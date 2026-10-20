@@ -1,0 +1,8 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of the_judge_confirms_the_screens_wall_once (§2.6).
+bind 0
+see busy
+see wall:usage-session
+tx wall usage-session confirm
+expect amend p1 wall confirmed=1 by=vendor src=transcript conf=exact
+tx wall usage-session confirm

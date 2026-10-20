@@ -7,7 +7,9 @@
 // Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
 // Convert keyboard layout handles through the typed Windows handle helpers; count key-text
 // graphemes with aterm-grapheme instead of unicode-segmentation; drop the unused
-// physicalkey_to_scancode table.
+// physicalkey_to_scancode table; keep the character an Alt code composes (`AltCode`); read
+// Windows through `replay` in tests and debug builds, so a recorded message sequence can drive
+// the key path (`super::recorded`).
 
 use std::char;
 use std::ffi::OsString;
@@ -75,13 +77,54 @@ pub struct MessageAsKeyEvent {
 pub struct KeyEventBuilder {
     event_info: Mutex<Option<PartialKeyEventInfo>>,
     pending: PendingEventQueue<MessageAsKeyEvent>,
+    /// LOCAL PATCH (aterm): the Alt code being typed, and the character the last one composed,
+    /// for the event loop to send as an IME commit ([`Self::take_alt_code_commit`]).
+    alt_code: Mutex<AltCode>,
+    alt_code_commit: Mutex<Option<String>>,
 }
 impl Default for KeyEventBuilder {
     fn default() -> Self {
-        KeyEventBuilder { event_info: Mutex::new(None), pending: Default::default() }
+        KeyEventBuilder {
+            event_info: Mutex::new(None),
+            pending: Default::default(),
+            alt_code: Mutex::new(AltCode::default()),
+            alt_code_commit: Mutex::new(None),
+        }
     }
 }
 impl KeyEventBuilder {
+    /// LOCAL PATCH (aterm): the character the last Alt code composed, once. Windows posts it as
+    /// a WM_CHAR with no key-down of its own after Alt is released, which upstream drops as
+    /// "probably IME"; the event loop sends it on as `Ime::Commit`.
+    pub(crate) fn take_alt_code_commit(&self) -> Option<String> {
+        self.alt_code_commit.lock().unwrap().take()
+    }
+
+    /// LOCAL PATCH (aterm): a key-down for [`AltCode`], with the live Alt and Ctrl state.
+    fn note_alt_code_key(&self, vkey: VIRTUAL_KEY) {
+        let held = |vk: VIRTUAL_KEY| key_state(vk) < 0;
+        let (alt, ctrl) = (held(VK_MENU), held(VK_CONTROL));
+        self.alt_code.lock().unwrap().key_down(vkey, alt, ctrl);
+    }
+
+    /// LOCAL PATCH (aterm): a WM_CHAR no key-down claimed. `true` when it belongs to an Alt
+    /// code; the last unit of the character stores it for [`Self::take_alt_code_commit`]. The
+    /// lock is released before `next_kbd_msg`, which can re-enter the window procedure.
+    fn alt_code_char(&self, hwnd: HWND, unit: u16) -> bool {
+        if !self.alt_code.lock().unwrap().push(unit) {
+            return false;
+        }
+        let more_char_coming =
+            next_kbd_msg(hwnd).map(|m| matches!(m.message, WM_CHAR | WM_SYSCHAR)).unwrap_or(false);
+        if !more_char_coming {
+            let text = self.alt_code.lock().unwrap().finish();
+            if text.is_some() {
+                *self.alt_code_commit.lock().unwrap() = text;
+            }
+        }
+        true
+    }
+
     /// Call this function for every window message.
     /// Returns Some() if this window message completes a KeyEvent.
     /// Returns None otherwise.
@@ -108,6 +151,7 @@ impl KeyEventBuilder {
                     MatchResult::MessagesToDispatch(self.pending.complete_multi(key_events))
                 },
                 WM_KILLFOCUS => {
+                    *self.alt_code.lock().unwrap() = AltCode::default();
                     // synthesize keyup events
                     let kbd_state = get_kbd_state();
                     let key_events = Self::synthesize_kbd_state(ElementState::Released, &kbd_state);
@@ -119,6 +163,7 @@ impl KeyEventBuilder {
                         // This is handled in `event_loop.rs`
                         return MatchResult::Nothing;
                     }
+                    self.note_alt_code_key(wparam as VIRTUAL_KEY);
                     let pending_token = self.pending.add_pending();
                     *result = ProcResult::Value(0);
 
@@ -178,6 +223,11 @@ impl KeyEventBuilder {
                 WM_CHAR | WM_SYSCHAR => {
                     let mut event_info = self.event_info.lock().unwrap();
                     if event_info.is_none() {
+                        drop(event_info);
+                        if self.alt_code_char(hwnd, wparam as u16) {
+                            *result = ProcResult::Value(0);
+                            return MatchResult::Nothing;
+                        }
                         trace!(
                             "Received a CHAR message but no `event_info` was available. The \
                              message is probably IME, returning."
@@ -431,7 +481,8 @@ impl KeyEventBuilder {
         locale_id: HKL,
         layouts: &mut MutexGuard<'_, LayoutCache>,
     ) -> Option<MessageAsKeyEvent> {
-        let scancode = unsafe { MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC_EX, locale_id) };
+        let scancode =
+            unsafe { MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC_EX, mapping_layout(locale_id)) };
         if scancode == 0 {
             return None;
         }
@@ -464,6 +515,59 @@ impl KeyEventBuilder {
         event.logical_key = logical_key;
         event.platform_specific.text_with_all_modifiers = text;
         Some(MessageAsKeyEvent { event, is_synthetic: true })
+    }
+}
+
+/// LOCAL PATCH (aterm): Windows' Alt-code entry. Alt held, a code typed on the NumLock-on
+/// keypad (Alt, 0, 2, 3, 3), and on Alt's release the system posts the composed character
+/// (`é`) as a WM_CHAR no key-down belongs to. Upstream dropped it, so the code typed nothing;
+/// the digits' own key events reach the app, which types nothing for them.
+///
+/// A keypad digit pressed with Alt and without Ctrl arms it (Ctrl+Alt is AltGr, and its own
+/// chords); any other key that is not a modifier disarms it. An armed WM_CHAR is the composed
+/// character, gathered unit by unit (a code above U+FFFF arrives as a surrogate pair) and
+/// handed over whole. Focus loss resets it.
+#[derive(Default)]
+struct AltCode {
+    armed: bool,
+    units: Vec<u16>,
+}
+
+impl AltCode {
+    fn key_down(&mut self, vkey: VIRTUAL_KEY, alt: bool, ctrl: bool) {
+        let digit = (VK_NUMPAD0..=VK_NUMPAD9).contains(&vkey);
+        let modifier = matches!(
+            vkey,
+            VK_MENU
+                | VK_LMENU
+                | VK_RMENU
+                | VK_SHIFT
+                | VK_LSHIFT
+                | VK_RSHIFT
+                | VK_CONTROL
+                | VK_LCONTROL
+                | VK_RCONTROL
+        );
+        if digit && alt && !ctrl {
+            self.armed = true;
+        } else if !modifier {
+            *self = AltCode::default();
+        }
+    }
+
+    /// Takes a WM_CHAR unit when armed; `false` leaves it to upstream's IME path.
+    fn push(&mut self, unit: u16) -> bool {
+        if self.armed {
+            self.units.push(unit);
+        }
+        self.armed
+    }
+
+    /// The composed character, once its last unit is in; disarms.
+    fn finish(&mut self) -> Option<String> {
+        let text = String::from_utf16(&self.units).ok().filter(|text| !text.is_empty());
+        *self = AltCode::default();
+        text
     }
 }
 
@@ -520,7 +624,7 @@ impl PartialKeyEventInfo {
                 MapVirtualKeyExW(
                     vkey as u32,
                     MAPVK_VK_TO_VSC_EX,
-                    super::handle::from_usize(layout.hkl as usize),
+                    mapping_layout(super::handle::from_usize(layout.hkl as usize)),
                 ) as u16
             }
         } else {
@@ -692,9 +796,91 @@ fn ex_scancode_from_lparam(lparam: LPARAM) -> ExScancode {
     new_ex_scancode(lparam.scancode, lparam.extended)
 }
 
+/// LOCAL PATCH (aterm): what the key path reads from Windows — the next key message
+/// (`PeekMessageW`), the keyboard state, one key's state and the thread's layout — answered from a
+/// RECORDED message sequence while one is replayed on this thread (`super::recorded`), and from
+/// Windows otherwise. Compiled into tests and debug builds only: a release build reads Windows.
+#[cfg(any(test, debug_assertions))]
+pub(crate) mod replay {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYFIRST, WM_KEYLAST};
+
+    /// The replay's view of Windows while one message is handled.
+    pub(crate) struct Replay {
+        /// The messages still to come, the next first.
+        pub(crate) queue: VecDeque<MSG>,
+        /// `GetKeyboardState` as of the message being handled.
+        pub(crate) keys: [u8; 256],
+        /// What `GetKeyboardLayout(0)` answers: the recorded layout's handle.
+        pub(crate) hkl: u64,
+    }
+
+    thread_local! {
+        static REPLAY: RefCell<Option<Replay>> = const { RefCell::new(None) };
+    }
+
+    /// Install (or, with `None`, end) this thread's replay.
+    pub(crate) fn set(replay: Option<Replay>) {
+        REPLAY.with(|cell| *cell.borrow_mut() = replay);
+    }
+
+    /// `PeekMessageW(.., WM_KEYFIRST, WM_KEYLAST, PM_NOREMOVE)` while replaying: the first key
+    /// message still to come.
+    pub(crate) fn next_key_message() -> Option<Option<MSG>> {
+        REPLAY.with(|cell| {
+            cell.borrow().as_ref().map(|replay| {
+                replay
+                    .queue
+                    .iter()
+                    .find(|msg| (WM_KEYFIRST..=WM_KEYLAST).contains(&msg.message))
+                    .copied()
+            })
+        })
+    }
+
+    /// `GetKeyboardState` while replaying.
+    pub(crate) fn keys() -> Option<[u8; 256]> {
+        REPLAY.with(|cell| cell.borrow().as_ref().map(|replay| replay.keys))
+    }
+
+    /// `GetKeyboardLayout(0)` while replaying.
+    pub(crate) fn layout() -> Option<u64> {
+        REPLAY.with(|cell| cell.borrow().as_ref().map(|replay| replay.hkl))
+    }
+}
+
+/// LOCAL PATCH (aterm): `GetKeyState(vk)`: the high bit set while the key is down, the low bit
+/// while a toggle key is on (the replay's recorded state while one runs).
+pub(crate) fn key_state(vk: VIRTUAL_KEY) -> i16 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(keys) = replay::keys() {
+        let state = keys[vk as usize];
+        return (if state & 0x80 != 0 { i16::MIN } else { 0 }) | i16::from(state & 1);
+    }
+    unsafe { GetKeyState(vk as i32) }
+}
+
+/// LOCAL PATCH (aterm): the layout `MapVirtualKeyExW` maps a scan code with. A recorded layout
+/// (`super::recorded`) is no layout Windows loaded, so a replay maps with the thread's own: the
+/// only keys mapped are the modifiers, the keypad and the navigation block, the same keys on every
+/// layout the recordings cover.
+pub(crate) fn mapping_layout(hkl: HKL) -> HKL {
+    #[cfg(any(test, debug_assertions))]
+    if replay::layout().is_some() {
+        return unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout(0) };
+    }
+    hkl
+}
+
 /// Gets the keyboard state as reported by messages that have been removed from the event queue.
 /// See also: get_async_kbd_state
 fn get_kbd_state() -> [u8; 256] {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(keys) = replay::keys() {
+        return keys;
+    }
     unsafe {
         let mut kbd_state: MaybeUninit<[u8; 256]> = MaybeUninit::uninit();
         GetKeyboardState(kbd_state.as_mut_ptr() as *mut u8);
@@ -706,6 +892,10 @@ fn get_kbd_state() -> [u8; 256] {
 /// been removed from the event queue. See also: get_kbd_state
 #[allow(clippy::uninit_assumed_init)]
 fn get_async_kbd_state() -> [u8; 256] {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(keys) = replay::keys() {
+        return keys;
+    }
     unsafe {
         let mut kbd_state: [u8; 256] = [0; 256];
         for (vk, state) in kbd_state.iter_mut().enumerate() {
@@ -887,6 +1077,10 @@ impl<T> Default for PendingEventQueue<T> {
 ///
 /// It can also cause code to get executed in a surprising order.
 pub fn next_kbd_msg(hwnd: HWND) -> Option<MSG> {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(next) = replay::next_key_message() {
+        return next;
+    }
     unsafe {
         let mut next_msg = MaybeUninit::uninit();
         let peek_retval =
@@ -900,7 +1094,9 @@ fn get_location(scancode: ExScancode, hkl: HKL) -> KeyLocation {
 
     let extension = 0xe000;
     let extended = (scancode & extension) == extension;
-    let vkey = unsafe { MapVirtualKeyExW(scancode as u32, MAPVK_VSC_TO_VK_EX, hkl) as VIRTUAL_KEY };
+    let vkey = unsafe {
+        MapVirtualKeyExW(scancode as u32, MAPVK_VSC_TO_VK_EX, mapping_layout(hkl)) as VIRTUAL_KEY
+    };
 
     // Use the native VKEY and the extended flag to cover most cases
     // This is taken from the `druid` GUI library, specifically
@@ -1081,4 +1277,55 @@ pub(crate) fn scancode_to_physicalkey(scancode: u32) -> PhysicalKey {
         0xe030 => KeyCode::AudioVolumeUp,
         _ => return PhysicalKey::Unidentified(NativeKeyCode::Windows(scancode as u16)),
     })
+}
+
+#[cfg(test)]
+mod alt_code_tests {
+    use super::AltCode;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        VK_LMENU, VK_MENU, VK_NUMPAD0, VK_NUMPAD2, VK_NUMPAD3, VK_RETURN, VK_SHIFT,
+    };
+
+    /// Alt, 0, 2, 3, 3 on the keypad, then Alt's release posts `é` as one WM_CHAR: the
+    /// code takes it and hands it over whole, once.
+    #[test]
+    fn an_alt_code_hands_over_its_character() {
+        let mut code = AltCode::default();
+        code.key_down(VK_MENU, true, false);
+        for digit in [VK_NUMPAD0, VK_NUMPAD2, VK_NUMPAD3, VK_NUMPAD3] {
+            code.key_down(digit, true, false);
+        }
+        assert!(code.push(0x00e9));
+        assert_eq!(code.finish().as_deref(), Some("é"));
+        assert!(!code.push(0x00e9), "one character per code");
+    }
+
+    /// A surrogate pair arrives as two WM_CHARs and leaves as one character.
+    #[test]
+    fn a_surrogate_pair_is_one_character() {
+        let mut code = AltCode::default();
+        code.key_down(VK_NUMPAD2, true, false);
+        assert!(code.push(0xd83d));
+        assert!(code.push(0xde00));
+        assert_eq!(code.finish().as_deref(), Some("😀"));
+    }
+
+    /// Nothing arms without Alt, Ctrl+Alt (AltGr) does not, and a key that is not a
+    /// modifier disarms: those WM_CHARs stay upstream's (an IME's, or nobody's).
+    #[test]
+    fn only_alt_and_a_keypad_digit_arm_it() {
+        let mut code = AltCode::default();
+        code.key_down(VK_NUMPAD2, false, false);
+        assert!(!code.push(u16::from(b'2')));
+        code.key_down(VK_NUMPAD2, true, true);
+        assert!(!code.push(u16::from(b'2')), "Ctrl+Alt is AltGr");
+        code.key_down(VK_NUMPAD2, true, false);
+        code.key_down(VK_SHIFT, true, false);
+        code.key_down(VK_LMENU, true, false);
+        assert!(code.push(0x00e9), "modifiers leave it armed");
+        let _ = code.finish();
+        code.key_down(VK_NUMPAD2, true, false);
+        code.key_down(VK_RETURN, true, false);
+        assert!(!code.push(u16::from(b'\r')), "another key disarms it");
+    }
 }

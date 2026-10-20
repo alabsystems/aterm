@@ -3,9 +3,9 @@
 
 //! Latest-wins off-thread preparation of immutable config font generations.
 
+use aterm_window::event_loop::EventLoopProxy;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use winit::event_loop::EventLoopProxy;
 
 use crate::app_config::{Config, ConfigAssetCatalog, FontConfig};
 use crate::native_config_service::ConfigDiskObservation;
@@ -23,9 +23,11 @@ pub(crate) const FAMILY_REFUSED: &str = "config font_family:";
 /// the next rung, aterm's default, and says so once per generation.
 pub(crate) const THEME_FAMILY_REFUSED: &str = "theme font:";
 
+/// The face the terminal draws now: its file and collection index when it
+/// came from one, and its bytes.
 #[derive(Clone)]
 pub(crate) struct PrimarySeed {
-    pub(crate) path: Option<String>,
+    pub(crate) face: Option<aterm_render::FaceRef>,
     pub(crate) bytes: Arc<[u8]>,
 }
 
@@ -49,16 +51,29 @@ pub(crate) struct Request {
     pub(crate) reason: crate::app_colorscheme::ThemeChange,
 }
 
-/// One font row whose authored name no resolver found: the setting's key
-/// and the name as written. The terminal kept what it had for that slot.
+/// One font row whose authored name the terminal could not honour: the
+/// setting's key, the name as written, and why.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FontRefusal {
     pub(crate) key: &'static str,
     pub(crate) family: String,
+    pub(crate) reason: FontRefusalReason,
     /// The theme that named it, when the name came from a theme file rather
     /// than the config: Settings then says "(from theme X, not installed)"
     /// instead of marking the person's own value "Not found".
     pub(crate) from_theme: Option<String>,
+}
+
+/// Why a font row's name was not honoured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FontRefusalReason {
+    /// No resolver found the name. The terminal kept what it had for that
+    /// slot.
+    NotFound,
+    /// The name names a face that does not draw the row's style
+    /// (`Menlo Italic` in the Bold row). The terminal draws that style in it
+    /// all the same.
+    WrongStyle,
 }
 
 pub(crate) struct PreparedFonts {
@@ -256,35 +271,40 @@ pub(crate) fn prepare(request: Request) -> Completion {
         .map(|fonts| fonts.0.as_slice())
         .unwrap_or(&[]);
 
-    let mut names = Vec::new();
-    let mut push = |value: &str| {
+    // Each request names the style it serves, so a family takes its own face
+    // for each slot (`font_family_bold = "Menlo"` is Menlo's Bold).
+    let regular = aterm_render::FaceTarget::REGULAR;
+    let mut names: Vec<(String, aterm_render::FaceTarget)> = Vec::new();
+    let mut push = |value: &str, target: aterm_render::FaceTarget| {
         let index = names.len();
-        names.push(value.to_string());
+        names.push((value.to_string(), target));
         index
     };
-    let primary_i = requested_family.as_deref().map(&mut push);
-    let style_i = styles.map(|value| {
-        value
+    let primary_i = requested_family
+        .as_deref()
+        .map(|value| push(value, regular));
+    let style_i: [Option<usize>; 3] = std::array::from_fn(|slot| {
+        styles[slot]
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .map(&mut push)
+            .map(|value| push(value, aterm_render::FaceTarget::for_slot(slot)))
     });
     let fallback_i = fallbacks
         .iter()
-        .map(|value| push(value))
+        .map(|value| push(value, regular))
         .collect::<Vec<_>>();
     let symbol_i = view
         .symbol_font
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .map(&mut push);
+        .map(|value| push(value, regular));
     let emoji_i = view
         .emoji_font
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .map(&mut push);
+        .map(|value| push(value, regular));
     let batch = aterm_render::font_catalog::resolve_and_admit(&names);
     let admitted = |index: usize| {
         batch
@@ -303,7 +323,7 @@ pub(crate) fn prepare(request: Request) -> Completion {
     };
     // The font rows Settings marks "Not found": each authored name no
     // resolver found. The family row only when the terminal asked for it,
-    // not for a launch font or a display face standing in front of it.
+    // not for a launch font standing in front of it.
     let refused =
         |index: Option<usize>| index.filter(|index| batch.get(*index).is_some_and(Result::is_err));
     let mut font_refusals = Vec::new();
@@ -337,7 +357,8 @@ pub(crate) fn prepare(request: Request) -> Completion {
         if let Some(index) = refused(index) {
             font_refusals.push(FontRefusal {
                 key,
-                family: names[index].clone(),
+                family: names[index].0.clone(),
+                reason: FontRefusalReason::NotFound,
                 from_theme: from_theme(theme_key),
             });
         }
@@ -357,9 +378,9 @@ pub(crate) fn prepare(request: Request) -> Completion {
     } else {
         requested_family
     };
-    let (primary_path, primary_bytes, family) = match primary_admitted {
+    let (primary_face, primary_bytes, family) = match primary_admitted {
         Some(asset) => (
-            Some(asset.path),
+            Some(asset.face()),
             Arc::<[u8]>::from(asset.bytes.as_slice()),
             requested_family,
         ),
@@ -373,13 +394,16 @@ pub(crate) fn prepare(request: Request) -> Completion {
                 "{FAMILY_REFUSED} {error}; keeping the current working face"
             ));
             (
-                request.primary.path.clone(),
+                request.primary.face.clone(),
                 Arc::clone(&request.primary.bytes),
                 request.previous_family.clone(),
             )
         }
         None if request.previous_family.is_some() => {
-            let candidates = aterm_render::primary_font_candidate_paths();
+            let candidates = aterm_render::primary_font_candidate_paths()
+                .into_iter()
+                .map(|candidate| (candidate, regular))
+                .collect::<Vec<_>>();
             let batch = aterm_render::font_catalog::resolve_and_admit(&candidates);
             match batch
                 .entries
@@ -387,27 +411,27 @@ pub(crate) fn prepare(request: Request) -> Completion {
                 .find_map(|entry| entry.result.ok())
             {
                 Some(asset) => (
-                    Some(asset.path),
+                    Some(asset.face()),
                     Arc::<[u8]>::from(asset.bytes.as_slice()),
                     None,
                 ),
                 None => (
-                    request.primary.path.clone(),
+                    request.primary.face.clone(),
                     Arc::clone(&request.primary.bytes),
                     request.previous_family.clone(),
                 ),
             }
         }
         None => (
-            request.primary.path.clone(),
+            request.primary.face.clone(),
             Arc::clone(&request.primary.bytes),
             None,
         ),
     };
 
-    let renderer = match primary_path.clone() {
-        Some(path) => {
-            aterm_render::Renderer::from_resolved_font_file(path, &primary_bytes, request.px, theme)
+    let renderer = match primary_face {
+        Some(face) => {
+            aterm_render::Renderer::from_resolved_font_file(face, &primary_bytes, request.px, theme)
         }
         None => aterm_render::Renderer::from_bytes(&primary_bytes, request.px, theme),
     };
@@ -436,42 +460,59 @@ pub(crate) fn prepare(request: Request) -> Completion {
         }
     };
 
-    // FONT-DISPLAY MIX: a `display:<id>+<id>` family carries EXTRA faces beyond the
-    // admitted primary (the mix's first face). Installed on the prepared
-    // renderer here, so hot reload and the seal/rebuild path (which clones the
-    // mix) both carry it; a rejected face degrades to the primary alone.
-    if let Some(mix) = family
-        .as_deref()
-        .and_then(aterm_render::display_face_mix_for_family)
-        && mix.len() > 1
-        && let Err(error) = renderer.set_display_mix_faces(&mix[1..])
-    {
-        warnings.push(format!("display face mix rejected ({error})"));
+    // FONT-DISPLAY LAYER: the display faces are drawn OVER the person's font
+    // (which alone sets the grid and is the chrome's face), installed on the
+    // prepared renderer here, so hot reload and the seal/rebuild path (which
+    // clones the layer) both carry it; a rejected face leaves the font alone.
+    let mut config = FontConfig {
+        display_faces: crate::effective_display_faces(&view),
+        ..FontConfig::default()
+    };
+    if let Err(error) = renderer.set_display_faces(&config.display_faces) {
+        warnings.push(format!("display_font rejected ({error})"));
+        config.display_faces = renderer.display_faces();
     }
-
-    let mut config = FontConfig::default();
     // A slot that fails keeps the current generation only when the PERSON
     // named it (DTP §9.4): a theme-named slot that fails is dropped with a
     // warning and never holds back the rest of the generation.
     let mut preserve_current_generation = false;
     config.synthetic_style = view.font_synthetic_style.unwrap_or(true);
     renderer.set_synthetic_styles(config.synthetic_style);
+    let style_keys = [
+        crate::prefs::EDIT_FONT_FAMILY_BOLD,
+        crate::prefs::EDIT_FONT_FAMILY_ITALIC,
+        crate::prefs::EDIT_FONT_FAMILY_BOLD_ITALIC,
+    ];
     for (slot, index) in style_i.into_iter().enumerate() {
         let Some(index) = index else { continue };
         let themed = from_theme(style_keys[slot]).is_some();
         match admitted(index) {
-            Some(asset) => match renderer.set_styled_font_bytes(slot, &asset.bytes) {
-                Ok(()) => config.styled_paths[slot] = Some(asset.path),
+            Some(asset) => match renderer.set_styled_face(slot, &asset.bytes, asset.index) {
+                Ok(()) => {
+                    // A name that resolved to a face of another style draws
+                    // that face; the row says so rather than "Changed".
+                    if !aterm_render::FaceTarget::for_slot(slot)
+                        .suits_face_in(&asset.bytes, asset.index)
+                    {
+                        font_refusals.push(FontRefusal {
+                            key: style_keys[slot],
+                            family: names[index].0.clone(),
+                            reason: FontRefusalReason::WrongStyle,
+                            from_theme: from_theme(style_keys[slot]),
+                        });
+                    }
+                    config.styled_paths[slot] = Some(asset.face());
+                }
                 Err(error) => warnings.push(format!("config styled font rejected ({error})")),
             },
             None if themed => warnings.push(theme_miss(
                 style_keys[slot],
-                &names[index],
+                &names[index].0,
                 "aterm's own choice",
             )),
             None => warnings.push(format!(
                 "config styled font {:?} was not admitted",
-                names[index]
+                names[index].0
             )),
         }
         if !themed
@@ -486,9 +527,9 @@ pub(crate) fn prepare(request: Request) -> Completion {
     for index in fallback_i {
         let Some(asset) = admitted(index) else {
             warnings.push(if fallbacks_themed {
-                theme_miss("fallback_fonts", &names[index], "the rest of the list")
+                theme_miss("fallback_fonts", &names[index].0, "the rest of the list")
             } else {
-                format!("config fallback font {:?} was not admitted", names[index])
+                format!("config fallback font {:?} was not admitted", names[index].0)
             });
             continue;
         };
@@ -520,9 +561,9 @@ pub(crate) fn prepare(request: Request) -> Completion {
         }
     } else if let Some(index) = symbol_i {
         warnings.push(if symbol_themed {
-            theme_miss("symbol_font", &names[index], "aterm's own choice")
+            theme_miss("symbol_font", &names[index].0, "aterm's own choice")
         } else {
-            format!("config symbol_font {:?} was not admitted", names[index])
+            format!("config symbol_font {:?} was not admitted", names[index].0)
         });
     }
     if !symbol_themed
@@ -540,9 +581,9 @@ pub(crate) fn prepare(request: Request) -> Completion {
         }
     } else if let Some(index) = emoji_i {
         warnings.push(if emoji_themed {
-            theme_miss("emoji_font", &names[index], "aterm's own choice")
+            theme_miss("emoji_font", &names[index].0, "aterm's own choice")
         } else {
-            format!("config emoji_font {:?} was not admitted", names[index])
+            format!("config emoji_font {:?} was not admitted", names[index].0)
         });
     }
     if !emoji_themed
@@ -626,8 +667,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        Completion, CompletionDisposition, Lane, PrimarySeed, Request, completion_disposition,
-        prepare,
+        Completion, CompletionDisposition, FontRefusal, FontRefusalReason, Lane, PrimarySeed,
+        Request, completion_disposition, prepare,
     };
 
     const DARK: aterm_types::Appearance = aterm_types::Appearance::Dark;
@@ -673,7 +714,7 @@ mod tests {
             previous_variations: Vec::new(),
             previous_dark_nudge: 0.0,
             primary: PrimarySeed {
-                path: None,
+                face: None,
                 bytes: Arc::from(
                     include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf").as_slice(),
                 ),
@@ -710,16 +751,141 @@ mod tests {
             "{:?}",
             completion.warnings
         );
-        // A display face in front of an unknown family: the terminal never
-        // asked for the family, so its row is not refused.
+        // A display face over an unknown family: the family still sets the
+        // grid and draws what the face lacks, so its row is still refused.
         let display = prepare(request_with_text(
             2,
             "font_family = \"NoSuchFontXYZ\"\ndisplay_font = \"pixel\"\n",
         ));
+        assert_eq!(
+            display
+                .font_refusals
+                .iter()
+                .map(|refusal| refusal.key)
+                .collect::<Vec<_>>(),
+            [crate::prefs::EDIT_FONT_FAMILY],
+        );
+    }
+
+    /// A DISPLAY FACE IS A LAYER OVER THE PERSON'S FONT. The prepared
+    /// generation's primary — what sets the grid and what the chrome (Settings
+    /// code text, the palette, the Manual editor) draws in — is the
+    /// `font_family` face with display faces on exactly as with them off, and
+    /// the faces are drawn over it. Before, the request became
+    /// `display:engraved`, the face was the primary, the grid took its `M`
+    /// cell, and the chrome fell back to the embedded font.
+    #[test]
+    fn a_display_face_is_drawn_over_the_font_family_never_in_its_place() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-font-lane-layer-")
+            .tempdir()
+            .unwrap();
+        let font = dir.path().join("Mono.ttf");
+        std::fs::write(
+            &font,
+            include_bytes!("../../aterm-render/assets/bundled/JetBrainsMono-Regular.ttf"),
+        )
+        .unwrap();
+        let family = crate::app_config::toml_basic_string(&font.to_string_lossy());
+        let chrome = |completion: &Completion| {
+            let fonts = completion.fonts.as_ref().expect("a generation installs");
+            (
+                fonts
+                    .renderer
+                    .chrome_primary_face()
+                    .map(|(bytes, index)| (bytes.to_vec(), index)),
+                fonts.renderer.cell_size(),
+                fonts.renderer.primary_source_path().map(str::to_string),
+            )
+        };
+        let plain = prepare(request_with_text(1, &format!("font_family = {family}\n")));
+        for faces in ["engraved", "pixel+engraved", "chunky+pixel+bubble"] {
+            let layered = prepare(request_with_text(
+                2,
+                &format!("font_family = {family}\ndisplay_font = \"{faces}\"\n"),
+            ));
+            assert_eq!(chrome(&layered), chrome(&plain), "{faces}");
+            let fonts = layered.fonts.as_ref().unwrap();
+            assert_eq!(
+                fonts.config.display_faces,
+                aterm_render::display_layer_ids(faces.split('+')),
+                "{faces}"
+            );
+            assert_eq!(fonts.renderer.display_faces(), fonts.config.display_faces);
+            assert!(layered.font_refusals.is_empty(), "{faces}");
+        }
+        assert_eq!(
+            chrome(&plain).0.map(|(bytes, _)| bytes),
+            Some(
+                include_bytes!("../../aterm-render/assets/bundled/JetBrainsMono-Regular.ttf")
+                    .to_vec()
+            ),
+            "the chrome is the person's font"
+        );
+        // Automatic: the same default face with and without the layer.
+        let automatic = prepare(request_with_text(1, "display_font = \"engraved\"\n"));
         assert!(
-            display.font_refusals.is_empty(),
-            "{:?}",
-            display.font_refusals
+            automatic.fonts.as_ref().is_none_or(|fonts| {
+                fonts.renderer.display_faces() == ["engraved"]
+                    && fonts
+                        .renderer
+                        .chrome_primary_face()
+                        .is_some_and(|(bytes, _)| {
+                            bytes.as_ref() != aterm_render::display_face_bytes("engraved").unwrap()
+                        })
+            }),
+            "the automatic font stays the primary under the layer"
+        );
+    }
+
+    /// A style row loads the face its name names inside a collection, the
+    /// face nearest the row's style for a whole file, and says when that
+    /// face is of another style. Before, every styled face was face 0 of its
+    /// file, so a Bold named inside `Menlo.ttc` drew Menlo Regular and the
+    /// row read "Changed".
+    #[test]
+    fn a_style_row_loads_its_own_face_of_a_collection_and_names_a_wrong_style() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-font-lane-faces-")
+            .tempdir()
+            .unwrap();
+        let collection = dir.path().join("Mono.ttc");
+        std::fs::write(
+            &collection,
+            aterm_render::font_catalog::ttc_of(&[
+                include_bytes!("../../aterm-render/assets/bundled/JetBrainsMono-Regular.ttf"),
+                include_bytes!("../../aterm-render/assets/bundled/JetBrainsMono-Bold.ttf"),
+                include_bytes!("../../aterm-render/assets/bundled/JetBrainsMono-Italic.ttf"),
+            ]),
+        )
+        .unwrap();
+        let bold = dir.path().join("Bold.ttf");
+        std::fs::write(
+            &bold,
+            include_bytes!("../../aterm-render/assets/bundled/JetBrainsMono-Bold.ttf"),
+        )
+        .unwrap();
+        let toml = format!(
+            "font_family_bold = {}\nfont_family_italic = {}\n",
+            crate::app_config::toml_basic_string(&collection.to_string_lossy()),
+            crate::app_config::toml_basic_string(&bold.to_string_lossy()),
+        );
+        let completion = prepare(request_with_text(1, &toml));
+        let fonts = completion.fonts.expect("a styled face installs");
+        assert_eq!(
+            fonts.config.styled_paths[0],
+            Some(aterm_render::FaceRef::new(collection.to_string_lossy(), 1)),
+            "the bold row takes the collection's Bold, face 1"
+        );
+        assert_eq!(
+            completion.font_refusals,
+            [FontRefusal {
+                key: crate::prefs::EDIT_FONT_FAMILY_ITALIC,
+                family: bold.to_string_lossy().into_owned(),
+                reason: FontRefusalReason::WrongStyle,
+                from_theme: None,
+            }],
+            "a bold face in the italic row is named"
         );
     }
 
@@ -754,15 +920,6 @@ mod tests {
         assert_eq!(
             completion_disposition(requested, current, 0, 0, DARK, DARK),
             CompletionDisposition::Publish
-        );
-
-        // Negative control: the mutant predicate reproduces stale publication.
-        let buggy_accepts = |_: u64, completed: u64| completed > 0;
-        assert!(buggy_accepts(requested, stale));
-        assert_ne!(
-            buggy_accepts(requested, stale),
-            completion_disposition(requested, stale, 0, 0, DARK, DARK)
-                == CompletionDisposition::Publish
         );
     }
 
@@ -1139,27 +1296,39 @@ mod tests {
     }
 
     /// A theme's `font_family` is the face the worker prepares when the
-    /// config names none (display faces: no system font involved). Negative
-    /// control: a config family wins.
+    /// config names none (a compiled-in face: no system font involved), and
+    /// a theme's `display:` family is the display LAYER over the default
+    /// font, never the font. Negative control: a config family wins.
     #[test]
     fn worker_applies_theme_family() {
-        let themes = studio("font_family = display:pixel");
+        let iosevka = aterm_render::bundled::IOSEVKA_ID;
+        let themes = studio(&format!("font_family = {iosevka}"));
         let themed = prepare(request_with_themes(1, "theme = \"Studio\"\n", &themes));
         let fonts = themed.fonts.expect("a new face");
-        assert_eq!(fonts.family.as_deref(), Some("display:pixel"));
+        assert_eq!(fonts.family.as_deref(), Some(iosevka));
+        assert!(fonts.config.display_faces.is_empty());
         assert!(
             themed.config.font_family.is_none(),
             "the authored config is kept"
         );
+        let bold = aterm_render::bundled::IOSEVKA_BOLD_ID;
         let mine = prepare(request_with_themes(
             2,
-            "theme = \"Studio\"\nfont_family = \"display:chunky\"\n",
+            &format!("theme = \"Studio\"\nfont_family = \"{bold}\"\n"),
             &themes,
         ));
         assert_eq!(
             mine.fonts.expect("a new face").family.as_deref(),
-            Some("display:chunky")
+            Some(bold)
         );
+        let layered = prepare(request_with_themes(
+            3,
+            "theme = \"Studio\"\n",
+            &studio("font_family = display:pixel"),
+        ));
+        let fonts = layered.fonts.expect("a new layer");
+        assert_eq!(fonts.family, None, "the default font stays the font");
+        assert_eq!(fonts.config.display_faces, ["pixel"]);
     }
 
     /// A theme's family that is not installed takes the default rung — never
@@ -1200,14 +1369,15 @@ mod tests {
             "font_family = \"Zz No Such Font Aterm\"\n",
             &crate::app_config::ThemeCatalog::empty(),
         );
-        mine.previous_family = Some("display:pixel".to_string());
+        let iosevka = aterm_render::bundled::IOSEVKA_ID;
+        mine.previous_family = Some(iosevka.to_string());
         let mine = prepare(mine);
         let kept = mine
             .fonts
             .as_ref()
             .and_then(|f| f.family.clone())
-            .or_else(|| (mine.fonts.is_none()).then(|| "display:pixel".to_string()));
-        assert_eq!(kept.as_deref(), Some("display:pixel"));
+            .or_else(|| (mine.fonts.is_none()).then(|| iosevka.to_string()));
+        assert_eq!(kept.as_deref(), Some(iosevka));
         assert!(
             mine.warnings
                 .iter()
@@ -1221,9 +1391,11 @@ mod tests {
     /// that fails is dropped and never suppresses the family change beside it.
     #[test]
     fn preserve_cliff_matrix() {
-        let previous_symbol = Some("display:pixel".to_string());
+        // Compiled-in faces, so no system font is read.
+        let symbol = aterm_render::bundled::IOSEVKA_ITALIC_ID;
+        let previous_symbol = Some(symbol.to_string());
         for themed in [true, false] {
-            for (name, admits) in [("display:pixel", true), ("Zz No Such Symbol Aterm", false)] {
+            for (name, admits) in [(symbol, true), ("Zz No Such Symbol Aterm", false)] {
                 for previous in [previous_symbol.clone(), None] {
                     let (theme_line, config_line) = if themed {
                         (format!("symbol_font = {name}"), String::new())
@@ -1234,7 +1406,8 @@ mod tests {
                     // A primary family change in the same generation, so the
                     // generation installs unless it is held back.
                     let text = format!(
-                        "theme = \"Studio\"\nfont_family = \"display:chunky\"\n{config_line}"
+                        "theme = \"Studio\"\nfont_family = \"{}\"\n{config_line}",
+                        aterm_render::bundled::IOSEVKA_ID
                     );
                     let mut request = request_with_themes(1, &text, &themes);
                     request
@@ -1466,20 +1639,54 @@ mod tests {
         );
     }
 
-    /// `font_size_scale` multiplies the size the apply derives: an explicit
+    /// `font_size_scale` multiplies the size the apply derives: a configured
     /// `font_px` 20 at 1.1 is 22; 1.0 is the identity.
     #[test]
     fn font_size_scale_scales_the_derived_size() {
         let (app, _requests) = app_with(&studio(""), "font_px = 20.0\nfont_size_scale = 1.1\n");
-        assert_eq!(app.default_font_px, 22.0);
+        assert_eq!(app.default_font_size, 22.0);
         assert_eq!(app.font_size_scale_milli, 1100);
         let (app, _requests) = app_with(
             &studio("font_size_scale = 1.1"),
             "theme = \"Studio\"\nfont_px = 20.0\n",
         );
-        assert_eq!(app.default_font_px, 22.0, "a theme's scale too");
+        assert_eq!(app.default_font_size, 22.0, "a theme's scale too");
         let (app, _requests) = app_with(&studio(""), "font_px = 20.0\nfont_size_scale = 1.0\n");
-        assert_eq!(app.default_font_px, 20.0);
+        assert_eq!(app.default_font_size, 20.0);
+    }
+
+    /// One font-size unit: on a 2× window the config's `font_px` is px at 1×
+    /// like Settings' slider and the default, so 13 draws at 26 device px, one
+    /// point above the default's 24, and 12 draws exactly what the default
+    /// draws. Negative control: the old explicit pin drew 13 at 13 device px,
+    /// half the default's size, from what the slider calls one step up.
+    #[test]
+    fn a_configured_size_draws_at_the_window_scale() {
+        let at_2x = |text: &str| {
+            let mut app = crate::App::headless_for_test();
+            let wid = crate::WindowId(0);
+            app.windows.get_mut(&wid).expect("window 0").scale = 2.0;
+            app.refresh_all_window_metrics();
+            let (lane, requests) = Lane::test_pair();
+            app.native_font_catalog = Some(lane);
+            app.reload_prepared_config_observation(request_with_text(70, text).prepared);
+            if let Ok(setup) = requests.try_recv() {
+                app.finish_font_catalog_generation(prepare(setup));
+            }
+            (app.font_size, app.windows[&wid].metrics.font_px)
+        };
+        let default = at_2x("");
+        assert_eq!(default, (crate::FONT_PX, (crate::FONT_PX * 2.0).round()));
+        assert_eq!(at_2x("font_px = 13.0\n"), (13.0, 26.0));
+        assert!(
+            at_2x("font_px = 13.0\n").1 > default.1,
+            "one step up grows the text"
+        );
+        assert_eq!(
+            at_2x(&format!("font_px = {:.1}\n", crate::FONT_PX)).1,
+            default.1,
+            "the default size named is the default"
+        );
     }
 
     #[test]

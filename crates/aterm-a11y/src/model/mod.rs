@@ -60,6 +60,8 @@ pub enum Role {
     Group,
     Heading,
     ListBox,
+    /// One option of a [`Role::ListBox`].
+    ListBoxOption,
     MenuItemRadio,
     Navigation,
     ProgressIndicator,
@@ -259,9 +261,11 @@ pub struct TextSelection {
 pub struct Node {
     role: Role,
     actions: u32,
+    action_context: Option<ActionContext>,
     disabled: bool,
     read_only: bool,
     busy: bool,
+    offscreen: bool,
     line_breaking: bool,
     children: Vec<NodeId>,
     label: Option<Box<str>>,
@@ -394,6 +398,12 @@ impl Node {
     }
     flag! {
         busy, is_busy, set_busy, clear_busy
+    }
+    flag! {
+        /// A node its scrolling container holds off screen: in the tree (a
+        /// reader can find it and scroll it into view) but not showing, and
+        /// no point on screen is its.
+        offscreen, is_offscreen, set_offscreen, clear_offscreen
     }
     flag! {
         /// Whether this node causes a hard line break.
@@ -554,6 +564,11 @@ impl Node {
         text_direction: TextDirection, text_direction, set_text_direction, clear_text_direction
     }
     copy_property! {
+        /// The owner and authorization captured by this publication. A platform
+        /// copies it into an action before queuing it, even if the node id is reused.
+        action_context: ActionContext, action_context, set_action_context, clear_action_context
+    }
+    copy_property! {
         numeric_value: f64, numeric_value, set_numeric_value, clear_numeric_value
     }
     copy_property! {
@@ -672,9 +687,76 @@ pub enum ActionData {
     SetTextSelection(TextSelection),
 }
 
+/// Lossless context captured by a publication before its action is queued.
+/// A semantic node's slot does not identify its current owner or authorization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ActionContext {
+    domain: ActionDomain,
+    owner: u64,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ActionDomain {
+    Native,
+    Message,
+    MessageLog,
+    Tab,
+}
+
+impl ActionContext {
+    /// The host's stable view identity and current lifecycle generation.
+    pub const fn new(owner: u64, generation: u64) -> Self {
+        Self {
+            domain: ActionDomain::Native,
+            owner,
+            generation,
+        }
+    }
+
+    /// A message's exact id and checked action-list revision, captured together.
+    pub const fn message(owner: u64, generation: u64) -> Self {
+        Self {
+            domain: ActionDomain::Message,
+            owner,
+            generation,
+        }
+    }
+
+    /// The message log's link, which does not authorize any individual row's action.
+    pub const fn message_log() -> Self {
+        Self {
+            domain: ActionDomain::MessageLog,
+            owner: 0,
+            generation: 0,
+        }
+    }
+
+    /// A tab's stable identity, independent of its current position in the strip.
+    pub const fn tab(owner: u64) -> Self {
+        Self {
+            domain: ActionDomain::Tab,
+            owner,
+            generation: 0,
+        }
+    }
+
+    /// Stable owner identity, without truncation or hashing.
+    pub const fn owner(self) -> u64 {
+        self.owner
+    }
+
+    /// Native lifecycle generation or message action-list revision.
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
 /// An action an assistive technology asks of a node.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActionRequest {
+    /// The target node's owner and authorization when the action was created.
+    pub context: Option<ActionContext>,
     pub action: Action,
     pub target_tree: TreeId,
     pub target_node: NodeId,

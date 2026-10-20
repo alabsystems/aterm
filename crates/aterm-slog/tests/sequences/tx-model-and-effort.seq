@@ -1,0 +1,11 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# S21: the model and effort as the vendor's rows say them, amended on the
+# run once: the same again writes nothing.
+bind 0
+see busy
+tx prompt v1
+tx model model=claude-opus-4-1 effort=high ver=2.1.0
+expect amend r1 agent model=claude-opus-4-1 effort=high ver=2.1.0 by=vendor src=transcript conf=exact
+tx model model=claude-opus-4-1 effort=high ver=2.1.0
+tx end
+expect close t1 turn out=done

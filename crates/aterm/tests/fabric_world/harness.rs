@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared by the `fabric_world` suite and `two_nodes_sealed.rs`: one guarded
-//! broker, one headless aterm, one real bridge child between them, and the
-//! bounded waits that keep the whole thing deterministic.
+//! Shared by the `fabric_world` suite: one guarded broker, one headless aterm,
+//! one real bridge child between them, and the bounded waits that keep the
+//! whole thing deterministic.
 //!
 //! Both suites mount this file, so it carries NO `#[test]` of its own: one
 //! would run once per mounting binary.
@@ -75,6 +75,18 @@ pub use aterm_spec::wait::until_within;
 /// milliseconds. It is [`DEADLINE`]'s argument applied to a slower clock: the
 /// only thing the number decides is how long a WEDGED run takes to be named.
 pub const PERIODIC_DEADLINE: Duration = Duration::from_secs(180);
+
+/// The fast-timers development seam as a [`World::boot_with`] environment
+/// entry: the instance's own waits at test pace (`aterm-gui-timing`), and its
+/// bridge's round and the presence republish window matched to it a quarter of
+/// production (`aterm-link`'s `roster_refresh`, `presence::republish_min`).
+///
+/// FOR A TEST THAT WAITS ON THE ROUND: a presence field a push cannot carry
+/// inside the republish window, the roster backstop itself, a replay walked per
+/// round. NEVER for one whose proof is that NO round ran inside some window (a
+/// premise made by posting before the next round, a bug a round would mask):
+/// four rounds a second are four times as likely to fall inside it.
+pub const FAST_TIMERS: (&str, &str) = (aterm_types::domain::ENV_DEV_FAST_TIMERS, "1");
 
 /// The bound on ONE control-verb reply: [`DEADLINE`] for the verb's own wait
 /// (`--wait=60000`, `--wait-ack=60000`, `timeout=60000` — each a minute's hang
@@ -439,7 +451,7 @@ pub fn cap_line(grant: &str) -> String {
     format!("{} {hex}\n", cap.filter)
 }
 
-/// A node's ring on the test fleet: THE ring `fabric on` and `mint-for` mint
+/// A node's ring on the test fleet: THE ring `fabric on` mints
 /// ([`aterm_link::enable::node_grants`]), so every guarded World and Fleet
 /// bridge attaches with what ships, and a grant the bridge needs cannot be
 /// added here and forgotten there.
@@ -611,45 +623,6 @@ pub fn kill(pid: i32, sig: i32) {
 unsafe extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
-}
-
-/// The `--tcp [--key-file …]` flags a CHILD process needs to reach this fixture,
-/// matched to how [`Fleet::boot`] served it. Without `sealed` the fixture serves
-/// plaintext loopback, and a child handed `--key-file` would be refused by its
-/// own `transport::connect` — which is how every non-sealed e2e test timed out
-/// on "the node's presence row to say live" the first time this was gated.
-#[must_use]
-pub fn fleet_child_flags(key_file: &std::path::Path) -> Vec<String> {
-    #[cfg(feature = "sealed")]
-    {
-        vec![
-            "--tcp".to_string(),
-            "--key-file".to_string(),
-            key_file.to_string_lossy().into_owned(),
-        ]
-    }
-    #[cfg(not(feature = "sealed"))]
-    {
-        let _ = key_file;
-        vec!["--tcp".to_string()]
-    }
-}
-
-/// The transport this fixture's clients dial with, matched to how [`Fleet::boot`]
-/// served it. `sealed` is astream's XChaCha20-Poly1305 record layer, which only
-/// `two_nodes_sealed` asserts; a default build serves and dials plaintext
-/// loopback, so every OTHER test here still runs without a cipher tree.
-#[must_use]
-pub fn fleet_transport(key: [u8; 32]) -> aterm_link::transport::Transport {
-    #[cfg(feature = "sealed")]
-    {
-        aterm_link::transport::Transport::Sealed(Box::new(key))
-    }
-    #[cfg(not(feature = "sealed"))]
-    {
-        let _ = key;
-        aterm_link::transport::Transport::Tcp
-    }
 }
 
 /// The binary every world runs: this package's own `aterm`, which cargo builds,
@@ -1128,6 +1101,48 @@ impl World {
         inbox_rows(&self.verb(&format!("@{sid} inbox --peek")))
     }
 
+    /// `@{from} post to=@{to} kind={kind} {flags} --wait=60000 {text}`, answered with its
+    /// header and the offset it LANDED at, however slowly a loaded machine's bridge
+    /// publishes it.
+    ///
+    /// A `--wait` post ends `ERR fabric stale id=<n> queued=1` once the bridge has owed an
+    /// answer for three link refreshes (6 s, the wedged-helper horizon `STALE_AFTER`), and
+    /// a live bridge at load 30 has taken that long. The post is still queued then, and the
+    /// bridge publishes it when it gets to it, so this waits (a hang detector, not a
+    /// budget) for the record on `to`'s lane and reads its offset there. Any other refusal
+    /// fails here with the header and the log.
+    pub fn post_landed(
+        &self,
+        from: &str,
+        to: &str,
+        kind: &str,
+        flags: &str,
+        text: &str,
+    ) -> (String, u64) {
+        let reply = self.verb(&format!(
+            "@{from} post to=@{to} kind={kind} {flags} --wait=60000 {text}"
+        ));
+        let header = reply.header().to_string();
+        if reply.ok() {
+            let off = off_of(&header);
+            return (header, off);
+        }
+        assert!(
+            header.starts_with("ERR fabric stale ") && header.contains(" queued=1"),
+            "@{from}'s post to @{to}: {header} — log:\n{}",
+            self.log_tail()
+        );
+        let lane = format!("/f/{FLEET}/in/{}/{to}/{}/{kind}", self.node, self.node);
+        let needle = format!("text={}", aterm_link::pct::encode(text));
+        let off = until("a post its slow bridge left queued to land", || {
+            let (rows, _) = self.read(|c| c.fetch(0, &lane, 256)).ok()?;
+            rows.into_iter()
+                .find(|(_, _, body)| String::from_utf8_lossy(body).contains(&needle))
+                .map(|(off, _, _)| off)
+        });
+        (header, off)
+    }
+
     /// The bridge child's pid, from its state dir.
     pub fn bridge_pid(&self) -> i32 {
         until("the bridge to write its pid", || {
@@ -1183,7 +1198,7 @@ fn read_cap() -> astream_cap::Capability {
 /// HMAC attach the broker verifies, a broker thread and (under the god cap) a
 /// warning line — up to six thousand of them for one wait the machine was
 /// merely slow to satisfy, competing with the bridge for the broker the wait
-/// was about (`two_nodes_sealed.rs` measured the sealed case timing out).
+/// was about (the two-node fleet measured its waits timing out on it).
 ///
 /// WHY IT HEALS. A broker restart force-closes the connection
 /// (`BrokerHandle::shutdown`), so a REUSED connection that fails is dropped
@@ -1615,29 +1630,54 @@ fn scratch_home(tmp: &std::path::Path) -> std::path::PathBuf {
     home
 }
 
+/// `cmd`, a one-shot `aterm link …` of the world at `tmp`, given that world's
+/// per-user folders ([`scratch_home`], and its `run` and `cfg`) and none of this
+/// process's `ATERM_*`: a CLI child reads `aterm.toml` and the state dir's
+/// `fabric.toml` as an instance does, and on the inherited `$HOME` those are the
+/// person's (2026-10-18: `link ls --fleet` and an observer's `link serve --fleet`
+/// read them).
+pub fn scratch_cli<'a>(cmd: &'a mut Command, tmp: &Path) -> &'a mut Command {
+    prepare_gui_environment(cmd);
+    cmd.envs(scratch_cli_env(tmp))
+}
+
+/// [`scratch_cli`] for a child built with `aterm_uds::spawnfd::command`.
+pub fn scratch_spawnfd<'a>(
+    cmd: &'a mut aterm_uds::spawnfd::Command,
+    tmp: &Path,
+) -> &'a mut aterm_uds::spawnfd::Command {
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("ATERM_") {
+            cmd.env_remove(&name);
+        }
+    }
+    cmd.envs(scratch_cli_env(tmp))
+}
+
+/// [`scratch_cli`]'s folders.
+fn scratch_cli_env(tmp: &Path) -> [(&'static str, PathBuf); 3] {
+    [
+        ("HOME", scratch_home(tmp)),
+        ("XDG_RUNTIME_DIR", tmp.join("run")),
+        ("XDG_CONFIG_HOME", tmp.join("cfg")),
+    ]
+}
+
 // ---------------------------------------------------------------------------
-// A5 — a FLEET: one broker on the sealed wire, and two or more nodes on it
+// A5 — a FLEET: one broker, and two or more nodes on it
 // ---------------------------------------------------------------------------
 
-/// One broker served over `--tcp --key-file`: astream's XChaCha20-Poly1305
-/// sealed record layer under a pre-shared key (§8.6).
-///
-/// LOOPBACK IS NOT A WEAKENING OF THE CLAIM. The sealed transport is a property
-/// of the connection, not of the route: the same two 36-byte hellos, the same
-/// per-connection AAD binding direction and record sequence, and the same
-/// key-confirming record each way run whether the two ends are on one host or
-/// two. What loopback buys is a test that needs no second machine; what it does
-/// NOT test is a network that reorders, drops or delays — that is the
-/// transport's own problem and astream's own tests.
+/// One guarded broker served on a Unix socket in the fleet's scratch dir, and
+/// the nodes the tests boot against it: what needs two NODES, which one
+/// [`World`] cannot be. Each node is its own headless aterm with its own
+/// bridge child, as two aterms on one machine are; the bus is one machine's.
 pub struct Fleet {
     pub tmp: PathBuf,
     broker: Option<Broker>,
     handle: Option<BrokerHandle>,
-    /// `127.0.0.1:<port>` — the port is ephemeral, so parallel runs never clash.
-    pub addr: String,
-    /// The 64-hex key file every node and `ls` is pointed at.
-    pub key_file: PathBuf,
-    key: [u8; 32],
+    /// The broker's socket, `<tmp>/b.sock`: `tmp` is per test and process, so
+    /// parallel runs never clash.
+    pub sock: String,
     next: u32,
     /// The read connection every polled broker read shares ([`Fleet::read`]).
     watch: std::sync::Mutex<Option<aterm_link::transport::Conn>>,
@@ -1672,78 +1712,44 @@ impl Fleet {
             .tempdir_in("/tmp")
             .expect("exclusive fleet scratch");
         let tmp = scratch.path().to_path_buf();
-        // A FIXED KEY, not a random one: the test is about the wire being
-        // sealed, and a key nobody can print is a test nobody can debug. It is
-        // written in the same 64-hex shape `asb --key-file` reads, because one
-        // key file has to feed the broker and every bridge on the fleet.
-        let key = [0x5au8; 32];
-        let key_file = tmp.join("fleet.key");
-        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
-        std::fs::write(&key_file, format!("{hex}\n")).expect("write the key file");
-
         let broker = Broker::open_guarded(
             tmp.join("b.log").to_string_lossy().as_ref(),
             SECRET.to_vec(),
         )
         .expect("guarded broker");
-        // THE WIRE, and the one place the cipher tree is optional. `sealed`
-        // serves astream's XChaCha20-Poly1305 record layer, which is what
-        // `two_nodes_sealed` asserts and the only rung that needs it. Without
-        // the feature this fixture is still a real two-node TCP fleet — every
-        // other test here uses it as "a broker on a socket" and asserts nothing
-        // about confidentiality — so they keep running in a default build,
-        // which is what lets a shipped binary carry no cipher at all.
-        #[cfg(feature = "sealed")]
-        let handle = broker
-            .serve_tcp_sealed("127.0.0.1:0", key)
-            .expect("serve the sealed wire");
-        #[cfg(not(feature = "sealed"))]
-        let handle = broker
-            .serve_tcp("127.0.0.1:0")
-            .expect("serve the plaintext loopback wire");
-        let addr = handle
-            .tcp_addr()
-            .expect("a TCP endpoint answers its bound address")
-            .to_string();
+        let sock = tmp.join("b.sock").to_string_lossy().into_owned();
+        assert!(
+            sock.len() < MAX_SOCK_PATH,
+            "socket path too long for sun_path: {sock}"
+        );
+        let handle = broker.serve(&sock).expect("serve the broker's socket");
         Self {
             tmp,
             broker: Some(broker),
             handle: Some(handle),
-            addr,
-            key_file,
-            key,
+            sock,
             next: 0,
             watch: std::sync::Mutex::new(None),
             scratch: Some(scratch),
         }
     }
 
-    /// The fleet's pre-shared key, for a test that opens its own connection.
-    #[must_use]
-    pub fn key(&self) -> [u8; 32] {
-        self.key
-    }
-
-    /// A god-cap client ON THE SEALED WIRE — the same transport the nodes use,
-    /// so a test that could reach the broker at all is a test whose handshake
-    /// succeeded.
+    /// A god-cap client on the socket the nodes use.
     pub fn god(&self) -> aterm_link::transport::Conn {
         let (mut c, _closer) =
-            aterm_link::transport::connect(&fleet_transport(self.key), &self.addr, DEADLINE)
-                .expect("connect to the broker");
+            aterm_link::transport::connect(&self.sock, DEADLINE).expect("connect to the broker");
         let cap = astream_cap::mint(SECRET, &format!("/f/{FLEET}/>")).expect("mint the god cap");
         c.attach(&cap.filter, &cap.tag).expect("attach the god cap");
         c
     }
 
-    /// [`World::read`] on the sealed wire: one broker READ on this fleet's
-    /// shared read connection, where a fresh one per poll is a TCP connect AND a
-    /// sealed handshake as well as the attach ([`read_on`]).
+    /// [`World::read`] on the fleet's broker: one broker READ on this fleet's
+    /// shared read connection, where a fresh one per poll is a connect as well
+    /// as the attach ([`read_on`]).
     ///
     /// # Errors
     ///
-    /// The connect, the handshake, the attach, or `f` on a connection opened
-    /// for it.
+    /// The connect, the attach, or `f` on a connection opened for it.
     pub fn read<T>(
         &self,
         f: impl FnMut(&mut aterm_link::transport::Conn) -> std::io::Result<T>,
@@ -1751,11 +1757,7 @@ impl Fleet {
         read_on(
             &self.watch,
             || {
-                let (mut c, _closer) = aterm_link::transport::connect(
-                    &fleet_transport(self.key),
-                    &self.addr,
-                    DEADLINE,
-                )?;
+                let (mut c, _closer) = aterm_link::transport::connect(&self.sock, DEADLINE)?;
                 let cap = read_cap();
                 c.attach(&cap.filter, &cap.tag)?;
                 Ok(c)
@@ -1780,7 +1782,7 @@ impl Fleet {
     }
 
     /// Boot one node: a headless `aterm` that launches its own real
-    /// `aterm link serve` child, both pointed at this fleet's sealed broker.
+    /// `aterm link serve` child, both pointed at this fleet's broker.
     pub fn node(&mut self, tag: &str, accept_from: &[&str]) -> Node {
         self.node_with(tag, accept_from, &[], &[])
     }
@@ -1805,14 +1807,15 @@ impl Fleet {
 
     /// Run `aterm link ls` against this fleet and answer its stdout.
     ///
-    /// THE REAL BINARY, over the real sealed transport, with a read-only cap —
+    /// THE REAL BINARY, on the fleet's broker, with a read-only cap —
     /// which is the whole point of the verb: one `Last` round trip and no
-    /// filesystem scan, so it works from a host that hosts nothing (§7).
+    /// filesystem scan, so a process that hosts nothing lists every node's
+    /// sessions (§7).
     pub fn ls(&self) -> String {
         let cap = self.cap_file("ls", &[format!("ro:/f/{FLEET}/pub/>")]);
         let mut cmd = Command::new(aterm_to_launch());
-        cmd.args(["link", "ls", "--fleet", FLEET, "--broker", &self.addr])
-            .args(fleet_child_flags(&self.key_file))
+        scratch_cli(&mut cmd, &self.tmp)
+            .args(["link", "ls", "--fleet", FLEET, "--broker", &self.sock])
             .args(["--cap-file", cap.to_string_lossy().as_ref()]);
         let out = output_within(&mut cmd, "aterm link ls");
         assert!(
@@ -1893,10 +1896,9 @@ impl Node {
         std::fs::write(&cap_file, caps).expect("write the node cap file");
 
         let mut fabric_cmd = format!(
-            "{} link serve --fleet {FLEET} --broker {} {} --cap-file {} --state {}",
+            "{} link serve --fleet {FLEET} --broker {} --cap-file {} --state {}",
             aterm_to_launch(),
-            fleet.addr,
-            fleet_child_flags(&fleet.key_file).join(" "),
+            fleet.sock,
             cap_file.display(),
             state.display()
         );
@@ -2019,5 +2021,45 @@ impl Node {
     /// The tail of this node's aterm log, for a failure message.
     pub fn log_tail(&self) -> String {
         log_tail_of(&self.gui_log)
+    }
+
+    /// The bridge child's pid, from its state dir.
+    pub fn bridge_pid(&self) -> i32 {
+        until("the bridge to write its pid", || {
+            std::fs::read_to_string(self.state.join("pid"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        })
+    }
+
+    /// QUIT this node's aterm the way a person does — `invoke Quit`, which a
+    /// headless instance takes without a confirm and ends through the same
+    /// teardown as Cmd-Q — and wait for the process to end, then for its
+    /// bridge to follow it: once the bridge is gone nothing more is published
+    /// under this node but its will.
+    ///
+    /// The verb's reply is not read: the instance may close the connection as
+    /// it quits, and the process ending is the observable that counts.
+    ///
+    /// The exited bridge's `state/pid` is removed once it is gone: [`Drop`]
+    /// SIGKILLs the pid that file names, and by the end of the test the
+    /// number may belong to another process of this user.
+    pub fn quit(&mut self) {
+        let bridge = self.bridge_pid();
+        let _ = self.ctl().request("invoke Quit");
+        assert!(self.gui.is_some(), "this node's aterm is running");
+        // Waited on in place: a quit that never lands panics with the child
+        // still in `self.gui`, so [`Drop`] kills it rather than leaving it
+        // running (and on the broker) for the rest of the test binary.
+        until("aterm to quit", || {
+            self.gui.as_mut()?.try_wait().ok().flatten()
+        });
+        self.gui = None;
+        until("its bridge to exit after it", || {
+            (!alive(bridge)).then_some(())
+        });
+        let _ = std::fs::remove_file(self.state.join("pid"));
     }
 }

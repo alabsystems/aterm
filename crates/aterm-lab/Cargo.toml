@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-lab"
+version.workspace = true
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "The real-Claude lab: the real Claude Code TUI (and Codex, Gemini CLI, agy, Muse Code) in a private, jailed headless aterm against a local stub of the API; and private aterm instances for checking a change (instance, presence-flap, codex-alab-proof, fleet-sim)"
+
+# Dev-only: never packed or shipped (the workspace's atpkg expose/bundle lists
+# name `aterm` alone). Run it as `targo --unverified lab <verb>` (the
+# `.cargo/config.toml` alias for `run -q -p aterm-lab --`).
+[[bin]]
+name = "aterm-lab"
+path = "src/main.rs"
+
+[dependencies]
+# The in-process control connection (`RelayClient`): the frame stream
+# (`subscribe`) and `await match` waits ride one authenticated socket instead of
+# a client process per read. And the shipped price table and its loader
+# (`harness::spend`), which `prices` sets against a build's own catalog.
+aterm-agent = { workspace = true }
+# The one spawn seam (`spawnfd::command`: posix_spawn, `setsid` as a spawn
+# attribute) and the lifeline a throwaway instance watches.
+aterm-uds = { workspace = true }
+# The PTY pair the relay puts between aterm's tab and Claude Code.
+aterm-pty = { workspace = true }
+# Claude Code's screen text (`aterm_phase::anchors`): the card, the banner, the
+# mode rows and the busy hint the lab waits on and judges by, never copied here.
+aterm-phase = { workspace = true }
+# The workspace's JSON parser: request bodies, settings, tool scripts, records.
+aterm-json = { workspace = true }
+# The workspace's TOML parser: a `harness` value is written as typed only when
+# it is a TOML value, so the scratch `aterm.toml` stays one aterm can read.
+aterm-toml = { workspace = true }
+# The workspace's HTTP/1.1 client: the stub's control calls and its self-test,
+# so the stub's framing (chunked SSE) is read by an independent parser.
+aterm-http = { workspace = true }
+# The regex of `catch` (the workspace's own engine; `await match` waits use the server's).
+aterm-regex = { workspace = true }
+# The Linux baseline's frames (`linux_baseline`), decoded to read the drop
+# highlight.
+aterm-png = { workspace = true }
+# `fleet-sim` dials a member's fleet port as a reader does (the mutual proof,
+# the key file) and speaks the wire for the reflected-tag conformance probe.
+aterm-net = { workspace = true }
+# The survey text's `tty::one_line` escaping judged, and the fixture's
+# transcript written with the one JSON escape.
+aterm-codec = { workspace = true }
+rustls = { workspace = true }
+# `fleet-sim`'s raw wrong-secret dialer: the documented proof (HKDF and
+# HMAC-SHA256 over the channel exporter) computed apart from aterm-net's.
+aterm-digest = { workspace = true }
+# `fleet-sim` holds a fleet read to the client's own deadline and budget
+# (`FLEET_WITHIN`, `DEFAULT_BUDGET`). Not a new edge in the build graph:
+# aterm-agent above already depends on it.
+aterm-ctl = { path = "../aterm-ctl" }
+# Signals, terminal modes, ioctls and the Mach bootstrap probe (`sys`).
+libc = { workspace = true }
+# The disk lane's fixtures finish their writes before it reads free space.
+aterm-durable = { workspace = true }
+# The node ring a bridge attaches with (`enable::node_grants`), THE ring
+# `aterm fabric on` mints: `codex-alab-proof` stands its own bus up for the
+# mail step, and a grant the bridge needs cannot be added there and forgotten
+# here.
+aterm-link = { path = "../aterm-link" }
+
+[dev-dependencies]
+# Private, exclusively created directories for counterfeit API fixtures.
+aterm-tempfile = { workspace = true }
+
+[lints]
+workspace = true

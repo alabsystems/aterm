@@ -57,8 +57,13 @@ pub struct StartFlags {
 pub struct StartMark {
     /// Cold or spare.
     pub kind: StartKind,
-    /// The final `${ZDOTDIR:-$HOME}` (zsh) or `$HOME` (bash), unescaped.
+    /// The final `${ZDOTDIR:-$HOME}` (zsh), `$HOME` (bash) or
+    /// `$__fish_config_dir` (fish), unescaped.
     pub rc_dir: Option<String>,
+    /// fish's other startup roots, unescaped: its sysconf folder, then each
+    /// vendor conf.d folder its conf.d loop walks. `None` where the record
+    /// named none (zsh, bash, or a fish that could not see them).
+    pub roots: Option<Vec<String>>,
     /// The flags, when they parsed.
     pub flags: Option<StartFlags>,
 }
@@ -96,8 +101,9 @@ impl StartFlags {
 /// What one OSC 7 does to the reported cwd: the app-event it queues for
 /// poll-based hosts (`//host/path`, or the bare path for a local host; none
 /// for a clear) and the local path it stores (none: clear it). Applied at once,
-/// or held while the authenticated shell sits at its prompt
-/// (`ShellIntegrationState::held_cwd`).
+/// or held while an authenticated shell that does not sign its own sits at its
+/// prompt (`ShellIntegrationState::held_cwd`); also the cwd a foreground job's
+/// report replaced (`ShellIntegrationState::cwd_before_job`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CwdReport {
     /// The app-event payload, or `None` for a clear (which queues none).
@@ -112,6 +118,33 @@ pub(super) struct CwdReport {
     pub(super) host: Option<String>,
 }
 
+impl CwdReport {
+    /// The report that stores `path` (none: clears it) with the `host` that
+    /// qualifies it (`None` for a local one), and queues the event an OSC 7
+    /// naming them queues; `None` when the engine would not store it
+    /// (`handler_osc::reported_cwd_is_storable`). What a checkpoint carries
+    /// and a job's end restores, rebuilt as OSC 7 would build it.
+    pub(super) fn of(path: Option<&str>, host: Option<&str>) -> Option<Self> {
+        let Some(path) = path else {
+            return Some(Self {
+                event: None,
+                path: None,
+                host: None,
+            });
+        };
+        let host = host.filter(|h| !h.is_empty() && !h.eq_ignore_ascii_case("localhost"));
+        let event = match host {
+            Some(h) => format!("//{h}{path}"),
+            None => path.to_owned(),
+        };
+        super::handler_osc::reported_cwd_is_storable(&event).then(|| Self {
+            event: Some(event),
+            path: Some(path.to_owned()),
+            host: host.map(str::to_owned),
+        })
+    }
+}
+
 /// The warm spare's marks as the engine holds them until the host takes them:
 /// the parked hold's one-shot, and the START record being assembled (its rc and
 /// flags arrive first; `AtermStart` completes it). Only the first record is
@@ -122,6 +155,8 @@ pub(super) struct SpareMarks {
     pub(super) parked: bool,
     /// The record's rc folder, before its `AtermStart`.
     pub(super) pending_rc: Option<String>,
+    /// The record's other startup roots, before its `AtermStart`.
+    pub(super) pending_roots: Option<Vec<String>>,
     /// The record's flags, before its `AtermStart`.
     pub(super) pending_flags: Option<StartFlags>,
     /// The completed record, until the host takes it.

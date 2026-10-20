@@ -105,11 +105,14 @@ fn record() -> SessionRecord {
         attention_owners: Vec::new(),
         viewport_from_bottom: None,
         render_debt: None,
+        render_debt_cut: 0,
         fabric: Default::default(),
         timeline_id: 0,
         log_ids: None,
         log_seq: 0,
         journal_key: None,
+        task: None,
+        status_seen: None,
     }
 }
 
@@ -215,8 +218,10 @@ impl Real {
                     held: Vec::new(),
                     roster_seq: None,
                     fabric_attached: Vec::new(),
+                    fleet_told: Vec::new(),
                     mirror_dropped: Vec::new(),
                     mirror_served: false,
+                    machine_names: Vec::new(),
                 };
                 stamp_manifest(
                     &mut manifest,
@@ -350,40 +355,6 @@ fn divergence(model: &Model, path: &[&'static str]) -> Vec<String> {
 
 /// Tier-1: every path of the committed machine, on the real code.
 #[test]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "NativeUpdateHistoryCarry",
-    action = "Output",
-    reason = "The environment: program output reaching the outgoing grid between the export \
-              and the park. Tier-1 drives it as real `Terminal::process` bytes; the carry's \
-              own seams (`join`, the export, the import) are what it is checked against."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "NativeUpdateHistoryCarry",
-    action = "Rewrap",
-    reason = "The environment: a width reflow (or a clear or reset) moving the history under \
-              the export's fence. Tier-1 drives a real `Terminal::resize`; the join's fence \
-              check is what refuses it."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "NativeUpdateHistoryCarry",
-    action = "Corrupt",
-    reason = "The environment: a sidecar that reaches the successor with other bytes than its \
-              stamp. Tier-1 flips a byte of the real named file; the import's length and sha \
-              check is what refuses it."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "NativeUpdateHistoryCarry",
-    action = "Clear",
-    reason = "The environment: the adopted shell clearing its scrollback (ED3, a reset) after \
-              Commit, before the import lands. Tier-1 feeds a real `ESC [3J` to the adopted \
-              engine; the import's claim check is what refuses to put the history back."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "NativeUpdateHistoryCarry",
-    action = "Settled",
-    reason = "Stutter: the settled session stays settled (the machine's deadlock guard); no \
-              shipping code runs for it."
-)]
 fn the_real_history_carry_is_the_derived_machine() {
     let model = aterm_models_update::native_update_history_carry_model();
     // Nine interleavings of up to two lines and a rewrap; the two that name a

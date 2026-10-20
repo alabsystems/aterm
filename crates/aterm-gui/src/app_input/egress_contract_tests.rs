@@ -223,10 +223,10 @@ fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
     );
     assert_eq!(
         outcome,
-        InputOutcome::WriteFailed,
-        "a refused key is never reported delivered"
+        InputOutcome::QueueFull,
+        "a refused key is never reported delivered: busy, nothing written"
     );
-    assert_eq!(second, InputOutcome::WriteFailed);
+    assert_eq!(second, InputOutcome::QueueFull);
     assert!(
         crate::metrics::input_refused() >= refused_before + 2,
         "each refusal is counted"
@@ -460,8 +460,9 @@ fn the_conpty_route_sends_every_key_through_the_ordered_writer() {
     assert!(!inline);
     assert!(receipt.input_queue_full(), "a full queue refuses the key");
     assert_eq!(
-        crate::app_input::egress_to_outcome(receipt.egress),
-        InputOutcome::WriteFailed
+        crate::app_input::receipt_outcome(receipt),
+        InputOutcome::QueueFull,
+        "refused with nothing written: the same answer the background lane gives"
     );
     drop(hold);
     drop(mirror);
@@ -659,8 +660,9 @@ fn the_conpty_route_sends_every_report_through_the_ordered_writer() {
     );
     assert!(!receipt.is_queued());
     assert_eq!(
-        crate::app_input::egress_to_outcome(receipt.egress),
-        InputOutcome::WriteFailed
+        crate::app_input::receipt_outcome(receipt),
+        InputOutcome::QueueFull,
+        "refused with nothing written: the same answer the background lane gives"
     );
     drop(hold);
     drop(mirror);

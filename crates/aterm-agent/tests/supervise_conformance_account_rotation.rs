@@ -878,6 +878,7 @@ fn turn_end(worked: Option<Duration>) -> TurnEndReading {
         login_back: false,
         auto_continue: None,
         since_limit: None,
+        background: false,
         served_in_transcript: false,
         notice_elsewhere: false,
         reset_clock: None,
@@ -889,7 +890,16 @@ fn turn_end(worked: Option<Duration>) -> TurnEndReading {
         login_label: None,
         login_superseded: false,
         login_notice: None,
+        login_screen: None,
+        login_interrupted: false,
+        login_method: None,
+        login_shared: None,
         wall_remembered: false,
+        answered: None,
+        worked_doubt: Duration::ZERO,
+        record_turn: None,
+        credits: None,
+        repo: None,
     }
 }
 

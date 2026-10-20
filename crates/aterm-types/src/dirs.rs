@@ -121,7 +121,7 @@ fn home_from_passwd(contents: &[u8], uid: u32) -> Option<PathBuf> {
 #[must_use]
 pub fn aterm_config_path() -> Option<PathBuf> {
     resolve_aterm_config_path(
-        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        config_home().as_deref(),
         std::env::var_os("APPDATA").as_deref(),
         std::env::var_os("HOME").as_deref(),
     )
@@ -162,10 +162,50 @@ pub fn resolve_aterm_config_path(
 #[must_use]
 pub fn aterm_config_dir() -> Option<PathBuf> {
     resolve_aterm_config_dir(
-        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        config_home().as_deref(),
         std::env::var_os("APPDATA").as_deref(),
         std::env::var_os("HOME").as_deref(),
     )
+}
+
+/// `$XDG_CONFIG_HOME` when set and non-empty; else, in a Cargo test binary
+/// ([`test_root`]), `<its root>/config`, so a test that names no config folder
+/// never reads the person's `aterm.toml` or themes; else `None`. The first rung
+/// of every reader of `aterm.toml`'s path.
+#[must_use]
+pub fn config_home() -> Option<std::ffi::OsString> {
+    match std::env::var_os("XDG_CONFIG_HOME").filter(|x| !x.is_empty()) {
+        Some(set) => Some(set),
+        None => test_root().map(|root| root.join("config").into_os_string()),
+    }
+}
+
+/// A Cargo test binary's own per-user root ([`aterm_uds::test_binary`]), under
+/// which this module's aterm folders answer in a test that names none of its
+/// own (`$ATERM_STATE_HOME`, `$XDG_CONFIG_HOME`): on 2026-10-18 the aterm-gui
+/// unit tests made directories in the person's state and log folders and read
+/// their `aterm.toml`, themes and machine list. `None` in every other process,
+/// a shipped one included, and on wasm.
+#[must_use]
+pub fn test_root() -> Option<&'static std::path::Path> {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        aterm_uds::test_binary::scratch_root()
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        None
+    }
+}
+
+/// The state root an instance was given in place of the per-user one: the
+/// development seam `$ATERM_STATE_HOME` ([`crate::dev_seam!`]), else a test
+/// binary's `<root>/state` ([`test_root`]).
+fn state_override() -> Option<PathBuf> {
+    match crate::dev_seam!("ATERM_STATE_HOME") {
+        Some(root) => Some(PathBuf::from(root)),
+        None => test_root().map(|root| root.join("state")),
+    }
 }
 
 /// The rule behind [`aterm_config_dir`] and [`resolve_aterm_config_path`]
@@ -197,10 +237,14 @@ pub fn resolve_aterm_config_dir(
 /// - **Linux**: `$XDG_DATA_HOME` (absolute) or `$HOME/.local/share`
 /// - **Windows**: `%LOCALAPPDATA%`
 ///
-/// [`resolve_data_dir`] is the rule; this reads the variables it consults.
+/// [`resolve_data_dir`] is the rule; this reads the variables it consults. In a
+/// Cargo test binary, `<its root>/data` ([`test_root`]).
 #[must_use]
 pub fn data_dir() -> Option<PathBuf> {
-    resolve_data_dir(data_platform())
+    match test_root() {
+        Some(root) => Some(root.join("data")),
+        None => resolve_data_dir(data_platform()),
+    }
 }
 
 /// The platform inputs [`resolve_data_dir`] and [`resolve_aterm_data_dir`] read,
@@ -262,16 +306,14 @@ pub fn resolve_data_dir(platform: DataPlatform) -> Option<PathBuf> {
 ///   refused as `None`, as [`state_dir`] refuses it) — so an instance given its own
 ///   state root never takes the owner's `session.toml` or claims the owner's crash
 ///   journals (ruling 406);
+/// - else, in a Cargo test binary, its `<root>/state` ([`test_root`]);
 /// - otherwise [`data_dir`]`/aterm` (on Linux `$XDG_DATA_HOME`/`.local/share`,
 ///   NOT [`state_dir`]'s `.local/state`: a shipped path does not move).
 ///
 /// `None` only when nothing resolves (a relative override, or no data dir).
 #[must_use]
 pub fn aterm_data_dir() -> Option<PathBuf> {
-    resolve_aterm_data_dir(
-        crate::dev_seam!("ATERM_STATE_HOME").map(PathBuf::from),
-        data_platform(),
-    )
+    resolve_aterm_data_dir(state_override(), data_platform())
 }
 
 /// The pure half of [`aterm_data_dir`]: `override_root` is `$ATERM_STATE_HOME`.
@@ -289,7 +331,8 @@ pub fn resolve_aterm_data_dir(
 
 /// Whether this process runs under a PRIVATE state root: a development build's
 /// `ATERM_STATE_HOME` seam is set ([`crate::dev_seam!`], so a shipped binary answers
-/// `false` whatever its environment holds). A relative or empty value counts: it
+/// `false` whatever its environment holds), or it is a Cargo test binary
+/// ([`test_root`]), whose state is its own wherever it named none. A relative or empty value counts: it
 /// resolves no root ([`aterm_data_dir`], [`state_dir`]), but the process asked for one
 /// of its own, so it never stands in for the person whose `$HOME` it shares.
 ///
@@ -302,18 +345,19 @@ pub fn resolve_aterm_data_dir(
 /// pkg machine apply` typed by a person still applies.
 #[must_use]
 pub fn runs_under_private_state_root() -> bool {
-    crate::dev_seam!("ATERM_STATE_HOME").is_some()
+    crate::dev_seam!("ATERM_STATE_HOME").is_some() || test_root().is_some()
 }
 
 /// aterm's own STATE root — where it keeps what it owns across launches (the
-/// harness state, the document journal, the session identities). ONE rule, so
-/// every state reader agrees on the directory:
+/// harness state, the document journal, the session identities, the workers'
+/// tasks). ONE rule, so every state reader agrees on the directory:
 ///
 /// - in a development build only, the `ATERM_STATE_HOME` seam
 ///   ([`crate::dev_seam!`], absolute; a relative value is refused as `None`,
 ///   never joined onto an arbitrary cwd) — what a test keeps its state in a temp
 ///   root with. A shipped binary reads no such variable: a scratch `$HOME` (or
 ///   `$XDG_STATE_HOME` off macOS) is how a release launch is isolated;
+/// - else, in a Cargo test binary, its `<root>/state` ([`test_root`]);
 /// - **macOS**: `$HOME/Library/Application Support/aterm`;
 /// - **Linux/other Unix**: `$XDG_STATE_HOME/aterm` (absolute) or
 ///   `$HOME/.local/state/aterm`;
@@ -323,7 +367,7 @@ pub fn runs_under_private_state_root() -> bool {
 #[must_use]
 pub fn state_dir() -> Option<PathBuf> {
     resolve_state_dir(
-        crate::dev_seam!("ATERM_STATE_HOME").map(PathBuf::from),
+        state_override(),
         StatePlatform {
             home: home_dir(),
             xdg_state_home: std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
@@ -351,8 +395,8 @@ pub fn resolve_state_dir(
     platform: StatePlatform,
 ) -> Option<PathBuf> {
     if let Some(root) = override_root {
-        // Relative is refused, not resolved: the operator crate errors on it,
-        // and a state root that depends on the cwd is no root at all.
+        // Relative is refused, not resolved: a state root that depends on the
+        // cwd is no root at all.
         return root.is_absolute().then_some(root);
     }
     #[cfg(target_os = "macos")]
@@ -393,6 +437,7 @@ pub fn resolve_state_dir(
 ///   ([`crate::dev_seam!`], as [`state_dir`] reads it; a relative value is refused as
 ///   `None`, as [`state_dir`] refuses it) — an instance given its own state root keeps
 ///   its log there too, never in the person's log beside their real instance's;
+/// - else, in a Cargo test binary, its `<root>/state/logs` ([`test_root`]);
 /// - **macOS**: `$HOME/Library/Logs/aterm` (Console.app's convention);
 /// - **Linux/other Unix**: `$XDG_STATE_HOME/aterm/logs` (absolute) or
 ///   `$HOME/.local/state/aterm/logs` — a Linux home has no business growing a `~/Library`;
@@ -404,7 +449,7 @@ pub fn resolve_state_dir(
 #[must_use]
 pub fn logs_dir() -> Option<PathBuf> {
     resolve_logs_dir(
-        crate::dev_seam!("ATERM_STATE_HOME").map(PathBuf::from),
+        state_override(),
         StatePlatform {
             home: home_dir(),
             xdg_state_home: std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
@@ -525,11 +570,12 @@ mod tests {
             None,
             "nothing to resolve from is None, not a panic"
         );
-        // The live resolver IS the rule over the live environment.
+        // The live resolver IS the rule over the live environment, a test
+        // binary's root standing in for an unset XDG_CONFIG_HOME.
         assert_eq!(
             aterm_config_path(),
             resolve_aterm_config_path(
-                std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+                config_home().as_deref(),
                 std::env::var_os("APPDATA").as_deref(),
                 std::env::var_os("HOME").as_deref(),
             )
@@ -602,10 +648,11 @@ mod tests {
             "a set XDG_CONFIG_HOME wins everywhere"
         );
 
-        // The live resolvers ARE the rule over the live environment, and the
-        // live themes folder is the live config dir's `themes`.
+        // The live resolvers ARE the rule over the live environment (a test
+        // binary's root standing in for an unset XDG_CONFIG_HOME), and the live
+        // themes folder is the live config dir's `themes`.
         let live = resolve_aterm_config_dir(
-            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+            config_home().as_deref(),
             std::env::var_os("APPDATA").as_deref(),
             std::env::var_os("HOME").as_deref(),
         );
@@ -796,10 +843,46 @@ mod tests {
             None,
             "nothing to resolve from is None, not a panic"
         );
-        // The live resolvers ARE the rules over the live environment.
-        assert_eq!(data_dir(), resolve_data_dir(data_platform()));
-        if crate::dev_seam!("ATERM_STATE_HOME").is_none() {
-            assert_eq!(aterm_data_dir(), data_dir().map(|data| data.join("aterm")));
+        // The live resolvers are the rules over the live environment, but in a
+        // test binary, which answers under its own root (`test_binary_folders_…`).
+        if test_root().is_none() {
+            assert_eq!(data_dir(), resolve_data_dir(data_platform()));
+        }
+    }
+
+    /// In a Cargo test binary every aterm folder this module resolves lies under
+    /// the binary's own root unless the test named one, so no test reads or writes
+    /// the person's state, logs or config. Negative control: the same rules over
+    /// the live environment without the root name the person's folders.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn test_binary_folders_lie_under_its_own_root() {
+        let root = test_root().expect("this test binary's root");
+        let state = crate::dev_seam!("ATERM_STATE_HOME").map(PathBuf::from);
+        let want_state = state.clone().unwrap_or_else(|| root.join("state"));
+        assert_eq!(state_dir(), Some(want_state.clone()));
+        assert_eq!(aterm_data_dir(), Some(want_state.clone()));
+        assert_eq!(logs_dir(), Some(want_state.join("logs")));
+        assert_eq!(identities_dir(), Some(want_state.join("identities")));
+        assert_eq!(data_dir(), Some(root.join("data")));
+        assert!(runs_under_private_state_root());
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|x| !x.is_empty())
+            .map_or_else(|| root.join("config"), PathBuf::from);
+        assert_eq!(aterm_config_dir(), Some(config.join("aterm")));
+        assert_eq!(aterm_config_path(), Some(config.join("aterm/aterm.toml")));
+
+        let person = resolve_state_dir(
+            None,
+            StatePlatform {
+                home: home_dir(),
+                xdg_state_home: std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+                local_app_data: std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+            },
+        );
+        if let Some(person) = person {
+            assert!(!person.starts_with(root), "{person:?}");
+            assert_ne!(state_dir(), Some(person));
         }
     }
 

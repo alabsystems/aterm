@@ -405,6 +405,16 @@ fn quarantine_mid_history_keeps_rows_and_counts_the_loss() {
         };
         assert_eq!(line.to_string(), expected, "line {i}");
     }
+
+    // The blank stand-ins retain the row positions above, but their text was
+    // already counted lost. Evicting those rows later only loses the other
+    // retained text, so each original line contributes once.
+    let before = sb.line_count();
+    sb.set_memory_budget(1).expect("the budget shrink enforces");
+    assert_eq!(sb.cold_line_count(), 0, "no cold page fits one byte");
+    let evicted = before - sb.line_count();
+    assert!(evicted > 10, "the budget took blank rows and real text");
+    assert_eq!(sb.pressure_evicted_lines(), evicted as u64);
 }
 
 /// The iterator skips a quarantined warm block's lines without a decompress

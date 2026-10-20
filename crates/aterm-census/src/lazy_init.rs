@@ -687,7 +687,11 @@ fn collect_touches_and_inits(
     }
 
     // --- deref form: any mention of a `LazyLock`/`Lazy` cell. ---
+    let deref = DerefNames::of(cells);
     for (i, code) in masked.iter().enumerate() {
+        if !deref.may_mention(code) {
+            continue;
+        }
         let declares = static_name(code);
         for cell in cells.iter().filter(|c| c.deref_lazy) {
             if !mentions_ident(code, &cell.name) {
@@ -803,6 +807,41 @@ fn receiver_before(joined: &str, at: usize) -> Option<&str> {
         end -= 1;
     }
     crate::ident_ending_at(joined, end)
+}
+
+/// The deref-lazy cells' names, read once per line instead of once per cell
+/// per line (the walk's whole cost when it searched every line for every name).
+struct DerefNames<'a> {
+    /// The names made of `[A-Za-z0-9_]` alone: [`mentions_ident`] finds one in
+    /// a line exactly when one of the line's maximal ident-byte runs is it.
+    words: std::collections::HashSet<&'a str>,
+    /// Any other name, which only [`mentions_ident`] itself can judge.
+    other: Vec<&'a str>,
+}
+
+impl<'a> DerefNames<'a> {
+    fn of(cells: &'a [Cell]) -> Self {
+        let mut names = Self {
+            words: std::collections::HashSet::new(),
+            other: Vec::new(),
+        };
+        for name in cells.iter().filter(|c| c.deref_lazy).map(|c| &*c.name) {
+            if name.bytes().all(is_ident_byte) {
+                names.words.insert(name);
+            } else {
+                names.other.push(name);
+            }
+        }
+        names
+    }
+
+    /// Can `code` mention a deref-lazy cell? `false` only when no cell's
+    /// [`mentions_ident`] would hold, so a line it rejects has no touch.
+    fn may_mention(&self, code: &str) -> bool {
+        code.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|w| self.words.contains(w))
+            || self.other.iter().any(|n| mentions_ident(code, n))
+    }
 }
 
 /// `ident` occurs in `code` as a whole word.

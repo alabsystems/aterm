@@ -30,8 +30,9 @@ pub struct CellAttrs {
     pub fg: u32,
     /// Packed background color (same format as fg).
     pub bg: u32,
-    /// Cell flags (bold, italic, underline, etc.) plus the main-cell WIDE bit.
-    /// Excludes WIDE_CONTINUATION/PROTECTED, the reserved bit 14, and COMPLEX.
+    /// Cell flags (bold, italic, underline, etc.) plus the main-cell WIDE bit,
+    /// and on a cell's first character [`Self::OPENS_CELL`]. Excludes
+    /// WIDE_CONTINUATION/PROTECTED and COMPLEX.
     pub flags: u16,
 }
 
@@ -64,9 +65,18 @@ impl CellAttrs {
     /// Mask for visual flags and write-time width geometry preserved in scrollback.
     /// Includes bits 0-9 (bold through WIDE) plus bits 11-13 (superscript,
     /// subscript, curly_underline). Excludes WIDE_CONTINUATION/PROTECTED (bit
-    /// 10), the reserved bit 14, and COMPLEX (bit 15), which cannot be
+    /// 10), bit 14 (a live cell never sets it; a stored one means
+    /// [`Self::OPENS_CELL`]), and COMPLEX (bit 15), which cannot be
     /// interpreted independently from their live-grid context.
     const VISUAL_FLAGS_MASK: u16 = 0x3BFF; // bits 0-9, 11-13
+
+    /// Stored-line geometry on a character: it opens a cell of its own,
+    /// though a walk of the line's text would fold it into the cell before
+    /// (flag halves or a skin tone and its base the grid drew apart, a cell
+    /// after one ending in a ZWJ). The writer of a line sets it where that walk
+    /// would fold a cell's first character; every walk of a stored line ends a
+    /// unit before it. Bit 14 of the flag word, which no live cell sets.
+    pub const OPENS_CELL: u16 = 1 << 14;
 
     /// Create from raw cell values, filtering to visual flags plus main-cell
     /// write-time width geometry.
@@ -79,12 +89,36 @@ impl CellAttrs {
             flags: flags & Self::VISUAL_FLAGS_MASK,
         }
     }
+
+    /// Whether the character these attributes are stored on opens a cell
+    /// ([`Self::OPENS_CELL`]).
+    #[must_use]
+    #[inline]
+    pub const fn opens_cell(self) -> bool {
+        self.flags & Self::OPENS_CELL != 0
+    }
+
+    /// These attributes with [`Self::OPENS_CELL`] set to `opens`: the rendition
+    /// a cell draws with is the same either way.
+    #[must_use]
+    #[inline]
+    pub const fn with_opens_cell(self, opens: bool) -> Self {
+        let flags = self.flags & !Self::OPENS_CELL;
+        Self {
+            flags: if opens {
+                flags | Self::OPENS_CELL
+            } else {
+                flags
+            },
+            ..self
+        }
+    }
 }
 
-// Strict-gate access idiom for the attrs RLE: all access goes through `attr_runs`
+// Trust-lane access idiom for the attrs RLE: all access goes through `attr_runs`
 // (`map_or(&[], Rle::runs)`, a method passed as a fn item, as `Line::hyperlinks`
 // does with `SmallVec::as_slice`). A direct `rle.runs()` / `rle.get(..)` call is
-// MIR-inlined with the `Vec` internals it wraps, and the strict gate's
+// MIR-inlined with the `Vec` internals it wraps, and the Trust lane's
 // hardened-unsafe check fails closed on std's unsafe blocks there. The fn-item
 // spelling keeps the callee a plain cross-crate call; `runs.len()` is
 // `run_count()`, and a linear walk of `runs` gives `Rle::get`'s value.
@@ -595,7 +629,7 @@ impl Line {
     /// Calculate memory used by this line.
     ///
     /// Saturating throughout: every operand is memory this process holds, so the
-    /// sum always fits; saturation only discharges the strict gate's overflow
+    /// sum always fits; saturation only discharges the Trust lane's overflow
     /// obligations.
     #[must_use]
     pub fn memory_used(&self) -> usize {
@@ -604,7 +638,7 @@ impl Line {
             LineContent::Inline(_) => 0, // Already counted in size_of
             LineContent::Heap(v) => v.capacity(),
         };
-        // Closure-free shapes below, for the strict gate (see `attr_runs`).
+        // Closure-free shapes below, for the Trust lane (see `attr_runs`).
         let attrs_mem = if self.attrs.is_some() {
             // Boxed: the Rle struct and its runs Vec are both on the heap.
             std::mem::size_of::<Rle<CellAttrs>>().saturating_add(

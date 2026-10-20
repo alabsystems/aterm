@@ -24,6 +24,10 @@
 //! (an OFFER's trailing `attempts` and `companions`, and the three companion kinds, 14 to 16). An
 //! older window's strict offer loop refuses any frame but an OFFER, and an older decoder refuses
 //! an unknown kind, so a COMPANION_OFFER sent to one would cost it its whole recovery.
+//!
+//! SYNC (17) grew it the same way: a keeper that answers one says [`CAP_SYNC`] in its WELCOME's
+//! caps, and a window sends SYNC only to such a keeper (an older one would refuse the kind and
+//! drop the connection, with every frame behind it).
 
 use crate::identity::IdentityPolicy;
 
@@ -63,6 +67,10 @@ pub const CAP_LINK: u8 = 0x02;
 /// it is offered (an OFFER's trailing `attempts` and `companions`, then COMPANION_OFFER). A keeper
 /// sends those only to a HELLO that stated it; a window sends its own only to a WELCOME that did.
 pub const CAP_JOURNAL: u8 = 0x04;
+/// WELCOME's trailing caps bit, from a keeper: it answers a SYNC with the same number once it has
+/// read every frame written before it on that connection. A window sends SYNC only to a keeper
+/// that states it.
+pub const CAP_SYNC: u8 = 0x08;
 /// The one companion kind this build knows: a crash-restore journal region (`aterm-restore`).
 pub const COMPANION_JOURNAL: u8 = 1;
 
@@ -104,6 +112,9 @@ pub enum Kind {
     /// W→K: drop this claim's companion and end its poison window (a window with no journal for
     /// the master: its region could not be made, or memory pressure shed it).
     CompanionRelease = 16,
+    /// Either way: W→K a number; K→W the same number, written once the keeper has read every frame
+    /// written before it on the connection (a round trip, to a keeper that states [`CAP_SYNC`]).
+    Sync = 17,
 }
 
 impl Kind {
@@ -127,6 +138,7 @@ impl Kind {
             14 => Kind::Companion,
             15 => Kind::CompanionOffer,
             16 => Kind::CompanionRelease,
+            17 => Kind::Sync,
             _ => return None,
         })
     }
@@ -376,6 +388,11 @@ pub enum Frame {
         rdev: u64,
         kind: u8,
     },
+    /// A round trip: the window's number, which the keeper writes back once it has read every
+    /// frame before it.
+    Sync {
+        seq: u64,
+    },
 }
 
 /// An OFFER's trailing crash-restore fields (the crash-restore plan §5).
@@ -452,6 +469,7 @@ impl Frame {
             Frame::Companion { .. } => Kind::Companion,
             Frame::CompanionOffer { .. } => Kind::CompanionOffer,
             Frame::CompanionRelease { .. } => Kind::CompanionRelease,
+            Frame::Sync { .. } => Kind::Sync,
         }
     }
 
@@ -508,6 +526,7 @@ impl Frame {
                 put_long(&mut body, meta, MAX_META, kind)?;
             }
             Frame::Release { rdev } => body.extend_from_slice(&rdev.to_be_bytes()),
+            Frame::Sync { seq } => body.extend_from_slice(&seq.to_be_bytes()),
             Frame::Pending { pid } => body.extend_from_slice(&pid.to_be_bytes()),
             Frame::Bye | Frame::RestartWhenSafe | Frame::Adopt => {}
             Frame::Offer {
@@ -620,6 +639,7 @@ impl Frame {
                 meta: r.long(MAX_META)?,
             },
             Kind::Release => Frame::Release { rdev: r.u64()? },
+            Kind::Sync => Frame::Sync { seq: r.u64()? },
             Kind::Pending => Frame::Pending { pid: r.u32()? },
             Kind::Bye => Frame::Bye,
             Kind::Offer => Frame::Offer {
@@ -895,6 +915,7 @@ mod tests {
             rdev: 0x0f00_000a,
             kind: COMPANION_JOURNAL,
         });
+        round(Frame::Sync { seq: u64::MAX });
     }
 
     /// Decode `bytes` (a whole frame) as a reader would.
@@ -960,27 +981,30 @@ mod tests {
         assert_eq!(decode_whole(&cut), Err(WireError::Short(Kind::Offer)));
     }
 
-    /// The companion kinds are numbered 14 to 16, never renumbered, and carry a descriptor
-    /// exactly where the plan says (COMPANION and COMPANION_OFFER, not COMPANION_RELEASE); a
-    /// decoder from before them refuses them as unknown kinds, which is why the keeper sends one
-    /// only to a window that stated CAP_JOURNAL.
+    /// The companion kinds are numbered 14 to 16 and SYNC 17, never renumbered, and carry a
+    /// descriptor exactly where the plan says (COMPANION and COMPANION_OFFER, not
+    /// COMPANION_RELEASE or SYNC); a decoder from before them refuses them as unknown kinds, which
+    /// is why the keeper sends a companion only to a window that stated CAP_JOURNAL, and a window
+    /// sends SYNC only to a keeper that stated CAP_SYNC.
     #[test]
     fn the_companion_kinds_are_numbered_and_carry_their_descriptors() {
         for (byte, kind, fd) in [
             (14, Kind::Companion, true),
             (15, Kind::CompanionOffer, true),
             (16, Kind::CompanionRelease, false),
+            (17, Kind::Sync, false),
         ] {
             assert_eq!(Kind::from_byte(byte), Some(kind));
             assert_eq!(kind as u8, byte);
             assert_eq!(kind.carries_fd(), fd, "{kind:?}");
         }
-        assert_eq!(Kind::from_byte(17), None, "the next number is unassigned");
-        assert_eq!(
-            CAP_JOURNAL & (CAP_SENDS_BYE | CAP_LINK),
-            0,
-            "a bit of its own"
-        );
+        assert_eq!(Kind::from_byte(18), None, "the next number is unassigned");
+        for (cap, others) in [
+            (CAP_JOURNAL, CAP_SENDS_BYE | CAP_LINK),
+            (CAP_SYNC, CAP_SENDS_BYE | CAP_LINK | CAP_JOURNAL),
+        ] {
+            assert_eq!(cap & others, 0, "a bit of its own");
+        }
         assert_eq!(
             Frame::CompanionRelease {
                 rdev: 1,

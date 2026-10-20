@@ -12,14 +12,13 @@ use crate::native_settings::ai_page::{
 };
 use aterm_agent::ai::state::{Mark, State};
 
-/// One CLI as a look would judge it: measured as its row is, wanted.
+/// One CLI as a look would judge it, wanted.
 fn cli(id: &'static str, state: State, mark: Mark, fact: &str) -> AiCli {
     let row = aterm_agent::ai::connector::connector(id).expect("a connection");
     AiCli {
         id,
         product: row.product,
         claude: row.is_claude(),
-        measured: row.measured,
         wanted: true,
         state,
         mark,

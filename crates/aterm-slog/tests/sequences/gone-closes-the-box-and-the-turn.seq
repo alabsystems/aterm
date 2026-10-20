@@ -1,0 +1,10 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# §2.4: - (the agent left) closes the turn gone, its box with it, innermost
+# first; nothing passed.
+see busy
+see prompt bash:not-read-only
+see -
+expect open p1 approval
+expect close p1 approval out=gone
+expect open t1 turn
+expect close t1 turn out=gone steps=1 appr=1

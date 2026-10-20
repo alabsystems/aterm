@@ -260,10 +260,12 @@ pub(crate) const STAGE_FREE_SPACE_HEADROOM: u64 = 64 * 1024 * 1024;
 pub(crate) const FREE_SPACE_REMEDY: &str =
     "free some space and check for updates, which retries it at once";
 
-/// A `ditto` failure that says WHY, from the tail of its stderr.
+/// A `ditto` failure that says WHY, from the tail of its stderr. `ditto` names files
+/// the bundle chose, so its line is quoted ([`crate::quote_tool_output`]): none can
+/// speak for the refusal.
 fn ditto_failure(what: &str, status: std::process::ExitStatus, stderr: &str) -> String {
     match crate::verify::last_stderr_line(stderr) {
-        Some(line) => format!("{what} ({status}): {line}"),
+        Some(line) => format!("{what} ({status}): {}", crate::quote_tool_output(line)),
         None => format!("{what} ({status})"),
     }
 }
@@ -291,7 +293,10 @@ pub(crate) fn unpack_failure(
     let Some(line) = full else {
         return ditto_failure(what, status, stderr);
     };
-    crate::warn(&format!("{what} ({status}): {line}"));
+    crate::warn(&format!(
+        "{what} ({status}): {}",
+        crate::quote_tool_output(line)
+    ));
     // A quota stop does not fill the disk, and `statvfs`'s free figure need not
     // reflect the quota, so its words name the quota and quote no figure.
     if line.contains("Disc quota exceeded") {
@@ -391,10 +396,32 @@ const EXPECTED_COMMIT_ENV: &str = "ATERM_UPDATE_EXPECTED_COMMIT";
 const EXPECTED_DIGEST_ENV: &str = "ATERM_UPDATE_EXPECTED_DMG_SHA256";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ExpectedArtifact {
+pub(crate) struct ExpectedArtifact {
     build: u64,
     commit: String,
     dmg_sha256: String,
+}
+
+impl ExpectedArtifact {
+    /// The exact artifact a handoff authorizes, from its three parts: a nonzero build,
+    /// a 40-hex commit and a 64-hex digest, both canonicalized. The successor's boot
+    /// apply reads it from the environment ([`take_expected_artifact`]); the parent
+    /// that swaps before it launches ([`swap_staged_for_launch`]) builds it from its
+    /// attempt.
+    pub(crate) fn from_parts(build: u64, commit: &str, dmg_sha256: &str) -> Result<Self, String> {
+        if build == 0 {
+            return Err("expected update build is malformed".to_string());
+        }
+        let commit = canonical_release_commit(Some(commit))
+            .ok_or_else(|| "expected update commit is malformed".to_string())?;
+        let dmg_sha256 = canonical_digest(dmg_sha256)
+            .ok_or_else(|| "expected update digest is malformed".to_string())?;
+        Ok(Self {
+            build,
+            commit,
+            dmg_sha256,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -476,21 +503,14 @@ fn take_expected_artifact() -> Result<Option<ExpectedArtifact>, String> {
             let build = build
                 .to_str()
                 .and_then(|value| value.parse::<u64>().ok())
-                .filter(|build| *build != 0)
                 .ok_or_else(|| "expected update build is malformed".to_string())?;
             let commit = commit
                 .to_str()
-                .and_then(|value| canonical_release_commit(Some(value)))
                 .ok_or_else(|| "expected update commit is malformed".to_string())?;
-            let dmg_sha256 = digest
+            let digest = digest
                 .to_str()
-                .and_then(canonical_digest)
                 .ok_or_else(|| "expected update digest is malformed".to_string())?;
-            Ok(Some(ExpectedArtifact {
-                build,
-                commit,
-                dmg_sha256,
-            }))
+            ExpectedArtifact::from_parts(build, commit, digest).map(Some)
         }
         _ => Err("expected update authority is incomplete".to_string()),
     }
@@ -501,6 +521,26 @@ fn ready_matches_expected(ready: &Ready, expected: &ExpectedArtifact) -> bool {
         && canonical_release_commit(ready.commit.as_deref()).as_deref()
             == Some(expected.commit.as_str())
         && canonical_digest(&ready.dmg_sha256).as_deref() == Some(expected.dmg_sha256.as_str())
+}
+
+/// The successor's refusal of a stage that is not the artifact its parent authorized,
+/// or `None` when it is. Classified as both pre-park checks classify the same stage:
+/// ANOTHER BUILD in the shared stage (a sibling published over it between the parent's
+/// pass and this apply lock) says nothing about the authorized build, so it is a moment,
+/// never STRUCTURAL against a healthy build. The same build with another commit or
+/// digest stays a verdict.
+fn expected_artifact_refusal(ready: &Ready, expected: &ExpectedArtifact) -> Option<String> {
+    (!ready_matches_expected(ready, expected)).then(|| {
+        let refusal = format!(
+            "staged update no longer matches authorized handoff artifact {} {} {}",
+            expected.build, expected.commit, expected.dmg_sha256
+        );
+        if ready.build_number == expected.build {
+            refusal
+        } else {
+            crate::verify::mark_passing(refusal)
+        }
+    })
 }
 
 fn set_fd_cloexec(fd: i32, cloexec: bool) -> bool {
@@ -3162,15 +3202,15 @@ fn handoff_floor_refusal(staging: &Staging, build: u64, machine: Option<&str>) -
 /// candidate's full pre-verification on it: `Some(refusal)`
 /// unless the stage the pass was cached for — `build` at `commit` — is still the
 /// published one, not quarantined, and admitted by the floor
-/// ([`handoff_apply_floor_refusal_at`]).
+/// ([`handoff_floor_refusal`], for the signer of the marker it read).
 ///
 /// The floor alone is not enough: its revocation arm reads the ready marker, which
 /// a revocation's retirement removes first, and a stage can also be quarantined by
 /// a sibling's revert or replaced by a newer one — each would launch a successor
 /// whose own gate finds no stage after every reader parked. Read-only and cheap
-/// like the floor (two small TOML reads, no lock, no
+/// like the floor (small TOML reads, no lock, no
 /// `codesign`); the refusals are the full check's own (`read_ready`'s ladder,
-/// [`crate::manifest::artifact_quarantined`]), so either lane files them alike.
+/// [`crate::manifest::artifact_quarantined_for_gate`]), so either lane files them alike.
 pub(crate) fn handoff_cached_pass_refusal_at(
     staging: &Staging,
     build: u64,
@@ -3203,12 +3243,22 @@ pub(crate) fn handoff_cached_pass_refusal_at(
             "staged build {build} is not the authorized commit {commit}; not handing off to it"
         ));
     }
-    if crate::manifest::artifact_quarantined(staging, build, &ready.dmg_sha256) {
-        return Some(format!(
-            "staged build {build} is quarantined: it crash-looped on this machine and was reverted"
-        ));
+    // A quarantine record that could not be read is passing, and still refuses.
+    match crate::manifest::artifact_quarantined_for_gate(staging, build, &ready.dmg_sha256) {
+        Err(refusal) => return Some(refusal),
+        Ok(true) => {
+            return Some(format!(
+                "staged build {build} is quarantined: it crash-looped on this machine and was \
+                 reverted"
+            ));
+        }
+        Ok(false) => {}
     }
-    if let Some(refusal) = handoff_apply_floor_refusal_at(staging, build) {
+    // The floor and the revocation set, judged against the signer of the marker read
+    // above: a second, lock-free read could find it already retired by the check that
+    // observed the revocation, skip the revocation arm, and pass a stage whose bundle
+    // is not yet removed.
+    if let Some(refusal) = handoff_floor_refusal(staging, build, ready.machine_id.as_deref()) {
         return Some(refusal);
     }
     // A stage whose roster authorization no check has confirmed for a day: the
@@ -3224,8 +3274,9 @@ pub(crate) fn handoff_cached_pass_refusal_at(
     // that removed the bundle first, or a sibling's publish that replaced it, or an
     // identity read that failed just then: the shared stage again, a moment, and
     // still no stage to hand off to. A bundle that really changed meets
-    // the full check once the pass expires.
-    (!ready.is_published_bundle(staging)).then(|| {
+    // the full check once the pass expires. The records were judged above and are not
+    // read again.
+    (!ready.names_published_bundle(staging)).then(|| {
         stage_moment(format!(
             "the staged bundle of build {build} is no longer the published stage; not handing \
              off to it"
@@ -3291,9 +3342,10 @@ fn preverify_staged_handoff_candidate_at<R>(
     // stage replaced it, and a read the kernel refused just then (`EMFILE` in a
     // Dock-launched window) reads as an unreadable marker. None of those says
     // anything about the authorized build, so each is marked passing — and the
-    // install is still refused. EXACTLY these four, named here; every refusal
-    // below (quarantine, the operator floor, the sealed identity, the installed
-    // rollback source) keeps its verdict.
+    // install is still refused. EXACTLY these four, named here, and a bundle gone
+    // from under its marker (below, before the sealed identity); every other refusal
+    // (quarantine, the operator floor, the sealed identity, the installed rollback
+    // source) keeps its verdict.
     let stage_moment = crate::verify::mark_passing;
     let ready = match read_ready(staging, current_build) {
         ReadyState::Newer(ready) => ready,
@@ -3318,8 +3370,13 @@ fn preverify_staged_handoff_candidate_at<R>(
         )));
     }
     // A stage an older stager published after this artifact was quarantined is not a
-    // candidate, however well it verifies.
-    if crate::manifest::artifact_quarantined(staging, ready.build_number, &ready.dmg_sha256) {
+    // candidate, however well it verifies. A quarantine record this read could not get
+    // through is passing, and refuses all the same.
+    if crate::manifest::artifact_quarantined_for_gate(
+        staging,
+        ready.build_number,
+        &ready.dmg_sha256,
+    )? {
         return Err(format!(
             "staged build {} is quarantined: it crash-looped on this machine and was reverted",
             ready.build_number
@@ -3342,6 +3399,20 @@ fn preverify_staged_handoff_candidate_at<R>(
         aterm_update_core::pins::roster_tier_armed(),
     ) {
         return Err(refusal);
+    }
+    // A marker whose bundle is GONE (moved to the fixed path by a swap prepare cut
+    // before it finished) is the stage's state again, the moment the cached-pass check
+    // files it as. Anything else at the path (a symlink, a file, a bundle that does not
+    // verify) goes on to the sealed identity and keeps its verdict.
+    if matches!(
+        std::fs::symlink_metadata(&staging.staged_app),
+        Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+    ) {
+        return Err(stage_moment(format!(
+            "the staged bundle of build {} is no longer the published stage; not handing off \
+             to it",
+            ready.build_number
+        )));
     }
     let (staged_build, sealed_commit) = verified_bundle_identity(&staging.staged_app)?;
     // The sealed-identity rebinds the apply path enforces: the number and provenance
@@ -3471,11 +3542,17 @@ fn publish_verified_stage_within(
 /// (or seen a yank), recorded it in the floor, and found no published stage to
 /// retire. Publishing now would arm this process's apply lane for a withdrawn
 /// machine's build. Either order is safe: a withdrawal recorded after the publish
-/// finds the stage and retires it. A floor that could not be read is no floor's word
-/// that the build is still admitted: refused as a moment, and the next check
-/// publishes it.
+/// finds the stage and retires it. A floor or quarantine record that could not be read
+/// is no record's word that the build is still admitted: refused as a moment, and the
+/// next check publishes it.
 fn stage_withdrawn(staging: &Staging, ready: &Ready) -> Result<(), String> {
-    if crate::manifest::artifact_quarantined(staging, ready.build_number, &ready.dmg_sha256) {
+    if crate::manifest::artifact_quarantined_for_gate(
+        staging,
+        ready.build_number,
+        &ready.dmg_sha256,
+    )
+    .map_err(|refusal| format!("stage refused: {refusal}"))?
+    {
         return Err(format!(
             "stage refused: build {} ({}) is quarantined — it crash-looped on this machine \
              and was reverted while this check was downloading it",
@@ -4085,8 +4162,12 @@ fn staging_manifest_commit(manifest: &Manifest) -> Result<String, String> {
 /// [`stage_from_dmg`] and [`stage_from_zip`], so the container can never change what
 /// is proved.
 ///
-/// Every failure path removes `incoming`, so a refused candidate leaves no
-/// half-staged bundle.
+/// The start probe's child is started first, held at its exec
+/// ([`verify::hold_staged_start`]), so syspolicyd's first-exec assessment of it runs
+/// beside the gate's helpers; it runs only once the gate has passed.
+///
+/// Every failure path kills the held probe unrun and then removes `incoming`, so a
+/// refused candidate leaves no half-staged bundle and no process.
 ///
 /// `roster_read_at` (RFC3339; empty for a clock that could not be read) is when the
 /// check that authorized `manifest` began reading the machine roster it judged by:
@@ -4099,13 +4180,23 @@ fn verify_and_publish_incoming(
     expected_team: &str,
     roster_read_at: &str,
 ) -> Result<(), String> {
+    // The start probe, held at its exec: its assessment runs while the gate below
+    // does, and nothing of it runs unless the whole gate passes.
+    let held = verify::hold_staged_start(incoming);
+    // A refusal before the probe kills the held child unrun FIRST, then removes the
+    // bundle: removed while a process still has its executable, a network home keeps
+    // the file aside (NFS's `.nfs*` rename) and with it the refused bundle's directory.
+    let refuse = |held: verify::HeldStart, why: String| -> Result<(), String> {
+        held.kill();
+        let _ = std::fs::remove_dir_all(incoming);
+        Err(why)
+    };
     // Verify the extracted bundle before publishing it (tiered: full Developer-ID
     // check when a Team ID is pinned, else structural-only — see the crate trust model).
     // Its helpers and the sealed reads run at once, and are read in this order.
     let checks = verify::check_bundle(incoming, expected_team, false);
     if let Err(e) = checks.policy {
-        let _ = std::fs::remove_dir_all(incoming);
-        return Err(format!("staged bundle failed verification: {e}"));
+        return refuse(held, format!("staged bundle failed verification: {e}"));
     }
     // Bind the (unauthenticated) manifest build_number to the number inside the
     // signed bundle, or a manifest could claim a high build_number while pointing at
@@ -4114,30 +4205,30 @@ fn verify_and_publish_incoming(
     let bundle_build = match checks.build {
         Ok(n) => n,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(incoming);
-            return Err(format!("staged bundle build number unreadable: {e}"));
+            return refuse(held, format!("staged bundle build number unreadable: {e}"));
         }
     };
     if bundle_build != manifest.build_number {
-        let _ = std::fs::remove_dir_all(incoming);
-        return Err(format!(
-            "staged bundle CFBundleVersion {bundle_build} != manifest build_number {} — \
-             refusing a manifest/bundle mismatch",
-            manifest.build_number
-        ));
+        return refuse(
+            held,
+            format!(
+                "staged bundle CFBundleVersion {bundle_build} != manifest build_number {} — \
+                 refusing a manifest/bundle mismatch",
+                manifest.build_number
+            ),
+        );
     }
     let sealed_commit = match checks.commit {
         Ok(commit) => commit,
-        Err(error) => {
-            let _ = std::fs::remove_dir_all(incoming);
-            return Err(format!("staged bundle commit unreadable: {error}"));
-        }
+        Err(error) => return refuse(held, format!("staged bundle commit unreadable: {error}")),
     };
     if !sealed_commit_matches(Some(manifest_commit), &sealed_commit) {
-        let _ = std::fs::remove_dir_all(incoming);
-        return Err(format!(
-            "staged bundle ATermGitCommit {sealed_commit:?} does not match manifest commit"
-        ));
+        return refuse(
+            held,
+            format!(
+                "staged bundle ATermGitCommit {sealed_commit:?} does not match manifest commit"
+            ),
+        );
     }
     let team = match checks.team {
         Some(Ok(team)) => team,
@@ -4156,11 +4247,17 @@ fn verify_and_publish_incoming(
     // is refused like any other stage verdict, before a marker exists; a probe that
     // could not run to an answer (timed out on a loaded machine, refused a spawn
     // just then) is no verdict and publishes: the apply's probe still gates the swap.
-    // A build the records already withdrew (`stage_withdrawn`) is not started: the
-    // publish refuses it under its lock, with these words.
-    if stage_withdrawn(staging, &ready).is_ok()
-        && let Err(error) = verify::probe_staged_bundle_starts(incoming, bundle_build)
-    {
+    // A build the records already withdrew (`stage_withdrawn`) is not started (its
+    // held probe is killed unrun): the publish refuses it under its lock, with
+    // these words.
+    let probed = match stage_withdrawn(staging, &ready) {
+        Ok(()) => verify::probe_staged_bundle_starts(incoming, bundle_build, held),
+        Err(_) => {
+            held.kill();
+            Ok(())
+        }
+    };
+    if let Err(error) = probed {
         if stage_failure_is_a_verdict(&error) {
             let _ = std::fs::remove_dir_all(incoming);
             return Err(format!("staged bundle cannot start: {error}"));
@@ -4215,10 +4312,10 @@ fn staged_ready_marker(
     }
 }
 
-/// Publishes the post-swap truth after `ready.toml` is retired but before exec. The
-/// new build number is intentional: an overlapping OLD reader sees a ledger
-/// mismatch and reconciles neutrally, while the re-exec'd NEW process sees an exact
-/// installed/activating outcome.
+/// Publishes the post-swap truth after `ready.toml` is retired but before exec (or,
+/// on the launched lane, before the parent's launch). The new build number is
+/// intentional: an overlapping OLD reader sees a ledger mismatch and reconciles
+/// neutrally, while the NEW process sees an exact installed/activating outcome.
 fn record_activating_status(staging: &Staging, ready: &Ready) {
     crate::status::record(
         staging,
@@ -4246,15 +4343,98 @@ fn unconfirmed_trial_refusal(armed_build: u64) -> String {
 /// staged, so why is it not running?".
 ///
 /// `NotApplicable`/`NoUpdate` are the common every-launch case and not refusals, so
-/// recording them would rewrite `status.toml` on every launch. `ReExecFailed` is a
-/// failure that already recorded its own status line;
+/// recording them would rewrite `status.toml` on every launch. `LeftForSession` is no
+/// refusal either: the stage is admitted and left for the window's own lane, which
+/// books what it does. `ReExecFailed` and `Reverted` are failures that already
+/// recorded their own status line and ledger entry;
 /// [`crate::health::Health::record_apply_failure`] clears refusals by design, so
 /// routing a failure through the refusal slot would invert that ordering.
 fn boot_apply_refusal_reason(outcome: &ApplyOutcome) -> Option<&str> {
     match outcome {
         ApplyOutcome::Deferred(reason) => Some(reason),
-        ApplyOutcome::NotApplicable | ApplyOutcome::NoUpdate | ApplyOutcome::ReExecFailed(_) => {
-            None
+        ApplyOutcome::NotApplicable
+        | ApplyOutcome::NoUpdate
+        | ApplyOutcome::LeftForSession { .. }
+        | ApplyOutcome::ReExecFailed(_)
+        | ApplyOutcome::Reverted(_) => None,
+    }
+}
+
+/// What a launch's boot does with a ready stage, by its image class
+/// ([`crate::ImageReplacement`]); [`boot_image_lane`] decides it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BootImageLane {
+    /// Swap the stage in and exec the build it installed (steps 3–10).
+    SwapAndExec,
+    /// Leave the admitted stage for the window's automatic in-session lane, with this
+    /// launch on the left-stage record ([`left_stage_path`]) that the escape counts:
+    /// nothing verified, swapped or exec'd ([`ApplyOutcome::LeftForSession`]).
+    LeaveForSession,
+    /// Leave it for a person's press (`[update] auto_apply = false`): nothing verified,
+    /// swapped or exec'd, and nothing recorded, since a launch that ends waiting for a
+    /// press is the design and no evidence that a lane cannot land the stage.
+    LeaveForPress,
+    /// Swap nothing: a LaunchServices-launched successor, whose parent swapped first.
+    NeverSwap,
+}
+
+/// The left-stage record ([`left_stage_path`]) as one boot of a window that keeps its
+/// image found it, for [`boot_image_lane`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeftRecord {
+    /// It names this many launches that left this same stage and have ended
+    /// ([`TrialLauncher::has_ended`]'s positive evidence; a clean quit and a crash alike).
+    Ended(usize),
+    /// It cannot count this launch: it could not be read or written, or the kernel will
+    /// not name this process.
+    Unusable,
+}
+
+/// The boot's lane for a ready stage: a launched successor never swaps, and a
+/// replaceable launch swaps and execs. A window that keeps its image leaves the stage
+/// for a press while `[update] auto_apply` is off (`auto_apply`), and otherwise for its
+/// own automatic lane until the record counts [`crate::LEFT_STAGE_ESCAPE`] ended
+/// launches that left it, or cannot count this one; then it swaps and execs as a
+/// replaceable launch does, so an old build whose own lane cannot land the stage never
+/// strands it. The class alone decides `NeverSwap` and `SwapAndExec` for a replaceable
+/// launch; the setting and the record matter only to a kept image. Pure.
+pub(crate) fn boot_image_lane(
+    image: crate::ImageReplacement,
+    auto_apply: bool,
+    record: LeftRecord,
+) -> BootImageLane {
+    match image {
+        crate::ImageReplacement::LaunchedSuccessor => BootImageLane::NeverSwap,
+        crate::ImageReplacement::Replaceable => BootImageLane::SwapAndExec,
+        crate::ImageReplacement::WindowKeepsImage if !auto_apply => BootImageLane::LeaveForPress,
+        crate::ImageReplacement::WindowKeepsImage => match record {
+            LeftRecord::Ended(ended) if ended < crate::LEFT_STAGE_ESCAPE => {
+                BootImageLane::LeaveForSession
+            }
+            LeftRecord::Ended(_) | LeftRecord::Unusable => BootImageLane::SwapAndExec,
+        },
+    }
+}
+
+/// What a crash-loop revert does once the previous build is back at the install
+/// ([`revert_lane`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RevertLane {
+    /// Re-exec the restored build as a fresh boot.
+    ReExec,
+    /// Return [`ApplyOutcome::Reverted`] for the caller to exit, replacing nothing.
+    ExitInstead,
+}
+
+/// The crash-loop revert's lane by image class: only a LaunchServices-launched
+/// successor exits instead of re-executing the restored build. A window that keeps its
+/// image still re-execs it: recovering from a crash loop outranks the launch record,
+/// and a revert without an exec would need a LaunchServices relaunch. Pure.
+pub(crate) fn revert_lane(image: crate::ImageReplacement) -> RevertLane {
+    match image {
+        crate::ImageReplacement::LaunchedSuccessor => RevertLane::ExitInstead,
+        crate::ImageReplacement::Replaceable | crate::ImageReplacement::WindowKeepsImage => {
+            RevertLane::ReExec
         }
     }
 }
@@ -4276,6 +4456,7 @@ pub fn apply_staged_if_ready(
     handoff_fds: &[i32],
     handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
     handoff_target_is_this_build: bool,
+    image: crate::ImageReplacement,
     witness: crate::TrialWitness,
 ) -> ApplyOutcome {
     let outcome = apply_staged_if_ready_inner(
@@ -4284,8 +4465,19 @@ pub fn apply_staged_if_ready(
         handoff_fds,
         handoff_env,
         handoff_target_is_this_build,
+        image,
         witness,
     );
+    // A STAGE LEFT FOR THE WINDOW'S LANE restarts its pending clock, as a wait for a
+    // roster confirmation does ([`record_boot_apply_refusal`]): the clock counts from the
+    // stage's first sighting, across the hours this app was closed, so the overdue notice
+    // would fire at this launch's first checker cycle, while the lane that installs it is
+    // still running. The hour counts from when a running lane could install it.
+    if let ApplyOutcome::LeftForSession { build, .. } = &outcome
+        && let Some(staging) = Staging::resolve()
+    {
+        crate::health::Health::restart_pending_update(&staging.health(), *build);
+    }
     if let Some(reason) = boot_apply_refusal_reason(&outcome) {
         crate::warn(&format!("boot apply refused: {reason}"));
         if let Some(staging) = Staging::resolve() {
@@ -4326,13 +4518,18 @@ fn apply_staged_if_ready_inner(
     handoff_fds: &[i32],
     handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
     handoff_target_is_this_build: bool,
+    image: crate::ImageReplacement,
     witness: crate::TrialWitness,
 ) -> ApplyOutcome {
-    // The swap's own cost, for the image that pays it: on a download lane the parent
-    // launches the current binary, so this image dittos the bundle and `execve`s, and
-    // `exec_preserving_handoff_fds` never returns to a timer in the GUI's
-    // `main_entry`. During a handoff every millisecond here is spent with the
-    // outgoing process's readers parked.
+    // The swap's own cost, for the image that pays it: a replaceable launch (headless, an
+    // explicit control socket, the cold lane's relaunch), a fork-lane successor (its
+    // parent forks the current binary) or a window's escape dittos the bundle and
+    // `execve`s, and `exec_preserving_handoff_fds` never returns to a timer in the GUI's
+    // `main_entry`. On the fork lane every millisecond here is spent with the outgoing
+    // process's readers parked. A LaunchServices-launched successor never swaps: its
+    // parent swapped before it launched ([`swap_staged_for_launch`]). A window that keeps
+    // its image runs only the admission under the lock and leaves the stage
+    // ([`BootImageLane::LeaveForSession`]).
     let apply_started = std::time::Instant::now();
     let reexec_nonce = take_reexec_nonce();
     // Consume/clear child authority while startup is single-threaded, but do not
@@ -4356,8 +4553,11 @@ fn apply_staged_if_ready_inner(
             s,
             current_build,
             current_commit,
-            handoff_fds,
-            handoff_env,
+            RollbackHandoff {
+                fds: handoff_fds,
+                env: handoff_env,
+                image,
+            },
             handoff_target_is_this_build,
             witness,
         )
@@ -4396,17 +4596,34 @@ fn apply_staged_if_ready_inner(
         return ApplyOutcome::NotApplicable;
     }
     // We are the authorized candidate of a seamless handoff (the outgoing process's
-    // target names this build): an activation successor, or a download successor
-    // already swapped and re-exec'd. Everything above still ran (the re-exec nonce
-    // and stamp consumed, the boot-trial launch counted, startup authority settled),
-    // but nothing below may swap: re-exec'ing a newer stage would be a build the
-    // parent did not authorize, and it would refuse the target and drop the adopted
-    // PTYs. The newer stage keeps for the successor's own apply lane (or the next
-    // launch). `NoUpdate` is not a refusal, so the ledger stays quiet.
+    // target names this build): an activation successor, a launched successor whose
+    // parent swapped before it launched, or a fork-lane successor already swapped and
+    // re-exec'd. Everything above still ran (the re-exec nonce and stamp consumed, the
+    // boot-trial launch counted, startup authority settled), but nothing below may
+    // swap: re-exec'ing a newer stage would be a build the parent did not authorize,
+    // and it would refuse the target and drop the adopted PTYs. The newer stage keeps
+    // for the successor's own apply lane. `NoUpdate` is not a refusal, so the ledger
+    // stays quiet.
     if handoff_target_is_this_build {
         crate::log(&format!(
             "boot apply: build {current_build} is the handoff's authorized target; any newer \
-             stage is left for the successor's own apply lane (or the next launch)"
+             stage is left for the successor's own apply lane"
+        ));
+        return ApplyOutcome::NoUpdate;
+    }
+    // A LAUNCHED SUCCESSOR NEVER SWAPS OR EXECS, whatever its target names. LaunchServices
+    // started this process, and an `execve` a few hundred milliseconds after such a launch
+    // leaves LaunchServices answering pid -1 for the app for the rest of its life (no
+    // Quit & Reopen, no menu-bar item, TCC judging it by the rollback path). Its parent
+    // swaps before it launches, so its target is this build; one that names another
+    // build (a sibling superseded the parent's swap) is refused by the handoff's own
+    // target check, as a moment. The class alone decides this lane, whatever the
+    // setting and the record say, so it is asked before the apply lock is taken.
+    if boot_image_lane(image, true, LeftRecord::Ended(0)) == BootImageLane::NeverSwap {
+        crate::log(&format!(
+            "boot apply: build {current_build} was launched by LaunchServices as a seamless \
+             successor, which never swaps or re-execs itself; its target is not this build, \
+             so the handoff will refuse it"
         ));
         return ApplyOutcome::NoUpdate;
     }
@@ -4419,129 +4636,49 @@ fn apply_staged_if_ready_inner(
         return ApplyOutcome::NotApplicable;
     };
 
-    // 3–4. The pre-lock peek, the lock, the work that must hold it, and the decision
-    //    made under it: one function ([`apply_lock_then_ready`]) that the Tier-1
-    //    test `two_processes_arming_one_build_swap_it_once` drives with a sibling's
-    //    whole apply injected while this launch waits for the lock.
-    //
-    // Bounded, unlike every other taker of this lock: we are before the window, so
-    // waiting here is a terminal that has not appeared. Every legitimate holder
-    // returns in milliseconds (publish is remove+rename+write) or is itself bounded
-    // (verification by the apply budget, a cross-volume copy by its ceiling). A
-    // holder that outlasts this is wedged, and we start on the build we have.
-    let (_lock, _budget, ready) = match apply_lock_then_ready(
-        &staging,
-        current_build,
-        || {
-            // A sibling's hold past the wait is a moment, marked so: a seamless
-            // successor that returns this stays the old build and refuses its
-            // target, and the parent must read that as "try again later", not as
-            // the new bytes' verdict.
-            FileLock::acquire_within(&staging.apply_lock, APPLY_LOCK_WAIT)
-                .map_err(|e| ApplyOutcome::Deferred(crate::verify::lock_wait_refusal("lock", &e)))
-        },
-        || {
-            // Everything from here to the swap is verification work on the launch path.
-            // One ceiling over all of it (the guard restores any outer budget on drop).
-            let budget = crate::verify::ApplyBudget::start(crate::verify::APPLY_BUDGET);
-            settle_trials_under_apply_lock(&staging, &b.app_root, current_build, current_commit)?;
-            Ok(budget)
-        },
-    ) {
-        Ok(held) => held,
-        Err(outcome) => return outcome,
-    };
-    if let Some(expected) = expected_artifact.as_ref()
-        && !ready_matches_expected(&ready, expected)
-    {
-        return ApplyOutcome::Deferred(format!(
-            "staged update no longer matches authorized handoff artifact {} {} {}",
-            expected.build, expected.commit, expected.dmg_sha256
-        ));
-    }
-
-    // 4b/4c/4d. The floor's withdrawals (a yank, a revoked signer), the published
-    // stage, and the age of its roster confirmation.
-    if let Some(outcome) = stage_admission_gates(&staging, current_build, &ready, unix_now_secs()) {
-        return outcome;
-    }
-
-    // 5. Can we write the install location? Checked before the more expensive
-    //    re-verification, so a persistently non-writable install (e.g. an
-    //    admin-owned /Applications) does not re-verify the stage on every launch.
-    if let Err(refusal) = install_location_check(&b.app_root) {
-        crate::status::record(
-            &staging,
-            current_build,
-            if crate::is_passing_refusal(&refusal) {
-                "deferred: install location could not be written just then"
-            } else {
-                "deferred: install location not writable"
-            },
-        );
-        return ApplyOutcome::Deferred(refusal);
-    }
-
-    // 6–7. Re-verify the stage and prove OLD the running build, both at once, then
-    // prepare NEW at the fixed path ([`verify_stage_and_prepare`]).
-    let VerifiedSwap {
-        prepared,
-        old: (old_build, old_commit),
-    } = match verify_stage_and_prepare(
+    // 3–5. The stage admitted under the apply lock ([`admit_stage_under_apply_lock`]),
+    // then the image's lane for it ([`boot_lane_under_apply_lock`], which asks
+    // [`boot_image_lane`]): a window that keeps its image leaves it here, with the lock
+    // let go, unless the escape applies. `[update] auto_apply` is read now, as the window
+    // will read it: with it off a window's stage waits for a press and never escapes.
+    let admitted = match admit_stage_under_apply_lock(
         &staging,
         &b.app_root,
-        &ready,
-        (current_build, current_commit),
-        verified_bundle_identity,
-        verified_bundle_identities,
+        current_build,
+        current_commit,
+        expected_artifact.as_ref(),
     ) {
-        Ok(verified) => verified,
+        Ok(admitted) => admitted,
         Err(outcome) => return outcome,
     };
-    // Preserve only a receipt that is authority for the exact sealed OLD bundle just
-    // rechecked. A well-formed but stale receipt is unsigned local state and must not
-    // be resurrected after an inverse swap.
-    let previous_receipt = previous_receipt_for_sealed_old(&staging, old_build, &old_commit);
-
-    // 7b. The candidate must be able to start. Every check so far is cryptographic,
-    // and the crash-loop sentinel runs inside the new build's own `main`, so a bundle
-    // dyld or Gatekeeper rejects before `main` would be swapped in and never
-    // reverted. Start it once here, while OLD is installed and backing out is free.
-    if let Err(error) = crate::verify::probe_bundle_starts(&prepared.fixed, ready.build_number) {
-        recover_prepared_candidate(&prepared, &staging);
-        // A probe that could not run to an answer (timed out, or the kernel would
-        // not start it) is not a candidate that cannot start: no failure memo, whose
-        // backoff would suppress re-staging healthy bytes.
-        if stage_failure_is_a_verdict(&error) {
-            crate::manifest::FailedMark::record_stage_failure(
-                &staging.failed(),
-                ready.build_number,
-                &ready.dmg_sha256,
-                unix_now_secs(),
-            );
-        }
-        return ApplyOutcome::Deferred(format!("staged candidate cannot start: {error}"));
-    }
-
-    // 8. Arm exact crash-loop authority only after fixed NEW is fully verified and
-    // immediately before the atomic swap. A crash after this point has one
-    // deterministic pre-swap shape: installed=OLD, fixed=NEW, ready+trial exact.
-    let sentinel = match prepare_trial(&staging, &ready, &b.app_root) {
-        Ok(sentinel) => sentinel,
-        Err(error) => {
-            recover_prepared_candidate(&prepared, &staging);
-            return ApplyOutcome::Deferred(error);
-        }
+    let auto_apply = aterm_update_core::settings::update_auto_apply();
+    let admitted = match boot_lane_under_apply_lock(&staging, image, auto_apply, admitted) {
+        Ok(admitted) => admitted,
+        Err(outcome) => return outcome,
     };
-    let retained =
-        match swap_in_and_record_receipt(&staging, &prepared, &b.app_root, &ready, &sentinel) {
-            Ok(retained) => retained,
-            Err(outcome) => return outcome,
-        };
-    // Don't let it re-apply on the next launch. This retirement cannot touch the
-    // fixed rollback sibling; it removes only ready + the duplicate staged NEW.
-    staging.retire_published();
-    record_activating_status(&staging, &ready);
+
+    // 6–8. The swap itself ([`swap_admitted_stage`], the remainder of the transaction a
+    // launched successor's parent runs before it launches). The lock and the
+    // verification budget come back held: this lane keeps the lock through its exec,
+    // and through the rollback when the exec fails.
+    let SwappedStage {
+        lock: _lock,
+        budget: _budget,
+        ready,
+        retained,
+        sentinel,
+        previous_receipt,
+    } = match swap_admitted_stage(
+        &staging,
+        &b.app_root,
+        current_build,
+        current_commit,
+        admitted,
+        &SHIPPED_SWAP_SEAMS,
+    ) {
+        Ok(swapped) => swapped,
+        Err(outcome) => return outcome,
+    };
 
     // 9. Write the single-use re-exec nonce stamp (0600, in our 0700 dir) before exec
     //    so the post-swap guard can prove this launch is our re-exec. If no nonce can
@@ -4558,7 +4695,22 @@ fn apply_staged_if_ready_inner(
     // 10. Re-exec into the new binary while still holding apply_lock. FileLock is
     // explicitly CLOEXEC, so success releases it atomically with image replacement;
     // an exec error leaves it held through rollback. No competing process can swap
-    // a higher build or overwrite our nonce between this swap and this exec.
+    // a higher build or overwrite our nonce between this swap and this exec. (The
+    // launched lane's parent lets the lock go between its swap and its launch, which
+    // needs no nonce: a sibling in that gap stops on the just-swapped shape in
+    // `settle_trials_under_apply_lock`, and the stage it would swap is retired.)
+    //
+    // WHO STILL EXECS HERE, exactly: a replaceable launch with a stage ready (a
+    // `--headless` launch, a window with an explicit `--control-sock`, the cold lane's
+    // relaunch of a running window, every CLI-started launch of those shapes), a
+    // fork-lane successor, and a window whose automatic lane is on, at its escape: after
+    // `LEFT_STAGE_ESCAPE` launches left this stage and ended, or when the left-stage
+    // record cannot count it (unreadable, unwritable, or a process the kernel will not
+    // name). A launched successor never gets here, and neither does a window whose
+    // `[update] auto_apply` is off. One LaunchServices started (the escape; a replaceable
+    // launch through `open --args`) keeps a stale record (pid -1) for its life, which its
+    // own `launch record:` measure books. The crash-loop revert's re-exec is outside this
+    // lane (`revert_to_rollback`).
     crate::log(&format!(
         "applied update {} in {} ms{} → exec into the new binary",
         ready.version,
@@ -4636,6 +4788,493 @@ fn apply_staged_if_ready_inner(
     })
 }
 
+/// A sealed bundle's (build, commit), or why it could not be read.
+type SealedIdentity = Result<(u64, String), String>;
+
+/// The swap's sealed-identity readers and its start probe: [`SHIPPED_SWAP_SEAMS`] in
+/// production, fakes over unsealed fixtures in the disk-transaction conformance test.
+struct SwapSeams<'a> {
+    /// One bundle's sealed identity ([`verified_bundle_identity`]).
+    one: &'a dyn Fn(&Path) -> SealedIdentity,
+    /// Two bundles' at once ([`verified_bundle_identities`]).
+    both: &'a dyn Fn([&Path; 2]) -> [SealedIdentity; 2],
+    /// One start of the prepared candidate ([`crate::verify::probe_bundle_starts`]).
+    probe: &'a dyn Fn(&Path, u64) -> Result<(), String>,
+}
+
+const SHIPPED_SWAP_SEAMS: SwapSeams<'static> = SwapSeams {
+    one: &verified_bundle_identity,
+    both: &verified_bundle_identities::<2>,
+    probe: &crate::verify::probe_bundle_starts,
+};
+
+/// What [`admit_stage_under_apply_lock`] leaves its caller: the stage read under the
+/// apply lock and admitted by every gate that reads no bundle (the authorized artifact,
+/// the floor, the quarantine, the published stage, the roster age, the install
+/// location), with the lock and the verification budget still held. Dropping it lets
+/// both go and leaves the disk as the admission found it.
+struct AdmittedStage {
+    lock: FileLock,
+    budget: crate::verify::ApplyBudget,
+    ready: Ready,
+}
+
+/// What [`swap_admitted_stage`] leaves its caller: NEW installed with its trial armed
+/// and its exact receipt recorded, OLD at the fixed rollback path (`retained`), the
+/// stage retired, and the apply lock and the verification budget still held. Dropping
+/// it lets both go.
+struct SwappedStage {
+    lock: FileLock,
+    budget: crate::verify::ApplyBudget,
+    ready: Ready,
+    retained: PathBuf,
+    sentinel: Sentinel,
+    previous_receipt: Option<crate::manifest::InstalledReceipt>,
+}
+
+/// Steps 3–8 of the boot apply, the whole swap and nothing after it: the stage admitted
+/// under the apply lock ([`admit_stage_under_apply_lock`]), then swapped in
+/// ([`swap_admitted_stage`]). `installed` is the install's `.app` root.
+///
+/// The parent of a LaunchServices-launched successor ([`swap_staged_for_launch`]) runs
+/// it, lets the lock go and launches the install path, which then holds NEW, so the
+/// process LaunchServices starts never replaces its own image. The boot lane
+/// ([`apply_staged_if_ready_inner`]) runs the same two halves with its image's lane
+/// between them, and execs the swapped-in build with the lock still held.
+///
+/// THE LOCK GAP THE PARENT OPENS is safe: until the launched NEW takes the lock in its
+/// `check_boot_health`, a sibling's swap stops on the just-swapped shape
+/// ([`settle_trials_under_apply_lock`]), and the stage it would swap is retired here.
+fn swap_under_apply_lock(
+    staging: &Staging,
+    installed: &Path,
+    current_build: u64,
+    current_commit: Option<&str>,
+    expected: Option<&ExpectedArtifact>,
+    seams: &SwapSeams<'_>,
+) -> Result<SwappedStage, ApplyOutcome> {
+    let admitted =
+        admit_stage_under_apply_lock(staging, installed, current_build, current_commit, expected)?;
+    swap_admitted_stage(
+        staging,
+        installed,
+        current_build,
+        current_commit,
+        admitted,
+        seams,
+    )
+}
+
+/// Steps 3–5 of the boot apply: the apply lock and the stage read under it
+/// ([`apply_lock_then_ready`], with trial and orphan recovery and the foreign-trial
+/// budget), the authorized artifact (`expected`, when a handoff names one), the
+/// admission gates and the install location. Nothing here reads a bundle or moves one,
+/// so a window that keeps its image runs it at boot and leaves the stage
+/// ([`boot_lane_under_apply_lock`]).
+fn admit_stage_under_apply_lock(
+    staging: &Staging,
+    installed: &Path,
+    current_build: u64,
+    current_commit: Option<&str>,
+    expected: Option<&ExpectedArtifact>,
+) -> Result<AdmittedStage, ApplyOutcome> {
+    // 3–4. The pre-lock peek, the lock, the work that must hold it, and the decision
+    //    made under it: one function ([`apply_lock_then_ready`]) that the Tier-1
+    //    test `two_processes_arming_one_build_swap_it_once` drives with a sibling's
+    //    whole apply injected while this launch waits for the lock.
+    //
+    // Bounded, unlike every other taker of this lock: we are before the window, so
+    // waiting here is a terminal that has not appeared. Every legitimate holder
+    // returns in milliseconds (publish is remove+rename+write) or is itself bounded
+    // (verification by the apply budget, a cross-volume copy by its ceiling). A
+    // holder that outlasts this is wedged, and we start on the build we have.
+    let (lock, budget, ready) = apply_lock_then_ready(
+        staging,
+        current_build,
+        || {
+            // A sibling's hold past the wait is a moment, marked so: a seamless
+            // successor that returns this stays the old build and refuses its
+            // target, and the parent must read that as "try again later", not as
+            // the new bytes' verdict.
+            FileLock::acquire_within(&staging.apply_lock, APPLY_LOCK_WAIT)
+                .map_err(|e| ApplyOutcome::Deferred(crate::verify::lock_wait_refusal("lock", &e)))
+        },
+        || {
+            // Everything from here to the swap is verification work on the launch path.
+            // One ceiling over all of it (the guard restores any outer budget on drop).
+            let budget = crate::verify::ApplyBudget::start(crate::verify::APPLY_BUDGET);
+            settle_trials_under_apply_lock(staging, installed, current_build, current_commit)?;
+            Ok(budget)
+        },
+    )?;
+    // The artifact a handoff's parent authorized, then 4b/4c/4d: the floor's
+    // withdrawals (a yank, a revoked signer), the quarantine, the published stage, and
+    // the age of its roster confirmation.
+    if let Some(outcome) =
+        stage_admission_gates(staging, current_build, &ready, expected, unix_now_secs())
+    {
+        return Err(outcome);
+    }
+
+    // 5. Can we write the install location? Checked before the more expensive
+    //    re-verification, so a persistently non-writable install (e.g. an
+    //    admin-owned /Applications) does not re-verify the stage on every launch.
+    if let Err(refusal) = install_location_check(installed) {
+        crate::status::record(
+            staging,
+            current_build,
+            if crate::is_passing_refusal(&refusal) {
+                "deferred: install location could not be written just then"
+            } else {
+                "deferred: install location not writable"
+            },
+        );
+        return Err(ApplyOutcome::Deferred(refusal));
+    }
+    Ok(AdmittedStage {
+        lock,
+        budget,
+        ready,
+    })
+}
+
+/// Steps 6–8 of the boot apply over an admitted stage, under its lock: both bundles
+/// verified and NEW prepared at the fixed path, one start of NEW, the trial armed, the
+/// atomic exchange and its receipt, the stage retired, the record of the window
+/// launches that left it removed ([`left_stage_path`]), and the status published.
+fn swap_admitted_stage(
+    staging: &Staging,
+    installed: &Path,
+    current_build: u64,
+    current_commit: Option<&str>,
+    admitted: AdmittedStage,
+    seams: &SwapSeams<'_>,
+) -> Result<SwappedStage, ApplyOutcome> {
+    let AdmittedStage {
+        lock,
+        budget,
+        ready,
+    } = admitted;
+    // 6–7. Re-verify the stage and prove OLD the running build, both at once, then
+    // prepare NEW at the fixed path ([`verify_stage_and_prepare`]).
+    let VerifiedSwap {
+        prepared,
+        old: (old_build, old_commit),
+    } = verify_stage_and_prepare(
+        staging,
+        installed,
+        &ready,
+        (current_build, current_commit),
+        seams.one,
+        seams.both,
+    )?;
+    // Preserve only a receipt that is authority for the exact sealed OLD bundle just
+    // rechecked. A well-formed but stale receipt is unsigned local state and must not
+    // be resurrected after an inverse swap.
+    let previous_receipt = previous_receipt_for_sealed_old(staging, old_build, &old_commit);
+
+    // 7b. The candidate must be able to start. Every check so far is cryptographic,
+    // and the crash-loop sentinel runs inside the new build's own `main`, so a bundle
+    // dyld or Gatekeeper rejects before `main` would be swapped in and never
+    // reverted. Start it once here, while OLD is installed and backing out is free.
+    if let Err(error) = (seams.probe)(&prepared.fixed, ready.build_number) {
+        recover_prepared_candidate(&prepared, staging);
+        // A probe that could not run to an answer (timed out, or the kernel would
+        // not start it) is not a candidate that cannot start: no failure memo, whose
+        // backoff would suppress re-staging healthy bytes.
+        if stage_failure_is_a_verdict(&error) {
+            crate::manifest::FailedMark::record_stage_failure(
+                &staging.failed(),
+                ready.build_number,
+                &ready.dmg_sha256,
+                unix_now_secs(),
+            );
+        }
+        return Err(ApplyOutcome::Deferred(format!(
+            "staged candidate cannot start: {error}"
+        )));
+    }
+
+    // 8. Arm exact crash-loop authority only after fixed NEW is fully verified and
+    // immediately before the atomic swap. A crash after this point has one
+    // deterministic pre-swap shape: installed=OLD, fixed=NEW, ready+trial exact.
+    let sentinel = match prepare_trial(staging, &ready, installed) {
+        Ok(sentinel) => sentinel,
+        Err(error) => {
+            recover_prepared_candidate(&prepared, staging);
+            return Err(ApplyOutcome::Deferred(error));
+        }
+    };
+    let retained = swap_in_and_record_receipt(staging, &prepared, installed, &ready, &sentinel)?;
+    // Don't let it re-apply on the next launch. This retirement cannot touch the
+    // fixed rollback sibling; it removes only ready + the duplicate staged NEW.
+    staging.retire_published();
+    // The launches that left this stage for their windows have nothing left to count.
+    let _ = std::fs::remove_file(left_stage_path(staging));
+    record_activating_status(staging, &ready);
+    Ok(SwappedStage {
+        lock,
+        budget,
+        ready,
+        retained,
+        sentinel,
+        previous_receipt,
+    })
+}
+
+/// Where the window launches that left a stage for their automatic in-session lane are
+/// recorded, never one that left it for a press (`left-stage`, 0600 in the 0700 staging
+/// root): `<build> <dmg_sha256>` on the first line, then `<pid> <seconds> <micros>` per
+/// launch, named as a trial's launchers are ([`TrialLauncher`]). Read and written under the apply lock. A record naming another
+/// stage, or one that does not parse, counts nothing, and the next launch that leaves
+/// this stage writes it afresh. Every successful swap removes it
+/// ([`swap_admitted_stage`]): the boot's and the parent's before a launch alike.
+fn left_stage_path(staging: &Staging) -> PathBuf {
+    staging.root.join("left-stage")
+}
+
+/// The most launches the left-stage record keeps; the oldest go first.
+const MAX_LEFT_LAUNCHERS: usize = 32;
+
+/// The launches the left-stage record names for exactly `ready`'s stage (its build and
+/// container digest), oldest first: none for another stage's record or a corrupt one.
+/// `Err` is a present record the read could not get through, which no writer may
+/// replace unseen.
+fn read_left_launchers(staging: &Staging, ready: &Ready) -> std::io::Result<Vec<TrialLauncher>> {
+    let Some(text) = crate::read_ledger_text_checked(&left_stage_path(staging))? else {
+        return Ok(Vec::new());
+    };
+    let mut lines = text.lines();
+    let identity = format!("{} {}", ready.build_number, ready.dmg_sha256);
+    if lines.next().map(str::trim) != Some(identity.as_str()) {
+        return Ok(Vec::new());
+    }
+    let mut launchers = Vec::new();
+    for line in lines {
+        let mut fields = line.split_whitespace();
+        let mut field = || fields.next().and_then(|field| field.parse::<i64>().ok());
+        let (Some(pid), Some(seconds), Some(micros), None) = (field(), field(), field(), field())
+        else {
+            return Ok(Vec::new());
+        };
+        let Ok(pid) = u32::try_from(pid) else {
+            return Ok(Vec::new());
+        };
+        launchers.push(TrialLauncher {
+            pid,
+            started: (seconds, micros),
+        });
+    }
+    Ok(launchers)
+}
+
+/// Write the left-stage record for `ready`'s stage, naming `launchers` (the newest
+/// [`MAX_LEFT_LAUNCHERS`]).
+fn write_left_launchers(
+    staging: &Staging,
+    ready: &Ready,
+    launchers: &[TrialLauncher],
+) -> std::io::Result<()> {
+    let skip = launchers.len().saturating_sub(MAX_LEFT_LAUNCHERS);
+    let mut text = format!("{} {}\n", ready.build_number, ready.dmg_sha256);
+    for launcher in &launchers[skip..] {
+        text.push_str(&format!(
+            "{} {} {}\n",
+            launcher.pid, launcher.started.0, launcher.started.1
+        ));
+    }
+    write_private_file(&left_stage_path(staging), text.as_bytes())
+}
+
+/// The image's lane for the stage it admitted under the apply lock, as
+/// [`boot_image_lane`] decides it from the class, `[update] auto_apply` (`auto_apply`)
+/// and the left-stage record ([`left_stage_path`]): the record counts the launches that
+/// left this same stage and have ended, a clean quit and a crash alike, by
+/// [`TrialLauncher::has_ended`]'s positive evidence (a launch whose end cannot be read is
+/// never counted). The one router of the boot apply ([`apply_staged_if_ready_inner`]).
+///
+/// `Ok` hands the stage on to the swap and the exec: a replaceable launch, or a window's
+/// escape (the record counts [`crate::LEFT_STAGE_ESCAPE`] ended launches, or cannot hold
+/// this one: unreadable, unwritable, or a process the kernel will not name).
+/// `Err(LeftForSession)` once the lock and budget are let go, with nothing verified,
+/// swapped or exec'd and the stage as it was: left for the window's automatic lane with
+/// this launch on the record, or for a press while `auto_apply` is off, recording
+/// nothing. `Err(NoUpdate)` for a launched successor, which swaps nothing.
+fn boot_lane_under_apply_lock(
+    staging: &Staging,
+    image: crate::ImageReplacement,
+    auto_apply: bool,
+    admitted: AdmittedStage,
+) -> Result<AdmittedStage, ApplyOutcome> {
+    let build = admitted.ready.build_number;
+    let read = read_left_launchers(staging, &admitted.ready);
+    let record = match &read {
+        Ok(launchers) => LeftRecord::Ended(
+            launchers
+                .iter()
+                .filter(|launcher| launcher.has_ended())
+                .count(),
+        ),
+        Err(_) => LeftRecord::Unusable,
+    };
+    let ended = match record {
+        LeftRecord::Ended(ended) => ended,
+        LeftRecord::Unusable => 0,
+    };
+    let mut unusable = read
+        .as_ref()
+        .err()
+        .map(|error| format!("could not be read ({error})"));
+    // A launch left for the automatic lane goes on the record before the lock is let go;
+    // a record that cannot take it is an unusable one, and the lane is asked again.
+    let lane = match boot_image_lane(image, auto_apply, record) {
+        BootImageLane::LeaveForSession => {
+            match record_left_launch(staging, &admitted.ready, read.unwrap_or_default()) {
+                Ok(()) => BootImageLane::LeaveForSession,
+                Err(why) => {
+                    unusable = Some(why);
+                    boot_image_lane(image, auto_apply, LeftRecord::Unusable)
+                }
+            }
+        }
+        lane => lane,
+    };
+    match lane {
+        BootImageLane::SwapAndExec => {
+            if image == crate::ImageReplacement::WindowKeepsImage {
+                crate::warn(&match unusable {
+                    Some(why) => format!(
+                        "boot apply: the record of the launches that left build {build} {why}; \
+                         installing it at this launch's boot (swap and exec) rather than leave \
+                         a stage no escape could count"
+                    ),
+                    None => format!(
+                        "boot apply: {ended} launches left build {build} for their windows' \
+                         in-session lane and ended before it installed; installing it at this \
+                         launch's boot (swap and exec)"
+                    ),
+                });
+            }
+            Ok(admitted)
+        }
+        BootImageLane::LeaveForSession | BootImageLane::LeaveForPress => {
+            let AdmittedStage {
+                lock,
+                budget,
+                ready,
+            } = admitted;
+            drop(budget);
+            drop(lock);
+            crate::log(&if lane == BootImageLane::LeaveForPress {
+                format!(
+                    "boot apply: build {build} left for this window's in-session lane, for a \
+                     press: [update] auto_apply is off, so no window launch installs it \
+                     without one (no swap, no exec before the window)"
+                )
+            } else {
+                format!(
+                    "boot apply: build {build} left for this window's in-session lane (no swap, \
+                     no exec before the window; {ended} earlier launch(es) that left it have \
+                     ended)"
+                )
+            });
+            Err(ApplyOutcome::LeftForSession {
+                build,
+                dmg_sha256: ready.dmg_sha256,
+            })
+        }
+        // A launched successor's lane returned before the admission; here too it swaps
+        // nothing.
+        BootImageLane::NeverSwap => Err(ApplyOutcome::NoUpdate),
+    }
+}
+
+/// Put this launch on the left-stage record for `ready`'s stage, beside `launchers`
+/// (what the record named for it), once. `Err` says why the record cannot hold it.
+fn record_left_launch(
+    staging: &Staging,
+    ready: &Ready,
+    mut launchers: Vec<TrialLauncher>,
+) -> Result<(), String> {
+    let me = TrialLauncher::this_process()
+        .ok_or_else(|| "cannot name this launch (the kernel will not)".to_string())?;
+    if !launchers.contains(&me) {
+        launchers.push(me);
+        write_left_launchers(staging, ready, &launchers)
+            .map_err(|error| format!("could not be written ({error})"))?;
+    }
+    Ok(())
+}
+
+/// The parent's half of a LaunchServices-launched handoff: swap the stage the attempt
+/// authorizes (`expected`) into the install before asking LaunchServices for the
+/// successor, so the process it starts is already NEW and never replaces its own image
+/// (an `execve` some hundred milliseconds after a LaunchServices launch leaves
+/// LaunchServices answering pid -1 for the app for the rest of its life). `Ok` names
+/// the build now installed, with its trial armed for that successor's launches to
+/// count; the apply lock and the verification budget are let go before it returns, no
+/// re-exec stamp is written, and nothing execs. A refusal is returned for the caller to
+/// file: it is not booked in the boot lane's ledger, since this is no boot.
+pub(crate) fn swap_staged_for_launch(
+    current_build: u64,
+    current_commit: &str,
+    expected: &ExpectedArtifact,
+) -> Result<u64, ApplyOutcome> {
+    if !crate::enabled() {
+        return Err(ApplyOutcome::NotApplicable);
+    }
+    let Some(b) = bundle::resolve() else {
+        return Err(ApplyOutcome::NotApplicable);
+    };
+    let Some(staging) = Staging::resolve() else {
+        return Err(ApplyOutcome::NotApplicable);
+    };
+    swap_staged_for_launch_at(
+        &staging,
+        &b.app_root,
+        current_build,
+        Some(current_commit),
+        expected,
+        &SHIPPED_SWAP_SEAMS,
+    )
+}
+
+/// [`swap_staged_for_launch`] over a named staging root and install, with the swap's
+/// readers named, so the conformance test drives it over unsealed fixtures.
+fn swap_staged_for_launch_at(
+    staging: &Staging,
+    installed: &Path,
+    current_build: u64,
+    current_commit: Option<&str>,
+    expected: &ExpectedArtifact,
+    seams: &SwapSeams<'_>,
+) -> Result<u64, ApplyOutcome> {
+    let started = std::time::Instant::now();
+    let SwappedStage {
+        lock,
+        budget,
+        ready,
+        ..
+    } = swap_under_apply_lock(
+        staging,
+        installed,
+        current_build,
+        current_commit,
+        Some(expected),
+        seams,
+    )?;
+    drop(budget);
+    drop(lock);
+    crate::log(&format!(
+        "installed update {} (build {}) in {} ms before launching its successor; the \
+         successor starts as that build and swaps nothing",
+        ready.version,
+        ready.build_number,
+        started.elapsed().as_millis()
+    ));
+    Ok(ready.build_number)
+}
+
 /// Which boot-health lane a counted launch takes ([`boot_health_lane`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BootHealthLane {
@@ -4683,13 +5322,14 @@ mod boot_health_lane_tests {
 /// launches (a crash loop), reverts to the retained OLD bundle and re-execs it.
 /// A trial with no predecessor a revert could restore is settled instead
 /// ([`settle_trial_without_revert`]). Returns `Some` only in the revert path
-/// (which normally execs away); `None` to continue booting the current build.
+/// (which normally execs away, and in a launched successor exits instead:
+/// [`RollbackHandoff::image`]); `None` to continue booting the current
+/// build.
 fn check_boot_health(
     staging: &Staging,
     current_build: u64,
     current_commit: Option<&str>,
-    handoff_fds: &[i32],
-    handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    handoff: RollbackHandoff<'_>,
     handoff_target: bool,
     witness: crate::TrialWitness,
 ) -> Option<ApplyOutcome> {
@@ -4697,8 +5337,7 @@ fn check_boot_health(
         staging,
         current_build,
         current_commit,
-        handoff_fds,
-        handoff_env,
+        handoff,
         handoff_target,
         witness,
         APPLY_LOCK_WAIT,
@@ -4713,8 +5352,7 @@ fn check_boot_health_with_lock_wait(
     staging: &Staging,
     current_build: u64,
     current_commit: Option<&str>,
-    handoff_fds: &[i32],
-    handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    handoff: RollbackHandoff<'_>,
     handoff_target: bool,
     witness: crate::TrialWitness,
     lock_wait: std::time::Duration,
@@ -4723,8 +5361,7 @@ fn check_boot_health_with_lock_wait(
     check_boot_health_with_proof(
         staging,
         current_build,
-        handoff_fds,
-        handoff_env,
+        handoff,
         handoff_target,
         witness,
         lock_wait,
@@ -4740,8 +5377,7 @@ fn check_boot_health_with_lock_wait(
 fn check_boot_health_with_proof(
     staging: &Staging,
     current_build: u64,
-    handoff_fds: &[i32],
-    handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    handoff: RollbackHandoff<'_>,
     handoff_target: bool,
     witness: crate::TrialWitness,
     lock_wait: std::time::Duration,
@@ -4885,10 +5521,7 @@ fn check_boot_health_with_proof(
                     &sentinel,
                     current_build,
                     rollback,
-                    RollbackHandoff {
-                        fds: handoff_fds,
-                        env: handoff_env,
-                    },
+                    handoff,
                     apply_lock,
                 ));
             }
@@ -4940,10 +5573,7 @@ fn check_boot_health_with_proof(
         &sentinel,
         current_build,
         verified_rollback,
-        RollbackHandoff {
-            fds: handoff_fds,
-            env: handoff_env,
-        },
+        handoff,
         apply_lock,
     ))
 }
@@ -5014,17 +5644,38 @@ fn rollback_reexec_command(
     reexec
 }
 
-/// Captured descriptors and the authority environment restored together when
-/// rollback re-execs the predecessor during an inherited handoff.
+/// What this launch was handed, as a crash-loop revert replaces its image: the
+/// descriptors and the authority environment restored together when rollback
+/// re-execs the predecessor during an inherited handoff, and whether the image may be
+/// replaced at all.
+#[derive(Clone, Copy)]
 struct RollbackHandoff<'a> {
     fds: &'a [i32],
     env: &'a [(std::ffi::OsString, std::ffi::OsString)],
+    /// What the revert may do to this image ([`revert_lane`]): a LaunchServices-launched
+    /// successor never replaces its own image (an `execve` leaves LaunchServices
+    /// answering pid -1 for it), so its revert restores the install and returns
+    /// [`ApplyOutcome::Reverted`], and the caller exits. Its parent sees a successor
+    /// that died before its dial and keeps its sessions, as it did when the restored
+    /// build refused the handoff. Every other class re-execs the restored build.
+    image: crate::ImageReplacement,
+}
+
+#[cfg(test)]
+impl RollbackHandoff<'_> {
+    /// No handoff: a launch that may replace its image.
+    const NONE: RollbackHandoff<'static> = RollbackHandoff {
+        fds: &[],
+        env: &[],
+        image: crate::ImageReplacement::Replaceable,
+    };
 }
 
 /// The trialed build is crash-looping: swaps the retained OLD bundle back over the
 /// install, discards the failed new build, sentinel and staged bundle, and re-execs
-/// the restored OLD binary. A missing or temporarily failing inverse swap keeps all
-/// recovery authority and returns Deferred; NEW may still be installed.
+/// the restored OLD binary, or, in a launched successor, returns `Reverted` for the
+/// caller to exit. A missing or temporarily failing inverse swap keeps all recovery
+/// authority and returns Deferred; NEW may still be installed.
 fn revert_to_rollback(
     b: &bundle::Bundle,
     staging: &Staging,
@@ -5037,6 +5688,7 @@ fn revert_to_rollback(
     let RollbackHandoff {
         fds: handoff_fds,
         env: handoff_env,
+        image,
     } = handoff;
     // check_boot_health acquired apply_lock before observing/incrementing. Keep that
     // same CLOEXEC guard through rollback exec; this function never takes stage_lock.
@@ -5130,6 +5782,17 @@ fn revert_to_rollback(
     crate::warn(&format!(
         "reverted a crash-looping update to the previous build {restored_build}{breach}"
     ));
+    // A LAUNCHED SUCCESSOR DOES NOT EXEC THE RESTORED BUILD: LaunchServices started
+    // it, and an image replaced in place keeps a stale LaunchServices record for life.
+    // The install is OLD again and the trial is settled, so it only has to leave: the
+    // caller exits before the dial, and the parent keeps its sessions (the handoff
+    // ends as it did when the restored image refused it on target identity).
+    if revert_lane(image) == RevertLane::ExitInstead {
+        return ApplyOutcome::Reverted(format!(
+            "reverted the crash-looping build {current_build} to build {restored_build}; \
+             this LaunchServices-launched successor exits instead of re-executing it"
+        ));
+    }
     // Re-exec the restored OLD binary as a fresh boot: no re-exec env, no sentinel
     // (already cleared), nothing staged.
     //
@@ -5153,8 +5816,9 @@ fn revert_to_rollback(
 /// The running build takes the install path back from an activation a newer stage
 /// supersedes: the transaction behind [`crate::supersede_installed_activation`].
 ///
-/// When build N's handoff fails, a launched-lane candidate has already boot-applied
-/// it, so N is installed with its boot trial armed and unconfirmed and this
+/// When build N's handoff fails after its swap (the launched lane's parent installs N
+/// before the launch, [`swap_staged_for_launch`]; a fork-lane child or an older build's
+/// candidate boot-applies it), N is installed with its boot trial armed and unconfirmed and this
 /// process's build M at the fixed rollback path. A newer verified stage N' then has
 /// no way in: M cannot swap it (the installed bundle is not M, so there is no
 /// rollback source), a launch of the install path is a launch of N (which refuses
@@ -5587,6 +6251,13 @@ fn reclaim_swapped_out_orphan(staging: &Staging) {
 /// fixed path while that window runs; the first launch after it is gone deletes it
 /// ([`release_kept_predecessor`]), and an update before then reuses the path as it
 /// reuses any retained predecessor ([`prepare_fixed_swap_candidate`]).
+///
+/// SINCE 2026-10-19 THE LAUNCHED SUCCESSOR NO LONGER SWAPS: its parent installs NEW
+/// before the launch ([`swap_staged_for_launch`]), so that window starts at the
+/// installed bundle already holding NEW and never execs. The kept predecessor is still
+/// needed for the lanes that do exec (a cold launch with a stage ready, a fork-lane
+/// successor) and for a successor an older build launched; whether `tccd` then names
+/// the installed path for the launched window is expected, not yet measured.
 fn kept_predecessor_path(staging: &Staging) -> PathBuf {
     staging.root.join("predecessor.kept")
 }
@@ -5847,8 +6518,10 @@ pub(crate) fn stamp_trial_launch(stamp: &Path) -> std::io::Result<()> {
 
 /// Write the name `launch` is counted under ([`TrialLauncher::name`]) to
 /// `stamp`, once: created, never followed and never replaced. A stamp already
-/// there is this launch's own, written before its boot apply re-exec'd it:
-/// `execve` keeps the pid and the kernel's birth stamp.
+/// there is this launch's own, written before an older build's boot apply
+/// re-exec'd it into this one (`execve` keeps the pid and the kernel's birth
+/// stamp). A launched successor of this build never re-execs: its parent swaps
+/// first.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
@@ -6602,16 +7275,12 @@ fn floor_withdrawal_gate(
     let floor = match crate::manifest::Floor::read_for_gate(&staging.floor()) {
         Ok(floor) => floor,
         Err(refusal) => {
-            crate::warn(&format!(
-                "staged build {} not applied: {refusal}",
-                ready.build_number
-            ));
-            crate::status::record(
+            return Some(records_unreadable_deferral(
                 staging,
                 current_build,
-                "deferred: aterm could not read its update records just then",
-            );
-            return Some(ApplyOutcome::Deferred(refusal));
+                ready,
+                refusal,
+            ));
         }
     };
     if ready.build_number < floor.min_build {
@@ -6677,11 +7346,34 @@ fn floor_withdrawal_gate(
     None
 }
 
-/// The swap's gates on the stage it read under the apply lock, in order: the floor's
-/// withdrawals (4b, 4c: [`floor_withdrawal_gate`], which retire), a marker that no
-/// longer names the published stage (retired), and the age of its roster
-/// confirmation (4d: [`roster_freshness_gate`], which waits). `Some` is the lane's
-/// answer; `None` goes on to the install location and the re-verification.
+/// The swap's answer to a record its gates could not read (`refusal`, passing): the
+/// stage waits for a read that can judge it, and nothing is retired.
+fn records_unreadable_deferral(
+    staging: &Staging,
+    current_build: u64,
+    ready: &Ready,
+    refusal: String,
+) -> ApplyOutcome {
+    crate::warn(&format!(
+        "staged build {} not applied: {refusal}",
+        ready.build_number
+    ));
+    crate::status::record(
+        staging,
+        current_build,
+        "deferred: aterm could not read its update records just then",
+    );
+    ApplyOutcome::Deferred(refusal)
+}
+
+/// The swap's gates on the stage it read under the apply lock, in order: the artifact
+/// a seamless handoff's parent authorized (`expected`, [`expected_artifact_refusal`],
+/// which refuses and retires nothing), the floor's withdrawals (4b, 4c:
+/// [`floor_withdrawal_gate`], which retire), the crash-loop quarantine (retired), a
+/// marker that no longer names the published stage (retired), and the age of its
+/// roster confirmation (4d: [`roster_freshness_gate`], which waits). A floor or
+/// quarantine record the gates could not read defers and retires nothing. `Some` is
+/// the lane's answer; `None` goes on to the install location and the re-verification.
 ///
 /// The `Swap` guard of `NativeUpdateRosterFreshness`: a stage on
 /// disk whose roster confirmation is younger than the window. Tier-1:
@@ -6730,12 +7422,38 @@ pub(crate) fn stage_admission_gates(
     staging: &Staging,
     current_build: u64,
     ready: &Ready,
+    expected: Option<&ExpectedArtifact>,
     now: u64,
 ) -> Option<ApplyOutcome> {
+    if let Some(refusal) = expected.and_then(|expected| expected_artifact_refusal(ready, expected))
+    {
+        return Some(ApplyOutcome::Deferred(refusal));
+    }
     if let Some(outcome) = floor_withdrawal_gate(staging, current_build, ready) {
         return Some(outcome);
     }
-    if !ready.is_publishable(staging) {
+    match crate::manifest::artifact_quarantined_for_gate(
+        staging,
+        ready.build_number,
+        &ready.dmg_sha256,
+    ) {
+        Err(refusal) => {
+            return Some(records_unreadable_deferral(
+                staging,
+                current_build,
+                ready,
+                refusal,
+            ));
+        }
+        Ok(true) => {
+            staging.retire_published();
+            return Some(ApplyOutcome::NoUpdate);
+        }
+        Ok(false) => {}
+    }
+    // The bundle without the records: the gates above just judged them, and a second
+    // read that failed on a moment's `EMFILE` would retire a good stage.
+    if !ready.names_published_bundle(staging) {
         staging.retire_published();
         return Some(ApplyOutcome::NoUpdate);
     }

@@ -38,7 +38,13 @@
 //! own word for one agent (`--now`), which probes it once more for that move
 //! ([`starts_with`]). The owner is told ONCE per build (`upgrade_status`'s
 //! `build-fails` fault, keyed by the build), never by a stop per agent the
-//! build was retried into.
+//! build was retried into. The one agent moved onto it first is not left
+//! down (LC-5 of ATERM-KI-1016-1): a Claude Code restart plans, beside its
+//! line onto the build, the line back onto the program its process ran
+//! ([`St::roll_back`]), and a relaunch that ends without registering the
+//! conversation is stopped `no-resume` (the failure noted as above) and
+//! relaunched once on that line, in the same shell, resuming the same
+//! conversation on the build it ran.
 //!
 //! A STOP TAKEN BACK IS NO FAILURE ([`note`]): a relaunch stopped
 //! `no-resume` whose agent came up after all (a start slower than the stale
@@ -53,21 +59,31 @@
 //! presented seconds before the crash, broken at its entry point, left the
 //! agent down until its relaunch went stale (`no-resume`, five minutes) and
 //! its back-off ran out (MEASURED in the real-Claude lab, 2026-10-15: down
-//! 15 minutes). The upgrade's own first move onto a build is how a build is
-//! tried at all, at a quiet moment of an agent that works; a crash's
-//! relaunch is the agent's way back, and is never staked on a build nothing
-//! has proved. So the same probe runs before it for a build no probe has
-//! passed yet, failure noted or not, and its answer is the build's note like
-//! any other ([`Note::proved`]; one that does not pass is not run again
-//! within [`PROBE_GAP_S`]). What it changes of the upgrade's own moves is
-//! only what it found failing (the review of the r20 relaunch lane): a build
-//! it found exiting with a failure holds every move off it, as a noted
-//! failure does — one it could not run (a build presented mid-install) or
-//! that did not end in time (a loaded machine) holds none, and only the
-//! crash's relaunch waits out the gap; and a probe that passed before any
-//! failure blinds nothing: the build's first move failure is met by the
-//! probe after a first failure, as round eighteen meets it ([`Note::blind`]
-//! comes only of a failure after a probe passed since a failure).
+//! 15 minutes). A crash's relaunch is the agent's way back, and is never
+//! staked on a build nothing has proved. So the same probe runs before it
+//! for a build no probe has passed yet, failure noted or not, and its answer
+//! is the build's note like any other ([`Note::proved`]; one that does not
+//! pass is not run again within [`PROBE_GAP_S`]). What it changes of the
+//! upgrade's own moves is only what it found failing (the review of the r20
+//! relaunch lane): a build it found exiting with a failure holds every move
+//! off it, as a noted failure does — one it could not run (a build presented
+//! mid-install) or that did not end in time (a loaded machine) holds none,
+//! and only the crash's relaunch waits out the gap; and a probe that passed
+//! before any failure blinds nothing: the build's first move failure is met
+//! by the probe after a first failure, as round eighteen meets it
+//! ([`Note::blind`] comes only of a failure after a probe passed since a
+//! failure).
+//!
+//! THE UPGRADE'S OWN FIRST MOVE ONTO A BUILD IS PROBED TOO (ATERM-KI-1016-1's
+//! LC-5): the move ends a working agent at a quiet moment, and a build broken
+//! at its entry point ended that agent before its noted failure held the
+//! rest. So a build no probe has run on is probed once before the first move
+//! onto it, with the crash's probe's rule for what holds: found exiting, no
+//! agent is moved onto it; could not run or did not end, the move goes (that
+//! says nothing of the build), and the next move past [`PROBE_GAP_S`] probes
+//! again; passed, it is proved, and a later crash's relaunch takes it too.
+//! What the probe cannot see (a crash in the interface, a resume the build
+//! refuses) is still met by the move, as round eighteen meets it.
 //!
 //! WHAT AN AGENT THE BUILD'S HOLD MEETS IS TOLD (`upgrade::build_hold`): a
 //! round that asked its agent is stopped and the agent released at once; a
@@ -389,8 +405,11 @@ fn note_failure(opts: &Opts, session: &str, st: &St, now: u64) {
 }
 
 /// WHETHER AN AGENT MAY BE MOVED ONTO `to` AT `now`: `Ok` for a build with
-/// no failure to start noted, and for one a probe run since its latest
-/// failure proved to start; else the probe is run now (no sooner than
+/// no failure to start noted that a probe has not found exiting — probed
+/// first where none has run on it (the module's "The upgrade's own first
+/// move"), and held only where that probe sees it exit with a failure — and
+/// for one a probe run since its latest failure proved to start; else the
+/// probe is run now (no sooner than
 /// [`PROBE_GAP_S`] after one that did not pass), its answer recorded and
 /// said once on the ledger (`build-probe:<what>`, as row `r`), and
 /// `Err(`[`BUILD_FAILS`]`)` where it did not pass — or where a move after a
@@ -398,15 +417,28 @@ fn note_failure(opts: &Opts, session: &str, st: &St, now: u64) {
 /// proves again for any agent but one whose move the owner asked for
 /// (`owner_now`, their `--now`): that move is probed once more, and taken
 /// if the probe passes. A dry run runs no build and records nothing: what
-/// is not proved is a wait.
+/// is not proved is a wait. `moving`: the step asked for moves now (an
+/// announcement, a restart, a fresh restart); asked of a round that waits,
+/// a build no probe has run on is not probed yet — its first probe comes
+/// right before the move it would stake an agent on.
 pub fn starts(
     opts: &Opts,
     r: &Report,
     to: &Candidate,
     now: u64,
     owner_now: bool,
+    moving: bool,
 ) -> Result<(), &'static str> {
-    starts_with(opts, r, to, now, owner_now, false, run_probe)
+    gate(
+        opts,
+        r,
+        &Build::of(to),
+        now,
+        owner_now,
+        false,
+        moving,
+        run_probe,
+    )
 }
 
 /// WHETHER A CRASHED AGENT'S RELAUNCH MAY MOVE ONTO `to` AT `now`
@@ -417,7 +449,51 @@ pub fn starts(
 /// `Err(`[`BUILD_FAILS`]`)` where it does not pass. A dry run runs nothing:
 /// what is not proved is a wait.
 pub fn proved(opts: &Opts, r: &Report, to: &Candidate, now: u64) -> Result<(), &'static str> {
-    starts_with(opts, r, to, now, false, true, run_probe)
+    gate(opts, r, &Build::of(to), now, false, true, true, run_probe)
+}
+
+/// [`proved`] for a build named by its program `exe` (what the move types),
+/// its `version` as its store record spells it and its install `source` —
+/// a build whose version the Claude lane's [`Candidate`] cannot hold: Muse
+/// Code's revision form (`1.4.11-R6500.1`), which its live upgrade moves onto
+/// only once proved (`upgrade_drive`'s `muse` module). Its note is filed
+/// under that install and version, as every build's is; a probe that does
+/// not end in time (`--help` waits on Muse's auth lock while another process
+/// holds it, measured) is no proof: `Err(`[`BUILD_FAILS`]`)`, and nothing is
+/// moved onto it until a probe passes, past [`PROBE_GAP_S`].
+pub fn proved_named(
+    opts: &Opts,
+    r: &Report,
+    exe: &Path,
+    version: &str,
+    source: &str,
+    now: u64,
+) -> Result<(), &'static str> {
+    let build = Build {
+        exe,
+        version: version.to_string(),
+        source,
+    };
+    gate(opts, r, &build, now, false, true, true, run_probe)
+}
+
+/// The build a start probe runs and its note is filed under: its program,
+/// its version as its record spells it, its install's word.
+struct Build<'a> {
+    exe: &'a Path,
+    version: String,
+    source: &'a str,
+}
+
+impl<'a> Build<'a> {
+    /// The Claude lane's candidate.
+    fn of(to: &'a Candidate) -> Build<'a> {
+        Build {
+            exe: &to.exe,
+            version: to.version.to_string(),
+            source: to.source.as_str(),
+        }
+    }
 }
 
 /// The probe [`starts`] and [`proved`] run: [`probe`] itself.
@@ -450,7 +526,9 @@ fn run_probe(exe: &Path) -> Probe {
     }
 }
 
-/// [`starts`] over the probe `run` — with `require`, [`proved`].
+/// [`starts`] over the probe `run` for a step that moves — with `require`,
+/// [`proved`]. The tests' seam: production probes through [`gate`].
+#[cfg(all(test, unix))]
 pub fn starts_with(
     opts: &Opts,
     r: &Report,
@@ -460,21 +538,41 @@ pub fn starts_with(
     require: bool,
     run: impl FnOnce(&Path) -> Probe,
 ) -> Result<(), &'static str> {
-    let version = to.version.to_string();
-    let mut note = match load(opts, to.source.as_str(), &version) {
-        Some(note) => note,
-        None if !require => return Ok(()),
-        None => Note {
-            version: version.clone(),
-            source: to.source.as_str().to_string(),
-            ..Note::default()
-        },
-    };
+    gate(opts, r, &Build::of(to), now, owner_now, require, true, run)
+}
+
+/// [`starts_with`], `moving` as [`starts`] takes it.
+#[allow(clippy::too_many_arguments)]
+fn gate(
+    opts: &Opts,
+    r: &Report,
+    to: &Build<'_>,
+    now: u64,
+    owner_now: bool,
+    require: bool,
+    moving: bool,
+    run: impl FnOnce(&Path) -> Probe,
+) -> Result<(), &'static str> {
+    let version = to.version.clone();
+    let mut note = load(opts, to.source, &version).unwrap_or_else(|| Note {
+        version: version.clone(),
+        source: to.source.to_string(),
+        ..Note::default()
+    });
     // No failure noted (or every one taken back): the upgrade's move needs
-    // no proof — unless a probe ran since and the build exited with a
-    // failure (a crash's relaunch found it so: the build's fact, for every
-    // move). A crash's relaunch needs the proof.
-    if note.failures == 0 && !require && !note.found_exiting() {
+    // no proof, but the build is PROBED ONCE before the first agent is staked
+    // on it (ATERM-KI-1016-1's LC-5: a build broken at its entry point ended
+    // the one working agent its first move ended, before its noted failure
+    // held the rest). What that probe finds holds the move only where it ran
+    // the build and saw it exit with a failure — the build's fact, for every
+    // move, as a crash's probe that found it so; one that could not run it or
+    // did not see it end says nothing of the build, holds none, and is run
+    // again past [`PROBE_GAP_S`]. A build proved, a dry read (which runs no
+    // build), a probe of no finding lately and a round that does not move
+    // now (its probe is the move's): the move goes. A crash's relaunch needs
+    // the proof.
+    let first_probe = note.failures == 0 && !require && !note.found_exiting();
+    if first_probe && (!moving || note.proved() || note.refused_lately(now) || opts.dry_run) {
         return Ok(());
     }
     if note.blind && !owner_now {
@@ -486,7 +584,7 @@ pub fn starts_with(
     if note.refused_lately(now) || opts.dry_run {
         return Err(BUILD_FAILS);
     }
-    let found = run(&to.exe);
+    let found = run(to.exe);
     note.probed_for = note.failures;
     note.probed_at = now;
     found.word().clone_into(&mut note.probe);
@@ -497,18 +595,36 @@ pub fn starts_with(
     }
     write(opts, &note);
     let row = Report {
-        to: format!("{version}({})", to.source.as_str()),
+        to: format!("{version}({})", to.source),
         ..said(r.clone(), format!("build-probe:{}", found.word()))
     };
     let failed = match note.failures {
         1 => "once".to_string(),
         n => format!("{n} times"),
     };
+    // The upgrade's own first probe holds its move only by a build it saw
+    // exit with a failure.
+    let goes = passed || (first_probe && found != Probe::Exited);
     let detail = if note.failures == 0 && passed {
         format!(
             "`{} {PROBE_ARG}` ran and exited 0: the build no agent has started on yet is proved \
-             to start without one, so a crashed agent's relaunch may move onto it",
+             to start without one, so an agent may move onto it",
             to.exe.display()
+        )
+    } else if first_probe && goes {
+        format!(
+            "`{} {PROBE_ARG}` {}: that says nothing of the build no agent has started on yet, so \
+             the upgrade's move onto it goes ahead",
+            to.exe.display(),
+            found.words()
+        )
+    } else if first_probe {
+        format!(
+            "`{} {PROBE_ARG}` {}: the build no agent has started on yet does not start, so no \
+             agent is moved onto it (probed again in {} at the earliest)",
+            to.exe.display(),
+            found.words(),
+            crate::harness::upgrade::span(PROBE_GAP_S)
         )
     } else if note.failures == 0 {
         format!(
@@ -542,7 +658,7 @@ pub fn starts_with(
         )
     };
     ledger(opts, &row, &detail);
-    if passed { Ok(()) } else { Err(BUILD_FAILS) }
+    if goes { Ok(()) } else { Err(BUILD_FAILS) }
 }
 
 /// What one start probe found ([`probe`]).

@@ -8,6 +8,7 @@
 //! `ChildSuccessor` here.
 
 use super::*;
+#[cfg(unix)]
 use std::io::{BufRead as _, Write as _};
 use std::path::PathBuf;
 
@@ -289,7 +290,7 @@ fn a_resumed_subscribe_carries_only_what_the_successor_can_answer() {
             Some("subscribe @s-aaaa events since-block=12 since-turn=7\n"),
         ),
         (
-            "@ subscribe screen,events since=4\n",
+            "@. subscribe screen,events since=4\n",
             &tied[..],
             seen,
             Some("@s-aaaa subscribe screen,events since-block=12 since-turn=7\n"),
@@ -322,9 +323,9 @@ fn a_resumed_subscribe_carries_only_what_the_successor_can_answer() {
         ),
         ("subscribe events\n", &tied[..], Some("subscribe events\n")),
         (
-            "@ subscribe screen,events since=4\n",
+            "@. subscribe screen,events since=4\n",
             &tied[..],
-            Some("@ subscribe screen,events\n"),
+            Some("@. subscribe screen,events\n"),
         ),
         // A sid target has no self to fall back to.
         ("subscribe @s-bbbb events\n", &tied[..], None),
@@ -457,6 +458,7 @@ fn a_fallback_to_self_survives_a_leg_that_was_pinned() {
 
 /// A successor's start after any hang-up: a fresh instance. Without it the
 /// in-process fake successor is this test process, started long before.
+#[cfg(unix)]
 fn started_later(_: u32) -> Option<Stamp> {
     Some(Stamp {
         boot: Some(BootClock(u64::MAX)),
@@ -1069,7 +1071,7 @@ fn a_successor_that_closes_on_the_resume_is_asked_again_and_never_a_silent_exit_
         // The forever-silent shape spends the whole successor wait asking:
         // short, and whichever way it ends, it is 75.
         let bound = if closes == usize::MAX {
-            Duration::from_secs(2)
+            Duration::from_millis(500)
         } else {
             REACHED
         };
@@ -2076,11 +2078,16 @@ fn only_anchorless_blocking_reads_are_asked_again() {
         "await idle 500",
         "await match prompt",
         "await inbox",
+        "@s-a await agent idle,prompt timeout=60000",
         // The session log's seq space continues across an update; `need`
         // latches on what the carried fold holds open.
         "await log need",
         "@s-a await log need timeout=600000",
         "await log close=turn since=4 ep=1 timeout=600000",
+        // A predicate list whose every member is `need` latches as `need`
+        // does (5F-1); any list with `since=` reads from its cursor.
+        "await log need,need",
+        "@s-a await log need,close=turn since=4 ep=1 timeout=600000",
     ] {
         assert!(retries_across_replacement(&parts(yes)), "{yes}");
         assert!(is_blocking_read(&parts(yes)), "{yes}");
@@ -2095,6 +2102,7 @@ fn only_anchorless_blocking_reads_are_asked_again() {
         "await consent",
         "await seq 40",
         "await inbox since=12",
+        "@s-a await agent idle,prompt since=7",
         "inbox get 4",
         "inbox since=7",
         "inbox 16 since=7",
@@ -2105,6 +2113,14 @@ fn only_anchorless_blocking_reads_are_asked_again() {
         "await log close=turn",
         "@s-a await log kind=verdict timeout=5000",
         "await log open=step timeout=1000",
+        // A list without `need` is armed at the head like its members.
+        "await log close=turn,kind=note",
+        // So is a since-less list holding `need` beside another member: the
+        // other member is armed at the successor's head, past a settle
+        // close the successor wrote before the retry armed (5F-1).
+        "await log need,close=turn",
+        "@s-a await log close=turn,need timeout=600000",
+        "await log need,kind=note timeout=5000",
         // A local number names a session of the old process.
         "@3 text",
         "@3 await match DONE",
@@ -2127,15 +2143,24 @@ fn only_anchorless_blocking_reads_are_asked_again() {
 
 /// A since-less `await log` cut by a replacement is not asked again, and its
 /// note says how to wait again without missing what the update wrote: from
-/// `status`'s cursor.
+/// `status`'s cursor. So is a since-less list that holds `need` beside
+/// another member (5F-1): its other member would arm at the successor's head.
 #[test]
 fn a_cut_since_less_await_log_says_to_wait_again_from_status() {
     let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
-    let cut = parts("@s-a await log close=turn timeout=600000");
-    assert!(reports_replacement(&cut));
-    assert!(!retries_across_replacement(&cut));
-    let note = not_asked_again_note(&cut);
-    assert!(note.contains("since=<log_seq> ep=<log_ep>"), "{note}");
+    for request in [
+        "@s-a await log close=turn timeout=600000",
+        "@s-a await log need,close=turn timeout=600000",
+    ] {
+        let cut = parts(request);
+        assert!(reports_replacement(&cut), "{request}");
+        assert!(!retries_across_replacement(&cut), "{request}");
+        let note = not_asked_again_note(&cut);
+        assert!(
+            note.contains("since=<log_seq> ep=<log_ep>"),
+            "{request}: {note}"
+        );
+    }
 }
 
 /// A cut `turn` or `post` is reported as a replacement (exit 75, a note that it
@@ -2478,6 +2503,62 @@ fn serve_by(
     }
 }
 
+/// An instance that said it was quitting (`EVENT * bye quit`) and hung up has
+/// no successor to wait for: exit 75 at once, with the bound a successor wait
+/// would take far past the hang detector (a stream that waited would end
+/// only at that bound, [`FAR`]). `bye handoff` is no quit, and a body that
+/// reads like the word is not one.
+#[cfg(unix)]
+#[test]
+fn a_stream_whose_instance_said_bye_quit_ends_at_once_with_75() {
+    let mut t = FrameTracker::new("subscribe @* events,sessions\n");
+    t.feed(b"sub 1 s-a\nEVENT * bye handoff\nDELTA 1 seq=2 screen 1\nEVENT * bye quit\n");
+    assert!(!t.said_quit(), "a handoff, and a screen row");
+    t.feed(b"EVENT * bye quit\n");
+    assert!(t.said_quit());
+    t.start_leg(LegSession::Same);
+    assert!(!t.said_quit(), "a new leg is a new instance's");
+
+    let (_dir, sock) = scratch_sock("rd-quit");
+    let path = sock.to_str().unwrap().to_string();
+    let request = "subscribe @* events,sessions\n";
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let old = fake_server(
+        aterm_uds::CtlListener::bind(&sock).unwrap(),
+        sock.clone(),
+        "OK subscribe 1\nsub 1 s-a\nEVENT * bye quit\n",
+        true,
+        tx,
+    );
+    let stream = CtlStream::connect(&sock).expect("connect");
+    let mut reader = BufReader::new(&stream);
+    handshake(&stream, &mut reader, request);
+    old.join().unwrap();
+    let started = Instant::now();
+    let mut out = Vec::new();
+    let code = relay_subscription(
+        FirstLeg {
+            stream: &stream,
+            reader: &mut reader,
+            dialed: &path,
+            server: Some(gone_pid()),
+            listener: None,
+        },
+        request,
+        None,
+        &Redial::new(Follow::Path(path.clone())).with_bound(FAR),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(code, ExitCode::from(EXIT_REPLACED));
+    assert!(started.elapsed() < REACHED, "{:?}", started.elapsed());
+    assert!(
+        String::from_utf8(out)
+            .unwrap()
+            .contains("EVENT * bye quit\n")
+    );
+}
+
 /// A server that still answers ended the stream on purpose (a fixed-target
 /// subscription whose sessions closed): exit 0 at once, no successor wait.
 #[cfg(unix)]
@@ -2608,10 +2689,12 @@ fn a_blocking_read_is_asked_again_only_where_that_means_the_same_question() {
 /// An explicit `--timeout` bounds the wait for a successor: the classification,
 /// a `subscribe` relay and a blocking read each give up at the deadline (exit
 /// 75). Each must end inside [`REACHED`], a minute's hang detector (AGENTS.md)
-/// that sits minutes under the [`FAR`] bound ignoring the deadline would wait;
-/// the 2 s deadline also leaves the relay time to read its buffered frames.
-/// (With no deadline the verdict is the bound's:
-/// [`a_hangup_is_classified_by_who_serves_the_path_now`].)
+/// that sits minutes under the [`FAR`] bound ignoring the deadline would wait.
+/// The relay's 2 s deadline leaves it time to read its buffered frames first;
+/// the classification and the blocking read wait on nothing but the deadline,
+/// so theirs is short. (With no deadline the verdict is the bound's:
+/// [`a_hangup_is_classified_by_who_serves_the_path_now`].) The wait ends AT
+/// the deadline where it comes before the bound, else at the bound.
 #[cfg(unix)]
 #[test]
 fn an_explicit_timeout_bounds_the_wait_for_a_successor() {
@@ -2619,18 +2702,57 @@ fn an_explicit_timeout_bounds_the_wait_for_a_successor() {
     let path = sock.to_str().unwrap().to_string();
     let gone = gone_pid();
     let deadline = Duration::from_secs(2);
+    let short = Duration::from_millis(200);
+    let until = Instant::now() + short;
+    let ends = |w: Wait| (w.deadline, w.by_deadline, w.started);
+    let (end, by_deadline, _) = ends(Wait::from_now(FAR, Some(until)));
+    assert_eq!((end, by_deadline), (until, true));
+    for later in [Some(until + FAR), None] {
+        let (end, by_deadline, started) = ends(Wait::from_now(short, later));
+        assert_eq!((end, by_deadline), (started + short, false), "{later:?}");
+    }
+    // A deadline already passed: one look where a successor may answer (a listener that
+    // refuses), then gone, by the deadline, the wait it took reported.
+    let (_refusing_dir, refusing) = scratch_sock("rd-passed");
+    let listener = aterm_uds::CtlListener::bind(&refusing).unwrap();
+    let looks = std::thread::spawn(move || {
+        let mut looks = 0;
+        while let Ok((conn, _)) = listener.accept() {
+            let mut request = String::new();
+            let _ = BufReader::new(&conn).read_line(&mut request);
+            if request.starts_with("stop") {
+                break;
+            }
+            looks += 1;
+            let _ = (&conn).write_all(b"ERR busy\n");
+        }
+        looks
+    });
+    let nowhere = refusing.with_file_name("nowhere.sock");
+    let follow = Redial::new(Follow::Path(refusing.to_str().unwrap().to_string()));
+    let verdict = follow.with_bound(FAR).after_host_gone(
+        nowhere.to_str().unwrap(),
+        gone,
+        Some(Instant::now()),
+    );
+    stop(&refusing);
+    assert!(
+        matches!(verdict, Hangup::Gone { waited, by_deadline: true } if !waited.is_zero()),
+        "{verdict:?}"
+    );
+    assert_eq!(looks.join().unwrap(), 1);
     let redial = Redial::new(Follow::Path(path.clone())).with_bound(FAR);
     let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
     let within_the_deadline = |started: Instant| {
         let took = started.elapsed();
         assert!(
             took < REACHED,
-            "took {took:?} against a {deadline:?} deadline and a {FAR:?} bound"
+            "took {took:?}: the deadline, not the {FAR:?} bound, ends the wait"
         );
     };
 
     let started = Instant::now();
-    let verdict = redial.after_hangup(&path, Some(gone), None, Some(started + deadline));
+    let verdict = redial.after_hangup(&path, Some(gone), None, Some(started + short));
     assert!(
         matches!(
             verdict,
@@ -2686,7 +2808,7 @@ fn an_explicit_timeout_bounds_the_wait_for_a_successor() {
         None,
         &parts("@s-a await match prompt"),
         &redial,
-        Some(started + deadline),
+        Some(started + short),
         |_| panic!("no successor to ask"),
         None,
     )

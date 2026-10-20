@@ -13,15 +13,55 @@
 # - The managed dirs, LIVE: an already-running session shell resolves claude/codex
 #   to atpkg's <prefix>/agents twins the moment atpkg lays them - no new tab
 #   (owner ask 2026-09-16; see LIVE below)
-# - Key bindings: the readline chords (Ctrl+A/E/K/U/W/Y, Alt+B/F, ...) layered
+# - Key bindings: the readline chords (Ctrl+A/E/J/K/U/W/Y, Alt+B/F, ...) layered
 #   over PSReadLine's Windows edit mode in an aterm tab; a key the profile bound
-#   to anything but its Windows-mode default keeps that binding, and
+#   to anything but its Windows-mode default keeps that binding, the Emacs block
+#   an earlier aterm setup wrote into a profile gives way to it, and
 #   $env:ATERM_DISABLE_READLINE_KEYS = '1' in $PROFILE turns the layer off
 #   (see KEY BINDINGS below)
 #
 # Compatible with: Windows PowerShell 5.1 and PowerShell 7+ (pwsh) on any OS.
 # ASCII only: aterm writes this file without a BOM, and Windows PowerShell 5.1
 # decodes BOM-less source as ANSI, so non-ASCII bytes would be misread.
+
+# AN OLDER SCRIPT'S ~/.aterm/bin, taken off (2026-10-19). Every script before
+# 613305828c (2026-10-16) set $__aterm_bin to $HOME/.aterm/bin at its first load
+# in a pwsh, left it set, and put that folder FIRST on PATH where it existed;
+# none since does (the package block below says why). The guard just below ends
+# a second load, so such a pwsh kept the entry until it exited, even with this
+# file dot-sourced into it again (a profile re-run after an update). The entry
+# goes where the pwsh PROVES that script put it there, and nowhere else (a
+# v0.106.0 pwsh, say, where a ~/.aterm/bin on PATH is the user's own):
+# $__aterm_bin - a variable, which no nested pwsh inherits and nothing since
+# 613305828c sets - says that script loaded THIS pwsh and names what it
+# prepended, and a folder older than the process (its positive creation time,
+# or last write only when creation is unavailable) says it was there. Then
+# one entry goes, the first equal to it, compared ordinally, and nothing else
+# moves: a copy the user's own profile added keeps the folder on PATH. The
+# variable goes too, so this runs once.
+if ((Test-Path -LiteralPath Variable:\__aterm_bin) -and ($__aterm_bin -is [string])) {
+    $__aterm_old = $__aterm_bin
+    Remove-Variable -Name __aterm_bin -ErrorAction SilentlyContinue
+    Remove-Variable -Name __aterm_bin -Scope Global -ErrorAction SilentlyContinue
+    $__aterm_item = Get-Item -LiteralPath $__aterm_old -Force -ErrorAction SilentlyContinue
+    if ($__aterm_item) {
+        $__aterm_born = $__aterm_item.CreationTimeUtc
+        if ($__aterm_born -le [DateTime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)) {
+            $__aterm_born = $__aterm_item.LastWriteTimeUtc
+        }
+        $__aterm_start = [System.Diagnostics.Process]::GetCurrentProcess().StartTime
+        if ($__aterm_born -lt $__aterm_start.ToUniversalTime()) {
+            $__aterm_sep = [string][System.IO.Path]::PathSeparator
+            $__aterm_parts = [System.Collections.Generic.List[string]]::new(
+                [string[]]($env:PATH -split [regex]::Escape($__aterm_sep)))
+            $__aterm_at = $__aterm_parts.IndexOf($__aterm_old)
+            if ($__aterm_at -ge 0) {
+                $__aterm_parts.RemoveAt($__aterm_at)
+                $env:PATH = $__aterm_parts -join $__aterm_sep
+            }
+        }
+    }
+}
 
 # Skip if already loaded
 if ($env:ATERM_SHELL_INTEGRATION_INSTALLED) { return }
@@ -256,6 +296,64 @@ $Global:__aterm_original_prompt = $function:Prompt
 # $null sentinel = "no prompt observed yet"; 0 = "prompt seen, history empty".
 $Global:__aterm_last_history_id = $null
 
+# --- The exit code of a line that failed ---
+#
+# $? says a line failed; which code it failed with has no one home. A native
+# program sets $LASTEXITCODE, a cmdlet error and `throw` leave it alone, so
+# after `cmd /c exit 7` every later failing cmdlet read as exit 7 too, until a
+# native command succeeded (measured 2026-10-17 on pwsh 7.6.7 and Windows
+# PowerShell 5.1: `Write-Error boom`, `throw "x"` and `Get-Item C:\nope` all
+# reported 7). So the line's start is marked - $LASTEXITCODE and the newest
+# $Error record, taken just before the line runs (the readline shim below, and
+# the end of the prompt where PSReadLine is not loaded) - and a failed line
+# reports, in this order:
+#   - a $LASTEXITCODE that moved to a non-zero value: a native program failed;
+#   - STATUS_CONTROL_C_EXIT (0xC000013A) for a line Ctrl+C stopped (its
+#     history entry is Stopped), the code a console program stopped by Ctrl+C
+#     exits with, so `Start-Sleep 60` reads as `ping -t` does;
+#   - 0 for a line that holds no statement (a lone comment), which runs
+#     nothing and leaves $? as the line before left it (measured: `#J1 alpha`
+#     after a failed `Get-Item` read as an earlier ping's -1073741510);
+#   - an unmoved non-zero $LASTEXITCODE when the line added no error record,
+#     or when its newest record is the native program's own: the same native
+#     failure again (`cmd /c exit 7` twice; Windows PowerShell 5.1 records a
+#     native program's redirected stderr as NativeCommandError, and pwsh 7.4+
+#     under $PSNativeCommandUseErrorActionPreference records the exit itself
+#     as ProgramExitedWithNonZeroCode);
+#   - else 1, a cmdlet's failure.
+# A line that does not parse (a stray `}`) runs nothing and leaves $? as the
+# line before left it, true or false, but its history entry is Failed: it is a
+# failed line, never a statement-less one (measured 2026-10-17 on pwsh 7.6.7
+# and Windows PowerShell 5.1: `}` after a success read 0).
+# Nothing here assigns the user's $LASTEXITCODE or $Error.
+$Global:__aterm_lec_before = $null
+$Global:__aterm_err_before = $null
+function Global:__aterm_mark_line_start {
+    $Global:__aterm_lec_before = $global:LASTEXITCODE
+    $Global:__aterm_err_before = $null
+    if ($global:Error.Count -gt 0) { $Global:__aterm_err_before = $global:Error[0] }
+}
+function Global:__aterm_history_failed($history) {
+    ($null -ne $history) -and ([string]$history.ExecutionStatus -eq 'Failed')
+}
+function Global:__aterm_failed_code($exit, $history) {
+    $moved = ($null -ne $exit) -and ($exit -ne 0) -and ($exit -ne $Global:__aterm_lec_before)
+    if ($moved) { return $exit }
+    if (($null -ne $history) -and ([string]$history.ExecutionStatus -eq 'Stopped')) { return -1073741510 }
+    if (($null -ne $history) -and -not (__aterm_history_failed $history)) {
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput([string]$history.CommandLine, [ref]$null, [ref]$null)
+        if (($null -eq $ast.EndBlock) -or ($ast.EndBlock.Statements.Count -eq 0)) { return 0 }
+    }
+    $new_error = ($global:Error.Count -gt 0) -and -not ($global:Error[0] -eq $Global:__aterm_err_before)
+    if (($null -ne $exit) -and ($exit -ne 0)) {
+        if (-not $new_error) { return $exit }
+        $newest = $global:Error[0]
+        if (($newest -is [System.Management.Automation.ErrorRecord]) -and
+            ([string]$newest.FullyQualifiedErrorId -match '^(NativeCommandError|NativeCommandErrorMessage|ProgramExitedWithNonZeroCode)(,|$)')) { return $exit }
+    }
+    1
+}
+
 function Global:Prompt {
     # Capture $? / $LASTEXITCODE first: any statement below would clobber them.
     $__aterm_ok = $global:?
@@ -276,11 +374,9 @@ function Global:Prompt {
     if ($null -ne $__aterm_history) { $__aterm_hid = $__aterm_history.Id }
     if (($null -ne $Global:__aterm_last_history_id) -and ($__aterm_hid -ne $Global:__aterm_last_history_id)) {
         $__aterm_code = 0
-        if (-not $__aterm_ok) {
-            # A native command's failure lands in $LASTEXITCODE; a cmdlet
-            # error leaves it untouched (possibly 0), so fall back to 1.
-            if (($null -ne $__aterm_exit) -and ($__aterm_exit -ne 0)) { $__aterm_code = $__aterm_exit } else { $__aterm_code = 1 }
-        }
+        # Which code a failed line reports: see "The exit code of a line that
+        # failed" above.
+        if ((-not $__aterm_ok) -or (__aterm_history_failed $__aterm_history)) { $__aterm_code = __aterm_failed_code $__aterm_exit $__aterm_history }
         $__aterm_out += "$__aterm_esc]133;D;$__aterm_code$__aterm_suffix$__aterm_bel"
     }
     $Global:__aterm_last_history_id = $__aterm_hid
@@ -289,8 +385,12 @@ function Global:Prompt {
     # (skip registry/cert/etc. provider locations).
     $__aterm_loc = $ExecutionContext.SessionState.Path.CurrentLocation
     if ($__aterm_loc.Provider.Name -eq 'FileSystem') {
-        $__aterm_uri = __aterm_osc7_path $__aterm_loc.ProviderPath
-        $__aterm_out += "$__aterm_esc]7;file://$([System.Environment]::MachineName)$__aterm_uri$__aterm_bel"
+        $__aterm_uri = "file://$([System.Environment]::MachineName)$(__aterm_osc7_path $__aterm_loc.ProviderPath)"
+        # SIGNED first, then plain (see the zsh script's __aterm_report_cwd).
+        if ($__aterm_suffix) {
+            $__aterm_out += "$__aterm_esc]633;P;AtermCwd=$__aterm_uri$__aterm_suffix$__aterm_bel"
+        }
+        $__aterm_out += "$__aterm_esc]7;$__aterm_uri$__aterm_bel"
 
         # Set tab title to abbreviated CWD (OSC 0). Strip control chars so a
         # crafted directory name cannot smuggle a nested escape sequence.
@@ -306,6 +406,12 @@ function Global:Prompt {
             $__aterm_out += "$__aterm_esc]0;$__aterm_title$__aterm_bel"
         }
     }
+
+    # Bracketed paste (2004) and in-band size reports (2048) off: PowerShell reads
+    # neither, and a program killed with them on (a Claude Code, a vim) left
+    # every later paste in ESC[200~ brackets and every resize typed as
+    # ESC[48;...t at this prompt (measured 2026-10-18 under OpenConsole).
+    $__aterm_out += $__aterm_esc + '[?2004l' + $__aterm_esc + '[?2048l'
 
     # Mark prompt start (OSC 133;A)
     $__aterm_out += "$__aterm_esc]133;A$__aterm_suffix$__aterm_bel"
@@ -323,6 +429,15 @@ function Global:Prompt {
 
     # Mark command line start (OSC 133;B) - after prompt, before user input
     $__aterm_out += "$__aterm_esc]133;B$__aterm_suffix$__aterm_bel"
+    # PSReadLine's own readline in place of the shim: install the shim again
+    # (see the readline shim below).
+    $__aterm_readline = $function:PSConsoleHostReadLine
+    if (($null -ne $__aterm_readline) -and ($null -ne $__aterm_readline.Module) -and ($__aterm_readline.Module.Name -eq 'PSReadLine')) {
+        __aterm_install_readline_shim
+    }
+    # The next line's start, after the user's prompt ran (it may add errors);
+    # the readline shim takes it again once the line is read.
+    __aterm_mark_line_start
     $__aterm_out
 }
 
@@ -330,23 +445,44 @@ function Global:Prompt {
 # (OSC 633;E). PSReadLine's readline shim is the only portable
 # submit-time hook; without PSReadLine these two marks are skipped
 # (prompt marks and cwd tracking above still work).
-if (Get-Module -Name PSReadLine) {
+#
+# The shim wraps whatever PSConsoleHostReadLine is in place when it is installed
+# (a profile's own wrapper included). `Import-Module PSReadLine -Force` puts
+# PSReadLine's own back over it, which left every later line unmarked, with no C
+# and no E, until the shell restarted (measured 2026-10-19 on pwsh 7.6.7 /
+# PSReadLine 2.4.5). So the prompt installs the shim again whenever the function
+# in place is PSReadLine's own (its script block's module is PSReadLine): the
+# line that re-imported it ran through the old shim, so no line goes unmarked,
+# and a PSReadLine first imported after this script gets the shim too. A
+# function other code put over the shim is left alone: it may call the shim,
+# and wrapping it again would loop.
+function Global:__aterm_install_readline_shim {
     $Global:__aterm_original_readline = $function:PSConsoleHostReadLine
     function Global:PSConsoleHostReadLine {
         $__aterm_line = [string]($Global:__aterm_original_readline.Invoke())
         # The managed dirs, live - BEFORE this line executes (see LIVE above).
         __aterm_managed_path_live
+        # The line's start, as it runs: a completer or predictor that ran while
+        # the line was edited may have moved $LASTEXITCODE or $Error.
+        __aterm_mark_line_start
         if ($__aterm_line -and $__aterm_line.Trim()) {
             $__aterm_esc = [char]27
             $__aterm_bel = [char]7
             $__aterm_suffix = __aterm_id_suffix
             # Report command text for session memory (OSC 633;E)
             $__aterm_out = "$__aterm_esc]633;E;$(__aterm_encode_cmd $__aterm_line)$__aterm_suffix$__aterm_bel"
-            # Set tab title to running command (OSC 0).
-            # Truncate to first 64 chars and strip control characters.
+            # Set tab title to running command (OSC 0): the line, control characters
+            # stripped, at most 256 characters; a longer one is its first 255 (never
+            # half a surrogate pair) and an ellipsis, so the tab knows its end is cut
+            # off and never shows a fragment of it as the file (the bash script's "The
+            # command title").
             if (-not $env:ATERM_DISABLE_PROMPT_TITLES) {
                 $__aterm_title = $__aterm_line
-                if ($__aterm_title.Length -gt 64) { $__aterm_title = $__aterm_title.Substring(0, 64) }
+                if ($__aterm_title.Length -gt 256) {
+                    $__aterm_cut = 255
+                    if ([char]::IsHighSurrogate($__aterm_title[$__aterm_cut - 1])) { $__aterm_cut-- }
+                    $__aterm_title = $__aterm_title.Substring(0, $__aterm_cut) + [char]0x2026
+                }
                 $__aterm_title = $__aterm_title -replace '[\x00-\x1f\x7f]', ''
                 $__aterm_out += "$__aterm_esc]0;$__aterm_title$__aterm_bel"
             }
@@ -356,6 +492,7 @@ if (Get-Module -Name PSReadLine) {
         $__aterm_line
     }
 }
+if (Get-Module -Name PSReadLine) { __aterm_install_readline_shim }
 
 # --- KEY BINDINGS: the readline chords, layered over PSReadLine's Windows mode ---
 #
@@ -369,6 +506,13 @@ if (Get-Module -Name PSReadLine) {
 # prefixes and Tab Complete. So the readline chords go over Windows mode, and
 # Tab, Ctrl+Z/V/C/X, Ctrl+Left/Right, Ctrl+Backspace/Delete, Escape and Home/End
 # stay as Windows has them. Alt+D is KillWord in Windows mode already.
+#
+# Ctrl+J is readline's accept-line, as on macOS and Linux. Its legacy byte, LF,
+# reached PSReadLine as Ctrl+Enter, InsertLineAbove, so aterm writes it as the J
+# key's record (char LF), which arrives as Ctrl+j, unbound in Windows mode. A
+# program that reads the character still gets LF: Git Bash runs the line on it
+# (measured 2026-10-17 through ConPTY on pwsh 7.6.7 / PSReadLine 2.4.5, Windows
+# PowerShell 5.1 / PSReadLine 2.0.0 and Git Bash 5.3.9).
 #
 # A chord is bound only where it is unbound or still holds its stock Windows-mode
 # function (each row's third column), so a key the user's profile bound to
@@ -387,11 +531,44 @@ if (Get-Module -Name PSReadLine) {
 # $PROFILE to keep stock Windows mode), and EditMode Windows, so a profile that
 # chose Emacs or Vi is left alone. Once per shell, by the loaded guard at the top.
 #
+# One Emacs is aterm's own, not the user's choice: the block an earlier aterm setup
+# wrote into a Windows PowerShell 5.1 profile (the four lines of
+# $__aterm_legacy_emacs_block below; found 2026-10-18 in a profile.ps1 dated
+# 2026-07-04, and written by no code in this repository's history). It was there
+# for Ctrl+A/E/K/U, which this layer now gives, and it cost Windows mode: in a 5.1
+# tab with it, 18 of 62 key checks failed (Alt+U/L/C typed u/l/c, Ctrl+Z typed ^Z,
+# Ctrl+/Alt+Left/Right, Ctrl+Shift+Left/Right, Ctrl+Backspace/Delete, Escape,
+# Ctrl+Enter, Ctrl+Shift+Enter), and with Windows mode back all 18 passed
+# (measured 2026-10-18 through OpenConsole). So that Emacs goes back to Windows
+# mode and gets the layer
+# (__aterm_legacy_emacs), but only where nothing else can have chosen it or would
+# be lost: setting EditMode rebinds every key to the mode's defaults, dropping any
+# binding made since. All of these hold, else Emacs stays exactly as it is:
+#   - EditMode is Emacs as the layer starts;
+#   - a profile $PROFILE names (aterm starts PowerShell without -NoProfile, so
+#     these are the files that ran) holds the four lines exactly, one after
+#     another, line endings and trailing blanks aside;
+#   - outside those lines no profile names EditMode, KeyHandler or Chord, comments
+#     included: a user's own Set-PSReadLineOption -EditMode, a key binding, PSFzf's
+#     -PSReadlineChordProvider, or a comment such as "# EditMode Emacs: mine",
+#     which is the documented way to keep Emacs with the block in place;
+#   - every bound key holds a PSReadLine function, so no module (oh-my-posh,
+#     PSFzf) has bound a script block the switch would drop.
+# The one binding none of these sees is a PSReadLine function bound to a key by a
+# file the profile dot-sources or by a module: the switch resets it with the rest.
+# A block with any line changed is the user's. Only the Emacs path reads files:
+# $PROFILE's existing files, read whole, once per shell. A start in Windows mode
+# took as long as before, and one in an Emacs of the user's 15 ms longer (measured
+# 2026-10-18 on 5.1 and pwsh 7, the script's load with no profile 68 ms and 62 ms).
+#
 # PowerShell 5.1 ships PSReadLine 2.0.0: it has no -Chord on
 # Get-PSReadLineKeyHandler, so the -Bound list is read whole, and no
 # BackwardKillInput (Ctrl+U falls back to BackwardKillLine) or Upcase/Downcase/
-# CapitalizeWord (those rows are skipped: a row whose function this PSReadLine
-# lacks binds nothing). Key strings are case-significant (Ctrl+C is Copy, Ctrl+c
+# CapitalizeWord. Skipped, those rows left Windows mode typing a bare u, l or c
+# for Alt+U/L/C (measured 2026-10-18), so there each is a script block under the
+# same name that does what 2.4.5's function does (__aterm_case_word): from the
+# caret to the end of the next word, upper-, lower- or capitalized, the caret
+# left after it. Key strings are case-significant (Ctrl+C is Copy, Ctrl+c
 # CopyOrCancelLine) and @{} is not, so the bound list is an Ordinal dictionary.
 # Alt+Left/Right (CSI 1;3D/1;3C) move by word on 5.1 with its own PSReadLine
 # 2.0.0 and on pwsh 7. A 5.1 running PSReadLine 2.4.5 (upgraded by
@@ -421,12 +598,56 @@ if (Get-Module -Name PSReadLine) {
 # variables: they are gone by then, and a block that read $__aterm_rl printed
 # "You cannot call a method on a null-valued expression" at every press and
 # accepted nothing (all measured 2026-10-16 through ConPTY, as above).
+$Global:__aterm_legacy_emacs_block = @(
+    '# aterm: emacs line-editing so Ctrl+A/Ctrl+E/Ctrl+K/Ctrl+U... move the cursor',
+    '# (Windows PowerShell 5.1''s PSReadLine defaults to "Windows" mode, where Ctrl+A =',
+    '# SelectAll and Ctrl+E is unbound). Remove this block to revert.',
+    'if (Get-Module -ListAvailable PSReadLine) { Set-PSReadLineOption -EditMode Emacs }')
+# Whether the Emacs mode PSReadLine is in is aterm's legacy block's alone (see
+# above). Called by the layer with its $ErrorActionPreference = 'Stop', so a file
+# it cannot read stops the layer and leaves Emacs as it is.
+function Global:__aterm_legacy_emacs {
+    if ($null -eq $global:PROFILE) { return $false }
+    $texts = @()
+    foreach ($name in 'AllUsersAllHosts', 'AllUsersCurrentHost', 'CurrentUserAllHosts', 'CurrentUserCurrentHost') {
+        $path = $global:PROFILE.PSObject.Properties[$name]
+        if ((-not $path) -or (-not $path.Value) -or (-not [System.IO.File]::Exists([string]$path.Value))) { continue }
+        $texts += [System.IO.File]::ReadAllText([string]$path.Value)
+    }
+    # An Emacs profile without the block, the usual one, is answered by one search.
+    if (-not ([string]::Join("`n", [string[]]$texts)).Contains($Global:__aterm_legacy_emacs_block[0])) { return $false }
+    $block = "`n" + [string]::Join("`n", [string[]]$Global:__aterm_legacy_emacs_block) + "`n"
+    $found = $false
+    foreach ($text in $texts) {
+        # Its lines without line endings or trailing blanks, less every copy of the
+        # block; a copy right after another loses its leading line feed to the first.
+        $lines = $text.Replace("`r`n", "`n").Replace("`r", "`n").Split("`n")
+        for ($i = 0; $i -lt $lines.Length; $i++) { $lines[$i] = $lines[$i].TrimEnd() }
+        $text = "`n" + [string]::Join("`n", $lines) + "`n"
+        $rest = $text
+        do { $length = $rest.Length; $rest = $rest.Replace($block, "`n") } while ($rest.Length -ne $length)
+        if ($rest.Length -ne $text.Length) { $found = $true }
+        if ($rest -match 'EditMode|KeyHandler|Chord') { return $false }
+    }
+    if (-not $found) { return $false }
+    # A script block's handler lists its BriefDescription, which names no member.
+    $rl = [Microsoft.PowerShell.PSConsoleReadLine]
+    foreach ($handler in @(Get-PSReadLineKeyHandler -Bound)) {
+        if ($rl.GetMember([string]$handler.Function).Length -eq 0) { return $false }
+    }
+    $true
+}
 function Global:__aterm_setup_keybindings {
     # Local to this function: any failure stops the layer, caught by the caller,
     # instead of printing at startup.
     $ErrorActionPreference = 'Stop'
     if (-not (Get-Module -Name PSReadLine)) { return }
-    if ((Get-PSReadLineOption).EditMode -ne 'Windows') { return }
+    $__aterm_mode = [string](Get-PSReadLineOption).EditMode
+    if (($__aterm_mode -eq 'Emacs') -and (__aterm_legacy_emacs)) {
+        Set-PSReadLineOption -EditMode Windows
+        $__aterm_mode = [string](Get-PSReadLineOption).EditMode
+    }
+    if ($__aterm_mode -ne 'Windows') { return }
     $__aterm_bound = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::Ordinal)
     foreach ($__aterm_h in @(Get-PSReadLineKeyHandler -Bound)) {
         $__aterm_k = [string]$__aterm_h.Key
@@ -454,6 +675,54 @@ function Global:__aterm_setup_keybindings {
             }
         }
     }
+    # Alt+U/L/C: PSReadLine's functions, or where this PSReadLine lacks them (2.0.0)
+    # script blocks under the same names over __aterm_case_word (see above).
+    function Global:__aterm_case_word([string]$how) {
+        $line = $null
+        $cursor = $null
+        [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
+        $delimiters = (Get-PSReadLineOption).WordDelimiters
+        $end = $cursor
+        while ($end -lt $line.Length -and ([char]::IsWhiteSpace($line[$end]) -or $delimiters.IndexOf($line[$end]) -ge 0)) { $end++ }
+        while ($end -lt $line.Length -and -not ([char]::IsWhiteSpace($line[$end]) -or $delimiters.IndexOf($line[$end]) -ge 0)) { $end++ }
+        if ($end -le $cursor) { return }
+        $word = $line.Substring($cursor, $end - $cursor)
+        if ($how -eq 'Upcase') { $word = $word.ToUpper() }
+        elseif ($how -eq 'Downcase') { $word = $word.ToLower() }
+        else {
+            $first = 0
+            while ($first -lt $word.Length -and -not [char]::IsLetter($word[$first])) { $first++ }
+            if ($first -lt $word.Length) {
+                $word = $word.Substring(0, $first) + $word.Substring($first, 1).ToUpper() + $word.Substring($first + 1).ToLower()
+            }
+        }
+        [Microsoft.PowerShell.PSConsoleReadLine]::Replace($cursor, $end - $cursor, $word)
+        [Microsoft.PowerShell.PSConsoleReadLine]::SetCursorPosition($end)
+    }
+    $__aterm_upcase = 'UpcaseWord'
+    if (-not $__aterm_rl.GetMethod('UpcaseWord')) {
+        $__aterm_upcase = @{
+            BriefDescription = 'UpcaseWord'
+            Description      = 'Upcase from the cursor to the end of the word (aterm readline keys)'
+            ScriptBlock      = { param($key, $arg) __aterm_case_word 'Upcase' }
+        }
+    }
+    $__aterm_downcase = 'DowncaseWord'
+    if (-not $__aterm_rl.GetMethod('DowncaseWord')) {
+        $__aterm_downcase = @{
+            BriefDescription = 'DowncaseWord'
+            Description      = 'Downcase from the cursor to the end of the word (aterm readline keys)'
+            ScriptBlock      = { param($key, $arg) __aterm_case_word 'Downcase' }
+        }
+    }
+    $__aterm_capitalize = 'CapitalizeWord'
+    if (-not $__aterm_rl.GetMethod('CapitalizeWord')) {
+        $__aterm_capitalize = @{
+            BriefDescription = 'CapitalizeWord'
+            Description      = 'Capitalize the word from the cursor and move past it (aterm readline keys)'
+            ScriptBlock      = { param($key, $arg) __aterm_case_word 'Capitalize' }
+        }
+    }
     # chord, function (a PSReadLine function's name, or a script block handler's
     # Set-PSReadLineKeyHandler parameters), the stock Windows-mode function it may
     # replace ('' = unbound)
@@ -471,14 +740,15 @@ function Global:__aterm_setup_keybindings {
             @('Ctrl+t', 'SwapCharacters', ''),
             @('Ctrl+y', 'Yank', 'Redo'),
             @('Ctrl+_', 'Undo', ''),
+            @('Ctrl+j', 'AcceptLine', ''),
             @('Alt+b', 'BackwardWord', ''),
             @('Alt+f', 'ForwardWord', ''),
             @('Alt+Backspace', 'BackwardKillWord', ''),
             @('Alt+LeftArrow', 'BackwardWord', ''),
             @('Alt+RightArrow', 'ForwardWord', ''),
-            @('Alt+u', 'UpcaseWord', ''),
-            @('Alt+l', 'DowncaseWord', ''),
-            @('Alt+c', 'CapitalizeWord', ''))) {
+            @('Alt+u', $__aterm_upcase, ''),
+            @('Alt+l', $__aterm_downcase, ''),
+            @('Alt+c', $__aterm_capitalize, ''))) {
         $__aterm_how = $__aterm_row[1]
         if ($__aterm_how -is [string]) {
             if (-not $__aterm_rl.GetMethod($__aterm_how)) { continue }

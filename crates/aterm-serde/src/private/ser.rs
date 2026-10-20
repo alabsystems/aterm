@@ -418,6 +418,9 @@ mod content {
         TupleStruct(&'static str, Vec<Content>),
         TupleVariant(&'static str, u32, &'static str, Vec<Content>),
         Map(Vec<(Content, Content)>),
+        /// A map key that is a struct's field (aterm's own: see
+        /// `SerializeMap::serialize_field_entry`), replayed as one.
+        Field(&'static str),
         Struct(&'static str, Vec<(&'static str, Content)>),
         StructVariant(
             &'static str,
@@ -447,6 +450,7 @@ mod content {
                 Content::F64(f) => serializer.serialize_f64(f),
                 Content::Char(c) => serializer.serialize_char(c),
                 Content::String(ref s) => serializer.serialize_str(s),
+                Content::Field(name) => serializer.serialize_str(name),
                 Content::Bytes(ref b) => serializer.serialize_bytes(b),
                 Content::None => serializer.serialize_none(),
                 Content::Some(ref c) => serializer.serialize_some(&**c),
@@ -486,7 +490,10 @@ mod content {
                     use crate::ser::SerializeMap;
                     let mut map = tri!(serializer.serialize_map(Some(entries.len())));
                     for (k, v) in entries {
-                        tri!(map.serialize_entry(k, v));
+                        tri!(match *k {
+                            Content::Field(name) => map.serialize_field_entry(name, v),
+                            _ => map.serialize_entry(k, v),
+                        });
                     }
                     map.end()
                 }
@@ -894,6 +901,15 @@ mod content {
             self.entries.push((key, value));
             Ok(())
         }
+
+        fn serialize_field_entry<T>(&mut self, key: &'static str, value: &T) -> Result<(), E>
+        where
+            T: ?Sized + Serialize,
+        {
+            let value = tri!(value.serialize(ContentSerializer::<E>::new()));
+            self.entries.push((Content::Field(key), value));
+            Ok(())
+        }
     }
 
     pub struct SerializeStruct<E> {
@@ -1184,6 +1200,13 @@ where
         self.0.serialize_entry(key, value)
     }
 
+    fn serialize_field_entry<T>(&mut self, key: &'static str, value: &T) -> Result<(), Self::Error>
+    where
+        T: ?Sized + Serialize,
+    {
+        self.0.serialize_field_entry(key, value)
+    }
+
     fn end(self) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -1199,11 +1222,12 @@ where
     type Ok = ();
     type Error = M::Error;
 
+    /// A flattened struct's field is still a field (`serialize_field_entry`).
     fn serialize_field<T>(&mut self, key: &'static str, value: &T) -> Result<(), Self::Error>
     where
         T: ?Sized + Serialize,
     {
-        self.0.serialize_entry(key, value)
+        self.0.serialize_field_entry(key, value)
     }
 
     fn end(self) -> Result<(), Self::Error> {

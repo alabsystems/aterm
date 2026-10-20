@@ -22,16 +22,29 @@
 #       re-answer every `shape` and `read` line of the committed corpora with
 #       the registry crates and diff (the facade cross-check)
 #   targo --unverified run -- hint ../../.. ../../fixtures/font-oracle/hinting.txt
-#       re-record the hinting corpus (skrifa's grid-fitted masks)
+#       re-record the hinting corpus (skrifa's grid-fitted masks) for the
+#       faces this host has, keeping every other host's lines
+#   targo --unverified run -- shape ../../.. ../../fixtures/font-oracle/shaping.txt
+#       record rustybuzz's `shape` lines for the colour faces this host has
+#       (a bless in the workspace never writes `shape` lines since TF.6)
 #   targo --unverified run -- gvar-alloc ../../.. ../../fixtures/font-oracle/reader-gvar-alloc.txt
 #       re-record the `read` answers of the faces past 32 `gvar` tuples
 #   targo --unverified run --release -- differential ../../.. [runs]
 #       shape seeded random runs with rustybuzz and with aterm-font's shaper
 #       and compare them (TF.6; the text domain is in src/differential.rs)
-#   targo --unverified run --release -- hint-differential ../../..
+#   targo --unverified run --release -- hint-differential ../../.. [font dir...]
 #       hint every face this host has with skrifa and with aterm-font's
 #       autohinter and compare the fitted outlines (TF.4; the domain is in
 #       src/hint_diff.rs)
+#   targo --unverified run -- budgets ../../.. [font dir...]
+#       count every glyph's outline steps and colour glyph's paint tables
+#       against aterm-font's work budgets, each glyph held to ttf-parser's
+#       answer (TF.5; src/budgets.rs). A debug build: aterm-font counts only
+#       with debug assertions on, so never --release here
+# In the Linux lane, from the checkout: `targo --unverified lab linux exec --
+# cargo run --manifest-path crates/aterm-render/tests/font_oracle/recorder/Cargo.toml
+# -- <mode> crates/aterm-render ...`; the checkout is read-only there, so a
+# record writes under the guest's /tmp and is copied out.
 # It includes ../probe.rs, ../reader.rs, ../shaper.rs, ../hint_raster.rs and
 # aterm-render's src/raster.rs by path, so it answers with the same code the
 # pin tests and the renderer run (reader.rs on ttf-parser here, on aterm-font
@@ -50,10 +63,11 @@ rustybuzz = "=0.20.1"
 ttf-parser = { version = "=0.25.1", features = ["gvar-alloc"] }
 skrifa = "=0.46.2"
 # `differential` and `hint-differential` only: aterm-font's shaper (by
-# `../shaper.rs`) and autohinter (its default `hint` feature), its Unicode
-# tables and bidi data. First-party crates with no third-party dependency, so
-# the registry crates above still resolve unpatched.
-aterm-font = { path = "../../../../aterm-font" }
+# `../shaper.rs`) and autohinter (its `hint` feature, named here so a profile
+# without debug assertions has it too), its Unicode tables and bidi data.
+# First-party crates with no third-party dependency, so the registry crates
+# above still resolve unpatched.
+aterm-font = { path = "../../../../aterm-font", features = ["hint"] }
 aterm-grapheme = { path = "../../../../aterm-grapheme" }
 aterm-bidi = { path = "../../../../aterm-bidi" }
 

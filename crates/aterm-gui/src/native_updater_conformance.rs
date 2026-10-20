@@ -11,12 +11,12 @@
 #![cfg(test)]
 
 use aterm_models_misc::native_update_disk_transaction_model;
-use aterm_models_release::native_updater_model;
 #[cfg(unix)]
 use aterm_models_update::native_update_auto_intent_model;
 use aterm_models_update::{
     native_update_admission_model, native_update_apply_ladder_model,
     native_update_attempt_identity_model, native_update_hidden_output_quiet_model,
+    native_updater_model,
 };
 use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, admits};
@@ -57,7 +57,7 @@ fn status(staged_build: Option<u64>, failing_checks: u32) -> DurableUpdateStatus
         apply_failure: String::new(),
         apply_failure_build: 0,
         apply_failures_for_target: 0,
-        installable: true,
+        installable: Some(true),
         channel_unreadable: false,
         checked_at: None,
     }
@@ -436,6 +436,9 @@ fn real_gui_boot_health_dispatch_requires_first_present_before_model_disarm() {
 
 fn admission_before(model: &Model, facts: AdmissionFacts) -> State {
     let mut state = model.init_state();
+    if facts.image_kept {
+        state = model.successors("KeepImage", &state)[0].clone();
+    }
     if !facts.staged_verified {
         state = model.successors("InvalidateArtifact", &state)[0].clone();
     }
@@ -499,50 +502,60 @@ fn admission_action(decision: AdmissionDecision) -> &'static str {
         | AdmissionDecision::Block(AdmissionBlock::LivePtysNeedSeamless) => {
             "BlockForegroundWithoutSeamless"
         }
+        AdmissionDecision::Block(AdmissionBlock::KeptImageNeedsTerminal) => {
+            "BlockKeptImageWithoutTerminal"
+        }
     }
 }
 
 /// Exhaust the bounded admission fact matrix against the genuine shipping
 /// classifier. This binds the model's foreground-job progress and cold-fallback
-/// safety predicates to compiled code rather than duplicating the policy in a
-/// test-only oracle.
+/// safety predicates, and the kept image's refusal of the cold lane, to compiled
+/// code rather than duplicating the policy in a test-only oracle.
 #[test]
 fn real_update_admission_classifier_conforms_for_every_bounded_fact_combination() {
     let model = native_update_admission_model();
-    for staged_verified in [false, true] {
-        for seamless_capable in [false, true] {
-            for live_ptys in [0, 1] {
-                for foreground_jobs in [0, 1] {
-                    for unknown_foregrounds in [0, 1] {
-                        for native_state_certified in [false, true] {
-                            if foreground_jobs > live_ptys || unknown_foregrounds > live_ptys {
-                                continue;
-                            }
-                            let facts = AdmissionFacts {
-                                staged_verified,
-                                seamless_capable,
-                                native_state_certified,
-                                live_ptys,
-                                foreground_jobs,
-                                unknown_foregrounds,
-                            };
-                            let before = admission_before(&model, facts);
-                            let decision = classify(facts);
-                            let after = project_admission_decision(&before, decision);
-                            let action = admission_action(decision);
-                            assert_eq!(
-                                model.successors(action, &before).as_slice(),
-                                std::slice::from_ref(&after),
-                                "shipping admission decision {decision:?} for {facts:?} must refine {action}"
+    for (staged_verified, seamless_capable, image_kept) in
+        [false, true].into_iter().flat_map(|verified| {
+            [false, true].into_iter().flat_map(move |seamless| {
+                [false, true]
+                    .into_iter()
+                    .map(move |kept| (verified, seamless, kept))
+            })
+        })
+    {
+        for live_ptys in [0, 1] {
+            for foreground_jobs in [0, 1] {
+                for unknown_foregrounds in [0, 1] {
+                    for native_state_certified in [false, true] {
+                        if foreground_jobs > live_ptys || unknown_foregrounds > live_ptys {
+                            continue;
+                        }
+                        let facts = AdmissionFacts {
+                            staged_verified,
+                            seamless_capable,
+                            native_state_certified,
+                            live_ptys,
+                            foreground_jobs,
+                            unknown_foregrounds,
+                            image_kept,
+                        };
+                        let before = admission_before(&model, facts);
+                        let decision = classify(facts);
+                        let after = project_admission_decision(&before, decision);
+                        let action = admission_action(decision);
+                        assert_eq!(
+                            model.successors(action, &before).as_slice(),
+                            std::slice::from_ref(&after),
+                            "shipping admission decision {decision:?} for {facts:?} must refine {action}"
+                        );
+                        assert_eq!(admits(&model, &before, &after), Some(action));
+                        for invariant in &model.invariants {
+                            assert!(
+                                model.check_invariant(invariant.name, &after),
+                                "shipping decision violates {} for {facts:?}: {after:?}",
+                                invariant.name
                             );
-                            assert_eq!(admits(&model, &before, &after), Some(action));
-                            for invariant in &model.invariants {
-                                assert!(
-                                    model.check_invariant(invariant.name, &after),
-                                    "shipping decision violates {} for {facts:?}: {after:?}",
-                                    invariant.name
-                                );
-                            }
                         }
                     }
                 }
@@ -559,6 +572,7 @@ fn real_update_admission_classifier_conforms_for_every_bounded_fact_combination(
         live_ptys: 1,
         foreground_jobs: 1,
         unknown_foregrounds: 0,
+        image_kept: false,
     };
     assert_eq!(
         classify(facts),
@@ -598,6 +612,25 @@ fn real_update_admission_classifier_conforms_for_every_bounded_fact_combination(
     let hung_up = buggy.successors("ReexecColdOverLiveSessions", &before)[0].clone();
     assert_eq!(admits(&model, &before, &hung_up), None);
     assert!(!buggy.check_invariant("ColdFallbackNeverDropsForeground", &hung_up));
+
+    // Negative control for the kept image: with no terminal and no seamless lane, a
+    // process that kept its image is refused, retryably. Without that check the
+    // classifier would admit the cold lane, which execs in place and leaves
+    // LaunchServices answering pid -1 for the app.
+    let facts = AdmissionFacts {
+        live_ptys: 0,
+        foreground_jobs: 0,
+        image_kept: true,
+        ..facts
+    };
+    assert_eq!(
+        classify(facts),
+        AdmissionDecision::Block(AdmissionBlock::KeptImageNeedsTerminal)
+    );
+    let before = admission_before(&model, facts);
+    let exec_in_place = buggy.successors("ClassifyColdOverKeptImage", &before)[0].clone();
+    assert_eq!(admits(&model, &before, &exec_in_place), None);
+    assert!(!buggy.check_invariant("KeptImageNeverReexecsCold", &exec_in_place));
 }
 
 fn assert_exact_model_action(model: &Model, action: &'static str, before: &State, after: &State) {
@@ -1049,6 +1082,7 @@ fn real_bundle_swap_keeps_the_latch_as_the_model_s_bundle_swap() {
             trial_launches: 0,
         }),
         installed_unproven: false,
+        installable: None,
     });
     assert!(
         app.native_updater_service
@@ -1506,6 +1540,7 @@ fn observation(
         }),
         installed,
         installed_unproven: unproven,
+        installable: None,
     }
 }
 

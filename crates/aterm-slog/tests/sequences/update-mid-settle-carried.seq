@@ -1,0 +1,13 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# §5.2: an armed settle crosses a carried update with the time its word
+# first held: the successor's settle comes due when the predecessor's would,
+# and closes the turn dated at its rest.
+see busy
+see idle
+pass 500
+handoff carried
+expect turn=t1
+expect wake=1000
+wait 500
+expect open t1 turn
+expect close t1 turn out=done at=0

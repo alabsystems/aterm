@@ -6,8 +6,8 @@
 //! * `aterm ai` — the doctor, read-only: one row per AI CLI and the health. Exit 0.
 //! * `aterm ai doctor [--read-only] [--json] [--on <host>,… | --fleet]` — looks, then on a
 //!   terminal a person is at signs in each CLI that needs it through the vendor's own flow,
-//!   one after another, and looks again. Exit 1 when a wanted, measured CLI still needs a
-//!   person.
+//!   one after another, and looks again. Exit 1 when a wanted CLI is definitely missing
+//!   its installation or login.
 //! * `aterm ai login <id>` — one CLI's sign-in.
 //! * `aterm ai review […]` and `aterm ai review --show <id>` — reviews across AIs.
 //! * `aterm ai fleet […]` — the fleet document: its status, a fetch, and the owner's signing.
@@ -671,7 +671,7 @@ fn doctor_here(
         .rows
         .iter()
         .enumerate()
-        .filter(|(_, r)| r.wanted && (r.mark == Mark::Fail || matches!(r.state, State::Due(_))))
+        .filter(|(_, r)| r.state.needs_person(r.wanted))
         .map(|(i, _)| i)
         .collect();
     if json || fix.is_err() || needs.is_empty() {
@@ -721,7 +721,7 @@ fn doctor_here(
             ) else {
                 continue;
             };
-            if r.mark == Mark::Fail || matches!(r.state, State::Due(_)) {
+            if r.state.needs_person(r.wanted) {
                 let done = sign_in_one(env, runner, &store, f, r, out);
                 let _ = writeln!(out, "{}", done_line(f.connector, &done));
             } else {

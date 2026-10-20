@@ -525,16 +525,19 @@ fn chat_row(row: &str) -> Option<(Option<u8>, bool)> {
         .then_some((None, focused))
 }
 
-/// The multi-select button row: one word at column 5, or `❯` and four
-/// spaces before it (the focus).
+/// The multi-select button row: one word of letters at column 5 (`Submit`,
+/// `Next`), or `❯` and four spaces before it (the focus). A word with any
+/// other mark in it is no label but the free-text row's last text row with
+/// `Submit` drawn over it: the rest of that row glued to the word
+/// (`❯    Submitked.)`, 2.1.300 MEASURED at 57 columns; with a space in the
+/// rest, `❯    Submit asked.)`, it is no one word either).
 fn button_row(row: &str) -> Option<(String, bool)> {
     let (focused, rest) = match row.strip_prefix('❯') {
         Some(rest) => (true, rest.strip_prefix("    ")?),
         None => (false, row.strip_prefix("     ")?),
     };
     let word = crate::text::trim_end(rest);
-    (!word.is_empty() && !word.starts_with(' ') && !word.contains(char::is_whitespace))
-        .then(|| (word.to_string(), focused))
+    (!word.is_empty() && word.chars().all(char::is_alphabetic)).then(|| (word.to_string(), focused))
 }
 
 /// The tab bar: ` ☐ Colors` (one chip, column 1), or `←  ☐ A  ☒ B  ✔ Submit

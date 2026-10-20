@@ -37,6 +37,8 @@ use aterm_lexicon::Lexicon;
 use aterm_models_effects::console_cursor_home_model;
 use aterm_spec::derive::Model;
 
+use crate::common::FrameHold;
+
 /// The recording's grid (`resize 40 120`, 7x14 px cells) and composer row.
 const ROWS: u16 = 40;
 const COLS: u16 = 120;
@@ -44,8 +46,6 @@ const CW: u16 = 7;
 const CH: u16 = 14;
 const ROW: u16 = 37;
 const FRAME_MS: u64 = 16;
-/// `app_render.rs`'s `SYNC_HOLD_CAP`.
-const SYNC_HOLD_CAP: Duration = Duration::from_millis(150);
 /// A bracket length measured live, and one past the terminal's 1 s timeout.
 const OWNER_MS: u64 = 280;
 const PAST_TIMEOUT_MS: u64 = 1_300;
@@ -182,33 +182,6 @@ fn full_repaint(src: &str) -> Vec<u8> {
     paint
 }
 
-/// `app_render.rs`'s `sync_frame_hold`, its logic verbatim.
-fn sync_frame_hold(
-    active: bool,
-    open_dirty: bool,
-    end_seq: u64,
-    was_active: bool,
-    armed: (Option<Instant>, u64),
-    now: Instant,
-) -> (Option<Instant>, bool, u64) {
-    if !active {
-        return (None, false, end_seq);
-    }
-    if was_active && end_seq != armed.1 {
-        return (Some(now + SYNC_HOLD_CAP), open_dirty, end_seq);
-    }
-    let mut deadline = if was_active {
-        armed.0
-    } else {
-        Some(now + SYNC_HOLD_CAP)
-    };
-    let hold = deadline.is_some_and(|d| now < d);
-    if !hold {
-        deadline = None;
-    }
-    (deadline, hold, end_seq)
-}
-
 /// One present, as the pet drew it.
 #[derive(Clone, Copy, Debug)]
 struct Shot {
@@ -232,9 +205,7 @@ struct Host {
     contract: Contract,
     t0: Instant,
     now: Instant,
-    sync_was_active: bool,
-    sync_hold_until: Option<Instant>,
-    sync_armed_seq: u64,
+    hold: FrameHold,
     painted: Option<(u16, u16)>,
     shots: Vec<Shot>,
     /// The last present's cell snapshot, keyed by the terminal's
@@ -253,7 +224,6 @@ impl Host {
         let mut owner = CompanionOwner::default();
         owner.set_enabled_seed(true, 0x5EED);
         let now = Instant::now();
-        let sync_armed_seq = term.sync_end_seq();
         Self {
             term,
             owner,
@@ -263,9 +233,7 @@ impl Host {
             contract,
             t0: now,
             now,
-            sync_was_active: false,
-            sync_hold_until: None,
-            sync_armed_seq,
+            hold: FrameHold::default(),
             painted: None,
             shots: Vec::new(),
             input: None,
@@ -288,19 +256,7 @@ impl Host {
     /// past the cap is presented as it stands. Then the pet's frame, in the
     /// native order: observe, prepare, tick, and the rescan it reads next.
     fn present(&mut self) {
-        let active = self.term.modes().synchronized_output();
-        let (deadline, hold, seq) = sync_frame_hold(
-            active,
-            self.term.sync_open_dirty(),
-            self.term.sync_end_seq(),
-            self.sync_was_active,
-            (self.sync_hold_until, self.sync_armed_seq),
-            self.now,
-        );
-        self.sync_was_active = active;
-        self.sync_hold_until = deadline;
-        self.sync_armed_seq = seq;
-        if hold {
+        if self.hold.withholds(&self.term, self.now) {
             return;
         }
         let mutations = self.term.screen_mutations();

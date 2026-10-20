@@ -33,6 +33,12 @@
 //! * **`\u` escapes must pair.** A lone surrogate half is refused rather than
 //!   silently replaced, because it is not a character.
 //! * **unescaped control characters are refused** in strings, per RFC 8259.
+//! * **every map the writer accepts reads back as itself.** A key that is not
+//!   a string (an integer of any width, a `bool`, a newtype over one) is
+//!   written in `Display`'s spelling and read back from that spelling only:
+//!   `"007"`, `"+7"` and `"-0"` are refused where an integer key is expected.
+//!   serde's buffer (a flattened map, an untagged or internally tagged enum)
+//!   reads its keys by the same rule (`serde::de::value::TextKeyDeserializer`).
 //! * **duplicate keys reach the visitor.** [`Value`] and maps keep the last
 //!   value; `#[derive(Deserialize)]` structs reject duplicate fields, matching
 //!   `serde_json`. [`aterm_toml`](https://docs.rs/aterm-toml) rejects duplicate
@@ -97,4 +103,117 @@ pub fn from_value<T: DeserializeOwned>(value: Value) -> Result<T> {
     // Same reasoning as [`to_value`].
     let text = to_vec(&value)?;
     from_slice(&text)
+}
+
+/// Return the maximum container nesting depth enforced by the deserializer (`127`).
+#[must_use]
+pub const fn recursion_limit() -> usize {
+    127
+}
+
+/// Return `true` when `depth` is within the JSON container recursion limit (`<= 127`).
+#[must_use]
+pub const fn within_recursion_limit(depth: usize) -> bool {
+    depth <= 127
+}
+
+/// Return `true` when `b` is RFC 8259 JSON whitespace (`' '`, `'\t'`, `'\n'`, `'\r'`).
+#[must_use]
+pub const fn is_json_whitespace_byte(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// Return `true` when `b` is an unescaped RFC 8259 control byte (`0x00..=0x1F`).
+#[must_use]
+pub const fn is_json_control_byte(b: u8) -> bool {
+    b <= 0x1f
+}
+
+/// Return `true` when `code` is a UTF-16 high surrogate (`0xD800..=0xDBFF`).
+#[must_use]
+pub const fn is_utf16_high_surrogate(code: u16) -> bool {
+    code >= 0xd800 && code <= 0xdbff
+}
+
+/// Return `true` when `code` is a UTF-16 low surrogate (`0xDC00..=0xDFFF`).
+#[must_use]
+pub const fn is_utf16_low_surrogate(code: u16) -> bool {
+    code >= 0xdc00 && code <= 0xdfff
+}
+
+/// Combine a valid UTF-16 surrogate pair (`high` in `0xD800..=0xDBFF`, `low` in
+/// `0xDC00..=0xDFFF`) into its Unicode scalar value (`0x10000..=0x10FFFF`).
+#[must_use]
+pub const fn decode_surrogate_pair(high: u16, low: u16) -> Option<u32> {
+    if !is_utf16_high_surrogate(high) || !is_utf16_low_surrogate(low) {
+        return None;
+    }
+    let hi = (high - 0xd800) as u32;
+    let lo = (low - 0xdc00) as u32;
+    Some(0x10000 + ((hi << 10) | lo))
+}
+
+/// Encode a JSON token span (`offset`, `len`, `line`, `col`) into 16 little-endian bytes.
+#[must_use]
+pub const fn encode_json_span_le(offset: u32, len: u32, line: u32, col: u32) -> [u8; 16] {
+    [
+        offset as u8,
+        (offset >> 8) as u8,
+        (offset >> 16) as u8,
+        (offset >> 24) as u8,
+        len as u8,
+        (len >> 8) as u8,
+        (len >> 16) as u8,
+        (len >> 24) as u8,
+        line as u8,
+        (line >> 8) as u8,
+        (line >> 16) as u8,
+        (line >> 24) as u8,
+        col as u8,
+        (col >> 8) as u8,
+        (col >> 16) as u8,
+        (col >> 24) as u8,
+    ]
+}
+
+/// Decode 16 little-endian bytes into a JSON token span (`offset`, `len`, `line`, `col`).
+#[must_use]
+pub const fn decode_json_span_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
+    let offset = (bytes[0] as u32)
+        | ((bytes[1] as u32) << 8)
+        | ((bytes[2] as u32) << 16)
+        | ((bytes[3] as u32) << 24);
+    let len = (bytes[4] as u32)
+        | ((bytes[5] as u32) << 8)
+        | ((bytes[6] as u32) << 16)
+        | ((bytes[7] as u32) << 24);
+    let line = (bytes[8] as u32)
+        | ((bytes[9] as u32) << 8)
+        | ((bytes[10] as u32) << 16)
+        | ((bytes[11] as u32) << 24);
+    let col = (bytes[12] as u32)
+        | ((bytes[13] as u32) << 8)
+        | ((bytes[14] as u32) << 16)
+        | ((bytes[15] as u32) << 24);
+    (offset, len, line, col)
+}
+
+#[cfg(test)]
+mod const_tests {
+    use super::*;
+
+    #[test]
+    fn json_const_helpers_round_trip() {
+        assert_eq!(recursion_limit(), 127);
+        assert!(within_recursion_limit(127));
+        assert!(!within_recursion_limit(128));
+        assert!(is_json_whitespace_byte(b' '));
+        assert!(!is_json_whitespace_byte(b'a'));
+        assert!(is_json_control_byte(0x1f));
+        assert!(!is_json_control_byte(0x20));
+        assert_eq!(decode_surrogate_pair(0xd83d, 0xde00), Some(0x1f600));
+        assert_eq!(decode_surrogate_pair(0xd800, 0x0041), None);
+        let enc = encode_json_span_le(12, 34, 5, 9);
+        assert_eq!(decode_json_span_le(enc), (12, 34, 5, 9));
+    }
 }

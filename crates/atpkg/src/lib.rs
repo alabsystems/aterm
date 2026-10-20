@@ -87,6 +87,9 @@ macro_rules! eprintln {
     };
 }
 
+/// abrew — aterm's Homebrew, an atpkg extension (`docs/DESIGN-abrew-2026-10-19.md`):
+/// relocation-free bottles and simple casks natively (everything else delegates to real brew before effects), the bundled Homebrew, and the `brew` reroute stub.
+pub mod abrew;
 pub mod activate;
 #[cfg(target_os = "macos")]
 pub mod activation_notice;
@@ -96,6 +99,10 @@ pub mod adoption;
 pub mod alab;
 pub mod apply;
 pub mod build_cache;
+/// Programs built into aterm (`amacs`): served by the one binary under an argv0 alias,
+/// never a store program — what `which`, `list`, `install`, `update` and `uninstall` say
+/// of one, kept apart from the stub roster so the front door never runs one from the store.
+pub mod builtin;
 pub mod cache;
 /// The shell that typed this command (2026-09-16): the parent process's executable when
 /// it is a shell, else `$SHELL` — what `doctor`/`which` key their in-place remedy on.
@@ -126,6 +133,9 @@ pub mod freespace;
 pub mod gate;
 pub mod gc;
 pub mod hooks;
+/// Which program and build a running image is, from the executable the kernel mapped
+/// (`docs/DESIGN-card-engine-2026-10-19.md` §3.2).
+pub mod image;
 /// Cheap, cross-process discovery of the next published toolchain index. A hit only
 /// wakes the ordinary signed update pass; it never authorizes an index by itself.
 pub mod index_probe;
@@ -232,6 +242,12 @@ pub mod verify;
 /// The one silent, detached, headless run of an agent build a vendor lane just landed, so
 /// the vendor CLI's account-bound caches are fresh before the user's first launch.
 pub mod warm;
+/// Yolo by default on every managed agent name, and the `--yolo` alias for it:
+/// the expansion to the vendor's own approvals-and-sandbox-off flags, injected
+/// unless the launch typed its own posture, and the one stderr line naming the
+/// command as run; the twin's block is `platform::sh_yolo_prelude`, the `run`
+/// lane's arm is in `cli::cmd_run`.
+pub mod yolo;
 
 pub use activate::{Aliases, activate_build, atomic_symlink, install_shims};
 pub use adoption::{Adoption, adoption_consented, session_bin_dir};

@@ -76,9 +76,12 @@ pub fn window_successor_args(
     successor
 }
 
-/// The flag that names a harness's lifeline descriptor — `aterm_uds::lifeline::FLAG`,
-/// spelled here because this module compiles on every platform and the lifeline is
-/// unix-only (a test pins the two spellings together).
+/// The flag that names a harness's lifeline descriptor: the instance's own spelling
+/// where the lifeline exists (unix), and that same word elsewhere, where this module
+/// still compiles but no instance takes one.
+#[cfg(unix)]
+const LIFELINE_FLAG: &str = aterm_uds::lifeline::FLAG;
+#[cfg(not(unix))]
 const LIFELINE_FLAG: &str = "--lifeline-fd";
 
 /// The flag that names a harness's ready signal: the write end of a pipe a headless
@@ -310,11 +313,5 @@ mod tests {
             running_window_successor_args(flags.clone().into_iter(), None),
             [args(&["--window"]), flags].concat()
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn the_lifeline_flag_is_the_one_the_instance_parses() {
-        assert_eq!(super::LIFELINE_FLAG, aterm_uds::lifeline::FLAG);
     }
 }

@@ -33,6 +33,13 @@
 //!
 //! The card's line follows the face through the footer's repaint key, which
 //! carries it (`claude_card::LineEnd`); it arms no episode.
+//!
+//! * COUNTS the same two ends in the A/B book (§11.6.3, item 4:
+//!   `AbBook::end`), by the same rule as the record, before the page is
+//!   republished — so Settings ▸ Harness's Ends row reads a landing once
+//!   however often its face is told. A quiet landing that lands after all
+//!   (spent → landed) is one task's end: both records stay, and the book
+//!   moves its count from quiet to landed (`AbBook::quiet_landed`).
 
 use aterm_agent::harness::acts::TaskFace;
 use aterm_agent::supervise::policy::turn_end::LAND_NUDGES;
@@ -40,29 +47,48 @@ use aterm_messages::{Message, Severity, tags};
 
 use crate::App;
 use crate::autopilot::AutopilotView;
+use crate::harness_ab::AbEnd;
+
+/// THE WORK FLOOR OF AN END (§11.2.3, items 1 and 3): an end under Cruise
+/// counts only after this much of the agent's busy time since its task
+/// opened — the kitty's own line between a quick success and a build
+/// (`kitty_pet::CHEER_BIG_MS`), kept apart and named for what it guards.
+/// Slice 2a's `is_a_task_end` reads it; the page's Ends row says it beside
+/// Cruise's count (`harness_ab::ends_words`).
+pub(crate) const END_WORK_MS: u64 = 30_000;
 
 impl App {
     /// Session `session`'s task face MOVED from `was` to `face` (`None`:
     /// unknown) — the timeline holds it already, and the footer is posted by
-    /// the caller (`App::apply_harness_fact`). The page is republished where
-    /// a view shows it, and a landing that landed or was spent under Land is
-    /// recorded ([`task_record`]: once an end, by the face it moved from).
+    /// the caller (`App::apply_harness_fact`), which has read the A/B book's
+    /// calendar and the session's mode (`App::note_harness_arm`). A landing
+    /// that landed or was spent under Land is counted in the A/B book and
+    /// recorded ([`is_an_end`]: once an end, by the face it moved from; the
+    /// count first, so the republish reads it; spent → landed moves the
+    /// quiet count to landed), and the page is republished where a view
+    /// shows it.
     pub(crate) fn harness_task_moved(
         &mut self,
         session: u64,
         was: Option<TaskFace>,
         face: Option<TaskFace>,
     ) {
+        let end = face
+            .filter(|face| is_an_end(was, *face))
+            .filter(|_| self.session_autopilot(session).1 == AutopilotView::Land);
+        if let Some(counted) = end.and_then(landing_end) {
+            let book = &mut self.harness_screen.ab;
+            let now = crate::turn_ledger::now_ms();
+            if counted == AbEnd::Landed && was == Some(TaskFace::Spent) {
+                book.quiet_landed(session, now);
+            } else {
+                book.end(session, counted, now);
+            }
+        }
         self.harness_screen_moved();
-        let Some(face) = face else {
+        let Some(face) = end else {
             return;
         };
-        if !is_an_end(was, face) {
-            return;
-        }
-        if self.session_autopilot(session).1 != AutopilotView::Land {
-            return;
-        }
         let Some(sid) = self
             .pool
             .get(session)
@@ -100,6 +126,17 @@ pub(crate) fn is_an_end(was: Option<TaskFace>, face: TaskFace) -> bool {
         TaskFace::Landed => was.is_some(),
         TaskFace::Spent => was == Some(TaskFace::Open),
         TaskFace::Open | TaskFace::Done | TaskFace::Theirs => false,
+    }
+}
+
+/// The A/B book's kind of a landing's end ([`is_an_end`]): landed, or
+/// quiet for spent; `None` for every face that ends no landing.
+#[must_use]
+pub(crate) const fn landing_end(face: TaskFace) -> Option<AbEnd> {
+    match face {
+        TaskFace::Landed => Some(AbEnd::Landed),
+        TaskFace::Spent => Some(AbEnd::Quiet),
+        TaskFace::Open | TaskFace::Done | TaskFace::Theirs => None,
     }
 }
 

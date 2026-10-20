@@ -6,10 +6,10 @@
 //! The two bridge subcommands §11.2 lists (USAGE has the rest):
 //!
 //! ```text
-//! aterm-link serve --fleet <F> --broker <ep> [--tcp] [--key-file PATH]
+//! aterm-link serve --fleet <F> --broker <socket>
 //!                  --cap-file <path>… [--state DIR] [--accept-from <p>,…]
 //!                  [--sock <path> --token-file <path>]
-//! aterm-link ls    --fleet <F> --broker <ep> [--tcp] [--key-file PATH]
+//! aterm-link ls    --fleet <F> --broker <socket>
 //!                  --cap-file <path>… [--attention]
 //! ```
 //!
@@ -61,58 +61,32 @@
 use std::process::ExitCode;
 
 use crate::bridge::{Bridge, Config};
-use crate::transport::{self, Transport};
-
-/// The build line [`USAGE`] ends with, per build. A macro rather than a
-/// `const` because `concat!` takes literals only.
-#[cfg(feature = "sealed")]
-macro_rules! build_line {
-    () => {
-        "this build: sealed TCP transport compiled in (--tcp --key-file dials and serves)\n"
-    };
-}
-#[cfg(not(feature = "sealed"))]
-macro_rules! build_line {
-    () => {
-        "this build: no sealed TCP transport (a default build: --tcp --key-file is refused)\n"
-    };
-}
+use crate::transport;
 
 /// Usage, printed to stderr on a usage error (exit 2, aterm's convention).
-///
-/// Its LAST LINE says whether this build carries the sealed transport
-/// (`build_line!`) — the one fact about a binary its flags cannot show, and
-/// the one `aterm fabric join` and `on --tcp` read off the binary they will
-/// write into a bridge command ([`crate::enable`]'s `binary_has_link`).
-const USAGE: &str = concat!(
-    "\
+const USAGE: &str = "\
 aterm-link — the aterm fabric bridge
 
-  aterm-link serve --fleet <F> --broker <ep> --cap-file <path>... [options]
-  aterm-link ls    --fleet <F> --broker <ep> --cap-file <path>... [--attention]
+  aterm-link serve --fleet <F> --broker <socket> --cap-file <path>... [options]
+  aterm-link ls    --fleet <F> --broker <socket> --cap-file <path>... [--attention]
   aterm-link notify --on <attention|ask:<person>|halt>,... --exec <cmd>
                     a command run when the fabric needs a human (`notify` for its usage)
   aterm-link broker <socket> [log] [--secret-file <path>] [--durability strict|ordered|relaxed]
                     the local bus itself (`broker` for its usage); relaxed acks
                     before the fsync, and a power loss can take what it acked
-  aterm-link broker --tcp <host:port> --key-file <k> --secret-file <s> <log>
-                    the bus on the SEALED TCP wire, always guarded (a `sealed` build)
   aterm-link broker --repair <log>
                     truncate a log the broker refuses as corrupt at that record
   aterm-link mint   <grant> --secret-file <path>    one capability line for --cap-file
-                    (a whole ring: `aterm fabric mint-for <node>|h-<person>`)
+                    (a person's whole ring: `aterm fabric mint-for h-<person>`)
   aterm-link fabric ...  the same as `aterm fabric` (`fabric help` for its usage)
 
-`ls` defaults its flags from the rendezvous file `aterm fabric on` (or `join`) writes
-beside the instance control sockets (fabric.toml): --fleet and --broker, and WITH a
-defaulted --broker only, the node's --cap-file and --state (a cap is minted for that one
-broker, so it is never presented to a --broker you named) and, on a host that joined
-over the sealed wire, --tcp --key-file. A flag given on the command line wins.
+`ls` defaults its flags from the rendezvous file `aterm fabric on` writes beside the
+instance control sockets (fabric.toml): --fleet and --broker, and WITH a defaulted
+--broker only, the node's --cap-file and --state (a cap is minted for that one broker,
+so it is never presented to a --broker you named). A flag given on the command line wins.
 
   --fleet <F>            the fleet name (the `/f/<F>/` subtree)
-  --broker <ep>          the broker: a Unix socket path, or <host>:<port> with --tcp
-  --tcp                  reach the broker over TCP instead of a Unix socket
-  --key-file <path>      64 hex chars: the sealed transport's pre-shared key (needs --tcp)
+  --broker <socket>      the broker's Unix socket path
   --cap-file <path>      a minted capability (`<grant> <tag-hex>` lines); repeatable
   --state <dir>          the state dir (node id, incarnation, sequence, watermarks)
   --accept-from <p>,...  principals whose task/control arrive undemoted
@@ -144,18 +118,7 @@ driving= always reads `-`; holder= and context= do too unless an older node wrot
 them, and role= detail= phase= title= do from a `minimal` bridge. <host>, fabric=,
 proto= (the astream protocol the node speaks) and aterm= (the release it runs) are
 on the node's own line; a session's line reads `-` for them.
-
-`--tcp` alone is plaintext: trusted networks only. `--tcp --key-file` is the sealed
-wire a cross-host fleet uses; the shipped `aterm` does not carry it, and a build
-without it refuses the flags. The line below says which this build is.
-
-",
-    build_line!()
-);
-
-/// The phrase [`USAGE`] carries in a `sealed` build — what a caller checks a
-/// binary's `link` output for before writing a sealed bridge command.
-pub const SEALED_BUILD_MARK: &str = "sealed TCP transport compiled in";
+";
 
 /// The bridge's whole command line, as a LIBRARY entry.
 ///
@@ -258,14 +221,6 @@ fn run(
     serve: bool,
     take_lanes: impl FnOnce() -> std::io::Result<crate::bridge::InheritedLanes>,
 ) -> ExitCode {
-    // THE SEALED WIRE IN A BUILD WITHOUT IT is refused here, by name, before
-    // `parse` reads the key file: `serve` would otherwise redial for ever. Not
-    // in `parse`, which `aterm fabric` also reads a sealed host's
-    // `[fabric] command` with.
-    if let Some(refusal) = transport::sealed_flags_refusal(args) {
-        eprintln!("aterm-link: --key-file: {refusal}");
-        return ExitCode::from(2);
-    }
     let parsed = match parse(args) {
         Ok(parsed) => parsed,
         Err(e) => {
@@ -367,7 +322,7 @@ fn column(raw: &str) -> String {
 /// escape so a row stays printable ASCII.
 const ELLIPSIS: &str = "%E2%80%A6";
 
-/// `aterm-link ls` — the cross-host `ls`: `Last{/f/<F>/pub/*/*/presence}`, which
+/// `aterm-link ls` — every node's roster: `Last{/f/<F>/pub/*/*/presence}`, which
 /// is one bounded last-value walk and no filesystem scan, no `dial`, and no
 /// saved peer names.
 ///
@@ -380,15 +335,13 @@ const ELLIPSIS: &str = "%E2%80%A6";
 fn roster(cfg: &Config, attention_only: bool) -> std::io::Result<()> {
     // One-shot, so bounded like every operator command: a wedged broker costs
     // a few seconds and an error, never a hung terminal.
-    let (mut client, _closer) =
-        transport::connect(&cfg.transport, &cfg.broker, crate::fabric::IO_TIMEOUT).map_err(
-            |e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!("cannot connect to the broker at {}: {e}", cfg.broker),
-                )
-            },
-        )?;
+    let (mut client, _closer) = transport::connect(&cfg.broker, crate::fabric::IO_TIMEOUT)
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("cannot connect to the broker at {}: {e}", cfg.broker),
+            )
+        })?;
     transport::attach_cap_files(&mut client, &cfg.cap_files)?;
     let filter = format!("/f/{}/pub/*/*/presence", cfg.fleet);
     transport::walk_last(&mut client, &filter, |(_, subject, raw)| {
@@ -468,7 +421,6 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
     let mut cfg = Config {
         fleet: String::new(),
         broker: String::new(),
-        transport: Transport::Unix,
         cap_files: Vec::new(),
         state_dir: String::new(),
         accept_from: Vec::new(),
@@ -482,8 +434,6 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
         log: crate::mirror::LogMode::Off,
     };
     let mut token_file: Option<String> = None;
-    let mut tcp = false;
-    let mut key_file: Option<String> = None;
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         let mut value = || {
@@ -494,16 +444,6 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
         match flag.as_str() {
             "--fleet" => cfg.fleet = value()?,
             "--broker" => cfg.broker = value()?,
-            "--tcp" => tcp = true,
-            "--key-file" => key_file = Some(value()?),
-            // REFUSED BY NAME: astream's forward-secret and identity transports
-            // would widen this crate's pinned dependency set (DESIGN-aterm-fabric.md
-            // §11.2), and silently falling back to the PSK would be worse.
-            other @ ("--handshake" | "--identity" | "--identity-file" | "--host-key-file") => {
-                return Err(format!(
-                    "{other}: unsupported; the only TCP wire is the sealed PSK one (--tcp --key-file)"
-                ));
-            }
             "--cap-file" => cfg.cap_files.push(value()?),
             "--state" => cfg.state_dir = value()?,
             "--accept-from" => {
@@ -539,11 +479,6 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
     if cfg.fleet.is_empty() || cfg.broker.is_empty() {
         return Err("--fleet and --broker are required".to_string());
     }
-    cfg.transport = transport_from_flags(
-        tcp,
-        key_file,
-        "aterm-link: --tcp without --key-file is plaintext; trusted networks only",
-    )?;
     if !crate::subject::is_fleet(&cfg.fleet) {
         return Err(format!(
             "--fleet {} is not a subject segment ([a-z0-9-]{{1,32}})",
@@ -580,31 +515,6 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
     })
 }
 
-/// The transport `--tcp` and `--key-file` name — shared by `serve` and `notify`. A
-/// KEY WITHOUT `--tcp` IS REFUSED: ignoring it would run unsealed while the operator
-/// believed otherwise, and implying `--tcp` would dial a socket path as a host:port.
-/// Plain `--tcp` prints `plaintext_warning` to stderr.
-pub(crate) fn transport_from_flags(
-    tcp: bool,
-    key_file: Option<String>,
-    plaintext_warning: &str,
-) -> Result<Transport, String> {
-    Ok(match (tcp, key_file) {
-        (false, None) => Transport::Unix,
-        (true, None) => {
-            eprintln!("{plaintext_warning}");
-            Transport::Tcp
-        }
-        (true, Some(path)) => Transport::Sealed(Box::new(
-            transport::read_key_file(&path)
-                .map_err(|e| format!("--key-file {}", transport::describe(&path, &e)))?,
-        )),
-        (false, Some(_)) => {
-            return Err("--key-file needs --tcp".to_string());
-        }
-    })
-}
-
 /// `$XDG_STATE_HOME/aterm-link`, else `$HOME/.local/state/aterm-link`, else the
 /// working directory — never a temp dir, because losing the node id loses the
 /// node's mail lane. `aterm-link notify` reads its journal under the same
@@ -625,39 +535,20 @@ pub(crate) fn default_state_dir() -> String {
 
 /// `aterm link broker <socket> [log]` — run the bus this instance's bridge talks to.
 ///
-/// TWO LISTENERS — and the second host's broker serves both:
+/// A Unix socket created world-connectable — nothing chmods it and no peer uid
+/// is checked — so WHO can connect is bounded by the DIRECTORY you put it in,
+/// 0700. What a connection may SAY is the guard's: with `--secret-file` it is
+/// `Broker::open_guarded`, every attach must carry a capability minted under
+/// that secret, and every request is authorized against the grants attached.
+/// THE ROOT'S SECRET GUARDS THE ROOT'S SOCKET: with no `--secret-file`, a
+/// `mint.secret` beside the socket (`aterm fabric on`'s layout) is the secret,
+/// so a supervisor job written before `on` passed the flag comes back guarded
+/// the next time it starts the broker (an update, a login) — one that cannot be
+/// read is a refusal, never an unguarded broker. Only a socket with no secret
+/// beside it is served unguarded, and the banner says so.
 ///
-/// * `<socket> [log]` — the LOCAL broker: a Unix socket created
-///   world-connectable — nothing chmods it and no peer uid is checked — so
-///   WHO can connect is bounded by the DIRECTORY you put it in, 0700. What a
-///   connection may SAY is the guard's: with `--secret-file` it is
-///   `Broker::open_guarded`, every attach must carry a capability minted under
-///   that secret, and every request is authorized against the grants attached.
-///   THE ROOT'S SECRET GUARDS THE ROOT'S SOCKET: with no `--secret-file`, a
-///   `mint.secret` beside the socket (`aterm fabric on`'s layout) is the
-///   secret, so a supervisor job written before `on` passed the flag comes back
-///   guarded the next time it starts the broker (an update, a login) — one
-///   that cannot be read is a refusal, never an unguarded broker. Only a socket
-///   with no secret beside it is served unguarded, and the banner says so.
-/// * `--tcp <host:port> --key-file <k> --secret-file <s> <log>` — the SECOND
-///   HOST's broker: astream's sealed record layer
-///   (`serve_tcp_sealed`, XChaCha20-Poly1305 under the 64-hex pre-shared key)
-///   and ALWAYS guarded. The guard is not optional on TCP, and that is the
-///   point of it: the pre-shared key is ONE secret every host holds, so it
-///   keeps a stranger off the wire and says nothing about which host is
-///   speaking. What stops the joined host publishing as the first host's node,
-///   or as a human (mail delivered `trust=human`, a fleet halt or its lift),
-///   is the capability it attaches — minted for its own node id by `aterm
-///   fabric mint-for` — and only a guarded broker checks one. A non-loopback bind is refused without `--allow-remote`. Only
-///   in a `sealed` build ([`transport::SEALED`]); a default build answers
-///   `--tcp` by naming the feature. `--unix <socket>` serves that Unix socket
-///   AS WELL, from the same guarded broker and log: the host that serves the
-///   sealed wire points its OWN bridges there (`aterm fabric on --tcp`),
-///   because astream admits only 64 connections into the sealed handshake at
-///   once and a peer that can reach the port can hold them without the key.
-///
-/// The key and the secret are files, never arguments (an argv is world-readable
-/// in `ps`), and both must be mode 0600 ([`transport::check_private`]).
+/// The secret is a file, never an argument (an argv is world-readable in `ps`),
+/// and it must be mode 0600 ([`transport::check_private`]).
 ///
 /// `--durability strict|ordered|relaxed` is what an ack promises, on either
 /// listener and guarded or not ([`crate::durability`]): `strict`, the
@@ -691,32 +582,16 @@ fn broker(args: &[String]) -> ExitCode {
     let watch = ExeWatch::capture();
     const USAGE: &str = "\
 usage: aterm link broker <socket> [log] [--secret-file <path>] [--durability <tier>]
-       aterm link broker --tcp <host:port> --key-file <path> --secret-file <path>
-                         [--allow-remote] [--unix <socket>] [--durability <tier>] <log>
        aterm link broker --repair <log>
 
   <socket>         the Unix socket path the bridge's `--broker` names
-  [log]            the durable record log (default: <socket>.log; required with --tcp)
+  [log]            the durable record log (default: <socket>.log)
   --secret-file    32+ raw bytes, 0600: the MINT secret. The broker becomes
                    GUARDED — every attach must carry a capability minted under
-                   it (`aterm link mint`, `aterm fabric mint-for`), and each
-                   request is checked against the grants attached. Without it
-                   on a socket, the `mint.secret` beside <socket> is the secret
-                   when there is one (`aterm fabric on`'s root)
-  --tcp <h:p>      serve the SEALED TCP wire instead of a socket: astream's
-                   XChaCha20-Poly1305 record layer under the pre-shared key.
-                   Only in a `sealed` build. Always guarded (--secret-file is
-                   required): the key is one secret every host holds, so the
-                   capability is what says which node may publish what
-  --key-file       64 hex characters, 0600: the pre-shared key (--tcp only)
-  --allow-remote   bind a non-loopback address (--tcp only). Without it only
-                   127.0.0.1 / ::1 is bound, because a broker on the network is
-                   reachable by anyone who holds the key file
-  --unix <socket>  --tcp only: ALSO serve this Unix socket, from the same broker
-                   and log, for the host's own bridges (`aterm fabric on --tcp`
-                   passes the root's bus.sock) — a peer that can reach the TCP
-                   port can hold all 64 of its pre-authentication slots without
-                   the key, and nothing on the socket waits on them
+                   it (`aterm link mint`, `aterm fabric mint-for h-<name>`), and
+                   each request is checked against the grants attached. Without
+                   it, the `mint.secret` beside <socket> is the secret when there
+                   is one (`aterm fabric on`'s root)
   --durability <tier>
                    what an ack promises: strict (the default), ordered or
                    relaxed. strict acks once the batch is flushed in full (on
@@ -756,14 +631,12 @@ usage: aterm link broker <socket> [log] [--secret-file <path>] [--durability <ti
                    is refused untouched (run that release). Refused while a
                    broker holds the log
 
-The Unix socket is created world-connectable, so who can connect is bounded by the
-DIRECTORY you put it in: use a 0700 one (`aterm fabric on` does). A socket broker
-with no --secret-file and no mint.secret beside its socket checks no capability on
-attach, and says `(unguarded)` on stderr. Prints `listening <endpoint>` once
-it is bound — the bound TCP address when the port was 0 — and, with --unix, a
-second `listening <socket>` line once that is bound too. It exits 0 within a minute
-of its executable being replaced by another build, for its supervisor (launchd
-KeepAlive, systemd Restart=always) to start that one.
+The socket is created world-connectable, so who can connect is bounded by the
+DIRECTORY you put it in: use a 0700 one (`aterm fabric on` does). A broker with no
+--secret-file and no mint.secret beside its socket checks no capability on attach,
+and says `(unguarded)` on stderr. Prints `listening <socket>` once it is bound. It
+exits 0 within a minute of its executable being replaced by another build, for its
+supervisor (launchd KeepAlive, systemd Restart=always) to start that one.
 ";
     let parsed = match crate::broker_args::BrokerArgs::parse(args) {
         Ok(parsed) => parsed,
@@ -776,24 +649,14 @@ KeepAlive, systemd Restart=always) to start that one.
             return ExitCode::from(2);
         }
     };
-    let tcp = parsed.tcp.cloned();
-    let key_file = parsed.key_file.cloned();
     let secret_file = parsed.secret_file.cloned();
-    let unix = parsed.unix.cloned();
     let durability = parsed.durability.cloned();
-    let allow_remote = parsed.allow_remote;
     let repair = parsed.repair;
     let words: Vec<&str> = parsed.words.iter().map(|word| word.as_str()).collect();
     // THE REPAIR SERVES NOTHING: one local file, and no other flag of the
     // line means anything to it — refused rather than ignored.
     if repair {
-        if tcp.is_some()
-            || key_file.is_some()
-            || secret_file.is_some()
-            || unix.is_some()
-            || durability.is_some()
-            || allow_remote
-        {
+        if secret_file.is_some() || durability.is_some() {
             eprintln!("aterm link broker: --repair takes <log> alone: it serves nothing");
             eprint!("{USAGE}");
             return ExitCode::from(2);
@@ -804,16 +667,6 @@ KeepAlive, systemd Restart=always) to start that one.
             return ExitCode::from(2);
         };
         return repair_log(log);
-    }
-    // THE BUILD FIRST: a default build answers `--tcp` by naming the feature,
-    // before any other word of the line is judged — what is missing is the
-    // transport, not a flag.
-    if tcp.is_some() && !transport::SEALED {
-        eprintln!(
-            "aterm link broker: --tcp: {}",
-            transport::SEALED_UNAVAILABLE
-        );
-        return ExitCode::from(2);
     }
     let usage_error = |why: &str| {
         eprintln!("aterm link broker: {why}");
@@ -829,69 +682,16 @@ KeepAlive, systemd Restart=always) to start that one.
         Ok(d) => crate::durability::resolve(d),
         Err(e) => return usage_error(&e),
     };
-    let (endpoint, log) = match &tcp {
-        None => {
-            if key_file.is_some() {
-                return usage_error("--key-file needs --tcp");
-            }
-            if allow_remote {
-                return usage_error("--allow-remote needs --tcp");
-            }
-            if unix.is_some() {
-                return usage_error("--unix needs --tcp");
-            }
-            // A surplus word is refused, never dropped.
-            match words.as_slice() {
-                [sock] => ((*sock).to_string(), format!("{sock}.log")),
-                [sock, log] => ((*sock).to_string(), (*log).to_string()),
-                [] => {
-                    eprint!("{USAGE}");
-                    return ExitCode::from(2);
-                }
-                [_, _, extra, ..] => {
-                    return usage_error(&format!("unexpected argument `{extra}`"));
-                }
-            }
+    // A surplus word is refused, never dropped.
+    let (endpoint, log) = match words.as_slice() {
+        [sock] => ((*sock).to_string(), format!("{sock}.log")),
+        [sock, log] => ((*sock).to_string(), (*log).to_string()),
+        [] => {
+            eprint!("{USAGE}");
+            return ExitCode::from(2);
         }
-        Some(bind) => {
-            let Some(key_path) = key_file.as_deref() else {
-                return usage_error("--tcp needs --key-file: the broker serves TCP only sealed");
-            };
-            if secret_file.is_none() {
-                return usage_error("--tcp needs --secret-file: a TCP broker is always guarded");
-            }
-            let log = match words.as_slice() {
-                [log] => (*log).to_string(),
-                [] => return usage_error("--tcp needs <log>"),
-                [_, extra, ..] => {
-                    return usage_error(&format!("unexpected argument `{extra}`"));
-                }
-            };
-            match transport::is_loopback_endpoint(bind) {
-                Ok(true) => {}
-                Ok(false) if allow_remote => {}
-                Ok(false) => {
-                    eprintln!(
-                        "aterm link broker: --tcp {bind}: not a loopback address, and every host \
-                         of the fleet holds the one key; add --allow-remote"
-                    );
-                    return ExitCode::from(2);
-                }
-                Err(e) => {
-                    eprintln!("aterm link broker: --tcp {bind}: {e} (a <host>:<port> to bind)");
-                    return ExitCode::from(2);
-                }
-            }
-            // Checked here, before the log is opened, so a bad key never leaves
-            // an empty log behind.
-            if let Err(e) = transport::read_private_key_file(key_path) {
-                eprintln!(
-                    "aterm link broker: --key-file {}",
-                    transport::describe(key_path, &e)
-                );
-                return ExitCode::FAILURE;
-            }
-            (bind.clone(), log)
+        [_, _, extra, ..] => {
+            return usage_error(&format!("unexpected argument `{extra}`"));
         }
     };
     // THE ROOT'S SECRET GUARDS THE ROOT'S SOCKET (the doc above). Present at
@@ -899,7 +699,8 @@ KeepAlive, systemd Restart=always) to start that one.
     // so a broken one is the reader's refusal below, never an unguarded bus.
     let secret_file = secret_file.or_else(|| {
         let beside = std::path::Path::new(&endpoint).with_file_name(crate::enable::MINT_SECRET);
-        (tcp.is_none() && std::fs::symlink_metadata(&beside).is_ok())
+        std::fs::symlink_metadata(&beside)
+            .is_ok()
             .then(|| beside.to_string_lossy().into_owned())
     });
     let secret = match secret_file
@@ -968,72 +769,43 @@ KeepAlive, systemd Restart=always) to start that one.
             return ExitCode::FAILURE;
         }
     };
-    let served = match &tcp {
-        None => broker.serve(&endpoint),
-        Some(bind) => serve_sealed(&broker, bind, key_file.as_deref().unwrap_or_default()),
-    };
-    // A refused bind leaves no empty log behind (see `log_created_here`).
-    let refused = |what: &str, e: std::io::Error, broker: astream_broker::Broker| {
-        eprintln!("aterm link broker: serve {what}: {e}");
-        if log_created_here
-            && std::fs::metadata(&log)
-                .map(|m| m.len() == 0)
-                .unwrap_or(false)
-        {
-            drop(broker);
-            let _ = std::fs::remove_file(&log);
-        }
-        ExitCode::FAILURE
-    };
-    let handle = match served {
+    let handle = match broker.serve(&endpoint) {
         Ok(h) => h,
-        Err(e) => return refused(&endpoint, e, broker),
-    };
-    // THE SOCKET BESIDE THE PORT, from the same broker: one log, one guard,
-    // one store — two acceptors.
-    let beside = match unix.as_deref().map(|sock| (sock, broker.serve(sock))) {
-        None => None,
-        Some((_, Ok(h))) => Some(h),
-        Some((sock, Err(e))) => {
-            drop(handle);
-            return refused(sock, e, broker);
+        Err(e) => {
+            // A refused bind leaves no empty log behind (see `log_created_here`).
+            eprintln!("aterm link broker: serve {endpoint}: {e}");
+            if log_created_here
+                && std::fs::metadata(&log)
+                    .map(|m| m.len() == 0)
+                    .unwrap_or(false)
+            {
+                drop(broker);
+                let _ = std::fs::remove_file(&log);
+            }
+            return ExitCode::FAILURE;
         }
     };
-    // The readiness line a supervisor waits for (`asb serve`'s word). On TCP
-    // it is the BOUND address, so a port-0 bind names the port it got.
-    //
-    // WRITTEN, NEVER PRINTED: a supervisor may close the pipe after the first
-    // line, and `println!` on a closed stdout panics (Rust ignores SIGPIPE).
-    let shown = handle.tcp_addr().map_or(endpoint, str::to_string);
-    let transport = if tcp.is_some() {
-        "sealed TCP"
-    } else {
-        "unix socket"
-    };
-    let beside_note = unix
-        .as_deref()
-        .map_or_else(String::new, |sock| format!(" and the unix socket {sock}"));
     // A secret that did not read stopped the broker above, so a named one
     // here is the one guarding it.
     let guard_note = match secret_file.as_deref() {
         Some(path) => format!(" (guarded by {path})"),
         None => " (unguarded: it checks no capability)".to_string(),
     };
+    // The readiness line a supervisor waits for (`asb serve`'s word).
+    //
+    // WRITTEN, NEVER PRINTED: a supervisor may close the pipe after the first
+    // line, and `println!` on a closed stdout panics (Rust ignores SIGPIPE).
     {
         use std::io::Write as _;
         let mut out = std::io::stdout().lock();
-        let _ = writeln!(out, "listening {shown}");
-        if let Some(sock) = unix.as_deref() {
-            let _ = writeln!(out, "listening {sock}");
-        }
+        let _ = writeln!(out, "listening {endpoint}");
         let _ = out.flush();
         // The tier SERVED is the broker's own word (`Hello`'s tag 0x01, the
         // same answer status and doctor read), never inferred from the flag:
         // `ordered` says "served strict" in this build.
         let _ = writeln!(
             std::io::stderr(),
-            "aterm link broker: {transport} on {shown}{beside_note}{guard_note}, durability {}: \
-             {}; log {}",
+            "aterm link broker: unix socket on {endpoint}{guard_note}, durability {}: {}; log {}",
             durability.name(),
             crate::durability::describe_served(durability, Some(broker.served_durability())),
             broker.log_identity()
@@ -1045,7 +817,7 @@ KeepAlive, systemd Restart=always) to start that one.
     // shuts the broker down and unlinks the socket, which is how it EXITS when
     // its build is replaced or it is stopped (the doc above). With neither to
     // wait for it serves until killed, as before the watch.
-    let keep = (handle, beside);
+    let keep = handle;
     let mut watch = watch;
     loop {
         if watch.is_some() {
@@ -1171,9 +943,10 @@ pub const NEWER_LOG_REMEDY: &str = "the log was written by a newer aterm and is 
 /// line naming `log` — `None` for a refusal with no remedy of aterm's own (a
 /// lock held, a permission), whose astream words say enough.
 ///
-/// By KIND, never by astream's wording. In aterm's build (no retention, no
-/// anti-rollback) `InvalidData` from an open is the corrupt-record refusal,
-/// and `Unsupported` a record format newer than this build reads.
+/// By KIND, never by astream's wording. In aterm's build (no anti-rollback,
+/// and retention compiled but never run, so no `.base`/`.state` sidecar
+/// exists) `InvalidData` from an open is the corrupt-record refusal, and
+/// `Unsupported` a record format newer than this build reads.
 #[must_use]
 pub fn log_refusal_remedy(kind: std::io::ErrorKind, log: &str) -> Option<String> {
     match kind {
@@ -1386,31 +1159,6 @@ fn replaced(start: &RunningImage, seen: Option<&FileId>, now: &std::io::Result<F
     matches!(now, Ok(now) if !start.matches(now) && seen == Some(now))
 }
 
-/// `serve_tcp_sealed` — in a `sealed` build. The default build never reaches
-/// here ([`broker`] refuses `--tcp` by name first); this arm exists so the
-/// call site has one shape in both builds.
-#[cfg(feature = "sealed")]
-fn serve_sealed(
-    broker: &astream_broker::Broker,
-    bind: &str,
-    key_file: &str,
-) -> std::io::Result<astream_broker::BrokerHandle> {
-    let key = transport::read_private_key_file(key_file)?;
-    broker.serve_tcp_sealed(bind, key)
-}
-
-#[cfg(not(feature = "sealed"))]
-fn serve_sealed(
-    _broker: &astream_broker::Broker,
-    _bind: &str,
-    _key_file: &str,
-) -> std::io::Result<astream_broker::BrokerHandle> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        transport::SEALED_UNAVAILABLE,
-    ))
-}
-
 /// `aterm link mint <grant> --secret-file <path>` — print one capability line.
 ///
 /// A cap file is `<grant> <tag-hex>` lines, and `serve --cap-file` reads them.
@@ -1493,7 +1241,7 @@ Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file`
 
 /// Print a minted capability only through the checked complete-result writer.
 fn minted_cap_to(out: &mut dyn std::io::Write, line: &str) -> ExitCode {
-    match crate::join::write_capability_to(out, &format!("{line}\n")) {
+    match crate::person::write_capability_to(out, &format!("{line}\n")) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!(

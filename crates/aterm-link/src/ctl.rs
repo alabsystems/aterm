@@ -24,15 +24,15 @@
 //!
 //! ## The request line's bounds live on the writer
 //!
-//! aterm's control server silently drops a connection whose request line
-//! reaches its `MAX_REQUEST_LINE` (`crates/aterm-gui/src/control.rs`). For the
-//! bridge that is aterm's fail-closed `bridge_lost` halt over every session,
-//! with nothing on this side seeing the close. So [`REQUEST_LINE_MAX`] is the
-//! one bound: [`Ctl::request_with_body`] refuses a longer line and writes
-//! nothing (stream framed, connection alive), and every caller that builds a
-//! variable-length line sizes the WHOLE line from it — not just its last field,
-//! or an attacker-sized earlier field leaves the line over the bound and the
-//! record with nowhere to go.
+//! aterm's control server closes a connection whose request line passes its
+//! `MAX_REQUEST_LINE` (`aterm_types::control_verbs`), after one `ERR request
+//! line too long` line. For the bridge that close is aterm's fail-closed
+//! `bridge_lost` halt over every session, whatever the line said. So
+//! [`REQUEST_LINE_MAX`] is the one bound: [`Ctl::request_with_body`] refuses a
+//! longer line and writes nothing (stream framed, connection alive), and every
+//! caller that builds a variable-length line sizes the WHOLE line from it — not
+//! just its last field, or an attacker-sized earlier field leaves the line over
+//! the bound and the record with nowhere to go.
 //!
 //! THE FRAMING IS THE WRITER'S TOO. aterm ends a request at its first `\n` and
 //! splits its fields on any whitespace, and the bridge's lane is owner-class
@@ -65,7 +65,7 @@ use aterm_types::control_verbs::{framing_of, Framing};
 ///
 /// One byte under aterm's `MAX_REQUEST_LINE` (64 KiB, newline excluded): an
 /// off-by-one in either implementation must cost an error, not a fleet halt.
-pub const REQUEST_LINE_MAX: usize = 64 * 1024 - 1;
+pub const REQUEST_LINE_MAX: usize = aterm_types::control_verbs::MAX_REQUEST_LINE - 1;
 
 /// The largest framed BODY this client will read, and the ceiling on the byte
 /// count a reply header may declare.

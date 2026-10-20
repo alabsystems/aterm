@@ -187,7 +187,10 @@ pub(crate) fn program_build_of_target(target: &Path) -> Option<(String, u64)> {
 /// really are inside this managed store can answer, and `..` is rejected for free (a
 /// `ParentDir` component is not `Normal`, so a lexical escape cannot masquerade as a program
 /// name). A trailing path (`/bin/<tool>`) is allowed, because a shim target has one.
-pub(crate) fn store_build_of(prefix: &Path, target: &Path) -> Option<(String, u64)> {
+/// Public for the image classifier (`crate::image`), which anchors a running process's
+/// executable the same way.
+#[must_use]
+pub fn store_build_of(prefix: &Path, target: &Path) -> Option<(String, u64)> {
     let rel = target.strip_prefix(prefix.join("store")).ok()?;
     let mut comps = rel.components();
     let (Some(std::path::Component::Normal(program)), Some(std::path::Component::Normal(build))) =
@@ -680,7 +683,7 @@ mod tests {
         // exactly the audited shape.
         std::fs::remove_dir_all(l.build_dir("ay", 17)).unwrap();
         assert!(
-            crate::platform::resolve_shim(&l.bin_dir().join("ay")).is_some(),
+            crate::platform::resolve_shim(&l.shim(&tool("ay"))).is_some(),
             "the shim itself must still resolve — otherwise this test proves nothing"
         );
         assert!(

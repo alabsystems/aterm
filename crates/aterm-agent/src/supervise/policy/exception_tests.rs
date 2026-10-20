@@ -6,8 +6,9 @@
 
 use super::*;
 use crate::supervise::phase::Phase;
+use crate::supervise::policy::notice;
 use crate::supervise::policy::turn_end::{
-    Composer, TurnEndAction, TurnEndReading, decide_turn_end,
+    Composer, RULE_LOGIN, TurnEndAction, TurnEndReading, decide_turn_end,
 };
 use aterm_phase::prompt::fixtures::{
     COMPACT_ERROR_500_MEASURED, COMPACT_FAILED_1_MEASURED, COMPACT_FAILED_2_MEASURED,
@@ -54,6 +55,7 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         login_back: false,
         auto_continue: None,
         since_limit: None,
+        background: false,
         served_in_transcript: false,
         notice_elsewhere: false,
         reset_clock: None,
@@ -64,6 +66,15 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         login_superseded: false,
         login_notice: None,
         wall_remembered: false,
+        answered: None,
+        worked_doubt: Duration::ZERO,
+        record_turn: None,
+        credits: None,
+        repo: None,
+        login_screen: None,
+        login_interrupted: false,
+        login_method: None,
+        login_shared: None,
     }
 }
 
@@ -71,30 +82,294 @@ fn seen(st: &mut TurnEndState, r: &TurnEndReading, now: Instant) {
     st.observe(r, now);
 }
 
-/// A lost login is an exception only once its `/login` has been typed (or the
-/// owner switched the retries off): before, the supervisor is still acting.
-#[test]
-fn a_lost_login_after_its_login_is_an_exception_with_its_action() {
-    let t = t0();
-    let r = walled(WallKind::Auth, "Login expired · Please run /login");
+/// The id of the notice `e` carries, if any.
+fn notice_id(e: Option<&Exception>) -> Option<&'static str> {
+    e.and_then(|e| e.notice.as_ref()).map(|n| n.id)
+}
+
+/// Observes `r` at `now`, then what the point decides and the exception that
+/// stands there.
+fn point(
+    st: &mut TurnEndState,
+    r: &TurnEndReading,
+    cfg: &SupervisorConfig,
+    now: Instant,
+) -> (TurnEndAction, Option<Exception>) {
+    st.observe(r, now);
+    (
+        decide_turn_end(st, r, cfg, now),
+        exception_for(st, r, cfg, now),
+    )
+}
+
+/// A reading of a real 2.1.303 `/login` screen, the session's login a
+/// subscription.
+fn dialog(text: &str) -> TurnEndReading {
+    let rows = screen(text);
+    let read = aterm_phase::read(Some("claude"), &rows, Some(2));
+    TurnEndReading {
+        login_method: Some(aterm_phase::LoginMethod::Subscription),
+        ..TurnEndReading::of(&read, &rows, false, None, None, None)
+    }
+}
+
+/// A state that saw the wall and typed `/login` into it at `t`.
+fn typed_login(t: Instant) -> TurnEndState {
     let mut st = TurnEndState::default();
-    seen(&mut st, &r, t);
-    assert_eq!(
-        exception_for(&st, &r, &cfg(), t),
-        None,
-        "the /login is still to be typed"
+    let wall = walled(WallKind::Auth, "Login expired · Please run /login");
+    let (a, _) = point(&mut st, &wall, &cfg(), t);
+    assert_eq!(a.rule_id(), Some(RULE_LOGIN), "{a:?}");
+    st.acted(&a, &wall, t);
+    st
+}
+
+/// THE NOTICE SAYS WHAT THE POINT DECIDES (the review of 2026-10-19:
+/// claims-login-ran, F5, F3''): a lost login's notice is chosen with the
+/// point's own decision, so none says `/login` ran, or that a browser
+/// opened, where nothing was typed. Nothing is told while aterm is still at
+/// it — `/login` about to go, a person's keys waited out — and `/login` held
+/// back is told with why: a draft, `retry_api_errors = false`, the hour's
+/// typing budget, no task, a finished task.
+#[test]
+fn a_lost_logins_notice_is_what_the_point_decides() {
+    let t = t0();
+    let wall = walled(WallKind::Auth, "Login expired · Please run /login");
+    // `/login` about to go: nothing told.
+    let mut st = TurnEndState::default();
+    let (a, e) = point(&mut st, &wall, &cfg(), t);
+    assert_eq!(a.rule_id(), Some(RULE_LOGIN), "{a:?}");
+    assert_eq!(e, None, "aterm is at it");
+    // A person's key after the wall was read: their grace waited out, nothing told.
+    let typing = TurnEndReading {
+        person: Some(Duration::from_secs(1)),
+        worked: None,
+        ..wall.clone()
+    };
+    let (a, e) = point(&mut st, &typing, &cfg(), t + Duration::from_secs(20));
+    assert!(matches!(a, TurnEndAction::WaitUntil { .. }), "{a:?}");
+    assert_eq!(e, None, "a wait with an end");
+    // Held back: `LOGIN_NOT_RUN`, with why.
+    let not_run = |st: &mut TurnEndState, r: &TurnEndReading, cfg: &SupervisorConfig, why| {
+        let (a, e) = point(st, r, cfg, t + MIN);
+        assert!(
+            matches!(a, TurnEndAction::Escalate { .. } | TurnEndAction::Nothing),
+            "{a:?}"
+        );
+        assert_eq!(
+            notice_id(e.as_ref()),
+            Some(notice::LOGIN_NOT_RUN.id),
+            "{e:?}"
+        );
+        let e = e.expect("told");
+        assert!(e.notice.is_some_and(|n| n.did.contains(why)), "{why}");
+    };
+    let drafted = TurnEndReading {
+        composer: Composer::Typed,
+        ..wall.clone()
+    };
+    not_run(
+        &mut TurnEndState::default(),
+        &drafted,
+        &cfg(),
+        notice::WHY_DRAFT,
     );
-    let a = crate::supervise::policy::turn_end::decide_turn_end(&st, &r, &cfg(), t);
-    st.acted(&a, &r, t);
-    let e = exception_for(&st, &r, &cfg(), t + MIN).expect("an exception");
-    assert_eq!((e.kind, e.when), (ExceptionKind::Login, Urgency::Now));
-    assert!(e.action.contains("browser"), "{e:?}");
     let off = SupervisorConfig {
         retry_api_errors: false,
         ..cfg()
     };
-    let st = TurnEndState::default();
-    assert!(exception_for(&st, &r, &off, t).is_some_and(|e| e.kind == ExceptionKind::Login));
+    not_run(
+        &mut TurnEndState::default(),
+        &wall,
+        &off,
+        notice::WHY_RETRY_OFF,
+    );
+    let taskless = TurnEndReading {
+        taskless: true,
+        ..wall.clone()
+    };
+    not_run(
+        &mut TurnEndState::default(),
+        &taskless,
+        &cfg(),
+        notice::WHY_NO_TASK,
+    );
+    let finished = TurnEndReading {
+        finished_record: Some(true),
+        ..wall.clone()
+    };
+    not_run(
+        &mut TurnEndState::default(),
+        &finished,
+        &cfg(),
+        notice::WHY_TASK_DONE,
+    );
+    // The hour's typing budget spent by a continuation the wall answered.
+    let budget = SupervisorConfig {
+        continue_per_hour: 1,
+        ..cfg()
+    };
+    let mut st = TurnEndState::default();
+    let ended = TurnEndReading {
+        wall: None,
+        wall_message: String::new(),
+        ..wall.clone()
+    };
+    let (a, _) = point(&mut st, &ended, &budget, t);
+    assert!(a.rule_id().is_some(), "a continuation: {a:?}");
+    st.acted(&a, &ended, t);
+    let met = TurnEndReading {
+        worked: None,
+        ..wall.clone()
+    };
+    st.observe(&met, t + Duration::from_secs(5));
+    not_run(&mut st, &met, &budget, notice::WHY_BUDGET);
+}
+
+/// THE SIGN-IN IS TOLD WHERE IT IS THE OWNER'S (F6, LW-2, LW-4): the browser
+/// hand-off of the `/login` aterm typed is the one step only they can take,
+/// named for the roster row the session's login is; the picker aterm answers
+/// is aterm's, one it does not answer the owner's; a `/login` left or stopped
+/// is theirs to type again. Inside `/login`'s take window, the wall read with
+/// no dialog yet is no sign-in left.
+#[test]
+fn the_sign_in_is_told_where_it_is_the_owners() {
+    use aterm_phase::prompt::fixtures::{
+        LOGIN_CONSOLE_MENU, LOGIN_ERROR, LOGIN_HANDOFF, LOGIN_INTERRUPTED, LOGIN_PICKER,
+        LOGIN_SUCCESS,
+    };
+    let t = t0();
+    let wall = walled(WallKind::Auth, "Login expired · Please run /login");
+    let at = |st: &mut TurnEndState, r: &TurnEndReading, now| point(st, r, &cfg(), now).1;
+    // The browser hand-off: the sign-in, the row named where there is one.
+    let handoff = dialog(LOGIN_HANDOFF);
+    assert_eq!(
+        handoff.login_screen,
+        Some(aterm_phase::LoginScreen::Browser)
+    );
+    let e = at(&mut typed_login(t), &handoff, t + MIN);
+    assert_eq!(
+        notice_id(e.as_ref()),
+        Some(notice::LOGIN_SIGN_IN.id),
+        "{e:?}"
+    );
+    let rostered = TurnEndReading {
+        login_label: Some("work-2".to_string()),
+        ..handoff.clone()
+    };
+    let e = at(&mut typed_login(t), &rostered, t + MIN);
+    assert_eq!(
+        notice_id(e.as_ref()),
+        Some(notice::LOGIN_SIGN_IN_AS.id),
+        "{e:?}"
+    );
+    assert!(e.is_some_and(|e| e.notice.is_some_and(|n| n.did.contains("work-2"))));
+    // The picker: aterm's to answer with the subscription; with nothing
+    // known of the method, the owner's.
+    let picker = dialog(LOGIN_PICKER);
+    assert_eq!(at(&mut typed_login(t), &picker, t + MIN), None);
+    let unknown = TurnEndReading {
+        login_method: None,
+        ..picker.clone()
+    };
+    let e = at(&mut typed_login(t), &unknown, t + MIN);
+    assert_eq!(
+        notice_id(e.as_ref()),
+        Some(notice::LOGIN_CHOOSE.id),
+        "{e:?}"
+    );
+    // Stopped on a state of the dialog's own.
+    for text in [LOGIN_ERROR, LOGIN_CONSOLE_MENU] {
+        let e = at(&mut typed_login(t), &dialog(text), t + MIN);
+        assert_eq!(
+            notice_id(e.as_ref()),
+            Some(notice::LOGIN_STOPPED.id),
+            "{text}"
+        );
+    }
+    // Left: `Login interrupted`, or the wall back with no dialog past
+    // `/login`'s take window — and not inside it.
+    let e = at(&mut typed_login(t), &dialog(LOGIN_INTERRUPTED), t + MIN);
+    assert_eq!(
+        notice_id(e.as_ref()),
+        Some(notice::LOGIN_CANCELLED.id),
+        "{e:?}"
+    );
+    let again = TurnEndReading {
+        worked: None,
+        ..wall.clone()
+    };
+    let mut st = typed_login(t);
+    assert_eq!(
+        at(&mut st, &again, t + Duration::from_secs(5)),
+        None,
+        "the dialog to come"
+    );
+    let e = at(&mut st, &again, t + MIN);
+    assert_eq!(
+        notice_id(e.as_ref()),
+        Some(notice::LOGIN_CANCELLED.id),
+        "{e:?}"
+    );
+    // The login back: nothing told.
+    assert_eq!(
+        at(&mut typed_login(t), &dialog(LOGIN_SUCCESS), t + MIN),
+        None
+    );
+}
+
+/// A PERSON'S OWN `/login` (the review's F2, F3', voluntary-login-false-alarm,
+/// LW-3): on a working session it is no lost login — nothing told, its picker
+/// theirs; at a lost login they are going through it — nothing told — and
+/// one they left is told as theirs (`login-left`, never "aterm ran /login"),
+/// with no `/login` of aterm's after it, their next prompt answered by the
+/// wall again included. NEGATIVE CONTROL: aterm's own `/login` left is told
+/// as aterm's (`login-cancelled`).
+#[test]
+fn a_persons_own_login_is_theirs() {
+    use aterm_phase::prompt::fixtures::{LOGIN_HANDOFF, LOGIN_INTERRUPTED, LOGIN_PICKER};
+    let t = t0();
+    let wall = walled(WallKind::Auth, "Login expired · Please run /login");
+    // On a working session: no lost login, nothing told.
+    for text in [LOGIN_PICKER, LOGIN_HANDOFF] {
+        let mut st = TurnEndState::default();
+        let r = TurnEndReading {
+            wall: None,
+            ..dialog(text)
+        };
+        let (a, e) = point(&mut st, &r, &cfg(), t);
+        assert_eq!(e, None, "{text}");
+        assert_eq!(a.rule_id(), None, "{text}: {a:?}");
+    }
+    // At a lost login, their dialog: nothing told.
+    for text in [LOGIN_PICKER, LOGIN_HANDOFF] {
+        let mut st = TurnEndState::default();
+        st.observe(&wall, t);
+        let (_, e) = point(&mut st, &dialog(text), &cfg(), t + Duration::from_secs(5));
+        assert_eq!(e, None, "{text}");
+    }
+    // Left: theirs, and no `/login` after it.
+    let mut st = TurnEndState::default();
+    st.observe(&wall, t);
+    let (a, e) = point(&mut st, &dialog(LOGIN_INTERRUPTED), &cfg(), t + MIN);
+    assert_eq!(a, TurnEndAction::Nothing);
+    assert_eq!(notice_id(e.as_ref()), Some(notice::LOGIN_LEFT.id), "{e:?}");
+    let next = TurnEndReading {
+        worked: None,
+        ..wall.clone()
+    };
+    for k in 2..=4 {
+        let (a, e) = point(&mut st, &next, &cfg(), t + k * MIN);
+        assert_eq!(a.rule_id(), None, "no /login over their cancel: {a:?}");
+        assert_eq!(notice_id(e.as_ref()), Some(notice::LOGIN_LEFT.id), "{e:?}");
+    }
+    // NEGATIVE CONTROL: aterm's own, left.
+    let mut st = typed_login(t);
+    let (_, e) = point(&mut st, &dialog(LOGIN_INTERRUPTED), &cfg(), t + MIN);
+    assert_eq!(
+        notice_id(e.as_ref()),
+        Some(notice::LOGIN_CANCELLED.id),
+        "{e:?}"
+    );
 }
 
 /// A spend or credit limit no reset ends says so once, with the action the
@@ -312,19 +587,42 @@ fn a_codex_sessions_walls_get_words_that_name_no_vendor() {
     }
 }
 
-/// `Goal cleared after an unrecoverable error (<label>)` names its cause.
+/// `Goal cleared after an unrecoverable error (<label>)` names its cause —
+/// but where the error is Claude Code's lost login, the sign-in is told
+/// first: it is needed now, and nothing runs, the goal included, until it
+/// is made.
 #[test]
 fn a_cleared_goal_names_its_cause() {
     let t = t0();
     let st = TurnEndState::default();
     let r = walled(
-        WallKind::Auth,
-        "Login expired · Please run /login — Goal cleared after an unrecoverable error (authentication failed): \"x\". Run /goal again to continue.",
+        WallKind::ApiError {
+            code: Some(500),
+            retryable: true,
+            cause: aterm_phase::ApiCause::Server,
+        },
+        "API Error: 500 — Goal cleared after an unrecoverable error (server error): \"x\". Run /goal again to continue.",
     );
     let e = exception_for(&st, &r, &cfg(), t).expect("an exception");
     assert_eq!(e.kind, ExceptionKind::GoalCleared);
-    assert!(e.why.contains("authentication failed"), "{e:?}");
+    assert!(e.why.contains("server error"), "{e:?}");
     assert!(e.action.contains("/goal"), "{e:?}");
+    let login = walled(
+        WallKind::Auth,
+        "Login expired · Please run /login — Goal cleared after an unrecoverable error (authentication failed): \"x\". Run /goal again to continue.",
+    );
+    assert_eq!(
+        exception_for(&st, &login, &cfg(), t),
+        None,
+        "aterm runs /login first"
+    );
+    let off = SupervisorConfig {
+        retry_api_errors: false,
+        ..cfg()
+    };
+    let e = exception_for(&st, &login, &off, t).expect("an exception");
+    assert_eq!((e.kind, e.when), (ExceptionKind::Login, Urgency::Now));
+    assert!(e.notice.is_some(), "{e:?}");
 }
 
 /// A bucket no reset ends is an exception only when the tab has not switched
@@ -464,8 +762,13 @@ fn read_screen(fixture: &str, worked: Option<Duration>) -> TurnEndReading {
 /// The exception after each answer to a wall as the loop meets it: `wall`, an
 /// act typed at it on the ladder, the next of `answers` drawn, and again.
 fn answered(wall: &str, answers: &[&str]) -> Vec<Option<Exception>> {
+    answered_from(read_screen(wall, Some(3 * MIN)), answers)
+}
+
+/// [`answered`] from the wall the loop first meets as `first`.
+fn answered_from(first: TurnEndReading, answers: &[&str]) -> Vec<Option<Exception>> {
     let (mut st, mut now) = (TurnEndState::default(), t0());
-    let mut r = read_screen(wall, Some(3 * MIN));
+    let mut r = first;
     let mut told = Vec::new();
     for answer in answers {
         loop {
@@ -525,6 +828,44 @@ fn a_full_context_three_compacts_leave_full_is_an_exception_with_the_way_back() 
     let errors = [COMPACT_ERROR_500_MEASURED; 3];
     assert_eq!(answered(CONTEXT_WALL_MEASURED, &errors)[2], None);
     assert_eq!(answered(END_529, &[END_529; 3])[2], None);
+}
+
+/// A FULL CONTEXT THAT IMAGES OR ATTACHMENTS FILL is told with the way back
+/// its own notice names (ATERM-KI-1016-1, limits: "the image notice's context
+/// wall reuses the context exception's wording (`go back a few messages`)
+/// after three `/compact`s do not help"). Claude Code's notice that an image
+/// is past the many-image size, or that images and attachments pushed the
+/// request past the API's size, is the full context's wall (its own remedy,
+/// `Run /compact`, is the act); where three `/compact`s fail, what fills the
+/// context is no run of recent messages but the image or the attachments, so
+/// the owner is told to go back to before them — read from the episode's own
+/// notice, though the vendor's `Compaction failed` row stands in its place by
+/// then. NEGATIVE CONTROL: the plain full context keeps its way back.
+#[test]
+fn a_full_context_images_fill_is_told_with_the_way_back_its_notice_names() {
+    const IMAGES: &str = "An image in the conversation exceeds the dimension limit for many-image requests (2000px). Run /compact to remove old images from context, or start a new session.";
+    const ATTACHMENTS: &str = "Request too large (max 32 MB). Accumulated images and attachments in the conversation pushed the request over the limit. Run /compact, or double press esc to go back and remove attachments.";
+    let failed = [
+        COMPACT_FAILED_1_MEASURED,
+        COMPACT_FAILED_2_MEASURED,
+        COMPACT_FAILED_3_MEASURED,
+    ];
+    let plain = Exception::context();
+    for (notice, names) in [(IMAGES, "image"), (ATTACHMENTS, "attachment")] {
+        let told = answered_from(walled(WallKind::Context, notice), &failed);
+        assert_eq!(told[..2], [None, None], "{names}: a ladder first");
+        let e = told[2].clone().expect("raised");
+        assert_eq!((e.kind, e.when), (ExceptionKind::Context, Urgency::Later));
+        assert!(
+            e.action != plain.action && e.action.contains(names) && e.why.contains(names),
+            "{names}: {e:?}"
+        );
+        // It is the notice's own way back when the notice itself stands.
+        let r = walled(WallKind::Context, notice);
+        assert_eq!(Exception::context_of(&r.wall_message, None), e, "{names}");
+    }
+    // NEGATIVE CONTROL: the plain full context.
+    assert_eq!(answered(CONTEXT_WALL_MEASURED, &failed)[2], Some(plain));
 }
 
 /// A wait is never an exception: a reset ahead, an API outage, the vendor's

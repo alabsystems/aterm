@@ -22,6 +22,7 @@ fn opts(dir: &std::path::Path) -> Opts {
         // The ask-and-drain flow these tests pin (`upgrade_ask = true`).
         ask: true,
         several_logins: false,
+        usage_credits: false,
         usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
@@ -364,6 +365,63 @@ fn status_rows_come_from_the_state_files_and_filter_by_tab() {
         Some(30_120)
     );
     assert_eq!(json.get("stalled").and_then(Value::as_str), Some("overdue"));
+}
+
+/// AN AFRESH MOVE'S ROW TAKES A WORD AND NAMES ITS MARK'S COMMAND (ATERM-KI-1016-1): the
+/// upgrade's restart of a conversation nobody had asked anything
+/// (`relaunch::CAUSE_UPGRADE_FRESH`) is a row of the owner's view (`St::is_upgrade`), and its
+/// agent, ended and not brought back, is started again by hand with a plain `claude` — the tab
+/// mark's command (`Row::agent_down`). `ask` took only records with an EMPTY cause, so a word
+/// on that row found "no upgrade is recorded", and `--now`'s refusal said `claude --resume
+/// <id>`, which Claude refuses for a conversation with no message. A home the relaunch line
+/// carried rides in front of it. NEGATIVE CONTROL: the same row of a move that resumed (no
+/// cause) says `claude --resume <id>`, as before.
+#[test]
+fn an_afresh_moves_row_takes_a_word_and_names_its_marks_command() {
+    const ID: &str = "0badf00d-1111-2222-3333-444455556666";
+    let dir = ScratchDir::new("upgrade-status", "afresh-ask");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let stopped = |cause: &str, line: &str| St {
+        phase: Phase::Failed("stale-exit".to_string()),
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        source: "managed".to_string(),
+        tab: TAB.to_string(),
+        exited_at: now_s() - 60,
+        cause: cause.to_string(),
+        line: line.to_string(),
+        salt: 5,
+        ..St::default()
+    };
+    let fresh = crate::harness::relaunch::CAUSE_UPGRADE_FRESH;
+    save(&o, ID, &stopped(fresh, ""));
+    let e = ask(&o, TAB, Ask::Now, false).expect_err("not re-armed");
+    assert!(e.contains("`claude` in the tab starts it again"), "{e}");
+    assert!(!e.contains("--resume"), "{e}");
+    let row = ask(&o, TAB, Ask::Skip, false).expect("a word on the afresh row lands");
+    assert_eq!(row.request, Request::Skip("2.1.282".to_string()));
+    // The mark says the same command.
+    let now = now_s();
+    let need = Row::of(ID, &stopped(fresh, ""), now)
+        .interrupt(now)
+        .expect("its agent is down");
+    assert_eq!(need.command.as_deref(), Some("claude"));
+    // Under the home its line carried.
+    let homed = " CLAUDE_CONFIG_DIR='/alt/.claude' '/opt/claude' '--dangerously-skip-permissions'";
+    let row = Row::of(ID, &stopped(fresh, homed), now);
+    assert_eq!(
+        row.fresh_command().as_deref(),
+        Some("CLAUDE_CONFIG_DIR=/alt/.claude claude")
+    );
+    assert_eq!(
+        row.interrupt(now).and_then(|n| n.command).as_deref(),
+        Some("CLAUDE_CONFIG_DIR=/alt/.claude claude")
+    );
+    // NEGATIVE CONTROL: a move that resumed names its conversation.
+    save(&o, ID, &stopped("", ""));
+    let e = ask(&o, TAB, Ask::Now, false).expect_err("not re-armed");
+    assert!(e.contains(&format!("`claude --resume {ID}`")), "{e}");
 }
 
 /// The user's word lands in the tab's upgrade under the sweep lock with a
@@ -1495,6 +1553,586 @@ fn a_tab_whose_autopilot_is_off_reads_its_off_never_aterms_own_fault() {
     pin_awake_since(0);
 }
 
+/// AN AGENT THE UPGRADE ENDED IS SAID DOWN IN A TAB SET ASIDE TOO
+/// (ATERM-KI-1016-1, lifecycle-1; the rule decided 2026-10-18). Autopilot Off
+/// and an agent's own switch set a move aside: one still owed there reads as
+/// held by them, quiet (above). A move that has already ended its agent is
+/// past setting aside: Off stops the tab's worker before its relaunch, the
+/// host forgets what it read of that agent once the roster names none there
+/// (`unwatched_exits`), and lifting Off on the bare shell admits no worker
+/// (no agent leads it), so nothing brings the conversation back and the row
+/// is the one place that names the line that does. So it raises `agent-down`
+/// with that line, in the window and in `--status` alike, as in any tab.
+/// THE ALTERNATIVE, quieting it as the owed move is, leaves an upgrade's
+/// restart carried through a hold when the owner turned the tab Off down for
+/// good with nobody told and no line named. NEGATIVE CONTROL: the same tab's
+/// move still owed, under either, is quiet.
+#[cfg(unix)]
+#[test]
+fn an_agent_the_upgrade_ended_is_said_down_in_a_tab_set_aside_too() {
+    let dir = ScratchDir::new("upgrade-status", "down-aside");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let nobody = |_: &BTreeSet<String>| -> Option<Vec<Holder>> { Some(Vec::new()) };
+    let strings = |tabs: &[&str]| tabs.iter().map(|t| (*t).to_string()).collect::<Vec<_>>();
+    // The window's look and `--status`, with `aside` naming the tab.
+    let read = |off: &[&str],
+                agent_off: &[&str],
+                held: &dyn Fn(&BTreeSet<String>) -> Option<Vec<Holder>>| {
+        let mut view = View::default();
+        view.set_off(&strings(off));
+        view.set_agent_off(&strings(agent_off));
+        let mut sent: Vec<Row> = Vec::new();
+        let _ = view.refresh_with(&o, &tabs, now_s(), held, &mut |rows| sent = rows.to_vec());
+        let aside = Aside {
+            off: off.iter().map(|t| (*t).to_string()).collect(),
+            agent_off: agent_off.iter().map(|t| (*t).to_string()).collect(),
+            ..Aside::default()
+        };
+        let (cli, vetted) = status_rows_with(&o, now_s(), held, &|| aside.clone());
+        assert!(vetted);
+        (sent, cli)
+    };
+    let stale = super::super::STALE_S;
+    let downs = [
+        (
+            "stopped after its exit",
+            Phase::Failed("stale-exit".to_string()),
+            now_s() - 600,
+        ),
+        (
+            "gone, its line untyped past the bound",
+            Phase::Exiting {
+                at_s: now_s() - stale - 60,
+            },
+            now_s() - stale - 30,
+        ),
+    ];
+    for (what, phase, exited_at) in downs {
+        let session = moved_state(&o, upgrade::Agent::Claude, phase, exited_at);
+        for (how, off, agent_off) in [
+            ("its Autopilot Off", &[TAB][..], &[][..]),
+            ("its agent switched off", &[][..], &[TAB][..]),
+            ("neither", &[][..], &[][..]),
+        ] {
+            let (window, cli) = read(off, agent_off, &nobody);
+            for (reader, rows) in [("the window", &window), ("--status", &cli)] {
+                assert_eq!(rows.len(), 1, "{what}, {how}, {reader}: {rows:?}");
+                match rows[0].attention(now_s()) {
+                    Attention::Interrupt(need) => {
+                        assert_eq!(need.kind, "agent-down", "{what}, {how}, {reader}");
+                        assert!(
+                            need.command
+                                .as_deref()
+                                .is_some_and(|c| c.contains(&format!("--resume {session}"))),
+                            "{what}, {how}, {reader}: the line that resumes it: {:?}",
+                            need.command
+                        );
+                    }
+                    other => panic!("{what}, {how}, {reader}: the owner is needed: {other:?}"),
+                }
+            }
+        }
+        std::fs::remove_file(state_dir(&o).join(format!("{session}.json"))).expect("the record");
+    }
+    // NEGATIVE CONTROL: the move still owed in that tab is set aside, quiet.
+    let owed = St {
+        phase: Phase::Pending,
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: TAB.to_string(),
+        pending_since: now_s() - 7 * 3_600,
+        looked_at: now_s() - 3 * 3_600,
+        ..St::default()
+    };
+    super::super::save_at(&o, "aaa", &owed, now_s() - 7 * 3_600);
+    for (how, off, agent_off, word) in [
+        ("its Autopilot Off", &[TAB][..], &[][..], AUTOPILOT_OFF),
+        ("its agent switched off", &[][..], &[TAB][..], AGENT_OFF),
+    ] {
+        let (window, cli) = read(off, agent_off, &behind_in(TAB));
+        for (reader, rows) in [("the window", &window), ("--status", &cli)] {
+            assert_eq!(rows.len(), 1, "{how}, {reader}: {rows:?}");
+            assert_eq!(rows[0].aside, word, "{how}, {reader}");
+            assert!(
+                matches!(rows[0].attention(now_s()), Attention::Quiet),
+                "NEGATIVE CONTROL, {how}, {reader}: {:?}",
+                rows[0].attention(now_s())
+            );
+        }
+    }
+}
+
+/// A RESTART'S AGENT NO LOOK SAW GONE IS READ GONE BY THE PROCESS TABLE
+/// (ATERM-KI-1016-1 lifecycle-5, found deciding lifecycle-1): the upgrade's
+/// SIGTERM is recorded `Exiting` before it is sent, and only a look of the
+/// restart stamps the exit ([`St::seen_gone`]). One whose relaunch waited out
+/// its 30 s for a slow shutdown (`wait:exiting`) and whose tab then went
+/// Autopilot Off, or had its agent switched off, gets no look again: no
+/// worker runs there, and lifting Off on the bare shell admits none. Read off
+/// the record alone, 15 minutes on the row said `hung-exit` — "Agent did not
+/// exit … Press Ctrl-C in that tab" — over an agent long gone, for good (an
+/// `Exiting` row always stands), with no line that resumes it. Now a row past
+/// that bound reads its agent as the restart's own looks do
+/// (`upgrade_wake::wait_exit`, nothing sent; sooner it is its carry's:
+/// `a_slow_shutdown_just_ended_in_a_watched_tab_is_its_carrys_to_relaunch`):
+/// gone, it is exited at its signal, as the stale bound reads
+/// an exit no look saw (`relaunch::expired`), so it is `agent-down` with
+/// that line, in the window and in `--status`. NEGATIVE CONTROLS: the agent
+/// still running is `hung-exit`, as before; a record that names no process
+/// (an older build's, a hand-built one) is read as it stands.
+#[cfg(unix)]
+#[test]
+fn a_restarts_agent_no_look_saw_gone_is_read_gone_by_the_process_table() {
+    let dir = ScratchDir::new("upgrade-status", "unseen-exit");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let nobody = |_: &BTreeSet<String>| -> Option<Vec<Holder>> { Some(Vec::new()) };
+    let gone = {
+        let mut child = aterm_uds::spawnfd::command("/usr/bin/true")
+            .spawn()
+            .expect("spawn /usr/bin/true");
+        let pid = child.id();
+        child.wait().expect("reap");
+        pid
+    };
+    let session = "0badf00d-1111-2222-3333-444455556666";
+    let signalled = now_s() - HUNG_EXIT_AFTER_S - 60;
+    let read = |pid: u32| {
+        save(
+            &o,
+            session,
+            &St {
+                agent: upgrade::Agent::Claude,
+                phase: Phase::Exiting { at_s: signalled },
+                from: "2.1.281".to_string(),
+                to: "2.1.283".to_string(),
+                source: "managed".to_string(),
+                tab: TAB.to_string(),
+                pending_since: signalled - 600,
+                pid,
+                exited_at: 0,
+                ..St::default()
+            },
+        );
+        let mut view = View::default();
+        view.set_off(&[TAB.to_string()]);
+        let mut sent: Vec<Row> = Vec::new();
+        let _ = view.refresh_with(&o, &tabs, now_s(), &nobody, &mut |rows| {
+            sent = rows.to_vec();
+        });
+        let aside = Aside {
+            off: [TAB.to_string()].into(),
+            ..Aside::default()
+        };
+        let (cli, vetted) = status_rows_with(&o, now_s(), &nobody, &|| aside.clone());
+        assert!(vetted);
+        [("the window", sent), ("--status", cli)].map(|(reader, rows)| {
+            assert_eq!(rows.len(), 1, "{reader}: {rows:?}");
+            match rows[0].attention(now_s()) {
+                Attention::Interrupt(need) => (reader, need.kind, need.command),
+                other => panic!("{reader}: the owner is needed: {other:?}"),
+            }
+        })
+    };
+    for (reader, kind, command) in read(gone) {
+        assert_eq!(kind, "agent-down", "{reader}: its agent is gone");
+        assert!(
+            command
+                .as_deref()
+                .is_some_and(|c| c.contains(&format!("--resume {session}"))),
+            "{reader}: the line that resumes it: {command:?}"
+        );
+    }
+    // NEGATIVE CONTROLS: still running (this test's own process), and no
+    // process named.
+    for pid in [std::process::id(), 0] {
+        for (reader, kind, command) in read(pid) {
+            assert_eq!(kind, "hung-exit", "{reader}, pid {pid}");
+            assert_eq!(command, None, "{reader}, pid {pid}");
+        }
+    }
+}
+
+/// A SLOW SHUTDOWN JUST ENDED IN A WATCHED TAB IS ITS CARRY'S TO RELAUNCH
+/// (the review of lifecycle-5, DR-LC-1): the process table is read for a
+/// restart's agent no look saw gone only past the hung-exit bound
+/// ([`HUNG_EXIT_AFTER_S`]), where the row would otherwise say `hung-exit`.
+/// Sooner, a watched tab's agent that outlived the stale bound from its
+/// signal and has just ended is the host's carry's: the carry stamps the exit
+/// as it reads it (`relaunch::carry_restart`, [`St::seen_gone`]), the bound
+/// counts from that stamp, and the agent is relaunched. Read gone and dated
+/// from the signal at once, the row raised `agent-down` with `claude --resume
+/// <id>` (the tab's mark, its band row, a notification) for an agent aterm was
+/// about to bring back, for as long as the carry waited on another actor's
+/// sweep lock (`busy:`, tried again every `relaunch::BUSY`), and asked the
+/// owner to type at the prompt the harness was about to type at. NEGATIVE
+/// CONTROL: the same gone agent past the hung-exit bound is `agent-down` with
+/// its resume line, in the window and in `--status`.
+#[cfg(unix)]
+#[test]
+fn a_slow_shutdown_just_ended_in_a_watched_tab_is_its_carrys_to_relaunch() {
+    let dir = ScratchDir::new("upgrade-status", "slow-shutdown-watched");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let nobody = |_: &BTreeSet<String>| -> Option<Vec<Holder>> { Some(Vec::new()) };
+    let gone = {
+        let mut child = aterm_uds::spawnfd::command("/usr/bin/true")
+            .spawn()
+            .expect("spawn /usr/bin/true");
+        let pid = child.id();
+        child.wait().expect("reap");
+        pid
+    };
+    let session = "0badf00d-1111-2222-3333-444455556666";
+    let record = |signalled: u64| St {
+        agent: upgrade::Agent::Claude,
+        phase: Phase::Exiting { at_s: signalled },
+        from: "2.1.281".to_string(),
+        to: "2.1.283".to_string(),
+        source: "managed".to_string(),
+        tab: TAB.to_string(),
+        pending_since: signalled - 600,
+        pid: gone,
+        // The shell the line is typed at is alive: no `shell-gone`.
+        shell: std::process::id(),
+        exited_at: 0,
+        wait: "exiting".to_string(),
+        ..St::default()
+    };
+    // The window's look and `--status` of a watched tab: what each raises.
+    let read = || {
+        let mut view = View::default();
+        let mut sent: Vec<Row> = Vec::new();
+        let _ = view.refresh_with(&o, &tabs, now_s(), &nobody, &mut |rows| {
+            sent = rows.to_vec()
+        });
+        let (cli, _) = status_rows_with(&o, now_s(), &nobody, &Aside::default);
+        [("the window", sent), ("--status", cli)].map(|(reader, rows)| {
+            assert_eq!(rows.len(), 1, "{reader}: {rows:?}");
+            match rows[0].attention(now_s()) {
+                Attention::Interrupt(need) => (reader, need.kind, need.command),
+                Attention::Quiet => (reader, "quiet", None),
+                other => panic!("{reader}: {other:?}"),
+            }
+        })
+    };
+    save(&o, session, &record(now_s() - super::super::STALE_S - 60));
+    // Another actor's step holds the sweep lock: the carry is `busy:` and
+    // stamps nothing.
+    let lock = super::super::sweep_lock(&o).expect("lock").expect("held");
+    let r = crate::harness::relaunch::carry_restart(&o, upgrade::Agent::Claude, Some(gone), false);
+    assert!(r.step.starts_with("busy:"), "{r:?}");
+    assert_eq!(
+        load(&o, session).expect("kept").exited_at,
+        0,
+        "nothing stamped"
+    );
+    for (reader, kind, command) in read() {
+        assert_eq!(
+            (kind, command),
+            ("quiet", None),
+            "{reader}, the carry busy: its relaunch is still to come"
+        );
+    }
+    drop(lock);
+    // The carry's own stamp once it takes the lock: the bound counts from it,
+    // and the relaunch goes on.
+    let mut st = load(&o, session).expect("kept");
+    assert!(st.seen_gone(now_s()));
+    assert!(
+        crate::harness::relaunch::expired(&st, now_s()).is_none(),
+        "the carry relaunches it"
+    );
+    save(&o, session, &st);
+    for (reader, kind, command) in read() {
+        assert_eq!(
+            (kind, command),
+            ("quiet", None),
+            "{reader}, stamped by the carry"
+        );
+    }
+    // NEGATIVE CONTROL: past the hung-exit bound, no look stamped it.
+    save(&o, session, &record(now_s() - HUNG_EXIT_AFTER_S - 60));
+    for (reader, kind, command) in read() {
+        assert_eq!(kind, "agent-down", "{reader}, past the hung-exit bound");
+        assert!(
+            command
+                .as_deref()
+                .is_some_and(|c| c.contains(&format!("--resume {session}"))),
+            "{reader}: the line that resumes it: {command:?}"
+        );
+    }
+}
+
+/// A RESTART'S AGENT THE PROCESS TABLE SAYS GONE IS NEVER SAID STILL SHUTTING
+/// DOWN (the lab's lc5o and lc1, 2026-10-18, on DR-LC-1's bound): in an
+/// Autopilot Off tab Claude Code ended about 60 s after the upgrade's signal,
+/// and from minute 5 to minute 15 the row read `stuck:exiting` ("asked to end
+/// for the upgrade and has not exited, its own shutdown still running") over a
+/// process long gone, until the hung-exit bound read the table. The stall now
+/// reads the table (`upgrade_wake::wait_exit`, nothing sent) as soon as it can
+/// be said, [`STALE_S`] from the signal: gone, it is `stuck:exited`, in the
+/// window and in `--status`, in an Off tab and a watched one alike. What the
+/// row RAISES keeps DR-LC-1's bound: quiet until [`HUNG_EXIT_AFTER_S`]
+/// (`a_slow_shutdown_just_ended_in_a_watched_tab_is_its_carrys_to_relaunch`).
+/// NEGATIVE CONTROLS, `stuck:exiting`: the agent still running (this test's
+/// own process), and a record that names no process.
+#[cfg(unix)]
+#[test]
+fn a_restarts_agent_the_process_table_says_gone_is_never_said_still_shutting_down() {
+    let dir = ScratchDir::new("upgrade-status", "gone-not-exiting");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let nobody = |_: &BTreeSet<String>| -> Option<Vec<Holder>> { Some(Vec::new()) };
+    let gone = {
+        let mut child = aterm_uds::spawnfd::command("/usr/bin/true")
+            .spawn()
+            .expect("spawn /usr/bin/true");
+        let pid = child.id();
+        child.wait().expect("reap");
+        pid
+    };
+    let session = "0badf00d-1111-2222-3333-444455556666";
+    let signalled = now_s() - super::super::STALE_S - 60;
+    // What each reader's row says and raises, the tab Off or watched.
+    let read = |pid: u32, off: bool| {
+        save(
+            &o,
+            session,
+            &St {
+                agent: upgrade::Agent::Claude,
+                phase: Phase::Exiting { at_s: signalled },
+                from: "2.1.302".to_string(),
+                to: "2.1.303".to_string(),
+                source: "managed".to_string(),
+                tab: TAB.to_string(),
+                pending_since: signalled - 600,
+                pid,
+                shell: std::process::id(),
+                exited_at: 0,
+                wait: "exiting".to_string(),
+                looked_at: now_s() - 30,
+                ..St::default()
+            },
+        );
+        let tab = [TAB.to_string()];
+        let mut view = View::default();
+        if off {
+            view.set_off(&tab);
+        }
+        let mut sent: Vec<Row> = Vec::new();
+        let _ = view.refresh_with(&o, &tabs, now_s(), &nobody, &mut |rows| {
+            sent = rows.to_vec();
+        });
+        let aside = Aside {
+            off: if off { tab.into() } else { BTreeSet::new() },
+            ..Aside::default()
+        };
+        let (cli, _) = status_rows_with(&o, now_s(), &nobody, &|| aside.clone());
+        [("the window", sent), ("--status", cli)].map(|(reader, rows)| {
+            assert_eq!(rows.len(), 1, "{reader}: {rows:?}");
+            let quiet = matches!(rows[0].attention(now_s()), Attention::Quiet);
+            (reader, rows[0].stall(now_s()), quiet)
+        })
+    };
+    for off in [true, false] {
+        for (reader, stall, quiet) in read(gone, off) {
+            assert_eq!(
+                stall.as_deref(),
+                Some("stuck:exited"),
+                "{reader}, off={off}: its agent is gone"
+            );
+            assert!(
+                quiet,
+                "{reader}, off={off}: raised only at the hung-exit bound"
+            );
+        }
+        // NEGATIVE CONTROLS.
+        for pid in [std::process::id(), 0] {
+            for (reader, stall, quiet) in read(pid, off) {
+                assert_eq!(
+                    stall.as_deref(),
+                    Some("stuck:exiting"),
+                    "{reader}, off={off}, pid {pid}"
+                );
+                assert!(quiet, "{reader}, off={off}, pid {pid}");
+            }
+        }
+    }
+}
+
+/// A RESTART DOWN IN FLIGHT IS LOWERED ONCE ITS CONVERSATION IS LIVE AGAIN
+/// (the review of lifecycle-1, DR-LC-2). Under Off (or the agent's own switch
+/// off) no worker visits the tab, so a restart whose agent was read gone
+/// stays `Exiting`, and its row raises `agent-down` with the line that brings
+/// it back (lifecycle-1). Then the owner types that line in the tab. Only a
+/// move that FAILED after its exit was answered by a holder
+/// ([`Row::held_again`]), and the worker's close of an overtaken restart
+/// (`St::close_overtaken`) never runs there, so the row kept the interrupt for
+/// as long as Off stood over a conversation live again. Now such a row is
+/// answered as that move is, in the window and in `--status`: a live holder of
+/// its conversation (and, for a fresh restart, whose line is a plain `claude`,
+/// an agent leading its tab) lowers it. It then stands only for a behind holder
+/// of its conversation in its tab, quiet, and in the window it stays lowered
+/// once that agent is quit by hand ([`View::back`]). NEGATIVE CONTROLS: no
+/// holder, or the very agent the restart ended still read as holding it (a
+/// zombie its shell has yet to reap, its session file still there), keeps
+/// `agent-down` with its line.
+#[cfg(unix)]
+#[test]
+fn a_restart_down_in_flight_is_lowered_once_its_conversation_is_live_again() {
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let session = "0badf00d-1111-2222-3333-444455556666";
+    let other = "11112222-3333-4444-5555-666677778888";
+    let gone = {
+        let mut child = aterm_uds::spawnfd::command("/usr/bin/true")
+            .spawn()
+            .expect("spawn /usr/bin/true");
+        let pid = child.id();
+        child.wait().expect("reap");
+        pid
+    };
+    let stale = super::super::STALE_S;
+    let fresh = crate::harness::relaunch::CAUSE_UPGRADE_FRESH;
+    // What, the signal, the exit a look stamped (`0`: none) and the cause.
+    let kinds = [
+        (
+            "seen gone by a look",
+            now_s() - stale - 60,
+            now_s() - stale - 30,
+            "",
+        ),
+        (
+            "read gone by the process table",
+            now_s() - HUNG_EXIT_AFTER_S - 60,
+            0,
+            "",
+        ),
+        (
+            "a fresh restart",
+            now_s() - stale - 60,
+            now_s() - stale - 30,
+            fresh,
+        ),
+    ];
+    for (n, (what, signalled, exited_at, cause)) in kinds.into_iter().enumerate() {
+        let dir = ScratchDir::new("upgrade-status", &format!("down-in-flight-{n}"));
+        let o = opts(&dir);
+        std::fs::create_dir_all(state_dir(&o)).expect("state");
+        save(
+            &o,
+            session,
+            &St {
+                agent: upgrade::Agent::Claude,
+                phase: Phase::Exiting { at_s: signalled },
+                from: "2.1.281".to_string(),
+                to: "2.1.283".to_string(),
+                source: "managed".to_string(),
+                tab: TAB.to_string(),
+                pending_since: signalled - 600,
+                pid: gone,
+                exited_at,
+                cause: cause.to_string(),
+                ..St::default()
+            },
+        );
+        // The window's look and `--status`, the tab's Autopilot Off.
+        let read = |held: &dyn Fn(&BTreeSet<String>) -> Option<Vec<Holder>>| {
+            let mut view = View::default();
+            view.set_off(&[TAB.to_string()]);
+            let mut sent: Vec<Row> = Vec::new();
+            let _ = view.refresh_with(&o, &tabs, now_s(), held, &mut |rows| sent = rows.to_vec());
+            let aside = Aside {
+                off: [TAB.to_string()].into(),
+                ..Aside::default()
+            };
+            let (cli, vetted) = status_rows_with(&o, now_s(), held, &|| aside.clone());
+            assert!(vetted);
+            [("the window", sent), ("--status", cli)]
+        };
+        let raised = |rows: &[Row]| -> Vec<(&'static str, Option<String>)> {
+            rows.iter()
+                .filter_map(|r| match r.attention(now_s()) {
+                    Attention::Interrupt(need) => Some((need.kind, need.command)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Who holds what, as `holders` reads it: `(conversation, pid, build)`.
+        let held_by = |who: Vec<(&'static str, u32, &'static str)>| {
+            move |_: &BTreeSet<String>| -> Option<Vec<Holder>> {
+                Some(
+                    who.iter()
+                        .map(|(s, pid, version)| Holder {
+                            pid: *pid,
+                            led: true,
+                            ..holder(s, version, Some(TAB))
+                        })
+                        .collect(),
+                )
+            }
+        };
+        let down = |rows: &[Row], why: &str| {
+            let said = raised(rows);
+            assert!(
+                matches!(said.as_slice(), [("agent-down", Some(_))]),
+                "{what}, {why}: agent-down with its line: {said:?}"
+            );
+        };
+        // NEGATIVE CONTROLS: nobody holds it; the agent the restart ended
+        // still reads as holding it, in its tab.
+        for (reader, rows) in read(&held_by(Vec::new())) {
+            down(&rows, &format!("{reader}, nobody"));
+        }
+        for (reader, rows) in read(&held_by(vec![(session, gone, "2.1.281")])) {
+            down(&rows, &format!("{reader}, the ended agent itself"));
+        }
+        // The owner's line: a resume of the conversation, or a fresh
+        // restart's plain `claude` (a new conversation leading its tab).
+        let resumed = if cause == fresh { other } else { session };
+        let me = std::process::id();
+        for (reader, rows) in read(&held_by(vec![(resumed, me, "2.1.281")])) {
+            assert_eq!(raised(&rows), Vec::new(), "{what}, {reader}: live again");
+            if cause == fresh {
+                assert!(rows.is_empty(), "{what}, {reader}: {rows:?}");
+            } else {
+                assert_eq!(rows.len(), 1, "{what}, {reader}: a behind holder");
+                assert_eq!(
+                    rows[0].attention(now_s()),
+                    Attention::Quiet,
+                    "{what}, {reader}"
+                );
+            }
+        }
+        for (reader, rows) in read(&held_by(vec![(resumed, me, "2.1.283")])) {
+            assert!(rows.is_empty(), "{what}, {reader}, current: {rows:?}");
+        }
+        // The owner quits it by hand: the window does not raise it again.
+        let [(_, window), _] = read(&held_by(Vec::new()));
+        assert_eq!(raised(&window), Vec::new(), "{what}: quit by hand");
+    }
+}
+
 /// A RECORD NO BUILD GAVE A TAB READS THE CLAIM ON ITS HOLDER'S TAB: `--status`
 /// shows such a row under the tab its holder is proven in, and reads its aside
 /// only once that tab is filled in, so a claim there holds it (never
@@ -1726,10 +2364,17 @@ fn the_host_sends_its_tabs_rows_only_when_they_change() {
     assert_eq!(sent.len(), 3, "said once");
 }
 
-/// Upgrade records that cannot be read whole say nothing (as an unreadable
-/// roster or session files do), so a successor's look does not withdraw stall
-/// rows. An unlistable state directory or an unreadable listed record hands
-/// over nothing; `--status` shows what reads. No directory at all is a look.
+/// Upgrade records that cannot be read whole withdraw nothing (as an
+/// unreadable roster or session files do), so a successor's look does not
+/// withdraw stall rows. An unlistable state directory hands over nothing; an
+/// unreadable listed record never read, naming no tab it can be read for,
+/// hands over the rows that read with EVERY live tab left as it stands
+/// (ATERM-KI-1016-1: it handed over nothing, and every tab's rows stood for
+/// as long as that record did); `--status` shows what reads. No directory at
+/// all is a look. The view names the directory it cannot list for as long
+/// as it cannot ([`View::unlisted`]: until then nothing was said to the
+/// owner while every row and mark stood at the last whole look), and names
+/// none once one is listed, or none is there, or the view stands down.
 #[test]
 fn records_that_cannot_be_read_whole_hand_the_window_nothing() {
     let dir = ScratchDir::new("upgrade-status", "unreadable-records");
@@ -1740,6 +2385,7 @@ fn records_that_cannot_be_read_whole_hand_the_window_nothing() {
     }];
     let held = behind_in(TAB);
     let mut sent: Vec<Vec<Row>> = Vec::new();
+    let mut kept: Vec<Vec<String>> = Vec::new();
     let mut view = View::default();
     // Not listable: a file where the directory goes (ENOTDIR).
     std::fs::create_dir_all(&o.state).expect("state");
@@ -1751,6 +2397,11 @@ fn records_that_cannot_be_read_whole_hand_the_window_nothing() {
     );
     assert_eq!(next, None);
     assert!(rows_at(&o, NOW).is_empty(), "--status reads no records");
+    assert_eq!(
+        view.unlisted(),
+        Some(state_dir(&o).as_path()),
+        "the directory it cannot list is named"
+    );
     // Listed, not readable: a record that loops on itself (ELOOP), beside
     // a stalled record that reads.
     std::fs::remove_file(state_dir(&o)).expect("unblock");
@@ -1769,27 +2420,51 @@ fn records_that_cannot_be_read_whole_hand_the_window_nothing() {
     );
     let looped = state_dir(&o).join("bbb.json");
     std::os::unix::fs::symlink(&looped, &looped).expect("a record that loops");
-    view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| sent.push(rows.to_vec()));
-    assert!(
-        sent.is_empty(),
-        "a record that cannot be read hands over nothing"
+    view.refresh_with_keeping(&o, &tabs, NOW, &held, &mut |rows, tabs| {
+        sent.push(rows.to_vec());
+        kept.push(tabs.to_vec());
+    });
+    assert_eq!(sent.len(), 1, "the rows that read are handed over");
+    assert_eq!(sent[0].len(), 1);
+    assert_eq!(view.unlisted(), None, "listed whole: no directory named");
+    assert_eq!(
+        kept,
+        [vec![TAB.to_string()]],
+        "with its conversation's tab left as it stands: the record names none it can be read for"
+    );
+    assert_eq!(
+        view.unreadable(),
+        std::slice::from_ref(&looped),
+        "the record it cannot read is named"
     );
     assert_eq!(
         rows_at(&o, NOW).len(),
         1,
         "--status reads the one that reads"
     );
-    // Read whole again: the look is handed over.
+    // Read whole again: the look is handed over, nothing left as it stands.
     std::fs::remove_file(&looped).expect("unloop");
-    view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| sent.push(rows.to_vec()));
-    assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].len(), 1);
-    assert_eq!(sent[0][0].stalled.as_deref(), Some("overdue"));
+    view.refresh_with_keeping(&o, &tabs, NOW, &held, &mut |rows, tabs| {
+        sent.push(rows.to_vec());
+        kept.push(tabs.to_vec());
+    });
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1].len(), 1);
+    assert_eq!(sent[1][0].stalled.as_deref(), Some("overdue"));
+    assert!(kept[1].is_empty(), "read whole: no tab left as it stands");
+    assert!(view.unreadable().is_empty(), "read whole: none named");
     // No directory at all: nothing recorded, and that is a look.
     std::fs::remove_dir_all(state_dir(&o)).expect("no records");
     view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| sent.push(rows.to_vec()));
-    assert_eq!(sent.len(), 2);
-    assert!(sent[1].is_empty(), "no directory: no records, handed over");
+    assert_eq!(sent.len(), 3);
+    assert!(sent[2].is_empty(), "no directory: no records, handed over");
+    assert_eq!(view.unlisted(), None, "no directory: none named");
+    // Unlistable again, then stood down: a view stood down names none.
+    std::fs::write(state_dir(&o), b"").expect("a file in the directory's place again");
+    view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| sent.push(rows.to_vec()));
+    assert!(view.unlisted().is_some());
+    view.stand_down(&mut |rows| sent.push(rows.to_vec()));
+    assert_eq!(view.unlisted(), None, "stood down: none named");
 }
 
 /// ONE STATE FILE, OLDER WRITERS: a file written by the build before the
@@ -2666,14 +3341,18 @@ fn moved_state_as(
             "2.1.283",
         ),
         upgrade::Agent::Codex => (format!("codex-{TAB}"), "0.157.0", "0.157.1"),
-        // Muse Code: its lane relaunches on exit and restores, and writes its
-        // `muse-<tab>` records for that; it has no live upgrade, so no
+        // Muse Code: its lane writes its `muse-<tab>` records for its
+        // relaunch on exit, its restore and its quiet live upgrade, none of
+        // which keeps this ladder's moved state to read.
+        upgrade::Agent::Muse => unreachable!("Muse Code's quiet upgrade keeps no ladder state"),
+        // agy: its lane writes its `agy-<tab>` records for its relaunch on
+        // exit, its restore and its quiet live upgrade, none of which keeps
+        // this ladder's moved state to read.
+        upgrade::Agent::Agy => unreachable!("agy's quiet upgrade keeps no ladder state"),
+        // Gemini CLI: its lane relaunches on exit and restores, and writes
+        // its `gemini-<tab>` records for that; it has no live upgrade, so no
         // upgrade of its moved state to read.
-        upgrade::Agent::Muse => unreachable!("Muse Code has no upgrade lane"),
-        // No lane yet (agy, Gemini CLI): no lane writes their state.
-        upgrade::Agent::Agy | upgrade::Agent::Gemini => {
-            unreachable!("{agent:?} has no upgrade lane")
-        }
+        upgrade::Agent::Gemini => unreachable!("Gemini CLI has no upgrade lane"),
     };
     save(
         o,
@@ -2819,9 +3498,10 @@ const NEW: &str = "5eed0000-1111-2222-3333-444455556666";
 /// the look the new agent's start brings comes before that agent files its
 /// record. NEGATIVE CONTROLS: an agent proven in another tab, or in none,
 /// lowers nothing; one proven by environment alone lowers nothing in the
-/// window; a view that never saw the agent back (aterm restarted) reads the
-/// record afresh; a later exit of the move, and a record that left the down
-/// state and came back to it, are raised again.
+/// window; a view started afresh (aterm restarted) keeps what the last one
+/// saw, from beside the records ([`BACK_FILE`]), and reads the record afresh
+/// with nothing kept there; a later exit of the move, and a record that left
+/// the down state and came back to it, are raised again.
 #[cfg(unix)]
 #[test]
 fn a_claude_move_down_after_its_exit_is_lowered_by_any_agent_back_in_its_tab() {
@@ -2932,11 +3612,19 @@ fn a_claude_move_down_after_its_exit_is_lowered_by_any_agent_back_in_its_tab() {
         "{:?}",
         meta()
     );
-    // A view that never saw it back (aterm restarted) reads the record
-    // afresh; `--status`, with no memory, lists it.
+    // A VIEW STARTED AFRESH (aterm restarted inside the day the row is
+    // shown) keeps what the last one saw, beside the records
+    // (ATERM-KI-1016-1's LC-2: it was that process's alone, and the row was
+    // raised again over the tab whose owner acted); `--status`, a record,
+    // lists it.
     let mut afresh = (View::default(), Vec::new());
-    assert_eq!(look(&mut afresh, &nobody), 1);
+    assert_eq!(look(&mut afresh, &nobody), 0);
     assert_eq!(listed(&nobody), 1);
+    // NEGATIVE CONTROL: with nothing kept beside the records, a view that
+    // never saw it back reads the record afresh.
+    std::fs::remove_file(state_dir(&o).join(BACK_FILE)).expect("kept beside the records");
+    let mut unkept = (View::default(), Vec::new());
+    assert_eq!(look(&mut unkept, &nobody), 1);
 
     // A LATER EXIT of the move is a new fact.
     down(exited + 30);
@@ -3030,7 +3718,10 @@ fn a_fresh_claude_in_the_down_tab_is_read_by_the_real_holders() {
     assert!(status_rows(&o, false).0.is_empty());
 
     // Proven by environment alone in the window (the roster names a group
-    // no stand-in has): not led, and the row stands.
+    // no stand-in has): not led, and the row stands — for a view that never
+    // saw it back (nothing kept beside the records: the view above keeps
+    // its sight of the agent there, `BACK_FILE`).
+    std::fs::remove_file(state_dir(&o).join(BACK_FILE)).expect("kept beside the records");
     let by_env = [LiveTab {
         sid: TAB.to_string(),
         fgpgid: Some(1),
@@ -3095,6 +3786,196 @@ fn a_fresh_claude_in_the_down_tab_is_read_by_the_real_holders() {
         &mut |r| sent.push(r.to_vec()),
     );
     assert_eq!(sent, [Vec::<Row>::new()], "never handed over again");
+}
+
+/// THE AGENTS THAT ANSWER A FRESH ROW WHOSE SHELL IS GONE (the review of
+/// LC-2, KR-7): its remedy is a new tab, where no agent of its own tab can
+/// ever be; [`answering_shell_gone`] gives it the earliest-started Claude
+/// Code that started after its exit, under its Claude directory and in its
+/// working directory — one agent a row, one row an agent, the oldest exit
+/// first. NEGATIVE CONTROLS: an agent started at or before the exit, in
+/// another directory, under another Claude home, or with no start time read
+/// answers nothing; a row with no working directory is answered by nobody;
+/// a second row is not answered by the first row's agent.
+#[test]
+fn a_shell_gone_row_is_answered_by_one_claude_started_after_it_in_its_project() {
+    let user = PathBuf::from("/u");
+    let mine = user.join(".claude");
+    let row = |session: &str, cwd: &str, exited_at: u64| ShellGone {
+        session: session.to_string(),
+        dir: Some(mine.clone()),
+        cwd: cwd.to_string(),
+        exited_at,
+    };
+    let agent = |pid: u32, cwd: &str, dir: Option<&Path>| {
+        let mut sf = upgrade::parse_session_file(&format!(
+            r#"{{"pid":{pid},"sessionId":"5eed0000-1111-2222-3333-44445555{pid:04}","cwd":"{cwd}","version":"2.1.283","status":"idle","statusUpdatedAt":1,"procStart":"Sat Oct 17 10:00:00 2026","kind":"interactive","entrypoint":"cli"}}"#
+        ))
+        .expect("a session file");
+        sf.claude_dir = dir.map(Path::to_path_buf);
+        let h = Holder {
+            led: true,
+            ..holder(&sf.session_id, "2.1.283", Some("s-new"))
+        };
+        (sf, h)
+    };
+    // pid -> the second it started.
+    let started = |pid: u32| -> Option<u64> {
+        match pid {
+            1 => Some(1_050),
+            2 => Some(1_200),
+            3 => Some(1_000),
+            _ => None,
+        }
+    };
+    let answered = |gone: &[ShellGone], others: &[(upgrade::SessionFile, Holder)]| {
+        answering_shell_gone(
+            &user,
+            gone,
+            others.iter().map(|(sf, h)| (sf, h.clone())).collect(),
+            started,
+        )
+        .into_iter()
+        .map(|h| (h.session, h.answers.unwrap_or_default()))
+        .collect::<Vec<_>>()
+    };
+    let sid = |pid: u32| format!("5eed0000-1111-2222-3333-44445555{pid:04}");
+
+    // One row, one agent started after its exit in its project, under its
+    // home — recorded, or read from text alone (the user's own `~/.claude`).
+    let a = [row("row-a", "/p", 1_000)];
+    for dir in [Some(mine.as_path()), None] {
+        assert_eq!(
+            answered(&a, &[agent(1, "/p", dir)]),
+            [(sid(1), "row-a".to_string())]
+        );
+    }
+    // NEGATIVE CONTROLS: started in the exit's second, another project,
+    // another Claude home, no start time read.
+    assert!(answered(&a, &[agent(3, "/p", Some(&mine))]).is_empty());
+    assert!(answered(&a, &[agent(1, "/q", Some(&mine))]).is_empty());
+    assert!(answered(&a, &[agent(1, "/p", Some(Path::new("/u/.claude-work")))]).is_empty());
+    assert!(answered(&a, &[agent(9, "/p", Some(&mine))]).is_empty());
+    // A row with no working directory recorded: nobody answers it.
+    assert!(answered(&[row("row-a", "", 1_000)], &[agent(1, "", Some(&mine))]).is_empty());
+
+    // Two rows: one agent each, the oldest exit taking the earliest agent
+    // after it — and with one agent, only the oldest row is answered.
+    let two = [row("row-b", "/p", 1_100), row("row-a", "/p", 1_000)];
+    let both = [agent(2, "/p", Some(&mine)), agent(1, "/p", Some(&mine))];
+    assert_eq!(
+        answered(&two, &both),
+        [(sid(1), "row-a".to_string()), (sid(2), "row-b".to_string())]
+    );
+    assert_eq!(
+        answered(&two, &[agent(2, "/p", Some(&mine))]),
+        [(sid(2), "row-a".to_string())]
+    );
+    // The later row's exit is after the only agent's start: the older row's.
+    assert_eq!(
+        answered(&two, &[agent(1, "/p", Some(&mine))]),
+        [(sid(1), "row-a".to_string())]
+    );
+}
+
+/// THE REAL READ OF A FRESH ROW WHOSE SHELL IS GONE (the review of LC-2,
+/// KR-7): the owner did what it asks — opened a new tab and started Claude
+/// Code in the row's project — and [`holders`] gives that agent to the row
+/// ([`Holder::answers`]), which the window's view and `--status` lower over
+/// it. NEGATIVE CONTROLS: shown while the agent runs in another project;
+/// a fresh row stopped for any other reason is answered by its own tab's
+/// agent alone; once the agent is gone `--status` lists it again.
+#[cfg(unix)]
+#[test]
+fn a_claude_started_in_a_new_tab_answers_the_row_whose_shell_is_gone() {
+    let dir = ScratchDir::new("upgrade-status", "shell-gone-answered");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let exited = now_s() - 120;
+    let fresh = crate::harness::relaunch::CAUSE_UPGRADE_FRESH;
+    let down = |why: &str, cwd: &str| {
+        let session = moved_state_as(
+            &o,
+            upgrade::Agent::Claude,
+            Phase::Failed(why.to_string()),
+            exited,
+            fresh,
+        );
+        let mut st = load(&o, &session).expect("the state");
+        cwd.clone_into(&mut st.cwd);
+        save(&o, &session, &st);
+        session
+    };
+    let old = down("shell-gone", "/elsewhere");
+    let vet: BTreeSet<String> = [old.clone()].into();
+    // The owner's new tab, its Claude Code started in `/` (`register_as`);
+    // the row's tab still open with no shell in it (where the window shows
+    // it at all).
+    let mut agent = parked_agent("s-new");
+    register_as(&o.home, agent.id(), NEW, "2.1.283");
+    let group = super::super::process_group(agent.id()).expect("group");
+    let tabs = [
+        LiveTab {
+            sid: TAB.to_string(),
+            fgpgid: None,
+        },
+        LiveTab {
+            sid: "s-new".to_string(),
+            fgpgid: Some(group),
+        },
+    ];
+    let answers = |held: Option<Vec<Holder>>| -> Vec<(Option<String>, bool)> {
+        held.expect("read whole")
+            .into_iter()
+            .filter(|h| h.session == NEW)
+            .map(|h| (h.answers, h.led))
+            .collect()
+    };
+    let shown = || -> usize {
+        let mut rows: Vec<Row> = Vec::new();
+        let _ = View::default().refresh_with(
+            &o,
+            &tabs,
+            now_s(),
+            &|s| holders(&o, s, Some(&tabs)),
+            &mut |r| rows = r.to_vec(),
+        );
+        rows.len()
+    };
+
+    // CONTROL: the agent runs in another project — the row stands, in the
+    // window and in `--status`.
+    assert!(answers(holders(&o, &vet, Some(&tabs))).is_empty());
+    assert_eq!(shown(), 1);
+    assert_eq!(status_rows(&o, false).0.len(), 1);
+
+    // In the row's project: the row's, led in the window, by environment
+    // in `--status`; lowered in both.
+    down("shell-gone", "/");
+    assert_eq!(
+        answers(holders(&o, &vet, Some(&tabs))),
+        [(Some(old.clone()), true)]
+    );
+    assert_eq!(
+        answers(holders(&o, &vet, None)),
+        [(Some(old.clone()), false)]
+    );
+    assert!(status_rows(&o, false).0.is_empty());
+    assert_eq!(shown(), 0);
+    std::fs::remove_file(state_dir(&o).join(BACK_FILE)).expect("kept beside the records");
+
+    // A fresh row stopped for another reason: its own tab's agent alone.
+    down("no-resume", "/");
+    assert!(answers(holders(&o, &vet, Some(&tabs))).is_empty());
+    assert_eq!(shown(), 1);
+    assert_eq!(status_rows(&o, false).0.len(), 1);
+
+    // The agent ends: no holder, and `--status` lists the row again.
+    down("shell-gone", "/");
+    let _ = agent.kill();
+    let _ = agent.wait();
+    assert!(answers(holders(&o, &vet, Some(&tabs))).is_empty());
+    assert_eq!(status_rows(&o, false).0.len(), 1);
 }
 
 /// A new round inherits nothing of the old one's restart ([`St::rearm`]): a
@@ -4935,6 +5816,71 @@ fn next_attention_at_names_every_change_by_time() {
     assert!(rows > 500, "{rows} rows swept");
 }
 
+/// A MARK ON A TAB LEFT AS IT STANDS STAYS (ATERM-KI-1016-1): while a record
+/// this view never read cannot be read and names no tab — so every live tab
+/// is left as it stands ([`View::refresh_keeping`]) — a tab's mark this view
+/// raised is not lowered though its own record no longer wants it: what the
+/// unread record says of that tab is not known. CONTROL: once every record
+/// reads, the mark is lowered.
+#[cfg(unix)]
+#[test]
+fn a_mark_on_a_tab_left_as_it_stands_stays() {
+    let dir = ScratchDir::new("upgrade-status", "kept-mark");
+    let (sock, asked) = recording_socket(&dir);
+    let o = Opts {
+        sock: Some(sock),
+        ..opts(&dir)
+    };
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let waiting = St {
+        phase: Phase::Pending,
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: TAB.to_string(),
+        pending_since: now_s() - 60,
+        ..St::default()
+    };
+    let stalled = St {
+        phase: Phase::Failed("stale-exit".to_string()),
+        exited_at: now_s() - 600,
+        ..waiting.clone()
+    };
+    save(&o, "aaa", &stalled);
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let lowered = |asked: &std::sync::Mutex<Vec<String>>| -> bool {
+        asked.lock().is_ok_and(|a| {
+            a.iter()
+                .any(|l| *l == format!("@{TAB} meta unset attention owner=upgrade"))
+        })
+    };
+    let nobody = |_: &BTreeSet<String>| -> Option<Vec<Holder>> { Some(Vec::new()) };
+    let held = behind_in(TAB);
+    let mut view = View::default();
+    let _ = view.refresh_with(&o, &tabs, now_s(), &nobody, &mut |_| {});
+    assert!(
+        view.badged.contains_key(TAB),
+        "the agent the upgrade ended is marked"
+    );
+    // A record that cannot be read and names no tab, and the stall over.
+    let looped = state_dir(&o).join("bbb.json");
+    std::os::unix::fs::symlink(&looped, &looped).expect("a record that loops");
+    save(&o, "aaa", &waiting);
+    asked.lock().expect("log").clear();
+    let _ = view.refresh_with(&o, &tabs, now_s(), &held, &mut |_| {});
+    assert!(
+        !lowered(&asked),
+        "left as it stands: its mark is not lowered"
+    );
+    assert!(view.badged.contains_key(TAB));
+    // CONTROL: every record reads.
+    std::fs::remove_file(&looped).expect("unloop");
+    let _ = view.refresh_with(&o, &tabs, now_s(), &held, &mut |_| {});
+    assert!(lowered(&asked), "CONTROL: read whole, the mark is lowered");
+}
+
 /// A DIGEST LINE IS KEYED BY KIND AND TAB, NEVER BY THE BUILD, AN AGE OR THE
 /// WORDS (Claude ships about daily, so a build key would raise again what the
 /// owner dismissed): the same
@@ -5347,6 +6293,41 @@ fn an_upgrade_that_cannot_run_is_one_owner_sentence() {
     // A step word longer than a sentence can hold is cut in the log line.
     let long = Need::upgrade_cannot_run(&"x".repeat(200));
     assert!(long.log_line.chars().count() < 100, "{}", long.log_line);
+    // ITS RECORDS' FOLDER UNLISTABLE ([`View::unlisted`]) is the host's one
+    // line too, under the same rules, and a kind of its own.
+    let need = Need::upgrade_records_unlisted();
+    assert_eq!(need.kind, "upgrade-records-unlisted");
+    assert_eq!(need.fingerprint, "upgrade-records-unlisted/-");
+    assert_eq!(need.severity, NeedSeverity::Warn);
+    assert!(need.why.chars().count() <= NEED_WHY_MAX);
+    assert!(need.then.chars().count() <= NEED_THEN_MAX);
+    assert!(!need.then.contains("; ") && !need.then.contains(" or "));
+    for text in [&need.why, &need.then, &need.title.to_string()] {
+        for n in ["restart", "relaunch", "reopen", "next launch", "reboot"] {
+            assert!(!text.to_lowercase().contains(n), "{n} in {text}");
+        }
+    }
+    let placed = format!("{} in tab 12", need.title);
+    assert!(placed.split_whitespace().count() <= 7 && placed.chars().count() <= 48);
+    assert!(!need.log_line.contains('\n') && need.log_line.contains(need.kind));
+    // A RECORD IT CANNOT READ ([`View::unreadable`]): the same rules, a kind
+    // of its own.
+    let unread = Need::upgrade_records_unreadable();
+    assert_eq!(unread.kind, "upgrade-records-unreadable");
+    assert_eq!(unread.fingerprint, "upgrade-records-unreadable/-");
+    assert_ne!(unread.kind, need.kind);
+    assert_eq!(unread.severity, NeedSeverity::Warn);
+    assert!(unread.why.chars().count() <= NEED_WHY_MAX, "{}", unread.why);
+    assert!(unread.then.chars().count() <= NEED_THEN_MAX);
+    assert!(!unread.then.contains("; ") && !unread.then.contains(" or "));
+    for text in [&unread.why, &unread.then, &unread.title.to_string()] {
+        for n in ["restart", "relaunch", "reopen", "next launch", "reboot"] {
+            assert!(!text.to_lowercase().contains(n), "{n} in {text}");
+        }
+    }
+    let placed = format!("{} in tab 12", unread.title);
+    assert!(placed.split_whitespace().count() <= 7 && placed.chars().count() <= 48);
+    assert!(!unread.log_line.contains('\n') && unread.log_line.contains(unread.kind));
 }
 
 /// aterm's own notice that its fence would not type is told as such: the row
@@ -7777,10 +8758,11 @@ fn a_recorded_line_ending_cd_reads_to_its_end_and_the_view_stands() {
 /// while it stood no tab's watch was renewed — a tab whose record came past
 /// its watch meanwhile was never watched — and the GUI host could only ask
 /// the whole view again later. Each record is read under its own catch now:
-/// the one that panics is left out and the look is not whole (its rows are
-/// not handed over, as with a record that cannot be read), while every other
-/// record's watch is named and listed as ever. CONTROL: with no such record,
-/// the same look is whole and hands its row.
+/// the one that panics is left out, while every other record's watch is
+/// named and listed as ever — and its row handed over (ATERM-KI-1016-1: the
+/// look counted as not whole then, and every tab's rows and marks stood at
+/// the last whole look for as long as that record panicked). CONTROL: with
+/// no such record, the same look hands the same row.
 #[test]
 fn one_record_whose_read_panics_is_an_unreadable_record() {
     for panics in [true, false] {
@@ -7820,22 +8802,560 @@ fn one_record_whose_read_panics_is_an_unreadable_record() {
         let held = behind_in(TAB);
         let mut view = View::default();
         let due = NOW + upgrade::REASK_S;
-        let mut sent = 0;
+        let mut sent: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+        let mut hand = |rows: &[Row], kept: &[String]| {
+            sent.push((
+                rows.iter().map(|r| r.session.clone()).collect(),
+                kept.to_vec(),
+            ));
+        };
         assert_eq!(
-            view.refresh_with(&o, &tabs, NOW, &held, &mut |_| sent += 1),
+            view.refresh_with_keeping(&o, &tabs, NOW, &held, &mut hand),
             Some(due),
             "panics={panics}: the readable record's watch is the instant named"
         );
-        let _ = view.refresh_with(&o, &tabs, due, &held, &mut |_| sent += 1);
+        let _ = view.refresh_with_keeping(&o, &tabs, due, &held, &mut hand);
         assert_eq!(
             view.watch_due(),
             [TAB],
             "panics={panics}: the readable record's tab is watched once due"
         );
-        if panics {
-            assert_eq!(sent, 0, "not whole: no rows handed over");
+        let kept: Vec<String> = if panics {
+            vec!["s-faulty".to_string()]
         } else {
-            assert!(sent >= 1, "CONTROL: a whole look hands its rows");
+            Vec::new()
+        };
+        assert_eq!(
+            sent.first(),
+            Some(&(vec!["aaa".to_string()], kept)),
+            "panics={panics}: the readable record's row is handed over, the faulty one's tab \
+             left as it stands"
+        );
+    }
+}
+
+/// AN AGY'S NEED NAMES A COMMAND THAT RUNS: agy, then its own picker
+/// (`/resume`), wherever an agy row would hand the owner a resume command
+/// (its quiet upgrade's restart that cannot land, a crash relaunch's). A
+/// bare `agy --conversation` — what both said before — is refused
+/// by agy (`flag needs an argument`, exit 2). NEGATIVE CONTROL: Muse Code's
+/// keeps its own verb.
+#[test]
+fn an_agys_need_names_a_command_that_runs() {
+    let agy = Row {
+        agent: upgrade::Agent::Agy,
+        ..Row::default()
+    };
+    let down = agy.agent_down("no-resume");
+    let (then, command) = agy.resume_said("Resume it in that tab with this command");
+    for (then, command) in [(&down.then, &down.command), (&then, &command)] {
+        assert_eq!(command.as_deref(), Some("agy"), "{then}");
+        assert!(then.ends_with("then /resume"), "{then}");
+        assert!(then.chars().count() <= NEED_THEN_MAX, "{then}");
+    }
+    let muse = Row {
+        agent: upgrade::Agent::Muse,
+        ..Row::default()
+    };
+    assert_eq!(
+        muse.resume_said("Resume it in that tab with this command")
+            .1
+            .as_deref(),
+        Some("muse resume"),
+        "CONTROL"
+    );
+}
+
+/// A RECORD THAT CANNOT BE READ ANY MORE LEAVES ITS TAB AS IT STANDS
+/// (ATERM-KI-1016-1): once a record read at one look panics at the next (a
+/// line this build cannot read written over it) or its file cannot be read,
+/// the look counted as not whole, so no tab's rows or marks were renewed for
+/// as long as it stood. Its tab is left as it stands now — the tab its text
+/// names, or, where its file cannot be read at all, the tab its last read
+/// gave ([`View::placed`]) — and every other record's row is renewed: here
+/// the readable tab's row leaves the view as its move ends, and no row of
+/// the faulty record is handed over (the window keeps the one it holds). A
+/// record never read whole leaves its tab as it stands too: named so with
+/// the rows, its mark not settled by that look. CONTROL: a tab with nothing
+/// unread is settled (the first look lowers its mark).
+#[cfg(unix)]
+#[test]
+fn a_record_that_cannot_be_read_any_more_leaves_its_tab_as_it_stands() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let pending = |tab: &str| St {
+        phase: Phase::Pending,
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: tab.to_string(),
+        pending_since: NOW - 60,
+        ..St::default()
+    };
+    let tabs = [
+        LiveTab {
+            sid: TAB.to_string(),
+            fgpgid: Some(7),
+        },
+        LiveTab {
+            sid: "s-faulty".to_string(),
+            fgpgid: Some(8),
+        },
+    ];
+    let held = |sessions: &BTreeSet<String>| -> Option<Vec<Holder>> {
+        Some(
+            sessions
+                .iter()
+                .map(|s| {
+                    let tab = if s == "aaa" { TAB } else { "s-faulty" };
+                    holder(s, "2.1.281", Some(tab))
+                })
+                .collect(),
+        )
+    };
+    for fault in ["panics", "unreadable"] {
+        let dir = ScratchDir::new("upgrade-status", "record-unread");
+        let o = opts(&dir);
+        std::fs::create_dir_all(state_dir(&o)).expect("state");
+        super::super::save_at(&o, "aaa", &pending(TAB), NOW);
+        let faulty = if fault == "panics" {
+            RECORD_PANICS
+        } else {
+            "fff"
+        };
+        let mut view = View::default();
+        // Each hand-over: its rows, as (conversation, tab), and its kept tabs.
+        type Handed = (Vec<(String, String)>, Vec<String>);
+        let sent: std::cell::RefCell<Vec<Handed>> = std::cell::RefCell::default();
+        let mut hand = |rows: &[Row], kept: &[String]| {
+            sent.borrow_mut().push((
+                rows.iter()
+                    .map(|r| (r.session.clone(), r.tab.clone()))
+                    .collect(),
+                kept.to_vec(),
+            ));
+        };
+        // The faulty conversation's record as a look read it whole (for a
+        // record that panics on every read, never: its text names its tab).
+        if fault == "panics" {
+            super::super::save_at(&o, RECORD_PANICS, &pending("s-faulty"), NOW);
+        } else {
+            super::super::save_at(&o, faulty, &pending("s-faulty"), NOW);
+        }
+        let _ = view.refresh_with_keeping(&o, &tabs, NOW, &held, &mut hand);
+        if fault == "unreadable" {
+            let path = state_dir(&o).join("fff.json");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+                .expect("unreadable");
+        }
+        // The readable tab's move ends: its row leaves the view.
+        let done = St {
+            phase: Phase::Done,
+            done_at: NOW - 3 * DONE_SHOWN_S,
+            ..pending(TAB)
+        };
+        super::super::save_at(&o, "aaa", &done, NOW);
+        sent.borrow_mut().clear();
+        let _ = view.refresh_with_keeping(&o, &tabs, NOW + 1, &held, &mut hand);
+        assert_eq!(
+            *sent.borrow(),
+            [(Vec::new(), vec!["s-faulty".to_string()])],
+            "{fault}: the readable row renewed, the faulty one's tab left as it stands"
+        );
+        let _ = std::fs::set_permissions(
+            state_dir(&o).join("fff.json"),
+            std::fs::Permissions::from_mode(0o644),
+        );
+    }
+    // CONTROL: never read whole, it is left out, and the look settles no
+    // mark on its tab — a tab with nothing unread is settled.
+    for unread in [true, false] {
+        let dir = ScratchDir::new("upgrade-status", "record-unread-mark");
+        let (sock, asked) = recording_socket(&dir);
+        let o = Opts {
+            sock: Some(sock),
+            ..opts(&dir)
+        };
+        std::fs::create_dir_all(state_dir(&o)).expect("state");
+        super::super::save_at(&o, "aaa", &pending(TAB), NOW);
+        if unread {
+            super::super::save_at(&o, RECORD_PANICS, &pending("s-faulty"), NOW);
+        }
+        let mut view = View::default();
+        let mut sent: Vec<(usize, Vec<String>)> = Vec::new();
+        let _ = view.refresh_with_keeping(&o, &tabs, NOW, &held, &mut |rows, kept| {
+            sent.push((rows.len(), kept.to_vec()));
+        });
+        let kept: Vec<String> = if unread {
+            vec!["s-faulty".to_string()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            sent,
+            [(1, kept)],
+            "unread={unread}: the readable record's row, the faulty tab left as it stands"
+        );
+        let lowered = asked
+            .lock()
+            .map(|a| {
+                a.iter()
+                    .any(|l| l == "@s-faulty meta unset attention owner=upgrade")
+            })
+            .unwrap_or(false);
+        assert_eq!(
+            lowered, !unread,
+            "unread={unread}: the faulty tab's mark is settled only with nothing unread"
+        );
+    }
+}
+
+/// A RECORD THIS LOOK CANNOT READ NEITHER RAISES NOR LOWERS ITS TAB'S MARK
+/// (ATERM-KI-1016-1 host-8, the review of its first cut): an `Exiting`
+/// record whose agent was gone ten seconds at the read, then unreadable — its
+/// file (read whole before) or its read panicking (never read) — while the
+/// relaunch landed and its process holds the conversation in the tab. Its
+/// last row read again in its place aged past the stale bound, and the view
+/// raised the owner's interrupt (`claude --resume …`) though what the record
+/// says now is unknown; a record never read whole raised nothing, so the two
+/// cases of one fault disagreed. Now neither raises a mark, and a mark the
+/// tab had before the fault stays up — not lowered off a row no read gave
+/// this look — while the other tab's record is renewed (only the faulty tab
+/// is left as it stands, by its text or by its last read). CONTROL: read
+/// again, the record settles the mark.
+#[cfg(unix)]
+#[test]
+fn a_record_this_look_cannot_read_neither_raises_nor_lowers_its_tabs_mark() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let gone = |tab: &str| St {
+        phase: Phase::Exiting { at_s: NOW - 10 },
+        exited_at: NOW - 10,
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: tab.to_string(),
+        ..St::default()
+    };
+    let tabs = [
+        LiveTab {
+            sid: TAB.to_string(),
+            fgpgid: Some(7),
+        },
+        LiveTab {
+            sid: "s-faulty".to_string(),
+            fgpgid: Some(8),
+        },
+    ];
+    // The relaunch landed: its new process holds each conversation in its tab.
+    let landed = |sessions: &BTreeSet<String>| -> Option<Vec<Holder>> {
+        Some(
+            sessions
+                .iter()
+                .map(|s| {
+                    let tab = if s == "aaa" { TAB } else { "s-faulty" };
+                    holder(s, "2.1.282", Some(tab))
+                })
+                .collect(),
+        )
+    };
+    let later = NOW + crate::harness::relaunch::STALE_S + 60;
+    for (fault, marked) in [
+        ("unreadable", false),
+        ("panics", false),
+        ("unreadable", true),
+    ] {
+        let case = format!("{fault} marked={marked}");
+        let dir = ScratchDir::new("upgrade-status", "unread-mark");
+        let (sock, asked) = recording_socket(&dir);
+        let o = Opts {
+            sock: Some(sock),
+            ..opts(&dir)
+        };
+        std::fs::create_dir_all(state_dir(&o)).expect("state");
+        super::super::save_at(&o, "aaa", &gone(TAB), NOW);
+        let session = if fault == "panics" {
+            RECORD_PANICS
+        } else {
+            "fff"
+        };
+        super::super::save_at(&o, session, &gone("s-faulty"), NOW);
+        let mut view = View::default();
+        if marked {
+            // Read whole past its bound, nothing holding it: marked.
+            let nobody = |_: &BTreeSet<String>| -> Option<Vec<Holder>> { Some(Vec::new()) };
+            let _ = view.refresh_with(&o, &tabs, later, &nobody, &mut |_| {});
+            assert!(view.badged.contains_key("s-faulty"), "{case}: marked");
+        } else {
+            let _ = view.refresh_with(&o, &tabs, NOW, &landed, &mut |_| {});
+            assert!(!view.badged.contains_key("s-faulty"), "{case}: unmarked");
+        }
+        let path = state_dir(&o).join(format!("{session}.json"));
+        if fault == "unreadable" {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+                .expect("unreadable");
+        }
+        asked.lock().expect("log").clear();
+        let _ = view.refresh_with_keeping(&o, &tabs, later + 1, &landed, &mut |_, _| {});
+        let lines: Vec<String> = asked
+            .lock()
+            .map(|a| {
+                a.iter()
+                    .filter(|l| l.starts_with("@s-faulty meta "))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            lines.is_empty(),
+            "{case}: no mark raised or lowered off a row no read gave this look: {lines:?}"
+        );
+        assert_eq!(
+            view.badged.contains_key("s-faulty"),
+            marked,
+            "{case}: its mark as it stood"
+        );
+        // What this look left as it stands: handed over only where it, or a
+        // row, changed (`View::sent_kept`), so read off the view whichever
+        // it was. (The other tab's restart, its relaunch landed, is held
+        // back on its target build and shows no row at either look.)
+        assert_eq!(
+            view.sent_kept,
+            ["s-faulty".to_string()],
+            "{case}: only the faulty tab left as it stands"
+        );
+        // CONTROL: readable again, saying what it said all along (here, the
+        // relaunch landed: done) — the mark is settled.
+        if fault == "unreadable" {
+            std::fs::remove_file(&path).expect("the unreadable copy");
+            let done = St {
+                phase: Phase::Done,
+                done_at: later,
+                ..gone("s-faulty")
+            };
+            super::super::save_at(&o, session, &done, later);
+            let _ = view.refresh_with(&o, &tabs, later + 2, &landed, &mut |_| {});
+            assert!(
+                !view.badged.contains_key("s-faulty"),
+                "{case}: CONTROL: read again, landed, no mark"
+            );
         }
     }
+    // ANOTHER RECORD OF THE SAME TAB that reads and wants a mark (its agent
+    // the upgrade ended, nothing holding its conversation) raises none while
+    // the tab is left as it stands: what the tab's one row is, the unread
+    // record's or this one's, is not known. CONTROL: nothing unread, raised.
+    for unread in [true, false] {
+        let dir = ScratchDir::new("upgrade-status", "unread-mark-other");
+        let (sock, asked) = recording_socket(&dir);
+        let o = Opts {
+            sock: Some(sock),
+            ..opts(&dir)
+        };
+        std::fs::create_dir_all(state_dir(&o)).expect("state");
+        let down = St {
+            phase: Phase::Failed("stale-exit".to_string()),
+            exited_at: later - 600,
+            ..gone("s-faulty")
+        };
+        super::super::save_at(&o, "ggg", &down, later);
+        if unread {
+            super::super::save_at(&o, RECORD_PANICS, &gone("s-faulty"), NOW);
+        }
+        let nobody = |_: &BTreeSet<String>| -> Option<Vec<Holder>> { Some(Vec::new()) };
+        let mut view = View::default();
+        let _ = view.refresh_with(&o, &tabs, later, &nobody, &mut |_| {});
+        let raised = asked.lock().is_ok_and(|a| {
+            a.iter()
+                .any(|l| l.starts_with("@s-faulty meta set attention owner=upgrade"))
+        });
+        assert_eq!(
+            raised, !unread,
+            "unread={unread}: raised only with nothing unread"
+        );
+    }
+}
+
+/// AN UNREAD RECORD NO TAB IS KNOWN FOR KEEPS ITS CONVERSATION'S TAB, AND IS
+/// SAID (ATERM-KI-1016-1 host-8, the review of its first cut): a listed
+/// record that cannot be read at all (a link that loops; a root-owned file
+/// `sudo aterm …` wrote is the same) and that no look of this view read
+/// before names no tab. It kept EVERY live tab as it stands, no mark lowered
+/// and no row withdrawn on any tab for as long as the file stood, and
+/// nothing told the owner. Now it keeps the tab its conversation's live
+/// process is proven in (the file is named by the conversation), every live
+/// tab only where no process holds it in one, and the view names the file
+/// ([`View::unreadable`]) while it keeps a live tab: not for a record whose
+/// tab closed, and not once it reads.
+#[cfg(unix)]
+#[test]
+fn an_unread_record_no_tab_is_known_for_keeps_its_conversations_tab() {
+    let dir = ScratchDir::new("upgrade-status", "unread-unplaced");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let pending = |tab: &str| St {
+        phase: Phase::Pending,
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: tab.to_string(),
+        pending_since: NOW - 60,
+        ..St::default()
+    };
+    super::super::save_at(&o, "aaa", &pending(TAB), NOW);
+    super::super::save_at(&o, "ccc", &pending("s-two"), NOW);
+    let tabs = [
+        LiveTab {
+            sid: TAB.to_string(),
+            fgpgid: Some(7),
+        },
+        LiveTab {
+            sid: "s-two".to_string(),
+            fgpgid: Some(8),
+        },
+    ];
+    let looped = state_dir(&o).join("bbb.json");
+    std::os::unix::fs::symlink(&looped, &looped).expect("a record that loops");
+    let in_two = |sessions: &BTreeSet<String>| -> Option<Vec<Holder>> {
+        Some(
+            sessions
+                .iter()
+                .map(|s| {
+                    let tab = if s == "aaa" { TAB } else { "s-two" };
+                    holder(s, "2.1.281", Some(tab))
+                })
+                .collect(),
+        )
+    };
+    let unheld = |sessions: &BTreeSet<String>| -> Option<Vec<Holder>> {
+        Some(
+            sessions
+                .iter()
+                .filter(|s| *s != "bbb")
+                .map(|s| {
+                    let tab = if s == "aaa" { TAB } else { "s-two" };
+                    holder(s, "2.1.281", Some(tab))
+                })
+                .collect(),
+        )
+    };
+    let keeps = |view: &mut View, holders: &dyn Fn(&BTreeSet<String>) -> Option<Vec<Holder>>| {
+        let mut kept: Vec<Vec<String>> = Vec::new();
+        let _ = view.refresh_with_keeping(&o, &tabs, NOW, holders, &mut |_, k| {
+            kept.push(k.to_vec());
+        });
+        kept.pop().unwrap_or_default()
+    };
+    let mut view = View::default();
+    assert_eq!(
+        keeps(&mut view, &in_two),
+        ["s-two".to_string()],
+        "the tab its conversation's process runs in, alone"
+    );
+    assert_eq!(view.unreadable(), std::slice::from_ref(&looped), "named");
+    assert_eq!(
+        keeps(&mut view, &unheld),
+        [TAB.to_string(), "s-two".to_string()],
+        "no process holds it in a tab: every live tab"
+    );
+    assert_eq!(view.unreadable(), std::slice::from_ref(&looped));
+    // Read again: nothing kept, nothing named.
+    std::fs::remove_file(&looped).expect("unloop");
+    assert!(keeps(&mut view, &in_two).is_empty(), "read whole");
+    assert!(view.unreadable().is_empty(), "read whole: none named");
+    // A record whose text names a tab that closed keeps nothing and is not
+    // said: nothing the window shows waits on it.
+    super::super::save_at(&o, RECORD_PANICS, &pending("s-closed"), NOW);
+    assert!(keeps(&mut view, &in_two).is_empty(), "its tab closed");
+    assert!(view.unreadable().is_empty(), "its tab closed: none named");
+    // Stood down: none named.
+    super::super::save_at(&o, RECORD_PANICS, &pending("s-two"), NOW);
+    let _ = keeps(&mut view, &in_two);
+    assert_eq!(view.unreadable().len(), 1);
+    view.stand_down(&mut |_| {});
+    assert!(view.unreadable().is_empty(), "stood down: none named");
+}
+
+/// An unreadable record does not revoke the answer the owner already gave it.
+#[cfg(unix)]
+#[test]
+fn an_answered_down_record_stays_answered_across_an_unread_look() {
+    let dir = ScratchDir::new("upgrade-status", "answered-unread");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let fresh = crate::harness::relaunch::CAUSE_UPGRADE_FRESH;
+    let exited = NOW - 120;
+    let st = St {
+        phase: Phase::Failed("no-resume".to_string()),
+        cause: fresh.to_string(),
+        tab: TAB.to_string(),
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        source: "managed".to_string(),
+        exited_at: exited,
+        ..St::default()
+    };
+    let session = "0badf00d-1111-2222-3333-444455556666";
+    super::super::save_at(&o, session, &st, NOW);
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let nobody = |_: &BTreeSet<String>| Some(Vec::<Holder>::new());
+    let owner_back = |_: &BTreeSet<String>| {
+        Some(vec![Holder {
+            led: true,
+            ..holder(NEW, "2.1.283", Some(TAB))
+        }])
+    };
+    let look = |view: &mut View, held: &dyn Fn(&BTreeSet<String>) -> Option<Vec<Holder>>| {
+        let mut shown = None;
+        let _ = view.refresh_with_keeping(&o, &tabs, NOW, held, &mut |rows, _| {
+            shown = Some(rows.to_vec())
+        });
+        shown
+    };
+    let mut view = View::default();
+    assert_eq!(
+        look(&mut view, &nobody).unwrap().len(),
+        1,
+        "ordinary unanswered row"
+    );
+    assert!(
+        look(&mut view, &owner_back).unwrap().is_empty(),
+        "owner answered"
+    );
+    assert_eq!(view.back.get(session), Some(&exited));
+    let path = state_dir(&o).join(format!("{session}.json"));
+    let saved = dir.join("held-record");
+    std::fs::rename(&path, &saved).expect("keep record");
+    std::os::unix::fs::symlink(&path, &path).expect("deterministic unreadable record");
+    let _ = look(&mut view, &nobody);
+    std::fs::remove_file(&path).expect("remove unreadable link");
+    std::fs::rename(&saved, &path).expect("readable again");
+    let shown = look(&mut view, &nobody).unwrap();
+    assert!(
+        shown.is_empty(),
+        "ANSWERED_RECORD_MUST_SURVIVE_UNREAD_LOOK: {shown:?}"
+    );
+    assert_eq!(view.back.get(session), Some(&exited));
+    let mut restarted = View::default();
+    assert!(
+        look(&mut restarted, &nobody).unwrap().is_empty(),
+        "answer still persisted"
+    );
+    // A positively read record leaving its down state really does retire the old answer.
+    super::super::save_at(
+        &o,
+        session,
+        &St {
+            phase: Phase::Done,
+            done_at: NOW,
+            ..st.clone()
+        },
+        NOW,
+    );
+    let _ = look(&mut view, &nobody);
+    assert!(!view.back.contains_key(session));
+    super::super::save_at(&o, session, &st, NOW);
+    assert_eq!(
+        look(&mut view, &nobody).unwrap().len(),
+        1,
+        "new down state is shown"
+    );
 }

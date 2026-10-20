@@ -237,7 +237,12 @@ fn install_refuses_an_id_that_leaves_the_requested_folder() {
     std::fs::create_dir(&dir).unwrap();
     // The old writer prefixes the id with '.', so this makes its temporary
     // path reachable too: refusal must come from the id contract, not I/O.
-    std::fs::create_dir(dir.join("...")).unwrap();
+    // Win32 strips a name's trailing dots, so there `...` names `dir` itself,
+    // which exists and keeps that path reachable already.
+    match std::fs::create_dir(dir.join("...")) {
+        Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        made => made.unwrap(),
+    }
     let ordinary = find("Iceberg Dark").expect("a pack theme");
     assert!(matches!(
         install(ordinary, Some(&dir), false),

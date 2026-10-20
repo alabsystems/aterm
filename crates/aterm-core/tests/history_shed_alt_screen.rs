@@ -9,7 +9,8 @@
 use aterm_core::scrollback::{Scrollback, ScrollbackStorage};
 use aterm_core::terminal::Terminal;
 
-const HISTORY_LINES: usize = 50_000;
+/// Enough lines of incompressible hex to put over a MiB in the cold tier.
+const HISTORY_LINES: usize = 12_000;
 
 /// A tiered terminal whose tiny hot/warm tiers push history into the
 /// byte-budgeted cold tier, with a budget large enough to keep all of it.
@@ -49,7 +50,7 @@ fn shed_trims_the_primary_history_while_the_alt_screen_is_up() {
         .expect("a tiered terminal has a history store");
     assert!(
         before > 1 << 20,
-        "50k lines must put real bytes in the store (got {before})"
+        "{HISTORY_LINES} lines must put real bytes in the store (got {before})"
     );
     let lines_before = term.main_grid().scrollback_lines();
 

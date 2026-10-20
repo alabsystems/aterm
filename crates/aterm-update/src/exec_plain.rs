@@ -12,9 +12,17 @@
 //! the window — would die on its next write to a peer that has gone (an `aterm ctl`
 //! client that disconnected mid-reply, the sentinel's pipe), taking every tab with it.
 //!
-//! [`exec_keeping_sigpipe`] is the one exec the update lane uses when it is not asking
-//! for a fresh responsibility record (a separate lane, not built yet): the same `execve`, and
+//! [`exec_keeping_sigpipe`] is the one exec the update lane uses: the same `execve`, and
 //! on failure SIGPIPE put back to what the caller had.
+//!
+//! An `execve` keeps the pid but not LaunchServices' record of the app: measured
+//! 2026-10-19 on macOS 27, an exec 240–400 ms after a LaunchServices launch leaves
+//! `NSRunningApplication` answering pid -1 for the rest of the process's life (no Quit &
+//! Reopen, no menu-bar item, TCC attributing it to the rollback path). So a process
+//! LaunchServices launched as a seamless successor never reaches this exec: its parent
+//! swaps the stage in first (`install::swap_staged_for_launch`). A cold launch that
+//! LaunchServices started with a stage ready still execs here; relaunching it through
+//! LaunchServices instead is a separate lane, not built yet.
 
 use std::io;
 use std::os::unix::process::CommandExt as _;

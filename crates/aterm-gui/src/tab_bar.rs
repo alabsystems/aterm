@@ -60,19 +60,86 @@ pub(crate) struct TabStripMetadata {
     pub(crate) icon: Option<TabIconKind>,
     pub(crate) dirty: bool,
     pub(crate) busy: bool,
-    /// The attention mark level: `Wait` is the hollow diamond, `Stop` a filled
-    /// one (held or at a limit), `Story` a dot (something happened while the
-    /// user was away). `App::stamp_presence_chips` folds the session's level over it.
+    /// The need mark: `Wait` the hollow diamond (a decide need only), `Stop` a
+    /// filled one (a stuck need), `Yours` the person's hold, `Done` a dot (a
+    /// finished task not yet looked at); the tab's own indicator bit (a
+    /// failed command, a notice) is `Note`, a short dash in the label ink,
+    /// never a need mark. `App::stamp_presence_chips` folds the published
+    /// verdict's mark over the bit.
     pub(crate) attention: ChipLevel,
     /// The connection-mark role; one shape per role. The `Hash` derive folds it
     /// into the in-grid strip fingerprint.
     pub(crate) conn: Option<TabConnRole>,
     pub(crate) closable: bool,
-    /// This tab hosts the session under a live drag-to-connect cursor. Transient
-    /// App state: always `false` from [`Self::from_presentation`], stamped by
-    /// `App::stamp_conn_drop_target` after each build. Not a status mark: it never
-    /// counts toward `status_count` or the connector cell.
-    pub(crate) drop_target: bool,
+    /// WHO DRIVES (owner surfaces §5, S9): the tab's team marks, `↳` before a
+    /// worker's title and `⇉N` after a manager's ([`team_title`]). Stamped by
+    /// `App::stamp_presence_chips` from the team table (`crate::team`); always
+    /// [`TabTeam::NONE`] from [`Self::from_presentation`]. Not a status mark.
+    pub(crate) team: TabTeam,
+}
+
+/// A tab's team marks (owner surfaces §5, S9): whether its session is a
+/// worker (its task's `from=` names another session) and how many workers
+/// name it. A record: no colour, no wake.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct TabTeam {
+    /// The session is a worker.
+    pub(crate) worker: bool,
+    /// How many workers name it (0: no manager).
+    pub(crate) workers: u16,
+}
+
+impl TabTeam {
+    /// No team: a session that is neither a worker nor a manager.
+    pub(crate) const NONE: Self = Self {
+        worker: false,
+        workers: 0,
+    };
+}
+
+/// `title` as a strip shows it for a tab wearing `team`: `↳ ` before a
+/// worker's, ` ⇉N` after a manager's, the title itself (borrowed) wearing
+/// neither. Applied where a strip lays its titles out — the in-grid splice
+/// and the native push — never to the tab's own name, which renames,
+/// tooltips and identity read.
+#[must_use]
+pub(crate) fn team_title(title: &str, team: TabTeam) -> std::borrow::Cow<'_, str> {
+    if team == TabTeam::NONE {
+        return std::borrow::Cow::Borrowed(title);
+    }
+    let mut out = String::with_capacity(title.len() + 12);
+    if team.worker {
+        out.push_str("\u{21b3} ");
+    }
+    out.push_str(title);
+    if team.workers > 0 {
+        out.push_str(" \u{21c9}");
+        out.push_str(&team.workers.to_string());
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Every title of a strip as it shows them ([`team_title`] by index over
+/// `metadata`), borrowed whole where no tab wears a team mark, so a strip
+/// with no team allocates nothing for it.
+#[must_use]
+pub(crate) fn team_titles<'a>(
+    titles: &'a [String],
+    metadata: &[TabStripMetadata],
+) -> std::borrow::Cow<'a, [String]> {
+    if metadata.iter().all(|item| item.team == TabTeam::NONE) {
+        return std::borrow::Cow::Borrowed(titles);
+    }
+    std::borrow::Cow::Owned(
+        titles
+            .iter()
+            .enumerate()
+            .map(|(i, title)| {
+                let team = metadata.get(i).map_or(TabTeam::NONE, |item| item.team);
+                team_title(title, team).into_owned()
+            })
+            .collect(),
+    )
 }
 
 impl TabStripMetadata {
@@ -88,7 +155,7 @@ impl TabStripMetadata {
             ),
             conn: presentation.conn,
             closable: presentation.closable,
-            drop_target: false,
+            team: TabTeam::NONE,
         }
     }
 
@@ -338,12 +405,6 @@ pub(crate) enum TabHit {
     /// A staged update is ready — a click on the LEADING update icon (`↻`) applies
     /// it. Shown as an alert only while a build is staged; matches the `+` affordance.
     Update,
-    /// The tab's connector: its status-mark cell. Arm-on-press, commit-on-release:
-    /// release within the movement threshold opens the session Connections menu
-    /// (never selecting the tab); movement past it starts drag-to-connect
-    /// (`crate::conn_drag`). Exists only while the segment painted a status canvas
-    /// ([`TabSegment::connector_col`]).
-    Connector(usize),
     /// The build's VERSION LABEL at the strip's trailing end (Windows only —
     /// [`STRIP_VERSION_SLOT`]): the macOS menu bar's Version title without its
     /// colour emoji ([`crate::menu::strip_version_label`] at `rung`, ` ↑` after
@@ -358,6 +419,13 @@ pub(crate) enum TabHit {
         /// An update is staged ([`crate::menu::staged_for_version_menu`]).
         attention: bool,
     },
+    /// The window's NEEDS PILL (owner surfaces §5), where this strip carries
+    /// it ([`layout_segments_with_pill`]): one segment per region the
+    /// engine's layout resolves a click to ([`strip_pill_layout`],
+    /// `PillLayout::hit`) — the body goes to the tab, the act runs, the `+N`
+    /// goes to the window's next need (`App::on_pill_act`). Committed on the
+    /// press like the `+`, never caption.
+    Pill(crate::presence::PillHit),
     /// One of the window's own buttons at the strip's far right, where the band is
     /// the window's header (a Wayland window the compositor leaves undecorated,
     /// [`crate::client_frame`]). A BUTTON, committed on the press like the `+`:
@@ -378,15 +446,10 @@ pub(crate) struct TabSegment {
     /// The column of the close `x`, if this segment drew one. A click here is a
     /// [`TabHit::Close`]; every other column of the segment is the `kind` action.
     pub close_col: Option<u16>,
-    /// The column of the painted STATUS-MARK canvas, if this segment drew one —
-    /// the tab's connection CONNECTOR (design §3.1 [v5], the `close_col`
-    /// precedent). A click here is a [`TabHit::Connector`]. Set only by the
-    /// metadata-aware layout ([`layout_segments_with_version`]) from the SAME
-    /// math the painter uses, so hit geometry equals painted geometry by
-    /// construction; the plain [`layout_segments`] leaves it `None`.
-    pub connector_col: Option<u16>,
-    /// The action a plain (non-close, non-connector) click on this segment
-    /// performs.
+    /// The action a plain (non-close) click on this segment performs — on
+    /// its status marks too, which are part of the chip: a press on a tab's
+    /// `◆` selects it like any other press on it
+    /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §5).
     pub kind: TabHit,
     /// This is the window's only tab, drawn as the window title (name and
     /// description centred on the body background) rather than a chip with a close
@@ -403,25 +466,211 @@ const NEW_TAB_W: u16 = 3;
 /// reads as a sibling affordance.
 const UPDATE_W: u16 = 3;
 
+/// Whether the tab band wears the Windows paint of the 2026-10-17 audit: one
+/// chip cap for every tab count ([`CHIP_MAX_COLS`]), the seam a rail on the
+/// band's last pixel rows ([`strip_seam_rail`]) that the pixel band also draws
+/// on its own canvas, status marks sized off the label, and titles cut in
+/// UI-face cells ([`pixel_band::ui_cells_per_cell`]).
+///
+/// WINDOWS ONLY, as [`STRIP_VERSION_SLOT`] is: Linux keeps its strip as it was
+/// until that lane is reviewed, a lone chip capped at [`LONE_CHIP_COLS`], two or
+/// more sharing the whole band, and the seam a cell underline
+/// ([`seal_strip_bottom`]). macOS has no band.
+pub(crate) const STRIP_WINDOWS_PAINT: bool = cfg!(windows);
+
+/// Whether the strip draws Windows 11 tabs rather than chips (Windows Terminal's,
+/// Edge's and Explorer's tab rows): the selected tab is the terminal's own ground
+/// ([`StripColors::ground`]) with its top corners rounded, and its foot opens
+/// through the seam into the grid, so the page and its tab are one surface;
+/// quiet tabs are bare titles on the band, with a hover wash under the pointer
+/// and a hairline between two quiet neighbours. It replaced grey capsules
+/// floating on the band, whose selected one was the DARKEST chip of a light
+/// theme (the 2026-10-18 judges' `tab-chips-not-win11-tabs`).
+///
+/// WINDOWS ONLY, like [`STRIP_WINDOWS_PAINT`]: Linux keeps its chip cards
+/// (libadwaita's tab bar is a row of cards) until that lane is reviewed.
+pub(crate) const SELECTED_TAB_IS_GROUND: bool = STRIP_WINDOWS_PAINT;
+
+/// How far a quiet tab's hover wash steps from a LIGHT Windows tab row's band
+/// toward the theme's ink: about WinUI's light `TabViewItem` hover
+/// (`SubtleFillColorSecondary`, 6% black), `#d3d4d7` on Default Light's
+/// `#e2e3e5` band. The selected tab and the update CTA rise toward white, so the
+/// wash is the opposite step and never reads as a second selected tab; it rose
+/// toward white too (`#eeeeef`, 1.08:1 from the selected `#f6f7f9`), the
+/// 2026-10-18 judges' `light-hover-wash-rises-toward-white` and
+/// `light-hover-mimics-selected-tab`.
+const LIGHT_TAB_HOVER_T: f32 = 0.08;
+
+/// How wide any tab's chip may grow, in columns, whatever the tab count; `None`
+/// where tabs share the band with no maximum (macOS, where a lone tab is also the
+/// window title band and spends the whole strip, [`SOLO_TITLE_BAND`], and Linux,
+/// which caps only a lone chip, [`SOLO_CHIP_MAX_COLS`]).
+///
+/// A full-width raised card would read as a heavy grey slab, so on Windows
+/// chips are capped and stay leading, leaving band to their right for the `+`,
+/// as browser and Windows Terminal tabs are. ONE cap for every count: the lone
+/// chip used to be capped at 28 columns while each of two chips took half the
+/// band, so a lone title was cut with half the strip empty and the chip jumped
+/// wider when a second tab opened (the 2026-10-17 audit's
+/// `lone-chip-narrower-than-pair`). The shipping strip takes the cap in DIPs
+/// and lets a long title's tab grow past it while the strip has room
+/// ([`TabSizing`]); its measure ignores a spinner's frames, so they never move
+/// the `✕`. A narrow window still gets the smaller equal share: this is a
+/// maximum.
+const CHIP_MAX_COLS: Option<u16> = if STRIP_WINDOWS_PAINT {
+    Some(MAX_CHIP_COLS)
+} else {
+    None
+};
+
 /// How wide a lone tab's chip may grow, in columns; `None` where a lone tab is the
 /// window title band and spends the whole strip (macOS; see [`SOLO_TITLE_BAND`]).
-///
-/// Elsewhere a full-width raised card would read as a heavy grey slab, so the lone
-/// chip is capped and stays leading, leaving band to its right for the `+`. A fixed
-/// width because `layout_segments` never sees titles (a content-sized chip would
-/// also move the `✕` on every OSC-title change). 28 leaves ~24 title cells. A
-/// narrow window still gets the smaller equal share: this is a maximum.
+/// Elsewhere the lone chip is capped and stays leading, leaving band to its right
+/// for the `+`: at [`LONE_CHIP_COLS`].
 const SOLO_CHIP_MAX_COLS: Option<u16> = if cfg!(target_os = "macos") {
     None
 } else {
     Some(LONE_CHIP_COLS)
 };
 
-/// The lone chip's width off macOS ([`SOLO_CHIP_MAX_COLS`]), named on its own
-/// because the trailing version label ([`TabHit::Version`]) is admitted beside a
-/// lone tab only while the band left of it still holds a chip this wide — so the
-/// label can never be the reason a one-tab window's chip shrinks.
-const LONE_CHIP_COLS: u16 = 28;
+/// The lone chip's width off macOS ([`SOLO_CHIP_MAX_COLS`]): the shared
+/// [`MAX_CHIP_COLS`] on Windows, 28 columns (~24 title cells) on Linux. Named
+/// on its own because the trailing version label ([`TabHit::Version`]) is
+/// admitted beside a lone tab only while the band left of it still holds a chip
+/// this wide — so the label can never be the reason a one-tab window's chip
+/// shrinks.
+const LONE_CHIP_COLS: u16 = if STRIP_WINDOWS_PAINT {
+    MAX_CHIP_COLS
+} else {
+    28
+};
+
+/// The Windows tab cap ([`CHIP_MAX_COLS`]) in 9 px cells, the 100% reading of
+/// [`TAB_MAX_DIP`]: 27 columns, 243 px. The live strip takes the cap in DIPs at
+/// its own cell width and scale ([`TabSizing::at`]); this is the fixed cap the
+/// layout contract's tests and a window without its metrics use
+/// ([`TabSizing::FIXED`]). It was 48 columns (432 px), which left a lone short
+/// title at the far left of an empty 432 px pill with its `✕` 360 px away,
+/// read as a text field rather than a tab (the 2026-10-18 judges'
+/// `lone-chip-432px`).
+const MAX_CHIP_COLS: u16 = 27;
+
+/// A Windows tab's width while the strip has room, in DIPs: WinUI's
+/// `TabViewItemMaxWidth` (240 epx), the equal width Windows Terminal's tabs
+/// keep. Counted in DIPs, not cell columns: the cell width rounds down from the
+/// font at 150% and 200% (13 and 17 px for 13.5 and 18) while the UI label
+/// scales exactly, so 27 columns cut a title at 2x that fit at 1x (the
+/// 2026-10-18 judges' `lone-tab-cap-hidpi`).
+const TAB_MAX_DIP: f32 = 240.0;
+
+/// The widest a Windows tab grows to seat its whole title, in DIPs: 432, the 48
+/// columns of 9 px the cap was, about sixty characters of the UI face (a Claude
+/// Code task title, a `less` or `vim` command line with its file). A tab whose
+/// title is wider than [`TAB_MAX_DIP`] grows toward it while the strip has room
+/// beside its neighbours, as WinUI's `TabView` sizes a tab to its content
+/// (Windows Terminal's `titleLength` width); a crowded strip shares the band
+/// equally as before. At a fixed 240 the lone tab cut `less -R +1200
+/// CHANGELOG.md` and Claude Code's task titles with 700 px of empty strip
+/// beside it (the judges' `tab-title-cap-27-cols-lone-tab`); a short title
+/// keeps the 240 tab, never the empty 432 px pill.
+const TAB_GROW_DIP: f32 = 432.0;
+
+/// How wide the Windows tab row's tabs are ([`layout_segments_with_caption_sized`]):
+/// equal at [`Self::cap`] while the strip has room, each growing toward the
+/// width its title wants ([`Self::wants`]) up to [`Self::grow`] with the room
+/// that is left. Under pressure, and off Windows, the layout is the equal-share
+/// one ([`layout_segments_seated`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TabSizing<'a> {
+    /// The equal width in columns ([`TAB_MAX_DIP`] at the window's metrics).
+    pub(crate) cap: u16,
+    /// The most a tab grows to, in columns ([`TAB_GROW_DIP`]).
+    pub(crate) grow: u16,
+    /// Each tab's wanted width in columns, title and chrome
+    /// ([`pixel_band::tab_wants`]); a tab past the end, or at 0, wants the cap.
+    pub(crate) wants: &'a [u16],
+}
+
+impl<'a> TabSizing<'a> {
+    /// Equal tabs at [`MAX_CHIP_COLS`] that never grow: the layout's contract
+    /// where no metrics or titles are at hand.
+    #[cfg(test)]
+    pub(crate) const FIXED: TabSizing<'static> = TabSizing {
+        cap: MAX_CHIP_COLS,
+        grow: MAX_CHIP_COLS,
+        wants: &[],
+    };
+
+    /// The sizing of a window whose cells are `cell_w` device px at `scale`:
+    /// the caps in DIPs rounded to whole columns (27 and 48 at 100%, 28 and 50
+    /// at 150%, 28 and 51 at 200%), and the tabs' `wants`.
+    pub(crate) fn at(cell_w: usize, scale: f32, wants: &'a [u16]) -> Self {
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        let cols = |dip: f32| {
+            let cols = (dip * scale / cell_w.max(1) as f32).round();
+            cols.clamp(1.0, f32::from(u16::MAX)) as u16
+        };
+        let cap = cols(TAB_MAX_DIP);
+        Self {
+            cap,
+            grow: cols(TAB_GROW_DIP).max(cap),
+            wants,
+        }
+    }
+
+    /// Tab `i`'s width when the strip has room: its want, held between the
+    /// equal width and the growth cap.
+    fn wanted(&self, i: usize) -> u16 {
+        self.wants
+            .get(i)
+            .copied()
+            .unwrap_or(0)
+            .clamp(self.cap, self.grow.max(self.cap))
+    }
+}
+
+/// The widths of `count` tabs from `first` that each start at `base` and may
+/// grow toward [`TabSizing::wanted`] within `band` columns: the room past
+/// `count × base` handed out evenly to the tabs still short of their want, in a
+/// few rounds, never more than a tab wants. Every tab keeps `base` when nothing
+/// is left.
+fn grown_widths(
+    sizing: &TabSizing<'_>,
+    first: usize,
+    count: usize,
+    base: u16,
+    band: u16,
+) -> Vec<u16> {
+    let mut widths = vec![base; count];
+    let wants: Vec<u16> = (first..first + count).map(|i| sizing.wanted(i)).collect();
+    let used = u32::from(base) * u32::try_from(count).unwrap_or(u32::MAX);
+    let mut room = u32::from(band).saturating_sub(used);
+    while room > 0 {
+        let short: Vec<usize> = (0..count).filter(|&i| widths[i] < wants[i]).collect();
+        if short.is_empty() {
+            break;
+        }
+        let each = (room / u32::try_from(short.len()).unwrap_or(u32::MAX)).max(1);
+        let mut given = 0u32;
+        for i in short {
+            let add = u32::from(wants[i] - widths[i]).min(each).min(room - given);
+            widths[i] += u16::try_from(add).unwrap_or(0);
+            given += add;
+            if given == room {
+                break;
+            }
+        }
+        if given == 0 {
+            break;
+        }
+        room -= given;
+    }
+    widths
+}
 
 /// The EQUAL-SHARE legibility floor, in columns. While every tab's equal share
 /// stays at or above this, tabs split the band evenly; once a share would drop
@@ -657,7 +906,7 @@ const PLAIN_TAB: TabStripMetadata = TabStripMetadata {
     busy: false,
     attention: ChipLevel::Off,
     conn: None,
-    drop_target: false,
+    team: TabTeam::NONE,
     closable: true,
 };
 
@@ -729,7 +978,6 @@ fn chip_title_cols(width: u16, chrome: TabStripMetadata) -> u16 {
         // narrow for ` x ` reserves no close cell, and a non-closable chip gives
         // that cell back.
         close_col: (chrome.closable && width >= MIN_SEG_WITH_CLOSE).then(|| width - 2),
-        connector_col: None,
         kind: TabHit::Select(0),
         solo: false,
     };
@@ -780,7 +1028,8 @@ fn strip_seat_cols(tab_count: usize, metadata: &[TabStripMetadata]) -> u16 {
 ///
 /// Same rules as the native strip (`toolbar::native_tab_cells` /
 /// `toolbar::set_window_tabs`):
-/// - tabs divide the band into equal shares with no maximum width;
+/// - tabs divide the band into equal shares, each capped at [`CHIP_MAX_COLS`]
+///   on Windows (no maximum elsewhere);
 /// - a lone tab is the window title: one full-band [`TabSegment::solo`] segment
 ///   with no close column (macOS only; elsewhere it is a leading chip capped at
 ///   [`SOLO_CHIP_MAX_COLS`], see [`SOLO_TITLE_BAND`]);
@@ -815,17 +1064,20 @@ pub(crate) fn layout_segments(
         active,
         show_update,
         chip_seat_cols(PLAIN_TAB),
+        TabSizing::FIXED,
     )
 }
 
 /// [`layout_segments`] with the seat width (`seat`, from [`strip_seat_cols`]):
-/// the one number the two entry points disagree about.
+/// the one number the two entry points disagree about. On Windows the tab cap
+/// and the tabs' growth are `sizing`'s ([`TabSizing`]).
 fn layout_segments_seated(
     cols: u16,
     tab_count: usize,
     active: usize,
     show_update: bool,
     seat: u16,
+    sizing: TabSizing<'_>,
 ) -> Vec<TabSegment> {
     let mut segs = Vec::new();
     if cols == 0 {
@@ -838,7 +1090,6 @@ fn layout_segments_seated(
             start_col: 0,
             end_col: UPDATE_W,
             close_col: None,
-            connector_col: None,
             kind: TabHit::Update,
             solo: false,
         });
@@ -856,13 +1107,15 @@ fn layout_segments_seated(
     let mut x: u16 = lead;
     if tab_count > 0 {
         let band = avail.saturating_sub(lead);
-        // Equal shares of the band past the leading update icon, no maximum for
-        // two or more tabs; floored so a tab is at least 1 cell.
+        // Equal shares of the band past the leading update icon; floored so a
+        // tab is at least 1 cell.
         let share = band / tab_count as u16;
-        // One tab off macOS: capped chip ([`SOLO_CHIP_MAX_COLS`]) kept leading,
-        // so the band and the `+` show to its right.
-        let per = match SOLO_CHIP_MAX_COLS {
-            Some(cap) if tab_count == 1 => share.min(cap),
+        // A capped chip ([`CHIP_MAX_COLS`] on Windows, a lone one
+        // [`SOLO_CHIP_MAX_COLS`] off macOS) is kept leading, so the band and the
+        // `+` show to its right.
+        let per = match (tab_count, SOLO_CHIP_MAX_COLS, CHIP_MAX_COLS) {
+            (1, Some(_), _) | (_, _, Some(_)) if STRIP_WINDOWS_PAINT => share.min(sizing.cap),
+            (1, Some(cap), _) | (_, _, Some(cap)) => share.min(cap),
             _ => share,
         };
         // Active priority under pressure (`toolbar::native_tab_cells`, in cells):
@@ -914,9 +1167,21 @@ fn layout_segments_seated(
         } else {
             (per, per)
         };
+        // A Windows tab row with room past the equal width: each tab grows
+        // toward its title ([`TabSizing`]), the room shared among the tabs that
+        // want it. Never under pressure, and never past the band.
+        let grown = (STRIP_WINDOWS_PAINT
+            && !(tab_count > 1 && share < seat)
+            && per == sizing.cap
+            && sizing.grow > sizing.cap)
+            .then(|| grown_widths(&sizing, first, seats.min(tab_count - first), per, band));
         x += u16::from(mark_left);
         for i in first..(first + seats).min(tab_count) {
-            let per = if i == active { active_w } else { inactive_w };
+            let per = match &grown {
+                Some(widths) => widths[i - first],
+                None if i == active => active_w,
+                None => inactive_w,
+            };
             if per == 0 || x >= avail {
                 break; // out of room: remaining tabs are not drawn (still reachable)
             }
@@ -930,7 +1195,6 @@ fn layout_segments_seated(
                 start_col: start,
                 end_col: end,
                 close_col,
-                connector_col: None,
                 kind: TabHit::Select(i),
                 solo,
             });
@@ -947,7 +1211,6 @@ fn layout_segments_seated(
             start_col: start,
             end_col: start + NEW_TAB_W,
             close_col: None,
-            connector_col: None,
             kind: TabHit::NewTab,
             solo: false,
         });
@@ -1019,9 +1282,14 @@ impl VersionSlotCols {
     };
 }
 
-/// THE SHIPPING STRIP LAYOUT: [`layout_segments_seated`] and the metadata pass,
-/// plus — where it fits — the build's VERSION LABEL flush against the strip's
-/// right edge ([`TabHit::Version`], `[cols - w, cols)`).
+/// THE STRIP LAYOUT WITHOUT A PILL, its tabs equal at [`MAX_CHIP_COLS`]
+/// ([`layout_segments_with_version_sized`] sizes them):
+/// [`layout_segments_seated`] and the metadata pass, plus — where it fits — the
+/// build's VERSION LABEL flush against the strip's right edge
+/// ([`TabHit::Version`], `[cols - w, cols)`). The shipping splice calls
+/// [`layout_segments_with_pill`], which is this exactly while the window shows
+/// no needs pill and its tabs are not sized; the layout tests hold the strip's
+/// own contract here.
 ///
 /// THE LABEL YIELDS; THE TABS NEVER DO. Everything left of the label is today's
 /// layout of `cols - w` columns, to the column — the `+` (clamped to
@@ -1033,6 +1301,7 @@ impl VersionSlotCols {
 /// ([`strip_seat_cols`]), so the strip never enters its pressure or windowed
 /// layout on the label's account. The full rung is tried first, then the short
 /// one; if neither fits there is no label and the layout is today's whole strip.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn layout_segments_with_version(
     cols: u16,
@@ -1042,10 +1311,83 @@ pub(crate) fn layout_segments_with_version(
     show_update: bool,
     slot: VersionSlotCols,
 ) -> Vec<TabSegment> {
+    layout_segments_with_version_sized(
+        cols,
+        tab_count,
+        metadata,
+        active,
+        show_update,
+        slot,
+        TabSizing::FIXED,
+    )
+}
+
+/// [`layout_segments_with_version`] with the Windows tabs sized by `sizing`
+/// ([`TabSizing`]).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn layout_segments_with_version_sized(
+    cols: u16,
+    tab_count: usize,
+    metadata: &[TabStripMetadata],
+    active: usize,
+    show_update: bool,
+    slot: VersionSlotCols,
+    sizing: TabSizing<'_>,
+) -> Vec<TabSegment> {
+    layout_segments_with_pill(
+        cols,
+        tab_count,
+        metadata,
+        active,
+        show_update,
+        slot,
+        None,
+        sizing,
+    )
+}
+
+/// THE SHIPPING STRIP LAYOUT, WITH THE WINDOW'S NEEDS PILL
+/// ([`layout_segments_with_version_sized`]'s exactly when `pill` is `None`),
+/// its Windows tabs sized by `sizing` ([`TabSizing`]). Unlike the
+/// version label the pill outranks the tabs, within its share (at most 40%
+/// of the strip, [`strip_pill_layout`]): it takes the trailing columns left
+/// of the version label, the label is admitted against what the pill leaves,
+/// and the tabs, the `+` and the `↻` are laid out left of both, as ever. Its
+/// regions are segments of their own ([`TabHit::Pill`]), cut from the
+/// engine's layout by its own hit rule (`PillLayout::hit` at each cell's
+/// centre; a pad or a gap belongs to the region left of it), so a click
+/// lands on what the painter drew there ([`paint_strip_pill`]).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the strip's layout inputs, each independent: width, tabs, chrome, \
+              selection, the update alert, the version label, the needs pill and \
+              the tabs' sizing"
+)]
+#[must_use]
+pub(crate) fn layout_segments_with_pill(
+    cols: u16,
+    tab_count: usize,
+    metadata: &[TabStripMetadata],
+    active: usize,
+    show_update: bool,
+    slot: VersionSlotCols,
+    pill: Option<&crate::presence::PillWords>,
+    sizing: TabSizing<'_>,
+) -> Vec<TabSegment> {
     let seat = strip_seat_cols(tab_count, metadata);
-    let version = version_rung_that_fits(cols, tab_count, seat, show_update, slot);
-    let laid_cols = version.map_or(cols, |(_, w)| cols - w);
-    let mut segments = layout_segments_seated(laid_cols, tab_count, active, show_update, seat);
+    let lone = if STRIP_WINDOWS_PAINT {
+        sizing.cap
+    } else {
+        LONE_CHIP_COLS
+    };
+    let pill = pill.and_then(|words| strip_pill_layout(cols, words));
+    let pill_w = pill.as_ref().map_or(0, strip_pill_cols);
+    let inner = cols - pill_w;
+    let version = version_rung_that_fits(inner, tab_count, seat, show_update, slot, lone);
+    let laid_cols = version.map_or(inner, |(_, w)| inner - w);
+    let mut segments =
+        layout_segments_seated(laid_cols, tab_count, active, show_update, seat, sizing);
     for segment in &mut segments {
         let TabHit::Select(index) = segment.kind else {
             continue;
@@ -1053,25 +1395,16 @@ pub(crate) fn layout_segments_with_version(
         if metadata.get(index).is_some_and(|item| !item.closable) {
             segment.close_col = None;
         }
-        // The connector hit region: the status-mark cell the painter draws, from
-        // the same math. Solo band marks paint at `end_col - 2` (span > 6);
-        // chips use `tab_content_layout`'s `status_col`.
-        let Some(item) = metadata.get(index).copied().filter(|it| it.has_status()) else {
-            continue;
-        };
-        segment.connector_col = if segment.solo {
-            (segment.end_col.saturating_sub(segment.start_col) > 6)
-                .then(|| segment.end_col.saturating_sub(2))
-        } else {
-            tab_content_layout(segment, item).status_col
-        };
+    }
+    if let Some(layout) = pill.as_ref() {
+        push_pill_segments(&mut segments, layout, laid_cols);
     }
     if let Some((rung, w)) = version {
+        let start = laid_cols + pill_w;
         segments.push(TabSegment {
-            start_col: laid_cols,
-            end_col: laid_cols + w,
+            start_col: start,
+            end_col: start + w,
             close_col: None,
-            connector_col: None,
             kind: TabHit::Version {
                 rung,
                 attention: slot.attention,
@@ -1082,19 +1415,96 @@ pub(crate) fn layout_segments_with_version(
     segments
 }
 
+/// THE WINDOW'S NEEDS PILL as the in-grid strip carries it (owner surfaces
+/// §5; a macOS window on glass draws it in its titlebar instead,
+/// `toolbar.rs`'s `NeedsPill`): what lit it and its words — the engine's one
+/// model, laid out here in strip cells ([`strip_pill_layout`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StripPill<'a> {
+    /// What lit it: its glyph's tone.
+    pub(crate) kind: crate::presence::PillKind,
+    /// Its words, in the pieces the layout clips.
+    pub(crate) words: &'a crate::presence::PillWords,
+}
+
+/// The in-grid pill's share of a `cols`-wide strip, its pads included: at
+/// most 40% of the strip (§5), as the titlebar pill's is of its band.
+fn strip_pill_share(cols: u16) -> u16 {
+    u16::try_from(u32::from(cols) * 2 / 5).unwrap_or(u16::MAX)
+}
+
+/// The in-grid pill laid out in its share of a `cols`-wide strip: the
+/// engine's `pill_layout` measured in strip cells ([`strip_display_cells`]),
+/// one cell between its pieces, inside a pad cell at each end — the words
+/// clip first, then the label, never the glyph. `None` where the share has no
+/// room for the glyph. The ONE geometry the layout cuts the pill's hit
+/// regions from and its painter draws by.
+#[must_use]
+pub(crate) fn strip_pill_layout(
+    cols: u16,
+    words: &crate::presence::PillWords,
+) -> Option<aterm_messages::presence::PillLayout> {
+    let inner = strip_pill_share(cols).checked_sub(2).filter(|w| *w > 0)?;
+    let layout = aterm_messages::presence::pill_layout(words, f64::from(inner), 1.0, |s| {
+        strip_display_cells(s) as f64
+    });
+    (layout.width >= 1.0 && layout.width <= f64::from(inner)).then_some(layout)
+}
+
+/// The columns a laid-out in-grid pill takes: its pieces and its two pads.
+fn strip_pill_cols(layout: &aterm_messages::presence::PillLayout) -> u16 {
+    cell_of(layout.width).saturating_add(2)
+}
+
+/// A whole-cell span edge of the in-grid pill's layout (measured in cells, so
+/// every edge is a whole number) as a column offset.
+fn cell_of(x: f64) -> u16 {
+    x.round().clamp(0.0, f64::from(u16::MAX)) as u16
+}
+
+/// The pill's regions from column `start` on, one [`TabHit::Pill`] segment
+/// per run of cells the engine's hit rule (`PillLayout::hit` at the cell's
+/// centre) gives one answer; a pad or a gap cell takes the region left of it,
+/// the leading pad the body's. Every column of the pill is one of its
+/// regions, so no click on it falls through to the bare band.
+fn push_pill_segments(
+    segments: &mut Vec<TabSegment>,
+    layout: &aterm_messages::presence::PillLayout,
+    start: u16,
+) {
+    let width = strip_pill_cols(layout);
+    let mut region = crate::presence::PillHit::Go;
+    let mut run_start = start;
+    for offset in 0..width {
+        // The pill's own coordinate: its pieces start past the leading pad.
+        let x = f64::from(offset) - 1.0 + 0.5;
+        let hit = layout.hit(x).unwrap_or(region);
+        if hit != region {
+            segments.push(pill_segment(run_start, start + offset, region));
+            region = hit;
+            run_start = start + offset;
+        }
+    }
+    segments.push(pill_segment(run_start, start + width, region));
+}
+
+fn pill_segment(start_col: u16, end_col: u16, hit: crate::presence::PillHit) -> TabSegment {
+    TabSegment {
+        start_col,
+        end_col,
+        close_col: None,
+        kind: TabHit::Pill(hit),
+        solo: false,
+    }
+}
+
 /// The cells a strip keeps left of the window buttons: the `+` and a few cells of
 /// tab, so the narrowest window still opens and shows a tab.
 const CAPTION_STRIP_FLOOR: u16 = NEW_TAB_W + 3;
 
-/// THE HEADER STRIP: [`layout_segments_with_version`] on the cells left of the
-/// window's own buttons, and the buttons ([`TabHit::Caption`]) flush against the
-/// strip's right edge, one [`CaptionSlot::button_cols`]-wide segment each.
-///
-/// THE TABS YIELD; THE BUTTONS DO NOT (the version label's rule, reversed): a
-/// window whose band is its header cannot lose its close button to a long tab
-/// list. Only a strip narrower than [`CAPTION_STRIP_FLOOR`] plus the buttons sheds
-/// them ([`CaptionSlot::fit`]). [`CaptionSlot::NONE`] (every window the window
-/// system decorates) is exactly [`layout_segments_with_version`].
+/// [`layout_segments_with_caption_sized`] with no needs pill and equal tabs:
+/// the header strip the caption tests hold the buttons' contract against.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn layout_segments_with_caption(
     cols: u16,
@@ -1105,10 +1515,63 @@ pub(crate) fn layout_segments_with_caption(
     slot: VersionSlotCols,
     caption: CaptionSlot,
 ) -> Vec<TabSegment> {
+    layout_segments_with_caption_sized(
+        cols,
+        tab_count,
+        metadata,
+        active,
+        show_update,
+        slot,
+        None,
+        caption,
+        TabSizing::FIXED,
+    )
+}
+
+/// THE HEADER STRIP, the shipping layout: [`layout_segments_with_pill`] (the
+/// tabs, sized by `sizing` ([`TabSizing`]: the cap in DIPs at the window's
+/// metrics, and each tab's growth toward its title), the version label and
+/// the window's needs pill) on the cells left of the window's own buttons, and
+/// the buttons ([`TabHit::Caption`]) flush against the strip's right edge, one
+/// [`CaptionSlot::button_cols`]-wide segment each.
+///
+/// THE TABS YIELD; THE BUTTONS DO NOT (the version label's rule, reversed): a
+/// window whose band is its header cannot lose its close button to a long tab
+/// list, nor to the pill, which takes its share of the cells the buttons
+/// leave ([`paint_strip_pill`] lays it out in the same cells). Only a strip
+/// narrower than [`CAPTION_STRIP_FLOOR`] plus the buttons sheds them
+/// ([`CaptionSlot::fit`]). [`CaptionSlot::NONE`] (every window the window
+/// system decorates) is exactly [`layout_segments_with_pill`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the strip's layout inputs, each independent: width, tabs, chrome, \
+              selection, the update alert, the version label, the needs pill, the \
+              window buttons and the tabs' sizing"
+)]
+#[must_use]
+pub(crate) fn layout_segments_with_caption_sized(
+    cols: u16,
+    tab_count: usize,
+    metadata: &[TabStripMetadata],
+    active: usize,
+    show_update: bool,
+    slot: VersionSlotCols,
+    pill: Option<&crate::presence::PillWords>,
+    caption: CaptionSlot,
+    sizing: TabSizing<'_>,
+) -> Vec<TabSegment> {
     let caption = caption.fit(cols, CAPTION_STRIP_FLOOR);
     let inner = cols.saturating_sub(caption.cols());
-    let mut segments =
-        layout_segments_with_version(inner, tab_count, metadata, active, show_update, slot);
+    let mut segments = layout_segments_with_pill(
+        inner,
+        tab_count,
+        metadata,
+        active,
+        show_update,
+        slot,
+        pill,
+        sizing,
+    );
     let width = caption.button_cols();
     for (i, button) in caption.buttons().enumerate() {
         let start_col = inner + u16::try_from(i).unwrap_or(u16::MAX).saturating_mul(width);
@@ -1116,7 +1579,6 @@ pub(crate) fn layout_segments_with_caption(
             start_col,
             end_col: start_col.saturating_add(width),
             close_col: None,
-            connector_col: None,
             kind: TabHit::Caption(button),
             solo: false,
         });
@@ -1130,8 +1592,9 @@ pub(crate) fn layout_segments_with_caption(
 /// Full first, then short; a rung of width 0 (absent) or one at least as wide as
 /// the strip is skipped. A rung fits when the strip LEFT of it (`inner`) still
 /// holds the `↻` (if shown) and the `+`, and the band between them still gives:
-/// no tab — always; one tab — a whole [`LONE_CHIP_COLS`] chip, so the lone chip
-/// never shrinks for the label; `n ≥ 2` tabs — an equal share of at least `seat`
+/// no tab — always; one tab — a whole `lone` chip ([`LONE_CHIP_COLS`], on
+/// Windows the window's tab cap, [`TabSizing::cap`]), so the lone chip never
+/// shrinks for the label; `n ≥ 2` tabs — an equal share of at least `seat`
 /// ([`strip_seat_cols`]) each, so the label yields before the strip would start
 /// compressing or windowing its tabs.
 fn version_rung_that_fits(
@@ -1140,6 +1603,7 @@ fn version_rung_that_fits(
     seat: u16,
     show_update: bool,
     slot: VersionSlotCols,
+    lone: u16,
 ) -> Option<(crate::menu::VersionRung, u16)> {
     [
         (crate::menu::VersionRung::Full, slot.full),
@@ -1161,7 +1625,7 @@ fn version_rung_that_fits(
         let band = inner - NEW_TAB_W - lead;
         match tab_count {
             0 => true,
-            1 => band >= LONE_CHIP_COLS,
+            1 => band >= lone,
             n => {
                 let n = u32::try_from(n).unwrap_or(u32::MAX);
                 u32::from(band) / n >= u32::from(seat)
@@ -1172,9 +1636,8 @@ fn version_rung_that_fits(
 
 /// Map a strip click at column `col` to its [`TabHit`], or `None` for a click on
 /// bare strip background (between/after segments). A click on a segment's
-/// `close_col` is a [`TabHit::Close`], on its `connector_col` a
-/// [`TabHit::Connector`] (the status-mark cell — design §3.1 [v5]); any other
-/// column of a tab segment selects it; the `+` segment opens a tab.
+/// `close_col` is a [`TabHit::Close`]; any other column of a tab segment,
+/// its status marks included, selects it; the `+` segment opens a tab.
 #[must_use]
 pub(crate) fn hit_test(segments: &[TabSegment], col: u16) -> Option<TabHit> {
     for seg in segments {
@@ -1183,11 +1646,6 @@ pub(crate) fn hit_test(segments: &[TabSegment], col: u16) -> Option<TabHit> {
                 && col == cx
             {
                 return Some(TabHit::Close(i));
-            }
-            if let (Some(cx), TabHit::Select(i)) = (seg.connector_col, seg.kind)
-                && col == cx
-            {
-                return Some(TabHit::Connector(i));
             }
             return Some(seg.kind);
         }
@@ -1398,11 +1856,17 @@ struct StripColors {
     /// [`crate::chrome_band::band_colors`]'s `bar_bg`, shared with the find bar,
     /// config notices and settings band.
     band_bg: [u8; 3],
-    /// The active tab's raised-button background. Equal to [`Self::raise_bg`]
-    /// unless the user's `active_tab_color` replaced it.
+    /// The surface under the seam ([`StripFloor`]; the terminal's own ground,
+    /// the theme background, over the grid): the band's foot
+    /// ([`BandGeometry::foot_px`]) and the gutters' rail are this tone, and the
+    /// selected tab opens through the seam exactly when it IS this tone.
+    foot: [u8; 3],
+    /// The active tab's background: on Windows the terminal's ground
+    /// ([`SELECTED_TAB_IS_GROUND`]), elsewhere the raised card [`Self::raise_bg`];
+    /// the user's `active_tab_color` replaces either.
     active_bg: [u8; 3],
-    /// The theme-derived raise, before any `active_tab_color` override. The `+`
-    /// uses this rather than [`Self::active_bg`].
+    /// The theme-derived raise, before any `active_tab_color` override: the
+    /// update CTA's card, and the selected chip off Windows.
     raise_bg: [u8; 3],
     /// Ink for [`Self::raise_bg`], floored against it: on muted schemes the raise
     /// walks the card toward its own label (Solarized Dark's fg would be 2.85:1).
@@ -1445,8 +1909,46 @@ struct StripColors {
     /// a rule the same colour as its own surface is not a rule.
     update_rule: [u8; 3],
     /// The hairline closing the bottom strip row against the terminal content
-    /// ([`seal_strip_bottom`]). `None` without a band ([`STRIP_IS_CHROME_BAND`]).
+    /// ([`strip_seam_rail`]). `None` without a band ([`STRIP_IS_CHROME_BAND`]).
     seam: Option<[u8; 3]>,
+    /// The selected Windows tab's 1-px outline, in [`Self::seam`]'s tone: on
+    /// every selected tab of a light band, and on a dark band where its fill
+    /// alone would not stand off the band ([`TAB_RIM_BELOW`]); `None`
+    /// elsewhere ([`selected_tab_rim`]).
+    active_rim: Option<[u8; 3]>,
+}
+
+/// The contrast with a DARK band under which a selected Windows tab
+/// ([`SELECTED_TAB_IS_GROUND`]) draws its outline ([`selected_tab_rim`]; a
+/// light band's selected tab always does). Default's grid and Settings page
+/// (1.28:1) read as tabs without one. The Appearance preview's window sample
+/// takes the same seam rim (`settings_preview::WINDOW_SAMPLE_RIM_BELOW`).
+const TAB_RIM_BELOW: f64 = 1.15;
+
+/// The selected tab's outline over the band ([`StripColors::active_rim`]): the
+/// band's `seam`, so the tab keeps the floor's tone and still reads as a tab,
+/// as WinUI's selected `TabViewItem` carries its card stroke. On a light band
+/// every selected Windows tab wears it, so a tab is one shape whatever it
+/// holds: drawn only within [`TAB_RIM_BELOW`] of the band, Default Light's
+/// Settings tab (`#eaebeb` on its `#e2e3e5` band, 1.08:1) had the outline and
+/// its terminal tab (1.20:1) none, and the selected tab changed shape with
+/// what it selected (the 2026-10-18 judge's
+/// `J4F-4-light-selected-tab-two-idioms`; before that the Settings tab was a
+/// shape only its missing seam drew, `j3d-light-settings-tab-faint`). On a
+/// dark band, where the selected tab is a darker slab the eye reads as a tab,
+/// only a fill within [`TAB_RIM_BELOW`] of the band wears it. `None` off
+/// Windows (a chip is a card) and without a seam.
+fn selected_tab_rim(active: [u8; 3], band: [u8; 3], seam: Option<[u8; 3]>) -> Option<[u8; 3]> {
+    seam.filter(|_| SELECTED_TAB_IS_GROUND && windows_tab_wears_rim(active, band))
+}
+
+/// Whether a selected Windows tab filled `active` on `band` wears the seam's
+/// outline: [`selected_tab_rim`]'s rule, asked on any host. Always on a light
+/// band, on a dark one only within [`TAB_RIM_BELOW`]. The Themes demo's
+/// Windows window (`settings_preview::paint_demo_windows_strip`) asks it, so
+/// its selected tab is the strip's own shape in every theme.
+pub(crate) fn windows_tab_wears_rim(active: [u8; 3], band: [u8; 3]) -> bool {
+    bg_is_light(band) || crate::chrome_band::contrast(active, band) < TAB_RIM_BELOW
 }
 
 /// The strip tones under an OS-forced chrome palette
@@ -1463,13 +1965,17 @@ struct StripColors {
 ///
 /// The seam is `COLOR_WINDOWTEXT`, not a blend, for the same reason; it carries the
 /// band's edge on schemes whose band and grid are both black.
-fn forced_strip_colors(hc: crate::chrome_band::ForcedChrome) -> StripColors {
+fn forced_strip_colors(hc: crate::chrome_band::ForcedChrome, foot: [u8; 3]) -> StripColors {
     let ink = crate::chrome_band::forced_ink;
     let band_fg = ink(hc.window_text, hc.btn_face);
     let plain_fg = ink(hc.window_text, hc.window);
     StripColors {
         fg: band_fg,
         band_bg: hc.btn_face,
+        // The terminal grid keeps its own colours under HC (`chrome_band`), so
+        // the band's foot is still what lies under it; the selected tab is the
+        // OS selection, which never opens into it.
+        foot,
         active_bg: hc.highlight,
         raise_bg: hc.window,
         raise_fg: plain_fg,
@@ -1495,6 +2001,8 @@ fn forced_strip_colors(hc: crate::chrome_band::ForcedChrome) -> StripColors {
         // Only Windows publishes a forced palette, and there the strip is already a
         // chrome band.
         seam: Some(ink(hc.window_text, hc.btn_face)),
+        // The OS selection is its own outline.
+        active_rim: None,
     }
 }
 
@@ -1518,15 +2026,93 @@ fn forced_strip_colors(hc: crate::chrome_band::ForcedChrome) -> StripColors {
 /// mild 0.15 on both, since the raised card carries the focus cue.
 /// `strip_inks_clear_the_legibility_floor` guards the inks and the accent.
 ///
+/// Windows ([`SELECTED_TAB_IS_GROUND`]) draws tabs, not chips: the selected tab
+/// is the terminal's own ground and opens into it, quiet tabs have no card,
+/// and on a light theme the update CTA steps toward white, as Windows 11's
+/// elevated surfaces do, never toward the ink: stepped toward the ink, the
+/// selected card of a light theme was the darkest chip on the band and read as
+/// pressed (the 2026-10-18 judges' `tab-chips-not-win11-tabs`). The hover wash
+/// is the one surface that steps toward the ink on a light band
+/// ([`LIGHT_TAB_HOVER_T`]), as WinUI's subtle fill does.
+///
 /// Under an OS-forced chrome palette (Windows High Contrast) [`forced_strip_colors`]
 /// answers instead.
+///
+/// The strip over the terminal's own ground ([`StripFloor::Ground`]); the band
+/// paints over whatever this frame puts under its seam through
+/// [`strip_colors_on`].
 fn strip_colors(p: impl Into<ChromePalette>) -> StripColors {
+    strip_colors_on(p, StripFloor::Ground)
+}
+
+/// What lies right under the strip's seam this frame, across the window: the
+/// surface the selected tab opens into, and the tone of the band's foot
+/// ([`BandGeometry::foot_px`](pixel_band::BandGeometry)) and of the rail in the
+/// gutters ([`strip_seam_rail`]). Windows tabs ([`SELECTED_TAB_IS_GROUND`]):
+/// the selected tab is ONE surface with what it opens into, as Windows
+/// Terminal's tab is with its terminal and WinUI's `TabView` tab is with its
+/// content area.
+///
+/// The selected tab takes the floor's tone and opens through the seam into it
+/// when that tone stands apart from the band ([`TAB_FLOOR_APART`]): the grid
+/// and a split's pane headers (both the terminal's ground, the headers wearing
+/// it on Windows, [`crate::pane_header`]) and a native page (Settings, its
+/// `surface`). Where the floor IS the band (the find panel on the window's top
+/// row, the message band, a pane header on the band's tone), a tab of that
+/// tone would vanish into the strip: the selected tab stands closed on the seam
+/// in the terminal's ground and the foot takes the floor's tone. It used to be
+/// the ground over every floor, opening into a grey header band, fusing with
+/// the find panel's well into one dark L, and stepping down onto a lighter
+/// Settings page (the 2026-10-18 judges' `selected-tab-opens-onto-grey-band`,
+/// `selected-tab-opens-into-header-band`, `settings-tab-ground-mismatch`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub(crate) enum StripFloor {
+    /// The terminal's own ground (the strip palette's theme background).
+    #[default]
+    Ground,
+    /// Any other surface, `0xRRGGBB` channels.
+    Surface([u8; 3]),
+}
+
+impl StripFloor {
+    /// The floor's tone over `ground`, the terminal's own.
+    fn tone(self, ground: [u8; 3]) -> [u8; 3] {
+        match self {
+            Self::Ground => ground,
+            Self::Surface(tone) => tone,
+        }
+    }
+
+    /// The selected tab's surface over this floor: the floor's tone where it
+    /// stands apart from the band (`band`), else the terminal's `ground`,
+    /// standing closed on the seam.
+    fn selected_surface(self, ground: [u8; 3], band: [u8; 3]) -> [u8; 3] {
+        let tone = self.tone(ground);
+        if crate::chrome_band::contrast(tone, band) >= TAB_FLOOR_APART {
+            tone
+        } else {
+            ground
+        }
+    }
+}
+
+/// How far a floor ([`StripFloor`]) must stand from the band, as a contrast
+/// ratio, for the selected tab to take its tone: just past the rounding of two
+/// derivations of the same band (the find panel's band over a live background is
+/// the strip's band to the byte or within a step), well under the subtlest page
+/// a tab opens into (Default Light's Settings `#eaebeb` on its `#e2e3e5` band,
+/// 1.08:1; WinUI's light selected tab is a step that small).
+const TAB_FLOOR_APART: f64 = 1.03;
+
+/// [`strip_colors`] over `floor`: the selected tab ([`StripFloor::selected_surface`])
+/// and the band's foot ([`StripColors::foot`]) follow what lies under the seam.
+fn strip_colors_on(p: impl Into<ChromePalette>, floor: StripFloor) -> StripColors {
+    let p = p.into();
     // High Contrast: the OS palette owns chrome, returned whole. The terminal grid
     // is untouched (see `chrome_band`'s module comment).
     if let Some(hc) = crate::chrome_band::forced_chrome() {
-        return forced_strip_colors(hc);
+        return forced_strip_colors(hc, floor.tone(crate::settings::u32_rgb(p.theme.bg)));
     }
-    let p = p.into();
     let theme = p.theme;
     // The shared chrome tokens: the accent and the seam every surface draws.
     let tokens = p.tokens();
@@ -1549,21 +2135,34 @@ fn strip_colors(p: impl Into<ChromePalette>) -> StripColors {
     // (Solarized).
     let light = bg_is_light(rgb(theme.bg));
     let (active_t, inactive_t, hover_t, chip_t) = match (light, STRIP_CHIP_CARDS) {
+        // Windows tabs: no quiet card; on a light band the CTA steps toward
+        // white, which takes a longer step to show, and the hover wash steps
+        // toward the ink ([`LIGHT_TAB_HOVER_T`]).
+        (true, true) if SELECTED_TAB_IS_GROUND => (0.6, 0.15, LIGHT_TAB_HOVER_T, 0.0),
+        (false, true) if SELECTED_TAB_IS_GROUND => (0.21, 0.15, 0.13, 0.0),
         (true, false) => (0.14, 0.15, 0.05, 0.0),
         (true, true) => (0.14, 0.15, 0.10, 0.055),
         (false, false) => (0.21, 0.15, 0.07, 0.0),
         (false, true) => (0.21, 0.15, 0.13, 0.06),
     };
     let fg = rgb(theme.fg);
+    let ground = rgb(theme.bg);
     // The one platform decision in the colour work: which surface the strip is.
     let band_bg = if STRIP_IS_CHROME_BAND {
         crate::chrome_band::band_colors(p).bar_bg
     } else {
         rgb(theme.bg)
     };
+    // What a surface rises toward: the ink, except a light Windows band's,
+    // which rises toward white (an elevated surface, never a pressed one).
+    let rise = if light && SELECTED_TAB_IS_GROUND {
+        [0xff, 0xff, 0xff]
+    } else {
+        fg
+    };
     // Surface blends take the RAW theme fg (a surface is not ink and must not be
     // dragged around by an ink floor); only the inks below are floored.
-    let raise_bg = crate::chrome_band::mix3(band_bg, fg, active_t);
+    let raise_bg = crate::chrome_band::mix3(band_bg, rise, active_t);
     // Each ink is floored against the surface it lands on: band and raised card are
     // two surfaces, and the raise also moves the card toward its ink.
     let ink = |c: [u8; 3], on: [u8; 3]| {
@@ -1586,7 +2185,10 @@ fn strip_colors(p: impl Into<ChromePalette>) -> StripColors {
         dim
     };
     // The hover wash is a surface (raw fg blend); its label is the inactive ink
-    // re-floored on it.
+    // re-floored on it. It steps toward the ink on every band, a light Windows
+    // band's too: there the selected tab and the CTA rise toward white, and a
+    // wash rising the same way read as a second selected tab (WinUI's light
+    // `TabViewItem` hover is `SubtleFillColorSecondary`, a black overlay).
     let hover_bg = crate::chrome_band::mix3(band_bg, fg, hover_t);
     let hover_fg = ink(inactive_fg, hover_bg);
     // The `+` on the wash: full-strength ink floored against the wash.
@@ -1596,22 +2198,51 @@ fn strip_colors(p: impl Into<ChromePalette>) -> StripColors {
     let chip_bg = crate::chrome_band::mix3(band_bg, fg, chip_t);
     let chip_fg = ink(inactive_fg, chip_bg);
     let chip_button_fg = ink(fg, chip_bg);
-    // The accent marks: the active underline sits on the raised card, the
-    // update rule on the `↻` card (the same raise), and the status marks on the
-    // band, so the token accent is floored against the card first and the band
-    // second. The card is a step from the band toward the ink, so the second
-    // floor is a no-op unless the first crossed the accent to the band's side.
-    let accent = {
-        let on_card = tokens.accent_on(raise_bg, STRIP_ACCENT_FLOOR);
-        crate::chrome_band::ensure_contrast(on_card, band_bg, STRIP_ACCENT_FLOOR)
+    // The selected tab: the raised card, or on Windows the surface it opens
+    // into ([`StripFloor::selected_surface`]: the terminal's ground, a native
+    // page's surface) with the terminal's own ink floored on it.
+    let foot = floor.tone(ground);
+    let (active_bg, active_fg) = if SELECTED_TAB_IS_GROUND {
+        let selected = floor.selected_surface(ground, band_bg);
+        (selected, ink(fg, selected))
+    } else {
+        (raise_bg, raise_fg)
     };
+    // The accent marks: the active underline and a selected tab's status marks
+    // sit on the selected surface, the update rule on the `↻` card (the
+    // raise), and the status marks on the band, so the token accent is floored
+    // against the selected surface and the band ([`floor_on_both`]), and the
+    // update rule on its card.
+    let accent = floor_on_both(
+        tokens.accent_on(active_bg, STRIP_ACCENT_FLOOR),
+        active_bg,
+        band_bg,
+        STRIP_ACCENT_FLOOR,
+    );
+    // A Windows tab row's hover wash steps the other way from the band than
+    // its selected tab does, so it is not between two floored surfaces: the
+    // marks a hovered tab carries are held on it too.
+    let accent = if SELECTED_TAB_IS_GROUND {
+        floor_on_all(accent, &[active_bg, band_bg, hover_bg], STRIP_ACCENT_FLOOR)
+    } else {
+        accent
+    };
+    let update_rule = if SELECTED_TAB_IS_GROUND {
+        floor_on_both(accent, raise_bg, band_bg, STRIP_ACCENT_FLOOR)
+    } else {
+        accent
+    };
+    // The band's seam: the authored border, else the band stepped toward the
+    // ink (`aterm_messages::tokens::SEAM_T`), held to the seam floor.
+    let seam = STRIP_IS_CHROME_BAND.then(|| tokens.seam_on(band_bg));
     StripColors {
         fg: band_fg,
         band_bg,
-        active_bg: raise_bg,
+        foot,
+        active_bg,
         raise_bg,
         raise_fg,
-        active_fg: raise_fg,
+        active_fg,
         inactive_fg,
         chip_bg,
         chip_fg,
@@ -1620,15 +2251,77 @@ fn strip_colors(p: impl Into<ChromePalette>) -> StripColors {
         hover_fg,
         button_hover_fg,
         accent,
-        // The selected pair plus the theme accent as its rule; only the
+        // The raised pair plus the theme accent as its rule; only the
         // forced-palette branch differs.
         update_bg: raise_bg,
         update_fg: raise_fg,
-        update_rule: accent,
-        // The band's seam: the authored border, else the band stepped toward the
-        // ink (`aterm_messages::tokens::SEAM_T`), held to the seam floor.
-        seam: STRIP_IS_CHROME_BAND.then(|| tokens.seam_on(band_bg)),
+        update_rule,
+        seam,
+        active_rim: selected_tab_rim(active_bg, band_bg, seam),
     }
+}
+
+/// [`floor_on_both`]'s last rule over any number of grounds: `mark` unchanged
+/// when it clears `floor` on every one, else its smallest step toward black or
+/// white that does; where none does, the step that came closest.
+fn floor_on_all(mark: [u8; 3], grounds: &[[u8; 3]], floor: f64) -> [u8; 3] {
+    use crate::chrome_band::{contrast, mix3};
+    let worst = |c: [u8; 3]| {
+        grounds
+            .iter()
+            .map(|g| contrast(c, *g))
+            .fold(f64::INFINITY, f64::min)
+    };
+    if worst(mark) >= floor {
+        return mark;
+    }
+    // The smallest step toward black or white that clears every ground; where
+    // none does, the step that came closest.
+    let (mut best, mut best_ratio) = (mark, worst(mark));
+    for step in 1..=10u8 {
+        for pole in [[0, 0, 0], [0xff, 0xff, 0xff]] {
+            let stepped = mix3(mark, pole, f32::from(step) / 10.0);
+            let ratio = worst(stepped);
+            if ratio >= floor {
+                return stepped;
+            }
+            if ratio > best_ratio {
+                (best, best_ratio) = (stepped, ratio);
+            }
+        }
+    }
+    best
+}
+
+/// `mark` held to `floor` on the card AND the band it may sit on: floored on
+/// the card, then on the band. The card is a step from the band toward the
+/// ink, so the band's floor is a no-op unless the card's left the mark on the
+/// band's side; there it walks the mark toward a pole THROUGH the card's tone,
+/// and can stop on it (an authored accent at the terminal background on a
+/// chrome band, 1.76:1 on the card). Then the mark takes the smallest step
+/// toward black or white that clears both grounds; where none does, the step
+/// that came closest.
+fn floor_on_both(mark: [u8; 3], card: [u8; 3], band: [u8; 3], floor: f64) -> [u8; 3] {
+    use crate::chrome_band::{contrast, ensure_contrast, mix3};
+    let worst = |c: [u8; 3]| contrast(c, card).min(contrast(c, band));
+    let floored = ensure_contrast(mark, band, floor);
+    if worst(floored) >= floor {
+        return floored;
+    }
+    let (mut best, mut best_ratio) = (floored, worst(floored));
+    for step in 1..=10u8 {
+        for pole in [[0, 0, 0], [0xff, 0xff, 0xff]] {
+            let stepped = mix3(mark, pole, f32::from(step) / 10.0);
+            let ratio = worst(stepped);
+            if ratio >= floor {
+                return stepped;
+            }
+            if ratio > best_ratio {
+                (best, best_ratio) = (stepped, ratio);
+            }
+        }
+    }
+    best
 }
 
 /// [`strip_colors`] test shorthand: `theme` with `active_override` as its authored
@@ -1649,9 +2342,15 @@ fn strip_colors_with_active(theme: Theme, active_override: Option<[u8; 3]>) -> S
 /// by the colour's luminance ([`bg_is_light`], the classifier the native toolbar
 /// pill uses). None authored is the theme-derived strip.
 fn strip_colors_for(p: impl Into<ChromePalette>) -> StripColors {
+    strip_colors_for_on(p, StripFloor::Ground)
+}
+
+/// [`strip_colors_for`] over `floor` ([`strip_colors_on`]): what the live strip
+/// paints. An authored `active_tab_color` stands on the seam over any floor.
+fn strip_colors_for_on(p: impl Into<ChromePalette>, floor: StripFloor) -> StripColors {
     let p = p.into();
     let active_override = p.authored.active_tab;
-    let mut colors = strip_colors(p);
+    let mut colors = strip_colors_on(p, floor);
     // Under an OS-forced palette (High Contrast) the override is dropped: HC is an
     // accessibility contract that the OS picks chrome colour. The config value is
     // kept and applies again once HC is off.
@@ -1666,11 +2365,89 @@ fn strip_colors_for(p: impl Into<ChromePalette>) -> StripColors {
         };
         colors.active_bg = active_bg;
         colors.active_fg = active_fg;
+        colors.active_rim = selected_tab_rim(active_bg, colors.band_bg, colors.seam);
         // The `↻` CTA also follows `active_tab_color`.
         colors.update_bg = active_bg;
         colors.update_fg = active_fg;
     }
     colors
+}
+
+/// How strongly macOS's native toolbar paints the selected tab's pill:
+/// `selectedContentBackgroundColor` at this alpha over the strip band, while
+/// no `active_tab_color` replaces it. The toolbar draws with it and
+/// [`automatic_active_tab_color`] composites with it, so the colour Settings
+/// names is the one on screen.
+pub(crate) const NATIVE_PILL_AUTO_ALPHA: f32 = 0.42;
+
+/// THE AUTOMATIC SELECTED-TAB COLOUR: what the selected tab is painted with
+/// while the `active_tab_color` key is unset, as one value Settings can show
+/// (the row's chip, the wheel's marker) rather than something only the paint
+/// paths know. The same derivation the strip runs ([`strip_colors_for_on`]):
+///
+/// * `header` is the strip's palette with the THEME's own authored chrome,
+///   no `active_tab_color` key over it, so a theme that authors the selected
+///   tab's colour names that colour;
+/// * `floor` is what lies under the strip's seam ([`StripFloor`]: on Windows
+///   the selected tab opens into it);
+/// * `native_selection` is the system's selected-content colour where macOS's
+///   native toolbar draws the pill (resolved in the strip's own appearance),
+///   `None` where the strip is drawn in the grid or as the pixel band.
+///
+/// Under an OS-forced palette (High Contrast) it is the highlight the strip
+/// paints. An authored colour is what the strip and the pill paint. On macOS's
+/// toolbar it is otherwise the pill composited over the band, elsewhere the
+/// strip's selected tab.
+pub(crate) fn automatic_active_tab_color(
+    header: ChromePalette,
+    floor: StripFloor,
+    native_selection: Option<[u8; 3]>,
+) -> [u8; 3] {
+    let colors = strip_colors_for_on(header, floor);
+    if crate::chrome_band::forced_chrome().is_some() || header.authored.active_tab.is_some() {
+        return colors.active_bg;
+    }
+    match native_selection {
+        Some(selection) => {
+            crate::chrome_band::mix3(colors.band_bg, selection, NATIVE_PILL_AUTO_ALPHA)
+        }
+        None => colors.active_bg,
+    }
+}
+
+/// The strip's tones as a picture of it paints them (the Themes page's demo
+/// window): the same derivation the live strip runs, so a theme's
+/// `active_tab_color`, `accent_color` and `border_color` show there exactly as
+/// they will on its tabs, and a theme that leaves them unset shows the
+/// derived ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StripSample {
+    /// The band under the tabs.
+    pub(crate) band: [u8; 3],
+    /// The selected tab's fill.
+    pub(crate) active: [u8; 3],
+    /// The selected tab's label.
+    pub(crate) active_ink: [u8; 3],
+    /// An unselected tab's label.
+    pub(crate) inactive_ink: [u8; 3],
+    /// The accent rule under the selected tab.
+    pub(crate) rule: [u8; 3],
+    /// The seam between the tabs and under the band.
+    pub(crate) seam: [u8; 3],
+}
+
+/// [`StripSample`] for one palette.
+pub(crate) fn strip_sample(p: impl Into<ChromePalette>) -> StripSample {
+    let p = p.into();
+    let colors = strip_colors_for(p);
+    StripSample {
+        band: colors.band_bg,
+        active: colors.active_bg,
+        active_ink: colors.active_fg,
+        inactive_ink: colors.inactive_fg,
+        rule: colors.accent,
+        seam: p.tokens().seam_on(colors.band_bg),
+    }
 }
 
 /// Whether this background is light: black text out-contrasts white on it (the
@@ -1724,8 +2501,90 @@ pub(crate) fn blank_cell(p: impl Into<ChromePalette>) -> RenderCell {
     strip_cell(' ', &strip_colors(p), StripRole::Inactive)
 }
 
+/// The chrome label's logical size: the settings tray's chrome base (13 px at
+/// 96 dpi ≈ 10 pt), not the terminal `font_px`. The strip's titles are set at
+/// it ([`chrome_label_base_px`]) and the pane headers a type step below.
+pub(crate) const CHROME_LABEL_LOGICAL_PX: f32 = 13.0;
+
+/// The chrome label base for a `row_h`-px row at the window's `scale`:
+/// [`CHROME_LABEL_LOGICAL_PX`] scaled and rounded, capped at 62% of the row,
+/// floored at a legible 6 px. The strip band's title size, and the base the
+/// pane headers' smaller step is taken from, so the two rows share one scale.
+#[must_use]
+pub(crate) fn chrome_label_base_px(row_h: f32, scale: f32) -> f32 {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    (CHROME_LABEL_LOGICAL_PX * scale)
+        .round()
+        .min((row_h * 0.62).floor())
+        .max(6.0)
+}
+
+/// The band's foot in logical px (Windows): the terminal's ground under the
+/// seam, before the grid's first row. Windows Terminal keeps 8 px of padding
+/// between its tab row and the text; the first row here sat flush under the
+/// rule, its ink 4 px below it and a prompt's coloured segment touching it,
+/// against 12 px of padding on the other three sides (the 2026-10-18 judges'
+/// `grid-flush-under-strip-seam`, `top-pad-zero-under-strip`). The synthetic
+/// head reserves it (`App::synthetic_strip_head_px`), so the visible band
+/// keeps its height and the grid starts this much lower.
+pub(crate) const STRIP_FOOT_LOGICAL_PX: f32 = if STRIP_WINDOWS_PAINT { 6.0 } else { 0.0 };
+
+/// The band's foot in device px for a strip canvas `canvas_px` tall (the top
+/// pad, the head and the strip's rows) whose visible band should measure
+/// `target_px` (the `tab_band_height` target at this scale; 0 for a compact
+/// band): what the canvas holds past the target, up to
+/// [`STRIP_FOOT_LOGICAL_PX`] at `scale`. A compact band, and a canvas with no
+/// head to spare (a headless window keeps its sealed boot band), have none.
+#[must_use]
+pub(crate) fn strip_foot_px(canvas_px: usize, target_px: usize, scale: f32) -> usize {
+    if target_px == 0 || STRIP_FOOT_LOGICAL_PX <= 0.0 {
+        return 0;
+    }
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let most = (STRIP_FOOT_LOGICAL_PX * scale).round().max(0.0) as usize;
+    canvas_px.saturating_sub(target_px).min(most)
+}
+
+impl crate::App {
+    /// Window `wid`'s band foot ([`strip_foot_px`]) under a `strip`-row strip:
+    /// out of the head the synthetic band reserved for it
+    /// (`App::synthetic_strip_head_px`); 0 on a compact band and on a headless
+    /// window's sealed boot band.
+    pub(crate) fn strip_foot_px(&self, wid: crate::WindowId, strip: usize) -> usize {
+        let cell_h = self.win_cell_size(wid).1;
+        let scale = self.windows.get(&wid).map_or(1.0, |ws| ws.scale);
+        let canvas = self.win_pad_top(wid) + self.win_head(wid) + strip * cell_h;
+        let target = crate::logical_to_device_px(
+            self.config.tab_band_height_or_default().target_logical_px(),
+            scale,
+        );
+        strip_foot_px(canvas, target, scale as f32)
+    }
+}
+
+/// The strip seam's thickness in device px at `scale`: one logical px, never
+/// under one device px (1 at 100% and 150%, 2 at 200%).
+#[must_use]
+pub(crate) fn strip_seam_px(scale: f32) -> usize {
+    if scale.is_finite() && scale >= 1.0 {
+        scale.floor() as usize
+    } else {
+        1
+    }
+}
+
 /// Close the bottom of the strip's last row against the terminal content with a
-/// hairline seam, in place. A no-op without a band ([`STRIP_IS_CHROME_BAND`]).
+/// hairline seam, in place: Linux's seam. A no-op without a band
+/// ([`STRIP_IS_CHROME_BAND`]) and where the seam is a rail instead
+/// ([`STRIP_WINDOWS_PAINT`], [`strip_seam_rail`]).
 ///
 /// The seam is an underline on the strip's own last row, not an overline on the
 /// first content row, which belongs to the session. On a chip-card band the
@@ -1734,6 +2593,9 @@ pub(crate) fn blank_cell(p: impl Into<ChromePalette>) -> RenderCell {
 /// Called once per strip rebuild from the row splice; recomputes the tones like
 /// [`blank_cell`].
 pub(crate) fn seal_strip_bottom(row: &mut [RenderCell], p: impl Into<ChromePalette>) {
+    if STRIP_WINDOWS_PAINT {
+        return;
+    }
     let Some(seam) = strip_colors(p).seam else {
         return;
     };
@@ -1747,6 +2609,79 @@ pub(crate) fn seal_strip_bottom(row: &mut [RenderCell], p: impl Into<ChromePalet
     }
 }
 
+/// The hairline closing the band against the terminal content on Windows
+/// ([`STRIP_WINDOWS_PAINT`]): a rail on the LAST `seam_px` pixel rows of the
+/// strip's last row (`row`), `frame_w` px wide, window edge to window edge, so
+/// it meets the grid and covers the gutters
+/// ([`aterm_render::chrome_rail_covers_gutters`] then retires the bleed's own
+/// gutter seam for that row). `None` without a band ([`STRIP_IS_CHROME_BAND`]),
+/// and on Linux, whose seam is a cell underline ([`seal_strip_bottom`]).
+///
+/// A rail, not a cell underline: an underline lands at the face's underline
+/// offset (row 19 of a 23 px Iosevka cell), which left a 4 px slab of band under
+/// the rule and the cards centred on it, high in the band (the 2026-10-17
+/// audit's `strip-seam-floats-above-band-edge`). The message band rails its
+/// seams the same way (`aterm_render::band`). The pixel band draws the same rule
+/// on its canvas's last rows ([`pixel_band::raster_band`]), since its opaque
+/// image covers the rail in the grid columns.
+///
+/// With a FOOT (`foot_px`, [`strip_foot_px`]) the canvas draws the rule that
+/// far above its last row and the floor's tone below it ([`StripFloor`]: the
+/// terminal's ground over the grid); the rail is then that tone, `foot_px` rows
+/// tall, so the gutters' band ends level with the rule's foot and the first row
+/// under the strip keeps the same air at the window's edges. The rule itself
+/// spans the grid's columns, inset like the text.
+///
+/// The rail is cached per `(frame_w, tone)` so a steady frame allocates nothing.
+#[must_use]
+pub(crate) fn strip_seam_rail(
+    row: u16,
+    frame_w: usize,
+    seam_px: usize,
+    foot_px: usize,
+    p: impl Into<ChromePalette>,
+    floor: StripFloor,
+) -> Option<aterm_core::render::ChromeRaster> {
+    if !STRIP_WINDOWS_PAINT {
+        return None;
+    }
+    let colors = strip_colors_on(p, floor);
+    let seam = colors.seam?;
+    let (tone, rail_h) = if foot_px > 0 {
+        (colors.foot, foot_px)
+    } else {
+        (seam, seam_px.max(1))
+    };
+    let seam = (u32::from(tone[0]) << 16) | (u32::from(tone[1]) << 8) | u32::from(tone[2]);
+    // The last rail laid: its width, its colour and its pixels.
+    type Rail = Option<(usize, u32, Arc<[u32]>)>;
+    thread_local! {
+        static RAIL: RefCell<Rail> = const { RefCell::new(None) };
+    }
+    let rail = RAIL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.as_ref() {
+            Some((w, c, rail)) if *w == frame_w && *c == seam => Arc::clone(rail),
+            _ => {
+                let rail: Arc<[u32]> = std::iter::repeat_n(seam, frame_w).collect();
+                *slot = Some((frame_w, seam, Arc::clone(&rail)));
+                rail
+            }
+        }
+    });
+    Some(aterm_core::render::ChromeRaster {
+        row,
+        ground: Arc::from(Vec::new()),
+        rail,
+        rail_h: u16::try_from(rail_h).unwrap_or(1),
+        clear_rail: false,
+        own: Vec::new(),
+        split: None,
+        rings: Vec::new(),
+        icons: Vec::new(),
+    })
+}
+
 /// Build the [`RenderCell`] for a strip cell from precomputed [`StripColors`] and the
 /// cell's [`StripRole`].
 fn strip_cell(ch: char, colors: &StripColors, role: StripRole) -> RenderCell {
@@ -1754,8 +2689,8 @@ fn strip_cell(ch: char, colors: &StripColors, role: StripRole) -> RenderCell {
     // seams it against the content below. Inactive tabs and the `+` are flat labels.
     let (fg, bg, bold, underline, underline_color) = match role {
         // On a chip-card band the filled card alone marks the selection: a cell
-        // underline would graze descenders, and [`seal_strip_bottom`] closes the
-        // band unbroken.
+        // underline would graze descenders, and the seam ([`strip_seam_rail`],
+        // [`seal_strip_bottom`] on Linux) closes the band unbroken.
         StripRole::Active if STRIP_CHIP_CARDS => (
             colors.active_fg,
             colors.active_bg,
@@ -1926,7 +2861,16 @@ pub(crate) fn paint_strip(
         subtitle: None,
         rename: None,
     };
-    let _ = paint_strip_impl(row, segments, titles, None, paint, active, theme.into());
+    let _ = paint_strip_impl(
+        row,
+        segments,
+        titles,
+        None,
+        paint,
+        active,
+        theme.into(),
+        StripFloor::Ground,
+    );
 }
 
 /// Per-frame paint inputs that are neither geometry nor colour: the hovered tab and
@@ -2009,6 +2953,7 @@ pub(crate) fn paint_strip_with_metadata(
             },
             ..ChromePalette::from(theme)
         },
+        StripFloor::Ground,
     )
     .0
 }
@@ -2016,10 +2961,11 @@ pub(crate) fn paint_strip_with_metadata(
 /// [`paint_strip_with_metadata`] plus the rename well's painted caret column
 /// (`None` when no rename field was drawn). The splice anchors the OS IME
 /// candidate window there while the rename field owns a composition
-/// ([`crate::app_input::PreeditOwner::Rename`]).
+/// ([`crate::app_input::PreeditOwner::Rename`]). The selected tab's cells take
+/// the surface it opens into over `floor` ([`StripFloor`]), as the band does.
 #[allow(
     clippy::too_many_arguments,
-    reason = "see `paint_strip_with_metadata`; identical inputs"
+    reason = "see `paint_strip_with_metadata`; identical inputs, plus what lies under the seam"
 )]
 pub(crate) fn paint_strip_with_metadata_and_rename_caret(
     row: &mut [RenderCell],
@@ -2029,6 +2975,7 @@ pub(crate) fn paint_strip_with_metadata_and_rename_caret(
     paint: StripPaint<'_>,
     active: usize,
     palette: ChromePalette,
+    floor: StripFloor,
 ) -> (Vec<(usize, ImageRef)>, Option<usize>) {
     paint_strip_impl(
         row,
@@ -2038,7 +2985,21 @@ pub(crate) fn paint_strip_with_metadata_and_rename_caret(
         paint,
         active,
         palette,
+        floor,
     )
+}
+
+/// The rename composition's frame cell: its painted caret when one fits,
+/// otherwise the start of the strip's last row. A missing strip has no anchor.
+/// The caller decides whether the rename field owns the composition.
+#[must_use]
+pub(crate) fn rename_ime_cursor_cell(
+    strip_rows: usize,
+    painted_col: Option<usize>,
+) -> Option<(usize, usize)> {
+    strip_rows
+        .checked_sub(1)
+        .map(|row| (row, painted_col.unwrap_or(0)))
 }
 
 #[allow(
@@ -2053,9 +3014,10 @@ fn paint_strip_impl(
     paint: StripPaint<'_>,
     active: usize,
     palette: ChromePalette,
+    floor: StripFloor,
 ) -> (Vec<(usize, ImageRef)>, Option<usize>) {
     // Derive the strip tones ONCE (frame-invariant), not per cell.
-    let colors = strip_colors_for(palette);
+    let colors = strip_colors_for_on(palette, floor);
     let mut images = Vec::new();
     // The rename well's caret column, when a rename field paints this frame —
     // at most one segment carries the field, so last-write-wins is exact.
@@ -2088,17 +3050,7 @@ fn paint_strip_impl(
             && !is_active
             && !seg.solo
             && matches!(seg.kind, TabHit::Select(i) if paint.hovered == Some(i));
-        // Drag-to-connect drop target: the chip under a live connection drag
-        // paints raised and accent-underlined (the `Update` treatment). Paint only.
-        let drop = match seg.kind {
-            TabHit::Select(i) => metadata
-                .and_then(|items| items.get(i))
-                .is_some_and(|item| item.drop_target),
-            _ => false,
-        };
-        let tab_role = if drop {
-            StripRole::Update
-        } else if is_active {
+        let tab_role = if is_active {
             StripRole::Active
         } else if is_hovered {
             StripRole::Hover
@@ -2146,18 +3098,8 @@ fn paint_strip_impl(
             // chip, underline or `✕`), title centred, description trailing dim.
             TabHit::Select(i) if seg.solo => {
                 let span = seg.end_col.saturating_sub(seg.start_col);
-                // The lone tab is still a drop target: the whole band takes the
-                // raised accent-underlined treatment during a drag.
-                let band_role = if drop {
-                    StripRole::Update
-                } else {
-                    StripRole::Inactive
-                };
-                let title_role = if drop {
-                    StripRole::Update
-                } else {
-                    StripRole::Title
-                };
+                let band_role = StripRole::Inactive;
+                let title_role = StripRole::Title;
                 for c in seg.start_col..seg.end_col {
                     put(row, c, ' ', band_role);
                 }
@@ -2257,13 +3199,12 @@ fn paint_strip_impl(
                     append_icon_images(&mut images, icon_start, kind, color);
                 }
                 if let (Some(item), Some(col)) = (item, layout.status_col) {
-                    let color = if item.dirty || item.attention >= ChipLevel::Wait {
-                        colors.accent
-                    } else if is_active {
+                    let ink = if is_active {
                         colors.fg
                     } else {
                         colors.inactive_fg
                     };
+                    let color = status_mark_ink(item, &colors, palette, ink);
                     append_status_image(&mut images, col, item, color);
                 }
                 // Title region follows the icon/status slots. The close column remains
@@ -2285,10 +3226,10 @@ fn paint_strip_impl(
                     );
                 } else {
                     // The distinct pass's label when it ran; otherwise (solo,
-                    // renaming, no band) the head-truncated title.
+                    // renaming, no band) the title's own cut ([`chip_cut`]).
                     let label = labels.get_mut(i).and_then(Option::take).unwrap_or_else(|| {
                         let avail = layout.title_end.saturating_sub(layout.title_start);
-                        truncate_title(raw, avail as usize)
+                        chip_cut(raw, avail as usize)
                     });
                     // In display cells, so a title never bleeds into the status
                     // canvas, the `✕` or the next chip.
@@ -2405,9 +3346,10 @@ fn paint_strip_impl(
                 let mid = seg.start_col + seg.end_col.saturating_sub(seg.start_col) / 2;
                 put(row, mid, mark, role);
             }
-            // `Close` / `Connector` are never a segment `kind` (only derived
-            // hits on `close_col` / `connector_col`).
-            TabHit::Close(_) | TabHit::Connector(_) => {}
+            // `Close` is never a segment `kind` (only a derived hit on
+            // `close_col`). The needs pill's regions keep the band's ground
+            // here; [`paint_strip_pill`] draws the pill over them.
+            TabHit::Close(_) | TabHit::Pill(_) => {}
         }
     }
     // The window's edges ([`strip_overflow`]): painted after the segments, on
@@ -2420,6 +3362,141 @@ fn paint_strip_impl(
     }
     images.sort_unstable_by_key(|(col, _)| *col);
     (images, rename_caret)
+}
+
+/// Half the length of the tab's own note's dash ([`ChipLevel::Note`]), in
+/// the 16-unit design box, before the four-mark shrink: shorter than a
+/// mark's diameter, so it reads as a dash, not a rule. The native chip
+/// draws the same one (`toolbar.rs`).
+pub(crate) const NOTE_DASH_HALF: f32 = 2.0;
+
+/// The ink a chip's status marks are drawn in (one image, one ink): a need's
+/// mark wears the border's tone — the stop tone for a stuck need, the wait
+/// tone for a decide need, held to AA on the band (the presence inks), as the
+/// native chip's red and amber do (owner surfaces §5) — else a dirty tab's the
+/// accent, else `ink`, the label's. The tab's own note (a failed command, a
+/// notice, [`ChipLevel::Note`]) is no need and wears no presence tone.
+fn status_mark_ink(
+    item: TabStripMetadata,
+    colors: &StripColors,
+    palette: ChromePalette,
+    ink: [u8; 3],
+) -> [u8; 3] {
+    let need = |stuck: bool| {
+        let inks = aterm_messages::presence::inks(
+            crate::chrome_band::presence_tones(palette),
+            colors.band_bg,
+        );
+        if stuck { inks.stop } else { inks.wait }
+    };
+    match item.attention {
+        ChipLevel::Stop(_) => need(true),
+        ChipLevel::Wait => need(false),
+        _ if item.dirty => colors.accent,
+        _ => ink,
+    }
+}
+
+/// [`status_mark_ink`] on the default theme's strip, for the host's tests.
+#[cfg(test)]
+pub(crate) fn status_mark_ink_for_test(item: TabStripMetadata, ink: [u8; 3]) -> [u8; 3] {
+    let theme = Theme::default();
+    status_mark_ink(
+        item,
+        &strip_colors_with_active(theme, None),
+        theme.into(),
+        ink,
+    )
+}
+
+/// Paint the window's NEEDS PILL into the strip row `row` over the columns
+/// its regions took ([`TabHit::Pill`], [`layout_segments_with_pill`]): each
+/// piece at its span of the same layout ([`strip_pill_layout`]), so what a
+/// click resolves to is what is drawn there. The glyph in the border's tone
+/// (the presence inks, AA on the band), the tab's label and the words in the
+/// strip's ink, each cut with `…` to its span; the act a bold underlined
+/// button in the accent; the `+N` dim. On the band's ground: no card, no
+/// wash, nothing that moves. Nothing is drawn where no region was laid out.
+pub(crate) fn paint_strip_pill(
+    row: &mut [RenderCell],
+    segments: &[TabSegment],
+    pill: StripPill<'_>,
+    palette: ChromePalette,
+) {
+    use crate::presence::{NeedSeverity, PillKind};
+    let Some(start) = segments
+        .iter()
+        .find(|seg| matches!(seg.kind, TabHit::Pill(_)))
+        .map(|seg| seg.start_col)
+    else {
+        return;
+    };
+    // The pill's share is of the cells left of the window's own buttons, as
+    // the layout measured it ([`layout_segments_with_caption_sized`]).
+    let cols = segments
+        .iter()
+        .find(|seg| matches!(seg.kind, TabHit::Caption(_)))
+        .map_or(u16::try_from(row.len()).unwrap_or(u16::MAX), |seg| {
+            seg.start_col
+        });
+    let Some(layout) = strip_pill_layout(cols, pill.words) else {
+        return;
+    };
+    let colors = strip_colors_for(palette);
+    let inks =
+        aterm_messages::presence::inks(crate::chrome_band::presence_tones(palette), colors.band_bg);
+    let tone = match pill.kind {
+        PillKind::Need(NeedSeverity::Stuck) => inks.stop,
+        PillKind::Need(NeedSeverity::Decide) => inks.wait,
+        PillKind::Yours => inks.yours,
+    };
+    let mut put = |span: aterm_messages::presence::Span, text: &str, fg: [u8; 3], button: bool| {
+        let from = start + 1 + cell_of(span.x);
+        let end = from + cell_of(span.w);
+        let text = truncate_title(text, usize::from(end - from));
+        let mut col = from;
+        for ch in text.chars() {
+            let ch = strip_char(ch);
+            let w = strip_char_cells(ch);
+            if col + w > end {
+                break;
+            }
+            if let Some(slot) = row.get_mut(usize::from(col)) {
+                let mut cell = strip_cell(ch, &colors, StripRole::Inactive);
+                cell.fg = fg;
+                cell.bold = button;
+                if button {
+                    cell.underline = UnderlineStyle::Single;
+                    cell.underline_color = Some(fg);
+                }
+                *slot = cell;
+            }
+            if w == 2
+                && let Some(slot) = row.get_mut(usize::from(col + 1))
+            {
+                let mut cell = strip_cell(' ', &colors, StripRole::Inactive);
+                cell.wide = true;
+                *slot = cell;
+            }
+            col += w;
+        }
+    };
+    let words = pill.words;
+    let mut glyph = [0u8; 4];
+    put(
+        layout.glyph,
+        words.glyph.encode_utf8(&mut glyph),
+        tone,
+        false,
+    );
+    put(layout.label, &words.label, colors.fg, false);
+    put(layout.words, &words.words, colors.fg, false);
+    if let Some((act, span)) = layout.act {
+        put(span, act.word(), colors.accent, true);
+    }
+    if let (Some(span), Some(more)) = (layout.more, words.more.as_deref()) {
+        put(span, more, colors.inactive_fg, false);
+    }
 }
 
 const ICON_RASTER_SIZE: u16 = 32;
@@ -2449,17 +3526,37 @@ fn status_primitives(metadata: TabStripMetadata) -> Vec<TabIconPrimitive> {
                 radius: 2.0 * s,
                 width: 1.25 * s,
             }),
-            // Attention level: hollow diamond for wait, filled for stop, a dot for
-            // story; the same marks the native chip draws (`toolbar.rs`).
+            // The need mark: a hollow diamond for a decide need, a filled one
+            // for a stuck need, the person's hold a hollow square, a finished
+            // task not yet looked at a dot, and the tab's own note (a failed
+            // command, a notice) a short dash — so a failed `grep` behind
+            // never reads as a finished worker; the same marks the native
+            // chip draws (`toolbar.rs`).
             TabStatusKind::Attention => {
                 let w = 1.15 * s;
                 let r = 2.5 * s;
                 match metadata.attention {
                     ChipLevel::Off => continue,
-                    ChipLevel::Story => {
+                    ChipLevel::Done => {
                         primitives.push(TabIconPrimitive::Dot {
                             center: [x, 8.0],
                             radius: 1.5 * s,
+                        });
+                        continue;
+                    }
+                    ChipLevel::Note => {
+                        primitives.push(TabIconPrimitive::Line {
+                            from: [x - NOTE_DASH_HALF * s, 8.0],
+                            to: [x + NOTE_DASH_HALF * s, 8.0],
+                            width: 1.25 * s,
+                        });
+                        continue;
+                    }
+                    ChipLevel::Yours => {
+                        primitives.push(TabIconPrimitive::RoundedRect {
+                            rect: [x - 2.2 * s, 8.0 - 2.2 * s, 4.4 * s, 4.4 * s],
+                            radius: 0.8 * s,
+                            width: 1.15 * s,
                         });
                         continue;
                     }
@@ -2962,6 +4059,134 @@ fn truncate_title(title: &str, max: usize) -> String {
     out
 }
 
+/// The mark a [`command_cut`] sets between the head it keeps and the end of
+/// the title's last argument: the ellipsis with a space on each side, 3 cells.
+const MIDDLE_MARK: &str = " \u{2026} ";
+
+/// A chip's cut of a title that does not fit `max` display cells: a command
+/// line keeps its last argument ([`command_cut`]), any other title its head
+/// ([`truncate_title`]). A title that fits is returned whole.
+fn chip_cut(title: &str, max: usize) -> String {
+    command_cut(title, max).unwrap_or_else(|| truncate_title(title, max))
+}
+
+/// A command line cut in the MIDDLE, so its last argument survives:
+/// `vim -n -R … src/platform_win.rs`, `less … CHANGELOG.md`. A head cut lost
+/// exactly what tells one such tab from another, vim's file (the 2026-10-18
+/// judges' `j3d-long-title-end-cut`); Windows Terminal and VS Code keep a
+/// path's meaningful end the same way.
+///
+/// The shape is two or more words whose last names a file or a path
+/// ([`names_a_file`]). The tail is sized first, as it is what names the tab:
+/// the last word whole, else its longest tail that starts a path component
+/// (`src/platform_win.rs`, then `platform_win.rs`), within what the first word
+/// and [`MIDDLE_MARK`] leave. The head then keeps as many whole leading words
+/// as the rest of `max` holds, a quoted argument kept whole, and at least the
+/// first. Where the first word, the mark and the file's own name do not fit
+/// together, the file is cut like a path, its longest such tail behind a
+/// leading `…` (`…platform_win.rs`). `None` when the title fits, is not of
+/// that shape, or not even the file's own name fits behind the mark: the head
+/// cut answers.
+///
+/// `None` too for a title that ENDS in `…`: its end is already cut off, so its
+/// last word is a fragment, not the file. The shell integrations end a command
+/// line they cut so (at 256 characters); a 64-character cut with no mark made
+/// the tab read `vim … crates/aterm-gui/src/plat` as if `plat` were the file
+/// (the 2026-10-18 judges' `J4F-1-cut64-middle-cut-misleads`). The head cut
+/// keeps the title's start and ends it with its own mark.
+fn command_cut(title: &str, max: usize) -> Option<String> {
+    if strip_display_cells(title) <= max {
+        return None;
+    }
+    let title = title.trim();
+    // A path with a blank in it is one name, cut as a path ([`path_chip_label`]).
+    if is_path_subject(title) || title.ends_with('\u{2026}') {
+        return None;
+    }
+    let (space, gap) = title
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())?;
+    let last = &title[space + gap.len_utf8()..];
+    let head = title[..space].trim_end();
+    if head.is_empty() || !names_a_file(last) {
+        return None;
+    }
+    let first = head
+        .split_once(char::is_whitespace)
+        .map_or(head, |(word, _)| word);
+    let mark = strip_display_cells(MIDDLE_MARK);
+    // The last word whole, then each tail after one of its separators,
+    // longest first; a trailing separator is no component of its own.
+    let word = last.trim_end_matches(['/', '\\']);
+    let tails: Vec<&str> = std::iter::once(last)
+        .chain(
+            word.char_indices()
+                .filter(|&(_, c)| matches!(c, '/' | '\\'))
+                .map(|(at, c)| &last[at + c.len_utf8()..]),
+        )
+        .filter(|tail| !tail.is_empty())
+        .collect();
+    let fits = |room: usize| {
+        tails
+            .iter()
+            .copied()
+            .find(move |tail| strip_display_cells(tail) <= room)
+    };
+    let Some(tail) = max
+        .checked_sub(strip_display_cells(first) + mark)
+        .and_then(&fits)
+    else {
+        // No room for the program beside the file: the file alone, behind
+        // the mark, as a tail cut (`…platform_win.rs`).
+        return max
+            .checked_sub(1)
+            .and_then(&fits)
+            .map(|tail| format!("\u{2026}{tail}"));
+    };
+    let head_room = max - mark - strip_display_cells(tail);
+    // Where the head may end: before a blank outside quotes, or its end.
+    let mut quote: Option<char> = None;
+    let mut kept = first;
+    for (at, c) in head.char_indices() {
+        match (quote, c) {
+            (Some(open), c) if c == open => quote = None,
+            (None, '\'' | '"') => quote = Some(c),
+            (None, c) if c.is_whitespace() => {
+                let words = head[..at].trim_end();
+                if strip_display_cells(words) > head_room {
+                    break;
+                }
+                kept = words;
+            }
+            _ => {}
+        }
+    }
+    if strip_display_cells(head) <= head_room {
+        kept = head;
+    }
+    Some(format!("{kept}{MIDDLE_MARK}{tail}"))
+}
+
+/// Whether a title's last word names a file or a path, as a command line's
+/// argument does: it holds a `/` or `\` with a name before or after it, or it
+/// ends in an extension (`.rs`, `.md`, `.json`: one to eight letters and
+/// digits, at least one a letter, after a name). A version (`0.106`), a
+/// sentence's last word and `e.g.` do not.
+fn names_a_file(word: &str) -> bool {
+    let word = word.trim_matches(|c: char| matches!(c, '\'' | '"' | ',' | ';' | ')' | '('));
+    if word.contains(['/', '\\']) {
+        return word.chars().any(|c| !matches!(c, '/' | '\\' | '.' | '~'));
+    }
+    word.rsplit_once('.').is_some_and(|(stem, ext)| {
+        !stem.is_empty()
+            && !stem.ends_with('.')
+            && (1..=8).contains(&ext.len())
+            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            && ext.chars().any(|c| c.is_ascii_alphabetic())
+    })
+}
+
 /// [`truncate_title`]'s mirror: keep the tail within `max` display cells, with a
 /// leading `…` for the cut head. Same whole-glyph rule. For titles that differ only
 /// at the end (`user@host: ~/aterm` vs `user@host: $HOME/trust`).
@@ -3013,8 +4238,9 @@ fn truncate_title_tail(title: &str, max: usize) -> String {
 /// tab instead.
 ///
 /// Rules, in order:
-/// - Every label is first cut head-first ([`truncate_title`]); a title that fits
-///   is shown whole.
+/// - Every label is first cut head-first ([`truncate_title`]), a command line
+///   whose last word names a file in the middle so that word survives
+///   ([`command_cut`]); a title that fits is shown whole.
 /// - Cut tabs cluster when their common prefix is at least half the smaller label
 ///   window. A cluster sheds its common suffix (snapped to a word boundary,
 ///   [`snap_shed`]), then cuts at the last word boundary inside the common head
@@ -3030,13 +4256,43 @@ fn truncate_title_tail(title: &str, max: usize) -> String {
 ///   its head flips nobody. A roomy strip keeps head cuts.
 /// - A path subject takes its own cut ([`path_chip_label`]): its end, told apart
 ///   from every other path in the window. Neither the cluster arm nor the flip
-///   re-cuts it; only twins still take an ordinal ([`path_ordinal_label`]).
+///   re-cuts it; twins still take an ordinal, a path twin with its path's own
+///   cut behind it ([`path_ordinal_label`]).
 fn distinct_chip_labels(
     segments: &[TabSegment],
     titles: &[String],
     metadata: Option<&[TabStripMetadata]>,
     active: usize,
     renaming: Option<usize>,
+) -> Vec<Option<String>> {
+    distinct_chip_labels_in(segments, titles, metadata, active, renaming, 1.0)
+}
+
+/// A chip's title budget, in display cells, for `cells` cell columns of title
+/// space set at `widen` display cells per column ([`distinct_chip_labels_in`]).
+fn widened_budget(cells: usize, widen: f32) -> usize {
+    if widen.is_finite() && widen > 1.0 {
+        (cells as f32 * widen).floor() as usize
+    } else {
+        cells
+    }
+}
+
+/// [`distinct_chip_labels`] with every chip's title budget widened to `widen`
+/// display cells per cell column. The cell lane passes 1.0. The pixel band sets
+/// its titles in the UI face, whose average character is narrower than a
+/// terminal cell ([`pixel_band::ui_cells_per_cell`]), so cutting there in cell
+/// columns left a 127 px card reading `Settin…` and half-empty labels (the
+/// 2026-10-17 audit's `tab-label-cut-by-cell-count`); it cuts in UI-sized cells
+/// and its pixel fit trims what the average overestimated. Pressure is still
+/// read off the segments' own widths.
+fn distinct_chip_labels_in(
+    segments: &[TabSegment],
+    titles: &[String],
+    metadata: Option<&[TabStripMetadata]>,
+    active: usize,
+    renaming: Option<usize>,
+    widen: f32,
 ) -> Vec<Option<String>> {
     let mut labels: Vec<Option<String>> = vec![None; titles.len()];
     // Clamp `active` as `layout_segments` does, so the twin exemption applies to
@@ -3074,14 +4330,17 @@ fn distinct_chip_labels(
         }
         let item = metadata.and_then(|items| items.get(i)).copied();
         let layout = tab_content_layout(seg, item.unwrap_or(PLAIN_TAB));
-        let avail = usize::from(layout.title_end.saturating_sub(layout.title_start));
+        let avail = widened_budget(
+            usize::from(layout.title_end.saturating_sub(layout.title_start)),
+            widen,
+        );
         let raw = titles[i].as_str();
         let over = strip_display_cells(raw) > avail;
         // A path keeps its end: its head is ancestry every tab shares. The path's
         // own cut is the same whichever branch labels it, so its chip holds still.
         path_cut[i] = over && is_path_subject(raw);
         let path = path_cut[i].then(|| path_chip_label(i, &subjects, avail));
-        labels[i] = Some(path.unwrap_or_else(|| truncate_title(raw, avail)));
+        labels[i] = Some(path.unwrap_or_else(|| chip_cut(raw, avail)));
         if over {
             cut.push((i, avail));
         }
@@ -3191,12 +4450,20 @@ fn distinct_chip_labels(
         } else {
             family_tail
         };
+        // A path twin's ordinal with the path's own cut behind it, where the
+        // window affords one: the subject the active twin shows
+        // (`2 · …\work\sub dir`). A family of identical paths used to leave the
+        // quiet twin a word-tail (`2 · …dir`, cut at the space in `sub dir`).
+        let path_ordinal = (twins >= 2 && i != active && path_cut[i])
+            .then(|| path_ordinal_label(i, &subjects, avail))
+            .filter(|label| !family_of_twins || label.contains(" · "));
         let label = if twins >= 2 && i != active {
-            if path_cut[i] && !family_of_twins {
-                // A path twin among other members carries the path's own cut
-                // behind its ordinal; the family cut would split the directory
-                // name.
-                path_ordinal_label(i, &subjects, avail)
+            if let Some(label) = path_ordinal {
+                // Among other members the path's own cut, bare or not: the
+                // family cut would split the directory name. In a family of
+                // twins only a cut with a tail; a bare number leaves the
+                // family's own context ([`twin_tail`]) to speak.
+                label
             } else {
                 ordinal_chip_label(i, &titles[i], core, remainder, avail, furniture, tail_cut)
             }
@@ -3423,6 +4690,18 @@ fn family_tail(core: &str, remainder: &str, room: usize) -> String {
 /// separator keeps its family cut (`…toml`). The head is `core`'s, so a prompt
 /// head (`user@host: `) is never dropped without its mark.
 fn twin_tail(core: &str, remainder: &str, room: usize) -> String {
+    // Twins share their whole title, so `remainder` is past the title's last
+    // blank. Where that blank is inside the last path component (`…/work/ünï 日本`,
+    // `…\work\sub dir`) it is no boundary of the subject: the subject is the
+    // whole core, cut at its separators below.
+    let remainder = if !remainder.is_empty()
+        && !remainder.contains(['/', '\\'])
+        && core.contains(['/', '\\'])
+    {
+        ""
+    } else {
+        remainder
+    };
     let family = family_tail(core, remainder, room);
     let subject = if remainder.is_empty() {
         core
@@ -3777,11 +5056,6 @@ pub(crate) mod pixel_band {
     use crate::type_scale::TypeStep;
     use crate::widget::{DrawPrim, TextFace, TextWeight, rgba, text_prim};
 
-    /// The band label's logical size: the settings tray's chrome base (13 px at
-    /// 96 dpi ≈ 10 pt), not the terminal `font_px`. Scaled by the window's scale
-    /// factor and capped against the band height.
-    const STRIP_LABEL_LOGICAL_PX: f32 = 13.0;
-
     /// The band owns its surfaces: the raster paints the band fill, rounded cards,
     /// the hover wash and the `+` button, as an opaque bar with cards centred
     /// between the band top and the seam, px gutters and rounded corners.
@@ -3813,13 +5087,24 @@ pub(crate) mod pixel_band {
         pub band_top_px: usize,
         /// The window's scale factor (drives the label size).
         pub scale: f32,
-        /// Canvas y (device px from the optical band's top) of the seam underline's
-        /// top row: `band_top_px + (strip_rows − 1)·cell_h + DecoMetrics::underline_y`,
-        /// resolved through the renderer's deco law (`Backend::deco_metrics_for`).
-        /// Cards are centred in `[0, seam_top_px)` and kept clear of the rule;
-        /// `None` (no resolved deco law, test fixtures) clears a hairline off the
-        /// canvas bottom instead.
+        /// Canvas y (device px from the optical band's top) of the seam's top
+        /// row. On Windows ([`STRIP_WINDOWS_PAINT`]) the canvas's last
+        /// [`strip_seam_px`] rows, `band_top_px + strip_rows·cell_h −
+        /// strip_seam_px(scale)`, where the strip's rail ([`strip_seam_rail`])
+        /// runs too, and the raster draws the rule there; on Linux the seam
+        /// underline's top row, `band_top_px + (strip_rows − 1)·cell_h +
+        /// DecoMetrics::underline_y` through the renderer's deco law
+        /// (`Backend::deco_metrics_for`), which the cell lane stamps over the
+        /// raster ([`seal_strip_bottom`]). Cards are centred in
+        /// `[0, seam_top_px)` and kept clear of the rule; `None` (test fixtures)
+        /// clears a hairline off the canvas bottom and draws no rule. On Windows
+        /// it sits [`Self::foot_px`] above the canvas's last row.
         pub seam_top_px: Option<usize>,
+        /// The band's FOOT on Windows: the canvas's last rows, under the seam,
+        /// in the terminal's ground ([`StripColors::ground`]), so the grid's
+        /// first row keeps air under the rule ([`strip_foot_px`]). 0 elsewhere
+        /// and on a compact band.
+        pub foot_px: usize,
     }
 
     /// Everything the band raster depends on. The caller caches the result keyed
@@ -3835,6 +5120,9 @@ pub(crate) mod pixel_band {
         /// The header's palette, its authored `active_tab_color` included.
         pub palette: ChromePalette,
         pub geometry: BandGeometry,
+        /// What lies under the seam this frame ([`StripFloor`]): the selected
+        /// tab's surface and the foot's tone.
+        pub floor: StripFloor,
     }
 
     impl BandInput<'_> {
@@ -3882,7 +5170,7 @@ pub(crate) mod pixel_band {
         // The band's ONE reading of the selection ([`BandInput::selected`]) —
         // resolved at the entry, before anything paints or measures.
         let active = input.selected();
-        let colors = strip_colors_for(input.palette);
+        let colors = strip_colors_for_on(input.palette, input.floor);
         let scale = if geometry.scale.is_finite() && geometry.scale > 0.0 {
             geometry.scale
         } else {
@@ -3925,6 +5213,51 @@ pub(crate) mod pixel_band {
             radius: 0.0,
             fill: rgba(colors.band_bg, 255),
         });
+        // The seam on the canvas's last rows, where the strip's rail runs in the
+        // gutters ([`strip_seam_rail`]): this opaque canvas covers the rail in
+        // the grid columns, so it draws the same rule itself, and under it the
+        // band's foot ([`BandGeometry::foot_px`]) in the floor's tone
+        // ([`StripColors::foot`]). On Linux the cell lane stamps its underline
+        // seam over this raster ([`seal_strip_bottom`]).
+        if STRIP_WINDOWS_PAINT
+            && let (Some(seam_top), Some(seam)) = (geometry.seam_top_px, colors.seam)
+            && seam_top < img_h
+        {
+            let foot_top = img_h.saturating_sub(geometry.foot_px).max(seam_top);
+            prims.push(DrawPrim::Panel {
+                x: 0.0,
+                y: seam_top as f32,
+                w: img_w as f32,
+                h: (foot_top - seam_top) as f32,
+                radius: 0.0,
+                fill: rgba(seam, 255),
+            });
+            if foot_top < img_h {
+                prims.push(DrawPrim::Panel {
+                    x: 0.0,
+                    y: foot_top as f32,
+                    w: img_w as f32,
+                    h: (img_h - foot_top) as f32,
+                    radius: 0.0,
+                    fill: rgba(colors.foot, 255),
+                });
+            }
+        }
+        // The selected tab opens through the seam where it IS what lies under
+        // it ([`StripFloor`]: the grid's ground, the pane headers, a native
+        // page); over a band it cannot take, an `active_tab_color`, or High
+        // Contrast's selection, it stands on the seam instead.
+        let opens = design.tabs && colors.active_bg == colors.foot;
+        // The seam's thickness, which a selected tab's rim takes, and the
+        // canvas row below the rule.
+        let seam_rows = strip_seam_px(scale).max(1);
+        let seam_bottom = geometry
+            .seam_top_px
+            .map(|top| (top + seam_rows).min(img_h) as f32);
+        // Every tab segment in order, `(start, end, lit, band)`: lit when it is
+        // selected or hovered, band when this raster draws it rather than the
+        // cell lane. The hairlines between quiet neighbours read it.
+        let mut drawn_tabs: Vec<(u16, u16, bool, bool)> = Vec::new();
 
         // Resolve all chip labels in one pass (the cell painter's rule), and the
         // pixel fit with them ([`resolve_band_labels`]): a second truncation done
@@ -3942,9 +5275,11 @@ pub(crate) mod pixel_band {
                 && !seg.solo
                 && matches!(seg.kind, TabHit::Select(i) if input.paint.hovered == Some(i));
             match seg.kind {
-                // The status-mark cell ([`TabHit::Connector`]) has no band design
-                // yet, so those columns go to the cell painter, like solo.
-                TabHit::Connector(_) => {
+                // The needs pill's regions go to the cell painter, like solo:
+                // the cell lane draws the pill ([`paint_strip_pill`]) by the
+                // layout its hit regions are cut from, so the band never
+                // re-measures it in another face.
+                TabHit::Pill(_) => {
                     fallback.push((seg.start_col, end));
                 }
                 TabHit::Select(i) if seg.solo => {
@@ -3958,6 +5293,7 @@ pub(crate) mod pixel_band {
                         // The inline rename WELL (field, caret, ‹› markers, IME
                         // preedit splice) stays the shipped cell machinery.
                         fallback.push((seg.start_col, end));
+                        drawn_tabs.push((seg.start_col, end, is_active || is_hovered, false));
                         continue;
                     }
                     let item = input.metadata.get(i).copied();
@@ -3969,10 +5305,42 @@ pub(crate) mod pixel_band {
                     // glyph-level fit ([`fit_labels_distinctly`]).
                     let label: String =
                         labels.get_mut(i).and_then(Option::take).unwrap_or_default();
-                    if !crate::tray_raster::strip_band_run_coverable(&label) {
-                        fallback.push((seg.start_col, end));
-                        continue;
-                    }
+                    // The face the label is set in: semibold only for the
+                    // selected tab, where the design says the selection earns
+                    // it. Its East Asian faces are that weight's.
+                    let label_face = if is_active && design.active_semibold {
+                        TextFace::UiBold
+                    } else {
+                        TextFace::Ui
+                    };
+                    // A title the UI stack cannot draw whole is drawn here too,
+                    // its colour emoji inline ([`emoji_label`]), in the tab like
+                    // every other; only a cluster that is no colour emoji and
+                    // no face maps leaves the title to the cell lane (a CJK
+                    // title is not one: the faces it needs at the label's
+                    // weight are parsed for it, `strip_band_run_coverable_in`).
+                    let pieces =
+                        if crate::tray_raster::strip_band_run_coverable_in(label_face, &label) {
+                            None
+                        } else {
+                            let title = input.titles.get(i).map_or("", String::as_str);
+                            // Windows only (STRIP_WINDOWS_PAINT): Linux keeps its
+                            // strip as it was until that lane is reviewed.
+                            let Some(pieces) = STRIP_WINDOWS_PAINT
+                                .then(|| emoji_label(title, label_px, label_face))
+                                .flatten()
+                            else {
+                                fallback.push((seg.start_col, end));
+                                drawn_tabs.push((
+                                    seg.start_col,
+                                    end,
+                                    is_active || is_hovered,
+                                    false,
+                                ));
+                                continue;
+                            };
+                            Some(pieces)
+                        };
                     // This tab's card: a rounded rect inset from the segment's cell
                     // span by the design's gutter, centred between the band top and
                     // the seam. The whole segment stays the hit region.
@@ -3989,7 +5357,62 @@ pub(crate) mod pixel_band {
                         if let Some(bg) = card_bg {
                             let x0 = f32::from(seg.start_col).mul_add(cw, design.gap_h);
                             let x1 = f32::from(end).mul_add(cw, -design.gap_h);
-                            if x1 > x0 {
+                            if x1 > x0 && design.tabs {
+                                // A tab: its top corners round, it stands on the
+                                // seam, and the selected one runs on through the
+                                // seam and the foot into the grid. Drawn a radius
+                                // past its foot under a clip, so only the top
+                                // corners show.
+                                let foot = if is_active && opens {
+                                    img_h as f32
+                                } else {
+                                    design.card_bot
+                                };
+                                prims.push(DrawPrim::ClipPush {
+                                    x: x0,
+                                    y: 0.0,
+                                    w: x1 - x0,
+                                    h: foot,
+                                });
+                                prims.push(DrawPrim::Panel {
+                                    x: x0,
+                                    y: design.card_top,
+                                    w: x1 - x0,
+                                    h: foot - design.card_top + design.radius,
+                                    radius: design.radius,
+                                    fill: rgba(bg, 255),
+                                });
+                                prims.push(DrawPrim::ClipPop);
+                                // A selected tab its fill alone would leave
+                                // faint on the band ([`TAB_RIM_BELOW`]) wears
+                                // the seam round its sides and top: an open
+                                // tab's sides run down through the seam rows
+                                // to meet the rule either side of it.
+                                if is_active && let Some(rim) = colors.active_rim {
+                                    let t = seam_rows as f32;
+                                    let bottom = if opens {
+                                        seam_bottom.unwrap_or(design.card_bot)
+                                    } else {
+                                        design.card_bot
+                                    };
+                                    prims.push(DrawPrim::ClipPush {
+                                        x: x0,
+                                        y: 0.0,
+                                        w: x1 - x0,
+                                        h: bottom,
+                                    });
+                                    prims.push(DrawPrim::Stroke {
+                                        x: x0 + t * 0.5,
+                                        y: design.card_top + t * 0.5,
+                                        w: x1 - x0 - t,
+                                        h: foot - design.card_top + design.radius,
+                                        radius: (design.radius - t * 0.5).max(0.0),
+                                        width: t,
+                                        color: rgba(rim, 255),
+                                    });
+                                    prims.push(DrawPrim::ClipPop);
+                                }
+                            } else if x1 > x0 {
                                 prims.push(DrawPrim::Panel {
                                     x: x0,
                                     y: design.card_top,
@@ -4000,25 +5423,21 @@ pub(crate) mod pixel_band {
                                 });
                             }
                         }
+                        drawn_tabs.push((seg.start_col, end, is_active || is_hovered, true));
                     }
                     // Inks follow the surface each label sits on (selected card,
-                    // hover wash, quiet chip, or bare band). Semibold only where the
-                    // design says the selection earns it.
+                    // hover wash, quiet chip, or bare band), in `label_face`.
                     let (ink, face) = {
-                        let active_face = if design.active_semibold {
-                            TextFace::UiBold
-                        } else {
-                            TextFace::Ui
-                        };
-                        if is_active {
-                            (colors.active_fg, active_face)
+                        let ink = if is_active {
+                            colors.active_fg
                         } else if is_hovered {
-                            (colors.hover_fg, TextFace::Ui)
+                            colors.hover_fg
                         } else if design.quiet_cards {
-                            (colors.chip_fg, TextFace::Ui)
+                            colors.chip_fg
                         } else {
-                            (colors.inactive_fg, TextFace::Ui)
-                        }
+                            colors.inactive_fg
+                        };
+                        (ink, label_face)
                     };
                     // No leading `│` separator: cards and gutters carry the
                     // structure.
@@ -4037,27 +5456,57 @@ pub(crate) mod pixel_band {
                         );
                     }
                     if let (Some(item), Some(col)) = (item, layout.status_col) {
-                        let color = if item.dirty || item.attention >= ChipLevel::Wait {
-                            colors.accent
+                        // One ink per surface (see the icon above), unless a
+                        // need's mark wears the border's tone.
+                        let color = status_mark_ink(item, &colors, input.palette, ink);
+                        // The marks fill about a third of their 16-unit design box,
+                        // so on Windows ([`STRIP_WINDOWS_PAINT`]) the box is sized
+                        // off the label (21 px at 100%): a busy ring about 5 px
+                        // across, where a cell-sized box drew it at under 3 px,
+                        // dust beside the ✕. It still sits between the gap cells
+                        // that flank the status cell. Linux keeps the cell box.
+                        let mark_box = if STRIP_WINDOWS_PAINT {
+                            label_px * 1.6
                         } else {
-                            // One ink per surface (see the icon above).
-                            ink
+                            cw * 1.2
                         };
                         draw_icon_prims(
                             &mut prims,
                             &status_primitives(item),
                             (f32::from(col) + 0.5) * cw,
                             cy,
-                            (cw * 1.2).min(band_h * 0.8).max(5.0),
+                            mark_box.min(band_h * 0.8).max(5.0),
                             color,
                         );
                     }
                     // The title, clipped to its span so it never bleeds into the
-                    // status canvas, the ✕ or the next chip. The Windows lane keeps
-                    // left alignment; the design lane centres the run in its span.
+                    // status canvas, the ✕ or the next chip, placed by
+                    // [`label_x`]: leading on Windows, centred elsewhere.
                     let x0 = f32::from(layout.title_start) * cw;
                     let span_px = f32::from(avail) * cw - 1.0;
-                    if span_px > 1.0 && !label.trim().is_empty() {
+                    if let Some(pieces) = pieces {
+                        if span_px > 1.0 {
+                            draw_emoji_label(
+                                &mut prims,
+                                &mut overlays,
+                                &pieces,
+                                EmojiLabelAt {
+                                    x0,
+                                    span_px,
+                                    baseline,
+                                    cy,
+                                    label_px,
+                                    height: img_h,
+                                },
+                                face,
+                                variable_pen
+                                    .as_ref()
+                                    .filter(|_| is_active && wants_semibold),
+                                ink,
+                                colors.active_bg,
+                            );
+                        }
+                    } else if span_px > 1.0 && !label.trim().is_empty() {
                         // The active label through the wght axis when the host has a
                         // variable UI face and the lane wants semibold. The whole
                         // label must shape on that face first; any char its cmap
@@ -4067,11 +5516,31 @@ pub(crate) mod pixel_band {
                         // shaped whole is fitted, at the glyph level.
                         let varied = if is_active && wants_semibold {
                             variable_pen.as_ref().and_then(|pen| {
-                                let run = pen.shape(&label, label_px)?;
+                                let mut run = pen.shape(&label, label_px)?;
+                                // The pen's advances can overrun the static
+                                // semibold's the cut was measured with; a cut
+                                // that keeps its end (a path's, a command's
+                                // file) is re-cut by its own rule against this
+                                // pen, never head-cut by `fit`.
+                                if run.width > span_px && cut_keeps_its_end(&label) {
+                                    let width = |s: &str| {
+                                        pen.shape(s, label_px).map_or(f32::INFINITY, |r| r.width)
+                                    };
+                                    run = pen.shape(
+                                        &fit_label(label.clone(), span_px, width),
+                                        label_px,
+                                    )?;
+                                }
                                 let run = pen.fit(run, span_px, label_px)?;
-                                let x = ((span_px - run.width) * 0.5).max(0.0) + x0;
+                                let x = label_x(x0, span_px, run.width);
                                 Some(variable_label_overlay(
-                                    &run, x, baseline, img_h, span_px, ink,
+                                    &run,
+                                    x,
+                                    baseline,
+                                    img_h,
+                                    span_px,
+                                    ink,
+                                    colors.active_bg,
                                 ))
                             })
                         } else {
@@ -4083,10 +5552,10 @@ pub(crate) mod pixel_band {
                                 // No second fit: the string is already cut to this
                                 // span with this face ([`resolve_band_labels`]), and a
                                 // per-chip fit could make two chips identical.
-                                // Centred by the same measure the pen draws with.
+                                // Placed by the same measure the pen draws with.
                                 let width =
                                     crate::tray_raster::ui_text_width_for(face, &label, label_px);
-                                let x = ((span_px - width) * 0.5).max(0.0) + x0;
+                                let x = label_x(x0, span_px, width);
                                 prims.push(DrawPrim::ClipPush {
                                     x: x0,
                                     y: 0.0,
@@ -4147,22 +5616,47 @@ pub(crate) mod pixel_band {
                         let seg1 = f32::from(end) * cw;
                         let center = (seg0 + seg1) * 0.5;
                         let card_h = design.card_bot - design.card_top;
-                        let side = card_h.min(seg1 - seg0 - 2.0 * design.gap_h);
                         let hot = input.paint.new_tab_hovered;
-                        if design.quiet_button && side > 4.0 {
-                            prims.push(DrawPrim::Panel {
-                                x: center - side * 0.5,
-                                y: design.card_top + (card_h - side) * 0.5,
-                                w: side,
-                                h: side,
-                                radius: design.radius.min(side * 0.5),
-                                fill: rgba(if hot { colors.hover_bg } else { colors.chip_bg }, 255),
-                            });
+                        if design.tabs {
+                            // A bare `+` on a tab row; under the pointer a
+                            // rounded square of the hover wash centred on it.
+                            let side = (label_px * 1.85)
+                                .round()
+                                .min(card_h)
+                                .min(seg1 - seg0 - 2.0 * design.gap_h);
+                            if hot && side > 4.0 {
+                                prims.push(DrawPrim::Panel {
+                                    x: center - side * 0.5,
+                                    y: (cy - side * 0.5)
+                                        .clamp(design.card_top, design.card_bot - side),
+                                    w: side,
+                                    h: side,
+                                    radius: (4.0 * scale).round().min(side * 0.5),
+                                    fill: rgba(colors.hover_bg, 255),
+                                });
+                            }
+                        } else {
+                            let side = card_h.min(seg1 - seg0 - 2.0 * design.gap_h);
+                            if design.quiet_button && side > 4.0 {
+                                prims.push(DrawPrim::Panel {
+                                    x: center - side * 0.5,
+                                    y: design.card_top + (card_h - side) * 0.5,
+                                    w: side,
+                                    h: side,
+                                    radius: design.radius.min(side * 0.5),
+                                    fill: rgba(
+                                        if hot { colors.hover_bg } else { colors.chip_bg },
+                                        255,
+                                    ),
+                                });
+                            }
                         }
-                        let ink = match (design.quiet_button, hot) {
-                            (true, false) => colors.chip_button_fg,
-                            (true, true) => colors.button_hover_fg,
-                            (false, _) => colors.fg,
+                        let ink = if hot && (design.quiet_button || design.tabs) {
+                            colors.button_hover_fg
+                        } else if design.quiet_button {
+                            colors.chip_button_fg
+                        } else {
+                            colors.fg
                         };
                         (center, rgba(ink, 255))
                     };
@@ -4294,6 +5788,36 @@ pub(crate) mod pixel_band {
                 TabHit::Close(_) => {}
             }
         }
+        // A tab row's hairline between two quiet neighbours (WinUI's tab
+        // separator): where neither side is selected or hovered, a seam-ink line
+        // on the boundary, centred on the labels, so a row of bare titles still
+        // reads as separate tabs — whichever lane draws each label
+        // ([`hairline_x`]).
+        if design.tabs
+            && let Some(seam) = colors.seam
+        {
+            let tab_h = design.card_bot - design.card_top;
+            let len = (16.0 * scale).round().min(tab_h * 0.6).max(4.0);
+            let w = scale.floor().max(1.0);
+            let y = (cy - len * 0.5).clamp(design.card_top, design.card_bot - len);
+            for pair in drawn_tabs.windows(2) {
+                let ((_, a_end, a_lit, a_band), (b_start, _, b_lit, b_band)) = (pair[0], pair[1]);
+                if a_lit || b_lit || a_end != b_start {
+                    continue;
+                }
+                let Some(x) = hairline_x(f32::from(a_end) * cw, w, a_band, b_band) else {
+                    continue;
+                };
+                prims.push(DrawPrim::Panel {
+                    x,
+                    y: y.round(),
+                    w,
+                    h: len,
+                    radius: 0.0,
+                    fill: rgba(seam, 255),
+                });
+            }
+        }
         // The window's edge marks ([`strip_overflow`]), drawn here on the same
         // optical centre (`cy`) as every other piece of furniture; the cell lane
         // can only place them on the cell baseline. Code-native strokes like the
@@ -4404,13 +5928,146 @@ pub(crate) mod pixel_band {
         Some(rows)
     }
 
-    /// The label size for a `band_h`-px optical band at `scale`: the logical size
-    /// scaled, capped against the band, floored at a legible minimum.
+    /// Whether chip titles start at their span's leading edge rather than centre
+    /// in it: Windows, where Fluent's TabView (Windows Terminal, Edge) leads the
+    /// title after the icon, and a centred title in a wide chip floated with
+    /// empty card on both sides. Linux keeps the centred design.
+    const LABELS_LEAD: bool = cfg!(windows);
+
+    /// Where a `width`-px title starts in its `span_px` span at `x0`
+    /// ([`LABELS_LEAD`]); a title wider than its span starts at `x0` either way.
+    fn label_x(x0: f32, span_px: f32, width: f32) -> f32 {
+        if LABELS_LEAD {
+            x0
+        } else {
+            ((span_px - width) * 0.5).max(0.0) + x0
+        }
+    }
+
+    /// Where the `w`-px hairline between two quiet tabs that meet at device x
+    /// `boundary` starts. Centred on the boundary when the band draws both
+    /// tabs. When the cell lane draws one of them (a title no face maps, the
+    /// rename well), that tab's columns are not the band's and would drop half
+    /// the line or all of it, so the line lies wholly on the band's side,
+    /// against the boundary. `None` when the cell lane draws both: the band
+    /// owns no pixel there.
+    fn hairline_x(boundary: f32, w: f32, a_band: bool, b_band: bool) -> Option<f32> {
+        let boundary = boundary.round();
+        match (a_band, b_band) {
+            (true, true) => Some(boundary - (w * 0.5).floor()),
+            (true, false) => Some(boundary - w),
+            (false, true) => Some(boundary),
+            (false, false) => None,
+        }
+    }
+
+    /// A sample of what chip titles are made of (words, a path, a prompt's
+    /// punctuation, digits), whose mean advance stands for a title's.
+    const TITLE_SAMPLE: &str = "Claude Code: fix tab labels ~/src/aterm-gui MINGW64 pwsh 0.106";
+
+    /// How many characters of a title the UI face sets in one terminal cell
+    /// column (`cell_w` px) at `label_px`: the cell width over [`TITLE_SAMPLE`]'s
+    /// mean advance, in `[1, 2]`. The chip labels are cut with this many display
+    /// cells per column ([`distinct_chip_labels_in`]); the pixel fit then trims
+    /// whatever a title of wider letters overruns. 1 before the UI face lands,
+    /// and on Linux, which keeps cutting in terminal cells
+    /// ([`STRIP_WINDOWS_PAINT`]).
+    pub(super) fn ui_cells_per_cell(cell_w: f32, label_px: f32) -> f32 {
+        if !STRIP_WINDOWS_PAINT || !crate::tray_raster::strip_band_ui_ready() || cell_w <= 0.0 {
+            return 1.0;
+        }
+        let chars = TITLE_SAMPLE.chars().count() as f32;
+        let mean =
+            crate::tray_raster::ui_text_width_for(TextFace::Ui, TITLE_SAMPLE, label_px) / chars;
+        if mean.is_finite() && mean > 0.0 {
+            (cell_w / mean).clamp(1.0, 2.0)
+        } else {
+            1.0
+        }
+    }
+
+    /// Each tab's wanted width in columns ([`TabSizing::wants`]) on a band
+    /// `band_h` px tall at `scale` with `cell_w`-px columns: the narrowest chip
+    /// ([`chip_title_cols`], the tab's own chrome) whose title span seats the
+    /// whole title in the UI face at the band's label size, by its pixels and by
+    /// the cells the label cut counts ([`ui_cells_per_cell`]), plus a column of
+    /// slack for the selected label's variable pen. Measured semibold, the
+    /// selected weight, so selecting a tab never resizes it; a leading status
+    /// glyph before a space (a spinner frame: Claude Code's `✳ `, a braille
+    /// frame) counts as a fixed em, so a spinner's frames never move the `✕`.
+    /// 0 (the cap) for a title the band cannot draw (the cell lane's) and before
+    /// the UI face lands.
+    pub(crate) fn tab_wants(
+        titles: &[String],
+        metadata: &[TabStripMetadata],
+        cell_w: usize,
+        band_h: usize,
+        scale: f32,
+    ) -> Vec<u16> {
+        if !STRIP_WINDOWS_PAINT || !crate::tray_raster::strip_band_ui_ready() || cell_w == 0 {
+            return Vec::new();
+        }
+        let label_px = band_label_px(band_h as f32, scale);
+        let cw = cell_w as f32;
+        let widen = ui_cells_per_cell(cw, label_px);
+        titles
+            .iter()
+            .enumerate()
+            .map(|(i, title)| {
+                if title.is_empty() {
+                    return 0;
+                }
+                let measure =
+                    |s: &str| crate::tray_raster::ui_text_width_for(TextFace::UiBold, s, label_px);
+                // Asked semibold too: the faces measured are the selected
+                // weight's (its East Asian faces Yu Gothic UI Semibold and
+                // Malgun Gothic Bold), parsed for it.
+                let (px, by_cells) =
+                    if crate::tray_raster::strip_band_run_coverable_in(TextFace::UiBold, title) {
+                        let cells = (strip_display_cells(title) as f32 / widen).ceil();
+                        (measure(&steady_title(title)), cells)
+                    } else if let Some(pieces) = emoji_label(title, label_px, TextFace::UiBold) {
+                        // A title with colour emoji ([`emoji_label`]), drawn from its
+                        // pieces, never cut by the cell pass.
+                        let px = pieces
+                            .iter()
+                            .map(|piece| match piece {
+                                LabelPiece::Text(text) => measure(text),
+                                LabelPiece::Emoji(_) => emoji_advance_px(label_px),
+                            })
+                            .sum();
+                        (px, 0.0)
+                    } else {
+                        return 0;
+                    };
+                let by_px = ((px + 1.0) / cw).ceil();
+                let need = (by_px.max(by_cells) + 1.0).clamp(1.0, 4096.0) as u16;
+                let chrome = metadata.get(i).copied().unwrap_or(PLAIN_TAB);
+                (need..need.saturating_add(16))
+                    .find(|&width| chip_title_cols(width, chrome) >= need)
+                    .unwrap_or(need.saturating_add(16))
+            })
+            .collect()
+    }
+
+    /// `title` as [`tab_wants`] measures it: a leading status glyph before a
+    /// space (a spinner frame: Claude Code's `✳ `, `·`, a braille frame) stood
+    /// in for by `M`, a wide letter, so every frame of a spinning title wants
+    /// one width and never moves the `✕`; any other title unchanged.
+    fn steady_title(title: &str) -> std::borrow::Cow<'_, str> {
+        let mut chars = title.chars();
+        match (chars.next(), chars.next()) {
+            (Some(mark), Some(' ')) if !mark.is_alphanumeric() => {
+                std::borrow::Cow::Owned(format!("M{}", &title[mark.len_utf8()..]))
+            }
+            _ => std::borrow::Cow::Borrowed(title),
+        }
+    }
+
+    /// The label size for a `band_h`-px optical band at `scale`: the chrome
+    /// label base ([`chrome_label_base_px`]).
     fn band_label_px(band_h: f32, scale: f32) -> f32 {
-        (STRIP_LABEL_LOGICAL_PX * scale)
-            .round()
-            .min((band_h * 0.62).floor())
-            .max(6.0)
+        chrome_label_base_px(band_h, scale)
     }
 
     /// The trailing VERSION LABEL's slot, in columns, for each rung — measured,
@@ -4594,13 +6251,19 @@ pub(crate) mod pixel_band {
     /// are canvas coordinates (0 = the window's top edge; the canvas carries the
     /// chrome lip via the image lift).
     struct BandDesign {
-        /// Cap-centred baseline for labels, in the content region.
+        /// The labels' baseline: cap-centred in the content region, or on
+        /// Windows ink-centred in the tab ([`DESCENDER_EM`]).
         baseline: f32,
         /// Top edge of the card row.
         card_top: f32,
-        /// Bottom edge of the card row — clear of the seam rule the cell lane
-        /// stamps over this raster ([`BandGeometry::seam_top_px`]).
+        /// Bottom edge of the card row — clear of the seam rule on the canvas's
+        /// last rows ([`BandGeometry::seam_top_px`]); on Windows the seam's top,
+        /// which a tab stands on.
         card_bot: f32,
+        /// Windows tabs, not chips ([`SELECTED_TAB_IS_GROUND`]): cards round
+        /// their top corners only and stand on the seam, quiet tabs have none,
+        /// and two quiet neighbours are parted by a hairline.
+        tabs: bool,
         /// Card corner radius.
         radius: f32,
         /// Horizontal inset from a segment's cell edge to its card's painted edge;
@@ -4627,45 +6290,86 @@ pub(crate) mod pixel_band {
             } else {
                 1.0
             };
-            // The content region: the canvas down to the seam rule (renderer's deco
-            // law), or a hairline off the canvas bottom without a resolved seam.
+            // The content region: the canvas down to the seam rule on its last
+            // rows, or a hairline off the canvas bottom without a resolved seam.
+            // The card row is centred in it, so the cards sit as far below the
+            // window's top edge as above the seam.
             let content_h = geometry
                 .seam_top_px
                 .map(|y| y as f32)
                 .unwrap_or_else(|| img_h as f32 - (2.0 * s).round())
                 .clamp(label_px, img_h as f32);
-            let baseline = crate::tray_raster::row_baseline(0.0, content_h, label_px).clamp(
-                label_px * 0.9,
-                (img_h as f32 - label_px * 0.28).max(label_px * 0.9),
-            );
+            let tabs = SELECTED_TAB_IS_GROUND;
             // The card row: ~3.5 logical px of band above and below the cards,
             // centred in the content region. On a compact band the inset shrinks
             // first, down to a hairline of interior, before `band_label_px`'s cap
-            // shrinks the type.
+            // shrinks the type. A Windows tab keeps the inset above it and stands
+            // on the seam.
             let inset_v = ((3.5 * s).round())
                 .max(3.0)
                 .min(content_h * 0.2)
                 .min(((content_h - label_px - 2.0) * 0.5).max(1.0));
             let card_top = inset_v;
-            let card_bot = (content_h - inset_v).max(card_top + 1.0);
+            let card_bot = if tabs {
+                content_h.max(card_top + 1.0)
+            } else {
+                (content_h - inset_v).max(card_top + 1.0)
+            };
             let card_h = card_bot - card_top;
-            // Corners round like a native tab's (6 logical px), never past a
-            // pill's semicircle.
-            let radius = (6.0 * s).round().min(card_h * 0.5);
+            let baseline = if tabs {
+                tab_baseline(card_top, card_bot, label_px, s)
+            } else {
+                crate::tray_raster::row_baseline(0.0, content_h, label_px).clamp(
+                    label_px * 0.9,
+                    (img_h as f32 - label_px * 0.28).max(label_px * 0.9),
+                )
+            };
+            // Corners round like a native tab's (6 logical px; a Windows tab's
+            // top corners WinUI's 8), never past a pill's semicircle.
+            let radius = (if tabs { 8.0 } else { 6.0 } * s).round().min(card_h * 0.5);
             // Half the inter-card gutter (6 logical px between neighbours).
             let gap_h = (3.0 * s).round().max(2.0);
             BandDesign {
                 baseline,
                 card_top,
                 card_bot,
+                tabs,
                 radius,
                 gap_h,
-                // The bake-off's verdict, hardwired — see each field's doc.
-                quiet_cards: true,
-                quiet_button: true,
+                // The bake-off's verdict, hardwired — see each field's doc. A
+                // Windows tab row has no quiet cards and a bare `+`, as Windows
+                // Terminal's: the selected tab is the one surface, the hover wash
+                // and the hairlines between quiet tabs keep each one an object.
+                quiet_cards: !tabs,
+                quiet_button: !tabs,
                 active_semibold: true,
             }
         }
+    }
+
+    /// A title's descender (`g`, `p`, `y`) below its baseline, in em: Segoe
+    /// UI's is about 0.21. A run's ink spans its cap height above the baseline
+    /// and this below, so a tab label is centred on that box, not on its caps.
+    const DESCENDER_EM: f32 = 0.22;
+
+    /// The baseline of a `label_px` title in a Windows tab spanning
+    /// `[top, bottom)`: its ink box (caps over descenders, [`DESCENDER_EM`])
+    /// centred in the tab, then held a logical pixel inside it at each end,
+    /// the descenders' end first. Centred on the caps alone, the descenders of
+    /// a 13 px title sat on the last row of a 16 px card at 100% (the
+    /// 2026-10-18 judges' `tab-title-descender-clearance`).
+    fn tab_baseline(top: f32, bottom: f32, label_px: f32, scale: f32) -> f32 {
+        let cap_centred = crate::tray_raster::row_baseline(top, bottom - top, label_px);
+        // The cap height the centring used: the baseline sits half of it below
+        // the tab's middle.
+        let cap = (2.0 * (cap_centred - (top + bottom) * 0.5)).max(0.0);
+        let descent = label_px * DESCENDER_EM;
+        let air = scale.max(1.0);
+        let lowest = bottom - air - descent;
+        let highest = top + air + cap;
+        (cap_centred - descent * 0.5)
+            .min(lowest)
+            .max(highest.min(lowest))
     }
 
     /// The content geometry of one band segment: [`tab_content_layout`] with
@@ -4693,10 +6397,11 @@ pub(crate) mod pixel_band {
     /// Every chip label the band paints, resolved together: the cell pass's rule
     /// ([`distinct_chip_labels`]) carried through the pixel fit.
     ///
-    /// The cell pass proves distinctness in cell columns; [`fit_label`] then cuts
-    /// again against the pixel span, which done per chip can collapse distinct
-    /// labels (`…~/aterm` and `…$HOME/trust` both to `…~…`). So the fit runs here over
-    /// the whole strip, and a collision it creates is re-cut by ordinal
+    /// The cell pass proves distinctness in (UI-widened) cell columns
+    /// ([`distinct_chip_labels_in`]); [`fit_label`] then cuts again against the
+    /// pixel span, which done per chip can collapse distinct labels
+    /// (`service-alpha` and `service-beta` both to `service-…`). So the fit runs
+    /// here over the whole strip, and a collision it creates is re-cut by ordinal
     /// ([`fit_labels_distinctly`]).
     ///
     /// A run the band cannot cover keeps its cell label (the cell painter draws
@@ -4714,45 +6419,104 @@ pub(crate) mod pixel_band {
         label_px: f32,
         wants_semibold: bool,
     ) -> Vec<Option<String>> {
-        let mut cell = if STRIP_DISTINCT_LABELS {
-            distinct_chip_labels(
-                input.segments,
-                input.titles,
-                Some(input.metadata),
-                active,
-                input.paint.rename.map(|edit| edit.tab),
-            )
-        } else {
-            Vec::new()
+        // Measure with the face each label will be drawn with. The active label may
+        // also go through [`VariablePen::fit`] (same candidates, marginally
+        // different advances); the repair rewrites it only when the fit left it
+        // naming nothing. The coverage questions below ask in that face too, so
+        // a label's East Asian faces are its own weight's before it is measured.
+        let face_of = |tab: usize| {
+            if tab == active && wants_semibold {
+                TextFace::UiBold
+            } else {
+                TextFace::Ui
+            }
         };
+        let measure =
+            |tab: usize, s: &str| crate::tray_raster::ui_text_width_for(face_of(tab), s, label_px);
+        let coverable =
+            |tab: usize, s: &str| crate::tray_raster::strip_band_run_coverable_in(face_of(tab), s);
+        // Every chip this pass labels, `(tab, title cells, span px)`: every skip
+        // the paint loop makes, made here too (a segment it hands to the cell
+        // painter has no pixel label to fit).
+        let seated: Vec<(usize, u16, f32)> = input
+            .segments
+            .iter()
+            .filter_map(|seg| {
+                let end = seg.end_col.min(cols as u16);
+                let TabHit::Select(i) = seg.kind else {
+                    return None;
+                };
+                if seg.start_col >= end
+                    || seg.solo
+                    || i >= input.titles.len()
+                    || input.paint.rename.is_some_and(|edit| edit.tab == i)
+                {
+                    return None;
+                }
+                let layout = band_content_layout(seg, input.metadata.get(i).copied(), end);
+                let avail = layout.title_end.saturating_sub(layout.title_start);
+                Some((i, avail, f32::from(avail) * cw - 1.0))
+            })
+            .collect();
+        // The cell pass at `widen` display cells per column, mapped to strip
+        // glyphs: `None` for a tab it does not label.
+        let labels_at = |widen: f32| -> Vec<Option<String>> {
+            let mut cell = if STRIP_DISTINCT_LABELS {
+                distinct_chip_labels_in(
+                    input.segments,
+                    input.titles,
+                    Some(input.metadata),
+                    active,
+                    input.paint.rename.map(|edit| edit.tab),
+                    widen,
+                )
+            } else {
+                Vec::new()
+            };
+            let mut out = vec![None; input.titles.len()];
+            for &(i, avail, _) in &seated {
+                let raw = input.titles[i].as_str();
+                let text: String = cell
+                    .get_mut(i)
+                    .and_then(Option::take)
+                    .unwrap_or_else(|| chip_cut(raw, widened_budget(usize::from(avail), widen)))
+                    .chars()
+                    .map(strip_char)
+                    .collect();
+                out[i] = Some(text);
+            }
+            out
+        };
+        // Cut in UI-face-sized cells, not terminal cells ([`ui_cells_per_cell`]),
+        // and narrow the step, tab by tab, until each label the cell pass
+        // resolved fits its own span ([`widest_fitting_cuts`]): the per-chip fit
+        // below then only trims glyph-level slack, and a cut keeps the cell
+        // pass's own rule (a path keeps its end) instead of losing its tail to a
+        // pixel trim. Every tab's step is the one its label fits at in the
+        // selected weight, as [`tab_wants`] sizes every tab, so selecting a tab
+        // never changes its words: a quiet `vim … platform_win.rs` would turn
+        // into `…platform_win.rs` as it took the wider semibold.
+        let selected_face = if wants_semibold {
+            TextFace::UiBold
+        } else {
+            TextFace::Ui
+        };
+        let spans: Vec<(usize, f32)> = seated.iter().map(|&(i, _, span)| (i, span)).collect();
+        let mut cell = widest_fitting_cuts(
+            &spans,
+            ui_cells_per_cell(cw, label_px),
+            labels_at,
+            |i, text, span_px| {
+                coverable(i, text)
+                    && crate::tray_raster::ui_text_width_for(selected_face, text, label_px)
+                        > span_px
+            },
+        );
         let mut resolved: Vec<Option<String>> = vec![None; input.titles.len()];
         let mut entries: Vec<BandLabel> = Vec::new();
-        for seg in input.segments {
-            let end = seg.end_col.min(cols as u16);
-            let TabHit::Select(i) = seg.kind else {
-                continue;
-            };
-            // Every skip the paint loop makes, made here too: a segment it
-            // hands to the cell painter has no pixel label to fit.
-            if seg.start_col >= end
-                || seg.solo
-                || i >= input.titles.len()
-                || input.paint.rename.is_some_and(|edit| edit.tab == i)
-            {
-                continue;
-            }
-            let item = input.metadata.get(i).copied();
-            let layout = band_content_layout(seg, item, end);
-            let avail = layout.title_end.saturating_sub(layout.title_start);
-            let raw = input.titles[i].as_str();
-            let text: String = cell
-                .get_mut(i)
-                .and_then(Option::take)
-                .unwrap_or_else(|| truncate_title(raw, usize::from(avail)))
-                .chars()
-                .map(strip_char)
-                .collect();
-            if !crate::tray_raster::strip_band_run_coverable(&text) {
+        for &(i, _, span_px) in &seated {
+            let text = cell[i].take().unwrap_or_default();
+            if !coverable(i, &text) {
                 // The cell painter's segment: hand the paint loop the string it
                 // checked coverage with, so it takes the same fallback branch.
                 resolved[i] = Some(text);
@@ -4760,27 +6524,66 @@ pub(crate) mod pixel_band {
             }
             entries.push(BandLabel {
                 tab: i,
-                span_px: f32::from(avail) * cw - 1.0,
+                span_px,
                 text,
             });
         }
-        // Measure with the face each label will be drawn with. The active label may
-        // also go through [`VariablePen::fit`] (same candidates, marginally
-        // different advances); the repair rewrites it only when the fit left it
-        // naming nothing.
-        let measure = |tab: usize, s: &str| {
-            let face = if tab == active && wants_semibold {
-                TextFace::UiBold
-            } else {
-                TextFace::Ui
-            };
-            crate::tray_raster::ui_text_width_for(face, s, label_px)
-        };
         let taken: Vec<&str> = resolved.iter().filter_map(Option::as_deref).collect();
         for (tab, text) in fit_labels_distinctly(&entries, active, &taken, &measure) {
             resolved[tab] = Some(text);
         }
         resolved
+    }
+
+    /// Each seated tab's cell-pass label at the WIDEST step at which that tab's
+    /// own label fits its span ([`resolve_band_labels`]). `seated` is
+    /// `(tab, span px)` per chip; `labels_at(widen)` is the cell pass at `widen`
+    /// display cells per column, indexed by tab; `overflows(tab, label, span)`
+    /// asks whether a label overruns its span (the band asks in the selected
+    /// weight for every tab). The step narrows by 0.1 from `widen` down to
+    /// 1.0, where every label still waiting is taken as it is.
+    ///
+    /// Tab by tab: a neighbour that needs a narrower step costs this tab no
+    /// characters. One step for the whole strip let one wide label shorten
+    /// every other cut, so a tab read differently with its neighbour's title:
+    /// at 200% the selected Claude Code task read `Claude Code: rev…` beside
+    /// a `C:\Users\m6-an\aterm` tab and `Claude Code: revi…` beside
+    /// `C:\Users\m6-an\aterm-winperfect`, a run in another folder read as a
+    /// regression (the 2026-10-18 verifier's `A11-hidpi-selected-label-fit`),
+    /// and at 100% a selected `less` or `vim` command cost the quiet Claude
+    /// Code tab a letter. Each step's pass is still the whole
+    /// strip's, so its cut rules (a cluster's shed, a twin's ordinal) hold at
+    /// that step, and the fit's collision repair ([`fit_labels_distinctly`])
+    /// renumbers any two labels taken at different steps that read alike.
+    fn widest_fitting_cuts(
+        seated: &[(usize, f32)],
+        mut widen: f32,
+        labels_at: impl Fn(f32) -> Vec<Option<String>>,
+        overflows: impl Fn(usize, &str, f32) -> bool,
+    ) -> Vec<Option<String>> {
+        let mut chosen: Vec<Option<String>> = Vec::new();
+        let mut waiting: Vec<(usize, f32)> = seated.to_vec();
+        loop {
+            let mut at = labels_at(widen);
+            if chosen.len() < at.len() {
+                chosen.resize(at.len(), None);
+            }
+            let floor = widen.is_nan() || widen <= 1.0;
+            waiting.retain(|&(tab, span_px)| {
+                let text = at.get_mut(tab).and_then(Option::take);
+                if !floor && text.as_deref().is_some_and(|t| overflows(tab, t, span_px)) {
+                    return true;
+                }
+                if let Some(slot) = chosen.get_mut(tab) {
+                    *slot = text;
+                }
+                false
+            });
+            if waiting.is_empty() {
+                return chosen;
+            }
+            widen = (widen - 0.1).max(1.0);
+        }
     }
 
     /// One chip's label on the way into the pixel fit: the cell pass's resolved
@@ -4962,14 +6765,50 @@ pub(crate) mod pixel_band {
     /// [`VariablePen::fit`] applies the same candidate order to a shaped run.
     ///
     /// Per chip, so only [`resolve_band_labels`] (which repairs collisions via
-    /// [`fit_labels_distinctly`]) and its ordinal fallback call it; the paint loop
-    /// never does.
+    /// [`fit_labels_distinctly`]) and its ordinal fallback call it, and the paint
+    /// loop only for a selected label that keeps its end and overruns its span
+    /// under the variable pen ([`cut_keeps_its_end`]).
     ///
-    /// Only a trailing mark is dropped, so a tail cut (`…and`) can shrink to `……`;
-    /// the repair detects that ([`label_says_nothing`]).
+    /// A tail cut (`…work\sub dir`, or one behind an ordinal, `2 · …sub dir`)
+    /// keeps its END, which is what tells the chip apart: it sheds characters
+    /// right after its mark instead, never below three (a shorter stub names
+    /// nothing, as [`path_tail`] rules). Its floor is the mark alone, which the
+    /// repair detects ([`label_says_nothing`]). Only a LEADING mark is a tail
+    /// cut: a title that says `…` itself (`Thinking… (esc to interrupt)`) is
+    /// head-cut like any other. A command cut (`vim -n -R … platform_win.rs`,
+    /// [`middle_cut_parts`]) keeps its end as well: its head sheds characters
+    /// before the mark, and with the head gone it is a tail cut.
     fn fit_label(label: String, span_px: f32, measure: impl Fn(&str) -> f32) -> String {
         if measure(&label) <= span_px {
             return label;
+        }
+        // A command cut ([`command_cut`]) keeps its end too: its head gives way
+        // first, a character at a time, then the tail cut's rule below.
+        if let Some((head, tail)) = middle_cut_parts(&label) {
+            let mut stem: Vec<char> = head.chars().collect();
+            while stem.pop().is_some() {
+                let kept: String = stem.iter().collect();
+                let kept = kept.trim_end();
+                if kept.is_empty() {
+                    break;
+                }
+                let candidate = format!("{kept}{MIDDLE_MARK}{tail}");
+                if measure(&candidate) <= span_px {
+                    return candidate;
+                }
+            }
+            return fit_label(format!("…{tail}"), span_px, measure);
+        }
+        if let Some(mark) = tail_cut_mark(&label) {
+            let (head, tail) = label.split_at(mark + '…'.len_utf8());
+            let mut rest = tail.chars();
+            while rest.next().is_some() && rest.as_str().chars().count() >= 3 {
+                let candidate = format!("{head}{}", rest.as_str());
+                if measure(&candidate) <= span_px {
+                    return candidate;
+                }
+            }
+            return head.to_string();
         }
         let mut stem: Vec<char> = label.chars().collect();
         // Drop a trailing ellipsis from the cell truncation before re-fitting.
@@ -4983,6 +6822,41 @@ pub(crate) mod pixel_band {
             }
         }
         "…".to_string()
+    }
+
+    /// Where a tail cut's mark sits in `label` ([`fit_label`]): first
+    /// (`…sub dir`), or right behind an ordinal (`12 · …sub dir`); `None` for
+    /// any other label, and for one that also ends in `…` (a head cut).
+    fn tail_cut_mark(label: &str) -> Option<usize> {
+        if label.ends_with('…') {
+            return None;
+        }
+        if label.starts_with('…') {
+            return Some(0);
+        }
+        label.split_once(" · …").and_then(|(digits, _)| {
+            (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| digits.len() + " · ".len())
+        })
+    }
+
+    /// A command cut's head and tail ([`command_cut`]): the text either side of
+    /// its last [`MIDDLE_MARK`], both non-empty, in a label that neither starts
+    /// nor ends with `…`.
+    fn middle_cut_parts(label: &str) -> Option<(&str, &str)> {
+        if label.starts_with('…') || label.ends_with('…') {
+            return None;
+        }
+        label
+            .rsplit_once(MIDDLE_MARK)
+            .filter(|(head, tail)| !head.trim().is_empty() && !tail.trim().is_empty())
+    }
+
+    /// Whether a label's cut keeps its END ([`tail_cut_mark`],
+    /// [`middle_cut_parts`]), so a pen that would cut its end off
+    /// ([`VariablePen::fit`]) must re-cut it by [`fit_label`] instead.
+    fn cut_keeps_its_end(label: &str) -> bool {
+        tail_cut_mark(label).is_some() || middle_cut_parts(label).is_some()
     }
 
     /// One glyph of a [`ShapedRun`]: its coverage raster and the pen position where
@@ -5167,7 +7041,18 @@ pub(crate) mod pixel_band {
     }
 
     /// Lay a [`ShapedRun`] into a straight-alpha RGBA overlay `height` px tall, at
-    /// most `span_px` wide, inked in `color` on a transparent ground.
+    /// most `span_px` wide, inked in `color` on a transparent ground, for the
+    /// `ground` it will be composited over (the selected tab's surface).
+    ///
+    /// The overlay's alpha is the glyph coverage after the perceptual remap every
+    /// other chrome glyph gets ([`aterm_render::correct_alpha`], the tray pen's
+    /// `blend_glyph_texel`), keyed on `color` over `ground`: the overlay is
+    /// composited by a plain linear-light source-over
+    /// ([`crate::tray_raster::composite_rgba_surface`]), which thins dark ink on
+    /// a light ground and thickens light ink on a dark one. Uncorrected, the
+    /// selected tab's semibold title measured 0.54 mean coverage on Default
+    /// Light against 0.68 on Default, lighter than the regular quiet titles
+    /// beside it (the 2026-10-18 judges' `light-selected-tab-label-uncorrected-alpha`).
     fn variable_label_overlay(
         run: &ShapedRun,
         x: f32,
@@ -5175,6 +7060,7 @@ pub(crate) mod pixel_band {
         height: usize,
         span_px: f32,
         color: [u8; 3],
+        ground: [u8; 3],
     ) -> LabelOverlay {
         let width = (run.width.ceil() as usize + 2)
             .min(span_px.floor().max(1.0) as usize)
@@ -5203,9 +7089,295 @@ pub(crate) mod pixel_band {
                 }
             }
         }
+        // The remap per coverage byte, once per label; 0 and 255 stay exact.
+        let pack = |c: [u8; 3]| u32::from(c[0]) << 16 | u32::from(c[1]) << 8 | u32::from(c[2]);
+        let (ink_l, ground_l) = (
+            aterm_render::linear_luminance(pack(color)),
+            aterm_render::linear_luminance(pack(ground)),
+        );
+        let mut remap = [0u8; 256];
+        for (coverage, slot) in remap.iter_mut().enumerate() {
+            *slot = match coverage {
+                0 => 0,
+                255 => 255,
+                c => (aterm_render::correct_alpha(ink_l, ground_l, c as f32 / 255.0) * 255.0)
+                    .round()
+                    .clamp(0.0, 255.0) as u8,
+            };
+        }
+        for alpha in rgba.iter_mut().skip(3).step_by(4) {
+            *alpha = remap[usize::from(*alpha)];
+        }
         LabelOverlay {
             x: x.max(0.0) as usize,
             width,
+            rgba,
+        }
+    }
+
+    /// A colour emoji's square in a band label, as a share of the label's size:
+    /// a touch over it, as Windows' own text sets an emoji beside its letters.
+    const EMOJI_EM: f32 = 1.2;
+
+    /// One piece of a band label that carries colour emoji ([`emoji_label`]).
+    pub(super) enum LabelPiece {
+        /// A run the UI stack draws.
+        Text(String),
+        /// A cluster it cannot, as its colour emoji.
+        Emoji(Arc<crate::tray_raster::ChromeEmoji>),
+    }
+
+    /// The square, in device px, a colour emoji takes in a `label_px` label.
+    fn emoji_box_px(label_px: f32) -> f32 {
+        (label_px * EMOJI_EM).round().max(4.0)
+    }
+
+    /// The advance of a colour emoji in a `label_px` label: its square and a
+    /// hair of air before the next letter.
+    fn emoji_advance_px(label_px: f32) -> f32 {
+        emoji_box_px(label_px) + (label_px * 0.12).round()
+    }
+
+    /// `title` as pieces the band draws when the UI stack cannot draw every
+    /// char of it: runs of text it can, and each grapheme it cannot as its
+    /// colour emoji ([`crate::tray_raster::chrome_colour_emoji`], the
+    /// terminal's own colour face). `None` when such a grapheme is no colour
+    /// emoji either and no face maps it: then the cell lane draws the title.
+    /// The text is asked in `face`, the face it is drawn in, so its East
+    /// Asian faces are that weight's.
+    pub(super) fn emoji_label(
+        title: &str,
+        label_px: f32,
+        face: TextFace,
+    ) -> Option<Vec<LabelPiece>> {
+        let side = emoji_box_px(label_px);
+        let mut pieces = Vec::new();
+        let mut run = String::new();
+        for grapheme in aterm_grapheme::split_graphemes(title) {
+            let cluster = grapheme.text;
+            if crate::tray_raster::strip_band_run_coverable_in(face, cluster) {
+                run.push_str(cluster);
+                continue;
+            }
+            // Only an emoji is asked of the colour face; anything else no face
+            // maps is the cell lane's title.
+            if !grapheme.is_emoji {
+                return None;
+            }
+            let emoji = crate::tray_raster::chrome_colour_emoji(cluster, side)?;
+            if !run.is_empty() {
+                pieces.push(LabelPiece::Text(std::mem::take(&mut run)));
+            }
+            pieces.push(LabelPiece::Emoji(emoji));
+        }
+        if !run.is_empty() {
+            pieces.push(LabelPiece::Text(run));
+        }
+        Some(pieces)
+    }
+
+    /// Where a label with colour emoji is drawn ([`draw_emoji_label`]): its
+    /// span from `x0`, the band's baseline and optical centre `cy`, the label
+    /// size and the canvas height.
+    struct EmojiLabelAt {
+        x0: f32,
+        span_px: f32,
+        baseline: f32,
+        cy: f32,
+        label_px: f32,
+        height: usize,
+    }
+
+    /// Draw `pieces` ([`emoji_label`]) as one label in its span: the text runs
+    /// in the UI face on the baseline (the selected title's through the
+    /// variable semibold `pen` when there is one, as every selected title is,
+    /// alpha-corrected on `ground`), each emoji in its square centred on the
+    /// label's optical centre, leading like every Windows title, and cut at the
+    /// end with `…` where the whole does not fit, never inside a cluster.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the label's pieces, the two outputs it draws into, where, and its face, \
+                  pen, ink and ground"
+    )]
+    fn draw_emoji_label(
+        prims: &mut Vec<DrawPrim>,
+        overlays: &mut Vec<LabelOverlay>,
+        pieces: &[LabelPiece],
+        at: EmojiLabelAt,
+        face: TextFace,
+        pen: Option<&VariablePen<'_>>,
+        ink: [u8; 3],
+        ground: [u8; 3],
+    ) {
+        use aterm_grapheme::GraphemeClusters as _;
+        let shaped = |s: &str| pen.and_then(|pen| pen.shape(s, at.label_px));
+        let measure = |s: &str| {
+            shaped(s).map_or_else(
+                || crate::tray_raster::ui_text_width_for(face, s, at.label_px),
+                |run| run.width,
+            )
+        };
+        let advance = emoji_advance_px(at.label_px);
+        // The label as units, each a whole cluster: what a cut may drop.
+        enum Unit<'a> {
+            Text(String),
+            Emoji(&'a Arc<crate::tray_raster::ChromeEmoji>),
+        }
+        let mut units: Vec<Unit<'_>> = Vec::new();
+        for piece in pieces {
+            match piece {
+                LabelPiece::Text(text) => {
+                    units.extend(text.graphemes().map(|g| Unit::Text(g.to_string())));
+                }
+                LabelPiece::Emoji(emoji) => units.push(Unit::Emoji(emoji)),
+            }
+        }
+        let width = |units: &[Unit<'_>]| -> f32 {
+            let mut text = String::new();
+            let mut total = 0.0;
+            for unit in units {
+                match unit {
+                    Unit::Text(s) => text.push_str(s),
+                    Unit::Emoji(_) => {
+                        total += measure(&std::mem::take(&mut text)) + advance;
+                    }
+                }
+            }
+            total + measure(&text)
+        };
+        let mut keep = units.len();
+        let mut cut = false;
+        while keep > 0 && width(&units[..keep]) > at.span_px {
+            keep -= 1;
+            cut = true;
+        }
+        if cut {
+            let ellipsis = measure("…");
+            while keep > 0 && width(&units[..keep]) + ellipsis > at.span_px {
+                keep -= 1;
+            }
+            units.truncate(keep);
+            units.push(Unit::Text("…".to_string()));
+        }
+        let total = width(&units);
+        let mut x = label_x(at.x0, at.span_px, total);
+        let end = at.x0 + at.span_px;
+        let side = emoji_box_px(at.label_px);
+        prims.push(DrawPrim::ClipPush {
+            x: at.x0,
+            y: 0.0,
+            w: at.span_px,
+            h: at.height as f32,
+        });
+        let mut text = String::new();
+        let flush = |prims: &mut Vec<DrawPrim>,
+                     overlays: &mut Vec<LabelOverlay>,
+                     text: &mut String,
+                     x: &mut f32| {
+            if text.is_empty() {
+                return;
+            }
+            let run = std::mem::take(text);
+            if let Some(shaped) = shaped(&run) {
+                let width = shaped.width;
+                overlays.push(variable_label_overlay(
+                    &shaped,
+                    *x,
+                    at.baseline,
+                    at.height,
+                    (end - *x).max(1.0),
+                    ink,
+                    ground,
+                ));
+                *x += width;
+                return;
+            }
+            let width = measure(&run);
+            prims.push(text_prim(
+                *x,
+                at.baseline,
+                run,
+                TypeStep::Body.px(at.label_px),
+                TextWeight::Regular,
+                face,
+                rgba(ink, 255),
+            ));
+            *x += width;
+        };
+        for unit in &units {
+            match unit {
+                Unit::Text(s) => text.push_str(s),
+                Unit::Emoji(emoji) => {
+                    flush(prims, overlays, &mut text, &mut x);
+                    if x + side <= end + 0.5 {
+                        overlays.push(emoji_overlay(emoji, x, at.cy, side, at.height));
+                    }
+                    x += advance;
+                }
+            }
+        }
+        flush(prims, overlays, &mut text, &mut x);
+        prims.push(DrawPrim::ClipPop);
+    }
+
+    /// `emoji` fitted into a `side`-px square whose left edge is `x` and whose
+    /// centre is at `cy`, as an overlay the canvas's height: a box filter over
+    /// its premultiplied texels when it scales (the raster is asked for at
+    /// about this size, so it rarely does by much).
+    fn emoji_overlay(
+        emoji: &crate::tray_raster::ChromeEmoji,
+        x: f32,
+        cy: f32,
+        side: f32,
+        height: usize,
+    ) -> LabelOverlay {
+        let side_px = side.max(1.0) as usize;
+        let scale = side / emoji.width.max(emoji.height) as f32;
+        let tw = ((emoji.width as f32 * scale).round() as usize).clamp(1, side_px);
+        let th = ((emoji.height as f32 * scale).round() as usize).clamp(1, side_px);
+        let left = (side_px - tw) / 2;
+        let top = ((cy - th as f32 * 0.5).round().max(0.0)) as usize;
+        let mut rgba = vec![0u8; side_px * height * 4];
+        // Sample a 4x4 grid of each target pixel's footprint in the source.
+        const SUB: usize = 4;
+        for ty in 0..th {
+            let y = top + ty;
+            if y >= height {
+                break;
+            }
+            for tx in 0..tw {
+                let mut acc = [0f32; 4];
+                for sy in 0..SUB {
+                    let src_y = (((ty * SUB + sy) as f32 + 0.5) / (th * SUB) as f32
+                        * emoji.height as f32) as usize;
+                    for sx in 0..SUB {
+                        let src_x = (((tx * SUB + sx) as f32 + 0.5) / (tw * SUB) as f32
+                            * emoji.width as f32) as usize;
+                        let at = (src_y.min(emoji.height - 1) * emoji.width
+                            + src_x.min(emoji.width - 1))
+                            * 4;
+                        let a = f32::from(emoji.rgba[at + 3]) / 255.0;
+                        for (k, sum) in acc.iter_mut().take(3).enumerate() {
+                            *sum += f32::from(emoji.rgba[at + k]) * a;
+                        }
+                        acc[3] += a;
+                    }
+                }
+                let n = (SUB * SUB) as f32;
+                let a = acc[3] / n;
+                if a <= 0.0 {
+                    continue;
+                }
+                let i = (y * side_px + left + tx) * 4;
+                for k in 0..3 {
+                    rgba[i + k] = (acc[k] / n / a).round().clamp(0.0, 255.0) as u8;
+                }
+                rgba[i + 3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        LabelOverlay {
+            x: x.round().max(0.0) as usize,
+            width: side_px,
             rgba,
         }
     }
@@ -5252,7 +7424,7 @@ pub(crate) mod pixel_band {
                         color: ink,
                     });
                 }
-                // The connector arrow. The band has no polygon fill, so the
+                // The connection mark's arrow. The band has no polygon fill, so the
                 // triangle is its three edges at the icon's stroke weight, which
                 // close into a solid mark at chip size.
                 TabIconPrimitive::Triangle { points } => {
@@ -5299,6 +7471,7 @@ pub(crate) mod pixel_band {
                 // These tests assert lane-specific pixels; the design lane's seam
                 // fixtures pass a resolved value.
                 seam_top_px: None,
+                foot_px: 0,
             }
         }
 
@@ -5311,7 +7484,7 @@ pub(crate) mod pixel_band {
                     attention: ChipLevel::Off,
                     conn: None,
                     closable: true,
-                    drop_target: false,
+                    team: TabTeam::NONE,
                 };
                 n
             ]
@@ -5332,6 +7505,7 @@ pub(crate) mod pixel_band {
                 active: 0,
                 palette: Theme::default().into(),
                 geometry,
+                floor: StripFloor::Ground,
             }
         }
 
@@ -5810,15 +7984,15 @@ pub(crate) mod pixel_band {
                     .any(|(c, r)| *c == probe && Arc::ptr_eq(&r.image, &rows[0][0].1.image)),
                 "the CJK segment is band-covered, not a fallback range"
             );
-            // Where the pen put the label: the band centres the run in its
-            // span by the very measure the pen advances with.
+            // Where the pen put the label: the band places the run in its span
+            // ([`label_x`]) by the very measure the pen advances with.
             let layout = tab_content_layout(&seg, metadata[1]);
             let label_px = band_label_px(h as f32, 1.0);
             let measure =
                 |s: &str| crate::tray_raster::ui_text_width_for(TextFace::Ui, s, label_px);
             let x0 = f32::from(layout.title_start) * CELL_W as f32;
             let span_px = f32::from(layout.title_end - layout.title_start) * CELL_W as f32 - 1.0;
-            let x = ((span_px - measure(title)) * 0.5).max(0.0) + x0;
+            let x = label_x(x0, span_px, measure(title));
             let cjk_end = x + measure("日本語");
             let latin_start = x + measure("日本語 ");
             let colors = strip_colors_with_active(Theme::default(), None);
@@ -5862,12 +8036,120 @@ pub(crate) mod pixel_band {
             crate::tray_raster::clear_ui_fonts_for_test();
         }
 
-        /// Until the chain face is parsed, a CJK title takes the cell lane: the
-        /// coverage rung admits only faces a renderer already parsed (no parse on
-        /// the UI thread), and the band re-rasters once one lands
-        /// (`strip_band_font_epoch_moves_when_a_chain_face_lands`).
+        /// A COLOUR-EMOJI TITLE IS A BAND TAB ([`emoji_label`]): the band covers
+        /// its whole segment, draws its tab (on Windows the selected tab opening
+        /// through the seam into the grid) and its label, the emoji in colour
+        /// from the terminal's own colour face beside the UI-face letters.
+        /// NEGATIVE CONTROL: with no colour face in the chrome stack (the
+        /// semantic renderer not landed) the title falls to the cell lane, the
+        /// square monospace slab the 2026-10-18 judges found
+        /// (`emoji-title-tab-slab-in-new-strip`).
         #[test]
-        fn a_cjk_title_falls_to_the_cell_lane_until_the_chain_face_lands() {
+        fn a_colour_emoji_title_is_a_band_tab() {
+            if !STRIP_WINDOWS_PAINT {
+                return;
+            }
+            let renderer = aterm_render::Renderer::from_bytes(
+                aterm_render::embedded_font(),
+                14.0,
+                Theme::default(),
+            )
+            .expect("embedded renderer");
+            crate::tray_raster::install_settled_chrome_fonts_for_test(renderer);
+            if !with_ui_faces() {
+                return;
+            }
+            let label_px = band_label_px((BAND_TOP + CELL_H) as f32, 1.0);
+            if crate::tray_raster::chrome_colour_emoji("\u{1F680}", emoji_box_px(label_px))
+                .is_none()
+            {
+                crate::logging::stderr_line!("no colour emoji face on this host");
+                crate::tray_raster::clear_ui_fonts_for_test();
+                return;
+            }
+            let title = "\u{1F680} deploy";
+            assert!(
+                !crate::tray_raster::strip_band_run_coverable(title),
+                "CONTROL: the UI stack cannot draw the rocket"
+            );
+            let metadata = plain(3);
+            let segments = layout_segments_with_metadata(90, 3, &metadata, 1, false);
+            let titles = vec!["build".to_string(), title.to_string(), "logs".to_string()];
+            let input = BandInput {
+                active: 1,
+                ..band(
+                    &segments,
+                    &titles,
+                    &metadata,
+                    StripPaint::default(),
+                    geometry(90, 1),
+                )
+            };
+            let rows = raster_band(&input, &[]).expect("band");
+            let covered = |col: u16| rows[0].iter().any(|(c, _)| *c == usize::from(col));
+            let seg = segments[1];
+            assert!(
+                (seg.start_col..seg.end_col).all(covered),
+                "the emoji tab's every column is the band's"
+            );
+            let (rgba, w, h) = image_of(&rows);
+            let layout = tab_content_layout(&seg, metadata[1]);
+            let colourful = (0..h)
+                .flat_map(|y| {
+                    (usize::from(layout.title_start) * CELL_W
+                        ..usize::from(layout.title_end) * CELL_W)
+                        .map(move |x| (x, y))
+                })
+                .filter(|&(x, y)| {
+                    let [r, g, b] = pixel(&rgba, w, x, y);
+                    r.max(g).max(b) - r.min(g).min(b) > 60
+                })
+                .count();
+            assert!(
+                colourful > 20,
+                "the rocket is drawn in colour: {colourful} px"
+            );
+            let colors = strip_colors_for(input.palette);
+            let inside = usize::from(seg.start_col) * CELL_W + 4;
+            assert_eq!(
+                pixel(&rgba, w, inside, h - 1),
+                colors.active_bg,
+                "the selected emoji tab is the tab, to the band's last row"
+            );
+            // NEGATIVE CONTROL: no colour face, the cell lane's title.
+            let bare = aterm_render::Renderer::from_bytes(
+                aterm_render::embedded_font(),
+                14.0,
+                Theme::default(),
+            )
+            .map(|mut renderer| {
+                renderer.set_runtime_font_discovery(false);
+                renderer
+            })
+            .expect("embedded renderer");
+            crate::tray_raster::install_settled_chrome_fonts_for_test(bare);
+            let rows = raster_band(&input, &[]).expect("band");
+            if crate::tray_raster::chrome_colour_emoji("\u{1F680}", emoji_box_px(label_px))
+                .is_none()
+            {
+                assert!(
+                    !rows[0]
+                        .iter()
+                        .any(|(c, _)| *c == usize::from(seg.start_col) + 1),
+                    "CONTROL: without a colour face the title is the cell lane's"
+                );
+            }
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
+        /// A CJK title NO face maps takes the cell lane: with no chain face in
+        /// the cascade at all, and none of the UI faces' own, the band has
+        /// nothing to parse for it and leaves its segment to the cell painter
+        /// (the twin of
+        /// `a_cjk_title_is_a_band_tab_on_its_first_frame_with_its_hairlines`,
+        /// whose cascade has the faces, unparsed).
+        #[test]
+        fn a_cjk_title_no_face_maps_falls_to_the_cell_lane() {
             // A settled cascade with NO chain face: the embedded primary alone.
             let mut renderer = aterm_render::Renderer::from_bytes(
                 aterm_render::embedded_font(),
@@ -5880,6 +8162,7 @@ pub(crate) mod pixel_band {
             if !with_ui_faces() {
                 return;
             }
+            crate::tray_raster::set_ui_cjk_faces_for_test(None);
             let title = "日本語 shell";
             assert!(
                 !crate::tray_raster::strip_band_run_coverable(title),
@@ -5905,6 +8188,228 @@ pub(crate) mod pixel_band {
                 !covered(segments[1].start_col + 1),
                 "the CJK segment is left to the cell lane"
             );
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
+        /// EACH LABEL'S EAST ASIAN FACES ARE ITS OWN WEIGHT'S (the 2026-10-18
+        /// judges' `j4t-cjk-band-labels-bold`: a quiet `日本語` and `한국어` in
+        /// Microsoft YaHei Bold and Malgun Gothic Bold beside Segoe UI Regular).
+        /// On the first raster of a strip whose SELECTED tab is `日本語 notes`
+        /// and whose quiet one is `한국어`, over a cold store of the UI faces'
+        /// own fallback, the band has exactly the faces those labels draw with
+        /// parsed: Yu Gothic UI Semibold for the selected label's ideographs,
+        /// Malgun Gothic (Regular) for the quiet label's Hangul, and neither
+        /// one's other weight. Both titles are band titles.
+        #[cfg(windows)]
+        #[test]
+        fn each_labels_east_asian_faces_are_its_own_weights() {
+            let Some(_live) = crate::tray_raster::install_unparsed_cjk_chain_for_test() else {
+                return;
+            };
+            let Some(store) = crate::tray_raster::host_ui_cjk_faces_for_test() else {
+                crate::tray_raster::clear_ui_fonts_for_test();
+                return;
+            };
+            crate::tray_raster::set_ui_cjk_faces_for_test(Some(Arc::clone(&store)));
+            if !with_ui_faces() {
+                return;
+            }
+            let (geometry, _) = window_band(100);
+            let metadata = plain(3);
+            let segments = layout_segments_with_metadata(100, 3, &metadata, 0, false);
+            let titles = vec![
+                "日本語 notes".to_string(),
+                "한국어".to_string(),
+                "logs".to_string(),
+            ];
+            let input = band(
+                &segments,
+                &titles,
+                &metadata,
+                StripPaint::default(),
+                geometry,
+            );
+            assert_eq!(input.selected(), 0, "the CJK tab is the selected one");
+            assert!(
+                store.parsed_files_for_test().is_empty(),
+                "CONTROL: a cold store"
+            );
+            let rows = raster_band(&input, &[]).expect("band");
+            assert_eq!(
+                store.parsed_files_for_test(),
+                ["malgun.ttf#0", "YuGothB.ttc#2"],
+                "the quiet Hangul's Regular face and the selected ideographs' Semibold one"
+            );
+            for tab in [0, 1] {
+                let seg = segments
+                    .iter()
+                    .find(|s| matches!(s.kind, TabHit::Select(i) if i == tab))
+                    .expect("the tab");
+                assert!(
+                    rows[0]
+                        .iter()
+                        .any(|(c, _)| *c == usize::from(seg.start_col) + 1),
+                    "tab {tab} is a band title"
+                );
+            }
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
+        /// The real window's band (2 px pad, a 13 px head, one 23 px row, the
+        /// 6 px foot) at `cols`, and the y the hairlines are centred on.
+        fn window_band(cols: usize) -> (BandGeometry, usize) {
+            let (band_top, cell_h, foot) = (15usize, 23usize, 6usize);
+            let h = band_top + cell_h;
+            let geometry = BandGeometry {
+                cols,
+                cell_w: CELL_W,
+                cell_h,
+                strip_rows: 1,
+                band_top_px: band_top,
+                scale: 1.0,
+                seam_top_px: Some(h - strip_seam_px(1.0) - foot),
+                foot_px: foot,
+            };
+            let label_px = band_label_px(h as f32, 1.0);
+            let d = BandDesign::resolve(&geometry, h, label_px);
+            (geometry, (d.baseline - label_px * 0.35).round() as usize)
+        }
+
+        /// THE FIRST FRAME OF A CJK TITLE IS A BAND TAB (the 2026-10-18 Fluent
+        /// judges' `F3-cjk-title-tab-cell-lane-first-paint`: on the first paint
+        /// `日本語 notes` was the cell lane's, in the terminal's bold face and
+        /// size, with no hairline on either side). The cascade holds the host's
+        /// CJK faces UNPARSED, as a fresh window's does (the chain's, and on
+        /// Windows the UI faces' own), and the very first raster of the strip
+        /// draws the title in the band, the face its quiet label draws with
+        /// parsed for it, parted from its quiet neighbours by a hairline on
+        /// each side. NEGATIVE CONTROL: before the raster the label's routing
+        /// does not reach the ideograph.
+        #[test]
+        fn a_cjk_title_is_a_band_tab_on_its_first_frame_with_its_hairlines() {
+            let Some(_live) = crate::tray_raster::install_unparsed_cjk_chain_for_test() else {
+                return;
+            };
+            if !with_ui_faces() {
+                return;
+            }
+            assert!(
+                !crate::tray_raster::chrome_ui_reaches_for_test(TextFace::Ui, '日'),
+                "CONTROL: the CJK face is not parsed before the first frame"
+            );
+            let (geometry, cy) = window_band(100);
+            let metadata = plain(4);
+            let segments = layout_segments_with_metadata(100, 4, &metadata, 0, false);
+            let titles = vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "日本語 notes".to_string(),
+                "gamma".to_string(),
+            ];
+            let input = band(
+                &segments,
+                &titles,
+                &metadata,
+                StripPaint::default(),
+                geometry,
+            );
+            let rows = raster_band(&input, &[]).expect("band");
+            let cjk = segments
+                .iter()
+                .find(|s| matches!(s.kind, TabHit::Select(2)))
+                .copied()
+                .expect("the CJK tab");
+            assert!(
+                (cjk.start_col..cjk.end_col)
+                    .all(|col| rows[0].iter().any(|(c, r)| *c == usize::from(col)
+                        && Arc::ptr_eq(&r.image, &rows[0][0].1.image))),
+                "the CJK tab's every column is the band's on its first frame"
+            );
+            assert!(
+                crate::tray_raster::chrome_ui_reaches_for_test(TextFace::Ui, '日'),
+                "the band had the face its label needs parsed"
+            );
+            if SELECTED_TAB_IS_GROUND {
+                let (rgba, w, _) = image_of(&rows);
+                let seam = strip_colors_for_on(input.palette, input.floor)
+                    .seam
+                    .expect("a seam");
+                for boundary in [cjk.start_col, cjk.end_col] {
+                    assert_eq!(
+                        pixel(&rgba, w, usize::from(boundary) * CELL_W, cy),
+                        seam,
+                        "a hairline at column {boundary}"
+                    );
+                }
+            }
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
+        /// A TITLE THE CELL LANE DRAWS KEEPS ITS HAIRLINES. A title no face maps
+        /// (a private-use char) is the cell lane's, whose columns are not the
+        /// band's; the hairline between it and each quiet neighbour lies wholly
+        /// in the neighbour's band column, against the boundary, so the cell
+        /// lane drops none of it. NEGATIVE CONTROL: the 2026-10-18 band drew
+        /// hairlines only between two tabs it drew itself.
+        #[test]
+        fn quiet_neighbours_of_a_cell_lane_title_keep_their_hairlines() {
+            if !SELECTED_TAB_IS_GROUND {
+                return;
+            }
+            // A settled cascade with no chain face: the embedded primary alone.
+            let mut renderer = aterm_render::Renderer::from_bytes(
+                aterm_render::embedded_font(),
+                14.0,
+                Theme::default(),
+            )
+            .expect("embedded renderer");
+            renderer.set_runtime_font_discovery(false);
+            crate::tray_raster::install_settled_chrome_fonts_for_test(renderer);
+            if !with_ui_faces() {
+                return;
+            }
+            let (geometry, cy) = window_band(100);
+            let metadata = plain(4);
+            let segments = layout_segments_with_metadata(100, 4, &metadata, 0, false);
+            let titles = vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "logs \u{10FFFD}".to_string(),
+                "gamma".to_string(),
+            ];
+            assert!(!crate::tray_raster::strip_band_run_coverable(&titles[2]));
+            let input = band(
+                &segments,
+                &titles,
+                &metadata,
+                StripPaint::default(),
+                geometry,
+            );
+            let rows = raster_band(&input, &[]).expect("band");
+            let covered = |col: usize| rows[0].iter().any(|(c, _)| *c == col);
+            let lane = segments
+                .iter()
+                .find(|s| matches!(s.kind, TabHit::Select(2)))
+                .copied()
+                .expect("the cell lane's tab");
+            let (start, end) = (usize::from(lane.start_col), usize::from(lane.end_col));
+            assert!(!covered(start) && !covered(end - 1), "the cell lane's tab");
+            let (rgba, w, _) = image_of(&rows);
+            let seam = strip_colors_for_on(input.palette, input.floor)
+                .seam
+                .expect("a seam");
+            // Before the cell lane's tab: the last pixel column of `beta`.
+            let before = start * CELL_W - 1;
+            // After it: the first pixel column of `gamma`.
+            let after = end * CELL_W;
+            for x in [before, after] {
+                assert!(covered(x / CELL_W), "x={x} is a band column");
+                assert_eq!(pixel(&rgba, w, x, cy), seam, "a hairline at x={x}");
+            }
+            assert_eq!(hairline_x(90.0, 2.0, true, true), Some(89.0));
+            assert_eq!(hairline_x(90.0, 2.0, true, false), Some(88.0));
+            assert_eq!(hairline_x(90.0, 2.0, false, true), Some(90.0));
+            assert_eq!(hairline_x(90.0, 2.0, false, false), None);
             crate::tray_raster::clear_ui_fonts_for_test();
         }
 
@@ -6054,6 +8559,161 @@ pub(crate) mod pixel_band {
             crate::tray_raster::clear_ui_fonts_for_test();
         }
 
+        /// A tab's want ([`tab_wants`]) seats its whole title, laid out and
+        /// labelled: the band draws the title uncut in a tab of that width. A
+        /// spinner's frames (`✳ `, `✶ `, `· `, a braille frame) want the same
+        /// width, so a spinning title never moves its `✕`; a short title wants
+        /// less than the equal tab and keeps it. NEGATIVE CONTROL: at the fixed
+        /// 27 columns the same title is cut.
+        #[test]
+        fn a_tabs_want_seats_its_title_and_ignores_a_spinner() {
+            if !STRIP_WINDOWS_PAINT || !with_ui_faces() {
+                return;
+            }
+            let band_h = BAND_TOP + CELL_H;
+            let title = "Claude Code: fix the strip floor under splits".to_string();
+            // The frames this host's chrome stack draws (a frame it cannot draw
+            // sends the title to the cell lane, which wants nothing).
+            let spun: Vec<String> = ["\u{2733}", "\u{2736}", "\u{b7}", "\u{280b}"]
+                .iter()
+                .map(|frame| format!("{frame} Fix the strip floor under splits"))
+                .filter(|title| crate::tray_raster::strip_band_run_coverable(title))
+                .collect();
+            assert!(spun.len() >= 2, "CONTROL: two frames to compare");
+            // Every frame is measured as one stand-in, whatever its own advance;
+            // a title that merely starts with a letter or a path is not touched.
+            for frame in ["\u{2733}", "\u{2736}", "\u{b7}", "\u{280b}", "*"] {
+                assert_eq!(
+                    steady_title(&format!("{frame} Fix the strip")),
+                    "M Fix the strip",
+                    "the {frame:?} frame"
+                );
+            }
+            for plain in ["logs", "~/src/aterm", "C:\\Users", "1 build"] {
+                assert_eq!(steady_title(plain), plain);
+            }
+            let wants = tab_wants(&spun, &plain(spun.len()), CELL_W, band_h, 1.0);
+            assert!(
+                wants.windows(2).all(|pair| pair[0] == pair[1]),
+                "a spinner's frames move the tab: {wants:?}"
+            );
+            let short = tab_wants(&["logs".to_string()], &plain(1), CELL_W, band_h, 1.0);
+            assert!(short[0] <= MAX_CHIP_COLS, "a short title wants {short:?}");
+            let want = tab_wants(std::slice::from_ref(&title), &plain(1), CELL_W, band_h, 1.0)[0];
+            assert!(want > MAX_CHIP_COLS, "CONTROL: the title is long: {want}");
+            let label = |sizing: TabSizing<'_>| {
+                let metadata = plain(1);
+                let titles = vec![title.clone()];
+                let segments = layout_segments_with_version_sized(
+                    120,
+                    1,
+                    &metadata,
+                    0,
+                    false,
+                    VersionSlotCols::NONE,
+                    sizing,
+                );
+                let input = band(
+                    &segments,
+                    &titles,
+                    &metadata,
+                    StripPaint::default(),
+                    geometry(120, 1),
+                );
+                let label_px = band_label_px(band_h as f32, 1.0);
+                resolve_band_labels(&input, 0, 120, CELL_W as f32, label_px, true)[0]
+                    .clone()
+                    .expect("a label")
+            };
+            let wants = [want];
+            assert_eq!(
+                label(TabSizing {
+                    cap: MAX_CHIP_COLS,
+                    grow: 48,
+                    wants: &wants
+                }),
+                title,
+                "the grown tab seats the whole title"
+            );
+            assert_ne!(label(TabSizing::FIXED), title, "CONTROL: 27 columns cut it");
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
+        /// The selected title through the variable semibold pen reads at one weight
+        /// in a dark and a light theme: its mean gamma-space coverage on its tab
+        /// (each ink pixel's step from the tab toward the ink, in sRGB luma) agrees
+        /// within 5% between Default and Default Light, as every other chrome
+        /// glyph's does. NEGATIVE CONTROL: composited uncorrected, the light title
+        /// measured 0.54 against the dark's 0.68 (the 2026-10-18 judges'
+        /// `light-selected-tab-label-uncorrected-alpha`).
+        #[test]
+        fn the_selected_title_keeps_its_weight_on_light_and_dark_tabs() {
+            if !with_ui_faces() {
+                return;
+            }
+            if crate::tray_raster::strip_band_variable_semibold().is_none() {
+                // Static UI regular: the selected title takes the corrected pen.
+                crate::tray_raster::clear_ui_fonts_for_test();
+                return;
+            }
+            let luma = |c: [u8; 3]| {
+                0.2126 * f32::from(c[0]) + 0.7152 * f32::from(c[1]) + 0.0722 * f32::from(c[2])
+            };
+            let mean_coverage = |theme: Theme| {
+                let metadata = plain(2);
+                let segments = layout_segments_with_metadata(80, 2, &metadata, 0, false);
+                let titles = vec!["~\\aterm-winperfect".to_string(), "logs".to_string()];
+                let input = BandInput {
+                    palette: theme.into(),
+                    ..band(
+                        &segments,
+                        &titles,
+                        &metadata,
+                        StripPaint::default(),
+                        geometry(80, 1),
+                    )
+                };
+                let colors = strip_colors_for(input.palette);
+                let rows = raster_band(&input, &[]).expect("band");
+                let (rgba, w, h) = image_of(&rows);
+                let layout = tab_content_layout(&segments[0], metadata[0]);
+                let (ground, ink) = (luma(colors.active_bg), luma(colors.active_fg));
+                // Inside the tab only: the band above it is not ink, nor is
+                // the seam-tone rim along a light tab's top
+                // ([`selected_tab_rim`]).
+                let d = BandDesign::resolve(&geometry(80, 1), h, band_label_px(h as f32, 1.0));
+                let rim = if colors.active_rim.is_some() {
+                    strip_seam_px(1.0)
+                } else {
+                    0
+                };
+                let (mut sum, mut n) = (0.0f32, 0usize);
+                for y in (d.card_top.ceil() as usize + rim)..(d.card_bot.floor() as usize).min(h) {
+                    for x in usize::from(layout.title_start) * CELL_W
+                        ..usize::from(layout.title_end) * CELL_W
+                    {
+                        let px = pixel(&rgba, w, x, y);
+                        let t = (luma(px) - ground) / (ink - ground);
+                        if t > 0.02 {
+                            sum += t.min(1.0);
+                            n += 1;
+                        }
+                    }
+                }
+                assert!(n > 50, "the selected title inked {n} px");
+                sum / n as f32
+            };
+            let dark = mean_coverage(Theme::default());
+            let light = mean_coverage(Theme::from(
+                &aterm_types::scheme::builtin("Default Light").expect("builtin"),
+            ));
+            assert!(
+                (dark - light).abs() <= 0.05 * dark.max(light),
+                "the selected title's weight differs by theme: dark {dark:.3}, light {light:.3}"
+            );
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
         /// The band's title window and span for one segment, measured as
         /// [`resolve_band_labels`] does, without metadata (layout numbers only).
         fn window(seg: &TabSegment) -> (u16, f32) {
@@ -6070,15 +8730,17 @@ pub(crate) mod pixel_band {
 
         /// The pixel fit must not collapse labels the cell pass
         /// ([`distinct_chip_labels`]) made distinct, whether they arrive distinct
-        /// (four prompts the per-chip fit collapses) or already ordinal-ed (ten
-        /// shells in one cwd): no two chips paint one string, the active chip is
-        /// never re-cut, a chip that leads with digits leads with its OWN position
-        /// (never `1…` cut from `10 · …`), and every answer fits its span.
+        /// (four titles that differ only at their end, whole in cells, which the
+        /// per-chip head fit collapses to one `service-…`) or already ordinal-ed
+        /// (ten shells in one cwd): no two chips paint one string, the active chip
+        /// is never re-cut, a chip that leads with digits leads with its OWN
+        /// position (never `1…` cut from `10 · …`), and every answer fits its span.
+        /// (A tail cut keeps its end through the fit, so prompts no longer collide.)
         #[test]
         fn the_pixel_fit_cannot_undo_the_cell_pass_distinctness() {
             let distinct: Vec<String> = ["alpha", "beta", "gamma", "delta"]
                 .iter()
-                .map(|leaf| format!("user@m17-tower: ~/work/service-{leaf}"))
+                .map(|leaf| format!("service-{leaf}"))
                 .collect();
             let identical: Vec<String> = (0..10)
                 .map(|_| "user@m17-tower: ~/aterm · Typing a command".to_string())
@@ -6174,7 +8836,35 @@ pub(crate) mod pixel_band {
             )));
             assert_eq!(
                 fit_label("…and".to_string(), squeeze, |s| wide_face(1, s)),
-                "……"
+                "…",
+                "a tail cut keeps its end down to three characters, then the mark"
+            );
+            assert_eq!(
+                fit_label(
+                    "…\\work\\sub dir".to_string(),
+                    wide_face(0, "…sub dir"),
+                    |s| { wide_face(0, s) }
+                ),
+                "…sub dir",
+                "a tail cut sheds from the front, keeping what tells it apart"
+            );
+            assert_eq!(
+                fit_label(
+                    "2 · …\\work\\sub dir".to_string(),
+                    wide_face(0, "2 · …sub dir"),
+                    |s| { wide_face(0, s) }
+                ),
+                "2 · …sub dir",
+                "behind its ordinal too"
+            );
+            assert_eq!(
+                fit_label(
+                    "Thinking… (esc to interrupt)".to_string(),
+                    wide_face(0, "Thinking… (esc…"),
+                    |s| wide_face(0, s)
+                ),
+                "Thinking… (esc…",
+                "a title's own `…` is no cut: it keeps its head"
             );
             let mono = |_tab: usize, s: &str| s.chars().count() as f32 * CELL_W as f32;
             let twin_span = mono(0, "13 · ~\\aterm") + 1.0;
@@ -6190,14 +8880,15 @@ pub(crate) mod pixel_band {
             };
             type Check<'a> = &'a dyn Fn(&str, &[(usize, String)], &[BandLabel]);
             // (case, face, [(tab, span, cell label)], active, fallbacks, check).
-            let cases: [(
-                &str,
-                &dyn Fn(usize, &str) -> f32,
-                Vec<(usize, f32, &str)>,
+            type Case<'a> = (
+                &'a str,
+                &'a dyn Fn(usize, &str) -> f32,
+                Vec<(usize, f32, &'a str)>,
                 usize,
-                &[&str],
-                Check,
-            ); 7] = [
+                &'a [&'a str],
+                Check<'a>,
+            );
+            let cases: [Case; 7] = [
                 (
                     "stranded selection",
                     &wide_face,
@@ -6316,6 +9007,190 @@ pub(crate) mod pixel_band {
             }
         }
 
+        /// Titles are cut for the UI face on Windows, not for terminal cells (Linux
+        /// keeps its cell cut): a short title in a chip the cells call too narrow
+        /// is whole (`Settings`, not `Settin…`), and a path the UI-widened budget
+        /// would keep whole but the face cannot fit is cut by the cell pass at a
+        /// narrower step, so both twins keep the directory (`…\work\sub dir`), the
+        /// quiet one behind its ordinal, rather than a pixel trim of the path's
+        /// tail.
+        #[test]
+        fn chip_titles_are_cut_for_the_ui_face_and_paths_keep_their_end() {
+            if !with_ui_faces() {
+                crate::tray_raster::clear_ui_fonts_for_test();
+                return;
+            }
+            let label_px = 13.0;
+            if !STRIP_WINDOWS_PAINT {
+                assert_eq!(
+                    ui_cells_per_cell(CELL_W as f32, label_px),
+                    1.0,
+                    "Linux keeps cutting titles in terminal cells"
+                );
+                crate::tray_raster::clear_ui_fonts_for_test();
+                return;
+            }
+            assert!(
+                ui_cells_per_cell(CELL_W as f32, label_px) > 1.2,
+                "the UI face sets more than a character per 9 px cell"
+            );
+            // Two 12-column chips: seven cells of title room, which cut `Settings`
+            // to `Settin…` in cells, though it measures well inside 62 px.
+            let titles = vec!["Settings".to_string(), "x".to_string()];
+            let metadata = plain(2);
+            let segments = layout_segments_with_metadata(27, 2, &metadata, 0, false);
+            let input = band(
+                &segments,
+                &titles,
+                &metadata,
+                StripPaint::default(),
+                geometry(27, 1),
+            );
+            let resolved = resolve_band_labels(&input, 0, 27, CELL_W as f32, label_px, true);
+            assert_eq!(resolved[0].as_deref(), Some("Settings"), "{resolved:?}");
+
+            let dir = r"C:\Users\m6-an\AppData\Local\Temp\wp-chrome2\work\sub dir".to_string();
+            let titles = vec![dir.clone(), dir];
+            let segments = layout_segments_with_metadata(100, 2, &metadata, 0, false);
+            let input = band(
+                &segments,
+                &titles,
+                &metadata,
+                StripPaint::default(),
+                geometry(100, 1),
+            );
+            let resolved = resolve_band_labels(&input, 0, 100, CELL_W as f32, label_px, true);
+            for (i, label) in resolved.iter().enumerate() {
+                let label = label.as_deref().expect("a painted chip has a label");
+                assert!(label.ends_with(r"\sub dir"), "tab {i}: {label:?}");
+            }
+            assert!(
+                resolved[1]
+                    .as_deref()
+                    .is_some_and(|l| l.starts_with("2 · ")),
+                "the quiet twin is numbered: {resolved:?}"
+            );
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
+        /// EACH TAB IS CUT AT ITS OWN WIDEST STEP ([`widest_fitting_cuts`],
+        /// font-free): a label that overruns its span at a step waits for a
+        /// narrower one, and a label that fits keeps the step it fits at, however
+        /// far a neighbour has to narrow. At the floor (1.0) every label left is
+        /// taken as it is. NEGATIVE CONTROL: one step for the whole strip cut the
+        /// fitting tab at the wide tab's step too.
+        #[test]
+        fn each_tab_is_cut_at_its_own_widest_step() {
+            // Two tabs of 20 cells; the cell pass at `widen` keeps that many
+            // characters of each title, the rest behind `…`.
+            let wide = "W".repeat(40);
+            let titles = [wide.as_str(), "Claude Code: reviewing the strip"];
+            let labels_at = |widen: f32| -> Vec<Option<String>> {
+                // The steps are tenths; read them as such, not a hair under.
+                let keep = (20.0 * widen + 0.001).floor() as usize;
+                titles
+                    .iter()
+                    .map(|title| {
+                        Some(if title.chars().count() <= keep {
+                            (*title).to_string()
+                        } else {
+                            title.chars().take(keep - 1).collect::<String>() + "…"
+                        })
+                    })
+                    .collect()
+            };
+            // `W` is twice as wide as the other letters.
+            let width = |s: &str| {
+                s.chars()
+                    .map(|c| if c == 'W' { 14.0 } else { 7.0 })
+                    .sum::<f32>()
+            };
+            let overflows = |_: usize, s: &str, span: f32| width(s) > span;
+            // Tab 0 overruns 200 px at every step and is taken at the floor;
+            // tab 1 fits 250 px at the first step, 1.5, and keeps it.
+            let cut = widest_fitting_cuts(&[(0, 200.0), (1, 250.0)], 1.5, labels_at, overflows);
+            assert_eq!(cut.len(), 2);
+            let floor = format!("{}…", "W".repeat(19));
+            assert_eq!(
+                cut[0].as_deref(),
+                Some(floor.as_str()),
+                "the floor: {cut:?}"
+            );
+            assert_eq!(
+                cut[1].as_deref(),
+                Some("Claude Code: reviewing the st…"),
+                "the fitting tab keeps its own step"
+            );
+            // The strip-wide step would have cut it with tab 0, at the floor.
+            assert_eq!(
+                labels_at(1.0)[1].as_deref(),
+                Some("Claude Code: review…"),
+                "CONTROL"
+            );
+            // A label that first fits at a middle step (1.2, 24 cells) stops
+            // there.
+            let middle = widest_fitting_cuts(&[(1, 180.0)], 1.5, labels_at, overflows);
+            assert_eq!(
+                middle[1].as_deref(),
+                Some("Claude Code: reviewing …"),
+                "{middle:?}"
+            );
+            // A tab the pass does not seat gets nothing.
+            assert_eq!(middle[0], None);
+        }
+
+        /// A NEIGHBOUR'S TITLE COSTS A TAB NO CHARACTERS (with the UI faces): at
+        /// 200% (17 px cells, a 26 px label) in a five-tab strip, the Claude Code
+        /// task's label, quiet or selected, reads the same beside a
+        /// `C:\Users\m6-an\aterm` tab as beside a `logs` tab, and the same
+        /// quiet as selected. NEGATIVE CONTROL:
+        /// with one step for the whole strip the path tab's overrun cut it to
+        /// `Claude Code: rev…` (the 2026-10-18 verifier's
+        /// `A11-hidpi-selected-label-fit`, measured live at 150% and 200%).
+        #[test]
+        fn a_neighbours_title_costs_a_tab_no_characters() {
+            if !STRIP_WINDOWS_PAINT || !with_ui_faces() {
+                crate::tray_raster::clear_ui_fonts_for_test();
+                return;
+            }
+            let claude = "Claude Code: reviewing platform_win.rs and the Default Light contrast of bright white on blue";
+            let (cw, label_px) = (17.0, 26.0);
+            let metadata = plain(5);
+            let label_of = |first: &str, active: usize| {
+                let titles: Vec<String> = [first, "build", claude, "wsl ~/src", "logs"]
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect();
+                let segments = layout_segments_with_metadata(100, 5, &metadata, active, false);
+                let input = band(
+                    &segments,
+                    &titles,
+                    &metadata,
+                    StripPaint::default(),
+                    geometry(100, 1),
+                );
+                resolve_band_labels(&input, active, 100, cw, label_px, true)[2]
+                    .clone()
+                    .expect("the Claude tab is labelled")
+            };
+            for active in [0, 2] {
+                let beside_logs = label_of("logs-old", active);
+                let beside_path = label_of(r"C:\Users\m6-an\aterm", active);
+                assert_eq!(beside_path, beside_logs, "active {active}");
+                assert!(
+                    beside_logs.starts_with("Claude Code: revi"),
+                    "{beside_logs:?}"
+                );
+            }
+            // Its step is chosen in the selected weight, so selecting it
+            // changes none of its words.
+            assert_eq!(
+                label_of(r"C:\Users\m6-an\aterm", 0),
+                label_of(r"C:\Users\m6-an\aterm", 2)
+            );
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
         /// Band label plumbing end to end, no fonts needed: every painted chip gets
         /// a resolved label, the inline rename segment gets none, and no two chips
         /// share a string.
@@ -6355,24 +9230,70 @@ pub(crate) mod pixel_band {
             }
         }
 
+        /// A CUT THAT KEEPS ITS END KEEPS IT THROUGH THE PIXEL FIT ([`fit_label`],
+        /// font-free): a command cut's head gives way a character at a time,
+        /// then the whole head, then the file's own head behind a leading mark,
+        /// so `…platform_win.rs` outlives `vim`. Only such a cut (and a tail
+        /// cut) is re-cut this way where the variable pen overruns its span
+        /// ([`cut_keeps_its_end`]); a head cut and a title that says `…` itself
+        /// keep [`VariablePen::fit`]'s head cut.
+        #[test]
+        fn the_pixel_fit_keeps_a_command_cuts_file() {
+            let measure = |s: &str| s.chars().count() as f32 * 7.0;
+            let label = format!("vim -n -R{MIDDLE_MARK}src/platform_win.rs");
+            assert_eq!(fit_label(label.clone(), 300.0, measure), label);
+            for (span, want) in [
+                (210.0, "vim -n - … src/platform_win.rs"),
+                (180.0, "vim … src/platform_win.rs"),
+                (140.0, "…src/platform_win.rs"),
+                (100.0, "…atform_win.rs"),
+            ] {
+                let fitted = fit_label(label.clone(), span, measure);
+                assert_eq!(fitted, want, "{span} px");
+                assert!(measure(&fitted) <= span, "{fitted:?} in {span} px");
+            }
+            for (label, keeps) in [
+                ("vim -n … src/x.rs", true),
+                ("…src/x.rs", true),
+                ("2 · …src/x.rs", true),
+                ("vim -n -R -i NO…", false),
+                ("Thinking… (esc to interrupt)", false),
+                ("logs", false),
+                ("…", false),
+            ] {
+                assert_eq!(cut_keeps_its_end(label), keeps, "{label:?}");
+            }
+        }
+
         /// `(band_top_px, cell_h, underline_y)` for the optical bands the Windows
-        /// metrics produce at 96 dpi for four font sizes. The synthetic head keeps
-        /// the band 32 px, so `band_top` shrinks as `cell_h` grows:
+        /// metrics produce at 96 dpi for four font sizes. The synthetic head
+        /// keeps the band 32 px, so `band_top` shrinks as `cell_h` grows. On
+        /// Windows the seam is the band's last pixel row (31) at every size; on
+        /// Linux it is the cell underline ([`seal_strip_bottom`]), at the seam
+        /// row below ([`band_seam_top`]):
         ///
-        /// | `font_px` | cell   | `pad_top + head` | seam row |
-        /// |----------:|:-------|-----------------:|---------:|
-        /// | 11        | 6×13   | 2 + 17 = 19      | 29       |
-        /// | 13        | 8×15   | 2 + 15 = 17      | 29       |
-        /// | 16        | 9×19   | 2 + 11 = 13      | 28       |
-        /// | 20        | 12×23  | 2 + 7  = 9       | 27       |
+        /// | `font_px` | cell   | `pad_top + head` | Linux seam row |
+        /// |----------:|:-------|-----------------:|---------------:|
+        /// | 11        | 6×13   | 2 + 17 = 19      | 29             |
+        /// | 13        | 8×15   | 2 + 15 = 17      | 29             |
+        /// | 16        | 9×19   | 2 + 11 = 13      | 28             |
+        /// | 17        | 9×23   | 2 + 7  = 9       | 27             |
         const WIN_BANDS: [(usize, usize, usize); 4] =
             [(19, 13, 10), (17, 15, 12), (13, 19, 15), (9, 23, 18)];
 
-        /// A one-window band at `(band_top, cell_h, underline_y)`.
-        fn win_geometry(
-            cols: usize,
-            (band_top, cell_h, underline_y): (usize, usize, usize),
-        ) -> BandGeometry {
+        /// The seam's canvas row for a [`WIN_BANDS`] band, as the splice resolves
+        /// it ([`BandGeometry::seam_top_px`]).
+        fn band_seam_top((band_top, cell_h, underline_y): (usize, usize, usize)) -> usize {
+            if STRIP_WINDOWS_PAINT {
+                band_top + cell_h - strip_seam_px(1.0)
+            } else {
+                band_top + underline_y
+            }
+        }
+
+        /// A one-window band at a [`WIN_BANDS`] row.
+        fn win_geometry(cols: usize, win: (usize, usize, usize)) -> BandGeometry {
+            let (band_top, cell_h, _) = win;
             BandGeometry {
                 cols,
                 cell_w: CELL_W,
@@ -6380,12 +9301,15 @@ pub(crate) mod pixel_band {
                 strip_rows: 1,
                 band_top_px: band_top,
                 scale: 1.0,
-                seam_top_px: Some(band_top + underline_y),
+                seam_top_px: Some(band_seam_top(win)),
+                foot_px: 0,
             }
         }
 
         /// At every Windows band, the label run sits inside its card and its
-        /// descenders clear the seam the cell lane stamps over the raster.
+        /// descenders clear the seam: on the band's last row, which the canvas
+        /// draws, on Windows; the cell lane's underline, which it does not, on
+        /// Linux.
         #[test]
         fn the_label_stays_in_its_card_with_descender_room_at_every_font_px() {
             if !with_ui_faces() {
@@ -6393,7 +9317,8 @@ pub(crate) mod pixel_band {
             }
             let colors = strip_colors_with_active(Theme::default(), None);
             for win in WIN_BANDS {
-                let (band_top, cell_h, underline_y) = win;
+                let (band_top, cell_h, _) = win;
+                let seam_top = band_seam_top(win);
                 let metadata = plain(2);
                 let segments = layout_segments_with_metadata(80, 2, &metadata, 0, false);
                 // ASCENDER and DESCENDER in one run, so the bbox is the label's
@@ -6439,11 +9364,397 @@ pub(crate) mod pixel_band {
                 );
                 // DESCENDER ROOM: the last inked row clears the seam rule.
                 assert!(
-                    y1 <= band_top + underline_y,
-                    "{win:?}: descenders reach {y1}, seam rule at {}",
-                    band_top + underline_y
+                    y1 < seam_top,
+                    "{win:?}: descenders reach {y1}, seam rule at {seam_top}"
                 );
+                if d.tabs {
+                    // A Windows tab stands on the seam, its title's ink box
+                    // centred in it with air at both ends.
+                    assert_eq!(d.card_bot, seam_top as f32, "{win:?}: on the seam");
+                    let (above, below) = (y0 as f32 - d.card_top, d.card_bot - 1.0 - y1 as f32);
+                    assert!(
+                        above >= 1.0 && below >= 1.0 && (above - below).abs() <= 3.0,
+                        "{win:?}: ink {y0}..={y1} in tab {}..{}: {above} above, {below} below",
+                        d.card_top,
+                        d.card_bot
+                    );
+                } else {
+                    // The card row is centred in the band above the seam: as far
+                    // below the window's top edge as above the rule.
+                    let above = d.card_top;
+                    let below = seam_top as f32 - d.card_bot;
+                    assert!(
+                        (above - below).abs() <= 1.0,
+                        "{win:?}: card {}..{} is not centred over the seam at {seam_top}",
+                        d.card_top,
+                        d.card_bot
+                    );
+                }
+                // On Windows the rule is the band's last row, in the seam tone,
+                // edge to edge; on Linux the canvas leaves it to the cell lane.
+                let seam = colors.seam.expect("a chrome band has a seam");
+                for x in [0, w / 2, w - 1] {
+                    let at = (seam_top * w + x) * 4;
+                    assert_eq!(
+                        &rgba[at..at + 3] == seam.as_slice(),
+                        STRIP_WINDOWS_PAINT,
+                        "{win:?}: seam at x={x}"
+                    );
+                }
             }
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
+        /// THE WINDOWS TAB ROW (`SELECTED_TAB_IS_GROUND`), on the real window's
+        /// band (2 px pad, a 13 px head, one 23 px row: the 32 px band and the
+        /// 6 px foot): the selected tab is the terminal's ground and runs through
+        /// the seam and the foot into the grid; a quiet tab has no card, the seam
+        /// runs under it and the foot below; two quiet neighbours are parted by a
+        /// hairline, a quiet tab and the selected one are not. On a light theme
+        /// the selected tab is the band's LIGHTEST surface. NEGATIVE CONTROL: the
+        /// 2026-10-18 strip painted every quiet tab a card and the selected one a
+        /// capsule above an unbroken seam, the darkest chip of a light band.
+        #[test]
+        fn a_selected_tab_opens_into_the_grid_and_quiet_tabs_are_bare() {
+            if !SELECTED_TAB_IS_GROUND || !with_ui_faces() {
+                return;
+            }
+            let (band_top, cell_h, foot) = (15usize, 23usize, 6usize);
+            let h = band_top + cell_h;
+            let seam_top = h - strip_seam_px(1.0) - foot;
+            let geometry = BandGeometry {
+                cols: 90,
+                cell_w: CELL_W,
+                cell_h,
+                strip_rows: 1,
+                band_top_px: band_top,
+                scale: 1.0,
+                seam_top_px: Some(seam_top),
+                foot_px: foot,
+            };
+            for theme in [
+                Theme::default(),
+                Theme::from(&aterm_types::scheme::builtin("Solarized Light").expect("builtin")),
+            ] {
+                let colors = strip_colors_with_active(theme, None);
+                let seam = colors.seam.expect("a seam");
+                let metadata = plain(3);
+                let segments = layout_segments_with_metadata(90, 3, &metadata, 0, false);
+                let titles = vec!["Apply".to_string(), "gypsy".to_string(), "logs".to_string()];
+                let input = band(
+                    &segments,
+                    &titles,
+                    &metadata,
+                    StripPaint::default(),
+                    geometry,
+                );
+                let input = BandInput {
+                    palette: theme.into(),
+                    ..input
+                };
+                let rows = raster_band(&input, &[]).expect("band");
+                let (rgba, w, img_h) = image_of(&rows);
+                assert_eq!(img_h, h);
+                let at = |x: usize, y: usize| pixel(&rgba, w, x, y);
+                let mid = |i: usize| {
+                    let s = segments[i];
+                    (
+                        usize::from(s.start_col) * CELL_W + 4,
+                        usize::from(s.end_col) * CELL_W,
+                    )
+                };
+                let (active_x, _) = mid(0);
+                let (quiet_x, quiet_end) = mid(1);
+                for y in [seam_top, seam_top + 1, h - 1] {
+                    assert_eq!(at(active_x, y), colors.foot, "the selected tab at y={y}");
+                }
+                assert_eq!(
+                    colors.active_bg, colors.foot,
+                    "the selected tab IS the ground"
+                );
+                assert_eq!(at(quiet_x, seam_top), seam, "the seam under a quiet tab");
+                assert_eq!(at(quiet_x, h - 1), colors.foot, "the foot");
+                assert_eq!(
+                    at(quiet_x, seam_top - 3),
+                    colors.band_bg,
+                    "a quiet tab has no card"
+                );
+                let d = BandDesign::resolve(&geometry, h, band_label_px(h as f32, 1.0));
+                let cy = (d.baseline - band_label_px(h as f32, 1.0) * 0.35).round() as usize;
+                assert_eq!(at(quiet_end, cy), seam, "a hairline between quiet tabs");
+                let (_, active_end) = mid(0);
+                assert_eq!(
+                    at(active_end, cy),
+                    colors.band_bg,
+                    "none beside the selection"
+                );
+                let luma = |c: [u8; 3]| crate::chrome_band::contrast(c, [0, 0, 0]);
+                if bg_is_light(colors.foot) {
+                    assert!(
+                        luma(colors.active_bg) > luma(colors.band_bg)
+                            && luma(colors.hover_bg) < luma(colors.band_bg),
+                        "light: the selected tab rises toward white, the hover toward the ink"
+                    );
+                }
+            }
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
+        /// THE SELECTED TAB IS ONE SURFACE WITH WHAT LIES UNDER THE SEAM
+        /// ([`StripFloor`]), on the real window's band: over a native page it
+        /// takes the page's surface and opens through the seam and the foot into
+        /// it; over a band it cannot take (the find panel's, the message band's)
+        /// it stands closed on the seam in the terminal's ground and the foot is
+        /// the band's tone, so the panel under it is not fused with the tab;
+        /// over the ground (the grid, a split's ground-wearing headers) it opens
+        /// as before. NEGATIVE CONTROL: the 2026-10-18 band painted the ground's
+        /// tab and foot over every floor: a dark notch over a lighter Settings
+        /// page, an island in the grey header band, an L with the find well (the
+        /// judges' `settings-tab-ground-mismatch`, `selected-tab-opens-onto-grey-band`).
+        #[test]
+        fn the_selected_tab_joins_what_lies_under_the_seam() {
+            if !SELECTED_TAB_IS_GROUND || !with_ui_faces() {
+                return;
+            }
+            let (band_top, cell_h, foot) = (15usize, 23usize, 6usize);
+            let h = band_top + cell_h;
+            let seam_top = h - strip_seam_px(1.0) - foot;
+            let geometry = BandGeometry {
+                cols: 90,
+                cell_w: CELL_W,
+                cell_h,
+                strip_rows: 1,
+                band_top_px: band_top,
+                scale: 1.0,
+                seam_top_px: Some(seam_top),
+                foot_px: foot,
+            };
+            for theme in [
+                Theme::default(),
+                Theme::from(&aterm_types::scheme::builtin("Default Light").expect("builtin")),
+            ] {
+                let ground = strip_colors(theme).foot;
+                let band_bg = strip_colors(theme).band_bg;
+                let page = crate::settings::Roles::from_theme(theme).surface;
+                assert_ne!(page, ground, "CONTROL: the page is not the ground");
+                let metadata = plain(3);
+                let segments = layout_segments_with_metadata(90, 3, &metadata, 0, false);
+                let titles = vec![
+                    "Settings".to_string(),
+                    "build".to_string(),
+                    "logs".to_string(),
+                ];
+                let paint_over = |floor: StripFloor| {
+                    let input = BandInput {
+                        palette: theme.into(),
+                        floor,
+                        ..band(
+                            &segments,
+                            &titles,
+                            &metadata,
+                            StripPaint::default(),
+                            geometry,
+                        )
+                    };
+                    let rows = raster_band(&input, &[]).expect("band");
+                    image_of(&rows)
+                };
+                let active_x = usize::from(segments[0].start_col) * CELL_W + 4;
+                let quiet_x = usize::from(segments[1].start_col) * CELL_W + 4;
+                let seam = strip_colors(theme).seam.expect("a seam");
+                let inside = seam_top - 3;
+                for (floor, tab, opens, under) in [
+                    (StripFloor::Ground, ground, true, ground),
+                    (StripFloor::Surface(ground), ground, true, ground),
+                    (StripFloor::Surface(page), page, true, page),
+                    (StripFloor::Surface(band_bg), ground, false, band_bg),
+                ] {
+                    let (rgba, w, _) = paint_over(floor);
+                    let at = |x: usize, y: usize| pixel(&rgba, w, x, y);
+                    assert_eq!(at(active_x, inside), tab, "{floor:?}: the selected tab");
+                    let at_seam = if opens { tab } else { seam };
+                    assert_eq!(at(active_x, seam_top), at_seam, "{floor:?}: under the tab");
+                    assert_eq!(
+                        at(active_x, h - 1),
+                        under,
+                        "{floor:?}: the foot under the tab"
+                    );
+                    assert_eq!(at(quiet_x, seam_top), seam, "{floor:?}: the seam elsewhere");
+                    assert_eq!(at(quiet_x, h - 1), under, "{floor:?}: the foot elsewhere");
+                }
+            }
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
+        /// A SELECTED TAB ON A LIGHT BAND WEARS THE SEAM ([`selected_tab_rim`]):
+        /// over Default Light's Settings page (`#eaebeb` on its `#e2e3e5` band,
+        /// 1.08:1) and over its grid (1.20:1) alike the selected tab keeps its
+        /// floor's tone and opens into it, its sides and top a seam-tone
+        /// hairline whose sides run down through the seam rows to meet the
+        /// rule, the foot under it the floor. At 1x and 2x the hairline is the
+        /// seam's own thickness. Over Default's page and grid the tab has no
+        /// outline. NEGATIVE CONTROL: the 2026-10-18 band left the light
+        /// Settings tab rimless, a shape only its missing seam drew (the
+        /// judges' `j3d-light-settings-tab-faint`), and the next one rimmed it
+        /// but not the light terminal tab (`J4F-4-light-selected-tab-two-idioms`).
+        #[test]
+        fn a_selected_tab_the_band_would_swallow_wears_the_seam() {
+            if !SELECTED_TAB_IS_GROUND || !with_ui_faces() {
+                return;
+            }
+            let light =
+                Theme::from(&aterm_types::scheme::builtin("Default Light").expect("builtin"));
+            for (theme, page, rimmed) in [
+                (light, true, true),
+                (light, false, true),
+                (Theme::default(), true, false),
+                (Theme::default(), false, false),
+            ] {
+                let floor = if page {
+                    StripFloor::Surface(crate::settings::Roles::from_theme(theme).surface)
+                } else {
+                    StripFloor::Ground
+                };
+                let colors = strip_colors_for_on(theme, floor);
+                assert_eq!(
+                    colors.active_rim.is_some(),
+                    rimmed,
+                    "page={page} {:?}: {:.2}:1",
+                    colors.active_bg,
+                    crate::chrome_band::contrast(colors.active_bg, colors.band_bg)
+                );
+                for scale in [1usize, 2] {
+                    let (band_top, cell_h, foot) = (15 * scale, 23 * scale, 6 * scale);
+                    let cell_w = CELL_W * scale;
+                    let h = band_top + cell_h;
+                    let seam_px = strip_seam_px(scale as f32);
+                    let seam_top = h - seam_px - foot;
+                    let geometry = BandGeometry {
+                        cols: 90,
+                        cell_w,
+                        cell_h,
+                        strip_rows: 1,
+                        band_top_px: band_top,
+                        scale: scale as f32,
+                        seam_top_px: Some(seam_top),
+                        foot_px: foot,
+                    };
+                    let metadata = plain(3);
+                    let segments = layout_segments_with_metadata(90, 3, &metadata, 0, false);
+                    let titles = vec![
+                        "Settings".to_string(),
+                        "build".to_string(),
+                        "logs".to_string(),
+                    ];
+                    let input = BandInput {
+                        palette: theme.into(),
+                        floor,
+                        ..band(
+                            &segments,
+                            &titles,
+                            &metadata,
+                            StripPaint::default(),
+                            geometry,
+                        )
+                    };
+                    let rows = raster_band(&input, &[]).expect("band");
+                    let (rgba, w, _) = image_of(&rows);
+                    let at = |x: usize, y: usize| pixel(&rgba, w, x, y);
+                    // Within a step per channel: the rim is an anti-aliased stroke.
+                    let near =
+                        |a: [u8; 3], b: [u8; 3]| a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 2);
+                    let d =
+                        BandDesign::resolve(&geometry, h, band_label_px(h as f32, scale as f32));
+                    let x0 = usize::from(segments[0].start_col) * cell_w + d.gap_h as usize;
+                    let x1 = usize::from(segments[0].end_col) * cell_w - d.gap_h as usize;
+                    let seam = colors.seam.expect("a seam");
+                    let tab = colors.active_bg;
+                    let inside = seam_top - 3 * scale;
+                    let case = format!("page={page} {scale}x");
+                    let mid_x = (x0 + x1) / 2;
+                    let top = d.card_top as usize;
+                    let is = |x: usize, y: usize, want: [u8; 3], what: &str| {
+                        let got = at(x, y);
+                        assert!(
+                            near(got, want),
+                            "{case}: {what} at ({x}, {y}): {got:?}, not {want:?}"
+                        );
+                    };
+                    if rimmed {
+                        for k in 0..seam_px {
+                            for y in [inside, seam_top, seam_top + seam_px - 1] {
+                                is(x0 + k, y, seam, "the left side");
+                                is(x1 - 1 - k, y, seam, "the right side");
+                            }
+                            is(mid_x, top + k, seam, "the top");
+                        }
+                        is(x0 + seam_px, inside, tab, "inside the rim");
+                        is(mid_x, top + seam_px, tab, "under the top");
+                        is(x0 + seam_px, seam_top, tab, "the opening");
+                    } else {
+                        is(x0, inside, tab, "no rim");
+                        is(mid_x, top, tab, "no rim on top");
+                    }
+                    assert_eq!(at(x0, h - 1), colors.foot, "{case}: the foot under the tab");
+                    assert_eq!(at(mid_x, h - 1), colors.foot, "{case}: the foot");
+                }
+            }
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
+        /// A compact band (the headless 25 px band: a 2 px pad over one 23 px
+        /// row) keeps a title's descenders a pixel inside its tab at 100%.
+        /// NEGATIVE CONTROL: cap-centred, the descenders of `gypsy` reached the
+        /// card's last row (the 2026-10-18 judges' `tab-title-descender-clearance`).
+        #[test]
+        fn a_compact_tab_keeps_its_descenders_inside() {
+            if !SELECTED_TAB_IS_GROUND || !with_ui_faces() {
+                return;
+            }
+            let geometry = BandGeometry {
+                cols: 80,
+                cell_w: CELL_W,
+                cell_h: 23,
+                strip_rows: 1,
+                band_top_px: 2,
+                scale: 1.0,
+                seam_top_px: Some(24),
+                foot_px: 0,
+            };
+            let colors = strip_colors_with_active(Theme::default(), None);
+            let metadata = plain(2);
+            let segments = layout_segments_with_metadata(80, 2, &metadata, 0, false);
+            let titles = vec!["gypsy jig".to_string(), "Apply".to_string()];
+            let input = band(
+                &segments,
+                &titles,
+                &metadata,
+                StripPaint::default(),
+                geometry,
+            );
+            let rows = raster_band(&input, &[]).expect("band");
+            let (rgba, w, h) = image_of(&rows);
+            let layout = tab_content_layout(&segments[0], metadata[0]);
+            let (_, y0, _, y1) = ink_bbox_off_surfaces(
+                &rgba,
+                w,
+                h,
+                usize::from(layout.title_start) * CELL_W,
+                usize::from(layout.title_end) * CELL_W,
+                &[colors.band_bg, colors.active_bg, colors.chip_bg],
+            )
+            .expect("the title inks");
+            let d = BandDesign::resolve(&geometry, h, band_label_px(h as f32, 1.0));
+            assert!(
+                y1 as f32 <= d.card_bot - 2.0,
+                "descenders at {y1}, the tab ends at {}",
+                d.card_bot
+            );
+            assert!(
+                y0 as f32 >= d.card_top + 1.0,
+                "ascenders at {y0}, the tab starts at {}",
+                d.card_top
+            );
             crate::tray_raster::clear_ui_fonts_for_test();
         }
     }
@@ -6518,111 +9829,6 @@ mod tests {
         assert_eq!(segs[1].start_col, 20 - NEW_TAB_W);
     }
 
-    /// A chip with status marks gains a `connector_col` at exactly the cell the
-    /// painter puts the status canvas on, hit-testing to [`TabHit::Connector`]; the
-    /// close column keeps its own cell, markless chips and the metadata-free layout
-    /// mint no connector.
-    #[test]
-    fn connector_col_is_the_painted_status_cell_and_hits_connector() {
-        let theme = Theme::default();
-        let mut busy = crate::tab_model::TabPresentation::terminal("a");
-        busy.indicators.busy = true;
-        let metadata = [
-            TabStripMetadata::from_presentation(&busy),
-            TabStripMetadata::from_presentation(&crate::tab_model::TabPresentation::terminal("b")),
-        ];
-        let segments = layout_segments_with_metadata(60, 2, &metadata, 0, false);
-        let seg = segments[0];
-        let connector = seg.connector_col.expect("status marks mint a connector");
-        assert_ne!(Some(connector), seg.close_col, "distinct from the close ✕");
-        assert_eq!(hit_test(&segments, connector), Some(TabHit::Connector(0)));
-        assert_eq!(
-            hit_test(&segments, seg.close_col.expect("wide chip has a ✕")),
-            Some(TabHit::Close(0))
-        );
-        assert_eq!(
-            hit_test(&segments, seg.start_col + 1),
-            Some(TabHit::Select(0))
-        );
-        assert_eq!(
-            segments[1].connector_col, None,
-            "a markless chip has no connector; its whole interior selects"
-        );
-        assert_eq!(
-            hit_test(&segments, segments[1].start_col + 3),
-            Some(TabHit::Select(1))
-        );
-
-        // Hit geometry == painted geometry: the status image lands on the SAME
-        // cell the hit region claims.
-        let titles = ["one".to_string(), "two".to_string()];
-        let mut row = vec![blank_cell(theme); 60];
-        let images = paint_strip_with_metadata(
-            &mut row,
-            &segments,
-            &titles,
-            &metadata,
-            StripPaint {
-                hovered: None,
-                new_tab_hovered: false,
-                version_hovered: false,
-                caption_hovered: None,
-                subtitle: None,
-                rename: None,
-            },
-            0,
-            theme,
-            None,
-        );
-        assert!(
-            images.iter().any(|(col, _)| *col == usize::from(connector)),
-            "the status canvas paints exactly on the connector cell"
-        );
-
-        // The metadata-free base layout never mints a connector.
-        assert!(
-            layout_segments(60, 2, 0, false)
-                .iter()
-                .all(|s| s.connector_col.is_none())
-        );
-
-        // A chip too narrow to paint its marks mints no connector; the context menu
-        // is the connect path there.
-        let narrow = layout_segments_with_metadata(9, 3, &[metadata[0]; 3], 0, false);
-        assert!(
-            narrow.iter().all(|s| s.connector_col.is_none()),
-            "narrow chips drop the marks, so they must drop the connector"
-        );
-        assert_eq!(
-            hit_test(&narrow, narrow[0].start_col + 1),
-            Some(TabHit::Select(0))
-        );
-
-        // A lone tab (the solo title band on macOS, a chip elsewhere): its status
-        // cell is the connector, hit and painted on the same cell; markless, none.
-        let lone = layout_segments_with_metadata(40, 1, &metadata[..1], 0, false);
-        assert_eq!(lone[0].solo, SOLO_TITLE_BAND);
-        let connector = lone[0].connector_col.expect("a lone tab with marks");
-        assert_eq!(hit_test(&lone, connector), Some(TabHit::Connector(0)));
-        let mut row = vec![blank_cell(theme); 40];
-        let images = paint_strip_with_metadata(
-            &mut row,
-            &lone,
-            &titles[..1],
-            &metadata[..1],
-            StripPaint::default(),
-            0,
-            theme,
-            None,
-        );
-        assert!(
-            images.iter().any(|(col, _)| *col == usize::from(connector)),
-            "the lone tab's status canvas paints on the connector cell"
-        );
-        let clean = layout_segments_with_metadata(40, 1, &metadata[1..], 0, false);
-        assert_eq!(clean[0].connector_col, None);
-    }
-
     /// The inline rename field replaces the chip's title span with the find bar's
     /// well: text verbatim (wide chars as themselves), a reverse-video block caret
     /// covering both cells of a wide char, and the selected chip's accent seam kept
@@ -6637,7 +9843,7 @@ mod tests {
         let segments = layout_segments_with_metadata(60, 2, &metadata, 0, false);
         let titles = ["one".to_string(), "two".to_string()];
         let mut row = vec![blank_cell(theme); 60];
-        paint_strip_with_metadata(
+        let (_, painted_caret) = paint_strip_with_metadata_and_rename_caret(
             &mut row,
             &segments,
             &titles,
@@ -6656,8 +9862,8 @@ mod tests {
                 }),
             },
             0,
-            theme,
-            None,
+            theme.into(),
+            StripFloor::Ground,
         );
         let seg = segments[0];
         let painted: String = row[seg.start_col as usize..seg.end_col as usize]
@@ -6701,6 +9907,44 @@ mod tests {
             .map(|c| c.ch)
             .collect();
         assert!(other.contains("two"));
+        assert_eq!(painted_caret, Some(lead_col));
+        assert_eq!(
+            rename_ime_cursor_cell(2, painted_caret),
+            Some((1, lead_col))
+        );
+
+        // An edit can outlive a resize that leaves no cell for its caret.
+        // Both the chip and solo-band paths must keep the anchor on the strip.
+        for solo in [false, true] {
+            let mut segments = forced_solo_segments(4, &metadata[..1]);
+            segments[0].solo = solo;
+            let mut narrow = vec![blank_cell(theme); 4];
+            let (_, painted_caret) = paint_strip_with_metadata_and_rename_caret(
+                &mut narrow,
+                &segments,
+                &titles[..1],
+                &metadata[..1],
+                StripPaint {
+                    hovered: None,
+                    new_tab_hovered: false,
+                    version_hovered: false,
+                    caption_hovered: None,
+                    subtitle: None,
+                    rename: Some(StripRenameField {
+                        tab: 0,
+                        text: "日",
+                        cursor: 0,
+                    }),
+                },
+                0,
+                theme.into(),
+                StripFloor::Ground,
+            );
+            assert_eq!(painted_caret, None, "no caret fits in the narrow well");
+            assert!(!narrow.iter().any(|cell| cell.wide));
+            assert_eq!(rename_ime_cursor_cell(2, painted_caret), Some((1, 0)));
+        }
+        assert_eq!(rename_ime_cursor_cell(0, painted_caret), None);
     }
 
     /// While editing a narrow chip, icon and status canvas are suppressed so the
@@ -6965,8 +10209,9 @@ mod tests {
         );
     }
 
-    /// Two or more tabs split the whole band into equal shares with no maximum, and
-    /// none is `solo`.
+    /// Two or more tabs split the band into equal shares, each at most
+    /// [`CHIP_MAX_COLS`] (no maximum on macOS), and none is `solo`. Where the cap
+    /// holds, the band left over shows after the last chip, as after a lone one.
     #[test]
     fn multiple_tabs_split_the_whole_band_evenly() {
         for count in 2..=6usize {
@@ -6977,15 +10222,227 @@ mod tests {
                 .collect();
             assert_eq!(tabs.len(), count);
             let band = 200 - NEW_TAB_W;
-            let per = band / u16::try_from(count).unwrap();
+            let share = band / u16::try_from(count).unwrap();
+            let per = CHIP_MAX_COLS.map_or(share, |cap| share.min(cap));
             for (index, seg) in tabs.iter().enumerate() {
                 assert!(!seg.solo, "only a LONE tab is a title band");
                 assert_eq!(seg.start_col, per * u16::try_from(index).unwrap());
                 assert_eq!(seg.end_col - seg.start_col, per, "equal shares");
             }
-            // Nothing but the integer-division remainder is left over.
-            assert!(band - tabs.last().unwrap().end_col < u16::try_from(count).unwrap());
+            if per == share {
+                // Nothing but the integer-division remainder is left over.
+                assert!(band - tabs.last().unwrap().end_col < u16::try_from(count).unwrap());
+            }
         }
+    }
+
+    /// ONE CAP FOR EVERY COUNT (Windows): a lone chip is never narrower than each
+    /// chip of a pair at the same width, so opening a second tab never widens the
+    /// first.
+    #[test]
+    fn a_lone_chip_is_as_wide_as_each_of_a_pair() {
+        if !STRIP_WINDOWS_PAINT {
+            return;
+        }
+        for cols in 20..=300u16 {
+            let width = |count: usize| {
+                let segs = layout_segments(cols, count, 0, false);
+                let seg = segs
+                    .iter()
+                    .find(|s| s.kind == TabHit::Select(0))
+                    .expect("the first chip");
+                seg.end_col - seg.start_col
+            };
+            assert!(
+                width(1) >= width(2),
+                "{cols} cols: {} < {}",
+                width(1),
+                width(2)
+            );
+        }
+    }
+
+    /// Each platform's chips at 200 columns. Windows caps every chip at
+    /// [`MAX_CHIP_COLS`]; Linux keeps its strip, a lone chip of 28 columns and two
+    /// tabs sharing the whole band; macOS's lone tab is the window title band.
+    #[test]
+    fn chip_widths_are_each_platforms_own() {
+        let width = |count: usize| {
+            let segs = layout_segments(200, count, 0, false);
+            let seg = segs
+                .iter()
+                .find(|s| s.kind == TabHit::Select(0))
+                .expect("the first chip");
+            seg.end_col - seg.start_col
+        };
+        let band = 200 - NEW_TAB_W;
+        let expected = if cfg!(windows) {
+            (27, 27)
+        } else if cfg!(target_os = "macos") {
+            (band, band / 2)
+        } else {
+            (28, band / 2)
+        };
+        assert_eq!((width(1), width(2)), expected);
+    }
+
+    /// THE WINDOWS TAB CAP IS IN DIPS ([`TabSizing::at`]): WinUI's 240 epx and the
+    /// 432 epx growth cap at each scale's own cell width, within half a cell of
+    /// the exact width, so a title that fits at 100% fits at 150% and 200%.
+    /// NEGATIVE CONTROL: 27 columns of the rounded-down cell (13 px at 150%, 17
+    /// at 200%) made the tab 4-6% narrower than its exactly scaled label (the
+    /// 2026-10-18 judges' `lone-tab-cap-hidpi`).
+    #[test]
+    fn the_windows_tab_cap_is_counted_in_dips() {
+        for (cell_w, scale, cap, grow) in [
+            (9usize, 1.0f32, 27u16, 48u16),
+            (13, 1.5, 28, 50),
+            (17, 2.0, 28, 51),
+        ] {
+            let sizing = TabSizing::at(cell_w, scale, &[]);
+            assert_eq!((sizing.cap, sizing.grow), (cap, grow), "{scale}x");
+            for (cols, dip) in [(sizing.cap, TAB_MAX_DIP), (sizing.grow, TAB_GROW_DIP)] {
+                let off = (f32::from(cols) * cell_w as f32 - dip * scale).abs();
+                assert!(
+                    off <= cell_w as f32 * 0.5,
+                    "{scale}x: {cols} cols is {off} px off"
+                );
+            }
+            assert!(
+                f32::from(MAX_CHIP_COLS) * (cell_w as f32) < TAB_MAX_DIP * scale - 6.0
+                    || scale <= 1.0,
+                "CONTROL: {MAX_CHIP_COLS} columns fall short at {scale}x"
+            );
+        }
+    }
+
+    /// A WINDOWS TAB GROWS TOWARD ITS TITLE WHILE THE STRIP HAS ROOM
+    /// ([`TabSizing`], [`layout_segments_with_version_sized`]): a lone tab whose
+    /// title wants 40 columns is 40 wide, one that wants less keeps the 27-column
+    /// tab, one that wants more stops at the growth cap; two tabs grow
+    /// independently; three share the room left past their equal widths; a
+    /// crowded strip keeps its equal shares; the `+` follows the last tab.
+    /// NEGATIVE CONTROL: the 2026-10-18 strip cut every title at 27 columns with
+    /// the rest of the band empty (the judges' `tab-title-cap-27-cols-lone-tab`).
+    #[test]
+    fn a_windows_tab_grows_toward_its_title_while_the_strip_has_room() {
+        if !STRIP_WINDOWS_PAINT {
+            return;
+        }
+        let widths = |cols: u16, wants: &[u16]| {
+            let metadata = vec![PLAIN_TAB; wants.len()];
+            let sizing = TabSizing::at(9, 1.0, wants);
+            let segs = layout_segments_with_version_sized(
+                cols,
+                wants.len(),
+                &metadata,
+                0,
+                false,
+                VersionSlotCols::NONE,
+                sizing,
+            );
+            let mut x = 0;
+            let mut out = Vec::new();
+            for seg in &segs {
+                assert_eq!(seg.start_col, x, "segments are packed: {segs:?}");
+                x = seg.end_col;
+                if let TabHit::Select(_) = seg.kind {
+                    out.push(seg.end_col - seg.start_col);
+                }
+            }
+            assert!(
+                segs.last().is_some_and(|s| s.kind == TabHit::NewTab),
+                "the + follows the last tab"
+            );
+            out
+        };
+        assert_eq!(widths(111, &[40]), vec![40], "a lone long title");
+        assert_eq!(widths(111, &[12]), vec![27], "a short title keeps the tab");
+        assert_eq!(widths(111, &[90]), vec![48], "the growth cap");
+        assert_eq!(widths(111, &[40, 0]), vec![40, 27], "two tabs");
+        assert_eq!(
+            widths(95, &[48, 48, 0]),
+            vec![33, 32, 27],
+            "the room past 3 x 27 is shared by the tabs that want it"
+        );
+        assert_eq!(
+            widths(100, &[48, 48, 48, 48, 48]),
+            vec![19; 5],
+            "a crowded strip keeps equal shares"
+        );
+        // The fixed sizing is the equal strip, to the column.
+        let metadata = vec![PLAIN_TAB; 2];
+        assert_eq!(
+            layout_segments_with_version_sized(
+                111,
+                2,
+                &metadata,
+                0,
+                false,
+                VersionSlotCols::NONE,
+                TabSizing::FIXED
+            ),
+            layout_segments_with_version(111, 2, &metadata, 0, false, VersionSlotCols::NONE)
+        );
+    }
+
+    /// THE BAND'S FOOT (Windows): a real window's synthetic head reserves
+    /// `STRIP_FOOT_LOGICAL_PX` past the 32 px band, the canvas gives it back as
+    /// the terminal's ground under the seam, and the gutters' rail is that
+    /// ground; a compact band and a headless window's sealed boot band (no head
+    /// to spare) keep the seam on the band's last row. NEGATIVE CONTROL: the
+    /// 2026-10-18 build reserved no foot, so the grid's first row met the rule.
+    #[test]
+    fn a_sized_band_keeps_a_foot_of_ground_under_its_seam() {
+        if !STRIP_WINDOWS_PAINT {
+            assert_eq!(strip_foot_px(38, 32, 1.0), 0, "no foot off Windows");
+            return;
+        }
+        // (canvas, target, scale) → foot: 2 + 13 + 23 at 100%, 3 + 19 + 35 at
+        // 150%, 4 + 26 + 46 at 200%, a large font with no head, headless, compact.
+        for (canvas, target, scale, want) in [
+            (38, 32, 1.0, 6),
+            (57, 48, 1.5, 9),
+            (76, 64, 2.0, 12),
+            (42, 32, 1.0, 6),
+            (25, 32, 1.0, 0),
+            (25, 0, 1.0, 0),
+        ] {
+            assert_eq!(
+                strip_foot_px(canvas, target, scale),
+                want,
+                "canvas {canvas}, target {target}, {scale}x"
+            );
+        }
+        let theme = Theme::default();
+        let colors = strip_colors(theme);
+        let pack = |c: [u8; 3]| (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
+        let footed = strip_seam_rail(0, 100, 1, 6, theme, StripFloor::Ground).expect("a rail");
+        assert_eq!(footed.rail_h, 6);
+        assert!(footed.rail.iter().all(|&px| px == pack(colors.foot)));
+        // Over another floor the gutters' foot takes that floor's tone, so it
+        // runs level with the band's own foot (`StripFloor`).
+        let page = [0x1e, 0x1e, 0x20];
+        let paged =
+            strip_seam_rail(0, 100, 1, 6, theme, StripFloor::Surface(page)).expect("a rail");
+        assert!(paged.rail.iter().all(|&px| px == pack(page)));
+        let bare = strip_seam_rail(0, 100, 1, 0, theme, StripFloor::Ground).expect("a rail");
+        assert_eq!(bare.rail_h, 1);
+        assert!(
+            bare.rail
+                .iter()
+                .all(|&px| px == pack(colors.seam.expect("a seam")))
+        );
+        // The synthetic head of a real window reserves the foot past the band.
+        let mut app = crate::App::headless_for_test();
+        app.tab_strip_rows = 1;
+        assert_eq!(
+            app.synthetic_strip_head_px(1.0, 23),
+            32 + 6
+                - crate::logical_to_device_px(app.config.window_padding_top_or_default(), 1.0)
+                - 23,
+            "the head holds the 32 px band less its row and pad, plus the foot"
+        );
     }
 
     /// `show_update` prepends a leading `↻` segment at col 0, shifting the tabs right;
@@ -7033,7 +10490,7 @@ mod tests {
                 attention: ChipLevel::Wait,
                 conn: Some(TabConnRole::Both),
                 closable: false,
-                drop_target: false,
+                team: TabTeam::NONE,
             },
         ];
         let canonical = layout_segments_with_metadata(80, metadata.len(), &metadata, 0, false);
@@ -7051,17 +10508,12 @@ mod tests {
             hit_test(&canonical, canonical[0].close_col.unwrap()),
             Some(TabHit::Close(0))
         );
-        // A non-closable chip's freed trailing cell holds its status canvas, which
-        // is the connector.
-        assert_eq!(
-            canonical[1].connector_col,
-            Some(base[1].close_col.unwrap()),
-            "the status canvas takes the freed trailing cell"
-        );
+        // A non-closable chip's freed trailing cell (its status canvas) is part
+        // of the chip: a press there selects it.
         assert_eq!(
             hit_test(&canonical, base[1].close_col.unwrap()),
-            Some(TabHit::Connector(1)),
-            "the painted status cell hit-tests as the connector"
+            Some(TabHit::Select(1)),
+            "the painted status cell selects its tab"
         );
     }
 
@@ -7094,7 +10546,7 @@ mod tests {
                     busy: bits & 0b010 != 0,
                     attention: crate::app_presence::chip_of_attention(bits & 0b100 != 0),
                     conn: None,
-                    drop_target: false,
+                    team: TabTeam::NONE,
                     closable: true,
                 };
                 let mut images = Vec::new();
@@ -7286,6 +10738,55 @@ mod tests {
         );
     }
 
+    /// THE TAB'S MARKS ARE TELLABLE APART (§5): every attention level draws
+    /// its own shape — a finished task's dot is never the tab's own note (a
+    /// failed command, a notice), which is a dash — so a background shell's
+    /// failed `grep` never reads as a finished worker. Pairwise distinct on
+    /// pixels, in one ink, like the role marks.
+    #[test]
+    fn every_attention_mark_is_tellable_apart() {
+        let with = |attention| TabStripMetadata {
+            icon: None,
+            dirty: false,
+            busy: false,
+            attention,
+            conn: None,
+            closable: true,
+            team: TabTeam::NONE,
+        };
+        let levels = [
+            ChipLevel::Note,
+            ChipLevel::Done,
+            ChipLevel::Yours,
+            ChipLevel::Wait,
+            ChipLevel::Stop(crate::presence::StopCause::Wall),
+        ];
+        let note = status_primitives(with(ChipLevel::Note));
+        assert!(
+            matches!(note[..], [TabIconPrimitive::Line { .. }]),
+            "the note is one dash"
+        );
+        let done = status_primitives(with(ChipLevel::Done));
+        assert!(
+            matches!(done[..], [TabIconPrimitive::Dot { .. }]),
+            "the done mark is one dot"
+        );
+        let rasters: Vec<Vec<u8>> = levels
+            .iter()
+            .map(|level| rasterize_icon(&status_primitives(with(*level)), [213, 219, 255]))
+            .collect();
+        for (i, a) in rasters.iter().enumerate() {
+            assert!(
+                a.as_chunks::<4>().0.iter().any(|p| p[3] != 0),
+                "{:?} draws",
+                levels[i]
+            );
+            for (j, b) in rasters.iter().enumerate().skip(i + 1) {
+                assert_ne!(a, b, "{:?} and {:?} look alike", levels[i], levels[j]);
+            }
+        }
+    }
+
     /// A segment below `MIN_SEG_WITH_CLOSE` drops the close `x` but still selects.
     /// The rule is per segment: 9 columns and 3 tabs seat the two-seat minimum
     /// ([`STRIP_MIN_SEATS`]), one of them too narrow for a close column.
@@ -7348,6 +10849,116 @@ mod tests {
         ] {
             assert_eq!(cut(title, max), expected, "{title:?} in {max} cells");
         }
+    }
+
+    /// A COMMAND LINE KEEPS ITS FILE ([`command_cut`]): cut in the middle, the
+    /// program and as many whole leading words as fit (a quoted argument kept
+    /// whole), the mark, then the last argument whole or its longest tail that
+    /// starts a path component; where the program and the file's own name do
+    /// not fit together, the file alone behind a leading mark. A title whose
+    /// last word names no file (prose, a version), or whose file's own name
+    /// does not fit at all, is head-cut; a title that fits is whole.
+    /// NEGATIVE CONTROL: the head cut
+    /// every chip took before lost vim's file at 60 cells (the 2026-10-18
+    /// judges' `j3d-long-title-end-cut`).
+    #[test]
+    fn a_cut_command_line_keeps_its_file() {
+        let vim = "vim -n -R -i NONE -c 'syntax on' +1925 crates/aterm-gui/src/platform_win.rs";
+        for (title, max, expected) in [
+            (
+                vim,
+                60,
+                "vim -n -R -i NONE -c … crates/aterm-gui/src/platform_win.rs",
+            ),
+            (vim, 30, "vim -n … src/platform_win.rs"),
+            (vim, 21, "vim … platform_win.rs"),
+            (vim, 20, "…src/platform_win.rs"),
+            (vim, 16, "…platform_win.rs"),
+            ("less -R +1200 CHANGELOG.md", 15, "…CHANGELOG.md"),
+            ("less -R +1200 CHANGELOG.md", 20, "less … CHANGELOG.md"),
+            (
+                "less -R +1200 CHANGELOG.md",
+                26,
+                "less -R +1200 CHANGELOG.md",
+            ),
+            (
+                r"code --wait C:\Users\m6-an\aterm-winperfect\SPECS.md",
+                32,
+                r"code … aterm-winperfect\SPECS.md",
+            ),
+            (
+                r"code --wait C:\Users\m6-an\aterm-winperfect\SPECS.md",
+                30,
+                "code --wait … SPECS.md",
+            ),
+            ("tail -f /var/log/syslog/", 14, "tail … syslog/"),
+        ] {
+            let cut = chip_cut(title, max);
+            assert_eq!(cut, expected, "{title:?} in {max} cells");
+            assert!(strip_display_cells(&cut) <= max, "{cut:?} in {max} cells");
+        }
+        for (title, max) in [
+            (vim, 15),
+            (
+                "Claude Code: reviewing platform_win.rs and the Default Light contrast",
+                40,
+            ),
+            ("aterm nightly build 0.106.1241", 20),
+            ("wait for it, e.g.", 10),
+            ("crates/aterm-gui/src/platform_win.rs", 20),
+            (r"C:\Program Files\Git\usr\share\doc\README.md", 30),
+        ] {
+            assert_eq!(command_cut(title, max), None, "{title:?} in {max} cells");
+            assert_eq!(chip_cut(title, max), truncate_title(title, max));
+        }
+        assert!(
+            !truncate_title(vim, 60).contains("platform_win.rs"),
+            "CONTROL: the head cut loses the file"
+        );
+        // The strip's first cut, on a lone chip (the window title on macOS,
+        // which this pass does not label) and beside a quiet one.
+        for tabs in [1usize, 2] {
+            if SOLO_TITLE_BAND && tabs == 1 {
+                continue;
+            }
+            let metadata = vec![PLAIN_TAB; tabs];
+            let segments = layout_segments_with_metadata(120, tabs, &metadata, 0, false);
+            let mut titles = vec![vim.to_string()];
+            titles.resize(tabs, "logs".to_string());
+            let labels = distinct_chip_labels(&segments, &titles, Some(&metadata), 0, None);
+            let label = labels[0].as_deref().expect("a seated chip");
+            assert!(
+                label.ends_with("platform_win.rs") && label.starts_with("vim"),
+                "{tabs} tab(s): {label:?}"
+            );
+        }
+    }
+
+    /// A TITLE THE SHELL ALREADY CUT keeps its end cut ([`command_cut`]): the
+    /// integrations end a command line they cut with `…`, so its last word is a
+    /// fragment of the file, and the chip cuts the title's head with its own
+    /// mark at the end; whole where it fits, mark and all. NEGATIVE CONTROL: the
+    /// same 64 characters with no mark, as every integration sent them before,
+    /// read as a command whose file is `crates/aterm-gui/src/plat` (the
+    /// 2026-10-18 judges' `J4F-1-cut64-middle-cut-misleads`).
+    #[test]
+    fn a_title_the_shell_cut_keeps_its_end_cut() {
+        let sent = "vim -n -R -i NONE -c 'syntax on' +1925 crates/aterm-gui/src/plat…";
+        for max in [12, 20, 30, 40, 60] {
+            assert_eq!(command_cut(sent, max), None, "{max} cells");
+            let cut = chip_cut(sent, max);
+            assert_eq!(cut, truncate_title(sent, max), "{max} cells");
+            assert!(
+                cut.starts_with("vim -n") && cut.ends_with('…') && !cut.contains(" … "),
+                "{cut:?} in {max} cells"
+            );
+        }
+        assert_eq!(chip_cut(sent, 80), sent);
+        let unmarked = sent.trim_end_matches('…');
+        assert!(
+            chip_cut(unmarked, 40).ends_with(" … crates/aterm-gui/src/plat"),
+            "CONTROL: an unmarked cut reads as its file"
+        );
     }
 
     /// A cut path keeps its end, cut only where a name begins ([`path_tail`]).
@@ -8337,6 +11948,36 @@ mod tests {
         assert!(cut > 50, "vacuous: only {cut} chips were cut");
     }
 
+    /// Twins in a roomy strip both name their place. Two shells in one directory
+    /// whose name has a space: the quiet twin shows the path's own cut behind its
+    /// number (`2 · …\work\sub dir`), not a word cut at that space (`2 · …dir`).
+    /// Two Git Bash prompts in one directory: the active twin shows the whole
+    /// trailing components (`…/work/ünï 日本`), not the last word (`…日本`).
+    #[test]
+    fn roomy_twins_name_their_directory_whole() {
+        let dir = r"C:\Users\me\AppData\Local\Temp\wp-shells\work\sub dir".to_string();
+        let titles = vec![dir.clone(), dir];
+        let segments = layout_segments(100, 2, 0, false);
+        let seats = seated(&segments, &titles, 0);
+        assert!(seats[0].1.ends_with(r"work\sub dir"), "{seats:?}");
+        // The cut keeps whole trailing components (`…work\sub dir`, the mark in
+        // place of the separator it cut at), never a word of the last one.
+        assert!(
+            seats[1].1.starts_with("2 · …") && seats[1].1.ends_with(r"work\sub dir"),
+            "the quiet twin names the directory: {seats:?}"
+        );
+
+        let prompt = "me@box MINGW64 /tmp/wp-shells/work/ünï 日本".to_string();
+        let titles = vec![prompt.clone(), prompt];
+        let segments = layout_segments(48, 2, 1, false);
+        let seats = seated(&segments, &titles, 1);
+        let active = &seats[1].1;
+        assert!(
+            active.ends_with("/ünï 日本") && active.len() > "…/ünï 日本".len(),
+            "the active twin keeps whole components: {seats:?}"
+        );
+    }
+
     /// [`twin_tail`]'s reach on a pressure strip. A family of twins that kept its
     /// head flips no loner into the tail dialect; one whose directory name fits
     /// behind the mark paints whole components and the loner flips with it. A
@@ -8498,7 +12139,6 @@ mod tests {
             start_col: 0,
             end_col: 18,
             close_col: Some(16),
-            connector_col: None,
             kind: TabHit::Select(0),
             solo: false,
         })
@@ -8508,7 +12148,6 @@ mod tests {
                 start_col: start,
                 end_col: start + 6,
                 close_col: Some(start + 4),
-                connector_col: None,
                 kind: TabHit::Select(usize::from(i)),
                 solo: false,
             }
@@ -8590,13 +12229,23 @@ mod tests {
         // The active tab's card cell: on a chip-card band the leading cell is the
         // gutter, so the card starts one column in.
         let card0 = t0.start_col as usize + usize::from(STRIP_CHIP_CARDS);
-        // Tab 0 is active: raised bg, bold full-strength text, and the accent
+        // Tab 0 is active: raised bg (on Windows the terminal's own ground, a
+        // surface apart from the band), bold full-strength text, and the accent
         // underline except on a chip-card band, where the filled card alone marks
         // the selection.
-        assert_ne!(
-            row[card0].bg, bg_rgb,
-            "active tab bg is raised above the body"
-        );
+        if SELECTED_TAB_IS_GROUND {
+            assert_eq!(row[card0].bg, bg_rgb, "the selected tab is the ground");
+            assert_ne!(
+                row[card0].bg,
+                strip_colors(theme).band_bg,
+                "apart from the band"
+            );
+        } else {
+            assert_ne!(
+                row[card0].bg, bg_rgb,
+                "active tab bg is raised above the body"
+            );
+        }
         assert_eq!(
             row[card0].fg, fg_rgb,
             "active tab fg = full-strength theme fg"
@@ -8808,9 +12457,13 @@ mod tests {
     }
 
     /// Whether this chip says something of its own tab: a cut of its title (the
-    /// tail dialect, the ordinal's tail, or a head cut).
+    /// tail dialect, the ordinal's tail, a head cut, or a command cut's head and
+    /// file, [`command_cut`]).
     fn says_its_own(label: &str, title: &str) -> bool {
         let painted = painted_text(label);
+        if let Some((head, tail)) = painted.rsplit_once(MIDDLE_MARK) {
+            return title.starts_with(head) && title.ends_with(tail);
+        }
         !painted.is_empty() && title.contains(painted)
     }
 
@@ -9149,9 +12802,14 @@ mod tests {
                 assert_ne!(authored.accent, c.accent, "{at}: CONTROL");
                 for (what, colors) in [("derived", &c), ("authored", &authored), ("at bg", &at_bg)]
                 {
+                    // The accent on the selected surface (the raised card, or on
+                    // Windows the terminal's ground), the band and a hovered tab;
+                    // the update rule on its card.
                     for (mark, on) in [
-                        (colors.accent, colors.raise_bg),
+                        (colors.accent, colors.active_bg),
                         (colors.accent, colors.band_bg),
+                        (colors.accent, colors.hover_bg),
+                        (colors.update_rule, colors.update_bg),
                     ] {
                         let ratio = rgb(mark).contrast(rgb(on));
                         assert!(ratio >= 3.0, "{at}: {what} accent {ratio:.2} < 3.0:1");
@@ -9212,11 +12870,18 @@ mod tests {
             (tp.cursor & 0xff) as u8,
         ];
         let contrast = crate::chrome_band::contrast;
-        assert!(
-            contrast(raw, c.raise_bg) < 3.0,
-            "negative control: Latte's raw cursor already clears 3:1 on the card"
-        );
-        assert!(contrast(c.accent, c.raise_bg) >= 3.0);
+        // The surfaces the accent marks sit on: the selected one (the raised
+        // card, or on Windows the terminal's ground, `SELECTED_TAB_IS_GROUND`),
+        // the band and a hovered tab.
+        let surfaces = [c.active_bg, c.band_bg, c.hover_bg];
+        if !SELECTED_TAB_IS_GROUND {
+            // The raised card steps toward the ink, where the cursor fades.
+            assert!(
+                contrast(raw, c.raise_bg) < 3.0,
+                "negative control: Latte's raw cursor already clears 3:1 on the card"
+            );
+        }
+        assert!(surfaces.iter().all(|on| contrast(c.accent, *on) >= 3.0));
         assert!(contrast(c.update_rule, c.update_bg) >= 3.0);
     }
 
@@ -9312,9 +12977,80 @@ mod tests {
         }
     }
 
-    /// `strip_colors` is appearance-aware: on a dark theme the active card steps
-    /// toward the light fg (brighter than the body), on a light theme toward the
-    /// dark fg (darker). Either way it is a distinct surface.
+    /// THE AUTOMATIC SELECTED-TAB COLOUR IS WHAT THE STRIP PAINTS: for every
+    /// built-in theme it is the selected tab the strip draws while no
+    /// `active_tab_color` key is set, over each floor; a colour the theme
+    /// authors is that colour, under the native pill too; under every stock
+    /// High Contrast scheme it is the highlight drawn there; over macOS's
+    /// toolbar it is the system pill at its alpha over the band. Negative
+    /// control: off Windows it is never the band under the card.
+    #[test]
+    fn the_automatic_tab_color_is_the_card_the_strip_paints() {
+        let selection = [0x0A, 0x64, 0xD8];
+        for name in aterm_types::scheme::builtin_names() {
+            let theme = Theme::from(&aterm_types::scheme::builtin(name).expect("builtin"));
+            let header = ChromePalette::from(theme);
+            for floor in [StripFloor::Ground, StripFloor::Surface([0xEA, 0xEB, 0xEB])] {
+                let painted = strip_colors_for_on(header, floor).active_bg;
+                assert_eq!(
+                    automatic_active_tab_color(header, floor, None),
+                    painted,
+                    "{name} {floor:?}"
+                );
+            }
+            if !SELECTED_TAB_IS_GROUND {
+                assert_ne!(
+                    automatic_active_tab_color(header, StripFloor::Ground, None),
+                    strip_colors(theme).band_bg,
+                    "{name}: the card, not the band under it"
+                );
+            }
+            assert_eq!(
+                automatic_active_tab_color(header, StripFloor::Ground, Some(selection)),
+                crate::chrome_band::mix3(
+                    strip_colors(theme).band_bg,
+                    selection,
+                    NATIVE_PILL_AUTO_ALPHA
+                ),
+                "{name}: the native pill over the band"
+            );
+            let authored = ChromePalette {
+                authored: aterm_messages::tokens::AuthoredChrome {
+                    active_tab: Some([0x33, 0x66, 0xCC]),
+                    ..aterm_messages::tokens::AuthoredChrome::NONE
+                },
+                ..header
+            };
+            assert_eq!(
+                automatic_active_tab_color(authored, StripFloor::Ground, Some(selection)),
+                [0x33, 0x66, 0xCC],
+                "{name}: the theme's own selected-tab colour"
+            );
+        }
+        for (name, palette) in crate::chrome_band::hc_fixtures::STOCK {
+            crate::chrome_band::hc_fixtures::with_forced(palette, || {
+                let header = ChromePalette::from(Theme::default());
+                assert_eq!(
+                    automatic_active_tab_color(header, StripFloor::Ground, Some(selection)),
+                    palette.highlight,
+                    "{name}"
+                );
+                assert_eq!(
+                    automatic_active_tab_color(header, StripFloor::Ground, None),
+                    strip_colors_for(header).active_bg,
+                    "{name}"
+                );
+            });
+        }
+    }
+
+    /// `strip_colors` is appearance-aware. Off Windows the active card steps
+    /// toward the fg: brighter than the body on a dark theme, darker on a light
+    /// one. On Windows the selected tab is the terminal's own ground, so it is
+    /// darker than the band on a dark theme and lighter on a light one, the
+    /// update CTA rises toward white off a light band, and the hover wash steps
+    /// toward the ink on every band ([`LIGHT_TAB_HOVER_T`]), so a hovered quiet
+    /// tab is never a second selected one. Either way it is a distinct surface.
     #[test]
     fn strip_colors_raise_direction_follows_appearance() {
         let luma = |c: [u8; 3]| {
@@ -9324,17 +13060,109 @@ mod tests {
             let s = aterm_types::scheme::builtin(name).expect("builtin exists");
             strip_colors(Theme::from(&s))
         };
-        // Dark builtin: the active card is brighter than the body (a raised step).
         let dark = parts("Dracula");
-        assert!(
-            luma(dark.active_bg) > luma(dark.band_bg),
-            "dark theme active card should be brighter than the body"
-        );
-        // Light builtin: the active card is darker than the body (a subtle card).
         let light = parts("Solarized Light");
+        if SELECTED_TAB_IS_GROUND {
+            assert_eq!(dark.active_bg, dark.foot, "the selected tab is the ground");
+            assert!(
+                luma(dark.active_bg) < luma(dark.band_bg),
+                "dark: below the band"
+            );
+            assert!(
+                luma(light.active_bg) > luma(light.band_bg),
+                "light: above the band"
+            );
+            assert!(
+                luma(light.raise_bg) > luma(light.band_bg),
+                "light update CTA rises toward white"
+            );
+            assert!(
+                luma(dark.hover_bg) > luma(dark.band_bg),
+                "dark hover rises toward fg"
+            );
+            // The light hover is the opposite step from the selected tab: below
+            // the band, a visible step, never toward the selection. NEGATIVE
+            // CONTROL: the 2026-10-18 strip rose it toward white, #eeeeef on
+            // Default Light's #e2e3e5 band beside the selected #f6f7f9.
+            for name in aterm_types::scheme::builtin_names() {
+                let c = parts(name);
+                if !bg_is_light(c.foot) {
+                    continue;
+                }
+                assert!(
+                    luma(c.hover_bg) < luma(c.band_bg) && luma(c.active_bg) > luma(c.band_bg),
+                    "{name}: hover {:?} must step below the band {:?}, the selected tab {:?} above",
+                    c.hover_bg,
+                    c.band_bg,
+                    c.active_bg
+                );
+                assert!(
+                    crate::chrome_band::contrast(c.hover_bg, c.band_bg) >= 1.08,
+                    "{name}: the hover wash {:?} hardly leaves the band {:?}",
+                    c.hover_bg,
+                    c.band_bg
+                );
+            }
+        } else {
+            // Dark builtin: the active card is brighter than the body (a raised step).
+            assert!(
+                luma(dark.active_bg) > luma(dark.band_bg),
+                "dark theme active card should be brighter than the body"
+            );
+            // Light builtin: the active card is darker than the body (a subtle card).
+            assert!(
+                luma(light.active_bg) < luma(light.band_bg),
+                "light theme active card should be darker than the body"
+            );
+        }
+    }
+
+    /// EVERY SELECTED TAB OF A LIGHT BAND IS ONE SHAPE ([`selected_tab_rim`]):
+    /// over the grid and over the Settings page alike, every light built-in
+    /// theme's selected Windows tab wears the seam's outline, as WinUI's
+    /// selected `TabViewItem` carries its card stroke whatever it holds; a
+    /// dark built-in's keeps the [`TAB_RIM_BELOW`] rule, so Default's tabs
+    /// stay bare. NEGATIVE CONTROL: by that contrast rule alone Default
+    /// Light's terminal tab (1.20:1) went bare while its Settings tab (1.08:1)
+    /// wore the outline (the 2026-10-18 judge's
+    /// `J4F-4-light-selected-tab-two-idioms`).
+    #[test]
+    fn every_selected_tab_of_a_light_band_wears_one_outline() {
+        use crate::chrome_band::contrast;
+        if !SELECTED_TAB_IS_GROUND {
+            return;
+        }
+        let theme_of =
+            |name: &str| Theme::from(&aterm_types::scheme::builtin(name).expect("builtin"));
+        let mut light = 0;
+        for name in aterm_types::scheme::builtin_names() {
+            let theme = theme_of(name);
+            let page = crate::settings::Roles::from_theme(theme).surface;
+            for floor in [StripFloor::Ground, StripFloor::Surface(page)] {
+                let c = strip_colors_for_on(theme, floor);
+                let ratio = contrast(c.active_bg, c.band_bg);
+                if bg_is_light(c.band_bg) {
+                    assert!(c.seam.is_some(), "{name}: a band has a seam");
+                    assert_eq!(c.active_rim, c.seam, "{name} {floor:?} {ratio:.2}:1");
+                } else {
+                    assert_eq!(
+                        c.active_rim.is_some(),
+                        ratio < TAB_RIM_BELOW,
+                        "{name} {floor:?} {ratio:.2}:1: a dark band keeps its rule"
+                    );
+                }
+            }
+            light += usize::from(bg_is_light(strip_colors(theme).band_bg));
+        }
+        assert!(light >= 2, "fixture: light built-ins ({light})");
+        let grid = strip_colors_for_on(theme_of("Default Light"), StripFloor::Ground);
         assert!(
-            luma(light.active_bg) < luma(light.band_bg),
-            "light theme active card should be darker than the body"
+            contrast(grid.active_bg, grid.band_bg) >= TAB_RIM_BELOW,
+            "CONTROL: the contrast rule alone leaves Default Light's terminal tab bare"
+        );
+        assert!(
+            strip_colors(Theme::default()).active_rim.is_none(),
+            "Default's terminal tab stays bare"
         );
     }
 
@@ -9867,7 +13695,6 @@ mod tests {
             start_col: 132 - width,
             end_col: 132,
             close_col: None,
-            connector_col: None,
             kind: TabHit::Version {
                 rung: VersionRung::Full,
                 attention: false,
@@ -10059,5 +13886,334 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+/// THE IN-GRID NEEDS PILL (owner surfaces §5): its regions are cut from the
+/// engine's layout by the engine's hit rule, and painted by that same layout,
+/// so a click lands on what the strip shows there.
+#[cfg(test)]
+mod pill_strip_tests {
+    use super::*;
+    use crate::presence::{NeedSeverity, PillAct, PillHit, PillKind, PillWords};
+
+    fn words(label: &str, said: &str, act: Option<PillAct>, more: usize) -> PillWords {
+        PillWords {
+            glyph: '\u{25c6}',
+            label: label.to_string(),
+            words: said.to_string(),
+            room: said.to_string(),
+            act,
+            more: (more > 0).then(|| format!("+{more}")),
+        }
+    }
+
+    fn theme() -> Theme {
+        Theme::default()
+    }
+
+    /// The strip with `pill` laid out and painted, at `cols` columns, three
+    /// plain tabs.
+    fn strip(cols: u16, pill: &PillWords) -> (Vec<TabSegment>, Vec<RenderCell>) {
+        let metadata = [PLAIN_TAB; 3];
+        let segments = layout_segments_with_pill(
+            cols,
+            3,
+            &metadata,
+            0,
+            false,
+            VersionSlotCols::NONE,
+            Some(pill),
+            TabSizing::FIXED,
+        );
+        let theme = theme();
+        let titles: Vec<String> = ["one", "two", "three"].map(String::from).to_vec();
+        let mut row = vec![blank_cell(theme); usize::from(cols)];
+        let _ = paint_strip_with_metadata(
+            &mut row,
+            &segments,
+            &titles,
+            &metadata,
+            StripPaint::default(),
+            0,
+            theme,
+            None,
+        );
+        paint_strip_pill(
+            &mut row,
+            &segments,
+            StripPill {
+                kind: PillKind::Need(NeedSeverity::Stuck),
+                words: pill,
+            },
+            theme.into(),
+        );
+        (segments, row)
+    }
+
+    /// The columns whose painted characters spell `text`, starting at the
+    /// first that does.
+    fn painted_at(row: &[RenderCell], text: &str) -> std::ops::Range<u16> {
+        let chars: Vec<char> = text.chars().collect();
+        let start = (0..row.len())
+            .find(|&at| {
+                chars
+                    .iter()
+                    .enumerate()
+                    .all(|(i, ch)| row.get(at + i).is_some_and(|c| c.ch == *ch))
+            })
+            .unwrap_or_else(|| panic!("{text:?} is painted"));
+        let start = u16::try_from(start).expect("a strip column");
+        start..start + u16::try_from(chars.len()).expect("short")
+    }
+
+    /// EVERY PAINTED PIECE RESOLVES TO ITS OWN ACT: the glyph, the label and
+    /// the words to the body, the act's word to the act, the `+N` to the
+    /// next need — columns found by what the painter drew, resolved by the
+    /// strip's own hit test.
+    #[test]
+    fn each_painted_piece_of_the_pill_resolves_to_its_act() {
+        let pill = words("fmt (tab 4)", "never started", Some(PillAct::Restart), 2);
+        let (segments, row) = strip(120, &pill);
+        let at = |text: &str| painted_at(&row, text);
+        for (text, want) in [
+            ("\u{25c6}", PillHit::Go),
+            ("fmt (tab 4)", PillHit::Go),
+            ("never started", PillHit::Go),
+            ("Restart", PillHit::Act(PillAct::Restart)),
+            ("+2", PillHit::More),
+        ] {
+            for col in at(text) {
+                assert_eq!(
+                    hit_test(&segments, col),
+                    Some(TabHit::Pill(want)),
+                    "{text:?} at {col}"
+                );
+            }
+        }
+        // Every column of the pill is one of its regions, none the bare band.
+        let pill_cols: Vec<_> = segments
+            .iter()
+            .filter(|s| matches!(s.kind, TabHit::Pill(_)))
+            .collect();
+        let (from, to) = (pill_cols[0].start_col, pill_cols.last().unwrap().end_col);
+        assert!((from..to).all(|col| matches!(hit_test(&segments, col), Some(TabHit::Pill(_)))));
+        // At most 40% of the strip, and the tabs and the `+` left of it.
+        assert!(to - from <= 120 * 2 / 5, "{from}..{to}");
+        assert!(
+            segments
+                .iter()
+                .filter(|s| !matches!(s.kind, TabHit::Pill(_)))
+                .all(|s| s.end_col <= from)
+        );
+    }
+
+    /// THE PILL'S AGE MOVES NO TAB (§5): two pills that differ only in their
+    /// age, within its unit (3s and 47s), lay the strip out to the same
+    /// column — the words' span is measured at their room, the age's widest
+    /// figure — while the age itself is painted as it is. NEGATIVE CONTROL:
+    /// measured by the words as drawn, the two pills' widths differ.
+    #[test]
+    fn a_pills_age_moves_no_tab_within_its_unit() {
+        let t0 = std::time::Instant::now();
+        let pill = aterm_messages::presence::Pill {
+            kind: PillKind::Need(NeedSeverity::Stuck),
+            session: 1,
+            label: "fmt".into(),
+            tab: Some(4),
+            what: "never started".into(),
+            since: Some(t0),
+            act: None,
+            more: 0,
+        };
+        let at = |secs: u64| {
+            crate::presence::pill_words(&pill, t0 + std::time::Duration::from_secs(secs))
+        };
+        let (young, old) = (at(3), at(47));
+        assert_ne!(young.words, old.words, "the ages differ");
+        let metadata = [PLAIN_TAB; 3];
+        let lay = |w: &PillWords| {
+            layout_segments_with_pill(
+                120,
+                3,
+                &metadata,
+                0,
+                false,
+                VersionSlotCols::NONE,
+                Some(w),
+                TabSizing::FIXED,
+            )
+        };
+        assert_eq!(lay(&young), lay(&old), "the tabs hold still");
+        let (_, row) = strip(120, &old);
+        let _ = painted_at(&row, "47s");
+        // CONTROL: by the words as drawn the two would not hold still.
+        let drawn = |w: &PillWords| PillWords {
+            room: w.words.clone(),
+            ..w.clone()
+        };
+        assert_ne!(lay(&drawn(&young)), lay(&drawn(&old)));
+    }
+
+    /// The share clips the words first, then the label, never the glyph; the
+    /// act stays whole while the glyph fits beside it.
+    #[test]
+    fn a_narrow_strip_clips_the_words_then_the_label_never_the_glyph() {
+        let long = "a very long need sentence that will not fit anywhere at all";
+        let pill = words("a long tab label (tab 9)", long, Some(PillAct::Restart), 0);
+        let (segments, row) = strip(60, &pill);
+        assert!(
+            !painted_at(&row, "\u{25c6}").is_empty(),
+            "the glyph is drawn"
+        );
+        let act = painted_at(&row, "Restart");
+        assert_eq!(
+            hit_test(&segments, act.start),
+            Some(TabHit::Pill(PillHit::Act(PillAct::Restart)))
+        );
+        let text: String = row.iter().map(|c| c.ch).collect();
+        assert!(!text.contains(long), "the words were clipped");
+        let span: u16 = segments
+            .iter()
+            .filter(|s| matches!(s.kind, TabHit::Pill(_)))
+            .map(|s| s.end_col - s.start_col)
+            .sum();
+        assert!(span <= 60 * 2 / 5, "{span}");
+    }
+
+    /// NEGATIVE CONTROL: with no pill the shipping layout is the pill-less
+    /// one to the column, and a version label keeps the strip's right edge
+    /// beside a pill.
+    #[test]
+    fn no_pill_is_the_pill_less_strip_and_the_version_label_stays_flush_right() {
+        let metadata = [PLAIN_TAB; 3];
+        let slot = VersionSlotCols {
+            full: 8,
+            short: 4,
+            attention: false,
+        };
+        assert_eq!(
+            layout_segments_with_pill(120, 3, &metadata, 1, false, slot, None, TabSizing::FIXED),
+            layout_segments_with_version(120, 3, &metadata, 1, false, slot)
+        );
+        let pill = words("", "frozen", None, 0);
+        let segs = layout_segments_with_pill(
+            120,
+            3,
+            &metadata,
+            1,
+            false,
+            slot,
+            Some(&pill),
+            TabSizing::FIXED,
+        );
+        let version = segs
+            .iter()
+            .find(|s| matches!(s.kind, TabHit::Version { .. }))
+            .expect("the label still fits");
+        assert_eq!(version.end_col, 120, "flush right");
+        let pill_end = segs
+            .iter()
+            .filter(|s| matches!(s.kind, TabHit::Pill(_)))
+            .map(|s| s.end_col)
+            .max()
+            .expect("the pill is laid out");
+        assert_eq!(pill_end, version.start_col, "the pill sits left of it");
+    }
+}
+
+/// WHO DRIVES (owner surfaces §5, S9): the strip's team marks.
+#[cfg(test)]
+mod team_title_tests {
+    use super::*;
+
+    /// A worker's title opens with `↳`, a manager's ends with `⇉N`, a tab
+    /// in both wears both; a strip whose tabs wear no mark borrows its
+    /// titles whole (the negative control: nothing is allocated for it).
+    #[test]
+    fn workers_and_managers_wear_their_marks_and_a_plain_strip_borrows() {
+        let worker = TabTeam {
+            worker: true,
+            workers: 0,
+        };
+        let manager = TabTeam {
+            worker: false,
+            workers: 3,
+        };
+        assert!(team_title("bench", worker).starts_with('\u{21b3}'));
+        assert!(team_title("lab-sweep", manager).ends_with("\u{21c9}3"));
+        let both = team_title(
+            "mid",
+            TabTeam {
+                worker: true,
+                workers: 2,
+            },
+        );
+        assert!(both.starts_with('\u{21b3}') && both.ends_with("\u{21c9}2"));
+        assert!(matches!(
+            team_title("plain", TabTeam::NONE),
+            std::borrow::Cow::Borrowed("plain")
+        ));
+        let titles = vec!["a".to_string(), "b".to_string()];
+        assert!(matches!(
+            team_titles(&titles, &[PLAIN_TAB; 2]),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let marked = team_titles(
+            &titles,
+            &[
+                PLAIN_TAB,
+                TabStripMetadata {
+                    team: worker,
+                    ..PLAIN_TAB
+                },
+            ],
+        );
+        assert_eq!(marked[0], "a");
+        assert!(marked[1].starts_with('\u{21b3}'));
+    }
+}
+
+/// A tab's need mark wears the border's tone on the in-grid strip.
+#[cfg(test)]
+mod status_mark_ink_tests {
+    use super::*;
+
+    /// A stuck need's mark is the stop ink and a decide need's the wait ink
+    /// (the border's two tones, as the native chip draws them); a dirty tab
+    /// with no need keeps the accent and a quiet one the label's ink, and so
+    /// does the tab's own note (a failed command): no need, no presence tone.
+    /// CONTROL: the two need inks differ from each other and from the accent.
+    #[test]
+    fn a_needs_mark_wears_the_borders_tone() {
+        let theme = Theme::default();
+        let colors = strip_colors_with_active(theme, None);
+        let inks = aterm_messages::presence::inks(
+            crate::chrome_band::presence_tones(theme),
+            colors.band_bg,
+        );
+        let ink = [1, 2, 3];
+        let of = |attention, dirty| {
+            status_mark_ink(
+                TabStripMetadata {
+                    attention,
+                    dirty,
+                    ..PLAIN_TAB
+                },
+                &colors,
+                theme.into(),
+                ink,
+            )
+        };
+        let stuck = of(ChipLevel::Stop(crate::presence::StopCause::Wall), true);
+        let decide = of(ChipLevel::Wait, false);
+        assert_eq!(stuck, inks.stop);
+        assert_eq!(decide, inks.wait);
+        assert_eq!(of(ChipLevel::Done, true), colors.accent);
+        assert_eq!(of(ChipLevel::Off, false), ink);
+        let note = of(ChipLevel::Note, false);
+        assert_eq!(note, ink);
+        assert!(note != inks.stop && note != inks.wait && note != inks.yours);
+        assert!(stuck != decide && stuck != colors.accent && decide != colors.accent);
     }
 }

@@ -367,7 +367,7 @@ mod imp {
     }
 
     /// `pid`'s code signing is valid AND it is an Apple platform binary.
-    fn cs_platform_valid(pid: i32) -> bool {
+    pub(super) fn cs_platform_valid(pid: i32) -> bool {
         let mut status: u32 = 0;
         // SAFETY: `status` is one writable u32, the size passed.
         let r = unsafe {
@@ -403,26 +403,44 @@ mod imp {
     /// reason (never the bytes read) on any miss. The identity check is a bonus
     /// only, so a csops-identity quirk never refuses a real `sudo`.
     pub(super) fn attest_sudo(pid: i32) -> Result<(), AttestError> {
-        let info = short_info(pid).ok_or("parent is gone or not readable")?;
+        // SAFETY: a plain syscall with no arguments.
+        let our_uid = unsafe { getuid() };
+        attest(
+            short_info(pid),
+            our_uid,
+            || exe_path(pid),
+            || cs_platform_valid(pid),
+        )?;
+        // A bonus positive signal; its absence does not refuse (the triad
+        // checked above is the proof).
+        let _ = cs_identity_contains(pid, b"com.apple.sudo");
+        Ok(())
+    }
+
+    /// [`attest_sudo`]'s rule over the facts read for one pid: `info` its short BSD info,
+    /// `our_uid` this process's real uid, `exe` and `platform_valid` its executable and its
+    /// code signing, each read only once every fact before it admitted the pid. Pure.
+    pub(super) fn attest(
+        info: Option<ShortInfo>,
+        our_uid: u32,
+        exe: impl FnOnce() -> Option<PathBuf>,
+        platform_valid: impl FnOnce() -> bool,
+    ) -> Result<(), AttestError> {
+        let info = info.ok_or("parent is gone or not readable")?;
         if info.uid != 0 {
             return Err("parent is not running as root".into());
         }
-        // SAFETY: a plain syscall with no arguments.
-        let our_uid = unsafe { getuid() };
         if info.ruid != our_uid {
             return Err("parent's real uid is not ours".into());
         }
-        match exe_path(pid) {
+        match exe() {
             Some(p) if p == std::path::Path::new("/usr/bin/sudo") => {}
             Some(_) => return Err("parent is not /usr/bin/sudo".into()),
             None => return Err("parent's executable is not readable".into()),
         }
-        if !cs_platform_valid(pid) {
+        if !platform_valid() {
             return Err("parent is not a valid Apple platform binary".into());
         }
-        // A bonus positive signal; its absence does not refuse (the triad
-        // above is the proof).
-        let _ = cs_identity_contains(pid, b"com.apple.sudo");
         Ok(())
     }
 
@@ -442,7 +460,12 @@ mod imp {
     /// prefers failing closed here.
     pub(super) fn stdout_is_anon_pipe() -> Result<(), AttestError> {
         // SAFETY: a plain syscall with no arguments.
-        let me = unsafe { getpid() };
+        fd_one_is_anon_pipe(unsafe { getpid() })
+    }
+
+    /// [`stdout_is_anon_pipe`]'s read of `me`'s live fd table: this process's own, but in the
+    /// tests, which ask a child's.
+    pub(super) fn fd_one_is_anon_pipe(me: i32) -> Result<(), AttestError> {
         // Size the fd listing, then read it (bounded to a sane ceiling).
         // SAFETY: a null buffer and zero size asks proc_pidinfo for the size.
         let need = unsafe { proc_pidinfo(me, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
@@ -450,8 +473,6 @@ mod imp {
         let Some(need) = need else {
             return Err("own fd table is not readable".into());
         };
-        // `struct proc_fdinfo { int32_t proc_fd; uint32_t proc_fdtype; }` = 8.
-        const FDINFO: usize = 8;
         let mut buf = vec![0u8; need];
         // SAFETY: `buf` is `need` writable bytes, the size passed.
         let got =
@@ -460,7 +481,15 @@ mod imp {
             .ok()
             .filter(|&n| n > 0 && n <= buf.len())
             .ok_or("own fd table is not readable")?;
-        for rec in buf[..got].as_chunks::<FDINFO>().0 {
+        stdout_record_is_anon_pipe(&buf[..got])
+    }
+
+    /// [`stdout_is_anon_pipe`]'s rule over the `PROC_PIDLISTFDS` table it read: fd 1's
+    /// record names an anonymous pipe. Pure.
+    pub(super) fn stdout_record_is_anon_pipe(table: &[u8]) -> Result<(), AttestError> {
+        // `struct proc_fdinfo { int32_t proc_fd; uint32_t proc_fdtype; }` = 8.
+        const FDINFO: usize = 8;
+        for rec in table.as_chunks::<FDINFO>().0 {
             let fd = i32::from_ne_bytes(rec[0..4].try_into().unwrap());
             if fd == 1 {
                 let ty = u32::from_ne_bytes(rec[4..8].try_into().unwrap());

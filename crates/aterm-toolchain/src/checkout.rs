@@ -32,9 +32,29 @@
 //! Reading any error on `Cargo.toml` as "removed" would delete the build
 //! cache (tens of GB, a full rebuild) of a checkout behind `chmod 000`, on an
 //! unmounted volume or at a volume's root. A checkout removed together with
-//! the folder that held it keeps its cache; that is the safe direction.
+//! the folder that held it keeps its cache — unless the caller can PLACE it
+//! ([`Placing`], [`gone_placed`]): under `$HOME`, reached through no link, its
+//! nearest existing folder on the home volume's device and not empty (an empty
+//! one is what a custom mount point reads while its volume is unplugged), and
+//! no mount point of a complete mount table between that folder and it. Then
+//! no volume can be unmounted there, so "away" cannot be the reason: a workspace nested in a
+//! removed checkout (`~/Developer/codex-alab-r3/codex-rs`, both gone) is
+//! gone. Measured 2026-10-17: seven such mirrors were kept for good.
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
+
+/// What lets [`gone_placed`] call a workspace gone whose folder and the
+/// folder above it are both missing: the home volume's device, and the mount
+/// points of a COMPLETE mount table (each spelling a walk meets, firmlinked
+/// forms included). A caller that has no complete table passes none, and the
+/// rule keeps such a cache, as [`gone`] does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Placing {
+    /// The device of `$HOME`'s volume (`st_dev`).
+    pub home_dev: u64,
+    /// Every mount point of a mount table read whole.
+    pub mounts: Vec<PathBuf>,
+}
 
 /// The manifests that make a folder a workspace: Cargo's, and Trust's native one.
 pub const MANIFESTS: &[&str] = &["Cargo.toml", "Targo.toml"];
@@ -81,9 +101,63 @@ pub const VOLUME_ROOTS: &[&str] = &["/media", "/run/media", "/mnt"];
 /// Why the checkout is not called gone: it is there, it was not looked at,
 /// or what was looked at could not be read.
 pub fn gone(checkout: &Path, home: Option<&Path>) -> Result<String, String> {
-    gone_by(checkout, home, &mut |p| {
-        std::fs::symlink_metadata(p).map(|m| m.is_dir())
-    })
+    gone_placed(checkout, home, None)
+}
+
+/// [`gone`], and where `placing` is given, a workspace whose folder and the
+/// folder above it are both missing is gone too when it can be PLACED on the
+/// home volume ([`Placing`], the module docs): under `home`, outside every
+/// place never looked into, every folder on the way below `home` a real
+/// folder (no link), its nearest existing ancestor on `placing.home_dev`, and
+/// no mount point of `placing.mounts` on the path between that ancestor and
+/// it.
+///
+/// # Errors
+///
+/// As [`gone`].
+pub fn gone_placed(
+    checkout: &Path,
+    home: Option<&Path>,
+    placing: Option<&Placing>,
+) -> Result<String, String> {
+    gone_with(
+        checkout,
+        home,
+        placing,
+        &mut |p| std::fs::symlink_metadata(p).map(|m| m.is_dir()),
+        &mut |p| device_of(p),
+        &mut |p| empty_folder(p),
+    )
+}
+
+/// Entries an empty folder may hold and still read as empty: what Finder
+/// leaves in a folder it showed.
+const FINDER_LITTER: &[&str] = &[".DS_Store", ".localized"];
+
+/// Whether the folder at `p` holds nothing but [`FINDER_LITTER`]: what a
+/// volume's mount point reads while the volume is not mounted.
+fn empty_folder(p: &Path) -> std::io::Result<bool> {
+    for entry in std::fs::read_dir(p)? {
+        let name = entry?.file_name();
+        if !FINDER_LITTER.iter().any(|l| name == *l) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The device of the entry at `p`, a link not followed.
+fn device_of(p: &Path) -> std::io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::symlink_metadata(p).map(|m| m.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = p;
+        Err(std::io::Error::other("no device numbers here"))
+    }
 }
 
 /// [`gone`], every look at the file system through `stat` — the path's
@@ -100,6 +174,32 @@ pub fn gone_by(
     checkout: &Path,
     home: Option<&Path>,
     stat: &mut dyn FnMut(&Path) -> std::io::Result<bool>,
+) -> Result<String, String> {
+    gone_with(
+        checkout,
+        home,
+        None,
+        stat,
+        &mut |_| Err(std::io::Error::other("not placed")),
+        &mut |_| Err(std::io::Error::other("not placed")),
+    )
+}
+
+/// [`gone_placed`], every look through `stat` (as [`gone_by`]), every
+/// device read through `dev` (the entry's, a link not followed) and every
+/// folder's emptiness through `empty` (it holds nothing but what Finder
+/// leaves).
+///
+/// # Errors
+///
+/// As [`gone`].
+pub fn gone_with(
+    checkout: &Path,
+    home: Option<&Path>,
+    placing: Option<&Placing>,
+    stat: &mut dyn FnMut(&Path) -> std::io::Result<bool>,
+    dev: &mut dyn FnMut(&Path) -> std::io::Result<u64>,
+    empty: &mut dyn FnMut(&Path) -> std::io::Result<bool>,
 ) -> Result<String, String> {
     let shown = checkout.display();
     if !checkout.is_absolute() || checkout.components().any(|c| c == Component::ParentDir) {
@@ -123,9 +223,12 @@ pub fn gone_by(
         .map_or(0, Iterator::count);
     let mut way: Vec<&Path> = checkout.ancestors().take(below_home).collect();
     way.reverse();
+    // The nearest folder of the way that is there (each looked at before
+    // anything under it, so none is reached through a link).
+    let mut nearest: Option<&Path> = None;
     for folder in way {
         match stat(folder) {
-            Ok(true) => {}
+            Ok(true) => nearest = Some(folder),
             Ok(false) => {
                 return Err(format!(
                     "{} is not a folder (a link is not followed), so its checkout is not \
@@ -160,11 +263,72 @@ pub fn gone_by(
             parent.display()
         )),
         Ok(false) => Err(format!("{} is not a folder", parent.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let away = format!(
+                "neither its checkout {shown} nor the folder that held it is there ({e}) — away \
+                 (a volume not mounted now), not seen removed"
+            );
+            match (placing, home) {
+                (Some(placing), Some(home)) if below_home > 0 => {
+                    placed_gone(checkout, home, nearest, placing, (stat, dev, empty)).ok_or(away)
+                }
+                _ => Err(away),
+            }
+        }
         Err(e) => Err(format!(
             "neither its checkout {shown} nor the folder that held it is there ({e}) — away \
              (a volume not mounted now), not seen removed"
         )),
     }
+}
+
+/// The looks [`placed_gone`] makes: `stat`, `dev` and `empty` of
+/// [`gone_with`].
+type Looks<'a> = (
+    &'a mut dyn FnMut(&Path) -> std::io::Result<bool>,
+    &'a mut dyn FnMut(&Path) -> std::io::Result<u64>,
+    &'a mut dyn FnMut(&Path) -> std::io::Result<bool>,
+);
+
+/// The sight of a workspace nested in a removed checkout ([`gone_placed`]):
+/// its nearest existing ancestor (`nearest`, a real folder below `home`, or
+/// `home` itself) is on the home volume's device, holds something (an EMPTY
+/// folder is what a volume's custom mount point — `~/Developer/ext` — reads
+/// while the volume is unplugged: its workspaces are away, not removed), and
+/// no mount point lies on the path between that ancestor and the workspace.
+/// `None`: it cannot be placed, and it is kept.
+fn placed_gone(
+    checkout: &Path,
+    home: &Path,
+    nearest: Option<&Path>,
+    placing: &Placing,
+    (stat, dev, empty): Looks<'_>,
+) -> Option<String> {
+    let ancestor = match nearest {
+        Some(folder) => folder,
+        None => {
+            // Nothing below `$HOME` is there: `$HOME` itself, a real folder.
+            stat(home).ok().filter(|is_dir| *is_dir)?;
+            home
+        }
+    };
+    if dev(ancestor).ok()? != placing.home_dev {
+        return None;
+    }
+    if empty(ancestor).unwrap_or(true) {
+        return None;
+    }
+    let mounted_between = placing
+        .mounts
+        .iter()
+        .any(|m| m.as_path() != ancestor && m.starts_with(ancestor) && checkout.starts_with(m));
+    (!mounted_between).then(|| {
+        format!(
+            "neither it nor the folder that held it is there, and {} — on the home volume, \
+             with no volume mounted between — is: removed with the checkout it was in",
+            ancestor.display()
+        )
+    })
 }
 
 /// The place `checkout` lies in that is never looked into, if it lies in
@@ -219,5 +383,125 @@ fn same_name(component: &std::ffi::OsStr, name: &str) -> bool {
             .is_some_and(|c| c.eq_ignore_ascii_case(name))
     } else {
         component == name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// What the fixture's `/`-rooted paths are rooted at: a drive on Windows,
+    /// where a path with no prefix is not absolute.
+    const ROOT: &str = if cfg!(windows) { "C:" } else { "" };
+
+    /// The fixture path `p` (`/`-rooted), absolute here.
+    fn at(p: &str) -> PathBuf {
+        PathBuf::from(format!("{ROOT}{p}"))
+    }
+
+    /// A file system of named folders (`true`), links (`false`) and their
+    /// devices; anything else is missing.
+    struct Fs {
+        entries: BTreeMap<PathBuf, (bool, u64)>,
+    }
+
+    impl Fs {
+        fn new(entries: &[(&str, bool, u64)]) -> Self {
+            Self {
+                entries: entries
+                    .iter()
+                    .map(|(p, dir, dev)| (at(p), (*dir, *dev)))
+                    .collect(),
+            }
+        }
+
+        fn gone(&self, checkout: &str, placing: Option<&Placing>) -> Result<String, String> {
+            let found = |p: &Path| {
+                self.entries
+                    .get(p)
+                    .copied()
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+            };
+            gone_with(
+                &at(checkout),
+                Some(&at("/h")),
+                placing,
+                &mut |p| found(p).map(|(dir, _)| dir),
+                &mut |p| found(p).map(|(_, dev)| dev),
+                &mut |p| {
+                    found(p)?;
+                    Ok(!self.entries.keys().any(|e| e.parent() == Some(p)))
+                },
+            )
+        }
+    }
+
+    fn placing(mounts: &[&str]) -> Placing {
+        Placing {
+            home_dev: 1,
+            mounts: mounts.iter().map(|m| at(m)).collect(),
+        }
+    }
+
+    /// A WORKSPACE NESTED IN A REMOVED CHECKOUT IS GONE once it can be placed:
+    /// `~/dev/codex-r3/codex-rs` with `~/dev/codex-r3` missing and `~/dev`
+    /// there on the home volume. NEGATIVE CONTROLS, each kept: no placing (the
+    /// rule as it was), a mount point on the path between, the nearest folder
+    /// on another device, a link on the way, a `$HOME` folder never looked
+    /// into, and a volume root.
+    #[test]
+    fn a_workspace_nested_in_a_removed_checkout_is_gone_only_where_it_can_be_placed() {
+        let fs = Fs::new(&[
+            ("/h", true, 1),
+            ("/h/dev", true, 1),
+            ("/h/dev/other", true, 1),
+            ("/h/ln", false, 1),
+            ("/h/dev/ext", true, 1),
+        ]);
+        let ws = "/h/dev/codex-r3/codex-rs";
+        assert!(fs.gone(ws, None).is_err(), "unplaced: away, kept");
+        let seen = fs.gone(ws, Some(&placing(&["/", "/System/Volumes/Data"])));
+        assert!(
+            seen.as_deref().is_ok_and(|s| s.contains("/h/dev")),
+            "{seen:?}"
+        );
+        for between in ["/h/dev/codex-r3", "/h/dev/codex-r3/codex-rs"] {
+            assert!(
+                fs.gone(ws, Some(&placing(&["/", between]))).is_err(),
+                "a mount at {between}"
+            );
+        }
+        let other = Placing {
+            home_dev: 2,
+            ..placing(&["/"])
+        };
+        assert!(fs.gone(ws, Some(&other)).is_err(), "another device");
+        assert!(
+            fs.gone("/h/ln/x/ws", Some(&placing(&["/"]))).is_err(),
+            "through a link"
+        );
+        let skip = format!("/h/{}/r/ws", HOME_SKIP[0]);
+        assert!(fs.gone(&skip, Some(&placing(&["/"]))).is_err());
+        assert!(
+            fs.gone(&format!("{}/x/ws", VOLUME_ROOTS[0]), Some(&placing(&["/"])))
+                .is_err()
+        );
+        // Nothing below `$HOME` there: placed against `$HOME` itself.
+        assert!(fs.gone("/h/gone/a/ws", Some(&placing(&["/"]))).is_ok());
+        // Its nearest folder EMPTY — a custom mount point (`~/dev/ext`) whose
+        // volume is unplugged: away, kept. NEGATIVE CONTROL: the same depth
+        // under the non-empty `~/dev` is gone.
+        assert!(
+            fs.gone("/h/dev/ext/proj/ws", Some(&placing(&["/"])))
+                .is_err_and(|e| e.contains("away")),
+            "an empty mount-point folder keeps it"
+        );
+        assert!(fs.gone("/h/dev/proj/ws", Some(&placing(&["/"]))).is_ok());
+        // The old sights still read as they did.
+        assert!(
+            fs.gone("/h/dev/ws", None)
+                .is_ok_and(|s| s.contains("there without it"))
+        );
     }
 }

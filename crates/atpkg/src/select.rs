@@ -301,7 +301,8 @@ mod tests {
         );
     }
 
-    // The highest signed index_build wins; an unsigned higher build cannot suppress it.
+    // The highest signed index_build wins; an unsigned higher build cannot suppress it. A
+    // tie keeps the earlier-listed candidate.
     #[test]
     fn picks_highest_signed_skips_unsigned() {
         let cands = vec![
@@ -309,10 +310,11 @@ mod tests {
             unsigned("v999-attack", 999), // huge claimed build, bad signature
             signed("v60", 60),
             signed("v55", 55),
+            signed("v60-again", 60),
         ];
         let out = select_index(&anchor(0), cands, floor(40), testkit::NOW);
         let sel = out.selected.expect("a signed index wins");
-        assert_eq!(sel.label, "v60");
+        assert_eq!((sel.label.as_str(), sel.candidate), ("v60", 2));
         assert_eq!(sel.index.index_build, 60);
         assert_eq!(sel.index.attribution().machine_id, testkit::MACHINE_ID);
         assert_eq!(
@@ -379,6 +381,19 @@ mod tests {
             sel.index.index_build, 60,
             "the higher build had no authority"
         );
+        // The roster memo keys on BOTH halves: the master's signature beside other roster
+        // bytes is a forgery, not the generation already admitted.
+        let mut forged = signed("v70", 70);
+        forged.roster_bytes.push(b'\n');
+        let sel = select_index(
+            &anchor(0),
+            vec![signed("v60", 60), forged],
+            no_floor(),
+            testkit::NOW,
+        )
+        .selected
+        .expect("the intact candidate still qualifies");
+        assert_eq!(sel.index.index_build, 60);
     }
 
     // A replayed roster generation is refused by the durable roster floor.

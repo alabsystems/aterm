@@ -65,6 +65,7 @@ use crate::typing_momentum::TypingMomentum;
 mod companion;
 mod custody;
 mod emit;
+mod light_body;
 mod probe;
 mod raster;
 mod scroll;
@@ -76,6 +77,7 @@ mod style;
 mod thermal;
 pub use companion::*;
 pub use custody::*;
+pub(crate) use light_body::*;
 pub use probe::*;
 pub use raster::*;
 pub use scroll::*;
@@ -523,6 +525,11 @@ pub struct CursorGlow {
     /// and forget nothing, and presses kept by a refusal below the caret are
     /// held to this row ([`PressCredits::held_through`]).
     hand_row: Option<HandRow>,
+    /// The caret row at a generic input boundary, and whether a later sample
+    /// proved it parked away from the output. Cold program setup has no such
+    /// boundary. A parked, unowned row cannot acquire typing ownership from
+    /// a redisplay's matching glyph; an established hand keeps its lane.
+    unowned_caret: Option<UnownedCaret>,
     /// A fresh composer-newline hint ([`Self::note_newline_break`]: an
     /// alt-screen Shift+Enter, bound by agent composers to a line break without
     /// submitting).
@@ -909,6 +916,21 @@ impl Geom {
     }
 }
 
+/// Exact chronological keys whose content was observed in a repainted input
+/// run. The source span is optional when every new glyph is on the landing
+/// row. `cells` also prices a proved line-break Space omitted by word wrap;
+/// only the observed spans are painted. This is one move's proof, not retained
+/// input authority.
+#[derive(Clone, Copy)]
+struct ExactTypedRun {
+    origin_row: u16,
+    slot: usize,
+    source: Option<(u16, u16, u16)>,
+    landing_start: u16,
+    cells: usize,
+    rewrap_start: Option<(u16, u16)>,
+}
+
 /// One observed cursor move as [`CursorGlow::spawn`]'s classifier read it: the
 /// raw endpoints, clock, config and geometry plus the typing-vs-jump verdicts
 /// every later spawn phase keys on. Built once per move by `classify_move`,
@@ -950,6 +972,9 @@ struct MoveCtx<'a> {
     /// (one cell, the landing), carried to the seam so the sweep and the spend
     /// agree. `false` for non-re-anchors and styles with no ribbon.
     re_anchor_lays_landing: bool,
+    /// The exact, already-paid repaint spans, replacing a re-anchor's generic
+    /// one-cell landing. Both content witnesses use the same payment and emit.
+    exact_typed_run: Option<ExactTypedRun>,
     /// The visible lane's typed re-anchor would have laid its one cell under a
     /// glyph no live press typed ([`CursorGlow::probe_glyph_before`], or for a
     /// flushed park [`HeldPark::landing_cell`], against
@@ -969,8 +994,8 @@ struct MoveCtx<'a> {
     /// Licensed by the in-flight pool alone (no stamp fresh; unpaid presses
     /// paid for the echo). The ring row reads `licence=inflight`.
     in_flight_licence: bool,
-    /// `shape_wrap || re_anchor`: the classifier's wrap verdict, read by the
-    /// momentum advance and the fold-shaped cat pulse.
+    /// A fold, re-anchor or exact repainted run: the classifier's wrap verdict,
+    /// read by the momentum advance and the fold-shaped cat pulse.
     wrap: bool,
     /// The press-hint half of typed pairing: a fresh key-time `typed_at` stamp.
     /// Equal to `typed_pair` under the licence law; kept separate because the
@@ -1384,6 +1409,14 @@ impl CursorGlow {
     /// …and its chained-life ceiling — well under the phaser's chained
     /// ceiling, so a slow rhythm never parks light on the line for seconds.
     const BEAM_CHAIN_LIFE_MAX: f32 = 1.2;
+    /// Water typing continuity: inside a rhythm ([`Self::CHAIN_GAP_MAX`]) the
+    /// wake's life is this many inter-key gaps, so about three cells of water
+    /// trail the drop at any human cadence; heat still stretches it further
+    /// into the torpedo at speed.
+    const WATER_CHAIN_KEYS: f32 = 4.0;
+    /// …and its chained-life ceiling, the beam's: a slow rhythm never leaves
+    /// water standing on the line for seconds.
+    const WATER_CHAIN_LIFE_MAX: f32 = 1.2;
 
     /// Last honest visible source owned by this engine. Native and pipeline
     /// hosts require the classic trail to report the same anchor before they
@@ -1701,6 +1734,7 @@ impl CursorGlow {
         self.insert.teardown();
         self.last_licensed_row = None;
         self.hand_row = None;
+        self.unowned_caret = None;
         self.bs_poof_hint = None;
         self.bs_baseline = None;
         self.last_poof = None;
@@ -2020,7 +2054,8 @@ impl CursorGlow {
                 self.spawns += 1;
                 self.log_licensed_as(now, from, to, AdmissionRecord::LICENCE_MOTION);
             }
-            // A light ground's veils ride the radial stream.
+            // A light ground's ink: the tracer and crown under the letters.
+            self.under_out.extend_from_slice(self.classic.under());
             self.halo_out.extend_from_slice(self.classic.halos());
             return fp;
         }
@@ -2211,10 +2246,10 @@ impl CursorGlow {
         let shown = self
             .last
             .or_else(|| self.last_visible.map(|(cell, _)| cell));
-        if key_in_flight
-            && self.v2.engaged()
+        if self.v2.engaged()
             && witness_n > 0
             && let (Some((pr, _)), Some((cr, _))) = (shown, cur)
+            && key_in_flight
             && pr.abs_diff(cr) == 1
         {
             let (samples, n) = witness_samples(&self.witness_rows, witness_n);
@@ -2225,6 +2260,26 @@ impl CursorGlow {
                 self.lift_hand_row(pr, cr);
                 self.v2.lift_hand(run);
             }
+        }
+        if !key_in_flight
+            && let (Some((pr, pc)), Some((cr, cc))) = (shown, cur)
+            && pc == cc
+            && pr.abs_diff(cr) == 1
+            && self
+                .row_cur_meta
+                .is_some_and(|m| m.row == cr && m.at == now)
+            && let Some(run) = self.recent_typed_run.as_mut()
+            && run.row == pr
+            && run.end() == cc
+            && (0..usize::from(run.len)).all(|i| {
+                self.row_cur
+                    .get(usize::from(run.col0) + i)
+                    .copied()
+                    .unwrap_or(' ')
+                    == run.glyphs[i]
+            })
+        {
+            run.row = cr;
         }
         // The caret goes hidden: keep the last probe that showed it.
         if cur.is_none()
@@ -2515,7 +2570,7 @@ impl CursorGlow {
             self.emit_ring(now, cfg, geom, out, &mut halos);
         }
         if out.len() < Self::MAX_QUADS {
-            self.emit_particles(now, cfg, geom, out, &mut halos);
+            self.emit_particles(now, cfg, geom, out, &mut halos, &mut under);
         }
         self.emit_vapor(now, cfg, geom, &mut halos);
         self.bolt_verts = bolt_verts;

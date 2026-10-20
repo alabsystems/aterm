@@ -743,6 +743,19 @@ impl HistoryPlan {
     /// What the export produced, as the worker's join takes it (see the
     /// variants for when each runs).
     pub(crate) fn results(self, dir: &Path) -> ExportResults {
+        self.results_within(dir, FORK_EXPORT_WAIT, FORK_HELD_WAIT)
+    }
+
+    /// [`Self::results`] for a test whose export must finish: the fork lane's
+    /// waits become a one-minute hang detector, so a loaded machine slows the
+    /// test instead of dropping the scrollback it checks.
+    #[cfg(test)]
+    pub(crate) fn results_for_test(self, dir: &Path) -> ExportResults {
+        const HANG: Duration = Duration::from_secs(60);
+        self.results_within(dir, HANG, HANG)
+    }
+
+    fn results_within(self, dir: &Path, wait: Duration, held_wait: Duration) -> ExportResults {
         match self {
             Self::Unexported => ExportResults::default(),
             Self::Withheld => ExportResults {
@@ -755,7 +768,7 @@ impl HistoryPlan {
             Self::Exported(export) => export.finish(Duration::ZERO),
             Self::Deferred(sessions) => {
                 match HistoryExporter::start(dir.to_path_buf(), sessions, false) {
-                    Ok(export) => export.finish_deferred(FORK_EXPORT_WAIT, FORK_HELD_WAIT),
+                    Ok(export) => export.finish_deferred(wait, held_wait),
                     Err(error) => {
                         aterm_log::warn!(
                             "update apply: the scrollback export could not start ({error}); each \
@@ -3128,3 +3141,47 @@ pub(crate) mod tests;
 #[cfg(all(test, unix))]
 #[path = "handoff_history_conformance.rs"]
 mod conformance;
+
+/// `NativeUpdateHistoryCarry` actions no shipping function performs, each waived where
+/// its Tier-1 (`conformance::the_real_history_carry_is_the_derived_machine`) binds it.
+#[cfg(all(any(test, debug_assertions), unix))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "NativeUpdateHistoryCarry",
+    action = "Output",
+    reason = "The environment: program output reaching the outgoing grid between the export \
+              and the park. Tier-1 drives it as real `Terminal::process` bytes; the carry's \
+              own seams (`join`, the export, the import) are what it is checked against."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "NativeUpdateHistoryCarry",
+    action = "Rewrap",
+    reason = "The environment: a width reflow (or a clear or reset) moving the history under \
+              the export's fence. Tier-1 drives a real `Terminal::resize`; the join's fence \
+              check is what refuses it."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "NativeUpdateHistoryCarry",
+    action = "Corrupt",
+    reason = "The environment: a sidecar that reaches the successor with other bytes than its \
+              stamp. Tier-1 flips a byte of the real named file; the import's length and sha \
+              check is what refuses it."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "NativeUpdateHistoryCarry",
+    action = "Clear",
+    reason = "The environment: the adopted shell clearing its scrollback (ED3, a reset) after \
+              Commit, before the import lands. Tier-1 feeds a real `ESC [3J` to the adopted \
+              engine; the import's claim check is what refuses to put the history back."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "NativeUpdateHistoryCarry",
+    action = "Settled",
+    reason = "Stutter: the settled session stays settled (the machine's deadlock guard); no \
+              shipping code runs for it."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn history_carry_waivers() {}

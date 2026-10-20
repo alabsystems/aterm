@@ -10,13 +10,11 @@
 //! misses its recording; and no single-bit flip of a recording decodes to the
 //! recorded message.
 
-mod support;
-
 use std::collections::BTreeMap;
 
+use crate::support::*;
 use aterm_dbus::message::{self, flags};
 use aterm_dbus::{Endian, Message, Type, Value};
-use support::*;
 
 const BUS: &str = "org.freedesktop.DBus";
 const BUS_PATH: &str = "/org/freedesktop/DBus";

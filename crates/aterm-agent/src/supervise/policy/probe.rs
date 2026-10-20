@@ -680,18 +680,20 @@ impl TapeValue for Result<GitView, String> {
     }
 }
 
+/// A shell's startup as a tape holds it ([`ShellStartup::names`] and
+/// [`ShellStartup::may_run_zsh`]): the probe's answer and a decision's facts
+/// (`box_facts`) write it alike.
+pub(crate) type ShellWire = (Vec<(String, String, bool)>, bool);
+
 impl TapeValue for Result<ShellStartup, String> {
     fn to_tape(&self) -> Vec<u8> {
         answer(self, |s| (s.names().to_vec(), s.may_run_zsh()))
     }
 
     fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
-        answer_of(
-            bytes,
-            |(names, zsh): (Vec<(String, String, bool)>, bool)| {
-                Ok(ShellStartup::of_parts(names, zsh))
-            },
-        )
+        answer_of(bytes, |(names, zsh): ShellWire| {
+            Ok(ShellStartup::of_parts(names, zsh))
+        })
     }
 }
 

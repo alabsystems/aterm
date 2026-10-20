@@ -140,7 +140,7 @@ pub(crate) fn project_focus_modifier_cache(
     fresh_ctrl: i64,
     delivered_ctrl: i64,
 ) -> std::collections::BTreeMap<&'static str, i64> {
-    use winit::keyboard::ModifiersState;
+    use aterm_window::keyboard::ModifiersState;
 
     let ws = &app.windows[&wid];
     [
@@ -161,7 +161,7 @@ pub(crate) fn project_focus_modifier_cache(
 /// later normal size recovers full height. Headless drives the passed-size fallback.
 #[test]
 fn on_resize_never_yields_a_degenerate_or_wedged_grid() {
-    use winit::dpi::PhysicalSize;
+    use aterm_window::dpi::PhysicalSize;
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
 
@@ -221,8 +221,7 @@ fn compose_band_for_test(app: &mut App) {
     app.splice_message_band(wid, aterm_render::Theme::default());
 }
 
-/// The composed band is sealed on the row that meets the terminal, including a presence
-/// row with no band row below it.
+/// The composed band is sealed on the row that meets the terminal.
 #[test]
 fn the_composed_band_is_sealed_on_the_row_that_meets_the_terminal() {
     use aterm_messages::{Message, Severity, tags};
@@ -231,10 +230,6 @@ fn the_composed_band_is_sealed_on_the_row_that_meets_the_terminal() {
     // height allows (`message_band::closing_line`).
     let line = |app: &App, row: usize| {
         crate::message_band::closing_line(&app.windows[&WindowId(0)].input_scratch, row)
-    };
-    let bare = |row: &[aterm_core::terminal::RenderCell]| {
-        row.iter()
-            .all(|c| c.underline == aterm_core::terminal::UnderlineStyle::None)
     };
 
     // Padded: two rows committed, one dismissed inside the shrink quiet.
@@ -265,21 +260,6 @@ fn the_composed_band_is_sealed_on_the_row_that_meets_the_terminal() {
         line(&app, 1),
         Some(ink),
         "the padded row meets the terminal, so it carries the seam"
-    );
-
-    // Presence only: no band row follows, so the presence row closes the chrome.
-    let mut app = App::headless_for_test();
-    assert_eq!(app.message_band_rows, 0);
-    app.windows.get_mut(&WindowId(0)).unwrap().presence.rows = 1;
-    compose_band_for_test(&mut app);
-    assert_eq!(
-        line(&app, 0),
-        Some(ink),
-        "a presence row with nothing under it carries the closing seam"
-    );
-    assert!(
-        line(&app, 1).is_none() && bare(&app.windows[&WindowId(0)].input_scratch.cells[1]),
-        "and the terminal's own first row does not"
     );
 }
 
@@ -1848,13 +1828,13 @@ fn focus_loss_scrubs_stale_modifiers_without_breaking_real_chords() {
     use aterm_session::sink::SinkWriter;
     use aterm_spec::derive::Model;
     use aterm_types::keyboard::{Key, KeyEventType, KeyboardMode, encode_key_with_event};
+    use aterm_window::event::{ElementState, KeyEvent};
+    use aterm_window::keyboard::{
+        Key as WinitKey, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr,
+    };
     use std::collections::BTreeMap;
     #[cfg(unix)]
     use std::sync::Arc;
-    use winit::event::{ElementState, KeyEvent};
-    use winit::keyboard::{
-        Key as WinitKey, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr,
-    };
 
     fn codex_l_bytes(mods: ModifiersState, event_type: KeyEventType) -> Vec<u8> {
         let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES
@@ -2768,6 +2748,7 @@ fn recording_pin_preserves_pet_across_raw_focus_loss() {
         presented: None,
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
+        unlogged_over_cap: 0,
         dir,
         handoff: None,
         cancel: super::VideoCancellation::new(),

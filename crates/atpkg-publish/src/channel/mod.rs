@@ -9,12 +9,10 @@
 //! | [`mirror`] | `mirror`: exactly the signed packs an index pins, made public |
 //! | [`group`] | `publish-group rustc`: the trust bundle and its siblings from one seal |
 //! | [`seed`] | the seed pin: the re-pin a SEED-MINT names is on the trust repo's main |
-//! | [`candidate`] | the candidate gate's admission (D27), asked of `ship trust candidate` |
 //! | [`status`] | `status`: the verified head, printed |
 //!
 //! The production release host is [`crate::host::gh`].
 
-pub mod candidate;
 pub mod group;
 pub mod index;
 pub mod mirror;

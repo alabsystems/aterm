@@ -30,28 +30,17 @@ pub enum Voice {
     StreakPip,
     /// The command verdict that replaces the pip's exhale.
     Verdict,
-    /// The supervisor's answer chime.
-    Chime,
 }
 
 impl Voice {
     /// Every voice, for a caller that asks what a policy idles.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 5] = [
         Self::Keystroke,
         Self::Riff,
         Self::Bonk,
         Self::StreakPip,
         Self::Verdict,
-        Self::Chime,
     ];
-
-    /// Whether real window focus gates this voice: a background window may
-    /// animate but never speak. The chime is the exception: its point is to
-    /// hear a background session's answer.
-    #[must_use]
-    pub const fn follows_focus(self) -> bool {
-        !matches!(self, Self::Chime)
-    }
 
     /// The motion effect this voice is the sound of, where a reduced motion
     /// policy stops it with its light: the bonk with the word sparkles' wince,
@@ -63,7 +52,7 @@ impl Voice {
         match self {
             Self::Bonk => Some(crate::motion::MotionEffect::WordSparkles),
             Self::StreakPip => Some(crate::motion::MotionEffect::OutputStreak),
-            Self::Keystroke | Self::Riff | Self::Verdict | Self::Chime => None,
+            Self::Keystroke | Self::Riff | Self::Verdict => None,
         }
     }
 }
@@ -74,7 +63,7 @@ pub struct VoiceTerms {
     /// The Music effects master (`trail_sounds`), with any host policy that
     /// silences every voice (serious mode) folded in.
     pub master: bool,
-    /// The voice's own switch (`trail_sound_riff`, `choice_sound`, the bonk's,
+    /// The voice's own switch (`trail_sound_riff`, the bonk's,
     /// `output_streak.sound`); `true` for a voice that has none.
     pub own: bool,
     /// `trail_sound_volume`.
@@ -87,19 +76,16 @@ pub struct VoiceTerms {
 }
 
 /// THE ONE SOUND LAW: the gain `voice` plays at, or `None` while it is
-/// silent. The master, the voice's own switch and the volume gate every
-/// voice; focus gates every voice that [`Voice::follows_focus`]; a reduced
-/// motion policy silences only a voice with a [`Voice::motion_twin`].
+/// silent. The master, the voice's own switch, the volume and real window
+/// focus gate every voice (a background window may animate but never
+/// speak); a reduced motion policy silences only a voice with a
+/// [`Voice::motion_twin`].
 #[must_use]
 pub fn voice_gain(voice: Voice, terms: &VoiceTerms) -> Option<f32> {
     if terms.reduced_motion && voice.motion_twin().is_some() {
         return None;
     }
-    trail_sound_gain(
-        terms.raw_focused || !voice.follows_focus(),
-        terms.master && terms.own,
-        terms.volume,
-    )
+    trail_sound_gain(terms.raw_focused, terms.master && terms.own, terms.volume)
 }
 
 /// Resolve trail-audio policy from real window focus, never the synthetic
@@ -202,9 +188,9 @@ mod voice_gain_tests {
     };
 
     /// THE VOICE TABLE: every voice plays with every gate open; the master,
-    /// its own switch and the volume silence each; focus silences all but the
-    /// chime; a reduced motion policy silences only the bonk and the pip,
-    /// whose light it stops.
+    /// its own switch, the volume and a background window silence each; a
+    /// reduced motion policy silences only the bonk and the pip, whose light
+    /// it stops.
     #[test]
     fn each_voice_obeys_exactly_its_gates() {
         for voice in Voice::ALL {
@@ -219,18 +205,13 @@ mod voice_gain_tests {
                     volume: 0.0,
                     ..OPEN
                 },
+                VoiceTerms {
+                    raw_focused: false,
+                    ..OPEN
+                },
             ] {
                 assert_eq!(voice_gain(voice, &closed), None, "{voice:?} {closed:?}");
             }
-            let unfocused = VoiceTerms {
-                raw_focused: false,
-                ..OPEN
-            };
-            assert_eq!(
-                voice_gain(voice, &unfocused).is_none(),
-                voice != Voice::Chime,
-                "{voice:?}: only the chime speaks from a background window"
-            );
             let reduced = VoiceTerms {
                 reduced_motion: true,
                 ..OPEN
@@ -324,8 +305,8 @@ pub fn drain_trail_sound_cues(
 /// `trail_sound_volume`. Per-class and master sparkle gates need no
 /// re-check: the engine records cues only for words it decorates.
 ///
-/// The bonk is a synth voice, so the master gates it as the Sound rows' shared
-/// note (`prefs::SOUND_NOTE`) promises; the terminal bell (`lib.rs::on_bell`)
+/// The bonk is a synth voice, so the master gates it as the Music effects
+/// row's note (`prefs::TRAIL_SOUNDS_NOTE`) promises; the terminal bell (`lib.rs::on_bell`)
 /// is the one stated exception. The focus, master and volume terms delegate
 /// to [`trail_sound_gain`], as [`sing_riff_gain`] does.
 pub fn bonk_sound_gain(
@@ -445,7 +426,7 @@ mod bonk_gain_tests {
             None,
             "raw focus"
         );
-        // The master switch gates the bonk, as `prefs::SOUND_NOTE` promises;
+        // The master switch gates the bonk, as `prefs::TRAIL_SOUNDS_NOTE` promises;
         // the bonk knob stays on so nothing else mutes it.
         assert_eq!(
             bonk_sound_gain(true, false, true, false, 0.4),

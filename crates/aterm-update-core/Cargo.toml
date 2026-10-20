@@ -68,6 +68,9 @@ libc = { workspace = true }
 aterm-digest = { workspace = true }
 
 [dev-dependencies]
+# The counting seam (`aterm_durable::seam`) its tests reach, in an optimized test
+# build too.
+aterm-durable = { workspace = true, features = ["test-support"] }
 # Exclusive private directories for file-hash fixtures, removed on drop.
 aterm-tempfile = { workspace = true }
 # The Linux binary-identity round-trip test reads its JSON back through the

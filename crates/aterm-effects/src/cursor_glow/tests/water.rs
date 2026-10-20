@@ -150,6 +150,79 @@ fn water_emits_a_smooth_wavy_wake() {
     }
 }
 
+/// Typed at a human rhythm (156 ms a key, about 75 words a minute, the
+/// Settings preview's own pace), the wake trails at least three cells behind
+/// the caret, one contiguous run: the row's promise of a blue wake behind the
+/// drop holds below torpedo speed. A lone key after a pause still leaves no
+/// long wake (the chain only spans a rhythm).
+#[test]
+fn water_wake_trails_behind_the_caret_at_human_cadence() {
+    let g = geom();
+    let c = cfg(GlowStyle::Water, true);
+    let mut glow = CursorGlow::default();
+    let mut out = Vec::new();
+    let mut t = Instant::now();
+    glow.tick(Some((2, 1)), t, &c, g, &mut out);
+    for col in 2..=20u16 {
+        // The preview's 52 ms frames between keys.
+        for _ in 0..2 {
+            t += ms(52);
+            glow.tick(Some((2, col - 1)), t, &c, g, &mut out);
+        }
+        t += ms(52);
+        glow.note_synthetic_typed(t, 1);
+        glow.tick(Some((2, col)), t, &c, g, &mut out);
+    }
+    glow.particles.clear();
+    t += ms(78);
+    glow.tick(Some((2, 20)), t, &c, g, &mut out);
+    let caret_x = 20 * g.cw as u16;
+    let lit: std::collections::BTreeSet<u16> = glow
+        .under_quads()
+        .iter()
+        .filter(|q| q.row == 2 && luma_of(q.color) >= 24)
+        .flat_map(|q| q.x..q.x.saturating_add(q.w))
+        .filter(|&x| x < caret_x)
+        .collect();
+    let reach = lit
+        .iter()
+        .next()
+        .map_or(0, |first| caret_x.saturating_sub(*first));
+    assert!(
+        reach >= 3 * g.cw as u16,
+        "the wake reaches three cells behind the caret at 156 ms a key: {reach}px"
+    );
+    let gaps = lit
+        .iter()
+        .zip(lit.iter().skip(1))
+        .filter(|(a, b)| **b != **a + 1);
+    assert_eq!(gaps.count(), 0, "the wake is one contiguous run");
+
+    // Negative control: a lone key after a one-second pause, seen 250 ms
+    // later, lays no wake past its own cell.
+    let mut lone = CursorGlow::default();
+    let mut t = Instant::now();
+    lone.tick(Some((2, 1)), t, &c, g, &mut out);
+    t += ms(1000);
+    lone.note_synthetic_typed(t, 1);
+    lone.tick(Some((2, 2)), t, &c, g, &mut out);
+    lone.particles.clear();
+    lone.tick(Some((2, 2)), t + ms(250), &c, g, &mut out);
+    assert!(
+        lone.under_quads()
+            .iter()
+            .filter(|q| q.row == 2 && luma_of(q.color) >= 24)
+            .all(|q| q.x + q.w <= 2 * g.cw as u16 + g.cw as u16),
+        "a lone key keeps its short base life"
+    );
+}
+
+/// The Rec. 709 luma of a premultiplied additive quad colour.
+fn luma_of(color: u32) -> u32 {
+    let (r, g, b) = ((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff);
+    (2126 * r + 7152 * g + 722 * b) / 10_000
+}
+
 /// A causally licensed Home/End-sized move gets Water's own full-vector
 /// crest even when the configured typing tail is one cell. Navigation is
 /// still calm: no heat, splash particles, or landing ring; a one-cell arrow
@@ -421,30 +494,81 @@ fn water_jump_reflection_drips_then_fades_smoothly_to_zero() {
     );
 }
 
-/// Light-theme law: the wake is additive light, which cannot show on a white
-/// ground, so on `dark_theme: false` a typed run lays source-over veils and no
-/// additive wake; the dark wake above is untouched.
+/// Light-theme law: Water draws its own wake in ink. The undertow and crest
+/// ride the swell as on a dark ground, as source-over ink under the letters
+/// (no additive light, which white paper cannot show), so the spine moves
+/// vertically from cell to cell; a jump's droplets and ripples are ink marks
+/// over the text. Negative control: the same run on a dark ground stays
+/// additive.
 #[test]
-fn light_theme_wake_is_veils_not_additive() {
+fn light_theme_wake_is_water_in_ink() {
     let g = geom();
     let mut c = cfg(GlowStyle::Water, true);
     c.dark_theme = false;
+    c.theme_fg = 0x0024_292F;
+    c.theme_bg = 0x00FF_FFFF;
     let t0 = Instant::now();
     let mut out = Vec::new();
     let mut glow = CursorGlow::default();
     glow.tick(Some((2, 4)), t0, &c, g, &mut out);
     let mut t = t0;
-    for col in 5..=9u16 {
+    for col in 5..=12u16 {
         t += Duration::from_millis(60);
         glow.note_synthetic_typed(t, 1);
         glow.tick(Some((2, col)), t, &c, g, &mut out);
     }
+    let under = glow.under_quads();
+    assert!(!under.is_empty(), "the light wake is drawn");
     assert!(
-        glow.under_quads().is_empty(),
-        "no additive wake under the ink on a light theme"
+        under.iter().all(|q| q.alpha > 0 && q.alpha2 > 0),
+        "the light wake is source-over ink"
     );
     assert!(
-        glow.halos().iter().any(|h| h.mode == HaloMode::Over),
-        "the light-theme wake renders as source-over veils"
+        out.iter().all(|q| q.alpha > 0),
+        "no additive light on paper"
     );
+    // The swell: the ink's top edge moves between cells behind the caret.
+    let tops: std::collections::BTreeSet<u16> = (6..11u16)
+        .filter_map(|col| {
+            let x = col * g.cw as u16 + g.cw as u16 / 2;
+            under
+                .iter()
+                .filter(|q| (q.x..q.x + q.w).contains(&x))
+                .map(|q| q.y)
+                .min()
+        })
+        .collect();
+    assert!(tops.len() >= 2, "the wake rides the swell: {tops:?}");
+    // A jump: droplets and ripples are ink marks.
+    glow.note_synthetic_move(t + Duration::from_millis(60));
+    glow.tick(
+        Some((4, 34)),
+        t + Duration::from_millis(60),
+        &c,
+        g,
+        &mut out,
+    );
+    glow.tick(
+        Some((4, 34)),
+        t + Duration::from_millis(120),
+        &c,
+        g,
+        &mut out,
+    );
+    assert!(
+        glow.halos().iter().all(|h| h.mode == HaloMode::Over),
+        "every mark over the text is source-over ink"
+    );
+    assert!(out.iter().all(|q| q.alpha > 0), "the ripples are ink");
+    // Negative control: a dark ground keeps the additive wake.
+    let dark = cfg(GlowStyle::Water, true);
+    let mut glow = CursorGlow::default();
+    let mut t = t0;
+    glow.tick(Some((2, 4)), t, &dark, g, &mut out);
+    for col in 5..=12u16 {
+        t += Duration::from_millis(60);
+        glow.note_synthetic_typed(t, 1);
+        glow.tick(Some((2, col)), t, &dark, g, &mut out);
+    }
+    assert!(glow.under_quads().iter().all(|q| q.alpha == 0));
 }

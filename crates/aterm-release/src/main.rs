@@ -88,13 +88,8 @@ mod trust_facts;
 // The lane itself (`ship trust run`): the gate list, the slots, the prover's
 // process trees and trustd, then the judge.
 mod trust_lane;
-// The candidate gate (`ship trust candidate`): the published seal's whole-tree run and
-// a candidate toolchain's, and the receipt the trust pack publisher admits.
-mod trust_candidate;
-// Its comparison: library by library, obligation by obligation, from what each measured.
-mod trust_compare;
-// Its per-obligation records (the lane reduces each check's report.ndjson), keys
-// and retraction ledger: every obligation the seal proved, not a count.
+// The lane's per-obligation records (`--obligations`: each check's report.ndjson
+// reduced beside its log).
 mod trust_oblig;
 mod verify;
 

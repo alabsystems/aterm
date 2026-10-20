@@ -435,8 +435,9 @@ fn walk(m: &Model, seed: u64, mutant: Mutant) -> Result<Vec<&'static str>, (Stri
 fn slog_journal_view_conforms_to_derived_model() {
     let m = session_log_journal_model();
     let mut ran = std::collections::BTreeSet::new();
-    for seed in 1..=2000u64 {
-        match walk(&m, seed, SHIPPING) {
+    let seeds: Vec<u64> = (1..=2000).collect();
+    for walked in aterm_spec::check::each(&seeds, |&seed| walk(&m, seed, SHIPPING)) {
+        match walked {
             Ok(r) => ran.extend(r),
             Err((why, _)) => panic!("{why}"),
         }
@@ -447,9 +448,13 @@ fn slog_journal_view_conforms_to_derived_model() {
 }
 
 /// NEGATIVE CONTROLS: each reader (or writer and reader) that breaks one law
-/// is refused on some walk, by the law it breaks, and only that law.
+/// is refused on some walk, by the law it breaks, and only that law. Each is
+/// held to its first `REFUSALS` refusals, which the seeds reach by seed 175
+/// for the rarest (the kept `#handed`) and by seed 33 for every other
+/// (2026-10-17); walking all 2,000 seeds for each took 15 s.
 #[test]
 fn slog_journal_view_conformance_rejects_each_broken_reader() {
+    const REFUSALS: usize = 8;
     let m = session_log_journal_model();
     let rules = |r: ViewRules| Mutant {
         rules: r,
@@ -511,6 +516,7 @@ fn slog_journal_view_conformance_rejects_each_broken_reader() {
     ] {
         let refused: Vec<(String, State)> = (1..=2000u64)
             .filter_map(|seed| walk(&m, seed, mutant).err())
+            .take(REFUSALS)
             .collect();
         assert!(
             !refused.is_empty(),

@@ -246,7 +246,11 @@ fn a_control_paste_in_flight_holds_the_commit_until_its_frame_is_whole() {
         .live
         .clone();
     assert!(
-        !super::handoff_egress_settled(&parked.app.pool, &live),
+        !super::handoff_egress_settled(
+            &parked.app.pool,
+            &live,
+            &crate::control::input_replies_of(&parked.app.store)
+        ),
         "a frame part-way into the kernel is egress still in flight"
     );
     let completion = parked.proof_ready();
@@ -259,7 +263,11 @@ fn a_control_paste_in_flight_holds_the_commit_until_its_frame_is_whole() {
     assert_eq!(reposted.len(), 1, "the drain gate waits for it");
 
     assert_whole(&parked.read_frame(writer));
-    assert!(super::handoff_egress_settled(&parked.app.pool, &live));
+    assert!(super::handoff_egress_settled(
+        &parked.app.pool,
+        &live,
+        &crate::control::input_replies_of(&parked.app.store)
+    ));
     assert_eq!(
         parked.run_to_verdict(reposted.remove(0)),
         WRITTEN,
@@ -291,6 +299,82 @@ fn a_control_paste_begun_after_the_drain_gate_stands_the_commit_down() {
         "the egress fence refused the write: {verdict}"
     );
     assert_whole(&parked.read_frame(writer));
+}
+
+/// AN INPUT REPLY OWED HOLDS THE COMMIT (ATERM-KI-1014-6): a background paste delivered whole
+/// whose `OK n bytes` is still on its way to the client is not settled, since the Commit's
+/// `_exit` would leave the client an EOF for input that landed, and a retry would type it twice.
+/// The drain gate re-posts while the reply is owed (`control::InputReplies`), and once it is
+/// delivered the same attempt commits.
+#[test]
+fn an_input_reply_still_owed_holds_the_commit_until_it_is_delivered() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut parked = Parked::new(b"");
+    let replies = crate::control::input_replies_of(&parked.app.store);
+    let live = parked
+        .app
+        .pending_update_handoff
+        .as_ref()
+        .expect("the parked attempt")
+        .live
+        .clone();
+    let owed = replies.enter("@s-1 paste-bin 6").expect("an input verb");
+    assert!(
+        !super::handoff_egress_settled(&parked.app.pool, &live, &replies),
+        "a reply owed is not settled"
+    );
+    let completion = parked.proof_ready();
+    let mut reposted = parked.pass(completion);
+    assert_eq!(
+        parked.app.handoff_rejections,
+        Vec::<String>::new(),
+        "no Commit is written over the owed reply"
+    );
+    assert_eq!(reposted.len(), 1, "the drain gate waits for it");
+
+    drop(owed);
+    assert!(super::handoff_egress_settled(
+        &parked.app.pool,
+        &live,
+        &replies
+    ));
+    assert_eq!(
+        parked.run_to_verdict(reposted.remove(0)),
+        WRITTEN,
+        "the reply delivered, the Commit is written"
+    );
+}
+
+/// An input reply first owed after the drain gate's last reading stands the Commit down: the
+/// fence reads the count once every handed session's frame lock is held, so a request that
+/// counted itself and wrote before the fence is seen, and the update retries (lossless).
+/// NEGATIVE CONTROL: nothing owed at the write, the Commit is written.
+#[test]
+fn an_input_reply_owed_at_the_write_stands_the_commit_down() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    for owed in [true, false] {
+        let mut parked = Parked::new(b"");
+        let replies = crate::control::input_replies_of(&parked.app.store);
+        let (held, guard) = std::sync::mpsc::sync_channel(1);
+        parked.app.handoff_before_egress_fence = Some(Box::new(move || {
+            held.send(owed.then(|| replies.enter("send ls").expect("an input verb")))
+                .expect("the test holds the reply");
+        }));
+        let completion = parked.proof_ready();
+        let verdict = parked.run_to_verdict(completion);
+        let _guard = guard.try_recv().expect("the hook ran at the write");
+        if owed {
+            assert!(
+                verdict.contains("tolerated input"),
+                "an owed reply stands the Commit down: {verdict}"
+            );
+        } else {
+            assert_eq!(
+                verdict, WRITTEN,
+                "NEGATIVE CONTROL: nothing owed, the Commit is written"
+            );
+        }
+    }
 }
 
 /// A reset on a parked session stands the Commit down: with the park's reset lane closed,
@@ -362,4 +446,57 @@ fn a_reset_at_the_write_is_never_answered_ok() {
         "a reset the Commit can no longer see is not answered OK"
     );
     assert_eq!(verdict, WRITTEN, "and the Commit is written");
+}
+
+/// THE OUTGOING COMMIT WRITES THE PERSON'S STAMPS AT ITS WRITE (LC-4 of
+/// ATERM-KI-1016-1; the review's KR-1): run through the Commit's own path
+/// (`App::finish_proven_handoff`), the attempt's person-stamps sidecar
+/// (`seamless::person_stamps_path` of its manifest) stands at the write and
+/// names the handed session a person keyed, with its age; a Commit that
+/// returns (its pipe has no reader) takes it back. NEGATIVE CONTROL: a
+/// session nobody keyed is named with how long it was served so (`-<age>`,
+/// the review's KR-2), never with an age.
+#[test]
+fn the_outgoing_commit_writes_the_persons_stamps_at_its_write() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    for keyed in [true, false] {
+        let mut parked = Parked::new(b"");
+        if keyed {
+            parked
+                .app
+                .pool
+                .get(0)
+                .expect("session 0")
+                .ctx
+                .human_input
+                .carry(90_000, crate::metrics::now_us());
+        }
+        let path = crate::seamless::person_stamps_path(
+            &crate::seamless::outgoing_manifest_path(&parked.nonce).expect("a manifest path"),
+        );
+        let (seen, at_write) = std::sync::mpsc::sync_channel(1);
+        let probe = path.clone();
+        parked.app.handoff_before_egress_fence = Some(Box::new(move || {
+            seen.send(std::fs::read_to_string(&probe).ok())
+                .expect("the test waits for the read");
+        }));
+        let completion = parked.proof_ready();
+        assert_eq!(parked.run_to_verdict(completion), WRITTEN);
+        let body = at_write
+            .try_recv()
+            .expect("read at the write")
+            .expect("the sidecar stands at the write");
+        let (id, age) = body.trim().split_once(' ').expect("one row");
+        assert_eq!(id, "0", "{body:?}");
+        if keyed {
+            assert!(age.parse::<u64>().is_ok_and(|ms| ms >= 90_000), "{body:?}");
+        } else {
+            assert!(
+                age.strip_prefix('-')
+                    .is_some_and(|ms| ms.parse::<u64>().is_ok()),
+                "NEGATIVE CONTROL: nobody keyed: {body:?}"
+            );
+        }
+        assert!(!path.exists(), "the Commit returned: taken back");
+    }
 }

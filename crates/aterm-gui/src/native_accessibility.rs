@@ -20,8 +20,8 @@ use std::ops::Range;
 use aterm_hash::{FxHashMap, FxHashSet};
 
 use aterm_a11y::model::{
-    Action, Affine, Invalid, Live, Node, NodeId, Rect, Role, TextPosition, TextSelection, Toggled,
-    Tree, TreeId, TreeUpdate,
+    Action, ActionContext, Affine, Invalid, Live, Node, NodeId, Rect, Role, TextPosition,
+    TextSelection, Toggled, Tree, TreeId, TreeUpdate,
 };
 
 use crate::native_ui::{
@@ -385,7 +385,8 @@ impl PublishedNativeAccessibility {
                 generation: self.generation,
             })
         })?;
-        (!self.qualified_routes || stable_node_id_for_view(owner.view, &route.key) == node)
+        (self.owners.contains(&owner)
+            && (!self.qualified_routes || stable_node_id_for_view(owner.view, &route.key) == node))
             .then_some(owner)
     }
 
@@ -431,6 +432,10 @@ pub(crate) enum RoutedAccessibilityAction {
         anchor_byte: usize,
         focus_byte: usize,
     },
+    /// Scroll the list that holds `key` off screen until it shows.
+    ScrollIntoView {
+        key: UiKey,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -443,6 +448,7 @@ pub(crate) enum AccessibilityActionError {
     WrongValueKind,
     NonFiniteValue,
     InvalidTextSelection,
+    WrongOwnerContext,
 }
 
 /// Validate and lower a platform request against the exact route table that was published.
@@ -456,6 +462,13 @@ pub(crate) fn route_accessibility_action(
     let route = published
         .route(request.target_node)
         .ok_or(AccessibilityActionError::UnknownNode)?;
+    let owner = published
+        .route_owner(request.target_node)
+        .ok_or(AccessibilityActionError::WrongOwnerContext)?;
+    let expected_context = ActionContext::new(owner.view.get(), owner.generation);
+    if request.context != Some(expected_context) {
+        return Err(AccessibilityActionError::WrongOwnerContext);
+    }
     if !route.supports(request.action) {
         return Err(AccessibilityActionError::UnsupportedAction);
     }
@@ -497,6 +510,9 @@ pub(crate) fn route_accessibility_action(
                 value: Some(value),
             })
         }
+        Action::ScrollIntoView => Ok(RoutedAccessibilityAction::ScrollIntoView {
+            key: route.key.clone(),
+        }),
         Action::ScrollUp => Ok(RoutedAccessibilityAction::Scroll {
             key: route.key.clone(),
             lines: -3,
@@ -557,7 +573,6 @@ pub(crate) fn route_accessibility_action(
         | Action::ShowTooltip
         | Action::ScrollLeft
         | Action::ScrollRight
-        | Action::ScrollIntoView
         | Action::ScrollToPoint
         | Action::SetScrollOffset
         | Action::SetSequentialFocusNavigationStartingPoint
@@ -872,6 +887,10 @@ pub(crate) fn project_native_accessibility_for_view_in_container(
         })?;
     for route in &mut projection.routes {
         route.owner = Some(owner);
+    }
+    let context = ActionContext::new(owner.view.get(), owner.generation);
+    for (_, node) in &mut projection.update.nodes {
+        node.set_action_context(context);
     }
     Ok(projection)
 }
@@ -1224,7 +1243,7 @@ fn lower_node(
 
     let enabled = semantic.state.is_none_or(|state| state.enabled);
     if let Some(state) = semantic.state {
-        lower_state(&mut node, state);
+        lower_state(&mut node, semantic.role, state);
     }
     lower_value(&mut node, semantic)?;
 
@@ -1244,6 +1263,12 @@ fn lower_node(
     }
     if enabled {
         lower_actions(&mut node, semantic, focusable);
+    }
+    // A list's row off its screen: in the tree, not showing, owning no
+    // point; a reader scrolls it into view.
+    if semantic.offscreen {
+        node.set_offscreen();
+        node.add_action(Action::ScrollIntoView);
     }
     Ok(node)
 }
@@ -1288,15 +1313,19 @@ fn lower_role(role: SemanticRole) -> Role {
         SemanticRole::Navigation => Role::Navigation,
         SemanticRole::Status => Role::Status,
         SemanticRole::List => Role::List,
+        SemanticRole::ListBox => Role::ListBox,
+        SemanticRole::ListBoxOption => Role::ListBoxOption,
     }
 }
 
-fn lower_state(node: &mut Node, state: ControlState) {
+fn lower_state(node: &mut Node, role: SemanticRole, state: ControlState) {
     if !state.enabled {
         node.set_disabled();
     }
-    if state.selected {
-        node.set_selected(true);
+    // An option says whether it is selected either way: AT-SPI exposes only
+    // an option that says so as selectable, and selects only those.
+    if state.selected || role == SemanticRole::ListBoxOption {
+        node.set_selected(state.selected);
     }
     if state.invalid {
         node.set_invalid(Invalid::True);
@@ -1342,7 +1371,14 @@ fn lower_value(
             node.set_numeric_value(*value);
             node.set_min_numeric_value(*minimum);
             node.set_max_numeric_value(*maximum);
-            node.set_value(value.to_string());
+            // The words the control paints for its value ("12 px"), else
+            // the number.
+            node.set_value(
+                semantic
+                    .value_text
+                    .clone()
+                    .unwrap_or_else(|| value.to_string()),
+            );
         }
     }
     Ok(())
@@ -1363,7 +1399,7 @@ fn lower_actions(node: &mut Node, semantic: &SemanticNode, focusable: bool) {
         SemanticRole::TextField if has_reducer_action => {
             node.add_action(Action::SetValue);
         }
-        SemanticRole::RichText | SemanticRole::List => {
+        SemanticRole::RichText | SemanticRole::List | SemanticRole::ListBox => {
             node.add_action(Action::ScrollUp);
             node.add_action(Action::ScrollDown);
         }
@@ -1382,6 +1418,7 @@ fn lower_actions(node: &mut Node, semantic: &SemanticNode, focusable: bool) {
         | SemanticRole::Button
         | SemanticRole::Switch
         | SemanticRole::Navigation
+        | SemanticRole::ListBoxOption
         | SemanticRole::Status => {}
     }
 }
@@ -1393,6 +1430,7 @@ fn supported_actions(node: &Node) -> Vec<Action> {
         Action::SetValue,
         Action::ScrollUp,
         Action::ScrollDown,
+        Action::ScrollIntoView,
         Action::ReplaceSelectedText,
         Action::SetTextSelection,
     ]
@@ -1469,6 +1507,8 @@ mod tests {
             action: None,
             audit_id: None,
             description: None,
+            offscreen: false,
+            value_text: None,
         }
     }
 
@@ -1503,6 +1543,9 @@ mod tests {
                 visual_value: None,
                 input: Some(input.clone()),
                 swatch: None,
+                trailing_hint: None,
+                description: None,
+                end_button: false,
             },
             ActionId::new("search"),
         )
@@ -1651,9 +1694,11 @@ mod tests {
         });
         let slider = Control::new(
             SliderSpec {
+                description: None,
+                track: None,
                 label: "Font size".to_string(),
                 step: 1.0,
-                display_value: "14".to_string(),
+                display_value: "14 px".to_string(),
             },
             ActionId::new("font/size"),
         )
@@ -1674,6 +1719,9 @@ mod tests {
                 visual_value: None,
                 input: None,
                 swatch: None,
+                trailing_hint: None,
+                description: None,
+                end_button: false,
             },
             ActionId::new("font/family"),
         )
@@ -1721,6 +1769,8 @@ mod tests {
 
         let font = node(&projection, "font");
         assert_eq!(font.numeric_value(), Some(14.0));
+        // The value says the words the slider paints, its unit with it.
+        assert_eq!(font.value(), Some("14 px"));
         assert_eq!(font.min_numeric_value(), Some(6.0));
         assert_eq!(font.max_numeric_value(), Some(32.0));
         assert!(font.supports_action(Action::Click));
@@ -1747,6 +1797,129 @@ mod tests {
         assert!(family.supports_action(Action::SetValue));
         assert!(!family.supports_action(Action::ReplaceSelectedText));
         assert_eq!(node(&projection, "status").live(), Some(Live::Polite));
+    }
+
+    /// A list box and its options lower to the platform's own roles: the
+    /// box scrolls, each option is pressed and focused, and the highlighted
+    /// one is selected.
+    /// A row its list holds off screen lowers as off screen (in the tree,
+    /// not showing) and takes a reader's "scroll into view", which routes to
+    /// its key. Negative control: a row on screen is neither.
+    #[test]
+    fn an_offscreen_row_lowers_off_screen_and_scrolls_into_view() {
+        let row = |key: &str| {
+            UiNode::new(
+                key,
+                UiContent::Button(
+                    Control::new(crate::native_ui::ButtonSpec::new(key), ActionId::new(key))
+                        .role(SemanticRole::ListBoxOption),
+                ),
+            )
+            .layout(Layout::default().height(Length::Fixed(32.0)))
+        };
+        let compiled = UiTree::new(
+            UiNode::new(
+                "list",
+                UiContent::Group(GroupSpec {
+                    label: Some("Themes".to_string()),
+                    role: SemanticRole::ListBox,
+                    style: crate::native_ui::StyleRef::Plain,
+                }),
+            )
+            .layout(Layout::column().clipped())
+            .children(vec![row("shown"), row("below").offscreen()]),
+        )
+        .compile(LogicalRect::new(0.0, 0.0, 200.0, 32.0))
+        .unwrap();
+        let projection = project_native_accessibility(&compiled, None).unwrap();
+        let below = node(&projection, "below");
+        assert!(below.is_offscreen());
+        assert!(below.supports_action(Action::ScrollIntoView));
+        let shown = node(&projection, "shown");
+        assert!(!shown.is_offscreen());
+        assert!(!shown.supports_action(Action::ScrollIntoView));
+        let below = projection.id_for_key(&UiKey::new("below")).unwrap();
+        let (_, routes) = projection.into_update_and_routes();
+        let published = PublishedNativeAccessibility::new(ViewId::from_stored(7), 3, routes);
+        assert_eq!(
+            route_accessibility_action(
+                &published,
+                &aterm_a11y::model::ActionRequest {
+                    context: Some(ActionContext::new(7, 3)),
+                    action: Action::ScrollIntoView,
+                    target_tree: TreeId::ROOT,
+                    target_node: below,
+                    data: None,
+                },
+            ),
+            Ok(RoutedAccessibilityAction::ScrollIntoView {
+                key: UiKey::new("below")
+            })
+        );
+    }
+
+    #[test]
+    fn list_box_and_its_options_lower_to_their_roles() {
+        let option = |key: &str, selected: bool| {
+            UiNode::new(
+                key,
+                UiContent::Button(
+                    Control::new(crate::native_ui::ButtonSpec::new(key), ActionId::new(key))
+                        .role(SemanticRole::ListBoxOption)
+                        .state(ControlState {
+                            selected,
+                            ..ControlState::default()
+                        }),
+                ),
+            )
+            .layout(Layout::default().height(Length::Fixed(32.0)))
+        };
+        let tree = UiTree::new(
+            UiNode::new(
+                "app",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
+            )
+            .layout(Layout::column().clipped())
+            .children(vec![
+                UiNode::new(
+                    "themes",
+                    UiContent::Group(GroupSpec {
+                        label: Some("Themes".to_string()),
+                        role: SemanticRole::ListBox,
+                        style: crate::native_ui::StyleRef::Plain,
+                    }),
+                )
+                .layout(Layout::column().height(Length::Fixed(64.0)))
+                .children(vec![option("night", true), option("day", false)]),
+                UiNode::new(
+                    "plain",
+                    UiContent::Button(Control::new(
+                        crate::native_ui::ButtonSpec::new("plain"),
+                        ActionId::new("plain"),
+                    )),
+                )
+                .layout(Layout::default().height(Length::Fixed(32.0))),
+            ]),
+        );
+        let compiled = tree
+            .compile(LogicalRect::new(0.0, 0.0, 200.0, 140.0))
+            .unwrap();
+        let projection = project_native_accessibility(&compiled, None).unwrap();
+        let list = node(&projection, "themes");
+        assert_eq!(list.role(), Role::ListBox);
+        assert!(list.supports_action(Action::ScrollDown));
+        let night = node(&projection, "night");
+        assert_eq!(night.role(), Role::ListBoxOption);
+        assert_eq!(night.is_selected(), Some(true));
+        assert!(night.supports_action(Action::Click));
+        assert!(night.supports_action(Action::Focus));
+        let day = node(&projection, "day");
+        assert_eq!(day.role(), Role::ListBoxOption);
+        assert_eq!(day.is_selected(), Some(false), "selectable, not selected");
+        // Negative control: a button with no role override stays a button,
+        // and says nothing about selection.
+        assert_eq!(node(&projection, "plain").role(), Role::Button);
+        assert_eq!(node(&projection, "plain").is_selected(), None);
     }
 
     #[test]
@@ -1818,6 +1991,64 @@ mod tests {
             project_native_accessibility_in_container(&compiled, None, Affine::scale(f64::NAN)),
             Err(AccessibilityProjectionError::InvalidContainerTransform)
         );
+    }
+
+    #[test]
+    fn a_queued_action_keeps_its_owner_context_after_the_same_key_is_republished() {
+        let compiled = compiled_form(&["alpha"]);
+        let owner = |generation| AccessibilityOwner {
+            view: ViewId::from_stored(41),
+            generation,
+        };
+        let before = project_native_accessibility_for_view_in_container(
+            &compiled,
+            None,
+            Affine::IDENTITY,
+            owner(7),
+        )
+        .unwrap();
+        let id = before.id_for_key(&UiKey::new("alpha")).unwrap();
+        let request = aterm_a11y::model::ActionRequest {
+            context: before
+                .update
+                .nodes
+                .iter()
+                .find(|(node, _)| *node == id)
+                .unwrap()
+                .1
+                .action_context(),
+            action: Action::Focus,
+            target_tree: TreeId::ROOT,
+            target_node: id,
+            data: None,
+        };
+        let after = project_native_accessibility_for_view_in_container(
+            &compiled,
+            None,
+            Affine::IDENTITY,
+            owner(8),
+        )
+        .unwrap();
+        assert_eq!(
+            after.id_for_key(&UiKey::new("alpha")),
+            Some(id),
+            "semantic ids remain stable"
+        );
+        let (_, routes, virtual_text) = after.into_update_routes_and_virtual_text();
+        let published =
+            PublishedNativeAccessibility::composite(owner(8), vec![owner(8)], routes, virtual_text);
+        assert_eq!(
+            route_accessibility_action(&published, &request),
+            Err(AccessibilityActionError::WrongOwnerContext)
+        );
+        let current = aterm_a11y::model::ActionRequest {
+            context: Some(ActionContext::new(41, 8)),
+            ..request
+        };
+        assert!(matches!(
+            route_accessibility_action(&published, &current),
+            Ok(RoutedAccessibilityAction::Focus { .. })
+        ));
     }
 
     #[test]
@@ -2062,6 +2293,7 @@ mod tests {
             projection.virtual_text().to_vec(),
         );
         let replacement = aterm_a11y::model::ActionRequest {
+            context: Some(ActionContext::new(7, 1)),
             action: Action::ReplaceSelectedText,
             target_tree: TreeId::ROOT,
             target_node: target.node,
@@ -2075,6 +2307,7 @@ mod tests {
             })
         );
         let selection = aterm_a11y::model::ActionRequest {
+            context: Some(ActionContext::new(7, 1)),
             action: Action::SetTextSelection,
             target_tree: TreeId::ROOT,
             target_node: target.node,
@@ -2202,6 +2435,8 @@ mod tests {
         .value(SemanticValue::Bool(false));
         let slider = Control::new(
             SliderSpec {
+                description: None,
+                track: None,
                 label: "Size".to_string(),
                 step: 1.0,
                 display_value: "12".to_string(),
@@ -2233,6 +2468,7 @@ mod tests {
         let published = PublishedNativeAccessibility::new(ViewId::from_stored(7), 3, routes);
 
         let click = aterm_a11y::model::ActionRequest {
+            context: Some(ActionContext::new(7, 3)),
             action: Action::Click,
             target_tree: TreeId::ROOT,
             target_node: enabled,
@@ -2248,6 +2484,7 @@ mod tests {
         );
 
         let set_size = aterm_a11y::model::ActionRequest {
+            context: Some(ActionContext::new(7, 3)),
             action: Action::SetValue,
             target_tree: TreeId::ROOT,
             target_node: size,

@@ -34,8 +34,8 @@
 //! launched with a config directory of its own is confirmed like any other
 //! (`upgrade_drive::process_transcript_tail`).
 //!
-//! NO TRANSCRIPT (no host — `aterm drive watch`, `aterm drive supervise` —,
-//! no record of the process yet, the conversation not written yet, two
+//! NO TRANSCRIPT (no host — a loop run without the window's —, an agent
+//! whose record cannot be read — a Codex —, no record of the process yet, the conversation not written yet, two
 //! transcripts of its id and none in its project's own place, a file that
 //! cannot be read): a wall the screen read UNDER A TOOL'S CALL
 //! ([`aterm_phase::Wall::under_call`]: a later column-2 row under a call the
@@ -49,7 +49,7 @@
 //! row, a Stop hook's `Stop hook error: [<command>]: …` row, a hook's
 //! `systemMessage` row (`<hook> says: …`) — are no wall on the screen at
 //! all ([`aterm_phase::classify_wall`], ATERM-KI-1015-14): read as one
-//! (2.1.302, measured), `aterm drive watch` typed `/login` on a Monitor's
+//! (2.1.302, measured), the since-removed `aterm drive watch` typed `/login` on a Monitor's
 //! event and on a Stop hook's stderr. Nor are a hook's words with no label
 //! under a row of Claude Code's own: a Stop hook's `stopReason` under the
 //! stop-hook summary, and the row under another hook's error row (`<hook>
@@ -59,7 +59,13 @@
 //! (`aterm-phase`'s `block_is_vendors`, rule 4). Read as walls, `aterm drive
 //! watch` typed `/login` on a `stopReason` and parked the session until the
 //! reset a double-spaced one named; a PostToolUse hook's blocking reason was
-//! read and refused here as under a call (measured). The walk
+//! read and refused here as under a call (measured). Where the hook drew no
+//! words of its own under its error row — a blocking reason of blank space
+//! (2.1.304, measured) — Claude Code's wall stands in their place, drawn as
+//! a hook's reason that is the wall's words is: with the transcript it is
+//! found there ([`Session::transcript_found`], the row showing the class of
+//! the notice the transcript ends on), with none it is not acted on, a
+//! knowing loss of recall (ATERM-KI-1015-14). The walk
 //! is given EVERY ROW THE SCREEN SHOWS for it: the loop reads the screen's
 //! tail (`tail=40`, the server's own agent-verdict cut, which every other
 //! read keeps), and a tail can hold the wall without the call above it, so
@@ -71,8 +77,9 @@
 //! included — is not acted on. Main DID act on walls under MCP and `!`
 //! calls: its walk did not know them as calls, and read every `⎿` row under
 //! them as Claude Code's, the output's first row included. So this is a
-//! KNOWING LOSS OF RECALL on the hostless paths (`aterm drive watch`, `aterm
-//! drive supervise`) and for a session whose transcript cannot be found — a
+//! KNOWING LOSS OF RECALL where no transcript can be read (a loop with no
+//! host, an agent whose record cannot be read, a session whose transcript
+//! cannot be found) — a
 //! real context wall after an MCP tool's output gets no `/compact` there,
 //! where main typed one (measured in the lab) — accepted to refuse the MCP
 //! multi-block and PreToolUse-hook spoofs there, which nothing on the screen
@@ -98,9 +105,11 @@
 //! 5, is the first row under its call, and no wall. The price, by the same
 //! ruling: Claude Code's real wall under an output that holds a blank row (a
 //! Bash output's, measured) is read under the call too, and with no
-//! transcript gets no `/compact`, where main and pass 5 typed one. What the
-//! rule does not reach, as on main: a tool's output whose call row has
-//! scrolled off the screen is read with no owner, and acted on.
+//! transcript gets no `/compact`, where main and pass 5 typed one. A tool's
+//! output whose call row has scrolled off the screen, read with no owner and
+//! acted on until ATERM-KI-1015-14, is judged with the main screen's history
+//! right above the screen, read up to the owner
+//! ([`Session::under_call_on_screen`]).
 //!
 //! RESIDUALS, known and left: (1) THE FOOTER AFTER `--continue`. Claude
 //! Code's own footer `Not logged in · Run /login` (read as a lost login,
@@ -111,13 +120,17 @@
 //! reply: Not logged in · Run /login`). Nothing is done until a request fails
 //! and writes the lost login's notice, which confirms it: the continuation's
 //! carry-on, where it types one, is such a request; with the continuation
-//! off, the person's next turn is. The footer's placement is NOT exempted: a
-//! custom statusline prints whatever its command prints there, a tool's or a
-//! page's words included. (2) A wall a screen reads under no owner where the
-//! call row has scrolled off the whole screen (above). (3) The tab still
-//! publishes `agent=wall:<kind>` for a wall refused here: the window's agent
-//! verdict (aterm-gui, `presence::agent_verdict`) reads the screen, not the
-//! transcript.
+//! off, the person's next turn is. The footer's placement is NOT exempted. A
+//! custom statusline's own rows are not read as a notice at all
+//! (`phase::footer_notice` reads only where Claude Code draws its own,
+//! ATERM-KI-1015-14), but one that prints a status glyph first, or
+//! right-aligns its words, reads as the vendor's. (2) With no transcript, a
+//! wall whose owner is above the screen is refused where the history cannot
+//! be read up to it: the alternate screen (the fullscreen renderer keeps no
+//! history), an evicted or unreadable row, an owner more than
+//! [`OWNER_ROWS`] rows up. (3) The tab still publishes `agent=wall:<kind>`
+//! for a wall refused here: the window's agent verdict (aterm-gui,
+//! `presence::agent_verdict`) reads the screen, not the transcript.
 //!
 //! THE DECISION'S READ ONLY: the transcript is asked (and, with none, the
 //! whole screen read) at the reads the point is DECIDED on
@@ -253,7 +266,11 @@
 //! read as "a user turn", the real limit was refused). A tool's output cannot
 //! write a `user` row of these shapes (it is a `tool_result` part); a
 //! shell-mode `!` command writes `<bash-input>…` and `<bash-stdout>…` rows,
-//! which stay the person's turn.
+//! which stay the person's turn. A prompt command's invocation passed over
+//! after the newest entry is marked on the end (`TranscriptEnd::prompted`):
+//! its prompt asks the model, so where that entry is an older notice the
+//! screen's `⏺` row does not show, the row is the answer not written yet, and
+//! is read again once, as a turn's input is (ATERM-KI-1016-1).
 //!
 //! THE ONE LOCAL COMMAND THAT IS A NOTICE: a `/compact` that FAILED (the
 //! context wall the policy meets again after its own `/compact`) writes no
@@ -346,6 +363,7 @@ use aterm_json::Value;
 use aterm_phase::{ApiCause, WallKind};
 
 use super::super::policy::turn_end::{LeftAnswer, WaitedLimit};
+use super::super::report::{Offscreen, parse_offscreen};
 use super::*;
 
 /// The rule an unconfirmed wall's journal line is written under.
@@ -353,15 +371,15 @@ pub(super) const RULE_WALL_CONFIRM: &str = "wall-confirm@v1";
 
 /// How many times a transcript that has not caught up with the screen is
 /// read again before its wall is refused ([`TranscriptEnd::lagging`]).
-pub(super) const LAG_TRIES: u32 = 4;
+pub(crate) const LAG_TRIES: u32 = 4;
 
 /// How long apart those reads are: the four cover ten times the lag
 /// measured on 2.1.294.
-pub(super) const LAG_STEP: Duration = Duration::from_millis(250);
+pub(crate) const LAG_STEP: Duration = Duration::from_millis(250);
 
 /// The newest main-chain entry of a Claude Code transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Entry {
+pub(crate) enum Entry {
     /// Nothing of the conversation's in the tail read.
     Nothing,
     /// Claude Code's own notice row: an `isApiErrorMessage` row (its text,
@@ -400,20 +418,25 @@ impl Entry {
 
 /// What a transcript's tail ends on ([`transcript_ends_on`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct TranscriptEnd {
+pub(crate) struct TranscriptEnd {
     /// The newest main-chain entry.
-    pub(super) last: Entry,
+    pub(crate) last: Entry,
     /// Claude Code closed the turn after it: a `system` row `turn_duration`.
-    pub(super) closed: bool,
+    pub(crate) closed: bool,
     /// The id (`uuid`) of the row the newest entry was read from (`None`: no
     /// entry, or a row that carries none): a usage limit's notice confirmed
     /// is remembered by it ([`served_since_notice`]).
-    pub(super) row: Option<String>,
+    pub(crate) row: Option<String>,
     /// When that row says it was written (its own `timestamp`, unix
     /// seconds; `None`: none, or none the parser reads): what tells a limit
     /// a cancel left in answer to the loop's act from an older one
     /// ([`Session::judge_wall`]).
-    pub(super) at: Option<i64>,
+    pub(crate) at: Option<i64>,
+    /// A PROMPT COMMAND's row (`<command-message>…`, [`prompt_command`]) was
+    /// passed over after the newest entry: its prompt is the model's to
+    /// answer, and the notice or reply that answers it is not written yet
+    /// ([`Session::transcript_found`]).
+    pub(crate) prompted: bool,
 }
 
 impl TranscriptEnd {
@@ -443,13 +466,13 @@ impl TranscriptEnd {
     /// words the rest of the turn follows, or nothing. A notice settles it,
     /// and so does a closed turn.
     #[must_use]
-    pub(super) fn lagging(&self) -> bool {
+    pub(crate) fn lagging(&self) -> bool {
         !self.closed && !matches!(self.last, Entry::Notice { .. })
     }
 }
 
 /// One row of the main chain, as [`transcript_ends_on`] reads it.
-enum Row {
+pub(crate) enum Row {
     /// An entry of the conversation's.
     Entry(Entry),
     /// Claude Code closed the turn: a `system` row `turn_duration`.
@@ -475,12 +498,13 @@ enum Row {
 /// wrote a relaunched Claude Code's first prompt after the session limit's
 /// notice, auto-continue and `turn_duration` that answered it (the lab,
 /// 2026-10-08) — it is older than they are, and ends nothing.
-pub(super) fn transcript_ends_on(jsonl: &str) -> TranscriptEnd {
+pub(crate) fn transcript_ends_on(jsonl: &str) -> TranscriptEnd {
     let mut end = TranscriptEnd {
         last: Entry::Nothing,
         closed: false,
         row: None,
         at: None,
+        prompted: false,
     };
     for line in jsonl.lines() {
         let Ok(v) = crate::harness::transcript::conversation(line) else {
@@ -501,12 +525,26 @@ pub(super) fn transcript_ends_on(jsonl: &str) -> TranscriptEnd {
                     closed: false,
                     row: row_id(&v),
                     at: row_time(&v),
+                    prompted: false,
                 };
             }
-            None => {}
+            None => end.prompted |= prompt_command(&v),
         }
     }
     end
+}
+
+/// Whether row `v` is a PROMPT COMMAND's invocation (`/doctor`, a project's
+/// `/review`: a `user` row opening `<command-message>…`, module docs): passed
+/// over as no turn of the conversation's ([`local_command`]), though its
+/// prompt (the meta row after it) asks the model, and the reply or notice that
+/// answers it follows.
+fn prompt_command(v: &Value) -> bool {
+    v.get("type").and_then(Value::as_str) == Some("user")
+        && v.get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.trim().starts_with("<command-message>"))
 }
 
 /// A row's own id (`uuid`).
@@ -711,7 +749,7 @@ fn turn_closed(jsonl: &str, launched: i64) -> Option<bool> {
 
 /// A main-chain row as [`transcript_ends_on`] reads it; `None` for a row
 /// that is neither an entry nor a turn's close.
-fn row_of(v: &Value) -> Option<Row> {
+pub(crate) fn row_of(v: &Value) -> Option<Row> {
     match v.get("type").and_then(Value::as_str) {
         Some("assistant") if v.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) => {
             Some(Row::Entry(Entry::Notice {
@@ -840,7 +878,7 @@ fn texts(v: &Value) -> String {
 /// none), and of an `API Error` whose words name nothing, the kind its
 /// notice is typed as ([`refined`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Class {
+pub(crate) enum Class {
     Limit,
     Context,
     Auth,
@@ -848,7 +886,7 @@ enum Class {
     Memory,
 }
 
-fn class(kind: WallKind) -> Class {
+pub(crate) fn class(kind: WallKind) -> Class {
     if kind.reads_limited() {
         return Class::Limit;
     }
@@ -920,6 +958,17 @@ fn signs_in(api_error: Option<&str>) -> bool {
     api_error.is_some_and(|a| LOGIN_API_ERRORS.contains(&a))
 }
 
+/// Whether a notice's typed fields say the LOGIN failed: the gateway's
+/// sign-in ([`signs_in`]), or the `error` word `authentication_failed` with
+/// no `apiError` of the vendor's terminal set ([`TERMINAL_API_ERRORS`]:
+/// `org_disabled_credential`, `api_key_auth_disabled`, refusals a 403 also
+/// carries that no login fixes).
+fn lost_login(error: Option<&str>, api_error: Option<&str>) -> bool {
+    signs_in(api_error)
+        || (error.and_then(error_class) == Some(Class::Auth)
+            && !api_error.is_some_and(|a| TERMINAL_API_ERRORS.contains(&a)))
+}
+
 /// The `error` words 2.1.300 writes with a request it refuses, sent again
 /// unchanged or not ([`transcript_wall`]).
 const REFUSED_ERRORS: &[&str] = &[
@@ -936,7 +985,7 @@ const REFUSED_ERRORS: &[&str] = &[
 /// wall the notice is ([`notice_wall`]). `None` for an open turn and an end
 /// that is no notice.
 #[must_use]
-pub(super) fn transcript_wall(end: &TranscriptEnd) -> Option<WallKind> {
+pub(crate) fn transcript_wall(end: &TranscriptEnd) -> Option<WallKind> {
     if !end.closed {
         return None;
     }
@@ -953,13 +1002,18 @@ pub(super) fn transcript_wall(end: &TranscriptEnd) -> Option<WallKind> {
 /// ([`REFUSED_ERRORS`]) is [`aterm_phase::ApiCause::Request`]; a
 /// `billing_error` is [`WallKind::Spend`]; an `apiErrorStatus` the vendor
 /// does not retry (400-499 but 401, 408, 409, 429 and 451) is a refused
-/// request; an `authentication_failed` is the lost login's (2.1.300's
-/// `Failed to authenticate. API Error: 401 …`, which no table names) — and
+/// request, unless its `error` word is `authentication_failed`: that is the
+/// lost login's whatever its status (2.1.300's `Failed to authenticate. API
+/// Error: 401 …`, which no table names, and a 403's) — and
 /// anything else (`unknown`, `server_error`, no status) the server's,
 /// retried, never a refusal: the vendor's own fallbacks (`API Error:
 /// terminated`, the bare `API Error`) pass. The table's own fallback for an
 /// `API Error` it names nothing of (no status, the server's) leaves the
-/// typed fields to decide. `None` for an entry that is no notice, and a
+/// typed fields to decide; words that name nothing but the status they
+/// print (`API Error: 403 Forbidden`,
+/// [`aterm_phase::wall::named_by_status_alone`]) are the lost login's where
+/// the typed fields say the login failed ([`lost_login`]), as a typed status
+/// is. `None` for an entry that is no notice, and a
 /// notice the table reads as no wall (`API Error: Request was aborted.`).
 /// Nothing of the notice is typed: the act names the kind in aterm's own
 /// words (H6-HARNESS-1).
@@ -980,6 +1034,18 @@ fn notice_wall(entry: &Entry) -> Option<WallKind> {
             cause: ApiCause::Server,
             ..
         }) => {}
+        // `API Error: 403 Forbidden`, the API's JSON body behind its status:
+        // words that name nothing but the status say only what its range
+        // does, and the vendor's typed word that the LOGIN failed decides over
+        // a status printed as over one typed (below): the lost login's
+        // `/login`, never a refused request's slow retries (the review's
+        // KR-LIM-3).
+        Some(WallKind::ApiError { .. })
+            if aterm_phase::wall::named_by_status_alone(text)
+                && lost_login(error.as_deref(), api_error.as_deref()) =>
+        {
+            return Some(WallKind::Auth);
+        }
         Some(kind) => return Some(kind),
         None if aterm_phase::wall::not_a_wall(text) => return None,
         // `An image in the conversation exceeds the dimension limit for
@@ -1019,12 +1085,19 @@ fn notice_wall(entry: &Entry) -> Option<WallKind> {
         Some("billing_error") => return Some(WallKind::Spend),
         _ => {}
     }
+    // The vendor's typed word that the LOGIN failed decides over the status
+    // it answered: a 403 `authentication_failed` (a token revoked, in words
+    // no table names) is the lost login's, whose remedy is `/login`, never a
+    // refused request retried slowly (ATERM-KI-1016-1). The refusals a 403
+    // also carries that no login fixes are typed otherwise
+    // ([`TERMINAL_API_ERRORS`]: `org_disabled_credential`,
+    // `api_key_auth_disabled`, …) and are read above.
+    if error.as_deref().and_then(error_class) == Some(Class::Auth) {
+        return Some(WallKind::Auth);
+    }
     if status.is_some_and(|c| (400..500).contains(&c) && !matches!(c, 401 | 408 | 409 | 429 | 451))
     {
         return Some(refused);
-    }
-    if error.as_deref().and_then(error_class) == Some(Class::Auth) {
-        return Some(WallKind::Auth);
     }
     Some(WallKind::ApiError {
         code: *status,
@@ -1053,10 +1126,18 @@ fn shows(said: &str, text: &str) -> bool {
 /// Whether the transcript's end CONFIRMS a screen wall of kind `screen`: its
 /// newest entry is Claude Code's own notice ([`Entry::Notice`]) of the same
 /// class ([`Class`]) — by its words, through the same table the screen is
-/// read by ([`aterm_phase::classify_wall`]), else by its `error` word.
+/// read by ([`aterm_phase::classify_wall`]), else by its `error` word; words
+/// naming nothing but their status confirm the lost login too where the
+/// typed fields say the login failed ([`lost_login`]).
 #[must_use]
-pub(super) fn confirms(screen: WallKind, end: &TranscriptEnd) -> bool {
-    let Entry::Notice { text, error, .. } = &end.last else {
+pub(crate) fn confirms(screen: WallKind, end: &TranscriptEnd) -> bool {
+    let Entry::Notice {
+        text,
+        error,
+        api_error,
+        ..
+    } = &end.last
+    else {
         return false;
     };
     // The table's own fallback for an `API Error` it names nothing of (no
@@ -1077,7 +1158,15 @@ pub(super) fn confirms(screen: WallKind, end: &TranscriptEnd) -> bool {
             .and_then(error_class)
             .or_else(|| named.map(class)),
     };
-    notice == Some(class(screen))
+    // Words that name nothing but the status they print (`API Error: 403
+    // Forbidden`) are of their status's class, and the lost login's as well
+    // where the typed fields say the login failed ([`notice_wall`]).
+    let login = || {
+        class(screen) == Class::Auth
+            && aterm_phase::wall::named_by_status_alone(text)
+            && lost_login(error.as_deref(), api_error.as_deref())
+    };
+    notice == Some(class(screen)) || login()
 }
 
 /// THE SCREEN'S UNNAMED `API Error` NAMED BY THE NOTICE THAT CONFIRMED IT
@@ -1096,34 +1185,46 @@ pub(super) fn confirms(screen: WallKind, end: &TranscriptEnd) -> bool {
 /// read, its first words the wall's own ([`shows`]): an older notice can be
 /// the newest entry while the turn's own rows are passed over (a prompt
 /// command's, before its reply or notice is written), and confirms the
-/// class all the same. `None`: any other wall, a notice the screen does not
-/// show, one that names nothing more, or one of another class (which
-/// [`confirms`] refused).
+/// class all the same. A screen wall its words name by the status they
+/// print alone (`API Error: 403 Forbidden`,
+/// [`aterm_phase::wall::named_by_status_alone`]) is renamed only to the lost
+/// login, where the notice's typed fields say the login failed. `None`: any
+/// other wall, a notice the screen does not show, one that names nothing
+/// more, or one of another class (which [`confirms`] refused).
 fn refined(w: &aterm_phase::Wall, end: &TranscriptEnd) -> Option<aterm_phase::Wall> {
-    if !matches!(
+    let unnamed = matches!(
         w.kind,
         WallKind::ApiError {
             code: None,
             cause: ApiCause::Server,
             ..
         }
-    ) {
-        return None;
-    }
+    );
     let Entry::Notice {
         text, api_error, ..
     } = &end.last
     else {
         return None;
     };
-    if !shows(&w.message, text) {
+    // The screen's `API Error: 403 Forbidden`, named by the status its words
+    // print alone: the lost login where the notice's typed fields say the
+    // login failed ([`notice_wall`]), and nothing else renamed (the review's
+    // KR-LIM-3).
+    let by_status = matches!(w.kind, WallKind::ApiError { code: Some(_), .. })
+        && aterm_phase::wall::named_by_status_alone(text);
+    if !(unnamed || by_status) || !shows(&w.message, text) {
         return None;
     }
     // Of the same class, save the gateway's sign-in, which is the lost login
     // whatever the words ([`LOGIN_API_ERRORS`]).
     let login = signs_in(api_error.as_deref());
     let kind = notice_wall(&end.last).filter(|k| {
-        *k != w.kind && (class(*k) == class(w.kind) || (login && *k == WallKind::Auth))
+        *k != w.kind
+            && if by_status {
+                *k == WallKind::Auth
+            } else {
+                class(*k) == class(w.kind) || (login && *k == WallKind::Auth)
+            }
     })?;
     Some(aterm_phase::Wall { kind, ..w.clone() })
 }
@@ -1352,6 +1453,23 @@ pub(super) struct Verdict {
     named: Option<Named>,
 }
 
+/// A row that opens in column 0 with words: the owner an owner walk reaches
+/// (`⏺`, `❯`, a done row), as the screen's own walk reads it.
+fn is_owner_row(row: &str) -> bool {
+    !row.is_empty() && !row.starts_with(char::is_whitespace)
+}
+
+/// Whether two reads of a screen are the same rows, trailing blanks aside.
+pub(super) fn same_rows(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.trim_end() == y.trim_end())
+}
+
+/// The most rows of the history above the screen a wall's owner is looked
+/// for in ([`Session::rows_up_to_owner`]): an owner further up counts as a
+/// call (a verbose output longer than this past the screen's top, with no
+/// transcript, gets no act).
+pub(super) const OWNER_ROWS: u64 = 400;
+
 impl<C: Ctl> Session<'_, C> {
     /// THE WALL OF `reading` CONFIRMED, or taken out of it (module docs). At
     /// a decision's read ([`Check::Decide`]) a Claude Code's wall (not its
@@ -1577,7 +1695,8 @@ impl<C: Ctl> Session<'_, C> {
     /// last thing said is a row Claude Code draws a notice of its own as
     /// ([`aterm_phase::phase::last_said_notice`]: a `⏺` message that is no
     /// call, or a vendor `⎿` block) and the session's transcript ends on a
-    /// CLOSED notice whose first words that row shows ([`shows`]): the wall
+    /// CLOSED notice whose first words that row shows ([`shows`]) — or, on
+    /// the row right under a hook's error row, whose class it shows: the wall
     /// the notice is ([`transcript_wall`]), placed on that row, its words the
     /// notice's own. The transcript is read again for its lag
     /// ([`LAG_TRIES`]) only where the row has the vendor's error row's own
@@ -1615,21 +1734,36 @@ impl<C: Ctl> Session<'_, C> {
         let said = aterm_phase::phase::last_said_notice(&screen.rows)
             .filter(|s| !aterm_phase::wall::not_a_wall(&s.text))?;
         let mut end = transcript_ends_on(&host.transcript_tail()?);
+        let error_row = said.placement == aterm_phase::Placement::ErrorRow;
+        // THE TRANSCRIPT BEHIND THE SCREEN'S `⏺` ROW ON AN OLDER NOTICE: its
+        // newest entry a notice that row does not show, with a prompt
+        // command's invocation passed over after it ([`TranscriptEnd::prompted`]).
+        // A prompt command's rows are no entry, so a request it sent right
+        // after an error notice leaves that notice the newest entry until the
+        // one its request met is written (ATERM-KI-1016-1: read once, the new
+        // notice drawn like prose was an ordinary turn end, and one
+        // continuation was typed into it). Whatever the row is — that notice,
+        // or the model's reply — the file has not written it yet.
+        let behind = |end: &TranscriptEnd| {
+            error_row
+                && end.prompted
+                && matches!(&end.last, Entry::Notice { text, .. } if !shows(&said.text, text))
+        };
         // A row shaped like prose is read again ONCE, and only where the
         // transcript holds nothing the turn said after its input (it ends,
-        // open, on the prompt or a tool's result) under a `⏺` message: a
-        // reply already written ends an ordinary turn, and is no reason to
-        // sleep.
-        let unsaid = said.placement == aterm_phase::Placement::ErrorRow
-            && !end.closed
-            && matches!(end.last, Entry::Input | Entry::ToolResult);
+        // open, on the prompt or a tool's result, or on an older notice a
+        // prompt command followed) under a `⏺` message: a reply already written
+        // ends an ordinary turn, and is no reason to sleep.
+        let unsaid = error_row
+            && ((!end.closed && matches!(end.last, Entry::Input | Entry::ToolResult))
+                || behind(&end));
         let tries = if said.shaped {
             LAG_TRIES
         } else {
             u32::from(unsaid)
         };
         for _ in 0..tries {
-            if !end.lagging() {
+            if !end.lagging() && !behind(&end) {
                 break;
             }
             self.fx.sleep(LAG_STEP);
@@ -1638,13 +1772,28 @@ impl<C: Ctl> Session<'_, C> {
                 None => break,
             }
         }
+        // Whether the transcript's newest entry is the notice the row shows:
+        // its first words; or, on the row right under a hook's error row
+        // (`SaidNotice::hook_words`), its class — the row is the screen's
+        // spelling of the notice (`Context limit reached · …` for `Prompt is
+        // too long`), where the hook drew no words of its own (a blocking
+        // reason of blank space, 2.1.304, measured: KI-1015-14). The hook's
+        // own words there in a notice's spelling leave the transcript on the
+        // model's reply, which is no notice.
+        let names = |end: &TranscriptEnd| match &end.last {
+            Entry::Notice { text, .. } => {
+                shows(&said.text, text)
+                    || (said.hook_words
+                        && aterm_phase::classify_wall(&said.text).is_some_and(|k| confirms(k, end)))
+            }
+            _ => false,
+        };
         // The notice the screen shows, its turn not closed yet: Claude Code
         // writes the `turn_duration` right after it (1 to 14 ms later in every
         // measured transcript), and a read can fall between the two. Read
         // again until it closes, [`LAG_TRIES`] times at most.
         for _ in 0..LAG_TRIES {
-            let open = !end.closed
-                && matches!(&end.last, Entry::Notice { text, .. } if shows(&said.text, text));
+            let open = !end.closed && names(&end);
             if !open {
                 break;
             }
@@ -1656,12 +1805,12 @@ impl<C: Ctl> Session<'_, C> {
         }
         self.turn_end.notice_typed_was(end.typed());
         self.turn_end.notice_written_at(end.notice_at());
+        if !names(&end) {
+            return None;
+        }
         let Entry::Notice { text, limit, .. } = &end.last else {
             return None;
         };
-        if !shows(&said.text, text) {
-            return None;
-        }
         let (kind, message) = found_named(transcript_wall(&end)?, text, limit.as_deref());
         Some(aterm_phase::Wall {
             kind,
@@ -1700,11 +1849,19 @@ impl<C: Ctl> Session<'_, C> {
     /// host names since: one it named none of yet is asked about again),
     /// whatever the policy tracks — the relaunched process's start-up reads
     /// busy, and read as work it dropped the limit's track; a decision that
-    /// is not open asks nothing and records nothing. Asked again while a row
-    /// is held only where the screen says something new with no turn seen
-    /// running (a person's short turn, a local command). A turn seen running
-    /// drops what is held: the model answered, or the screen draws the limit
-    /// again. A read for the books ([`Check::AsDecided`]) takes what the
+    /// is not open asks nothing and records nothing. Asked too at an open
+    /// decision of a point the host wants a step at, as that step asks
+    /// ([`Session::host_steps_here`]), and at one after a turn seen
+    /// running: a relaunch's first decision on the snapshot the host kept
+    /// from before it names the old process, and its start-up is such a
+    /// turn. Asked again while a row is held where the screen says something
+    /// new with no turn seen running (a person's short turn, a local
+    /// command), or where the host wants a step. A turn seen running drops
+    /// what is held and asks afresh: the model answered (a reply after the
+    /// row, which stands no limit), the screen draws the limit again, or a
+    /// relaunched process started on a conversation still at it. With no
+    /// turn seen running since, the same process and conversation are asked
+    /// nothing. A read for the books ([`Check::AsDecided`]) takes what the
     /// decision placed on its screen, and asks nothing.
     pub(super) fn read_standing_limit(
         &mut self,
@@ -1747,7 +1904,22 @@ impl<C: Ctl> Session<'_, C> {
                 .found
                 .as_ref()
                 .is_some_and(|f| f.said != said);
-        if open && (unasked || again) {
+        // A POINT THE HOST WANTS A STEP AT is asked about as that step asks
+        // ([`Session::host_steps_here`]'s last guard): the decision and the
+        // step read the point alike. Keyed on whom alone, a relaunch's first
+        // decision on the snapshot the host kept from before it named the
+        // process already asked about, asked nothing, and decided the
+        // standing weekly limit away while the step, asked after it, held
+        // its carry-on behind the same row (ATERM-KI-1016-1). And A POINT
+        // AFTER A TURN SEEN RUNNING: the turn drops what is held, and is no
+        // proof the model answered — a relaunched process's start-up reads
+        // busy, and a host that wants no step there (the carry-on settled or
+        // recorded, a person's own relaunch) still names the old process, so
+        // the decision read the limit away and backed off toward `keep going`
+        // (the review's KR-LIM-2). The transcript says whether the model
+        // answered: a reply after the row stands no limit.
+        let steps = host.wants();
+        if open && (unasked || again || steps || worked) {
             self.standing_read.found = host.standing_limit().and_then(|limit| {
                 let kind = limit_named(&limit.text, limit.window.as_deref())?;
                 let message = limit_words(&limit.text, limit.window.as_deref());
@@ -1964,21 +2136,166 @@ impl<C: Ctl> Session<'_, C> {
     /// finds the same wall and no call over it. A whole read that fails, or
     /// a screen that no longer reads the same wall, counts as under a call:
     /// nothing is acted on that the screen's rows above were not read for.
+    ///
+    /// THE OWNER ABOVE THE SCREEN (ATERM-KI-1015-14): where the walk reaches
+    /// the whole grid's first row with no owner found
+    /// ([`aterm_phase::phase::owner_above_rows`]) — a call row scrolled off
+    /// over its long output — the rows right above the screen are read up
+    /// to the owner ([`Self::rows_up_to_owner`]) and the wall read again with
+    /// those rows over the screen's. Measured on 2.1.304: Claude Code's
+    /// inline renderer scrolls its rows into the main screen's history, and
+    /// the rows right above the screen are the call's (`⏺ Bash(…)`, its
+    /// output's first rows) with no gap; on the alternate screen, where the
+    /// fullscreen renderer keeps no history, aterm's archive of the rows that
+    /// scrolled off it holds them. On the base such a wall was read under no
+    /// owner and acted on: a tool's own words in a later column-2 row (an MCP
+    /// result's second block, measured on 2.1.294) typed `/login`. Rows that
+    /// cannot all be read — an evicted or unreadable row, a gap in the
+    /// archive, an owner further up than [`OWNER_ROWS`], a screen that moved
+    /// under the reads — count as under a call, as a failed whole read does.
     fn under_call_on_screen(&mut self, w: &aterm_phase::Wall, screen: &Screen) -> bool {
         if w.under_call {
             return true;
         }
-        if screen.first == 0 || w.placement != aterm_phase::Placement::Gutter {
+        if w.placement != aterm_phase::Placement::Gutter {
             return false;
         }
-        let Ok(whole) = self.grid() else {
+        let (rows, cursor_col, wall) = if screen.first == 0 {
+            (screen.rows.clone(), screen.cursor_col, w.clone())
+        } else {
+            let Ok(whole) = self.grid() else {
+                return true;
+            };
+            let read = self
+                .reader(&whole.rows)
+                .read(&whole.rows, Some(whole.cursor_col));
+            match read.wall {
+                Some(x) if !x.under_call && x.kind == w.kind && x.message == w.message => {
+                    (whole.rows, whole.cursor_col, x)
+                }
+                _ => return true,
+            }
+        };
+        if !aterm_phase::phase::owner_above_rows(&rows, wall.row) {
+            return false;
+        }
+        let Ok(Some(mut joined)) = self.rows_up_to_owner(&rows) else {
             return true;
         };
-        let read = self
-            .reader(&whole.rows)
-            .read(&whole.rows, Some(whole.cursor_col));
+        joined.extend(rows);
+        let read = self.reader(&joined).read(&joined, Some(cursor_col));
         read.wall
-            .is_none_or(|x| x.under_call || x.kind != w.kind || x.message != w.message)
+            .is_none_or(|x| x.under_call || x.kind != wall.kind || x.message != wall.message)
+    }
+
+    /// The rows right above the screen `rows` (the whole grid a wall was
+    /// read on), oldest first, from the nearest row that opens in column 0 —
+    /// the owner the screen's owner walk would reach — down to the screen's
+    /// first row. On the main screen they are its HISTORY: `search` with no
+    /// pattern places the screen, `line` reads each row up from it, and the
+    /// grid read again after them is `rows` (and the screen's place the
+    /// same), so they are the rows over the screen the wall was read on. On
+    /// the alternate screen they are the ARCHIVE of the rows that scrolled
+    /// off it ([`Self::archived_up_to_owner`]). `None` where they cannot all
+    /// be read: a host without the verbs, an evicted or unreadable row, no
+    /// owner within [`OWNER_ROWS`], or the screen moved by the time the rows
+    /// were read.
+    pub(super) fn rows_up_to_owner(
+        &mut self,
+        rows: &[String],
+    ) -> Result<Option<Vec<String>>, Fail> {
+        if self.alt_screen_now()? {
+            return self.archived_up_to_owner(rows);
+        }
+        let screen_first = |s: &mut Self| -> Result<Option<u64>, Fail> {
+            let r = s.call(&["search"])?;
+            if s.unserved(&r) {
+                return Err(Fail::Lost(format!("search failed: {}", r.stderr.trim())));
+            }
+            Ok(r.ok()
+                .then(|| super::box_head::search_screen_first(&r))
+                .flatten())
+        };
+        let Some(first) = screen_first(self)? else {
+            return Ok(None);
+        };
+        let mut above = Vec::new();
+        let mut at = first;
+        while at > 0 {
+            if first - at >= OWNER_ROWS {
+                return Ok(None);
+            }
+            at -= 1;
+            let r = self.call(&["line", &at.to_string()])?;
+            if self.unserved(&r) {
+                return Err(Fail::Lost(format!("line failed: {}", r.stderr.trim())));
+            }
+            if !r.ok() {
+                return Ok(None);
+            }
+            let line = r.stdout.lines().next().unwrap_or("");
+            let text = line.strip_prefix("OK").unwrap_or(line);
+            let text = text.strip_prefix(' ').unwrap_or(text).to_string();
+            let owner = is_owner_row(&text);
+            above.push(text);
+            if owner {
+                break;
+            }
+        }
+        if screen_first(self)? != Some(first) || !same_rows(&self.grid()?.rows, rows) {
+            return Ok(None);
+        }
+        above.reverse();
+        Ok(Some(above))
+    }
+
+    /// The rows of the ALTERNATE screen's archive right above the screen
+    /// `rows`, oldest first, from the nearest that opens in column 0 (as
+    /// [`Self::rows_up_to_owner`]): Claude Code's fullscreen renderer
+    /// repaints the alternate screen in place and keeps no history, and
+    /// aterm archives each row that leaves its top (`offscreen`). Read with
+    /// the screen under the same lock (`offscreen since=<i> tail=<n>
+    /// screen=1`, the archive's newest index read first): the screen read
+    /// there is `rows`, the rows since that index none evicted (`lost=0`)
+    /// and with no gap among them or after them (`breaks=0`: a redraw with no
+    /// overlap, a resize, a reset), none shown on the screen again (`back=0`),
+    /// the archive the same (`origin=`) and on. `None` otherwise, or with no
+    /// owner among the newest [`OWNER_ROWS`]. Before, the alternate screen
+    /// counted as under a call: a real wall under a long prompt there was
+    /// left to the person with no transcript (the review of 87faa9bf23).
+    fn archived_up_to_owner(&mut self, rows: &[String]) -> Result<Option<Vec<String>>, Fail> {
+        let read = |s: &mut Self, args: &[&str]| -> Result<Option<Offscreen>, Fail> {
+            let mut call = vec!["offscreen"];
+            call.extend_from_slice(args);
+            let r = s.call(&call)?;
+            if s.unserved(&r) {
+                return Err(Fail::Lost(format!("offscreen failed: {}", r.stderr.trim())));
+            }
+            Ok(r.ok().then(|| parse_offscreen(&r).ok()).flatten())
+        };
+        let Some(head) = read(self, &["tail=1"])? else {
+            return Ok(None);
+        };
+        let since = format!("since={}", head.last.saturating_sub(OWNER_ROWS));
+        let tail = format!("tail={OWNER_ROWS}");
+        let Some(off) = read(self, &[&since, &tail, "screen=1"])? else {
+            return Ok(None);
+        };
+        let whole = off.alt
+            && off.enabled
+            && off.lost == 0
+            && off.breaks == 0
+            && off.back == 0
+            && off.origin == head.origin
+            && same_rows(&off.screen, rows);
+        if !whole {
+            return Ok(None);
+        }
+        Ok(off
+            .archived
+            .iter()
+            .rposition(|r| is_owner_row(r))
+            .map(|owner| off.archived[owner..].to_vec()))
     }
 
     /// The point `turn` read again as its decision read it

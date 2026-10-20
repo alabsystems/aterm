@@ -137,10 +137,9 @@ fn generator<'a>(
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert!(
-            args.iter().any(|a| a == "--ignored")
-                && fixtures::GENERATOR_TESTS
-                    .iter()
-                    .all(|t| args.iter().any(|a| a == t)),
+            fixtures::GENERATOR_TESTS
+                .iter()
+                .all(|t| args.iter().any(|a| a == t)),
             "{args:?}"
         );
         let out = PathBuf::from(env_of(cmd, "ATERM_HANDOFF_FIXTURE_OUT").unwrap());

@@ -26,8 +26,6 @@
 extern crate self as aterm_spec;
 
 #[cfg(feature = "anchors")]
-pub use aterm_spec_anchor::{refines, spec_unmodeled};
-#[cfg(feature = "anchors")]
 pub use aterm_spec_macros::{liveness, model, ty_model};
 
 pub mod check;

@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use super::approval::{ApprovalCtx, QuestionPriority};
 use super::claude_settings::OwnerAsk;
 use super::git_config::WorkerEnv;
-use super::probe::{Answer, AskWire};
+use super::probe::{Answer, AskWire, ShellWire};
 use super::shell_startup::ShellStartup;
 use crate::supervise::config::SupervisorConfig;
 use crate::supervise::run::ApprovalEnv;
@@ -54,6 +54,9 @@ pub struct BoxFacts {
     pub program: Option<String>,
     /// The session's working directory (`meta cwd=`); `None`: unknown.
     pub cwd: Option<PathBuf>,
+    /// The one folder the session's own starter trusted for it (`meta
+    /// trusted_cwd=`, [`ApprovalCtx::trusted_cwd`]); `None`: none.
+    pub trusted_cwd: Option<PathBuf>,
     /// The footer last read names bypass mode.
     pub bypass: bool,
     /// A limit reset was passed over at this dialog's mount.
@@ -76,6 +79,13 @@ pub struct BoxFacts {
     pub question: Option<QuestionFacts>,
     /// A tool candidate from the agent's transcript.
     pub box_call: Option<String>,
+    /// The `/login` picker is behind the loop's own `/login`
+    /// ([`ApprovalCtx::login_carry`]).
+    pub login_carry: bool,
+    /// The method the session's login already is, as its host read it
+    /// ([`ApprovalCtx::login_method`]), for the picker of the loop's own
+    /// `/login` only; `None`: not read, or nothing says.
+    pub login_method: Option<aterm_phase::LoginMethod>,
 }
 
 /// How a question dialog was to be answered, as the session's word, the
@@ -98,6 +108,7 @@ pub struct QuestionFacts {
 pub const FIELDS: &[&str] = &[
     "program",
     "cwd",
+    "trusted_cwd",
     "bypass",
     "limit_reset_passed",
     "worker",
@@ -108,6 +119,8 @@ pub const FIELDS: &[&str] = &[
     "screen_rows",
     "question",
     "box_call",
+    "login_carry",
+    "login_method",
 ];
 
 impl ApprovalCtx {
@@ -136,6 +149,7 @@ impl ApprovalCtx {
         );
         ctx.cwd_known = facts.cwd.is_some();
         ctx.set_trust_roots(&config.trust_roots, env.uid);
+        ctx.trusted_cwd.clone_from(&facts.trusted_cwd);
         // A safe rule a withdrawn key took away (`config::Withheld`): its roots.
         if config.withheld.rm_breaker {
             ctx.scratch_roots.clear();
@@ -156,6 +170,9 @@ impl ApprovalCtx {
         // The grant row's rule, under `[harness] limit_reset` — and never
         // again at a dialog mount the reset was passed over for.
         ctx.limit_reset = config.limit_reset && !facts.limit_reset_passed;
+        // A credits consent, under `[harness] usage_credits` alone: policy,
+        // no fact of the box.
+        ctx.usage_credits = config.usage_credits;
         ctx.python_allow = allow.to_vec();
         if let Some(worker) = &facts.worker {
             ctx.worker = worker.clone();
@@ -178,13 +195,13 @@ impl ApprovalCtx {
             }
         }
         ctx.box_call = facts.box_call.clone();
+        ctx.login_carry = facts.login_carry;
+        ctx.login_method = facts.login_method;
         ctx
     }
 }
 
 // -- the facts on a tape ------------------------------------------------------
-
-type ShellWire = (Vec<(String, String, bool)>, bool);
 
 /// The facts as a mark holds them: every field optional ([module docs](self)).
 #[derive(Serialize, Deserialize, Default)]
@@ -192,6 +209,7 @@ type ShellWire = (Vec<(String, String, bool)>, bool);
 struct Wire {
     program: Option<String>,
     cwd: Option<String>,
+    trusted_cwd: Option<String>,
     bypass: bool,
     limit_reset_passed: bool,
     worker: Option<Answer<WorkerWire>>,
@@ -202,6 +220,8 @@ struct Wire {
     screen_rows: u64,
     question: Option<QuestionWire>,
     box_call: Option<String>,
+    login_carry: bool,
+    login_method: Option<String>,
 }
 
 /// The worker as a tape knows it: its digest (sixteen hex digits) and pid.
@@ -231,6 +251,7 @@ impl BoxFacts {
         let wire = Wire {
             program: self.program.clone(),
             cwd: self.cwd.as_deref().map(text),
+            trusted_cwd: self.trusted_cwd.as_deref().map(text),
             bypass: self.bypass,
             limit_reset_passed: self.limit_reset_passed,
             worker: self.worker.as_ref().map(|w| match w {
@@ -258,6 +279,8 @@ impl BoxFacts {
                 fell_back: q.fell_back,
             }),
             box_call: self.box_call.clone(),
+            login_carry: self.login_carry,
+            login_method: self.login_method.map(|m| m.word().to_string()),
         };
         // The wire holds strings, numbers, booleans and lists of them, which
         // always serialize.
@@ -297,6 +320,7 @@ impl BoxFacts {
         let facts = Self {
             program: wire.program,
             cwd: wire.cwd.as_deref().map(path).transpose()?,
+            trusted_cwd: wire.trusted_cwd.as_deref().map(path).transpose()?,
             bypass: wire.bypass,
             limit_reset_passed: wire.limit_reset_passed,
             worker: wire
@@ -343,6 +367,15 @@ impl BoxFacts {
                 })
                 .transpose()?,
             box_call: wire.box_call,
+            login_carry: wire.login_carry,
+            login_method: wire
+                .login_method
+                .as_deref()
+                .map(|w| {
+                    aterm_phase::LoginMethod::of_word(w)
+                        .ok_or_else(|| format!("a login method {w:?}"))
+                })
+                .transpose()?,
         };
         Ok((facts, needs))
     }

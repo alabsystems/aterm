@@ -83,41 +83,43 @@ fn first_difference(a: &[String], b: &[String]) -> String {
     )
 }
 
+/// Every screen height from 8 to 37 rows, each flap of 1..=9 rows (fewer on a
+/// short screen) and each pair of shrinks of 1..=3 rows grown back at once,
+/// on a freshly painted screen.
 #[test]
 fn a_quiet_flap_is_a_styled_identity() {
     let mut seed = 0x57_71_1E_D5_u64;
-    for i in 0..2500 {
-        let rows = 8 + (next(&mut seed) % 30) as u16;
-
+    for rows in 8..38u16 {
         // One flap of 1..=9 rows.
-        let mut t = Terminal::new(rows, COLS);
-        paint(&mut seed, &mut t, rows);
-        let before = picture(&t);
-        let k = 1 + (next(&mut seed) % u32::from(rows.min(10) - 1)) as u16;
-        t.resize(rows - k, COLS);
-        t.resize(rows, COLS);
-        let after = picture(&t);
-        assert!(
-            after == before,
-            "screen {i} (rows {rows}, flap of {k}): {}",
-            first_difference(&before, &after)
-        );
+        for k in 1..rows.min(10) {
+            let mut t = Terminal::new(rows, COLS);
+            paint(&mut seed, &mut t, rows);
+            let before = picture(&t);
+            t.resize(rows - k, COLS);
+            t.resize(rows, COLS);
+            let after = picture(&t);
+            assert!(
+                after == before,
+                "rows {rows}, flap of {k}: {}",
+                first_difference(&before, &after)
+            );
+        }
 
         // Two shrinks and one grow back.
-        let mut t = Terminal::new(rows, COLS);
-        paint(&mut seed, &mut t, rows);
-        let before = picture(&t);
-        let k1 = 1 + (next(&mut seed) % 3) as u16;
-        let k2 = 1 + (next(&mut seed) % 3) as u16;
-        t.resize(rows - k1, COLS);
-        t.resize(rows - k1 - k2, COLS);
-        t.resize(rows, COLS);
-        let after = picture(&t);
-        assert!(
-            after == before,
-            "screen {i} (rows {rows}, shrinks {k1}+{k2}): {}",
-            first_difference(&before, &after)
-        );
+        for (k1, k2) in (1..=3u16).flat_map(|a| (1..=3u16).map(move |b| (a, b))) {
+            let mut t = Terminal::new(rows, COLS);
+            paint(&mut seed, &mut t, rows);
+            let before = picture(&t);
+            t.resize(rows - k1, COLS);
+            t.resize(rows - k1 - k2, COLS);
+            t.resize(rows, COLS);
+            let after = picture(&t);
+            assert!(
+                after == before,
+                "rows {rows}, shrinks {k1}+{k2}: {}",
+                first_difference(&before, &after)
+            );
+        }
     }
 }
 

@@ -21,6 +21,7 @@
 //! which CAN, SUB and ESC leave as they always do.
 
 use crate::state::State;
+use crate::tmux::TmuxPassthrough;
 use crate::utf8::Utf8Prefix;
 use crate::{MAX_INTERMEDIATES, MAX_OSC_DATA, MAX_PARAMS, Parser};
 
@@ -100,6 +101,13 @@ pub struct ParserCarry {
     /// field has none, and one this build writes reads, to such a build, as a
     /// string whose next `0x9C` ends it (serde ignores the unknown field).
     pub string_utf8_tail: Vec<u8>,
+    /// The tmux passthrough wrapper the parser stands in
+    /// ([`TmuxPassthrough::Open`] or [`TmuxPassthrough::Escape`], with the
+    /// payload's own state in the fields above), or at the head of
+    /// ([`TmuxPassthrough::Head`], only in `DcsIgnore`). A build before
+    /// wrappers were unwrapped ignores it and reads the rest of the wrapper
+    /// bare, as it read every wrapper.
+    pub tmux: TmuxPassthrough,
 }
 
 impl ParserCarry {
@@ -199,6 +207,7 @@ impl Parser {
         }
         let mut carry = ParserCarry {
             state: self.state,
+            tmux: self.tmux,
             ..ParserCarry::default()
         };
         match self.state {
@@ -241,8 +250,8 @@ impl Parser {
     /// rather than printed. Whether that loses anything is the HOOKED
     /// HANDLER's question — this parser cannot see what its hook collected —
     /// so the caller decides when to take it: `aterm-core`'s checkpoint takes
-    /// it when the handler keeps nothing (a string it only consumes, such as a
-    /// tmux passthrough wrapper) or holds a picture a stream's next frame
+    /// it when the handler keeps nothing (a string it only consumes, such as
+    /// tmux control mode) or holds a picture a stream's next frame
     /// replaces (a sixel), and never for a query whose reply would be lost
     /// (round eight of the update audit, finding 57). A pure read.
     ///
@@ -274,12 +283,14 @@ impl Parser {
         if self.dcs_st_pending {
             return ParserCarry {
                 state: State::Escape,
+                tmux: self.tmux,
                 ..ParserCarry::default()
             };
         }
         self.carry().unwrap_or_else(|| ParserCarry {
             state: HOOKED_STRING_CARRY,
             string_utf8_tail: self.string_utf8.as_slice().to_vec(),
+            tmux: self.tmux,
             ..ParserCarry::default()
         })
     }
@@ -363,6 +374,7 @@ impl Parser {
         self.utf8_expected = carry.utf8_expected;
         self.string_utf8 =
             Utf8Prefix::from_bytes(&carry.string_utf8_tail).unwrap_or(Utf8Prefix::NONE);
+        self.tmux = carry.tmux;
         Ok(())
     }
 
@@ -453,6 +465,14 @@ impl Parser {
         }
         if Utf8Prefix::from_bytes(&carry.string_utf8_tail).is_none() {
             return Err(CarryRefusal::Utf8Tail);
+        }
+
+        // A wrapper's head: 1 to 4 bytes of `tmux;`, read only in the ignored
+        // DCS its `ESC P t` began. An open wrapper holds any payload state.
+        if let TmuxPassthrough::Head(matched) = carry.tmux
+            && (carry.state != State::DcsIgnore || !(1..=4).contains(&matched))
+        {
+            return Err(CarryRefusal::FieldOutsideState);
         }
         Ok(())
     }

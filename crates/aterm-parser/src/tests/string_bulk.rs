@@ -69,7 +69,9 @@ fn osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint() {
 /// same payload below the cap,
 /// at exactly the cap (the `copy_len < n` branch: the buffer fills before the
 /// C0) and well over it, where both truncate to `MAX_OSC_DATA` bytes of
-/// `0;` + payload.
+/// `0;` + payload. The byte-per-read side reads one byte at a time from 4 KiB
+/// below the cap on; the bytes before that only append, so it takes them in one
+/// read (one byte per read across 8 MiB took seconds).
 #[test]
 fn osc_payload_cap_parity() {
     for (payload_len, delivered) in [
@@ -83,7 +85,9 @@ fn osc_payload_cap_parity() {
 
         let mut sink_slow = RecordingSink::default();
         let mut per_byte = Parser::new();
-        for byte in &input {
+        let (head, tail) = input.split_at(MAX_OSC_DATA - 4096);
+        per_byte.advance_fast(head, &mut sink_slow);
+        for byte in tail {
             per_byte.advance_fast(std::slice::from_ref(byte), &mut sink_slow);
         }
         let mut sink_fast = RecordingSink::default();

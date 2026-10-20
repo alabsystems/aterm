@@ -1,0 +1,11 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of lost_rows_are_counted_on_the_source_mark_never_as_ring_loss (S27).
+bind 0
+tx lost 2
+tx flush
+tx flush
+state partial
+tx prompt v1
+expect mark r1 source state=on skipped=0
+expect mark r1 source state=on dropped=2
+expect mark r1 source state=partial dropped=2

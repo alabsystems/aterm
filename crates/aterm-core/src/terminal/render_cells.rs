@@ -74,6 +74,23 @@ trust_island! {
             resolvePlainCellStyle 2 1 memoVal freshVal = freshVal := by
           rfl
 
+        -- Single-pass combining-mark scan computes (has_any, has_vs15,
+        -- has_emoji_marker, utf8_bytes) in one traversal instead of cloning
+        -- the mark iterator 4 times per complex/styled cell.
+        structure MarkScan where
+          hasAny : Bool
+          hasVs15 : Bool
+          hasEmojiMarker : Bool
+          utf8Bytes : Nat
+        deriving Repr
+
+        def emptyMarkScan : MarkScan :=
+          { hasAny := false, hasVs15 := false, hasEmojiMarker := false, utf8Bytes := 0 }
+
+        theorem empty_mark_scan_has_none :
+            emptyMarkScan.hasAny = false := by
+          rfl
+
         end RenderCellsProofs
     }
 }
@@ -242,8 +259,10 @@ impl Default for RenderCell {
     }
 }
 
-/// The plain-cell style memo's key: a plain cell's style depends on its colors and flags alone.
-type PlainStyleKey = (crate::grid::PackedColors, CellFlags);
+/// The plain-cell style memo's key: a plain cell's style depends on its colors and flags, and
+/// on whether it holds a shape the theme-pair floor leaves alone
+/// ([`super::color_resolve::is_shape_glyph`]).
+type PlainStyleKey = (crate::grid::PackedColors, CellFlags, bool);
 
 /// What the memo keeps per key: foreground, background, underline, and the
 /// strikethrough, overline, bold and italic flags.
@@ -384,23 +403,20 @@ impl Terminal {
         let default_fg = self.default_foreground();
         let default_bg = self.default_background();
         let reverse_video = self.modes().reverse_video();
-        // Host style policy: bold-to-bright and faint opacity, set by `apply_config`.
+        // Host style policy: bold-to-bright, faint opacity and the theme-pair
+        // contrast floor, set by `apply_config`.
         let style_opts = StyleResolveOpts {
             bold_is_bright: self.color.bold_is_bright,
             faint_opacity: self.color.faint_opacity,
+            indexed_minimum_contrast: self.color.indexed_minimum_contrast,
         };
 
-        let cols = view.len();
-        out.reserve(cols as usize);
+        let cells = view.cells_slice();
+        out.reserve(cells.len());
         // Whether `view.cell(col - 1)` is wide (false at col 0 and past a missing cell).
         let mut prev_wide = false;
         let mut plain_style_memo: Option<(PlainStyleKey, PlainStyle)> = None;
-        for col in 0..cols {
-            let Some(cell) = view.cell(col) else {
-                prev_wide = false;
-                continue;
-            };
-
+        for (col, &cell) in (0..view.len()).zip(cells) {
             // One flag-gated overflow lookup covering fg/bg RGB, resolved char
             // and cell extra; a no-op for the common plain cell. The view keys
             // the live probe on the display-mapped screen row and swaps in
@@ -415,7 +431,11 @@ impl Terminal {
                 && !cell.bg_needs_overflow()
                 && data.cell_extra().is_none()
             {
-                let key = (cell.colors(), cell.flags());
+                let key = (
+                    cell.colors(),
+                    cell.flags(),
+                    super::color_resolve::is_shape_glyph(cell.char()),
+                );
                 let (fg, bg, underline, strikethrough, overline, bold, italic) =
                     match plain_style_memo {
                         Some((k, resolved)) if k == key => resolved,
@@ -498,11 +518,25 @@ impl Terminal {
             };
             let ch = if wide || raw == '\0' { ' ' } else { raw };
 
-            // Read the selector/cluster tail once. Besides feeding the optional
-            // cluster/combining snapshot below, it preserves an explicit VS15
-            // request for the renderer: Unicode default presentation alone cannot
-            // distinguish bare 😀 (colour) from narrow `😀︎` (text).
+            // Read the selector/cluster tail once and classify it in a single pass.
+            // Besides feeding the optional cluster/combining snapshot below, it
+            // preserves an explicit VS15 request for the renderer: Unicode default
+            // presentation alone cannot distinguish bare 😀 (colour) from narrow `😀︎` (text).
             let marks = data.marks();
+            let mut has_any_mark = false;
+            let mut has_vs15 = false;
+            let mut has_emoji_marker = false;
+            let mut marks_utf8_bytes = 0usize;
+            for m in marks.clone() {
+                has_any_mark = true;
+                if m == '\u{FE0E}' {
+                    has_vs15 = true;
+                }
+                if is_emoji_sequence_marker(m) {
+                    has_emoji_marker = true;
+                }
+                marks_utf8_bytes += m.len_utf8();
+            }
 
             // Emoji presentation: an emoji-capable base is narrow by default, so
             // a wide lead cell holding one was widened by VS16
@@ -513,8 +547,7 @@ impl Terminal {
             // lead remains narrow. This also handles selector replay exactly:
             // `⌚︎️` is wide again (VS16 took effect) and therefore not text,
             // while an ineffective later VS16 at the row edge leaves VS15 active.
-            let text_presentation =
-                !wide && !cell.is_wide() && marks.clone().any(|c| c == '\u{FE0E}');
+            let text_presentation = !wide && !cell.is_wide() && has_vs15;
 
             // Line decorations (SGR 4 family / 9 / 53).
             let cflags = cell.flags();
@@ -581,7 +614,7 @@ impl Terminal {
             // pass so the snapshot probes the extras once per cell. `marks()` reads the live
             // combining slice, or reconstructs a materialized cell's cluster tail.
             if let Some((clusters, combining_out)) = extras_out.as_mut() {
-                if marks.clone().any(is_emoji_sequence_marker) {
+                if has_emoji_marker {
                     // Multi-codepoint emoji sequence (ZWJ, skin tone, keycap,
                     // regional-indicator pair): surface the whole grapheme for
                     // shaping. Skip a NUL base.
@@ -589,14 +622,13 @@ impl Terminal {
                         // Count UTF-8 bytes, not scalars: even a flag's two
                         // scalars occupy eight bytes. Exact capacity avoids
                         // growing the string and shrinking it again for Box.
-                        let bytes =
-                            raw.len_utf8() + marks.clone().map(char::len_utf8).sum::<usize>();
+                        let bytes = raw.len_utf8() + marks_utf8_bytes;
                         let mut s = String::with_capacity(bytes);
                         s.push(raw);
                         s.extend(marks);
                         clusters.push((col as usize, s.into_boxed_str()));
                     }
-                } else if marks.clone().next().is_some() {
+                } else if has_any_mark {
                     // Plain combining diacritics: overlay every mark that has a
                     // glyph of its own (`draws_no_glyph` names the exceptions).
                     let overlay: Box<[char]> = marks.filter(|&c| !draws_no_glyph(c)).collect();
@@ -1314,7 +1346,7 @@ impl Terminal {
     /// moves `content_gen` (their mutators only mark `Damage::Full`, and a
     /// config reload changes the style policy with no output at all): the live
     /// palette, default colours, DECSCNM, the style policy (`bold_is_bright`,
-    /// `faint_opacity`) and the BiDi modes. A cache of resolved rows keys on
+    /// `faint_opacity`, `indexed_minimum_contrast`) and the BiDi modes. A cache of resolved rows keys on
     /// this value: the apron memo, and `screen since=<etag>` through
     /// `aterm-gui`'s `render_sig`. An input the resolver gains belongs here,
     /// or both serve stale colours.
@@ -1329,6 +1361,7 @@ impl Terminal {
         h.write_u8(u8::from(modes.reverse_video()));
         h.write_u8(u8::from(self.color.bold_is_bright));
         h.write_u32(self.color.faint_opacity.to_bits());
+        h.write_u32(self.color.indexed_minimum_contrast.to_bits());
         h.write_u8(modes.bidi_mode as u8);
         h.write_u8(modes.bidi_direction as u8);
         h.write_u8(u8::from(modes.bidi_autodetection));
@@ -1450,6 +1483,8 @@ impl Terminal {
         // width reflow renumbers every retained row without moving
         // `absolute_row_revision`.
         scratch.history_renumber_epoch = self.grid().history_renumber_epoch();
+        // The fence, resolved to absolute rows in this frame's numbering.
+        scratch.holder = self.holder_view();
         scratch.selection.clone_from(self.text_selection());
         scratch.selection_bg = self
             .selection_background()
@@ -2159,8 +2194,8 @@ mod tests {
         };
         let mut term = Terminal::new(2, 12);
         term.apply_config(&tc);
-        // A bold palette-3 cell, a dim cell, a palette-1 cell.
-        term.process(b"\x1b[1;33mB\x1b[0m \x1b[2mD\x1b[0m \x1b[31mR\x1b[0m");
+        // A bold palette-3 cell, a dim cell, a palette-1 cell, palette 4 on palette 2.
+        term.process(b"\x1b[1;33mB\x1b[0m \x1b[2mD\x1b[0m \x1b[31mR\x1b[0m \x1b[34;42mG\x1b[0m");
         let arms: &[Arm] = &[
             ("bold_is_bright (config reload)", |t, c| {
                 c.bold_is_bright = !c.bold_is_bright;
@@ -2168,6 +2203,10 @@ mod tests {
             }),
             ("faint_opacity (config reload)", |t, c| {
                 c.faint_opacity = 0.9;
+                t.apply_config(c);
+            }),
+            ("indexed_minimum_contrast (config reload)", |t, c| {
+                c.indexed_minimum_contrast = 21.0;
                 t.apply_config(c);
             }),
             ("palette entry (OSC 4)", |t, _| {

@@ -397,6 +397,7 @@ impl BandInks {
                 cursor: theme.cursor,
                 ansi,
                 authored: AuthoredChrome::NONE,
+                system_accent: None,
                 base,
             }),
         )

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
+// under them (crates/aterm-spec-anchor/anchor_rules.rs).
+#![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
+
 //! `aterm-effects`: the host-agnostic visual-effects engines (cursor aurora and
 //! comet trail, sparkle words, animated ink, cat, supernova) shared by the native
 //! app and the web embedders (`aterm-wasm`, `aterm-gpu-web`).
@@ -32,12 +36,12 @@ pub mod animal_glyphs_gen {
     include!("animal_glyphs_gen.rs");
 }
 pub mod cat_baker;
-/// The cat-art codegen (docs/cat-art-v4-design.md §1): turns the semantic glyph
-/// asset TOMLs into the checked-in [`cat_glyphs_gen`] const drawlists.
-pub mod cat_glyphs_codegen;
+/// The examples share this generator source with the unit drift/schema tests.
+#[cfg(test)]
+mod cat_glyphs_codegen;
 /// `@generated` cat drawlists; regenerate with `targo --unverified run -p aterm-effects
-/// --example gen_cat_glyphs` (drift test in [`cat_glyphs_codegen`]). `include!`d rather
-/// than `mod` so rustfmt never reflows the generated file.
+/// --example gen_cat_glyphs` (unit drift test `cat_glyphs_gen_matches_assets`).
+/// `include!`d rather than `mod` so rustfmt never reflows the generated file.
 pub mod cat_glyphs_gen {
     include!("cat_glyphs_gen.rs");
 }

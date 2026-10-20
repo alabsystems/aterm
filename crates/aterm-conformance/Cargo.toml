@@ -8,9 +8,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "aterm VT conformance tests (feed -> read screen -> assert, the engine read API as the oracle), and the MEASURE instruments that pixel-check and spin-check a release binary."
-# Every tests/*.rs is either a `mod` of the `vt` suite (tests/vt.rs) or one of
-# the explicit [[test]] targets below; with autotests off, a file that is
-# neither silently never compiles.
+# With autotests off, tests/vt.rs explicitly mounts every VT suite file; a file
+# neither mounted nor declared as a target would silently never compile.
 autotests = false
 
 [dependencies]
@@ -30,9 +29,6 @@ aterm-tempfile = { workspace = true }
 
 [dev-dependencies]
 aterm-types = { workspace = true }
-# `aterm_spec::host::could_not_run`: the one spelling of the COULD NOT RUN
-# sentinel the verify gate reads (paint and spin's undecided takes).
-aterm-spec = { workspace = true }
 # Scratch directories for the scanner's end-to-end PNG test.
 aterm-tempfile = { workspace = true }
 # THE DIFFERENTIAL VT ORACLE (tests/vt_oracle/): astream's pure, zero-dependency
@@ -59,13 +55,18 @@ test = false
 name = "vt"
 path = "tests/vt.rs"
 
-# The paint rows: ignored by default, run with `-- --ignored` and the release
-# binary in ATERM_PAINT_BIN; each takes its turn on a process-wide lock.
-[[test]]
+# Explicit acceptance measurements of the handed release binary. The default
+# test selection runs neither matrix; verify measure runs both with --profile
+# test, preserving the ordinary build's debug seams and dependency units.
+[[bench]]
 name = "paint"
-path = "tests/paint.rs"
+path = "benches/paint.rs"
+harness = false
+test = false
 
 # The spin rows: as `paint`, with ATERM_SPIN_BIN (or ATERM_PAINT_BIN).
-[[test]]
+[[bench]]
 name = "spin"
-path = "tests/spin.rs"
+path = "benches/spin.rs"
+harness = false
+test = false

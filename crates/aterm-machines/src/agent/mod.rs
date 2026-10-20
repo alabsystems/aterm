@@ -14,11 +14,15 @@
 //! | `put-file <path> <mode>` | a user, never root | standard input atomically into a file in that user's home ([`inbox`]) |
 //! | `install …` | root, through a password `sudo` at enrollment only | puts the staged agent in place ([`install`]) |
 //! | `lock-screen` | the admin, in their login session, run by `screen` through a signed `exec` | locks that session and reads it back locked ([`lock`]) |
+//! | `screen-watch arm …`, `disarm <id>` | root, run by `screen` through a signed `exec` | starts, and ends, a watcher that locks the admin's session should `screen` vanish before its own lock ([`watch`]) |
+//! | `screen-watch run <id>` | root, started by `arm` | the watcher itself, detached from the run ([`watch`]) |
 //! | `version` | anyone | the agent's version |
 //!
 //! Nothing here reads the environment, `HOME` or aterm's own configuration, except `ssh`,
-//! whose input is `SSH_ORIGINAL_COMMAND`: every path comes from [`Layout`], every account
-//! from `crate::facts::user`, and every child gets an explicit environment from the port.
+//! whose input is `SSH_ORIGINAL_COMMAND`, and `hello`'s tab list, read only in the
+//! account's own home (`crate::sessions::is_live_account`): every path comes from
+//! [`Layout`], every account from `crate::facts::user`, and every child gets an explicit
+//! environment from the port.
 
 use crate::port::System;
 use std::io::{Read, Write};
@@ -36,6 +40,7 @@ pub mod lock;
 pub mod platform;
 pub mod relay;
 pub mod state;
+pub mod watch;
 
 /// Where everything the agent keeps lives: [`crate::AGENT_ROOT`] on a managed host, a
 /// temporary directory in tests.
@@ -132,6 +137,19 @@ impl Layout {
     #[must_use]
     pub fn last_run(&self) -> PathBuf {
         self.state().join("last_run")
+    }
+
+    /// `state/last_busy` (0644): the newest signed request refused `busy`, named as its run
+    /// would have been: a heartbeat of the screen watch ([`watch`]).
+    #[must_use]
+    pub fn last_busy(&self) -> PathBuf {
+        self.state().join("last_busy")
+    }
+
+    /// `state/screen-watch/` (0700): `screen`'s armed watchers and what each did ([`watch`]).
+    #[must_use]
+    pub fn screen_watch(&self) -> PathBuf {
+        self.state().join("screen-watch")
     }
 
     /// `state/journal.ndjson` (0600): one line per change, written before it is applied.
@@ -247,6 +265,7 @@ pub fn run(
         ["put-file", path, mode] => inbox::put_file(sys, Path::new(path), mode, stdin, out),
         ["install", rest @ ..] => install::main(sys, layout, exe, rest, out),
         ["lock-screen"] => lock::lock_screen(sys, out, lock::LOCK_HANG),
+        ["screen-watch", rest @ ..] => watch::main(sys, layout, exe, rest, out),
         ["version"] => {
             let _ = writeln!(out, "{}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -255,7 +274,7 @@ pub fn run(
             out,
             &format!(
                 "`aterm machines agent {}` is not an agent verb (ssh, hello, put, apply, \
-                 run-job, attach, put-file, install, lock-screen, version)",
+                 run-job, attach, put-file, install, lock-screen, screen-watch, version)",
                 args.join(" ")
             ),
         ),

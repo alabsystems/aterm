@@ -68,6 +68,24 @@ impl Op {
             _ => None,
         }
     }
+
+    /// Whether `self` is part of the standard human-seat vocabulary (`ReadScreen`, `WriteInput`, `Signal`).
+    #[must_use]
+    pub const fn is_human_seat_op(self) -> bool {
+        matches!(self, Op::ReadScreen | Op::WriteInput | Op::Signal)
+    }
+
+    /// Whether `self` is an elevated authority never minted by [`ConnectionKind`].
+    #[must_use]
+    pub const fn is_elevated_op(self) -> bool {
+        matches!(self, Op::ConfigWrite | Op::ClipboardWrite | Op::DeriveLoop)
+    }
+
+    /// Whether `self` mutates or signals the destination session (`!ReadScreen`).
+    #[must_use]
+    pub const fn mutates_destination(self) -> bool {
+        !matches!(self, Op::ReadScreen)
+    }
 }
 
 /// The connection vocabulary the UX and wire mint in, deliberately smaller than
@@ -92,11 +110,43 @@ impl ConnectionKind {
     /// The exact ops this kind mints; [`EdgeTable::grant_connection`] draws only
     /// from these.
     #[must_use]
-    pub fn ops(&self) -> &'static [Op] {
+    pub const fn ops(&self) -> &'static [Op] {
         match self {
             ConnectionKind::Pull => &[Op::ReadScreen],
             ConnectionKind::Push => &[Op::WriteInput, Op::Signal],
             ConnectionKind::Both => &[Op::ReadScreen, Op::WriteInput, Op::Signal],
+        }
+    }
+
+    /// Number of [`Op`]s granted by this connection kind (`1`, `2`, or `3`).
+    #[must_use]
+    pub const fn op_count(self) -> usize {
+        match self {
+            ConnectionKind::Pull => 1,
+            ConnectionKind::Push => 2,
+            ConnectionKind::Both => 3,
+        }
+    }
+
+    /// Whether this connection kind includes read-screen (`Pull` or `Both`).
+    #[must_use]
+    pub const fn includes_pull(self) -> bool {
+        matches!(self, ConnectionKind::Pull | ConnectionKind::Both)
+    }
+
+    /// Whether this connection kind includes write-input + signal (`Push` or `Both`).
+    #[must_use]
+    pub const fn includes_push(self) -> bool {
+        matches!(self, ConnectionKind::Push | ConnectionKind::Both)
+    }
+
+    /// Whether this connection kind grants `op`.
+    #[must_use]
+    pub const fn grants_op(self, op: Op) -> bool {
+        match self {
+            ConnectionKind::Pull => matches!(op, Op::ReadScreen),
+            ConnectionKind::Push => matches!(op, Op::WriteInput | Op::Signal),
+            ConnectionKind::Both => matches!(op, Op::ReadScreen | Op::WriteInput | Op::Signal),
         }
     }
 }
@@ -765,5 +815,43 @@ mod tests {
         for (op, tok) in &minted {
             assert_eq!(decide_edge(&tbl, tok, &b, *op, &nonce), EdgeDecision::Deny);
         }
+    }
+
+    #[test]
+    fn edge_and_backlog_const_helpers_invariants() {
+        assert!(Op::ReadScreen.is_human_seat_op() && !Op::ReadScreen.is_elevated_op());
+        assert!(!Op::ReadScreen.mutates_destination());
+        assert!(Op::WriteInput.mutates_destination());
+        assert!(Op::ConfigWrite.is_elevated_op() && !Op::ConfigWrite.is_human_seat_op());
+
+        assert_eq!(ConnectionKind::Pull.op_count(), 1);
+        assert_eq!(ConnectionKind::Push.op_count(), 2);
+        assert_eq!(ConnectionKind::Both.op_count(), 3);
+        assert!(ConnectionKind::Pull.includes_pull() && !ConnectionKind::Pull.includes_push());
+        assert!(ConnectionKind::Push.includes_push() && !ConnectionKind::Push.includes_pull());
+        assert!(ConnectionKind::Both.includes_pull() && ConnectionKind::Both.includes_push());
+        assert!(ConnectionKind::Push.grants_op(Op::WriteInput));
+        assert!(!ConnectionKind::Push.grants_op(Op::ReadScreen));
+
+        let idle = crate::input_backlog::Contention::from_per_cpu_milli(500);
+        assert!(!idle.is_oversubscribed());
+        assert_eq!(idle.factor_milli(), 1000);
+        assert_eq!(idle.stretch_millis(10_000), 10_000);
+        assert_eq!(idle.fair_share_ns(1_000_000), 1_000_000);
+
+        let heavy = crate::input_backlog::Contention::from_per_cpu_milli(25_000);
+        assert!(heavy.is_oversubscribed() && heavy.is_at_max_stretch());
+        assert_eq!(heavy.factor_milli(), 10_000);
+        assert_eq!(heavy.stretch_millis(10_000), 100_000);
+        assert_eq!(heavy.fair_share_ns(1_000_000), 100_000);
+
+        assert_eq!(crate::input_backlog::oldest_unread_offset(100, 30), 70);
+        assert!(crate::input_backlog::unread_within_accepted(100, 30));
+        assert!(!crate::input_backlog::unread_within_accepted(30, 100));
+        let wm = crate::input_backlog::encode_backlog_watermarks_le(1000, 250);
+        assert_eq!(
+            crate::input_backlog::decode_backlog_watermarks_le(wm),
+            (1000, 250)
+        );
     }
 }

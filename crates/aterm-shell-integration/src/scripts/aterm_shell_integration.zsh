@@ -149,11 +149,28 @@ case "${ATERM_MUX:-}" in 0|off|no|none|false) __aterm_mux="" ;; esac
 # upgrade in place: everything below is idempotent, and what must run once per
 # shell (the package blocks, the hook and widget wiring) is skipped where it
 # already ran.
-typeset -gi __aterm_fresh_load=1
+#
+# An upgrade in place first notes, for the body's AN OLDER SCRIPT'S
+# `~/.aterm/bin`, the script that loaded this shell FRESH — before this load
+# writes over what says so: the loader in `__aterm_si_dir` when its own load was
+# the fresh one (`__aterm_fresh_load` 1), `-` for a shell from before loaders
+# (neither is set), nothing it can name otherwise (a loader that itself came in
+# place). Once per shell, while the body has not settled it.
 if [[ -n "${ATERM_SHELL_INTEGRATION_INSTALLED:-}" ]] &&
    (( ${+__aterm_shell_nonce} && ${+functions[__aterm_precmd]} )); then
-    __aterm_fresh_load=0
+    if (( ! ${+__aterm_old_bin_off} && ! ${+__aterm_bin_from} )); then
+        if (( ! ${+__aterm_fresh_load} && ! ${+__aterm_si_dir} )); then
+            typeset -g __aterm_bin_from=-
+        elif [[ "${__aterm_fresh_load-}" == 1 && -n "${__aterm_si_dir-}" ]]; then
+            typeset -g __aterm_bin_from="$__aterm_si_dir/aterm_shell_integration.zsh"
+        else
+            typeset -g __aterm_bin_from=
+        fi
+    fi
+    typeset -gi __aterm_fresh_load=0
     ATERM_SHELL_INTEGRATION_INSTALLED=
+else
+    typeset -gi __aterm_fresh_load=1
 fi
 
 # Skip if already loaded — marking the boundary on the way out when the
@@ -315,6 +332,13 @@ if [[ ${#__aterm_body_rev} -ne 16 || "$__aterm_body_rev" == *[^0-9a-f]* ]]; then
     __aterm_body_rev=""
 fi
 
+# A fresh load settles the body's AN OLDER SCRIPT'S `~/.aterm/bin` at once: this
+# loader puts no `~/.aterm/bin` on PATH, so no entry there is an integration's
+# and the body has nothing to look for.
+if (( __aterm_fresh_load )); then
+    typeset -g __aterm_old_bin_off=1
+fi
+
 # Source package shell hooks — once per shell: an upgrade in place already ran
 # them (the LIVE block re-sources the atpkg hook whenever it changes).
 # No `~/.aterm/bin` goes on PATH: nothing creates or manages that folder, and an
@@ -386,6 +410,76 @@ autoload -Uz add-zsh-hook
 # Not traced (see THE TRACE): a loader from before it sources this body at a switch
 # with the user's XTRACE on, and its body check puts that back at its return.
 : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
+
+# ─── AN OLDER SCRIPT'S `~/.aterm/bin`, taken off (2026-10-19) ───
+#
+# Every script before 613305828c (2026-10-16) put `$HOME/.aterm/bin` FIRST on
+# PATH when it loaded a shell fresh and that folder existed; none since does
+# (the loader's package block says why). Such a shell kept the entry through an
+# upgrade in place — this body sourced at a prompt by its older loader, or this
+# loader sourced over it — until it exited. So the body takes it off, once per
+# shell, where the shell PROVES that such a script put it there, and nowhere
+# else: v0.106.0 and every build from 613305828c up to this one put none there
+# and set no mark, so in their shells a `~/.aterm/bin` on PATH is the user's
+# own. The proof has two halves:
+#
+#  1. The script that loaded this shell fresh carried the prepend. That is the
+#     loader in `__aterm_si_dir` when its own load was the fresh one
+#     (`__aterm_fresh_load` 1), or, when this build's loader came in place, the
+#     one it noted there (`__aterm_bin_from`, the loader's block says how; `-`
+#     for a shell from before loaders, whose every script prepended). The
+#     folder is content-addressed, so its loader still holds the bytes that
+#     loaded the shell, and the prepend line is looked for in it, spelled here
+#     so that this file never holds it. A folder already collected, or a loader
+#     an intermediate build sourced in place, leaves nothing to prove it with:
+#     the entry stays.
+#  2. The folder was there at that load: it is older than the shell process —
+#     its positive birth, or its last change only when birth is unavailable,
+#     by more than the whole seconds `stat`, `date` and `ps -o etime=` count in.
+#     A usable birth takes precedence even if mtime was preserved or backdated.
+#     The clock is read before the shell's age; mtime without a usable birth
+#     remains a fallback reading, not an independent creation-time witness.
+#
+# One `sh` asks both (grep, stat, ps and date: once per shell, and only where
+# PATH holds the entry and the folder exists). Then one copy goes — the first
+# equal to `$HOME/.aterm/bin`, where the old script put it — and nothing else
+# moves: an EMPTY entry ("here") keeps its place, and a copy the user's own
+# startup added keeps the folder on PATH. `(ie)` finds it by string equality,
+# never as a pattern, and under `emulate -L zsh`, so a user's ksh_arrays cannot
+# move the index.
+if (( ! ${+__aterm_old_bin_off} )); then
+    typeset -g __aterm_old_bin_off=1
+    () {
+        emulate -L zsh
+        local from= bin=${HOME-}/.aterm/bin
+        if (( ${+__aterm_bin_from} )); then
+            from=$__aterm_bin_from
+        elif [[ ${__aterm_fresh_load-} == 1 && -n ${__aterm_si_dir-} ]]; then
+            from=$__aterm_si_dir/aterm_shell_integration.zsh
+        fi
+        local -i at=${path[(ie)$bin]}
+        if [[ -n $from && -d $bin ]] && (( at <= $#path )) &&
+            command sh -c '
+                [ "$1" = - ] || grep -qF -e "$2" -- "$1" || exit 1
+                t=$(stat -f "%B %m" -- "$3") || t=$(stat -c "%W %Y" -- "$3") || exit 1
+                b=${t%% *}; m=${t##* }
+                case $m in ""|*[!0-9]*) exit 1 ;; esac
+                case $b in ""|*[!0-9]*|0) b=$m ;; esac
+                n=$(date +%s) || exit 1
+                e=$(ps -o etime= -p "$4") || exit 1
+                e=${e##* }; d=0
+                case $e in *-*) d=${e%%-*}; d=${d#0}; e=${e#*-} ;; esac
+                case $d$e in ""|*[!0-9:]*) exit 1 ;; esac
+                s=0; IFS=:
+                for x in $e; do x=${x#0}; s=$((s * 60 + ${x:-0})); done
+                [ $((b + ${d:-0} * 86400 + s + 1)) -lt "$n" ]
+            ' sh "$from" "export PATH=\"\$HOME/.aterm/bin:\$PATH\"" "$bin" "$$" 2>/dev/null
+        then
+            path[at]=()
+        fi
+    }
+    unset __aterm_bin_from
+fi
 
 # ─── The reroute directory, FIRST — and the agents directory beside it ───
 #
@@ -777,11 +871,20 @@ __aterm_urlencode() {
     REPLY="$encoded"
 }
 
-# Report current working directory (OSC 7)
+# Report current working directory (OSC 7). With a nonce, the same URI first
+# goes SIGNED like the marks as the property `633;P;AtermCwd=` (the encoder
+# above always escapes `;`): the shell's own word, so aterm drops a background
+# job's report that lands between it and the 133;A. The OSC 7 carries no nonce:
+# an aterm from before the property ignores the property and stores what the
+# OSC 7 names (docs/DESIGN-cwd-reports-2026-10-19.md).
 __aterm_report_cwd() {
     local REPLY
     __aterm_urlencode "$PWD"
-    __aterm_osc "7;file://${__aterm_report_host}${REPLY}"
+    local uri="file://${__aterm_report_host}${REPLY}"
+    if [[ -n "$__aterm_id_suffix_str" ]]; then
+        __aterm_osc "633;P;AtermCwd=${uri}${__aterm_id_suffix_str}"
+    fi
+    __aterm_osc "7;${uri}"
 }
 
 # Mark prompt start (OSC 133;A)
@@ -888,7 +991,9 @@ __aterm_mark_integration_rev() {
 # read is what the shell kept: the line editor leaves ISIG, the flag the repair
 # reads, as it found it. Found broken — an rc ran a raw program that died — the
 # tty is repaired THROUGH the thaw (`__aterm_tty_thaw_run`), so the shell keeps
-# the repair and freezes that, before the first command runs. An upgrade in
+# the repair and freezes that, before the first command runs. A Ctrl-C at
+# that first prompt cannot wait for a command: THE FIRST PROMPT'S CTRL-C
+# below takes the read as soon as it answers. An upgrade in
 # place (`__aterm_fresh_load` 0) reads at once, as before: that shell may be
 # broken right now. A body taken through the pointer finds the shell armed by
 # the body before it, except in a shell whose earlier body had no arm (builds
@@ -902,6 +1007,9 @@ typeset -gi __aterm_tty_armed="${__aterm_tty_armed:-0}"
 typeset -gi __aterm_tty_frozen="${__aterm_tty_frozen:-0}"
 # The descriptor of the read a fresh shell's first prompt left running, or 0.
 typeset -gi __aterm_tty_probe_fd="${__aterm_tty_probe_fd:-0}"
+# 1 once THE FIRST PROMPT'S CTRL-C repaired the tty from inside the line
+# editor, thawed: the freeze is owed to the next prompt or command.
+typeset -gi __aterm_tty_owed="${__aterm_tty_owed:-0}"
 
 # Whether the tty is in a dead raw program's state (part 1 above): `raw` in
 # REPLY when it is, else nothing. One fork to read it; silent when stdin is
@@ -925,12 +1033,7 @@ __aterm_tty_repair() {
     emulate -L zsh
     local REPLY=""
     if (( __aterm_tty_probe_fd )); then
-        # Up to its end — the probe has long exited by now — where `read`
-        # answers 1: the first command of an `||` list, so no user's ZERR trap
-        # hears it.
-        read -r -u $__aterm_tty_probe_fd REPLY || true
-        exec {__aterm_tty_probe_fd}<&-
-        __aterm_tty_probe_fd=0
+        __aterm_tty_take
     else
         __aterm_tty_read
     fi
@@ -940,6 +1043,50 @@ __aterm_tty_repair() {
     else
         command stty isig icanon iexten echo icrnl opost 2>/dev/null
     fi
+    return 0
+}
+
+# The first prompt's read, taken into the caller's REPLY: up to its end — the
+# probe has exited by then — where `read` answers 1, the first command of an
+# `||` list, so no user's ZERR trap hears it. The editor's watch on it goes too.
+__aterm_tty_take() {
+    zle -F $__aterm_tty_probe_fd 2>/dev/null
+    read -r -u $__aterm_tty_probe_fd REPLY || true
+    exec {__aterm_tty_probe_fd}<&-
+    __aterm_tty_probe_fd=0
+}
+
+# THE FIRST PROMPT'S CTRL-C (2026-10-17). Until the deferred read is taken, a
+# fresh shell's first prompt runs in the tty its rc left. A raw one has ISIG
+# off, so Ctrl-C there reached the line editor as a byte, which beeped (emacs)
+# or inserted a ^C (viins) and kept the line: measured, zsh 5.9, `echo LOST`,
+# Ctrl-C, `echo KEPT` ran `echo LOSTecho KEPT`. Waiting for the read before
+# the prompt would put its fork and exec back on every new tab, so the line
+# editor watches it instead (`zle -F`) and takes it the moment it answers,
+# about a millisecond after the prompt is drawn; a sane tty costs nothing
+# more. Answered `raw`, the repair runs right there, from inside the editor,
+# which takes three steps (zsh 5.9's zle_main.c, jobs.c): `zle -I` hands the
+# tty back in the state the shell keeps and asks the editor to keep whatever
+# it finds when it takes the tty again — but only while the tty is not
+# frozen (a job run inside the editor is never adopted) — so the freeze is
+# lifted, `stty` puts back what raw modes turn off (its stdin the tty: the
+# editor's is not), and the editor redraws the prompt in place on the
+# repaired tty. Ctrl-C there is then the shell's own, `$?` 130 and all. The
+# freeze is owed to the next prompt or command (`__aterm_tty_owed`). A
+# command typed before the read answers takes it at its preexec, as before.
+# Not traced (see THE TRACE): the editor calls it under the user's options.
+__aterm_tty_probe_ready() {
+    : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
+    emulate -L zsh
+    local REPLY=""
+    __aterm_tty_take
+    [[ "$REPLY" == raw ]] || return 0
+    zle -I
+    if (( __aterm_tty_frozen )); then
+        builtin ttyctl -u
+        __aterm_tty_owed=1
+    fi
+    command stty isig icanon iexten echo icrnl opost 2>/dev/null <$TTY
     return 0
 }
 
@@ -986,8 +1133,10 @@ __aterm_tty_arm() {
     emulate -L zsh
     __aterm_tty_armed=1
     if (( __aterm_fresh_load )); then
-        # The probe answers in a word, so taking it is one short read.
+        # The probe answers in a word, so taking it is one short read; the
+        # editor takes it when it does (THE FIRST PROMPT'S CTRL-C).
         exec {__aterm_tty_probe_fd}< <(__aterm_tty_read; print -rn -- "$REPLY")
+        zle -F $__aterm_tty_probe_fd __aterm_tty_probe_ready 2>/dev/null
     fi
     (( __aterm_tty_probe_fd )) || __aterm_tty_repair
     local __aterm_tty_name
@@ -1031,6 +1180,7 @@ __aterm_body_precmd() {
     # after that, fork-free while frozen, and one probe after a failed command
     # where the user's own definitions ruled the freeze out.
     (( ! __aterm_tty_probe_fd )) || __aterm_tty_repair
+    (( ! __aterm_tty_owed )) || { __aterm_tty_owed=0; builtin ttyctl -f }
     (( __aterm_tty_armed )) || __aterm_tty_arm
     (( __aterm_tty_frozen || last_status == 0 )) || __aterm_tty_repair
 
@@ -1118,8 +1268,10 @@ __aterm_preexec() {
     typeset -g __aterm_in_command=1
 
     # A fresh shell's tty, repaired before its first command runs (see "A FRESH
-    # SHELL'S FIRST PROMPT").
+    # SHELL'S FIRST PROMPT"), and frozen again where the first prompt's repair
+    # left it thawed (THE FIRST PROMPT'S CTRL-C).
     (( ! __aterm_tty_probe_fd )) || __aterm_tty_repair
+    (( ! __aterm_tty_owed )) || { __aterm_tty_owed=0; builtin ttyctl -f }
 
     # The managed dirs, live — BEFORE this command resolves: a `claude` typed at a
     # prompt that was drawn before atpkg laid agents/ must already run the twin.
@@ -1130,10 +1282,12 @@ __aterm_preexec() {
     __aterm_encode_cmd "$1"
     __aterm_osc "633;E;${REPLY}${__aterm_id_suffix_str}"
 
-    # Set tab title to running command (OSC 0).
-    # Truncate to first 64 chars and strip control characters.
-    local cmd="${1:0:64}"
+    # Set tab title to running command (OSC 0): the line, control characters
+    # stripped, at most 256 characters; a longer one is its first 255 and `…`, so
+    # the tab knows its end is cut off (the bash script's "The command title").
     if [[ -z "${ATERM_DISABLE_PROMPT_TITLES:-}" ]]; then
+        local cmd="$1"
+        (( ${#cmd} <= 256 )) || cmd="${cmd:0:255}…"
         __aterm_osc "0;${cmd//[[:cntrl:]]/}"
     fi
 
@@ -1499,7 +1653,8 @@ __aterm_start_mark() {
 # A WARM spare's hold: its startup files have run (unseen, told `run` at the
 # parked hold), and it waits here, at the top of its first prompt hook, before any
 # prompt work, clock, git segment or history-dependent expansion. A discard's
-# hang-up writes no history (SAVEHIST is 0 while held). Released by `go`, it
+# hang-up writes no history (SAVEHIST is 0 while held, unless the rc made it
+# readonly: then it is left as it is). Released by `go`, it
 # carries `$SECONDS` on from the rc's run and leaves `__aterm_spare_reload` set
 # when the history file moved meanwhile. Nothing here touches the tty, so what
 # is typed before the release waits there for zle.
@@ -1508,6 +1663,7 @@ __aterm_spare_hold() {
     emulate -L zsh
     local __aterm_rc=$SECONDS __aterm_hs0="" __aterm_go="" __aterm_ss=${SAVEHIST-}
     local -i __aterm_n=0 __aterm_ss_set=${+SAVEHIST}
+    [[ ${(t)SAVEHIST} != *readonly* ]] || __aterm_ss_set=2
     local -A __aterm_h
     # The history stamp needs zsh/stat LOADED, which a session shell defers to
     # its first atpkg hook (`__aterm_atpkg_hook_stamp`): loaded here, in the
@@ -1517,7 +1673,7 @@ __aterm_spare_hold() {
        zstat -H __aterm_h -- "$HISTFILE" 2>/dev/null; then
         __aterm_hs0="${__aterm_h[mtime]}:${__aterm_h[size]}:${__aterm_h[inode]}"
     fi
-    SAVEHIST=0
+    (( __aterm_ss_set == 2 )) || SAVEHIST=0
     __aterm_start_mark spare
     while :; do
         if IFS= read -r __aterm_go < "$__aterm_spare_fifo"; then
@@ -1527,7 +1683,10 @@ __aterm_spare_hold() {
         fi
     done 2>/dev/null
     unset __aterm_spare_mode __aterm_spare_fifo
-    if (( __aterm_ss_set )); then SAVEHIST=$__aterm_ss; else unset SAVEHIST; fi
+    case $__aterm_ss_set in
+        1) SAVEHIST=$__aterm_ss ;;
+        0) unset SAVEHIST ;;
+    esac
     typeset -g __aterm_spare_reload=""
     if [[ -n ${HISTFILE-} ]]; then
         __aterm_h=()
@@ -1547,16 +1706,19 @@ __aterm_spare_hold() {
 
 # After the release, with the user's options: the history read again exactly as
 # a cold start reads it when the file moved during the hold (the stale list is
-# pushed under with SAVEHIST 0, so it is never written), then the precmd hooks
+# pushed under with SAVEHIST 0, so it is never written, and a SAVEHIST the rc
+# unset is unset again after; not where HISTFILE or
+# SAVEHIST is readonly, which `fc -p` and that 0 would assign), then the precmd hooks
 # that ran ahead of aterm's at spare time run again, silenced, each with the `$?`
 # the rc left — what an Enter on an empty line does — so direnv, mise and their
 # like reflect the moment the tab was asked for.
 __aterm_spare_rerun() {
     : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
-    if [[ -n ${__aterm_spare_reload-} ]]; then
-        local __aterm_hf=$HISTFILE __aterm_hz=$HISTSIZE __aterm_hss=${SAVEHIST-}
+    if [[ -n ${__aterm_spare_reload-} && ${(t)HISTFILE-}${(t)SAVEHIST-} != *readonly* ]]; then
+        local __aterm_hf=$HISTFILE __aterm_hz=$HISTSIZE __aterm_hss=${SAVEHIST-} __aterm_hss_set=${+SAVEHIST}
         SAVEHIST=0
         fc -p "$__aterm_hf" "$__aterm_hz" "$__aterm_hss"
+        [[ $__aterm_hss_set == 1 ]] || unset SAVEHIST
     fi
     unset __aterm_spare_reload
     local __aterm_f

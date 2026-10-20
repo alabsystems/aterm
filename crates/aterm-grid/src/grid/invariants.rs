@@ -176,8 +176,8 @@ impl Grid {
         );
     }
 
-    /// RowsNonEmpty + RingHeadValid + TotalLinesValid + TotalLinesMinimum:
-    /// ring buffer structural invariants.
+    /// RowsNonEmpty + RingHeadValid + TotalLinesValid + TotalLinesMinimum +
+    /// RingExtrasAligned: ring buffer structural invariants.
     #[cfg(any(debug_assertions, test))]
     fn assert_ring_buffer_valid(&self) {
         // The ring always has a row (the constructor enforces rows.max(1));
@@ -217,6 +217,13 @@ impl Grid {
             self.storage.ring_head,
             self.storage.total_lines,
             self.storage.rows.len()
+        );
+        // One extras slot per ring history row, oldest first: a slot missing or
+        // left over moves history rows' links and graphemes onto their neighbours.
+        assert_eq!(
+            self.storage.ring_extras.len(),
+            self.storage.ring_buffer_scrollback(),
+            "RingExtrasAligned violated: ring_extras.len() != ring_buffer_scrollback()"
         );
     }
 }

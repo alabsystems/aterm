@@ -377,15 +377,46 @@ impl Corpus {
         );
 
         let seam = divider_cell(self.app.theme);
+        // The Fluent split (Windows) draws its seam as hairline glyphs in the
+        // gap (`crate::pane_chrome::stamp_seam_lines`) and its ring as overlay
+        // pixels beside them (`crate::pane_chrome::push_focus_ring`), whose
+        // pixel columns stand for the mark's here; the Classic one as the slab
+        // and the half-block mark.
+        let fluent = crate::pane_chrome::split_chrome() == crate::pane_chrome::SplitChrome::Fluent;
+        let inks = crate::pane_chrome::SeamInks::derive(
+            self.app
+                .chrome_palette(crate::app_render::ChromeSurface::Grid),
+            self.app
+                .chrome_palette(crate::app_render::ChromeSurface::Header),
+        );
+        let hairline = |ch: char| ('\u{2500}'..='\u{257f}').contains(&ch);
         let (mut ring_columns, mut seam_seen, mut stale) = (Vec::new(), false, Vec::new());
         {
             let ws = &self.app.windows[&self.wid];
+            if fluent {
+                let ring = (u32::from(inks.ring[0]) << 16)
+                    | (u32::from(inks.ring[1]) << 8)
+                    | u32::from(inks.ring[2]);
+                let cw = self.app.win_cell_size(self.wid).0;
+                ring_columns.extend(
+                    ws.pane_overlay
+                        .pending_quads()
+                        .iter()
+                        .filter(|q| q.alpha == 255 && q.color == ring && usize::from(q.w) < cw)
+                        .map(|q| usize::from(q.x)),
+                );
+            }
             for (r, row) in ws.input_scratch.cells.iter().enumerate() {
                 for (c, cell) in row.iter().enumerate() {
-                    if MARK_GLYPHS.contains(&cell.ch) {
+                    let (ringed, plain) = if fluent {
+                        (false, hairline(cell.ch) && cell.fg == inks.line)
+                    } else {
+                        (MARK_GLYPHS.contains(&cell.ch), *cell == seam)
+                    };
+                    if ringed {
                         ring_columns.push(c);
                     }
-                    if *cell == seam {
+                    if plain {
                         seam_seen = true;
                     }
                     if *cell == poison_cell() {

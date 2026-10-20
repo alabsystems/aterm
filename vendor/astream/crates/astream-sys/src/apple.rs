@@ -45,7 +45,7 @@ pub(crate) fn barrier_fsync(file: &File) -> io::Result<()> {
 /// The raw `kern.bootsessionuuid` answer (the UUID text and its NUL), or `None` when
 /// the call fails. The buffer leaves room past a UUID's 37 bytes: a longer answer is
 /// refused by the kernel (`ENOMEM`), never truncated, and reads `None`.
-pub(crate) fn boot_session_uuid() -> Option<Vec<u8>> {
+pub(crate) fn boot_session_uuid() -> Option<[u8; 64]> {
     let mut buf = [0u8; 64];
     let mut len = buf.len();
     let len_ptr = std::slice::from_mut(&mut len).as_mut_ptr();
@@ -56,8 +56,8 @@ pub(crate) fn boot_session_uuid() -> Option<Vec<u8>> {
         std::ptr::null_mut(),
         0
     ));
-    if rc != 0 {
+    if rc != 0 || len > buf.len() {
         return None;
     }
-    buf.get(..len).map(<[u8]>::to_vec)
+    Some(buf)
 }

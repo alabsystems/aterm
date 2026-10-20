@@ -23,3 +23,10 @@ aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+[features]
+# The counting seam (`seam`) in an optimized build. A test or debug build of this
+# crate has it anyway; a dependent whose tests reach it (the recording, or the
+# test arm's `durable_fsync`) turns this on from its dev-dependencies, so its
+# `--release` test targets build too, and nothing a shipped binary links does.
+test-support = []

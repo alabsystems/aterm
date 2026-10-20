@@ -281,6 +281,7 @@ impl App {
                 Some(path) => format!("file path={path:?}"),
                 None => "file".to_string(),
             },
+            ThemeSource::Pack(_) => "pack".to_string(),
             ThemeSource::DefaultFallback { .. } => "default".to_string(),
         };
         let misses = crate::app_config::theme_misses(&self.config, themes);
@@ -445,13 +446,13 @@ impl App {
             .find_map(|side| {
                 match self
                     .config
-                    .resolved_colors(side, &self.config_assets.themes, Some(id))
+                    .resolved_colors_previewing(side, &self.config_assets.themes, Some(id))
                     .source
                 {
                     ThemeSource::DefaultFallback { reason } => {
                         Some(format!("unavailable ({reason}); nothing changed"))
                     }
-                    ThemeSource::Builtin | ThemeSource::File(_) => None,
+                    ThemeSource::Builtin | ThemeSource::File(_) | ThemeSource::Pack(_) => None,
                 }
             })
     }
@@ -608,7 +609,8 @@ impl App {
     /// preview stands until the write's reload ends it, so the screen does not
     /// fall back to the old theme in between.
     fn commit_theme_preview(&mut self, reply: std::sync::mpsc::Sender<Result<String, String>>) {
-        self.commit_theme_preview_with(reply, |app, id, request_id, reply| {
+        let dir = aterm_types::scheme::user_theme_dir();
+        self.commit_theme_preview_into(dir.as_deref(), reply, |app, id, request_id, reply| {
             app.queue_control_settings_field_admitted(
                 crate::prefs::EDIT_THEME.to_string(),
                 Some(id),
@@ -616,6 +618,70 @@ impl App {
                 request_id,
             )
         });
+    }
+
+    /// Commit the standing preview, first installing into `dir` the
+    /// community pack file a pack-only preview draws
+    /// ([`Self::install_pack_preview`]), so the `theme` written names a theme
+    /// the catalog holds. A failed install refuses the commit and leaves the
+    /// preview standing.
+    pub(crate) fn commit_theme_preview_into(
+        &mut self,
+        dir: Option<&std::path::Path>,
+        reply: std::sync::mpsc::Sender<Result<String, String>>,
+        queue: impl FnOnce(
+            &mut Self,
+            String,
+            u64,
+            std::sync::mpsc::Sender<Result<String, String>>,
+        ) -> Option<u64>,
+    ) {
+        if let Some(id) = self.theme_preview.as_ref().map(|p| p.id.clone())
+            && let Err(why) = self.install_pack_preview(&id, dir)
+        {
+            let _ = reply.send(Err(format!("theme commit {id:?}: {why}")));
+            return;
+        }
+        self.commit_theme_preview_with(reply, queue);
+    }
+
+    /// Install the community pack file each side of selector `id` draws from
+    /// the embedded pack ([`ThemeSource::Pack`]) into `dir`, then read the
+    /// folder into the catalog at once (not on the watcher's next poll). A
+    /// selector the catalog already draws writes nothing.
+    pub(crate) fn install_pack_preview(
+        &mut self,
+        id: &str,
+        dir: Option<&std::path::Path>,
+    ) -> Result<(), String> {
+        let mut pack_ids = Vec::new();
+        for side in [Appearance::Dark, Appearance::Light] {
+            if let ThemeSource::Pack(pack_id) = self
+                .config
+                .resolved_colors_previewing(side, &self.config_assets.themes, Some(id))
+                .source
+                && !pack_ids.contains(&pack_id)
+            {
+                pack_ids.push(pack_id);
+            }
+        }
+        if pack_ids.is_empty() {
+            return Ok(());
+        }
+        let dir = dir.ok_or_else(|| {
+            "no themes folder: neither XDG_CONFIG_HOME, APPDATA nor HOME is set".to_string()
+        })?;
+        for pack_id in &pack_ids {
+            match crate::settings_themes_host::add_pack_into(dir, pack_id) {
+                crate::native_app::ThemesOutcome::Added { .. } => {}
+                crate::native_app::ThemesOutcome::Failed { message } => return Err(message),
+                other => return Err(format!("could not add {pack_id}: {other:?}")),
+            }
+        }
+        let catalog = crate::app_config::ThemeCatalog::try_discover_in(dir)
+            .map_err(|_| "the themes folder could not be read after the install".to_string())?;
+        self.reload_theme_catalog(std::sync::Arc::new(catalog));
+        Ok(())
     }
 
     /// The same preview commit with the queue handoff injected: tests can keep

@@ -48,6 +48,12 @@
 //! blind discovery dials), and a presented token with no active terminal
 //! context to check it against as an edge.
 //!
+//! THE FLEET'S REFUSALS ([`FLEET_REFUSALS`], `crate::fleet_listen`, and
+//! [`FLEET_GATE_DENIALS`]) keep the same rule in runs of their own: every
+//! remote peer's refusals are ONE run there ([`AuthDenials::record_network`]),
+//! since a remote dialer can change its address at will where a local one
+//! cannot change its user.
+//!
 //! DYNAMIC, NEVER A GATE: there is no fixed window or cap. The spacing grows
 //! with the run's measured count and restarts on the run's measured quiet.
 //! Nothing is blocked or delayed — the thinning only decides which refusals are
@@ -160,6 +166,18 @@ pub(crate) struct AuthDenials {
 /// This process's runs: the control server's handshake records through it.
 pub(crate) static AUTH_DENIALS: AuthDenials = AuthDenials::new();
 
+/// The fleet listener's refusals (`crate::fleet_listen`), counted apart from
+/// the local socket's — a remote peer's flood is never a local program's run,
+/// nor the other way round — and thinned by the network rule in a run of
+/// their own.
+pub(crate) static FLEET_REFUSALS: AuthDenials = AuthDenials::new();
+
+/// The fleet gate's refusals of a proved peer's line (`control::fleet_refusal`),
+/// thinned by the same network rule in a run of their own, apart from the
+/// listener's refusals of peers that proved nothing.
+#[cfg(any(unix, test))]
+pub(crate) static FLEET_GATE_DENIALS: AuthDenials = AuthDenials::new();
+
 impl AuthDenials {
     pub(crate) const fn new() -> Self {
         Self {
@@ -197,6 +215,32 @@ impl AuthDenials {
             Written::Nth { count, span } => format!(
                 "{reason} ({count} from this program in {span:.1?}, {total} since launch; {peer})"
             ),
+        })
+    }
+
+    /// Count one refusal of a network listener at `now` and return
+    /// its line — `line`, the refusal's own, which names the peer and why —
+    /// when THIS one is to be written, with the run's count past the first, or
+    /// `None` when it is only counted.
+    ///
+    /// Every peer's refusals are ONE run, thinned by the rule the local
+    /// socket's are: a run per program works where the programs are this
+    /// user's, but an address is no identity a remote dialer cannot change
+    /// (one IPv6 /64 holds 2^64), and a run per address would write every new
+    /// one at once. So a flood writes its 1st, 2nd, 4th … refusal, from
+    /// whatever addresses, and a refusal after a quiet longer than twice the
+    /// run's span is written at once and starts a new run.
+    pub(crate) fn record_network(&self, line: &str, now: Instant) -> Option<String> {
+        let (written, total) = self.count(KINDS.len(), None, now)?;
+        Some(match written {
+            // One run, never dropped: a peer of its own is the first refusal.
+            Written::First | Written::Peer { .. } => line.to_owned(),
+            Written::Quiet(quiet) => {
+                format!("{line} (again after {quiet:.1?} quiet; {total} since launch)")
+            }
+            Written::Nth { count, span } => {
+                format!("{line} ({count} refused in {span:.1?}, {total} since launch)")
+            }
         })
     }
 
@@ -264,6 +308,12 @@ impl AuthDenials {
             .position(|k| *k == reason)
             .unwrap_or(KINDS.len());
         self.kinds.lock().unwrap_or_else(|p| p.into_inner())[slot].total
+    }
+
+    /// Refusals [`Self::record_network`] counted since this instance started.
+    #[cfg(test)]
+    pub(crate) fn network_total(&self) -> u64 {
+        self.kinds.lock().unwrap_or_else(|p| p.into_inner())[KINDS.len()].total
     }
 }
 
@@ -447,5 +497,48 @@ mod tests {
         assert_eq!(refuse("AUTH abab"), NO_CONTEXT);
         assert_eq!(refuse("TOKEN abab sessions"), NO_CONTEXT);
         assert_eq!(refuse("AUTHX abab"), NO_TOKEN);
+    }
+
+    /// THE AUDIT FLOOD: an unauthenticated peer that opens and closes a
+    /// connection a millisecond, from a new address each time, writes the 1st,
+    /// 2nd, 4th … of its refusals, each saying how many there were, not one line
+    /// per connection. A refusal after a quiet longer than the run is written
+    /// at once, and a run's first line is the refusal's own.
+    #[test]
+    fn a_flood_of_network_refusals_is_one_thinned_run() {
+        let refusals = AuthDenials::new();
+        let t0 = Instant::now();
+        let line = |i: u64| {
+            format!(
+                "fleet: 198.51.100.{}:{} not admitted: received corrupt message",
+                1 + i % 250,
+                10_000 + i
+            )
+        };
+        let written: Vec<String> = (0..1000_u64)
+            .filter_map(|i| refusals.record_network(&line(i), t0 + Duration::from_millis(i)))
+            .collect();
+        assert_eq!(
+            written.len(),
+            10,
+            "the 1st, 2nd, 4th … 512th of 1000 refusals: {written:#?}"
+        );
+        assert_eq!(written[0], line(0), "the first refusal is written as it is");
+        assert_eq!(
+            written[9],
+            format!("{} (512 refused in 511.0ms, 512 since launch)", line(511))
+        );
+        assert_eq!(refusals.network_total(), 1000);
+
+        // Ten minutes of quiet: the next refusal starts a new run, written.
+        let later = t0 + Duration::from_secs(600);
+        let again = refusals
+            .record_network("fleet: 198.51.100.251:4242 not admitted: no proof", later)
+            .expect("a refusal after a long quiet is written");
+        assert!(
+            again.starts_with("fleet: 198.51.100.251:4242 not admitted: no proof (again after ")
+                && again.ends_with("quiet; 1001 since launch)"),
+            "{again}"
+        );
     }
 }

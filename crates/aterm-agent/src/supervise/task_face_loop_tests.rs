@@ -7,8 +7,9 @@
 // start, then where a point moves it (landed, done, theirs, spent) and at the
 // first live read of someone else's turn — and the landing a loop before
 // this one landed, read back from the journal beside the ledger
-// (`landed_before`), so a restart types no land instruction into finished
-// work, and never takes someone else's later done turn for the landing. Each
+// (`ended_before`, a done likewise, its time kept), so a restart types no
+// land instruction into finished work, and never takes someone else's later
+// done turn for the landing. Each
 // behaviour has its negative control. Included from `run_tests.rs` (`mod
 // task_face_loop`), so the `Mock` and its helpers are in scope.
 
@@ -25,12 +26,22 @@ const PROGRESS: &str = "Committing the parser now; the lexer is next.";
 #[derive(Debug, Default)]
 struct Faces {
     told: Mutex<Vec<TaskFace>>,
+    /// The faces told restated from the journal, with their note's time
+    /// ([`IdleHost::task_face_noted`]); each is in `told` too.
+    noted: Mutex<Vec<(TaskFace, i64)>>,
     lifted: bool,
 }
 
 impl Faces {
     fn told(&self) -> Vec<TaskFace> {
         self.told
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn noted(&self) -> Vec<(TaskFace, i64)> {
+        self.noted
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -55,6 +66,13 @@ impl IdleHost for Faces {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(face);
+    }
+    fn task_face_noted(&self, face: TaskFace, noted_ms: i64) {
+        self.noted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((face, noted_ms));
+        self.task_face(face);
     }
 }
 
@@ -130,7 +148,7 @@ fn run_kept(
         },
         journal: ledger.map(crate::supervise::approvals::journal_beside),
         idle_host: Some(Arc::clone(host) as Arc<dyn IdleHost>),
-        ..auto(30, None)
+        ..auto(30)
     };
     let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
         s.set_turn_end_timing(TurnEndTiming {
@@ -634,6 +652,435 @@ fn a_landings_point_said_again_is_read_by_its_words_never_its_seq() {
     assert_eq!(got, None, "by its seq the point is another one");
 }
 
+/// A DONE OF ANY KIND IS READ BACK AS DONE, A LANDING AS LANDED
+/// (`ended_before`, the done's seed of §10.2.7): the last note of a task's
+/// end is the worker's `FINISHED` (`rule=finished@v1`), the done check's or
+/// the open-items challenge's `DONE`, and nothing typed or judged came after
+/// it — a done, its point's mark with it; the land's `DONE` is a landing,
+/// and the last of the two notes is the one read. NEGATIVE CONTROLS: a
+/// person's `LEFT` as the last end, a typed row after the note, another
+/// reply's point after it, and another session's note each seed nothing.
+#[test]
+fn a_done_of_any_kind_is_read_back_as_done_and_a_landing_as_landed() {
+    let min = |n: u64| Duration::from_secs(60 * n);
+    let mark = said_mark(Some(TOKEN_REPLY));
+    let theirs = said_mark(Some(THEIR_TOKEN_REPLY));
+    assert!(mark.is_some() && mark != theirs);
+    let finished = "DONE seq=104 rule=finished@v1 the worker reported ATERM-TASK-DONE: its task \
+         is finished; nothing more is typed until a person or an orchestrator types";
+    let check = "DONE seq=104 rule=continue-done-check@v1 the worker said it is done after the \
+         done check: nothing more is typed until a person or an orchestrator types";
+    let open_items = "DONE seq=104 rule=continue-open-items@v1 the worker said it is done after \
+         the open-items challenge: nothing more is typed until a person or an orchestrator types";
+    let left = "LEFT seq=104 rule=left-to-person@v1 a person's own exchange (their message, \
+         answered within 10 min): nothing is typed until the next turn ends";
+    let read =
+        |tag: &str, ledger: &[String], notes: &[&str], after: &[String], sid: Option<&str>| {
+            // Each note after its point, as the loop writes them.
+            let mut journal: Vec<String> = notes
+                .iter()
+                .flat_map(|n| {
+                    [
+                        marked_row("EVENT idle seq=104 ATERM-TASK-DONE", min(9), sid, mark),
+                        journal_row(n, min(9), sid),
+                    ]
+                })
+                .collect();
+            journal.extend_from_slice(after);
+            let (dir, path) = files(tag, ledger, &journal);
+            let typed = crate::supervise::approvals::typed_at(&path, None);
+            let journal =
+                std::fs::read_to_string(crate::supervise::approvals::journal_beside(&path))
+                    .unwrap_or_default();
+            let got = ended_before(&journal, None, typed.last().copied())
+                .map(|(face, words, _)| (face, words));
+            let _ = std::fs::remove_dir_all(&dir);
+            got
+        };
+    let earlier = [ledger_row("continue@v1", "keep going", min(10))];
+    for note in [finished, check, open_items] {
+        assert_eq!(
+            read("ended-done", &earlier, &[note], &[], None),
+            Some((TaskFace::Done, mark)),
+            "{note}"
+        );
+    }
+    assert_eq!(
+        read("ended-land", &earlier, &[LANDED_NOTE], &[], None),
+        Some((TaskFace::Landed, mark))
+    );
+    assert_eq!(
+        read(
+            "ended-land-then-done",
+            &earlier,
+            &[LANDED_NOTE, finished],
+            &[],
+            None
+        ),
+        Some((TaskFace::Done, mark)),
+        "the last end is the one read"
+    );
+    assert_eq!(
+        read(
+            "ended-done-then-land",
+            &earlier,
+            &[finished, LANDED_NOTE],
+            &[],
+            None
+        ),
+        Some((TaskFace::Landed, mark))
+    );
+    // NEGATIVE CONTROLS.
+    assert_eq!(
+        read("ended-left", &earlier, &[finished, left], &[], None),
+        None
+    );
+    let typed = [
+        earlier[0].clone(),
+        ledger_row("continue@v1", "keep going", min(2)),
+    ];
+    assert_eq!(read("ended-typed", &typed, &[finished], &[], None), None);
+    let point = marked_row("EVENT idle seq=9 ATERM-TASK-DONE", min(5), None, theirs);
+    assert_eq!(
+        read("ended-their-point", &earlier, &[finished], &[point], None),
+        None
+    );
+    let own = marked_row("EVENT idle seq=9 ATERM-TASK-DONE", min(5), None, mark);
+    assert_eq!(
+        read("ended-own-point", &earlier, &[finished], &[own], None),
+        Some((TaskFace::Done, mark)),
+        "its own point said again keeps it"
+    );
+    assert_eq!(
+        read("ended-sid", &earlier, &[finished], &[], Some("s-other")),
+        None
+    );
+}
+
+/// The first loop of a CRUISE DONE over the ledger and journal of `tag`: the
+/// job's progress, a continuation, the worker's token — `DONE …
+/// rule=finished@v1` — told open then done, one turn typed. The files' dir
+/// and ledger.
+fn finished_first(tag: &str) -> (PathBuf, PathBuf) {
+    let (dir, ledger) = files(tag, &[], &[]);
+    let host = Arc::new(Faces::default());
+    let screens = vec![
+        busy_screen(),
+        ended(PROGRESS),
+        busy_screen(),
+        ended(TOKEN_REPLY),
+    ];
+    let (lines, turns) = run(screens, "cruise", vec![1], &host, Some(&ledger), None);
+    assert_eq!(turns, 1, "{tag}: {lines:#?}");
+    assert_eq!(host.told(), [TaskFace::Open, TaskFace::Done], "{tag}");
+    assert!(
+        journal_lines(&ledger)
+            .iter()
+            .any(|l| l.starts_with("DONE ") && l.contains(" rule=finished@v1 ")),
+        "{tag}: {lines:#?}"
+    );
+    (dir, ledger)
+}
+
+/// A RESTARTED DONE IS RESTATED, ITS TIME KEPT (the review of 2026-10-17,
+/// owner-eye-4: the done clock was stamped again at a supervision restart):
+/// a Cruise task done, then its loop restarted — in place, or as the
+/// session's Off lifts under Cruise or under Land — is told `done` at its
+/// start and nothing more over the same reply, and nothing is typed. The
+/// window keeps a held face's time across the host's "unknown" when the
+/// same face follows, and a move from open is what it stamps anew. NEGATIVE
+/// CONTROLS: a typed row after the note seeds nothing (open, then done);
+/// someone else's done turn that no loop watched (another reply's words)
+/// withdraws the seed — told open, then the new done, which the window
+/// stamps anew; a reply that moved on drops it (open).
+#[test]
+fn a_restarted_done_is_restated_and_typed_nothing() {
+    // In place.
+    let (dir, ledger) = finished_first("done-restart-plain");
+    let host = Arc::new(Faces::default());
+    let (lines, turns) = run(
+        vec![ended(TOKEN_REPLY)],
+        "cruise",
+        Vec::new(),
+        &host,
+        Some(&ledger),
+        None,
+    );
+    assert_eq!(
+        (host.told(), turns),
+        (vec![TaskFace::Done], 0),
+        "{lines:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    // As Off lifts, under Cruise and under Land, twice over.
+    for word in ["cruise", "land"] {
+        let (dir, ledger) = finished_first(&format!("done-restart-{word}"));
+        for again in 0..2 {
+            let (told, turns, added, lines) = after_off(&ledger, word, TOKEN_REPLY);
+            let log = format!("{added:#?}\n{lines:#?}");
+            assert_eq!(told, [TaskFace::Done], "{word} {again}: {log}");
+            assert_eq!(turns, 0, "{word} {again}: nothing typed: {log}");
+            assert!(!added.iter().any(|l| landed_note(l)), "{word}: {log}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // NEGATIVE CONTROL: a typed row after the note.
+    let (dir, ledger) = finished_first("done-restart-typed");
+    std::thread::sleep(Duration::from_millis(5));
+    let mut rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+    rows.push_str(&ledger_row("continue@v1", "keep going", Duration::ZERO));
+    rows.push('\n');
+    std::fs::write(&ledger, rows).expect("ledger");
+    let (told, _, _, lines) = after_off(&ledger, "cruise", TOKEN_REPLY);
+    assert_eq!(told, [TaskFace::Open, TaskFace::Done], "{lines:#?}");
+    let _ = std::fs::remove_dir_all(&dir);
+    // NEGATIVE CONTROL: someone else's done turn no loop watched.
+    let (dir, ledger) = finished_first("done-restart-theirs");
+    let (told, turns, _, lines) = after_off(&ledger, "cruise", THEIR_TOKEN_REPLY);
+    assert_eq!(
+        (told, turns),
+        (vec![TaskFace::Done, TaskFace::Open, TaskFace::Done], 0),
+        "withdrawn, then the new done: {lines:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    // NEGATIVE CONTROL: the reply moved on.
+    let (dir, ledger) = finished_first("done-restart-moved");
+    let (told, _, _, lines) = after_off(&ledger, "cruise", PROGRESS);
+    assert_eq!(told, [TaskFace::Done, TaskFace::Open], "{lines:#?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The wall time (unix ms) of the last `DONE … rule=<rule>` note in the
+/// journal beside `ledger`.
+fn note_time(ledger: &Path, rule: &str) -> i64 {
+    let (records, _) = crate::supervise::journal::read_journal(
+        &crate::supervise::approvals::journal_beside(ledger),
+    )
+    .expect("journal");
+    records
+        .iter()
+        .rev()
+        .find(|r| r.line.starts_with("DONE ") && r.line.contains(&format!(" rule={rule} ")))
+        .map(|r| r.t)
+        .expect("the end's note")
+}
+
+/// A RESTATED END CARRIES THE TIME ITS NOTE WAS JOURNALED (§10.2.7; the
+/// review of the done's seed: a seamless update's new window holds no face
+/// of the session, so the done or the landing a restarted loop restated was
+/// stamped with the update's clock there): a restarted loop over a Cruise
+/// done, and over a landing whose note is nine minutes old, tells its start
+/// face through `IdleHost::task_face_noted` with the `t` of the journal's
+/// note of that end — and every other face through `task_face` alone.
+/// NEGATIVE CONTROLS: a fresh loop, and a restart after a typed row (no
+/// seed: open at the start), tell nothing with a time; a seed withdrawn at
+/// the first point (another reply's done) tells only the restated start
+/// with the note's time — the new done after it goes without, so a window
+/// stamps it at its own time.
+#[test]
+fn a_restated_end_carries_the_time_its_note_was_journaled() {
+    let min = |n: u64| Duration::from_secs(60 * n);
+    // A done, restarted in place.
+    let (dir, ledger) = finished_first("noted-done");
+    let at = note_time(&ledger, "finished@v1");
+    let host = Arc::new(Faces::default());
+    let (lines, _) = run(
+        vec![ended(TOKEN_REPLY)],
+        "cruise",
+        Vec::new(),
+        &host,
+        Some(&ledger),
+        None,
+    );
+    assert_eq!(host.told(), [TaskFace::Done], "{lines:#?}");
+    assert_eq!(host.noted(), [(TaskFace::Done, at)], "{lines:#?}");
+    let _ = std::fs::remove_dir_all(&dir);
+    // A landing noted nine minutes back, restarted under Land.
+    let (dir, path) = files(
+        "noted-landed",
+        &[ledger_row(RULE_LAND, "land", min(10))],
+        &[journal_row(LANDED_NOTE, min(9), None)],
+    );
+    let at = note_time(&path, RULE_LAND);
+    assert!(at < crate::supervise::journal::unix_ms() - 8 * 60_000);
+    let host = Arc::new(Faces::default());
+    let (lines, turns) = run(
+        vec![ended(TOKEN_REPLY)],
+        "land",
+        Vec::new(),
+        &host,
+        Some(&path),
+        None,
+    );
+    assert_eq!(turns, 0, "{lines:#?}");
+    assert_eq!(host.noted(), [(TaskFace::Landed, at)], "{lines:#?}");
+    let _ = std::fs::remove_dir_all(&dir);
+    // NEGATIVE CONTROL: a fresh loop.
+    let (dir, path) = files("noted-fresh", &[], &[]);
+    let host = Arc::new(Faces::default());
+    run(
+        vec![busy_screen(), ended(TOKEN_REPLY)],
+        "cruise",
+        Vec::new(),
+        &host,
+        Some(&path),
+        None,
+    );
+    assert_eq!(host.told(), [TaskFace::Open, TaskFace::Done]);
+    assert_eq!(host.noted(), []);
+    let _ = std::fs::remove_dir_all(&dir);
+    // NEGATIVE CONTROL: a typed row after the note.
+    let (dir, ledger) = finished_first("noted-typed");
+    std::thread::sleep(Duration::from_millis(5));
+    let mut rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+    rows.push_str(&ledger_row("continue@v1", "keep going", Duration::ZERO));
+    rows.push('\n');
+    std::fs::write(&ledger, rows).expect("ledger");
+    let host = Arc::new(Faces::default());
+    run(
+        vec![ended(TOKEN_REPLY)],
+        "cruise",
+        Vec::new(),
+        &host,
+        Some(&ledger),
+        None,
+    );
+    assert_eq!(host.told()[0], TaskFace::Open);
+    assert_eq!(host.noted(), []);
+    let _ = std::fs::remove_dir_all(&dir);
+    // NEGATIVE CONTROL: the seed withdrawn by another reply's done.
+    let (dir, ledger) = finished_first("noted-theirs");
+    let at = note_time(&ledger, "finished@v1");
+    let host = Arc::new(Faces {
+        lifted: true,
+        ..Faces::default()
+    });
+    let (lines, _) = run(
+        vec![ended(THEIR_TOKEN_REPLY)],
+        "cruise",
+        Vec::new(),
+        &host,
+        Some(&ledger),
+        None,
+    );
+    assert_eq!(
+        host.told(),
+        [TaskFace::Done, TaskFace::Open, TaskFace::Done],
+        "{lines:#?}"
+    );
+    assert_eq!(host.noted(), [(TaskFace::Done, at)], "only the start");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The last `DONE …` note in the journal beside `ledger`.
+fn last_done(ledger: &Path) -> crate::supervise::journal::JournalRecord {
+    let (records, _) = crate::supervise::journal::read_journal(
+        &crate::supervise::approvals::journal_beside(ledger),
+    )
+    .expect("journal");
+    records
+        .into_iter()
+        .rev()
+        .find(|r| r.line.starts_with("DONE "))
+        .expect("a DONE note")
+}
+
+/// A RESTATED END'S NOTE CARRIES ITS FIRST TIME FORWARD (§10.2.7): every
+/// restarted loop journals the end again at its first point — its note must
+/// be newer than the point record that loop wrote, or no loop after it could
+/// seed — and that note keeps the time the end was FIRST noted
+/// (`JournalRecord::ended`), so the loop after a restart and then another
+/// (a seamless update, say) restates the done, and the landing, with the
+/// first time rather than the last restart's. NEGATIVE CONTROLS: the first
+/// loop's own note carries none; a done withdrawn by another reply's done is
+/// a new end — its note carries none, and the loop after it restates it at
+/// its own time.
+#[test]
+fn a_restated_ends_note_carries_its_first_time_forward() {
+    let min = |n: u64| Duration::from_secs(60 * n);
+    // A done, restarted twice.
+    let (dir, ledger) = finished_first("chain-done");
+    let first = last_done(&ledger);
+    assert_eq!(first.ended, None, "the first loop's own end");
+    for again in 0..2 {
+        std::thread::sleep(Duration::from_millis(5));
+        let host = Arc::new(Faces::default());
+        let (lines, turns) = run(
+            vec![ended(TOKEN_REPLY)],
+            "cruise",
+            Vec::new(),
+            &host,
+            Some(&ledger),
+            None,
+        );
+        assert_eq!(turns, 0, "{again}: {lines:#?}");
+        assert_eq!(
+            host.noted(),
+            [(TaskFace::Done, first.t)],
+            "{again}: the first time: {lines:#?}"
+        );
+        let note = last_done(&ledger);
+        assert!(note.t > first.t, "{again}: restated again: {note:?}");
+        assert_eq!(note.ended, Some(first.t), "{again}: {note:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    // A landing noted nine minutes back, restarted twice under Land.
+    let (dir, path) = files(
+        "chain-landed",
+        &[ledger_row(RULE_LAND, "land", min(10))],
+        &[journal_row(LANDED_NOTE, min(9), None)],
+    );
+    let at = note_time(&path, RULE_LAND);
+    for again in 0..2 {
+        let host = Arc::new(Faces::default());
+        let (lines, turns) = run(
+            vec![ended(TOKEN_REPLY)],
+            "land",
+            Vec::new(),
+            &host,
+            Some(&path),
+            None,
+        );
+        assert_eq!(turns, 0, "{again}: {lines:#?}");
+        assert_eq!(host.noted(), [(TaskFace::Landed, at)], "{again}");
+        let note = last_done(&path);
+        assert!(landed_note(&note.line), "{again}: {note:?}");
+        assert_eq!(note.ended, Some(at), "{again}: {note:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    // NEGATIVE CONTROL: another reply's done withdraws the seed.
+    let (dir, ledger) = finished_first("chain-theirs");
+    let host = Arc::new(Faces {
+        lifted: true,
+        ..Faces::default()
+    });
+    run(
+        vec![ended(THEIR_TOKEN_REPLY)],
+        "cruise",
+        Vec::new(),
+        &host,
+        Some(&ledger),
+        None,
+    );
+    assert_eq!(
+        host.told(),
+        [TaskFace::Done, TaskFace::Open, TaskFace::Done]
+    );
+    let theirs = last_done(&ledger);
+    assert_eq!(theirs.ended, None, "a new end: {theirs:?}");
+    let host = Arc::new(Faces::default());
+    run(
+        vec![ended(THEIR_TOKEN_REPLY)],
+        "cruise",
+        Vec::new(),
+        &host,
+        Some(&ledger),
+        None,
+    );
+    assert_eq!(host.noted(), [(TaskFace::Done, theirs.t)], "its own time");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A RESTART OF A LANDED SESSION TYPES NOTHING (§9.4.5): the loop finds the
 /// land's `DONE` as the journal's last end and no typed row after it, and the
 /// screen's reply still saying done — it is told `landed` AT ITS START and
@@ -836,7 +1283,9 @@ const THEIR_TOKEN_REPLY_REWRAPPED: &str =
 /// already done (§9.3.7: nothing typed, `✓ done`), so no decision there
 /// acts — the loop reads the word fresh only where one would — and no
 /// landing is claimed. The loop after the next Off, under Land, reads the
-/// same. No loop after the landing notes a second `DONE … rule=land@v1`.
+/// same, restated from the Cruise loop's done note (the done's seed: told
+/// `done` at its start, nothing more). No loop after the landing notes a
+/// second `DONE … rule=land@v1`.
 /// The same where that turn was a person's own exchange (their hand in it:
 /// `theirs`). NEGATIVE CONTROLS:
 /// `a_plain_landing_restarted_after_off_still_reads_landed` (a plain landing
@@ -900,11 +1349,14 @@ fn someone_elses_done_turn_after_a_landing_is_never_read_as_the_landing() {
                 );
             }
             assert_eq!(turns, 0, "{tag} {word}: nothing typed: {log}");
-            assert_eq!(
-                told,
-                [TaskFace::Open, TaskFace::Done],
-                "{tag} {word}: done, never landed: {log}"
-            );
+            // Under Land the Cruise loop's done note seeds the done: told at
+            // the start, its time kept, and kept by the same reply's words.
+            let want: &[TaskFace] = if word == "cruise" {
+                &[TaskFace::Open, TaskFace::Done]
+            } else {
+                &[TaskFace::Done]
+            };
+            assert_eq!(told, want, "{tag} {word}: done, never landed: {log}");
             assert_eq!(
                 added
                     .iter()
@@ -953,13 +1405,10 @@ fn a_done_turn_no_loop_watched_after_a_landing_reads_done_not_landed() {
             "{word}: their task's end: {log}"
         );
         assert!(!added.iter().any(|l| landed_note(l)), "{word}: {log}");
-        // …and the loop after it reads that end: done, nothing seeded.
+        // …and the loop after it restates that end from its note: done at
+        // its start (the done's seed, its time kept), nothing more told.
         let (told, turns, _, _) = after_off(&ledger, word, THEIR_TOKEN_REPLY);
-        assert_eq!(
-            (told, turns),
-            (vec![TaskFace::Open, TaskFace::Done], 0),
-            "{word}"
-        );
+        assert_eq!((told, turns), (vec![TaskFace::Done], 0), "{word}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -982,8 +1431,10 @@ fn a_landing_ridden_through_an_update_cut_reads_landed_after_its_restart() {
     const WORDS_DONE: &str = "Verified, committed and pushed the parser. All done.";
     for reply in [WORDS_DONE, TOKEN_REPLY] {
         // The cut's request index, after the landing: the first that leaves
-        // the landing's point handed over again after the reconnect.
-        let found = (4..40usize).find_map(|i| {
+        // the landing's point handed over again after the reconnect. Every
+        // index is tried at once, each on a thread of its own: a run whose cut
+        // misses waits its loop out.
+        let cut = |i: usize| {
             let (dir, ledger) = files("update-cut", &[], &[]);
             let host = Arc::new(Faces::default());
             let screens = vec![busy_screen(), ended(PROGRESS), busy_screen(), ended(reply)];
@@ -1013,9 +1464,22 @@ fn a_landing_ridden_through_an_update_cut_reads_landed_after_its_restart() {
                 let _ = std::fs::remove_dir_all(&dir);
                 None
             }
+        };
+        let cut = &cut;
+        let mut handed: Vec<_> = std::thread::scope(|scope| {
+            let tries: Vec<_> = (4..40usize).map(|i| scope.spawn(move || cut(i))).collect();
+            tries
+                .into_iter()
+                .filter_map(|t| t.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
         });
-        let (dir, ledger, first) =
-            found.unwrap_or_else(|| panic!("{reply:?}: no cut handed the landing's point again"));
+        for (later, _, _) in handed.iter().skip(1) {
+            let _ = std::fs::remove_dir_all(later);
+        }
+        handed.truncate(1);
+        let (dir, ledger, first) = handed
+            .pop()
+            .unwrap_or_else(|| panic!("{reply:?}: no cut handed the landing's point again"));
         let (told, turns, added, lines) = after_off(&ledger, "land", reply);
         let log = format!("{first:#?}\n{added:#?}\n{lines:#?}");
         assert_eq!(
@@ -1187,7 +1651,7 @@ fn relaunched(
         },
         journal: Some(journal.clone()),
         idle_host: Some(Arc::clone(host) as Arc<dyn IdleHost>),
-        ..auto(30, None)
+        ..auto(30)
     };
     let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
         s.set_turn_end_timing(TurnEndTiming {
@@ -1397,7 +1861,7 @@ fn a_landing_the_memory_banner_cut_is_carried_on_after_its_restart() {
             },
             journal: Some(journal.clone()),
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
-            ..auto(30, None)
+            ..auto(30)
         };
         let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
             s.set_turn_end_timing(TurnEndTiming {

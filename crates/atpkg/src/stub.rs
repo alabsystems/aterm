@@ -618,8 +618,8 @@ impl Embedder {
     }
 
     /// An embedder offering `offered`, with `temp_roots` as the temporary directories — a
-    /// process stood anywhere, for a test.
-    #[cfg(test)]
+    /// process stood anywhere, for a test (the lay tests that ask are unix).
+    #[cfg(all(test, unix))]
     #[must_use]
     pub(crate) fn offering(offered: &Path, temp_roots: &[PathBuf]) -> Self {
         Self {
@@ -1113,8 +1113,14 @@ mod tests {
             assert!(pending_stub_exists(&l, command), "{command} answers");
             assert_eq!(program_of(command), "trust");
             let body = std::fs::read_to_string(l.shim(&tool(command))).unwrap();
+            // Spelled per host: the sh body's `"$@"`, the batch body's `%*`.
+            let names = if cfg!(windows) {
+                format!("__pending \"{command}\" %*")
+            } else {
+                format!("__pending '{command}' \"$@\"")
+            };
             assert!(
-                body.contains(&format!("__pending '{command}' \"$@\"")),
+                body.contains(&names),
                 "the stub names what was typed: {body}"
             );
         }
@@ -1122,8 +1128,10 @@ mod tests {
         for upstream in [
             "cargo", "rustc", "clippy", "rustfmt", "rustdoc", "lean", "z3",
         ] {
+            // The stub's file name on this host (`cargo` and `rustc` are no `ToolName`).
+            let stub = format!("{upstream}{}", crate::platform::SHIM_SUFFIX);
             assert!(
-                std::fs::symlink_metadata(l.bin_dir().join(upstream)).is_err(),
+                std::fs::symlink_metadata(l.bin_dir().join(stub)).is_err(),
                 "{upstream} is never stubbed in bin/"
             );
         }

@@ -37,14 +37,15 @@ graph_method = "cargo-tree-normal-no-dedupe-locked-offline-v1"
 
 # --- winit 0.30.13: ABSORBED, no longer a fork ------------------------------
 # Re-homed 2026-10-15 as crates/aterm-window, a workspace member
-# (docs/AUDIT-third-party-2026-10-15.md, winit-core step 4); its package keeps the
-# name `winit`, which accesskit_winit required until A11Y.4 retired it; the rename is
-# winit-core step 7. Its [[fork]] block retired with
-# the move: the root [patch.crates-io] row now points at an ABSORBED target, whose
-# NOTICE line, retained LICENSE and Apache-2.0 §4(b) notices `targo --unverified
-# forge attest` holds ([OB-5]/[OB-6]/[OB-7]/[OB-9]), and which aterm-census scans
-# from its ABSORBED_CRATES row. The carve ledger below stays: those backends are
-# still gone, now from crates/aterm-window.
+# (docs/AUDIT-third-party-2026-10-15.md, winit-core step 4). Its [[fork]] block
+# retired with the move. Its package kept the name `winit`, served by a root
+# [patch.crates-io] row, while accesskit_winit required a crate of that name; A11Y.4
+# retired accesskit_winit and winit-core step 7 (2026-10-19) renamed the package
+# `aterm-window` and deleted the row. It is an ABSORBED member: NOTICE lists it as
+# winit 0.30.13, and `targo --unverified forge attest` holds that line, its retained
+# LICENSE and its Apache-2.0 §4(b) notices ([OB-5]/[OB-6]/[OB-7]/[OB-9]);
+# aterm-census scans it from its ABSORBED_CRATES row. The carve ledger below stays:
+# those backends are still gone, now from crates/aterm-window.
 
 # The four backends no aterm cell compiles, DELETED from the fork 2026-10-15
 # (docs/AUDIT-third-party-2026-10-15.md, winit-core step 1; re-pointed with the

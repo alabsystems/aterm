@@ -18,8 +18,9 @@
 //!
 //! argv0 aliases: the bundle ships symlinks (`aterm-ctl`, `atpkg`, `aterm-fleet`,
 //! `aterm-drive`, `aterm-askpass`, `aterm-link`, `aterm-gui`, `aterm-cli`) onto this binary, a
-//! login renewal links `aterm-open-url` to it, and main dispatches as whichever tool it was
-//! invoked as.
+//! login renewal links `aterm-open-url` to it, `aterm machines enroll` links
+//! `aterm-machines-askpass` to it in its scratch directory, and main dispatches as whichever
+//! tool it was invoked as.
 
 // No `windows_subsystem = "windows"` here: this file is the console image. A Windows shell
 // waits for a console-subsystem child and not a GUI one, so with the attribute no shell would
@@ -30,6 +31,13 @@
 // runs a window in-process: it hands it to the windowed sibling (`run_window`,
 // `windowed_sibling`) and returns, so the prompt comes back. Elsewhere the extra bin is a
 // std-only stub (see `windowed.rs`).
+
+// Registers the `trust` tool namespace for the one `trust::skip` below
+// (`dispatch_link`'s nested `take_startup_lanes`) under the Trust verifier.
+// Unix only, as that function is: on Windows `windowed.rs` includes this file
+// as a module, where a crate attribute does not belong.
+#![cfg_attr(all(unix, trust_verify), feature(register_tool))]
+#![cfg_attr(all(unix, trust_verify), register_tool(trust))]
 
 use std::ffi::OsString;
 use std::ops::ControlFlow;
@@ -70,11 +78,22 @@ fn machines_unavailable() -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// The `aterm ctl` verbs this binary answers in-process because it links the terminal engine,
-/// handed to the dependency-free `aterm-ctl` as plain functions ([`aterm_ctl::LocalVerbs`]) by
-/// both routes into it (the `ctl` verb and the `aterm-ctl` argv0 alias).
+/// The `aterm ctl` verbs this binary answers in-process because it links the terminal engine
+/// and the fleet's TLS, handed to the dependency-free `aterm-ctl` as plain functions
+/// ([`aterm_ctl::LocalVerbs`]) by both routes into it (the `ctl` verb and the `aterm-ctl`
+/// argv0 alias).
 const CTL_LOCAL: aterm_ctl::LocalVerbs = aterm_ctl::LocalVerbs {
     cast_drift: Some(ctl_cast_drift),
+    // `survey --fleet | --host`: the fleet's peers, asked over its port.
+    #[cfg(unix)]
+    fleet_survey: Some(aterm_agent::survey_fleet),
+    #[cfg(not(unix))]
+    fleet_survey: None,
+    // `--host <h>`: another Mac's aterm, driven over the fleet's `drive` op.
+    #[cfg(unix)]
+    fleet_drive: Some(aterm_agent::drive_fleet),
+    #[cfg(not(unix))]
+    fleet_drive: None,
 };
 
 /// `cast drift` computed by the client: against a server that predates the verb (from the
@@ -155,22 +174,52 @@ const BUILD_STAMP: aterm_types::version::BuildStamp = aterm_types::version::Buil
 
 /// The executable's inherited-lane ownership admission. The Link library
 /// parses first and invokes this provider only for inherited `serve`; observer
-/// and unrelated verbs never take descriptors3/4. The take itself is
-/// `aterm_uds::spawnfd::adopt_startup_bridge_lanes`, whose contract this route keeps.
+/// and unrelated verbs never take descriptors 3/4. The take itself is the nested
+/// `take_startup_lanes`, scoped to this function so no other route can name it.
 #[cfg(unix)]
 fn dispatch_link(args: &[String]) -> ExitCode {
-    aterm_link::cli::dispatch_with_inherited_lanes(args, || {
-        // This early startup route takes the launcher's unclaimed lanes once,
-        // before bridge threads: neither has another owner or can be closed or
-        // replaced concurrently; the library's socket/flag checks only refuse.
-        let (verb, push) = aterm_uds::spawnfd::adopt_startup_bridge_lanes()?;
+    /// The startup take of the launcher's two bridge lanes: the one unsafe call this
+    /// executable makes, `aterm_uds::spawnfd::adopt_startup_bridge_lanes`, whose
+    /// `# Safety` contract (exclusive transfer of descriptors 3/4, no concurrent
+    /// close or replacement) only this startup route can keep.
+    // Skip: Trust has no model of descriptor ownership, so the verified build
+    // (`targo trust build -p aterm`) refutes any unsafe block in this package: a
+    // `[unsafe]` stand-in row is minted for every unsafe block (no SAFETY comment
+    // reaches the verifier), and an `[unsafe:unmodeled-call]` row for this
+    // non-foreign callee (the installed lane models an unsafe call only by a
+    // sysroot-name list this path is not on; Trust main admits only declared
+    // sysroot items), both forced failed. `trust::skip` makes this function an
+    // explicit `user-opt-out` assumption row instead: the obligation below stays
+    // the premise, disclosed in the census and never proved, and strict
+    // verification still refuses it. Keep nothing else in this body, and keep it
+    // nested here. Drop the skip once Trust charges a user `unsafe fn`'s contract
+    // at its call site (a modeled callee and a caller-side obligation),
+    // re-checking with that build after each `aterm pkg update trust`.
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn take_startup_lanes() -> std::io::Result<aterm_link::bridge::InheritedLanes> {
+        // SAFETY: the launcher transfers eligible lanes exclusively to this startup
+        // route, and `dispatch_link` is the only route that reaches this function.
+        // No other owner retains them and no thread or callback closes or replaces
+        // either number during adoption. Missing or ineligible lanes are checked
+        // refusals; the once-only guard alone would not establish ownership.
+        let (verb, push) = unsafe { aterm_uds::spawnfd::adopt_startup_bridge_lanes() }?;
         Ok(aterm_link::bridge::InheritedLanes { verb, push })
-    })
+    }
+    aterm_link::cli::dispatch_with_inherited_lanes(args, take_startup_lanes)
 }
 
 // `pub(crate)`: `src/windowed.rs` includes this file as a module and calls this `main` from its
 // own; rustc accepts any visibility on a bin root's `main`.
 pub(crate) fn main() -> ExitCode {
+    // A tab's console clients (`aterm_pty::serve_console_client`): the window starts this image
+    // into an OpenConsole tab's console after a resize, to write one input record, and at the
+    // prompt after a full-screen app died on the alternate screen, to leave it. Each does its
+    // one write and exits. Hidden, and answered before anything else runs: the write the guard
+    // protects waits for it.
+    #[cfg(windows)]
+    if let Some(code) = aterm_pty::serve_console_client() {
+        return code;
+    }
     // First, before any route can read a build fact (`aterm --version`, About, `ctl version`,
     // the handoff identity, XTVERSION).
     aterm_types::version::install(BUILD_STAMP);
@@ -212,7 +261,12 @@ pub(crate) fn main() -> ExitCode {
     match alias_route(argv0, &first) {
         AliasRoute::Ctl => return aterm_ctl::main_entry_with(rest, CTL_LOCAL),
         AliasRoute::Askpass => return aterm_ctl::askpass_main_entry(rest),
+        #[cfg(target_os = "macos")]
+        AliasRoute::MachinesAskpass => return aterm_machines::askpass::main(&rest),
+        #[cfg(not(target_os = "macos"))]
+        AliasRoute::MachinesAskpass => return machines_unavailable(),
         AliasRoute::Pkg => return atpkg::cli::main_entry(rest),
+        AliasRoute::Abrew => return atpkg::abrew::main_entry(rest),
         AliasRoute::Fleet => return aterm_agent::fleet_cli::main_entry(rest),
         AliasRoute::Drive => return aterm_agent::drive_cli::main_entry(rest),
         AliasRoute::OpenUrl => return aterm_agent::harness::open_url::main_entry(rest),
@@ -278,7 +332,13 @@ pub(crate) fn main() -> ExitCode {
             // door for the standing pull/push wiring, presentation over the control-socket
             // verbs `ctl` speaks, hence in aterm-ctl.
             aterm_cli::Verb::Conn => aterm_ctl::conn_main_entry(forwarded),
-            aterm_cli::Verb::Pkg => atpkg::cli::main_entry(forwarded),
+            aterm_cli::Verb::Pkg => {
+                #[cfg(target_os = "macos")]
+                if aterm_machines::cli::pkg_retires(&forwarded) {
+                    aterm_machines::cli::retire_lan_agent();
+                }
+                atpkg::cli::main_entry(forwarded)
+            }
             aterm_cli::Verb::Fleet => aterm_agent::fleet_cli::main_entry(forwarded),
             aterm_cli::Verb::Drive => aterm_agent::drive_cli::main_entry(forwarded),
             // The fabric bridge. `dispatch` takes `String`s: every operand is a subject, a path
@@ -334,6 +394,12 @@ pub(crate) fn main() -> ExitCode {
             // The PTY keeper (docs/DESIGN-pty-keeper-2026-09-26.md).
             aterm_cli::Verb::Keeper => {
                 aterm_keeper::cli::main_entry(forwarded, aterm_types::version::app_version())
+            }
+            // The menu-bar keep-awake mug, its own launchd job (`aterm help caffeine`). Its
+            // `aterm_log` records go to aterm.log with the window's, never to this terminal.
+            aterm_cli::Verb::Caffeine => {
+                aterm_gui::install_session_log();
+                aterm_caffeine::cli::main_entry(forwarded, aterm_types::version::app_version())
             }
             // `agents` is parsed by aterm-cli itself (it prints and exits), so the whole
             // operand list goes back to that parser.
@@ -615,6 +681,15 @@ pub(crate) fn main() -> ExitCode {
         start_session_head_watch(layout, packages);
     }
 
+    // The LaunchAgent earlier builds installed (`systems.alab.aterm-machines`), unloaded and
+    // deleted in the background where it is there (docs/DESIGN-machines-2026-10-16.md §14.2).
+    #[cfg(target_os = "macos")]
+    if session_lane_is_interactive() {
+        let _ = std::thread::Builder::new()
+            .name("aterm-machines-retire".into())
+            .spawn(aterm_machines::cli::retire_lan_agent);
+    }
+
     session_lane(quiet)
 }
 
@@ -861,14 +936,23 @@ fn spawn_detached_machine_apply() {
 /// ([`session_pass_args`]), in its own process group so the session's exit and SIGHUP cannot
 /// take it down mid-install, stdio on `/dev/null` (atpkg records `status.toml`, and a window
 /// tails its progress file), never waited for. A failed spawn is a log line, never stderr.
+/// Behind the utility clamp, but for the first run a person waits on (the store's first
+/// install of the ALab toolset still ahead, [`atpkg::adoption::first_install_ahead`]), which
+/// starts at the default band, as the window's does
+/// ([`atpkg::platform::spawn_detached_waited`]). A store a pass already served that holds no
+/// ALab program (an unserved architecture, a declined machine updating its agents) is
+/// routine.
 fn spawn_detached_pkg_update(layout: &atpkg::store::Layout) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
     let detached = (atpkg::cli::SPAWNER_PID_ENV, atpkg::cli::SPAWNER_DETACHED);
-    if let Err(error) =
-        atpkg::platform::spawn_detached(exe.as_os_str(), &session_pass_args(layout), Some(detached))
-    {
+    let spawn = if atpkg::adoption::first_install_ahead(layout) {
+        atpkg::platform::spawn_detached_waited
+    } else {
+        atpkg::platform::spawn_detached
+    };
+    if let Err(error) = spawn(exe.as_os_str(), &session_pass_args(layout), Some(detached)) {
         aterm_log::warn!("aterm: could not start the background `aterm pkg update` pass: {error}");
     }
 }
@@ -912,7 +996,10 @@ enum AliasRoute {
     Ctl,
     /// `atpkg` — the package manager.
     Pkg,
-    /// `aterm-fleet` — fleet federation.
+    /// `abrew` / `atpkg-abrew` — aterm's Homebrew (docs/DESIGN-abrew-2026-10-19.md):
+    /// an alias because the reroute stub and user shells name one executable.
+    Abrew,
+    /// `aterm-fleet` — this machine's fleet membership.
     Fleet,
     /// `aterm-drive` — the agent drive CLI.
     Drive,
@@ -934,6 +1021,11 @@ enum AliasRoute {
     /// an argv0 alias because `sudo` execs it as `[path, prompt]` with no room for a verb, and,
     /// having no tty, it must run before the session/window fork.
     Askpass,
+    /// `aterm-machines-askpass <prompt>`, the `SSH_ASKPASS` program `aterm machines enroll`
+    /// points each Mac's `ssh` login at, through a link it makes in its own scratch
+    /// directory: it answers with the password `enroll` feeds `ssh`'s standard input. An
+    /// alias for the reason `aterm-askpass` is one: `ssh` execs it as `[path, prompt]`.
+    MachinesAskpass,
     /// Not an alias: `aterm`, `aterm-cli` (the front door forced to a session), a renamed copy.
     FrontDoor,
 }
@@ -949,9 +1041,11 @@ fn alias_route(argv0: &str, first: &str) -> AliasRoute {
         }
         "aterm-ctl" => AliasRoute::Ctl,
         "atpkg" => AliasRoute::Pkg,
+        "abrew" | "atpkg-abrew" => AliasRoute::Abrew,
         "aterm-fleet" => AliasRoute::Fleet,
         "aterm-drive" => AliasRoute::Drive,
         "aterm-askpass" => AliasRoute::Askpass,
+        "aterm-machines-askpass" => AliasRoute::MachinesAskpass,
         "aterm-link" => AliasRoute::Link,
         "aterm-open-url" => AliasRoute::OpenUrl,
         "aterm-gui" | "aterm-windowed" => match aterm_cli::Verb::from_operand(first) {
@@ -1046,6 +1140,19 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     }
     #[cfg(not(windows))]
     let _ = (host, handoff);
+    #[cfg(target_os = "macos")]
+    if !args
+        .iter()
+        .any(|a| matches!(a.to_string_lossy().as_ref(), "--headless" | "--diagnose"))
+    {
+        let _ = std::thread::Builder::new()
+            .name("aterm-machines-retire".into())
+            .spawn(aterm_machines::cli::retire_lan_agent);
+    }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one window door: every window route reaches the GUI here"
+    )]
     aterm_gui::main_entry(args);
     ExitCode::SUCCESS
 }
@@ -2706,8 +2813,6 @@ mod tests {
             trial_starts: 0,
             trial_healthy: false,
             refused_newer: false,
-            refused_unstarted: false,
-            kept_unproven: false,
         });
         assert!(!up_to_date(&say(&waiting, None)), "an unfinished install");
         waiting.linux.as_mut().expect("linux").trial_healthy = true;
@@ -3045,6 +3150,12 @@ mod tests {
         assert_eq!(
             alias_route("aterm-askpass", "Password:"),
             AliasRoute::Askpass
+        );
+        // `ssh` execs `enroll`'s helper as `[…/aterm-machines-askpass, "<user>@<host>'s
+        // password: "]`.
+        assert_eq!(
+            alias_route("aterm-machines-askpass", "admin@lab-07.local's password: "),
+            AliasRoute::MachinesAskpass
         );
         // A bridge is spawned by that name out of `[fabric] command`.
         assert_eq!(alias_route("aterm-link", ""), AliasRoute::Link);

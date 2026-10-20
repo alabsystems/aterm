@@ -417,8 +417,9 @@ mounted as `seamless::carry_tests::fixture_generator` and compiled into every
 `targo --unverified test -p aterm-gui --lib` build. It calls the release's own
 policy reader, capture ladder, history carry, writer and consumer, so a
 producer change that breaks it fails to compile, and each release's tree
-carries the generator that matches its producer. Its two tests are
-`#[ignore]`d and run only by name: `generate_handoff_fixtures` writes every
+carries the generator that matches its producer. Its two tests run in isolated
+child processes with private output in ordinary tests; the release cutter
+supplies an explicit output directory and its reserved identity: `generate_handoff_fixtures` writes every
 desk in `REQUIRED_DESKS`, and `generate_rendezvous_fixture` (macOS) writes
 `rendezvous.toml` with the guard's own capture (`capture_transport`). Each
 self-checks: the release's own consumer must adopt every desk exactly, held
@@ -451,7 +452,7 @@ The cut (`crates/aterm-release/src/fixtures.rs`):
    is published or claimed: both tests run in the clone at R (C is R plus the
    ledger line and the rolled changelog), `targo --unverified test -p
    aterm-gui --lib -- generate_handoff_fixtures generate_rendezvous_fixture
-   --ignored --test-threads 1` in
+   --test-threads 1` in
    `target-fixture-guard` (removed after), with C's and n's pins and the
    prover's `TRUST_STAGE2_BIN`, into the release cache
    (`<clone>-release.noindex/handoff-fixtures/vX.Y.0-<n>-<C12>/`, outside the
@@ -501,7 +502,7 @@ ATERM_BUILD_GIT_COMMIT_FULL=$(git rev-parse 'vX.Y.0^{commit}') \
 SOURCE_DATE_EPOCH=<the release's build number in RELEASES.ledger> \
 ATERM_HANDOFF_FIXTURE_OUT=$OUT ATERM_RENDEZVOUS_FIXTURE_OUT=$OUT \
   targo --unverified test -p aterm-gui --lib -- \
-  generate_handoff_fixtures generate_rendezvous_fixture --ignored --test-threads 1
+  generate_handoff_fixtures generate_rendezvous_fixture --test-threads 1
 ```
 
 The tag is annotated, so take the commit it points at, not the tag object's own

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
+// under them (crates/aterm-spec-anchor/anchor_rules.rs).
+#![cfg_attr(anchor_rules, feature(macro_attr))]
+
 //! The single PTY spawn and IO seam: every raw PTY primitive (Unix pty pair, `fork`,
 //! `execve`, `read`/`write`, `TIOCSWINSZ`, the queue probes [`input_queue_len`],
 //! [`output_queue_len`] and [`flush_input_queue`]; Windows ConPTY) lives here, so the
@@ -226,6 +230,28 @@ impl TtyEcho {
     pub const fn swallows_input(self) -> bool {
         !self.echo && self.canonical
     }
+
+    /// Whether the line discipline is in full raw mode (`!ECHO && !ICANON && ISIG` off).
+    #[must_use]
+    pub const fn is_raw_mode(self) -> bool {
+        !self.echo && !self.canonical && self.signals.is_none()
+    }
+
+    /// Whether the line discipline is in standard cooked echo mode (`ECHO && ICANON`).
+    #[must_use]
+    pub const fn is_cooked_echo(self) -> bool {
+        self.echo && self.canonical
+    }
+
+    /// Whether writing `byte` into this line discipline triggers a terminal signal
+    /// (`ISIG` enabled and `byte` matches `VINTR`, `VQUIT`, or `VSUSP`).
+    #[must_use]
+    pub const fn intercepts_signal_byte(self, byte: u8) -> bool {
+        match self.signals {
+            Some(s) => s.signals(byte),
+            None => false,
+        }
+    }
 }
 
 /// The slave's signal characters (`c_cc[VINTR]`, `c_cc[VQUIT]`, `c_cc[VSUSP]`), read
@@ -245,11 +271,49 @@ pub struct TtySignals {
 }
 
 impl TtySignals {
+    /// Standard POSIX default control characters (`^C` = `0x03`, `^\` = `0x1c`, `^Z` = `0x1a`).
+    #[must_use]
+    pub const fn posix_defaults() -> Self {
+        Self {
+            intr: Some(0x03),
+            quit: Some(0x1c),
+            susp: Some(0x1a),
+        }
+    }
+
+    /// All three signal characters disabled (`_POSIX_VDISABLE`).
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            intr: None,
+            quit: None,
+            susp: None,
+        }
+    }
+
+    /// Whether `byte` matches `VINTR`.
+    #[must_use]
+    pub const fn is_intr(self, byte: u8) -> bool {
+        matches!(self.intr, Some(b) if b == byte)
+    }
+
+    /// Whether `byte` matches `VQUIT`.
+    #[must_use]
+    pub const fn is_quit(self, byte: u8) -> bool {
+        matches!(self.quit, Some(b) if b == byte)
+    }
+
+    /// Whether `byte` matches `VSUSP`.
+    #[must_use]
+    pub const fn is_susp(self, byte: u8) -> bool {
+        matches!(self.susp, Some(b) if b == byte)
+    }
+
     /// Whether `byte`, written into the PTY, is turned into a signal rather
     /// than queued.
     #[must_use]
-    pub fn signals(self, byte: u8) -> bool {
-        [self.intr, self.quit, self.susp].contains(&Some(byte))
+    pub const fn signals(self, byte: u8) -> bool {
+        self.is_intr(byte) || self.is_quit(byte) || self.is_susp(byte)
     }
 }
 
@@ -300,6 +364,24 @@ impl ShellIdentity {
     pub const fn unproven(pid: i32) -> Self {
         Self::from_parts(pid, None, false)
     }
+
+    /// Whether the recorded pid is a positive OS process identifier (`> 0`).
+    #[must_use]
+    pub const fn has_positive_pid(self) -> bool {
+        self.pid > 0
+    }
+
+    /// Whether a process birth timestamp was recorded when the session took the shell.
+    #[must_use]
+    pub const fn has_birth_record(self) -> bool {
+        self.birth.is_some()
+    }
+
+    /// Pure birth-timestamp comparison against a kernel-reported `(pid, birth)`.
+    #[must_use]
+    pub const fn matches_kernel_birth(self, kernel_pid: i32, kernel_birth: u64) -> bool {
+        self.pid > 0 && self.pid == kernel_pid && matches!(self.birth, Some(b) if b == kernel_birth)
+    }
 }
 
 /// What [`hangup_shell`] signalled, so tests observe teardown's choice directly.
@@ -315,6 +397,23 @@ pub enum ShellHangup {
     Nothing,
 }
 
+impl ShellHangup {
+    /// Return the process-group id that received `SIGHUP`, if any.
+    #[must_use]
+    pub const fn signalled_pgid(self) -> Option<i32> {
+        match self {
+            Self::Shell(pgid) | Self::Foreground(pgid) => Some(pgid),
+            Self::Nothing => None,
+        }
+    }
+
+    /// Whether any process group was signalled.
+    #[must_use]
+    pub const fn did_signal(self) -> bool {
+        !matches!(self, Self::Nothing)
+    }
+}
+
 /// How a spawned child ended, as far as the platform can say.
 ///
 /// [`collect_exit_status`] never blocks, so "not yet exited" and "not ours to reap"
@@ -326,6 +425,87 @@ pub enum ChildExit {
     Code(i32),
     /// Killed by this signal (Unix only).
     Signal(u8),
+}
+
+impl ChildExit {
+    /// Whether the child exited normally with code `0`.
+    #[must_use]
+    pub const fn is_success(self) -> bool {
+        matches!(self, Self::Code(0))
+    }
+
+    /// Return the normal exit code if the child was not killed by a signal.
+    #[must_use]
+    pub const fn exit_code(self) -> Option<i32> {
+        match self {
+            Self::Code(c) => Some(c),
+            Self::Signal(_) => None,
+        }
+    }
+
+    /// Return the signal number if the child was terminated by a signal.
+    #[must_use]
+    pub const fn signal_number(self) -> Option<u8> {
+        match self {
+            Self::Code(_) => None,
+            Self::Signal(s) => Some(s),
+        }
+    }
+
+    /// Conventional POSIX shell `$?` encoding (`code` for normal exit, `128 + sig` for signals).
+    #[must_use]
+    pub const fn shell_status_code(self) -> i32 {
+        match self {
+            Self::Code(c) => c,
+            Self::Signal(s) => 128i32.saturating_add(s as i32),
+        }
+    }
+}
+
+impl SpawnedShell {
+    /// Whether both the master descriptor/key (`>= 0`) and child pid (`> 0`) are valid.
+    #[must_use]
+    pub const fn has_valid_handles(self) -> bool {
+        self.master >= 0 && self.pid > 0
+    }
+}
+
+/// Clamp a requested PTY window dimension (`cols` or `rows`) to at least `1` cell,
+/// substituting `fallback` (or `1` if `fallback == 0`) when `cells == 0`.
+#[must_use]
+pub const fn clamp_winsize_cells(cells: u16, fallback: u16) -> u16 {
+    if cells > 0 {
+        cells
+    } else if fallback > 0 {
+        fallback
+    } else {
+        1
+    }
+}
+
+/// Encode a 4-field PTY window size `(cols, rows, xpixel, ypixel)` into 8 little-endian bytes.
+#[must_use]
+pub const fn encode_winsize_le(cols: u16, rows: u16, xpixel: u16, ypixel: u16) -> [u8; 8] {
+    [
+        (cols & 0xFF) as u8,
+        ((cols >> 8) & 0xFF) as u8,
+        (rows & 0xFF) as u8,
+        ((rows >> 8) & 0xFF) as u8,
+        (xpixel & 0xFF) as u8,
+        ((xpixel >> 8) & 0xFF) as u8,
+        (ypixel & 0xFF) as u8,
+        ((ypixel >> 8) & 0xFF) as u8,
+    ]
+}
+
+/// Decode 8 little-endian bytes into a 4-field PTY window size `(cols, rows, xpixel, ypixel)`.
+#[must_use]
+pub const fn decode_winsize_le(bytes: [u8; 8]) -> (u16, u16, u16, u16) {
+    let cols = (bytes[0] as u16) | ((bytes[1] as u16) << 8);
+    let rows = (bytes[2] as u16) | ((bytes[3] as u16) << 8);
+    let xpixel = (bytes[4] as u16) | ((bytes[5] as u16) << 8);
+    let ypixel = (bytes[6] as u16) | ((bytes[7] as u16) << 8);
+    (cols, rows, xpixel, ypixel)
 }
 
 // The console host a Windows pseudoconsole runs in (aterm.toml `conpty`): the
@@ -345,6 +525,10 @@ pub use unix_shell::{
     ShellOrigin, fallback_shell, login_shell, select_shell_with_origin, shell_cannot_start,
     shell_env_for_child,
 };
+// Releasing a writer blocked in a synchronous input write (the ConPTY backend's
+// sever and stop); platform-free, so the unix suite runs it.
+#[cfg(any(windows, test))]
+mod input_release;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -613,5 +797,54 @@ mod tests {
         let inherited = vec![(os("anthropic_api_key"), os("distinct-var"))];
         let out = build_child_env(inherited.into_iter(), &[]);
         assert_eq!(out.len(), 1, "exact-case deny must not match on unix");
+    }
+
+    #[test]
+    fn pty_echo_signals_identity_and_exit_const_helpers() {
+        let sigs = TtySignals::posix_defaults();
+        assert!(sigs.is_intr(0x03) && sigs.is_quit(0x1c) && sigs.is_susp(0x1a));
+        assert!(sigs.signals(0x03) && !sigs.signals(b'a'));
+        assert!(!TtySignals::disabled().signals(0x03));
+
+        let cooked = TtyEcho {
+            echo: true,
+            canonical: true,
+            signals: Some(sigs),
+        };
+        assert!(cooked.is_cooked_echo() && !cooked.is_raw_mode() && !cooked.swallows_input());
+        assert!(cooked.intercepts_signal_byte(0x03));
+
+        let raw = TtyEcho {
+            echo: false,
+            canonical: false,
+            signals: None,
+        };
+        assert!(raw.is_raw_mode() && !raw.intercepts_signal_byte(0x03));
+
+        let id = ShellIdentity::from_parts(42, Some(1000), true);
+        assert!(id.has_positive_pid() && id.has_birth_record());
+        assert!(id.matches_kernel_birth(42, 1000));
+        assert!(!id.matches_kernel_birth(42, 999));
+        assert!(!ShellIdentity::unproven(-1).has_positive_pid());
+
+        assert_eq!(ShellHangup::Shell(42).signalled_pgid(), Some(42));
+        assert!(ShellHangup::Foreground(9).did_signal());
+        assert!(!ShellHangup::Nothing.did_signal());
+
+        assert!(ChildExit::Code(0).is_success());
+        assert_eq!(ChildExit::Code(2).exit_code(), Some(2));
+        assert_eq!(ChildExit::Signal(9).signal_number(), Some(9));
+        assert_eq!(ChildExit::Signal(9).shell_status_code(), 137);
+        assert!(
+            SpawnedShell {
+                master: 3,
+                pid: 100
+            }
+            .has_valid_handles()
+        );
+        assert_eq!(clamp_winsize_cells(0, 80), 80);
+        assert_eq!(clamp_winsize_cells(0, 0), 1);
+        let ws = encode_winsize_le(80, 24, 640, 384);
+        assert_eq!(decode_winsize_le(ws), (80, 24, 640, 384));
     }
 }

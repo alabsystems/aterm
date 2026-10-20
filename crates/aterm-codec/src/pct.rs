@@ -37,6 +37,53 @@ pub fn encode_into(out: &mut String, s: &str) {
     }
 }
 
+/// [`encode`]'s narrow sibling for ONE WORD of an argv carried as a line of
+/// space-separated words ([`join_words`]): `%`, every whitespace character and
+/// every control character become `%XX` (each byte of their UTF-8), so the
+/// word is one whitespace-free token, and everything else — non-ASCII letters
+/// included — is kept as written. A word with none of those is its own
+/// encoding, so an argv of plain words travels byte for byte as
+/// `argv.join(" ")`. [`decode`] inverts it.
+#[must_use]
+pub fn encode_word(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '%' || c.is_whitespace() || c.is_control() {
+            let mut buf = [0u8; 4];
+            for b in c.encode_utf8(&mut buf).bytes() {
+                out.push('%');
+                out.push(HEX[usize::from(b >> 4)] as char);
+                out.push(HEX[usize::from(b & 0x0f)] as char);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// An argv as ONE LINE of words: each [`encode_word`]-ed, joined by one
+/// space. [`split_words`] gives the argv back, every word whole, for any argv
+/// whose words are non-empty (an empty word has no token to be; the argv
+/// readers refuse one before it gets here).
+#[must_use]
+pub fn join_words<S: AsRef<str>>(words: &[S]) -> String {
+    words
+        .iter()
+        .map(|w| encode_word(w.as_ref()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// [`join_words`]'s inverse: the line split on whitespace, each word
+/// [`decode`]d. A line of plain words — no `%` in any — is its own whitespace
+/// split.
+#[must_use]
+pub fn split_words(line: &str) -> Vec<String> {
+    line.split_whitespace().map(decode).collect()
+}
+
 /// Decode [`encode`]'s output: `%XX` (either case) becomes its byte; anything
 /// else passes through and invalid UTF-8 decodes lossily. Total.
 #[must_use]
@@ -116,6 +163,45 @@ mod tests {
         let mut into = String::from("k=");
         encode_into(&mut into, "a b");
         assert_eq!(into, "k=a%20b");
+    }
+
+    /// An argv travels as one line of words and comes back whole: a word with
+    /// a space, a tab, a newline, a `%` or a non-breaking space stays ONE
+    /// word, and an argv of plain words is carried as its plain join.
+    /// Negative control: the plain whitespace split of the same line, which
+    /// is what a reader that does not decode would do, breaks the spaced word.
+    #[test]
+    fn an_argv_line_keeps_every_word_whole() {
+        let argv = [
+            "/Users//u/Applications/aterm (dev).app/Contents/MacOS/aterm",
+            "link",
+            "100%",
+            "tab\there",
+            "line\nend",
+            "nb\u{a0}sp",
+            "Caf\u{e9}",
+        ];
+        let line = join_words(&argv);
+        assert!(!line.contains('\n') && !line.contains('\t'), "{line}");
+        assert_eq!(split_words(&line), argv, "{line}");
+        assert_eq!(line.split_whitespace().count(), argv.len(), "{line}");
+        // Negative control: the space-joined line, split, is the wrong argv.
+        let joined = argv.join(" ");
+        let naive: Vec<&str> = joined.split_whitespace().collect();
+        assert_ne!(naive, argv);
+        // Plain words are their own encoding, non-ASCII letters included.
+        let plain = [
+            "/usr/bin/aterm",
+            "link",
+            "serve",
+            "--state",
+            "/Users//u/Caf\u{e9}",
+        ];
+        assert_eq!(join_words(&plain), plain.join(" "));
+        assert_eq!(split_words(&plain.join(" ")), plain);
+        assert_eq!(encode_word("a%b"), "a%25b");
+        assert_eq!(encode_word("a b"), "a%20b");
+        assert_eq!(encode_word("nb\u{a0}sp"), "nb%C2%A0sp");
     }
 
     /// Anything else survives: malformed and truncated escapes verbatim, an

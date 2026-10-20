@@ -28,8 +28,8 @@ use aterm_uds::CtlStream;
 use crate::frameio::{Incoming, read_frame, write_frame};
 use crate::identity::{CheckError, Identity, IdentityPolicy};
 use crate::wire::{
-    CAP_JOURNAL, CAP_LINK, CAP_SENDS_BYE, COMPANION_JOURNAL, Frame, JournalOffer, MarkerRef,
-    MasterHeader, PROTO, PeerClass,
+    CAP_JOURNAL, CAP_LINK, CAP_SENDS_BYE, CAP_SYNC, COMPANION_JOURNAL, Frame, JournalOffer,
+    MarkerRef, MasterHeader, PROTO, PeerClass,
 };
 
 /// One OFFER as the window receives it: the master, its fixed header, the
@@ -102,8 +102,14 @@ pub struct KeeperClient {
     /// own must be no weaker than ([`KeeperClient::served`]).
     policy: IdentityPolicy,
     /// The capabilities the keeper's WELCOME stated (0 before it, or from an older keeper):
-    /// a window sends companions only to one that states [`CAP_JOURNAL`].
+    /// a window sends companions only to one that states [`CAP_JOURNAL`], and SYNC only to one
+    /// that states [`CAP_SYNC`].
     keeper_caps: Cell<u8>,
+    /// The number of the last SYNC written on this connection ([`Self::sync`]).
+    syncs: Cell<u64>,
+    /// The highest SYNC number the keeper wrote back ([`Self::drain`] reads it): every frame
+    /// written before that SYNC was read.
+    synced: Cell<u64>,
 }
 
 impl KeeperClient {
@@ -123,6 +129,8 @@ impl KeeperClient {
             stream,
             policy: identity.policy(),
             keeper_caps: Cell::new(0),
+            syncs: Cell::new(0),
+            synced: Cell::new(0),
         })
     }
 
@@ -130,6 +138,42 @@ impl KeeperClient {
     #[must_use]
     pub fn keeper_journals(&self) -> bool {
         self.keeper_caps.get() & CAP_JOURNAL != 0
+    }
+
+    /// Whether the keeper's WELCOME stated it answers SYNC.
+    #[must_use]
+    pub fn keeper_syncs(&self) -> bool {
+        self.keeper_caps.get() & CAP_SYNC != 0
+    }
+
+    /// SYNC: ask the keeper to say when it has read every frame written so far. Returns the
+    /// SYNC's number, which [`Self::synced`] reaches once the answer is read ([`Self::drain`]).
+    /// Only to a keeper that states [`CAP_SYNC`] ([`Self::keeper_syncs`]); an older one would
+    /// refuse the kind and drop the connection.
+    ///
+    /// # Errors
+    /// The keeper did not state SYNC support, the sequence is exhausted, or the write failed.
+    pub fn sync(&self) -> io::Result<u64> {
+        if !self.keeper_syncs() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the keeper did not state SYNC support",
+            ));
+        }
+        let seq = self
+            .syncs
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("the keeper SYNC sequence is exhausted"))?;
+        self.send(&Frame::Sync { seq }, None)?;
+        self.syncs.set(seq);
+        Ok(seq)
+    }
+
+    /// The highest SYNC number the keeper answered on this connection (0 before any).
+    #[must_use]
+    pub fn synced(&self) -> u64 {
+        self.synced.get()
     }
 
     /// Read a WELCOME's policy and caps: the policy must serve this window ([`Self::served`]),
@@ -345,8 +389,8 @@ impl KeeperClient {
         }
     }
 
-    /// Read and discard every frame already waiting (a link reads nothing it
-    /// acts on); `false` once the keeper has gone (EOF, a malformed frame).
+    /// Read every frame already waiting, keeping only a SYNC's answer ([`Self::synced`]; a link
+    /// acts on nothing else); `false` once the keeper has gone (EOF, a malformed frame).
     /// Never waits for a frame that has not begun to arrive.
     #[must_use]
     pub fn drain(&self) -> bool {
@@ -364,6 +408,13 @@ impl KeeperClient {
                 Err(_) => return false,
             }
             match self.recv() {
+                // Never past the last one written: an answer is to a SYNC this side sent.
+                Ok(Some(Incoming {
+                    frame: Frame::Sync { seq },
+                    ..
+                })) => self
+                    .synced
+                    .set(self.synced.get().max(seq.min(self.syncs.get()))),
                 // An OFFER's descriptor, were one ever sent here, closes.
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => return false,
@@ -457,7 +508,7 @@ type Queued = (LinkOp, Option<SyncSender<bool>>);
 /// The window's link: a worker thread that owns the connection, reconnects
 /// after a keeper restart and re-registers every master it still holds a
 /// duplicate of (§5.3 step 9), then tells the keeper every RELEASE of a
-/// registered master it could not write while the connection was down.
+/// registered master no keeper confirmed it read ([`Owed`]).
 #[derive(Debug)]
 pub struct KeeperLink {
     tx: SyncSender<Queued>,
@@ -592,12 +643,19 @@ enum HeldJournal {
 
 type Held = std::collections::BTreeMap<u64, HeldMaster>;
 
-/// The registered masters whose RELEASE the link could not write, by rdev. A live keeper that
-/// saw only the link drop still holds what the dropped connection claimed, and a reconnect
-/// registers only what the window holds, so these are told to the next connection after its
-/// registrations; a keeper that restarted refuses them as NotClaimant (drained). Bounded by
-/// [`LINK_QUEUE`].
-type Owed = std::collections::BTreeSet<u64>;
+/// The registered masters whose RELEASE no keeper has confirmed it read, by rdev: `None` owed to
+/// the next connection (the write failed, or the connection ended before an answer), `Some(n)`
+/// written on this connection ahead of its SYNC `n`, and dropped once the keeper answers that
+/// SYNC. A keeper drops a connection with frames still unread (a malformed frame, a stalled
+/// one), and a write that succeeded says only that the bytes left. A live keeper that saw only
+/// the link drop still holds what the dropped connection claimed, and a reconnect registers only
+/// what the window holds, so each one owed is told to the next connection after its
+/// registrations. A keeper that read it already, or restarted, refuses the copy as NotClaimant
+/// (drained); and since the keeper honours a RELEASE only for claims of its own connection or an
+/// older one of the window, a first copy still unread on the dropped connection cannot end a
+/// claim this link made since at the same rdev. To a keeper that answers no SYNC (an older one),
+/// a written RELEASE is all the link can know. Bounded by [`LINK_QUEUE`]: past it, one is lost.
+type Owed = std::collections::BTreeMap<u64, Option<u64>>;
 
 /// What one queued op sends once connected.
 enum Send {
@@ -626,8 +684,16 @@ fn link_worker(peer: &LinkPeer, rx: &Receiver<Queued>, booted: Option<KeeperClie
             Err(mpsc::RecvTimeoutError::Timeout) => (None, None),
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
-        if client.as_ref().is_some_and(|c| !c.drain()) {
-            client = None;
+        if let Some(c) = &client {
+            let open = c.drain();
+            // What the keeper answered a SYNC behind has reached it, the answers read just
+            // before an EOF included.
+            let synced = c.synced();
+            owed.retain(|_, sync| sync.is_none_or(|n| n > synced));
+            if !open {
+                client = None;
+                unconfirm(&mut owed);
+            }
         }
         let bye = matches!(op, Some(LinkOp::Bye));
         // The RELEASE of a master this link registered: one that must reach a
@@ -719,7 +785,7 @@ fn link_worker(peer: &LinkPeer, rx: &Receiver<Queued>, booted: Option<KeeperClie
             }
             continue;
         };
-        let sent = match &send {
+        let mut sent = match &send {
             // A fresh connection already registered everything held, told it every META and
             // every journal it could take.
             Send::Register(_) | Send::Companion(_) if fresh => Ok(()),
@@ -744,11 +810,22 @@ fn link_worker(peer: &LinkPeer, rx: &Receiver<Queued>, booted: Option<KeeperClie
             },
             Send::Frame(frame) => c.send(frame, None),
         };
+        // A RELEASE that must reach a keeper is followed by a SYNC, and kept until its answer.
+        if sent.is_ok()
+            && let Some(rdev) = must_reach
+            && c.keeper_syncs()
+        {
+            match c.sync() {
+                Ok(n) => keep(&mut owed, rdev, Some(n)),
+                Err(e) => sent = Err(e),
+            }
+        }
         if let Some(ack) = ack {
             let _ = ack.try_send(sent.is_ok());
         }
         if sent.is_err() {
             client = None;
+            unconfirm(&mut owed);
             owe(&mut owed, must_reach);
         }
         if bye {
@@ -762,10 +839,23 @@ fn link_worker(peer: &LinkPeer, rx: &Receiver<Queued>, booted: Option<KeeperClie
 /// Keep the RELEASE of `rdev`, a master this link registered, for the next
 /// connection.
 fn owe(owed: &mut Owed, rdev: Option<u64>) {
-    if let Some(rdev) = rdev
-        && owed.len() < LINK_QUEUE
-    {
-        owed.insert(rdev);
+    if let Some(rdev) = rdev {
+        keep(owed, rdev, None);
+    }
+}
+
+/// Keep the RELEASE of `rdev` until `sync` is answered (`None`: until the next connection).
+fn keep(owed: &mut Owed, rdev: u64, sync: Option<u64>) {
+    if owed.len() < LINK_QUEUE || owed.contains_key(&rdev) {
+        owed.insert(rdev, sync);
+    }
+}
+
+/// The connection ended: every RELEASE it carried that the keeper did not confirm is owed to
+/// the next one.
+fn unconfirm(owed: &mut Owed) {
+    for sync in owed.values_mut() {
+        *sync = None;
     }
 }
 
@@ -803,12 +893,19 @@ fn reconnect(
         )
         .ok()?;
     }
-    // Then every RELEASE the last connection could not carry: the keeper
-    // takes one from any link of the process whose dropped link claimed it.
-    for rdev in owed.iter() {
+    // Then every RELEASE no keeper confirmed: the keeper takes one from a newer link of the
+    // process whose dropped link claimed it. Kept until the answer to the SYNC behind them.
+    for rdev in owed.keys() {
         c.send(&Frame::Release { rdev: *rdev }, None).ok()?;
     }
-    owed.clear();
+    if owed.is_empty() || !c.keeper_syncs() {
+        owed.clear();
+    } else {
+        let n = c.sync().ok()?;
+        for sync in owed.values_mut() {
+            *sync = Some(n);
+        }
+    }
     Some(c)
 }
 
@@ -851,13 +948,30 @@ mod tests {
         }
     }
 
+    /// The REGISTER of a duplicate of `path` (a character device, as a master is), and its rdev.
+    fn register_op(path: &str, local_id: u64) -> (u64, LinkOp) {
+        let master = std::fs::File::open(path).expect("open");
+        let rdev = master.metadata().expect("stat").rdev();
+        let op = LinkOp::Register {
+            master: OwnedFd::from(master),
+            header: MasterHeader {
+                rdev,
+                shell_pid: std::process::id(),
+                shell_birth: Birth::default(),
+                local_id,
+            },
+            tag: Vec::new(),
+        };
+        (rdev, op)
+    }
+
     /// Apple's `nc` listening on the socket fails the designated check ([`refused_identity`]).
     /// Negative controls: no socket, and a socket this process may not open (also
     /// `PermissionDenied`), are not read as that refusal.
     #[test]
     fn a_listener_of_other_code_is_refused_as_not_this_build() {
         use std::os::unix::fs::PermissionsExt as _;
-        crate::require_trust_service();
+        aterm_uds::deadline::require_trust_service();
         let dir = std::env::temp_dir().join(format!("akl-other-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
@@ -916,7 +1030,7 @@ mod tests {
     /// both refused. Control: the same build serving under its designated requirement is accepted.
     #[test]
     fn a_keeper_at_the_uid_floor_is_refused_by_a_window_that_checks_code() {
-        crate::require_trust_service();
+        aterm_uds::deadline::require_trust_service();
         let dir = std::env::temp_dir().join(format!("akl-floor-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
@@ -1048,23 +1162,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let sock = dir.join("k.sock");
         let mut first = serve(&sock);
-        let open = |path: &str, local_id| {
-            let master = std::fs::File::open(path).expect("open");
-            let rdev = master.metadata().expect("stat").rdev();
-            let op = LinkOp::Register {
-                master: OwnedFd::from(master),
-                header: MasterHeader {
-                    rdev,
-                    shell_pid: std::process::id(),
-                    shell_birth: Birth::default(),
-                    local_id,
-                },
-                tag: Vec::new(),
-            };
-            (rdev, op)
-        };
-        let (journaled, journaled_op) = open("/dev/null", 1);
-        let (unsaid, unsaid_op) = open("/dev/zero", 2);
+        let (journaled, journaled_op) = register_op("/dev/null", 1);
+        let (unsaid, unsaid_op) = register_op("/dev/zero", 2);
         let link = KeeperLink::start_marked(
             sock.clone(),
             Identity::same_uid(),
@@ -1136,23 +1235,8 @@ mod tests {
         let sock = dir.join("k.sock");
         let aside = dir.join("k.aside");
         let mut server = serve(&sock);
-        let register = |path: &str, local_id| {
-            let master = std::fs::File::open(path).expect("open");
-            let rdev = master.metadata().expect("stat").rdev();
-            let op = LinkOp::Register {
-                master: OwnedFd::from(master),
-                header: MasterHeader {
-                    rdev,
-                    shell_pid: std::process::id(),
-                    shell_birth: Birth::default(),
-                    local_id,
-                },
-                tag: Vec::new(),
-            };
-            (rdev, op)
-        };
-        let (closed, closed_op) = register("/dev/null", 1);
-        let (kept, kept_op) = register("/dev/zero", 2);
+        let (closed, closed_op) = register_op("/dev/null", 1);
+        let (kept, kept_op) = register_op("/dev/zero", 2);
         assert_ne!(closed, kept);
         let link = KeeperLink::start(sock.clone(), Identity::same_uid(), "t".into()).expect("link");
         assert!(link.enqueue(closed_op));
@@ -1174,6 +1258,92 @@ mod tests {
         assert!(server.holds(kept), "the open tab stays in custody");
         link.shutdown();
         drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A live keeper drops the link with a RELEASE the link wrote still unread (a malformed frame or
+    /// a stalled one ends a connection there). The write succeeded, so only the keeper's answer to
+    /// the SYNC behind it could say the RELEASE was read: unanswered, it is told again to the next
+    /// connection, and the closed tab leaves custody.
+    #[test]
+    fn a_release_the_keeper_dropped_unread_is_told_to_the_next_connection() {
+        let base = std::env::temp_dir();
+        let dir = base.join(format!("akl-unread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sock = dir.join("k.sock");
+        let mut server = serve(&sock);
+        let (closed, closed_op) = register_op("/dev/null", 1);
+        let (kept, kept_op) = register_op("/dev/zero", 2);
+        let link = KeeperLink::start(sock.clone(), Identity::same_uid(), "t".into()).expect("link");
+        assert!(link.enqueue(closed_op));
+        assert!(link.enqueue(kept_op));
+        step_until(&mut server, "the keeper holds both", |s| {
+            s.holds(closed) && s.holds(kept)
+        });
+        // Written, while the keeper is not stepped: nothing reads it before the drop.
+        let written = link.send_and_wait(LinkOp::Release { rdev: closed }, Duration::from_secs(60));
+        assert!(written, "the RELEASE was written");
+        server.test_drop_connections();
+        assert!(server.holds(closed), "the keeper never read the RELEASE");
+        step_until(&mut server, "the RELEASE reaches the keeper", |s| {
+            !s.holds(closed)
+        });
+        assert!(server.holds(kept), "the open tab stays in custody");
+        link.shutdown();
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A keeper whose WELCOME states no CAP_SYNC (an older one, which refuses an unknown kind and
+    /// drops the connection with every frame behind it) is sent no SYNC: the link's frames reach
+    /// it as they always did.
+    #[test]
+    fn a_keeper_that_answers_no_sync_is_sent_none() {
+        use crate::wire::Kind;
+        let base = std::env::temp_dir();
+        let dir = base.join(format!("akl-nosync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let sock = dir.join("k.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        let older = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            // A hang detector, not a latency budget.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .expect("timeout");
+            let mut kinds = Vec::new();
+            loop {
+                let frame = read_frame(&stream).expect("read").expect("a frame").frame;
+                kinds.push(frame.kind());
+                match frame {
+                    Frame::Hello { .. } => {
+                        let welcome = Frame::Welcome {
+                            proto: PROTO,
+                            offers: 0,
+                            version: "older".into(),
+                            identity: Some(IdentityPolicy::SameUid),
+                            caps: Some(CAP_JOURNAL),
+                        };
+                        write_frame(&stream, &welcome, None).expect("welcome");
+                    }
+                    Frame::Pending { .. } => return kinds,
+                    _ => {}
+                }
+            }
+        });
+        let (rdev, op) = register_op("/dev/null", 1);
+        let link = KeeperLink::start(sock, Identity::same_uid(), "t".into()).expect("link");
+        assert!(link.enqueue(op));
+        let within = Duration::from_secs(60);
+        assert!(link.send_and_wait(LinkOp::Release { rdev }, within));
+        assert!(link.send_and_wait(LinkOp::Pending { pid: 1 }, within));
+        let kinds = older.join().expect("the older keeper");
+        assert_eq!(
+            kinds,
+            [Kind::Hello, Kind::Register, Kind::Release, Kind::Pending]
+        );
+        link.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

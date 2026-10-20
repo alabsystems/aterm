@@ -10,14 +10,12 @@
 
 #![cfg(target_endian = "little")]
 
-mod support;
-
 use std::collections::BTreeMap;
 
+use crate::support::*;
 use aterm_x11::proto::event::SelectionNotify;
 use aterm_x11::proto::xproto::{self, PropMode, config, cw, event_mask, gc, image_format};
 use aterm_x11::proto::{Request, ValueList, randr, shm, xinput};
-use support::*;
 
 const RECORDING: &str = "x11rb-protocol-0.13.2-requests.tsv";
 

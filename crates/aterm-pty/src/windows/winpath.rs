@@ -13,9 +13,10 @@
 //!
 //! [`refresh_child_path`] reads the authoritative Machine + User `Path` values
 //! straight from the registry (auto-expanding `%VAR%` references), unions them with
-//! whatever `PATH` was inherited (so a session-specific addition is never LOST), and
-//! sets that as the child shell's `PATH`. Always on: it only ever adds what the
-//! registry says is on `PATH` and loses nothing inherited.
+//! whatever `PATH` was inherited (so a session-specific addition is never LOST, and
+//! what the spawn seam put in front stays there: `union_paths`), and sets that as the
+//! child shell's `PATH`. Always on: it only ever adds what the registry says is on
+//! `PATH` and loses nothing inherited.
 
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -115,9 +116,28 @@ fn registry_path() -> Option<OsString> {
 }
 
 /// Union two `;`-separated PATH strings, case-insensitively de-duplicated, `first`
-/// entries before `extra` ones — preserving order and never emitting a dir twice.
+/// entries before `extra` ones — preserving order and never emitting a dir twice —
+/// except `extra`'s LEAD: every entry before its first one `first` also names stays in
+/// front. That lead is what the spawn seam put first on purpose (the reroute and agents
+/// dirs, the running build's own folder: `reroute_path_env` in aterm-gui) and whatever a
+/// launcher prepended; behind the registry they lost to it, so a tab of a portable or
+/// scratch build ran the installed `aterm` its user PATH names (measured 2026-10-17).
 /// PURE (no I/O), so it is unit-tested below.
 fn union_paths(first: &OsString, extra: Option<&OsString>) -> OsString {
+    let key_of = |seg: &str| seg.trim().trim_end_matches('\\').to_ascii_lowercase();
+    let first = first.to_string_lossy();
+    let extra = extra.map(|extra| extra.to_string_lossy());
+    let first_keys: Vec<String> = first.split(';').map(key_of).collect();
+    let extra_segs: Vec<&str> = extra
+        .as_deref()
+        .map_or_else(Vec::new, |e| e.split(';').collect());
+    let lead = extra_segs
+        .iter()
+        .position(|seg| {
+            let key = key_of(seg);
+            !key.is_empty() && first_keys.contains(&key)
+        })
+        .unwrap_or(extra_segs.len());
     let mut seen: Vec<String> = Vec::new();
     let mut out: Vec<OsString> = Vec::new();
     let mut add = |seg: &str| {
@@ -125,22 +145,21 @@ fn union_paths(first: &OsString, extra: Option<&OsString>) -> OsString {
         if seg.is_empty() {
             return;
         }
-        let key = seg.trim_end_matches('\\').to_ascii_lowercase();
+        let key = key_of(seg);
         if seen.contains(&key) {
             return;
         }
         seen.push(key);
         out.push(OsString::from(seg));
     };
-    let first = first.to_string_lossy();
+    for seg in &extra_segs[..lead] {
+        add(seg);
+    }
     for seg in first.split(';') {
         add(seg);
     }
-    if let Some(extra) = extra {
-        let extra = extra.to_string_lossy();
-        for seg in extra.split(';') {
-            add(seg);
-        }
+    for seg in &extra_segs[lead..] {
+        add(seg);
     }
     // Re-join with ';'.
     let mut joined = OsString::new();
@@ -154,7 +173,8 @@ fn union_paths(first: &OsString, extra: Option<&OsString>) -> OsString {
 }
 
 /// Overwrite the child env's `PATH` with the union of the live registry PATH and the
-/// inherited PATH (registry first, inherited extras kept). No-op when the registry is
+/// inherited PATH (the inherited lead, then the registry, then the inherited extras:
+/// [`union_paths`]). No-op when the registry is
 /// unreadable. `PATH` lookup is case-insensitive
 /// (Windows env names are), so the single canonical `PATH` entry is updated in place.
 pub(crate) fn refresh_child_path(env_pairs: &mut Vec<(OsString, OsString)>) {
@@ -196,6 +216,26 @@ mod tests {
         assert_eq!(
             merged,
             r"C:\Windows\system32;C:\Windows;C:\tools;C:\session-only"
+        );
+    }
+
+    /// What the inherited PATH holds before its first registry entry stays in front:
+    /// the spawn seam's agents dir and the running build's folder lead the tab's PATH,
+    /// ahead of the user PATH's installed aterm, and the rest keeps registry order.
+    #[test]
+    fn union_keeps_the_inherited_lead_in_front() {
+        let reg = os(r"C:\Windows\system32;C:\Users\u\AppData\Local\Programs\aterm");
+        let inherited = os(
+            r"C:\Users\u\pkg\agents;D:\scratch\aterm;;C:\WINDOWS\system32;C:\session-only;D:\scratch\aterm",
+        );
+        assert_eq!(
+            union_paths(&reg, Some(&inherited)).to_string_lossy(),
+            r"C:\Users\u\pkg\agents;D:\scratch\aterm;C:\Windows\system32;C:\Users\u\AppData\Local\Programs\aterm;C:\session-only"
+        );
+        // An inherited PATH sharing nothing with the registry leads it whole.
+        assert_eq!(
+            union_paths(&reg, Some(&os(r"D:\only"))).to_string_lossy(),
+            r"D:\only;C:\Windows\system32;C:\Users\u\AppData\Local\Programs\aterm"
         );
     }
 

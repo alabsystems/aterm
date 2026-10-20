@@ -976,6 +976,256 @@ fn wait_for_exec_status(rd: libc::c_int, budget: std::time::Duration) -> ExecSta
     read_exec_status_now(rd).unwrap_or(ExecStatus::NoVerdict)
 }
 
+// The spawn-kit pool. Every spawn needs a PTY pair and an exec-status channel before
+// its fork, and on Darwin both are filesystem work. Measured on the GUI's spawner
+// thread (`sample` over 200 tab spawns, 2026-10-17, load 7-16): the fifo's `mkfifo`,
+// `unlink` and the final `close` that reclaims its unlinked node took about a third of
+// the spawn, the `/dev/ptmx` open 5-8% (growing about 4 µs per pty open on the
+// machine), the fork 12%. A kit is those four descriptors opened ahead: a frontend's
+// own idle thread fills the pool ([`fill_spawn_kits`]); a spawn takes a ready kit,
+// gives it its winsize and forks, and leaves its spent channel end in the pool for the
+// next fill to close. Each end comes from the same calls a spawn makes itself, so it
+// is close-on-exec from birth and a kit waiting in the pool leaks into no exec'd
+// process. A child some thread forks while a kit waits holds copies until it execs, as
+// with any spawn running beside it; a kit taken later gets its EOF once that child
+// execs or its forker kills it, inside the forker's own `EXEC_STATUS_BUDGET`. A pool
+// nobody fills stays off: each spawn opens its own kit and closes it inline.
+
+/// One spawn's descriptors, opened ahead of its fork: the PTY pair (the spawn termios
+/// on the slave) and the exec-status channel. Dropped unused, it closes all four.
+#[derive(Debug)]
+struct SpawnKit {
+    master: libc::c_int,
+    slave: libc::c_int,
+    status_rd: libc::c_int,
+    status_wr: libc::c_int,
+}
+
+impl SpawnKit {
+    /// Open the exec-status channel, then the PTY pair with the spawn termios and
+    /// `winp` applied to the slave; a pooled kit gets its spawn's winsize at
+    /// [`Self::size`].
+    ///
+    /// # Errors
+    /// The OS error from whichever step failed; no descriptor escapes.
+    fn open(winp: Option<&libc::winsize>) -> io::Result<Self> {
+        let (status_rd, status_wr, _carrier) = open_exec_status_channel()?;
+        // Kernel defaults + IUTF8 + B230400 (`build_spawn_termios`), applied at
+        // slave-open time so no post-fork `tcsetattr` races the shell's own
+        // termios reads.
+        let termp = spawn_termios();
+        match open_pty_pair_cloexec(termp.as_ref(), winp) {
+            Ok((master, slave)) => Ok(Self {
+                master,
+                slave,
+                status_rd,
+                status_wr,
+            }),
+            Err(err) => {
+                // SAFETY: closing the two channel ends opened above; no pty exists,
+                // since `open_pty_pair_cloexec` fails closed.
+                unsafe {
+                    libc::close(status_rd);
+                    libc::close(status_wr);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Give the slave the spawn's winsize, before the fork, as [`Self::open`] does for
+    /// a kit opened by its spawn; best-effort, as `openpty`.
+    fn size(&self, w: &libc::winsize) {
+        // SAFETY: `w` is a live, fully-initialized winsize; `TIOCSWINSZ` reads
+        // exactly that struct through the pointer, on a slave this kit owns.
+        unsafe {
+            libc::ioctl(self.slave, libc::TIOCSWINSZ, ptr::from_ref(w));
+        }
+    }
+
+    /// Hand the four descriptors `(master, slave, status_rd, status_wr)` to the
+    /// spawn, which closes each on its own path.
+    fn into_raw(self) -> (libc::c_int, libc::c_int, libc::c_int, libc::c_int) {
+        let kit = std::mem::ManuallyDrop::new(self);
+        (kit.master, kit.slave, kit.status_rd, kit.status_wr)
+    }
+}
+
+impl Drop for SpawnKit {
+    fn drop(&mut self) {
+        // SAFETY: the four descriptors this kit opened and still owns: an unused
+        // kit, whose ends no spawn took.
+        unsafe {
+            libc::close(self.master);
+            libc::close(self.slave);
+            libc::close(self.status_rd);
+            libc::close(self.status_wr);
+        }
+    }
+}
+
+/// How many spent channel ends wait for the next fill at most. Past it a spawn closes
+/// its own inline, as with the pool off, so a filler that stopped coming leaks nothing.
+const SPENT_MAX: usize = 16;
+
+/// The kits waiting for spawns and the spent channel ends waiting to be closed.
+#[derive(Debug)]
+struct KitPool {
+    /// Turned on by the first fill. Off, a spawn opens its own kit and closes its
+    /// spent channel end inline.
+    on: bool,
+    ready: Vec<SpawnKit>,
+    spent: Vec<libc::c_int>,
+}
+
+impl KitPool {
+    const fn new() -> Self {
+        Self {
+            on: false,
+            ready: Vec::new(),
+            spent: Vec::new(),
+        }
+    }
+
+    /// A ready kit, if the pool is on and holds one.
+    fn take(&mut self) -> Option<SpawnKit> {
+        if self.on { self.ready.pop() } else { None }
+    }
+
+    /// Keep the spent channel end `fd` for the next fill to close; `Some(fd)` back
+    /// when the pool is off or full, for the caller to close now.
+    fn keep_spent(&mut self, fd: libc::c_int) -> Option<libc::c_int> {
+        if self.on && self.spent.len() < SPENT_MAX {
+            self.spent.push(fd);
+            None
+        } else {
+            Some(fd)
+        }
+    }
+}
+
+impl Drop for KitPool {
+    fn drop(&mut self) {
+        for fd in self.spent.drain(..) {
+            // SAFETY: a spent channel end the pool owned and nothing else uses.
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
+/// The process's kit pool.
+static KITS: std::sync::Mutex<KitPool> = std::sync::Mutex::new(KitPool::new());
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own pool for the spawns on its thread, so a test that counts
+    /// kits is not raced by its siblings' spawns through [`KITS`].
+    static TEST_KITS: std::cell::Cell<Option<&'static std::sync::Mutex<KitPool>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The pool this thread's spawns use: [`KITS`], or a test's own.
+fn kit_pool() -> &'static std::sync::Mutex<KitPool> {
+    #[cfg(test)]
+    if let Some(pool) = TEST_KITS.with(std::cell::Cell::get) {
+        return pool;
+    }
+    &KITS
+}
+
+/// Close the spent channel end `fd`: by the next fill when the pool is on, else now.
+/// The last close of the Darwin fifo reclaims its unlinked node, filesystem work a
+/// spawn's caller should not wait for.
+fn retire_spent(fd: libc::c_int) {
+    let kits = kit_pool();
+    let refused = kits
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keep_spent(fd);
+    if let Some(fd) = refused {
+        // SAFETY: the spent channel end this spawn owns; nothing else uses it.
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
+/// The folder a child spawned with no `cwd` `chdir`s into before `exec`: `$HOME` for a
+/// process whose own folder is `/` (an app started from Finder or launchd), else none,
+/// and the child stays in this process's folder. [`spawn_shell_with_pid`] decides by it,
+/// so a caller that must judge that folder first (a home on a network volume that
+/// stopped answering holds the `chdir`, and so the exec verdict) judges the same one.
+pub fn default_start_folder() -> Option<std::ffi::OsString> {
+    if std::env::current_dir().ok().as_deref() == Some(std::path::Path::new("/")) {
+        std::env::var_os("HOME")
+    } else {
+        None
+    }
+}
+
+/// Open spawn kits until `depth` are ready, and close the channel ends spawns left
+/// since the last call. The first call turns the pool on: from then a spawn takes a
+/// ready kit instead of opening its PTY pair and exec-status channel, and leaves its
+/// spent channel end here instead of closing it (see the spawn-kit pool above).
+/// Returns how many kits it opened.
+///
+/// Blocking filesystem work, tens of ms on a busy volume: call it from a thread
+/// nobody waits on.
+///
+/// # Errors
+/// The OS error from the kit that failed to open; the kits opened before it stay.
+pub fn fill_spawn_kits(depth: usize) -> io::Result<usize> {
+    fill_kits(kit_pool(), depth)
+}
+
+/// How many kits wait in the pool for a spawn. Each holds one PTY master (and its
+/// slave) that no session owns yet, so a census of the process's open masters
+/// counts these beside the sessions'. Zero while the pool is off.
+#[must_use]
+pub fn ready_spawn_kits() -> usize {
+    kit_pool()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .ready
+        .len()
+}
+
+/// [`fill_spawn_kits`] on `kits`.
+fn fill_kits(kits: &std::sync::Mutex<KitPool>, depth: usize) -> io::Result<usize> {
+    let spent = {
+        let mut pool = kits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pool.on = true;
+        std::mem::take(&mut pool.spent)
+    };
+    for fd in spent {
+        // SAFETY: a spent channel end the pool owned; its spawn is done with it.
+        unsafe {
+            libc::close(fd);
+        }
+    }
+    let mut opened = 0;
+    // Opened outside the lock, so a spawn taking a kit never waits on the volume.
+    let ready = || {
+        kits.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ready
+            .len()
+    };
+    while ready() < depth {
+        let kit = SpawnKit::open(None)?;
+        kits.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ready
+            .push(kit);
+        opened += 1;
+    }
+    Ok(opened)
+}
+
 /// Spawn the shell in a fresh PTY of `rows`×`cols`, returning the master fd and the
 /// child pid (see [`SpawnedShell`]). Requires a `Cap<Spawn>` of at least `Trusted` tier.
 /// The shell is `$SHELL`; with it unset or empty, the account's login shell from the
@@ -992,7 +1242,7 @@ fn wait_for_exec_status(rd: libc::c_int, budget: std::time::Duration) -> ExecSta
 /// ([`argv_cstrings`]), as does a `shell_override` holding one when the shell would run.
 ///
 /// `cwd` is the directory the child `chdir`s into (`--working-directory`), overriding
-/// the `/`→`$HOME` fallback; a failed `chdir` is non-fatal.
+/// the `/`→`$HOME` fallback ([`default_start_folder`]); a failed `chdir` is non-fatal.
 ///
 /// `sandbox_wrap = Some(sbpl)` runs the program under `/usr/bin/sandbox-exec -p <sbpl>`
 /// (macOS Seatbelt), built in the parent, and fails closed if the wrapper is missing.
@@ -1245,24 +1495,11 @@ pub fn spawn_shell_with_pid_cell_px(
     argv.push(ptr::null());
 
     // chdir target: `--working-directory` (`cwd`) wins; else a launch from `/` (Finder,
-    // launchd) starts in $HOME.
-    let chdir_c: Option<CString> = if let Some(dir) = cwd {
-        CString::new(dir.as_bytes()).ok()
-    } else if std::env::current_dir().ok().as_deref() == Some(std::path::Path::new("/")) {
-        std::env::var_os("HOME").and_then(|h| CString::new(h.as_bytes()).ok())
-    } else {
-        None
+    // launchd) starts in $HOME ([`default_start_folder`]).
+    let chdir_c: Option<CString> = match cwd {
+        Some(dir) => CString::new(dir.as_bytes()).ok(),
+        None => default_start_folder().and_then(|h| CString::new(h.as_bytes()).ok()),
     };
-
-    // Exec-status channel, both ends close-on-exec from birth (see
-    // `open_exec_status_channel`): a successful `execve` closes the child's write end
-    // and the parent reads EOF; a pre-exec failure (sandbox or `execve`) writes one
-    // reason byte, and the parent returns an error instead of the master.
-    let (status_rd, status_wr, _status_carrier) = open_exec_status_channel()?;
-    // The child's inheritance strip (step 0c), prepared in the parent: its last-resort
-    // bound is the kernel's per-process maximum, which no thread can raise before the
-    // fork.
-    let inherit_strip = aterm_uds::spawnfd::InheritStrip::prepare();
 
     // The child's first winsize, pixel fields included, for a tool that reads
     // TIOCGWINSZ before any resize.
@@ -1273,23 +1510,29 @@ pub fn spawn_shell_with_pid_cell_px(
         ws_xpixel,
         ws_ypixel,
     };
-    // Kernel defaults + IUTF8 + B230400 (`build_spawn_termios`), applied at slave-open
-    // time so no post-fork `tcsetattr` races the shell's own termios reads.
-    let termp = spawn_termios();
-    // The PTY pair, both ends close-on-exec from birth, with termios and winsize applied
-    // to the slave before the fork (see `open_pty_pair_cloexec`).
-    let (master, slave) = match open_pty_pair_cloexec(termp.as_ref(), Some(&ws)) {
-        Ok(pair) => pair,
-        Err(err) => {
-            // SAFETY: closing the two pipe fds we just opened; no pty exists —
-            // `open_pty_pair_cloexec` fails closed and leaks no descriptor.
-            unsafe {
-                libc::close(status_rd);
-                libc::close(status_wr);
-            }
-            return Err(err);
+    // The exec-status channel and the PTY pair, every end close-on-exec from birth: a
+    // kit the pool opened ahead, given this spawn's winsize, else opened here (see the
+    // spawn-kit pool). On the channel a successful `execve` closes the child's write
+    // end and the parent reads EOF; a pre-exec failure (sandbox or `execve`) writes one
+    // reason byte, and the parent returns an error instead of the master. The slave
+    // has the spawn termios and the winsize before the fork (`open_pty_pair_cloexec`).
+    let kits = kit_pool();
+    let pooled = kits
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let kit = match pooled {
+        Some(kit) => {
+            kit.size(&ws);
+            kit
         }
+        None => SpawnKit::open(Some(&ws))?,
     };
+    let (master, slave, status_rd, status_wr) = kit.into_raw();
+    // The child's inheritance strip (step 0c), prepared in the parent: its last-resort
+    // bound is the kernel's per-process maximum, which no thread can raise before the
+    // fork.
+    let inherit_strip = aterm_uds::spawnfd::InheritStrip::prepare();
     // SAFETY: `fork` takes no arguments and returns the child pid in the parent,
     // 0 in the child, or -1 on failure.
     let pid = unsafe { libc::fork() };
@@ -1396,6 +1639,16 @@ pub fn spawn_shell_with_pid_cell_px(
                 libc::_exit(126);
             }
         }
+        // (1b) a shell's own band (macOS), part of the spec's `Setrlimit` step: see
+        //     [`SHELL_ROLE`]. One system call, async-signal-safe; a refusal (aterm is
+        //     no app) leaves the band the child inherited.
+        #[cfg(target_os = "macos")]
+        if !runs_program {
+            // SAFETY: sets this process's own darwin role; takes no pointers.
+            unsafe {
+                libc::setpriority(PRIO_DARWIN_ROLE, 0, SHELL_ROLE);
+            }
+        }
         // (2) chdir (`--working-directory`, or $HOME when started from `/`).
         if let Some(dir) = &chdir_c {
             // SAFETY: `dir` is a valid NUL-terminated path; `chdir` is async-signal-safe.
@@ -1446,10 +1699,9 @@ pub fn spawn_shell_with_pid_cell_px(
         libc::close(status_wr);
     }
     let status = wait_for_exec_status(status_rd, EXEC_STATUS_BUDGET);
-    // SAFETY: done with the read end, on every branch below.
-    unsafe {
-        libc::close(status_rd);
-    }
+    // Done with the read end, on every branch below: the pool's next fill closes it
+    // when the pool is on ([`retire_spent`]).
+    retire_spent(status_rd);
     let failure: Option<(io::ErrorKind, String)> = match status {
         // EOF: the kernel closed the child's close-on-exec write end at the image
         // switch. The only success verdict.
@@ -1811,6 +2063,12 @@ fn reap_shell_scheduled(
         if r == pid {
             return; // reaped
         }
+        #[cfg(any(test, debug_assertions))]
+        if Some(tick) == kill_at {
+            while HOLD_REAP_KILLS.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(POLL);
+            }
+        }
         // Alive past the grace: it ignored SIGHUP. Re-verify immediately before the
         // SIGKILL, since the check above may be one `waitpid` stale.
         if Some(tick) == kill_at && identity.verify() {
@@ -1898,6 +2156,33 @@ pub fn wait_for_reaps(bound: std::time::Duration) -> bool {
         .wait_timeout_while(in_grace, bound, |n| *n > 0)
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *in_grace == 0
+}
+
+/// Set while a [`ReapKillHold`] lives: every [`reap_shell`] that reaches its SIGKILL
+/// tick waits there, still in its grace.
+#[cfg(any(test, debug_assertions))]
+static HOLD_REAP_KILLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Test seam (a debug build's, for other crates' tests): until the returned guard
+/// drops, every [`reap_shell`] in this process stays in its grace at its SIGKILL tick,
+/// so a test can read "a closed tab's reap is in its grace" without racing the ~250 ms
+/// grace. Process-wide: a caller runs alone in its process.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn hold_reap_kills_for_test() -> ReapKillHold {
+    HOLD_REAP_KILLS.store(true, std::sync::atomic::Ordering::Release);
+    ReapKillHold(())
+}
+
+/// [`hold_reap_kills_for_test`]'s guard: dropping it lets the held reaps go on.
+#[cfg(any(test, debug_assertions))]
+pub struct ReapKillHold(());
+
+#[cfg(any(test, debug_assertions))]
+impl Drop for ReapKillHold {
+    fn drop(&mut self) {
+        HOLD_REAP_KILLS.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// [`reap_shell`]'s poll period.
@@ -2174,6 +2459,21 @@ pub fn write_some(master: i32, bytes: &[u8]) -> io::Result<usize> {
         return Ok(r as usize);
     }
 }
+
+/// Unix twin of the Windows `as_reply`, which lets the terminal's answers to
+/// queries pass a ConPTY session's resize guard: a PTY has no such guard, so
+/// this is `write()`. Kept so the reply writer has one call shape.
+#[inline]
+pub fn as_reply<T>(write: impl FnOnce() -> T) -> T {
+    write()
+}
+
+/// Unix twin of the Windows `settle_input`, which runs a ConPTY session's
+/// resize-guard client before an input writer takes the lock the terminal's
+/// answers need: a PTY has no such guard, so this does nothing. Kept so the
+/// sink has one call shape.
+#[inline]
+pub fn settle_input(_master: i32) {}
 
 /// A single non-parking `write(2)`, classified for aterm-session's
 /// `SinkWriter::write_frame_nonparking`, which must tell `WouldBlock` from a fatal error
@@ -3147,6 +3447,36 @@ pub fn declare_interactive_thread() {
     }
 }
 
+/// `PRIO_DARWIN_ROLE` (`<sys/resource.h>`, private): `setpriority`'s darwin-role
+/// selector. Not in `libc`, which is generated from a pinned reference.
+#[cfg(target_os = "macos")]
+pub(crate) const PRIO_DARWIN_ROLE: libc::c_int = 6;
+
+/// The darwin role a spawned SHELL takes before its `execve`:
+/// `PRIO_DARWIN_ROLE_UI`, "may draw UI, focus unknown" (`TASK_DEFAULT_APPLICATION`).
+///
+/// A fork child of an app (aterm.app is one, and the app type is inherited) starts
+/// with no role, and macOS squashes the user-interactive and user-initiated threads
+/// of an app without a role to the legacy band, 31: on a busy machine the band that
+/// waits behind every build and runs on the efficiency cores. With this role the
+/// shell's main thread runs at its user-interactive class, priority 46, one below
+/// aterm's own UI thread (47, the frontmost app's). Measured 2026-10-18 (LAG-7, M4
+/// Max, 12 busy threads beside it): a cold spawn reached its first prompt in 20.5 ms
+/// instead of 27.0 (medians, n=30), and zsh echoed a typed key at p90 0.09-1.07 ms
+/// instead of 0.44-2.75. An idle machine already ran the shell on a performance core.
+/// The price: a starting shell outranks aterm's own Responsive lanes (37), so on that
+/// busy machine a control `spawn`'s reply took 4.65 ms instead of 3.50.
+///
+/// THE ROLE STOPS AT THE SHELL. It survives `execve` (a shell that `exec`s keeps it)
+/// and not `fork`: every program the shell starts runs in the default band again, so
+/// a build never outranks aterm's PTY drain. A program run directly (`-e`) is no
+/// shell and keeps the default too. Only an app may hold a role: an aterm that is
+/// none (started by launchd as a job, over ssh) gets `ENOTSUP`, and its shells keep
+/// the band they inherited. Read back: a role 0 zsh at priority 31, a role 2 zsh at
+/// 46 and its forked child at 31.
+#[cfg(target_os = "macos")]
+pub(crate) const SHELL_ROLE: libc::c_int = 2;
+
 /// Close a raw fd (a wake-pipe end). Best-effort; ignores a negative sentinel.
 pub fn close_fd(fd: i32) {
     if fd >= 0 {
@@ -3157,9 +3487,10 @@ pub fn close_fd(fd: i32) {
     }
 }
 
-/// Focus-linked shell QoS boost: a no-op on Unix, where raising another process's
-/// priority needs root and macOS has no cross-process QoS API. The Windows
-/// implementation is in `src/windows/mod.rs`.
+/// Focus-linked shell QoS boost: a no-op on Unix. On macOS every shell already runs
+/// in the UI tier from its spawn (`SHELL_ROLE`), focused or not; elsewhere raising
+/// another process's priority needs root. The Windows implementation is in
+/// `src/windows/mod.rs`.
 pub fn set_focus_boost(_master: i32, _on: bool) {}
 
 /// Resize the PTY to `rows`×`cols` (`TIOCSWINSZ`) with the pixel fields zero; prefer

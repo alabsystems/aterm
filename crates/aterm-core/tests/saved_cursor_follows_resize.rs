@@ -245,52 +245,73 @@ fn a_saved_column_past_the_lines_content_keeps_its_distance() {
 }
 
 /// A slot a shrink left past the grid (DECSC on the blank row below the
-/// cursor, which the shrink trimmed) is below the content it followed, and a
-/// grow that reveals history moves it down with that content, still past the
-/// grid. Grown once more, with no history left to reveal, the grid gains the
-/// blank row the slot names, and DECRC lands there, not on the last line of
-/// output, which a slot clamped into the grid at the reveal would overwrite.
+/// cursor, which the shrink trimmed) is below the content it followed. A grow
+/// hands the trimmed row back before it reveals history (`aterm_grid`'s rows
+/// hand-back) and moves the slot down with the content it reveals over, so the
+/// slot is back on its own row, the blank under the output. With the trim
+/// forgotten (the law before the hand-back, which a replay of an older
+/// recording runs) the grow reveals history only and the slot rides it, still
+/// past the grid. Grown once more, the grid gains the blank row the slot
+/// names, and DECRC lands there, not on the last line of output, which a slot
+/// clamped into the grid at the reveal would overwrite.
 #[test]
 fn a_slot_past_the_grid_rides_a_reveal_below_the_content() {
     for path in [Path::Sync, Path::Offloaded] {
-        let mut term = Terminal::new(6, 20);
-        for i in 0..9 {
-            term.process(format!("line {i}\r\n").as_bytes());
+        for forget in [false, true] {
+            let at = format!("{path:?} forget={forget}");
+            let mut term = Terminal::new(6, 20);
+            for i in 0..9 {
+                term.process(format!("line {i}\r\n").as_bytes());
+            }
+            // DECSC on the blank last row, then up onto `line 8`.
+            term.process(b"\x1b7\x1b[A");
+            path.resize(&mut term, 5, 20);
+            let slot = |term: &Terminal| {
+                term.checkpoint_carry(0)
+                    .and_then(|cp| cp.saved_cursor_main)
+                    .map(|saved| (saved.cursor_row, saved.cursor_col))
+            };
+            assert_eq!(
+                slot(&term),
+                Some((5, 0)),
+                "{at}: the shrink trimmed its row"
+            );
+            if forget {
+                term.grid_mut().forget_handback();
+            }
+            path.resize(&mut term, 9, 20);
+            if forget {
+                assert_eq!(
+                    screen(&term)[0],
+                    "line 0",
+                    "{at}: the grow revealed history"
+                );
+                assert_eq!(slot(&term), Some((9, 0)), "{at}: still past the grid");
+            } else {
+                assert_eq!(
+                    screen(&term)[0],
+                    "line 1",
+                    "{at}: the blank came back first"
+                );
+                assert_eq!(screen(&term)[7], "line 8", "{at}");
+                assert_eq!(slot(&term), Some((8, 0)), "{at}: back on its own row");
+            }
+            path.resize(&mut term, 10, 20);
+            term.process(b"\x1b8X");
+            assert_eq!(screen(&term)[8], "line 8", "{at}");
+            assert_eq!(screen(&term)[9], "X", "{at}");
         }
-        // DECSC on the blank last row, then up onto `line 8`.
-        term.process(b"\x1b7\x1b[A");
-        path.resize(&mut term, 5, 20);
-        let slot = |term: &Terminal| {
-            term.checkpoint_carry(0)
-                .and_then(|cp| cp.saved_cursor_main)
-                .map(|saved| (saved.cursor_row, saved.cursor_col))
-        };
-        assert_eq!(
-            slot(&term),
-            Some((5, 0)),
-            "{path:?}: the shrink trimmed its row"
-        );
-        path.resize(&mut term, 9, 20);
-        assert_eq!(
-            screen(&term)[0],
-            "line 0",
-            "{path:?}: the grow revealed history"
-        );
-        assert_eq!(slot(&term), Some((9, 0)), "{path:?}: still past the grid");
-        path.resize(&mut term, 10, 20);
-        term.process(b"\x1b8X");
-        assert_eq!(screen(&term)[8], "line 8", "{path:?}");
-        assert_eq!(screen(&term)[9], "X", "{path:?}");
     }
 }
 
-/// A narrowing that rewraps more rows than fit below the cursor drops them
-/// (the Native rule keeps the cursor's rows). A slot saved on a dropped line
-/// stays past the grid where that line went, not clamped onto the last row
-/// kept, so a grow followed by DECRC lands on a blank row below the kept
-/// output instead of overwriting it.
+/// A narrowing that rewraps more rows than fit below a cursor too near the top
+/// pushes them off the bottom into history, as a rows-only shrink's bottom push
+/// does, and the grow back puts them back under the screen (ATERM-KI-1015-1:
+/// it dropped them). A slot saved on one of them stays past the grid while its
+/// line is in history, not clamped onto the last row kept, and comes back
+/// with it: DECRC after the grow lands on its own cell.
 #[test]
-fn a_slot_on_a_line_the_narrowing_dropped_stays_past_the_grid() {
+fn a_slot_on_a_line_the_narrowing_pushed_off_comes_back_with_it() {
     for path in [Path::Sync, Path::Offloaded] {
         let mut term = Terminal::new(4, 10);
         term.process(b"\x1b[2;1Haaaaaaaaaa\x1b[3;1Hbbbbbbbbbb\x1b[4;1Hcccccccccc");
@@ -299,24 +320,25 @@ fn a_slot_on_a_line_the_narrowing_dropped_stays_past_the_grid() {
         assert_eq!(
             screen(&term),
             ["$ ", "aaaaa", "aaaaa", "bbbbb"],
-            "{path:?}: PRECONDITION: the rows past the cursor's were dropped"
+            "{path:?}: PRECONDITION: the rows past the cursor's went to history"
         );
         path.resize(&mut term, 7, 5);
         term.process(b"\x1b8X");
         assert_eq!(
             screen(&term),
-            ["$ ", "aaaaa", "aaaaa", "bbbbb", "", "  X", ""],
+            ["$ ", "aaaaa", "aaaaa", "bbbbb", "bbbbb", "ccXcc", "ccccc"],
             "{path:?}"
         );
     }
 }
 
-/// A slot past the grid (its blank row trimmed) rides the deficit fill that
-/// bottom-anchors a widening, still past the grid: grown by a row once the
-/// history is spent, DECRC lands on the blank row under the output, not on
-/// its last line.
+/// A slot past the grid (its blank row trimmed) stays past the grid through a
+/// widening, which puts that blank row back under the output (the rows
+/// hand-back lays the widened rows out as the screen held them): DECRC lands
+/// on the blank row under the output, and once grown by a row, which reveals
+/// history at the top, on the blank row again, not on the output's last line.
 #[test]
-fn a_slot_past_the_grid_rides_the_deficit_fill_below_the_content() {
+fn a_slot_past_the_grid_stays_below_the_content_through_a_widening() {
     for path in [Path::Sync, Path::Offloaded] {
         let mut term = Terminal::new(6, 10);
         term.process(b"h0\r\nh1\r\n0123456789abcdefghij\r\nx2\r\nx3\r\n");
@@ -326,8 +348,8 @@ fn a_slot_past_the_grid_rides_the_deficit_fill_below_the_content() {
         path.resize(&mut term, 5, 20);
         assert_eq!(
             screen(&term),
-            ["h0", "h1", "0123456789abcdefghij", "x2", "x3"],
-            "{path:?}: PRECONDITION: the widening pulled the history back"
+            ["h1", "0123456789abcdefghij", "x2", "x3", ""],
+            "{path:?}: PRECONDITION: the widening put the trimmed blank row back"
         );
         path.resize(&mut term, 6, 20);
         term.process(b"\x1b8X");
@@ -335,6 +357,58 @@ fn a_slot_past_the_grid_rides_the_deficit_fill_below_the_content() {
             screen(&term),
             ["h0", "h1", "0123456789abcdefghij", "x2", "x3", "X"],
             "{path:?}"
+        );
+    }
+}
+
+/// A move that follows the content inside an offloaded width change's window
+/// keeps the history rows the re-attach owes (`FillDebt`): DECRC and the 1049
+/// exit's restore (the slot moves with the rows), VT52 `ESC A` and the reverse
+/// wrap (one row up from the cursor) land on the rows the synchronous resize
+/// moved down, and the re-attach pulls the history over the blanks under them
+/// as that resize did. A full screen widened in one step: every row ends where
+/// the synchronous resize leaves it.
+#[test]
+fn a_move_that_follows_the_content_in_the_offload_window_keeps_the_owed_rows() {
+    let fixture = |term: &mut Terminal| {
+        for i in 0..12 {
+            term.process(format!("line {i:02} {}\r\n", "x".repeat(24)).as_bytes());
+        }
+        term.process(b"\x1b[2J\x1b[H");
+        term.process(format!("{}\r\n{}\r\n", "a".repeat(27), "b".repeat(27)).as_bytes());
+        // DECSC on `top`, then the prompt on the last row: a full screen.
+        term.process(b"\x1b7top\r\n$ ");
+    };
+    // (name, before the resize, inside the window)
+    for (name, before, step) in [
+        ("DECRC", &b""[..], &b"\x1b8X"[..]),
+        ("1049 exit after 47", b"\x1b[?47h", b"\x1b[?1049lX"),
+        ("VT52 ESC A", b"", b"\x1b[?2l\x1bAX\x1b<"),
+        ("reverse wrap", b"", b"\x1b[?45h\r\x08X"),
+    ] {
+        let mut sync = Terminal::with_scrollback(6, 20, 2, Scrollback::with_defaults());
+        let mut offloaded = Terminal::with_scrollback(6, 20, 2, Scrollback::with_defaults());
+        for term in [&mut sync, &mut offloaded] {
+            fixture(term);
+            term.process(before);
+        }
+        sync.resize(6, 40);
+        let mut job = offloaded.resize_offloading_scrollback(6, 40);
+        assert!(job.is_some(), "{name}: PRECONDITION: the widening detaches");
+        assert!(
+            !before.is_empty() || screen(&offloaded)[0] != screen(&sync)[0],
+            "{name}: PRECONDITION: the window's screen owes the rows the synchronous one pulled"
+        );
+        sync.process(step);
+        offloaded.process(step);
+        while let Some(pending) = job {
+            job = offloaded.finish_resize_offload(pending.reflow());
+        }
+        assert_eq!(screen(&offloaded), screen(&sync), "{name}: the screen");
+        assert_eq!(
+            offloaded.grid().cursor(),
+            sync.grid().cursor(),
+            "{name}: the cursor"
         );
     }
 }

@@ -25,14 +25,37 @@
 //!   the controller. A headless RFB client connects to the printed port itself. Like `screen`
 //!   it needs a terminal on standard input and standard error, so a harness runs it on a pty.
 
+#[cfg(unix)]
 use aterm_machines::controller::enroll::{self, Master, Request, Trust};
+#[cfg(unix)]
 use aterm_machines::controller::inventory::Paths;
+#[cfg(unix)]
 use aterm_machines::port::{Live, System};
+#[cfg(unix)]
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+// The crate is unix-only (`src/lib.rs`); elsewhere this dev tool honestly refuses.
+#[cfg(not(unix))]
 fn main() -> ExitCode {
+    eprintln!("aterm-machines-dev: unsupported here (aterm machines manages Macs, from a Mac)");
+    ExitCode::from(2)
+}
+
+#[cfg(unix)]
+fn main() -> ExitCode {
+    // Enrolled from this dev binary, `ssh` runs it as `enroll`'s SSH_ASKPASS helper through
+    // the link `aterm-machines-askpass`, as crates/aterm's front door routes that alias.
+    let argv0 = std::env::args_os().next().unwrap_or_default();
+    if Path::new(&argv0)
+        .file_name()
+        .is_some_and(|n| n == aterm_machines::askpass::ALIAS)
+    {
+        let rest: Vec<OsString> = std::env::args_os().skip(1).collect();
+        return aterm_machines::askpass::main(&rest);
+    }
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let words: Vec<String> = args
         .iter()
@@ -61,6 +84,7 @@ fn main() -> ExitCode {
 /// [--artifact <sha256>] [--exec '<absolute program> <args>'] [--upgrade <dev-zip sha256>
 /// --version <v>] [--issued <unix>] [--expires <unix>]`:
 /// one envelope, signed by `envelope::seal`, on standard output.
+#[cfg(unix)]
 fn seal(words: &[String]) -> ExitCode {
     use aterm_machines::envelope::{self, Action, ArtifactRef, Disrupt, Envelope, Exec, Upgrade};
     let mut get = std::collections::BTreeMap::new();
@@ -142,6 +166,7 @@ fn seal(words: &[String]) -> ExitCode {
     }
 }
 
+#[cfg(unix)]
 fn relay(words: &[String]) -> ExitCode {
     use aterm_machines::controller::screen;
     use aterm_machines::controller::ssh::{self, Target};
@@ -229,8 +254,10 @@ fn relay(words: &[String]) -> ExitCode {
 /// An opener that opens nothing: it prints the URL it was handed (which carries the relay's
 /// local port) and returns, so the walk goes on to wait for the login session while a
 /// headless RFB client connects to that port. No window is ever opened on the controller.
+#[cfg(unix)]
 struct PrintOpener;
 
+#[cfg(unix)]
 impl aterm_machines::controller::screen::Opener for PrintOpener {
     fn open(&self, url: &str) -> Result<(), String> {
         use std::io::Write as _;
@@ -242,6 +269,7 @@ impl aterm_machines::controller::screen::Opener for PrintOpener {
 
 /// `screen-headless <host> [<step>] --controller <dir>`: `aterm machines screen` with
 /// [`PrintOpener`] in place of the live opener.
+#[cfg(unix)]
 fn screen_headless(words: &[String]) -> ExitCode {
     use aterm_machines::controller::commands::{self, Env};
     use aterm_machines::controller::screen::Terminals;
@@ -281,6 +309,7 @@ fn screen_headless(words: &[String]) -> ExitCode {
     commands::walk(&env, host, false, step, terminals, &PrintOpener)
 }
 
+#[cfg(unix)]
 fn enroll_through(words: &[String]) -> ExitCode {
     let mut master = None;
     let mut address = None;

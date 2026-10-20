@@ -62,7 +62,7 @@ use aterm_spec::derive::Model;
 /// slot's).
 ///
 /// Tier-0 is `tests/derived_crash_restore.rs`; Tier-1
-/// (`aterm-restore/src/conformance_region_tests.rs`) drives the real writer over a
+/// (`aterm-restore/src/conformance_region.rs`) drives the real writer over a
 /// store that dies at every primitive store and runs the real `recover`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]

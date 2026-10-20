@@ -1,0 +1,30 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Monitor whose command printed one line of 147 characters ending in 'Usage limit reached · resets 3pm': its event row is cut with … at the pane's edge, one row, never wrapped (the reply after it an API error: the stub's custom mode streamed nothing)
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ toolstart
+
+⏺ Monitor(build watch)
+  ⎿  Monitor started · task bbhephj1d · timeout 300s
+
+⏺ Watching the build.
+
+✻ Brewed for 0s · done 5:37 PM · 1 monitor still running
+
+⏺ Monitor event: the nightly pipeline finished its integration suite and the deploy gate reported back to the build bot: Usage limit reached · …
+
+⏺ Streaming response ended before any complete data was received. Retrying without streaming. If this keeps happening, check any proxy
+  or gateway between Claude Code and your model provider.
+
+⏺ API Error: API returned an empty or malformed response (HTTP 200) — check for a proxy or gateway intercepting the request. Response:
+  content-type none, empty body, 0 bytes, request-id absent, server other. This was the non-streaming retry of streaming request (no
+  Anthropic request-id), which failed with: no_events, StreamNoEventsError; 0 stream events received.
+
+✻ Cooked for 0s · done 5:37 PM · 1 monitor still running
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 1 monitor · ↓ to manage

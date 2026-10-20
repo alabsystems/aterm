@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use crate::support::{Lib, SYSTEM_PATH, Scratch, bash, install_sh, q, s, sh, symlink};
+use crate::support::{Lib, Scratch, bash, install_sh, q, s, sh, symlink, system_path};
 
 /// Long enough that a script's first exec, waiting on the system's code
 /// assessment on a loaded machine, still answers; short of the batch's hang
@@ -203,7 +203,7 @@ fn a_foreign_binary_can_neither_swallow_nor_stall_the_installer() {
         store = q(s(&store)),
     );
     let home = scratch.mkdir("home");
-    let run = sh(&script, &[("PATH", SYSTEM_PATH), ("HOME", s(&home))]);
+    let run = sh(&script, &[("PATH", system_path()), ("HOME", s(&home))]);
     assert_eq!(
         run.stdout,
         "verdict=foreign not a symlink — a hand-built binary this installer did not place\nLINE-AFTER-THE-PROBE\n",

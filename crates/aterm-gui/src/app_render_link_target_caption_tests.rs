@@ -944,7 +944,10 @@ fn a_stationary_pointer_event_under_mouse_tracking_takes_no_lock_and_reports_not
         );
 
         // The wheel tick itself is still the app's to hear.
-        app.on_mouse_wheel(wid, winit::event::MouseScrollDelta::LineDelta(0.0, -1.0));
+        app.on_mouse_wheel(
+            wid,
+            aterm_window::event::MouseScrollDelta::LineDelta(0.0, -1.0),
+        );
         let reported = drain();
         assert!(
             reported.starts_with(b"\x1b[<64;") || reported.starts_with(b"\x1b[<65;"),
@@ -1047,7 +1050,10 @@ fn a_keyboard_focus_move_under_a_still_pointer_re_derives_the_cell_before_the_wh
         drain().is_empty(),
         "…and still reports no motion under 1000 for a pointer that did not move"
     );
-    app.on_mouse_wheel(wid, winit::event::MouseScrollDelta::LineDelta(0.0, -1.0));
+    app.on_mouse_wheel(
+        wid,
+        aterm_window::event::MouseScrollDelta::LineDelta(0.0, -1.0),
+    );
     let reported = drain();
     let expected_tail = format!(";{};{}M", b_cell.1 + 1, b_cell.0 + 1);
     assert!(
@@ -1068,7 +1074,10 @@ fn a_keyboard_focus_move_under_a_still_pointer_re_derives_the_cell_before_the_wh
     );
     assert!(drain().is_empty());
     assert_eq!(app.windows[&wid].last_mouse_cell, b_cell);
-    app.on_mouse_wheel(wid, winit::event::MouseScrollDelta::LineDelta(0.0, -1.0));
+    app.on_mouse_wheel(
+        wid,
+        aterm_window::event::MouseScrollDelta::LineDelta(0.0, -1.0),
+    );
     let reported = drain();
     assert!(
         reported.ends_with(expected_tail.as_bytes()),
@@ -1087,66 +1096,6 @@ fn strip_px(app: &App, wid: WindowId, col: u16) -> (f64, f64) {
         app.win_pad(wid) as f64 + cw as f64 * (f64::from(col) + 0.5),
         (app.win_pad_top(wid) + app.win_head(wid)) as f64 + ch as f64 * 0.5,
     )
-}
-
-/// The frame-time refresh continues the last routing decision: during a
-/// connector drag it must not swap the grab cursor for an I-beam or caption
-/// a link under the dragging hand.
-#[test]
-fn a_connector_drag_crossing_a_link_keeps_the_grab_and_earns_no_caption() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    app.tab_strip_rows = 1;
-    app.splice_tab_strip(wid);
-    feed(&app, wid, PHISH);
-    // The grid arm has resolved once: a memo exists and the I-beam is up.
-    hover(&mut app, wid, 0, LINK_COL);
-    assert!(
-        compose(&mut app, wid)
-            .last()
-            .expect("rows")
-            .contains(TARGET),
-        "precondition: the destination is disclosed"
-    );
-    assert!(
-        app.windows[&wid].native_text_cursor,
-        "precondition: the grid's I-beam"
-    );
-    // Press the connector on the strip and drag down across the link cell
-    // through the real motion path.
-    let (sx, sy) = strip_px(&app, wid, 2);
-    app.on_cursor_moved(wid, sx, sy);
-    assert!(
-        !app.windows[&wid].native_text_cursor && !app.windows[&wid].hover_pointer,
-        "the strip resolves the plain arrow"
-    );
-    assert!(app.conn_drag_arm(wid, 0), "tab 0 has a session to drag");
-    let (ox, oy) = app.conn_drag.as_ref().expect("armed").origin;
-    app.on_cursor_moved(wid, ox + crate::conn_drag::CONN_DRAG_THRESHOLD_PX * 2.0, oy);
-    assert!(
-        app.conn_drag.as_ref().expect("armed").dragging,
-        "past the threshold: the grab cursor was set"
-    );
-    hover(&mut app, wid, 0, LINK_COL);
-    assert!(app.conn_drag.is_some(), "the drag swallowed the motion");
-    // Frames during the drag (the wire repaint): the grab stands, no
-    // caption is spliced, no hover is published.
-    for frame in 0..2 {
-        let rows = compose(&mut app, wid);
-        assert!(
-            !rows.concat().contains("example"),
-            "frame {frame}: no caption mid-drag: {rows:?}"
-        );
-        assert!(
-            app.windows[&wid].link_hover.is_none(),
-            "frame {frame}: no hover published under a drag"
-        );
-        assert!(
-            !app.windows[&wid].native_text_cursor && !app.windows[&wid].hover_pointer,
-            "frame {frame}: the frame did not replace the grab with an I-beam"
-        );
-    }
-    app.conn_drag_abort();
 }
 
 /// The tab context menu owns the pointer while up; a frame must not paint an
@@ -1295,9 +1244,9 @@ fn a_pointer_over_a_sibling_pane_discloses_nothing() {
     // The open modifier is down, so the pointer hand is live too.
     if let Some(ws) = app.windows.get_mut(&wid) {
         ws.mods = if cfg!(target_os = "macos") {
-            winit::keyboard::ModifiersState::SUPER
+            aterm_window::keyboard::ModifiersState::SUPER
         } else {
-            winit::keyboard::ModifiersState::CONTROL
+            aterm_window::keyboard::ModifiersState::CONTROL
         };
     }
 

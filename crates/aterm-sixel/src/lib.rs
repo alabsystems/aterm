@@ -118,13 +118,13 @@ pub struct SixelImage {
 impl SixelImage {
     /// Image width in pixels.
     #[must_use]
-    pub fn width(&self) -> usize {
+    pub const fn width(&self) -> usize {
         self.width
     }
 
     /// Image height in pixels.
     #[must_use]
-    pub fn height(&self) -> usize {
+    pub const fn height(&self) -> usize {
         self.height
     }
 
@@ -137,32 +137,33 @@ impl SixelImage {
     /// Number of grid rows this image spans given a cell height in pixels.
     /// Always at least 1 for a non-empty image.
     #[must_use]
-    pub fn rows_spanned(&self, cell_h: u16) -> usize {
-        // Pin the divisor nonzero via an explicit branch (the verifier does not
-        // carry `.max(1) >= 1`), then do a manual ceil-div: `div_ceil` is an
-        // absent std callee whose panic-freedom obligation cannot be discharged.
-        // `saturating_add` for the ceil bump can never really saturate (the
-        // rounding term is only added when `cell_h >= 2`, so the quotient is
-        // `<= height/2`), so this is byte-identical to `height.div_ceil(cell_h)`.
-        let ch = usize::from(cell_h);
+    pub const fn rows_spanned(&self, cell_h: u16) -> usize {
+        let ch = cell_h as usize;
         let cell_h = if ch == 0 { 1 } else { ch };
-        let ceil =
-            (self.height / cell_h).saturating_add(usize::from(!self.height.is_multiple_of(cell_h)));
-        ceil.max(usize::from(self.height > 0))
+        let rem_bump = if self.height.is_multiple_of(cell_h) {
+            0
+        } else {
+            1
+        };
+        let ceil = (self.height / cell_h).saturating_add(rem_bump);
+        let min_span = if self.height > 0 { 1 } else { 0 };
+        if ceil > min_span { ceil } else { min_span }
     }
 
     /// Number of grid columns this image spans given a cell width in pixels.
     /// Always at least 1 for a non-empty image.
     #[must_use]
-    pub fn cols_spanned(&self, cell_w: u16) -> usize {
-        // Manual ceil-div with a branch-pinned nonzero divisor; see
-        // `rows_spanned` for why `div_ceil` is rewritten and the
-        // `saturating_add` is behavior-identical.
-        let cw = usize::from(cell_w);
+    pub const fn cols_spanned(&self, cell_w: u16) -> usize {
+        let cw = cell_w as usize;
         let cell_w = if cw == 0 { 1 } else { cw };
-        let ceil =
-            (self.width / cell_w).saturating_add(usize::from(!self.width.is_multiple_of(cell_w)));
-        ceil.max(usize::from(self.width > 0))
+        let rem_bump = if self.width.is_multiple_of(cell_w) {
+            0
+        } else {
+            1
+        };
+        let ceil = (self.width / cell_w).saturating_add(rem_bump);
+        let min_span = if self.width > 0 { 1 } else { 0 };
+        if ceil > min_span { ceil } else { min_span }
     }
 }
 
@@ -427,6 +428,36 @@ impl SixelDecoder {
         self.raster
             .len()
             .saturating_mul(core::mem::size_of::<u32>())
+    }
+
+    /// Returns `true` if the decoder is currently between `hook` and `unhook`/`abort`.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Returns the currently selected palette register (`0..MAX_COLOR_REGISTERS`).
+    #[must_use]
+    pub const fn current_color(&self) -> usize {
+        self.current_color
+    }
+
+    /// Returns the current write column (`x`) and band top (`band_top`).
+    #[must_use]
+    pub const fn cursor_pos(&self) -> (usize, usize) {
+        (self.x, self.band_top)
+    }
+
+    /// Returns the exclusive maximum painted coordinates `(max_x, max_y)`.
+    #[must_use]
+    pub const fn painted_extent(&self) -> (usize, usize) {
+        (self.max_x, self.max_y)
+    }
+
+    /// Returns the DECGRA declared raster dimensions `(declared_w, declared_h)`.
+    #[must_use]
+    pub const fn declared_dimensions(&self) -> (usize, usize) {
+        (self.declared_w, self.declared_h)
     }
 
     // --- internals ---------------------------------------------------------
@@ -812,8 +843,9 @@ impl SixelDecoder {
 }
 
 /// Scale an `0..=100` percent component to `0..=255`.
-fn scale_pct(v: u32) -> u32 {
-    let v = v.min(100);
+#[must_use]
+pub const fn scale_pct(v: u32) -> u32 {
+    let v = if v > 100 { 100 } else { v };
     // `v <= 100`, so `v * 255 + 50 <= 25550` and the saturating ops can never
     // actually saturate: they are behavior-identical to plain `*`/`+` for every
     // possible input, but give the prover overflow-free arithmetic.
@@ -821,8 +853,175 @@ fn scale_pct(v: u32) -> u32 {
 }
 
 /// Pack an RGB-percent triple (`0..=100` each) into `0x00RRGGBB`.
-fn rgb_percent(r: u32, g: u32, b: u32) -> u32 {
+#[must_use]
+pub const fn rgb_percent(r: u32, g: u32, b: u32) -> u32 {
     (scale_pct(r) << 16) | (scale_pct(g) << 8) | scale_pct(b)
+}
+
+/// Returns `true` if `byte` is a sixel data character (`0x3F..=0x7E`, `?`..=`~`).
+#[must_use]
+pub const fn is_sixel_data_byte(byte: u8) -> bool {
+    byte >= 0x3F && byte <= 0x7E
+}
+
+/// Decodes a sixel data byte (`0x3F..=0x7E`) into its 6-bit pixel column mask (`0..=63`).
+#[must_use]
+pub const fn sixel_data_bits(byte: u8) -> Option<u8> {
+    if byte >= 0x3F && byte <= 0x7E {
+        Some(byte - 0x3F)
+    } else {
+        None
+    }
+}
+
+/// Encodes a 6-bit pixel column mask (`bits & 0x3F`) into a sixel data byte (`0x3F..=0x7E`).
+#[must_use]
+pub const fn encode_sixel_data_byte(bits: u8) -> u8 {
+    0x3F + (bits & 0x3F)
+}
+
+/// Returns the bit mask (`1 << row`) for a row within a 6-pixel sixel band (`0..6`), or `0` if out of range.
+#[must_use]
+pub const fn sixel_row_mask(row: usize) -> u8 {
+    if row < 6 { SIXEL_ROW_MASKS[row] } else { 0 }
+}
+
+/// Returns `true` if `row` (`0..6`) is set in the 6-bit column mask `bits`.
+#[must_use]
+pub const fn sixel_bit_is_set(bits: u8, row: usize) -> bool {
+    (bits & sixel_row_mask(row)) != 0
+}
+
+/// Clamps a color register index to `0..MAX_COLOR_REGISTERS`.
+#[must_use]
+pub const fn clamp_color_register(reg: usize) -> usize {
+    let max_idx = MAX_COLOR_REGISTERS.saturating_sub(1);
+    if reg > max_idx { max_idx } else { reg }
+}
+
+/// Clamps a raster dimension to `0..=SIXEL_MAX_DIMENSION`.
+#[must_use]
+pub const fn clamp_sixel_dimension(dim: usize) -> usize {
+    if dim > SIXEL_MAX_DIMENSION {
+        SIXEL_MAX_DIMENSION
+    } else {
+        dim
+    }
+}
+
+/// Validates and computes `width * height` for a sixel raster within [`SIXEL_MAX_DIMENSION`] and [`SIXEL_MAX_PIXELS`].
+#[must_use]
+pub const fn checked_sixel_pixel_count(width: usize, height: usize) -> Option<usize> {
+    if width == 0 || height == 0 || width > SIXEL_MAX_DIMENSION || height > SIXEL_MAX_DIMENSION {
+        return None;
+    }
+    let total = width.saturating_mul(height);
+    if total > SIXEL_MAX_PIXELS {
+        None
+    } else {
+        Some(total)
+    }
+}
+
+/// Validates and computes the packed-RGBA byte size (`width * height * 4`) within [`SIXEL_MAX_IMAGE_BYTES`].
+#[must_use]
+pub const fn checked_sixel_image_bytes(width: usize, height: usize) -> Option<usize> {
+    let Some(total) = checked_sixel_pixel_count(width, height) else {
+        return None;
+    };
+    let bytes = total.saturating_mul(4);
+    if bytes > SIXEL_MAX_IMAGE_BYTES {
+        None
+    } else {
+        Some(bytes)
+    }
+}
+
+/// Packs an opaque `(r, g, b)` pixel into `0xFFRRGGBB`.
+#[must_use]
+pub const fn pack_argb_pixel(r: u8, g: u8, b: u8) -> u32 {
+    0xFF00_0000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+/// Unpacks a `0xAARRGGBB` pixel into `(a, r, g, b)`.
+#[must_use]
+pub const fn unpack_argb_channels(pixel: u32) -> (u8, u8, u8, u8) {
+    (
+        ((pixel >> 24) & 0xFF) as u8,
+        ((pixel >> 16) & 0xFF) as u8,
+        ((pixel >> 8) & 0xFF) as u8,
+        (pixel & 0xFF) as u8,
+    )
+}
+
+/// Encodes a `0xAARRGGBB` pixel into 4 little-endian bytes `[b, g, r, a]`.
+#[must_use]
+pub const fn encode_argb_pixel_le(pixel: u32) -> [u8; 4] {
+    [
+        (pixel & 0xFF) as u8,
+        ((pixel >> 8) & 0xFF) as u8,
+        ((pixel >> 16) & 0xFF) as u8,
+        ((pixel >> 24) & 0xFF) as u8,
+    ]
+}
+
+/// Decodes 4 little-endian bytes `[b, g, r, a]` into a `0xAARRGGBB` pixel.
+#[must_use]
+pub const fn decode_argb_pixel_le(bytes: [u8; 4]) -> u32 {
+    (bytes[0] as u32)
+        | ((bytes[1] as u32) << 8)
+        | ((bytes[2] as u32) << 16)
+        | ((bytes[3] as u32) << 24)
+}
+
+/// Encodes a 4-word sixel raster header `(width, height, color_reg, repeat)` into 16 little-endian bytes.
+#[must_use]
+pub const fn encode_sixel_header_le(
+    width: u32,
+    height: u32,
+    color_reg: u32,
+    repeat: u32,
+) -> [u8; 16] {
+    [
+        (width & 0xFF) as u8,
+        ((width >> 8) & 0xFF) as u8,
+        ((width >> 16) & 0xFF) as u8,
+        ((width >> 24) & 0xFF) as u8,
+        (height & 0xFF) as u8,
+        ((height >> 8) & 0xFF) as u8,
+        ((height >> 16) & 0xFF) as u8,
+        ((height >> 24) & 0xFF) as u8,
+        (color_reg & 0xFF) as u8,
+        ((color_reg >> 8) & 0xFF) as u8,
+        ((color_reg >> 16) & 0xFF) as u8,
+        ((color_reg >> 24) & 0xFF) as u8,
+        (repeat & 0xFF) as u8,
+        ((repeat >> 8) & 0xFF) as u8,
+        ((repeat >> 16) & 0xFF) as u8,
+        ((repeat >> 24) & 0xFF) as u8,
+    ]
+}
+
+/// Decodes 16 little-endian bytes into a 4-word sixel raster header `(width, height, color_reg, repeat)`.
+#[must_use]
+pub const fn decode_sixel_header_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
+    let width = (bytes[0] as u32)
+        | ((bytes[1] as u32) << 8)
+        | ((bytes[2] as u32) << 16)
+        | ((bytes[3] as u32) << 24);
+    let height = (bytes[4] as u32)
+        | ((bytes[5] as u32) << 8)
+        | ((bytes[6] as u32) << 16)
+        | ((bytes[7] as u32) << 24);
+    let color_reg = (bytes[8] as u32)
+        | ((bytes[9] as u32) << 8)
+        | ((bytes[10] as u32) << 16)
+        | ((bytes[11] as u32) << 24);
+    let repeat = (bytes[12] as u32)
+        | ((bytes[13] as u32) << 8)
+        | ((bytes[14] as u32) << 16)
+        | ((bytes[15] as u32) << 24);
+    (width, height, color_reg, repeat)
 }
 
 /// Convert DEC HLS (`h`=0..360, `l`=0..100, `s`=0..100) to packed `0x00RRGGBB`.
@@ -846,8 +1045,8 @@ fn hls_to_rgb(h: u32, l: u32, s: u32) -> u32 {
     // branches (inlined, not via a helper — the prover does not carry magnitude
     // bounds across a call) so every float multiply below has operands the
     // verifier knows are bounded, hence provably non-overflowing.
-    let li = l.min(100); // 0..=100
-    let si = s.min(100); // 0..=100
+    let li = if l > 100 { 100 } else { l }; // 0..=100
+    let si = if s > 100 { 100 } else { s }; // 0..=100
     let l = (li as f64) / 100.0; // 0.0..=1.0
     let s = (si as f64) / 100.0; // 0.0..=1.0
     let h = (h % 360) as f64; // 0.0..360.0

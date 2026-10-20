@@ -171,238 +171,6 @@ pub fn terminal_modes_model() -> Model {
     }
 }
 
-/// The bounded event-log ring as a derived model — the single source the spec in
-/// `Evict.tla` hand-encodes, scalar-projected to `<<seq, lo>>`. `Push` advances
-/// `seq` and evicts the oldest live event (`lo`) exactly when the live window
-/// would exceed `Cap`. `MaxSeq` bounds the state space so `ty check` is
-/// exhaustive + terminating; `Cap` is the ring capacity. Action name is `Push`
-/// (not `Append`, which clashes with ty's Sequences builtin).
-///
-/// `Buggy = 1` evicts one push late, so the ring holds `Cap + 1` live events —
-/// the shape of the alt-screen archive undercharge (`a4c4d3eaa`: a row charged
-/// as `len + 32` let a 4 MiB budget hold 5.23 MiB, and admitted a fourth row into
-/// a three-row budget, the negative control `alt_archive_tests.rs` binds against
-/// this model). `LenBounded` is its counterexample.
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
-#[cfg_attr(trust_verify, trust::skip)]
-#[aterm_spec::model]
-pub fn ring_model() -> Model {
-    Model {
-        name: "Ring",
-        consts: vec![("MaxSeq", 6), ("Cap", 3), ("Buggy", 0)],
-        vars: vec![
-            StateVar {
-                name: "seq",
-                init: 0,
-            },
-            StateVar {
-                name: "lo",
-                init: 1,
-            },
-        ],
-        fn_vars: vec![],
-        actions: vec![Action {
-            name: "Push",
-            guard: Some(le(var("seq"), sub(cst("MaxSeq"), int(1)))), // seq <= MaxSeq - 1
-            updates: vec![
-                Update {
-                    var: "seq",
-                    expr: add(var("seq"), int(1)),
-                },
-                Update {
-                    var: "lo",
-                    // IF (seq + 1) - lo + 1 > Cap + Buggy THEN lo + 1 ELSE lo
-                    expr: if_(
-                        gt(
-                            add(sub(add(var("seq"), int(1)), var("lo")), int(1)),
-                            add(cst("Cap"), cst("Buggy")),
-                        ),
-                        add(var("lo"), int(1)),
-                        var("lo"),
-                    ),
-                },
-            ],
-        }],
-        invariants: vec![Invariant {
-            name: "LenBounded",
-            kind: InvariantKind::Claim,
-            // seq - lo + 1 <= Cap
-            expr: le(add(sub(var("seq"), var("lo")), int(1)), cst("Cap")),
-        }],
-    }
-}
-
-/// A second derived model — a writer/subscriber cursor — chosen because it
-/// exercises derivation paths the ring does not: TWO actions (so `Next` is a
-/// disjunction) and PARTIAL updates (so each action emits an `UNCHANGED` clause
-/// for the variable it leaves alone). `Grow` advances the writer `seq`; `Deliver`
-/// catches the reader `cursor` up to `seq`. Invariant: the reader never passes the
-/// writer (`cursor <= seq`). This is the Subscribe/Kernel family in miniature, and
-/// it proves the derivation engine generalizes beyond the single-action ring.
-///
-/// `Buggy = 1` is the off-by-one class a subscriber cursor can ship with (the
-/// non-vacuity witness for `CursorBounded`, not a defect the code is known to have
-/// had): a `Deliver` that parks the cursor one PAST the head it delivered, so the
-/// next event written is silently skipped. `CursorBounded` catches it on the first
-/// delivery. Tier-1: aterm-buffer's `tests/conformance_cursor.rs` drives the real
-/// `Surface::subscribe`/`poll` — the library's read face, which no product crate
-/// calls today — and reads the cursor's position back through the real `poll`
-/// itself, which is what catches an overshoot `subscribe_model`'s bind (a
-/// caller-tracked cursor) cannot see.
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
-#[cfg_attr(trust_verify, trust::skip)]
-#[aterm_spec::model]
-pub fn cursor_model() -> Model {
-    Model {
-        name: "Cursor",
-        consts: vec![("MaxSeq", 4), ("Buggy", 0)],
-        vars: vec![
-            StateVar {
-                name: "seq",
-                init: 0,
-            },
-            StateVar {
-                name: "cursor",
-                init: 0,
-            },
-        ],
-        fn_vars: vec![],
-        actions: vec![
-            Action {
-                name: "Grow", // writer appends; cursor is UNCHANGED
-                guard: Some(le(var("seq"), sub(cst("MaxSeq"), int(1)))),
-                updates: vec![Update {
-                    var: "seq",
-                    expr: add(var("seq"), int(1)),
-                }],
-            },
-            Action {
-                name: "Deliver", // reader catches up; seq is UNCHANGED
-                guard: Some(gt(var("seq"), var("cursor"))),
-                // cursor' = IF Buggy = 1 THEN seq + 1 ELSE seq  (Buggy overshoots)
-                updates: vec![Update {
-                    var: "cursor",
-                    expr: if_(
-                        eq(cst("Buggy"), int(1)),
-                        add(var("seq"), int(1)),
-                        var("seq"),
-                    ),
-                }],
-            },
-        ],
-        invariants: vec![Invariant {
-            name: "CursorBounded",
-            kind: InvariantKind::Claim,
-            expr: le(var("cursor"), var("seq")), // cursor <= seq
-        }],
-    }
-}
-
-/// A third derived model — the subscriber's NO-SILENT-LOSS / gap discipline, the
-/// kernel family's most important correctness property: a reader that has fallen
-/// behind the live ring window MUST receive a Gap (resync) and must NEVER be
-/// silently delivered events as if nothing was lost. Scalar projection over
-/// `<<seq, lo, cursor, lost>>`: `Grow` advances the writer and evicts the oldest
-/// when over `Cap`; `PollGap` resyncs a fallen-behind reader (`lo > cursor + 1`);
-/// `PollDeliver` delivers while the reader is still within the live window.
-///
-/// The `Buggy` constant flips `PollDeliver`'s guard: with `Buggy = 0` (committed)
-/// it is correctly guarded and `lost` stays 0; with `Buggy = 1` it fires even when
-/// the reader is behind, silently skipping evicted events — so `lost` becomes 1
-/// and `NoSilentLoss` is violated. Thus `ty` both PROVES the property (Buggy=0)
-/// and, via a `Buggy=1` cfg, shows it genuinely CATCHES the silent-loss bug.
-/// Exercises the `Expr` disjunction (`\/`) and equality (`=`) operators.
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
-#[cfg_attr(trust_verify, trust::skip)]
-#[aterm_spec::model]
-pub fn subscribe_model() -> Model {
-    Model {
-        name: "Subscribe",
-        consts: vec![("MaxSeq", 4), ("Cap", 2), ("Buggy", 0)],
-        vars: vec![
-            StateVar {
-                name: "seq",
-                init: 0,
-            },
-            StateVar {
-                name: "lo",
-                init: 1,
-            },
-            StateVar {
-                name: "cursor",
-                init: 0,
-            },
-            StateVar {
-                name: "lost",
-                init: 0,
-            },
-        ],
-        fn_vars: vec![],
-        actions: vec![
-            Action {
-                name: "Grow", // writer appends + evicts oldest when over Cap
-                guard: Some(le(var("seq"), sub(cst("MaxSeq"), int(1)))),
-                updates: vec![
-                    Update {
-                        var: "seq",
-                        expr: add(var("seq"), int(1)),
-                    },
-                    Update {
-                        var: "lo",
-                        expr: if_(
-                            gt(
-                                add(sub(add(var("seq"), int(1)), var("lo")), int(1)),
-                                cst("Cap"),
-                            ),
-                            add(var("lo"), int(1)),
-                            var("lo"),
-                        ),
-                    },
-                ], // cursor, lost UNCHANGED
-            },
-            Action {
-                name: "PollGap", // reader fell behind (lo > cursor + 1): resync, no loss
-                guard: Some(gt(var("lo"), add(var("cursor"), int(1)))),
-                updates: vec![Update {
-                    var: "cursor",
-                    expr: var("seq"),
-                }], // seq, lo, lost UNCHANGED
-            },
-            Action {
-                name: "PollDeliver", // deliver; correct iff the reader is still in window
-                // Buggy = 1 \/ lo =< cursor + 1  (Buggy removes the in-window guard)
-                guard: Some(or_(
-                    eq(cst("Buggy"), int(1)),
-                    le(var("lo"), add(var("cursor"), int(1))),
-                )),
-                updates: vec![
-                    Update {
-                        var: "cursor",
-                        expr: var("seq"),
-                    },
-                    // lost' = IF lo > cursor + 1 THEN 1 ELSE lost  (records a silent skip)
-                    Update {
-                        var: "lost",
-                        expr: if_(
-                            gt(var("lo"), add(var("cursor"), int(1))),
-                            int(1),
-                            var("lost"),
-                        ),
-                    },
-                ], // seq, lo UNCHANGED
-            },
-        ],
-        invariants: vec![Invariant {
-            name: "NoSilentLoss",
-            kind: InvariantKind::Claim,
-            expr: eq(var("lost"), int(0)), // lost = 0
-        }],
-    }
-}
-
 /// Which historical defect a wake-latch model's `Buggy = 1` replays (see
 /// [`damage_to_present_model`] and [`wake_heal_evidence_model`]: one machine,
 /// held to three laws, each with the mutant that breaks it).
@@ -1756,6 +1524,115 @@ pub fn predictive_echo_visibility_model() -> Model {
             // ends the other.
             invariant ClassProofRidesOnGlyphProof:
                 if edit_proven == 1 { confirmed == 1 } else { 1 == 1 };
+        }
+    }
+}
+
+/// NETWORK LISTENER SLOT DISPLACEMENT — `aterm-net`'s listener slots (the
+/// fleet listener's, `slots::Slots`; the network drive's `serve` until it was
+/// removed, 2026-10-15) keep at most `Cap` connections in flight, handshaking
+/// or relaying, and at capacity let a newcomer take the slot of one that has
+/// NOT authenticated (r13 NET-1, ruling 2026-10-10: idle sockets renewed
+/// against the handshake deadline used to hold every slot and lock token
+/// holders out). Which slot is the address policy's (`slots::pick_displaced`,
+/// unit-tested); this is the machine that policy runs on, and the law it must
+/// never break: an admitted relay is never cut.
+///
+/// Each connection holding a slot is `pending` (its watchdog state is still
+/// `WD_RUNNING`), `authed` (its handshake claimed `WD_AUTHED`: relaying, or
+/// tearing down after a denied capability) or `cut` (the deadline claimed
+/// `WD_FIRED` or the listener `WD_EVICTED`: its socket force-closed, its
+/// threads ending). One compare-and-swap out of `WD_RUNNING` decides between
+/// the three claimants — the handshake (`Authenticate`, `HandshakeWatchdog::
+/// finish`), the watchdog's deadline (`Deadline`) and the listener
+/// (`Evict`, `Evictor::evict`) — so each connection is claimed exactly once.
+/// `Evict` is the accept loop at capacity: it claims a pending connection and
+/// then WAITS (`waiting`) for that connection's threads to end (`Release`)
+/// before the newcomer takes the slot (`Accept`), or gives up after
+/// `ACCEPT_POLL` and refuses the newcomer (`Refuse`). `Close` is a relay's or a
+/// denied connection's end. `arrivals` counts connections given a slot and
+/// `claims` the claims won on them: ghost counters for the exactly-once law.
+///
+/// `Buggy = 1` is four defects, each caught by its own invariant alone:
+/// `Accept` takes a slot while the displaced connection still holds it (the
+/// loop returning on its claim, not on the freed slot), which
+/// `InFlightBounded` catches; `Authenticate` STORES `WD_AUTHED` over a cut
+/// connection's claim (a relay on a force-closed socket), which
+/// `ClaimExactlyOnce` catches; the watchdog force-closes a connection its
+/// handshake claimed (the close decided by the deadline alone, not by who won
+/// the claim), which `AuthedNeverCut` catches; and `Evict` STORES
+/// `WD_EVICTED` over an authenticated connection instead of a
+/// compare-and-swap, which both of the last two catch. Each mutant fires only
+/// from a state that has not slipped yet, so the `Buggy = 1` space stays
+/// finite.
+///
+/// Tier-1: aterm-net's `slots::tests::slots_conform_to_net_slot_displacement`
+/// drives the real `Slots` and `HandshakeWatchdog` over real sockets at the
+/// production capacity (`Cap` overridden to the fleet's `MAX_SLOTS`), projects
+/// every slot's claim onto these counts after each step, and validates each
+/// transition; every action is anchored by `#[refines]` in `slots.rs`.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn net_slot_displacement_model() -> Model {
+    aterm_spec::ty_model! {
+        NetSlotDisplacement {
+            const Buggy = 0;
+            const Cap = 2;
+            // Bounds the connections the checker walks.
+            const Arrivals = 4;
+            var pending = 0;
+            var authed = 0;
+            var cut = 0;
+            var waiting = 0;
+            var arrivals = 0;
+            var claims = 0;
+            // An authenticated connection's socket was force-closed.
+            var authed_cut = 0;
+            action Accept when (
+                arrivals <= Arrivals - 1 &&
+                pending + authed + cut <= if Buggy == 1 { Cap } else { Cap - 1 }
+            ) {
+                pending = pending + 1;
+                arrivals = arrivals + 1;
+                waiting = 0;
+            }
+            action Authenticate when (
+                pending > 0 || (Buggy == 1 && cut > 0 && claims + pending == arrivals)
+            ) {
+                pending = if pending > 0 { pending - 1 } else { pending };
+                cut = if pending > 0 { cut } else { cut - 1 };
+                authed = authed + 1;
+                claims = claims + 1;
+            }
+            action Deadline when (pending > 0 || (Buggy == 1 && authed > 0 && authed_cut == 0)) {
+                pending = if pending > 0 { pending - 1 } else { pending };
+                cut = if pending > 0 { cut + 1 } else { cut };
+                claims = if pending > 0 { claims + 1 } else { claims };
+                authed_cut = if pending > 0 { authed_cut } else { 1 };
+            }
+            action Evict when (
+                waiting == 0 && Cap <= pending + authed + cut &&
+                (pending > 0 || (Buggy == 1 && authed > 0 && claims + pending == arrivals))
+            ) {
+                pending = if pending > 0 { pending - 1 } else { pending };
+                authed = if pending > 0 { authed } else { authed - 1 };
+                authed_cut = if pending > 0 { authed_cut } else { 1 };
+                cut = cut + 1;
+                claims = claims + 1;
+                waiting = 1;
+            }
+            action Release when (cut > 0) {
+                cut = cut - 1;
+            }
+            action Close when (authed > 0) {
+                authed = authed - 1;
+            }
+            action Refuse when (waiting == 1) {
+                waiting = 0;
+            }
+            invariant InFlightBounded: pending + authed + cut <= Cap;
+            invariant ClaimExactlyOnce: claims + pending == arrivals;
+            invariant AuthedNeverCut: authed_cut == 0;
         }
     }
 }

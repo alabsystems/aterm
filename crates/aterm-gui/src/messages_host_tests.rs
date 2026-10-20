@@ -3,7 +3,9 @@
 
 use super::*;
 use crate::update_words::LiveHealth as _;
-use aterm_messages::{LogRecord, LogState, MAX_ROWS, Retired, Severity, tags};
+#[cfg(unix)]
+use aterm_messages::MAX_ROWS;
+use aterm_messages::{LogRecord, LogState, Retired, Severity, tags};
 
 fn warn(title: &str) -> Message {
     Message::new(tags::CONFIG, Severity::Warn, title).line("why")
@@ -693,7 +695,7 @@ fn a_menu_line_opens_messages_at_its_entry() {
     let first = app.post_message(warn("first"));
     let second = app.post_message(warn("second"));
     assert!(app.open_messages_entry(wid, Some(first)));
-    assert!(app.open_messages_entry_anywhere(second.raw()));
+    assert_eq!(app.open_messages_entry_anywhere(second.raw()), Some(wid));
     let view = settings_view(&app, wid).expect("Settings in the first window");
     assert_eq!(view.route, SettingsRoute::Messages);
     assert_eq!(view.messages_selected, Some(second.raw()));
@@ -826,16 +828,13 @@ fn a_transient_status_line_is_cleared_about_five_seconds_on() {
             _ => unreachable!(),
         }
     }
-    view_mut(&mut app, wid).show_messages_feedback_for_test("Copied");
+    view_mut(&mut app, wid).show_transient_status_for_test("Copied");
     // The publish that starts the clock is due at the 2 Hz gap.
     assert_eq!(app.messages_publish_due_at(), Some(opened + GAP));
     app.publish_native_messages_state_if_due(opened + GAP);
     let stamped = app.messages_last_publish.unwrap();
     assert_ne!(stamped, opened);
-    assert_eq!(
-        settings_view(&app, wid).unwrap().messages_feedback_clock(),
-        Some(true)
-    );
+    assert_eq!(settings_view(&app, wid).unwrap().status_clock(), Some(true));
     assert!(settings_view(&app, wid).unwrap().feedback.is_some());
     // The one that clears it, five seconds on — not the minute tick.
     assert_eq!(app.messages_publish_due_at(), Some(stamped + WAIT));
@@ -845,18 +844,63 @@ fn a_transient_status_line_is_cleared_about_five_seconds_on() {
     // The page times the line by the projections' wall clock, which a test
     // cannot wait out: age the stamp as five seconds would.
     view_mut(&mut app, wid)
-        .age_messages_feedback_for_test(crate::native_settings::MESSAGES_FEEDBACK_MS);
+        .age_transient_status_for_test(crate::native_settings::MESSAGES_FEEDBACK_MS);
     app.publish_native_messages_state_if_due(stamped + WAIT);
     let cleared = app.messages_last_publish.unwrap();
     assert_ne!(cleared, stamped);
     let view = settings_view(&app, wid).unwrap();
     assert_eq!(view.feedback, None, "cleared about five seconds on");
-    assert_eq!(view.messages_feedback_clock(), None);
+    assert_eq!(view.status_clock(), None);
     assert_eq!(
         app.messages_publish_due_at(),
         Some(cleared + TICK),
         "then only the minute tick"
     );
+}
+
+/// A COMPLETION'S LINE IS CLEARED ABOUT FIVE SECONDS ON, ON EVERY PAGE (xa-13): only
+/// the Messages page had a clock, so "Build information copied" on About or
+/// "Discarded 2 unsaved Settings drafts." on Terminal stood until navigation, the
+/// bar's room out of a compact list. The host now arms the same two publishes for
+/// a transient line on any page, and nothing after it is cleared (About has no
+/// minute tick). NEGATIVE CONTROL: before the line, About arms no publish.
+#[test]
+fn a_transient_status_line_clears_on_every_page() {
+    use crate::app_native::{MESSAGES_FEEDBACK_WAIT as WAIT, MESSAGES_PUBLISH_MIN_GAP as GAP};
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    assert!(app.open_settings_tab_in_window(wid, SettingsRoute::About));
+    let opened = app
+        .messages_last_publish
+        .expect("opening Settings publishes");
+    assert_eq!(
+        app.messages_publish_due_at(),
+        None,
+        "About with no transient line arms nothing"
+    );
+    fn view_mut(app: &mut App, wid: WindowId) -> &mut crate::native_settings::SettingsViewState {
+        let (_, view) = app.active_native_view(wid).expect("Settings fronts it");
+        match app.native_runtime.view_state_mut(view) {
+            Some(crate::native_app::AppViewState::Settings(state)) => state,
+            _ => unreachable!(),
+        }
+    }
+    view_mut(&mut app, wid).show_transient_status_for_test("Build information copied");
+    assert_eq!(app.messages_publish_due_at(), Some(opened + GAP));
+    app.publish_native_messages_state_if_due(opened + GAP);
+    let stamped = app.messages_last_publish.unwrap();
+    assert_eq!(settings_view(&app, wid).unwrap().status_clock(), Some(true));
+    assert_eq!(app.messages_publish_due_at(), Some(stamped + WAIT));
+    view_mut(&mut app, wid)
+        .age_transient_status_for_test(crate::native_settings::MESSAGES_FEEDBACK_MS);
+    app.publish_native_messages_state_if_due(stamped + WAIT);
+    let view = settings_view(&app, wid).unwrap();
+    assert_eq!(
+        view.feedback, None,
+        "cleared about five seconds on, on About"
+    );
+    assert_eq!(app.messages_publish_due_at(), None, "then nothing is armed");
 }
 
 /// THE PUBLISH IS RATE-LIMITED, AND ONLY WHILE SETTINGS EXISTS (design
@@ -1699,6 +1743,8 @@ pub(super) fn window_carry(
         update_verified_unix_ms: None,
         font_px_milli: None,
         font_reset_px_milli: None,
+        font_size_milli: None,
+        font_reset_size_milli: None,
         update_health_said: carried.update_health_said,
         messages_captured_unix_ms: carried.captured_unix_ms,
     }
@@ -1995,6 +2041,16 @@ fn a_landed_update_leaves_no_outcome_row_that_said_it_had_not() {
     }
 }
 
+/// Every window of `app` shows its band on screen (`band_on_screen_for_test`):
+/// a row said there is seen, so it holds its time and folds, and nothing is owed
+/// (ATERM-KI-1015-2, U37: a row said where no band is seen waits to be seen).
+fn band_seen(app: &mut App) {
+    for ws in app.windows.values_mut() {
+        ws.band_on_screen_for_test = true;
+        ws.occluded = false;
+    }
+}
+
 /// The successor of a parent that raised `raise`, carried on the explicit
 /// lane (an installing row crosses) or the automatic one (none does),
 /// committed and landed: the realistic state its next event meets.
@@ -2069,6 +2125,7 @@ fn a_carried_unhealed_stall_never_silences_the_successors_own_watchdog() {
     let stalled = update_words::HealthKind::Stalled;
     for carried in [true, false] {
         let mut parent = App::headless_for_test();
+        band_seen(&mut parent);
         if carried {
             // Stalled inside its lane: the replacement cannot check, so the
             // warning is never healed.
@@ -2199,6 +2256,7 @@ fn a_carried_check_warning_heals_by_the_successors_first_healthy_check() {
     // over, once.
     UPDATER_ADOPTED_HEALTH.with(|adopted| adopted.borrow_mut().clear());
     let _folded = landed_successor(false, |parent| {
+        band_seen(parent);
         assert!(parent.note_update_health(title, body));
         parent.settle_messages(
             Instant::now() + aterm_messages::HOLD_WARN + std::time::Duration::from_secs(60),
@@ -2744,6 +2802,7 @@ fn a_healing_the_parked_parent_recorded_is_on_record_once_whatever_its_row_did()
         let (mut successor, dir) = committed_after_park(
             name,
             |parent| {
+                band_seen(parent);
                 say_check_warning(parent);
                 assert!(parent.note_update_health_as(
                     update_words::HealthKind::Download,
@@ -4388,6 +4447,7 @@ fn a_failing_title_is_announced_once_whoever_raises_it() {
     let overdue = "build 9 has been waiting on this machine since 2026-09-24T00:00:00Z and \
                    build 8 is still running: why.";
     let mut app = App::headless_for_test();
+    band_seen(&mut app);
     assert!(app.note_update_health(apply, "automatic apply of build 9 stopped"));
     let revision = app.messages.revision();
     assert!(
@@ -4433,6 +4493,7 @@ fn a_restated_health_warning_takes_its_new_words_where_it_stands() {
     let kind = update_words::HealthKind::of_updater_title(apply);
     let words = |app: &App| app.messages.live_health().map(|l| l.msg.detail.join(" "));
     let mut app = App::headless_for_test();
+    band_seen(&mut app);
     assert!(app.note_update_health(apply, "it didn't install; it tries again in 24 h"));
     let rows = app.messages.live_rows().count();
     app.restate_update_health(
@@ -4956,6 +5017,7 @@ fn an_unchanged_managed_current_is_recorded_once_and_news_again() {
         timeline_id: 0,
         log: Default::default(),
         journal_key: None,
+        task: None,
     }];
     assert!(
         app.post_managed_current(
@@ -5276,12 +5338,15 @@ fn r44_host3_a_retired_rows_live_intents_are_gone_from_the_page() {
     }
 }
 
-/// AN UPDATE WARNING SAID WHILE NO WINDOW IS ON SCREEN IS SHOWN WHEN ONE IS
-/// (ATERM-KI-1015-2, U37). The warning holds its 45 s from the post whether or
-/// not any window's band is on screen (minimized, fully covered, or no OS window
-/// at all), the kind stays latched for the launch, and no OS banner stands in
-/// for it unless desktop alerts are on — so a stuck update announced while
-/// nobody was looking folded unseen and was never shown again in that process.
+/// AN UPDATE WARNING SAID WHILE NO WINDOW IS ON SCREEN IS SHOWN WHEN ONE IS,
+/// AS ONE ENTRY (ATERM-KI-1015-2, U37 and its review). The warning held its 45 s
+/// from the post whether or not any window's band was on screen (minimized,
+/// fully covered, or no OS window at all), the kind stays latched for the
+/// launch, and no OS banner stands in for it unless desktop alerts are on — so a
+/// stuck update announced while nobody was looking folded unseen and was never
+/// shown again in that process. Then it was posted again once seen, and
+/// Settings ▸ Messages listed it twice: the fold nobody saw and the row shown.
+/// It waits on the band however long nobody looks, and is one record.
 ///
 /// Driven headlessly: a window whose band is off screen, then on screen
 /// (`band_on_screen_for_test`, the seam `band_on_screen` reads).
@@ -5301,12 +5366,13 @@ fn an_update_warning_said_with_no_window_on_screen_is_shown_when_one_is() {
     );
     assert!(app.note_update_health(title, body), "announced");
     assert_eq!(app.live_update_health(|k| k == kind).len(), 1);
-    // Its hold, and any queue patience, run out while nobody looks.
+    // Far past its hold, and any queue patience, while nobody looks.
     let unseen = Instant::now() + std::time::Duration::from_secs(10 * 60);
     app.settle_messages(unseen);
-    assert!(
-        app.live_update_health(|k| k == kind).is_empty(),
-        "PRECONDITION: the warning folded unseen"
+    assert_eq!(
+        app.live_update_health(|k| k == kind).len(),
+        1,
+        "the warning waits while nobody can see it"
     );
     // The window comes on screen.
     app.windows.get_mut(&wid).unwrap().occluded = false;
@@ -5317,6 +5383,178 @@ fn an_update_warning_said_with_no_window_on_screen_is_shown_when_one_is() {
         1,
         "the warning is shown once a window can show it"
     );
+    app.settle_messages(back + aterm_messages::HOLD_WARN + std::time::Duration::from_secs(5));
+    assert!(
+        app.live_update_health(|k| k == kind).is_empty(),
+        "PRECONDITION: it folded after its hold"
+    );
+    let entries = app
+        .messages
+        .log()
+        .records()
+        .filter(|rec| rec.key.as_deref() == Some(kind.key()))
+        .count();
+    assert_eq!(entries, 1, "one entry in Settings ▸ Messages");
+}
+
+/// …AND ONE QUEUED BEHIND ROWS THAT HOLD THE BAND IS ONE ENTRY TOO (U37's
+/// second review). Three standing errors hold every slot, so the warning said
+/// while nobody can see the band waits in the queue, where its patience ran
+/// from the post: it left unseen after a minute, and once a window came on
+/// screen it was posted again, a second entry under the same key. Unseen, its
+/// patience starts again at every settle; seen, it reaches the band when a slot
+/// frees, folds after its hold, and is one record. Negative control: without
+/// the restart it is gone from the queue before anyone looks.
+#[test]
+fn an_owed_update_warning_queued_behind_the_band_is_one_entry() {
+    use aterm_messages::Hold;
+    let title = aterm_update::health_failing_title("apply");
+    let kind = update_words::HealthKind::of_updater_title(title);
+    let body = "build 12 has been waiting on this machine since 2026-10-16T08:00:00Z and \
+                build 11 is still running: no apply attempt has been recorded for it.";
+    let secs = std::time::Duration::from_secs;
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().occluded = true;
+    let said = Instant::now();
+    let standing: Vec<MessageId> = (0..=aterm_messages::MAX_ROWS)
+        .map(|n| {
+            app.post_message(
+                Message::new(tags::RENDER, Severity::Error, format!("standing {n}"))
+                    .hold(Hold::STANDING),
+            )
+        })
+        .collect();
+    assert!(app.note_update_health(title, body), "announced");
+    app.settle_messages(said + secs(1));
+    let original = app.live_update_health(|k| k == kind)[0];
+    let warning = |app: &App| {
+        app.live_update_health(|k| k == kind)
+            .first()
+            .and_then(|id| app.messages.live(*id))
+            .map(aterm_messages::Live::is_queued)
+    };
+    assert_eq!(
+        warning(&app),
+        Some(true),
+        "PRECONDITION: the standing rows hold the band and the warning is queued"
+    );
+    for minute in 1..=10 {
+        app.settle_messages(said + secs(60 * minute));
+    }
+    assert_eq!(
+        warning(&app),
+        Some(true),
+        "it waits in the queue while nobody can see the band"
+    );
+    app.windows.get_mut(&wid).unwrap().occluded = false;
+    let back = said + secs(10 * 60 + 1);
+    app.settle_messages(back);
+    let mut later = back;
+    // A visible band still occupied by standing errors has shown none of
+    // this warning. Cross its actual patience deadline repeatedly: it must
+    // remain the same queued record, not retire and silently discharge owed.
+    for _ in 0..3 {
+        later = later.max(
+            app.messages
+                .live(original)
+                .expect("same queued warning")
+                .patience_at,
+        ) + secs(1);
+        app.settle_messages(later);
+        assert_eq!(warning(&app), Some(true));
+        assert_eq!(app.live_update_health(|k| k == kind), vec![original]);
+    }
+    let freed = later + secs(1);
+    for id in standing {
+        assert!(app.messages.withdraw(id, freed));
+    }
+    app.settle_messages(freed + secs(1));
+    assert_eq!(warning(&app), Some(false), "a freed slot shows it");
+    // Wait on the actual pending shrink before posting a new blocker. With
+    // spare glass slots the center preserves the warning beside the errors;
+    // a one-row band makes the first higher-ranked row demote it.
+    let requeue = app
+        .messages
+        .quiet_shrink_at()
+        .expect("one-row shrink is pending")
+        .max(app.band_regrow_floor().unwrap_or(freed));
+    app.settle_messages(requeue);
+    assert_eq!(
+        app.messages.committed_rows(),
+        1,
+        "the band shrank before the new errors"
+    );
+    // After being seen briefly, higher-priority rows can queue it again.
+    // Previously seen is not permission to spend a queued row's patience.
+    let standing: Vec<MessageId> = (0..=aterm_messages::MAX_ROWS)
+        .map(|n| {
+            app.post_unsynced_at(
+                Message::new(tags::RENDER, Severity::Error, format!("later standing {n}"))
+                    .hold(Hold::STANDING),
+                wall_stamp_now(),
+                requeue,
+            )
+        })
+        .collect();
+    app.settle_messages(requeue);
+    assert_eq!(
+        warning(&app),
+        Some(true),
+        "the partly seen warning is requeued"
+    );
+    for _ in 0..3 {
+        later = later.max(
+            app.messages
+                .live(original)
+                .expect("same requeued warning")
+                .patience_at,
+        ) + secs(1);
+        app.settle_messages(later);
+        assert_eq!(warning(&app), Some(true));
+        assert_eq!(app.live_update_health(|k| k == kind), vec![original]);
+    }
+    let freed = later + secs(1);
+    for id in standing {
+        assert!(app.messages.withdraw(id, freed));
+    }
+    app.settle_messages(freed + secs(1));
+    assert_eq!(warning(&app), Some(false), "a freed slot shows it again");
+    // The drive put it on glass after the preceding keep_owed_rows sweep.
+    // Let the next sweep credit that visible row before testing its full hold.
+    let shown = freed + secs(2);
+    app.settle_messages(shown);
+    assert_eq!(warning(&app), Some(false), "credited on glass");
+    // Withdrawal can rebalance immediately, before the host's next sweep.
+    // Read the actual anchored hold rather than guess which sweep placed it.
+    let fold_at = app
+        .messages
+        .live(original)
+        .expect("the original warning is visible")
+        .fold_at
+        .expect("the visible warning has a hold");
+    assert!(fold_at >= freed + aterm_messages::HOLD_WARN);
+    app.settle_messages(fold_at - secs(1));
+    assert_eq!(
+        warning(&app),
+        Some(false),
+        "its whole visible hold remains available"
+    );
+    app.settle_messages(fold_at + secs(5));
+    assert_eq!(
+        warning(&app),
+        None,
+        "PRECONDITION: it folded after its hold"
+    );
+    app.settle_messages(fold_at + secs(6));
+    let entries = app
+        .messages
+        .log()
+        .records()
+        .filter(|rec| rec.key.as_deref() == Some(kind.key()))
+        .count();
+    assert_eq!(entries, 1, "one entry in Settings ▸ Messages");
 }
 
 /// …A ROW STILL UP WHEN THE WINDOW COMES BACK IS SEEN FOR ITS WHOLE HOLD, AND
@@ -5375,12 +5613,17 @@ fn an_owed_update_warning_is_shown_once_and_only_while_unanswered() {
     assert_eq!(live(&app), 0, "a healed warning is owed nothing");
 }
 
-/// AN OWED WARNING GOES WITH THE HANDOFF (the review of ATERM-KI-1015-2, U37). A
-/// check warning said while no band was on screen folded unseen in the parent; a
-/// seamless update then handed the windows over. The successor takes the warning
-/// up — its updater adopts the class as announced, so it is not said again — but
-/// was not told it was owed, and so never showed it. Driven headlessly: the
-/// parent's band off screen, the successor's on.
+/// AN OWED WARNING GOES WITH THE HANDOFF, AND WAITS FOR A BAND THAT IS SEEN (the
+/// reviews of ATERM-KI-1015-2, U37). A check warning said while no band was on screen
+/// is carried to the successor, which takes the warning up — its updater adopts the
+/// class as announced, so it is not said again — and owes it to its own windows. A
+/// handoff boot's windows start hidden and not yet occluded (`pending_reveal`), and
+/// `band_on_screen` counted them, so the warning was shown at the successor's first
+/// settle on a window nobody could see; when the carried stack then minimized the
+/// window, or it turned out covered, the row folded unseen and was owed no more. A
+/// hidden window's band is not on screen, and an owed row seen for part of its hold and
+/// then hidden waits again, for its whole hold once seen. Driven headlessly: the
+/// parent's band off screen, the successor's hidden, minimized, then on.
 #[test]
 fn an_owed_update_warning_is_shown_by_the_successor_it_is_carried_to() {
     let title = aterm_update::health_failing_title("manifest");
@@ -5393,26 +5636,60 @@ fn an_owed_update_warning_is_shown_by_the_successor_it_is_carried_to() {
         ws.band_on_screen_for_test = true;
         ws.occluded = !seen;
     };
+    let live = |app: &App| app.live_update_health(|k| k == kind).len();
     let mut parent = App::headless_for_test();
     on_screen(&mut parent, false);
-    let said = Instant::now();
     assert!(parent.note_update_health(title, body), "announced");
-    parent.settle_messages(said + secs(10 * 60));
-    assert!(
-        parent.live_update_health(|k| k == kind).is_empty(),
-        "PRECONDITION: the warning folded unseen in the parent"
-    );
+    parent.settle_messages(Instant::now() + secs(10 * 60));
     let carry = window_carry(parent.message_band_rows, parent.carried_messages());
 
     let mut successor = App::headless_for_test();
     successor.seed_carried_messages(&carry, Some("0.76.0"));
+    successor.messages.after_handoff_commit(Instant::now());
     on_screen(&mut successor, true);
-    successor.settle_messages(Instant::now() + secs(1));
-    assert_eq!(
-        successor.live_update_health(|k| k == kind).len(),
-        1,
-        "the successor shows the warning nobody saw"
+    let boot = Instant::now();
+    successor
+        .windows
+        .get_mut(&WindowId(0))
+        .unwrap()
+        .pending_reveal = Some(boot + secs(5));
+    assert!(
+        !band_on_screen(&successor.windows[&WindowId(0)]),
+        "a hidden boot window's band is not on screen"
     );
+    successor.settle_messages(boot + secs(1));
+    // The carried stack minimizes the window as it is revealed.
+    successor
+        .windows
+        .get_mut(&WindowId(0))
+        .unwrap()
+        .pending_reveal = None;
+    on_screen(&mut successor, false);
+    successor.settle_messages(boot + secs(10 * 60));
+    assert_eq!(
+        live(&successor),
+        1,
+        "the warning waits for a band that is seen"
+    );
+    // Seen for ten seconds, then covered: it waits again.
+    on_screen(&mut successor, true);
+    let seen = boot + secs(10 * 60 + 1);
+    successor.settle_messages(seen);
+    on_screen(&mut successor, false);
+    successor.settle_messages(seen + secs(10));
+    successor.settle_messages(seen + secs(10 * 60));
+    assert_eq!(
+        live(&successor),
+        1,
+        "seen for part of its hold, it waits again"
+    );
+    on_screen(&mut successor, true);
+    let again = seen + secs(10 * 60 + 1);
+    successor.settle_messages(again);
+    successor.settle_messages(again + secs(40));
+    assert_eq!(live(&successor), 1, "its whole hold once seen");
+    successor.settle_messages(again + secs(45 + 5));
+    assert_eq!(live(&successor), 0, "and then it folds");
 }
 
 /// THE LINUX WAIT FOR A START IS A NOTICE, NEVER A HEALTH WARNING (the review of
@@ -5465,9 +5742,9 @@ fn a_linux_install_waiting_for_a_start_is_a_notice_and_its_end_takes_it_down() {
         "its end takes it down"
     );
 
-    let rollback = "aterm 0.11.0 didn\u{2019}t start properly in 3 launches, so aterm 0.10.0 is \
-                    back and aterm 0.11.0 won\u{2019}t install again.";
-    assert!(app.note_update_health(aterm_update::health_failing_title("apply"), rollback));
+    let rollback = "aterm 0.11.0 didn\u{2019}t start properly, so aterm 0.10.0 is back and \
+                    aterm 0.11.0 won\u{2019}t install again.";
+    assert!(app.note_update_health(aterm_update::INSTALL_CRASH_LOOP_TITLE, rollback));
     let install = app.live_update_health(|k| k == update_words::HealthKind::Install);
     assert_eq!(
         install.len(),
@@ -5480,6 +5757,61 @@ fn a_linux_install_waiting_for_a_start_is_a_notice_and_its_end_takes_it_down() {
         "in its own words: {:?}",
         row.msg.detail
     );
+}
+
+/// A SECOND LINUX CRASH LOOP IS A ROW OF ITS OWN (ATERM-KI-1015-2, U21). A newer
+/// build installed over a crash loop's rollback crash-looped too before anything
+/// answered the first: the updater restated it, and the window's latch made it a
+/// log line, so no row said that a second build had failed. Each crash loop's end
+/// ([`aterm_update::INSTALL_CRASH_LOOP_TITLE`]) is said, with its banner, under the
+/// install half's title, in the words naming the build that failed — the row up
+/// takes them. Negative control: another producer's install warning said again is
+/// still the latch's log line.
+#[test]
+fn a_second_linux_crash_loop_is_a_row_of_its_own() {
+    let crash = aterm_update::INSTALL_CRASH_LOOP_TITLE;
+    let install = update_words::HealthKind::Install;
+    let first = "aterm 0.11.0 didn\u{2019}t start properly, so aterm 0.10.0 is back and aterm \
+                 0.11.0 won\u{2019}t install again.";
+    let second = "aterm 0.12.0 didn\u{2019}t start properly, so aterm 0.10.0 is back and aterm \
+                  0.12.0 won\u{2019}t install again.";
+    let words = |app: &App| {
+        app.live_update_health(|k| k == install)
+            .iter()
+            .filter_map(|id| app.messages.live(*id))
+            .map(|l| (l.msg.title.clone(), l.msg.detail.join(" ")))
+            .collect::<Vec<_>>()
+    };
+    let mut app = App::headless_for_test();
+    band_seen(&mut app);
+    assert!(
+        app.note_update_health(crash, first),
+        "the first is announced"
+    );
+    assert!(
+        app.note_update_health(crash, second),
+        "and the second, banner and all"
+    );
+    let shown = words(&app);
+    assert!(
+        matches!(shown.as_slice(), [(title, detail)]
+            if title == aterm_update::health_failing_title("apply") && detail.contains("0.12.0")),
+        "one install warning, in the second's words: {shown:?}"
+    );
+    let _ = app.settle_messages(
+        Instant::now() + aterm_messages::HOLD_WARN + std::time::Duration::from_secs(1),
+    );
+    assert!(words(&app).is_empty(), "PRECONDITION: it folded");
+    assert!(
+        !app.note_update_health(aterm_update::health_failing_title("apply"), first),
+        "another producer's install warning is still latched"
+    );
+    assert!(words(&app).is_empty());
+    assert!(
+        app.note_update_health(crash, second),
+        "a crash loop after the fold is a row again"
+    );
+    assert_eq!(words(&app).len(), 1);
 }
 
 /// …SAID WHILE NOBODY COULD SEE IT, THE NOTICE IS SHOWN WHEN A WINDOW CAN, AND
@@ -5505,7 +5837,7 @@ fn a_linux_start_wait_said_unseen_is_shown_once_seen_unless_it_ended() {
     let said = Instant::now();
     app.note_update_health(aterm_update::INSTALL_AWAITS_START_TITLE, body);
     app.settle_messages(said + secs(10 * 60));
-    assert!(!live(&app), "PRECONDITION: it folded unseen");
+    assert!(live(&app), "it waits while nobody can see it");
     on_screen(&mut app, true);
     app.settle_messages(said + secs(10 * 60 + 1));
     assert!(live(&app), "shown once a window can show it");
@@ -5531,8 +5863,10 @@ fn a_linux_start_wait_said_unseen_is_shown_once_seen_unless_it_ended() {
 /// reaches only after its first present (the cold lane) or at Commit (the
 /// seamless lanes). The band showed a failure the landing was about to answer,
 /// and the history kept a second "Couldn't install updates" beside "aterm
-/// updates work again". Both lanes: neither shows nor records the warning, and
-/// the landing still records its healing against the parent's words.
+/// updates work again". Both lanes: neither shows the warning nor records it
+/// again — the seamless lane carries the parent's row, still waiting unseen
+/// there, and the landing answers that one record — and the landing still
+/// records its healing against the parent's words.
 #[test]
 fn an_owed_install_warning_is_answered_by_the_landing_it_is_carried_to() {
     let title = aterm_update::health_failing_title("apply");
@@ -5558,9 +5892,11 @@ fn an_owed_install_warning_is_answered_by_the_landing_it_is_carried_to() {
     let said = Instant::now();
     assert!(parent.note_update_health(title, body), "announced");
     parent.settle_messages(said + secs(10 * 60));
-    assert!(
-        parent.live_update_health(|k| k == kind).is_empty(),
-        "PRECONDITION: the warning folded unseen in the parent"
+    let warned = parent.live_update_health(|k| k == kind);
+    assert_eq!(
+        warned.len(),
+        1,
+        "PRECONDITION: the warning waits unseen in the parent"
     );
     assert!(
         parent.carried_health_said().iter().all(|said| said.owed),
@@ -5605,10 +5941,270 @@ fn an_owed_install_warning_is_answered_by_the_landing_it_is_carried_to() {
     seamless.messages.after_handoff_commit(Instant::now());
     seamless.post_update_landed("9.9.9", 7, 0);
     seamless.settle_messages(Instant::now());
-    assert_eq!(records(&seamless, title), 0, "nor records it");
+    assert!(
+        seamless
+            .messages
+            .log()
+            .records()
+            .filter(|r| r.title == title)
+            .all(|r| warned.contains(&r.id) && !r.is_live()),
+        "nor records it again: its one record is the parent's, carried and answered"
+    );
     assert_eq!(
         records(&seamless, "aterm updates work again"),
         1,
         "the landing records the healing"
     );
+}
+
+/// WHAT IS ON SCREEN DECIDES BAND OR RECORD (t-3): a config problem Settings says on
+/// the row of the setting it is about ("Not found" on Font family) raised while a
+/// terminal was in front is a band row; once Settings comes to the front it becomes
+/// its record in place, so the band never repeats the row above it or pushes the
+/// page down, and the same words returning never raise it again. NEGATIVE CONTROL: a
+/// misspelled key, which no Settings row says, keeps its band row.
+#[test]
+fn a_font_row_raised_over_a_terminal_is_a_record_once_settings_comes_to_front() {
+    use crate::message_reporters::{ConfigFamily, ConfigWarnings};
+    use aterm_messages::Retired;
+    let warnings = || {
+        let mut warns = ConfigWarnings::default();
+        warns.push(
+            ConfigFamily::IgnoredKeys,
+            "config line 3: unknown key \"windw_padding\"".to_string(),
+        );
+        warns.push_shown_in_settings(
+            ConfigFamily::Fonts,
+            "config font_family: \"NoSuchFontXYZ\" does not resolve to a font file; keeping \
+             the current working face"
+                .to_string(),
+        );
+        warns
+    };
+    let scope: Vec<&'static str> = ConfigFamily::ALL.iter().map(|f| f.key()).collect();
+    let reload = |app: &mut App| {
+        let warns = warnings();
+        app.note_config_settings_shows(&scope, &warns.settings_shown_keys());
+        let messages = warns.into_messages_routed(app.settings_in_front());
+        app.replace_config_messages(messages);
+    };
+    let fonts = ConfigFamily::Fonts.key();
+    let keys = ConfigFamily::IgnoredKeys.key();
+    let mut app = App::headless_for_test();
+    assert!(!app.settings_in_front());
+    reload(&mut app);
+    let row = app
+        .messages
+        .live_by_key(fonts)
+        .map(|live| live.id)
+        .expect("over a terminal the problem is a band row");
+    assert!(app.messages.live_by_key(keys).is_some());
+
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));
+    assert!(app.settings_in_front());
+    assert!(
+        app.messages.live_by_key(fonts).is_none(),
+        "with Settings in front the font problem is no band row"
+    );
+    let rec = app.messages.log().get(row).expect("logged");
+    assert_eq!(rec.retired(), Some(&Retired::Recorded), "{rec:?}");
+    assert!(
+        app.messages.live_by_key(keys).is_some(),
+        "a misspelled key no row says keeps its band row"
+    );
+    // The same words again with the terminal back in front: still a record.
+    app.switch_tab(0);
+    assert!(!app.settings_in_front());
+    reload(&mut app);
+    assert!(
+        app.messages.live_by_key(fonts).is_none(),
+        "a problem already told is never raised again"
+    );
+}
+
+/// A REFUSED `font_px` OR THEME IS THE ROW'S TO SAY WHILE SETTINGS IS IN FRONT (t-3's
+/// hand-edited `font_px = 500`): the unaccepted-values family Settings says on Font
+/// size ("Configured 500 → Default") and Color theme is a record with Settings in
+/// front and a band row over a terminal. NEGATIVE CONTROL: a `[harness]` value no row
+/// says, in the same family, keeps the band row even with Settings in front.
+#[test]
+fn a_refused_font_size_is_a_record_while_settings_is_in_front() {
+    use crate::message_reporters::{ConfigFamily, ConfigWarnings};
+    let shown = |config_text: &str| {
+        let config = crate::app_config::Config::parse(config_text).expect("config");
+        let mut warns = ConfigWarnings::default();
+        crate::app_config::collect_unaccepted_value_notices(
+            &mut warns,
+            &config,
+            &crate::app_config::ThemeCatalog::empty(),
+            config_text,
+        );
+        warns
+    };
+    let key = ConfigFamily::UnacceptedValues.key();
+    let warns = shown("font_px = 500.0\n");
+    assert!(warns.settings_shows(ConfigFamily::UnacceptedValues));
+    let messages = warns.into_messages_routed(true);
+    let msg = messages
+        .iter()
+        .find(|m| m.key.as_deref() == Some(key))
+        .expect("the refused size is said");
+    assert_eq!(msg.hold, Hold::LogOnly, "a record with Settings in front");
+    let messages = shown("font_px = 500.0\n").into_messages_routed(false);
+    let msg = messages
+        .iter()
+        .find(|m| m.key.as_deref() == Some(key))
+        .expect("the refused size is said");
+    assert_ne!(msg.hold, Hold::LogOnly, "a band row over a terminal");
+
+    let mut mixed = shown("font_px = 500.0\n");
+    mixed.push(
+        ConfigFamily::UnacceptedValues,
+        "config harness.idle_minutes: \"soon\" is not a number; keeping 30".to_string(),
+    );
+    assert!(!mixed.settings_shows(ConfigFamily::UnacceptedValues));
+    let messages = mixed.into_messages_routed(true);
+    let msg = messages
+        .iter()
+        .find(|m| m.key.as_deref() == Some(key))
+        .expect("said");
+    assert_ne!(
+        msg.hold,
+        Hold::LogOnly,
+        "a family with a sentence no row says keeps its band row"
+    );
+}
+
+/// A BAND ROW THAT BECOMES ITS RECORD DOES NOT SAY ITS FIRST SENTENCE TWICE: a
+/// config row raised over a terminal carries its painted excerpt as its first
+/// detail line; when Settings comes to the front and the row becomes its record
+/// (the decision made on screen, t-3), that excerpt went with it, so Settings ▸
+/// Messages read "font_px: 500.0 is not accepted" over "font_px: 500.0 is not
+/// accepted (expected 6–200; …)". A record is never painted: it keeps the sentences
+/// alone. NEGATIVE CONTROL: the band row keeps its excerpt.
+#[test]
+fn a_band_row_that_becomes_its_record_says_its_sentence_once() {
+    use crate::message_reporters::{ConfigFamily, ConfigWarnings, config_record};
+    let config = crate::app_config::Config::parse("font_px = 500.0\n").expect("config");
+    let mut warns = ConfigWarnings::default();
+    crate::app_config::collect_unaccepted_value_notices(
+        &mut warns,
+        &config,
+        &crate::app_config::ThemeCatalog::empty(),
+        "font_px = 500.0\n",
+    );
+    let band = warns
+        .into_messages_routed(false)
+        .into_iter()
+        .find(|m| m.key.as_deref() == Some(ConfigFamily::UnacceptedValues.key()))
+        .expect("the refused size is said");
+    assert!(
+        band.detail.len() >= 2 && band.detail[1].starts_with(&band.detail[0]),
+        "the band row paints its excerpt first: {:?}",
+        band.detail
+    );
+    let record = config_record(&band);
+    assert_eq!(record.hold, Hold::LogOnly);
+    assert_eq!(
+        record.detail,
+        band.detail[1..].to_vec(),
+        "the record keeps the sentences alone"
+    );
+}
+
+/// THE FIX'S WORDS ARE DECIDED WHEN IT ENDS (appearance-24): a refused wallpaper
+/// taken out logs "Wallpaper removed", one that now decodes "Wallpaper loaded", a
+/// refused font family taken out "Font setting removed" — never "Font applied" for a
+/// font nobody applied — whether the problem was still a band row or already a
+/// record. NEGATIVE CONTROL: a reload that saw nothing end keeps the words the family
+/// declared at post.
+#[test]
+fn a_fixed_config_problem_is_logged_in_the_words_of_how_it_ended() {
+    use crate::app_config::{Config, ConfigAssetCatalog, WallpaperAsset, config_fix_observations};
+    use crate::message_reporters::{ConfigFamily, ConfigWarnings, KEY_FONT_FAMILY};
+    let catalog = |wallpaper: WallpaperAsset| {
+        let mut catalog = (*ConfigAssetCatalog::empty()).clone();
+        catalog.wallpaper = wallpaper;
+        catalog
+    };
+    let invalid = catalog(WallpaperAsset::Invalid {
+        source_id: "/tmp/bad.png".into(),
+        bounded_reason: "not a decodable image".into(),
+    });
+    let ready = catalog(WallpaperAsset::Ready {
+        source_id: "/tmp/good.png".into(),
+        w: 1,
+        h: 1,
+        rgba: std::sync::Arc::from(vec![0u8; 4]),
+        fp: 1,
+    });
+    let none = catalog(WallpaperAsset::None);
+    let plain = Config::default();
+    let assets = ConfigFamily::Assets.key();
+    assert_eq!(
+        config_fix_observations(&plain, &invalid, &plain, &none)
+            .get(assets)
+            .map(String::as_str),
+        Some("Wallpaper removed")
+    );
+    assert_eq!(
+        config_fix_observations(&plain, &invalid, &plain, &ready)
+            .get(assets)
+            .map(String::as_str),
+        Some("Wallpaper loaded")
+    );
+    assert_eq!(
+        config_fix_observations(&plain, &none, &plain, &none).get(assets),
+        None,
+        "nothing refused before: no words decided"
+    );
+    let named = Config::parse("font_family = \"NoSuchFontXyz\"\n").expect("config");
+    assert_eq!(
+        config_fix_observations(&named, &none, &plain, &none)
+            .get(KEY_FONT_FAMILY)
+            .map(String::as_str),
+        Some("Font setting removed")
+    );
+    assert_eq!(
+        config_fix_observations(&named, &none, &named, &none)
+            .get(KEY_FONT_FAMILY)
+            .map(String::as_str),
+        Some("Font applied")
+    );
+
+    // Through the replace: a live row and a record both close in those words.
+    let refused = || {
+        let mut warns = ConfigWarnings::default();
+        warns.push_shown_in_settings(
+            ConfigFamily::Assets,
+            "config wallpaper \"/tmp/bad.png\" invalid: not a decodable image".to_string(),
+        );
+        warns
+    };
+    for in_front in [false, true] {
+        let mut app = App::headless_for_test();
+        let messages = refused().into_messages_routed(in_front);
+        let id = app.post_message(messages.into_iter().next().expect("one family"));
+        let removed = std::collections::BTreeMap::from([(
+            assets.to_string(),
+            "Wallpaper removed".to_string(),
+        )]);
+        app.replace_config_messages_after_font_work(Vec::new(), false, &removed);
+        let rec = app.messages.log().get(id).expect("logged");
+        assert_eq!(
+            rec.title, "Wallpaper removed",
+            "in_front={in_front}: {rec:?}"
+        );
+        assert_eq!(rec.severity, Severity::Success, "{rec:?}");
+        // NEGATIVE CONTROL: no observation, the family's own words.
+        let mut app = App::headless_for_test();
+        let messages = refused().into_messages_routed(in_front);
+        let id = app.post_message(messages.into_iter().next().expect("one family"));
+        app.replace_config_messages(Vec::new());
+        let rec = app.messages.log().get(id).expect("logged");
+        assert_eq!(
+            rec.title, "Image problem fixed",
+            "in_front={in_front}: {rec:?}"
+        );
+    }
 }

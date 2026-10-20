@@ -11,14 +11,16 @@ use super::world::{self, Fake, NOW, native_exe};
 use super::*;
 
 /// An ALab build of codex, laid in the store at `build`, complete; activated when `active`.
+/// Its entrypoint is the executable this host's shim runs ([`world::bin`]).
 fn alab_codex(l: &Layout, build: u64, active: bool) {
     let dir = l.build_dir("codex", build);
+    let entry = world::bin("codex");
     std::fs::create_dir_all(dir.join("bin")).unwrap();
-    std::fs::write(dir.join("bin/codex"), native_exe(&format!("alab {build}"))).unwrap();
+    std::fs::write(dir.join(&entry), native_exe(&format!("alab {build}"))).unwrap();
     std::fs::write(
         dir.join(crate::alab::PACKAGE_JSON),
         format!(
-            r#"{{"layoutVersion":1,"version":"0.164.0-dev.{build}+gabc","entrypoint":"bin/codex"}}"#
+            r#"{{"layoutVersion":1,"version":"0.164.0-dev.{build}+gabc","entrypoint":"{entry}"}}"#
         ),
     )
     .unwrap();
@@ -55,6 +57,26 @@ fn lane<'a>(
     }
 }
 
+/// The target ALab builds codex for ([`crate::alab`]): the source rule's input on every ALab
+/// arm here, whatever this host is — the synthetic fixture executable is never run, and those
+/// arms read no vendor document. A vendor install keeps [`lane`]'s host triple, the one the
+/// fake publishes for.
+const ALAB_TARGET: &str = "aarch64-apple-darwin";
+
+/// [`lane`], deciding for [`ALAB_TARGET`].
+fn alab_lane<'a>(
+    l: &'a Layout,
+    f: &'a Fake,
+    policy: &'a Policy,
+    trust: &'a Trust,
+    asked: bool,
+) -> Lane<'a> {
+    Lane {
+        triple: ALAB_TARGET,
+        ..lane(l, f, policy, trust, asked)
+    }
+}
+
 fn active(l: &Layout) -> Option<u64> {
     crate::ops::active_builds(l).get("codex").copied()
 }
@@ -73,7 +95,7 @@ fn an_alab_build_is_kept_asked_or_not_and_no_vendor_head_is_read() {
     f.publish_codex_default("0.165.0");
     let (policy, trust) = (Policy::default(), world::trust());
     for asked in [false, true] {
-        let o = install_one(&lane(&l, &f, &policy, &trust, asked), codex(), false);
+        let o = install_one(&alab_lane(&l, &f, &policy, &trust, asked), codex(), false);
         assert!(
             matches!(o.verdict, Verdict::AlabKept { .. }),
             "asked={asked}: {o:?}"
@@ -128,7 +150,7 @@ fn a_yanked_alab_build_rolls_back_onto_an_older_alab_build_and_never_to_the_vend
     // A legacy index build of the vendor's bytes, retained between them.
     let legacy = l.build_dir("codex", B - 1);
     std::fs::create_dir_all(legacy.join("bin")).unwrap();
-    std::fs::write(legacy.join("bin/codex"), native_exe("legacy")).unwrap();
+    std::fs::write(legacy.join(world::bin("codex")), native_exe("legacy")).unwrap();
     crate::store::mark_build_ready(&legacy).unwrap();
     alab_codex(&l, B, true);
     let f = Fake::default();
@@ -136,7 +158,7 @@ fn a_yanked_alab_build_rolls_back_onto_an_older_alab_build_and_never_to_the_vend
     let trust = world::trust();
     let yank = format!("codex@{B}");
     let policy = Policy::from_entries([yank.as_str()]);
-    let o = install_one(&lane(&l, &f, &policy, &trust, false), codex(), false);
+    let o = install_one(&alab_lane(&l, &f, &policy, &trust, false), codex(), false);
     assert!(
         matches!(o.verdict, Verdict::AlabRolledBack { to_build, .. } if to_build == B - 2),
         "{o:?}"
@@ -147,7 +169,7 @@ fn a_yanked_alab_build_rolls_back_onto_an_older_alab_build_and_never_to_the_vend
     let older = format!("codex@{}", B - 2);
     let policy = Policy::from_entries([yank.as_str(), older.as_str()]);
     for asked in [false, true, false] {
-        let o = install_one(&lane(&l, &f, &policy, &trust, asked), codex(), false);
+        let o = install_one(&alab_lane(&l, &f, &policy, &trust, asked), codex(), false);
         assert!(
             matches!(
                 o.verdict,
@@ -167,7 +189,7 @@ fn a_yanked_alab_build_rolls_back_onto_an_older_alab_build_and_never_to_the_vend
 
     // The yank lifted: the ALab build's commands are laid back, still no vendor read.
     let policy = Policy::from_entries([yank.as_str()]);
-    let o = install_one(&lane(&l, &f, &policy, &trust, false), codex(), false);
+    let o = install_one(&alab_lane(&l, &f, &policy, &trust, false), codex(), false);
     assert!(matches!(o.verdict, Verdict::AlabKept { .. }), "{o:?}");
     assert_eq!(active(&l), Some(B - 2));
     assert!(f.gets.borrow().is_empty());
@@ -196,11 +218,11 @@ fn the_signed_floor_revokes_an_alab_build_and_bounds_its_rollback() {
     };
     // At the floor: kept (the control).
     let policy = floored(B, &[]);
-    let o = install_one(&lane(&l, &f, &policy, &trust, false), codex(), false);
+    let o = install_one(&alab_lane(&l, &f, &policy, &trust, false), codex(), false);
     assert!(matches!(o.verdict, Verdict::AlabKept { .. }), "{o:?}");
     // Yanked, with the floor above the build behind it: no rollback below the floor.
     let policy = floored(B - 1, &[format!("codex@{B}")]);
-    let o = install_one(&lane(&l, &f, &policy, &trust, false), codex(), false);
+    let o = install_one(&alab_lane(&l, &f, &policy, &trust, false), codex(), false);
     assert!(
         matches!(
             o.verdict,
@@ -220,7 +242,7 @@ fn the_signed_floor_revokes_an_alab_build_and_bounds_its_rollback() {
     let l = world::layout("alab-floor-only");
     alab_codex(&l, B, true);
     let policy = floored(B + 1, &[]);
-    let o = install_one(&lane(&l, &f, &policy, &trust, true), codex(), false);
+    let o = install_one(&alab_lane(&l, &f, &policy, &trust, true), codex(), false);
     assert!(
         matches!(
             o.verdict,
@@ -250,7 +272,7 @@ fn an_alab_build_hidden_by_a_lost_or_tombstoned_shim_is_laid_back_never_replaced
     f.publish_codex_default("0.165.0");
     let (policy, trust) = (Policy::default(), world::trust());
     for asked in [false, true] {
-        let o = install_one(&lane(&l, &f, &policy, &trust, asked), codex(), false);
+        let o = install_one(&alab_lane(&l, &f, &policy, &trust, asked), codex(), false);
         assert!(matches!(o.verdict, Verdict::AlabKept { .. }), "{o:?}");
         assert_eq!(active(&l), Some(B));
         // A tombstone over it hides it the same way (the index lane disabled it under a
@@ -258,7 +280,7 @@ fn an_alab_build_hidden_by_a_lost_or_tombstoned_shim_is_laid_back_never_replaced
         crate::flow::install_tombstone_shims(&l, "codex", Some(B));
         assert_eq!(active(&l), None);
     }
-    let o = install_one(&lane(&l, &f, &policy, &trust, false), codex(), false);
+    let o = install_one(&alab_lane(&l, &f, &policy, &trust, false), codex(), false);
     assert!(matches!(o.verdict, Verdict::AlabKept { .. }), "{o:?}");
     assert_eq!(active(&l), Some(B));
     assert!(f.gets.borrow().is_empty(), "no vendor document was read");
@@ -273,7 +295,7 @@ fn a_rollback_by_hand_from_an_alab_build_lands_on_alab_builds_only() {
     alab_codex(&l, B - 2, false);
     let legacy = l.build_dir("codex", B - 1);
     std::fs::create_dir_all(legacy.join("bin")).unwrap();
-    std::fs::write(legacy.join("bin/codex"), native_exe("legacy")).unwrap();
+    std::fs::write(legacy.join(world::bin("codex")), native_exe("legacy")).unwrap();
     crate::store::mark_build_ready(&legacy).unwrap();
     alab_codex(&l, B, true);
     let moved = roll_back_by_hand(&l, &Policy::default(), codex()).expect("an older ALab build");
@@ -283,7 +305,7 @@ fn a_rollback_by_hand_from_an_alab_build_lands_on_alab_builds_only() {
     let only = world::layout("alab-byhand-only");
     let legacy = only.build_dir("codex", B - 1);
     std::fs::create_dir_all(legacy.join("bin")).unwrap();
-    std::fs::write(legacy.join("bin/codex"), native_exe("legacy")).unwrap();
+    std::fs::write(legacy.join(world::bin("codex")), native_exe("legacy")).unwrap();
     crate::store::mark_build_ready(&legacy).unwrap();
     alab_codex(&only, B, true);
     roll_back_by_hand(&only, &Policy::default(), codex()).expect_err("no older ALab build");
@@ -300,9 +322,7 @@ fn an_alab_command_restore_error_is_a_failed_outcome() {
     let shim = l.shim(&crate::store::ToolName::new("codex").unwrap());
     let f = Fake::default();
     let (policy, trust) = (Policy::default(), world::trust());
-    let mut config = lane(&l, &f, &policy, &trust, false);
-    // A supplied source-rule target: the synthetic fixture executable is never run.
-    config.triple = "aarch64-apple-darwin";
+    let mut config = alab_lane(&l, &f, &policy, &trust, false);
 
     std::fs::remove_file(&shim).unwrap();
     let restored = install_one(&config, codex(), false);

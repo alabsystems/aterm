@@ -389,22 +389,66 @@ fn a_symlink_is_resolved_to_its_target_and_a_link_to_a_directory_is_refused() {
     );
 }
 
+/// A Windows program's citation reads whole: the drive's colon is no line
+/// suffix, and the line and column after the path are. Where a backslash
+/// separates (Windows) a name with no extension reads as a path too.
+#[test]
+fn a_windows_citation_names_its_drive_path_line_and_column() {
+    let row = r"error: C:\proj\src\main.rs:12:5 here";
+    for col in 7..31 {
+        assert_eq!(
+            span_at(row, col),
+            some(r"C:\proj\src\main.rs", Some(12), Some(5)),
+            "{col}"
+        );
+    }
+    assert_eq!(
+        span_at(r"see C:\proj\Makefile", 6),
+        cfg!(windows).then(|| (r"C:\proj\Makefile".to_string(), None, None))
+    );
+}
+
+/// `src/foo.rs` as this host writes it: `src\foo.rs` on Windows.
+fn src_foo() -> String {
+    Path::new("src").join("foo.rs").display().to_string()
+}
+
 #[test]
 fn the_caption_names_the_file_relative_to_the_session_or_home() {
     let s = Scratch::new();
     let file = s.root.join("src/foo.rs");
     assert_eq!(
         display(&file, Some(3), Some(2), Some(&s.root), None),
-        "src/foo.rs:3:2"
+        format!("{}:3:2", src_foo())
     );
     assert_eq!(
         display(&file, None, None, None, Some(&s.root)),
-        "~/src/foo.rs"
+        format!("~{}{}", std::path::MAIN_SEPARATOR, src_foo())
     );
-    assert_eq!(
-        display(&file, Some(9), None, None, None),
-        format!("{}:9", file.display())
-    );
+    let whole = display(&file, Some(9), None, None, None);
+    assert_eq!(whole, format!("{}:9", plain_text(&file)));
+    assert!(!whole.starts_with(r"\\?\"), "{whole}");
+}
+
+/// The caption writes a whole path as a shell prints it: on Windows without
+/// the `\\?\` prefix `canonicalize` gives every resolved file, a drive's
+/// path and a share's alike. CONTROL: a verbatim path that names no drive
+/// or share has no shorter spelling and is kept whole; elsewhere every path
+/// is kept as it is.
+#[test]
+fn the_caption_writes_a_path_without_the_verbatim_prefix() {
+    let disk = Path::new(r"\\?\C:\proj\src\foo.rs");
+    let share = Path::new(r"\\?\UNC\host\share\foo.rs");
+    if cfg!(windows) {
+        assert_eq!(plain_text(disk), r"C:\proj\src\foo.rs");
+        assert_eq!(plain_text(share), r"\\host\share\foo.rs");
+    } else {
+        assert_eq!(plain_text(disk), disk.to_string_lossy());
+        assert_eq!(plain_text(share), share.to_string_lossy());
+    }
+    let volume = Path::new(r"\\?\Volume{0}\foo.rs");
+    assert_eq!(plain_text(volume), volume.to_string_lossy());
+    assert_eq!(plain_text(Path::new("/tmp/x.rs")), "/tmp/x.rs");
 }
 
 /// The caption names a file where it really is, never relative to one of the
@@ -420,7 +464,7 @@ fn the_caption_names_the_file_where_it_is_never_relative_to_a_directory() {
     let span = |row: &str| find_path_span(&chars(row), 0).expect("a citation");
     let here = PathTarget::resolve(&span("src/foo.rs:12"), &s.bases(), None).unwrap();
     assert_eq!(here.path, file);
-    assert_eq!(here.shown, format!("{}:12", file.display()));
+    assert_eq!(here.shown, format!("{}:12", plain_text(&file)));
     let there = PathTarget::resolve(&span("src/foo.rs:12"), &other.bases(), None).unwrap();
     assert_ne!(here.shown, there.shown, "two projects' files read apart");
     let agent = aterm_tempfile::tempdir().unwrap();
@@ -429,8 +473,13 @@ fn the_caption_names_the_file_where_it_is_never_relative_to_a_directory() {
         .expect("found through the second directory");
     assert_eq!(elsewhere.shown, here.shown);
     let home = PathTarget::resolve(&span("src/foo.rs:12"), &s.bases(), Some(&s.root)).unwrap();
-    assert_eq!(home.shown, "~/src/foo.rs:12", "under home");
-    let printed = format!("{}:3", file.display());
+    assert_eq!(
+        home.shown,
+        format!("~{}{}:12", std::path::MAIN_SEPARATOR, src_foo()),
+        "under home"
+    );
+    // Printed as a program prints a whole path (on Windows `C:\…`).
+    let printed = format!("{}:3", plain_text(&file));
     let absolute = PathTarget::resolve(&span(&printed), &[PathBuf::from("/")], None).unwrap();
     assert_eq!(absolute.shown, printed);
 }
@@ -523,31 +572,108 @@ fn a_cwd_report_stands_only_under_the_group_it_was_seen_under() {
         !report_stands(None, Some((3, shell)), shell),
         "a carried cwd"
     );
+    // First seen as the front moved: held to no group, it stands under none.
+    for front in [shell, ssh, 0, -1] {
+        assert!(
+            !report_stands(Some(3), Some((3, 0)), front),
+            "a report seen as the front moved, under {front}"
+        );
+    }
 }
 
-/// The program in front runs here when aterm names it a shell or an agent:
-/// an allow-list, so a remote shell, a multiplexer, a wrapper with its own
-/// terminal and a name not resolved yet need no list to be refused.
-/// NEGATIVE CONTROLS: each of those, and Claude Code's screen read under
-/// `ssh` (a remote one), is not.
+/// The sweep names the group a report is held to only when the front held
+/// still: the same group at the sweep before and under the report's own read.
+/// A remote shell's report first seen after its ssh exited, or across a group
+/// that moved under the read, is held to no group. NEGATIVE CONTROLS: a report
+/// first seen under a front that held still is held to it, and a later look at
+/// the same report changes nothing.
 #[test]
-fn only_a_shell_or_an_identified_agent_runs_here() {
-    let front = |program: Option<&str>, reader: Option<aterm_phase::Program>| {
-        crate::session_timeline::AgentPublication {
-            program: program.map(String::from),
-            reader,
-            ..Default::default()
-        }
-    };
-    for program in [
-        "zsh", "bash", "fish", "sh", "nu", "pwsh", "claude", "codex", "agy",
-    ] {
-        assert!(runs_here(&front(Some(program), None)), "{program}");
-    }
-    assert!(
-        runs_here(&front(Some("node"), Some(aterm_phase::Program::Claude))),
-        "Claude Code started as node, by its screen"
+fn a_report_seen_as_the_front_moved_is_held_to_no_group() {
+    let (shell, ssh) = (100, 200);
+    let mut tl = crate::session_timeline::SessionTimeline::default();
+    tl.note_foreground_group(ssh);
+    tl.witness_cwd_report(Some(1), ssh, ssh);
+    assert_eq!(
+        tl.cwd_witness(),
+        Some((1, ssh)),
+        "control: the ssh held still"
     );
+    // The remote shell's next report, first seen once the shell is back.
+    tl.witness_cwd_report(Some(2), shell, shell);
+    assert_eq!(
+        tl.cwd_witness(),
+        Some((2, 0)),
+        "the front moved since the last sweep"
+    );
+    tl.note_foreground_group(shell);
+    tl.witness_cwd_report(Some(2), shell, shell);
+    assert_eq!(
+        tl.cwd_witness(),
+        Some((2, 0)),
+        "a later look changes nothing"
+    );
+    // A group that moved under the read.
+    tl.witness_cwd_report(Some(3), shell, ssh);
+    assert_eq!(tl.cwd_witness(), Some((3, 0)), "moved under the read");
+    tl.witness_cwd_report(Some(4), shell, shell);
+    assert_eq!(tl.cwd_witness(), Some((4, shell)), "control: held still");
+}
+
+/// The program in front runs here when aterm names it a shell the person
+/// types into or an identified agent: an
+/// allow-list, so a remote shell, a multiplexer, a wrapper with its own
+/// terminal and a name not resolved yet need no list to be refused. A shell
+/// counts only alone in the group it leads and still a shell by the kernel's
+/// name, and the root shell not while its integration runs a command.
+/// NEGATIVE CONTROLS: each of those refusals, Claude Code's screen read under
+/// `ssh` (a remote one), and an unidentified runtime.
+#[test]
+fn only_a_shell_alone_or_an_identified_agent_runs_here() {
+    let front = |program: Option<&'static str>, agent: Option<aterm_phase::Program>| Front {
+        program,
+        agent,
+        root: false,
+        running: false,
+    };
+    let alone = || Some("zsh".to_string());
+    for program in ["zsh", "bash", "fish", "sh", "nu", "pwsh", "-zsh"] {
+        assert!(runs_here(&front(Some(program), None), alone), "{program}");
+    }
+    for (program, agent) in [
+        ("claude", aterm_phase::Program::Claude),
+        ("codex", aterm_phase::Program::Codex),
+        ("agy", aterm_phase::Program::Agy),
+        ("node", aterm_phase::Program::Claude),
+    ] {
+        assert!(
+            runs_here(&front(Some(program), Some(agent)), || None),
+            "{program} identified"
+        );
+    }
+    // A shell that shares its group, one an `exec` replaced, unreadable.
+    for leader in [None, Some("ssh"), Some("tmux"), Some("docker")] {
+        assert!(
+            !runs_here(&front(Some("bash"), None), || leader.map(String::from)),
+            "a bash whose group reads {leader:?}"
+        );
+    }
+    // The root shell in front while its integration runs a command; at its
+    // prompt (the control) it runs here, and a nested shell is not the root.
+    let root = |running| Front {
+        root: true,
+        running,
+        ..front(Some("zsh"), None)
+    };
+    assert!(!runs_here(&root(true), alone), "the root shell's `exec`");
+    assert!(
+        runs_here(&root(false), alone),
+        "control: the root at its prompt"
+    );
+    let nested = Front {
+        running: true,
+        ..front(Some("bash"), None)
+    };
+    assert!(runs_here(&nested, alone), "control: a nested shell, alone");
     for program in [
         "ssh",
         "mosh-client",
@@ -565,13 +691,24 @@ fn only_a_shell_or_an_identified_agent_runs_here() {
         "vim",
         "less",
         "node",
+        "bun",
         "",
     ] {
-        assert!(!runs_here(&front(Some(program), None)), "{program}");
+        assert!(!runs_here(&front(Some(program), None), alone), "{program}");
     }
-    assert!(!runs_here(&front(None, None)), "not named yet");
+    assert!(!runs_here(&front(None, None), alone), "not named yet");
     assert!(
-        !runs_here(&front(Some("ssh"), Some(aterm_phase::Program::Claude))),
+        !runs_here(
+            &front(
+                Some("ssh"),
+                crate::harness_host::identified_agent(&crate::session_timeline::AgentPublication {
+                    program: Some("ssh".into()),
+                    reader: Some(aterm_phase::Program::Claude),
+                    ..Default::default()
+                })
+            ),
+            alone
+        ),
         "a remote Claude Code's screen"
     );
 }
@@ -596,7 +733,7 @@ fn a_look_not_back_in_time_is_no_link_yet_and_its_answer_is_kept() {
     assert_eq!(target.path, s.root.join("src/foo.rs"));
     assert_eq!(
         target.shown,
-        format!("{}:2", s.root.join("src/foo.rs").display())
+        format!("{}:2", plain_text(&s.root.join("src/foo.rs")))
     );
     // Text that refuses on its face is answered at once, with no look.
     let hostile = PathSpan {

@@ -32,7 +32,7 @@ use std::ptr;
 use std::sync::Arc;
 
 use aterm_objc::{CGPoint, CGRect, Id, Obj, Sel, class, sel};
-use winit::window::Window;
+use aterm_window::window::Window;
 
 use super::{CpuFrameBuffer, CpuPresenter, DamageRect};
 use crate::appkit::{self, MainThread};

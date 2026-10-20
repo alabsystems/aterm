@@ -18,6 +18,24 @@
 //! author no connection names. An Owner can mint any number of edges, so the
 //! table is bounded and a flood of minted sources marks at most as fast as
 //! the named slots and the overflow together allow, whatever their number.
+//!
+//! THE MARKS A BUCKET WAS SHORT OF (phase 5, ruling T1): a host that counts
+//! a mark instead of making it, its author's bucket short
+//! ([`MarkLimiter::note_short`]), keeps the count IN THAT BUCKET, and the
+//! next mark made from the same bucket says it ([`MarkLimiter::owed`],
+//! [`MarkLimiter::said`]): a trusted actor's own, a session's while it
+//! holds its named slot, and the overflow's for every author that shares
+//! it. So a trusted actor's count, and a session's while it holds a named
+//! slot, never rides another author's mark; a session that takes a slot
+//! says nothing its last holder owed, and a named slot owing a count is
+//! given to another session only when no free slot or idle slot owing
+//! nothing is left, its count going with it, unsaid. The overflow's
+//! authors (the sessions past the table, and `-`, `aterm` and a vendor)
+//! share ONE count as they share one bucket: any of them may say what
+//! another was short of, its `dropped=` naming the bucket, not the author.
+//! A count per overflowed author is not kept: an Owner can mint any number
+//! of edges, so a table of them would be one more bounded table with an
+//! overflow of its own.
 
 use crate::vocab::{Actor, ShortId};
 
@@ -31,11 +49,13 @@ pub const MARK_ACTORS: usize = 16;
 /// A bucket's full level, in thousandths of a token.
 const FULL: u32 = MARK_BURST * 1000;
 
-/// One author's tokens, in thousandths, as of a monotonic instant.
+/// One author's tokens, in thousandths, as of a monotonic instant, and the
+/// marks it was short of since one last said so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Bucket {
     milli: u32,
     at_mono_ms: u64,
+    short: u64,
 }
 
 impl Bucket {
@@ -43,6 +63,7 @@ impl Bucket {
         Bucket {
             milli: FULL,
             at_mono_ms: now,
+            short: 0,
         }
     }
 
@@ -140,10 +161,20 @@ impl MarkLimiter {
         {
             return Slot::Named(i);
         }
-        let free = self.named.iter_mut().position(|s| match s {
-            None => true,
-            Some((_, b)) => b.idle(now),
-        });
+        // A free slot, or an idle one owing nothing; else an idle one whose
+        // count goes unsaid (module doc).
+        let free = self
+            .named
+            .iter_mut()
+            .position(|s| match s {
+                None => true,
+                Some((_, b)) => b.idle(now) && b.short == 0,
+            })
+            .or_else(|| {
+                self.named
+                    .iter_mut()
+                    .position(|s| s.as_mut().is_some_and(|(_, b)| b.idle(now)))
+            });
         match free {
             Some(i) => {
                 if take {
@@ -191,6 +222,37 @@ impl MarkLimiter {
     pub fn spend(&mut self, by: &Actor, now_mono_ms: u64) {
         let slot = self.slot(by, now_mono_ms, true);
         self.bucket(slot).spend(now_mono_ms);
+    }
+
+    /// `by` was short of a token at `now_mono_ms` and its mark was counted,
+    /// not made: one more in its bucket's count, which the next mark from
+    /// that bucket says ([`Self::owed`]). A session that holds no slot yet
+    /// takes one as [`Self::spend`] would, else counts in the overflow.
+    pub fn note_short(&mut self, by: &Actor, now_mono_ms: u64) {
+        let slot = self.slot(by, now_mono_ms, true);
+        let b = self.bucket(slot);
+        b.short = b.short.saturating_add(1);
+    }
+
+    /// How many marks `by`'s bucket was short of since one last said so
+    /// ([`Self::note_short`], [`Self::said`]): its own, the named slot it
+    /// holds, or the overflow it shares. `0` for a session that holds no
+    /// slot while one is there to take (free, or idle), whatever that slot's
+    /// last holder or the overflow owes.
+    pub fn owed(&mut self, by: &Actor, now_mono_ms: u64) -> u64 {
+        match self.slot(by, now_mono_ms, false) {
+            Slot::Named(i) if !self.holds(i, by) => 0,
+            slot => self.bucket(slot).short,
+        }
+    }
+
+    /// A mark from `by` said its bucket's count ([`Self::owed`]): that
+    /// bucket's alone starts again from zero.
+    pub fn said(&mut self, by: &Actor, now_mono_ms: u64) {
+        match self.slot(by, now_mono_ms, false) {
+            Slot::Named(i) if !self.holds(i, by) => {}
+            slot => self.bucket(slot).short = 0,
+        }
     }
 
     /// Whether named slot `i` is `by`'s own.

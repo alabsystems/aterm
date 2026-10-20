@@ -1,0 +1,12 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_bind_seeds_past_the_history_and_says_so_once (S1).
+see busy
+tx prompt v0
+bind 8192
+expect mark r1 source state=on skipped=8192 by=aterm src=transcript
+tx prompt v1 off=8000 dated=0
+tx prompt v2 dated=-60001
+tx prompt v3 dated=-1
+bind 8992
+tx prompt v4 dated=0
+expect amend t1 turn vref=v4

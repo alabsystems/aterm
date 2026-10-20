@@ -140,8 +140,8 @@ use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::limit::{ResetSpec, place_reset, within_a_session_window};
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::turn_end::{
-    RULE_CONTINUE, RULE_LIMIT_RESUME, TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming,
-    decide_turn_end,
+    FIRED_EARLY, RULE_CONTINUE, RULE_LIMIT_RESUME, TurnEndAction, TurnEndReading, TurnEndState,
+    TurnEndTiming, decide_turn_end,
 };
 use aterm_models_harness::supervisor_usage_wall_model;
 use aterm_phase::prompt::fixtures::screen;
@@ -312,16 +312,106 @@ fn timing(m: &Model) -> TurnEndTiming {
 /// The screen a state stands for: the wall (`bg`: the shell the tab counted
 /// kept, else the done row and the footer without it), the wall whose notice
 /// left the screen ([`left`]), or a worker at work.
-fn rows(st: &State) -> Vec<String> {
-    match st["wall"] {
-        1 => walled(st["bg"] == 1),
-        6 if st["other"] == 1 => resumed(),
-        6 if st["other"] == 2 => resumed_continued(),
-        6 if st["unread"] == 1 => cancelled(),
-        6 => left(),
-        _ if st["credits"] == 1 => on_credits(),
-        _ => screen(LIVE),
+#[derive(Clone, Copy)]
+enum Screen {
+    Walled,
+    WalledShell,
+    Resumed,
+    ResumedContinued,
+    Cancelled,
+    Left,
+    OnCredits,
+    Live,
+}
+
+impl Screen {
+    const ALL: [Self; 8] = [
+        Self::Walled,
+        Self::WalledShell,
+        Self::Resumed,
+        Self::ResumedContinued,
+        Self::Cancelled,
+        Self::Left,
+        Self::OnCredits,
+        Self::Live,
+    ];
+
+    fn of(st: &State) -> Self {
+        match st["wall"] {
+            1 if st["bg"] == 1 => Self::WalledShell,
+            1 => Self::Walled,
+            6 if st["other"] == 1 => Self::Resumed,
+            6 if st["other"] == 2 => Self::ResumedContinued,
+            6 if st["unread"] == 1 => Self::Cancelled,
+            6 => Self::Left,
+            _ if st["credits"] == 1 => Self::OnCredits,
+            _ => Self::Live,
+        }
     }
+
+    fn rows(self) -> Vec<String> {
+        match self {
+            Self::Walled => walled(false),
+            Self::WalledShell => walled(true),
+            Self::Resumed => resumed(),
+            Self::ResumedContinued => resumed_continued(),
+            Self::Cancelled => cancelled(),
+            Self::Left => left(),
+            Self::OnCredits => on_credits(),
+            Self::Live => screen(LIVE),
+        }
+    }
+
+    /// The screen's rows and the REAL reader's read of them, each made once:
+    /// both are pure, and a walk asks for them at every state and at every
+    /// transition (the read was half of a walk's time).
+    fn read(self) -> &'static (Vec<String>, aterm_phase::Reading) {
+        static READ: std::sync::OnceLock<Vec<(Vec<String>, aterm_phase::Reading)>> =
+            std::sync::OnceLock::new();
+        let all = READ.get_or_init(|| {
+            Self::ALL
+                .iter()
+                .map(|s| {
+                    let rows = s.rows();
+                    let read = aterm_phase::read(Some("claude"), &rows, Some(2));
+                    (rows, read)
+                })
+                .collect()
+        });
+        &all[self as usize]
+    }
+}
+
+fn rows(st: &State) -> Vec<String> {
+    Screen::of(st).rows()
+}
+
+/// The REAL [`TurnEndReading::of`] of `read` over `screen`'s rows, made once
+/// per thread for each set of inputs: it is pure, and a walk hands it the same
+/// ones again and again (it was two thirds of a walk's time). A hit is the
+/// same rows, the same `worked` and `reset_at`, and a read EQUAL to the one
+/// it was made from.
+fn turn_end_reading(
+    screen: Screen,
+    read: &aterm_phase::Reading,
+    worked: Option<Duration>,
+    reset_at: Option<Instant>,
+) -> TurnEndReading {
+    type Key = (usize, Option<Duration>, Option<Instant>);
+    type Made = Vec<(aterm_phase::Reading, TurnEndReading)>;
+    thread_local! {
+        static MADE: std::cell::RefCell<std::collections::HashMap<Key, Made>> =
+            std::cell::RefCell::default();
+    }
+    MADE.with_borrow_mut(|made| {
+        let made = made.entry((screen as usize, worked, reset_at)).or_default();
+        if let Some((_, t)) = made.iter().find(|(r, _)| r == read) {
+            return t.clone();
+        }
+        let t = TurnEndReading::of(read, &screen.read().0, false, worked, reset_at, None);
+        made.push((read.clone(), t.clone()));
+        t
+    })
 }
 
 /// A RUNNING TURN CARRIED BY USAGE CREDITS: the worker at work, and Claude
@@ -432,8 +522,8 @@ fn reading(
     run: Run,
     real: &TurnEndState,
 ) -> TurnEndReading {
-    let r = rows(st);
-    let mut read = aterm_phase::read(Some("claude"), &r, Some(2));
+    let (r, read) = Screen::of(st).read();
+    let mut read = read.clone();
     // A reader that takes usage credits for a spend wall.
     if run.credits_as_wall && st["credits"] == 1 && read.credits.is_some() {
         let mut w = aterm_phase::Wall {
@@ -460,7 +550,7 @@ fn reading(
     if read.wall.is_none()
         && !run.blind_to_left
         && let Some(w) = real
-            .left_answer(&r)
+            .left_answer(r)
             .filter(|a| {
                 a.screen_tells && (!run.blind_to_a_persons_left || real.untaken_act().is_some())
             })
@@ -473,7 +563,7 @@ fn reading(
         read.wall = Some(w);
     }
     let reset_at = read.wall.is_some().then_some(reset);
-    let mut t = TurnEndReading::of(&read, &r, false, worked, reset_at, None);
+    let mut t = turn_end_reading(Screen::of(st), &read, worked, reset_at);
     t.restartable = true;
     if run.masked && st["bg"] == 1 && st["wall"] == 1 {
         t.phase = Phase::Busy;
@@ -490,8 +580,11 @@ fn reading(
     // limit's notice is this limit's (tied to none): read as if its notice
     // were the wall's own.
     if run.untied_continuation && t.auto_continue == Some(aterm_phase::AutoContinue::Fired) {
-        let own = aterm_phase::read(Some("claude"), &walled(false), Some(2))
+        let own = Screen::Walled
+            .read()
+            .1
             .wall
+            .clone()
             .expect("the measured wall");
         t.since_limit = Some(aterm_phase::SinceLimit {
             kind: own.kind,
@@ -576,6 +669,9 @@ enum Verdict {
     Take,
     /// An act of another rule than the wall's (the continue policy's).
     Typed(&'static str),
+    /// The owner told: the credits hold's word where a reader takes the
+    /// credits notice for a spend wall (`Run::credits_as_wall`).
+    Told,
 }
 
 fn expected(m: &Model, st: &State) -> Verdict {
@@ -614,6 +710,7 @@ fn verdict(a: &TurnEndAction, now: Instant) -> Verdict {
             Verdict::Wait(until.saturating_duration_since(now))
         }
         TurnEndAction::Nothing => Verdict::Nothing,
+        TurnEndAction::Escalate { .. } => Verdict::Told,
         other => panic!("an act the model has no word for: {other:?}"),
     }
 }
@@ -840,6 +937,10 @@ struct Walked {
     fired: BTreeMap<&'static str, usize>,
     /// The states each action left the real wait disagreeing from.
     off_after: BTreeMap<&'static str, Vec<State>>,
+    /// Per action, how many fired with the real reset more than
+    /// [`FIRED_EARLY`] ahead: where the vendor's word that it went on is
+    /// another day's, under any notice.
+    early: BTreeMap<&'static str, usize>,
 }
 
 fn walk(m: &Model, strict: bool, run: Run) -> Walked {
@@ -856,6 +957,7 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
     let mut disagree = Vec::new();
     let mut fired: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut off_after: BTreeMap<&'static str, Vec<State>> = BTreeMap::new();
+    let mut early: BTreeMap<&'static str, usize> = BTreeMap::new();
     while let Some((st, real)) = queue.pop_front() {
         if !seen.insert(st.clone()) {
             continue;
@@ -885,6 +987,9 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
             let mut r = real.clone();
             if mirror(m, action.name, &st, &next, &mut r, &cfg, run) {
                 *fired.entry(action.name).or_default() += 1;
+                if r.reset.saturating_duration_since(r.now) > FIRED_EARLY {
+                    *early.entry(action.name).or_default() += 1;
+                }
                 // Checked at the transition, not at the state: the walk
                 // keeps the real side of the first path to reach a state.
                 if !run.masked && !waits_as_modelled(&r, &next) {
@@ -906,6 +1011,7 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
         off: disagree,
         fired,
         off_after,
+        early,
     }
 }
 
@@ -944,9 +1050,12 @@ fn tier1_the_real_reader_and_decider_continue_a_usage_wall_exactly_where_the_mod
 /// continue policy typed into the standing limit (the stub's 429, 22 minutes
 /// before the reset) — the model's `OtherLimitsContinuationRead`. Walked with
 /// that reading, the real state stops waiting after EVERY
-/// `ArmedConversationResumed`, where the model's limit stands; the loop as it
-/// is (the strict walk) waits on, the vendor's word tied to this limit's own
-/// notice by the reset it names.
+/// `ArmedConversationResumed` in the reset's last minute, where the model's
+/// limit stands; the loop as it is (the strict walk) waits on, the vendor's
+/// word tied to this limit's own notice by the reset it names. Earlier than
+/// that minute even the untied reading waits: the vendor goes on at the
+/// reset, so its word read sooner is another day's ([`FIRED_EARLY`],
+/// ATERM-KI-1015-1 LP-1) — a second rule, which the walk counts apart.
 #[test]
 fn the_loop_that_ties_no_continuation_to_its_limit_ends_the_wait_on_a_resume_at_an_armed_wall() {
     let m = walled_model();
@@ -964,10 +1073,21 @@ fn the_loop_that_ties_no_continuation_to_its_limit_ends_the_wait_on_a_resume_at_
         .off_after
         .get("ArmedConversationResumed")
         .map_or(0, Vec::len);
-    assert!(resumed > 0, "{:?}", walked.fired);
+    let early = walked
+        .early
+        .get("ArmedConversationResumed")
+        .copied()
+        .unwrap_or(0);
+    assert!(
+        resumed > early && early > 0,
+        "{:?} {:?}",
+        walked.fired,
+        walked.early
+    );
     assert_eq!(
-        ended, resumed,
-        "every resume at the armed wall ends the wait"
+        ended,
+        resumed - early,
+        "every resume at the armed wall in its reset's last minute ends the wait"
     );
     // ... and the model's defect is that loop: it types into the standing
     // limit before its tokens are back.

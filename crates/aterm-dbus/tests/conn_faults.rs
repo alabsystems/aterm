@@ -9,15 +9,13 @@
 
 #![cfg(unix)]
 
-mod support;
-
 use std::io::{Read as _, Write as _};
 use std::thread;
 use std::time::Duration;
 
+use crate::support::*;
 use aterm_dbus::{Connection, Error, Message, Value};
 use aterm_uds::CtlStream;
-use support::*;
 
 /// A wait for something that must happen: a hang detector, not a budget.
 const HANG: Duration = Duration::from_secs(60);

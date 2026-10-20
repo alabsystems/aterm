@@ -86,7 +86,8 @@ pub(crate) const STYLED: u8 = 1 << 2;
 pub(crate) const EMOJI: u8 = 1 << 3;
 /// A face the Linux/Windows grid-fitting path draws (the hinting corpus), or
 /// one that stands in for an outline format it draws: the committed CFF
-/// fixture on every host, and SF India's CFF2 variable face on a Mac (TF.4).
+/// fixture on every host, SF India's CFF2 variable face on a Mac (TF.4), and
+/// on Linux Noto Sans CJK, the autohinter's CJK style over CFF outlines.
 pub(crate) const HINT: u8 = 1 << 4;
 
 pub(crate) struct FaceFile {
@@ -413,16 +414,21 @@ pub(crate) const FACES: &[FaceFile] = &[
     ),
     // Linux and Windows: the colour faces, the CJK face aterm's Linux fallback
     // chain loads (CFF), and a CFF2 candidate, recorded when the corpus is
-    // blessed on a host that has them. No Linux host has confirmed these
-    // paths yet: Noto ships its CFF2 variable CJK build as `*-VF.otf.ttc` (the
-    // `*-VF.ttf.ttc` build is TrueType), and a distribution may install it
-    // elsewhere or not at all. An absent path records nothing.
+    // blessed on a host that has them. An absent path records nothing.
     //
-    // OPEN FOR TF.6: whether Noto Color Emoji or Segoe UI Emoji position a
-    // mark on its base in an emoji cluster (GPOS MarkBase), which decides if
-    // TF.6 needs MarkBase, waits on a bless on a host that has them. Until
-    // then only Apple Color Emoji's emoji shaping is pinned, so a host
-    // without it pins no emoji shaping at all.
+    // Recorded in the Linux lane (Ubuntu 24.04, L-FONTS of
+    // docs/AUDIT-third-party-2026-10-15.md, 2026-10-19): Noto Color Emoji
+    // 2.047 (`fonts-noto-color-emoji`) is the CBDT build, with `GSUB` and no
+    // `GPOS` or `COLR`, and its `shape` lines came from the recorder's
+    // `shape` mode on rustybuzz. Every emoji case shapes to one glyph with no
+    // offset (VS15 adds a zero-advance glyph), so there is no mark for
+    // `GPOS` MarkBase, or rustybuzz's fallback placement, to position, and
+    // aterm-font's shaper carves neither. `fonts-noto-cjk` 1:20230817
+    // installs static CFF collections only (Noto Sans CJK Regular is ten
+    // faces, five regions' Sans and Sans Mono); Ubuntu ships no variable CJK
+    // build, so the CFF2 path below is absent there (Noto ships it as
+    // `*-VF.otf.ttc`; the `*-VF.ttf.ttc` build is TrueType).
+    // Segoe UI Emoji waits on a bless on Windows.
     sys(
         "NotoColorEmoji",
         "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
@@ -433,7 +439,7 @@ pub(crate) const FACES: &[FaceFile] = &[
         "NotoSansCJK-Regular",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         &[0],
-        READ,
+        READ | HINT,
     ),
     sys(
         "NotoSansCJK-VF-CFF2",
@@ -453,6 +459,50 @@ pub(crate) const FACES: &[FaceFile] = &[
         &[0],
         READ | PRIMARY,
     ),
+];
+
+/// The clusters `Renderer::shape_cluster` shapes on the colour face: the
+/// `emoji.*` case of every [`EMOJI`] face's `shape` lines, with no features
+/// and no coordinates. `tests/font_oracle.rs` answers them with aterm-font's
+/// shaper, and the recorder's `shape` mode records them with rustybuzz on a
+/// host whose colour face no bless has recorded yet.
+pub(crate) const EMOJI_CASES: &[(&str, &str)] = &[
+    ("emoji.grin", "\u{1F600}"),
+    ("emoji.heart-vs16", "\u{2764}\u{FE0F}"),
+    ("emoji.smile-vs15", "\u{263A}\u{FE0E}"),
+    (
+        "emoji.family",
+        "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
+    ),
+    ("emoji.technologist", "\u{1F469}\u{200D}\u{1F4BB}"),
+    ("emoji.rainbow-flag", "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}"),
+    ("emoji.heart-fire", "\u{2764}\u{FE0F}\u{200D}\u{1F525}"),
+    (
+        "emoji.holding-hands",
+        "\u{1F9D1}\u{200D}\u{1F91D}\u{200D}\u{1F9D1}",
+    ),
+    ("emoji.thumbs-medium", "\u{1F44D}\u{1F3FD}"),
+    ("emoji.wave-dark", "\u{1F44B}\u{1F3FF}"),
+    (
+        "emoji.red-hair-light",
+        "\u{1F9D1}\u{1F3FB}\u{200D}\u{1F9B0}",
+    ),
+    (
+        "emoji.couple-tones",
+        "\u{1F469}\u{1F3FE}\u{200D}\u{1F91D}\u{200D}\u{1F468}\u{1F3FB}",
+    ),
+    ("emoji.flag-us", "\u{1F1FA}\u{1F1F8}"),
+    ("emoji.flag-jp", "\u{1F1EF}\u{1F1F5}"),
+    ("emoji.flag-invalid", "\u{1F1E6}\u{1F1E6}"),
+    (
+        "emoji.flag-england",
+        "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}",
+    ),
+    ("emoji.keycap-1", "1\u{FE0F}\u{20E3}"),
+    ("emoji.keycap-hash", "#\u{FE0F}\u{20E3}"),
+    ("emoji.keycap-bare", "*\u{20E3}"),
+    ("emoji.melting", "\u{1FAE0}"),
+    ("emoji.ascii", "A"),
 ];
 
 /// The faces whose `read` answers live in `reader-gvar-alloc.txt`, not

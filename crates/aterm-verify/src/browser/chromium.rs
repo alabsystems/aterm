@@ -95,7 +95,9 @@ pub(crate) fn cache_root(
         .map(|c| c.join("aterm/browser"))
 }
 
-fn host_cache_root() -> Option<PathBuf> {
+/// This host's browser cache ([`cache_root`]); the lane's Firefox is
+/// unpacked beside the Chromium.
+pub(crate) fn host_cache_root() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let xdg = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from);
     cache_root(std::env::consts::OS, home.as_deref(), xdg.as_deref())
@@ -209,48 +211,95 @@ pub(crate) fn find() -> Result<Browser, String> {
     ))
 }
 
-/// `verify fetch-browser`: the pinned chrome-headless-shell for this host,
-/// downloaded, held to its sha256 and unpacked into the cache. Prints the
-/// executable; exit 0, 1 on a failure, 3 where nothing is pinned.
+/// `verify fetch-browser`: the pinned chrome-headless-shell and Firefox for
+/// this host, each downloaded, held to its sha256 and unpacked into the
+/// cache. Prints each executable; exit 0, 1 on a failure, 3 where nothing
+/// is pinned.
 pub fn fetch_main(args: &[String]) -> i32 {
     if let Some(a) = args.first() {
         eprintln!(
             "verify fetch-browser: takes no arguments, not `{a}` (it fetches chrome-headless-shell \
-             {PIN_VERSION} for this host)"
+             {PIN_VERSION} and Playwright's Firefox build {} for this host)",
+            super::firefox::BUILD
         );
         return crate::exit::USAGE;
     }
-    let Some(pin) = host_pin() else {
-        eprintln!(
-            "verify fetch-browser: COULD NOT RUN — no chrome-headless-shell is pinned for {}-{}; \
-             set {BROWSER_ENV} to a Chromium",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        );
-        return crate::exit::COULD_NOT_RUN;
-    };
     let Some(root) = host_cache_root() else {
         eprintln!("verify fetch-browser: COULD NOT RUN — no HOME to put the cache under");
         return crate::exit::COULD_NOT_RUN;
     };
-    match fetch(pin, &root) {
-        Ok(binary) => {
-            println!("{}", binary.display());
-            crate::exit::PASS
-        }
-        Err(e) => {
-            eprintln!("verify fetch-browser: FAIL — {e}");
-            crate::exit::FAILED
+    let chromium = host_pin().map(|pin| Archive {
+        what: format!("chrome-headless-shell {PIN_VERSION}"),
+        url: archive_url(pin.platform),
+        sha256: pin.sha256,
+        bytes: pin.bytes,
+        dir: pinned_dir(&root, pin.platform),
+        binary: pinned_binary(Path::new(""), pin.platform),
+    });
+    let firefox = super::firefox::host_pin().map(|pin| Archive {
+        what: format!(
+            "Playwright's Firefox build {} (Firefox {})",
+            super::firefox::BUILD,
+            super::firefox::VERSION
+        ),
+        url: super::firefox::archive_url(pin),
+        sha256: pin.sha256,
+        bytes: pin.bytes,
+        dir: super::firefox::pinned_dir(&root, pin),
+        binary: PathBuf::from(pin.binary),
+    });
+    let pinned: Vec<Archive> = chromium.into_iter().chain(firefox).collect();
+    if pinned.is_empty() {
+        eprintln!(
+            "verify fetch-browser: COULD NOT RUN — no browser is pinned for {}-{}; set \
+             {BROWSER_ENV} to a Chromium",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        return crate::exit::COULD_NOT_RUN;
+    }
+    if super::firefox::host_pin().is_none() {
+        eprintln!(
+            "verify fetch-browser: no Firefox is pinned for {}-{}; the browser lane's Firefox \
+             rows run only with {}",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            super::firefox::FIREFOX_ENV
+        );
+    }
+    let mut code = crate::exit::PASS;
+    for archive in &pinned {
+        match fetch(archive, &root) {
+            Ok(binary) => println!("{}", binary.display()),
+            Err(e) => {
+                eprintln!("verify fetch-browser: FAIL — {}: {e}", archive.what);
+                code = crate::exit::FAILED;
+            }
         }
     }
+    code
 }
 
-/// Download, check and unpack `pin` under `root`; the executable.
-fn fetch(pin: &Pinned, root: &Path) -> Result<PathBuf, String> {
-    let dir = pinned_dir(root, pin.platform);
-    let binary = pinned_binary(&dir, pin.platform);
+/// One archive `verify fetch-browser` unpacks into the cache: where it is
+/// served, what it must hash to, the directory it is unpacked into, and its
+/// executable inside that.
+struct Archive {
+    what: String,
+    url: String,
+    sha256: &'static str,
+    bytes: u64,
+    dir: PathBuf,
+    binary: PathBuf,
+}
+
+/// Download, check and unpack `archive` under `root`; the executable.
+fn fetch(archive: &Archive, root: &Path) -> Result<PathBuf, String> {
+    let binary = archive.dir.join(&archive.binary);
     if binary.is_file() {
-        eprintln!("verify fetch-browser: already in the cache");
+        eprintln!(
+            "verify fetch-browser: {} already in the cache",
+            archive.what
+        );
         return Ok(binary);
     }
     std::fs::create_dir_all(root)
@@ -262,24 +311,24 @@ fn fetch(pin: &Pinned, root: &Path) -> Result<PathBuf, String> {
         .tempdir_in(root)
         .map_err(|e| format!("could not create scratch under {}: {e}", root.display()))?;
     let zip = scratch.path().join("browser.zip");
-    let url = archive_url(pin.platform);
+    let url = &archive.url;
     eprintln!(
         "verify fetch-browser: downloading {url} ({} MB)",
-        pin.bytes / 1_000_000
+        archive.bytes / 1_000_000
     );
     run(
         command("curl")
             .args(["-sSfL", "--retry", "0", "-o"])
             .arg(&zip)
-            .arg(&url),
+            .arg(url),
         "curl",
     )?;
     let got = crate::perf::arena::sha256_file(&zip)?;
-    if got != pin.sha256 {
+    if got != archive.sha256 {
         return Err(format!(
-            "{url} hashes to {got}, the pin is {} (crates/aterm-verify/src/browser/chromium.rs): \
-             the archive changed under its version; nothing was unpacked",
-            pin.sha256
+            "{url} hashes to {got}, the pin is {} (crates/aterm-verify/src/browser/): the \
+             archive changed under its version; nothing was unpacked",
+            archive.sha256
         ));
     }
     // Only a completed, checked unpack is renamed into the shared cache.
@@ -295,16 +344,13 @@ fn fetch(pin: &Pinned, root: &Path) -> Result<PathBuf, String> {
             "unzip",
         )
     }?;
-    if !pinned_binary(&staging, pin.platform).is_file() {
-        return Err(format!(
-            "the archive holds no chrome-headless-shell-{}/chrome-headless-shell",
-            pin.platform
-        ));
+    if !staging.join(&archive.binary).is_file() {
+        return Err(format!("the archive holds no {}", archive.binary.display()));
     }
-    if let Err(e) = std::fs::rename(&staging, &dir) {
+    if let Err(e) = std::fs::rename(&staging, &archive.dir) {
         // Another fetch may have published the same pin while this one unpacked.
         if !binary.is_file() {
-            return Err(format!("could not place {}: {e}", dir.display()));
+            return Err(format!("could not place {}: {e}", archive.dir.display()));
         }
     }
     Ok(binary)
@@ -326,20 +372,65 @@ fn run(cmd: &mut aterm_uds::spawnfd::Command, what: &str) -> Result<(), String> 
     }
 }
 
-/// The ANGLE backend WebGL2 runs on: Metal on macOS, SwiftShader (a CPU
-/// Vulkan, no GPU needed) elsewhere.
-pub(crate) fn angle_backend() -> &'static str {
+/// An ANGLE backend a session asks WebGL2 to run on (`--use-angle`). The
+/// pinned shell offers two on macOS, Metal and SwiftShader; its log names
+/// them when another is asked for (`allowed implementations:
+/// [(gl=egl-angle,angle=metal),(gl=egl-angle,angle=swiftshader)]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Angle {
+    /// The Mac's GPU, through ANGLE's Metal backend.
+    Metal,
+    /// SwiftShader, a CPU Vulkan under ANGLE: Chromium's software WebGL,
+    /// no GPU needed.
+    SwiftShader,
+}
+
+impl Angle {
+    /// The `--use-angle` value, and the backend's name in the lane's rows.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Angle::Metal => "metal",
+            Angle::SwiftShader => "swiftshader",
+        }
+    }
+
+    /// Whether `adapter`, the unmasked renderer the GPU page reports, is
+    /// this backend's. A browser that cannot give the backend asked for
+    /// falls back to another (SwiftShader) without failing the page, so a
+    /// session is held to the backend its adapter names.
+    pub(crate) fn drew(self, adapter: &str) -> bool {
+        adapter.contains(match self {
+            Angle::Metal => "ANGLE Metal Renderer",
+            Angle::SwiftShader => "SwiftShader",
+        })
+    }
+}
+
+/// The backends the lane runs, one browser session each: on macOS Metal
+/// (the GPU the wgpu-WebGL recording was drawn on) and SwiftShader;
+/// elsewhere SwiftShader, which needs no GPU.
+pub(crate) fn angle_backends() -> &'static [Angle] {
     if cfg!(target_os = "macos") {
-        "metal"
+        &[Angle::Metal, Angle::SwiftShader]
     } else {
-        "swiftshader"
+        &[Angle::SwiftShader]
     }
 }
 
 /// The browser's arguments: headless, a private profile under `profile`,
-/// DevTools on fds 3 and 4, WebGL2 on [`angle_backend`], and nothing that
-/// throttles a page the lane is waiting on.
-pub(crate) fn launch_args(browser: &Browser, profile: &Path) -> Vec<std::ffi::OsString> {
+/// DevTools on fds 3 and 4, WebGL2 on `angle`, and nothing that throttles a
+/// page the lane is waiting on. Every session takes
+/// `--enable-unsafe-swiftshader`, Chromium's opt-in to software WebGL for
+/// trusted content. Under SwiftShader it silences the deprecation the
+/// software path logs without it; under Metal it lets a GPU process that
+/// cannot start fall back to SwiftShader (without it the page gets no
+/// WebGL2 at all), and [`Angle::drew`] then names the session as not run
+/// instead of the page failing for want of a GPU.
+pub(crate) fn launch_args(
+    browser: &Browser,
+    profile: &Path,
+    angle: Angle,
+) -> Vec<std::ffi::OsString> {
     let mut v: Vec<std::ffi::OsString> = Vec::new();
     if !browser.shell {
         v.push("--headless".into());
@@ -364,7 +455,7 @@ pub(crate) fn launch_args(browser: &Browser, profile: &Path) -> Vec<std::ffi::Os
     ] {
         v.push(a.into());
     }
-    v.push(format!("--use-angle={}", angle_backend()).into());
+    v.push(format!("--use-angle={}", angle.name()).into());
     v.push("about:blank".into());
     v
 }
@@ -420,12 +511,36 @@ mod tests {
             shell: false,
             ..shell.clone()
         };
-        let has = |b: &Browser, a: &str| launch_args(b, profile).iter().any(|x| x == a);
+        let has =
+            |b: &Browser, a: &str| launch_args(b, profile, Angle::Metal).iter().any(|x| x == a);
         assert!(!has(&shell, "--headless") && has(&full, "--headless"));
         for b in [&shell, &full] {
             assert!(has(b, "--remote-debugging-pipe") && has(b, "--user-data-dir=/p"));
         }
         assert!(is_shell(Path::new("/x/chrome-headless-shell")));
         assert!(!is_shell(Path::new("/x/Google Chrome")));
+    }
+
+    /// Each backend asks for itself, and a session is held to the adapter
+    /// the pinned shell reports for its backend: a Metal session that fell
+    /// back to SwiftShader is not a Metal session.
+    #[test]
+    fn each_backend_asks_for_itself_and_knows_its_adapter() {
+        let shell = Browser {
+            path: PathBuf::from("/c/chrome-headless-shell"),
+            shell: true,
+            source: String::new(),
+        };
+        let args = |angle| launch_args(&shell, Path::new("/p"), angle);
+        let has = |angle, a: &str| args(angle).iter().any(|x| x == a);
+        assert!(has(Angle::Metal, "--use-angle=metal"));
+        assert!(!has(Angle::Metal, "--use-angle=swiftshader"));
+        assert!(has(Angle::SwiftShader, "--use-angle=swiftshader"));
+        let metal = "ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Pro, Unspecified Version) (Gl)";
+        let swiftshader = "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) \
+                           (0x0000C0DE)), SwiftShader driver) (Gl)";
+        assert!(Angle::Metal.drew(metal) && !Angle::Metal.drew(swiftshader));
+        assert!(Angle::SwiftShader.drew(swiftshader) && !Angle::SwiftShader.drew(metal));
+        assert_eq!(angle_backends().last(), Some(&Angle::SwiftShader));
     }
 }

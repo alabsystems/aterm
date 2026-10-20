@@ -22,7 +22,7 @@ use aterm_verify::{Ctx, Scope, Show, exit, mktemp_dir, plan, stages};
 /// unit-tested where it lives), the node-driven `wasm-smoke` and `wasm-glue`,
 /// the Chromium-driven `browser`, the bundle's `measure`, the release's feature
 /// builds (`checkers`, `gpu-oracle`, each a stage unit-tested in `stages`), the
-/// sealed rung, the machine-package `codex-alab` and the VM-driving `linux`.
+/// machine-package `codex-alab` and the VM-driving `linux`.
 fn land() -> Vec<Check> {
     CHECKS
         .iter()
@@ -40,7 +40,6 @@ fn land() -> Vec<Check> {
                     | Check::Measure
                     | Check::Checkers
                     | Check::GpuOracle
-                    | Check::Sealed
                     | Check::CodexAlab
                     | Check::Linux
             )

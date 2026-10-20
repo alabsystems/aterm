@@ -9,6 +9,7 @@
 //! inside each profile and none at the root.
 
 use super::*;
+use crate::harness::host_path::abs;
 
 /// A fixed instant; never `SystemTime::now()`.
 const NOW: i64 = 1_789_603_200;
@@ -115,6 +116,7 @@ pub(crate) fn synthetic_target(tmp: &Tmp, name: &str) -> PathBuf {
 }
 
 /// The real remover under the default stale window at `now`, on any device.
+#[cfg(unix)]
 fn real(now: i64) -> impl FnMut(&Row) -> std::io::Result<Removed> {
     remover(Judge {
         now,
@@ -151,6 +153,7 @@ fn applying() -> Config {
 
 // -- the report ----------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn a_synthetic_stale_target_is_reported_and_then_removed_with_its_witness_in_the_row() {
     let tmp = Tmp::new("stale-target");
@@ -350,10 +353,16 @@ fn an_unresolvable_live_symlink_blocks_every_version_row_rather_than_guessing() 
     assert!(done.removed.is_empty());
 }
 
+/// A superseded store build is a row only when atpkg's retention would take
+/// it: the live build and its rollback target (the newest below the live
+/// one) are kept by `aterm pkg gc`, so neither is a row; the older one and a
+/// staged-but-never-activated build above the live one are. NEGATIVE
+/// CONTROL: the rollback target, which the report listed before 2026-10-17
+/// although `aterm pkg gc` never frees it, is not among the rows.
 #[test]
 fn a_superseded_store_build_is_reported_and_delegated_never_removed_here() {
     let mut survey = Survey::new(NOW);
-    for build in ["2026091601", "2026091701"] {
+    for build in ["2026091501", "2026091601", "2026091701", "2026091801"] {
         survey.store.push(StoreBuild {
             program: "claude".to_owned(),
             build: build.to_owned(),
@@ -367,7 +376,19 @@ fn a_superseded_store_build_is_reported_and_delegated_never_removed_here() {
         .insert("claude".to_owned(), "2026091701".to_owned());
     let rep = report(&survey, applying());
     let rows = rep.rows_of(Class::AtpkgGc);
-    assert_eq!(rows.len(), 1, "only the superseded one: {rep:?}");
+    let named: Vec<&Path> = rows.iter().map(|r| r.path.as_path()).collect();
+    assert_eq!(
+        named,
+        [
+            Path::new("/store/claude/2026091501"),
+            Path::new("/store/claude/2026091801")
+        ],
+        "what atpkg's retention takes: {rep:?}"
+    );
+    assert!(
+        !named.contains(&Path::new("/store/claude/2026091601")),
+        "the rollback target is atpkg's to keep"
+    );
     assert!(
         matches!(&rows[0].witness, Witness::Superseded { program, live }
             if program == "claude" && live == "2026091701")
@@ -425,6 +446,7 @@ fn free_space_warns_only_on_a_figure_it_actually_has() {
 
 // -- apply: the default, the fences ---------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn report_only_is_the_default_and_apply_without_a_class_does_nothing() {
     let tmp = Tmp::new("default");
@@ -493,29 +515,30 @@ fn report_only_is_the_default_and_apply_without_a_class_does_nothing() {
 
 #[test]
 fn a_path_outside_the_list_is_refused_with_a_denial_row() {
+    let reported = PathBuf::from(abs("/v/2.1.259"));
     let mut survey = Survey::new(NOW);
     survey.versions.push(VersionDir {
-        path: PathBuf::from("/v/2.1.259"),
+        path: reported.clone(),
         bytes: 200,
         bytes_partial: false,
     });
-    survey.live_version = Some(PathBuf::from("/v/2.1.265"));
+    survey.live_version = Some(PathBuf::from(abs("/v/2.1.265")));
     let rep = report(&survey, applying());
 
     // A path that is simply not on the report.
-    let outside = Path::new("/etc/passwd");
-    let err = guard(&rep, None, Class::ClaudeStaleVersions, outside)
+    let outside = abs("/etc/passwd");
+    let err = guard(&rep, None, Class::ClaudeStaleVersions, Path::new(&outside))
         .expect_err("a path nothing reported has no witness");
     assert_eq!(err.code(), "not-reported");
     let line = denial_row(NOW, "sid-1", &err);
     assert!(line.contains("\"kind\":\"denial\""), "{line}");
     assert!(line.contains("\"reason\":\"not-reported\""), "{line}");
-    assert!(line.contains("/etc/passwd"), "{line}");
+    assert!(line.contains(&outside), "{line}");
     assert!(!line.contains('\n'), "one row is one line: {line}");
 
     // A reported path, but under the wrong class: the grant does not carry.
     assert_eq!(
-        guard(&rep, None, Class::CargoTargets, Path::new("/v/2.1.259"))
+        guard(&rep, None, Class::CargoTargets, &reported)
             .expect_err("a cargo-targets grant cannot reach a versions row")
             .code(),
         "not-reported"
@@ -546,13 +569,7 @@ fn a_path_outside_the_list_is_refused_with_a_denial_row() {
     );
 
     // The path that is on the report passes the same fence.
-    guard(
-        &rep,
-        None,
-        Class::ClaudeStaleVersions,
-        Path::new("/v/2.1.259"),
-    )
-    .expect("the reported row passes");
+    guard(&rep, None, Class::ClaudeStaleVersions, &reported).expect("the reported row passes");
 }
 
 #[test]
@@ -560,13 +577,14 @@ fn nothing_under_the_transcripts_root_is_ever_removed_even_when_it_is_on_the_rep
     // A report that (wrongly) carries a transcript path as a removable row:
     // the SECOND fence is what this test is about, so the first is bypassed.
     let mut survey = Survey::new(NOW);
-    survey.transcripts_root = Some(PathBuf::from("/home/a/.claude/projects"));
+    let root = PathBuf::from(abs("/home/a/.claude/projects"));
+    survey.transcripts_root = Some(root.clone());
     survey.versions.push(VersionDir {
-        path: PathBuf::from("/home/a/.claude/projects/repo"),
+        path: root.join("repo"),
         bytes: 999,
         bytes_partial: false,
     });
-    survey.live_version = Some(PathBuf::from("/v/2.1.265"));
+    survey.live_version = Some(PathBuf::from(abs("/v/2.1.265")));
     let rep = report(&survey, applying());
     assert_eq!(
         rep.rows_of(Class::ClaudeStaleVersions).len(),
@@ -594,7 +612,7 @@ fn nothing_under_the_transcripts_root_is_ever_removed_even_when_it_is_on_the_rep
             &rep,
             survey.transcripts_root.as_deref(),
             Class::ClaudeStaleVersions,
-            Path::new("/home/a/.claude/projects")
+            &root
         )
         .expect_err("the root itself")
         .code(),
@@ -607,12 +625,12 @@ fn a_removal_that_fails_is_a_denial_row_and_does_not_abandon_the_rest() {
     let mut survey = Survey::new(NOW);
     for name in ["2.1.259", "2.1.260"] {
         survey.versions.push(VersionDir {
-            path: PathBuf::from("/v").join(name),
+            path: PathBuf::from(abs("/v")).join(name),
             bytes: 10,
             bytes_partial: false,
         });
     }
-    survey.live_version = Some(PathBuf::from("/v/2.1.265"));
+    survey.live_version = Some(PathBuf::from(abs("/v/2.1.265")));
     let rep = report(&survey, applying());
     let mut steps = Vec::new();
     let done = apply(
@@ -767,25 +785,25 @@ fn the_report_json_carries_every_row_with_its_witness() {
     assert!(line.contains("\"warn\":true"), "{line}");
 }
 
+/// THE FREE FIGURE IS ONE SYSCALL ON THE MOUNT POINT, never a fork: this
+/// test's own temp directory reads a figure no larger than its volume, a path
+/// that does not exist yet reads its nearest ancestor's volume (where it would
+/// be written), and a spelling through a link (`/tmp` on macOS) reads the
+/// volume it resolves to. NEGATIVE CONTROL: a relative path reads nothing.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn the_df_reading_is_anchored_on_capacity_and_never_on_a_field_count() {
-    let plain = "Filesystem 1024-blocks      Used Available Capacity  Mounted on\n\
-                 /dev/disk3s5 971350180 120000000 700000000      15%    /System/Volumes/Data\n";
-    assert_eq!(parse_df_kb(plain), Some(700_000_000 * 1024));
-
-    // The case a field count gets wrong: macOS autofs names the source `map
-    // auto_home`, so the row has seven fields and the fourth is `Used`.
-    let autofs = "Filesystem    1024-blocks Used Available Capacity  Mounted on\n\
-                  map auto_home           0    0         0   100%    /System/Volumes/Data/home\n";
-    assert_eq!(parse_df_kb(autofs), Some(0));
-
-    // Negative: no anchor, no row, a non-numeric cell, and a mount name that
-    // merely contains a `%` all answer None rather than a plausible guess.
-    assert_eq!(parse_df_kb(""), None);
-    assert_eq!(parse_df_kb("Filesystem 1024-blocks\n"), None);
-    assert_eq!(parse_df_kb("h\n/dev/d 1 2 3 4 /mnt\n"), None);
-    assert_eq!(parse_df_kb("h\n/dev/d 1 2 three 15% /mnt\n"), None);
-    assert_eq!(parse_df_kb("h\n/dev/50%share 1 2 3 /mnt\n"), None);
+fn the_free_figure_is_read_on_the_volume_a_path_resolves_to() {
+    let tmp = Tmp::new("free-figure");
+    let table = aterm_sysprobe::volumes::table();
+    let here = volume_of(tmp.path(), &table).expect("a local volume");
+    assert!(here.free > 0 && here.free <= here.total, "{here:?}");
+    let ghost = volume_of(&tmp.path().join("not/yet/here"), &table).expect("its ancestor");
+    assert_eq!(ghost.key, here.key);
+    assert_eq!(ghost.mount, here.mount);
+    let linked = volume_of(&std::env::temp_dir(), &table).expect("the temp root");
+    assert_eq!(linked.mount, here.mount);
+    assert!(free_bytes(tmp.path()).is_some());
+    assert!(free_bytes(Path::new("relative/path")).is_none());
 }
 
 #[test]
@@ -1064,12 +1082,17 @@ fn the_innermost_build_directory_decides_a_nested_profile_in_the_idle_pass() {
 
 // -- the automatic floor --------------------------------------------------------
 
-/// The automatic grant: below `auto_free_gib` the idle build cache goes, with
-/// `disk.apply` off, since the floor is its own grant, and nothing of another
-/// class does; at or above the floor, or on an unknown free figure, nothing is
-/// planned and the remover is never called.
+/// The automatic grant: once the volume is LOW (below the warning) the idle
+/// build cache goes — tier 2 — with `disk.apply` off, since the automatic
+/// removal is its own grant, and nothing of another class does; free space is
+/// measured again before it and the tier stops at the warning, so an hourly
+/// pass at `low` cannot take every idle cache. At or above the warning, or on
+/// an unknown free figure, nothing is planned and the remover is never
+/// called. NEGATIVE CONTROL: a re-measure that already reads the warning
+/// stops the tier with the cache kept.
+#[cfg(unix)]
 #[test]
-fn below_the_floor_the_stale_target_goes_and_nothing_else_does() {
+fn from_low_the_stale_target_goes_re_measured_and_nothing_else_does() {
     let tmp = Tmp::new("auto-floor");
     let dir = synthetic_target(&tmp, "target");
     let now = now_after_write(DEFAULT_TARGET_STALE_DAYS + 1);
@@ -1093,8 +1116,8 @@ fn below_the_floor_the_stale_target_goes_and_nothing_else_does() {
         survey
     };
 
-    // At and above the floor, and unknown: nothing.
-    for free in [Some(DEFAULT_AUTO_FREE_GIB * GIB), Some(500 * GIB), None] {
+    // At and above the warning, and unknown: nothing.
+    for free in [Some(DEFAULT_WARN_FREE_GIB * GIB), Some(500 * GIB), None] {
         let rep = report(&survey_at(free), config);
         assert_eq!(auto_plan(&rep), None, "free={free:?}");
         let mut calls = 0;
@@ -1115,9 +1138,30 @@ fn below_the_floor_the_stale_target_goes_and_nothing_else_does() {
     };
     assert_eq!(auto_plan(&report(&survey_at(Some(GIB)), off)), None);
 
-    // Below it: the stale target, and only it.
-    let rep = report(&survey_at(Some(GIB)), config);
-    let rows = auto_plan(&rep).expect("below the floor");
+    // Low, but the re-measure reads the warning already: the tier stops.
+    let low = Some(20 * GIB);
+    let rep = report(&survey_at(low), config);
+    let plan = pass_plan(&rep).expect("low");
+    assert_eq!(
+        plan.iter().map(|p| p.target).collect::<Vec<_>>(),
+        [Some(DEFAULT_WARN_FREE_GIB * GIB)],
+        "tier 2 stops at the warning"
+    );
+    let mut calls = 0;
+    let done = apply_auto(
+        &rep,
+        None,
+        &mut counting(&mut calls),
+        &mut || Some(DEFAULT_WARN_FREE_GIB * GIB),
+        &mut |_| true,
+    )
+    .expect("planned");
+    assert_eq!(calls, 0, "{done:?}");
+    assert_eq!(done.stopped.as_ref().map(|s| s.by), Some(StopBy::Measured));
+    assert_eq!(done.stopped.as_ref().and_then(|s| s.tier), Some(2));
+
+    // Low, and still short of the warning: the stale target, and only it.
+    let rows = auto_plan(&rep).expect("low");
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].class, Class::CargoTargets);
     assert!(
@@ -1126,8 +1170,7 @@ fn below_the_floor_the_stale_target_goes_and_nothing_else_does() {
             .any(|r| r.class == Class::ClaudeStaleVersions && r.removable),
         "the other class had a removable row the floor left alone: {rep:?}"
     );
-    let done =
-        apply_auto(&rep, None, &mut real(now), &mut no_pressure, &mut |_| true).expect("applied");
+    let done = apply_auto(&rep, None, &mut real(now), &mut || low, &mut |_| true).expect("applied");
     assert_eq!(done.removed.len(), 1, "{done:?}");
     assert!(done.denials.is_empty(), "{done:?}");
     assert!(
@@ -1178,10 +1221,13 @@ fn thresholds_are_the_larger_of_the_knob_and_the_volumes_share() {
         assert_eq!(t.level(free, files), want, "free {free:?} files {files:?}");
     }
 
+    // A small volume holds the unwritten fixed defaults to its share
+    // ([`SMALL_WARN_MAX_PCT`], [`SMALL_FLOOR_MAX_PCT`]): 40 GiB is all of a
+    // 40 GiB disk.
     let small = Config::default().thresholds(Some(40 * GIB));
     assert_eq!(
         (small.floor, small.warn, small.emergency),
-        (10 * GIB, 40 * GIB, 4 * GIB)
+        (4 * GIB, 8 * GIB, 4 * GIB)
     );
     let unknown = Config::default().thresholds(None);
     assert_eq!(unknown.floor, DEFAULT_AUTO_FREE_GIB * GIB);
@@ -1198,6 +1244,43 @@ fn thresholds_are_the_larger_of_the_knob_and_the_volumes_share() {
         "off: never Short"
     );
     assert_eq!(t.level(Some(0), None), Level::Emergency);
+}
+
+/// THE LINES ON FOUR VOLUMES, no room measured (design
+/// `docs/DESIGN-disk-awareness-2026-10-17.md` §2.4's table): a 128 GB disk
+/// warns at 20 % of itself, no longer at 40 GiB (34 %, `low` for good); a
+/// 256 GB one keeps today's lines; the owner's 1.81 TiB volume and a 4 TB
+/// one hold the capped shares. NEGATIVE CONTROL: the same knobs WRITTEN on
+/// the 128 GB disk are read as written, so the hold is the unwritten
+/// default's alone; and a 10 GiB disk keeps a floor that is on (never `0`).
+#[test]
+fn the_lines_on_four_volumes_hold_the_unwritten_defaults_to_a_small_volumes_share() {
+    let owners_mac = 1_948_404_040 * 1024;
+    for (total, warn, floor, emergency) in [
+        (128_000_000_000, 23, 10, 4),
+        (256_000_000_000, 40, 12, 4),
+        (owners_mac, 64, 32, 8),
+        (4_000_000_000_000, 64, 32, 8),
+    ] {
+        let t = Config::default().thresholds(Some(total));
+        assert_eq!(
+            (t.warn / GIB, t.floor / GIB, t.emergency / GIB),
+            (warn, floor, emergency),
+            "{total}"
+        );
+        assert!(t.warn * 100 / total <= SMALL_WARN_MAX_PCT.max(WARN_FREE_PCT));
+    }
+    let written = Config::default().thresholds_on(
+        Some(128_000_000_000),
+        Written {
+            auto_free_gib: true,
+            warn_free_gib: true,
+        },
+    );
+    assert_eq!((written.warn / GIB, written.floor / GIB), (40, 10));
+    let tiny = Config::default().thresholds(Some(10 * GIB));
+    assert_eq!(tiny.floor, GIB, "held, never off");
+    assert_eq!(tiny.level(Some(GIB / 2), None), Level::Emergency);
 }
 
 /// THE VOLUME'S SHARE IS CAPPED AND NEVER RAISES A VALUE THE OWNER WROTE:
@@ -1239,4 +1322,32 @@ fn the_volume_share_is_capped_and_a_written_knob_is_read_as_written() {
         (raised.auto_free_gib, raised.warn_free_gib),
         (AUTO_FREE_SHARE_MAX_GIB, WARN_FREE_SHARE_MAX_GIB)
     );
+}
+
+/// CLAUDE CODE'S WINDOWS TEMP ROOT is `claude` under Node's `os.tmpdir()`:
+/// `%TEMP%`, else `%TMP%` — the user's own directory, so no uid. NEGATIVE
+/// CONTROLS: an empty `%TEMP%` is unset, a relative one names none, and on
+/// Windows the root a survey walks is absolute (the Unix spelling,
+/// `/tmp/claude-0`, names no drive).
+#[test]
+fn claude_codes_windows_temp_root_is_under_its_temp() {
+    let (temp, tmp) = (abs("/Users//u/AppData/Local/Temp"), abs("/t"));
+    let root = |vars: &[(&str, &str)]| {
+        discover::windows_claude_tmp(|name| {
+            vars.iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| std::ffi::OsString::from(v))
+        })
+    };
+    let under = |dir: &str| Some(PathBuf::from(dir).join("claude"));
+    assert_eq!(root(&[("TEMP", &temp), ("TMP", &tmp)]), under(&temp));
+    assert_eq!(root(&[("TEMP", ""), ("TMP", &tmp)]), under(&tmp));
+    assert_eq!(root(&[("TMP", &tmp)]), under(&tmp));
+    assert_eq!(root(&[("TEMP", "Temp"), ("TMP", &tmp)]), None);
+    assert_eq!(root(&[]), None);
+    #[cfg(windows)]
+    {
+        let live = discover::claude_tmp_root(discover::own_uid());
+        assert!(live.is_absolute() && live.ends_with("claude"), "{live:?}");
+    }
 }

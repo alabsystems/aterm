@@ -146,23 +146,23 @@ const _: () = assert!(BRIDGE_VERB_FD == 3 && BRIDGE_PUSH_FD == 4);
 /// The composing executable's startup admission of the bridge's two inherited lanes,
 /// [`BRIDGE_VERB_FD`] then [`BRIDGE_PUSH_FD`], each by [`adopt_inherited_socket`].
 ///
-/// Only the `aterm` executable's `aterm link` route calls it, once, before that
-/// process opens or closes a descriptor or starts a thread: there the lanes are the
-/// launcher's, unclaimed, and a hand-started process may have neither, which is a
-/// checked refusal. Socket type and descriptor flags do not establish custody; the
-/// launcher's protocol does, and this call is the one place the process takes it:
-/// a second call in the same process is refused untouched, so no Rust code here can
-/// come to own either lane twice.
+/// The `aterm link` startup route takes the launcher's unclaimed lanes. A second
+/// call is refused untouched; that guard does not establish the first call's
+/// exclusive ownership or prevent concurrent replacement of either number.
 ///
-/// It is a safe entry so the `aterm` package carries no `unsafe` block, which its
-/// release build (`targo trust build -p aterm`) charges as a refutation whatever
-/// its SAFETY comment says.
+/// # Safety
+///
+/// Each eligible lane at [`BRIDGE_VERB_FD`] and [`BRIDGE_PUSH_FD`] must have been
+/// transferred exclusively to this call: no Rust or foreign owner may retain it.
+/// No thread or callback may close or replace either lane during adoption. The
+/// call consumes each eligible lane, including on a later failure. Missing or
+/// ineligible descriptors are refused untouched.
 ///
 /// # Errors
 ///
 /// A second call, or [`adopt_inherited_socket`]'s, for whichever lane it refused
 /// first.
-pub fn adopt_startup_bridge_lanes() -> io::Result<(OwnedFd, OwnedFd)> {
+pub unsafe fn adopt_startup_bridge_lanes() -> io::Result<(OwnedFd, OwnedFd)> {
     static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if TAKEN.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return Err(io::Error::new(
@@ -432,6 +432,24 @@ impl LaneChild {
         }
     }
 
+    /// `SIGCONT` the child: a child started stopped ([`Command::start_suspended`]) runs; a
+    /// running one carries on. A child already reaped is not signalled and answers `Ok`, as
+    /// [`Self::kill`].
+    ///
+    /// # Errors
+    /// `kill`'s.
+    pub fn resume(&mut self) -> io::Result<()> {
+        if self.status.is_some() {
+            return Ok(());
+        }
+        // SAFETY: as in `kill`: two integers, and our own unreaped child.
+        if unsafe { kill(self.pid, SIGCONT) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     /// One `waitpid(pid, options)`, `EINTR` retried; the status once collected.
     fn reap(&mut self, options: i32) -> io::Result<Option<ExitStatus>> {
         if let Some(status) = self.status {
@@ -592,6 +610,10 @@ struct Placement<'a> {
     /// fails the spawn before `posix_spawn`, so it never becomes a child
     /// started undisclaimed. [`Command`] alone sets it.
     disclaim: Option<&'a std::ffi::CStr>,
+    /// Start the child stopped at its exec, before its first instruction
+    /// (`POSIX_SPAWN_START_SUSPENDED`), for a `SIGCONT` to run, with `SIGHUP` at its
+    /// default. Darwin only; [`Command`] alone sets it ([`Command::start_suspended`]).
+    suspended: bool,
 }
 
 impl Default for Placement<'_> {
@@ -607,6 +629,7 @@ impl Default for Placement<'_> {
             long_entry_ends: false,
             inherit_all: false,
             disclaim: None,
+            suspended: false,
         }
     }
 }
@@ -822,12 +845,15 @@ mod platform {
     const POSIX_SPAWN_SETSIGDEF: i16 = 0x0004;
     const POSIX_SPAWN_SETSIGMASK: i16 = 0x0008;
     const POSIX_SPAWN_SETEXEC: i16 = 0x0040;
+    const POSIX_SPAWN_START_SUSPENDED: i16 = 0x0080;
     const POSIX_SPAWN_SETSID: i16 = 0x0400;
     const POSIX_SPAWN_CLOEXEC_DEFAULT: i16 = 0x4000;
     const O_RDONLY: i32 = 0;
     const O_WRONLY: i32 = 1;
     /// `sigset_t` is a 32-bit mask on Darwin, signal `n` at bit `n - 1`.
     const SIGPIPE_BIT: u32 = 1 << (13 - 1);
+    /// `SIGHUP` is signal 1: bit 0.
+    const SIGHUP_BIT: u32 = 1;
     /// `<sys/syslimits.h>`: the buffer `posix_spawnp` builds a candidate in.
     const PATH_MAX: usize = 1024;
     // <sys/errno.h>: the answers `posix_spawnp` sorts.
@@ -989,13 +1015,25 @@ mod platform {
     /// attribute object exists and called on it beside the other attributes, and either failing
     /// returns before any `posix_spawn`, so a disclaim the OS cannot apply never becomes a child
     /// started undisclaimed.
+    ///
+    /// `suspended` returns once the exec is done and the child stopped before its first
+    /// instruction (`POSIX_SPAWN_START_SUSPENDED`); a `SIGCONT` runs it. Its `SIGHUP` goes
+    /// back to the default too, whatever this process has it as: when the process holding a
+    /// stopped child dies, the kernel sends the child's process group, orphaned, `SIGHUP`
+    /// then `SIGCONT`, and an inherited `SIG_IGN` would let that `SIGCONT` run it (measured:
+    /// a held shell whose parent ignored `SIGHUP` ran on its parent's exit; with the default
+    /// it died unrun).
     pub(super) fn spawn(image: &Image, place: &Placement<'_>) -> io::Result<i32> {
         let argv = Image::pointers(&image.argv);
         let envp = Image::pointers(&image.envp);
         let disclaim = place.disclaim.map(disclaimer).transpose()?;
         let mut objects = Objects::new()?;
         let empty: u32 = 0;
-        let pipe_only: u32 = SIGPIPE_BIT;
+        let defaults: u32 = if place.suspended {
+            SIGPIPE_BIT | SIGHUP_BIT
+        } else {
+            SIGPIPE_BIT
+        };
         let mut flags = POSIX_SPAWN_SETSIGDEF;
         if !place.inherit_all {
             flags |= POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK;
@@ -1009,6 +1047,9 @@ mod platform {
         if place.replace {
             flags |= POSIX_SPAWN_SETEXEC;
         }
+        if place.suspended {
+            flags |= POSIX_SPAWN_START_SUSPENDED;
+        }
         // SAFETY: each call takes an object `Objects::new` initialised and a
         // live local or C string; none retains a pointer past the call. The
         // disclaim setter is the SPI `disclaimer` resolved, called with its
@@ -1018,7 +1059,7 @@ mod platform {
             if !place.inherit_all {
                 check(posix_spawnattr_setsigmask(&mut objects.attr, &empty))?;
             }
-            check(posix_spawnattr_setsigdefault(&mut objects.attr, &pipe_only))?;
+            check(posix_spawnattr_setsigdefault(&mut objects.attr, &defaults))?;
             if let Some(pgroup) = place.pgroup {
                 check(posix_spawnattr_setpgroup(&mut objects.attr, pgroup))?;
             }
@@ -1220,8 +1261,18 @@ mod platform {
     /// It places stdio and lanes only: `Command`, the one spawn that sets a working directory,
     /// a process group, a session, an `exec` or `posix_spawnp`'s walk, starts through std here
     /// (`spawnfd_command.rs`), and a disclaim (Darwin's responsibility SPI) is refused, starting
-    /// nothing. `inherit_all` ([`super::transparent`]) forks with no strip.
+    /// nothing. `inherit_all` ([`super::transparent`]) forks with no strip. An exec refused as
+    /// `ETXTBSY` is tried again ([`super::past_text_busy`]).
     pub(super) fn spawn(image: &Image, place: &Placement<'_>) -> io::Result<i32> {
+        super::past_text_busy(
+            super::TEXT_BUSY_FOR,
+            || spawn_once(image, place),
+            super::text_busy_pause,
+        )
+    }
+
+    /// One fork and exec of [`spawn`].
+    fn spawn_once(image: &Image, place: &Placement<'_>) -> io::Result<i32> {
         if place.cwd.is_some()
             || place.base.is_some()
             || place.pgroup.is_some()
@@ -1229,6 +1280,7 @@ mod platform {
             || place.replace
             || place.long_entry_ends
             || place.disclaim.is_some()
+            || place.suspended
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1532,6 +1584,81 @@ impl InheritNothing for StdCommand {
             })
         }
     }
+}
+
+/// How long a spawn the kernel refuses as `ETXTBSY` is tried again ([`past_text_busy`]),
+/// and the pause between a refusal and the next try.
+#[cfg(not(target_vendor = "apple"))]
+const TEXT_BUSY_FOR: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(not(target_vendor = "apple"))]
+const TEXT_BUSY_PAUSE: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// `spawn`, again while the kernel refuses its exec as `ETXTBSY` and `within` has not passed,
+/// `pause` between a refusal and the next try; any other answer, and the last, as it came.
+///
+/// Linux refuses to exec a file anything holds open for writing, and a child another thread
+/// forked while a file was open for writing holds that descriptor until its own exec or exit:
+/// every spawn here forks (std's arm for [`Command`], the lane arm for the rest), so a program
+/// this process, or any multi-threaded one, has just written — atpkg's shims and twins, a
+/// test's stand-in — is refused for that window, which a loaded machine stretches (atpkg's
+/// suite on the Linux lane, 2026-10-17: `Text file busy` from a shim spawned just after it was
+/// laid, in 3 runs of 10 under load). A refused exec ran nothing, so trying again is safe; a writer
+/// that keeps the file open is still refused after `within`. Darwin refuses no such exec.
+#[cfg(not(target_vendor = "apple"))]
+fn past_text_busy<T>(
+    within: std::time::Duration,
+    mut spawn: impl FnMut() -> io::Result<T>,
+    mut pause: impl FnMut(),
+) -> io::Result<T> {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        match spawn() {
+            Err(error)
+                if error.kind() == io::ErrorKind::ExecutableFileBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                pause();
+            }
+            done => return done,
+        }
+    }
+}
+
+/// A spawn this module does not make — a `std::process::Command` built with
+/// [`InheritNothing`] — tried again while the kernel refuses its exec as `ETXTBSY`, as this
+/// module's own are ([`past_text_busy`]): for up to a second off Darwin, once on Darwin.
+///
+/// # Errors
+/// What `spawn` answered last.
+pub fn spawn_past_text_busy<T>(spawn: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        past_text_busy(TEXT_BUSY_FOR, spawn, text_busy_pause)
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        let mut spawn = spawn;
+        spawn()
+    }
+}
+
+/// The pause between an `ETXTBSY` refusal and the next try ([`TEXT_BUSY_PAUSE`]), or a test
+/// thread's one-shot stand-in for it ([`TEXT_BUSY_HOOK`]).
+#[cfg(not(target_vendor = "apple"))]
+fn text_busy_pause() {
+    #[cfg(test)]
+    if let Some(hook) = TEXT_BUSY_HOOK.with(|hook| hook.borrow_mut().take()) {
+        hook();
+        return;
+    }
+    std::thread::sleep(TEXT_BUSY_PAUSE);
+}
+
+#[cfg(all(test, not(target_vendor = "apple")))]
+thread_local! {
+    /// What the next [`text_busy_pause`] on this test thread does instead of pausing.
+    static TEXT_BUSY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[path = "spawnfd_command.rs"]
@@ -1909,6 +2036,11 @@ const F_DUPFD_CLOEXEC: i32 = 67;
 const F_DUPFD_CLOEXEC: i32 = 1030;
 const WNOHANG: i32 = 1;
 const SIGKILL: i32 = 9;
+/// `SIGCONT`: 19 on Darwin and the BSDs, 18 on Linux.
+#[cfg(target_vendor = "apple")]
+const SIGCONT: i32 = 19;
+#[cfg(not(target_vendor = "apple"))]
+const SIGCONT: i32 = 18;
 #[cfg(not(target_vendor = "apple"))]
 const ENOENT: i32 = 2;
 #[cfg(any(test, not(target_vendor = "apple")))]

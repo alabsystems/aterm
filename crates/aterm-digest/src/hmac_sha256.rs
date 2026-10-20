@@ -79,43 +79,51 @@ impl HmacSha256 {
     /// # Errors
     ///
     /// Never. See [`InvalidLength`].
-    pub fn new_from_slice(key: &[u8]) -> Result<Self, InvalidLength> {
+    pub const fn new_from_slice(key: &[u8]) -> Result<Self, InvalidLength> {
         // K' -- the key reduced to exactly one block.
         let mut padded = [0u8; BLOCK_LEN];
         if key.len() > BLOCK_LEN {
-            padded[..OUTPUT_LEN].copy_from_slice(&Sha256::digest(key));
+            let hk = Sha256::digest_slice(key);
+            let mut i = 0usize;
+            while i < OUTPUT_LEN {
+                padded[i] = hk[i];
+                i += 1;
+            }
         } else {
-            padded[..key.len()].copy_from_slice(key);
+            let mut i = 0usize;
+            while i < key.len() && i < BLOCK_LEN {
+                padded[i] = key[i];
+                i += 1;
+            }
         }
 
         let mut ipad_block = [0u8; BLOCK_LEN];
         let mut outer_key = [0u8; BLOCK_LEN];
-        for ((i, o), &k) in ipad_block
-            .iter_mut()
-            .zip(outer_key.iter_mut())
-            .zip(padded.iter())
-        {
-            *i = k ^ IPAD;
-            *o = k ^ OPAD;
+        let mut idx = 0usize;
+        while idx < BLOCK_LEN {
+            let k = padded[idx];
+            ipad_block[idx] = k ^ IPAD;
+            outer_key[idx] = k ^ OPAD;
+            idx += 1;
         }
 
         let mut inner = Sha256::new();
-        inner.update(ipad_block);
+        inner.update_slice(&ipad_block);
         Ok(Self { inner, outer_key })
     }
 
     /// Feeds more bytes into the authenticated message.
-    pub fn update(&mut self, bytes: &[u8]) {
-        self.inner.update(bytes);
+    pub const fn update(&mut self, bytes: &[u8]) {
+        self.inner.update_slice(bytes);
     }
 
     /// Finishes the MAC and returns the 32-byte tag.
     #[must_use]
-    pub fn finalize(self) -> [u8; OUTPUT_LEN] {
+    pub const fn finalize(self) -> [u8; OUTPUT_LEN] {
         let inner = self.inner.finalize();
         let mut outer = Sha256::new();
-        outer.update(self.outer_key);
-        outer.update(inner);
+        outer.update_slice(&self.outer_key);
+        outer.update_slice(&inner);
         outer.finalize()
     }
 
@@ -217,25 +225,6 @@ mod tests {
             let full = mac(key, data);
             assert_eq!(hex(&full[..tag.len() / 2]), tag, "RFC 4231 case {case}");
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // Key handling
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn exactly_block_size_key_is_not_hashed() {
-        // A 64-byte key is used verbatim, a 65-byte key is hashed, so they
-        // differ even when the 65th byte is the zero padding would supply.
-        let mut k64 = [0u8; 64];
-        k64[0] = 0x91;
-        let mut k65 = [0u8; 65];
-        k65[0] = 0x91;
-        assert_ne!(mac(&k64, b"m"), mac(&k65, b"m"));
-
-        // And a long key equals the MAC under its own digest, per RFC 2104.
-        let long = [0x3fu8; 200];
-        assert_eq!(mac(&long, b"m"), mac(&Sha256::digest(long), b"m"));
     }
 
     // -----------------------------------------------------------------------

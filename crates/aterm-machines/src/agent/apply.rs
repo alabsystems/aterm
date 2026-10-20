@@ -9,7 +9,8 @@
 //! 2. reads the envelope from standard input (at most 8 MiB) and verifies it with
 //!    `ssh-keygen` against `allowed_signers`, this Mac's UUID, the clock and the floors.
 //!    Before the signature is accepted it parses nothing and acts on nothing;
-//! 3. takes `state/run.lock` (a live run answers `busy run=<id>`), checks the floor again
+//! 3. takes `state/run.lock` (a live run answers `busy run=<id>`, recorded in
+//!    `state/last_busy` for the screen watch, `super::watch`), checks the floor again
 //!    under the lock, and RAISES the signer's floor before it acts, so a run that crashes
 //!    cannot be replayed;
 //! 4. copies each artifact the envelope names from the admin's inbox into the root cache,
@@ -96,6 +97,8 @@ pub fn apply(
     match state::take_lock(sys, layout, &run, std::process::id()) {
         Ok(state::Lock::Taken) => {}
         Ok(state::Lock::Busy { run: other }) => {
+            // Signed and fresh, so a controller is there: the screen watch's heartbeat.
+            state::set_last_busy(sys, layout, &run);
             return refuse_line(out, &format!("busy run={other}"));
         }
         Err(why) => return refuse_line(out, &why),
@@ -927,6 +930,11 @@ mod tests {
             state::floors_or_refuse(&fake, &layout())
                 .unwrap()
                 .is_empty()
+        );
+        // Recorded for the screen watch, by the id the run would have had.
+        assert_eq!(
+            state::last_busy(&fake, &layout()).as_deref(),
+            Some("1800000000-6")
         );
         assert!(
             !fake

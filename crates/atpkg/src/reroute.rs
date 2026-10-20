@@ -1999,6 +1999,11 @@ pub(crate) fn lay_with(
             }
         }
     }
+    // abrew's `brew` stub (docs/DESIGN-abrew-2026-10-19.md §6) lives in this
+    // directory under its own marker, laid after the sweep above so no lay
+    // ever removes it; a failure is abrew's to report (`abrew doctor`), never
+    // this lay's — the toolchain stubs just landed either way.
+    let _ = crate::abrew::stub::lay_with(layout, embedder);
     Ok(())
 }
 
@@ -2796,13 +2801,13 @@ fn storeless_plan(row: &Row, args: &[String], machine: &Machine<'_>) -> Plan {
 /// judged ([`plan`]). Never with [`PASSTHROUGH_ENV`]: that is the escape, and an allowed
 /// Trust cargo handing it to its tree let a stock `rustc +1.97.1` beneath it run inside a
 /// Trust checkout unjudged (2026-10-01).
-#[expect(
-    clippy::disallowed_types,
-    reason = "a pass-through by exec: its caller's descriptors are the program's"
-)]
 fn exec_upstream(target: &Path, args: &[String]) -> ExitCode {
     // Raw: TRANSPARENT, so the caller's descriptors are the program's. Its Windows
     // console is decided here.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "a pass-through by exec: its caller's descriptors are the program's"
+    )]
     let mut command = std::process::Command::new(target);
     aterm_uds::spawn::set_flags(&mut command, 0);
     command.args(args).env(ANNOUNCED_ENV, "1");
@@ -2836,14 +2841,14 @@ fn direct_args(source_verb: Option<SourceVerb>, args: &[String]) -> Vec<String> 
 
 /// A branded tool's managed `copy` ([`crate::ops::managed`]), exec'd with the managed `bin/` appended
 /// for its children and its shim's environment exported — `atpkg run`'s discipline.
-#[expect(
-    clippy::disallowed_types,
-    reason = "a pass-through by exec: its caller's descriptors are the program's"
-)]
 fn exec_branded(layout: &Layout, copy: &Managed, args: &[String]) -> ExitCode {
     let child_path =
         crate::store::append_bin_to_path(std::env::var_os("PATH").as_deref(), &layout.bin_dir());
     // Raw and console-decided, as `exec_upstream`.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "a pass-through by exec: its caller's descriptors are the program's"
+    )]
     let mut command = std::process::Command::new(&copy.target);
     aterm_uds::spawn::set_flags(&mut command, 0);
     command.args(args).env("PATH", child_path);

@@ -170,11 +170,14 @@ pub(super) const LIGHT_INK_MAX_CHANNEL: f32 = 150.0;
 /// (`aterm_render::halo_over_cap`): `over_rgb(glyph, ink, cap)` keeps
 /// `(255−cap)/255` of the glyph, so near-black ink stays near-black and a white
 /// counter stays light grey. Pinned by `light_ink_cap_keeps_glyphs_legible`.
-pub(super) const LIGHT_INK_ALPHA_CAP: f32 = 190.0;
-/// Ceiling on the opacity of a beam-family body drawn under the letters on a
-/// light ground (`CursorGlow::emit_comet_light`): bold ink at this alpha
-/// keeps near-black glyphs on top of it far past a readable contrast.
-pub(super) const LIGHT_BODY_ALPHA_CAP: f32 = 200.0;
+pub(crate) const LIGHT_INK_ALPHA_CAP: f32 = 190.0;
+/// Ceiling on the opacity of any body drawn under the letters on a light
+/// ground (the beam family's bodies, every crown, the comet's coma, the
+/// rod's sleeve, the typing glow): the full byte. Legibility is the ink's,
+/// never this cap's: a body's ink is solved so that even laid opaque, and so
+/// however many bodies stack on one pixel, the theme's text keeps the bar
+/// over it (`light_body_ink`).
+pub(crate) const LIGHT_BODY_ALPHA_CAP: f32 = 255.0;
 
 /// Rec. 709 luma of a `0x00RRGGBB` colour, 0..255. The one luminance the light
 /// arms measure with.
@@ -200,6 +203,19 @@ pub(super) fn luma709(rgb: u32) -> f32 {
 // Bold ink is about 1.8x the weight of conservative ink, so mixing them inside
 // one landing reads as half the event washed out. Pinned by
 // `one_light_ink_policy_per_compositing_role`.
+//
+// The rule is for marks that can composite over a glyph. On a light ground
+// the harness card's marks never do: its trail, rim, stars, sparkles and
+// burst lie on cells the host read blank (the stars are clipped to that
+// region, `star_region`, which on a light ground stops short of the border's
+// column, where a glyph may stand), and its border is drawn under glyph ink.
+// So on a light ground they are opaque card art in `harness_card`'s print
+// inks (its "the light ground: print inks" and "one printed piece"), as its
+// kitty is; on dark they are added light, which keeps any letter under it
+// readable. Its line is text: its letters take the paper law's point-mark
+// ink (`rainbow_kitty::ribbon`'s `paper_mark_ink`, WCAG AA against the page)
+// rather than this rule, as does the composer rule's wordmark under the card
+// (`claude_footer.rs`'s `brand_letter_fg`). Every other mark keeps the rule.
 
 /// Leading-only ink: vivid, for marks that never touch a glyph.
 ///

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The bounded child runner, [`capture_bounded`], through which [`super::disk`]
-//! reads `df`.
+//! The bounded child runner, [`capture_bounded`]: a child read to a deadline
+//! (the `claude auth` probes of [`super::cli`]).
 //!
 //! [`capture_bounded`] parks on stdout until its deadline, then checks a child
 //! that closed stdout but has not exited at a bounded 20 ms cadence, so the
@@ -272,7 +272,7 @@ fn capture_pipe_ready(fd: std::os::fd::RawFd, deadline: Instant) -> std::io::Res
 }
 
 #[cfg(unix)]
-fn read_capture_pipe(
+pub(super) fn read_capture_pipe(
     mut pipe: std::process::ChildStdout,
     max_stdout: usize,
     deadline: Instant,

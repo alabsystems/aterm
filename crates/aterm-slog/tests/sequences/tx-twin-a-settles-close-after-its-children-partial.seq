@@ -1,0 +1,15 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_settles_close_is_never_dated_before_a_transcript_child, the
+# partial rig (A21).
+state partial
+bind 0
+see busy
+tx prompt v1
+tx tool c1
+pass 3000
+see idle
+pass 100
+tx result c1 error dated=3200
+tx tool c2 dated=3250
+wait 1000
+expect close t1 turn at=3250

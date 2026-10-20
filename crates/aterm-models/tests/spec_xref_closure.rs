@@ -4,17 +4,20 @@
 //! `spec_xref_closure`: the toolchain-free source↔spec closure over every anchored crate.
 //!
 //! The registry only collects anchors linked into the binary. Anchors expand in every test
-//! and debug build of their crate (`cfg(any(test, debug_assertions))`), so this test — which
-//! links every anchored crate as a dev-dependency and every model through
+//! and debug build of their crate (`#[cfg_attr(any(test, debug_assertions),
+//! aterm_spec_anchor::refines(…))]`, the `macro_rules!` attributes on a Trust compiler), so
+//! this test — which links every anchored crate as a dev-dependency and every model through
 //! `aterm_models::link_all` — sees them from outside. It enforces:
 //!   1. Action exists: every anchor names a real action of its machine.
 //!   3. Coverage: every actively bound machine has every action bound or waived
 //!      (`ratio == 1.0`); others are reported (`aterm_spec::xref::check_closure`).
 //!   4. Machine exists: every named machine resolves to a registered model.
 //!
-//! The machines aterm-gui binds are the exception for obligation 3: some of their seams and
-//! waivers are test-only there, so aterm-gui's own `spec_xref_gate` closes them, and runs
-//! their Tier-1 bodies with the per-step execution evidence. Obligation 2 (symbols resolve
+//! Every machine closes here, aterm-gui's included: a waiver sits on a non-test item
+//! (a debug-and-test carrier fn where no shipping fn performs the action), so the
+//! registry this binary links is the whole of it. aterm-gui's `spec_xref_gate` only runs
+//! the two custody machines' Tier-1 bodies with the per-step execution evidence, which
+//! reads crate-private seams. Obligation 2 (symbols resolve
 //! to live DefIds) needs typed Trust `FuncId`s, which aterm does not have, so it is not
 //! checked. `ty --strict-vacuity` over the registry is `spec-check vacuity`.
 
@@ -30,30 +33,6 @@ fn registered_modules() -> Vec<SpecModule> {
         .collect()
 }
 
-/// The registered machines (as the closure names them) that some anchor or waiver linked
-/// here from `source` binds.
-fn machines_bound_from(report: &xref::ClosureReport, source: &str) -> BTreeSet<String> {
-    let anchored: BTreeSet<&str> = xref::refinements()
-        .filter(|r| r.location.starts_with(source))
-        .map(|r| r.machine)
-        .chain(
-            xref::waivers()
-                .filter(|w| w.location.starts_with(source) && !w.machine.is_empty())
-                .map(|w| w.machine),
-        )
-        .collect();
-    report
-        .coverage
-        .iter()
-        .filter(|c| {
-            anchored
-                .iter()
-                .any(|a| xref::machine_matches(a, &c.machine))
-        })
-        .map(|c| c.machine.clone())
-        .collect()
-}
-
 #[test]
 fn spec_xref_closure() {
     // LINK every anchored crate and every model. The registry sees only object code the
@@ -61,6 +40,10 @@ fn spec_xref_closure() {
     // crate pulls in its anchored code (the window's entry reaches the GUI and the libraries
     // it drives).
     let _domains = aterm_models::link_all();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a link root: the window's entry is named, never called"
+    )]
     std::hint::black_box((
         aterm_gui::main_entry as fn(Vec<std::ffi::OsString>),
         aterm_core::terminal::Terminal::new as fn(u16, u16) -> aterm_core::terminal::Terminal,
@@ -68,6 +51,15 @@ fn spec_xref_closure() {
         aterm_keeper::RelaunchBrake::new as fn() -> aterm_keeper::RelaunchBrake,
         aterm_keeper::core::classify_death
             as fn(aterm_keeper::core::DeathEvidence) -> aterm_keeper::core::Verdict,
+        // aterm-restore's anchored modules hold generic fns only but for these two, which
+        // keep `recover.rs` and `writer.rs` linked whether or not the window reaches them.
+        aterm_restore::recover::Restored::history_admissible
+            as fn(&aterm_restore::recover::Restored) -> bool,
+        <aterm_restore::writer::WriteError as std::fmt::Display>::fmt
+            as fn(
+                &aterm_restore::writer::WriteError,
+                &mut std::fmt::Formatter<'_>,
+            ) -> std::fmt::Result,
     ));
     // ---- Proof #1: the registry ACTUALLY collected the anchors, cross-crate. ----
     let refs: Vec<_> = xref::refinements().collect();
@@ -114,17 +106,7 @@ fn spec_xref_closure() {
     eprintln!("spec_xref_closure: {} registered model(s)", modules.len());
 
     // ---- Run the obligations (1, 3, 4) ----
-    let mut report = xref::check_closure(&modules);
-    // A machine aterm-gui binds is closed by aterm-gui's own `spec_xref_gate`: some of its
-    // seams and waivers are test-only there, so its coverage is whole only in that binary.
-    // Its anchors' obligations 1 and 4 hold here as everywhere.
-    let gui_bound = machines_bound_from(&report, "crates/aterm-gui/");
-    report.violations.retain(|v| {
-        v.obligation != 3
-            || !gui_bound
-                .iter()
-                .any(|m| v.message.starts_with(&format!("machine `{m}` ")))
-    });
+    let report = xref::check_closure(&modules);
 
     eprintln!("spec_xref_closure: per-machine coverage ledger:");
     for c in &report.coverage {
@@ -162,7 +144,6 @@ fn spec_xref_closure() {
 
     eprintln!(
         "spec_xref_closure: GREEN — obligations 1/3/4 hold over every anchor, waiver and model \
-         linked here ({} machine(s) aterm-gui binds are closed by its own gate).",
-        gui_bound.len()
+         linked here."
     );
 }

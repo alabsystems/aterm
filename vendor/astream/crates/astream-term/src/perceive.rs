@@ -27,7 +27,7 @@ contract_fn! {
     /// Discharged in the Clean CIC kernel by definitional equality against
     /// `perceive_row_in_bounds_isl` (`clean-kernel-defeq`).
     #[must_use]
-    pub fn perceive_row_in_bounds(row: u16, rows: u16) -> bool
+    pub const fn perceive_row_in_bounds(row: u16, rows: u16) -> bool
     clauses [ensures result == (row < rows)]
     {
         row < rows
@@ -37,7 +37,12 @@ contract_fn! {
 /// The screen as of offset `k`: fold of `records[0..=k]` (later records are not
 /// applied). This is what makes every read below time-addressable.
 pub fn frame(cols: u16, rows: u16, records: &[Record], k: usize) -> Screen {
-    let take = perceive_clamp_take_count(k.saturating_add(1) as u64, records.len() as u64) as usize;
+    let req = k.saturating_add(1);
+    let take = if req <= records.len() {
+        req
+    } else {
+        records.len()
+    };
     fold(cols, rows, records.get(..take).unwrap_or(&[]))
 }
 
@@ -119,12 +124,16 @@ pub fn search(screen: &Screen, needle: &str) -> Vec<Hit> {
     for (r, line) in text(screen).iter().enumerate() {
         let mut from = 0usize; // byte offset into `line`
         let mut col = 0u16; // character column of `from`
-        while let Some(pos) = line.get(from..).and_then(|s| s.find(needle)) {
+        while let Some(rem) = line.get(from..) {
+            let Some(pos) = rem.find(needle) else {
+                break;
+            };
             // Count only the characters skipped since the last hit, so a row full
             // of matches is scanned once, not once per match.
-            let prefix_chars = line
-                .get(from..from.saturating_add(pos))
-                .map_or(0, |s| s.chars().count()) as u16;
+            let prefix_chars = match line.get(from..from.saturating_add(pos)) {
+                Some(s) => s.chars().count() as u16,
+                None => 0,
+            };
             col = col.saturating_add(prefix_chars);
             out.push(Hit {
                 row: r as u16,

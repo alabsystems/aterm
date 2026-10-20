@@ -229,14 +229,22 @@ pub struct Measured {
     /// budget" — a function that ran out of the verifier's memory ceiling.
     pub budget_rows: u64,
     /// Bodies the memory census says were "skipped at the memory ceiling",
-    /// summed over the census lines.
-    pub skipped: u64,
+    /// summed over the census lines ([`census_skipped`]); `None` when no line
+    /// names a count. The census and its ceiling are the 321aaeda7 seal's:
+    /// trust main has no in-run memory ceiling (5aa81ac1683) and prints no such
+    /// line, so a seal from main leaves this ABSENT — never a zero, which would
+    /// say no body was skipped.
+    pub skipped: Option<u64>,
     /// The ceiling the log names, as it names it: the last census line's
     /// (`3.0 GiB`), else the last `-Ztrust-verify-memory-ceiling-bytes` it
-    /// carries (`3221225472 B`); empty when it names none.
+    /// carries (`3221225472 B`); empty when it names none. A seal from trust
+    /// main has neither, so its logs always leave this empty: an absent
+    /// ceiling, never one that held.
     pub ceiling: String,
     /// The verifier's peak, the largest any census line names (`3.5 GiB`), as
-    /// it names it; empty when the log has no census line.
+    /// it names it; empty when the log has no census line. Absent, too, on a
+    /// seal from trust main: its opt-in `-Ztrust-memory-notes` census (which the
+    /// lane does not ask for) names no peak in these words.
     pub peak: String,
     /// A CHECK TARGO WOULD NOT START: its log has no Summary and
     /// names targo's refusal to start without a trustd it can prove its own
@@ -680,7 +688,9 @@ pub fn parse_summary(line: &str) -> (Option<u64>, Option<u64>) {
 }
 
 /// `.*memory census:.*[^0-9]([0-9]+) bodies skipped at the memory ceiling.*`
-/// over one line: the rightmost count with a census marker before it.
+/// over one line: the rightmost count with a census marker before it. Only the
+/// 321aaeda7 seal prints one; trust main's `-Ztrust-memory-notes` census counts
+/// compacted slots, not skipped bodies, so a line of its gives `None`.
 fn census_skipped(line: &str) -> Option<u64> {
     let census = line.find("memory census:")? + "memory census:".len();
     find_all(line, " bodies skipped at the memory ceiling")
@@ -953,7 +963,7 @@ impl Measured {
                 m.budget_rows += 1;
             }
             if let Some(s) = census_skipped(line) {
-                m.skipped = m.skipped.saturating_add(s);
+                m.skipped = Some(m.skipped.unwrap_or(0).saturating_add(s));
             }
             if let Some(c) = census_figure(line, " ceiling ") {
                 m.ceiling = c;
@@ -965,6 +975,8 @@ impl Measured {
                     m.peak = p;
                 }
             }
+            // The 321aaeda7 seal's flag; trust main has none (5aa81ac1683), so a
+            // log of a seal from main names no ceiling here either.
             for i in find_all(line, "trust-verify-memory-ceiling-bytes") {
                 let at = i + "trust-verify-memory-ceiling-bytes".len();
                 if matches!(line.as_bytes().get(at), Some(b'=' | b' ')) {
@@ -1048,7 +1060,7 @@ impl Measured {
             self.lapsed.to_string(),
             self.cancelled.to_string(),
             self.budget_rows.to_string(),
-            self.skipped.to_string(),
+            self.skipped.map_or_else(|| "-".into(), |n| n.to_string()),
             one_line(&self.ceiling),
             one_line(&self.peak),
             one_line(&self.launch),
@@ -1104,7 +1116,11 @@ impl Measured {
             lapsed: lapsed.parse().ok()?,
             cancelled: cancelled.parse().ok()?,
             budget_rows: budget_rows.parse().ok()?,
-            skipped: skipped.parse().ok()?,
+            // `-` is a log with no census count ([`Measured::skipped`]).
+            skipped: match *skipped {
+                "-" => None,
+                n => Some(n.parse().ok()?),
+            },
             ceiling: (*ceiling).to_string(),
             peak: (*peak).to_string(),
             launch: (*launch).to_string(),
@@ -1554,7 +1570,8 @@ pub struct HostObs {
     pub spec: String,
     /// `held` (it met its floor anyway) or `cap-bound` (it fell below it).
     pub outcome: String,
-    /// The run's ceiling, GiB.
+    /// The run's ceiling, GiB, as its log names it; `-` for a `held` run whose log
+    /// names none, a row [`parse_host_obs`] drops.
     pub ceil: String,
     /// The verifier's peak, GiB, `-` when the log had none.
     pub peak: String,
@@ -1647,39 +1664,6 @@ pub struct Refusal {
     /// The RAM that surely verifies it, when its floor records a ceiling or its
     /// need was measured with room.
     pub sure: Option<u64>,
-}
-
-/// What a run refused up front for memory says when [`memory_refusal`] has no
-/// line for it (this host's memory unreadable, or no rule matched): the figures
-/// that are known, and the RAM the floor's ceiling needs when it is recorded.
-pub(crate) fn memory_refusal_fallback(host: &Host, row: &MemRow) -> String {
-    let floor = gib(&row.f);
-    match (floor, host.ceiling()) {
-        (Some(f), Some(c)) if !gib_le(&row.f, &c) => format!(
-            "its floor needs {} GiB, this host gives {c} GiB ({}); {}",
-            row.f,
-            host.share(),
-            host.ram_phrase(Some(ram_for(f)), None)
-        ),
-        (Some(_), Some(c)) => format!(
-            "its floor needs {} GiB and this host gives {c} GiB ({}), which covers it; the run refused it anyway",
-            row.f,
-            host.share()
-        ),
-        (Some(f), None) => format!(
-            "its floor needs {} GiB and this host's memory could not be read; {}",
-            row.f,
-            host.ram_phrase(Some(ram_for(f)), None)
-        ),
-        (None, Some(c)) => format!(
-            "this host gives {c} GiB ({}), too little for its floor; {}",
-            host.share(),
-            host.ram_phrase(None, None)
-        ),
-        (None, None) => {
-            "this host's memory could not be read and its floor records no ceiling".into()
-        }
-    }
 }
 
 /// REFUSE UP FRONT (the lane's `memory_refusal`): does this host refuse the
@@ -1803,7 +1787,7 @@ pub(crate) fn memory_refusal(
 struct Census {
     peak: Option<String>,
     ceil: Option<String>,
-    skipped: u64,
+    skipped: Option<u64>,
     budget: u64,
     exhausted: bool,
     atceil: bool,
@@ -1819,7 +1803,7 @@ impl Census {
             budget: m.budget_rows,
             ..Census::default()
         };
-        if m.skipped > 0 {
+        if m.skipped.is_some_and(|n| n > 0) {
             c.exhausted = true;
         } else if let (true, Some(p), Some(x)) = (m.budget_rows > 0, peak, ceil)
             && x <= p
@@ -2294,21 +2278,6 @@ fn floor_of(ratchet: Option<&str>, name: &str) -> Option<Floor> {
         driver: col(3),
         why: col(4),
     })
-}
-
-/// The floor `name` holds in `ratchet` when the prover `driver` (a ratchet row's
-/// fourth column, [`Facts::driver_row`]) recorded it: the proved count of the
-/// row the lane reads (the first naming it), `None` when there is none, another
-/// prover recorded it, or its count does not parse. The candidate gate's
-/// baseline for a library the published seal's own check left without a result
-/// ([`crate::trust_compare`]).
-#[must_use]
-pub fn floor_recorded_by(ratchet: &str, name: &str, driver: &str) -> Option<u64> {
-    let f = floor_of(Some(ratchet), name)?;
-    if f.driver != driver {
-        return None;
-    }
-    f.proved.parse().ok()
 }
 
 /// The report's line for a path targo refused ([`PathRefusal`]), naming each
@@ -2837,16 +2806,16 @@ pub fn judge(
         // A run that ran out and still met its floor is remembered as `held`, so
         // the next run here gates it rather than refusing it; any other run
         // forgets the library (one that did not run out learned nothing to keep,
-        // and one that fell short must never turn into a refusal next time).
+        // and one that fell short must never turn into a refusal next time). Its
+        // ceiling is the one its log names, never this host's RAM / 8: a log that
+        // names none (a seal from trust main has no in-run ceiling) is filed `-`,
+        // which no later run reads as a ceiling it held at.
         host_obs.push((
             name.into(),
             match (cen.exhausted, floor) {
                 (true, Some(f)) if proved >= f => Some([
                     "held".into(),
-                    cen.ceil
-                        .clone()
-                        .or_else(|| host.ceiling())
-                        .unwrap_or_else(dash),
+                    cen.ceil.clone().unwrap_or_else(dash),
                     cen.peak.clone().unwrap_or_else(dash),
                     proved.to_string(),
                     f.to_string(),
@@ -2917,12 +2886,12 @@ pub fn judge(
                 }
                 // A CEILING THAT RAN OUT is said beside the failure, with why it
                 // does not excuse it.
-                let exhausted = m.budget_rows.saturating_add(m.skipped);
+                let skipped = m.skipped.unwrap_or(0);
+                let exhausted = m.budget_rows.saturating_add(skipped);
                 if exhausted > 0 {
-                    let skipped_note = if m.skipped > 0 {
+                    let skipped_note = if skipped > 0 {
                         format!(
-                            "; {} of them were bodies skipped at the ceiling, never verified",
-                            m.skipped
+                            "; {skipped} of them were bodies skipped at the ceiling, never verified"
                         )
                     } else {
                         String::new()
@@ -3043,9 +3012,14 @@ pub fn judge(
         // memory record is kept current beside it: the floor ceiling becomes this
         // run's when it writes a new floor value, the smaller of the two when it
         // rewrites the same value, and stays when it leaves the floor alone.
+        // THIS RUN'S CEILING is the one its log names ([`Measured::ceiling`]),
+        // never this host's RAM / 8: a seal from trust main has no in-run ceiling
+        // and its logs name none, so a floor value such a run writes was set at no
+        // ceiling (`-`, absent), and its lowering of a floor set at one is withheld,
+        // since nothing shows that run had the room the floor was set with.
         if update.on {
             let mut nf = mem.f.clone();
-            let run_c = cen.ceil.clone().or_else(|| host.ceiling());
+            let run_c = cen.ceil.clone();
             let lowers = floor.is_some_and(|f| proved < f);
             let reason = update.reason.filter(|_| lowers && !own_floor);
             if lowers && reason.is_none() {
@@ -3060,13 +3034,13 @@ pub fn judge(
                     (Some(f), _) if proved >= f || mem.f == "-" => None,
                     (None, _) => None,
                     (Some(_), None) => Some(format!(
-                        "this run's verifier ceiling is unknown, and its floor was set at {} GiB",
+                        "this run's log names no verifier ceiling (a seal from trust main has none), and its floor was set at {} GiB; re-base it from a run whose log names its ceiling",
                         mem.f
                     )),
                     (Some(_), Some(rc))
                         if !gib_le(&mem.f, rc)
                             && (cen.peak.is_none()
-                                || cen.skipped > 0
+                                || cen.skipped.is_some_and(|n| n > 0)
                                 || cen.budget > 0
                                 || cen.exhausted) =>
                     {
@@ -3076,17 +3050,15 @@ pub fn judge(
                             "nothing in its census shows it had room"
                         };
                         Some(format!(
-                            "this host's {rc} GiB ceiling is below the {} GiB its floor was set at, and {how}",
-                            mem.f
+                            "this host's {rc} GiB ceiling is below the {} GiB its floor was set at, and {how}; re-base it on a host with {} GiB",
+                            mem.f,
+                            ram_for(gib(&mem.f).unwrap_or(0.0))
                         ))
                     }
                     (Some(_), Some(_)) => None,
                 };
                 if let Some(w) = withhold {
-                    notes.push(format!(
-                        "RE-BASE WITHHELD: {name}: {w}; re-base it on a host with {} GiB",
-                        ram_for(gib(&mem.f).unwrap_or(0.0))
-                    ));
+                    notes.push(format!("RE-BASE WITHHELD: {name}: {w}"));
                 } else {
                     let mut lines: Vec<String> = ratchet_now
                         .as_deref()
@@ -3106,13 +3078,16 @@ pub fn judge(
                     text.push('\n');
                     ratchet_now = Some(text);
                     rewrote = true;
-                    if let Some(rc) = run_c {
-                        nf = if floor == Some(proved) && own_floor && mem.f != "-" {
-                            gib_min(&mem.f, &rc)
-                        } else {
-                            rc
-                        };
-                    }
+                    let same = floor == Some(proved) && own_floor;
+                    nf = match run_c {
+                        Some(rc) if same && mem.f != "-" => gib_min(&mem.f, &rc),
+                        Some(rc) => rc,
+                        // The same value rewritten stands at the ceiling its
+                        // row names; a value from a run whose log names no
+                        // ceiling was set at none.
+                        None if same => mem.f.clone(),
+                        None => dash(),
+                    };
                 }
             }
             if let Some(r) = mem_learn(mem, &nf, &cen, today, &host) {
@@ -3571,9 +3546,9 @@ pub fn facts_key(tree_sans_floors: &str, prover: &str, lane: &str) -> String {
 // THE LANE'S END: [`conclude`]
 // ---------------------------------------------------------------------------
 
-/// What a lane run wrote in its log directory (`.plan`, read by [`conclude`] and
-/// by the candidate gate's comparison): the run's decisions and where its logs are,
-/// and — when the run is one that files — what the record is filed from.
+/// What a lane run wrote in its log directory (`.plan`, read by [`conclude`]): the
+/// run's decisions and where its logs are, and — when the run is one that files — what
+/// the record is filed from.
 #[derive(Clone, Debug, Default)]
 pub struct Plan {
     pub facts: Facts,
@@ -3592,17 +3567,6 @@ pub struct Plan {
     /// of this key leave undecided, and [`conclude`] folds them into that record
     /// ([`remeasured`]).
     pub remeasure: bool,
-    /// The per-crate wall budget every check ran under, in seconds, as the lane
-    /// wrote it (`crate-budget`); empty in a plan from a lane that wrote none.
-    /// Read by the candidate gate ([`crate::trust_compare`]), which compares two
-    /// runs only when they were bounded alike.
-    pub crate_budget: String,
-    /// `--obligations`: each check also wrote its report, and the lane reduced
-    /// it to the check's per-obligation record (`<spec>.log.oblig.tsv`,
-    /// [`crate::trust_oblig`]) — what the candidate gate compares, obligation by
-    /// obligation (`obligations 1`; `0`, or no line, from a lane not asked to or
-    /// older than it).
-    pub obligations: bool,
     /// Present when the run files: why it may not (empty when it may).
     pub file: Option<FilePlan>,
 }
@@ -3677,14 +3641,6 @@ impl Plan {
                 "host-obs" => p.host_obs = (!v.is_empty()).then(|| v.into()),
                 "try-refused" => p.try_refused = v == "1",
                 "remeasure" => p.remeasure = v == "1",
-                "crate-budget" => p.crate_budget = v.into(),
-                "obligations" => {
-                    p.obligations = match v {
-                        "0" => false,
-                        "1" => true,
-                        _ => return Err(bad()),
-                    };
-                }
                 "host-mem" => p.facts.host.mem = v.parse().map_err(|_| bad())?,
                 "host-mem-os" => p.facts.host.memtotal = v == "MemTotal",
                 "now" => p.facts.measured_at = v.into(),
@@ -3733,9 +3689,6 @@ impl Plan {
                     file.lane_env.passed.insert(v.into());
                 }
                 "target-root" => file.target_root = v.into(),
-                // Written by lanes before 2026-10-15 for closure keys nothing judged;
-                // a recorded plan (a published seal's run) still carries them.
-                "metadata" | "argv" => {}
                 "cargo-home" => file.cargo_home = (!v.is_empty()).then(|| v.into()),
                 "since" => file.since = v.parse().map_err(|_| bad())?,
                 "host" => file.host = v.into(),
@@ -4713,9 +4666,6 @@ pub enum TrustCmd {
     /// `run (-p <crate>… | --whole-tree | --remeasure) [flags]`: the lane
     /// ([`crate::trust_lane`]).
     Run(crate::trust_lane::Config),
-    /// `candidate (--candidate <dir> | --admits <dir>) [flags]`: the candidate gate
-    /// ([`crate::trust_candidate`]).
-    Candidate(crate::trust_candidate::Args),
     /// `judge [--commit REV] [--prover BIN] [--update-ratchet [--reason WHY]]`:
     /// the whole report for REV's facts against the working ratchet; with
     /// `--reason`, a floor another prover recorded that the facts fall below is
@@ -4726,10 +4676,6 @@ pub enum TrustCmd {
         update: bool,
         reason: Option<String>,
     },
-    /// `compare --base <plan> --candidate <plan> [--base-logdir DIR]
-    /// [--candidate-logdir DIR] [--tsv FILE] [--base-prover ID] [--ratchet FILE]`: the
-    /// candidate gate's comparison (D27, [`crate::trust_compare`]) of two runs' plans.
-    Compare(crate::trust_compare::Args),
 }
 
 /// Parse `trust <verb> …`.
@@ -4739,36 +4685,16 @@ pub enum TrustCmd {
 pub fn parse_cmd<'a>(
     it: &mut impl Iterator<Item = &'a str>,
 ) -> std::result::Result<TrustCmd, String> {
-    let verb = it
-        .next()
-        .ok_or("trust needs a verb: run, candidate, judge or compare")?;
+    let verb = it.next().ok_or("trust needs a verb: run or judge")?;
     if verb == "run" {
         return crate::trust_lane::parse(it).map(TrustCmd::Run);
     }
-    if verb == "candidate" {
-        return crate::trust_candidate::parse(it).map(TrustCmd::Candidate);
+    if verb != "judge" {
+        return Err(format!("unknown trust verb {verb:?}"));
     }
     let mut flags: BTreeMap<&str, Option<&str>> = BTreeMap::new();
     while let Some(flag) = it.next() {
-        let takes_value = matches!(
-            flag,
-            "--commit"
-                | "--prover"
-                | "--reason"
-                | "--base"
-                | "--candidate"
-                | "--base-logdir"
-                | "--candidate-logdir"
-                | "--tsv"
-                | "--base-prover"
-                | "--ratchet"
-                | "--retractions"
-                | "--trust-repo"
-                | "--candidate-trust-commit"
-                | "--base-trust-commit"
-                | "--obligations-tsv"
-        );
-        let value = if takes_value {
+        let value = if matches!(flag, "--commit" | "--prover" | "--reason") {
             let v = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
             if v.is_empty() || v.starts_with('-') {
                 return Err(format!("{flag} needs a value, got {v:?}"));
@@ -4783,29 +4709,7 @@ pub fn parse_cmd<'a>(
             return Err(format!("{flag} given twice"));
         }
     }
-    let allowed: &[&str] = match verb {
-        "judge" => &["--commit", "--prover", "--update-ratchet", "--reason"],
-        "compare" => &[
-            "--base",
-            "--candidate",
-            "--base-logdir",
-            "--candidate-logdir",
-            "--tsv",
-            "--base-prover",
-            "--ratchet",
-            "--retractions",
-            "--trust-repo",
-            "--candidate-trust-commit",
-            "--base-trust-commit",
-            "--obligations-tsv",
-        ],
-        other => return Err(format!("unknown trust verb {other:?}")),
-    };
-    if let Some(bad) = flags.keys().find(|f| !allowed.contains(f)) {
-        return Err(format!("trust {verb} does not take {bad}"));
-    }
     let value = |f: &str| flags.get(f).copied().flatten();
-    let path = |f: &str| value(f).map(PathBuf::from);
     let commit = value("--commit").unwrap_or("HEAD").to_string();
     let update = flags.contains_key("--update-ratchet");
     let reason = value("--reason").map(str::to_string);
@@ -4814,28 +4718,11 @@ pub fn parse_cmd<'a>(
             "trust judge: --reason says why --update-ratchet lowers a floor; give both".into(),
         );
     }
-    Ok(match verb {
-        "compare" => TrustCmd::Compare(crate::trust_compare::Args {
-            base: path("--base").ok_or("trust compare needs --base <the published seal's plan>")?,
-            candidate: path("--candidate")
-                .ok_or("trust compare needs --candidate <the candidate's plan>")?,
-            base_logdir: path("--base-logdir"),
-            candidate_logdir: path("--candidate-logdir"),
-            tsv: path("--tsv"),
-            base_prover: value("--base-prover").map(str::to_string),
-            ratchet: path("--ratchet"),
-            retractions: path("--retractions"),
-            trust_repo: path("--trust-repo"),
-            candidate_trust_commit: value("--candidate-trust-commit").map(str::to_string),
-            base_trust_commit: value("--base-trust-commit").map(str::to_string),
-            obligations_tsv: path("--obligations-tsv"),
-        }),
-        _ => TrustCmd::Judge {
-            commit,
-            prover: path("--prover"),
-            update,
-            reason,
-        },
+    Ok(TrustCmd::Judge {
+        commit,
+        prover: value("--prover").map(PathBuf::from),
+        update,
+        reason,
     })
 }
 
@@ -4877,13 +4764,9 @@ pub fn pending_for(
 pub fn run_cmd(repo: &Path, cmd: TrustCmd) -> i32 {
     let git = crate::ledger::GitCli::new(repo);
     match cmd {
-        TrustCmd::Compare(args) => crate::trust_compare::run(&args),
         TrustCmd::Run(mut cfg) => {
             cfg.repo = repo.to_path_buf();
             crate::trust_lane::run(&cfg, &mut std::io::stdout()).exit()
-        }
-        TrustCmd::Candidate(args) => {
-            crate::trust_candidate::run(repo, &args, &mut std::io::stdout())
         }
         TrustCmd::Judge {
             commit,
@@ -5127,7 +5010,7 @@ mod tests {
         );
         assert_eq!(m.refused, 1, "the [UNKNOWN] listing, not its detail line");
         assert_eq!(m.refused_why, "trustd unreachable: 1");
-        assert_eq!(m.skipped, 3);
+        assert_eq!(m.skipped, Some(3));
         assert_eq!(m.ceiling, "3.0 GiB");
         assert_eq!(m.budget_rows, 1, "result rows only, never the detail line");
         assert!(!m.transport);
@@ -5138,6 +5021,21 @@ mod tests {
         let m = log("rustc -Ztrust-verify-memory-ceiling-bytes=3221225472 x\n");
         assert_eq!(m.ceiling, "3221225472 B");
         assert_eq!(gib_of(&m.ceiling), Some(3.0));
+        // A seal from trust main prints no census and has no ceiling flag; with
+        // `-Ztrust-memory-notes` its census counts slots. Every memory fact is
+        // then absent, never a zero, and is filed as absent.
+        let m = log(concat!(
+            "note: trust: memory census: 12 artifact slots compacted after their verify pass (0 after the pass had dropped its own handle), 0 compacted slots recomputed by a later pass; resident 1.1 GiB now, highest 2.3 GiB read at a body boundary\n",
+            "  Summary: 2 proved, 0 failed (2 total)\n",
+        ));
+        assert_eq!(
+            (m.skipped, m.ceiling.as_str(), m.peak.as_str()),
+            (None, "", "")
+        );
+        let fields = m.to_fields();
+        assert_eq!(fields.split('\t').nth(6), Some("-"), "{fields}");
+        let back = Measured::from_fields(&fields.split('\t').collect::<Vec<_>>());
+        assert_eq!(back.map(|b| b.skipped), Some(None));
         assert!(log("targo trust: error: verification did not run\n").transport);
     }
 
@@ -6186,6 +6084,65 @@ mod tests {
         );
     }
 
+    /// A LOG THAT NAMES NO CEILING records none (every log of a seal from trust
+    /// main, which has no in-run ceiling), never this host's RAM / 8: a floor
+    /// value its run writes takes no floor ceiling, its reasoned lowering of a
+    /// floor set at one is withheld, and a `held` observation files its ceiling
+    /// as absent. On this 24 GiB host RAM / 8 is 3.0, above the floor's 1.0.
+    #[test]
+    fn a_log_that_names_no_ceiling_records_none() {
+        let theirs = "targo 1.99.0-dev (bbbbbbbbb 2026-09-17) (targo 0.1.0)";
+        let run = |skipped: Option<u64>, floor: &str, update: Update<'_>| {
+            let mut f = facts(vec![(
+                "alpha",
+                Decision::Gate(Measured {
+                    rc: "0".into(),
+                    summary: "Summary: 3 proved (3 total)".into(),
+                    skipped,
+                    ..Measured::default()
+                }),
+            )]);
+            f.crates[0].memory = MemRow {
+                f: "1.0".into(),
+                ..MemRow::default()
+            };
+            f.host = host(24);
+            judge(&f, Some(floor), "R", "M", update)
+        };
+        // A re-base it meets: written, and its floor ceiling is absent, not 3.0.
+        let met = run(None, &format!("alpha\t2\t2\t{theirs}\n"), Update::RAISE);
+        assert_eq!(
+            met.ratchet.as_deref(),
+            Some(format!("alpha\t3\t3\t{DRV}\n").as_str())
+        );
+        assert_eq!(met.memory_rows, [("alpha".to_string(), MemRow::default())]);
+        // A reasoned lowering of a floor set at 1.0 GiB: withheld, and said.
+        let low = run(
+            None,
+            &format!("alpha\t9\t9\t{theirs}\n"),
+            Update {
+                on: true,
+                reason: Some("the new seal proves fewer"),
+            },
+        );
+        assert_eq!(low.ratchet, None);
+        assert!(
+            low.report
+                .contains("RE-BASE WITHHELD: alpha: this run's log names no verifier ceiling"),
+            "{}",
+            low.report
+        );
+        // It ran out (bodies skipped) and met its floor: held, at no ceiling.
+        let held = run(Some(2), &format!("alpha\t3\t3\t{DRV}\n"), Update::NONE);
+        assert_eq!(
+            held.host_obs,
+            [(
+                "alpha".to_string(),
+                Some(["held", "-", "-", "3", "3"].map(String::from))
+            )]
+        );
+    }
+
     /// A SHORTFALL THE CLOCK MAY HAVE CAUSED decides nothing (no floor excuses):
     /// 2 proved with 1 lapsed against a floor of 3 is UNDECIDED — in neither total,
     /// COULD NOT RUN, and named for a re-measure — never a pass; a drop larger
@@ -6933,8 +6890,7 @@ mod tests {
 
     /// One `REFUSED PATH:` line per path, naming every library it failed (one bad
     /// directory fails every check) and what to do; each row keeps the status it
-    /// had (`trust_compare` reads the same words), and the verdict's own line says
-    /// it too.
+    /// had, and the verdict's own line says it too.
     #[test]
     fn a_refused_path_is_said_once_with_every_library_it_failed() {
         let me = aterm_uds::peer::our_uid();

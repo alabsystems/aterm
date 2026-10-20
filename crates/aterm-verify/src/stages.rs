@@ -32,7 +32,6 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::Test => test(ctx, &mut r),
         StageId::MeasuringTests => measuring_tests(ctx, &mut r),
         StageId::Doctests => doctests(ctx, &mut r),
-        StageId::SealedLane => sealed_lane(ctx, &mut r),
         StageId::Tippy => tippy(ctx, &mut r),
         StageId::Formatting => crate::fmt::run(ctx, &mut r),
         StageId::Export => export(ctx, &mut r),
@@ -122,8 +121,8 @@ pub fn test_compile_args(scope: &Scope) -> Vec<String> {
 /// `targo --unverified test <scope> --no-fail-fast --tests` — the second child,
 /// run only when the first compiled: every lib, bin and integration test target
 /// with `test = true` ([`TEST_TARGETS`], the first child's), no doctests (the
-/// doctests stage runs those) and no examples. The measuring rows are
-/// `#[ignore]`, so it never takes one ([`measuring_args`] runs them, alone).
+/// doctests stage runs those) and no examples or benches. The measurement
+/// matrices are explicit benches ([`measuring_args`] runs them, alone).
 ///
 /// Cargo runs it with a recording runner ([`crate::testrun::recording_cmd`]) and
 /// verify runs the recorded binaries several at once ([`crate::testrun`]);
@@ -140,20 +139,18 @@ pub fn test_run_args(scope: &Scope) -> Vec<String> {
 /// example ([`test_compile_args`]).
 pub const TEST_TARGETS: [&str; 1] = ["--tests"];
 
-/// The measuring stage's test targets in aterm-conformance: each must pass a
-/// row, or the stage measured nothing for it ([`decide_measuring_child`]).
+/// The measuring stage's benchmark targets in aterm-conformance. Each must
+/// report its complete nonempty matrix ([`decide_measuring_child`]).
 const MEASURING_TARGETS: [&str; 2] = ["paint", "spin"];
 
-/// `targo --unverified test -p aterm-conformance --no-fail-fast --test paint
-/// --test spin -- --ignored measuring::`: the measuring stage's one child, the
+/// `targo --unverified bench --profile test -p aterm-conformance --no-fail-fast
+/// --bench paint --bench spin`: the measuring stage's one child, the
 /// paint and spin matrices ([`MEASURING_TARGETS`]) that judge the release
-/// bundle's frames and idle wakes on a live instance. Every row is `#[ignore]`,
-/// so only `--ignored` selects them.
+/// bundle's frames and idle wakes on a live instance. Each matrix takes every
+/// row once, sequentially, and reports typed outcomes rather than libtest rows.
 #[must_use]
 pub fn measuring_args() -> Vec<String> {
-    let mut a = measuring_targets_args();
-    a.extend(["--", "--ignored", "measuring::"].map(String::from));
-    a
+    measuring_targets_args()
 }
 
 /// [`measuring_args`]'s compile alone (`--no-run`): the measuring rows' prebuild,
@@ -166,12 +163,14 @@ pub fn measure_prebuild_args() -> Vec<String> {
     a
 }
 
-/// `targo --unverified test -p aterm-conformance --no-fail-fast --test paint
-/// --test spin`: what the measuring child and its prebuild share.
+/// The measuring child and its prebuild share their target selection and the
+/// main lane's test profile; only the prebuild adds `--no-run`.
 fn measuring_targets_args() -> Vec<String> {
     let mut a: Vec<String> = [
         "--unverified",
-        "test",
+        "bench",
+        MAIN_PROFILE[0],
+        MAIN_PROFILE[1],
         "-p",
         "aterm-conformance",
         "--no-fail-fast",
@@ -179,7 +178,7 @@ fn measuring_targets_args() -> Vec<String> {
     .map(String::from)
     .into();
     for t in MEASURING_TARGETS {
-        a.extend(["--test".to_string(), t.to_string()]);
+        a.extend(["--bench".to_string(), t.to_string()]);
     }
     a
 }
@@ -256,35 +255,6 @@ fn workspace_member_dirs(root: &std::path::Path) -> Vec<(String, std::path::Path
         .collect();
     v.sort();
     v
-}
-
-/// `targo --unverified test -p aterm --features sealed --test two_nodes_sealed --test fabric_world --no-fail-fast`
-///
-/// The sealed cross-host rung, and the fabric world suite under the same
-/// feature: its `sealed`-only tests (`second_host`) compile nowhere else, so a
-/// red one would sit unseen. `two_nodes_sealed` is `required-features =
-/// ["sealed"]`, so the workspace test stage never builds it; this is the one
-/// run of the vendored astream-aead test. Both suites drive this package's own
-/// binary (`CARGO_BIN_EXE_aterm`), so cargo builds it first, in the sealed lane
-/// ([`sealed_lane_cmd`]).
-#[must_use]
-pub fn sealed_lane_args() -> Vec<String> {
-    [
-        "--unverified",
-        "test",
-        "-p",
-        "aterm",
-        "--features",
-        "sealed",
-        "--test",
-        "two_nodes_sealed",
-        "--test",
-        "fabric_world",
-        "--no-fail-fast",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
 }
 
 /// `<tippy> <scope> --all-targets --keep-going -- -D warnings`
@@ -369,14 +339,14 @@ pub fn manifest_required_features(text: &str) -> Vec<(String, String)> {
 /// resolves. `None` when the scope selects no gated package.
 #[must_use]
 pub fn tippy_gated_args(scope: &Scope, gated: &[(String, String)]) -> Option<Vec<String>> {
-    let mut packages: Vec<&str> = Vec::new();
+    let mut packages: Vec<String> = Vec::new();
     let mut features: Vec<String> = Vec::new();
     for (pkg, feat) in gated {
-        if !scope.includes_crate(pkg) {
+        let Some(spec) = scope.spec_of(pkg) else {
             continue;
-        }
-        if !packages.contains(&pkg.as_str()) {
-            packages.push(pkg);
+        };
+        if !packages.contains(&spec) {
+            packages.push(spec);
         }
         features.push(format!("{pkg}/{feat}"));
     }
@@ -384,8 +354,8 @@ pub fn tippy_gated_args(scope: &Scope, gated: &[(String, String)]) -> Option<Vec
         return None;
     }
     let mut a: Vec<String> = packages
-        .iter()
-        .flat_map(|p| ["-p".to_string(), (*p).to_string()])
+        .into_iter()
+        .flat_map(|p| ["-p".to_string(), p])
         .collect();
     a.push("--features".to_string());
     a.push(features.join(","));
@@ -470,9 +440,11 @@ pub fn redraw_conformance_build_args() -> Vec<String> {
 /// driver ([`objc_drive_outcome`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Code3 {
-    /// A pass that claims less than `0`: some rows were checked against the
+    /// A pass that claims less than `0`, worded apart from it so no line claims
+    /// what went unmeasured: the class audit checked some rows against the
     /// fork's own declaration because this host's AppKit registers no protocol
-    /// for them. Worded apart from `0` so no line claims runtime authority.
+    /// for them; the IME drive's Option-as-Alt stage ran without a control that
+    /// composed, so whether Option as Alt stops a dead key was not measured.
     WeakerPassOk(&'static str),
     /// The driver's watchdog fired (a modal tracking loop never returned), so it
     /// decided nothing: could not run.
@@ -515,22 +487,28 @@ pub const OBJC_DRIVES: [ObjcDrive; 5] = [
         pass: "every row the registered WinitWindowDelegate and WinitView hold agrees with the runtime's own authority, and each class claims the protocols its rows come from",
     },
     // The audit proves `WinitView` is shaped right; this drives a whole
-    // composition through its NSTextInputClient rows.
+    // composition through its NSTextInputClient rows. Its Option-as-Alt stage
+    // has a control (the same Option chords without it must compose), and macOS
+    // may refuse the activation the control needs.
     ObjcDrive {
         package: "aterm-gui",
         example: "objc_ime_drive",
-        code3: Code3::None,
+        code3: Code3::WeakerPassOk(
+            "a composition ran through the ported WinitView's NSTextInputClient rows, and with Option as Alt, each Option chord arrived as its bare key — but the same chords WITHOUT Option as Alt did not all compose here (macOS did not make the drive the active app, or this layout's Option chords are not the U.S. dead keys), so whether Option as Alt stops each dead key was NOT measured (exit 3)",
+        ),
         no_status: Severity::CouldNotRun,
-        pass: "a composition ran through the ported WinitView's NSTextInputClient rows — preedit, cursor conversion, commit and the candidate-window rectangle — and with Option as Alt, Option+E started no dead key",
+        pass: "a composition ran through the ported WinitView's NSTextInputClient rows — preedit, cursor conversion, commit and the candidate-window rectangle — and with Option as Alt, no U.S. Option dead key (E, U, I, N, `) started a composition where the same key without it did, and Option+B arrived as b, not ∫",
     },
     // It enters `-mouseDown:` IMPs directly; a context menu that really popped
-    // would never return, and its watchdog says so as `3`.
+    // would never return, and its watchdog says so as `3`. Its clicks through
+    // AppKit's routing need the drive to be the active app; when another app
+    // held activation instead and nothing else failed, it answers `2`.
     ObjcDrive {
         package: "aterm-gui",
         example: "objc_toolbar_drive",
         code3: Code3::Hung,
         no_status: Severity::CouldNotRun,
-        pass: "the real tab strip answered every question — 27 drawn states, and all four declared classes read off live objects against the runtime's own authority",
+        pass: "the real tab strip answered every question — every state its drawing matrix names, and all four declared classes read off live objects against the runtime's own authority",
     },
     // The only row that touches the window surface, where a use-after-free can
     // compile clean.
@@ -572,9 +550,11 @@ pub fn objc_drive_build_args(drive: &ObjcDrive) -> Vec<String> {
     .collect()
 }
 
-/// How the ladder reads one driver's exit. Only `0`, and the audit's weaker `3`,
-/// are passes: `2` means no window server answered or nothing was installed to
-/// drive, and must never read as green.
+/// How the ladder reads one driver's exit. Only `0`, and a weaker `3` where the
+/// row declares one (the class audit's fallback to the fork's own declaration,
+/// the IME drive's uncontrolled Option-as-Alt stage), are passes: `2` means no
+/// window server answered, nothing was installed to drive, or another app held
+/// the activation a check needs, and must never read as green.
 #[must_use]
 pub fn objc_drive_outcome(drive: &ObjcDrive, code: Option<i32>) -> (Outcome, String) {
     let name = drive.example;
@@ -586,7 +566,7 @@ pub fn objc_drive_outcome(drive: &ObjcDrive, code: Option<i32>) -> (Outcome, Str
         ),
         (Some(2), _) => (
             Outcome::Fail(Severity::CouldNotRun),
-            "no event loop, no window, or nothing installed to drive, so nothing was proven (exit 2, never a pass)".to_string(),
+            "no event loop, no window, nothing installed to drive, or another app held the activation a check needs (the transcript says which), so its claim was not proven (exit 2, never a pass)".to_string(),
         ),
         (Some(3), Code3::WeakerPassOk(label)) => (Outcome::Ok, label.to_string()),
         (Some(3), Code3::Hung) => (
@@ -757,7 +737,7 @@ pub fn main_targo(ctx: &Ctx, args: Vec<String>) -> Cmd {
 pub const fn lane_build_jobs(lane: Lane) -> Option<u32> {
     match lane {
         Lane::TrustTarget | Lane::CellsTarget | Lane::GpuOracleTarget => Some(4),
-        Lane::SealedTarget | Lane::CheckersTarget => Some(8),
+        Lane::CheckersTarget => Some(8),
         _ => None,
     }
 }
@@ -1038,7 +1018,7 @@ pub const NO_APP: &str = "(no release bundle to judge — fix: pass --app <path 
 const RELEASE_PAINT_BIN: &str = "ATERM_PAINT_BIN";
 const RELEASE_SPIN_BIN: &str = "ATERM_SPIN_BIN";
 
-/// The measuring stage's test child, [`measuring_args`] handed the release
+/// The measuring stage's benchmark child, [`measuring_args`] handed the release
 /// bundle's `aterm` through both overrides, and its ladder label. The prebuild
 /// ([`measure_prebuild`]) runs [`measure_prebuild_args`] in this same
 /// environment, so the two agree on every fingerprint.
@@ -1068,53 +1048,100 @@ fn measure_prebuild(ctx: &Ctx, r: &mut Report) {
 
 fn measuring_tests(ctx: &Ctx, r: &mut Report) {
     if !ctx.tools.have_targo() {
-        r.skip("measuring tests (no targo)");
+        r.skip("measuring matrices (no targo)");
         return;
     }
     // Never a binary of the run's own choosing: the bundle publication signs.
     let Some(artifact) = &ctx.measure_artifact else {
-        r.skip(format!("measuring tests {NO_APP}"));
+        r.skip(format!("measuring matrices {NO_APP}"));
         return;
     };
     let (label, cmd) = measuring_cmd(ctx, artifact, measuring_args());
-    let env = crate::findings::rerun_env(&cmd, ctx.test_threads);
     run_child(ctx, r, &label, &cmd, |r, run, label| {
-        decide_measuring_child(r, run, label, &env);
+        decide_measuring_child(r, run, label);
     });
 }
 
-/// A measuring child decides as any test child does, except that one which
-/// exited 0 with a target ([`MEASURING_TARGETS`]) that passed no row measured
-/// nothing there: a filter that selects nothing (a renamed module, a lost
-/// `--ignored`) is could not run, never a green measure check. Read per target,
-/// so the other target's passes cannot cover it.
-fn decide_measuring_child(
-    r: &mut Report,
-    run: &exec::Run,
-    label: &str,
-    env: &[(std::ffi::OsString, std::ffi::OsString)],
-) {
-    if run.ok {
-        let by_target = crate::libtest::passed_by_target(&run.output);
-        let empty: Vec<String> = MEASURING_TARGETS
-            .iter()
-            .map(|t| format!("tests/{t}.rs"))
-            .filter(|want| {
-                !by_target
-                    .iter()
-                    .any(|(target, passed)| target == want && passed.is_some_and(|n| n > 0))
-            })
-            .collect();
-        if !empty.is_empty() {
-            r.cannot_run(format!(
-                "{label} — {}: {}",
-                empty.join(", "),
-                crate::libtest::PASSED_NONE
-            ));
-            return;
+#[derive(Clone, Copy)]
+struct MeasuringCounts {
+    planned: usize,
+    passed: usize,
+    failed: usize,
+    refused: usize,
+}
+
+impl MeasuringCounts {
+    /// The benches print one final summary derived from their execution table.
+    /// Reject missing fields, extra fields and counts that cannot be represented.
+    fn parse(fields: &str) -> Option<Self> {
+        let mut fields = fields.split_whitespace();
+        let mut count = |key: &str| fields.next()?.strip_prefix(key)?.parse().ok();
+        let counts = Self {
+            planned: count("planned=")?,
+            passed: count("passed=")?,
+            failed: count("failed=")?,
+            refused: count("refused=")?,
+        };
+        fields.next().is_none().then_some(counts)
+    }
+
+    fn complete(self) -> bool {
+        self.planned > 0
+            && self
+                .passed
+                .checked_add(self.failed)
+                .and_then(|n| n.checked_add(self.refused))
+                == Some(self.planned)
+    }
+}
+
+/// A measurement is green only after both complete nonempty matrices decide
+/// every row. A finding outranks host refusals; a wholly undecided or partial
+/// matrix is COULD NOT RUN. Compilation errors or unexpected child exits keep
+/// their ordinary failure verdict. Libtest remains the parser for test lanes.
+fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str) {
+    let mut incomplete = Vec::new();
+    let mut refused = Vec::new();
+    let mut any_failed = false;
+    let mut all_reported = true;
+    for target in MEASURING_TARGETS {
+        let prefix = format!("measure result: {target} ");
+        let mut summaries = run.output.lines().filter_map(|l| l.strip_prefix(&prefix));
+        let counts = summaries.next().and_then(MeasuringCounts::parse);
+        let counts = counts.filter(|_| summaries.next().is_none());
+        match counts {
+            Some(counts) => {
+                any_failed |= counts.failed != 0;
+                if !counts.complete() {
+                    incomplete.push(target);
+                }
+                if counts.refused != 0 {
+                    refused.push(target);
+                }
+            }
+            None => {
+                all_reported = false;
+                incomplete.push(target);
+            }
         }
     }
-    r.decide_test_child(run, label, env);
+    if any_failed {
+        r.record_child(run, Outcome::Fail(Severity::GateFailed), label);
+    } else if !incomplete.is_empty()
+        && (run.ok || all_reported || run.output.contains("measure: COULD NOT RUN —"))
+    {
+        r.cannot_run(format!(
+            "{label} — {}: no complete nonempty measurement matrix",
+            incomplete.join(", ")
+        ));
+    } else if incomplete.is_empty() && !refused.is_empty() {
+        r.cannot_run(format!(
+            "{label} — {}: the instrument could not decide every row",
+            refused.join(", ")
+        ));
+    } else {
+        r.decide_child(run, label);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1171,28 +1198,6 @@ fn doctests(ctx: &Ctx, r: &mut Report) {
     }
 }
 
-/// The sealed rung's one child, labelled — the exact command, so a test
-/// asserts on it. It runs in the sealed lane, the run's one feature build of
-/// the shipped binary; cargo builds the `aterm` it drives there as the suites'
-/// own binary dependency.
-#[must_use]
-pub fn sealed_lane_cmd(ctx: &Ctx) -> (String, Cmd) {
-    (
-        "targo test -p aterm --features sealed --test two_nodes_sealed --test fabric_world"
-            .to_string(),
-        in_lane(ctx, Lane::SealedTarget, targo(ctx, sealed_lane_args())),
-    )
-}
-
-fn sealed_lane(ctx: &Ctx, r: &mut Report) {
-    if !ctx.tools.have_targo() {
-        r.skip("sealed fabric lane (no targo)");
-        return;
-    }
-    let (label, cmd) = sealed_lane_cmd(ctx);
-    run_labeled(ctx, r, &label, &cmd);
-}
-
 // ---------------------------------------------------------------------------
 // Tippy: the lint under the Trust toolchain's Clippy fork. Present means
 // `-D warnings` must pass; absent is a named skip. Its own target dir
@@ -1200,13 +1205,23 @@ fn sealed_lane(ctx: &Ctx, r: &mut Report) {
 // ---------------------------------------------------------------------------
 /// The exact command the lint stage spawns, so the test asserts on it rather
 /// than a replica.
+///
+/// The lint's whole toolchain is the one its driver lives in: that directory goes
+/// first on PATH, so `targo-tippy` finds its own `tippy-driver` and `trustc`. When the
+/// run took the driver from the managed Trust build (`Toolchain::borrowed`), that
+/// build is also the `TRUST_STAGE2_BIN` the lint's children are told, never the
+/// toolchain directory that lacked it.
 fn tippy_cmd(ctx: &Ctx, bin: &std::path::Path, args: Vec<String>) -> Cmd {
     let dir = bin.parent().unwrap_or(&ctx.tools.stage2_dir).to_path_buf();
     let mut path = std::ffi::OsString::from(dir.as_os_str());
     path.push(":");
     path.push(&ctx.path_env);
-    Cmd::new(bin)
-        .args(args)
+    let cmd = if ctx.tools.borrowed(crate::toolchain::TIPPY) == Some(bin) {
+        Cmd::new(bin).env("TRUST_STAGE2_BIN", &dir)
+    } else {
+        Cmd::new(bin)
+    };
+    cmd.args(args)
         .env("PATH", path)
         .env(
             "CARGO_TARGET_DIR",
@@ -1222,10 +1237,12 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
         r.skip(ctx.tools.missing_tippy_label());
         return;
     };
+    // Every row this driver decides names a borrowed one.
+    let borrowed = crate::fmt::borrowed_suffix(ctx, crate::toolchain::TIPPY);
     run_scoped(
         ctx,
         r,
-        &format!("tippy {} -D warnings", ctx.scope.label()),
+        &format!("tippy {} -D warnings{borrowed}", ctx.scope.label()),
         &tippy_cmd(ctx, &bin, tippy_args(&ctx.scope)),
     );
     // The oracle's arm, wherever the selection holds aterm-gpu. Its own row.
@@ -1234,14 +1251,13 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
         run_scoped(
             ctx,
             r,
-            &format!("tippy -p {pkg} --features {feature} -D warnings"),
+            &format!("tippy -p {pkg} --features {feature} -D warnings{borrowed}"),
             &tippy_cmd(ctx, &bin, args),
         );
     }
     // The second pass, under `release` only: `--all-targets` above built no
     // target whose `required-features` are off, so those
-    // ([`gated_lint_features`]: benches, a harness bin and aterm-link's
-    // `sealed` rung with every `sealed` arm of that crate, none of it the
+    // ([`gated_lint_features`]: benches and a harness bin, none of it the
     // shipped build) are linted here or nowhere. Its own row.
     if ctx.release
         && let Some(args) = tippy_gated_args(&ctx.scope, &gated_lint_features(&ctx.root))
@@ -1249,7 +1265,7 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
         run_scoped(
             ctx,
             r,
-            "tippy required-features targets -D warnings",
+            &format!("tippy required-features targets -D warnings{borrowed}"),
             &tippy_cmd(ctx, &bin, args),
         );
     }
@@ -2253,8 +2269,9 @@ mod tests {
     use crate::EnvSnapshot;
     use std::path::PathBuf;
 
-    /// The ordinary pass retains Cargo's exact package spec; the required-
-    /// feature pass identifies the package by name without dropping the pass.
+    /// The ordinary pass retains Cargo's exact package spec, and so does the
+    /// required-feature pass ([`Scope::spec_of`]): a versioned package keeps
+    /// it, and a spec naming another package, or none, has no such pass.
     #[test]
     fn a_versioned_package_keeps_its_required_feature_lint_pass() {
         let gated = vec![("aterm-gui".to_string(), "control-conformance".to_string())];
@@ -2285,7 +2302,9 @@ mod tests {
             .iter()
             .map(|scope| tippy_gated_args(scope, &gated))
             .collect();
-        assert_eq!(passes, vec![Some(bare.clone()), Some(bare)]);
+        let mut versioned = bare;
+        versioned[1] = spec.to_string();
+        assert_eq!(passes, vec![Some(versioned.clone()), Some(versioned)]);
     }
 
     fn ctx(scope: Scope) -> Ctx {
@@ -2361,11 +2380,9 @@ mod tests {
         );
         // The prebuild compiles exactly what the run runs, and runs nothing.
         let (pre, rows) = (prebuild.argv(), run.argv());
-        let at = rows
-            .iter()
-            .position(|a| a == "--")
-            .expect("the rows' filter");
-        assert_eq!(pre[..pre.len() - 1], rows[..at], "{pre:?} vs {rows:?}");
+        assert_eq!(pre[..pre.len() - 1], rows, "{pre:?} vs {rows:?}");
+        assert!(rows.windows(2).any(|w| w == MAIN_PROFILE));
+        assert!(!rows.iter().any(|a| a == "--ignored" || a == "measuring::"));
         assert_eq!(pre.last().map(String::as_str), Some("--no-run"));
         // No bundle: a skip, with the flag that hands one.
         let mut c = ctx(Scope::workspace());
@@ -2659,10 +2676,102 @@ mod tests {
         }
     }
 
+    /// A lint driver taken from the managed Trust build (`Toolchain::borrowed`)
+    /// runs under that build: its directory first on PATH and as the children's
+    /// `TRUST_STAGE2_BIN`, and the row names it. NEGATIVE CONTROL: the toolchain
+    /// directory's own driver sets no `TRUST_STAGE2_BIN` of its own and its row
+    /// names nothing borrowed.
+    #[test]
+    fn a_borrowed_lint_driver_runs_under_its_own_build_and_says_so() {
+        use crate::toolchain::TIPPY;
+        let env_of = |cmd: &Cmd, key: &str| {
+            cmd.envs
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+        let managed = PathBuf::from("/m/store/trust/9192/bin").join(TIPPY);
+        let mut c = ctx(Scope::workspace());
+        c.tools.tippy = Some(managed.clone());
+        c.tools.borrowed = vec![(TIPPY, managed.clone())];
+        let cmd = tippy_cmd(&c, &managed, tippy_args(&c.scope));
+        assert_eq!(
+            env_of(&cmd, "TRUST_STAGE2_BIN").as_deref(),
+            Some("/m/store/trust/9192/bin")
+        );
+        assert!(
+            env_of(&cmd, "PATH").is_some_and(|p| p.starts_with("/m/store/trust/9192/bin:")),
+            "{cmd:?}"
+        );
+        assert_eq!(
+            crate::fmt::borrowed_suffix(&c, TIPPY),
+            " (the managed Trust build's /m/store/trust/9192/bin/targo-tippy)"
+        );
+        // CONTROL: the toolchain's own driver.
+        let own = c.tools.stage2_dir.join(TIPPY);
+        c.tools.tippy = Some(own.clone());
+        c.tools.borrowed.clear();
+        let cmd = tippy_cmd(&c, &own, tippy_args(&c.scope));
+        assert_eq!(env_of(&cmd, "TRUST_STAGE2_BIN"), None);
+        assert_eq!(crate::fmt::borrowed_suffix(&c, TIPPY), "");
+    }
+
+    /// Every row a borrowed lint driver decides names it: the selection's, the
+    /// oracle's arm and the release-only `required-features` pass.
+    /// NEGATIVE CONTROL: the same three rows under the toolchain's own driver
+    /// name nothing borrowed.
+    #[test]
+    fn every_row_a_borrowed_lint_driver_decides_names_it() {
+        use crate::toolchain::TIPPY;
+        let root = std::fs::canonicalize(crate::mktemp_dir("atv-lintrows").expect("mktemp"))
+            .expect("real");
+        std::fs::create_dir_all(root.join("crates/gui")).expect("mkdir");
+        std::fs::write(
+            root.join("crates/gui/Cargo.toml"),
+            "[package]\nname = \"aterm-gui\"\n\n[[bench]]\nname = \"b\"\n\
+             required-features = [\"bench-support\"]\n",
+        )
+        .expect("manifest");
+        let managed = root.join("m/bin").join(TIPPY);
+        let own = root.join("s2/bin").join(TIPPY);
+        let scope = Scope::packages(&["aterm-gpu".to_string(), "aterm-gui".to_string()]);
+        let mut c = Ctx::new(root.clone(), scope, EnvSnapshot::default(), root.join("t"))
+            .with_release(true);
+        c.tools.stage2_dir = own.parent().expect("dir").to_path_buf();
+        c.tools.tippy = Some(managed.clone());
+        c.tools.borrowed = vec![(TIPPY, managed.clone())];
+        // The labels are the property, whatever the (absent) driver's outcome.
+        let rows = |c: &Ctx| {
+            let mut r = Report::new("lint");
+            tippy(c, &mut r);
+            r.outcomes()
+                .map(|(o, l)| (o, l.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let said = format!(" (the managed Trust build's {})", managed.display());
+        let borrowed = rows(&c);
+        assert_eq!(borrowed.len(), 3, "{borrowed:?}");
+        assert!(
+            borrowed.iter().all(|(_, l)| l.contains(&said)),
+            "{borrowed:?}"
+        );
+        // CONTROL: the toolchain's own driver.
+        c.tools.tippy = Some(own);
+        c.tools.borrowed.clear();
+        let theirs = rows(&c);
+        assert_eq!(theirs.len(), 3, "{theirs:?}");
+        assert!(
+            theirs
+                .iter()
+                .all(|(_, l)| !l.contains("the managed Trust build's")),
+            "{theirs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Which children yield the CPU ([`Cmd::demoted`]): every child that only
     /// compiles. A child that runs code keeps the inherited tier, since a clamp
-    /// reaches everything it launches (the test run and the sealed rung launch
-    /// aterms).
+    /// reaches everything it launches (the test run launches aterms).
     #[test]
     fn compile_only_children_yield_and_children_that_run_code_do_not() {
         let mut c = ctx(Scope::workspace());
@@ -2678,7 +2787,7 @@ mod tests {
             let (_, measuring) = measuring_cmd(&c, &artifact, measuring_args());
             assert!(
                 !measuring.demoted,
-                "the measuring tests run the paint and spin guards"
+                "the measuring benches run the paint and spin guards"
             );
         }
         assert!(
@@ -2705,11 +2814,6 @@ mod tests {
         ] {
             assert!(argv.windows(2).any(|w| w == MAIN_PROFILE), "{argv:?}");
         }
-        let (suite_label, suite) = sealed_lane_cmd(&c);
-        assert!(
-            !suite.demoted,
-            "{suite_label} boots real aterm --headless processes"
-        );
     }
 
     /// The gated list is the manifests' own: each `required-features` key counts
@@ -2772,6 +2876,22 @@ mod tests {
             )
             .is_some(),
             "a changed-scope run that rebuilt aterm-gui must still lint its benches"
+        );
+        // A cone member named by its spec (the lock holds another package of
+        // its name) is selected by that spec, its features by its name.
+        let by_spec = tippy_gated_args(
+            &Scope::changed("main", vec!["aterm-scrollback@9.9.9".into()], true),
+            &gated,
+        )
+        .expect("the spec names the gated package");
+        assert_eq!(
+            by_spec[..4],
+            [
+                "-p",
+                "aterm-scrollback@9.9.9",
+                "--features",
+                "aterm-scrollback/disk-tier"
+            ]
         );
     }
 
@@ -3058,21 +3178,18 @@ mod tests {
         }
     }
 
-    /// A measuring child that passed no row measured nothing: COULD NOT RUN,
-    /// however cleanly it exited (every row ignored, a filter matching
-    /// nothing). One that passed rows is green, and a failed one is a finding.
+    /// Both named matrices must account for all their rows; test-shaped output,
+    /// missing or partial summaries and host refusals never count as a pass.
     #[test]
-    fn a_measuring_child_that_passed_no_row_could_not_run() {
-        let result = |target: &str, passed: usize, failed: usize, ignored: usize| {
+    fn a_measuring_child_requires_complete_decided_matrices() {
+        let result = |target: &str, planned, passed, failed, refused| {
             format!(
-                "     Running tests/{target}.rs (target/debug/deps/{target}-1)\n\
-                 test result: ok. {passed} passed; {failed} failed; {ignored} ignored; 0 \
-                 measured; 0 filtered out; finished in 0.01s\n"
+                "measure result: {target} planned={planned} passed={passed} \
+                 failed={failed} refused={refused}\n"
             )
         };
-        let both = |paint: (usize, usize, usize), spin: (usize, usize, usize)| {
-            result("paint", paint.0, paint.1, paint.2) + &result("spin", spin.0, spin.1, spin.2)
-        };
+        let paint = result("paint", 23, 23, 0, 0);
+        let spin = result("spin", 2, 2, 0, 0);
         let decide = |ok: bool, output: String| {
             let run = exec::Run {
                 ok,
@@ -3081,38 +3198,72 @@ mod tests {
                 spawn_error: None,
             };
             let mut r = Report::new("measuring");
-            decide_measuring_child(&mut r, &run, "measuring tests", &[]);
+            decide_measuring_child(&mut r, &run, "measuring matrices");
             let (outcome, label) = r.outcomes().next().expect("a decision");
             (outcome, label.to_string())
         };
-        assert_eq!(
-            decide(true, both((0, 0, 23), (0, 0, 2))).0,
-            Outcome::Fail(Severity::CouldNotRun),
-            "every row ignored"
-        );
-        let (outcome, label) = decide(true, both((0, 0, 0), (2, 0, 0)));
-        assert_eq!(
-            outcome,
-            Outcome::Fail(Severity::CouldNotRun),
-            "paint selected nothing beside a spin that passed"
-        );
+        let could_not_run = Outcome::Fail(Severity::CouldNotRun);
+        for output in [
+            String::new(),
+            "test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured\n".into(),
+            result("paint", 0, 0, 0, 0) + &spin,
+            result("paint", 23, 22, 0, 0) + &spin,
+            result("paint", 23, 24, 0, 0) + &spin,
+            paint.clone(),
+            spin.clone(),
+            paint.clone() + &paint + &spin,
+            paint.replace("passed=23", "passed=unknown") + &spin,
+            paint.clone() + &spin + "measure result: spin planned=2\n",
+            result("paint", usize::MAX, usize::MAX, 0, 1) + &spin,
+        ] {
+            assert_eq!(decide(true, output.clone()).0, could_not_run, "{output}");
+        }
+        let (outcome, label) = decide(true, spin.clone());
+        assert_eq!(outcome, could_not_run);
         assert!(
-            label.contains("tests/paint.rs") && !label.contains("tests/spin.rs"),
+            label.contains("paint") && !label.contains("spin"),
             "{label}"
         );
+        assert_eq!(decide(true, paint.clone() + &spin).0, Outcome::Ok);
         assert_eq!(
-            decide(true, result("paint", 23, 0, 0)).0,
-            Outcome::Fail(Severity::CouldNotRun),
-            "spin never ran"
+            decide(false, result("paint", 23, 22, 0, 1) + &spin).0,
+            could_not_run,
+            "an undecided take is not a finding about paint"
         );
         assert_eq!(
-            decide(true, String::new()).0,
-            Outcome::Fail(Severity::CouldNotRun),
-            "no binary ran"
+            decide(
+                false,
+                result("paint", 23, 0, 0, 23) + &result("spin", 2, 0, 0, 2)
+            )
+            .0,
+            could_not_run,
+            "neither matrix decided anything"
         );
-        assert_eq!(decide(true, both((23, 0, 0), (2, 0, 0))).0, Outcome::Ok);
         assert_eq!(
-            decide(false, both((22, 1, 0), (2, 0, 0))).0,
+            decide(
+                false,
+                result("paint", 23, 22, 1, 0) + &result("spin", 2, 0, 0, 2)
+            )
+            .0,
+            Outcome::Fail(Severity::GateFailed),
+            "a definite finding outweighs another matrix's refusal"
+        );
+        assert_eq!(
+            decide(true, result("paint", 23, 22, 1, 0) + &spin).0,
+            Outcome::Fail(Severity::GateFailed),
+            "an incorrect zero exit cannot erase the row's finding"
+        );
+        assert_eq!(
+            decide(false, paint + &spin).0,
+            Outcome::Fail(Severity::GateFailed),
+            "complete passes cannot hide an unexpected process failure"
+        );
+        assert_eq!(
+            decide(
+                false,
+                "error: could not compile the measurement binary\n".into()
+            )
+            .0,
             Outcome::Fail(Severity::GateFailed)
         );
     }
@@ -3125,7 +3276,6 @@ mod tests {
         for lane in [
             Lane::TrustTarget,
             Lane::CellsTarget,
-            Lane::SealedTarget,
             Lane::CheckersTarget,
             Lane::GpuOracleTarget,
         ] {
@@ -3166,12 +3316,6 @@ mod tests {
                 })
                 .collect()
         };
-        let (label, sealed) = sealed_lane_cmd(&c);
-        assert!(
-            envs(&sealed).contains(&("CARGO_BUILD_JOBS".to_string(), "3".to_string())),
-            "{label}: {:?}",
-            envs(&sealed)
-        );
         assert!(envs(&export_cmd(&c)).contains(&("CARGO_BUILD_JOBS".to_string(), "3".to_string())));
     }
 
@@ -3200,22 +3344,17 @@ mod tests {
         ] {
             assert_eq!(cmd.argv()[1..3], ["--config", value], "{:?}", cmd.argv());
         }
-        let (_, sealed) = sealed_lane_cmd(&c);
         assert!(
-            !sealed.argv().iter().any(|a| a == "--config"),
+            !export_cmd(&c).argv().iter().any(|a| a == "--config"),
             "a side lane keeps its own dir"
         );
-        assert!(!export_cmd(&c).argv().iter().any(|a| a == "--config"));
     }
 
     /// THE DRIVEN BINARY IS THE ONE ITS STAGE BUILT: the codex-alab proof's build
     /// child only compiles, in the main target the plan schedules the row in, and the
     /// suite is handed that target's `aterm` as its argument and nothing else.
-    /// The sealed rung has no build child: its suites drive
-    /// `CARGO_BIN_EXE_aterm`, which cargo builds in its own lane, and it is
-    /// handed nothing beyond the lane.
     #[test]
-    fn the_codex_alab_proof_drives_the_main_targets_aterm_and_the_sealed_rung_its_own() {
+    fn the_codex_alab_proof_drives_the_main_targets_aterm() {
         let lane = |cmd: &Cmd| {
             cmd.envs
                 .iter()
@@ -3257,21 +3396,6 @@ mod tests {
             suite.term_grace,
             Some(CODEX_TERM_GRACE),
             "a lane over the ceiling is sent SIGTERM first, so it tears down"
-        );
-
-        let (_, sealed) = sealed_lane_cmd(&c);
-        assert!(!sealed.demoted, "the sealed suites run code");
-        assert_eq!(lane(&sealed), lane_of(StageId::SealedLane));
-        assert_eq!(
-            sealed.envs,
-            [
-                (
-                    "CARGO_TARGET_DIR".into(),
-                    c.target_dir.join("verify/sealed").into_os_string()
-                ),
-                ("CARGO_BUILD_JOBS".into(), "8".into()),
-            ],
-            "the lane and nothing else"
         );
     }
 

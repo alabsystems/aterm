@@ -4,11 +4,10 @@
 //! STAND-IN PROGRAMS IN RUST: a live lane runs a terminal program of its own
 //! (a TUI, a job that arms modes and dies) by re-executing THIS test binary.
 //!
-//! Each lane declares one `#[ignore]`d `#[test]` as its entry; [`argv`] runs
-//! exactly that entry, and the entry, finding [`ENV`] set, plays the program
-//! named there and leaves through [`exit`] without returning to libtest. An
-//! ordinary run of the suite lists the entry as ignored, and one that runs it
-//! anyway (`--include-ignored`) finds [`ENV`] unset and does nothing.
+//! Each lane uses one of its real tests as the child entry. Before that test's
+//! ordinary body, it checks [`ENV`] and plays the named program when set,
+//! leaving through [`exit`] without returning to libtest. [`argv`] selects
+//! exactly that test; an ordinary run executes its full parent assertions.
 //!
 //! libtest prints `running 1 test` before the entry starts; every program
 //! here paints over that line or prints past it, and no lane reads it.
@@ -31,8 +30,8 @@ pub fn exe() -> PathBuf {
 
 /// The arguments after [`exe`] that run the entry `test` (its full path in
 /// this binary, `<module>::<fn>`) and nothing else.
-pub fn argv(test: &str) -> [&str; 5] {
-    ["--exact", test, "--ignored", "--nocapture", "--quiet"]
+pub fn argv(test: &str) -> [&str; 4] {
+    ["--exact", test, "--nocapture", "--quiet"]
 }
 
 /// A shell command line that runs the entry `test` as the program `spec`

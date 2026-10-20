@@ -1,22 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The SESSION PICKER overlay (design §2.3/§2.5 — the wave-2 "picker slice"):
-//! a palette-style choose-a-session card. Three intents share it:
+//! The PICKER overlay (`controls session-picker`): a palette-style
+//! type-to-filter card for File ▸ New Window / New Tab With Identity… (round
+//! 18's identity rows): every agent identity by name, plus a last row that
+//! creates the identity the FILTER names; choosing opens the window or tab
+//! under it, introspectable (`controls`) on every platform.
 //!
-//! * **Connect** — `Connect to Session…` (`session.connect_to`): every live
-//!   session except the subject; choosing one opens the shared confirm card
-//!   ([`crate::conn_card`]) for subject ⇄ chosen.
-//! * **Configure** — `session.configure_connection` invoked with several
-//!   peers: only the subject's CONNECTED peers; choosing opens the same card
-//!   pre-filled (§2.5 — the sheet when one peer, this picker when several).
-//! * **Disconnect** — `session.disconnect` with several peers: connected
-//!   peers; choosing dissolves both directions (never guesses, §2.3).
-//! * **New Window / New Tab With Identity** — File ▸ `…With Identity…` (round
-//!   18's identity rows): every agent identity by name, plus a last row that
-//!   creates the identity the FILTER names; choosing opens the window or tab
-//!   under it. One picker surface for sessions and identities alike, so the
-//!   identity rows are introspectable (`controls`) on every platform.
+//! It also picked a session for the connection ids (Connect to Session…,
+//! Configure Connection…, Disconnect Session…) until those were retired
+//! (`docs/DESIGN-owner-surfaces-2026-10-16.md` §7): every in-session client
+//! already holds Owner, and workers start with `spawn agent=claude`.
 //!
 //! Reuses the palette machinery deliberately: the SAME fuzzy filter
 //! ([`crate::palette::fuzzy_subsequence`]), the same cursor/scroll/pointer
@@ -27,7 +21,6 @@
 
 #[cfg(test)]
 use aterm_render::Theme;
-use aterm_session::SessionId;
 
 #[cfg(a11y_tree)]
 use crate::palette::{a11y_epoch_from, a11y_slot_for, list_overlay_a11y};
@@ -36,23 +29,17 @@ use crate::settings::{Roles, SettingsGeom, text_w};
 use crate::type_scale::TypeStep;
 use crate::widget::{DrawPrim, TrayInput, rgba};
 
-/// The most session rows shown at once; beyond this the filtered list scrolls.
+/// The most rows shown at once; beyond this the filtered list scrolls.
 const MAX_ROWS: usize = 12;
 /// Chrome rows framing the scrolling band: title + query on top, hint footer.
 const CHROME_ROWS: usize = 3;
 /// Maximum logical width of the floating card (the palette's rule).
 const MAX_CARD_WIDTH: f32 = 720.0;
 
-/// What choosing a session DOES — carried from open to activation so the
+/// What choosing a row DOES — carried from open to activation so the
 /// selection dispatches without re-deriving intent from ambient state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PickerIntent {
-    /// Open the confirm card for subject ⇄ chosen (fresh or existing pair).
-    Connect,
-    /// Open the confirm card pre-filled for an EXISTING pair.
-    Configure,
-    /// Dissolve both directions of subject ⇄ chosen.
-    Disconnect,
     /// Open a new WINDOW whose first shell runs under the chosen identity.
     NewWindowWithIdentity,
     /// Open a new TAB (front window) under the chosen identity.
@@ -63,59 +50,26 @@ impl PickerIntent {
     /// The card's title line.
     pub(crate) fn title(self) -> &'static str {
         match self {
-            PickerIntent::Connect => "Connect to Session",
-            PickerIntent::Configure => "Configure Connection",
-            PickerIntent::Disconnect => "Disconnect",
             PickerIntent::NewWindowWithIdentity => "New Window With Identity",
             PickerIntent::NewTabWithIdentity => "New Tab With Identity",
         }
     }
 
-    /// Whether this intent picks an IDENTITY rather than a session.
-    pub(crate) fn picks_identity(self) -> bool {
-        matches!(
-            self,
-            PickerIntent::NewWindowWithIdentity | PickerIntent::NewTabWithIdentity
-        )
-    }
-
     /// The `controls` spelling.
     fn wire(self) -> &'static str {
         match self {
-            PickerIntent::Connect => "connect",
-            PickerIntent::Configure => "configure",
-            PickerIntent::Disconnect => "disconnect",
             PickerIntent::NewWindowWithIdentity => "new-window-identity",
             PickerIntent::NewTabWithIdentity => "new-tab-identity",
         }
     }
 }
 
-/// One choosable session, snapshotted at open (registry facts; a session that
-/// exits while the picker is open is re-checked at dispatch, never trusted).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SessionRow {
-    pub sid: SessionId,
-    /// Registry local id (the tab model's addressing grain) — lets activation
-    /// raise/resolve without another sid scan.
-    pub local_id: u64,
-    /// Display title: user meta title ▸ registry title (the fleet-glance rung).
-    pub title: String,
-    /// Whether the subject already has any connection with this session —
-    /// listed honestly beside the title (`· connected`).
-    pub connected: bool,
-}
-
-/// One choosable row: a live session (the connection intents), an existing
-/// agent identity, or the row that creates the identity the filter names.
+/// One choosable row: an existing agent identity, or the row that creates the
+/// identity the filter names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PickerRow {
-    Session(SessionRow),
     /// An identity on disk, by (folded) name, with how many live sessions wear it.
-    Identity {
-        name: String,
-        sessions: usize,
-    },
+    Identity { name: String, sessions: usize },
     /// The last row of an identity picker: create the identity the QUERY names.
     /// It never filters out, and activating it with a query that is not a valid,
     /// new name is a no-op.
@@ -126,27 +80,14 @@ pub(crate) enum PickerRow {
 /// new-identity row yields the name typed into the filter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PickerChoice {
-    Session(SessionId),
     /// An identity to spawn under; `create` only for the new-identity row.
-    Identity {
-        name: String,
-        create: bool,
-    },
+    Identity { name: String, create: bool },
 }
 
 impl PickerRow {
-    /// The session this row picks, if it is a session row.
-    pub(crate) fn sid(&self) -> Option<&SessionId> {
-        match self {
-            PickerRow::Session(row) => Some(&row.sid),
-            PickerRow::Identity { .. } | PickerRow::NewIdentity => None,
-        }
-    }
-
     /// The stable key `controls` and the a11y epoch identify a row by.
     fn key(&self) -> String {
         match self {
-            PickerRow::Session(row) => format!("sid={}", row.sid.as_str()),
             PickerRow::Identity { name, .. } => format!("identity={name}"),
             PickerRow::NewIdentity => "identity=+new".to_string(),
         }
@@ -160,15 +101,11 @@ struct PickerLayout {
     body_rows: usize,
 }
 
-/// Transient state of the open session picker — the
+/// Transient state of the open picker — the
 /// [`crate::overlay::Overlay::SessionPicker`] payload.
 pub(crate) struct SessionPickerState {
     /// The hosting window.
     pub(crate) window: crate::WindowId,
-    /// The SUBJECT session ("S" — `@self` of the §2.3 ids) every connection
-    /// intent acts from; `None` for the identity intents, which act from none.
-    pub(crate) subject: Option<SessionId>,
-    subject_title: String,
     pub(crate) intent: PickerIntent,
     rows: Vec<PickerRow>,
     query: String,
@@ -182,17 +119,9 @@ pub(crate) struct SessionPickerState {
 }
 
 impl SessionPickerState {
-    pub(crate) fn new(
-        window: crate::WindowId,
-        subject: Option<SessionId>,
-        subject_title: String,
-        intent: PickerIntent,
-        rows: Vec<PickerRow>,
-    ) -> Self {
+    pub(crate) fn new(window: crate::WindowId, intent: PickerIntent, rows: Vec<PickerRow>) -> Self {
         Self {
             window,
-            subject,
-            subject_title,
             intent,
             rows,
             query: String::new(),
@@ -207,20 +136,6 @@ impl SessionPickerState {
     /// The new-identity row reads the live query, so it is a method of the state.
     fn row_line(&self, row: &PickerRow) -> String {
         match row {
-            PickerRow::Session(row) => {
-                let mut title = crate::session_timeline::sanitize_presentation_line(&row.title, 64);
-                if title.is_empty() {
-                    title = "(untitled)".to_string();
-                }
-                // Only the Connect picker mixes peers with strangers; the
-                // Configure and Disconnect pickers list connections alone.
-                let connected = if row.connected && self.intent == PickerIntent::Connect {
-                    " \u{00b7} connected"
-                } else {
-                    ""
-                };
-                format!("\"{title}\"  @{}{connected}", row.sid.as_str())
-            }
             PickerRow::Identity { name, sessions } => match sessions {
                 0 => name.clone(),
                 1 => format!("{name}  \u{00b7} 1 session"),
@@ -284,8 +199,8 @@ impl SessionPickerState {
         // `work` row that row tells the person to choose.
         let q = self.query.trim().to_ascii_lowercase();
         (0..self.rows.len()).filter(move |&i| {
-            // Opening the picker shows every session. No display-string formatting
-            // or title sanitization is needed to answer an empty filter.
+            // Opening the picker shows every identity. No display-string formatting
+            // is needed to answer an empty filter.
             if q.is_empty() || matches!(self.rows[i], PickerRow::NewIdentity) {
                 return true;
             }
@@ -422,7 +337,6 @@ impl SessionPickerState {
     /// (the new-identity row before a valid, new name is typed).
     pub(crate) fn choice_for(&self, row: &PickerRow) -> Option<PickerChoice> {
         match row {
-            PickerRow::Session(row) => Some(PickerChoice::Session(row.sid.clone())),
             PickerRow::Identity { name, .. } => Some(PickerChoice::Identity {
                 name: name.clone(),
                 create: false,
@@ -454,10 +368,9 @@ impl SessionPickerState {
         let vis = self.filtered();
         let mut out = Vec::with_capacity(vis.len() + 1);
         out.push(format!(
-            "session-picker window={} intent={} subject={} rows={} shown={} selected={} query={:?}",
+            "session-picker window={} intent={} rows={} shown={} selected={} query={:?}",
             self.window.0,
             self.intent.wire(),
-            self.subject.as_ref().map_or("-", SessionId::as_str),
             self.rows.len(),
             vis.len(),
             self.selected,
@@ -479,7 +392,6 @@ impl SessionPickerState {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.window.0.hash(&mut h);
-        self.subject.as_ref().map(SessionId::as_str).hash(&mut h);
         std::mem::discriminant(&self.intent).hash(&mut h);
         self.query.hash(&mut h);
         self.selected.hash(&mut h);
@@ -578,8 +490,8 @@ pub(crate) fn picker_row_hit(
     None
 }
 
-/// Paint the picker: intent title + subject, the pinned query row, one row per
-/// filtered session (cursor washed+ringed), a key-hint footer. PURE.
+/// Paint the picker: the intent's title, the pinned query row, one row per
+/// filtered identity (cursor washed+ringed), a key-hint footer. PURE.
 pub(crate) fn picker_tray(
     state: &SessionPickerState,
     g: &SettingsGeom,
@@ -593,33 +505,15 @@ pub(crate) fn picker_tray(
     let mut prims = overlay_card_frame(layout.card, ch, &r, true);
     let text_at = row_text_writer(px, ch);
 
-    // Title row: the intent + the subject it acts from (identity intents act
-    // from no session, so they carry the intent alone).
-    {
-        let subject_title =
-            crate::session_timeline::sanitize_presentation_line(&state.subject_title, 48);
-        let title = match &state.subject {
-            Some(subject) => format!(
-                "{} \u{2014} @{} \"{}\"",
-                state.intent.title(),
-                subject.as_str(),
-                if subject_title.is_empty() {
-                    "(untitled)"
-                } else {
-                    subject_title.as_str()
-                },
-            ),
-            None => state.intent.title().to_string(),
-        };
-        text_at(
-            &mut prims,
-            card_x + cw,
-            card_y,
-            TypeStep::Body,
-            title,
-            rgba(r.text_primary, 0xFF),
-        );
-    }
+    // Title row: the intent.
+    text_at(
+        &mut prims,
+        card_x + cw,
+        card_y,
+        TypeStep::Body,
+        state.intent.title().to_string(),
+        rgba(r.text_primary, 0xFF),
+    );
 
     // Pinned query row (the palette's framed field).
     let qy = card_y + ch;
@@ -660,7 +554,7 @@ pub(crate) fn picker_tray(
         rgba(r.text_tertiary, 0xFF),
     );
 
-    // The scrolling session band.
+    // The scrolling band.
     for slot in 0..layout.body_rows {
         let Some(&idx) = vis.get(state.scroll + slot) else {
             break;
@@ -704,11 +598,7 @@ pub(crate) fn picker_tray(
             card_y + 2.0 * ch,
             TypeStep::Body,
             if state.rows.is_empty() {
-                if state.intent.picks_identity() {
-                    "no identities yet".to_string()
-                } else {
-                    "no other sessions".to_string()
-                }
+                "no identities yet".to_string()
             } else {
                 "no match".to_string()
             },
@@ -755,35 +645,30 @@ mod tests {
 
     fn rows() -> Vec<PickerRow> {
         vec![
-            PickerRow::Session(SessionRow {
-                sid: SessionId::new("s-alpha"),
-                local_id: 1,
-                title: "build worker".to_string(),
-                connected: false,
-            }),
-            PickerRow::Session(SessionRow {
-                sid: SessionId::new("s-beta"),
-                local_id: 2,
-                title: "operator".to_string(),
-                connected: true,
-            }),
-            PickerRow::Session(SessionRow {
-                sid: SessionId::new("s-gamma"),
-                local_id: 3,
-                title: "scratch".to_string(),
-                connected: false,
-            }),
+            PickerRow::Identity {
+                name: "build".to_string(),
+                sessions: 0,
+            },
+            PickerRow::Identity {
+                name: "review".to_string(),
+                sessions: 1,
+            },
+            PickerRow::Identity {
+                name: "scratch".to_string(),
+                sessions: 2,
+            },
         ]
     }
 
     fn picker() -> SessionPickerState {
-        SessionPickerState::new(
-            crate::WindowId(0),
-            Some(SessionId::new("s-self")),
-            "me".to_string(),
-            PickerIntent::Connect,
-            rows(),
-        )
+        SessionPickerState::new(crate::WindowId(0), PickerIntent::NewTabWithIdentity, rows())
+    }
+
+    fn chosen(p: &SessionPickerState, row: &PickerRow) -> String {
+        match p.choice_for(row) {
+            Some(PickerChoice::Identity { name, .. }) => name,
+            None => "-".to_string(),
+        }
     }
 
     fn geom() -> SettingsGeom {
@@ -796,30 +681,24 @@ mod tests {
         }
     }
 
-    /// Type-to-filter narrows by title AND by sid (the palette's fuzzy
-    /// subsequence over the painted row line); backspace widens again; the
-    /// cursor resets to the top on every edit.
+    /// Type-to-filter narrows by name (the palette's fuzzy subsequence over
+    /// the painted row line); backspace widens again; the cursor resets to the
+    /// top on every edit; nothing matching selects nothing.
     #[test]
-    fn filter_narrows_by_title_and_sid_and_resets_the_cursor() {
+    fn filter_narrows_by_name_and_resets_the_cursor() {
         let mut p = picker();
         assert_eq!(p.filtered().len(), 3);
         p.move_selection(2);
-        assert_eq!(p.selected_row().unwrap().sid().unwrap().as_str(), "s-gamma");
-        for c in "oper".chars() {
+        assert_eq!(chosen(&p, p.selected_row().unwrap()), "scratch");
+        for c in "revi".chars() {
             p.push_char(c);
         }
         assert_eq!(p.filtered().len(), 1);
-        assert_eq!(p.selected_row().unwrap().sid().unwrap().as_str(), "s-beta");
-        // Sid text matches too (the row line carries `@<sid>`).
-        p.backspace();
-        p.backspace();
-        p.backspace();
-        p.backspace();
-        for c in "s-alp".chars() {
-            p.push_char(c);
+        assert_eq!(chosen(&p, p.selected_row().unwrap()), "review");
+        for _ in 0..4 {
+            p.backspace();
         }
-        assert_eq!(p.selected_row().unwrap().sid().unwrap().as_str(), "s-alpha");
-        // Nothing matches: selection is honestly None.
+        assert_eq!(p.filtered().len(), 3);
         for c in "zzz".chars() {
             p.push_char(c);
         }
@@ -827,15 +706,15 @@ mod tests {
         assert!(p.selected_row().is_none());
     }
 
-    /// The cursor wraps over the filtered set and selection follows filtering
-    /// (the palette's move/clamp discipline).
+    /// The cursor wraps over the filtered set (the palette's move/clamp
+    /// discipline).
     #[test]
     fn selection_wraps_and_survives_scroll() {
         let mut p = picker();
         p.move_selection(-1);
-        assert_eq!(p.selected_row().unwrap().sid().unwrap().as_str(), "s-gamma");
+        assert_eq!(chosen(&p, p.selected_row().unwrap()), "scratch");
         p.move_selection(1);
-        assert_eq!(p.selected_row().unwrap().sid().unwrap().as_str(), "s-alpha");
+        assert_eq!(chosen(&p, p.selected_row().unwrap()), "build");
         assert_eq!(p.scroll_extent(), (0, 3, 3));
     }
 
@@ -850,14 +729,10 @@ mod tests {
         assert!(p.pointer_press(Some(1)));
         let (_, activate) = p.pointer_release(Some(1));
         assert!(activate);
-        assert_eq!(
-            p.row_at_filtered(1).unwrap().sid().unwrap().as_str(),
-            "s-beta"
-        );
+        assert_eq!(chosen(&p, p.row_at_filtered(1).unwrap()), "review");
     }
 
-    /// Painter and hit-test share one row rectangle; the connected annotation
-    /// is painted so the choice is honest.
+    /// Painter and hit-test share one row rectangle.
     #[test]
     fn hit_test_and_paint_share_rectangles() {
         let p = picker();
@@ -868,27 +743,6 @@ mod tests {
         assert_eq!(picker_row_hit(&p, &g, x - 2.0 * g.cw, y), None);
         let tray = picker_tray(&p, &g, Theme::default());
         assert_eq!(tray.card, layout.card);
-        assert!(
-            tray.prims.iter().any(
-                |pr| matches!(pr, DrawPrim::Text { s, .. } if s.contains("connected") && s.contains("s-beta"))
-            ),
-            "the connected annotation is painted"
-        );
-    }
-
-    /// The Configure and Disconnect pickers list connections only, so no row
-    /// repeats ` · connected`; the Connect picker keeps it (the test above).
-    #[test]
-    fn only_the_connect_picker_marks_connected_rows() {
-        let p = SessionPickerState::new(
-            crate::WindowId(0),
-            Some(SessionId::new("s-self")),
-            "me".to_string(),
-            PickerIntent::Configure,
-            rows(),
-        );
-        let lines: Vec<String> = p.rows.iter().map(|r| p.row_line(r)).collect();
-        assert!(lines.iter().all(|l| !l.contains("connected")), "{lines:?}");
     }
 
     /// The new-identity row creates only a name `parse_name` takes that is not
@@ -897,8 +751,6 @@ mod tests {
     fn the_new_identity_row_creates_only_an_unlisted_valid_name() {
         let mut p = SessionPickerState::new(
             crate::WindowId(0),
-            None,
-            String::new(),
             PickerIntent::NewTabWithIdentity,
             vec![
                 PickerRow::Identity {
@@ -928,11 +780,11 @@ mod tests {
         let mut p = picker();
         p.move_selection(1);
         let lines = p.controls_lines();
-        assert!(lines[0].contains("intent=connect") && lines[0].contains("subject=s-self"));
+        assert!(lines[0].contains("intent=new-tab-identity"), "{lines:?}");
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("sid=s-beta") && l.contains("selected=true")),
+                .any(|l| l.contains("identity=review") && l.contains("selected=true")),
             "{lines:?}"
         );
         // Fingerprint tracks the cursor (repaint-key law), nonzero.

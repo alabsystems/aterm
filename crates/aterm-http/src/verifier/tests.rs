@@ -9,16 +9,24 @@
 //! * **Apple arm** — fully exercised here, accept and reject, offline.
 //! * **Unix arm** — exercised by the same corpus on a Unix host (the `webpki`
 //!   column); its `/etc/ssl/certs` DISCOVERY half is `verifier::unix`'s.
-//! * **Windows arm** — not exercised here.
+//! * **Windows arm** — exercised by the same corpus on a Windows host (the
+//!   `windows` column, first measured on Windows 11 26200, 2026-10-17).
 //!
 //! # Two places the platforms genuinely disagree
 //!
-//! Each case records BOTH expectations and the assertion picks by platform:
+//! Each case records every platform's expectation and the assertion picks by
+//! platform:
 //!
 //! * a leaf with **no `extendedKeyUsage` at all** — RFC 5280 reads an absent EKU
-//!   as unconstrained and webpki follows it; Apple requires an explicit
+//!   as unconstrained and webpki and crypt32 follow it; Apple requires an explicit
 //!   `id-kp-serverAuth`;
 //! * a leaf whose `keyUsage` lacks `digitalSignature`.
+//!
+//! Windows also NAMES two rejections its own way: a leaf under a CA:FALSE issuer
+//! as a wrong usage (`CERT_E_WRONG_USAGE`), and a broken signature as an unmapped
+//! rejection (`TRUST_E_CERT_SIGNATURE`). Both stay rejections. The one place it
+//! ACCEPTED where the others refuse — a leaf with no subjectAltName, matched on its
+//! CN — is closed in `verifier::windows`.
 //!
 //! [`extra_anchors_add_to_the_system_set_rather_than_replacing_it`] exists
 //! because `SecTrustSetAnchorCertificatesOnly(true)` instead of `false` is
@@ -40,7 +48,7 @@ use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
 use super::PlatformVerifier;
-use super::test_platform::trust_service_silent;
+use super::test_platform::require_trust_service;
 
 // --- fixtures --------------------------------------------------------------
 // See `src/testdata/tls/README.md` for what each one is and `PROVENANCE.md`
@@ -169,6 +177,8 @@ struct Case {
     apple: Outcome,
     /// What the webpki chain math (the Unix arm) does with it. MEASURED.
     webpki: Outcome,
+    /// What crypt32 (the Windows arm) does with it. MEASURED (Windows 11 26200).
+    windows: Outcome,
 }
 
 impl Case {
@@ -176,6 +186,8 @@ impl Case {
     fn expected(&self) -> Outcome {
         if cfg!(target_vendor = "apple") {
             self.apple
+        } else if cfg!(windows) {
+            self.windows
         } else {
             self.webpki
         }
@@ -214,6 +226,7 @@ const CORPUS: &[Case] = &[
         now: T26,
         apple: Outcome::Accept,
         webpki: Outcome::Accept,
+        windows: Outcome::Accept,
     },
     Case {
         what: "the SAME bytes, evaluated after the window closes",
@@ -222,6 +235,7 @@ const CORPUS: &[Case] = &[
         now: T27,
         apple: Outcome::Rejected,
         webpki: Outcome::Rejected,
+        windows: Outcome::Rejected,
     },
     Case {
         what: "the SAME bytes, evaluated before the window opens",
@@ -230,6 +244,7 @@ const CORPUS: &[Case] = &[
         now: T25,
         apple: Outcome::Rejected,
         webpki: Outcome::Rejected,
+        windows: Outcome::Rejected,
     },
     // --- expiry, from both sides ---
     Case {
@@ -239,6 +254,7 @@ const CORPUS: &[Case] = &[
         now: T26,
         apple: Outcome::Rejected,
         webpki: Outcome::Rejected,
+        windows: Outcome::Rejected,
     },
     Case {
         what: "the same expired leaf, at a now INSIDE its window",
@@ -247,6 +263,7 @@ const CORPUS: &[Case] = &[
         now: T25,
         apple: Outcome::Accept,
         webpki: Outcome::Accept,
+        windows: Outcome::Accept,
     },
     Case {
         what: "a not-yet-valid leaf, at a now before its notBefore",
@@ -255,6 +272,7 @@ const CORPUS: &[Case] = &[
         now: T26,
         apple: Outcome::Rejected,
         webpki: Outcome::Rejected,
+        windows: Outcome::Rejected,
     },
     Case {
         what: "the same not-yet-valid leaf, at a now INSIDE its window",
@@ -263,6 +281,7 @@ const CORPUS: &[Case] = &[
         now: T27,
         apple: Outcome::Accept,
         webpki: Outcome::Accept,
+        windows: Outcome::Accept,
     },
     // --- names ---
     Case {
@@ -272,6 +291,7 @@ const CORPUS: &[Case] = &[
         now: T26,
         apple: Outcome::NotValidForName,
         webpki: Outcome::NotValidForName,
+        windows: Outcome::NotValidForName,
     },
     Case {
         what: "the same leaf, asked for the name it actually carries",
@@ -280,6 +300,7 @@ const CORPUS: &[Case] = &[
         now: T26,
         apple: Outcome::Accept,
         webpki: Outcome::Accept,
+        windows: Outcome::Accept,
     },
     Case {
         what: "a leaf with a common name but NO subjectAltName",
@@ -288,6 +309,7 @@ const CORPUS: &[Case] = &[
         now: T26,
         apple: Outcome::NotValidForName,
         webpki: Outcome::NotValidForName,
+        windows: Outcome::NotValidForName,
     },
     Case {
         what: "a leaf whose only SAN is an IP address, dialled by that IP",
@@ -296,6 +318,7 @@ const CORPUS: &[Case] = &[
         now: T26,
         apple: Outcome::Accept,
         webpki: Outcome::Accept,
+        windows: Outcome::Accept,
     },
     Case {
         what: "the same leaf, dialled by a DIFFERENT IP",
@@ -304,6 +327,7 @@ const CORPUS: &[Case] = &[
         now: T26,
         apple: Outcome::NotValidForName,
         webpki: Outcome::NotValidForName,
+        windows: Outcome::NotValidForName,
     },
     // --- chain construction ---
     Case {
@@ -313,6 +337,7 @@ const CORPUS: &[Case] = &[
         now: T26,
         apple: Outcome::Accept,
         webpki: Outcome::Accept,
+        windows: Outcome::Accept,
     },
     Case {
         what: "the same leaf with the intermediate OMITTED",
@@ -321,6 +346,7 @@ const CORPUS: &[Case] = &[
         now: T26,
         apple: Outcome::UnknownIssuer,
         webpki: Outcome::UnknownIssuer,
+        windows: Outcome::UnknownIssuer,
     },
     Case {
         what: "a leaf signed by a CA:FALSE certificate",
@@ -329,6 +355,7 @@ const CORPUS: &[Case] = &[
         now: T26,
         apple: Outcome::Rejected,
         webpki: Outcome::Rejected,
+        windows: Outcome::Eku,
     },
     Case {
         what: "a leaf that is its own issuer",
@@ -337,6 +364,7 @@ const CORPUS: &[Case] = &[
         now: T26,
         apple: Outcome::Rejected,
         webpki: Outcome::UnknownIssuer,
+        windows: Outcome::UnknownIssuer,
     },
     // --- signature integrity: the trap for a verifier that never checks it ---
     Case {
@@ -346,6 +374,7 @@ const CORPUS: &[Case] = &[
         now: T26,
         apple: Outcome::UnknownIssuer,
         webpki: Outcome::BadSignature,
+        windows: Outcome::Rejected,
     },
     Case {
         what: "the good leaf with a SAN byte rewritten inside the signed body",
@@ -354,6 +383,7 @@ const CORPUS: &[Case] = &[
         now: T26,
         apple: Outcome::UnknownIssuer,
         webpki: Outcome::BadSignature,
+        windows: Outcome::Rejected,
     },
     // --- purpose ---
     Case {
@@ -363,6 +393,7 @@ const CORPUS: &[Case] = &[
         now: T26,
         apple: Outcome::Eku,
         webpki: Outcome::Eku,
+        windows: Outcome::Eku,
     },
     Case {
         what: "a leaf with NO extendedKeyUsage extension (the platforms differ)",
@@ -371,6 +402,7 @@ const CORPUS: &[Case] = &[
         now: T26,
         apple: Outcome::Eku,
         webpki: Outcome::Accept,
+        windows: Outcome::Accept,
     },
     Case {
         what: "a leaf whose keyUsage omits digitalSignature",
@@ -379,6 +411,7 @@ const CORPUS: &[Case] = &[
         now: T26,
         apple: Outcome::Accept,
         webpki: Outcome::Accept,
+        windows: Outcome::Accept,
     },
     // --- the wrong-reason control ---
     Case {
@@ -388,6 +421,7 @@ const CORPUS: &[Case] = &[
         now: T26,
         apple: Outcome::BadEncoding,
         webpki: Outcome::BadEncoding,
+        windows: Outcome::BadEncoding,
     },
 ];
 
@@ -398,27 +432,23 @@ const CORPUS: &[Case] = &[
 const UNANCHORED_GITHUB: &str = "this machine's trust store did not validate the captured \
      github.com chain; see src/testdata/tls/README.md for recapture";
 
-/// The verifier over the fixture root. A target with no platform verifier
-/// ends COULD NOT RUN; `None`, after the shared skip line, only where the
-/// platform's certificate service does not answer ([`trust_service_silent`]).
-fn mine() -> Option<PlatformVerifier> {
+/// The verifier over the fixture root. A target with no platform verifier,
+/// or whose certificate service does not answer ([`require_trust_service`]),
+/// ends COULD NOT RUN.
+fn mine() -> PlatformVerifier {
     let mine = PlatformVerifier::new_with_extra_roots(vec![der(ROOT)], provider()).unwrap_or_else(
         |error| {
             aterm_spec::host::could_not_run(format!("no platform verifier on this target: {error}"))
         },
     );
-    if trust_service_silent() {
-        return None;
-    }
-    Some(mine)
+    require_trust_service();
+    mine
 }
 
 #[test]
 fn the_first_party_verifier_matches_its_recorded_expectations() {
     // The table was measured, not predicted.
-    let Some(mine) = mine() else {
-        return;
-    };
+    let mine = mine();
     let mut wrong = Vec::new();
     for case in CORPUS {
         let got = case.run(&mine);
@@ -446,9 +476,7 @@ fn the_shipped_constructor_trusts_no_fixture_anchor() {
     // The stronger half of this guarantee is structural rather than behavioural:
     // `new_with_extra_roots` is `#[cfg(test)]`, so no non-test caller can name
     // it and the compiler enforces that. This is the behavioural half.
-    if trust_service_silent() {
-        return;
-    }
+    require_trust_service();
     let shipped = match PlatformVerifier::new(provider()) {
         Ok(verifier) => verifier,
         Err(error) => aterm_spec::host::could_not_run(format!(
@@ -462,6 +490,7 @@ fn the_shipped_constructor_trusts_no_fixture_anchor() {
         now: T26,
         apple: Outcome::UnknownIssuer,
         webpki: Outcome::UnknownIssuer,
+        windows: Outcome::UnknownIssuer,
     };
     let got = case.run(&shipped);
     assert!(
@@ -472,12 +501,10 @@ fn the_shipped_constructor_trusts_no_fixture_anchor() {
     // ...and the SAME chain accepts once the anchor is supplied, which proves
     // the rejection above is about the anchor set and not about the fixture
     // being broken in some other way.
-    if let Some(mine) = mine() {
-        assert!(
-            case.run(&mine).accepted(),
-            "the fixture chain must be good; only its anchor is missing"
-        );
-    }
+    assert!(
+        case.run(&mine()).accepted(),
+        "the fixture chain must be good; only its anchor is missing"
+    );
 }
 
 #[test]
@@ -498,6 +525,7 @@ fn the_system_trust_store_is_actually_consulted() {
         now: T_GH,
         apple: Outcome::Accept,
         webpki: Outcome::Accept,
+        windows: Outcome::Accept,
     };
     let wrong_name = Case {
         what: "the same chain, asked for a name it does not carry",
@@ -506,14 +534,13 @@ fn the_system_trust_store_is_actually_consulted() {
         now: T_GH,
         apple: Outcome::NotValidForName,
         webpki: Outcome::NotValidForName,
+        windows: Outcome::NotValidForName,
     };
 
     let mine = PlatformVerifier::new(provider()).unwrap_or_else(|error| {
         aterm_spec::host::could_not_run(format!("no system trust store on this target: {error}"))
     });
-    if trust_service_silent() {
-        return;
-    }
+    require_trust_service();
     assert!(
         !wrong_name.run(&mine).accepted(),
         "a real chain was accepted for a name it does not carry"
@@ -546,8 +573,9 @@ fn extra_anchors_add_to_the_system_set_rather_than_replacing_it() {
         now: T_GH,
         apple: Outcome::Accept,
         webpki: Outcome::Accept,
+        windows: Outcome::Accept,
     };
-    let Some(mine) = mine() else { return };
+    let mine = mine();
     // Off Apple, a store without the github.com anchor cannot tell add from
     // replace: COULD NOT RUN, never a pass.
     let accepted = chain.run(&mine).accepted();
@@ -565,7 +593,7 @@ fn a_parse_failure_is_reported_as_one_and_never_as_a_trust_verdict() {
     // If `BadEncoding` were reported as an ordinary rejection, a future change
     // that broke DER handling would look like a suite full of healthy reject
     // cases. It is called out separately for exactly that reason.
-    let Some(mine) = mine() else { return };
+    let mine = mine();
     for (what, bytes) in [
         ("nine bytes of garbage", MALFORMED),
         ("no bytes at all", &[] as &[u8]),
@@ -577,6 +605,7 @@ fn a_parse_failure_is_reported_as_one_and_never_as_a_trust_verdict() {
             now: T26,
             apple: Outcome::BadEncoding,
             webpki: Outcome::BadEncoding,
+            windows: Outcome::BadEncoding,
         };
         let chain = [CertificateDer::from(bytes.to_vec())];
         let name = ServerName::try_from(HOST).unwrap();
@@ -609,9 +638,7 @@ fn a_degenerate_server_name_fails_closed_instead_of_disabling_name_checking() {
     // What is asserted here is the adjacent value a refactor is most likely to
     // let through — the EMPTY name — plus the fact that name checking is on at
     // all. Neither may accept.
-    let Some(mine) = mine() else {
-        return;
-    };
+    let mine = mine();
 
     // Name checking is live: a certificate for another name is refused.
     let mismatch = Case {
@@ -621,6 +648,7 @@ fn a_degenerate_server_name_fails_closed_instead_of_disabling_name_checking() {
         now: T26,
         apple: Outcome::NotValidForName,
         webpki: Outcome::NotValidForName,
+        windows: Outcome::NotValidForName,
     };
     assert!(
         !mismatch.run(&mine).accepted(),

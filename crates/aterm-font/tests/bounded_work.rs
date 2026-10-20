@@ -116,6 +116,34 @@ fn varied_composite_work_is_shared_across_sibling_components() {
     refuses_expansion(&composite_face(true), GlyphId(24));
 }
 
+/// The measurement seam (`take_spent`, debug builds; the recorder's
+/// `budgets` mode reads it) counts the budget's own steps: an ordinary glyph
+/// reads what it took, a refused expansion more than the budget, and each
+/// read starts the count again.
+#[test]
+fn spent_counts_the_outline_budget_steps() {
+    let bytes = composite_face(false);
+    let face = Face::parse(&bytes, 0).expect("the synthetic face parses");
+    let _ = aterm_font::take_spent();
+    assert!(
+        face.outline_glyph(GlyphId(0), &mut Guard::default())
+            .is_some()
+    );
+    let ordinary = aterm_font::take_spent().outline_steps;
+    assert!((1..64).contains(&ordinary), "the triangle took {ordinary}");
+    // One composite level more is one glyph entry per component, and the
+    // child's own steps twice.
+    assert!(
+        face.outline_glyph(GlyphId(1), &mut Guard::default())
+            .is_some()
+    );
+    assert_eq!(aterm_font::take_spent().outline_steps, 1 + 2 * ordinary);
+    assert_eq!(face.outline_glyph(GlyphId(24), &mut Guard::default()), None);
+    let refused = aterm_font::take_spent().outline_steps;
+    assert!(refused > 65_536, "the refused expansion read {refused}");
+    assert_eq!(aterm_font::take_spent(), aterm_font::Spent::default());
+}
+
 /// Work exhaustion must not change gvar's existing answer for an ordinary
 /// composite whose nonempty component is followed by a zero-contour one.
 #[test]
@@ -135,7 +163,8 @@ fn a_zero_contour_component_keeps_the_existing_varied_outline_answer() {
     assert!(face.glyph_bounding_box(GlyphId(0)).is_some());
 }
 
-fn index(items: &[Vec<u8>], cff2: bool) -> Vec<u8> {
+/// A CFF INDEX of `items` (CFF2's 32-bit count when `cff2`), 2-byte offsets.
+pub(crate) fn index(items: &[Vec<u8>], cff2: bool) -> Vec<u8> {
     let mut data = if cff2 {
         u32::try_from(items.len()).unwrap().to_be_bytes().to_vec()
     } else {

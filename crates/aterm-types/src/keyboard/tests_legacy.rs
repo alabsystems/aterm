@@ -609,7 +609,10 @@ fn legacy_numpad_begin_is_the_xterm_letter_form_never_a_digit() {
 /// NumLock does not cancel DECKPAM: it is a lock, not a chord. A physical keypad types digits
 /// only with NumLock on, so letting it cancel application mode would put DECKPAM's `SS3 p..y`
 /// out of a keyboard's reach. Under `smkx` programs (vim, less, tmux) the keypad digits send
-/// `SS3 p..y`, as xterm does; vim maps them back, less does not.
+/// `SS3 p..y`, as VTE does; xterm's default (`numLock: true`) lets NumLock cancel DECKPAM, and
+/// vim maps most of them back but takes keypad 3 and 9 as PageDown and PageUp (terminfo `kc3`,
+/// `ka3`). Behind a Windows console host in win32-input-mode the keypad is its key records
+/// instead, DECKPAM or not (`encode_win32_keys`).
 #[test]
 fn legacy_numpad_digit_under_app_keypad_ignores_num_lock() {
     let kp5 = Key::Named(NamedKey::Numpad5);

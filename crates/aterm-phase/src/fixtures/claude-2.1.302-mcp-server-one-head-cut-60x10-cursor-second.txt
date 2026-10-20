@@ -1,0 +1,10 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (60x10, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the single-server .mcp.json approval dialog (one new server lab-probe), Up once from its default (`Continue without using this MCP server`), the pane 60x10 (`ctl resize 10 60`): its head off the screen, the Select (two options shown in this pane) scrolled to the first two, the cursor's on the second over the vendor's arrow, nothing under it
+
+  MCP servers may execute code or access system resources.
+  All tool calls require approval. Learn more in the MCP
+  documentation.
+
+    Use this MCP server
+  ❯ Use this and all future MCP servers in this project
+
+  Enter to confirm · Esc to cancel

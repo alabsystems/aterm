@@ -880,6 +880,9 @@ pub(crate) struct JournalAppendPlan {
     /// A legacy journal the host must retire before this append publishes
     /// (`native_document_journal::LegacyJournal`); bound with `expected_image`.
     pub(crate) retire_legacy: Option<crate::native_document_journal::LegacyJournal>,
+    /// Named on the image this append publishes; bound with `expected_image`
+    /// (`native_document_journal::DraftJournalHost::owner_id`).
+    pub(crate) owner: Option<crate::native_document_journal::JournalOwnerId>,
     pub(crate) bytes: Arc<[u8]>,
     pub(crate) encoded_fingerprint: ContentFingerprint,
 }
@@ -1081,6 +1084,7 @@ impl DraftJournalReducer {
             target_seq,
             expected_image: None,
             retire_legacy: None,
+            owner: None,
             encoded_fingerprint: ContentFingerprint::of(&bytes),
             bytes,
         };

@@ -6,7 +6,8 @@
 
 // Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
 // Bridge public handle ids to windows-sys 0.61 using typed conversion helpers; drop the
-// unused physicalkey_to_scancode export; take `SmolStr` from `crate::keyboard`.
+// unused physicalkey_to_scancode export; take `SmolStr` from `crate::keyboard`; add the
+// `recorded` key-message replay (tests and debug builds).
 
 use crate::keyboard::SmolStr;
 use windows_sys::Win32::Foundation::HWND;
@@ -207,5 +208,8 @@ mod keyboard;
 mod keyboard_layout;
 mod monitor;
 mod raw_input;
+// aterm: recorded key messages replayed through the key path (tests and debug builds).
+#[cfg(any(test, debug_assertions))]
+pub mod recorded;
 mod window;
 mod window_state;

@@ -150,65 +150,98 @@ impl TerminalHandler<'_> {
     }
 
     /// Handle OSC 7 current working directory (`OSC 7 ; file://host/path ST`):
-    /// extract and percent-decode the path, and apply it, or hold it for the
-    /// shell's next prompt while the authenticated shell sits at its prompt
-    /// ([`Self::reported_cwd_waits_for_prompt`]).
+    /// a report no one signed ([`Self::report_cwd`]). `params[1..]` is the URI,
+    /// which the parser split at its literal semicolons.
     pub(super) fn handle_osc_7(&mut self, params: &[&[u8]]) {
-        let Some(report) = Self::osc_7_report(params) else {
+        self.report_cwd(params.get(1..).unwrap_or_default(), false);
+    }
+
+    /// Apply a cwd report (`uri`, a `file://host/path` split at its literal
+    /// semicolons; percent-decoded here), unless the authenticated shell sits at
+    /// its prompt ([`Self::shell_sits_at_prompt`]) and did not sign it.
+    ///
+    /// The shell signs its own report as it signs its marks: right before its
+    /// OSC 7 it sends the same URI as the property
+    /// `633;P;AtermCwd=<uri>;id=<nonce>` (`aterm_shell_integration::CWD_REPORT_KEY`),
+    /// so `signed` says the nonce gate verified it, and its OSC 7 then names the
+    /// folder already stored. A signed report is the shell's word: it lands at
+    /// once, whatever the phase, and drops a report held at the prompt and a
+    /// job's restore. One no one signed while the shell sits at its prompt is a
+    /// program's: it lands while the host says a program holds the foreground
+    /// (`Terminal::set_foreground_job`) or runs a program the shell started since
+    /// its prompt where that word cannot see it (`Terminal::set_program_probe`),
+    /// and the cwd it replaced comes back when the program is gone. Otherwise it
+    /// is a background job's output or the prompt's own text, never the shell's:
+    /// dropped from a shell that signs its reports, held for the next `A` from
+    /// one that does not (an integration from before the signature).
+    pub(super) fn report_cwd(&mut self, uri: &[&[u8]], signed: bool) {
+        if signed {
+            self.shell.signs_cwd = true;
+            self.shell.held_cwd = None;
+            self.shell.cwd_before_job = None;
+        }
+        let Some(mut report) = Self::osc_7_report(uri) else {
             return;
         };
-        if self.reported_cwd_waits_for_prompt() {
+        let unchanged = report.path.as_deref() == self.current_working_directory.as_deref()
+            && report.host == self.shell.cwd_host;
+        if signed {
+            // At every prompt, the folder unchanged: nothing to tell the host.
+            if unchanged {
+                report.event = None;
+            }
+            self.apply_cwd_report(report);
+        } else if unchanged && self.shell.signs_cwd {
+            // A shell that signs its reports already said this one: its own
+            // OSC 7 right after its signed word (or a program naming the same
+            // folder) changes nothing, and asks the host nothing.
+        } else if !self.shell_sits_at_prompt() {
+            self.apply_cwd_report(report);
+        } else if self.shell.foreground_job || self.shell.program_runs_since_prompt() {
+            if self.shell.cwd_before_job.is_none() {
+                self.shell.cwd_before_job = super::shell::CwdReport::of(
+                    self.current_working_directory.as_deref(),
+                    self.shell.cwd_host.as_deref(),
+                );
+            }
+            self.apply_cwd_report(report);
+        } else if !self.shell.signs_cwd {
             // The latest report wins: the shell's own comes last, right
             // before its prompt start.
             self.shell.held_cwd = Some(report);
-        } else {
-            self.apply_cwd_report(report);
         }
     }
 
-    /// What an OSC 7 does to the reported cwd, or `None` when it leaves it
-    /// unchanged (a non-file:// URI, an unstorable path).
-    fn osc_7_report(params: &[&[u8]]) -> Option<super::shell::CwdReport> {
-        // params[0] = "7"; params[1..] = the URI. URIs may contain literal
-        // semicolons (RFC 3986 §3.3), which the parser splits: rejoin with ";".
-        // A missing, empty or non-UTF-8 URI clears the cwd.
-        let uri_bytes = params.get(1..).unwrap_or_default().join(&b';');
+    /// What an OSC 7 whose URI is `uri` (split at its literal semicolons)
+    /// does to the reported cwd, or `None` when it leaves it unchanged (a
+    /// non-file:// URI, an unstorable path).
+    fn osc_7_report(uri: &[&[u8]]) -> Option<super::shell::CwdReport> {
+        // URIs may contain literal semicolons (RFC 3986 §3.3), which the
+        // parser splits: rejoin with ";". A missing, empty or non-UTF-8 URI
+        // clears the cwd.
+        let uri_bytes = uri.join(&b';');
         let uri = std::str::from_utf8(&uri_bytes).unwrap_or_default();
         if uri.is_empty() {
-            return Some(super::shell::CwdReport {
-                event: None,
-                path: None,
-                host: None,
-            });
+            return super::shell::CwdReport::of(None, None);
         }
 
         // A non-file:// URI leaves the cwd unchanged.
         let (host, path) = Self::parse_file_uri(uri)?;
         // A non-local RFC 8089 host (Windows UNC `file://server/share/dir`, an
-        // SSH remote) must reach the embedder: queue it as `//host/path`, which
-        // Windows accepts natively. An empty host or "localhost" keeps the bare
-        // decoded path. The engine cannot know its own hostname (wasm has none),
-        // so the consumer decides whether a named host is local.
-        let event = match &host {
-            Some(h) => format!("//{h}{path}"),
-            None => path.clone(),
-        };
-        // Refuse an unstorable path before it is queued or stored (the parser
-        // admits up to MAX_OSC_DATA, 8 MiB).
-        if !reported_cwd_is_storable(&event) {
-            return None;
-        }
+        // SSH remote) must reach the embedder: the event is `//host/path`,
+        // which Windows accepts natively. An empty host or "localhost" keeps
+        // the bare decoded path. The engine cannot know its own hostname (wasm
+        // has none), so the consumer decides whether a named host is local.
+        // An unstorable event is refused before it is queued or stored (the
+        // parser admits up to MAX_OSC_DATA, 8 MiB).
+        //
         // The stored cwd and command marks keep the plain decoded path: shells
         // often report their own hostname for a local cwd, and local-path
         // consumers (spawn-in-cwd, the `cwd` verb) need a real local directory.
         // The host is stored beside it (`Terminal::reported_cwd_host`): only
         // the embedder knows its own name, so only it can tell a remote
         // shell's directory from this machine's.
-        Some(super::shell::CwdReport {
-            event: Some(event),
-            path: Some(path),
-            host,
-        })
+        super::shell::CwdReport::of(Some(&path), host.as_deref())
     }
 
     /// Apply an OSC 7 report: queue its real parsed cwd (host-preserving) for
@@ -496,7 +529,7 @@ impl TerminalHandler<'_> {
 ///   megabytes in the count-capped cwd/event fields;
 /// - no NUL byte: no directory name contains one (OSC 7's decode turns `%00`
 ///   into `\0`), and the seamless-update wire refuses a cwd holding one.
-fn reported_cwd_is_storable(path: &str) -> bool {
+pub(super) fn reported_cwd_is_storable(path: &str) -> bool {
     path.len() <= MAX_CWD_PATH_BYTES && !path.contains('\0')
 }
 

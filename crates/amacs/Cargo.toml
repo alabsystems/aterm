@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "amacs"
+# Integration tests are declared below, not discovered: every file is a module
+# of the one `amacs_suite` binary. With autotests off a `tests/*.rs` file listed
+# nowhere never compiles. The engine's own tests live in its source files.
+autotests = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The headless reducer, document store and rope behind aterm's native Editor, the one input reducer its keys go through, and the `edit` request and file-URI wire forms aterm-gui serves. Further amacs faces and protocols are planned in docs/DESIGN-amacs-2026-10-19.md."
+
+[dependencies]
+# The editor's grapheme and width rules, and the rope's chunked buffer.
+aterm-buffer = { path = "../aterm-buffer" }
+aterm-grapheme = { workspace = true }
+# The document store's write capability; the engine never mints one.
+aterm-cap = { workspace = true }
+# The key vocabulary (`Key`, `Modifiers`) the input reducer reads.
+aterm-types = { workspace = true }
+
+[dev-dependencies]
+# The engine's tests mint a root authority for the store's write cap; only a
+# test may, below the launchers (the `launcher-mint` guard).
+aterm-cap = { workspace = true, features = ["launcher-mint"] }
+# The engine's Tier-1 binds to its derived models.
+aterm-spec = { workspace = true }
+aterm-models-native = { workspace = true }
+# The editor's smart-selection test drives the engine's word rules.
+aterm-core = { workspace = true }
+
+[[test]]
+name = "amacs_suite"
+path = "tests/amacs_suite.rs"
+
+[lints]
+workspace = true

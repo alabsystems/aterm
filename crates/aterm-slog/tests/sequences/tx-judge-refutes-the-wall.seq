@@ -1,0 +1,57 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# S2: a refutation closes the wall retracted at exact, its need with it, and
+# disarms its settle: however long the screen still shows the wall, the turn
+# stays open; the latch lifts with the word, and the idle settles it done.
+bind 0
+see busy
+see wall:usage-session
+tx wall usage-session refute
+expect close p1 wall out=retracted by=vendor src=transcript conf=exact
+expect need=none
+expect wake=none
+expect tx refuted=usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+expect turn=open
+see idle
+expect tx refuted=none
+wait 1000
+expect close t1 turn out=done walls=1 src=screen at=10000

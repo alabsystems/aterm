@@ -204,7 +204,7 @@ fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
     let ended = |clock, passed, over| {
         super::autopilot_timer_ended("s-1", "in tab 3", clock, passed, over, TODAY)
     };
-    let turned = "Tab 3: at 18:00 the word turned land; ";
+    let turned = "Tab 3: at 18:00 Autopilot switched to land; ";
     for (over, then) in [
         (
             FireOver::Work,
@@ -242,13 +242,24 @@ fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
             "this aterm has no control socket, so nothing is landed".to_string(),
         ),
         (
-            FireOver::NoAgent,
+            FireOver::NoAgent { split: false },
             "no agent runs in the tab, so there is nothing to land".to_string(),
+        ),
+        (
+            FireOver::NoAgent { split: true },
+            "no agent runs in this pane, so there is nothing to land".to_string(),
         ),
     ] {
         let msg = ended(Some("18:00"), None, over);
-        assert_eq!(msg.title, "Autopilot began landing", "{over:?}");
+        // One title true over every fire, in the chip's and the menu's
+        // words (owner-eye-8): never `began landing` over nothing landed,
+        // never the setting's own name for its value (`the word`).
+        assert_eq!(msg.title, "Autopilot switched to land", "{over:?}");
         assert_eq!(msg.detail, [format!("{turned}{then}")], "{over:?}");
+        assert!(
+            !msg.detail[0].contains("the word") && !msg.title.contains("landing"),
+            "{over:?}: {msg:?}"
+        );
         assert_eq!(
             then.contains("wraps the work up"),
             over == FireOver::Work,
@@ -280,7 +291,8 @@ fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
     assert_eq!(
         unzoned.detail,
         [
-            "Tab 3: the word turned land; the harness wraps the work up at its next point, then stops"
+            "Tab 3: Autopilot switched to land; the harness wraps the work up at its next point, \
+             then stops"
         ]
     );
     titles.push(unzoned.title);
@@ -926,20 +938,37 @@ fn every_reporter_message() -> Vec<Message> {
                 action: "Run aterm harness accounts login pool-a.".to_string(),
                 clears: "the login signed in again, an account to move to, or the agent working",
                 escalated: false,
+                notice: None,
             },
         ));
+        // Every notice the loop raises, at the longest label and clause.
+        for text in aterm_agent::supervise::policy::notice::ALL {
+            all.push(resume_ask(
+                "s-0123456789abcdef",
+                &UpgradeSpot {
+                    place: place.to_string(),
+                    nav: None,
+                },
+                &Exception::of_notice(
+                    text,
+                    Some(&"a".repeat(aterm_agent::harness::accounts::LABEL_MAX)),
+                    Some("its typing budget for the hour is spent"),
+                    "the agent working",
+                ),
+            ));
+        }
     }
     all.push(a11y_publisher_dead("Server GUID mismatch", true));
     all.push(a11y_publisher_dead("Server GUID mismatch", false));
     all.push(presence_not_saved(
-        "presence.band",
-        "Presence Band",
+        "presence.rim",
+        "Show Needs in Windows",
         "the write was refused",
         false,
     ));
     all.push(presence_not_saved(
         "presence.rim",
-        "Presence Rim",
+        "Show Needs in Windows",
         "the write could not be verified",
         true,
     ));
@@ -953,15 +982,17 @@ fn every_reporter_message() -> Vec<Message> {
         "the write could not be verified",
         true,
     ));
-    all.push(fleet_hold(true, "main%20broken"));
-    all.push(fleet_hold(false, "main%20broken"));
-    all.push(fleet_hold(false, crate::fabric::FABRIC_LOST));
     for view in crate::autopilot::AutopilotView::ALL {
         all.push(autopilot_set("s-1", "in tab 2", view, true, None));
         all.push(autopilot_set("s-1", "in its tab", view, false, None));
     }
     all.push(hold_refused(true, "no session"));
     all.push(hold_refused(false, "no session"));
+    all.push(stop_worker_failed("bench", "no foreground process group"));
+    all.push(stop_worker_nothing(
+        "bench",
+        "its task is not running: nothing was stopped",
+    ));
     all.push(fabric_failure(
         "document",
         "Couldn't open the document",
@@ -973,20 +1004,21 @@ fn every_reporter_message() -> Vec<Message> {
         &["cannot spawn its thread"],
     ));
     all.push(fabric_failure(
-        "inbox",
-        "Couldn't open the inbox",
-        &["no such file"],
-    ));
-    all.push(fabric_failure(
         "status",
         "Couldn't start Fabric Status",
         &["cannot spawn its thread"],
     ));
-    all.push(fabric_status("on", "Fabric On finished", "", true));
-    all.push(fabric_status(
-        "off",
-        "Couldn't run Fabric Off",
+    all.push(cli_tab_finished("bus-on", "Message Bus On", "", true));
+    all.push(cli_tab_finished(
+        "bus-status",
+        "Message bus status",
         "exited 2",
+        true,
+    ));
+    all.push(cli_tab_finished(
+        "read-mac",
+        "Read This Mac",
+        "/x/aterm: not found",
         false,
     ));
     all.push(serious_mode_feedback(
@@ -1396,17 +1428,6 @@ fn every_reporter_message() -> Vec<Message> {
     ] {
         all.push(install_posture(posture).expect("a posture to fix"));
     }
-    for kind in [
-        crate::connections::ConnectedSpawnKind::Controlled,
-        crate::connections::ConnectedSpawnKind::Controller,
-    ] {
-        all.push(session_connection_created(
-            &crate::connections::first_use_notice_text(kind),
-        ));
-    }
-    all.push(session_connection_created(
-        &crate::connections::first_use_connect_notice_text(true, false),
-    ));
     all
 }
 
@@ -1628,7 +1649,6 @@ fn gesture_failures() -> Vec<Message> {
         shell_lost_in_update("descriptor 9 was closed"),
         restored_tab_failed("exec failed"),
         input_refused("the paste is too large \u{2014} paste it in smaller pieces"),
-        no_connection(true),
     ]
 }
 
@@ -1720,14 +1740,9 @@ fn the_rest_of_the_retired_toast_is_rows_only_where_there_is_something_to_fix() 
         assert!(row.actions.is_empty(), "{posture:?}");
         assert_eq!(row.key.as_deref(), Some(KEY_INSTALL_POSTURE));
     }
-    for record in [
-        file_access_granted(),
-        session_connection_created(&crate::connections::first_use_notice_text(
-            crate::connections::ConnectedSpawnKind::Controlled,
-        )),
-    ] {
-        assert_eq!(record.hold, Hold::LogOnly, "{record:?}");
-    }
+    // R17 is a record (R20 went with the sealed seed, Phase 5; R22 with the
+    // connection card).
+    assert_eq!(file_access_granted().hold, Hold::LogOnly);
     assert_eq!(file_access_granted().key.as_deref(), Some(KEY_FILE_ACCESS));
     // A dialog the card is not about: a record per service, naming the tab.
     let dialog = consent_dialog_record("MediaLibrary", "the music and media library", Some(3));
@@ -2087,6 +2102,78 @@ fn a_restored_codex_that_did_not_come_back_is_said_as_codex() {
     );
 }
 
+/// A RESTORED AGY THAT DID NOT COME BACK IS TOLD A COMMAND THAT RUNS: agy
+/// and its own picker (`/resume`), in its own name. The row carries no
+/// conversation id, and a bare `agy --conversation` — what it said before —
+/// is refused by agy (`flag needs an argument: -conversation`, exit 2,
+/// checked live on 1.4.2). NEGATIVE CONTROL: no line, step or mixed row
+/// names `--conversation` without its id.
+#[test]
+fn a_restored_agy_that_did_not_come_back_is_told_a_command_that_runs() {
+    use aterm_agent::harness::relaunch::Outcome;
+    use aterm_agent::harness::upgrade::Agent;
+    let one = restored_agents_not_resumed(
+        &[(
+            "in tab 2".to_string(),
+            Agent::Agy,
+            Outcome::NotYet("wait:resume".into()),
+        )],
+        None,
+    );
+    assert_eq!(one.title, "Couldn't resume Antigravity CLI in tab 2");
+    assert_eq!(
+        one.detail[0],
+        "the relaunched agy did not come up in the tab, so its conversation did not come back \
+         after aterm stopped: type agy then /resume there to pick it up again"
+    );
+    let two = restored_agents_not_resumed(
+        &[
+            (
+                "in tab 1".to_string(),
+                Agent::Agy,
+                Outcome::Cannot("shell-gone".into()),
+            ),
+            (
+                "in tab 2".to_string(),
+                Agent::Agy,
+                Outcome::Cannot("shell-gone".into()),
+            ),
+        ],
+        None,
+    );
+    assert!(
+        two.detail[0].contains("type agy then /resume in each tab"),
+        "{:?}",
+        two.detail
+    );
+    let mixed = restored_agents_not_resumed(
+        &[
+            (
+                "in tab 1".to_string(),
+                Agent::Claude,
+                Outcome::Cannot("shell-gone".into()),
+            ),
+            (
+                "in tab 2".to_string(),
+                Agent::Agy,
+                Outcome::Cannot("shell-gone".into()),
+            ),
+        ],
+        None,
+    );
+    assert_eq!(
+        mixed.detail[2],
+        "in tab 2, its tab's shell had ended: type agy then /resume there"
+    );
+    for row in [&one, &two, &mixed] {
+        let words = format!("{row:?}");
+        assert!(
+            !words.contains("--conversation"),
+            "a bare flag agy refuses: {words}"
+        );
+    }
+}
+
 fn journal_note_fixtures() -> Vec<crate::crash_journal::Note> {
     let id = crate::crash_journal::JournalId { pid: 9, nanos: 9 };
     vec![
@@ -2238,6 +2325,78 @@ fn a_retired_spelling_is_a_record_and_never_counted_as_an_unknown_key() {
         crate::native_config_language::ignored_key_warnings(src).len(),
         3
     );
+}
+
+/// AN AFRESH MOVE'S BAND ROW NAMES ITS MARK'S COMMAND (ATERM-KI-1016-1): the upgrade's restart
+/// that started its agent afresh (`Row::fresh`), ended and not brought back, stands as the
+/// need its mark carries — a plain `claude`, under the home its line carried — never
+/// `claude --resume <id>`, which Claude refuses for a conversation with no message. NEGATIVE
+/// CONTROL: the same row of a move that resumed names its conversation.
+#[test]
+fn an_afresh_moves_band_row_names_its_marks_command() {
+    use aterm_agent::harness::upgrade::Phase;
+    use aterm_agent::harness::upgrade_drive::Row;
+    const NOW: u64 = 1_790_311_076;
+    let session = "0badf00d-1111-2222-3333-444455556666";
+    let row = |fresh: bool| Row {
+        session: session.into(),
+        tab: "s-b5cf2faabac5ce5127bd".into(),
+        from: "2.1.281".into(),
+        to: "2.1.283".into(),
+        behind_since: NOW - 600,
+        phase: Phase::Failed("stale-exit".into()),
+        exited_at: NOW - 60,
+        fresh,
+        ..Row::default()
+    };
+    let fresh = agent_upgrade_stalled(&row(true), NOW, "in tab 2");
+    assert!(
+        fresh.detail.contains(&"`claude`".to_string())
+            && !fresh.detail.iter().any(|l| l.contains("--resume")),
+        "{:?}",
+        fresh.detail
+    );
+    let resumed = agent_upgrade_stalled(&row(false), NOW, "in tab 2");
+    assert!(
+        resumed
+            .detail
+            .contains(&format!("`claude --resume {session}`")),
+        "{:?}",
+        resumed.detail
+    );
+}
+
+/// The person's own presses on a worker: a Take Over or Hand Back that moved
+/// nothing, and a Stop Worker the signal refused, are the gesture failing (a
+/// row for the gesture's hold, one per hold or tab, the later superseding);
+/// a stop that found nothing to stop asked for what already is, and a command
+/// read into a tab ends as a record whatever its exit, unless it left no tab.
+#[test]
+fn a_failed_worker_gesture_is_a_row_and_one_that_found_nothing_a_record() {
+    for on in [true, false] {
+        let refused = hold_refused(on, "x");
+        assert_eq!(refused.key.as_deref(), Some(KEY_FABRIC_HOLD));
+        assert_eq!(refused.severity, Severity::Warn);
+    }
+    assert_ne!(
+        hold_refused(true, "x").title,
+        hold_refused(false, "x").title,
+        "the two presses are titled apart"
+    );
+    let failed = stop_worker_failed("bench", "no foreground process group");
+    assert_eq!(failed.hold, Hold::For(HOLD_GESTURE));
+    assert_eq!(failed.severity, Severity::Warn);
+    let nothing = stop_worker_nothing("bench", "its task is not running");
+    assert_eq!(nothing.hold, Hold::LogOnly, "asked for what already is");
+    assert_eq!(nothing.severity, Severity::Info);
+    assert!(nothing.actions.is_empty(), "no step");
+    assert_eq!(nothing.key, failed.key);
+    let off = cli_tab_finished("bus-status", "Message bus status", "exited 2", true);
+    assert_eq!(off.hold, Hold::LogOnly, "a non-zero exit is a record");
+    assert_eq!(off.severity, Severity::Info);
+    let lost = cli_tab_finished("read-mac", "Read This Mac", "no binary", false);
+    assert_eq!(lost.hold, Hold::For(HOLD_GESTURE));
+    assert_ne!(lost.severity, Severity::Error);
 }
 
 /// A DIAGNOSTIC IS ONE PROBLEM, NOT ONE LINE (upstream e7dc1feee, ported
@@ -2817,11 +2976,9 @@ fn a_quiet_round_its_own_work_gave_up_on_offers_no_upgrade_now() {
 
 /// THE LOGIN LIFECYCLE'S WORDS ARE SHOWABLE (accounts v2 S7): the due line,
 /// the day's warning, the wrong account, each a valid entry whose title
-/// counts and whose detail names the labels, never an address; and the
-/// machine's renew ask, a standing Now whose one step renews every label,
-/// or the whole batch where the labels would not fit.
+/// counts and whose detail names the labels, never an address.
 #[test]
-fn the_login_lifecycle_entries_and_the_renew_ask_are_showable() {
+fn the_login_lifecycle_entries_are_showable() {
     let labels = |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
     let due = super::accounts_due_entry(&labels(&["m7-a", "pool-1"]))
         .expect("an entry")
@@ -2842,29 +2999,99 @@ fn the_login_lifecycle_entries_and_the_renew_ask_are_showable() {
         .expect("an entry")
         .message()
         .expect("a valid entry");
+    let renew = |labels: &str| {
+        aterm_agent::supervise::policy::notice::RENEWAL_WRONG_ACCOUNT
+            .fill(Some(labels), None)
+            .todo
+    };
     assert!(
-        wrong
-            .detail
-            .iter()
-            .any(|l| l == "Run aterm harness accounts renew m7-a"),
+        wrong.detail.iter().any(|l| *l == renew("m7-a")),
         "{:?}",
         wrong.detail
     );
     for text in due.detail.iter().chain(&none.detail).chain(&wrong.detail) {
         assert!(!text.contains('@'), "{text}");
     }
-    let ask = super::renew_ask(&labels(&["m7-a"]), &["in tab 3".to_string()]);
-    assert!(matches!(ask.hold, aterm_messages::Hold::Standing(_)));
-    assert_eq!(ask.key.as_deref(), Some(super::RENEW_ASK_KEY));
-    assert!(ask.title.ends_with("in tab 3"), "{}", ask.title);
-    let many: Vec<String> = (0..20).map(|i| format!("account-number-{i:02}")).collect();
-    let ask = super::renew_ask(&many, &["in tab 3".to_string(), "in tab 4".to_string()]);
-    assert!(
-        ask.detail
-            .iter()
-            .any(|l| l == "Run aterm harness accounts renew --due"),
-        "the batch where the labels do not fit: {:?}",
-        ask.detail
+    // The two accounts notices read whole: at any count of labels, what
+    // aterm did and what follows close the detail, and every line is the
+    // expanded row's sentence. NEGATIVE CONTROL: the due line's labels are
+    // its technical detail.
+    let crowd: Vec<String> = (0..40).map(|i| format!("account-number-{i:02}")).collect();
+    for (text, entry) in [
+        (
+            &aterm_agent::supervise::policy::notice::RENEWAL_WRONG_ACCOUNT,
+            super::accounts_wrong_entry(&crowd),
+        ),
+        (
+            &aterm_agent::supervise::policy::notice::ACCOUNT_SIGNED_OUT,
+            super::accounts_signed_out_entry(&crowd),
+        ),
+    ] {
+        let msg = entry.expect("an entry").message().expect("a valid entry");
+        let filled = text.fill(Some(&crowd[0]), None);
+        assert_eq!(
+            msg.detail[msg.detail.len() - 2..],
+            [filled.did, filled.expect],
+            "{}",
+            text.id
+        );
+        assert_eq!(
+            sentence_lines(msg.key.as_deref(), &msg.detail),
+            msg.detail.len(),
+            "{}",
+            text.id
+        );
+    }
+    assert_eq!(sentence_lines(due.key.as_deref(), &due.detail), 1);
+}
+
+/// EVERY NOTICE'S ASK IS ITS OWN ROW, KEYED WHOLE: at a tab id of the shape
+/// sessions have (`s-` and twenty hex digits, as the real-Claude lab's tab
+/// read on 2026-10-19), the engine keeps each notice's key as written (its
+/// cap cut `harness.resume-ask.<tab>.login-…` once, and every notice's
+/// key was one), the keys differ, and each row is the owner's four parts,
+/// the reason and the step leading, all four the expanded row's sentence.
+/// NEGATIVE CONTROL: an exception with no notice keeps the tab's own key.
+#[test]
+fn every_notices_ask_is_its_own_row_keyed_whole() {
+    let sid = "s-5f7f1e417ee76c7b52ae";
+    let spot = UpgradeSpot {
+        place: "in tab 1".to_string(),
+        nav: None,
+    };
+    let mut keys = std::collections::BTreeSet::new();
+    for text in aterm_agent::supervise::policy::notice::ALL {
+        let e = Exception::of_notice(text, Some("main"), Some("a draft is in the composer"), "x");
+        let n = e.notice.clone().expect("a notice");
+        let msg = resume_ask(sid, &spot, &e);
+        let key = notice_ask_key(sid, Some(text.code));
+        assert_eq!(msg.key.as_deref(), Some(key.as_str()), "{}", text.id);
+        assert!(keys.insert(key), "{}: a key twice", text.id);
+        assert_eq!(
+            msg.detail,
+            [e.why.clone(), e.action.clone(), n.did, n.expect],
+            "{}",
+            text.id
+        );
+        assert!(matches!(msg.need(), aterm_messages::need::Need::Now(_)));
+        assert_eq!(
+            sentence_lines(msg.key.as_deref(), &msg.detail),
+            4,
+            "{}: all four a person's words",
+            text.id
+        );
+    }
+    let plain = Exception {
+        notice: None,
+        ..Exception::of_notice(
+            &aterm_agent::supervise::policy::notice::LOGIN_SIGN_IN,
+            None,
+            None,
+            "x",
+        )
+    };
+    assert_eq!(
+        resume_ask(sid, &spot, &plain).key,
+        Some(resume_ask_key(sid))
     );
-    assert_eq!(ask.title, "Claude's login ended in 2 tabs");
 }

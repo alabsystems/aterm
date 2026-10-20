@@ -1,0 +1,14 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# S2: the judge's refutation retracts the wall and disarms its settle
+# (turn open, no wall, no wake); the vendor turn's end then closes the turn.
+see busy
+see wall:usage-session
+expect wake=1000
+judge-refutes
+expect open p1 wall
+expect close p1 wall out=retracted by=vendor src=transcript conf=exact
+expect wake=none
+expect turn=open
+expect tx refuted=usage-session
+vendor-turn
+expect close t1 turn out=done by=vendor src=transcript

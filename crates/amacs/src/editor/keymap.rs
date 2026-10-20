@@ -1,0 +1,647 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The keymap: a trie from key sequences to editor commands, and the built-in
+//! Emacs tables each face's keymap is made of (its [`Profile`]).
+
+use std::collections::BTreeMap;
+
+use super::chord::KeyChord;
+use super::command::EditorCommand;
+
+#[derive(Clone, Debug, Default)]
+struct KeyNode {
+    command: Option<EditorCommand>,
+    children: BTreeMap<KeyChord, KeyNode>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Keymap {
+    root: KeyNode,
+    profile: Profile,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyResolution {
+    Command(EditorCommand),
+    Prefix {
+        display: String,
+        reachable: Vec<String>,
+    },
+    Unbound,
+}
+
+/// One row of single chords: alternate spellings of one key for one command.
+type ChordRow = (&'static [&'static str], EditorCommand);
+
+/// The built-in single chords. A row with more than one spelling lists
+/// ALTERNATE keys for its command, and each binds as a chord of its own
+/// ([`Keymap::bind_alternatives`]); no row here is a sequence.
+const EMACS_CHORDS: &[ChordRow] = &[
+    (&["C-b"], EditorCommand::MoveBackward),
+    (&["C-f"], EditorCommand::MoveForward),
+    (&["C-p"], EditorCommand::MoveLineUp),
+    (&["C-n"], EditorCommand::MoveLineDown),
+    (&["C-a"], EditorCommand::MoveLineStart),
+    (&["C-e"], EditorCommand::MoveLineEnd),
+    // Both spellings of word motion: the emacs one and the macOS one. ⌥←/⌥→
+    // are what a Mac user reaches for; `M-b`/`M-f` are what an emacs user
+    // reaches for. This row once bound the two as a SEQUENCE (M-b, then
+    // M-left), which left M-b a dead prefix and ⌥← unbound.
+    (&["M-b", "M-left"], EditorCommand::MoveWordBackward),
+    (&["M-f", "M-right"], EditorCommand::MoveWordForward),
+    (&["Backspace"], EditorCommand::DeleteBackward),
+    // TAB indents (design D-15): native focus traversal moved to F6, and
+    // Ctrl+Tab stays the host's next tab.
+    (&["Tab"], EditorCommand::IndentForTab),
+    (&["C-d"], EditorCommand::DeleteForward),
+    (&["C-Space"], EditorCommand::SetMark),
+    (&["C-w"], EditorCommand::KillRegion),
+    (&["C-k"], EditorCommand::KillLine),
+    (&["C-y"], EditorCommand::Yank),
+    (&["M-y"], EditorCommand::YankPop),
+    (&["C-/"], EditorCommand::Undo),
+    (&["C-u"], EditorCommand::UniversalArgument),
+    (&["M-x"], EditorCommand::ExecuteCommand),
+    (&["C-s"], EditorCommand::IncrementalSearch),
+    (&["C-g"], EditorCommand::Abort),
+];
+
+/// The built-in key sequences, each one space-separated string. They are the
+/// built-in keymap's only multi-chord bindings.
+const EMACS_SEQUENCES: &[(&str, EditorCommand)] = &[
+    ("C-x u", EditorCommand::Undo),
+    ("C-x C-s", EditorCommand::Save),
+    ("C-x b", EditorCommand::SwitchBuffer),
+    ("C-x (", EditorCommand::StartMacro),
+    ("C-x )", EditorCommand::EndMacro),
+    ("C-x e", EditorCommand::PlayMacro),
+    ("M-g g", EditorCommand::GotoLine),
+];
+
+/// Off macOS, C-left/C-right are the PLATFORM word-motion spelling (the
+/// Windows/GTK text convention) — and real emacs binds the very same commands
+/// to them (`right-word`/`left-word`), so no emacs muscle memory is
+/// contradicted. The C-letter rows are untouched: C-b/C-f stay by-character,
+/// exactly as the audit scoped it (named keys only). macOS keeps the table
+/// as-is: ⌥ is its word modifier and Ctrl+arrow belongs to Mission Control
+/// there. C-Backspace is NOT seeded — the editor has no word-delete
+/// `EditorCommand` to bind it to, and inventing one is capability growth, not
+/// a keymap alias.
+const OFF_MAC_CHORDS: &[ChordRow] = &[
+    (&["C-left"], EditorCommand::MoveWordBackward),
+    (&["C-right"], EditorCommand::MoveWordForward),
+];
+
+/// WINDOWS: Ctrl+S SAVES (audit I9). This is not a preference — it is the one
+/// chord every Windows application, from Notepad to Visual Studio, has
+/// answered for thirty years, and the editor answering it with an INCREMENTAL
+/// SEARCH is the single most alarming thing the built-in editor did: the user
+/// hits ^S to protect their work and the buffer starts hunting for text
+/// instead. And Save had no single-stroke chord here at all — only the
+/// two-stroke `C-x C-s`, since the ⌘S arm in `app_native` tests SUPER, which
+/// off macOS is the WINDOWS key (Win+S opens Search) — so the reflex was not
+/// merely mismapped, it was unserved. These rows bind after
+/// [`EMACS_CHORDS`], and binding an already-bound chord REPLACES it, so they
+/// own `C-s` on Windows.
+///
+/// isearch keeps a chord rather than being exiled to `M-x`: `M-s` is emacs's
+/// own SEARCH-MAP prefix letter and is free in this keymap, so the alias
+/// contradicts no emacs muscle memory (nothing else answers M-s here) and
+/// Alt+S is unclaimed on a Windows window with no menu bar. Both strings are
+/// re-advertised platform-aware in `commands()`.
+///
+/// REJECTED — a global `save` keybinding action (`ACTION_NAMES` +
+/// `PLATFORM_DEFAULT_PAIRS`), which is what the audit line literally asked
+/// for. `on_key` resolves the keybinding table BEFORE the terminal paths and
+/// dispatches unconditionally, so seeding `ctrl+s = "save"` would swallow ^S
+/// over the GRID too — killing XOFF/flow control and vim's `C-s` for every
+/// shell on Windows, a far worse defect than the one being fixed. A
+/// user-bindable-but-unseeded `save` fares no better: over a terminal the
+/// chord would be consumed and do nothing (a dead key), because the dispatch
+/// arm cannot fall through. The editor's own keymap is the only layer that is
+/// live exactly when an editor buffer is frontmost, which is exactly when
+/// "save" means anything.
+///
+/// Windows only, unlike [`OFF_MAC_CHORDS`]: macOS spells Save ⌘S and `C-s` is
+/// isearch there for the same emacs reason it is on Linux — and Linux/GTK
+/// editors (gedit, VS Code) do spell Save Ctrl+S, but this editor is
+/// emacs-shaped and the Linux wave has not asked for it. This is a Windows fix
+/// for a Windows reflex.
+const WINDOWS_CHORDS: &[ChordRow] = &[
+    (&["C-s"], EditorCommand::Save),
+    (&["M-s"], EditorCommand::IncrementalSearch),
+];
+
+/// Emacs' page commands, `C-v` (`scroll-up-command`) and `M-v`
+/// (`scroll-down-command`). Page Down and Page Up reach the same commands in
+/// every profile through the input reducer's named-key arms; these chords are
+/// bound in every profile but the Windows GUI, where Ctrl+V is paste's
+/// thirty-year reflex and must never page a buffer away from the person
+/// reaching for it. (A terminal's own paste never reaches its program as
+/// C-v, so the terminal face keeps Emacs' binding.)
+const PAGE_CHORDS: &[ChordRow] = &[
+    (&["C-v"], EditorCommand::ScrollPageDown),
+    (&["M-v"], EditorCommand::ScrollPageUp),
+];
+
+/// The platform a GUI keymap is made for. The platform arms are data, not
+/// `cfg` blocks, so a test on any host builds and checks every platform's
+/// keymap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Platform {
+    Mac,
+    Windows,
+    Other,
+}
+
+impl Platform {
+    /// The platform this build runs on.
+    pub const HOST: Self = if cfg!(target_os = "macos") {
+        Self::Mac
+    } else if cfg!(windows) {
+        Self::Windows
+    } else {
+        Self::Other
+    };
+}
+
+/// Which face a built-in keymap serves (design §4.4). Both are Emacs; they
+/// differ only where a face's platform has a reflex of its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Profile {
+    /// aterm's native Editor view on `Platform`: Emacs, plus that platform's
+    /// spellings (Ctrl+arrow word motion off macOS, `C-s` Save on Windows)
+    /// and its Super (⌘) shortcuts.
+    Gui(Platform),
+    /// The terminal face: Emacs alone. `C-s` is isearch, because the terminal
+    /// face clears IXON, and no Super key reaches a terminal program.
+    #[default]
+    Terminal,
+}
+
+impl Profile {
+    /// The rows this profile adds after [`EMACS_CHORDS`], in binding order.
+    fn chord_rows(self) -> &'static [&'static [ChordRow]] {
+        match self {
+            Self::Gui(Platform::Mac) => &[PAGE_CHORDS],
+            Self::Gui(Platform::Other) => &[PAGE_CHORDS, OFF_MAC_CHORDS],
+            Self::Gui(Platform::Windows) => &[OFF_MAC_CHORDS, WINDOWS_CHORDS],
+            // Real Emacs binds C-left/C-right to word motion in a terminal too.
+            Self::Terminal => &[PAGE_CHORDS, OFF_MAC_CHORDS],
+        }
+    }
+
+    /// Whether the Super (⌘) shortcuts apply: Save, Select All, Undo, Redo.
+    pub const fn super_shortcuts(self) -> bool {
+        matches!(self, Self::Gui(_))
+    }
+
+    /// Whether Escape quits before it arms ESC as Meta for the next key. A
+    /// GUI's Escape has always quit (`keyboard-quit`: the region and a `C-u`
+    /// argument go, and the status says Quit), and still does, so Escape,
+    /// then typing, never leaves a region or an argument behind. The
+    /// terminal face's ESC is Emacs's alone: it only arms Meta, so `C-u ESC
+    /// x` keeps its argument, and ESC ESC quits.
+    pub const fn escape_quits(self) -> bool {
+        matches!(self, Self::Gui(_))
+    }
+}
+
+impl Keymap {
+    /// The built-in Emacs keymap for `profile`.
+    pub fn emacs(profile: Profile) -> Self {
+        let mut map = Self {
+            profile,
+            ..Self::default()
+        };
+        let profile_rows = profile.chord_rows().iter().copied().flatten();
+        for (chords, command) in EMACS_CHORDS.iter().chain(profile_rows) {
+            map.bind_alternatives(chords, *command)
+                .expect("built-in editor chord is valid");
+        }
+        for (sequence, command) in EMACS_SEQUENCES {
+            map.bind(sequence, *command)
+                .expect("built-in editor key sequence is valid");
+        }
+        map
+    }
+
+    /// The face this keymap was built for.
+    pub const fn profile(&self) -> Profile {
+        self.profile
+    }
+
+    /// Bind a key SEQUENCE, written as one space-separated string
+    /// (`"C-x C-s"`); binding a bound sequence again replaces its command.
+    /// Alternate spellings of one key go to [`Self::bind_alternatives`].
+    pub fn bind(&mut self, sequence: &str, command: EditorCommand) -> Result<(), &'static str> {
+        let chords = sequence
+            .split_whitespace()
+            .map(|source| KeyChord::parse(source).ok_or("invalid chord"))
+            .collect::<Result<Vec<_>, _>>()?;
+        if chords.is_empty() {
+            return Err("empty key sequence");
+        }
+        self.bind_chords(chords, command);
+        Ok(())
+    }
+
+    /// Bind each element of `chords` as a one-chord binding of its own:
+    /// alternate spellings of one key (`M-b`, and ⌥← as `M-left`), never a
+    /// sequence. An element that is not one chord (`"C-x C-s"`) refuses the
+    /// whole row, which then binds nothing.
+    pub fn bind_alternatives(
+        &mut self,
+        chords: &[&str],
+        command: EditorCommand,
+    ) -> Result<(), &'static str> {
+        let chords = chords
+            .iter()
+            .map(|source| KeyChord::parse(source).ok_or("invalid chord"))
+            .collect::<Result<Vec<_>, _>>()?;
+        if chords.is_empty() {
+            return Err("no key chord");
+        }
+        for chord in chords {
+            self.bind_chords(vec![chord], command);
+        }
+        Ok(())
+    }
+
+    fn bind_chords(&mut self, sequence: Vec<KeyChord>, command: EditorCommand) {
+        let mut node = &mut self.root;
+        for chord in sequence {
+            node = node.children.entry(chord).or_default();
+        }
+        node.command = Some(command);
+    }
+
+    pub fn resolve(&self, sequence: &[KeyChord]) -> KeyResolution {
+        let mut node = &self.root;
+        for chord in sequence {
+            let Some(next) = node.children.get(chord) else {
+                return KeyResolution::Unbound;
+            };
+            node = next;
+        }
+        if let Some(command) = &node.command {
+            return KeyResolution::Command(*command);
+        }
+        if node.children.is_empty() {
+            return KeyResolution::Unbound;
+        }
+        KeyResolution::Prefix {
+            display: sequence
+                .iter()
+                .map(KeyChord::display)
+                .collect::<Vec<_>>()
+                .join(" "),
+            reachable: node
+                .children
+                .iter()
+                .map(|(chord, child)| {
+                    let suffix = child.command.as_ref().map_or("prefix", EditorCommand::name);
+                    format!("{}  {suffix}", chord.display())
+                })
+                .collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::{EditorBufferView, EditorLines, Selection, editor};
+
+    const PROFILES: [Profile; 4] = [
+        Profile::Gui(Platform::Mac),
+        Profile::Gui(Platform::Windows),
+        Profile::Gui(Platform::Other),
+        Profile::Terminal,
+    ];
+
+    /// PAGE DOWN AND PAGE UP PAGE THE CARET WITH THE VIEW: a screen less two
+    /// lines of context each press, the caret keeping its row on screen and
+    /// its goal column across a short line; at the end the view stops and the
+    /// caret goes on to the last line, so no press is a no-op before the end
+    /// of the document; Page Up mirrors it back to the top. `C-v` and `M-v`
+    /// are the same commands off Windows. (They used to be an eight-line view
+    /// scroll the caret pulled straight back.)
+    #[test]
+    fn page_down_and_up_move_the_caret_and_the_view_a_screen_at_a_time() {
+        let mut text = (0..300)
+            .map(|line| format!("line {line:03}\n"))
+            .collect::<String>();
+        // A short line on the way keeps the goal column only as a goal.
+        text = text.replacen("line 033\n", "s\n", 1);
+        let (mut store, mut workspace, mut view, _) = editor(&text);
+        view.reconcile_viewport(&text, 35);
+        view.selections = vec![Selection::caret("line ".len())];
+        let lines = EditorLines::scanning(&text);
+        let at = |view: &EditorBufferView| {
+            (
+                lines.number_at(view.viewport_anchor),
+                lines.number_at(view.primary_selection().head),
+            )
+        };
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::ScrollPageDown)
+            .unwrap();
+        assert_eq!(at(&view), (33, 33));
+        assert_eq!(view.primary_selection().head, text.find("s\n").unwrap() + 1);
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::ScrollPageDown)
+            .unwrap();
+        assert_eq!(at(&view), (66, 66));
+        let line_66 = text.find("line 066").unwrap();
+        assert_eq!(
+            view.primary_selection().head,
+            line_66 + "line ".len(),
+            "goal column"
+        );
+        let mut previous = at(&view);
+        loop {
+            workspace
+                .execute(&mut store, &mut view, EditorCommand::ScrollPageDown)
+                .unwrap();
+            let now = at(&view);
+            if now == previous {
+                break;
+            }
+            assert!(
+                now.1 > previous.1,
+                "every press moves the caret until the end"
+            );
+            previous = now;
+        }
+        assert_eq!(
+            previous.1, 300,
+            "the caret reaches the last line (after the final newline)"
+        );
+        assert_eq!(previous.0, 301 - 35, "the view stops at the last full page");
+        while at(&view).1 > 0 {
+            let before = at(&view);
+            workspace
+                .execute(&mut store, &mut view, EditorCommand::ScrollPageUp)
+                .unwrap();
+            assert!(at(&view).1 < before.1, "every press moves the caret back");
+        }
+        assert_eq!(at(&view), (0, 0));
+
+        if Platform::HOST == Platform::Windows {
+            // Ctrl+V is paste there; Page Down and Page Up are the keys.
+            return;
+        }
+        let (mut store, mut workspace, mut view, _) = editor(&text);
+        view.reconcile_viewport(&text, 35);
+        workspace
+            .handle_chord(&mut store, &mut view, KeyChord::parse("C-v").unwrap())
+            .unwrap();
+        assert_eq!(at(&view), (33, 33));
+        workspace
+            .handle_chord(&mut store, &mut view, KeyChord::parse("M-v").unwrap())
+            .unwrap();
+        assert_eq!(at(&view), (0, 0));
+    }
+
+    /// Each spelling in a row of alternates is a chord of its own: `M-b` and
+    /// ⌥← (`M-left`) both move back a word, `M-f` and ⌥→ (`M-right`) forward,
+    /// and none is a prefix waiting for the other. Off macOS, `C-left`/`C-right`
+    /// are the PLATFORM word-motion spelling and resolve to the same commands
+    /// (real emacs binds `left-word`/`right-word` there too), while the
+    /// C-letter arms stay by-character (`C-b` is one column). Every platform's
+    /// keymap is checked, whatever the host.
+    #[test]
+    fn alternate_keys_bind_single_chords() {
+        let chord = |s: &str| KeyChord::parse(s).expect("test chord parses");
+        for profile in PROFILES {
+            let map = Keymap::emacs(profile);
+            let mut word_keys = vec![
+                ("M-b", EditorCommand::MoveWordBackward),
+                ("M-left", EditorCommand::MoveWordBackward),
+                ("M-f", EditorCommand::MoveWordForward),
+                ("M-right", EditorCommand::MoveWordForward),
+            ];
+            if profile != Profile::Gui(Platform::Mac) {
+                word_keys.push(("C-left", EditorCommand::MoveWordBackward));
+                word_keys.push(("C-right", EditorCommand::MoveWordForward));
+            }
+            for (key, command) in word_keys {
+                assert_eq!(
+                    map.resolve(&[chord(key)]),
+                    KeyResolution::Command(command),
+                    "{key} is one chord on {profile:?}"
+                );
+            }
+            // The old two-chord sequence is gone.
+            assert_eq!(
+                map.resolve(&[chord("M-b"), chord("M-left")]),
+                KeyResolution::Unbound
+            );
+            assert_eq!(
+                map.resolve(&[chord("C-b")]),
+                KeyResolution::Command(EditorCommand::MoveBackward),
+                "C-b stays by-character on {profile:?}"
+            );
+        }
+
+        // And each one moves the caret in a real buffer, with the host's keymap.
+        let text = "alpha beta gamma";
+        let (mut store, mut workspace, mut view, _) = editor(text);
+        view.selections = vec![Selection::caret(text.len())];
+        for (key, head) in [("M-left", 11), ("M-b", 6), ("M-right", 10), ("M-f", 16)] {
+            workspace
+                .handle_chord(&mut store, &mut view, chord(key))
+                .unwrap();
+            assert_eq!(view.primary_selection().head, head, "after {key}");
+            assert!(!view.chord_pending(), "{key} left a prefix pending");
+        }
+    }
+
+    /// The bindings of `map` with more than one chord that `EMACS_SEQUENCES`
+    /// does not declare, each as its display string.
+    fn undeclared_sequences(map: &Keymap) -> Vec<String> {
+        fn walk(node: &KeyNode, path: &mut Vec<KeyChord>, out: &mut Vec<Vec<KeyChord>>) {
+            if node.command.is_some() && path.len() > 1 {
+                out.push(path.clone());
+            }
+            for (chord, child) in &node.children {
+                path.push(chord.clone());
+                walk(child, path, out);
+                path.pop();
+            }
+        }
+        let declared = EMACS_SEQUENCES
+            .iter()
+            .map(|(sequence, _)| {
+                sequence
+                    .split_whitespace()
+                    .map(|chord| KeyChord::parse(chord).expect("declared chord parses"))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut bound = Vec::new();
+        walk(&map.root, &mut Vec::new(), &mut bound);
+        bound
+            .into_iter()
+            .filter(|sequence| !declared.contains(sequence))
+            .map(|sequence| {
+                sequence
+                    .iter()
+                    .map(KeyChord::display)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    }
+
+    /// Every multi-chord binding in each platform's built-in keymap is a
+    /// declared sequence, so no row of alternates, platform arm or later edit
+    /// can bind one by accident; every alternate is bound as a chord; and no
+    /// bound chord is also a prefix, which would hide the sequences under it.
+    #[test]
+    fn no_row_binds_an_accidental_sequence() {
+        fn no_shadowed_prefix(node: &KeyNode) {
+            for (chord, child) in &node.children {
+                assert!(
+                    child.command.is_none() || child.children.is_empty(),
+                    "{} is both a command and a prefix",
+                    chord.display()
+                );
+                no_shadowed_prefix(child);
+            }
+        }
+        for profile in PROFILES {
+            let map = Keymap::emacs(profile);
+            assert_eq!(
+                undeclared_sequences(&map),
+                Vec::<String>::new(),
+                "{profile:?}"
+            );
+            let profile_rows = profile.chord_rows().iter().copied().flatten();
+            for (chords, _) in EMACS_CHORDS.iter().chain(profile_rows) {
+                for key in *chords {
+                    let chord = KeyChord::parse(key).expect("built-in chord parses");
+                    assert!(
+                        matches!(map.resolve(&[chord]), KeyResolution::Command(_)),
+                        "{key} is not bound as one chord on {profile:?}"
+                    );
+                }
+            }
+            no_shadowed_prefix(&map.root);
+        }
+        // A row that is not one chord is refused whole and binds nothing.
+        let mut refused = Keymap::default();
+        assert!(
+            refused
+                .bind_alternatives(&["M-b", "C-x u"], EditorCommand::MoveWordBackward)
+                .is_err()
+        );
+        assert_eq!(
+            refused.resolve(&[KeyChord::parse("M-b").unwrap()]),
+            KeyResolution::Unbound
+        );
+
+        // Negative control: the old row, bound as a sequence, is caught.
+        let mut old = Keymap::emacs(Profile::Terminal);
+        old.bind("M-b M-left", EditorCommand::MoveWordBackward)
+            .unwrap();
+        assert_eq!(undeclared_sequences(&old), ["M-b M-left"]);
+    }
+
+    /// The real sequences still bind as sequences: their first chord is a
+    /// prefix and the whole sequence runs its command.
+    #[test]
+    fn sequences_still_bind_as_prefixes() {
+        let keys = |sequence: &str| {
+            sequence
+                .split_whitespace()
+                .map(|chord| KeyChord::parse(chord).expect("test chord parses"))
+                .collect::<Vec<_>>()
+        };
+        for profile in PROFILES {
+            let map = Keymap::emacs(profile);
+            for (sequence, command) in [
+                ("C-x C-s", EditorCommand::Save),
+                ("C-x u", EditorCommand::Undo),
+                ("C-x (", EditorCommand::StartMacro),
+                ("M-g g", EditorCommand::GotoLine),
+            ] {
+                let chords = keys(sequence);
+                assert!(
+                    matches!(map.resolve(&chords[..1]), KeyResolution::Prefix { .. }),
+                    "{sequence} starts with a prefix on {profile:?}"
+                );
+                assert_eq!(
+                    map.resolve(&chords),
+                    KeyResolution::Command(command),
+                    "{sequence} on {profile:?}"
+                );
+            }
+        }
+    }
+
+    /// The macOS keymap is byte-identical to what shipped before the platform
+    /// additions: Ctrl+arrow stays unbound there (⌥ owns word motion; Ctrl+arrow
+    /// belongs to Mission Control).
+    #[test]
+    fn ctrl_arrows_stay_unbound_on_macos() {
+        let map = Keymap::emacs(Profile::Gui(Platform::Mac));
+        let chord = |s: &str| KeyChord::parse(s).expect("test chord parses");
+        assert_eq!(map.resolve(&[chord("C-left")]), KeyResolution::Unbound);
+        assert_eq!(map.resolve(&[chord("C-right")]), KeyResolution::Unbound);
+    }
+
+    /// AUDIT I9, Windows: `C-s` SAVES — the reflex every Windows app owes its
+    /// user, and previously the one chord that did something alarming instead
+    /// (it started an incremental search). isearch keeps a chord at `M-s`, and
+    /// the emacs `C-x C-s` spelling still saves, so nothing was traded away.
+    /// Checked on every host: the Windows arm is data.
+    #[test]
+    fn ctrl_s_saves_on_windows_and_isearch_keeps_a_chord() {
+        let map = Keymap::emacs(Profile::Gui(Platform::Windows));
+        let chord = |s: &str| KeyChord::parse(s).expect("test chord parses");
+        assert_eq!(
+            map.resolve(&[chord("C-s")]),
+            KeyResolution::Command(EditorCommand::Save),
+            "Ctrl+S must save, not search"
+        );
+        assert_eq!(
+            map.resolve(&[chord("M-s")]),
+            KeyResolution::Command(EditorCommand::IncrementalSearch),
+            "isearch keeps a chord of its own"
+        );
+        assert_eq!(
+            map.resolve(&[chord("C-x"), chord("C-s")]),
+            KeyResolution::Command(EditorCommand::Save),
+            "the emacs spelling is untouched"
+        );
+    }
+
+    /// …and OFF Windows the table is exactly what it always was: `C-s` is
+    /// isearch (emacs's own binding) and `M-s` is unbound. This is the fence
+    /// that keeps the Windows reflex from leaking onto macOS/Linux and into
+    /// the terminal face.
+    #[test]
+    fn ctrl_s_stays_incremental_search_off_windows() {
+        let chord = |s: &str| KeyChord::parse(s).expect("test chord parses");
+        for profile in [
+            Profile::Gui(Platform::Mac),
+            Profile::Gui(Platform::Other),
+            Profile::Terminal,
+        ] {
+            let map = Keymap::emacs(profile);
+            assert_eq!(
+                map.resolve(&[chord("C-s")]),
+                KeyResolution::Command(EditorCommand::IncrementalSearch),
+                "{profile:?}"
+            );
+            assert_eq!(
+                map.resolve(&[chord("M-s")]),
+                KeyResolution::Unbound,
+                "{profile:?}"
+            );
+        }
+    }
+}

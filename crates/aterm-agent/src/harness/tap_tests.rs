@@ -4,6 +4,7 @@
 use super::*;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 const EXE: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
 const SID: &str = "s-60776b6e2ed1b73bd013";
 
@@ -74,6 +75,7 @@ fn tap(stdin: &[u8], vars: &TapVars, dir: Option<&Path>) -> (std::process::ExitC
 /// another command, an argument after `tap`, a relative path, a path with a
 /// space or a quote — is another's, carried verbatim. NEGATIVE CONTROL: the
 /// same value with its refresh changed is not ours.
+#[cfg(unix)]
 #[test]
 fn the_tap_value_is_exact_and_only_it_is_ours() {
     let value = settings_value(Path::new(EXE)).expect("an admissible path");
@@ -119,6 +121,68 @@ fn the_tap_value_is_exact_and_only_it_is_ours() {
     assert!(!carried_by(&argv(&["--", "--settings", &value])));
     assert!(!carried_by(&argv(&["--settings", r#"{"model":"x"}"#])));
     assert!(!carried_by(&argv(&[])));
+}
+
+/// ON WINDOWS THE VALUE NAMES A DRIVE PATH WITH `/` SEPARATORS. Claude Code runs a status-line
+/// command through Git Bash (else PowerShell), where a `\` is an escape: the path the window's
+/// canonical `current_exe` gives (`\\?\C:\…`) is spelled `C:/…`, which Git Bash, pwsh 7 and
+/// Windows PowerShell 5.1 each ran (measured 2026-10-17), and the value round-trips as ours.
+/// Every path refused before still is (the census found every Windows path refused: a drive
+/// colon and backslashes), and so are a UNC path, a drive-relative one and a value spelled with
+/// backslashes.
+#[cfg(windows)]
+#[test]
+fn a_windows_exe_is_named_with_forward_slashes() {
+    let installed = r"C:\Users\m6-an\AppData\Local\Programs\aterm\aterm.exe";
+    let value = settings_value(Path::new(installed)).expect("an admissible path");
+    assert_eq!(
+        value,
+        r#"{"statusLine":{"type":"command","command":"C:/Users//m6-an/AppData/Local/Programs/aterm/aterm.exe harness tap","refreshInterval":10}}"#
+    );
+    assert!(is_ours(&value));
+    assert!(exe_admissible(Path::new(installed)));
+    let canonical = format!(r"\\?\{installed}");
+    assert_eq!(
+        settings_value(Path::new(&canonical)).as_deref(),
+        Some(value.as_str())
+    );
+    for exe in [
+        r"C:\Program Files\aterm\aterm.exe",
+        r"C:\Users\o'neil\aterm.exe",
+        r"C:\a$b\aterm.exe",
+        r"\\server\share\aterm.exe",
+        r"\\?\UNC\server\share\aterm.exe",
+        r"aterm\aterm.exe",
+        r"C:aterm.exe",
+        "/Applications/aterm.app/Contents/MacOS/aterm",
+    ] {
+        assert!(settings_value(Path::new(exe)).is_none(), "{exe}");
+    }
+    let backslashed = format!(r"{VALUE_HEAD}C:\\Users\\aterm.exe{COMMAND_TAIL}{VALUE_TAIL}");
+    assert!(!is_ours(&backslashed), "{backslashed}");
+}
+
+/// The tap's command names the console image: on Windows the window runs `aterm-gui.exe` (a
+/// build tree's `aterm-windowed.exe`), which would open a window for `harness tap`, so the
+/// console `aterm.exe` beside it is named, and no tap where there is none. Elsewhere, and for
+/// the console image itself, the running image.
+#[test]
+fn the_tap_names_the_console_image_beside_a_windowed_one() {
+    let dir = Path::new(r"C:\Users\u\AppData\Local\Programs\aterm");
+    let gui = dir.join("aterm-gui.exe");
+    let console = dir.join("aterm.exe");
+    let beside = |path: &Path| path == console;
+    if cfg!(windows) {
+        assert_eq!(tap_image(&gui, beside), Some(console.clone()));
+        assert_eq!(
+            tap_image(&dir.join("aterm-windowed.exe"), beside),
+            Some(console.clone())
+        );
+        assert_eq!(tap_image(&gui, |_| false), None);
+    } else {
+        assert_eq!(tap_image(&gui, |_| false), Some(gui.clone()));
+    }
+    assert_eq!(tap_image(&console, |_| false), Some(console.clone()));
 }
 
 /// THE VERB, ON EVERY STDIN: a v1 file of mode 0600 in a 0700 directory,
@@ -231,7 +295,10 @@ fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
 /// neither in the file nor on the line. Run as the real front door
 /// (`aterm harness tap`, [`super::super::cli::main_entry`]) in a child of
 /// this test binary, so the environment is a real one. NEGATIVE CONTROL:
-/// the child did write its reading (the figures are there).
+/// the child did write its reading (the figures are there). The seam names
+/// the state root the scratch `HOME` resolves to, so a build that compiles no
+/// seam (an optimized test build) keeps its reading where a development build
+/// does.
 #[test]
 fn the_verb_never_writes_a_secret_it_was_handed() {
     if std::env::var_os("ATERM_TAP_TEST_CHILD").is_some() {
@@ -239,6 +306,15 @@ fn the_verb_never_writes_a_secret_it_was_handed() {
         return;
     }
     let dir = scratch("secret");
+    let state = aterm_types::dirs::resolve_state_dir(
+        None,
+        aterm_types::dirs::StatePlatform {
+            home: Some(dir.clone()),
+            local_app_data: Some(dir.clone()),
+            ..aterm_types::dirs::StatePlatform::default()
+        },
+    )
+    .expect("the scratch HOME resolves a state root");
     let mut stdin = payload(5, Some((7, 1_792_062_396)), Some((9, 1_792_397_196)));
     stdin.insert_str(1, r#""oauth":"sk-ant-oat01-SECRET","#);
     let mut child = aterm_uds::spawnfd::command(std::env::current_exe().expect("exe"));
@@ -251,8 +327,9 @@ fn the_verb_never_writes_a_secret_it_was_handed() {
         ])
         .env_clear()
         .env("ATERM_TAP_TEST_CHILD", "1")
-        .env("ATERM_STATE_HOME", &dir)
+        .env("ATERM_STATE_HOME", &state)
         .env("HOME", &dir)
+        .env("LOCALAPPDATA", &dir)
         .env("ATERM_PARENT_SESSION_ID", SID)
         .env("CLAUDE_PID", "4242")
         .env("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-SECRET")
@@ -270,7 +347,7 @@ fn the_verb_never_writes_a_secret_it_was_handed() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{stdout}");
     assert!(stdout.contains("5h 7% \u{b7} 7d 9%"), "{stdout}");
-    let file = dir
+    let file = state
         .join("harness")
         .join(super::super::cli::HARNESS)
         .join("rl")
@@ -510,6 +587,7 @@ fn a_sweep_takes_the_dead_and_the_old_and_nothing_else() {
 
 /// The facts of a line the gate admits: the switch on, the machine's own
 /// stored login, a plain launch, every document there and quiet.
+#[cfg(unix)]
 fn all_clear<'a>(argv: &'a [String], settings: &'a [(String, Source)]) -> GateFacts<'a> {
     GateFacts {
         exe: Some(Path::new(EXE)),
@@ -535,6 +613,7 @@ fn all_clear<'a>(argv: &'a [String], settings: &'a [(String, Source)]) -> GateFa
 /// too ([`Armed::lone_login`]) — but not another login beside it, nor it in
 /// a home of its own; a quiet document and one with a harmless `env` key let
 /// it through.
+#[cfg(unix)]
 #[test]
 fn each_guard_alone_refuses_the_tap() {
     let argv: Vec<String> = ["claude", "--model", "opus"].map(str::to_owned).to_vec();
@@ -721,8 +800,8 @@ fn with_tap_row(rows: &[String], row: &str) -> Vec<String> {
 /// credits`): with every line the tap prints in its row, the phase reads
 /// idle with no wall, the footer's mode row and the live REPL's row are
 /// found under it, and the line holds no guarded string of the vendor's.
-/// NEGATIVE CONTROLS: a usage-limit wall in that row reads as one (the
-/// readers do read it), and a blank row there hides the mode row from the
+/// NEGATIVE CONTROLS: Claude Code's own usage-limit banner in that row
+/// reads as a wall (the readers do read the row), and a blank row there hides the mode row from the
 /// footer — which a tap that prints nothing would cost (on 2.1.300 a silent
 /// or failing command takes no row at all: the `tap-row-silent-command`
 /// capture).
@@ -782,16 +861,22 @@ fn the_taps_row_reads_idle_and_keeps_the_mode_row_for_every_reader() {
                 assert!(!line.contains(anchor.text), "{line} holds {}", anchor.id);
             }
         }
-        // Negative controls.
-        let walled = with_tap_row(
-            &rows,
-            "  ⎿  You've hit your session limit · resets 12:23pm (America/Los_Angeles)",
-        );
+        // Negative controls. The vendor's banner there (its `⚠` first, as
+        // 2.1.304 draws it above a status line) is read; a status line's
+        // own words naming a limit are not (KI-1015-14: the footer reads
+        // only where Claude Code draws its notices).
+        let walled = with_tap_row(&rows, "  ⚠ Usage limit reached · limit resets 12:23pm");
         let read = aterm_phase::read(Some("claude"), &walled, None);
         assert!(
             read.wall.is_some() || matches!(read.phase, aterm_phase::Phase::Limited { .. }),
             "the readers read that row: {read:?}"
         );
+        let said = with_tap_row(
+            &rows,
+            "  You've hit your session limit · resets 12:23pm (America/Los_Angeles)",
+        );
+        let read = aterm_phase::read(Some("claude"), &said, None);
+        assert!(read.wall.is_none(), "a status line's words: {read:?}");
         let blank = with_tap_row(&rows, "");
         assert_eq!(
             footer::mode_row(&blank),

@@ -16,13 +16,15 @@
 //! file, and nothing types.
 //!
 //! None of it has been seen live: its reader's texts (`aterm_phase::reset`)
-//! come from Claude Code's 2.1.287 bundle, never a screen, and `[harness]
-//! limit_reset` defaults off.
+//! come from Claude Code's 2.1.287 and 2.1.304 bundles, never a screen, and
+//! `[harness] limit_reset` defaults off. The automatic flow supports legacy
+//! and Full allowances, recording only the claimed raw wall as cleared;
+//! partial kinds need a person.
 
 use std::fmt;
 use std::time::Duration;
 
-use aterm_phase::ConfirmRead;
+use aterm_phase::{ConfirmRead, ResetKind};
 
 use crate::harness::accounts::OFFER_EXPIRING_S;
 
@@ -45,12 +47,15 @@ pub struct ResetAsk {
     /// notice's zone where the loop holds one, else the local one; `None`
     /// where the day did not place.
     pub day_start: Option<i64>,
+    /// The kind of reset the row names (Claude Code 2.1.304 on); `None` for
+    /// a row that names none. Handed back in the go ([`ResetGo::kind`]).
+    pub kind: Option<ResetKind>,
 }
 
 impl ResetAsk {
     /// The go for this ask: what only the host knows (`until`, `long`,
-    /// `limits`), with the row's own count and day carried over unchanged, so
-    /// the confirmation is held to the row that was taken
+    /// `limits`), with the row's own count, day and kind carried over
+    /// unchanged, so the confirmation is held to the row that was taken
     /// ([`confirm_verdict`]).
     #[must_use]
     pub fn go(&self, until: i64, long: bool, limits: Vec<String>) -> ResetGo {
@@ -60,6 +65,7 @@ impl ResetAsk {
             limits,
             left: self.left,
             day: self.day.clone(),
+            kind: self.kind,
         }
     }
 }
@@ -82,6 +88,17 @@ pub struct ResetGo {
     pub left: u32,
     /// The grant's last day as the row drew it ([`ResetAsk::day`]).
     pub day: String,
+    /// The kind of reset the row named ([`ResetAsk::kind`]).
+    pub kind: Option<ResetKind>,
+}
+
+/// Which protocol kinds the automatic reset flow supports. Legacy and Full
+/// confirmations have the required bounded answer path; partial allowances
+/// still need a person. Full does not mean every account quota was reset:
+/// the host records success only for the raw window its claim observed.
+#[must_use]
+pub const fn supports_automatic_kind(kind: Option<ResetKind>) -> bool {
+    matches!(kind, None | Some(ResetKind::Full))
 }
 
 /// Why the host did not give the go ([`ResetWord::No`]): one stable word each
@@ -109,6 +126,8 @@ pub enum ResetNo {
     NoReset,
     /// The walled window is not one a grant clears.
     Window,
+    /// The automatic flow does not support this partial allowance.
+    Kind,
     /// Neither a wall that stands more than a day nor a grant whose last day
     /// could hold a deadline within one.
     NotQualifying,
@@ -134,6 +153,7 @@ impl ResetNo {
             ResetNo::NotOwnWall => "not-own-wall",
             ResetNo::NoReset => "no-reset",
             ResetNo::Window => "window",
+            ResetNo::Kind => "partial-kind",
             ResetNo::NotQualifying => "not-qualifying",
             ResetNo::Held => "held",
             ResetNo::Attempted => "attempted",
@@ -142,7 +162,7 @@ impl ResetNo {
     }
 
     /// Every refusal, in the order [`Self::word`] lists them.
-    pub const ALL: [ResetNo; 12] = [
+    pub const ALL: [ResetNo; 13] = [
         ResetNo::Off,
         ResetNo::NoHost,
         ResetNo::Unread,
@@ -151,6 +171,7 @@ impl ResetNo {
         ResetNo::NotOwnWall,
         ResetNo::NoReset,
         ResetNo::Window,
+        ResetNo::Kind,
         ResetNo::NotQualifying,
         ResetNo::Held,
         ResetNo::Attempted,
@@ -190,6 +211,10 @@ pub enum KeepWhy {
     OtherLimit,
     /// Its count is not the row's.
     Count,
+    /// It is the confirmation of another kind of reset than the row's
+    /// (Claude Code 2.1.304 on), or names a kind where the row named none or
+    /// none where the row named one.
+    Kind,
     /// Its deadline's day is not the row's day.
     Day,
     /// The wall is not a long one, and its deadline did not place or is not
@@ -220,6 +245,7 @@ impl fmt::Display for KeepWhy {
             KeepWhy::Inexact(part) => return write!(f, "inexact-{part}"),
             KeepWhy::OtherLimit => "other-limit",
             KeepWhy::Count => "count",
+            KeepWhy::Kind => "kind",
             KeepWhy::Day => "day",
             KeepWhy::Deadline => "deadline",
             KeepWhy::NotQualifying => "not-qualifying",
@@ -232,6 +258,65 @@ impl fmt::Display for KeepWhy {
             KeepWhy::Closed => "closed",
         };
         f.write_str(word)
+    }
+}
+
+impl KeepWhy {
+    /// Every word but [`KeepWhy::Inexact`]'s, which carries its part.
+    const WORDED: [KeepWhy; 13] = [
+        KeepWhy::OtherLimit,
+        KeepWhy::Count,
+        KeepWhy::Kind,
+        KeepWhy::Day,
+        KeepWhy::Deadline,
+        KeepWhy::NotQualifying,
+        KeepWhy::Focus,
+        KeepWhy::Claim,
+        KeepWhy::NotOpened,
+        KeepWhy::CheckTimeout,
+        KeepWhy::EnterNotTaken,
+        KeepWhy::Successor,
+        KeepWhy::Closed,
+    ];
+
+    /// The ledger's word for why a reset was kept ([`fmt::Display`], the
+    /// reason of a `declined` row under [`super::approval::RULE_LIMIT_RESET`])
+    /// in a person's words, for Settings ▸ Harness's DECIDED FOR YOU
+    /// (`crate::harness::stats`); `None` for a word no build writes. Read
+    /// through the words [`fmt::Display`] writes, so the two cannot drift.
+    #[must_use]
+    pub fn plain_words(word: &str) -> Option<String> {
+        if let Some(part) = word.strip_prefix("inexact-").filter(|p| !p.is_empty()) {
+            return Some(format!(
+                "its confirmation did not read exactly as expected (its {part})"
+            ));
+        }
+        let why = KeepWhy::WORDED
+            .into_iter()
+            .find(|why| why.to_string() == word)?;
+        let words = match why {
+            KeepWhy::Inexact(_) => return None,
+            KeepWhy::OtherLimit => "its confirmation named none of the limits the session hit",
+            KeepWhy::Count => "its confirmation's count of resets was not the one offered",
+            KeepWhy::Kind => "its reset allowance changed or needs a person",
+            KeepWhy::Day => "its confirmation's deadline was not on the day offered",
+            KeepWhy::Deadline => {
+                "the limit was a short one, and the reset's deadline could not be placed ahead"
+            }
+            KeepWhy::NotQualifying => {
+                "the limit was a short one, and the reset's deadline more than a day off"
+            }
+            KeepWhy::Focus => "the cursor was not on the confirmation's yes",
+            KeepWhy::Claim => "the reset was no longer this session's to take",
+            KeepWhy::NotOpened => "pressing the reset's row opened nothing",
+            KeepWhy::CheckTimeout => "the check for a reset took longer than it may",
+            KeepWhy::EnterNotTaken => "the confirmation stayed up after its Enter",
+            KeepWhy::Successor => {
+                "a later loop found the confirmation, and only the loop that opened one enters it"
+            }
+            KeepWhy::Closed => "the confirmation was gone before it was read",
+        };
+        Some(words.to_string())
     }
 }
 
@@ -253,13 +338,16 @@ pub enum Verdict {
 /// 2. a limit its body names is one the wall is drawn by (`go.limits`,
 ///    compared as drawn) — [`KeepWhy::OtherLimit`];
 /// 3. its count is the row's, and one at least — [`KeepWhy::Count`];
-/// 4. its deadline's text is the row's day followed by ` at ` and an hour —
+/// 4. its kind is the row's and supported by the automatic flow (both none,
+///    or the same Full kind of 2.1.304's) —
+///    [`KeepWhy::Kind`];
+/// 5. its deadline's text is the row's day followed by ` at ` and an hour —
 ///    [`KeepWhy::Day`];
-/// 5. the wall is a long one (`go.long`), or the deadline is placed
+/// 6. the wall is a long one (`go.long`), or the deadline is placed
 ///    (`deadline`, unix seconds), ahead of `now` and no more than
 ///    [`OFFER_EXPIRING_S`] away — [`KeepWhy::Deadline`] where it is not
 ///    placed or not ahead, [`KeepWhy::NotQualifying`] where it is further;
-/// 6. the cursor is on the yes — [`KeepWhy::Focus`].
+/// 7. the cursor is on the yes — [`KeepWhy::Focus`].
 ///
 /// `deadline` is the confirmation's own day and hour as the loop placed it;
 /// a long wall does not consult it.
@@ -280,6 +368,9 @@ pub fn confirm_verdict(
     }
     if confirm.left != go.left || confirm.left < 1 {
         return Verdict::Keep(KeepWhy::Count);
+    }
+    if confirm.kind != go.kind || !supports_automatic_kind(go.kind) {
+        return Verdict::Keep(KeepWhy::Kind);
     }
     let on_the_day = !go.day.is_empty()
         && confirm
@@ -329,7 +420,7 @@ pub enum ResetOutcome {
     /// The reset was spent and the limits are refilled. `asks`: the line asks
     /// for a message to continue (the vendor queued none of its own); `left`:
     /// the resets left as the line counts them; `cleared_at`: the unix second
-    /// the account's walls were cleared at.
+    /// the claimed wall was cleared at.
     Spent {
         asks: bool,
         left: Option<u32>,
@@ -391,6 +482,7 @@ mod tests {
             left: 2,
             day: "Oct 5".to_string(),
             day_start: None,
+            kind: None,
         }
         .go(1_800_000_000, true, vec!["weekly".to_string()])
     }
@@ -507,6 +599,20 @@ mod tests {
                 KeepWhy::Count,
             ),
             (
+                "the row named a full reset, the confirmation none",
+                read_ok.clone(),
+                with_go(&|g| g.kind = Some(ResetKind::Full)),
+                None,
+                KeepWhy::Kind,
+            ),
+            (
+                "the confirmation is for a weekly reset, the row named none",
+                with_read(&|c| c.kind = Some(ResetKind::Weekly)),
+                go(),
+                None,
+                KeepWhy::Kind,
+            ),
+            (
                 "the row's day is the day after",
                 read_ok.clone(),
                 with_go(&|g| g.day = "Oct 6".to_string()),
@@ -590,6 +696,55 @@ mod tests {
         );
     }
 
+    /// Claude Code 2.1.304's confirmation (the reader's composed screen of a
+    /// full reset) is entered for the row that named a full reset, and kept
+    /// for a row that named another kind, or none. NEGATIVE CONTROL: the same
+    /// go with its kind changed is the only difference between Enter and Keep.
+    #[test]
+    fn a_kinds_confirmation_is_entered_only_for_its_own_kind() {
+        let read = read(composed::KINDS_CONFIRM);
+        let ConfirmRead::Exact(confirm) = &read else {
+            panic!("not exact: {read:?}");
+        };
+        assert_eq!(
+            (confirm.kind, confirm.left, confirm.deadline.as_str()),
+            (Some(ResetKind::Full), 2, "Oct 5 at 3pm")
+        );
+        let go_kind = |kind| ResetGo { kind, ..go() };
+        assert_eq!(
+            confirm_verdict(&read, &go_kind(Some(ResetKind::Full)), None, NOW),
+            Verdict::Enter
+        );
+        for kind in [
+            None,
+            Some(ResetKind::Session),
+            Some(ResetKind::Weekly),
+            Some(ResetKind::Fable),
+        ] {
+            assert_eq!(
+                confirm_verdict(&read, &go_kind(kind), None, NOW),
+                Verdict::Keep(KeepWhy::Kind),
+                "{kind:?}"
+            );
+        }
+        for kind in [ResetKind::Session, ResetKind::Weekly, ResetKind::Fable] {
+            let ConfirmRead::Exact(mut partial) = read.clone() else {
+                unreachable!()
+            };
+            partial.kind = Some(kind);
+            assert_eq!(
+                confirm_verdict(
+                    &ConfirmRead::Exact(partial),
+                    &go_kind(Some(kind)),
+                    None,
+                    NOW
+                ),
+                Verdict::Keep(KeepWhy::Kind),
+                "an external host's exact partial grant: {kind:?}"
+            );
+        }
+    }
+
     /// At a wall that is not long, a deadline within a day (to the second) is
     /// entered; one a minute past it, one not placed, one now and one in the
     /// past are kept. Negative control: at a long wall each is entered.
@@ -655,6 +810,7 @@ mod tests {
             left: 2,
             day: "Oct 5".to_string(),
             day_start: Some(NOW),
+            kind: None,
         };
         let ends = [true, false].map(|entered| ResetEnd {
             entered,
@@ -665,6 +821,34 @@ mod tests {
         assert_eq!(Silent.reset_take(&ask), ResetWord::No(ResetNo::NoHost));
         for end in &ends {
             assert_eq!(Silent.reset_told(end), ResetOutcome::Unread);
+        }
+    }
+
+    /// EVERY KEPT RESET'S WORD HAS A PERSON'S WORDS (Settings ▸ Harness's
+    /// DECIDED FOR YOU): each word the ledger's `declined` row can carry —
+    /// read through [`fmt::Display`], so a word reworded there is reworded
+    /// here — reads as a sentence, never the hyphenated code, an inexact
+    /// read with its part named. NEGATIVE CONTROL: a word no build
+    /// writes, and `inexact-` with no part, have none.
+    #[test]
+    fn every_kept_resets_word_has_a_persons_words() {
+        for why in KeepWhy::WORDED
+            .into_iter()
+            .chain([KeepWhy::Inexact("title"), KeepWhy::Inexact("deadline")])
+        {
+            let word = why.to_string();
+            let words = KeepWhy::plain_words(&word).unwrap_or_else(|| panic!("{word}"));
+            assert!(
+                words.split(' ').count() >= 4 && !words.contains('-'),
+                "{word}: {words}"
+            );
+        }
+        assert_eq!(
+            KeepWhy::plain_words("inexact-title").as_deref(),
+            Some("its confirmation did not read exactly as expected (its title)")
+        );
+        for unknown in ["frobbed", "inexact-", ""] {
+            assert_eq!(KeepWhy::plain_words(unknown), None, "CONTROL: {unknown:?}");
         }
     }
 }

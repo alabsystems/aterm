@@ -69,6 +69,21 @@ enum Prim {
     DottedRing(f32, f32, f32, u32),
     /// A stroked polyline with round joins/caps.
     Line(&'static [(f32, f32)]),
+    /// `n` teardrops about the box centre, the first pointing up and the
+    /// rest every `360/n` degrees: each narrows to a point at the centre and
+    /// ends in a round head of radius `r` (box units) touching the box's
+    /// inscribed circle.
+    Teardrops(u32, f32),
+    /// `n` stroked spokes from the centre to the box's inscribed circle,
+    /// round-capped, the first pointing up.
+    Spokes(u32),
+    /// A filled `n`-pointed star, the first point up, as large as the cell
+    /// holds it (not the box: a six-pointed star is `cos 30°` as wide as it
+    /// is tall, so in a tall cell its side points reach the cell's edges),
+    /// its inner corners at `inner` of the points' radius (`1/√3` would be
+    /// two crossed triangles for `n = 6`, a hexagon with bumps from about
+    /// 0.6).
+    Star(u32, f32),
 }
 
 /// One symbol: its box size, stroke weight (× the light stroke) and shape.
@@ -91,6 +106,14 @@ const fn heavy(size: Size, prims: &'static [Prim]) -> Spec {
     Spec {
         size,
         weight: 2.0,
+        prims,
+    }
+}
+
+const fn weighted(size: Size, weight: f32, prims: &'static [Prim]) -> Spec {
+    Spec {
+        size,
+        weight,
         prims,
     }
 }
@@ -132,7 +155,10 @@ const X_B: &[(f32, f32)] = &[(0.85, 0.15), (0.15, 0.85)];
 const BALLOT_A: &[(f32, f32)] = &[(0.2, 0.1), (0.8, 0.9)];
 const BALLOT_B: &[(f32, f32)] = &[(0.84, 0.08), (0.16, 0.92)];
 
-use Prim::{Disc, DottedRing, HalfDisc, Line, Poly, PolyOutline, Rect, RectOutline, Ring};
+use Prim::{
+    Disc, DottedRing, HalfDisc, Line, Poly, PolyOutline, Rect, RectOutline, Ring, Spokes, Star,
+    Teardrops,
+};
 use Size::{Full, Large, Medium, Small};
 
 /// The symbol table: every code point this module draws, and how.
@@ -246,6 +272,16 @@ fn lookup(cp: u32) -> Option<Spec> {
         0x2716 => heavy(Large, &[Line(X_A), Line(X_B)]), // ✖
         0x2717 => spec(Large, &[Line(BALLOT_A), Line(BALLOT_B)]), // ✗
         0x2718 => heavy(Large, &[Line(BALLOT_A), Line(BALLOT_B)]), // ✘
+        // Claude Code's spinner frames ([`is_spinner_star`]): strokes and
+        // petals solid enough, and inks close enough, that no frame dims
+        // the cycle. `✶` keeps a face's proportions: its notches reach in to
+        // 0.4 of its points (Iosevka Term's own `✶` is 0.40; DejaVu Sans
+        // Mono's, Segoe UI Symbol's and Noto Sans Symbols 2's 0.29-0.33).
+        0x2722 => spec(Full, &[Teardrops(4, 0.16)]), // ✢
+        0x2733 => weighted(Full, 1.3, &[Spokes(8)]), // ✳
+        0x2736 => spec(Full, &[Star(6, 0.4)]),       // ✶
+        0x273B => spec(Full, &[Teardrops(6, 0.13)]), // ✻
+        0x273D => spec(Full, &[Teardrops(6, 0.15)]), // ✽
         // ---- Miscellaneous Symbols and Arrows ------------------------------
         0x2B24 => spec(Full, &[Disc(0.5, 0.5, 0.5)]), // ⬤
         0x2B58 => heavy(Large, &[Ring(0.5, 0.5, 0.5)]), // ⭘
@@ -266,9 +302,13 @@ pub(super) fn coverage(ch: char, cell_w: usize, cell_h: usize, span: usize) -> O
     if cell_w == 0 || cell_h == 0 {
         return None;
     }
-    let cp = u32::from(ch);
+    Some(draw(lookup(u32::from(ch))?, cell_w, cell_h, span))
+}
+
+/// Row-major coverage of `spec` at `span * cell_w` × `cell_h` (`span`
+/// clamped to `1..=2`); `cell_w` and `cell_h` are non-zero.
+fn draw(spec: Spec, cell_w: usize, cell_h: usize, span: usize) -> Vec<u8> {
     let w = cell_w * span.clamp(1, 2);
-    let spec = lookup(cp)?;
     let mut c = Canvas::new(w, cell_h);
     let (wf, hf) = (w as f32, cell_h as f32);
     let side = wf.min(hf) * spec.size.scale();
@@ -353,10 +393,101 @@ pub(super) fn coverage(ch: char, cell_w: usize, cell_h: usize, span: usize) -> O
                         .any(|s| seg_dist(px, py, s[0].0, s[0].1, s[1].0, s[1].1) <= half)
                 });
             }
+            Teardrops(n, r) => {
+                let (cx, cy) = to_px((0.5, 0.5));
+                let head = r * side;
+                let reach = (0.5 - r) * side;
+                let dirs = directions(n);
+                c.paint_aa(|px, py| {
+                    let (vx, vy) = (px - cx, py - cy);
+                    dirs.iter().any(|&(dx, dy)| {
+                        let along = vx * dx + vy * dy;
+                        let (hx, hy) = (vx - dx * reach, vy - dy * reach);
+                        // The head, or the cone from the centre that widens
+                        // to it.
+                        hx.hypot(hy) <= head
+                            || ((0.0..=reach).contains(&along)
+                                && (vx * dy - vy * dx).abs() <= head * along / reach)
+                    })
+                });
+            }
+            Star(n, inner) => {
+                let (cx, cy) = to_px((0.5, 0.5));
+                // The largest star whose points stay inside the cell: the
+                // points' radius over the widest and tallest of their
+                // directions (`cos 30°` and 1 for six standing on one).
+                let (sx, sy) = directions(n)
+                    .iter()
+                    .fold((0.0f32, 0.0f32), |(sx, sy), &(dx, dy)| {
+                        (sx.max(dx.abs()), sy.max(dy.abs()))
+                    });
+                let outer = (wf / 2.0 / sx).min(hf / 2.0 / sy) * spec.size.scale();
+                let inner = inner * outer;
+                let step = std::f32::consts::PI / n as f32;
+                // One edge, in the frame of the inner corner's direction:
+                // from the corner `(inner, 0)` out to the point.
+                let (tx, ty) = (outer * step.cos(), outer * step.sin());
+                c.paint_aa(|px, py| {
+                    let (vx, vy) = (px - cx, py - cy);
+                    let d = vx.hypot(vy);
+                    if d <= inner {
+                        return true;
+                    }
+                    // The angle from the nearest inner corner: 0 there,
+                    // `step` at a point.
+                    let a = ((vy.atan2(vx) + std::f32::consts::FRAC_PI_2).rem_euclid(2.0 * step)
+                        - step)
+                        .abs();
+                    let (qx, qy) = (d * a.cos(), d * a.sin());
+                    // On the centre's side of the edge.
+                    (tx - inner) * qy - ty * (qx - inner) >= 0.0
+                });
+            }
+            Spokes(n) => {
+                let (cx, cy) = to_px((0.5, 0.5));
+                let half = stroke / 2.0;
+                let reach = side / 2.0 - half;
+                let dirs = directions(n);
+                c.paint_aa(|px, py| {
+                    dirs.iter().any(|&(dx, dy)| {
+                        seg_dist(px, py, cx, cy, cx + dx * reach, cy + dy * reach) <= half
+                    })
+                });
+            }
         }
     }
-    Some(c.buf)
+    c.buf
 }
+
+/// `n` unit directions, the first straight up (`v` grows downward), then
+/// every `360/n` degrees clockwise.
+fn directions(n: u32) -> Vec<(f32, f32)> {
+    (0..n)
+        .map(|k| {
+            let a = -std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::TAU / n as f32;
+            (a.cos(), a.sin())
+        })
+        .collect()
+}
+
+/// Claude Code's spinner frames, `✢ ✳ ✶ ✻ ✽` (with `·`, which every text
+/// face draws, and the face's own `*`, or `✳` in Ghostty). A face's dingbats are
+/// pictures at text size: the Iosevka Term Semibold the Windows default
+/// draws them as x-height marks, and the DejaVu Sans Mono its chain then
+/// reached drew `✳`'s eight 1 px spokes and `✶`'s small star soft once
+/// fitted into the cell — 8.5% and 14% of their ink solid, about half the
+/// ink of `✻` and `✽` (measured 2026-10-18 at 9x23), so the spinner dimmed on
+/// those frames. These are drawn from the cell instead, wherever the primary
+/// yields them and the text is smaller than `bundled::SPINNER_STARS_CRISP_PX`
+/// (`Renderer::spinner_star_preempts`); everywhere else they are only the
+/// last resort for a host with no face for them.
+pub(crate) fn is_spinner_star(ch: char) -> bool {
+    SPINNER_STARS.contains(&ch)
+}
+
+/// The [`is_spinner_star`] frames, in Claude Code's order: `✢ ✳ ✶ ✻ ✽`.
+pub(crate) const SPINNER_STARS: [char; 5] =
+    ['\u{2722}', '\u{2733}', '\u{2736}', '\u{273B}', '\u{273D}'];
 
 /// U+23BF `⎿`, Claude Code's tool-output connector: a light vertical on the `│` columns
 /// from the top edge to the three-quarter line, then a light horizontal to the right
@@ -413,5 +544,125 @@ impl ConvexPoly {
             .iter()
             .map(|&(ax, ay, nx, ny)| (px - ax) * nx + (py - ay) * ny)
             .fold(f32::NEG_INFINITY, f32::max)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Full, Star, coverage, draw, is_spinner_star, spec};
+
+    /// `(ink sum in full texels, solid share, peak)` of a coverage mask:
+    /// solid is a texel at 90% coverage or more, ink any texel at all.
+    fn ink(mask: &[u8]) -> (f32, f32, u8) {
+        let inked = mask.iter().filter(|&&c| c > 0).count();
+        let solid = mask.iter().filter(|&&c| c >= 230).count();
+        let sum = mask.iter().map(|&c| f32::from(c) / 255.0).sum();
+        let peak = mask.iter().copied().max().unwrap_or(0);
+        (sum, solid as f32 / inked.max(1) as f32, peak)
+    }
+
+    /// Claude Code's spinner frames read as one growing star, not a cycle
+    /// that dims: at the Windows default cell (9x23), its 1.25x and 1.5x
+    /// zooms (11x29, 13x36), larger cells (14x34, 18x46) and the cells of
+    /// other font sizes (8x17, 10x21), every frame reaches full ink, at
+    /// least a quarter of its ink is solid, and the frames' ink sums are
+    /// within 1.5x of each other. (The fitted DejaVu Sans Mono glyphs were
+    /// 0-12% solid at 9x23, and `✳` and `✶` about half the ink of `✽`.) A
+    /// quarter, not more: in an even-width cell a centred upright point
+    /// straddles two texel columns, which leaves `✶`'s slender points 26%
+    /// solid at 8x17. A 7 px cell is too narrow for six spokes to stay
+    /// apart; there every frame still reaches full ink.
+    #[test]
+    fn spinner_frames_are_solid_and_even() {
+        let frames = ['\u{2722}', '\u{2733}', '\u{2736}', '\u{273B}', '\u{273D}'];
+        assert!(frames.iter().all(|&ch| is_spinner_star(ch)));
+        for (w, h) in [
+            (9, 23),
+            (11, 29),
+            (13, 36),
+            (14, 34),
+            (18, 46),
+            (8, 17),
+            (10, 21),
+        ] {
+            let mut sums = Vec::new();
+            for ch in frames {
+                let mask = coverage(ch, w, h, 1).expect("drawn");
+                let (sum, solid, peak) = ink(&mask);
+                assert_eq!(peak, 255, "{ch} at {w}x{h}");
+                assert!(solid >= 0.25, "{ch} at {w}x{h}: {solid:.2} solid");
+                sums.push(sum);
+            }
+            let (lo, hi) = sums
+                .iter()
+                .fold((f32::MAX, 0.0f32), |(lo, hi), &s| (lo.min(s), hi.max(s)));
+            assert!(hi <= lo * 1.5, "{w}x{h}: ink sums {sums:?}");
+        }
+        for ch in frames {
+            let mask = coverage(ch, 7, 15, 1).expect("drawn");
+            assert_eq!(ink(&mask).2, 255, "{ch} at 7x15");
+        }
+    }
+
+    /// The coverage of `mask` (`w` wide) at the continuous point `(x, y)`,
+    /// bilinear between texel centres, in `0..=1`.
+    fn sample(mask: &[u8], w: usize, x: f32, y: f32) -> f32 {
+        let h = mask.len() / w;
+        let at = |i: f32, j: f32| {
+            let (i, j) = (i.clamp(0.0, (w - 1) as f32), j.clamp(0.0, (h - 1) as f32));
+            f32::from(mask[j as usize * w + i as usize]) / 255.0
+        };
+        let (fx, fy) = (x - 0.5, y - 0.5);
+        let (x0, y0) = (fx.floor(), fy.floor());
+        let (tx, ty) = (fx - x0, fy - y0);
+        let top = at(x0, y0) * (1.0 - tx) + at(x0 + 1.0, y0) * tx;
+        let bottom = at(x0, y0 + 1.0) * (1.0 - tx) + at(x0 + 1.0, y0 + 1.0) * tx;
+        top * (1.0 - ty) + bottom * ty
+    }
+
+    /// `(least coverage along the six points, most along the six notches)`
+    /// of a six-pointed star drawn at `w`x`h`, sampled at `reach` of its
+    /// points' radius from the cell centre.
+    fn points_and_notches(mask: &[u8], w: usize, h: usize, reach: f32) -> (f32, f32) {
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        // Side points at the cell's edges (`Prim::Star`).
+        let r = reach * (w as f32 / 2.0) / (std::f32::consts::PI / 6.0).cos();
+        let along = |deg: f32| {
+            let a = deg.to_radians();
+            sample(mask, w, cx + r * a.cos(), cy + r * a.sin())
+        };
+        let points = (0..6).map(|k| along(-90.0 + 60.0 * k as f32));
+        let notches = (0..6).map(|k| along(-60.0 + 60.0 * k as f32));
+        (points.fold(1.0, f32::min), notches.fold(0.0, f32::max))
+    }
+
+    /// `✶` READS AS A SIX-POINTED STAR, NOT A HEXAGON. At 0.6 of its points'
+    /// radius each of its six points is at least half covered, and at 0.65
+    /// each notch between them is at most 15% covered, at the Windows
+    /// default's 1x, 1.25x and 1.5x cells (9x23, 11x29, 13x36) and at 7x15,
+    /// 8x17 and 10x21; its side points reach the cell's edges, so it
+    /// stands as tall against its width as a face's `✶`. Control: the
+    /// proportions it had (inner corners at 0.65 of the points) fill the
+    /// notches at least half — the hexagon with stub points the judges saw.
+    #[test]
+    fn the_six_pointed_star_keeps_its_notches_open() {
+        for (w, h) in [(9, 23), (11, 29), (13, 36), (7, 15), (8, 17), (10, 21)] {
+            let star = coverage('\u{2736}', w, h, 1).expect("drawn");
+            let (points, _) = points_and_notches(&star, w, h, 0.6);
+            let (_, notches) = points_and_notches(&star, w, h, 0.65);
+            assert!(points >= 0.5, "✶ at {w}x{h}: a point holds {points:.2}");
+            assert!(notches <= 0.15, "✶ at {w}x{h}: a notch holds {notches:.2}");
+            let edge = |x: usize| (0..h).map(|y| star[y * w + x]).max().unwrap_or(0);
+            assert!(
+                edge(0) > 0 && edge(w - 1) > 0,
+                "✶ at {w}x{h}: its side points reach the cell's edges"
+            );
+            let fat = draw(spec(Full, &[Star(6, 0.65)]), w, h, 1);
+            let (_, filled) = points_and_notches(&fat, w, h, 0.65);
+            assert!(
+                filled >= 0.5,
+                "control at {w}x{h}: notches hold {filled:.2}"
+            );
+        }
     }
 }

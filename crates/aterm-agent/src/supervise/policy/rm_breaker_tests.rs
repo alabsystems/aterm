@@ -437,6 +437,9 @@ fn zsh_expansions_are_not_text() {
     assert_eq!(approves("S=/tmp/w/a; rm -rf \"${S}:h\""), ["/tmp/w/a:h"]);
     // A `:` before anything but a modifier letter is text in zsh too
     // (`"$S: x"`, `$S:/c`, `$S:1`), in an operand and in another command's word.
+    // On Windows a `:` is no file-name character (`a:` reads as a drive), so the
+    // walk on the disk places none of them there.
+    #[cfg(unix)]
     assert_eq!(
         approves("S=/tmp/w/a; rm -rf \"$S: x\" $S:/c \"$S:1\""),
         ["/tmp/w/a: x", "/tmp/w/a:/c", "/tmp/w/a:1"]
@@ -577,7 +580,8 @@ impl TempTree {
     }
 
     /// The path as `std::env::temp_dir` spells it (on macOS through the
-    /// `/var` link), no trailing `/`.
+    /// `/var` link), no trailing `/`: for the link tests, which are Unix's.
+    #[cfg(unix)]
     fn at(&self, rel: &str) -> String {
         let base = self
             .0
@@ -885,6 +889,8 @@ fn a_directory_the_line_just_made_is_proven_wherever_it_is() {
 /// A variable the line does not assign is not proven, whatever this process holds for it.
 #[test]
 fn a_variable_from_the_environment_is_not_proven() {
+    // A Windows process's home is `USERPROFILE`, and it holds no `HOME` of its own.
+    #[cfg(unix)]
     assert!(
         std::env::var_os("HOME").is_some(),
         "this process holds $HOME"

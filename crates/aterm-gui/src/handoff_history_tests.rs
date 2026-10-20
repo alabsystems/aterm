@@ -69,11 +69,14 @@ fn record(local_id: u64) -> SessionRecord {
         attention_owners: Vec::new(),
         viewport_from_bottom: None,
         render_debt: None,
+        render_debt_cut: 0,
         fabric: Default::default(),
         timeline_id: 0,
         log_ids: None,
         log_seq: 0,
         journal_key: None,
+        task: None,
+        status_seen: None,
     }
 }
 
@@ -88,8 +91,10 @@ fn manifest(ids: &[u64]) -> SessionHandoff {
         held: Vec::new(),
         roster_seq: None,
         fabric_attached: Vec::new(),
+        fleet_told: Vec::new(),
         mirror_dropped: Vec::new(),
         mirror_served: false,
+        machine_names: Vec::new(),
     }
 }
 

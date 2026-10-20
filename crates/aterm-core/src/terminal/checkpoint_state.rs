@@ -501,6 +501,67 @@ pub struct ShellRepr {
     /// out at `0`, so that state re-encodes as it was written.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero_seq"))]
     pub started_seq: u64,
+    /// The shell signs its own cwd report (`ShellIntegrationState::signs_cwd`).
+    /// Absent from a predecessor that did not read signatures, and left out when
+    /// false.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_false"))]
+    pub signs_cwd: bool,
+    /// The shell finished a command it never marked with `C`
+    /// (`ShellIntegrationState::unmarked_run`). Absent or left out when false.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_false"))]
+    pub unmarked_run: bool,
+    /// The phase predates the nonce the shell just took: only its next accepted
+    /// `A` makes the phase current. Absent from predecessors and left out when false.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_false"))]
+    pub phase_stale: bool,
+    /// An OSC 7 held at the prompt of a shell that does not sign its own
+    /// (`ShellIntegrationState::held_cwd`), which the shell's next `A` applies.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub held_cwd: Option<CwdReportRepr>,
+    /// The cwd a foreground job's report replaced at the shell's prompt
+    /// (`ShellIntegrationState::cwd_before_job`), which comes back once the host
+    /// says no job holds the foreground.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub cwd_before_job: Option<CwdReportRepr>,
+}
+
+/// A reported cwd as a checkpoint carries it: the path it stores (none: it
+/// clears the cwd) and the host its OSC 7 named (none: a local one). Installed
+/// only when the engine would store it from an OSC 7.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CwdReportRepr {
+    /// The decoded local path, or `None` for a report that clears the cwd.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub path: Option<String>,
+    /// The host the report named, or `None` for a local one.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub host: Option<String>,
+}
+
+impl CwdReportRepr {
+    fn capture(report: &super::shell::CwdReport) -> Self {
+        Self {
+            path: report.path.clone(),
+            host: report.host.clone(),
+        }
+    }
+
+    fn to_report(&self) -> Option<super::shell::CwdReport> {
+        super::shell::CwdReport::of(self.path.as_deref(), self.host.as_deref())
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -770,6 +831,11 @@ impl Terminal {
             next_block_id: s.next_block_id,
             completed_seq: s.completed_seq,
             started_seq: s.started_seq,
+            signs_cwd: s.signs_cwd,
+            unmarked_run: s.unmarked_run,
+            phase_stale: s.phase_stale,
+            held_cwd: s.held_cwd.as_ref().map(CwdReportRepr::capture),
+            cwd_before_job: s.cwd_before_job.as_ref().map(CwdReportRepr::capture),
         }
     }
 
@@ -873,9 +939,17 @@ impl Terminal {
         s.next_block_id = s.next_block_id.max(repr.next_block_id);
         s.completed_seq = s.completed_seq.max(repr.completed_seq);
         s.started_seq = s.started_seq.max(repr.started_seq);
-        // A held OSC 7 belongs to the previous prompt, not this installed
-        // shell projection. It is never part of a checkpoint's carry.
-        s.held_cwd = None;
+        // The shell's habits and the reports its prompt left pending are the
+        // carry's: a report held at this engine's previous prompt, or a cwd
+        // its own job replaced, belongs to a shell this projection replaces.
+        s.signs_cwd = repr.signs_cwd;
+        s.unmarked_run = repr.unmarked_run;
+        s.phase_stale = repr.phase_stale;
+        s.held_cwd = repr.held_cwd.as_ref().and_then(CwdReportRepr::to_report);
+        s.cwd_before_job = repr
+            .cwd_before_job
+            .as_ref()
+            .and_then(CwdReportRepr::to_report);
         // Nor is the stored cwd's host: the restore installs the carried cwd,
         // which this engine's host never qualified. The shell's next OSC 7
         // names it again.

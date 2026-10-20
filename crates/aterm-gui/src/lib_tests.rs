@@ -1318,7 +1318,7 @@ fn keybindings_table_parses() {
     .unwrap();
     let kb = crate::keybinding::Keybindings::from_config(c.keybindings.as_ref());
     assert!(!kb.is_empty());
-    use winit::keyboard::{Key as WK, ModifiersState as MS, SmolStr};
+    use aterm_window::keyboard::{Key as WK, ModifiersState as MS, SmolStr};
     assert_eq!(
         kb.lookup(&WK::Character(SmolStr::new("n")), MS::SUPER | MS::SHIFT),
         Some(crate::keybinding::Action::NewTab)
@@ -1854,20 +1854,20 @@ use super::{MetricsView, font_px_for_scale};
 /// constants.
 #[test]
 fn metrics_view_for_scale_padded_honors_config_padding() {
-    let v = MetricsView::for_scale_padded(2.0, 20.0, 5.0, 1000);
+    let v = MetricsView::for_scale_padded(super::FONT_PX, 2.0, 20.0, 5.0);
     assert_eq!((v.pad, v.pad_top), (40, 10));
-    assert_eq!(v.font_px, font_px_for_scale(2.0, 1000));
+    assert_eq!(v.font_px, font_px_for_scale(super::FONT_PX, 2.0));
     // Top capped at the base pad even when mis-supplied above it.
-    let v = MetricsView::for_scale_padded(1.0, 4.0, 9.0, 1000);
+    let v = MetricsView::for_scale_padded(super::FONT_PX, 1.0, 4.0, 9.0);
     assert_eq!((v.pad, v.pad_top), (4, 4));
     // Defaults reproduce the pure derivation exactly, at every test scale.
     for &s in &[1.0f64, 1.25, 1.5, 2.0, 3.0] {
         assert_eq!(
             MetricsView::for_scale_padded(
+                super::FONT_PX,
                 s,
                 super::PAD_LOGICAL_PX,
                 super::PAD_TOP_LOGICAL_PX,
-                1000
             ),
             MetricsView::for_scale(s),
             "scale {s}"
@@ -1883,7 +1883,6 @@ fn metrics_view_for_scale_padded_honors_config_padding() {
 fn two_windows_mixed_dpi_each_resolve_their_own_cell_size() {
     use super::{App, MetricsView, WindowId};
     let mut app = App::headless_for_test(); // window 0
-    app.font_px_explicit = false; // auto font ⇒ apply_window_scale is live
     // Window 0 = the 1× laptop.
     let w0 = WindowId(0);
     if let Some(ws) = app.windows.get_mut(&w0) {
@@ -1948,13 +1947,14 @@ fn two_windows_mixed_dpi_each_resolve_their_own_cell_size() {
     );
 }
 
-/// A config reload that flips the font-size REGIME re-resolves every
-/// window's per-window metric authority, so hit-test / IME / grid-sizing never
-/// read a stale size after the backend is rebuilt. An EXPLICIT font pins the px
-/// for every window (each keeping its own scale-derived pad); dropping back to
-/// auto restores each window's own scale-derived px.
+/// A config reload that changes the font size re-resolves every window's per-window
+/// metric authority, so hit-test / IME / grid-sizing never read a stale size after the
+/// backend is rebuilt. A named size draws at each window's own scale, exactly as the
+/// default does: 15 is 15 device px on the 1× window and 30 on the 2× one. Negative
+/// control: the old pin drew a named size at the same device px in every window, half
+/// size on the 2× one.
 #[test]
-fn reload_refreshes_every_window_metric_to_the_new_font_regime() {
+fn reload_refreshes_every_window_metric_to_the_new_font_size() {
     use super::{App, MetricsView, WindowId};
     let mut app = App::headless_for_test();
     let w0 = WindowId(0);
@@ -1969,13 +1969,10 @@ fn reload_refreshes_every_window_metric_to_the_new_font_regime() {
         ws.metrics = MetricsView::for_scale(2.0);
     }
 
-    // Simulate a reload that added an explicit `font_px = 30` (the regime flip
-    // `reload_config` performs before calling `refresh_all_window_metrics`).
-    app.font_px_explicit = true;
-    app.font_px = 30.0;
+    // The size a reload of `font_px = 15` commits before `refresh_all_window_metrics`.
+    app.font_size = 15.0;
     app.refresh_all_window_metrics();
-    // Both windows now render at the explicit px (each keeps its own pad).
-    assert_eq!(app.windows[&w0].metrics.font_px, 30.0);
+    assert_eq!(app.windows[&w0].metrics.font_px, 15.0);
     assert_eq!(app.windows[&w1].metrics.font_px, 30.0);
     assert_eq!(
         app.windows[&w0].metrics.pad,
@@ -1985,49 +1982,49 @@ fn reload_refreshes_every_window_metric_to_the_new_font_regime() {
         app.windows[&w1].metrics.pad,
         MetricsView::for_scale(2.0).pad
     );
-    // ... and both windows agree with the pure geometry read at that px.
-    assert_eq!(
-        app.win_cell_size(w0),
-        app.win_cell_size(w1),
-        "explicit font ⇒ equal cell boxes"
-    );
-
-    // A subsequent reload that REMOVED the explicit font restores auto scaling:
-    // each window returns to its own scale-derived px.
-    app.font_px_explicit = false;
-    app.refresh_all_window_metrics();
-    assert_eq!(app.windows[&w0].metrics, MetricsView::for_scale(1.0));
-    assert_eq!(app.windows[&w1].metrics, MetricsView::for_scale(2.0));
     let (c0w, c0h) = app.win_cell_size(w0);
     let (c1w, c1h) = app.win_cell_size(w1);
     assert!(
         c1w > c0w && c1h > c0h,
-        "auto font ⇒ 2× window's cell box exceeds 1×"
+        "a named size ⇒ the 2× window's cell box exceeds 1×"
     );
+
+    // Back to the default: each window returns to its own scale's default.
+    app.font_size = super::FONT_PX;
+    app.refresh_all_window_metrics();
+    assert_eq!(app.windows[&w0].metrics, MetricsView::for_scale(1.0));
+    assert_eq!(app.windows[&w1].metrics, MetricsView::for_scale(2.0));
 }
 
-/// Live font zoom: `set_font_px` re-resolves and pins every window's [`MetricsView`], so
-/// `on_resize` re-grids with the new cell box instead of drawing new glyphs into the old
-/// layout.
+/// Live font zoom: `set_font_size` re-resolves every window's [`MetricsView`] at its
+/// own scale, so `on_resize` re-grids with the new cell box instead of drawing new glyphs
+/// into the old layout, and one step is one step of every window's text.
 #[test]
-fn live_font_zoom_refreshes_per_window_metrics_and_pins_explicit() {
-    use super::{App, WindowId};
-    let mut app = App::headless_for_test(); // window 0, AUTO font at FONT_PX
-    app.font_px_explicit = false;
+fn live_font_zoom_refreshes_per_window_metrics() {
+    use super::{App, MetricsView, WindowId};
+    let mut app = App::headless_for_test(); // window 0, the default size at 1×
     let w0 = WindowId(0);
-    let base_px = app.font_px;
+    let w1 = WindowId(1);
+    app.install_window_state(w1, super::stub_session(1), 24, 80);
+    if let Some(ws) = app.windows.get_mut(&w1) {
+        ws.scale = 2.0;
+        ws.metrics = MetricsView::for_scale(2.0);
+    }
+    let base = app.font_size;
     let (bw, bh) = app.win_cell_size(w0);
 
-    // Zoom IN. The per-window record must follow, the size must pin explicit, and the
-    // cell box must actually GROW (the stale-metrics bug kept it flat).
-    app.set_font_px(base_px + 8.0);
+    // Zoom IN. The per-window records must follow and the cell box must GROW (the
+    // stale-metrics bug kept it flat).
+    app.set_font_size(base + 8.0);
+    assert_eq!(app.font_size, base + 8.0);
     assert!(
-        app.font_px_explicit,
-        "a live zoom pins the font size as explicit"
+        (app.windows[&w0].metrics.font_px - (base + 8.0)).abs() < 0.5,
+        "the per-window MetricsView must track the zoomed size, not stay stale"
     );
-    assert!(
-        (app.windows[&w0].metrics.font_px - (base_px + 8.0)).abs() < 0.5,
-        "the per-window MetricsView must track the zoomed px, not stay stale"
+    assert_eq!(
+        app.windows[&w1].metrics.font_px,
+        font_px_for_scale(base + 8.0, 2.0),
+        "the 2× window draws the zoom at its own scale"
     );
     let (zw, zh) = app.win_cell_size(w0);
     assert!(
@@ -2036,9 +2033,9 @@ fn live_font_zoom_refreshes_per_window_metrics_and_pins_explicit() {
     );
 
     // Zoom back out, below the base: the per-window cell box shrinks in lockstep.
-    app.set_font_px(base_px - 2.0);
+    app.set_font_size(base - 2.0);
     assert!(
-        (app.windows[&w0].metrics.font_px - (base_px - 2.0)).abs() < 0.5,
+        (app.windows[&w0].metrics.font_px - (base - 2.0)).abs() < 0.5,
         "the per-window MetricsView follows a zoom-out too"
     );
     let (sw, sh) = app.win_cell_size(w0);
@@ -2056,37 +2053,33 @@ fn failed_live_font_zoom_rolls_back_font_authority_and_window_metrics() {
     use super::{App, WindowId};
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    app.font_px_explicit = false;
-    let old_px = app.font_px;
+    let (old_size, old_px) = (app.font_size, app.font_px);
     let old_metrics = app.windows[&wid].metrics;
     let old_cell = app.win_cell_size(wid);
 
-    assert!(!app.set_font_px_with(old_px + 8.0, |_| false));
-    assert_eq!(app.font_px, old_px);
-    assert!(!app.font_px_explicit);
+    assert!(!app.set_font_size_with(old_size + 8.0, |_| false));
+    assert_eq!((app.font_size, app.font_px), (old_size, old_px));
     assert_eq!(app.windows[&wid].metrics, old_metrics);
     assert_eq!(app.win_cell_size(wid), old_cell);
 }
 
-/// A config reload without `font_px` keeps a zoomed px pinned (`reload_font_pin`), and
-/// even with the pin dropped `apply_window_scale` re-grids the window it re-tunes, so the
-/// frame never exceeds the glass.
+/// A zoom survives the redraw-time scale re-tune and a metrics refresh (a reload that
+/// leaves the size alone), and when the size returns to the default the re-tune re-grids
+/// the window it re-tunes, so the frame never exceeds the glass.
 #[test]
 fn zoom_surviving_a_reload_never_paints_a_frame_wider_than_the_window() {
     use super::{App, MetricsView, WindowId};
-    use winit::dpi::PhysicalSize;
+    use aterm_window::dpi::PhysicalSize;
     let mut app = App::headless_for_test();
     let w0 = WindowId(0);
     let win = PhysicalSize::new(1808u32, 1452u32);
     // A 2×-display window state: per-window scale + metrics + a recorded raw size.
-    app.font_px_explicit = false;
     if let Some(ws) = app.windows.get_mut(&w0) {
         ws.scale = 2.0;
         ws.metrics = MetricsView::for_scale(2.0);
         ws.win_px = Some(win);
     }
     app.font_px = MetricsView::for_scale(2.0).font_px;
-    app.default_font_px = app.font_px;
     app.on_resize(w0, win);
 
     // The frame the compose would build: grid cols × the active cell box + pad.
@@ -2101,35 +2094,28 @@ fn zoom_surviving_a_reload_never_paints_a_frame_wider_than_the_window() {
 
     // Cmd-−: zoom out. (Headless: `rebuild_backend`'s re-grid loop skips
     // windows with no OS surface, so re-grid explicitly like the windowed path.)
-    app.set_font_px(app.font_px - 2.0 * super::FONT_ZOOM_STEP);
+    app.set_font_size(app.font_size - 2.0 * super::FONT_ZOOM_STEP);
     app.on_resize(w0, win);
     let zoomed_px = app.font_px;
     let zoomed_cols = app.windows[&w0].cols;
+    assert_eq!(zoomed_px, font_px_for_scale(app.font_size, 2.0));
     assert!(frame_w(&app) <= win.width as usize, "zoomed-out grid fits");
 
-    // A config reload that preserves the zoom (no font_px; scale default
-    // unchanged): the pin law must keep the zoom pinned...
-    let pin = crate::app_config::reload_font_pin(false, app.font_px, app.default_font_px);
-    assert!(
-        pin,
-        "a surviving zoom keeps its explicit pin across a reload"
-    );
-    // ...so the reload's regime flip leaves metrics AT the zoomed px and the
-    // redraw-time scale re-tune stays gated: nothing moves.
-    app.font_px_explicit = pin;
+    // A reload that leaves the size alone refreshes the metrics at the same size,
+    // and the redraw-time re-tune finds nothing to change.
     app.refresh_all_window_metrics();
     app.apply_window_scale(w0);
-    assert_eq!(app.font_px, zoomed_px, "pinned zoom survives the redraw");
+    assert_eq!(app.font_px, zoomed_px, "the zoom survives the redraw");
     assert!(frame_w(&app) <= win.width as usize, "frame still fits");
 
-    // With the pin dropped and metrics at the scale default, the redraw-time re-tune must
-    // re-grid, so the frame never exceeds the glass.
-    app.font_px_explicit = false;
+    // Back at the default size, the redraw-time re-tune must re-grid, so the frame
+    // never exceeds the glass.
+    app.font_size = app.default_font_size;
     app.refresh_all_window_metrics(); // metrics -> for_scale(2.0) ≠ zoomed px
-    app.apply_window_scale(w0); // flips the active px back to the scale default
+    app.apply_window_scale(w0); // flips the active px back to the default
     assert!(
         (app.font_px - MetricsView::for_scale(2.0).font_px).abs() < 0.5,
-        "unpinned redraw re-tunes to the scale default"
+        "the redraw re-tunes to the default at 2x"
     );
     assert!(
         app.windows[&w0].cols < zoomed_cols,

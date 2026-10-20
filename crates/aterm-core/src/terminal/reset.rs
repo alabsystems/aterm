@@ -69,6 +69,7 @@ fn reset_modes(prev: &TerminalModes) -> TerminalModes {
         require_shell_integration_nonce: prev.require_shell_integration_nonce,
         kitty_keyboard_enabled: prev.kitty_keyboard_enabled,
         win32_input_enabled: prev.win32_input_enabled,
+        win32_input_openconsole: prev.win32_input_openconsole,
         ambiguous_width_double: prev.ambiguous_width_double,
         color_scheme: prev.color_scheme,
         ..TerminalModes::new()
@@ -162,6 +163,8 @@ impl Terminal {
             &mut self.secure_keyboard_entry,
             &mut groups,
         );
+        // A reset leaves the alternate screen.
+        self.holder_fence.note_alt_exit();
         // The host's default cursor style is host preference, not app state: it survives.
         self.modes.cursor_style = self.default_cursor_style;
         // Mode 12 mirrors the style's blink bit (see `set_cursor_blink`).

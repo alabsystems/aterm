@@ -1,0 +1,16 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# §5.2: the last close (a view's) does not cross a carried update; the open
+# turn does, and its successor closes it.
+see busy
+see idle
+wait 1000
+expect close t1 turn out=done
+see busy
+handoff carried
+expect mark - handoff carried=5 shed=0 epoch=1
+expect turn=t2
+see idle
+wait 1000
+expect open t1 turn
+expect open t2 turn at=1000
+expect close t2 turn out=done at=1000

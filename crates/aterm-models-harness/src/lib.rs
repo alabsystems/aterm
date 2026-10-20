@@ -17,6 +17,7 @@
 //! and those tests, never a library.
 
 mod models_agent_verdict;
+mod models_disk;
 mod models_harness;
 mod models_harness_host;
 mod models_harness_policy_writer;
@@ -30,13 +31,15 @@ mod models_supervise_accounts;
 mod models_supervise_tape;
 
 pub use models_agent_verdict::claude_idle_at_composer_model;
+pub use models_disk::{disk_await_liveness, disk_await_model, disk_reclaim_pass_model};
 pub use models_harness::*;
 pub use models_harness_host::{
-    harness_commit_owed_model, harness_exit_record_model, harness_handoff_claim_model,
-    harness_leave_model, harness_muse_exit_witness_model, harness_relaunch_on_exit_model,
-    harness_restart_stamp_liveness, harness_restart_stamp_model, harness_restored_carry_model,
-    harness_restored_first_attempt_model, harness_upgrade_age_model, harness_upgrade_look_model,
-    harness_worker_lifecycle_model,
+    harness_agy_exit_witness_model, harness_agy_quiet_upgrade_model, harness_commit_owed_model,
+    harness_exit_record_model, harness_gemini_exit_witness_model, harness_handoff_claim_model,
+    harness_leave_model, harness_muse_exit_witness_model, harness_muse_quiet_upgrade_model,
+    harness_relaunch_on_exit_model, harness_restart_stamp_liveness, harness_restart_stamp_model,
+    harness_restored_carry_model, harness_restored_first_attempt_model, harness_upgrade_age_model,
+    harness_upgrade_look_model, harness_worker_lifecycle_model,
 };
 pub use models_harness_policy_writer::{
     harness_policy_one_writer_liveness, harness_policy_one_writer_model,
@@ -52,12 +55,13 @@ pub use models_program_resolution::program_resolution_retry_model;
 pub use models_relaunch_prompt::{relaunch_prompt_read_liveness, relaunch_prompt_read_model};
 pub use models_supervise::{
     supervisor_box_ask_model, supervisor_break_offer_model, supervisor_claim_model,
-    supervisor_decline_keys_model, supervisor_done_check_model, supervisor_focus_choice_model,
-    supervisor_host_turn_end_model, supervisor_model_switch_liveness,
-    supervisor_model_switch_model, supervisor_network_wall_model, supervisor_question_answer_model,
-    supervisor_question_text_model, supervisor_stall_remedy_model, supervisor_survey_press_model,
-    supervisor_turn_end_model, supervisor_usage_wall_liveness, supervisor_usage_wall_model,
-    upgrade_attended_turn_end_model, upgrade_refused_turn_end_model, upgrade_settle_turn_end_model,
+    supervisor_credits_hold_liveness, supervisor_credits_hold_model, supervisor_decline_keys_model,
+    supervisor_done_check_model, supervisor_focus_choice_model, supervisor_host_turn_end_model,
+    supervisor_model_switch_liveness, supervisor_model_switch_model, supervisor_network_wall_model,
+    supervisor_question_answer_model, supervisor_question_text_model,
+    supervisor_stall_remedy_model, supervisor_survey_press_model, supervisor_turn_end_model,
+    supervisor_usage_wall_liveness, supervisor_usage_wall_model, upgrade_attended_turn_end_model,
+    upgrade_refused_turn_end_model, upgrade_settle_turn_end_model,
 };
 pub use models_supervise_accounts::{
     supervisor_account_rotation_liveness, supervisor_account_rotation_model,

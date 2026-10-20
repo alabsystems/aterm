@@ -12,6 +12,10 @@
 //! machine lacks or which holds someone's login. Read as plain lines: a bare `curl`
 //! is a line whose command (after an optional `if` and `!`) is `curl` without
 //! `--proto`; `api.github.com` and `gh api|auth|release` are refused anywhere.
+//!
+//! The installer is also the script walk's anchor: a guard run that reads no
+//! `tools/install.sh` lost the scripts (a moved `tools/`, a narrowed
+//! [`Script`] test), and every rule over them held vacuously.
 
 use super::{Finding, Rule, Script, Tree};
 
@@ -24,12 +28,22 @@ pub(super) const INSTALLER_NETWORK: Rule = Rule {
     check: installer_network,
 };
 
-/// The one installer.
+/// The one installer, and the one script every guard run must read: an
+/// anchor, not a count, so a script deleted on purpose moves no number.
 const INSTALLER: &str = "tools/install.sh";
 
 fn installer_network(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    if let Some(script) = tree.corpus.scripts.iter().find(|s| s.rel == INSTALLER) {
-        out.extend(fences(script));
+    match tree.corpus.scripts.iter().find(|s| s.rel == INSTALLER) {
+        Some(script) => out.extend(fences(script)),
+        None => out.push(Finding {
+            rule: INSTALLER_NETWORK.id,
+            path: INSTALLER.to_string(),
+            line: 0,
+            detail: format!(
+                "read no {INSTALLER}, the one script every run must scan: the walk lost the \
+                 scripts, so every script rule held vacuously"
+            ),
+        }),
     }
 }
 
@@ -121,5 +135,20 @@ mod tests {
         );
         let lost = run(&INSTALLER_NETWORK, &[(INSTALLER, "#!/bin/sh\nwget x\n")]);
         assert_eq!(spots(&lost), ["tools/install.sh:0"]);
+    }
+
+    /// A walk that reads no installer lost the scripts: other scripts do not
+    /// stand in for it.
+    #[test]
+    fn a_walk_that_misses_the_installer_is_a_finding() {
+        let clean = format!("#!/bin/sh\n{TRANSPORT}");
+        for files in [&[][..], &[("tools/other.sh", clean.as_str())][..]] {
+            let found = run(&INSTALLER_NETWORK, files);
+            assert!(
+                found.len() == 1 && found[0].detail.starts_with("read no tools/install.sh"),
+                "{found:?}"
+            );
+        }
+        assert!(run(&INSTALLER_NETWORK, &[(INSTALLER, &clean)]).is_empty());
     }
 }

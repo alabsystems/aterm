@@ -215,7 +215,10 @@ impl KeyContext<'_> {
         let (key_without_modifiers, _) = event.key_without_modifiers();
         let text_with_all_modifiers = event.text_with_all_modifiers();
 
-        let platform_specific = KeyEventExtra { text_with_all_modifiers, key_without_modifiers };
+        let text_ignoring_lock = event.text_ignoring_lock();
+
+        let platform_specific =
+            KeyEventExtra { text_with_all_modifiers, key_without_modifiers, text_ignoring_lock };
 
         KeyEvent { physical_key, logical_key, text, location, state, repeat, platform_specific }
     }
@@ -334,6 +337,21 @@ impl<'a, 'b> KeyEventResults<'a, 'b> {
         self.composed_text().unwrap_or_else(|_| self.context.keysym_to_utf8_raw(self.keysym))
     }
 
+    /// [`Self::text`] at the press's Shift level with Caps Lock off
+    /// (`KeyEventExtModifierSupplement::text_ignoring_lock`): the keysym read again on the
+    /// state without the keymap's `Lock`. A composed press is its composition.
+    pub fn text_ignoring_lock(&mut self) -> Option<SmolStr> {
+        if let Ok(composed) = self.composed_text() {
+            return composed;
+        }
+        let Some(lock) = self.context.keymap.mods_indices().caps else {
+            return self.text();
+        };
+        let keysym =
+            self.context.state.get_one_sym_without(self.context.keymap, 1 << lock, self.keycode);
+        self.context.keysym_to_utf8_raw(keysym)
+    }
+
     // The current behaviour makes it so composing a character overrides attempts to input a
     // control character with the `Ctrl` key. We can potentially add a configuration option
     // if someone specifically wants the opposite behaviour.
@@ -429,4 +447,85 @@ fn byte_slice_to_smol_str(bytes: &[u8]) -> Option<SmolStr> {
             tracing::warn!("UTF-8 received from libxkbcommon ({:?}) was invalid: {_e}", bytes)
         })
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aterm_xkb::RuleNames;
+
+    /// The evdev keycodes (plus 8) of the two `i` keys of Turkish Q: `<AC11>` types `i`, and
+    /// `İ` with Shift; `<AD08>` (the US `i`) types `ı`, and `I` with Shift.
+    const TR_DOTTED_I: u32 = 40 + 8;
+    const TR_DOTLESS_I: u32 = 23 + 8;
+
+    /// A context over the evdev `tr` keymap, or `None` (with `SKIP:`) where the machine has
+    /// no libxkbcommon or keyboard data.
+    fn turkish() -> Option<Context> {
+        let Ok(mut context) = Context::new() else {
+            eprintln!("SKIP: no libxkbcommon");
+            return None;
+        };
+        let names = RuleNames {
+            rules: c"evdev".as_ptr(),
+            model: c"pc105".as_ptr(),
+            layout: c"tr".as_ptr(),
+            variant: c"".as_ptr(),
+            options: c"".as_ptr(),
+        };
+        // SAFETY: a live context and NUL-terminated names that outlive the call.
+        let keymap = unsafe {
+            (xkbh().keymap_new_from_names)(
+                context.context.as_ptr(),
+                &names,
+                xkb::KEYMAP_COMPILE_NO_FLAGS,
+            )
+        };
+        let Some(keymap) = NonNull::new(keymap) else {
+            eprintln!("SKIP: no xkeyboard-config data for evdev/tr");
+            return None;
+        };
+        let keymap = XkbKeymap::from_raw_for_test(keymap);
+        context.state = XkbState::new_for_test(&keymap);
+        context.keymap = Some(keymap);
+        Some(context)
+    }
+
+    /// `(text, text_ignoring_lock)` of a press of `keycode` under `shift` and `lock`.
+    fn press(context: &mut Context, keycode: u32, shift: bool, lock: bool) -> (String, String) {
+        let indices = context.keymap.as_ref().unwrap().mods_indices();
+        let mask = |on: bool, index: Option<u32>| if on { 1u32 << index.unwrap() } else { 0 };
+        let state = context.state.as_mut().unwrap();
+        state.update_modifiers(mask(shift, indices.shift), 0, mask(lock, indices.caps), 0, 0, 0);
+        let event =
+            context.key_context().unwrap().process_key_event(keycode, ElementState::Pressed, false);
+        let text_ignoring_lock = event.platform_specific.text_ignoring_lock.clone();
+        let text = |t: Option<SmolStr>| t.map(|t| t.to_string()).unwrap_or_default();
+        (text(event.text), text(text_ignoring_lock))
+    }
+
+    /// A CHORD'S LETTER TAKES SHIFT'S CASE, NEVER CAPS LOCK'S, ON XKB TOO (ATERM-KI-1015-9). xkb
+    /// cancels Shift against Lock on an alphabetic key, so Turkish Caps Lock + Shift+i types
+    /// `i`, and an Alt chord built from that text named `i`'s default capital `I` where Shift
+    /// alone names `İ`. The press read again without the lock is Shift's: `İ`. Without Shift
+    /// it is the lowercase letter; without the lock it is the text itself (the controls).
+    #[test]
+    fn a_press_under_caps_lock_is_read_again_without_it() {
+        let Some(mut tr) = turkish() else { return };
+        for (keycode, shift, lock, text, ignoring_lock) in [
+            (TR_DOTTED_I, true, true, "i", "\u{130}"),
+            (TR_DOTTED_I, false, true, "\u{130}", "i"),
+            (TR_DOTTED_I, true, false, "\u{130}", "\u{130}"),
+            (TR_DOTTED_I, false, false, "i", "i"),
+            (TR_DOTLESS_I, true, true, "\u{131}", "I"),
+            (TR_DOTLESS_I, false, true, "I", "\u{131}"),
+            (TR_DOTLESS_I, true, false, "I", "I"),
+        ] {
+            assert_eq!(
+                press(&mut tr, keycode, shift, lock),
+                (text.to_string(), ignoring_lock.to_string()),
+                "key {keycode}, shift {shift}, lock {lock}"
+            );
+        }
+    }
 }

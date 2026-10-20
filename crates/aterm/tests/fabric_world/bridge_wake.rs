@@ -89,10 +89,15 @@ fn a_queued_fetch_has_a_prompt_event_without_the_roster_drain() {
 /// dropped event, so a normal post event cannot make this test pass by accident.
 #[test]
 fn a_lost_post_event_is_delivered_by_the_roster_backstop() {
+    // The round IS the subject, so it runs at test pace
+    // ([`harness::FAST_TIMERS`]).
     let w = World::boot_with(
         "r2postdrop",
         &[],
-        &[("ATERM_LINK_FAULT", "drop-post-event-while-marked")],
+        &[
+            ("ATERM_LINK_FAULT", "drop-post-event-while-marked"),
+            harness::FAST_TIMERS,
+        ],
     );
     w.wait_ready();
     let (a, b) = w.two_sessions();
@@ -109,8 +114,8 @@ fn a_lost_post_event_is_delivered_by_the_roster_backstop() {
     assert!(model.fire("LoseEvent", &mut state));
     let _ = std::fs::remove_file(w.state.join("drop-post-event"));
     // A hang detector: the backstop is the only path left, and it runs every
-    // roster round (2 s), so a minute is dozens of rounds — and the wait ends at
-    // the first one that delivers.
+    // roster round (500 ms at test pace), so a minute is a hundred rounds — and
+    // the wait ends at the first one that delivers.
     let row = until(
         "the roster backstop to deliver a post without its event",
         || {

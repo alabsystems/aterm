@@ -182,7 +182,7 @@ fn capture_reflects_the_live_layout() {
 #[test]
 fn a_cold_restore_brings_every_window_back_at_its_own_grid_and_size() {
     use crate::app_window::CarriedFrame;
-    use winit::dpi::PhysicalSize;
+    use aterm_window::dpi::PhysicalSize;
     let (w0, w1) = (WindowId(0), WindowId(1));
     let grid = |app: &App, wid: WindowId| (app.windows[&wid].rows, app.windows[&wid].cols);
     // A real window's re-grid inside the size it has.
@@ -212,7 +212,7 @@ fn a_cold_restore_brings_every_window_back_at_its_own_grid_and_size() {
             w1
         );
         let ws = next.windows.get_mut(&w1).expect("window 1");
-        ws.take_carried_frame(inner, row.is_some_and(|row| row.presence_row));
+        ws.take_carried_frame(inner);
         let carried = ws.carried_inner_px.take();
         let frame = next.attach_frame_px(w1, rows, cols, carried);
         size_to(&mut next, w1, frame);
@@ -221,7 +221,7 @@ fn a_cold_restore_brings_every_window_back_at_its_own_grid_and_size() {
 
     // THE DESK.
     let mut desk = App::headless_for_test();
-    let base = desk.font_px;
+    let base = desk.font_size;
     assert_eq!(
         desk.insert_logical_window(crate::stub_session(1), 40, 120),
         w1
@@ -244,7 +244,7 @@ fn a_cold_restore_brings_every_window_back_at_its_own_grid_and_size() {
     assert_eq!(grid(&next, w0), (29, 100));
 
     // A ZOOMED QUIT: the saved size holds the zoomed grid only at the zoom.
-    desk.set_font_px(base + crate::FONT_ZOOM_STEP);
+    desk.set_font_size(base + crate::FONT_ZOOM_STEP);
     size_to(&mut desk, w0, first);
     size_to(&mut desk, w1, dragged);
     let zoomed = grid(&desk, w1);
@@ -1057,7 +1057,9 @@ fn manual_editor_identity_survives_capture_restore_and_blocks_malformed_save() {
     let root = std::path::PathBuf::from(std::env::var_os(ROOT).unwrap());
     let config = root.join("aterm/aterm.toml");
     let mut source = App::headless_for_test();
-    assert!(source.open_settings_tab(crate::native_settings::SettingsRoute::Manual));
+    source
+        .open_config_editor_in_front()
+        .expect("Open aterm.toml opens the editor");
     assert!(config.is_file(), "Manual resolves the isolated aterm.toml");
     let (_, source_view) = source.active_native_view(WindowId(0)).unwrap();
     let descriptor = match source.view_restore_descriptor(source_view).unwrap() {
@@ -1120,8 +1122,11 @@ fn manual_editor_identity_survives_capture_restore_and_blocks_malformed_save() {
     assert!(!save.enabled, "malformed restored Manual cannot Save");
 }
 
+/// A captured Manual page restores as the Manual page, with or without a
+/// Settings tab already open, and opens no editor: going to a page is never
+/// a way to open aterm.toml.
 #[test]
-fn legacy_manual_settings_restore_normalizes_with_or_without_singleton() {
+fn manual_settings_restore_is_the_manual_page_with_or_without_singleton() {
     let wid = WindowId(0);
     let descriptor = restore::NativeLeafRestore::settings("/manual".to_string());
     for preinstall_singleton in [false, true] {
@@ -1133,8 +1138,12 @@ fn legacy_manual_settings_restore_normalizes_with_or_without_singleton() {
         assert!(matches!(
             app.native_runtime.view_state(view),
             Some(crate::native_app::AppViewState::Settings(state))
-                if state.route == crate::native_settings::SettingsRoute::Home
+                if state.route == crate::native_settings::SettingsRoute::Manual
         ));
+        assert!(
+            app.native_runtime.config_editor_document().is_none(),
+            "restoring the page opens no editor"
+        );
         app.remove_view_link(view);
     }
 }
@@ -1249,12 +1258,9 @@ fn remint_carried_connections_remints_kinds_and_drops_the_unmintable() {
             .expect("the a → b record is back");
         assert_eq!(rec.kind(), Some(aterm_session::ConnectionKind::Both));
     }
-    // And the ❯ count agrees with the map's arrow fold: one connection.
-    assert_eq!(crate::connections::connection_count(&app.store), 1);
-
     // Second pass: nothing pending, nothing changes.
     app.remint_carried_connections();
-    assert_eq!(crate::connections::connection_count(&app.store), 1);
+    assert_eq!(app.connections.records().len(), 1);
 }
 
 /// A one-window, one-terminal-leaf layout whose leaf carries `leaf`'s USER
@@ -1303,6 +1309,7 @@ fn bare_leaf() -> restore::TerminalLeafRestore {
         theme: None,
         agent: None,
         supervised: None,
+        lost: None,
         held: false,
         holds: Vec::new(),
     }
@@ -1387,7 +1394,7 @@ fn a_handoff_keeps_user_metadata_on_every_adopted_window_bootstrap() {
         (MetaField::Questions, "recommended"),
     ] {
         assert_eq!(
-            write_session_meta(&ctx, field, MetaEdit::Set(value)),
+            write_session_meta(&ctx, field, MetaEdit::Set(value), aterm_slog::Actor::Ctl),
             Ok(true),
             "`meta set {}` stores",
             field.wire_name()
@@ -1587,7 +1594,8 @@ fn driver_meta(
         .ctx
         .clone();
     assert!(
-        crate::session_timeline::write_session_meta(&ctx, field, edit).is_ok(),
+        crate::session_timeline::write_session_meta(&ctx, field, edit, aterm_slog::Actor::Ctl)
+            .is_ok(),
         "`meta` answers OK to {field:?} {edit:?}"
     );
 }
@@ -1940,6 +1948,7 @@ const OWED_LOGIN: &str = "/Users//me/logins/work-2";
 fn owed_relaunch(tab: &str) -> aterm_agent::harness::relaunch::Snapshot {
     aterm_agent::harness::relaunch::Snapshot {
         stored_login: false,
+        profile: None,
         tab: tab.to_string(),
         pid: 4242,
         start: "Sat Sep 27 01:02:03 2026".into(),
@@ -3009,6 +3018,210 @@ fn the_handoff_leaf_names_the_supervised_agent_where_nothing_is_owed() {
     );
     crate::harness_host::publish_snapshot_for_test(&sid, None);
     app.rollback_overlap(None, &[]);
+}
+
+/// THE HANDOFF LEAF CARRIES THE HOST'S LOST WORD, AND THE SUCCESSOR'S HOST
+/// STANDS IT AT ITS COMMIT (LC-4 of ATERM-KI-1016-1): the word standing
+/// that a tab's agent cannot be brought back rides that tab's handoff leaf
+/// (`TerminalLeafRestore::lost`) — through the wire, never on a durable
+/// layout — and is compared at the Commit with the agents, the topology
+/// unmoved; the successor finds it on the shell adopted under the id the
+/// leaf names and hands it to its own host
+/// (`App::adopt_carried_lost_words`), whose word the tab then keeps.
+/// NEGATIVE CONTROL: a leaf that carries none stands none.
+#[cfg(unix)]
+#[test]
+fn the_handoff_leaf_carries_the_lost_word_and_the_successor_stands_it() {
+    use crate::app_update_handoff::{commit_agent_carry, commit_layout_topology};
+    let act = || {
+        crate::harness_host::HostHandle::for_restored_test_with_open_tabs(std::sync::Arc::new(
+            |_, _, _, _| "wait:shell-prompt".to_string(),
+        ))
+    };
+    let host = act();
+    let mut app = App::headless_for_test();
+    let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
+    let sid = {
+        let g = app.store.read().unwrap();
+        g.by_local(0).expect("registered").sid.as_str().to_string()
+    };
+    app.harness = Some(host.clone());
+    let word = restore::LostRestore {
+        session: "1057c0de-6e66-4f1e-9c0d-8e4f5a6b7c8d".to_string(),
+        pid: 4242,
+        marked: true,
+        reason: "its conversation could not be resumed".to_string(),
+        restarted: false,
+        command: Some("claude --resume 1057c0de-6e66-4f1e-9c0d-8e4f5a6b7c8d".to_string()),
+    };
+    let leaf = |layout: &restore::RestoreManifest| {
+        layout
+            .handed_off_leaves()
+            .into_iter()
+            .find(|leaf| leaf.local_id == Some(0))
+            .expect("the tab's leaf")
+    };
+    assert!(app.park_all_readers(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN));
+    assert_eq!(
+        leaf(&app.capture_handoff_layout()).lost,
+        None,
+        "no word yet"
+    );
+    let carried = Some(Box::new(word.clone()));
+    host.adopt_lost_words(vec![(sid.clone(), word.clone())]);
+    let pending = app.capture_handoff_layout();
+    assert_eq!(leaf(&pending).lost, carried, "the handoff leaf");
+    let wire = pending.to_toml().expect("the wire");
+    assert_eq!(
+        leaf(&restore::RestoreManifest::from_toml(&wire).expect("read back")).lost,
+        carried,
+        "through the wire"
+    );
+    assert_eq!(
+        leaf(&app.capture_restore_manifest()).lost,
+        None,
+        "a durable layout carries none"
+    );
+    // A word that moved between the two captures refuses the Commit; the
+    // topology does not move.
+    let mut moved = app.capture_handoff_layout();
+    let before = commit_agent_carry(&moved);
+    assert_eq!(before, commit_agent_carry(&pending));
+    for window in &mut moved.windows {
+        for tab in &mut window.restored_tabs {
+            if let restore::RestoredSplitTree::Leaf {
+                view: restore::RestoredView::Terminal(terminal),
+            } = &mut tab.root
+            {
+                terminal.lost = None;
+            }
+        }
+    }
+    assert_ne!(commit_agent_carry(&moved), before, "compared at the Commit");
+    assert_eq!(
+        commit_layout_topology(&moved),
+        commit_layout_topology(&pending),
+        "not topology"
+    );
+    app.rollback_overlap(None, &[]);
+
+    // The successor: the shell adopted under the id the leaf names.
+    let stood = |carried: Option<restore::LostRestore>| {
+        let successor_host = act();
+        let mut successor = App::headless_for_test();
+        successor.handoff_successor = true;
+        successor.restore_into_window(
+            WindowId(0),
+            window_of(vec![restore::RestoredSplitTree::leaf(
+                restore::RestoredView::Terminal(restore::TerminalLeafRestore {
+                    local_id: Some(8),
+                    lost: carried.map(Box::new),
+                    ..bare_leaf()
+                }),
+            )]),
+        );
+        let adopted = *successor.pool.sessions.keys().max().expect("a session");
+        adopt_as(&mut successor, adopted, 8);
+        let adopted_sid = {
+            let g = successor.store.read().unwrap();
+            g.by_local(adopted)
+                .expect("registered")
+                .sid
+                .as_str()
+                .to_string()
+        };
+        successor.harness = Some(successor_host.clone());
+        successor.hand_carried_restored_agents();
+        successor_host.lost_word(&adopted_sid)
+    };
+    assert_eq!(stood(Some(word.clone())), Some(word), "stood at the Commit");
+    assert_eq!(stood(None), None, "NEGATIVE CONTROL");
+}
+
+/// THE SUCCESSOR'S COMMIT CARRIES WHAT THE PREDECESSOR LEFT FOR ITS HOST
+/// BEFORE THE HOST RESUMES (LC-4 of ATERM-KI-1016-1; the review's KR-1):
+/// run through the Commit wake's own step
+/// (`App::take_over_supervision_at_commit`), the adopted shell reads the
+/// person's stamp the outgoing process wrote at its Commit, the sidecar is
+/// consumed, and the lost word its handoff leaf carried already stands on
+/// the host when the host resumes — a relaunch the host carries through a
+/// hand asks whether nobody keyed since, and a pass of it lowers a mark no
+/// word keeps. NEGATIVE CONTROL: a successor nothing was carried for reads
+/// the shell as never keyed and has no word standing at the resume.
+#[cfg(unix)]
+#[test]
+fn the_successors_commit_carries_the_stamps_and_words_before_its_host_resumes() {
+    let word = restore::LostRestore {
+        session: "2057c0de-6e66-4f1e-9c0d-8e4f5a6b7c8d".to_string(),
+        pid: 4343,
+        marked: true,
+        reason: "its conversation could not be resumed".to_string(),
+        restarted: false,
+        command: Some("claude --resume 2057c0de-6e66-4f1e-9c0d-8e4f5a6b7c8d".to_string()),
+    };
+    let dir = crate::control_auth::socket_dir().expect("a private control dir");
+    let commit = |carried: bool| {
+        let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
+            std::sync::Arc::new(|_, _, _, _| "wait:shell-prompt".to_string()),
+        );
+        let mut successor = App::headless_for_test();
+        successor.handoff_successor = true;
+        let adopted = *successor.pool.sessions.keys().max().expect("a session");
+        adopt_as(&mut successor, adopted, 8);
+        let sid = {
+            let g = successor.store.read().unwrap();
+            g.by_local(adopted)
+                .expect("registered")
+                .sid
+                .as_str()
+                .to_string()
+        };
+        let sidecar = dir.join(format!(
+            "seamless-{}-{}.person",
+            std::process::id(),
+            aterm_uds::rand::hex_token::<8>().expect("a token")
+        ));
+        if carried {
+            assert!(crate::seamless::write_person_stamps(
+                &sidecar,
+                &[(8, crate::seamless::PersonStamp::Keyed(90_000))]
+            ));
+            successor.handoff_person_stamps = Some(sidecar.clone());
+            successor.handoff_lost_words = vec![(8, word.clone())];
+        }
+        successor.harness = Some(host.clone());
+        let at_resume = std::rc::Rc::new(std::cell::RefCell::new(None));
+        {
+            let at_resume = std::rc::Rc::clone(&at_resume);
+            let (host, sid) = (host.clone(), sid.clone());
+            successor.handoff_before_host_resume = Some(Box::new(move |_| {
+                *at_resume.borrow_mut() = Some(host.lost_word(&sid));
+            }));
+        }
+        successor.take_over_supervision_at_commit();
+        let stamp = successor
+            .pool
+            .get(adopted)
+            .expect("live")
+            .ctx
+            .human_input
+            .ms_since(crate::metrics::now_us());
+        let stood = at_resume.borrow_mut().take().expect("the host resumed");
+        (stamp, stood, sidecar.exists())
+    };
+    let (stamp, stood, left) = commit(true);
+    assert!(stamp.is_some_and(|ms| ms >= 90_000), "the stamp: {stamp:?}");
+    assert_eq!(
+        stood.as_ref(),
+        Some(&word),
+        "standing when the host resumed"
+    );
+    assert!(!left, "the sidecar is consumed");
+    assert_eq!(
+        commit(false),
+        (None, None, false),
+        "NEGATIVE CONTROL: nothing carried"
+    );
 }
 
 /// THE HANDOFF LEAF NAMES THE CONVERSATION ITS AGENT'S RECORD NAMES, AND A
@@ -4151,6 +4364,7 @@ fn handed_off_shell(local_id: u64) -> crate::spawn::Adopted {
         timeline_id: 0,
         log: Default::default(),
         journal_key: None,
+        task: None,
     }
 }
 
@@ -6628,6 +6842,137 @@ fn a_session_theme_rides_the_layout_and_comes_back_restored() {
     );
 }
 
+/// WINDOWS' END-SESSION SNAPSHOT CARRIES A WORD ABOUT TYPING AT ONCE
+/// (ATERM-KI-1016-1): the `WM_ENDSESSION` handler writes the layout the loop
+/// last published (`platform_win::set_end_session_snapshot`), which was taken
+/// at most every 2 s — so a Land, Off or hold set within 2 s of a logoff was
+/// lost, and the reopened tab was typed into. Now the snapshot is due at once
+/// where a word moved from what the last one carries
+/// (`crash_journal::EndSessionCadence`, told by `App::journal_owner_words`
+/// whatever the crash journal's lane is — inert, as on Windows): Land over
+/// the wire, the owner's hold, a timed Cruise and the timer landing it, and
+/// Off from the window's writer, each inside the interval of the one before.
+/// NEGATIVE CONTROLS: inside the interval with nothing moved, and a title
+/// (no word about typing), nothing is due; past it, the layout's own cadence
+/// takes it; with `restore_session` off it is retracted. Platform-neutral,
+/// so tested here; the Windows lane publishes it from `about_to_wait`. The
+/// first snapshot is stamped an hour ahead: no clock is raced.
+#[test]
+fn a_word_about_typing_reaches_windows_end_session_snapshot_at_once() {
+    use aterm_agent::supervise::Autopilot;
+
+    use crate::fabric::{Hold, apply_hold_for_test};
+    use crate::session_timeline::{MetaField, apply_meta_value};
+
+    let mut app = App::headless_for_test();
+    assert!(
+        !app.crash_journal.is_active(),
+        "the lane is inert, as on Windows"
+    );
+    let ctx = std::sync::Arc::clone(&app.pool.get(0).expect("the window's shell").ctx);
+    let sid = ctx.self_id.clone();
+    let words = |snapshot: Option<Option<restore::RestoreManifest>>| {
+        let manifest = snapshot.expect("due").expect("restore_session on");
+        let leaf = manifest
+            .handed_off_leaves()
+            .into_iter()
+            .find(|leaf| leaf.local_id == Some(0))
+            .expect("the tab's leaf");
+        (leaf.autopilot, leaf.holds)
+    };
+    let ahead = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    let mut at = ahead;
+    let mut inside = || {
+        at += std::time::Duration::from_millis(100);
+        at
+    };
+    assert!(app.end_session_snapshot(ahead).is_some(), "the first");
+    assert!(
+        app.end_session_snapshot(inside()).is_none(),
+        "nothing moved"
+    );
+
+    // NEGATIVE CONTROL: a title is no word about typing.
+    assert!(apply_meta_value(
+        &ctx,
+        MetaField::Title,
+        Some("renamed".into()),
+        aterm_slog::Actor::Ctl
+    ));
+    app.on_meta_changed(0);
+    assert!(
+        app.end_session_snapshot(inside()).is_none(),
+        "a title waits"
+    );
+
+    // LAND over the wire.
+    assert!(apply_meta_value(
+        &ctx,
+        MetaField::Autopilot,
+        Some("land".into()),
+        aterm_slog::Actor::Ctl
+    ));
+    app.on_meta_changed(0);
+    assert_eq!(
+        words(app.end_session_snapshot(inside())),
+        (Some("land".to_string()), Vec::new()),
+        "Land: at once"
+    );
+    assert!(app.end_session_snapshot(inside()).is_none(), "carried now");
+
+    // THE OWNER'S HOLD.
+    assert!(apply_hold_for_test(
+        &ctx,
+        Some(Hold {
+            reason: "review".to_string(),
+            origin: "local".to_string(),
+        })
+    ));
+    app.on_fabric_changed(&sid);
+    let held = vec!["local review".to_string()];
+    assert_eq!(
+        words(app.end_session_snapshot(inside())),
+        (Some("land".to_string()), held.clone()),
+        "the hold: at once"
+    );
+
+    // A TIMED CRUISE, and the timer landing it.
+    assert!(app.set_session_autopilot_timed(0, Some(Autopilot::Cruise), Some(1_000)));
+    assert_eq!(
+        words(app.end_session_snapshot(inside())).0.as_deref(),
+        Some("cruise"),
+        "the timed Cruise: at once"
+    );
+    app.expire_autopilot_timers_at(ahead, 2_000);
+    assert_eq!(
+        words(app.end_session_snapshot(inside())).0.as_deref(),
+        Some("land"),
+        "the timer's Land: at once"
+    );
+
+    // OFF from the window's writer.
+    assert!(app.set_session_autopilot(0, Some(Autopilot::Off)));
+    assert_eq!(
+        words(app.end_session_snapshot(inside())),
+        (Some("off".to_string()), held),
+        "Off: at once"
+    );
+
+    // NEGATIVE CONTROLS: the layout's own cadence, and a retraction.
+    let later = inside() + crate::crash_journal::END_SESSION_SNAPSHOT_TTL;
+    assert!(
+        app.end_session_snapshot(later).is_some(),
+        "past the interval"
+    );
+    app.config.restore_session = Some(false);
+    let off = later + crate::crash_journal::END_SESSION_SNAPSHOT_TTL;
+    assert_eq!(
+        app.end_session_snapshot(off),
+        Some(None),
+        "restore_session off: retracted"
+    );
+}
+
 /// A PERSON'S WORD ABOUT TYPING REACHES THE CRASH JOURNAL AT ONCE, AND THE
 /// TAB REOPENED FROM IT KEEPS IT (the live lab of 2026-10-17, `aterm-lab
 /// restore crash --land-open`: Land set, aterm SIGKILLed 0.8 s after the
@@ -6682,7 +7027,8 @@ fn a_word_about_typing_inside_the_write_interval_is_journaled_at_once_and_reopen
     assert!(apply_meta_value(
         &ctx,
         MetaField::Title,
-        Some("renamed".into())
+        Some("renamed".into()),
+        aterm_slog::Actor::Ctl
     ));
     woken(&mut app);
     app.on_meta_changed(0);
@@ -6696,7 +7042,8 @@ fn a_word_about_typing_inside_the_write_interval_is_journaled_at_once_and_reopen
     assert!(apply_meta_value(
         &ctx,
         MetaField::Autopilot,
-        Some("land".into())
+        Some("land".into()),
+        aterm_slog::Actor::Ctl
     ));
     woken(&mut app);
     app.on_meta_changed(0);
@@ -6798,6 +7145,440 @@ fn a_word_about_typing_inside_the_write_interval_is_journaled_at_once_and_reopen
     );
 }
 
+/// THE `OK` OF `hold` IS A DURABILITY ACK (ATERM-KI-1016-1): the control
+/// verb's answer comes once the crash journal's image that carries the hold
+/// is on disk, so a kill sent at the reply cannot lose it. The live lab had
+/// the reply up to 0.4 ms before the image was renamed into place in 16 of
+/// 100 trials, and a `SIGKILL` sent at the reply lost a hold in 2 of 7. The
+/// verb runs on a thread of its own, as a control lane does; this thread is
+/// the main loop, its turn's capture (`App::tick_crash_journal`). The verb
+/// takes its ticket and waits, unanswered, until the loop's capture hands the
+/// image and the writer has it on disk; at the answer, the disk names the
+/// hold. NEGATIVE CONTROLS: a lane with `restore_session` off, and an inert
+/// one, answer at once with no ticket.
+#[cfg(unix)]
+#[test]
+fn a_holds_ok_comes_once_the_journal_image_carrying_it_is_on_disk() {
+    let mut app = App::headless_for_test();
+    let sid = app
+        .pool
+        .get(0)
+        .expect("the window's shell")
+        .ctx
+        .self_id
+        .clone();
+    let journal_dir = crate::crash_journal::tests::scratch("cj-ack");
+    app.crash_journal = crate::crash_journal::Lane::new(
+        Some(journal_dir.path().to_path_buf()),
+        crate::crash_journal::tests::reaped_pid(),
+    );
+    app.arm_word_durability(|| {});
+    app.first_present_done = true;
+    let journal = app.crash_journal.journal_id();
+    let ahead = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    app.tick_crash_journal(ahead);
+    let durable = app.crash_journal.durable();
+
+    let store = std::sync::Arc::clone(&app.store);
+    let line = format!("hold {sid} on");
+    let verb = std::thread::spawn(move || {
+        crate::control::hold_line_for_test(&store, &line, crate::control::Scope::Owner)
+    });
+    // The verb took its ticket and is waiting: no loop turn has run.
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the verb's ticket, or its answer",
+        || {
+            (durable.covered() > 0 || verb.is_finished() || app.crash_journal.capture_due(ahead))
+                .then_some(())
+        },
+    );
+    assert!(
+        !verb.is_finished(),
+        "the OK waits for the journal: nothing has captured the hold yet"
+    );
+    // The loop's turns, until the verb is answered.
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the verb's answer", || {
+        app.tick_crash_journal(std::time::Instant::now());
+        verb.is_finished().then_some(())
+    });
+    assert_eq!(verb.join().expect("the verb's thread"), "OK hold=1\n");
+    // At the answer, the image on disk names the hold.
+    let text =
+        std::fs::read_to_string(journal_dir.path().join(journal.file_name())).expect("the journal");
+    let (_, image) = crate::crash_journal::decode(&text).expect("the image decodes");
+    let holds = image
+        .handed_off_leaves()
+        .into_iter()
+        .find(|leaf| leaf.local_id == Some(0))
+        .map(|leaf| leaf.holds)
+        .unwrap_or_default();
+    assert_eq!(holds, vec!["local -".to_string()], "the hold is on disk");
+
+    // NEGATIVE CONTROLS: restore_session off, and an inert lane, answer at
+    // once (no loop turn runs here).
+    app.config.restore_session = Some(false);
+    app.tick_crash_journal(std::time::Instant::now());
+    assert_eq!(
+        crate::control::hold_line_for_test(
+            &app.store,
+            &format!("hold {sid} off"),
+            crate::control::Scope::Owner
+        ),
+        "OK hold=0\n",
+        "restore_session off: at once"
+    );
+    app.crash_journal = crate::crash_journal::Lane::inert();
+    app.arm_word_durability(|| {});
+    assert_eq!(
+        crate::control::hold_line_for_test(
+            &app.store,
+            &format!("hold {sid} on"),
+            crate::control::Scope::Owner
+        ),
+        "OK hold=1\n",
+        "an inert lane: at once"
+    );
+    crate::crash_journal::tests::await_released(&journal_dir.path().join(journal.lock_name()));
+}
+
+/// THE FLEET'S HOLDS ARE ANSWERED AT ONCE; THE OWNER'S WAIT ON THE JOURNAL
+/// (the review's KR-J-1 of ATERM-KI-1016-1). The bridge writes its holds one
+/// session at a time on one blocking connection, and every `OK` of theirs
+/// waited on the journal: where the lane journals the desk but cannot
+/// capture yet (here: no first frame, as before it, in a cold restore's
+/// drain or before a successor's Commit), each fleet hold — and each lift of
+/// an attach that changes nothing — waited out the whole bound, so a fleet
+/// halt reached a later session only after the bound once per session
+/// before it. The fleet's halt has its own durable home (the bus's standing
+/// row every attach applies again), and the bridge reads its `OK` as
+/// "applied". On this lane no image can carry a word, so a verb that waits
+/// answers `journaled=0` whatever the bound (a short one here: nothing is
+/// raced), and one that does not answers bare. NEGATIVE CONTROLS: the
+/// owner's hold still waits, and so does its retry, which changes nothing —
+/// no image on disk carries the hold — and a bridge's act on the owner's
+/// slot.
+#[cfg(unix)]
+#[test]
+fn a_fleet_hold_is_answered_at_once_where_the_owners_waits_on_the_journal() {
+    use crate::control::{Scope, hold_line_for_test};
+    let mut app = App::headless_for_test();
+    let sid = app
+        .pool
+        .get(0)
+        .expect("the window's shell")
+        .ctx
+        .self_id
+        .clone();
+    let journal_dir = crate::crash_journal::tests::scratch("cj-fleet");
+    app.crash_journal = crate::crash_journal::Lane::new(
+        Some(journal_dir.path().to_path_buf()),
+        crate::crash_journal::tests::reaped_pid(),
+    );
+    app.arm_word_durability(|| {});
+    let journal = app.crash_journal.journal_id();
+    // A lane that journals the desk and cannot capture: no first frame.
+    app.first_present_done = false;
+    app.tick_crash_journal(std::time::Instant::now());
+    app.crash_journal
+        .durable()
+        .set_word_bound(std::time::Duration::from_millis(1));
+    let hold = |line: String, scope| hold_line_for_test(&app.store, &line, scope);
+
+    assert_eq!(
+        hold(
+            format!("hold {sid} on reason=stop origin=fleet"),
+            Scope::Bridge
+        ),
+        "OK hold=1\n",
+        "the fleet's halt: at once"
+    );
+    assert_eq!(
+        hold(format!("hold {sid} off origin=fleet"), Scope::Bridge),
+        "OK hold=0\n",
+        "its lift: at once"
+    );
+    assert_eq!(
+        hold(format!("hold {sid} off"), Scope::Bridge),
+        "OK hold=0\n",
+        "an attach's lift that changes nothing: at once"
+    );
+    // NEGATIVE CONTROLS: the owner's slot waits.
+    assert_eq!(
+        hold(format!("hold {sid} on"), Scope::Owner),
+        "OK hold=1 journaled=0\n",
+        "the owner's hold waits"
+    );
+    assert_eq!(
+        hold(format!("hold {sid} on"), Scope::Owner),
+        "OK hold=1 journaled=0\n",
+        "its retry changes nothing and still waits: no image carries it"
+    );
+    assert_eq!(
+        hold(format!("hold {sid} off origin=local"), Scope::Bridge),
+        "OK hold=0 journaled=0\n",
+        "a bridge's act on the owner's slot waits"
+    );
+    app.crash_journal = crate::crash_journal::Lane::inert();
+    crate::crash_journal::tests::await_released(&journal_dir.path().join(journal.lock_name()));
+}
+
+/// A HOLD LIFTED BEFORE A SEAMLESS SUCCESSOR'S FIRST IMAGE COMES BACK HELD,
+/// AND ITS LIFT SAYS SO (ATERM-KI-1016-1 LC-8, lifecycle-3; decided by ruling
+/// 23 (iii) and (iv) of `docs/HANDOFF-robustness-rounds-2026-10-08.md`: an
+/// end nobody chose fails toward the holder's stop). At its Commit the
+/// successor takes its parent's journal image over, the owner's hold on the
+/// tab's leaf (`local pause`), and writes no image of its own until its
+/// layout is its own (`crash_journal_writable`). The owner lifts the hold
+/// there: the `OK` says `journaled=0` (no image on disk carries the lift),
+/// the disk still names the hold, and a crash then reopens the tab held —
+/// with no agent on the leaf too (ruling 23 (iii): "for a tab with no agent
+/// too"). Nothing written can say the lift came after that image: the
+/// parent's image is the newest on disk, so the stop it names stands, and the
+/// owner lifts it again as any local hold (`hold <sid> off`, Fabric > Lift
+/// Hold; a held agent's record names that line). NEGATIVE CONTROL: once
+/// the successor's own image is on disk the lift is durable, and the crash
+/// reopens the tab unheld.
+#[cfg(unix)]
+#[test]
+fn a_hold_lifted_before_a_successors_first_image_comes_back_held_and_says_so() {
+    use crate::control::{Scope, hold_line_for_test};
+    use crate::crash_journal::{self, JournalHeader, JournalId, JournalOwner, Lane, tests as cj};
+    use crate::fabric::{Hold, apply_hold_for_test};
+    let reopened_held = |own_image_first: bool| -> bool {
+        let (dir, logs) = (cj::scratch("cj-lift"), cj::scratch("cj-lift-logs"));
+        // THE PARENT'S IMAGE: one tab, the owner's hold on its leaf, no agent.
+        let parent = JournalId::now(cj::reaped_pid());
+        let owner = JournalOwner::create(dir.path(), parent).expect("armed");
+        let held = restore::TerminalLeafRestore {
+            local_id: Some(0),
+            cwd: Some("/a".to_string()),
+            holds: vec!["local pause".to_string()],
+            ..bare_leaf()
+        };
+        owner
+            .publish(
+                &restore::RestoreManifest::new(vec![window_of(vec![
+                    restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(held)),
+                ])]),
+                &JournalHeader::now(parent.pid, false),
+            )
+            .expect("published");
+        cj::die(owner);
+        // THE SUCCESSOR at its Commit: it adopted the parent's shell 0 as its
+        // session 0, held as the handoff carried it, and took the image over.
+        let mut app = App::headless_for_test();
+        adopt_as(&mut app, 0, 0);
+        let ctx = std::sync::Arc::clone(&app.pool.get(0).expect("session 0").ctx);
+        assert!(apply_hold_for_test(
+            &ctx,
+            Some(Hold {
+                reason: "pause".to_string(),
+                origin: "local".to_string(),
+            })
+        ));
+        let sid = ctx.self_id.clone();
+        let mut lane = Lane::new(Some(dir.path().to_path_buf()), cj::reaped_pid());
+        lane.set_predecessor(parent.pid, Some(parent.nanos));
+        let own = lane.journal_id();
+        cj::marker(logs.path(), own);
+        assert_eq!(lane.adopt_predecessor(true), Some(parent));
+        app.crash_journal = lane;
+        app.arm_word_durability(|| {});
+        // The image on disk, and whether it is the successor's own (its
+        // writer's pid), not the parent's it took over.
+        let on_disk = || {
+            let text =
+                std::fs::read_to_string(dir.path().join(own.file_name())).expect("the journal");
+            let (header, image) = crash_journal::decode(&text).expect("the image decodes");
+            (header.pid == own.pid, image)
+        };
+        assert!(!on_disk().0, "the parent's image, taken over");
+        app.first_present_done = own_image_first;
+        app.tick_crash_journal(std::time::Instant::now());
+        if own_image_first {
+            aterm_spec::wait::until_within(
+                aterm_spec::wait::MUST_HAPPEN,
+                "the successor's own image on disk",
+                || {
+                    app.tick_crash_journal(std::time::Instant::now());
+                    on_disk().0.then_some(())
+                },
+            );
+        }
+        // THE OWNER'S LIFT.
+        let bound = if own_image_first {
+            aterm_spec::wait::MUST_HAPPEN
+        } else {
+            std::time::Duration::from_millis(1)
+        };
+        app.crash_journal.durable().set_word_bound(bound);
+        let store = std::sync::Arc::clone(&app.store);
+        let line = format!("hold {sid} off");
+        let verb = std::thread::spawn(move || hold_line_for_test(&store, &line, Scope::Owner));
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the lift's answer", || {
+            app.tick_crash_journal(std::time::Instant::now());
+            verb.is_finished().then_some(())
+        });
+        let answer = verb.join().expect("the verb's thread");
+        let leaf_holds = on_disk()
+            .1
+            .handed_off_leaves()
+            .into_iter()
+            .find(|leaf| leaf.local_id == Some(0))
+            .map(|leaf| leaf.holds)
+            .unwrap_or_default();
+        if own_image_first {
+            assert_eq!(answer, "OK hold=0\n", "durable: the successor's image");
+            assert!(leaf_holds.is_empty(), "{leaf_holds:?}");
+        } else {
+            assert_eq!(
+                answer, "OK hold=0 journaled=0\n",
+                "the lift says no image carries it"
+            );
+            assert_eq!(
+                leaf_holds,
+                vec!["local pause".to_string()],
+                "the disk still holds"
+            );
+        }
+        // THE CRASH, and the next launch's claim and restore.
+        app.crash_journal = Lane::inert();
+        cj::await_released(&dir.path().join(own.lock_name()));
+        let claim = crash_journal::claim_at_boot(
+            dir.path(),
+            &crash_journal::Evidence {
+                log_dir: Some(logs.path()),
+                swept: &[],
+            },
+            std::process::id(),
+            crash_journal::QuitLayout::default(),
+        );
+        let reopened = claim.reopened.expect("the desk comes back");
+        let window = reopened
+            .manifest
+            .windows
+            .into_iter()
+            .next()
+            .expect("the window");
+        let mut cold = App::headless_for_test();
+        cold.restore_into_window(WindowId(0), window);
+        assert!(
+            cold.take_restored_agents().is_empty(),
+            "no agent on the leaf"
+        );
+        cold.pool
+            .get(0)
+            .expect("the reopened tab's shell")
+            .ctx
+            .fabric
+            .holds()
+            .has("local")
+    };
+    assert!(
+        reopened_held(false),
+        "lifted before the successor's first image: held again"
+    );
+    assert!(
+        !reopened_held(true),
+        "NEGATIVE CONTROL: lifted after it, the lift stands"
+    );
+}
+
+/// THE `OK` OF `meta set|unset autopilot` IS A DURABILITY ACK, AS `hold`'s
+/// IS (ATERM-KI-1016-1; the review's KR-J-2: no test ran a `meta` line
+/// through the verb's own door, so the arm's wait could be taken out with
+/// every test green). Each line runs on a thread of its own, as a control
+/// lane does, through the dispatch's `meta` answer
+/// (`control::meta_line_for_test`); this thread is the main loop. The verb
+/// takes its ticket (the lane's wake rings) and waits, unanswered, until
+/// the loop's capture hands the image and the writer has it on disk; at the
+/// answer, the disk names the word — Land, then none. NEGATIVE CONTROLS:
+/// another field's line rings nothing and answers at once, and so does an
+/// Autopilot word with `restore_session` off.
+#[cfg(unix)]
+#[test]
+fn a_meta_autopilot_words_ok_comes_once_the_journal_image_carrying_it_is_on_disk() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut app = App::headless_for_test();
+    let (term, ctx) = {
+        let shell = app.pool.get(0).expect("the window's shell");
+        (Arc::clone(&shell.term), Arc::clone(&shell.ctx))
+    };
+    let journal_dir = crate::crash_journal::tests::scratch("cj-meta-ack");
+    app.crash_journal = crate::crash_journal::Lane::new(
+        Some(journal_dir.path().to_path_buf()),
+        crate::crash_journal::tests::reaped_pid(),
+    );
+    let rings = Arc::new(AtomicUsize::new(0));
+    {
+        let rings = Arc::clone(&rings);
+        app.arm_word_durability(move || {
+            rings.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+    app.first_present_done = true;
+    let journal = app.crash_journal.journal_id();
+    let ahead = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    app.tick_crash_journal(ahead);
+    let on_disk = || {
+        let text = std::fs::read_to_string(journal_dir.path().join(journal.file_name()))
+            .expect("the journal");
+        let (_, image) = crate::crash_journal::decode(&text).expect("the image decodes");
+        image
+            .handed_off_leaves()
+            .into_iter()
+            .find(|leaf| leaf.local_id == Some(0))
+            .and_then(|leaf| leaf.autopilot)
+    };
+    let store = Arc::clone(&app.store);
+    let meta = |rest: &'static str| {
+        let (store, term, ctx) = (Arc::clone(&store), Arc::clone(&term), Arc::clone(&ctx));
+        std::thread::spawn(move || crate::control::meta_line_for_test(&store, &term, 0, &ctx, rest))
+    };
+
+    for (n, rest, word) in [
+        (1, "set autopilot land", Some("land".to_string())),
+        (2, "unset autopilot", None),
+    ] {
+        let verb = meta(rest);
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the verb's ticket, or its answer",
+            || (rings.load(Ordering::SeqCst) >= n || verb.is_finished()).then_some(()),
+        );
+        assert!(
+            !verb.is_finished(),
+            "{rest}: the OK waits for the journal, and no loop turn has run"
+        );
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the verb's answer", || {
+            app.tick_crash_journal(std::time::Instant::now());
+            verb.is_finished().then_some(())
+        });
+        assert_eq!(verb.join().expect("the verb's thread"), "OK\n", "{rest}");
+        assert_eq!(on_disk(), word, "{rest}: the word is on disk at the answer");
+    }
+
+    // NEGATIVE CONTROLS: no loop turn runs here.
+    let before = rings.load(Ordering::SeqCst);
+    assert_eq!(
+        crate::control::meta_line_for_test(&app.store, &term, 0, &ctx, "set title x"),
+        "OK\n",
+        "another field: at once"
+    );
+    assert_eq!(rings.load(Ordering::SeqCst), before, "and no ticket");
+    app.config.restore_session = Some(false);
+    app.tick_crash_journal(std::time::Instant::now());
+    assert_eq!(
+        crate::control::meta_line_for_test(&app.store, &term, 0, &ctx, "set autopilot off"),
+        "OK\n",
+        "restore_session off: at once"
+    );
+    app.crash_journal = crate::crash_journal::Lane::inert();
+    crate::crash_journal::tests::await_released(&journal_dir.path().join(journal.lock_name()));
+}
+
 /// A STORM OF WORDS ABOUT TYPING ON ONE LOOP TURN COSTS ONE CAPTURE, AND IT
 /// NAMES THE LAST WORD (review OW-P1 of the owner-word fix: each word took a
 /// whole desk capture on the main thread inside its wake's arm, so 41 words
@@ -6836,7 +7617,8 @@ fn words_about_typing_on_one_loop_turn_cost_one_capture_naming_the_last() {
         assert!(apply_meta_value(
             &ctx,
             MetaField::Autopilot,
-            Some(words[n % 2].into())
+            Some(words[n % 2].into()),
+            aterm_slog::Actor::Ctl
         ));
         app.crash_journal.note_activity();
         app.on_meta_changed(0);
@@ -6871,4 +7653,313 @@ fn words_about_typing_on_one_loop_turn_cost_one_capture_naming_the_last() {
     assert!(!image.windows.is_empty());
     app.crash_journal = crate::crash_journal::Lane::inert();
     crate::crash_journal::tests::await_released(&journal_dir.path().join(journal.lock_name()));
+}
+
+/// A desk of `n` tabs in one window, each tab's session registered: its
+/// sids, tab 1 first.
+fn restored_desk(n: usize) -> (App, Vec<String>) {
+    let mut app = App::headless_for_test();
+    let wid = crate::WindowId(0);
+    let mut locals = vec![app.focused_session_id(wid).expect("the front session")];
+    for _ in 1..n {
+        let local = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(local));
+        locals.push(local);
+    }
+    let sids = locals
+        .into_iter()
+        .map(|local| {
+            if app.store.read().unwrap().by_local(local).is_none() {
+                app.store
+                    .write()
+                    .unwrap()
+                    .register(crate::session_store::test_handle(local));
+            }
+            let store = app.store.read().unwrap();
+            store.by_local(local).unwrap().sid.as_str().to_string()
+        })
+        .collect();
+    (app, sids)
+}
+
+/// A restored agents' row as the host says it: `lines` of `(sid, place, said)`,
+/// each a Claude whose tab's shell had ended.
+fn restored_row(seq: u64, lines: &[(&str, &str, u64)]) -> crate::harness_host::RestoredRow {
+    crate::harness_host::RestoredRow {
+        seq,
+        lines: lines
+            .iter()
+            .map(|(sid, place, said)| crate::harness_host::RestoredLine {
+                sid: (*sid).to_string(),
+                place: (*place).to_string(),
+                agent: aterm_agent::harness::upgrade::Agent::Claude,
+                outcome: aterm_agent::harness::relaunch::Outcome::Cannot("shell-gone".to_string()),
+                said: *said,
+            })
+            .collect(),
+        log: None,
+    }
+}
+
+/// The restored agents' rows up now, `(title, detail)`.
+fn restored_up(app: &App) -> Vec<(String, Vec<String>)> {
+    app.messages
+        .live_rows()
+        .filter(|l| {
+            l.msg
+                .key
+                .as_deref()
+                .is_some_and(|k| k.starts_with(crate::message_reporters::KEY_RESTORED_AGENTS))
+                && !l
+                    .msg
+                    .key
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with(crate::message_reporters::KEY_RESTORED_HELD))
+        })
+        .map(|l| (l.msg.title.clone(), l.msg.detail.clone()))
+        .collect()
+}
+
+/// A RESTORED ROW SAID BEFORE A LATER ONE IS PASSED OVER (ATERM-KI-1016-1
+/// host-7): the host counts each row as it makes it, under its queue's lock,
+/// and the later one names it all. Two sayers raced after a Commit, and the
+/// one queued last could be the older, taking the newer one's tabs off. Here
+/// the older row reaches the inbox last. CONTROL: in order, the later row
+/// stands too.
+#[test]
+fn a_restored_row_said_before_a_later_one_is_passed_over() {
+    let _lane = crate::message_inbox::lane_test_guard();
+    for stale_last in [true, false] {
+        let _ = crate::message_inbox::take_queued();
+        let (mut app, sids) = restored_desk(2);
+        let older = restored_row(10, &[(&sids[0], "in tab 1", 9)]);
+        let newer = restored_row(12, &[(&sids[0], "in tab 1", 9), (&sids[1], "in tab 2", 11)]);
+        let rows = if stale_last {
+            [newer, older]
+        } else {
+            [older, newer]
+        };
+        for row in rows {
+            crate::message_inbox::queue_restored_row(crate::message_inbox::current_lane(), row);
+        }
+        app.drain_message_inbox();
+        let up = restored_up(&app);
+        assert_eq!(up.len(), 1, "stale_last={stale_last}: {up:?}");
+        assert_eq!(
+            up[0].0, "Couldn't resume Claude in 2 tabs",
+            "stale_last={stale_last}"
+        );
+    }
+}
+
+/// WHAT THE OWNER SAW THROUGH STAYS DOWN (ATERM-KI-1016-1 host-7): once the
+/// row this process showed is dismissed, the next row names only what was
+/// said since. Until then the dismissed row came back inside the next one.
+/// CONTROL: the row still up, the next names both, in its place.
+#[test]
+fn a_restored_row_the_owner_dismissed_does_not_come_back_inside_the_next() {
+    for dismissed in [true, false] {
+        let (mut app, sids) = restored_desk(2);
+        let stamp = crate::messages_host::wall_stamp_now();
+        app.post_restored_row(restored_row(1, &[(&sids[0], "in tab 1", 1)]), stamp);
+        let first = app.restored_shown.id.expect("posted");
+        if dismissed {
+            assert!(app.messages.dismiss(first, std::time::Instant::now()));
+        }
+        app.post_restored_row(
+            restored_row(3, &[(&sids[0], "in tab 1", 1), (&sids[1], "in tab 2", 2)]),
+            stamp,
+        );
+        let titles: Vec<String> = restored_up(&app).into_iter().map(|(t, _)| t).collect();
+        let want = if dismissed {
+            "Couldn't resume Claude in tab 2"
+        } else {
+            "Couldn't resume Claude in 2 tabs"
+        };
+        assert_eq!(titles, [want], "dismissed={dismissed}");
+        // A miss said again is news, even after the owner saw it.
+        if dismissed {
+            app.post_restored_row(
+                restored_row(5, &[(&sids[0], "in tab 1", 4), (&sids[1], "in tab 2", 2)]),
+                stamp,
+            );
+            let titles: Vec<String> = restored_up(&app).into_iter().map(|(t, _)| t).collect();
+            assert_eq!(titles, ["Couldn't resume Claude in 2 tabs"]);
+        }
+    }
+}
+
+/// EACH TAB WHERE IT IS NOW (ATERM-KI-1016-1 host-7): a tab renumbered since
+/// its miss is named by its place now, and an earlier miss whose tab closed
+/// leaves the row. Until then every line kept the place worded at its miss,
+/// which named another tab once tab 1 closed. CONTROL: the row in the words
+/// it was said with.
+#[test]
+fn a_restored_row_names_each_tab_where_it_is_now() {
+    let (mut app, sids) = restored_desk(3);
+    let stamp = crate::messages_host::wall_stamp_now();
+    app.post_restored_row(
+        restored_row(1, &[(&sids[0], "in tab 1", 1), (&sids[1], "in tab 2", 2)]),
+        stamp,
+    );
+    assert_eq!(restored_up(&app)[0].0, "Couldn't resume Claude in 2 tabs");
+    // `false`: not the window's last tab.
+    assert!(!app.close_tab_at(crate::WindowId(0), 0));
+    assert_eq!(app.upgrade_place(&sids[0]), "in its tab", "closed");
+    assert_eq!(app.upgrade_place(&sids[1]), "in tab 1", "renumbered");
+    let row = restored_row(
+        3,
+        &[
+            (&sids[0], "in tab 1", 1),
+            (&sids[1], "in tab 2", 2),
+            (&sids[2], "in tab 3", 3),
+        ],
+    );
+    // CONTROL: the words it was said with name three tabs, tab 1 among them.
+    let said = row.message();
+    assert_eq!(said.title, "Couldn't resume Claude in 3 tabs");
+    app.post_restored_row(row, stamp);
+    let up = restored_up(&app);
+    assert_eq!(up.len(), 1, "{up:?}");
+    assert_eq!(up[0].0, "Couldn't resume Claude in 2 tabs");
+    let places: Vec<&str> = up[0]
+        .1
+        .iter()
+        .filter_map(|l| l.split_once(", ").map(|(place, _)| place))
+        .filter(|p| p.starts_with("in tab"))
+        .collect();
+    assert_eq!(places, ["in tab 1", "in tab 2"], "{:?}", up[0].1);
+}
+
+/// A SUCCESSOR NEVER SUPERSEDES THE ROW CARRIED FROM THE ATERM BEFORE IT
+/// (ATERM-KI-1016-1 host-7): that row names the tabs said at the park, which
+/// this process never said, so its own row stands beside it. Until then the
+/// successor's first row superseded it and those tabs left the view.
+/// CONTROL: a row under the carried row's key supersedes it, as before.
+#[test]
+fn a_successors_restored_row_stands_beside_the_one_carried_to_it() {
+    for own_key in [true, false] {
+        let mut parent = App::headless_for_test();
+        let mut carried = restored_row(1, &[("s-parked", "in tab 4", 1)]).message();
+        // The predecessor's row, as a build before this one keyed it.
+        carried.key = Some(crate::message_reporters::KEY_RESTORED_AGENTS.to_string());
+        let _ = parent.post_message(carried.clone());
+        let _ = parent.messages.settle(
+            std::time::Instant::now() + aterm_messages::PROGRESS_GRACE,
+            true,
+        );
+        let carry = parent.messages.carried();
+        let (mut app, sids) = restored_desk(1);
+        app.messages.seed_carried(
+            &carry,
+            crate::messages_host::wall_stamp_now(),
+            std::time::Instant::now(),
+        );
+        let row = restored_row(5, &[(&sids[0], "in tab 1", 4)]);
+        if own_key {
+            app.post_restored_row(row, crate::messages_host::wall_stamp_now());
+        } else {
+            let mut msg = row.message();
+            msg.key.clone_from(&carried.key);
+            let _ = app.post_message(msg);
+        }
+        let mut titles: Vec<String> = restored_up(&app).into_iter().map(|(t, _)| t).collect();
+        titles.sort();
+        if own_key {
+            assert_eq!(
+                titles,
+                [
+                    "Couldn't resume Claude in tab 1",
+                    "Couldn't resume Claude in tab 4"
+                ]
+            );
+        } else {
+            assert_eq!(titles, ["Couldn't resume Claude in tab 1"], "CONTROL");
+        }
+    }
+}
+
+/// A ROW NOBODY SAW THROUGH COMES BACK INSIDE THE NEXT (ATERM-KI-1016-1
+/// host-7, the review of its first cut): a restored agents' row that left the
+/// band unseen — it never reached the glass, or its reporter withdrew it — is
+/// not seen through: the next row still names its misses, as it names those
+/// of a row still up. The first cut took any row no longer up for one the
+/// owner saw through, so a miss said before the window showed it, or while
+/// the band was full, was dropped from every later row. CONTROLS: a row the
+/// owner dismissed, its reporter resolved, or that folded on the glass stays
+/// down.
+#[test]
+fn a_restored_row_nobody_saw_through_comes_back_inside_the_next() {
+    use aterm_messages::Retired;
+    type Retire = fn(&mut App, aterm_messages::MessageId);
+    fn now() -> std::time::Instant {
+        std::time::Instant::now()
+    }
+    let cases: [(&str, Retire, Retired, bool); 5] = [
+        (
+            "unseen",
+            |app, _| {
+                let _ = app
+                    .messages
+                    .settle(now() + std::time::Duration::from_secs(3600), true);
+            },
+            Retired::Unseen,
+            true,
+        ),
+        (
+            "folded",
+            |app, id| {
+                // On the glass (read), then its span runs out there.
+                assert!(app.messages.mark_seen(id, now()));
+                let _ = app
+                    .messages
+                    .settle(now() + std::time::Duration::from_secs(3600), true);
+            },
+            Retired::Folded,
+            false,
+        ),
+        (
+            "withdrawn",
+            |app, id| assert!(app.messages.withdraw(id, now())),
+            Retired::Withdrawn,
+            true,
+        ),
+        (
+            "dismissed",
+            |app, id| assert!(app.messages.dismiss(id, now())),
+            Retired::Dismissed,
+            false,
+        ),
+        (
+            "resolved",
+            |app, id| assert!(app.messages.resolve(id, aterm_messages::Outcome::Ok, now())),
+            Retired::Resolved(aterm_messages::Outcome::Ok),
+            false,
+        ),
+    ];
+    for (case, retire, how, named) in cases {
+        let (mut app, sids) = restored_desk(2);
+        let stamp = crate::messages_host::wall_stamp_now();
+        app.post_restored_row(restored_row(1, &[(&sids[0], "in tab 1", 1)]), stamp);
+        let first = app.restored_shown.id.expect("posted");
+        retire(&mut app, first);
+        let retired = app
+            .messages
+            .log()
+            .get(first)
+            .and_then(|r| r.retired().cloned());
+        assert!(app.messages.live(first).is_none(), "{case}: off the band");
+        assert_eq!(retired, Some(how), "{case}: retired so");
+        app.post_restored_row(
+            restored_row(3, &[(&sids[0], "in tab 1", 1), (&sids[1], "in tab 2", 2)]),
+            stamp,
+        );
+        let titles: Vec<String> = restored_up(&app).into_iter().map(|(t, _)| t).collect();
+        let want = if named {
+            "Couldn't resume Claude in 2 tabs"
+        } else {
+            "Couldn't resume Claude in tab 2"
+        };
+        assert_eq!(titles, [want], "{case}");
+    }
 }

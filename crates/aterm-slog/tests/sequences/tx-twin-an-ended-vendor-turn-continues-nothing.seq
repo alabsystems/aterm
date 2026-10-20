@@ -1,0 +1,14 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of the_screen_busy_again_continues_a_running_vendor_turn, its second
+# rig (the negative control).
+bind 0
+see busy
+tx prompt v1
+see prompt bash:not-read-only
+tx end
+see busy
+see idle
+wait 1000
+see busy
+expect open t1 turn
+expect open t2 turn

@@ -30,10 +30,9 @@ pub(crate) use super::types::{
     CoordType, Granularity, Interface, InterfaceSet, Layer, Politeness, RelationType, Role,
     ScrollType, State, StateSet,
 };
-pub(crate) use crate::tree::NodeId;
 pub(crate) use adapter::{Adapter, next_adapter_id};
 pub(crate) use context::{ActionHandlerNoMut, ActionHandlerWrapper, AppContext, SharedLock};
-pub(crate) use node::{CacheNode, NodeIdOrRoot, PlatformNode, PlatformRoot};
+pub(crate) use node::{CacheNode, NodeIdOrRoot, NodeIdentity, PlatformNode, PlatformRoot};
 pub(crate) use util::WindowBounds;
 
 /// One AT-SPI action of a node: its name, description and key binding.
@@ -45,8 +44,8 @@ pub(crate) struct Action {
 
 /// Where a window's tree reports its registrations and events.
 pub(crate) trait AdapterCallback {
-    fn register_interfaces(&self, adapter: &Adapter, id: NodeId, interfaces: InterfaceSet);
-    fn unregister_interfaces(&self, adapter: &Adapter, id: NodeId, interfaces: InterfaceSet);
+    fn register_interfaces(&self, adapter: &Adapter, id: NodeIdentity, interfaces: InterfaceSet);
+    fn unregister_interfaces(&self, adapter: &Adapter, id: NodeIdentity, interfaces: InterfaceSet);
     fn emit_event(&self, adapter: &Adapter, event: Event);
 }
 
@@ -116,7 +115,7 @@ pub(crate) enum Event {
         event: ObjectEvent,
     },
     Window {
-        target: NodeId,
+        target: NodeIdentity,
         name: String,
         event: WindowEvent,
     },
@@ -125,8 +124,8 @@ pub(crate) enum Event {
 
 #[derive(Debug)]
 pub(crate) enum CacheEvent {
-    Added(NodeId),
-    Removed(NodeId),
+    Added(NodeIdentity),
+    Removed(NodeIdentity),
 }
 
 #[derive(Debug)]
@@ -144,12 +143,12 @@ pub(crate) enum Property {
 )]
 #[derive(Debug)]
 pub(crate) enum ObjectEvent {
-    ActiveDescendantChanged(NodeId),
+    ActiveDescendantChanged(NodeIdentity),
     Announcement(String, Politeness),
     BoundsChanged(Rect),
     CaretMoved(i32),
-    ChildAdded(usize, NodeId),
-    ChildRemoved(NodeId),
+    ChildAdded(usize, NodeIdentity),
+    ChildRemoved(NodeIdentity),
     PropertyChanged(Property),
     SelectionChanged,
     StateChanged(State, bool),

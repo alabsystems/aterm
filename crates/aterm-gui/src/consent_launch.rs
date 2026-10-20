@@ -23,9 +23,17 @@
 //!    every folder answered, the bundle id is noted (`<state>/privacy-warmup-answered`)
 //!    and never walked again: macOS keeps each answer for a grant-stable build.
 //!
+//! The order on a new Mac is the Full Disk Access page, the Developer Tools page, aterm's
+//! once-per-Mac debugger-access question (`debugger_access`, owner ruling O29), then the
+//! folders: the warm-up waits while that question is still to come and while a
+//! debugger-access change is under way, so no folder dialog stacks on macOS's
+//! administrator dialog (one left unanswered holds the folders for that process).
+//!
 //! Nothing here answers a dialog, flips a switch or writes TCC.db, and no control verb,
 //! environment variable or session reaches it: the triggers are the window's own launch
-//! check and the owner's own presses. A headless instance and every unit test hold the
+//! check and the owner's own presses. Held by construction: `App::tick_launch_warmup`,
+//! `App::hand_fda_to_owner`, `App::fda_page_opened_by_owner` and `Lane::queue_fda` are
+//! clippy.toml `disallowed-methods` rows, and only those callers carry the `#[expect]`. A headless instance and every unit test hold the
 //! inert arm ([`LaunchConsent::new`]), which reads and writes nothing.
 
 use std::time::Instant;
@@ -52,6 +60,30 @@ pub(crate) enum FdaLaunch {
     /// was shown already for this version, the build's grant would not survive the next
     /// one, or the Full Disk Access question is switched off.
     NotAsked,
+}
+
+/// WHETHER THE LAUNCH CHECK HANDS FULL DISK ACCESS OVER: the probe read the grant off on a
+/// Mac where aterm never verified it — the access card's launch verdict `NoNeedYet`, or
+/// `ReadsOffAfterVerified` beside a record verified on another Mac or for another bundle
+/// (`verified_here` is `Some(false)`: the record travels with a synced or migrated config
+/// directory; a record with no stamp keeps its word). Whose reading it was is not judged
+/// here: the hand-over brings nothing up from a window another app is responsible for
+/// (`devtools_helper::admit_fda`, at its quiet moment), and an update's successor on the
+/// fork lane names its outgoing process responsible for the seconds the launch check runs
+/// in. Pure.
+#[must_use]
+pub(crate) fn hands_over(
+    fda: FdaState,
+    verdict: &crate::consent_card::LaunchVerdict,
+    verified_here: Option<bool>,
+) -> bool {
+    use crate::consent_card::{LaunchVerdict, NotDue};
+    fda == FdaState::Denied
+        && match verdict {
+            LaunchVerdict::Quiet(NotDue::NoNeedYet) => true,
+            LaunchVerdict::Quiet(NotDue::ReadsOffAfterVerified) => verified_here == Some(false),
+            _ => false,
+        }
 }
 
 impl FdaLaunch {
@@ -322,7 +354,7 @@ fn read_answered_at(path: &std::path::Path) -> std::io::Result<Option<String>> {
 }
 
 /// The live marker read at an explicit path; tests own that path.
-fn answered_at(path: &std::path::Path, bundle_id: &str) -> Option<bool> {
+pub(crate) fn answered_at(path: &std::path::Path, bundle_id: &str) -> Option<bool> {
     if bundle_id.trim() != bundle_id || !aterm_containment::consent::bundle_id_is_usable(bundle_id)
     {
         return None;

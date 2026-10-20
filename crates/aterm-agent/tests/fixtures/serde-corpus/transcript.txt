@@ -2,10 +2,10 @@
 # ok: the value written back out; err: the error's Display. \n \t \r \\ and
 # \u{..} escape control characters; an ok longer than 4096 bytes is its
 # FNV-1a digest and length. docs/AUDIT-third-party-2026-10-15.md, SP.3.
-claude/assistant/usage	ok	{"isSidechain":false,"message":{"id":"msg_1","model":"claude-opus-5-5","usage":{"cache_creation_input_tokens":2048,"cache_read_input_tokens":40960,"input_tokens":3,"iterations":[{"type":"message"}],"output_tokens":120,"server_tool_use":{"web_search_requests":0},"service_tier":"standard"}},"timestamp":"2026-10-15T20:36:32.123Z","type":"assistant"}
+claude/assistant/usage	ok	{"isSidechain":false,"message":{"id":"msg_1","model":"claude-opus-5-5","usage":{"cache_creation_input_tokens":2048,"cache_read_input_tokens":40960,"input_tokens":3,"output_tokens":120}},"timestamp":"2026-10-15T20:36:32.123Z","type":"assistant"}
 claude/assistant/metadata	ok	{"cwd":"/home/dev/src","effort":"high","isSidechain":false,"message":{"model":"claude-opus-5-5"},"timestamp":"2026-10-15T20:36:32.123Z","type":"assistant","version":"2.1.301"}
 claude/assistant/command	ok	{"cwd":"/home/dev/src","effort":"high","isSidechain":false,"message":{"content":null,"model":"claude-opus-5-5"},"timestamp":"2026-10-15T20:36:32.123Z","type":"assistant","version":"2.1.301"}
-claude/assistant/conversation	ok	{"isSidechain":false,"message":{"content":[{"text":"Done.","type":"text"},{"type":"tool_use"}],"model":"claude-opus-5-5"},"parentUuid":"p-1","timestamp":"2026-10-15T20:36:32.123Z","type":"assistant","uuid":"u-2","version":"2.1.301"}
+claude/assistant/conversation	ok	{"isSidechain":false,"message":{"content":[{"text":"Done.","type":"text"},{"type":"tool_use"}],"model":"claude-opus-5-5","stop_reason":"end_turn"},"parentUuid":"p-1","timestamp":"2026-10-15T20:36:32.123Z","type":"assistant","uuid":"u-2","version":"2.1.301"}
 claude/user-prompt/usage	ok	{"isSidechain":false,"message":{},"timestamp":"2026-10-15T20:36:30Z","type":"user"}
 claude/user-prompt/metadata	ok	{"cwd":"/home/dev/src","isSidechain":false,"message":{},"timestamp":"2026-10-15T20:36:30Z","type":"user","version":"2.1.301"}
 claude/user-prompt/command	ok	{"cwd":"/home/dev/src","isSidechain":false,"message":{"content":"/model opus"},"timestamp":"2026-10-15T20:36:30Z","type":"user","version":"2.1.301"}
@@ -17,7 +17,7 @@ claude/user-tool-result/conversation	ok	{"message":{"content":[{"type":"tool_res
 claude/turn-duration/usage	ok	{"durationMs":5123,"isSidechain":false,"subtype":"turn_duration","timestamp":"2026-10-15T20:36:41Z","type":"system"}
 claude/turn-duration/metadata	ok	{"isSidechain":false,"timestamp":"2026-10-15T20:36:41Z","type":"system"}
 claude/turn-duration/command	ok	{"isSidechain":false,"timestamp":"2026-10-15T20:36:41Z","type":"system"}
-claude/turn-duration/conversation	ok	{"isMeta":true,"isSidechain":false,"parentUuid":"u-3","subtype":"turn_duration","timestamp":"2026-10-15T20:36:41Z","type":"system","uuid":"u-4"}
+claude/turn-duration/conversation	ok	{"durationMs":5123,"isMeta":true,"isSidechain":false,"parentUuid":"u-3","subtype":"turn_duration","timestamp":"2026-10-15T20:36:41Z","type":"system","uuid":"u-4"}
 claude/limit/usage	ok	{"isApiErrorMessage":true,"subtype":"api_error","timestamp":"2026-10-15T20:37:00Z","type":"system"}
 claude/limit/metadata	ok	{"timestamp":"2026-10-15T20:37:00Z","type":"system"}
 claude/limit/command	ok	{"timestamp":"2026-10-15T20:37:00Z","type":"system"}
@@ -81,11 +81,11 @@ number/i64-min/conversation	ok	{"message":{},"type":"assistant"}
 number/negative-zero/usage	ok	{"durationMs":-0.0,"message":{"usage":{"input_tokens":-0.0}},"type":"assistant"}
 number/negative-zero/metadata	ok	{"message":{},"type":"assistant"}
 number/negative-zero/command	ok	{"message":{},"type":"assistant"}
-number/negative-zero/conversation	ok	{"message":{},"type":"assistant"}
+number/negative-zero/conversation	ok	{"durationMs":-0.0,"message":{},"type":"assistant"}
 number/exponent/usage	ok	{"durationMs":1000.0,"type":"system"}
 number/exponent/metadata	ok	{"type":"system"}
 number/exponent/command	ok	{"type":"system"}
-number/exponent/conversation	ok	{"type":"system"}
+number/exponent/conversation	ok	{"durationMs":1000.0,"type":"system"}
 number/infinite/usage	err	number out of range at line 1 column 37
 number/infinite/metadata	err	number out of range at line 1 column 37
 number/infinite/command	err	number out of range at line 1 column 37

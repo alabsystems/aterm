@@ -225,15 +225,26 @@ fn every_family_has_one_mode_and_no_prefix_shadows_another() {
             }
         }
     }
-    // The level families are the three whose reporters look on a cadence of
-    // their own (the AI CLIs' look among them: each look states every CLI
-    // that needs a person); everything else raises by event and is never
-    // swept.
+    // The level families are the ones whose reporters state their whole answer
+    // (the upgrade's and the resume loop's looks, the AI CLIs' look — each
+    // states every CLI that needs a person — the need publication's API
+    // outage, the window's long holds, the fleet glance's read); everything
+    // else raises by event and is never swept.
     let level: Vec<Family> = all
         .into_iter()
         .filter(|f| f.mode() == Mode::Level)
         .collect();
-    assert_eq!(level, vec![Family::Upgrade, Family::Resume, Family::Ai]);
+    assert_eq!(
+        level,
+        vec![
+            Family::Upgrade,
+            Family::Resume,
+            Family::Ai,
+            Family::ApiOutage,
+            Family::LongHold,
+            Family::FleetUnreadable
+        ]
+    );
     assert_eq!(Family::Ai.stem(), "ai");
     assert_eq!(Family::Ai.tag(), tags::HARNESS);
 }
@@ -290,6 +301,95 @@ fn a_words_only_change_restates_at_most_once_in_ten_minutes() {
     let s = c.sync_digest(UPGRADE, vec![louder], stamp(), now + RESTATE_QUIET + ms(2));
     assert_eq!(s.restated, 1);
     assert_eq!(posted_lines(&c), 1, "restating writes no log line");
+}
+
+/// Words that move only with their fact (`LaterAsk::restated_at_once`: the
+/// tabs an outage holds, counted as they join it) are restated at once, inside
+/// the ten minutes; the same count change on an ordinary entry waits (the
+/// negative control, `a_words_only_change_restates_at_most_once_in_ten_minutes`).
+#[test]
+fn words_that_move_with_their_fact_restate_at_once() {
+    let now = t0();
+    let mut c = fresh(now);
+    let outage = |holders: u32| {
+        let ask = LaterAsk::person(
+            Why::OnlyYou(Reason::new(format!(
+                "the network keeps {holders} programs from their API server"
+            ))),
+            Then::step("Check this Mac's network connection"),
+            Fingerprint::new("harness.upgrade", "s-1", "own-work"),
+            Resurface::WAIT,
+        )
+        .restated_at_once();
+        Message::new(
+            tags::HARNESS,
+            Severity::Info,
+            format!("{holders} can't reach it"),
+        )
+        .later(ask)
+    };
+    let _ = c.sync_digest(UPGRADE, vec![outage(1)], stamp(), now);
+    let s = c.sync_digest(UPGRADE, vec![outage(2)], stamp(), now + ms(1_000));
+    assert_eq!(s.restated, 1, "the count moved with its fact: news at once");
+    assert!(c.digest().entries[0].why.contains("2 programs"));
+    let s = c.sync_digest(UPGRADE, vec![outage(2)], stamp(), now + ms(2_000));
+    assert_eq!(s.restated, 0, "the same words are a duplicate");
+    assert_eq!(posted_lines(&c), 1, "restating writes no log line");
+}
+
+/// A NEW STEP IS NEWS AT ONCE: the one thing an entry tells the owner to do
+/// (a renewal's command naming the next account) is never held for the ten
+/// minutes that keep a moving count quiet, so the entry never asks for what no
+/// longer helps. NEGATIVE CONTROL: the same entry whose reason alone moves
+/// inside the ten minutes stands in its first words.
+#[test]
+fn a_new_step_restates_at_once_and_a_moving_reason_waits() {
+    let now = t0();
+    let mut c = fresh(now);
+    let renew = |why: &str, label: &str| {
+        let ask = LaterAsk::person(
+            Why::OnlyYou(Reason::new(why)),
+            Then::step(format!(
+                "Run in a terminal: aterm harness accounts renew {label}"
+            )),
+            Fingerprint::new("harness.upgrade", "", "wrong-account"),
+            Resurface::WAIT,
+        );
+        Message::new(
+            tags::HARNESS,
+            Severity::Info,
+            "Claude renewal used another account",
+        )
+        .later(ask)
+    };
+    let first = "A renewal signed in a Claude account other than its roster row's";
+    let _ = c.sync_digest(UPGRADE, vec![renew(first, "pool-a")], stamp(), now);
+    // NEGATIVE CONTROL: the reason moves, the step does not.
+    let s = c.sync_digest(
+        UPGRADE,
+        vec![renew(
+            "Two renewals signed in other Claude accounts",
+            "pool-a",
+        )],
+        stamp(),
+        now + ms(1_000),
+    );
+    assert_eq!(s.restated, 0, "words alone: not news yet");
+    assert_eq!(c.digest().entries[0].why, first);
+    // The step moves: at once, and the entry says the new step.
+    let s = c.sync_digest(
+        UPGRADE,
+        vec![renew(first, "pool-b")],
+        stamp(),
+        now + ms(2_000),
+    );
+    assert_eq!(s.restated, 1, "a new step is news at once");
+    assert!(
+        c.digest().entries[0].then.ends_with("renew pool-b"),
+        "{:?}",
+        c.digest().entries[0]
+    );
+    assert_eq!(posted_lines(&c), 1, "one entry");
 }
 
 /// The owner filed the batch: the next pass names the same facts and gets

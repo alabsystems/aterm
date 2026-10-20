@@ -26,7 +26,6 @@ pub enum Check {
     Appkit,
     Export,
     Measure,
-    Sealed,
     CodexAlab,
     Linux,
 }
@@ -55,7 +54,7 @@ pub struct Spec {
 }
 
 /// Every check, in the order `list` shows them and a verdict names them.
-pub const CHECKS: [Spec; 20] = [
+pub const CHECKS: [Spec; 19] = [
     Spec {
         check: Check::Fmt,
         name: "fmt",
@@ -85,7 +84,7 @@ pub const CHECKS: [Spec; 20] = [
         name: "test",
         stages: &[StageId::TestCompile, StageId::Test],
         reach: Reach::Selection,
-        needs: "targo; python3.11+ and openssl 3 (aterm-update), node (aterm-verify's glue)",
+        needs: "targo, fish, zsh; python3.11+ and openssl 3 (aterm-update), node (aterm-verify's glue)",
         runs: "targo test <selection> --tests (no examples), binaries in parallel",
     },
     Spec {
@@ -133,8 +132,8 @@ pub const CHECKS: [Spec; 20] = [
         name: "browser",
         stages: &[StageId::BrowserLane],
         reach: Reach::WholeTree,
-        needs: "a Chromium (`verify fetch-browser`), rustup stable + wasm32",
-        runs: "both web modules (dev) in headless Chromium: a WebGL2 boot, GPU vs CPU pixels, GPU vs the recorded wgpu-WebGL frames (STOCK EXCEPTION)",
+        needs: "a Chromium and a Firefox (`verify fetch-browser`), rustup stable + wasm32",
+        runs: "both web modules (dev) in headless Chromium, WebGL2 on ANGLE Metal (macOS) and SwiftShader, and in headless Firefox; the GPU module on the page and in a worker (init_offscreen): a WebGL2 boot, GPU vs CPU pixels, GPU vs the recorded wgpu-WebGL frames (STOCK EXCEPTION)",
     },
     Spec {
         check: Check::Libc,
@@ -197,14 +196,6 @@ pub const CHECKS: [Spec; 20] = [
         runs: "the ignored paint/spin rows on <APP>, GUI pacing smoke (alone)",
     },
     Spec {
-        check: Check::Sealed,
-        name: "sealed",
-        stages: &[StageId::SealedLane],
-        reach: Reach::WholeTree,
-        needs: "targo",
-        runs: "targo test -p aterm --features sealed (two_nodes_sealed, fabric_world)",
-    },
-    Spec {
         check: Check::CodexAlab,
         name: "codex-alab",
         stages: &[StageId::CodexAlabProof],
@@ -238,7 +229,7 @@ pub const DEV: [Check; 5] = [
 /// macOS bundle, so nothing it builds is for the foreign triples, and a
 /// Windows-only type error or a stable without a cross std stopped a macOS
 /// release. `verify cells` runs by hand.
-pub const RELEASE: [Check; 13] = [
+pub const RELEASE: [Check; 12] = [
     Check::Fmt,
     Check::Lint,
     Check::Test,
@@ -251,7 +242,6 @@ pub const RELEASE: [Check; 13] = [
     Check::GpuOracle,
     Check::Appkit,
     Check::Measure,
-    Check::Sealed,
 ];
 
 impl Check {

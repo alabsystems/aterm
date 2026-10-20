@@ -5,27 +5,31 @@
 //! grid shrinks), no chrome source lets them fall (the grid grows back) inside
 //! [`CHROME_REGROW_SETTLE`].
 //!
-//! The tab strip, the message band and the presence row are reserved out of
-//! the window's grid, so every change of their total re-grids it. Each source
-//! spaces its own fall from its own rise ([`crate::SHRINK_QUIET`],
-//! [`crate::presence::FOLD_QUIET`]), but neither reads the other's rise, so
-//! two sources can make a shrink-then-grow pair milliseconds apart. On the
+//! The tab strip and the message band are reserved out of the window's grid,
+//! so every change of their total re-grids it. The band spaces its own fall
+//! from its own rise ([`crate::SHRINK_QUIET`]), but not from the strip's, and a
+//! person's Settings edit takes the strip down whenever it lands, so two
+//! sources can make a shrink-then-grow pair milliseconds apart. (The
+//! presence row was the third source until the owner surfaces, 2026-10-16,
+//! took it out: presence re-grids nothing now.) On the
 //! alternate screen that pair shifts every row up one, and a program that
 //! repaints only when its `SIGWINCH` handler reads a changed size (Claude
 //! Code) never repaints; the grid's resize undo (aterm-grid
 //! `grid/resize_undo.rs`) restores the screen only when nothing is written
 //! between the halves.
 //!
-//! The host notes every rise ([`RegrowFloor::rose`]): the presence row's birth
-//! on that window, a band row reaching the glass, and a tab-strip rise on every
-//! window. A source's own quiet fall then also waits the floor
-//! ([`fall_allowed`], [`at_floor`]). A rise is never delayed: grow-then-shrink
-//! trims the blank row the grow appended, an exact identity. Three falls are
-//! not floored: the window's own (it can no longer afford a row), the person's
-//! View-menu hide of the presence band, and the tab strip's (a host-only
-//! source the host re-grids at once). The band's fall re-grids every window,
-//! so it waits the [`latest`] floor of every window with glass; a window
-//! without glass has no floor.
+//! The host notes every rise ([`RegrowFloor::rose`]): a band row reaching the
+//! glass and a tab-strip rise, on every window. The band's quiet fall and the
+//! tab strip's fall then wait the floor ([`fall_allowed`], [`at_floor`]); the
+//! strip's re-grids at once when no row rose inside the settle, so a Settings
+//! edit is delayed only after a rise, by at most the settle. A rise is never
+//! delayed: grow-then-shrink trims the blank row the grow appended, an exact
+//! identity. One fall is not floored: the window's own (it can no longer
+//! afford a row). The band's and the strip's falls re-grid every window, so
+//! they wait the [`latest`] floor of every window with glass; a window without
+//! glass has no floor. (The strip's fall was immediate until 2026-10-19, when
+//! the windowed lane measured a band rise and a Settings edit's strip fall
+//! re-gridding 38 ms apart.)
 //!
 //! Every instant is the host's `now`. The derived model is aterm-spec's
 //! `ChromeRegrowFloor` (`models_chrome_regrow.rs`: `NoQuickRegrow`,
@@ -40,8 +44,8 @@ use crate::{Duration, Instant};
 ///   so the program reads and repaints each size the grid takes;
 /// * wider than the resize ledger's run gap (`RUN_GAP_MS` in aterm-gui,
 ///   250 ms), so a spaced rise and fall the program drew between are two runs;
-/// * shorter than each source's own quiet ([`crate::SHRINK_QUIET`],
-///   [`crate::presence::FOLD_QUIET`]), so the floor binds only across sources.
+/// * shorter than the band's own quiet ([`crate::SHRINK_QUIET`]), so the
+///   floor binds only across sources.
 pub const CHROME_REGROW_SETTLE: Duration = Duration::from_millis(400);
 
 /// One window's regrow floor: when its chrome rows last rose. The host keeps

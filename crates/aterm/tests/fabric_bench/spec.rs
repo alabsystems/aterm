@@ -3,17 +3,13 @@
 
 //! What one run measures, read from [`ENV`].
 //!
-//! ONE VARIABLE, WORDS INSIDE IT. libtest refuses an argument it does not know,
-//! so the measuring entry cannot take flags; and a variable per knob is a
-//! family of names nothing lists. `FABRIC_BENCH="out=<dir> samples=200 …"` is
+//! ONE VARIABLE, WORDS INSIDE IT. `FABRIC_BENCH="out=<dir> samples=200 …"` is
 //! one name the lane sets (`crates/aterm-verify/src/perf/fabric.rs`) and one
 //! grammar this file parses, refusing a word it does not know rather than
 //! measuring something other than what was asked.
 //!
-//! The variable is also the SWITCH: the entry is `#[ignore]`d and, run with
-//! `--include-ignored` but without it, does nothing — the `support/standin.rs`
-//! discipline, so a sweep of every ignored test never boots a minute of live
-//! stacks by accident.
+//! The explicit bench requires this specification; an unset, non-Unicode or
+//! malformed value refuses the run instead of reporting an empty measurement.
 
 use std::path::PathBuf;
 
@@ -210,24 +206,23 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
     Ok(spec)
 }
 
-/// The run [`ENV`] names: `None` when it is unset (an ordinary test run).
+/// The required run [`ENV`] names.
 ///
-/// # Panics
+/// # Errors
 ///
-/// When it is set but does not parse: a run that measured something other than
-/// what its caller asked for is worse than none.
-#[must_use]
-pub fn from_env() -> Option<Spec> {
-    let raw = std::env::var(ENV).ok()?;
-    Some(parse(&raw).unwrap_or_else(|e| panic!("{e}")))
+/// Missing, non-Unicode or malformed input.
+pub fn from_env() -> Result<Spec, String> {
+    let raw = std::env::var(ENV)
+        .map_err(|e| format!("{ENV} is required (`verify perf fabric` sets it): {e}"))?;
+    parse(&raw)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn the_defaults_fill_what_the_words_leave_out() {
+        use super::*;
+
         let spec = parse("out=/tmp/x").expect("parses");
         assert_eq!(spec.out, PathBuf::from("/tmp/x"));
         assert_eq!(spec.samples, DEFAULT_SAMPLES);
@@ -247,6 +242,8 @@ mod tests {
 
     #[test]
     fn every_knob_is_read_and_a_bad_word_is_refused() {
+        use super::*;
+
         let spec = parse("out=/o samples=7 warmup=0 burst=101 pingpong=9 attach=2,4 rounds=1")
             .expect("ok");
         assert_eq!(
@@ -281,6 +278,8 @@ mod tests {
 
     #[test]
     fn the_durability_word_names_the_tier_and_nothing_else() {
+        use super::*;
+
         for (word, tier) in [("strict", Tier::Strict), ("relaxed", Tier::Relaxed)] {
             let spec = parse(&format!("out=/o durability={word}")).expect(word);
             assert_eq!(spec.durability, tier, "{word}");

@@ -5,7 +5,10 @@
 //! joining four sources:
 //!
 //! 1. the worker's turn ledger (`history`): every turn the manager typed, when
-//!    it started, how long it took, how it settled;
+//!    it started, how long it took, how it settled — the window harness's own
+//!    turns (`by=harness`: its `keep going`, its done check, its `/usage`)
+//!    are not the manager's, and are counted in SOURCES and left out, so a
+//!    reply runs on through the continuations the harness typed into it;
 //! 2. the watcher's journal (`watch --journal`, [`super::journal`]), when
 //!    given, with the Unix time each line was printed;
 //! 3. the manager's fabric mail with that worker (`inbox --peek --meta` and
@@ -20,18 +23,73 @@
 //! turn carried from an earlier process by a self-update (`carried=1`) has no
 //! time here. A source that cannot be read is named in SOURCES and the rest is
 //! printed.
+//!
+//! `--source log` ([`LedgerSource::Log`], session log plan 5F-4, beside the
+//! anchor path, which stays the default until P6 is ruled, T35) reads no
+//! anchor: each turn's time is its own session log record's wall `t=`,
+//! joined to `history` by `ledger=` alone (`@<worker> log class=turn`: the
+//! turn's open, or its close less `dur_ms` once the open was evicted — the
+//! close restates `ledger=`, 5F-4a), and each message's is its `mail` mark's
+//! (`@self log kinds=mail`, joined to the inbox rows by `inbox=`; the inbox
+//! read stays, for `len=` and `trust=`). Nothing is ever joined by time
+//! (ruling T12): a turn whose `ledger=` is gone stays unplaced, and SOURCES
+//! counts it. A turn's time there is when the worker's screen saw it begin,
+//! after the press, so its row reads `turn <id> began`, where the anchor
+//! path's `turn <id> sent` is the exchange's start: the two agree to the
+//! second only when the press was immediate.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use super::journal::{JournalRecord, json_str, read_journal};
 use super::limit::{civil, days_from_civil};
-use super::mail::{bare_sid, field, is_from_session};
 use super::report::{
     MARKER_CHARS, Mark, OffscreenError, PASTED, decimal, is_user_row, join, parse_offscreen,
     paste_fits, paste_like, pct_decode, user_text, without_verb,
 };
 use super::run::{Ctl, CtlReply};
+
+/// `key=value` of a row's words.
+fn field<'r>(row: &'r str, key: &str) -> Option<&'r str> {
+    row.split(' ')
+        .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+}
+
+/// A sid as the mail rows spell it (`@s-…`, `s-…@n-…`), bare.
+fn bare_sid(s: &str) -> &str {
+    let s = s.trim_start_matches('@');
+    s.split_once('@').map_or(s, |(sid, _)| sid)
+}
+
+/// Whether `from`, a row's attested sender, is the session `worker` names
+/// (`@s-…`/`s-…`, or `@s-…@n-…` for a session on another node) — the WHOLE
+/// principal, never the sid alone.
+///
+/// A session speaks on the bus as `<sid>@<node>`, and only the node half is
+/// attested: the broker forces it from the sending node's cap, while the sid is
+/// that node's own word about which of its sessions spoke. So `s-w@n-evil` is
+/// any node calling one of its posts `s-w`, and matching the sid alone handed it
+/// the worker's report and the worker's answer to a task. A worker named with
+/// its node must match that node. A worker named bare leaves the node to the
+/// bridge, which renders no other node's claim to it: a remote node's claim to
+/// speak for a session hosted here, or pinned to another node, is attributed
+/// to that node itself (`aterm-link`'s `render_from`), and its reply to a task
+/// that went elsewhere arrives demoted. A bare principal (`h-…`, `n-…`) is a
+/// human or a node speaking as itself, never a session.
+fn is_from_session(from: &str, worker: &str) -> bool {
+    let worker = worker.strip_prefix('@').unwrap_or(worker);
+    let Some((sid, node)) = from.split_once('@') else {
+        return false;
+    };
+    if !node.starts_with("n-") {
+        return false;
+    }
+    match worker.split_once('@') {
+        Some((want_sid, want_node)) => sid == want_sid && node == want_node,
+        None => sid == worker,
+    }
+}
 
 /// The most archived rows the reply-size read asks for (the archive is 4 MiB).
 pub const LEDGER_MAX_ROWS: usize = 20_000;
@@ -72,6 +130,32 @@ pub struct LedgerOpts {
     pub journal: Option<PathBuf>,
     /// `--since`: nothing before this Unix time (ms).
     pub since_ms: Option<i64>,
+    /// `--source`: where the times come from.
+    pub source: LedgerSource,
+}
+
+/// `--source`: what places the turns and the mail on the wall clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LedgerSource {
+    /// The process clock's stamps, placed by the instance's [`ClockAnchor`]
+    /// (the default).
+    #[default]
+    Anchor,
+    /// The session log's own wall times, joined by `ledger=` and `inbox=`
+    /// (plan 5F-4; the module doc).
+    Log,
+}
+
+impl LedgerSource {
+    /// `anchor` or `log`.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "anchor" => Some(Self::Anchor),
+            "log" => Some(Self::Log),
+            _ => None,
+        }
+    }
 }
 
 /// Where a session's aterm process started the clock its `history`,
@@ -111,6 +195,9 @@ pub struct HistTurn {
     pub id: u64,
     pub submitted: bool,
     pub status: String,
+    /// Who typed it (`by=`: `harness`, `ctl`, `bridge`, a sid, `-`); `-` from
+    /// a host that predates the field.
+    pub by: String,
     pub started_ms: u64,
     pub dur_ms: u64,
     pub arch: Option<Mark>,
@@ -132,7 +219,7 @@ pub(crate) fn history_floor(reply: &CtlReply) -> Option<u64> {
 }
 
 /// The records of a `history` reply (`turn <id> submitted=… status=…
-/// started_ms=… dur_ms=… … arch=<o>:<l> [carried=1] text=<pct>`); any other
+/// started_ms=… dur_ms=… … by=<who> arch=<o>:<l> [carried=1] text=<pct>`); any other
 /// line is skipped. `text=` is the free-text tail, so the line is cut there
 /// first.
 pub fn parse_history_records(body: &str) -> Vec<HistTurn> {
@@ -145,6 +232,7 @@ pub fn parse_history_records(body: &str) -> Vec<HistTurn> {
                 id: decimal(words.next()?)?,
                 submitted: false,
                 status: "-".to_string(),
+                by: "-".to_string(),
                 started_ms: 0,
                 dur_ms: 0,
                 arch: None,
@@ -155,6 +243,7 @@ pub fn parse_history_records(body: &str) -> Vec<HistTurn> {
                 match word.split_once('=') {
                     Some(("submitted", v)) => t.submitted = v == "1",
                     Some(("status", v)) => t.status = v.to_string(),
+                    Some(("by", v)) => t.by = pct_decode(v),
                     Some(("started_ms", v)) => t.started_ms = decimal(v).unwrap_or(0),
                     Some(("dur_ms", v)) => t.dur_ms = decimal(v).unwrap_or(0),
                     Some(("arch", v)) => t.arch = Mark::parse(v),
@@ -189,11 +278,11 @@ pub struct Mail {
     pub pending: bool,
 }
 
-/// The `inbox --peek --meta` rows from `worker` (`msg … t=<ms> from=<sid@node>
-/// kind=… trust=… len=…`, the whole principal: [`is_from_session`]) with their
-/// process-clock `t`, and the ids of the posts to it that have not landed
-/// (`post <id> to=… off=-`).
-fn inbox_rows(body: &str, worker: &str) -> (Vec<(u64, Mail)>, Vec<u64>) {
+/// The `inbox --peek --meta` rows from `worker` (`msg <id> … t=<ms>
+/// from=<sid@node> kind=… trust=… len=…`, the whole principal:
+/// [`is_from_session`]) with their id and process-clock `t`, and the ids of
+/// the posts to it that have not landed (`post <id> to=… off=-`).
+fn inbox_rows(body: &str, worker: &str) -> (Vec<(u64, u64, Mail)>, Vec<u64>) {
     let mut got = Vec::new();
     let mut pending = Vec::new();
     for row in body.lines() {
@@ -202,7 +291,9 @@ fn inbox_rows(body: &str, worker: &str) -> (Vec<(u64, Mail)>, Vec<u64>) {
                 continue;
             }
             let t = field(row, "t").and_then(decimal);
+            let id = row.split(' ').nth(1).and_then(decimal).unwrap_or(0);
             got.push((
+                id,
                 t.unwrap_or(0),
                 Mail {
                     t: None,
@@ -246,6 +337,117 @@ fn timeline_posts(body: &str, worker: &str) -> Vec<(u64, u64, String)> {
         .collect()
 }
 
+/// One record line of a `log` reply (`<seq> <op> <node> <kind> [par=…]
+/// <key>=<value>… t=<ms>`): its op, node and kind words, and its `t=`. The
+/// header and a `gap` line are no record.
+fn log_record(line: &str) -> Option<(&str, &str, &str, Option<i64>)> {
+    let mut w = line.split(' ');
+    decimal(w.next()?)?;
+    let (op, node, kind) = (w.next()?, w.next()?, w.next()?);
+    let t = field(line, "t")
+        .and_then(decimal)
+        .and_then(|t| i64::try_from(t).ok());
+    Some((op, node, kind, t))
+}
+
+/// What the worker's `log class=turn` says of its turns (plan 5F-4, ruling
+/// T12), by `ledger=` alone, never by time.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LogTurns {
+    /// Each `ledger=` id's turn start, wall ms: the turn's open record's
+    /// `t=`, or — its open evicted — its close's `t=` less `dur_ms` (the
+    /// close restates `ledger=`, 5F-4a).
+    start: BTreeMap<u64, i64>,
+    /// Of `start`, the turns placed by their close: the open was evicted.
+    by_close: usize,
+    /// Turns only a close shows (the open evicted) that name no `ledger=`.
+    /// A close restates its open's `ledger=` (5F-4a), so on this build such
+    /// a turn never had one: no `turn` exchange opened it (a person's, or
+    /// input sent with `send` or `key`). Only an older aterm's close may
+    /// have lost one. Either way it joins nothing, and it is no lost join:
+    /// the history turns the log no longer places are counted apart.
+    unledgered: usize,
+    /// The records the ring evicted before this read (its `gap` line).
+    lost: u64,
+}
+
+/// [`LogTurns`] from a `log class=turn` reply's body.
+fn log_turns(body: &str) -> LogTurns {
+    let mut out = LogTurns::default();
+    let mut opened: Vec<&str> = Vec::new();
+    for line in body.lines() {
+        if let Some(gap) = line.strip_prefix("gap ") {
+            out.lost += field(gap, "lost").and_then(decimal).unwrap_or(0);
+            continue;
+        }
+        let Some((op, node, kind, t)) = log_record(line) else {
+            continue;
+        };
+        if kind != "turn" {
+            continue;
+        }
+        let ledger = field(line, "ledger").and_then(decimal);
+        match op {
+            "open" => {
+                opened.push(node);
+                if let (Some(id), Some(t)) = (ledger, t) {
+                    out.start.entry(id).or_insert(t);
+                }
+            }
+            "close" if !opened.contains(&node) => match (ledger, t) {
+                (Some(id), Some(t)) => {
+                    let dur = field(line, "dur_ms")
+                        .and_then(decimal)
+                        .and_then(|d| i64::try_from(d).ok())
+                        .unwrap_or(0);
+                    if let std::collections::btree_map::Entry::Vacant(e) = out.start.entry(id) {
+                        e.insert(t.saturating_sub(dur));
+                        out.by_close += 1;
+                    }
+                }
+                _ => out.unledgered += 1,
+            },
+            _ => {}
+        }
+    }
+    out
+}
+
+/// One post to the worker a `mail dir=out` mark tells: its wall time, post
+/// id and kind.
+type LogPost = (i64, u64, String);
+
+/// The `mail` marks of this session's `log kinds=mail` reply: each message
+/// in's wall time by its inbox id (`dir=in … inbox=<id>`), and each post to
+/// `worker` (`dir=out to=<@sid> kind=<k> inbox=<post id>`).
+fn log_mail(body: &str, worker: &str) -> (BTreeMap<u64, i64>, Vec<LogPost>) {
+    let mut ins = BTreeMap::new();
+    let mut outs = Vec::new();
+    for line in body.lines() {
+        let Some((op, _, kind, Some(t))) = log_record(line) else {
+            continue;
+        };
+        let Some(id) = field(line, "inbox").and_then(decimal) else {
+            continue;
+        };
+        if op != "mark" || kind != "mail" {
+            continue;
+        }
+        match field(line, "dir") {
+            Some("in") => {
+                ins.entry(id).or_insert(t);
+            }
+            Some("out")
+                if field(line, "to").map(pct_decode).as_deref().map(bare_sid) == Some(worker) =>
+            {
+                outs.push((t, id, field(line, "kind").unwrap_or("-").to_string()));
+            }
+            _ => {}
+        }
+    }
+    (ins, outs)
+}
+
 /// One turn, placed on the wall clock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnRow {
@@ -256,6 +458,10 @@ pub struct TurnRow {
     pub submitted: bool,
     pub dur_ms: u64,
     pub carried: bool,
+    /// Whether `t` is when the worker's session log saw the turn BEGIN (its
+    /// open record, `--source log`), which is after the press, rather than
+    /// when the exchange that typed it started (`history`'s `started_ms`).
+    pub began: bool,
     pub text: String,
     /// The worker's reply, in rows, or why it is not known.
     pub rows: Result<usize, String>,
@@ -337,13 +543,26 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
     let manager = ask(ctl, &["whoami"])
         .ok()
         .and_then(|r| r.stdout.split_whitespace().nth(1).map(str::to_string));
-    let worker_anchor = (host.anchor)(&worker);
-    let manager_anchor = manager.as_deref().map(|m| (host.anchor)(m));
-    let aligned = worker_anchor.is_ok();
+    let from_log = opts.source == LedgerSource::Log;
+    let worker_anchor = if from_log {
+        Err("the session log's own times are read instead (`--source log`)".to_string())
+    } else {
+        (host.anchor)(&worker)
+    };
+    let manager_anchor = if from_log {
+        None
+    } else {
+        manager.as_deref().map(|m| (host.anchor)(m))
+    };
+    let mut aligned = worker_anchor.is_ok();
     sources.push(Source {
         name: "clock",
-        ok: aligned,
+        ok: aligned || from_log,
         detail: match &worker_anchor {
+            _ if from_log => "the session log's own wall times (`--source log`): each turn by \
+                              its record's t= joined by ledger=, each message by its mail \
+                              mark's joined by inbox=; no clock anchor is read"
+                .to_string(),
             Ok(a) => format!(
                 "instance {}'s clock started {} ({}); history, inbox and timeline times are \
                  placed by it",
@@ -360,9 +579,26 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
 
     // 1. The turn ledger.
     let mut hist: Vec<HistTurn> = Vec::new();
+    // The newest stamp read, the harness's turns among them (the clock's
+    // fallback below).
+    let mut newest = None;
     match ask(ctl, &[&at, "history"]) {
         Ok(r) => {
             hist = parse_history_records(&r.stdout);
+            newest = hist
+                .iter()
+                .filter(|t| !t.carried)
+                .map(|t| t.started_ms)
+                .max();
+            let typed = hist.len();
+            hist.retain(|t| t.by != "harness");
+            let harness = match typed - hist.len() {
+                0 => String::new(),
+                n => format!(
+                    "; {n} more typed by aterm's window harness (by=harness), not the manager: \
+                     left out"
+                ),
+            };
             let carried = hist.iter().filter(|t| t.carried).count();
             // An update that could not carry the ledger whole says so (`unheld_below=`): then
             // an empty ledger is not a session nobody drove.
@@ -376,12 +612,14 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
                 name: "history",
                 ok: !hist.is_empty(),
                 detail: match (hist.is_empty(), lost) {
-                    (true, Some(lost)) => format!("{at} has no turns in its ledger ({lost})"),
-                    (true, None) => format!(
-                        "{at} has no turns in its ledger (typed by hand or by `drive prompt`?)"
-                    ),
+                    (true, Some(lost)) => {
+                        format!("{at} has no turns in its ledger ({lost}){harness}")
+                    }
+                    (true, None) => {
+                        format!("{at} has no turns in its ledger (typed by hand?){harness}")
+                    }
                     (false, lost) => format!(
-                        "{} turn(s) from {at}{}{}",
+                        "{} turn(s) from {at}{}{}{harness}",
                         hist.len(),
                         if carried > 0 {
                             format!(", {carried} carried from an earlier aterm (no time)")
@@ -400,13 +638,64 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         }),
     }
 
-    // The process clock onto the wall clock. Without an anchor the newest stamp is taken as
-    // now, so the order still reads.
-    let newest = hist
-        .iter()
-        .filter(|t| !t.carried)
-        .map(|t| t.started_ms)
-        .max();
+    // `--source log`: the turns' times from the worker's log, by `ledger=` alone.
+    let log_starts = from_log.then(|| match ask(ctl, &[&at, "log", "class=turn"]) {
+        Ok(r) => {
+            let lt = log_turns(&r.stdout);
+            let placed = hist.iter().filter(|h| lt.start.contains_key(&h.id)).count();
+            let mut detail = format!(
+                "{at} log class=turn: {placed} of {} turn(s) placed by ledger=",
+                hist.len()
+            );
+            if lt.by_close > 0 {
+                let _ = write!(
+                    detail,
+                    " ({} by its close: the open was evicted)",
+                    lt.by_close
+                );
+            }
+            if placed < hist.len() {
+                let _ = write!(
+                    detail,
+                    "; {} the log no longer holds: no time",
+                    hist.len() - placed
+                );
+            }
+            if lt.unledgered > 0 {
+                let _ = write!(
+                    detail,
+                    "; {} closed turn(s) whose open was evicted name no ledger= (no `turn` \
+                     exchange opened them, or an older aterm closed them): joined to nothing",
+                    lt.unledgered
+                );
+            }
+            if lt.lost > 0 {
+                let _ = write!(
+                    detail,
+                    "; the ring evicted {} record(s) before this read",
+                    lt.lost
+                );
+            }
+            aligned = true;
+            sources.push(Source {
+                name: "log",
+                ok: true,
+                detail,
+            });
+            lt.start
+        }
+        Err(e) => {
+            sources.push(Source {
+                name: "log",
+                ok: false,
+                detail: format!("{at}: {e}: no turn is placed"),
+            });
+            BTreeMap::new()
+        }
+    });
+
+    // The process clock onto the wall clock. Without an anchor the newest stamp (read with the
+    // ledger, above) is taken as now, so the order still reads.
     let fallback = host.now_ms - i64::try_from(newest.unwrap_or(0)).unwrap_or(0);
     let worker_epoch = worker_anchor.as_ref().map_or(fallback, |a| a.epoch_ms);
     let manager_epoch = match &manager_anchor {
@@ -423,11 +712,15 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         .zip(sizes)
         .map(|(h, (rows, swallowed))| TurnRow {
             id: h.id,
-            t: (!h.carried).then(|| place(worker_epoch, h.started_ms)),
+            t: match &log_starts {
+                Some(starts) => starts.get(&h.id).copied(),
+                None => (!h.carried).then(|| place(worker_epoch, h.started_ms)),
+            },
             status: h.status.clone(),
             submitted: h.submitted,
             dur_ms: h.dur_ms,
             carried: h.carried,
+            began: log_starts.is_some(),
             text: h.text.clone(),
             rows,
             swallowed,
@@ -491,24 +784,28 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
             mail_ok = true;
             let (got, pending) = inbox_rows(&r.stdout, &opts.worker);
             mail_notes.push(format!("{} message(s) from {at} in the inbox", got.len()));
-            mail.extend(got.into_iter().map(|(t, m)| Mail {
-                t: Some(place(manager_epoch, t)),
-                ..m
-            }));
-            match ask(ctl, &["@self", "timeline"]) {
-                Ok(r) => {
-                    let posts = timeline_posts(&r.stdout, &worker);
-                    mail_notes.push(format!("{} post(s) to it in the timeline", posts.len()));
-                    mail.extend(posts.into_iter().map(|(t, id, kind)| Mail {
-                        t: Some(place(manager_epoch, t)),
-                        dir: Dir::Out,
-                        kind,
-                        len: None,
-                        trust: None,
-                        pending: pending.contains(&id),
-                    }));
+            if from_log {
+                log_placed_mail(ctl, &worker, got, &pending, &mut mail, &mut mail_notes);
+            } else {
+                mail.extend(got.into_iter().map(|(_, t, m)| Mail {
+                    t: Some(place(manager_epoch, t)),
+                    ..m
+                }));
+                match ask(ctl, &["@self", "timeline"]) {
+                    Ok(r) => {
+                        let posts = timeline_posts(&r.stdout, &worker);
+                        mail_notes.push(format!("{} post(s) to it in the timeline", posts.len()));
+                        mail.extend(posts.into_iter().map(|(t, id, kind)| Mail {
+                            t: Some(place(manager_epoch, t)),
+                            dir: Dir::Out,
+                            kind,
+                            len: None,
+                            trust: None,
+                            pending: pending.contains(&id),
+                        }));
+                    }
+                    Err(e) => mail_notes.push(format!("timeline: {e} (posts to it not shown)")),
                 }
-                Err(e) => mail_notes.push(format!("timeline: {e} (posts to it not shown)")),
             }
         }
         Err(e) => mail_notes.push(format!("inbox: {e}")),
@@ -563,8 +860,49 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
     }
 }
 
-/// An EVENT the worker's turn ended with, waiting for words: `idle`, also as `watch --mail`
-/// prints it (`turn`, its report folded in, and `idle-no-report`).
+/// `--source log`'s mail (plan 5F-4): the inbox's messages from the worker
+/// (`got`: id, process-clock `t`, row), each placed by its `mail dir=in`
+/// mark's wall time joined by `inbox=` — one the log no longer holds keeps
+/// no time, counted — and this session's posts to the worker from its `mail
+/// dir=out` marks, `pending` (the inbox's own word) those not landed.
+fn log_placed_mail<C: Ctl>(
+    ctl: &mut C,
+    worker: &str,
+    got: Vec<(u64, u64, Mail)>,
+    pending: &[u64],
+    mail: &mut Vec<Mail>,
+    notes: &mut Vec<String>,
+) {
+    let (ins, outs) = match ask(ctl, &["@self", "log", "kinds=mail"]) {
+        Ok(r) => log_mail(&r.stdout, worker),
+        Err(e) => {
+            notes.push(format!(
+                "log: {e} (no message placed, posts to it not shown)"
+            ));
+            (BTreeMap::new(), Vec::new())
+        }
+    };
+    let unplaced = got.iter().filter(|(id, ..)| !ins.contains_key(id)).count();
+    if unplaced > 0 {
+        notes.push(format!("{unplaced} the log no longer holds: no time"));
+    }
+    mail.extend(got.into_iter().map(|(id, _, m)| Mail {
+        t: ins.get(&id).copied(),
+        ..m
+    }));
+    notes.push(format!("{} post(s) to it in the log", outs.len()));
+    mail.extend(outs.into_iter().map(|(t, id, kind)| Mail {
+        t: Some(t),
+        dir: Dir::Out,
+        kind,
+        len: None,
+        trust: None,
+        pending: pending.contains(&id),
+    }));
+}
+
+/// An EVENT the worker's turn ended with, waiting for words: `idle`, and in a journal an older
+/// build's removed `watch --mail` wrote, its `turn` (a report folded in) and `idle-no-report`.
 fn ended_on_words(phase: &str) -> bool {
     matches!(
         phase,
@@ -753,8 +1091,6 @@ pub struct Summary {
     pub exits: usize,
     pub mail_in: usize,
     pub mail_out: usize,
-    pub complete: usize,
-    pub incomplete: usize,
 }
 
 impl Summary {
@@ -818,11 +1154,6 @@ impl Ledger {
                 ("exit", _) => s.exits += 1,
                 _ => {}
             }
-            match r.complete {
-                Some(true) => s.complete += 1,
-                Some(false) => s.incomplete += 1,
-                None => {}
-            }
         }
         for m in &self.mail {
             match m.dir {
@@ -837,6 +1168,10 @@ impl Ledger {
     pub fn items(&self) -> Vec<Item> {
         let mut items = Vec::new();
         for t in &self.turns {
+            // `--source log` places a turn where its session log saw it begin
+            // (after the press, by however long the press took), so its row
+            // says so; the anchor path places the exchange's start.
+            let sent = if t.began { "began" } else { "sent" };
             let settle = if !t.submitted {
                 format!("not submitted ({})", ms(t.dur_ms))
             } else if t.status == "settled" {
@@ -848,9 +1183,9 @@ impl Ledger {
                 t: t.t,
                 lane: Lane::Manager,
                 mark: MarkKind::Turn,
-                what: format!("turn {} sent: {}", t.id, cut(&t.text, TURN_CHARS)),
+                what: format!("turn {} {sent}: {}", t.id, cut(&t.text, TURN_CHARS)),
                 full: format!(
-                    "turn {} sent{}: {}",
+                    "turn {} {sent}{}: {}",
                     t.id,
                     if t.carried { " (carried)" } else { "" },
                     t.text
@@ -1237,13 +1572,6 @@ pub fn summary_rows(l: &Ledger, s: &Summary) -> Vec<(&'static str, String)> {
         ),
         ("reconnects", j(s.reconnects.to_string())),
         ("mail", format!("{} in · {} out", s.mail_in, s.mail_out)),
-        (
-            "reports",
-            j(format!(
-                "{} complete · {} incomplete",
-                s.complete, s.incomplete
-            )),
-        ),
     ]
 }
 

@@ -711,60 +711,73 @@ const CAPTURED_PHASE: i64 = 1;
 fn a_stale_hint_is_reselected_before_any_carried_present() {
     use crate::handoff_warm_hint::WarmHint;
     let model = native_update_successor_warm_before_claim_model();
-    let carry = |zoom: Option<(u32, u32)>| crate::session_store::WindowCarry {
-        rows: 30,
-        cols: 100,
-        outer_x: None,
-        outer_y: None,
-        inner_px: None,
-        presence_row: false,
-        status_bar_rows: 0,
-        messages: Default::default(),
-        next_message_id: Default::default(),
-        update_verified_unix_ms: None,
-        font_px_milli: zoom.map(|(px, _)| px),
-        font_reset_px_milli: zoom.map(|(_, reset)| reset),
-        update_health_said: Default::default(),
-        messages_captured_unix_ms: None,
-    };
+    // A carry holds the px-at-1x pair this build writes (`size`) and the device
+    // pair for an older successor (`device`); an older parent wrote `device` alone.
+    let carry =
+        |device: Option<(u32, u32)>, size: Option<(u32, u32)>| crate::session_store::WindowCarry {
+            rows: 30,
+            cols: 100,
+            outer_x: None,
+            outer_y: None,
+            inner_px: None,
+            presence_row: false,
+            status_bar_rows: 0,
+            messages: Default::default(),
+            next_message_id: Default::default(),
+            update_verified_unix_ms: None,
+            font_px_milli: device.map(|(px, _)| px),
+            font_reset_px_milli: device.map(|(_, reset)| reset),
+            font_size_milli: size.map(|(px, _)| px),
+            font_reset_size_milli: size.map(|(_, reset)| reset),
+            update_health_said: Default::default(),
+            messages_captured_unix_ms: None,
+        };
+    let zoomed = (Some((28_000, 24_000)), Some((14_000, 12_000)));
+    let unzoomed = (None, None);
+    let older = (Some((28_000, 24_000)), None);
+    const ZOOM_HINT: &str =
+        "w1;windows=1;sessions=1;cols=100;rows=30;px=28000;reset=24000;size=14000;sizereset=12000";
     // (hint on the wire, the carry the park then writes, a miss expected)
     let cases = [
-        ("w1;windows=1;sessions=1;cols=100;rows=30", None, false),
+        ("w1;windows=1;sessions=1;cols=100;rows=30", unzoomed, false),
+        (ZOOM_HINT, zoomed, false),
+        // An older parent: device px in the hint and the carry alike.
         (
             "w1;windows=1;sessions=1;cols=100;rows=30;px=28000;reset=24000",
-            Some((28_000, 24_000)),
+            older,
             false,
         ),
         // Zoomed during the hold: the hint said unzoomed.
-        (
-            "w1;windows=1;sessions=1;cols=100;rows=30",
-            Some((28_000, 24_000)),
-            true,
-        ),
+        ("w1;windows=1;sessions=1;cols=100;rows=30", zoomed, true),
         // Unzoomed during the hold: the hint said zoomed.
-        (
-            "w1;windows=1;sessions=1;cols=100;rows=30;px=28000;reset=24000",
-            None,
-            true,
-        ),
+        (ZOOM_HINT, unzoomed, true),
         // Hostile: a size outside the zoom's bounds is no zoom, so no miss.
         (
             "w1;windows=1;sessions=1;cols=100;rows=30;px=999999;reset=24000",
-            None,
+            unzoomed,
             false,
         ),
         // Unreadable: warms at the config's size, like no hint.
-        ("w9;px=28000", Some((28_000, 24_000)), true),
+        ("w9;px=28000", zoomed, true),
     ];
-    for (wire, carried, miss_expected) in cases {
-        let zoom = WarmHint::parse(wire).map_or((None, None), |hint| hint.zoom_milli());
-        let built = crate::app_config::launch_font_for_zoom(24.0, false, zoom.0, zoom.1);
-        let launch = crate::app_config::successor_font_px(24.0, false, Some(&carry(carried)));
-        let miss = crate::warm_miss_px(built.px, launch.px);
-        assert_eq!(miss.is_some(), miss_expected, "{wire} against {carried:?}");
+    for (wire, (device, size), miss_expected) in cases {
+        let zoom = WarmHint::parse(wire)
+            .map_or_else(crate::app_config::CarriedZoom::default, |hint| {
+                hint.carried_zoom()
+            });
+        // A window launch builds unscaled; its attach selects its scale's px.
+        let built = crate::app_config::launch_font_for_zoom(12.0, zoom).build_px(None);
+        let launch =
+            crate::app_config::successor_font_px(12.0, Some(&carry(device, size))).build_px(None);
+        let miss = crate::warm_miss_px(built, launch);
+        assert_eq!(
+            miss.is_some(),
+            miss_expected,
+            "{wire} against {device:?}/{size:?}"
+        );
         if let Some(px) = miss {
             assert!(
-                (px - launch.px).abs() < f32::EPSILON,
+                (px - launch).abs() < f32::EPSILON,
                 "the join selects the carry's"
             );
         }
@@ -792,8 +805,8 @@ fn a_stale_hint_is_reselected_before_any_carried_present() {
             "{wire}: no carried present at a stale hint's size"
         );
         // After the join's re-selection the build size is the launch size.
-        let reshaped = miss.unwrap_or(built.px);
-        assert!(crate::warm_miss_px(reshaped, launch.px).is_none());
+        let reshaped = miss.unwrap_or(built);
+        assert!(crate::warm_miss_px(reshaped, launch).is_none());
     }
 }
 
@@ -903,7 +916,7 @@ fn a_theme_file_edit_during_the_hold_is_warmed_again() {
     save_theme("#102030");
     crate::test_env::scoped("XDG_CONFIG_HOME", dir.path(), || {
         let read = crate::WarmConfigRead::take(Some(&path));
-        let early = crate::warm_config(true, (None, None));
+        let early = crate::warm_config(true, crate::app_config::CarriedZoom::default());
         assert_eq!(
             early.theme.bg, 0x10_2030,
             "the early warm read the theme file"
@@ -917,7 +930,7 @@ fn a_theme_file_edit_during_the_hold_is_warmed_again() {
             crate::warm_config_moved(&read, Some(&path)),
             "the theme the outgoing process parked under is not the one the early warm read"
         );
-        let late = crate::warm_config(true, (None, None));
+        let late = crate::warm_config(true, crate::app_config::CarriedZoom::default());
         assert_eq!(late.theme.bg, 0x40_5060, "the re-warm reads the edit");
         let _ = early.backend_handle.join().expect("the early worker");
         let _ = late.backend_handle.join().expect("the re-warm's worker");
@@ -1068,12 +1081,17 @@ fn the_hint_never_reaches_the_adoption_proof() {
 /// launchd's 256 in miniature — through the steps `main_entry` runs on the fork
 /// lane, in its order (the snapshot, the prearm, the descriptor limit, the
 /// intake), and then the descriptors each adopted session opens.
-#[cfg(target_os = "macos")]
+///
+/// LINUX TOO: the fork lane is POSIX, and until the limit's settle left
+/// `handoff_rendezvous` (macOS's) a Linux fork-lane successor kept its
+/// producer's limit, so the wake pipes ran out there as well (Linux has no exit
+/// witness to open).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_fork_lane_successor_makes_room_for_the_sessions_it_adopts() {
     /// Sessions handed over: their masters and slaves (this process is both
     /// halves) fit the 96 spare, and their adoption does not.
-    const SESSIONS: usize = 24;
+    const SESSIONS: usize = 32;
     if !crate::control_auth::enter_low_nofile_test_child(96) {
         return;
     }
@@ -1093,10 +1111,10 @@ fn a_fork_lane_successor_makes_room_for_the_sessions_it_adopts() {
     let mut env = HandoffEnv::capture();
     let prearmed = prearm_incoming_fds_from(&mut env);
     assert!(!prearmed.rejects_boot() && prearmed.parent_pid().is_some());
-    crate::handoff_rendezvous::settle_incoming_descriptor_limit(&env);
+    crate::descriptor_limit::settle_incoming_descriptor_limit(&env);
     assert_eq!(
-        crate::handoff_rendezvous::park_raised_from(),
-        crate::handoff_rendezvous::launcher_soft_descriptor_limit(),
+        crate::descriptor_limit::park_raised_from(),
+        crate::descriptor_limit::launcher_soft_descriptor_limit(),
         "a forked successor's own raise is recorded as a park's, from the launcher's limit"
     );
     let incoming = take_incoming_from(&mut env);
@@ -1105,7 +1123,8 @@ fn a_fork_lane_successor_makes_room_for_the_sessions_it_adopts() {
     // What each adopted session opens: its reader's wake pipe and its exit
     // witness (watching this process, which is alive).
     let mut pipes = Vec::new();
-    let mut witnesses = Vec::new();
+    #[cfg_attr(not(target_vendor = "apple"), allow(unused_mut))]
+    let mut witnesses: Vec<aterm_uds::exitwatch::ExitWatch> = Vec::new();
     for index in 0..incoming.adopted.len() {
         let mut fds = [0i32; 2];
         // SAFETY: plain pipe(2) into a valid 2-slot out-array.
@@ -1117,13 +1136,16 @@ fn a_fork_lane_successor_makes_room_for_the_sessions_it_adopts() {
         }
         // SAFETY: pipe(2) just returned both numbers; nothing else holds them.
         pipes.push(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) });
-        let Some(witness) = aterm_uds::exitwatch::ExitWatch::watch(std::process::id()) else {
-            panic!(
-                "adopted session {index} of {SESSIONS}: its exit witness could not open: {}",
-                std::io::Error::last_os_error()
-            );
-        };
-        witnesses.push(witness);
+        #[cfg(target_vendor = "apple")]
+        {
+            let Some(witness) = aterm_uds::exitwatch::ExitWatch::watch(std::process::id()) else {
+                panic!(
+                    "adopted session {index} of {SESSIONS}: its exit witness could not open: {}",
+                    std::io::Error::last_os_error()
+                );
+            };
+            witnesses.push(witness);
+        }
     }
     drop((pipes, witnesses, incoming, ready_read, commit_write));
     staged.teardown();

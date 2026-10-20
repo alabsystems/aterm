@@ -18,19 +18,19 @@ mod corpus;
 
 // The hinting oracle's shared half (the answer format and aterm-render's
 // raster paths), over the corpus digest and aterm-render's rasterizer.
-#[cfg(feature = "hint")]
+#[cfg(any(feature = "hint", debug_assertions))]
 use corpus::Fnv;
-#[cfg(feature = "hint")]
+#[cfg(any(feature = "hint", debug_assertions))]
 #[path = "../../aterm-render/tests/font_oracle/hint_raster.rs"]
 mod hint_raster;
-#[cfg(feature = "hint")]
+#[cfg(any(feature = "hint", debug_assertions))]
 #[path = "../../aterm-render/src/raster.rs"]
 #[allow(dead_code)]
 mod raster;
 
 mod bounded_work;
 mod gvar_tuples;
-#[cfg(feature = "hint")]
+#[cfg(any(feature = "hint", debug_assertions))]
 mod hint_oracle;
 mod never_panic;
 mod reader_oracle;

@@ -390,16 +390,39 @@ impl Terminal {
         self.note_scroll_custody(before);
     }
 
-    /// Take pending response data (DSR/DA replies) for the PTY and clear the
-    /// buffer; `None` if empty. Clones and clears rather than `mem::take` so the
-    /// buffer keeps its allocation.
+    /// Take everything owed to the PTY and clear it: the replies (DSR/DA and the
+    /// other answers to a sequence), then the reports the terminal sends unasked
+    /// ([`Self::take_reports`]); `None` if both are empty. Clones and clears
+    /// rather than `mem::take` so the buffers keep their allocations.
     #[must_use]
     pub fn take_response(&mut self) -> Option<Vec<u8>> {
-        if self.transient.response_buffer.is_empty() {
+        let transient = &mut self.transient;
+        if transient.response_buffer.is_empty() && transient.report_buffer.is_empty() {
+            return None;
+        }
+        let mut data = Vec::with_capacity(transient.owed_len());
+        data.extend_from_slice(&transient.response_buffer);
+        data.extend_from_slice(&transient.report_buffer);
+        transient.response_buffer.clear();
+        transient.report_buffer.clear();
+        Some(data)
+    }
+
+    /// Take only the reports the terminal sends unasked, at a change of its own
+    /// rather than in answer to a sequence: DEC 2048 in-band size reports (a
+    /// resize, a new cell box, the mode's enable) and DSR 997 colour-scheme
+    /// pushes (DEC 2031); `None` if there are none. A host whose input path
+    /// treats a program's input apart from the terminal's answers takes these
+    /// first and sends them as input (aterm-gui on Windows, where the ConPTY
+    /// resize guard must protect them: `aterm_pty`'s `resize_guard`); the
+    /// replies stay for [`Self::take_response`].
+    #[must_use]
+    pub fn take_reports(&mut self) -> Option<Vec<u8>> {
+        if self.transient.report_buffer.is_empty() {
             None
         } else {
-            let data = self.transient.response_buffer.clone();
-            self.transient.response_buffer.clear();
+            let data = self.transient.report_buffer.clone();
+            self.transient.report_buffer.clear();
             Some(data)
         }
     }
@@ -593,24 +616,23 @@ mod tests {
         assert_eq!(t.scrollback_truncated_lines(), 0);
     }
 
-    /// A paste carrying ESC[201~ cannot end the bracket early: ESC is stripped,
-    /// so the only ESC[201~ on the wire is the final guard.
+    /// A paste carrying a bracket terminator cannot end the bracket early: ESC,
+    /// and C1 CSI (0x9B, which terminates it like ESC[ when 8-bit controls are
+    /// honored), are stripped, so the only ESC[201~ on the wire is the final
+    /// guard.
     #[test]
-    fn bracketed_paste_blocks_embedded_escape_terminator() {
+    fn bracketed_paste_blocks_embedded_terminators() {
         let mut term = Terminal::new(24, 80);
         term.process(b"\x1b[?2004h");
-        let out = term.format_paste("safe\x1b[201~rm -rf ~");
-        assert_eq!(out, b"\x1b[200~safe[201~rm -rf ~\x1b[201~");
-    }
-
-    /// C1 CSI (0x9B) terminates the bracket region just like ESC[ when 8-bit
-    /// controls are honored; it must be stripped too.
-    #[test]
-    fn bracketed_paste_blocks_c1_csi_terminator() {
-        let mut term = Terminal::new(24, 80);
-        term.process(b"\x1b[?2004h");
-        let out = term.format_paste("a\u{009B}201~b");
-        assert_eq!(out, b"\x1b[200~a201~b\x1b[201~");
+        for (paste, wire) in [
+            (
+                "safe\x1b[201~rm -rf ~",
+                &b"\x1b[200~safe[201~rm -rf ~\x1b[201~"[..],
+            ),
+            ("a\u{009B}201~b", &b"\x1b[200~a201~b\x1b[201~"[..]),
+        ] {
+            assert_eq!(term.format_paste(paste), wire, "{paste:?}");
+        }
     }
 
     /// Without bracketed paste there is no guard at all, so ESC and C1
@@ -927,6 +949,28 @@ mod tests {
         u.process(b"\x1bc");
         assert_eq!(u.print_anchor(), None);
         assert_eq!(u.print_anchor_glyph(), None);
+    }
+
+    #[test]
+    fn paste_preserves_non_ascii_spaces() {
+        let mut t = Terminal::new(4, 80);
+        let macos_screenshot =
+            "'/Users//example/Desktop/Screenshot 2026-10-19 at 12.17.46\u{202f}PM.png'";
+        let expected = macos_screenshot.as_bytes();
+        assert_eq!(t.format_paste_framed(macos_screenshot, false), expected);
+        assert_eq!(
+            t.format_paste_framed(macos_screenshot, true),
+            [b"\x1b[200~".as_slice(), expected, b"\x1b[201~".as_slice()].concat()
+        );
+        assert_eq!(
+            Terminal::paste_insert_cells(macos_screenshot, false),
+            Some(u16::try_from(macos_screenshot.chars().count()).unwrap())
+        );
+        t.process(b"\x1b[?2004h");
+        assert_eq!(
+            t.format_paste("a\u{00a0}b\u{202f}c"),
+            "\x1b[200~a\u{00a0}b\u{202f}c\x1b[201~".as_bytes()
+        );
     }
 }
 

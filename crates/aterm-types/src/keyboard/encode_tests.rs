@@ -148,7 +148,7 @@ fn encode_enter(mode: KeyboardMode, mods: Modifiers) -> Vec<u8> {
 #[test]
 fn shift_enter_distinct_from_enter_in_every_mode() {
     for bits in 0u32..(1u32 << KEYBOARD_MODE_DEFINED_BITS) {
-        let mode = KeyboardMode::from_bits_truncate(bits as u16);
+        let mode = KeyboardMode::from_bits_truncate(bits);
         let plain = encode_enter(mode, Modifiers::empty());
         let shift = encode_enter(mode, Modifiers::SHIFT);
         assert_ne!(
@@ -213,7 +213,7 @@ fn release_encodes_to_nothing_without_report_event_types() {
         Modifiers::CTRL | Modifiers::SHIFT,
     ];
     for bits in 0u32..(1u32 << KEYBOARD_MODE_DEFINED_BITS) {
-        let mode = KeyboardMode::from_bits_truncate(bits as u16);
+        let mode = KeyboardMode::from_bits_truncate(bits);
         if mode.contains(KeyboardMode::REPORT_EVENT_TYPES) {
             continue;
         }
@@ -244,7 +244,7 @@ fn release_encodes_to_nothing_without_report_event_types() {
 fn text_and_recovery_key_releases_require_report_all_keys() {
     let text_keys = [Key::Character('a'), Key::Named(NamedKey::Space)];
     for bits in 0u32..(1u32 << KEYBOARD_MODE_DEFINED_BITS) {
-        let mode = KeyboardMode::from_bits_truncate(bits as u16);
+        let mode = KeyboardMode::from_bits_truncate(bits);
         if !mode.contains(KeyboardMode::REPORT_EVENT_TYPES)
             || mode.contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC)
         {
@@ -300,7 +300,7 @@ fn text_and_recovery_key_releases_require_report_all_keys() {
 fn reported_release_is_never_byte_identical_to_press() {
     let mods_grid = [Modifiers::empty(), Modifiers::SHIFT, Modifiers::CTRL];
     for bits in 0u32..(1u32 << KEYBOARD_MODE_DEFINED_BITS) {
-        let mode = KeyboardMode::from_bits_truncate(bits as u16);
+        let mode = KeyboardMode::from_bits_truncate(bits);
         for key in release_obligation_keys() {
             for mods in mods_grid {
                 let released = encode_key_with_event(&key, mods, mode, KeyEventType::Release);
@@ -392,9 +392,10 @@ fn kitty_text_preserving_modes() -> Vec<KeyboardMode> {
 
 /// THEOREM (text refinement): for every kitty mode without report-all-keys,
 /// every text-producing PRESS and REPEAT — plain and shift-only characters,
-/// Space, and unmodified Enter/Tab/Backspace — encodes byte-identically to
-/// the pure-legacy encoding of the same event. This is what makes capitals
-/// arrive as 'A' (not `ESC[97;2u`) in text-preserving TUIs.
+/// Space, unmodified Enter/Tab/Backspace, and Shift+Backspace — encodes
+/// byte-identically to the pure-legacy encoding of the same event. The
+/// Shift+Backspace case is aterm's compatibility policy; report-all keeps
+/// its modifier. Capitals arrive as 'A' (not `ESC[97;2u`).
 #[test]
 fn kitty_text_events_encode_exactly_like_legacy() {
     let text_events: Vec<(Key, Modifiers)> = vec![
@@ -407,6 +408,7 @@ fn kitty_text_events_encode_exactly_like_legacy() {
         (Key::Named(NamedKey::Enter), Modifiers::empty()),
         (Key::Named(NamedKey::Tab), Modifiers::empty()),
         (Key::Named(NamedKey::Backspace), Modifiers::empty()),
+        (Key::Named(NamedKey::Backspace), Modifiers::SHIFT),
     ];
     for kitty_mode in kitty_text_preserving_modes() {
         // Cross with the legacy bits that change these keys' byte forms, and
@@ -510,7 +512,7 @@ fn modifier_keys_silent_in_every_mode_without_report_all() {
         NamedKey::NumLock,
     ];
     for bits in 0u32..(1u32 << KEYBOARD_MODE_DEFINED_BITS) {
-        let mode = KeyboardMode::from_bits_truncate(bits as u16);
+        let mode = KeyboardMode::from_bits_truncate(bits);
         if mode.contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC) {
             continue;
         }
@@ -1145,8 +1147,11 @@ fn win32_input_is_not_a_kitty_flag() {
     // "the app negotiated kitty semantics" anywhere the aggregate is consulted.
     assert!(!KeyboardMode::KITTY_PROTOCOL_FLAGS.contains(WIN32));
     assert!(!WIN32.intersects(KeyboardMode::KITTY_PROTOCOL_FLAGS));
-    // …and it fits the u16 word the lock-free mode mirror publishes.
+    // Nor is the host bit that rides with it.
+    assert!(!KeyboardMode::OPENCONSOLE_HOST.intersects(KeyboardMode::KITTY_PROTOCOL_FLAGS));
+    // …and both fit the u32 word the lock-free mode mirror publishes.
     assert_eq!(WIN32.bits(), 1 << 15);
+    assert_eq!(KeyboardMode::OPENCONSOLE_HOST.bits(), 1 << 16);
 }
 
 #[test]
@@ -1338,7 +1343,6 @@ fn win32_keys_conhost_still_reads_keep_their_bytes() {
         (Key::Named(NamedKey::Tab), Modifiers::CTRL),
         (Key::Named(NamedKey::Tab), Modifiers::ALT),
         (Key::Named(NamedKey::Backspace), Modifiers::CTRL),
-        (Key::Named(NamedKey::Space), Modifiers::CTRL),
         (Key::Named(NamedKey::Space), Modifiers::ALT),
         (Key::Named(NamedKey::ArrowUp), Modifiers::empty()),
         (Key::Named(NamedKey::ArrowUp), Modifiers::SHIFT),
@@ -1367,7 +1371,7 @@ fn win32_keys_conhost_still_reads_keep_their_bytes() {
         (Key::Character('é'), Modifiers::ALT),
         (Key::Named(NamedKey::NumpadEnter), Modifiers::empty()),
         (Key::Named(NamedKey::NumpadEnter), Modifiers::ALT),
-        (Key::Named(NamedKey::Numpad5), Modifiers::SHIFT),
+        (Key::Named(NamedKey::Numpad5), Modifiers::ALT),
         // `ESC ESC [ E`: conhost drops it before the switch and after it alike,
         // and poisons nothing either way — not a key the switch broke.
         (Key::Named(NamedKey::NumpadBegin), Modifiers::ALT),
@@ -1816,6 +1820,51 @@ fn win32_ctrl_h_is_a_record_of_the_h_key() {
 }
 
 #[test]
+fn win32_ctrl_j_is_a_record_of_the_j_key() {
+    // The regression: conhost decodes a bare LF as Ctrl+Enter (`ReadKey`:
+    // `Enter MODS=Control CHAR=0x0A`), so Ctrl+J at a PowerShell prompt ran
+    // PSReadLine's InsertLineAbove, where readline's C-j accepts the line. The J
+    // key's record arrives as Ctrl+j, which the pwsh readline layer binds to
+    // AcceptLine, and Git Bash reads its LF and accepts the line (measured
+    // 2026-10-17 through ConPTY, conhost 10.0.26200; the presses are
+    // aterm-shell-integration's `test_ctrl_j_accepts_the_line_in_powershell_and_git_bash`).
+    let j = Key::Character('j');
+    let ctrl = Modifiers::CTRL;
+    let rec = |key: &Key, mods: Modifiers, base: Option<char>| {
+        encode_key_with_layout(key, mods, WIN32, KeyEventType::Press, base)
+    };
+    // VK_J (0x4A), scan 0x24, char LF, LEFT_CTRL_PRESSED: the bytes the test presses.
+    assert_eq!(
+        rec(&j, ctrl, Some('j')),
+        b"\x1b[74;36;10;1;8;1_\x1b[74;36;10;0;8;1_"
+    );
+    assert_eq!(rec(&j, ctrl, None), win32_pair(74, 36, 10, 0x08));
+    // Shift and Caps Lock change nothing, as for Ctrl+H; Russian Ctrl+о on the J
+    // key writes the US letter's LF, so it is the same record.
+    for (key, mods) in [
+        (j.clone(), ctrl | Modifiers::SHIFT),
+        (Key::Character('J'), ctrl),
+        (Key::Character('J'), ctrl | Modifiers::CAPS_LOCK),
+        (Key::Character('о'), ctrl),
+    ] {
+        assert_eq!(
+            rec(&key, mods, Some('j')),
+            win32_pair(74, 36, 10, 0x08),
+            "{key:?}+{mods:?}"
+        );
+    }
+    // What stays: Ctrl+Enter is its own Enter record, a LF character (no letter)
+    // keeps its byte, Alt+Ctrl+J keeps `ESC LF`, and without 9001 Ctrl+J is LF.
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::Enter), ctrl, WIN32),
+        win32_enter_pair(10, 0x08)
+    );
+    assert_eq!(encode_key(&Key::Character('\n'), ctrl, WIN32), b"\x0a");
+    assert_eq!(encode_key(&j, ctrl | Modifiers::ALT, WIN32), b"\x1b\x0a");
+    assert_eq!(encode_key(&j, ctrl, KeyboardMode::empty()), b"\x0a");
+}
+
+#[test]
 fn win32_ctrl_h_record_outranks_kitty_and_modify_other_keys() {
     // conhost drops the protocol spellings of a Ctrl chord (measured
     // 2026-09-27: `CSI 99;5 u`, kitty's Ctrl+c, reached `ReadKey` as nothing),
@@ -1865,10 +1914,14 @@ fn win32_changes_only_the_held_forms_across_the_whole_ascii_keyboard() {
     // The sweep behind the rule: for every printable character key and every
     // named key, under every Shift/Ctrl/Alt combination, 9001 either leaves
     // the legacy bytes alone or — exactly when conhost would hold them —
-    // replaces them with ONE well-formed down/up record pair. The one other
-    // change is Ctrl(+Shift)+h, whose BS conhost reads as Ctrl+Backspace: it
-    // becomes the H key's Ctrl record, Shift or not, and no other key does.
-    // (Enter chords are their own family, pinned above.)
+    // replaces them with ONE well-formed down/up record pair. The other
+    // changes are Ctrl(+Shift)+h and Ctrl(+Shift)+j, whose BS and LF conhost
+    // reads as Ctrl+Backspace and Ctrl+Enter: each becomes its letter key's
+    // Ctrl record, Shift or not, and no other character key does.
+    // (Enter chords are their own family, pinned above, and so are the named
+    // keys' records — Shift+Space, Ctrl+Space and Ctrl+Alt(+Shift)+Space,
+    // Shift+Backspace and the keypad without Alt — which
+    // `encode_win32_keys_tests` pins.)
     let mods_list = [
         Modifiers::empty(),
         Modifiers::SHIFT,
@@ -1899,6 +1952,8 @@ fn win32_changes_only_the_held_forms_across_the_whole_ascii_keyboard() {
     );
     let mut routed = 0;
     let mut ctrl_h = 0;
+    let mut ctrl_j = 0;
+    let mut named = 0;
     for key in &keys {
         for mods in mods_list {
             let legacy = encode_key(key, mods, KeyboardMode::empty());
@@ -1912,6 +1967,37 @@ fn win32_changes_only_the_held_forms_across_the_whole_ascii_keyboard() {
                 ctrl_h += 1;
                 assert_eq!(legacy, b"\x08", "{key:?}+{mods:?}: legacy BS");
                 assert_eq!(win, win32_pair(72, 35, 8, 0x08), "{key:?}+{mods:?}");
+                continue;
+            }
+            // And Ctrl(+Shift)+j/J, whose LF conhost reads as Ctrl+Enter.
+            if matches!(key, Key::Character('j' | 'J'))
+                && mods.contains(Modifiers::CTRL)
+                && !mods.contains(Modifiers::ALT)
+            {
+                ctrl_j += 1;
+                assert_eq!(legacy, b"\x0a", "{key:?}+{mods:?}: legacy LF");
+                assert_eq!(win, win32_pair(74, 36, 10, 0x08), "{key:?}+{mods:?}");
+                continue;
+            }
+            // The named keys' records, named here from the keys.
+            let named_record = match key {
+                Key::Named(NamedKey::Space) => {
+                    mods == Modifiers::SHIFT
+                        || mods == Modifiers::CTRL
+                        || mods.contains(Modifiers::CTRL | Modifiers::ALT)
+                }
+                Key::Named(NamedKey::Backspace) => mods == Modifiers::SHIFT,
+                Key::Named(NamedKey::Numpad5 | NamedKey::NumpadDecimal) => {
+                    !mods.contains(Modifiers::ALT)
+                }
+                _ => false,
+            };
+            if named_record {
+                named += 1;
+                assert!(
+                    parse_win32_pair(&win).is_some(),
+                    "{key:?}+{mods:?}: {win:?} is not a record pair"
+                );
                 continue;
             }
             if !conhost_holds_once_switched(&legacy) {
@@ -1948,8 +2034,13 @@ fn win32_changes_only_the_held_forms_across_the_whole_ascii_keyboard() {
     // Escape ×8, Backspace+Alt ×2, and the character chords that dangle —
     // non-zero is the non-vacuity check; the exact count is not the contract.
     assert!(routed > 20, "only {routed} keys were routed");
-    // The carve-out is exactly the four Ctrl+H chords, each of them reached.
+    // The carve-outs are exactly the four Ctrl+H and four Ctrl+J chords, each
+    // of them reached.
     assert_eq!(ctrl_h, 4, "Ctrl(+Shift)+h/H");
+    assert_eq!(ctrl_j, 4, "Ctrl(+Shift)+j/J");
+    // Space: Shift, Ctrl and the two Ctrl+Alt chords (Ctrl+Shift+Space keeps
+    // its NUL); Backspace: Shift; two keypad keys under the four Alt-free chords.
+    assert_eq!(named, 4 + 1 + 8, "named-key records");
 }
 
 #[test]
@@ -1979,9 +2070,9 @@ fn win32_numpad_enter_chord_is_an_enhanced_key_record() {
         ),
         win32_enter_pair(10, 0x11a)
     );
-    // DECKPAM does not change the record: it names the physical key, and
-    // conhost applies the application's keypad mode itself. (In legacy, SHIFT
-    // cancels application keypad mode → bare LF, and CTRL keeps SS3 M.)
+    // DECKPAM does not change the record: it names the physical key. (In
+    // legacy, SHIFT cancels application keypad mode → bare LF, and CTRL keeps
+    // SS3 M, which the record does not carry.)
     let app = WIN32 | KeyboardMode::APP_KEYPAD;
     assert_eq!(
         encode_key(&kp, Modifiers::SHIFT, app),
@@ -1991,16 +2082,19 @@ fn win32_numpad_enter_chord_is_an_enhanced_key_record() {
         encode_key(&kp, Modifiers::CTRL, app),
         win32_enter_pair(10, 0x108)
     );
-    // Plain and Alt+KP_Enter stay legacy in and out of DECKPAM — conhost
-    // translates CR, SS3 M and ESC CR itself.
-    for mods in [Modifiers::empty(), Modifiers::ALT] {
-        assert_eq!(
-            encode_key(&kp, mods, app),
-            encode_key(&kp, mods, KeyboardMode::APP_KEYPAD),
-            "{mods:?} KP_Enter under DECKPAM must not change under 9001"
-        );
-    }
-    assert_eq!(encode_key(&kp, Modifiers::empty(), app), b"\x1bOM");
+    // Alt+KP_Enter stays legacy in and out of DECKPAM, and plain KP_Enter
+    // outside it: conhost translates CR and ESC CR itself. Plain KP_Enter
+    // under DECKPAM is its record, CR to a VT reader on either host, as the
+    // rest of the keypad is (`encode_win32_keys`).
+    assert_eq!(
+        encode_key(&kp, Modifiers::ALT, app),
+        encode_key(&kp, Modifiers::ALT, KeyboardMode::APP_KEYPAD)
+    );
+    assert_eq!(encode_key(&kp, Modifiers::empty(), WIN32), b"\r");
+    assert_eq!(
+        encode_key(&kp, Modifiers::empty(), app),
+        win32_enter_pair(13, 0x100)
+    );
     // The release stand-down covers the keypad chord too.
     assert!(encode_key_with_event(&kp, Modifiers::SHIFT, WIN32, KeyEventType::Release).is_empty());
 }

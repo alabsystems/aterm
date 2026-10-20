@@ -63,14 +63,13 @@ pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[FirstPartyVendored {
           it. It is a git submodule (vendor/README-astream.md), and aterm resolves the astream \
           crates its members use by path, outside this workspace ([OB-1] names each one it \
           finds in the graph and holds it to the submodule; vendor/README-astream.md's table \
-          says what each is for); astream-aead only under aterm-link's off-by-default sealed \
-          feature, astream-term only as aterm-conformance's dev-dependency (the differential \
-          VT oracle's fold, zero dependencies). Not on crates.io, so no \
+          says what each is for); astream-term only as aterm-conformance's dev-dependency \
+          (the differential VT oracle's fold, zero dependencies). Not on crates.io, so no \
           [patch.crates-io] entry could ever name it: a patch entry replaces a registry \
-          package and there is none to replace. The third-party packages it DRAGS IN (none in \
-          a default build since astream-cap's SHA-256 became astream-digest, 2026-10-15; \
-          chacha20poly1305 and getrandom under aterm-link's sealed feature) are unaffected \
-          by this row and stay on the ratchet.",
+          package and there is none to replace. The third-party packages it DRAGS IN (none \
+          since astream-cap's SHA-256 became astream-digest and the sealed transport, with \
+          its astream-aead, was removed, 2026-10-15) are unaffected by this row and stay on \
+          the ratchet.",
 }];
 
 /// The roster row whose directory contains `rel`, if any. `rel` is

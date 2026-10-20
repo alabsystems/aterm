@@ -106,49 +106,9 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
             A::LocalUi,
             C::Terminal,
         ),
-        // Session-connection spawn presets: peer and place are reducer parameters, never id
-        // names (one fieldless id per parameterless act). Owner because each mints standing
-        // session-connection authority over the focused session; terminal content because the
-        // origin is the focused session.
-        M::NewControlledWindow => spec(
-            "session.connect_controlled_window",
-            S::Process,
-            A::Owner,
-            C::Terminal,
-        ),
-        M::NewControlledTab => spec(
-            "session.connect_controlled_tab",
-            S::Window,
-            A::Owner,
-            C::Terminal,
-        ),
-        M::NewControllerWindow => spec(
-            "session.connect_controller_window",
-            S::Process,
-            A::Owner,
-            C::Terminal,
-        ),
-        M::NewControllerTab => spec(
-            "session.connect_controller_tab",
-            S::Window,
-            A::Owner,
-            C::Terminal,
-        ),
-        // The connection picker (the chosen peer is a reducer parameter) and the instance-wide
-        // map: Owner, as they mint standing authority / aggregate disclosure like the presets and
-        // the `flows` verb.
-        M::ConnectToSession => spec("session.connect_to", S::Window, A::Owner, C::Terminal),
-        M::ShowConnectionMap => spec("view.connections", S::App, A::Owner, C::Any),
-        // Configure/disconnect an existing connection: the peer is a reducer parameter, never an
-        // id name. Owner because both rewrite or dissolve standing session-connection authority;
-        // terminal content because the subject is the focused (or clicked-tab) session.
-        M::ConfigureConnection => spec(
-            "session.configure_connection",
-            S::Window,
-            A::Owner,
-            C::Terminal,
-        ),
-        M::DisconnectSession => spec("session.disconnect", S::Window, A::Owner, C::Terminal),
+        // The Overview lists every session of the instance: Owner, the
+        // aggregate-disclosure class of the `flows` verb.
+        M::Overview => spec("view.overview", S::App, A::Owner, C::Any),
         // `CloseTab` closes the focused pane/view, hence the view id.
         M::CloseTab => spec("view.close_focused", S::View, A::LocalUi, C::Any),
         M::Copy => spec("selection.copy", S::View, A::Clipboard, C::Any),
@@ -215,23 +175,29 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::NewWindowWithIdentity => spec("window.new_with_identity", S::App, A::Owner, C::Any),
         M::NewTabWithIdentity => spec("tab.new_with_identity", S::Window, A::Owner, C::Any),
         M::Help => spec("app.help.open", S::App, A::ExternalOpen, C::Any),
-        // The fabric menu: a session's mail metadata on screen is Owner (the class of the map),
-        // terminal content (the inbox is a session's).
-        M::Inbox => spec("session.inbox.open", S::Tab, A::Owner, C::Terminal),
-        // Converges on `App::open_session_ledger`.
-        M::LedgerForSession => spec("session.ledger.open", S::Tab, A::ExternalOpen, C::Terminal),
-        // The halt pair: the `hold` verb's two acts, Owner-class like the verb.
-        M::HoldSession => spec("session.hold", S::Tab, A::Owner, C::Terminal),
-        M::LiftHold => spec("session.hold.lift", S::Tab, A::Owner, C::Terminal),
-        // The three `aterm fabric` commands run as a child of this process:
-        // Owner, process-scoped, no content requirement.
+        // The Agents menu. Next That Needs You moves focus (a local act).
+        M::NextNeed => spec("agents.next_need", S::App, A::LocalUi, C::Any),
+        // Converges on `App::open_session_ledger`; the id keeps the ledger's.
+        M::HarnessLog => spec("session.ledger.open", S::Tab, A::ExternalOpen, C::Terminal),
+        // The reads, Fleet Machines and Summarize run a child or start a
+        // worker that sees the whole Mac or fleet: Owner, process-scoped.
+        M::ReadThisMac => spec("agents.read_mac", S::Process, A::Owner, C::Any),
+        M::ReadFleet => spec("agents.read_fleet", S::Process, A::Owner, C::Any),
+        M::SummarizeFleet => spec("agents.summarize", S::Process, A::Owner, C::Any),
+        M::FleetMachines => spec("agents.fleet_machines", S::Process, A::Owner, C::Any),
+        // The person's hold pair (Take Over / Hand Back): the window's own act
+        // on the person's slot, at the highest ceiling the registry names; the
+        // `invoke` fence refuses every socket scope (`InvokeAuthority::PersonOnly`).
+        M::TakeOver => spec("session.take_over", S::Tab, A::Owner, C::Terminal),
+        M::HandBack => spec("session.hand_back", S::Tab, A::Owner, C::Terminal),
+        // The message bus's three commands (`aterm fabric`) run as a child of
+        // this process: Owner, process-scoped, no content requirement.
         M::FabricStatus => spec("fabric.status", S::Process, A::Owner, C::Any),
         M::FabricOn => spec("fabric.on", S::Process, A::Owner, C::Any),
         M::FabricOff => spec("fabric.off", S::Process, A::Owner, C::Any),
-        // The presence checkables write `[presence]` — durable config, the
-        // Serious Mode class.
-        M::TogglePresenceBand => spec("presence.band.toggle", S::Process, A::ConfigMutate, C::Any),
-        M::TogglePresenceRim => spec("presence.rim.toggle", S::Process, A::ConfigMutate, C::Any),
+        // Show Needs in Windows writes `[presence] rim` — durable config, the
+        // Serious Mode class; the id keeps the rim's.
+        M::ToggleNeedsInWindows => spec("presence.rim.toggle", S::Process, A::ConfigMutate, C::Any),
         // The manual reset of the focused view's terminal to its host defaults: runtime engine
         // state only (`LocalUi`, the class of the font zoom), and it needs a terminal leaf.
         M::ResetTerminal => spec("terminal.reset", S::View, A::LocalUi, C::Terminal),
@@ -337,6 +303,7 @@ pub(crate) fn editor_command(command: &crate::native_editor::EditorCommand) -> C
         E::Save | E::RevertBuffer => A::DocumentWrite,
         E::DeleteBackward
         | E::DeleteForward
+        | E::IndentForTab
         | E::KillRegion
         | E::KillLine
         | E::Yank
@@ -350,6 +317,8 @@ pub(crate) fn editor_command(command: &crate::native_editor::EditorCommand) -> C
         | E::MoveForward
         | E::MoveLineUp
         | E::MoveLineDown
+        | E::ScrollPageDown
+        | E::ScrollPageUp
         | E::MoveLineStart
         | E::MoveLineEnd
         | E::MoveWordBackward
@@ -379,49 +348,30 @@ mod tests {
             menu_command(menu::MenuAction::SplitVertical).content,
             ContentRequirement::Any
         );
-        // The session-connection presets: one fieldless id each, Owner (they mint standing
-        // authority), terminal content (the origin is the focused session).
-        for (action, id) in [
-            (
-                menu::MenuAction::NewControlledWindow,
-                "session.connect_controlled_window",
-            ),
-            (
-                menu::MenuAction::NewControlledTab,
-                "session.connect_controlled_tab",
-            ),
-            (
-                menu::MenuAction::NewControllerWindow,
-                "session.connect_controller_window",
-            ),
-            (
-                menu::MenuAction::NewControllerTab,
-                "session.connect_controller_tab",
-            ),
-        ] {
-            let spec = menu_command(action);
-            assert_eq!(spec.id.as_str(), id);
-            assert_eq!(
-                spec.authority,
-                ActionAuthority::Owner,
-                "{id} mints authority"
-            );
-            assert_eq!(spec.content, ContentRequirement::Terminal);
-        }
-        // The picker/map ids: stable, Owner (the picker mints, the map aggregates).
-        let connect_to = menu_command(menu::MenuAction::ConnectToSession);
-        assert_eq!(connect_to.id.as_str(), "session.connect_to");
-        assert_eq!(connect_to.authority, ActionAuthority::Owner);
-        let map = menu_command(menu::MenuAction::ShowConnectionMap);
-        assert_eq!(map.id.as_str(), "view.connections");
+        // The Overview's id: stable, Owner (it lists every session).
+        let map = menu_command(menu::MenuAction::Overview);
+        assert_eq!(map.id.as_str(), "view.overview");
         assert_eq!(map.authority, ActionAuthority::Owner);
-        // The configure/disconnect ids: the peer stays a parameter, and both are Owner.
-        let configure = menu_command(menu::MenuAction::ConfigureConnection);
-        assert_eq!(configure.id.as_str(), "session.configure_connection");
-        assert_eq!(configure.authority, ActionAuthority::Owner);
-        let disconnect = menu_command(menu::MenuAction::DisconnectSession);
-        assert_eq!(disconnect.id.as_str(), "session.disconnect");
-        assert_eq!(disconnect.authority, ActionAuthority::Owner);
+        // The person's pair and the Agents rows that see the whole Mac or
+        // fleet carry the Owner ceiling; Next That Needs You is a local act.
+        for action in [
+            menu::MenuAction::TakeOver,
+            menu::MenuAction::HandBack,
+            menu::MenuAction::ReadThisMac,
+            menu::MenuAction::ReadFleet,
+            menu::MenuAction::SummarizeFleet,
+            menu::MenuAction::FleetMachines,
+        ] {
+            assert_eq!(
+                menu_command(action).authority,
+                ActionAuthority::Owner,
+                "{action:?}"
+            );
+        }
+        assert_eq!(
+            menu_command(menu::MenuAction::NextNeed).authority,
+            ActionAuthority::LocalUi
+        );
     }
 
     #[test]

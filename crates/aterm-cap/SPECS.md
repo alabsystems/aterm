@@ -45,7 +45,7 @@ that closes it, but the machine's `trust` channel has not been flipped to it.
 - `MintModel` is the claim `NoUntrustedTop`: no crate outside `Launchers` obtains a root
   `Authority`. No derived model encodes it; its earlier one was unbound and was deleted.
 - `Guard` is the aterm-census `launcher-mint` guard (`crates/aterm-census/src/guards/mint.rs`, run by
-  `verify guards`). Outside `Launchers` it reports every shipped line under a crate's `src/` whose
+  `verify census`). Outside `Launchers` it reports every shipped line under a crate's `src/` whose
   code names `root_authority`, and every shipped table of the root `Cargo.toml` or a
   `crates/<name>/Cargo.toml` that enables `aterm-cap/launcher-mint`. Test items, test files and
   dev-dependency edges are not read.

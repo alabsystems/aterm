@@ -175,6 +175,8 @@ fn an_untracked_link_is_held_back_and_never_read_through() {
     std::os::unix::fs::symlink(&outside, r.root.join("notes.md")).expect("link");
     let c = take(&r, &Base::Uncommitted).expect("change");
     assert!(!c.diff.contains("PRIVATE-MARKER"), "{}", c.diff);
+    // Making a link takes a privilege on Windows: there the plain-file control alone runs.
+    #[cfg(unix)]
     assert_eq!(
         c.links,
         ["notes.md"],
@@ -229,16 +231,50 @@ fn only_the_repositorys_own_filter_driver_refuses() {
     );
 }
 
+/// The person's own (global) `aterm.aiReview = false` refuses too, read from their home as
+/// git finds it on this host: `HOME`, or on Windows `USERPROFILE` (where no `HOME` is set).
+/// Negative control: the same home without the key sends.
+#[test]
+fn a_global_opt_out_in_the_persons_home_refuses() {
+    let r = repo();
+    std::fs::write(r.root.join("a.rs"), "fn a() { 6 }\n").expect("edit");
+    let home = r._dir.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let take_in = |home: &Path| {
+        let path = std::env::var("PATH").ok();
+        let home = home.display().to_string();
+        let var = move |k: &str| match k {
+            "PATH" => path.clone(),
+            k if k == key => Some(home.clone()),
+            _ => None,
+        };
+        collect(&LiveRunner, &var, &r.root, &Base::Uncommitted, None)
+    };
+    assert!(take_in(&home).is_ok(), "the control: no opt-out sends");
+    std::fs::write(home.join(".gitconfig"), "[aterm]\n\taiReview = false\n").expect("gitconfig");
+    assert!(
+        matches!(take_in(&home), Err(Refused(why)) if why.contains("says no")),
+        "the person's global opt-out"
+    );
+}
+
 #[test]
 fn a_git_the_repository_carries_is_never_run() {
     let r = repo();
     let bin = r.root.join("bin");
     std::fs::create_dir_all(&bin).expect("bin");
-    std::fs::write(bin.join("git"), "#!/bin/sh\n").expect("git");
+    for name in ["git", "git.exe"] {
+        std::fs::write(bin.join(name), "#!/bin/sh\n").expect("git");
+    }
     let sub = r.root.join("src");
     std::fs::create_dir_all(&sub).expect("src");
-    let path = format!("{}:/usr/bin:/bin", bin.display());
-    let got = git_program(Some(&path), &sub).expect("a git");
+    // The carried bin first, then the host's own PATH (where the fixtures' git is).
+    let host = std::env::var_os("PATH").unwrap_or_default();
+    let path =
+        std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(&host)))
+            .expect("PATH");
+    let got = git_program(path.to_str(), &sub).expect("a git");
     assert!(!got.starts_with(&r.root), "{}", got.display());
     assert_eq!(repo_roots_of(&sub).first(), Some(&real(&r.root)));
 }

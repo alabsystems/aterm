@@ -13,10 +13,10 @@
 //!
 //! THE SPLIT (aterm-shell-integration, "THE LOADER" in the zsh script): each
 //! zsh/bash/fish script is a LOADER around one BODY. The body is also written
-//! alone into the script folder, which is named by the SHA-256 of everything in
-//! it, so a folder's 16-hex address names one body exactly. At spawn the host
-//! exports [`POINTER_VAR`] = `<control dir>/integration/<sid>` to every
-//! zsh/bash/fish it integrates; the loader captures and scrubs it and checks the
+//! alone into the script folder, which is named by a 64-bit hash of everything
+//! in it (`script_set_address`), so a folder's 16-hex address names one body.
+//! At spawn the host exports [`POINTER_VAR`] = `<control dir>/integration/<sid>`
+//! to every zsh/bash/fish it integrates; the loader captures and scrubs it and checks the
 //! file at every prompt (one fork-free `[[ -f ]]`). A successor that adopts such
 //! a shell across an update writes ITS OWN folder's address there
 //! ([`hand_over`]: the folder installed first, then the file `0600`, renamed

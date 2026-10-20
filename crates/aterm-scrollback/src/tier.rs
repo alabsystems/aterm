@@ -607,7 +607,7 @@ impl WarmTier {
         }
     }
 
-    /// Saturating folds for the strict gate, as in
+    /// Saturating folds for the Trust lane, as in
     /// [`push_compressed`](Self::push_compressed).
     ///
     /// Test-only: the invariant recomputation that calls it is.

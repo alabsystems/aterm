@@ -62,8 +62,9 @@
 //! module declaration AND in Cargo.toml (aterm-font's `hint` feature is asked
 //! for there only): macOS keeps CoreText byte-identically, the wasm consumer
 //! keeps fontdue byte-identically, and neither compiles this module (nor, in
-//! a per-package build, the hinter).
-//! macOS unit tests also compile this pure raster with embedded fonts.
+//! a release build, the hinter).
+//! macOS unit tests also compile this pure raster with embedded fonts, on the
+//! hinter every debug-assertions build of aterm-font carries.
 
 use aterm_font::autohint::{HintingInstance, Target};
 

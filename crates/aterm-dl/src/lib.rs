@@ -84,6 +84,71 @@ impl fmt::Display for Error {
     }
 }
 
+impl Error {
+    /// Return `true` when this error is `Error::Unsupported`.
+    #[must_use]
+    pub const fn is_unsupported(&self) -> bool {
+        matches!(self, Self::Unsupported { .. })
+    }
+
+    /// Return `true` when this error is `Error::MissingSymbol`.
+    #[must_use]
+    pub const fn is_missing_symbol(&self) -> bool {
+        matches!(self, Self::MissingSymbol { .. })
+    }
+}
+
+/// Encode dynamic-library symbol-table counts (`required_total`, `required_loaded`,
+/// `optional_total`, `optional_loaded`) into 16 little-endian bytes.
+#[must_use]
+pub const fn encode_dl_table_counts_le(
+    required_total: u32,
+    required_loaded: u32,
+    optional_total: u32,
+    optional_loaded: u32,
+) -> [u8; 16] {
+    [
+        required_total as u8,
+        (required_total >> 8) as u8,
+        (required_total >> 16) as u8,
+        (required_total >> 24) as u8,
+        required_loaded as u8,
+        (required_loaded >> 8) as u8,
+        (required_loaded >> 16) as u8,
+        (required_loaded >> 24) as u8,
+        optional_total as u8,
+        (optional_total >> 8) as u8,
+        (optional_total >> 16) as u8,
+        (optional_total >> 24) as u8,
+        optional_loaded as u8,
+        (optional_loaded >> 8) as u8,
+        (optional_loaded >> 16) as u8,
+        (optional_loaded >> 24) as u8,
+    ]
+}
+
+/// Decode 16 little-endian bytes into dynamic-library symbol-table counts.
+#[must_use]
+pub const fn decode_dl_table_counts_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
+    let req_tot = (bytes[0] as u32)
+        | ((bytes[1] as u32) << 8)
+        | ((bytes[2] as u32) << 16)
+        | ((bytes[3] as u32) << 24);
+    let req_ok = (bytes[4] as u32)
+        | ((bytes[5] as u32) << 8)
+        | ((bytes[6] as u32) << 16)
+        | ((bytes[7] as u32) << 24);
+    let opt_tot = (bytes[8] as u32)
+        | ((bytes[9] as u32) << 8)
+        | ((bytes[10] as u32) << 16)
+        | ((bytes[11] as u32) << 24);
+    let opt_ok = (bytes[12] as u32)
+        | ((bytes[13] as u32) << 8)
+        | ((bytes[14] as u32) << 16)
+        | ((bytes[15] as u32) << 24);
+    (req_tot, req_ok, opt_tot, opt_ok)
+}
+
 impl std::error::Error for Error {}
 
 /// An opened shared library, kept loaded for the life of the process.

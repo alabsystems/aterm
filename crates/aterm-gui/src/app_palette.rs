@@ -20,7 +20,6 @@
 //! is built by the shared `splice_settings_panel`.
 
 use crate::App;
-use crate::Wake;
 use crate::control_theme::PreviewHold;
 use crate::palette::{
     NativeCommandScope, NativeCommandTarget, PaletteLive, PaletteState, PaletteTarget, PaletteTheme,
@@ -66,9 +65,9 @@ fn menu_binding(action: crate::menu::MenuAction) -> Option<crate::keybinding::Ac
         M::NextTab => K::NextTab,
         M::PrevTab => K::PrevTab,
         M::RenameSession => K::RenameSession,
-        // The Fabric menu's ledger row and the ledger key run the same method
+        // The harness log row and the ledger key run the same method
         // (`App::open_session_ledger`), so the row shows the chord that fires it.
-        M::LedgerForSession => K::OpenLedger,
+        M::HarnessLog => K::OpenLedger,
         _ => return None,
     })
 }
@@ -403,6 +402,10 @@ impl App {
             .and_then(|ws| ws.os_window.as_ref())
             .and_then(|w| w.fullscreen())
             .is_some();
+        let maximized = self
+            .front()
+            .and_then(|ws| ws.os_window.as_ref())
+            .is_some_and(|w| w.is_maximized());
         let multi_tab = self.front().is_some_and(|ws| ws.tab_set.len() >= 2);
         let native_tab_active = self
             .frontmost_window
@@ -452,12 +455,15 @@ impl App {
         let can_rename = self
             .frontmost_window
             .is_some_and(|wid| self.can_rename_session(wid));
-        // The front session's standing hold (round 19, the Fabric menu's halt
-        // pair) — read from the session's own fabric leaf, the same fact the
-        // presence band prints, so the palette and the band never disagree.
-        let front_hold = self
+        // The person's hold on the front session (Take Over / Hand Back) —
+        // read from the session's own fabric leaf, the fact the native bar's
+        // static carries too.
+        let front_person_hold = self
             .frontmost_window
-            .and_then(|wid| self.front_hold_fact(wid));
+            .is_some_and(|wid| self.front_person_hold(wid));
+        let front_remote_hold = self
+            .frontmost_window
+            .is_some_and(|wid| self.front_remote_hold(wid));
         // Accelerator hints for menu rows (keyboard audit #6): the resolved
         // chord for every menu action bound in the EFFECTIVE keybinding table,
         // deduped by action (a command listed in two menus shows one truth).
@@ -493,6 +499,7 @@ impl App {
             kitty_favourited,
             serious_mode: self.serious_mode_enabled(),
             fullscreen,
+            maximized,
             front_tab_split: self.front_tab_split(),
             multi_tab,
             native_tab_active,
@@ -513,9 +520,10 @@ impl App {
             // can dismiss.
             local_file_picker_available: !self.headless
                 && crate::menu::local_file_picker_available(),
-            front_hold,
-            presence_band: self.presence_band_on(),
-            presence_rim: self.presence_rim_on(),
+            front_person_hold,
+            front_remote_hold,
+            needs_in_windows: self.presence_rim_on(),
+            agents: self.agents_live(),
             staged,
             staged_trouble,
             staged_on_hold,
@@ -753,10 +761,11 @@ impl App {
         if closed {
             self.end_theme_preview_if(|preview| preview.hold == PreviewHold::Palette);
         }
-        if closed && let Some((x, y)) = self.windows.get(&wid).map(|window| window.last_cursor_px) {
+        if closed {
             // Re-resolve the cursor immediately against the revealed surface. Keyboard
-            // close must not leave a stale neutral pointer over editor text until motion.
-            self.on_cursor_moved(wid, x, y);
+            // close must not leave a stale neutral pointer over editor text until motion;
+            // a pointer the window no longer holds is not replayed.
+            self.replay_held_pointer(wid);
         }
     }
 
@@ -806,10 +815,22 @@ impl App {
         }
         self.palette_exit();
         match target {
-            PaletteTarget::Menu(action) => {
-                if let Some(proxy) = self.proxy.as_ref() {
-                    let _ = proxy.send_event(Wake::MenuAction { action });
+            // The person's own acts run NOW, in the gesture's turn, where a
+            // control client's key is still marked and refused
+            // (`App::person_gesture_refused`); a posted action would run a
+            // turn later, unmarked.
+            PaletteTarget::Menu(crate::menu::MenuAction::TakeOver) => {
+                if let Some(wid) = self.frontmost_window {
+                    self.take_over(wid);
                 }
+            }
+            PaletteTarget::Menu(crate::menu::MenuAction::HandBack) => {
+                if let Some(wid) = self.frontmost_window {
+                    self.hand_back(wid);
+                }
+            }
+            PaletteTarget::Menu(action) => {
+                self.post_menu_action(action);
             }
             PaletteTarget::Native(target) => {
                 let _ = self.activate_native_palette_target(&target);
@@ -893,8 +914,8 @@ impl App {
     pub(crate) fn on_key_palette_mode(
         &mut self,
         wid: crate::WindowId,
-        mods: winit::keyboard::ModifiersState,
-        ev: &winit::event::KeyEvent,
+        mods: aterm_window::keyboard::ModifiersState,
+        ev: &aterm_window::event::KeyEvent,
     ) -> bool {
         if self.windows.get(&wid).and_then(|ws| ws.palette()).is_none() {
             return false;
@@ -968,11 +989,11 @@ pub(crate) enum PaletteKey {
 /// winit reported with no `text` (the field keymap types `text` only), and any other
 /// printable `text`.
 pub(crate) fn palette_key(
-    mods: winit::keyboard::ModifiersState,
-    ev: &winit::event::KeyEvent,
+    mods: aterm_window::keyboard::ModifiersState,
+    ev: &aterm_window::event::KeyEvent,
 ) -> PaletteKey {
     use crate::app_search::SearchEdit;
-    use winit::keyboard::{Key, NamedKey};
+    use aterm_window::keyboard::{Key, NamedKey};
     match &ev.logical_key {
         Key::Named(NamedKey::Escape) => return PaletteKey::Close,
         Key::Named(NamedKey::ArrowUp) => return PaletteKey::Move(-1),
@@ -1073,9 +1094,6 @@ mod tests {
     #[test]
     fn the_menu_bar_publishes_what_the_palette_resolves() {
         use crate::menu::{MenuAction, menu_live, native_live_title, set_menu_live};
-        let _statics = crate::menu::MENU_STATICS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
         let before = menu_live();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -1121,9 +1139,6 @@ mod tests {
     #[test]
     fn a_live_rename_keeps_the_menu_bar_copy_row_enabled() {
         use crate::menu::{menu_live, set_menu_live};
-        let _statics = crate::menu::MENU_STATICS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
         let before = menu_live();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -1150,8 +1165,10 @@ mod tests {
     /// `}` and `T` into its search.
     #[test]
     fn a_command_chord_never_types_into_the_palette_search() {
-        use winit::event::{ElementState, KeyEvent};
-        use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr};
+        use aterm_window::event::{ElementState, KeyEvent};
+        use aterm_window::keyboard::{
+            Key, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr,
+        };
         let press = |code, text: &str| {
             KeyEvent::synthetic_for_test(
                 PhysicalKey::Code(code),
@@ -1588,6 +1605,54 @@ mod tests {
             filtered_fp, open_fp,
             "swallowed input changes visible pixels"
         );
+    }
+
+    /// The palette's scrim rides beside a card-sized raster as a colour, never
+    /// baked into a window-sized one, so a keystroke rasterizes, compares and
+    /// uploads the card alone; and the theme picker's card carries none, so its
+    /// preview is seen undimmed (Windows; no scrim elsewhere).
+    ///
+    /// A window-sized raster starts at the window's edge and spans it; the card's
+    /// is inset and narrower. (Not "under half the window": the card is capped at
+    /// 820 points plus its shadow, 844 px, wider than half of 200 seven-pixel
+    /// columns.)
+    #[test]
+    fn the_palette_scrim_is_a_layer_and_the_theme_picker_has_none() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.cols = 200;
+            ws.input_scratch.cells = vec![Vec::new(); 50];
+        }
+        app.palette_enter();
+        app.splice_settings_panel(wid);
+        let frame_w = 200 * app.win_cell_size(wid).0;
+        let card = app.windows[&wid]
+            .settings_card
+            .as_ref()
+            .expect("an open palette rasterizes a card");
+        assert_eq!(card.scrim, crate::palette::palette_scrim());
+        assert!(
+            card.dx > 0 && (card.dx + card.pw) as usize <= frame_w,
+            "the raster is the card's ({} px at {}), not the {frame_w} px window's",
+            card.pw,
+            card.dx
+        );
+
+        app.windows.get_mut(&wid).unwrap().overlay = None;
+        app.open_theme_palette();
+        assert!(
+            app.windows[&wid]
+                .palette()
+                .is_some_and(|p| p.is_themes_only())
+        );
+        app.splice_settings_panel(wid);
+        let card = app.windows[&wid]
+            .settings_card
+            .as_ref()
+            .expect("the theme picker rasterizes a card");
+        assert_eq!(card.scrim, None, "Choose Theme… previews undimmed");
     }
 
     /// A theme change that is NOT an OS appearance flip — a colour-only config
@@ -2081,10 +2146,16 @@ mod tests {
         for _ in 0..5 {
             app.palette_move(1);
             app.sync_palette_theme_preview();
+            // A greyed row (Check for Updates… where no updater exists,
+            // `MenuAction::offered_on_this_platform`) has no target; it is
+            // not a theme either.
             assert!(
-                front_palette(&app)
-                    .selected_target()
-                    .is_some_and(|target| !matches!(target, PaletteTarget::Theme(_)))
+                !matches!(
+                    front_palette(&app).selected_target(),
+                    Some(PaletteTarget::Theme(_))
+                ),
+                "{:#?}",
+                front_palette(&app).controls_lines()
             );
             assert!(app.theme_preview.is_none());
             assert_eq!(app.theme, before);
@@ -2175,14 +2246,14 @@ mod tests {
     /// since a filter that typed `text` would type it.
     fn press_key(
         app: &mut App,
-        mods: winit::keyboard::ModifiersState,
-        code: winit::keyboard::KeyCode,
-        logical: winit::keyboard::Key,
+        mods: aterm_window::keyboard::ModifiersState,
+        code: aterm_window::keyboard::KeyCode,
+        logical: aterm_window::keyboard::Key,
         text: Option<&str>,
         repeat: bool,
     ) {
-        use winit::event::{ElementState, KeyEvent};
-        use winit::keyboard::{KeyLocation, PhysicalKey, SmolStr};
+        use aterm_window::event::{ElementState, KeyEvent};
+        use aterm_window::keyboard::{KeyLocation, PhysicalKey, SmolStr};
         app.windows.get_mut(&WindowId(0)).expect("window").mods = mods;
         app.on_key(
             WindowId(0),
@@ -2197,13 +2268,13 @@ mod tests {
         );
     }
 
-    fn release_key(app: &mut App, code: winit::keyboard::KeyCode) {
-        app.release_physical_press(WindowId(0), winit::keyboard::PhysicalKey::Code(code));
+    fn release_key(app: &mut App, code: aterm_window::keyboard::KeyCode) {
+        app.release_physical_press(WindowId(0), aterm_window::keyboard::PhysicalKey::Code(code));
     }
 
     /// A Ctrl+letter (`ctrl` = true) or a plain typed letter, pressed and released.
     fn letter(app: &mut App, ctrl: bool, letter: &str) {
-        use winit::keyboard::{Key, KeyCode, ModifiersState, SmolStr};
+        use aterm_window::keyboard::{Key, KeyCode, ModifiersState, SmolStr};
         let mods = if ctrl {
             ModifiersState::CONTROL
         } else {
@@ -2270,7 +2341,7 @@ mod tests {
     /// LeftCtrl+LeftAlt spelling of AltGr: de-DE `@`).
     #[test]
     fn typing_navigation_and_the_named_keys_still_drive_the_palette() {
-        use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, SmolStr};
+        use aterm_window::keyboard::{Key, KeyCode, ModifiersState, NamedKey, SmolStr};
         let mut app = App::headless_for_test();
         app.palette_enter();
         typed(&mut app, "copy");
@@ -2370,7 +2441,7 @@ mod tests {
     /// auto-repeat used to replay the key's letter, so holding `^W` typed `www…`.
     #[test]
     fn a_held_readline_chord_repeats_its_edit_not_its_letter() {
-        use winit::keyboard::{Key, KeyCode, ModifiersState, SmolStr};
+        use aterm_window::keyboard::{Key, KeyCode, ModifiersState, SmolStr};
         let mut app = App::headless_for_test();
         app.palette_enter();
         typed(&mut app, "one two three");
@@ -2416,7 +2487,7 @@ mod tests {
     /// `super+x` typed their letter and `shift+x` typed `x`.
     #[test]
     fn a_driven_palette_edits_its_filter_as_a_typed_one_does() {
-        use winit::keyboard::{Key, KeyCode, ModifiersState as M, NamedKey, SmolStr};
+        use aterm_window::keyboard::{Key, KeyCode, ModifiersState as M, NamedKey, SmolStr};
         let ch = |s: &str| Key::Character(SmolStr::new(s));
         let named = Key::Named;
         let start = "one two";

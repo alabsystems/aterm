@@ -1,0 +1,19 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# S1 (seed at the end): nothing is read before a bind; the bind seeds the
+# watermark at the file's end and says so once (source state=on
+# skipped=<len>, by aterm, on the run); no row at or below it, before the
+# process's start, or before the run opened is applied; a lapsed watch's
+# re-bind keeps the watermark.
+see busy
+tx prompt v0
+expect tx through=none
+bind 8192
+expect mark r1 source field=transcript state=on skipped=8192 by=aterm src=transcript conf=exact
+expect tx through=8192
+tx prompt v1 off=8000
+tx prompt v2 dated=-60001
+tx prompt v3 dated=-1
+bind 8992
+tx prompt v4 dated=0
+expect amend t1 turn vref=v4 by=vendor src=transcript conf=exact
+expect tx mapped=t1 vref=v4

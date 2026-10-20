@@ -151,6 +151,17 @@ pub fn peer_pid(stream: &CtlStream) -> io::Result<u32> {
     scm::peer_pid(stream)
 }
 
+/// [`peer_pid`] of the connected socket `fd` names, which stays the caller's: for a server
+/// lane that holds the connection it serves as a descriptor rather than a stream (the
+/// control server's `ServingFd`).
+///
+/// # Errors
+/// As [`peer_pid`]'s, and `EBADF`/`ENOTSOCK` for a descriptor that names no socket.
+#[cfg(unix)]
+pub fn peer_pid_of_fd(fd: std::os::fd::RawFd) -> io::Result<u32> {
+    scm::peer_pid_of_fd(fd)
+}
+
 /// The two ABIs this file mirrors field-for-field. Everything outside `abi` is
 /// platform-independent: the cmsg walk, the ownership discipline, the
 /// validation.
@@ -627,6 +638,11 @@ mod scm {
         abi::peer_pid(stream.as_raw_fd())
     }
 
+    /// See [`super::peer_pid_of_fd`].
+    pub fn peer_pid_of_fd(fd: RawFd) -> io::Result<u32> {
+        abi::peer_pid(fd)
+    }
+
     /// Validate what `getsockopt` answered: the option must have come back at
     /// its full size (a short answer means we read something that is not the
     /// structure we asked for), and a pid must be a pid.
@@ -744,8 +760,8 @@ mod scm {
     #[cfg(test)]
     mod tests {
         use super::{
-            CMSG_DATA_OFFSET, CMSG_HDR_LEN, CONTROL_LEN, FD_LEN, abi, cmsg_len, cmsg_space,
-            scan_control, write_i32,
+            CMSG_DATA_OFFSET, CMSG_HDR_LEN, CONTROL_LEN, FD_LEN, abi, checked_pid, cmsg_align,
+            cmsg_len, cmsg_space, scan_control, write_i32,
         };
 
         /// One `SCM_RIGHTS` header whose `cmsg_len` claims `claimed` descriptors, then
@@ -775,21 +791,52 @@ mod scm {
             assert_eq!(cmsg_len(4), expected + 4, "CMSG_LEN(4)");
         }
 
+        /// Every message is walked, each header at the aligned end of the one before (here a
+        /// foreign one whose one data byte leaves padding), and only `SCM_RIGHTS` yields.
         #[test]
         fn a_complete_message_yields_every_descriptor_in_order() {
             let buf = control(3, &[7, 8, 9], cmsg_space(3 * FD_LEN));
             let scan = scan_control(&buf);
             assert_eq!(scan.fds, [7, 8, 9]);
             assert!(!scan.truncated, "a complete message is not truncated");
+
+            let next = cmsg_align(cmsg_len(1));
+            let mut two = vec![0u8; next + cmsg_space(2 * FD_LEN)];
+            abi::write_cmsg_len(&mut two, cmsg_len(1));
+            write_i32(&mut two, abi::LEVEL_OFFSET, abi::SOL_SOCKET);
+            write_i32(&mut two, abi::TYPE_OFFSET, abi::SCM_RIGHTS + 1);
+            two[CMSG_DATA_OFFSET] = 0xff;
+            two[next..].copy_from_slice(&control(2, &[7, 8], cmsg_space(2 * FD_LEN)));
+            let scan = scan_control(&two);
+            assert_eq!(scan.fds, [7, 8], "the message after a foreign one");
+            assert!(!scan.truncated);
         }
 
-        /// `cmsg_len` claims three descriptors, the buffer holds one.
+        /// What `getsockopt` answered for the peer pid is taken only whole and only as a pid.
+        #[test]
+        fn a_peer_pid_is_a_whole_answer_naming_a_process() {
+            assert_eq!(checked_pid(7, 4, 4).ok(), Some(7));
+            for (pid, got_len) in [(7, 3), (0, 4), (-1, 4)] {
+                let refused = checked_pid(pid, got_len, 4).err().map(|e| e.kind());
+                assert_eq!(
+                    refused,
+                    Some(std::io::ErrorKind::InvalidData),
+                    "{pid} {got_len}"
+                );
+            }
+        }
+
+        /// `cmsg_len` claims three descriptors, the buffer holds one, or only the header.
         #[test]
         fn a_cmsg_len_past_the_buffer_is_clamped_and_flagged() {
             let buf = control(3, &[7], CMSG_DATA_OFFSET + FD_LEN);
             let scan = scan_control(&buf);
             assert_eq!(scan.fds, [7], "only the descriptor really present");
             assert!(scan.truncated, "an overrunning cmsg_len is truncation");
+
+            let scan = scan_control(&control(1, &[7], CMSG_HDR_LEN));
+            assert!(scan.fds.is_empty());
+            assert!(scan.truncated, "a header whose descriptors were cut off");
         }
 
         /// The whole descriptors are reported (ours to close) and the half-copied one makes
@@ -800,23 +847,101 @@ mod scm {
             let scan = scan_control(&buf);
             assert_eq!(scan.fds, [7]);
             assert!(scan.truncated);
+
+            // The buffer holds all `cmsg_len` claims, which ends mid-descriptor.
+            let mut buf = control(2, &[7, 8], cmsg_space(2 * FD_LEN));
+            abi::write_cmsg_len(&mut buf, cmsg_len(FD_LEN + 2));
+            let scan = scan_control(&buf);
+            assert_eq!(scan.fds, [7]);
+            assert!(scan.truncated, "half a descriptor inside the buffer");
         }
 
-        /// Neither a non-`SCM_RIGHTS` message nor a header shorter than its own data area
-        /// yields a descriptor; the runt is refused.
+        /// Neither a non-`SCM_RIGHTS` message (another type, or `SCM_RIGHTS`'s number at
+        /// another level) nor a header shorter than its own data area yields a descriptor;
+        /// the runt is refused, and a header with no data at all is no runt.
         #[test]
         fn foreign_and_malformed_headers_yield_no_descriptors() {
-            let mut foreign = control(2, &[7, 8], cmsg_space(2 * FD_LEN));
-            write_i32(&mut foreign, abi::TYPE_OFFSET, abi::SCM_RIGHTS + 1);
-            let scan = scan_control(&foreign);
-            assert!(scan.fds.is_empty(), "not SCM_RIGHTS: no descriptors");
-            assert!(!scan.truncated);
+            for (level, kind) in [
+                (abi::SOL_SOCKET, abi::SCM_RIGHTS + 1),
+                (abi::SOL_SOCKET + 1, abi::SCM_RIGHTS),
+            ] {
+                let mut foreign = control(2, &[7, 8], cmsg_space(2 * FD_LEN));
+                write_i32(&mut foreign, abi::LEVEL_OFFSET, level);
+                write_i32(&mut foreign, abi::TYPE_OFFSET, kind);
+                let scan = scan_control(&foreign);
+                assert!(scan.fds.is_empty(), "not SCM_RIGHTS: no descriptors");
+                assert!(!scan.truncated);
+            }
+
+            let scan = scan_control(&control(0, &[], cmsg_space(0)));
+            assert!(scan.fds.is_empty());
+            assert!(!scan.truncated, "a header exactly its own length is whole");
 
             let mut runt = control(2, &[7, 8], cmsg_space(2 * FD_LEN));
             abi::write_cmsg_len(&mut runt, CMSG_DATA_OFFSET - 1);
             let scan = scan_control(&runt);
             assert!(scan.fds.is_empty(), "malformed: no descriptors");
             assert!(scan.truncated, "malformed is refused, not ignored");
+        }
+
+        /// A peer that sends past `MAX_FDS` (`send_with_fds` refuses to; a raw `sendmsg` does
+        /// not), up to the twice-`MAX_FDS` budget the module documents, is still a visible
+        /// over-count: every descriptor it sent is named, closed and refused, and none stays
+        /// here. The sender's buffer is its own, sized for what it sends: one sized by
+        /// `CONTROL_FDS` would shrink with a smaller budget and drop the slots past it.
+        #[test]
+        fn an_over_send_past_the_cap_is_named_closed_and_refused() {
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
+            use std::os::unix::fs::MetadataExt as _;
+            const SENT: usize = 2 * super::MAX_FDS;
+            #[repr(C, align(8))]
+            struct SenderControl([u8; cmsg_space(SENT * FD_LEN)]);
+            let scratch = aterm_tempfile::Builder::new()
+                .prefix("aterm-uds-oversend.")
+                .tempdir()
+                .expect("scratch");
+            let file = std::fs::File::create(scratch.path().join("passed")).expect("file");
+            let want = file.metadata().map(|m| (m.dev(), m.ino())).expect("fstat");
+            let copies = || {
+                (0..4096)
+                    .filter(|&fd| {
+                        // SAFETY: borrowed for one `fstat` and never closed (`ManuallyDrop`); a
+                        // number nothing has open fails it.
+                        let f =
+                            std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+                        f.metadata().is_ok_and(|m| (m.dev(), m.ino()) == want)
+                    })
+                    .count()
+            };
+            let (a, b) = crate::CtlStream::pair().expect("pair");
+            let mut control = SenderControl([0; cmsg_space(SENT * FD_LEN)]);
+            abi::write_cmsg_len(&mut control.0, cmsg_len(SENT * FD_LEN));
+            write_i32(&mut control.0, abi::LEVEL_OFFSET, abi::SOL_SOCKET);
+            write_i32(&mut control.0, abi::TYPE_OFFSET, abi::SCM_RIGHTS);
+            for slot in control.0[CMSG_DATA_OFFSET..cmsg_len(SENT * FD_LEN)]
+                .as_chunks_mut::<FD_LEN>()
+                .0
+            {
+                slot.copy_from_slice(&file.as_raw_fd().to_ne_bytes());
+            }
+            let payload = [1u8];
+            let mut iov = super::IoVec {
+                iov_base: payload.as_ptr().cast_mut().cast(),
+                iov_len: payload.len(),
+            };
+            let msg = abi::msghdr(&mut iov, 1, control.0.as_mut_ptr(), cmsg_len(SENT * FD_LEN));
+            // SAFETY: as in `send_with_fds`: `msg` points at the live `iov` and `control`, and
+            // the control length it declares is inside `control`.
+            let sent = unsafe { super::sendmsg(a.as_raw_fd(), &msg, abi::SEND_FLAGS) };
+            assert_eq!(sent, 1, "{}", std::io::Error::last_os_error());
+            let before = copies();
+            let mut buf = [0u8; 4];
+            let refused = super::recv_with_fds(&b, &mut buf, super::MAX_FDS).err();
+            assert_eq!(
+                refused.map(|e| e.kind()),
+                Some(std::io::ErrorKind::InvalidData)
+            );
+            assert_eq!(copies(), before, "a descriptor the peer sent stayed open");
         }
 
         /// A buffer too short to hold a header is no message, not a truncated one.
@@ -878,6 +1003,11 @@ mod scm {
 
     #[cfg(not(windows))]
     pub fn peer_pid(_stream: &CtlStream) -> io::Result<u32> {
+        Err(unsupported("the peer pid"))
+    }
+
+    #[cfg(unix)]
+    pub fn peer_pid_of_fd(_fd: std::os::fd::RawFd) -> io::Result<u32> {
         Err(unsupported("the peer pid"))
     }
 }

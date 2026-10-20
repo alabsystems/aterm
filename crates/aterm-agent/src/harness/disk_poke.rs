@@ -26,6 +26,14 @@ pub enum Cause {
     },
     /// A write of aterm's own failed for want of space (`what` failed).
     Write(String),
+    /// An agent's wait (`await sys free>=`) needs `need` bytes the volume
+    /// does not have: a DEMAND, which the next pass adopts.
+    Demand {
+        /// The session that waits.
+        sid: String,
+        /// The free bytes it needs.
+        need: u64,
+    },
 }
 
 impl Cause {
@@ -35,6 +43,10 @@ impl Cause {
         match self {
             Cause::Screen { sid, code } => format!("session {sid}'s screen says {code}"),
             Cause::Write(what) => format!("a write failed for want of space: {what}"),
+            Cause::Demand { sid, need } => format!(
+                "session {sid} waits for {} free (await sys)",
+                super::human_bytes(*need)
+            ),
         }
     }
 }

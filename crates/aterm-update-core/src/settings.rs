@@ -16,12 +16,32 @@ use std::path::{Path, PathBuf};
 /// The same admission budget the native config service and atpkg's reader use.
 const MAX_CONFIG_BYTES: u64 = 512 * 1024;
 
+/// The ONE name of `[update] enabled`'s switch, on every surface that names it:
+/// Settings (its registry label, so Software Update's card, Search, Modified, the
+/// status line and the Reset All question), the Manual page `aterm help update`,
+/// and what the updater says it is holding for. A second spelling of it anywhere
+/// is a second name for one switch.
+pub const CHECK_LABEL: &str = "Check for updates automatically";
+/// The ONE name of `[update] auto_apply`'s switch, as [`CHECK_LABEL`] is the check
+/// switch's.
+pub const INSTALL_LABEL: &str = "Install updates automatically";
+
+/// Why a downloaded build waits for a press when `[update] auto_apply` holds it,
+/// in the words every updater surface says it with (the macOS ready row and
+/// Software Update's staged line, the Linux held download): the install switch by
+/// its one name, [`INSTALL_LABEL`], never by its key.
+#[must_use]
+pub fn install_switch_off() -> String {
+    format!("\u{201c}{INSTALL_LABEL}\u{201d} is off")
+}
+
 /// The user config file, resolved as the GUI's `app_config::config_path` does:
 /// `$XDG_CONFIG_HOME/aterm/aterm.toml`, else (Windows) `%APPDATA%\aterm\aterm.toml`, else
 /// `$HOME/.config/aterm/aterm.toml`.
 #[must_use]
 pub fn config_path() -> Option<PathBuf> {
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|x| !x.is_empty()) {
+    // `aterm_types::dirs::config_home`: `$XDG_CONFIG_HOME`, or a test binary's own root.
+    if let Some(x) = aterm_types::dirs::config_home() {
         return Some(PathBuf::from(x).join("aterm").join("aterm.toml"));
     }
     #[cfg(windows)]

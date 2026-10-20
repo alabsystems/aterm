@@ -44,7 +44,8 @@
 //! # Who takes one
 //!
 //! `aterm-release` for a whole cut (`aterm_release::gates`, through [`take_for_dir`]),
-//! `aterm-verify` for a whole run (`aterm_verify::hold_toolchain`, the same call), and anything else
+//! `aterm-verify` for a whole run (`aterm_verify::hold_toolchain`, one lease per build it
+//! runs a tool from, a borrowed formatter or lint driver's included), and anything else
 //! through the HOLDER VERB, `aterm pkg lease <dir> -- <command…>` ([`hold_for`]): it takes
 //! the lease, runs the command as its child, waits for it and lets the lease go: a shell
 //! script has no `flock(1)` on macOS to hold one with, and a lock held on an inherited

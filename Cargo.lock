@@ -3,20 +3,31 @@
 version = 4
 
 [[package]]
-name = "aead"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d122413f284cf2d62fb1b7db97e02edb8cda96d769b16e443a4f6195e35662b0"
-dependencies = [
- "crypto-common",
- "generic-array",
-]
-
-[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+
+[[package]]
+name = "amacs"
+version = "0.107.0"
+dependencies = [
+ "aterm-buffer",
+ "aterm-cap",
+ "aterm-core",
+ "aterm-grapheme",
+ "aterm-models-native",
+ "aterm-spec",
+ "aterm-types",
+]
+
+[[package]]
+name = "amacs-files"
+version = "0.107.0"
+
+[[package]]
+name = "amacs-term"
+version = "0.107.0"
 
 [[package]]
 name = "android_system_properties"
@@ -44,18 +55,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "astream-aead"
-version = "0.2.0"
-dependencies = [
- "chacha20poly1305",
- "getrandom",
-]
-
-[[package]]
 name = "astream-broker"
 version = "0.2.0"
 dependencies = [
- "astream-aead",
  "astream-cap",
  "astream-sys",
  "astream-wire",
@@ -91,11 +93,12 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "astream-broker",
  "astream-cap",
  "aterm-agent",
+ "aterm-caffeine",
  "aterm-cli",
  "aterm-containment",
  "aterm-control",
@@ -107,7 +110,9 @@ dependencies = [
  "aterm-log",
  "aterm-machines",
  "aterm-models-session",
+ "aterm-net",
  "aterm-pty",
+ "aterm-shell-integration",
  "aterm-slog",
  "aterm-spec",
  "aterm-tempfile",
@@ -124,18 +129,21 @@ dependencies = [
 
 [[package]]
 name = "aterm-a11y"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-dbus",
  "aterm-log",
+ "aterm-objc",
  "aterm-types",
  "aterm-uds",
  "libc",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]
 name = "aterm-agent"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "astream-effects",
  "aterm-codec",
@@ -149,6 +157,7 @@ dependencies = [
  "aterm-lz4",
  "aterm-messages",
  "aterm-models-harness",
+ "aterm-net",
  "aterm-observe",
  "aterm-phase",
  "aterm-primer",
@@ -173,32 +182,37 @@ dependencies = [
 
 [[package]]
 name = "aterm-alloc"
-version = "0.106.0"
+version = "0.107.0"
 
 [[package]]
 name = "aterm-bench"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-core",
+ "aterm-effects",
+ "aterm-gpu",
  "aterm-grid",
+ "aterm-pty",
+ "aterm-render",
  "aterm-restore",
  "aterm-zstd",
+ "libc",
 ]
 
 [[package]]
 name = "aterm-bidi"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-bits"
-version = "0.106.0"
+version = "0.107.0"
 
 [[package]]
 name = "aterm-buffer"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-cap",
  "aterm-models-core",
@@ -207,19 +221,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "aterm-caffeine"
+version = "0.107.0"
+dependencies = [
+ "aterm-durable",
+ "aterm-hash",
+ "aterm-log",
+ "aterm-objc",
+ "aterm-png",
+ "aterm-tempfile",
+ "aterm-time",
+ "aterm-types",
+ "aterm-uds",
+ "libc",
+]
+
+[[package]]
 name = "aterm-cap"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-models-core",
 ]
 
 [[package]]
 name = "aterm-census"
-version = "0.106.0"
+version = "0.107.0"
+dependencies = [
+ "aterm-regex",
+]
 
 [[package]]
 name = "aterm-cg"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-objc",
  "aterm-tempfile",
@@ -227,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-cli"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-cap",
  "aterm-containment",
@@ -247,26 +280,26 @@ dependencies = [
  "aterm-types",
  "aterm-uds",
  "aterm-update",
+ "aterm-update-core",
  "atpkg",
  "libc",
 ]
 
 [[package]]
 name = "aterm-codec"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-conformance"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "astream-term",
  "aterm-core",
  "aterm-json",
  "aterm-png",
- "aterm-spec",
  "aterm-tempfile",
  "aterm-types",
  "aterm-uds",
@@ -275,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-containment"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-log",
  "aterm-spec",
@@ -286,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-control"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-codec",
  "aterm-core",
@@ -296,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-core"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-bidi",
  "aterm-codec",
@@ -327,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-ctl"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-codec",
  "aterm-pty",
@@ -339,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-dbus"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-codec",
  "aterm-spec",
@@ -350,14 +383,14 @@ dependencies = [
 
 [[package]]
 name = "aterm-digest"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "astream-digest",
 ]
 
 [[package]]
 name = "aterm-dirfd"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-tempfile",
  "libc",
@@ -365,14 +398,14 @@ dependencies = [
 
 [[package]]
 name = "aterm-dl"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "aterm-durable"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "astream-sys",
  "aterm-tempfile",
@@ -380,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-effects"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-core",
  "aterm-grapheme",
@@ -403,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-font"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-bidi",
  "aterm-grapheme",
@@ -411,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-forge"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-census",
  "aterm-json",
@@ -422,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-gpu"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-bits",
  "aterm-codec",
@@ -449,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-gpu-web"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-core",
  "aterm-effects",
@@ -465,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-grapheme"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-models-core",
  "aterm-spec",
@@ -474,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-grid"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-alloc",
  "aterm-grapheme",
@@ -492,10 +525,12 @@ dependencies = [
 
 [[package]]
 name = "aterm-gui"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
+ "amacs",
  "aterm-a11y",
  "aterm-agent",
+ "aterm-bench",
  "aterm-buffer",
  "aterm-cap",
  "aterm-codec",
@@ -518,6 +553,7 @@ dependencies = [
  "aterm-gui-timing",
  "aterm-hash",
  "aterm-http",
+ "aterm-jpeg",
  "aterm-json",
  "aterm-keeper",
  "aterm-lexicon",
@@ -534,6 +570,7 @@ dependencies = [
  "aterm-models-render",
  "aterm-models-session",
  "aterm-models-update",
+ "aterm-net",
  "aterm-objc",
  "aterm-observe",
  "aterm-phase",
@@ -561,7 +598,9 @@ dependencies = [
  "aterm-uds",
  "aterm-update",
  "aterm-update-core",
+ "aterm-vitals",
  "aterm-wayland",
+ "aterm-window",
  "aterm-winit-keymap",
  "aterm-winres",
  "aterm-x11",
@@ -569,12 +608,11 @@ dependencies = [
  "libc",
  "softbuffer",
  "windows",
- "winit",
 ]
 
 [[package]]
 name = "aterm-gui-consent"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-containment",
  "aterm-durable",
@@ -587,19 +625,16 @@ dependencies = [
 
 [[package]]
 name = "aterm-gui-documents"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
- "aterm-buffer",
- "aterm-cap",
- "aterm-core",
- "aterm-grapheme",
+ "amacs",
  "aterm-models-native",
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-gui-fabric"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-control",
  "aterm-gui-timing",
@@ -614,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-gui-tabs"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-core",
  "aterm-models-gui",
@@ -625,18 +660,18 @@ dependencies = [
 
 [[package]]
 name = "aterm-gui-timing"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-types",
 ]
 
 [[package]]
 name = "aterm-hash"
-version = "0.106.0"
+version = "0.107.0"
 
 [[package]]
 name = "aterm-http"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-codec",
  "aterm-spec",
@@ -646,15 +681,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aterm-jpeg"
+version = "0.107.0"
+
+[[package]]
 name = "aterm-json"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-serde",
 ]
 
 [[package]]
 name = "aterm-keeper"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-core",
  "aterm-hash",
@@ -667,8 +706,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "aterm-lab"
+version = "0.107.0"
+dependencies = [
+ "aterm-agent",
+ "aterm-codec",
+ "aterm-ctl",
+ "aterm-digest",
+ "aterm-durable",
+ "aterm-http",
+ "aterm-json",
+ "aterm-link",
+ "aterm-net",
+ "aterm-phase",
+ "aterm-png",
+ "aterm-pty",
+ "aterm-regex",
+ "aterm-tempfile",
+ "aterm-toml",
+ "aterm-uds",
+ "libc",
+ "rustls",
+]
+
+[[package]]
+name = "aterm-lab-clock"
+version = "0.107.0"
+dependencies = [
+ "aterm-uds",
+]
+
+[[package]]
 name = "aterm-lexicon"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-hash",
  "aterm-serde",
@@ -678,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-libc-oracle"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-json",
  "aterm-spec",
@@ -689,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-link"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "astream-broker",
  "astream-cap",
@@ -712,15 +782,15 @@ dependencies = [
 
 [[package]]
 name = "aterm-log"
-version = "0.106.0"
+version = "0.107.0"
 
 [[package]]
 name = "aterm-lz4"
-version = "0.106.0"
+version = "0.107.0"
 
 [[package]]
 name = "aterm-machines"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-codec",
  "aterm-digest",
@@ -736,11 +806,11 @@ dependencies = [
 
 [[package]]
 name = "aterm-macro-support"
-version = "0.106.0"
+version = "0.107.0"
 
 [[package]]
 name = "aterm-messages"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-codec",
  "aterm-grapheme",
@@ -752,7 +822,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-models"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-agent",
  "aterm-core",
@@ -774,6 +844,7 @@ dependencies = [
  "aterm-models-update",
  "aterm-pty",
  "aterm-render",
+ "aterm-restore",
  "aterm-sandbox",
  "aterm-search",
  "aterm-selection",
@@ -784,84 +855,101 @@ dependencies = [
 
 [[package]]
 name = "aterm-models-atpkg"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-models-core"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-models-effects"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-models-gui"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-models-harness"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-models-misc"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-models-native"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-models-release"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-models-render"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-models-session"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-models-update"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-spec",
 ]
 
 [[package]]
+name = "aterm-net"
+version = "0.107.0"
+dependencies = [
+ "aterm-codec",
+ "aterm-digest",
+ "aterm-models-core",
+ "aterm-models-session",
+ "aterm-spec",
+ "aterm-spec-anchor",
+ "aterm-uds",
+ "libc",
+ "ring",
+ "rustls",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "aterm-objc"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-models-core",
  "aterm-spec",
@@ -870,7 +958,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-observe"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-core",
  "aterm-regex",
@@ -878,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-parser"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-alloc",
  "aterm-provenance",
@@ -886,21 +974,22 @@ dependencies = [
 
 [[package]]
 name = "aterm-phase"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-tempfile",
+ "aterm-uds",
 ]
 
 [[package]]
 name = "aterm-png"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-codec",
 ]
 
 [[package]]
 name = "aterm-policy"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-policy",
  "aterm-serde",
@@ -910,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-predict"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-core",
  "aterm-grapheme",
@@ -921,19 +1010,22 @@ dependencies = [
 
 [[package]]
 name = "aterm-primer"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
+ "aterm-ctl",
  "aterm-durable",
+ "aterm-slog",
  "aterm-tempfile",
+ "aterm-types",
 ]
 
 [[package]]
 name = "aterm-provenance"
-version = "0.106.0"
+version = "0.107.0"
 
 [[package]]
 name = "aterm-pty"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-cap",
  "aterm-containment",
@@ -948,11 +1040,11 @@ dependencies = [
 
 [[package]]
 name = "aterm-regex"
-version = "0.106.0"
+version = "0.107.0"
 
 [[package]]
 name = "aterm-release"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-codec",
  "aterm-digest",
@@ -971,13 +1063,12 @@ dependencies = [
  "aterm-verify",
  "atpkg",
  "atpkg-keys",
- "atpkg-publish",
  "ring",
 ]
 
 [[package]]
 name = "aterm-render"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-bidi",
  "aterm-codec",
@@ -998,7 +1089,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-restore"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "astream-wire",
  "aterm-core",
@@ -1013,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-rle"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-models-core",
  "aterm-spec",
@@ -1021,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-sandbox"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-cap",
  "aterm-models-core",
@@ -1031,11 +1122,11 @@ dependencies = [
 
 [[package]]
 name = "aterm-scene"
-version = "0.106.0"
+version = "0.107.0"
 
 [[package]]
 name = "aterm-scrollback"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-alloc",
  "aterm-log",
@@ -1047,7 +1138,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-search"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-grapheme",
  "aterm-hash",
@@ -1059,7 +1150,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-selection"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-grapheme",
  "aterm-models-core",
@@ -1071,14 +1162,14 @@ dependencies = [
 
 [[package]]
 name = "aterm-serde"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-serde-derive",
 ]
 
 [[package]]
 name = "aterm-serde-derive"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-macro-support",
  "aterm-serde",
@@ -1086,7 +1177,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-session"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-models-core",
  "aterm-models-session",
@@ -1099,11 +1190,11 @@ dependencies = [
 
 [[package]]
 name = "aterm-shell-integration"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-cap",
  "aterm-containment",
- "aterm-digest",
+ "aterm-hash",
  "aterm-log",
  "aterm-pty",
  "aterm-sandbox",
@@ -1114,22 +1205,23 @@ dependencies = [
 
 [[package]]
 name = "aterm-sixel"
-version = "0.106.0"
+version = "0.107.0"
 
 [[package]]
 name = "aterm-slog"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-codec",
  "aterm-messages",
  "aterm-models-session",
  "aterm-phase",
  "aterm-spec",
+ "aterm-types",
 ]
 
 [[package]]
 name = "aterm-spec"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-json",
  "aterm-spec",
@@ -1142,14 +1234,15 @@ dependencies = [
 
 [[package]]
 name = "aterm-spec-anchor"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
+ "aterm-spec",
  "aterm-spec-macros",
 ]
 
 [[package]]
 name = "aterm-spec-macros"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-macro-support",
  "aterm-spec",
@@ -1158,22 +1251,23 @@ dependencies = [
 
 [[package]]
 name = "aterm-spec-models"
-version = "0.106.0"
+version = "0.107.0"
 
 [[package]]
 name = "aterm-sysprobe"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
+ "aterm-tempfile",
  "libc",
 ]
 
 [[package]]
 name = "aterm-tempfile"
-version = "0.106.0"
+version = "0.107.0"
 
 [[package]]
 name = "aterm-theme-pack"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-tempfile",
  "aterm-types",
@@ -1181,26 +1275,39 @@ dependencies = [
 
 [[package]]
 name = "aterm-time"
-version = "0.106.0"
+version = "0.107.0"
 
 [[package]]
 name = "aterm-toml"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-serde",
 ]
 
 [[package]]
 name = "aterm-toolchain"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-spec",
  "aterm-tempfile",
 ]
 
 [[package]]
+name = "aterm-tty"
+version = "0.107.0"
+dependencies = [
+ "aterm-core",
+ "aterm-grapheme",
+ "aterm-pty",
+ "aterm-spec",
+ "aterm-types",
+ "aterm-uds",
+ "libc",
+]
+
+[[package]]
 name = "aterm-types"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-alloc",
  "aterm-durable",
@@ -1211,11 +1318,12 @@ dependencies = [
  "aterm-spec",
  "aterm-tempfile",
  "aterm-time",
+ "aterm-uds",
 ]
 
 [[package]]
 name = "aterm-uds"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-tempfile",
  "libc",
@@ -1223,7 +1331,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-update"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-codec",
  "aterm-digest",
@@ -1248,7 +1356,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-update-core"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-codec",
  "aterm-digest",
@@ -1267,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-verify"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-census",
  "aterm-codec",
@@ -1286,8 +1394,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "aterm-vitals"
+version = "0.107.0"
+
+[[package]]
 name = "aterm-wasm"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-control",
  "aterm-core",
@@ -1303,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-wasm-abi"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-wasm-abi",
  "aterm-wasm-abi-macros",
@@ -1311,7 +1423,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-wasm-abi-macros"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-macro-support",
  "aterm-wasm-abi",
@@ -1319,7 +1431,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-wayland"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-dl",
  "aterm-log",
@@ -1330,11 +1442,11 @@ dependencies = [
 
 [[package]]
 name = "aterm-win32"
-version = "0.106.0"
+version = "0.107.0"
 
 [[package]]
 name = "aterm-win32-oracle"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-census",
  "aterm-json",
@@ -1344,27 +1456,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "aterm-window"
+version = "0.30.13"
+dependencies = [
+ "aterm-cg",
+ "aterm-grapheme",
+ "aterm-hash",
+ "aterm-objc",
+ "aterm-types",
+ "aterm-wayland",
+ "aterm-x11",
+ "aterm-xkb",
+ "libc",
+ "raw-window-handle",
+ "tracing",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "aterm-winit-keymap"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-types",
- "winit",
+ "aterm-window",
 ]
 
 [[package]]
 name = "aterm-winres"
-version = "0.106.0"
+version = "0.107.0"
 
 [[package]]
 name = "aterm-winsign"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-update-core",
 ]
 
 [[package]]
 name = "aterm-x11"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-dl",
  "aterm-tempfile",
@@ -1374,7 +1504,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-xkb"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-dl",
  "aterm-x11",
@@ -1382,14 +1512,14 @@ dependencies = [
 
 [[package]]
 name = "aterm-zstd"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-digest",
 ]
 
 [[package]]
 name = "atpkg"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-codec",
  "aterm-containment",
@@ -1417,7 +1547,7 @@ dependencies = [
 
 [[package]]
 name = "atpkg-keys"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-codec",
  "aterm-durable",
@@ -1437,7 +1567,7 @@ dependencies = [
 
 [[package]]
 name = "atpkg-publish"
-version = "0.106.0"
+version = "0.107.0"
 dependencies = [
  "aterm-digest",
  "aterm-durable",
@@ -1538,41 +1668,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
-name = "chacha20"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
-dependencies = [
- "cfg-if",
- "cipher",
- "cpufeatures",
-]
-
-[[package]]
-name = "chacha20poly1305"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
-dependencies = [
- "aead",
- "chacha20",
- "cipher",
- "poly1305",
- "zeroize",
-]
-
-[[package]]
-name = "cipher"
-version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
-dependencies = [
- "crypto-common",
- "inout",
- "zeroize",
-]
-
-[[package]]
 name = "codespan-reporting"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1582,29 +1677,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "cpufeatures"
-version = "0.2.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
-
-[[package]]
-name = "crypto-common"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
-dependencies = [
- "generic-array",
- "typenum",
-]
 
 [[package]]
 name = "dispatch2"
@@ -1652,16 +1728,6 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
-
-[[package]]
-name = "generic-array"
-version = "0.14.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
-dependencies = [
- "typenum",
- "version_check",
-]
 
 [[package]]
 name = "getrandom"
@@ -1783,15 +1849,6 @@ checksum = "7714e70437a7dc3ac8eb7e6f8df75fd8eb422675fc7678aff7364301092b1017"
 dependencies = [
  "equivalent",
  "hashbrown 0.16.1",
-]
-
-[[package]]
-name = "inout"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
-dependencies = [
- "generic-array",
 ]
 
 [[package]]
@@ -2059,12 +2116,6 @@ name = "once_cell"
 version = "1.21.4"
 
 [[package]]
-name = "opaque-debug"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
-
-[[package]]
 name = "ordered-float"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2101,17 +2152,6 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
-
-[[package]]
-name = "poly1305"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8159bd90725d2df49889a078b54f4f79e87f1f8a8444194cdca81d38f5393abf"
-dependencies = [
- "cpufeatures",
- "opaque-debug",
- "universal-hash",
-]
 
 [[package]]
 name = "portable-atomic"
@@ -2441,12 +2481,6 @@ name = "tracing"
 version = "0.1.44"
 
 [[package]]
-name = "typenum"
-version = "1.20.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
-
-[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2457,16 +2491,6 @@ name = "unicode-width"
 version = "0.2.2"
 dependencies = [
  "aterm-grapheme",
-]
-
-[[package]]
-name = "universal-hash"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc1de2c688dc15305988b563c3854064043356019f97a4b46276fe734c4f07ea"
-dependencies = [
- "crypto-common",
- "subtle",
 ]
 
 [[package]]
@@ -2829,24 +2853,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3949bd5b99cafdf1c7ca86b43ca564028dfe27d66958f2470940f73d86d75b37"
 dependencies = [
  "windows-link",
-]
-
-[[package]]
-name = "winit"
-version = "0.30.13"
-dependencies = [
- "aterm-cg",
- "aterm-grapheme",
- "aterm-hash",
- "aterm-objc",
- "aterm-types",
- "aterm-wayland",
- "aterm-x11",
- "aterm-xkb",
- "libc",
- "raw-window-handle",
- "tracing",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -6,106 +6,27 @@ use crate::WindowId;
 use crate::native_app::{ActionInvocation, AppEvent};
 use crate::native_ui::ActionId;
 
-/// THE A/B CLOCK charges each stretch to the bucket that was in force when
-/// it ran: a phase change closes the stretch under the arm and phase of
-/// then, a SWITCH OF ARMS MID-PHASE charges the time so far to the arm that
-/// was in force, the open stretches count to the instant read, and a
-/// session's end settles its stretch for good. Words that are no busy and no
-/// wait (a wall, a survey) count in neither phase. NEGATIVE CONTROLS: an
-/// instant before a stretch's start counts nothing, and a session with no
-/// stretch open is not charged by its end.
-#[test]
-fn the_ab_clock_charges_each_stretch_to_the_arm_in_force() {
-    let mut book = AbBook::default();
-    let busy = Some(AbPhase::Busy);
-    let waiting = Some(AbPhase::Waiting);
-    // Session 1, on Cruise: busy 0..1000, waiting 1000..4000.
-    book.observe(1, busy, AbArm::Cruise, 0);
-    book.observe(1, waiting, AbArm::Cruise, 1_000);
-    // Its word moves to busy as its arm turns Off (Off written): the wait
-    // goes to Cruise, the new stretch opens Off.
-    book.observe(1, busy, AbArm::Off, 4_000);
-    // Mid-phase, the arm turns to Land (Land written): Off busy 4000..6000.
-    book.observe(1, busy, AbArm::Land, 6_000);
-    // Session 2, off throughout: waiting 500..2500, then a wall.
-    book.observe(2, waiting, AbArm::Off, 500);
-    book.observe(2, None, AbArm::Off, 2_500);
-    let settled = AbTotals {
-        cruise: AbArmTotals {
-            busy_ms: 1_000,
-            waiting_ms: 3_000,
-        },
-        off: AbArmTotals {
-            busy_ms: 2_000,
-            waiting_ms: 2_000,
-        },
-        ..AbTotals::default()
-    };
-    assert_eq!(book.totals_at(6_000), settled);
-    // Session 1's open busy stretch counts to the instant read, on Land.
-    let mut open = settled;
-    open.land.busy_ms += 1_500;
-    assert_eq!(book.totals_at(7_500), open);
-    // The wall counts nothing however long it stands.
-    book.observe(2, None, AbArm::Off, 90_000);
-    assert_eq!(book.totals_at(7_500), open);
-    // Its end settles session 1's stretch; nothing grows after.
-    book.retire(1, 8_000);
-    let mut ended = settled;
-    ended.land.busy_ms += 2_000;
-    assert_eq!(book.totals_at(8_000), ended);
-    assert_eq!(book.totals_at(1_000_000), ended);
-    // An instant before a stretch's start counts nothing (never negative).
-    book.observe(3, waiting, AbArm::Unsupervised, 10_000);
-    book.observe(3, busy, AbArm::Unsupervised, 9_000);
-    assert_eq!(book.totals_at(10_000), ended);
-    // A session with no open stretch is not charged by its end.
-    book.retire(4, 50_000);
-    book.retire(3, 10_000);
-    assert_eq!(book.totals_at(1_000_000), ended);
-}
+/// SESSIONS' `Every session` row on the App (design §11.5.5).
+#[path = "harness_every_tests.rs"]
+mod every;
 
-/// The words the A/B counts, and its arms — one per Autopilot state: Cruise
-/// and Land each their own arm under this host's claim (NEGATIVE CONTROL:
-/// Land is never Cruise's, so a landing's end, a wait by design, never
-/// counts as the harness's); Off is plain Claude Code — the word Off, the
-/// master switch off or no host — with nobody's claim live; everything else
-/// is unsupervised.
+#[cfg(target_os = "macos")]
 #[test]
-fn the_ab_phases_and_arms_are_the_designs() {
-    assert_eq!(AbPhase::of("busy"), Some(AbPhase::Busy));
-    for word in ["idle", "prompt", "question"] {
-        assert_eq!(AbPhase::of(word), Some(AbPhase::Waiting), "{word}");
-    }
-    for word in ["wall:limit", "wall:unresponsive", "survey", "unknown", "-"] {
-        assert_eq!(AbPhase::of(word), None, "{word}");
-    }
-    assert_eq!(AbArm::of(AutopilotView::Cruise, true, true), AbArm::Cruise);
-    assert_eq!(AbArm::of(AutopilotView::Land, true, true), AbArm::Land);
-    for view in [AutopilotView::Cruise, AutopilotView::Land] {
-        assert_eq!(
-            AbArm::of(view, false, false),
-            AbArm::Unsupervised,
-            "{view:?}: not attached yet"
-        );
-        assert_eq!(
-            AbArm::of(view, false, true),
-            AbArm::Unsupervised,
-            "{view:?}: another supervisor's claim"
-        );
-    }
-    for view in [
-        AutopilotView::Off,
-        AutopilotView::MasterOff,
-        AutopilotView::Unhosted,
+fn lan_discovery_uses_only_the_resolved_service_endpoint() {
+    assert_eq!(
+        bonjour_ssh_target(
+            "Office Server._ssh._tcp.local. can be reached at actual-peer.local.:2222 (interface 8)"
+        ),
+        Some(("actual-peer.local".to_string(), 2222))
+    );
+    for unresolved in [
+        "",
+        "Office Server._ssh._tcp.local.",
+        "Office Server can be reached at actual-peer.local.:invalid (interface 8)",
+        "Office Server can be reached at :22 (interface 8)",
+        "Office Server can be reached at /foreign/path:22 (interface 8)",
     ] {
-        assert_eq!(AbArm::of(view, false, false), AbArm::Off, "{view:?}");
-        assert_eq!(
-            AbArm::of(view, false, true),
-            AbArm::Unsupervised,
-            "{view:?}: a claim still live is no baseline"
-        );
-        assert_eq!(AbArm::of(view, true, true), AbArm::Unsupervised, "{view:?}");
+        assert_eq!(bonjour_ssh_target(unresolved), None, "{unresolved}");
     }
 }
 
@@ -123,88 +44,6 @@ fn durations_and_shares_read_as_the_page_says_them() {
     assert_eq!(share_words(999, 1_000), ">99%");
     assert_eq!(share_words(1_000, 1_000), "100%");
     assert_eq!(share_words(0, 0), "0%");
-    assert_eq!(
-        ab_rows(AbTotals::default()),
-        [
-            ("Cruise".to_string(), "not measured yet".to_string()),
-            ("Land".to_string(), "not measured yet".to_string()),
-            ("Off".to_string(), "not measured yet".to_string()),
-        ]
-    );
-}
-
-/// THE COMPARISON IS CRUISE AGAINST OFF: each state's share on its own row,
-/// the unsupervised time where there is any, and one sentence setting
-/// Cruise beside Off once both have time — saying "this run" once — and,
-/// last, what every share counts: a finished agent's wait too.
-/// NEGATIVE CONTROLS: a landing's long wait (its end state) moves Land's own
-/// row and never the sentence; with Off unmeasured there is no sentence,
-/// however much Land and unsupervised time there is; and with no time in
-/// any state there is no last row (the quiet card's rows are pinned in
-/// `durations_and_shares_read_as_the_page_says_them`).
-#[test]
-fn the_ab_card_compares_cruise_with_off_and_land_stands_alone() {
-    let arm = |busy_ms, waiting_ms| AbArmTotals {
-        busy_ms,
-        waiting_ms,
-    };
-    let mut ab = AbTotals {
-        cruise: arm(97_000, 3_000),
-        land: arm(60_000, 3_540_000),
-        unsupervised: arm(30_000, 30_000),
-        ..AbTotals::default()
-    };
-    let rows = ab_rows(ab);
-    assert_eq!(
-        rows,
-        [
-            (
-                "Cruise".to_string(),
-                "waited for input 3% of the time \u{b7} 1m measured".to_string()
-            ),
-            (
-                "Land".to_string(),
-                "waited for input 98% of the time \u{b7} 1h measured".to_string()
-            ),
-            ("Off".to_string(), "not measured yet".to_string()),
-            (
-                "Unsupervised".to_string(),
-                "waited for input 50% of the time \u{b7} 1m measured".to_string()
-            ),
-            (
-                "Finished".to_string(),
-                "an agent done with its work still waits for input; each share counts that wait"
-                    .to_string()
-            ),
-        ],
-        "no Off time: nothing to compare Cruise with"
-    );
-    ab.off = arm(59_000, 41_000);
-    let sentence = |ab: AbTotals| {
-        ab_rows(ab)
-            .into_iter()
-            .find(|(label, _)| label == "This run")
-            .map(|(_, words)| words)
-    };
-    assert_eq!(
-        sentence(ab).as_deref(),
-        Some("agents waited for input 3% of the time on Cruise vs 41% with the harness off")
-    );
-    // A landing that waits on and on moves its own row, not the comparison.
-    ab.land.waiting_ms *= 10;
-    assert_eq!(
-        sentence(ab).as_deref(),
-        Some("agents waited for input 3% of the time on Cruise vs 41% with the harness off")
-    );
-    assert!(
-        !ab_rows(ab).iter().any(|(_, words)| words.contains("saved")),
-        "never a time saved"
-    );
-    assert_eq!(
-        ab_rows(ab).last().map(|(label, _)| label.as_str()),
-        Some("Finished"),
-        "what the shares count is the card's last word"
-    );
 }
 
 /// A reading's time is the local clock's, and says UTC where no zone was
@@ -647,13 +486,12 @@ fn claim(ctx: &crate::SessionCtx) {
     .unwrap();
 }
 
-/// Session `session`'s open stretch on the A/B clock: its phase and arm.
+/// Session `session`'s open stretch in the A/B book: its phase and arm.
 fn stretch(app: &App, session: u64) -> Option<(AbPhase, AbArm)> {
     app.harness_screen
         .ab
-        .clocks
-        .get(&session)
-        .map(|open| (open.phase, open.arm))
+        .stretch(session)
+        .map(|(phase, arm, _)| (phase, arm))
 }
 
 /// THE APP FEEDS THE CLOCK: a session's word moving charges its stretch to
@@ -684,12 +522,257 @@ fn the_app_feeds_the_ab_clock_at_each_change() {
     app.note_harness_phase(0);
     assert_eq!(
         stretch(&app, 0),
-        Some((AbPhase::Waiting, AbArm::Unsupervised))
+        Some((AbPhase::AtPrompt, AbArm::Unsupervised))
     );
     // The session's end settles it.
     app.retire_harness_ab(0);
-    assert!(app.harness_screen.ab.clocks.is_empty());
+    assert_eq!(app.harness_screen.ab.open_stretches(), 0);
     host.shutdown_and_join();
+}
+
+/// THE FACE AND THE PAUSE MOVE THE BOOK'S CAUSE (§10.5.3 B.3), told
+/// through `apply_harness_fact` as the host tells them: under Cruise at the
+/// prompt, a pause makes the prompt's time from there the harness's
+/// pausing, a face of done makes it finished (first, over a pause still
+/// standing), and a face of open none again. NEGATIVE CONTROL: under Off,
+/// with no claim, the same pause gives none.
+#[test]
+fn the_face_and_the_pause_told_move_the_books_cause() {
+    use aterm_agent::harness::acts::TaskFace;
+    let mut app = App::headless_for_test();
+    run_claude(&app, 0);
+    let host = idle_host();
+    app.harness = Some(host.clone());
+    let ctx = app.pool.get(0).unwrap().ctx.clone();
+    let sid = ctx.self_id.as_str().to_string();
+    claim(&ctx);
+    assert!(publish(&ctx, "idle"));
+    app.note_harness_phase(0);
+    let open = |app: &App| app.harness_screen.ab.stretch(0);
+    assert_eq!(open(&app), Some((AbPhase::AtPrompt, AbArm::Cruise, None)));
+    let plan = crate::PausePlan {
+        at_unix: 1_792_262_513,
+        short: 2,
+    };
+    let cause = |app: &App| open(app).and_then(|(_, _, cause)| cause);
+    app.apply_harness_fact(&sid, crate::HarnessFact::Pause(Some(plan)));
+    assert_eq!(cause(&app), Some(AbCause::Pausing));
+    app.apply_harness_fact(&sid, crate::HarnessFact::Task(Some(TaskFace::Done)));
+    assert_eq!(cause(&app), Some(AbCause::Finished));
+    app.apply_harness_fact(&sid, crate::HarnessFact::Pause(None));
+    assert_eq!(cause(&app), Some(AbCause::Finished));
+    app.apply_harness_fact(&sid, crate::HarnessFact::Task(Some(TaskFace::Open)));
+    assert_eq!(cause(&app), None);
+    // Off, its claim given back: no harness to say why.
+    assert!(app.set_session_autopilot(0, Some(Autopilot::Off)));
+    crate::session_timeline::release_supervisor(
+        &ctx,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    );
+    app.note_harness_arm(0);
+    app.apply_harness_fact(&sid, crate::HarnessFact::Pause(Some(plan)));
+    assert_eq!(open(&app), Some((AbPhase::AtPrompt, AbArm::Off, None)));
+    host.shutdown_and_join();
+}
+
+/// A MOVED WALL READS THE BOOK'S CALENDAR AGAIN (`Wake::WallMoved`,
+/// `App::on_wall_moved`): the book's today follows the wall the wake read.
+/// NEGATIVE CONTROLS: before the book is first fed a moved wall reads
+/// nothing, and a wall that moved with no wake moves nothing.
+#[test]
+fn a_moved_wall_reads_the_books_calendar_again_once_it_is_fed() {
+    use crate::autopilot_timers::set_fake_clocks;
+    let mut app = App::headless_for_test();
+    run_claude(&app, 0);
+    let wall = 1_792_177_200_000_i64;
+    set_fake_clocks(Some((std::time::Instant::now(), wall)));
+    app.on_wall_moved();
+    assert!(
+        !app.harness_screen.ab.has_calendar(),
+        "nothing fed, nothing read"
+    );
+    let ctx = app.pool.get(0).unwrap().ctx.clone();
+    assert!(publish(&ctx, "busy"));
+    app.note_harness_phase(0);
+    assert!(app.harness_screen.ab.has_calendar(), "read where first fed");
+    let today = |app: &App| {
+        app.harness_screen
+            .ab
+            .ring_at(crate::turn_ledger::now_ms())
+            .map(|(_, today)| today)
+    };
+    let first = today(&app).expect("a calendar");
+    set_fake_clocks(Some((std::time::Instant::now(), wall + 3 * 86_400_000)));
+    assert_eq!(today(&app), Some(first), "no wake, no move");
+    app.on_wall_moved();
+    assert_eq!(today(&app), Some(first + 3));
+    set_fake_clocks(None);
+}
+
+/// THE EXIT SEAM WRITES THE LIVE BOOK (§10.5.3 C.2): what `lib.rs` calls
+/// once the event loop has returned writes this process's own file, which
+/// another process reads back — a box held 2 s under Off, one sample.
+/// NEGATIVE CONTROL: a book never fed writes no file.
+#[test]
+fn the_exit_seam_writes_the_live_book() {
+    use crate::harness_ab::{AbCalendar, bucket};
+    use crate::harness_ab_store::{dir_of, own_name, read_others};
+    let state = aterm_tempfile::tempdir().expect("scratch state");
+    crate::harness_host::with_harness_state(state.path(), || {
+        let mut app = App::headless_for_test();
+        let own = dir_of(state.path()).join(own_name());
+        app.write_harness_ab_at_exit();
+        assert!(!own.exists(), "nothing fed, nothing written");
+        let book = &mut app.harness_screen.ab;
+        book.set_calendar(AbCalendar::read(
+            0,
+            unix_ms_now(),
+            crate::autopilot_timers::local_offset_at,
+        ));
+        book.observe(1, Some(AbPhase::Busy), None, AbArm::Off, 0);
+        book.observe(1, Some(AbPhase::AtBox), None, AbArm::Off, 1_000);
+        book.observe(1, Some(AbPhase::Busy), None, AbArm::Off, 3_000);
+        book.retire(1, 4_000);
+        app.write_harness_ab_at_exit();
+        assert!(own.exists(), "the exit seam wrote it");
+        let today = app
+            .harness_screen
+            .ab
+            .ring_at(crate::turn_ledger::now_ms())
+            .map(|(_, today)| today)
+            .expect("a calendar");
+        let read = read_others(state.path(), "0-0.json", today);
+        let off = |day: &crate::harness_ab::AbDay| day.arms[AbArm::Off.index()];
+        let (at_box, busy): (u64, u64) = read
+            .iter()
+            .map(|day| (off(day).at_box_ms, off(day).busy_ms))
+            .fold((0, 0), |(a, b), (x, y)| (a + x, b + y));
+        assert_eq!((at_box, busy), (2_000, 2_000));
+        let boxes: u32 = read.iter().map(|day| day.holds[2][0][bucket(2_000)]).sum();
+        assert_eq!(boxes, 1);
+    });
+}
+
+/// A day of the book for the reading's tests: Off busy `busy_ms`.
+fn off_day(day: i64, first_unix_ms: i64, busy_ms: u64) -> crate::harness_ab::AbDay {
+    let mut kept = crate::harness_ab::AbDay::new(day, first_unix_ms);
+    kept.arms[AbArm::Off.index()].busy_ms = busy_ms;
+    kept
+}
+
+/// A ring holding `day` alone.
+fn ring_of(day: crate::harness_ab::AbDay) -> crate::harness_ab::AbRing {
+    use crate::harness_ab::DAYS;
+    let mut ring: crate::harness_ab::AbRing = [None; DAYS];
+    ring[usize::try_from(day.day.rem_euclid(DAYS as i64)).unwrap()] = Some(day);
+    ring
+}
+
+/// A READING EXCHANGES THE BOOKS (§10.5.3 C.2–3): the stats thread's
+/// reading writes this process's ring as its own file and reads every
+/// other process's into `ab_others`, never its own; ledgers that cannot be
+/// read still leave the file written. NEGATIVE CONTROLS: a book never fed
+/// writes no file and still reads the others'; with no harness state
+/// nothing is written.
+#[test]
+fn a_reading_writes_this_books_file_and_reads_the_others() {
+    use crate::harness_ab_store::{dir_of, read_others, write_own};
+    const DAY: i64 = 20_002;
+    let noon = DAY * 86_400_000 + 43_200_000;
+    let utc: fn(i64) -> Option<i64> = |_| Some(0);
+    let state = aterm_tempfile::tempdir().expect("scratch state");
+    let hs = aterm_tempfile::tempdir().expect("scratch harness state");
+    let file = |name: &str| dir_of(hs.path()).join(name);
+    write_own(
+        hs.path(),
+        "1-1.json",
+        &ring_of(off_day(DAY, 10, 5_000)),
+        DAY,
+        0,
+    )
+    .unwrap();
+    let writes = std::sync::Arc::new(crate::harness_ab_store::AbWrites::default());
+    let mine = writes
+        .snapshot((ring_of(off_day(DAY, 20, 7_000)), DAY))
+        .unwrap();
+    let report = read_harness_stats(
+        Some(state.path()),
+        Some(hs.path()),
+        Some(&mine),
+        "2-2.json",
+        noon,
+        utc,
+    )
+    .expect("a reading");
+    assert_eq!(report.ab_others, [off_day(DAY, 10, 5_000)], "never its own");
+    assert!(file("2-2.json").exists(), "its own written");
+    // The ledgers unreadable: the book is written all the same.
+    let unread = writes
+        .snapshot((ring_of(off_day(DAY, 20, 7_000)), DAY))
+        .unwrap();
+    let failed = read_harness_stats(None, Some(hs.path()), Some(&unread), "3-3.json", noon, utc);
+    assert!(failed.is_err());
+    assert!(file("3-3.json").exists());
+    // NEGATIVE CONTROL: a book never fed writes nothing, reads the rest.
+    let unfed = read_harness_stats(
+        Some(state.path()),
+        Some(hs.path()),
+        None,
+        "4-4.json",
+        noon,
+        utc,
+    )
+    .expect("a reading");
+    assert!(!file("4-4.json").exists());
+    assert_eq!(unfed.ab_others, read_others(hs.path(), "4-4.json", DAY));
+    assert_eq!(unfed.ab_others[0].arms[AbArm::Off.index()].busy_ms, 19_000);
+    // NEGATIVE CONTROL: no harness state, no book.
+    let none = read_harness_stats(Some(state.path()), None, Some(&mine), "5-5.json", noon, utc);
+    assert!(none.is_err());
+    assert!(!file("5-5.json").exists());
+}
+
+/// THE PAGE'S WEEK ADDS THE OTHER PROCESSES' DAYS (§10.5.3 C.4): the
+/// reading's `ab_others` within the week are summed into the live book's,
+/// the earliest first stretch named; a day before the week is left out.
+/// NEGATIVE CONTROL: with no reading the week is the live book's alone.
+#[test]
+fn the_page_adds_the_other_processes_days_to_its_week() {
+    use crate::harness_ab::AbCalendar;
+    let mut app = App::headless_for_test();
+    let wall = unix_ms_now();
+    let book = &mut app.harness_screen.ab;
+    book.set_calendar(AbCalendar::read(
+        0,
+        wall,
+        crate::autopilot_timers::local_offset_at,
+    ));
+    book.observe(1, Some(AbPhase::Busy), None, AbArm::Off, 0);
+    book.retire(1, 2_000);
+    let today = book
+        .ring_at(crate::turn_ledger::now_ms())
+        .map(|(_, today)| today)
+        .expect("a calendar");
+    let alone = app.harness_ab();
+    assert_eq!(alone.arm(AbArm::Off).busy_ms, 2_000, "no reading yet");
+    let earlier = wall - 3 * 86_400_000;
+    let mut today_stats = HarnessStats::new(0);
+    today_stats.rows = 0;
+    let mut report =
+        HarnessStatsReport::new(today_stats.clone(), today_stats, wall, Some(0), &|_| {
+            Some(0)
+        });
+    report.ab_others = vec![
+        off_day(today - 7, earlier - 86_400_000, 100_000),
+        off_day(today - 3, earlier, 5_000),
+        off_day(today, wall, 1_000),
+    ];
+    app.harness_screen.stats.report = Some(std::sync::Arc::new(report));
+    let week = app.harness_ab();
+    assert_eq!(week.arm(AbArm::Off).busy_ms, 8_000, "the week's three");
+    assert_eq!(week.first, Some((today - 3, earlier)));
 }
 
 /// THE ARM READS THE CLAIM ONCE, and reads it right: under Off, another
@@ -710,7 +793,7 @@ fn the_ab_arm_reads_whose_claim_is_live() {
     assert!(app.set_session_autopilot(0, Some(Autopilot::Off)));
     assert_eq!(app.harness_ab_arm(0), AbArm::Unsupervised, "ours, live");
     // Another supervisor's live claim: claimed, not ours.
-    crate::session_timeline::release_supervisor(&ctx, None, now_us);
+    crate::session_timeline::release_supervisor(&ctx, None, now_us, aterm_slog::Actor::Ctl);
     crate::session_timeline::claim_supervisor(&ctx, "another-host", None, None, now_us).unwrap();
     assert_eq!(
         app.harness_ab_arm(0),
@@ -718,7 +801,7 @@ fn the_ab_arm_reads_whose_claim_is_live() {
         "another's, live"
     );
     // This host's claim, lapsed: nobody's.
-    crate::session_timeline::release_supervisor(&ctx, None, now_us);
+    crate::session_timeline::release_supervisor(&ctx, None, now_us, aterm_slog::Actor::Ctl);
     crate::session_timeline::claim_supervisor(
         &ctx,
         &crate::harness_host::holder(),
@@ -794,7 +877,12 @@ fn the_sweep_the_meta_wake_and_the_policy_feed_the_ab_clock() {
     );
 
     // The claim given back over the wire: nothing moves until the wake.
-    crate::session_timeline::release_supervisor(&ctx, None, crate::metrics::now_us());
+    crate::session_timeline::release_supervisor(
+        &ctx,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    );
     assert_eq!(stretch(&app, session), Some((AbPhase::Busy, AbArm::Cruise)));
     app.on_meta_changed(session);
     assert_eq!(
@@ -852,7 +940,7 @@ fn a_lapsed_claim_moves_the_ab_arm_as_a_released_one_does() {
     app.note_harness_phase(session);
     assert_eq!(
         stretch(&app, session),
-        Some((AbPhase::Waiting, AbArm::Unsupervised)),
+        Some((AbPhase::AtPrompt, AbArm::Unsupervised)),
         "Off behind another's claim"
     );
     assert!(app.open_harness_settings(wid, crate::harness_screen::HarnessFocus::Top));
@@ -864,7 +952,7 @@ fn a_lapsed_claim_moves_the_ab_arm_as_a_released_one_does() {
     crate::session_timeline::claim_supervisor(&ctx, holder, None, Some(now - 1), now - 2).unwrap();
     assert_eq!(
         stretch(&app, session),
-        Some((AbPhase::Waiting, AbArm::Unsupervised)),
+        Some((AbPhase::AtPrompt, AbArm::Unsupervised)),
         "NEGATIVE CONTROL: not lapsed yet"
     );
     let revision = app.harness_screen.revision;
@@ -875,7 +963,7 @@ fn a_lapsed_claim_moves_the_ab_arm_as_a_released_one_does() {
     );
     assert_eq!(
         stretch(&app, session),
-        Some((AbPhase::Waiting, AbArm::Off)),
+        Some((AbPhase::AtPrompt, AbArm::Off)),
         "the Off baseline's wait from the lapse"
     );
     assert!(
@@ -1285,10 +1373,13 @@ fn a_failed_reread_beside_a_reading_is_said() {
 
 /// WHAT THE HARNESS DID SAYS EVERY FAMILY THE FOLD KEEPS (design §10.3.1):
 /// Land's prompts are `Land prompts` (they count the prompts typed, never
-/// landings); `Declined` and `Waited at limits` are drawn; a press the safe
-/// rules could not prove is said after the window it fell in, only where
-/// one did. NEGATIVE CONTROLS: no `Landed` row; no `unproven` words in a
-/// window with none.
+/// landings); `Declined` and `Waited at limits` are drawn; the presses no
+/// safe rule proved are the row under `Approved`, labelled a part of it
+/// (`of those`), both windows, where the week had one — said once (the
+/// post-check of wave 1, owner-eye-6: the week holds today, so a suffix
+/// after each window said it twice), and never in the ledger's word
+/// `unproven` (its review, finding 4). NEGATIVE CONTROLS: no `Landed` row;
+/// no `of those` row in a week with none.
 #[test]
 fn what_the_harness_did_draws_every_family_the_fold_keeps() {
     let mut today = HarnessStats::new(0);
@@ -1300,19 +1391,23 @@ fn what_the_harness_did_draws_every_family_the_fold_keeps() {
     today.rows = 43;
     let mut week = HarnessStats::new(0);
     week.approved = 212;
+    week.unproven = 45;
     week.land_prompts = 9;
     week.declined = 4;
     week.limit_wait_ms = 7_500_000;
     week.rows = 230;
     let mut state = HarnessState::unobserved();
     state.observed = true;
-    state.stats.report = Some(std::sync::Arc::new(HarnessStatsReport::new(
-        today.clone(),
-        week.clone(),
-        1_000_000_000,
-        Some(0),
-        &|_| Some(0),
-    )));
+    let report = |today: &HarnessStats, week: &HarnessStats| {
+        Some(std::sync::Arc::new(HarnessStatsReport::new(
+            today.clone(),
+            week.clone(),
+            1_000_000_000,
+            Some(0),
+            &|_| Some(0),
+        )))
+    };
+    state.stats.report = report(&today, &week);
     let rows = state.projection().did_rows;
     let words = |label: &str| {
         rows.iter()
@@ -1320,26 +1415,35 @@ fn what_the_harness_did_draws_every_family_the_fold_keeps() {
             .map(|(_, w)| w.clone())
             .unwrap_or_else(|| panic!("no {label} row: {rows:?}"))
     };
+    assert_eq!(words("Approved"), "40 today \u{b7} 212 in 7 days");
     assert_eq!(
-        words("Approved"),
-        "40 today \u{b7} 40 unproven \u{b7} 212 in 7 days"
+        words("of those"),
+        "no safe rule proved 40 today \u{b7} 45 in 7 days"
     );
     assert_eq!(words("Land prompts"), "2 today \u{b7} 9 in 7 days");
     assert_eq!(words("Declined"), "1 today \u{b7} 4 in 7 days");
     assert_eq!(words("Waited at limits"), "2m today \u{b7} 2h 5m in 7 days");
+    let said = |words: &str| {
+        rows.iter()
+            .map(|(l, w)| format!("{l} {w}").to_lowercase().matches(words).count())
+            .sum::<usize>()
+    };
+    assert_eq!(said("no safe rule proved"), 1, "said once: {rows:?}");
+    assert_eq!(said("unproven"), 0, "never the ledger's word: {rows:?}");
     let labels: Vec<&str> = rows.iter().map(|(l, _)| l.as_str()).collect();
     assert_eq!(
-        labels[..11],
+        labels[..12],
         [
             "Approved",
+            "of those",
             "Declined",
             "Answered",
-            "Continued",
+            "Kept going",
             "Land prompts",
             "Resumed",
             "Relaunched",
             "Upgraded",
-            "Escalated",
+            "Needed you",
             "Waited on you",
             "Waited at limits",
         ]
@@ -1347,7 +1451,89 @@ fn what_the_harness_did_draws_every_family_the_fold_keeps() {
     // NEGATIVE CONTROLS.
     assert!(!labels.contains(&"Landed"), "{labels:?}");
     today.unproven = 0;
+    week.unproven = 0;
+    state.stats.report = report(&today, &week);
+    let rows = state.projection().did_rows;
+    assert!(
+        rows.iter()
+            .all(|(l, w)| l != "of those" && !w.contains("no safe rule")),
+        "a week with none says none: {rows:?}"
+    );
+    // A week's unproven presses, none today: the row says both windows.
     week.unproven = 3;
+    state.stats.report = report(&today, &week);
+    let rows = state.projection().did_rows;
+    assert_eq!(
+        rows.iter()
+            .find(|(l, _)| l == "of those")
+            .map(|(_, w)| w.as_str()),
+        Some("no safe rule proved 0 today \u{b7} 3 in 7 days"),
+    );
+}
+
+/// ONE NAME FOR EACH COUNT, FROM THE CHIP TO THE PAGE (the post-check of
+/// wave 1, owner-eye-6): STATUS's today line, a SESSIONS row's day line
+/// and WHAT THE HARNESS DID say every count in one table's words — the
+/// label the line's word with its first letter upper case, and where the
+/// chip lights the act, the chip's own word (`↻ kept going`): `Kept going`,
+/// never `Continued`; `Needed you`, never `Escalated`. And the presses no
+/// safe rule proved are named one way on the page, WHAT THE HARNESS DID's
+/// row and DECIDED FOR YOU's sentence alike. NEGATIVE CONTROL: the label
+/// table and the line table are read apart, so a label that drifted from its
+/// line's word is caught.
+#[test]
+fn one_name_for_each_count_from_the_chip_to_the_page() {
+    use aterm_agent::harness::acts::Act;
+    use aterm_agent::harness::stats::{DecisionKind, Tally};
+    let press = decision(
+        "s-7",
+        0,
+        DecisionKind::Unproven,
+        ("git push", "", Some("Approve permission boxes: All")),
+    );
+    assert!(
+        decision_sentence(&press, "fix the build")
+            .ends_with(&format!("; {NO_SAFE_RULE_PROVED} it")),
+        "DECIDED FOR YOU says it in the page's words"
+    );
+    for words in FAMILY_WORDS.iter().chain([&NEEDED_YOU]) {
+        let mut first = words.many.chars();
+        let label: String = first
+            .next()
+            .map(|c| c.to_uppercase().chain(first).collect())
+            .unwrap_or_default();
+        assert_eq!(words.label, label, "{words:?}");
+    }
+    for (words, act) in [
+        (APPROVED, Act::Approved),
+        (KEPT_GOING, Act::Continued),
+        (ANSWERED, Act::Answered),
+        (RESUMED, Act::Resumed),
+        (DECLINED, Act::Declined),
+    ] {
+        assert_eq!((words.one, words.many), (act.word(), act.word()));
+    }
+    // One reading, every surface.
+    let mut today = HarnessStats::per_session(0);
+    today.continued = 3;
+    today.escalated = 1;
+    today.human_wait_ms = 30_000;
+    today.by_session.as_mut().expect("per session").insert(
+        "s-1".to_string(),
+        Tally {
+            continued: 3,
+            escalated: 1,
+            human_wait_ms: 30_000,
+            ..Tally::default()
+        },
+    );
+    today.rows = 4;
+    let mut week = HarnessStats::new(0);
+    week.continued = 3;
+    week.escalated = 1;
+    week.rows = 4;
+    let mut state = HarnessState::unobserved();
+    state.observed = true;
     state.stats.report = Some(std::sync::Arc::new(HarnessStatsReport::new(
         today,
         week,
@@ -1355,13 +1541,29 @@ fn what_the_harness_did_draws_every_family_the_fold_keeps() {
         Some(0),
         &|_| Some(0),
     )));
-    let rows = state.projection().did_rows;
-    assert_eq!(
-        rows.iter()
-            .find(|(l, _)| l == "Approved")
-            .map(|(_, w)| w.as_str()),
-        Some("40 today \u{b7} 212 in 7 days \u{b7} 3 unproven"),
-        "today had none unproven: said for the week alone"
+    let projection = state.projection();
+    let (lead, _) = projection.today.expect("today's lines");
+    assert!(lead.starts_with("3 kept going today"), "{lead:?}");
+    let did = |label: &str| projection.did_rows.iter().any(|(l, _)| l == label);
+    assert!(
+        did("Kept going") && did("Needed you"),
+        "{:?}",
+        projection.did_rows
+    );
+    assert!(
+        !did("Continued") && !did("Escalated"),
+        "{:?}",
+        projection.did_rows
+    );
+    let tally = Tally {
+        continued: 3,
+        escalated: 1,
+        ..Tally::default()
+    };
+    let day = day_line(&tally, Some(0)).expect("a day");
+    assert!(
+        day.contains("needed you once") && day.contains("3 kept going"),
+        "{day:?}"
     );
 }
 
@@ -1734,6 +1936,88 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
     assert_eq!(
         row(AutopilotView::Land, unplaced).state_line().as_deref(),
         Some("done")
+    );
+}
+
+/// THE PAUSE ON THE STATE LINE (design §10.5.1): `pausing until 18:41 (3
+/// short turns in a row)` where no face or timer has the line — over the
+/// trail's `last:` — and the face's end and the timer's line win over it.
+/// NEGATIVE CONTROL: the same glass without the pause says the trail's
+/// newest act.
+#[test]
+fn the_state_line_says_the_pause_where_no_face_or_timer_has_the_line() {
+    use crate::claude_lights::{ChipGlass, Clock, LandAtGlass, Stamp};
+    use crate::harness_glass::PauseGlass;
+    use aterm_agent::harness::acts::{Act, TaskFace};
+    const TODAY: i64 = 20_007;
+    let row = |view: AutopilotView, glass: ChipGlass| HarnessSessionRow {
+        local_id: 7,
+        title: "fix the build".to_string(),
+        name: "fix the build".to_string(),
+        day_line: None,
+        detail: String::new(),
+        mode: view.mode(),
+        default: view.mode(),
+        view,
+        glass,
+        armed_at_ms: None,
+        today: TODAY,
+    };
+    let stamp = |h: u16, m: u16| Stamp {
+        clock: Clock::of_minute(h * 60 + m),
+        day: TODAY,
+    };
+    let pause = Some(PauseGlass {
+        until: stamp(18, 41),
+        short: 3,
+    });
+    let last = Some((Act::Approved, stamp(18, 35)));
+    let pausing = ChipGlass {
+        pause,
+        last,
+        ..ChipGlass::default()
+    };
+    for view in [AutopilotView::Cruise, AutopilotView::Land] {
+        assert_eq!(
+            row(view, pausing).state_line().as_deref(),
+            Some("pausing until 18:41 (3 short turns in a row)"),
+            "{view:?}"
+        );
+    }
+    let timed = ChipGlass {
+        land_at: Some(LandAtGlass {
+            clock: Clock::of_minute(19 * 60),
+            other_day: None,
+        }),
+        ..pausing
+    };
+    assert_eq!(
+        row(AutopilotView::Cruise, timed).state_line().as_deref(),
+        Some("lands at 19:00"),
+        "the timer's line wins"
+    );
+    let done = ChipGlass {
+        task: Some(TaskFace::Done),
+        task_at: Some(stamp(17, 42)),
+        ..pausing
+    };
+    assert_eq!(
+        row(AutopilotView::Land, done).state_line().as_deref(),
+        Some("done 17:42"),
+        "the face's end wins"
+    );
+    // NEGATIVE CONTROL: no pause, the trail's newest act.
+    assert_eq!(
+        row(
+            AutopilotView::Cruise,
+            ChipGlass {
+                pause: None,
+                ..pausing
+            }
+        )
+        .state_line()
+        .as_deref(),
+        Some("last: \u{2713} approved 18:35")
     );
 }
 
@@ -2116,8 +2400,11 @@ fn a_page_held_open_across_the_minute_names_the_day_from_then_on() {
 /// it nothing is read, and past it the page asks for a reading (STATUS's
 /// today and each row's day were Friday's) and owes the next midnight.
 /// With `land_at = "23:55"` the 23:55 turn republishes the offer but reads
-/// nothing, and midnight still reads. NEGATIVE CONTROLS: the 23:55 turn
-/// over a reading of today asks for none; the page gone, nothing is owed.
+/// nothing, and midnight still reads. EFFECT's end clock (§11.6.4, "A page
+/// held open past midnight") is each publish's own: 23:50, 23:55, then the
+/// new day's 00:00. NEGATIVE CONTROLS: the 23:55 turn over a reading of
+/// today asks for none; the page gone, nothing is owed; an end clock stamped
+/// where the book was built, not at the publish, would stay at the first.
 #[test]
 fn a_page_held_open_past_midnight_reads_the_new_day() {
     use crate::autopilot_timers::{local_offset_at, set_fake_clocks};
@@ -2137,6 +2424,20 @@ fn a_page_held_open_past_midnight_reads_the_new_day() {
         t0 + std::time::Duration::from_millis(u64::try_from(wall - opened).expect("ahead"))
     };
     let clocks = |wall: i64| set_fake_clocks(Some((mono(wall), wall)));
+    // The instant EFFECT OF EACH AUTOPILOT says it counted to, as published.
+    let until = |app: &App| {
+        let instance = app
+            .native_runtime
+            .instance_by_kind(crate::native_app::AppKind::Settings)
+            .expect("the Settings controller");
+        let Some(crate::native_app::NativeApp::Settings(settings)) =
+            app.native_runtime.app(instance)
+        else {
+            unreachable!("a Settings instance")
+        };
+        settings.harness_snapshot().ab.until
+    };
+    let stamp = |wall: i64| crate::harness_glass::Stamp::at(wall.div_euclid(1000));
     // Friday's reading, as the route's arrival would have landed it.
     let read_friday = |app: &mut App| {
         app.harness_screen.stats.collecting = false;
@@ -2160,6 +2461,7 @@ fn a_page_held_open_past_midnight_reads_the_new_day() {
         assert!(app.harness_page_shown());
         read_friday(&mut app);
         app.publish_native_harness_state();
+        assert_eq!(until(&app), stamp(opened), "{land_at:?}: 23:50");
         let asked = app.harness_screen.readings_asked;
         if land_at.is_some() {
             assert_eq!(
@@ -2175,6 +2477,7 @@ fn a_page_held_open_past_midnight_reads_the_new_day() {
                 app.harness_screen.readings_asked, asked,
                 "CONTROL: a turn over today's reading reads nothing"
             );
+            assert_eq!(until(&app), stamp(local(day, 23, 55)), "the turn's");
         }
         assert_eq!(
             app.autopilot_offer_deadline(),
@@ -2193,6 +2496,12 @@ fn a_page_held_open_past_midnight_reads_the_new_day() {
             app.harness_screen.readings_asked,
             asked + 1,
             "{land_at:?}: past midnight the page reads the new day"
+        );
+        let midnight = stamp(local(day + 1, 0, 0)).expect("the zone reads");
+        assert_eq!(until(&app), Some(midnight), "{land_at:?}: the new day's");
+        assert_eq!(
+            (midnight.day, midnight.words(Some(day + 1))),
+            (day + 1, "00:00".to_string())
         );
         if land_at.is_none() {
             assert_eq!(
@@ -2796,9 +3105,8 @@ fn two_agents_in_one_tab_are_told_apart_by_their_panes() {
 /// SHOW RAISES THE SESSION'S TAB AND FOCUSES ITS PANE (§10.3.1): from
 /// another tab in front, Show on the right pane's row fronts its tab with
 /// the right pane focused, and on the left one's, the left. NEGATIVE
-/// CONTROLS: `raise` alone fronts the tab and keeps the pane it last had (so
-/// Show's own focus is load-bearing); a session gone since the draw moves
-/// nothing.
+/// CONTROLS: selecting the tab alone keeps the pane it last had (so Show's
+/// own focus is load-bearing); a session gone since the draw moves nothing.
 #[test]
 fn show_raises_the_sessions_tab_and_focuses_its_pane() {
     use crate::native_app::HarnessRequest;
@@ -2816,9 +3124,13 @@ fn show_raises_the_sessions_tab_and_focuses_its_pane() {
         "another tab in front"
     );
     let tab_pane = |app: &App| app.focused_session_id(wid);
-    // CONTROL: the raise alone fronts the tab and keeps the pane it last had.
-    app.raise_session_by_id(0).expect("raised");
-    assert_eq!(tab_pane(&app), Some(right), "the raise kept the right pane");
+    // CONTROL: selecting the tab alone keeps the pane it last had.
+    app.switch_tab_in(wid, 0);
+    assert_eq!(
+        tab_pane(&app),
+        Some(right),
+        "the selection kept the right pane"
+    );
     app.switch_tab_in(wid, 1);
     assert_eq!(tab_pane(&app), Some(other));
     app.execute_native_harness(HarnessRequest::Show { session: 0 });
@@ -2827,6 +3139,166 @@ fn show_raises_the_sessions_tab_and_focuses_its_pane() {
     assert_eq!(tab_pane(&app), Some(right), "the right pane, focused");
     app.execute_native_harness(HarnessRequest::Show { session: 777 });
     assert_eq!(tab_pane(&app), Some(right), "a gone session moves nothing");
+}
+
+/// A LANDING STANDS UNTIL A RENDER HAS DRAWN IT (post-check of wave 1,
+/// behaviour-2 and owner-eye-2): `⚙` (or the menu's `Harness settings…`, or
+/// `⊘ off`) on a Settings ▸ Harness tab that is already open and drawn —
+/// scrolled to its bottom, or at its top with the row below the fold —
+/// lands the page on the session's row, or on SUPERVISION, even where a
+/// reply to the refreshes the open started reaches the view before the
+/// next frame: `HarnessChanged` (the ledger reading), `PackagesChanged` and
+/// `UpdateChanged`, each fanned out to every Settings view. A session's row
+/// the page does not list yet keeps its landing for the frame that lists
+/// it. CONTROLS: the scroll moved the rows off the screen first, so only
+/// the landing brings one back.
+#[test]
+fn a_landing_stands_until_a_render_has_drawn_it() {
+    use crate::app_introspect::AuxTarget;
+    use crate::harness_screen::HarnessFocus;
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    run_claude(&app, 0);
+    let mut sessions = vec![0];
+    for _ in 0..9 {
+        let s = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(s));
+        run_claude(&app, s);
+        sessions.push(s);
+    }
+    let host = idle_host();
+    app.harness = Some(host.clone());
+    let far = *sessions.last().expect("sessions");
+    let show = |s: u64| format!("ui key=\"harness/session/{s}/show\" ");
+    let drawn = |app: &App, s: u64| {
+        app.read_aux_controls(AuxTarget::Prefs)
+            .into_iter()
+            .find(|l| l.starts_with(&show(s)))
+    };
+    let selected =
+        |line: &Option<String>| line.as_ref().is_some_and(|l| l.contains("selected:true"));
+    let switch = format!(
+        "ui key=\"settings/control/{}\" ",
+        crate::prefs::EDIT_HARNESS_ENABLED
+    );
+    let supervision = |app: &App| {
+        app.read_aux_controls(AuxTarget::Prefs)
+            .iter()
+            .any(|l| l.starts_with(&switch))
+    };
+    // The page open, published and drawn at its top.
+    assert!(app.open_harness_settings(wid, HarnessFocus::Top));
+    app.publish_native_harness_state();
+    assert_eq!(drawn(&app, far), None, "the far row is below the fold");
+    // Past the page's last screen, wherever it was landed: the list's pages
+    // clamp at its end (SESSIONS' `Every session` row is one more of them).
+    let scroll_to_the_bottom = |app: &mut App| {
+        let (_, view) = app.active_native_view(wid).expect("the Settings view");
+        for _ in 0..40 {
+            app.dispatch_native_view_event(wid, view, AppEvent::ScrollPage(1))
+                .expect("dispatched");
+        }
+        assert!(!supervision(app), "control: SUPERVISION is scrolled away");
+        assert_eq!(
+            drawn(app, 0),
+            None,
+            "control: the first row is scrolled away"
+        );
+        assert_eq!(
+            drawn(app, far),
+            None,
+            "control: the far row is scrolled away"
+        );
+    };
+    // A reply that reaches the view between the landing and the frame: its
+    // name, and how it arrives.
+    type Reply = (&'static str, fn(&mut App));
+    let replies: [Reply; 3] = [
+        ("HarnessChanged", |app| app.publish_native_harness_state()),
+        ("PackagesChanged", |app| {
+            app.dispatch_to_settings_views(&AppEvent::PackagesChanged { revision: 1 });
+        }),
+        ("UpdateChanged", |app| {
+            app.dispatch_to_settings_views(&AppEvent::UpdateChanged { revision: 1 });
+        }),
+    ];
+    for (reply, arrive) in replies {
+        // At its top, drawn: the far row is below the fold.
+        assert!(app.open_harness_settings(wid, HarnessFocus::Top));
+        assert_eq!(drawn(&app, far), None, "{reply}: control");
+        assert!(app.open_harness_settings(wid, HarnessFocus::Session(far)));
+        arrive(&mut app);
+        let landed = drawn(&app, far);
+        assert!(selected(&landed), "{reply}, at the top: {landed:?}");
+        // Scrolled to its bottom, drawn: the first row is off the screen.
+        scroll_to_the_bottom(&mut app);
+        assert!(app.open_harness_settings(wid, HarnessFocus::Session(0)));
+        arrive(&mut app);
+        arrive(&mut app);
+        let landed = drawn(&app, 0);
+        assert!(selected(&landed), "{reply}, scrolled: {landed:?}");
+        // SUPERVISION, from the bottom.
+        scroll_to_the_bottom(&mut app);
+        assert!(app.open_harness_settings(wid, HarnessFocus::Supervision));
+        arrive(&mut app);
+        assert!(supervision(&app), "{reply}: SUPERVISION in view");
+    }
+    // A session the page does not list yet (its agent has not started): the
+    // frames before the reading that lists it keep its landing, and the one
+    // after lands on it.
+    assert!(app.open_harness_settings(wid, HarnessFocus::Top));
+    let late = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(late));
+    assert!(app.open_harness_settings(wid, HarnessFocus::Session(late)));
+    assert_eq!(drawn(&app, late), None, "not listed yet");
+    app.dispatch_to_settings_views(&AppEvent::PackagesChanged { revision: 2 });
+    assert_eq!(drawn(&app, late), None, "still not listed");
+    run_claude(&app, late);
+    app.publish_native_harness_state();
+    let landed = drawn(&app, late);
+    assert!(selected(&landed), "listed, and landed on: {landed:?}");
+    // A LATER OPEN REPLACES A LANDING STILL WAITING FOR ITS ROW (the review
+    // of the fix): `⚙` for a session not listed yet, then View ▸ Coding
+    // Agent Harness… (the page's top) — the session listed afterwards moves
+    // nothing: the page stays at its top, STATUS on screen, and no row is
+    // drawn selected.
+    let status = |app: &App| {
+        app.read_aux_controls(AuxTarget::Prefs)
+            .iter()
+            .any(|l| l.starts_with("ui key=\"harness/status"))
+    };
+    // At its top again, by the wheel.
+    let (_, view) = app.active_native_view(wid).expect("the Settings view");
+    for _ in 0..40 {
+        app.dispatch_native_view_event(wid, view, AppEvent::ScrollPage(-1))
+            .expect("dispatched");
+    }
+    assert!(status(&app), "control: at the top");
+    let later = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(later));
+    assert!(app.open_harness_settings(wid, HarnessFocus::Session(later)));
+    assert_eq!(drawn(&app, later), None, "not listed yet");
+    assert!(app.open_harness_settings(wid, HarnessFocus::Top));
+    app.publish_native_harness_state();
+    assert!(status(&app), "View ▸ Coding Agent Harness…: the top");
+    run_claude(&app, later);
+    app.publish_native_harness_state();
+    assert_eq!(
+        drawn(&app, later),
+        None,
+        "listed after the page was opened at its top: not landed on"
+    );
+    assert!(status(&app), "the page stayed at its top");
+    // The page's top from its bottom: View ▸ Coding Agent Harness… opens it
+    // at the top (§10.3.1), as it does a page not open yet.
+    scroll_to_the_bottom(&mut app);
+    assert!(!status(&app), "control: STATUS is scrolled away");
+    assert!(app.open_harness_settings(wid, HarnessFocus::Top));
+    assert!(
+        status(&app),
+        "View ▸ Coding Agent Harness… from the bottom: the top"
+    );
+    host.shutdown_and_join();
 }
 
 /// THE PAGE LANDS ON THE ROW (§10.3.3, item 8): `⚙` for a session whose row
@@ -2861,15 +3333,17 @@ fn the_gear_lands_the_page_on_its_sessions_row_drawn_selected() {
     };
     let selected =
         |line: &Option<String>| line.as_ref().is_some_and(|l| l.contains("selected:true"));
-    // CONTROL: at the top, the far row is off this screen.
+    // CONTROL: at the top, the far row is off this screen and no row's Show
+    // is drawn selected. (A row on the first screen draws the mode it runs
+    // under selected: its Cruise is, and says nothing of a landing.)
     assert!(app.open_harness_settings(wid, HarnessFocus::Top));
     app.publish_native_harness_state();
-    assert!(
-        !app.read_aux_controls(AuxTarget::Prefs)
-            .iter()
-            .any(|l| l.contains("selected:true") && l.contains("harness/session/")),
-        "nothing landed"
-    );
+    let landed: Vec<u64> = sessions
+        .iter()
+        .copied()
+        .filter(|&s| selected(&line(&app, s)))
+        .collect();
+    assert!(landed.is_empty(), "nothing landed: {landed:?}");
     assert_eq!(
         line(&app, far),
         None,
@@ -2912,4 +3386,476 @@ fn the_gear_lands_the_page_on_its_sessions_row_drawn_selected() {
         "SUPERVISION in view"
     );
     host.shutdown_and_join();
+}
+
+/// A decision of `sid`'s at `t_ms` (unix ms).
+fn decision(
+    sid: &str,
+    t_ms: i64,
+    kind: aterm_agent::harness::stats::DecisionKind,
+    (asked, did, why): (&str, &str, Option<&str>),
+) -> aterm_agent::harness::stats::Decision {
+    aterm_agent::harness::stats::Decision {
+        t_ms,
+        sid: sid.to_string(),
+        kind,
+        asked: Box::from(asked),
+        said: false,
+        did: Box::from(did),
+        why: why.map(Box::from),
+        times: 1,
+    }
+}
+
+/// A state whose today holds `decisions` (oldest first) of `total`, its
+/// SESSIONS one supervised row (`s-7`, `fix the build`) and, open but no
+/// SESSIONS row, `s-9` (`zsh`: its agent exited).
+fn state_deciding(
+    decisions: Vec<aterm_agent::harness::stats::Decision>,
+    total: u64,
+) -> HarnessState {
+    let mut today = HarnessStats::per_session(0);
+    today.declined = total;
+    let decided = today.decided.as_mut().expect("per session keeps decisions");
+    decided.rows = decisions;
+    decided.total = total;
+    let mut state = state_with_today(Some(today), false);
+    state.sessions = vec![HarnessSession {
+        local_id: 7,
+        sid: "s-7".to_string(),
+        title: "fix the build".to_string(),
+        place: "in tab 1".to_string(),
+        program: "Claude Code",
+        word: None,
+        view: AutopilotView::Cruise,
+        glass: crate::claude_lights::ChipGlass::default(),
+        armed_at_ms: None,
+        default: Some(Autopilot::Cruise),
+        supervised: true,
+    }];
+    state.decided_open = vec![OpenSession {
+        sid: "s-9".to_string(),
+        local_id: 9,
+        title: "zsh".to_string(),
+    }];
+    state
+}
+
+/// DECIDED FOR YOU'S ROWS (§10.4.2, item 3; §10.4.3): newest first, each at
+/// its clock time, keyed by its decision's id; each sentence
+/// names its session — a SESSIONS row by its title, a live session SESSIONS
+/// does not list by its name, a session gone by `A closed session` — and
+/// only an open session's row has a `Show tab`. Each kind in its words: the
+/// dialog's question, choice and why; the prose answer (`said` where the
+/// words are the turn's last row); the run of unproven presses `×3` naming
+/// the owner's switch; the refusal and its reason. The words never say
+/// "unsafe". NEGATIVE CONTROL: the same row's session closed (no SESSIONS
+/// row) names it `A closed session`, with no `Show tab`.
+#[test]
+fn decided_rows_name_a_live_and_a_closed_session() {
+    use aterm_agent::harness::stats::DecisionKind;
+    let at = |h: i64, m: i64| (h * 3_600 + m * 60) * 1_000;
+    let mut press = decision(
+        "s-9",
+        at(18, 28),
+        DecisionKind::Unproven,
+        (
+            "python3 - <<PY \u{2026}",
+            "",
+            Some("Approve permission boxes: All"),
+        ),
+    );
+    press.times = 3;
+    let mut said = decision(
+        "s-7",
+        at(18, 30),
+        DecisionKind::Answered,
+        (
+            "Done for now.",
+            "the answer text \u{201c}Decide.\u{201d}",
+            None,
+        ),
+    );
+    said.said = true;
+    let decisions = vec![
+        decision(
+            "s-7",
+            at(18, 25),
+            DecisionKind::Chose,
+            (
+                "Should divide() return true division (float) or floor division?",
+                "True division (float)",
+                Some("no option was marked Recommended, so it took the first"),
+            ),
+        ),
+        press,
+        said,
+        decision(
+            "s-gone",
+            at(18, 34),
+            DecisionKind::Answered,
+            (
+                "What should I add next?",
+                "the land answer: finish cleanly soonest, start nothing new",
+                None,
+            ),
+        ),
+        decision(
+            "s-7",
+            at(18, 40),
+            DecisionKind::Declined,
+            ("rm -rf build", "", Some("Nothing outside the worktree.")),
+        ),
+    ];
+    let id = |k: usize| decisions[k].id();
+    let ids = [id(4), id(3), id(2), id(1), id(0)];
+    let state = state_deciding(decisions, 5);
+    let rows: Vec<(String, String, String, Option<u64>)> = state
+        .decided_rows()
+        .into_iter()
+        .map(|row| (row.id, row.clock, row.sentence, row.show))
+        .collect();
+    let [i5, i4, i3, i2, i1] = ids;
+    assert_eq!(
+        rows,
+        [
+            (
+                i5,
+                "18:40".to_string(),
+                "fix the build: declined rm -rf build: Nothing outside the worktree.".to_string(),
+                Some(7)
+            ),
+            (
+                i4,
+                "18:34".to_string(),
+                "A closed session asked \u{201c}What should I add next?\u{201d} \u{2192} the land \
+                 answer: finish cleanly soonest, start nothing new"
+                    .to_string(),
+                None
+            ),
+            (
+                i3,
+                "18:30".to_string(),
+                "fix the build said \u{201c}Done for now.\u{201d} \u{2192} the answer text \
+                 \u{201c}Decide.\u{201d}"
+                    .to_string(),
+                Some(7)
+            ),
+            (
+                i2,
+                "18:28".to_string(),
+                "zsh: pressed Yes on python3 - <<PY \u{2026} \u{d7}3 under Approve permission \
+                 boxes: All; no safe rule proved it"
+                    .to_string(),
+                Some(9)
+            ),
+            (
+                i1,
+                "18:25".to_string(),
+                "fix the build asked \u{201c}Should divide() return true division (float) or \
+                 floor division?\u{201d} \u{2192} the harness chose True division (float): no \
+                 option was marked Recommended, so it took the first"
+                    .to_string(),
+                Some(7)
+            ),
+        ]
+    );
+    assert!(
+        rows.iter()
+            .all(|(_, _, sentence, _)| !sentence.to_lowercase().contains("unsafe"))
+    );
+    assert_eq!(state.projection().decided_total, 5);
+    // NEGATIVE CONTROL: s-7 closed.
+    let mut closed = state.clone();
+    closed.sessions.clear();
+    let first = closed.decided_rows().remove(0);
+    assert_eq!(
+        (first.sentence.as_str(), first.show),
+        (
+            "A closed session: declined rm -rf build: Nothing outside the worktree.",
+            None
+        )
+    );
+}
+
+/// STATUS COUNTS THE CHOICES (§10.4.1): its second line ends `3 choices made
+/// for you` (every one today, kept or not), `1 choice made for you` for one.
+/// NEGATIVE CONTROL: a day with none says nothing of them.
+#[test]
+fn statuss_second_line_counts_the_choices_made_for_you() {
+    use aterm_agent::harness::stats::DecisionKind;
+    let one = decision("s-7", 0, DecisionKind::Declined, ("x", "", None));
+    let state = state_deciding(vec![one.clone(), one.clone(), one.clone()], 70);
+    let (_, rest) = state.today_lines().expect("lines");
+    assert!(rest.ends_with("70 choices made for you"), "{rest}");
+    let state = state_deciding(vec![one], 1);
+    assert_eq!(
+        state.today_lines().map(|(_, rest)| rest).as_deref(),
+        Some("1 choice made for you")
+    );
+    let state = state_deciding(Vec::new(), 0);
+    let (_, rest) = state.today_lines().expect("lines");
+    assert!(!rest.contains("made for you"), "CONTROL: {rest:?}");
+}
+
+/// AN UNPROVEN PRESS OF ANOTHER OPTION, AND A KEPT RESET, IN WORDS
+/// (§10.4.4): where full power chose an option other than the box's yes
+/// (`No, keep default`), the row says `chose “<option>”`, and a box whose
+/// words were all drawing is `a box`; a limit reset kept unspent says why,
+/// or only that it was kept. NEGATIVE CONTROL: a yes (no option named, or
+/// `Yes`) is `pressed Yes`.
+#[test]
+fn an_unproven_option_and_a_kept_reset_in_words() {
+    use aterm_agent::harness::stats::DecisionKind;
+    let all = Some("Approve permission boxes: All");
+    let mut wait = decision(
+        "s-7",
+        0,
+        DecisionKind::Unproven,
+        ("", "Stop and wait for limit to reset", all),
+    );
+    wait.times = 2;
+    let said = |d: &aterm_agent::harness::stats::Decision| decision_sentence(d, "fix the build");
+    assert_eq!(
+        said(&decision(
+            "s-7",
+            0,
+            DecisionKind::Unproven,
+            ("Enable the new model?", "No, keep default", all)
+        )),
+        "fix the build: chose \u{201c}No, keep default\u{201d} on Enable the new model? under \
+         Approve permission boxes: All; no safe rule proved it"
+    );
+    assert_eq!(
+        said(&wait),
+        "fix the build: chose \u{201c}Stop and wait for limit to reset\u{201d} on a box \u{d7}2 \
+         under Approve permission boxes: All; no safe rule proved it"
+    );
+    assert_eq!(
+        said(&decision(
+            "s-7",
+            0,
+            DecisionKind::KeptReset,
+            (
+                "",
+                "",
+                Some("the check for a reset took longer than it may")
+            )
+        )),
+        "fix the build: kept its limit reset unspent: the check for a reset took longer than it may"
+    );
+    assert_eq!(
+        said(&decision("s-7", 0, DecisionKind::KeptReset, ("", "", None))),
+        "fix the build: kept its limit reset unspent"
+    );
+    // NEGATIVE CONTROL: a yes.
+    for yes in ["", "Yes"] {
+        assert!(
+            said(&decision(
+                "s-7",
+                0,
+                DecisionKind::Unproven,
+                ("touch a", yes, all)
+            ))
+            .starts_with("fix the build: pressed Yes on touch a under"),
+            "{yes:?}"
+        );
+    }
+}
+
+/// A ROW KEEPS ITS KEY (§10.4.4): a row's key is its decision's id, so a
+/// dialog told late, which sorts in among the older rows, moves no other
+/// row's key; two decisions with one id are told apart (`-2`). NEGATIVE
+/// CONTROL: the newest row's place among the day's moved.
+#[test]
+fn a_decided_row_keeps_its_key_when_an_older_row_sorts_in() {
+    use aterm_agent::harness::stats::DecisionKind;
+    let words = ("rm -rf build", "", Some("no"));
+    let a = decision("s-7", 1_000, DecisionKind::Declined, words);
+    let b = decision("s-7", 3_000, DecisionKind::Declined, words);
+    let late = decision(
+        "s-7",
+        2_000,
+        DecisionKind::Chose,
+        ("Late?", "Yes", Some("the option marked Recommended")),
+    );
+    let before = state_deciding(vec![a.clone(), b.clone()], 2).decided_rows();
+    let after = state_deciding(vec![a.clone(), late, b.clone()], 3).decided_rows();
+    assert_eq!(before[0].id, b.id());
+    assert_eq!(after[0].id, b.id(), "the newest keeps its key");
+    assert_eq!(after[2].id, a.id());
+    let twice = state_deciding(vec![a.clone(), a.clone()], 2).decided_rows();
+    assert_eq!(
+        twice.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),
+        [format!("{}-2", a.id()), a.id()]
+    );
+    // NEGATIVE CONTROL: its place among the day's, counted from the first,
+    // moved from 2 to 3.
+    let place = |rows: &[crate::harness_screen::DecidedRow], id: &str| {
+        rows.len() - rows.iter().position(|row| row.id == id).expect("listed")
+    };
+    assert_eq!((place(&before, &b.id()), place(&after, &b.id())), (2, 3));
+}
+
+/// A decision's clock belongs to its event, including either side of a
+/// same-day daylight-saving transition. The report reads those offsets;
+/// projection reads only the immutable report. Ordinary fixed and unknown
+/// zones remain controls, and the report's read-at clock keeps its own offset.
+#[test]
+fn each_decisions_clock_uses_its_events_offset_not_the_readings() {
+    use aterm_agent::harness::stats::DecisionKind;
+    const HOUR: i64 = 3_600_000;
+    const DAY: i64 = 24 * HOUR;
+    let read = |now: i64, before: i64, after: i64, zone: &dyn Fn(i64) -> Option<i64>| {
+        let mut today = HarnessStats::per_session(0);
+        let decided = today.decided.as_mut().expect("per-session decisions");
+        decided.total = 2;
+        decided.rows = vec![
+            decision(
+                "before",
+                before,
+                DecisionKind::Declined,
+                ("before?", "", None),
+            ),
+            decision("after", after, DecisionKind::Declined, ("after?", "", None)),
+        ];
+        let report = HarnessStatsReport::new(
+            today,
+            HarnessStats::new(0),
+            now,
+            zone(now.div_euclid(1000)),
+            zone,
+        );
+        let checked = read_at_words(report.collected_unix_ms, report.offset_s);
+        let mut state = HarnessState::unobserved();
+        state.stats.report = Some(std::sync::Arc::new(report));
+        let clocks: Vec<String> = state.decided_rows().into_iter().map(|r| r.clock).collect();
+        (checked, clocks)
+    };
+    let before = 10 * DAY + 6 * HOUR + HOUR / 2;
+    let after = before + HOUR;
+    let now = 10 * DAY + 16 * HOUR;
+    for (offset, want) in [
+        (Some(0), ["07:30", "06:30"]),
+        (Some(-4 * 3_600), ["03:30", "02:30"]),
+        (None, ["07:30 UTC", "06:30 UTC"]),
+    ] {
+        let (checked, clocks) = read(now, before, after, &|_| offset);
+        assert_eq!(clocks, want, "CONTROL: fixed or unknown zone");
+        assert_eq!(checked, read_at_words(now, offset));
+    }
+    let spring = 10 * DAY + 7 * HOUR;
+    let fall = 20 * DAY + 6 * HOUR;
+    let zone = |unix: i64| {
+        Some(if (spring..fall).contains(&(unix * 1000)) {
+            -4 * 3_600
+        } else {
+            -5 * 3_600
+        })
+    };
+    for (now, boundary, want) in [
+        (10 * DAY + 16 * HOUR, spring, ["03:30", "01:30"]),
+        (20 * DAY + 17 * HOUR, fall, ["01:30", "01:30"]),
+    ] {
+        let before = boundary - HOUR / 2;
+        let after = boundary + HOUR / 2;
+        assert_ne!(zone(before / 1000), zone(after / 1000));
+        let (checked, clocks) = read(now, before, after, &zone);
+        assert_eq!(
+            clocks, want,
+            "DECISION_EVENT_CLOCK_NEEDS_EVENT_OFFSET: newest first"
+        );
+        assert_eq!(checked, read_at_words(now, zone(now / 1000)));
+    }
+    // An event whose zone is unreadable is explicitly UTC, even where the
+    // reading and the other event have a known local offset.
+    let (_, clocks) = read(now, before, after, &|at| {
+        (at != before / 1000).then_some(-4 * 3_600)
+    });
+    assert_eq!(clocks, ["03:30", "06:30 UTC"]);
+}
+
+/// THE STATS READING DIALS A SIBLING AS ITS HANDSHAKE ASKS (2026-10-18): the
+/// token beside the sibling's socket on an `AUTH <hex>` line, then `ls`. A
+/// sibling whose token cannot be read is sent nothing: it refuses every line
+/// without one and logs each as a DENIED line, and the old read sent the token
+/// bare (no `AUTH`), four refusals a reading in the live window's log. Negative
+/// control: the tokenless sibling's listener reads no byte.
+#[cfg(unix)]
+#[test]
+fn the_stats_reading_dials_a_sibling_on_its_auth_line_and_never_blind() {
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = aterm_uds::control_socket_dir().expect("this test binary's control dir");
+    std::fs::create_dir_all(&dir).expect("the control dir");
+    // Two pids no listener here owns: the folder is this binary's own control
+    // folder, so no live instance's socket can be in it.
+    let (with, without) = (4_000_001_u32, 4_000_002_u32);
+    let sock = |pid: u32| dir.join(format!("aterm-{pid}.sock"));
+    let token_file = dir.join(format!("aterm-{with}.token"));
+    let token = "ab".repeat(32);
+    let _ = std::fs::remove_file(sock(with));
+    let _ = std::fs::remove_file(sock(without));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&token_file)
+        .and_then(|mut f| f.write_all(token.as_bytes()))
+        .expect("the sibling's token");
+    // Every reading this binary takes dials both, so each listener takes every
+    // connection until the reading below has returned and its backlog is drained;
+    // each answers with what its peer sent before hanging up.
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    let listen = |pid: u32| {
+        let listener = UnixListener::bind(sock(pid)).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let done = std::sync::Arc::clone(&done);
+        std::thread::spawn(move || {
+            let mut sent: Vec<Vec<u8>> = Vec::new();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).expect("blocking");
+                        let mut bytes = Vec::new();
+                        let _ = stream.read_to_end(&mut bytes);
+                        sent.push(bytes);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if done.load(Ordering::Acquire) {
+                            return sent;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            }
+        })
+    };
+    let (answered, blind) = (listen(with), listen(without));
+
+    let _ = collect_sibling_aterm_tabs();
+    done.store(true, Ordering::Release);
+    let answered = answered.join().expect("the sibling's listener");
+    let blind = blind.join().expect("the tokenless sibling's listener");
+    let _ = std::fs::remove_file(sock(with));
+    let _ = std::fs::remove_file(sock(without));
+    let _ = std::fs::remove_file(&token_file);
+
+    assert!(!answered.is_empty(), "the reading dials the sibling");
+    for bytes in &answered {
+        assert_eq!(
+            String::from_utf8_lossy(bytes),
+            format!("AUTH {token}\nsessions\n"),
+            "the handshake's own line, then the roster verb"
+        );
+    }
+    assert!(!blind.is_empty(), "the tokenless sibling is connected to");
+    assert!(
+        blind.iter().all(Vec::is_empty),
+        "and sent nothing blind: {blind:?}"
+    );
 }

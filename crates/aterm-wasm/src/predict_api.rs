@@ -561,7 +561,7 @@ mod tests {
         let mut t = terminal();
         t.set_predictive_echo("always");
         t.predict_char('a');
-        t.resize(10, 40);
+        t.resize(10, 40).expect("admitted geometry");
         assert!(t.predict_overlay().is_empty(), "stale-coords guess dropped");
         assert!(t.predict_next_deadline_ms().is_none());
     }

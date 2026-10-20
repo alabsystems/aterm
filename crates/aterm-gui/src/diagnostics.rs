@@ -276,8 +276,14 @@ fn shell_integration_runtime(config: &crate::app_config::Config) -> String {
 
 /// The `primer:` line: every registry agent's primer state under the real `$HOME`
 /// (read-only: `--diagnose` installs nothing) and the resolved `agents_auto_prime` knob.
+/// A Cargo test binary reads its own root's `home` (`aterm_types::dirs::test_root`),
+/// never the person's agents.
 fn agent_primer_line(config: &crate::app_config::Config) -> String {
-    let status = aterm_primer::home_dir().map_or_else(
+    let home = match aterm_types::dirs::test_root() {
+        Some(root) => Some(root.join("home")),
+        None => aterm_primer::home_dir(),
+    };
+    let status = home.map_or_else(
         || "(no HOME — nowhere to look)".to_string(),
         |home| aterm_primer::status_line(&home),
     );
@@ -327,7 +333,7 @@ pub(crate) fn privacy_line(
          notice={notice} report_attribution={attribution}",
         fda = fda.as_str(),
         // Nothing here measures a scope, so the measured half is `Unknown`, as the verb
-        // passes under `SpikeEvidence::UNMEASURED`. Per-folder state stays unknown:
+        // passes under `SpikeEvidence::MEASURED`. Per-folder state stays unknown:
         // testing a folder is what raises the dialog.
         scope =
             crate::control_privacy::observed_fda_scope(fda, aterm_containment::FdaScope::Unknown,)
@@ -411,7 +417,7 @@ pub(crate) fn collect() -> DiagInfo {
         agent_primer: agent_primer_line(&config),
         privacy: privacy_line(&config, None),
         debugger: debugger_line(&config, None, aterm_containment::consent::self_hardening()),
-        features: vec![("a11y-appkit", cfg!(feature = "a11y-appkit"))],
+        features: Vec::new(),
         capabilities: capability_list(),
         objc_protocols_absent: objc_protocols_absent(),
         config_path,
@@ -1375,19 +1381,16 @@ fn unexpanded_windows_env_var(value: &str) -> Option<&str> {
     let mut rest = value;
     while let Some(open) = rest.find('%') {
         let after = &rest[open + 1..];
-        if let Some(close) = after.find('%') {
-            let name = &after[..close];
-            if !name.is_empty()
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '(' | ')'))
-            {
-                return Some(name);
-            }
-            rest = &after[close..];
-        } else {
-            return None;
+        let close = after.find('%')?;
+        let name = &after[..close];
+        if !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '(' | ')'))
+        {
+            return Some(name);
         }
+        rest = &after[close..];
     }
     None
 }
@@ -1669,11 +1672,6 @@ pub(crate) fn config_backend_capability_warnings(
             (
                 crate::prefs::EDIT_TRAIL_SOUND_RIFF,
                 config.trail_sound_riff.is_some(),
-            ),
-            // The supervisor's choice chime is a synth voice on the same output.
-            (
-                crate::prefs::EDIT_CHOICE_SOUND,
-                config.choice_sound.is_some(),
             ),
         ] {
             if authored {
@@ -2286,10 +2284,13 @@ pub fn theme_font_available(family: &str) -> bool {
                 .split('+')
                 .all(|id| aterm_render::display_face_canonical_id(id).is_some());
     }
-    aterm_render::font_catalog::resolve_and_admit(&[name.to_string()])
-        .entries
-        .first()
-        .is_some_and(|entry| entry.result.is_ok())
+    aterm_render::font_catalog::resolve_and_admit(&[(
+        name.to_string(),
+        aterm_render::FaceTarget::REGULAR,
+    )])
+    .entries
+    .first()
+    .is_some_and(|entry| entry.result.is_ok())
 }
 
 /// The appearance a background measures as, by the one dark/light rule the
@@ -2642,6 +2643,19 @@ fn show_config_shell(config: &crate::app_config::Config) -> (String, String) {
     )
 }
 
+/// `--show-config`'s console-host row (Windows): the host a new tab of this launch runs
+/// in under aterm.toml `conpty`, with its version and path, in the words of `aterm
+/// doctor`'s `conpty:` row. A preview (`aterm_pty::preview_console_host`): it neither
+/// states the process's choice, copies Windows Terminal's host nor starts one, so a
+/// host that would fail to start reads as chosen here and as a fallback in `doctor`.
+#[cfg(windows)]
+fn show_config_console_host(config: &crate::app_config::Config) -> String {
+    aterm_pty::preview_console_host(&aterm_pty::ConsoleHostChoice::from_config(
+        config.conpty.as_deref(),
+    ))
+    .line
+}
+
 /// The `shell_origin` token: `--shell` or `aterm.toml` for an override (the CLI's
 /// `aterm.toml`, plus the flag only a window launch has), else `default:<word>` in the
 /// CLI's words ([`aterm_pty::ShellOrigin::word`]).
@@ -2654,15 +2668,12 @@ fn shell_origin_token(origin: aterm_pty::ShellOrigin, from_flag: bool) -> String
 }
 
 fn show_config_font_px(value: f32, explicit: bool) -> String {
-    if explicit {
-        format!("{value} (explicit physical px)")
-    } else {
-        format!("{value} (auto base; final physical px depends on display scale)")
-    }
+    let source = if explicit { "set" } else { "default" };
+    format!("{value} ({source}; px at 1×, each window draws it × its display scale)")
 }
 
-/// `--show-config`: the resolved launch config (flag > config > default). An unset font
-/// size shows its auto-scale base, since the physical size needs the display scale. The
+/// `--show-config`: the resolved launch config (flag > config > default). The font size
+/// is in px at 1×, the one font-size unit; each window draws it × its display scale. The
 /// header names the config file and whether it was read: when it was rejected, every
 /// line under it is a default.
 pub(crate) fn show_config() -> String {
@@ -2729,6 +2740,8 @@ fn show_config_report(launch_failure: Option<&str>) -> String {
     let (shell, shell_origin) = show_config_shell(&config);
     let _ = writeln!(s, "shell:          {shell}");
     let _ = writeln!(s, "shell_origin:   {shell_origin}");
+    #[cfg(windows)]
+    let _ = writeln!(s, "console_host:   {}", show_config_console_host(&config));
     let _ = writeln!(s, "theme:          {theme_name}");
     // Typography knobs (config > default).
     let _ = writeln!(
@@ -2791,7 +2804,7 @@ pub(crate) fn show_config_type_rows(
     config: &crate::app_config::Config,
     themes: &crate::app_config::ThemeCatalog,
     flag: Option<&str>,
-    admit: impl Fn(Option<&str>) -> Result<Option<String>, String>,
+    admit: impl Fn(Option<&str>) -> Result<Option<aterm_render::FaceRef>, String>,
 ) -> ShowConfigTypeRows {
     use crate::resolved_typography::TypeOrigin;
     let sides = [
@@ -2840,18 +2853,32 @@ pub(crate) fn show_config_type_rows(
     // JetBrains Mono on Linux, SF Mono on macOS); `--show-face` adds its file
     // and metrics.
     let default_face = || {
-        aterm_render::default_primary_identity()
-            .unwrap_or_else(|| "the embedded last-resort face".to_string())
+        aterm_render::default_primary_identity().map_or_else(
+            || "the embedded last-resort face".to_string(),
+            |face| face.path,
+        )
     };
-    let family = |view: &crate::app_config::Config| match crate::effective_font_family_with(
-        flag,
-        view.font_family_request().as_deref(),
-    ) {
-        None => format!("(default) {}", default_face()),
-        Some(family) if admit(Some(&family)).is_err() => {
-            format!("(default) {}; {family:?} did not load", default_face())
+    // A display layer (`display_font`, a `display:` family from a theme or
+    // `--font`) is drawn over the font, never in its place: the row names the
+    // font and then the layer.
+    let family = |view: &crate::app_config::Config| {
+        let font =
+            match crate::effective_font_family_with(flag, view.font_family_request().as_deref()) {
+                None => format!("(default) {}", default_face()),
+                Some(family) if admit(Some(&family)).is_err() => {
+                    format!("(default) {}; {family:?} did not load", default_face())
+                }
+                Some(family) => family,
+            };
+        let layer = flag
+            .and_then(aterm_render::display_face_ids_for_family)
+            .map(aterm_render::display_layer_ids)
+            .unwrap_or_else(|| view.display_faces_request());
+        if layer.is_empty() {
+            font
+        } else {
+            format!("{font} with display faces {}", layer.join("+"))
         }
-        Some(family) => family,
     };
     let font_family = row(
         [family(&views[0]), family(&views[1])],
@@ -2899,6 +2926,7 @@ fn color_source_label(resolved: &crate::resolved_colors::ResolvedColors) -> Stri
     let mut label = match &resolved.source {
         ThemeSource::Builtin => format!("{} (built-in)", resolved.id),
         ThemeSource::File(id) => format!("{id} (themes folder)"),
+        ThemeSource::Pack(id) => format!("{id} (community pack preview)"),
         ThemeSource::DefaultFallback { reason } => format!("Default (fallback: {reason})"),
     };
     let keys = resolved.config_keys();
@@ -2964,7 +2992,7 @@ pub(crate) fn show_face(family: &str) -> (String, bool) {
                 (configured.clone(), format!("{configured:?}"))
             }
             _ => match aterm_render::default_primary_identity() {
-                Some(default) => (default, "the default font".to_string()),
+                Some(default) => (default.path, "the default font".to_string()),
                 None => {
                     return (
                         "no font family configured and no default face loads; the \
@@ -2987,6 +3015,7 @@ pub(crate) fn show_face(family: &str) -> (String, bool) {
             let mut s = String::new();
             let _ = writeln!(s, "resolved face for {header}{side_note}:");
             let _ = writeln!(s, "  path:        {}", info.path);
+            let _ = writeln!(s, "  face index:  {}", info.index);
             let _ = writeln!(
                 s,
                 "  metrics at:  {} px (probe size)",
@@ -4728,11 +4757,15 @@ ink = "rainbow"
     fn every_tsv_row_has_the_header_column_count() {
         let dir = theme_list_scratch("tsv");
         let hostile = "Tab\there\u{1b}[31m";
-        std::fs::write(
-            dir.join(format!("{hostile}.conf")),
-            "foreground = #e0e0e0\nbackground = #101010\n",
-        )
-        .unwrap();
+        // NTFS admits no control character in a name, so on Windows no such
+        // file can exist; the pure escaping check below still runs there.
+        if cfg!(unix) {
+            std::fs::write(
+                dir.join(format!("{hostile}.conf")),
+                "foreground = #e0e0e0\nbackground = #101010\n",
+            )
+            .unwrap();
+        }
         std::fs::write(dir.join("Plain.conf"), "nonsense\twith\ttabs\n").unwrap();
         let catalog = crate::app_config::ThemeCatalog::discover_in(&dir);
         let tsv = theme_list(&catalog, Some(&dir), None, ThemeListFormat::Tsv);
@@ -4929,6 +4962,32 @@ ink = "rainbow"
         }
     }
 
+    /// The window's `--show-config` names the console host a new tab runs in on Windows
+    /// (WINDOWS_PARAGON_DESIGN §5.4's `console_host:` row, missing until 2026-10-17): the
+    /// preview of aterm.toml `conpty`, in `aterm doctor`'s `conpty:` words. Off Windows
+    /// there is no console host and no row.
+    #[test]
+    fn show_config_names_the_console_host_on_windows_only() {
+        let out = show_config();
+        let row = out.lines().find(|l| l.starts_with("console_host:"));
+        #[cfg(windows)]
+        {
+            let config = crate::app_config::load_config();
+            let host = aterm_pty::preview_console_host(&aterm_pty::ConsoleHostChoice::from_config(
+                config.conpty.as_deref(),
+            ));
+            assert!(!host.line.is_empty());
+            let want = format!("console_host:   {}", host.line);
+            assert_eq!(row, Some(want.as_str()), "{out}");
+            assert!(
+                out.find("\nshell_origin:") < out.find("\nconsole_host:"),
+                "the host follows the shell it hosts: {out}"
+            );
+        }
+        #[cfg(not(windows))]
+        assert_eq!(row, None, "{out}");
+    }
+
     /// `--show-config`'s font rows name each value's source: a theme's
     /// family and line height, a config key that beats the theme, `--font`,
     /// and each side of a split whose typography differs. Negative control:
@@ -4954,7 +5013,16 @@ ink = "rainbow"
             show_config_type_rows(&config, &themes, flag, admit)
         };
         let themed = rows("theme = \"Studio\"\nfont_px = 20.0\n", None);
-        assert_eq!(themed.font_family, "display:pixel  (source: theme Studio)");
+        // A theme's `display:` family is the display layer over the default
+        // font, never the font itself.
+        let default = aterm_render::default_primary_identity().map_or_else(
+            || "the embedded last-resort face".to_string(),
+            |face| face.path,
+        );
+        assert_eq!(
+            themed.font_family,
+            format!("(default) {default} with display faces pixel  (source: theme Studio)")
+        );
         assert_eq!(themed.line_height, "1.25  (source: theme Studio)");
         assert_eq!(themed.font_size_scale, "1.1  (source: theme Studio)");
         assert_eq!(themed.font_px, [22.0, 22.0], "the scale applies to font_px");
@@ -5082,6 +5150,9 @@ ink = "rainbow"
         let default = aterm_render::default_primary_identity().expect("a default face loads");
         let (msg, ok) = show_face("monospace");
         assert!(ok, "{msg}");
-        assert!(msg.contains(&format!("path:        {default}\n")), "{msg}");
+        assert!(
+            msg.contains(&format!("path:        {}\n", default.path)),
+            "{msg}"
+        );
     }
 }

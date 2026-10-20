@@ -18,6 +18,12 @@ serde = { workspace = true, features = ["derive"] }
 aterm-toml = { workspace = true }
 aterm-hash = { workspace = true }
 
+# The build script decodes the embedded lexicon (`build.rs`) through the same
+# shapes and TOML reader as the run-time decoder.
+[build-dependencies]
+serde = { workspace = true, features = ["derive"] }
+aterm-toml = { workspace = true }
+
 [dev-dependencies]
 # `host::could_not_run`: the dictionary gates end COULD NOT RUN on a host without
 # Webster's Second, never as a pass.

@@ -10,8 +10,8 @@
 //! `live` before anything moves; a second child launched through a symlink
 //! retargeted mid-run must stay `live`.
 //!
-//! The child is this test binary, re-entered through the `#[ignore]`d
-//! `anchor_probe_child`.
+//! The child is this test binary, re-entered through the first real test,
+//! which dispatches `anchor_probe_child` before its parent assertions.
 
 #![cfg(target_os = "macos")]
 
@@ -39,7 +39,11 @@ struct Probe {
 impl Probe {
     fn spawn(exe: &Path) -> Self {
         let mut child = Command::new(exe)
-            .args(["--exact", "anchor_probe_child", "--nocapture", "--ignored"])
+            .args([
+                "--exact",
+                "the_anchor_follows_a_bundle_renamed_and_then_deleted_under_a_live_process",
+                "--nocapture",
+            ])
             .env(CHILD_MARKER, "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -93,6 +97,10 @@ fn lay_bundle(root: &Path, name: &str) -> std::path::PathBuf {
 
 #[test]
 fn the_anchor_follows_a_bundle_renamed_and_then_deleted_under_a_live_process() {
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        anchor_probe_child();
+        return;
+    }
     let scratch = aterm_tempfile::tempdir().expect("tempdir");
     let root = scratch.path();
     let exe = lay_bundle(root, "A.app");
@@ -133,14 +141,9 @@ fn a_retargeted_launch_symlink_is_not_a_displacement() {
     assert_eq!(probe.read("after retarget"), "live");
 }
 
-/// The child half: one tagged reading per nudge. `#[ignore]`d and gated on the
-/// marker so an `--ignored` sweep cannot hang on a stdin nobody writes to.
-#[test]
-#[ignore = "re-entered as the child of the live-anchor tests"]
+/// The child half: one tagged reading per nudge, dispatched only when the
+/// parent test is re-entered with [`CHILD_MARKER`].
 fn anchor_probe_child() {
-    if std::env::var_os(CHILD_MARKER).is_none() {
-        return;
-    }
     let stdin = std::io::stdin();
     loop {
         println!("{TAG}{}", aterm_containment::image_anchor().as_str());

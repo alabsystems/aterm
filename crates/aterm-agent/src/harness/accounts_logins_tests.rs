@@ -8,6 +8,7 @@
 //! is an example.com one; nothing here reads a login, a keychain or a home.
 
 use super::*;
+use crate::harness::host_path::abs;
 
 const NOW: i64 = 1_790_000_000;
 const HOUR: i64 = 3600;
@@ -22,7 +23,9 @@ fn tmp(tag: &str) -> aterm_tempfile::TempDir {
 
 /// This machine's own login, renewable, and a second account with a login
 /// directory of its own and no email.
-const ROSTER: &str = r#"
+fn roster_text() -> String {
+    format!(
+        r#"
 [[account]]
 label = "main"
 class = "dedicated"
@@ -32,11 +35,14 @@ browser = "Claude main"
 [[account]]
 label = "work-2"
 class = "dedicated"
-dir = "/logins/work-2"
-"#;
+dir = "{}"
+"#,
+        abs("/logins/work-2")
+    )
+}
 
 fn roster() -> Roster {
-    Roster::parse(ROSTER).expect("admits")
+    Roster::parse(&roster_text()).expect("admits")
 }
 
 fn every(roster: &Roster) -> BTreeSet<String> {
@@ -59,7 +65,7 @@ fn renewed(at: i64) -> (State, Logins) {
         &mut logins,
         "main",
         None,
-        "/s/main.1",
+        &abs("/s/main.1"),
         Some("max"),
         at,
     );
@@ -111,8 +117,9 @@ fn an_email_and_a_browser_are_admitted_and_a_bad_one_refuses_the_file_unquoted()
     assert!(why.contains("its email is a TOML integer"), "{why}");
     // One address is one account, whatever its case.
     let twice = format!(
-        "{}\n[[account]]\nlabel = \"two\"\nclass = \"shared\"\ndir = \"/l/two\"\nemail = \"OWNER@example.com\"\n",
-        with("email", "owner@example.com")
+        "{}\n[[account]]\nlabel = \"two\"\nclass = \"shared\"\ndir = \"{}\"\nemail = \"OWNER@example.com\"\n",
+        with("email", "owner@example.com"),
+        abs("/l/two")
     );
     let why = Roster::parse(&twice).expect_err("one email twice");
     assert!(
@@ -139,8 +146,11 @@ fn a_row_with_an_email_is_written_as_it_reads_back_and_never_printed() {
         vec![row.clone()]
     );
     // A refusal the owner adds by hand prints a placeholder, never the address.
-    let inline = "account = [ { label = \"w\", class = \"shared\", dir = \"/l/w\" } ]\n";
-    let why = append_rows(inline, std::slice::from_ref(&row)).expect_err("inline");
+    let inline = format!(
+        "account = [ {{ label = \"w\", class = \"shared\", dir = \"{}\" }} ]\n",
+        abs("/l/w")
+    );
+    let why = append_rows(&inline, std::slice::from_ref(&row)).expect_err("inline");
     assert!(why.contains(EMAIL_BY_HAND), "{why}");
     assert!(!why.contains("owner@example.com"), "{why}");
     // A bad row is refused before anything is joined, the address unquoted.
@@ -170,10 +180,14 @@ fn logins_round_trip_bounded_and_beside_an_untouched_state() {
     for i in 0..MAX_ACCOUNTS {
         labels.insert(
             format!("l{i:02}"),
-            aterm_json::from_str(
-                r#"{"dir":"/s/current","renewed_at":9999999999,"lifetime_s":99999999,
-                    "was":["/a","/b","/c",null],"subscription":"max"}"#,
-            )
+            aterm_json::from_str(&format!(
+                r#"{{"dir":"{}","renewed_at":9999999999,"lifetime_s":99999999,
+                    "was":["{}","{}","{}",null],"subscription":"max"}}"#,
+                abs("/s/current"),
+                abs("/a"),
+                abs("/b"),
+                abs("/c")
+            ))
             .expect("json"),
         );
     }
@@ -188,7 +202,7 @@ fn logins_round_trip_bounded_and_beside_an_untouched_state() {
     .expect("ours");
     assert_eq!(read.labels.len(), MAX_ACCOUNTS);
     let b = read.labels.values().next().expect("one");
-    assert_eq!(b.dir.as_deref(), Some("/s/current"));
+    assert_eq!(b.dir.as_deref(), Some(abs("/s/current").as_str()));
     assert_eq!(b.renewed_at, Some(NOW), "no stamp from the future");
     assert_eq!(b.lifetime_s, LIFETIME_MAX_S);
     assert_eq!(b.was.len(), MAX_LEFT);
@@ -620,29 +634,22 @@ fn due_logins_and_none_working_are_the_renewable_rows() {
 /// is a third login, which is neither.
 #[test]
 fn a_bound_roster_reads_the_renewed_login_and_the_superseded_one_byte_for_byte() {
+    let (main_1, work_2, w_1) = (abs("/s/main.1"), abs("/logins/work-2"), abs("/s/w.1"));
     let mut state = state();
     let mut logins = Logins::default();
-    note_renewed(
-        &mut state,
-        &mut logins,
-        "main",
-        None,
-        "/s/main.1",
-        None,
-        NOW,
-    );
+    note_renewed(&mut state, &mut logins, "main", None, &main_1, None, NOW);
     note_renewed(
         &mut state,
         &mut logins,
         "work-2",
-        Some("/logins/work-2"),
-        "/s/w.1",
+        Some(&work_2),
+        &w_1,
         None,
         NOW,
     );
     let b = bound(&roster(), &logins);
-    assert_eq!(b.rows[0].dir.as_deref(), Some("/s/main.1"));
-    assert_eq!(b.rows[1].dir.as_deref(), Some("/s/w.1"));
+    assert_eq!(b.rows[0].dir.as_deref(), Some(main_1.as_str()));
+    assert_eq!(b.rows[1].dir.as_deref(), Some(w_1.as_str()));
     assert_eq!(
         b.rows[0].email,
         roster().rows[0].email,
@@ -657,26 +664,26 @@ fn a_bound_roster_reads_the_renewed_login_and_the_superseded_one_byte_for_byte()
         let me = who(login).me(&b);
         (me.account, me.left)
     };
-    assert_eq!(on(Some("/s/main.1")), (Some("main"), None));
+    assert_eq!(on(Some(&main_1)), (Some("main"), None));
     assert_eq!(
         on(None),
         (None, Some("main")),
         "the default login, superseded"
     );
-    assert_eq!(on(Some("/logins/work-2")), (None, Some("work-2")));
+    assert_eq!(on(Some(&work_2)), (None, Some("work-2")));
     assert_eq!(
-        on(Some("/logins/work-2/")),
+        on(Some(&format!("{work_2}/"))),
         (None, None),
         "another string, another login"
     );
-    assert_eq!(on(Some("/s/w.1")), (Some("work-2"), None));
+    assert_eq!(on(Some(&w_1)), (Some("work-2"), None));
     // The same account all the same: judged, recorded and shown as it.
     assert_eq!(judged_label(&b, &who(None)), Some("main"));
     // NEGATIVE CONTROL: the file as written knows no renewal.
     let file = roster();
     let me = who(None).me(&file);
     assert_eq!((me.account, me.left), (Some("main"), None));
-    assert_eq!(who(Some("/s/main.1")).me(&file).label(), None);
+    assert_eq!(who(Some(&main_1)).me(&file).label(), None);
     // The store reads the roster through its file, and a file it cannot read
     // binds nothing.
     let dir = tmp("bound");
@@ -697,14 +704,15 @@ fn a_bound_roster_reads_the_renewed_login_and_the_superseded_one_byte_for_byte()
 /// no renewal, does not attribute the renewed login.
 #[test]
 fn a_superseded_logins_usage_is_recorded_for_its_rows_account() {
+    let (work_2, w_1) = (abs("/logins/work-2"), abs("/s/w.1"));
     let mut state = state();
     let mut logins = Logins::default();
     note_renewed(
         &mut state,
         &mut logins,
         "work-2",
-        Some("/logins/work-2"),
-        "/s/w.1",
+        Some(&work_2),
+        &w_1,
         None,
         NOW,
     );
@@ -726,7 +734,7 @@ fn a_superseded_logins_usage_is_recorded_for_its_rows_account() {
             reset: None,
         }),
     };
-    let old = on("/logins/work-2");
+    let old = on(&work_2);
     let me = old.me(&b);
     assert_eq!((me.account, me.left), (None, Some("work-2")), "superseded");
     assert_eq!(
@@ -753,17 +761,24 @@ fn a_superseded_logins_usage_is_recorded_for_its_rows_account() {
         ..said
     };
     assert_eq!(
-        record_usage(&store, &b, "s-new", &on("/s/w.1"), &later, NOW).as_str(),
+        record_usage(&store, &b, "s-new", &on(&w_1), &later, NOW).as_str(),
         "usage",
         "the renewed login's"
     );
     // NEGATIVE CONTROLS: a login no row has held; the unbound file.
     assert_eq!(
-        record_usage(&store, &b, "s-x", &on("/logins/elsewhere"), &later, NOW),
+        record_usage(
+            &store,
+            &b,
+            "s-x",
+            &on(&abs("/logins/elsewhere")),
+            &later,
+            NOW
+        ),
         Recorded::NotListed
     );
     assert_eq!(
-        record_usage(&store, &roster(), "s-new", &on("/s/w.1"), &later, NOW),
+        record_usage(&store, &roster(), "s-new", &on(&w_1), &later, NOW),
         Recorded::NotListed
     );
 }
@@ -785,25 +800,18 @@ fn the_one_accounts_login_follows_its_renewal() {
     let path = dir.path().join(ACCOUNTS_FILE);
     std::fs::write(&path, ONE).expect("roster");
     assert_eq!(lone_login_at(Some(&path), &store, NOW), None, "not renewed");
+    let main_1 = abs("/s/main.1");
     let mut state = state();
     let mut logins = Logins::default();
-    note_renewed(
-        &mut state,
-        &mut logins,
-        "main",
-        None,
-        "/s/main.1",
-        None,
-        NOW,
-    );
+    note_renewed(&mut state, &mut logins, "main", None, &main_1, None, NOW);
     store.save_logins(&logins).expect("save");
-    assert_eq!(bound(&one, &logins).lone_login(), Some("/s/main.1"));
+    assert_eq!(bound(&one, &logins).lone_login(), Some(main_1.as_str()));
     assert_eq!(
         lone_login_at(Some(&path), &store, NOW).as_deref(),
-        Some("/s/main.1")
+        Some(main_1.as_str())
     );
     // NEGATIVE CONTROLS.
-    std::fs::write(&path, ROSTER).expect("two rows");
+    std::fs::write(&path, roster_text()).expect("two rows");
     assert_eq!(bound(&roster(), &logins).lone_login(), None);
     assert_eq!(lone_login_at(Some(&path), &store, NOW), None, "two rows");
     std::fs::write(&path, "[[account]]\nlabel = 7\n").expect("refused");
@@ -819,6 +827,7 @@ fn the_one_accounts_login_follows_its_renewal() {
 /// of its own forgets its first login past the bound.
 #[test]
 fn the_default_login_stays_the_own_rows_past_every_renewal() {
+    let work_2 = abs("/logins/work-2");
     let mut state = state();
     let mut logins = Logins::default();
     for n in 1..=MAX_LEFT + 2 {
@@ -828,7 +837,7 @@ fn the_default_login_stays_the_own_rows_past_every_renewal() {
             &mut logins,
             "main",
             None,
-            &format!("/s/main.{n}"),
+            &abs(&format!("/s/main.{n}")),
             None,
             at,
         );
@@ -836,8 +845,8 @@ fn the_default_login_stays_the_own_rows_past_every_renewal() {
             &mut state,
             &mut logins,
             "work-2",
-            Some("/logins/work-2"),
-            &format!("/s/w.{n}"),
+            Some(&work_2),
+            &abs(&format!("/s/w.{n}")),
             None,
             at,
         );
@@ -853,10 +862,10 @@ fn the_default_login_stays_the_own_rows_past_every_renewal() {
         .left
     };
     assert_eq!(left(None), Some("main"), "the default login, still main's");
-    assert_eq!(left(Some("/s/main.1")), None, "past the bound");
-    assert_eq!(left(Some("/logins/work-2")), None);
+    assert_eq!(left(Some(&abs("/s/main.1"))), None, "past the bound");
+    assert_eq!(left(Some(&work_2)), None);
     assert_eq!(
-        left(Some(&format!("/s/w.{}", MAX_LEFT + 1))),
+        left(Some(&abs(&format!("/s/w.{}", MAX_LEFT + 1)))),
         Some("work-2")
     );
 }
@@ -866,7 +875,9 @@ fn the_default_login_stays_the_own_rows_past_every_renewal() {
 #[test]
 fn a_login_end_is_advised_the_sessions_own_label_and_never_another() {
     let r = Roster::parse(&format!(
-        "{ROSTER}\n[[account]]\nlabel = \"pool-a\"\nclass = \"shared\"\ndir = \"/logins/pool-a\"\n"
+        "{}\n[[account]]\nlabel = \"pool-a\"\nclass = \"shared\"\ndir = \"{}\"\n",
+        roster_text(),
+        abs("/logins/pool-a")
     ))
     .expect("admits");
     let enrolled = every(&r);

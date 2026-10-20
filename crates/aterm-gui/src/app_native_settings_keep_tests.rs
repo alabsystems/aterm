@@ -225,10 +225,22 @@ fn pending_font_text_save() -> (App, crate::tab_model::ViewId) {
     let key = crate::native_ui::UiKey::new("settings/control/font_family");
     app.dispatch_native_event(wid, AppEvent::FocusChanged(Some(key.clone())))
         .unwrap();
-    // Typing on the actual font-list row opens its normal text-entry mode.
+    // Typing on the actual font-list row opens its list, searching what was
+    // typed; no installed font matches, so Other… is highlighted, and Return
+    // opens the row's text entry holding the typed name.
     assert!(app.native_input_event(
         wid,
         &crate::input::InputEvent::Text("Saved Mono".to_string())
+    ));
+    assert!(app.native_input_event(
+        wid,
+        &crate::input::InputEvent::Key {
+            key: aterm_types::keyboard::Key::Named(aterm_types::keyboard::NamedKey::Enter),
+            mods: aterm_types::keyboard::Modifiers::empty(),
+            base_layout: None,
+            layout_text: None,
+            event_type: aterm_types::keyboard::KeyEventType::Press,
+        }
     ));
     let before = app.compiled_native_ui(wid).unwrap();
     let field = before
@@ -328,4 +340,51 @@ fn text_save_completion_retires_unchanged_draft_only_on_success() {
             Some(if rejected { "First Mono" } else { "Saved Mono" })
         );
     }
+}
+
+/// A held arrow installs once per turn: three ↓ dispatched in one turn
+/// install nothing themselves, and the turn's one sync installs the row the
+/// highlight landed on, never the rows it passed.
+#[test]
+fn a_held_arrow_installs_once_per_frame() {
+    let mut app = app();
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Themes));
+    // A frame lays the list out: the arrows walk the rows it listed.
+    let _ = app.read_aux_controls(crate::app_introspect::AuxTarget::Prefs);
+    let (_, instance, view, state) = app.native_settings_view_target().unwrap();
+    let order = state.showcase.listed();
+    let home = state.highlighted_slug().expect("the in-use row");
+    let at = order.iter().position(|slug| *slug == home).expect("listed");
+    let landing = order[at + 3].clone();
+    let landing_id = state
+        .showcase
+        .cards
+        .iter()
+        .find(|card| card.slug == landing)
+        .unwrap()
+        .id
+        .clone();
+    let row = |slug: &str| crate::native_ui::UiKey::new(format!("settings/showcase/card/{slug}"));
+    let _ = app
+        .native_runtime
+        .dispatch(instance, view, AppEvent::FocusChanged(Some(row(&home))))
+        .unwrap();
+    for _ in 0..3 {
+        let _ = app
+            .native_runtime
+            .dispatch(instance, view, AppEvent::StepFocus(1))
+            .unwrap();
+    }
+    assert_eq!(
+        app.installed_colors.id, "Dracula",
+        "a step installs nothing"
+    );
+    app.sync_settings_theme_trial(std::time::Instant::now());
+    assert_eq!(app.installed_colors.id, landing_id);
+    assert_eq!(
+        app.theme_preview
+            .as_ref()
+            .map(|preview| preview.id.as_str()),
+        Some(landing_id.as_str())
+    );
 }

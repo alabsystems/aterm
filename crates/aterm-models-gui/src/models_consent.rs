@@ -18,6 +18,28 @@ use aterm_spec::derive::*;
 /// spike D2's to measure; the model only lets the child take as long as it
 /// likes.
 ///
+/// THE LAUNCH ASK (owner ruling O29, 2026-10-19). Once per Mac aterm asks by
+/// itself, at a quiet moment after the first-launch hand-overs, whether to
+/// turn debugger access on. It raises the press's alert, in its launch
+/// wording, and takes the answer exactly as a press's: `Offer` lands in phase
+/// 1 like `Press`, and `Consent`/`Decline` follow. So a change still starts
+/// only from the owner's yes in `Consent`, which alone sets `fresh`.
+///
+/// `Offer` takes the press's guard, plus no held lock (`lock == 0`) and no
+/// dead marker on disk (`stale == 0`), and fires only while the record beside
+/// `aterm.toml` (`privacy-debugger-asked`, keyed by host) does not name this
+/// Mac. It writes that record AHEAD of the alert, so an alert left up through
+/// a crash, quit or update is never raised again. `Forgo` writes the record
+/// without an alert, when the App's admission settled the question: a change
+/// under way, an alert the owner answered already, debugger access on, or on
+/// or turned off before. `Forgo` is enabled in any phase, because a change
+/// under way settles it too. The admission's host facts are the App's pure
+/// `admit_launch_ask`, table-tested there: windowed, macOS, `[privacy]`, a
+/// hardened aterm, the order behind the Full Disk Access and Developer Tools
+/// hand-overs, and a quiet moment. Only On is ever offered, since aterm never
+/// asks by itself to turn it off, so Tier-1 drives `Offer` in the On
+/// direction only.
+///
 /// DIRECTION-NORMALISED. *Turn off* is the same reducer with the roles of the
 /// two modes swapped, so `world` and `obs` count in the change's own terms:
 /// `0` is the change's PRECONDITION (`disabled` for On, `enabled` for Off), `1`
@@ -45,7 +67,12 @@ use aterm_spec::derive::*;
 /// names a child that is gone and that this lane does not follow — a peer
 /// aterm's, whose change that peer has yet to record (`PeerSettle`).
 /// `misadopted`: a records read re-read a change whose child was still
-/// running as one that had ended.
+/// running as one that had ended. `asked`: the asked record names this Mac
+/// (one written by `Offer` or `Forgo`, here or on an earlier launch).
+/// `reasked`: an alert raised over a record that already named this Mac.
+/// Every `Offer` writes the record first, so a second launch alert on one Mac
+/// is always one of these. `overlapped`: a launch alert raised while a
+/// change was in flight.
 ///
 /// THE RECORDS RE-READ. Mid-session the lane reads the shared records again
 /// (an unsettled read, or a mode the drift watch must judge against the
@@ -75,6 +102,23 @@ use aterm_spec::derive::*;
 /// the lane's own `needs_poll`, so it says something about the code: a lane
 /// that stops re-reading while a change is under way breaks it.
 ///
+/// The launch ask's laws have their own mutant dial, `Buggy = 2`.
+/// `AtMostOneOffer: reasked == 0` is broken by `OfferAgain`: the record is not
+/// read, or not written ahead of the alert, and a later launch asks again.
+/// `NoOfferOverAChange: overlapped == 0` is broken by `OfferWhileInFlight`:
+/// the alert is raised over our running child, whose administrator dialog may
+/// be up. `NoActWithoutConsent` is broken by `OfferRunsUnasked`: the first
+/// launch runs `-enable` with no alert answered.
+///
+/// Why a separate dial: the interpreter walks at most 100 000 states
+/// (`interp::MAX_STATES`). `asked` doubles the space, from 789 to 1 578
+/// states at `Buggy = 0` and from 35 310 to 70 620 at `Buggy = 1`. These
+/// three mutants on `Buggy = 1` as well would take it to 176 550. On their own
+/// dial they reach 5 217 states. `reasked` is a flag rather than a count of
+/// alerts for the same reason: a count would keep a settled Mac (`Forgo`)
+/// apart from an asked one, and triple the space instead (105 930 at
+/// `Buggy = 1`).
+///
 /// THE RESIDUAL RACE IS NAMED, NOT HIDDEN. `ChildClobbers` is honest
 /// environment behaviour: the rule can change between the worker's re-read and
 /// `DevToolsSecurity`'s own write, and that window spans the whole time the
@@ -86,7 +130,9 @@ use aterm_spec::derive::*;
 /// variable stands for aterm's own hardening and no guard refuses `Press` on
 /// it — the alert body states the exposure instead. A Tier-1 bind drives the
 /// real reducer with `self_hardened = NotHardened` and requires the press to
-/// be ACCEPTED like any other.
+/// be ACCEPTED like any other. O8 does not reach the launch ask, which is
+/// aterm's own initiative: an unhardened aterm never raises it. That is a
+/// host gate of `admit_launch_ask`, not a guard on `Offer`.
 ///
 /// Tier-1 (P1, `aterm-gui/src/debugger_access.rs`) drives the real
 /// `DebuggerChangeLane` (`begin` with the owner's answer, `poll`, `observe`,
@@ -96,11 +142,15 @@ use aterm_spec::derive::*;
 /// scripted re-read and a stand-in child, in both directions, and the records
 /// re-read mid-session (`ask_records`, the real reader `read_records`, then
 /// `poll`; a peer's marker written as its worker writes it and let go by the
-/// real `settle_markers`). It projects `phase`/`obs`/`polling` from the lane,
-/// `claim` from what the Security row states, `stale` from the marker on disk
-/// and the lane's own `follows`, and `lock`/`fresh`/`launches`/`unconsented`/
-/// `inflight`/`armed`/`unarmed`/`misadopted` from what the stand-in
-/// environment saw happen; it checks
+/// real `settle_markers`). It also drives the launch ask through the real
+/// `DebuggerChangeLane::offer` (the record written, then the answer through
+/// `begin`) and `DebuggerChangeLane::forgo`, across a relaunch over the same
+/// config folder. It projects `phase`/`obs`/`polling` from the lane, `claim`
+/// from what the Security row states, `stale` from the marker on disk and the
+/// lane's own `follows`, `asked` from the asked record on disk (the real
+/// reader, `read_asked`), and `lock`/`fresh`/`launches`/`unconsented`/
+/// `inflight`/`armed`/`unarmed`/`misadopted`/`reasked`/`overlapped` from what
+/// the stand-in environment saw happen; it checks
 /// `Model::action_enabled` against the lane's acceptance at every step, and
 /// negative controls run the same harness over deliberately faulty lanes and
 /// orders and require it to fail.
@@ -126,6 +176,9 @@ pub fn debugger_access_change_model() -> Model {
             var clobbered = 0;
             var stale = 0;
             var misadopted = 0;
+            var asked = 0;
+            var reasked = 0;
+            var overlapped = 0;
 
             // A completed `-status` read, idle or once the result was read:
             // the only step that sets what a surface says. It ends the change.
@@ -150,6 +203,41 @@ pub fn debugger_access_change_model() -> Model {
             // MUTANT: the button stays live while our child is in flight.
             action PressWhileInFlight when (Buggy == 1 && phase == 4) {
                 phase = 1;
+            }
+            // THE LAUNCH ASK (O29): once per Mac, aterm raises the press's own
+            // alert by itself, only where that press would be taken now, with
+            // no change marker or held lock on disk, and only while the record
+            // beside `aterm.toml` does not name this Mac. The record is written
+            // AHEAD of the alert, and the answer is the press's own: `Consent`
+            // or `Decline` next.
+            action Offer when (phase == 0 && obs == 0 && lock == 0 && stale == 0 && asked == 0) {
+                asked = 1;
+                phase = 1;
+            }
+            // MUTANT: the record is not read, or not written ahead of the
+            // alert, and a later launch asks again.
+            action OfferAgain when (Buggy == 2 && phase == 0 && obs == 0 && lock == 0 && stale == 0 && asked == 1) {
+                reasked = 1;
+                phase = 1;
+            }
+            // MUTANT: the ask raises its alert while our child is in flight
+            // (macOS's administrator dialog may be up).
+            action OfferWhileInFlight when (Buggy == 2 && phase == 4 && asked == 0) {
+                asked = 1;
+                overlapped = 1;
+            }
+            // MUTANT: the ask starts the change with no alert answered.
+            action OfferRunsUnasked when (Buggy == 2 && phase == 0 && obs == 0 && lock == 0 && stale == 0 && asked == 0 && launches <= Cap - 1) {
+                asked = 1;
+                polling = 1;
+                phase = 2;
+            }
+            // The ask settled without an alert (a change under way, an alert
+            // the owner answered already, the rule on, or on or turned off
+            // before): the record names this Mac and nothing else moves. In
+            // any phase, since a change under way settles it too.
+            action Forgo when (asked == 0) {
+                asked = 1;
             }
             // Cancel in aterm's alert, or nobody asked: nothing is spawned.
             action Decline when (phase == 1) {
@@ -316,6 +404,8 @@ pub fn debugger_access_change_model() -> Model {
             invariant EveryLaunchFollowsAFreshRead: unarmed == 0;
             invariant UnderWayIsPolled: (phase <= 1 && (lock == 0 || lock == 2)) || polling == 1;
             invariant ReReadsOnlyAnEndedChange: misadopted == 0;
+            invariant AtMostOneOffer: reasked == 0;
+            invariant NoOfferOverAChange: overlapped == 0;
         }
     }
 }

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `watch --journal FILE` / `supervise --journal FILE`: the loop's own record of what it
-//! decided, one JSON object per line, which `aterm drive ledger` replays.
+//! The supervising loop's own record of what it decided
+//! ([`super::SuperviseOpts::journal`], the file its window host names), one JSON object per
+//! line, which `aterm drive ledger` replays.
 //!
-//! Every line either loop prints is journaled as printed (`watch`'s stdout, `supervise`'s
-//! stderr, and for `supervise` the lines `watch` would have printed for what it decides
-//! silently), as
+//! Every line the loop prints is journaled as printed, and so is every journal-only line it
+//! decides silently, as
 //!
 //! ```text
 //! {"t":<unix ms>,"sid":"<sid>"|null,
@@ -16,17 +16,22 @@
 //!  "phase":"idle|question|prompt|limited|survey|context|compacted|turn|idle-no-report|
 //!           <rule id>|resumed|still-limited|rebriefed|rebrief-failed|-",
 //!  "seq":<n>|null,"complete":0|1|null,"rows":<n>|null,"summary":"<the line's free-text tail>",
-//!  "line":"<the exact line>","turn":<id>|null,"report":<id>|null[,"mark":"<16 hex>"]}
+//!  "line":"<the exact line>","turn":<id>|null,"report":<id>|null[,"mark":"<16 hex>"]
+//!  [,"ended":<unix ms>]}
 //! ```
 //!
 //! read from the line itself ([`JournalRecord::of_line`]), so record and line cannot disagree.
 //! An `EVENT`'s phase is its second word; a policy line's is its `rule=<id>` where it names
-//! one. `turn` is the ledger turn the point's report was counted from (`watch --report`);
-//! `report` is the inbox row id of the report `watch --mail` folded into an `EVENT turn`
-//! line, whose `rows=` is that body's row count. `mark`, on a review point's `EVENT` alone and
-//! only where the worker's last words were read there, is their mark
-//! (`policy::turn_end::said_mark`): what the next loop compares a landing's point with
-//! (`run.rs`'s `landed_before`), never printed.
+//! one. `complete`, `rows`, `turn` and `report` are an older build's, read back from its
+//! journals and written `null` now: the `complete=<0|1> rows=<n>` of a removed `watch
+//! --report`, with the ledger turn its report was counted from, and the inbox row id of the
+//! report a removed `watch --mail` folded into an `EVENT turn` line; a `MAIL …` line is `kind`
+//! `mail`, its words the summary. `mark`, on a review point's `EVENT` alone and only where the
+//! worker's last words were read there, is their mark (`policy::turn_end::said_mark`): what
+//! the next loop compares a landing's point with (`run.rs`'s `ended_before`), never printed.
+//! `ended`, on a task end's `DONE` note a restarted loop wrote for the end a loop before it
+//! noted, is when that end was first noted (unix ms), carried forward by each restatement:
+//! the time the next loop restates the end with (`ended_before`), never printed.
 //!
 //! Some lines are journal-only, never printed (`Review::note`): `ESCALATED`, `CLEARED`,
 //! `WAITING`, `UNVERIFIED`, most `SKIPPED`, `UNPROVEN` (after a full-power `APPROVED`: why no
@@ -95,45 +100,44 @@ pub const CLEARED_BADGES: [&str; 6] = [
 pub const ATTENTION_KEPT: &str = "kept";
 
 /// The line a stall's hold writes (`stall.rs`'s `hold_for_stall`): `FROZEN
-/// seq=<n> input=<word> wait_ms=<n> bytes=<n> rss_mb=<n> attention=<reply>
-/// mail=<reply>`. A record of kind `other`. The hold takes the loop's point
-/// badge down (the server's own entry says "frozen" over it), and no
-/// `CLEARED` line follows: its `attention=<reply>` is that unset's —
-/// [`ATTENTION_KEPT`] where the entry carries a limit's badge, which stands,
-/// and [`ATTENTION_SKIPPED`]'s `skipped: …` behind another supervisor, which
-/// touched nothing. Any other reply took the loop's entry down (or found
-/// none).
+/// seq=<n> input=<word> wait_ms=<n> bytes=<n> rss_mb=<n> attention=<reply>`.
+/// A record of kind `other`. The hold takes the loop's point badge down (the
+/// server's own entry says "frozen" over it), and no `CLEARED` line follows:
+/// its `attention=<reply>` is that unset's — [`ATTENTION_KEPT`] where the
+/// entry carries a limit's badge, which stands, and [`ATTENTION_SKIPPED`]'s
+/// `skipped: …` behind another supervisor, which touched nothing. Any other
+/// reply took the loop's entry down (or found none).
 pub const FROZEN: &str = "FROZEN";
 
-/// How an `ESCALATED seq=<n> attention=<reply> mail=<reply>` line's tail
-/// begins where NO BADGE went up, with why after it: another supervisor
-/// holds the session ([`ESCALATED_BEHIND`]), or a stall was in hand and the
-/// ask was withheld (`stall.rs`). Nobody was asked by this loop.
+/// How an `ESCALATED seq=<n> attention=<reply>` line's tail begins where NO
+/// BADGE went up, with why after it: another supervisor holds the session
+/// ([`ESCALATED_BEHIND`]), or a stall was in hand and the ask was withheld
+/// (`stall.rs`). Nobody was asked by this loop.
 pub const ATTENTION_SKIPPED: &str = "attention=skipped: ";
 /// Why [`ATTENTION_SKIPPED`] behind another supervisor's claim: `… another
 /// supervisor (<holder>) answers this session`.
 pub const ESCALATED_BEHIND: &str = "another supervisor";
-/// The mail word of a limit episode's escalation where a retry hit the wall
-/// again before the worker answered, or the notice an Autopilot Off park
-/// took the badge off is still up after it (`run.rs`'s `open_episode`): the
-/// same episode's badge up again, no second ask — `mail=skipped: the retry
-/// hit the wall again, the episode of seq=<n>`.
-pub const MAIL_RETRY: &str = "skipped: the retry hit the wall again";
-/// The mail word of a limit episode's escalation over a badge adopted from a
-/// previous loop ([`ADOPTED`]): the same ask, set again — `mail=skipped:
-/// adopted from a previous watcher`. Only while the notice it was adopted
-/// for still stands: once the worker answers past it, a limit is a new
-/// episode, mailed.
-pub const MAIL_ADOPTED: &str = "skipped: adopted from a previous watcher";
-/// The mail word of the turn-end policy's badge set again as an Autopilot
-/// Off park ends (`lifecycle.rs`'s `raise_parked_badge`): the badge the park
-/// took down, up again with no second ask of its own — `mail=skipped: set
-/// again after an off park`. Most such badges no point raises again
-/// (`/login`'s); one an act's own miss
+/// The `again=<why>` an `ESCALATED` line ends with where its badge is the
+/// same ask set again, no new one — the harness's stats count no second
+/// escalation. Here a limit episode's, where a retry hit the wall again
+/// before the worker answered, or the notice an Autopilot Off park took the
+/// badge off is still up after it (`run.rs`'s `open_episode`): `again=the
+/// retry hit the wall again, the episode of seq=<n>`. (A journal written
+/// before the manager's mail went says these as `mail=skipped: <why>`.)
+pub const AGAIN_RETRY: &str = "the retry hit the wall again";
+/// The `again=<why>` of a limit episode's escalation over a badge adopted
+/// from a previous loop ([`ADOPTED`]): the same ask, set again. Only while
+/// the notice it was adopted for still stands: once the worker answers past
+/// it, a limit is a new episode, a new ask.
+pub const AGAIN_ADOPTED: &str = "adopted from a previous watcher";
+/// The `again=<why>` of the turn-end policy's badge set again as an
+/// Autopilot Off park ends (`lifecycle.rs`'s `raise_parked_badge`): the
+/// badge the park took down, up again with no second ask of its own. Most
+/// such badges no point raises again (`/login`'s); one an act's own miss
 /// raised (a text not written or left typed, a draft with no fenced Enter)
 /// may be escalated again after this line, by its act decided afresh and
 /// missing again — its own `ESCALATED` line and ask.
-pub const MAIL_UNPARKED: &str = "skipped: set again after an off park";
+pub const AGAIN_UNPARKED: &str = "set again after an off park";
 
 /// One journaled line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,9 +155,9 @@ pub struct JournalRecord {
     pub phase: String,
     /// The line's `seq=`.
     pub seq: Option<u64>,
-    /// The line's `complete=` (`watch --report`).
+    /// The line's `complete=` (an older build's `watch --report`).
     pub complete: Option<bool>,
-    /// The line's `rows=` (`watch --report`).
+    /// The line's `rows=` (an older build's `watch --report`).
     pub rows: Option<u64>,
     /// The line's free-text tail.
     pub summary: String,
@@ -167,6 +171,14 @@ pub struct JournalRecord {
     /// (`policy::turn_end::said_mark`), `None` on every other line and where
     /// no words were read.
     pub mark: Option<u64>,
+    /// THE TIME THE END THIS NOTE RESTATES WAS FIRST NOTED (unix ms), on a
+    /// task end's note (`DONE …`) a restarted loop wrote for the end a loop
+    /// before it noted — a landing or a done seeded and taken up at its first
+    /// point (`policy::turn_end::TurnEndState::restated_noted_ms`) — carried
+    /// forward by every restatement, so the end's time survives any number
+    /// of restarts and seamless updates (`run.rs`'s `ended_before`); `None`
+    /// on every other line, and on a note of an end of its own.
+    pub ended: Option<i64>,
 }
 
 /// The first word of `s` and the rest after one space.
@@ -200,6 +212,7 @@ impl JournalRecord {
             turn,
             report: None,
             mark: None,
+            ended: None,
         };
         let (word, rest) = split_word(line);
         let mut tail = rest;
@@ -283,16 +296,19 @@ impl JournalRecord {
     }
 
     /// One JSON object, no newline, keys in the order the module doc lists
-    /// (`mark` only where there is one).
+    /// (`mark` and `ended` only where there is one).
     pub fn to_json(&self) -> String {
         let opt_str = |s: &Option<String>| s.as_deref().map_or("null".to_string(), json_str);
         let opt_num = |n: Option<u64>| n.map_or("null".to_string(), |n| n.to_string());
         let mark = self
             .mark
             .map_or_else(String::new, |m| format!(",\"mark\":\"{m:016x}\""));
+        let ended = self
+            .ended
+            .map_or_else(String::new, |e| format!(",\"ended\":{e}"));
         format!(
             "{{\"t\":{},\"sid\":{},\"kind\":{},\"phase\":{},\"seq\":{},\"complete\":{},\
-             \"rows\":{},\"summary\":{},\"line\":{},\"turn\":{},\"report\":{}{mark}}}",
+             \"rows\":{},\"summary\":{},\"line\":{},\"turn\":{},\"report\":{}{mark}{ended}}}",
             self.t,
             opt_str(&self.sid),
             json_str(&self.kind),
@@ -330,6 +346,7 @@ impl JournalRecord {
             turn: n("turn"),
             report: n("report"),
             mark: s("mark").and_then(|h| u64::from_str_radix(&h, 16).ok()),
+            ended: n("ended").and_then(|e| i64::try_from(e).ok()),
         })
     }
 }
@@ -419,14 +436,8 @@ impl Journal {
     /// Returns the row it wrote (its newline included) — or would have
     /// written, to a file it could not open — for a journal it was given;
     /// `None` with none: what a harness tape holds of the journal.
-    pub fn record(
-        &mut self,
-        t_ms: i64,
-        line: &str,
-        turn: Option<u64>,
-        warn: &mut dyn Write,
-    ) -> Option<String> {
-        self.record_marked(t_ms, line, turn, None, warn)
+    pub fn record(&mut self, t_ms: i64, line: &str, warn: &mut dyn Write) -> Option<String> {
+        self.record_marked(t_ms, line, None, warn)
     }
 
     /// [`Self::record`] of a review point's line, with the mark of the
@@ -435,13 +446,38 @@ impl Journal {
         &mut self,
         t_ms: i64,
         line: &str,
-        turn: Option<u64>,
         mark: Option<u64>,
         warn: &mut dyn Write,
     ) -> Option<String> {
+        self.record_with(t_ms, line, mark, None, warn)
+    }
+
+    /// [`Self::record`] of a task end's note that restates an end a loop
+    /// before this one noted, with the time that end was first noted
+    /// ([`JournalRecord::ended`]).
+    pub fn record_ended(
+        &mut self,
+        t_ms: i64,
+        line: &str,
+        ended: Option<i64>,
+        warn: &mut dyn Write,
+    ) -> Option<String> {
+        self.record_with(t_ms, line, None, ended, warn)
+    }
+
+    /// [`Self::record`] with the record's mark and end time.
+    fn record_with(
+        &mut self,
+        t_ms: i64,
+        line: &str,
+        mark: Option<u64>,
+        ended: Option<i64>,
+        warn: &mut dyn Write,
+    ) -> Option<String> {
         self.path.as_ref()?;
-        let mut rec = JournalRecord::of_line(t_ms, self.sid.as_deref(), line, turn);
+        let mut rec = JournalRecord::of_line(t_ms, self.sid.as_deref(), line, None);
         rec.mark = mark;
+        rec.ended = ended;
         let mut text = rec.to_json();
         text.push('\n');
         let res = match self.file.as_mut() {
@@ -782,6 +818,23 @@ mod tests {
             "{json}"
         );
         assert_eq!(JournalRecord::from_json(&json), Ok(r));
+        // A restated end's first time: written only where there is one, and
+        // an older record reads back without it.
+        let mut r = JournalRecord::of_line(
+            5,
+            Some("s-1"),
+            "DONE seq=4 rule=finished@v1 the worker reported ATERM-TASK-DONE",
+            None,
+        );
+        assert!(!r.to_json().contains("ended"), "{}", r.to_json());
+        r.ended = Some(1_792_458_186_177);
+        let json = r.to_json();
+        assert!(
+            json.ends_with(",\"report\":null,\"ended\":1792458186177}"),
+            "{json}"
+        );
+        assert_eq!(JournalRecord::from_json(&json), Ok(r));
+        assert_eq!(old.ended, None);
         assert!(JournalRecord::from_json("{\"kind\":\"event\"}").is_err());
         assert!(JournalRecord::from_json("{\"t\":1,\"kind\":\"event\",\"line\":").is_err());
     }

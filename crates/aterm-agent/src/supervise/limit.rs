@@ -451,13 +451,22 @@ pub fn printed_by_the_screen(
     local_offset_s: i64,
     live: bool,
 ) -> Option<i64> {
+    done_row_ended(rows, now, local_offset_s)
+        .or(live.then_some(now - PRINT_LAG_S))
+        .map(|p| p - CLOCK_SLACK_S)
+}
+
+/// WHEN THE TURN ON `rows` ENDED by its done row's clock (`done 7:58 PM`,
+/// Claude Code's own stamp, [`super::policy::turn_end::done_row_clock`]):
+/// the start of that minute (unix seconds), its last occurrence within a day
+/// up to `now`. `None` without a done row's clock.
+#[must_use]
+pub fn done_row_ended(rows: &[String], now: i64, local_offset_s: i64) -> Option<i64> {
     let earliest = now - 86_400 + 60;
     super::policy::turn_end::done_row_clock(rows)
         .and_then(|c| parse_reset(&c))
         .and_then(|d| reset_in_zone(&d, earliest, i64::MAX, &|_| Some(local_offset_s)))
         .filter(|d| *d <= now)
-        .or(live.then_some(now - PRINT_LAG_S))
-        .map(|p| p - CLOCK_SLACK_S)
 }
 
 /// Where a WALL's reset falls, by the wall's kind: `harness limits` says it by
@@ -1049,7 +1058,9 @@ mod tests {
     }
 
     /// `date` answers a zone's offset at an instant, where the machine has
-    /// the zone; a name no zone has, or a path, is asked nothing.
+    /// the zone; a name no zone has, or a path, is asked nothing. Unix only:
+    /// off Unix [`offset_at`] reads no offset at all.
+    #[cfg(unix)]
     #[test]
     fn a_zones_offset_is_read_at_the_instant() {
         if !Path::new("/usr/share/zoneinfo/America/Los_Angeles").is_file() {

@@ -4,9 +4,13 @@
 //! THE MUSE CODE LANE, ITS I/O HALF ([`super::super::upgrade_muse`] is the
 //! pure half): a Muse Code that crashed out of its tab is relaunched there on
 //! its own session, and one aterm's own end took is brought back in its
-//! reopened tab. Relaunch on exit only: no live upgrade moves a Muse Code
-//! (`lanes().upgrade` is false for it, and atpkg's `live_upgrade` too), so no
-//! sweep visits it and nothing is ever typed into a Muse Code that runs.
+//! reopened tab. And its LIVE UPGRADE'S QUIET FLOW (`upgrade_muse_live_drive.rs`,
+//! [`live`]; [`super::super::upgrade_muse_live`] is its pure half): a
+//! supervised Muse Code behind the build atpkg landed is ended at a genuinely
+//! idle point and relaunched through the managed twin on the same session by
+//! the relaunch below, its exit claimed as the upgrade's own, nothing typed
+//! after. Only the window's host's step visits it; a hand-run sweep moves no
+//! Muse Code.
 //!
 //! 1. **The snapshot** ([`snapshot`]): the tab's foreground Muse Code TUI
 //!    (no `exec`, no tool subcommand), its data home (its own
@@ -38,9 +42,8 @@
 //! 4. **The continuation** ([`carry_on`]): `muse resume` takes no prompt, so
 //!    at the loop's first idle point, once the new process holds the
 //!    session's lock and its composer reads empty and idle, the relaunch's
-//!    continuation is typed and submitted by a guarded `turn` (Muse reads an
-//!    Enter in the text's own burst as a newline: the echo is held still
-//!    first).
+//!    continuation is typed using the standard turn echo settle and guarded
+//!    submit.
 //!
 //! Records are filed per tab (`<state>/upgrade/muse-<tab>.json`,
 //! [`upgrade::Agent::record_key`]), pruned as codex-alab's path prunes its own
@@ -50,15 +53,19 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::super::relaunch::{ExitCause, WAIT_HAND_LIFTS, exit_clock, first_idle, hand_waits_out};
+use super::super::relaunch::{
+    ExitCause, NO_SHELL, NO_SHELL_DETAIL, WAIT_HAND_LIFTS, exit_clock, first_idle, hand_waits_out,
+};
 use super::super::upgrade_muse::{self as mz, ExitKind};
 use super::upgrade::{Agent, Dialect, Phase};
 use super::{
     Client, Hand, Kernel, Live, LiveTab, NoPlan, Opts, Plan, PromptLook, RelaunchLineError, Report,
-    STALE_S, St, TURN_WAIT, TabLife, Typed, alive, base_name, connect, cwd_of, exe_of, held, ids,
-    is_generation, ledger, load, lsof_holders, lsof_open_files, now_s, parse_etime, ps,
-    registry_graph, registry_life, roster, said, save, screen, squash, state_dir, table,
-    turn_takes_gen, turn_verdict, type_relaunch_line_with, under_hand, upgrade, wait_until,
+    STALE_S, St, TURN_WAIT, TabLife, Typed, alive, connect, cwd_of, descendants_in, exe_of,
+    exit_status, held, ids, is_generation, ledger, line_status, load, lsof_holders,
+    lsof_open_files, managed_agent_twin, now_s, registry_graph, registry_life, roster,
+    running_block, said, save, screen, shell_dialect_of, squash, started_ms, state_dir,
+    store_version, table, turn_takes_gen, turn_verdict, twin_version, type_relaunch_line_with,
+    under_hand, upgrade, wait_until,
 };
 
 // ---------------------------------------------------------------- the kernel
@@ -86,6 +93,19 @@ pub(super) trait MuseKernel: Kernel {
     /// Whether `pid` is still the foreground group of `tab` by the host's own
     /// roster: asked right before every typed act.
     fn in_tab(&self, c: &mut Client, pid: u32, tab: &str) -> bool;
+    /// Every descendant of `pid` (`(pid, basename)`), `None` where the
+    /// process table cannot be read: the live upgrade's process rule (G-M3,
+    /// an idle Muse Code has no child at all). The default reads the live
+    /// table, as [`Live`] does.
+    fn descendants(&self, pid: u32) -> Option<Vec<(u32, String)>> {
+        descendants_in(&table(), pid)
+    }
+    /// When `pid` started, unix milliseconds (the kernel's): where a
+    /// session's log begins to be this process's. The default reads the
+    /// kernel, as [`Live`] does.
+    fn started_ms(&self, pid: u32) -> Option<u64> {
+        started_ms(pid)
+    }
 }
 
 impl MuseKernel for Live {
@@ -164,42 +184,6 @@ fn relaunch_program(program: &Path, twin: Option<PathBuf>) -> Result<PathBuf, &'
         return Ok(program.to_path_buf());
     }
     twin.ok_or("no-managed-muse")
-}
-
-/// atpkg's `agents/muse` twin, where it names a `muse` build.
-fn managed_twin() -> Option<PathBuf> {
-    let twin = atpkg::store::resolve_configured()?
-        .agents_dir()
-        .join(mz::PROGRAM);
-    twin_of(&twin)
-}
-
-/// `twin` where its script names a `muse` build that exists.
-fn twin_of(twin: &Path) -> Option<PathBuf> {
-    let exe = super::catalog::twin_binary(&std::fs::read_to_string(twin).ok()?)?;
-    (exe.file_name().and_then(|n| n.to_str()) == Some(mz::PROGRAM) && exe.is_file())
-        .then(|| twin.to_path_buf())
-}
-
-/// The version a store build names in atpkg's record beside it
-/// (`<store>/muse/<build>.vendor`: `version = "1.4.10-R6427.1"`); `None`
-/// for a program run from no store, or no record. Never `--version`, which
-/// takes Muse Code's auth lock.
-fn store_version(program: &Path) -> Option<String> {
-    let build = program.parent()?.parent()?;
-    let record = build.with_extension("vendor");
-    let text = std::fs::read_to_string(record).ok()?;
-    text.lines().find_map(|l| {
-        let v = l.trim().strip_prefix("version")?.trim_start();
-        let v = v.strip_prefix('=')?.trim().trim_matches('"');
-        (!v.is_empty() && !v.chars().any(char::is_control)).then(|| v.to_string())
-    })
-}
-
-/// The version the twin's build names, for the record's `to`.
-fn twin_version(twin: &Path) -> Option<String> {
-    let exe = super::catalog::twin_binary(&std::fs::read_to_string(twin).ok()?)?;
-    store_version(&exe)
 }
 
 // ---------------------------------------------------------------- the witness
@@ -343,24 +327,6 @@ fn homes_of(
     ))
 }
 
-/// How many of the tab's newest command blocks a look at the relaunch
-/// line's own block reads ([`line_word`]): the line's, the prompt after it,
-/// and a few commands a person ran since.
-const LINE_BLOCKS: u32 = 8;
-
-/// THE EXIT STATUS OF COMMAND BLOCK `block` in one `blocks --json` reply:
-/// `None` while it runs, or where the reply does not hold it complete (no
-/// shell integration, a block scrolled past the window, blocks reset).
-fn block_exit(head: &str, body: &str, block: u64) -> Option<i64> {
-    use aterm_json::Value;
-    blocks_of(head, body)?
-        .iter()
-        .find(|b| b.get("id").and_then(Value::as_u64) == Some(block))
-        .filter(|b| b.get("state").and_then(Value::as_str) == Some("complete"))?
-        .get("exit")
-        .and_then(Value::as_i64)
-}
-
 /// THE WORD OF THE RELAUNCH LINE'S OWN COMMAND (its block `block`,
 /// [`St::line_block`], read right before the line was typed), once it ended
 /// ([`mz::line_exit_kind`]): Muse Code refused the resume (`1`, `2`), or the
@@ -369,11 +335,7 @@ fn block_exit(head: &str, body: &str, block: u64) -> Option<i64> {
 /// `None` while that command runs, where no block was read before it was
 /// typed (no shell integration), or where the tab no longer shows it.
 fn line_word(c: &mut Client, tab: &str, block: Option<u64>) -> Option<ExitKind> {
-    let block = block?;
-    let (head, body) = c
-        .request_counted(&format!("@{tab} blocks {LINE_BLOCKS} --json"))
-        .ok()?;
-    block_exit(&head, &body, block).map(mz::line_exit_kind)
+    line_status(c, tab, block).map(mz::line_exit_kind)
 }
 
 /// WHETHER `st` IS THE RECORD OF AN EARLIER ATTEMPT AT THIS VERY EXIT THAT
@@ -415,7 +377,7 @@ pub(super) fn snapshot(
     let held = witness(&mz::sessions_root(&data), &files, pid);
     let workspace = held.as_ref().and_then(|(_, lock)| workspace_of(lock));
     let cwd = k.cwd(pid).unwrap_or_default();
-    let started_ms = started_ms(pid).unwrap_or(0);
+    let started_ms = k.started_ms(pid).unwrap_or(0);
     Ok(super::super::relaunch::Snapshot {
         tab: tab.to_string(),
         pid,
@@ -432,17 +394,24 @@ pub(super) fn snapshot(
             workspace,
             lock: held.map(|(_, lock)| lock),
             started_ms,
-            block: connect(opts, tab)
-                .ok()
+            // A tab's own Muse Code ([`NO_SHELL`]) runs in no shell's block,
+            // and no shell writes it a line: read for its readers, relaunched
+            // by nothing ([`after_exit_onto`], [`plan`]).
+            block: (shell != NO_SHELL)
+                .then(|| connect(opts, tab).ok())
+                .flatten()
                 .and_then(|mut c| running_block(&mut c, tab)),
         }),
-        dialect: shell_dialect(shell, k),
+        dialect: (shell != NO_SHELL)
+            .then(|| shell_dialect(shell, k))
+            .flatten(),
         // Claude Code's variables: a Muse Code has no such login or home,
         // and no usage tap.
         login: None,
         home: None,
         claude_dir: None,
         stored_login: false,
+        profile: None,
     })
 }
 
@@ -477,74 +446,6 @@ pub(super) fn follow(snap: &mut super::super::relaunch::Snapshot) -> bool {
     run.lock = held.map(|(_, lock)| lock);
     snap.session = session;
     true
-}
-
-/// When `pid` started, unix milliseconds (to the second: `ps`'s elapsed
-/// time), while it runs ([`MuseRun::started_ms`]).
-///
-/// [`MuseRun::started_ms`]: super::super::relaunch::MuseRun::started_ms
-fn started_ms(pid: u32) -> Option<u64> {
-    let etime = ps(&["-o", "etime=", "-p", &pid.to_string()])?;
-    let age_s = parse_etime(etime.trim())?;
-    let now_ms = u64::try_from(aterm_time::since_epoch()?.as_millis()).ok()?;
-    Some(now_ms.saturating_sub(age_s.saturating_mul(1000)))
-}
-
-// ---------------------------------------------------------------- the command blocks
-
-/// The blocks of one `blocks --json` reply.
-fn blocks_of(head: &str, body: &str) -> Option<Vec<aterm_json::Value>> {
-    if !crate::is_ok_reply(head) {
-        return None;
-    }
-    let json = if body.trim().is_empty() {
-        head.strip_prefix("OK ")?.to_string()
-    } else {
-        body.to_string()
-    };
-    let v: aterm_json::Value = aterm_json::from_str(json.trim()).ok()?;
-    Some(v.get("blocks")?.as_array()?.clone())
-}
-
-/// The block a Muse Code TUI runs in, read while it runs: the tab's last
-/// block, executing ([`MuseRun::block`]).
-///
-/// [`MuseRun::block`]: super::super::relaunch::MuseRun::block
-fn running_block(c: &mut Client, tab: &str) -> Option<u64> {
-    use aterm_json::Value;
-    let (head, body) = c.request_counted(&format!("@{tab} blocks 1 --json")).ok()?;
-    let blocks = blocks_of(&head, &body)?;
-    let last = blocks.last()?;
-    (last.get("state").and_then(Value::as_str) == Some("executing"))
-        .then(|| last.get("id").and_then(Value::as_u64))
-        .flatten()
-}
-
-/// The exit status of the command that just ran in `tab`, per shell
-/// integration: the finished block ending where the entering prompt begins
-/// (`blocks 2 --json`) — block `block` where the TUI's snapshot named the one
-/// it ran in ([`running_block`]), so another command run since is never read
-/// as its exit. `None` while there is none.
-fn exit_status(c: &mut Client, tab: &str, block: Option<u64>) -> Option<i64> {
-    let (head, body) = c.request_counted(&format!("@{tab} blocks 2 --json")).ok()?;
-    parse_exit_status(&head, &body, block)
-}
-
-/// [`exit_status`] over one `blocks --json` reply.
-fn parse_exit_status(head: &str, body: &str, block: Option<u64>) -> Option<i64> {
-    use aterm_json::Value;
-    let blocks = blocks_of(head, body)?;
-    let (last, rest) = blocks.split_last()?;
-    if last.get("state").and_then(Value::as_str) != Some("entering") {
-        return None;
-    }
-    let prompt = last.get("prompt").and_then(Value::as_u64)?;
-    let done = rest.last()?;
-    (done.get("state").and_then(Value::as_str) == Some("complete")
-        && done.get("end").and_then(Value::as_u64) == Some(prompt)
-        && block.is_none_or(|block| done.get("id").and_then(Value::as_u64) == Some(block)))
-    .then(|| done.get("exit").and_then(Value::as_i64))
-    .flatten()
 }
 
 /// THE WORD THE EXIT OF `snap`'S MUSE CODE LEFT: its shell's exit status of
@@ -599,21 +500,10 @@ pub(super) fn look_at_exit(
 }
 
 /// The dialect of `shell` from its executable, as the relaunch line is
-/// written for it; `None` for a shell no line is written for (`sh`, tcsh,
-/// nushell…), which [`plan`] waits on for ever.
+/// written for it ([`shell_dialect_of`]); `None` for a shell no line is
+/// written for (`sh`, tcsh, nushell…), which [`plan`] waits on for ever.
 fn shell_dialect(shell: u32, k: &dyn MuseKernel) -> Option<Dialect> {
-    k.args(shell)
-        .map(|a| a.exec_path)
-        .or_else(|| {
-            table()
-                .into_iter()
-                .find(|(p, _, _)| *p == shell)
-                .map(|(_, _, n)| n)
-        })
-        .as_deref()
-        .map(base_name)
-        .as_deref()
-        .and_then(Dialect::from_exe_name)
+    shell_dialect_of(shell, k.args(shell))
 }
 
 /// Relaunch on exit, Muse Code lane ([`super::super::relaunch::after_exit`]
@@ -628,7 +518,8 @@ fn shell_dialect(shell: u32, k: &dyn MuseKernel) -> Option<Dialect> {
 /// are kept for a stamp another build wrote) or aterm itself ended
 /// ([`ExitCause::HostEnded`]). A crash is relaunched via [`relaunch`] on the
 /// session the witness proved, in its workspace, on the managed twin. `_upgrade`
-/// (`[harness] upgrade`) moves nothing here: Muse Code has no upgrade lane,
+/// (`[harness] upgrade`) moves nothing here: a relaunch on exit is no
+/// upgrade (Muse Code's live upgrade is its quiet flow's own step, [`live`]),
 /// and its relaunch types the twin a person's own `muse` runs.
 pub(super) fn after_exit(
     opts: &Opts,
@@ -638,10 +529,10 @@ pub(super) fn after_exit(
     cause: ExitCause,
     k: &dyn MuseKernel,
 ) -> Report {
-    after_exit_onto(opts, snap, left, cause, managed_twin(), k)
+    after_exit_onto(opts, snap, left, cause, managed_agent_twin(mz::PROGRAM), k)
 }
 
-/// [`after_exit`] onto the twin `twin` ([`managed_twin`]): the seam a test
+/// [`after_exit`] onto the twin `twin` ([`managed_agent_twin`]): the seam a test
 /// names its own through.
 #[allow(clippy::too_many_lines)]
 pub(super) fn after_exit_onto(
@@ -782,6 +673,11 @@ pub(super) fn after_exit_onto(
             Some(ExitKind::Refused) => return said(r, "ended:refused-start"),
             None => return said(r, "ended:exit-unwitnessed"),
         }
+    }
+    // A tab's own Muse Code ([`NO_SHELL`]): no shell is left to type its
+    // relaunch into, and none would come back in that tab.
+    if snap.shell == NO_SHELL {
+        return said(r, "refused:not-a-shell-job");
     }
     if !k.alive(snap.shell) {
         return said(r, "refused:shell-gone");
@@ -932,6 +828,15 @@ fn st_lock(st: &St) -> Option<PathBuf> {
 /// ([`mz::rewrite_argv`]) behind the homes the process was started with
 /// ([`mz::line_env`], REQUIRED: a line that cannot hold them is refused).
 pub(super) fn plan(opts: &Opts, st: &St, k: &dyn MuseKernel) -> Result<Plan, NoPlan> {
+    // No shell ([`NO_SHELL`], a tab's own Muse Code) is refused for good, as
+    // the Claude lane's plan refuses it: nothing would read the line.
+    if st.shell == NO_SHELL {
+        return Err(NoPlan::Refused {
+            why: "not-a-shell-job".to_string(),
+            what: "not-a-shell-job".to_string(),
+            detail: NO_SHELL_DETAIL.to_string(),
+        });
+    }
     let Some(dialect) = shell_dialect(st.shell, k) else {
         return Err(NoPlan::Wait("shell-dialect"));
     };
@@ -1261,8 +1166,13 @@ fn adopt(
     ledger(
         opts,
         &r,
-        "the relaunched Muse Code leads the tab; its supervisor types the continuation at its \
-         first idle point",
+        if st.quiet {
+            "the relaunched Muse Code leads the tab; at its first idle point its supervisor \
+             confirms the session's lock names it, and types nothing"
+        } else {
+            "the relaunched Muse Code leads the tab; its supervisor types the continuation at its \
+             first idle point"
+        },
     );
     r
 }
@@ -1357,9 +1267,7 @@ fn typing_fence(c: &mut Client, tab: &str) -> Result<Option<String>, &'static st
 }
 
 /// Type `text` into Muse Code's composer as one turn, fenced on `generation`
-/// and submitted under the composer's guard once the echo has held still
-/// (`idle=600`: Muse reads an Enter inside a typed burst as a newline,
-/// measured on 1.4.9 and 1.4.10).
+/// using the standard turn echo settle and guarded submit.
 fn type_text(c: &mut Client, tab: &str, text: &str, generation: Option<&str>) -> Result<(), Typed> {
     let fence = generation
         .filter(|g| is_generation(g))
@@ -1369,7 +1277,7 @@ fn type_text(c: &mut Client, tab: &str, text: &str, generation: Option<&str>) ->
     let guard = super::composer_guard('❯', text);
     let (head, _) = c
         .request_counted(&format!(
-            "@{tab} turn {fence}submit=guarded:{guard} idle=600 {TURN_WAIT} {text}"
+            "@{tab} turn {fence}submit=guarded:{guard} {TURN_WAIT} {text}"
         ))
         .map_err(|e| Typed::Refused(format!("{e}")))?;
     turn_verdict(&head)
@@ -1398,6 +1306,20 @@ fn carry_on(
         screen(c, &tab).is_some_and(|s| aterm_phase::muse::composer(&s.rows).is_some())
     });
     let mut typed = false;
+    // THE QUIET RESTART'S ADOPTION (the live upgrade's G-M4): nothing is
+    // typed, and the relaunch is the session's once its `.session.lock` names
+    // the new process (its body, as Muse writes it at its start: measured
+    // moving to the resumed pid), never on a typed line's verdict.
+    let lock_moved = up
+        && st.quiet
+        && st_lock(st).is_some_and(|lock| {
+            wait_until(opts.timings.muse_lock, || {
+                if let Some(h) = hand.as_deref_mut() {
+                    h.keep(c);
+                }
+                std::fs::read_to_string(&lock).is_ok_and(|body| mz::lock_pid(&body) == Some(new))
+            })
+        });
     if up && !st.quiet {
         let lock = st_lock(st);
         let holds = wait_until(opts.timings.muse_lock, || {
@@ -1447,13 +1369,24 @@ fn carry_on(
     st.resumed_pid = new;
     st.resumed_on.clone_from(&st.to);
     st.done_at = now_s();
-    st.outcome = format!("muse on {} · the same conversation resumed", st.to);
+    st.outcome = if st.quiet {
+        format!(
+            "muse upgraded to {} (from {}) · the same session resumed, nothing typed",
+            st.to, st.from
+        )
+    } else {
+        format!("muse on {} · the same conversation resumed", st.to)
+    };
     let step = if !up {
         "done:unconfirmed"
     } else if typed {
         "continued"
-    } else if st.quiet {
+    } else if st.quiet && lock_moved {
         "done:resumed"
+    } else if st.quiet {
+        // Up, and its session's lock never named it: the relaunch is not
+        // proved the session's (nothing was typed either way).
+        "done:unconfirmed"
     } else {
         "done:no-continue"
     };
@@ -1565,6 +1498,11 @@ pub(super) fn holders(
         })
         .collect()
 }
+
+// THE LIVE UPGRADE'S QUIET FLOW, its I/O half: the step the window's host
+// takes at the idle point it parked its loop at.
+#[path = "upgrade_muse_live_drive.rs"]
+pub(super) mod live;
 
 // The Muse Code lane's driver tests drive scripted processes over a stand-in tab.
 #[cfg(all(test, unix))]

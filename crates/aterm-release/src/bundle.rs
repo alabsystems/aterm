@@ -32,21 +32,9 @@ use std::path::{Path, PathBuf};
 pub const BUNDLE_ID: &str = "com.aterm.aterm";
 
 /// The argv0 aliases every bundle carries in `Contents/MacOS`, each a symlink onto the
-/// one `aterm` binary, which dispatches on the name it is run as. `aterm-link` is spawned
-/// BY NAME out of `[fabric] command`, so a shipped install must carry it too.
-pub const ARGV0_ALIASES: [&str; 8] = [
-    "aterm-cli",
-    "aterm-ctl",
-    "atpkg",
-    "aterm-fleet",
-    "aterm-drive",
-    // The `SUDO_ASKPASS` helper `sudo` runs with no tty
-    // (`docs/DESIGN-sudo-askpass-2026-10-15.md`): an argv0 alias because `sudo`
-    // execs it as `[path, prompt]` with no room for a verb.
-    "aterm-askpass",
-    "aterm-link",
-    "aterm-gui",
-];
+/// one `aterm` binary, which dispatches on the name it is run as. The list is
+/// `aterm_types::argv0::ALIASES`, the one every Rust reader shares.
+pub use aterm_types::argv0::ALIASES as ARGV0_ALIASES;
 
 /// Everything [`assemble_at`] + [`write_provenance`] need, resolved by the caller.
 pub struct BundleSpec {
@@ -449,7 +437,7 @@ pub fn assemble_at(spec: &BundleSpec, app: &Path) -> Result<(), String> {
     // plus argv0 compat SYMLINKS. One Mach-O carries the window, the session,
     // and every verb; the symlinks keep every pre-one-binary name resolving
     // (old installs' ~/.local/bin/aterm -> aterm-cli, in-session `aterm-ctl`
-    // scripts, the drive/fleet clients' sibling lookup, direct atpkg calls).
+    // scripts, the drive client's sibling lookup, direct atpkg calls).
     // The binary dispatches on argv[0], so each alias IS that tool. Symlinks
     // are not Mach-Os: nothing extra to sign, and the sealed bundle covers
     // them as resources.
@@ -580,6 +568,19 @@ pub fn place_handoff_policy(
     Ok(policy)
 }
 
+/// The bundle executable's mode: runnable, and writable by nobody. `~/.local/bin/aterm` is
+/// a link to this file, so a `cp build ~/.local/bin/aterm` with a write bit here opens the
+/// RUNNING app's own inode: the kernel kills every aterm window (CODESIGNING, Invalid
+/// Page) and a copy cut short with them leaves an app that cannot start (2026-10-19).
+/// Without one, `cp` is refused and `cp -f` replaces the link instead. Every later step
+/// keeps it: codesign writes a new inode in the same mode, `cp -RX` and `ditto` carry it
+/// into the DMG and the zip, and the updater only renames and deletes whole bundles. The
+/// mode is not part of the code seal (measured: `codesign --verify --deep --strict` and
+/// `spctl` pass). Never the directory: the updater's cross-parent bundle renames and
+/// every `remove_dir_all` of a bundle need `Contents/MacOS` writable.
+#[cfg(unix)]
+const EXE_MODE: u32 = 0o555;
+
 fn copy_exe(src: &Path, dst: &Path) -> Result<(), String> {
     std::fs::copy(src, dst)
         .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
@@ -588,11 +589,7 @@ fn copy_exe(src: &Path, dst: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(dst)
-            .map_err(|e| format!("stat {}: {e}", dst.display()))?
-            .permissions();
-        perms.set_mode(perms.mode() | 0o755);
-        std::fs::set_permissions(dst, perms)
+        std::fs::set_permissions(dst, std::fs::Permissions::from_mode(EXE_MODE))
             .map_err(|e| format!("chmod {}: {e}", dst.display()))?;
     }
     Ok(())
@@ -787,5 +784,41 @@ mod staging_tests {
             "nothing left to discard is not a failure"
         );
         let _ = std::fs::remove_dir_all(&dist);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod exe_mode_tests {
+    //! WRITABLE BY NOBODY: a copy aimed at `aterm` on PATH never lands in the installed
+    //! app's own executable.
+
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The laid executable is exactly r-x, so a copy through a link to it (what
+    /// `cp build ~/.local/bin/aterm` is) is refused and leaves its bytes, and the bundle
+    /// holding it still deletes whole, as the updater and `ship dev-app` delete bundles.
+    #[test]
+    fn a_copy_through_a_link_to_the_bundle_executable_never_rewrites_it() {
+        let scratch = aterm_tempfile::TempDir::new().expect("owned bundle scratch");
+        let dir = scratch.path();
+        let macos = dir.join("aterm.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).expect("create bundle");
+        let built = dir.join("built");
+        std::fs::write(&built, b"release").expect("write build");
+        let exe = macos.join("aterm");
+        copy_exe(&built, &exe).expect("copy_exe");
+        let mode = std::fs::metadata(&exe).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o7777, EXE_MODE, "{mode:o}");
+
+        let link = dir.join("aterm");
+        std::os::unix::fs::symlink(&exe, &link).expect("link");
+        let debug = dir.join("debug-aterm");
+        std::fs::write(&debug, b"a debug build").expect("write debug build");
+        let refused = std::fs::copy(&debug, &link).expect_err("a write through the link");
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&exe).expect("read"), b"release");
+
+        std::fs::remove_dir_all(dir.join("aterm.app")).expect("the bundle deletes whole");
     }
 }

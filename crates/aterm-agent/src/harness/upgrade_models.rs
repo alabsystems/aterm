@@ -9,6 +9,17 @@
 //! ([`Priority::admit`]), every change carrying its provenance. Evidence is read from files
 //! Claude Code already keeps; no model call decides anything here. The move rule is
 //! [`model_due`]: same family first, then the list.
+//!
+//! A MODEL THE ACCOUNT BILLS TO USAGE CREDITS is no model the harness moves a session onto
+//! under `[harness] usage_credits = false`, the default (the owner, 2026-10-19: *"for continuing
+//! on credits, that's an optional additional feature that's off by default. use
+//! subscriptions."*): the profile's word on how the plan bills Fable
+//! ([`super::profile::FablePlan`]), the consents it stores and the families it bills to credits
+//! only ([`credits_billed`]) make it unavailable ([`availability`]), so neither step of the rule
+//! offers it; a relaunch onto it is refused ([`super::relaunch`]'s `refused:model-on-credits`).
+//! WHERE THE BILLING CANNOT BE READ — no profile, a plan or a date that did not read, two logins
+//! listed — Fable is taken for billed (fail closed: the review of 2026-10-19, P4,
+//! [`CREDITS_BILLED_UNREAD`]). A plan that reads as billing none is judged as before.
 
 use std::path::{Path, PathBuf};
 
@@ -360,6 +371,60 @@ pub struct Evidence {
     pub disabled_options: Vec<String>,
     /// Launch announcements.
     pub announcements: Vec<Announcement>,
+    /// The model families the account's profile bills to usage credits
+    /// ([`credits_billed`]), read only under `[harness] usage_credits =
+    /// false`: each is unavailable ([`availability`]). Empty — the key on, no
+    /// profile, or a plan billing none or not read — judges as before.
+    pub credits_billed: Vec<String>,
+}
+
+/// The model families taken for billed to usage credits where the account's
+/// billing cannot be read ([`credits_billed`]): Fable, the family Claude Code
+/// bills per request with no dialog.
+pub const CREDITS_BILLED_UNREAD: &[&str] = &["fable"];
+
+/// THE MODEL FAMILIES AN ACCOUNT BILLS TO USAGE CREDITS at `now` (unix
+/// seconds), by its profile ([`super::profile::Profile`]): Fable where its
+/// plan bills it ([`fable_billed`]); every family a stored consent bills with
+/// no dialog ([`super::profile::Profile::consented`]); every family billed to
+/// credits only ([`super::profile::Profile::credits_only`]).
+#[must_use]
+pub fn credits_billed(profile: &super::profile::Profile, now: i64) -> Vec<String> {
+    let mut billed: Vec<String> = Vec::new();
+    let fable = fable_billed(&profile.fable, now).then(|| "fable".to_string());
+    for family in fable
+        .into_iter()
+        .chain(profile.consented.iter().cloned())
+        .chain(profile.credits_only.iter().flatten().cloned())
+    {
+        if !billed.contains(&family) {
+            billed.push(family);
+        }
+    }
+    billed
+}
+
+/// WHETHER THE PLAN BILLS FABLE TO USAGE CREDITS at `now`
+/// ([`super::profile::FablePlan`]): on credits only, past the date its Fable
+/// limits end — and, failing closed, where that date or the plan did not
+/// read. Included: no; a date still ahead: not yet.
+#[must_use]
+pub fn fable_billed(fable: &super::profile::FablePlan, now: i64) -> bool {
+    use super::profile::FablePlan;
+    match fable {
+        FablePlan::CreditsOnly | FablePlan::LimitsEnd(None) | FablePlan::Unknown => true,
+        FablePlan::LimitsEnd(Some(at)) => now >= *at,
+        FablePlan::Included => false,
+    }
+}
+
+/// Whether `model` — an id (`claude-fable-5-1[1m]`) or Claude Code's alias for
+/// a family (`fable`) — is of a family in `billed` ([`credits_billed`]).
+#[must_use]
+pub fn billed_to_credits(model: &str, billed: &[String]) -> bool {
+    let base = base_id(model);
+    let family = family_version(base).map_or_else(|| base.to_string(), |(family, _)| family);
+    billed.contains(&family)
 }
 
 /// Parse a served catalog cache document.
@@ -484,6 +549,7 @@ pub fn read_evidence(config_dir: &Path, claude_json: &Path) -> Evidence {
         denied,
         disabled_options,
         announcements,
+        credits_billed: Vec::new(),
     }
 }
 
@@ -505,7 +571,8 @@ impl Availability {
 }
 
 /// Is `id` usable for a session that will run Claude Code `cc_version`
-/// (the served catalog, the person's deny lists, the build's own catalog)?
+/// (the served catalog, the person's deny lists, the build's own catalog, a
+/// family billed to usage credits under the key off)?
 #[must_use]
 pub fn availability(
     id: &str,
@@ -516,6 +583,9 @@ pub fn availability(
     let base = base_id(id);
     if ev.denied.iter().any(|d| d == base) {
         return Availability::No("modelAccessCache entitled:false".to_string());
+    }
+    if billed_to_credits(base, &ev.credits_billed) {
+        return Availability::No("billed to usage credits (usage_credits off)".to_string());
     }
     if ev.disabled_options.iter().any(|d| d == base) {
         return Availability::No("additionalModelOptionsCache disabled".to_string());
@@ -2785,6 +2855,61 @@ mod tests {
         assert_eq!(u.default.as_deref(), Some("opus"));
         assert_eq!(u.allowed, Some(vec!["claude-opus-5-5".to_string()]));
         assert_eq!(parse_user_settings("nope"), UserModelSettings::default());
+    }
+
+    /// THE PLANS THAT BILL A MODEL TO USAGE CREDITS ([`credits_billed`]): Fable
+    /// on credits only, or past the date the plan's Fable limits end — and,
+    /// failing closed (the review of 2026-10-19, P4), where that date or the
+    /// plan did not read; a family a stored consent bills with no dialog, or
+    /// that `tengu_calm_seal` bills to credits only (P1) — by id or by alias
+    /// ([`billed_to_credits`]). NEGATIVE CONTROLS: a date still ahead and a
+    /// plan that includes Fable bill none; a consent the profile stores as
+    /// `false` bills none; another family is never billed.
+    #[test]
+    fn a_plan_bills_fable_to_usage_credits_only_where_its_profile_says() {
+        use super::super::profile::{FablePlan, parse};
+        let now = 1_792_000_000;
+        let fable = vec!["fable".to_string()];
+        for billed in [
+            FablePlan::CreditsOnly,
+            FablePlan::LimitsEnd(Some(now)),
+            FablePlan::LimitsEnd(None),
+            FablePlan::Unknown,
+        ] {
+            assert!(fable_billed(&billed, now), "{billed:?}");
+        }
+        for none in [FablePlan::LimitsEnd(Some(now + 1)), FablePlan::Included] {
+            assert!(!fable_billed(&none, now), "{none:?}");
+        }
+        // A Max plan whose flags include Fable, with consents stored.
+        let profile = |extra: &str| {
+            parse(
+                format!(
+                    r#"{{"oauthAccount":{{"organizationType":"claude_max"}},
+                    "cachedGrowthBookFeatures":{{"tengu_saffron_credits_only_tiers":[],
+                        "tengu_saffron_lattice":{{"enabled":false}}{extra}}}"#
+                )
+                .as_bytes(),
+            )
+            .expect("a profile")
+        };
+        let included = profile("}");
+        assert_eq!(included.fable, FablePlan::Included);
+        assert!(credits_billed(&included, now).is_empty());
+        let consented = profile(
+            r#"},"fableOverageConsentV2":{"acct:0b6c":true},
+            "usageCreditsOnlyModelConsent":{"Nimbus":{"org-1":true},"Opus":{"org-1":false}}"#,
+        );
+        assert_eq!(credits_billed(&consented, now), ["fable", "nimbus"]);
+        let sealed = profile(r#","tengu_calm_seal":["Nimbus","Lyra"]}"#);
+        assert_eq!(credits_billed(&sealed, now), ["nimbus", "lyra"]);
+        for m in ["fable", "claude-fable-5-1", "claude-fable-5-1[1m]"] {
+            assert!(billed_to_credits(m, &fable), "{m}");
+            assert!(!billed_to_credits(m, &[]), "{m}");
+        }
+        for m in ["opus", "claude-opus-5-5", "sonnet"] {
+            assert!(!billed_to_credits(m, &fable), "{m}");
+        }
     }
 }
 

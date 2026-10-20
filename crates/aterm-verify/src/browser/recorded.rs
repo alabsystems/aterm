@@ -10,9 +10,10 @@
 //!
 //! A recording is a directory: `recording.json` (the module, the browser,
 //! the WebGL2 adapter, and each frame's name, size and the SHA-256 of its
-//! RGBA8 bytes) and one RGBA8 PNG per frame. Every run writes the frames it
-//! saw to `<work>/gpu-frames/` in that layout ([`write`]), so a run's frames
-//! can be looked at, and the recording was made by copying one.
+//! RGBA8 bytes) and one RGBA8 PNG per frame. Every session writes the
+//! frames it saw to `<work>/<backend>/gpu-frames/` in that layout
+//! ([`write`]), so a run's frames can be looked at, and the recording was
+//! made by copying one (then `<work>/gpu-frames/`: the lane ran Metal alone).
 //!
 //! [`judge`]: on the recording's adapter each frame must be byte-identical
 //! to its recorded twin; on another adapter, within the CPU parity tolerance

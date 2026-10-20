@@ -148,6 +148,33 @@ pub struct VendorSpec {
     /// per row. Where each was measured is the table in
     /// `docs/DESIGN-vendor-self-update-2026-09-19.md`.
     pub self_update_verbs: &'static [&'static str],
+    /// The vendor flags `--yolo` on the managed name expands to ([`crate::yolo`]) — the
+    /// program's own "every approval and sandbox off" spelling, measured from its
+    /// `--help` on the version at this row's floor or later. Each must pass
+    /// [`crate::yolo::is_shell_safe_flag`] (it is embedded quoted in the twin's block).
+    /// EMPTY: the program's twin carries no `--yolo` block — an explicit decision per
+    /// row, like [`Self::self_update_verbs`].
+    pub yolo_flags: &'static [&'static str],
+    /// The tokens that already decide this launch's permission posture, so the
+    /// default yolo injection ([`crate::yolo`]) leaves the argv as typed: the
+    /// row's own [`Self::yolo_flags`], its permission-mode and sandbox words, and
+    /// their `--word=` spellings (an entry ending in `=`). Each must pass
+    /// [`crate::yolo::is_shell_safe_marker`]. The renderer refuses a `--yolo`
+    /// block with no markers: a default that cannot tell a decided launch from an
+    /// undecided one would silently upgrade the harness's own resume lines.
+    pub yolo_markers: &'static [&'static str],
+    /// First words (subcommands) the default injection goes AFTER rather than in
+    /// front of, because the program takes its safety switches only behind them
+    /// (muse's `exec` and `resume`, measured 1.4.11, 2026-10-19); an explicit
+    /// `--yolo` typed ahead of one expands there too. Each must pass
+    /// [`crate::selfupdate::is_shell_safe_verb`].
+    pub yolo_after: &'static [&'static str],
+    /// First words (subcommands) that are not sessions and take no safety
+    /// switches, so the default injection leaves them as typed (muse's
+    /// `skills`, `auth`, …: switches in front are `invalid TUI options`,
+    /// measured 1.4.11, 2026-10-19). Each must pass
+    /// [`crate::selfupdate::is_shell_safe_verb`].
+    pub yolo_skip: &'static [&'static str],
     /// Whether aterm's live upgrade moves a running session of this program onto a build a
     /// pass lands, so a pass that moves the program's `agents/` twin wakes the window's host
     /// ([`crate::activation_notice`]). `false` for a program no harness supervises: no
@@ -342,6 +369,19 @@ pub const VENDORS: &[VendorSpec] = &[
             }),
         }),
         self_update_verbs: &["update", "upgrade", "install"],
+        // `--yolo` itself is an unknown option to claude (measured 2.1.304,
+        // 2026-10-19).
+        yolo_flags: &["--dangerously-skip-permissions"],
+        yolo_markers: &[
+            "--dangerously-skip-permissions",
+            "--allow-dangerously-skip-permissions",
+            "--permission-mode",
+            "--permission-mode=",
+        ],
+        // Global options ride in front of every subcommand measured (mcp, doctor,
+        // 2.1.304).
+        yolo_after: &[],
+        yolo_skip: &[],
         live_upgrade: true,
         revision_versions: false,
         floor: floor(2, 1, 281),
@@ -395,6 +435,22 @@ pub const VENDORS: &[VendorSpec] = &[
             }),
         }),
         self_update_verbs: &["update"],
+        // codex 0.163 parses `--yolo` itself (measured 2026-10-19); the expansion is
+        // still spelled in full so the echo names the posture exactly.
+        yolo_flags: &["--dangerously-bypass-approvals-and-sandbox"],
+        // The bypass flag repeated is a clap refusal (exit 2, measured 0.163), so
+        // its presence must suppress any second copy, by the flag or by default.
+        yolo_markers: &[
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--sandbox",
+            "--sandbox=",
+            "-s",
+            "--ask-for-approval",
+            "--ask-for-approval=",
+            "-a",
+        ],
+        yolo_after: &[],
+        yolo_skip: &[],
         live_upgrade: true,
         revision_versions: false,
         floor: floor(0, 156, 1),
@@ -433,7 +489,23 @@ pub const VENDORS: &[VendorSpec] = &[
         // Nothing measured warms it signed out (`agy models` exits 1).
         warm: None,
         self_update_verbs: &["update", "install"],
-        live_upgrade: false,
+        // `--yolo` is not a defined flag to agy (measured 1.4.2, 2026-10-19); its
+        // sandbox is opt-in (`--sandbox`), off by default, so nothing else is owed.
+        yolo_flags: &["--dangerously-skip-permissions"],
+        // `--mode plan|accept-edits` and an explicit `--sandbox` are a decided
+        // posture the default never overrides.
+        yolo_markers: &[
+            "--dangerously-skip-permissions",
+            "--mode",
+            "--mode=",
+            "--sandbox",
+        ],
+        yolo_after: &[],
+        yolo_skip: &[],
+        // The harness's live upgrade moves a supervised agy onto a build a pass lands, in its
+        // quiet flow (aterm-agent `upgrade_agy_live`, 2026-10-18): a landing that moves
+        // `agents/agy` wakes the window's host for its agy sessions alone (its own marker).
+        live_upgrade: true,
         revision_versions: false,
         floor: floor(1, 3, 6),
         legacy_ceiling: NEVER_INDEX_PINNED,
@@ -471,7 +543,51 @@ pub const VENDORS: &[VendorSpec] = &[
         warm: None,
         // No updater, so no verb to hand over (`muse update` is read as a prompt).
         self_update_verbs: &[],
-        live_upgrade: false,
+        // muse's `--help` defines its native `--yolo` (measured 1.4.11, 2026-10-19)
+        // as exactly these four switches, each its own flag; spelled out so the echo
+        // names the posture, as on every other row.
+        yolo_flags: &[
+            "--disable-approval",
+            "--disable-sandbox",
+            "--trust-workspace",
+            "--disable-request-user-input",
+        ],
+        yolo_markers: &[
+            "--disable-approval",
+            "--disable-sandbox",
+            "--trust-workspace",
+            "--disable-request-user-input",
+            "--approval-mode",
+            "--approval-mode=",
+            "--permission-profile",
+            "--permission-profile=",
+        ],
+        // Top-level switches AHEAD of a subcommand are `invalid TUI options`
+        // (measured 1.4.11): `exec` and `resume` take them behind the word, the
+        // rest take none at all.
+        yolo_after: &["exec", "resume"],
+        yolo_skip: &[
+            "config",
+            "export",
+            "trace",
+            "model-profile",
+            "skills",
+            "voice",
+            "plugins",
+            "sandbox",
+            "schema",
+            "serve",
+            "session-message",
+            "mcp",
+            "auth",
+            "login",
+            "logout",
+            "init",
+        ],
+        // The harness's live upgrade moves a supervised Muse Code onto a build a pass lands,
+        // in its quiet flow (aterm-agent `upgrade_muse_live`, 2026-10-18): a landing that
+        // moves `agents/muse` wakes the window's host.
+        live_upgrade: true,
         revision_versions: true,
         floor: revision_floor(1, 4, 9, 6297, Some(1)),
         legacy_ceiling: NEVER_INDEX_PINNED,

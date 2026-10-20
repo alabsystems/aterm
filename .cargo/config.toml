@@ -1,0 +1,89 @@
+# COMPILE WITH TRUST. rust-toolchain.toml pins the Trust toolchain: the atpkg
+# store's `targo` and the `trustc` beside it (`aterm pkg which targo` names the
+# resolution, `aterm pkg doctor` audits it), or rustup's `trust` toolchain,
+# which atpkg keeps pointing at the store (crates/atpkg/src/seam.rs). That
+# compiler verifies what it compiles, fail-closed, so targo makes the lane
+# explicit: `targo --unverified build|check|test|run` switches in-compilation
+# verification off for every unit (it appends `-Ztrust-verify=off` to each
+# rustc and rustdoc line, build scripts and proc macros included) and makes no
+# proof claim; `targo trust <cmd>` is the verified lane.
+#
+# THIS FILE CARRIES NO `-Ztrust-*` FLAG. Targo refuses a project-config
+# `-Ztrust-verify=off` under `targo trust`: off-switches are per-invocation,
+# never in a project file (Trust's docs/TOOLCHAIN_POSTURE.md §4.2). So an
+# invocation that names no lane (rustup's plain `cargo`, an editor's flycheck
+# running `cargo check`) compiles at the compiler's default strict policy and
+# stops, fail-closed, on the first unit it cannot prove.
+#
+# A COMMAND THAT CANNOT SAY `--unverified` names the lane with one cfg-scoped
+# `--config`, which appends the switch to this table for that invocation only:
+#   cargo build --config "target.'cfg(trust_verify)'.rustflags=[\"-Ztrust-verify=off\"]"
+# A stock toolchain prints no `trust_verify` cfg, so the line is inert there.
+# tools/install.sh's rustup lane and the nested test builds whose driver may be
+# a plain `cargo` carry it; every other build here is `targo --unverified`.
+# Editors: .vscode/settings.json points rust-analyzer's flycheck and build
+# scripts at `targo --unverified check`.
+#
+# WHERE VERIFICATION RUNS: in the advisory lane, `targo --unverified ship trust
+# run` (crates/aterm-release/src/trust_lane.rs), which runs `targo trust check
+# -p <lib> --lib --allow-l0-gaps` library by library against the up-only floor
+# in crates/aterm-release/trust/floors.tsv. `targo
+# trust` scopes verification PER UNIT itself: it verifies the one library named
+# and switches every dependency and build-script unit off, naming each in the
+# report's trust base as a Conditional assumption. `targo --unverified ship
+# trust run -p <crate>` checks a library on demand; no landing check and no
+# release runs it. The release pipeline separately requires its built bundle's
+# `verify release` record; this explicit whole-tree floor run is not a release
+# step.
+#
+# NOTHING HERE CHANGES WHAT COMPILES. A crate's `clean { … }` proof islands
+# are switched on by its own build script, which asks the compiler whether it
+# is Trust (crates/aterm-log/clean_islands.rs), so every lane, RUSTFLAGS or
+# not, compiles the same code. This table carries speed only: `-Zthreads=4`,
+# the parallel front end, takes type and borrow checking off one core at the
+# tail of the test compile (aterm-gui's lib test, 55 s -> 37 s); 8 threads
+# bought no more wall time for more CPU and memory. `cfg(trust_verify)`
+# matches exactly when the resolved compiler prints `trust_verify` in
+# `rustc --print cfg`, which a Trust rustc does and an upstream rustc never
+# does, so the flag never reaches an upstream lane (the release's
+# x86_64-apple-darwin compat slice, the Windows cfg-validation build below).
+# RUSTFLAGS and `targo trust` replace the table and tippy-driver takes none of
+# it; each loses only the speed.
+[target.'cfg(trust_verify)']
+rustflags = ["-Zthreads=4"]
+
+# STOCK EXCEPTION: Trust has no x86_64-pc-windows-gnu std, so the Windows cfg
+# check is `cargo +stable build --target x86_64-pc-windows-gnu`.
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"
+
+# THE C FLOOR IS THE RUST FLOOR. cc-rs passes no macOS minimum, so clang would
+# target the SDK's version, and a C symbol newer than macOS 11 in any C
+# dependency would become a hard import that stops aterm launching on older
+# systems. The values are rustc's defaults for each slice of the universal app;
+# CFLAGS_<target> reaches only cc-rs builds, so Rust units keep their
+# fingerprints. `ship release` scrubs the caller's C environment from every
+# step, which leaves this table in force.
+[env]
+CFLAGS_aarch64_apple_darwin = "-mmacosx-version-min=11.0"
+CFLAGS_x86_64_apple_darwin = "-mmacosx-version-min=10.12"
+
+# Tools that always run from source. targo requires a named lane:
+# `targo --unverified ship|verify|forge|winsign ...`. The dev tools build under
+# `[profile.gate]` (release semantics without LTO): fast enough to run, quick
+# to rebuild.
+[alias]
+# The release cutter (crates/aterm-release). No `-q`, so a failing run is never silent.
+ship = "run --profile gate -p aterm-release --"
+# Every check, alone or in any combination, and the perf lanes
+# (crates/aterm-verify): `targo --unverified verify --help`. Dev profile, the
+# caller's target dir.
+verify = "run -q -p aterm-verify --"
+# The real-Claude lab (crates/aterm-lab): `targo --unverified lab help`. Dev
+# profile, the caller's target dir; the aterm it tests is the one beside it.
+lab = "run -q -p aterm-lab --"
+# Third-party surface survey and ratchet (crates/aterm-forge).
+forge = "run --profile gate -p aterm-forge --"
+# Authenticode signing of the Windows exe (crates/aterm-winsign).
+winsign = "run -q --profile gate -p aterm-winsign --"

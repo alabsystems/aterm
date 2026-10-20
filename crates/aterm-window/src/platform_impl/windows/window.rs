@@ -6,7 +6,7 @@
 
 // Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
 // Adapt pointer handles and preserve thread-executor dispatch with SendHandle; drop the
-// rwh_04 and rwh_05 handle methods.
+// rwh_04 and rwh_05 handle methods; build the FlashWindowEx request apart (`attention_flash`).
 
 #![cfg(windows_platform)]
 
@@ -934,21 +934,7 @@ impl Window {
         }
 
         self.thread_executor.execute_in_thread(move || unsafe {
-            let window = window.get();
-            let (flags, count) = request_type
-                .map(|ty| match ty {
-                    UserAttentionType::Critical => (FLASHW_ALL | FLASHW_TIMERNOFG, u32::MAX),
-                    UserAttentionType::Informational => (FLASHW_TRAY | FLASHW_TIMERNOFG, 0),
-                })
-                .unwrap_or((FLASHW_STOP, 0));
-
-            let flash_info = FLASHWINFO {
-                cbSize: mem::size_of::<FLASHWINFO>() as u32,
-                hwnd: window,
-                dwFlags: flags,
-                uCount: count,
-                dwTimeout: 0,
-            };
+            let flash_info = attention_flash(window.get(), request_type);
             FlashWindowEx(&flash_info);
         });
     }
@@ -1199,6 +1185,7 @@ impl InitData<'_> {
             _file_drop_handler: file_drop_handler,
             userdata_removed: Cell::new(false),
             recurse_depth: Cell::new(0),
+            minimized: Cell::new(false),
         }
     }
 
@@ -1567,4 +1554,52 @@ unsafe fn force_window_active(handle: HWND) {
     unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), mem::size_of::<INPUT>() as i32) };
 
     unsafe { SetForegroundWindow(handle) };
+}
+
+/// LOCAL PATCH (aterm): the `FlashWindowEx` request `request_user_attention` makes for `window`,
+/// apart so its flags are testable without a window. Informational (a bell) flashes the taskbar
+/// button until the window comes forward; Critical flashes the caption too, until it does; `None`
+/// stops a flash.
+fn attention_flash(window: HWND, request_type: Option<UserAttentionType>) -> FLASHWINFO {
+    let (flags, count) = request_type
+        .map(|ty| match ty {
+            UserAttentionType::Critical => (FLASHW_ALL | FLASHW_TIMERNOFG, u32::MAX),
+            UserAttentionType::Informational => (FLASHW_TRAY | FLASHW_TIMERNOFG, 0),
+        })
+        .unwrap_or((FLASHW_STOP, 0));
+    FLASHWINFO {
+        cbSize: mem::size_of::<FLASHWINFO>() as u32,
+        hwnd: window,
+        dwFlags: flags,
+        uCount: count,
+        dwTimeout: 0,
+    }
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use super::{attention_flash, UserAttentionType};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FLASHW_ALL, FLASHW_STOP, FLASHW_TIMERNOFG, FLASHW_TRAY,
+    };
+
+    /// A bell's request flashes the taskbar button alone, until the window comes forward
+    /// (`FLASHW_TIMERNOFG` with no count); a critical one flashes the caption too; none stops.
+    /// The structure is `winuser.h`'s `FLASHWINFO` (32 bytes on a 64-bit target), sized in
+    /// its own `cbSize`.
+    #[test]
+    fn a_bell_flashes_the_taskbar_button_until_the_window_comes_forward() {
+        let hwnd = 0x1234 as _;
+        let bell = attention_flash(hwnd, Some(UserAttentionType::Informational));
+        assert_eq!(
+            (bell.dwFlags, bell.uCount, bell.dwTimeout),
+            (FLASHW_TRAY | FLASHW_TIMERNOFG, 0, 0)
+        );
+        assert_eq!(bell.hwnd, hwnd);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(bell.cbSize, 32);
+        let critical = attention_flash(hwnd, Some(UserAttentionType::Critical));
+        assert_eq!((critical.dwFlags, critical.uCount), (FLASHW_ALL | FLASHW_TIMERNOFG, u32::MAX));
+        assert_eq!(attention_flash(hwnd, None).dwFlags, FLASHW_STOP);
+    }
 }

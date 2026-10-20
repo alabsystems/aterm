@@ -265,9 +265,9 @@ pub fn redact(text: &str) -> (String, usize) {
     (out, count)
 }
 
-/// The markers aterm's own primer asks an agent to end its report with: a reviewer that
-/// reads the primer (Codex reads its global `AGENTS.md`) may end its answer with one, and a
-/// review must never end the asking agent's turn.
+/// Legacy completion markers an older primer may have taught a reviewer to
+/// emit. Strip them from review text so it cannot end the asking agent's turn.
+/// Current primers ask for ordinary-language reports without these markers.
 pub const MARKERS: &[&str] = &["ATERM-TASK-DONE"];
 
 /// `text` without the lines that are only a [`MARKERS`] word.

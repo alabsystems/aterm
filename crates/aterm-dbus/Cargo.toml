@@ -8,6 +8,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "First-party D-Bus for aterm: the wire format, SASL EXTERNAL and a blocking unix-socket client, written against the specification and held to bytes recorded from zbus/zvariant"
+# The integration files are modules of `tests/dbus_suite.rs`, one test binary.
+# With autotests off a `tests/*.rs` file listed nowhere never compiles.
+autotests = false
 
 [dependencies]
 # hex for the SASL line and address escapes.
@@ -30,3 +33,7 @@ aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "dbus_suite"
+path = "tests/dbus_suite.rs"

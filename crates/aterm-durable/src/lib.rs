@@ -51,6 +51,8 @@
 //!
 //! ## Test and debug builds
 //!
+//! (And any build with the `test-support` feature, which a dependent's tests turn
+//! on from its dev-dependencies, so its optimized test targets build.)
 //! [`seam::Recording`] records which of the two each operation on this thread asked
 //! for, so a test asserts the tier a site chose with no timing. It records and changes
 //! nothing else: [`ordered`] issues the real `F_BARRIERFSYNC` in every build, test,
@@ -77,6 +79,103 @@ pub enum Flush {
 }
 
 impl Flush {
+    /// Canonical 1-byte wire tag (`1` = `Durable`, `2` = `Ordered`).
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::Durable => 1,
+            Self::Ordered => 2,
+        }
+    }
+
+    /// Decode a 1-byte wire tag (`1` = `Durable`, `2` = `Ordered`).
+    #[must_use]
+    pub const fn from_u8(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Durable),
+            2 => Some(Self::Ordered),
+            _ => None,
+        }
+    }
+
+    /// Whether this flush is [`Flush::Durable`].
+    #[must_use]
+    pub const fn is_durable(self) -> bool {
+        matches!(self, Self::Durable)
+    }
+
+    /// Whether this flush is [`Flush::Ordered`].
+    #[must_use]
+    pub const fn is_ordered(self) -> bool {
+        matches!(self, Self::Ordered)
+    }
+
+    /// [`Flush::Ordered`] when `written_dev == later_dev`, else [`Flush::Durable`].
+    #[must_use]
+    pub const fn for_devices(written_dev: u64, later_dev: u64) -> Self {
+        if written_dev == later_dev {
+            Self::Ordered
+        } else {
+            Self::Durable
+        }
+    }
+
+    /// Encode a 17-byte device-pair decision record `(flush_tag: u8, written_dev: u64, later_dev: u64)`
+    /// in little-endian byte order using bitwise shifts.
+    #[must_use]
+    pub const fn encode_device_pair(written_dev: u64, later_dev: u64) -> [u8; 17] {
+        let tag = Self::for_devices(written_dev, later_dev).as_u8();
+        [
+            tag,
+            (written_dev & 0xFF) as u8,
+            ((written_dev >> 8) & 0xFF) as u8,
+            ((written_dev >> 16) & 0xFF) as u8,
+            ((written_dev >> 24) & 0xFF) as u8,
+            ((written_dev >> 32) & 0xFF) as u8,
+            ((written_dev >> 40) & 0xFF) as u8,
+            ((written_dev >> 48) & 0xFF) as u8,
+            ((written_dev >> 56) & 0xFF) as u8,
+            (later_dev & 0xFF) as u8,
+            ((later_dev >> 8) & 0xFF) as u8,
+            ((later_dev >> 16) & 0xFF) as u8,
+            ((later_dev >> 24) & 0xFF) as u8,
+            ((later_dev >> 32) & 0xFF) as u8,
+            ((later_dev >> 40) & 0xFF) as u8,
+            ((later_dev >> 48) & 0xFF) as u8,
+            ((later_dev >> 56) & 0xFF) as u8,
+        ]
+    }
+
+    /// Decode a 17-byte device-pair decision record `(Flush, written_dev, later_dev)`,
+    /// returning `None` if the tag is invalid or inconsistent with `for_devices(written_dev, later_dev)`.
+    #[must_use]
+    pub const fn decode_device_pair(bytes: &[u8; 17]) -> Option<(Self, u64, u64)> {
+        let Some(flush) = Self::from_u8(bytes[0]) else {
+            return None;
+        };
+        let written_dev = (bytes[1] as u64)
+            | ((bytes[2] as u64) << 8)
+            | ((bytes[3] as u64) << 16)
+            | ((bytes[4] as u64) << 24)
+            | ((bytes[5] as u64) << 32)
+            | ((bytes[6] as u64) << 40)
+            | ((bytes[7] as u64) << 48)
+            | ((bytes[8] as u64) << 56);
+        let later_dev = (bytes[9] as u64)
+            | ((bytes[10] as u64) << 8)
+            | ((bytes[11] as u64) << 16)
+            | ((bytes[12] as u64) << 24)
+            | ((bytes[13] as u64) << 32)
+            | ((bytes[14] as u64) << 40)
+            | ((bytes[15] as u64) << 48)
+            | ((bytes[16] as u64) << 56);
+        let expected = Self::for_devices(written_dev, later_dev);
+        if flush.as_u8() != expected.as_u8() {
+            return None;
+        }
+        Some((flush, written_dev, later_dev))
+    }
+
     /// Finish a write to `file` with this flush.
     ///
     /// # Errors
@@ -93,7 +192,10 @@ impl Flush {
     /// # Errors
     /// The directory could not be opened, or the flush's own error.
     pub fn dir(self, dir: &Path) -> io::Result<()> {
-        self.file(&File::open(dir)?)
+        match File::open(dir) {
+            Ok(f) => self.file(&f),
+            Err(e) => Err(e),
+        }
     }
 
     /// [`Flush::Ordered`] when `written` and `later` are on one device, else
@@ -117,7 +219,7 @@ impl Flush {
 /// # Errors
 /// The flush's own error.
 pub fn durable(file: &File) -> io::Result<()> {
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
     seam::note(Flush::Durable);
     primitive::full(file)
 }
@@ -130,7 +232,7 @@ pub fn durable(file: &File) -> io::Result<()> {
 /// # Errors
 /// The flush's own error.
 pub fn durable_data(file: &File) -> io::Result<()> {
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
     seam::note(Flush::Durable);
     primitive::full_data(file)
 }
@@ -144,7 +246,7 @@ pub fn durable_data(file: &File) -> io::Result<()> {
 /// # Errors
 /// The flush's own error (the full flush's, when the barrier was refused).
 pub fn ordered(file: &File) -> io::Result<()> {
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
     seam::note(Flush::Ordered);
     primitive::barrier(file)
 }
@@ -155,7 +257,10 @@ pub fn ordered(file: &File) -> io::Result<()> {
 /// # Errors
 /// The directory could not be opened, or the flush's own error.
 pub fn durable_dir(dir: &Path) -> io::Result<()> {
-    durable(&File::open(dir)?)
+    match File::open(dir) {
+        Ok(f) => durable(&f),
+        Err(e) => Err(e),
+    }
 }
 
 /// [`ordered`] for the directory `dir`: a create, rename or unlink in it reaches the
@@ -164,7 +269,10 @@ pub fn durable_dir(dir: &Path) -> io::Result<()> {
 /// # Errors
 /// The directory could not be opened, or the flush's own error.
 pub fn ordered_dir(dir: &Path) -> io::Result<()> {
-    ordered(&File::open(dir)?)
+    match File::open(dir) {
+        Ok(f) => ordered(&f),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(unix)]
@@ -223,7 +331,10 @@ pub mod primitive {
     pub fn barrier(file: &File) -> io::Result<()> {
         #[cfg(target_vendor = "apple")]
         {
-            barrier_or_full(file, astream_sys::barrier_sync)
+            match astream_sys::barrier_sync(file) {
+                Ok(()) => Ok(()),
+                Err(_refused) => full(file),
+            }
         }
         #[cfg(not(target_vendor = "apple"))]
         {
@@ -234,9 +345,8 @@ pub mod primitive {
     /// `barrier`, answered by the full flush when it fails. astream-sys's contract: a
     /// filesystem or device that cannot honour the barrier answers an error, which
     /// promises no ordering. The full flush orders by persisting, and it reports a
-    /// real I/O error (`EIO`, `ENOSPC`) the barrier hit just as well. Apple's
-    /// alone outside the tests: elsewhere `barrier` is the full flush.
-    #[cfg(any(target_vendor = "apple", test))]
+    /// real I/O error (`EIO`, `ENOSPC`) the barrier hit just as well.
+    #[cfg(test)]
     pub(crate) fn barrier_or_full(
         file: &File,
         barrier: impl FnOnce(&File) -> io::Result<()>,
@@ -275,11 +385,12 @@ pub mod primitive {
     }
 }
 
-/// THE COUNTING SEAM (test and debug builds): which flush each operation asked for,
+/// THE COUNTING SEAM (test and debug builds, and the `test-support` feature): which
+/// flush each operation asked for,
 /// recorded per thread while a [`Recording`] lives, so a test asserts the tier a site
 /// chose without timing anything. A thread with no recording pays one thread-local
-/// read per flush; a release build compiles none of this.
-#[cfg(any(test, debug_assertions))]
+/// read per flush; a release build without `test-support` compiles none of this.
+#[cfg(any(test, debug_assertions, feature = "test-support"))]
 pub mod seam {
     use super::Flush;
     use std::cell::RefCell;
@@ -318,11 +429,9 @@ pub mod seam {
         /// an empty log behind them.
         #[must_use]
         pub fn take(&self) -> Vec<Flush> {
-            LOG.with(|log| {
-                log.borrow_mut()
-                    .as_mut()
-                    .map(std::mem::take)
-                    .unwrap_or_default()
+            LOG.with(|log| match log.borrow_mut().as_mut() {
+                Some(v) => std::mem::take(v),
+                None => Vec::new(),
             })
         }
     }
@@ -369,6 +478,27 @@ mod tests {
             .prefix("aterm-durable-")
             .tempdir()
             .expect("a scratch directory")
+    }
+
+    #[test]
+    fn flush_device_pair_codec_round_trips_and_rejects_mismatched_tags() {
+        let same = Flush::encode_device_pair(42, 42);
+        assert_eq!(
+            Flush::decode_device_pair(&same),
+            Some((Flush::Ordered, 42, 42))
+        );
+        assert!(Flush::Ordered.is_ordered() && !Flush::Ordered.is_durable());
+        let diff = Flush::encode_device_pair(42, 99);
+        assert_eq!(
+            Flush::decode_device_pair(&diff),
+            Some((Flush::Durable, 42, 99))
+        );
+        assert!(Flush::Durable.is_durable() && !Flush::Durable.is_ordered());
+        let mut bad = same;
+        bad[0] = Flush::Durable.as_u8();
+        assert_eq!(Flush::decode_device_pair(&bad), None);
+        bad[0] = 0;
+        assert_eq!(Flush::decode_device_pair(&bad), None);
     }
 
     #[test]
@@ -437,7 +567,10 @@ mod tests {
         std::fs::write(&path, b"x").unwrap();
         let recording = seam::Recording::start();
         std::thread::spawn(move || {
-            durable(&std::fs::File::open(&path).unwrap()).unwrap();
+            // Open for writing, as a writer flushes: Windows's `FlushFileBuffers`
+            // refuses a read-only handle (access denied), where `fsync(2)` takes one.
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            durable(&file).unwrap();
         })
         .join()
         .unwrap();

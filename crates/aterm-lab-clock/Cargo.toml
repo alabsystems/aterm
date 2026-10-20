@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-lab-clock"
+version.workspace = true
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "The real-Claude lab's sleep clock: a macOS library the lab loads with DYLD_INSERT_LIBRARIES into its own private instance and its Claude Code, shifting their wall clocks (and the clocks macOS counts a sleep in) by an offset the lab steps, so `lab sleep` is what a sleep of the Mac looks like from inside each process; empty on other systems"
+
+# Dev-only: part of the real-Claude lab (crates/aterm-lab), a check runner, so
+# it is not in the root's default-members. Never linked into anything: the lab
+# builds it (`targo --unverified build -p aterm-lab-clock --lib`) when a lab
+# comes up with LAB_CLOCK=1 and copies the library into that lab's run
+# directory. A cdylib alone, never an rlib: its interposing table and its
+# constructor must not reach a binary that links it.
+[lib]
+crate-type = ["cdylib"]
+
+# The live test's child (tests/live.rs): reads every clock on a line of stdin.
+[[bin]]
+name = "lab-clock-probe"
+path = "src/bin/lab-clock-probe.rs"
+
+[dev-dependencies]
+# The one spawn seam: the probe child is started by it.
+aterm-uds = { workspace = true }
+
+[lints]
+workspace = true

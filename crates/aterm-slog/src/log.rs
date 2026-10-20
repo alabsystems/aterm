@@ -29,7 +29,9 @@
 //! - **Closing.** Closing a node first closes its open descendants,
 //!   innermost first, with `out=gone`. A node closes exactly once. A new
 //!   turn closes an unclosed turn under the same run with `out=superseded`.
-//!   Every close carries its node's rollup.
+//!   Every close carries its node's rollup, and a turn's close restates its
+//!   open's `ledger=` (plan 5F-4a), so a close outliving its open still
+//!   names its exchange.
 //! - **Ids.** `r<n>`, `t<n>` and `p<n>` count per level and are never
 //!   reused while the session lives: a successor continues the
 //!   predecessor's counters ([`Log::after_handoff`], [`IdCounters`]).
@@ -2007,6 +2009,7 @@ impl Log {
         for (k, v) in caller.iter() {
             let _ = f.set(*k, v.clone());
         }
+        let restated = self.restated_ledger(node, &f);
         let mut rec = Rec {
             seq: 0,
             t: at.wall_ms,
@@ -2019,6 +2022,15 @@ impl Log {
             by,
             f,
         };
+        if let Some(ledger) = restated {
+            let mut grown = rec.f.clone();
+            if grown.set(Key::Ledger, Val::U(ledger)).is_ok() {
+                let before = std::mem::replace(&mut rec.f, grown);
+                if fits(&rec).is_err() {
+                    rec.f = before;
+                }
+            }
+        }
         for (k, v) in roll.fields() {
             let mut grown = rec.f.clone();
             if grown.set(k, v).is_err() {
@@ -2044,6 +2056,25 @@ impl Log {
             }
         }
         self.push(rec)
+    }
+
+    /// A TURN'S CLOSE RESTATES ITS `ledger=` (plan 5F-4a, ruling T12): the
+    /// `ledger=` of turn `node`'s open record, which the ring still holds
+    /// (an open node's open is pinned, and its close is not appended yet),
+    /// unless the close's own fields `f` already name one. A reader holding
+    /// the close alone — its open evicted once the turn closed — still joins
+    /// the turn to the exchange that opened it (`drive ledger --source=log`),
+    /// with no clock. Nothing for another level, or a turn opened without
+    /// one. `by=` is not restated: the join reads it from its own rows.
+    fn restated_ledger(&self, node: Node, f: &Fields) -> Option<u64> {
+        if node.lvl != Lvl::Turn || f.get(Key::Ledger).is_some() {
+            return None;
+        }
+        self.ring
+            .iter()
+            .rev()
+            .find(|e| e.rec.node == node && e.rec.op == Op::Open)
+            .and_then(|e| e.rec.f.get_u(Key::Ledger))
     }
 
     /// Append a record that fits: assign its seq, apply it to the fold,

@@ -1452,13 +1452,33 @@ const MALFORMED_GNU_LONG_NAMES: &str = "dfcb97d991201c19";
 const PAX_SIZE_RECORDS: &str = "c81421544fe5ae0b";
 const PAX_GLOBAL_HEADERS: &str = "921b7363448ceb57";
 const DUPLICATE_AND_RECOVERED_PAX_RECORDS: &str = "709decb1b388bf9a";
-const MAGIC_AND_VERSION_COMBINATIONS: &str = "8eefe78cdff18f7c";
+// The four corpora below carry non-UTF-8 path bytes, and pin a second digest on Windows:
+// there `tarread` refuses such a path (`path is not valid unicode`) where unix reads the
+// bytes as they are, since a Windows path has no spelling for them. Every other answer is
+// the unix one: under a lossless Windows arm all four matched their unix pins (2026-10-17).
+const MAGIC_AND_VERSION_COMBINATIONS: &str = if cfg!(windows) {
+    "bee39615eac71f98"
+} else {
+    "8eefe78cdff18f7c"
+};
 const MAGICLESS_EXTENSION_HEADERS: &str = "932ba0fd24080695";
 const DUPLICATE_EXTENSION_HEADERS: &str = "f5ba49d2eebd7a02";
 const BASE256_NUMERIC_FIELDS: &str = "6cabebd3910a7260";
-const CHECKSUM_REPAIRED_HEADER_MUTATIONS: &str = "2f62c6b7a9a2b5e6";
-const REPAIRED_MUTATIONS_OF_REAL_ARCHIVES: &str = "5a67be6fd371e14a";
-const BYTE_MUTATIONS: &str = "d8d32811cf9fff73";
+const CHECKSUM_REPAIRED_HEADER_MUTATIONS: &str = if cfg!(windows) {
+    "851ffe23e6ca6ed2"
+} else {
+    "2f62c6b7a9a2b5e6"
+};
+const REPAIRED_MUTATIONS_OF_REAL_ARCHIVES: &str = if cfg!(windows) {
+    "255d8b6a7a638e0f"
+} else {
+    "5a67be6fd371e14a"
+};
+const BYTE_MUTATIONS: &str = if cfg!(windows) {
+    "2636f847ee73c9c3"
+} else {
+    "d8d32811cf9fff73"
+};
 const BLOCK_MUTATIONS: &str = "3778168542b363d6";
 const RANDOM_BYTES: &str = "0467702b21fd1c25";
 const SPARSE: &str = "beedb3b4d1868b3b";

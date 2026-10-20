@@ -270,11 +270,15 @@ pub(crate) struct GlTailIn<'a> {
     pub(crate) clear: crate::device_layer::ClearColor4,
     pub(crate) text_blend: u32,
     pub(crate) cursor_opaque: bool,
+    /// The pass-economy ablation (`FramePlanCtx::ablation`).
+    pub(crate) ablation: crate::renderer::UnormAblation,
 }
 
-/// What the tail drew: the pass count, pass 0's load and the scissor.
+/// What the tail drew: the pass count, pass 0's load, the scissor and the
+/// CPU time staging the instance streams.
 pub(crate) struct GlTailOut {
     pub(crate) passes: usize,
+    pub(crate) stage_ns: u64,
     pub(crate) load0: crate::device_layer::FrameLoad,
     pub(crate) scissor: Option<(u32, u32, u32, u32)>,
 }
@@ -292,6 +296,7 @@ pub(crate) fn encode_tail(
 ) -> Result<GlTailOut, String> {
     let (w, h) = t.dims;
     // 1. Stage the streams: `Some` count iff the stream uploaded.
+    let stage_started = aterm_time::Instant::now();
     let mut counts: [Option<u32>; STREAM_COUNT] = [None; STREAM_COUNT];
     for id in StreamId::ALL {
         let (bytes, count) = t.inst.stream_bytes(id);
@@ -299,6 +304,7 @@ pub(crate) fn encode_tail(
             counts[id as usize] = Some(count);
         }
     }
+    let stage_ns = u64::try_from(stage_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     // 2. The plan. The image plane's CPU-side texels are retained at build
     //    time while armed (`ImagePlane::gl_texels`); a plane built before
     //    arming withholds its draws by name rather than draw stale texels.
@@ -323,6 +329,7 @@ pub(crate) fn encode_tail(
             has_free: win.free_atlas.is_some(),
             has_wallpaper: win.wallpaper_tex.is_some(),
             cursor_opaque: t.cursor_opaque,
+            ablation: t.ablation,
         },
     );
     // 3. The offscreen, reused at the same dims.
@@ -477,6 +484,7 @@ pub(crate) fn encode_tail(
     }
     Ok(GlTailOut {
         passes,
+        stage_ns,
         load0,
         scissor,
     })
@@ -1005,6 +1013,10 @@ impl GpuRenderer {
         win: &mut WindowGpu,
         t: TrayQuad<'_>,
     ) -> Result<(), String> {
+        debug_assert!(
+            t.scrim.is_none(),
+            "the GL arm draws no tray scrim (`TrayQuad::scrim`): Linux shows none"
+        );
         let (fw, fh) = win
             .gl_offscreen
             .as_ref()

@@ -8,6 +8,8 @@
 //! every Settings view renders. Collection ([`collect_packages_status`]) runs off the event
 //! loop; the service itself is memory-only.
 
+use crate::native_ui::FACT_SEPARATOR;
+
 /// Which co-located `atpkg` verb is running. The busy gate serializes UI-initiated verbs
 /// only; the 6-hour background `atpkg update` is a separate process that can run
 /// concurrently, kept fail-closed by atpkg's own sha256/tree_root verify gates.
@@ -197,8 +199,8 @@ pub(crate) struct ProgramUpdate {
     pub(crate) checked_at: Option<i64>,
 }
 
-/// A program row's words: the summary beside its name (`2.1.280  ·  latest from
-/// Anthropic`) and the detail under it (`Updated 3 h ago  ·  Checked 4 min ago`).
+/// A program row's words: the summary beside its name (`2.1.280 · latest from
+/// Anthropic`) and the detail under it (`Updated 3 h ago · Checked 4 min ago`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProgramWords {
     pub(crate) summary: String,
@@ -253,7 +255,7 @@ impl ProgramUpdate {
                 newer = None;
             }
             Some(said) => {
-                summary.push_str("  \u{b7}  ");
+                summary.push_str(FACT_SEPARATOR);
                 summary.push_str(&said);
             }
             None => {}
@@ -282,7 +284,7 @@ impl ProgramUpdate {
         }
         Some(ProgramWords {
             summary,
-            detail: (!detail.is_empty()).then(|| detail.join("  \u{b7}  ")),
+            detail: (!detail.is_empty()).then(|| detail.join(FACT_SEPARATOR)),
         })
     }
 }
@@ -639,14 +641,14 @@ impl VendorFacts {
         }
     }
 
-    /// `"<vendor>  ·  <license>  ·  <size>"`, whichever facts the line carried.
+    /// `"<vendor> · <license> · <size>"`, whichever facts the line carried.
     pub(crate) fn line(&self) -> String {
         let mut out = self.vendor.clone();
         for extra in [self.license.as_deref(), self.size.as_deref()]
             .into_iter()
             .flatten()
         {
-            out.push_str("  \u{b7}  ");
+            out.push_str(FACT_SEPARATOR);
             out.push_str(extra);
         }
         out
@@ -1506,6 +1508,19 @@ pub(crate) struct PackagesService {
     /// How many programs the last check or install moved to a new build, so the card says
     /// `2 programs updated` rather than a bare "completed". Cleared when a verb begins.
     updated: usize,
+    /// Whether this copy can manage packages at all — known before any status read
+    /// ([`Self::note_tool`]): the co-located `atpkg` stat and the compiled root key.
+    /// The slow status worker learns nothing new about either, so admission never
+    /// waits on it.
+    tool: Option<PackageTool>,
+}
+
+/// What this copy's package tool IS, as opposed to what its status says: an `atpkg`
+/// beside the executable, and a build with the package root key compiled in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PackageTool {
+    pub(crate) available: bool,
+    pub(crate) manager_enabled: bool,
 }
 
 /// The `[machine]` host settings as the window confirmed them: the record bare `atpkg
@@ -1576,7 +1591,25 @@ impl PackagesService {
             machine: MachinePosture::default(),
             pass_trouble: None,
             updated: 0,
+            tool: None,
         }
+    }
+
+    /// Record what this copy's package tool is — `available`, the co-located
+    /// `atpkg` stat the host makes on its loop (cheap), and the compiled root key —
+    /// before any status read, so the first frame Settings draws already admits or
+    /// refuses the package rows on what is known. Returns whether it changed.
+    pub(crate) fn note_tool(&mut self, available: bool) -> bool {
+        let tool = PackageTool {
+            available,
+            manager_enabled: atpkg::manager_enabled(),
+        };
+        if self.tool == Some(tool) {
+            return false;
+        }
+        self.tool = Some(tool);
+        self.revision = self.revision.saturating_add(1);
+        true
     }
 
     pub(crate) fn revision(&self) -> u64 {
@@ -1873,6 +1906,10 @@ impl PackagesService {
         {
             self.updated = updated_programs(self.report.as_ref(), &completion.report);
         }
+        self.tool = Some(PackageTool {
+            available: completion.report.available,
+            manager_enabled: completion.report.manager_enabled,
+        });
         self.report = Some(completion.report);
         if completion.command.is_some() {
             self.last_command = completion.command;
@@ -1919,12 +1956,20 @@ impl PackagesService {
         auto_install: bool,
         loop_running: bool,
     ) -> PackagesState {
+        // Before the first status read, the report is the honest zero state with
+        // the tool's own facts filled in: admission is known, status is not.
+        let report = self.report.clone().unwrap_or_else(|| {
+            let mut report = PackagesStatusReport::unobserved();
+            if let Some(tool) = self.tool {
+                report.available = tool.available;
+                report.manager_enabled = tool.manager_enabled;
+            }
+            report
+        });
         PackagesState {
             observed: self.report.is_some(),
-            report: self
-                .report
-                .clone()
-                .unwrap_or_else(PackagesStatusReport::unobserved),
+            tool_observed: self.tool.is_some(),
+            report,
             busy: self.busy,
             inflight: self.inflight,
             last_command: self.last_command.clone(),
@@ -1963,6 +2008,10 @@ pub(crate) struct PackagesState {
     /// A worker pass has completed at least once (before that the page says
     /// "Reading package status…" instead of claiming anything).
     observed: bool,
+    /// What the package tool is — present, and built with its root key — is
+    /// known ([`PackagesService::note_tool`]), whether or not a status read has
+    /// landed: admission reads THIS, the status lines read [`Self::observed`].
+    tool_observed: bool,
     report: PackagesStatusReport,
     busy: Option<PackagesBusy>,
     /// Any worker is inflight, the silent status refresh (`busy` `None`) included. Actions
@@ -2017,6 +2066,7 @@ impl PackagesState {
     pub(crate) fn unobserved() -> Self {
         Self {
             observed: false,
+            tool_observed: false,
             report: PackagesStatusReport::unobserved(),
             busy: None,
             inflight: false,
@@ -2132,7 +2182,7 @@ impl PackagesState {
                     None => format!("checked {stamp}"),
                 });
             }
-            (!parts.is_empty()).then(|| parts.join("  \u{b7}  "))
+            (!parts.is_empty()).then(|| parts.join(FACT_SEPARATOR))
         };
         // A machine apply that succeeded quotes the pass's own verdict sentence
         // (`applied — …` / `nothing changed — …`) instead of a bare headline.
@@ -2178,7 +2228,7 @@ impl PackagesState {
             }
             parts.extend(attention_line.clone());
             parts.extend(recorded_detail(false));
-            (!parts.is_empty()).then(|| parts.join("  \u{b7}  "))
+            (!parts.is_empty()).then(|| parts.join(FACT_SEPARATOR))
         } else if let Some(command) = self.last_command.as_ref() {
             let mut detail = command_feedback
                 .clone()
@@ -2186,13 +2236,13 @@ impl PackagesState {
             // What still needs attention follows the verb's own result, never
             // replaces it.
             if let Some(line) = attention_line.as_deref() {
-                detail.push_str("  \u{b7}  ");
+                detail.push_str(FACT_SEPARATOR);
                 detail.push_str(line);
             }
             match command {
                 PackagesCommandOutcome::Succeeded { .. } => {
                     if let Some(recorded) = recorded_detail(false) {
-                        detail.push_str("  \u{b7}  ");
+                        detail.push_str(FACT_SEPARATOR);
                         detail.push_str(&recorded);
                     }
                 }
@@ -2200,7 +2250,8 @@ impl PackagesState {
                 // this attempt's result.
                 PackagesCommandOutcome::Failed { .. } => {
                     if let Some(recorded) = recorded_detail(true) {
-                        detail.push_str("  \u{b7}  Before this attempt: ");
+                        detail.push_str(FACT_SEPARATOR);
+                        detail.push_str("Before this attempt: ");
                         detail.push_str(&recorded);
                     }
                 }
@@ -2229,7 +2280,7 @@ impl PackagesState {
                 cause.strip_prefix("atpkg: ").unwrap_or(cause)
             );
             detail = Some(match detail {
-                Some(rest) => format!("{last}  \u{b7}  {rest}"),
+                Some(rest) => format!("{last}{FACT_SEPARATOR}{rest}"),
                 None => last,
             });
         }
@@ -2240,7 +2291,7 @@ impl PackagesState {
         {
             match detail.as_mut() {
                 Some(detail) => {
-                    detail.push_str("  ·  ");
+                    detail.push_str(FACT_SEPARATOR);
                     detail.push_str(note);
                 }
                 None => detail = Some(note.to_string()),
@@ -2256,7 +2307,7 @@ impl PackagesState {
         {
             match detail.as_mut() {
                 Some(detail) => {
-                    detail.push_str("  ·  ");
+                    detail.push_str(FACT_SEPARATOR);
                     detail.push_str(&line);
                 }
                 None => detail = Some(line),
@@ -2271,7 +2322,7 @@ impl PackagesState {
             let warning = format!("Package metadata warning: {error}");
             match detail.as_mut() {
                 Some(detail) => {
-                    detail.push_str("  ·  ");
+                    detail.push_str(FACT_SEPARATOR);
                     detail.push_str(&warning);
                 }
                 None => detail = Some(warning),
@@ -2289,7 +2340,7 @@ impl PackagesState {
         } else {
             ""
         };
-        let loop_status = if self.observed && !report.available {
+        let loop_status = if self.tool_observed && !report.available {
             "Unavailable in this copy of aterm".to_string()
         } else if !self.loop_running {
             format!("Not running in this window{still_works}")
@@ -2313,14 +2364,16 @@ impl PackagesState {
             })
             .collect();
         let activity = activity_lines(&report.activity, now_unix, offset);
+        let activity_capped = report.activity.len() >= atpkg::packages_log::ACTIVITY_EVENTS;
         // The machine verb is not manager-gated (`atpkg machine apply` works with the
         // manager off): its slice gets the page's idleness alone.
-        let machine_idle = self.observed && report.available && !self.inflight;
+        let machine_idle = self.tool_observed && report.available && !self.inflight;
         let machine =
-            self.machine_projection(machine_idle, self.observed && !report.available, now);
+            self.machine_projection(machine_idle, self.tool_observed && !report.available, now);
         PackagesProjection {
             machine,
             observed: self.observed,
+            tool_observed: self.tool_observed,
             available: report.available,
             manager_enabled: report.manager_enabled,
             // The compiled pin is the live anchor, so its fingerprint is the one to show.
@@ -2331,6 +2384,7 @@ impl PackagesState {
             index_source: report.index_source.clone(),
             programs,
             activity,
+            activity_capped,
             log_path: report.log_path.clone(),
             collection_error: report.collection_error.clone(),
             busy: self.busy,
@@ -2400,8 +2454,17 @@ impl PackagesState {
                 .duration_since(*at)
                 .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
                 .unwrap_or(0);
+            // In the records' plain words, never atpkg's wire tokens
+            // (`universal-control disabled`).
+            let said = items
+                .split(';')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(|item| crate::toolchain_words::machine_setting_words(item).0)
+                .collect::<Vec<_>>()
+                .join("; ");
             format!(
-                "Last change: {items} · {}",
+                "Last change: {said} · {}",
                 crate::session_chrome::relative_age(age_ms)
             )
         });
@@ -2455,22 +2518,28 @@ impl PackagesState {
         // it was then, so say what the next read or pass will do, never as if measured.
         // Apply Now is named only where it is drawn (something left to do, nothing in the
         // way). Off on a Mac already off adds no line: the measured line already says so.
+        // When Off lands is the row's own timing, in its words
+        // (`prefs::universal_control_timing`): the next ALab tools check, or
+        // with Keep ALab tools up to date off, the daily apply at a launch.
+        let off_when = crate::prefs::universal_control_timing(
+            UniversalControlPolicy::Off,
+            self.master_enabled,
+        )
+        .map_or("", crate::prefs::ApplicationTiming::clause);
         let saved = state
             .filter(|s| s.policy != self.saved_universal_control)
             .and_then(|s| match self.saved_universal_control {
-                UniversalControlPolicy::Off if next && reason.is_none() => Some(
-                    "Saved: aterm turns Universal Control off at the next ALab tools \
-                     check. Apply Now does it now.",
-                ),
+                UniversalControlPolicy::Off if next && reason.is_none() => Some(format!(
+                    "Saved: aterm turns Universal Control off {off_when}. Apply Now does it now."
+                )),
                 UniversalControlPolicy::Off if s.universal_control == UcPosture::Disabled => None,
-                UniversalControlPolicy::Off => {
-                    Some("Saved: aterm turns Universal Control off at the next ALab tools check.")
-                }
+                UniversalControlPolicy::Off => Some(format!(
+                    "Saved: aterm turns Universal Control off {off_when}."
+                )),
                 UniversalControlPolicy::Leave => {
-                    Some("Saved: aterm leaves Universal Control as macOS has it.")
+                    Some("Saved: aterm leaves Universal Control as macOS has it.".to_string())
                 }
-            })
-            .map(str::to_string);
+            });
         let apply_enabled = idle
             && supported
             && posture.observed
@@ -2552,7 +2621,11 @@ pub(crate) struct MachineProjection {
 pub(crate) struct PackagesProjection {
     /// The `[machine]` host settings slice (Settings ▸ Security's "This Mac" status).
     pub(crate) machine: MachineProjection,
+    /// A status read has landed (the headline, Activity and program rows wait on it).
     pub(crate) observed: bool,
+    /// What the package tool is, is known: package admission reads this, never
+    /// [`Self::observed`] ([`PackagesService::note_tool`]).
+    pub(crate) tool_observed: bool,
     pub(crate) available: bool,
     pub(crate) manager_enabled: bool,
     pub(crate) root_fingerprint: String,
@@ -2591,6 +2664,9 @@ pub(crate) struct PackagesProjection {
     /// The package log's newest events as the Activity card reads them, newest first
     /// ([`activity_lines`]).
     pub(crate) activity: Vec<ActivityLine>,
+    /// Whether the tail is full ([`atpkg::packages_log::ACTIVITY_EVENTS`] events): older
+    /// ones are in the log, which the card says Open Log has.
+    pub(crate) activity_capped: bool,
     /// The package log, for "Open Log" (`None`: no log directory resolves).
     pub(crate) log_path: Option<std::path::PathBuf>,
 }
@@ -3837,6 +3913,20 @@ mod tests {
                 off.machine.next == MACHINE_APPLY_WOULD,
                 "Apply Now named exactly where it is drawn ({uc:?} {home:?})"
             );
+            // With Keep ALab tools up to date off no ALab tools check runs:
+            // the Saved line says when Off does land, in the row's words.
+            let kept_off = service
+                .state(false, true, true)
+                .with_machine_config(atpkg::config::UniversalControlPolicy::Off)
+                .projection_at(now);
+            let when = crate::prefs::ApplicationTiming::DailyLaunchApply.clause();
+            assert_eq!(
+                kept_off.machine.saved.as_deref(),
+                saved
+                    .map(|saved| saved.replace("at the next ALab tools check", when))
+                    .as_deref(),
+                "{uc:?} {home:?} with Keep off"
+            );
         }
         let _ = service
             .replace_machine_state(Ok(machine_state(UcPosture::Default, HomePosture::Account)));
@@ -3980,7 +4070,7 @@ mod tests {
     /// A change a pass reported reaches the status and asks for a fresh read: the wake arm
     /// notes the change (the status's "Last change") and starts a re-read.
     #[test]
-    fn a_reported_change_lands_on_the_card_and_asks_for_a_read() {
+    fn a_reported_change_lands_on_the_status_and_asks_for_a_read() {
         use atpkg::machine::{HomePosture, UcPosture};
         let mut service = live_service();
         let _ = service
@@ -3996,10 +4086,8 @@ mod tests {
             .machine;
         assert_ne!(after.last_change, before.last_change);
         assert!(
-            after
-                .last_change
-                .as_deref()
-                .is_some_and(|change| change.contains("universal-control disabled")),
+            after.last_change.as_deref().is_some_and(|change| change
+                .starts_with("Last change: ALab tools turned off Universal Control · ")),
             "{:?}",
             after.last_change
         );

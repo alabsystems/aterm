@@ -1,0 +1,34 @@
+# claude-code 2.1.268 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the composer holding `/cl`, the slash menu open under the frame: no pointer drawn, its entries at column 2 · the top entry `/clear` highlighted in colour only (no pointer in the text); Enter then ran `/clear` (MEASURED)
+ ▐▛███▛█   Claude Code v2.1.268
+▝▜██████▀  Opus 5 (1M context) · API Usage Billing
+  ▝▝ ▝▝    /private/tmp/at.XoY0/proj
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /cl
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  /clear                        Start a new session with empty context; previous session stays on disk (resumable with /resume)
+  /claude-api                   Reference for the Claude API / Anthropic SDK — model ids, pricing, params, streaming, tool use, MCP, agents,
+                                caching, token counting, model migration. TRIGGER — read BEFORE opening the target file; don't skip because i…
+  /doctor                       Health-check the user's Claude Code setup and fix issues: diagnose installation health — what the `claude
+                                doctor` terminal diagnostics cover — from local data (duplicate or leftover installs, PATH, unparseable setti…
+  /update-config                Use this skill to configure the Claude Code harness via settings.json. Automated behaviors ("from now on when
+                                X", "each time X", "whenever X", "before/after X") require hooks configured in settings.json - the harness ex…
+  /design-sync                  Push a React design system to claude.ai/design. This runs a converter that bundles the real component code
+                                (from Storybook or a bare package) and uploads it. Use when the user runs /design-sync or says "sync my desig…
+  /agents                       (removed) Ask Claude to create/manage subagents, or edit .claude/agents/
+  /copy                         Copy Claude's last response to clipboard (or /copy N for the Nth-latest)
+  /code-review                  Review the current diff, or a PR number/branch/path target, for correctness bugs and
+                                reuse/simplification/efficiency cleanups at the given effort level (low/medium: fewer, high-confidence findin…
+  /status                       Show Claude Code status including version, model, account, API connectivity, and tool statuses
+  /deep-research                [dynamic workflow] Deep research harness — fan-out web searches, fetch sources, adversarially verify claims,
+                                                   synthesize a cited report.
+  /design                       Grant or revoke Claude agent access to your Design projects
+  /simplify                     Review the changed code for reuse, simplification, efficiency, and altitude cleanups, then apply the fixes.
+                                Quality only — it does not hunt for bugs; use /code-review for that.
+  /fewer-permission-prompts     Scan your transcripts for common read-only Bash and MCP tool calls, then add a prioritized allowlist to
+                                project .claude/settings.json to reduce permission prompts.
+  /run                          Launch and drive this project's app to see a change working. Use when asked to run, start, or screenshot the
+                                app, or to confirm a change works in the real app (not just tests). First looks for a project skill that alre…
+  /run-skill-generator          Author or improve the run-<unit> skill - a per-project skill that tells agents how to build, launch, and drive
+                                this project's app. Use when the user asks to set up the project, get it running, write run instructions, or …

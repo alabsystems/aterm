@@ -167,14 +167,25 @@ pub struct TerminalConfig {
     pub bold_is_bright: bool,
 
     /// SGR 2 (dim/faint): the fraction of the foreground retained, `0.0..=1.0`.
-    /// The fg is blended toward the cell background in linear light
+    /// The fg is blended toward the cell background
     /// (`color_resolve::dim_toward_bg`), so faint text recedes on dark and light
-    /// themes. The mix is raised where needed so faint text keeps at least
+    /// themes: light ink as far as an sRGB (alpha) blend at this opacity, dark
+    /// ink as a linear-light one. The mix is raised where needed so faint text keeps at least
     /// this share of the fg's contrast (in log space) and a readable
     /// `9^faint_opacity` (3:1 at the default), the latter capped at
     /// `contrast^((1+faint_opacity)/2)` so faint always stays fainter than its
     /// colour. Default `0.5` (config `faint_opacity`).
     pub faint_opacity: f32,
+
+    /// The theme-pair contrast floor, a WCAG ratio clamped `1.0..=21.0`:
+    /// where a cell's foreground and background are both the theme's own
+    /// (the defaults or palette slots 0-15) and not both the defaults, the
+    /// foreground is held to this ratio against a coloured cell and to at
+    /// most 3:1 against the theme's background
+    /// (`color_resolve::theme_pair_floor`). Truecolor and the 256-colour
+    /// cube stay exact. Default `1.0`, off; aterm's app turns it on on
+    /// Windows (config `minimum_contrast`).
+    pub indexed_minimum_contrast: f32,
 
     // === BiDi Settings ===
     /// Bidirectional text configuration (how RTL text is displayed).
@@ -211,6 +222,7 @@ impl Default for TerminalConfig {
             ambiguous_width_double: false,
             bold_is_bright: true,
             faint_opacity: aterm_types::DIM_FACTOR,
+            indexed_minimum_contrast: 1.0,
             // BiDi
             bidi: BiDiConfig::default(),
         }

@@ -11,6 +11,7 @@ use crate::supervise::fx::ClockSource;
 use crate::supervise::tape::ctl::TapedCtl;
 use crate::supervise::tape::testing::MemoryTape;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::mpsc;
 
 /// A loop on `ctl` with no box settle, no card settle and no landing time for a
 /// `0`: a scripted server has no key guard and no debounce ([`BOX_SETTLE`],
@@ -151,6 +152,12 @@ struct Mock {
     /// `watch` test that ends on what happened, not on a wall-clock `max`
     /// a loaded machine fits fewer turns into.
     exit_when: Option<fn(&Mock) -> bool>,
+    /// The session is gone (`ERR exited`, as with `exit_when`) at the first
+    /// sitting wait once this many requests have been served: a world that
+    /// never moves on by itself, whose waits count nothing toward
+    /// `vanish_after` (the panel's), ends after a count of the loop's own
+    /// steps, never on a wall-clock `max` a loaded machine fits fewer into.
+    exit_at_request: Option<usize>,
     /// The session is gone (`ERR exited`) at the first `await seq`/`await
     /// gone` on the LAST screen that asks for [`PARKED`] or more: the loop's
     /// own word that nothing is due before then (its wait asks the time to
@@ -159,6 +166,17 @@ struct Mock {
     /// turn gate holds the last screen as before; a test whose host or
     /// server changes under a sitting screen keeps its window instead.
     end_when_parked: bool,
+    /// The run's clock, when a whole-run helper made it ([`memory_tape`]): a
+    /// wait on a screen that sits ([`Self::held`]) SKIPS the whole time it
+    /// asks on it ([`super::super::fx::ScriptedClock::skip`]), as a server
+    /// holding a still screen answers, instead of a nap of real time — or
+    /// [`Self::stall_sleep`] of it at most, for a test that counts the steps
+    /// of a wait. A run that types nothing at a held screen reads its `--max`
+    /// out in a few waits, not in a window of sleeps.
+    waits: Option<Arc<super::super::fx::ScriptedClock>>,
+    /// Every wait naps real time, never skips ([`Self::waits`]): for a run
+    /// beside a host that reads the system's clock, as a shipped host does.
+    real_time: bool,
     stalls: u32,
     /// `await idle` passes over busy screens (see the struct doc).
     idle_skips_busy: bool,
@@ -179,12 +197,6 @@ struct Mock {
     history: Option<CtlReply>,
     /// `offscreen` replies, in order (none left: a host without the verb).
     offscreen: VecDeque<CtlReply>,
-    /// The mail lane's `await inbox` answers this mock RELEASES as it
-    /// serves chosen requests (by arrival index), so a test decides
-    /// whether the worker's report lands before or after the idle point
-    /// the screen shows ([`MailMock`]).
-    release: Option<std::sync::mpsc::Sender<CtlReply>>,
-    release_at: BTreeMap<usize, Vec<CtlReply>>,
     /// Replies by verb (`turn`, `post`, `meta`), in order, ahead of the
     /// built-in answer for that verb.
     verb_replies: BTreeMap<&'static str, VecDeque<CtlReply>>,
@@ -217,6 +229,9 @@ struct Mock {
     /// How many `meta set attention` requests were served
     /// ([`Self::attention_gates`]).
     attentions: usize,
+    /// The `kind=` token the loop's last `meta set attention
+    /// owner=supervisor` named, `None` when it named none.
+    attention_kind: Option<String>,
     /// The cursor's column on the screen of this index, over
     /// `cursor_col` (a suggestion drawn at column 2, then filled).
     screen_cols: BTreeMap<usize, usize>,
@@ -231,6 +246,13 @@ struct Mock {
     /// The pane's width a read's `dims.cols` sends (120 when `None`): a
     /// frame measured at another width.
     pane_cols: Option<usize>,
+    /// A whole read (`text --json`, no `tail=`) right after a `tail=` read
+    /// serves the screen that tail did, unmoved, as the server does when
+    /// nothing is drawn between: a box the loop takes whole (an `Edit file`
+    /// box on a pane taller than the tail) is one script screen, not two.
+    whole_sees_the_tail: bool,
+    /// The last `text` read was a `tail=` read ([`Self::whole_sees_the_tail`]).
+    last_read_tail: bool,
     /// A `turn` was sent.
     turned: bool,
     /// How many `turn`s were sent.
@@ -238,7 +260,8 @@ struct Mock {
     /// A timed-out `await seq` on a screen that sits SLEEPS this long
     /// (the requested timeout at most) before it answers, as the real
     /// server does — for a loop whose waits are bounded in
-    /// milliseconds, so it does not spin through thousands of requests.
+    /// milliseconds, so it does not spin through thousands of requests. On
+    /// the run's clock ([`Self::waits`]) the time is skipped, not slept.
     stall_sleep: Option<Duration>,
     /// Once more than this many `turn`s were sent, every request answers
     /// `ERR exited`: the session is gone — how a probe test ends.
@@ -263,6 +286,9 @@ struct Mock {
     cwd: Option<String>,
     /// `meta agent_cwd=`: the foreground program's own directory.
     pub agent_cwd: Option<String>,
+    /// `meta trusted_cwd=`: the folder a worker's `spawn agent=claude`
+    /// trusted for it (pct-encoded as the server writes it; `None`: `-`).
+    pub trusted_cwd: Option<String>,
     /// What `help …` answers (stdout): by default the catalog line for
     /// `key` of a host that has no generation fence.
     help: String,
@@ -413,6 +439,10 @@ struct Mock {
     cell_fg: &'static str,
     /// The server does not answer a `cell` read (an older one): `ERR`.
     cell_unreadable: bool,
+    /// The reply a `cell <row> <col>` read gets at that cell, over
+    /// [`Self::cell_fg`] and [`Self::cell_attrs`]: a measured cell (a
+    /// completion menu's entry drawn in its colour).
+    cells: BTreeMap<(usize, usize), String>,
     /// `human_ms` for the status reads to come, one each, before it
     /// answers for all the rest: a person who stops typing.
     human_ms_reads: VecDeque<Option<u64>>,
@@ -496,12 +526,55 @@ struct Mock {
     /// `modes`' `alt_screen=` row (`None`: a host whose `modes` names
     /// none — the bare `OK` every unscripted verb gets).
     alt_screen: Option<bool>,
+    /// The main screen's history: the rows right above the screen, oldest
+    /// first, the screen's own first row the absolute row after them.
+    /// `search <^literal> regex` answers its hits there and on the screen
+    /// last served, under the header's `screen_first=` (`search` with no
+    /// pattern, the header alone), and `line <n>` each row, as the server
+    /// does (`None`: a host whose `search` and `line`
+    /// get the bare `OK` every unscripted verb gets).
+    scrollback: Option<Vec<String>>,
+    /// `line <n>` of a history row above this one is `ERR evicted`.
+    evicted_below: u64,
+    /// The ALTERNATE screen's archive of the rows that scrolled off it,
+    /// oldest first, archived rows `1..=n`: `offscreen` answers its newest
+    /// (`tail=`) after `since=`, the screen last served appended under
+    /// `screen=1`, as the server does ([`Self::archive_read`]; `None`: the
+    /// scripted [`Self::offscreen`] replies, or none).
+    alt_archive: Option<Vec<String>>,
+    /// A gap after the archive's newest row (`breaks=1`): a redraw with no
+    /// overlap, a resize.
+    archive_gap: bool,
+    /// `line <n>` of this row is `ERR unreadable`.
+    unreadable_row: Option<u64>,
+    /// What the `search` header carries after its count (` incomplete
+    /// rewrapping`: a search that may have left out newer rows).
+    search_qualifier: &'static str,
     /// Claude Code's `/usage` panel as a world that REACTS to the loop's
     /// writes ([`PanelWorld`]); `None`: the script alone, as ever.
     panel: Option<PanelWorld>,
     /// Claude Code's limit-reset program as a world that reacts to the
     /// loop's keys ([`ResetWorld`]); `None`: the script alone.
     reset: Option<ResetWorld>,
+    /// The session's TASK RECORD as `task` answers it: its rev and the
+    /// fields after it (`state=<s> from=ctl … result_bytes=<n> [why=…]
+    /// [result_path=…]`); `None`: no task (`OK task -`). A `task mark`
+    /// sets it as the server does — the whole new state, `changed=0` and
+    /// no rev for the same one. Its requests run outside every script's
+    /// indexes, as the claim's do ([`Self::task_requests`]).
+    task: Option<(u64, String)>,
+    /// Every `task …` request, in order.
+    task_requests: Vec<String>,
+    /// Once this many screens are served, the record — `done` — moves to
+    /// `working why=turn` (rev + 1): the server's own reopen at a turn
+    /// someone else typed into the finished worker.
+    task_reopens_at: Option<usize>,
+    /// How many `task mark` requests, from the first, are answered `ERR
+    /// busy` (a seamless update committing) and change nothing.
+    task_busy: usize,
+    /// How many bare `task` reads, from the first, are turned away
+    /// unserved (`ERR control server busy`): a read the loop asks again.
+    task_lost: usize,
 }
 
 /// Where the `/usage` panel's world stands ([`PanelWorld`]).
@@ -792,6 +865,9 @@ struct ResetShared {
 struct ResetWorld {
     at: ResetAt,
     labels: Vec<String>,
+    /// The dialog's row that spends a reset ([`RESET_GRANT`], or a 2.1.304
+    /// row of one kind of reset's): the world's own oracle of the row.
+    grant: String,
     focus: usize,
     check_reads: usize,
     claim_reads: usize,
@@ -824,6 +900,10 @@ struct ResetWorld {
     /// read and the `status` the dialog was judged on, while the host
     /// is asked for the claim.
     person_at_row_key: usize,
+    /// A row the dialog draws as the loop's first arrow lands, at this
+    /// index, the cursor kept on its own row: Claude Code 2.1.304 draws a
+    /// row per kind of reset as its offers come in, while the dialog is up.
+    drawn_at_arrow: Option<(usize, String)>,
     /// A PERSON presses Enter on the confirmation's yes, at the first
     /// read of it this long after it mounted: the claim begins with no
     /// key of the loop's.
@@ -865,6 +945,7 @@ impl ResetWorld {
         Self {
             at: ResetAt::Dialog,
             labels: labels.iter().map(|l| (*l).to_string()).collect(),
+            grant: RESET_GRANT.to_string(),
             focus,
             check_reads: 1,
             claim_reads: 1,
@@ -880,6 +961,7 @@ impl ResetWorld {
             person_at_read: None,
             person_at_confirm_key: 0,
             person_at_row_key: 0,
+            drawn_at_arrow: None,
             yes_by_person_after: None,
             resetting: screen(aterm_phase::reset::fixtures::RESETTING),
             lose_reply_to: None,
@@ -924,7 +1006,18 @@ impl ResetWorld {
     /// The dialog's cursor is on the grant row, by the world's own labels:
     /// a reader seeded with a defect cannot make the world agree with it.
     fn on_grant(&self) -> bool {
-        self.labels[self.focus] == RESET_GRANT
+        self.labels[self.focus] == self.grant
+    }
+
+    /// The row [`Self::drawn_at_arrow`] names, drawn once, the cursor kept on
+    /// the row it is on.
+    fn draw_at_arrow(&mut self) {
+        if let Some((at, label)) = self.drawn_at_arrow.take() {
+            self.labels.insert(at, label);
+            if at <= self.focus {
+                self.focus += 1;
+            }
+        }
     }
 
     /// The confirmation's cursor moves to its other option.
@@ -935,7 +1028,8 @@ impl ResetWorld {
                     .trim_start()
                     .trim_start_matches('❯')
                     .trim_start();
-                row.starts_with("Yes, use my reset") || row.starts_with("No, keep it")
+                // `Yes, use my reset`, 2.1.304's `Yes, use my <kind>`.
+                row.starts_with("Yes, use my ") || row.starts_with("No, keep it")
             })
             .collect();
         for i in rows {
@@ -960,7 +1054,7 @@ impl ResetWorld {
     fn dlg(&self) -> i64 {
         match self.at {
             ResetAt::Gone => 0,
-            ResetAt::Dialog if self.labels.iter().any(|l| l == RESET_GRANT) => 1,
+            ResetAt::Dialog if self.labels.contains(&self.grant) => 1,
             ResetAt::Dialog => 2,
             ResetAt::Checking => 3,
             ResetAt::Confirm if self.exact => 4,
@@ -1020,6 +1114,17 @@ fn bare_err() -> CtlReply {
 fn closed() -> CtlReply {
     failed(1, "server closed the connection without responding")
 }
+/// The run's monotonic clock now ([`Mock::waits`]): the system's, and what the
+/// run's waits skipped; the system's alone with no run's clock.
+fn run_now(waits: Option<&super::super::fx::ScriptedClock>) -> Instant {
+    waits.map_or_else(Instant::now, super::super::fx::ScriptedClock::mono)
+}
+
+/// How long since `at` on [`run_now`]'s clock.
+fn run_since(waits: Option<&super::super::fx::ScriptedClock>, at: Instant) -> Duration {
+    run_now(waits).saturating_duration_since(at)
+}
+
 /// A client-side failure: `aterm-ctl: <text>` on stderr, nothing on stdout.
 fn failed(code: i32, text: &str) -> CtlReply {
     CtlReply {
@@ -1040,7 +1145,10 @@ impl Mock {
             seq: 100,
             vanish_after: None,
             exit_when: None,
+            exit_at_request: None,
             end_when_parked: false,
+            waits: None,
+            real_time: false,
             title: None,
             stalls: 0,
             idle_skips_busy: false,
@@ -1052,8 +1160,6 @@ impl Mock {
             delay: BTreeMap::new(),
             history: None,
             offscreen: VecDeque::new(),
-            release: None,
-            release_at: BTreeMap::new(),
             verb_replies: BTreeMap::new(),
             turn_releases: None,
             key_releases: None,
@@ -1063,10 +1169,13 @@ impl Mock {
             turn_gates: Vec::new(),
             attention_gates: Vec::new(),
             attentions: 0,
+            attention_kind: None,
             screen_cols: BTreeMap::new(),
             cursor_on_caret: false,
             screen_cursors: BTreeMap::new(),
             pane_cols: None,
+            whole_sees_the_tail: false,
+            last_read_tail: false,
             turned: false,
             turns: 0,
             stall_sleep: None,
@@ -1080,6 +1189,7 @@ impl Mock {
                 .ok()
                 .map(|d| d.to_string_lossy().into_owned()),
             agent_cwd: None,
+            trusted_cwd: None,
             help: "key [id=<key>] [if=<re>] <name>: send a named key\n".to_string(),
             help_send: None,
             send_replies: VecDeque::new(),
@@ -1128,6 +1238,7 @@ impl Mock {
             cell_attrs: "dim",
             cell_fg: "d0d0d0",
             cell_unreadable: false,
+            cells: BTreeMap::new(),
             human_ms_reads: VecDeque::new(),
             status_human_from: BTreeMap::new(),
             agent_pushes: false,
@@ -1150,8 +1261,76 @@ impl Mock {
             gone_ran_out: false,
             after_gone: Vec::new(),
             alt_screen: None,
+            scrollback: None,
+            evicted_below: 0,
+            alt_archive: None,
+            archive_gap: false,
+            unreadable_row: None,
+            search_qualifier: "",
             panel: None,
             reset: None,
+            task: None,
+            task_requests: Vec::new(),
+            task_reopens_at: None,
+            task_busy: 0,
+            task_lost: 0,
+        }
+    }
+    /// A `task` request ([`Self::task`]): the record, or the record after
+    /// the mark and whether it moved.
+    fn task_call(&mut self, words: &[&str]) -> CtlReply {
+        if let Some(at) = self.task_reopens_at
+            && self.served >= at
+            && self
+                .task
+                .as_ref()
+                .is_some_and(|(_, f)| f.starts_with("state=done "))
+        {
+            self.task_reopens_at = None;
+            let rev = self.task.as_ref().map_or(0, |(rev, _)| rev + 1);
+            self.task = Some((
+                rev,
+                "state=working from=ctl since_ms=0 result_bytes=0 why=turn".to_string(),
+            ));
+        }
+        let line = |task: &Option<(u64, String)>| match task {
+            Some((rev, fields)) => format!("OK task rev={rev} {fields} agent=idle attention=-"),
+            None => "OK task -".to_string(),
+        };
+        match words {
+            ["task"] if self.task_lost > 0 => {
+                self.task_lost -= 1;
+                err("control server busy")
+            }
+            ["task"] => ok(&format!("{}\n", line(&self.task))),
+            ["task", "mark", ..] if self.task_busy > 0 => {
+                self.task_busy -= 1;
+                err("busy: a seamless update is committing")
+            }
+            ["task", "mark", state, facts @ ..] => {
+                let bytes = facts
+                    .iter()
+                    .find_map(|f| f.strip_prefix("result_bytes="))
+                    .unwrap_or("0");
+                let others: String = facts
+                    .iter()
+                    .filter(|f| !f.starts_with("result_bytes="))
+                    .map(|f| format!(" {f}"))
+                    .collect();
+                let fields =
+                    format!("state={state} from=ctl since_ms=0 result_bytes={bytes}{others}");
+                let changed = self.task.as_ref().is_none_or(|(_, f)| *f != fields);
+                if changed {
+                    let rev = self.task.as_ref().map_or(1, |(rev, _)| rev + 1);
+                    self.task = Some((rev, fields));
+                }
+                ok(&format!(
+                    "{} changed={}\n",
+                    line(&self.task),
+                    u8::from(changed)
+                ))
+            }
+            _ => err("usage: task [mark <working|done|exited|stalled> …]"),
         }
     }
     /// The bare `meta` reply, `attention=` pct-encoded as the server spells
@@ -1171,6 +1350,10 @@ impl Mock {
             usize::from(self.attention.is_some()) + usize::from(self.human_attention.is_some());
         let cwd = self.cwd.as_deref().unwrap_or("-");
         let agent_cwd = self.agent_cwd.as_deref().unwrap_or("-");
+        let trusted_cwd = self
+            .trusted_cwd
+            .as_deref()
+            .map_or_else(|| "-".to_string(), aterm_codec::pct::encode);
         let questions = self
             .questions
             .map_or_else(String::new, |w| format!(" questions={w}"));
@@ -1180,7 +1363,7 @@ impl Mock {
         format!(
             "OK title=- user_title=- description=- icon=- role=- attention={attention} \
              cwd={cwd} state=alive attention_owner={owner} attention_owners={owners} \
-             supervisor=-{questions}{autopilot} agent_cwd={agent_cwd}\n"
+             supervisor=-{questions} agent_cwd={agent_cwd} trusted_cwd={trusted_cwd}{autopilot}\n"
         )
     }
     /// The `status` reply: the fields the loop reads.
@@ -1215,7 +1398,9 @@ impl Mock {
             .as_ref()
             .and_then(|p| p.keyed_at)
             .or_else(|| self.reset.as_ref().and_then(|w| w.keyed_at))
-            .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX));
+            .map(|at| {
+                u64::try_from(run_since(self.waits.as_deref(), at).as_millis()).unwrap_or(u64::MAX)
+            });
         let mut human = keyed
             .or(after_read)
             .map_or_else(
@@ -1249,6 +1434,126 @@ impl Mock {
             self.status_sid, self.hold, self.fabric, self.program, self.agent, self.seq, self.hand
         )
     }
+    /// The measured reply of the `cell <row> <col>` read `tail` names
+    /// ([`Self::cells`]).
+    fn measured_cell(&self, tail: &[&str]) -> Option<String> {
+        let [row, col] = tail else { return None };
+        self.cells
+            .get(&(row.parse().ok()?, col.parse().ok()?))
+            .cloned()
+    }
+
+    /// `search <^literal> regex` over [`Self::scrollback`] and the screen
+    /// last served: the rows that open with the literal.
+    fn scrollback_search(&self, tail: &[&str]) -> CtlReply {
+        let history = self.scrollback.as_deref().unwrap_or_default();
+        let verb = "search";
+        // No pattern: the server's answer that places the screen alone.
+        if tail.is_empty() {
+            return super::super::transport::render(
+                verb,
+                aterm_types::control_verbs::framing_of(verb, verb),
+                &format!("OK 0 screen_first={}", history.len()),
+                String::new(),
+            );
+        }
+        let [pattern, "regex"] = tail else {
+            return err("usage: search <pattern> [regex]");
+        };
+        let Some(lead) = pattern
+            .strip_prefix('^')
+            .filter(|l| !l.contains(|c: char| "\\.*+?[](){}|$^".contains(c)))
+        else {
+            return err("the mock searches for an anchored literal only");
+        };
+        let hits: String = history
+            .iter()
+            .chain(self.last_served())
+            .enumerate()
+            .filter(|(_, r)| r.starts_with(lead))
+            .map(|(k, _)| format!("{k} 0 {}\n", lead.chars().count()))
+            .collect();
+        super::super::transport::render(
+            verb,
+            aterm_types::control_verbs::framing_of(verb, verb),
+            &format!(
+                "OK {}{} screen_first={}",
+                hits.lines().count(),
+                self.search_qualifier,
+                history.len()
+            ),
+            hits,
+        )
+    }
+
+    /// `line <n>` over [`Self::scrollback`] and the screen last served.
+    fn scrollback_line(&self, tail: &[&str]) -> CtlReply {
+        let Some(row) = tail.first().and_then(|n| n.parse::<u64>().ok()) else {
+            return err("usage: line <n>");
+        };
+        if row < self.evicted_below {
+            return err("evicted");
+        }
+        if self.unreadable_row == Some(row) {
+            return err("unreadable");
+        }
+        let history = self.scrollback.as_deref().unwrap_or_default();
+        let text = usize::try_from(row)
+            .ok()
+            .and_then(|k| history.iter().chain(self.last_served()).nth(k));
+        let verb = "line";
+        match text {
+            Some(text) => super::super::transport::render(
+                verb,
+                aterm_types::control_verbs::framing_of(verb, verb),
+                &format!("OK {text}"),
+                "",
+            ),
+            None => err("out of range"),
+        }
+    }
+
+    /// `offscreen [since=<i>] [tail=<n>] [screen=1]` over
+    /// [`Self::alt_archive`] and the screen last served.
+    fn archive_read(&self, tail: &[&str]) -> CtlReply {
+        let archive = self.alt_archive.as_deref().unwrap_or_default();
+        let arg = |key: &str| {
+            tail.iter()
+                .find_map(|a| a.strip_prefix(key))
+                .and_then(|v| v.parse::<usize>().ok())
+        };
+        let since = arg("since=").unwrap_or(0).min(archive.len());
+        let after = &archive[since..];
+        let take = arg("tail=").unwrap_or(2000).min(after.len());
+        let rows = &after[after.len() - take..];
+        let screen: &[String] = if tail.contains(&"screen=1") {
+            self.last_served()
+        } else {
+            &[]
+        };
+        let mut body = String::new();
+        for row in rows.iter().chain(screen) {
+            body.push_str(row);
+            body.push('\n');
+        }
+        let verb = "offscreen";
+        super::super::transport::render(
+            verb,
+            aterm_types::control_verbs::framing_of(verb, verb),
+            &format!(
+                "OK {} first={} last={} lost=0 breaks={} back=0 epoch=1 origin=7 alt=1 seq={} \
+                 screen_rows={}",
+                rows.len() + screen.len(),
+                archive.len() + 1 - take,
+                archive.len(),
+                u8::from(self.archive_gap),
+                self.seq,
+                screen.len()
+            ),
+            body,
+        )
+    }
+
     fn last_served(&self) -> &[String] {
         &self.screens[self.served.saturating_sub(1).min(self.screens.len() - 1)]
     }
@@ -1278,9 +1583,12 @@ impl Mock {
     /// `tail=<n>` read) a screen taller than `n` rows is served as its
     /// last `n` with the `first` row they start at, as the server does.
     fn screen_json(&mut self, tail: Option<usize>) -> String {
+        let after_tail = std::mem::replace(&mut self.last_read_tail, tail.is_some());
         let i = if self.card_debounce.is_some() {
             self.reactive_index()
-        } else if self.held() {
+        } else if self.held()
+            || tail.is_none() && after_tail && self.whole_sees_the_tail && self.served > 0
+        {
             self.served - 1
         } else {
             let i = self.served.min(self.screens.len() - 1);
@@ -1289,7 +1597,8 @@ impl Mock {
             i
         };
         if survey_open(&self.screens[i]) {
-            self.card_first_served.get_or_insert_with(Instant::now);
+            let now = run_now(self.waits.as_deref());
+            self.card_first_served.get_or_insert(now);
         } else {
             self.card_first_served = None;
         }
@@ -1361,6 +1670,14 @@ impl Mock {
             self.seq
         )
     }
+    /// The session goes at this sitting wait: a test's [`Self::exit_when`]
+    /// holds, or [`Self::exit_at_request`] requests have been served.
+    fn exiting(&self) -> bool {
+        self.exit_when.is_some_and(|done| done(self))
+            || self
+                .exit_at_request
+                .is_some_and(|n| self.requests.len() >= n)
+    }
     /// Whether the wait `tail` (an `await` request's words after its
     /// verb) is the loop parked on the last screen ([`Self::end_when_parked`]).
     fn parked(&self, tail: &[&str]) -> bool {
@@ -1376,7 +1693,7 @@ impl Mock {
     /// A wait on a screen that sits: `ERR exited` once `vanish_after`
     /// stalls have passed, else (after `stall_sleep`) `OK timeout`.
     fn stall(&mut self, tail: &[&str]) -> CtlReply {
-        if self.exit_when.is_some_and(|done| done(self)) {
+        if self.exiting() {
             return err("exited");
         }
         if let Some(n) = self.vanish_after {
@@ -1392,7 +1709,10 @@ impl Mock {
                 .and_then(|i| tail.get(i + 1))
                 .and_then(|ms| ms.parse::<u64>().ok())
                 .map_or(nap, Duration::from_millis);
-            std::thread::sleep(nap.min(asked));
+            match &self.waits {
+                Some(clock) => clock.skip(nap.min(asked)),
+                None => std::thread::sleep(nap.min(asked)),
+            }
         }
         timeout()
     }
@@ -1410,7 +1730,7 @@ impl Mock {
     fn reactive_index(&mut self) -> usize {
         let debounce = self.card_debounce.expect("reactive");
         if let Digit::Pending { at, take } = self.digit
-            && at.elapsed() >= debounce
+            && run_since(self.waits.as_deref(), at) >= debounce
         {
             self.digit = if take { Digit::Taken } else { Digit::Standing };
         }
@@ -1429,7 +1749,7 @@ impl Mock {
     /// The bookkeeping of a wait that ran out (`vanish_after`), for a reactive wait that
     /// already spent its time.
     fn stall_count(&mut self) -> CtlReply {
-        if self.exit_when.is_some_and(|done| done(self)) {
+        if self.exiting() {
             return err("exited");
         }
         if let Some(n) = self.vanish_after {
@@ -1456,16 +1776,19 @@ impl Mock {
         // ([`Self::stall_sleep`]), so a card that has left does not hold the run for the
         // loop's whole 20 s step.
         let asked = asked.min(self.stall_sleep.unwrap_or(asked));
-        let start = Instant::now();
+        let start = run_now(self.waits.as_deref());
         loop {
             self.reactive_index();
             if let Some(r) = done(self) {
                 return r;
             }
-            if start.elapsed() >= asked {
+            if run_since(self.waits.as_deref(), start) >= asked {
                 return self.stall_count();
             }
-            std::thread::sleep(Duration::from_millis(2));
+            match &self.waits {
+                Some(clock) => clock.skip(Duration::from_millis(2)),
+                None => std::thread::sleep(Duration::from_millis(2)),
+            }
         }
     }
     /// Every write to the session, in order, as the question answer
@@ -1518,14 +1841,15 @@ impl Mock {
             return false;
         };
         let grace = u64::try_from(p.grace.as_millis()).unwrap_or(u64::MAX);
-        p.keyed_at.is_some_and(|at| at.elapsed() < p.grace)
+        p.keyed_at
+            .is_some_and(|at| run_since(self.waits.as_deref(), at) < p.grace)
             || self.human_ms.is_some_and(|ms| ms < grace)
     }
 
     /// A person keyed the session.
     fn panel_person(&mut self) {
         if let Some(p) = self.panel.as_mut() {
-            p.keyed_at = Some(Instant::now());
+            p.keyed_at = Some(run_now(self.waits.as_deref()));
         }
     }
 
@@ -1548,7 +1872,7 @@ impl Mock {
                 owed: matches!(p.at, PanelAt::Typed(_) | PanelAt::Open),
                 claims: p.shared.claims.load(SeqCst),
                 tolds: p.shared.tolds.load(SeqCst),
-                at: Instant::now(),
+                at: run_now(self.waits.as_deref()),
             });
         }
     }
@@ -1614,7 +1938,7 @@ impl Mock {
             p.frames.get((p.reads - 1).min(p.frames.len() - 1)).cloned()
         };
         if keys {
-            p.keyed_at = Some(Instant::now());
+            p.keyed_at = Some(run_now(self.waits.as_deref()));
             if let Some(n) = self.human_seq.as_mut() {
                 *n += 1;
             }
@@ -1643,7 +1967,7 @@ impl Mock {
     /// test's [`Self::exit_when`] ends the session here as at any sitting
     /// wait: a world whose panel never closes ends on what happened.
     fn panel_wait(&mut self, tail: &[&str]) -> CtlReply {
-        if self.exit_when.is_some_and(|done| done(self)) {
+        if self.exiting() {
             return err("exited");
         }
         let asked = tail
@@ -1815,14 +2139,15 @@ impl Mock {
             return false;
         };
         let grace = u64::try_from(w.grace.as_millis()).unwrap_or(u64::MAX);
-        w.keyed_at.is_some_and(|at| at.elapsed() < w.grace)
+        w.keyed_at
+            .is_some_and(|at| run_since(self.waits.as_deref(), at) < w.grace)
             || self.human_ms.is_some_and(|ms| ms < grace)
     }
 
     /// A person keyed the session.
     fn reset_person(&mut self) {
         if let Some(w) = self.reset.as_mut() {
-            w.keyed_at = Some(Instant::now());
+            w.keyed_at = Some(run_now(self.waits.as_deref()));
         }
     }
 
@@ -1863,7 +2188,7 @@ impl Mock {
         let moved = match w.at {
             ResetAt::Checking if w.reads > w.check_reads => {
                 w.at = ResetAt::Confirm;
-                w.mounted = Some(Instant::now());
+                w.mounted = Some(run_now(self.waits.as_deref()));
                 true
             }
             ResetAt::Resetting if w.reads > w.claim_reads => {
@@ -1872,14 +2197,15 @@ impl Mock {
             }
             // A person's own Enter on the yes.
             ResetAt::Confirm
-                if w.yes_by_person_after
-                    .is_some_and(|after| w.mounted.is_some_and(|at| at.elapsed() >= after))
-                    && w.on_yes() =>
+                if w.yes_by_person_after.is_some_and(|after| {
+                    w.mounted
+                        .is_some_and(|at| run_since(self.waits.as_deref(), at) >= after)
+                }) && w.on_yes() =>
             {
                 w.yes_by_person_after = None;
                 w.yes_taken += 1;
                 w.at = ResetAt::Resetting;
-                w.keyed_at = Some(Instant::now());
+                w.keyed_at = Some(run_now(self.waits.as_deref()));
                 if let Some(n) = self.human_seq.as_mut() {
                     *n += 1;
                 }
@@ -1897,7 +2223,7 @@ impl Mock {
         }
         let keys = w.at == ResetAt::Confirm && w.person_at_read == Some(w.reads);
         if keys {
-            w.keyed_at = Some(Instant::now());
+            w.keyed_at = Some(run_now(self.waits.as_deref()));
             if let Some(n) = self.human_seq.as_mut() {
                 *n += 1;
             }
@@ -1973,7 +2299,7 @@ impl Mock {
             };
             if let Some(left) = left.filter(|left| **left > 0) {
                 *left -= 1;
-                w.keyed_at = Some(Instant::now());
+                w.keyed_at = Some(run_now(self.waits.as_deref()));
                 if let Some(n) = self.human_seq.as_mut() {
                     *n += 1;
                 }
@@ -2026,9 +2352,13 @@ impl Mock {
             w.lose_reply_to = None;
         }
         match (w.at, key) {
-            (ResetAt::Dialog, "down") => w.focus = (w.focus + 1) % w.labels.len(),
+            (ResetAt::Dialog, "down") => {
+                w.focus = (w.focus + 1) % w.labels.len();
+                w.draw_at_arrow();
+            }
             (ResetAt::Dialog, "up") => {
                 w.focus = (w.focus + w.labels.len() - 1) % w.labels.len();
+                w.draw_at_arrow();
             }
             (ResetAt::Dialog, "enter") => {
                 let grant = w.on_grant();
@@ -2050,7 +2380,7 @@ impl Mock {
             // re-arms on it.
             (ResetAt::Confirm, key) if w.guarded() => {
                 w.refused.push(key.to_string());
-                w.mounted = Some(Instant::now());
+                w.mounted = Some(run_now(self.waits.as_deref()));
                 if matches!(key, "enter" | "esc") {
                     w.shared
                         .ph
@@ -2301,14 +2631,22 @@ impl Mock {
                     .and_then(|n| n.parse::<u64>().ok())
                     .is_some_and(|n| n > self.seq);
                 if self.held() {
-                    // As a real wait on a screen that sits: not at once.
+                    // As a real wait on a screen that sits: not at once — the
+                    // whole time asked, skipped on the run's clock
+                    // ([`Self::waits`]), else a nap of it.
                     let asked = tail
                         .iter()
                         .position(|a| *a == "timeout")
                         .and_then(|i| tail.get(i + 1))
                         .and_then(|ms| ms.parse::<u64>().ok())
                         .unwrap_or(0);
-                    std::thread::sleep(Duration::from_millis(asked.min(2)));
+                    match &self.waits {
+                        Some(clock) => {
+                            let asked = Duration::from_millis(asked.max(1));
+                            clock.skip(self.stall_sleep.map_or(asked, |nap| asked.min(nap)));
+                        }
+                        None => std::thread::sleep(Duration::from_millis(asked.min(2))),
+                    }
                     return Ok(timeout());
                 }
                 if self.served < self.screens.len() && !stale {
@@ -2347,7 +2685,7 @@ impl Mock {
                     request: line.clone(),
                     card_age: survey_open(&screen).then(|| {
                         self.card_first_served
-                            .map_or(Duration::ZERO, |f| f.elapsed())
+                            .map_or(Duration::ZERO, |f| run_since(self.waits.as_deref(), f))
                     }),
                     zero: screen.iter().any(|r| r == "❯ 0"),
                     draft: screen.iter().any(|r| r.starts_with("❯ ") && r != "❯ 0"),
@@ -2401,6 +2739,11 @@ impl Mock {
                     return Ok(r);
                 }
                 let mut tail = tail;
+                // `act=<word>` (a host whose `help key` names it): what the
+                // press means for the box; it fences nothing.
+                if tail.first().is_some_and(|a| a.starts_with("act=")) {
+                    tail = &tail[1..];
+                }
                 // `if-human=<n>` (a host that sends the count): a person
                 // who keyed since the read skips the key.
                 if let Some(fence) = tail.first().and_then(|a| a.strip_prefix("if-human=")) {
@@ -2441,17 +2784,18 @@ impl Mock {
                     if tail.last() == Some(&"0")
                         && let (Some(within), Some(first)) =
                             (self.card_ignores_within, self.card_first_served)
-                        && first.elapsed() < within
+                        && run_since(self.waits.as_deref(), first) < within
                     {
                         self.early_zeroes += 1;
                     }
                     if tail.last() == Some(&"0") && self.card_debounce.is_some() {
                         let take = !self.card_drops_digits
                             && self.card_ignores_within.is_none_or(|w| {
-                                self.card_first_served.is_none_or(|f| f.elapsed() >= w)
+                                self.card_first_served
+                                    .is_none_or(|f| run_since(self.waits.as_deref(), f) >= w)
                             });
                         self.digit = Digit::Pending {
-                            at: Instant::now(),
+                            at: run_now(self.waits.as_deref()),
                             take,
                         };
                     }
@@ -2551,6 +2895,9 @@ impl Mock {
                 .history
                 .clone()
                 .unwrap_or_else(|| err("unknown verb (try: help)"))),
+            "offscreen" if self.offscreen.is_empty() && self.alt_archive.is_some() => {
+                Ok(self.archive_read(tail))
+            }
             "offscreen" => Ok(self
                 .offscreen
                 .pop_front()
@@ -2578,7 +2925,13 @@ impl Mock {
             }
             "help" => Ok(ok(&self.help.clone())),
             "who" if self.who.is_some() => Ok(ok(self.who.as_deref().unwrap_or_default())),
+            "search" if self.scrollback.is_some() => Ok(self.scrollback_search(tail)),
+            "line" if self.scrollback.is_some() => Ok(self.scrollback_line(tail)),
             "cell" if self.cell_unreadable => Ok(err("no such verb: cell")),
+            "cell" if self.measured_cell(tail).is_some() => Ok(ok(&format!(
+                "{}\n",
+                self.measured_cell(tail).unwrap_or_default()
+            ))),
             // The composer's column-2 cell: dim (the placeholder) unless
             // a test says the text there was typed.
             "cell" => Ok(ok(&format!(
@@ -2594,7 +2947,20 @@ impl Mock {
                     // Keyed: `owner=supervisor` is the loop's entry; the
                     // bare form is a person's.
                     let keyed = tail.get(2) == Some(&"owner=supervisor");
-                    let text = tail[if keyed { 3 } else { 2 }..].join(" ");
+                    // The server stores a keyed entry's `kind=` beside its
+                    // text, never in it.
+                    let kinded = keyed && tail.get(3).is_some_and(|t| t.starts_with("kind="));
+                    let text = tail[if kinded {
+                        4
+                    } else if keyed {
+                        3
+                    } else {
+                        2
+                    }..]
+                        .join(" ");
+                    if keyed && tail.first() == Some(&"set") {
+                        self.attention_kind = kinded.then(|| tail[3].to_string());
+                    }
                     match (tail.first(), keyed) {
                         (Some(&"set"), true) => {
                             if let Some(word) = self.questions_after_badge.take() {
@@ -2638,6 +3004,15 @@ impl Ctl for Mock {
             self.order.push((args.join(" "), r.ok()));
             return Ok(r);
         }
+        // The task record: the loop's bookkeeping too, outside the indexes —
+        // and, like the claim, a request the worker was sent, which a
+        // replay of the run's tape asks again (`tape::testing::assert_replays`).
+        if words.first() == Some(&"task") {
+            self.task_requests.push(words.join(" "));
+            let r = self.task_call(&words);
+            self.order.push((args.join(" "), r.ok()));
+            return Ok(r);
+        }
         let r = self.call_counted(args)?;
         self.order.push((args.join(" "), r.ok()));
         Ok(r)
@@ -2661,13 +3036,6 @@ impl Mock {
         } else {
             if let Some(pause) = self.delay.remove(&at) {
                 std::thread::sleep(pause);
-            }
-            if let Some(replies) = self.release_at.remove(&at)
-                && let Some(tx) = &self.release
-            {
-                for r in replies {
-                    let _ = tx.send(r);
-                }
             }
             if let Some((i, seq)) = self.restart
                 && i == at
@@ -3179,31 +3547,82 @@ fn write_prompt() -> Vec<String> {
     r[4] = "   rm -rf target".to_string();
     r
 }
-fn notes_file(tag: &str) -> (PathBuf, PathBuf) {
-    let dir = crate::supervise::test_scratch_path("supervise", tag);
-    std::fs::create_dir_all(&dir).expect("tmp dir");
-    let notes = dir.join("notes.txt");
-    let _ = std::fs::remove_file(&notes);
-    (dir, notes)
+/// A test's own approvals ledger (`<scratch>/s-1.jsonl`), kept by the loop it
+/// is given to ([`Book::keep`]): what the loop decided, box by box, read back
+/// as `<decision> <command>` rows ([`Book::decided`]), and why it handed a
+/// box over ([`Book::escalated`]). Its scratch dir goes with it.
+struct Book {
+    dir: PathBuf,
+    path: PathBuf,
 }
-fn read_notes(dir: &Path, notes: &Path) -> Vec<String> {
-    let text = std::fs::read_to_string(notes).unwrap_or_default();
-    let lines = text.lines().map(str::to_string).collect();
-    let _ = std::fs::remove_file(notes);
-    let _ = std::fs::remove_dir(dir);
-    lines
+
+impl Book {
+    fn new(tag: &str) -> Self {
+        let dir = crate::supervise::test_scratch_path("book", tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let path = dir.join("s-1.jsonl");
+        Self { dir, path }
+    }
+
+    /// `s` keeps its approval ledger here.
+    fn keep<C: Ctl>(&self, s: &mut Session<'_, C>) {
+        s.set_approval_ledger(Some(self.path.clone()));
+    }
+
+    /// Every row, in order, as `(decision, command, reason)` — but the
+    /// loop's own record that a turn was read running
+    /// ([`crate::supervise::approvals::RULE_TURN_RAN`]), which decides no box.
+    fn rows(&self) -> Vec<(String, String, String)> {
+        std::fs::read_to_string(&self.path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|row| {
+                let v = aterm_json::from_str::<aterm_json::Value>(row).ok()?;
+                let field = |k: &str| {
+                    v.get(k)
+                        .and_then(aterm_json::Value::as_str)
+                        .unwrap_or("?")
+                        .to_string()
+                };
+                (field("rule_id") != crate::supervise::approvals::RULE_TURN_RAN)
+                    .then(|| (field("decision"), field("command"), field("reason")))
+            })
+            .collect()
+    }
+
+    /// Every row, in order, as `<decision> <command>`.
+    fn decided(&self) -> Vec<String> {
+        self.rows()
+            .into_iter()
+            .map(|(decision, command, _)| format!("{decision} {command}"))
+            .collect()
+    }
+
+    /// The reasons of the rows that handed a box over, in order.
+    fn escalated(&self) -> Vec<String> {
+        self.rows()
+            .into_iter()
+            .filter(|(decision, ..)| decision == "escalated")
+            .map(|(.., reason)| reason)
+            .collect()
+    }
 }
-fn auto(max_s: u64, notes: Option<PathBuf>) -> SuperviseOpts {
+
+impl Drop for Book {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn auto(max_s: u64) -> SuperviseOpts {
     SuperviseOpts {
         max: Duration::from_secs(max_s),
         python_allow: vec![],
-        notes,
-        report: false,
-        // The CLI's default: with no indicator on a screen, nothing moves.
+        // The hosted loop's: with no indicator on a screen, nothing moves.
         context_warn: 10,
         journal: None,
         ledger: None,
-        mail: None,
         // The safe approval rules alone (an rm breaker they cannot prove
         // is a person's, `rm_breaker_ask`), and every turn-end act limited
         // except a usage limit's resume, which only a test that sets it
@@ -3225,6 +3644,7 @@ fn auto(max_s: u64, notes: Option<PathBuf>) -> SuperviseOpts {
         },
         yield_when_held: false,
         idle_host: None,
+        tasks: None,
     }
 }
 
@@ -3391,6 +3811,75 @@ fn a_span_the_grid_no_longer_has_is_read_again() {
     );
 }
 
+/// A transport that answers every request with one reply and records
+/// what it was sent: the session log's `act` marks, alone.
+struct MarkFake {
+    sent: Vec<String>,
+    reply: CtlReply,
+}
+
+impl Ctl for MarkFake {
+    fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
+        self.sent.push(args.join(" "));
+        Ok(self.reply.clone())
+    }
+}
+
+/// THE ACT MARKS' LATCH (ruling S28): a server that refuses the verb (an
+/// older build's `ERR unknown verb`) or the mark itself (`ERR usage: mark`,
+/// `ERR mark:`) is sent ONE mark, and the loop sends no other after it,
+/// queued then or later; `ERR busy retry_ms=` drops that mark alone, never
+/// retried. Each request is exactly `mark - act word=<w> [rule=<id>]` and
+/// no other verb is ever sent for one.
+#[test]
+fn a_refused_act_mark_latches_the_rest_off() {
+    let first = "@s-1 mark - act word=approve rule=read-only.classify-v3";
+    for (err, latched) in [
+        ("ERR unknown verb 'mark' (help lists them)", true),
+        ("ERR usage: mark <node|-> <kind> [word=<w>] …", true),
+        ("ERR mark: word=x is not a act word (approve deny)", true),
+        ("ERR busy retry_ms=50", false),
+    ] {
+        let mut fake = MarkFake {
+            sent: Vec::new(),
+            reply: CtlReply {
+                code: 1,
+                stdout: String::new(),
+                stderr: format!("aterm-ctl: {err}\n"),
+            },
+        };
+        let mut s = Session::new(&mut fake, Some("@s-1".to_string()));
+        s.act_marks
+            .queue("act word=approve rule=read-only.classify-v3".to_string());
+        s.act_marks.queue("act word=escalate".to_string());
+        s.send_act_marks();
+        s.act_marks.queue("act word=deny rule=write.v1".to_string());
+        s.send_act_marks();
+        drop(s);
+        let want: Vec<&str> = if latched {
+            vec![first]
+        } else {
+            vec![
+                first,
+                "@s-1 mark - act word=escalate",
+                "@s-1 mark - act word=deny rule=write.v1",
+            ]
+        };
+        assert_eq!(fake.sent, want, "{err}");
+    }
+    // NEGATIVE CONTROL: a server that takes them is sent each, once.
+    let mut fake = MarkFake {
+        sent: Vec::new(),
+        reply: ok("OK 9\n"),
+    };
+    let mut s = Session::new(&mut fake, None);
+    s.act_marks.queue("act word=answer".to_string());
+    s.send_act_marks();
+    s.send_act_marks();
+    drop(s);
+    assert_eq!(fake.sent, ["mark - act word=answer"]);
+}
+
 /// The approval policy: a read-only Bash prompt is approved with the
 /// guarded press (the judged command row, anchored; the fence asked of
 /// `help key` once), noted; the loop waits for the box to leave (`await
@@ -3398,12 +3887,11 @@ fn a_span_the_grid_no_longer_has_is_read_again() {
 /// not `await gone`; the next (write) prompt is handed to the manager.
 #[test]
 fn supervise_auto_approves_reads_guarded_and_hands_over_writes() {
-    let (dir, notes) = notes_file("approve");
+    let book = Book::new("approve");
     let mut m = fenced(vec![bash_one_row(), busy_screen(), write_prompt()]);
     let mut s = session(&mut m, Some("@s-9".to_string()));
-    let (out, code) = s
-        .supervise(&auto(30, Some(notes.clone())))
-        .expect("supervise");
+    book.keep(&mut s);
+    let (out, code) = s.supervise(&auto(30)).expect("supervise");
     assert_eq!(code, 0);
     assert!(
         out.starts_with("prompt\nkind bash\ncommand rm -rf target\n"),
@@ -3420,70 +3908,64 @@ fn supervise_auto_approves_reads_guarded_and_hands_over_writes() {
             "@s-9 key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             "@s-9 await seq 101 timeout 20000",
             "@s-9 text --json tail=40",
+            "@s-9 mark - act word=approve rule=read-only.classify-v3",
             "@s-9 await idle 500 timeout 1500",
             "@s-9 text --json tail=40",
             "@s-9 status",
+            "@s-9 mark - act word=escalate",
         ],
         "one guarded press, then the box must leave before the next look; \
          after it the settle wait, not `await gone` (the footer is not up yet); \
-         each box decided reads the session's program first"
+         each box decided reads the session's program first; each look's \
+         act (the press, the hand-over) is the session log's mark once the \
+         look returns"
     );
-    let lines = read_notes(&dir, &notes);
-    assert_eq!(lines.len(), 2, "{lines:?}");
-    assert!(lines[0].contains("approved read-only"), "{lines:?}");
-    assert!(lines[1].contains("handed to the manager"), "{lines:?}");
+    assert_eq!(
+        book.decided(),
+        ["approved git log --oneline -5", "escalated rm -rf target"]
+    );
 }
 
 /// `OK skipped seq=<n>` is an answer, not an approval: nothing was
-/// pressed, so nothing is approved or noted as such — the loop looks again.
+/// pressed, so nothing is approved — the press is booked skipped, and the
+/// loop looks again.
 #[test]
 fn a_skipped_guard_is_not_an_approval() {
-    let (dir, notes) = notes_file("skipped");
+    let book = Book::new("skipped");
     let mut m = fenced(vec![bash_one_row(), idle_screen()]);
     // The box resolved between the read (seq 101) and the check (seq 105).
     m.key_replies.push_back(ok("OK skipped seq=105\n"));
     let mut s = session(&mut m, None);
-    let (out, code) = s
-        .supervise(&auto(30, Some(notes.clone())))
-        .expect("supervise");
+    book.keep(&mut s);
+    let (out, code) = s.supervise(&auto(30)).expect("supervise");
     assert_eq!(code, 0);
     assert!(out.starts_with("idle\n--\n"), "{out}");
     assert_eq!(
         m.presses(),
         ["key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1"]
     );
-    let lines = read_notes(&dir, &notes);
-    assert_eq!(lines.len(), 1, "{lines:?}");
-    assert!(
-        lines[0].ends_with("nothing pressed, the box had left the screen: git log --oneline -5"),
-        "{lines:?}"
-    );
-    assert!(!lines.iter().any(|l| l.contains("approved")), "{lines:?}");
+    assert_eq!(book.decided(), ["skipped git log --oneline -5"]);
 }
 
 /// A guard that misses on the very screen that was parsed (`OK skipped` at
 /// the read's own seq) hands the box to the manager rather than looping.
 #[test]
 fn a_guard_that_matches_no_row_of_the_parsed_box_is_handed_over() {
-    let (dir, notes) = notes_file("norow");
     let mut m = fenced(vec![bash_one_row()]);
     // The read is seq 101; the guard found no row on that very screen.
     m.key_replies.push_back(ok("OK skipped seq=101\n"));
     let mut s = session(&mut m, None);
-    let (out, code) = s
-        .supervise(&auto(30, Some(notes.clone())))
-        .expect("supervise");
+    let (out, code) = s.supervise(&auto(30)).expect("supervise");
+    assert_eq!(
+        s.box_reason.as_ref().map(|(_, why)| why.as_str()),
+        Some("aterm could not find the box's row")
+    );
+    drop(s);
     assert_eq!(code, 0);
     assert!(out.starts_with("prompt\nkind bash\n"), "{out}");
     assert_eq!(
         m.presses(),
         ["key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1"]
-    );
-    let lines = read_notes(&dir, &notes);
-    assert_eq!(lines.len(), 1, "{lines:?}");
-    assert!(
-        lines[0].contains("handed to the manager (aterm could not find the box's row)"),
-        "{lines:?}"
     );
 }
 
@@ -3494,7 +3976,7 @@ fn a_guard_that_matches_no_row_of_the_parsed_box_is_handed_over() {
 /// nothing approved.
 #[test]
 fn guard_errors_are_retried_or_surfaced_never_approved() {
-    let (dir, notes) = notes_file("busy");
+    let book = Book::new("busy");
     let mut m = fenced(vec![
         bash_one_row(),
         bash_one_row(),
@@ -3503,9 +3985,8 @@ fn guard_errors_are_retried_or_surfaced_never_approved() {
     ]);
     m.key_replies.push_back(err("busy sink"));
     let mut s = session(&mut m, None);
-    let (out, code) = s
-        .supervise(&auto(30, Some(notes.clone())))
-        .expect("supervise");
+    book.keep(&mut s);
+    let (out, code) = s.supervise(&auto(30)).expect("supervise");
     assert_eq!(code, 0);
     assert!(out.starts_with("idle\n--\n"), "{out}");
     let guard = G_PRESS.trim_start_matches("key ");
@@ -3530,22 +4011,27 @@ fn guard_errors_are_retried_or_surfaced_never_approved() {
         "the second press follows a fresh read: {:?}",
         m.requests
     );
-    let lines = read_notes(&dir, &notes);
-    assert_eq!(lines.len(), 1, "{lines:?}");
-    assert!(lines[0].contains("approved read-only"), "{lines:?}");
+    let decided = book.decided();
+    assert_eq!(
+        decided.iter().filter(|r| r.starts_with("approved")).count(),
+        1,
+        "{decided:?}"
+    );
 
     for what in ["no such session", "badregex"] {
-        let (dir, notes) = notes_file("halted");
+        let book = Book::new("halted");
         let mut m = fenced(vec![bash_one_row()]);
         m.key_replies.push_back(err(what));
         let mut s = session(&mut m, None);
-        let e = s
-            .supervise(&auto(30, Some(notes.clone())))
-            .expect_err("surfaces");
+        book.keep(&mut s);
+        let e = s.supervise(&auto(30)).expect_err("surfaces");
         assert!(e.contains(&format!("ERR {what}")), "{what}: {e}");
         assert_eq!(m.presses().len(), 1, "{what}: {:?}", m.requests);
-        let lines = read_notes(&dir, &notes);
-        assert!(lines.is_empty(), "{what}: nothing approved: {lines:?}");
+        let decided = book.decided();
+        assert!(
+            !decided.iter().any(|r| r.starts_with("approved")),
+            "{what}: nothing approved: {decided:?}"
+        );
     }
 }
 
@@ -3574,12 +4060,11 @@ fn under_approve_none_every_prompt_is_handed_over() {
 /// unchanged is pressed once and handed over.
 #[test]
 fn the_same_box_is_never_pressed_twice_on_an_unchanged_screen() {
-    let (dir, notes) = notes_file("unchanged");
+    let book = Book::new("unchanged");
     let mut m = fenced(vec![bash_one_row()]);
     let mut s = session(&mut m, None);
-    let (out, code) = s
-        .supervise(&auto(30, Some(notes.clone())))
-        .expect("supervise");
+    book.keep(&mut s);
+    let (out, code) = s.supervise(&auto(30)).expect("supervise");
     assert_eq!(code, 0);
     assert!(out.starts_with("prompt\n"), "{out}");
     assert_eq!(
@@ -3593,24 +4078,20 @@ fn the_same_box_is_never_pressed_twice_on_an_unchanged_screen() {
             "key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             "await seq 101 timeout 20000",
             "text --json tail=40",
+            "mark - act word=approve rule=read-only.classify-v3",
         ],
         "{:?}",
         m.requests
     );
-    let lines = read_notes(&dir, &notes);
-    assert_eq!(lines.len(), 2, "{lines:?}");
-    assert!(lines[0].contains("approved read-only"), "{lines:?}");
-    assert!(
-        lines[1].contains("handed to the manager (the box did not change after the press)"),
-        "{lines:?}"
-    );
+    // Approved once, and then handed over (`out` is the box's point).
+    assert_eq!(book.decided(), ["approved git log --oneline -5"]);
 }
 
 /// The same read coming back after real turns is approved twice; the third
 /// time it is handed over rather than pressed forever.
 #[test]
 fn a_read_that_keeps_coming_back_is_approved_twice_then_handed_over() {
-    let (dir, notes) = notes_file("repeat");
+    let book = Book::new("repeat");
     let mut m = fenced(vec![
         bash_one_row(),
         busy_screen(),
@@ -3619,20 +4100,21 @@ fn a_read_that_keeps_coming_back_is_approved_twice_then_handed_over() {
         bash_one_row(),
     ]);
     let mut s = session(&mut m, None);
-    let (out, code) = s
-        .supervise(&auto(30, Some(notes.clone())))
-        .expect("supervise");
+    book.keep(&mut s);
+    let (out, code) = s.supervise(&auto(30)).expect("supervise");
     assert_eq!(code, 0);
     assert!(
         out.starts_with("prompt\nkind bash\ncommand git log --oneline -5\n"),
         "{out}"
     );
     assert_eq!(m.presses().len(), 2, "{:?}", m.requests);
-    let lines = read_notes(&dir, &notes);
-    assert_eq!(lines.len(), 3, "{lines:?}");
-    assert!(
-        lines[2].contains("handed to the manager (the same prompt came back after two approvals)"),
-        "{lines:?}"
+    assert_eq!(
+        book.decided(),
+        [
+            "approved git log --oneline -5",
+            "approved git log --oneline -5",
+            "escalated git log --oneline -5",
+        ]
     );
 }
 
@@ -3739,10 +4221,13 @@ fn taped_session<'m, 't>(
     s.set_fx(tape.fx.clone());
     s
 }
-/// A memory tape over a fixed clock not yet fixed, and the transport `m`
-/// through its door.
+/// A memory tape over a fixed clock not yet fixed, which `m`'s waits on a
+/// sitting screen skip ([`Mock::waits`]), and the transport `m` through its
+/// door.
 fn memory_tape(m: &mut Mock) -> (MemoryTape, TapedCtl<'_, Mock>) {
-    let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())));
+    let clock = Arc::new(super::super::fx::ScriptedClock::default());
+    m.waits = (!m.real_time).then(|| Arc::clone(&clock));
+    let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(clock)));
     let taped = TapedCtl::new(m, tape.fx.clone(), crate::supervise::tape::doors::CTL);
     (tape, taped)
 }
@@ -4040,6 +4525,46 @@ fn render_prompt_prints_the_notes_after_the_description_and_before_classify() {
     assert!(!out.contains("\nnote "), "{out}");
 }
 
+/// `aterm drive phase` names agy's and Muse Code's OWN BACKGROUND WORK as
+/// the reason a turn's end reads busy (their readers' `background_wait`):
+/// `reason its own background work: a background task running` under agy's
+/// panel, `… background work running` under Muse Code's. NEGATIVE CONTROLS:
+/// a turn running over agy's panel keeps its spinner's reason, and the same
+/// sessions with their work over read idle, with no reason line.
+#[test]
+fn drive_phase_names_agy_and_muse_background_work() {
+    use aterm_phase::agy::fixtures::lab as a;
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    use aterm_phase::{AgyReader, MuseReader};
+    let render = |reader: &dyn ScreenReader, text: &str| {
+        let rows = screen(text);
+        let turn = Turn {
+            phase: reader.phase(&rows),
+            screen: Screen {
+                rows,
+                ..Screen::default()
+            },
+            timed_out: false,
+        };
+        render_phase(&turn, reader, &[])
+    };
+    assert_eq!(
+        render(&AgyReader, a::BG_TASK),
+        "busy\nreason its own background work: a background task running\n"
+    );
+    assert_eq!(
+        render(&MuseReader, u::END_OF_TURN_BG_RUNNING),
+        "busy\nreason its own background work: background work running\n"
+    );
+    assert_eq!(
+        render(&AgyReader, a::BG_BUSY),
+        "busy\nreason status row: esc to interrupt\n"
+    );
+    assert_eq!(render(&AgyReader, a::BG_TASK_ENDED), "idle\n");
+    assert_eq!(render(&MuseReader, u::END_OF_TURN_BG_FINISHED), "idle\n");
+}
+
 /// The EVENT summary is the worker's last row, never the session survey
 /// Claude Code parks under the done row (the saved wait_bg7 screen). A
 /// workflow launch, which has no command, is named by its description.
@@ -4212,7 +4737,7 @@ fn the_event_summary_joins_the_replys_wrapped_rows() {
 fn supervise_hands_a_limit_notice_over_like_idle() {
     let mut m = Mock::new(vec![busy_screen(), limited_screen()]);
     let mut s = session(&mut m, None);
-    let (out, code) = s.supervise(&auto(30, None)).expect("supervise");
+    let (out, code) = s.supervise(&auto(30)).expect("supervise");
     assert_eq!(code, 0);
     assert!(
         out.starts_with(
@@ -4226,157 +4751,9 @@ fn supervise_hands_a_limit_notice_over_like_idle() {
     assert!(
         !m.requests
             .iter()
-            .any(|r| r.starts_with("meta") || r.starts_with("post") || r.starts_with("turn")),
+            .any(|r| r.starts_with("meta") || r.starts_with("turn")),
         "{:?}",
         m.requests
-    );
-}
-
-/// An `offscreen … screen=1` reply as `aterm ctl` prints it: the rows on
-/// stdout, the header on stderr.
-fn offscreen_reply(first: u64, archived: &[&str], screen: &[String]) -> CtlReply {
-    let n = u64::try_from(archived.len()).expect("fits");
-    let mut stdout: String = archived.iter().map(|r| format!("{r}\n")).collect();
-    stdout.extend(screen.iter().map(|r| format!("{r}\n")));
-    CtlReply {
-        code: 0,
-        stdout,
-        stderr: format!(
-            "aterm-ctl: OK {} first={first} last={} lost=0 breaks=0 back=0 epoch=1 \
-             origin=5 alt=1 seq=1 screen_rows={}\n",
-            archived.len() + screen.len(),
-            (first + n).saturating_sub(1),
-            screen.len()
-        ),
-    }
-}
-
-/// `watch --report`: an idle, question or limited point's EVENT line
-/// carries `complete=<0|1> rows=<n>` of the report — read at the point,
-/// `history` then one `offscreen` — before the summary; an approval and
-/// a prompt's EVENT are as without the flag, and nothing else changes.
-#[test]
-fn watch_report_counts_the_report_into_the_events_that_end_on_words() {
-    let mut m = fenced(vec![
-        busy_screen(),
-        bash_one_row(),
-        busy_screen(),
-        question_screen(),
-        busy_screen(),
-        idle_screen(),
-    ]);
-    m.vanish_after = Some(1);
-    m.history = Some(ok(
-        "turn 7 submitted=1 status=settled started_ms=1 dur_ms=2 seq=3 \
-         hash=0000000000000000 arch=5:40 text=Pick%20one\n",
-    ));
-    // At the question: the turn's row scrolled off (archived 41..=42).
-    m.offscreen.push_back(offscreen_reply(
-        41,
-        &["❯ Pick one", "⏺ Looking at both."],
-        &question_screen(),
-    ));
-    // At the idle point: the turn's row is nowhere to be read.
-    m.offscreen
-        .push_back(offscreen_reply(41, &[], &idle_screen()));
-    let opts = SuperviseOpts {
-        report: true,
-        ..auto(30, None)
-    };
-    let (lines, code) = watch_lines(&mut m, &opts);
-    assert_eq!(
-        lines,
-        [
-            "APPROVED seq=102 git log --oneline -5",
-            "EVENT question seq=104 complete=1 rows=3 ⏺ Did the suite pass on your machine?",
-            "EVENT idle seq=106 complete=0 rows=3 ⏺ Done.",
-            "EXIT session gone (await seq 106 failed: aterm-ctl: ERR exited)",
-        ]
-    );
-    assert_eq!(code, 1);
-    let reads: Vec<&String> = m
-        .requests
-        .iter()
-        .filter(|r| r.starts_with("history") || r.starts_with("offscreen"))
-        .collect();
-    assert_eq!(
-        reads,
-        [
-            "history 8",
-            "offscreen since=5:40 max=8000 screen=1",
-            "history 8",
-            "offscreen since=5:40 max=8000 screen=1",
-        ]
-    );
-    // A prompt's point counts no report, and busy is never a point.
-    assert!(!reported(&Phase::Prompt) && !reported(&Phase::Busy));
-    let mut m = Mock::new(vec![write_prompt()]);
-    m.vanish_after = Some(1);
-    let (lines, _) = watch_lines(&mut m, &opts);
-    assert_eq!(
-        lines[0],
-        "EVENT prompt seq=101 kind=bash classify=not-read-only:rm command=rm -rf target"
-    );
-    assert!(
-        !m.requests
-            .iter()
-            .any(|r| r.starts_with("history") || r.starts_with("offscreen")),
-        "{:?}",
-        m.requests
-    );
-}
-
-/// A report that fails for any reason but a lost connection does not end
-/// `watch`: the point is still reported, `complete=0 rows=0`, and the
-/// failure goes to the notes.
-#[test]
-fn a_report_that_fails_still_reports_the_point() {
-    let (dir, notes) = notes_file("report-fails");
-    let mut m = Mock::new(vec![idle_screen()]);
-    m.vanish_after = Some(1);
-    m.offscreen.push_back(CtlReply {
-        code: 0,
-        stdout: "one row\n".to_string(),
-        stderr: "aterm-ctl: OK 3 first=1 last=1 lost=0 breaks=0 back=0 origin=5 alt=1\n"
-            .to_string(),
-    });
-    let opts = SuperviseOpts {
-        report: true,
-        ..auto(30, Some(notes.clone()))
-    };
-    let (lines, _) = watch_lines(&mut m, &opts);
-    assert_eq!(lines[0], "EVENT idle seq=101 complete=0 rows=0 ⏺ Done.");
-    let noted = read_notes(&dir, &notes);
-    assert!(
-        noted.len() == 1 && noted[0].contains("report failed: offscreen: the header counts 3"),
-        "{noted:?}"
-    );
-}
-
-/// `watch --report` against a host without `offscreen`: the report is the
-/// screen alone (a full `text --json`), never complete.
-#[test]
-fn watch_report_on_an_old_host_reads_the_screen_alone() {
-    let mut m = Mock::new(vec![idle_screen()]);
-    m.vanish_after = Some(1);
-    let opts = SuperviseOpts {
-        report: true,
-        ..auto(30, None)
-    };
-    let (lines, _) = watch_lines(&mut m, &opts);
-    assert_eq!(lines[0], "EVENT idle seq=101 complete=0 rows=3 ⏺ Done.");
-    let at = m
-        .requests
-        .iter()
-        .position(|r| r == "history 8")
-        .expect("history read");
-    assert_eq!(
-        m.requests[at..at + 3],
-        [
-            "history 8",
-            "offscreen tail=8000 max=8000 screen=1",
-            "text --json"
-        ]
     );
 }
 
@@ -4396,7 +4773,7 @@ fn a_point_is_new_when_its_transcript_moved_whatever_the_loop_saw() {
     let mut m = Mock::new(vec![question_screen(), ticked]);
     m.idle_skips_busy = true;
     m.vanish_after = Some(1);
-    let (lines, code) = watch_lines(&mut m, &auto(30, None));
+    let (lines, code) = watch_lines(&mut m, &auto(30));
     assert_eq!(
         lines,
         [
@@ -4431,7 +4808,7 @@ fn a_point_is_new_when_its_transcript_moved_whatever_the_loop_saw() {
     let mut m = Mock::new(vec![first, busy_screen(), again]);
     m.idle_skips_busy = true;
     m.vanish_after = Some(0);
-    let (lines, _) = watch_lines(&mut m, &auto(30, None));
+    let (lines, _) = watch_lines(&mut m, &auto(30));
     assert_eq!(
         lines,
         [
@@ -4527,7 +4904,7 @@ fn a_frameless_screen_still_changing_is_busy_until_it_settles() {
     m.replies.push_back(ok("OK gone 100\n"));
     m.replies.push_back(timeout());
     let mut s = session(&mut m, None);
-    let (out, code) = s.supervise(&auto(30, None)).expect("supervise");
+    let (out, code) = s.supervise(&auto(30)).expect("supervise");
     assert_eq!(code, 0);
     assert_eq!(out, "idle\n--\n$ make\ncompiling a\ncompiling b\ndone\n$\n");
     assert_eq!(
@@ -4564,7 +4941,7 @@ fn nothing_happens_after_the_budget() {
 
     let mut m = fenced(vec![bash_one_row()]);
     let mut s = session(&mut m, None);
-    let (out, code) = s.supervise(&auto(0, None)).expect("supervise");
+    let (out, code) = s.supervise(&auto(0)).expect("supervise");
     assert_eq!(code, EXIT_TIMEOUT);
     assert!(out.starts_with("TIMEOUT\nprompt\nkind bash\n"), "{out}");
     assert!(m.presses().is_empty(), "{:?}", m.requests);
@@ -4584,7 +4961,7 @@ fn nothing_happens_after_the_budget() {
     m.delay.insert(6, Duration::from_millis(200));
     let opts = SuperviseOpts {
         max: Duration::from_millis(100),
-        ..auto(0, None)
+        ..auto(0)
     };
     let (lines, code) = watch_lines(&mut m, &opts);
     assert_eq!(
@@ -4598,8 +4975,13 @@ fn nothing_happens_after_the_budget() {
         )
     );
     // The start-up `meta`, then the seven (the box's `status` and cwd
-    // `meta` among them); nothing read after.
-    assert_eq!(m.requests.len(), 8, "nothing read after: {:?}", m.requests);
+    // `meta` among them); nothing read after, only the session log's mark
+    // of the press the budget held (sent once its look returned).
+    assert_eq!(m.requests.len(), 9, "nothing read after: {:?}", m.requests);
+    assert_eq!(
+        m.requests.last().map(String::as_str),
+        Some("mark - act word=approve rule=read-only.classify-v3")
+    );
 }
 
 #[test]
@@ -4651,7 +5033,7 @@ fn watch_says_a_survey_once_when_it_appears() {
         with_survey(said_idle("⏺ Pushed.")),
     ]);
     m.vanish_after = Some(1);
-    let (lines, code) = watch_lines(&mut m, &auto(30, None));
+    let (lines, code) = watch_lines(&mut m, &auto(30));
     assert_eq!(
         lines,
         [
@@ -4673,23 +5055,26 @@ fn watch_says_a_survey_once_when_it_appears() {
 /// `dismiss_surveys`: the survey that appears gets one guarded `0` (`key
 /// if=^●.How.is.Claude.doing 0`, no other key) and the loop looks again
 /// from a fresh read: the survey gone, the `0` is said as `DISMISSED
-/// survey seq=<n>` (the press's seq) and noted, and the point under it
-/// reported. `supervise` says the line on stderr, never in its result.
+/// survey seq=<n>` (the press's seq), and the point under it reported. `supervise` says the line on stderr, never in its result.
 #[test]
 fn dismiss_surveys_presses_one_guarded_0() {
-    let (dir, notes) = notes_file("survey");
     let mut m = Mock::new(vec![with_survey(idle_screen()), idle_screen()]);
     m.vanish_after = Some(1);
-    let (lines, code) = watch_lines(&mut m, &surveys(auto(30, Some(notes.clone())), true));
-    // (The printed lines: `watch_tells_the_window_its_story_through_the_teller_and_prints_the_same_lines`,
-    // the same script.)
-    assert_eq!(lines[0], "DISMISSED survey seq=101");
+    let opts = surveys(auto(30), true);
+    let (lines, code) = watch_lines(&mut m, &opts);
+    assert_eq!(
+        lines,
+        [
+            "DISMISSED survey seq=101",
+            "EVENT idle seq=102 ⏺ Done.",
+            "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)",
+        ]
+    );
     assert_eq!(code, 1);
     assert_eq!(m.presses(), ["key if=^●.How.is.Claude.doing 0"]);
-    assert_eq!(read_notes(&dir, &notes).len(), 1, "the dismissal noted");
 
     let mut m = Mock::new(vec![with_survey(idle_screen()), idle_screen()]);
-    let opts = surveys(auto(30, None), true);
+    let opts = surveys(auto(30), true);
     let mut log: Vec<u8> = Vec::new();
     let (out, code) = session(&mut m, Some("@s-1".to_string()))
         .supervise_to(&opts, &mut log)
@@ -4736,7 +5121,7 @@ fn agys_survey_is_dismissed_with_its_guarded_0() {
     let mut m = Mock::new(vec![card.clone(), card.clone(), ended.clone()]);
     m.program = "agy";
     m.vanish_after = Some(1);
-    let (lines, _) = watch_lines(&mut m, &surveys(auto(30, None), true));
+    let (lines, _) = watch_lines(&mut m, &surveys(auto(30), true));
     assert_eq!(
         m.presses(),
         [&format!("key if={guard} 0")],
@@ -4758,7 +5143,7 @@ fn agys_survey_is_dismissed_with_its_guarded_0() {
     let mut m = Mock::new(vec![card.clone(), card, ended]);
     m.program = "agy";
     m.vanish_after = Some(1);
-    let (lines, _) = watch_lines(&mut m, &surveys(auto(30, None), false));
+    let (lines, _) = watch_lines(&mut m, &surveys(auto(30), false));
     assert!(m.presses().is_empty(), "the control: {:?}", m.requests);
     let said = format!(" dismiss with: aterm ctl key 'if={guard}' 0");
     assert!(
@@ -4769,129 +5154,15 @@ fn agys_survey_is_dismissed_with_its_guarded_0() {
     );
 }
 
-/// What a printed line is told to the window as: the command never travels
-/// (an APPROVED is told bare), a line with no decision is told nothing,
-/// and the text is cut to the wire's 96 bytes at a character boundary.
-#[test]
-fn story_of_maps_the_journal_lines_onto_the_closed_verb_set_without_the_command() {
-    let told = |l: &str| story_of(l).map(|(v, t)| format!("{v}|{t}"));
-    assert_eq!(
-        told("APPROVED seq=41 rm -rf target").as_deref(),
-        Some("approved|"),
-        "never the command"
-    );
-    assert_eq!(
-        told("DISMISSED survey seq=101").as_deref(),
-        Some("dismissed|survey")
-    );
-    assert_eq!(
-        told("RECONNECTED after 812 ms").as_deref(),
-        Some("reconnected|after 812 ms")
-    );
-    assert_eq!(told("TIMEOUT").as_deref(), Some("timeout|"));
-    assert_eq!(
-        told("EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)").as_deref(),
-        Some("exit|session gone (await seq 102 failed: aterm-ctl: ERR exited)")
-    );
-    assert_eq!(
-        told("CHOSE seq=40 rule=answer-recommended@v1 policy=recommended Drop the table? → No")
-            .as_deref(),
-        Some("chose|recommended"),
-        "the policy word, never the question or its answer"
-    );
-    assert_eq!(told("EVENT compacted seq=9").as_deref(), Some("compacted|"));
-    assert_eq!(
-        told("EVENT context seq=9 12% until auto-compact").as_deref(),
-        Some("warned|context 12% until auto-compact")
-    );
-    for none in [
-        "EVENT idle seq=102 ⏺ Done.",
-        "EVENT prompt seq=3 kind=bash classify=read-only command=ls",
-        "EVENT turn seq=5 report=7 rows=12 done",
-        "EVENT survey seq=7 dismiss with: aterm ctl @s-1 key 0",
-        "RECONNECT lost socket",
-        "MAIL id=3 off=1 from=s-2 kind=report len=40",
-        "",
-    ] {
-        assert_eq!(told(none), None, "{none:?}");
-    }
-    let long = format!("EXIT {}é", "x".repeat(95));
-    let (_, text) = story_of(&long).expect("an exit");
-    assert_eq!(
-        text.len(),
-        95,
-        "cut BEFORE the 2-byte char that would cross 96"
-    );
-    assert!(text.is_char_boundary(text.len()));
-}
-
-/// `watch` tells the worker's window its story (one `@sid story <verb>
-/// [<text>]` per journaled decision, through the teller's client, in
-/// journal order) and the printed lines are byte-identical to a watch
-/// without one (the `dismiss_surveys` case above). The session's own client
-/// sees no story request: the lane is a second connection.
-#[test]
-fn watch_tells_the_window_its_story_through_the_teller_and_prints_the_same_lines() {
-    let mut m = Mock::new(vec![with_survey(idle_screen()), idle_screen()]);
-    m.vanish_after = Some(1);
-    let mut teller = Mock::new(Vec::new());
-    let opts = surveys(auto(30, None), true);
-    let mut out: Vec<u8> = Vec::new();
-    let mut warn: Vec<u8> = Vec::new();
-    let code = session(&mut m, Some("@s-1".to_string())).watch_with(
-        &opts,
-        None::<&mut NoLane>,
-        Some(&mut teller),
-        &mut out,
-        &mut warn,
-    );
-    let lines: Vec<String> = String::from_utf8(out)
-        .expect("utf-8")
-        .lines()
-        .map(str::to_string)
-        .collect();
-    assert_eq!(
-        lines,
-        [
-            "DISMISSED survey seq=101",
-            "EVENT idle seq=102 ⏺ Done.",
-            "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)",
-        ],
-        "byte-identical to the watch without a teller"
-    );
-    assert_eq!(code, 1);
-    assert_eq!(
-        teller.requests,
-        [
-            "@s-1 story dismissed survey",
-            "@s-1 story exit session gone (await seq 102 failed: aterm-ctl: ERR exited)",
-        ],
-        "{:?}",
-        teller.requests
-    );
-    assert!(
-        m.requests.iter().all(|r| !r.contains("story")),
-        "the session's own client carries no story: {:?}",
-        m.requests
-    );
-    assert!(warn.is_empty(), "{}", String::from_utf8_lossy(&warn));
-}
-
 /// A guarded `0` that finds no survey row — it left between the read and
 /// the check, `OK skipped seq=<n>` — pressed nothing: no DISMISSED line,
-/// no note, and the loop looks again (where the survey is gone).
+/// and the loop looks again (where the survey is gone).
 #[test]
 fn a_skipped_survey_press_says_nothing() {
-    let (dir, notes) = notes_file("survey-skipped");
     let mut m = Mock::new(vec![with_survey(idle_screen()), idle_screen()]);
     m.key_replies.push_back(ok("OK skipped seq=105\n"));
     m.vanish_after = Some(0);
-    let opts = surveys(
-        SuperviseOpts {
-            ..auto(30, Some(notes.clone()))
-        },
-        true,
-    );
+    let opts = surveys(auto(30), true);
     let (lines, code) = watch_lines(&mut m, &opts);
     assert_eq!(
         lines,
@@ -4902,8 +5173,6 @@ fn a_skipped_survey_press_says_nothing() {
     );
     assert_eq!(code, 1);
     assert_eq!(m.presses(), ["key if=^●.How.is.Claude.doing 0"]);
-    let noted = read_notes(&dir, &notes);
-    assert!(noted.is_empty(), "{noted:?}");
 }
 
 /// A survey on a screen with a box waits for the box: the read is approved
@@ -4918,7 +5187,7 @@ fn a_survey_waits_while_a_box_is_up() {
         idle_screen(),
     ]);
     m.vanish_after = Some(1);
-    let opts = surveys(auto(30, None), true);
+    let opts = surveys(auto(30), true);
     let (lines, _) = watch_lines(&mut m, &opts);
     assert_eq!(
         lines,
@@ -4941,8 +5210,8 @@ fn a_survey_waits_while_a_box_is_up() {
 }
 
 /// The survey dismissed, on the defaults of the other survey tests.
-fn dismissing(notes: Option<PathBuf>) -> SuperviseOpts {
-    surveys(auto(30, notes), true)
+fn dismissing() -> SuperviseOpts {
+    surveys(auto(30), true)
 }
 
 /// A host that only hears about the surveys the loop cannot close
@@ -5000,7 +5269,7 @@ fn a_look_the_host_scheduled_ends_the_idle_wait_step_at_its_instant() {
         m.vanish_after = Some(1);
         let opts = SuperviseOpts {
             idle_host: Some(Arc::new(LooksAt(at)) as Arc<dyn IdleHost>),
-            ..auto(30, None)
+            ..auto(30)
         };
         let _ = watch_lines(&mut m, &opts);
         m.requests
@@ -5061,9 +5330,11 @@ fn the_wake_at_a_host_look_steps_the_host_and_decides_no_turn_end() {
         m.stall_sleep = Some(Duration::from_millis(50));
         m.vanish_after = Some(30);
         m.cursor_on_caret = true;
+        // The host's look is due on the system's clock.
+        m.real_time = true;
         let opts = SuperviseOpts {
             idle_host: look.then(|| Arc::clone(&host) as Arc<dyn IdleHost>),
-            ..auto(30, None)
+            ..auto(30)
         };
         let (lines, _) = watch_lines(&mut m, &opts);
         let acts: Vec<String> = m
@@ -5223,7 +5494,7 @@ fn a_persons_grace_holds_the_0_on_busy_reads_and_says_so_once() {
         let opts = SuperviseOpts {
             max: Duration::from_secs(1),
             journal: Some(path.clone()),
-            ..surveys(auto(1, None), true)
+            ..surveys(auto(1), true)
         };
         let (_, _) = watch_lines(&mut m, &opts);
         assert!(m.presses().is_empty(), "{:?}", m.requests);
@@ -5272,7 +5543,7 @@ fn a_withheld_card_first_read_busy_is_told_at_the_idle_look_and_ended_when_it_go
         idle_screen(),
     ]);
     m.vanish_after = Some(1);
-    let (opts, told) = told_surveys(dismissing(None));
+    let (opts, told) = told_surveys(dismissing());
     let (lines, _) = watch_lines(&mut m, &opts);
     assert!(m.presses().is_empty(), "{:?}", m.requests);
     assert_no_attention(&m);
@@ -5301,7 +5572,7 @@ fn an_unknown_card_without_the_vendors_mark_is_said_and_never_pressed() {
     ];
     let mut m = Mock::new(vec![with_card(idle_screen(), &card)]);
     m.vanish_after = Some(0);
-    let (lines, _) = watch_lines(&mut m, &dismissing(None));
+    let (lines, _) = watch_lines(&mut m, &dismissing());
     assert!(m.presses().is_empty(), "{:?}", m.requests);
     assert!(
         lines.iter().any(
@@ -5319,7 +5590,7 @@ fn an_unknown_card_without_the_vendors_mark_is_said_and_never_pressed() {
     ];
     let mut m = Mock::new(vec![with_card(idle_screen(), &card)]);
     m.vanish_after = Some(0);
-    let (opts, told) = told_surveys(dismissing(None));
+    let (opts, told) = told_surveys(dismissing());
     let (lines, _) = watch_lines(&mut m, &opts);
     assert!(m.presses().is_empty(), "{:?}", m.requests);
     assert!(
@@ -5347,7 +5618,7 @@ fn an_unknown_card_without_the_vendors_mark_is_said_and_never_pressed() {
 fn a_loop_that_sees_no_survey_tells_the_host_once() {
     let mut m = Mock::new(vec![idle_screen(), idle_screen(), idle_screen()]);
     m.vanish_after = Some(0);
-    let (opts, told) = told_surveys(dismissing(None));
+    let (opts, told) = told_surveys(dismissing());
     let _ = watch_lines(&mut m, &opts);
     let told = told.0.lock().unwrap().clone();
     assert_eq!(told, [None], "once, with nothing to end: {told:?}");
@@ -5359,7 +5630,7 @@ fn a_loop_that_sees_no_survey_tells_the_host_once() {
 fn the_drafts_card_is_never_pressed_or_called_a_survey() {
     let mut m = Mock::new(vec![with_card(idle_screen(), &DRAFTS_ROWS)]);
     m.vanish_after = Some(0);
-    let (lines, _) = watch_lines(&mut m, &dismissing(None));
+    let (lines, _) = watch_lines(&mut m, &dismissing());
     assert!(m.presses().is_empty(), "{:?}", m.requests);
     assert!(!lines.iter().any(|l| l.contains("survey")), "{lines:?}");
     assert!(!survey_open(&with_card(idle_screen(), &DRAFTS_ROWS)));
@@ -5415,7 +5686,7 @@ fn every_kind_is_dismissed_over_a_workflow_wait_on_the_busy_read() {
     ] {
         let mut m = Mock::new(vec![with_card(workflow_screen(), card), workflow_screen()]);
         m.vanish_after = Some(1);
-        let (lines, _) = watch_lines(&mut m, &dismissing(None));
+        let (lines, _) = watch_lines(&mut m, &dismissing());
         assert_eq!(
             m.presses(),
             [&format!("key if={guard} 0")],
@@ -5452,7 +5723,7 @@ fn a_late_vendor_timer_takes_the_0_inside_the_landing_time_and_is_never_backspac
         m.card_debounce = Some(Duration::from_millis(debounce_ms));
         m.vanish_after = Some(1);
         m.stall_sleep = Some(Duration::from_millis(500));
-        let (lines, _) = watch_lines_with(&mut m, &dismissing(None), |s| {
+        let (lines, _) = watch_lines_with(&mut m, &dismissing(), |s| {
             s.set_survey_land(Duration::from_millis(400));
         });
         assert_eq!(
@@ -5489,7 +5760,7 @@ fn a_busy_read_presses_a_card_once_and_leaves_the_ladder_to_the_idle_look() {
     let run = |base: &dyn Fn() -> Vec<String>| {
         let mut m = Mock::new(script(base));
         m.vanish_after = Some(1);
-        let _ = watch_lines_with(&mut m, &dismissing(None), |s| {
+        let _ = watch_lines_with(&mut m, &dismissing(), |s| {
             s.set_survey_retry([Duration::ZERO; SURVEY_TRIES]);
         });
         m
@@ -5539,27 +5810,20 @@ fn a_refused_backspace_keeps_the_0_owed_until_the_server_takes_it() {
             m.hold_lifts_after = Some(1);
         }
         m.vanish_after = Some(0);
-        let (dir, notes) = notes_file("survey-refused-backspace");
-        let (lines, _) = watch_lines(&mut m, &dismissing(Some(notes.clone())));
+        let (lines, _) = watch_lines(&mut m, &dismissing());
         let backspaces = m.requests.iter().filter(|r| *r == "key backspace").count();
-        assert!(
-            backspaces >= 2,
-            "{refusal}: the removal is tried again, not forgotten: {:#?}",
+        // "busy sink" is retried inside the helper (three quick tries) before it is a
+        // refusal: the refused reply is consumed by the first, the second is taken. Once
+        // taken, the `0` is removed: no backspace follows it.
+        assert_eq!(
+            backspaces, 2,
+            "{refusal}: the removal is tried again, not forgotten, and only until it is \
+             taken: {:#?}",
             m.requests
         );
         assert!(
             lines.iter().all(|l| !l.contains("DISMISSED")),
             "{refusal}: {lines:?}"
-        );
-        let noted = read_notes(&dir, &notes);
-        // Exactly one note that a `0` was backspaced, and only after the server took it.
-        assert_eq!(
-            noted
-                .iter()
-                .filter(|n| n.contains("backspaced a 0 left in the composer"))
-                .count(),
-            1,
-            "{refusal}: {noted:?}"
         );
     }
 }
@@ -5581,7 +5845,7 @@ fn a_survey_whose_0_did_not_take_is_tried_again_until_it_goes() {
         idle_screen(),
     ]);
     m.vanish_after = Some(1);
-    let (opts, told) = told_surveys(dismissing(None));
+    let (opts, told) = told_surveys(dismissing());
     let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
         s.set_survey_retry([Duration::ZERO; SURVEY_TRIES]);
     });
@@ -5603,24 +5867,55 @@ fn a_survey_whose_0_did_not_take_is_tried_again_until_it_goes() {
             if why.starts_with("the session survey did not close")),
         "told from the second failure, ended when it went: {told:?}"
     );
+    // The `0` that did not take is accounted for at the look that finds the card still open
+    // without it: a lone `0` read after the card has gone is someone else's, never backspaced.
+    let mut m = Mock::new(vec![
+        with_survey(idle_screen()),
+        with_survey(idle_screen()),
+        idle_screen(),
+        with_zero(idle_screen()),
+    ]);
+    m.vanish_after = Some(1);
+    let _ = watch_lines(&mut m, &dismissing());
+    assert_eq!(
+        m.presses(),
+        ["key if=^●.How.is.Claude.doing 0"],
+        "{:#?}",
+        m.requests
+    );
+    // …but not at a look under a box drawn under the card (the composer not shown): the `0`
+    // stays owed there, and the card's dropped `0` is backspaced once the box has gone.
+    let mut m = Mock::new(vec![
+        with_survey(idle_screen()),
+        with_survey(bash_one_row()),
+        with_zero(with_survey(idle_screen())),
+        idle_screen(),
+    ]);
+    m.vanish_after = Some(0);
+    let _ = watch_lines(&mut m, &dismissing());
+    assert_eq!(
+        m.presses(),
+        ["key if=^●.How.is.Claude.doing 0", "key backspace"],
+        "{:#?}",
+        m.requests
+    );
     // Negative control: the dismissal switched off.
     let mut m = Mock::new(vec![with_survey(idle_screen())]);
     m.vanish_after = Some(1);
-    let _ = watch_lines(&mut m, &surveys(auto(30, None), false));
+    let _ = watch_lines(&mut m, &surveys(auto(30), false));
     assert!(m.presses().is_empty(), "{:#?}", m.requests);
 }
 
 /// A `0` that landed in the composer (the survey left between the check and
-/// the keystroke) is backspaced and noted, and nothing is said dismissed.
+/// the keystroke) is backspaced, and nothing is said dismissed.
 #[test]
 fn a_0_that_landed_in_the_composer_is_backspaced_not_dismissed() {
-    let (dir, notes) = notes_file("survey-stray");
     let mut zero = idle_screen();
     let c = zero.iter().position(|r| r == "❯").expect("composer");
     zero[c] = "❯ 0".to_string();
     let mut m = Mock::new(vec![with_survey(idle_screen()), zero, idle_screen()]);
     m.vanish_after = Some(0);
-    let (lines, _) = watch_lines(&mut m, &dismissing(Some(notes.clone())));
+    let (lines, _) = watch_lines(&mut m, &dismissing());
     assert_eq!(
         lines,
         [
@@ -5632,9 +5927,6 @@ fn a_0_that_landed_in_the_composer_is_backspaced_not_dismissed() {
         m.presses(),
         ["key if=^●.How.is.Claude.doing 0", "key backspace"]
     );
-    let noted = read_notes(&dir, &notes);
-    assert_eq!(noted.len(), 1, "{noted:?}");
-    assert!(noted[0].contains("nothing was dismissed"), "{noted:?}");
 }
 
 /// A survey that leaves during a busy spell and comes back has appeared
@@ -5649,7 +5941,7 @@ fn a_survey_back_after_a_busy_spell_is_a_new_appearance() {
         said_idle("⏺ Pushed."),
     ]);
     m.vanish_after = Some(0);
-    let (lines, _) = watch_lines(&mut m, &dismissing(None));
+    let (lines, _) = watch_lines(&mut m, &dismissing());
     assert_eq!(
         lines,
         [
@@ -5666,6 +5958,24 @@ fn a_survey_back_after_a_busy_spell_is_a_new_appearance() {
             "key if=^●.How.is.Claude.doing 0"
         ]
     );
+    // Gone at a read no look judges (output still being written), and back while the first
+    // card's `0` may still be landing: the wait on the card back keeps the first one's leaving,
+    // and the first card is said dismissed once the landing time is out.
+    let mut m = Mock::new(vec![
+        with_survey(idle_screen()),
+        rows(&["$ targo --unverified build", "   Compiling aterm-agent"]),
+        with_survey(idle_screen()),
+    ]);
+    m.vanish_after = Some(2);
+    m.stall_sleep = Some(Duration::from_millis(400));
+    let (lines, _) = watch_lines_with(&mut m, &dismissing(), |s| {
+        s.set_survey_land(Duration::from_millis(300));
+        s.set_mono_standing();
+    });
+    assert!(
+        lines.iter().any(|l| l == "DISMISSED survey seq=101"),
+        "{lines:#?}"
+    );
 }
 
 /// A guarded `0` that was skipped, with the survey still open at the next
@@ -5673,11 +5983,10 @@ fn a_survey_back_after_a_busy_spell_is_a_new_appearance() {
 /// line and tried again after its back-off.
 #[test]
 fn a_skipped_0_on_a_survey_still_open_is_handed_over() {
-    let (dir, notes) = notes_file("survey-skip-stays");
     let mut m = Mock::new(vec![with_survey(idle_screen())]);
     m.key_replies.push_back(ok("OK skipped seq=101\n"));
     m.vanish_after = Some(1);
-    let (lines, _) = watch_lines(&mut m, &dismissing(Some(notes.clone())));
+    let (lines, _) = watch_lines(&mut m, &dismissing());
     assert_eq!(
         lines,
         [
@@ -5687,11 +5996,6 @@ fn a_skipped_0_on_a_survey_still_open_is_handed_over() {
         ]
     );
     assert_eq!(m.presses(), ["key if=^●.How.is.Claude.doing 0"]);
-    let noted = read_notes(&dir, &notes);
-    assert!(
-        noted.len() == 1 && !noted[0].contains("dismissed the"),
-        "{noted:?}"
-    );
 }
 
 /// A draft can fill more than one composer row, and a `0` pressed then
@@ -5883,7 +6187,7 @@ fn descent() -> Vec<Vec<String>> {
 fn watch_says_a_descent_once_and_the_compaction_once() {
     let mut m = Mock::new(descent());
     m.vanish_after = Some(0);
-    let (lines, code) = watch_lines(&mut m, &auto(30, None));
+    let (lines, code) = watch_lines(&mut m, &auto(30));
     assert_eq!(
         lines,
         [
@@ -5898,11 +6202,11 @@ fn watch_says_a_descent_once_and_the_compaction_once() {
     assert!(m.presses().is_empty(), "{:?}", m.requests);
 }
 
-/// `--context-warn 0` says neither line: the same descent and compaction
+/// `context_warn: 0` says neither line: the same descent and compaction
 /// — here down to 0%, which 0 would read as low if it were a threshold
 /// and not off — print only the idle point, as without the indicator.
-/// `await-turn` says nothing of the indicator, even on a session a loop
-/// left a threshold on.
+/// The bare wait ([`Session::await_turn`], a test seam) says nothing of the
+/// indicator, even on a session a loop left a threshold on.
 #[test]
 fn context_warn_0_says_neither_line() {
     let mut screens = descent();
@@ -5911,7 +6215,7 @@ fn context_warn_0_says_neither_line() {
     m.vanish_after = Some(0);
     let opts = SuperviseOpts {
         context_warn: 0,
-        ..auto(30, None)
+        ..auto(30)
     };
     let (lines, _) = watch_lines(&mut m, &opts);
     assert_eq!(
@@ -5948,7 +6252,7 @@ fn a_jump_of_30_points_is_a_compaction_and_a_box_is_not() {
         with_context(said_idle("⏺ Pushed."), 60),
     ]);
     m.vanish_after = Some(0);
-    let (lines, _) = watch_lines(&mut m, &auto(30, None));
+    let (lines, _) = watch_lines(&mut m, &auto(30));
     assert_eq!(
         lines,
         [
@@ -6012,7 +6316,7 @@ fn a_narrowed_pane_is_not_a_compaction() {
         idle,
     ]);
     m.vanish_after = Some(0);
-    let (lines, _) = watch_lines(&mut m, &auto(30, None));
+    let (lines, _) = watch_lines(&mut m, &auto(30));
     assert_eq!(
         lines,
         [
@@ -6034,7 +6338,7 @@ fn supervise_watches_one_run() {
         let mut m = Mock::new(screens);
         let mut log: Vec<u8> = Vec::new();
         let (out, code) = session(&mut m, Some("@s-1".to_string()))
-            .supervise_to(&auto(30, None), &mut log)
+            .supervise_to(&auto(30), &mut log)
             .expect("supervise");
         assert_eq!(code, 0);
         assert!(out.starts_with("idle\n"), "{out}");
@@ -6136,7 +6440,7 @@ fn quick(m: &mut Mock, window: Duration) -> Session<'_, Mock> {
     s
 }
 fn watch_quick(m: &mut Mock, window: Duration) -> (Vec<String>, u8) {
-    watch_quick_with(m, window, &auto(30, None))
+    watch_quick_with(m, window, &auto(30))
 }
 /// [`watch_quick`] with `opts`: recorded, and replayed from its tape, as
 /// [`watch_lines_with`].
@@ -6160,10 +6464,10 @@ fn watch_quick_with(m: &mut Mock, window: Duration, opts: &SuperviseOpts) -> (Ve
     (lines, code)
 }
 /// The approval policy with a budget of `ms` milliseconds.
-fn auto_ms(ms: u64, notes: Option<PathBuf>) -> SuperviseOpts {
+fn auto_ms(ms: u64) -> SuperviseOpts {
     SuperviseOpts {
         max: Duration::from_millis(ms),
-        ..auto(0, notes)
+        ..auto(0)
     }
 }
 /// The milliseconds a `RECONNECTED after <ms> ms` line names.
@@ -6322,8 +6626,9 @@ fn exit_75_is_a_request_not_served() {
     assert!(!failed(1, REPLACED_ANCHOR).lost());
 }
 
-/// The same on `aterm drive await-turn`'s own client, [`crate::CtlClient`]
-/// — one `aterm-ctl` per request, its exit code handed up as it is. The
+/// A bare wait ([`Session::await_turn`], a test seam) on the per-request
+/// client, [`crate::CtlClient`] — one `aterm-ctl` per request, its exit code
+/// handed up as it is. The
 /// `aterm-ctl` here ends the turn's first wait as a real one ends a wait an
 /// update's Commit cut (the note, exit 75), then answers as the successor:
 /// the turn is read off the successor after one `RECONNECT`.
@@ -6495,7 +6800,7 @@ fn fx_virtual_clock_rides_out_an_hour_long_outage() {
         s.setup.pause = pause;
         s.setup.pause_max = pause_max;
         let mut out: Vec<u8> = Vec::new();
-        let code = s.watch(&auto(2 * 3600, None), &mut out);
+        let code = s.watch(&auto(2 * 3600), &mut out);
         let _ = tx.send((String::from_utf8(out).expect("utf-8"), code));
     });
     let (log, code) = rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN).expect(
@@ -6879,11 +7184,12 @@ fn a_connection_turned_away_is_ridden_out() {
     assert_eq!(code, 1);
 }
 
-/// The budget bounds an outage too: once `--max-s` (or `--timeout`) is
-/// spent while a lost connection is ridden out — or as the request is
-/// lost — the loop ends as it does on any spent budget. `watch` says
-/// `TIMEOUT` and exits 124; `supervise` returns `TIMEOUT` with the last
-/// screen read; `await-turn` the timed-out turn, and when no read ever
+/// The budget bounds an outage too: once [`SuperviseOpts::max`] (or the
+/// wait's timeout) is spent while a lost connection is ridden out — or as
+/// the request is lost — the loop ends as it does on any spent budget. The
+/// engine tests' seams: `Session::watch` says `TIMEOUT` and exits 124;
+/// `Session::supervise` returns `TIMEOUT` with the last screen read;
+/// `Session::await_turn` the timed-out turn, and when no read ever
 /// answered, a busy phase that says so.
 #[test]
 fn a_budget_spent_in_an_outage_is_the_timeout() {
@@ -6895,7 +7201,7 @@ fn a_budget_spent_in_an_outage_is_the_timeout() {
     // window of two minutes against a minute's hang detector tells the two
     // apart whatever the machine's load.
     let started = Instant::now();
-    let (lines, code) = watch_quick_with(&mut m, Duration::from_secs(120), &auto_ms(150, None));
+    let (lines, code) = watch_quick_with(&mut m, Duration::from_secs(120), &auto_ms(150));
     assert!(
         started.elapsed() < Duration::from_secs(60),
         "{:?}",
@@ -6915,7 +7221,7 @@ fn a_budget_spent_in_an_outage_is_the_timeout() {
     let mut m = Mock::new(vec![question_screen()]);
     m.by_index.insert(5, closed());
     m.delay.insert(5, Duration::from_millis(200));
-    let (lines, code) = watch_quick_with(&mut m, Duration::from_secs(5), &auto_ms(100, None));
+    let (lines, code) = watch_quick_with(&mut m, Duration::from_secs(5), &auto_ms(100));
     assert_eq!(
         lines,
         [
@@ -6937,7 +7243,7 @@ fn a_budget_spent_in_an_outage_is_the_timeout() {
     m.down = Some((2, closed()));
     let mut log: Vec<u8> = Vec::new();
     let (out, code) = quick(&mut m, Duration::from_secs(5))
-        .supervise_to(&auto_ms(150, None), &mut log)
+        .supervise_to(&auto_ms(150), &mut log)
         .expect("supervise");
     assert_eq!(code, EXIT_TIMEOUT);
     assert!(out.starts_with("TIMEOUT\nbusy\n"), "{out}");
@@ -6961,20 +7267,15 @@ fn a_budget_spent_in_an_outage_is_the_timeout() {
 /// the loop reads and classifies first. Here the box moved — a write now,
 /// not the read it was about to approve — so it is handed over, with the
 /// one press the log shows; nothing is APPROVED, since the press was never
-/// confirmed, and the notes say a press went unanswered. When the same
+/// confirmed: a press went unanswered. When the same
 /// read box is still up after the reconnect, it is pressed again only
 /// after the fresh read.
 #[test]
 fn a_press_in_flight_is_decided_again_from_a_fresh_read() {
-    let (dir, notes) = notes_file("inflight");
     let mut m = fenced(vec![bash_one_row(), write_prompt()]);
     m.by_index.insert(5, closed());
     m.vanish_after = Some(0);
-    let (lines, code) = watch_quick_with(
-        &mut m,
-        Duration::from_secs(5),
-        &auto(30, Some(notes.clone())),
-    );
+    let (lines, code) = watch_quick_with(&mut m, Duration::from_secs(5), &auto(30));
     assert_eq!(lines.len(), 4, "{lines:?}");
     assert_eq!(
         lines[0],
@@ -6999,10 +7300,6 @@ fn a_press_in_flight_is_decided_again_from_a_fresh_read() {
         m.presses(),
         ["key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1"]
     );
-    // The unanswered press is noted, never as an approval.
-    let noted = read_notes(&dir, &notes);
-    assert_eq!(noted.len(), 2, "{noted:?}");
-    assert!(!noted.iter().any(|n| n.contains("approved")), "{noted:?}");
 
     let mut m = fenced(vec![
         bash_one_row(),
@@ -7099,16 +7396,17 @@ fn a_busy_read_before_a_lost_connection_still_counts() {
     );
 }
 
-/// `supervise` rides it out the same way (`await-turn` too:
-/// `await_turn_on_the_per_request_client_rides_out_exit_75`); its lines go to
-/// the log (stderr), and its result is untouched.
+/// The engine tests' other seams, `Session::supervise` and
+/// [`Session::await_turn`] (`await_turn_on_the_per_request_client_rides_out_exit_75`),
+/// ride it out the same way; their lines go to the log they are handed, and
+/// their result is untouched.
 #[test]
 fn await_turn_and_supervise_ride_it_out_with_the_lines_on_stderr() {
     let mut m = Mock::new(vec![busy_screen(), write_prompt()]);
     m.by_index.insert(2, closed());
     let mut log: Vec<u8> = Vec::new();
     let (out, code) = quick(&mut m, Duration::from_secs(5))
-        .supervise_to(&auto(30, None), &mut log)
+        .supervise_to(&auto(30), &mut log)
         .expect("supervise");
     assert_eq!(code, 0);
     assert!(
@@ -7179,7 +7477,7 @@ fn watch_journals_every_line_it_prints() {
     m.vanish_after = Some(3);
     let opts = SuperviseOpts {
         journal: Some(path.clone()),
-        ..auto(30, None)
+        ..auto(30)
     };
     let mut out: Vec<u8> = Vec::new();
     let mut warn: Vec<u8> = Vec::new();
@@ -7257,43 +7555,6 @@ fn watch_journals_every_line_it_prints() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// `watch --report --journal`: the point's line carries `complete=` and
-/// `rows=`, and the record carries them as fields — with the ledger turn
-/// the report counted from, so the ledger can attribute the reply to the
-/// turn that asked for it.
-#[test]
-fn a_reported_point_journals_its_report_and_its_turn() {
-    let (dir, path) = journal_file("report");
-    let mut m = Mock::new(vec![idle_screen()]);
-    m.vanish_after = Some(1);
-    m.history = Some(ok(
-        "turn 7 submitted=1 status=settled started_ms=1 dur_ms=2 seq=3 \
-         hash=0000000000000000 arch=5:40 text=Pick%20one\n",
-    ));
-    m.offscreen
-        .push_back(offscreen_reply(41, &["❯ Pick one"], &idle_screen()));
-    let opts = SuperviseOpts {
-        report: true,
-        journal: Some(path.clone()),
-        ..auto(30, None)
-    };
-    let mut out: Vec<u8> = Vec::new();
-    let mut warn: Vec<u8> = Vec::new();
-    session(&mut m, None).watch_to(&opts, &mut out, &mut warn);
-    let (records, _) = journal_records(&path);
-    let point = &records[0];
-    assert_eq!(point.kind, "event");
-    assert_eq!(
-        (point.complete, point.rows, point.turn),
-        (Some(true), Some(4), Some(7))
-    );
-    assert_eq!(point.summary, "⏺ Done.");
-    assert!(point.sid.is_none(), "no @sid was given");
-    assert_eq!(records[1].kind, "exit");
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_dir(dir);
-}
-
 /// `supervise --journal`: the lines it says on stderr are journaled, and
 /// so are the ones `watch` would have printed for what it decides
 /// silently — the review point's EVENT line, an approval, and the
@@ -7303,7 +7564,7 @@ fn supervise_journals_what_watch_would_have_printed() {
     let (dir, path) = journal_file("supervise");
     let opts = SuperviseOpts {
         journal: Some(path.clone()),
-        ..auto(30, None)
+        ..auto(30)
     };
     let mut m = Mock::new(vec![
         with_context(busy_screen(), 9),
@@ -7356,7 +7617,7 @@ fn supervise_journals_what_watch_would_have_printed() {
         .supervise_to(
             &SuperviseOpts {
                 journal: Some(path.clone()),
-                ..auto(30, None)
+                ..auto(30)
             },
             &mut log,
         )
@@ -7384,7 +7645,7 @@ fn a_journal_that_fails_is_said_once_and_stops_nothing() {
     std::fs::write(&path, "").expect("a file where a directory would have to be");
     let opts = SuperviseOpts {
         journal: Some(path.join("under-a-file.jsonl")),
-        ..auto(30, None)
+        ..auto(30)
     };
     let mut m = Mock::new(vec![busy_screen(), question_screen()]);
     m.vanish_after = Some(1);
@@ -7416,619 +7677,6 @@ fn a_journal_that_fails_is_said_once_and_stops_nothing() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// The mail lane's scripted client (`Session::watch_mail`'s second
-/// [`Ctl`]). `await inbox` answers come through a channel the screen mock
-/// releases into ([`Mock::release_at`]) and time out after `step` with
-/// none, as the server's parked wait does; every other request pops the
-/// next scripted reply (an empty inbox listing with none left).
-struct MailMock {
-    requests: Vec<String>,
-    awaits: std::sync::mpsc::Receiver<CtlReply>,
-    /// The interrupter's way in: a timeout sent here ends a parked wait.
-    release: std::sync::mpsc::Sender<CtlReply>,
-    replies: VecDeque<CtlReply>,
-    step: Duration,
-}
-
-/// A short parked wait: the loop's process ends within one.
-const MAIL_STEP: Duration = Duration::from_millis(10);
-
-impl MailMock {
-    /// The lane's mock and the sender the screen mock releases through.
-    fn new(replies: Vec<CtlReply>) -> (Self, std::sync::mpsc::Sender<CtlReply>) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        (
-            Self {
-                requests: Vec::new(),
-                awaits: rx,
-                release: tx.clone(),
-                replies: replies.into(),
-                step: MAIL_STEP,
-            },
-            tx,
-        )
-    }
-    /// The requests with the parked waits' `timeout <ms>` and their
-    /// repeats cut: what the lane asked, in order, each once.
-    fn asked(&self) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for r in &self.requests {
-            let r = match r.find(" timeout ") {
-                Some(i) => r[..i].to_string(),
-                None => r.clone(),
-            };
-            if out.last() != Some(&r) {
-                out.push(r);
-            }
-        }
-        out
-    }
-}
-
-impl Ctl for MailMock {
-    fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
-        self.requests.push(args.join(" "));
-        let verb_at = usize::from(args.first().is_some_and(|a| a.starts_with('@')));
-        if args.get(verb_at) == Some(&"await") {
-            return Ok(self
-                .awaits
-                .recv_timeout(self.step)
-                .unwrap_or_else(|_| timeout()));
-        }
-        Ok(self
-            .replies
-            .pop_front()
-            .unwrap_or_else(|| ok("OK 0 hold=0 holder=- seen=0 bus_head=0 dropped=0 pending=0\n")))
-    }
-    /// As the real client's: the parked wait answers at once (here with
-    /// a timeout; `aterm-ctl` signalled answers with no `OK`).
-    fn interrupter(&self) -> Option<Interrupter> {
-        let release = self.release.clone();
-        Some(Box::new(move || {
-            let _ = release.send(timeout());
-        }))
-    }
-}
-
-/// The manager's inbox as the lane first reads it: one row, id 4.
-const INBOX_AT_START: &str = "OK 1 hold=0 holder=- seen=3 bus_head=80 dropped=0 pending=0\n\
-                              msg 4 off=80 t=1000 from=h-owner kind=note trust=human len=3\n";
-/// What lands during the run: the owner's ask, then the worker's report.
-const INBOX_LANDED: &str = "OK 2 hold=0 holder=- seen=3 bus_head=91 dropped=0 pending=0\n\
-                            msg 5 off=90 t=2000 from=h-owner kind=ask trust=human re=70 len=7\n\
-                            msg 6 off=91 t=2100 from=s-1@n-1 kind=report trust=agent len=40\n";
-const REPORT_BODY: &str = "Suite green.\n987 passed, 0 failed.\nNothing left.\n";
-
-fn mail_opts(window: Duration, grace: Duration) -> SuperviseOpts {
-    SuperviseOpts {
-        mail: Some(super::super::mail::MailOpts {
-            inbox: None,
-            report_window: window,
-            idle_grace: grace,
-        }),
-        ..auto(30, None)
-    }
-}
-fn watch_mail_lines(m: &mut Mock, lane: &mut MailMock, opts: &SuperviseOpts) -> (Vec<String>, u8) {
-    let mut out: Vec<u8> = Vec::new();
-    let mut s = session(m, Some("@s-1".to_string()));
-    s.set_mail_step(MAIL_STEP);
-    let code = s.watch_mail(opts, Some(lane), &mut out);
-    let text = String::from_utf8(out).expect("utf-8");
-    (text.lines().map(str::to_string).collect(), code)
-}
-
-/// `watch --mail`: the lane parks on the manager's inbox and prints one
-/// `MAIL` line per delivery; the worker's `report` after the idle point is
-/// folded into it as one `EVENT turn` line (the report's row id and body
-/// row count, no `report` read from the screen), while the worker's socket
-/// sees exactly the requests it sees without the flag. The journal records
-/// the MAIL lines (kind `mail`) and the fold (`report`, `rows`).
-#[test]
-fn watch_mail_folds_the_workers_report_into_its_turn() {
-    let (dir, path) = journal_file("mail");
-    let (mut lane, release) =
-        MailMock::new(vec![ok(INBOX_AT_START), ok(INBOX_LANDED), ok(REPORT_BODY)]);
-    let mut m = Mock::new(vec![busy_screen(), idle_screen()]);
-    m.vanish_after = Some(1);
-    m.release = Some(release);
-    // Released as the idle screen is read (request 3, after the busy
-    // read's footer wait): the report comes AFTER the point.
-    m.release_at.insert(3, vec![ok("OK inbox 6\n")]);
-    let opts = SuperviseOpts {
-        report: true,
-        journal: Some(path.clone()),
-        ..mail_opts(Duration::from_secs(120), Duration::from_secs(180))
-    };
-    let (lines, code) = watch_mail_lines(&mut m, &mut lane, &opts);
-    assert_eq!(
-        lines,
-        [
-            "MAIL id=5 off=90 from=h-owner kind=ask len=7 re=70",
-            "MAIL id=6 off=91 from=s-1@n-1 kind=report len=40",
-            "EVENT turn seq=102 report=6 rows=3 ⏺ Done.",
-            "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)",
-        ]
-    );
-    assert_eq!(code, 1);
-    // The worker's socket: not one request more than without --mail, and no
-    // `report` read for the folded point.
-    assert_eq!(
-        m.requests,
-        [
-            "@s-1 meta",
-            "@s-1 await gone esc.to.interrupt timeout 3000",
-            "@s-1 text --json tail=40",
-            "@s-1 await gone esc.to.interrupt rows 2 7 timeout 20000",
-            "@s-1 text --json tail=40",
-            "@s-1 await seq 102 timeout 20000",
-            "@s-1 text --json tail=40",
-            // No `status` read yet: the step that ran out asks whether
-            // the worker still reads its input (`stall.rs`).
-            "@s-1 status",
-            "@s-1 await seq 102 timeout 20000",
-        ]
-    );
-    assert_eq!(
-        lane.asked(),
-        [
-            "@self inbox 1 --peek --meta".to_string(),
-            format!(
-                "@self await inbox since=4 {}",
-                super::super::mail::mail_kinds_arg()
-            ),
-            "@self inbox since=4 --peek --meta".to_string(),
-            "@self inbox get 6".to_string(),
-            format!(
-                "@self await inbox since=6 {}",
-                super::super::mail::mail_kinds_arg()
-            ),
-        ]
-    );
-    let (records, _) = journal_records(&path);
-    assert_eq!(
-        records.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(),
-        ["mail", "mail", "event", "exit"]
-    );
-    assert_eq!(
-        records[1].summary,
-        "id=6 off=91 from=s-1@n-1 kind=report len=40"
-    );
-    assert_eq!(
-        (
-            records[2].phase.as_str(),
-            records[2].seq,
-            records[2].report,
-            records[2].rows,
-            records[2].complete
-        ),
-        ("turn", Some(102), Some(6), Some(3), None)
-    );
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_dir(dir);
-}
-
-/// A report that lands BEFORE the screen settles (the worker posts as
-/// the turn ends) folds into the idle point that follows within the
-/// window; outside the window it is another turn's, and the idle waits
-/// its grace and is said with no report.
-#[test]
-fn a_report_that_came_first_folds_into_the_idle_that_follows() {
-    let landed = "OK 1 hold=0 holder=- seen=3 bus_head=91 dropped=0 pending=0\n\
-                  msg 6 off=91 t=2100 from=s-1@n-1 kind=report trust=agent len=40\n";
-    let (mut lane, release) = MailMock::new(vec![ok(INBOX_AT_START), ok(landed), ok(REPORT_BODY)]);
-    let mut m = Mock::new(vec![busy_screen(), idle_screen()]);
-    m.vanish_after = Some(1);
-    m.release = Some(release);
-    // Released at the loop's first request: the report is in before the
-    // worker's screen was even read.
-    m.release_at.insert(0, vec![ok("OK inbox 6\n")]);
-    let opts = mail_opts(Duration::from_secs(120), Duration::from_secs(180));
-    let (lines, _) = watch_mail_lines(&mut m, &mut lane, &opts);
-    assert_eq!(
-        lines,
-        [
-            "MAIL id=6 off=91 from=s-1@n-1 kind=report len=40",
-            "EVENT turn seq=102 report=6 rows=3 ⏺ Done.",
-            "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)",
-        ]
-    );
-    // The window is all the loop knows when it never saw the turn begin:
-    // a worker found idle at the loop's start, a report that came before
-    // its screen was read. Within the window it is this turn's …
-    let found_idle = |window: Duration| {
-        let (mut lane, release) =
-            MailMock::new(vec![ok(INBOX_AT_START), ok(landed), ok(REPORT_BODY)]);
-        let mut m = Mock::new(vec![idle_screen()]);
-        m.vanish_after = Some(1);
-        m.release = Some(release);
-        m.release_at.insert(0, vec![ok("OK inbox 6\n")]);
-        // The report is in before the screen is read (request 1).
-        m.delay.insert(1, Duration::from_millis(40));
-        let opts = mail_opts(window, Duration::from_millis(50));
-        watch_mail_lines(&mut m, &mut lane, &opts).0
-    };
-    assert_eq!(
-        found_idle(Duration::from_secs(120)),
-        [
-            "MAIL id=6 off=91 from=s-1@n-1 kind=report len=40",
-            "EVENT turn seq=101 report=6 rows=3 ⏺ Done.",
-            "EXIT session gone (await seq 101 failed: aterm-ctl: ERR exited)",
-        ]
-    );
-    // … and past it (a zero window) another turn's.
-    assert_eq!(
-        found_idle(Duration::ZERO),
-        [
-            "MAIL id=6 off=91 from=s-1@n-1 kind=report len=40",
-            "EVENT idle-no-report seq=101 ⏺ Done.",
-            "EXIT session gone (await seq 101 failed: aterm-ctl: ERR exited)",
-        ]
-    );
-}
-
-const LANDED_6: &str = "OK 1 hold=0 holder=- seen=3 bus_head=91 dropped=0 pending=0\n\
-                        msg 6 off=91 t=2100 from=s-1@n-1 kind=report trust=agent len=40\n";
-const LANDED_7: &str = "OK 1 hold=0 holder=- seen=3 bus_head=92 dropped=0 pending=0\n\
-                        msg 7 off=92 t=2200 from=s-1@n-1 kind=report trust=agent len=18\n";
-
-/// A worker ends a turn with a question and posts that turn's report. A
-/// question point is not held, so the report stays pending. The manager
-/// answers, the worker works and goes idle with no report: the next idle
-/// must not name the question turn's report, since a report from before
-/// the last handed-over point is never the next turn's.
-#[test]
-fn a_question_turns_report_is_not_the_next_turns() {
-    let (mut lane, release) =
-        MailMock::new(vec![ok(INBOX_AT_START), ok(LANDED_6), ok(REPORT_BODY)]);
-    let mut m = Mock::new(vec![
-        busy_screen(),
-        question_screen(),
-        busy_screen(),
-        idle_screen(),
-    ]);
-    m.vanish_after = Some(1);
-    m.release = Some(release);
-    // The report lands as the question settles (request 2 is the wait
-    // for the busy footer to leave); the question is read 100 ms later
-    // (request 3), the MAIL line printed by then.
-    m.release_at.insert(2, vec![ok("OK inbox 6\n")]);
-    m.delay.insert(3, Duration::from_millis(100));
-    let opts = mail_opts(Duration::from_secs(120), Duration::from_millis(200));
-    let (lines, _) = watch_mail_lines(&mut m, &mut lane, &opts);
-    assert_eq!(
-        lines,
-        [
-            "MAIL id=6 off=91 from=s-1@n-1 kind=report len=40",
-            "EVENT question seq=102 ⏺ Did the suite pass on your machine?",
-            "EVENT idle-no-report seq=104 ⏺ Done.",
-            "EXIT session gone (await seq 104 failed: aterm-ctl: ERR exited)",
-        ]
-    );
-}
-
-/// Two reports in one turn, both the worker's. The first folds into the
-/// idle; the second lands while the worker is STILL
-/// idle in that turn, after the point was handed over and before the
-/// worker was read busy again. It is that turn's late report, not the
-/// next turn's.
-#[test]
-fn a_second_report_of_a_turn_is_not_the_next_turns() {
-    let (mut lane, release) = MailMock::new(vec![
-        ok(INBOX_AT_START),
-        ok(LANDED_6),
-        ok(REPORT_BODY),
-        ok(LANDED_7),
-        ok("Also: lint clean.\n"),
-    ]);
-    let mut m = Mock::new(vec![
-        busy_screen(),
-        idle_screen(),
-        busy_screen(),
-        idle_screen(),
-    ]);
-    m.vanish_after = Some(1);
-    m.release = Some(release);
-    // The first report as the idle is read (request 3, after the busy
-    // read's footer wait): folds into it.
-    m.release_at.insert(3, vec![ok("OK inbox 6\n")]);
-    // The worker's own report after the fold, the worker still idle
-    // (request 4 is the wait past the point); the next turn's reads come
-    // 100 ms later, the MAIL line printed by then.
-    m.release_at.insert(4, vec![ok("OK inbox 7\n")]);
-    m.delay.insert(5, Duration::from_millis(100));
-    let opts = mail_opts(Duration::from_secs(120), Duration::from_millis(200));
-    let (lines, _) = watch_mail_lines(&mut m, &mut lane, &opts);
-    assert_eq!(
-        lines,
-        [
-            "MAIL id=6 off=91 from=s-1@n-1 kind=report len=40",
-            "EVENT turn seq=102 report=6 rows=3 ⏺ Done.",
-            "MAIL id=7 off=92 from=s-1@n-1 kind=report len=18",
-            "EVENT idle-no-report seq=104 ⏺ Done.",
-            "EXIT session gone (await seq 104 failed: aterm-ctl: ERR exited)",
-        ]
-    );
-}
-
-/// A report posted mid-turn (a re-fired Stop's, a tool call's), the worker
-/// then working past the window (100 ms here, 120 s in production): the
-/// report came after the worker was read busy, so the turn did report.
-#[test]
-fn a_mid_turn_report_older_than_the_window_is_still_its_turns() {
-    let (mut lane, release) =
-        MailMock::new(vec![ok(INBOX_AT_START), ok(LANDED_6), ok(REPORT_BODY)]);
-    let mut m = Mock::new(vec![busy_screen(), idle_screen()]);
-    m.vanish_after = Some(1);
-    m.release = Some(release);
-    // Posted while busy (request 2 waits on the busy screen's footer) …
-    m.release_at.insert(2, vec![ok("OK inbox 6\n")]);
-    // … and the worker works on for 300 ms past the window.
-    m.delay.insert(3, Duration::from_millis(300));
-    let opts = mail_opts(Duration::from_millis(100), Duration::from_millis(100));
-    let (lines, _) = watch_mail_lines(&mut m, &mut lane, &opts);
-    assert_eq!(
-        lines,
-        [
-            "MAIL id=6 off=91 from=s-1@n-1 kind=report len=40",
-            "EVENT turn seq=102 report=6 rows=3 ⏺ Done.",
-            "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)",
-        ]
-    );
-}
-
-/// A writer that stamps each line with when it was printed.
-struct Stamped {
-    started: Instant,
-    buf: Vec<u8>,
-    lines: Vec<(Duration, String)>,
-}
-impl Write for Stamped {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.buf.extend_from_slice(b);
-        while let Some(i) = self.buf.iter().position(|&c| c == b'\n') {
-            let line = String::from_utf8_lossy(&self.buf[..i]).into_owned();
-            self.lines.push((self.started.elapsed(), line));
-            self.buf.drain(..=i);
-        }
-        Ok(b.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// The screen is the safety net under the hold: a permission prompt that
-/// follows an idle is seen within one hold step, not after the grace. The
-/// idle is said as `idle-no-report`, then the prompt, from the screen the
-/// hold read. A footer tick under the hold is not a move.
-#[test]
-fn a_prompt_after_an_idle_is_seen_within_a_hold_step() {
-    let (mut lane, _release) = MailMock::new(vec![ok(INBOX_AT_START)]);
-    let mut m = Mock::new(vec![busy_screen(), idle_screen(), write_prompt()]);
-    m.vanish_after = Some(1);
-    // The grace is 120 s so the two outcomes sit far apart: the screen read
-    // under the hold prints the prompt one 20 ms step in, a hold that never
-    // reads it prints it at 120 s or later. The bound is half of that, a
-    // one-minute hang detector. Passing never waits the grace: the prompt
-    // ends the hold.
-    let grace = Duration::from_secs(120);
-    let opts = mail_opts(Duration::from_secs(120), grace);
-    let mut out = Stamped {
-        started: Instant::now(),
-        buf: Vec::new(),
-        lines: Vec::new(),
-    };
-    let mut s = session(&mut m, Some("@s-1".to_string()));
-    s.set_mail_step(MAIL_STEP);
-    s.set_hold_step(Duration::from_millis(20));
-    let _ = s.watch_mail(&opts, Some(&mut lane), &mut out);
-    let lines: Vec<&str> = out.lines.iter().map(|(_, l)| l.as_str()).collect();
-    assert_eq!(
-        lines,
-        [
-            "EVENT idle-no-report seq=102 ⏺ Done.",
-            "EVENT prompt seq=103 kind=bash classify=not-read-only:rm command=rm -rf target",
-            "EXIT session gone (await gone ^\\x20{3}rm\\x20-rf\\x20target\\s*$ failed: aterm-ctl: ERR exited)",
-        ]
-    );
-    let prompt = out
-        .lines
-        .iter()
-        .find(|(_, l)| l.starts_with("EVENT prompt"))
-        .unwrap();
-    assert!(
-        prompt.0 < grace / 2,
-        "the prompt waited the idle's grace: {:?}",
-        out.lines
-    );
-    // A ticking footer (the composer's hint cycling): the same point,
-    // held on.
-    let (mut lane, _release) = MailMock::new(vec![ok(INBOX_AT_START)]);
-    let mut ticked = rows(&["⏺ Done.", "", "✻ Cogitated for 4s · done 2:41 PM", ""]);
-    ticked.extend(composer("  /help for help"));
-    let mut m = Mock::new(vec![busy_screen(), idle_screen(), ticked]);
-    m.vanish_after = Some(1);
-    let opts = mail_opts(Duration::from_secs(120), Duration::from_millis(60));
-    let mut out: Vec<u8> = Vec::new();
-    let mut s = session(&mut m, Some("@s-1".to_string()));
-    s.set_mail_step(MAIL_STEP);
-    s.set_hold_step(Duration::from_millis(20));
-    let _ = s.watch_mail(&opts, Some(&mut lane), &mut out);
-    let text = String::from_utf8(out).expect("utf-8");
-    assert_eq!(
-        text.lines().next(),
-        Some("EVENT idle-no-report seq=102 ⏺ Done."),
-        "{text}"
-    );
-    assert_eq!(
-        text.lines().filter(|l| l.starts_with("EVENT")).count(),
-        1,
-        "{text}"
-    );
-}
-
-/// `supervise --mail`: the result IS the wake, and it is handed back the
-/// moment the review point is reached — the lane's parked `await inbox`
-/// (20 s in production, `PARKED` here) is cut short, not waited out.
-#[test]
-fn supervise_mails_result_does_not_wait_for_the_lanes_parked_step() {
-    /// The lane's parked wait, which only the cut ends early. The bound
-    /// below is half of it: a return before then can only be the cut, so it
-    /// discriminates without timing the scheduler (a cut late by under a
-    /// minute would still pass).
-    const PARKED: Duration = Duration::from_secs(120);
-    let (mut lane, _release) = MailMock::new(vec![ok(INBOX_AT_START)]);
-    lane.step = PARKED;
-    let mut m = Mock::new(vec![idle_screen()]);
-    let opts = mail_opts(Duration::from_secs(120), Duration::ZERO);
-    let mut log: Vec<u8> = Vec::new();
-    let mut s = session(&mut m, Some("@s-1".to_string()));
-    s.set_mail_step(PARKED);
-    let started = Instant::now();
-    let (out, code) = s
-        .supervise_with(&opts, Some(&mut lane), &mut log)
-        .expect("supervise");
-    assert_eq!(code, 0);
-    assert!(out.starts_with("idle\nreport -\n"), "{out}");
-    assert!(
-        started.elapsed() < PARKED / 2,
-        "the review point was reached at once; the result came back after {:?}, \
-         the lane's {PARKED:?} park showing through rather than the cut",
-        started.elapsed()
-    );
-    // The cut wait is not the lane's to judge: no `MAIL off` line.
-    assert!(log.is_empty(), "{}", String::from_utf8_lossy(&log));
-}
-
-/// Without `--mail` — the flag not given, or given with no lane to run —
-/// every line is byte-identical to `watch`'s, and the worker's socket
-/// sees the same requests.
-#[test]
-fn without_mail_every_line_is_as_before() {
-    let screens = || {
-        vec![
-            busy_screen(),
-            bash_one_row(),
-            busy_screen(),
-            question_screen(),
-            busy_screen(),
-            idle_screen(),
-        ]
-    };
-    let mut m = Mock::new(screens());
-    m.vanish_after = Some(1);
-    let (plain, code) = watch_lines(&mut m, &auto(30, None));
-    let asked = m.requests.clone();
-    assert_eq!(code, 1);
-    assert_eq!(plain[2], "EVENT idle seq=106 ⏺ Done.");
-    // The flag, no lane.
-    let mut m = Mock::new(screens());
-    m.vanish_after = Some(1);
-    let mut out: Vec<u8> = Vec::new();
-    let opts = mail_opts(Duration::from_secs(120), Duration::from_secs(180));
-    let code = session(&mut m, None).watch_mail(&opts, None::<&mut NoLane>, &mut out);
-    let text = String::from_utf8(out).expect("utf-8");
-    assert_eq!(text.lines().collect::<Vec<_>>(), plain);
-    assert_eq!((code, &m.requests), (1, &asked));
-    // A lane, no flag.
-    let (mut lane, _release) = MailMock::new(vec![ok(INBOX_AT_START)]);
-    let mut m = Mock::new(screens());
-    m.vanish_after = Some(1);
-    let mut out: Vec<u8> = Vec::new();
-    let code = session(&mut m, Some("@s-1".to_string())).watch_mail(
-        &auto(30, None),
-        Some(&mut lane),
-        &mut out,
-    );
-    let text = String::from_utf8(out).expect("utf-8");
-    assert_eq!(text.lines().collect::<Vec<_>>(), plain);
-    assert_eq!(code, 1);
-    assert!(lane.requests.is_empty(), "no flag: the lane never runs");
-    let unselected: Vec<&str> = m
-        .requests
-        .iter()
-        .map(|r| r.strip_prefix("@s-1 ").unwrap_or(r))
-        .collect();
-    assert_eq!(unselected, asked);
-}
-
-/// A lane that cannot start (no fabric verbs, no `$ATERM_PARENT_SESSION_ID`
-/// for `@self`) says so once and the loop goes on: an idle point is not
-/// held, and prints as without the flag.
-#[test]
-fn a_lane_that_cannot_start_says_so_once_and_the_loop_goes_on() {
-    let (mut lane, _release) = MailMock::new(vec![err("unknown verb (try: help)")]);
-    let mut m = Mock::new(vec![busy_screen(), idle_screen()]);
-    m.vanish_after = Some(1);
-    let opts = mail_opts(Duration::from_secs(120), Duration::from_secs(180));
-    let started = Instant::now();
-    let (lines, code) = watch_mail_lines(&mut m, &mut lane, &opts);
-    assert_eq!(
-        lines,
-        [
-            "MAIL off: inbox: ERR unknown verb (try: help) (the loop goes on without mail)",
-            "EVENT idle seq=102 ⏺ Done.",
-            "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)",
-        ]
-    );
-    assert_eq!(code, 1);
-    assert!(
-        started.elapsed() < Duration::from_secs(60),
-        "no grace was waited with no lane"
-    );
-    assert_eq!(lane.requests, ["@self inbox 1 --peek --meta"]);
-}
-
-/// `supervise --mail`: the MAIL lines go to stderr with the RECONNECT
-/// lines, the idle review point is held for the report, the result's
-/// phase lines name it (`report <id> rows=<n>`) ahead of the rows, and
-/// the journal gets the `EVENT turn` line `watch --mail` would print. (No
-/// report: `supervise_mails_result_does_not_wait_for_the_lanes_parked_step`.)
-#[test]
-fn supervise_mail_holds_the_idle_and_names_the_report() {
-    let (dir, path) = journal_file("supervise-mail");
-    let (mut lane, release) =
-        MailMock::new(vec![ok(INBOX_AT_START), ok(INBOX_LANDED), ok(REPORT_BODY)]);
-    let mut m = Mock::new(vec![busy_screen(), idle_screen()]);
-    m.release = Some(release);
-    // Released as the idle screen is read (request 3, after the busy
-    // read's footer wait).
-    m.release_at.insert(3, vec![ok("OK inbox 6\n")]);
-    let opts = SuperviseOpts {
-        journal: Some(path.clone()),
-        ..mail_opts(Duration::from_secs(120), Duration::from_secs(180))
-    };
-    let mut log: Vec<u8> = Vec::new();
-    let mut s = session(&mut m, Some("@s-1".to_string()));
-    s.set_mail_step(MAIL_STEP);
-    let (out, code) = s
-        .supervise_with(&opts, Some(&mut lane), &mut log)
-        .expect("supervise");
-    assert_eq!(code, 0);
-    assert!(out.starts_with("idle\nreport 6 rows=3\n--\n"), "{out}");
-    assert!(out.ends_with("? for shortcuts\n"), "{out}");
-    let log = String::from_utf8(log).expect("utf-8");
-    assert_eq!(
-        log.lines().collect::<Vec<_>>(),
-        [
-            "MAIL id=5 off=90 from=h-owner kind=ask len=7 re=70",
-            "MAIL id=6 off=91 from=s-1@n-1 kind=report len=40",
-        ]
-    );
-    let (records, _) = journal_records(&path);
-    assert_eq!(
-        records.iter().map(|r| r.line.clone()).collect::<Vec<_>>(),
-        [
-            "MAIL id=5 off=90 from=h-owner kind=ask len=7 re=70",
-            "MAIL id=6 off=91 from=s-1@n-1 kind=report len=40",
-            "EVENT turn seq=102 report=6 rows=3 ⏺ Done.",
-        ]
-    );
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_dir(dir);
-}
-
 // ----- A usage limit is a decision point the watcher handles alone -----
 
 /// A weekly-limit notice under the worker's last message, at an idle
@@ -8041,10 +7689,9 @@ const WEEKLY_RESET: &str = "Sep 19 at 11am (America/Los_Angeles)";
 /// A box the loop does not approve is the manager's, once per box. For the
 /// rm breaker box (outside a bypass session), a Read of a secret and a trust
 /// prompt (`other`): the worker's `attention` is set to `claude <kind>:
-/// <command, path or question> (<why no rule approved it>)` and one
-/// `kind=ask` is posted to the manager (fabric connected); a second look at
-/// the same box posts nothing; once the box has left the badge is unset
-/// (read first, ours) and journaled `CLEARED … box`.
+/// <command, path or question> (<why no rule approved it>)`; a second look at
+/// the same box raises nothing; once the box has left the badge is unset
+/// (read first, ours) and journaled `CLEARED … box`. Nothing is posted.
 #[test]
 fn a_box_the_loop_does_not_approve_is_escalated_once_and_cleared_when_it_goes() {
     for (box_rows, label) in [
@@ -8067,14 +7714,17 @@ fn a_box_the_loop_does_not_approve_is_escalated_once_and_cleared_when_it_goes() 
             idle_screen(),
         ]);
         m.vanish_after = Some(4);
-        m.verb_replies
-            .insert("post", VecDeque::from([ok("OK 7 off=91\n")]));
         let opts = SuperviseOpts {
             journal: Some(path.clone()),
-            ..auto(30, None)
+            ..auto(30)
         };
         let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
-            s.set_manager(Some("@s-9".to_string()));
+            // A `/` home the Read rule reads `~` against on every host (a
+            // Windows process's own is `C:\Users\…`).
+            s.set_approval_env(ApprovalEnv {
+                home: Some(PathBuf::from("/Users/_owner")),
+                ..ApprovalEnv::of_process()
+            });
         });
         assert!(
             lines[0].starts_with("EVENT prompt "),
@@ -8094,18 +7744,15 @@ fn a_box_the_loop_does_not_approve_is_escalated_once_and_cleared_when_it_goes() 
         let acts: Vec<&String> = m
             .requests
             .iter()
-            .filter(|r| {
-                r.starts_with("meta set") || r.starts_with("meta unset") || r.starts_with("post")
-            })
+            .filter(|r| r.starts_with("meta set") || r.starts_with("meta unset"))
             .collect();
         assert_eq!(
             acts,
             [
                 &format!("meta set attention owner=supervisor {text}"),
-                &format!("post to=@s-9 kind=ask --wait=0 {text}"),
                 &"meta unset attention owner=supervisor".to_string(),
             ],
-            "one set, one ask, one clear: {:?}",
+            "one set, one clear: {:?}",
             m.requests
         );
         let (records, _) = journal_records(&path);
@@ -8117,16 +7764,16 @@ fn a_box_the_loop_does_not_approve_is_escalated_once_and_cleared_when_it_goes() 
     }
 }
 
-/// The escalations `(set attention, post)` requests of a finished mock.
+/// The escalations (set attention) requests of a finished mock.
 fn box_acts(m: &Mock) -> Vec<String> {
     m.requests
         .iter()
-        .filter(|r| r.starts_with("meta set attention") || r.starts_with("post"))
+        .filter(|r| r.starts_with("meta set attention"))
         .cloned()
         .collect()
 }
 
-/// A headerless box's badge and ask name the box's own first row, never a
+/// A headerless box's badge names the box's own first row, never a
 /// transcript row above it, however tall the transcript.
 #[test]
 fn a_headerless_box_under_a_tall_transcript_is_named_by_its_own_first_row() {
@@ -8145,11 +7792,7 @@ fn a_headerless_box_under_a_tall_transcript_is_named_by_its_own_first_row() {
     let mut m = Mock::new(vec![busy_screen(), screen, busy_screen(), idle_screen()]);
     m.cursor_row = Some(focus);
     m.vanish_after = Some(4);
-    m.verb_replies
-        .insert("post", VecDeque::from([ok("OK 7 off=91\n")]));
-    let (_, _) = watch_lines_with(&mut m, &auto(30, None), |s| {
-        s.set_manager(Some("@s-9".to_string()));
-    });
+    let (_, _) = watch_lines(&mut m, &auto(30));
     // The attention format (`<program> <kind>: <subject> (<reason>)`): the
     // subject of a headerless box is its question row, found from the
     // box's own first row down, never a transcript row above it.
@@ -8158,10 +7801,7 @@ fn a_headerless_box_under_a_tall_transcript_is_named_by_its_own_first_row() {
     assert!(!text.contains("transcript row"));
     assert_eq!(
         box_acts(&m),
-        [
-            format!("meta set attention owner=supervisor {text}"),
-            format!("post to=@s-9 kind=ask --wait=0 {text}"),
-        ],
+        [format!("meta set attention owner=supervisor {text}")],
         "{:?}",
         m.requests
     );
@@ -8175,7 +7815,7 @@ fn a_headerless_box_under_a_tall_transcript_is_named_by_its_own_first_row() {
 fn an_answered_box_loses_its_badge_at_the_first_busy_read() {
     let mut m = Mock::new(vec![busy_screen(), trust_box(), trust_box(), busy_screen()]);
     m.vanish_after = Some(3);
-    let (_, _) = watch_lines(&mut m, &auto(30, None));
+    let (_, _) = watch_lines(&mut m, &auto(30));
     let set = m
         .requests
         .iter()
@@ -8211,8 +7851,8 @@ fn an_answered_box_loses_its_badge_at_the_first_busy_read() {
 }
 
 /// The same box back after the worker worked is a new review point (`EVENT
-/// prompt` again) and so a new ask: the badge set again and the manager
-/// asked again. One set and one post per point, never per look.
+/// prompt` again) and so a new ask: the badge set again. One set per point,
+/// never per look.
 #[test]
 fn the_same_box_after_the_worker_worked_is_a_new_ask() {
     let b = bash_multi_row_with_note();
@@ -8227,29 +7867,17 @@ fn the_same_box_after_the_worker_worked_is_a_new_ask() {
         idle_screen(),
     ]);
     m.vanish_after = Some(4);
-    m.verb_replies.insert(
-        "post",
-        VecDeque::from([ok("OK 7 off=91\n"), ok("OK 8 off=92\n")]),
-    );
-    let (lines, _) = watch_lines_with(&mut m, &auto(30, None), |s| {
-        s.set_manager(Some("@s-9".to_string()));
-    });
+    let (lines, _) = watch_lines(&mut m, &auto(30));
     let prompts = lines
         .iter()
         .filter(|l| l.starts_with("EVENT prompt "))
         .count();
-    let asks = m.requests.iter().filter(|r| r.starts_with("post ")).count();
     let sets = m
         .requests
         .iter()
         .filter(|r| r.starts_with("meta set attention"))
         .count();
-    assert_eq!(
-        (prompts, asks, sets),
-        (2, 2, 2),
-        "{lines:?}\n{:?}",
-        m.requests
-    );
+    assert_eq!((prompts, sets), (2, 2), "{lines:?}\n{:?}", m.requests);
 }
 
 /// The badge's line is cut by terminal cells (a wide character is two), and
@@ -8273,50 +7901,6 @@ fn the_approval_line_is_sanitized_and_cut_by_cells() {
     assert!(line.starts_with("Bash command · 100% "), "{line:?}");
     // A plain line is untouched.
     assert_eq!(approval_line(&bash_one_row()), "Bash command");
-}
-
-/// The ask carries `--wait=0` (no landing wait inside the single-threaded
-/// loop), and a reply that means queued is journaled `queued id=<n> (…)`;
-/// a real refusal keeps its words.
-#[test]
-fn a_box_ask_never_waits_and_a_queued_post_is_journaled_as_queued() {
-    for (reply, said) in [
-        (err("timeout id=7"), "mail=queued id=7"),
-        (err("outbox full"), "mail=ERR outbox full"),
-    ] {
-        let (dir, path) = journal_file("box-queued");
-        let mut m = Mock::new(vec![
-            busy_screen(),
-            read_box(),
-            busy_screen(),
-            idle_screen(),
-        ]);
-        m.vanish_after = Some(4);
-        m.verb_replies.insert("post", VecDeque::from([reply]));
-        let opts = SuperviseOpts {
-            journal: Some(path.clone()),
-            ..auto(30, None)
-        };
-        let (_, _) = watch_lines_with(&mut m, &opts, |s| {
-            s.set_manager(Some("@s-9".to_string()));
-        });
-        assert!(
-            m.requests
-                .iter()
-                .any(|r| r.starts_with("post to=@s-9 kind=ask --wait=0 ")),
-            "{:?}",
-            m.requests
-        );
-        let (records, _) = journal_records(&path);
-        let escalated: Vec<&String> = records
-            .iter()
-            .filter(|r| r.kind == "escalated")
-            .map(|r| &r.line)
-            .collect();
-        assert_eq!(escalated.len(), 1, "{records:?}");
-        assert!(escalated[0].contains(said), "{said}: {}", escalated[0]);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
 
 fn weekly_limited() -> Vec<String> {
@@ -8765,6 +8349,9 @@ struct ResetHost {
     short_from: Mutex<Option<usize>>,
     /// It refuses, with this word.
     no: Mutex<Option<ResetNo>>,
+    /// The asks (1-based) it answers that it cannot say yet
+    /// ([`ResetWord::Again`]).
+    again: Mutex<Vec<usize>>,
     /// From this ask on (1-based) the claim is no longer this
     /// session's.
     lapses_at: Mutex<Option<usize>>,
@@ -8785,6 +8372,7 @@ impl ResetHost {
             limits: vec!["weekly".to_string()],
             short_from: Mutex::new(None),
             no: Mutex::new(None),
+            again: Mutex::new(Vec::new()),
             lapses_at: Mutex::new(None),
             asks: std::sync::atomic::AtomicUsize::new(0),
             outcome: Mutex::new(outcome),
@@ -8840,10 +8428,16 @@ impl IdleHost for ResetHost {
     }
     fn reset_take(&self, ask: &ResetAsk) -> ResetWord {
         let n = self.asks.fetch_add(1, Ordering::SeqCst) + 1;
+        let kind = ask
+            .kind
+            .map_or_else(String::new, |kind| format!(" kind={}", kind.word()));
         self.said.lock().unwrap().push(format!(
-            "take left={} day={} day_start={:?}",
+            "take left={} day={} day_start={:?}{kind}",
             ask.left, ask.day, ask.day_start
         ));
+        if self.again.lock().unwrap().contains(&n) {
+            return ResetWord::Again;
+        }
         if let Some(why) = *self.no.lock().unwrap() {
             return ResetWord::No(why);
         }
@@ -8947,7 +8541,7 @@ fn reset_opts(host: &Arc<ResetHost>, on: bool, grace_s: u32) -> SuperviseOpts {
             human_grace_s: grace_s,
             ..SupervisorConfig::default()
         },
-        ..auto(60, None)
+        ..auto(60)
     }
 }
 
@@ -9176,8 +8770,8 @@ fn reset_violations(m: &Mock, host: &ResetHost) -> Vec<String> {
 }
 
 /// `EVENT limited` escalates once an episode (the worker's `attention` set
-/// to the notice, the same text posted as `kind=control` to the manager,
-/// one `ESCALATED` journal line), and a 30 s budget that would run out two
+/// to the notice, one `ESCALATED` journal line, nothing posted), and a 30 s
+/// budget that would run out two
 /// days before the named reset is stretched to 10 min past it, `EXTEND`
 /// said once: the retry's notice (a new point, printed) escalates and
 /// extends nothing again. The printed lines are unchanged but for the one
@@ -9192,15 +8786,11 @@ fn a_limit_escalates_once_and_extends_the_budget_once() {
         weekly_retried(),
     ]);
     m.vanish_after = Some(3);
-    m.verb_replies
-        .insert("post", VecDeque::from([ok("OK 7 off=91\n")]));
     let opts = SuperviseOpts {
         journal: Some(path.clone()),
-        ..auto(30, None)
+        ..auto(30)
     };
-    let (lines, code) = watch_lines_with(&mut m, &opts, |s| {
-        s.set_manager(Some("@s-9".to_string()));
-    });
+    let (lines, code) = watch_lines(&mut m, &opts);
     assert_eq!(
         lines,
         [
@@ -9215,13 +8805,13 @@ fn a_limit_escalates_once_and_extends_the_budget_once() {
     assert_eq!(
         m.requests
             .iter()
-            .filter(|r| r.starts_with("meta") || r.starts_with("post"))
+            .filter(|r| r.starts_with("meta"))
             .collect::<Vec<_>>(),
         [
             // The start-up reconcile read.
             &"meta".to_string(),
-            &format!("meta set attention owner=supervisor {text}"),
-            &format!("post to=@s-9 kind=control {text}"),
+            // `resume_limits = false`: nothing here continues it, so it asks.
+            &format!("meta set attention owner=supervisor kind=ask {text}"),
         ]
     );
     assert_eq!(count(&m, "turn"), 0, "no probe without resuming");
@@ -9241,14 +8831,13 @@ fn a_limit_escalates_once_and_extends_the_budget_once() {
     );
     assert_eq!(
         (records[1].seq, records[1].summary.as_str()),
-        (Some(102), "attention=OK mail=OK 7 off=91")
+        (Some(102), "attention=OK")
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The escalation records what the server said, and goes on: a refused
-/// attention, and no manager to mail (neither `--inbox` nor
-/// `$ATERM_PARENT_SESSION_ID`), are journal words, not the loop's end.
+/// attention is a journal word, not the loop's end, and nothing is posted.
 /// A notice naming no reset extends nothing.
 #[test]
 fn a_refused_escalation_is_journaled_and_the_loop_goes_on() {
@@ -9277,17 +8866,15 @@ fn a_refused_escalation_is_journaled_and_the_loop_goes_on() {
     );
     let opts = SuperviseOpts {
         journal: Some(path.clone()),
-        ..auto(30, None)
+        ..auto(30)
     };
     let (lines, _) = watch_lines(&mut m, &opts);
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert!(lines[0].starts_with("EVENT limited seq=102 message=You've reached your Fable limit."));
     assert!(lines[1].starts_with("EXIT session gone"), "{lines:?}");
-    assert_eq!(count(&m, "post"), 0);
     let (records, _) = journal_records(&path);
     assert!(
-        records[1].summary.starts_with("attention=ERR ")
-            && records[1].summary.contains("mail=skipped"),
+        records[1].summary.starts_with("attention=ERR ") && !records[1].summary.contains("mail="),
         "{:?}",
         records[1].summary
     );
@@ -9324,7 +8911,7 @@ fn a_refusal_naming_a_tighter_cap_is_sent_again_cut_to_it() {
     );
     let opts = SuperviseOpts {
         journal: Some(path.clone()),
-        ..auto(30, None)
+        ..auto(30)
     };
     let _ = watch_lines(&mut m, &opts);
     let sets: Vec<&String> = m
@@ -9333,7 +8920,9 @@ fn a_refusal_naming_a_tighter_cap_is_sent_again_cut_to_it() {
         .filter(|r| r.starts_with("meta set attention owner=supervisor "))
         .collect();
     assert_eq!(sets.len(), 2, "{sets:#?}");
-    let second = sets[1].trim_start_matches("meta set attention owner=supervisor ");
+    // A limit's badge names its kind before the text: nothing here ends this
+    // one (no reset, limits not resumed), so it asks.
+    let second = sets[1].trim_start_matches("meta set attention owner=supervisor kind=ask ");
     assert!(second.len() <= 40, "{second}");
     assert!(
         sets[0].ends_with(second) || sets[0].contains(second),
@@ -9360,7 +8949,7 @@ fn resume_never_continues_what_the_policy_limited() {
         let eight_pm = TEST_NOW + 11 * 3600 + 5 * 60;
         // The false arm waits out the whole budget (nothing is typed), so
         // it is short: the reset passed long before either arm decides.
-        let mut opts = auto(2, None);
+        let mut opts = auto(2);
         opts.policy.resume_limits = resume_limits;
         let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
             s.set_clock(eight_pm, PDT);
@@ -9395,11 +8984,10 @@ fn at_the_reset_one_continuation_goes_with_the_rules_and_the_answer_closes_the_e
     m.turn_releases = Some(1);
     let opts = SuperviseOpts {
         journal: Some(journal.clone()),
-        ..auto(30, None)
+        ..auto(30)
     };
     let (lines, code) = watch_lines_with(&mut m, &resuming(&opts, Some(rules.clone())), |s| {
         s.set_clock(AFTER_RESET, PDT);
-        s.set_manager(Some("@s-9".to_string()));
         s.set_turn_end_timing(quick_turn_end(&[Duration::from_secs(600)]));
     });
     assert_eq!(
@@ -9427,8 +9015,12 @@ fn at_the_reset_one_continuation_goes_with_the_rules_and_the_answer_closes_the_e
         "status",
         "the program read fresh first"
     );
-    assert_eq!(count(&m, "post"), 0, "handled at once: {:#?}", m.requests);
-    assert_eq!(count(&m, "meta set attention"), 0, "{:#?}", m.requests);
+    assert_eq!(
+        count(&m, "meta set attention"),
+        0,
+        "handled at once: {:#?}",
+        m.requests
+    );
     assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
     let (records, _) = journal_records(&journal);
     assert_eq!(
@@ -9466,7 +9058,7 @@ fn the_screen_leaving_the_notice_is_continued_at_once() {
     ]);
     m.vanish_after = Some(2);
     m.turn_releases = Some(2);
-    let (lines, _) = watch_lines_with(&mut m, &resuming(&auto(3 * 86_400, None), None), |_| {});
+    let (lines, _) = watch_lines_with(&mut m, &resuming(&auto(3 * 86_400), None), |_| {});
     assert_eq!(lines.len(), 5, "{lines:#?}");
     assert_eq!(
         lines[0],
@@ -9506,7 +9098,7 @@ fn a_standing_approval_attention_survives_the_episode_close() {
     m.foreign_attention = Some(approval.to_string());
     let opts = SuperviseOpts {
         journal: Some(path.clone()),
-        ..auto(3 * 86_400, None)
+        ..auto(3 * 86_400)
     };
     // Resuming limited: the episode is escalated, and closed when the
     // worker works again.
@@ -9564,7 +9156,7 @@ fn the_notice_again_after_a_continuation_is_the_same_episode_and_backs_off() {
     m.turn_releases = Some(1);
     let opts = SuperviseOpts {
         journal: Some(path.clone()),
-        ..auto(30, None)
+        ..auto(30)
     };
     let (lines, _) = watch_lines_with(&mut m, &resuming(&opts, None), |s| {
         s.set_clock(AFTER_RESET, PDT);
@@ -9613,7 +9205,11 @@ fn a_span_is_read_once_and_the_continuations_back_off_ten_then_thirty() {
         "✻ Worked for 12s · done 4:51 PM",
         "",
     ]);
-    limited.extend(composer("  You've reached your Fable limit · resets in 1s"));
+    // Right-aligned on the mode row, where Claude Code draws its own notices.
+    limited.extend(composer(&aterm_phase::prompt::fixtures::right_aligned(
+        "  ⏵⏵ auto mode on",
+        "You've reached your Fable limit · resets in 1s",
+    )));
     let mut m = Mock::new(vec![
         busy_screen(),
         limited.clone(),
@@ -9628,7 +9224,7 @@ fn a_span_is_read_once_and_the_continuations_back_off_ten_then_thirty() {
     m.dead_after_turns = Some(3);
     let opts = SuperviseOpts {
         journal: Some(path.clone()),
-        ..auto(30, None)
+        ..auto(30)
     };
     let mut out: Vec<u8> = Vec::new();
     let mut s = session(&mut m, None);
@@ -9675,7 +9271,7 @@ fn a_draft_in_the_composer_holds_the_continuation() {
     m.vanish_after = Some(3);
     // The cursor at the end of the draft.
     m.cursor_col = Some(29);
-    let (lines, _) = watch_lines_with(&mut m, &resuming(&auto(30, None), None), |s| {
+    let (lines, _) = watch_lines_with(&mut m, &resuming(&auto(30), None), |s| {
         s.set_clock(AFTER_RESET, PDT);
         s.set_turn_end_timing(quick_turn_end(&[Duration::from_millis(10)]));
     });
@@ -9690,7 +9286,7 @@ fn a_draft_in_the_composer_holds_the_continuation() {
     // Negative control: the same notice with nothing typed continues.
     let mut m = Mock::new(vec![busy_screen(), weekly_limited()]);
     m.vanish_after = Some(3);
-    let _ = watch_lines_with(&mut m, &resuming(&auto(30, None), None), |s| {
+    let _ = watch_lines_with(&mut m, &resuming(&auto(30), None), |s| {
         s.set_clock(AFTER_RESET, PDT);
         s.set_turn_end_timing(quick_turn_end(&[Duration::from_millis(10)]));
     });
@@ -9711,11 +9307,7 @@ fn a_worked_point_closes_the_episode_and_types_nothing() {
         idle_screen(),
     ]);
     m.vanish_after = Some(2);
-    let (lines, _) = watch_lines_with(
-        &mut m,
-        &resuming(&auto(30, None), Some(rules.clone())),
-        |_| {},
-    );
+    let (lines, _) = watch_lines_with(&mut m, &resuming(&auto(30), Some(rules.clone())), |_| {});
     assert_eq!(
         lines,
         [
@@ -9740,7 +9332,7 @@ fn a_worked_point_closes_the_episode_and_types_nothing() {
 fn a_screen_without_a_composer_gets_no_continuation() {
     let mut m = Mock::new(vec![busy_screen(), weekly_limited(), login_code_prompt()]);
     m.vanish_after = Some(2);
-    let (lines, _) = watch_lines_with(&mut m, &resuming(&auto(3 * 86_400, None), None), |_| {});
+    let (lines, _) = watch_lines_with(&mut m, &resuming(&auto(3 * 86_400), None), |_| {});
     assert_eq!(lines.len(), 3, "{lines:#?}");
     assert!(lines[0].starts_with("EVENT limited seq=102"), "{lines:#?}");
     // A screen with no composer frame is settled by the full idle wait:
@@ -9769,7 +9361,7 @@ fn a_reset_further_off_than_a_week_extends_nothing() {
     misread.extend(composer("  ? for shortcuts"));
     let mut m = Mock::new(vec![busy_screen(), misread]);
     m.vanish_after = Some(1);
-    let (lines, _) = watch_lines(&mut m, &auto(30, None));
+    let (lines, _) = watch_lines(&mut m, &auto(30));
     assert_eq!(
         lines,
         [
@@ -9840,7 +9432,7 @@ fn an_auto_continue_notice_closes_at_the_first_busy_read_and_nothing_is_typed() 
     m.vanish_after = Some(2);
     let opts = SuperviseOpts {
         journal: Some(path.clone()),
-        ..auto(30, None)
+        ..auto(30)
     };
     let (lines, _) = watch_lines_with(&mut m, &resuming(&opts, Some(rules.clone())), |_| {});
     assert_eq!(
@@ -9856,7 +9448,6 @@ fn an_auto_continue_notice_closes_at_the_first_busy_read_and_nothing_is_typed() 
         m.requests
     );
     assert_eq!(count(&m, "meta set attention"), 0, "{:?}", m.requests);
-    assert_eq!(count(&m, "post "), 0, "{:?}", m.requests);
     assert_eq!(count(&m, "turn"), 0, "{:?}", m.requests);
     let (records, _) = journal_records(&path);
     let cleared: Vec<Option<u64>> = records
@@ -9884,7 +9475,7 @@ fn an_auto_continue_notice_closes_at_the_first_busy_read_and_nothing_is_typed() 
 fn a_continuing_shortly_notice_is_a_reset_a_minute_off() {
     let mut m = Mock::new(vec![busy_screen(), auto_waiting(SHORTLY_TEXT)]);
     m.vanish_after = Some(2);
-    let (lines, _) = watch_lines_with(&mut m, &resuming(&auto(30, None), None), |_| {});
+    let (lines, _) = watch_lines_with(&mut m, &resuming(&auto(30), None), |_| {});
     assert_eq!(
         lines,
         [
@@ -9915,7 +9506,7 @@ fn an_auto_continue_notice_is_never_continued_even_past_its_time() {
         auto_done(),
     ]);
     m.vanish_after = Some(2);
-    let (lines, _) = watch_lines_with(&mut m, &resuming(&auto(30, None), None), |s| {
+    let (lines, _) = watch_lines_with(&mut m, &resuming(&auto(30), None), |s| {
         s.set_clock(read_at, PDT);
         s.set_turn_end_timing(quick_turn_end(&[Duration::from_secs(600)]));
     });
@@ -9935,7 +9526,7 @@ fn an_auto_continue_notice_is_never_continued_even_past_its_time() {
     assert_eq!(count(&m, "meta set attention"), 0, "{:?}", m.requests);
     let mut m = Mock::new(vec![busy_screen(), weekly_limited()]);
     m.vanish_after = Some(2);
-    let _ = watch_lines_with(&mut m, &resuming(&auto(30, None), None), |s| {
+    let _ = watch_lines_with(&mut m, &resuming(&auto(30), None), |s| {
         s.set_clock(AFTER_RESET, PDT);
         s.set_turn_end_timing(quick_turn_end(&[Duration::from_secs(600)]));
     });
@@ -9945,10 +9536,10 @@ fn an_auto_continue_notice_is_never_continued_even_past_its_time() {
 /// A continuation that hits the wall again (the retry's spinner, then
 /// `continuing shortly`) closes the episode at the busy read and finds the
 /// notice again: the same episode reopened. A self-resuming notice is
-/// handled (waited out): no badge or mail at any of them, and each episode
-/// is journaled `LIMITED … handled`, never `ESCALATED`.
+/// handled (waited out): no badge at any of them, and each episode is
+/// journaled `LIMITED … handled`, never `ESCALATED`.
 #[test]
-fn a_retry_that_hits_the_wall_again_is_the_same_episode_and_mails_once() {
+fn a_retry_that_hits_the_wall_again_is_the_same_episode() {
     let (dir, path) = journal_file("auto-retry");
     let mut m = Mock::new(vec![
         busy_screen(),
@@ -9961,11 +9552,9 @@ fn a_retry_that_hits_the_wall_again_is_the_same_episode_and_mails_once() {
     m.vanish_after = Some(2);
     let opts = SuperviseOpts {
         journal: Some(path.clone()),
-        ..auto(30, None)
+        ..auto(30)
     };
-    let (lines, _) = watch_lines_with(&mut m, &resuming(&opts, None), |s| {
-        s.set_manager(Some("@s-9".to_string()));
-    });
+    let (lines, _) = watch_lines(&mut m, &resuming(&opts, None));
     assert_eq!(
         lines,
         [
@@ -9979,11 +9568,8 @@ fn a_retry_that_hits_the_wall_again_is_the_same_episode_and_mails_once() {
         m.requests
     );
     assert_eq!(
-        (
-            count(&m, "meta set attention"),
-            count(&m, "post to=@s-9 kind=control"),
-        ),
-        (0, 0),
+        count(&m, "meta set attention"),
+        0,
         "nothing raised: {:#?}",
         m.requests
     );
@@ -9999,6 +9585,33 @@ fn a_retry_that_hits_the_wall_again_is_the_same_episode_and_mails_once() {
         "each busy read closes its episode: {records:#?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `meta`'s `trusted_cwd=` — the one folder an Owner's `spawn agent=claude`
+/// trusted for its worker — is read pct-decoded into the loop's
+/// `trusted_cwd`, which the folder-trust rule gets (`ApprovalCtx`). NEGATIVE
+/// CONTROLS: `-` (none trusted), a relative value, and an older host that
+/// prints no such key trust nothing, each over one that did; `cwd=` and
+/// `agent_cwd=` are never read as it.
+#[test]
+fn the_folder_a_spawn_trusted_is_read_off_meta_decoded() {
+    let mut m = Mock::new(vec![idle_screen()]);
+    let mut s = Session::new(&mut m, Some("@s-w".to_string()));
+    let meta = |trusted: &str| {
+        format!("OK title=- cwd=/w agent_cwd=/w/a state=alive trusted_cwd={trusted}\n")
+    };
+    s.note_cwd(&meta("/w/a%20b"));
+    assert_eq!(s.trusted_cwd, Some(PathBuf::from("/w/a b")), "decoded");
+    assert_eq!(s.cwd, Some(PathBuf::from("/w/a")), "agent_cwd= is the cwd");
+    for none in [
+        meta("-"),
+        meta("w/a"),
+        "OK title=- cwd=/w agent_cwd=/w/a state=alive\n".to_string(),
+    ] {
+        s.note_cwd(&meta("/w/a%20b"));
+        s.note_cwd(&none);
+        assert_eq!(s.trusted_cwd, None, "{none}");
+    }
 }
 
 /// The engine's tests: the approval policy in the loop, the wake, the
@@ -10019,6 +9632,13 @@ mod engine {
         use super::*;
         include!("run_box_key_tests.rs");
     }
+}
+
+/// A box taller than the pane, read whole from the history above the screen
+/// (`box_head_tests.rs`).
+mod box_head_loop {
+    use super::*;
+    include!("box_head_tests.rs");
 }
 
 /// The turn-end policy in the loop (`turn_end_loop_tests.rs`).

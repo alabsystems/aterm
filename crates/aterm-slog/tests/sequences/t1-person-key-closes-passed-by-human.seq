@@ -1,0 +1,10 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# T1: a person's key on the open box: it binds the box at once and the
+# close is the person's, `passed` (a key says nothing of what it meant).
+see busy
+half
+see prompt edit
+expect open p1 approval par=t1 box=edit at=500
+person
+see busy
+expect close p1 approval out=passed by=human

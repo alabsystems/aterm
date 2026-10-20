@@ -691,8 +691,9 @@ fn slog_ring_conforms_to_derived_model() {
         }
         *ran.entry(action).or_insert(0usize) += 1;
     }
-    for seed in 1..=40u64 {
-        for (k, v) in walk(&m, seed, 400) {
+    let seeds: Vec<u64> = (1..=40).collect();
+    for walked in aterm_spec::check::each(&seeds, |&seed| walk(&m, seed, 400)) {
+        for (k, v) in walked {
             *ran.entry(k).or_insert(0usize) += v;
         }
     }

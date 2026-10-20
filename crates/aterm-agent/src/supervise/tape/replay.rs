@@ -46,11 +46,11 @@
 //! journal or ledger the run named is NOT opened (the loop's door says so:
 //! `Fx::opens_files`): its rows are outputs, compared and never written.
 //!
-//! The replayed loop's teller lane (`watch`'s `story`) is given exactly when
-//! the tape holds a crossing of it: a teller is called only for a line that
-//! carries a story, so a run that had one and told nothing left nothing a
-//! replay without one would ask differently, and a run without one (a test's)
-//! left no crossing to replay.
+//! The loop this build replays is the window harness's hosted one, and in
+//! this crate's tests the engine's `watch` and `supervise` seams over it; a
+//! tape of the removed `aterm drive watch|supervise` reads (`tape cat`,
+//! `tape show`) but does not replay, and its teller lane (`story`, a second
+//! client) has no loop to cross.
 //!
 //! **A recorded panic** replays to PANICKED. One above every door (in the
 //! policy, the loop): the replayed loop panics with the same message once
@@ -92,7 +92,7 @@ use super::host::ReplayHost;
 use super::report::{Cause, Class, Divergence, Report, Verdict};
 use super::{doors, show};
 use crate::supervise::fx::Fx;
-use crate::supervise::run::{IdleHost, NoLane, Session, SuperviseOpts};
+use crate::supervise::run::{IdleHost, Session, SuperviseOpts};
 
 /// How many flag reads in a row may consume no record before the replay is
 /// called stuck (the plan's progress guard): far past any loop's honest run
@@ -511,19 +511,6 @@ impl ReplayCore {
         })
     }
 
-    /// Something no replay can make (a mail delivery under a replay).
-    pub(crate) fn unreplayable(&self, why: &str) -> ! {
-        let at = self.lock().seam.position() as u64;
-        self.diverge(Divergence {
-            at,
-            door: None,
-            class: Class::Drift,
-            cause: Cause::Unreplayable {
-                why: why.to_string(),
-            },
-        })
-    }
-
     /// The tape says the recorded run died inside `door`'s live call asking
     /// `request` (`core::NOTE_UNWOUND_IN`): what [`Self::emit`] knows the
     /// place by when the door is a notification to the window's host.
@@ -647,6 +634,7 @@ fn is_output(door: &str) -> bool {
         doors::JOURNAL,
         doors::LEDGER,
         doors::WRITE_BOUND,
+        doors::TASK_RESULT,
     ]
     .contains(&door)
 }
@@ -706,10 +694,10 @@ pub fn watch_end(code: u8) -> String {
     format!("exit {code}")
 }
 
-/// How a `supervise` run's end is said on its tape: its exit code, then the
-/// review it returns for the manager — the text `aterm drive supervise`
-/// prints (the phase lines, the box or the last rows, a `TIMEOUT` before
-/// them), line for line. That text is the run's main OUTPUT: a `watch`'s
+/// How a `supervise` run's end is said on its tape (the engine tests' seam,
+/// an older build's `aterm drive supervise`): its exit code, then the review
+/// it returns for the manager (the phase lines, the box or the last rows, a
+/// `TIMEOUT` before them), line for line. That text is the run's main OUTPUT: a `watch`'s
 /// lines cross the `out` door one by one where they are printed, but a
 /// `supervise` returns its review as its value, so the end is where it is
 /// compared — a build that renders the review otherwise, on the very same
@@ -771,8 +759,15 @@ pub fn replay(bytes: &[u8], options: &Options) -> Result<Report, String> {
         ));
     }
     let header = Header::decode_remapped(text, &base)?;
-    if header.opts.mail.is_some() {
-        return Err("a run with --mail: the mail lane's reads reach no tape".to_string());
+    // `aterm drive watch|supervise` are gone: their tapes read (`tape cat`,
+    // `tape show`), and only this crate's tests, which run those loops still,
+    // replay them.
+    if !cfg!(test) && header.entry != Entry::Hosted {
+        return Err(format!(
+            "a tape of `aterm drive {}`, which this build no longer has: only the window \
+             harness's hosted runs replay",
+            header.entry.word()
+        ));
     }
     let mut tail = show::tail_note(&tape);
     // The items are MOVED into what the replay keeps — the records into the
@@ -796,9 +791,6 @@ pub fn replay(bytes: &[u8], options: &Options) -> Result<Report, String> {
             Item::Note { .. } | Item::Mark(_) => {}
         }
     }
-    let teller = records
-        .iter()
-        .any(|r| matches!(r, EffectRecord::Exchange { door, .. } if door == doors::TELLER));
     let core = ReplayCore::start(
         records,
         header.roots.clone(),
@@ -810,7 +802,7 @@ pub fn replay(bytes: &[u8], options: &Options) -> Result<Report, String> {
         core.died_inside(door, request);
     }
     let fx = Fx::replay(Arc::clone(&core));
-    let run = run_entry(&header, &fx, teller);
+    let run = run_entry(&header, &fx);
     if let Some(door) = capped {
         tail = Some(format!(
             "the run reached its cap: effect #{door} on are not on the tape"
@@ -829,9 +821,8 @@ fn sanitized(id: &str) -> String {
 
 /// Run the recorded entry over `fx`, under `catch_unwind`: how it ended, as a
 /// tape says an end, or what it unwound with.
-fn run_entry(header: &Header, fx: &Fx, teller: bool) -> std::thread::Result<String> {
+fn run_entry(header: &Header, fx: &Fx) -> std::thread::Result<String> {
     let mut ctl = ReplayCtl::new(fx.clone(), doors::CTL);
-    let mut told = teller.then(|| ReplayCtl::new(fx.clone(), doors::TELLER));
     let mut session = Session::from_setup(&mut ctl, header.setup.clone());
     session.set_fx(fx.clone());
     // A run that had a window host is replayed with the replay's host in its
@@ -846,13 +837,17 @@ fn run_entry(header: &Header, fx: &Fx, teller: bool) -> std::thread::Result<Stri
     };
     let entry = header.entry;
     std::panic::catch_unwind(AssertUnwindSafe(|| match entry {
-        Entry::Watch => watch_end(session.watch_telling(
-            &opts,
-            None::<&mut NoLane>,
-            told.as_mut(),
-            &mut io::sink(),
-        )),
-        Entry::Supervise => supervise_end(&session.supervise_mail(&opts, None::<&mut NoLane>)),
+        // The engine tests' seams over the hosted loop's engine
+        // (`Session::watch`, `Session::supervise`): a shipped build refuses
+        // these tapes before it gets here ([`replay`]).
+        #[cfg(test)]
+        Entry::Watch => watch_end(session.watch(&opts, &mut io::sink())),
+        #[cfg(test)]
+        Entry::Supervise => supervise_end(&session.supervise(&opts)),
+        #[cfg(not(test))]
+        Entry::Watch | Entry::Supervise => {
+            format!("error: no {} loop in this build", entry.word())
+        }
         Entry::Hosted => hosted_end(&session.run_hosted(
             &opts,
             Arc::new(AtomicBool::new(false)),

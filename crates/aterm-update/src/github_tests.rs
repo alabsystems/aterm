@@ -928,6 +928,84 @@ fn a_release_whose_declared_machine_disagrees_with_the_signer_is_refused() {
     );
 }
 
+/// The authoritative appcast must be the tag's own release: a genuine, attributed
+/// appcast naming the tag's DMG under another version is refused. Negative control:
+/// the tag's own version is selected, and its `min_build` reaches the floor as the
+/// signing machine's, so a revocation of that machine takes it back.
+#[test]
+fn an_appcast_of_another_version_under_the_tag_is_refused() {
+    let signed = |version: &str| {
+        let mut c = chain(
+            &[("m3", M3_SEED_FIXTURE)],
+            &[],
+            ("m3", M3_SEED_FIXTURE),
+            4,
+            &MASTER_SEED_FIXTURE,
+            4,
+        );
+        let text = String::from_utf8(manifest_bytes(version, 10, 7))
+            .unwrap()
+            .replace(&format!("aterm-{version}.dmg"), "aterm-0.10.0.dmg");
+        c.manifest = (text + "machine_id = \"m3\"\nroster_seq = 4\n").into_bytes();
+        c.manifest_sig = Ed25519KeyPair::from_seed_unchecked(&M3_SEED_FIXTURE)
+            .unwrap()
+            .sign(&c.manifest)
+            .as_ref()
+            .to_vec();
+        c
+    };
+    let other = signed("0.9.0");
+    let masters = [other.master_pub.as_str()];
+    let refused = run_chain(&other, &masters, 0, ROSTER_NOW);
+    assert!(refused.selected.is_none() && refused.manifest_rejected);
+    let own = run_chain(&signed("0.10.0"), &masters, 0, ROSTER_NOW);
+    assert!(own.selected.is_some());
+    let observation = own.floor_observation();
+    assert_eq!(
+        (observation.min_build, observation.machine),
+        (7, Some("m3"))
+    );
+}
+
+/// After the chain selected a release and before anything is staged, the check refuses
+/// one whose signed manifest names no container URL under the pointer's tag, and one
+/// whose signer this client's durable revocation set holds, though the roster in hand
+/// lists it. Negative control: a bound release under a floor revoking nobody stands.
+#[test]
+fn a_selected_release_unbound_to_its_tag_or_durably_revoked_is_refused() {
+    let bound = tag_url(WEB_TAG, "aterm-0.10.0.dmg");
+    let revoking = crate::manifest::Floor {
+        revoked_machines: vec!["m3".into()],
+        ..crate::manifest::Floor::default()
+    };
+    let rows = [
+        (
+            Some(bound.as_str()),
+            crate::manifest::Floor::default(),
+            true,
+        ),
+        (None, crate::manifest::Floor::default(), false),
+        (Some(bound.as_str()), revoking, false),
+    ];
+    for (url, floor, stands) in rows {
+        let channel = web_channel(url);
+        let masters = [channel.master_pub.as_str()];
+        let mut fetched = fetch_authoritative_release(
+            Some(web_release(&test_source(), WEB_TAG).unwrap()),
+            &mut |url, _| channel.serve(url),
+            &channel.policy(&masters),
+        );
+        assert!(fetched.selected.is_some(), "the chain selects it");
+        fetched.refuse_unbound_or_revoked(&test_source(), &floor, WEB_TAG);
+        assert_eq!(
+            (fetched.selected.is_some(), fetched.manifest_rejected),
+            (stands, !stands),
+            "url {url:?}, revoked {:?}",
+            floor.revoked_machines
+        );
+    }
+}
+
 /// THE OBSERVATION-RATCHET SEMANTICS, pinned end to end so the code and its comment
 /// can never again disagree about when the floor moves. "A client that merely SAW
 /// roster generation n must refuse n-1 forever after" means the observation is
@@ -958,6 +1036,16 @@ fn the_roster_floor_ratchets_on_observation_not_on_acceptance() {
         saw_revocation.observed_roster_seq,
         Some(10),
         "observing the revoking generation must be reported for the durable ratchet"
+    );
+    // And what it revokes reaches the floor, though nothing is attributed.
+    let observation = saw_revocation.floor_observation();
+    assert_eq!(
+        (
+            observation.roster_seq,
+            observation.revoked,
+            observation.machine
+        ),
+        (10, &["m3".to_string()][..], None)
     );
 
     // ACT 2 — the replay, against the floor ACT 1's observation produced. The seq-9
@@ -1015,21 +1103,21 @@ fn admission_rereads_the_durable_floor_a_concurrent_check_may_have_ratcheted() {
         9,
     );
     let masters = [c.master_pub.as_str()];
-    let run_with_refresh = |refreshed_floor: u64| {
-        // The concurrent actor's ratchet, visible only through the re-read: the
-        // snapshot below stays at 0, exactly as in the race.
+    let run_with = |snapshot: u64, refreshed_floor: u64| {
+        // The concurrent actor's ratchet, visible only through the re-read.
         let refresh = move || refreshed_floor;
         fetch_authoritative_release(
             Some(web_release(&test_source(), WEB_TAG).unwrap()),
             &mut |url, _| serve_chain(&c, url),
             &RosterPolicy {
                 master_pubkeys: &masters,
-                floor_seq: 0,
+                floor_seq: snapshot,
                 now_unix: ROSTER_NOW,
                 floor_refresh: Some(&refresh),
             },
         )
     };
+    let run_with_refresh = |refreshed_floor: u64| run_with(0, refreshed_floor);
     // The other instance recorded generation 10 mid-download: this seq-9 roster is
     // superseded and must be refused, stale snapshot notwithstanding.
     let raced = run_with_refresh(10);
@@ -1043,6 +1131,10 @@ fn admission_rereads_the_durable_floor_a_concurrent_check_may_have_ratcheted() {
     let quiet = run_with_refresh(9);
     assert!(quiet.selected.is_some());
     assert_eq!(quiet.observed_roster_seq, Some(9));
+    // A re-read below the snapshot (a floor that could not be read reads as 0) only
+    // tightens: the snapshot at 10 still refuses generation 9.
+    let unread = run_with(10, 0);
+    assert!(unread.selected.is_none() && unread.manifest_rejected);
 }
 
 /// A marker written before the attribution fields existed names no machine. A
@@ -1461,9 +1553,14 @@ fn roster_freshness_conformance() {
             .entry((state["conf"], state["now"]))
             .or_insert_with(|| {
                 let (staging, ready) = lay_out(state["conf"]);
-                let admitted =
-                    crate::install::stage_admission_gates(&staging, 10, &ready, at(state["now"]))
-                        .is_none();
+                let admitted = crate::install::stage_admission_gates(
+                    &staging,
+                    10,
+                    &ready,
+                    None,
+                    at(state["now"]),
+                )
+                .is_none();
                 // NEGATIVE CONTROL: the floor-alone lane.
                 let floor_alone = crate::manifest::Floor::read(&staging.floor())
                     .withdraws(ready.build_number, ready.machine_id.as_deref())
@@ -1556,7 +1653,7 @@ fn roster_freshness_conformance() {
     // ...and the real gates then admit a swap the window should have stopped.
     let stamped = Ready::read_published_bundle(&staging).unwrap();
     assert_eq!(
-        crate::install::stage_admission_gates(&staging, 10, &stamped, at(blind["now"])),
+        crate::install::stage_admission_gates(&staging, 10, &stamped, None, at(blind["now"])),
         None
     );
     let swapped = project(read_disk(&staging), &blind, Some(late(&blind)));
@@ -1824,6 +1921,23 @@ fn a_stale_anchor_names_the_reinstall_and_a_publisher_fault_does_not() {
         replayed.manifest_rejected && !is_stale_anchor_refusal(reason),
         "a rolled-back roster is a replay, not a stale anchor: {reason}"
     );
+    // A roster the master signed in a schema this build cannot read is a verdict too,
+    // never a delivery fault to retry.
+    let mut newer = good.clone();
+    let text = String::from_utf8(newer.roster).unwrap();
+    assert_eq!(text.matches("schema = 1\n").count(), 1, "{text}");
+    newer.roster = text.replace("schema = 1\n", "schema = 2\n").into_bytes();
+    newer.roster_sig = Ed25519KeyPair::from_seed_unchecked(&MASTER_SEED_FIXTURE)
+        .unwrap()
+        .sign(&newer.roster)
+        .as_ref()
+        .to_vec();
+    let unreadable = run_chain(&newer, &masters, 0, ROSTER_NOW);
+    assert!(
+        unreadable.manifest_rejected && !unreadable.appcast_fetch_error,
+        "{:?}",
+        unreadable.rejection_reason
+    );
     // And a verified, accepted release carries no reason at all.
     let accepted = run_chain(&good, &masters, 0, ROSTER_NOW);
     assert!(accepted.selected.is_some() && accepted.rejection_reason.is_none());
@@ -1835,12 +1949,15 @@ fn a_stale_anchor_names_the_reinstall_and_a_publisher_fault_does_not() {
 /// would change nothing. A body that cannot be an Ed25519 signature (not 64
 /// bytes) has judged nothing, so it is the transport arm — still a refusal,
 /// nothing selected. A well-formed signature that fails to verify stays the
-/// stale-anchor verdict (the test above).
+/// stale-anchor verdict (the test above). A malformed APPCAST signature is judged
+/// after the roster is admitted, so its generation and revocations still reach the
+/// caller (the floor ratchets, a stage m11 signed is retired); only the roster's own
+/// signature, without which nothing is observed, is checked before.
 #[test]
 fn a_signature_that_is_not_signature_shaped_is_a_delivery_fault_not_a_stale_anchor() {
     let base = chain(
         &[("m3", M3_SEED_FIXTURE)],
-        &[],
+        &["m11"],
         ("m3", M3_SEED_FIXTURE),
         4,
         &MASTER_SEED_FIXTURE,
@@ -1876,6 +1993,14 @@ fn a_signature_that_is_not_signature_shaped_is_a_delivery_fault_not_a_stale_anch
             "a {what} block page is booked as a delivery failure, not a manifest verdict"
         );
     }
+    let fetched = run_chain(&appcast_sig_blocked, &masters, 0, ROSTER_NOW);
+    assert_eq!(fetched.observed_roster_seq, Some(4));
+    assert_eq!(fetched.observed_revocations, vec!["m11".to_string()]);
+    let fetched = run_chain(&roster_sig_blocked, &masters, 0, ROSTER_NOW);
+    assert_eq!(
+        fetched.observed_roster_seq, None,
+        "no roster, no observation"
+    );
 }
 
 /// THE RATCHET AND THE BIND, on the transport path, under the new authority.

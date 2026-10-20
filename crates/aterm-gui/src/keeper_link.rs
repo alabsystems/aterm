@@ -94,6 +94,51 @@ pub(crate) fn on() -> bool {
     ON.load(Ordering::Relaxed)
 }
 
+/// Local registration state, not evidence of a keeper's acknowledged custody.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "portable Settings projections include Unix registration states"
+    )
+)]
+pub(crate) enum RegistrationPhase {
+    Off,
+    Armed,
+    Live,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Status {
+    pub(crate) phase: RegistrationPhase,
+    pub(crate) tracked: usize,
+}
+
+/// Reads existing local memory only. KeeperLink has no cached connection or
+/// per-master acknowledgment, so this must never be presented as protection.
+pub(crate) fn status() -> Status {
+    #[cfg(unix)]
+    {
+        let state = keeper_state();
+        Status {
+            phase: match state.phase {
+                Phase::Off => RegistrationPhase::Off,
+                Phase::Armed => RegistrationPhase::Armed,
+                Phase::Live(_) => RegistrationPhase::Live,
+            },
+            tracked: state.tracked.len(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Status {
+            phase: RegistrationPhase::Off,
+            tracked: 0,
+        }
+    }
+}
+
 /// The fingerprint whose change sends a META: the modes with the per-frame
 /// ones masked (DEC 2026 synchronized output and `?25` cursor visibility —
 /// M9: a steady TUI toggles both every frame), the kitty keyboard flags and
@@ -616,8 +661,7 @@ fn boot_unix(candidate: bool, cfg: Option<&aterm_core::config::TerminalConfig>) 
     // Room for what the HELLO hands over, before it does (round seven,
     // finding 26's review): each adopted session holds about four
     // descriptors, and a cold launch runs at launchd's soft 256.
-    #[cfg(target_os = "macos")]
-    crate::handoff_rendezvous::raise_descriptor_limit_for_recovery();
+    crate::descriptor_limit::raise_descriptor_limit_for_recovery();
     let mut recovery = Recovery::default();
     let booted = match KeeperClient::connect(&socket, &identity, Duration::from_secs(2)) {
         Ok(client) => match client.hello_app_marked(&build(), marker(), JOURNAL) {
@@ -1063,6 +1107,7 @@ fn admit_recovered_journaled(
             ..Default::default()
         },
         journal_key: None,
+        task: None,
     })
 }
 
@@ -1322,12 +1367,10 @@ pub(crate) fn pending_before_grant(successor: u32) -> bool {
 /// window's masters and the kernel hangs the shells up as today. Waits at most
 /// [`BYE_WAIT`] for the frame to be written.
 pub(crate) fn bye() {
-    if !on() {
-        return;
-    }
     #[cfg(unix)]
     {
-        if let Some(link) = live_link()
+        if on()
+            && let Some(link) = live_link()
             && !link.send_and_wait(LinkOp::Bye, BYE_WAIT)
         {
             aterm_log::warn!("keeper: the BYE was not written");
@@ -2487,36 +2530,44 @@ mod tests {
     /// carry does not fit the old form but would without the directory and
     /// colours (then the title and mark state), a window before round
     /// seventeen sent it so shed, and every reader lost the directory. This one
-    /// sends the packed form whole. 118 alternate-screen columns and a 60-byte
-    /// directory (the review's case: 4,164 bytes whole, 4,094 shed): a newer
+    /// sends the packed form whole. An alternate screen with a 60-byte directory
+    /// (the review's case: 118 columns, 4,164 bytes whole, 4,094 shed): a newer
     /// window recovers the directory AND the program's region. An older window
     /// keeps every mode and the directory, and loses the region it used to
     /// keep: the trade `PackedTabStops`' VERSION SKEW records.
+    ///
+    /// The width is found, not pinned: every field the carry gains moves the
+    /// band (by 2026-10-18, 32 bytes: 118 columns came to 4,196 whole and 4,126
+    /// shed, past the cap both ways), and a column moves both forms by its two
+    /// stops, about 11 bytes, a step narrower than the 70-byte band.
     #[cfg(unix)]
     #[test]
     fn where_only_a_shed_old_form_fit_the_meta_goes_packed_and_whole() {
-        let mut t = Terminal::new(50, 118);
-        t.process(format!("\x1b]7;file://host/{}\x1b\\", "d".repeat(60)).as_bytes());
-        t.process(TUI_SETUP);
-        let mut shed = t.carry_meta_abandoning_partial();
-        let dir = shed
-            .current_working_directory
-            .take()
-            .expect("PRECONDITION: a directory");
-        shed.color = aterm_core::terminal::ColorRepr::default();
-        shed.title = None;
-        shed.shell = aterm_core::terminal::ShellRepr::default();
-        shed.shell_integration_nonce = None;
-        shed.parser = None;
-        shed.output_state = aterm_core::terminal::OutputStateRepr::default();
-        let (whole, shed) = (
-            old_form_meta(&t).len(),
-            aterm_json::to_string(&shed).expect("json").len(),
-        );
-        assert!(
-            whole > aterm_keeper::wire::MAX_META && shed <= aterm_keeper::wire::MAX_META,
-            "PRECONDITION: the band, where only a shed old form fits: {whole}, shed {shed}"
-        );
+        let in_band = |cols: u16| {
+            let mut t = Terminal::new(50, cols);
+            t.process(format!("\x1b]7;file://host/{}\x1b\\", "d".repeat(60)).as_bytes());
+            t.process(TUI_SETUP);
+            let mut shed = t.carry_meta_abandoning_partial();
+            let dir = shed
+                .current_working_directory
+                .take()
+                .expect("PRECONDITION: a directory");
+            shed.color = aterm_core::terminal::ColorRepr::default();
+            shed.title = None;
+            shed.shell = aterm_core::terminal::ShellRepr::default();
+            shed.shell_integration_nonce = None;
+            shed.parser = None;
+            shed.output_state = aterm_core::terminal::OutputStateRepr::default();
+            let (whole, shed) = (
+                old_form_meta(&t).len(),
+                aterm_json::to_string(&shed).expect("json").len(),
+            );
+            (whole > aterm_keeper::wire::MAX_META && shed <= aterm_keeper::wire::MAX_META)
+                .then_some((t, dir))
+        };
+        let (t, dir) = (40_u16..=400)
+            .find_map(in_band)
+            .expect("PRECONDITION: a width where only a shed old form fits");
 
         let meta = crate::seamless::keeper_meta(&t).expect("built");
         assert!(

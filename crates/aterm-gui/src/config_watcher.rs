@@ -35,7 +35,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use winit::event_loop::EventLoopProxy;
+use aterm_window::event_loop::EventLoopProxy;
 
 use crate::Wake;
 
@@ -930,14 +930,17 @@ impl ThemePollSchedule {
 /// The first content read happens only in `try_discover_in` after this stamp has
 /// selected a real candidate edge.
 fn theme_directory_stamp(path: &std::path::Path) -> Result<ThemeDirectoryStamp, WatchFailureKind> {
-    theme_directory_stamp_capped(path, crate::app_config::MAX_USER_THEME_DIRECTORY_ENTRIES)
+    theme_directory_stamp_capped(path, crate::app_config::ThemeScanCaps::PRODUCTION)
 }
 
-/// [`theme_directory_stamp`] reading at most `cap` entries (`truncated` past it).
+/// [`theme_directory_stamp`] reading at most `caps.entries` entries (`truncated`
+/// past it) and keeping the metadata of at most `caps.candidates` candidates —
+/// discovery's own bounds ([`crate::app_config::ThemeScanCaps`]).
 fn theme_directory_stamp_capped(
     path: &std::path::Path,
-    cap: usize,
+    caps: crate::app_config::ThemeScanCaps,
 ) -> Result<ThemeDirectoryStamp, WatchFailureKind> {
+    let cap = caps.entries;
     let directory_metadata = match std::fs::metadata(path) {
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -976,7 +979,7 @@ fn theme_directory_stamp_capped(
             }
             count = count.saturating_add(1);
             candidates.insert(entry.path());
-            if candidates.len() > crate::app_config::MAX_USER_THEME_CANDIDATES {
+            if candidates.len() > caps.candidates {
                 candidates.pop_last();
             }
         }
@@ -1108,15 +1111,54 @@ impl crate::App {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[cfg(unix)]
+    use super::feed_paths_of;
     use super::post_harness;
     use super::{
         FailureLatch, POLL_INTERVAL, THEME_IDLE_POLL_INTERVAL, ThemePollSchedule, WatchFailure,
         WatchFailureKind, WatchStatusEvent, WatchStatusState, WatchTarget,
         coherent_theme_sample_with, config_failure_kind, config_file_observation,
-        config_file_stamp, config_path_stamp, feed_paths_of, initial_config_observation_changed,
-        observed_harness, path_feed_stamp, prepare_config_edge_with, prepare_theme_edge_with,
-        theme_directory_stamp, theme_directory_stamp_capped,
+        config_file_stamp, config_path_stamp, initial_config_observation_changed, observed_harness,
+        path_feed_stamp, prepare_config_edge_with, prepare_theme_edge_with, theme_directory_stamp,
+        theme_directory_stamp_capped,
     };
+
+    /// Return once the clock the filesystem stamps a ctime from has moved past
+    /// `path`'s ctime, so a rewrite now carries a ctime of its own. Linux takes
+    /// ctime from the kernel's coarse clock (a tick of 1-4 ms), and a rewrite
+    /// inside the tick of the write before it keeps that write's ctime: a
+    /// metadata stamp cannot tell them apart (measured on the Linux lane, all
+    /// four same-length rewrite tests below read an unmoved stamp). APFS's ctime
+    /// has no such tick, so on macOS the first probe returns. The probe is a
+    /// file beside `path`'s directory, so the directory's own stamp is not
+    /// touched. A hang detector (a minute), never a budget: the clock must move.
+    #[cfg(unix)]
+    fn after_ctime_tick(path: &std::path::Path) {
+        use std::os::unix::fs::MetadataExt;
+        let ctime = |p: &std::path::Path| {
+            let m = std::fs::metadata(p).unwrap();
+            (m.ctime(), m.ctime_nsec())
+        };
+        let was = ctime(path);
+        let probe = std::env::temp_dir().join(format!(
+            "aterm-ctime-tick-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            std::fs::write(&probe, b"").unwrap();
+            if ctime(&probe) > was {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the filesystem's clock did not move past a ctime in a minute"
+            );
+            std::thread::yield_now();
+        }
+        let _ = std::fs::remove_file(&probe);
+    }
 
     /// Editing only the lexicon hot-reloads it: the feeds the config names are stamped beside it,
     /// so a same-length, mtime-restored lexicon rewrite under an unchanged `aterm.toml` moves the
@@ -1150,6 +1192,7 @@ pub(crate) mod tests {
 
         let metadata = std::fs::metadata(&lexicon).unwrap();
         let modified = metadata.modified().unwrap();
+        after_ctime_tick(&lexicon);
         std::fs::write(&lexicon, b"[[entry]]\nword = \"mews\"\n").unwrap();
         std::fs::OpenOptions::new()
             .write(true)
@@ -1319,6 +1362,7 @@ pub(crate) mod tests {
         let accessed = metadata.accessed().unwrap();
         let before = config_path_stamp(&path).unwrap();
 
+        after_ctime_tick(&path);
         std::fs::write(&path, b"theme = \"Rose\"\n").unwrap();
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.set_times(
@@ -1364,64 +1408,6 @@ pub(crate) mod tests {
         state.insert("forget_pending", i64::from(forget_pending));
         state
     }
-
-    /// `HarnessPolicyOneWriter`'s actions with no shipping function the
-    /// Tier-1 drives, each waived by name. Bound: `Poll` (`post_harness`),
-    /// `Deliver` (`App::adopt_harness_policy`), `AdmitOn`/`AdmitOff`
-    /// (`App::apply_prepared_config_generation`).
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "HarnessPolicyOneWriter",
-        action = "WriteOn",
-        reason = "The environment: a person saves aterm.toml with approvals on. The Tier-1 \
-                  writes the real file and the real watcher read (observed_harness) sees it."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "HarnessPolicyOneWriter",
-        action = "WriteOff",
-        reason = "The environment: a person saves the kill switch, refused for a stray \
-                  non-UTF-8 byte. The Tier-1 writes the real file and the real watcher read \
-                  (observed_harness) sees it."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "HarnessPolicyOneWriter",
-        action = "Commit",
-        reason = "A seamless successor's Commit (Wake::ActivateCommittedHandoff), bound by the \
-                  native-update handoff machines. Its one effect here, repost_after_commit, \
-                  raises the process-wide REPOST_AFTER_COMMIT that a live watcher thread in \
-                  the same test binary could consume, so the Tier-1 stands in for it."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "HarnessPolicyOneWriter",
-        action = "Forget",
-        reason = "An inline block of the watcher thread's loop (REPOST_AFTER_COMMIT's swap, \
-                  then last_harness = None), which the Tier-1 transcribes: the loop polls \
-                  forever and posts through a real event-loop proxy."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "HarnessPolicyOneWriter",
-        action = "SecondWriterOff",
-        reason = "The Buggy=1 mutant: an admission adopting its own kill switch, the design \
-                  this replaced; no shipping code, and the Tier-1's negative control sees the \
-                  step refused."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "HarnessPolicyOneWriter",
-        action = "SecondWriterOn",
-        reason = "The Buggy=1 mutant: an admission adopting its own approvals, the design this \
-                  replaced; no shipping code, and the Tier-1's negative control sees the step \
-                  refused."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "HarnessPolicyOneWriter",
-        action = "CommitWithoutForget",
-        reason = "The Buggy=1 mutant: a Commit that raises no REPOST_AFTER_COMMIT; no shipping \
-                  code (the Commit handler calls repost_after_commit)."
-    )]
-    #[expect(
-        dead_code,
-        reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it"
-    )]
-    fn harness_policy_one_writer_waivers() {}
 
     /// The real parts of the one-writer protocol, driven step by step.
     struct HarnessWriterDrive {
@@ -1923,6 +1909,7 @@ pub(crate) mod tests {
         let accessed = metadata.accessed().unwrap();
         let before = theme_directory_stamp(&dir).unwrap();
 
+        after_ctime_tick(&theme);
         std::fs::write(&theme, b"foreground = #445566\n").unwrap();
         let file = std::fs::OpenOptions::new()
             .write(true)
@@ -1955,6 +1942,8 @@ pub(crate) mod tests {
             calls += 1;
             let catalog = std::sync::Arc::new(crate::app_config::ThemeCatalog::discover_in(&dir));
             if calls == 1 {
+                #[cfg(unix)]
+                after_ctime_tick(&theme);
                 std::fs::write(&theme, "foreground = #222222\n").unwrap();
             }
             Ok(catalog)
@@ -1969,8 +1958,12 @@ pub(crate) mod tests {
     #[test]
     fn theme_stamp_bounds_total_entries_and_detects_return_under_cap() {
         // The cap is the production one's law at a size the test can lay down
-        // (`theme_directory_stamp` passes `MAX_USER_THEME_DIRECTORY_ENTRIES`).
+        // (`theme_directory_stamp` passes `ThemeScanCaps::PRODUCTION`).
         const CAP: usize = 8;
+        let caps = crate::app_config::ThemeScanCaps {
+            entries: CAP,
+            ..crate::app_config::ThemeScanCaps::PRODUCTION
+        };
         let dir = std::env::temp_dir().join(format!(
             "aterm-theme-watch-entry-cap-{}",
             std::process::id()
@@ -1983,11 +1976,11 @@ pub(crate) mod tests {
         for path in &noise {
             std::fs::write(path, []).unwrap();
         }
-        let over = theme_directory_stamp_capped(&dir, CAP).unwrap();
+        let over = theme_directory_stamp_capped(&dir, caps).unwrap();
         assert!(over.truncated);
         assert_eq!(over.inspected_entries, CAP + 1);
         std::fs::remove_file(&noise[0]).unwrap();
-        let under = theme_directory_stamp_capped(&dir, CAP).unwrap();
+        let under = theme_directory_stamp_capped(&dir, caps).unwrap();
         assert_ne!(over, under, "returning under the entry cap is observable");
         assert!(!under.truncated);
         let _ = std::fs::remove_dir_all(dir);
@@ -2001,7 +1994,12 @@ pub(crate) mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let cap = crate::app_config::MAX_USER_THEME_CANDIDATES;
+        // Discovery's candidate bound at a size the test can lay down.
+        let caps = crate::app_config::ThemeScanCaps {
+            candidates: 4,
+            ..crate::app_config::ThemeScanCaps::PRODUCTION
+        };
+        let cap = caps.candidates;
         for index in 0..cap + 8 {
             std::fs::write(
                 dir.join(format!("Theme-{index:04}.conf")),
@@ -2009,7 +2007,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         }
-        let stamp = theme_directory_stamp(&dir).unwrap();
+        let stamp = theme_directory_stamp_capped(&dir, caps).unwrap();
         assert_eq!(stamp.inspected_entries, cap + 8);
         assert_eq!(stamp.candidate_metadata, cap);
 
@@ -2271,3 +2269,65 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+/// `HarnessPolicyOneWriter` actions no shipping function performs, each waived where
+/// its Tier-1 (`tests`) binds it.
+/// `HarnessPolicyOneWriter`'s actions with no shipping function the
+/// Tier-1 drives, each waived by name. Bound: `Poll` (`post_harness`),
+/// `Deliver` (`App::adopt_harness_policy`), `AdmitOn`/`AdmitOff`
+/// (`App::apply_prepared_config_generation`).
+#[cfg(any(test, debug_assertions))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "HarnessPolicyOneWriter",
+    action = "WriteOn",
+    reason = "The environment: a person saves aterm.toml with approvals on. The Tier-1 \
+              writes the real file and the real watcher read (observed_harness) sees it."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "HarnessPolicyOneWriter",
+    action = "WriteOff",
+    reason = "The environment: a person saves the kill switch, refused for a stray \
+              non-UTF-8 byte. The Tier-1 writes the real file and the real watcher read \
+              (observed_harness) sees it."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "HarnessPolicyOneWriter",
+    action = "Commit",
+    reason = "A seamless successor's Commit (Wake::ActivateCommittedHandoff), bound by the \
+              native-update handoff machines. Its one effect here, repost_after_commit, \
+              raises the process-wide REPOST_AFTER_COMMIT that a live watcher thread in \
+              the same test binary could consume, so the Tier-1 stands in for it."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "HarnessPolicyOneWriter",
+    action = "Forget",
+    reason = "An inline block of the watcher thread's loop (REPOST_AFTER_COMMIT's swap, \
+              then last_harness = None), which the Tier-1 transcribes: the loop polls \
+              forever and posts through a real event-loop proxy."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "HarnessPolicyOneWriter",
+    action = "SecondWriterOff",
+    reason = "The Buggy=1 mutant: an admission adopting its own kill switch, the design \
+              this replaced; no shipping code, and the Tier-1's negative control sees the \
+              step refused."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "HarnessPolicyOneWriter",
+    action = "SecondWriterOn",
+    reason = "The Buggy=1 mutant: an admission adopting its own approvals, the design this \
+              replaced; no shipping code, and the Tier-1's negative control sees the step \
+              refused."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "HarnessPolicyOneWriter",
+    action = "CommitWithoutForget",
+    reason = "The Buggy=1 mutant: a Commit that raises no REPOST_AFTER_COMMIT; no shipping \
+              code (the Commit handler calls repost_after_commit)."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn harness_policy_one_writer_waivers() {}

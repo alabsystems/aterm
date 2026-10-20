@@ -1,0 +1,27 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the same subscriber after esc cancelled the automatic continue (`⏺ Automatic continue cancelled · …` in the transcript; the footer's own copy of it, right-aligned on the status line's row, had timed out by this frame): no banner, the status line printing 'Not logged in · Run /login' at column 2 right above the mode row
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ hello
+
+⏺ Hi! I am the local lab stub, not a model. (reply 29)
+
+✻ Sautéed for 0s · done 5:48 PM
+
+❯ carry on
+  ⎿  You've hit your session limit · resets 6:19pm (America/Los_Angeles)
+     /upgrade to increase your usage limit.
+
+⏺ Usage limit reached · continuing automatically at 6:19pm · esc to cancel
+
+✻ Cooked for 0s · done 5:49 PM
+
+⏺ Automatic continue cancelled · /rate-limit-options to re-arm
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Not logged in · Run /login
+  ⏵⏵ auto mode on (shift+tab to cycle)

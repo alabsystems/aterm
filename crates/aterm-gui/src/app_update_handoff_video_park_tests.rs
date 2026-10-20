@@ -310,8 +310,10 @@ fn a_gate_wait_after_a_missed_park_takes_the_rim_away() {
 
     app.update_handoff_prelaunch = None;
     drop(app);
-    aterm_pty::close_fd(slave);
+    // The master first: a slave closed over output its master never read
+    // waits out the tty's drain (0.6 s on macOS).
     aterm_pty::close_fd(master);
+    aterm_pty::close_fd(slave);
 }
 
 /// A COMMIT THE WORKER TOOK FIRST NEVER ANSWERS A LIVE TAKE (the review
@@ -1081,6 +1083,7 @@ fn live_take(
         presented: None,
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
+        unlogged_over_cap: 0,
         dir,
         handoff: None,
         cancel: crate::VideoCancellation::new(),

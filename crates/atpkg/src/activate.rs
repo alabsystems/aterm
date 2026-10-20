@@ -254,7 +254,7 @@ pub(crate) fn install_tools_env(
         }
     }
     files.iter().try_for_each(crate::lay::write_in_process)?;
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     for tool in tools {
         agents_checkpoint::at(layout, agents_checkpoint::Event::Written(tool.as_str()));
     }
@@ -323,7 +323,7 @@ pub fn reconcile_agents(layout: &Layout) {
         };
         let dev_link = primary_is == AgentPrimary::DevLink;
         let env = platform::shim_env_of(&primary);
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         agents_checkpoint::at(layout, agents_checkpoint::Event::Read(name));
         let twin = layout.agent_shim(&tool);
         // WHAT THE TWIN EXECS ([`twin_exec`]): the primary's target, except for ALab bytes,
@@ -352,8 +352,9 @@ pub fn reconcile_agents(layout: &Layout) {
         };
         let standing = named(&twin).or_else(|| named(&primary));
         let atpkg = crate::stub::Embedder::this_process().embed(standing.as_deref());
-        // A DEV LINK'S TWIN carries no self-update block: the checkout is the
-        // developer's, and atpkg updates no build of it.
+        // A DEV LINK'S TWIN carries no prelude (self-update or `--yolo`): the
+        // checkout is the developer's, and atpkg updates no build of it nor
+        // rewrites its argv.
         let prelude = if dev_link {
             String::new()
         } else {
@@ -362,6 +363,7 @@ pub fn reconcile_agents(layout: &Layout) {
                 &layout.prefix,
                 atpkg.as_deref(),
                 crate::selfupdate::verbs_of(name),
+                &crate::yolo::policy_of(name),
             )
         };
         // THE `bin/` SHIM ANSWERS THE SAME VERBS. Outside an aterm session
@@ -385,7 +387,7 @@ pub fn reconcile_agents(layout: &Layout) {
                 .and_then(|file| crate::lay::write_in_publication_turn(&file, &publication))
         {
             eprintln!(
-                "atpkg: {name}: bin/{name} lacks the self-update block ({e}); runs the store \
+                "atpkg: {name}: bin/{name} lacks the twin's prelude ({e}); runs the store \
                  build; retried next pass"
             );
         }
@@ -539,8 +541,9 @@ fn agent_primary(layout: &Layout, program: &str, target: &Path) -> Option<AgentP
 static AGENTS_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A fixture may park a real agent-shim read or write for its own prefix only. Callbacks
-/// run outside the registry lock, and removing the guard unregisters the fixture.
-#[cfg(test)]
+/// run outside the registry lock, and removing the guard unregisters the fixture. Unix test
+/// builds only, as those fixtures (cli's `tests`) are.
+#[cfg(all(test, unix))]
 pub(crate) mod agents_checkpoint {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -1043,7 +1046,7 @@ pub fn install_tombstone_shim(layout: &Layout, tool: &ToolName) -> io::Result<()
     // Atomic install through the platform backend (Unix: an executable `sh` script
     // temp+rename; Windows: a `.cmd` batch wrapper), replacing whatever shim was there.
     platform::install_tombstone_shim(&shim, &message)?;
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     agents_checkpoint::at(layout, agents_checkpoint::Event::Written(tool.as_str()));
     // A revoked agent program must not stay runnable through its front-of-PATH twin:
     // the tombstone resolves to no target, so the sweep drops the twin.
@@ -2080,6 +2083,10 @@ mod tests {
                     &layout.prefix,
                     Some(atpkg),
                     crate::selfupdate::verbs_of("claude"),
+                    // No yolo block: this test strand-proofs the self-update
+                    // hand-over alone (the yolo block's executed proof is in
+                    // platform's twin tests).
+                    &crate::yolo::Policy::NONE,
                 ),
             )
         };

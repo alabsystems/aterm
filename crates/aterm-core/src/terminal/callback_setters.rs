@@ -49,6 +49,10 @@ impl Terminal {
         }
         // Each saved cursor rides the resize of the grid it belongs to.
         self.lend_saved_cursors();
+        // The holder fence's anchors ride a rewrap lent, as the cursors do.
+        let anchors = cols_changed
+            .then(|| self.lend_main_anchors(aterm_grid::LendReach::Ring))
+            .flatten();
         if self.modes.alternate_screen {
             // Alt active: the app redraws its grid; the saved primary reflows.
             self.grid.resize_no_reflow_with_policy(rows, cols, policy);
@@ -63,7 +67,36 @@ impl Terminal {
             }
         }
         self.take_back_saved_cursors();
+        self.take_back_main_anchors(anchors);
         self.finalize_resize(cols_changed, rows_before, origin);
+    }
+
+    /// The primary-content grid: the inactive one while the alternate screen
+    /// is up.
+    fn main_grid_mut(&mut self) -> &mut crate::grid::Grid {
+        if self.modes.alternate_screen {
+            self.alt_grid.as_mut().unwrap_or(&mut self.grid)
+        } else {
+            &mut self.grid
+        }
+    }
+
+    /// Lend the main grid's holder-fence anchors out for a width change or
+    /// a re-attach ([`Grid::lend_anchors`](crate::grid::Grid::lend_anchors)),
+    /// reading history no further than `reach`. `None`, free, when no drawer
+    /// ever ran.
+    fn lend_main_anchors(
+        &mut self,
+        reach: aterm_grid::LendReach,
+    ) -> Option<aterm_grid::AnchorLend> {
+        self.main_grid_mut().lend_anchors(reach)
+    }
+
+    /// Put lent anchors back where their text landed.
+    fn take_back_main_anchors(&mut self, lend: Option<aterm_grid::AnchorLend>) {
+        if let Some(lend) = lend {
+            self.main_grid_mut().take_back_anchors(lend);
+        }
     }
 
     /// Lend each grid the DECSC slot that belongs to it (xterm `sc[0]` to the
@@ -146,6 +179,21 @@ impl Terminal {
         // As in `resize_with_policy`; the re-attach lends the saved cursors again
         // for its deficit fill.
         self.lend_saved_cursors();
+        // The anchors too, but only as far up as the history this resize
+        // rewraps synchronously: a Start beyond it clamps to the oldest line
+        // held back, and a span wholly beyond empties, so nothing rides the
+        // job (the design's clamp before detach).
+        let anchors = if cols_changed {
+            let main = self.main_grid_mut();
+            let reach = if main.scrollback().is_some() {
+                main.anchor_reach_for_offload(rows, cols)
+            } else {
+                aterm_grid::LendReach::Ring
+            };
+            self.lend_main_anchors(reach)
+        } else {
+            None
+        };
         let pending = if self.modes.alternate_screen {
             // Alt active: the saved primary holds the scrollback that reflows.
             self.grid.resize_no_reflow_with_policy(rows, cols, policy);
@@ -163,6 +211,7 @@ impl Terminal {
             pending
         };
         self.take_back_saved_cursors();
+        self.take_back_main_anchors(anchors);
         self.finalize_resize(cols_changed, rows_before, origin);
         pending
     }
@@ -182,8 +231,9 @@ impl Terminal {
         reflowed: aterm_grid::ReflowedScrollback,
     ) -> Option<aterm_grid::PendingScrollbackReflow> {
         // The re-attach's deficit fill moves the screen down by the lines it
-        // pulls back; the saved cursors move with it.
+        // pulls back; the saved cursors and the fence's anchors move with it.
         self.lend_saved_cursors();
+        let anchors = self.lend_main_anchors(aterm_grid::LendReach::Ring);
         let target = if self.modes.alternate_screen {
             self.alt_grid.as_mut()
         } else {
@@ -191,6 +241,7 @@ impl Terminal {
         };
         let next = target.and_then(|grid| grid.reattach_reflowed_scrollback_or_redetach(reflowed));
         self.take_back_saved_cursors();
+        self.take_back_main_anchors(anchors);
         next
     }
 
@@ -358,11 +409,12 @@ impl Terminal {
                 }
             }
         }
-        // DEC mode 2048: send an in-band size report on every resize (the emitter
-        // holds the response buffer's cap against a resize storm).
+        // DEC mode 2048: send an in-band size report on every resize, with the
+        // reports sent unasked (`take_reports`; the emitter holds the cap of what
+        // is owed to the peer against a resize storm).
         if self.modes.in_band_size_reports {
             super::state_accessors::push_in_band_size_report(
-                &mut self.transient.response_buffer,
+                &mut self.transient,
                 self.grid.rows(),
                 self.grid.cols(),
                 self.iterm2.host_cell_px(),

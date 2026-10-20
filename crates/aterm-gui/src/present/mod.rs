@@ -27,7 +27,7 @@ use std::num::NonZeroU32;
 use std::ops::DerefMut;
 use std::sync::Arc;
 
-use winit::window::Window;
+use aterm_window::window::Window;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;

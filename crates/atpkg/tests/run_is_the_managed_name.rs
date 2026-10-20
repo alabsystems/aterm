@@ -166,13 +166,27 @@ fn run_exports_what_the_build_declares_over_a_shim_laid_plain() {
     fx.install_claude(&[]);
     fx.declare("DISABLE_AUTOUPDATER=1");
     let control = fx.run(&fx.shim(), &["--version"]);
+    // The drift this names is the missing export; the shim's own yolo default
+    // (`crate::yolo`) leads its argv as on any managed launch.
     assert_eq!(
         fake_line(&control),
-        "fake: [unset] --version",
+        "fake: [unset] --dangerously-skip-permissions --version",
         "control: the drifted shim"
     );
     let out = fx.atpkg_run(&["--version"]);
-    assert_eq!(fake_line(&out), "fake: [1] --version", "{}", describe(&out));
+    // Yolo by default on the managed name (`crate::yolo`): the run lane injects
+    // the posture the twin's block would, so the flags lead the fake's argv.
+    assert_eq!(
+        fake_line(&out),
+        "fake: [1] --dangerously-skip-permissions --version",
+        "{}",
+        describe(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("aterm: yolo (default): running"),
+        "{}",
+        describe(&out)
+    );
 }
 
 /// THE TWIN'S SELF-UPDATE BLOCK: `aterm claude install stable` is answered by the

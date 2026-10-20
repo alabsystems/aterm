@@ -46,6 +46,14 @@ fn reachable_starts() -> Vec<(Vec<u8>, State)> {
         (b"\x1b_\xe6", State::SosPmApcString),
         (b"\x1bX", State::SosPmApcString),
         (b"\x1b^", State::SosPmApcString),
+        // A tmux passthrough wrapper: its head, open, at its ESC, and with
+        // the payload's own DCS hooked and at that DCS's ESC.
+        (b"\x1bPt", State::DcsIgnore),
+        (b"\x1bPtmux", State::DcsIgnore),
+        (b"\x1bPtmux;", State::Ground),
+        (b"\x1bPtmux;\x1b", State::Ground),
+        (b"\x1bPtmux;\x1b\x1bPq", State::DcsPassthrough),
+        (b"\x1bPtmux;\x1b\x1bPq\x1b\x1b", State::Escape),
     ];
     let mut out: Vec<(Vec<u8>, State)> = starts
         .iter()
@@ -123,7 +131,13 @@ fn every_state_every_byte_keeps_the_type_invariant() {
                 if first == 0x18 || first == 0x1A {
                     assert_eq!(one.state(), State::Ground, "{}", at());
                 }
-                if !c1 && *state == State::Ground && (0x80..=0x9F).contains(&first) {
+                // (Not where an open tmux wrapper holds an ESC: that ESC
+                // reaches the payload with the byte after it.)
+                if !c1
+                    && *state == State::Ground
+                    && start.tmux_passthrough() != TmuxPassthrough::Escape
+                    && (0x80..=0x9F).contains(&first)
+                {
                     assert_eq!(one.state(), State::Ground, "{}", at());
                 }
                 for second in 0..=u8::MAX {

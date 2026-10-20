@@ -289,6 +289,140 @@ fn the_projection_is_newest_first_in_the_chips_order_with_the_hosts_facts() {
     assert!(MessagesState::empty().saved && MessagesState::empty().entries.is_empty());
 }
 
+/// ONE FACT, ONE ROW (the owner, 2026-10-19: Settings ▸ Messages listed one lost
+/// login three times): a story told on — a keyed row in new words, a row of
+/// another key that replaced it, a record the owner read that a later row tells
+/// on — is ONE entry, the latest, in its current words; the counts and the chips
+/// count it once. NEGATIVE CONTROLS: a record whose replacement the ring no longer
+/// holds, or one replaced "back" by an earlier record, stays its own row
+/// (`replaced`), and an unrelated record stands.
+#[test]
+fn a_story_told_on_is_one_row_in_its_latest_words() {
+    let now = Instant::now();
+    let mut c = center(now);
+    let notice = |title: &str, key: &str, step: &str| {
+        Message::new(tags::HARNESS, Severity::Warn, title)
+            .line(step)
+            .key(key)
+            .hold(Hold::STANDING)
+    };
+    let other = c
+        .post(
+            Message::new(tags::SYSTEM, Severity::Info, "Font installed").hold(Hold::LogOnly),
+            stamp(NOW - 9 * 60_000),
+            now,
+        )
+        .id;
+    // The sign-in, read; the same key in new words; another key's next state.
+    let si = c
+        .post(
+            notice("Login expired in tab 1", "n.s-1.si", "Finish signing in"),
+            stamp(NOW - 8 * 60_000),
+            now,
+        )
+        .id;
+    let si2 = c
+        .post(
+            notice(
+                "Login expired in tab 1",
+                "n.s-1.si",
+                "Finish signing in as main",
+            ),
+            stamp(NOW - 7 * 60_000),
+            now,
+        )
+        .id;
+    assert_eq!(
+        c.log().get(si).and_then(LogRecord::retired),
+        Some(&crate::Retired::Superseded { by: si2 }),
+        "the center's own keyed supersede"
+    );
+    c.commit_rows(now, 3);
+    assert!(c.mark_seen(si2, now));
+    let ca = c
+        .post(
+            notice("Sign-in cancelled in tab 1", "n.s-1.ca", "Type /login"),
+            stamp(NOW - 6 * 60_000),
+            now,
+        )
+        .id;
+    assert!(c.supersede_record(si2, ca, now), "a read record told on");
+    let page = MessagesState::of(&c, &Desk::default());
+    let ids: Vec<u64> = page.entries.iter().map(|e| e.id).collect();
+    assert_eq!(
+        ids,
+        [ca.raw(), other.raw()],
+        "the story once, and the other fact"
+    );
+    let row = page.entry(ca.raw()).expect("the story");
+    assert_eq!(row.title, "Sign-in cancelled in tab 1", "its latest words");
+    assert_eq!(row.state, "live");
+    assert_eq!(
+        page.tags,
+        [("harness".to_string(), 1), ("system".to_string(), 1)],
+        "counted once"
+    );
+    // NEGATIVE CONTROL: replaced "back" by an earlier record: its own row.
+    let late = c
+        .post(
+            notice("Login expired in tab 2", "n.s-2.si", "Finish signing in"),
+            stamp(NOW - 60_000),
+            now,
+        )
+        .id;
+    assert!(c.withdraw(late, now));
+    assert!(!c.supersede_record(late, other, now), "never told back");
+    let page = MessagesState::of(&c, &Desk::default());
+    assert!(page.entry(late.raw()).is_some(), "its own row");
+    // NEGATIVE CONTROL: a replacement the ring no longer holds.
+    let mut ring = MessageLog::empty();
+    let mut head = c.log().get(si).expect("the record").clone();
+    head.state = crate::LogState::Posted;
+    head.retired_unix_ms = None;
+    ring.replay_all([
+        LogLine::Posted(head),
+        LogLine::Retired {
+            id: si,
+            how: crate::Retired::Superseded { by: si2 },
+            unix_ms: NOW - 7 * 60_000,
+            title: "Login expired in tab 1".into(),
+            detail: vec!["Finish signing in".into()],
+            repeats: 1,
+            mark: None,
+        },
+    ]);
+    let alone = MessageCenter::new(ring, now);
+    let page = MessagesState::of(&alone, &Desk::default());
+    let row = page
+        .entry(si.raw())
+        .expect("its successor is gone: its own row");
+    assert_eq!(row.state_words(), "replaced");
+    // NEGATIVE CONTROL: a file that says a record was replaced by an EARLIER
+    // one (no build of this center writes it; the page reads any file) keeps
+    // both rows: the earlier record cannot stand for a later one.
+    let mut ring = MessageLog::empty();
+    let mut back = c.log().get(late).expect("the record").clone();
+    back.state = crate::LogState::Posted;
+    back.retired_unix_ms = None;
+    ring.replay_all([
+        LogLine::Posted(c.log().get(other).expect("the record").clone()),
+        LogLine::Posted(back),
+        LogLine::Retired {
+            id: late,
+            how: crate::Retired::Superseded { by: other },
+            unix_ms: NOW - 60_000,
+            title: "Login expired in tab 2".into(),
+            detail: vec!["Finish signing in".into()],
+            repeats: 1,
+            mark: None,
+        },
+    ]);
+    let back = MessageCenter::new(ring, now);
+    let page = MessagesState::of(&back, &Desk::default());
+    let ids: Vec<u64> = page.entries.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [late.raw(), other.raw()], "told back: both rows");
+}
+
 /// `Install now` is pressable only while the host says that build is still staged; an
 /// answered decision is not offered again; the sentence count is the host's.
 #[test]

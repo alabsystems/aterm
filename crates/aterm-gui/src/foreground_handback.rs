@@ -614,7 +614,7 @@ fn linux_group_has_stopped_member(master: i32, pgid: i32) -> bool {
 /// (`/proc/<pid>/task/<tid>/children`). `None` when no thread's list can be
 /// read — the process is gone, or the kernel lacks `CONFIG_PROC_CHILDREN`.
 #[cfg(target_os = "linux")]
-fn linux_children(pid: i32) -> Option<Vec<i32>> {
+pub(crate) fn linux_children(pid: i32) -> Option<Vec<i32>> {
     let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
     let mut out = Vec::new();
     let mut read_any = false;
@@ -831,8 +831,10 @@ pub(crate) fn restored_payload(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::leader_gone;
     use super::{
-        FgCutter, FgEdge, FgOwners, FgRole, TREE_CAP, group_orphaned, leader_gone, parse_children,
+        FgCutter, FgEdge, FgOwners, FgRole, TREE_CAP, group_orphaned, parse_children,
         proc_stat_is_stopped_in, restored_payload, splice_at, tree_any,
     };
     use aterm_core::terminal::program_evidence::{
@@ -1428,3 +1430,28 @@ mod tests {
         );
     }
 }
+
+/// `foreground_handback_ownership` environment actions, each waived where its Tier-1
+/// (`foreground_handback_conformance`) binds it.
+// The machine's other four actions carry `#[refines]` anchors on the shipping
+// code: `Arm` and `ShellArm` on `FgOwners::observe` (whose slice holder decides
+// which), `Reclaim` on `FgOwners::orphaned_by`, `Sample` on `FgCutter::sample`.
+#[cfg(all(any(test, debug_assertions), unix))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback_ownership",
+    action = "Launch",
+    reason = "The shell's `tcsetpgrp` giving a job the terminal: an environment step. The \
+              Tier-1 rows move the scripted foreground probe exactly there."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback_ownership",
+    action = "Die",
+    reason = "A process's death: an environment step. The Tier-1 rows add the job to the \
+              scripted liveness probe's dead set exactly there."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn ownership_scope_waivers() {}

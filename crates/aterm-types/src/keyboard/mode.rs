@@ -7,7 +7,7 @@
 bitflags! {
     /// Terminal mode flags relevant to keyboard encoding: a subset of the full terminal modes.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub struct KeyboardMode: u16 {
+    pub struct KeyboardMode: u32 {
         /// Kitty keyboard protocol: disambiguate escape codes (CSI u encoding).
         const DISAMBIGUATE_ESC_CODES = 1 << 0;
         /// Kitty keyboard protocol: report key repeat/release events.
@@ -54,7 +54,8 @@ bitflags! {
         /// Ctrl alone: conhost reads their legacy BS as Ctrl+Backspace, which PSReadLine and
         /// cmd.exe take as a word delete, and PSReadLine inserts a literal BS on a record that
         /// carries Shift (measured 2026-10-16; `win32_ctrl_character_record`). Ctrl+Backspace
-        /// keeps its BS.
+        /// keeps its BS. Ctrl+J is the J key's record the same way: conhost reads its legacy
+        /// LF as Ctrl+Enter (measured 2026-10-17).
         ///
         /// A negotiation bit with the host, not a kitty flag, in this word only because the
         /// encoder reads one word: it is never part of the `CSI ? flags u` answer, the kitty
@@ -63,6 +64,19 @@ bitflags! {
         /// keys it covers, because conhost drops the CSI-u reports written back; every other key
         /// follows the kitty flags.
         const WIN32_INPUT = 1 << 15;
+        /// The console host that asked for [`Self::WIN32_INPUT`] is OpenConsole (the host
+        /// aterm bundles, a Windows tab's default), not Windows' inbox conhost. Meaningful only
+        /// with `WIN32_INPUT`, and a negotiation bit like it: never kitty, never an answer.
+        ///
+        /// The two hosts read a few keys differently (measured 2026-10-18, OpenConsole
+        /// 1.25.2609.30003 against conhost 10.0.26200): OpenConsole types a CSI it does not
+        /// know as text, so KP_Begin's legacy `CSI E` reached PSReadLine as Escape, which
+        /// reverted the line, and `[E`; it hands a VT reader xterm's bytes for the `VK_CLEAR`
+        /// and F13-F20 records (`CSI E`, `CSI 1;2E`, `CSI 25~`, `CSI 25;5~`), where conhost
+        /// gives `CSI G` and nothing. So under it KP_Begin and F13-F20 go out as records
+        /// (`encode_win32_keys`), and under conhost they keep their legacy bytes. The keypad
+        /// under DECKPAM is records on both hosts.
+        const OPENCONSOLE_HOST = 1 << 16;
 
         /// Aggregate: any kitty progressive-enhancement flag. With one set the app negotiated
         /// kitty semantics, which supersede xterm modifyOtherKeys.

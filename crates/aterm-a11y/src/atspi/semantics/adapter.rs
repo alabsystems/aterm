@@ -24,7 +24,7 @@ use crate::model::{Role, TreeUpdate};
 use crate::tree::{ChangeHandler, FilterResult, Node, NodeId, State as TreeState, Tree};
 
 use super::context::{ActionHandlerNoMut, AppContext, Context, SharedLock};
-use super::node::{NodeIdOrRoot, NodeWrapper, PlatformNode};
+use super::node::{NodeIdOrRoot, NodeIdentity, NodeWrapper, PlatformNode};
 use super::{
     AdapterCallback, CacheEvent, Event, InterfaceSet, ObjectEvent, Politeness, State, WindowBounds,
     WindowEvent,
@@ -33,10 +33,10 @@ use crate::tree::common_filter as filter;
 
 struct AdapterChangeHandler<'a> {
     adapter: &'a Adapter,
-    added_nodes: HashSet<NodeId>,
-    removed_nodes: HashSet<NodeId>,
+    added_nodes: HashSet<NodeIdentity>,
+    removed_nodes: HashSet<NodeIdentity>,
     checked_text_change: HashSet<NodeId>,
-    selection_changed: BTreeSet<NodeId>,
+    selection_changed: BTreeSet<NodeIdentity>,
 }
 
 impl<'a> AdapterChangeHandler<'a> {
@@ -51,7 +51,7 @@ impl<'a> AdapterChangeHandler<'a> {
     }
 
     fn add_node(&mut self, node: &Node) {
-        let id = node.id();
+        let id = NodeIdentity::of(node);
         if !self.added_nodes.insert(id) {
             return;
         }
@@ -60,8 +60,9 @@ impl<'a> AdapterChangeHandler<'a> {
         let is_root = node.is_root();
         let wrapper = NodeWrapper(node);
         let interfaces = wrapper.interfaces();
-        self.adapter.register_interfaces(node.id(), interfaces);
-        self.adapter.emit_cache_added(node.id());
+        self.adapter
+            .register_interfaces(NodeIdentity::of(node), interfaces);
+        self.adapter.emit_cache_added(NodeIdentity::of(node));
         if is_root
             && role == Role::Window
             && let Ok(adapter_index) = self
@@ -71,15 +72,18 @@ impl<'a> AdapterChangeHandler<'a> {
                 .read()
                 .adapter_index(self.adapter.id)
         {
-            self.adapter.window_created(adapter_index, node.id());
+            self.adapter
+                .window_created(adapter_index, NodeIdentity::of(node));
         }
 
         let live = wrapper.live();
         if live != Politeness::None
             && let Some(name) = wrapper.name()
         {
-            self.adapter
-                .emit_object_event(node.id(), ObjectEvent::Announcement(name, live));
+            self.adapter.emit_object_event(
+                NodeIdentity::of(node),
+                ObjectEvent::Announcement(name, live),
+            );
         }
         if let Some(true) = node.is_selected() {
             self.enqueue_selection_changed_if_needed(node);
@@ -94,7 +98,7 @@ impl<'a> AdapterChangeHandler<'a> {
     }
 
     fn remove_node(&mut self, node: &Node) {
-        let id = node.id();
+        let id = NodeIdentity::of(node);
         if !self.removed_nodes.insert(id) {
             return;
         }
@@ -103,13 +107,15 @@ impl<'a> AdapterChangeHandler<'a> {
         let is_root = node.is_root();
         let wrapper = NodeWrapper(node);
         if is_root && role == Role::Window {
-            self.adapter.window_destroyed(node.id());
+            self.adapter.window_destroyed(NodeIdentity::of(node));
         }
+        self.adapter.emit_object_event(
+            NodeIdentity::of(node),
+            ObjectEvent::StateChanged(State::Defunct, true),
+        );
+        self.adapter.emit_cache_removed(NodeIdentity::of(node));
         self.adapter
-            .emit_object_event(node.id(), ObjectEvent::StateChanged(State::Defunct, true));
-        self.adapter.emit_cache_removed(node.id());
-        self.adapter
-            .unregister_interfaces(node.id(), wrapper.interfaces());
+            .unregister_interfaces(NodeIdentity::of(node), wrapper.interfaces());
         if let Some(true) = node.is_selected() {
             self.enqueue_selection_changed_if_needed(node);
         }
@@ -160,7 +166,7 @@ impl<'a> AdapterChangeHandler<'a> {
             && length > 0
         {
             self.adapter.emit_object_event(
-                id,
+                NodeIdentity::of(new_node),
                 ObjectEvent::TextRemoved {
                     start_index: prefix_usv_count,
                     length,
@@ -174,7 +180,7 @@ impl<'a> AdapterChangeHandler<'a> {
             && length > 0
         {
             self.adapter.emit_object_event(
-                id,
+                NodeIdentity::of(new_node),
                 ObjectEvent::TextInserted {
                     start_index: prefix_usv_count,
                     length,
@@ -205,14 +211,16 @@ impl<'a> AdapterChangeHandler<'a> {
             if let Some(selection) = new_node.text_selection()
                 && !selection.is_degenerate()
             {
-                self.adapter
-                    .emit_object_event(new_node.id(), ObjectEvent::TextSelectionChanged);
+                self.adapter.emit_object_event(
+                    NodeIdentity::of(new_node),
+                    ObjectEvent::TextSelectionChanged,
+                );
             }
             if let Some(selection_focus) = new_node.text_selection_focus()
                 && let Ok(offset) = selection_focus.to_global_usv_index().try_into()
             {
                 self.adapter
-                    .emit_object_event(new_node.id(), ObjectEvent::CaretMoved(offset));
+                    .emit_object_event(NodeIdentity::of(new_node), ObjectEvent::CaretMoved(offset));
             }
             return;
         };
@@ -228,8 +236,10 @@ impl<'a> AdapterChangeHandler<'a> {
                     .map(|selection| !selection.is_degenerate())
                     .unwrap_or(false))
         {
-            self.adapter
-                .emit_object_event(new_node.id(), ObjectEvent::TextSelectionChanged);
+            self.adapter.emit_object_event(
+                NodeIdentity::of(new_node),
+                ObjectEvent::TextSelectionChanged,
+            );
         }
 
         let old_caret_position = old_node
@@ -243,7 +253,7 @@ impl<'a> AdapterChangeHandler<'a> {
             && let Ok(offset) = selection_focus.to_global_usv_index().try_into()
         {
             self.adapter
-                .emit_object_event(new_node.id(), ObjectEvent::CaretMoved(offset));
+                .emit_object_event(NodeIdentity::of(new_node), ObjectEvent::CaretMoved(offset));
         }
     }
 
@@ -251,7 +261,7 @@ impl<'a> AdapterChangeHandler<'a> {
         if !node.is_container_with_selectable_children() {
             return;
         }
-        self.selection_changed.insert(node.id());
+        self.selection_changed.insert(NodeIdentity::of(&node));
     }
 
     fn enqueue_selection_changed_if_needed(&mut self, node: &Node) {
@@ -282,6 +292,30 @@ impl ChangeHandler for AdapterChangeHandler<'_> {
     }
 
     fn node_updated(&mut self, old_node: &Node, new_node: &Node) {
+        if NodeIdentity::of(old_node) != NodeIdentity::of(new_node)
+            && filter(old_node) == FilterResult::Include
+            && filter(new_node) == FilterResult::Include
+        {
+            self.remove_node(old_node);
+            self.add_node(new_node);
+            // A surviving container must replace its cached child reference too.
+            if let Some(parent) = old_node.filtered_parent(&filter) {
+                self.adapter.emit_object_event(
+                    NodeIdentity::of(&parent),
+                    ObjectEvent::ChildRemoved(NodeIdentity::of(old_node)),
+                );
+            }
+            if let Some(parent) = new_node.filtered_parent(&filter) {
+                self.adapter.emit_object_event(
+                    NodeIdentity::of(&parent),
+                    ObjectEvent::ChildAdded(
+                        new_node.preceding_filtered_siblings(&filter).count(),
+                        NodeIdentity::of(new_node),
+                    ),
+                );
+            }
+            return;
+        }
         self.emit_text_change_if_needed(old_node, new_node);
         let filter_old = filter(old_node);
         let filter_new = filter(new_node);
@@ -308,7 +342,7 @@ impl ChangeHandler for AdapterChangeHandler<'_> {
             self.adapter
                 .unregister_interfaces(new_wrapper.id(), old_interfaces ^ kept_interfaces);
             self.adapter
-                .register_interfaces(new_node.id(), new_interfaces ^ kept_interfaces);
+                .register_interfaces(NodeIdentity::of(new_node), new_interfaces ^ kept_interfaces);
             let bounds = *self.adapter.context.root_window_bounds.read();
             new_wrapper.notify_changes(&bounds, self.adapter, &old_wrapper);
             self.emit_text_selection_change(Some(old_node), new_node);
@@ -329,13 +363,17 @@ impl ChangeHandler for AdapterChangeHandler<'_> {
             self.adapter.window_deactivated(&NodeWrapper(&root_window));
         }
         if let Some(node) = new_node {
-            self.adapter
-                .emit_object_event(node.id(), ObjectEvent::StateChanged(State::Focused, true));
+            self.adapter.emit_object_event(
+                NodeIdentity::of(node),
+                ObjectEvent::StateChanged(State::Focused, true),
+            );
             self.emit_text_selection_change(None, node);
         }
         if let Some(node) = old_node {
-            self.adapter
-                .emit_object_event(node.id(), ObjectEvent::StateChanged(State::Focused, false));
+            self.adapter.emit_object_event(
+                NodeIdentity::of(node),
+                ObjectEvent::StateChanged(State::Focused, false),
+            );
         }
     }
 
@@ -381,7 +419,7 @@ impl Adapter {
         action_handler: Arc<dyn ActionHandlerNoMut + Send + Sync>,
     ) -> Self {
         let tree = Tree::new(initial_state, is_window_focused);
-        let focus_id = tree.state().focus().map(|node| node.id());
+        let focus_id = tree.state().focus().map(|node| NodeIdentity::of(&node));
         let context = Context::new(app_context, tree, action_handler, root_window_bounds);
         context.app_context.write().push_adapter(id, &context);
         let adapter = Self {
@@ -397,9 +435,9 @@ impl Adapter {
     }
 
     fn register_tree(&self) {
-        fn add_children(node: Node<'_>, to_add: &mut Vec<(NodeId, InterfaceSet)>) {
+        fn add_children(node: Node<'_>, to_add: &mut Vec<(NodeIdentity, InterfaceSet)>) {
             for child in node.filtered_children(&filter) {
-                let child_id = child.id();
+                let child_id = NodeIdentity::of(&child);
                 let wrapper = NodeWrapper(&child);
                 let interfaces = wrapper.interfaces();
                 to_add.push((child_id, interfaces));
@@ -417,7 +455,7 @@ impl Adapter {
             app_context.toolkit_version = tree_state.toolkit_version().map(|s| s.to_string());
             let adapter_index = app_context.adapter_index(self.id);
             let root = tree_state.root();
-            let root_id = root.id();
+            let root_id = NodeIdentity::of(&root);
             let wrapper = NodeWrapper(&root);
             objects_to_add.push((root_id, wrapper.interfaces()));
             add_children(root, &mut objects_to_add);
@@ -434,25 +472,25 @@ impl Adapter {
         }
     }
 
-    pub(crate) fn platform_node(&self, id: NodeId) -> PlatformNode {
+    pub(crate) fn platform_node(&self, id: NodeIdentity) -> PlatformNode {
         PlatformNode::new(&self.context, self.id, id)
     }
 
     #[cfg(test)]
-    pub(crate) fn root_id(&self) -> NodeId {
-        self.context.tree.read().state().root_id()
+    pub(crate) fn root_id(&self) -> NodeIdentity {
+        NodeIdentity::of(&self.context.tree.read().state().root())
     }
 
-    fn register_interfaces(&self, id: NodeId, new_interfaces: InterfaceSet) {
+    fn register_interfaces(&self, id: NodeIdentity, new_interfaces: InterfaceSet) {
         self.callback.register_interfaces(self, id, new_interfaces);
     }
 
-    fn unregister_interfaces(&self, id: NodeId, old_interfaces: InterfaceSet) {
+    fn unregister_interfaces(&self, id: NodeIdentity, old_interfaces: InterfaceSet) {
         self.callback
             .unregister_interfaces(self, id, old_interfaces);
     }
 
-    pub(crate) fn emit_object_event(&self, target: NodeId, event: ObjectEvent) {
+    pub(crate) fn emit_object_event(&self, target: NodeIdentity, event: ObjectEvent) {
         let target = NodeIdOrRoot::Node(target);
         self.callback
             .emit_event(self, Event::Object { target, event });
@@ -464,12 +502,12 @@ impl Adapter {
             .emit_event(self, Event::Object { target, event });
     }
 
-    fn emit_cache_added(&self, target: NodeId) {
+    fn emit_cache_added(&self, target: NodeIdentity) {
         self.callback
             .emit_event(self, Event::Cache(CacheEvent::Added(target)));
     }
 
-    fn emit_cache_removed(&self, target: NodeId) {
+    fn emit_cache_removed(&self, target: NodeIdentity) {
         self.callback
             .emit_event(self, Event::Cache(CacheEvent::Removed(target)));
     }
@@ -492,7 +530,7 @@ impl Adapter {
         tree.update_host_focus_state_and_process_changes(is_focused, &mut handler);
     }
 
-    fn window_created(&self, adapter_index: usize, window: NodeId) {
+    fn window_created(&self, adapter_index: usize, window: NodeIdentity) {
         self.emit_root_object_event(ObjectEvent::ChildAdded(adapter_index, window));
     }
 
@@ -521,7 +559,7 @@ impl Adapter {
         self.emit_object_event(window.id(), ObjectEvent::StateChanged(State::Active, false));
     }
 
-    fn window_destroyed(&self, window: NodeId) {
+    fn window_destroyed(&self, window: NodeIdentity) {
         self.emit_root_object_event(ObjectEvent::ChildRemoved(window));
     }
 
@@ -552,7 +590,7 @@ fn root_window(current_state: &TreeState) -> Option<Node<'_>> {
 
 impl Drop for Adapter {
     fn drop(&mut self) {
-        let root_id = self.context.tree.read().state().root_id();
+        let root_id = NodeIdentity::of(&self.context.tree.read().state().root());
         self.window_destroyed(root_id);
         // Note: We deliberately do the following here, not in a Drop
         // implementation on context, because AppContext owns a second

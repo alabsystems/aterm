@@ -86,16 +86,21 @@ fn check(name: &str, rows: &[String]) -> Result<(), String> {
 #[test]
 fn the_live_zone_keeps_every_row_the_busy_reading_reads() {
     let screens = fixture_screens("busy zone sweep");
-    let mut bad = Vec::new();
-    let mut framed = 0;
-    for (name, rows) in &screens {
-        framed += usize::from(aterm_phase::phase::composer_rules(rows).is_some());
-        for k in 0..rows.len() {
-            if let Err(e) = check(&format!("{name} [{k}..]"), &rows[k..]) {
-                bad.push(e);
-            }
-        }
-    }
+    // One job per tail cut: a tall capture's cuts are most of the sweep.
+    let cuts: Vec<(&str, &[String], usize)> = screens
+        .iter()
+        .flat_map(|(name, rows)| (0..rows.len()).map(move |k| (name.as_str(), &rows[..], k)))
+        .collect();
+    let bad: Vec<String> = crate::on_every_core(&cuts, |&(name, rows, k)| {
+        check(&format!("{name} [{k}..]"), &rows[k..]).err()
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    let framed = screens
+        .iter()
+        .filter(|(_, rows)| aterm_phase::phase::composer_rules(rows).is_some())
+        .count();
     assert!(
         bad.is_empty(),
         "{} violations:\n{}",
@@ -109,9 +114,7 @@ fn the_live_zone_keeps_every_row_the_busy_reading_reads() {
         "{} screens, {framed} framed",
         screens.len()
     );
-    assert!(
-        screens
-            .iter()
-            .any(|(n, _)| n.ends_with("/claude-2.1.283-exit-relaunch-stale-busy.txt"))
-    );
+    assert!(screens.iter().any(|(n, _)| {
+        std::path::Path::new(n).ends_with("claude-2.1.283-exit-relaunch-stale-busy.txt")
+    }));
 }

@@ -27,7 +27,7 @@
 //! resize against output, and the host stamps wall time. Nothing is checkpointed.
 
 use super::Terminal;
-use crate::grid::ResizePolicy;
+use crate::grid::{ResizeLaw, ResizePolicy};
 
 #[cfg(test)]
 #[path = "resize_journal_tests.rs"]
@@ -80,12 +80,16 @@ pub struct ResizeReport {
     /// earlier shrink demoted them and nothing drew since, so the grow put them
     /// back where the app painted them.
     pub restored_top: u16,
-    /// Rows the resize undo put back at the bottom, where an earlier shrink
-    /// pushed them off (nothing moved; not counted in `appended`).
+    /// Rows put back at the bottom, where an earlier shrink pushed them off:
+    /// by the resize undo, or from history by the rows hand-back (nothing
+    /// moved; not counted in `appended`).
     pub restored_bottom: u16,
     /// A width change rewrapped the grid (a primary-screen reflow), which
     /// renumbers rows wholesale, so the counts above are not a displacement.
     pub reflowed: bool,
+    /// Columns of drawn cells a narrowing with no rewrap cut off the right edge
+    /// ([`aterm_grid::ResizeShape::cut`]): a grow back brings blanks there.
+    pub cut: u16,
     /// The active grid's content sequence (`Terminal::content_seq`) after the resize, which
     /// advances it by itself: compare a live `content_seq` to learn whether the app drew
     /// since.
@@ -146,6 +150,62 @@ impl ResizeReport {
     #[must_use]
     pub fn healed_by(&self, full_clears: u64, screen_replaced: u64) -> bool {
         full_clears > self.full_clears || screen_replaced > self.screen_replaced
+    }
+}
+
+/// What the alternate screen owes its program ([`Terminal::render_debt`]): what its
+/// resizes did to the cells the program drew that the program has not drawn again.
+///
+/// A program redraws on SIGWINCH, so a resize it sees is paid by its own repaint. A flap
+/// whose halves both land before the handler runs shows it no change: whatever the
+/// first half moved or cut stays as the second half left it. Rows and columns are the
+/// same debt: [`owed`](Self::owed) is whether any of it is unpaid.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderDebt {
+    /// Rows the painted content moved (the sum of [`ResizeReport::shift`]): `-1` means
+    /// every row sits one higher than drawn.
+    pub shift: i32,
+    /// Rows pushed off the bottom and not put back (the sum of
+    /// [`ResizeReport::net_pushed`]).
+    pub pushed: i32,
+    /// Columns of drawn cells narrowings cut off the right edge (the sum of
+    /// [`ResizeReport::cut`]): a grow back brought blanks where the program drew them.
+    pub cut: u16,
+}
+
+impl RenderDebt {
+    /// A debt of rows only, `(shift, pushed)`.
+    #[must_use]
+    pub const fn of_rows(shift: i32, pushed: i32) -> Self {
+        Self {
+            shift,
+            pushed,
+            cut: 0,
+        }
+    }
+
+    /// The rows owed, `(shift, pushed)`; `(0, 0)` when every row sits where it was drawn.
+    #[must_use]
+    pub const fn rows(self) -> (i32, i32) {
+        (self.shift, self.pushed)
+    }
+
+    /// Anything is owed: a row sits away from where it was drawn, or a drawn cell is gone.
+    #[must_use]
+    pub const fn owed(self) -> bool {
+        self.shift != 0 || self.pushed != 0 || self.cut != 0
+    }
+
+    /// The debt after `report`, one more non-reflowed alternate-screen resize: each count
+    /// adds that resize's. A cut counts only the drawn cells still on the screen, so a
+    /// column a former cut emptied is never counted twice.
+    #[must_use]
+    pub fn after(self, report: &ResizeReport) -> Self {
+        Self {
+            shift: self.shift.saturating_add(report.shift()),
+            pushed: self.pushed.saturating_add(report.net_pushed()),
+            cut: self.cut.saturating_add(report.cut),
+        }
     }
 }
 
@@ -313,6 +373,7 @@ impl Terminal {
             restored_top: shape.restored_top,
             restored_bottom: shape.restored_bottom,
             reflowed: shape.reflowed,
+            cut: shape.cut,
             content_seq: self.content_seq(),
             content_seq_before: origin.content_seq,
             full_clears: self.transient.full_clears,
@@ -322,31 +383,55 @@ impl Terminal {
         // moves with its cursor); a rewrap renumbers rows on its own, and under ConPTY
         // conhost repaints the viewport itself.
         if origin.native && report.alt && !report.reflowed {
-            let (shift, pushed) = self.transient.render_debt;
-            self.transient.render_debt = (
-                shift.saturating_add(report.shift()),
-                pushed.saturating_add(report.net_pushed()),
-            );
+            self.transient.render_debt = self.transient.render_debt.after(&report);
         }
         self.resize_journal.push(report);
     }
 
-    /// The rows the alternate screen owes its program since it was last repainted from
-    /// scratch: `(shift, pushed)`, the sums of [`ResizeReport::shift`] and
-    /// [`ResizeReport::net_pushed`] over its non-reflowed `ResizePolicy::Native` resizes;
-    /// `(-1, 0)` means every row sits one higher than drawn. Zeroed by a full clear, an
-    /// alternate-screen switch and a reset; exact however far the journal was overrun.
+    /// What the alternate screen owes its program since it was last repainted from
+    /// scratch ([`RenderDebt`]): the rows its non-reflowed `ResizePolicy::Native` resizes
+    /// moved and the drawn columns they cut. Zeroed by a full clear, an alternate-screen
+    /// switch and a reset; exact however far the journal was overrun.
     #[must_use]
-    pub fn render_debt(&self) -> (i32, i32) {
+    pub fn render_debt(&self) -> RenderDebt {
         self.transient.render_debt
     }
 
     /// Carry a predecessor's render debt across a handoff: once, right after a checkpoint
-    /// restore, and only while the alternate screen is up (the debt is about its rows).
-    pub fn seed_render_debt(&mut self, shift: i32, pushed: i32) {
+    /// restore, and only while the alternate screen is up (the debt is about its cells).
+    pub fn seed_render_debt(&mut self, debt: RenderDebt) {
         if self.modes.alternate_screen {
-            self.transient.render_debt = (shift, pushed);
+            self.transient.render_debt = debt;
         }
+    }
+
+    /// Forget, on both grids, what earlier rows-only resizes owe back at one edge
+    /// (`aterm_grid`'s rows hand-back): the blank rows trims took, which the next grow
+    /// would append before revealing history, and the history lines grows revealed, which
+    /// the next shrink would demote before trimming. The next resize then reveals or trims
+    /// first, and runs as one pass over both axes, as an aterm before the hand-back did.
+    pub fn forget_handback(&mut self) {
+        self.grid.forget_handback();
+        if let Some(parked) = self.alt_grid.as_mut() {
+            parked.forget_handback();
+        }
+    }
+
+    /// Lay the rows out under `law` from the next resize on, on both grids and on every
+    /// alternate buffer entered after (`aterm_grid`'s [`ResizeLaw`]): an older law for the
+    /// replay of a recording made under it (`cast drift`, from the recording's
+    /// `aterm_resize_undo`).
+    pub fn set_resize_law(&mut self, law: ResizeLaw) {
+        self.grid.set_resize_law(law);
+        if let Some(parked) = self.alt_grid.as_mut() {
+            parked.set_resize_law(law);
+        }
+    }
+
+    /// The resize law the rows are laid out under ([`Self::set_resize_law`]).
+    #[must_use]
+    pub fn resize_law(&self) -> ResizeLaw {
+        self.grid.resize_law()
     }
 
     /// How many resizes this engine has applied (the newest ordinal, 0 before the first).

@@ -1202,6 +1202,84 @@ fn write_private_new(path: &std::path::Path, bytes: &[u8]) -> Option<()> {
     Some(())
 }
 
+/// THE PERSON'S STAMPS AT THE COMMIT'S WRITE (LC-4 of ATERM-KI-1016-1): the
+/// sidecar beside an attempt's manifest (`seamless-<pid>-<nonce>.person`, swept
+/// with the attempt's other files once its writer is gone) in which the
+/// outgoing process names, right before its Commit's one write, how long ago a
+/// person last gave each carried session input
+/// ([`crate::App::write_person_stamps_at_commit`]), and which the successor
+/// takes at its Commit ([`crate::App::take_carried_person_stamps`]). Written
+/// then, not with the manifest at the park: a key the overlap passes through
+/// to a shell after the park is in it.
+#[cfg(unix)]
+pub(crate) fn person_stamps_path(manifest: &std::path::Path) -> std::path::PathBuf {
+    manifest.with_extension("person")
+}
+
+/// The most a person-stamps sidecar may hold ([`take_person_stamps`]): a line
+/// of two integers per carried session, far under this for any real window.
+#[cfg(unix)]
+const MAX_PERSON_STAMPS_BYTES: u64 = 64 * 1024;
+
+/// One carried session's row in the person-stamps sidecar
+/// ([`write_person_stamps`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PersonStamp {
+    /// A person last gave the session input this many milliseconds ago.
+    Keyed(u64),
+    /// No person ever did in the milliseconds the outgoing
+    /// process (and those before it) served it
+    /// (`human_input::HumanInputStamp::unkeyed_ms`).
+    Unkeyed(u64),
+}
+
+/// Write the person-stamps sidecar at `path` ([`person_stamps_path`]): one
+/// line per handed session, `<local id> <milliseconds since the last
+/// gesture>` for a keyed one and `<local id> -<milliseconds served unkeyed>`
+/// for one nobody keyed ([`PersonStamp`]), created afresh with owner-only
+/// permissions. An older successor reads a `-` row as malformed and drops
+/// it: that session reads never keyed there, as before. Whether it was
+/// written.
+#[cfg(unix)]
+pub(crate) fn write_person_stamps(path: &std::path::Path, stamps: &[(u64, PersonStamp)]) -> bool {
+    let body: String = stamps
+        .iter()
+        .map(|(local_id, stamp)| match stamp {
+            PersonStamp::Keyed(age_ms) => format!("{local_id} {age_ms}\n"),
+            PersonStamp::Unkeyed(age_ms) => format!("{local_id} -{age_ms}\n"),
+        })
+        .collect();
+    write_private_new(path, body.as_bytes()).is_some()
+}
+
+/// Take the person-stamps sidecar at `path` under the private dir `dir`
+/// ([`write_person_stamps`]): its `(local id, stamp)` rows, a malformed row
+/// dropped; none for a missing, oversized or unreadable file — every adopted
+/// session then reads as never keyed since the Commit. Consumed whatever it
+/// held.
+#[cfg(unix)]
+pub(crate) fn take_person_stamps(
+    path: &std::path::Path,
+    dir: &std::path::Path,
+) -> Vec<(u64, PersonStamp)> {
+    let Some(body) = take_regular_capped(path, dir, MAX_PERSON_STAMPS_BYTES)
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    else {
+        return Vec::new();
+    };
+    body.lines()
+        .filter_map(|line| {
+            let (local_id, age) = line.split_once(' ')?;
+            let stamp = match age.strip_prefix('-') {
+                Some(unkeyed) => PersonStamp::Unkeyed(unkeyed.parse().ok()?),
+                None => PersonStamp::Keyed(age.parse().ok()?),
+            };
+            Some((local_id.parse().ok()?, stamp))
+        })
+        .collect()
+}
+
 /// Read a regular file without following a symlink, without blocking on
 /// whatever else sits at the path, and without allocating past its protocol
 /// cap. The caller supplies an exact private-dir path; it is consumed on every
@@ -2341,6 +2419,12 @@ fn repaint_checkpoint_within(
     sanitized.cursor = sanitized_cursor(&meta.cursor);
     sanitized.alt_cursor =
         has_alt.then(|| sanitized_cursor(meta.alt_cursor.as_ref().unwrap_or(&blank.cursor)));
+    // The screen is blank: the rows the carried resizes moved are not on it, so
+    // nothing is owed back (a fresh engine's carry owes nothing).
+    for cursor in std::iter::once(&mut sanitized.cursor).chain(sanitized.alt_cursor.as_mut()) {
+        cursor.handback_rows = 0;
+        cursor.handback_above = 0;
+    }
     for slot in [
         &mut sanitized.saved_cursor_main,
         &mut sanitized.saved_cursor_alt,
@@ -4754,6 +4838,25 @@ pub(crate) struct IncomingHandoff {
     /// configured (round seven of the update audit, finding 7).
     #[cfg_attr(not(unix), expect(dead_code, reason = "read only by the unix boot"))]
     pub fabric_attached: Vec<String>,
+    /// What the outgoing status item knew of each session, by sid
+    /// ([`crate::session_store::SessionRecord::status_seen`]), as the record
+    /// carried it: read at each adopted session's first publication
+    /// (`App::adopt_status_carry`), never a reason to refuse. Empty for a
+    /// boot that was offered no handoff.
+    pub status_seen: Vec<(String, String)>,
+    /// The fleet needs the outgoing herald had told
+    /// ([`crate::session_store::SessionHandoff::fleet_told`]), as the
+    /// manifest carried them: read at this process's first fresh fleet read
+    /// (`App::herald_fleet`), never a reason to refuse. Empty for a boot
+    /// that was offered no handoff.
+    pub fleet_told: Vec<String>,
+    /// Where the outgoing process will name, at its Commit, how long ago a
+    /// person last keyed each carried session ([`person_stamps_path`] of the
+    /// manifest this process read), for the Commit to take
+    /// (`App::take_carried_person_stamps`). `None` for a boot that adopted
+    /// nothing.
+    #[cfg(unix)]
+    pub person_stamps: Option<std::path::PathBuf>,
     /// The outgoing process's bus-mirror tombstones
     /// ([`crate::session_store::SessionHandoff::mirror_dropped`]), the rows as
     /// written; adopted into this process's store before its first session.
@@ -5910,7 +6013,7 @@ pub(crate) fn parse_target_identity(raw: &str) -> Option<HandoffTarget> {
 /// image refuses `take_target_identity`, closes the adopted fds and exits, and
 /// the parent books a `ChildDied` structural failure for a candidate that was
 /// perfectly healthy (found by the 2026-08-19 audit; the newer stage on disk is
-/// left for the successor's own apply lane, or the next launch, instead). Malformed
+/// left for the successor's own apply lane instead). Malformed
 /// values answer `false`: the
 /// consuming reader is the one that diagnoses them.
 #[must_use]
@@ -6033,8 +6136,10 @@ pub(crate) const EXIT_SUCCESSOR_PASSING: i32 = 75;
 /// [`EXIT_SUCCESSOR_PASSING`] instead of the ordinary refusal's clean `0`.
 ///
 /// THE FIELD SHAPE (round four, plan item 2): on the download lane the outgoing
-/// process launches ITS OWN image, which boot-applies the staged build and
-/// re-execs into it. When that apply is `Deferred` for a moment — the apply lock
+/// process launched ITS OWN image, which boot-applied the staged build and
+/// re-exec'd into it (a fork-lane child, or a successor an older build launches,
+/// still does; since 2026-10-19 the launched lane's parent swaps first,
+/// `aterm_update::swap_staged_for_launch`, and files its own refusal). When that apply is `Deferred` for a moment — the apply lock
 /// held past its wait by a sibling launch, a `codesign` that ran out of the
 /// apply budget on a loaded desk ([`aterm_update::is_passing_refusal`]) — the
 /// image stays the old build, [`take_target_identity_from`] rightly refuses the
@@ -6073,9 +6178,16 @@ pub(crate) fn passing_refusal_exit(
     parent_reads_passing: bool,
 ) -> Option<i32> {
     let no_verdict_on_the_stage = match boot_apply {
-        aterm_update::ApplyOutcome::NoUpdate | aterm_update::ApplyOutcome::NotApplicable => true,
+        // A stage left for a window's lane is no verdict on it either.
+        aterm_update::ApplyOutcome::NoUpdate
+        | aterm_update::ApplyOutcome::NotApplicable
+        | aterm_update::ApplyOutcome::LeftForSession { .. } => true,
         aterm_update::ApplyOutcome::Deferred(reason) => aterm_update::is_passing_refusal(reason),
-        aterm_update::ApplyOutcome::ReExecFailed(_) => false,
+        // A crash-loop revert is the boot's verdict on the build (and its caller has
+        // exited before ever reaching this).
+        aterm_update::ApplyOutcome::ReExecFailed(_) | aterm_update::ApplyOutcome::Reverted(_) => {
+            false
+        }
     };
     (no_verdict_on_the_stage
         && !target_admitted
@@ -7508,7 +7620,7 @@ fn own_handoff_policy() -> Option<aterm_update_core::handoff_policy::HandoffPoli
 
 /// Play `policy` as this build's own sealed handoff policy on this thread, for
 /// the rest of the guard's life.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn own_policy_for_test(
     policy: Option<aterm_update_core::handoff_policy::HandoffPolicy>,
 ) -> impl Drop {
@@ -7814,21 +7926,17 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
                     wire,
                 } => (checkpoint, Some((cause, wire))),
             };
-            // THE RENDER DEBT (R08): the rows the parent's engine owed this
-            // session's alternate screen. Seeded only onto a screen that was
+            // THE RENDER DEBT (R08): the rows and columns the parent's engine
+            // owed this session's alternate screen. Seeded only onto a screen that was
             // carried (a blank one, repainted by the program, has none) and that
             // restores onto the alternate screen; a value that does not read is
             // no debt. Never in either proof digest, never a reason to refuse.
-            let render_debt = rec
-                .render_debt
-                .as_deref()
-                .and_then(crate::session_store::parse_render_debt)
-                .filter(|_| {
-                    !repaint
-                        && checkpoint
-                            .as_ref()
-                            .is_some_and(|cp| cp.modes.alternate_screen)
-                });
+            let render_debt = rec.carried_render_debt().filter(|_| {
+                !repaint
+                    && checkpoint
+                        .as_ref()
+                        .is_some_and(|cp| cp.modes.alternate_screen)
+            });
             // Ownership of the master moves from the guard to this adoption: from
             // here its `Adopted` closes it if the handoff is refused after all.
             #[cfg(unix)]
@@ -7948,6 +8056,9 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
                         .journal_key
                         .as_deref()
                         .and_then(crate::session_store::parse_journal_key),
+                    // THE TASK RECORD (the worker pillar), as the record
+                    // carried it, re-validated at the seed.
+                    task: rec.task.clone(),
                 },
             })
         })
@@ -8130,6 +8241,11 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
         }
         crate::control::raise_turn_ids(floor);
     }
+    // THIS MACHINE'S NAMES GO ON: the names the outgoing process read the kernel
+    // give the machine, kept beside this process's own, so a carried shell's OSC 7
+    // under the name it started with is still this machine's
+    // (`tab_label::names_this_machine`).
+    crate::tab_label::adopt_machine_names(&manifest.machine_names);
     for high in adopted
         .iter()
         .filter_map(|a| a.control.as_ref()?.high_turn_id())
@@ -8153,6 +8269,14 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
         refusal: None,
         roster_seq: manifest.roster_seq,
         fabric_attached: manifest.fabric_attached,
+        fleet_told: manifest.fleet_told,
+        status_seen: manifest
+            .sessions
+            .iter()
+            .filter_map(|rec| Some((rec.sid.clone(), rec.status_seen.clone()?)))
+            .collect(),
+        #[cfg(unix)]
+        person_stamps: Some(person_stamps_path(std::path::Path::new(&path))),
         mirror_dropped: manifest.mirror_dropped,
         mirror_served: manifest.mirror_served,
     }

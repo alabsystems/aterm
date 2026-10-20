@@ -85,10 +85,11 @@ pub(crate) fn merge_shell_args_in(
     }
 }
 
-/// Whether this platform's bash loader reads a login shell's files itself
-/// (`bash/rcfile`, macOS and Git Bash) rather than starting bash as bash starts
-/// (`bash/bashrc`).
-const LOGIN_STYLE_LOADER: bool = matches!(BASH_LOADER_FILE.as_bytes(), b"rcfile");
+/// Whether this platform's integrated bash reads a login shell's files whatever
+/// its arguments (macOS's `bash/rcfile`, Git Bash's login start,
+/// [`crate::BASH_LOGIN_START`]) rather than starting bash as bash starts
+/// (`bash/bashrc` on the other Unixes).
+const LOGIN_STYLE_LOADER: bool = !cfg!(all(unix, not(target_os = "macos")));
 
 /// One argument of a bash argv, after the long options.
 #[derive(Debug)]
@@ -239,16 +240,17 @@ fn parse_bash_args(args: &[String]) -> Result<BashArgs, String> {
 }
 
 /// [`merge_shell_args`] for bash: `injection.argv_override` is `[bash, --rcfile,
-/// <loader>]` ([`crate::prepare`]).
+/// <loader>]`, or under Git Bash `[bash, --login, --posix]` ([`crate::prepare`]):
+/// the program, then the start's own long options.
 fn merge_bash(
     injection: &mut InjectionEnv,
     args: &[String],
     env: &dyn Fn(&str) -> Option<String>,
 ) -> ArgsMerge {
-    let Some([argv0, _, loader]) = injection.argv_override.as_deref() else {
+    let Some([argv0, start @ ..]) = injection.argv_override.as_deref() else {
         return ArgsMerge::Integrated;
     };
-    let (argv0, loader) = (argv0.clone(), loader.clone());
+    let (argv0, start) = (argv0.clone(), start.to_vec());
     let mut parsed = match parse_bash_args(args) {
         Ok(parsed) => parsed,
         Err(why) => return ArgsMerge::Bypass(why),
@@ -262,8 +264,8 @@ fn merge_bash(
                     .to_string(),
             );
         }
-        // The loader reads the login files itself, and a login bash would ignore
-        // the `--rcfile` that runs it.
+        // The start reads the login files itself: macOS's `--rcfile`, which a
+        // login bash would ignore, and Git Bash's, which is a login start already.
         parsed.longs.retain(|long| long != "--login");
         parsed.shorts.retain_mut(|short| {
             if short.value || !short.text.starts_with('-') {
@@ -273,7 +275,7 @@ fn merge_bash(
             short.text != "-"
         });
         argv.extend(parsed.longs);
-        argv.extend(["--rcfile".to_string(), loader]);
+        argv.extend(start);
     } else if parsed.login || parsed.norc {
         // No `--rcfile` can run under these: a login bash ignores it, and nothing
         // keeps a non-login bash from its system bashrc. In POSIX mode bash reads
@@ -283,7 +285,7 @@ fn merge_bash(
         posix_start_env(&mut injection.env_add, parsed.noprofile, env);
     } else {
         argv.extend(parsed.longs);
-        argv.extend(["--rcfile".to_string(), loader]);
+        argv.extend(start);
         if let Some(file) = parsed.rcfile {
             injection
                 .env_add
@@ -301,7 +303,11 @@ fn merge_bash(
 /// is not to be expanded twice), the caller's own `ENV` to put back, and — when
 /// aterm's environment names no `HISTFILE` — `~/.bash_history`, which POSIX mode
 /// would otherwise have replaced with `~/.sh_history`, exported for the start only.
-fn posix_start_env(
+/// Under Git Bash the loader sets it from the shell's own `$HOME`
+/// (`ATERM_BASH_HISTFILE=home`): MSYS2 makes that `/c/Users/…` from the Windows
+/// profile when aterm's environment has no `HOME`, and a Windows `HOME` is no
+/// POSIX path, so the history file reads as it does in a login Git Bash.
+pub(crate) fn posix_start_env(
     env_add: &mut Vec<(String, String)>,
     noprofile: bool,
     env: &dyn Fn(&str) -> Option<String>,
@@ -315,11 +321,13 @@ fn posix_start_env(
     if let Some(theirs) = env("ENV") {
         add("ATERM_BASH_ENV", theirs);
     }
-    if env("HISTFILE").is_none()
-        && let Some(home) = env("HOME").filter(|home| !home.is_empty())
-    {
-        add("HISTFILE", format!("{home}/.bash_history"));
-        add("ATERM_BASH_HISTFILE", "1".to_string());
+    if env("HISTFILE").is_none() {
+        if crate::BASH_LOGIN_START {
+            add("ATERM_BASH_HISTFILE", "home".to_string());
+        } else if let Some(home) = env("HOME").filter(|home| !home.is_empty()) {
+            add("HISTFILE", format!("{home}/.bash_history"));
+            add("ATERM_BASH_HISTFILE", "1".to_string());
+        }
     }
     if noprofile {
         add("ATERM_BASH_NOPROFILE", "1".to_string());
@@ -568,6 +576,52 @@ mod tests {
                 "{args:?}"
             );
         }
+    }
+
+    /// Git Bash is started as a login shell in POSIX mode on the loader
+    /// (`crate::BASH_LOGIN_START`): `ENV` names `bash/bashrc` through the integration
+    /// dir, the history file is left to the loader (the shell's own `$HOME`), and the
+    /// person's options go around that start as bash takes them, a `-l` of theirs
+    /// being the start's own.
+    #[cfg(windows)]
+    #[test]
+    fn git_bash_starts_as_a_login_shell_on_the_loader() {
+        let mut injection =
+            crate::injection_for(ShellType::Bash, std::path::Path::new(r"C:\si")).expect("bash");
+        assert_eq!(argv(&injection), ["bash", "--login", "--posix"]);
+        let has = |injection: &InjectionEnv, key: &str, value: &str| {
+            injection
+                .env_add
+                .iter()
+                .any(|(k, v)| k == key && v == value)
+        };
+        assert!(has(&injection, "ATERM_BASH_POSIX", "1"), "{injection:?}");
+        assert!(
+            has(
+                &injection,
+                "ENV",
+                "${ATERM_SHELL_INTEGRATION_DIR}/bash/bashrc"
+            ),
+            "{injection:?}"
+        );
+        let mut env_add = Vec::new();
+        posix_start_env(&mut env_add, false, &|key| {
+            (key == "HOME").then(|| r"C:\Users\u".to_string())
+        });
+        assert!(
+            env_add.contains(&("ATERM_BASH_HISTFILE".to_string(), "home".to_string()))
+                && !env_add.iter().any(|(key, _)| key == "HISTFILE"),
+            "a Windows HOME is no POSIX path: {env_add:?}"
+        );
+        let args = strings(&["-li", "--verbose", "-o", "vi"]);
+        assert_eq!(
+            merge_shell_args_in(ShellType::Bash, &mut injection, &args, &no_env),
+            ArgsMerge::Integrated
+        );
+        assert_eq!(
+            argv(&injection),
+            ["bash", "--verbose", "--login", "--posix", "-i", "-o", "vi"]
+        );
     }
 
     fn pwsh() -> InjectionEnv {

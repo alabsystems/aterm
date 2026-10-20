@@ -30,7 +30,7 @@ fn every_field_moved(dir: &Path) -> SessionSetup {
         holder: "odd-holder".to_string(),
         beside: Some("codex-alab:7".to_string()),
         handover: Handover(Some(Arc::new(AtomicBool::new(true)))),
-        manager: Some("@s-manager".to_string()),
+        types_under_hand: true,
         ledger_path: Some(dir.join("drive").join("s-odd.jsonl")),
         approval_env: ApprovalEnv {
             home: Some(dir.join("home")),
@@ -61,9 +61,8 @@ fn every_field_moved(dir: &Path) -> SessionSetup {
             window: d(19),
             take_within: d(20),
             restart_backoff: vec![d(21)],
+            credits_bound: d(57),
         },
-        mail_step: d(25),
-        hold_step: d(26),
         press_badge_after: d(27),
         survey_retry: [d(28), d(29), d(30), d(31)],
         survey_settle: d(32),
@@ -110,7 +109,12 @@ fn setup_lines(text: &str) -> Vec<&str> {
 /// present and not raised: its value is the host's to raise, never setup.
 #[test]
 fn every_field_of_the_setup_comes_back_from_the_header() {
-    let dir = Path::new("/odd-root");
+    // An absolute root of this host (a `/`-rooted path names no drive on Windows).
+    let dir = Path::new(if cfg!(windows) {
+        r"C:\odd-root"
+    } else {
+        "/odd-root"
+    });
     let odd = every_field_moved(dir);
     let opts = SuperviseOpts::default();
     let text = Header::capture("t-1", Entry::Watch, Some(dir), &odd, &opts).encode();
@@ -172,13 +176,13 @@ fn the_setters_write_the_setup() {
 
     s.set_handover(Arc::new(AtomicBool::new(false)));
     s.set_approval_ledger(Some(PathBuf::from("/l/s-1.jsonl")));
-    s.set_manager(Some("@s-m".to_string()));
+    s.type_under_hand(true);
     s.set_reconnect(Duration::from_secs(3));
     s.set_claim_timing(Duration::from_millis(10), 99);
     let setup = s.setup().clone();
     assert!(setup.handover.0.is_some());
     assert_eq!(setup.ledger_path(), Some(Path::new("/l/s-1.jsonl")));
-    assert_eq!(setup.manager.as_deref(), Some("@s-m"));
+    assert!(setup.types_under_hand);
     assert_eq!(setup.reconnect, Duration::from_secs(3));
     assert_eq!(
         (setup.claim_renew, setup.claim_ttl_ms),

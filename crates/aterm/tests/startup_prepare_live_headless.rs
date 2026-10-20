@@ -31,10 +31,10 @@ use headless_boot::{ctl_ok, field};
 const PHASES: [&str; 10] = [
     "startup_prepare_boot_ms",
     "startup_prepare_warm_ms",
-    "startup_prepare_event_loop_ms",
-    "startup_prepare_services_ms",
     "startup_prepare_journal_ms",
     "startup_prepare_session0_ms",
+    "startup_prepare_event_loop_ms",
+    "startup_prepare_services_ms",
     "startup_prepare_control_ms",
     "startup_prepare_config_join_ms",
     "startup_prepare_app_ms",

@@ -96,8 +96,8 @@
 //! [`step`] now runs each gesture inside a ONE-STEP-WIDE execution-evidence window
 //! (`aterm_spec::xref::StepEvidence`) — the thread-local anchor-entry record is
 //! cleared, the shipping seam is called, and what was entered is snapshotted before
-//! `recorded()` or the post-state projection touch anything. `spec_xref_closure`
-//! (crates/aterm-gui/src/lib.rs, the `PressCustody` block) then requires each action's
+//! `recorded()` or the post-state projection touch anything. `spec_xref_gate`'s
+//! `press_custody_steps_enter_their_own_seams` then requires each action's
 //! annotated function to have been ENTERED BY EVERY WINDOW THAT DRIVES IT, and — the
 //! contrapositive, which is what discriminates inside a `Terminal::process` batch — to
 //! be entered by NO window driving an action it is not anchored for. An anchor parked
@@ -1245,9 +1245,9 @@ fn output_batches(validated: &mut usize, ev: &mut StepEvidence) {
     }
 }
 
-/// The `PressCustody` Tier-1 body, RUN by `spec_xref_gate`'s `spec_xref_closure` and
-/// by nothing else: the gate's "PressCustody is actively bound" claim then means the
-/// real engine and GUI seams were driven and checked, not merely that anchors exist.
+/// The `PressCustody` Tier-1 body, run by `spec_xref_gate` with its execution evidence:
+/// the real engine and GUI seams are driven and checked, and each step must enter its own
+/// action's anchored function.
 pub(crate) fn run_conformance() -> StepEvidence {
     let mut validated = 0usize;
     // EXECUTION EVIDENCE. `step` drives each seam inside a one-step-wide window, so

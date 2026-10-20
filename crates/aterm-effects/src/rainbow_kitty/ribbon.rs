@@ -66,7 +66,7 @@ use aterm_render::{
     ribbon_beam,
 };
 
-use crate::color_math::relative_luminance;
+use crate::color_math::{hsv2rgb, oklab_distance, relative_luminance, rgb2hsv};
 use crate::cursor_glow::{InkRole, band_pos, band_row};
 use crate::effect_util::lerp_rgb;
 use crate::spectrum::{spectrum, spectrum_with_min_saturation};
@@ -346,15 +346,13 @@ pub fn reads_as_ink(rgb: u32) -> bool {
 /// ([`bed_luma_budget`]), so a brighter alpha cannot break it.
 const BODY_FRAME_TOP: f32 = 251.0;
 
-/// The contrast bar every legibility ceiling in the rainbow family is solved
-/// against: unlit ink over lit ground, 5.25:1 (L3).
-const BODY_CONTRAST_BAR: f32 = 5.25;
-
-/// The margin under [`BODY_CONTRAST_BAR`] for the emitter's own rounding:
-/// [`solve_for_luma`] answers from under its target and the LUT's lerp stays
-/// under the bar (the EOTF is convex), leaving one level of composite rounding
-/// and one Bayer level over the frame top.
-const BODY_CONTRAST_GUARD: f32 = 0.05;
+// The contrast bar every legibility ceiling in the rainbow family is solved
+// against (unlit ink over lit ground, 5.25:1, L3) and its rounding guard are
+// the cursor family's one pair: `cursor_glow::BODY_CONTRAST_BAR` and
+// `BODY_CONTRAST_GUARD`, which the light ground's bodies are solved against
+// too. Here the guard is the margin [`solve_for_luma`] answers under and the
+// LUT's lerp stays under (the EOTF is convex).
+use crate::cursor_glow::{BODY_CONTRAST_BAR, BODY_CONTRAST_GUARD};
 
 /// Floor on the bed's composited luminance budget. A theme whose foreground is
 /// almost black would solve to a bed nobody can see; below this the ribbon
@@ -373,6 +371,38 @@ const BED_LUMA_MAX: f32 = 0.150;
 /// grey notch. The shipped arc is `S 1.00` throughout, so `1.0` is the identity
 /// there; it stays because [`bed_ink`] is public.
 pub const BED_SAT_FLOOR: f32 = 1.0;
+
+/// The light bed's one weight: the OKLab distance from the page every stop's tint is
+/// solved onto ([`paper_ink`]). At `0.24` on white the arc composites from a coral red
+/// through apricot, a nearly pure yellow, lime and cyan to a sky blue and lilac: a
+/// highlighter's rainbow, light enough that dark letters keep far more than the bar.
+pub const PAPER_WEIGHT: f32 = 0.24;
+
+/// The light bed's bar on a theme whose own text sits under the body's (Solarized Light's
+/// `#586e75` on `#fdf6e3` is 4.97:1): this share of the theme's own contrast, so such a
+/// theme keeps a fainter ribbon rather than none ([`paper_ink`]).
+pub const PAPER_BAR_THEME_SHARE: f32 = 0.8;
+
+/// The leading-only body's weight (the underline spelling, [`InkRole::Leading`]): no
+/// letter stands on it, and a thin band needs more ink than a tall one to read.
+pub const PAPER_WEIGHT_LEADING: f32 = 0.30;
+
+/// The least contrast the caret block keeps against a light page ([`paper_caret_ink`]): the
+/// glyph under a block cursor is cut out in the page's own colour, and 3:1 is WCAG's bar for
+/// large text and marks.
+pub const PAPER_CARET_CONTRAST: f32 = 3.0;
+
+/// The least contrast a point mark keeps against a light page ([`paper_mark_ink`]): stars,
+/// sparks, pin arms, the coma and the landing flash can cross a letter, so they stay a
+/// step deeper than the caret.
+pub const PAPER_MARK_CONTRAST: f32 = 4.5;
+
+/// The vivid inks' hue bend on paper ([`paper_caret_ink`], [`paper_mark_ink`]), as
+/// `(from, to)` HSV hue knots in degrees, linear between them. A yellow darkened to [`PAPER_CARET_CONTRAST`] at its own hue is olive, and no
+/// continuous path from orange to green avoids the olive band (about `50°..85°`), so the
+/// path crosses it in ten degrees of the arc instead of fifty: yellow lands on amber,
+/// chartreuse on leaf green.
+const PAPER_HUE_BEND: [(f32, f32); 4] = [(30.0, 30.0), (72.0, 50.0), (82.0, 85.0), (110.0, 110.0)];
 
 // No floor for the bed against the ground: it would lift the bed over the
 // luminance the text can bear. The bar wins; a dark-foreground theme's dim bed
@@ -859,7 +889,8 @@ pub struct Cohort {
     /// The caret column the retract pulls this cohort toward, captured the
     /// frame it entered its retract ([`Ribbon::advance_swoosh`]) and held until
     /// a key brings the cohort back to laying: toward the hand that let go of
-    /// it, not the live caret, so a later jump cannot make it lurch.
+    /// it, not the live caret. A flowing edge narrows with its remaining live
+    /// cells, so an erased suffix cannot pull their light off the text.
     pub retract_col: Option<u16>,
     /// Which end drains first once the retract owns the mark, frozen beside
     /// [`Cohort::retract_col`]: `false` (left end first) for the caret's own
@@ -1583,6 +1614,128 @@ pub fn bed_ink(rgb: u32, budget: f32) -> u32 {
     onto_luma(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR), budget)
 }
 
+/// The bed's light twin, its ink on paper. On a light page the body is ink, not light, and
+/// darkening a stop onto one luminance (the dark bed's law) prints yellow as olive and orange
+/// as brown. Here each stop keeps its own hue at full value and spends coverage instead: it
+/// is tinted toward the page until the composite stands `role`'s weight
+/// ([`PAPER_WEIGHT`], [`PAPER_WEIGHT_LEADING`]) from the page in OKLab, so the whole arc
+/// reads at one weight (yellow nearly pure, blue a sky tint), and a body that letters stand
+/// on ([`InkRole::OverText`]) stops short of the legibility bar against `fg` too (the body's
+/// bar, or [`PAPER_BAR_THEME_SHARE`] of the theme's own contrast where that is lower).
+///
+/// Returned as the ink that composites there at the role's own alpha ceiling, so the
+/// coverage law ([`cov_cap`]) is unchanged and a dimmer slab is only a fainter tint.
+#[must_use]
+pub(crate) fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 {
+    let rgb = spectrum_with_min_saturation(rgb, BED_SAT_FLOOR);
+    let mx = ((rgb >> 16) & 0xff).max((rgb >> 8) & 0xff).max(rgb & 0xff);
+    if mx == 0 {
+        return bg;
+    }
+    let full = scale_rgb(rgb, 255.0 / mx as f32);
+    let bg = bg & 0x00FF_FFFF;
+    let cap = (role.alpha_cap() / 255.0).clamp(0.0, 1.0);
+    let y_fg = relative_luminance(fg);
+    let ratio = |y: f32| (y.max(y_fg) + 0.05) / (y.min(y_fg) + 0.05);
+    let (weight, bar) = match role {
+        InkRole::OverText => (
+            PAPER_WEIGHT,
+            Some(
+                (BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD)
+                    .min(PAPER_BAR_THEME_SHARE * ratio(relative_luminance(bg))),
+            ),
+        ),
+        InkRole::Leading => (PAPER_WEIGHT_LEADING, None),
+    };
+    // The emitter rounds the ink to bytes and composites it in integer source-over, each
+    // within half a step per channel (`aterm_render::over_premul`), and on paper one step of
+    // green under dark text is a whole guard's worth of contrast. So the bar is read on the
+    // composite a full step darker in every channel: the worst the two roundings print.
+    let worst = |ink: u32| {
+        let ch = |sh: u32| {
+            let (i, b) = (((ink >> sh) & 0xff) as f32, ((bg >> sh) & 0xff) as f32);
+            (b + (i - b) * cap - 1.0).max(0.0) as u32
+        };
+        (ch(16) << 16) | (ch(8) << 8) | ch(0)
+    };
+    // Both halves are monotone in the share: the composite walks a straight line from the
+    // page to the hue, away from the page and (on a light page) toward the dark text.
+    let holds = |share: f32| {
+        let on_glass = lerp_rgb(bg, full, share * cap);
+        oklab_distance(on_glass, bg) <= weight
+            && bar.is_none_or(|bar| {
+                ratio(relative_luminance(worst(lerp_rgb(bg, full, share)))) >= bar
+            })
+    };
+    let share = if holds(1.0) {
+        1.0
+    } else {
+        // 24 halvings resolve below 1e-7; the answer is the last share that held.
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        for _ in 0..24 {
+            let mid = 0.5 * (lo + hi);
+            if holds(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    };
+    lerp_rgb(bg, full, share)
+}
+
+/// The caret's ink on paper: the deepest mark of the trail, as the dark theme's caret is its
+/// brightest. The stop at full value (yellow bent through [`PAPER_HUE_BEND`]), darkened
+/// with its hue intact only as far as [`PAPER_CARET_CONTRAST`] against `bg` needs; red,
+/// blue, indigo and violet already clear it and stay pure.
+#[must_use]
+pub fn paper_caret_ink(rgb: u32, bg: u32) -> u32 {
+    paper_vivid_ink(rgb, bg, PAPER_CARET_CONTRAST)
+}
+
+/// A point mark's ink on paper: [`paper_caret_ink`]'s law at [`PAPER_MARK_CONTRAST`], so a
+/// star or spark keeps its stop's hue (a yellow one gold, never olive) and a letter it
+/// crosses stays readable through it.
+#[must_use]
+pub fn paper_mark_ink(rgb: u32, bg: u32) -> u32 {
+    paper_vivid_ink(rgb, bg, PAPER_MARK_CONTRAST)
+}
+
+/// The vivid inks' one law: the stop at full value, bent, darkened onto `bar` against `bg`.
+fn paper_vivid_ink(rgb: u32, bg: u32, bar: f32) -> u32 {
+    let (h, s, v) = rgb2hsv(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR));
+    if v <= 0.0 {
+        return 0;
+    }
+    let h = PAPER_HUE_BEND
+        .windows(2)
+        .find(|k| (k[0].0..k[1].0).contains(&h))
+        .map_or(h, |k| {
+            k[0].1 + (k[1].1 - k[0].1) * (h - k[0].0) / (k[1].0 - k[0].0)
+        });
+    let full = hsv2rgb(h, s, 1.0);
+    let y_bg = relative_luminance(bg & 0x00FF_FFFF);
+    let holds = |k: f32| {
+        let y = relative_luminance(scale_rgb(full, k));
+        (y.max(y_bg) + 0.05) / (y.min(y_bg) + 0.05) >= bar
+    };
+    if holds(1.0) {
+        return full;
+    }
+    // On a light page darker is further from the page: black holds, `1.0` does not.
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..24 {
+        let mid = 0.5 * (lo + hi);
+        if holds(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    scale_rgb(full, lo)
+}
+
 /// The WCAG contrast of one channel, both bytes read as a monochrome light:
 /// the per-channel form of [`relative_luminance`]'s ratio, in which
 /// [`SEEN_CONTRAST`] is stated.
@@ -1602,7 +1755,7 @@ fn channel_contrast(a: f32, b: f32) -> f32 {
 /// bytes of channel spread. Contrast alone passes a grey smudge; spread alone
 /// passes a tinted ground. Both halves are ground-independent.
 #[must_use]
-fn seen(rgb: u32, bg: u32) -> bool {
+pub(crate) fn seen(rgb: u32, bg: u32) -> bool {
     let ch = |c: u32, sh: u32| f32::from(((c >> sh) & 0xff) as u8);
     let (r, g, b) = (ch(rgb, 16), ch(rgb, 8), ch(rgb, 0));
     let stand = channel_contrast(r, ch(bg, 16))
@@ -1758,10 +1911,23 @@ impl BedInkLut {
             // Indexed by the walk, filled from the arc ([`walk_pace`]): readers keep
             // `sample`'s one lerp and the pace costs nothing per frame.
             let arc = spectrum(walk_pace(x));
+            // A light ground: the tall body stands under the letters, so its
+            // ink is solved against the theme's text at the body's strongest
+            // opacity (the role's ceiling plus one Bayer level), the dark
+            // bed's bar read as a floor (`cursor_glow::light_body_ink`). The
+            // underline body lives in the leading, under no glyph, and keeps
+            // its vivid role ink.
             let bed = if cfg.dark_theme {
                 bed_ink(arc, budget)
+            } else if cfg.ribbon_tall {
+                crate::cursor_glow::light_body_ink(
+                    arc,
+                    cfg.theme_fg,
+                    cfg.theme_bg,
+                    (cov_cap(cfg) + 16.0).min(255.0) as u8,
+                )
             } else {
-                role.ink(arc)
+                paper_ink(arc, cfg.theme_fg, cfg.theme_bg, role)
             };
             self.lut.push(bed);
             self.hot.push(hot_edge_ink(arc));
@@ -2050,9 +2216,18 @@ struct ShortReanchorProof {
     at: Instant,
 }
 
-/// The first text column a same-row re-anchor's landing row holds, keyed by
-/// the move: `(from, to, start)` ([`Ribbon::note_rewrap_start`]).
-type RewrapStart = ((u16, u16), (u16, u16), u16);
+/// Sampled geometry of the next matching typed rewrap, including the last Space in
+/// its separately paid suffix when the key sequence proved one.
+#[derive(Clone, Copy, Debug)]
+struct RewrapStart {
+    from: (u16, u16),
+    to: (u16, u16),
+    start: u16,
+    /// An exact content proof may override the legacy moved-word measure;
+    /// zero means the old word stayed on its source row.
+    width: Option<u16>,
+    space: Option<u16>,
+}
 
 /// The ribbon producer: the laid cells, their cohorts, this frame's plan, and
 /// the field index every other producer reads. The pool, plan and index are
@@ -2218,10 +2393,9 @@ pub struct Ribbon {
     /// the length of that one replay ([`Ribbon::lift_move`]) and read by the
     /// `Move` arm's same-row retreat.
     lift: Option<Lift>,
-    /// Where the relaid text starts, as the row shows it: for the same-row
-    /// re-anchor `from → to` about to be replayed, the first column the landing
-    /// row's sample holds text at ([`Ribbon::note_rewrap_start`]). Taken by that
-    /// move's [`Ribbon::re_anchor`] alone.
+    /// Where the relaid text starts, as the row shows it, for the typed
+    /// rewrap `from → to` about to be replayed ([`Ribbon::note_rewrap_start`]).
+    /// Taken by that move's [`Ribbon::re_anchor`] or [`Ribbon::leave_row`].
     rewrap_start: Option<RewrapStart>,
     /// The revived run's own walk ([`Revive`]): set only for the one `Sweep`
     /// that re-lays a retired typed run ([`Ribbon::revive_sweep`]) and read by
@@ -2805,13 +2979,20 @@ impl Ribbon {
                             // The erase's retreat: the erased cells are those at
                             // and past the landing, whichever tick the `Erase`
                             // was replayed on.
-                            self.retract_suffix(to.0, to.1, from.1 - to.1, at, RETRACT_FADE_S);
-                            self.pending_erase = 0;
+                            let erased = from.1 - to.1;
+                            self.retract_suffix(to.0, to.1, erased, at, RETRACT_FADE_S);
+                            // Later erases may already be queued while this frame
+                            // observes an earlier key's echo. Only this retreat
+                            // pays down the outstanding erase count.
+                            self.pending_erase = self.pending_erase.saturating_sub(erased);
                         } else if licence == Licence::Typed
                             && !self.scroll_followed
                             && (from.1 - to.1 >= RE_ANCHOR_MIN_CELLS
                                 || self.short_reanchor.is_some_and(|proof| {
                                     proof.from == from && proof.to == to && proof.at == at
+                                })
+                                || self.rewrap_start.is_some_and(|proof| {
+                                    proof.from == from && proof.to == to && proof.width.is_some()
                                 }))
                         {
                             // Below the host's three-cell floor only the
@@ -3182,8 +3363,9 @@ impl Ribbon {
         Self::target_toward(coh, self.caret)
     }
 
-    /// A flowing band's fold edge, drain order and drift, frozen the frame its
-    /// flow begins ([`Ribbon::advance_swoosh`]). The edge is the band's kept
+    /// A flowing band's initial fold edge, drain order and drift
+    /// ([`Ribbon::advance_swoosh`]). Later content loss narrows the edge and
+    /// drift to the surviving live span in [`Ribbon::retire`]. The edge is the band's kept
     /// end nearest the hand in logical order (rightmost non-leaving cell above
     /// the caret, leftmost below), not the cohort's bounds, which may still
     /// include cells a re-wrap stamped to leave ([`Ribbon::leave_row`]). The
@@ -3578,7 +3760,12 @@ impl Ribbon {
         // they had ([`Ribbon::relay_origin`]). A plain terminal fold lands on the pane's first
         // column and takes nothing.
         let pane_col0 = self.pane.map_or(0, |(c0, _)| c0);
-        let w = self.moved_word_len(from, at);
+        let rewrap = self
+            .rewrap_start
+            .filter(|rewrap| rewrap.from == from && rewrap.to == to);
+        let w = rewrap
+            .and_then(|rewrap| rewrap.width)
+            .unwrap_or_else(|| self.moved_word_len(from, at));
         let held_after = self.space_held_after_the_wrap(from);
         let re_wrapped = licence == Licence::Typed && to.1 > pane_col0.saturating_add(1);
         // The origin is read before the retract stamps the word's cells.
@@ -3615,7 +3802,19 @@ impl Ribbon {
         self.arrived = None;
         self.relocate = None;
         if re_wrapped {
-            self.begin_relocate(to, w, at, origin);
+            let rewrap = self.take_rewrap_start(from, to);
+            if let Some(rewrap) = rewrap
+                && rewrap.start.checked_add(w).is_some_and(|end| end < to.1)
+            {
+                // The exact-key sweep lays the new suffix separately. This
+                // old prefix returns at its observed indent on its old walk.
+                self.relay_word(to.0, rewrap.start, rewrap.start + w, at, origin);
+                if let Some(space) = rewrap.space {
+                    self.note_space((to.0, space));
+                }
+            } else {
+                self.begin_relocate(to, w, at, origin);
+            }
         }
     }
 
@@ -3705,7 +3904,10 @@ impl Ribbon {
     /// ink on this row ([`Ribbon::hand_floor`]); a span starting left of it relays nothing.
     fn re_anchor(&mut self, from: (u16, u16), to: (u16, u16), at: Instant) {
         let n = from.1 - to.1;
-        let w = self.moved_word_len(from, at);
+        let rewrap = self.take_rewrap_start(from, to);
+        let w = rewrap
+            .and_then(|rewrap| rewrap.width)
+            .unwrap_or_else(|| self.moved_word_len(from, at));
         let held_after = self.space_held_after_the_wrap(from);
         // The origin is read before the retract stamps the word's cells.
         let origin = self.relay_origin(from, w);
@@ -3714,29 +3916,34 @@ impl Ribbon {
         // start left of the echoed word (`w`). The landing row's sample says
         // where it starts ([`Ribbon::note_rewrap_start`]); if further left, the
         // whole span to the landing is relaid as one run on the word's walk.
-        let start = self
-            .rewrap_start
-            .take()
-            .filter(|&(f, t, _)| f == from && t == to)
-            .map(|(_, _, c)| c);
+        let start = rewrap.map(|rewrap| rewrap.start);
         // One relay per split ([`SplitOff`]): a later one reads its own.
         self.split_off = None;
         // The re-anchor drains the old line toward its landing on the retract's clock,
         // whatever the app rewrites there.
         self.retract_suffix(to.0, to.1, n, at, RETRACT_DUR_S);
         self.reseat_spaces(held_after, to);
+        if let Some(space) = rewrap.and_then(|rewrap| rewrap.space) {
+            self.note_space((to.0, space));
+        }
         self.arrived = None;
         // The span `begin_relocate` would lay is `[landing − 1 − w, landing −
-        // 1)`. An unknown floor bounds nothing.
-        let relays_off_the_hand_s_ink = self
+        // 1)`. An unknown floor bounds nothing; when `note_rewrap_start`
+        // sampled a continuation indent `start` left of the first line's
+        // prompt, the wrapped word at `start..to.1` lowers the floor to
+        // `start`.
+        let hand_floor = self
             .hand_floor_on(to.0)
-            .is_some_and(|floor| to.1.saturating_sub(1).saturating_sub(w) < floor);
+            .map(|floor| start.map_or(floor, |s| floor.min(s)));
+        let relays_off_the_hand_s_ink =
+            hand_floor.is_some_and(|floor| to.1.saturating_sub(1).saturating_sub(w) < floor);
         if relays_off_the_hand_s_ink {
             return;
         }
         if let (Some(start), Some(glyph)) = (start, to.1.checked_sub(1))
-            && start < glyph.saturating_sub(w)
-            && self.hand_floor_on(to.0).is_none_or(|floor| start >= floor)
+            && start <= glyph.saturating_sub(w)
+            && start < glyph
+            && hand_floor.is_none_or(|floor| start >= floor)
         {
             self.relocate = None;
             self.relay_word(to.0, start, to.1, at, origin);
@@ -3745,11 +3952,41 @@ impl Ribbon {
         self.begin_relocate(to, w, at, origin);
     }
 
-    /// The engine's row sample says the text the same-row re-anchor
-    /// `from → to` relays starts at column `start` of `to`'s row. Read by that
-    /// move's [`Ribbon::re_anchor`] only; any other clears it.
-    pub(super) fn note_rewrap_start(&mut self, from: (u16, u16), to: (u16, u16), start: u16) {
-        self.rewrap_start = Some((from, to, start));
+    /// The content witness says the text this typed rewrap relays starts at
+    /// `start` on its landing row. Only the matching move consumes it.
+    pub(super) fn note_rewrap_start(
+        &mut self,
+        from: (u16, u16),
+        to: (u16, u16),
+        start: u16,
+        width: Option<u16>,
+        space: Option<u16>,
+    ) {
+        // The follow pass may also sample an earlier buffered move. A legacy
+        // sample must not replace a queued exact-key width/Space proof.
+        if width.is_none()
+            && self
+                .rewrap_start
+                .is_some_and(|rewrap| rewrap.width.is_some())
+        {
+            return;
+        }
+        self.rewrap_start = Some(RewrapStart {
+            from,
+            to,
+            start,
+            width,
+            space,
+        });
+    }
+
+    /// An earlier buffered move cannot consume a later move's exact geometry.
+    fn take_rewrap_start(&mut self, from: (u16, u16), to: (u16, u16)) -> Option<RewrapStart> {
+        let rewrap = self
+            .rewrap_start
+            .filter(|rewrap| rewrap.from == from && rewrap.to == to)?;
+        self.rewrap_start = None;
+        Some(rewrap)
     }
 
     /// Correct a Space's cell from an exact ordered key batch and its licensed
@@ -3923,7 +4160,7 @@ impl Ribbon {
     /// line wraps mid-word: the app moved nothing). An arrival inside the hand's own live typed
     /// run (an arrow back over the word, a typo fix) reaches back over that run, still bounded
     /// by the Space; an arrival into unlit program text stands (`tests/wrap_code_reflow.rs`).
-    fn moved_word_len(&self, from: (u16, u16), at: Instant) -> u16 {
+    pub(crate) fn moved_word_len(&self, from: (u16, u16), at: Instant) -> u16 {
         let after_space = match self.word_space(from) {
             Some((row, s)) if row == from.0 && s < from.1 => Some(s + 1),
             _ => None,
@@ -3947,6 +4184,17 @@ impl Ribbon {
         self.cells
             .iter()
             .any(|c| c.row == row && c.col == col && c.typing && self.alive_at(c, at))
+    }
+
+    /// Resident typed suffix immediately before `from`, for a content proof
+    /// whose preceding Space was program text rather than a typed event.
+    /// This measures existing light; it grants no relocation by itself.
+    pub(crate) fn typed_suffix_len(&self, from: (u16, u16), at: Instant) -> u16 {
+        (0..from.1)
+            .rev()
+            .take_while(|&col| self.typed_live(from.0, col, at))
+            .last()
+            .map_or(0, |start| from.1 - start)
     }
 
     /// Relay a re-anchor's moved word (`w` cells) before the wrap key's own
@@ -5423,6 +5671,14 @@ impl Ribbon {
         // follow pass has already read ([`Ribbon::followed_now`]).
         self.followed_now.clear();
         self.short_reanchor = None;
+        // Exact key proofs name a Move queued in this replay. Legacy sampled
+        // starts may still belong to a held park waiting for its later flush.
+        if self
+            .rewrap_start
+            .is_some_and(|rewrap| rewrap.width.is_some())
+        {
+            self.rewrap_start = None;
+        }
         self.shifted_now.clear();
     }
 
@@ -5604,8 +5860,36 @@ impl Ribbon {
                 alive_at: gone.alive_at,
             });
         }
-        self.cohorts
-            .retain(|coh| cells.iter().any(|c| c.cohort == coh.id));
+        self.cohorts.retain_mut(|coh| {
+            if coh.flow.is_none() {
+                return cells.iter().any(|cell| cell.cohort == coh.id);
+            }
+            let (resident, lo, hi) = cells.iter().filter(|cell| cell.cohort == coh.id).fold(
+                (false, u16::MAX, 0u16),
+                |(_, lo, hi), cell| {
+                    if cell.leaving() {
+                        (true, lo, hi)
+                    } else {
+                        (true, lo.min(cell.col), hi.max(cell.col))
+                    }
+                },
+            );
+            if lo > hi {
+                // A wholly leaving cohort keeps its existing fade until its
+                // last resident cell retires.
+                return resident;
+            }
+            // A rewrap can remove the word after the flow froze its edge.
+            // Keep the original drain direction, but never pull the surviving
+            // text toward columns whose light is already leaving.
+            if let Some(edge) = &mut coh.retract_col {
+                *edge = (*edge).clamp(lo, hi);
+                coh.flow_drift = coh
+                    .flow_drift
+                    .min(FLOW_DRIFT_MAX_SHARE * (f32::from(hi - lo) + 1.0));
+            }
+            true
+        });
     }
 
     /// The plan and the index, from one sort.
@@ -6817,7 +7101,8 @@ impl Ribbon {
     /// The source RGB a companion cursor inherits to meet the laid ribbon with no palette seam
     /// (seam point 5), or `None` before any cursor was observed: on dark themes the authored
     /// stop at the caret's field (the consumer applies its own ink, since [`bed_ink`] would
-    /// paint a yellow caret olive), on light themes the body's leading ink there.
+    /// paint a yellow caret olive), on light themes that stop's caret ink on the page
+    /// ([`paper_caret_ink`]).
     #[must_use]
     pub fn head_rgb(&self, cfg: &Config) -> Option<u32> {
         self.caret?;
@@ -6825,7 +7110,7 @@ impl Ribbon {
         Some(if cfg.dark_theme {
             arc
         } else {
-            light_role(cfg).ink(arc)
+            paper_caret_ink(arc, cfg.theme_bg)
         })
     }
 
@@ -7919,6 +8204,92 @@ mod tests {
         assert!(
             worst >= BODY_CONTRAST_BAR,
             "the bed composited to {worst:.4}:1 at {at}; the bar is {BODY_CONTRAST_BAR}:1 on every dark theme above the floor"
+        );
+    }
+
+    /// The shipped light pairs the paper laws are read on: GitHub Light, Aterm Day,
+    /// Default Light, Gruvbox Light, Catppuccin Latte and Solarized Light (whose own text
+    /// sits under the body's bar).
+    const PAPERS: [(u32, u32); 6] = [
+        (0x001F_2328, 0x00FF_FFFF),
+        (0x0020_2733, 0x00F8_FAFD),
+        (0x002B_2D33, 0x00F6_F7F9),
+        (0x003C_3836, 0x00FB_F1C7),
+        (0x004C_4F69, 0x00EF_F1F5),
+        (0x0058_6E75, 0x00FD_F6E3),
+    ];
+
+    #[test]
+    fn the_paper_bed_keeps_every_stop_its_hue_and_every_letter_its_bar() {
+        // At every coverage up to the role's ceiling the letters keep the bar the body
+        // promises (the body's, or its share of the theme's own contrast), and at full
+        // coverage every stop composites as its own hue: a yellow stays yellow (the
+        // luminance law printed `(119, 119, 65)` there) and nothing goes out.
+        let cap = InkRole::OverText.alpha_cap() as u32;
+        for (fg, bg) in PAPERS {
+            let bar = (BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD)
+                .min(PAPER_BAR_THEME_SHARE * contrast(fg, bg))
+                - BODY_CONTRAST_GUARD;
+            for i in 0..=128u32 {
+                let stop = spectrum(i as f32 / 128.0);
+                let ink = paper_ink(stop, fg, bg, InkRole::OverText);
+                for cov in 1..=cap {
+                    let cov = cov as u8;
+                    let lit = over_premul(bg, premul_rgb(ink, cov), cov);
+                    let c = contrast(fg, lit);
+                    assert!(
+                        c >= bar,
+                        "#{fg:06X} on #{bg:06X}: stop #{stop:06X} at cov {cov} composites #{lit:06X}, {c:.3}:1 under {bar:.3}:1"
+                    );
+                }
+                let lit = over_premul(bg, premul_rgb(ink, cap as u8), cap as u8);
+                assert_ne!(lit, bg, "#{bg:06X}: stop #{stop:06X} went out");
+                if bg == 0x00FF_FFFF {
+                    let (h, ..) = rgb2hsv(lit);
+                    let (h0, ..) = rgb2hsv(stop);
+                    let off = (h - h0).abs().min(360.0 - (h - h0).abs());
+                    assert!(
+                        off <= 4.0,
+                        "on white stop #{stop:06X} (hue {h0:.1}) composites #{lit:06X} (hue {h:.1})"
+                    );
+                }
+            }
+        }
+        let yellow = paper_ink(0x00FF_FF00, PAPERS[0].0, PAPERS[0].1, InkRole::OverText);
+        let lit = over_premul(0x00FF_FFFF, premul_rgb(yellow, cap as u8), cap as u8);
+        assert!(
+            lit & 0x00FF_FF00 == 0x00FF_FF00,
+            "yellow on white composites #{lit:06X}, not a yellow"
+        );
+    }
+
+    #[test]
+    fn the_paper_caret_is_its_stop_deepened_and_never_olive() {
+        // Every stop's caret clears 3:1 on every paper (the glyph cut out of the block is
+        // the page's colour) on a pure hue ray (HSV saturation 1), a stop that already
+        // clears it stays pure, and yellow lands on amber, not on its own olive.
+        for (_, bg) in PAPERS {
+            for i in 0..=128u32 {
+                let stop = spectrum(i as f32 / 128.0);
+                let caret = paper_caret_ink(stop, bg);
+                let c = contrast(caret, bg);
+                assert!(
+                    c >= PAPER_CARET_CONTRAST - 0.01,
+                    "on #{bg:06X} stop #{stop:06X} carets #{caret:06X} at {c:.3}:1"
+                );
+                let (_, s, _) = rgb2hsv(caret);
+                assert!(
+                    s >= 0.99,
+                    "stop #{stop:06X} carets #{caret:06X}, off its hue ray"
+                );
+            }
+        }
+        assert_eq!(paper_caret_ink(0x00FF_0000, 0x00FF_FFFF), 0x00FF_0000);
+        assert_eq!(paper_caret_ink(0x0000_00FF, 0x00FF_FFFF), 0x0000_00FF);
+        let (h, ..) = rgb2hsv(paper_caret_ink(0x00FF_FF00, 0x00FF_FFFF));
+        assert!(
+            (35.0..=50.0).contains(&h),
+            "yellow's caret sits at hue {h:.1}, not amber"
         );
     }
 
@@ -11066,6 +11437,59 @@ mod tests {
     }
 
     // -- §3.3: the light fork ---------------------------------------------
+
+    /// THE LIGHT BED KEEPS THE THEME'S TEXT AT THE BAR OVER IT: the tall
+    /// body on a light ground stands under the letters, so every entry of
+    /// its ink table, composited at the body's strongest opacity (its role's
+    /// ceiling plus one Bayer level) over the theme's paper, leaves the
+    /// theme's text at [`BODY_CONTRAST_BAR`] — on GitHub Light and a sweep of
+    /// dark foregrounds on white and cream — and on Solarized Light, whose
+    /// own text cannot meet the bar, every stop still reads as a colour.
+    /// Negative control: the old table (conservative ink, never solved
+    /// against the text) put near-black text under 3:1 over its blue.
+    #[test]
+    fn the_light_bed_keeps_theme_ink_over_it_at_the_bar() {
+        fn contrast(a: u32, b: u32) -> f32 {
+            let (x, y) = (relative_luminance(a), relative_luminance(b));
+            let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+            (hi + 0.05) / (lo + 0.05)
+        }
+        let blend_at = |c: &Config, ink: u32| {
+            let a = (cov_cap(c) + 16.0).min(255.0) as u8;
+            over_premul(c.theme_bg, premul_rgb(ink, a), a) & 0x00FF_FFFF
+        };
+        let mut themes = vec![(0x001F_2328, 0x00FF_FFFF)];
+        for bg in [0x00FF_FFFF, 0x00FD_F6E3] {
+            for grey in (0..=0x33u32).step_by(0x11) {
+                themes.push(((grey << 16) | (grey << 8) | grey, bg));
+            }
+        }
+        for (fg, bg) in themes {
+            let mut c = cfg(false, true);
+            c.theme_fg = fg;
+            c.theme_bg = bg;
+            let mut lut = BedInkLut::default();
+            lut.sync(&c);
+            for &ink in &lut.lut {
+                let blend = blend_at(&c, ink);
+                assert!(
+                    contrast(fg, blend) >= BODY_CONTRAST_BAR,
+                    "{ink:06x} under {fg:06x} on {bg:06x}: {:.2}:1",
+                    contrast(fg, blend)
+                );
+            }
+        }
+        let mut sol = cfg(false, true);
+        sol.theme_fg = 0x0065_7B83;
+        sol.theme_bg = 0x00FD_F6E3;
+        let mut lut = BedInkLut::default();
+        lut.sync(&sol);
+        for &ink in &lut.lut {
+            assert!(seen(blend_at(&sol, ink), sol.theme_bg), "{ink:06x} reads");
+        }
+        let old = blend_at(&cfg(false, true), InkRole::OverText.ink(0x0000_00FF));
+        assert!(contrast(0x001F_2328, old) < 3.0, "the old table's blue");
+    }
 
     #[test]
     fn a_light_theme_ribbon_is_source_over_ink_and_never_additive() {

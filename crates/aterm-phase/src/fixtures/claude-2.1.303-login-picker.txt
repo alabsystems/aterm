@@ -1,0 +1,27 @@
+# claude-code 2.1.303 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the /login method picker under a subscriber env token, 2.1.303
+ ▐▛███▛█   Claude Code v2.1.303
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.26bb/proj
+
+
+❯ hi
+  ⎿  Not logged in · Please run /login
+
+✻ Worked for 1s · done 10:24 AM
+
+❯ /login
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Login
+
+  Warning: CLAUDE_CODE_OAUTH_TOKEN is set in your environment. This session will switch to your new credentials after logging in, but if that
+  variable is set in your shell profile or a Claude Code settings file, new `claude` sessions will keep using the old token until you remove
+  it there.
+
+  Select login method:
+
+  ❯ 1. Claude account with subscription · Pro, Max, Team, or Enterprise
+    2. Anthropic Console account · API usage billing
+    3. 3rd-party platform · Amazon Bedrock, Microsoft Foundry, Google Vertex AI
+
+  Esc to cancel

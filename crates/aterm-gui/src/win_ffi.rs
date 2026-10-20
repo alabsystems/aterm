@@ -80,6 +80,50 @@ impl Drop for Com {
 /// line, never more.
 pub(crate) type StepError = (&'static str, i32);
 
+/// `RPC_E_CHANGED_MODE` — this thread is already in an apartment of the OTHER
+/// model. Not a failure for us: the shell dialog and the imaging component
+/// work from either, and the apartment we did not enter is not ours to leave.
+const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
+
+/// This thread's COM apartment for the duration of one call (the file
+/// picker's dialog, a wallpaper decode through the imaging component), so an
+/// error path cannot leak it (`Com` releases the references).
+///
+/// `owned` is the whole subtlety. On the UI thread winit has already run
+/// `OleInitialize`, so our `CoInitializeEx` returns `S_FALSE` — still a SUCCESS
+/// that took a reference, and one we must therefore drop. `RPC_E_CHANGED_MODE`
+/// means the thread is an MTA that somebody else established: both callers are
+/// happy there, but we took no reference and must not release one.
+pub(crate) struct Apartment {
+    owned: bool,
+}
+
+impl Apartment {
+    pub(crate) fn enter() -> Result<Self, StepError> {
+        // SAFETY: no reserved parameter; STA is the apartment a shell dialog
+        // wants, and is the one the UI thread is already in.
+        let hr = unsafe { CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED) };
+        if hr >= 0 {
+            // S_OK and S_FALSE both took a reference; both must be balanced.
+            Ok(Self { owned: true })
+        } else if hr == RPC_E_CHANGED_MODE {
+            Ok(Self { owned: false })
+        } else {
+            Err(("CoInitializeEx", hr))
+        }
+    }
+}
+
+impl Drop for Apartment {
+    fn drop(&mut self) {
+        if self.owned {
+            // SAFETY: balanced against the successful CoInitializeEx in `enter`,
+            // on the SAME thread, as COM requires.
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
 pub(crate) fn check(hr: i32, step: &'static str) -> Result<(), StepError> {
     if hr < 0 { Err((step, hr)) } else { Ok(()) }
 }

@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The AppKit half: the app and what each click, choice and tick does ([`app`]), the status
+//! item and its menu ([`ui`]), the activity that keeps the Mac awake ([`awake`]) and the
+//! update watch ([`watch`]). Reached only from `aterm caffeine serve`, never from a test or
+//! a headless path: `run` creates `NSApplication`, which opens a WindowServer connection.
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use crate::instance::Instance;
+use crate::paths::Paths;
+
+mod app;
+mod awake;
+mod ui;
+mod watch;
+
+/// What `serve` hands the menu-bar app.
+#[derive(Debug)]
+pub(crate) struct ServeContext {
+    /// The mug's files.
+    pub paths: Paths,
+    /// Its launchd job's label (Enable at Startup writes that job's plist).
+    pub label: String,
+    /// The executable the job runs: where `serve` was started, not the copy it runs from.
+    pub origin: PathBuf,
+    /// The app version the about row prints.
+    pub version: String,
+    /// End with [`crate::launchd::EXIT_RESTART`] when the origin's code changes: only under
+    /// launchd, which starts it again.
+    pub restart_on_update: bool,
+    /// This process's hold on the one-mug lock, kept until it returns.
+    pub instance: Instance,
+}
+
+/// Run the menu-bar mug on this thread, the process main thread, until Quit (or an update
+/// restart); what `serve` returns.
+pub(crate) fn serve(ctx: ServeContext) -> ExitCode {
+    app::run(ctx)
+}

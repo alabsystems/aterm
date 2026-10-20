@@ -60,10 +60,10 @@ fn ok_reply(reply: &str) -> bool {
 }
 
 /// The `aterm.toml` lines the smoke's instance runs with (top-level keys, ahead
-/// of the sandbox's first `[table]`): the cursor effects and their trail
-/// sounds on, the shipped default config, written out so the burst measures
-/// the effects whatever the defaults become.
-pub const SMOKE_CONFIG: &str = "cursor_trail = true\ntrail_sounds = true\n";
+/// of the sandbox's first `[table]`): the cursor effects (the shipped default
+/// trail style and the typing glow) and their trail sounds on, written out so
+/// the burst measures the effects whatever the defaults become.
+pub const SMOKE_CONFIG: &str = "cursor_trail_style = \"rainbow kitty pet\"\ncursor_momentum_glow = true\ntrail_sounds = true\n";
 
 /// Late (`past`) `cursor_effect` arms the burst may book: healthy effects-on
 /// bursts arm ~430 deadlines and book 0-2 late, so four leaves two of headroom.
@@ -451,6 +451,7 @@ pub fn gui_typing_smoke(ctx: &Ctx, r: &mut Report) {
     };
     if let Ready::Up { ctl: ctl_bin } = bring_up(ctx, r, &mut sb, bundle) {
         typing_burst(ctx, r, &mut sb, &ctl_bin);
+        settings_hardware_key_step(ctx, r, &mut sb, &ctl_bin);
     }
     sb.teardown(r);
 }
@@ -530,6 +531,84 @@ fn typing_burst(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
     match hardware_key_verdict(posted, &summary, &percentiles) {
         Ok(line) => r.pass(line),
         Err(bad) => r.fail(bad),
+    }
+}
+
+/// THE REAL KEY PATH REACHES A NATIVE VIEW (xa-20): with Settings in front of a
+/// real window, one `hwkey tab` — a real NSEvent through the OS queue, winit's
+/// `KeyboardInput` arm, `App::on_key` and the native-view key path — must move
+/// Settings' keyboard focus. In-process tests synthesize winit `KeyEvent`s and
+/// cannot see NSEvent translation or AppKit key equivalents with a native tab in
+/// front; only this lane can. The wait for the move is a hang detector, never a
+/// latency budget.
+fn settings_hardware_key_step(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
+    let tag = "gui smoke: settings key path";
+    let Some(pid) = sb.child.as_ref().map(Child::id) else {
+        r.cannot_run(format!("{tag}: no child to drive"));
+        return;
+    };
+    let got = ctl(
+        ctx,
+        sb,
+        ctl_bin,
+        &["open", "app", "settings", "/appearance"],
+    );
+    if !ok_reply(&got) {
+        r.fail(format!("{tag}: open app settings -> {}", or_no_reply(&got)));
+        return;
+    }
+    if !crate::smoke::activate_macos_gui_pid(pid) {
+        r.skip(format!("{tag} (could not keep the test window frontmost)"));
+        return;
+    }
+    let tabs = ctl(ctx, sb, ctl_bin, &["inspect", "app/v1", "tabs"]);
+    let Some(view) = tabs
+        .lines()
+        .find(|line| line.contains("app=settings"))
+        .and_then(|line| reply_field(line, "view").parse::<u64>().ok())
+    else {
+        r.fail(format!("{tag}: no Settings view in {}", or_no_reply(&tabs)));
+        return;
+    };
+    let view = view.to_string();
+    let focused = |sb: &Sandbox| -> Option<String> {
+        ctl(
+            ctx,
+            sb,
+            ctl_bin,
+            &["inspect", "app/v1", "view", &view, "controls"],
+        )
+        .lines()
+        .find(|line| line.contains("focused:true"))
+        .map(|line| reply_field(line, "key").trim_matches('"').to_string())
+    };
+    let before = focused(sb);
+    let got = ctl(ctx, sb, ctl_bin, &["hwkey", "tab"]);
+    if !ok_reply(&got) || metric_u64(&got, "posted") != Some(1) {
+        r.fail(format!("{tag}: hwkey tab -> {}", or_no_reply(&got)));
+        return;
+    }
+    // One minute: a hang detector, as every wait for something that must happen.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let now = focused(sb);
+        if now.is_some() && now != before {
+            r.pass(format!(
+                "a real Tab moved Settings' focus ({} -> {})",
+                before.as_deref().unwrap_or("-"),
+                now.as_deref().unwrap_or("-")
+            ));
+            return;
+        }
+        if std::time::Instant::now() >= deadline || child_exited(sb) {
+            r.fail(format!(
+                "{tag}: a real Tab never moved Settings' focus (still {})",
+                now.as_deref().unwrap_or("-")
+            ));
+            r.raw(smoke_log_tail("GUI smoke", &sb.gui_log));
+            return;
+        }
+        std::thread::sleep(POLL_GAP);
     }
 }
 

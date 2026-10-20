@@ -188,6 +188,31 @@ fn fed(start: u64) -> (MessageCenter, MessageId, Instant) {
 
 // ---- deadlines vs. what is drawn ---------------------------------------------
 
+/// The comet at `cols` in `look` for 75 s, its elapsed words included: the
+/// frames it missed, after its cadence is held to the look's pace.
+fn comet_walk(cols: usize, look: Look) -> Vec<String> {
+    let now = minted_now();
+    let mut c = MessageCenter::new(MessageLog::empty(), now);
+    c.post(busy("Installing Homebrew"), stamp(), now);
+    c.commit_rows(now, 3);
+    let p = present(&c, cols);
+    let a = audit(&c, &p, look, now, now + ms(75_000));
+    for w in a.wakes.windows(2) {
+        let gap = w[1] - w[0];
+        match look.pace {
+            Pace::Moving => assert!(gap >= ANIM_FRAME, "comet {cols} {look:?}: {gap:?}"),
+            Pace::Still => assert!(gap >= ms(990), "comet {cols} {look:?}: {gap:?}"),
+        }
+    }
+    if look.pace == Pace::Moving {
+        assert_eq!(a.wasted, 0, "comet {cols} {look:?}: a wasted comet frame");
+    }
+    a.missed
+        .iter()
+        .map(|m| format!("comet {cols}: {m}"))
+        .collect()
+}
+
 /// NO MISSED FRAME, IN ANY LOOK: the comet at three widths for 75 s (its
 /// elapsed words included), a download through its latched ETA, its glint
 /// and its stall where the width lays out the ETA slot, a data glide, and
@@ -202,28 +227,17 @@ fn fed(start: u64) -> (MessageCenter, MessageId, Instant) {
 /// still echo asks no frame at all.
 #[test]
 fn deadlines_never_miss_a_change_the_motion_draws() {
-    let mut missed = Vec::new();
-    for cols in [60usize, 80, 120] {
-        for look in LOOKS {
-            let now = minted_now();
-            let mut c = MessageCenter::new(MessageLog::empty(), now);
-            c.post(busy("Installing Homebrew"), stamp(), now);
-            c.commit_rows(now, 3);
-            let p = present(&c, cols);
-            let a = audit(&c, &p, look, now, now + ms(75_000));
-            missed.extend(a.missed.iter().map(|m| format!("comet {cols}: {m}")));
-            for w in a.wakes.windows(2) {
-                let gap = w[1] - w[0];
-                match look.pace {
-                    Pace::Moving => assert!(gap >= ANIM_FRAME, "comet {cols} {look:?}: {gap:?}"),
-                    Pace::Still => assert!(gap >= ms(990), "comet {cols} {look:?}: {gap:?}"),
-                }
-            }
-            if look.pace == Pace::Moving {
-                assert_eq!(a.wasted, 0, "comet {cols} {look:?}: a wasted comet frame");
-            }
-        }
-    }
+    // The comet's twelve 75 s walks are most of this test: on every core,
+    // their misses in order.
+    let comets: Vec<(usize, Look)> = [60usize, 80, 120]
+        .into_iter()
+        .flat_map(|cols| LOOKS.map(|look| (cols, look)))
+        .collect();
+    let mut missed: Vec<String> =
+        aterm_spec::check::each(&comets, |&(cols, look)| comet_walk(cols, look))
+            .into_iter()
+            .flatten()
+            .collect();
     // The download at widths that lay out its ETA slot (the starved slot is
     // pinned on its own, below).
     for start in [1_000_000u64, 40_000_000] {

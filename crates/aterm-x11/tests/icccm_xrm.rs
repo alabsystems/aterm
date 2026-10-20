@@ -12,14 +12,12 @@
 
 #![cfg(target_endian = "little")]
 
-mod support;
-
 use std::collections::BTreeMap;
 
+use crate::support::*;
 use aterm_x11::icccm::{InitialState, Specified, WmClass, WmHints, WmSizeHints};
 use aterm_x11::proto::xproto::GetPropertyReply;
 use aterm_x11::xrm::Database;
-use support::*;
 
 const ICCCM: &str = "x11rb-0.13.2-icccm.tsv";
 const XRM: &str = "x11rb-protocol-0.13.2-xrm.tsv";

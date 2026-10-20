@@ -9,10 +9,10 @@
 //! requests that skip `Session::call` — the claim's renewal and release
 //! (`meta set|unset supervisor`), the worker's `who` — still go through the
 //! one transport the session holds, so they are taped by construction, and no
-//! new bypass can be written that is not. The teller's lane (`watch`'s
-//! `story`, its own client) is wrapped the same way under its own door
-//! ([`super::doors::TELLER`]), so its replies, which no decision reads, never
-//! interleave with the loop's under one door name.
+//! new bypass can be written that is not. An older build's teller lane (the
+//! removed `aterm drive watch`'s `story`, its own client) crossed a door of
+//! its own ([`super::doors::TELLER`]), so a reader of its tapes still tells
+//! its replies, which no decision read, from the loop's.
 //!
 //! The door also closes the tape's open frame where a reader of a live tape
 //! needs it on disk: before a WAIT (`await …`: an idle loop's tape is on disk
@@ -37,7 +37,7 @@ pub(crate) struct TapedCtl<'c, C: Ctl + ?Sized> {
 
 impl<'c, C: Ctl + ?Sized> TapedCtl<'c, C> {
     /// `inner`'s round trips, through `fx` at `door` ([`super::doors::CTL`] for the
-    /// loop's lane, [`super::doors::TELLER`] for the teller's).
+    /// loop's lane).
     pub(crate) fn new(inner: &'c mut C, fx: Fx, door: &'static str) -> Self {
         Self { inner, fx, door }
     }

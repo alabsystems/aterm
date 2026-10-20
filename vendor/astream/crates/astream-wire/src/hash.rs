@@ -20,7 +20,7 @@ contract_fn! {
     ///
     /// Verified against `Astream.Wire.TlaSlicingCrc32.crc_table_index_in_bounds_isl` by
     /// `clean-kernel-defeq`.
-    pub fn crc_table_index_in_bounds(idx: u64, max_idx: u64) -> bool
+    pub const fn crc_table_index_in_bounds(idx: u64, max_idx: u64) -> bool
     clauses [ensures result == (idx <= max_idx)]
     {
         idx <= max_idx
@@ -34,11 +34,13 @@ pub const FNV1A_64_INIT: u64 = 0xcbf2_9ce4_8422_2325;
 /// [`FNV1A_64_INIT`]). Allows hashing multi-field length-prefixed tuples with
 /// zero heap allocation.
 #[must_use]
-pub fn fnv1a_64_update(mut h: u64, bytes: &[u8]) -> u64 {
+pub const fn fnv1a_64_update(mut h: u64, bytes: &[u8]) -> u64 {
     const PRIME: u64 = 0x0000_0100_0000_01b3;
-    for &b in bytes {
+    let mut rest = bytes;
+    while let &[b, ref tail @ ..] = rest {
         h ^= b as u64;
         h = h.wrapping_mul(PRIME);
+        rest = tail;
     }
     h
 }
@@ -46,7 +48,7 @@ pub fn fnv1a_64_update(mut h: u64, bytes: &[u8]) -> u64 {
 /// FNV-1a, 64-bit. A stable non-cryptographic hash used for partition
 /// assignment. Stable across processes and architectures (no `Hash` RNG).
 #[must_use]
-pub fn fnv1a_64(bytes: &[u8]) -> u64 {
+pub const fn fnv1a_64(bytes: &[u8]) -> u64 {
     fnv1a_64_update(FNV1A_64_INIT, bytes)
 }
 
@@ -124,6 +126,11 @@ const fn crc32_tables() -> [[u32; 256]; 8] {
 
 const CRC32_TABLES: [[u32; 256]; 8] = crc32_tables();
 
+#[inline(always)]
+const fn u32_le(b0: u8, b1: u8, b2: u8, b3: u8) -> u32 {
+    (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16) | ((b3 as u32) << 24)
+}
+
 /// Feed `data` into an ongoing CRC-32/IEEE computation started at `0`
 /// (`crc32_ieee(b"")`).
 ///
@@ -133,14 +140,13 @@ const CRC32_TABLES: [[u32; 256]; 8] = crc32_tables();
 /// allows computing frame CRCs across non-contiguous fields without
 /// intermediate buffer copies.
 #[must_use]
-pub fn crc32_ieee_update(crc: u32, data: &[u8]) -> u32 {
+pub const fn crc32_ieee_update(crc: u32, data: &[u8]) -> u32 {
     let [t0, t1, t2, t3, t4, t5, t6, t7] = &CRC32_TABLES;
     let mut state: u32 = !crc;
-    let (chunks, rest) = data.as_chunks::<8>();
-    for c in chunks {
-        let [c0, c1, c2, c3, c4, c5, c6, c7] = *c;
-        let lo = state ^ u32::from_le_bytes([c0, c1, c2, c3]);
-        let hi = u32::from_le_bytes([c4, c5, c6, c7]);
+    let mut rest = data;
+    while let &[c0, c1, c2, c3, c4, c5, c6, c7, ref tail @ ..] = rest {
+        let lo = state ^ u32_le(c0, c1, c2, c3);
+        let hi = u32_le(c4, c5, c6, c7);
         state = crc_table_at(t7, lo as u8)
             ^ crc_table_at(t6, (lo >> 8) as u8)
             ^ crc_table_at(t5, (lo >> 16) as u8)
@@ -149,11 +155,57 @@ pub fn crc32_ieee_update(crc: u32, data: &[u8]) -> u32 {
             ^ crc_table_at(t2, (hi >> 8) as u8)
             ^ crc_table_at(t1, (hi >> 16) as u8)
             ^ crc_table_at(t0, (hi >> 24) as u8);
+        rest = tail;
     }
-    for &b in rest {
+    while let &[b, ref tail @ ..] = rest {
         state = (state >> 8) ^ crc_table_at(t0, (state as u8) ^ b);
+        rest = tail;
     }
     !state
+}
+
+/// Compute the CRC-32/IEEE of the first `len` bytes of `data`, or `None` if
+/// `data.len() < len`. Uses built-in slice pattern matching (`Subslice`) so
+/// it requires no `split_at_checked` call.
+#[must_use]
+pub const fn crc32_ieee_prefix(data: &[u8], len: usize) -> Option<u32> {
+    if data.len() < len {
+        return None;
+    }
+    let [t0, t1, t2, t3, t4, t5, t6, t7] = &CRC32_TABLES;
+    let mut state: u32 = !0u32;
+    let mut rest = data;
+    let mut done = 0usize;
+    while let &[c0, c1, c2, c3, c4, c5, c6, c7, ref tail @ ..] = rest {
+        if done >= len || len.wrapping_sub(done) < 8 {
+            break;
+        }
+        let lo = state ^ u32_le(c0, c1, c2, c3);
+        let hi = u32_le(c4, c5, c6, c7);
+        state = crc_table_at(t7, lo as u8)
+            ^ crc_table_at(t6, (lo >> 8) as u8)
+            ^ crc_table_at(t5, (lo >> 16) as u8)
+            ^ crc_table_at(t4, (lo >> 24) as u8)
+            ^ crc_table_at(t3, hi as u8)
+            ^ crc_table_at(t2, (hi >> 8) as u8)
+            ^ crc_table_at(t1, (hi >> 16) as u8)
+            ^ crc_table_at(t0, (hi >> 24) as u8);
+        done = done.saturating_add(8);
+        rest = tail;
+    }
+    while let &[b, ref tail @ ..] = rest {
+        if done >= len {
+            return Some(!state);
+        }
+        state = (state >> 8) ^ crc_table_at(t0, (state as u8) ^ b);
+        done = done.saturating_add(1);
+        rest = tail;
+    }
+    if done == len {
+        Some(!state)
+    } else {
+        None
+    }
 }
 
 /// CRC-32, IEEE 802.3 polynomial (reflected `0xEDB88320`). Used for frame
@@ -168,7 +220,7 @@ pub fn crc32_ieee_update(crc: u32, data: &[u8]) -> u32 {
 /// canonical `123456789 -> 0xCBF43926` vector and a differential test against
 /// that reference both pin it.
 #[must_use]
-pub fn crc32_ieee(data: &[u8]) -> u32 {
+pub const fn crc32_ieee(data: &[u8]) -> u32 {
     crc32_ieee_update(0, data)
 }
 

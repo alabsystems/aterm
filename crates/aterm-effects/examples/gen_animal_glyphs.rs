@@ -16,7 +16,10 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use aterm_effects::cat_glyphs_codegen::generate_animal_from_assets;
+#[path = "../src/cat_glyphs_codegen.rs"]
+pub mod cat_glyphs_codegen;
+
+use cat_glyphs_codegen::generate_animal_from_assets;
 
 /// Shared asset-dir reader (the engine reads no files; the generator does).
 #[path = "support/asset_dir.rs"]

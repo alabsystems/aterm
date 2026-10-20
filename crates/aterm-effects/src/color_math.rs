@@ -77,6 +77,34 @@ pub fn relative_luminance(rgb: u32) -> f32 {
     relative_luminance_with(relative_luminance_table(), rgb)
 }
 
+/// OKLab `[L, a, b]` of a `0x00RRGGBB` colour (Björn Ottosson's matrices), the
+/// uniform space a tint's distance from its page is weighed in.
+pub(crate) fn oklab(rgb: u32) -> [f32; 3] {
+    let lin = |sh: u32| {
+        let n = ((rgb >> sh) & 0xff) as f32 / 255.0;
+        if n <= 0.040_45 {
+            n / 12.92
+        } else {
+            ((n + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let (r, g, b) = (lin(16), lin(8), lin(0));
+    let l = (0.412_221_47 * r + 0.536_332_55 * g + 0.051_445_995 * b).cbrt();
+    let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
+    let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
+    [
+        0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
+        1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
+        0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
+    ]
+}
+
+/// The Euclidean OKLab distance between two `0x00RRGGBB` colours.
+pub(crate) fn oklab_distance(a: u32, b: u32) -> f32 {
+    let (x, y) = (oklab(a), oklab(b));
+    ((x[0] - y[0]).powi(2) + (x[1] - y[1]).powi(2) + (x[2] - y[2]).powi(2)).sqrt()
+}
+
 /// HSV (`h` degrees, `s`/`v` in `0..=1`) → `0x00RRGGBB`.
 pub fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
     let c = v * s;

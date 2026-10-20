@@ -1,0 +1,12 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_prompt_older_than_the_open_turn_does_not_name_it, the on rig
+# (S13): 599 s older names nothing; within the window names it.
+bind 0
+pass 600000
+see busy
+tx prompt vold dated=1000
+expect tx mapped=none
+tx tool c1
+expect tx dropped=1
+tx prompt vnew dated=599000
+expect amend t1 turn vref=vnew

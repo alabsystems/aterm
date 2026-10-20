@@ -1,0 +1,26 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0 fe4ac0e0d7) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab), the harness off · a shell call (`echo q3-bg-start; sleep 100; echo q3-bg-end`, escalated, `yield_time_ms: 1000`) approved and backgrounded, 3 s in: the turn's end, the pointer `  (↓ to view terminals)` under its reply, and under the bottom rule the background-work panel `main · ↓ to select` / `└ ◈ Q3 background wait  running  2s` (its glyph and its count redraw every second) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  Muse Code 1.4.10
+
+❯ toolstart
+
+◆ Ran command · Q2 tool shell · ✓ · 14s · ctrl+o
+
+◆ Tool call done. Result: { "chunk_id": "exec-1-1", "exit_code": 0, "terminal_status": "completed", "output": "q2-tool-ran\n",
+  "original_output_bytes": 12, "original_output_tokens": 3, "truncated": false }
+
+❯ toolstart
+
+◆ Backgrounded · Q3 background wait · 2.2s · ctrl+o
+
+◆ Tool call done. Result: { "chunk_id": "exec-2-1", "execution_state": "background_running", "session_id": 2, "work_id":
+  "work.v2.managed_bash.sha256.65232663014469ba98739dcde0ce49f304a9b9af51f5cc1aa217e2c09d18829c", ~
+
+  (↓ to view terminals)
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+main · ↓ to select
+└ ◈ Q3 background wait  running                                                                                                               2s
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

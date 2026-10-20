@@ -219,6 +219,24 @@ fn a_running_scripted_clock_keeps_pace_with_the_monotonic_clock() {
     }
 }
 
+/// A STANDING MONOTONIC CLOCK READS NO REAL TIME: across a real sleep every
+/// read, a peek's too, is the one instant, so a test that ages the policy's
+/// instants itself is aged by no slow step of a loaded machine. NEGATIVE
+/// CONTROL: unstood, the same sleep moves it.
+#[test]
+fn a_standing_monotonic_clock_reads_no_real_time() {
+    let mut fx = Fx::os();
+    fx.scripted().expect("scripted").set_at_ms(NOW * 1000);
+    let runs = fx.mono();
+    std::thread::sleep(Duration::from_millis(2));
+    assert!(fx.mono() > runs, "unstood, it is the system's");
+    fx.scripted().expect("scripted").stand_mono();
+    let stands = fx.mono();
+    std::thread::sleep(Duration::from_millis(2));
+    assert_eq!((fx.mono(), fx.peek().0), (stands, stands));
+    assert_eq!(fx.wall_ms(), NOW * 1000);
+}
+
 /// UNFIXED, the scripted clock is the system's: a session whose test stages
 /// nothing reads what the shipped loop reads, on every clock of the door.
 #[test]
@@ -293,6 +311,60 @@ fn virtual_clocks_move_only_by_sleeps() {
     assert_eq!(fx.wall_s(), NOW + 3601);
     assert_eq!(fx.stamp_ms(), NOW * 1000 + 3_601_500);
     assert!(fx.scripted().is_none(), "no fixed clock over virtual ones");
+}
+
+/// THE TEST CLOCKS COUNT THE MACHINE'S SLEEP ONLY WHERE A TEST COUNTS
+/// ([`Fx::asleep`], [`Fx::last_sleep`]): uncounted — every test before the
+/// count — a loop over them reads a sleep by its clocks alone, as on a
+/// machine that keeps no count; counted, a sleep they stage is counted, on
+/// [`TEST_BOOT`] or the boot the test names, and recorded as the last, and a
+/// step that is no sleep (the fixed clock set on, a sleep of the loop's own
+/// through the door) is time awake.
+#[test]
+fn the_test_clocks_count_a_sleep_only_where_a_test_counts() {
+    let secs = Duration::from_secs;
+    let mut fx = Fx::os();
+    let clock = fx.scripted_handle().expect("scripted");
+    clock.set_at_ms(NOW * 1000);
+    clock.slept(60);
+    assert_eq!(fx.wall_ms(), (NOW + 60) * 1000);
+    assert_eq!((fx.asleep(), fx.last_sleep()), (None, None), "uncounted");
+    clock.count_sleeps(secs(100));
+    clock.set_at_ms((NOW + 600) * 1000);
+    assert_eq!(fx.asleep().map(|c| c.asleep), Some(secs(100)), "a step");
+    // The count moves as the wall clock's reads show the sleep.
+    clock.slept(1800);
+    assert_eq!(fx.asleep().map(|c| c.asleep), Some(secs(100)));
+    assert_eq!(fx.wall_ms(), (NOW + 2460) * 1000);
+    let count = fx.asleep().expect("counted");
+    assert_eq!(count.asleep, secs(1900));
+    assert_eq!(count.boot.as_deref(), Some(TEST_BOOT));
+    assert_eq!(
+        fx.last_sleep(),
+        Some(((NOW + 660) * 1000, (NOW + 2460) * 1000))
+    );
+    clock.set_boot("another");
+    assert_eq!(fx.asleep().and_then(|c| c.boot).as_deref(), Some("another"));
+
+    let origin = Instant::now();
+    let virt = Arc::new(VirtualClock::new(origin, NOW * 1000));
+    let fx = Fx::over(ClockSource::Virtual(Arc::clone(&virt)));
+    virt.sleep_mac(secs(600));
+    assert_eq!((fx.mono(), fx.wall_ms()), (origin, (NOW + 600) * 1000));
+    assert_eq!((fx.asleep(), fx.last_sleep()), (None, None), "uncounted");
+    virt.count_sleeps();
+    fx.sleep(secs(60));
+    virt.sleep_mac(secs(1800));
+    assert_eq!(
+        fx.mono(),
+        origin + secs(60),
+        "the sleep stops the awake clock"
+    );
+    assert_eq!(fx.asleep().map(|c| c.asleep), Some(secs(2400)));
+    assert_eq!(
+        fx.last_sleep(),
+        Some(((NOW + 660) * 1000, (NOW + 2460) * 1000))
+    );
 }
 
 /// `since` is `elapsed`: zero for an instant ahead of the clock, never a

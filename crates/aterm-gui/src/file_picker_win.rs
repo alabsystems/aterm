@@ -26,7 +26,7 @@
 //! prompt, no allowed-content-type restriction for a document (images only for
 //! a wallpaper) and no forced starting directory; [`dialog_options`] maps each
 //! of those onto a `FILEOPENDIALOGOPTIONS` bit, [`ALL_FILES`] mirrors the
-//! unrestricted document list and [`PNG_IMAGES`] the images the wallpaper
+//! unrestricted document list and [`image_rows`] the images the wallpaper
 //! decoder reads here. Cancel returns `None` — a user decision, never an error.
 //!
 //! **`IFileOpenDialog`, not `GetOpenFileName`.** The Common Item Dialog is the
@@ -49,10 +49,7 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use crate::win_ffi::{
-    COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize, Com, Guid, StepError, check,
-    co_create, wide,
-};
+use crate::win_ffi::{Apartment, Com, Guid, StepError, check, co_create, wide};
 
 // ---------------------------------------------------------------------------
 // GUIDs (from shobjidl_core.h)
@@ -149,10 +146,6 @@ struct IShellItem {
     vtbl: *const IShellItemVtbl,
 }
 
-/// `RPC_E_CHANGED_MODE` — this thread is already in an apartment of the OTHER
-/// model. Not a failure for us: the dialog works from either, and the apartment
-/// we did not enter is not ours to leave.
-const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
 /// `HRESULT_FROM_WIN32(ERROR_CANCELLED)` — what `IModalWindow::Show` returns when
 /// the user dismisses the dialog. A DECISION, not a fault: it is the whole reason
 /// [`show_dialog`] returns `Result<Option<…>>` instead of `Result<…>`.
@@ -191,47 +184,6 @@ unsafe extern "system" {
 }
 
 // ---------------------------------------------------------------------------
-// Tiny RAII so error paths cannot leak an apartment (`Com` releases references)
-// ---------------------------------------------------------------------------
-
-/// This thread's COM apartment for the duration of one picker call.
-///
-/// `owned` is the whole subtlety. On the UI thread winit has already run
-/// `OleInitialize`, so our `CoInitializeEx` returns `S_FALSE` — still a SUCCESS
-/// that took a reference, and one we must therefore drop. `RPC_E_CHANGED_MODE`
-/// means the thread is an MTA that somebody else established: the dialog is happy
-/// there, but we took no reference and must not release one.
-struct Apartment {
-    owned: bool,
-}
-
-impl Apartment {
-    fn enter() -> Result<Self, StepError> {
-        // SAFETY: no reserved parameter; STA is the apartment a shell dialog
-        // wants, and is the one the UI thread is already in.
-        let hr = unsafe { CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED) };
-        if hr >= 0 {
-            // S_OK and S_FALSE both took a reference; both must be balanced.
-            Ok(Self { owned: true })
-        } else if hr == RPC_E_CHANGED_MODE {
-            Ok(Self { owned: false })
-        } else {
-            Err(("CoInitializeEx", hr))
-        }
-    }
-}
-
-impl Drop for Apartment {
-    fn drop(&mut self) {
-        if self.owned {
-            // SAFETY: balanced against the successful CoInitializeEx in `enter`,
-            // on the SAME thread, as COM requires.
-            unsafe { CoUninitialize() };
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // The pure halves — everything a headless test can reach
 // ---------------------------------------------------------------------------
 
@@ -246,9 +198,15 @@ impl Drop for Apartment {
 /// missing control.
 const ALL_FILES: [(&str, &str); 1] = [("All Files", "*.*")];
 
-/// The wallpaper picker's list: off macOS the wallpaper decoder reads PNG only
-/// (`app_config::decode_wallpaper_bytes`), so that is all it offers.
-const PNG_IMAGES: [(&str, &str); 1] = [("PNG images", "*.png")];
+/// The wallpaper picker's list: the images the wallpaper decoder reads here
+/// (`app_config::decode_wallpaper_bytes`: PNG and JPEG first-party, and every
+/// format the imaging component's installed decoders claim), from the
+/// decoders' own tables, so the picker and the decoder cannot drift apart.
+fn image_rows() -> [(String, String); 1] {
+    [crate::app_config::wallpaper_image_filter(
+        crate::image_decode_win::decodable_extensions(),
+    )]
+}
 
 /// Owned `COMDLG_FILTERSPEC` rows: the wide buffers AND the array of pointers
 /// into them, kept together so the array cannot outlive its strings.
@@ -260,11 +218,11 @@ struct FilterSpecs {
 }
 
 impl FilterSpecs {
-    fn new(rows: &[(&str, &str)]) -> Self {
+    fn new<N: AsRef<str>, S: AsRef<str>>(rows: &[(N, S)]) -> Self {
         let mut text: Vec<Vec<u16>> = Vec::with_capacity(rows.len() * 2);
         for (name, spec) in rows {
-            text.push(wide(name));
-            text.push(wide(spec));
+            text.push(wide(name.as_ref()));
+            text.push(wide(spec.as_ref()));
         }
         let specs = (0..rows.len())
             .map(|i| FilterSpec {
@@ -276,7 +234,7 @@ impl FilterSpecs {
     }
 
     fn len(&self) -> u32 {
-        // `rows` is a compile-time table; the cast cannot truncate.
+        // `rows` is a table of one or two rows; the cast cannot truncate.
         self.specs.len() as u32
     }
 
@@ -365,10 +323,14 @@ pub(crate) fn choose(title: &str, prompt: &str) -> Option<PathBuf> {
 /// [`choose`] offering only the images the wallpaper decoder reads here; the
 /// Windows arm of `menu::choose_local_image`.
 pub(crate) fn choose_image(title: &str, prompt: &str) -> Option<PathBuf> {
-    choose_from(title, prompt, &PNG_IMAGES)
+    choose_from(title, prompt, &image_rows())
 }
 
-fn choose_from(title: &str, prompt: &str, types: &[(&str, &str)]) -> Option<PathBuf> {
+fn choose_from<N: AsRef<str>, S: AsRef<str>>(
+    title: &str,
+    prompt: &str,
+    types: &[(N, S)],
+) -> Option<PathBuf> {
     // SAFETY: `show_dialog` is one linear pass of documented shell COM calls;
     // every pointer it hands the shell lives for the duration of its call (the
     // wide strings and the filter table are locals that outlive each use), every
@@ -402,10 +364,10 @@ fn owner_window() -> isize {
 /// `Ok(None)` is a CANCEL — the user's answer, and the reason this is not a bare
 /// `Result<PathBuf, _>`. `Err` is a genuine failure the caller turns into one
 /// warn line.
-unsafe fn show_dialog(
+unsafe fn show_dialog<N: AsRef<str>, S: AsRef<str>>(
     title: &str,
     prompt: &str,
-    types: &[(&str, &str)],
+    types: &[(N, S)],
     owner: isize,
 ) -> Result<Option<PathBuf>, StepError> {
     let _apartment = Apartment::enter()?;
@@ -490,7 +452,7 @@ mod tests {
     use super::{
         ALL_FILES, FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM,
         FOS_NODEREFERENCELINKS, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FilterSpecs,
-        IFileOpenDialogVtbl, IShellItemVtbl, dialog_options, is_cancelled,
+        IFileOpenDialogVtbl, IShellItemVtbl, dialog_options, image_rows, is_cancelled,
         path_from_nul_terminated,
     };
     use std::path::PathBuf;
@@ -628,6 +590,23 @@ mod tests {
                 read_row(&specs, i),
                 ((*name).to_string(), (*spec).to_string()),
                 "row {i}"
+            );
+        }
+    }
+
+    /// The wallpaper picker offers exactly what the wallpaper decoder reads
+    /// here: PNG and JPEG first-party, and what the imaging component's
+    /// decoders claim (BMP ships with every Windows).
+    #[test]
+    fn the_image_row_offers_what_the_decoders_read() {
+        let specs = FilterSpecs::new(&image_rows());
+        assert_eq!(specs.len(), 1, "one row");
+        let (name, spec) = read_row(&specs, 0);
+        assert_eq!(name, "Images");
+        for pattern in ["*.png", "*.jpg", "*.jpeg", "*.bmp"] {
+            assert!(
+                spec.split(';').any(|row| row == pattern),
+                "{pattern} in {spec}"
             );
         }
     }

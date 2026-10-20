@@ -11,7 +11,7 @@
 use std::collections::VecDeque;
 
 use crate::WindowId;
-use crate::restore::{RestoreBranch, RestoredTab, RestoredView, SplitKind};
+use crate::restore::{RestoreBranch, RestoredSplitTree, RestoredTab, RestoredView, SplitKind};
 use crate::tab_model::TabId;
 
 pub(crate) const CLOSED_VIEW_LIMIT: usize = 64;
@@ -147,6 +147,21 @@ impl<T> RecoveryLedger<T> {
         });
     }
 
+    /// Every record a reopen could still hand out at `now_ms`, oldest first,
+    /// with the first instant it no longer can.
+    fn live(&self, now_ms: u64) -> impl Iterator<Item = (&T, u64)> {
+        self.entries
+            .iter()
+            .filter(move |entry| now_ms.saturating_sub(entry.closed_at_ms) <= self.max_age_ms)
+            .map(|entry| {
+                let expires_ms = entry
+                    .closed_at_ms
+                    .saturating_add(self.max_age_ms)
+                    .saturating_add(1);
+                (&entry.value, expires_ms)
+            })
+    }
+
     pub(crate) fn prune(&mut self, now_ms: u64) {
         while self
             .entries
@@ -206,6 +221,45 @@ pub(crate) struct ClosedRecoveryLedgers {
     pub(crate) tabs: RecoveryLedger<ClosedTab>,
 }
 
+impl ClosedRecoveryLedgers {
+    /// The URI of every document view a reopen could still bring back at
+    /// `now_ms`, with the first instant its record no longer can. Each holds
+    /// its document in memory, so a reopen finds the very document, its undo
+    /// history with it (§5.10's "recovery records").
+    pub(crate) fn document_uris(&self, now_ms: u64) -> Vec<(&str, u64)> {
+        fn leaf_uri(view: &RestoredView) -> Option<&str> {
+            match view {
+                RestoredView::Native(native) => native.uri.as_deref(),
+                RestoredView::Terminal(_) | RestoredView::Placeholder(_) => None,
+            }
+        }
+        fn tree_uris<'a>(
+            tree: &'a RestoredSplitTree,
+            expires_ms: u64,
+            uris: &mut Vec<(&'a str, u64)>,
+        ) {
+            match tree {
+                RestoredSplitTree::Leaf { view } => {
+                    uris.extend(leaf_uri(view).map(|uri| (uri, expires_ms)));
+                }
+                RestoredSplitTree::Split { first, second, .. } => {
+                    tree_uris(first, expires_ms, uris);
+                    tree_uris(second, expires_ms, uris);
+                }
+            }
+        }
+        let mut uris: Vec<(&str, u64)> = self
+            .views
+            .live(now_ms)
+            .filter_map(|(closed, expires_ms)| leaf_uri(&closed.view).map(|uri| (uri, expires_ms)))
+            .collect();
+        for (closed, expires_ms) in self.tabs.live(now_ms) {
+            tree_uris(&closed.tab.root, expires_ms, &mut uris);
+        }
+        uris
+    }
+}
+
 impl Default for ClosedRecoveryLedgers {
     fn default() -> Self {
         Self {
@@ -240,6 +294,7 @@ mod tests {
             theme: None,
             agent: None,
             supervised: None,
+            lost: None,
             held: false,
             holds: Vec::new(),
         })

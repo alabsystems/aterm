@@ -143,15 +143,34 @@ fn now_secs() -> u64 {
 /// `restores`: how this launch's keeper recovery brought its screens back, when it
 /// recovered any (the crash restore's rungs), recorded on the row.
 pub(crate) fn record(launch: LaunchKind, restores: Option<Restores>) {
+    record_into(
+        crate::session_log_node::node_log(),
+        crate::logging::log_dir,
+        launch,
+        restores,
+    );
+}
+
+/// [`record`], reading the ledger in the directory `dir` names (on the
+/// census thread) and telling `node` how the previous run ended: the node
+/// log's `start prev_end=` (session log 5J-2), amended as soon as the class
+/// is known, whether or not the row then appends.
+fn record_into(
+    node: &'static crate::session_log_node::NodeLogHost,
+    dir: impl FnOnce() -> Option<PathBuf> + Send + 'static,
+    launch: LaunchKind,
+    restores: Option<Restores>,
+) {
     let spawned = crate::qos::spawn_lane_thread(
         "aterm-recovery-census",
         crate::qos::Role::Background,
         move || {
             // Nobody waits on the census: it reads files and appends one line.
-            let Some(dir) = crate::logging::log_dir() else {
+            let Some(dir) = dir() else {
                 return;
             };
             let mut row = census_row(&dir, &Me::current(), launch, now_secs(), &System);
+            node.note_prev_end(row.prev.class);
             row.restores = restores;
             let path = ledger_path(&dir);
             match append_row(&path, &row) {
@@ -670,6 +689,39 @@ mod tests {
             "crash-marker-{pid}-{}-app.log",
             u128::from(birth) * 1_000_000_000 + 7
         )
+    }
+
+    /// THE CENSUS PRODUCER of the node log (session log 5J-2, ruling T27):
+    /// the census thread tells the node log how the run before this launch
+    /// ended, read under the one-minute hang detector. A first launch (an
+    /// empty ledger) ended `none`; the row is appended after.
+    #[test]
+    fn the_census_thread_amends_the_node_logs_start() {
+        let s = Scratch::new("node-log");
+        let clock =
+            crate::session_log::Clock::reading(|| aterm_slog::Stamp::new(1_760_000_000_000, 5));
+        let node: &'static crate::session_log_node::NodeLogHost = Box::leak(Box::new(
+            crate::session_log_node::NodeLogHost::started(7, clock),
+        ));
+        let dir = s.0.path().to_path_buf();
+        record_into(node, move || Some(dir), LaunchKind::Cold, None);
+        let amended = aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the census's prev_end in the node log",
+            || {
+                node.lines()
+                    .into_iter()
+                    .find(|l| l.contains(" amend n start "))
+            },
+        );
+        assert!(
+            amended.starts_with("2 amend n start prev_end=none by=aterm src=aterm conf=exact "),
+            "{amended}"
+        );
+        // The row follows: the scratch dir outlives the thread's write.
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the census's row", || {
+            (read_rows(&ledger_path(s.0.path())).len() == 1).then_some(())
+        });
     }
 
     #[test]

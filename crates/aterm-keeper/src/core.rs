@@ -1690,13 +1690,19 @@ impl KeeperCore {
         )
     )]
     pub fn release(&mut self, conn: ConnId, rdev: Rdev) -> Vec<Out> {
-        // A claimant of the same process (pid and birth) is this connection's own claim: a window
-        // that closed a tab while its link was down registers on the new link only what it still
-        // holds, then sends that tab's RELEASE for a record only the dropped link claims.
+        // A claimant of the same process (pid and birth) on an older connection is this
+        // connection's own claim: a window that closed a tab while its link was down sends that
+        // tab's RELEASE on the new link for a record only the dropped link claims. A newer
+        // connection's claim is not: a link writes nothing on a connection once it moved to the
+        // next (ConnIds grow with each accept), so a RELEASE read late from an older one predates
+        // every claim of the newer, such as a new tab at the reused rdev after the link told that
+        // RELEASE again, and leaves it where it is, as a late REGISTER does.
         let peers = &self.peers;
         let me = peers.get(&conn).map(|p| (p.pid, p.birth));
         let mine = |c: &ConnId| {
-            *c == conn || me.is_some_and(|me| peers.get(c).is_some_and(|p| (p.pid, p.birth) == me))
+            *c == conn
+                || (*c < conn
+                    && me.is_some_and(|me| peers.get(c).is_some_and(|p| (p.pid, p.birth) == me)))
         };
         let allowed = self.records.get(&rdev).is_some_and(|rec| {
             rec.claimants.iter().any(mine) || rec.state == RecordState::Offered { to: conn }
@@ -2191,7 +2197,7 @@ impl KeeperCore {
         let mut orphaned_any = false;
         // Offers returned to Orphaned, here or at this connection's EOF: the
         // window died before it registered them. They owe a window only when
-        // it did not quit (a BYE, [`Self::bye`]).
+        // it did not quit (below).
         let mut returned_offers = peer.returned_offers;
         let mut last: Vec<Rdev> = Vec::new();
         for (rdev, rec) in &mut self.records {
@@ -2218,9 +2224,6 @@ impl KeeperCore {
         }
         if !peer.is_app() {
             return out;
-        }
-        if returned_offers && !peer.bye {
-            orphaned_any = true;
         }
         // Only this window's own update holds its masters: another window's PENDING names no
         // successor of these, and read as one it would hold a quit's masters for a successor
@@ -2254,11 +2257,29 @@ impl KeeperCore {
             });
         let mut held_for_fallen = false;
         // The marker is read once per death, after it (the process is gone:
-        // its exit path, if it ran, has already unlinked the marker).
-        let marker = match (&peer.marker, last.is_empty()) {
+        // its exit path, if it ran, has already unlinked the marker), when a
+        // verdict needs it: a master this was the last to claim, or an offer it
+        // returned with no BYE to say it quit.
+        let returned_unexplained = returned_offers && !peer.bye;
+        let marker = match (&peer.marker, last.is_empty() && !returned_unexplained) {
             (Some(m), false) => env.marker(peer.pid, m),
             _ => MarkerEvidence::Unknown,
         };
+        // The returned offers owe a window unless the process quit: its BYE ([`Self::bye`] marks
+        // every link of it), or a quit whose BYE was lost, which the classifier reads from the
+        // `exit(0)` and the marker its exit path removed. A clean quit leaves no orphan of its
+        // own, so another window's orphan never makes it a death that relaunches aterm.
+        if returned_unexplained
+            && classify_death(DeathEvidence {
+                successor_holds: false,
+                bye: false,
+                sends_bye: peer.caps & CAP_SENDS_BYE != 0,
+                status,
+                marker,
+            }) == Verdict::Crash
+        {
+            orphaned_any = true;
+        }
         // Whether this peer ended as a quit does, the successor aside: a hold it leaves keeps
         // this for its own judgement.
         let outgoing_clean = peer.bye || status.is_some_and(exited_zero);
@@ -2631,6 +2652,7 @@ mod tests {
     /// A world the tests describe directly.
     #[derive(Default)]
     struct World {
+        /// Who holds each master; an empty list is a scan that could not decide.
         held: BTreeMap<Rdev, Vec<u32>>,
         dead_shells: Vec<u32>,
         live_pids: Vec<u32>,
@@ -2644,8 +2666,9 @@ mod tests {
     impl World {
         fn answer(&self, rdev: Rdev) -> Holders {
             match self.held.get(&rdev) {
-                Some(p) if !p.is_empty() => Holders::Held(p.clone()),
-                _ => Holders::None,
+                Some(p) if p.is_empty() => Holders::Unknown,
+                Some(p) => Holders::Held(p.clone()),
+                None => Holders::None,
             }
         }
     }
@@ -2840,6 +2863,24 @@ mod tests {
         );
         assert_eq!(k.records()[&10].state, RecordState::Claimed);
         assert!(k.peers()[&2].relaunched);
+        // It lives on: 30 minutes after its HELLO (not its relaunch) the lane is idle and the
+        // streak resets.
+        k.tick(8 + 30 * 60_000 - 1, &mut w);
+        assert_eq!(
+            (k.relaunch_state(), k.brake().streak()),
+            (
+                RelaunchState::InFlight {
+                    since: 7,
+                    hello: Some((2, 8))
+                },
+                1
+            )
+        );
+        k.tick(8 + 30 * 60_000, &mut w);
+        assert_eq!(
+            (k.relaunch_state(), k.brake().streak()),
+            (RelaunchState::Idle, 0)
+        );
     }
 
     /// A crashed window's 200 masters are judged, and offered to the next boot HELLO, after one
@@ -3245,6 +3286,44 @@ mod tests {
         assert_eq!(k.release(2, 10), vec![Out::Close(10)]);
     }
 
+    /// A RELEASE the link told again on its new connection lands before the copy still unread on
+    /// the old one, and the window opens a tab at the freed rdev on the new link. The old copy,
+    /// read last, is stale: it was written before every frame of the newer link, so it cannot
+    /// end the new tab's custody (or a crash would hang that shell up instead of restoring it).
+    #[test]
+    fn a_stale_release_from_an_older_link_leaves_the_newer_links_claim() {
+        let mut k = KeeperCore::new(true);
+        let mut w = World::default();
+        window(&mut k, &mut w, 1, 500, 0);
+        k.register(1, hdr(10, 900), vec![], 10);
+        assert!(k.accept(2, 500, None));
+        k.hello(2, PeerClass::App, CAP_SENDS_BYE | CAP_LINK, 1, &mut w);
+        assert_eq!(
+            k.release(2, 10),
+            vec![Out::Close(10)],
+            "the replay ends the old link's claim"
+        );
+        k.register(2, hdr(10, 901), vec![], 10);
+        assert_eq!(
+            k.records()[&10].claimants,
+            vec![2],
+            "the new tab is claimed"
+        );
+        assert_eq!(
+            k.release(1, 10),
+            vec![Out::Refused {
+                conn: 1,
+                code: RefuseCode::NotClaimant,
+                rdev: 10
+            }]
+        );
+        assert_eq!(
+            k.records()[&10].claimants,
+            vec![2],
+            "the new tab stays in custody"
+        );
+    }
+
     #[test]
     fn a_release_keeps_the_claim_of_a_reused_pid() {
         let mut k = KeeperCore::new(true);
@@ -3361,10 +3440,10 @@ mod tests {
     }
 
     /// An orphan whose shell dies is closed at its leader's exit, without waiting for a HELLO, and
-    /// `status` no longer lists it.
+    /// `status` no longer lists it. With none left, the relaunch the crash made due is not made.
     #[test]
     fn an_orphan_whose_shell_dies_is_pruned_at_once() {
-        let mut k = KeeperCore::new(false);
+        let mut k = KeeperCore::new(true);
         let mut w = World::default();
         window(&mut k, &mut w, 1, 500, 0);
         k.register(1, hdr(10, 900), vec![], 10);
@@ -3390,6 +3469,8 @@ mod tests {
         w.dead_shells.push(901);
         assert_eq!(k.prune_dead_orphans(&mut w), vec![Out::Close(11)]);
         assert_eq!(k.records().len(), 0);
+        assert!(k.tick(5, &mut w).is_empty());
+        assert_eq!(k.relaunch_state(), RelaunchState::Idle);
     }
 
     /// Row 3's cross-check through the core: a window that named a held marker at HELLO and ended
@@ -3476,6 +3557,12 @@ mod tests {
             journal: None
         }));
         assert_eq!(k.brake().streak(), 0);
+        // …and lifts the lane's hold: its own crash is relaunched at once.
+        k.register(2, hdr(10, 900), vec![], 10);
+        w.live_pids.clear();
+        k.eof(2, 10_000_002, &mut w);
+        k.peer_exit(600, 9, 10_000_002, &mut w);
+        assert_eq!(k.tick(10_000_002, &mut w), vec![Out::Relaunch]);
     }
 
     /// A relaunched window that lives on (it hands its desk to an update's successor, or its link
@@ -3547,25 +3634,38 @@ mod tests {
         assert_eq!(k.orphan_count(), 1, "held for the next manual launch");
     }
 
+    /// The recipient of an offer crashes before it registers it: judged on its EOF and status, or
+    /// on its status alone once `DEATH_GRACE_MS` ran out (no EOF: a child kept its link open).
     #[test]
     fn an_offer_whose_recipient_dies_is_an_orphan_again() {
-        let mut k = KeeperCore::new(true);
-        let mut w = World::default();
-        window(&mut k, &mut w, 1, 500, 0);
-        k.register(1, hdr(10, 900), vec![], 10);
-        w.live_pids.clear();
-        k.eof(1, 0, &mut w);
-        k.peer_exit(500, 9, 0, &mut w);
-        window(&mut k, &mut w, 2, 600, 1);
-        assert_eq!(k.records()[&10].state, RecordState::Offered { to: 2 });
-        w.live_pids.clear();
-        k.eof(2, 2, &mut w);
-        k.peer_exit(600, 9, 2, &mut w);
-        assert_eq!(k.records()[&10].state, RecordState::Orphaned);
-        assert!(
-            matches!(k.relaunch_state(), RelaunchState::Due { .. }),
-            "a recipient that crashed before it registered still owes the orphan a window"
-        );
+        for eof_read in [true, false] {
+            let mut k = KeeperCore::new(true);
+            let mut w = World::default();
+            window(&mut k, &mut w, 1, 500, 0);
+            k.register(1, hdr(10, 900), vec![], 10);
+            w.live_pids.clear();
+            k.eof(1, 0, &mut w);
+            k.peer_exit(500, 9, 0, &mut w);
+            window(&mut k, &mut w, 2, 600, 1);
+            assert_eq!(k.records()[&10].state, RecordState::Offered { to: 2 });
+            w.live_pids.clear();
+            let mut outs = Vec::new();
+            if eof_read {
+                outs.extend(k.eof(2, 2, &mut w));
+            }
+            outs.extend(k.peer_exit(600, 9, 2, &mut w));
+            outs.extend(k.tick(2 + DEATH_GRACE_MS, &mut w));
+            assert_eq!(k.records()[&10].state, RecordState::Orphaned);
+            assert!(
+                outs.contains(&Out::WatchPid(900)),
+                "the orphan's leader is watched again (EOF read: {eof_read}): {outs:?}"
+            );
+            assert!(
+                outs.contains(&Out::Relaunch),
+                "a recipient that crashed before it registered still owes the orphan a window \
+                 (EOF read: {eof_read})"
+            );
+        }
     }
 
     /// An offer is made to a connection: when it drops while its window lives, the offer returns
@@ -3611,6 +3711,17 @@ mod tests {
             k.hello(3, PeerClass::App, CAP_SENDS_BYE | CAP_LINK, 3, &mut w),
             vec![Out::Welcome { conn: 3, offers: 0 }]
         );
+        // While a live process holds the master (the descriptor that OFFER carried), or the scan
+        // cannot tell, no one is offered it: two readers would split the shell's output.
+        for holders in [vec![20], Vec::new()] {
+            w.held.insert(10, holders);
+            assert_eq!(
+                k.adopt(3, &mut w),
+                vec![Out::Welcome { conn: 3, offers: 0 }]
+            );
+            assert_eq!(k.records()[&10].state, RecordState::Orphaned);
+        }
+        w.held.clear();
         let outs = k.adopt(3, &mut w);
         assert!(
             outs.contains(&Out::Offer {
@@ -3632,10 +3743,10 @@ mod tests {
                 "a window the person quit is never brought back"
             );
         }
-        assert!(
-            !matches!(k.relaunch_state(), RelaunchState::Due { .. }),
-            "{:?}",
-            k.relaunch_state()
+        assert_eq!(
+            k.relaunch_state(),
+            RelaunchState::Idle,
+            "the relaunched window quit: the lane is settled"
         );
     }
 
@@ -3724,6 +3835,93 @@ mod tests {
         assert_eq!(k.release(3, 10), refused(3), "another birth at the pid");
         assert_eq!(k.records()[&10].claimants, vec![1]);
     }
+
+    /// Window 500 crashes and leaves orphan 10; window 600 boots, and its admission connection,
+    /// offered 10, drops before 600's link registers it, so the offer goes back to Orphaned at
+    /// that EOF (`claimed_since`: the link registers it after). Window 700 crashes and leaves
+    /// orphan 20 while 600 lives. Then 600 ends with `exit(0)` and no BYE, its crash marker as
+    /// `marker_at_death` says. The relaunch lane after that end.
+    fn an_end_after_its_offer_went_back(
+        claimed_since: bool,
+        marker_at_death: MarkerEvidence,
+    ) -> RelaunchState {
+        let marker = MarkerRef {
+            nanos: 7,
+            dir: b"/logs".to_vec(),
+        };
+        let mut k = KeeperCore::new(true);
+        let mut w = World::default();
+        window(&mut k, &mut w, 1, 500, 0);
+        k.register(1, hdr(10, 900), vec![], 10);
+        w.live_pids.retain(|p| *p != 500);
+        k.eof(1, 1, &mut w);
+        k.peer_exit(500, 9, 1, &mut w);
+        w.markers.insert(600, MarkerEvidence::Held);
+        window(&mut k, &mut w, 2, 600, 2);
+        assert!(k.name_marker(2, marker.clone(), &mut w));
+        assert_eq!(k.records()[&10].state, RecordState::Offered { to: 2 });
+        assert!(k.accept(3, 600, None));
+        k.hello(3, PeerClass::App, CAP_SENDS_BYE | CAP_LINK, 3, &mut w);
+        assert!(k.name_marker(3, marker, &mut w));
+        k.eof(2, 4, &mut w);
+        assert_eq!(k.records()[&10].state, RecordState::Orphaned);
+        if claimed_since {
+            assert_eq!(
+                k.register(3, hdr(10, 900), vec![], 10),
+                vec![Out::DropDuplicate(10)]
+            );
+        }
+        window(&mut k, &mut w, 4, 700, 5);
+        k.register(4, hdr(20, 920), vec![], 20);
+        assert!(k.accept(5, 800, None));
+        k.hello(5, PeerClass::Status, 0, 5, &mut w);
+        w.live_pids.retain(|p| *p != 700);
+        k.eof(4, 6, &mut w);
+        let told: Vec<(ConnId, u16)> = k
+            .peer_exit(700, 9, 6, &mut w)
+            .iter()
+            .filter_map(|o| match o {
+                Out::Orphans { conn, n } => Some((*conn, *n)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            told,
+            vec![(3, if claimed_since { 1 } else { 2 })],
+            "the live link hears how many orphans are on offer; the dropped connection and the \
+             status client do not"
+        );
+        k.tick(7, &mut w);
+        assert_eq!(k.relaunch_state(), RelaunchState::Idle, "window 600 lives");
+        w.markers.insert(600, marker_at_death);
+        k.eof(3, 8, &mut w);
+        w.live_pids.retain(|p| *p != 600);
+        k.peer_exit(600, 0, 8, &mut w);
+        k.relaunch_state()
+    }
+
+    /// A quit whose BYE was lost (`exit(0)` with the marker its exit path removed) is a quit for
+    /// the offers its connection returned too: they owe no window, so another window's orphan
+    /// never relaunches aterm after the person quit it, whether the link claimed the returned
+    /// master since or not. Control: an `exit(0)` that skipped the exit path (the marker left,
+    /// its lock free) is a crash, and its returned offer still asks the brake.
+    #[test]
+    fn a_quit_whose_bye_was_lost_owes_its_returned_offers_nothing() {
+        use MarkerEvidence::{Dead, Released};
+        for claimed_since in [false, true] {
+            assert_eq!(
+                an_end_after_its_offer_went_back(claimed_since, Released),
+                RelaunchState::Idle,
+                "a quit relaunches nothing (claimed since: {claimed_since})"
+            );
+        }
+        assert_eq!(
+            an_end_after_its_offer_went_back(false, Dead),
+            RelaunchState::Due { at: 8 },
+            "a crash's returned offer owes a window, at once: with no relaunch yet, the crash \
+             beside a live window spent no streak"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3753,53 +3951,88 @@ mod late_hello_tests {
     }
 
     /// A build that boots slower than HELLO_DEADLINE_MS and crashes after its HELLO: each late
-    /// HELLO is still that relaunch answering, never a manual launch that resets the brake.
+    /// HELLO (within §6.2's five minutes of `open`) is still that relaunch answering, never a
+    /// manual launch that resets the brake, and a death minutes after its relaunch still spends
+    /// the streak. Controls: a HELLO five minutes after `open` is a manual launch, and windows
+    /// that each die HEALTHY_MS after their relaunch are relaunched every time.
     #[test]
     fn a_slow_booting_crash_loop_is_still_braked() {
-        let mut k = KeeperCore::new(true);
-        let mut w = Alive(vec![500]);
-        assert!(k.accept(1, 500, None));
-        k.hello(1, PeerClass::App, CAP_SENDS_BYE, 0, &mut w);
-        k.register(1, hdr(10), vec![], 10);
-        w.0.clear();
-        k.eof(1, 0, &mut w);
-        k.peer_exit(500, 9, 0, &mut w);
-        let mut now = 0u64;
-        let mut relaunches = 0;
-        // Far more cycles than the streak allows.
-        for conn in 2u64..22 {
-            // Run the clock until the lane relaunches (or holds for good).
-            let mut fired = false;
-            for _ in 0..200 {
-                if k.tick(now, &mut w).contains(&Out::Relaunch) {
-                    fired = true;
+        const MIN: u64 = 60_000;
+        // The HELLO this long after `open`, the crash this long after the HELLO, whether that
+        // HELLO is the relaunch answering, and whether the brake holds.
+        for (boots_in, lives_for, answering, braked) in [
+            (20_000, 5_000, true, true),
+            (4 * MIN, 5_000, true, true),
+            (5 * MIN, 5_000, false, false),
+            (20_000, 25 * MIN, true, true),
+            // Dead exactly 30 minutes after `open`: 29 min 40 s after its HELLO.
+            (20_000, 30 * MIN - 20_000, true, false),
+        ] {
+            let row = format!("HELLO {boots_in} ms after open, crash {lives_for} ms after it");
+            let mut k = KeeperCore::new(true);
+            let mut w = Alive(vec![500]);
+            assert!(k.accept(1, 500, None));
+            k.hello(1, PeerClass::App, CAP_SENDS_BYE, 0, &mut w);
+            k.register(1, hdr(10), vec![], 10);
+            w.0.clear();
+            k.eof(1, 0, &mut w);
+            k.peer_exit(500, 9, 0, &mut w);
+            let mut now = 0u64;
+            let mut relaunches = 0;
+            // Far more cycles than the streak allows.
+            let conns = 2u64..22;
+            let cycles = conns.end - conns.start;
+            for conn in conns {
+                // Run the clock until the lane relaunches (or holds for good).
+                let mut fired = false;
+                for _ in 0..200 {
+                    if k.tick(now, &mut w).contains(&Out::Relaunch) {
+                        fired = true;
+                        break;
+                    }
+                    now += 1_000;
+                }
+                if !fired {
                     break;
                 }
-                now += 1_000;
+                let opened = now;
+                relaunches += 1;
+                // The window says HELLO after the 15 s deadline.
+                now += boots_in;
+                k.tick(now, &mut w);
+                let pid = 600 + u32::try_from(conn).expect("small");
+                assert!(k.accept(conn, pid, None));
+                w.0.push(pid);
+                k.hello(conn, PeerClass::App, CAP_SENDS_BYE, now, &mut w);
+                let answered = RelaunchState::InFlight {
+                    since: opened,
+                    hello: Some((conn, now)),
+                };
+                assert_eq!(
+                    k.relaunch_state(),
+                    if answering {
+                        answered
+                    } else {
+                        RelaunchState::Idle
+                    },
+                    "{row}: the HELLO is the relaunch answering: {answering}"
+                );
+                k.register(conn, hdr(10), vec![], 10);
+                now += lives_for;
+                w.0.clear();
+                k.eof(conn, now, &mut w);
+                k.peer_exit(pid, 9, now, &mut w);
             }
-            if !fired {
-                break;
+            if braked {
+                assert!(
+                    relaunches <= u64::from(MAX_STREAK) + 1,
+                    "{row}: relaunched {relaunches} times: the brake never held"
+                );
+            } else {
+                assert_eq!(relaunches, cycles, "{row}: the brake is reset each time");
             }
-            relaunches += 1;
-            // The window says HELLO 20 s later: after the 15 s deadline.
-            now += 20_000;
-            k.tick(now, &mut w);
-            let pid = 600 + u32::try_from(conn).expect("small");
-            assert!(k.accept(conn, pid, None));
-            w.0.push(pid);
-            k.hello(conn, PeerClass::App, CAP_SENDS_BYE, now, &mut w);
-            k.register(conn, hdr(10), vec![], 10);
-            // It crashes 5 s after its HELLO.
-            now += 5_000;
-            w.0.clear();
-            k.eof(conn, now, &mut w);
-            k.peer_exit(pid, 9, now, &mut w);
+            assert_eq!(k.orphan_count(), 1, "{row}: the orphan is still kept");
         }
-        assert!(
-            relaunches <= MAX_STREAK as usize + 1,
-            "relaunched {relaunches} times: the brake never held"
-        );
-        assert_eq!(k.orphan_count(), 1, "the orphan is still kept");
     }
 }
 

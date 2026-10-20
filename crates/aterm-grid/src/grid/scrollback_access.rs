@@ -224,8 +224,28 @@ impl Grid {
     /// reads them directly instead of round-tripping through text + RLE. It
     /// declines whenever it cannot prove the same result; `history_line_rev`
     /// answers the declined cases and lines beyond the ring.
+    ///
+    /// An early-wrap hole closing the row is painted as the print path painted
+    /// it, from the wide glyph that opens the row after
+    /// ([`MaterializedRow::paint_hole`](scroll_materialize::MaterializedRow::paint_hole)):
+    /// the line left the hole out, as it is no text.
     #[must_use]
     pub fn materialize_scrollback_row_full(
+        &self,
+        rev_idx: usize,
+        cols: u16,
+    ) -> Option<scroll_materialize::MaterializedRow> {
+        let mut mat = self.materialize_history_row(rev_idx, cols)?;
+        if mat.hole
+            && let Some((glyph, bg_rgb)) = self.history_wrap_opening(rev_idx, cols)
+        {
+            mat.paint_hole(glyph, bg_rgb);
+        }
+        Some(mat)
+    }
+
+    /// History row `rev_idx` as its line draws it, with no hole painted.
+    fn materialize_history_row(
         &self,
         rev_idx: usize,
         cols: u16,
@@ -239,34 +259,34 @@ impl Grid {
         Some(scroll_materialize::materialize_from_line(&line, cols))
     }
 
-    /// Where each cell of history line `idx` (0 = oldest) lies in `text`, when
-    /// the ring tier draws the row from its own cells: `push(bytes, col, width,
-    /// count)` in column order as
-    /// [`stored_line_cells`](scroll_materialize::stored_line_cells) yields them,
-    /// then `true`. `text` is the line's text as read
-    /// ([`history_line_rev`](Self::history_line_rev) or the dense walk, bounded).
-    ///
-    /// `false` for a line past the ring or a ring row the fast path declines:
-    /// `stored_line_cells` draws that row and is the walk to read it with, and
-    /// the cells pushed so far are not the row's. Word selection, copy and find
-    /// ask here first because the ring tier's cells keep apart what the stored
-    /// walk joins (two flag halves drawn out of order stay two cells).
-    pub fn ring_history_cells(
+    /// The wide glyph that opens the row after history row `rev_idx`, with its
+    /// truecolour background, when that row continues it: the glyph whose
+    /// early wrap left a hole at the end of `rev_idx`. The newest line's
+    /// continuation is the screen's top row.
+    fn history_wrap_opening(
         &self,
-        idx: usize,
-        text: &str,
-        push: impl FnMut(std::ops::Range<usize>, u16, u16, u16),
-    ) -> bool {
-        let Some(rev_idx) = idx
-            .checked_add(1)
-            .and_then(|n| self.storage.scrollback_lines().checked_sub(n))
-        else {
-            return false;
+        rev_idx: usize,
+        cols: u16,
+    ) -> Option<(crate::Cell, Option<[u8; 3]>)> {
+        let Some(newer) = rev_idx.checked_sub(1) else {
+            let glyph = super::scroll_fill::wrap_opening(self.storage.row_at_screen(0)?)?;
+            return Some((glyph, self.storage.extras.bg_rgb_for(0, 0)));
         };
-        let Some((row, extras)) = self.ring_history_row_at_rev(rev_idx) else {
-            return false;
-        };
-        scroll_materialize::ring_row_cells(row, extras, self.cols(), text, push)
+        if let Some((row, extras)) = self.ring_history_row_at_rev(newer) {
+            let glyph = super::scroll_fill::wrap_opening(row)?;
+            let bg_rgb = extras.and_then(|extras| {
+                extras
+                    .rgb_bg
+                    .iter()
+                    .find_map(|&(col, rgb)| (col == 0).then_some(rgb))
+            });
+            return Some((glyph, bg_rgb));
+        }
+        let line = self.history_line_rev(newer)?;
+        let next = scroll_materialize::materialize_from_line(&line, cols);
+        let glyph = *next.cells.first()?;
+        (next.is_wrapped() && glyph.is_wide())
+            .then(|| (glyph, next.get_extra(0).and_then(crate::CellExtra::bg_rgb)))
     }
 
     /// Total history lines; same as [`Self::scrollback_lines`].

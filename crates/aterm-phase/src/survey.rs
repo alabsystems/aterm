@@ -30,7 +30,13 @@
 //! turn read idle (five boxes on the plugin and memory cards, `4: Unsure` among them,
 //! wrap the same way). The options are read as that one row of boxes
 //! ([`options_line`], [`crate::wrap::rejoined_cells`]) and the question as the line Ink
-//! wrapped ([`crate::wrap`]): one card, its kind named by its whole question.
+//! wrapped ([`crate::wrap`]): one card, its kind named by its whole question. Each box
+//! is `(columns - 2) / n` wide there, its edges rounded half up (Yoga's rounding; held
+//! to the three captures by the tests' `rating_card`), so under 24 columns (under 30 on a
+//! five-box card) the FIRST box is too narrow for `1: Bad` too: its row opens `  1:` and
+//! spaces, and the row under it opens at column two (`  Bad  Fine  Good smiss` at 23), no
+//! hint against the right edge. The card is found from the lowest row above the composer
+//! that is not parked, as an options row or one of the rows its boxes wrapped onto.
 
 use crate::phase::{
     composer_frame, is_against_right_edge, is_glyph_row, is_rule, is_transcript_row,
@@ -127,13 +133,11 @@ const OPTION_ROWS: usize = 4;
 
 /// The cells the options' keys start at on the options' first row — `1:` at column 2
 /// first, then each `<digit>:` after it, whatever ran into it (`  1: Bad2:    3:` at 26
-/// columns): the columns of the boxes Ink lays the options out in. `None` when the row
-/// does not open `  1: ` two columns in.
+/// columns, `  1:   2:    3:   0: Di` at 23, where the first box is too narrow for `1:
+/// Bad`): the columns of the boxes Ink lays the options out in. `None` when the row
+/// does not open `  1:` two columns in.
 fn option_keys(row: &str) -> Option<Vec<usize>> {
-    let rest = row.strip_prefix("  1:")?;
-    if rest.starts_with(' ') && rest[1..].starts_with(' ') {
-        return None;
-    }
+    row.strip_prefix("  1:")?;
     let chars: Vec<char> = row.chars().collect();
     let mut starts = Vec::new();
     let mut cell = 0;
@@ -194,22 +198,27 @@ pub fn survey_block(rows: &[String]) -> Option<SurveyBlock> {
     let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
     // Walking up from the rule: the options' first row, under which every row down to the
     // rule is the options' own or parked. A box's wrapped row is passed over as a parked
-    // hint: it ends against the pane's right edge, for the last box's label (`0:
-    // Dismiss`) is the longest, so the boxes shrink it first and it wraps onto every row
-    // any box does (`Dismiss` alone at 34 and 40 columns, `Fine  Good  miss` at 26).
-    let (first, options) = (1..frame.top).rev().find_map(|i| {
-        if let Some(last) = options_line(rows, i, frame.top, width)
-            && rows[last + 1..frame.top]
-                .iter()
-                .all(|r| is_parked(r, width))
-        {
-            Some(Some((i, last)))
-        } else if is_parked(&rows[i], width) {
-            None
-        } else {
-            Some(None)
-        }
-    })??;
+    // hint where it ends against the pane's right edge, as the last box's label (`0:
+    // Dismiss`), the longest, wraps onto every row any box does (`Dismiss` alone at 34
+    // and 40 columns, `Fine  Good  miss` at 26). Where the FIRST box wraps too (`1:` over
+    // `Bad`: the session card under 24 columns, a five-box card under 30) its row opens
+    // at column two (`  Bad  Fine  Good smiss`) and is no hint: the lowest row that is
+    // not parked is then an options row or one of the [`OPTION_ROWS`] its line takes.
+    let parked_under = |last: usize| {
+        rows[last + 1..frame.top]
+            .iter()
+            .all(|r| is_parked(r, width))
+    };
+    let low = (1..frame.top)
+        .rev()
+        .find(|&i| !is_parked(&rows[i], width))?;
+    let (first, options) = (low.saturating_sub(OPTION_ROWS - 1)..=low)
+        .rev()
+        .find_map(|i| {
+            options_line(rows, i, frame.top, width)
+                .filter(|&last| last >= low && parked_under(last))
+                .map(|last| (i, last))
+        })?;
     let head = (first.saturating_sub(MAX_ABOVE_OPTIONS)..first)
         .rev()
         .find_map(|i| {
@@ -1210,5 +1219,175 @@ mod tests {
             })
             .collect();
         assert!(survey_block(&off).is_none(), "{off:#?}");
+    }
+    /// Claude Code's rating card as Ink lays it out `width` columns wide (2.1.300's
+    /// `PD`). SYNTHETIC: `⏺ Done.` and a blank over the card, the composer's frame
+    /// under it; the question after `● ` and each `extra` row at column two, wrapped as
+    /// Ink wraps a line (`wrap-ansi`, `hard`: greedily at single spaces, a word longer
+    /// than its room broken where the row is full); the options a row of boxes ten cells
+    /// wide after the two-column margin, shrunk alike where the pane is narrower (each
+    /// `(width - 2) / n` wide, its left and right edges rounded half up, as Yoga rounds a
+    /// box), each label wrapped the same way inside its own box. Held to the three
+    /// measured captures (26, 34 and 40 columns) in
+    /// `the_rating_card_layout_is_the_measured_one`.
+    fn rating_card(question: &str, extra: &[&str], labels: &[&str], width: usize) -> Vec<String> {
+        fn wrap(text: &str, cols: usize) -> Vec<String> {
+            let mut rows = vec![String::new()];
+            for (k, word) in text.split(' ').enumerate() {
+                let mut len = rows.last().map_or(0, |r| r.chars().count());
+                if k > 0 && len > 0 {
+                    rows.last_mut().expect("a row").push(' ');
+                    len += 1;
+                }
+                let n = word.chars().count();
+                if n > cols {
+                    // `wrap-ansi`'s hard break: on this row unless starting on the
+                    // next one breaks the word fewer times.
+                    let here = 1 + (n + len).saturating_sub(cols + 1) / cols;
+                    let next = (n - 1) / cols;
+                    if next < here {
+                        rows.push(String::new());
+                    }
+                    for c in word.chars() {
+                        if rows.last().is_some_and(|r| r.chars().count() >= cols) {
+                            rows.push(String::new());
+                        }
+                        rows.last_mut().expect("a row").push(c);
+                    }
+                } else {
+                    if len + n > cols && len > 0 {
+                        rows.push(String::new());
+                    }
+                    rows.last_mut().expect("a row").push_str(word);
+                }
+            }
+            rows.iter().map(|r| r.trim_end().to_string()).collect()
+        }
+        let mut out = vec!["⏺ Done.".to_string(), String::new()];
+        for (k, row) in wrap(question, width - 2).iter().enumerate() {
+            out.push(format!("{}{row}", if k == 0 { "● " } else { "  " }));
+        }
+        for row in extra.iter().flat_map(|e| wrap(e, width - 2)) {
+            out.push(format!("  {row}"));
+        }
+        let n = labels.len();
+        let each = if width - 2 >= 10 * n {
+            10.0
+        } else {
+            (width - 2) as f64 / n as f64
+        };
+        // Half up: Yoga's rounding of a box's edge.
+        let edge = |k: usize| (2.0 + k as f64 * each + 0.5).floor() as usize;
+        let boxes: Vec<(usize, Vec<String>)> = labels
+            .iter()
+            .enumerate()
+            .map(|(k, l)| (edge(k), wrap(l, edge(k + 1) - edge(k))))
+            .collect();
+        let height = boxes.iter().map(|(_, b)| b.len()).max().unwrap_or(0);
+        for r in 0..height {
+            let mut row: Vec<char> = vec![' '; width];
+            for (left, b) in &boxes {
+                for (j, c) in b.get(r).map_or("", String::as_str).chars().enumerate() {
+                    row[left + j] = c;
+                }
+            }
+            out.push(row.iter().collect::<String>().trim_end().to_string());
+        }
+        out.push(String::new());
+        out.extend(r(&[
+            &"─".repeat(width),
+            "❯",
+            &"─".repeat(width),
+            "  ⏵⏵ auto mode on",
+        ]));
+        out
+    }
+
+    const SESSION_QUESTION: &str = "How is Claude doing this session? (optional)";
+    const SESSION_LABELS: [&str; 4] = ["1: Bad", "2: Fine", "3: Good", "0: Dismiss"];
+    const PLUGIN_QUESTION: &str = "How helpful has the gh plugin been? (optional)";
+    const PLUGIN_USED: &str = "Used this session: the skill, the command";
+    const PLUGIN_LABELS: [&str; 5] = ["1: Bad", "2: Fine", "3: Good", "4: Unsure", "0: Dismiss"];
+
+    /// [`rating_card`] draws the session card's question and options exactly as Claude
+    /// Code 2.1.300 drew them at 26, 34 and 40 columns.
+    #[test]
+    fn the_rating_card_layout_is_the_measured_one() {
+        use crate::prompt::fixtures::{
+            SURVEY_SESSION_26_2_1_300, SURVEY_SESSION_34_2_1_300, SURVEY_SESSION_40_2_1_300,
+            screen as fixture,
+        };
+        for (width, text) in [
+            (26, SURVEY_SESSION_26_2_1_300),
+            (34, SURVEY_SESSION_34_2_1_300),
+            (40, SURVEY_SESSION_40_2_1_300),
+        ] {
+            let measured = fixture(text);
+            let head = measured.iter().position(|x| x.starts_with('●')).expect("●");
+            let card = |rows: &[String]| -> Vec<String> {
+                rows.iter().take_while(|x| !x.is_empty()).cloned().collect()
+            };
+            let drawn = rating_card(SESSION_QUESTION, &[], &SESSION_LABELS, width);
+            let at = drawn.iter().position(|x| x.starts_with('●')).expect("●");
+            assert_eq!(card(&drawn[at..]), card(&measured[head..]), "{width}");
+        }
+    }
+
+    /// ATERM-KI-1016-1, "Dialogs in narrow panes": where Ink shrinks the card's FIRST box
+    /// under its label (`1:` over `Bad`: the session card under 24 columns, the plugin
+    /// and memory cards' five boxes under 30), the options' first row opens `  1:` and
+    /// spaces, and the row under it opens at column two (`  Bad  Fine  Good smiss`) —
+    /// neither parked nor an options row. Read so, no card was open: its rows were the
+    /// worker's last words, and the continue policy typed into the standing card. Every
+    /// width from 16 to 60 now reads the card, its kind by its question, its options'
+    /// last row the card's, the worker's words its last said; it is withheld from a press
+    /// only where its head row is too short to guard.
+    #[test]
+    fn a_rating_card_whose_first_box_wraps_is_the_card() {
+        for width in 16..=60 {
+            for (question, extra, labels, kind) in [
+                (
+                    SESSION_QUESTION,
+                    &[][..],
+                    &SESSION_LABELS[..],
+                    SurveyKind::Session,
+                ),
+                (
+                    PLUGIN_QUESTION,
+                    &[PLUGIN_USED][..],
+                    &PLUGIN_LABELS[..],
+                    SurveyKind::Plugin,
+                ),
+            ] {
+                let rows = rating_card(question, extra, labels, width);
+                let block =
+                    survey_block(&rows).unwrap_or_else(|| panic!("{width}: the card: {rows:#?}"));
+                assert_eq!(block.kind, kind, "{width}");
+                assert_eq!(rows[block.head], rows[2], "{width}");
+                assert!(rows[block.options + 1].is_empty(), "{width}: {rows:#?}");
+                // Pressed wherever its head row fences a press: under 18 columns the
+                // plugin card's is `● How helpful`, two words, no guard.
+                assert_eq!(
+                    block.withheld().is_some(),
+                    block.guard.is_empty(),
+                    "{width}"
+                );
+                assert!(survey_open(&rows), "{width}");
+                assert_eq!(worker_phase(&rows), Phase::Idle, "{width}");
+                assert_eq!(last_said_row(&rows), Some("⏺ Done."), "{width}");
+            }
+        }
+        // NEGATIVE CONTROLS: the card's boxes with no `0: Dismiss` in the last, and the
+        // worker's own words under the `  1:` row, are no card.
+        let rows = rating_card(SESSION_QUESTION, &[], &SESSION_LABELS, 23);
+        let cut: Vec<String> = rows
+            .iter()
+            .map(|x| x.replace("smiss", "     ").trim_end().to_string())
+            .collect();
+        assert!(survey_block(&cut).is_none(), "{cut:#?}");
+        let first = rows.iter().position(|x| x.starts_with("  1:")).expect("1:");
+        let mut said = rows.clone();
+        said[first + 1] = "  but the build is red".to_string();
+        assert!(survey_block(&said).is_none(), "{said:#?}");
     }
 }

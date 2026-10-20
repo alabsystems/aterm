@@ -1570,7 +1570,7 @@ impl NamedKey {
     /// # Examples
     ///
     /// ```
-    /// use winit::keyboard::NamedKey;
+    /// use aterm_window::keyboard::NamedKey;
     ///
     /// assert_eq!(NamedKey::Enter.to_text(), Some("\r"));
     /// assert_eq!(NamedKey::F20.to_text(), None);
@@ -1593,7 +1593,7 @@ impl Key {
     /// # Examples
     ///
     /// ```
-    /// use winit::keyboard::{Key, NamedKey};
+    /// use aterm_window::keyboard::{Key, NamedKey};
     ///
     /// assert_eq!(Key::Character("a".into()).to_text(), Some("a"));
     /// assert_eq!(Key::Named(NamedKey::Enter).to_text(), Some("\r"));

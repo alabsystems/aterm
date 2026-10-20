@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 
+use serde::de::value::{KeyText, TextKeyDeserializer};
 use serde::de::{self, IntoDeserializer as _, Visitor};
 
 use crate::error::{Error, Result};
@@ -787,7 +788,7 @@ impl<'de> de::MapAccess<'de> for MapAccess<'_, 'de> {
         if self.de.peek() != Some(b'"') {
             return Err(self.de.err("expected an object key"));
         }
-        seed.deserialize(KeyDeserializer { de: self.de }).map(Some)
+        seed.deserialize(self.de.key()?).map(Some)
     }
 
     fn next_value_seed<V: de::DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value> {
@@ -796,19 +797,36 @@ impl<'de> de::MapAccess<'de> for MapAccess<'_, 'de> {
     }
 }
 
-/// Object keys are always JSON strings, so the key deserializer is the string
-/// parser and nothing else — a numeric key type still arrives as text and is
-/// re-parsed by `serde`'s own integer-from-string handling.
-struct KeyDeserializer<'a, 'de> {
-    de: &'a mut Deserializer<'de>,
+impl<'de> Deserializer<'de> {
+    /// The object key or variant name at the cursor, ready for its seed.
+    fn key(&mut self) -> Result<TextKeyDeserializer<Key<'de>>> {
+        self.expect(b'"', "an object key")?;
+        let text = self.parse_string_body()?;
+        Ok(TextKeyDeserializer::new(Key { text }))
+    }
 }
 
-impl<'de> de::Deserializer<'de> for KeyDeserializer<'_, 'de> {
+/// An object key's text. Object keys are always JSON strings, so a key type
+/// that is not a string (an integer, a `bool`, a newtype or `Option` over one)
+/// is read through [`TextKeyDeserializer`], which reads it back from exactly
+/// the text the serializer spells it with (`"7"`, `"-3"`, `"true"`) and from
+/// no other: `"007"`, `"+7"`, `"-0"` and `"True"` reach the visitor as the
+/// strings they are, which it refuses.
+struct Key<'de> {
+    text: Cow<'de, str>,
+}
+
+impl KeyText for Key<'_> {
+    fn key_text(&self) -> Option<&str> {
+        Some(&self.text)
+    }
+}
+
+impl<'de> de::Deserializer<'de> for Key<'de> {
     type Error = Error;
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        self.de.expect(b'"', "an object key")?;
-        match self.de.parse_string_body()? {
+        match self.text {
             Cow::Borrowed(text) => visitor.visit_borrowed_str(text),
             Cow::Owned(text) => visitor.visit_string(text),
         }
@@ -820,9 +838,7 @@ impl<'de> de::Deserializer<'de> for KeyDeserializer<'_, 'de> {
         _variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value> {
-        self.de.expect(b'"', "an object key")?;
-        let name = self.de.parse_string_body()?;
-        visitor.visit_enum(name.into_deserializer())
+        visitor.visit_enum(self.text.into_deserializer())
     }
 
     serde::forward_to_deserialize_any! {
@@ -845,7 +861,7 @@ impl<'de> de::EnumAccess<'de> for EnumAccess<'_, 'de> {
         if self.de.peek() != Some(b'"') {
             return Err(self.de.err("expected an enum variant name"));
         }
-        let value = seed.deserialize(KeyDeserializer { de: self.de })?;
+        let value = seed.deserialize(self.de.key()?)?;
         self.de.expect(b':', "`:` after the enum variant name")?;
         Ok((value, self))
     }

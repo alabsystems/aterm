@@ -40,6 +40,15 @@
 //! `OnceLock` the UI thread's own first use would block on) is NOT demoted
 //! below [`Role::Responsive`], because a descheduled lock holder at a lower
 //! class is a priority inversion — the one hazard a QoS port can introduce.
+//!
+//! NO WORK INTERVAL (LAG-12, 2026-10-19). No role here, and no `os_workgroup`
+//! interval either, lifts a spawn out of the idle slow clock. An audio interval
+//! speeds the threads inside it but cannot hold the shell, another process,
+//! whose first prompt came no sooner with it in aterm's own coalition (44.1
+//! against 44.2 ms) and 3.7-5.3 ms later inside an agent's. A member thread
+//! with no open interval runs slower than a plain one, and control lanes inside
+//! one doubled a spawn's reply under load. The measurements are in
+//! `docs/DESIGN-warm-spare-2026-10-16.md` §16 D6.
 
 /// What a thread's work is worth relative to the human at the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -468,7 +477,8 @@ pub(crate) fn slice_of_self() -> Option<(u64, u64)> {
 //
 // Measured 2026-09-15 on macOS: a thread at UTILITY (`ps` pri 20) or BACKGROUND
 // (pri 4) still starts its child at pri 31, the default band. That is the band
-// the user's shell and the program being typed into run in. So the `Background`
+// the programs the user's shell starts run in (the shell itself runs above it,
+// in the UI tier: `aterm_pty`'s `SHELL_ROLE`). So the `Background`
 // workers that launch `atpkg update`, a package verb or a login-shell PATH probe
 // handed that work straight back to the scheduler
 // as an equal of the foreground TUI: the thread yielded, and the process doing
@@ -539,6 +549,30 @@ pub(crate) fn command(
 /// lag while an update pass verifies a snapshot.
 pub(crate) fn atpkg_command(atpkg: impl AsRef<std::path::Path>) -> aterm_uds::spawnfd::Command {
     command(Role::Background, atpkg)
+}
+
+/// The package lane's pass child: [`atpkg_command`], except for the FIRST RUN a person
+/// waits on (`waited`: the store's first install of the ALab toolset still ahead,
+/// `crate::pass_is_waited_on`): told to wait for the toolset, with stubs on PATH blocking
+/// until it lands. That pass starts at the default band ([`Role::Responsive`], a bare
+/// spawn), an equal of the program being typed into, and so of whatever else keeps a fresh
+/// Mac busy. Measured on a contended
+/// first launch (14 spinners and a disk copy at the default band, 2026-10-17, n=4 each):
+/// clamped, the Trust toolchain landed at 276 s and the pass ended at 357 s; unclamped at
+/// 25 s and 31 s. A shell's typing echo during it rose 0.06 ms at p95 (0.16 to 0.22 ms)
+/// and fell at p99 (1.60 to 0.62 ms). Every routine pass stays clamped.
+pub(crate) fn atpkg_pass_command(
+    atpkg: impl AsRef<std::path::Path>,
+    waited: bool,
+) -> aterm_uds::spawnfd::Command {
+    command(
+        if waited {
+            Role::Responsive
+        } else {
+            Role::Background
+        },
+        atpkg,
+    )
 }
 
 /// [`command`] over an explicit launcher, so the wrapping decision is testable on

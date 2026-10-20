@@ -99,8 +99,10 @@ fn an_older_successor_misses_a_split_csi_over_queued_output() {
 
     set_master(&mut app, 0, -1);
     drop(app);
-    aterm_pty::close_fd(slave);
+    // The master first: a slave closed over output its master never read
+    // waits out the tty's drain (0.6 s on macOS).
     aterm_pty::close_fd(master);
+    aterm_pty::close_fd(slave);
 }
 
 fn set_master(app: &mut crate::App, id: u64, master: i32) {
@@ -175,8 +177,10 @@ fn a_parser_parked_mid_sequence_over_queued_output_misses_the_park() {
 
     set_master(&mut app, 0, -1);
     drop(app);
-    aterm_pty::close_fd(slave);
+    // The master first: a slave closed over output its master never read
+    // waits out the tty's drain (0.6 s on macOS).
     aterm_pty::close_fd(master);
+    aterm_pty::close_fd(slave);
 }
 
 /// A carry that would only swallow the queued tail is a miss: an OSC over the 4 KiB cap or a
@@ -519,6 +523,9 @@ fn an_exited_held_pane_is_not_handed_and_does_not_hold_the_park() {
     app.hold = true;
     let (exited_master, exited_slave) = openpty();
     write_all(exited_slave, b"build finished\r\n");
+    // Nonblocking, so the close flushes the unread output at once instead of
+    // waiting out the tty's drain (0.6 s on macOS) to flush it.
+    aterm_pty::set_nonblocking(exited_slave, true).expect("nonblocking slave");
     aterm_pty::close_fd(exited_slave);
     let probe = [(1u64, exited_master, 0i32)];
     // A hang detector: the hang-up arrives only once every copy of the slave is closed, and a
@@ -724,7 +731,11 @@ fn a_session_that_owes_rows_carries_its_render_debt_and_the_others_carry_none() 
         t.resize(11, 20);
         t.process(b"\x1b[?1004h");
         t.resize(12, 20);
-        assert_eq!(t.render_debt(), (-1, 0), "the flap left a residue");
+        assert_eq!(
+            t.render_debt(),
+            aterm_core::terminal::RenderDebt::of_rows(-1, 0),
+            "the flap left a residue"
+        );
         t
     };
     let mut app = crate::App::headless_for_test();
@@ -733,7 +744,10 @@ fn a_session_that_owes_rows_carries_its_render_debt_and_the_others_carry_none() 
         &mut app,
         aterm_update_core::handoff_policy::CarryCeiling::Full,
     );
-    assert_eq!(parked.render_debts, vec![(0, (-1, 0))]);
+    assert_eq!(
+        parked.render_debts,
+        vec![(0, aterm_core::terminal::RenderDebt::of_rows(-1, 0))]
+    );
     let manifest = stamp_render_debts(
         handed_sessions_only(
             crate::session_store::SessionHandoff::from_store(
@@ -752,6 +766,25 @@ fn a_session_that_owes_rows_carries_its_render_debt_and_the_others_carry_none() 
     assert_eq!(
         read.sessions[0].render_debt.as_deref(),
         Some("-1,0"),
+        "round trip"
+    );
+
+    // Columns cut ride a key of their own: the rows key stays the two fields
+    // a build older than the column judge reads, so a rollback keeps the rows.
+    let cut = aterm_core::terminal::RenderDebt {
+        shift: -1,
+        pushed: 0,
+        cut: 2,
+    };
+    let wire = stamp_render_debts(manifest.clone(), &[(0, cut)])
+        .to_toml()
+        .expect("serialize");
+    assert!(wire.contains("render_debt = \"-1,0\""), "{wire}");
+    assert!(wire.contains("render_debt_cut = 2"), "{wire}");
+    let read = crate::session_store::SessionHandoff::from_toml(&wire).expect("parse");
+    assert_eq!(
+        read.sessions[0].carried_render_debt(),
+        Some(cut),
         "round trip"
     );
 
@@ -793,7 +826,10 @@ fn a_session_that_owes_rows_carries_its_render_debt_and_the_others_carry_none() 
     );
     assert!(parked.render_debts.is_empty());
     // Another session's debt lands on no record of this one.
-    let other = stamp_render_debts(manifest, &[(7, (-1, 0))]);
+    let other = stamp_render_debts(
+        manifest,
+        &[(7, aterm_core::terminal::RenderDebt::of_rows(-1, 0))],
+    );
     assert_eq!(other.sessions[0].render_debt, None);
 }
 

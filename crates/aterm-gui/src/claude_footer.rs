@@ -60,6 +60,11 @@
 //!   file or the vendor's profile store gives a credential is still
 //!   labelled; and one started under another `HOME` is named by the row with
 //!   no `dir` (`accounts::judged_label`).
+//! * THE SURVEY'S EXCERPTS (`aterm_agent::harness::excerpt`: the newest
+//!   prompts, words and tool in flight) come off the same tail read and are
+//!   published beside the facts (`SessionTimeline::set_claude_excerpts`), so
+//!   `survey` reads no transcript; a worker's task head is read once per
+//!   image from the file its environment names ([`Identity::task`]).
 //! * A CLOSED TAB's fold goes when the tab does ([`stop_session`], from the
 //!   status observer's own retirement), not at the end of its watch; the
 //!   process's tail stays while the process lives ([`ProcessTails`]).
@@ -113,7 +118,7 @@ use aterm_agent::harness::accounts;
 use aterm_agent::harness::footer::{self, FooterFacts, LaunchFacts};
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::RenderCell;
-use winit::event_loop::EventLoopProxy;
+use aterm_window::event_loop::EventLoopProxy;
 
 use crate::session_timeline::SessionTimeline;
 use crate::{App, VisibleContentRoute, Wake, WindowId};
@@ -137,10 +142,10 @@ pub(crate) fn drawn_for(program: Option<&str>) -> bool {
     program
         .and_then(aterm_phase::program_of)
         .is_some_and(|program| match program {
-            aterm_phase::Program::Claude => true,
-            aterm_phase::Program::Codex
+            aterm_phase::Program::Claude
             | aterm_phase::Program::Agy
-            | aterm_phase::Program::Muse
+            | aterm_phase::Program::Muse => true,
+            aterm_phase::Program::Codex
             | aterm_phase::Program::Gemini
             | aterm_phase::Program::Generic => false,
         })
@@ -161,6 +166,14 @@ struct Lit {
     shown: bool,
 }
 
+/// One undoable row edit for agy's transcript presentation on `RenderInput`.
+struct AgyRowEdit {
+    frame_row: usize,
+    col: usize,
+    cells: Vec<RenderCell>,
+    ground: RenderCell,
+}
+
 /// The footer splice's per-frame lists, kept on the window for their
 /// buffers (`WindowState::claude_footer_lists`): taken at the top of a
 /// splice and handed back EMPTY at its end, so a frame allocates none of
@@ -176,9 +189,16 @@ pub(crate) struct SpliceLists {
     bare: Vec<u64>,
     /// The rules' compositions, written as [`rule_edits`].
     rules: Vec<RuleWrite>,
+    /// agy's glass-only transcript markdown edits.
+    agy_edits: Vec<AgyRowEdit>,
+    /// Top-rule harness border toggle pill spans `(frame_row, term_row, cols, session, needs_write)`.
+    border_toggles: Vec<(usize, usize, std::ops::Range<usize>, u64, bool)>,
     lit: Vec<Lit>,
     /// The rule row's coverable cells ([`rule_mask`]), one pane's at a time.
     mask: Vec<bool>,
+    /// Sessions whose log the launch card's amend moved: their watchers are
+    /// woken after the frame (addendum A28, ruling S29).
+    log_owed: Vec<u64>,
 }
 
 /// One pane's composition for its composer rule ([`compose_rule_spans`],
@@ -200,8 +220,11 @@ impl SpliceLists {
         self.seen.clear();
         self.bare.clear();
         self.rules.clear();
+        self.agy_edits.clear();
+        self.border_toggles.clear();
         self.lit.clear();
         self.mask.clear();
+        self.log_owed.clear();
     }
 }
 
@@ -492,7 +515,7 @@ impl Readings {
             #[cfg(test)]
             crate::work_counts::footer_frame_searched();
             crate::reader_guard::read_or_none(session, "Claude Code footer", rows, || {
-                aterm_phase::phase::FrameReach::of(rows)
+                aterm_phase::phase::FrameReach::of_or_agy(rows)
             })
         };
         match now {
@@ -523,7 +546,7 @@ fn read_pane(
     crate::work_counts::footer_pane_read();
     let reach = found.or_else(|| {
         crate::reader_guard::read_or_none(session, "Claude Code footer", rows, || {
-            aterm_phase::phase::FrameReach::of(rows)
+            aterm_phase::phase::FrameReach::of_or_agy(rows)
         })
     });
     let rule =
@@ -980,7 +1003,7 @@ struct RuleKey {
 struct BlockCopy {
     lights: Vec<RenderCell>,
     title: Vec<RenderCell>,
-    lean: [Vec<RenderCell>; 2],
+    lean: [Vec<RenderCell>; crate::claude_lights::LEAN_FORMS],
     short_title: Vec<RenderCell>,
     reason: bool,
     holds: usize,
@@ -1149,7 +1172,7 @@ impl PaneFooter {
             let widths = block.map(|b| footer::LightsWidth {
                 chips: b.holds,
                 title: b.title.len(),
-                lean: [b.lean[0].len(), b.lean[1].len()],
+                lean: b.lean.each_ref().map(Vec::len),
                 short: b.short_title.len(),
                 reason: b.reason,
             });
@@ -1222,10 +1245,96 @@ pub(crate) fn post_changed(session: u64) {
 /// The follow-up reads after every request, measured from it. Two cases need
 /// them, and both were seen on a dev build (2026-09-24): Claude Code writes
 /// `sessions/<pid>.json` a moment AFTER it takes the foreground, so the read
-/// that fires on first sight of `claude` found nothing; and a turn's final
-/// transcript row lands as the screen settles, after the last sweep that asked.
-/// Bounded — a request buys these two reads and no more.
+/// that fires on first sight of `claude` found nothing (now the first-row
+/// ladder's to catch, [`FIRST_ROW_STEP`]); and a turn's final transcript row
+/// lands as the screen settles, after the last sweep that asked. Bounded — a
+/// request buys these two reads and no more.
 const FOLLOW_UPS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(6)];
+
+/// THE FIRST-ROW LADDER: how often a Claude Code process is read again while
+/// no read has found its registry row (`sessions/<pid>.json`), and for how
+/// long after the first ask for it ([`FIRST_ROW_FOR`]). Every fact is read
+/// from that row — the footer and its chips, and the running build
+/// (`FooterFacts::version`) the harness card's decoration waits on
+/// (`claude_card`'s GATES) — and Claude Code writes it a moment AFTER it
+/// takes the foreground. Measured on 2.1.303 (2026-10-19, four launches in a
+/// trusted folder, on the fullscreen renderer it started with): the row was
+/// born 0.35-0.8 s after the process was named and 100-215 ms BEFORE its
+/// launch card was drawn, while the read after first sight's miss waited for
+/// [`FOLLOW_UPS`]' first, 2 s on; so the card stood bare and the footer
+/// absent for 1.3-1.7 s, and the kitty rode in that late. On the ladder a
+/// miss is read again a rung later, until the first read that finds the row
+/// — the footer, and with it the decoration, then land at the first rung
+/// after the row's birth, at most a step after it. That is the card's first
+/// frame where the row leads the card by more than the wait for that rung
+/// (all three launches measured after: the row 21-130 ms ahead), and a frame
+/// or a few into the card where it does not: where it leads by less, or
+/// comes after, as on Claude Code's inline renderer
+/// (`CLAUDE_CODE_NO_FLICKER=0`), which draws the card before it writes the
+/// row (the card bare 88 and 170 ms, two launches on a debug build). The
+/// ladder is over for that process there, whatever later reads find (a read
+/// landing mid-write is the kept-facts rule's, [`resolve_facts`]).
+/// Bounded: a process whose row is never read (a `claude` that is not Claude
+/// Code, a Claude home the resolver does not find) costs at most
+/// `FIRST_ROW_FOR / FIRST_ROW_STEP` reads, each one failed open of one small
+/// file, and is then on the follow-ups' and the idle clock's cadence alone;
+/// a watch stopped (another program in front) and asked for again climbs
+/// again, once per ask — never a poll for the process's life. Five seconds
+/// also covers a new folder's trust dialog the harness answers, after which
+/// Claude Code writes its row (measured once: 3.3 s after the harness's
+/// claim). On the resolver thread, as every read is: no frame waits on it.
+const FIRST_ROW_STEP: Duration = Duration::from_millis(100);
+const FIRST_ROW_FOR: Duration = Duration::from_secs(5);
+
+/// The rung after a read at `at` that found no row, for a process first asked
+/// for at `since`: [`FIRST_ROW_STEP`] on, while that is within
+/// [`FIRST_ROW_FOR`] of `since`; `None` once it is not — the ladder's bound.
+fn first_row_rung(since: std::time::Instant, at: std::time::Instant) -> Option<std::time::Instant> {
+    let next = at + FIRST_ROW_STEP;
+    (next <= since + FIRST_ROW_FOR).then_some(next)
+}
+
+/// Where a watched process stands on its first-row ladder ([`FIRST_ROW_STEP`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ladder {
+    /// No read has found the process's row: read it again at `next`. `since`
+    /// is the first ask for the process, which the bound runs from.
+    Climbing {
+        since: std::time::Instant,
+        next: std::time::Instant,
+    },
+    /// A read found the row, or the bound passed with none: over for this
+    /// process, whatever a later read finds.
+    Done,
+}
+
+impl Ladder {
+    /// A process first asked for at `asked`, before its first read is told.
+    fn start(asked: std::time::Instant) -> Ladder {
+        Ladder::Climbing {
+            since: asked,
+            next: asked,
+        }
+    }
+
+    /// The ladder after a read at `at` that found the process's row (`row`)
+    /// or not.
+    fn after(self, at: std::time::Instant, row: bool) -> Ladder {
+        match self {
+            Ladder::Climbing { since, .. } if !row => first_row_rung(since, at)
+                .map_or(Ladder::Done, |next| Ladder::Climbing { since, next }),
+            Ladder::Climbing { .. } | Ladder::Done => Ladder::Done,
+        }
+    }
+
+    /// The rung owed, if the ladder still climbs.
+    fn rung(self) -> Option<std::time::Instant> {
+        match self {
+            Ladder::Climbing { next, .. } => Some(next),
+            Ladder::Done => None,
+        }
+    }
+}
 
 /// How often a Claude Code session's facts are re-read while nothing asks
 /// for them — the status sweep asks only while the screen moves, so a branch
@@ -1266,12 +1375,70 @@ fn still_watched(
     now.saturating_duration_since(asked) < WATCH_FOR || walled_alive()
 }
 
-/// One resolution: the session, its timeline and the Claude Code process.
+/// THE LOG'S WAKE from this thread (session log Phase 3B, rulings S12, A12,
+/// A13): the instance's subscribers, notified DIRECTLY once the timeline is
+/// released when the transcript's steps moved what a reader of the session's
+/// log sees — no hop through the loop, which a headless test App does not
+/// run — and the `[session_log] clause` switch, under which the loop is told
+/// too (`Wake::SessionLogMoved`) so the tab's chrome follows the clause. The
+/// loop is told as well when the steps armed the turn tracker's settle,
+/// whose tick only the loop keeps. Carried by each request (a field of the
+/// [`Job`]), never a static. The default (a test's) holds no subscribers and
+/// the switch off.
+#[derive(Clone, Default)]
+pub(crate) struct LogWake {
+    subscribers: Option<crate::subscribe::Subscribers>,
+    clause: bool,
+}
+
+impl LogWake {
+    /// The wake for an instance's `subscribers`, the clause switch `clause`.
+    pub(crate) fn new(subscribers: &crate::subscribe::Subscribers, clause: bool) -> LogWake {
+        LogWake {
+            subscribers: Some(Arc::clone(subscribers)),
+            clause,
+        }
+    }
+
+    /// After a batch of transcript steps was applied to session `session`'s
+    /// log and every timeline hold released: wake its watchers when they are
+    /// owed one, and the loop when it owes a settle tick or the clause
+    /// switch is on.
+    pub(crate) fn after(&self, session: u64, applied: &crate::session_log::transcript::Applied) {
+        if applied.owed
+            && let Some(subscribers) = self.subscribers.as_ref()
+            && subscribers.any()
+        {
+            subscribers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .notify(session);
+        }
+        if (applied.owed && self.clause) || applied.settle.is_some() {
+            post_log_moved(session);
+        }
+    }
+}
+
+/// A session's log moved off the loop in a way the loop must follow (its
+/// settle tick, the clause in its chrome).
+fn post_log_moved(session: u64) {
+    if let Some(proxy) = PROXY.get() {
+        let _ = proxy.send_event(Wake::SessionLogMoved {
+            session,
+            notify: false,
+        });
+    }
+}
+
+/// One resolution: the session, its timeline and the Claude Code process,
+/// and what a moved log wakes ([`LogWake`]).
 #[derive(Clone)]
 struct Job {
     session: u64,
     timeline: Arc<Mutex<SessionTimeline>>,
     pgid: i32,
+    wake: LogWake,
 }
 
 enum Command {
@@ -1291,10 +1458,17 @@ enum Command {
 static RESOLVER: Mutex<Option<Sender<Command>>> = Mutex::new(None);
 
 /// Read `pgid`'s footer facts off-thread into `timeline` now, and again at
-/// each of [`FOLLOW_UPS`]. A newer request for the same session replaces the
-/// follow-ups still owed for it. If the thread cannot be started the footer
+/// each of [`FOLLOW_UPS`] — and, while no read has found the process's
+/// registry row, on the first-row ladder ([`FIRST_ROW_STEP`]). A newer
+/// request for the same session replaces the follow-ups still owed for it,
+/// and keeps its process's ladder. If the thread cannot be started the footer
 /// simply does not appear.
-pub(crate) fn request_footer(session: u64, timeline: &Arc<Mutex<SessionTimeline>>, pgid: i32) {
+pub(crate) fn request_footer(
+    session: u64,
+    timeline: &Arc<Mutex<SessionTimeline>>,
+    pgid: i32,
+    wake: &LogWake,
+) {
     if pgid <= 0 {
         return;
     }
@@ -1322,6 +1496,7 @@ pub(crate) fn request_footer(session: u64, timeline: &Arc<Mutex<SessionTimeline>
         session,
         timeline: Arc::clone(timeline),
         pgid,
+        wake: wake.clone(),
     };
     if slot
         .as_ref()
@@ -1376,7 +1551,17 @@ fn send_stop(session: u64, pgid: Option<i32>) {
 #[derive(Default)]
 struct WatchSchedule {
     owed: Vec<(std::time::Instant, Job)>,
-    watched: HashMap<u64, (Job, std::time::Instant, std::time::Instant)>,
+    watched: HashMap<u64, Watch>,
+}
+
+/// One watched session: its latest job, when it was last ASKED for and last
+/// READ — the idle re-reads ([`IDLE_RECHECK`]) run off these — and its
+/// process's first-row ladder ([`FIRST_ROW_STEP`]).
+struct Watch {
+    job: Job,
+    asked: std::time::Instant,
+    read: std::time::Instant,
+    ladder: Ladder,
 }
 
 impl WatchSchedule {
@@ -1384,8 +1569,8 @@ impl WatchSchedule {
     /// unless `walled_alive` — asked only then — says the session's footer
     /// shows a limit wall and its process lives ([`still_watched`]).
     fn prune(&mut self, now: std::time::Instant, mut walled_alive: impl FnMut(u64, &Job) -> bool) {
-        self.watched.retain(|session, (job, asked, _)| {
-            still_watched(now, *asked, || walled_alive(*session, job))
+        self.watched.retain(|session, watch| {
+            still_watched(now, watch.asked, || walled_alive(*session, &watch.job))
         });
     }
 
@@ -1396,7 +1581,12 @@ impl WatchSchedule {
             .chain(
                 self.watched
                     .values()
-                    .map(|(_, asked, read)| *read + recheck_after(now, *asked)),
+                    .map(|watch| watch.read + recheck_after(now, watch.asked)),
+            )
+            .chain(
+                self.watched
+                    .values()
+                    .filter_map(|watch| watch.ladder.rung()),
             )
             .min()
     }
@@ -1435,7 +1625,7 @@ impl WatchSchedule {
         if !self
             .watched
             .get(&session)
-            .is_some_and(|(job, _, _)| Self::matches(job, session, pgid))
+            .is_some_and(|watch| Self::matches(&watch.job, session, pgid))
         {
             return false;
         }
@@ -1444,13 +1634,30 @@ impl WatchSchedule {
         true
     }
 
-    fn watch(&mut self, job: Job, asked: std::time::Instant) {
+    /// Watch `job`, asked for and read at `asked`, that read having found
+    /// its process's registry row (`row`) or not. An ask for the process the
+    /// session already watches keeps its ladder, and so its bound; a new
+    /// process in the session starts one.
+    fn watch(&mut self, job: Job, asked: std::time::Instant, row: bool) {
         self.owed
             .retain(|(_, pending)| pending.session != job.session);
         for delay in FOLLOW_UPS {
             self.owed.push((asked + delay, job.clone()));
         }
-        self.watched.insert(job.session, (job, asked, asked));
+        let ladder = self
+            .watched
+            .get(&job.session)
+            .filter(|watch| watch.job.pgid == job.pgid)
+            .map_or_else(|| Ladder::start(asked), |watch| watch.ladder);
+        self.watched.insert(
+            job.session,
+            Watch {
+                job,
+                asked,
+                read: asked,
+                ladder: ladder.after(asked, row),
+            },
+        );
     }
 
     fn due_followups(&mut self, now: std::time::Instant) -> Vec<Job> {
@@ -1459,17 +1666,67 @@ impl WatchSchedule {
         due.into_iter().map(|(_, job)| job).collect()
     }
 
+    /// The jobs whose first-row rung is due at `now`. Each is read and told
+    /// back ([`Self::read`]), which moves its rung past `now` or ends it.
+    fn due_rungs(&self, now: std::time::Instant) -> Vec<Job> {
+        self.watched
+            .values()
+            .filter(|watch| watch.ladder.rung().is_some_and(|at| at <= now))
+            .map(|watch| watch.job.clone())
+            .collect()
+    }
+
     fn due_idle(&self, now: std::time::Instant) -> Option<Job> {
         self.watched
             .values()
-            .find(|(_, asked, read)| now >= *read + recheck_after(now, *asked))
-            .map(|(job, _, _)| job.clone())
+            .find(|watch| now >= watch.read + recheck_after(now, watch.asked))
+            .map(|watch| watch.job.clone())
     }
 
-    fn read(&mut self, session: u64, at: std::time::Instant) {
-        if let Some((_, _, read)) = self.watched.get_mut(&session) {
-            *read = at;
+    /// `session` was read at `at`, the read having found its process's
+    /// registry row (`row`) or not.
+    fn read(&mut self, session: u64, at: std::time::Instant, row: bool) {
+        if let Some(watch) = self.watched.get_mut(&session) {
+            watch.read = at;
+            watch.ladder = watch.ladder.after(at, row);
         }
+    }
+
+    /// One pass of the resolver thread ([`run`]) over the asks it just took
+    /// (`latest`) and what is owed: each ask is read and watched, then each
+    /// follow-up due at the pass's instant, then each first-row rung due
+    /// then — after the follow-ups, so a process one of them just read has
+    /// its rung moved past the instant and is not read twice in one pass —
+    /// then each idle re-read due then. `read` reads a job and says whether
+    /// it found the process's registry row ([`Found::row`]); `clock` is the
+    /// time, asked as each read ends. Returns the pass's instant, and LEAVES
+    /// NOTHING OWED AT OR BEFORE IT: every read moves its own clock past the
+    /// instant or ends it, so the thread's next sleep ([`Self::next`]) is
+    /// never zero — a rung left unread would wake it at once, again and again.
+    fn serve(
+        &mut self,
+        latest: Vec<Job>,
+        mut read: impl FnMut(&Job) -> bool,
+        mut clock: impl FnMut() -> std::time::Instant,
+    ) -> std::time::Instant {
+        for job in latest {
+            let row = read(&job);
+            self.watch(job, clock(), row);
+        }
+        let now = clock();
+        for job in self.due_followups(now) {
+            let row = read(&job);
+            self.read(job.session, clock(), row);
+        }
+        for job in self.due_rungs(now) {
+            let row = read(&job);
+            self.read(job.session, clock(), row);
+        }
+        while let Some(job) = self.due_idle(now) {
+            let row = read(&job);
+            self.read(job.session, clock(), row);
+        }
+        now
     }
 }
 
@@ -1563,14 +1820,17 @@ impl ProcessTails {
             let watched = schedule
                 .watched
                 .get(&kept.session)
-                .is_some_and(|(job, _, _)| job.pgid == pgid);
+                .is_some_and(|watch| watch.job.pgid == pgid);
             watched || started.is_some_and(|started| !sweep || alive(pgid, started))
         });
     }
 }
 
 /// The resolver thread: each request is read at once and again at each
-/// follow-up, and the thread sleeps exactly until the next one is owed.
+/// follow-up — a process whose registry row no read has found yet, on each
+/// rung of its first-row ladder too ([`FIRST_ROW_STEP`]) — and the thread
+/// sleeps exactly until the next one is owed. Each wake is one pass
+/// ([`WatchSchedule::serve`]), which leaves nothing owed at its instant.
 fn run(rx: &std::sync::mpsc::Receiver<Command>) {
     let mut schedule = WatchSchedule::default();
     let mut known: HashMap<u64, Identity> = HashMap::new();
@@ -1582,8 +1842,9 @@ fn run(rx: &std::sync::mpsc::Receiver<Command>) {
     let mut walled: HashSet<u64> = HashSet::new();
     // The accounts roster, for every session's label.
     let mut roster = RosterMemo::default();
-    // Per session: its latest job, when it was last ASKED for, and when it
-    // was last READ — the idle re-reads ([`IDLE_RECHECK`]) run off this.
+    // Per session: its latest job, when it was last ASKED for, when it was
+    // last READ — the idle re-reads ([`IDLE_RECHECK`]) run off this — and its
+    // process's first-row ladder ([`Watch`]).
     loop {
         let now = std::time::Instant::now();
         schedule.prune(now, |session, job| {
@@ -1630,20 +1891,7 @@ fn run(rx: &std::sync::mpsc::Receiver<Command>) {
             walled: &mut walled,
             roster: &mut roster,
         };
-        for job in latest {
-            reads.resolve(&job);
-            let asked = std::time::Instant::now();
-            schedule.watch(job, asked);
-        }
-        let now = std::time::Instant::now();
-        for job in schedule.due_followups(now) {
-            reads.resolve(&job);
-            schedule.read(job.session, std::time::Instant::now());
-        }
-        while let Some(job) = schedule.due_idle(now) {
-            reads.resolve(&job);
-            schedule.read(job.session, std::time::Instant::now());
-        }
+        schedule.serve(latest, |job| reads.resolve(job), std::time::Instant::now);
     }
 }
 
@@ -1660,19 +1908,30 @@ struct Reads<'a> {
 
 impl Reads<'_> {
     /// Read `job`'s session and keep it in the walled set exactly while its
-    /// published footer shows a limit wall.
-    fn resolve(&mut self, job: &Job) {
-        let shows_wall = resolve_and_post(
+    /// published footer shows a limit wall. Whether the read found the
+    /// process's registry row (the schedule's first-row ladder).
+    fn resolve(&mut self, job: &Job) -> bool {
+        let found = resolve_and_post(
             self.known,
             self.tails,
             self.folds.entry(job.session).or_default(),
             self.roster,
-            job.session,
-            &job.timeline,
-            job.pgid,
+            job,
         );
-        note_wall(self.walled, job.session, shows_wall);
+        note_wall(self.walled, job.session, found.wall);
+        found.row
     }
+}
+
+/// What one read found, for the resolver's own state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Found {
+    /// The process's registry row answered the read ([`footer::read_pid`]
+    /// gave facts): the first-row ladder ends at the first read it is true
+    /// for ([`FIRST_ROW_STEP`]).
+    row: bool,
+    /// The footer the session's timeline now shows carries a limit wall.
+    wall: bool,
 }
 
 /// Keep `session` in `walled` exactly while its footer shows a limit wall.
@@ -1729,6 +1988,11 @@ struct Identity {
     /// the frozen-program remedy's resume line carries
     /// ([`aterm_agent::harness::resume::of_entry`], 2026-09-26).
     argv: Vec<String>,
+    /// The head of the task a `spawn agent=` worker was started with, read
+    /// once per image from the file its exec environment names
+    /// (`ATERM_TASK_FILE`, [`crate::survey::task_prompt_of_env`]): the
+    /// survey's `prompt=` for a tasked session.
+    task: Option<String>,
 }
 
 /// The kernel's start time of `pid`, unix seconds, where this platform can
@@ -1829,35 +2093,38 @@ fn live_roster() -> Option<accounts::Roster> {
         .ok()
 }
 
-/// What a read asks outside Claude Code's own files: a process's exec read
-/// and the accounts roster. The resolver asks the machine ([`LIVE`]); a test
-/// answers for it.
+/// What a read asks outside Claude Code's own files: a process's exec read,
+/// the accounts roster and the person's home (the resume line's `HOME` is
+/// judged against its `.claude`). The resolver asks the machine ([`LIVE`]); a
+/// test answers for it, so it never resolves the person's own `~/.claude`.
 #[derive(Clone, Copy)]
 struct Asks {
     args: fn(i32) -> Option<atpkg::caller_shell::ProcArgs>,
     roster: fn() -> Option<accounts::Roster>,
+    home: fn() -> Option<PathBuf>,
 }
 
-/// [`process_args`] and [`live_roster`].
+/// [`process_args`], [`live_roster`] and [`aterm_types::dirs::home_dir`].
 const LIVE: Asks = Asks {
     args: process_args,
     roster: live_roster,
+    home: aterm_types::dirs::home_dir,
 };
 
 /// [`resolve_into`], then wake the loop when the facts moved — and, when the
 /// moved facts carry a repository read the kernel refused with `EPERM`, post that
 /// too, so the App can raise its consent attention for this session
 /// (`Wake::ProtectedRead`; the App decides whether the path is protected).
-/// Whether the session's published footer now shows a limit wall.
+/// Whether the read found the process's registry row, and whether the
+/// session's published footer now shows a limit wall.
 fn resolve_and_post(
     known: &mut HashMap<u64, Identity>,
     tails: &mut ProcessTails,
     fold: &mut footer::FooterCache,
     roster: &mut RosterMemo,
-    session: u64,
-    timeline: &Arc<Mutex<SessionTimeline>>,
-    pgid: i32,
-) -> bool {
+    job: &Job,
+) -> Found {
+    let (session, timeline, pgid) = (job.session, &job.timeline, job.pgid);
     let started = birth_seconds(pgid);
     let cached = known
         .get(&session)
@@ -1874,6 +2141,7 @@ fn resolve_and_post(
         launch_for: None,
         login: None,
         argv: Vec::new(),
+        task: None,
     });
     let tail = tails.cache(
         session,
@@ -1881,7 +2149,8 @@ fn resolve_and_post(
         identity.started,
         std::time::Instant::now(),
     );
-    let (moved, shows_wall) = resolve_into(timeline, &mut identity, tail, fold, roster, LIVE);
+    let (moved, found, logged) = resolve_into(timeline, &mut identity, tail, fold, roster, LIVE);
+    job.wake.after(session, &logged);
     // No directory is not remembered: a launch through the atpkg twin is
     // `/bin/sh` for its first milliseconds, whose environment macOS hides,
     // and the `exec` into Claude Code keeps both the pid and the start time
@@ -1898,7 +2167,7 @@ fn resolve_and_post(
             let _ = proxy.send_event(Wake::ProtectedRead { session, path });
         }
     }
-    shows_wall
+    found
 }
 
 /// A zone's offset from UTC AT the instant `unix` (`None`: the local zone) —
@@ -1957,10 +2226,11 @@ fn cached_offset(
 
 /// Read `identity`'s facts and publish them on `timeline`: `Some` when they
 /// MOVED, carrying the working directory whose repository read was refused, if
-/// one was; and whether the footer the timeline now shows carries a limit
-/// wall. The file reads run before the (leaf) timeline lock is taken. A
-/// registry entry that names an image `identity` was not read for reads the
-/// command line and the login into it first (`asks`). The facts are read
+/// one was; and what the read [`Found`] — the process's registry row, and
+/// whether the footer the timeline now shows carries a limit wall. The file
+/// reads run before the (leaf) timeline lock is taken. A registry entry that
+/// names an image `identity` was not read for reads the command line and the
+/// login into it first (`asks`). The facts are read
 /// over the process's `tail`, the session's usage folded on in `fold`; a
 /// read that answers is given its account from `roster`
 /// ([`accounts::footer_label`]), which is asked only then, and only for a
@@ -1972,7 +2242,52 @@ fn resolve_into(
     fold: &mut footer::FooterCache,
     roster: &mut RosterMemo,
     asks: Asks,
-) -> (Option<Option<PathBuf>>, bool) {
+) -> (
+    Option<Option<PathBuf>>,
+    Found,
+    crate::session_log::transcript::Applied,
+) {
+    // THE SESSION LOG'S STEP TAP (phase 3B): armed before the read while the
+    // log holds a run that reads a transcript, with that run's watermark and
+    // floor — one short hold of the (leaf) timeline lock, released before
+    // any file is read. A tap still waiting for its file is armed again, so
+    // the run in front now gives it its floor and watermark.
+    if !fold.steps_armed() || !fold.steps_bound() {
+        let arm = timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .slog()
+            .transcript_arm();
+        if let Some(arm) = arm {
+            fold.set_floor(arm.floor_ms, arm.given);
+        }
+    }
+    let (moved, found) = resolve_facts(timeline, identity, tail, fold, roster, asks);
+    // The steps the read tapped, applied after the facts were published, at
+    // most `transcript::CHUNK` events a hold (ruling S16).
+    let logged = if fold.steps_armed() {
+        let batch = fold.take_steps();
+        let applied =
+            crate::session_log::transcript::apply_batch(timeline, &batch, fold.steps_bound());
+        if applied.disarm {
+            fold.disarm_steps();
+        }
+        applied
+    } else {
+        crate::session_log::transcript::Applied::default()
+    };
+    (moved, found, logged)
+}
+
+/// [`resolve_into`]'s footer half: read `identity`'s facts and publish them.
+fn resolve_facts(
+    timeline: &Arc<Mutex<SessionTimeline>>,
+    identity: &mut Identity,
+    tail: &mut footer::TailCache,
+    fold: &mut footer::FooterCache,
+    roster: &mut RosterMemo,
+    asks: Asks,
+) -> (Option<Option<PathBuf>>, Found) {
     // ONE footer read (`footer::read_pid`): one read of `sessions/<pid>.json`
     // feeds the model, the Σ, the wall and the frozen-program remedy's resume
     // line alike, so after `/clear` or `/resume` the footer never pairs one
@@ -2003,6 +2318,9 @@ fn resolve_into(
                         .map(|a| footer::launch_facts_of(&a.argv, &a.env))
                         .unwrap_or_default();
                     identity.login = login_of_args(args.as_ref());
+                    identity.task = args
+                        .as_ref()
+                        .and_then(|a| crate::survey::task_prompt_of_env(&a.env));
                     if args.is_some() {
                         identity.launch_for = Some(entry.started_at);
                     }
@@ -2019,9 +2337,65 @@ fn resolve_into(
                 fold,
                 &clock,
                 crate::harness_host::harness_state().as_deref(),
-                aterm_types::dirs::home_dir().as_deref(),
+                (asks.home)().as_deref(),
             )
         });
+    if facts.is_none() {
+        let non_registry_prog = timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent()
+            .program
+            .as_deref()
+            .and_then(aterm_phase::program_of)
+            .filter(|p| matches!(p, aterm_phase::Program::Agy | aterm_phase::Program::Muse));
+        if let Some(prog) = non_registry_prog {
+            let prefix = match prog {
+                aterm_phase::Program::Muse => "muse",
+                _ => "agy",
+            };
+            let cwd = u32::try_from(identity.pid)
+                .ok()
+                .and_then(aterm_sysprobe::process_cwd);
+            let home = (asks.home)();
+            let (branch, repo_read_denied) = match cwd.as_deref().map(footer::read_git_head) {
+                Some(footer::GitHeadRead::Found(b)) => (Some(b), None),
+                Some(footer::GitHeadRead::Denied) => (None, cwd.clone()),
+                Some(footer::GitHeadRead::Absent) | None => (None, None),
+            };
+            let args = (asks.args)(identity.pid);
+            let launch = args
+                .as_ref()
+                .map(|a| footer::launch_facts_of(&a.argv, &a.env))
+                .unwrap_or_default();
+            let model = launch
+                .model
+                .as_deref()
+                .and_then(footer::footer_model_name)
+                .or(launch.model);
+            facts = Some(FooterFacts {
+                model_open: model.is_none(),
+                model,
+                effort: None,
+                effort_open: true,
+                effort_for: None,
+                path: cwd
+                    .as_deref()
+                    .and_then(|dir| footer::home_path(dir, home.as_deref())),
+                branch,
+                repo_read_denied,
+                version: None,
+                resume: None,
+                usage: None,
+                owner: Some(footer::FactsOwner {
+                    floor: started,
+                    session_id: format!("{prefix}-{}", identity.pid),
+                }),
+                upgrade: None,
+                account: None,
+            });
+        }
+    }
     // The account is laid in here: only this thread holds the process's
     // login and the roster (`FooterFacts::account`).
     if let (Some(facts), Some(who)) = (facts.as_mut(), identity.login.as_ref()) {
@@ -2031,6 +2405,14 @@ fn resolve_into(
             .map(str::to_owned);
     }
     let denied = facts.as_ref().and_then(|f| f.repo_read_denied.clone());
+    // The survey's excerpts, from the same tail read: published beside the
+    // facts, never in them, so a new excerpt repaints nothing.
+    let excerpts = facts.as_ref().map(|_| crate::survey::ClaudeExcerpts {
+        excerpts: tail.excerpts().cloned().unwrap_or_default(),
+        task: identity.task.clone(),
+        transcript_len: tail.transcript_len(),
+    });
+    let row = facts.is_some();
     let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
     // One unreadable read of the SAME process — Claude rewrites its sessions
     // file on every status change, and a read can land mid-write — keeps the
@@ -2043,12 +2425,25 @@ fn resolve_into(
         && identity.started.is_some()
         && timeline.claude_footer_identity() == Some((identity.pid, identity.started))
     {
-        return (None, shows_wall(&timeline));
+        return (
+            None,
+            Found {
+                row,
+                wall: shows_wall(&timeline),
+            },
+        );
     }
+    timeline.set_claude_excerpts(identity.pid, excerpts);
     let moved = timeline
         .set_claude_footer(identity.pid, identity.started, facts)
         .then_some(denied);
-    (moved, shows_wall(&timeline))
+    (
+        moved,
+        Found {
+            row,
+            wall: shows_wall(&timeline),
+        },
+    )
 }
 
 /// Whether the footer `timeline` shows NOW carries a limit wall.
@@ -2094,6 +2489,9 @@ pub(crate) fn fingerprint(
         upgrade,
         account,
     } = facts;
+    let version = version
+        .as_deref()
+        .or_else(|| card.map(|c| c.version.as_str()).filter(|v| !v.is_empty()));
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (
         model,
@@ -2734,6 +3132,8 @@ impl App {
                     ^ self
                         .claude_card_term(ws, index, session, view, supervised)
                         .rotate_left(37)
+                    // …and the Team chip (who drives, `crate::team`).
+                    ^ self.team_term(session).rotate_left(53)
             } else {
                 0
             };
@@ -2791,6 +3191,20 @@ impl App {
             return;
         };
         self.splice_claude_footer_with(wid, plan, route, &mut lists);
+        // The launch card's amends wake their watchers outside the render
+        // path, on the loop's next turn (`Wake::SessionLogMoved`); a loop
+        // with no proxy (a headless test App) wakes them now.
+        for session in lists.log_owed.drain(..) {
+            match self.proxy.as_ref() {
+                Some(proxy) => {
+                    let _ = proxy.send_event(Wake::SessionLogMoved {
+                        session,
+                        notify: true,
+                    });
+                }
+                None => self.wake_log_watchers(session, true),
+            }
+        }
         lists.clear();
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.claude_footer_lists = lists;
@@ -2866,9 +3280,37 @@ impl App {
                 // timeline lock this frame: the PTY reader holds it while
                 // Claude streams.
                 let (held, agent) = {
-                    let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
                     #[cfg(test)]
                     crate::work_counts::footer_timeline_locked();
+                    if timeline.claude_footer().is_none()
+                        && timeline.agent().program_pgid > 0
+                        && let Some(prog @ (aterm_phase::Program::Agy | aterm_phase::Program::Muse)) =
+                            timeline
+                                .agent()
+                                .program
+                                .as_deref()
+                                .and_then(aterm_phase::program_of)
+                    {
+                        let pgid = timeline.agent().program_pgid;
+                        let prefix = match prog {
+                            aterm_phase::Program::Muse => "muse",
+                            _ => "agy",
+                        };
+                        timeline.set_claude_footer(
+                            pgid,
+                            None,
+                            Some(FooterFacts {
+                                model_open: true,
+                                effort_open: true,
+                                owner: Some(footer::FactsOwner {
+                                    floor: None,
+                                    session_id: format!("{prefix}-{pgid}"),
+                                }),
+                                ..FooterFacts::default()
+                            }),
+                        );
+                    }
                     let held = timeline.claude_footer().map(|facts| {
                         let mut texts = ws.claude_footer_texts.borrow_mut();
                         let footer = texts.footer(leaf_index, session);
@@ -2909,6 +3351,61 @@ impl App {
                 let mut texts = ws.claude_footer_texts.borrow_mut();
                 texts.rows(leaf_index, session, &ws.input_scratch, region);
                 let texts = &mut *texts;
+                // Nothing since this process started named its model or
+                // effort: its launch card may, read off a live REPL of its
+                // own build (`footer::launch_card`). It is read again on
+                // every rebuild of the pane's text while they stay open (every
+                // frame that reuses the text shares the reading), and the
+                // NEWEST reading for this owner is kept (`note_claude_card`):
+                // a card read in the moment between a new owner and the new
+                // process's first paint — its predecessor's, still on the
+                // glass — is replaced as soon as the new process draws its
+                // own. A frame with no card to read (it scrolled away, a
+                // message sits under it) keeps the last reading: the card
+                // still names what the process started on. A card kept anew
+                // shows now. A reading the timeline already keeps for these
+                // facts is no news, and takes no lock.
+                let footer = &texts.footers[leaf_index];
+                if let Some(owner) = footer.card_owner()
+                    && let Some(card) = texts.footer_card(leaf_index, session)
+                {
+                    let same_as_kept = footer.kept_card().is_some_and(|kept| {
+                        kept.model == card.model
+                            && kept.effort == card.effort
+                            && (kept.version == card.version || card.version.is_empty())
+                    });
+                    if !same_as_kept {
+                        let mut card = card.clone();
+                        if card.version.is_empty()
+                            && let Some(kept) = footer.kept_card()
+                            && !kept.version.is_empty()
+                        {
+                            card.version.clone_from(&kept.version);
+                        }
+                        let owner = owner.clone();
+                        let mut timeline =
+                            entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                        #[cfg(test)]
+                        crate::work_counts::footer_timeline_locked();
+                        if let Some((pgid, _)) = timeline.claude_footer_identity()
+                            && timeline.note_claude_card(pgid, &owner, card)
+                        {
+                            // The card's amend of the session log: its wake is
+                            // taken in this hold, its watchers woken after the
+                            // frame.
+                            if timeline.slog_take_wake() {
+                                lists.log_owed.push(session);
+                            }
+                            if let Some(facts) = timeline.claude_footer() {
+                                texts.footer(leaf_index, session).note_facts(
+                                    facts,
+                                    timeline.claude_card(),
+                                    usage,
+                                );
+                            }
+                        }
+                    }
+                }
                 // The harness card reads the same rows, rect and strip, and
                 // the process as the facts read under that lock (what shows
                 // keeps the facts' build: `filled_from` fills the model and
@@ -2942,40 +3439,6 @@ impl App {
                 if read.is_some_and(|r| !r.mode_row) {
                     texts.note_drift(leaf_index, session, version);
                 }
-                // Nothing since this process started named its model or
-                // effort: its launch card may, read off a live REPL of its
-                // own build (`footer::launch_card`). It is read again on
-                // every rebuild of the pane's text while they stay open (every
-                // frame that reuses the text shares the reading), and the
-                // NEWEST reading for this owner is kept (`note_claude_card`):
-                // a card read in the moment between a new owner and the new
-                // process's first paint — its predecessor's, still on the
-                // glass — is replaced as soon as the new process draws its
-                // own. A frame with no card to read (it scrolled away, a
-                // message sits under it) keeps the last reading: the card
-                // still names what the process started on. A card kept anew
-                // shows now. A reading the timeline already keeps for these
-                // facts is no news, and takes no lock.
-                let footer = &texts.footers[leaf_index];
-                if let Some(owner) = footer.card_owner()
-                    && let Some(card) = texts.footer_card(leaf_index, session)
-                    && footer.kept_card() != Some(card)
-                {
-                    let (owner, card) = (owner.clone(), card.clone());
-                    let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-                    #[cfg(test)]
-                    crate::work_counts::footer_timeline_locked();
-                    if let Some((pgid, _)) = timeline.claude_footer_identity()
-                        && timeline.note_claude_card(pgid, &owner, card)
-                        && let Some(facts) = timeline.claude_footer()
-                    {
-                        texts.footer(leaf_index, session).note_facts(
-                            facts,
-                            timeline.claude_card(),
-                            usage,
-                        );
-                    }
-                }
                 let on_glass = read
                     .map(|r| r.rule)
                     .filter(|&r| !self.chrome_owns_terminal_row(wid, row_off + r));
@@ -2992,6 +3455,51 @@ impl App {
                 });
                 if on_glass.is_some() && rule.is_none() {
                     lists.bare.push(session);
+                }
+                let harness_on = (view.carries() && supervised)
+                    || (matches!(view, crate::autopilot::AutopilotView::Unhosted)
+                        && word != Some(aterm_agent::supervise::Autopilot::Off));
+                let top_rule = readings.reach.and_then(|r| r.rules()).map(|(top, _)| top);
+                if let Some(
+                    prog @ (aterm_phase::Program::Claude
+                    | aterm_phase::Program::Agy
+                    | aterm_phase::Program::Muse),
+                ) = agent
+                {
+                    let rule_cell = rule.as_ref().map_or(blank, |(_, _, _, rc)| *rc);
+                    if let Some(top) = top_rule
+                        && !self.chrome_owns_terminal_row(wid, row_off + top)
+                    {
+                        collect_composer_border_brand_edits(
+                            &ws.input_scratch,
+                            session,
+                            prog,
+                            harness_on,
+                            region,
+                            top,
+                            blank,
+                            rule_cell,
+                            mark_fg,
+                            &mut lists.agy_edits,
+                            &mut lists.border_toggles,
+                        );
+                    }
+                    if harness_on
+                        && matches!(prog, aterm_phase::Program::Agy | aterm_phase::Program::Muse)
+                        && let Some(Some(cached)) = texts.panes.get(leaf_index)
+                    {
+                        collect_agy_transcript_edits(
+                            &ws.input_scratch,
+                            prog,
+                            &cached.rows,
+                            region,
+                            top_rule,
+                            blank,
+                            rule_cell,
+                            mark_fg,
+                            &mut lists.agy_edits,
+                        );
+                    }
                 }
                 // Every Claude Code pane is OBSERVED for its lights, painted
                 // rule or not (`App::observe_claude_lights`).
@@ -3044,7 +3552,7 @@ impl App {
             .windows
             .get(&wid)
             .is_some_and(|ws| ws.claude_card.lines().next().is_some());
-        if lists.panes.is_empty() && !lines {
+        if lists.panes.is_empty() && !lines && lists.agy_edits.is_empty() {
             return;
         }
         for pane in lists.panes.drain(..) {
@@ -3067,6 +3575,7 @@ impl App {
             self.note_claude_footer_row(wid, pane.session, chips_room);
             let (word, view) = pane.autopilot;
             self.note_claude_autopilot(wid, pane.session, word, view);
+            self.note_claude_team(wid, pane.session);
             let block = self.claude_lights_block(
                 wid,
                 pane.session,
@@ -3129,6 +3638,7 @@ impl App {
                 input_scratch,
                 claude_card,
                 claude_footer_texts,
+                claude_lights,
                 pet_chrome,
                 ..
             } = &mut **ws;
@@ -3145,7 +3655,15 @@ impl App {
                     r.ground,
                 )
             });
-            write_edits(claude_footer_undo, input_scratch, card_edits.chain(rules));
+            let agy = lists
+                .agy_edits
+                .iter()
+                .map(|e| (e.frame_row, e.col, e.cells.as_slice(), e.ground));
+            write_edits(
+                claude_footer_undo,
+                input_scratch,
+                card_edits.chain(rules).chain(agy),
+            );
             // Only a light the glass shows can be pointed at: a pane whose
             // write was skipped (`write_edits`) records none — keyed by the
             // edit's row AND column, since two panes side by side share a
@@ -3159,6 +3677,17 @@ impl App {
             let took = |at: (usize, usize)| rows.iter().any(|r| (r.frame_row, r.col_off) == at);
             for l in &mut lists.lit {
                 l.shown = took((l.frame_row, l.col));
+            }
+            for (fr, tr, cols, s, needs_write) in lists.border_toggles.drain(..) {
+                if !needs_write
+                    || rows.iter().any(|r| {
+                        r.frame_row == fr
+                            && r.col_off <= cols.start
+                            && r.col_off + r.painted.len() >= cols.end
+                    })
+                {
+                    claude_lights.border_toggles.push((fr, tr, cols, s));
+                }
             }
             // So with the harness card's line: its ink and its star go where
             // its cells did.
@@ -3286,6 +3815,673 @@ fn unread_pill_row(rows: &[String]) -> Option<String> {
         .then(|| row.trim_end().to_owned())
 }
 
+/// The wordmark's letter at spectrum stop `stop` (`0..=255`) on the pane
+/// whose blank cell is `blank`. On a dark ground the stop lifted a quarter
+/// toward the pane's ink, as always. On a light ground the paper law's
+/// point-mark ink against the pane's ground (`rainbow_kitty::ribbon`'s
+/// `paper_mark_ink`: the stop at full value, yellow bent to amber, darkened
+/// along its own hue only as far as WCAG AA's 4.5:1 needs), as the harness
+/// card's line letters are (`harness_card`'s `LineInks`): the quarter lift
+/// left the wordmark's yellow and green letters near 1.6:1 on cream paper,
+/// washed out beside the card's print rainbow.
+fn brand_letter_fg(stop: usize, blank: RenderCell) -> [u8; 3] {
+    let c = aterm_effects::spectrum::SPECTRUM_LUT[stop.min(255)];
+    let stop_rgb = [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+    let bg = u32::from_be_bytes([0, blank.bg[0], blank.bg[1], blank.bg[2]]);
+    if aterm_effects::harness_card::dark_ground(bg) {
+        mix(stop_rgb, blank.fg, 0.25)
+    } else {
+        let ink = aterm_effects::rainbow_kitty::ribbon::paper_mark_ink(c & 0x00FF_FFFF, bg);
+        [(ink >> 16) as u8, (ink >> 8) as u8, ink as u8]
+    }
+}
+
+/// Collect the ALab rainbow kitty border-and-banner branding edit on the
+/// composer's top rule (`top_rule`) for `Claude`, `Agy`, and `Muse`. When
+/// `harness_on` is `true`, tints the plain `─` run with the 256-stop ALab
+/// rainbow spectrum and right-aligns ` ✦ alab kitty · <claude|agy|muse> harness ● on `.
+/// Always records the badge column span as a clickable single-switch toggle
+/// target so clicking the top-right badge region toggles both On -> Off and
+/// Off -> On seamlessly.
+#[allow(clippy::too_many_arguments)]
+fn collect_composer_border_brand_edits(
+    scratch: &RenderInput,
+    session: u64,
+    program: aterm_phase::Program,
+    harness_on: bool,
+    region: PaneTextRegion,
+    top_rule: usize,
+    blank: RenderCell,
+    fallback_rule: RenderCell,
+    mark_fg: [u8; 3],
+    out: &mut Vec<AgyRowEdit>,
+    toggles: &mut Vec<(usize, usize, std::ops::Range<usize>, u64, bool)>,
+) {
+    let (full_badge, short_badge) = match program {
+        aterm_phase::Program::Claude => (
+            " \u{2726} alab kitty \u{00b7} claude harness \u{25cf} on ",
+            " \u{2726} alab \u{00b7} claude \u{25cf} on ",
+        ),
+        aterm_phase::Program::Agy => (
+            " \u{2726} alab kitty \u{00b7} agy harness \u{25cf} on ",
+            " \u{2726} alab \u{00b7} agy \u{25cf} on ",
+        ),
+        aterm_phase::Program::Muse => (
+            " \u{2726} alab kitty \u{00b7} muse harness \u{25cf} on ",
+            " \u{2726} alab \u{00b7} muse \u{25cf} on ",
+        ),
+        _ => return,
+    };
+    let term_row = region.row_off + top_rule;
+    let frame_row = region.strip + term_row;
+    let Some(frame_cells) = scratch.cells.get(frame_row) else {
+        return;
+    };
+    let pane_end = frame_cells.len().min(region.col_off + region.cols);
+    let Some(pane_slice) = frame_cells.get(region.col_off..pane_end) else {
+        return;
+    };
+    if pane_slice.is_empty() || pane_slice.iter().any(|c| c.bg != blank.bg) {
+        return;
+    }
+    let Some(first) = pane_slice.iter().find(|c| c.ch == '\u{2500}').copied() else {
+        return;
+    };
+    let last = pane_slice
+        .iter()
+        .rev()
+        .find(|c| c.ch == '\u{2500}')
+        .copied()
+        .unwrap_or(first);
+    let count = |style: &RenderCell| pane_slice.iter().filter(|c| *c == style).count();
+    let rule_cell = if first == last || count(&last) >= count(&first) {
+        last
+    } else if first.ch == '\u{2500}' {
+        first
+    } else {
+        fallback_rule
+    };
+    // Find the rightmost contiguous run of plain `─` cells matching `rule_cell`.
+    let mut best = 0..0;
+    let mut cur_start = None;
+    for (idx, cell) in pane_slice.iter().enumerate() {
+        let col = region.col_off + idx;
+        let plain = *cell == rule_cell
+            && !touches(&scratch.clusters, frame_row, &(col..col + 1))
+            && !touches(&scratch.combining, frame_row, &(col..col + 1))
+            && !touches(&scratch.images, frame_row, &(col..col + 1));
+        if plain {
+            let s = *cur_start.get_or_insert(idx);
+            if idx + 1 - s >= best.len() {
+                best = s..idx + 1;
+            }
+        } else {
+            cur_start = None;
+        }
+    }
+    let span_len = best.len();
+    if span_len < 22 {
+        return;
+    }
+    let full_len = full_badge.chars().count();
+    let short_len = short_badge.chars().count();
+    let badge = if span_len >= full_len + 4 {
+        Some((full_badge, full_len))
+    } else if span_len >= short_len + 4 {
+        Some((short_badge, short_len))
+    } else {
+        None
+    };
+    if !harness_on {
+        if let Some((_, b_len)) = badge {
+            let b_start = span_len - 2 - b_len;
+            let col_start = region.col_off + best.start + b_start;
+            toggles.push((
+                frame_row,
+                term_row,
+                col_start..col_start + b_len,
+                session,
+                false,
+            ));
+        }
+        return;
+    }
+    let mut cells = Vec::with_capacity(span_len);
+    let denom = span_len.saturating_sub(1).max(1);
+    for i in 0..span_len {
+        let stop = (i * 255) / denom;
+        let c = aterm_effects::spectrum::SPECTRUM_LUT[stop];
+        let stop_rgb = [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+        let lifted = mix(stop_rgb, blank.fg, 0.25);
+        let mut fg = mix(rule_cell.fg, lifted, 0.68);
+        if fg == rule_cell.fg {
+            fg[0] ^= 1;
+        }
+        cells.push(RenderCell {
+            ch: '\u{2500}',
+            fg,
+            ..rule_cell
+        });
+    }
+    if let Some((badge_str, b_len)) = badge {
+        let b_start = span_len - 2 - b_len;
+        let dot_pos = badge_str
+            .chars()
+            .position(|c| c == '\u{00b7}')
+            .unwrap_or(b_len);
+        let bullet_pos = badge_str
+            .chars()
+            .position(|c| c == '\u{25cf}')
+            .unwrap_or(b_len);
+        let agent_fg = mix(mark_fg, blank.fg, 0.35);
+        for (k, ch) in badge_str.chars().enumerate() {
+            let fg = if k < dot_pos {
+                brand_letter_fg((k * 255) / dot_pos.max(1), blank)
+            } else if k == dot_pos {
+                rule_cell.fg
+            } else if k < bullet_pos {
+                agent_fg
+            } else {
+                mark_fg
+            };
+            cells[b_start + k] = RenderCell {
+                ch,
+                fg,
+                bold: k != dot_pos,
+                ..blank
+            };
+        }
+        let col_start = region.col_off + best.start + b_start;
+        toggles.push((
+            frame_row,
+            term_row,
+            col_start..col_start + b_len,
+            session,
+            true,
+        ));
+    }
+    out.push(AgyRowEdit {
+        frame_row,
+        col: region.col_off + best.start,
+        cells,
+        ground: blank,
+    });
+}
+
+/// Whether `row` is an agy tool-call header (`● Ran (…)`, `● Explored …`,
+/// `● Edited …`, `● Read(…)`, etc.) rather than an assistant prose reply.
+fn is_agy_tool_call_row(row: &str) -> bool {
+    let Some(rest) = row.strip_prefix("● ") else {
+        return false;
+    };
+    if [
+        "Ran ",
+        "Explored ",
+        "Edited ",
+        "Created ",
+        "Deleted ",
+        "Searched ",
+        "Viewed ",
+        "Listed ",
+    ]
+    .iter()
+    .any(|verb| rest.starts_with(verb))
+    {
+        return true;
+    }
+    let Some((name, _)) = rest.split_once('(') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && rest.trim_end().ends_with(')')
+}
+
+/// Render inline markdown (`***bold italic***`, `**bold**`, `*italic*`,
+/// `` `code` ``, `[label](url)`) into `out` with clear visual distinction
+/// (inline code pill background and tinted foreground, underlined links,
+/// recursive inline spans) without changing row height.
+fn push_agy_inline_markdown(
+    text: &str,
+    base: RenderCell,
+    code_fg: [u8; 3],
+    code_bg: [u8; 3],
+    link_fg: [u8; 3],
+    max_cols: usize,
+    out: &mut Vec<RenderCell>,
+) -> bool {
+    let mut changed = false;
+    let mut rest = text;
+    while !rest.is_empty() && out.len() < max_cols {
+        if let Some(after_open) = rest.strip_prefix("***")
+            && !after_open.starts_with(' ')
+            && let Some((inner, after_close)) = after_open.split_once("***")
+            && !inner.is_empty()
+            && !inner.ends_with(' ')
+        {
+            changed = true;
+            let bold_italic_cell = RenderCell {
+                bold: true,
+                italic: true,
+                ..base
+            };
+            push_agy_inline_markdown(
+                inner,
+                bold_italic_cell,
+                code_fg,
+                code_bg,
+                link_fg,
+                max_cols,
+                out,
+            );
+            rest = after_close;
+            continue;
+        }
+        if let Some(after_open) = rest.strip_prefix("**")
+            && !after_open.starts_with('*')
+            && let Some((inner, after_close)) = after_open.split_once("**")
+            && !inner.is_empty()
+        {
+            changed = true;
+            let bold_cell = RenderCell { bold: true, ..base };
+            push_agy_inline_markdown(inner, bold_cell, code_fg, code_bg, link_fg, max_cols, out);
+            rest = after_close;
+            continue;
+        }
+        if let Some(after_open) = rest.strip_prefix('`')
+            && let Some((inner, after_close)) = after_open.split_once('`')
+            && !inner.is_empty()
+        {
+            changed = true;
+            let code_cell = RenderCell {
+                fg: code_fg,
+                bg: code_bg,
+                underline: aterm_core::terminal::UnderlineStyle::None,
+                ..base
+            };
+            for ch in inner.chars() {
+                if out.len() >= max_cols {
+                    break;
+                }
+                out.push(RenderCell { ch, ..code_cell });
+            }
+            rest = after_close;
+            continue;
+        }
+        if let Some(after_open) = rest.strip_prefix('[')
+            && let Some((label, after_label)) = after_open.split_once("](")
+            && !label.is_empty()
+            && !label.contains(['[', ']'])
+            && let Some((url, after_url)) = after_label.split_once(')')
+            && !url.is_empty()
+            && !url.contains(' ')
+        {
+            changed = true;
+            let link_cell = RenderCell {
+                fg: link_fg,
+                underline: aterm_core::terminal::UnderlineStyle::Single,
+                ..base
+            };
+            push_agy_inline_markdown(label, link_cell, code_fg, code_bg, link_fg, max_cols, out);
+            rest = after_url;
+            continue;
+        }
+        if let Some(after_open) = rest.strip_prefix('*')
+            && !after_open.starts_with(['*', ' '])
+            && let Some((inner, after_close)) = after_open.split_once('*')
+            && !inner.is_empty()
+            && !inner.ends_with(' ')
+        {
+            changed = true;
+            let italic_cell = RenderCell {
+                italic: true,
+                ..base
+            };
+            push_agy_inline_markdown(inner, italic_cell, code_fg, code_bg, link_fg, max_cols, out);
+            rest = after_close;
+            continue;
+        }
+        let mut chars = rest.chars();
+        if let Some(ch) = chars.next() {
+            out.push(RenderCell { ch, ..base });
+            rest = chars.as_str();
+        }
+    }
+    changed
+}
+
+/// Format one non-fenced row of an assistant reply (`● …`, `◆ …`, or 2-space
+/// continuation) with clear visual distinction across H1/H2/H3 headings,
+/// inline code pills, markdown links, nested bullets, checkboxes, ordered
+/// lists, horizontal rules, and quotes while keeping 1-to-1 row height so the
+/// screen never blows up.
+#[allow(clippy::too_many_arguments)]
+fn render_agy_markdown_row(
+    row: &str,
+    max_cols: usize,
+    orig_width: usize,
+    blank: RenderCell,
+    rule: RenderCell,
+    mark_fg: [u8; 3],
+) -> Option<Vec<RenderCell>> {
+    let trimmed_end = row.trim_end_matches(' ');
+    if trimmed_end.is_empty() {
+        return None;
+    }
+    let code_fg = mix(mark_fg, blank.fg, 0.55);
+    let code_bg = mix(blank.bg, rule.fg, 0.16);
+    let link_fg = mix(mark_fg, blank.fg, 0.42);
+    let quiet_fg = mix(rule.fg, blank.fg, VALUE_LIFT);
+    let (lead, body, lead_glyph) = if let Some(rest) = trimmed_end.strip_prefix("● ") {
+        ("● ", rest, Some('●'))
+    } else if let Some(rest) = trimmed_end.strip_prefix("\u{25c6} ") {
+        ("\u{25c6} ", rest, Some('\u{25c6}'))
+    } else {
+        let spaces = trimmed_end.bytes().take_while(|&b| b == b' ').count();
+        (&trimmed_end[..spaces], &trimmed_end[spaces..], None)
+    };
+    let mut out = Vec::with_capacity(orig_width);
+    let mut changed = false;
+    if let Some(glyph) = lead_glyph {
+        out.push(RenderCell {
+            ch: glyph,
+            fg: mark_fg,
+            bold: true,
+            ..blank
+        });
+        out.push(blank);
+    } else {
+        for _ in 0..lead.len().min(max_cols) {
+            out.push(blank);
+        }
+    }
+    let heading_level = body.bytes().take_while(|&b| b == b'#').count();
+    if (1..=4).contains(&heading_level)
+        && let Some(heading_text) = body[heading_level..].strip_prefix(' ')
+    {
+        changed = true;
+        let heading_base = match heading_level {
+            1 => RenderCell {
+                fg: mix(mark_fg, blank.fg, 0.28),
+                bold: true,
+                underline: aterm_core::terminal::UnderlineStyle::Single,
+                ..blank
+            },
+            2 => RenderCell {
+                fg: mix(mark_fg, blank.fg, 0.52),
+                bold: true,
+                ..blank
+            },
+            _ => RenderCell {
+                fg: mix(rule.fg, blank.fg, 0.78),
+                bold: true,
+                italic: true,
+                ..blank
+            },
+        };
+        push_agy_inline_markdown(
+            heading_text,
+            heading_base,
+            code_fg,
+            code_bg,
+            link_fg,
+            max_cols,
+            &mut out,
+        );
+    } else if body.len() >= 3
+        && (body.bytes().all(|b| b == b'-') || body.bytes().all(|b| b == b'*'))
+    {
+        changed = true;
+        let dash_cell = RenderCell {
+            ch: '\u{2500}',
+            fg: rule.fg,
+            ..blank
+        };
+        let target = orig_width.max(12).min(max_cols);
+        while out.len() < target {
+            out.push(dash_cell);
+        }
+    } else if let Some(list_item) = body.strip_prefix("- ").or_else(|| body.strip_prefix("* ")) {
+        changed = true;
+        let (marker, marker_fg, marker_bold, item_rest) =
+            if let Some(unchecked) = list_item.strip_prefix("[ ] ") {
+                ('\u{2610}', quiet_fg, false, unchecked)
+            } else if let Some(checked) = list_item
+                .strip_prefix("[x] ")
+                .or_else(|| list_item.strip_prefix("[X] "))
+            {
+                ('\u{2713}', mark_fg, true, checked)
+            } else if lead_glyph.is_none() && lead.len() >= 4 {
+                ('\u{25e6}', quiet_fg, false, list_item)
+            } else {
+                ('\u{2022}', mark_fg, true, list_item)
+            };
+        if out.len() < max_cols {
+            out.push(RenderCell {
+                ch: marker,
+                fg: marker_fg,
+                bold: marker_bold,
+                ..blank
+            });
+        }
+        if out.len() < max_cols {
+            out.push(blank);
+        }
+        push_agy_inline_markdown(
+            item_rest, blank, code_fg, code_bg, link_fg, max_cols, &mut out,
+        );
+    } else if let digits = body.bytes().take_while(|b| b.is_ascii_digit()).count()
+        && digits > 0
+        && digits <= 3
+        && let Some(item_rest) = body[digits..].strip_prefix(". ")
+    {
+        changed = true;
+        for ch in body[..digits + 1].chars() {
+            if out.len() < max_cols {
+                out.push(RenderCell {
+                    ch,
+                    fg: mark_fg,
+                    bold: true,
+                    ..blank
+                });
+            }
+        }
+        if out.len() < max_cols {
+            out.push(blank);
+        }
+        push_agy_inline_markdown(
+            item_rest, blank, code_fg, code_bg, link_fg, max_cols, &mut out,
+        );
+    } else if let Some(quote_item) = body.strip_prefix("> ") {
+        changed = true;
+        if out.len() < max_cols {
+            out.push(RenderCell {
+                ch: '▎',
+                fg: rule.fg,
+                ..blank
+            });
+        }
+        if out.len() < max_cols {
+            out.push(blank);
+        }
+        let quote_base = RenderCell {
+            fg: quiet_fg,
+            italic: true,
+            ..blank
+        };
+        push_agy_inline_markdown(
+            quote_item, quote_base, code_fg, code_bg, link_fg, max_cols, &mut out,
+        );
+    } else {
+        changed |=
+            push_agy_inline_markdown(body, blank, code_fg, code_bg, link_fg, max_cols, &mut out);
+    }
+    if !changed {
+        return None;
+    }
+    while out.len() < orig_width.min(max_cols) {
+        out.push(blank);
+    }
+    Some(out)
+}
+
+/// Collect glass-only undoable markdown edits for an `agy` or `muse` pane. Row
+/// text alone does not prove startup or tool-output provenance, so no transcript
+/// row is deleted as cruft. Fenced code is left literal; a viewport clipped
+/// inside a fence still keeps its literal startup-like lines. With any active
+/// selection or a row carrying wide/presentation flags, keep the original
+/// cells rather than rebuild them from plain text. A BiDi row also stays
+/// intact: its column map describes the original cells, not a markdown edit.
+#[allow(clippy::too_many_arguments)]
+fn collect_agy_transcript_edits(
+    scratch: &RenderInput,
+    program: aterm_phase::Program,
+    rows: &[String],
+    region: PaneTextRegion,
+    top_rule: Option<usize>,
+    blank: RenderCell,
+    rule: RenderCell,
+    mark_fg: [u8; 3],
+    out: &mut Vec<AgyRowEdit>,
+) {
+    if scratch.any_selection() {
+        return;
+    }
+    let limit = top_rule
+        .unwrap_or_else(|| rows.len().min(3))
+        .min(rows.len())
+        .min(region.rows);
+    let is_muse = program == aterm_phase::Program::Muse;
+    let card_range = if is_muse {
+        let (_, muse_place) = aterm_phase::muse::launch_card_scan(&rows[..limit]);
+        muse_place.map(|p| p.top..p.top + 2)
+    } else {
+        let (_, agy_place) = aterm_phase::agy::launch_card_scan(&rows[..limit]);
+        agy_place.map(|p| p.top..p.top + 5)
+    };
+    let mut in_user_msg = false;
+    let mut in_muse_reply = false;
+    let mut in_code_block = false;
+
+    for (r, row_str) in rows.iter().enumerate().take(limit) {
+        // Track fences before any card, user-message or row heuristic. A
+        // literal code sample can contain every one of those shapes.
+        let body = row_str
+            .strip_prefix("● ")
+            .or_else(|| row_str.strip_prefix("\u{25c6} "))
+            .unwrap_or(row_str)
+            .trim_start();
+        if body.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block {
+            continue;
+        }
+        if card_range.as_ref().is_some_and(|rng| rng.contains(&r)) {
+            in_user_msg = false;
+            in_muse_reply = false;
+            in_code_block = false;
+            continue;
+        }
+        let orig_width = row_str
+            .trim_end_matches(' ')
+            .chars()
+            .count()
+            .min(region.cols);
+        if orig_width == 0 {
+            in_user_msg = false;
+            in_muse_reply = false;
+            continue;
+        }
+        if is_muse {
+            if row_str == "\u{276f}"
+                || row_str.starts_with("\u{276f} ")
+                || row_str == "  \u{276f}"
+                || row_str.starts_with("  \u{276f} ")
+            {
+                in_user_msg = true;
+                in_muse_reply = false;
+                in_code_block = false;
+                continue;
+            }
+        } else if r > 0 && (row_str == ">" || row_str.starts_with("> ")) {
+            let prev = rows[r - 1].trim_end_matches(' ');
+            if prev.chars().count() >= 10 && prev.chars().all(|c| c == '\u{2500}') {
+                in_user_msg = true;
+                in_code_block = false;
+                continue;
+            }
+        }
+        if in_user_msg {
+            if row_str.starts_with("  ") {
+                continue;
+            }
+            in_user_msg = false;
+        }
+        if is_muse {
+            if row_str.starts_with("\u{25c6} ") {
+                in_muse_reply = true;
+            } else if in_muse_reply {
+                let trimmed_lead = row_str.trim_start();
+                if !row_str.starts_with("  ")
+                    || trimmed_lead.starts_with([
+                        '\u{256d}', '\u{2502}', '\u{2570}', '\u{25c7}', '\u{25c8}', '└', '⎿', '↑',
+                        '\u{276f}', '/',
+                    ])
+                    || (row_str.starts_with("  ")
+                        && !row_str.starts_with("   ")
+                        && row_str.matches(" \u{00B7} ").count() >= 2)
+                {
+                    in_muse_reply = false;
+                }
+            }
+        }
+        let frame_row = region.strip + region.row_off + r;
+        if scratch.cursor_visible && scratch.cursor_row == frame_row {
+            continue;
+        }
+        let Some(frame_cells) = scratch.cells.get(frame_row) else {
+            continue;
+        };
+        let pane_slice = frame_cells
+            .get(region.col_off..frame_cells.len().min(region.col_off + region.cols))
+            .unwrap_or(&[]);
+        // The text cache retains only `ch`, not these rendition flags.
+        if !scratch.visual_to_logical_row(frame_row).is_empty()
+            || pane_slice
+                .iter()
+                .any(|c| c.bg != blank.bg || c.wide || c.emoji_presentation || c.text_presentation)
+        {
+            continue;
+        }
+        if top_rule.is_none() {
+            continue;
+        }
+        let is_reply_row = if is_muse {
+            in_muse_reply
+        } else {
+            (row_str.starts_with("  ") && !row_str.trim_start().starts_with(['└', '⎿', '↑', '◆']))
+                || (row_str.starts_with("● ") && !is_agy_tool_call_row(row_str))
+        };
+        if !is_reply_row {
+            in_code_block = false;
+            continue;
+        }
+        if let Some(cells) =
+            render_agy_markdown_row(row_str, region.cols, orig_width, blank, rule, mark_fg)
+        {
+            out.push(AgyRowEdit {
+                frame_row,
+                col: region.col_off,
+                cells,
+                ground: blank,
+            });
+        }
+    }
+}
+
 /// `read` over pane `session`'s rows inside the reader's panic fence
 /// (`crate::reader_guard`): a panic is warned once and read as NO rule, so
 /// the vendor's own rows are left as drawn (the seam the tests inject a
@@ -3364,16 +4560,167 @@ pub(crate) mod probe;
 #[path = "claude_footer_cost_tests.rs"]
 mod cost_tests;
 
+/// THE FOOTER READ FOR OTHER MODULES' TESTS (session log Phase 3B, addendum
+/// A25): a Claude home on disk, and one read of a process in it through the
+/// resolver's own path ([`resolve_into`], then the wake [`LogWake::after`]),
+/// the process's exec read and the roster answered here, never the machine's.
+#[cfg(test)]
+pub(crate) mod rig {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    use aterm_agent::harness::footer;
+
+    use super::{Asks, Identity, LaunchFacts, LogWake, RosterMemo};
+    use crate::session_log::transcript::Applied;
+    use crate::session_timeline::SessionTimeline;
+
+    /// The session id the registry row [`claude_home`] writes names.
+    pub(crate) const SESSION_ID: &str = "00000000-0000-4000-8000-000000000a01";
+
+    /// The person's home a test's read judges the resume line against: this
+    /// test binary's own (`aterm_types::dirs::test_root`), never the person's
+    /// `~/.claude`.
+    pub(crate) fn scratch_home() -> Option<PathBuf> {
+        aterm_types::dirs::test_root().map(|root| root.join("home"))
+    }
+
+    /// A Claude home under a fresh temp root, with the registry row of `pid`
+    /// naming the image `started_at`: `(root, home)`.
+    pub(crate) fn claude_home(name: &str, pid: i32, started_at: u64) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("aterm-gui-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (cwd, claude) = (root.join("work"), root.join("claude"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(claude.join("sessions")).unwrap();
+        std::fs::write(
+            claude.join(format!("sessions/{pid}.json")),
+            format!(
+                r#"{{"pid":{pid},"sessionId":"{SESSION_ID}","cwd":{},"startedAt":{},"version":"2.1.287"}}"#,
+                // A JSON string, as Claude Code writes it (a Windows path's
+                // backslashes escaped).
+                aterm_json::to_string(&cwd.display().to_string()).unwrap(),
+                started_at * 1000 + 684
+            ),
+        )
+        .unwrap();
+        (root, claude)
+    }
+
+    /// The transcript of [`claude_home`]'s session under `root`.
+    pub(crate) fn transcript_of(root: &Path, claude: &Path) -> PathBuf {
+        let dir = claude
+            .join("projects")
+            .join(footer::project_slug(&root.join("work")));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(format!("{SESSION_ID}.jsonl"))
+    }
+
+    /// One footer read of process `pid` under `claude` into `timeline`,
+    /// folded on in `fold` over `tail`, then the wake `wake` for `session`:
+    /// what the read applied to the session's log.
+    pub(crate) fn read(
+        timeline: &Arc<Mutex<SessionTimeline>>,
+        pid: i32,
+        claude: &Path,
+        fold: &mut footer::FooterCache,
+        tail: &mut footer::TailCache,
+        session: u64,
+        wake: &LogWake,
+    ) -> Applied {
+        let mut identity = Identity {
+            pid,
+            started: None,
+            dir: Some(claude.to_path_buf()),
+            launch: LaunchFacts::default(),
+            launch_for: None,
+            login: None,
+            argv: Vec::new(),
+            task: None,
+        };
+        let asks = Asks {
+            args: |_| {
+                Some(atpkg::caller_shell::ProcArgs {
+                    argv: vec!["claude".into()],
+                    env: vec!["HOME=/home/someone".into()],
+                    ..Default::default()
+                })
+            },
+            roster: || None,
+            home: scratch_home,
+        };
+        let (_, _, applied) = super::resolve_into(
+            timeline,
+            &mut identity,
+            tail,
+            fold,
+            &mut RosterMemo::default(),
+            asks,
+        );
+        wake.after(session, &applied);
+        applied
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// THE FOOTER STANDS WHERE THE HOST SUPERVISES CLAUDE CODE BY NAME: the
-    /// predicate was the literal `claude`, so a `claude-code` argv0, which
+    /// THE WORDMARK READS ON PAPER: every colour the composer rule's ` ✦ alab
+    /// kitty` letters can take (each spectrum stop before its dot) reads at
+    /// 4.5:1 or more against every light built-in's ground, a pure hue (one
+    /// channel at zero) as the card's line letters are; on a dark ground a
+    /// letter is the stop lifted a quarter toward the pane's ink, as before.
+    /// NEGATIVE CONTROL: that lift on a light ground leaves a letter under
+    /// 2:1, the washed-out wordmark.
+    #[test]
+    fn the_wordmark_reads_on_paper() {
+        use aterm_effects::color_math::relative_luminance;
+        use aterm_types::scheme::{Appearance, builtin, builtin_names};
+        let contrast = |a: [u8; 3], b: [u8; 3]| {
+            let l = |c: [u8; 3]| relative_luminance(u32::from_be_bytes([0, c[0], c[1], c[2]]));
+            let (la, lb) = (l(a), l(b));
+            (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+        };
+        let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
+        let (mut light, mut washed) = (0, f32::MAX);
+        for name in builtin_names() {
+            let Some(scheme) = builtin(name) else {
+                continue;
+            };
+            let blank = RenderCell {
+                fg: rgb(scheme.foreground),
+                bg: rgb(scheme.background),
+                ..RenderCell::default()
+            };
+            for stop in 0..255 {
+                let fg = brand_letter_fg(stop, blank);
+                let c = aterm_effects::spectrum::SPECTRUM_LUT[stop];
+                let lifted = mix([(c >> 16) as u8, (c >> 8) as u8, c as u8], blank.fg, 0.25);
+                if scheme.appearance == Appearance::Light {
+                    light += 1;
+                    let k = contrast(fg, blank.bg);
+                    assert!(k >= 4.5, "{name} stop {stop}: {fg:?} at {k:.2}:1");
+                    assert!(
+                        fg.contains(&0),
+                        "{name} stop {stop}: {fg:?} is not a pure hue"
+                    );
+                    washed = washed.min(contrast(lifted, blank.bg));
+                } else {
+                    assert_eq!(fg, lifted, "{name} stop {stop}: dark as before");
+                }
+            }
+        }
+        assert!(light >= 7 * 255, "{light} light letters");
+        assert!(washed < 2.0, "CONTROL: {washed:.2}");
+    }
+
+    /// THE FOOTER STANDS WHERE THE HOST SUPERVISES CLAUDE CODE OR AGY BY NAME:
+    /// the predicate was the literal `claude`, so a `claude-code` argv0, which
     /// the host supervised as Claude Code, got no footer, no chips and no
-    /// harness card. Every name the host reads as Claude Code by name draws
-    /// it, in any case; NEGATIVE CONTROLS: Codex, a runtime with no reader,
-    /// a shell, a near-miss name and no name at all draw none.
+    /// harness card. Every name the host reads as Claude Code or agy by name
+    /// draws it, in any case; NEGATIVE CONTROLS: Codex, a runtime with no
+    /// reader, a shell, a near-miss name and no name at all draw none.
     #[test]
     fn the_footer_is_drawn_for_every_name_the_host_supervises_as_claude_code() {
         use crate::session_timeline::AgentPublication;
@@ -3382,6 +4729,11 @@ mod tests {
             "claude-code",
             "Claude",
             "CLAUDE-CODE",
+            "agy",
+            "AGY",
+            "muse",
+            "MUSE",
+            "muse-code",
             "codex",
             "node",
             "bun",
@@ -3396,10 +4748,10 @@ mod tests {
                 ..AgentPublication::default()
             };
             let host = crate::harness_host::agent_of(&publication).is_some_and(|p| match p {
-                aterm_phase::Program::Claude => true,
-                aterm_phase::Program::Codex
+                aterm_phase::Program::Claude
                 | aterm_phase::Program::Agy
-                | aterm_phase::Program::Muse
+                | aterm_phase::Program::Muse => true,
+                aterm_phase::Program::Codex
                 | aterm_phase::Program::Gemini
                 | aterm_phase::Program::Generic => false,
             });
@@ -3410,8 +4762,8 @@ mod tests {
             );
         }
         assert!(
-            drawn_for(Some("claude-code")),
-            "a claude-code argv0 is supervised, so it gets the footer"
+            drawn_for(Some("claude-code")) && drawn_for(Some("agy")) && drawn_for(Some("muse")),
+            "claude-code, agy, and muse argv0s are supervised, so they get the footer"
         );
         assert!(!drawn_for(Some("codex")) && !drawn_for(None));
     }
@@ -3455,7 +4807,7 @@ mod tests {
                     let widths = footer::LightsWidth {
                         chips,
                         title: title.chars().count(),
-                        lean: [0, 0],
+                        lean: [0; footer::LEAN_FORMS],
                         short: short.chars().count(),
                         reason: false,
                     };
@@ -3482,7 +4834,7 @@ mod tests {
     }
 
     fn watch_model_projection(schedule: &WatchSchedule) -> i64 {
-        match schedule.watched.get(&7).map(|(job, _, _)| job.pgid) {
+        match schedule.watched.get(&7).map(|watch| watch.job.pgid) {
             None => 0,
             Some(42) => 1,
             Some(43) => 2,
@@ -3505,8 +4857,10 @@ mod tests {
                 session: 7,
                 timeline,
                 pgid: 42,
+                wake: LogWake::default(),
             },
             now,
+            false,
         );
         assert!(model.fire("AskOld", &mut state));
         assert_eq!(state["watch"], watch_model_projection(&schedule));
@@ -3514,6 +4868,9 @@ mod tests {
             model.action_enabled("IdleRead", &state),
             schedule.due_idle(now + IDLE_RECHECK).is_some()
         );
+        // Its row unread, the process is on the first-row ladder, which goes
+        // with the watch.
+        assert_eq!(schedule.next(now), Some(now + FIRST_ROW_STEP));
         let (immediate, stopped) = schedule.accept([Command::Stop {
             session: 7,
             pgid: None,
@@ -3543,8 +4900,10 @@ mod tests {
                 session: 7,
                 timeline: Arc::clone(&timeline),
                 pgid: 42,
+                wake: LogWake::default(),
             },
             now,
+            true,
         );
         assert!(model.fire("AskOld", &mut state));
         let (mut immediate, stopped) = schedule.accept([
@@ -3552,6 +4911,7 @@ mod tests {
                 session: 7,
                 timeline,
                 pgid: 43,
+                wake: LogWake::default(),
             }),
             Command::Stop {
                 session: 7,
@@ -3564,7 +4924,7 @@ mod tests {
         assert_eq!(immediate.len(), 1);
         let replacement = immediate.pop().unwrap();
         assert_eq!(replacement.pgid, 43);
-        schedule.watch(replacement, now);
+        schedule.watch(replacement, now, true);
         assert_eq!(state["watch"], watch_model_projection(&schedule));
         let (immediate, stopped) = schedule.accept([Command::Stop {
             session: 7,
@@ -3611,8 +4971,10 @@ mod tests {
             std::fs::write(
                 claude.join("sessions/4242.json"),
                 format!(
-                    r#"{{"pid":4242,"sessionId":"{session}","cwd":"{}","procStart":"{}","startedAt":{},"version":"2.1.284"}}"#,
-                    cwd.display(),
+                    r#"{{"pid":4242,"sessionId":"{session}","cwd":{},"procStart":"{}","startedAt":{},"version":"2.1.284"}}"#,
+                    // A JSON string, as Claude Code writes it (a Windows
+                    // path's backslashes escaped).
+                    aterm_json::to_string(&cwd.display().to_string()).unwrap(),
                     footer::lstart_utc(START),
                     START * 1000 + 684
                 ),
@@ -3657,8 +5019,10 @@ mod tests {
                     session: 7,
                     timeline: Arc::new(Mutex::new(SessionTimeline::default())),
                     pgid: 4242,
+                    wake: LogWake::default(),
                 },
                 t0,
+                true,
             );
             let mut tails = ProcessTails::default();
             register(S);
@@ -3969,7 +5333,7 @@ mod tests {
         let widths = footer::LightsWidth {
             chips: harness.lights.len(),
             title: harness.title.len(),
-            lean: [0, 0],
+            lean: [0; footer::LEAN_FORMS],
             short: harness.short_title.len(),
             reason: harness.reason,
         };
@@ -4243,17 +5607,209 @@ mod tests {
                 session: 7,
                 timeline,
                 pgid: 42,
+                wake: LogWake::default(),
             },
             asked,
+            true,
         );
         let _ = schedule.due_followups(past);
-        schedule.read(7, past);
+        schedule.read(7, past, true);
         schedule.prune(past, |session, job| session == 7 && job.pgid == 42);
         assert_eq!(schedule.next(past), Some(past + WALL_RECHECK));
         assert!(schedule.due_idle(past + IDLE_RECHECK).is_none());
         assert!(schedule.due_idle(past + WALL_RECHECK).is_some());
         schedule.prune(past, |_, _| false);
         assert!(schedule.watched.is_empty(), "no wall: the watch ends");
+    }
+
+    /// The process each of `jobs` reads.
+    fn pgids(jobs: &[Job]) -> Vec<i32> {
+        jobs.iter().map(|job| job.pgid).collect()
+    }
+
+    /// THE FIRST-ROW LADDER (owner, 2026-10-19: "have this banner animation
+    /// happen at load not a bit later"). Claude Code writes its registry row
+    /// a moment after the read on first sight of the process, and every fact
+    /// is that row's — the build the harness card's decoration waits on among
+    /// them. Here the resolver's own read misses the unwritten row and says
+    /// so ([`Found::row`]); the schedule reads the process again a
+    /// [`FIRST_ROW_STEP`] on — not at [`FOLLOW_UPS`]' first, 2 s on, which
+    /// held the decoration and its ride-in 1.3-1.7 s past the card — and at
+    /// each rung while it misses; the rung's read that finds the row
+    /// publishes the build, and the ladder is over: the next read is the
+    /// follow-ups' again. NEGATIVE CONTROLS: a later miss of the same process
+    /// (a read landing mid-write) and the status sweep's re-ask of it climb
+    /// no ladder again; a new process in the session climbs its own; a
+    /// process whose first read finds its row climbs none.
+    #[test]
+    fn a_new_process_is_read_on_the_first_row_ladder_until_its_row() {
+        const PID: i32 = 4244;
+        let (root, claude) = claude_home("footer-first-row", PID, 1_790_607_848);
+        let registry = claude.join(format!("sessions/{PID}.json"));
+        let written = std::fs::read(&registry).unwrap();
+        // First sight: Claude Code has not written its row yet.
+        std::fs::remove_file(&registry).unwrap();
+        let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+        timeline.lock().unwrap().note_foreground_group(PID);
+        let asks = Asks {
+            args: |_| Some(args_of(&["HOME=/home/someone"])),
+            roster: || None,
+            home: scratch_home,
+        };
+        let mut identity = unread(PID, &claude);
+        let read = |identity: &mut Identity| {
+            resolve_into(
+                &timeline,
+                identity,
+                &mut footer::TailCache::default(),
+                &mut footer::FooterCache::default(),
+                &mut RosterMemo::default(),
+                asks,
+            )
+            .1
+        };
+        let job = |pgid| Job {
+            session: 7,
+            timeline: Arc::clone(&timeline),
+            pgid,
+            wake: LogWake::default(),
+        };
+        let t0 = std::time::Instant::now();
+        let mut schedule = WatchSchedule::default();
+        let found = read(&mut identity);
+        assert_eq!(
+            found,
+            Found {
+                row: false,
+                wall: false
+            }
+        );
+        schedule.watch(job(PID), t0, found.row);
+        let rung = t0 + FIRST_ROW_STEP;
+        assert_eq!(schedule.next(t0), Some(rung), "a rung on, not 2 s on");
+        assert!(
+            schedule
+                .due_rungs(rung - Duration::from_millis(1))
+                .is_empty()
+        );
+        assert_eq!(pgids(&schedule.due_rungs(rung)), [PID]);
+        // Missed at the rung too: the next is a step on.
+        schedule.read(7, rung, read(&mut identity).row);
+        let rung = rung + FIRST_ROW_STEP;
+        assert_eq!(schedule.next(t0), Some(rung));
+        // Claude Code writes its row; the rung's read finds it and publishes
+        // the build the card's decoration is gated on.
+        std::fs::write(&registry, &written).unwrap();
+        assert_eq!(pgids(&schedule.due_rungs(rung)), [PID]);
+        let found = read(&mut identity);
+        assert!(found.row);
+        schedule.read(7, rung, found.row);
+        assert_eq!(
+            timeline
+                .lock()
+                .unwrap()
+                .claude_footer()
+                .and_then(|facts| facts.version.clone())
+                .as_deref(),
+            Some("2.1.287")
+        );
+        assert_eq!(
+            schedule.next(rung),
+            Some(t0 + FOLLOW_UPS[0]),
+            "the follow-ups' cadence again"
+        );
+        let bound = t0 + FIRST_ROW_FOR;
+        assert!(schedule.due_rungs(bound).is_empty());
+        // CONTROLS: a later miss of the process, then the sweep's re-ask.
+        std::fs::remove_file(&registry).unwrap();
+        schedule.read(7, rung + FIRST_ROW_STEP, read(&mut identity).row);
+        schedule.watch(job(PID), t0 + RECHECK, false);
+        assert!(schedule.due_rungs(bound).is_empty());
+        assert_eq!(
+            schedule.next(t0 + RECHECK),
+            Some(t0 + RECHECK + FOLLOW_UPS[0])
+        );
+        // A new process in the session climbs its own ladder; one whose
+        // first read found its row, none.
+        let t1 = t0 + Duration::from_secs(60);
+        schedule.watch(job(PID + 1), t1, false);
+        assert_eq!(pgids(&schedule.due_rungs(t1 + FIRST_ROW_STEP)), [PID + 1]);
+        schedule.watch(job(PID + 2), t1, true);
+        assert!(schedule.due_rungs(t1 + FIRST_ROW_FOR).is_empty());
+        assert_eq!(schedule.next(t1), Some(t1 + FOLLOW_UPS[0]));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// THE LADDER'S BOUND, AS THE RESOLVER THREAD READS IT. A process whose
+    /// registry row no read finds (a `claude` that is not Claude Code, a
+    /// Claude home the resolver does not find), driven through the thread's
+    /// own pass ([`WatchSchedule::serve`]) and its sleep to
+    /// [`WatchSchedule::next`] on an injected clock, is read at the ask and
+    /// then every [`FIRST_ROW_STEP`] to [`FIRST_ROW_FOR`] after it — the
+    /// status sweep's re-ask on the way is one of those reads and keeps the
+    /// bound, never restarting it, and a follow-up that falls on a rung is
+    /// one read — and then on the follow-ups' and the idle clock's cadence
+    /// alone. No pass leaves a read owed at or before its own instant: with
+    /// the run loop's rung reads deleted every schedule test passed (the
+    /// review of the ladder), while the thread, its rung owed and never
+    /// moved, woke at once on every turn — a spin until the follow-ups ended
+    /// the ladder.
+    #[test]
+    fn a_process_whose_row_is_never_read_leaves_the_ladder_at_its_bound() {
+        let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+        let job = || Job {
+            session: 7,
+            timeline: Arc::clone(&timeline),
+            pgid: 42,
+            wake: LogWake::default(),
+        };
+        let t0 = std::time::Instant::now();
+        // The asks the thread takes: Claude Code named, then the status
+        // sweep's re-ask while the screen moves.
+        let mut asks = vec![t0, t0 + RECHECK];
+        let end = t0 + Duration::from_secs(10);
+        let mut schedule = WatchSchedule::default();
+        let mut reads = Vec::new();
+        let mut now = t0;
+        // The thread's turns: sleep to the next read owed, or until an ask
+        // comes in, then a pass.
+        while let Some(wake) = schedule
+            .next(now)
+            .into_iter()
+            .chain(asks.first().copied())
+            .min()
+            && wake <= end
+        {
+            now = wake;
+            let taken = asks.iter().take_while(|&&at| at <= now).count();
+            let latest = asks.drain(..taken).map(|_| job()).collect();
+            let served = schedule.serve(
+                latest,
+                |read| {
+                    assert_eq!(read.pgid, 42);
+                    reads.push(now);
+                    false
+                },
+                || now,
+            );
+            assert!(
+                schedule.next(served).is_none_or(|next| next > served),
+                "the pass {:?} after the ask leaves a read owed: the thread spins",
+                served - t0
+            );
+        }
+        let steps = u32::try_from(FIRST_ROW_FOR.as_millis() / FIRST_ROW_STEP.as_millis()).unwrap();
+        let ladder: Vec<_> = (0..=steps).map(|k| t0 + FIRST_ROW_STEP * k).collect();
+        assert_eq!(
+            reads.get(..ladder.len()),
+            Some(&ladder[..]),
+            "the ask, then a rung a step on, to the bound"
+        );
+        assert_eq!(
+            reads[ladder.len()..],
+            [t0 + RECHECK + FOLLOW_UPS[1]],
+            "then the re-ask's last follow-up, and the idle clock past it"
+        );
     }
 
     /// A retired session's resolver state goes whole: its fold, its watch,
@@ -4265,6 +5821,7 @@ mod tests {
             session,
             timeline: Arc::clone(&timeline),
             pgid: 1,
+            wake: LogWake::default(),
         };
         let now = std::time::Instant::now();
         let mut schedule = WatchSchedule::default();
@@ -4272,7 +5829,7 @@ mod tests {
         let mut folds: HashMap<u64, footer::FooterCache> = HashMap::new();
         let mut walled: HashSet<u64> = HashSet::new();
         for session in [1, 2] {
-            schedule.watch(job(session), now);
+            schedule.watch(job(session), now, true);
             known.insert(
                 session,
                 Identity {
@@ -4283,6 +5840,7 @@ mod tests {
                     launch_for: None,
                     login: None,
                     argv: Vec::new(),
+                    task: None,
                 },
             );
             folds.insert(session, footer::FooterCache::default());
@@ -4339,8 +5897,10 @@ mod tests {
                 session: 1,
                 timeline: Arc::clone(&timeline),
                 pgid: 40,
+                wake: LogWake::default(),
             },
             now,
+            true,
         );
         folds.insert(1, footer::FooterCache::default());
         walled.insert(1);
@@ -4391,25 +5951,7 @@ mod tests {
         login_of_args(Some(&args_of(&["HOME=/home/someone", &login])))
     }
 
-    /// A Claude home under a fresh temp root, with the registry row of `pid`
-    /// naming the image `started_at`: `(root, home)`.
-    fn claude_home(name: &str, pid: i32, started_at: u64) -> (PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("aterm-gui-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let (cwd, claude) = (root.join("work"), root.join("claude"));
-        std::fs::create_dir_all(&cwd).unwrap();
-        std::fs::create_dir_all(claude.join("sessions")).unwrap();
-        std::fs::write(
-            claude.join(format!("sessions/{pid}.json")),
-            format!(
-                r#"{{"pid":{pid},"sessionId":"00000000-0000-4000-8000-000000000a01","cwd":"{}","startedAt":{},"version":"2.1.287"}}"#,
-                cwd.display(),
-                started_at * 1000 + 684
-            ),
-        )
-        .unwrap();
-        (root, claude)
-    }
+    use super::rig::{claude_home, scratch_home};
 
     /// The login is read only off an environment that WAS read: no read, and
     /// one that reads empty, name no login — "no variable set" would say the
@@ -4519,6 +6061,7 @@ mod tests {
             launch_for: None,
             login: None,
             argv: Vec::new(),
+            task: None,
         }
     }
 
@@ -4559,10 +6102,12 @@ mod tests {
         let listed = |args| Asks {
             args,
             roster: || Some(two_accounts()),
+            home: scratch_home,
         };
         let unasked = |args| Asks {
             args,
             roster: || unreachable!("no login was read: the roster is not asked"),
+            home: scratch_home,
         };
         let read = |asks: Asks| {
             let mut memo = RosterMemo::default();
@@ -4584,6 +6129,7 @@ mod tests {
         let none = Asks {
             args: on_main,
             roster: || None,
+            home: scratch_home,
         };
         assert_eq!(read(none), (Some(None), true), "no roster: asked, none");
         assert_eq!(
@@ -4613,8 +6159,72 @@ mod tests {
         let nothing = Asks {
             args: |_| unreachable!("no registry row: the process is not read"),
             roster: || unreachable!("no facts: the roster is not asked"),
+            home: scratch_home,
         };
         assert_eq!(read(nothing), (None, false));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// THE SURVEY'S EXCERPTS are published beside the facts by the read that
+    /// answers, from the same tail read: the newest prompt and words, none
+    /// painted (the facts compare equal with or without them). A worker's
+    /// task head comes only from a file its environment names (none here).
+    /// NEGATIVE CONTROL: a read with no answer (no registry row) publishes
+    /// none.
+    #[test]
+    fn a_read_publishes_the_excerpts_beside_the_facts() {
+        const PID: i32 = 4243;
+        let (root, claude) = claude_home("footer-excerpts", PID, 1_790_607_848);
+        let project = claude
+            .join("projects")
+            .join(footer::project_slug(&root.join("work")));
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("00000000-0000-4000-8000-000000000a01.jsonl"),
+            concat!(
+                r#"{"type":"user","timestamp":"2026-09-28T15:00:00Z","message":{"content":"wire the survey"}}"#,
+                "\n",
+                r#"{"type":"assistant","timestamp":"2026-09-28T15:00:05Z","message":{"id":"m1","model":"claude-opus-5-5","content":[{"type":"text","text":"On it."}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let asks = Asks {
+            args: |_| Some(args_of(&["HOME=/home/someone"])),
+            roster: || None,
+            home: scratch_home,
+        };
+        let read = |asks: Asks| {
+            let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+            timeline.lock().unwrap().note_foreground_group(PID);
+            resolve_into(
+                &timeline,
+                &mut unread(PID, &claude),
+                &mut footer::TailCache::default(),
+                &mut footer::FooterCache::default(),
+                &mut RosterMemo::default(),
+                asks,
+            );
+            let timeline = timeline.lock().unwrap();
+            (
+                timeline.claude_footer().is_some(),
+                timeline.claude_excerpts().cloned(),
+            )
+        };
+        let (facts, excerpts) = read(asks);
+        assert!(facts, "the footer is published");
+        let excerpts = excerpts.expect("and its excerpts");
+        assert_eq!(excerpts.excerpts.prompts.len(), 1);
+        assert_eq!(excerpts.excerpts.prompts[0].text, "wire the survey");
+        assert_eq!(excerpts.excerpts.said.as_deref(), Some("On it."));
+        assert_eq!(excerpts.task, None, "no task file named");
+        std::fs::remove_file(claude.join(format!("sessions/{PID}.json"))).unwrap();
+        let nothing = Asks {
+            args: |_| unreachable!("no registry row: the process is not read"),
+            roster: || unreachable!("no facts: the roster is not asked"),
+            home: scratch_home,
+        };
+        assert_eq!(read(nothing), (false, None));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4633,6 +6243,7 @@ mod tests {
         let listed = |args| Asks {
             args,
             roster: || Some(two_accounts()),
+            home: scratch_home,
         };
         let mut memo = RosterMemo::default();
         // What a read before the registry row held: the launcher's.
@@ -5103,7 +6714,7 @@ mod tests {
         }
         let caret = rows
             .iter()
-            .rposition(|r| r.starts_with('\u{276F}'))
+            .rposition(|r| r.starts_with(['\u{276F}', '>']))
             .unwrap_or(0);
         out.push_str(&format!("\x1b[{};3H", caret + 1));
         let term = app.pool.get(session).expect("session").term.clone();
@@ -5889,5 +7500,575 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn agy_launch_card_and_composer_footer_render_on_the_glass() {
+        let (mut app, wid, session) = glass(120);
+        {
+            let entry = app.pool.get(session).expect("session");
+            let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            timeline.note_foreground_group(4242);
+            timeline.set_program(4242, Some("agy".into()));
+            assert!(timeline.set_claude_footer(
+                4242,
+                None,
+                Some(FooterFacts {
+                    model_open: true,
+                    effort_open: true,
+                    path: Some("~/aterm".into()),
+                    branch: Some("main".into()),
+                    owner: Some(footer::FactsOwner {
+                        floor: None,
+                        session_id: "agy-4242".into(),
+                    }),
+                    ..FooterFacts::default()
+                }),
+            ));
+        }
+        let host = crate::harness_host::HostHandle::for_supervised_test(
+            Vec::new(),
+            std::sync::Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+        );
+        app.harness = Some(host.clone());
+        let ctx = app.pool.get(session).expect("session").ctx.clone();
+        crate::session_timeline::claim_supervisor(
+            &ctx,
+            &crate::harness_host::holder(),
+            None,
+            None,
+            crate::metrics::now_us(),
+        )
+        .expect("claim");
+
+        let rule = "\u{2500}".repeat(120);
+        let rows = vec![
+            String::new(),
+            "      \u{2584}\u{2580}\u{2580}\u{2584}        Antigravity CLI 1.4.0".into(),
+            "     \u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}       redacted-user@example.test (Google AI Ultra)".into(),
+            "    \u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}      Gemini 4 Argon (Medium)".into(),
+            "   \u{2584}\u{2580}\u{2580}    \u{2580}\u{2580}\u{2584}     ~/aterm".into(),
+            "  \u{2584}\u{2580}\u{2580}      \u{2580}\u{2580}\u{2584}".into(),
+            String::new(),
+            rule.clone(),
+            "> ".into(),
+            rule,
+            "? for shortcuts                                                                                  Gemini 4 Argon \u{00B7} medium".into(),
+        ];
+        feed_rows(&app, session, &rows);
+        frame(&mut app, wid);
+
+        let strip = strip(&app, wid);
+        let card_line = text_of(&app.windows[&wid].input_scratch.cells[strip + 5]);
+        assert!(
+            card_line.contains("enhanced by aterm harness")
+                && card_line.contains("\u{00B7} agy \u{00B7}")
+                && card_line.contains("autopilot"),
+            "agy card line on row top+4: {card_line:?}"
+        );
+        assert!(
+            !app.windows[&wid].input_scratch.glow_under.is_empty(),
+            "agy card rainbow border and trail drawn"
+        );
+        assert!(
+            !app.windows[&wid].input_scratch.nova_add.is_empty(),
+            "agy card kitty and stars drawn"
+        );
+        let top_rule = text_of(&app.windows[&wid].input_scratch.cells[strip + 7]);
+        assert!(
+            top_rule.contains("\u{2726} alab kitty \u{00B7} agy harness \u{25CF} on"),
+            "agy top rule has ALab rainbow kitty harness brand: {top_rule:?}"
+        );
+        let bottom_rule = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
+        assert!(
+            bottom_rule.contains('\u{221E}') && bottom_rule.contains('\u{2699}'),
+            "agy composer rule has autopilot and settings chips: {bottom_rule:?}"
+        );
+        assert!(
+            bottom_rule
+                .contains("\u{25C6} Gemini 4 Argon medium   \u{2302} ~/aterm   \u{2387} main"),
+            "agy composer rule has model, effort, path, and branch: {bottom_rule:?}"
+        );
+        host.shutdown_and_join();
+    }
+
+    #[test]
+    fn muse_launch_card_and_composer_footer_render_on_the_glass() {
+        let (mut app, wid, session) = glass(120);
+        {
+            let entry = app.pool.get(session).expect("session");
+            let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            timeline.note_foreground_group(5151);
+            timeline.set_program(5151, Some("muse".into()));
+            assert!(timeline.set_claude_footer(
+                5151,
+                None,
+                Some(FooterFacts {
+                    model_open: true,
+                    effort_open: true,
+                    path: Some("~/aterm".into()),
+                    branch: Some("main".into()),
+                    owner: Some(footer::FactsOwner {
+                        floor: None,
+                        session_id: "muse-5151".into(),
+                    }),
+                    ..FooterFacts::default()
+                }),
+            ));
+        }
+        let host = crate::harness_host::HostHandle::for_supervised_test(
+            Vec::new(),
+            std::sync::Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+        );
+        app.harness = Some(host.clone());
+        let ctx = app.pool.get(session).expect("session").ctx.clone();
+        crate::session_timeline::claim_supervisor(
+            &ctx,
+            &crate::harness_host::holder(),
+            None,
+            None,
+            crate::metrics::now_us(),
+        )
+        .expect("claim");
+
+        let rule = "\u{2500}".repeat(120);
+        let rows = vec![
+            String::new(),
+            "  Muse Code 0.9.3".into(),
+            String::new(),
+            rule.clone(),
+            "\u{276F} ".into(),
+            rule,
+            "  gpt-5.4 \u{00B7} high \u{00B7} ~/aterm \u{00B7} Auto-review".into(),
+        ];
+        feed_rows(&app, session, &rows);
+        frame(&mut app, wid);
+
+        let strip = strip(&app, wid);
+        let card_line = text_of(&app.windows[&wid].input_scratch.cells[strip + 2]);
+        assert!(
+            card_line.contains("enhanced by aterm harness")
+                && card_line.contains("\u{00B7} muse \u{00B7}")
+                && card_line.contains("autopilot"),
+            "muse card line on row top+1: {card_line:?}"
+        );
+        assert!(
+            !app.windows[&wid].input_scratch.glow_under.is_empty(),
+            "muse card rainbow border and trail drawn"
+        );
+        assert!(
+            !app.windows[&wid].input_scratch.nova_add.is_empty(),
+            "muse card kitty and stars drawn"
+        );
+        let top_rule = text_of(&app.windows[&wid].input_scratch.cells[strip + 3]);
+        assert!(
+            top_rule.contains("\u{2726} alab kitty \u{00B7} muse harness \u{25CF} on"),
+            "muse top rule has ALab rainbow kitty harness brand: {top_rule:?}"
+        );
+        let bottom_rule = text_of(&app.windows[&wid].input_scratch.cells[strip + 5]);
+        assert!(
+            bottom_rule.contains('\u{221E}') && bottom_rule.contains('\u{2699}'),
+            "muse composer rule has autopilot and settings chips: {bottom_rule:?}"
+        );
+        assert!(
+            bottom_rule.contains("\u{25C6} gpt-5.4 high   \u{2302} ~/aterm   \u{2387} main"),
+            "muse composer rule has model, effort, path, and branch: {bottom_rule:?}"
+        );
+        host.shutdown_and_join();
+    }
+
+    #[test]
+    fn single_toggle_switch_disables_and_reenables_entire_harness_for_claude_agy_and_muse() {
+        let rule = "\u{2500}".repeat(120);
+        let claude_fixture = vec![
+            String::new(),
+            " \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259C}\u{258C}   Claude Code v2.1.92".into(),
+            "\u{259D}\u{259C}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{259B}\u{2598}  Opus 4.6 \u{00B7} Claude Max".into(),
+            "  \u{2598}\u{2598} \u{259D}\u{259D}    ~/aterm".into(),
+            String::new(),
+            rule.clone(),
+            "\u{276F} ".into(),
+            rule.clone(),
+            "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle)".into(),
+        ];
+        let agy_fixture = vec![
+            "      \u{2584}\u{2580}\u{2580}\u{2584}        Antigravity CLI 1.4.0".into(),
+            "     \u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}       redacted-user@example.test (Google AI Ultra)".into(),
+            "    \u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}      Gemini 4 Argon (Medium)".into(),
+            "   \u{2584}\u{2580}\u{2580}    \u{2580}\u{2580}\u{2584}     ~/aterm".into(),
+            "  \u{2584}\u{2580}\u{2580}      \u{2580}\u{2580}\u{2584}".into(),
+            "\u{25CF} # Heading".into(),
+            rule.clone(),
+            "> ".into(),
+            rule.clone(),
+            "? for shortcuts                                                                                  Gemini 4 Argon \u{00B7} medium".into(),
+        ];
+        let muse_fixture = vec![
+            String::new(),
+            "  Muse Code 0.9.3".into(),
+            String::new(),
+            rule.clone(),
+            "\u{276F} ".into(),
+            rule,
+            "  gpt-5.4 \u{00B7} high \u{00B7} ~/aterm \u{00B7} Auto-review".into(),
+        ];
+
+        for (prog, rows, top_rule_row, card_row) in [
+            ("claude", claude_fixture, 5usize, 4usize),
+            ("agy", agy_fixture, 6usize, 4usize),
+            ("muse", muse_fixture, 3usize, 2usize),
+        ] {
+            let (mut app, wid, session) = glass(120);
+            {
+                let entry = app.pool.get(session).expect("session");
+                let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                timeline.note_foreground_group(7000);
+                timeline.set_program(7000, Some(prog.into()));
+                assert!(timeline.set_claude_footer(
+                    7000,
+                    None,
+                    Some(FooterFacts {
+                        model_open: true,
+                        effort_open: true,
+                        path: Some("~/aterm".into()),
+                        branch: Some("main".into()),
+                        owner: Some(footer::FactsOwner {
+                            floor: None,
+                            session_id: format!("{prog}-7000"),
+                        }),
+                        ..FooterFacts::default()
+                    }),
+                ));
+            }
+            let host = crate::harness_host::HostHandle::for_supervised_test(
+                Vec::new(),
+                std::sync::Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+            );
+            app.harness = Some(host.clone());
+            let ctx = app.pool.get(session).expect("session").ctx.clone();
+            crate::session_timeline::claim_supervisor(
+                &ctx,
+                &crate::harness_host::holder(),
+                None,
+                None,
+                crate::metrics::now_us(),
+            )
+            .expect("claim");
+
+            feed_rows(&app, session, &rows);
+            frame(&mut app, wid);
+
+            let strip = strip(&app, wid);
+            let expected_badge = format!("\u{2726} alab kitty \u{00B7} {prog} harness \u{25CF} on");
+            let top_on = text_of(&app.windows[&wid].input_scratch.cells[strip + top_rule_row]);
+            assert!(
+                top_on.contains(&expected_badge),
+                "{prog}: active harness brands composer top rule: {top_on:?}"
+            );
+            let card_on = text_of(&app.windows[&wid].input_scratch.cells[strip + card_row]);
+            assert!(
+                card_on.contains("enhanced by aterm harness") && card_on.contains("autopilot"),
+                "{prog}: active harness draws launch card banner: {card_on:?}"
+            );
+            assert!(
+                !app.windows[&wid].input_scratch.nova_add.is_empty(),
+                "{prog}: active harness draws rainbow kitty"
+            );
+
+            // Toggle OFF with a single switch call during the running session.
+            let off_view = app.toggle_session_harness(session);
+            assert_eq!(
+                off_view.mode(),
+                Some(aterm_agent::supervise::Autopilot::Off),
+                "{prog}: single toggle switches harness to Off"
+            );
+            frame(&mut app, wid);
+
+            let top_off = text_of(&app.windows[&wid].input_scratch.cells[strip + top_rule_row]);
+            assert!(
+                !top_off.contains("alab kitty"),
+                "{prog}: toggled-off harness restores raw top rule: {top_off:?}"
+            );
+            let card_off = text_of(&app.windows[&wid].input_scratch.cells[strip + card_row]);
+            assert!(
+                !card_off.contains("enhanced by aterm harness"),
+                "{prog}: toggled-off harness removes launch card banner: {card_off:?}"
+            );
+            if prog == "agy" {
+                let raw_md = text_of(&app.windows[&wid].input_scratch.cells[strip + 5]);
+                assert_eq!(
+                    raw_md.trim_end(),
+                    "\u{25CF} # Heading",
+                    "agy: toggled-off harness restores raw transcript row"
+                );
+            }
+
+            // Toggle back ON with the same single switch during the running session.
+            let on_view = app.toggle_session_harness(session);
+            assert_eq!(
+                on_view.mode(),
+                Some(aterm_agent::supervise::Autopilot::Cruise),
+                "{prog}: second single toggle seamlessly re-enables Cruise"
+            );
+            frame(&mut app, wid);
+
+            let top_reenabled =
+                text_of(&app.windows[&wid].input_scratch.cells[strip + top_rule_row]);
+            assert!(
+                top_reenabled.contains(&expected_badge),
+                "{prog}: re-enabled harness restores composer top rule branding: {top_reenabled:?}"
+            );
+            let card_reenabled = text_of(&app.windows[&wid].input_scratch.cells[strip + card_row]);
+            assert!(
+                card_reenabled.contains("enhanced by aterm harness"),
+                "{prog}: re-enabled harness restores launch card banner: {card_reenabled:?}"
+            );
+
+            // Verify border_toggles remains registered in both On and Off states so
+            // clicking the top-right badge position can toggle On -> Off and Off -> On.
+            assert!(
+                !app.windows[&wid].claude_lights.border_toggles.is_empty(),
+                "{prog}: border_toggles registered when On"
+            );
+            app.toggle_session_harness(session);
+            frame(&mut app, wid);
+            assert!(
+                !app.windows[&wid].claude_lights.border_toggles.is_empty(),
+                "{prog}: border_toggles still registered when Off so top-right click can re-enable"
+            );
+
+            host.shutdown_and_join();
+        }
+    }
+
+    #[test]
+    fn agy_glass_presentation_preserves_literal_cells_and_undoes_cleanly() {
+        fn collect(scratch: &RenderInput) -> Vec<AgyRowEdit> {
+            collect_for(scratch, aterm_phase::Program::Agy)
+        }
+        fn collect_for(scratch: &RenderInput, program: aterm_phase::Program) -> Vec<AgyRowEdit> {
+            let rows: Vec<String> = scratch
+                .cells
+                .iter()
+                .map(|r| r.iter().map(|c| c.ch).collect())
+                .collect();
+            let mut edits = Vec::new();
+            collect_agy_transcript_edits(
+                scratch,
+                program,
+                &rows,
+                PaneTextRegion {
+                    strip: 0,
+                    row_off: 0,
+                    col_off: 0,
+                    rows: scratch.rows,
+                    cols: scratch.cols,
+                },
+                Some(scratch.rows),
+                RenderCell::default(),
+                RenderCell {
+                    fg: [80, 80, 80],
+                    ..RenderCell::default()
+                },
+                [180, 100, 80],
+                &mut edits,
+            );
+            edits
+        }
+        let rows = [
+            "Signing in...",
+            "Authenticated.",
+            "  └ Tip: literal tool output",
+            "^[[?2026$p^[P>|aterm(0.42.0)",
+            "○ Thought for 1s (literal suffix)",
+            "● # Overview",
+            "  Here is **bold**, *italic*, and `code`.",
+            "  ```text",
+            "  Signing in...",
+            "  └ Tip: literal code",
+            "  **literal**",
+            "  ^[[?2026$p",
+            "  ```",
+            "  - First item",
+            "  ```text",
+            "──────────────",
+            "> x",
+            "hello",
+            "  **literal**",
+            "      ▄▀▀▄        Antigravity CLI 1.4.0",
+            "     ▀▀▀▀▀▀       redacted-user@example.test (Google AI Ultra)",
+            "    ▀▀▀▀▀▀▀▀      Gemini 4 Argon (Medium)",
+            "   ▄▀▀    ▀▀▄     ~/aterm",
+            "  ▄▀▀      ▀▀▄",
+            "  **still literal after a quoted card**",
+            "  ```",
+        ];
+        let quoted: Vec<String> = rows.iter().map(|r| (*r).to_owned()).collect();
+        assert!(aterm_phase::agy::launch_card_scan(&quoted).1.is_some());
+        let mut scratch = RenderInput::empty();
+        scratch.rows = rows.len();
+        scratch.cols = 100;
+        scratch.cursor_visible = false;
+        scratch.cells = rows.iter().map(|r| row_of(r, [0, 0, 0])).collect();
+        let original = scratch.cells.clone();
+        let edits = collect(&scratch);
+        assert_eq!(
+            edits.iter().map(|e| e.frame_row).collect::<Vec<_>>(),
+            vec![5, 6, 13]
+        );
+        let mut undo_slot = FooterUndo::default();
+        write_edits(
+            &mut undo_slot,
+            &mut scratch,
+            edits
+                .iter()
+                .map(|e| (e.frame_row, e.col, e.cells.as_slice(), e.ground)),
+        );
+        assert_eq!(text_of(&scratch.cells[5]).trim_end(), "● Overview");
+        assert!(
+            scratch.cells[5][2].bold
+                && scratch.cells[5][2].underline == aterm_core::terminal::UnderlineStyle::Single,
+            "H1 heading is bold + underlined"
+        );
+        assert_eq!(
+            text_of(&scratch.cells[6]).trim_end(),
+            "  Here is bold, italic, and code."
+        );
+        assert!(scratch.cells[6][10].bold && scratch.cells[6][16].italic);
+        assert_ne!(
+            scratch.cells[6][28].bg,
+            RenderCell::default().bg,
+            "inline code pill background tinted"
+        );
+        assert_eq!(text_of(&scratch.cells[13]).trim_end(), "  • First item");
+        for (r, original_row) in original.iter().enumerate().take(scratch.rows) {
+            if ![5, 6, 13].contains(&r) {
+                assert_eq!(&scratch.cells[r], original_row);
+            }
+        }
+        assert!(undo(&mut undo_slot, &mut scratch));
+        assert_eq!(scratch.cells, original);
+
+        // Verify H2/H3 visual hierarchy, links, checkboxes, nested bullets, and quotes.
+        let md_rows = [
+            "  ## Section",
+            "  ### Detail",
+            "  See [docs](https://example.com) now.",
+            "  - [ ] Pending",
+            "    - Nested",
+            "  > Quoted",
+        ];
+        scratch.rows = md_rows.len();
+        scratch.cells = md_rows.iter().map(|r| row_of(r, [0, 0, 0])).collect();
+        let md_edits = collect(&scratch);
+        assert_eq!(md_edits.len(), 6);
+        assert_eq!(text_of(&md_edits[0].cells).trim_end(), "  Section");
+        assert!(
+            md_edits[0].cells[2].bold
+                && !md_edits[0].cells[2].italic
+                && md_edits[0].cells[2].underline == aterm_core::terminal::UnderlineStyle::None
+        );
+        assert_eq!(text_of(&md_edits[1].cells).trim_end(), "  Detail");
+        assert!(md_edits[1].cells[2].bold && md_edits[1].cells[2].italic);
+        assert_eq!(text_of(&md_edits[2].cells).trim_end(), "  See docs now.");
+        assert_eq!(
+            md_edits[2].cells[6].underline,
+            aterm_core::terminal::UnderlineStyle::Single
+        );
+        assert_eq!(text_of(&md_edits[3].cells).trim_end(), "  \u{2610} Pending");
+        assert_eq!(
+            text_of(&md_edits[4].cells).trim_end(),
+            "    \u{25E6} Nested"
+        );
+        assert_eq!(text_of(&md_edits[5].cells).trim_end(), "  \u{258E} Quoted");
+
+        // Verify Muse transcript grammar: `◆ ` reply lead and continuations are styled,
+        // while `❯ ` user prompts (and wrapped 2-space user continuations), tool boxes
+        // (`  ╭─`, `  │ `), and status lines (`  ◇ `) stay untouched.
+        let muse_rows = [
+            "  Muse Code 0.9.3",
+            "\u{276f} user prompt",
+            "  **wrapped user text stays literal**",
+            "  \u{256d}\u{2500} Bash",
+            "  \u{2502} **tool output stays literal**",
+            "  \u{2570}\u{2500}",
+            "  \u{25c7} Thinking **literal**...",
+            "\u{25c6} # Muse Heading",
+            "  Here is ***bold italic*** and **bold `code`**.",
+            "  ---",
+        ];
+        scratch.rows = muse_rows.len();
+        scratch.cells = muse_rows.iter().map(|r| row_of(r, [0, 0, 0])).collect();
+        let muse_edits = collect_for(&scratch, aterm_phase::Program::Muse);
+        assert_eq!(
+            muse_edits.iter().map(|e| e.frame_row).collect::<Vec<_>>(),
+            vec![7, 8, 9],
+            "only Muse assistant reply rows (7, 8, 9) are styled"
+        );
+        assert_eq!(
+            text_of(&muse_edits[0].cells).trim_end(),
+            "\u{25c6} Muse Heading"
+        );
+        assert_eq!(
+            text_of(&muse_edits[1].cells).trim_end(),
+            "  Here is bold italic and bold code."
+        );
+        assert!(muse_edits[1].cells[10].bold && muse_edits[1].cells[10].italic);
+        assert!(
+            muse_edits[2]
+                .cells
+                .iter()
+                .skip(2)
+                .take(10)
+                .all(|c| c.ch == '\u{2500}'),
+            "horizontal rule rendered as box-drawing line"
+        );
+
+        // A clipped viewport has no opening fence to establish code context.
+        // Startup-like strings still cannot authorize deletion.
+        scratch.rows = 3;
+        scratch.cells = [8, 9, 11]
+            .into_iter()
+            .map(|r| original[r].clone())
+            .collect();
+        assert!(collect(&scratch).is_empty());
+
+        // Ordinary markdown still styles; wide continuation and presentation
+        // flags require the untouched cells, not plain-character rebuilding.
+        scratch.rows = 1;
+        scratch.cells = vec![row_of("  **text**", [0, 0, 0])];
+        assert_eq!(collect(&scratch).len(), 1);
+        scratch.cells = vec![row_of("  **你 **", [0, 0, 0])];
+        scratch.cells[0][5].wide = true;
+        assert!(collect(&scratch).is_empty());
+        scratch.cells = vec![row_of("  **❤ **", [0, 0, 0])];
+        scratch.cells[0][4].emoji_presentation = true;
+        scratch.cells[0][5].wide = true;
+        assert!(collect(&scratch).is_empty());
+        scratch.cells = vec![row_of("  **😀**", [0, 0, 0])];
+        scratch.cells[0][4].text_presentation = true;
+        assert!(collect(&scratch).is_empty());
+        scratch.cells = vec![row_of("  **גבא**", [0, 0, 0])];
+        let mut map: Vec<u16> = (0..scratch.cols)
+            .map(|c| u16::try_from(c).unwrap())
+            .collect();
+        map.swap(4, 6);
+        scratch.visual_to_logical = vec![map];
+        assert!(collect(&scratch).is_empty());
+        scratch.visual_to_logical.clear();
+        assert_eq!(collect(&scratch).len(), 1);
+        scratch.cells = vec![row_of("  **text**", [0, 0, 0])];
+        scratch.selection.start_selection(
+            0,
+            2,
+            aterm_core::selection::SelectionSide::Left,
+            aterm_core::selection::SelectionType::Simple,
+        );
+        scratch
+            .selection
+            .update_selection(0, 7, aterm_core::selection::SelectionSide::Right);
+        scratch.selection.complete_selection();
+        assert!(scratch.any_selection());
+        assert!(collect(&scratch).is_empty());
     }
 }

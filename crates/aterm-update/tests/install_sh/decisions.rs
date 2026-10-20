@@ -185,11 +185,8 @@ fn digests_compare_case_blind_and_never_empty() {
 /// identity, and the lane compared that whole report, refusing every release.
 /// A version on a later line is not the identity; a candidate that cannot run
 /// is a different refusal from one that names another release.
+#[cfg(target_os = "linux")]
 #[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "the Linux release lane's probe runs under coreutils timeout"
-)]
 fn the_linux_candidate_is_judged_by_its_identity_line() {
     let scratch = Scratch::new();
     // aterm-cli's version_text: identity, origin, build, which copy, trust roots.

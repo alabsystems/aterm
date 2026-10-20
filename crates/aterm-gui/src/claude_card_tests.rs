@@ -212,11 +212,12 @@ fn expected_line(view: AutopilotView, at: usize, cols: usize) -> String {
 
 /// THE WRAPPED CARD (§3): Cruise under this host's live claim — the border
 /// and the trail in `glow_under` (window pixels, additive on a dark ground,
-/// every quad on one of the box's frame rows), the kitty and the stars in
-/// `nova_add` (the kitty opaque art), and the line `✦ enhanced by aterm
-/// harness <version> · autopilot ∞ cruise` written on the glass under the
-/// card at its text column, in the footer's value colour, inked, behind a
-/// drawn `Star4`.
+/// every quad on one of the box's frame rows or the blank rows over and
+/// under it, the border standing half a row into each: its air, §10.6.8),
+/// the kitty and the stars in `nova_add` (the kitty opaque art), and the
+/// line `✦ enhanced by aterm harness <version> · autopilot ∞ cruise`
+/// written on the glass under the card at its text column, in the footer's
+/// value colour, inked, behind a drawn `Star4`.
 #[test]
 fn the_wrapped_card_wears_its_border_kitty_stars_and_line() {
     let (mut app, wid, session) = glass(120);
@@ -228,7 +229,8 @@ fn the_wrapped_card_wears_its_border_kitty_stars_and_line() {
     );
     frame(&mut app, wid);
     let strip = strip_rows(&app, wid);
-    // The card's banner is pane row 1: the box is rows 1..=4 (the line's).
+    // The card's banner is pane row 1: the box is rows 1..=4 (the line's),
+    // blank rows 0 and 5 its air.
     let (top, text_col) = (1usize, 11usize);
     let p = painted(&app, wid);
     assert!(!p.under.is_empty(), "the border and the trail");
@@ -239,8 +241,8 @@ fn the_wrapped_card_wears_its_border_kitty_stars_and_line() {
         assert_eq!(q.alpha, 0, "additive light on a dark ground");
         let row = usize::from(q.row);
         assert!(
-            (strip + top..strip + top + 4).contains(&row),
-            "row {row}: one of the box's frame rows"
+            (strip + top - 1..=strip + top + 4).contains(&row),
+            "row {row}: one of the box's frame rows, or its air's"
         );
     }
     for q in &p.over {
@@ -259,6 +261,19 @@ fn the_wrapped_card_wears_its_border_kitty_stars_and_line() {
         p.under
             .iter()
             .all(|q| y_of(q) >= grid_top + usize::from(q.row) * ch)
+    );
+    // The border half a row into the blank rows over and under the box.
+    let (y0, y1) = (
+        p.under.iter().map(y_of).min(),
+        p.under.iter().map(|q| y_of(q) + usize::from(q.h)).max(),
+    );
+    assert_eq!(
+        (y0, y1),
+        (
+            Some(grid_top + (strip + top) * ch - ch / 2),
+            Some(grid_top + (strip + top + 4) * ch + ch / 2)
+        ),
+        "the border stands in the box's air"
     );
     assert!(
         p.over
@@ -776,6 +791,56 @@ fn the_cards_line_follows_an_armed_timer() {
     ] {
         assert_eq!(end.timed(view, at), end, "CONTROL: {view:?} {end:?}");
     }
+
+    // Agy starts untimed; Muse starts timed. Timed text must not occupy
+    // the untimed mode slot, and changing a timer's face changes its words.
+    for (rows_kind, agent, timed_first) in [(4, "agy", false), (1, "muse", true)] {
+        let first = timed_first.then(|| {
+            line_texts_for(
+                rows_kind,
+                AutopilotView::Cruise,
+                LineEnd::CruiseUntil(six_pm(false)),
+            )
+        });
+        let cruise = line_texts_for(rows_kind, AutopilotView::Cruise, LineEnd::Mode);
+        assert!(cruise[0].contains(&format!(" \u{b7} {agent} \u{b7} autopilot")));
+        assert!(
+            !cruise[0].contains('\u{2913}'),
+            "an untimed line stays untimed"
+        );
+        let mut timed = Vec::new();
+        for (other_day, tail) in [(false, "\u{2913}18:00"), (true, "\u{2913}Sat 18:00")] {
+            let end = LineEnd::CruiseUntil(six_pm(other_day));
+            let texts = line_texts_for(rows_kind, AutopilotView::Cruise, end);
+            assert_eq!(texts[0], format!("{} {tail}", cruise[0]));
+            assert_eq!(texts[1..], cruise[..], "then the untimed rungs");
+            assert!(std::ptr::eq(
+                texts,
+                line_texts_for(rows_kind, AutopilotView::Cruise, end),
+            ));
+            assert_eq!(
+                line_texts_for(rows_kind, AutopilotView::Land, end),
+                line_texts_for(rows_kind, AutopilotView::Land, LineEnd::Mode),
+                "the timer is Cruise's",
+            );
+            timed.push(texts);
+        }
+        assert_ne!(timed[0][0], timed[1][0], "each face keeps its own words");
+        if let Some(first) = first {
+            assert!(
+                std::ptr::eq(first, timed[0]),
+                "the timed-first face is reused"
+            );
+        }
+        assert!(std::ptr::eq(
+            cruise,
+            line_texts_for(rows_kind, AutopilotView::Cruise, LineEnd::Mode),
+        ));
+        assert!(
+            !cruise[0].contains('\u{2913}'),
+            "cleared timer, untimed words"
+        );
+    }
 }
 
 /// THE TIMER ON THE GLASS: a settled Cruise card whose session arms a timer
@@ -889,7 +954,12 @@ fn off_unsupervised_switched_off_another_build_or_scrolled_back_draw_nothing() {
         }),
         ("unsupervised", |app, session| {
             let ctx = app.pool.get(session).unwrap().ctx.clone();
-            crate::session_timeline::release_supervisor(&ctx, None, crate::metrics::now_us());
+            crate::session_timeline::release_supervisor(
+                &ctx,
+                None,
+                crate::metrics::now_us(),
+                aterm_slog::Actor::Ctl,
+            );
         }),
         ("switched off", |app, _| {
             app.config.claude_footer = Some(crate::app_config::ClaudeFooterConfig {
@@ -1150,22 +1220,59 @@ fn the_card_settles_to_a_constant_key_and_arms_no_wake() {
     host.shutdown_and_join();
 }
 
-/// LIGHT THEMES (§3: "additive light is invisible on white"): every quad of
-/// the card is source-over ink (`alpha > 0`), and its star is stamped over.
+/// LIGHT THEMES (§3: "additive light is invisible on white"). A LIGHT
+/// THEME'S CARD IS INK, ITS LINE TEXT ON ITS OWN GROUND: on white and on a
+/// cream ground (Gruvbox Light's), every quad of the card is source-over ink,
+/// the line's `✦` is opaque ink (on light it was a see-through tint that
+/// fell under AA), every letter reads at 4.5:1 or more against the pane's
+/// ground, and no letter is solved on its own — the scene's ground and the
+/// line's are both the pane's, so the line's inks are the ones the card's
+/// tick kept (`harness_card::take_line_ink_solves`). On cream, letters
+/// solved for white fall under AA.
 #[test]
 fn a_light_theme_card_is_ink() {
-    let (mut app, wid, session) = glass(120);
-    {
-        let term = app.pool.get(session).unwrap().term.clone();
-        crate::term_lock(&term).process(b"\x1b]11;rgb:ff/ff/ff\x1b\\\x1b]10;rgb:20/20/20\x1b\\");
+    use aterm_effects::color_math::relative_luminance;
+    let contrast = |a: u32, b: u32| {
+        let (la, lb) = (relative_luminance(a), relative_luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    };
+    for (osc, bg) in [("ff/ff/ff", 0x00FF_FFFF), ("fb/f1/c7", 0x00FB_F1C7)] {
+        let (mut app, wid, session) = glass(120);
+        {
+            let term = app.pool.get(session).unwrap().term.clone();
+            crate::term_lock(&term)
+                .process(format!("\x1b]11;rgb:{osc}\x1b\\\x1b]10;rgb:20/20/20\x1b\\").as_bytes());
+        }
+        let host = supervise(&mut app, session);
+        let _ = aterm_effects::harness_card::take_line_ink_solves();
+        frame(&mut app, wid);
+        let p = painted(&app, wid);
+        assert!(!p.under.is_empty() && !p.over.is_empty(), "{osc}");
+        assert!(p.under.iter().chain(&p.over).all(|q| q.alpha > 0), "{osc}");
+        assert!(
+            !p.decos.is_empty()
+                && p.decos
+                    .iter()
+                    .all(|d| d.blend == DecoBlend::Over && d.alpha == u8::MAX),
+            "{osc}: {:?}",
+            p.decos
+        );
+        assert!(p.ink.len() > 20, "{osc}: the line, {} letters", p.ink.len());
+        for c in &p.ink {
+            let rgb = pack(c.color);
+            assert!(
+                contrast(rgb, bg) >= 4.5,
+                "{osc}: {rgb:06x} at {:.2}:1",
+                contrast(rgb, bg)
+            );
+        }
+        assert_eq!(
+            aterm_effects::harness_card::take_line_ink_solves(),
+            0,
+            "{osc}: letters solved on their own"
+        );
+        host.shutdown_and_join();
     }
-    let host = supervise(&mut app, session);
-    frame(&mut app, wid);
-    let p = painted(&app, wid);
-    assert!(!p.under.is_empty() && !p.over.is_empty());
-    assert!(p.under.iter().chain(&p.over).all(|q| q.alpha > 0));
-    assert!(p.decos.iter().all(|d| d.blend == DecoBlend::Over));
-    host.shutdown_and_join();
 }
 
 /// A NARROW PANE gives up the kitty and its trail first (they need 8 trail
@@ -1277,6 +1384,21 @@ fn scratch_of(rows: &[String], cols: usize) -> RenderInput {
     s
 }
 
+/// [`scratch_of`]'s rows as one pane, its whole width, in the default blank.
+fn cells_on(scratch: &RenderInput) -> PaneCells<'_> {
+    PaneCells {
+        scratch,
+        pane: PaneGeom {
+            strip: 0,
+            row_off: 0,
+            col_off: 0,
+            rows: scratch.rows,
+            cols: scratch.cols,
+        },
+        blank: RenderCell::default(),
+    }
+}
+
 /// The rows of [`card_screen`] above the composer, the card's banner at row 1.
 fn card_rows(cols: usize, model: &str) -> Vec<String> {
     card_screen(12, cols, model, VERSION)[..8].to_vec()
@@ -1291,10 +1413,60 @@ fn card_rows(cols: usize, model: &str) -> Vec<String> {
 /// trail's start to the kitty's margin — a glyph anywhere in that span, at
 /// either end of it, keeps it two rows tall, one past it does not (the row
 /// is read no further) — and the read is one of the layout's noted tests
-/// ([`Seen`]): a glyph put in the span after it fails them.
+/// ([`Seen`]): a glyph put in the span after it fails them. The box has its
+/// AIR (§10.6.8) over and under it where the pane rows there are blank from
+/// column 0 to the border's column: a glyph over the box at either end of
+/// that span takes the air over it, one past it does not (the row is read no
+/// further, and a glyph there passes the noted tests); none over the pane's
+/// first row, where no row over it is read; none under it over a notice or
+/// at the pane's last row; and none under a three-row box, whose row under
+/// it the line's test read and is not read again.
 #[test]
 fn the_layout_follows_the_designs_rules() {
     let texts = vec!["w".repeat(40), "v".repeat(20)];
+    // A scan with a visible agy banner but no complete card still owns
+    // five rows. Completing only its path or feet must invalidate absence.
+    let agy = vec![
+        "      ▄▀▀▄        Antigravity CLI 1.4.0".to_string(),
+        "     ▀▀▀▀▀▀       user@example.test (Google AI Ultra)".to_string(),
+        "    ▀▀▀▀▀▀▀▀      Gemini 4 Argon (Medium)".to_string(),
+        "   ▄▀▀    ▀▀▄     ~/aterm".to_string(),
+        "  ▄▀▀      ▀▀▄".to_string(),
+        String::new(),
+    ];
+    for missing in [3, 4] {
+        let mut incomplete = agy.clone();
+        incomplete[missing].clear();
+        let reading = read_card(7, &incomplete, None);
+        assert!(reading.read.is_none());
+        assert!(
+            !reading.holds(7, &agy, &[missing]),
+            "row {missing} completes the card"
+        );
+        let complete = read_card(7, &agy, None);
+        let card = complete.read.as_ref().expect("the completed agy card");
+        assert_eq!((card.place.rows, &*card.version), (4, "1.4.0"));
+        assert!(complete.holds(7, &agy, &[]));
+        let mut under = agy.clone();
+        under[5] = "ordinary output under the card".to_string();
+        assert!(
+            complete.holds(7, &under, &[5]),
+            "unrelated output keeps the reading"
+        );
+    }
+    // Claude's scanner has priority even when its newly drawn banner is
+    // above an existing agy card, outside that card's own changed rows.
+    let mut lower = vec![String::new(); 8];
+    lower.extend(agy.clone());
+    let reading = read_card(7, &lower, None);
+    assert_eq!(reading.read.as_ref().expect("agy").place.rows, 4);
+    let claude = card_rows(120, MODEL);
+    let mut both = lower;
+    both[..claude.len()].clone_from_slice(&claude);
+    assert!(!reading.holds(7, &both, &[1, 2, 3]));
+    let preferred = read_card(7, &both, None);
+    let card = preferred.read.as_ref().expect("Claude remains preferred");
+    assert_eq!((card.place.rows, &*card.version), (3, VERSION));
     let lay = |rows: &[String], cols: usize, kc: usize| {
         let s = scratch_of(rows, cols);
         let place = aterm_phase::launch_card_place(rows).expect("a card");
@@ -1317,6 +1489,7 @@ fn the_layout_follows_the_designs_rules() {
     let rows = card_rows(120, MODEL);
     let l = lay(&rows, 120, 6).expect("laid out");
     assert_eq!(l.rows, 4);
+    assert_eq!(l.air, (true, true), "blank rows over and under the box");
     assert_eq!(
         l.line,
         Some(LinePlace {
@@ -1401,12 +1574,84 @@ fn the_layout_follows_the_designs_rules() {
         };
         assert!(seen.hold(&cells), "one past the span: never read");
     }
+    // The air: the rows over and under the box, each read once from column
+    // 0 to the border's column, noted.
+    let span = l.cols + 1;
+    let over = |at: usize| {
+        let mut r = rows.clone();
+        r[0] = format!("{}x", " ".repeat(at));
+        r
+    };
+    for (at, air) in [(0, false), (l.cols, false), (span, true)] {
+        let l = lay(&over(at), 120, 6).expect("laid out");
+        assert_eq!(l.air, (air, true), "a glyph over the box at {at}");
+    }
+    {
+        let s = scratch_of(&rows, 120);
+        let place = aterm_phase::launch_card_place(&rows).expect("a card");
+        let cells = cells_on(&s);
+        let mut seen = Seen::default();
+        layout(&cells, &place, 6, &texts, &mut seen).expect("laid out");
+        for row in [0, 5] {
+            let read = Probe::Blanks {
+                row,
+                from: 0,
+                to: span,
+                len: span,
+            };
+            assert!(seen.0.contains(&read), "row {row} read: {:?}", seen.0);
+        }
+        for (at, holds) in [(l.cols, false), (span, true)] {
+            let moved = scratch_of(&over(at), 120);
+            assert_eq!(
+                seen.hold(&cells_on(&moved)),
+                holds,
+                "a glyph over the box at {at}"
+            );
+        }
+        // The card on the pane's first row: no row over it, none read.
+        let first = rows[1..].to_vec();
+        let s = scratch_of(&first, 120);
+        let place = aterm_phase::launch_card_place(&first).expect("a card");
+        let mut seen = Seen::default();
+        let l = layout(&cells_on(&s), &place, 6, &texts, &mut seen).expect("laid out");
+        assert_eq!((place.top, l.air), (0, (false, true)));
+        let from_0: Vec<usize> = seen
+            .0
+            .iter()
+            .filter_map(|p| match *p {
+                Probe::Blanks { row, from: 0, .. } => Some(row),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(from_0, [4], "only the row under the box: {:?}", seen.0);
+    }
+    // A notice under the box, and the line's row the pane's last.
+    let mut notice = rows.clone();
+    notice[5] = "  Get to finished work sooner with Opus 5.5".to_string();
+    assert_eq!(lay(&notice, 120, 6).expect("laid out").air, (true, false));
+    let l = lay(&rows[..5], 120, 6).expect("laid out");
+    assert_eq!((l.rows, l.air), (4, (true, false)), "nothing under the box");
     // Text under the card: the line goes on the banner row, the box keeps
-    // three rows and the kitty rides after the line.
+    // three rows and the kitty rides after the line; the row under the box
+    // is the one the line's test read, and is not read again for the air.
     let mut busy = rows.clone();
     busy[4] = "           a message under the card".to_string();
     let l = lay(&busy, 120, 6).expect("laid out");
     assert_eq!(l.rows, 3);
+    assert_eq!(l.air, (true, false), "a message under the box");
+    {
+        let s = scratch_of(&busy, 120);
+        let place = aterm_phase::launch_card_place(&busy).expect("a card");
+        let mut seen = Seen::default();
+        layout(&cells_on(&s), &place, 6, &texts, &mut seen).expect("laid out");
+        let under = seen
+            .0
+            .iter()
+            .filter(|p| matches!(p, Probe::Blanks { row: 4, .. }))
+            .count();
+        assert_eq!(under, 1, "the row under the box read once: {:?}", seen.0);
+    }
     let banner_end = 11 + banner().chars().count() + VERSION.len();
     let line = l.line.clone().expect("on the banner row");
     assert_eq!((line.row, line.col), (1, banner_end + 2));
@@ -1454,6 +1699,79 @@ fn the_layout_follows_the_designs_rules() {
     let l = layout(&cells, &place, 0, &short, &mut Seen::default()).expect("laid out");
     assert_eq!(l.cols, 38, "the working directory's wide glyph, whole");
     assert!(38 > banner_end.max(model_end).max(11 + LINE_LEAD + 1));
+
+    // agy's path is its fourth text row; CardPlace keeps only three ends.
+    // Drive the actual scanner and layout with a wide final path glyph.
+    let agy = vec![
+        "      ▄▀▀▄        Antigravity CLI 1.4.0".to_string(),
+        "     ▀▀▀▀▀▀       user@example.test (Google AI Ultra)".to_string(),
+        "    ▀▀▀▀▀▀▀▀      Gemini 4 Argon (Medium)".to_string(),
+        format!("   ▄▀▀    ▀▀▄     ~/{}東", "path/".repeat(12)),
+        "  ▄▀▀      ▀▀▄".to_string(),
+        String::new(),
+    ];
+    let place = aterm_phase::agy::launch_card_scan(&agy)
+        .1
+        .expect("a whole agy card");
+    assert_eq!(place.rows, 4);
+    let end = agy[3].chars().count();
+    assert_eq!(place.ends[2], end);
+    let mut s = scratch_of(&agy, 120);
+    s.cells[3].insert(
+        end,
+        RenderCell {
+            wide: true,
+            ..RenderCell::default()
+        },
+    );
+    s.cells[3].truncate(120);
+    let mut seen = Seen::default();
+    let l = layout(&cells_on(&s), &place, 0, &short, &mut seen).expect("wide path fits");
+    assert_eq!(l.cols, end + 1, "border column clears the continuation");
+    assert!(seen.hold(&cells_on(&s)));
+    let mut narrow = agy.clone();
+    narrow[3].pop();
+    narrow[3].push('x');
+    let narrow_place = aterm_phase::agy::launch_card_scan(&narrow)
+        .1
+        .expect("an ASCII path card");
+    let ascii = scratch_of(&narrow, 120);
+    let ordinary = layout(
+        &cells_on(&ascii),
+        &narrow_place,
+        0,
+        &short,
+        &mut Seen::default(),
+    )
+    .expect("ASCII path fits");
+    assert_eq!(
+        ordinary.cols, end,
+        "ASCII control needs no continuation column"
+    );
+    assert!(
+        !seen.hold(&cells_on(&ascii)),
+        "a changed fourth-row wide flag invalidates the cache"
+    );
+    // The continuation occupies the last pane cell: no clear border column
+    // remains. The same-width ASCII card still fits without that extra cell.
+    s.cols = end + 1;
+    for row in &mut s.cells {
+        row.truncate(s.cols);
+    }
+    assert!(layout(&cells_on(&s), &place, 0, &short, &mut Seen::default()).is_none());
+    let ascii = scratch_of(&narrow, end + 1);
+    assert_eq!(
+        layout(
+            &cells_on(&ascii),
+            &narrow_place,
+            0,
+            &short,
+            &mut Seen::default()
+        )
+        .expect("ASCII boundary control")
+        .cols,
+        end
+    );
 }
 
 /// The pane width a corpus capture was taken at: its name's `-<n>col`, else
@@ -1485,7 +1803,13 @@ fn capture_cols(name: &str, text: &str, rows: &[String]) -> usize {
 /// directory row is blank from the trail's start to the kitty's margin —
 /// judged here from the row's text — and two rows tall elsewhere. CONTROL:
 /// each card again with its path run on past the trail's start stands the
-/// kitty two rows tall, its place and its trail unchanged.
+/// kitty two rows tall, its place and its trail unchanged. THE AIR OVER THE
+/// CORPUS (§10.6.8): the box stands its border in the row over it, and in
+/// the row under it, exactly where that row is blank across the box's
+/// columns, judged from the rows' text — over the fullscreen renderer's
+/// cards (row 1, under a blank row 0), never over a card at the pane's
+/// first row (every inline capture, after the lab's clear) or under its
+/// launch line; under the box unless one of Claude's notices is there.
 #[test]
 fn every_recorded_card_stands_the_kitty_tall_only_beside_a_blank_path_row() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
@@ -1511,18 +1835,55 @@ fn every_recorded_card_stands_the_kitty_tall_only_beside_a_blank_path_row() {
             pane,
             blank: RenderCell::default(),
         };
-        layout(&cells, &place, kc, texts, &mut Seen::default())
-            .map(|l| (place, l.trail, l.kitty_col, l.kitty_rows))
+        layout(&cells, &place, kc, texts, &mut Seen::default()).map(|l| {
+            (
+                place,
+                l.trail,
+                l.kitty_col,
+                l.kitty_rows,
+                (l.rows, l.cols, l.air),
+            )
+        })
     };
     let (mut tall, mut short, mut bare, mut workspace) = (0, 0, 0, 0);
+    // The air's tallies: over the box (the card at the pane's first row, a
+    // blank row over it, text over it), and under it (blank, not).
+    let (mut first, mut aired, mut lined, mut under, mut noticed) = (0, 0, 0, 0, 0);
     for path in paths {
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let rows = aterm_phase::prompt::fixtures::screen(&text);
         let cols = capture_cols(&name, &text, &rows);
-        let Some((place, trail, kitty_col, rows_tall)) = lay(&rows, cols) else {
+        let Some((place, trail, kitty_col, rows_tall, (boxed, box_cols, air))) = lay(&rows, cols)
+        else {
             continue;
         };
+        // THE AIR (§10.6.8): over the box where the row over it is blank
+        // across the box's columns, under it where the row under it is —
+        // judged here from the rows' text.
+        let blank = |row: usize| {
+            rows[row]
+                .chars()
+                .chain(std::iter::repeat(' '))
+                .take(box_cols + 1)
+                .all(|c| c == ' ')
+        };
+        let below = place.top + boxed;
+        let want = (
+            place.top > 0 && blank(place.top - 1),
+            below < rows.len() && blank(below),
+        );
+        assert_eq!(air, want, "{name}: the air over and under the box");
+        match (place.top, air.0) {
+            (0, _) => first += 1,
+            (_, true) => aired += 1,
+            (_, false) => lined += 1,
+        }
+        if air.1 {
+            under += 1;
+        } else {
+            noticed += 1;
+        }
         let (Some((start, _)), Some(kitty_col)) = (trail, kitty_col) else {
             assert_eq!(rows_tall, 2, "{name}: no kitty");
             bare += 1;
@@ -1559,7 +1920,7 @@ fn every_recorded_card_stands_the_kitty_tall_only_beside_a_blank_path_row() {
             "{head}{}",
             "/deep".repeat(run).chars().take(run).collect::<String>()
         );
-        let (_, trail_long, kitty_long, rows_long) =
+        let (_, trail_long, kitty_long, rows_long, _) =
             lay(&long, cols).unwrap_or_else(|| panic!("{name}: the long path's card"));
         assert_eq!((trail_long, kitty_long), (trail, Some(kitty_col)), "{name}");
         assert_eq!(
@@ -1571,6 +1932,11 @@ fn every_recorded_card_stands_the_kitty_tall_only_beside_a_blank_path_row() {
         tall + short + bare >= 140 && tall >= 100 && workspace >= 1,
         "the corpus must exercise the layout: {tall} tall, {short} short, {bare} bare, \
          {workspace} workspace"
+    );
+    assert!(
+        first >= 140 && aired >= 70 && lined >= 10 && under >= 190 && noticed >= 40,
+        "the corpus must exercise the air: {first} at the first row, {aired} aired over, \
+         {lined} under a launch line, {under} aired under, {noticed} over a notice"
     );
 }
 
@@ -2214,7 +2580,8 @@ fn off_to_cruise_plays_though_the_claim_lands_a_frame_later() {
         assert!(crate::session_timeline::release_supervisor(
             &ctx,
             None,
-            crate::metrics::now_us()
+            crate::metrics::now_us(),
+            aterm_slog::Actor::Ctl
         ));
     };
     let mut t = Instant::now();
@@ -3296,20 +3663,22 @@ fn fresh_card(cols: u16, paint: &dyn Fn(&App, u64)) -> CardGlass {
 /// again, a keystroke in the composer, a row of output under it) costs no
 /// reading and no layout; a cell in each region the layout reads — the row
 /// under the card where the line goes, the card's rows right of their text
-/// where the kitty runs — laid anew, and so is a COLOUR-ONLY change of one
-/// (a coloured space is no blank; its row's text is the same), a combining
-/// mark on a space there (a side channel, the text the same) and a wide
-/// glyph; a card row whose last glyph turns wide or narrow again with as
-/// many chars (the same place: only the glyph's spacer cell says the row is
-/// a cell longer) is laid anew; a newer card printed below, the card
-/// scrolled, its own words edited and a resize read it anew; and the pass
-/// after each keeps what it made. An anchor right of where the line goes is
-/// past what the layout reads, and costs nothing.
+/// where the kitty runs, the rows over and under the box (its air) — is
+/// laid anew, and so is a COLOUR-ONLY change of one (a coloured space is no
+/// blank; its row's text is the same), a combining mark on a space there (a
+/// side channel, the text the same) and a wide glyph; a card row whose last
+/// glyph turns wide or narrow again with as many chars (the same place: only
+/// the glyph's spacer cell says the row is a cell longer) is laid anew; a
+/// newer card printed below, the card scrolled, its own words edited and a
+/// resize read it anew; and the pass after each keeps what it made. An
+/// anchor right of where the line goes, or right of the box over it, is past
+/// what the layout reads, and costs nothing.
 /// CONTROL: the comparisons are not vacuous — the line leaves the row under
-/// the card, the kitty moves, the card follows a scroll (each step's glass
-/// differs from the settled one's). Mutation-checked: a kept layout blind to
-/// colour, to the side channels, to the row under the card, to the kitty's
-/// rows or to a card row's wide last glyph (`Seen`'s wide tests), and a
+/// the card, the kitty moves, the border closes on the card over words or a
+/// notice, the card follows a scroll (each step's glass differs from the
+/// settled one's). Mutation-checked: a kept layout blind to colour, to the
+/// side channels, to the row under the card, to the kitty's rows, to the
+/// air's rows or to a card row's wide last glyph (`Seen`'s wide tests), and a
 /// reading kept across a changed card row or a newer banner, each fail here.
 #[test]
 fn a_change_the_card_reads_lays_it_as_a_fresh_window_would() {
@@ -3364,6 +3733,29 @@ fn a_change_the_card_reads_lays_it_as_a_fresh_window_would() {
         (
             "words where the line goes",
             edit(4, pad(4, 40, "word")),
+            String::new(),
+            (0, 1),
+            true,
+        ),
+        ("back", base.clone(), String::new(), (0, 1), false),
+        (
+            "words over the card",
+            edit(0, "x".into()),
+            String::new(),
+            (0, 1),
+            true,
+        ),
+        ("back", base.clone(), String::new(), (0, 1), false),
+        (
+            "an anchor right of the box over the card",
+            edit(0, pad(0, 100, "zz")),
+            String::new(),
+            (0, 0),
+            false,
+        ),
+        (
+            "a notice under the box",
+            edit(5, "  Get to finished work sooner".into()),
             String::new(),
             (0, 1),
             true,

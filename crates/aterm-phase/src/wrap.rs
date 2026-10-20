@@ -95,6 +95,68 @@ use crate::question::cells;
 /// first word, with two cells of slack, as the question dialog's measured
 /// labels wrap ([`crate::question`]).
 pub(crate) fn continues(above: &str, col: usize, below: &str, room: usize) -> bool {
+    wraps_with(above, 0, col, below, room, 2)
+}
+
+/// [`continues`] with no slack, for a caller that says its room to the cell
+/// and counts the row above as wrap-ansi filled it: `above` (its text) and
+/// the `lead` cells before it, [`lead`]'s, could not have taken `below`'s
+/// first word, a space before it, in `room` cells — where Ink breaks: its
+/// wrap-ansi moves a word that does not fit beside the row to the next one,
+/// and keeps one that fits (`hard` only breaks a word longer than a whole
+/// row). An unnumbered
+/// option's label (`crate::prompt`'s `unnumbered`), in the room a cell short
+/// of the pane's edge: Ink wraps one at the edge (MEASURED on 2.1.302's MCP
+/// server and folder-trust dialogs), and aterm's hand-built held-message
+/// frames a cell short of it (MODELLED), so a row is read as the rest where
+/// its first word has no room a cell short of the edge, where Ink could have
+/// wrapped it at either.
+pub(crate) fn continues_exactly(
+    above: &str,
+    lead: usize,
+    col: usize,
+    below: &str,
+    room: usize,
+) -> bool {
+    wraps_with(above, lead, col, below, room, 0)
+}
+
+/// The cells wrap-ansi spent on a row before its text: 1 where the row above
+/// it, `above` cells (its own lead counted), is at or past `room`, else 0.
+/// At it: the row exactly full in a box `room` wide, as Ink's wrap fills
+/// one. Past it: a row read in a room a cell short of where Ink wrapped it,
+/// as `crate::prompt`'s `unnumbered` reads a label (a cell short of the
+/// pane's edge), that is full to that edge — at 31 columns the MCP server
+/// dialog's `Use this and all future MCP`, 27 cells against 26 (MEASURED on
+/// 2.1.302) — under which Ink's row starts with the space too. A label row
+/// exactly full a cell short of the edge is counted so as well, though Ink,
+/// wrapping at the edge, starts the row under it with none: the room is read
+/// at the nearer of the two edges Ink could have wrapped at.
+/// Ink wraps its text with wrap-ansi, `trim` off (READ in
+/// 2.1.302's bundle: `Ku` calls `Bun.wrapAnsi(text, room, {trim: false, hard:
+/// true})`), which starts the row under a full row with the space before its
+/// next word; Ink's `Vb` then slices that one space off the row as it draws
+/// it, at the line's column. So the space is drawn nowhere and still takes a
+/// cell of that row: MEASURED on 2.1.302 (the MCP server dialog's title at 27
+/// columns, `New MCP server found in` filling its 23 cells over `this
+/// project:` over `lab-probe`, which fits beside `this project:` only
+/// without the space; its body at 21, `require approval.` over `Learn more
+/// in` over `the MCP`; the model picker's `0 per Mtok` over `($0.50/$2` over
+/// `.50 for`) and on 2.1.299 ([`rows_in`]).
+pub(crate) fn lead(above: usize, room: usize) -> usize {
+    usize::from(above >= room)
+}
+
+/// [`continues`] with `slack` cells of it, the row above `lead` cells into
+/// the room before its text.
+fn wraps_with(
+    above: &str,
+    lead: usize,
+    col: usize,
+    below: &str,
+    room: usize,
+    slack: usize,
+) -> bool {
     let rest = crate::text::trim(below);
     let drawn = |t: &str| t.chars().any(|c| ('\u{2500}'..='\u{259F}').contains(&c));
     if above.is_empty()
@@ -106,7 +168,7 @@ pub(crate) fn continues(above: &str, col: usize, below: &str, room: usize) -> bo
         return false;
     }
     let word = rest.split(' ').next().map_or(0, cells);
-    cells(above) + 1 + word + 2 > room
+    lead + cells(above) + 1 + word + slack > room
 }
 
 /// The room a line drawn from column `col` of a pane `width` cells wide has

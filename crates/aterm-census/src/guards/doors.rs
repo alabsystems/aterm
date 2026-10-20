@@ -28,7 +28,10 @@ fn product<'a>(tree: &Tree<'a>) -> impl Iterator<Item = &'a SourceFile> {
 const DEVTOOLS_HOME: &str = "crates/aterm-containment/src/consent.rs";
 /// The file of the one function that may run a change.
 const DEVTOOLS_FLOW: &str = "crates/aterm-gui/src/debugger_access.rs";
-/// That function: the live arm of the owner's confirmed gesture.
+/// That function: the live arm that runs a change for the owner's yes in aterm's
+/// alert. Both ways the yes is given reach it through the App's one start
+/// (`App::run_debugger_change`): the owner's press in Settings ▸ Security, and the
+/// alert aterm raises once per Mac at first launch (owner ruling O29).
 const DEVTOOLS_WORKER: &str = "spawn_devtools_worker";
 /// The runner: public, so aterm-gui can reach it.
 const DEVTOOLS_RUNNER: &str = "run_devtools_change";
@@ -76,9 +79,10 @@ pub(super) const DEVTOOLS_DOOR: Rule = Rule {
     id: "devtools-door",
     why: "DevToolsSecurity changes the debug right for the whole Mac and ENABLES when run with no \
           flag: no shipped line builds a process naming it, its path constant and argv live in \
-          consent.rs's builders alone, only the owner's confirmed gesture (aterm-gui's \
-          `spawn_devtools_worker`) runs `run_devtools_change`, no shipped line holds the bare tool \
-          path, and aterm calls no authorization-database or privileged-helper API",
+          consent.rs's builders alone, only the owner's yes in aterm's alert — their press, or \
+          the once-per-Mac launch ask — runs `run_devtools_change`, through aterm-gui's one \
+          worker `spawn_devtools_worker`, no shipped line holds the bare tool path, and aterm \
+          calls no authorization-database or privileged-helper API",
     scope: &[DEVTOOLS_HOME, DEVTOOLS_FLOW],
     check: devtools_door,
 };

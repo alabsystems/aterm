@@ -213,7 +213,7 @@ contract_fn! {
     /// Verified check that an `asb` exit code is within the documented `{0, 1, 2}` contract
     /// (`code <= 2`), linked via `clean-kernel-defeq` to `asb_exit_code_valid_isl`.
     #[must_use]
-    pub fn asb_exit_code_valid(code: u8) -> bool
+    pub const fn asb_exit_code_valid(code: u8) -> bool
     clauses [ensures result == (code <= 2)]
     {
         code <= 2
@@ -359,6 +359,212 @@ fn fail_exit(code: u8, msg: &str) -> u8 {
     code
 }
 
+/// Four-byte magic prefix (`"ASBH"`) for a 24-byte `asb` frame header wire descriptor.
+pub const ASB_FRAME_HEADER_WIRE_MAGIC: [u8; 4] = *b"ASBH";
+
+/// Wire format version for `asb` frame header wire descriptors.
+pub const ASB_FRAME_HEADER_WIRE_VERSION: u8 = 1;
+
+/// Encode a 24-byte `asb` frame header wire descriptor:
+/// `[0..4] = b"ASBH"`, `[4] = version (1)`, `[5] = verb_tag` (`0` = Sub, `1` = Last,
+/// `2` = Fetch, `3` = Drain, `4` = Mark), `[6..8] = subject_len (BE)`,
+/// `[8..16] = offset_or_next (BE)`, `[16..24] = len_or_head (BE)`.
+#[must_use]
+pub const fn asb_encode_frame_header_wire(
+    verb_tag: u8,
+    subject_len: u16,
+    offset_or_next: u64,
+    len_or_head: u64,
+) -> Option<[u8; 24]> {
+    let out = [
+        ASB_FRAME_HEADER_WIRE_MAGIC[0],
+        ASB_FRAME_HEADER_WIRE_MAGIC[1],
+        ASB_FRAME_HEADER_WIRE_MAGIC[2],
+        ASB_FRAME_HEADER_WIRE_MAGIC[3],
+        ASB_FRAME_HEADER_WIRE_VERSION,
+        verb_tag,
+        ((subject_len >> 8) & 0xFF) as u8,
+        (subject_len & 0xFF) as u8,
+        ((offset_or_next >> 56) & 0xFF) as u8,
+        ((offset_or_next >> 48) & 0xFF) as u8,
+        ((offset_or_next >> 40) & 0xFF) as u8,
+        ((offset_or_next >> 32) & 0xFF) as u8,
+        ((offset_or_next >> 24) & 0xFF) as u8,
+        ((offset_or_next >> 16) & 0xFF) as u8,
+        ((offset_or_next >> 8) & 0xFF) as u8,
+        (offset_or_next & 0xFF) as u8,
+        ((len_or_head >> 56) & 0xFF) as u8,
+        ((len_or_head >> 48) & 0xFF) as u8,
+        ((len_or_head >> 40) & 0xFF) as u8,
+        ((len_or_head >> 32) & 0xFF) as u8,
+        ((len_or_head >> 24) & 0xFF) as u8,
+        ((len_or_head >> 16) & 0xFF) as u8,
+        ((len_or_head >> 8) & 0xFF) as u8,
+        (len_or_head & 0xFF) as u8,
+    ];
+    match verb_tag {
+        0 => {
+            if subject_len != 0 || len_or_head > MAX_RECORD_PAYLOAD as u64 {
+                return None;
+            }
+        }
+        1..=3 => {
+            if subject_len == 0 || len_or_head > MAX_RECORD_PAYLOAD as u64 {
+                return None;
+            }
+        }
+        4 => {
+            if subject_len != 0 {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// Decode a 24-byte `asb` frame header wire descriptor into
+/// `(verb_tag, subject_len, offset_or_next, len_or_head)`.
+#[must_use]
+pub const fn asb_decode_frame_header_wire(buf: &[u8]) -> Option<(u8, u16, u64, u64)> {
+    let [b'A', b'S', b'B', b'H', ASB_FRAME_HEADER_WIRE_VERSION, verb_tag, s0, s1, o0, o1, o2, o3, o4, o5, o6, o7, l0, l1, l2, l3, l4, l5, l6, l7, ..] =
+        *buf
+    else {
+        return None;
+    };
+    let subject_len = ((s0 as u16) << 8) | (s1 as u16);
+    let offset_or_next = ((o0 as u64) << 56)
+        | ((o1 as u64) << 48)
+        | ((o2 as u64) << 40)
+        | ((o3 as u64) << 32)
+        | ((o4 as u64) << 24)
+        | ((o5 as u64) << 16)
+        | ((o6 as u64) << 8)
+        | (o7 as u64);
+    let len_or_head = ((l0 as u64) << 56)
+        | ((l1 as u64) << 48)
+        | ((l2 as u64) << 40)
+        | ((l3 as u64) << 32)
+        | ((l4 as u64) << 24)
+        | ((l5 as u64) << 16)
+        | ((l6 as u64) << 8)
+        | (l7 as u64);
+    match verb_tag {
+        0 => {
+            if subject_len != 0 || len_or_head > MAX_RECORD_PAYLOAD as u64 {
+                return None;
+            }
+        }
+        1..=3 => {
+            if subject_len == 0 || len_or_head > MAX_RECORD_PAYLOAD as u64 {
+                return None;
+            }
+        }
+        4 => {
+            if subject_len != 0 {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some((verb_tag, subject_len, offset_or_next, len_or_head))
+}
+
+/// Four-byte magic prefix (`"ASBK"`) for a 24-byte `asb ack` wire header.
+pub const ASB_ACK_WIRE_MAGIC: [u8; 4] = *b"ASBK";
+
+/// Wire format version for `asb ack` wire headers.
+pub const ASB_ACK_WIRE_VERSION: u8 = 1;
+
+/// Encode a 24-byte `asb ack` wire header:
+/// `[0..4] = b"ASBK"`, `[4] = version (1)`, `[5] =disposition_tag` (`0` = Handled,
+/// `1` = Refused, `2` = Deferred), `[6..8] = group_len (BE)`,
+/// `[8..16] = input_offset (BE)` (`< ACK_SEQ_BASE`),
+/// `[16..24] = producer_seq (BE)` (`ACK_SEQ_BASE | input_offset`).
+#[must_use]
+pub const fn asb_encode_ack_wire(
+    disposition_tag: u8,
+    group_len: u16,
+    input_offset: u64,
+) -> Option<[u8; 24]> {
+    let producer_seq = ACK_SEQ_BASE | input_offset;
+    let out = [
+        ASB_ACK_WIRE_MAGIC[0],
+        ASB_ACK_WIRE_MAGIC[1],
+        ASB_ACK_WIRE_MAGIC[2],
+        ASB_ACK_WIRE_MAGIC[3],
+        ASB_ACK_WIRE_VERSION,
+        disposition_tag,
+        ((group_len >> 8) & 0xFF) as u8,
+        (group_len & 0xFF) as u8,
+        ((input_offset >> 56) & 0xFF) as u8,
+        ((input_offset >> 48) & 0xFF) as u8,
+        ((input_offset >> 40) & 0xFF) as u8,
+        ((input_offset >> 32) & 0xFF) as u8,
+        ((input_offset >> 24) & 0xFF) as u8,
+        ((input_offset >> 16) & 0xFF) as u8,
+        ((input_offset >> 8) & 0xFF) as u8,
+        (input_offset & 0xFF) as u8,
+        ((producer_seq >> 56) & 0xFF) as u8,
+        ((producer_seq >> 48) & 0xFF) as u8,
+        ((producer_seq >> 40) & 0xFF) as u8,
+        ((producer_seq >> 32) & 0xFF) as u8,
+        ((producer_seq >> 24) & 0xFF) as u8,
+        ((producer_seq >> 16) & 0xFF) as u8,
+        ((producer_seq >> 8) & 0xFF) as u8,
+        (producer_seq & 0xFF) as u8,
+    ];
+    if disposition_tag > 2 || group_len == 0 || input_offset >= ACK_SEQ_BASE {
+        return None;
+    }
+    Some(out)
+}
+
+/// Decode a 24-byte `asb ack` wire header into `(disposition_tag, group_len, input_offset, producer_seq)`.
+#[must_use]
+pub const fn asb_decode_ack_wire(buf: &[u8]) -> Option<(u8, u16, u64, u64)> {
+    let [b'A', b'S', b'B', b'K', ASB_ACK_WIRE_VERSION, disposition_tag, g0, g1, i0, i1, i2, i3, i4, i5, i6, i7, p0, p1, p2, p3, p4, p5, p6, p7, ..] =
+        *buf
+    else {
+        return None;
+    };
+    let group_len = ((g0 as u16) << 8) | (g1 as u16);
+    let input_offset = ((i0 as u64) << 56)
+        | ((i1 as u64) << 48)
+        | ((i2 as u64) << 40)
+        | ((i3 as u64) << 32)
+        | ((i4 as u64) << 24)
+        | ((i5 as u64) << 16)
+        | ((i6 as u64) << 8)
+        | (i7 as u64);
+    let producer_seq = ((p0 as u64) << 56)
+        | ((p1 as u64) << 48)
+        | ((p2 as u64) << 40)
+        | ((p3 as u64) << 32)
+        | ((p4 as u64) << 24)
+        | ((p5 as u64) << 16)
+        | ((p6 as u64) << 8)
+        | (p7 as u64);
+    if disposition_tag > 2
+        || group_len == 0
+        || input_offset >= ACK_SEQ_BASE
+        || producer_seq != (ACK_SEQ_BASE | input_offset)
+    {
+        return None;
+    }
+    Some((disposition_tag, group_len, input_offset, producer_seq))
+}
+
+/// Decode one ASCII hex digit into its 4-bit value (`0..=15`).
+const fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some((b - b'a').saturating_add(10)),
+        b'A'..=b'F' => Some((b - b'A').saturating_add(10)),
+        _ => None,
+    }
+}
+
 /// Decode exactly `out.len()` bytes of hex from `hex`. Strict: ASCII hex digits
 /// only (no sign, no whitespace, no multibyte), exact length. Byte-indexed, so a
 /// multibyte character can never hit a char-boundary panic — it is simply not hex.
@@ -373,26 +579,19 @@ fn decode_hex(hex: &[u8], out: &mut [u8]) -> Result<(), String> {
             hex.len()
         ));
     }
-    fn nibble(b: u8) -> Option<u8> {
-        match b {
-            b'0'..=b'9' => Some(b - b'0'),
-            b'a'..=b'f' => Some(b - b'a' + 10),
-            b'A'..=b'F' => Some(b - b'A' + 10),
-            _ => None,
-        }
-    }
-    for (i, (slot, pair)) in out
-        .iter_mut()
-        .zip(hex.as_chunks::<2>().0.iter())
-        .enumerate()
-    {
-        match (nibble(pair[0]), nibble(pair[1])) {
+    let mut i = 0usize;
+    while i < out.len() {
+        let pos = i.saturating_mul(2);
+        let (Some(&h), Some(&l), Some(slot)) =
+            (hex.get(pos), hex.get(pos.saturating_add(1)), out.get_mut(i))
+        else {
+            return Err(format!("not valid hex at char {pos}"));
+        };
+        match (hex_nibble(h), hex_nibble(l)) {
             (Some(hi), Some(lo)) => *slot = (hi << 4) | lo,
-            _ => {
-                let pos = i.saturating_mul(2);
-                return Err(format!("not valid hex at char {pos}"));
-            }
+            _ => return Err(format!("not valid hex at char {pos}")),
         }
+        i = i.saturating_add(1);
     }
     Ok(())
 }
@@ -458,6 +657,22 @@ fn load_key(src: &KeySource) -> Result<[u8; 32], u8> {
 /// /dev/urandom`), and what the aterm fabric has always refused below.
 const SECRET_MIN: usize = 32;
 
+fn metadata_str(path: &str) -> io::Result<std::fs::Metadata> {
+    std::fs::metadata(path)
+}
+
+fn remove_file_str(path: &str) -> io::Result<()> {
+    std::fs::remove_file(path)
+}
+
+fn open_with_options(opts: &std::fs::OpenOptions, path: &str) -> io::Result<std::fs::File> {
+    opts.open(path)
+}
+
+fn rename_str(from: &str, to: &str) -> io::Result<()> {
+    std::fs::rename(from, to)
+}
+
 /// Refuse a SECRET file anyone but its owner can read — a mint secret, or the
 /// pre-shared key a broker serves under: `mode & 0o077` must be zero. The refusal
 /// names the `chmod` rather than fixing it silently, because a key that sat
@@ -465,7 +680,7 @@ const SECRET_MIN: usize = 32;
 #[cfg(unix)]
 fn check_private(flag: &str, path: &str) -> Result<(), u8> {
     use std::os::unix::fs::PermissionsExt;
-    let mode = match std::fs::metadata(path) {
+    let mode = match metadata_str(path) {
         Ok(m) => m.permissions().mode() & 0o777,
         Err(e) => return Err(fail_exit(2, &format!("{flag} {path}: {e}"))),
     };
@@ -526,14 +741,21 @@ fn load_secret(src: &KeySource) -> Result<Vec<u8>, u8> {
 /// every interface, so they are not.
 fn is_loopback_endpoint(ep: &str) -> io::Result<bool> {
     use std::net::ToSocketAddrs;
-    let addrs: Vec<std::net::SocketAddr> = ep.to_socket_addrs()?.collect();
-    if addrs.is_empty() {
+    let mut any = false;
+    let mut all_loopback = true;
+    for addr in ep.to_socket_addrs()? {
+        any = true;
+        if !addr.ip().is_loopback() {
+            all_loopback = false;
+        }
+    }
+    if !any {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("{ep} resolves to no address"),
         ));
     }
-    Ok(addrs.iter().all(|a| a.ip().is_loopback()))
+    Ok(all_loopback)
 }
 
 /// One minted capability to attach before the verb runs: the grant string and the
@@ -579,19 +801,24 @@ fn load_caps(paths: &[String]) -> Result<Vec<Cap>, u8> {
 /// an unambiguous ring look ambiguous and demand an `--id` for no reason.
 #[cfg(feature = "cap")]
 fn bound_producer_id(caps: &[Cap]) -> Result<Option<u64>, u8> {
-    let mut names: Vec<String> = caps
-        .iter()
-        .filter_map(|c| {
-            let grant = astream_cap::Grant::parse(&c.grant).ok()?;
-            (grant.mode == astream_cap::Mode::ReadWrite).then_some(grant.principal)?
-        })
-        .collect();
+    let mut names: Vec<String> = Vec::new();
+    let mut rest = caps;
+    while let [c, tail @ ..] = rest {
+        if let Ok(grant) = astream_cap::Grant::parse(c.grant.as_str()) {
+            if matches!(grant.mode, astream_cap::Mode::ReadWrite) {
+                if let Some(p) = grant.principal {
+                    names.push(p);
+                }
+            }
+        }
+        rest = tail;
+    }
     names.sort();
     names.dedup();
     if names.is_empty() {
         Ok(None)
-    } else if let (1, Some(only)) = (names.len(), names.first()) {
-        Ok(Some(astream_cap::producer_id_of(only)))
+    } else if let [only] = names.as_slice() {
+        Ok(Some(astream_cap::producer_id_of(only.as_str())))
     } else {
         Err(usage_error(&format!(
             "the attached grants bind {} different principals ({}); pass --id to say which producer id to publish under",
@@ -767,7 +994,7 @@ const ARGV_SECRETS: &[(&str, &str)] = &[
 /// The flush is part of it: a buffered line that fails on the implicit flush at exit
 /// would otherwise be a write error nobody sees at all.
 fn say(line: &str) -> io::Result<()> {
-    let mut out = io::stdout().lock();
+    let mut out = stdout_buffered();
     out.write_all(line.as_bytes())?;
     out.write_all(b"\n")?;
     out.flush()
@@ -781,12 +1008,15 @@ fn say(line: &str) -> io::Result<()> {
 /// that a retry would DUPLICATE, because `pub`'s default sequence is a fresh
 /// timestamp. Then the error propagates and the process exits 1.
 fn say_durable(line: &str, what: &str) -> io::Result<()> {
-    say(line).map_err(|e| {
-        warn(&format!(
-            "asb: stdout: {e} — {what} anyway: `{line}`. Do NOT retry on this status: the effect is already durable"
-        ));
-        e
-    })
+    match say(line) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            warn(&format!(
+                "asb: stdout: {e} — {what} anyway: `{line}`. Do NOT retry on this status: the effect is already durable"
+            ));
+            Err(e)
+        }
+    }
 }
 
 /// Every diagnostic `asb` puts on STDERR goes through here.
@@ -914,20 +1144,32 @@ impl Cli {
     /// is exactly as much of a mistake as a mistyped one — `asb pub --from 3` means
     /// its author expected something the command will not do.
     fn only(&self, verb: &str, allowed: &[&str]) -> Result<(), u8> {
-        let mut given: Vec<&str> = self
-            .kv
-            .keys()
-            .chain(self.bools.iter())
-            .map(String::as_str)
-            .collect();
+        let mut given: Vec<&str> = Vec::new();
+        for k in self.kv.keys() {
+            given.push(k.as_str());
+        }
+        for b in &self.bools {
+            given.push(b.as_str());
+        }
         if !self.cap_files.is_empty() {
             given.push("--cap-file");
         }
         given.sort_unstable(); // a deterministic message when several are wrong
-        for f in given {
-            if !allowed.contains(&f) {
+        let mut rest = given.as_slice();
+        while let [f, tail @ ..] = rest {
+            let mut ok = false;
+            let mut al_rest = allowed;
+            while let [a, al_tail @ ..] = al_rest {
+                if a.as_bytes() == f.as_bytes() {
+                    ok = true;
+                    break;
+                }
+                al_rest = al_tail;
+            }
+            if !ok {
                 return Err(usage_error(&format!("{f} does not apply to {verb}")));
             }
+            rest = tail;
         }
         Ok(())
     }
@@ -1035,18 +1277,18 @@ impl Cli {
 
 // Nanoseconds since the epoch — a per-invocation-unique default producer_seq.
 fn now_nanos() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as u64,
+        Err(_) => 0,
+    }
 }
 
 // Milliseconds since the epoch — the fabric envelope's informational `t=`.
 fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as u64,
+        Err(_) => 0,
+    }
 }
 
 /// Connect over the chosen transport and attach every capability, in order, under
@@ -1300,17 +1542,27 @@ fn advance_seq_file(path: &str) -> io::Result<u64> {
     let _lock = lock_seq_file(path)?;
     let current = match std::fs::read(path) {
         Ok(bytes) => {
-            let text = String::from_utf8_lossy(&bytes).trim().to_string();
-            text.parse::<u64>().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "--seq-file {path}: {text:?} is not an unsigned integer (only an ABSENT \
-                         file starts a sequence; an empty one would silently restart it and have \
-                         the broker dedup live records away)"
-                    ),
-                )
-            })?
+            let trimmed = bytes.trim_ascii();
+            let mut parsed = None;
+            if let Ok(s) = std::str::from_utf8(trimmed) {
+                if let Ok(n) = s.parse::<u64>() {
+                    parsed = Some(n);
+                }
+            }
+            match parsed {
+                Some(n) => n,
+                None => {
+                    let shown = std::str::from_utf8(trimmed).unwrap_or("<non-utf8>");
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "--seq-file {path}: {shown:?} is not an unsigned integer (only an ABSENT \
+                             file starts a sequence; an empty one would silently restart it and have \
+                             the broker dedup live records away)"
+                        ),
+                    ));
+                }
+            }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
         Err(e) => return Err(e),
@@ -1336,20 +1588,20 @@ fn advance_seq_file(path: &str) -> io::Result<u64> {
         // and a plain create truncates and overwrites the link's target. A leftover
         // from a crashed run under the same pid is unlinked first (unlinking a
         // symlink never touches its target).
-        let _ = std::fs::remove_file(&tmp);
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let _ = remove_file_str(&tmp);
+        let mut f = open_with_options(
+            std::fs::OpenOptions::new().write(true).create_new(true),
+            &tmp,
+        )?;
         f.write_all(next.to_string().as_bytes())?;
         f.sync_all()?;
         drop(f);
-        std::fs::rename(&tmp, path)
+        rename_str(&tmp, path)
     })();
     if let Err(e) = staged {
         // Leave no half-written staging file behind for the next invocation to trip
         // over; the sequence file itself is untouched, so nothing was burned.
-        let _ = std::fs::remove_file(&tmp);
+        let _ = remove_file_str(&tmp);
         return Err(io::Error::new(
             e.kind(),
             format!("--seq-file {path}: staging {tmp}: {e}"),
@@ -1385,11 +1637,13 @@ fn lock_seq_file(path: &str) -> io::Result<std::fs::File> {
     // would follow it and make an empty file at the link's target. A concurrent
     // invocation that created it first is simply opened.
     let open = |create: bool| {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(create)
-            .open(&lock_path)
+        open_with_options(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(create),
+            &lock_path,
+        )
     };
     let f = match open(false) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => match open(true) {
@@ -1430,7 +1684,11 @@ fn sync_parent_dir(path: &str) -> io::Result<()> {
         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
         _ => std::path::PathBuf::from("."),
     };
-    match std::fs::File::open(&dir).and_then(|d| d.sync_all()) {
+    let res = match std::fs::File::open(&dir) {
+        Ok(d) => d.sync_all(),
+        Err(e) => Err(e),
+    };
+    match res {
         Ok(()) => Ok(()),
         Err(e)
             if matches!(
@@ -1469,7 +1727,13 @@ fn unbound_god_cap_filter(grant: &str) -> Option<String> {
 /// the semantic gate belongs to the build that can actually mint.
 #[cfg(not(feature = "cap"))]
 fn unbound_god_cap_filter(grant: &str) -> Option<String> {
-    grant.starts_with('/').then(|| grant.to_string())
+    if matches!(grant.as_bytes().first(), Some(&b'/')) {
+        let mut out = String::new();
+        out.push_str(grant);
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// Mint a capability and print the one line a `--cap-file` holds.
@@ -1528,7 +1792,7 @@ fn do_attenuate(_secret: Option<&[u8]>, _parent: &Cap, _child_grant: &str) -> Re
 /// that is not a socket; checking here names the endpoint in asb's own error.)
 #[cfg(unix)]
 fn refuse_live_socket(ep: &str) -> Result<(), u8> {
-    if std::fs::metadata(ep).is_ok() && std::os::unix::net::UnixStream::connect(ep).is_ok() {
+    if metadata_str(ep).is_ok() && std::os::unix::net::UnixStream::connect(ep).is_ok() {
         return Err(fail_exit(
             1,
             &format!("{ep} is already served by another broker (a peer answered on the socket); refusing to take it over"),
@@ -1577,12 +1841,12 @@ fn serve_durability(cli: &Cli) -> Result<Durability, u8> {
 }
 
 /// A tier's name on the command line and in `serve`'s stderr.
-fn tier_word(tier: astream_broker::Tier) -> String {
+fn tier_word(tier: astream_broker::Tier) -> &'static str {
     match tier {
-        astream_broker::Tier::Strict => "strict".to_string(),
-        astream_broker::Tier::Ordered => "ordered".to_string(),
-        astream_broker::Tier::Relaxed => "relaxed".to_string(),
-        other => format!("{other:?}"),
+        astream_broker::Tier::Strict => "strict",
+        astream_broker::Tier::Ordered => "ordered",
+        astream_broker::Tier::Relaxed => "relaxed",
+        _ => "other",
     }
 }
 
@@ -1590,7 +1854,7 @@ fn tier_word(tier: astream_broker::Tier) -> String {
 /// full flush after every batch for 0, and no bound at all for none (which an embedder's
 /// broker can ask for and `asb` cannot); nothing for another tier, which keeps none.
 fn horizon_note(served: &astream_broker::ServedInfo) -> String {
-    if served.requested != astream_broker::Tier::Ordered {
+    if !matches!(served.requested, astream_broker::Tier::Ordered) {
         return String::new();
     }
     match served.horizon_ms {
@@ -1627,8 +1891,8 @@ fn open_broker(log: &str, _secret: Option<Vec<u8>>, durability: Durability) -> i
 /// that existed before, is never touched.
 fn discard_created_log(log: &str, created_here: bool, broker: Broker) {
     drop(broker);
-    if created_here && std::fs::metadata(log).is_ok_and(|m| m.len() == 0) {
-        let _ = std::fs::remove_file(log);
+    if created_here && matches!(metadata_str(log), Ok(m) if m.len() == 0) {
+        let _ = remove_file_str(log);
     }
 }
 
@@ -1958,9 +2222,12 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
     ));
     // Dropping a handle shuts its acceptor down and unlinks its socket.
     let _keep = (handle, beside_handle);
-    loop {
+    let mut parks = 0u64;
+    while parks < u64::MAX {
         std::thread::park();
+        parks = parks.saturating_add(1);
     }
+    Ok(())
 }
 
 fn cmd_pub(cli: &Cli) -> Result<(), AsbErr> {
@@ -2047,7 +2314,10 @@ fn cmd_last(cli: &Cli) -> Result<(), AsbErr> {
     let filter = cli.at(2, "filter")?;
     cli.no_more_than(3)?;
     cli.only_net("last", &["--after", "--max"])?;
-    let after = cli.kv.get("--after").cloned().unwrap_or_default();
+    let after = match cli.kv.get("--after") {
+        Some(s) => s.as_str(),
+        None => "",
+    };
     let max = cli.num32("--max")?.unwrap_or(DEFAULT_PAGE);
     let caps = cli.caps()?;
     let (mut c, _) = connect_attached(cli, &ep, &caps)?;
@@ -2056,7 +2326,7 @@ fn cmd_last(cli: &Cli) -> Result<(), AsbErr> {
     // were the whole answer. What that does NOT buy is one snapshot — see
     // `last_all`: the MARK is the FIRST request's, and a subject superseded past
     // a request's pinned head is omitted from its page.
-    let (records, next, head) = last_all(&mut c, &filter, &after, max)?;
+    let (records, next, head) = last_all(&mut c, &filter, after, max)?;
     Ok(print_page(&records, next, head)?)
 }
 

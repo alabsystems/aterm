@@ -14,7 +14,7 @@
 #[cfg(target_os = "macos")]
 use std::time::Instant;
 
-use winit::event_loop::EventLoopProxy;
+use aterm_window::event_loop::EventLoopProxy;
 
 use crate::Wake;
 #[cfg(target_os = "macos")]
@@ -262,33 +262,96 @@ mod debugger_tests {
         sudo_target_is_debugger(Some(&argv)).expect("complete, supported exact argv")
     }
 
+    /// A root debugger is recognised past sudo's options, environment
+    /// assignments and a path, and only as the command — not as a mere argument
+    /// to another tool, an option's value or text inside a prompt.
     #[test]
-    fn debugger_options_and_environment_values_do_not_become_the_command() {
-        for argv in [
-            vec!["sudo", "--user", "root", "lldb"],
-            vec!["sudo", "--prompt", "Password:", "gdb"],
-            vec!["sudo", "-Anu", "root", "/usr/bin/debugserver"],
-            vec!["sudo", "FOO=bar", "lldb"],
-        ] {
-            assert!(classify(&argv), "a direct debugger stays refused: {argv:?}");
-        }
-        assert!(!classify(&["sudo", "--user", "root", "make", "lldb"]));
-        assert!(!classify(&["sudo", "FOO=lldb", "make", "install"]));
-    }
-
-    #[test]
-    fn debugger_classification_preserves_prompt_argument_boundaries() {
-        let debugger = ["sudo", "--prompt", "hello make", "lldb"];
-        let ordinary = ["sudo", "--prompt", "hello", "make", "lldb"];
-        assert_eq!(debugger.join(" "), ordinary.join(" "));
-        assert!(classify(&debugger));
-        assert!(!classify(&ordinary));
-    }
-
-    #[test]
-    fn a_debugger_path_keeps_whitespace_inside_its_argument() {
-        assert!(classify(&["sudo", "/tmp/private tools/lldb", "./a.out"]));
-        assert!(!classify(&["sudo", "/tmp/private tools/make", "lldb"]));
+    fn debugger_target_is_recognized_only_as_the_command() {
+        let cases: &[(&str, &[&str], bool)] = &[
+            ("bare debugger", &["sudo", "lldb", "./a.out"], true),
+            (
+                "after -u and a path",
+                &["sudo", "-u", "root", "/usr/bin/debugserver", "-", "./a.out"],
+                true,
+            ),
+            (
+                "absolute sudo, flags",
+                &["/usr/bin/sudo", "-A", "-k", "gdb"],
+                true,
+            ),
+            ("dtrace", &["sudo", "dtrace", "-n", "syscall:::"], true),
+            (
+                "after --user's value",
+                &["sudo", "--user", "root", "lldb"],
+                true,
+            ),
+            (
+                "after --prompt's value",
+                &["sudo", "--prompt", "Password:", "gdb"],
+                true,
+            ),
+            (
+                "after clustered -Anu's value",
+                &["sudo", "-Anu", "root", "/usr/bin/debugserver"],
+                true,
+            ),
+            ("after an assignment", &["sudo", "FOO=bar", "lldb"], true),
+            (
+                "prompt value holding a space",
+                &["sudo", "--prompt", "hello make", "lldb"],
+                true,
+            ),
+            (
+                "whitespace inside the path",
+                &["sudo", "/tmp/private tools/lldb", "./a.out"],
+                true,
+            ),
+            (
+                "after --user= and --",
+                &["sudo", "--user=root", "--", "lldb"],
+                true,
+            ),
+            ("after attached -uroot", &["sudo", "-uroot", "lldb"], true),
+            ("path argument", &["sudo", "rm", "-rf", "/tmp/lldb"], false),
+            (
+                "package argument",
+                &["sudo", "apt", "install", "gdb"],
+                false,
+            ),
+            ("ordinary command", &["sudo", "make", "install"], false),
+            (
+                "argument after --user's value",
+                &["sudo", "--user", "root", "make", "lldb"],
+                false,
+            ),
+            (
+                "assignment value",
+                &["sudo", "FOO=lldb", "make", "install"],
+                false,
+            ),
+            (
+                "same text, split prompt",
+                &["sudo", "--prompt", "hello", "make", "lldb"],
+                false,
+            ),
+            (
+                "argument after a spaced path",
+                &["sudo", "/tmp/private tools/make", "lldb"],
+                false,
+            ),
+            ("option after --", &["sudo", "--", "--user", "lldb"], false),
+            (
+                "argument after --preserve-env=",
+                &["sudo", "--preserve-env=PATH,HOME", "make", "lldb"],
+                false,
+            ),
+        ];
+        let wrong = cases
+            .iter()
+            .filter(|(_, argv, debugger)| classify(argv) != *debugger)
+            .map(|(case, argv, debugger)| format!("{case}: {argv:?} should be {debugger}"))
+            .collect::<Vec<_>>();
+        assert!(wrong.is_empty(), "misclassified: {wrong:#?}");
     }
 
     #[test]
@@ -304,36 +367,7 @@ mod debugger_tests {
             vec!["sudo".into(), "odd/name=value".into(), "lldb".into()],
             vec!["sudo".into(), "=value".into(), "lldb".into()],
         ] {
-            assert!(sudo_target_is_debugger(Some(&argv)).is_err());
+            assert!(sudo_target_is_debugger(Some(&argv)).is_err(), "{argv:?}");
         }
-        assert!(classify(&["sudo", "--user=root", "--", "lldb"]));
-        assert!(classify(&["sudo", "-uroot", "lldb"]));
-        assert!(!classify(&["sudo", "--", "--user", "lldb"]));
-        assert!(!classify(&[
-            "sudo",
-            "--preserve-env=PATH,HOME",
-            "make",
-            "lldb"
-        ]));
-    }
-
-    /// A root debugger is recognised past sudo's options and a path, and only as
-    /// the command — not as a mere argument to another tool.
-    #[test]
-    fn debugger_target_is_recognized_only_as_the_command() {
-        assert!(classify(&["sudo", "lldb", "./a.out"]));
-        assert!(classify(&[
-            "sudo",
-            "-u",
-            "root",
-            "/usr/bin/debugserver",
-            "-",
-            "./a.out"
-        ]));
-        assert!(classify(&["/usr/bin/sudo", "-A", "-k", "gdb"]));
-        assert!(classify(&["sudo", "dtrace", "-n", "syscall:::"]));
-        assert!(!classify(&["sudo", "rm", "-rf", "/tmp/lldb"]));
-        assert!(!classify(&["sudo", "apt", "install", "gdb"]));
-        assert!(!classify(&["sudo", "make", "install"]));
     }
 }

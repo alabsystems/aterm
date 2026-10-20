@@ -1,0 +1,27 @@
+# claude-code 2.1.303 · HAND-BUILT 2026-10-19 (no live capture: the state opens the host's browser, which no lab here may do): the measured hand-off capture (claude-2.1.303-login-handoff.txt) with its body replaced by what 2.1.303's `waiting_for_login` render draws before the URL shows (READ in the bundle: a spinner glyph and `Opening browser to sign in…` in one row, no URL, no paste field) · the /login browser hand-off's first 3 s, 2.1.303
+ ▐▛███▛█   Claude Code v2.1.303
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.26bb/proj
+
+
+❯ hi
+  ⎿  Not logged in · Please run /login
+
+✻ Worked for 1s · done 10:24 AM
+
+❯ /login
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Login
+
+  ✻ Opening browser to sign in…
+
+
+
+
+
+
+
+
+
+  Esc to cancel

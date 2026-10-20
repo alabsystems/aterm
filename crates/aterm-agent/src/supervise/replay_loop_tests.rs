@@ -41,7 +41,7 @@ fn script() -> Mock {
 /// after checking it replays as recorded.
 fn recorded() -> (String, Vec<Item>) {
     let mut m = script();
-    let run = record_watch(&mut m, &auto(30, None), |_| {});
+    let run = record_watch(&mut m, &auto(30), |_| {});
     let report = assert_replays(&run.tape, &run.header, &run.sent, &run.lines);
     assert_eq!(report.verdict, Verdict::Reproduced);
     let header = run.header.encode();
@@ -58,7 +58,7 @@ fn recorded_supervise() -> (String, Vec<Item>, String) {
     let mut s = taped_session(&mut taped, &tape);
     s.set_clock(TEST_NOW, PDT);
     s.set_zone_lookup(test_zones);
-    let opts = auto(30, None);
+    let opts = auto(30);
     let header = crate::supervise::tape::header::Header::capture(
         crate::supervise::tape::testing::TAPE_ID,
         crate::supervise::tape::header::Entry::Supervise,
@@ -384,7 +384,7 @@ fn a_recorded_panic_replays_to_panicked() {
         s.set_fx(tape.fx.clone());
         s.set_clock(TEST_NOW, PDT);
         s.set_zone_lookup(test_zones);
-        let opts = auto(30, None);
+        let opts = auto(30);
         header = run_header(&s, &opts);
         tape.core().reroot(header.roots.clone());
         PANIC_AT_DECIDE.with(|p| p.set(true));
@@ -466,7 +466,7 @@ fn a_panic_inside_a_door_replays_to_panicked_at_that_door() {
         s.set_fx(tape.fx.clone());
         s.set_clock(TEST_NOW, PDT);
         s.set_zone_lookup(test_zones);
-        let opts = auto(30, None);
+        let opts = auto(30);
         header = run_header(&s, &opts);
         tape.core().reroot(header.roots.clone());
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -598,20 +598,13 @@ fn a_replaying_door_never_calls_the_transport() {
 }
 
 /// The tapes no replay can stand on are refused, each named: bytes that are
-/// no tape, a run with a mail lane, and roots that would land on a directory
-/// that exists.
+/// no tape, and roots that would land on a directory that exists. (A run
+/// with a mail lane went with the lane, removed 2026-10-15: no recording
+/// took `--mail`, and the header's retired keys are read and dropped.)
 #[test]
 fn a_tape_no_replay_can_stand_on_is_refused() {
     let (header, items) = recorded();
     assert!(replay(b"not a tape", &Options::default()).is_err());
-    let mailed = header.replacen(
-        "\nmail\n",
-        "\nmail=on\nmail.inbox\nmail.report_window=20s\nmail.idle_grace=10s\n",
-        1,
-    );
-    assert_ne!(mailed, header);
-    let err = replay(&written(&mailed, &items), &Options::default()).expect_err("refused");
-    assert!(err.contains("--mail"), "{err}");
     let dir = crate::supervise::ScratchDir::new("replay", "base");
     let err = replay(
         &written(&header, &items),

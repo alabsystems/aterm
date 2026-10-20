@@ -23,7 +23,12 @@
 //! caption ✕, the Quit menu) waits for them.
 //!
 //! No TTL and no auto-dismiss: the banner stands until a key, a click, `confirm`, or the window
-//! closing answers it. One at a time: a second destructive gesture while one stands is refused.
+//! closing answers it. One shows at a time. A person's gesture over another window while one
+//! stands (the taskbar's "Close all windows") waits its turn, one per window, and is asked once
+//! the standing question is answered or dropped (`App::ask_next_queued_close`); any other second
+//! gesture is refused with the standing question named. The window a question stands over is
+//! raised and focused for a person's gesture (`App::raise_close_question`), so a question over a
+//! background or minimized window is seen.
 //!
 //! The macOS `NSAlert` path is not immune — `menu::confirm` answers inside `runModal`, and
 //! control wakes queue behind that nested run loop (`menu::confirm_owner`) — but is out of this

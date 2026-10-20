@@ -832,9 +832,12 @@ impl ChildProxy {
 impl Drop for ChildProxy {
     fn drop(&mut self) {
         deregister_child(&self.sid);
-        if let Some(file) = &self.edge_file {
-            // Removed while still locked: no sweep can take it in between.
-            let _ = std::fs::remove_file(file.path());
+        if let Some(file) = self.edge_file.take() {
+            // Removed while still locked, so no sweep can take it in between,
+            // then unlocked: off the event loop once `spawn_prep` runs, since
+            // the removal and the close that reclaims the file are filesystem
+            // work a closing tab held the loop for (about 1 ms).
+            crate::spawn_prep::retire_edge_file(file);
         }
     }
 }
@@ -1153,8 +1156,8 @@ impl ForwardHost {
 /// [`connect_and_relay`] with its relay stage as a parameter: the reply-fidelity
 /// contract (`reply_fidelity_model`) lives entirely here, so the Tier-1 bind
 /// (`reply_fidelity_conformance`) drives it with the real relay and with one
-/// that fails after delivery (a `try_clone` under fd exhaustion cannot be
-/// staged in a shared test process).
+/// that fails after delivery (a worker thread the system refuses to start
+/// cannot be staged in a shared test process).
 fn deliver_then_relay(
     child_sock: &str,
     first_line: &ForwardLine,
@@ -1183,9 +1186,10 @@ fn deliver_then_relay(
         (&child).write_all(client_prebuffered)?;
     }
     (&child).flush()?;
-    // Past this point the verb has been delivered. A relay-stage failure (e.g. a
-    // `try_clone` under fd exhaustion) must not read as a failed forward: only the
-    // connect/handshake errors above surface as `Err` (the caller's `ERR forward`).
+    // Past this point the verb has been delivered. A relay-stage failure (a
+    // worker thread the system refuses to start) must not read as a failed
+    // forward: only the connect/handshake errors above surface as `Err` (the
+    // caller's `ERR forward`).
     // A host going away under the delivered verb is the relay's to say
     // ([`ForwardHost::gone_line`]).
     let host = ForwardHost {
@@ -1216,105 +1220,128 @@ fn deliver_then_relay(
 /// and the peer then reads no EOF while any copy of the descriptor lives (a fork
 /// holds one until it execs).
 ///
+/// Every end of file the relay gives is a shutdown, never a close. Its two pumps
+/// borrow `client` and `child` (a scoped worker, no `try_clone`), so it holds no
+/// copy of either end, and no way out leaves a peer waiting on the last close of
+/// a descriptor a fork elsewhere may still hold: a worker the system refuses to
+/// start, a pump that unwinds ([`HangUpOnUnwind`]) and the normal end all hang
+/// both sides up before the relay returns.
+///
 /// No exit waits on a wake from another thread: every hang-up of the child is
 /// preceded by setting `stop`, and the worker polls the child's end
 /// ([`crate::control::HANGUP_POLL`]) before each read, re-reading `stop` whenever a
-/// poll times out, because a read parked on one descriptor is not reliably woken by
-/// a `shutdown(SHUT_RD)` through a sibling descriptor. The worker's hang-up of the
-/// client sets `client_stop` the same way for this thread's client read.
+/// poll times out, so no exit depends on a `shutdown(SHUT_RD)` waking a read
+/// already parked, which through a sibling descriptor is not reliable. The
+/// worker's hang-up of the client sets `client_stop` the same way for this
+/// thread's client read.
 fn relay_bidirectional(
     client: &CtlStream,
     child: &CtlStream,
     host: ForwardHost,
 ) -> std::io::Result<()> {
     use aterm_uds::hangup::hang_up;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 
-    let mut c2s_r = client.try_clone()?;
-    let mut c2s_w = child.try_clone()?;
-    let s2c_r = child.try_clone()?;
-    let mut s2c_w = client.try_clone()?;
-    let w_client = client.try_clone()?;
-    let w_child = child.try_clone()?;
     // Set once this side found the client gone and tore both down: the
     // child's end the worker then reads is that, not the host's.
-    let client_gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let torn = Arc::clone(&client_gone);
+    let client_gone = &AtomicBool::new(false);
     // Set before every hang-up of the child: the worker stops at its next
     // poll timeout even if the hang-up's wake never reaches it.
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stopped = Arc::clone(&stop);
+    let stop = &AtomicBool::new(false);
     // Set before the worker's hang-up of the client: this thread's client
     // read stops at its next poll timeout, as the client's end of file.
-    let client_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let client_stopped = Arc::clone(&client_stop);
-    let hang_up_child = |child: &CtlStream| {
-        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let client_stop = &AtomicBool::new(false);
+    let hang_up_child = move || {
+        stop.store(true, SeqCst);
         hang_up(child);
+    };
+    // A leg that broke, or a pump that unwinds: both sides, for the whole socket.
+    let hang_up_both = move || {
+        client_stop.store(true, SeqCst);
+        hang_up(client);
+        hang_up_child();
     };
     // child -> client on a worker; client -> child here. The worker says when
     // it is done (its sender drops even if it unwinds), so the hangup watch
     // below costs no latency on a relay that ends normally.
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-    let worker = std::thread::spawn(move || {
-        let ready = || readable_unless_stopped(&s2c_r, &stopped);
-        match copy_host_to_client(&mut &s2c_r, &mut s2c_w, ready) {
-            HostLeg::HostEnded => {
-                if !torn.load(std::sync::atomic::Ordering::SeqCst)
-                    && !aterm_uds::hangup::peer_closed(&w_client)
-                    && let Some(line) = host.gone_line()
-                {
-                    let _ = (&w_client).write_all(line.as_bytes());
-                    let _ = (&w_client).flush();
+    let relayed: std::io::Result<()> = std::thread::scope(|scope| {
+        // An unwind out of this thread waits in the scope for the worker,
+        // which ends only once `stop` is set: so both sides are hung up first.
+        let _unwinding = HangUpOnUnwind(hang_up_both);
+        let worker = std::thread::Builder::new().spawn_scoped(scope, move || {
+            let _unwinding = HangUpOnUnwind(hang_up_both);
+            let (mut from_host, mut to_client) = (child, client);
+            let ready = || readable_unless_stopped(child, stop);
+            match copy_host_to_client(&mut from_host, &mut to_client, ready) {
+                HostLeg::HostEnded => {
+                    if !client_gone.load(SeqCst)
+                        && !aterm_uds::hangup::peer_closed(client)
+                        && let Some(line) = host.gone_line()
+                    {
+                        let _ = to_client.write_all(line.as_bytes());
+                        let _ = to_client.flush();
+                    }
+                    let _ = client.shutdown(std::net::Shutdown::Write);
                 }
-                let _ = w_client.shutdown(std::net::Shutdown::Write);
+                HostLeg::Broke => hang_up_both(),
             }
-            HostLeg::Broke => {
-                client_stopped.store(true, std::sync::atomic::Ordering::SeqCst);
-                hang_up(&w_client);
-                stopped.store(true, std::sync::atomic::Ordering::SeqCst);
-                hang_up(&w_child);
+            let _ = done_tx.send(());
+        })?;
+        let (mut from_client, mut to_child) = (client, child);
+        let client_ready = || readable_unless_stopped(client, client_stop);
+        match copy_until_eof(&mut from_client, &mut to_child, client_ready) {
+            // The client's EOF: a half-close still wants the answer, but a client
+            // that closed both halves has nobody to answer, so tear both sides down
+            // and let the child's blocking verb and this lane end now.
+            Ok(()) if !aterm_uds::hangup::peer_closed(client) => {
+                let _ = child.shutdown(std::net::Shutdown::Write);
+            }
+            // A copy that failed with the client still there failed on the
+            // host's side — it went away under a write: end that half only, and
+            // the worker, reading the host's end, says so.
+            Err(_) if !aterm_uds::hangup::peer_closed(client) => {
+                hang_up_child();
+            }
+            Ok(()) | Err(_) => {
+                client_gone.store(true, SeqCst);
+                hang_up(client);
+                hang_up_child();
             }
         }
-        let _ = done_tx.send(());
+        // A client that half-closed and then died is seen by nobody above (this
+        // thread no longer reads it; the worker is parked on the child): watch for
+        // that hangup while the answer is coming, so a dead client's lane is given
+        // back within a poll rather than when the child's verb times out.
+        while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            done_rx.recv_timeout(crate::control::HANGUP_POLL)
+        {
+            if aterm_uds::hangup::peer_closed(client) {
+                client_gone.store(true, SeqCst);
+                hang_up(client);
+                hang_up_child();
+                break;
+            }
+        }
+        let _ = worker.join();
+        Ok(())
     });
-    let client_ready = || readable_unless_stopped(client, &client_stop);
-    match copy_until_eof(&mut c2s_r, &mut c2s_w, client_ready) {
-        // The client's EOF: a half-close still wants the answer, but a client
-        // that closed both halves has nobody to answer, so tear both sides down
-        // and let the child's blocking verb and this lane end now.
-        Ok(()) if !aterm_uds::hangup::peer_closed(client) => {
-            let _ = child.shutdown(std::net::Shutdown::Write);
-        }
-        // A copy that failed with the client still there failed on the
-        // host's side — it went away under a write: end that half only, and
-        // the worker, reading the host's end, says so.
-        Err(_) if !aterm_uds::hangup::peer_closed(client) => {
-            hang_up_child(child);
-        }
-        Ok(()) | Err(_) => {
-            client_gone.store(true, std::sync::atomic::Ordering::SeqCst);
-            hang_up(client);
-            hang_up_child(child);
-        }
-    }
-    // A client that half-closed and then died is seen by nobody above (this
-    // thread no longer reads it; the worker is parked on the child): watch for
-    // that hangup while the answer is coming, so a dead client's lane is given
-    // back within a poll rather than when the child's verb times out.
-    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
-        done_rx.recv_timeout(crate::control::HANGUP_POLL)
-    {
-        if aterm_uds::hangup::peer_closed(client) {
-            client_gone.store(true, std::sync::atomic::Ordering::SeqCst);
-            hang_up(client);
-            hang_up_child(child);
-            break;
-        }
-    }
-    let _ = worker.join();
     hang_up(client);
-    hang_up_child(child);
-    Ok(())
+    hang_up_child();
+    relayed
+}
+
+/// Runs its hang-up when an unwind drops it: a relay pump that panics still
+/// ends both sides with a shutdown, so neither peer, nor the other pump, nor
+/// the scope that joins them waits on it.
+struct HangUpOnUnwind<F: Fn()>(F);
+
+impl<F: Fn()> Drop for HangUpOnUnwind<F> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            (self.0)();
+        }
+    }
 }
 
 /// Wait until the relay's end `end` has something for a read (bytes, its end
@@ -1447,6 +1474,7 @@ mod reply_fidelity_conformance;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_socket::read_to_end_of_file;
     use crate::test_socket::{hang_up, join_after_hang_up};
     use std::io::BufReader;
 
@@ -1459,6 +1487,17 @@ mod tests {
             pid: None,
             listener: None,
         }
+    }
+
+    /// A private scratch dir short enough for a socket path: under `/tmp` where
+    /// the platform temporary root outruns `sun_path` (macOS), under the
+    /// temporary root on Windows, which has no `/tmp`.
+    fn sock_scratch() -> aterm_tempfile::TempDir {
+        #[cfg(unix)]
+        let dir = aterm_tempfile::TempDir::new_in("/tmp");
+        #[cfg(not(unix))]
+        let dir = aterm_tempfile::tempdir();
+        dir.expect("scratch")
     }
 
     /// A capability with fresh tokens, for tests that only need an entry.
@@ -1602,7 +1641,7 @@ mod tests {
     /// `connect_and_relay_pipes_handshake_and_response` is the negative control.
     #[test]
     fn a_child_that_accepts_nothing_fails_the_forward_fast() {
-        let dir = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch");
+        let dir = sock_scratch();
         let sock = dir.path().join("wedged.sock");
         let _listener = aterm_uds::CtlListener::bind(&sock).expect("bind, never accept");
         let (_client_app, client_relay) = CtlStream::pair().expect("pair");
@@ -1637,7 +1676,7 @@ mod tests {
     /// forward before the verb is sent.
     #[test]
     fn a_child_that_refuses_the_probe_never_receives_the_verb() {
-        let dir = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch");
+        let dir = sock_scratch();
         let sock = dir.path().join("refuse.sock");
         let listener = aterm_uds::CtlListener::bind(&sock).expect("bind");
         let child = std::thread::spawn(move || {
@@ -1667,9 +1706,14 @@ mod tests {
     /// line and closes without reading, so the probe's write fails (`EPIPE`) and the
     /// line left behind is the answer [`ForwardHost::serves`] takes as proof the
     /// host is alive.
+    ///
+    /// Unix only: afunix on Windows takes the probe's write and then resets the
+    /// connection, discarding the line left unread (`WSAECONNRESET` to the read),
+    /// and there no host's pid is read, so [`ForwardHost::serves`] is never asked.
+    #[cfg(unix)]
     #[test]
     fn a_busy_line_left_behind_answers_a_probe_whose_write_failed() {
-        let dir = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch");
+        let dir = sock_scratch();
         let sock = dir.path().join("busy.sock");
         let listener = aterm_uds::CtlListener::bind(&sock).expect("bind");
         let look = CtlStream::connect(&sock).expect("connect");
@@ -1701,7 +1745,7 @@ mod tests {
             ServesOn,
         }
         for case in [Host::Gone, Host::Reopened, Host::ServesOn] {
-            let dir = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch");
+            let dir = sock_scratch();
             let sock = dir.path().join("host.sock");
             let sock_s = sock.to_string_lossy().into_owned();
             let listener = aterm_uds::CtlListener::bind(&sock).expect("bind host");
@@ -1757,10 +1801,15 @@ mod tests {
                     &[],
                 )
             });
-            let mut told = String::new();
-            BufReader::new(&client_app)
-                .read_to_string(&mut told)
-                .expect("read to the relay's EOF");
+            // Read in slices ([`read_to_end_of_file`]), never one read parked on
+            // the relay's half-close.
+            let told = String::from_utf8(read_to_end_of_file(&client_app, |read| {
+                format!(
+                    "{case:?}: the relay's EOF, after {:?}",
+                    String::from_utf8_lossy(read)
+                )
+            }))
+            .expect("the relay passes text");
             // Gone, as a client process that read its answer is: closed.
             drop(client_app);
             relay
@@ -1772,7 +1821,10 @@ mod tests {
             {
                 let _ = (&conn).write_all(b"stop\n");
             }
-            if case == Host::ServesOn {
+            // Where the connecting end cannot read its host's pid (afunix on Windows
+            // answers it no pid, `aterm_uds::fdpass::peer_pid`), the relay cannot
+            // judge the host and leaves the bare EOF, as for one that serves on.
+            if case == Host::ServesOn || cfg!(windows) {
                 assert_eq!(told, "", "a host that serves on ended it on purpose");
             } else {
                 assert_eq!(
@@ -1992,12 +2044,16 @@ mod tests {
         };
         speaker.write_all(said).expect("speak");
         // Both are facts the real relay must reach, so each wait is a hang
-        // detector, never a latency budget: a loaded host only slows them.
-        speaker
-            .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
-            .expect("deadline");
-        let mut byte = [0u8; 1];
-        let done = matches!(speaker.read(&mut byte), Ok(0));
+        // detector, never a latency budget: a loaded host only slows them. The
+        // end-of-file is waited for in slices, never on one parked read's wake
+        // ([`read_to_end_of_file`]).
+        let done = read_to_end_of_file(speaker, |read| {
+            format!(
+                "{fault:?}: the speaker's end-of-file, after {:?}",
+                String::from_utf8_lossy(read)
+            )
+        })
+        .is_empty();
         let returned = returned_rx
             .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .is_ok();
@@ -2107,6 +2163,27 @@ mod tests {
         pump.join().expect("the pump");
     }
 
+    /// What the socket `end` names holds for its reader, peeked without blocking
+    /// or consuming: the bytes queued (up to 64), `Ok(0)` at its end of file, and
+    /// `WouldBlock` for an open socket with nothing queued.
+    #[cfg(unix)]
+    fn peek_now(end: &CtlStream) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd as _;
+        let mut buf = [0u8; 64];
+        // SAFETY: `end` is borrowed for the call, so its fd is open; `buf` is
+        // writable for its whole length, and `MSG_PEEK | MSG_DONTWAIT` neither
+        // consumes nor blocks.
+        let n = unsafe {
+            libc::recv(
+                end.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        usize::try_from(n).map_err(|_| std::io::Error::last_os_error())
+    }
+
     /// A child that half-closed reads end-of-file when the relay ends, though a copy
     /// of the relay's end of it survives (a `try_clone` here, as a fork holds one
     /// until it execs).
@@ -2116,6 +2193,11 @@ mod tests {
     /// read of the child's end is the verdict. Negative control: restore both-ways
     /// `shutdown` calls, which Darwin refuses (`ENOTCONN`) on a socket whose read
     /// half the child's half-close shut, and the child reads `WouldBlock`.
+    ///
+    /// The client's read is a hang detector that says how far the relay got when
+    /// it fires (once, in a full gate on m3 under load, 2026-10-16): the bytes the
+    /// client had, whether the relay had read the child's answer, and whether it
+    /// had returned.
     #[test]
     #[cfg(unix)]
     fn a_child_that_half_closed_reads_eof_when_the_relay_ends_though_a_copy_survives() {
@@ -2134,14 +2216,26 @@ mod tests {
         child
             .shutdown(std::net::Shutdown::Write)
             .expect("the child half-closes");
-        original
-            .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
-            .expect("hang detector");
-        let mut answer = String::new();
-        (&original)
-            .read_to_string(&mut answer)
-            .expect("the answer, then the relay's half-close");
-        assert_eq!(answer, "OK answer\n");
+        // Read in slices ([`read_to_end_of_file`]): a read parked on the wake can
+        // sleep through the relay's half-close on Darwin, the 2026-10-16 failure.
+        let answer = read_to_end_of_file(&original, |read| {
+            format!(
+                "the answer, then the relay's half-close: {:?} read; the relay's end of \
+                 the child {}; the relay {}",
+                String::from_utf8_lossy(read),
+                match peek_now(&forked_copy) {
+                    Ok(0) => "had nothing left to read".to_string(),
+                    Ok(n) => format!("still held {n} bytes the relay never read"),
+                    Err(e) => format!("could not be peeked: {e}"),
+                },
+                if relay.is_finished() {
+                    "had returned"
+                } else {
+                    "was still running"
+                },
+            )
+        });
+        assert_eq!(String::from_utf8_lossy(&answer), "OK answer\n");
         original
             .shutdown(std::net::Shutdown::Write)
             .expect("the client is done");
@@ -2471,7 +2565,7 @@ mod tests {
     /// ids, whose entries must survive. Negative control: its own entry goes.
     #[test]
     fn a_quit_retires_only_its_own_graph_entries() {
-        let dir = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+        let dir = sock_scratch();
         let ours = dir.path().join("aterm-cand.sock");
         let theirs = dir.path().join("aterm-parent.sock");
         let (mine, parents) = (SessionId::generate(), SessionId::generate());

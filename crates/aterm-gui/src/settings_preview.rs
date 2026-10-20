@@ -11,18 +11,17 @@
 //! bounded and deterministic; no PTY, platform widget, web view, filesystem
 //! access, or wall-clock decision is involved.
 //!
-//! Optional display-headroom effects are represented by the same bounded SDR
-//! tone-map used by capture, so the semantic preview remains portable and
-//! truthful on hosts without an HDR panel.
+//! The bloom is the live terminal's own kernel run on the CPU
+//! ([`aterm_render::bloom`]) and its SDR crown; display headroom past SDR
+//! white is not drawn, so the preview stays truthful on hosts without an HDR
+//! panel.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aterm_effects::cursor_fx::{CursorFx, CursorFxInput};
 use aterm_grapheme::GraphemeClusters;
-#[cfg(test)]
-use aterm_grapheme::grapheme_display_width;
-use aterm_render::{GlowQuad, HaloMode, RainHalo, RenderInput, Theme};
+use aterm_render::{GlowQuad, RainHalo, RenderInput, Theme};
 
 use crate::cursor_glow::{Geom, GlowStyle};
 use crate::cursor_trail::TrailConfig;
@@ -64,6 +63,14 @@ pub(crate) enum PreviewScene {
     Typography,
     #[default]
     CursorMotion,
+    /// The Themes page's demo terminal: a scripted session played through a
+    /// real terminal ([`crate::settings_theme_demo`]) in a two-tab window.
+    ThemeDemo,
+    /// The Wallpaper page's preview: the color specimen's shell session over
+    /// the chosen picture ([`SettingsPreviewSpec::wallpaper`]), drawn through
+    /// the renderer's own wallpaper path, so the dim and the text tint show
+    /// as a tab draws them. The specimen covers the whole terminal.
+    Wallpaper,
 }
 
 impl PreviewScene {
@@ -72,6 +79,8 @@ impl PreviewScene {
             Self::Appearance => "Appearance preview",
             Self::Typography => "Typography preview",
             Self::CursorMotion => "Cursor and motion preview",
+            Self::ThemeDemo => "Demo terminal",
+            Self::Wallpaper => "Wallpaper preview",
         }
     }
 
@@ -80,6 +89,8 @@ impl PreviewScene {
             Self::Appearance => "COLOR PREVIEW",
             Self::Typography => "TEXT PREVIEW",
             Self::CursorMotion => "CURSOR PREVIEW",
+            Self::ThemeDemo => "DEMO",
+            Self::Wallpaper => "WALLPAPER PREVIEW",
         }
     }
 }
@@ -99,6 +110,8 @@ pub(crate) enum PreviewPause {
     MotionSetting,
     /// Motion follows the system, and the system asks for reduced motion.
     SystemReduceMotion,
+    /// The demo played three times over with nothing touched on its page.
+    Resting,
 }
 
 impl PreviewPause {
@@ -114,13 +127,14 @@ impl PreviewPause {
                 crate::native_settings::reduce_motion_words()
             ),
             Self::SystemReduceMotion => "the system asks for reduced motion".to_string(),
+            Self::Resting => "nothing on the page has changed for a while".to_string(),
         }
     }
 
     fn badge(self) -> String {
         match self {
             Self::SeriousMode => "Serious Mode".to_string(),
-            Self::Unfocused | Self::Load => "Paused".to_string(),
+            Self::Unfocused | Self::Load | Self::Resting => "Paused".to_string(),
             Self::MotionSetting => crate::native_settings::reduce_motion_words(),
             Self::SystemReduceMotion => "System Reduce Motion".to_string(),
             Self::Unspecified => "Reduced motion".to_string(),
@@ -219,6 +233,9 @@ impl PreviewTrailStyle {
 pub(crate) struct CursorPreviewSpec {
     pub(crate) style: PreviewCursorStyle,
     pub(crate) blink: bool,
+    /// Cursor effects may draw: Serious Mode does not hide them. The style
+    /// decides whether a trail is drawn (Off draws none) and the typing glow
+    /// its own switch.
     pub(crate) trail_enabled: bool,
     pub(crate) trail_style: PreviewTrailStyle,
     /// The selected preference token, retained because rainbow-family
@@ -386,14 +403,6 @@ impl CursorPreviewSpec {
     }
 }
 
-/// What the typing-momentum glow shows on a preview ([`SettingsPreviewSpec::typing_glow`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TypingGlow {
-    Halo,
-    Tint,
-    Nothing,
-}
-
 /// A bounded terminal-canvas palette used to preview an uncommitted theme.
 ///
 /// Values are packed `0x00RRGGBB`. The override is intentionally narrower
@@ -467,7 +476,7 @@ impl PreviewTerminalTheme {
         Self::new(self.fg, self.bg, self.cursor, self.selection, self.ansi)
     }
 
-    const fn into_theme(self) -> Theme {
+    pub(crate) const fn into_theme(self) -> Theme {
         Theme {
             fg: self.fg,
             bg: self.bg,
@@ -552,6 +561,13 @@ fn trim_contrast(ratio: f64) -> String {
 pub(crate) struct AppearancePreviewSpec {
     pub(crate) window_theme: String,
     pub(crate) minimum_contrast: f32,
+    /// The engine's theme-pair contrast floor
+    /// (`TerminalConfig::indexed_minimum_contrast`), as the terminal resolves
+    /// it (`Config::indexed_minimum_contrast_or_default`): the platform's
+    /// default while `minimum_contrast` is unset, off once it is set. Every
+    /// terminal sample (the colour, type and cursor specimens and the Themes
+    /// demo) is drawn under it, so a sample shows the colours a tab does.
+    pub(crate) indexed_minimum_contrast: f32,
     pub(crate) selection_foreground: Option<u32>,
     pub(crate) selection_inactive: bool,
     pub(crate) bold_is_bright: bool,
@@ -563,6 +579,7 @@ impl Default for AppearancePreviewSpec {
         Self {
             window_theme: "auto".to_string(),
             minimum_contrast: 1.0,
+            indexed_minimum_contrast: crate::app_config::DEFAULT_INDEXED_MINIMUM_CONTRAST,
             selection_foreground: None,
             selection_inactive: false,
             bold_is_bright: true,
@@ -611,6 +628,9 @@ pub(crate) struct CursorPostFxSpec {
     pub(crate) fire_shimmer: bool,
     pub(crate) hdr_glow: bool,
     pub(crate) sdr_boost: f32,
+    /// The window's screen shows EDR: HDR glow, where on, is the trail's
+    /// brightness there; elsewhere SDR glow boost is (the GPU uses one).
+    pub(crate) display_edr: bool,
     pub(crate) motion_raw: String,
     pub(crate) motion_effective: String,
     pub(crate) motion_reason: String,
@@ -632,6 +652,7 @@ impl Default for CursorPostFxSpec {
             fire_shimmer: true,
             hdr_glow: true,
             sdr_boost: 0.35,
+            display_edr: false,
             motion_raw: "auto".to_string(),
             motion_effective: "full".to_string(),
             motion_reason: "system permits motion".to_string(),
@@ -639,6 +660,169 @@ impl Default for CursorPostFxSpec {
             performance_reduced: false,
             companion_look: aterm_effects::kitty_registry::KittyLook::default(),
         }
+    }
+}
+
+/// What the Themes demo plays ([`PreviewScene::ThemeDemo`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ThemeDemoSpec {
+    /// Milliseconds into the tape's loop; normalized modulo
+    /// [`crate::settings_theme_demo::DEMO_LOOP_MS`].
+    pub(crate) phase_ms: u64,
+    /// The chrome colours the candidate theme authors (config over theme), for
+    /// the window's tab strip and frame, and for the Appearance preview's
+    /// window sample on Windows (`window_sample_tone`).
+    pub(crate) chrome: aterm_messages::tokens::AuthoredChrome,
+    /// The type a typography package sets, in words ("Menlo 1.3×"), for the
+    /// spoken value.
+    pub(crate) sets_type: Option<String>,
+    /// The most rows the demo shows; `0` is the tape's own bound.
+    pub(crate) max_rows: usize,
+}
+
+/// The most rows and columns the demo terminal is laid out at. The rows
+/// fill a tall demo (the tape is about forty lines): a grid that stopped
+/// short would scroll its first lines away over a band of empty background.
+pub(crate) const DEMO_MAX_ROWS: usize = 40;
+pub(crate) const DEMO_MAX_COLS: usize = 100;
+/// The demo window's tab strip height.
+pub(crate) const DEMO_STRIP_HEIGHT: f32 = 28.0;
+/// The inset between the demo window's edge and its grid.
+pub(crate) const DEMO_GRID_INSET: f32 = 8.0;
+
+/// The window the Themes demo frames its terminal in: the one aterm's own
+/// window looks like on this platform, so a theme is shown in the chrome it
+/// will be worn in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DemoFrame {
+    /// A Windows 11 aterm window, whose tab row is its title bar (Windows
+    /// Terminal's, the caption the band's tone, `platform_win::caption_tint`):
+    /// 8-pt window corners, the tabs leading with the selected one the
+    /// terminal's ground, its top corners rounded and its foot opening through
+    /// the seam into the grid (`tab_bar::SELECTED_TAB_IS_GROUND`), its `✕`
+    /// resident, the quiet one a bare title, a `+` after them, and minimize,
+    /// maximize and close at the right. The labels are Windows shells.
+    Windows,
+    /// Three window dots at the left and a two-tab strip whose selected card
+    /// carries the accent rule: macOS's and Linux's frame.
+    Dots,
+}
+
+impl DemoFrame {
+    /// The frame this build draws: the Windows one where the real strip draws
+    /// Windows 11 tabs ([`crate::tab_bar::SELECTED_TAB_IS_GROUND`]), so the
+    /// picture and the strip change together.
+    pub(crate) const PLATFORM: Self = if crate::tab_bar::SELECTED_TAB_IS_GROUND {
+        Self::Windows
+    } else {
+        Self::Dots
+    };
+
+    /// The window's corner radius: Windows 11's 8, else 10.
+    pub(crate) const fn radius(self) -> f32 {
+        match self {
+            Self::Windows => 8.0,
+            Self::Dots => 10.0,
+        }
+    }
+
+    /// The two tabs' labels, the selected one first.
+    pub(crate) const fn labels(self) -> [&'static str; 2] {
+        match self {
+            Self::Windows => ["PowerShell", "Command Prompt"],
+            Self::Dots => ["zsh — aterm", "targo test"],
+        }
+    }
+}
+
+/// A Windows demo's caption button, as wide as the 28-pt row is to the
+/// 32-pt caption whose 46-pt buttons it stands for.
+const DEMO_CAPTION_BUTTON_W: f32 = 40.0;
+/// The caption glyphs' box (Windows 11's 10-pt minimize, maximize and close).
+const DEMO_CAPTION_GLYPH: f32 = 10.0;
+/// The `+` slot after a Windows demo's tabs.
+const DEMO_NEW_TAB_W: f32 = 32.0;
+/// A Windows demo tab's top corners: WinUI's 8, as the real strip's.
+const DEMO_TAB_RADIUS: f32 = 8.0;
+
+/// Where a demo window drawn in `rect` puts its strip's pieces
+/// ([`DemoStripLayout::of`]), shared by the paint and its tests.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DemoStripLayout {
+    /// The strip's height: [`DEMO_STRIP_HEIGHT`], or the whole of a shorter
+    /// rect.
+    pub(crate) strip_h: f32,
+    /// The tabs' top edge.
+    pub(crate) tab_top: f32,
+    /// The selected tab's left edge; the quiet tab follows it at `tab_w`.
+    pub(crate) tabs_x: f32,
+    /// Each tab's width; under 24 pt the tabs are not drawn.
+    pub(crate) tab_w: f32,
+    /// A Windows frame's caption glyph centres, minimize, maximize and close,
+    /// and the strip's middle they share; `None` on the dots frame, or a
+    /// window too narrow for its buttons.
+    pub(crate) caption: Option<([f32; 3], f32)>,
+    /// A Windows frame's `+` centre, while its tabs are drawn.
+    pub(crate) new_tab: Option<f32>,
+}
+
+impl DemoStripLayout {
+    /// The least tab the strip draws.
+    pub(crate) const MIN_TAB_W: f32 = 24.0;
+
+    pub(crate) fn of(rect: LogicalRect, frame: DemoFrame) -> Self {
+        let top = rect.y;
+        let strip_h = DEMO_STRIP_HEIGHT.min(rect.height);
+        match frame {
+            DemoFrame::Dots => {
+                let tabs_x = rect.x + 52.0;
+                Self {
+                    strip_h,
+                    tab_top: top + 5.0,
+                    tabs_x,
+                    tab_w: ((rect.right() - 12.0 - tabs_x) / 2.0).clamp(0.0, 168.0),
+                    caption: None,
+                    new_tab: None,
+                }
+            }
+            DemoFrame::Windows => {
+                let tabs_x = (rect.x + 8.0).round();
+                let buttons = DEMO_CAPTION_BUTTON_W * 3.0;
+                // The buttons stand at the window's right edge whenever they
+                // fit beside its leading inset; the tabs take what they leave.
+                let caption = (rect.width >= buttons + 16.0).then(|| {
+                    let x = (rect.right() - buttons).round();
+                    let centre = |index: f32| x + DEMO_CAPTION_BUTTON_W * (index + 0.5);
+                    (
+                        [centre(0.0), centre(1.0), centre(2.0)],
+                        (top + strip_h * 0.5).round(),
+                    )
+                });
+                let tabs_end = caption.map_or(rect.right(), |_| rect.right() - buttons - 8.0);
+                let tab_w = ((tabs_end - DEMO_NEW_TAB_W - tabs_x) / 2.0)
+                    .floor()
+                    .clamp(0.0, 168.0);
+                Self {
+                    strip_h,
+                    tab_top: top + 6.0,
+                    tabs_x,
+                    tab_w,
+                    caption,
+                    new_tab: (tab_w >= Self::MIN_TAB_W)
+                        .then_some(tabs_x + tab_w * 2.0 + DEMO_NEW_TAB_W * 0.5),
+                }
+            }
+        }
+    }
+
+    /// The tabs' height, down to the strip's foot.
+    pub(crate) fn tab_h(&self, rect: LogicalRect) -> f32 {
+        rect.y + self.strip_h - self.tab_top
+    }
+
+    /// The optical centre of the tab labels' row: their caps' middle.
+    pub(crate) fn label_cy(&self, rect: LogicalRect) -> f32 {
+        self.tab_top + (self.tab_h(rect) - 2.0) * 0.5
     }
 }
 
@@ -680,6 +864,15 @@ pub(crate) struct SettingsPreviewSpec {
     /// pointed at or being tried), not what the configuration applies: the
     /// badge says `Sample:` instead of `Theme:`.
     pub(crate) theme_sample: bool,
+    /// The focused cursor style is being TRIED, not saved (a Cursor Styles
+    /// row the pointer or the keyboard rests on that nobody chose): the badge
+    /// says `Trying:` and the spoken value says it is not saved.
+    pub(crate) style_trial: bool,
+    /// The focused row's own verdict when it changes nothing now, in the
+    /// words the row shows (`Inactive: dark themes only`, `Inactive: Bloom
+    /// Off`): the header says it in place of a live state, so the row and the
+    /// header cannot disagree.
+    pub(crate) focused_effect: Option<String>,
     pub(crate) font_status: String,
     pub(crate) font_ready_epoch: u64,
     pub(crate) prepared_font: crate::tray_raster::PreparedSemanticFont,
@@ -698,6 +891,12 @@ pub(crate) struct SettingsPreviewSpec {
     pub(crate) reduced_motion: bool,
     /// Why `reduced_motion` holds, for the badge and the spoken summary.
     pub(crate) pause: PreviewPause,
+    /// The Themes demo's playback; read only by [`PreviewScene::ThemeDemo`].
+    pub(crate) demo: ThemeDemoSpec,
+    /// The wallpaper the terminal draws under its default backgrounds, as a
+    /// tab does: the Wallpaper page's preview, and the Appearance color
+    /// sample while one is set. `None` draws the theme background.
+    pub(crate) wallpaper: Option<crate::widget::SpecimenWallpaper>,
 }
 
 impl Default for SettingsPreviewSpec {
@@ -721,6 +920,8 @@ impl Default for SettingsPreviewSpec {
             focused_value: crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE.to_string(),
             focused_label: String::new(),
             theme_sample: false,
+            style_trial: false,
+            focused_effect: None,
             font_status: "host-prepared renderer snapshot unavailable".to_string(),
             font_ready_epoch: 0,
             prepared_font: crate::tray_raster::PreparedSemanticFont::unavailable(
@@ -732,6 +933,8 @@ impl Default for SettingsPreviewSpec {
             phase_ms: 720,
             reduced_motion: false,
             pause: PreviewPause::Unspecified,
+            demo: ThemeDemoSpec::default(),
+            wallpaper: None,
         }
     }
 }
@@ -761,6 +964,50 @@ impl SettingsPreviewSpec {
             },
             ..Self::default()
         }
+    }
+
+    /// The Themes demo at `phase_ms` into its loop: the window follows the
+    /// candidate theme, and the caret is the tape's own.
+    pub(crate) fn theme_demo(font_px: f32, phase_ms: u64) -> Self {
+        Self {
+            scene: PreviewScene::ThemeDemo,
+            font_px,
+            window_follows_theme: true,
+            cursor: CursorPreviewSpec {
+                trail_enabled: false,
+                blink: false,
+                ..CursorPreviewSpec::default()
+            },
+            demo: ThemeDemoSpec {
+                phase_ms,
+                ..ThemeDemoSpec::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    /// The chrome colours the candidate theme authors, alone: the Appearance
+    /// window sample's band tone on Windows (`window_sample_tone`). The Themes
+    /// demo takes them with its other inputs ([`Self::with_demo`]).
+    pub(crate) fn with_authored_chrome(
+        mut self,
+        chrome: aterm_messages::tokens::AuthoredChrome,
+    ) -> Self {
+        self.demo.chrome = chrome;
+        self
+    }
+
+    /// The demo's chrome colours, its type words and its row bound.
+    pub(crate) fn with_demo(
+        mut self,
+        chrome: aterm_messages::tokens::AuthoredChrome,
+        sets_type: Option<String>,
+        max_rows: usize,
+    ) -> Self {
+        self.demo.chrome = chrome;
+        self.demo.sets_type = sets_type;
+        self.demo.max_rows = max_rows;
+        self
     }
 
     pub(crate) fn cursor(cursor: CursorPreviewSpec) -> Self {
@@ -837,6 +1084,19 @@ impl SettingsPreviewSpec {
         self
     }
 
+    /// Mark the focused cursor style as tried, not saved.
+    pub(crate) fn with_style_trial(mut self, trial: bool) -> Self {
+        self.style_trial = trial;
+        self
+    }
+
+    /// The focused row's verdict when it changes nothing now, in the row's
+    /// own words.
+    pub(crate) fn with_focused_effect(mut self, effect: Option<String>) -> Self {
+        self.focused_effect = effect;
+        self
+    }
+
     pub(crate) fn with_prepared_font(
         mut self,
         prepared: crate::tray_raster::PreparedSemanticFont,
@@ -857,6 +1117,7 @@ impl SettingsPreviewSpec {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_window_following_theme(mut self, follows: bool) -> Self {
         self.window_follows_theme = follows;
         self
@@ -892,6 +1153,8 @@ impl SettingsPreviewSpec {
             appearance: AppearancePreviewSpec {
                 window_theme: self.appearance.window_theme.trim().to_ascii_lowercase(),
                 minimum_contrast: finite_or(self.appearance.minimum_contrast, 1.0).clamp(1.0, 21.0),
+                indexed_minimum_contrast: finite_or(self.appearance.indexed_minimum_contrast, 1.0)
+                    .clamp(1.0, 21.0),
                 selection_foreground: self
                     .appearance
                     .selection_foreground
@@ -921,6 +1184,7 @@ impl SettingsPreviewSpec {
                 fire_shimmer: self.post_fx.fire_shimmer,
                 hdr_glow: self.post_fx.hdr_glow,
                 sdr_boost: finite_or(self.post_fx.sdr_boost, 0.35).clamp(0.0, 1.0),
+                display_edr: self.post_fx.display_edr,
                 motion_raw: self.post_fx.motion_raw.trim().to_ascii_lowercase(),
                 motion_effective: self.post_fx.motion_effective.clone(),
                 motion_reason: self.post_fx.motion_reason.clone(),
@@ -932,15 +1196,33 @@ impl SettingsPreviewSpec {
             focused_value: self.focused_value.trim().to_string(),
             focused_label: self.focused_label.trim().to_string(),
             theme_sample: self.theme_sample,
+            style_trial: self.style_trial,
+            focused_effect: self.focused_effect.clone(),
             font_status: self.font_status.clone(),
             font_ready_epoch: self.font_ready_epoch,
             prepared_font: self.prepared_font.clone(),
             terminal_theme: self.terminal_theme.map(PreviewTerminalTheme::normalized),
             terminal_theme_identity: self.terminal_theme_identity.clone(),
             cursor: self.cursor.normalized(),
-            phase_ms: self.phase_ms % PHASE_CYCLE_MS,
+            phase_ms: self.phase_ms % self.phase_cycle_ms(),
             reduced_motion: self.reduced_motion,
             pause: self.pause,
+            demo: ThemeDemoSpec {
+                phase_ms: self.demo.phase_ms % crate::settings_theme_demo::DEMO_LOOP_MS,
+                chrome: self.demo.chrome,
+                sets_type: self
+                    .demo
+                    .sets_type
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|words| !words.is_empty())
+                    .map(str::to_string),
+                max_rows: self.demo.max_rows,
+            },
+            wallpaper: self.wallpaper.clone().map(|mut wallpaper| {
+                wallpaper.dim = finite_or(wallpaper.dim, 0.0).clamp(0.0, 1.0);
+                wallpaper
+            }),
         }
     }
 
@@ -955,7 +1237,7 @@ impl SettingsPreviewSpec {
     /// `normalized()` costs to produce a three-variant enum. Nothing it reads
     /// needs normalizing except a non-finite `intensity`, which collapses to 0.0
     /// (no motion) here exactly as it does in paint;
-    /// `millis_until_next_blink_edge` re-applies `% PHASE_CYCLE_MS` itself.
+    /// `millis_until_next_blink_edge` re-applies the scene's cycle itself.
     pub(crate) fn animation(&self) -> PreviewAnimation {
         if self.reduced_motion {
             return PreviewAnimation::None;
@@ -964,6 +1246,9 @@ impl SettingsPreviewSpec {
     }
 
     fn animation_without_reduction(&self) -> PreviewAnimation {
+        if self.scene == PreviewScene::ThemeDemo {
+            return crate::settings_theme_demo::demo_animation(self.demo.phase_ms, true);
+        }
         // Appearance and Typography never paint the cursor-motion lane below.
         // Their shared candidate state still carries cursor fields so switching
         // scenes is lossless, but invisible trail/blink values must not arm the
@@ -1069,22 +1354,33 @@ impl SettingsPreviewSpec {
         Some((format!("{state} · {label}: {value}"), true))
     }
 
-    /// `phase_ms` is cyclic, while 2,400 ms is intentionally not an integer
-    /// multiple of the 530 ms blink half-period. The cycle reset occurs during
+    /// `phase_ms` is cyclic, while a cycle ([`Self::phase_cycle_ms`]) is
+    /// not an integer multiple of the 530 ms blink half-period. The cycle reset occurs during
     /// an already-visible half, so it is not itself a visual edge; after the
     /// final in-cycle edge the next wake is 530 ms into the next cycle.
     fn millis_until_next_blink_edge(&self) -> u64 {
-        let phase = self.phase_ms % PHASE_CYCLE_MS;
+        let cycle = self.phase_cycle_ms();
+        let phase = self.phase_ms % cycle;
         for multiple in 1.. {
             let edge = multiple * CURSOR_BLINK_HALF_MS;
-            if edge >= PHASE_CYCLE_MS {
+            if edge >= cycle {
                 break;
             }
             if edge > phase {
                 return edge - phase;
             }
         }
-        PHASE_CYCLE_MS - phase + CURSOR_BLINK_HALF_MS
+        cycle - phase + CURSOR_BLINK_HALF_MS
+    }
+
+    /// The phase cycle this scene loops on: the cursor scene's script
+    /// ([`CURSOR_SCENE_CYCLE_MS`]), else the shared [`PHASE_CYCLE_MS`].
+    fn phase_cycle_ms(&self) -> u64 {
+        if self.scene == PreviewScene::CursorMotion {
+            CURSOR_SCENE_CYCLE_MS
+        } else {
+            PHASE_CYCLE_MS
+        }
     }
 
     pub(crate) fn semantic_label(&self) -> String {
@@ -1115,10 +1411,10 @@ impl SettingsPreviewSpec {
                 let window = match spec.appearance.window_theme.as_str() {
                     "light" => "Light window appearance",
                     "dark" => "Dark window appearance",
-                    // Linux Auto follows the TERMINAL THEME, not a live OS
-                    // appearance feed (`chrome_theme_for_apprt`); announce the
-                    // side the painter resolves through `window_sample_light`,
-                    // never a second opinion of our own.
+                    // Linux and Windows Auto follow the TERMINAL THEME, not a
+                    // live OS appearance feed ([`AUTO_WINDOW_FOLLOWS_TERMINAL`]);
+                    // announce the side the painter resolves through
+                    // `window_sample_light`, never a second opinion of our own.
                     //
                     // With no candidate palette the painter falls back to the
                     // HOST terminal theme — a colour the semantic projection is
@@ -1128,7 +1424,7 @@ impl SettingsPreviewSpec {
                     // not consult. (Every shipping spec carries a candidate:
                     // `renderer_preview_spec_for_key_with_font` derives one from
                     // the host theme even when nothing is edited.)
-                    _ if spec.window_follows_theme || cfg!(target_os = "linux") => {
+                    _ if spec.window_follows_theme || AUTO_WINDOW_FOLLOWS_TERMINAL => {
                         match spec.terminal_theme {
                             Some(candidate) => {
                                 if window_sample_light(&spec, candidate.into_theme()) {
@@ -1151,7 +1447,7 @@ impl SettingsPreviewSpec {
                     }
                     _ => "window appearance that follows the system, currently Light",
                 };
-                // "Sample" only when the stage draws a card, never for the
+                // "Sample" only when the demo draws a tried row, never for the
                 // theme the configuration applies.
                 let subject = if spec.theme_sample {
                     "Color theme sample"
@@ -1160,11 +1456,53 @@ impl SettingsPreviewSpec {
                 };
                 format!("{subject}: {colors}, with {window}.")
             }
+            PreviewScene::ThemeDemo => {
+                let colors = spec.terminal_theme.map_or_else(
+                    || "the current terminal colors".to_string(),
+                    |theme| spoken_palette(theme, spec.terminal_theme_identity.as_ref()),
+                );
+                let sets_type = spec
+                    .demo
+                    .sets_type
+                    .as_ref()
+                    .map_or_else(String::new, |words| format!(", sets type {words}"));
+                let state = if spec.reduced_motion {
+                    format!(", paused because {}", spec.pause.because())
+                } else {
+                    ", animated demo session".to_string()
+                };
+                format!("{colors}{sets_type}{state}")
+            }
+            PreviewScene::Wallpaper => {
+                let words = spec.wallpaper.as_ref().map_or_else(
+                    || "no picture".to_string(),
+                    |wallpaper| {
+                        format!(
+                            "{} by {} pixels, dim {}%, text tint {}",
+                            wallpaper.w,
+                            wallpaper.h,
+                            (wallpaper.dim * 100.0).round(),
+                            if wallpaper.tint { "on" } else { "off" }
+                        )
+                    },
+                );
+                // The file's name (the badge's value adds its size, which
+                // the words below say).
+                let name = spec.focused_value.split(" · ").next().unwrap_or("").trim();
+                if name.is_empty() {
+                    format!("Wallpaper preview: {words}.")
+                } else {
+                    format!("Wallpaper preview: {name}, {words}.")
+                }
+            }
             PreviewScene::Typography => {
                 // A family no resolver found is not what the sample shows.
                 let regular_missing = spec.font_status.to_ascii_lowercase().contains("unresolved")
                     && crate::tray_raster::first_unresolved_slot(&spec.font_status)
                         == Some("regular");
+                // The sample's letters are the display layer's when one is
+                // on (`drawn_family`), else the font's.
+                let drawn = spec.font_candidate.drawn_family();
                 let family = match spec
                     .font_candidate
                     .regular
@@ -1176,15 +1514,20 @@ impl SettingsPreviewSpec {
                         "the current font, because \u{201c}{}\u{201d} is not found",
                         family_words(family)
                     ),
-                    Some(family) => family_words(family),
-                    None => "the current font".to_string(),
+                    _ => match drawn.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+                        Some(family) => family_words(family),
+                        None => "the current font".to_string(),
+                    },
                 };
                 let detail = spec
                     .typography_detail()
                     .map_or_else(String::new, |detail| format!(", {detail}"));
+                // The size in the one unit every font size is in — px at 1×,
+                // what the Font size slider reads — never this display's
+                // device px: on a 2× display "13" is 13 here as on the slider.
                 format!(
                     "Text sample in {family} at {} pixels{detail}; ligatures are {} and synthetic styles are {}.",
-                    trim_float(spec.font_px * spec.terminal_scale),
+                    trim_float(spec.font_px),
                     if spec.ligatures { "on" } else { "off" },
                     if spec.synthetic_styles { "on" } else { "off" },
                 )
@@ -1193,12 +1536,10 @@ impl SettingsPreviewSpec {
                 let trail = if spec.cursor.trail_enabled && spec.cursor.has_resolved_trail() {
                     format!("{} trail", spec.cursor.trail_style_label())
                 } else if spec.cursor.trail_enabled && spec.cursor.momentum_glow {
-                    match spec.typing_glow() {
-                        TypingGlow::Halo => "no trail, glowing as you type",
-                        TypingGlow::Tint => "no trail, tinting as you type",
-                        TypingGlow::Nothing => "no trail",
-                    }
-                    .to_string()
+                    // The typing glow is light on a dark ground and warm ink
+                    // on a light one (`aterm_effects::cursor_momentum`): a
+                    // glow either way, round any cursor shape.
+                    "no trail, glowing as you type".to_string()
                 } else {
                     "no trail".to_string()
                 };
@@ -1211,8 +1552,26 @@ impl SettingsPreviewSpec {
                         PreviewAnimation::None => String::new(),
                     }
                 };
+                // A tried style is said to be unsaved, as a theme sample is.
+                let lead = if spec.style_trial
+                    && spec.focused_key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE
+                {
+                    format!(
+                        "Cursor preview, trying {} (not saved; Return saves, Escape goes back)",
+                        spec.cursor.trail_style_label()
+                    )
+                } else {
+                    "Cursor preview".to_string()
+                };
+                // The focused row's verdict when it changes nothing now.
+                let idle = spec
+                    .focused_effect
+                    .as_deref()
+                    .map_or_else(String::new, |effect| {
+                        format!(" {} · {effect}.", spec.focused_label)
+                    });
                 format!(
-                    "Cursor preview: {} cursor, {trail}{state}.",
+                    "{lead}: {} cursor, {trail}{state}.{idle}",
                     spec.cursor.style.label()
                 )
             }
@@ -1332,7 +1691,7 @@ impl SettingsPreviewSpec {
             |color| format!("#{color:06X}"),
         );
         let post_fx = format!(
-            "portable SDR tone-map: bloom {} strength {} radius {}; fire shimmer {}; HDR candidate {} tone-mapped (no panel-headroom claim); SDR boost {}",
+            "live bloom kernel on the CPU: bloom {} strength {} radius {}; fire shimmer {}; HDR candidate {} drawn as its SDR crown (no panel-headroom claim); SDR boost {}",
             if spec.post_fx.bloom { "on" } else { "off" },
             trim_float(spec.post_fx.bloom_strength),
             trim_float(spec.post_fx.bloom_radius),
@@ -1436,6 +1795,14 @@ impl SettingsPreviewSpec {
         )
     }
 
+    /// The frame a Themes demo shows ([`crate::settings_theme_demo::frame_key`]):
+    /// the settled one once it rests. `None` for any other scene.
+    pub(crate) fn demo_frame(&self) -> Option<(usize, bool, u16)> {
+        (self.scene == PreviewScene::ThemeDemo).then(|| {
+            crate::settings_theme_demo::frame_key(self.demo.phase_ms, !self.reduced_motion)
+        })
+    }
+
     /// Paint-only identity folded into [`crate::native_ui::CompiledUi`]'s
     /// retained-raster key. Animation phase deliberately stays out of the
     /// accessibility value, but it must invalidate pixels while motion runs.
@@ -1468,8 +1835,10 @@ impl SettingsPreviewSpec {
     ///
     /// INVARIANT: the hashed value SET and its many-to-one collapses must stay
     /// exactly those of `normalized()` — same clamps, same `0x00ff_ffff` masks,
-    /// and the same `phase_ms % PHASE_CYCLE_MS`. Hashing coarser would stale-serve a
-    /// retained raster; hashing finer would re-raster identical pixels.
+    /// and the same phase reduction ([`Self::phase_cycle_ms`]; a cursor scene
+    /// paints its phase on the 52 ms step its engines take, and its blink
+    /// half). Hashing coarser would stale-serve a retained raster; hashing
+    /// finer would re-raster identical pixels.
     fn paint_identity_hash(&self) -> u64 {
         use std::hash::{Hash, Hasher};
 
@@ -1490,6 +1859,10 @@ impl SettingsPreviewSpec {
         self.focused_value.trim().hash(&mut hash);
         hash_trimmed_lowercase(&self.appearance.window_theme, &mut hash);
         finite_or(self.appearance.minimum_contrast, 1.0)
+            .clamp(1.0, 21.0)
+            .to_bits()
+            .hash(&mut hash);
+        finite_or(self.appearance.indexed_minimum_contrast, 1.0)
             .clamp(1.0, 21.0)
             .to_bits()
             .hash(&mut hash);
@@ -1547,6 +1920,7 @@ impl SettingsPreviewSpec {
             .hash(&mut hash);
         self.post_fx.fire_shimmer.hash(&mut hash);
         self.post_fx.hdr_glow.hash(&mut hash);
+        self.post_fx.display_edr.hash(&mut hash);
         finite_or(self.post_fx.sdr_boost, 0.35)
             .clamp(0.0, 1.0)
             .to_bits()
@@ -1558,6 +1932,8 @@ impl SettingsPreviewSpec {
         self.post_fx.performance_reduced.hash(&mut hash);
         self.focused_label.trim().hash(&mut hash);
         self.theme_sample.hash(&mut hash);
+        self.style_trial.hash(&mut hash);
+        self.focused_effect.hash(&mut hash);
         // `PreviewTerminalTheme` is `Copy`, so the normalized candidate is a
         // stack value.
         self.terminal_theme
@@ -1597,19 +1973,48 @@ impl SettingsPreviewSpec {
         self.cursor.cursor_color_pinned.hash(&mut hash);
         self.reduced_motion.hash(&mut hash);
         self.pause.hash(&mut hash);
-        // The phase MUST be reduced before the blink parity is read: 2,400 ms is
-        // deliberately not a whole multiple of the 530 ms half-period, so raw
-        // phase 4,800 (parity odd) and normalized phase 0 (parity even) disagree.
+        self.wallpaper
+            .as_ref()
+            .map(|wallpaper| {
+                let (fp, w, h, _, tint) = wallpaper.identity();
+                (
+                    fp,
+                    w,
+                    h,
+                    finite_or(wallpaper.dim, 0.0).clamp(0.0, 1.0).to_bits(),
+                    tint,
+                )
+            })
+            .hash(&mut hash);
+        // The phase MUST be reduced before the blink parity is read: a cycle is
+        // deliberately not a whole multiple of the 530 ms half-period, so a raw
+        // phase two cycles in (parity odd for 2,400 ms) and the normalized phase
+        // 0 (parity even) disagree.
         // Paint goes through `normalized()`, so the key must too, or two frames
         // that paint differently collide on one retained raster.
-        let phase_ms = self.phase_ms % PHASE_CYCLE_MS;
+        let phase_ms = self.phase_ms % self.phase_cycle_ms();
         let cursor_visible = self.reduced_motion
             || !self.cursor.blink
             || (phase_ms / CURSOR_BLINK_HALF_MS).is_multiple_of(2);
         match self.animation() {
-            PreviewAnimation::Continuous => phase_ms.hash(&mut hash),
+            // The cursor scene's engines step on a 52 ms grid, so the phases
+            // inside one step paint one frame; the blink half rides along.
+            PreviewAnimation::Continuous => {
+                (phase_ms / MOTION_STEP_MS).hash(&mut hash);
+                cursor_visible.hash(&mut hash);
+            }
             PreviewAnimation::BlinkEdge { .. } => cursor_visible.hash(&mut hash),
             PreviewAnimation::None => 0_u64.hash(&mut hash),
+        }
+        if let Some(frame) = self.demo_frame() {
+            // The frame the tape shows, never the raw phase: the phases
+            // between two writes paint the same pixels.
+            frame.hash(&mut hash);
+            self.demo.chrome.hash(&mut hash);
+            self.demo.max_rows.hash(&mut hash);
+        } else if WINDOW_SAMPLE_WEARS_THE_BAND && self.scene == PreviewScene::Appearance {
+            // The window sample wears the band the authored chrome tints.
+            self.demo.chrome.hash(&mut hash);
         }
         hash.finish() | 1
     }
@@ -1635,19 +2040,59 @@ impl SettingsPreviewSpec {
         floor.max(match self.scene {
             PreviewScene::Typography => self.typography_height(1),
             PreviewScene::CursorMotion => {
-                preview_header_height(&spec)
-                    + 15.0
-                    + spec.specimen_headroom()
-                    + spec.typography_row_height()
+                preview_header_height(&spec) + 15.0 + spec.typography_row_height()
             }
             PreviewScene::Appearance => {
                 preview_header_height(&spec)
                     + 15.0
-                    + appearance_terminal_floor(
-                        spec.specimen_headroom() + spec.typography_row_height(),
-                    )
+                    + appearance_terminal_floor(spec.typography_row_height())
+            }
+            PreviewScene::ThemeDemo => spec.demo_height(6),
+            // Two rows of the session over the picture.
+            PreviewScene::Wallpaper => {
+                preview_header_height(&spec) + 15.0 + 2.0 * spec.typography_row_height()
             }
         })
+    }
+
+    /// The demo terminal's cell in logical points: the prepared face's, else
+    /// an estimate from the type size.
+    pub(crate) fn demo_cell_size(&self) -> (f32, f32) {
+        let scale = finite_or(self.terminal_scale, 1.0).max(f32::EPSILON);
+        self.prepared_font
+            .specimen_cell_size(
+                self.font_px * scale,
+                self.line_height,
+                &self.variation_requests(),
+            )
+            .filter(|&(w, h)| w > 0 && h > 0)
+            .map_or_else(
+                || (self.font_px * 0.6, self.font_px * self.line_height * 1.25),
+                |(w, h)| (w as f32 / scale, h as f32 / scale),
+            )
+    }
+
+    /// The demo window's height with `rows` whole rows.
+    pub(crate) fn demo_height(&self, rows: usize) -> f32 {
+        let (_, cell_h) = self.demo_cell_size();
+        (DEMO_STRIP_HEIGHT + DEMO_GRID_INSET * 2.0 + rows as f32 * cell_h).ceil()
+    }
+
+    /// The demo grid a `rect` holds: whole rows and columns inside the frame,
+    /// bounded by [`DEMO_MAX_ROWS`] (or the spec's own bound) and
+    /// [`DEMO_MAX_COLS`].
+    pub(crate) fn demo_grid(&self, rect: LogicalRect) -> (usize, usize) {
+        let (cell_w, cell_h) = self.demo_cell_size();
+        let width = (rect.width - DEMO_GRID_INSET * 2.0).max(0.0);
+        let height = (rect.height - DEMO_STRIP_HEIGHT - DEMO_GRID_INSET * 2.0).max(0.0);
+        let bound = match self.demo.max_rows {
+            0 => DEMO_MAX_ROWS,
+            rows => rows.min(DEMO_MAX_ROWS),
+        };
+        (
+            ((height / cell_h).floor() as usize).clamp(1, bound),
+            ((width / cell_w).floor() as usize).clamp(8, DEMO_MAX_COLS),
+        )
     }
 
     /// The height at which a color specimen shows every row it has; a host
@@ -1659,8 +2104,7 @@ impl SettingsPreviewSpec {
             (preview_header_height(&spec)
                 + 15.0
                 + appearance_terminal_floor(
-                    spec.specimen_headroom()
-                        + APPEARANCE_SPECIMEN_ROWS as f32 * spec.typography_row_height(),
+                    APPEARANCE_SPECIMEN_ROWS as f32 * spec.typography_row_height(),
                 ))
             .ceil()
         })
@@ -1671,29 +2115,9 @@ impl SettingsPreviewSpec {
         let spec = self.normalized();
         preview_header_height(&spec)
             + 15.0
-            + spec.specimen_headroom()
             + rows as f32 * spec.typography_row_height()
             + font_candidate_pill_height(crate::native_appearance::text_scale())
             + 10.0
-    }
-
-    /// The room above the specimen's first row that a display face's
-    /// capitals rise into (the frame's head band,
-    /// [`aterm_render::Renderer::display_ink_headroom`]), with a point of
-    /// rounding slack; `0` for an ordinary font.
-    fn specimen_headroom(&self) -> f32 {
-        self.specimen_headroom_at(self.font_px)
-    }
-
-    fn specimen_headroom_at(&self, font_px: f32) -> f32 {
-        match self.prepared_font.specimen_ink_headroom(
-            font_px,
-            self.line_height,
-            self.baseline_adjust,
-        ) {
-            Some(rise) if rise > 0 => rise as f32 + 1.0,
-            _ => 0.0,
-        }
     }
 
     fn variation_requests(&self) -> Vec<(u32, f32)> {
@@ -1787,13 +2211,7 @@ impl SettingsPreviewSpec {
             &self.variation_requests(),
         )?;
         let (cell_w, cell_h) = (cell_w as f32 / scale, cell_h as f32 / scale);
-        let rows = appearance_whole_rows(
-            terminal,
-            drop,
-            self.specimen_headroom_at(px),
-            self.row_height_at(px),
-        )
-        .min(columns.len());
+        let rows = appearance_whole_rows(terminal, drop, self.row_height_at(px)).min(columns.len());
         let band = appearance_window_band(terminal);
         let mut worst: Option<f32> = None;
         for (index, &cols) in columns[..rows].iter().enumerate() {
@@ -1815,11 +2233,195 @@ impl SettingsPreviewSpec {
 
     fn terminal_specimen(&self, theme: Theme, rows: Option<usize>) -> TerminalSpecimenSpec {
         let (input, input_fingerprint) = build_terminal_specimen_input_rows(self, theme, rows);
+        self.specimen_of(theme, input, input_fingerprint, rows)
+    }
+
+    /// The demo window: a framed terminal under a two-tab strip in the
+    /// candidate's chrome colours, its grid the tape's frame at this phase,
+    /// in the window `frame` this platform draws ([`DemoFrame::PLATFORM`]).
+    fn paint_theme_demo(
+        &self,
+        prims: &mut Vec<DrawPrim>,
+        rect: LogicalRect,
+        theme: Theme,
+        roles: Roles,
+        frame: DemoFrame,
+    ) {
+        let candidate = self
+            .terminal_theme
+            .unwrap_or_else(|| PreviewTerminalTheme::over_engine_palette(theme));
+        let terminal_theme = candidate.into_theme();
+        let strip = crate::tab_bar::strip_sample(crate::chrome_band::ChromePalette {
+            theme: terminal_theme,
+            ansi: Some(demo_ansi_hues(&candidate)),
+            authored: self.demo.chrome,
+        });
+        let light_page = !crate::native_appearance::surface_is_dark(roles.surface);
+        let radius = frame.radius();
+        push_demo_shadow(prims, rect, light_page, true, radius);
+        let background = crate::settings::u32_rgb(terminal_theme.bg);
+        prims.push(DrawPrim::Panel {
+            x: rect.x,
+            y: rect.y,
+            w: rect.width,
+            h: rect.height,
+            radius,
+            fill: rgba(background, 255),
+        });
+        // The tab strip: rounded on top, square where it meets the grid.
+        let layout = DemoStripLayout::of(rect, frame);
+        prims.push(DrawPrim::Panel {
+            x: rect.x,
+            y: rect.y,
+            w: rect.width,
+            h: layout.strip_h,
+            radius,
+            fill: rgba(strip.band, 255),
+        });
+        prims.push(DrawPrim::Panel {
+            x: rect.x,
+            y: rect.y + layout.strip_h * 0.5,
+            w: rect.width,
+            h: layout.strip_h * 0.5,
+            radius: 0.0,
+            fill: rgba(strip.band, 255),
+        });
+        let caption = TypeStep::Caption
+            .px(13.75)
+            .scaled(crate::native_appearance::text_scale());
+        match frame {
+            DemoFrame::Dots => paint_demo_dots_strip(prims, rect, &layout, &strip, roles, caption),
+            DemoFrame::Windows => paint_demo_windows_strip(
+                prims,
+                rect,
+                &layout,
+                &strip,
+                background,
+                crate::settings::u32_rgb(terminal_theme.fg),
+                caption,
+            ),
+        }
+        if let Some(grid) = Self::demo_grid_rect(rect) {
+            let (rows, cols) = self.demo_grid(rect);
+            let (_, cell_h) = self.demo_cell_size();
+            if grid.height >= cell_h && grid.width > 0.0 {
+                let colors = crate::settings_theme_demo::DemoColors::new(
+                    candidate,
+                    self.appearance.selection_foreground,
+                    self.appearance.bold_is_bright,
+                    self.appearance.indexed_minimum_contrast,
+                );
+                let (input, fingerprint) = crate::settings_theme_demo::demo_frame(
+                    &colors,
+                    self.demo.phase_ms,
+                    !self.reduced_motion,
+                    rows,
+                    cols,
+                );
+                prims.push(DrawPrim::ClipPush {
+                    x: grid.x,
+                    y: grid.y,
+                    w: grid.width,
+                    h: grid.height,
+                });
+                prims.push(DrawPrim::TerminalSpecimen {
+                    x: grid.x,
+                    y: grid.y,
+                    spec: Box::new(self.specimen_of(terminal_theme, input, fingerprint, None)),
+                });
+                prims.push(DrawPrim::ClipPop);
+            }
+        }
+        // The frame's hairline: the theme's border colour, else the page's
+        // separator.
+        let hairline = self.demo.chrome.border.unwrap_or(roles.separator);
+        prims.push(DrawPrim::Stroke {
+            x: rect.x + 0.5,
+            y: rect.y + 0.5,
+            w: (rect.width - 1.0).max(0.0),
+            h: (rect.height - 1.0).max(0.0),
+            radius: radius - 0.5,
+            width: 1.0,
+            color: rgba(hairline, 255),
+        });
+    }
+
+    /// [`Self::paint`] of a Themes demo in `frame`, whatever this platform
+    /// draws, so a test can hold either frame on every platform.
+    #[cfg(test)]
+    pub(crate) fn paint_demo_frame(
+        &self,
+        prims: &mut Vec<DrawPrim>,
+        rect: LogicalRect,
+        theme: Theme,
+        roles: Roles,
+        frame: DemoFrame,
+    ) {
+        self.normalized()
+            .paint_theme_demo(prims, rect, theme, roles, frame);
+    }
+
+    /// Where a demo drawn in `rect` puts its terminal grid, under the tab
+    /// strip; `None` while the strip leaves no room for one.
+    fn demo_grid_rect(rect: LogicalRect) -> Option<LogicalRect> {
+        let strip_h = DEMO_STRIP_HEIGHT.min(rect.height);
+        (strip_h >= DEMO_STRIP_HEIGHT).then(|| {
+            LogicalRect::new(
+                rect.x + DEMO_GRID_INSET,
+                rect.y + strip_h + DEMO_GRID_INSET,
+                (rect.width - DEMO_GRID_INSET * 2.0).max(0.0),
+                (rect.height - strip_h - DEMO_GRID_INSET * 2.0).max(0.0),
+            )
+        })
+    }
+
+    /// What one tick of this preview's motion can repaint, of a node drawn
+    /// in `rect`: a Themes demo's tick changes only its terminal grid (the
+    /// window, its strip and its shadow stay); every other scene, `rect`.
+    pub(crate) fn tick_rect(&self, rect: LogicalRect) -> LogicalRect {
+        if self.scene != PreviewScene::ThemeDemo || rect.width <= 2.0 || rect.height <= 2.0 {
+            return rect;
+        }
+        Self::demo_grid_rect(rect).unwrap_or(rect)
+    }
+
+    /// What changing this spec to `next` repaints of a node drawn in `rect`:
+    /// between two Themes demo specs that differ only in where the tape is,
+    /// whether it rests, or the face its grid is set in, the grid
+    /// ([`Self::tick_rect`]); any other change, `rect`.
+    pub(crate) fn repaint_rect(&self, next: &Self, rect: LogicalRect) -> LogicalRect {
+        if self.scene != PreviewScene::ThemeDemo || next.scene != PreviewScene::ThemeDemo {
+            return rect;
+        }
+        let mut moved = self.clone();
+        moved.demo.phase_ms = next.demo.phase_ms;
+        moved.phase_ms = next.phase_ms;
+        moved.reduced_motion = next.reduced_motion;
+        moved.pause = next.pause;
+        moved.font_candidate = next.font_candidate.clone();
+        moved.font_ready_epoch = next.font_ready_epoch;
+        moved.prepared_font = next.prepared_font.clone();
+        if moved == *next {
+            self.tick_rect(rect)
+        } else {
+            rect
+        }
+    }
+
+    /// The specimen primitive for a prepared frame; `card_rows` is the whole
+    /// rows its card shows.
+    fn specimen_of(
+        &self,
+        theme: Theme,
+        input: Arc<aterm_render::RenderInput>,
+        input_fingerprint: u64,
+        card_rows: Option<usize>,
+    ) -> TerminalSpecimenSpec {
         TerminalSpecimenSpec {
             input,
             input_fingerprint,
             motion: (self.scene == PreviewScene::CursorMotion)
-                .then(|| Arc::new(CursorScene::new(self, theme))),
+                .then(|| Arc::new(CursorScene::new(self, theme, card_rows))),
             prepared_font: self.prepared_font.clone(),
             theme,
             font_px: self.font_px,
@@ -1839,6 +2441,7 @@ impl SettingsPreviewSpec {
             minimum_contrast: self.appearance.minimum_contrast,
             selection_foreground: self.appearance.selection_foreground,
             selection_inactive: self.appearance.selection_inactive,
+            wallpaper: self.wallpaper.clone(),
         }
     }
 
@@ -1866,6 +2469,10 @@ impl SettingsPreviewSpec {
     ) {
         let spec = self.normalized();
         if rect.width <= 2.0 || rect.height <= 2.0 {
+            return;
+        }
+        if spec.scene == PreviewScene::ThemeDemo {
+            spec.paint_theme_demo(prims, rect, theme, roles, DemoFrame::PLATFORM);
             return;
         }
 
@@ -1907,8 +2514,18 @@ impl SettingsPreviewSpec {
         let with_state = |candidate: String| spec.with_state_badge(candidate);
         // The whole badge wherever the header holds it; a long one shortens
         // its subject first, so the value being tried stays readable.
-        let mut state = with_state(spec.candidate_badge());
+        // A tried style says how to keep it while the header has room.
+        let mut state =
+            if spec.style_trial && spec.focused_key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE {
+                format!("{} · Return to save", with_state(spec.candidate_badge()))
+            } else {
+                with_state(spec.candidate_badge())
+            };
         let mut state_width = measure(&state);
+        if scene_width + 8.0 + state_width > available {
+            state = with_state(spec.candidate_badge());
+            state_width = measure(&state);
+        }
         if scene_width + 8.0 + state_width > available {
             state = with_state(spec.bounded_candidate_badge(30));
             state_width = measure(&state);
@@ -1929,6 +2546,7 @@ impl SettingsPreviewSpec {
             state_width = measure(&state);
         }
         if state_width > available
+            && !spec.candidate_is_unsaved()
             && let Some((_, value)) = spec.candidate_parts()
             && spec.compact_state_badge() == spec.candidate_badge()
         {
@@ -1970,7 +2588,7 @@ impl SettingsPreviewSpec {
             TextWeight::Regular,
             TextFace::UiBold,
             rgba(
-                if matches!(spec.animation(), PreviewAnimation::Continuous) {
+                if spec.reads_live() {
                     roles.success
                 } else {
                     roles.text_secondary
@@ -2005,25 +2623,28 @@ impl SettingsPreviewSpec {
         // band would leave no whole row it yields to the glyphs, which are
         // the proof, unless it is warning that the font failed.
         let row = spec.typography_row_height();
-        // A display face's capitals rise into a band above the first row.
-        let head = spec.specimen_headroom();
         let pill_band = font_candidate_pill_height(crate::native_appearance::text_scale()) + 10.0;
         let mut shows_pill = false;
         let whole_rows = match spec.scene {
-            PreviewScene::Appearance => appearance_whole_rows(terminal, drop, head, row),
+            // The demo painted above and returned; it never reaches here.
+            PreviewScene::Appearance | PreviewScene::ThemeDemo => {
+                appearance_whole_rows(terminal, drop, row)
+            }
+            PreviewScene::Wallpaper => {
+                ((terminal.height.max(0.0) / row).floor() as usize).min(APPEARANCE_SPECIMEN_ROWS)
+            }
             PreviewScene::Typography => {
-                let with_pill =
-                    ((terminal.height - head - pill_band).max(0.0) / row).floor() as usize;
-                let bare = ((terminal.height - head - 4.0).max(0.0) / row).floor() as usize;
+                let with_pill = ((terminal.height - pill_band).max(0.0) / row).floor() as usize;
+                let bare = ((terminal.height - 4.0).max(0.0) / row).floor() as usize;
                 let pill = spec.font_candidate_pill();
                 let warning = pill.as_ref().is_some_and(|(_, warning)| *warning);
                 shows_pill =
                     pill.is_some() && (with_pill > 0 || (warning && terminal.height >= pill_band));
                 if shows_pill { with_pill } else { bare }.min(TYPOGRAPHY_SPECIMEN_ROWS)
             }
-            PreviewScene::CursorMotion => (((terminal.height - head).max(0.0) / row).floor()
-                as usize)
-                .min(CURSOR_SPECIMEN_ROWS),
+            PreviewScene::CursorMotion => {
+                ((terminal.height.max(0.0) / row).floor() as usize).min(CURSOR_SPECIMEN_ROWS)
+            }
         };
         // A body that holds no whole row (and no status band) is a sliver:
         // the card keeps its header naming what it would show, and paints
@@ -2046,7 +2667,25 @@ impl SettingsPreviewSpec {
             h: terminal.height,
         });
         if whole_rows > 0 {
-            let terminal_specimen = spec.terminal_specimen(terminal_theme, Some(whole_rows));
+            let terminal_specimen = if spec.wallpaper.is_some() {
+                // The picture under the whole terminal (a color sample's rows
+                // below its window sample): a grid that covers it, the
+                // session on its first rows.
+                let (cell_w, cell_h) = spec.demo_cell_size();
+                let grid = (
+                    ((terminal.height - drop) / cell_h.max(1.0)).ceil().max(1.0) as usize,
+                    (terminal.width / cell_w.max(1.0)).ceil().max(1.0) as usize,
+                );
+                let (input, fingerprint) = build_terminal_specimen_input_grid(
+                    &spec,
+                    terminal_theme,
+                    Some(whole_rows),
+                    Some(grid),
+                );
+                spec.specimen_of(terminal_theme, input, fingerprint, Some(whole_rows))
+            } else {
+                spec.terminal_specimen(terminal_theme, Some(whole_rows))
+            };
             if spec.scene == PreviewScene::Appearance {
                 let specimen_clip = appearance_specimen_clip(terminal);
                 prims.push(DrawPrim::ClipPush {
@@ -2074,19 +2713,36 @@ impl SettingsPreviewSpec {
         prims.push(DrawPrim::ClipPop);
     }
 
-    /// What the typing-momentum glow draws on this preview's terminal: a
-    /// halo of light on a dark one; on a light one, where light cannot
-    /// show, only the block caret's warmer fill, and nothing for a bar
-    /// ([`aterm_effects::cursor_momentum`]). A preview with no terminal
-    /// theme of its own follows the host's, and says the halo.
-    fn typing_glow(&self) -> TypingGlow {
-        match self.terminal_theme {
-            Some(theme) if !theme_bg_is_dark(theme.bg) => match self.cursor.style {
-                PreviewCursorStyle::Block => TypingGlow::Tint,
-                PreviewCursorStyle::Bar => TypingGlow::Nothing,
-            },
-            _ => TypingGlow::Halo,
+    /// What the header says after the candidate: the focused row's own
+    /// verdict when it changes nothing now ([`Self::focused_effect`]), else
+    /// the scene's state. A pause keeps priority, since it already says why
+    /// nothing moves.
+    fn live_state(&self) -> String {
+        match self.focused_idle() {
+            Some(effect) if !self.reduction_suppresses_motion() => effect,
+            _ => self.state_badge(),
         }
+    }
+
+    /// Why the focused row changes nothing in this preview: its own verdict
+    /// ([`Self::focused_effect`]), else a Trail length the cursor scene's
+    /// Tab cannot show, since it only cuts a jump longer than itself.
+    fn focused_idle(&self) -> Option<String> {
+        if let Some(effect) = &self.focused_effect {
+            return Some(effect.clone());
+        }
+        let jump = CURSOR_SCENE_TAB.1 - CURSOR_SCENE_TAB.0;
+        (self.scene == PreviewScene::CursorMotion
+            && self.focused_key == crate::prefs::EDIT_CURSOR_TRAIL_LENGTH
+            && self.animation() == PreviewAnimation::Continuous
+            && self.cursor.length >= jump)
+            .then(|| format!("Covers this {jump}-cell jump"))
+    }
+
+    /// The header's state reads as live: the scene plays and the focused row
+    /// is not idle.
+    fn reads_live(&self) -> bool {
+        matches!(self.animation(), PreviewAnimation::Continuous) && self.focused_idle().is_none()
     }
 
     fn state_badge(&self) -> String {
@@ -2098,15 +2754,12 @@ impl SettingsPreviewSpec {
                     PreviewScene::Appearance => "Color sample".to_string(),
                     PreviewScene::Typography => "Text sample".to_string(),
                     PreviewScene::CursorMotion => "Static preview".to_string(),
+                    PreviewScene::ThemeDemo => "Demo".to_string(),
+                    PreviewScene::Wallpaper => "Picture sample".to_string(),
                 },
                 PreviewAnimation::BlinkEdge { .. } => "Live cursor blink".to_string(),
                 PreviewAnimation::Continuous if !self.cursor.has_resolved_trail() => {
-                    match self.typing_glow() {
-                        TypingGlow::Halo => "Live typing glow",
-                        TypingGlow::Tint => "Live typing tint",
-                        TypingGlow::Nothing => "Live typing",
-                    }
-                    .to_string()
+                    "Live typing glow".to_string()
                 }
                 PreviewAnimation::Continuous => "Live trail".to_string(),
             }
@@ -2118,7 +2771,7 @@ impl SettingsPreviewSpec {
     /// and a theme's `Theme:`/`Sample:` already names the still colour
     /// sample (a pause still reads after it).
     fn with_state_badge(&self, candidate: String) -> String {
-        let state = self.state_badge();
+        let state = self.live_state();
         let redundant = if self.focused_key == crate::prefs::EDIT_MOTION {
             self.reduction_suppresses_motion()
         } else {
@@ -2142,6 +2795,7 @@ impl SettingsPreviewSpec {
         let subject = match key {
             crate::prefs::EDIT_THEME if self.theme_sample => "Sample",
             crate::prefs::EDIT_THEME => "Theme",
+            crate::prefs::EDIT_CURSOR_TRAIL_STYLE if self.style_trial => "Trying",
             crate::prefs::EDIT_WINDOW_THEME => "Window appearance",
             crate::prefs::EDIT_CURSOR_TRAIL_STYLE => "Style",
             crate::prefs::EDIT_CURSOR_STYLE => "Shape",
@@ -2199,15 +2853,21 @@ impl SettingsPreviewSpec {
             // The words the picker shows ("Match macOS"), not the raw value.
             let raw = raw.strip_suffix(" (default)").unwrap_or(raw);
             crate::native_settings::setting_choice_label(key, raw)
-        } else if key == crate::prefs::EDIT_LINE_HEIGHT {
-            format!("{raw}×")
-        } else if key == crate::prefs::EDIT_FONT_PX {
+        } else if key == crate::prefs::EDIT_FONT_PX
+            && let Some(px) = raw.strip_suffix("(automatic)")
+        {
             // Unset, the value is the row's placeholder, "12 (automatic)":
             // the unit belongs to the number, the note after it.
-            match raw.strip_suffix("(automatic)") {
-                Some(px) => format!("{} px (automatic)", px.trim()),
-                None => format!("{raw} px"),
-            }
+            let px = px.trim();
+            let reading = px
+                .parse::<f64>()
+                .ok()
+                .and_then(|value| crate::prefs::numeric_reading(key, value, px))
+                .unwrap_or_else(|| px.to_string());
+            format!("{reading} (automatic)")
+        } else if key == crate::prefs::EDIT_WALLPAPER {
+            // A file's name as it is written ("wall.png", never "Wall.png").
+            raw.trim().to_string()
         } else if crate::prefs::edit_kind(key) == crate::prefs::EditKind::Color
             && let Some(color) = aterm_types::scheme::parse_hex(raw)
         {
@@ -2228,6 +2888,12 @@ impl SettingsPreviewSpec {
         Some((subject.to_string(), value))
     }
 
+    /// The focused value is shown unsaved: a theme sample or a tried style.
+    fn candidate_is_unsaved(&self) -> bool {
+        (self.theme_sample && self.focused_key == crate::prefs::EDIT_THEME)
+            || (self.style_trial && self.focused_key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE)
+    }
+
     fn candidate_badge(&self) -> String {
         self.candidate_parts().map_or_else(
             || friendly_preview_value(&self.focused_value),
@@ -2244,12 +2910,16 @@ impl SettingsPreviewSpec {
                 if full.graphemes().count() <= max {
                     return full;
                 }
-                // A display-face mix says what it is in the row; a short
-                // badge keeps the faces' names instead.
-                let value = display_face_suffix_stripped(&value).unwrap_or(&value);
                 let value_len = value.graphemes().count();
                 if subject.graphemes().count() + 2 + value_len <= max {
                     return format!("{subject}: {value}");
+                }
+                // A subject that says the value is unsaved ("Trying",
+                // "Sample") is the point of the badge: it stays whole and the
+                // value is cut instead.
+                if self.candidate_is_unsaved() {
+                    let room = max.saturating_sub(subject.graphemes().count() + 2);
+                    return format!("{subject}: {}", bounded_badge(&value, room.max(1)));
                 }
                 // ": " and the "…" a shortened subject ends in come out of
                 // the subject's share, never the value's; a subject with no
@@ -2261,7 +2931,7 @@ impl SettingsPreviewSpec {
                 } else if value_len <= max {
                     value.to_string()
                 } else {
-                    bounded_badge(value, max)
+                    bounded_badge(&value, max)
                 }
             }
             None => bounded_badge(&friendly_preview_value(&self.focused_value), max),
@@ -2272,6 +2942,8 @@ impl SettingsPreviewSpec {
     fn compact_state_badge(&self) -> String {
         if self.reduction_suppresses_motion() {
             self.pause.badge()
+        } else if let Some(effect) = self.focused_idle() {
+            effect
         } else {
             match self.animation() {
                 PreviewAnimation::None => self.candidate_badge(),
@@ -2341,16 +3013,14 @@ fn paint_font_candidate_pill_at_scale(
     }
     // The terminal has a 5pt outer inset and the pill has 8pt text padding on
     // both sides: the label fits that exact pixel budget, whole wherever the
-    // specimen is wide enough, and a display-face note goes before any of
-    // the faces' names does.
+    // specimen is wide enough.
     let budget = (terminal.width - 26.0).max(0.0);
     let label = if crate::tray_raster::ui_text_width_for(TextFace::UiBold, &label, text_size.get())
         <= budget
     {
         label
     } else {
-        let short = display_face_suffix_stripped(&label).unwrap_or(&label);
-        bounded_badge_width(short, budget, text_size.get())
+        bounded_badge_width(&label, budget, text_size.get())
     };
     let text_width =
         crate::tray_raster::ui_text_width_for(TextFace::UiBold, &label, text_size.get());
@@ -2395,11 +3065,11 @@ fn paint_platform_window_controls(
     x: f32,
     y: f32,
     title_h: f32,
-    light: bool,
+    ink: [u8; 3],
 ) -> f32 {
     #[cfg(target_os = "macos")]
     {
-        let _ = light;
+        let _ = ink;
         for (index, color) in [[0xFF, 0x5F, 0x57], [0xFE, 0xBC, 0x2E], [0x28, 0xC8, 0x40]]
             .into_iter()
             .enumerate()
@@ -2422,7 +3092,7 @@ fn paint_platform_window_controls(
             h: 7.0,
             radius: 1.0,
             width: 1.0,
-            color: rgba(window_chrome_text_color(light), 210),
+            color: rgba(ink, 210),
         });
         22.0
     }
@@ -2439,6 +3109,87 @@ const fn window_chrome_text_color(light: bool) -> [u8; 3] {
     }
 }
 
+/// Whether the window sample's title bar wears the candidate theme's tab-band
+/// tone under Auto: on Windows, whose caption is painted the colour of the
+/// band directly under it (`platform_win::caption_tint` over
+/// `App::caption_surface_tone`), so caption and tabs read as one block. A
+/// forced Light or Dark keeps the stock caption there, and macOS and Linux
+/// draw their own title bars.
+const WINDOW_SAMPLE_WEARS_THE_BAND: bool = cfg!(windows);
+
+/// What the window sample's title bar wears ([`window_sample_tone`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowSampleTone {
+    /// The title bar's fill.
+    fill: [u8; 3],
+    /// The title line and the window control, 4.5:1 or more on `fill`.
+    ink: [u8; 3],
+    /// The 1-px rim round the bar, where its fill alone would not stand off
+    /// the specimen ([`WINDOW_SAMPLE_RIM_BELOW`]).
+    edge: Option<[u8; 3]>,
+}
+
+/// The contrast with the specimen's background under which the window
+/// sample's bar draws a rim: Default Light's band is 1.2:1 off its page and
+/// the stock light fill 1.04:1, where Default's band is 1.43:1 off its page
+/// and reads without one.
+const WINDOW_SAMPLE_RIM_BELOW: f64 = 1.3;
+
+/// The window sample's tones. Under Auto on Windows
+/// ([`WINDOW_SAMPLE_WEARS_THE_BAND`]) the fill is the candidate's tab-band tone
+/// (`tab_bar::strip_sample`, from its palette's hues and the chrome it
+/// authors), the colour the real caption wears, and its rim is the band's
+/// seam, the hairline the window draws where its band meets the grid. A
+/// forced Light or Dark on Windows is the stock caption, its rim the seam
+/// rule over the stock fill (Windows 11's 1-px window border). Either draws
+/// its rim only where the fill sits within [`WINDOW_SAMPLE_RIM_BELOW`] of the
+/// specimen's background: without it Default Light's sample showed only its
+/// glyphs. Elsewhere the stock fill alone. The ink is
+/// [`window_chrome_text_color`], floored to 4.5:1 on the fill.
+fn window_sample_tone(
+    spec: &SettingsPreviewSpec,
+    candidate: &PreviewTerminalTheme,
+    light: bool,
+) -> WindowSampleTone {
+    use aterm_messages::ink::{contrast, ensure_contrast, mix3};
+    // The words `window_sample_light` reads: anything else is Auto.
+    let auto = !matches!(spec.appearance.window_theme.as_str(), "light" | "dark");
+    let page = crate::settings::u32_rgb(candidate.bg);
+    let ink_on = |fill: [u8; 3]| ensure_contrast(window_chrome_text_color(light), fill, 4.5);
+    let rim = |fill: [u8; 3], seam: [u8; 3]| {
+        (WINDOW_SAMPLE_WEARS_THE_BAND && contrast(fill, page) < WINDOW_SAMPLE_RIM_BELOW)
+            .then_some(seam)
+    };
+    if WINDOW_SAMPLE_WEARS_THE_BAND && auto {
+        let strip = crate::tab_bar::strip_sample(crate::chrome_band::ChromePalette {
+            theme: candidate.into_theme(),
+            ansi: Some(demo_ansi_hues(candidate)),
+            authored: spec.demo.chrome,
+        });
+        return WindowSampleTone {
+            fill: strip.band,
+            ink: ink_on(strip.band),
+            edge: rim(strip.band, strip.seam),
+        };
+    }
+    let fill = if light {
+        [0xF1, 0xF2, 0xF5]
+    } else {
+        [0x20, 0x22, 0x2A]
+    };
+    let ink = ink_on(fill);
+    let seam = ensure_contrast(
+        mix3(fill, ink, aterm_messages::tokens::SEAM_T),
+        fill,
+        aterm_messages::tokens::SEAM_FLOOR,
+    );
+    WindowSampleTone {
+        fill,
+        ink,
+        edge: rim(fill, seam),
+    }
+}
+
 /// The one dark/light classifier for the preview — the trail sample and the
 /// window sample both read it — delegating to [`aterm_render::theme_is_dark`],
 /// which is itself the chrome's `ink::bg_is_light` inverted, so the preview,
@@ -2448,19 +3199,26 @@ fn theme_bg_is_dark(bg: u32) -> bool {
     aterm_render::theme_is_dark(bg)
 }
 
+/// Whether this platform's Auto window appearance follows the TERMINAL THEME
+/// rather than the OS. Linux does (`chrome_theme_for_apprt`/`chrome_palette_theme`;
+/// no live OS-appearance feed exists under winit's Wayland backend), and so does
+/// Windows, whose caption resolves Auto from the terminal background
+/// (`platform_win::resolve_chrome_theme`, the dropdown's "Match terminal
+/// (default)"). macOS follows the system.
+const AUTO_WINDOW_FOLLOWS_TERMINAL: bool = cfg!(any(target_os = "linux", windows));
+
 /// The light/dark side the WINDOW SAMPLE paints for the spec's `window_theme`.
-/// Explicit Light/Dark is itself. Auto is the PLATFORM truth: macOS/Windows
-/// follow the live system appearance (`system_dark`), while Linux follows the
-/// candidate TERMINAL THEME's darkness — the resolution the shipping chrome
-/// actually uses there (`chrome_theme_for_apprt`/`chrome_palette_theme`; no
-/// live OS-appearance feed exists under winit's Wayland backend). The Themes
-/// stage ([`SettingsPreviewSpec::window_follows_theme`]) takes the candidate's
-/// side on every platform: its sample is the theme, not the OS.
+/// Explicit Light/Dark is itself. Auto is the PLATFORM truth: macOS follows the
+/// live system appearance (`system_dark`), while Linux and Windows follow the
+/// candidate TERMINAL THEME's darkness ([`AUTO_WINDOW_FOLLOWS_TERMINAL`]) — the
+/// resolution the shipping chrome actually uses there. The Themes stage
+/// ([`SettingsPreviewSpec::window_follows_theme`]) takes the candidate's side on
+/// every platform: its sample is the theme, not the OS.
 fn window_sample_light(spec: &SettingsPreviewSpec, terminal_theme: Theme) -> bool {
     match spec.appearance.window_theme.as_str() {
         "light" => true,
         "dark" => false,
-        _ if spec.window_follows_theme || cfg!(target_os = "linux") => {
+        _ if spec.window_follows_theme || AUTO_WINDOW_FOLLOWS_TERMINAL => {
             !theme_bg_is_dark(terminal_theme.bg)
         }
         _ => !spec.system_dark,
@@ -2503,13 +3261,14 @@ fn appearance_terminal_floor(row: f32) -> f32 {
 }
 
 /// The whole color specimen rows `terminal` shows with its first row `drop`
-/// below the body's top, for a `head` band and `row` pitch: none below the
-/// least body a color specimen demonstrates in.
-fn appearance_whole_rows(terminal: LogicalRect, drop: f32, head: f32, row: f32) -> usize {
-    if terminal.height < appearance_terminal_floor(head + row) {
+/// below the body's top, for a `row` pitch: none below the least body a color
+/// specimen demonstrates in. A display face draws inside its cells, so no
+/// head band sits above the first row.
+fn appearance_whole_rows(terminal: LogicalRect, drop: f32, row: f32) -> usize {
+    if terminal.height < appearance_terminal_floor(row) {
         return 0;
     }
-    (((appearance_specimen_clip(terminal).height - drop - head) / row)
+    (((appearance_specimen_clip(terminal).height - drop) / row)
         .floor()
         .max(0.0) as usize)
         .min(APPEARANCE_SPECIMEN_ROWS)
@@ -2581,14 +3340,13 @@ fn paint_window_theme_sample(
     spec: &SettingsPreviewSpec,
     terminal_theme: Theme,
 ) {
+    let candidate = spec
+        .terminal_theme
+        .unwrap_or_else(|| PreviewTerminalTheme::over_engine_palette(terminal_theme));
     let light = window_sample_light(spec, terminal_theme);
     let width = appearance_window_sample_width(terminal);
     let x = terminal.right() - width;
-    let fill = if light {
-        [0xF1, 0xF2, 0xF5]
-    } else {
-        [0x20, 0x22, 0x2A]
-    };
+    let tone = window_sample_tone(spec, &candidate, light);
     if appearance_window_sample_drawn(terminal) {
         prims.push(DrawPrim::Panel {
             x,
@@ -2596,14 +3354,25 @@ fn paint_window_theme_sample(
             w: width,
             h: APPEARANCE_WINDOW_SAMPLE_HEIGHT,
             radius: 0.0,
-            fill: rgba(fill, 255),
+            fill: rgba(tone.fill, 255),
         });
+        if let Some(edge) = tone.edge {
+            prims.push(DrawPrim::Stroke {
+                x,
+                y: terminal.y,
+                w: width,
+                h: APPEARANCE_WINDOW_SAMPLE_HEIGHT,
+                radius: 0.0,
+                width: 1.0,
+                color: rgba(edge, 255),
+            });
+        }
         let title_inset = paint_platform_window_controls(
             prims,
             x,
             terminal.y,
             APPEARANCE_WINDOW_SAMPLE_HEIGHT,
-            light,
+            tone.ink,
         );
         prims.push(DrawPrim::Line {
             x1: x + title_inset,
@@ -2611,7 +3380,7 @@ fn paint_window_theme_sample(
             x2: terminal.right() - 8.0,
             y2: terminal.y + APPEARANCE_WINDOW_SAMPLE_HEIGHT / 2.0,
             width: 2.0,
-            color: rgba(window_chrome_text_color(light), 210),
+            color: rgba(tone.ink, 210),
         });
     }
 
@@ -2621,9 +3390,6 @@ fn paint_window_theme_sample(
     // frame with a renderer-native monospace label and literal ANSI swatches.
     // These use the candidate palette and therefore cannot collapse into the
     // blank background-only sample the old 132pt card produced.
-    let candidate = spec
-        .terminal_theme
-        .unwrap_or_else(|| PreviewTerminalTheme::over_engine_palette(terminal_theme));
     if terminal.height >= 42.0 && !spec.prepared_font.is_ready() {
         let sample_size = TypeStep::Caption.px(11.5);
         prims.push(text_prim(
@@ -2673,6 +3439,19 @@ fn paint_window_theme_sample(
     }
 }
 
+/// The hues the chrome borrows from a candidate's palette (its red, green,
+/// yellow, blue and cyan), as the live strip borrows them from the terminal's.
+pub(crate) fn demo_ansi_hues(candidate: &PreviewTerminalTheme) -> aterm_messages::ink::AnsiHues {
+    let rgb = crate::settings::u32_rgb;
+    aterm_messages::ink::AnsiHues {
+        red: rgb(candidate.ansi[1]),
+        green: rgb(candidate.ansi[2]),
+        yellow: rgb(candidate.ansi[3]),
+        blue: rgb(candidate.ansi[4]),
+        cyan: rgb(candidate.ansi[6]),
+    }
+}
+
 /// `color` packed as `0x00RRGGBB`; the inverse of [`packed_rgb`].
 pub(crate) const fn pack_rgb(color: aterm_types::Rgb) -> u32 {
     ((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32
@@ -2699,13 +3478,25 @@ fn build_terminal_specimen_input_rows(
     theme: Theme,
     visible_rows: Option<usize>,
 ) -> (Arc<aterm_render::RenderInput>, u64) {
+    build_terminal_specimen_input_grid(spec, theme, visible_rows, None)
+}
+
+/// [`build_terminal_specimen_input_rows`] on a `grid` (`rows × cols`) of its
+/// own, where the scene draws over a picture it must cover: the sample's
+/// lines on its first rows, blank rows and columns after them.
+fn build_terminal_specimen_input_grid(
+    spec: &SettingsPreviewSpec,
+    theme: Theme,
+    visible_rows: Option<usize>,
+    grid: Option<(usize, usize)>,
+) -> (Arc<aterm_render::RenderInput>, u64) {
     use std::hash::{Hash, Hasher};
 
     use aterm_core::selection::{SelectionSide, SelectionType};
     use aterm_core::terminal::{CursorStyle, Terminal};
 
     const FULL_SOURCE: &str = concat!(
-        "\u{1b}[31mANSI 4 \u{1b}[1mBOLD\u{1b}[0m \u{1b}[2mFAINT\u{1b}[0m\r\n",
+        "\u{1b}[34mANSI 4 \u{1b}[1mBOLD\u{1b}[0m \u{1b}[2mFAINT\u{1b}[0m\r\n",
         "!= => -> \u{1b}[3mITAL\u{1b}[0m \u{1b}[1;3mB+I\u{1b}[0m cursor\r\n",
         "\u{1b}[4mgypq_j underline\u{1b}[0m\r\n",
         "CJK 你好  symbols ∑✓♥\r\n",
@@ -2713,27 +3504,50 @@ fn build_terminal_specimen_input_rows(
     );
     let cursor_scene = spec.scene == PreviewScene::CursorMotion;
     let (rows, source) = match spec.scene {
-        PreviewScene::Appearance => (APPEARANCE_SPECIMEN_ROWS, APPEARANCE_SOURCE.to_string()),
+        // The demo builds its own frames (`settings_theme_demo`); asked for a
+        // specimen anyway, it is the color one.
+        PreviewScene::Appearance | PreviewScene::ThemeDemo | PreviewScene::Wallpaper => {
+            (APPEARANCE_SPECIMEN_ROWS, APPEARANCE_SOURCE.to_string())
+        }
         PreviewScene::Typography => (TYPOGRAPHY_SPECIMEN_ROWS, FULL_SOURCE.to_string()),
         // The cursor scene keeps its NEWEST lines, so the prompt it types on
-        // is always shown, with the room below it a terminal has once there
-        // are three rows to spend.
+        // is always shown, and its grid always holds a blank row below the
+        // prompt, as a terminal's prompt has: the effects below the baseline
+        // (the ribbon's lobe and rail, a halo's lower half) draw as they do
+        // there, and the card clips what falls past its edge. A short card
+        // shows every whole row as text (the blank row hangs below it); from
+        // three rows on, the last whole row is the blank one.
         PreviewScene::CursorMotion => {
-            let rows = visible_rows
+            let shown = visible_rows
                 .unwrap_or(CURSOR_SPECIMEN_ROWS)
                 .clamp(1, CURSOR_SPECIMEN_ROWS);
-            let lines = if rows >= 3 { rows - 1 } else { rows };
+            let lines = cursor_scene_lines(shown);
             (
-                rows,
+                lines + 1,
                 CURSOR_SPECIMEN_LINES[CURSOR_SPECIMEN_LINES.len() - lines..].join("\r\n"),
             )
         }
     };
-    let rows = visible_rows.unwrap_or(rows).clamp(1, rows);
+    let rows = if cursor_scene {
+        rows
+    } else {
+        visible_rows.unwrap_or(rows).clamp(1, rows)
+    };
     let source = source
         .match_indices("\r\n")
         .nth(rows - 1)
         .map_or(source.as_str(), |(end, _)| &source[..end]);
+    // The grid the sample is drawn on: its own lines' rows and the scene's
+    // columns (the cursor scene is wider, room for its runways), or a
+    // covering grid of at least those rows.
+    let own_cols = if cursor_scene {
+        CURSOR_SCENE_COLS
+    } else {
+        SPECIMEN_COLS
+    };
+    let (grid_rows, cols) = grid.map_or((rows, own_cols), |(grid_rows, cols)| {
+        (grid_rows.clamp(rows, 256), cols.clamp(1, 512))
+    });
 
     // The memo key comes FIRST because it is a total function of this call's
     // inputs — nothing below reads anything that is not hashed here.
@@ -2745,6 +3559,7 @@ fn build_terminal_specimen_input_rows(
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     source.hash(&mut hash);
     rows.hash(&mut hash);
+    (grid_rows, cols).hash(&mut hash);
     theme.fg.hash(&mut hash);
     theme.bg.hash(&mut hash);
     theme.cursor.hash(&mut hash);
@@ -2756,6 +3571,10 @@ fn build_terminal_specimen_input_rows(
     spec.appearance.selection_foreground.hash(&mut hash);
     spec.appearance.bold_is_bright.hash(&mut hash);
     spec.appearance.faint_opacity.to_bits().hash(&mut hash);
+    spec.appearance
+        .indexed_minimum_contrast
+        .to_bits()
+        .hash(&mut hash);
     (spec.cursor.style as u8).hash(&mut hash);
     spec.cursor.blink.hash(&mut hash);
     (!cursor_scene && spec.cursor_visible()).hash(&mut hash);
@@ -2791,6 +3610,9 @@ fn build_terminal_specimen_input_rows(
         selection_foreground: spec.appearance.selection_foreground.map(packed_rgb),
         bold_is_bright: spec.appearance.bold_is_bright,
         faint_opacity: spec.appearance.faint_opacity,
+        // The floor a tab holds the theme's own colours to, so the sample
+        // shows the colours a tab does.
+        indexed_minimum_contrast: spec.appearance.indexed_minimum_contrast,
         // The blink lives IN the style (`CursorStyle` names shape + blink, and
         // the renderer arms its blink clock off the `Blinking*` variants), so
         // the preview folds `spec.cursor.blink` into the shape. Setting the
@@ -2811,10 +3633,10 @@ fn build_terminal_specimen_input_rows(
         }
         terminal_config.custom_palette = Some(palette);
     }
-    let mut terminal = Terminal::new(rows as u16, SPECIMEN_COLS as u16);
+    let mut terminal = Terminal::new(grid_rows as u16, cols as u16);
     let _ = terminal.apply_config(&terminal_config);
     terminal.process(source.as_bytes());
-    let mut input = terminal.cell_frame(rows, SPECIMEN_COLS);
+    let mut input = terminal.cell_frame(grid_rows, cols);
     input.cursor_style = terminal_config.cursor_style;
     input.cursor_color = theme.cursor;
     input.default_bg = theme.bg;
@@ -2843,10 +3665,19 @@ fn build_terminal_specimen_input_rows(
 
 /// The color specimen's text. The first three rows are what every color
 /// card keeps; a taller one shows the palette at work, as a listing and as
-/// status words, then a short shell session. Every line fits the
-/// specimen's 32 columns, so none wraps into the row under it.
-const APPEARANCE_SOURCE: &str = concat!(
-    "\u{1b}[31mANSI 4 \u{1b}[1mBOLD\u{1b}[0m \u{1b}[2mFAINT\u{1b}[0m\r\n",
+/// status words, then a short shell session in this platform's shell:
+/// PowerShell on Windows ([`APPEARANCE_SOURCE_PWSH`]), a `$` shell elsewhere.
+/// Every line fits the specimen's 32 columns, so none wraps into the row
+/// under it.
+const APPEARANCE_SOURCE: &str = if cfg!(windows) {
+    APPEARANCE_SOURCE_PWSH
+} else {
+    APPEARANCE_SOURCE_SH
+};
+
+/// The color specimen in a `$` shell (macOS, Linux).
+const APPEARANCE_SOURCE_SH: &str = concat!(
+    "\u{1b}[34mANSI 4 \u{1b}[1mBOLD\u{1b}[0m \u{1b}[2mFAINT\u{1b}[0m\r\n",
     "!= => -> \u{1b}[3mITAL\u{1b}[0m \u{1b}[1;3mB+I\u{1b}[0m cursor\r\n",
     "\u{1b}[4mgypq_j underline\u{1b}[0m\r\n",
     "\u{1b}[1;34mdocs/\u{1b}[0m  \u{1b}[1;32mbuild.sh\u{1b}[0m  \u{1b}[35mlogo.png\u{1b}[0m  ",
@@ -2863,6 +3694,32 @@ const APPEARANCE_SOURCE: &str = concat!(
     "\u{1b}[32m$\u{1b}[0m make test\r\n",
     "\u{1b}[32mok\u{1b}[0m 42 passed  \u{1b}[33m1 ignored\u{1b}[0m\r\n",
     "\u{1b}[32m$\u{1b}[0m "
+);
+
+/// The color specimen in PowerShell (Windows): pwsh's `PS C:\src>` prompt and
+/// PSReadLine's colours on the typed commands (the command bright yellow, a
+/// parameter bright black). It read `$ git status --short` under a Windows
+/// window (the 2026-10-18 Fluent judge's
+/// `J4F-7-settings-samples-unix-and-light-badges`). The palette rows are the
+/// `$` shell's, with a Windows script in the listing.
+const APPEARANCE_SOURCE_PWSH: &str = concat!(
+    "\u{1b}[34mANSI 4 \u{1b}[1mBOLD\u{1b}[0m \u{1b}[2mFAINT\u{1b}[0m\r\n",
+    "!= => -> \u{1b}[3mITAL\u{1b}[0m \u{1b}[1;3mB+I\u{1b}[0m cursor\r\n",
+    "\u{1b}[4mgypq_j underline\u{1b}[0m\r\n",
+    "\u{1b}[1;34mdocs\u{1b}[0m  \u{1b}[1;32mbuild.ps1\u{1b}[0m  \u{1b}[35mlogo.png\u{1b}[0m  ",
+    "\u{1b}[36mlink\u{1b}[0m\r\n",
+    "\u{1b}[31merror\u{1b}[0m \u{1b}[33mwarning\u{1b}[0m \u{1b}[32mpassed\u{1b}[0m \u{1b}[34mnote\u{1b}[0m\r\n",
+    "PS C:\\src> \u{1b}[93mgit\u{1b}[0m status \u{1b}[90m--short\u{1b}[0m\r\n",
+    "\u{1b}[32mM\u{1b}[0m  src/theme.rs\r\n",
+    " \u{1b}[31mM\u{1b}[0m README.md\r\n",
+    "\u{1b}[31m??\u{1b}[0m notes.txt\r\n",
+    "PS C:\\src> \u{1b}[93mgit\u{1b}[0m diff\r\n",
+    "\u{1b}[36m@@ -8,2 +8,2 @@\u{1b}[0m fn main()\r\n",
+    "\u{1b}[31m-    let x = 1;\u{1b}[0m\r\n",
+    "\u{1b}[32m+    let x = 2;\u{1b}[0m\r\n",
+    "PS C:\\src> \u{1b}[93mcargo\u{1b}[0m test\r\n",
+    "\u{1b}[32mok\u{1b}[0m 42 passed  \u{1b}[33m1 ignored\u{1b}[0m\r\n",
+    "PS C:\\src> "
 );
 
 /// Columns of every terminal specimen.
@@ -2883,6 +3740,13 @@ fn specimen_cursor_col(spec: &SettingsPreviewSpec) -> usize {
 /// The cursor scene's rows: its transcript and the blank row below the prompt.
 const CURSOR_SPECIMEN_ROWS: usize = CURSOR_SPECIMEN_LINES.len() + 1;
 
+/// The transcript lines a cursor card with `shown` whole rows draws: every
+/// row on a card of one or two (the blank row below the prompt hangs past
+/// the card's edge), else all but the last, which is the blank row.
+const fn cursor_scene_lines(shown: usize) -> usize {
+    if shown >= 3 { shown - 1 } else { shown }
+}
+
 /// The row the cursor scene types on: its last row with text.
 fn prompt_row(input: &RenderInput) -> usize {
     input
@@ -2892,38 +3756,156 @@ fn prompt_row(input: &RenderInput) -> usize {
         .unwrap_or(input.rows.saturating_sub(1))
 }
 
+/// The specimen after the cursor scene's Return: the typed line on `row`
+/// (whole) one row up, above the fresh prompt, and the rows above it with
+/// it, the top one gone, as a terminal at its foot scrolls. A one-row grid
+/// keeps only the prompt.
+fn scroll_previous_line(base: &RenderInput, row: usize) -> RenderInput {
+    let mut scrolled = base.clone();
+    if row > 0 && row < scrolled.cells.len() {
+        let previous = scrolled.cells[row].clone();
+        scrolled.cells[..row].rotate_left(1);
+        scrolled.cells[row - 1] = previous;
+    }
+    scrolled
+}
+
 /// The cursor scene's shell, oldest line first. The last line is the prompt
 /// the scene types its command on, one key at a time; a short card keeps the
-/// newest lines so the prompt is always shown.
-const CURSOR_SPECIMEN_LINES: [&str; 7] = [
+/// newest lines so the prompt is always shown. PowerShell on Windows
+/// ([`CURSOR_SPECIMEN_LINES_PWSH`]), a `$` shell elsewhere.
+const CURSOR_SPECIMEN_LINES: [&str; 7] = if cfg!(windows) {
+    CURSOR_SPECIMEN_LINES_PWSH
+} else {
+    CURSOR_SPECIMEN_LINES_SH
+};
+
+/// The cursor scene in a `$` shell (macOS, Linux).
+const CURSOR_SPECIMEN_LINES_SH: [&str; 7] = [
     "\u{1b}[32m~/demo\u{1b}[0m $ git pull",
     "Already up to date.",
     "\u{1b}[32m~/demo\u{1b}[0m $ ls",
     "\u{1b}[1;34msrc\u{1b}[0m  notes.md  \u{1b}[1;32mbuild.sh\u{1b}[0m",
     "\u{1b}[32m~/demo\u{1b}[0m $ cat notes.md",
     "ship it \u{2713}",
-    "\u{1b}[32m~/demo\u{1b}[0m $ echo hello world",
+    "\u{1b}[32m~/demo\u{1b}[0m $ git add notes.md && git commit",
 ];
+
+/// The cursor scene in PowerShell (Windows): pwsh's prompt, PSReadLine's
+/// bright yellow command names, and `cat` and `echo` as pwsh's own aliases.
+/// It read `~/demo $ cat notes.md` under a Windows window (the 2026-10-18
+/// Fluent judge's `J4F-7-settings-samples-unix-and-light-badges`). The prompt
+/// is the drive's root, `PS C:\>`, so the typed line ends where the `$`
+/// shell's did and the pet keeps its station right of the caret.
+const CURSOR_SPECIMEN_LINES_PWSH: [&str; 7] = [
+    "PS C:\\> \u{1b}[93mgit\u{1b}[0m pull",
+    "Already up to date.",
+    "PS C:\\> \u{1b}[93mgit\u{1b}[0m status \u{1b}[90m-s\u{1b}[0m",
+    " \u{1b}[31mM\u{1b}[0m notes.md",
+    "PS C:\\> \u{1b}[93mcat\u{1b}[0m notes.md",
+    "ship it \u{2713}",
+    "PS C:\\> \u{1b}[93mgit\u{1b}[0m add .\\notes.md; \u{1b}[93mgit\u{1b}[0m commit",
+];
+
 /// One scripted keystroke every this many milliseconds (about 75 words a
-/// minute), so the command is typed across the whole phase cycle.
+/// minute): three of the scene's engine steps.
 const KEY_MS: u64 = 3 * MOTION_STEP_MS;
-/// Keys already typed when the phase cycle starts, so its first frame already
-/// has a trail behind the caret.
-const WARMUP_KEYS: u64 = 1;
-/// The scripted key the Flying kitty arrives on, about halfway through the
-/// command: in the terminal the kitty is earned by a run of steady typing
-/// (`aterm_effects::kitty_cursor`), so the preview shows the ribbon alone
-/// first and the kitty flying in partway through, never a kitty that is
-/// simply always there.
-const FLYING_ARRIVES_AT_KEY: usize = 9;
-/// How long the arriving Flying kitty takes to fade in, as the terminal's
-/// does (`aterm_effects::kitty_cursor`'s fade-in).
-const FLYING_FADE_IN_MS: u64 = 350;
+
+/// The command the cursor scene types on its prompt, in the platform's shell
+/// (the prompt line of [`CURSOR_SPECIMEN_LINES`] spells it, coloured).
+const CURSOR_SCENE_COMMAND: &str = if cfg!(windows) {
+    "git add .\\notes.md; git commit"
+} else {
+    "git add notes.md && git commit"
+};
+
+/// The span of [`CURSOR_SCENE_COMMAND`] (in cells from its first) a Tab
+/// completion lands at once: the scene's multi-cell move, licensed as a real
+/// Tab is (`note_user_gesture`), so the styles draw their jump (the comet's
+/// path cut by Trail length, the landing ring in the accent colour). The keys
+/// before it are typed one by one, the Tab is one more key, and the rest is
+/// typed again.
+const CURSOR_SCENE_TAB: (usize, usize) = if cfg!(windows) { (8, 18) } else { (10, 16) };
+
+/// The scene's keystrokes: the keys before the completion, the Tab, and the
+/// keys after it.
+const CURSOR_SCENE_KEYS: u64 =
+    (CURSOR_SCENE_TAB.0 + 1 + (CURSOR_SCENE_COMMAND.len() - CURSOR_SCENE_TAB.1)) as u64;
+
+/// How long the finished line rests before the next prompt, so the trail and
+/// the companion settle as they do when typing stops.
+const CURSOR_SCENE_HOLD_MS: u64 = 15 * MOTION_STEP_MS;
+
+/// The cursor scene's cycle: a fresh prompt (the Return that ended the last
+/// line), the command's keystrokes, then the rest. Every event lands on the
+/// engine's step grid.
+const CURSOR_SCENE_CYCLE_MS: u64 = CURSOR_SCENE_KEYS * KEY_MS + CURSOR_SCENE_HOLD_MS;
+const _: () = assert!(CURSOR_SCENE_CYCLE_MS.is_multiple_of(MOTION_STEP_MS));
+
+/// Cycles the scene's engines play before the one shown, so the shown one
+/// opens as warm as a terminal that has been typing this way: Fire's coal
+/// bed and forge metal, the typing glow and the cadence chain carry the
+/// earlier lines, as they do there. Two lines bring every style to the
+/// loop's steady heat ([`CursorScene::warm_cycles`]).
+const CURSOR_SCENE_WARM_CYCLES: u64 = 2;
+
+/// The cursor scene's grid width: the prompt, the command and the
+/// companion's station past the caret.
+const CURSOR_SCENE_COLS: usize = 48;
+
+/// What the scene's script does at `offset` ms into its cycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SceneEvent {
+    /// A fresh prompt: the Return that handed the last line to the shell.
+    Return,
+    /// The `n`th printable key of the command (0-based cell).
+    Glyph(usize),
+    /// The Tab that completes [`CURSOR_SCENE_TAB`].
+    Tab,
+}
+
+impl SceneEvent {
+    fn at(offset: u64) -> Option<Self> {
+        if offset == 0 {
+            return Some(Self::Return);
+        }
+        if !offset.is_multiple_of(KEY_MS) {
+            return None;
+        }
+        let key = usize::try_from(offset / KEY_MS).ok()?;
+        let (from, to) = CURSOR_SCENE_TAB;
+        match key {
+            0 => None,
+            key if key <= from => Some(Self::Glyph(key - 1)),
+            key if key == from + 1 => Some(Self::Tab),
+            key if key as u64 <= CURSOR_SCENE_KEYS => Some(Self::Glyph(to + key - from - 2)),
+            _ => None,
+        }
+    }
+}
+
+/// The command cells shown `offset` ms into the scene's cycle.
+fn scene_cells_at(offset: u64) -> usize {
+    let (from, to) = CURSOR_SCENE_TAB;
+    let keys = usize::try_from((offset / KEY_MS).min(CURSOR_SCENE_KEYS)).unwrap_or(0);
+    if keys <= from {
+        keys
+    } else {
+        to + (keys - from - 1)
+    }
+}
+
+/// When the scene's last keystroke at or before `offset` landed (the Return
+/// at the cycle's start counts).
+fn scene_last_key_ms(offset: u64) -> u64 {
+    (offset / KEY_MS).min(CURSOR_SCENE_KEYS) * KEY_MS
+}
 
 /// The prompt row of the cursor scene: where the command starts and ends.
 #[derive(Clone, Copy, Debug)]
 struct TypedLine {
-    /// First column after the `$ ` prompt.
+    /// First column after the prompt: the first `$ ` (a `$` shell's) or
+    /// `> ` (pwsh's `PS C:\> `).
     start: usize,
     /// One past the command's last cell.
     end: usize,
@@ -2937,21 +3919,19 @@ impl TypedLine {
             .map_or(0, |last| last + 1);
         let start = row
             .windows(2)
-            .position(|pair| pair[0].ch == '$' && pair[1].ch == ' ')
-            .map_or(0, |dollar| dollar + 2)
+            .position(|pair| matches!(pair[0].ch, '$' | '>') && pair[1].ch == ' ')
+            .map_or(0, |mark| mark + 2)
             .min(end);
         Self { start, end }
     }
 
-    /// Keys typed by scripted time `t_ms`.
-    fn typed_at(self, t_ms: u64) -> usize {
-        usize::try_from(t_ms / KEY_MS)
-            .unwrap_or(usize::MAX)
-            .min(self.end - self.start)
+    /// The command cells shown `offset` ms into the cycle.
+    fn shown_at(self, offset: u64) -> usize {
+        scene_cells_at(offset).min(self.end - self.start)
     }
 
-    fn caret(self, typed: usize) -> usize {
-        self.start + typed
+    fn caret(self, shown: usize) -> usize {
+        self.start + shown
     }
 }
 
@@ -2979,16 +3959,81 @@ pub(crate) struct CursorScene {
     /// The blink phase (and the cursor style) show the caret.
     caret_shown: bool,
     companion: SceneCompanion,
-    /// The Flying kitty is the selected style's, so it is earned partway
-    /// through the typing ([`FLYING_ARRIVES_AT_KEY`]); the sprite control's
-    /// diagnostic kitty shows at once.
+    /// The Flying kitty is the selected style's, so the real cursor cat
+    /// (`aterm_effects::kitty_cursor::CursorCat`) earns it as the terminal
+    /// does; the sprite control's diagnostic kitty shows at once.
     flying_earned: bool,
+    /// The whole rows the card shows (`None`: every row of the grid); the
+    /// grid's blank row below the prompt hangs past a short card's edge.
+    card_rows: Option<usize>,
+    /// Total over every field above but the phase: the scene's engines
+    /// ([`ScenePlayer`]) carry on across frames while it holds.
+    script_key: u64,
     /// Total over every field above, for the raster frame memo.
     pub(crate) fingerprint: u64,
 }
 
+/// The effect streams and caret facts one scene step produced.
+#[derive(Clone, Debug, Default)]
+struct SceneStep {
+    glow_add: Vec<GlowQuad>,
+    glow_under: Vec<GlowQuad>,
+    glow_halo: Vec<RainHalo>,
+    fire_patch: Vec<aterm_core::render::FirePatch>,
+    char_fg: Vec<aterm_core::render::CharFg>,
+    fire_halo: Vec<aterm_core::render::FireHaloCell>,
+    trail: Vec<aterm_core::render::TrailCell>,
+    frame: Option<aterm_effects::cursor_fx::CursorFxFrame>,
+    cat: Option<aterm_effects::kitty_cursor::CatFrame>,
+}
+
+/// The cursor scene's engines, WARM ACROSS FRAMES: the shipping cursor family
+/// (`CursorFx`) and cursor cat, stepped on the scene's 52 ms grid and fed
+/// exactly what a window's input seam feeds them for the same keys (a typed
+/// glyph, the Tab, the Return). A frame advances the held engines from the
+/// last step to its own; only a new scene or a new cycle replays, from cold,
+/// [`CursorScene::warm_cycles`] cycles before the shown one, so a frame is a
+/// pure function of the scene and its phase however the frames arrive.
+struct ScenePlayer {
+    key: u64,
+    origin: Instant,
+    fx: CursorFx,
+    cat: aterm_effects::kitty_cursor::CursorCat,
+    /// Scene time of the last step played, ms since `origin`.
+    at: Option<u64>,
+    step: SceneStep,
+}
+
+impl ScenePlayer {
+    fn new(key: u64, look: aterm_effects::kitty_registry::KittyLook) -> Self {
+        let mut cat = aterm_effects::kitty_cursor::CursorCat::default();
+        cat.set_look(look);
+        Self {
+            key,
+            origin: Instant::now(),
+            fx: CursorFx::default(),
+            cat,
+            at: None,
+            step: SceneStep::default(),
+        }
+    }
+}
+
+/// The geometry and rows one scene frame plays against.
+struct SceneStage<'a> {
+    /// The specimen as the first line types on it.
+    base: &'a RenderInput,
+    /// The specimen once a Return has handed a line to the shell: that line
+    /// one row up, above the fresh prompt ([`scroll_previous_line`]).
+    scrolled: &'a RenderInput,
+    row: usize,
+    line: TypedLine,
+    geom: Geom,
+    cursor_style: aterm_core::terminal::CursorStyle,
+}
+
 impl CursorScene {
-    fn new(spec: &SettingsPreviewSpec, theme: Theme) -> Self {
+    fn new(spec: &SettingsPreviewSpec, theme: Theme, card_rows: Option<usize>) -> Self {
         use std::hash::{Hash, Hasher};
 
         let sprite_diagnostic = spec.focused_key == crate::prefs::EDIT_CURSOR_NYAN_SPRITE;
@@ -3018,21 +4063,33 @@ impl CursorScene {
                 }
             }
         };
+        let hash_theme = |hash: &mut aterm_hash::FxHasher| {
+            theme.fg.hash(hash);
+            theme.bg.hash(hash);
+            theme.cursor.hash(hash);
+            theme.selection.hash(hash);
+        };
+        let mut script = aterm_hash::FxHasher::default();
+        spec.clone()
+            .with_phase(0)
+            .paint_fingerprint()
+            .hash(&mut script);
+        hash_theme(&mut script);
         let mut hash = aterm_hash::FxHasher::default();
         spec.paint_fingerprint().hash(&mut hash);
-        theme.fg.hash(&mut hash);
-        theme.bg.hash(&mut hash);
-        theme.cursor.hash(&mut hash);
-        theme.selection.hash(&mut hash);
+        hash_theme(&mut hash);
+        card_rows.hash(&mut hash);
         Self {
             cursor: spec.cursor.clone(),
             post_fx: spec.post_fx.clone(),
             theme,
-            phase_ms: spec.phase_ms,
+            phase_ms: spec.phase_ms % CURSOR_SCENE_CYCLE_MS,
             typing: spec.animation() == PreviewAnimation::Continuous,
             caret_shown: spec.cursor_visible(),
             companion,
             flying_earned: companion == SceneCompanion::FlyingKitty && !sprite_diagnostic,
+            card_rows,
+            script_key: script.finish(),
             fingerprint: hash.finish() | 1,
         }
     }
@@ -3040,6 +4097,24 @@ impl CursorScene {
     /// The scripted typing plays, so every frame differs.
     pub(crate) fn is_moving(&self) -> bool {
         self.typing
+    }
+
+    /// The cycles played before the shown one ([`CURSOR_SCENE_WARM_CYCLES`]).
+    /// An earned Flying kitty shows the line it is earned on: the real cursor
+    /// cat flies in on the line after a line of steady typing and then stays
+    /// through every short rest, so the shown cycle is that second line, and
+    /// the kitty arrives partway through it as in the terminal.
+    fn warm_cycles(&self) -> u64 {
+        if self.flying_earned {
+            1
+        } else {
+            CURSOR_SCENE_WARM_CYCLES
+        }
+    }
+
+    /// The scene's step this frame shows: its phase, down to the step grid.
+    fn shown_offset(&self) -> u64 {
+        self.phase_ms - self.phase_ms % MOTION_STEP_MS
     }
 
     /// Play the scene onto `base` for a renderer whose cells are `cell` device
@@ -3054,9 +4129,17 @@ impl CursorScene {
         }
         let row = prompt_row(&input);
         let line = TypedLine::of(&input.cells[row]);
-        let end_ms = WARMUP_KEYS * KEY_MS + self.phase_ms;
-        let typed = if self.typing {
-            line.typed_at(end_ms)
+        // Every cycle the scene shows follows a line its Return handed to the
+        // shell ([`Self::warm_cycles`] is at least one), so the text is the
+        // terminal's after that Return: the line one row up, above the fresh
+        // prompt. A still line has no history.
+        let scrolled = self.typing.then(|| scroll_previous_line(base, row));
+        if let Some(scrolled) = &scrolled {
+            input.cells.clone_from(&scrolled.cells);
+        }
+        let offset = self.shown_offset();
+        let shown = if self.typing {
+            line.shown_at(offset)
         } else {
             line.end - line.start
         };
@@ -3068,11 +4151,11 @@ impl CursorScene {
         for cell in input.cells[row]
             .iter_mut()
             .take(line.end)
-            .skip(line.caret(typed))
+            .skip(line.caret(shown))
         {
             *cell = blank;
         }
-        let caret = (row as u16, line.caret(typed).min(cols - 1) as u16);
+        let caret = (row as u16, line.caret(shown).min(cols - 1) as u16);
         input.cursor_row = usize::from(caret.0);
         input.cursor_col = usize::from(caret.1);
         input.cursor_visible = self.caret_shown;
@@ -3087,35 +4170,194 @@ impl CursorScene {
             win_h: u16::try_from(rows.saturating_mul(cell_h)).unwrap_or(u16::MAX),
             head: 0,
         };
+        let mut cat = None;
         if self.typing {
-            self.play(&mut input, base, (row, line), geom, end_ms);
+            let stage = SceneStage {
+                base,
+                scrolled: scrolled.as_ref().unwrap_or(base),
+                row,
+                line,
+                geom,
+                cursor_style: input.cursor_style,
+            };
+            cat = self.play(&mut input, &stage, cell);
             self.post_glow(&mut input, geom, caret);
         }
-        let last_key_ms = typed as u64 * KEY_MS;
         let settled_ms = if self.typing {
-            end_ms.saturating_sub(last_key_ms)
+            offset - scene_last_key_ms(offset)
         } else {
             u64::MAX
         };
-        self.place_companion(&mut input, cell, caret, typed, settled_ms);
+        self.place_companion(&mut input, cell, caret, shown, settled_ms, cat);
         input
     }
 
-    /// Run the cursor family from the first key to `end_ms`, one 52 ms frame
-    /// at a time, and hand its streams and caret to `input`.
+    /// The scene's engines at this frame's step ([`ScenePlayer`]), their
+    /// streams and caret handed to `input`; the cursor cat's frame for a
+    /// Flying kitty.
     fn play(
         &self,
         input: &mut RenderInput,
-        base: &RenderInput,
-        (row, line): (usize, TypedLine),
-        geom: Geom,
-        end_ms: u64,
-    ) {
-        use aterm_effects::cursor_fx::{compose_caret_style_override, head_dx_for};
+        stage: &SceneStage<'_>,
+        cell: (usize, usize),
+    ) -> Option<aterm_effects::kitty_cursor::CatFrame> {
+        use std::hash::{Hash, Hasher};
 
+        use aterm_effects::cursor_fx::compose_caret_style_override;
+
+        thread_local! {
+            // One held scene per raster thread: the Settings preview shows one
+            // cursor scene at a time.
+            static PLAYER: std::cell::RefCell<Option<ScenePlayer>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let mut key = aterm_hash::FxHasher::default();
+        self.script_key.hash(&mut key);
+        cell.hash(&mut key);
+        (stage.row, stage.line.start, stage.line.end).hash(&mut key);
+        (stage.geom.rows, stage.geom.cols).hash(&mut key);
+        let key = key.finish();
+        let target = self.warm_cycles() * CURSOR_SCENE_CYCLE_MS + self.shown_offset();
+        let step = PLAYER.with_borrow_mut(|slot| {
+            let player = match slot {
+                Some(player) if player.key == key && player.at.is_some_and(|at| at <= target) => {
+                    player
+                }
+                _ => slot.insert(ScenePlayer::new(key, self.post_fx.companion_look)),
+            };
+            let mut next = player.at.map_or(0, |at| at + MOTION_STEP_MS);
+            while next <= target {
+                self.step(player, stage, next, next == target);
+                player.at = Some(next);
+                next += MOTION_STEP_MS;
+            }
+            player.step.clone()
+        });
+        input.cursor_glow_add = step.glow_add;
+        input.glow_under = step.glow_under;
+        input.glow_halo = step.glow_halo;
+        input.fire_patch = step.fire_patch;
+        input.char_fg = step.char_fg;
+        input.fire_halo = step.fire_halo;
+        input.cursor_trail = step.trail;
+        if let Some(frame) = step.frame {
+            input.cursor_trail_color = frame.trail_color;
+            input.cursor_fill_override = frame.block_fill.map(|owned| owned.fill);
+            input.cursor_effect_style_override = compose_caret_style_override(
+                frame.bolt_cursor,
+                frame.twinkle_cursor,
+                frame.momentum_steady,
+            );
+        }
+        // A caret an effect holds steady does not blink, whatever the phase.
+        if input
+            .cursor_effect_style_override
+            .is_some_and(|style| !style.blinks())
+        {
+            input.cursor_visible = true;
+        }
+        step.cat
+    }
+
+    /// One 52 ms engine step at scene time `at`: the script's key (fed as a
+    /// window's input seam feeds it), the row the shell shows, the tick, and
+    /// the cursor cat; the streams kept when `keep` (the frame's own step).
+    fn step(&self, player: &mut ScenePlayer, stage: &SceneStage<'_>, at: u64, keep: bool) {
+        use aterm_effects::cursor_fx::head_dx_for;
+
+        let ScenePlayer {
+            origin,
+            fx,
+            cat: cursor_cat,
+            step: kept,
+            ..
+        } = player;
+        let now = *origin + Duration::from_millis(at);
+        let offset = at % CURSOR_SCENE_CYCLE_MS;
+        fx.begin(true, true);
+        match SceneEvent::at(offset) {
+            // The Return that hands the line to the shell; the next prompt
+            // starts the next cycle. The first step of the run has no line.
+            Some(SceneEvent::Return) if at > 0 => {
+                fx.cadence.on_keystroke(now);
+                fx.glow.supersede_typed_press();
+                fx.glow.note_return(now);
+                fx.trail.note_return(now);
+                cursor_cat.on_enter(now);
+                // The shell's newline and fresh prompt, at the foot of the
+                // screen: the content scrolls up a row and the engines' light
+                // goes with its line, as the hosts' content-scroll law
+                // translates it (`sync_scroll` in `pipeline_native`), so the
+                // last line's trail never lies on the blank prompt and the
+                // caret's way back is the terminal's move to the next row, not
+                // a sweep along it.
+                fx.scroll_translate(1);
+            }
+            Some(SceneEvent::Glyph(cell)) => {
+                let ch = CURSOR_SCENE_COMMAND[cell..].chars().next().unwrap_or(' ');
+                fx.cadence.on_keystroke(now);
+                fx.glow.supersede_typed_press();
+                fx.momentum
+                    .on_key(now, aterm_effects::cursor_momentum::MOMENTUM_GLOW_TAU_S);
+                fx.glow.note_typed_expected(
+                    now,
+                    1,
+                    ch.is_ascii_uppercase() || "~!@#$%^&*()_+{}|:\"<>?".contains(ch),
+                    crate::app_input::typed_class_for(Some(ch)),
+                    ch,
+                );
+                fx.trail.note_typed(now);
+            }
+            Some(SceneEvent::Tab) => {
+                fx.cadence.on_keystroke(now);
+                fx.glow.note_user_gesture(now);
+                fx.trail.note_user_gesture(now);
+                if self.cursor.trail_style == PreviewTrailStyle::RainbowKitty {
+                    fx.glow
+                        .note_insert_armed(now, aterm_effects::cursor_glow::InsertWidth::Unknown);
+                }
+            }
+            Some(SceneEvent::Return) | None => {}
+        }
+        let (row, line) = (stage.row, stage.line);
+        // The rows the shell shows at this step: the first line's, then, from
+        // the first Return on, the last line one row up.
+        let base = if at >= CURSOR_SCENE_CYCLE_MS {
+            stage.scrolled
+        } else {
+            stage.base
+        };
+        let shown = line.shown_at(offset);
+        let caret = line.caret(shown).min(stage.geom.cols - 1) as u16;
+        let probe_of = |cells: &[aterm_core::terminal::RenderCell], upto: usize| {
+            cells
+                .iter()
+                .enumerate()
+                .map(|(col, cell)| match cell {
+                    _ if col >= upto => ' ',
+                    cell if cell.wide => '\0',
+                    cell => cell.ch,
+                })
+                .collect::<Vec<_>>()
+        };
+        let above = (row > 0).then(|| probe_of(&base.cells[row - 1], usize::MAX));
+        let below = base
+            .cells
+            .get(row + 1)
+            .map(|cells| probe_of(cells, usize::MAX));
+        fx.glow.observe_row_with_trust(
+            row as u16,
+            caret,
+            &probe_of(&base.cells[row], line.caret(shown)),
+            now,
+            crate::cursor_glow::ProbeTrust::Full,
+        );
+        fx.glow
+            .observe_neighbor_rows(above.as_deref(), below.as_deref());
+        fx.glow.observe_caret_drawn(true);
         let mut glow = self
             .cursor
-            .glow_config(self.theme, head_dx_for(input.cursor_style));
+            .glow_config(self.theme, head_dx_for(stage.cursor_style));
         let presentation = self.cursor.resolved_trail_presentation();
         let mut comet = TrailConfig {
             enabled: self.cursor.trail_enabled && presentation.comet,
@@ -3139,123 +4381,100 @@ impl CursorScene {
             self.cursor.color.is_some(),
             self.cursor.accent.is_some(),
         );
-        let probe_of = |cells: &[aterm_core::terminal::RenderCell], upto: usize| {
-            cells
-                .iter()
-                .enumerate()
-                .map(|(col, cell)| match cell {
-                    _ if col >= upto => ' ',
-                    cell if cell.wide => '\0',
-                    cell => cell.ch,
-                })
-                .collect::<Vec<_>>()
-        };
-        let above = (row > 0).then(|| probe_of(&base.cells[row - 1], usize::MAX));
-        let mut fx = CursorFx::default();
-        let origin = Instant::now();
-        let mut typed_before = 0;
-        let mut t = 0;
-        let frame = loop {
-            let now = origin + Duration::from_millis(t);
-            let typed = line.typed_at(t);
-            let keys = typed - typed_before;
-            fx.begin(true, true);
-            for _ in 0..keys {
-                fx.cadence.on_keystroke(now);
-                fx.momentum
-                    .on_key(now, aterm_effects::cursor_momentum::MOMENTUM_GLOW_TAU_S);
-                fx.glow.note_typed_cells(now, 1);
-            }
-            if keys > 0 {
-                fx.trail
-                    .note_typed_batch(now, u32::try_from(keys).unwrap_or(u32::MAX));
-            }
-            let caret = line.caret(typed).min(geom.cols - 1) as u16;
-            fx.glow.observe_row_with_trust(
-                row as u16,
-                caret,
-                &probe_of(&base.cells[row], line.caret(typed)),
+        let frame = fx.tick(
+            &CursorFxInput {
                 now,
-                crate::cursor_glow::ProbeTrust::Full,
-            );
-            fx.glow.observe_neighbor_rows(above.as_deref(), None);
-            fx.glow.observe_caret_drawn(true);
-            let frame = fx.tick(
-                &CursorFxInput {
-                    now,
-                    cur: Some((row as u16, caret)),
-                    live_viewport: true,
-                    cursor_style: input.cursor_style,
-                    blink_phase: true,
-                    live_cursor: self.theme.cursor,
-                    cursor_color_pinned: self.cursor.cursor_color_pinned,
-                    default_bg: self.theme.bg,
-                    geom,
-                    focused: true,
-                    amplitude: 1.0,
-                    shed_envelope: 1.0,
-                    body_allowed: true,
-                    master: self.cursor.trail_enabled,
-                    momentum_glow: self.cursor.momentum_glow,
-                    user_tinted: self.cursor.color.is_some(),
-                },
-                &glow,
-                comet,
-            );
-            typed_before = typed;
-            if t >= end_ms {
-                break frame;
-            }
-            t = (t + MOTION_STEP_MS).min(end_ms);
-        };
-        input.cursor_glow_add = std::mem::take(&mut fx.glow_scratch);
-        input.glow_under = fx.glow.under_quads().to_vec();
-        input.glow_halo = fx.glow.halos().to_vec();
-        input.fire_patch = fx.glow.patches().to_vec();
-        input.char_fg = fx.glow.charred().to_vec();
-        input.fire_halo = fx.glow.halo_cells().to_vec();
-        input.cursor_trail = std::mem::take(&mut fx.trail_scratch);
-        input.cursor_trail_color = frame.trail_color;
-        input.cursor_fill_override = frame.block_fill.map(|owned| owned.fill);
-        input.cursor_effect_style_override = compose_caret_style_override(
-            frame.bolt_cursor,
-            frame.twinkle_cursor,
-            frame.momentum_steady,
+                cur: Some((row as u16, caret)),
+                live_viewport: true,
+                cursor_style: stage.cursor_style,
+                blink_phase: true,
+                live_cursor: self.theme.cursor,
+                cursor_color_pinned: self.cursor.cursor_color_pinned,
+                default_bg: self.theme.bg,
+                geom: stage.geom,
+                focused: true,
+                amplitude: 1.0,
+                shed_envelope: 1.0,
+                body_allowed: true,
+                momentum_glow: self.cursor.trail_enabled && self.cursor.momentum_glow,
+                user_tinted: self.cursor.color.is_some(),
+            },
+            &glow,
+            comet,
         );
-        // A caret an effect holds steady does not blink, whatever the phase.
-        if input
-            .cursor_effect_style_override
-            .is_some_and(|style| !style.blinks())
-        {
-            input.cursor_visible = true;
+        // The window's chain (`App::cursor_frame`): the aurora's motion pulse
+        // drives the cursor cat, which earns and paces the Flying kitty.
+        let cat = self.flying_earned.then(|| {
+            crate::app_render::forward_kitty_cursor_motion(
+                self.cursor.trail_enabled,
+                false,
+                glow.style,
+                fx.glow.take_cursor_cat_motion_pulse(),
+                cursor_cat,
+            );
+            cursor_cat.frame(now)
+        });
+        if keep {
+            *kept = SceneStep {
+                glow_add: fx.glow_scratch.clone(),
+                glow_under: fx.glow.under_quads().to_vec(),
+                glow_halo: fx.glow.halos().to_vec(),
+                fire_patch: fx.glow.patches().to_vec(),
+                char_fg: fx.glow.charred().to_vec(),
+                fire_halo: fx.glow.halo_cells().to_vec(),
+                trail: fx.trail_scratch.clone(),
+                frame: Some(frame),
+                cat,
+            };
         }
     }
 
-    /// The portable stand-ins for the GPU-only bloom and fire shimmer: additive
-    /// light, so like the real thing they only show on a dark ground.
+    /// The live terminal's post passes over the rendered scene `frame`: the
+    /// bloom (the GPU's kernel, run on the CPU by [`aterm_render::bloom::apply`]
+    /// at the live strength and radius), then the one crown the window draws
+    /// (`format_plan`): on a screen that shows EDR with HDR glow on, the HDR
+    /// pass at its boost, clipped here to the tray's standard range; anywhere
+    /// else the SDR crown at the budget SDR glow boost sets
+    /// (`hdr::sdr_glow_budget`). One of the two lifts the glow, never both.
+    pub(crate) fn post_process(
+        &self,
+        frame: &mut aterm_render::Frame,
+        input: &RenderInput,
+    ) -> Result<(), String> {
+        if !self.typing {
+            return Ok(());
+        }
+        if self.post_fx.bloom {
+            aterm_render::bloom::apply(
+                frame,
+                &input.cursor_glow_add,
+                input.rows,
+                aterm_render::bloom::BloomParams {
+                    strength: finite_or(self.post_fx.bloom_strength, 0.0).max(0.0),
+                    radius: finite_or(self.post_fx.bloom_radius, aterm_render::bloom::BLOOM_RADIUS)
+                        .max(0.0),
+                },
+            )?;
+        }
+        let budget = if self.post_fx.hdr_glow && self.post_fx.display_edr {
+            aterm_render::hdr::HDR_GLOW_BOOST
+        } else {
+            let luma = aterm_render::hdr::packed_luma(self.theme.bg);
+            aterm_render::hdr::sdr_glow_budget(luma, self.post_fx.sdr_boost)
+        };
+        aterm_render::bloom::sdr_crown(frame, &input.cursor_glow_add, input.rows, budget)
+    }
+
+    /// The portable stand-in for the GPU-only fire shimmer: additive light,
+    /// so like the real thing it only shows on a dark ground. The bloom is
+    /// the live kernel, run over the rendered frame
+    /// ([`aterm_render::bloom`], `tray_raster::render_specimen_frame`).
     fn post_glow(&self, input: &mut RenderInput, geom: Geom, caret: (u16, u16)) {
         if !input.cursor_visible {
             return;
         }
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
         let cx = f32::from(caret.1) * cw + cw * 0.5;
-        let cy = f32::from(caret.0) * ch + ch * 0.5;
-        let luma = aterm_render::hdr::packed_luma(self.theme.bg);
-        let sdr_budget = aterm_render::hdr::sdr_glow_budget(luma, self.post_fx.sdr_boost);
-        let hdr_tone = if self.post_fx.hdr_glow { 0.18 } else { 0.0 };
-        let strength = if self.post_fx.bloom {
-            self.post_fx.bloom_strength / 3.0
-        } else {
-            0.0
-        };
-        let alpha = ((sdr_budget + hdr_tone) * strength * 255.0)
-            .round()
-            .clamp(0.0, 150.0);
-        if alpha > 0.0 {
-            let radius = ch * (0.22 + self.post_fx.bloom_radius * 0.12) * 1.15;
-            let peak = aterm_render::premul_rgb(self.theme.cursor, (alpha * 2.0).min(255.0) as u8);
-            push_additive_halo(&mut input.glow_halo, geom, (cx, cy), radius, peak);
-        }
         if self.post_fx.fire_shimmer && self.cursor.trail_style == PreviewTrailStyle::Fire {
             let wobble =
                 (((self.phase_ms / MOTION_STEP_MS) % 5) as f32 - 2.0) * (cw / 8.0).max(1.0);
@@ -3278,7 +4497,9 @@ impl CursorScene {
 
     /// Draw the companion beside the caret on its row: the pet stands at its
     /// station just past the caret, walking while keys land and sitting once
-    /// they stop; the flying kitty leads the caret along its ribbon.
+    /// they stop; the flying kitty leads the caret along its ribbon as the
+    /// cursor cat's frame (`cat`) says: earned, faded, banked and bobbing as
+    /// in the terminal.
     fn place_companion(
         &self,
         input: &mut RenderInput,
@@ -3286,12 +4507,24 @@ impl CursorScene {
         caret: (u16, u16),
         typed: usize,
         settled_ms: u64,
+        cat: Option<aterm_effects::kitty_cursor::CatFrame>,
     ) {
         use aterm_effects::word_decorations::{EffectGeom, KittySpriteSource, WordDecorations};
 
-        if self.companion == SceneCompanion::None || self.flying_alpha(typed, settled_ms) == 0 {
+        if self.companion == SceneCompanion::None {
             return;
         }
+        // The earned kitty is the cursor cat's; a still line (nothing plays)
+        // and the sprite control's diagnostic show it whole.
+        let flight = match cat {
+            Some(frame) if self.flying_earned => {
+                if frame.alpha == 0 {
+                    return;
+                }
+                Some(frame)
+            }
+            _ => None,
+        };
         let asset = &self.post_fx.kitty_asset;
         if self.companion == SceneCompanion::FlyingKitty
             && matches!(asset, crate::app_config::KittySpriteAsset::Invalid { .. })
@@ -3342,43 +4575,41 @@ impl CursorScene {
                 return;
             };
             let mut sprites = Vec::new();
-            // Each emission is its own frame with a fresh bake budget. A first
-            // sight of a look can need a second budget, and a still preview
-            // has no next frame to wait for.
-            for _ in 0..3 {
-                decorations.begin_host_frame();
-                self.emit_companion(
-                    decorations,
-                    (geom, colors),
-                    caret,
-                    typed,
-                    settled_ms,
-                    1.0,
-                    &mut sprites,
-                );
-                if !sprites.is_empty() {
-                    break;
-                }
-            }
-            let floor = i32::from(rows) * i32::from(cell_h);
             // Every companion is taller than one row (the flying head and the
-            // pet both stand 1.7 rows): a one-row card (a short window) draws
-            // it smaller and whole, the pet still on its feet, rather than cut
-            // at the card's edge. It is baked already, so the redraw is a
-            // scale.
+            // pet both stand 1.7 rows): a card too short for it draws it
+            // smaller and whole, the pet still on its feet, rather than cut at
+            // the card's edge. It is baked already, so the redraw is a scale.
+            let shown_rows = self.card_rows.map_or(rows, |card| {
+                u16::try_from(card).unwrap_or(u16::MAX).min(rows)
+            });
+            let floor = i32::from(shown_rows.max(1)) * i32::from(cell_h);
+            let ink = (geom, colors);
+            let mut emit = |fit: f32, sprites: &mut Vec<aterm_core::render::FreeSprite>| {
+                // Each emission is its own frame with a fresh bake budget. A
+                // first sight of a look can need a second budget, and a still
+                // preview has no next frame to wait for.
+                for _ in 0..3 {
+                    decorations.begin_host_frame();
+                    self.emit_companion(
+                        decorations,
+                        ink,
+                        caret,
+                        typed,
+                        settled_ms,
+                        flight,
+                        fit,
+                        sprites,
+                    );
+                    if !sprites.is_empty() {
+                        break;
+                    }
+                }
+            };
+            emit(1.0, &mut sprites);
             let tallest = sprites.iter().map(|sprite| i32::from(sprite.h)).max();
             if let Some(tallest) = tallest.filter(|tallest| *tallest > floor) {
                 let mut fitted = Vec::new();
-                decorations.begin_host_frame();
-                self.emit_companion(
-                    decorations,
-                    (geom, colors),
-                    caret,
-                    typed,
-                    settled_ms,
-                    floor as f32 / tallest as f32,
-                    &mut fitted,
-                );
+                emit(floor as f32 / tallest as f32, &mut fitted);
                 if !fitted.is_empty() {
                     sprites = fitted;
                 }
@@ -3386,8 +4617,8 @@ impl CursorScene {
             if let Some(atlas) = decorations.free_atlas()
                 && !sprites.is_empty()
             {
-                // A short card's prompt is its last row: lift a head that would
-                // hang below the frame back inside it rather than clip it.
+                // A short card's prompt is its last text row: lift a head that
+                // would hang below it back inside rather than clip it.
                 for sprite in &mut sprites {
                     sprite.y = sprite.y.min(floor - i32::from(sprite.h)).max(0);
                 }
@@ -3397,26 +4628,11 @@ impl CursorScene {
         });
     }
 
-    /// The Flying kitty's opacity with `typed` keys down and `settled_ms`
-    /// since the last: nothing before it is earned, then a fade-in (full on a
-    /// still preview, whose line stands typed). Full for every other
-    /// companion.
-    fn flying_alpha(&self, typed: usize, settled_ms: u64) -> u8 {
-        if !self.flying_earned {
-            return 255;
-        }
-        let Some(past) = typed.checked_sub(FLYING_ARRIVES_AT_KEY) else {
-            return 0;
-        };
-        let since = (past as u64)
-            .saturating_mul(KEY_MS)
-            .saturating_add(settled_ms);
-        u8::try_from(since.saturating_mul(255) / FLYING_FADE_IN_MS).unwrap_or(255)
-    }
-
     /// One companion frame. `fit` scales the companion (1.0: its own size),
     /// for a card too short to hold it: the flying head about its centre,
-    /// the pet about its feet, its left edge kept at its station.
+    /// the pet about its feet, its left edge kept at its station. `flight` is
+    /// the cursor cat's frame for an earned Flying kitty (its opacity, bank
+    /// and bob); `None` draws it whole and still.
     #[allow(clippy::too_many_arguments)] // One companion frame's placement facts.
     fn emit_companion(
         &self,
@@ -3428,6 +4644,7 @@ impl CursorScene {
         caret: (u16, u16),
         typed: usize,
         settled_ms: u64,
+        flight: Option<aterm_effects::kitty_cursor::CatFrame>,
         fit: f32,
         sprites: &mut Vec<aterm_core::render::FreeSprite>,
     ) {
@@ -3491,21 +4708,37 @@ impl CursorScene {
                 );
             }
             SceneCompanion::FlyingKitty => {
+                let (look, alpha, bob, pose, sing) = match flight {
+                    Some(frame) => (
+                        frame.render_look(),
+                        frame.alpha,
+                        frame.bob,
+                        frame.pose,
+                        frame.sing,
+                    ),
+                    None => (
+                        self.post_fx.companion_look,
+                        255,
+                        0.0,
+                        aterm_effects::kitty_cursor::CatPose::STILL,
+                        0.0,
+                    ),
+                };
                 let _ = decorations.kitty_cursor(
                     KittyCursorFrame {
                         geom,
                         cursor: caret,
-                        look: self.post_fx.companion_look,
+                        look,
                         colors,
-                        bob: 0.0,
-                        alpha: self.flying_alpha(typed, settled_ms),
+                        bob,
+                        alpha,
                         pose: aterm_effects::kitty_cursor::CatPose {
-                            scale_x: fit,
-                            scale_y: fit,
-                            ..aterm_effects::kitty_cursor::CatPose::STILL
+                            scale_x: pose.scale_x * fit,
+                            scale_y: pose.scale_y * fit,
+                            ..pose
                         },
-                        // A preview still: no celebration, no notes.
-                        sing: 0.0,
+                        sing,
+                        // A preview draws no song notes.
                         notes: [None; aterm_effects::kitty_sing::MAX_NOTES],
                     },
                     sprites,
@@ -3513,46 +4746,6 @@ impl CursorScene {
             }
             SceneCompanion::None => {}
         }
-    }
-}
-
-/// One additive radial light centred at `(cx, cy)`, split into the per-row
-/// bands every halo stream requires.
-fn push_additive_halo(
-    out: &mut Vec<RainHalo>,
-    geom: Geom,
-    (cx, cy): (f32, f32),
-    radius: f32,
-    color: u32,
-) {
-    let r = radius.round().max(1.0) as i32;
-    let (cxi, cyi) = (cx.round() as i32, cy.round() as i32);
-    let (Ok(cxu), Ok(cyu), Ok(ru)) = (u16::try_from(cxi), u16::try_from(cyi), u16::try_from(r))
-    else {
-        return;
-    };
-    let x0 = (cxi - r).max(0);
-    let x1 = (cxi + r).min(i32::from(geom.win_w));
-    let ch = geom.ch as i32;
-    let mut y = (cyi - r).max(0);
-    let y1 = (cyi + r).min(i32::from(geom.win_h));
-    while y < y1 && x1 > x0 {
-        let band_row = y / ch;
-        let band_end = ((band_row + 1) * ch).min(y1);
-        out.push(RainHalo {
-            row: band_row as u16,
-            x: x0 as u16,
-            y: y as u16,
-            w: (x1 - x0) as u16,
-            h: (band_end - y) as u16,
-            color,
-            cx: cxu,
-            cy: cyu,
-            rx: ru,
-            ry: ru,
-            mode: HaloMode::Add,
-        });
-        y = band_end;
     }
 }
 
@@ -3588,39 +4781,329 @@ pub(crate) fn preview_node(
     )
 }
 
-/// Return the longest complete-grapheme prefix that fits a terminal row.
-/// Wide CJK/emoji clusters consume two columns and ZWJ/combining sequences are
-/// never split at the preview clip edge.
-#[cfg(test)]
-fn terminal_prefix(value: &str, columns: usize) -> &str {
-    if columns == 0 {
-        return "";
+/// The dots frame's strip ([`DemoFrame::Dots`]): three window dots, the
+/// selected tab a card with its accent rule over the strip's seam, a seam
+/// between the two tabs and one under the band.
+fn paint_demo_dots_strip(
+    prims: &mut Vec<DrawPrim>,
+    rect: LogicalRect,
+    layout: &DemoStripLayout,
+    strip: &crate::tab_bar::StripSample,
+    roles: Roles,
+    caption: crate::type_scale::StepPx,
+) {
+    let top = rect.y;
+    let strip_h = layout.strip_h;
+    for index in 0..3 {
+        prims.push(DrawPrim::Dot {
+            cx: rect.x + 14.0 + index as f32 * 10.0,
+            cy: top + strip_h * 0.5,
+            r: 3.5,
+            color: rgba(roles.text_tertiary, 255),
+        });
     }
-    let mut used = 0_usize;
-    let mut end = 0_usize;
-    for (offset, grapheme) in value.grapheme_indices() {
-        let width = grapheme_display_width(grapheme);
-        if used.saturating_add(width) > columns {
-            break;
+    let (tabs_x, tab_w, tab_top) = (layout.tabs_x, layout.tab_w, layout.tab_top);
+    let tab_h = layout.tab_h(rect);
+    let [selected, quiet] = DemoFrame::Dots.labels();
+    if tab_w >= DemoStripLayout::MIN_TAB_W {
+        prims.push(DrawPrim::Panel {
+            x: tabs_x,
+            y: tab_top,
+            w: tab_w,
+            h: tab_h,
+            radius: 6.0,
+            fill: rgba(strip.active, 255),
+        });
+        prims.push(DrawPrim::Panel {
+            x: tabs_x,
+            y: tab_top + tab_h * 0.5,
+            w: tab_w,
+            h: tab_h * 0.5,
+            radius: 0.0,
+            fill: rgba(strip.active, 255),
+        });
+        let baseline = crate::tray_raster::row_baseline(tab_top, tab_h - 2.0, caption.get());
+        for (x, label, ink) in [
+            (tabs_x + 10.0, selected, strip.active_ink),
+            (tabs_x + tab_w + 11.0, quiet, strip.inactive_ink),
+        ] {
+            let room = (tab_w - 20.0).max(0.0);
+            let label = bounded_badge_width(label, room, caption.get());
+            if !label.is_empty() {
+                prims.push(text_prim(
+                    x,
+                    baseline,
+                    label,
+                    caption,
+                    TextWeight::Regular,
+                    TextFace::Ui,
+                    rgba(ink, 255),
+                ));
+            }
         }
-        used = used.saturating_add(width);
-        end = offset.saturating_add(grapheme.len());
+        // The seam between the two tabs.
+        prims.push(DrawPrim::Panel {
+            x: tabs_x + tab_w,
+            y: tab_top + 4.0,
+            w: 1.0,
+            h: tab_h - 8.0,
+            radius: 0.0,
+            fill: rgba(strip.seam, 255),
+        });
     }
-    &value[..end]
+    // The strip's own bottom seam against the grid.
+    prims.push(DrawPrim::Panel {
+        x: rect.x,
+        y: top + strip_h - 1.0,
+        w: rect.width,
+        h: 1.0,
+        radius: 0.0,
+        fill: rgba(strip.seam, 255),
+    });
+    // The active tab's rule sits over the seam, once the window has a grid.
+    if tab_w >= DemoStripLayout::MIN_TAB_W && SettingsPreviewSpec::demo_grid_rect(rect).is_some() {
+        prims.push(DrawPrim::Panel {
+            x: tabs_x,
+            y: top + strip_h - 2.0,
+            w: tab_w,
+            h: 2.0,
+            radius: 0.0,
+            fill: rgba(strip.rule, 255),
+        });
+    }
 }
 
-#[cfg(test)]
-fn grapheme_at_terminal_column(value: &str, column: usize) -> Option<&str> {
-    let mut left = 0_usize;
-    for grapheme in value.graphemes() {
-        let width = grapheme_display_width(grapheme);
-        let right = left.saturating_add(width);
-        if width > 0 && column >= left && column < right {
-            return Some(grapheme);
+/// The Windows frame's strip ([`DemoFrame::Windows`]), the real Windows tab
+/// row in small: the seam under the band; the selected tab the terminal's
+/// `ground` with its top corners rounded, running on through the seam into
+/// the grid where its fill IS the ground and standing closed on the seam
+/// where it is not (an authored `active_tab_color`), wearing the seam round
+/// its sides and top where the strip's selected tab does
+/// (`tab_bar::windows_tab_wears_rim`: on every light band, and on a dark one
+/// where its fill alone would be faint); its label semibold with its `✕`; the quiet tab a
+/// bare title; the `+` in the band's ink; and the caption's minimize, maximize
+/// and close glyphs at the right in white or black, as Windows draws them on a
+/// dark or light caption (`platform_win::caption_tint`).
+fn paint_demo_windows_strip(
+    prims: &mut Vec<DrawPrim>,
+    rect: LogicalRect,
+    layout: &DemoStripLayout,
+    strip: &crate::tab_bar::StripSample,
+    ground: [u8; 3],
+    fg: [u8; 3],
+    caption: crate::type_scale::StepPx,
+) {
+    use aterm_messages::ink::ensure_contrast;
+    let top = rect.y;
+    let foot = top + layout.strip_h;
+    let seam_y = foot - 1.0;
+    prims.push(DrawPrim::Panel {
+        x: rect.x,
+        y: seam_y,
+        w: rect.width,
+        h: 1.0,
+        radius: 0.0,
+        fill: rgba(strip.seam, 255),
+    });
+    let px = caption.get();
+    let cy = layout.label_cy(rect);
+    let (tabs_x, tab_w, tab_top) = (layout.tabs_x, layout.tab_w, layout.tab_top);
+    if tab_w >= DemoStripLayout::MIN_TAB_W {
+        let opens = strip.active == ground;
+        let bottom = if opens { foot } else { seam_y };
+        // Drawn a radius past its foot under a clip, so only the top corners
+        // round.
+        prims.push(DrawPrim::ClipPush {
+            x: tabs_x,
+            y: top,
+            w: tab_w,
+            h: bottom - top,
+        });
+        prims.push(DrawPrim::Panel {
+            x: tabs_x,
+            y: tab_top,
+            w: tab_w,
+            h: bottom - tab_top + DEMO_TAB_RADIUS,
+            radius: DEMO_TAB_RADIUS,
+            fill: rgba(strip.active, 255),
+        });
+        if crate::tab_bar::windows_tab_wears_rim(strip.active, strip.band) {
+            prims.push(DrawPrim::Stroke {
+                x: tabs_x + 0.5,
+                y: tab_top + 0.5,
+                w: tab_w - 1.0,
+                h: bottom - tab_top + DEMO_TAB_RADIUS,
+                radius: DEMO_TAB_RADIUS - 0.5,
+                width: 1.0,
+                color: rgba(strip.seam, 255),
+            });
         }
-        left = right;
+        prims.push(DrawPrim::ClipPop);
+        let baseline = crate::tray_raster::row_baseline(tab_top, layout.tab_h(rect) - 2.0, px);
+        let [selected, quiet] = DemoFrame::Windows.labels();
+        // The selected title stops clear of its `✕`.
+        let close_cx = tabs_x + tab_w - 14.0;
+        for (x, label, room, face, ink) in [
+            (
+                tabs_x + 10.0,
+                selected,
+                tab_w - 34.0,
+                TextFace::UiBold,
+                strip.active_ink,
+            ),
+            (
+                tabs_x + tab_w + 10.0,
+                quiet,
+                tab_w - 20.0,
+                TextFace::Ui,
+                strip.inactive_ink,
+            ),
+        ] {
+            let label = bounded_badge_width(label, room.max(0.0), px);
+            if !label.is_empty() {
+                prims.push(text_prim(
+                    x,
+                    baseline,
+                    label,
+                    caption,
+                    TextWeight::Regular,
+                    face,
+                    rgba(ink, 255),
+                ));
+            }
+        }
+        // The resident `✕` and the `+`: the real strip's strokes at the
+        // labels' size.
+        let ink = rgba(strip.active_ink, 255);
+        let (r, width) = ((px * 0.26).max(2.0), (px / 9.0).max(1.0));
+        for dy in [-r, r] {
+            prims.push(DrawPrim::Line {
+                x1: close_cx - r,
+                y1: cy - dy,
+                x2: close_cx + r,
+                y2: cy + dy,
+                width,
+                color: ink,
+            });
+        }
+        if let Some(plus_cx) = layout.new_tab {
+            let ink = rgba(ensure_contrast(fg, strip.band, 4.5), 255);
+            let (r, width) = ((px * 0.30).max(2.5), (px / 8.5).max(1.2));
+            prims.push(DrawPrim::Line {
+                x1: plus_cx - r,
+                y1: cy,
+                x2: plus_cx + r,
+                y2: cy,
+                width,
+                color: ink,
+            });
+            prims.push(DrawPrim::Line {
+                x1: plus_cx,
+                y1: cy - r,
+                x2: plus_cx,
+                y2: cy + r,
+                width,
+                color: ink,
+            });
+        }
     }
-    None
+    if let Some(([minimize, maximize, close], glyph_cy)) = layout.caption {
+        let ink = rgba(
+            if crate::tab_bar::bg_is_light(strip.band) {
+                [0, 0, 0]
+            } else {
+                [0xff, 0xff, 0xff]
+            },
+            255,
+        );
+        let half = DEMO_CAPTION_GLYPH * 0.5;
+        // Minimize: a bar across the glyph box's middle.
+        prims.push(DrawPrim::Panel {
+            x: minimize - half,
+            y: glyph_cy,
+            w: DEMO_CAPTION_GLYPH,
+            h: 1.0,
+            radius: 0.0,
+            fill: ink,
+        });
+        // Maximize: the box, its corners eased as Windows 11's are.
+        prims.push(DrawPrim::Stroke {
+            x: maximize - half + 0.5,
+            y: glyph_cy - half + 0.5,
+            w: DEMO_CAPTION_GLYPH - 1.0,
+            h: DEMO_CAPTION_GLYPH - 1.0,
+            radius: 1.0,
+            width: 1.0,
+            color: ink,
+        });
+        // Close: the box's two diagonals.
+        let arm = half - 0.5;
+        for dy in [-arm, arm] {
+            prims.push(DrawPrim::Line {
+                x1: close - arm,
+                y1: glyph_cy - dy,
+                x2: close + arm,
+                y2: glyph_cy + dy,
+                width: 1.0,
+                color: ink,
+            });
+        }
+    }
+}
+
+/// The demo window's soft drop shadow, 4 down and about 16 across, from
+/// stacked translucent panels: 18% black on a light page, 30% on a dark one.
+/// With `ring`, each panel is drawn only where it can show: outside the
+/// window's opaque body, whose interior (inset by its corner radius,
+/// `body_radius`, which the panels' corners follow) hides whatever is under
+/// it. Four translucent full-size panels blended in linear light were most of
+/// a demo repaint; the ring paints the same pixels.
+fn push_demo_shadow(
+    prims: &mut Vec<DrawPrim>,
+    rect: LogicalRect,
+    light_page: bool,
+    ring: bool,
+    body_radius: f32,
+) {
+    let shadow = if light_page { 0.18 } else { 0.30 };
+    let body_radius = body_radius.max(0.0);
+    for layer in 0..4 {
+        let spread = 2.0 + layer as f32 * 3.0;
+        let panel = DrawPrim::Panel {
+            x: rect.x - spread,
+            y: rect.y + 4.0 - spread * 0.5,
+            w: rect.width + spread * 2.0,
+            h: rect.height + spread,
+            radius: body_radius + spread,
+            fill: rgba([0, 0, 0], (shadow * 255.0 / 6.0) as u8),
+        };
+        if !ring || rect.width <= body_radius * 2.0 || rect.height <= body_radius * 2.0 {
+            prims.push(panel);
+            continue;
+        }
+        let (x0, y0) = (rect.x - spread - 1.0, rect.y + 4.0 - spread * 0.5 - 1.0);
+        let (x1, y1) = (
+            rect.right() + spread + 1.0,
+            rect.bottom() + 4.0 + spread * 0.5 + 1.0,
+        );
+        let (inner_x0, inner_y0) = (rect.x + body_radius, rect.y + body_radius);
+        let (inner_x1, inner_y1) = (rect.right() - body_radius, rect.bottom() - body_radius);
+        for (x, y, right, bottom) in [
+            (x0, y0, x1, inner_y0),
+            (x0, inner_y1, x1, y1),
+            (x0, inner_y0, inner_x0, inner_y1),
+            (inner_x1, inner_y0, x1, inner_y1),
+        ] {
+            prims.push(DrawPrim::ClipPush {
+                x,
+                y,
+                w: (right - x).max(0.0),
+                h: (bottom - y).max(0.0),
+            });
+            prims.push(panel.clone());
+            prims.push(DrawPrim::ClipPop);
+        }
+    }
 }
 
 fn finite_or(value: f32, fallback: f32) -> f32 {
@@ -3699,14 +5182,6 @@ fn family_words(family: &str) -> String {
     }
 }
 
-/// `value` without the " (display face)" note [`family_words`] gives a
-/// display-face family, for a badge too short for the note.
-fn display_face_suffix_stripped(value: &str) -> Option<&str> {
-    value
-        .strip_suffix(" (display faces)")
-        .or_else(|| value.strip_suffix(" (display face)"))
-}
-
 fn friendly_preview_value(value: &str) -> String {
     let value = value.trim();
     if value.is_empty() {
@@ -3728,7 +5203,7 @@ fn trim_float(value: f32) -> String {
     }
 }
 
-/// Settings ▸ Themes' gallery cards: their data, built once per catalog
+/// Settings ▸ Themes' chooser rows: their data, built once per catalog
 /// generation, and their paint-only specimen tiles.
 #[path = "settings_preview_theme_card.rs"]
 pub(crate) mod theme_card;
@@ -3757,7 +5232,7 @@ mod tests {
     fn played(spec: &SettingsPreviewSpec, theme: Theme) -> RenderInput {
         let spec = spec.normalized();
         let (base, _) = build_terminal_specimen_input(&spec, theme);
-        CursorScene::new(&spec, theme).decorate(&base, (8, 17))
+        CursorScene::new(&spec, theme, None).decorate(&base, (8, 17))
     }
 
     fn has_effect_light(input: &RenderInput) -> bool {
@@ -3827,8 +5302,119 @@ mod tests {
         .expect("preview compiles")
     }
 
+    /// The demo's shadow drawn as a ring paints exactly the pixels the full
+    /// shadow does under the window's opaque body, on a light page and a dark
+    /// one, at 1x and 2x. Negative control: without the body over it the ring
+    /// is not the full shadow (its interior really is skipped).
+    #[test]
+    fn the_demo_shadow_ring_paints_what_the_full_shadow_shows() {
+        let rect = LogicalRect::new(40.0, 30.0, 300.0, 180.0);
+        // Both frames' corners: the dots window's 10 and Windows 11's 8.
+        for radius in [DemoFrame::Dots.radius(), DemoFrame::Windows.radius()] {
+            let body = DrawPrim::Panel {
+                x: rect.x,
+                y: rect.y,
+                w: rect.width,
+                h: rect.height,
+                radius,
+                fill: rgba([30, 34, 40], 255),
+            };
+            let raster = |ring: bool, light: bool, with_body: bool, scale: f32| {
+                let mut prims = Vec::new();
+                push_demo_shadow(&mut prims, rect, light, ring, radius);
+                if with_body {
+                    prims.push(body.clone());
+                }
+                crate::tray_raster::rasterize_tray(&prims, 400, 260, scale, [236, 236, 236, 255]).0
+            };
+            for light in [true, false] {
+                for scale in [1.0, 2.0] {
+                    assert!(
+                        raster(true, light, true, scale) == raster(false, light, true, scale),
+                        "radius {radius}, light {light} at {scale}x"
+                    );
+                }
+            }
+            assert!(raster(true, true, false, 1.0) != raster(false, true, false, 1.0));
+        }
+    }
+
     fn pixels(spec: SettingsPreviewSpec) -> Vec<u8> {
         raster_of(&compiled(spec).tray(Theme::default(), 13.0).prims)
+    }
+
+    /// A solid `rgb` picture, 4×2.
+    fn solid_wallpaper(rgb: [u8; 3], dim: f32, tint: bool) -> crate::widget::SpecimenWallpaper {
+        crate::widget::SpecimenWallpaper {
+            rgba: Arc::from(
+                std::iter::repeat_n([rgb[0], rgb[1], rgb[2], 255], 8)
+                    .flatten()
+                    .collect::<Vec<u8>>(),
+            ),
+            w: 4,
+            h: 2,
+            fp: u64::from(u32::from_be_bytes([0, rgb[0], rgb[1], rgb[2]])) ^ 0x5157,
+            dim,
+            tint,
+        }
+    }
+
+    /// The Wallpaper preview over `wallpaper` on the Default theme.
+    fn wallpaper_spec(wallpaper: Option<crate::widget::SpecimenWallpaper>) -> SettingsPreviewSpec {
+        SettingsPreviewSpec {
+            scene: PreviewScene::Wallpaper,
+            wallpaper,
+            terminal_theme: Some(PreviewTerminalTheme::from_scheme(
+                &aterm_types::ColorScheme::default(),
+            )),
+            focused_key: crate::prefs::EDIT_WALLPAPER.to_string(),
+            focused_value: "wall.png".to_string(),
+            ..SettingsPreviewSpec::appearance(14.0)
+        }
+    }
+
+    /// The pixel at `(x, y)` of a raster [`VIEWPORT`] wide.
+    fn texel(raster: &[u8], x: usize, y: usize) -> [u8; 3] {
+        let i = (y * VIEWPORT.width as usize + x) * 4;
+        [raster[i], raster[i + 1], raster[i + 2]]
+    }
+
+    /// THE WALLPAPER PREVIEW DRAWS THE PICTURE AS A TAB DOES: through the
+    /// renderer's own wallpaper path, under the whole terminal (its blank
+    /// cells at the bottom right as well as beside the session), toned by the
+    /// dim toward the theme background: the picture itself at dim 0, the
+    /// background at dim 1, their 70/30 mix at dim 0.3. Negative control: no
+    /// wallpaper draws the theme background.
+    #[test]
+    fn the_wallpaper_preview_draws_the_picture_under_the_terminal() {
+        let bg = crate::settings::u32_rgb(Theme::default().bg);
+        let red = [0xE0, 0x20, 0x20];
+        // Inside the terminal, below and right of the session's ink.
+        let (x, y) = (
+            (VIEWPORT.width - 10.0 - 10.0 - 6.0) as usize,
+            (10.0 + 190.0 - 10.0 - 6.0) as usize,
+        );
+        let at = |wallpaper| texel(&pixels(wallpaper_spec(wallpaper)), x, y);
+        assert_eq!(at(None), bg, "no wallpaper: the theme background");
+        assert_eq!(at(Some(solid_wallpaper(red, 0.0, false))), red, "dim 0");
+        assert_eq!(at(Some(solid_wallpaper(red, 1.0, false))), bg, "dim 1");
+        let mixed = at(Some(solid_wallpaper(red, 0.3, false)));
+        for channel in 0..3 {
+            let want = f32::from(red[channel]) * 0.7 + f32::from(bg[channel]) * 0.3;
+            assert!(
+                (f32::from(mixed[channel]) - want).abs() <= 2.0,
+                "dim 0.3: {mixed:?} against {want} on channel {channel}"
+            );
+        }
+        // The text tint recolours the session's default-foreground text
+        // toward the picture under it; off, the text keeps the theme's ink.
+        let tinted = |tint| pixels(wallpaper_spec(Some(solid_wallpaper(red, 0.0, tint))));
+        assert_ne!(tinted(true), tinted(false), "the tint moves the text's ink");
+        // Another dim is another raster (the fingerprint moves with it).
+        assert_ne!(
+            wallpaper_spec(Some(solid_wallpaper(red, 0.3, false))).paint_fingerprint(),
+            wallpaper_spec(Some(solid_wallpaper(red, 0.4, false))).paint_fingerprint()
+        );
     }
 
     fn raster_of(prims: &[DrawPrim]) -> Vec<u8> {
@@ -4054,33 +5640,13 @@ mod tests {
             spec.bounded_candidate_badge(40),
             "Reduce motion under heavy load: On"
         );
-
-        // A display-face mix keeps every face's name before its note.
-        let mix = SettingsPreviewSpec::typography(12.0)
-            .with_focus(
-                crate::prefs::EDIT_FONT_FAMILY,
-                "display:chunky+pixel+engraved",
-            )
-            .with_font_candidate(SemanticFontCandidate {
-                regular: Some("display:chunky+pixel+engraved".to_string()),
-                ..SemanticFontCandidate::default()
-            });
-        assert_eq!(
-            mix.candidate_badge(),
-            "Font: Chunky + Pixel + Engraved (display faces)"
-        );
-        assert_eq!(
-            mix.bounded_candidate_badge(40),
-            "Font: Chunky + Pixel + Engraved"
-        );
-        assert_eq!(mix.bounded_candidate_badge(30), "Chunky + Pixel + Engraved");
     }
 
     /// A header with room says the whole badge: the 30-character cap is for
     /// headers that need it, not a wide one with 400pt to spare.
     #[test]
     fn a_wide_preview_header_says_the_whole_badge() {
-        let family = "display:chunky+pixel+engraved";
+        let family = "Iosevka Term Extended Heavy Oblique";
         let spec = SettingsPreviewSpec::typography(12.0)
             .with_focus(crate::prefs::EDIT_FONT_FAMILY, family)
             .with_font_candidate(SemanticFontCandidate {
@@ -4109,11 +5675,11 @@ mod tests {
         };
         assert_eq!(
             header(720.0),
-            "Font: Chunky + Pixel + Engraved (display faces) · Text sample"
+            "Font: Iosevka Term Extended Heavy Oblique · Text sample"
         );
-        // A narrow one shortens, keeping the faces' names.
+        // A narrow one shortens.
         let narrow = header(320.0);
-        assert!(narrow.contains("Chunky + Pixel + Engraved"), "{narrow}");
+        assert!(narrow.len() < header(720.0).len(), "{narrow}");
     }
 
     /// An unset font size reads with its unit on the number: "12 px
@@ -4272,6 +5838,99 @@ mod tests {
         }
     }
 
+    /// EVERY LISTED STYLE IS A LOOK OF ITS OWN, at every card size and on a
+    /// dark and a light theme: for each pair the Cursor Styles page lists,
+    /// some phase of the scene paints more than a sprinkle of pixels apart
+    /// (the list's rule). At the shipped 102x29 card (two whole rows) the
+    /// prompt keeps a row below it, so the default draws its comet body and
+    /// is not Flat rainbow. Negative control: an alias of the default
+    /// (`rainbow kitty`) paints as the default does.
+    #[test]
+    fn every_listed_cursor_style_is_a_look_of_its_own_at_every_card_size() {
+        let _ = compiled(SettingsPreviewSpec::default());
+        let prepared = crate::tray_raster::prepared_semantic_font_for_direct_view_test(
+            &SemanticFontCandidate::default(),
+        );
+        let themes = [
+            (
+                "GitHub Light",
+                PreviewTerminalTheme::from_scheme(
+                    &aterm_types::scheme::builtin("GitHub Light").expect("built-in light theme"),
+                ),
+            ),
+            (
+                "Default",
+                PreviewTerminalTheme::from_scheme(&aterm_types::ColorScheme::default()),
+            ),
+        ];
+        const PHASES: [u64; 4] = [300, 900, 1_500, 2_100];
+        let render = |style: &str, theme: PreviewTerminalTheme, rows: usize, phase: u64| {
+            let spec = SettingsPreviewSpec::cursor(CursorPreviewSpec {
+                blink: false,
+                trail_style: PreviewTrailStyle::parse(style),
+                trail_style_raw: Arc::from(style),
+                ..CursorPreviewSpec::default()
+            })
+            .with_terminal_theme(theme)
+            .with_phase(phase)
+            .with_prepared_font(prepared.clone())
+            .normalized();
+            let specimen = spec.terminal_specimen(theme.into_theme(), Some(rows));
+            crate::tray_raster::rasterize_tray(
+                &[DrawPrim::TerminalSpecimen {
+                    x: 0.0,
+                    y: 0.0,
+                    spec: Box::new(specimen),
+                }],
+                360,
+                160,
+                1.0,
+                [0, 0, 0, 255],
+            )
+            .0
+        };
+        let styles: Vec<&str> = crate::native_settings::listed_cursor_style_values().collect();
+        for (name, theme) in themes {
+            for rows in [2, 5] {
+                let frames: Vec<Vec<Vec<u8>>> = styles
+                    .iter()
+                    .map(|style| {
+                        PHASES
+                            .iter()
+                            .map(|&phase| render(style, theme, rows, phase))
+                            .collect()
+                    })
+                    .collect();
+                for (i, a) in styles.iter().enumerate() {
+                    for (j, b) in styles.iter().enumerate().skip(i + 1) {
+                        let apart = (0..PHASES.len())
+                            .map(|p| differences(&frames[i][p], &frames[j][p]) / 4)
+                            .max()
+                            .unwrap_or(0);
+                        assert!(
+                            apart > 40,
+                            "{a} and {b} paint only {apart} pixels apart on {name} at {rows} rows"
+                        );
+                    }
+                }
+                let default = styles
+                    .iter()
+                    .position(|style| *style == crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE)
+                    .expect("the default is listed");
+                for (p, &phase) in PHASES.iter().enumerate() {
+                    assert_eq!(
+                        differences(
+                            &render("rainbow kitty", theme, rows, phase),
+                            &frames[default][p]
+                        ),
+                        0,
+                        "an alias paints as the style it names ({name}, {rows} rows)"
+                    );
+                }
+            }
+        }
+    }
+
     /// Spoken summaries name what the preview shows: the cursor's shape and
     /// trail, the theme a colour sample shows, the text setting being tried —
     /// never a raw value standing in for a font or a theme.
@@ -4415,8 +6074,71 @@ mod tests {
     }
 
     /// The spoken value names the theme in the painted badge's words, and
-    /// says "sample" only for a card the stage draws; the badge says the
+    /// says "sample" only for a tried row the demo draws; the badge says the
     /// still colour sample once, through its `Theme:`/`Sample:` subject.
+    /// A TRIED STYLE IS BADGED AND SPOKEN AS UNSAVED, AND KEEPS SAYING SO WHEN
+    /// SHORTENED: `Trying:` leads the badge, survives every shortening (the
+    /// value is cut, not the marker), and the spoken value says it is not
+    /// saved. Negative control: the same style unmarked reads `Style:` and says
+    /// nothing of saving.
+    #[test]
+    fn a_tried_style_badges_and_speaks_as_unsaved() {
+        let spec = |trial: bool| {
+            SettingsPreviewSpec::cursor(rainbow_cursor("rainbow dog pet"))
+                .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, "rainbow dog pet")
+                .with_style_trial(trial)
+        };
+        let tried = spec(true);
+        let badge = tried.with_state_badge(tried.candidate_badge());
+        assert!(badge.starts_with("Trying: Rainbow dog"), "{badge}");
+        assert!(tried.bounded_candidate_badge(12).starts_with("Trying:"));
+        assert!(compact_header_state(&tried).starts_with("Trying:"));
+        assert!(tried.semantic_value().contains("not saved"));
+        let saved = spec(false);
+        let badge = saved.with_state_badge(saved.candidate_badge());
+        assert!(badge.starts_with("Style: Rainbow dog"), "{badge}");
+        assert!(!badge.contains("Trying") && !saved.semantic_value().contains("not saved"));
+    }
+
+    /// THE HEADER SAYS THE FOCUSED ROW'S VERDICT, NOT "LIVE": a row that
+    /// changes nothing now puts its own words where the live state goes and
+    /// the header stops reading as live; a pause still leads, since it already
+    /// says why nothing moves.
+    #[test]
+    fn an_idle_focused_row_is_never_badged_live() {
+        let comet = || CursorPreviewSpec {
+            blink: false,
+            trail_style: PreviewTrailStyle::Comet,
+            trail_style_raw: Arc::from("comet"),
+            ..CursorPreviewSpec::default()
+        };
+        let spec = SettingsPreviewSpec::cursor(comet())
+            .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_BLOOM, "true")
+            .with_focus_label("Bloom")
+            .with_focused_effect(Some("Inactive: dark themes only".to_string()));
+        let badge = spec.with_state_badge(spec.candidate_badge());
+        assert_eq!(badge, "Bloom: On · Inactive: dark themes only");
+        assert!(!spec.reads_live());
+        assert!(!compact_header_state(&spec).contains("Live"));
+        assert!(spec.semantic_value().contains("Inactive: dark themes only"));
+        // Negative control: no verdict, a live trail.
+        let live = SettingsPreviewSpec::cursor(comet())
+            .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_BLOOM, "true")
+            .with_focus_label("Bloom");
+        assert_eq!(
+            live.with_state_badge(live.candidate_badge()),
+            "Bloom: On · Live trail"
+        );
+        assert!(live.reads_live());
+        // A pause leads.
+        let paused = spec.with_reduced_motion(true);
+        assert!(
+            !paused.live_state().contains("Inactive"),
+            "{}",
+            paused.live_state()
+        );
+    }
+
     #[test]
     fn theme_stage_speaks_and_badges_the_theme_as_painted() {
         let theme = |value: &str, sample: bool| {
@@ -4530,7 +6252,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     fn automatic_window_samples_follow_the_os_not_the_terminal_palette() {
         // Deliberately pair a dark terminal palette with OS Light, then flip
         // only the host appearance. Auto must repaint both preview scenes.
@@ -4572,57 +6294,19 @@ mod tests {
         );
     }
 
-    /// The Themes stage frames each theme in its own side: under Auto its
-    /// window sample follows the candidate palette whatever the OS says, so
-    /// a light theme previewed on a dark desktop is not drawn under a dark
-    /// titlebar. A forced `window_theme` still wins.
-    #[test]
-    fn the_themes_stage_window_sample_takes_the_candidate_side() {
-        const PAPER: PreviewTerminalTheme = PreviewTerminalTheme {
-            fg: 0x33_3333,
-            bg: 0xFA_FAFA,
-            cursor: 0x35_84E4,
-            selection: 0xD0_D7DE,
-            ..NORD
-        };
-        let host = Theme::default();
-        for system_dark in [false, true] {
-            let stage = SettingsPreviewSpec::appearance(14.0)
-                .with_system_dark(system_dark)
-                .with_window_following_theme(true);
-            let light = stage.clone().with_terminal_theme(PAPER);
-            let dark = stage.clone().with_terminal_theme(NORD);
-            assert!(light.window_sample_is_light(host), "os dark {system_dark}");
-            assert!(!dark.window_sample_is_light(host), "os dark {system_dark}");
-            assert!(light.semantic_value().contains("currently Light"));
-            let forced = light.with_appearance(AppearancePreviewSpec {
-                window_theme: "dark".to_string(),
-                ..AppearancePreviewSpec::default()
-            });
-            assert!(!forced.window_sample_is_light(host));
-        }
-        // Negative control: off the stage, macOS and Windows Auto follow the
-        // OS, so a light palette on a dark desktop draws a dark sample.
-        let page = SettingsPreviewSpec::appearance(14.0)
-            .with_system_dark(true)
-            .with_terminal_theme(PAPER);
-        assert_eq!(page.window_sample_is_light(host), cfg!(target_os = "linux"));
-        let stage = page.clone().with_window_following_theme(true);
-        if !cfg!(target_os = "linux") {
-            assert_ne!(page.paint_fingerprint(), stage.paint_fingerprint());
-            assert!(differences(&pixels(page), &pixels_recomputed(stage)) > 40);
-        }
-    }
-
-    /// The Linux twin of the OS-following test above: winit's Wayland backend
-    /// never delivers `ThemeChanged`, so the shipping chrome resolves Auto from
-    /// the TERMINAL THEME's darkness (`chrome_theme_for_apprt` /
-    /// `chrome_palette_theme`) — and the window sample must tell that truth:
+    /// The Linux and Windows window sample follows the terminal theme: winit's
+    /// Wayland backend never delivers `ThemeChanged`, so the shipping chrome
+    /// resolves Auto from the TERMINAL THEME's darkness (`chrome_theme_for_apprt`
+    /// / `chrome_palette_theme`), and Windows' caption resolves Auto from the
+    /// terminal background (`platform_win::resolve_chrome_theme`, the dropdown's
+    /// "Match terminal (default)") — and the window sample must tell that truth:
     /// an OS appearance flip moves nothing, a terminal palette flip moves the
-    /// sample titlebar.
+    /// sample titlebar, and the spoken description names the terminal. Windows
+    /// used to draw its sample from the OS (a dark title bar over Default
+    /// Light on a dark desktop, the 2026-10-18 judges).
     #[test]
-    #[cfg(target_os = "linux")]
-    fn automatic_window_samples_follow_the_terminal_palette_on_linux() {
+    #[cfg(any(target_os = "linux", windows))]
+    fn automatic_window_samples_follow_the_terminal_palette_on_linux_and_windows() {
         // A light candidate palette, luminance-opposite to NORD.
         let paper = PreviewTerminalTheme {
             fg: 0x33_3333,
@@ -4644,6 +6328,20 @@ mod tests {
         );
         // Flip the TERMINAL palette: Auto follows it.
         let light_palette = dark_palette.clone().with_terminal_theme(paper);
+        // The sides, against the OS: a dark palette on a light desktop draws a
+        // dark sample, a light palette on a dark desktop a light one, and the
+        // description says so in the dropdown's words.
+        let host = Theme::default();
+        assert!(!dark_palette.window_sample_is_light(host));
+        let light_on_dark_os = light_palette.clone().with_system_dark(true);
+        assert!(light_on_dark_os.window_sample_is_light(host));
+        assert!(
+            light_on_dark_os
+                .semantic_value()
+                .contains("matches the terminal theme, currently Light"),
+            "{}",
+            light_on_dark_os.semantic_value()
+        );
         assert!(differences(&pixels(dark_palette.clone()), &pixels(light_palette)) > 40);
 
         // An explicit appearance remains independent of both feeds.
@@ -4663,6 +6361,185 @@ mod tests {
             explicit.paint_fingerprint(),
             explicit_flip.paint_fingerprint()
         );
+    }
+
+    /// The window sample's fill, rim and title line, as one Appearance paint
+    /// draws them.
+    fn window_sample_tones(spec: SettingsPreviewSpec) -> ([u8; 3], Option<[u8; 3]>, [u8; 3]) {
+        let mut prims = Vec::new();
+        spec.paint(
+            &mut prims,
+            LogicalRect::new(0.0, 0.0, 360.0, 156.0),
+            Theme::default(),
+            Roles::from_theme(Theme::default()),
+        );
+        let rgb = |c: [u8; 4]| [c[0], c[1], c[2]];
+        let bar = |h: f32| (h - APPEARANCE_WINDOW_SAMPLE_HEIGHT).abs() < 0.01;
+        let fill = prims.iter().find_map(|p| match p {
+            DrawPrim::Panel {
+                h, radius, fill, ..
+            } if *radius == 0.0 && bar(*h) => Some(rgb(*fill)),
+            _ => None,
+        });
+        let rim = prims.iter().find_map(|p| match p {
+            DrawPrim::Stroke {
+                h, width, color, ..
+            } if bar(*h) && (*width - 1.0).abs() < 0.01 => Some(rgb(*color)),
+            _ => None,
+        });
+        let line = prims.iter().find_map(|p| match p {
+            DrawPrim::Line { width, color, .. } if (*width - 2.0).abs() < 0.01 => Some(rgb(*color)),
+            _ => None,
+        });
+        (
+            fill.expect("the sample's bar"),
+            rim,
+            line.expect("the sample's title line"),
+        )
+    }
+
+    /// THE THEMES DEMO'S SELECTED TAB IS THE STRIP'S SHAPE: in every built-in
+    /// theme, the Windows demo's selected tab wears the seam's outline exactly
+    /// where the strip's selected tab does (`tab_bar::windows_tab_wears_rim`):
+    /// on every light band (Default Light's terminal tab, 1.20:1 on its band,
+    /// included), and on a dark band only where its fill would fade into it, so
+    /// Default's has none. NEGATIVE CONTROL: the demo's own copy of the old
+    /// dark-only rule (within 1.15:1 of the band) left Default Light's demo tab
+    /// bare while its real tab was outlined (c552052a9c).
+    #[test]
+    fn the_demo_selected_tab_wears_the_strips_outline() {
+        let rect = LogicalRect::new(0.0, 0.0, 520.0, 300.0);
+        let layout = DemoStripLayout::of(rect, DemoFrame::Windows);
+        let rimmed = |name: &str| {
+            let candidate = PreviewTerminalTheme::from_scheme(
+                &aterm_types::scheme::builtin(name).expect("a built-in theme"),
+            );
+            let strip = crate::tab_bar::strip_sample(crate::chrome_band::ChromePalette {
+                theme: candidate.into_theme(),
+                ansi: Some(demo_ansi_hues(&candidate)),
+                authored: aterm_messages::tokens::AuthoredChrome::NONE,
+            });
+            let mut prims = Vec::new();
+            paint_demo_windows_strip(
+                &mut prims,
+                rect,
+                &layout,
+                &strip,
+                crate::settings::u32_rgb(candidate.bg),
+                crate::settings::u32_rgb(candidate.fg),
+                TypeStep::Caption.px(13.75),
+            );
+            let rim = prims.iter().any(|prim| {
+                matches!(prim, DrawPrim::Stroke { width, color, radius, .. }
+                    if *width == 1.0
+                        && *radius == DEMO_TAB_RADIUS - 0.5
+                        && color[..3] == strip.seam)
+            });
+            (rim, strip)
+        };
+        let (light, strip) = rimmed("Default Light");
+        assert!(light, "Default Light's tab is outlined: {strip:?}");
+        assert!(aterm_messages::ink::contrast(strip.active, strip.band) >= 1.15);
+        assert!(!rimmed("Default").0, "Default's tab stands off its band");
+        for name in aterm_types::scheme::builtin_names() {
+            let (rim, strip) = rimmed(name);
+            assert_eq!(
+                rim,
+                crate::tab_bar::windows_tab_wears_rim(strip.active, strip.band),
+                "{name}"
+            );
+            if crate::tab_bar::bg_is_light(strip.band) {
+                assert!(rim, "{name}: every light band's selected tab is outlined");
+            }
+        }
+    }
+
+    /// On Windows, under Auto, the window sample wears what the real caption
+    /// wears: the candidate's tab-band tone (`platform_win::caption_tint` over
+    /// `App::caption_surface_tone`, whose strip shows by default), the chrome
+    /// the theme authors included, not a `#20222A` or `#F1F2F5` of the
+    /// preview's own. Where that tone sits within 1.3:1 of the page, the
+    /// band's seam rims it: Default Light's band is 1.2:1 off its page, its
+    /// rim 1.5:1 or more off band and page, where the old stock `#F1F2F5` was
+    /// 1.04:1 and only its glyphs showed (the 2026-10-18 judges); Default's
+    /// band stands off its page alone. A forced Light or Dark keeps the stock
+    /// caption, rimmed the same way. Elsewhere the stock fill and no rim. The
+    /// title line clears 4.5:1 on every fill. Negative control: the stock
+    /// light fill on Default Light's page.
+    #[test]
+    fn the_window_sample_wears_the_caption_tone_with_a_rim_on_windows() {
+        let theme = |name: &str| {
+            PreviewTerminalTheme::from_scheme(
+                &aterm_types::scheme::builtin(name).expect("a built-in theme"),
+            )
+        };
+        let contrast = aterm_messages::ink::contrast;
+        let (light, dark) = (theme("Default Light"), theme("Default"));
+        let band = |candidate: PreviewTerminalTheme| {
+            crate::tab_bar::strip_sample(crate::chrome_band::ChromePalette {
+                theme: candidate.into_theme(),
+                ansi: Some(demo_ansi_hues(&candidate)),
+                authored: aterm_messages::tokens::AuthoredChrome::NONE,
+            })
+        };
+        let page = |candidate: PreviewTerminalTheme| crate::settings::u32_rgb(candidate.bg);
+        let stock_light = [0xF1, 0xF2, 0xF5];
+        assert!(
+            contrast(stock_light, page(light)) < 1.1,
+            "control: the stock fill vanishes"
+        );
+        for (candidate, rimmed) in [(light, true), (dark, false)] {
+            let spec = SettingsPreviewSpec::appearance(14.0).with_terminal_theme(candidate);
+            let (fill, rim, line) = window_sample_tones(spec);
+            assert!(contrast(line, fill) >= 4.5, "{line:?} on {fill:?}");
+            let strip = band(candidate);
+            if cfg!(windows) {
+                assert_eq!(fill, strip.band);
+                assert_eq!(rim, rimmed.then_some(strip.seam));
+                assert!(contrast(fill, page(candidate)) > 1.1, "{fill:?}");
+            } else {
+                assert_eq!(rim, None);
+                assert_ne!(fill, strip.band);
+            }
+            if let Some(rim) = rim {
+                assert!(contrast(rim, fill) >= 1.5, "{rim:?} on {fill:?}");
+                assert!(contrast(rim, page(candidate)) >= 1.5, "{rim:?}");
+            }
+        }
+        if cfg!(windows) {
+            // The chrome the theme authors reaches the sample, and its key.
+            let plain = SettingsPreviewSpec::appearance(14.0).with_terminal_theme(light);
+            let red = [0xFF, 0x00, 0x00];
+            let authored =
+                plain
+                    .clone()
+                    .with_authored_chrome(aterm_messages::tokens::AuthoredChrome {
+                        border: Some(red),
+                        ..aterm_messages::tokens::AuthoredChrome::NONE
+                    });
+            assert_eq!(window_sample_tones(authored.clone()).1, Some(red));
+            assert_ne!(plain.paint_fingerprint(), authored.paint_fingerprint());
+        }
+        // A forced side keeps the stock caption, rimmed on Windows where it
+        // sits on its own side's page.
+        for (candidate, forced, stock) in [
+            (light, "light", stock_light),
+            (dark, "dark", [0x20, 0x22, 0x2A]),
+        ] {
+            let spec = SettingsPreviewSpec::appearance(14.0)
+                .with_terminal_theme(candidate)
+                .with_appearance(AppearancePreviewSpec {
+                    window_theme: forced.to_string(),
+                    ..AppearancePreviewSpec::default()
+                });
+            let (fill, rim, line) = window_sample_tones(spec);
+            assert_eq!(fill, stock);
+            assert!(contrast(line, fill) >= 4.5);
+            assert_eq!(rim.is_some(), cfg!(windows), "{forced}");
+            if let Some(rim) = rim {
+                assert!(contrast(rim, fill) >= 1.5, "{rim:?} on {fill:?}");
+            }
+        }
     }
 
     #[test]
@@ -5035,18 +6912,6 @@ mod tests {
             .with_focus(crate::prefs::EDIT_CURSOR_BREAK_LIGATURES, "true");
         let (input, _) = build_terminal_specimen_input(&breaking.normalized(), Theme::default());
         assert_eq!(input.cursor_col, 1);
-
-        let mixed = "A你🚀B";
-        assert_eq!(terminal_prefix(mixed, 0), "");
-        assert_eq!(terminal_prefix(mixed, 2), "A");
-        assert_eq!(terminal_prefix(mixed, 3), "A你");
-        assert_eq!(terminal_prefix(mixed, 5), "A你🚀");
-
-        let zwj = "A🐈‍⬛B";
-        assert_eq!(terminal_prefix(zwj, 2), "A");
-        assert_eq!(terminal_prefix(zwj, 3), "A🐈‍⬛");
-        assert_eq!(grapheme_at_terminal_column("CJK: 你好", 5), Some("你"));
-        assert_eq!(grapheme_at_terminal_column("CJK: 你好", 6), Some("你"));
     }
 
     #[test]
@@ -5399,7 +7264,8 @@ mod tests {
                 let body = |rows: Option<usize>| {
                     let (base, _) =
                         build_terminal_specimen_input_rows(&spec, Theme::default(), rows);
-                    let input = CursorScene::new(&spec, Theme::default()).decorate(&base, cell);
+                    let input =
+                        CursorScene::new(&spec, Theme::default(), rows).decorate(&base, cell);
                     let sprite = input
                         .free_sprites
                         .iter()
@@ -5410,7 +7276,7 @@ mod tests {
                 };
                 let at = format!("{raw} at {phase} ms");
                 let (rows, short) = body(Some(1));
-                assert_eq!(rows, 1, "{at}");
+                assert_eq!(rows, 2, "{at}: the prompt row and the blank row below it");
                 assert!(
                     short.y >= 0 && short.y + i32::from(short.h) <= 17,
                     "{at}: whole in one row: y {} h {}",
@@ -5437,11 +7303,465 @@ mod tests {
         }
     }
 
+    /// The effect streams a played frame carries, for comparing two frames.
+    fn scene_streams(input: &RenderInput) -> String {
+        format!(
+            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
+            input.cursor_glow_add,
+            input.glow_under,
+            input.glow_halo,
+            input.fire_patch,
+            input.char_fg,
+            input.fire_halo,
+            input.cursor_trail,
+            input.cursor_fill_override,
+            input.free_sprites,
+        )
+    }
+
+    /// THE SCENE'S ENGINES CARRY ON ACROSS FRAMES, and a frame is the same
+    /// however the frames arrive: a frame played after an earlier one of the
+    /// same cycle (the held engines step on) equals the frame played alone (a
+    /// fresh replay), for a style with heat, a ribbon and a companion.
+    #[test]
+    fn a_scene_frame_is_the_same_however_the_frames_arrive() {
+        for raw in ["fire", "rainbow kitty pet", "rainbow kitty flying", "comet"] {
+            let at = |phase: u64| {
+                played(
+                    &SettingsPreviewSpec::cursor(rainbow_cursor(raw)).with_phase(phase),
+                    Theme::default(),
+                )
+            };
+            let alone = scene_streams(&at(2_340));
+            // A different scene in between makes the next one replay.
+            let _ = played(
+                &SettingsPreviewSpec::cursor(rainbow_cursor("water")).with_phase(100),
+                Theme::default(),
+            );
+            let _ = at(900);
+            let _ = at(1_716);
+            assert_eq!(scene_streams(&at(2_340)), alone, "{raw}");
+        }
+    }
+
+    /// THE SCENE OPENS WARM: its engines have typed the line before (the
+    /// earlier cycles), so Fire's forge metal and flames at the shown cycle
+    /// are a sustained blaze's, not a cold start's. NEGATIVE CONTROL: the
+    /// same engines stepped from cold through the first cycle only (the old
+    /// replay) stay under the warm scene's heat at every step.
+    #[test]
+    fn the_fire_preview_shows_the_sustained_blaze() {
+        let spec = SettingsPreviewSpec::cursor(CursorPreviewSpec {
+            blink: false,
+            trail_style: PreviewTrailStyle::Fire,
+            trail_style_raw: Arc::from("fire"),
+            ..CursorPreviewSpec::default()
+        });
+        let heat = |input: &RenderInput| {
+            input
+                .fire_patch
+                .iter()
+                .map(|patch| (patch.temp, patch.peak_h))
+                .max()
+                .unwrap_or((0, 0))
+        };
+        let warm: Vec<(u8, u16)> = (0..CURSOR_SCENE_CYCLE_MS)
+            .step_by(KEY_MS as usize)
+            .map(|phase| heat(&played(&spec.clone().with_phase(phase), Theme::default())))
+            .collect();
+        // The cold first cycle, stepped by hand on fresh engines.
+        let spec = spec.normalized();
+        let (base, _) = build_terminal_specimen_input(&spec, Theme::default());
+        let scene = CursorScene::new(&spec, Theme::default(), None);
+        let row = prompt_row(&base);
+        let geom = Geom {
+            cw: 8,
+            ch: 17,
+            rows: base.rows,
+            cols: base.cols,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: (base.cols * 8) as u16,
+            win_h: (base.rows * 17) as u16,
+            head: 0,
+        };
+        let stage = SceneStage {
+            base: &base,
+            scrolled: &base,
+            row,
+            line: TypedLine::of(&base.cells[row]),
+            geom,
+            cursor_style: base.cursor_style,
+        };
+        let mut player = ScenePlayer::new(0, spec.post_fx.companion_look);
+        let mut cold = Vec::new();
+        for at in (0..CURSOR_SCENE_CYCLE_MS).step_by(MOTION_STEP_MS as usize) {
+            scene.step(&mut player, &stage, at, true);
+            if at.is_multiple_of(KEY_MS) {
+                cold.push(
+                    player
+                        .step
+                        .fire_patch
+                        .iter()
+                        .map(|patch| (patch.temp, patch.peak_h))
+                        .max()
+                        .unwrap_or((0, 0)),
+                );
+            }
+        }
+        let warmest = warm.iter().map(|(temp, _)| *temp).max().unwrap_or(0);
+        let coldest_peak = cold.iter().map(|(temp, _)| *temp).max().unwrap_or(0);
+        assert!(warmest >= 120, "the blaze reaches orange metal: {warm:?}");
+        assert!(
+            warmest > coldest_peak + 10,
+            "warmer than a cold start ever gets: {warm:?} against {cold:?}"
+        );
+        // Through the typed line (before the hold), the warm scene's flames
+        // stand above the row at least as tall as the cold one's at the
+        // same key, and taller somewhere.
+        let keys = CURSOR_SCENE_KEYS as usize;
+        assert!(
+            (1..keys).all(|key| warm[key].0 + 8 >= cold[key].0),
+            "{warm:?} against {cold:?}"
+        );
+        assert!(
+            warm[1..keys]
+                .iter()
+                .zip(&cold[1..keys])
+                .any(|(w, c)| w.1 > c.1)
+        );
+    }
+
+    /// THE KNOBS THAT ACT ON A JUMP SHOW IN THE PREVIEW: the scene's Tab lands
+    /// a completion at once, licensed as a real Tab is, so for every style
+    /// whose engine reads Ring on jumps or Trail length (the knob law, on a
+    /// dark ground with the ring on) two values of the knob paint differently
+    /// after the Tab, as does Phaser's accent, which colours only its ring.
+    /// NEGATIVE CONTROL: between the Return's landing and the Tab, typing
+    /// alone, the same values paint alike.
+    #[test]
+    fn the_jump_knobs_show_after_the_scenes_tab() {
+        use aterm_effects::cursor_glow::{KnobContext, TrailKnob};
+
+        let tab_ms = (CURSOR_SCENE_TAB.0 as u64 + 1) * KEY_MS;
+        let after: Vec<u64> = (0..6).map(|step| tab_ms + step * MOTION_STEP_MS).collect();
+        // Typing alone: past the Return's own landing at the cycle's start.
+        let before: Vec<u64> = (5..=CURSOR_SCENE_TAB.0 as u64)
+            .map(|key| key * KEY_MS)
+            .collect();
+        let frames = |cursor: CursorPreviewSpec, phases: &[u64]| -> Vec<String> {
+            phases
+                .iter()
+                .map(|&phase| {
+                    scene_streams(&played(
+                        &SettingsPreviewSpec::cursor(cursor.clone()).with_phase(phase),
+                        Theme::default(),
+                    ))
+                })
+                .collect()
+        };
+        let ctx = KnobContext {
+            dark: true,
+            bar: false,
+            ring: true,
+            classic_tinted: false,
+        };
+        for &raw in crate::prefs::CURSOR_TRAIL_STYLES {
+            let style = PreviewTrailStyle::parse(raw);
+            let Some(glow) = crate::app_config::resolve_trail_style(raw).style else {
+                continue;
+            };
+            let base = CursorPreviewSpec {
+                blink: false,
+                trail_style: style,
+                trail_style_raw: Arc::from(raw),
+                ..CursorPreviewSpec::default()
+            };
+            let mut knobs: Vec<(&str, CursorPreviewSpec, CursorPreviewSpec)> = Vec::new();
+            if glow.reads_knob(TrailKnob::Ring, ctx) {
+                knobs.push((
+                    "ring",
+                    CursorPreviewSpec {
+                        ring: true,
+                        ..base.clone()
+                    },
+                    CursorPreviewSpec {
+                        ring: false,
+                        ..base.clone()
+                    },
+                ));
+            }
+            if glow.reads_knob(TrailKnob::Length, ctx) {
+                knobs.push((
+                    "length",
+                    CursorPreviewSpec {
+                        length: 2,
+                        ..base.clone()
+                    },
+                    CursorPreviewSpec {
+                        length: 24,
+                        ..base.clone()
+                    },
+                ));
+            }
+            if glow == GlowStyle::Phaser {
+                knobs.push((
+                    "accent",
+                    CursorPreviewSpec {
+                        accent: Some(0x00FF_0000),
+                        ..base.clone()
+                    },
+                    CursorPreviewSpec {
+                        accent: Some(0x0000_FFFF),
+                        ..base.clone()
+                    },
+                ));
+            }
+            for (knob, a, b) in knobs {
+                assert_ne!(
+                    frames(a.clone(), &after),
+                    frames(b.clone(), &after),
+                    "{raw}: {knob} shows after the Tab"
+                );
+                assert_eq!(
+                    frames(a, &before),
+                    frames(b, &before),
+                    "{raw}: {knob} is invisible while only typing"
+                );
+            }
+        }
+    }
+
+    /// THE SCENE'S RETURN SCROLLS, as a terminal at its foot does: right after
+    /// it the line just typed shows one row up, and the light that was its
+    /// went up with it. The default's ribbon leaves nothing hanging under the
+    /// fresh prompt past the caret (no last line's ribbon lying where the line
+    /// was); Comet's Return is the terminal's move from the line's end one row
+    /// up to the fresh prompt, never a sweep back along the prompt's own row.
+    /// NEGATIVE CONTROL: the step before the Return carries that light out to
+    /// the typed line's end, on the prompt row and under it.
+    #[test]
+    fn the_scenes_return_scrolls_the_line_up_with_its_light() {
+        // The fixture's cell width (`played`).
+        let cw = 8_i32;
+        let reach = |input: &RenderInput, row: usize| -> i32 {
+            let quads = input
+                .cursor_glow_add
+                .iter()
+                .chain(&input.glow_under)
+                .filter(|quad| usize::from(quad.row) == row && quad.w > 0 && quad.h > 0)
+                .map(|quad| i32::from(quad.x) + i32::from(quad.w));
+            let halos = input
+                .glow_halo
+                .iter()
+                .filter(|halo| usize::from(halo.row) == row && halo.w > 0)
+                .map(|halo| i32::from(halo.x) + i32::from(halo.w));
+            let trail = input
+                .cursor_trail
+                .iter()
+                .filter(|cell| cell.row == row && cell.alpha > 0)
+                .map(|cell| (cell.col as i32 + 1) * cw);
+            quads.chain(halos).chain(trail).max().unwrap_or(0)
+        };
+        let text = |cells: &[aterm_core::terminal::RenderCell]| -> String {
+            cells.iter().map(|cell| cell.ch).collect()
+        };
+        for raw in ["rainbow kitty pet", "comet"] {
+            let cursor = CursorPreviewSpec {
+                blink: false,
+                trail_style: PreviewTrailStyle::parse(raw),
+                trail_style_raw: Arc::from(raw),
+                ..CursorPreviewSpec::default()
+            };
+            let at = |phase: u64| {
+                played(
+                    &SettingsPreviewSpec::cursor(cursor.clone()).with_phase(phase),
+                    Theme::default(),
+                )
+            };
+            let (before, after) = (
+                at(CURSOR_SCENE_CYCLE_MS - MOTION_STEP_MS),
+                at(MOTION_STEP_MS),
+            );
+            let row = after.cursor_row;
+            assert!(row > 0 && before.cursor_row == row, "{raw}: one prompt row");
+            assert!(
+                text(&after.cells[row - 1]).contains(CURSOR_SCENE_COMMAND),
+                "{raw}: the line just typed is one row up: {:?}",
+                text(&after.cells[row - 1])
+            );
+            // Out to the typed line's end, give or take the head's cell.
+            let line_end = before.cursor_col as i32 * cw - 2 * cw;
+            let caret_x = after.cursor_col as i32 * cw;
+            assert!(
+                reach(&before, row) >= line_end && reach(&before, row + 1) >= line_end,
+                "{raw}, control: the light reaches the typed line's end before the Return"
+            );
+            if raw == "comet" {
+                assert!(
+                    reach(&after, row - 1) >= line_end,
+                    "comet: the Return's streak leaves the line's end, one row up: {} px",
+                    reach(&after, row - 1)
+                );
+                assert!(
+                    reach(&after, row) < line_end,
+                    "comet: no sweep back along the prompt's row: {} px",
+                    reach(&after, row)
+                );
+            } else {
+                assert!(
+                    reach(&after, row + 1) <= caret_x + 4 * cw,
+                    "{raw}: under the fresh prompt light reaches {} px, the caret at {caret_x}",
+                    reach(&after, row + 1)
+                );
+            }
+        }
+    }
+
+    /// THE PREVIEW BLOOMS AS THE TERMINAL DOES: a Water scene on the shipped
+    /// two-row card, rasterized as the card draws it, gains the live bloom
+    /// kernel's light around the caret, and some of it below the prompt row
+    /// (the grid's blank row there, which the card shows in its band).
+    /// NEGATIVE CONTROL: with Bloom off (and no SDR crown) the frame is the
+    /// bare render.
+    #[test]
+    fn the_preview_blooms_with_the_live_kernel_below_the_prompt_too() {
+        let _ = compiled(SettingsPreviewSpec::default());
+        let prepared = crate::tray_raster::prepared_semantic_font_for_direct_view_test(
+            &SemanticFontCandidate::default(),
+        );
+        let theme = PreviewTerminalTheme::from_scheme(&aterm_types::ColorScheme::default());
+        let render = |bloom: bool| {
+            let mut spec = SettingsPreviewSpec::cursor(CursorPreviewSpec {
+                blink: false,
+                trail_style: PreviewTrailStyle::Water,
+                trail_style_raw: Arc::from("water"),
+                ..CursorPreviewSpec::default()
+            })
+            .with_terminal_theme(theme)
+            .with_phase(2_340)
+            .with_prepared_font(prepared.clone());
+            spec.post_fx.bloom = bloom;
+            spec.post_fx.bloom_strength = aterm_render::bloom::BLOOM_STRENGTH;
+            spec.post_fx.sdr_boost = 0.0;
+            let spec = spec.normalized();
+            let specimen = spec.terminal_specimen(theme.into_theme(), Some(2));
+            let cell = crate::tray_raster::specimen_cell_size_for_test(&specimen, 1.0)
+                .expect("the fixture renderer forks");
+            let pixels = crate::tray_raster::rasterize_tray(
+                &[DrawPrim::TerminalSpecimen {
+                    x: 0.0,
+                    y: 0.0,
+                    spec: Box::new(specimen),
+                }],
+                400,
+                80,
+                1.0,
+                [0, 0, 0, 255],
+            )
+            .0;
+            (pixels, cell)
+        };
+        let ((lit, (_, cell_h)), (bare, _)) = (render(true), render(false));
+        assert_ne!(lit, bare, "the bloom adds light");
+        // Rows 0-1 are text, row 2 the blank row below the prompt.
+        let gain_below: u32 = lit
+            .chunks(400 * 4)
+            .zip(bare.chunks(400 * 4))
+            .skip(2 * cell_h)
+            .take(cell_h)
+            .flat_map(|(l, b)| l.iter().zip(b))
+            .map(|(l, b)| u32::from(l.saturating_sub(*b)))
+            .sum();
+        assert!(gain_below > 0, "light below the prompt row");
+        let (off_a, _) = render(false);
+        assert_eq!(off_a, bare);
+    }
+
+    /// THE WATER ROW'S WAKE IS IN ITS PREVIEW: while the scene types, Water
+    /// lays its wake at least three cells behind the drop on the prompt row
+    /// (the row promises "a blue wake behind it"), on a dark and a light
+    /// ground. Measured mid-line, between keys, past the Tab.
+    #[test]
+    fn the_water_preview_draws_its_wake_behind_the_drop() {
+        let light = PreviewTerminalTheme::from_scheme(
+            &aterm_types::scheme::builtin("GitHub Light").expect("built-in light theme"),
+        );
+        for (name, theme) in [
+            ("Default", Theme::default()),
+            ("GitHub Light", light.into_theme()),
+        ] {
+            let reach = [2_652_u64, 2_756, 2_964, 3_172]
+                .into_iter()
+                .map(|phase| {
+                    let input = played(
+                        &SettingsPreviewSpec::cursor(CursorPreviewSpec {
+                            blink: false,
+                            trail_style: PreviewTrailStyle::Water,
+                            trail_style_raw: Arc::from("water"),
+                            ..CursorPreviewSpec::default()
+                        })
+                        .with_phase(phase),
+                        theme,
+                    );
+                    let row = input.cursor_row as u16;
+                    let caret_x = input.cursor_col as i32 * 8;
+                    input
+                        .glow_under
+                        .iter()
+                        .chain(&input.cursor_glow_add)
+                        .filter(|quad| quad.row == row)
+                        .filter(|quad| {
+                            let c = quad.color;
+                            ((c >> 16) & 0xff).max((c >> 8) & 0xff).max(c & 0xff) >= 24
+                                || quad.alpha >= 24
+                        })
+                        .map(|quad| caret_x - i32::from(quad.x))
+                        .max()
+                        .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0);
+            assert!(
+                reach >= 3 * 8,
+                "{name}: the wake reaches {reach} px behind the drop"
+            );
+        }
+    }
+
+    /// A TRAIL LENGTH THE SCENE CANNOT SHOW SAYS SO: the scene's Tab is a
+    /// six-cell jump, and Trail length only cuts a jump longer than itself,
+    /// so a focused length of six or more reads "Covers this 6-cell jump"
+    /// (not live) instead of "Live trail", in the full and the compact
+    /// header. NEGATIVE CONTROL: a length the jump does cut reads live.
+    #[test]
+    fn a_trail_length_the_scenes_jump_cannot_show_says_so() {
+        let focused = |length: usize| {
+            SettingsPreviewSpec::cursor(CursorPreviewSpec {
+                trail_style: PreviewTrailStyle::Comet,
+                trail_style_raw: Arc::from("comet"),
+                length,
+                ..CursorPreviewSpec::default()
+            })
+            .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_LENGTH, length.to_string())
+            .with_phase(900)
+            .normalized()
+        };
+        let long = focused(24);
+        assert_eq!(long.live_state(), "Covers this 6-cell jump");
+        assert_eq!(long.compact_state_badge(), "Covers this 6-cell jump");
+        assert!(!long.reads_live());
+        let cut = focused(3);
+        assert!(cut.reads_live(), "{}", cut.live_state());
+        assert!(!cut.live_state().contains("jump"));
+    }
+
     /// THE FLYING KITTY IS EARNED, in the preview as in the terminal: the
-    /// scripted typing shows the ribbon alone for its first keys and the
-    /// kitty flying in partway through, never a kitty there from the first
-    /// key. The sprite control's diagnostic kitty still shows at once, and a
-    /// walking pet is there from the start.
+    /// real cursor cat earns it from the scene's typing (a line, the Return,
+    /// and the next line, where it flies in), so the shown cycle opens with
+    /// the ribbon alone and the kitty arrives partway through. The sprite
+    /// control's diagnostic kitty still shows at once, and a walking pet is
+    /// there from the start.
     #[test]
     fn the_flying_kitty_arrives_partway_through_the_typing() {
         let at = |raw: &'static str, phase: u64| {
@@ -5472,6 +7792,64 @@ mod tests {
         assert!(
             !diagnostic.free_sprites.is_empty(),
             "the sprite control previews its kitty at once"
+        );
+    }
+
+    /// ONE OF HDR GLOW AND SDR GLOW BOOST LIFTS THE GLOW, as on the GPU: on a
+    /// screen that shows EDR, HDR glow on or off changes the crown and SDR
+    /// glow boost does not; on one that does not, the reverse. (The preview
+    /// drew the SDR crown everywhere, so SDR glow boost changed it on a screen
+    /// where the window ignores it and HDR glow never did.)
+    #[test]
+    fn the_glow_is_lifted_by_hdr_glow_or_sdr_glow_boost_never_both() {
+        let halo = |display_edr: bool, hdr_glow: bool, sdr_boost: f32| {
+            let spec = SettingsPreviewSpec::cursor(CursorPreviewSpec {
+                blink: false,
+                trail_style: PreviewTrailStyle::Phaser,
+                ..CursorPreviewSpec::default()
+            })
+            .with_post_fx(CursorPostFxSpec {
+                display_edr,
+                hdr_glow,
+                sdr_boost,
+                ..CursorPostFxSpec::default()
+            })
+            .normalized();
+            let theme = Theme::default();
+            let (base, _) = build_terminal_specimen_input(&spec, theme);
+            let scene = CursorScene::new(&spec, theme, None);
+            let input = scene.decorate(&base, (8, 17));
+            let mut frame = aterm_render::Frame {
+                width: 8 * input.cols,
+                height: 17 * input.rows,
+                pixels: vec![theme.bg; 8 * input.cols * 17 * input.rows],
+            };
+            scene.post_process(&mut frame, &input).unwrap();
+            frame.pixels
+        };
+        assert!(
+            halo(true, true, 0.25) != halo(false, false, 0.0),
+            "premise: a crown to compare"
+        );
+        assert_ne!(
+            halo(true, true, 0.25),
+            halo(true, false, 0.25),
+            "EDR: HDR glow"
+        );
+        assert_eq!(
+            halo(true, true, 0.1),
+            halo(true, true, 0.9),
+            "EDR: not SDR boost"
+        );
+        assert_eq!(
+            halo(false, true, 0.5),
+            halo(false, false, 0.5),
+            "SDR: not HDR glow"
+        );
+        assert_ne!(
+            halo(false, true, 0.1),
+            halo(false, true, 0.9),
+            "SDR: SDR boost"
         );
     }
 
@@ -5562,6 +7940,8 @@ mod tests {
         assert!(has_effect_light(&played(&spec, Theme::default())));
     }
 
+    /// A malformed or missing pack is no trail, never Lumen or another
+    /// built-in: with the typing glow off it holds still and draws no light.
     #[test]
     fn unresolved_font_candidate_is_acknowledged_inside_the_specimen() {
         let family = "No Such Font Family 7F31";
@@ -5758,57 +8138,6 @@ mod tests {
         assert!(row_h * TYPOGRAPHY_SPECIMEN_ROWS as f32 > old_terminal_h - 24.0);
     }
 
-    /// A display face's capitals rise past its cell; the specimen reserves
-    /// the band above its first row the frame draws them into, so the box
-    /// never cuts their tops off, and still shows whole rows under it.
-    #[test]
-    fn a_display_face_specimen_keeps_room_for_its_capitals() {
-        let family = "display:chunky";
-        let candidate = SemanticFontCandidate {
-            regular: Some(family.to_string()),
-            ..SemanticFontCandidate::default()
-        };
-        let prepared = crate::tray_raster::prepared_semantic_font_from_bytes_for_test(
-            &candidate,
-            aterm_render::display_face_bytes("chunky").unwrap(),
-        );
-        let spec = SettingsPreviewSpec::typography(12.0)
-            .with_font_candidate(candidate)
-            .with_focus(crate::prefs::EDIT_FONT_FAMILY, family)
-            .with_prepared_font(prepared);
-        let head = spec.normalized().specimen_headroom();
-        assert!(head > 0.0, "Luckiest Guy's capitals rise past its cell");
-        let row = spec.normalized().typography_row_height();
-        let theme = Theme::default();
-        for rows in 1..=TYPOGRAPHY_SPECIMEN_ROWS {
-            let height = spec.typography_height(rows);
-            let mut prims = Vec::new();
-            spec.paint(
-                &mut prims,
-                LogicalRect::new(0.0, 0.0, 600.0, height),
-                theme,
-                Roles::from_theme(theme),
-            );
-            let specimen = prims
-                .iter()
-                .find_map(|prim| match prim {
-                    DrawPrim::TerminalSpecimen { spec, .. } => Some(spec),
-                    _ => None,
-                })
-                .expect("a whole row fits");
-            assert!(specimen.input.rows >= rows, "{rows} rows at {height}pt");
-            let body = height - preview_header_height(&spec.normalized()) - 15.0;
-            assert!(head + specimen.input.rows as f32 * row <= body + 0.01);
-        }
-        // An ordinary font reserves nothing.
-        let plain = SettingsPreviewSpec::typography(12.0).with_prepared_font(
-            crate::tray_raster::prepared_semantic_font_for_direct_view_test(
-                &SemanticFontCandidate::default(),
-            ),
-        );
-        assert_eq!(plain.normalized().specimen_headroom(), 0.0);
-    }
-
     /// A text preview squeezed under one whole row paints its header alone:
     /// no dark strip, and no status pill sliced through its label.
     #[test]
@@ -5955,9 +8284,9 @@ mod tests {
             PreviewAnimation::BlinkEdge { after_ms: 530 }
         );
         assert_eq!(
-            blink(2_200).animation(),
+            blink(CURSOR_SCENE_CYCLE_MS - 200).animation(),
             PreviewAnimation::BlinkEdge { after_ms: 730 },
-            "the 2,400 ms phase reset is not a visual blink edge"
+            "the cycle's phase reset is not a visual blink edge"
         );
 
         assert_eq!(
@@ -6043,45 +8372,187 @@ mod tests {
         assert!(!off(false).semantic_value().contains("glowing"));
     }
 
-    /// On a light terminal the typing glow has no halo (light cannot show
-    /// on paper): Off's preview never says it glows there. A block caret's
-    /// fill still warms, so it says that; a bar shows nothing, so it says
-    /// no more than the typing.
+    /// The typing glow is light on a dark terminal and warm ink under the
+    /// letters on a light one (`aterm_effects::cursor_momentum`), round a
+    /// block or a bar alike: Off's preview says it glows on both, and the
+    /// played frame carries the glow's ink on paper. Negative control: with
+    /// the glow off, nothing is inked and nothing glows.
     #[test]
-    fn the_off_preview_promises_no_glow_on_a_light_terminal() {
-        let off = |style: PreviewCursorStyle, bg: u32| {
+    fn the_off_preview_glows_on_every_terminal() {
+        let off = |style: PreviewCursorStyle, bg: u32, glow: bool| {
             let mut spec = SettingsPreviewSpec::cursor(CursorPreviewSpec {
                 style,
                 blink: false,
                 trail_enabled: true,
                 trail_style: PreviewTrailStyle::Off,
                 trail_style_raw: Arc::from("off"),
-                momentum_glow: true,
+                momentum_glow: glow,
                 ..CursorPreviewSpec::default()
             });
             spec.terminal_theme = Some(PreviewTerminalTheme::new(
-                0x0080_8080,
+                0x001F_2328,
                 bg,
                 0x0009_69DA,
                 0x0080_8080,
                 [0; 16],
             ));
-            spec
+            spec.with_phase(1_500)
         };
-        let dark = off(PreviewCursorStyle::Block, 0x0011_1111);
+        let dark = off(PreviewCursorStyle::Block, 0x0011_1111, true);
         assert_eq!(dark.state_badge(), "Live typing glow");
         assert!(dark.semantic_value().contains("glowing as you type"));
-        let block = off(PreviewCursorStyle::Block, 0x00FF_FFFF);
-        assert_eq!(block.animation(), PreviewAnimation::Continuous);
-        assert_eq!(block.state_badge(), "Live typing tint");
-        assert!(
-            block
-                .semantic_value()
-                .contains("no trail, tinting as you type")
+        for style in [PreviewCursorStyle::Block, PreviewCursorStyle::Bar] {
+            let light = off(style, 0x00FF_FFFF, true);
+            assert_eq!(light.animation(), PreviewAnimation::Continuous);
+            assert_eq!(light.state_badge(), "Live typing glow", "{style:?}");
+            assert!(light.semantic_value().contains("glowing as you type"));
+            let paper = light.terminal_theme.expect("a light terminal").into_theme();
+            let input = played(&light, paper);
+            assert!(
+                input.glow_under.iter().any(|q| q.alpha > 0),
+                "{style:?}: the glow inks the paper"
+            );
+            let unlit = played(&off(style, 0x00FF_FFFF, false), paper);
+            assert!(unlit.glow_under.is_empty(), "{style:?}: no glow, no ink");
+        }
+    }
+
+    /// The rows `source` leaves on a terminal wide enough that none wraps.
+    fn sample_rows(source: &str) -> Vec<String> {
+        let mut term = aterm_core::terminal::Terminal::new(24, 80);
+        term.process(source.as_bytes());
+        term.cell_frame(24, 80)
+            .cells
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The colour and cursor samples speak the platform's shell: on Windows
+    /// pwsh's `PS C:\…>` prompts, where they read `$ git status --short` and
+    /// `~/demo $ cat notes.md` under a Windows window (the 2026-10-18 Fluent
+    /// judge's `J4F-7-settings-samples-unix-and-light-badges`). Every row fits
+    /// the specimen's columns, and the cursor scene types its command after
+    /// either prompt. NEGATIVE CONTROL: the `$` samples, which macOS and Linux
+    /// keep.
+    #[test]
+    fn the_shell_samples_speak_this_platforms_shell() {
+        assert_eq!(APPEARANCE_SOURCE == APPEARANCE_SOURCE_PWSH, cfg!(windows));
+        assert_eq!(
+            CURSOR_SPECIMEN_LINES == CURSOR_SPECIMEN_LINES_PWSH,
+            cfg!(windows)
         );
-        let bar = off(PreviewCursorStyle::Bar, 0x00FF_FFFF);
-        assert_eq!(bar.state_badge(), "Live typing");
-        assert!(!bar.semantic_value().contains("glow"));
-        assert!(!bar.semantic_value().contains("tint"));
+        let color = sample_rows(APPEARANCE_SOURCE_PWSH);
+        let cursor = sample_rows(&CURSOR_SPECIMEN_LINES_PWSH.join("\r\n"));
+        for (rows, line) in [
+            (&color, "PS C:\\src> git status --short"),
+            (&color, "PS C:\\src> cargo test"),
+            (&cursor, "PS C:\\> cat notes.md"),
+            (&cursor, "PS C:\\> git add .\\notes.md; git commit"),
+        ] {
+            assert!(rows.iter().any(|row| row == line), "{line}: {rows:#?}");
+        }
+        for row in color.iter().chain(&cursor) {
+            for mark in ["$ ", "~/", "build.sh", "make "] {
+                assert!(!row.contains(mark), "{mark} in a PowerShell sample: {row}");
+            }
+        }
+        // Negative control: the `$` samples.
+        let sh = sample_rows(APPEARANCE_SOURCE_SH);
+        assert!(sh.iter().any(|row| row == "$ git status --short"));
+        assert_eq!(
+            sample_rows(&CURSOR_SPECIMEN_LINES_SH.join("\r\n"))[4],
+            "~/demo $ cat notes.md"
+        );
+        // Every row fits its specimen, in both shells: the colour sample's
+        // columns, and the cursor scene's with room for the companion's
+        // station past the caret.
+        for row in color.iter().chain(&sh) {
+            assert!(row.chars().count() <= SPECIMEN_COLS, "{row}");
+        }
+        // The companion stands past the caret: about five cells at the
+        // usual cell's aspect, a cell of lead and a cell of slack.
+        let station = aterm_effects::kitty_pet::art_cols(8, 17).ceil() as usize + 2;
+        for row in cursor
+            .iter()
+            .chain(&sample_rows(&CURSOR_SPECIMEN_LINES_SH.join("\r\n")))
+        {
+            assert!(row.chars().count() + station <= CURSOR_SCENE_COLS, "{row}");
+        }
+        assert_eq!(
+            APPEARANCE_SOURCE_PWSH.split("\r\n").count(),
+            APPEARANCE_SPECIMEN_ROWS
+        );
+        // The scene types after either prompt.
+        for (lines, prompt) in [
+            (CURSOR_SPECIMEN_LINES_PWSH, "PS C:\\> "),
+            (CURSOR_SPECIMEN_LINES_SH, "~/demo $ "),
+        ] {
+            let mut term = aterm_core::terminal::Terminal::new(2, CURSOR_SCENE_COLS as u16);
+            term.process(lines[lines.len() - 1].as_bytes());
+            let input = term.cell_frame(2, CURSOR_SCENE_COLS);
+            let line = TypedLine::of(&input.cells[0]);
+            assert_eq!(
+                (line.start, line.end),
+                (prompt.len(), prompt.len() + 30),
+                "{prompt}"
+            );
+            // The prompt line spells the command the scene types.
+            let typed: String = input.cells[0][line.start..line.end]
+                .iter()
+                .map(|cell| cell.ch)
+                .collect();
+            let command = if prompt.starts_with("PS") {
+                "git add .\\notes.md; git commit"
+            } else {
+                "git add notes.md && git commit"
+            };
+            assert_eq!(typed, command, "{prompt}");
+        }
+    }
+
+    /// Every terminal sample is drawn under the theme-pair floor a tab
+    /// applies (`indexed_minimum_contrast`): palette text a theme puts on
+    /// its own background is lifted to 3:1 under Windows' default floor, and
+    /// the floor is part of the sample's key. NEGATIVE CONTROL: with the
+    /// floor off (as on macOS and Linux, or once `minimum_contrast` is set)
+    /// the same text keeps the colour it vanishes in.
+    #[test]
+    fn terminal_samples_hold_theme_pairs_to_the_tabs_floor() {
+        // Slot 4 is the background itself: `ANSI 4` vanishes unfloored.
+        let mut ansi = [0x0020_2020; 16];
+        ansi[4] = 0x00F0_F0F0;
+        let candidate =
+            PreviewTerminalTheme::new(0x0020_2020, 0x00F0_F0F0, 0x0020_2020, 0x00C0_C0C0, ansi);
+        let sample = |floor: f32| {
+            let spec = SettingsPreviewSpec::appearance(14.0)
+                .with_terminal_theme(candidate)
+                .with_appearance(AppearancePreviewSpec {
+                    indexed_minimum_contrast: floor,
+                    ..AppearancePreviewSpec::default()
+                });
+            build_terminal_specimen_input_rows(&spec, candidate.into_theme(), Some(1))
+        };
+        let (off, off_key) = sample(1.0);
+        let (on, on_key) = sample(crate::app_config::DEFAULT_INDEXED_MINIMUM_CONTRAST.max(4.5));
+        assert_ne!(off_key, on_key, "the floor is part of the sample's key");
+        let ratio = |input: &RenderInput| {
+            let cell = &input.cells[0][0];
+            assert_eq!(cell.ch, 'A');
+            crate::native_appearance::contrast_ratio(cell.fg, cell.bg)
+        };
+        assert!(ratio(&off) < 1.1, "unfloored: {}", ratio(&off));
+        assert!(ratio(&on) >= 3.0, "floored: {}", ratio(&on));
+        assert_eq!(
+            AppearancePreviewSpec::default().indexed_minimum_contrast,
+            crate::app_config::DEFAULT_INDEXED_MINIMUM_CONTRAST,
+            "a sample's floor is the tab's default"
+        );
     }
 }

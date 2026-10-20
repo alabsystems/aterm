@@ -341,7 +341,8 @@ pub fn repo_overrides(cfg: &PackagesConfig) -> BTreeMap<String, String> {
 /// `$HOME/.config/aterm/aterm.toml`.
 #[must_use]
 pub fn config_path() -> Option<PathBuf> {
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|x| !x.is_empty()) {
+    // `aterm_types::dirs::config_home`: `$XDG_CONFIG_HOME`, or a test binary's own root.
+    if let Some(x) = aterm_types::dirs::config_home() {
         return Some(PathBuf::from(x).join("aterm").join("aterm.toml"));
     }
     #[cfg(windows)]
@@ -469,6 +470,69 @@ impl RerouteConfig {
     pub fn strict(&self) -> bool {
         self.strict.unwrap_or(false)
     }
+}
+
+/// The `[abrew]` table — aterm's Homebrew ([`crate::abrew`],
+/// docs/DESIGN-abrew-2026-10-19.md). `enabled = false` lays no `brew`
+/// stub and makes the engine pass through to real Homebrew; the
+/// `abrew off` stamp and this setting are two spellings of off, and
+/// either one wins (fail toward the user's real brew).
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[serde(default)]
+pub struct AbrewConfig {
+    /// `[abrew].enabled`: default true.
+    pub enabled: Option<bool>,
+}
+
+impl AbrewConfig {
+    /// `[abrew].enabled`, default true.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+}
+
+/// Deserialization wrapper for the `[abrew]` table alone.
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct AbrewOnly {
+    abrew: Option<AbrewConfig>,
+}
+
+/// Parse the `[abrew]` table out of full `aterm.toml` text.
+#[must_use]
+pub fn parse_abrew(text: &str) -> AbrewConfig {
+    match aterm_toml::from_str::<AbrewOnly>(text) {
+        Ok(root) => root.abrew.unwrap_or_default(),
+        Err(_) => {
+            // Fail closed: a config that names [abrew] but does not parse
+            // must not silently read as enabled (reroute on) — the same
+            // direction as every other escape in abrew.
+            if text.lines().any(|l| l.trim_start().starts_with("[abrew]")) {
+                AbrewConfig {
+                    enabled: Some(false),
+                }
+            } else {
+                AbrewConfig::default()
+            }
+        }
+    }
+}
+
+/// The `[abrew]` config as the file says it now (long-lived callers
+/// re-read, like [`load_reroute`]).
+#[must_use]
+pub fn load_abrew() -> AbrewConfig {
+    config_path()
+        .and_then(|p| read_config_text(&p))
+        .map_or_else(AbrewConfig::default, |t| parse_abrew(&t))
+}
+
+/// The process-wide `[abrew]` config, read once per invocation.
+#[must_use]
+pub fn cached_abrew() -> &'static AbrewConfig {
+    static CFG: std::sync::OnceLock<AbrewConfig> = std::sync::OnceLock::new();
+    CFG.get_or_init(load_abrew)
 }
 
 /// Deserialization wrapper for the `[reroute]` table alone (see [`PackagesOnly`]).
@@ -656,7 +720,7 @@ pub fn parse_machine(text: &str) -> MachineConfig {
         Ok(root) => root.machine.unwrap_or_default(),
         Err(e) => {
             // `inert()` makes every resolver leave the machine alone; `unreadable` lets the
-            // CLI verdict, the "This Mac" card and the `machine-state:` record say why
+            // CLI verdict, Settings' This Mac status and the `machine-state:` record say why
             // nothing is applied, rather than show a machine deliberately switched off.
             if !say_not_toml(text) {
                 crate::notice::say(&format!(
@@ -736,7 +800,28 @@ pub fn cached() -> &'static PackagesConfig {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn abrew_config_fails_closed_on_malformed_table() {
+        assert!(!parse_abrew("[abrew]\nenabled = maybe\n").enabled());
+        assert!(!parse_abrew("[abrew]\nenabled = false\n").enabled());
+        assert!(parse_abrew("[abrew]\nenabled = true\n").enabled());
+        assert!(parse_abrew("").enabled());
+        // A malformed file that never mentions [abrew] keeps the default.
+        assert!(parse_abrew("[packages]\nbroken = [\n").enabled());
+    }
+
     use super::*;
+
+    /// `unix` (a rooted `/…` path) as an absolute path on this host: Windows roots it
+    /// on a drive, since `/opt/…` alone is drive-relative there.
+    fn abs(unix: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{unix}")
+        } else {
+            unix.to_string()
+        }
+    }
 
     // `[machine]`: the default acts (Universal Control off); the opt-out is the explicit
     // spelling; a word the owner did not write is inert.
@@ -911,16 +996,14 @@ mod tests {
     #[test]
     fn an_ignored_prefix_stops_unattended_installs_until_the_line_is_removed() {
         let home = Path::new("/Users//someone");
+        let opt = abs("/opt/aterm/pkg");
         let shared = parse_packages_at(
-            "[packages]\nprefix = \"/opt/aterm/pkg\"\n",
+            &format!("[packages]\nprefix = \"{opt}\"\n"),
             false,
             Some(home),
         );
         assert_eq!(shared.prefix, None, "dropped");
-        assert_eq!(
-            shared.ignored_prefix.as_deref(),
-            Some(Path::new("/opt/aterm/pkg"))
-        );
+        assert_eq!(shared.ignored_prefix.as_deref(), Some(Path::new(&opt)));
         assert!(
             shared.auto_install(),
             "the consent itself is untouched (Settings shows it)"
@@ -947,7 +1030,7 @@ mod tests {
         );
         assert!(same.installs_unattended());
         let dev = parse_packages_at(
-            "[packages]\nprefix = \"/opt/aterm/pkg\"\n",
+            &format!("[packages]\nprefix = \"{opt}\"\n"),
             true,
             Some(home),
         );
@@ -1186,8 +1269,8 @@ mod tests {
         let home = Path::new("/home/u");
         // Absolute path → checkout.
         assert_eq!(
-            classify_link("/src/ay", Some(home)),
-            LinkTarget::Checkout(PathBuf::from("/src/ay"))
+            classify_link(&abs("/src/ay"), Some(home)),
+            LinkTarget::Checkout(PathBuf::from(abs("/src/ay")))
         );
         // ~ expansion (against the injected home).
         assert_eq!(
@@ -1243,8 +1326,8 @@ mod tests {
         assert_eq!(of(None), None, "absent ⇒ the default prefix");
         assert_eq!(of(Some("   ")), None, "blank ⇒ the default prefix");
         assert_eq!(
-            of(Some("/opt/aterm/pkg")),
-            Some(PathBuf::from("/opt/aterm/pkg")),
+            of(Some(&abs("/opt/aterm/pkg"))),
+            Some(PathBuf::from(abs("/opt/aterm/pkg"))),
             "an absolute system prefix survives to vet_prefix"
         );
         assert_eq!(

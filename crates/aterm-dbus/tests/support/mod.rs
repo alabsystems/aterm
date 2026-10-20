@@ -7,7 +7,7 @@
 
 #![allow(
     dead_code,
-    reason = "each test binary uses its own part of the support module"
+    reason = "a part only a unix module uses is dead where that module is compiled out"
 )]
 
 use aterm_dbus::{Type, Value};

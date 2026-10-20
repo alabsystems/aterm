@@ -194,8 +194,7 @@ impl GitRunner for GitCli {
 ///
 /// Replace refs matter most: under `git replace <a> <b>`, `git cat-file --batch` answers
 /// for `<a>` with `<b>`'s bytes under a header naming `<a>`. The one git for reading what
-/// a commit holds: the release snapshot ([`crate::snapshot`]) and the Trust lane
-/// ([`crate::trust_oblig::TrustGit`]) spawn it.
+/// a commit holds: the release snapshot ([`crate::snapshot`]) spawns it.
 pub fn object_git(repo: &Path) -> Command {
     let mut cmd = command("git");
     for (key, _) in std::env::vars_os() {

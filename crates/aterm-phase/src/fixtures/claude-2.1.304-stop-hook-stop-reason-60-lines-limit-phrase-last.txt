@@ -1,0 +1,50 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Stop hook (command ./sl60.sh) printing {"continue": false} with a 60-line stopReason (59 note lines, then 'Usage limit reached · resets 3pm'), after /clear and an ordinary reply: taller than the 50-row pane, the summary `⏺ Ran 1 stop hook` and the stopReason's first 18 lines scrolled into the history (claude-2.1.304-stop-hook-stop-reason-60-lines-limit-phrase-last-scrollback.txt), the screen opening on its 19th line at column 2
+  note line 19 from the nightly hook
+  note line 20 from the nightly hook
+  note line 21 from the nightly hook
+  note line 22 from the nightly hook
+  note line 23 from the nightly hook
+  note line 24 from the nightly hook
+  note line 25 from the nightly hook
+  note line 26 from the nightly hook
+  note line 27 from the nightly hook
+  note line 28 from the nightly hook
+  note line 29 from the nightly hook
+  note line 30 from the nightly hook
+  note line 31 from the nightly hook
+  note line 32 from the nightly hook
+  note line 33 from the nightly hook
+  note line 34 from the nightly hook
+  note line 35 from the nightly hook
+  note line 36 from the nightly hook
+  note line 37 from the nightly hook
+  note line 38 from the nightly hook
+  note line 39 from the nightly hook
+  note line 40 from the nightly hook
+  note line 41 from the nightly hook
+  note line 42 from the nightly hook
+  note line 43 from the nightly hook
+  note line 44 from the nightly hook
+  note line 45 from the nightly hook
+  note line 46 from the nightly hook
+  note line 47 from the nightly hook
+  note line 48 from the nightly hook
+  note line 49 from the nightly hook
+  note line 50 from the nightly hook
+  note line 51 from the nightly hook
+  note line 52 from the nightly hook
+  note line 53 from the nightly hook
+  note line 54 from the nightly hook
+  note line 55 from the nightly hook
+  note line 56 from the nightly hook
+  note line 57 from the nightly hook
+  note line 58 from the nightly hook
+  note line 59 from the nightly hook
+  Usage limit reached · resets 3pm
+
+✻ Cogitated for 0s · done 7:57 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

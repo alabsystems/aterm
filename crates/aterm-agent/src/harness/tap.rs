@@ -87,29 +87,48 @@ pub const NO_FIGURES: &str = "5h \u{2013} \u{b7} 7d \u{2013}";
 /// which is a letter, a digit or one of `/ . _ - +`. Claude Code runs the command through a shell,
 /// so the path must be inert to one. A space is refused too: its round trip through each shell's
 /// quoting of the relaunch line is unmeasured, and the installed `aterm.app` path has none.
+///
+/// On Windows it is a drive path, which the command names with `/` separators
+/// ([`command_spelling`]).
 #[must_use]
 pub fn exe_admissible(exe: &Path) -> bool {
-    let Some(text) = exe.to_str() else {
-        return false;
-    };
-    exe.is_absolute()
-        && text.len() > 1
-        && text
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'+'))
+    command_spelling(exe).is_some()
+}
+
+/// How `exe` is spelled in the status-line command, or `None` where it is not
+/// [`exe_admissible`].
+///
+/// On Windows Claude Code runs a status-line command as it runs a hook's: through Git Bash where
+/// it finds one, else through PowerShell (Claude Code 2.1.x's hook runner, read 2026-10-17: a
+/// command with no `shell` runs in `bash` when Git Bash resolves). bash reads a `\` as an escape,
+/// so `C:\Users\…\aterm.exe` would name `C:Users…aterm.exe`; the same path with `/` separators,
+/// `C:/Users/…/aterm.exe`, is the file to Git Bash, pwsh 7 and Windows PowerShell 5.1 alike
+/// (measured 2026-10-17: each ran `C:/Users/…/aterm.exe --version`), and needs no JSON escape.
+/// So a Windows path is admitted as a drive letter, `:`, a separator and then the bytes above,
+/// `\` written as `/`; the `\\?\` prefix a canonical path carries is dropped first. A UNC or
+/// device path (`\\server\…`, `\\?\UNC\…`) is refused.
+fn command_spelling(exe: &Path) -> Option<String> {
+    let text = exe.to_str()?;
+    let inert = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'+');
+    if cfg!(windows) {
+        let text = text.strip_prefix(r"\\?\").unwrap_or(text);
+        let bytes = text.as_bytes();
+        let drive = bytes.len() > 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/');
+        let spelled = text.replace('\\', "/");
+        return (drive && spelled.bytes().skip(2).all(inert)).then_some(spelled);
+    }
+    (exe.is_absolute() && text.len() > 1 && text.bytes().all(inert)).then(|| text.to_owned())
 }
 
 /// The `--settings` value for `exe`, byte for byte
 /// `{"statusLine":{"type":"command","command":"<exe> harness tap","refreshInterval":10}}`, or
-/// `None` where `exe` is not [`exe_admissible`].
+/// `None` where `exe` is not [`exe_admissible`]. `<exe>` is its [`command_spelling`].
 #[must_use]
 pub fn settings_value(exe: &Path) -> Option<String> {
-    exe_admissible(exe).then(|| {
-        format!(
-            "{VALUE_HEAD}{}{COMMAND_TAIL}{VALUE_TAIL}",
-            exe.to_str().unwrap_or_default()
-        )
-    })
+    command_spelling(exe).map(|exe| format!("{VALUE_HEAD}{exe}{COMMAND_TAIL}{VALUE_TAIL}"))
 }
 
 /// Whether a `--settings` value is exactly aterm's tap ([`settings_value`] of some admissible
@@ -149,15 +168,38 @@ pub fn carried_by(argv: &[String]) -> bool {
 /// This aterm's canonical `current_exe`, where it is at a lasting place (`atpkg::stub::lasting`:
 /// not a temp or cargo target directory, nor a translocated or mounted copy) and
 /// [`exe_admissible`]; `None` otherwise, and then no line carries the tap. Computed once per
-/// process.
+/// process. On Windows the window runs the windowed image, which takes `harness tap` for a
+/// window's flags, so the tap names the console image beside it ([`tap_image`]).
 #[must_use]
 pub fn stable_exe() -> Option<PathBuf> {
     static EXE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     EXE.get_or_init(|| {
         let exe = std::fs::canonicalize(std::env::current_exe().ok()?).ok()?;
+        let exe = tap_image(&exe, |path| path.is_file())?;
         (atpkg::stub::lasting(&exe) && exe_admissible(&exe)).then_some(exe)
     })
     .clone()
+}
+
+/// The image the tap's command runs for a running `exe`: on Windows the console image
+/// `aterm.exe` beside a windowed one (`aterm-gui.exe`, a build tree's `aterm-windowed.exe`), or
+/// `None` where `is_file` finds none; `exe` itself otherwise. `aterm-gui harness tap` would open
+/// a window: the windowed image routes every verb but the windowing ones to the window
+/// (`alias_route` in crates/aterm/src/main.rs). `is_file` is injected for the tests.
+pub(crate) fn tap_image(exe: &Path, is_file: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    let windowed = cfg!(windows)
+        && exe
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| {
+                stem.eq_ignore_ascii_case("aterm-gui")
+                    || stem.eq_ignore_ascii_case("aterm-windowed")
+            });
+    if !windowed {
+        return Some(exe.to_path_buf());
+    }
+    let console = exe.with_file_name("aterm.exe");
+    is_file(&console).then_some(console)
 }
 
 /// Where the readings are: `<aterm state>/harness/claude-harness/rl`. `None` where no state root

@@ -1,0 +1,10 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# T1: a box no input dismissed (the agent withdrew it, a timeout): it
+# closes `passed` by nobody.
+see busy
+half
+see prompt edit
+expect open p1 approval par=t1 box=edit at=500
+half
+see busy
+expect close p1 approval out=passed by=- at=1000

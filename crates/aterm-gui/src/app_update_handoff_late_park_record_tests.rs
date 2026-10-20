@@ -30,7 +30,7 @@ pub(super) fn prelaunch_record(
             stand_down,
             transfer,
             arbiter: crate::HandoffAttemptArbiter::new(),
-            launched_at: std::time::Instant::now(),
+            begun_at: std::time::Instant::now(),
             dialled: None,
             park_retry_at: None,
             park_misses: 0,
@@ -41,6 +41,8 @@ pub(super) fn prelaunch_record(
             stood_down: false,
             teardown: crate::DeferredHandoffTeardown::None,
             revoked_by_activity: false,
+            #[cfg(target_os = "macos")]
+            booked_launch_unregistered: false,
             history_export: None,
         },
         cancelled,
@@ -96,13 +98,24 @@ fn completion(attempt_id: u64) -> crate::UpdateHandoffCompletion {
 }
 
 /// A completion for an attempt that only ever prelaunched clears that record, so a retry may
-/// launch.
+/// launch, and ends the digest entry it booked for a successor LaunchServices had no pid
+/// for: that successor is gone, and this window's record is sound.
 #[test]
 fn a_prelaunched_attempt_is_cleared_by_its_completion() {
     let mut app = App::headless_for_test();
     let (record, _cancelled, _stood_down, _transferred) = prelaunch_record(9, ApplyMode::Immediate);
     app.update_handoff_prelaunch = Some(record);
     assert!(app.update_handoff_in_flight());
+    #[cfg(target_os = "macos")]
+    let unregistered = crate::update_words::launch_unregistered_entry(0).key();
+    #[cfg(target_os = "macos")]
+    {
+        app.book_launch_unregistered(9, 4242);
+        assert!(
+            app.owes_exception(&unregistered),
+            "booked while the attempt stands"
+        );
+    }
     let teardown = app
         .reduce_returned_handoff_completion(completion(9))
         .expect("the prelaunched attempt is reduced");
@@ -110,6 +123,16 @@ fn a_prelaunched_attempt_is_cleared_by_its_completion() {
     assert!(app.update_handoff_prelaunch.is_none());
     assert!(app.pending_update_handoff.is_none());
     assert!(!app.update_handoff_in_flight());
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            !app.owes_exception(&unregistered),
+            "the returned attempt withdrew it"
+        );
+        // A report that arrives after its attempt ended books nothing.
+        app.book_launch_unregistered(9, 4242);
+        assert!(!app.owes_exception(&unregistered));
+    }
 }
 
 /// A health warning is not the live attempt's refusal: one landing while a
@@ -778,8 +801,13 @@ fn a_topic_escalation_or_claim_moved_after_the_draw_stands_the_commit_down() {
     arm(&mut app);
 
     // A keyed escalation (the bare one rides the layout, compared apart).
-    write_attention_owned(&ctx, "ci", MetaEdit::Set("needs your review"))
-        .expect("a keyed escalation");
+    write_attention_owned(
+        &ctx,
+        "ci",
+        MetaEdit::Set("needs your review"),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("a keyed escalation");
     assert!(
         !exact_activity(&mut app),
         "the escalation is in no manifest"

@@ -301,12 +301,18 @@ fn a_colr_graph_that_shares_children_is_walked_within_a_budget() {
         count.0
     };
     // Each path ends in one `paint` call.
+    let _ = aterm_font::take_spent();
     assert_eq!(painted(8), 256, "a small shared graph paints every path");
+    // The measurement seam (`take_spent`, debug builds) counts the paint
+    // tables walked: level i's 2^i, the 256 leaves of level 8 among them.
+    assert_eq!(aterm_font::take_spent().paint_tables, (1 << 9) - 1);
     let deep = painted(60);
     assert!(
         (1..=1 << 16).contains(&deep),
         "the deep graph painted {deep} times"
     );
+    let walked = aterm_font::take_spent().paint_tables;
+    assert!(walked > 1 << 16, "the capped walk read {walked}");
 }
 
 /// The sweep gradients a COLR glyph paints: centre and angles.
@@ -466,6 +472,272 @@ fn cff2_blend_on_an_empty_stack_is_an_error() {
     assert_eq!(face.outline_glyph(GlyphId(1), &mut sink), None);
     assert_eq!(face.outline_glyph(GlyphId(2), &mut sink), None);
     assert_eq!(face.outline_glyph(GlyphId(3), &mut sink), None);
+}
+
+/// An OpenType `kern` table of one format 2 subtable whose left-class,
+/// right-class and array offsets (from the subtable start, its 6-byte header
+/// included) are `offsets`. Well formed they are `[14, 20, 26]`: glyph 10 is
+/// left class 26 (the array's one row), glyph 20 right class 2 (the row's
+/// second value), and the array is `[-7, -9]`.
+fn kern_format_2(offsets: [u16; 3]) -> Vec<u8> {
+    let mut kern: Vec<u8> = vec![0, 0, 0, 1, 0, 0, 0, 30, 2, 1];
+    kern.extend(2u16.to_be_bytes()); // rowWidth
+    for v in offsets.into_iter().chain([10, 1, 26, 20, 1, 2]) {
+        kern.extend(v.to_be_bytes());
+    }
+    for v in [-7i16, -9] {
+        kern.extend(v.to_be_bytes());
+    }
+    sfnt(1, &[(b"kern", &kern)])
+}
+
+/// The first `kern` subtable's value for the pair `(left, right)`.
+fn kerning(bytes: &[u8], left: u16, right: u16) -> Option<i64> {
+    let face = Face::parse(bytes, 0).expect("the synthetic face parses");
+    let kern = face.tables().kern.expect("kern parses");
+    let sub = kern.subtables.into_iter().next().expect("one subtable");
+    sub.glyphs_kerning(GlyphId(left), GlyphId(right))
+        .map(i64::from)
+}
+
+/// Each point's x, as a point sink sees it.
+#[derive(Default)]
+struct Xs(Vec<Option<i64>>);
+
+impl PointSink for Xs {
+    fn point(&mut self, x: f32, _: f32, _: PointKind) {
+        self.0.push(Some(x as i64));
+    }
+    fn end_contour(&mut self) {}
+}
+
+/// Crafted tables at the edges of their fields' ranges, where the arithmetic
+/// leaves its integer type, answer as ttf-parser 0.25.1's code at each site
+/// does (a refusal or the format's fallback), never with a panic: the test
+/// profile keeps overflow checks on. A well-formed neighbour in each table
+/// shows the table is read. Each edge needs two fields to agree, which the
+/// fuzz below does not reach.
+#[test]
+fn crafted_table_edges_answer_as_upstream() {
+    type Answer = fn() -> Vec<Option<i64>>;
+    let rows: [(&str, Answer, &[Option<i64>]); 7] = [
+        (
+            "kern format 2: a glyph before a class table's first is class 0; an offset \
+             inside the subtable header, or a value index before it, is refused; a left \
+             class below the array offset less the header is refused",
+            || {
+                [
+                    ([14, 20, 26], 10, 20),
+                    ([14, 20, 26], 10, 5),
+                    ([14, 20, 26], 5, 20),
+                    // Read from the data start, rowWidth would be the first
+                    // glyph and glyph 3 left class 26.
+                    ([2, 20, 26], 3, 20),
+                    ([14, 2, 26], 10, 20),
+                    ([14, 20, 2], 10, 20),
+                    ([14, 20, 6], 5, 5),
+                    // Left class 0, though right class 26 alone reaches the array.
+                    ([14, 14, 26], 5, 10),
+                    // Left class 26 against array offset 32, less the header: 26.
+                    ([14, 20, 32], 10, 20),
+                ]
+                .map(|(offsets, left, right)| kerning(&kern_format_2(offsets), left, right))
+                .to_vec()
+            },
+            &[
+                Some(-9),
+                Some(-7),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(-9),
+            ],
+        ),
+        (
+            "gvar: a point inferred between touched points 40,000 or 50,000 units apart \
+             (past i16) is not moved",
+            || {
+                // One tuple at full weight: private point numbers 0 and 3,
+                // x deltas 0 and +40, y deltas zero; points 1 and 2 are
+                // inferred (IUP).
+                let mut iup = Vec::new();
+                for v in [1u16, 10, 8, 0xA000, 0x4000] {
+                    iup.extend(v.to_be_bytes());
+                }
+                iup.extend([2, 0x01, 0, 3, 0x01, 0, 40, 0x81]);
+                let narrow = [(0, 0), (100, 100), (300, 100), (400, 0)];
+                let wide = [(-20000, 0), (0, 100), (20000, 100), (30000, 0)];
+                let bytes = crate::gvar_tuples::face_bytes(&[
+                    (crate::gvar_tuples::simple(&narrow), iup.clone()),
+                    (crate::gvar_tuples::simple(&wide), iup),
+                ]);
+                let mut face = Face::parse(&bytes, 0).expect("the synthetic face parses");
+                face.set_variation(Tag::from_bytes(b"wght"), 900.0)
+                    .expect("wght");
+                let mut xs = Xs::default();
+                for g in 0..2 {
+                    face.outline_glyph_points(GlyphId(g), &mut xs)
+                        .expect("draws");
+                }
+                xs.0
+            },
+            &[
+                Some(0),
+                Some(110),
+                Some(330),
+                Some(440),
+                Some(-20000),
+                Some(0),
+                Some(20000),
+                Some(30040),
+            ],
+        ),
+        (
+            "COLR v0: a layer range ending past u16::MAX is refused, not cut at the last \
+             record",
+            || {
+                // 65,535 layer records, each glyph 3 in the foreground colour.
+                // Glyph 1 is layer 0; glyph 2's one layer is index 0xFFFF, one
+                // past the last.
+                let (mut colr, mut cpal) = (Vec::new(), Vec::new());
+                for v in [0u16, 2, 0, 14, 0, 26, 0xFFFF, 1, 0, 1, 2, 0xFFFF, 1] {
+                    colr.extend(v.to_be_bytes());
+                }
+                colr.extend([0, 3, 0xFF, 0xFF].repeat(0xFFFF));
+                for v in [0u16, 1, 1, 1, 0, 14, 0] {
+                    cpal.extend(v.to_be_bytes());
+                }
+                cpal.extend([0, 0, 0, 255]);
+                let bytes = sfnt(4, &[(b"COLR", &colr), (b"CPAL", &cpal)]);
+                let face = Face::parse(&bytes, 0).expect("the synthetic face parses");
+                let fg = RgbaColor::new(0, 0, 0, 255);
+                [1, 2]
+                    .map(|g| {
+                        let mut calls = Count::default();
+                        face.paint_color_glyph(GlyphId(g), 0, fg, &mut calls)
+                            .map(|()| calls.0 as i64)
+                    })
+                    .to_vec()
+            },
+            &[Some(2), None],
+        ),
+        (
+            "cmap format 12: a group whose start glyph plus the code point passes u32::MAX \
+             maps nothing (wrapped, U+0101 would be glyph 0)",
+            || {
+                let mut f12: Vec<u8> = vec![0, 12, 0, 0];
+                for v in [40u32, 0, 2, 0x41, 0x42, 1, 0x100, 0x101, u32::MAX] {
+                    f12.extend(v.to_be_bytes());
+                }
+                let bytes = sfnt(1, &[(b"cmap", &cmap(&f12))]);
+                let face = Face::parse(&bytes, 0).expect("the synthetic face parses");
+                let cmap = face.tables().cmap.expect("cmap parses");
+                let sub = cmap.subtables.get(0).expect("one subtable");
+                [0x41, 0x42, 0x100, 0x101]
+                    .map(|cp| sub.glyph_index(cp).map(|g| i64::from(g.0)))
+                    .to_vec()
+            },
+            &[Some(1), Some(2), None, None],
+        ),
+        (
+            "GDEF mark glyph set, coverage format 2: a coverage index past u16::MAX is not \
+             covered",
+            || {
+                // GDEF 1.2 with only a mark glyph set: one coverage, glyphs
+                // 7..=8 from coverage index 0xFFFF.
+                let mut gdef = Vec::new();
+                for v in [1u16, 2, 0, 0, 0, 0, 14, 1, 1, 0, 8, 2, 1, 7, 8, 0xFFFF] {
+                    gdef.extend(v.to_be_bytes());
+                }
+                let bytes = sfnt(9, &[(b"GDEF", &gdef)]);
+                let face = Face::parse(&bytes, 0).expect("the synthetic face parses");
+                let gdef = face.tables().gdef.expect("GDEF parses");
+                [6, 7, 8]
+                    .map(|g| Some(i64::from(gdef.is_mark_glyph(GlyphId(g), Some(0)))))
+                    .to_vec()
+            },
+            &[Some(0), Some(1), Some(0)],
+        ),
+        (
+            "CFF charset formats 1 and 2: a range naming more glyphs than the font has, \
+             or 65,536 glyphs, is refused, whatever ranges follow",
+            || {
+                use crate::bounded_work::index;
+                // Two glyphs (each `endchar`) and a charset of ranges from
+                // SID 1 (then 2), each glyph count less one in the range's
+                // last byte or two.
+                let names = index(&[b"A".to_vec()], false);
+                let at = 4 + names.len() + 19 + 4;
+                let charsets: [&[u8]; 5] = [
+                    &[1, 0, 1, 0],
+                    &[1, 0, 1, 1],
+                    &[2, 0, 1, 0, 0],
+                    &[2, 0, 1, 0, 1, 0, 2, 0xFF, 0xFE],
+                    &[2, 0, 1, 0xFF, 0xFF, 0, 2, 0, 0],
+                ];
+                charsets
+                    .map(|charset| {
+                        let mut top = vec![29];
+                        top.extend(u32::try_from(at).expect("small").to_be_bytes());
+                        top.extend([15, 29]); // charset, then CharStrings
+                        let char_strings = at + charset.len();
+                        top.extend(u32::try_from(char_strings).expect("small").to_be_bytes());
+                        top.push(17);
+                        let mut cff = vec![1, 0, 4, 4];
+                        cff.extend(&names);
+                        cff.extend(index(&[top], false));
+                        cff.extend([0, 0, 0, 0]); // empty String and Global Subr INDEXes
+                        cff.extend(charset);
+                        cff.extend(index(&[vec![14], vec![14]], false));
+                        let bytes = sfnt(2, &[(b"CFF ", &cff)]);
+                        let face = Face::parse(&bytes, 0).expect("the synthetic face parses");
+                        face.tables()
+                            .cff
+                            .map(|cff| i64::from(cff.number_of_glyphs()))
+                    })
+                    .to_vec()
+            },
+            &[Some(2), None, Some(2), None, None],
+        ),
+        (
+            "avar: a coordinate past the last mapping is shifted by that mapping",
+            || {
+                // One axis, `wght` 100..=400..=900, and a malformed map with
+                // no +1.0 record: -1.0 -> -1.0, 0.5 -> 0.25.
+                let mut fvar = Vec::new();
+                for v in [1u16, 0, 16, 2, 1, 20, 0, 8] {
+                    fvar.extend(v.to_be_bytes());
+                }
+                fvar.extend(*b"wght");
+                for user in [100i32, 400, 900] {
+                    fvar.extend((user << 16).to_be_bytes());
+                }
+                fvar.extend([0, 0, 1, 0]);
+                let mut avar = Vec::new();
+                for v in [1u16, 0, 0, 1, 2, 0xC000, 0xC000, 0x2000, 0x1000] {
+                    avar.extend(v.to_be_bytes());
+                }
+                let bytes = sfnt(1, &[(b"avar", &avar), (b"fvar", &fvar)]);
+                let mut face = Face::parse(&bytes, 0).expect("the synthetic face parses");
+                [650.0, 900.0]
+                    .map(|wght| {
+                        face.set_variation(Tag::from_bytes(b"wght"), wght)
+                            .expect("wght");
+                        let coords = face.variation_coordinates();
+                        coords.first().map(|c| i64::from(c.get()))
+                    })
+                    .to_vec()
+            },
+            // 0.5 maps to 0.25 and 1.0 to 1.0 - 0.5 + 0.25, in F2DOT14.
+            &[Some(0x1000), Some(0x3000)],
+        ),
+    ];
+    for (case, answer, want) in rows {
+        assert_eq!(answer(), want, "{case}");
+    }
 }
 
 /// The seed faces: one per outline format. The committed ones run on every
@@ -934,7 +1206,7 @@ fn exercise(bytes: &[u8], rng: &mut Lcg, glyph_cap: u16) -> u64 {
             let _ = face.outline_glyph(GlyphId(g), &mut sink);
             let _ = face.glyph_hor_advance(GlyphId(g));
         }
-        #[cfg(feature = "hint")]
+        #[cfg(any(feature = "hint", debug_assertions))]
         {
             sink.0 += hint(bytes, index, &face, rng, glyph_cap);
         }
@@ -946,7 +1218,7 @@ fn exercise(bytes: &[u8], rng: &mut Lcg, glyph_cap: u16) -> u64 {
 /// size to an absurd one), at the face's own hostile instance spelled in
 /// user space, every glyph up to `glyph_cap / 8` and the glyphs past the
 /// end.
-#[cfg(feature = "hint")]
+#[cfg(any(feature = "hint", debug_assertions))]
 fn hint(bytes: &[u8], index: u32, face: &Face<'_>, rng: &mut Lcg, glyph_cap: u16) -> u64 {
     use aterm_font::autohint::{HintingInstance, Target};
     let target = [Target::Normal, Target::Light, Target::Lcd][rng.below(3)];
@@ -990,6 +1262,12 @@ fn seeds_answer() {
 }
 
 /// Mutated seeds never panic.
+///
+/// The round counts are load-bearing (2026-10-17): of seventeen planted
+/// one-line overflow mutations of aterm-font, these rounds caught five on a
+/// macOS host (one through a system face); 128 rounds a face (48 for a big
+/// one), with a generator per face, caught three and missed the CFF INDEX
+/// offset `n - 1` and the `glyf` point count `endpoints.last() + 1`.
 #[test]
 fn mutated_faces_never_panic() {
     let mut rng = Lcg(0x9E37_79B9_7F4A_7C15);

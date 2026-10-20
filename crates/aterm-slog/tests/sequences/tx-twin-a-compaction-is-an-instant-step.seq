@@ -1,0 +1,10 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_compaction_is_an_instant_step (S24).
+bind 0
+tx compact
+expect open p1 compact par=r1
+expect close p1 compact out=ok dur_ms=0
+see busy
+tx compact
+expect open p2 compact par=t1
+expect close p2 compact out=ok

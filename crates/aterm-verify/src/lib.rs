@@ -864,6 +864,9 @@ fn toolchain_lines(ctx: &Ctx) -> String {
     if let Some(d) = &ctx.tools.demoted {
         s.push_str(&format!("toolchain note: {}\n", d.sentence()));
     }
+    if let Some(note) = ctx.tools.borrowed_note() {
+        s.push_str(&format!("toolchain note: {note}\n"));
+    }
     if let Some(lease) = &ctx.toolchain_lease {
         s.push_str(&format!("toolchain lease: {lease}\n"));
     }
@@ -879,45 +882,72 @@ fn toolchain_lines(ctx: &Ctx) -> String {
     s
 }
 
-/// THE RUN'S TOOLCHAIN LEASE (`aterm_toolchain::lease`): the run hands one
+/// THE RUN'S TOOLCHAIN LEASES (`aterm_toolchain::lease`): the run hands one
 /// physical toolchain directory to every child, and between two children no
 /// process runs from it, so without a lease atpkg's gc could reclaim it and an
 /// unattended trust update could flip it mid-run (two compilers, a rebuild of the
 /// graph). Held for the whole run, it keeps the build from gc and makes the
-/// unattended flip wait (atpkg's `quiet`, at most its `CEILING_SECS`). A
-/// toolchain atpkg does not manage takes none; one that cannot be taken is said
-/// on stderr and the run goes on as it would have without it. Returns the lease
-/// (drop it when the run ends) and the log's sentence about it.
+/// unattended flip wait (atpkg's `quiet`, at most its `CEILING_SECS`). A tool the
+/// directory lacks and the run took from the managed Trust build
+/// ([`Toolchain::borrowed`]) runs out of THAT build, so it is held too: one lease per
+/// distinct build the run executes from ([`held_dirs`]). A directory atpkg does not
+/// manage takes none; one that cannot be taken is said on stderr and the run goes on
+/// as it would have without it. Returns the leases (drop them when the run ends) and
+/// the log's sentence about them.
 #[must_use]
 pub fn hold_toolchain(
     env: &EnvSnapshot,
     tools: &Toolchain,
     root: &Path,
-) -> (Option<aterm_toolchain::lease::Lease>, Option<String>) {
+) -> (Vec<aterm_toolchain::lease::Lease>, Option<String>) {
+    use aterm_toolchain::lease;
     let prefix = toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref());
     let who = format!(
         "aterm-verify (pid {}) \u{2014} a verify run in {}",
         std::process::id(),
         root.display()
     );
-    match aterm_toolchain::lease::take_for_dir(&prefix, &tools.stage2_dir, &who) {
-        Ok(Some(lease)) => {
-            let said = format!(
-                "{} held for this run; an unattended trust update waits for it",
-                lease.subject().describe()
-            );
-            (Some(lease), Some(said))
+    let mut held: Vec<lease::Lease> = Vec::new();
+    for dir in held_dirs(tools) {
+        let Some(subject) = lease::Subject::of_dir(&prefix, &dir) else {
+            continue;
+        };
+        if held.iter().any(|l| *l.subject() == subject) {
+            continue;
         }
-        Ok(None) => (None, None),
-        Err(e) => {
-            eprintln!(
+        match lease::take(&prefix, &subject, &who, lease::DEFAULT_WAIT) {
+            Ok(l) => held.push(l),
+            Err(e) => eprintln!(
                 "verify: warn \u{2014} toolchain not held ({e}); an update during this run can \
                  replace {}",
-                tools.stage2_dir.display()
-            );
-            (None, None)
+                dir.display()
+            ),
         }
     }
+    let said = (!held.is_empty()).then(|| {
+        let each: Vec<String> = held.iter().map(|l| l.subject().describe()).collect();
+        format!(
+            "{} held for this run; an unattended trust update waits for {}",
+            each.join(", "),
+            if held.len() == 1 { "it" } else { "them" }
+        )
+    });
+    (held, said)
+}
+
+/// The directories a run executes tools from: the toolchain directory, then the
+/// directory of each tool it took from the managed build ([`Toolchain::borrowed`]),
+/// each once, in that order.
+fn held_dirs(tools: &Toolchain) -> Vec<PathBuf> {
+    let mut dirs = vec![tools.stage2_dir.clone()];
+    for (_, file) in &tools.borrowed {
+        if let Some(dir) = file.parent()
+            && !dirs.iter().any(|d| d == dir)
+        {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+    dirs
 }
 
 /// How many of the run logs are kept.
@@ -1056,7 +1086,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         Err(e) => return could_not_run(format!("cannot create a scratch directory: {e}")),
     };
     // Held until this function returns: the whole run.
-    let (_lease, lease_said) = hold_toolchain(&env, &tools, &root);
+    let (_leases, lease_said) = hold_toolchain(&env, &tools, &root);
     #[cfg(unix)]
     exec::group::kill_on_interrupt();
 
@@ -1240,6 +1270,113 @@ pub fn install_fix(tool: &str, formula: &str, package: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool the run took from the managed build runs out of THAT build, so the run
+    /// holds it for as long as it runs, once however many tools came from it.
+    /// NEGATIVE CONTROL: the same toolchain with nothing borrowed holds nothing (its
+    /// directory is none of atpkg's), and once the run's leases drop nobody holds it.
+    #[test]
+    fn a_borrowed_tools_build_is_held_for_the_run() {
+        use aterm_toolchain::lease::{self, Holders, Subject};
+        let home = std::fs::canonicalize(mktemp_dir("atv-lease").expect("mktemp")).expect("real");
+        let env = EnvSnapshot {
+            home: home.clone(),
+            xdg_config_home: Some(home.join("xdg")),
+            ..EnvSnapshot::default()
+        };
+        let prefix = toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref());
+        let managed = prefix.join("store/trust/9192/bin");
+        std::fs::create_dir_all(&managed).expect("store build");
+        let own = home.join("trust/build/host/stage2/bin");
+        let tools = Toolchain {
+            stage2_dir: own.clone(),
+            targo: own.join("targo"),
+            trustdoc: own.join("trustdoc"),
+            tippy: Some(managed.join(toolchain::TIPPY)),
+            trustfmt: Some(managed.join(toolchain::TRUSTFMT)),
+            borrowed: vec![
+                (toolchain::TRUSTFMT, managed.join(toolchain::TRUSTFMT)),
+                (toolchain::TIPPY, managed.join(toolchain::TIPPY)),
+            ],
+            refused: None,
+            store_bin: Some(prefix.join("store/trust/current/bin")),
+            demoted: None,
+        };
+        let subject = Subject::of_dir(&prefix, &managed).expect("a store build");
+        let (held, said) = hold_toolchain(&env, &tools, Path::new("/repo"));
+        assert_eq!(held.len(), 1, "one build, held once");
+        assert_eq!(held[0].subject(), &subject);
+        assert!(matches!(
+            lease::holders(&prefix, &subject),
+            Holders::Held(_)
+        ));
+        let said = said.expect("said in the log");
+        assert!(said.contains("trust build 9192"), "{said}");
+        drop(held);
+        assert_eq!(lease::holders(&prefix, &subject), Holders::Free);
+
+        let own_only = Toolchain {
+            borrowed: Vec::new(),
+            ..tools
+        };
+        let (none, said) = hold_toolchain(&env, &own_only, Path::new("/repo"));
+        assert!(none.is_empty(), "an unmanaged directory takes no lease");
+        assert_eq!(said, None);
+        assert_eq!(lease::holders(&prefix, &subject), Holders::Free);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let runnable = |path: &Path, body: &str| {
+                std::fs::create_dir_all(path.parent().expect("bin")).expect("mkdir");
+                std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("write");
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+            };
+            for bin in [&own, &managed] {
+                std::fs::create_dir_all(bin.parent().expect("sysroot").join("lib/rustlib"))
+                    .expect("rustlib");
+            }
+            runnable(&own.join("targo"), "exit 0");
+            runnable(
+                &own.join("trustc"),
+                &format!("echo '{}'", own.parent().expect("sysroot").display()),
+            );
+            runnable(&managed.join(toolchain::TIPPY), "exit 0");
+            let rustup = home.join("rustup");
+            std::fs::create_dir_all(rustup.join("toolchains")).expect("toolchains");
+            std::os::unix::fs::symlink(
+                own.parent().expect("sysroot"),
+                rustup.join("toolchains/trust"),
+            )
+            .expect("rustup entry");
+            let shims = prefix.join("bin");
+            runnable(&shims.join(toolchain::TIPPY), "exit 0");
+            runnable(
+                &shims.join("trustc"),
+                &format!("echo '{}'", managed.parent().expect("sysroot").display()),
+            );
+            // No current link exists: discovery must use the PATH shim's reported
+            // physical sysroot before the run asks the actual lease holder.
+            let discovered = Toolchain::discover_with_store(
+                None,
+                &rustup,
+                Some(&prefix),
+                shims.as_os_str(),
+                Some("trust"),
+            );
+            let (held, _) = hold_toolchain(&env, &discovered, Path::new("/repo"));
+            assert!(
+                matches!(lease::holders(&prefix, &subject), Holders::Held(_)),
+                "BORROWED_SHIM_MUST_HOLD_THE_PHYSICAL_BUILD"
+            );
+            assert_eq!(held.len(), 1);
+            assert_eq!(discovered.tippy, Some(managed.join(toolchain::TIPPY)));
+            drop(held);
+            assert_eq!(lease::holders(&prefix, &subject), Holders::Free);
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     /// Every child builds in the caller's `CARGO_TARGET_DIR`, and
     /// `--test-threads` reaches every child only when asked.

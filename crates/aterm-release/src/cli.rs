@@ -11,7 +11,7 @@
 //! [--release-credentials <profile.toml>]` (the release's `cut`),
 //! `recover vX.Y.Z <claim-sha> --old-publisher-stopped`, `status`,
 //! `check [--commit REV] [--engine DIR] [--cut] [--export] [--wasm32]`,
-//! `trust run|candidate|judge|compare`,
+//! `trust run|judge`,
 //! `verify [vX.Y.Z]`, `site [--latest] [--dry-run] …` (alab.systems brought to a release),
 //! `hook pre-promote|post-promote|transforms` (the publication engine's hooks),
 //! `yank <build> [--release-credentials <profile.toml>] --mac-only|--linux-artifacts DIRECTORY`,
@@ -217,14 +217,20 @@ USAGE
                            crates/aterm-release/trust/floors.tsv. A whole-tree run
                            on a clean checkout files facts for explicit verdicts.
                            A member feature that turns on fork code is a row of
-                           its own, <lib>+<feature> (aterm-link+sealed), checked
+                           its own, <lib>+<feature>, checked
                            with --features <feature>; -p <lib> selects it too.
                            --update-ratchet raises floors it meets (never lowers
                            one) and keeps trust/memory.tsv and trust/costs.tsv
                            current; --try-refused verifies what this host would
                            refuse for memory; --stop-if-narrowed stops before
                            any check when it would; --obligations keeps each check's
-                           per-obligation record (the candidate gate's).
+                           per-obligation record beside its log
+                           (<spec>.log.oblig.tsv). Its --report-dir store is
+                           capped at 512 MiB by a prover without trust
+                           a40ddc8e9c (the seal 321aaeda75), which ends a
+                           library past it (aterm-agent) with exit 2 before
+                           its Summary: give such a library --prover <the bin/
+                           of a build that holds a40ddc8e9c>.
                            --target-root defaults to <repo>/target-trust, or,
                            where `targo trust` refuses a component of that (a
                            checkout made under umask 002 is 0775), to this
@@ -245,60 +251,6 @@ USAGE
                            recorded that the facts fall below is lowered onto
                            this prover, WHY in its fifth column; working floors
                            the up-only rule refuses are named LOWERED, and fail
-  targo --unverified ship trust candidate --candidate <staged toolchain dir>
-        [--base <bin> | --base-build N] [--crate-budget SECONDS] [--jobs N|auto]
-        [--out DIR] [--min-free-gib N] [--no-guard | [--guard-footprint-gib G]
-        [--guard-swap-gib G] [--guard-level PCT] [--guard-min-free-gib G]]
-        [--measure-narrowed] [--public-repo OWNER/REPO] [--retractions FILE]
-        [--trust-repo DIR] [--dry-run]
-  targo --unverified ship trust candidate --admits <staged toolchain dir>
-        [--receipts DIR] [--base-build N] [--public-repo OWNER/REPO]
-                           THE CANDIDATE GATE, for publishing a Trust toolchain:
-                           two whole-tree lane runs of this clean checkout on
-                           this machine, the published seal's (the build the
-                           public channel pins, as this host's atpkg verified
-                           it) then the candidate's, each check with its
-                           per-obligation record and under a memory guard
-                           (a check ends at a process-tree footprint of six
-                           tenths of the RAM, 8 GiB of swap, memorystatus_level
-                           under 10, or 2 GiB under --min-free-gib free),
-                           compared by `trust compare`; the RECEIPT under --out
-                           is what the trust pack publisher admits. Exit 0
-                           PUBLISH-OK, 1 PUBLISH-REFUSED, 2 could not compare,
-                           3 no verdict (--dry-run). --admits asks what the
-                           publisher asks: did the newest run of the gate for
-                           that directory pass, against the build the channel
-                           pins now, at most 7 days ago, on an aterm commit
-                           this checkout contains, under the retraction ledger
-                           committed there (0 admitted, 1 refused, 2 could not
-                           check)
-  targo --unverified ship trust compare --base <plan> --candidate <plan>
-        [--base-logdir DIR] [--candidate-logdir DIR] [--tsv FILE] [--base-prover ID]
-        [--ratchet FILE] [--retractions FILE] [--trust-repo DIR]
-        [--candidate-trust-commit SHA] [--base-trust-commit SHA] [--obligations-tsv FILE]
-                           the candidate gate's comparison of two whole-tree runs
-                           of one aterm tree on one machine (each run's
-                           <target root>/logs/.plan) — the published seal's and
-                           a candidate toolchain's — library by library and,
-                           from each check's per-obligation record, obligation
-                           by obligation. An obligation the seal proved that
-                           the candidate does not refuses, whatever it gains
-                           elsewhere, unless the retraction ledger
-                           (--retractions) names it as a false proof retracted
-                           by a trust commit the candidate's own contains (read
-                           in --trust-repo); a library given no result in its
-                           wall budget, or no usable record, refuses; where the
-                           seal's own check gave none, the candidate is held to
-                           the floor the seal's prover recorded (--ratchet,
-                           default the base plan's) and refused when there is
-                           none. --obligations-tsv lists each lost obligation
-                           by its ledger key. Exit 0 PUBLISH-OK, 1
-                           PUBLISH-REFUSED, 2 could not compare: runs of
-                           different trees, machines, scopes, budgets or slot
-                           counts, a run that did not conclude or captured no
-                           records, the same prover twice, nothing compared at
-                           all, a ledger that does not read or that a candidate
-                           contradicts
   targo --unverified ship recover vX.Y.Z <full-claim-sha> --old-publisher-stopped
         [--release-credentials <profile.toml>] [--no-draft-was-posted]
                            finish or withdraw the cut of a machine that died

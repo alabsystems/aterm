@@ -51,7 +51,7 @@
 use std::os::fd::OwnedFd;
 use std::time::Duration;
 
-use winit::event_loop::EventLoopProxy;
+use aterm_window::event_loop::EventLoopProxy;
 
 /// How long a cut lifeline waits for the ordinary quit before the backstop ends
 /// the process. Generous on purpose: the quit's teardown can wait on a video
@@ -167,7 +167,9 @@ pub(crate) fn inherit_across_exec() -> Option<InheritedAcrossExec> {
         return None;
     }
     let fd = relaunch_descriptor()?;
-    set_close_on_exec(fd, false).then_some(InheritedAcrossExec { fd })
+    // Lazy: `then_some` would build the guard on a refusal too, and its drop
+    // would run another `fcntl`.
+    set_close_on_exec(fd, false).then(|| InheritedAcrossExec { fd })
 }
 
 /// See [`inherit_across_exec`].

@@ -117,7 +117,7 @@
 //!   is who may claim one ([`reset_allowed`]: this machine's own login, and
 //!   no other login on record as run), the one attempt a wall
 //!   ([`claim_reset`], [`reset_in_flight`]) and its outcome
-//!   ([`reset_outcome`], which ends the account's walls where a reset was
+//!   ([`reset_outcome`], which ends the claimed raw wall where a reset was
 //!   used or the limit had lifted); [`Roster::own`] is the roster of a
 //!   machine that lists none, for that alone; and [`note_offer`] records an
 //!   offer only from a confirmation that was read or from the vendor's own
@@ -2123,8 +2123,8 @@ pub fn note_wrong_account(logins: &mut Logins, label: &str, at: i64) -> Vec<Even
 // 2. The state (design §5), schema 1
 // ---------------------------------------------------------------------------
 
-/// A usage limit one of this account's sessions hit, by the vendor's own
-/// limit type. An OBSERVATION: account-wide, merged by newest `at`.
+/// The newest observation or scoped clearing of one raw vendor limit type.
+/// Clearing records share the same bounded map as standing observations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wall {
     /// The reset the wall named (Unix seconds), or `None` when it named none.
@@ -2136,6 +2136,9 @@ pub struct Wall {
     /// How many times it was found standing with no reset ahead of it: `0`
     /// for a wall observed before its own reset.
     pub attempts: u32,
+    /// This window was cleared at `at`, rather than observed standing. The
+    /// record prevents an older transcript row from putting that wall back.
+    pub cleared: bool,
 }
 
 /// The rung of `ladder` for the `attempts`th observation, the last one for
@@ -2150,19 +2153,21 @@ fn rung(ladder: &[i64], attempts: u32) -> i64 {
 }
 
 impl Wall {
-    /// The instant this wall stops standing (design §5's table): its reset
-    /// plus [`RESET_GRACE_S`]; observed after its own reset, the observation
-    /// plus [`LATE_WALL_S`]; naming no reset, the observation plus
-    /// [`NO_RESET_WALL_S`].
+    /// When this observed wall stops standing: its reset plus
+    /// [`RESET_GRACE_S`], or the observation plus [`LATE_WALL_S`] after its
+    /// reset / [`NO_RESET_WALL_S`] with none. A scoped clear stands no wall.
     #[must_use]
-    pub fn stands_until(&self) -> i64 {
-        match self.until {
+    pub fn stands_until(&self) -> Option<i64> {
+        if self.cleared {
+            return None;
+        }
+        Some(match self.until {
             Some(until) if self.at <= until => until.saturating_add(RESET_GRACE_S),
             Some(_) => self.at.saturating_add(rung(&LATE_WALL_S, self.attempts)),
             None => self
                 .at
                 .saturating_add(rung(&NO_RESET_WALL_S, self.attempts)),
-        }
+        })
     }
 }
 
@@ -2323,10 +2328,18 @@ impl CreditsUse {
     /// began. Judged at an answer, whether that answer is this episode's.
     #[must_use]
     pub fn stands(&self, now: i64) -> bool {
+        now < self.until_at()
+    }
+
+    /// Until when this episode is taken as in use ([`Self::stands`]): the
+    /// later of its window's reset and [`CREDITS_STALE_S`] after its newest
+    /// answer.
+    #[must_use]
+    pub fn until_at(&self) -> i64 {
         let reset = self
             .until
             .unwrap_or_else(|| self.since.saturating_add(SESSION_WINDOW_S));
-        now < self.seen.saturating_add(CREDITS_STALE_S) || now < reset
+        reset.max(self.seen.saturating_add(CREDITS_STALE_S))
     }
 }
 
@@ -2425,12 +2438,11 @@ pub struct Account {
     pub auth: Auth,
     /// MACHINE-LOCAL: when that word was learned.
     pub auth_at: Option<i64>,
-    /// MACHINE-LOCAL: when the owner's pin last cleared its walls ([`pin`]).
-    /// A wall another machine observed at or before this instant is the one
-    /// the owner cleared, and a merge does not bring it back; nor does this
-    /// machine's own look at a row written before it
-    /// ([`Account::cleared_since`]). A reset that ended this account's walls
-    /// stamps it too ([`reset_outcome`]).
+    /// MACHINE-LOCAL: the latest account-wide clearing. New writes come
+    /// from the owner's [`pin`]; older schema-1 states may also carry an
+    /// automated reset's stamp. An older transcript row cannot restore a
+    /// wall cleared by it ([`Account::cleared_since`]). Automated resets now
+    /// clear only their claimed window, in that window's [`Wall`] record.
     pub cleared_at: Option<i64>,
     /// MACHINE-LOCAL: when a session was last read running on it
     /// ([`note_session`]). It outlives the session's own row, which goes
@@ -2444,10 +2456,10 @@ pub struct Account {
     /// began on.
     pub credits_day: Option<i64>,
     /// OBSERVATION: the newest word on its five-hour window apart from a
-    /// `/usage` sample ([`WindowSaid`]). Kept apart from [`Self::sample`]:
-    /// nothing that moves a session reads it.
+    /// `/usage` sample ([`WindowSaid`]).
     pub warned_session: Option<WindowSaid>,
-    /// OBSERVATION: the same of its week: what [`windows_full`] reads of it.
+    /// OBSERVATION: the same of its week: what [`windows_full`] and
+    /// [`Self::week_low_until`] read of it.
     pub warned_week: Option<WindowSaid>,
 }
 
@@ -2469,18 +2481,137 @@ impl Account {
     pub fn limited_until(&self, now: i64) -> Option<i64> {
         self.walls
             .values()
-            .map(Wall::stands_until)
+            .filter_map(Wall::stands_until)
             .filter(|end| now < *end)
             .max()
     }
 
-    /// Whether a wall observed at `at` is one the owner has cleared SINCE
-    /// ([`pin`]): it was observed before the clearing — the clearing read as
-    /// made no later than `now`, as every stamp of this machine's is. An
-    /// observation of the clearing's own second is read as made after it,
-    /// as [`note_wall`] reads every tie.
-    fn cleared_since(&self, at: i64, now: i64) -> bool {
-        self.cleared_at.is_some_and(|cleared| at < cleared.min(now))
+    /// Until when the five-hour window shows this account `low` at `now`:
+    /// the later of its `/usage` sample (unless a limit reset refilled the
+    /// window since) and the vendor's session warning, while at
+    /// [`LOW_SESSION_PCT`] or more.
+    #[must_use]
+    pub fn session_low_until(&self, now: i64) -> Option<i64> {
+        let refilled = self
+            .warned_session
+            .as_ref()
+            .is_some_and(|w| w.pct.is_none() && self.sample.as_ref().is_none_or(|s| w.at >= s.at));
+        let sample = (!refilled)
+            .then(|| self.sample.as_ref()?.session(now))
+            .flatten()
+            .filter(|(pct, _)| *pct >= LOW_SESSION_PCT)
+            .map(|(_, end)| end);
+        let warned = self
+            .warned_session
+            .as_ref()
+            .and_then(|w| w.figure(SESSION_WINDOW_S, now))
+            .filter(|(pct, _)| *pct >= LOW_SESSION_PCT)
+            .map(|(_, end)| end);
+        sample.max(warned)
+    }
+
+    /// Until when the seven-day window shows this account `low` at `now`:
+    /// the later of its `/usage` sample (unless a limit reset refilled the
+    /// week since) and the vendor's weekly warning, while at
+    /// [`LOW_WEEK_PCT`] or more.
+    #[must_use]
+    pub fn week_low_until(&self, now: i64) -> Option<i64> {
+        let refilled = self
+            .warned_week
+            .as_ref()
+            .is_some_and(|w| w.pct.is_none() && self.sample.as_ref().is_none_or(|s| w.at >= s.at));
+        let sample = (!refilled)
+            .then(|| self.sample.as_ref()?.week(now))
+            .flatten()
+            .filter(|(pct, _)| *pct >= LOW_WEEK_PCT)
+            .map(|(_, end)| end);
+        let warned = self
+            .warned_week
+            .as_ref()
+            .and_then(|w| w.figure(WEEK_WINDOW_S, now))
+            .filter(|(pct, _)| *pct >= LOW_WEEK_PCT)
+            .map(|(_, end)| end);
+        sample.max(warned)
+    }
+
+    /// Until when usage credits carrying this account's sessions past a
+    /// limit show it `low` at `now` ([`CreditsUse::stands`]).
+    #[must_use]
+    pub fn credits_until(&self, now: i64) -> Option<i64> {
+        match &self.credits {
+            Some(Credits::InUse(c)) if c.stands(now) => Some(c.until_at()),
+            _ => None,
+        }
+    }
+
+    /// Until when this account is `low` at `now`: the end of the last
+    /// running window at its threshold or active credits episode.
+    #[must_use]
+    pub fn low_until(&self, now: i64) -> Option<i64> {
+        [
+            self.session_low_until(now),
+            self.week_low_until(now),
+            self.credits_until(now),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+    }
+
+    /// Whether this account is `low` at `now`.
+    #[must_use]
+    pub fn low(&self, now: i64) -> bool {
+        self.low_until(now).is_some()
+    }
+
+    /// Whether a session on this account is worth moving off it ahead of
+    /// its wall: usage credits are already carrying it past a limit, or it
+    /// is `low` by a window that does not reset within [`RESET_SOON_S`].
+    #[must_use]
+    pub fn leave_early(&self, now: i64) -> bool {
+        self.credits_until(now).is_some()
+            || self
+                .low_until(now)
+                .is_some_and(|end| end.saturating_sub(now) > RESET_SOON_S)
+    }
+
+    /// When this account's week resets, while known and still ahead at `now`.
+    #[must_use]
+    pub fn week_reset(&self, now: i64) -> Option<i64> {
+        let refilled = self
+            .warned_week
+            .as_ref()
+            .is_some_and(|w| w.pct.is_none() && self.sample.as_ref().is_none_or(|s| w.at >= s.at));
+        let sample = (!refilled)
+            .then(|| self.sample.as_ref()?.week_reset)
+            .flatten()
+            .filter(|reset| *reset > now);
+        let warned = self
+            .warned_week
+            .as_ref()
+            .and_then(|w| w.figure(WEEK_WINDOW_S, now))
+            .and_then(|(_, _)| self.warned_week.as_ref()?.reset)
+            .filter(|reset| *reset > now);
+        sample.or(warned)
+    }
+
+    /// When this raw window was cleared after its row at `at`, by a scoped
+    /// reset or the owner's account-wide [`pin`]. A clearing is read as no
+    /// later than `now`; a row from the clearing's own second is new, as
+    /// [`note_wall`] reads every tie.
+    #[must_use]
+    pub fn cleared_since(&self, window: &str, at: i64, now: i64) -> Option<i64> {
+        self.cleared_at
+            .into_iter()
+            .chain(
+                self.walls
+                    .get(window)
+                    .filter(|wall| wall.cleared)
+                    .map(|wall| wall.at),
+            )
+            .map(|cleared| cleared.min(now))
+            .filter(|cleared| at < *cleared)
+            .max()
     }
 
     /// When anything about it was last written (its eviction order).
@@ -2568,6 +2699,9 @@ pub struct ResetClaim {
     pub account: String,
     /// The wall's own reset: one attempt per (account, wall).
     pub until: Option<i64>,
+    /// The vendor's raw limit type observed at this claim. An older claim
+    /// without this scope can record an outcome but cannot clear any wall.
+    pub window: Option<String>,
     /// The session that takes the row.
     pub sid: String,
     /// When it was claimed.
@@ -2722,6 +2856,7 @@ fn wall_json(w: &Wall) -> Value {
     o.insert("at".to_owned(), Value::from(w.at));
     o.insert("by".to_owned(), Value::from(w.by.as_str()));
     o.insert("attempts".to_owned(), Value::from(w.attempts));
+    o.insert("cleared".to_owned(), Value::from(w.cleared));
     Value::Object(o)
 }
 
@@ -2731,6 +2866,7 @@ fn wall_of(v: &Value, cap: i64) -> Option<Wall> {
         at: stamp(v.get("at"), cap)?,
         by: word(v.get("by"), WORD_MAX).unwrap_or_default(),
         attempts: count(v.get("attempts")).unwrap_or(0),
+        cleared: v.get("cleared").and_then(Value::as_bool).unwrap_or(false),
     })
 }
 
@@ -3019,6 +3155,7 @@ impl State {
                 let mut m = Map::new();
                 m.insert("account".to_owned(), Value::from(c.account.as_str()));
                 m.insert("until".to_owned(), Value::from(c.until));
+                m.insert("window".to_owned(), Value::from(c.window.clone()));
                 m.insert("sid".to_owned(), Value::from(c.sid.as_str()));
                 m.insert("at".to_owned(), Value::from(c.at));
                 m.insert("pid".to_owned(), Value::from(c.pid));
@@ -3116,6 +3253,7 @@ impl State {
             Some(ResetClaim {
                 account: label(c.get("account"))?,
                 until: int(c.get("until")),
+                window: word(c.get("window"), WORD_MAX),
                 sid: word(c.get("sid"), WORD_MAX)?,
                 at: int(c.get("at"))?,
                 // Absent in a state an older build wrote: a claim of no
@@ -3299,7 +3437,7 @@ pub fn condition(row: &Row, state: &State, enrolled: bool, now: i64) -> Conditio
     if let Some(until) = account.limited_until(now) {
         return Condition::Limited { until };
     }
-    if account.sample.as_ref().is_some_and(|s| s.low(now)) {
+    if account.low(now) {
         return Condition::Low;
     }
     if account.observed() {
@@ -3642,8 +3780,7 @@ fn usable_at(row: &Row, state: &State, cond: Condition, now: i64) -> Option<i64>
         Condition::Low => state
             .accounts
             .get(&row.label)
-            .and_then(|a| a.sample.as_ref())
-            .and_then(|s| s.low_until(now)),
+            .and_then(|a| a.low_until(now)),
         Condition::SignedOut | Condition::NotEnrolled => None,
     }
 }
@@ -3656,7 +3793,7 @@ fn usable_at(row: &Row, state: &State, cond: Condition, now: i64) -> Option<i64>
 /// A `low` account is one only at a wall, and only when no account —
 /// `me` included, and the low account itself — becomes usable within
 /// [`LOW_ONLY_AFTER_S`]: a limited one by its wall ending, a low one by the
-/// window that makes it low resetting ([`Sample::low_until`]).
+/// window that makes it low resetting ([`Account::low_until`]).
 #[must_use]
 pub fn candidates(
     roster: &Roster,
@@ -3689,9 +3826,7 @@ pub fn candidates(
                 week_reset: state
                     .accounts
                     .get(&row.label)
-                    .and_then(|a| a.sample.as_ref())
-                    .and_then(|s| s.week_reset)
-                    .filter(|reset| *reset > now),
+                    .and_then(|a| a.week_reset(now)),
             };
             let verdict = if me == Some(row.label.as_str()) {
                 Err(WhyNot::Me)
@@ -4034,8 +4169,9 @@ fn offer_expiring(account: &Account, now: i64) -> bool {
 ///    — and at once for a caller that asks past the probe
 ///    ([`advise_past_probe`]) — on an account to LEAVE — `limited` (a wall
 ///    another tab recorded), or `low` by a window that does not reset within
-///    [`RESET_SOON_S`] ([`Sample::leave_early`]) — with a fresh candidate
-///    and no reset offer about to expire: `Move` ahead of the wall.
+///    [`RESET_SOON_S`], or already on usage credits
+///    ([`Account::leave_early`]) — with a fresh candidate and no reset offer
+///    about to expire: `Move` ahead of the wall.
 /// 5. Otherwise **Stay**.
 ///
 /// A move that rotates is `Stay` ([`StayWhy::Breaker`], with the instant the
@@ -4156,11 +4292,11 @@ fn advise_with(
     // stands at is the wall the owner lifted, and nothing has been recorded
     // against the account since.
     if let Point::Wall {
-        at: Some(written), ..
+        window,
+        at: Some(written),
     } = point
         && let Some(record) = state.accounts.get(&mine.label)
-        && let Some(cleared_at) = record.cleared_at
-        && record.cleared_since(*written, now)
+        && let Some(cleared_at) = record.cleared_since(window, *written, now)
         && cond(mine).runs()
     {
         return Advice::Resume {
@@ -4234,9 +4370,9 @@ fn advise_with(
     let own = cond(mine);
     let limited = matches!(own, Condition::Limited { .. });
     // An account to leave ahead of its wall: one a wall already stands on,
-    // or one low by a window that is not about to reset.
-    let leave = limited
-        || (own == Condition::Low && account.sample.as_ref().is_some_and(|s| s.leave_early(now)));
+    // or one low by a window that is not about to reset or already on usage
+    // credits.
+    let leave = limited || (own == Condition::Low && account.leave_early(now));
     if state.pinned {
         return Advice::Stay(if leave {
             StayWhy::Pinned
@@ -4492,7 +4628,7 @@ impl Event {
     /// waiting session should follow: the caller touches the wake marker
     /// ([`Store::touch_wake`]) so a tab waiting until Thursday decides again.
     /// EVERY reset outcome does: a reset used or a limit found lifted ends
-    /// the account's walls, and one kept or failed ends the hold a reset in
+    /// the claimed wall, and one kept or failed ends the hold a reset in
     /// flight put on every move off the account ([`reset_in_flight`]). So
     /// does a renewal: a session stopped on the login it replaced moves now.
     #[must_use]
@@ -4593,12 +4729,12 @@ fn end_pin(state: &mut State, account: &str, why: &str, t: i64, out: &mut Vec<Ev
     }
 }
 
-/// The wall of `walls` that stops standing first: the one a ninth wall
-/// takes the place of.
+/// The record a ninth raw window replaces: the oldest scoped clear first,
+/// otherwise the observed wall that stops standing first.
 fn most_lapsed(walls: &BTreeMap<String, Wall>) -> Option<String> {
     walls
         .iter()
-        .min_by_key(|(_, w)| w.stands_until())
+        .min_by_key(|(_, w)| (w.stands_until(), w.at))
         .map(|(k, _)| k.clone())
 }
 
@@ -4629,11 +4765,9 @@ pub fn believed_reset(until: Option<i64>, at: i64) -> Option<i64> {
 /// A wall on the pinned account ends the pin, whichever of those it was:
 /// seeing a wall there again says the same thing as seeing it first.
 ///
-/// THE OWNER'S CLEARING STANDS: a wall observed BEFORE the pin cleared the
-/// account's walls ([`Account::cleared_at`]) is the wall the owner cleared.
-/// It is dropped and ends no pin — a session left standing at that wall
-/// still has the row in its transcript, and a look at it ([`record_wall`])
-/// would otherwise put the wall back and end the owner's pin with it.
+/// An older row does not restore a wall cleared by the owner's account-wide
+/// pin or a reset of that raw window ([`Account::cleared_since`]). It is
+/// dropped and ends no pin. A row of the clearing's own second is new.
 ///
 /// A RESET TOO FAR OFF IS NOT BELIEVED ([`believed_reset`]): one more than
 /// [`RESET_BELIEVED_S`] past the observation is recorded as no reset, here,
@@ -4657,7 +4791,7 @@ pub fn note_wall(
     let Some(record) = account_mut(state, account) else {
         return out;
     };
-    if record.cleared_since(at, now) {
+    if record.cleared_since(&window, at, now).is_some() {
         return out;
     }
     let late = u32::from(until.is_none_or(|u| at > u));
@@ -4668,8 +4802,7 @@ pub fn note_wall(
     // held, newer or still standing.
     let attempts = match record.walls.get(&window) {
         Some(old) if at < old.at => None,
-        Some(old) if old.until == until => {
-            let end = old.stands_until();
+        Some(old) if old.until == until => old.stands_until().map_or(Some(late), |end| {
             if at < end {
                 None
             } else if at.saturating_sub(end) > WALL_EPISODE_S {
@@ -4677,7 +4810,7 @@ pub fn note_wall(
             } else {
                 Some(old.attempts.saturating_add(1))
             }
-        }
+        }),
         _ => Some(late),
     };
     if let Some(attempts) = attempts {
@@ -4694,6 +4827,7 @@ pub fn note_wall(
                 at,
                 by,
                 attempts,
+                cleared: false,
             },
         );
         let why = match until {
@@ -5094,21 +5228,31 @@ pub enum ResetClaimed {
 pub fn claim_reset(
     state: &mut State,
     account: &str,
-    until: i64,
+    wall: (&str, i64),
     sid: &str,
     pid: u32,
     start: &str,
     now: i64,
 ) -> ResetClaimed {
+    let (window, until) = wall;
     let sid = one_line(sid, WORD_MAX);
     let start = one_line(start, WORD_MAX);
-    if sid.is_empty() || start.is_empty() || pid == 0 || !admissible_label(account) {
+    let window = one_line(window, WORD_MAX);
+    if sid.is_empty()
+        || start.is_empty()
+        || window.is_empty()
+        || pid == 0
+        || !admissible_label(account)
+    {
         return ResetClaimed::Attempted;
     }
     if let Some(held) = &state.reset {
         let flying = held.done.is_none() && recent(held.at, now, RESET_CLAIM_S);
         let this_wall = held.until == Some(until);
-        let mine = held.sid == sid && held.pid == pid && held.start == start;
+        let mine = held.sid == sid
+            && held.pid == pid
+            && held.start == start
+            && held.window.as_deref() == Some(window.as_str());
         let stands_past = held
             .until
             .is_some_and(|theirs| until < theirs && now < theirs);
@@ -5127,6 +5271,7 @@ pub fn claim_reset(
     state.reset = Some(ResetClaim {
         account: account.to_owned(),
         until: Some(until),
+        window: Some(window),
         sid,
         at: now,
         pid,
@@ -5139,7 +5284,7 @@ pub fn claim_reset(
 /// Whether a reset is IN FLIGHT on `account` at `now`, as the instant its
 /// claim lapses: the slot names the account, has no outcome and is younger
 /// than [`RESET_CLAIM_S`]. While it is, nobody is moved off the account: the
-/// reset may be about to end its walls for every session on it, and a
+/// reset may be about to end its claimed wall for sessions on it, and a
 /// rotation made meanwhile would take the machine off an account just
 /// refilled. `None` once the outcome is recorded or the claim has lapsed,
 /// and for a claim stamped ahead of the clock.
@@ -5282,32 +5427,19 @@ fn reset_reason(why: &str) -> String {
 ///   [`ResetDone::Kept`];
 /// * `reset-failed` for [`ResetDone::Failed`].
 ///
-/// USED AND LIFTED END THE ACCOUNT'S WALLS FOR EVERYONE, as the owner's pin
-/// does ([`pin`]): the walls are cleared and the instant kept
-/// ([`Account::cleared_at`]). So a row still standing in a transcript does
-/// not put the wall back ([`note_wall`]), and a session standing at that row
-/// is advised to continue where it is ([`Advice::Resume`]). EACH WALLED
-/// WINDOW is said refilled at `now` ([`WindowSaid`], the newest word on it):
-/// the refill names the limit it refills (`Refills your weekly limit now`),
-/// and Lifted says that limit had reset on its own; kept, a week refilled
-/// stayed `nearly used` in the digest until its old reset ([`windows_full`]),
-/// and a warning drawn before the reset and said again changes nothing. A
-/// window is walled when its wall stood as the reset was claimed
-/// ([`ResetClaim::at`], [`Wall::stands_until`]) — the claimed wall always
-/// did, though an outcome may be read after it lapsed. A lapsed wall stays
-/// among the account's walls until they are cleared or a ninth takes its
-/// place: one from last week walls nothing now. A window that was not walled
-/// keeps its word. Kept and failed change no wall.
-/// `active`, the pin and the proof are left as they are.
-/// Every row wakes the waiting sessions ([`Event::wakes`]).
+/// Used and lifted clear only the claim's raw window, retaining a scoped
+/// tombstone in its existing [`Wall`] slot. Another raw window, a newer wall,
+/// a changed reset and an older claim with no scope are left intact. A
+/// generic session or weekly warning is refilled only for that exact claimed
+/// key, and never over a warning or sample newer than the claim. Kept and failed change no wall.
 ///
-/// EVERY wall of the account, whichever limits the grant refilled: the
-/// clearing is one instant an account, as the pin's is, and neither the
-/// walled window nor the limits a confirmation named reach this function.
-/// Where a limit the reset did not refill still stands, a session at it is
-/// advised to continue once, or one on another account is moved here, and
-/// the wall answers; it is then recorded again from its new row. That costs
-/// one continuation or one relaunch, never a reset.
+/// The account-wide [`Account::cleared_at`] remains the owner's [`pin`]
+/// write path; older schema-1 states may already contain that stamp from a
+/// past automatic reset, whose erased walls cannot be reconstructed here.
+/// `active`, the pin and the proof stay as they are. Every outcome wakes
+/// the waiting sessions ([`Event::wakes`]). Scoped clears share
+/// [`MAX_WALLS`]' bounded retention; eviction can require reading an old
+/// wall again, never clearing an unrelated one.
 pub fn reset_outcome(
     state: &mut State,
     account: &str,
@@ -5324,6 +5456,8 @@ pub fn reset_outcome(
     };
     claim.done = Some(done.word().to_owned());
     let claimed = claim.at;
+    let window = claim.window.clone();
+    let machine = state.machine.clone();
     let (kind, why) = match done {
         ResetDone::Used { left } => (
             Kind::ResetUsed,
@@ -5334,28 +5468,41 @@ pub fn reset_outcome(
         ResetDone::Failed(why) => (Kind::ResetFailed, reset_reason(why)),
     };
     if matches!(done, ResetDone::Used { .. } | ResetDone::Lifted)
+        && let Some(window) = window
         && let Some(record) = account_mut(state, account)
+        && let Some(wall) = record.walls.get_mut(&window)
+        && wall.until == Some(until)
+        && wall.at <= claimed
+        && !wall.cleared
     {
-        let refilled = Some(WindowSaid {
-            pct: None,
-            reset: None,
-            at: now,
-        });
-        let walled = |limit: &str| {
-            record
-                .walls
-                .get(limit)
-                .is_some_and(|wall| claimed < wall.stands_until())
+        let stood = wall.stands_until().is_some_and(|end| claimed < end);
+        wall.cleared = true;
+        wall.at = now;
+        wall.by = machine;
+        wall.attempts = 0;
+        let sample = record.sample.as_ref();
+        let bucket = match window.as_str() {
+            WEEK_LIMIT => Some((
+                &mut record.warned_week,
+                sample.filter(|s| s.week_pct.is_some()).map(|s| s.at),
+            )),
+            SESSION_LIMIT => Some((
+                &mut record.warned_session,
+                sample.filter(|s| s.session_pct.is_some()).map(|s| s.at),
+            )),
+            _ => None,
         };
-        let (week, session) = (walled(WEEK_LIMIT), walled(SESSION_LIMIT));
-        if week {
-            record.warned_week = refilled.clone();
+        if stood
+            && let Some((warned, sampled)) = bucket
+            && sampled.is_none_or(|at| at <= claimed)
+            && warned.as_ref().is_none_or(|w| w.at <= claimed)
+        {
+            *warned = Some(WindowSaid {
+                pct: None,
+                reset: None,
+                at: now,
+            });
         }
-        if session {
-            record.warned_session = refilled;
-        }
-        record.walls.clear();
-        record.cleared_at = Some(now);
     }
     vec![Event::new(now, kind, account).with_sid(&sid).because(&why)]
 }
@@ -6346,7 +6493,7 @@ impl Store {
     /// state's ([`Store::transact_held`]) with `logins.json` read and saved
     /// beside it — the logins FIRST, so a session the wake marker sends to
     /// decide again reads the binding the same transaction made.
-    fn transact_logins_held(
+    pub(super) fn transact_logins_held(
         &self,
         held: &Lock,
         now: i64,
@@ -6599,7 +6746,7 @@ pub fn record_wall(
         cleared = state
             .accounts
             .get(account)
-            .is_some_and(|record| record.cleared_since(at, now));
+            .is_some_and(|record| record.cleared_since(&window, at, now).is_some());
         events.extend(note_wall(state, account, &window, until, at, now));
         note_credits_word(state, account, wall.credits.as_ref(), at);
         changed = *state != before;
@@ -6711,8 +6858,9 @@ pub struct UsageSaid {
 /// that login, through a [`bound`] roster) — the facts [`record_wall`] is
 /// handed and judged by (the process's login a row of `roster`, its default
 /// home, a stored login), under the store's lock taken inside for the
-/// bounded wait. Nothing is typed, no session is touched, and no move is
-/// advised by this: nothing that moves a session reads it.
+/// bounded wait. This recorder types nothing and touches no session. Its
+/// warnings and credits episodes feed [`Account::low`] and the existing
+/// early-rotation advice ([`advise`]).
 ///
 /// ONE RULE KEEPS IT ([`Credits`], [`WindowSaid`]): what the screen says is
 /// as old as `said.at`, the newest answer it was drawn after

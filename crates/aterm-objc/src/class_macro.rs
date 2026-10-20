@@ -115,11 +115,13 @@ macro_rules! __aterm_objc_count {
 /// aterm's replacement for objc2's `declare_class!`, shaped by the declared
 /// classes in `aterm-gui` and `crates/aterm-window` (see [`crate::declare`]).
 ///
-/// ```ignore
+/// ```no_run
+/// # use aterm_objc::Id;
+/// # struct ReduceMotionIvars { relay: Box<dyn Fn()> }
 /// aterm_objc::declare_class! {
 ///     /// The notification-observer target.
 ///     pub(crate) struct ReduceMotionTarget: NSObject {
-///         const NAME: &str = "ATermReduceMotionTarget";
+///         const NAME: &str = "ATermDocReduceMotionTarget";
 ///         type Ivars = ReduceMotionIvars;
 ///
 ///         @sel(reduceMotionDidChange:)

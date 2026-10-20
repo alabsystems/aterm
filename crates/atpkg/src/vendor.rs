@@ -208,13 +208,15 @@ fn refuse2(head: &str, detail: &str) -> FlowError {
 
 /// Admit an artifact row before any byte moves, by its `protocol`:
 ///
-/// * `github-release` ([`check_release_row`]): only a bare `asset` name; the release lane's
-///   other gates are the signed `sha256`/`tree_root` at stage time;
+/// * `github-release` ([`check_release_row`]): only a bare `asset` name and no `dmg` payload
+///   (below); the release lane's other gates are the signed `sha256`/`tree_root` at stage
+///   time;
 /// * `https`: an allow-listed bare host, a known `payload` matching the `kind`
 ///   (`dmg` ⇔ `app-bundle`), a shimmable exposed `entry` for the single-binary lanes,
 ///   `strip_components` on archives only, `links` keys exposed and targets in-tree (none on
 ///   `tar-gz-binary`), a bare `asset` name, `size > 0`, a 64-hex `sha256`, a non-empty
-///   `tree_root`;
+///   `tree_root`; and then no `dmg` (`crate::install`'s `stage_dmg`: attaching an image
+///   raises macOS's removable-volume dialog);
 /// * anything else (the removed OS-installer protocols included) is refused by name.
 ///
 /// `exposes` is the manifest's signed `exposes` list: the single-binary `entry` and every
@@ -248,8 +250,21 @@ fn check_release_row(artifact: &Artifact) -> Result<(), FlowError> {
             &artifact.asset,
         ));
     }
+    // The stage picks its lane by `payload` whatever the protocol, so a release row naming
+    // the dmg lane would attach an image as an https one would: refused the same way.
+    if artifact.payload == "dmg" {
+        return Err(refuse(DMG_REFUSED));
+    }
     Ok(())
 }
+
+/// Why a row naming the `dmg` lane is refused, whatever its protocol: until a disk image can
+/// be read without attaching it, the attach and the read inside it draw macOS's
+/// removable-volume dialog where aterm lacks Full Disk Access, and a TCC dialog has no
+/// timeout (`install::stage_dmg`).
+const DMG_REFUSED: &str = "payload = dmg is refused until a disk image can be read without \
+     attaching it (attaching one raises macOS's removable-volume dialog, which waits for an \
+     answer)";
 
 /// The `https` half of [`check_row`].
 fn check_https_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowError> {
@@ -356,6 +371,11 @@ fn check_https_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowEr
     }
     if artifact.tree_root.is_empty() {
         return Err(refuse("tree_root is required for an https row"));
+    }
+    // 7. The dmg lane itself, last, so every other field of a dmg row is still judged
+    //    ([`DMG_REFUSED`]).
+    if artifact.payload == "dmg" {
+        return Err(refuse(DMG_REFUSED));
     }
     Ok(())
 }
@@ -651,6 +671,22 @@ pub fn shadowing_binary_on_path(
     first_foreign_on_path(prefix, bin, path_var, AtManaged::Stop)
 }
 
+/// The copy a shell runs when `bin` is typed: the first executable of that name in an
+/// absolute `PATH` entry, wherever it lives, the managed prefix included. The
+/// relative-entry and `PATHEXT` rules of [`system_binary_on_path`], none of its prefix
+/// rules: a program built into aterm ([`crate::builtin`]) has no managed copy for a walk
+/// to stop at or skip.
+#[must_use]
+pub fn first_on_path(bin: &str, path_var: Option<&OsStr>) -> Option<PathBuf> {
+    if !bare_file_name(bin) {
+        return None;
+    }
+    std::env::split_paths(path_var?)
+        .filter(|dir| !dir.as_os_str().is_empty() && dir.is_absolute())
+        .flat_map(|dir| lookup_candidates(&dir, bin))
+        .find(|candidate| is_executable_file(candidate))
+}
+
 #[cfg(test)]
 thread_local! {
     static PATH_VAR: std::cell::RefCell<Option<Option<std::ffi::OsString>>> =
@@ -813,6 +849,13 @@ mod tests {
         a.strip_components = 1;
         a.links.insert("gh".into(), "share/gh/bin/gh".into());
         check_row(&a, &["gh".to_string()]).expect("archive row admits");
+    }
+
+    /// A `dmg` row is refused before any download until an image can be read without
+    /// attaching it (`install::stage_dmg`): one whose every other field is admitted is
+    /// refused for its lane alone, with the reason.
+    #[test]
+    fn a_well_formed_dmg_row_is_refused_for_its_lane_alone() {
         let mut d = row();
         d.kind = "app-bundle".into();
         d.url = "https://github.com/example/app/releases/download/v1/App-1.0-universal.dmg".into();
@@ -824,7 +867,19 @@ mod tests {
             "emacsclient".into(),
             "Emacs.app/Contents/MacOS/bin/emacsclient".into(),
         );
-        check_row(&d, &["emacs".to_string(), "emacsclient".to_string()]).expect("dmg row admits");
+        let m = refused(&d, &["emacs".to_string(), "emacsclient".to_string()]);
+        assert!(m.starts_with("payload = dmg is refused"), "{m}");
+        assert!(m.contains("removable-volume dialog"), "{m}");
+        // The stage picks the lane by `payload` whatever the protocol: a release row naming
+        // it is refused too, and the same row on another lane is admitted.
+        let mut r = row();
+        r.protocol = "github-release".into();
+        r.sha256 = "d".into();
+        r.payload = "dmg".into();
+        let m = refused(&r, &[]);
+        assert!(m.starts_with("payload = dmg is refused"), "{m}");
+        r.payload = String::new();
+        check_row(&r, &[]).expect("the same release row on the bundle lane");
     }
 
     /// The kind ⇔ payload pairing over https: an app-bundle arrives only as a dmg, a binary

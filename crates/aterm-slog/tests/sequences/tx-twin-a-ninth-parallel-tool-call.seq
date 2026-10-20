@@ -1,0 +1,26 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_ninth_parallel_tool_call_is_counted_never_opened (S23).
+bind 0
+see busy
+tx prompt v1
+tx tool c0
+tx tool c1
+tx tool c2
+tx tool c3
+tx tool c4
+tx tool c5
+tx tool c6
+tx tool c7
+tx tool c8
+expect tx dropped=1
+tx result c0
+tx tool c9
+expect open p1 tool vref=c0
+expect open p2 tool vref=c1
+expect open p3 tool vref=c2
+expect open p4 tool vref=c3
+expect open p5 tool vref=c4
+expect open p6 tool vref=c5
+expect open p7 tool vref=c6
+expect open p8 tool vref=c7
+expect open p9 tool vref=c9

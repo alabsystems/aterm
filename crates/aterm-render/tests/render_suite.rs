@@ -51,6 +51,7 @@ mod font_subpixel_config;
 mod free_composite;
 mod free_overlay;
 mod fuzz_render_never_panics;
+mod fx_layers;
 mod glow_halo;
 mod glow_under;
 mod incoming_row_apron;

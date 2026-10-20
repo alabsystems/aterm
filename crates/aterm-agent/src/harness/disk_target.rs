@@ -5,14 +5,22 @@
 //! profile's `incremental/`. Incremental state is the largest share of a debug build directory
 //! and losing it costs only speed.
 //!
-//! `incremental/` is the only unit, by design. `deps/`, `build/` and `.fingerprint/` are
-//! `targo clean`'s: cargo releases its locks before it runs tests, doctests or a runner, and
-//! those read `deps/` and `build/`, so no lock proves them unused. Nothing is reached through
-//! a symlink.
+//! `incremental/` is the unit of tiers 2 and 4 and of the owner's verb. `deps/`, `build/` and
+//! `.fingerprint/` are not theirs: cargo releases its locks before it runs tests, doctests or
+//! a runner, and those read `deps/` and `build/`, so no lock proves them unused. Nothing is
+//! reached through a symlink.
 //!
-//! One exception: below the floor, a build directory whose owner is gone goes whole
-//! ([`reclaim_whole`]), where what is running stands in for the missing lock proof
-//! (`super::discover::unused`).
+//! Two exceptions, each the window's pass's alone, where what is running stands in for the
+//! missing lock proof — asked of every process of this uid, aterm's own executable and
+//! working directory included (`super::discover::unused_under`), and asked again under the
+//! locks, right before the delete:
+//!
+//! - tier 1, a build directory whose owner is gone, goes whole ([`reclaim_whole`]);
+//! - tier 3, a live checkout's whole idle build directory, has each profile EMPTIED of
+//!   cargo's own outputs ([`reclaim_profiles`], [`PROFILE_OUTPUTS`]): its caches,
+//!   `examples/`, its dep-info files and its uplifted artifacts. Anything else in a profile
+//!   (an app bundle, a file a tool or a person put there) and everything at the build
+//!   directory's root that is not a profile stays.
 //!
 //! # Profiles and idleness
 //!
@@ -81,6 +89,36 @@ pub const CACHE_DIRS: &[&str] = &[".fingerprint", "deps", "build", "incremental"
 /// What dates a profile: the directories a compile writes, and `examples/`.
 /// Not `incremental/`, which the reclaim's own unlinks write.
 pub const CLOCK_DIRS: &[&str] = &[".fingerprint", "deps", "build", "examples"];
+
+/// A profile's directories cargo writes and rebuilds: what tier 3 empties
+/// ([`reclaim_profiles`]), with the dep-info files and the uplifted
+/// artifacts beside them ([`uplift_twin`]). Nothing else of a profile goes.
+pub const PROFILE_OUTPUTS: &[&str] = &[".fingerprint", "build", "deps", "incremental", "examples"];
+
+/// Is the `deps/` entry `dep` the hashed twin of `name`, the artifact cargo
+/// uplifts into the profile: `name` is `<stem><ext>` (`ext` from its last
+/// `.`, none for a bare binary) and `dep` is `<stem>-<hash><ext>`, the stems
+/// equal with `-` read as `_` (a binary keeps its target's `-`, its twin
+/// carries the crate's `_`) and `<hash>` at least eight hex digits. PURE.
+#[must_use]
+pub fn uplift_twin(name: &str, dep: &str) -> bool {
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => name.split_at(i),
+        _ => (name, ""),
+    };
+    if stem.is_empty() || (ext.is_empty() && dep.contains('.')) {
+        return false;
+    }
+    let Some(rest) = dep.strip_suffix(ext) else {
+        return false;
+    };
+    let Some((twin, hash)) = rest.rsplit_once('-') else {
+        return false;
+    };
+    hash.len() >= 8
+        && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        && twin.replace('-', "_") == stem.replace('-', "_")
+}
 
 /// Root entries that mark source. A build directory holding any of them at its root is not a
 /// candidate.
@@ -185,6 +223,13 @@ pub struct TargetDir {
     /// Its whole size ([`total_bytes`]) and whether that is a floor, when it
     /// was sized: what the report's largest-hogs list reads.
     pub total: Option<(u64, bool)>,
+    /// Why it holds an entry of another user, when the sizing walk met one
+    /// ([`total_bytes_owned`]): a whole removal could not delete it, and would
+    /// leave a half-removed directory, so none is made.
+    pub foreign: Option<String>,
+    /// Tier 3's verdict on it ([`super::idle::assess`]): its facts as a whole
+    /// idle build directory, or why it is kept whole. `None`: not assessed.
+    pub idle: Option<Result<super::idle::IdleFacts, String>>,
 }
 
 impl TargetDir {
@@ -412,6 +457,137 @@ pub fn total_bytes(dir: &Path) -> (u64, bool) {
     walk_bytes(dir, |meta| same_dev(meta, dev), shared_blocks)
 }
 
+/// [`total_bytes`], and the first owner other than this process's user met
+/// on the way (the directory itself included), said as why a whole removal
+/// does not go: such an entry would fail to delete.
+#[must_use]
+pub fn total_bytes_owned(dir: &Path) -> ((u64, bool), Option<String>) {
+    let dev = dev_of(dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let me = super::discover::own_uid();
+        let foreign = std::cell::Cell::new(
+            std::fs::symlink_metadata(dir)
+                .ok()
+                .map(|m| m.uid())
+                .filter(|uid| *uid != me),
+        );
+        let seen = |meta: &std::fs::Metadata| {
+            if foreign.get().is_none() && meta.uid() != me {
+                foreign.set(Some(meta.uid()));
+            }
+        };
+        let total = walk_bytes(
+            dir,
+            |meta| {
+                seen(meta);
+                same_dev(meta, dev)
+            },
+            |meta| {
+                seen(meta);
+                shared_blocks(meta)
+            },
+        );
+        let why = foreign.get().map(|uid| {
+            format!(
+                "it holds an entry of another user (uid {uid}), which a removal could not delete"
+            )
+        });
+        (total, why)
+    }
+    #[cfg(not(unix))]
+    {
+        (
+            walk_bytes(dir, |meta| same_dev(meta, dev), shared_blocks),
+            None,
+        )
+    }
+}
+
+/// The most entries [`foreign_beyond`] reads.
+pub const FOREIGN_WALK_ENTRIES: usize = 5_000_000;
+
+/// [`foreign_beyond`]'s wall-clock bound.
+pub const FOREIGN_WALK_WALL: Duration = Duration::from_secs(60);
+
+/// THE OTHER-USER FENCE OF A WHOLE REMOVAL, past a sizing walk that stopped
+/// short ([`total_bytes_owned`]: a large build directory holds more than
+/// [`MAX_WALK_ENTRIES`], or a folder could not be read): its own walk, up
+/// to [`FOREIGN_WALK_ENTRIES`] entries and [`FOREIGN_WALK_WALL`], never
+/// through a link or onto another device. `None`: every entry read, each
+/// this user's. `Some(why)`: an entry of another user, or why none could be
+/// ruled out (a walk cut short, a folder or an entry it could not read) —
+/// either keeps the directory from going whole.
+#[must_use]
+pub fn foreign_beyond(dir: &Path) -> Option<String> {
+    foreign_walk(dir, FOREIGN_WALK_ENTRIES, FOREIGN_WALK_WALL)
+}
+
+/// [`foreign_beyond`] within `max` entries and `wall`.
+#[must_use]
+pub fn foreign_walk(dir: &Path, max: usize, wall: Duration) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let me = super::discover::own_uid();
+        let dev = dev_of(dir);
+        let started = std::time::Instant::now();
+        let mut seen = 0usize;
+        let mut stack = vec![dir.to_path_buf()];
+        let unruled = |what: String| {
+            Some(format!(
+                "{what}, so nothing of another user's in it is ruled out"
+            ))
+        };
+        while let Some(d) = stack.pop() {
+            if started.elapsed() >= wall {
+                return unruled("its ownership walk ran out of time".to_owned());
+            }
+            let rd = match std::fs::read_dir(&d) {
+                Ok(rd) => rd,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return unruled(format!("{} could not be read ({e})", d.display())),
+            };
+            for entry in rd {
+                let Ok(entry) = entry else {
+                    return unruled(format!("{} could not be listed", d.display()));
+                };
+                seen += 1;
+                super::beat::tick(1);
+                if seen > max {
+                    return unruled(format!("it holds more than {max} entries"));
+                }
+                let meta = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        return unruled(format!(
+                            "{} could not be read ({e})",
+                            entry.path().display()
+                        ));
+                    }
+                };
+                if meta.uid() != me {
+                    return Some(format!(
+                        "it holds an entry of another user (uid {}), which a removal could not delete",
+                        meta.uid()
+                    ));
+                }
+                if meta.is_dir() && same_dev(&meta, dev) {
+                    stack.push(entry.path());
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, max, wall);
+        Some("no owner can be read here, so nothing of another user's is ruled out".to_owned())
+    }
+}
+
 /// The blocks of the file `meta` describes, divided among its links.
 fn shared_blocks(meta: &std::fs::Metadata) -> u64 {
     #[cfg(unix)]
@@ -473,6 +649,8 @@ fn facts(path: &Path, budget: WalkBudget) -> Option<TargetDir> {
         origin: Origin::Named,
         owned: Owned::NotOwned,
         total: None,
+        foreign: None,
+        idle: None,
     })
 }
 
@@ -650,14 +828,14 @@ fn released(meta: &std::fs::Metadata) -> u64 {
 // Reclaim
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     static FAULT_CREATE_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A test's fault: on this thread, creating a missing lock fails as a full
 /// disk makes it fail (ENOSPC).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn inject_create_lock_fault(on: bool) {
     FAULT_CREATE_LOCK.with(|f| f.set(on));
 }
@@ -802,6 +980,64 @@ pub fn reclaim_whole_with(
     hook: &mut dyn FnMut(Stage, &Path),
 ) -> io::Result<Removed> {
     fd::reclaim_whole(path, judge, seen, quiet_s, check, hook)
+}
+
+/// TIER 3's removal of a live checkout's whole idle build directory
+/// (`super::Witness::IdleWhole`): its PROFILES EMPTIED, one at a time, each
+/// under every one of its cargo locks, and kept — the profile directory and
+/// its lock files stay, so a cargo that starts meanwhile waits on the real
+/// lock and then rebuilds into a consistent, empty profile (had the lock files
+/// been unlinked, or the directory renamed away, that cargo would hold a lock
+/// on a dead inode while a second locked a new file, and two builds would
+/// write one profile). Under each profile's locks its clock is read again
+/// (written no later than `seen`, the survey's newest last use, and not
+/// within `window_s` of `judge.now`) and the mount table (`mounts`); its
+/// `.fingerprint/` goes first (an interrupted removal leaves a profile cargo
+/// rebuilds, never one whose fingerprints vouch for missing outputs), then
+/// `build/`, `deps/`, `incremental/`, `examples/`, the dep-info files and the
+/// uplifted artifacts — only cargo's own outputs ([`PROFILE_OUTPUTS`],
+/// [`uplift_twin`]); any other entry of a profile stays and is said in
+/// [`super::Removed::skipped`]. Under each profile's locks, after its clock
+/// and the mount table, `between` is asked too — for every profile, the
+/// first included — right before the delete (no process runs from the
+/// checkout or the build directory, its git files still quiet): cargo gives
+/// its locks up before it runs a test from `deps/`. Nothing at the build
+/// directory's root that is not a profile is touched (`doc/`, `criterion/`,
+/// `tmp/`, `package/`, anything unknown, the markers). A held lock, or a
+/// refusal, stops the removal there: what was emptied stays emptied (each
+/// profile is consistent on its own), the rest is kept and said.
+///
+/// # Errors
+///
+/// As [`reclaim`]; the marker is not a signed `CACHEDIR.TAG`; it holds no
+/// profile; or nothing was emptied (each profile's reason in the message).
+pub fn reclaim_profiles(
+    path: &Path,
+    judge: &Judge,
+    seen: i64,
+    window_s: i64,
+    mounts: &mut dyn FnMut() -> Result<(), String>,
+    between: &mut dyn FnMut() -> Result<(), String>,
+) -> io::Result<Removed> {
+    reclaim_profiles_with(path, judge, seen, window_s, mounts, between, &mut |_, _| {})
+}
+
+/// [`reclaim_profiles`] with a hook told each [`Stage`] of each profile (a
+/// test's probe; the path is the profile's).
+///
+/// # Errors
+///
+/// As [`reclaim_profiles`].
+pub fn reclaim_profiles_with(
+    path: &Path,
+    judge: &Judge,
+    seen: i64,
+    window_s: i64,
+    mounts: &mut dyn FnMut() -> Result<(), String>,
+    between: &mut dyn FnMut() -> Result<(), String>,
+    hook: &mut dyn FnMut(Stage, &Path),
+) -> io::Result<Removed> {
+    fd::reclaim_profiles(path, judge, (seen, window_s), mounts, between, hook)
 }
 
 /// Which profiles one reclaim of a build directory takes.
@@ -1033,6 +1269,7 @@ mod fd {
                 }
             };
             self.entries = self.entries.saturating_add(names.len());
+            super::super::beat::tick(names.len());
             if self.entries > self.budget.entries {
                 self.cut = Some(format!(
                     "it holds more than {} entries outside its caches",
@@ -1234,6 +1471,7 @@ mod fd {
                     .push(format!("{}: {}", here.display(), io::Error::from(e)));
             }
         };
+        super::super::beat::tick(1);
         let Some(fd) = dir else {
             let freed = open_file(parent, name)
                 .and_then(|f| f.metadata().ok())
@@ -1378,6 +1616,8 @@ mod fd {
             origin: super::Origin::Named,
             owned: super::Owned::NotOwned,
             total: None,
+            foreign: None,
+            idle: None,
         }
         .fences()
         .map_err(refuse)?;
@@ -1501,6 +1741,270 @@ mod fd {
         })
     }
 
+    /// Where a profile's entry is deleted in [`reclaim_profiles`]' order:
+    /// `.fingerprint/` first, then what a build reads, the uplifted files last.
+    fn content_rank(name: &OsStr) -> u8 {
+        match name.to_str() {
+            Some(".fingerprint") => 0,
+            Some("build") => 1,
+            Some("deps") => 2,
+            Some("incremental") => 3,
+            Some("examples") => 4,
+            _ => 5,
+        }
+    }
+
+    /// The same artifact through stable plain-file handles: hard links need no
+    /// reads; distinct inodes must hold equal bytes, with both identities and
+    /// write stamps unchanged throughout. An unreadable or changing file stays.
+    fn same_artifact(left: &std::fs::File, right: &std::fs::File) -> bool {
+        use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+
+        let (Ok(a), Ok(b)) = (left.metadata(), right.metadata()) else {
+            return false;
+        };
+        if a.len() != b.len() {
+            return false;
+        }
+        if a.dev() != b.dev() || a.ino() != b.ino() {
+            let mut at = 0;
+            let mut left_bytes = [0u8; 8192];
+            let mut right_bytes = [0u8; 8192];
+            while at < a.len() {
+                let count = (a.len() - at).min(left_bytes.len() as u64) as usize;
+                if left.read_exact_at(&mut left_bytes[..count], at).is_err()
+                    || right.read_exact_at(&mut right_bytes[..count], at).is_err()
+                    || left_bytes[..count] != right_bytes[..count]
+                {
+                    return false;
+                }
+                at += count as u64;
+            }
+        }
+        let stamp = |m: &std::fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        left.metadata()
+            .is_ok_and(|after| stamp(&a) == stamp(&after))
+            && right
+                .metadata()
+                .is_ok_and(|after| stamp(&b) == stamp(&after))
+    }
+
+    /// Is the entry `name` of the profile `profile` cargo's own output, which
+    /// tier 3 empties ([`super::PROFILE_OUTPUTS`])? Its caches and
+    /// `examples/`; a dep-info file (`*.d`, a plain file); and an UPLIFTED
+    /// artifact: a plain file or a link whose `deps/` twin is there by
+    /// cargo's naming (`<stem>-<hash><ext>`, `-` read as `_`), a plain one
+    /// the same inode as that twin (a hard link) or the same stable bytes
+    /// (macOS cargo copies by clone), a link only where it is one (cargo links an
+    /// uplifted `.dSYM`). Anything else — an app bundle a packager wrote, a
+    /// database a tool keeps beside its binary, a file a person put there —
+    /// is not cargo's to rebuild, and stays.
+    fn cargo_output(profile: &OwnedFd, name: &OsStr, deps: &[OsString]) -> bool {
+        if super::PROFILE_OUTPUTS.iter().any(|o| name == *o) {
+            return true;
+        }
+        let Some(text) = name.to_str() else {
+            return false;
+        };
+        let plain = open_file(profile, name);
+        if text.len() > 2 && text.ends_with(".d") && plain.is_some() {
+            return true;
+        }
+        let twins: Vec<&OsString> = deps
+            .iter()
+            .filter(|d| d.to_str().is_some_and(|d| super::uplift_twin(text, d)))
+            .collect();
+        if twins.is_empty() {
+            return false;
+        }
+        match plain {
+            Some(file) => {
+                let Ok(Some(deps_fd)) = open_dir(profile, OsStr::new("deps")) else {
+                    return false;
+                };
+                twins.iter().any(|twin| {
+                    open_file(&deps_fd, twin).is_some_and(|twin| same_artifact(&file, &twin))
+                })
+            }
+            // Not a plain file: a link (never followed, `ELOOP` under
+            // `O_NOFOLLOW`) is unlinked; a directory or anything else stays.
+            None => matches!(
+                dirfd::openat(
+                    profile,
+                    name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                    Mode::empty()
+                ),
+                Err(e) if e.0 == libc::ELOOP
+            ),
+        }
+    }
+
+    /// Empty the profiles of the build directory at `path`
+    /// ([`super::reclaim_profiles`]).
+    pub(super) fn reclaim_profiles(
+        path: &Path,
+        judge: &Judge,
+        (seen, window_s): (i64, i64),
+        mounts: &mut dyn FnMut() -> Result<(), String>,
+        between: &mut dyn FnMut() -> Result<(), String>,
+        hook: &mut dyn FnMut(Stage, &Path),
+    ) -> io::Result<Removed> {
+        let root = pin(path).map_err(gone_since)?;
+        let root_dev = dev(&root)?;
+        if judge.device.is_some_and(|d| d != root_dev) {
+            return Err(io::Error::other(
+                "no longer a candidate: it is on another volume than the one measured",
+            ));
+        }
+        let refuse = |why: String| io::Error::other(format!("no longer a candidate: {why}"));
+        let (marker, holds_source) = root_facts(path);
+        let (profiles, cut) = find_at(&root, path, WalkBudget::SHIPPED);
+        let marker = TargetDir {
+            path: path.to_path_buf(),
+            marker,
+            holds_source,
+            walk_cut_short: cut,
+            profiles: Vec::new(),
+            device: Some(root_dev),
+            probed_recent: false,
+            origin: super::Origin::Named,
+            owned: super::Owned::NotOwned,
+            total: None,
+            foreign: None,
+            idle: None,
+        }
+        .fences()
+        .map_err(refuse)?;
+        if marker != "CACHEDIR.TAG" {
+            return Err(refuse(format!(
+                "only a signed CACHEDIR.TAG lets a whole build directory go, and it carries {marker}"
+            )));
+        }
+        if profiles.is_empty() {
+            return Err(refuse("it holds no cargo profile".to_owned()));
+        }
+        let mut done = Removed::default();
+        let mut stop: Option<(usize, String)> = None;
+        for (i, profile) in profiles.iter().enumerate() {
+            let fd = match reopen(&root, path, profile, root_dev) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    stop = Some((i, e.to_string()));
+                    break;
+                }
+            };
+            // 1. Every lock, exclusively, without waiting: a held one stops
+            // the removal here.
+            let held = match take_all(&fd, profile) {
+                Ok(held) => held,
+                Err(why) => {
+                    stop = Some((i, why));
+                    break;
+                }
+            };
+            hook(Stage::Locked, profile);
+            // 2. Under the locks: still a profile, still idle, no mount point.
+            let names = match names(&fd) {
+                Ok(n) => n,
+                Err(e) => {
+                    stop = Some((i, format!("it could not be read: {e}")));
+                    break;
+                }
+            };
+            let refused = if !has_layout(&fd, &names) {
+                Some("no longer a cargo profile".to_owned())
+            } else {
+                match clock_at(&fd) {
+                    None => Some("its caches' clock could not be read".to_owned()),
+                    Some(m) if m > seen => Some("written into since the survey".to_owned()),
+                    Some(m) if judge.now.saturating_sub(m) < window_s => Some(format!(
+                        "written into {} ago, inside the {} window",
+                        super::human_age(judge.now.saturating_sub(m)),
+                        super::human_age(window_s)
+                    )),
+                    // The caller's checks last, every lock held: no process
+                    // runs from the checkout or the build directory (cargo
+                    // gives its locks up before it runs a test from `deps/`,
+                    // so the locks alone prove nothing of it) and its git
+                    // files still quiet — asked for EVERY profile, the first
+                    // too, right before its delete.
+                    Some(_) => mounts().err().or_else(|| between().err()),
+                }
+            };
+            if let Some(why) = refused {
+                stop = Some((i, why));
+                break;
+            }
+            hook(Stage::Deleting, profile);
+            // 3. Its contents, every lock still held: fingerprints first, the
+            // lock files kept, and only what is cargo's own
+            // ([`cargo_output`]); anything else stays, and is said.
+            let deps = open_dir(&fd, OsStr::new("deps"))
+                .ok()
+                .flatten()
+                .and_then(|d| self::names(&d).ok())
+                .unwrap_or_default();
+            let mut order: Vec<OsString> = Vec::new();
+            for name in names {
+                if CARGO_LOCKS.iter().any(|l| name == *l) {
+                    continue;
+                }
+                if cargo_output(&fd, &name, &deps) {
+                    order.push(name);
+                } else {
+                    done.skipped.push((
+                        profile.join(&name),
+                        "kept: not one of cargo's outputs (tier 3 empties only its caches, \
+                         examples/, dep-info files and uplifted artifacts)"
+                            .to_owned(),
+                    ));
+                }
+            }
+            order.sort_by_key(|n| content_rank(n));
+            let mut deleted = Deleted::default();
+            for name in order {
+                remove_tree_at(&fd, &name, profile, root_dev, 1, &mut deleted);
+            }
+            // 4. Release: `LOCK_UN`, each ([`HeldLock`]).
+            drop(held);
+            hook(Stage::Released, profile);
+            done.bytes = done.bytes.saturating_add(deleted.bytes);
+            if deleted.kept.is_empty() {
+                done.units.push(profile.clone());
+            }
+            done.trouble.extend(deleted.kept);
+        }
+        if let Some((from, why)) = stop {
+            for p in &profiles[from..] {
+                done.skipped.push((p.clone(), why.clone()));
+            }
+        }
+        if done.units.is_empty() && done.bytes == 0 {
+            let mut why: Vec<String> = done
+                .skipped
+                .iter()
+                .map(|(p, w)| format!("{}: {w}", p.display()))
+                .collect();
+            why.extend(done.trouble.iter().cloned());
+            return Err(io::Error::other(format!(
+                "nothing reclaimed — {}",
+                why.join("; ")
+            )));
+        }
+        Ok(done)
+    }
+
     /// Reclaim the build directory at `path`: the profiles `select` names.
     pub(super) fn reclaim(
         path: &Path,
@@ -1529,6 +2033,8 @@ mod fd {
             origin: super::Origin::Named,
             owned: super::Owned::NotOwned,
             total: None,
+            foreign: None,
+            idle: None,
         }
         .fences()
         .map_err(|why| io::Error::other(format!("no longer a candidate: {why}")))?;
@@ -1630,6 +2136,16 @@ mod fd {
         _seen: i64,
         _quiet_s: i64,
         _check: &mut dyn FnMut() -> Result<(), String>,
+        _hook: &mut dyn FnMut(Stage, &Path),
+    ) -> io::Result<Removed> {
+        Err(io::Error::other("reclaiming build caches is unix-only"))
+    }
+    pub(super) fn reclaim_profiles(
+        _path: &Path,
+        _judge: &Judge,
+        _window: (i64, i64),
+        _mounts: &mut dyn FnMut() -> Result<(), String>,
+        _between: &mut dyn FnMut() -> Result<(), String>,
         _hook: &mut dyn FnMut(Stage, &Path),
     ) -> io::Result<Removed> {
         Err(io::Error::other("reclaiming build caches is unix-only"))

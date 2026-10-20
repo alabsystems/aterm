@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The `rustc` group publish over fakes of its parts (the packers, the indexer, the seal's
-//! `-Vv`, the receipt switch, the candidate gate) and real git checkouts in scratch: the
+//! `-Vv`, the receipt switch) and real git checkouts in scratch: the
 //! preflight collects every refusal before anything runs (the seal, the exposes, a live
 //! tree, the store, the trust build and every sibling judged against the floor per target,
 //! the force rules), and step 2 re-checks each sibling before any packs and before its
@@ -20,7 +20,6 @@ use atpkg_publish::api::{
 };
 use atpkg_publish::artifact::lineage_switch::Switch;
 use atpkg_publish::channel::Log;
-use atpkg_publish::channel::candidate::{CandidateGate, GateAnswer};
 use atpkg_publish::channel::group::{
     GroupOutcome, GroupRequest, Mode, Parts, SealProbe, publish_group,
 };
@@ -113,18 +112,6 @@ impl SealProbe for Probe {
     }
 }
 
-struct Gate {
-    answer: GateAnswer,
-    asked: RefCell<Vec<Option<u64>>>,
-}
-
-impl CandidateGate for Gate {
-    fn admits(&self, _: &Ctx, _: &Path, pin: Option<u64>) -> GateAnswer {
-        self.asked.borrow_mut().push(pin);
-        self.answer.clone()
-    }
-}
-
 /// A step a peer session takes while a pack runs.
 type During = RefCell<Option<Box<dyn Fn()>>>;
 /// The same, told which sibling is packing.
@@ -202,7 +189,6 @@ struct Cut {
     commit: String,
     checkouts: BTreeMap<String, PathBuf>,
     probe: Probe,
-    gate: Gate,
     packs: Packs,
 }
 
@@ -267,10 +253,6 @@ fn cut_unstaged(label: &str, pins: &[(&str, u64)], overlay: &[(&str, u64)]) -> C
             vv: RefCell::new(vv(&commit, MAC)),
             switch: Switch::Dormant,
         },
-        gate: Gate {
-            answer: GateAnswer::Admitted("PASS (fixture receipt)".into()),
-            asked: RefCell::new(Vec::new()),
-        },
         packs: Packs::default(),
         rig,
         seal,
@@ -303,7 +285,6 @@ fn request(c: &Cut, mode: Mode) -> GroupRequest {
 fn run(c: &Cut, req: &GroupRequest) -> (Result<GroupOutcome>, Log) {
     let parts = Parts {
         probe: &c.probe,
-        gate: &c.gate,
         bundle: &c.packs,
         packer: &c.packs,
         indexer: &c.packs,
@@ -341,17 +322,6 @@ fn a_dry_run_judges_everything_and_runs_nothing() {
     assert!(o.builds.is_empty() && o.index_build.is_none());
     assert!(c.packs.bundles.borrow().is_empty() && c.packs.packs.borrow().is_empty());
     assert!(c.packs.indexes.borrow().is_empty());
-    assert_eq!(
-        *c.gate.asked.borrow(),
-        [Some(3)],
-        "a dry run asks the gate (in-process, cheap), against the published pin"
-    );
-    ok(&c, &request(&c, Mode::Stage));
-    assert_eq!(
-        *c.gate.asked.borrow(),
-        [Some(3), Some(3)],
-        "a stage asks the gate too"
-    );
 }
 
 #[test]
@@ -739,25 +709,6 @@ fn a_sibling_that_moves_while_the_bundle_packs_stops_the_cut() {
         .map(|p| p.program.clone())
         .collect();
     assert_eq!(packed, ["trust-cg", "trust-ir"]);
-}
-
-#[test]
-fn the_candidate_gate_decides_a_publish_and_informs_a_stage() {
-    let mut c = cut("group-gate", &FLOOR, &[]);
-    c.gate.answer = GateAnswer::Refused(vec![
-        "no candidate-gate receipt names this seal".into(),
-        "second reason".into(),
-    ]);
-    ok(&c, &request(&c, Mode::Stage));
-    let e = refused(&c, &request(&c, Mode::Upload));
-    assert!(
-        e.contains("no candidate-gate receipt names this seal") && e.contains("second reason"),
-        "{e}"
-    );
-    c.gate.answer = GateAnswer::CannotCheck("the gate could not check".into());
-    assert!(refused(&c, &request(&c, Mode::Upload)).contains("the gate could not check"));
-    c.gate.answer = GateAnswer::Admitted("PASS (r)".into());
-    ok(&c, &request(&c, Mode::Stage));
 }
 
 #[test]

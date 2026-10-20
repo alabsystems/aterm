@@ -14,16 +14,16 @@
 //!   `try_proxy_forward` writes `ERR forward` to the client.
 //!
 //! Five runs: the real relay (delivered, no error), a relay stage that fails
-//! after delivery (injected at the seam; fd exhaustion cannot be staged in a
-//! shared test process), a dial with no listener, a child that never accepts,
-//! and a sibling whose token is unreadable once connected (the last three
-//! reported, never delivered).
+//! after delivery (injected at the seam; a worker thread the system refuses to
+//! start cannot be staged in a shared test process), a dial with no listener, a
+//! child that never accepts, and a sibling whose token is unreadable once
+//! connected (the last three reported, never delivered).
 //!
 //! Negative control: from the real delivered state, reporting the relay
 //! failure is rejected by the committed model and admitted by `Buggy = 1`.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::sync::mpsc;
 
 use aterm_models_effects::reply_fidelity_model;
@@ -152,7 +152,7 @@ fn real_forward_outcomes_conform_to_reply_fidelity_model() {
     let mut at_relay = None;
     let result = deliver_then_relay(&c.sock, &line(), &client_relay, &[], PATIENCE, |_, _, _| {
         at_relay = Some(state(child_read(&c), false));
-        Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+        Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
     });
     let delivered = at_relay.expect("the relay stage ran");
     let (ok, why) = conforms(&init, &delivered, "Deliver");
@@ -207,10 +207,12 @@ fn real_forward_outcomes_conform_to_reply_fidelity_model() {
     let tokenless = dir.path().join("aterm-77031.sock");
     let listener = aterm_uds::CtlListener::bind(&tokenless).expect("bind the sibling");
     let heard = std::thread::spawn(move || {
-        let (mut conn, _) = listener.accept().expect("accept");
-        let mut read = Vec::new();
-        let _ = conn.read_to_end(&mut read);
-        read
+        let (conn, _) = listener.accept().expect("accept");
+        // In read slices, never one read parked on the end-of-file
+        // ([`crate::test_socket::read_to_end_of_file`]).
+        crate::test_socket::read_to_end_of_file(&conn, |read| {
+            format!("the forward's end ({} bytes read)", read.len())
+        })
     });
     let (_client_app, client_relay) = CtlStream::pair().expect("pair");
     let sibling = ForwardLine::sibling("@s-1 screen".into());
@@ -226,7 +228,7 @@ fn real_forward_outcomes_conform_to_reply_fidelity_model() {
     // in its backlog, otherwise this closed connection is, so the run is
     // judged rather than hung.
     drop(CtlStream::connect(&tokenless));
-    // Its `read_to_end` ends at the last close of the forward's end, which a
+    // Its read ends at the last close of the forward's end, which a
     // sibling's fork may hold until its exec: a delay, joined with a hang
     // detector.
     let heard = join_after_hang_up(heard, "the sibling to read the forward to its end");

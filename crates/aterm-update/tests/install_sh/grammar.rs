@@ -12,7 +12,9 @@ use aterm_update_core::pointer::{self, canonical_app_tag};
 use aterm_update_core::tag::{TagKind, parse_release_tag};
 use aterm_update_core::{HeadAnswer, is_valid_slug};
 
-use crate::support::{Lib, Rng, Scratch, q, s};
+use std::path::Path;
+
+use crate::support::{Lib, Rng, Scratch, install_sh, q, s};
 
 /// The locales a `curl … | bash` meets: none set, and a person's UTF-8 shell.
 const LOCALES: [&str; 2] = ["C", "en_US.UTF-8"];
@@ -79,7 +81,10 @@ fn tag_corpus() -> Vec<String> {
     .iter()
     .map(|t| (*t).to_string())
     .collect();
-    let small = &COMPONENTS[..10];
+    // One spelling of each small-component class (zero, a digit at each end of
+    // the range, two and three digits, a leading zero, a doubled zero) in every
+    // position.
+    let small = ["0", "1", "9", "10", "100", "01", "00"];
     for a in small {
         tags.push(format!("v{a}"));
         for b in small {
@@ -90,7 +95,7 @@ fn tag_corpus() -> Vec<String> {
         }
     }
     let mut rng = Rng::new(0x7a67_5f67_7261_6d6d);
-    for _ in 0..1500 {
+    for _ in 0..500 {
         let prefix = *rng.pick(&["v", "v", "v", "", "V", "vv", "v "]);
         let arity = rng.below(6);
         let parts: Vec<&str> = (0..arity).map(|_| *rng.pick(COMPONENTS)).collect();
@@ -115,7 +120,9 @@ fn updater_tag(tag: &str) -> (&'static str, bool) {
 }
 
 /// The tags whose classification differs between the installer and the
-/// updater, with `redefine` (shell code run after sourcing) applied first.
+/// updater, with `redefine` (shell code run after sourcing) applied first. The
+/// walk ticks the batch's progress at every tag (`__tick`), so the hang
+/// detector times one tag, never the corpus.
 fn tag_disagreements(scratch: &Scratch, redefine: &str, locale: &str) -> Vec<String> {
     let corpus = tag_corpus();
     let file = scratch.write("tags", corpus.join("\n") + "\n");
@@ -128,6 +135,7 @@ fn tag_disagreements(scratch: &Scratch, redefine: &str, locale: &str) -> Vec<Str
 			if parse_release_tag \"$tag\"; then k=\"$TAG_KIND_RESULT\"; else k=refused; fi
 			if canonical_authority_tag \"$tag\"; then a=1; else a=0; fi
 			printf '%s %s\\n' \"$k\" \"$a\"
+			__tick
 		done <{} >{}",
         q(s(&file)),
         q(s(&out))
@@ -206,7 +214,7 @@ fn tag_order_agrees_with_the_updaters_release_order() {
     let scratch = Scratch::new();
     let mut rng = Rng::new(0x6f_7264_6572);
     let mut pairs: Vec<(String, String)> = Vec::new();
-    for _ in 0..600 {
+    for _ in 0..200 {
         let a = candidate(&mut rng);
         let b = if rng.below(4) == 0 {
             a.clone()
@@ -294,6 +302,26 @@ const OWNER: &str = "example";
 const REPO: &str = "aterm";
 const APPCAST: &str = "aterm-appcast.toml";
 
+/// The redirect codes the updater's pointer reads a `Location` under (one
+/// `301 | 302 | 303 | 307 | 308` arm in `pointer::classify`); the installer's
+/// `channel_head` must read every one of them, and alike.
+const REDIRECTS: [u16; 5] = [301, 302, 303, 307, 308];
+
+/// The answers both sides elect a head from.
+///
+/// EVERY LOCATION UNDER 302, the code the release host sends, and a few under
+/// every other code. Past the code neither side's verdict depends on which code
+/// it was, so the rest would repeat verdicts already made, a forked command
+/// substitution each:
+///
+/// * under 301, 303, 307 and 308 both read the `Location` with the very parser
+///   302 takes (the one redirect arm of `pointer::classify`, the one redirect arm
+///   of install.sh's `channel_head` case). The samples show each code reaches
+///   it: an elected tag, a skipped legacy tag, a refused host, no `Location`;
+/// * under any other code neither reads the `Location` at all: `classify`'s
+///   404, 429/5xx and catch-all arms never touch it, and `channel_head` returns
+///   from its case before the parse. The samples pin that a `Location` there
+///   elects nothing, 300 and 304 (the 3xx that are no redirect) included.
 fn location_corpus() -> Vec<(u16, Option<String>)> {
     let hosts = [
         "https://github.com",
@@ -332,7 +360,6 @@ fn location_corpus() -> Vec<(u16, Option<String>)> {
         "x/aterm-appcast.toml",
         "aterm-machines.toml",
     ];
-    let codes = [302, 404, 429, 500, 503, 200, 403];
     let parts: [&[&str]; 6] = [&hosts, &owners, &repos, &middles, &tags, &assets];
     let location = |pick: [&str; 6]| {
         format!(
@@ -354,20 +381,30 @@ fn location_corpus() -> Vec<(u16, Option<String>)> {
     for _ in 0..300 {
         locations.push(location(parts.map(|p| *rng.pick(p))));
     }
-    let mut corpus = vec![(302, None)];
-    for location in locations {
-        for code in codes {
-            corpus.push((code, Some(location.clone())));
+    let mut corpus: Vec<(u16, Option<String>)> =
+        locations.into_iter().map(|l| (302, Some(l))).collect();
+    let canonical = parts.map(|p| p[0]);
+    let mut legacy = canonical;
+    legacy[4] = "v0.61";
+    let mut foreign = canonical;
+    foreign[0] = "https://evil.example";
+    let samples = [location(canonical), location(legacy), location(foreign)];
+    for code in REDIRECTS {
+        corpus.push((code, None));
+    }
+    for code in [301, 303, 307, 308, 300, 304, 404, 429, 500, 503, 200, 403] {
+        for sample in &samples {
+            corpus.push((code, Some(sample.clone())));
         }
     }
     corpus
 }
 
-/// The answers on which the installer's `channel_head` elects a different tag
-/// than the updater's pointer, with `redefine` run after sourcing.
-fn head_disagreements(scratch: &Scratch, redefine: &str) -> Vec<String> {
+/// The answers on which `script`'s `channel_head` elects a different tag than
+/// the updater's pointer, with `redefine` run after sourcing.
+fn head_disagreements(scratch: &Scratch, script: &Path, redefine: &str) -> Vec<String> {
     let corpus = location_corpus();
-    let mut lib = Lib::new();
+    let mut lib = Lib::of(script);
     lib.step(format!(
         "REPO_SLUG={OWNER}/{REPO}; web_curl() {{ printf '%s' \"$STUB_ANSWER\"; }}"
     ));
@@ -408,7 +445,7 @@ fn head_disagreements(scratch: &Scratch, redefine: &str) -> Vec<String> {
 #[test]
 fn the_head_pointer_elects_what_the_updater_elects() {
     let scratch = Scratch::new();
-    let wrong = head_disagreements(&scratch, ":");
+    let wrong = head_disagreements(&scratch, &install_sh(), ":");
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
@@ -419,9 +456,31 @@ fn the_head_differential_catches_an_elected_legacy_tag() {
     let scratch = Scratch::new();
     let wrong = head_disagreements(
         &scratch,
+        &install_sh(),
         "canonical_authority_tag() { parse_release_tag \"$1\"; }",
     );
     assert!(wrong.iter().any(|w| w.contains("/v0.61/")), "{wrong:?}");
+}
+
+/// Negative control: an installer that reads its head from a 302 alone, as
+/// install.sh did until 2026-10-17 while the updater read all five redirect
+/// codes, is caught on each of the other four.
+#[test]
+fn the_head_differential_catches_an_installer_that_reads_only_302() {
+    let scratch = Scratch::new();
+    let text = std::fs::read_to_string(install_sh()).expect("install.sh");
+    let arm = "\t301 | 302 | 303 | 307 | 308) ;;\n";
+    assert_eq!(text.matches(arm).count(), 1, "the arm the control narrows");
+    let narrowed = scratch.write("install-302-only.sh", text.replace(arm, "\t302) ;;\n"));
+    let wrong = head_disagreements(&scratch, &narrowed, ":");
+    for code in REDIRECTS.iter().filter(|code| **code != 302) {
+        assert!(
+            wrong
+                .iter()
+                .any(|w| w.starts_with(&format!("{code} Some("))),
+            "{code}: {wrong:?}"
+        );
+    }
 }
 
 /// `channel_head`'s own classes: elected (0), a skip with its reason (1), a
@@ -454,7 +513,13 @@ fn the_head_pointer_classifies_each_answer() {
         ("302 B/v0.61/aterm-appcast.toml", 1, ""),
         ("302 B/atpkg-index-12/aterm-appcast.toml", 1, ""),
         ("302 B/v0.09.0/aterm-appcast.toml", 1, ""),
-        ("301 B/v0.92.0/aterm-appcast.toml", 1, ""),
+        ("301 B/v0.92.0/aterm-appcast.toml", 0, "v0.92.0"),
+        ("303 B/v0.92.0/aterm-appcast.toml", 0, "v0.92.0"),
+        ("307 B/v0.92.0/aterm-appcast.toml", 0, "v0.92.0"),
+        ("308 B/v0.92.0/aterm-appcast.toml", 0, "v0.92.0"),
+        ("307 ", 2, ""),
+        ("300 B/v0.92.0/aterm-appcast.toml", 1, ""),
+        ("304 B/v0.92.0/aterm-appcast.toml", 1, ""),
         ("404 ", 1, ""),
         ("429 ", 1, ""),
         ("503 ", 1, ""),

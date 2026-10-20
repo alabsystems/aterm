@@ -116,14 +116,14 @@ impl<'a> VisibleRowView<'a> {
         }
     }
 
-    /// How many columns the row's text spans ([`Row::written_len`] live: a
+    /// How many columns the row's text spans ([`Row::written_len`]): a
     /// recorded early-wrap hole is not text, also when BCE put it inside
-    /// `len`; a history row's line already left it out).
+    /// `len`, live or painted on a history row.
     #[must_use]
     pub fn written_len(&self) -> u16 {
         match self {
             Self::Live { row, .. } => row.written_len(),
-            Self::History { mat } => mat.len(),
+            Self::History { mat } => mat.written_len(),
             Self::Empty => 0,
         }
     }
@@ -152,6 +152,26 @@ impl<'a> VisibleRowView<'a> {
             Self::Live { row, .. } => row.get(col).copied(),
             Self::History { mat } => mat.cells.get(col as usize).copied(),
             Self::Empty => None,
+        }
+    }
+
+    /// The occupied cell prefix (`len()` cells) as a contiguous slice, avoiding per-column
+    /// `Live`/`History` enum dispatch in hot row-rendering loops.
+    #[must_use]
+    #[inline]
+    pub fn cells_slice(&self) -> &[Cell] {
+        match self {
+            Self::Live { row, .. } => {
+                let s = row.as_slice();
+                let n = usize::from(row.len()).min(s.len());
+                &s[..n]
+            }
+            Self::History { mat } => {
+                let s = mat.cells.as_slice();
+                let n = usize::from(mat.len()).min(s.len());
+                &s[..n]
+            }
+            Self::Empty => &[],
         }
     }
 

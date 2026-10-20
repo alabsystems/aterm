@@ -229,21 +229,10 @@ impl Run {
         if self.output.contains(ENOSPC_SENTENCE) {
             return Some(format!("the child ran out of disk ({ENOSPC_SENTENCE})"));
         }
-        crate::libtest::environment_refusals(&self.output).map(|names| {
-            let shown: Vec<&str> = names.iter().take(4).map(String::as_str).collect();
-            let more = names.len().saturating_sub(shown.len());
-            format!(
-                "every failing test refused the machine, not the tree ({}{}) — see `{}` in \
-                 their output",
-                shown.join(", "),
-                if more > 0 {
-                    format!(" and {more} more")
-                } else {
-                    String::new()
-                },
-                crate::libtest::COULD_NOT_RUN_SENTINEL
-            )
-        })
+        // The row names what the machine lacks and its fix (`install node
+        // (brew install node)`), where its reader looks, not only in the log.
+        crate::libtest::environment_refusals(&self.output)
+            .map(|names| crate::libtest::refusal_reason("every failing test", &names, &self.output))
     }
 }
 
@@ -691,6 +680,8 @@ pub mod group {
     use std::ffi::c_long;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use libc::{P_PID, WNOHANG, WNOWAIT, siginfo_t, waitid};
     use libc::{killpg, nanosleep, signal};
 
     const SIGHUP: i32 = 1;
@@ -968,46 +959,17 @@ pub mod group {
         }
     }
 
-    /// `siginfo_t`, as far as [`exited`] reads it: `si_signo` comes first on
-    /// macOS and on Linux, `si_code` third on macOS (the one place it is
-    /// read), and the rest is room for the kernel to write the whole struct
-    /// into (104 bytes on macOS, 128 on Linux, aligned to a pointer on
-    /// both).
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[repr(C, align(8))]
-    struct Siginfo {
-        si_signo: i32,
-        _si_errno: i32,
-        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-        si_code: i32,
-        _rest: [i32; 29],
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    unsafe extern "C" {
-        fn waitid(idtype: i32, id: u32, info: *mut Siginfo, options: i32) -> i32;
-    }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) fn exited(pid: u32, block: bool) -> std::io::Result<bool> {
-        const P_PID: i32 = 1;
-        const WNOHANG: i32 = 1;
-        const WEXITED: i32 = 4;
-        #[cfg(target_os = "macos")]
-        const WNOWAIT: i32 = 0x20;
-        #[cfg(target_os = "linux")]
-        const WNOWAIT: i32 = 0x0100_0000;
         const EINTR: i32 = 4;
-        let options = WEXITED | WNOWAIT | if block { 0 } else { WNOHANG };
+        let options = libc::WEXITED | WNOWAIT | if block { 0 } else { WNOHANG };
         let mut nap = std::time::Duration::from_millis(1);
         loop {
-            let mut info = Siginfo {
-                si_signo: 0,
-                _si_errno: 0,
-                si_code: 0,
-                _rest: [0; 29],
-            };
-            // SAFETY: `info` is live, writable, and at least as large and as
-            // aligned as either kernel's `siginfo_t` (`Siginfo`).
+            // SAFETY: every field of `siginfo_t` is an integer or a pointer,
+            // so all-zero is a valid value; the kernel overwrites it.
+            let mut info: siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `info` is live and writable, and `pid` names the child
+            // whose exit is observed without reaping it (`WNOWAIT`).
             let got = unsafe { waitid(P_PID, pid, &raw mut info, options) };
             if got == 0 {
                 // `CLD_EXITED`, `CLD_KILLED`, `CLD_DUMPED`.

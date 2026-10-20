@@ -16,8 +16,9 @@
 /// - Bit 12: subscript (SGR 74)
 /// - Bits 11+12: overline (SGR 53), exclusive with super/subscript
 /// - Bit 13: curly underline
-/// - Bit 14: reserved, never set (it once marked a style-interned cell;
-///   `aterm-scrollback`'s `CellAttrs::VISUAL_FLAGS_MASK` still masks it)
+/// - Bit 14: reserved, never set on a cell (it once marked a style-interned
+///   cell; `aterm-scrollback`'s `CellAttrs::VISUAL_FLAGS_MASK` masks it, and a
+///   stored line's walk clears its `CellAttrs::OPENS_CELL` there)
 /// - Bit 15: COMPLEX (char_data is an overflow table index)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]

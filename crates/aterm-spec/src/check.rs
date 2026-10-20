@@ -271,9 +271,11 @@ fn attempt<R>(f: impl FnOnce() -> R) -> Result<R, String> {
     })
 }
 
-/// `work` over every item on every core, results in item order. Each item's
-/// work is a checker process of its own, so they run side by side.
-fn each<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
+/// `work` over every item on every core, results in item order: here each
+/// item's work is a checker process of its own, and in a test each is one
+/// seed's walk, one fixture's sweep or one configuration's replay. A panic in
+/// `work` is raised again on the caller's thread, with its own message.
+pub fn each<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let next = AtomicUsize::new(0);
     let workers = std::thread::available_parallelism()
         .map_or(4, std::num::NonZeroUsize::get)
@@ -295,7 +297,7 @@ fn each<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> 
             .into_iter()
             .flat_map(|h| {
                 h.join()
-                    .unwrap_or_else(|_| panic!("a spec-check worker died outside its work"))
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
             })
             .collect()
     });

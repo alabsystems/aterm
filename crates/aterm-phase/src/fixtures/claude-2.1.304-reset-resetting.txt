@@ -1,0 +1,7 @@
+# claude-code 2.1.304 · COMPOSED 2026-10-19, never captured: the texts are the bundle's (the claiming line under the confirmation's title, `_Ae` N:L371446@582 (one dim child, `hideInputGuide`, as 2.1.287's); N is a `strings -n 8` dump of the 2.1.304 executable, not kept in the tree; crates/aterm-phase/src/reset.rs's module doc cites the same positions), the frame is the wall dialog's hand-built one (claude-2.1.287-usage-limit-dialog-fullscreen-panel.txt; same Dialog component), the values are invented · OPEN: replace with a capture (SPEC §6) · the confirmation of a full reset taken: its title over `Resetting your limits…`, no input guide
+⏺ Suites are running; I'll report the number when it lands.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Use a full reset?
+
+   Resetting your limits… this usually takes a few seconds

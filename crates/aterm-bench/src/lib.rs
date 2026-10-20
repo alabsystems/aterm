@@ -120,3 +120,77 @@ pub fn throughput_corpus(bytes: usize) -> Vec<u8> {
     }
     out
 }
+
+/// Return the initial byte capacity reserved for `lines` in [`rotating_corpus`] (`lines * 50`, saturating).
+#[must_use]
+pub const fn rotating_corpus_min_cap(lines: usize) -> usize {
+    lines.saturating_mul(50)
+}
+
+/// Return the number of 80-column grid rows occupied by `lines` of [`linkheavy_corpus`] (`lines * 2`, saturating).
+#[must_use]
+pub const fn linkheavy_grid_rows(lines: usize) -> usize {
+    lines.saturating_mul(2)
+}
+
+/// Encode a benchmark sample (`elapsed_ns`, `bytes_processed`, `iterations`) into 16 LE bytes.
+#[must_use]
+pub const fn encode_bench_sample_le(
+    elapsed_ns: u64,
+    bytes_processed: u32,
+    iterations: u32,
+) -> [u8; 16] {
+    [
+        elapsed_ns as u8,
+        (elapsed_ns >> 8) as u8,
+        (elapsed_ns >> 16) as u8,
+        (elapsed_ns >> 24) as u8,
+        (elapsed_ns >> 32) as u8,
+        (elapsed_ns >> 40) as u8,
+        (elapsed_ns >> 48) as u8,
+        (elapsed_ns >> 56) as u8,
+        bytes_processed as u8,
+        (bytes_processed >> 8) as u8,
+        (bytes_processed >> 16) as u8,
+        (bytes_processed >> 24) as u8,
+        iterations as u8,
+        (iterations >> 8) as u8,
+        (iterations >> 16) as u8,
+        (iterations >> 24) as u8,
+    ]
+}
+
+/// Decode 16 LE bytes into a benchmark sample (`elapsed_ns`, `bytes_processed`, `iterations`).
+#[must_use]
+pub const fn decode_bench_sample_le(bytes: [u8; 16]) -> (u64, u32, u32) {
+    let elapsed_ns = (bytes[0] as u64)
+        | ((bytes[1] as u64) << 8)
+        | ((bytes[2] as u64) << 16)
+        | ((bytes[3] as u64) << 24)
+        | ((bytes[4] as u64) << 32)
+        | ((bytes[5] as u64) << 40)
+        | ((bytes[6] as u64) << 48)
+        | ((bytes[7] as u64) << 56);
+    let bytes_processed = (bytes[8] as u32)
+        | ((bytes[9] as u32) << 8)
+        | ((bytes[10] as u32) << 16)
+        | ((bytes[11] as u32) << 24);
+    let iterations = (bytes[12] as u32)
+        | ((bytes[13] as u32) << 8)
+        | ((bytes[14] as u32) << 16)
+        | ((bytes[15] as u32) << 24);
+    (elapsed_ns, bytes_processed, iterations)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bench_sample_le_round_trips() {
+        assert_eq!(rotating_corpus_min_cap(10), 500);
+        assert_eq!(linkheavy_grid_rows(25), 50);
+        let enc = encode_bench_sample_le(1_234_567, 65_536, 100);
+        assert_eq!(decode_bench_sample_le(enc), (1_234_567, 65_536, 100));
+    }
+}

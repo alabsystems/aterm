@@ -18,9 +18,12 @@
 
 mod models_control_bind_retry;
 mod models_control_preparation;
+mod models_engine_corpus;
+mod models_native_updater;
 mod models_rendezvous_grant;
 mod models_update;
 mod models_update_activation_observation;
+mod models_update_boot_image;
 mod models_update_carried_health;
 mod models_update_check_coordination;
 mod models_update_editor_carry;
@@ -40,9 +43,12 @@ mod models_update_window_show;
 
 pub use models_control_bind_retry::native_update_handoff_bind_retry_model;
 pub use models_control_preparation::native_update_control_preparation_model;
+pub use models_engine_corpus::*;
+pub use models_native_updater::native_updater_model;
 pub use models_rendezvous_grant::native_update_rendezvous_grant_model;
 pub use models_update::*;
 pub use models_update_activation_observation::native_update_activation_observation_model;
+pub use models_update_boot_image::native_update_boot_image_model;
 pub use models_update_carried_health::native_update_carried_health_model;
 pub use models_update_check_coordination::{
     native_update_boot_health_lock_model, native_update_check_join_model,

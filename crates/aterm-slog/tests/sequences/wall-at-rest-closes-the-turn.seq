@@ -1,0 +1,21 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# §2.4: a wall while the agent rests closes the turn out=wall:<kind>, dated
+# when the wall came; the wall continues on the run (cont=), one wall
+# counted once, and its need holds until busy lifts it.
+see busy
+see wall:usage-session 3:15pm fixture=claude-2.1.296-wall-session-auto-continue-armed
+expect open p1 wall par=t1 wall=usage-session detail=3:15pm
+wait 500
+expect turn=open
+wait 500
+expect close p1 wall out=gone
+expect close t1 turn out=wall:usage-session steps=1 walls=1 at=0
+expect open p2 wall par=r1 wall=usage-session detail=3:15pm cont=p1 orphan=1
+expect need=wall:usage-session
+expect clause=limit · 3:15pm
+see busy
+expect close p2 wall out=passed dur_ms=1000
+expect open t1 turn
+expect open t2 turn at=1000
+expect need=none
+wait 1000

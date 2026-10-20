@@ -88,10 +88,10 @@ selection-range-projection	contract	facade_api::{selection_range_for,display_row
 cell-under-geometry	contract	messages_api::WebBand::cell_under, messages_api::band_row, aterm_messages::Geometry::cell_at	∀ x y: f64, cols, m. cell_under(x,y,cols,m) = None if ¬(x ≥ 0 ∧ y ≥ 0) (covers NaN). Else with row = band_row(y as usize, m.grid_top, m.cell_h): Some((row, Geometry(cols,m.cell_w,m.pad).cell_at(x as usize))) if row < committed(), else None.	messages_api::cell_under_is_the_band_cell_under_a_pixel	MEDIUM: f64 comparisons, the saturating f64→usize cast, Option chaining, &self over a struct holding a MessageCenter, cross-crate cell_at	1,2,3,12
 scroll-stamp	contract	scroll_input_api::ScrollInputState::stamp	∀ input n h. After stamp(input,n,h): input.scroll_frac_px = frac_px(h), input.grid_top_row = 0, input.grid_bot_row = n, every other field unchanged.	scroll_input_api::stamp_fills_the_full_grid_band_every_frame	EASY with field framing: writes through &mut RenderInput, a large cross-crate struct	1,2,12
 scroll-input-export	refinement	AtermTerminal::{scroll_px,scroll_lines_frac,scroll_rows_input,scroll_lines,scroll_to_bottom,scroll_to_top,scroll_frac_rows,scroll_frac_px,display_offset}	∀ T∈Reach, d. (a) scroll_px(d) = scroll_lines_frac(d / cell_height) when cell_height > 0, else no-op. (b) scroll_lines_frac(d): w = scroll_input.add_rows(d); display_offset' = clamp(display_offset + w, 0, scrollback_lines) (engine scroll_display); then clamp_at_history_edges(display_offset', scrollback_lines). (c) scroll_lines(d) sets display_offset' = clamp(display_offset + d, 0, scrollback_lines); scroll_to_bottom gives 0, scroll_to_top gives scrollback_lines; all three leave the residual 0. process(output) at offset 0 keeps the offset 0. (d) scroll_frac_px() = scroll_input.frac_px(cell_height). (e) the next render presents scroll_frac_px as the grid-band translate, so the frame differs from the residual-0 frame iff frac_px ≠ 0 (identity at 0 is render-history-independence).	scroll_input_api::scroll_px_accumulates_and_flips_through_the_export, scroll_input_api::whole_row_navigation_resets_the_residual, scroll_input_api::history_ends_clamp_the_residual_through_the_export, scroll_input_api::render_presents_the_banked_residual_and_is_identity_at_zero	MEDIUM once the ScrollInputState specs hold: &mut self, f64 division, callee-ensures composition, cross-crate scroll_display clamp. Absorbs the chunk's separate scroll-navigation spec, which was clause (c) seen from lib.rs.	1,2,4,12,14
-dims-clamped	invariant	AtermTerminal::{new,new_from_system,new_registered,resize}	∀ T∈Reach. T.rows = T.term.grid().rows() and T.cols = T.term.grid().cols(), both ∈ [1,4096]: after construction with any u16 dims (0 and u16::MAX included) and after every resize(r,c), with rows = clamp(r,1,4096), cols = clamp(c,1,4096).	lib::oversized_dims_are_clamped_to_the_grid_bound	EASY-MEDIUM: a struct invariant across the constructors and &mut self resize; cross-crate grid clamp	1,2,4,12
-frame-geometry	contract	AtermTerminal::{render,width,height,rgba,set_chrome,band_rows,band_height_px,grid_top_px}	∀ T∈Reach after render(), with chrome (pad,head), cell (cw,ch), n committed band rows: width = cols·cw + 2·pad; height = rows·ch + 2·pad + head + n·ch; |rgba| = 4·width·height; grid_top_px = pad + head + n·ch; band_height_px = n·ch. Cell contents do not depend on chrome, so row_text is unchanged by set_chrome.	lib::set_chrome_pads_the_frame_and_zero_restores_identity	EASY-MEDIUM: usize arithmetic over cross-crate renderer metrics, Vec length	1,2,4,12
-present-buffer-coherence	invariant	AtermTerminal::render, dirty_band_present_api::{expand_damage_to_rgba,expand_rgba_band,shift_rgba_band,expand_full}	∀ T∈Reach after every render(): T.rgba = FullExp(T), i.e. rgba[4i..4i+4] = Pack(frame_pixels[i]) ∀ i and |rgba| = 4·|frame_pixels|. By induction over renders with three lemmas: (a) expand_rgba_band(p,rgba,s,e) writes exactly Pack(p[i]) at i ∈ [min(s,e'),e'), e' = min(e,|p|), and nothing else; (b) shift_rgba_band(rgba,w,y0,y1,k) equals copying rows [y0,y1) from a pristine snapshot shifted by k and touches nothing outside the band; (c) every DamageOutcome arm (GateHit, Rows, Scroll, Full/stale) re-expands a superset of the pixels the renderer changed since the last render.	dirty_band_present_api::keystroke_damage_exports_a_sub_frame_band_and_stays_byte_exact, dirty_band_present_api::scroll_blit_is_taken_and_stays_byte_exact, dirty_band_present_api::shade_scroll_blit_present_stays_byte_exact, lib::walking_pet_presents_sub_frame_bands	MEDIUM for (a),(b): as_chunks_mut zip loops, direction-matched copy_within, Vec resize. HARD for (c): a split borrow of self, a cross-crate DamageOutcome match, and an aterm-render ensures that dirty_rows covers every changed pixel	1,2,4,7,12
-present-band-classification	contract	dirty_band_present_api::expand_damage_to_rgba, AtermTerminal::{render,present_band_count,present_bands_ptr}	∀ T∈Reach after render(), present_bands = [] if the render was gated or the renderer reported GateHit on a coherent buffer; = dirty_rows_to_bands(win.dirty_rows(), grid_top, ch, W, H) if the outcome is Rows and the frame is chromeless (grid_top = 0, H = rows·ch, W = cols·cw); = [0,0,W,H] otherwise (first frame, size change, Full, Scroll blit, a sub-row translate frame or the frame releasing one, a chromed frame). present_band_count() = |present_bands|/4. So a frame whose dirty rows are a strict subset of the grid presents fewer than W·H pixels.	dirty_band_present_api::first_frame_is_one_full_band_and_gate_hit_is_zero, dirty_band_present_api::scroll_and_resize_take_the_full_band_path, dirty_band_present_api::fractional_scroll_frames_present_the_full_band, dirty_band_present_api::selection_change_bands_only_the_selection_rows	MEDIUM: a guarded match on a cross-crate enum, Vec<i32> writes, usize equalities on renderer metrics	1,2,4,12
+dims-clamped	invariant	AtermTerminal::{new,new_from_system,new_registered,resize}	On successful construction or resize, rows and cols equal the engine grid and the inputs clamped by core::grid::{MAX_GRID_ROWS,MAX_GRID_COLS}, including zero→one. Before allocating or mutating grids, the physical frame including committed message rows must pass Renderer::checked_frame_size (256 MiB per framebuffer); constructor returns Err, native constructor None, or resize Err otherwise. resize Err preserves text, dimensions, prediction, reflow and frame-gate/presentation state. set_px and set_chrome preflight proposed geometry before any mutation and also preserve state on Err. render preflights the physical frame and reserves host RGBA fallibly before consuming damage or changing exported pixels; the cache render uses try_render_input_cached. Font/line-height updates can independently produce a frame render refuses; correcting geometry permits rendering again. Browser Result errors throw strings; successful void calls still yield undefined.	lib::oversized_frames_are_refused_before_state_changes	EASY-MEDIUM: a struct invariant across the constructors and &mut self resize; cross-crate grid clamp	1,2,4,12
+frame-geometry	contract	AtermTerminal::{render,width,height,rgba,set_chrome,band_rows,band_height_px,grid_top_px}	∀ T∈Reach after render() = Ok, with chrome (pad,head), cell (cw,ch), n committed band rows: width = cols·cw + 2·pad; height = rows·ch + 2·pad + head + n·ch; |rgba| = 4·width·height; grid_top_px = pad + head + n·ch; band_height_px = n·ch. Cell contents do not depend on chrome, so row_text is unchanged by set_chrome.	lib::set_chrome_pads_the_frame_and_zero_restores_identity	EASY-MEDIUM: usize arithmetic over cross-crate renderer metrics, Vec length	1,2,4,12
+present-buffer-coherence	invariant	AtermTerminal::render, dirty_band_present_api::{expand_damage_to_rgba,expand_rgba_band,shift_rgba_band,expand_full}	∀ T∈Reach after every successful render(): T.rgba = FullExp(T), i.e. rgba[4i..4i+4] = Pack(frame_pixels[i]) ∀ i and |rgba| = 4·|frame_pixels|. By induction over renders with three lemmas: (a) expand_rgba_band(p,rgba,s,e) writes exactly Pack(p[i]) at i ∈ [min(s,e'),e'), e' = min(e,|p|), and nothing else; (b) shift_rgba_band(rgba,w,y0,y1,k) equals copying rows [y0,y1) from a pristine snapshot shifted by k and touches nothing outside the band; (c) every DamageOutcome arm (GateHit, Rows, Scroll, Full/stale) re-expands a superset of the pixels the renderer changed since the last render.	dirty_band_present_api::keystroke_damage_exports_a_sub_frame_band_and_stays_byte_exact, dirty_band_present_api::scroll_blit_is_taken_and_stays_byte_exact, dirty_band_present_api::shade_scroll_blit_present_stays_byte_exact, lib::walking_pet_presents_sub_frame_bands	MEDIUM for (a),(b): as_chunks_mut zip loops, direction-matched copy_within, Vec resize. HARD for (c): a split borrow of self, a cross-crate DamageOutcome match, and an aterm-render ensures that dirty_rows covers every changed pixel	1,2,4,7,12
+present-band-classification	contract	dirty_band_present_api::expand_damage_to_rgba, AtermTerminal::{render,present_band_count,present_bands_ptr}	∀ T∈Reach after render() = Ok, present_bands = [] if the render was gated or the renderer reported GateHit on a coherent buffer; = dirty_rows_to_bands(win.dirty_rows(), grid_top, ch, W, H) if the outcome is Rows and the frame is chromeless (grid_top = 0, H = rows·ch, W = cols·cw); = [0,0,W,H] otherwise (first frame, size change, Full, Scroll blit, a sub-row translate frame or the frame releasing one, a chromed frame). present_band_count() = |present_bands|/4. So a frame whose dirty rows are a strict subset of the grid presents fewer than W·H pixels.	dirty_band_present_api::first_frame_is_one_full_band_and_gate_hit_is_zero, dirty_band_present_api::scroll_and_resize_take_the_full_band_path, dirty_band_present_api::fractional_scroll_frames_present_the_full_band, dirty_band_present_api::selection_change_bands_only_the_selection_rows	MEDIUM: a guarded match on a cross-crate enum, Vec<i32> writes, usize equalities on renderer metrics	1,2,4,12
 needs-frame-is-gate	equivalence	AtermTerminal::{needs_frame,render,last_render_skipped}	∀ T∈Reach. needs_frame() = ¬Gated(T); with no call between, the next render() has last_render_skipped() = ¬needs_frame() (both compute the same key from the same fields, and Terminal::damage_epoch is idempotent between them). A gated render leaves rgba, spill, width and height unchanged and sets present_bands = [].	messages_api::a_settled_band_needs_no_frame	MEDIUM: &mut self (damage_epoch latches), struct-equality key, an idempotence ensures on cross-crate Terminal::damage_epoch	1,2,4,12
 frame-gate-doors	contract	AtermTerminal::{note_host_visual_change,set_cursor_blink_phase,selection_*,scroll_lines,note_pointer_px,note_pointer_leave,pet_press_px,process,render}	∀ T∈Reach with Gated(T), each of these makes needs_frame() true: a process(x) that advances damage_epoch; set_cursor_blink_phase(p) with p ≠ the current phase; any one-shot selection mutator; a display_offset change; note_pointer_px(x,y) with finite (x,y) ≠ the last sample; the first note_pointer_leave after a sample; pet_press_px ≠ 0; any committed band, details-view, forced-colour or theme change. Conversely an equal blink phase, an equal or non-finite pointer sample, a repeated leave and pet_press_px = 0 leave it false. Each wasm-layer mutator raises host_visual_gen by at most 1 (wrapping).	lib::frame_gate_skips_settled_frames_and_reopens_on_every_change_class, lib::pointer_and_pet_press_reopen_the_frame_gate	MEDIUM: a u64 wrapping_add counter, value-shadow bools returned by aterm-effects calls (callee ensures), a damage epoch in aterm-core	1,2,4,12
 selection-extend-bumps-iff-moved	contract	AtermTerminal::{selection_extend,display_row_to_terminal}	∀ T∈Reach, row col. selection_extend(row,col) sets the selection end to (row − display_offset, col, Right) and bumps host_visual_gen iff the engine's TextSelection value changed. So equal arguments after a scroll bump (they name a different terminal row), a move back to a prior cell bumps, a new drag onto the old end bumps (selection_start already changed the value), and a sub-cell repeat does not bump and gives a gated frame with unchanged selection_text.	lib::redundant_selection_extend_gates_but_every_real_move_still_draws	EASY-MEDIUM: a Clone + PartialEq struct compared around a cross-crate &mut call, i32 arithmetic	1,2,4,12
@@ -218,7 +218,7 @@ src/lib.rs	web_translucency_floors_the_rendered_glyphs	web-contrast-floor
 src/lib.rs	row_range_json_batches_rows_matching_the_per_row_exports	row-range-json	json-string-escape, display-relative-reads
 src/lib.rs	paste_export_wraps_only_sanitized_text_so_a_planted_terminator_stays_inert	paste-sanitize-then-wrap	
 src/lib.rs	serialize_replay_lands_history_in_scrollback_not_under_the_viewport_paint	serialize-replay-roundtrip	
-src/lib.rs	oversized_dims_are_clamped_to_the_grid_bound	dims-clamped	
+src/lib.rs	oversized_frames_are_refused_before_state_changes	dims-clamped	frame-geometry
 src/lib.rs	set_theme_repaints_an_idle_pane_to_the_new_background	render-history-independence	
 src/lib.rs	scrolled_cell_reads_are_display_relative_like_row_text	display-relative-reads	
 src/lib.rs	display_row_cache_distinguishes_main_and_alt_screen	display-row-cache-transparent	
@@ -238,42 +238,42 @@ src/lib.rs	search_budgeted_resumes_to_the_one_shot_result	search-budgeted-refine
 src/lib.rs	web_path_scoped_refill_matches_a_full_extraction_over_a_mutation_stream	scoped-refill-equals-full	
 src/lib.rs	frame_gate_skips_settled_frames_and_reopens_on_every_change_class	frame-gate-doors	
 src/lib.rs	redundant_selection_extend_gates_but_every_real_move_still_draws	selection-extend-bumps-iff-moved	
-src/messages_api.rs	wire_replies_and_caps_are_the_engines	notice-is-wire	
-src/messages_api.rs	an_idle_band_arms_no_timer	band-next-wake	
-src/messages_api.rs	a_held_warn_arms_exactly_its_hold	band-next-wake	
-src/messages_api.rs	a_comet_wakes_on_the_frame_grid_only_while_moving	band-next-wake	
-src/messages_api.rs	a_resize_before_the_render_wakes_for_the_new_width	band-next-wake	
-src/messages_api.rs	a_glide_is_read_on_the_pages_frame_period	band-next-wake	
-src/messages_api.rs	the_pointer_is_a_hand_exactly_where_a_press_acts	band-press-semantics	
-src/messages_api.rs	a_settled_band_needs_no_frame	needs-frame-is-gate	frame-gate-doors
-src/messages_api.rs	an_echo_frame_under_a_band_takes_the_scoped_refill	scoped-refill-equals-full	band-is-translation
-src/messages_api.rs	no_band_row_leaves_the_frame_byte_identical	band-is-translation	
-src/messages_api.rs	the_frame_grows_by_the_band_rows	band-is-translation	
+src/messages_api_tests.rs	wire_replies_and_caps_are_the_engines	notice-is-wire	
+src/messages_api_tests.rs	an_idle_band_arms_no_timer	band-next-wake	
+src/messages_api_tests.rs	a_held_warn_arms_exactly_its_hold	band-next-wake	
+src/messages_api_tests.rs	a_comet_wakes_on_the_frame_grid_only_while_moving	band-next-wake	
+src/messages_api_tests.rs	a_resize_before_the_render_wakes_for_the_new_width	band-next-wake	
+src/messages_api_tests.rs	a_glide_is_read_on_the_pages_frame_period	band-next-wake	
+src/messages_api_tests.rs	the_pointer_is_a_hand_exactly_where_a_press_acts	band-press-semantics	
+src/messages_api_tests.rs	a_settled_band_needs_no_frame	needs-frame-is-gate	frame-gate-doors
+src/messages_api_tests.rs	an_echo_frame_under_a_band_takes_the_scoped_refill	scoped-refill-equals-full	band-is-translation
+src/messages_api_tests.rs	no_band_row_leaves_the_frame_byte_identical	band-is-translation	
+src/messages_api_tests.rs	the_frame_grows_by_the_band_rows	band-is-translation	
 src/messages_api.rs	the_pet_is_pressed_where_the_band_draws_it	band-is-translation	frame-gate-doors
-src/messages_api.rs	the_band_leaving_restores_the_bandless_frame	band-is-translation	render-history-independence
-src/messages_api.rs	messages_read_pages_the_log	messages-read-is-wire	
-src/messages_api.rs	a_hidden_page_arms_no_timer_and_resumes	band-next-wake	
-src/messages_api.rs	the_pointer_lights_only_the_chip_and_a_press_is_notice_act	band-hover-and-press	band-press-semantics, render-history-independence
+src/messages_api_tests.rs	the_band_leaving_restores_the_bandless_frame	band-is-translation	render-history-independence
+src/messages_api_tests.rs	messages_read_pages_the_log	messages-read-is-wire	
+src/messages_api_tests.rs	a_hidden_page_arms_no_timer_and_resumes	band-next-wake	
+src/messages_api_tests.rs	the_pointer_lights_only_the_chip_and_a_press_is_notice_act	band-hover-and-press	band-press-semantics, render-history-independence
 src/messages_api.rs	a_still_pointers_chip_never_lights_the_echo	band-hover-and-press	
-src/messages_api.rs	a_details_press_needs_the_pages_details_view	notice-is-wire	band-press-semantics
-src/messages_api.rs	the_overflow_row_opens_the_details_view_only_with_one	band-press-semantics	
-src/messages_api.rs	forced_colors_own_the_band_ungraded	forced-colors-inks	
-src/messages_api.rs	the_log_drains_as_codec_lines_since_a_cursor	log-journal-cursor	
-src/messages_api.rs	a_closing_page_writes_the_quit_record	quit-record	log-journal-cursor
-src/messages_api.rs	a_restored_log_is_records_and_never_the_glass	restore-log	
-src/messages_api.rs	restoring_twice_or_after_a_post_never_duplicates	restore-log	
-src/messages_api.rs	two_tabs_sharing_a_store_both_load	restore-log	
-src/messages_api.rs	a_restore_skips_junk_and_reads_only_the_newest_lines	read-kept-bounded	restore-log
-src/messages_api.rs	messages_entry_is_the_records_row	messages-read-is-wire	
-src/messages_api.rs	pct_encode_is_the_control_wires	pct-encode-equals-control	
-src/messages_api.rs	band_row_is_the_pixel_rows_band_row	band-row-arith	
-src/messages_api.rs	cell_under_is_the_band_cell_under_a_pixel	cell-under-geometry	
-src/messages_api.rs	the_tick_reply_is_two_bits	tick-bits	
-src/messages_api.rs	a_page_offset_is_seconds_east_of_utc	utc-offset-seconds	
-src/messages_api.rs	effects_under_a_band_are_the_bandless_frame_translated	band-is-translation	
-src/messages_api.rs	the_web_band_is_the_native_golden	web-band-native-golden	
-src/messages_api.rs	the_web_page_is_the_engines_page	messages-page-is-engine-page	utc-offset-seconds
-src/messages_api.rs	the_web_page_offers_no_file_and_no_upgrade	messages-page-is-engine-page	
+src/messages_api_tests.rs	a_details_press_needs_the_pages_details_view	notice-is-wire	band-press-semantics
+src/messages_api_tests.rs	the_overflow_row_opens_the_details_view_only_with_one	band-press-semantics	
+src/messages_api_tests.rs	forced_colors_own_the_band_ungraded	forced-colors-inks	
+src/messages_api_tests.rs	the_log_drains_as_codec_lines_since_a_cursor	log-journal-cursor	
+src/messages_api_tests.rs	a_closing_page_writes_the_quit_record	quit-record	log-journal-cursor
+src/messages_api_tests.rs	a_restored_log_is_records_and_never_the_glass	restore-log	
+src/messages_api_tests.rs	restoring_twice_or_after_a_post_never_duplicates	restore-log	
+src/messages_api_tests.rs	two_tabs_sharing_a_store_both_load	restore-log	
+src/messages_api_tests.rs	a_restore_skips_junk_and_reads_only_the_newest_lines	read-kept-bounded	restore-log
+src/messages_api_tests.rs	messages_entry_is_the_records_row	messages-read-is-wire	
+src/messages_api_tests.rs	pct_encode_is_the_control_wires	pct-encode-equals-control	
+src/messages_api_tests.rs	band_row_is_the_pixel_rows_band_row	band-row-arith	
+src/messages_api_tests.rs	cell_under_is_the_band_cell_under_a_pixel	cell-under-geometry	
+src/messages_api_tests.rs	the_tick_reply_is_two_bits	tick-bits	
+src/messages_api_tests.rs	a_page_offset_is_seconds_east_of_utc	utc-offset-seconds	
+src/messages_api_tests.rs	effects_under_a_band_are_the_bandless_frame_translated	band-is-translation	
+src/messages_api_tests.rs	the_web_band_is_the_native_golden	web-band-native-golden	
+src/messages_api_tests.rs	the_web_page_is_the_engines_page	messages-page-is-engine-page	utc-offset-seconds
+src/messages_api_tests.rs	the_web_page_offers_no_file_and_no_upgrade	messages-page-is-engine-page	
 src/messages_api.rs	the_restore_moves_the_pages_rev	restore-log	
 src/notifications_api.rs	authorized_osc9_round_trips_through_the_drain	notification-queue	json-string-escape
 src/notifications_api.rs	unauthorized_notifications_never_enqueue	notification-queue	
@@ -304,14 +304,14 @@ src/scroll_input_api.rs	stamp_fills_the_full_grid_band_every_frame	scroll-stamp
 src/scroll_input_api.rs	scroll_px_accumulates_and_flips_through_the_export	scroll-input-export	
 src/scroll_input_api.rs	whole_row_navigation_resets_the_residual	scroll-input-export	
 src/scroll_input_api.rs	history_ends_clamp_the_residual_through_the_export	scroll-input-export	
-src/scroll_input_api.rs	render_presents_the_banked_residual_and_is_identity_at_zero	scroll-input-export	scroll-stamp, render-history-independence
+src/scroll_input_api_tests.rs	render_presents_the_banked_residual_and_is_identity_at_zero	scroll-input-export	scroll-stamp, render-history-independence
 src/scrollback_tiers_api.rs	ctor_attaches_tiered_store_with_the_unified_default_total	tiered-ctor-staging	
-src/scrollback_tiers_api.rs	ingest_stages_and_render_promotes	tiered-ctor-staging	
-src/scrollback_tiers_api.rs	a_flood_between_frames_leaves_one_marker	flood-one-marker	
-src/scrollback_tiers_api.rs	set_scrollback_limit_caps_the_total_across_tiers	scrollback-retention-limit	
-src/scrollback_tiers_api.rs	pane_budget_evicts_and_reports	scrollback-budget	
-src/scrollback_tiers_api.rs	global_budget_caps_the_effective_share	scrollback-budget	
-src/scrollback_tiers_api.rs	truncation_and_pressure_are_observable_out_of_band	scrollback-budget	
+src/scrollback_tiers_api_tests.rs	ingest_stages_and_render_promotes	tiered-ctor-staging	
+src/scrollback_tiers_api_tests.rs	a_flood_between_frames_leaves_one_marker	flood-one-marker	
+src/scrollback_tiers_api_tests.rs	set_scrollback_limit_caps_the_total_across_tiers	scrollback-retention-limit	
+src/scrollback_tiers_api_tests.rs	pane_budget_evicts_and_reports	scrollback-budget	
+src/scrollback_tiers_api_tests.rs	global_budget_caps_the_effective_share	scrollback-budget	
+src/scrollback_tiers_api_tests.rs	truncation_and_pressure_are_observable_out_of_band	scrollback-budget	
 src/scrollback_tiers_api.rs	tier_capabilities_json_pins_the_wire_contract	tier-capabilities-json	
 src/theme_api.rs	catalog_json_lists_builtins_then_registered	web-theme-register	
 src/theme_api.rs	named_install_keeps_program_colours	web-theme-install	theme-reset-baseline

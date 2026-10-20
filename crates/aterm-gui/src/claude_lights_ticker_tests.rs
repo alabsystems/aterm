@@ -471,6 +471,90 @@ fn a_hovered_chip_names_its_face_clocks_day_where_it_is_not_today() {
     }
 }
 
+/// A PAUSE TOLD UNDER A HOVER IS IN THE TITLE ON THE NEXT FRAME
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §10.5.7, 4a): a session
+/// with no trail and no face clock, its Autopilot chip hovered and its
+/// title drawn; the loop's pause told through the window's one door for
+/// harness facts asks the window reading that title for a frame, and that
+/// frame's title names the pause's end with its weekday — the pause is the
+/// title's only stamp, so the build reads today's date for it alone. The
+/// pause ends two days on, so a wall whose date turns during the test still
+/// names a later day. Told gone, the next frame's title drops it.
+///
+/// NEGATIVE CONTROL: with nobody reading the title, the same pause asks no
+/// window for a frame.
+#[test]
+fn a_pause_told_under_a_hover_is_in_the_title_on_the_next_frame() {
+    use crate::harness_glass::Stamp;
+    use crate::work_counts::take_harness_clock_reads;
+    let asked = || crate::claude_lights::TITLE_READERS_ASKED.with(|a| a.replace(0));
+    let wall_now = || {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after the epoch")
+                .as_secs(),
+        )
+        .expect("a second")
+    };
+    let (mut app, wid, session, _host) = ticker_app(200);
+    let sid = app
+        .pool
+        .get(session)
+        .expect("the session")
+        .ctx
+        .self_id
+        .as_str()
+        .to_string();
+    let glass = app.chip_glass(session);
+    assert!(
+        glass.last.is_none() && glass.task_at.is_none(),
+        "CONTROL: no trail and no face clock, so only the pause asks for the day"
+    );
+    let at_unix = wall_now() + 2 * 86_400;
+    let plan = crate::PausePlan { at_unix, short: 3 };
+    let until = Stamp::at(at_unix).expect("the zone reads here");
+    let wkd = crate::claude_lights::Weekday::of_days(until.day).short();
+    let words = format!(
+        "pausing until {wkd} {} after 3 short turns",
+        until.clock.as_str()
+    );
+
+    // NEGATIVE CONTROL: nobody reads the title; the pause asks no frame.
+    asked();
+    app.apply_harness_fact(&sid, crate::HarnessFact::Pause(Some(plan)));
+    assert_eq!(asked(), 0, "no reader, no frame asked");
+    app.apply_harness_fact(&sid, crate::HarnessFact::Pause(None));
+    assert_eq!(asked(), 0);
+
+    app.hover_claude_chip(wid, Some((session, Chip::Autopilot)));
+    frame(&mut app, wid);
+    assert!(
+        !rule(&app, wid).contains("pausing until"),
+        "{:?}",
+        rule(&app, wid)
+    );
+    take_harness_clock_reads();
+    app.apply_harness_fact(&sid, crate::HarnessFact::Pause(Some(plan)));
+    assert_eq!(asked(), 1, "the reading window is asked for a frame");
+    frame(&mut app, wid);
+    let titled = rule(&app, wid);
+    assert!(titled.contains(&words), "want {words:?} in {titled:?}");
+    assert_eq!(
+        take_harness_clock_reads(),
+        1,
+        "built again once, one wall read"
+    );
+    app.apply_harness_fact(&sid, crate::HarnessFact::Pause(None));
+    assert_eq!(asked(), 1);
+    frame(&mut app, wid);
+    assert!(
+        !rule(&app, wid).contains("pausing until"),
+        "{:?}",
+        rule(&app, wid)
+    );
+}
+
 /// THE CHIPS ARE BUTTONS A SCREEN READER CAN PRESS (§9.2.1): the tree's
 /// chips are the frame's — Autopilot and `⚙`, each over the cells the
 /// painter recorded, named in words (`Autopilot: cruise.`, `Harness
@@ -657,17 +741,20 @@ fn a_reader_chip_click_commits_an_open_in_grid_rename() {
 }
 
 /// A HOVERED TITLE WITH A TRAIL GIVES ITS PARTS UP IN ORDER (§9.2.1; review
-/// of fix/autopilot-menu-wiring, finding 2): walked from 240 columns down to
-/// 60 with one act taken, the hovered Autopilot title beside the whole facts
-/// is the WHOLE (the trail and the menu's line), then the whole WITHOUT ITS
-/// TRAIL (the menu still offered), then V1'S WORDS (the menu's line given up
-/// too), then the SHORT form, then none — in that order as the pane
-/// narrows, never back; the facts stay whole beside each. CONTROL: each of
-/// the five forms is met.
+/// of fix/autopilot-menu-wiring, finding 2; owner-eye-1 of the post-landing
+/// check of Autopilot v3 wave 1): walked from 240 columns down to 60 with
+/// one act taken, the hovered Autopilot title beside the whole facts is the
+/// WHOLE (the trail and the menu's line), then the whole WITHOUT ITS TRAIL
+/// (the menu still offered), then V1'S WORDS (the menu's line given up
+/// too), then the phrase WITH BOTH CLICKS (the explanation given up), then
+/// the phrase WITH THE CLICK, then the SHORT form, then none — in that
+/// order as the pane narrows, never back; the facts stay whole beside each.
+/// CONTROL: each of the seven forms is met.
 ///
-/// RED before the fix: a pane with no room for the trail beside the facts
-/// showed `autopilot: cruise` alone, and the menu's line went with the
-/// trail.
+/// RED before the menu wiring's fix: a pane with no room for the trail
+/// beside the facts showed `autopilot: cruise` alone, and the menu's line
+/// went with the trail; before owner-eye-1's, the clicks went with the
+/// explanation.
 #[test]
 fn a_hovered_title_gives_up_its_trail_then_its_menu_line_then_its_words() {
     let t0 = Instant::now();
@@ -676,6 +763,8 @@ fn a_hovered_title_gives_up_its_trail_then_its_menu_line_then_its_words() {
     on_act_at(&mut app, session, Act::Approved, act);
     let v1 = "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land";
     let menu = format!("{v1} \u{b7} right-click: more");
+    let click = "autopilot: cruise \u{b7} click: land";
+    let clicks = format!("{click} \u{b7} right-click: more");
     let tail = format!("{at} \u{b7} click: land \u{b7} right-click: more");
     let mut seen: Vec<(u16, u8)> = Vec::new();
     for width in (60..=240u16).rev() {
@@ -690,12 +779,24 @@ fn a_hovered_title_gives_up_its_trail_then_its_menu_line_then_its_words() {
             "autopilot: cruise \u{2014} keeps the work moving \u{b7} last: \u{2713} approved ",
         ) && rule.contains(&tail)
         {
-            4
+            6
         } else if rule.contains(&menu) {
             assert!(!rule.contains("last:"), "{width}: {rule:?}");
-            3
+            5
         } else if rule.contains(v1) {
             assert!(!rule.contains("right-click"), "{width}: {rule:?}");
+            4
+        } else if rule.contains(&clicks) {
+            assert!(
+                !rule.contains("last:") && !rule.contains("\u{2014}"),
+                "{width}: {rule:?}"
+            );
+            3
+        } else if rule.contains(click) {
+            assert!(
+                !rule.contains("right-click") && !rule.contains("\u{2014}"),
+                "{width}: {rule:?}"
+            );
             2
         } else if rule.contains(&format!("{CHIPS}  autopilot: cruise ")) {
             assert!(
@@ -725,7 +826,7 @@ fn a_hovered_title_gives_up_its_trail_then_its_menu_line_then_its_words() {
         seen.push((width, form));
     }
     let met = |form: u8| seen.iter().any(|(_, f)| *f == form);
-    assert!((0..=4).all(met), "CONTROL: every form is met: {seen:?}");
+    assert!((0..=6).all(met), "CONTROL: every form is met: {seen:?}");
     let from = |form: u8| {
         seen.iter()
             .filter(|(_, f)| *f == form)
@@ -734,7 +835,9 @@ fn a_hovered_title_gives_up_its_trail_then_its_menu_line_then_its_words() {
     };
     eprintln!(
         "with one act: whole from {:?}, without the trail from {:?}, v1's words from {:?}, \
-         short from {:?}",
+         both clicks from {:?}, the click from {:?}, short from {:?}",
+        from(6),
+        from(5),
         from(4),
         from(3),
         from(2),

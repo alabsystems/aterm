@@ -15,7 +15,8 @@
 //! cannot drift from the table either.
 //!
 //! ISOLATION: `support/launch_isolation.rs` and `support/headless_boot.rs` (a
-//! product that cannot start fails; only a scratch/spawn refusal skips).
+//! product that cannot start fails; a scratch/spawn refusal is COULD NOT RUN,
+//! `boot_with`, never a pass).
 
 #![cfg(unix)]
 
@@ -44,10 +45,12 @@ fn token(inst: &Instance) -> String {
 }
 
 /// One boot with the temporal recorder on (so `temporal` has a spine to read)
-/// and the token file written.
-fn boot() -> Instance {
+/// and the token file written. `prefix` names its scratch root, which is
+/// per process: each test boots under its own. A refused boot is COULD NOT
+/// RUN, never a pass.
+fn boot(prefix: &str) -> Instance {
     headless_boot::boot_with(
-        "atrg",
+        prefix,
         |tmp, cmd| {
             let cfg = tmp.join("cfg/aterm/aterm.toml");
             let base = std::fs::read_to_string(&cfg).expect("the isolation config");
@@ -149,7 +152,7 @@ fn field<'a>(row: &'a str, key: &str) -> Option<&'a str> {
 
 #[test]
 fn the_audit_verbs_frame_their_replies_as_the_table_says() {
-    let inst = boot();
+    let inst = boot("atrg");
 
     // `await seq <n> timeout=0`: the cheap dirty check — a Status line.
     match wire(&inst, "await seq 0 timeout=0") {
@@ -180,10 +183,13 @@ fn the_audit_verbs_frame_their_replies_as_the_table_says() {
                 "dur_ms",
                 "seq",
                 "hash",
+                "by",
                 "arch",
             ] {
                 assert!(field(row, key).is_some(), "history row lacks {key}=: {row}");
             }
+            // The test's own connection presents the owner token: `ctl`.
+            assert_eq!(field(row, "by"), Some("ctl"), "{row}");
             let (_, text) = row.split_once(" text=").expect("text= is the tail");
             assert!(text.contains("grammar-lane"), "{row}");
         }
@@ -250,4 +256,183 @@ fn the_audit_verbs_frame_their_replies_as_the_table_says() {
         Reply::Lines(s, rows) => assert_eq!(s, format!("OK {}", rows.len())),
         other => panic!("{other:?}"),
     }
+}
+
+/// One persistent connection, as a supervisor holds one: `AUTH <token>`
+/// first (no reply), then requests whose status lines are read in turn. A
+/// lease belongs to the connection that took it, so a hand's acquire, the
+/// writes under it and its release go out on one.
+struct Conn {
+    reader: BufReader<UnixStream>,
+    writer: UnixStream,
+}
+
+impl Conn {
+    fn open(inst: &Instance) -> Self {
+        let writer = UnixStream::connect(&inst.sock).expect("connect the control socket");
+        writer.set_read_timeout(Some(REPLY_DEADLINE)).unwrap();
+        writer.set_write_timeout(Some(REPLY_DEADLINE)).unwrap();
+        let mut writer = writer;
+        writeln!(writer, "AUTH {}", token(inst)).expect("authenticate");
+        let reader = BufReader::new(writer.try_clone().expect("a second handle"));
+        Conn { reader, writer }
+    }
+
+    /// The one status line `line` is answered with.
+    fn ask(&mut self, line: &str) -> String {
+        writeln!(self.writer, "{line}").expect("write the request");
+        let mut status = String::new();
+        self.reader
+            .read_line(&mut status)
+            .unwrap_or_else(|e| panic!("{line}: no status line ({e})"));
+        status.trim_end_matches('\n').to_string()
+    }
+}
+
+/// A program that draws `READY` and reads the terminal in raw mode with no
+/// echo, keeping what it reads in `$1`: typing into it moves nothing on the
+/// screen, so one read's generation fences every write after it.
+const QUIET_READER: &str = "#!/bin/sh\nstty raw -echo\nprintf 'READY\\r\\n'\nexec cat > \"$1\"\n";
+
+/// THE WINDOW HARNESS'S `send` AND `key enter` ARE ITS TURN, over the real
+/// socket and on the turn-end loop's own wire: on one connection, the hand
+/// taken as the loop takes it (holder `aterm-harness@<this instance's pid>`,
+/// the window harness's own name, `hard here`), the fenced text (`send
+/// if-gen=<the read's generation> if=<a row of it> -- …`), its fenced Enter
+/// (`key if-gen=… if=… enter`), the hand given back (`here`) — is one
+/// `history` row, `by=harness status=pressed submitted=1`, its text the
+/// tail. NEGATIVE CONTROLS: the same fenced `send` and `key enter` with no
+/// hand, and the unfenced lines that start the reader, add no row (a raw
+/// driver's line is no turn); an owner-token `turn` is `by=ctl` (the test
+/// above).
+#[test]
+fn the_harness_send_and_enter_land_in_the_ledger_as_its_turn() {
+    let inst = boot("atrh");
+    let history = |inst: &Instance| match wire(inst, "history") {
+        Reply::Lines(_, rows) => rows,
+        other => panic!("history is Lines-framed: {other:?}"),
+    };
+    let before = history(&inst);
+    let script = inst.tmp.join("quiet.sh");
+    let keys = inst.tmp.join("keys.log");
+    std::fs::write(&script, QUIET_READER).expect("write the reader");
+    let mut c = Conn::open(&inst);
+    let ok = |c: &mut Conn, line: &str| {
+        let reply = c.ask(line);
+        assert!(
+            reply.starts_with("OK") && !reply.contains("skipped"),
+            "{line}: {reply}"
+        );
+    };
+    ok(
+        &mut c,
+        &format!(
+            "send -- exec /bin/sh {} {}",
+            script.display(),
+            keys.display()
+        ),
+    );
+    ok(&mut c, "key enter");
+    match wire(&inst, "await match READY timeout=60000") {
+        Reply::Status(s) => assert!(s.starts_with("OK") && !s.contains("timeout"), "{s}"),
+        other => panic!("await is one status line: {other:?}"),
+    }
+    let fenced = |c: &mut Conn, text: &str| {
+        let status = c.ask("status");
+        let generation = field(&status, "gen")
+            .unwrap_or_else(|| panic!("status names a generation: {status}"))
+            .to_string();
+        ok(c, &format!("send if-gen={generation} if=READY -- {text}"));
+        ok(c, &format!("key if-gen={generation} if=READY enter"));
+    };
+    fenced(&mut c, "no-hand");
+    assert_eq!(history(&inst), before, "no hand, no turn");
+
+    let holder = format!("aterm-harness@{}", inst.child.id());
+    let took = c.ask(&format!(
+        "lease acquire ttl=60000 holder={holder} hard here"
+    ));
+    assert!(took.starts_with("OK lease acquired"), "{took}");
+    fenced(&mut c, "harness-lane");
+    assert_eq!(
+        c.ask(&format!("lease release holder={holder} here")),
+        "OK lease released"
+    );
+    let after = history(&inst);
+    assert_eq!(after.len(), before.len() + 1, "{after:#?}");
+    let row = after.last().expect("the harness's row");
+    for (key, want) in [("by", "harness"), ("status", "pressed"), ("submitted", "1")] {
+        assert_eq!(field(row, key), Some(want), "{key}: {row}");
+    }
+    let (_, text) = row.split_once(" text=").expect("text= is the tail");
+    assert_eq!(text, "harness-lane", "{row}");
+}
+
+/// A HAND TAKEN `here` ENDS WITH ITS CONNECTION, over the real socket: the
+/// turn-end loop's hand, when a stop hangs the loop's connection up before
+/// the give-back (the cut lets no `lease` out after it). One connection
+/// takes the harness's hand as the loop takes it (`hard here`) and hangs up
+/// holding it; the tab is then free (`lease status` reads `none`, waited for
+/// with a one-minute hang detector, since the server reads the end on its
+/// own lane; the hand's TTL is ten, so a lapse cannot pass for it), and
+/// another connection's write is not refused `ERR busy`.
+/// NEGATIVE CONTROL: the same hand taken without `here` outlives its
+/// connection — read once a supervisor claim that connection bound to
+/// itself has been released by the same sweep, so the end was read.
+#[test]
+fn a_hand_taken_here_ends_with_its_connection() {
+    let inst = boot("atrl");
+    let holder = format!("aterm-harness@{}", inst.child.id());
+    let status_line = |line: &str| match wire(&inst, line) {
+        Reply::Status(s) => s,
+        other => panic!("{line} is one status line: {other:?}"),
+    };
+    let ok = |c: &mut Conn, line: &str| {
+        let reply = c.ask(line);
+        assert!(reply.starts_with("OK"), "{line}: {reply}");
+    };
+
+    // NEGATIVE CONTROL first: a plain hand outlives its connection.
+    let mut c = Conn::open(&inst);
+    ok(&mut c, "meta set supervisor grammar-sweep");
+    ok(
+        &mut c,
+        &format!("lease acquire ttl=600000 holder={holder} hard"),
+    );
+    drop(c);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the ended connection's bound claim released",
+        || {
+            let meta = status_line("meta");
+            (field(&meta, "supervisor") == Some("-")).then_some(())
+        },
+    );
+    let plain = status_line("lease status");
+    assert!(
+        plain.starts_with(&format!("OK lease holder={holder} ")),
+        "a plain hand outlives its connection: {plain}"
+    );
+    assert_eq!(
+        status_line(&format!("lease release holder={holder}")),
+        "OK lease released"
+    );
+
+    let mut c = Conn::open(&inst);
+    ok(
+        &mut c,
+        &format!("lease acquire ttl=600000 holder={holder} hard here"),
+    );
+    assert!(
+        status_line("send -- x").starts_with("ERR busy lease="),
+        "held while its connection lives"
+    );
+    drop(c);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the hand taken `here` freed with its connection",
+        || (status_line("lease status") == "OK lease none").then_some(()),
+    );
+    let write = status_line("send -- x");
+    assert!(write.starts_with("OK"), "free to write: {write}");
 }

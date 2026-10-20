@@ -71,6 +71,7 @@ fn seeds(theme: ThemeInks, ansi: Option<AnsiHues>, authored: AuthoredChrome) -> 
         cursor: theme.cursor,
         ansi,
         authored,
+        system_accent: None,
         base: BarBase::Blend,
     }
 }
@@ -137,6 +138,40 @@ fn accent_rule_follows_the_theme() {
         (t.accent_source, t.accent),
         (AccentSource::Neutral, [0xc0; 3])
     );
+}
+
+/// A host that follows the OS accent hands it in as a seed: it outranks every
+/// borrowed accent (the cursor, the ANSI blue or cyan), and an authored
+/// `accent_color` outranks it.
+#[test]
+fn the_system_accent_follows_an_authored_one_and_leads_the_borrowed_ones() {
+    let windows_blue = [0x4c, 0xc2, 0xff];
+    for b in builtins() {
+        let with_system = |authored: AuthoredChrome| {
+            ChromeTokens::derive(&ChromeSeeds {
+                system_accent: Some(windows_blue),
+                ..seeds(b.theme, Some(b.ansi), authored)
+            })
+        };
+        let t = with_system(AuthoredChrome::NONE);
+        assert_eq!(
+            (t.accent_source, t.accent),
+            (AccentSource::System, windows_blue),
+            "{}",
+            b.name
+        );
+        let authored = AuthoredChrome {
+            accent: Some([0xff, 0x00, 0xaa]),
+            ..AuthoredChrome::NONE
+        };
+        assert_eq!(
+            with_system(authored).accent_source,
+            AccentSource::Authored,
+            "{}",
+            b.name
+        );
+    }
+    assert_eq!(AccentSource::System.label(), "system");
 }
 
 /// THE BAND'S METER IS THE TOKEN ACCENT, and the parity proof: on every

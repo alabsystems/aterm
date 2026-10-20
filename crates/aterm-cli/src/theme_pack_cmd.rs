@@ -9,7 +9,7 @@
 //! `aterm_theme_pack`: embedded at build time, never fetched. `pack` lists it
 //! (or prints one theme's file, or every notice); `install` copies themes
 //! into the themes folder through the pack's one install path, the one
-//! Settings ▸ Themes ▸ Get More takes too.
+//! Keep on a Settings ▸ Themes ▸ Community row takes too.
 
 use std::ffi::OsString;
 use std::fmt::Write as _;

@@ -95,12 +95,13 @@ pub fn layer_order(z_index: i32, kitty: Option<KittyPlacementTag>) -> (i32, u32,
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ImageScaling {
     /// Scale, aspect preserved, into the largest box that fits the footprint, centred, the
-    /// rest transparent. For a target named in cells (`File=width=40;height=8`, Kitty
-    /// `c=`/`r=`, the host's chrome rasters).
+    /// rest transparent. For a target named in cells (`File=width=40;height=8`, Kitty `c=`
+    /// or `r=` alone, the host's chrome rasters).
     #[default]
     Fit,
     /// Scale to the whole footprint, aspect ignored: only on explicit request (iTerm2's
-    /// `preserveAspectRatio=0`).
+    /// `preserveAspectRatio=0`, Kitty's `c=` with `r=`, a box kitty fills whole from the
+    /// cursor cell).
     Stretch,
     /// One source pixel to one device pixel, anchored top-left, the remainder transparent.
     /// For protocols that name pixels: a sixel footprint is the pixel size rounded up to whole

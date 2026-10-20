@@ -32,10 +32,14 @@ fn limits() -> Limits {
     Limits::new(8, 1 << 20).expect("a small ring")
 }
 
+/// Fields drop in this order: the bridge, then the broker, then the lane and
+/// the scratch dir that holds the broker's socket. A broker whose socket was
+/// removed under it cannot dial its own acceptor awake, and its shutdown waits
+/// out astream's whole wake bound (a second) instead.
 struct World {
-    lane: FakeVerbLane,
     bridge: Bridge,
     _server: astream_broker::BrokerHandle,
+    lane: FakeVerbLane,
     model: aterm_spec::derive::Model,
     expect: State,
     clock: u64,
@@ -73,9 +77,9 @@ impl World {
         let model = aterm_models_session::log_mirror_model();
         let expect = model.init_state();
         let mut w = World {
-            lane,
             bridge,
             _server: server,
+            lane,
             model,
             expect,
             clock: 10,
@@ -1768,7 +1772,7 @@ fn successor(
 fn a_dedup_whose_record_retention_took_is_sent_again_never_a_collision() {
     let (lane, mut first) = FakeVerbLane::bridge(&[]);
     let socket = lane.dir.path().join("broker.sock");
-    let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+    let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
     let _server = broker.serve(&socket).unwrap();
     mirroring(&lane, &mut first, &socket);
     // A batch on the bus, its bridge gone before the landing: the pin stands.
@@ -1832,7 +1836,7 @@ fn a_dedup_whose_record_retention_took_is_sent_again_never_a_collision() {
 fn a_second_dedup_at_an_offset_the_face_does_not_hold_is_a_collision() {
     let (lane, mut first) = FakeVerbLane::bridge(&[]);
     let socket = lane.dir.path().join("broker.sock");
-    let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+    let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
     let _server = broker.serve(&socket).unwrap();
     mirroring(&lane, &mut first, &socket);
     first.mirror_take();

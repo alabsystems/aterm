@@ -238,6 +238,66 @@ fn help_fills_what_an_older_server_cannot_say() {
     let _ = std::fs::remove_dir(&dir);
 }
 
+/// The `exchange` backstop: a `cast drift` that reaches it (every one is the
+/// `drift` module's first) against a server that predates the verb answers
+/// the bare cast (`OK <nbytes>` + body, no `verdict=`). The client reads the
+/// body off and refuses by name, promptly, with nothing on stdout.
+#[cfg(unix)]
+#[test]
+fn the_exchange_backstop_refuses_an_older_servers_bare_cast() {
+    use std::io::{BufRead, Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
+
+    const CAST: &str = "{\"version\": 2, \"width\": 20, \"height\": 8}\n\
+                        [0.1, \"o\", \"hi\"]\n[0.2, \"r\", \"20x7\"]\n";
+    let dir = std::env::temp_dir().join(format!("aterm-ctl-olddrift-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let sock = dir.join("old.sock");
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock).expect("bind mock socket");
+    // The server keeps the connection open after its reply, as a live one
+    // does: a client reading lines of a byte body would wait forever.
+    let srv = std::thread::spawn(move || {
+        let (conn, _) = listener.accept().expect("accept");
+        let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
+        let mut first = String::new();
+        r.read_line(&mut first).expect("read request line");
+        let mut w = conn;
+        w.write_all(format!("OK {}\n{CAST}", CAST.len()).as_bytes())
+            .expect("write reply");
+        w.flush().expect("flush");
+        let mut sink = Vec::new();
+        let _ = r.read_to_end(&mut sink);
+        first
+    });
+    let sockpath = sock.to_str().expect("utf8 path").to_string();
+    let (tx, rx) = mpsc::channel();
+    let cli = std::thread::spawn(move || {
+        let res = exchange(
+            &sockpath,
+            TargetOrigin::Pinned,
+            "cast drift\n",
+            "cast",
+            // Longer than the recv below, so a client reading lines of the
+            // byte body is caught by the recv.
+            Some(std::time::Duration::from_secs(120)),
+            false,
+            &redial::Redial::none(),
+        );
+        let _ = tx.send(res.map_err(|e| e.to_string()));
+    });
+    let res = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the refusal must not wait for the connection to close");
+    let err = res.expect_err("an older server's bare cast is refused");
+    assert!(err.contains("predates `cast drift`"), "{err}");
+    cli.join().expect("client thread");
+    assert_eq!(srv.join().expect("server thread"), "cast drift\n");
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_dir(&dir);
+}
+
 /// `search`'s header is `OK <n> incomplete[ capped][ rewrapping][ long-line][ older]`
 /// when the list is not exhaustive; the count parser reads only the first
 /// token, so the matches are kept, and stderr names every cause.
@@ -493,6 +553,428 @@ fn validate_request_parts_rejects_embedded_line_terminators() {
     assert!(validate_request_parts(&clean).is_ok());
 }
 
+/// A request line the server would refuse is refused here, before sending,
+/// in the server's words; `send` and `paste` are told their stdin form, and
+/// no other verb is pointed at one. One at the cap is sent.
+#[test]
+fn validate_request_line_len_refuses_past_the_servers_cap() {
+    let words = aterm_types::control_verbs::request_line_too_long();
+    for verb in ["send", "paste", "turn"] {
+        let at_cap = format!("{verb} {}", "a".repeat(MAX_REQUEST_LINE - verb.len() - 1));
+        assert!(
+            validate_request_line_len(&at_cap, Some(verb)).is_ok(),
+            "{verb}"
+        );
+        let err = validate_request_line_len(&format!("{at_cap}a"), Some(verb)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{verb}");
+        let said = err.to_string();
+        assert!(said.starts_with(&words), "{verb}: {said}");
+        let stdin = format!("{verb} --stdin");
+        assert_eq!(said.contains(&stdin), verb != "turn", "{verb}: {said}");
+        assert_eq!(said.contains("--stdin"), verb != "turn", "{verb}: {said}");
+    }
+}
+
+/// The refusal comes BEFORE the dial: `main_entry_with` fails an over-long
+/// `send`, and the listener at `--sock` is sent not a byte. It counts what
+/// every connection it accepts sends (answering its first line `OK`) until
+/// one is over after the run ended: a request's own, or a marker connection
+/// that sends nothing. Every wait in it is a one-minute hang detector: the
+/// client's run, and each read of a connection. Negative control: a request
+/// at the cap does reach it.
+#[cfg(unix)]
+#[test]
+fn an_over_long_request_never_leaves_the_client() {
+    use std::io::{BufRead, Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+    // A private dir holding only the socket (no token file): no AUTH line.
+    let dir = std::env::temp_dir().join(format!("aterm-ctl-overlong-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let sock = dir.join("cap.sock");
+    let path = sock.to_str().expect("utf8 path").to_string();
+    let sent = |text: String| {
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("bind mock socket");
+        let done = Arc::new(AtomicBool::new(false));
+        let srv = std::thread::spawn({
+            let done = Arc::clone(&done);
+            move || {
+                let mut bytes = 0;
+                loop {
+                    let (conn, _) = listener.accept().expect("accept");
+                    // macOS refuses the option (EINVAL) on a connection
+                    // its peer already closed, whose reads end at once.
+                    let _ = conn.set_read_timeout(Some(HANG));
+                    let _ = conn.set_write_timeout(Some(HANG));
+                    let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
+                    let mut line = Vec::new();
+                    let _ = r.read_until(b'\n', &mut line);
+                    if !line.is_empty() {
+                        let _ = (&conn).write_all(b"OK\n");
+                    }
+                    let _ = r.read_to_end(&mut line);
+                    bytes += line.len();
+                    if done.load(Ordering::SeqCst) {
+                        return bytes;
+                    }
+                }
+            }
+        });
+        let argv: Vec<std::ffi::OsString> = ["--sock", path.as_str(), "send", text.as_str()]
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(main_entry_with(argv, LocalVerbs::NONE));
+        });
+        let code = rx.recv_timeout(HANG).expect("the client ends its run");
+        done.store(true, Ordering::SeqCst);
+        // Refused once the listener ended on a request's own connection.
+        drop(UnixStream::connect(&sock));
+        (code, srv.join().expect("the listener"))
+    };
+    let (code, bytes) = sent("a".repeat(MAX_REQUEST_LINE));
+    assert_eq!(code, ExitCode::FAILURE, "the over-long send is refused");
+    assert_eq!(bytes, 0, "not a byte of it was sent");
+    let (_, bytes) = sent("a".repeat(MAX_REQUEST_LINE - "send ".len()));
+    assert!(
+        bytes > MAX_REQUEST_LINE,
+        "the request at the cap was sent: {bytes}"
+    );
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_dir(&dir);
+}
+
+fn argv(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// `unix`, an absolute path spelled as on Unix, as this platform spells one:
+/// on Windows on drive `C:`, every `/` a `\`.
+fn native_abs(unix: &str) -> String {
+    if cfg!(windows) {
+        format!("C:{}", unix.replace('/', "\\"))
+    } else {
+        unix.to_string()
+    }
+}
+
+/// A WORKER's spawn line (`spawn agent=… -`): the stdin marker is required
+/// and dropped, `len=` is the client's alone, the starter becomes `from=`
+/// unless one is named, and a missing `cwd=` becomes this directory — quoted
+/// when it holds a space, refused when it holds a space and a quote. An
+/// absolute `cwd=` given goes by the same rule (one already quoted as given);
+/// a relative one is made absolute against this directory (the server would
+/// resolve it against its own), and with no directory to read it is refused.
+/// On Windows a folder rooted on no drive (`\x`) takes this directory's, and
+/// one relative to another drive's current folder (`D:x`) is refused.
+#[test]
+fn a_worker_spawn_line_names_its_folder_and_leaves_the_length_to_the_frame() {
+    let args = argv(&["agent=claude", "model=opus", "-"]);
+    let proj = native_abs("/w/proj");
+    let here = Path::new(&proj);
+    assert_eq!(
+        worker_spawn_head(Some("@s-cd34"), &args, Some("s-ab12"), Some(here)).unwrap(),
+        format!("@s-cd34 spawn agent=claude model=opus from=s-ab12 cwd={proj}")
+    );
+    let spaced = native_abs("/a b/c");
+    assert_eq!(
+        worker_spawn_head(
+            None,
+            &argv(&["agent=claude", "-"]),
+            None,
+            Some(Path::new(&spaced))
+        )
+        .unwrap(),
+        format!("spawn agent=claude cwd=\"{spaced}\"")
+    );
+    let x = format!("cwd={}", native_abs("/x"));
+    assert_eq!(
+        worker_spawn_head(
+            None,
+            &argv(&[
+                x.as_str(),
+                "from=s-ef56",
+                "agent=claude",
+                "raise=false",
+                "-"
+            ]),
+            Some("s-ab12"),
+            None
+        )
+        .unwrap(),
+        format!("spawn {x} from=s-ef56 agent=claude raise=false")
+    );
+    // The shell's `cwd="$PWD"` in a folder with a space: one argument with
+    // the space in it, quoted on the wire as the filled-in folder is.
+    let project = native_abs("/My Project/x");
+    for given in [format!("cwd={project}"), format!("cwd=\"{project}\"")] {
+        assert_eq!(
+            worker_spawn_head(
+                None,
+                &argv(&[given.as_str(), "agent=claude", "-"]),
+                None,
+                Some(here)
+            )
+            .unwrap(),
+            format!("spawn cwd=\"{project}\" agent=claude")
+        );
+    }
+    let relative = |cwd: &str| {
+        worker_spawn_head(None, &argv(&["agent=claude", cwd, "-"]), None, Some(here)).unwrap()
+    };
+    let under = |unix: &str| native_abs(&format!("/w/proj{unix}"));
+    assert_eq!(
+        relative("cwd=sub"),
+        format!("spawn agent=claude cwd={}", under("/sub"))
+    );
+    assert_eq!(relative("cwd=."), format!("spawn agent=claude cwd={proj}"));
+    assert_eq!(
+        relative("cwd=../x"),
+        format!("spawn agent=claude cwd={}", under("/../x"))
+    );
+    assert_eq!(
+        relative("cwd=\"my dir\""),
+        format!("spawn agent=claude cwd=\"{}\"", under("/my dir"))
+    );
+    assert_eq!(
+        relative("cwd=my dir"),
+        format!("spawn agent=claude cwd=\"{}\"", under("/my dir"))
+    );
+    let mut refused = vec![
+        worker_spawn_head(
+            None,
+            &argv(&[
+                format!("cwd={}", native_abs("/a \"b")).as_str(),
+                "agent=claude",
+                "-",
+            ]),
+            None,
+            Some(here),
+        ),
+        worker_spawn_head(None, &argv(&["agent=claude"]), None, Some(here)),
+        worker_spawn_head(
+            None,
+            &argv(&["agent=claude", "len=3", "-"]),
+            None,
+            Some(here),
+        ),
+        worker_spawn_head(
+            None,
+            &argv(&["agent=claude", "-"]),
+            None,
+            Some(Path::new(&native_abs("/a \"b"))),
+        ),
+        worker_spawn_head(None, &argv(&["agent=claude", "-"]), None, None),
+        worker_spawn_head(None, &argv(&["agent=claude", "cwd=sub", "-"]), None, None),
+        worker_spawn_head(
+            None,
+            &argv(&["agent=claude", "a\nb", "-"]),
+            None,
+            Some(here),
+        ),
+    ];
+    if cfg!(windows) {
+        // Rooted on no drive, or on its drive: this directory's drive.
+        assert_eq!(relative(r"cwd=\x"), r"spawn agent=claude cwd=C:\x");
+        assert_eq!(relative("cwd=/x"), r"spawn agent=claude cwd=C:\x");
+        assert_eq!(relative(r"cwd=D:\x"), r"spawn agent=claude cwd=D:\x");
+        refused.extend([
+            worker_spawn_head(None, &argv(&["agent=claude", "cwd=/x", "-"]), None, None),
+            worker_spawn_head(
+                None,
+                &argv(&["agent=claude", "cwd=D:x", "-"]),
+                None,
+                Some(here),
+            ),
+        ]);
+    }
+    for refused in refused {
+        assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+}
+
+/// A plain `spawn`'s line (`[@<sel>] spawn …`): a folder with a
+/// space goes quoted, as the server's spawn tokenizer reads it, whatever
+/// aims it; a folder without one, one already quoted and every other word go
+/// as given; a folder with a space and a quote is refused.
+#[test]
+fn a_spawn_line_keeps_a_spaced_folder_whole() {
+    let line = |parts: &[&str]| spawn_wire_line(&argv(parts));
+    assert_eq!(
+        line(&["@s-1", "spawn", "cwd=/My Project", "split=v"]).unwrap(),
+        "@s-1 spawn cwd=\"/My Project\" split=v"
+    );
+    for given in [
+        &["spawn", "cwd=/w/proj", "raise=false"][..],
+        &["spawn", "cwd=\"/a b\""],
+        &["spawn", "cwd=/tmp/a\"b"],
+    ] {
+        assert_eq!(line(given).unwrap(), given.join(" "));
+    }
+    assert_eq!(
+        line(&["spawn", "cwd=/a \"b"]).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+}
+
+/// A PLAIN `spawn` GOES OUT BY ITS SPAWN RULE, however it is aimed: the
+/// request line keeps a spaced folder whole for `spawn` and `@<sel> spawn`
+/// alike (the verb read past the selector, never the line's first word).
+/// NEGATIVE CONTROL: any other verb's words are joined as given, a spaced
+/// `cwd=`-looking word split by the server as ever.
+#[test]
+fn a_plain_spawn_request_keeps_its_folder_whole_however_aimed() {
+    let line = |parts: &[&str]| request_line(&argv(parts)).unwrap();
+    assert_eq!(
+        line(&["spawn", "cwd=/My Project"]),
+        "spawn cwd=\"/My Project\""
+    );
+    assert_eq!(
+        line(&["@s-1", "spawn", "cwd=/My Project", "split=v"]),
+        "@s-1 spawn cwd=\"/My Project\" split=v"
+    );
+    assert_eq!(
+        request_line(&argv(&["@s-1", "spawn", "cwd=/a \"b"]))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput,
+        "refused before a byte is sent"
+    );
+    // NEGATIVE CONTROL: another verb, aimed or not.
+    assert_eq!(
+        line(&["@s-1", "turn", "cwd=/My Project"]),
+        "@s-1 turn cwd=/My Project"
+    );
+    assert_eq!(line(&["send", "cwd=/a \"b"]), "send cwd=/a \"b");
+}
+
+/// A worker's starter — its `from=` however it is aimed — is the session the
+/// client runs in; the spawn aims at it unless a selector names another, or
+/// the call is pinned to an instance that may not host it.
+#[test]
+fn a_workers_starter_is_its_own_session_and_its_aim_unless_told_or_pinned() {
+    assert_eq!(
+        worker_starter(Some("s-ab12".to_string())).as_deref(),
+        Some("s-ab12")
+    );
+    assert_eq!(worker_starter(None), None, "outside any session");
+    assert_eq!(worker_starter(Some(String::new())), None);
+    assert_eq!(worker_starter(Some("s-a b".to_string())), None);
+    let me = Some("s-ab12");
+    assert_eq!(worker_selector(None, false, me).as_deref(), Some("@s-ab12"));
+    assert_eq!(
+        worker_selector(Some("@s-cd34"), false, me).as_deref(),
+        Some("@s-cd34")
+    );
+    assert_eq!(
+        worker_selector(None, true, me),
+        None,
+        "pinned: --sock/--pid"
+    );
+    assert_eq!(
+        worker_selector(None, false, None),
+        None,
+        "outside any session"
+    );
+}
+
+/// A WORKER'S TASK IS SENT ONLY TO A SERVER THAT SAID IT READS IT: over a
+/// stand-in instance, the task follows the line only once the line is
+/// answered `GO <n>`, and a second `GO` is read past to the answer. A server
+/// that predates the frame — it refuses the line with the usage error and
+/// keeps the connection, where every line of a task behind it would be
+/// served as a request — is sent the line alone: not a byte of the task, and
+/// the client exits FAILURE. Unix only: the stand-in is a `UnixListener`.
+#[cfg(unix)]
+#[test]
+fn a_workers_task_follows_only_the_servers_go() {
+    use std::io::{BufRead, Read};
+    use std::os::unix::net::UnixListener;
+
+    // A private dir holding only the socket, so no token is read and the
+    // request line is the first line the stand-in sees.
+    let dir = std::env::temp_dir().join(format!("aterm-ctl-worker-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let sock = dir.join("worker.sock");
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock).expect("bind mock socket");
+    let path = sock.to_str().expect("utf8 path").to_string();
+    let task = b"close\ntab close\nsend rm -rf ~\n";
+    let head = format!("spawn agent=claude cwd=/w len={}", task.len());
+    let deadline = Some(std::time::Duration::from_secs(60));
+    // One connection per run: `answers` is what the stand-in says to the line
+    // (`GO`s read the task and answer `OK s-new`); it returns the line and
+    // every byte that followed it until the client hung up.
+    let serve = |answers: &'static [&'static str], listener: UnixListener| {
+        std::thread::spawn(move || {
+            let (conn, _) = listener.accept().expect("accept");
+            let mut w = conn.try_clone().expect("clone");
+            let mut r = std::io::BufReader::new(conn);
+            let mut first = String::new();
+            r.read_line(&mut first).expect("request line");
+            let mut rest = Vec::new();
+            if answers.first().is_some_and(|a| a.starts_with("GO")) {
+                for answer in answers {
+                    std::io::Write::write_all(&mut w, answer.as_bytes()).expect("answer");
+                }
+                let mut body = vec![0u8; task.len()];
+                r.read_exact(&mut body).expect("the task");
+                rest.extend_from_slice(&body);
+                std::io::Write::write_all(&mut w, b"OK s-new\n").expect("answer");
+            } else {
+                std::io::Write::write_all(&mut w, answers[0].as_bytes()).expect("answer");
+            }
+            let _ = r.read_to_end(&mut rest);
+            (listener, first, rest)
+        })
+    };
+    let go: &'static str = aterm_types::control_verbs::task_frame_go(task.len()).leak();
+    let srv = serve(vec![go].leak(), listener);
+    let code = worker_exchange(&path, TargetOrigin::Pinned, &head, task, deadline).expect("run");
+    assert_eq!(code, ExitCode::SUCCESS);
+    let (listener, first, rest) = srv.join().expect("server");
+    assert_eq!(first, format!("{head}\n"));
+    assert_eq!(rest, task, "the task, after the GO");
+
+    let srv = serve(vec![go, go].leak(), listener);
+    let code = worker_exchange(&path, TargetOrigin::Pinned, &head, task, deadline).expect("run");
+    assert_eq!(code, ExitCode::SUCCESS, "a second GO is read past");
+    let (listener, _, rest) = srv.join().expect("server");
+    assert_eq!(rest, task);
+
+    let srv = serve(
+        &["ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>]\n"],
+        listener,
+    );
+    let code = worker_exchange(&path, TargetOrigin::Pinned, &head, task, deadline).expect("run");
+    assert_eq!(code, ExitCode::FAILURE);
+    let (_, first, rest) = srv.join().expect("server");
+    assert_eq!(first, format!("{head}\n"));
+    assert!(rest.is_empty(), "not a byte of the task: {rest:?}");
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_dir(&dir);
+}
+
+/// A worker's task is 1 byte to 64 KiB: empty and over are refused before
+/// anything is sent.
+#[test]
+fn a_worker_task_is_refused_empty_or_past_the_cap() {
+    assert!(validate_task_payload(b"t").is_ok());
+    assert!(validate_task_payload(&vec![b'x'; MAX_TASK_BYTES]).is_ok());
+    for bad in [Vec::new(), vec![b'x'; MAX_TASK_BYTES + 1]] {
+        assert_eq!(
+            validate_task_payload(&bad).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+}
+
 /// Every flag pins the socket, so a dead one is never answered with another
 /// instance to drive; both flags at once are refused. (The flagless arm is
 /// not exercised: it would dial the developer's real `latest` alias.)
@@ -527,11 +1009,11 @@ fn self_location_refuses_a_sid_that_is_not_server_shaped() {
 }
 
 /// `read_bounded_line`'s success path is byte-identical to
-/// `BufRead::read_line` (headers, CRLF body rows, the EOF-cut partial line,
-/// std's invalid-UTF-8 error).
+/// `BufRead::read_line` (headers, CRLF body rows, blank rows, clean EOF and
+/// std's invalid-UTF-8 error). A cut row is an incomplete framed reply.
 #[test]
 fn read_bounded_line_matches_read_line_on_wellformed_input() {
-    let data: &[u8] = b"OK 2 incomplete\r\nalpha\n\nbeta"; // header, body, blank, EOF-cut tail
+    let data: &[u8] = b"OK 2 incomplete\r\nalpha\n\n"; // header, body, blank
     let mut bounded = io::Cursor::new(data);
     let mut plain = io::Cursor::new(data);
     loop {
@@ -543,6 +1025,18 @@ fn read_bounded_line_matches_read_line_on_wellformed_input() {
             break;
         }
     }
+    // A partial status or body row never becomes a complete answer, even if
+    // its bytes form valid text. Refusal leaves existing caller output alone.
+    for partial in [&b"beta"[..], &b"OK version=0.0.0 commi"[..], &b"\xc3"[..]] {
+        let mut out = String::from("already read");
+        let error = read_bounded_line(&mut io::Cursor::new(partial), &mut out).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(out, "already read");
+    }
+    let error = read_reply_lines(&mut io::Cursor::new(b"first\nlast"), 2)
+        .expect_err("a partial last row is not a complete counted body");
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    assert_eq!(exit_for(&error), ExitCode::FAILURE);
     // Invalid UTF-8: same kind, same message, `line` left untouched.
     let mut out = String::new();
     let e = read_bounded_line(&mut io::Cursor::new(&b"\xffbad\n"[..]), &mut out).unwrap_err();
@@ -703,25 +1197,27 @@ fn a_server_that_stalls_is_a_named_wait_not_eagain() {
         seen
     });
     let path = sock.to_str().expect("utf8 path").to_string();
-    let deadline = Some(std::time::Duration::from_secs(1));
+    // Nothing is waited for under the first two deadlines but the deadline
+    // itself; under the third the server's first row is, so it is longer.
+    let unanswered = Some(std::time::Duration::from_millis(200));
     let errors = [
         exchange(
             &path,
             TargetOrigin::Pinned,
             "text\n",
             "text",
-            deadline,
+            unanswered,
             false,
             &redial::Redial::none(),
         )
         .expect_err("nothing answers the verb line"),
-        feed_bin_exchange(&path, TargetOrigin::Pinned, "feed-bin", b"x", deadline)
+        feed_bin_exchange(&path, TargetOrigin::Pinned, "feed-bin", b"x", unanswered)
             .expect_err("nothing answers the payload"),
         help_with_fallback(
             &path,
             TargetOrigin::Pinned,
             "text",
-            deadline,
+            Some(std::time::Duration::from_secs(1)),
             &LocalVerbs::NONE,
         )
         .expect_err("the second row never comes"),
@@ -777,7 +1273,7 @@ fn split_selector_peels_leading_at() {
 
 /// `@self` / `@env` expand to `@<sid>` from `$ATERM_PARENT_SESSION_ID`
 /// before framing — selector-second for `subscribe`, each element of a comma
-/// list; a missing or empty variable is an error with the parts left as-is;
+/// list; a missing, empty or blank variable is an error with the parts left as-is;
 /// other selectors and flagless verbs pass through.
 #[test]
 fn expand_self_selector_expands_env_and_errors_when_unset() {
@@ -787,6 +1283,9 @@ fn expand_self_selector_expands_env_and_errors_when_unset() {
         ("@env send hi", Some("s-ff"), Some("@s-ff send hi")),
         ("@self text", None, None),
         ("@self text", Some(""), None),
+        // A blank sid would frame `@ `: a selector naming nothing.
+        ("@self text", Some(" "), None),
+        ("@self text", Some("\t"), None),
         ("@s-xyz text", Some("s-abc"), Some("@s-xyz text")),
         ("@. text", Some("s-abc"), Some("@. text")),
         ("text", None, Some("text")),
@@ -816,6 +1315,107 @@ fn expand_self_selector_expands_env_and_errors_when_unset() {
             }
         }
     }
+}
+
+/// A selector that names nothing — a bare `@` (what `@$W` is when `$W` is
+/// empty), `@` and a blank, or such an element of a comma list — is refused
+/// in the request's selector position; every named form, and `@` inside a
+/// verb's own arguments, passes.
+#[test]
+fn an_empty_selector_is_refused_in_the_selector_position_only() {
+    let p = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+    for refused in [
+        vec!["@".to_string(), "turn".into(), "hi".into()],
+        vec!["@ ".to_string(), "status".into()],
+        vec!["@ status".to_string()],
+        vec!["@\t".to_string(), "close".into()],
+        p("subscribe @ screen"),
+        p("subscribe @s-a,@ screen"),
+        p("subscribe @,@self events"),
+    ] {
+        let e = refuse_empty_selectors(&refused).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{refused:?}");
+        assert_eq!(
+            e.to_string(),
+            aterm_types::control_verbs::EMPTY_SELECTOR,
+            "{refused:?}"
+        );
+    }
+    for passed in [
+        p("@. status"),
+        p("@self turn hi"),
+        p("@s-ab12 send x"),
+        p("@3 close"),
+        p("subscribe @s-a,@self screen"),
+        p("subscribe screen"),
+        p("send @"),
+        p("status"),
+    ] {
+        refuse_empty_selectors(&passed).unwrap_or_else(|e| panic!("{passed:?}: {e}"));
+    }
+    refuse_empty_selectors(&[]).unwrap();
+}
+
+/// The same refusal in a whole run: `aterm ctl --sock <s> @ <verb>` exits on
+/// the usage error without dialling, while `@.` (the negative control, the
+/// active tab named outright) reaches the very socket with its line intact.
+#[cfg(unix)]
+#[test]
+fn an_empty_selector_never_reaches_the_socket_and_a_named_one_does() {
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixListener;
+
+    let dir = std::env::temp_dir().join(format!("aterm-ctl-emptysel-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let sock = dir.join("s.sock");
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock).expect("bind mock socket");
+    // One connection, whichever comes first: a refused case that dialled would
+    // be the line seen here (and the control would then find no listener).
+    let srv = std::thread::spawn(move || {
+        let (conn, _) = listener.accept().expect("accept");
+        let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
+        let mut line = String::new();
+        r.read_line(&mut line).expect("request");
+        let mut w = conn;
+        w.write_all(b"OK task rev=0 state=- from=- since_ms=0 result_bytes=0 why=- result_path=- agent=- attention=-\n")
+            .expect("reply");
+        w.flush().expect("flush");
+        line
+    });
+    let path = sock.to_str().expect("utf8 path").to_string();
+    let run = |argv: &[&str]| {
+        let mut full = vec!["--sock", path.as_str()];
+        full.extend_from_slice(argv);
+        real_main(
+            strings(&full).into_iter().map(Into::into).collect(),
+            LocalVerbs::NONE,
+        )
+    };
+    for argv in [
+        &["@", "task"][..],
+        &["@ ", "task"][..],
+        &["@", "turn", "typed=1", "hi"][..],
+        &["@", "send", "hi"][..],
+        &["@", "signal", "term"][..],
+        &["@", "close"][..],
+        &["@", "spawn", "agent=claude", "-"][..],
+        &["@", "await", "task"][..],
+        &["subscribe", "@", "events"][..],
+    ] {
+        let e = run(argv).expect_err("an empty selector is a usage error");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{argv:?}");
+        assert_eq!(
+            e.to_string(),
+            aterm_types::control_verbs::EMPTY_SELECTOR,
+            "{argv:?}"
+        );
+    }
+    let code = run(&["@.", "task"]).expect("the named selector is sent");
+    assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+    assert_eq!(srv.join().expect("server"), "@. task\n");
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_dir(&dir);
 }
 
 /// The hidden `--completions <shell>` generators, `aterm-ctl`'s and the
@@ -862,8 +1462,8 @@ fn completions_cover_every_verb_per_shell_and_reject_unknown() {
 }
 
 /// `aterm-uds` keeps a std-only mirror of the token-filename rule
-/// (`aterm-agent`'s `aterm drive --socket` path reads tokens through it
-/// without depending on `aterm-types`). This crate depends on both, so it pins their
+/// (`aterm-agent` reads tokens through it without depending
+/// on `aterm-types`). This crate depends on both, so it pins their
 /// agreement for the name the server writes and the ordered list a client
 /// reads.
 #[test]
@@ -1177,7 +1777,9 @@ fn help_is_answered_client_side_only_for_what_the_client_knows() {
         "autopilot=<off|cruise|land|->",
         "path_evidence=",
         "upgrade=<-|<state>/<to>/<why>/<age>>",
-        "land_at=<unix-s|-> task=<open|landed|done|spent|theirs|->[ *]",
+        "land_at=<unix-s|-> task=<open|landed|done|spent|theirs|->",
+        "pause=<unix-s|-> task_state=<working|done|exited|stalled|->",
+        "task_rev=<n>[ *]",
     ];
     let at: Vec<Option<usize>> = order.iter().map(|field| ls.find(field)).collect();
     assert!(
@@ -1651,7 +2253,8 @@ fn mock_instance(
 /// (labelled by pid liveness), a missing file is Other, `ERR auth` is
 /// NoToken with nothing on disk and AuthRejected when a token was sent, a
 /// complete `OK n` is Answered, a truncated `OK n` or headerless hang-up is
-/// Other(UnexpectedEof), and a non-auth `ERR` keeps its words. Unix only.
+/// Other(UnexpectedEof), and a non-auth `ERR` is Replied, its words kept.
+/// Unix only.
 #[cfg(unix)]
 #[test]
 fn probe_lines_classifies_real_sockets() {
@@ -1730,11 +2333,18 @@ fn probe_lines_classifies_real_sockets() {
     }
     srv.join().expect("mock");
 
-    // Other: a non-auth ERR keeps the server's words.
+    // Replied: a non-auth ERR is the instance's own refusal, its words kept,
+    // and the report quotes them as before.
     let (sock, srv) = mock_instance(&dir, "mock.sock", b"ERR usage: sessions\n");
     match probe_lines(&sock, "sessions", 0) {
-        Probe::Other(e) => assert_eq!(e.to_string(), "server replied: ERR usage: sessions"),
-        other => panic!("a non-auth ERR is Other, got {other:?}"),
+        Probe::Replied(said) => {
+            assert_eq!(said, "ERR usage: sessions");
+            assert_eq!(
+                probe_cause(0, &Probe::Replied(said)),
+                "server replied: ERR usage: sessions"
+            );
+        }
+        other => panic!("a non-auth ERR is Replied, got {other:?}"),
     }
     srv.join().expect("mock");
 

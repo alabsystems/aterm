@@ -196,3 +196,112 @@ fn a_flood_of_minted_edges_never_delays_a_trusted_author() {
         }
     }
 }
+
+/// THE SHORT COUNT RIDES ITS OWN BUCKET (phase 5, ruling T1): session A
+/// was short of 79 marks and session B of none; B's next mark owes
+/// nothing, A's owes the 79, and A saying them leaves the rest alone. The
+/// overflow's authors (an unattributed author, `aterm`, a vendor) share
+/// its one count; a trusted actor's is its own. A named slot owing a count
+/// is not given away while an idle slot owing nothing is left, and is when
+/// none is: its count goes with it, unsaid. A session that would take a
+/// slot owes nothing and says nothing: not the overflow's count while a
+/// slot is free, nor the count of the idle slot it would take from A, which
+/// A keeps until the new session spends. NEGATIVE CONTROLS (by scratch
+/// revert): a slot given away whatever it owes goes first, A's count with
+/// it; and without `owed`'s and `said`'s guard for a slot not yet held, the
+/// new session reads, then clears, the overflow's count and A's.
+/// (aterm-gui's `an_edges_dropped_count_rides_only_its_own_mark` is the
+/// host's, against 5D-2's one count for every session.)
+#[test]
+fn a_short_count_rides_only_its_own_bucket() {
+    let mut lim = MarkLimiter::new(0);
+    let (a, b) = (minted(1), minted(2));
+    for _ in 0..MARK_BURST {
+        lim.spend(&a, 0);
+    }
+    lim.spend(&b, 0);
+    for _ in 0..79 {
+        assert!(lim.peek(&a, 0).is_err(), "A is short");
+        lim.note_short(&a, 0);
+    }
+    assert_eq!(lim.owed(&b, 0), 0, "B was short of nothing");
+    assert_eq!(lim.owed(&minted(3), 0), 0, "a session with no slot yet");
+    assert_eq!(lim.owed(&a, 0), 79);
+    lim.said(&b, 0);
+    assert_eq!(lim.owed(&a, 0), 79, "B saying its own leaves A's");
+    lim.said(&a, 0);
+    assert_eq!(lim.owed(&a, 0), 0, "said once");
+    // The overflow's authors share its count; the trusted keep their own.
+    for _ in 0..3 {
+        lim.note_short(&Actor::Nobody, 0);
+    }
+    assert_eq!(lim.owed(&Actor::Aterm, 0), 3, "the overflow is shared");
+    lim.said(&Actor::Vendor, 0);
+    assert_eq!(lim.owed(&Actor::Nobody, 0), 0, "one said it for all");
+    assert_eq!(lim.owed(&Actor::Harness, 0), 0);
+    lim.note_short(&Actor::Harness, 0);
+    assert_eq!(lim.owed(&Actor::Harness, 0), 1);
+    assert_eq!(lim.owed(&Actor::Ctl, 0), 0, "the harness's is its own");
+    // Slot reuse: A owes again; every slot is taken, then all fall idle.
+    lim.note_short(&a, 0);
+    for i in 4..MARK_ACTORS + 2 {
+        lim.spend(&minted(i), 0);
+    }
+    let idle = MARK_REFILL_MS * u64::from(MARK_BURST) * 2;
+    for i in 100..100 + MARK_ACTORS - 1 {
+        lim.spend(&minted(i), idle);
+    }
+    assert_eq!(
+        lim.owed(&a, idle),
+        1,
+        "an idle slot owing nothing went first"
+    );
+    lim.spend(&minted(500), idle);
+    // A holds no slot now and none is free: it reads the overflow's count,
+    // nothing; its own 1 went with its slot.
+    assert_eq!(
+        lim.owed(&a, idle),
+        0,
+        "the last slot went, its count unsaid"
+    );
+
+    // A session that would take a slot says no other author's count.
+    let mut lim = MarkLimiter::new(0);
+    let (a, fresh) = (minted(1), minted(7));
+    for _ in 0..3 {
+        lim.note_short(&Actor::Nobody, 0);
+    }
+    lim.spend(&a, 0);
+    assert_eq!(lim.owed(&fresh, 0), 0, "a free slot owes nothing");
+    lim.said(&fresh, 0);
+    assert_eq!(lim.owed(&Actor::Nobody, 0), 3, "the overflow's still owed");
+    // A's slot idle and owing 5; every other slot in debt.
+    for _ in 0..MARK_BURST - 1 {
+        lim.spend(&a, 0);
+    }
+    for _ in 0..5 {
+        lim.note_short(&a, 0);
+    }
+    let idle = MARK_REFILL_MS * u64::from(MARK_BURST) * 2;
+    for i in 100..100 + MARK_ACTORS - 1 {
+        lim.spend(&minted(i), idle);
+    }
+    assert!(
+        lim.peek(&fresh, idle).is_ok(),
+        "A's idle slot is there to take"
+    );
+    assert_eq!(
+        lim.owed(&fresh, idle),
+        0,
+        "A's count is not the new session's"
+    );
+    lim.said(&fresh, idle);
+    assert_eq!(lim.owed(&a, idle), 5, "nor did the new session clear it");
+    lim.spend(&fresh, idle);
+    assert_eq!(lim.owed(&fresh, idle), 0, "the slot it took owes nothing");
+    assert_eq!(
+        lim.owed(&a, idle),
+        3,
+        "A's 5 went unsaid; A shares the overflow"
+    );
+}

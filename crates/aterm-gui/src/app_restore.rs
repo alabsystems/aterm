@@ -19,7 +19,7 @@
 
 use crate::spawn::spawn_session;
 use crate::{App, Session, TabIndex, WindowId, WindowState, pane, restore};
-use winit::event_loop::ActiveEventLoop;
+use aterm_window::event_loop::ActiveEventLoop;
 
 type BuiltRestoreTab = (crate::tab_model::Tab, Option<pane::PaneTree>);
 /// One agent a restore pass hands the host ([`App::take_restored_agents`]):
@@ -625,9 +625,11 @@ impl App {
             .map(|(index, (&wid, ws))| {
                 // A window system that went away answers nothing (an X11
                 // window's position is an unwrapped round trip on the dead
-                // connection): its windows are captured from this App's own
-                // state alone, with no origin, show state or maximized bit.
-                let os_window = ws.os_window.as_ref().filter(|_| !self.window_system_gone);
+                // connection), nor is one asked after any other failure of the
+                // event loop: its windows are captured from this App's own
+                // state alone, with no origin, show state, maximized bit or
+                // full-screen state.
+                let os_window = ws.os_window.as_ref().filter(|_| !self.event_loop_failed);
                 // W3 (Windows): show state + frame origin, read TOGETHER from
                 // `GetWindowPlacement` when the window is maximized. winit's
                 // `outer_position()` reports the MAXIMIZED frame's origin (the
@@ -643,9 +645,10 @@ impl App {
                     let placement = os_window.and_then(|w| crate::app_window::placement::read(w));
                     let pos = os_window.and_then(|w| w.outer_position().ok());
                     match placement {
-                        Some((true, (x, y))) => {
-                            (Some(winit::dpi::PhysicalPosition::new(x, y)), Some(true))
-                        }
+                        Some((true, (x, y))) => (
+                            Some(aterm_window::dpi::PhysicalPosition::new(x, y)),
+                            Some(true),
+                        ),
                         Some((false, _)) => (pos, Some(false)),
                         // Placement unreadable (no HWND yet, or the call failed):
                         // degrade to exactly the old capture — position only.
@@ -672,7 +675,7 @@ impl App {
                     let (origin, _) =
                         captured_frame(live, (ws.rows, ws.cols), maximized, ws.normal_frame);
                     (
-                        origin.map(|(x, y)| winit::dpi::PhysicalPosition::new(x, y)),
+                        origin.map(|(x, y)| aterm_window::dpi::PhysicalPosition::new(x, y)),
                         maximized,
                     )
                 };
@@ -777,10 +780,7 @@ impl App {
                 // update carries it, since its successor must recreate the
                 // window at the grid its adopted shells have.
                 let fullscreen = show.fullscreen == Some(true)
-                    || ws
-                        .os_window
-                        .as_ref()
-                        .is_some_and(|w| w.fullscreen().is_some());
+                    || os_window.is_some_and(|w| w.fullscreen().is_some());
                 let inner_px = ws
                     .win_px
                     .filter(|size| {
@@ -798,10 +798,10 @@ impl App {
                     outer_y: pos.map(|p| p.y),
                     maximized,
                     inner_px,
-                    // …and its presence row, which the successor reserves
-                    // before that first attach; a cold restore judges its
-                    // rows afresh.
-                    presence_row: handoff && ws.presence.rows > 0,
+                    // Presence owns no row: nothing for a successor to
+                    // reserve (the field stays on the wire for an older
+                    // reader, always unset).
+                    presence_row: false,
                     show,
                     tabs: terminal_tabs,
                     native_tabs,
@@ -1063,6 +1063,15 @@ impl App {
                         } else {
                             None
                         },
+                        // THE HOST'S WORD THAT THE TAB'S AGENT CANNOT BE
+                        // BROUGHT BACK (LC-4 of ATERM-KI-1016-1), on the
+                        // handoff layout only: the successor's host stands
+                        // it again at its Commit (`adopt_carried_lost_words`).
+                        lost: if carry_drafts {
+                            self.hosted_lost_word(terminal.session).map(Box::new)
+                        } else {
+                            None
+                        },
                         // Durable captures only (see the field): the
                         // handoff's Commit compares layouts, and a program
                         // may start or end in between.
@@ -1101,16 +1110,7 @@ impl App {
                     (
                         crate::native_app::AppKind::Settings,
                         crate::native_app::AppViewState::Settings(settings),
-                    ) => restore::NativeLeafRestore::settings(
-                        if settings.route == crate::native_settings::SettingsRoute::Manual {
-                            // Manual is a launcher for the separately persisted
-                            // config Editor tab, never a restorable interstitial.
-                            crate::native_settings::SettingsRoute::Home.path()
-                        } else {
-                            settings.route.path()
-                        }
-                        .to_string(),
-                    ),
+                    ) => restore::NativeLeafRestore::settings(settings.route.path().to_string()),
                     (
                         crate::native_app::AppKind::Markdown,
                         crate::native_app::AppViewState::Markdown(_),
@@ -1293,6 +1293,14 @@ impl App {
             .map(restore::AgentRestore::of)
     }
 
+    /// The word standing that pool session `id`'s agent cannot be brought
+    /// back, as its supervisor host keeps it
+    /// ([`crate::harness_host::HostHandle::lost_word`]), in the form a
+    /// handoff leaf carries ([`restore::TerminalLeafRestore::lost`]).
+    fn hosted_lost_word(&self, id: u64) -> Option<restore::LostRestore> {
+        self.harness.as_ref()?.lost_word(&self.session_sid(id)?)
+    }
+
     /// The agent a restore that is still under way owes pool session `id`'s
     /// tab and has not handed the host yet (`restored_agents`, handed at the
     /// pass's end: [`Self::close_restore_pass`]) — a cold drain's landed tab
@@ -1306,6 +1314,17 @@ impl App {
     /// could not put back on it ([`Self::unhanded_restored_holds`]) — and
     /// the next launch says it again. With held agents in a list of their
     /// own (LC-8), a restart inside the drain lost it.
+    ///
+    /// ONLY WHILE A HOLD STANDS ON IT (ruling 23 (ii): a held tab's agent is
+    /// not relaunched when the hold lifts; ATERM-KI-1016-1 LC-8). A held
+    /// tab's agent the owner's lift has left with no hold on the leaf
+    /// ([`Self::desk_holds`] empty) is named nowhere: the leaf of an end
+    /// inside the drain named it with no hold, and the next launch
+    /// relaunched it into the tab and typed its carry-on there — where the
+    /// same lift after the drain's last slice, which says the held agent and
+    /// lets it go ([`Self::say_restored_held`]), relaunched nothing. The
+    /// lift's own wake says it and lets it go ([`Self::let_go_lifted_held`]);
+    /// this keeps a layout taken before that wake is read from naming it.
     fn unhanded_restored_agent(&self, id: u64) -> Option<restore::AgentRestore> {
         self.restored_agents
             .iter()
@@ -1313,6 +1332,7 @@ impl App {
             .chain(
                 self.restored_held
                     .iter()
+                    .filter(|(session, ..)| *session != id || !self.desk_holds(id).is_empty())
                     .map(|(session, agent, ..)| (session, agent)),
             )
             .find(|(session, _)| **session == id)
@@ -1431,13 +1451,14 @@ impl App {
     /// sleeps ([`Self::crash_journal_wake`]). Nothing is captured here, so a
     /// batch of words (a scripted `meta set` loop, a fleet's holds) costs one
     /// capture, not one per word (review OW-P1). Every other change keeps the
-    /// write interval.
+    /// write interval. Windows' end-session snapshot is told too
+    /// ([`Self::end_session_snapshot`]).
     /// Cheap where nothing moved: one meta guard, one fabric guard, one walk
     /// of the last image — so every wake that may move a word asks.
     ///
     /// [`SessionMeta::carried_autopilot`]: crate::session_timeline::SessionMeta::carried_autopilot
     pub(crate) fn journal_owner_words(&mut self, local_id: u64) {
-        if !self.crash_journal.is_active() {
+        if !self.crash_journal.is_active() && !self.end_session.taking() {
             return;
         }
         let Some((autopilot, land_at)) = self.pool.get(local_id).map(|s| {
@@ -1454,7 +1475,57 @@ impl App {
             land_at,
             holds: self.desk_holds(local_id),
         };
+        self.end_session.note_owner_words(local_id, &words);
         self.crash_journal.note_owner_words(local_id, &words);
+    }
+
+    /// WINDOWS' END-SESSION SNAPSHOT, WHEN DUE at `now`
+    /// ([`crate::crash_journal::EndSessionCadence`]: every couple of seconds,
+    /// and at once where a word about typing moved from what the last one
+    /// carries, [`Self::journal_owner_words`]): the layout for the
+    /// end-session handler to write, `None` inside it where `restore_session`
+    /// is off (retracted); `None` when not due. A logoff or a shutdown is an
+    /// end nobody chose, so the layout keeps the desk's agents and the
+    /// owner's holds on their leaves ([`Self::fill_desk_agents`]), as the
+    /// crash journal's image and a restart's quit do: taken from the layout
+    /// alone, it carried no hold at all, and the reopened tab was unheld. The Windows lane publishes it
+    /// from `about_to_wait` (`platform_win::set_end_session_snapshot`).
+    #[cfg_attr(
+        not(any(windows, test)),
+        allow(
+            dead_code,
+            reason = "only the Windows lane publishes the end-session snapshot; every host tests \
+                      when it is taken"
+        )
+    )]
+    pub(crate) fn end_session_snapshot(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<Option<restore::RestoreManifest>> {
+        if !self.end_session.due(now) {
+            return None;
+        }
+        let snapshot = self.config.restore_session_or_default().then(|| {
+            let mut manifest = self.capture_restore_manifest();
+            self.fill_desk_agents(&mut manifest);
+            manifest
+        });
+        self.end_session.took(snapshot.as_ref(), now);
+        Some(snapshot)
+    }
+
+    /// ARM THE WORDS' DURABILITY ACK (ATERM-KI-1016-1): the session store
+    /// hands the control verbs that move a word about typing this lane's
+    /// [`crate::crash_journal::Durable`], and a ticket (or a failed write)
+    /// wakes the loop with `wake`. Once at launch, and again by a test that
+    /// swaps the lane in.
+    pub(crate) fn arm_word_durability(&self, wake: impl Fn() + Send + Sync + 'static) {
+        let durable = self.crash_journal.durable();
+        durable.set_wake(wake);
+        self.store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_journal_durable(durable);
     }
 
     /// WHAT A QUIT'S LAYOUT KEEPS OF THE DESK'S AGENTS AND THE OWNER'S HOLDS
@@ -1558,6 +1629,10 @@ impl App {
             self.crash_journal.withdraw();
             return;
         }
+        // The verbs waiting on a word's image are answered by this lane
+        // (`crash_journal::Durable`), and a write that failed is owed again.
+        self.crash_journal.set_live(true);
+        self.crash_journal.poll_writer();
         if !crash_journal_writable(
             self.desk.on_glass(self.first_present_done),
             self.restore_pass_queued(),
@@ -1578,6 +1653,9 @@ impl App {
         // wrote images naming no agent there, and stopped before the
         // relaunch ran it came back bare. Not closed: from a relaunch's
         // landing to its agent's first publication neither names it.
+        // The tickets of the words stored so far are read out first: the
+        // capture below reads every one of those words.
+        self.crash_journal.begin_capture();
         let mut manifest = self.capture_restore_manifest();
         self.fill_desk_agents(&mut manifest);
         let programs = self.crash_journal_programs(&manifest);
@@ -2054,6 +2132,90 @@ impl App {
         self.post_message(record);
     }
 
+    /// THE RESTORED AGENTS' ROW, WORDED BY THE WINDOW (ATERM-KI-1016-1 host-7):
+    /// the row the host said (`harness_host::say_restored`, every miss it
+    /// said this process), as the owner should see it now. The host knows
+    /// which agents did not come back; only the window knows where their tabs
+    /// are and what became of the row it showed last ([`RestoredShown`]).
+    ///
+    /// - A ROW SAID BEFORE A LATER ONE IS PASSED OVER ([`RestoredRow::seq`]):
+    ///   the later one names it all. Two sayers raced after a Commit, and the
+    ///   row posted last could be the older one, taking the newer one's tabs off.
+    /// - WHAT THE OWNER SAW THROUGH STAYS DOWN: once the row this process
+    ///   showed was seen through ([`restored_row_seen_through`]: dismissed,
+    ///   answered, resolved by its reporter, or on the glass for its whole
+    ///   span), the misses it named are not named again, so the next row
+    ///   starts a fresh list, as the folder rows do. Until then a row the owner
+    ///   dismissed came back inside the next one. A row that left the band
+    ///   otherwise — it never reached the glass (unseen), the band was full
+    ///   (evicted), it went stale or was withdrawn — was seen through by
+    ///   nobody: its misses are named again in the next row, as a row still up
+    ///   is (the review of host-7's first cut, which counted any row no longer
+    ///   up as seen and dropped a miss said while the band was full or before
+    ///   the window showed it). A miss said again is said anew.
+    /// - EACH TAB WHERE IT IS NOW: a line is worded with its tab's place now
+    ///   ([`Self::upgrade_place`]). A miss said before whose tab no tab shows
+    ///   any more leaves the row. A miss said in this row whose tab is not shown
+    ///   keeps the place it was said with. Until then a tab renumbered since
+    ///   its miss was named by its old place, which could be another tab's
+    ///   now.
+    /// - POSTED UNDER THIS PROCESS'S KEY
+    ///   ([`crate::message_reporters::restored_agents_key`]): a seamless update's
+    ///   successor never supersedes the row carried from the aterm before it,
+    ///   which names the tabs said at the park.
+    ///
+    /// Nothing is posted when no line is left: the row up, if any, stands.
+    pub(crate) fn post_restored_row(
+        &mut self,
+        row: crate::harness_host::RestoredRow,
+        stamp: aterm_messages::WallStamp,
+    ) {
+        if row.seq <= self.restored_shown.seq {
+            return;
+        }
+        self.restored_shown.seq = row.seq;
+        if self.restored_shown.id.is_some_and(|id| {
+            self.messages.live(id).is_none()
+                && self
+                    .messages
+                    .log()
+                    .get(id)
+                    .and_then(aterm_messages::LogRecord::retired)
+                    .is_some_and(restored_row_seen_through)
+        }) {
+            let named = std::mem::take(&mut self.restored_shown.named);
+            self.restored_shown.seen.extend(named);
+            self.restored_shown.id = None;
+        }
+        let shown = self.shown_session_sids();
+        let mut named = Vec::new();
+        let mut lines = Vec::new();
+        for line in &row.lines {
+            let said = (line.sid.clone(), line.said);
+            if self.restored_shown.seen.contains(&said) {
+                continue;
+            }
+            let place = if shown.contains(&line.sid) {
+                self.upgrade_place(&line.sid)
+            } else if self.restored_shown.named.contains(&said) {
+                continue;
+            } else {
+                line.place.clone()
+            };
+            named.push(said);
+            lines.push((place, line.agent, line.outcome.clone()));
+        }
+        if lines.is_empty() {
+            return;
+        }
+        let mut msg =
+            crate::message_reporters::restored_agents_not_resumed(&lines, row.log.as_deref());
+        msg.key = Some(crate::message_reporters::restored_agents_key());
+        let id = self.post_unsynced(msg, stamp);
+        self.restored_shown.id = Some(id);
+        self.restored_shown.named = named;
+    }
+
     /// Hand the agents the restore pass found ([`Self::carry_restored_identity`])
     /// to the supervisor host, which relaunches each in the tab that now
     /// stands for it ([`crate::harness_host::HostHandle::relaunch_restored`]):
@@ -2105,14 +2267,72 @@ impl App {
     /// it). A session no longer here (its leaf failed to rebuild) is passed
     /// over, and an agent two leaves named (a session shown in two windows)
     /// is said once, at the first ([`restore::AgentRestore::ran_as`], as its
-    /// relaunch would be made). One-shot.
+    /// relaunch would be made). One-shot. A tab whose hold the owner has
+    /// lifted since is said lifted ([`Self::let_go_lifted_held`] says it as
+    /// the lift's wake is read).
     fn say_restored_held(&mut self) {
+        let lifted: Vec<bool> = self
+            .restored_held
+            .iter()
+            .map(|(id, ..)| self.desk_holds(*id).is_empty())
+            .collect();
+        let held = std::mem::take(&mut self.restored_held);
+        self.say_held_agents(held.into_iter().zip(lifted));
+    }
+
+    /// A LANDED HELD TAB WHOSE HOLD THE OWNER LIFTED INSIDE THE COLD DRAIN IS
+    /// LET GO AS THE LIFT'S WAKE IS READ, ITS RECORD SAID (the review's
+    /// KR-J-5 of ATERM-KI-1016-1; ruling 23 (ii)): pool session `session`'s
+    /// held entry (`restored_held`), once no hold stands on its leaf
+    /// ([`Self::desk_holds`]: the session's rows, and the rows the restore
+    /// could not put back). Its leaf names its agent only while a hold
+    /// stands ([`Self::unhanded_restored_agent`]), so a restart or crash
+    /// inside the drain after the lift relaunches nothing — and the record
+    /// that names the agent and the line that resumes it, said only at the
+    /// pass's end ([`Self::say_restored_held`]), was said nowhere: the next
+    /// launch has no held tab to say. Said here, on the lift's own loop
+    /// turn (`Wake::FabricChanged`, `App::on_fabric_changed`), it is in the
+    /// message log before an end the turn's park did not reach; as the same
+    /// lift after the pass's end, it lets the agent go.
+    pub(crate) fn let_go_lifted_held(&mut self, session: u64) {
+        if !self.restored_held.iter().any(|(id, ..)| *id == session)
+            || !self.desk_holds(session).is_empty()
+        {
+            return;
+        }
+        let (lifted, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.restored_held)
+            .into_iter()
+            .partition(|(id, ..)| *id == session);
+        self.restored_held = held;
+        self.say_held_agents(lifted.into_iter().map(|entry| (entry, true)));
+    }
+
+    /// Every held tab the drain still holds whose hold no longer stands, let
+    /// go and said ([`Self::let_go_lifted_held`]): at the exit, before the
+    /// message log closes (`App::close_messages_at_exit`), for a lift whose
+    /// wake the loop never read — the quit's layout, written after the log
+    /// closed, names no agent there, and the record would be said nowhere.
+    pub(crate) fn let_go_every_lifted_held(&mut self) {
+        let mut sessions: Vec<u64> = self.restored_held.iter().map(|(id, ..)| *id).collect();
+        sessions.dedup();
+        for session in sessions {
+            self.let_go_lifted_held(session);
+        }
+    }
+
+    /// The records and log lines of held tabs' agents
+    /// ([`Self::say_restored_held`]), each with whether its hold was lifted
+    /// since it came back.
+    fn say_held_agents(
+        &mut self,
+        held: impl IntoIterator<Item = ((u64, restore::AgentRestore, bool, Vec<String>), bool)>,
+    ) {
         let relaunching = self
             .harness
             .as_ref()
             .is_some_and(crate::harness_host::HostHandle::relaunches_restored);
         let mut said: Vec<(u32, String)> = Vec::new();
-        for (id, agent, fleet, _) in std::mem::take(&mut self.restored_held) {
+        for ((id, agent, fleet, _), lifted) in held {
             let (pid, start) = agent.ran_as();
             if said.iter().any(|(p, s)| (*p, s.as_str()) == (pid, start)) {
                 continue;
@@ -2160,6 +2380,7 @@ impl App {
                     resume: resume.as_deref(),
                     stopped_by_hold: relaunching && agent.resumes() && name.is_some(),
                     fleet,
+                    lifted,
                 },
             ) {
                 self.record_message(record);
@@ -2177,8 +2398,9 @@ impl App {
     /// never typed twice, and one whose agent is back is left to it. A named
     /// shell this process did not adopt is dropped, said in one log line.
     /// One-shot.
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     pub(crate) fn hand_carried_restored_agents(&mut self) {
+        self.adopt_carried_lost_words();
         self.queue_carried_restored_agents();
         self.hand_restored_agents();
         self.watch_handed_agents();
@@ -2194,7 +2416,7 @@ impl App {
     /// host's first pass names it is this host's to read and relaunch. One
     /// whose shell this process did not adopt is dropped; with no host
     /// nothing is watched. One-shot.
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     fn watch_handed_agents(&mut self) {
         let handed = std::mem::take(&mut self.handoff_supervised_agents);
         let Some(host) = self.harness.as_ref() else {
@@ -2210,15 +2432,80 @@ impl App {
                         .iter()
                         .find(|session| session.handoff_local_id == Some(named))?;
                     let sid = g.by_local(session.id)?.sid.as_str().to_string();
-                    let shell = u32::try_from(session.pid).ok()?;
-                    Some((sid.clone(), agent.snapshot(sid, shell)?))
+                    let adopted = u32::try_from(session.pid).ok()?;
+                    Some((sid.clone(), agent.handed_snapshot(sid, adopted)?))
                 })
                 .collect()
         };
         host.watch_handed(agents);
     }
 
-    /// [`Self::hand_carried_restored_agents`]' first half: each carried agent
+    /// THE WORDS THE OUTGOING INSTANCE'S HOST KEPT THAT A TAB'S AGENT CANNOT
+    /// BE BROUGHT BACK (LC-4 of ATERM-KI-1016-1;
+    /// `restore::TerminalLeafRestore::lost`), each stood again by this
+    /// process's host on the shell adopted under the id its leaf names
+    /// ([`crate::harness_host::HostHandle::adopt_lost_words`]). Called at the
+    /// Commit before the host resumes, so no pass of it starts a worker in
+    /// such a tab — and lowers the carried mark as an earlier aterm's —
+    /// before the word that keeps it stands. One whose shell this process did
+    /// not adopt is dropped; with no host nothing is stood. One-shot: a later
+    /// call finds nothing.
+    #[cfg(unix)]
+    pub(crate) fn adopt_carried_lost_words(&mut self) {
+        let carried = std::mem::take(&mut self.handoff_lost_words);
+        let Some(host) = self.harness.as_ref() else {
+            return;
+        };
+        if carried.is_empty() {
+            return;
+        }
+        let words: Vec<(String, restore::LostRestore)> = {
+            let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+            carried
+                .into_iter()
+                .filter_map(|(named, lost)| {
+                    let session = self
+                        .pool
+                        .iter()
+                        .find(|session| session.handoff_local_id == Some(named))?;
+                    Some((g.by_local(session.id)?.sid.as_str().to_string(), lost))
+                })
+                .collect()
+        };
+        host.adopt_lost_words(words);
+    }
+
+    /// THE SUPERVISION TAKEN OVER AT A SUCCESSOR'S COMMIT (the Commit wake,
+    /// `Wake::ActivateCommittedHandoff`): the predecessor's supervisor host
+    /// stopped at its Commit, and this one takes the sessions over (one
+    /// supervisor per session), carries on every restart it left in flight,
+    /// and relaunches the restored agents its cold-restore queue still owed
+    /// (round four, plan item 7). Before the host resumes, what the
+    /// predecessor carried for it stands here (LC-4 of ATERM-KI-1016-1): the
+    /// person's stamps it wrote right before its Commit, taken before its
+    /// files are swept ([`Self::take_carried_person_stamps`]) — a relaunch
+    /// the host carries through a hand asks whether nobody keyed since — and
+    /// the words it kept that a tab's agent cannot be brought back
+    /// ([`Self::adopt_carried_lost_words`]), so no pass of this host lowers a
+    /// carried mark one of them keeps. One-shot.
+    #[cfg(unix)]
+    pub(crate) fn take_over_supervision_at_commit(&mut self) {
+        self.take_carried_person_stamps();
+        // The predecessor leaves at Commit without its graceful cleanup; its
+        // per-process files go once it has.
+        crate::control::sweep_after_handoff(self.sock_plan.as_ref());
+        self.adopt_carried_lost_words();
+        #[cfg(test)]
+        if let Some(probe) = self.handoff_before_host_resume.take() {
+            probe(self);
+        }
+        if let Some(host) = self.harness.as_ref() {
+            host.resume_after_handoff(self.handoff_carry_on_places());
+        }
+        self.hand_carried_restored_agents();
+    }
+
+    /// [`Self::hand_carried_restored_agents`]' queue: each carried agent
     /// onto the pool session adopted under the id its leaf names, beside the
     /// cold restore's ([`Self::take_restored_agents`] reads both alike).
     #[cfg(any(unix, test))]
@@ -2247,7 +2534,7 @@ impl App {
     /// instance left in flight
     /// ([`crate::harness_host::HostHandle::resume_after_handoff`]), and how a
     /// row names each tab.
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     pub(crate) fn handoff_carry_on_places(&self) -> Vec<(String, String)> {
         let sids: Vec<String> = {
             let g = self.store.read().unwrap_or_else(|p| p.into_inner());
@@ -2458,11 +2745,11 @@ impl App {
             let wid = self.create_native_restore_window(wl.rows, wl.cols);
             if let Some(ws) = self.windows.get_mut(&wid) {
                 let frame = crate::app_window::CarriedFrame::of(&wl);
-                ws.take_carried_frame(
-                    frame.map(|frame| frame.inner_px),
-                    frame.is_some_and(|frame| frame.presence_row),
-                );
+                ws.take_carried_frame(frame.map(|frame| frame.inner_px));
             }
+            // Windows: placed while still hidden, by the attach below.
+            #[cfg(windows)]
+            self.stage_restore_placement(wid, outer, maximized);
             self.restore_into_window(wid, wl);
             let restored = self
                 .windows
@@ -2484,15 +2771,18 @@ impl App {
             }
             placed.shown.push((wid, show));
             // W4: validated against the LIVE monitor set first — same
-            // contract as the terminal-window arm below.
-            if let (Some(x), Some(y)) = outer
+            // contract as the terminal-window arm below. (Windows placed it
+            // before its reveal.)
+            if !cfg!(windows)
+                && let (Some(x), Some(y)) = outer
                 && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
                 && crate::app_window::restored_position_on_screen(w, x, y)
             {
-                w.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+                w.set_outer_position(aterm_window::dpi::PhysicalPosition::new(x, y));
             }
             // W3: maximized LAST — see the ordering note below.
-            if maximized == Some(true)
+            if !cfg!(windows)
+                && maximized == Some(true)
                 && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
             {
                 w.set_maximized(true);
@@ -2543,6 +2833,7 @@ impl App {
             None,
             identity0.as_deref(),
             crate::app_window::CarriedFrame::of(&wl),
+            (outer, maximized),
         ) else {
             // A window create fails on spawn or GPU-surface trouble — both likely to
             // repeat. Keep what restored rather than looping on failures. If this
@@ -2573,12 +2864,14 @@ impl App {
         // point is validated against the monitors that exist NOW, because the set
         // that existed at capture time is exactly what an undock/unplug changes —
         // a raw `set_outer_position` here used to reopen those windows entirely
-        // outside the desktop.
-        if let (Some(x), Some(y)) = outer
+        // outside the desktop. Windows did both inside the attach, before the
+        // reveal (`App::stage_restore_placement`): here it is already on glass.
+        if !cfg!(windows)
+            && let (Some(x), Some(y)) = outer
             && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
             && crate::app_window::restored_position_on_screen(w, x, y)
         {
-            w.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+            w.set_outer_position(aterm_window::dpi::PhysicalPosition::new(x, y));
         }
         // W3: re-maximize AFTER the position lands. The order is load-bearing
         // twice over: winit's Windows backend clears its MAXIMIZED window flag
@@ -2587,7 +2880,8 @@ impl App {
         // whatever monitor the cascade picked rather than the one the persisted
         // point names. `Some(true)` only — `None` (an old manifest, or a
         // platform that does not capture the state) must never force a change.
-        if maximized == Some(true)
+        if !cfg!(windows)
+            && maximized == Some(true)
             && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
         {
             w.set_maximized(true);
@@ -2787,6 +3081,7 @@ impl App {
             None,
             None, // not a connected controller spawn
             None, // adopted: the shell keeps its env; the label rides `Adopted::identity`
+            None, // no worker's task
             Some(adopted),
         )
     }
@@ -3553,7 +3848,7 @@ impl App {
         let carried_block =
             crate::session_status::completed_block(&crate::term_lock(&session.term));
         // ITS TURN LEDGER AND ARCHIVE TAIL CROSS AS AN ADOPTED SESSION'S DO
-        // (round eight, finding 730): `history`, `aterm drive report` and a
+        // (round eight, finding 730): `history`, the report reader and a
         // resumed `since-turn=` still read the turns a manager drove into the
         // pane before its command ended. A pane the outgoing process carried
         // none for (an older one, or a carry it left out) starts with a ledger
@@ -3669,7 +3964,7 @@ impl App {
         if let Some(session) = self.adopted_in_this_restore(terminal, ids) {
             self.carry_restored_identity(terminal, FillingShell::Registered(session), ids);
             self.refresh_meta_dependent_chrome(session);
-            self.refresh_operator_status_item();
+            self.mark_status_dirty();
             self.pool.attach(session);
             return match self.view_store.insert_terminal(session) {
                 Ok(view) => Ok(view),
@@ -3774,6 +4069,17 @@ impl App {
         } else {
             None
         };
+        // A cold restore's shell starts on the side of the theme its leaf will
+        // draw (`carry_restored_theme`, after the spawn), as a booked tab's does.
+        // An adopted shell keeps the env it has.
+        #[cfg(windows)]
+        let shell_factory = adopt
+            .is_none()
+            .then(|| self.shell_factory(terminal.theme.as_deref(), identity.as_deref()));
+        #[cfg(windows)]
+        let factory = shell_factory.as_ref().unwrap_or(&self.session_factory);
+        #[cfg(not(windows))]
+        let factory = &self.session_factory;
         let session = spawn_session(
             id,
             wid,
@@ -3781,11 +4087,12 @@ impl App {
             cols,
             // CELL-PX-1: the host window's real cell box for the newborn engine.
             self.spawn_cell_px(wid),
-            &self.session_factory,
+            factory,
             &proxy,
             terminal.start_cwd().as_deref(),
             None, // not a connected controller spawn
             identity.as_deref(),
+            None, // no worker's task
             adopt,
         )
         .map_err(|error| error.to_string())?;
@@ -3924,10 +4231,10 @@ impl App {
     /// Put `leaf`'s USER identity (its six `meta set` fields) on the shell
     /// the leaf NAMES — on a handoff, not necessarily the session `filling` its
     /// pane. A peer reads a session's identity before typing into it: the
-    /// `role=` it checks, the `attention=` it answers, and `role=operator`,
-    /// which moves the status item's operator election and its Stop
-    /// confirm-suppression. So the identity must describe the process that
-    /// runs under the sid it is read from.
+    /// `role=` it checks (the label the status item names its tab by) and
+    /// the `attention=` it answers (a need the status item counts). So the
+    /// identity must describe the process that runs under the sid it is read
+    /// from.
     ///
     /// * A COLD restore's leaf, or one from this process's own closed-tab
     ///   ledger ([`LeafIds::Live`]), names no running shell to look for. The
@@ -4053,6 +4360,17 @@ impl App {
             self.handoff_supervised_agents
                 .push((named, (**supervised).clone()));
         }
+        // THE OUTGOING HOST'S WORD THAT THE TAB'S AGENT CANNOT BE BROUGHT
+        // BACK (LC-4 of ATERM-KI-1016-1; a handoff leaf alone): stood again
+        // by this process's host at its Commit, before its first pass
+        // ([`Self::adopt_carried_lost_words`]).
+        if ids == LeafIds::Retired
+            && self.handoff_successor
+            && let (Some(named), Some(lost)) = (leaf.local_id, &leaf.lost)
+            && !self.handoff_lost_words.iter().any(|(tab, _)| *tab == named)
+        {
+            self.handoff_lost_words.push((named, (**lost).clone()));
+        }
         let filling_adopted_as = match filling {
             FillingShell::Registered(session) => self
                 .pool
@@ -4089,7 +4407,8 @@ impl App {
                         && !live.ctx.fabric.holds().has("local")
                     {
                         for hold in owners.standing() {
-                            if !crate::fabric::carry_hold(&live.ctx, hold) {
+                            let wake = || self.wake_log_watchers(*session, true);
+                            if !crate::fabric::carry_hold_waking(&live.ctx, hold, &wake) {
                                 aterm_log::warn!(
                                     "session restore: the owner's hold on a reopened tab was not \
                                      put back: an update is committing the session; its agent is \
@@ -4167,7 +4486,7 @@ impl App {
                     // so fan the change out the way a driver's `meta set` does
                     // (`Wake::MetaChanged`): its tab chrome and the operator item.
                     self.refresh_meta_dependent_chrome(named);
-                    self.refresh_operator_status_item();
+                    self.mark_status_dirty();
                     "; that pane's identity went to the shell it names, which runs in another pane"
                 } else {
                     // Nothing moved: the leaf carries no identity, the shell
@@ -4284,7 +4603,11 @@ impl App {
             return false;
         };
         let ctx = live.ctx.clone();
+        let lands = self.harness_ab_reading(session).1;
         let moved = crate::session_timeline::restore_carried_meta(&ctx, &leaf.carried_user_meta());
+        // A carried word is no move into Land: the landing began before this
+        // process (the A/B book's time from Land to landed, §11.6.4).
+        self.harness_mode_carried(session, lands);
         if moved && self.subscribers.any() {
             self.subscribers
                 .lock()
@@ -4304,16 +4627,13 @@ impl App {
     ) -> Result<BuiltRestoreLeaf, String> {
         match descriptor.restore_tag.as_str() {
             "settings" => {
-                let mut route = descriptor
+                // Every route is a page, Manual included: going to one opens
+                // nothing, so each restores as it was captured.
+                let route = descriptor
                     .route
                     .as_deref()
                     .and_then(crate::native_settings::SettingsRoute::from_path)
                     .ok_or_else(|| "Settings route is unavailable".to_string())?;
-                if route == crate::native_settings::SettingsRoute::Manual {
-                    // Compatibility with manifests captured before Manual became
-                    // a real Editor: restore the Settings launcher to Top Settings.
-                    route = crate::native_settings::SettingsRoute::Home;
-                }
                 self.stage_settings_restore_view(wid, route)?;
             }
             "markdown" | "editor" => {
@@ -4550,7 +4870,7 @@ impl App {
     /// Whether this successor settled a loss of carried Settings drafts that it
     /// says at Commit ([`CarriedDraftsLedger::owed`]): the conformance rig's
     /// projection of the model's `Surfaced` before Commit.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn carried_settings_drafts_loss_owed(&self) -> bool {
         let owed = &self.carried_settings_drafts.owed;
         !owed.lost.is_empty() || owed.unreadable > 0
@@ -5078,6 +5398,7 @@ impl App {
                 leaf.cwd(),
                 None, // not a connected controller spawn
                 None, // a legacy (RESTORE-1) layout carries no identity
+                None, // no worker's task
                 adopt,
             ) {
                 Ok(s) => {
@@ -5200,6 +5521,39 @@ fn prune_lost_settings_drafts(folder: &std::path::Path) {
     for (_, path) in saved.into_iter().skip(LOST_SETTINGS_DRAFTS_KEPT) {
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// Whether a restored agents' row that retired `how` was seen through by the
+/// owner ([`App::post_restored_row`]): they dismissed it or answered it, its
+/// reporter resolved it, or it folded — on the glass for its whole span, the
+/// read the message center itself counts a fold as (a standing row's quiet
+/// span). A row that never reached the glass (unseen), was pushed off a full
+/// band (evicted), went stale or was withdrawn was not: the misses it named
+/// are named again in the next row. (Superseded, it was by this process's
+/// next row, which names them; carried or quit, this process is ending.)
+fn restored_row_seen_through(how: &aterm_messages::Retired) -> bool {
+    matches!(
+        how,
+        aterm_messages::Retired::Dismissed
+            | aterm_messages::Retired::Answered { .. }
+            | aterm_messages::Retired::Resolved(_)
+            | aterm_messages::Retired::Folded
+    )
+}
+
+/// The restored agents' row this process last showed
+/// ([`App::post_restored_row`]).
+#[derive(Debug, Default)]
+pub(crate) struct RestoredShown {
+    /// The last row's [`crate::harness_host::RestoredRow::seq`] (`0`: none yet).
+    seq: u64,
+    /// The row it posted for it, while it may still be up.
+    id: Option<aterm_messages::MessageId>,
+    /// The misses that row names, each `(tab session, when said)`.
+    named: Vec<(String, u64)>,
+    /// The misses of the rows the owner saw through
+    /// ([`restored_row_seen_through`]).
+    seen: std::collections::BTreeSet<(String, u64)>,
 }
 
 #[cfg(test)]

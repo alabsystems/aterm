@@ -1723,8 +1723,7 @@ impl EffectsPipeline {
                     shed_envelope: 1.0,
                     body_allowed: !self.serious,
                     // A page's glow switch is also its momentum-glow switch.
-                    master: self.glow_cfg.enabled,
-                    momentum_glow: true,
+                    momentum_glow: self.glow_cfg.enabled,
                     user_tinted: !self.glow_color_from_cursor,
                 },
                 glow: &self.glow_cfg,

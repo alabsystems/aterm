@@ -794,11 +794,7 @@ pub fn shim_env_of(shim: &Path) -> crate::shim_env::ShimEnv {
 }
 
 /// Replace the current process image with `command` (`execve`); returns only on failure.
-#[expect(
-    clippy::disallowed_types,
-    reason = "the pass-throughs' exec: the caller's descriptors are the program's"
-)]
-pub fn exec_or_run(command: &mut std::process::Command) -> io::Error {
+pub fn exec_or_run(command: &mut aterm_uds::spawnfd::StdCommand) -> io::Error {
     use std::os::unix::process::CommandExt as _;
     // `exec` replaces this process and never returns on success; the returned value is
     // the error that PREVENTED the exec.
@@ -824,7 +820,11 @@ pub fn exec_or_run(command: &mut std::process::Command) -> io::Error {
 /// terminal already sent them to the whole group and a second would read as a second key.
 ///
 /// The dispositions are set AFTER the spawn — an ignored signal is inherited across `exec`,
-/// and the child must meet the key with its own — and put back before this returns.
+/// and the child must meet the key with its own — and put back before this returns. So a
+/// SIGINT, SIGQUIT, SIGTERM or SIGHUP that arrives between the spawn and the ignore still
+/// acts on this process; closing that needs the ignore set before the spawn, with the child
+/// resetting the signals that were not ignored on entry (`POSIX_SPAWN_SETSIGDEF`) through
+/// `aterm_uds::spawnfd`, which no spawn path of it offers yet (it resets SIGPIPE alone).
 ///
 /// # Errors
 /// The wait's.

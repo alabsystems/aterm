@@ -14,6 +14,13 @@
 // the grid via `present_input`; `render_offscreen` plus `rgba`/`width`/
 // `height` read the framebuffer back so an e2e harness can pixel-compare GPU
 // against CPU.
+//
+// Construction, resize, zoom, chrome and render admission use the CPU twin's
+// shared 256 MiB per-frame bound, including committed message rows. The browser
+// ABI throws Result errors as strings; successful void operations still return
+// undefined. Rejected resize/zoom/chrome leave state intact. Font/line-height
+// setters can change geometry independently; a later render then refuses an
+// oversized frame until the host corrects it.
 
 // What JS sees is marked `#[export]` (aterm-wasm-abi, which replaces
 // wasm-bindgen: wasm-platform WP.8, as WP.7 did for aterm-wasm), and `verify
@@ -46,6 +53,8 @@ macro_rules! web_terminal_impl {
 mod effects_api;
 #[path = "../../aterm-wasm/src/facade_api.rs"]
 mod facade_api;
+#[path = "../../aterm-wasm/src/frame_geometry_api.rs"]
+mod frame_geometry_api;
 mod host;
 #[path = "../../aterm-wasm/src/messages_api.rs"]
 mod messages_api;
@@ -531,12 +540,6 @@ impl AtermGpuTerminal {
         }
     }
 
-    /// The rows the swapchain is sized for: the grid's and the band's above
-    /// it (the frame grows by the band, as the CPU twin's does).
-    fn surface_rows(&self) -> usize {
-        self.rows + self.band.committed()
-    }
-
     /// The band changed: reopen the frame gate for one frame and, when its row
     /// count moved, resize the swapchain to the new frame height.
     pub(crate) fn note_band_change(&mut self, rows_moved: bool) {
@@ -547,13 +550,15 @@ impl AtermGpuTerminal {
     }
 
     /// Size the live swapchain to the frame [`Self::build_frame`] composes:
-    /// [`Self::surface_rows`] (grid plus band rows) at the renderer's pad and
+    /// the grid plus committed band rows at the renderer's pad and
     /// head. The one sizing site after init (`resize`, `set_chrome`, band row
-    /// moves), so the surface is never shorter than the frame.
+    /// moves). A band change can make the frame inadmissible; leave the old
+    /// surface intact then, and the next render returns the geometry error.
     fn size_swapchain(&mut self) {
-        let rows = self.surface_rows();
+        let Ok((w, h)) = self.checked_surface_size() else {
+            return;
+        };
         if let Some(gpu) = self.gpu.as_mut() {
-            let (w, h) = gpu.renderer.frame_size(rows, self.cols);
             gpu.renderer
                 .resize_surface(&mut gpu.win, &mut gpu.surface, w as u32, h as u32);
         }
@@ -645,7 +650,7 @@ impl AtermGpuTerminal {
     /// TEST BUILDS ONLY: build one headless frame, so the frame gate settles.
     #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) fn settle_frame(&mut self) {
-        self.render_headless();
+        self.render_headless().expect("renderable frame");
     }
 }
 
@@ -688,10 +693,9 @@ impl AtermGpuTerminal {
         // No filesystem on the web: a real miss surfaces via
         // `take_missing_font_classes` (E1 lazy fonts), never system discovery.
         cpu.set_runtime_font_discovery(false);
-        // The engine clamps rows/cols to 1..=4096; store the clamped dims, since
-        // the GPU framebuffer is sized from `self.rows`/`self.cols` and an
-        // unclamped copy could request an oversized texture. The tiered store
-        // is attached here; compression drains at the render frame boundary.
+        // Check the clamped dimensions before the engine allocates its grids.
+        let (rows, cols) = frame_geometry_api::checked_grid_size(&cpu, rows, cols, 0)?;
+        // The tiered store is attached here; compression drains at the render boundary.
         let mut term = scrollback_tiers_api::tiered_terminal(rows, cols);
         let budget_share = scrollback_tiers_api::register_budget_share(&term);
         apply_terminal_theme_colors(&mut term, fg, bg, cursor, selection);
@@ -1122,7 +1126,10 @@ impl AtermGpuTerminal {
     /// The swapchain resizes to the padded frame (the host offsets the canvas by
     /// `-pad,-(pad+head)`) and effect emissions become window-absolute. Set on
     /// both faces; `0/0` (default) is byte-identical to the exact-fit frame.
-    pub fn set_chrome(&mut self, pad: u16, head: u16) {
+    /// Throws before changing anything if the proposed physical frame is too large.
+    pub fn set_chrome(&mut self, pad: u16, head: u16) -> Result<(), String> {
+        let (cw, ch) = self.cpu.cell_size();
+        self.checked_surface_geometry(cw, ch, usize::from(pad), usize::from(head))?;
         // WF-1 gate
         self.note_host_visual_change();
         self.cpu.set_pad(pad as usize);
@@ -1137,6 +1144,7 @@ impl AtermGpuTerminal {
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.win.invalidate_present();
         }
+        Ok(())
     }
 
     /// The chrome interior padding from [`Self::set_chrome`] (px; 0 = exact
@@ -1194,7 +1202,10 @@ impl AtermGpuTerminal {
     /// Re-rasterize at a new cell font px (DPI change) on both faces; the GPU
     /// renderer also drops its atlas. The host re-reads cell metrics and
     /// resizes after.
-    pub fn set_px(&mut self, px: f32) {
+    /// Throws before changing anything if the proposed physical frame is too large.
+    pub fn set_px(&mut self, px: f32) -> Result<(), String> {
+        let (cw, ch, _) = self.cpu.cell_geometry(px);
+        self.checked_surface_geometry(cw, ch, self.cpu.pad(), self.cpu.head())?;
         // WF-1 gate
         self.note_host_visual_change();
         self.cpu.set_px(px);
@@ -1202,6 +1213,7 @@ impl AtermGpuTerminal {
             gpu.renderer.set_px(px);
             gpu.win.invalidate_present();
         }
+        Ok(())
     }
 
     /// Resize the grid and, if the GPU is live, the swapchain.
@@ -1211,7 +1223,11 @@ impl AtermGpuTerminal {
     /// (`resize_offloading_scrollback`) and rewraps it in later budgeted tasks
     /// (see [`Self::pump_reflow`]); histories up to `INLINE_REFLOW_MAX_LINES`
     /// rewrap inline.
-    pub fn resize(&mut self, rows: u16, cols: u16) {
+    /// Dimensions clamp to the engine's bounds; an oversized physical frame is
+    /// refused before grid, reflow, prediction, frame-gate or swapchain changes.
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), String> {
+        let (rows, cols) =
+            frame_geometry_api::checked_grid_size(&self.cpu, rows, cols, self.band.committed())?;
         // A reconfigured swapchain's contents are undefined, so the canvas no
         // longer holds the frame `last_frame_key` describes; bump always, even
         // for a same-dims call.
@@ -1242,6 +1258,7 @@ impl AtermGpuTerminal {
         self.predict.reset();
         // The swapchain holds the band's rows too (the frame grows by them).
         self.size_swapchain();
+        Ok(())
     }
 
     /// Whether the next `render` would draw: the exported frame gate, so a JS
@@ -1480,7 +1497,7 @@ pub fn encode_key_with_mode(
     mode_bits: u32,
 ) -> Option<Vec<u8>> {
     use aterm_types::keyboard::{encode_dom_key, KeyboardMode};
-    let mode = KeyboardMode::from_bits_truncate(mode_bits as u16);
+    let mode = KeyboardMode::from_bits_truncate(mode_bits);
     encode_dom_key(key, mods, event_type, base_layout_key, mode)
 }
 
@@ -1640,6 +1657,7 @@ impl AtermGpuTerminal {
     /// pending canvas surface from `target`, then the renderer and swapchain
     /// config. Not `pub` because `CanvasTarget` is not a JS type.
     fn init_with_target(&mut self, target: aterm_gpu::web::CanvasTarget) -> Result<(), String> {
+        let (w, h) = self.checked_surface_size()?;
         // The WebGL2 context lives on the canvas, so aterm-gpu makes it there
         // and hands the canvas back unconfigured. Its errors name the failed
         // step.
@@ -1650,7 +1668,6 @@ impl AtermGpuTerminal {
         let renderer = GpuRenderer::from_parts(ctx, self.gpu_face()?, None, self.theme)?;
 
         // Configure the canvas swapchain (non-sRGB, sized to the grid).
-        let (w, h) = renderer.frame_size(self.surface_rows(), self.cols);
         let surface = renderer
             .configure_canvas_surface(canvas_surface, w as u32, h as u32)
             .map_err(|e| format!("configure canvas surface failed: {e}"))?;
@@ -1677,6 +1694,7 @@ impl AtermGpuTerminal {
     /// offscreen (atlas upload + instanced bg/glyph/cursor quads) and blits it
     /// into the canvas swapchain.
     pub fn render(&mut self) -> Result<(), String> {
+        self.checked_surface_size()?;
         // Frame gate: `None` means the canvas already holds an identical frame,
         // so neither the build nor the present runs.
         let Some(key) = self.open_frame() else {
@@ -1715,8 +1733,14 @@ impl AtermGpuTerminal {
     /// internal RGBA8 buffer, for GPU-vs-CPU pixel comparison (a WebGL
     /// swapchain is not CPU-readable). Same contract as aterm-wasm's
     /// `render()`+`rgba()`: `Frame` pixels (0xTTRRGGBB, TT = transmittance, 0 =
-    /// opaque) expanded to RGBA8. Errors if WebGL was not initialized.
+    /// opaque) expanded to RGBA8. Errors if WebGL was not initialized, geometry
+    /// exceeds the frame limit, or framebuffer reservation/readback fails.
     pub fn render_offscreen(&mut self) -> Result<(), String> {
+        let (width, height) = self.checked_surface_size()?;
+        let bytes = width * height * 4;
+        self.rgba
+            .try_reserve_exact(bytes.saturating_sub(self.rgba.len()))
+            .map_err(|e| format!("cannot reserve RGBA framebuffer: {e}"))?;
         // Ungated: a harness asking for a readback gets one. The frame-boundary
         // pumps still run.
         self.pump_reflow_on_render_tick();
@@ -1735,13 +1759,12 @@ impl AtermGpuTerminal {
         // `None`: the web/canvas path has no settings-card tray (the P3 tray arg).
         let frame = gpu
             .renderer
-            .render_input(&mut gpu.win, &self.frame_scratch, None);
+            .try_render_input(&mut gpu.win, &self.frame_scratch, None)?;
         self.fb_width = frame.width;
         self.fb_height = frame.height;
         // Expand 0xTTRRGGBB (TT = 255 - alpha) to RGBA8 for ImageData. Alpha is
         // 0xff at default opacity, lower on default-bg pixels below it.
         self.rgba.clear();
-        self.rgba.reserve(frame.pixels.len() * 4);
         for &p in &frame.pixels {
             self.rgba.push((p >> 16) as u8);
             self.rgba.push((p >> 8) as u8);
@@ -1781,7 +1804,8 @@ impl AtermGpuTerminal {
     /// The native half of `render`: the same frame gate and frame build, minus
     /// the WebGL present. Returns `true` when the frame was gated.
     ///
-    /// Returns `true` when the frame was elided by the settled-frame gate.
+    /// Returns `Ok(true)` when the settled-frame gate elided the frame, or an
+    /// error before frame work when its physical geometry is too large.
     ///
     /// This exists so the gate and the per-tick frame build are measurable and
     /// testable OFF the browser: the crate's own native tests use it as the
@@ -1795,20 +1819,22 @@ impl AtermGpuTerminal {
     /// `cfg(not(wasm32))`, like `new_from_system` directly below and for the
     /// same reason: it adds ZERO surface to the module that actually ships —
     /// the wasm build does not contain it.
-    pub fn render_headless(&mut self) -> bool {
+    pub fn render_headless(&mut self) -> Result<bool, String> {
+        self.checked_surface_size()?;
         let Some(key) = self.open_frame() else {
-            return true;
+            return Ok(true);
         };
         self.build_frame();
         // The native seam has no canvas, so "presented" means "built": that is
         // what makes the gate settle here exactly as it settles in the browser.
         self.record_presented_frame(key);
-        false
+        Ok(false)
     }
 
     pub fn new_from_system(rows: u16, cols: u16, px: f32) -> Option<AtermGpuTerminal> {
         let theme = Theme::default();
         let cpu = Renderer::from_system(px, theme)?;
+        let (rows, cols) = frame_geometry_api::checked_grid_size(&cpu, rows, cols, 0).ok()?;
         // Same tiered-store attachment as `new`.
         let mut term = scrollback_tiers_api::tiered_terminal(rows, cols);
         let budget_share = scrollback_tiers_api::register_budget_share(&term);
@@ -1932,9 +1958,9 @@ mod tests {
     fn the_gpu_face_is_the_face_the_host_set() {
         let mut t = AtermGpuTerminal::new(8, 48, BUNDLED_FACE, 14.0, 0, 0, 0, 0)
             .expect("the bundled face parses");
-        t.set_px(21.0);
+        t.set_px(21.0).expect("admitted geometry");
         t.set_line_height(1.25);
-        t.set_chrome(4, 2);
+        t.set_chrome(4, 2).expect("admitted geometry");
         // An unusable request keeps the last valid CPU geometry. Rebuilding
         // must retain that geometry too, rather than replay the rejected input.
         t.set_line_height(f32::INFINITY);
@@ -2144,8 +2170,8 @@ mod tests {
         for r in 0..rows {
             t.process(format!("line {r} of selectable text\r\n").as_bytes());
         }
-        t.render_headless();
-        t.render_headless();
+        t.render_headless().expect("renderable frame");
+        t.render_headless().expect("renderable frame");
         assert!(t.last_render_skipped(), "setup must reach a settled frame");
         t
     }
@@ -2160,16 +2186,25 @@ mod tests {
         // REOPEN 1: grid damage (echo).
         t.process(b"!");
         assert!(t.needs_frame(), "damage must reopen the gate");
-        assert!(!t.render_headless(), "an echo tick must draw");
-        assert!(t.render_headless(), "and then re-settle");
+        assert!(
+            !t.render_headless().expect("renderable frame"),
+            "an echo tick must draw"
+        );
+        assert!(
+            t.render_headless().expect("renderable frame"),
+            "and then re-settle"
+        );
 
         // REOPEN 2: renderer-held blink phase (no grid damage), with the
         // value-shadow de-dup on the second, identical assertion.
         t.set_cursor_blink_phase(false);
-        assert!(!t.render_headless(), "a blink flip must draw");
+        assert!(
+            !t.render_headless().expect("renderable frame"),
+            "a blink flip must draw"
+        );
         t.set_cursor_blink_phase(false);
         assert!(
-            t.render_headless(),
+            t.render_headless().expect("renderable frame"),
             "an idempotent blink re-assert must gate"
         );
 
@@ -2177,40 +2212,64 @@ mod tests {
         // pointer-cadence de-dup.
         t.selection_start(2, 1);
         t.selection_extend(2, 8);
-        assert!(!t.render_headless(), "a selection change must draw");
+        assert!(
+            !t.render_headless().expect("renderable frame"),
+            "a selection change must draw"
+        );
         t.selection_extend(2, 8);
         assert!(
-            t.render_headless(),
+            t.render_headless().expect("renderable frame"),
             "a cell-identical extend must be gated away"
         );
         t.selection_extend(2, 9);
-        assert!(!t.render_headless(), "a one-cell move must draw");
+        assert!(
+            !t.render_headless().expect("renderable frame"),
+            "a one-cell move must draw"
+        );
         t.selection_clear();
-        assert!(!t.render_headless(), "clearing a selection must draw");
-        t.render_headless();
+        assert!(
+            !t.render_headless().expect("renderable frame"),
+            "clearing a selection must draw"
+        );
+        t.render_headless().expect("renderable frame");
 
         // REOPEN 4: viewport scroll (display-offset damage -> epoch).
         t.scroll_lines(3);
-        assert!(!t.render_headless(), "a viewport scroll must draw");
-        t.render_headless();
+        assert!(
+            !t.render_headless().expect("renderable frame"),
+            "a viewport scroll must draw"
+        );
+        t.render_headless().expect("renderable frame");
         t.scroll_to_bottom();
-        assert!(!t.render_headless(), "and scrolling back must draw");
-        t.render_headless();
+        assert!(
+            !t.render_headless().expect("renderable frame"),
+            "and scrolling back must draw"
+        );
+        t.render_headless().expect("renderable frame");
 
         // REOPEN 5: appearance-only change that moves no cell. This is the one
         // the engine's damage epoch is structurally blind to.
         t.set_theme(0x00FF_0000, 0x0000_2200, 0x00FF_FFFF, 0x0033_3366);
-        assert!(!t.render_headless(), "a theme change must draw");
-        t.render_headless();
+        assert!(
+            !t.render_headless().expect("renderable frame"),
+            "a theme change must draw"
+        );
+        t.render_headless().expect("renderable frame");
         t.set_palette_color(1, 9, 9, 9);
-        assert!(!t.render_headless(), "a palette change must draw");
-        t.render_headless();
+        assert!(
+            !t.render_headless().expect("renderable frame"),
+            "a palette change must draw"
+        );
+        t.render_headless().expect("renderable frame");
 
         // An active effects pipeline animates, so it never gates, and the
         // active->idle edge buys one settle frame. Matrix rain is the ambient
         // effect a web host can ignite without typed-move witnesses.
         t.set_matrix_rain_enabled(true);
-        assert!(!t.render_headless(), "an ignited effect must draw");
+        assert!(
+            !t.render_headless().expect("renderable frame"),
+            "an ignited effect must draw"
+        );
         let mut saw_active = false;
         for i in 0u32..60 {
             // Real output now and then: rain holds still on a pane that is only
@@ -2221,7 +2280,7 @@ mod tests {
             t.advance_effects(16.0);
             let active = t.effects.is_active();
             saw_active |= active;
-            let gated = t.render_headless();
+            let gated = t.render_headless().expect("renderable frame");
             if active {
                 assert!(!gated, "an active effects pipeline must never gate");
                 assert!(t.needs_frame(), "and needs_frame must say so");
@@ -2236,7 +2295,7 @@ mod tests {
         t.set_matrix_rain_enabled(false);
         let mut settled = false;
         for _ in 0..10 {
-            if t.render_headless() {
+            if t.render_headless().expect("renderable frame") {
                 settled = true;
                 break;
             }
@@ -2311,13 +2370,15 @@ mod tests {
             }),
             ("set_minimum_contrast", |t| t.set_minimum_contrast(4.5)),
             ("set_background_opacity", |t| t.set_background_opacity(0.8)),
-            ("set_chrome", |t| t.set_chrome(4, 2)),
+            ("set_chrome", |t| {
+                t.set_chrome(4, 2).expect("admitted geometry")
+            }),
             ("set_cursor_opacity", |t| t.set_cursor_opacity(0.5)),
             ("set_selection_inactive", |t| t.set_selection_inactive(true)),
             ("set_selection_inactive_bg", |t| {
                 t.set_selection_inactive_bg(Some(0x0020_2020))
             }),
-            ("set_px", |t| t.set_px(15.0)),
+            ("set_px", |t| t.set_px(15.0).expect("admitted geometry")),
             ("set_spill_include_veils", |t| {
                 t.set_spill_include_veils(true)
             }),
@@ -2341,7 +2402,7 @@ mod tests {
             ("selection_clear", |t| t.selection_clear()),
             // Last, since it changes the grid: a resize reconfigures the
             // swapchain, so it reopens the gate even at unchanged dims.
-            ("resize", |t| t.resize(8, 40)),
+            ("resize", |t| t.resize(8, 40).expect("admitted geometry")),
         ] {
             mutate(&mut t);
             assert!(
@@ -2354,7 +2415,7 @@ mod tests {
                 "{label} must reopen the frame gate end to end"
             );
             last = t.host_visual_gen;
-            t.render_headless();
+            t.render_headless().expect("renderable frame");
         }
     }
 
@@ -2494,39 +2555,112 @@ mod tests {
         assert_eq!((bad.incomplete(), bad.match_count()), (false, 0));
     }
 
-    /// Construction and `resize` store the grid's clamped dims (1..=4096), not
-    /// the raw u16 args, so the GPU framebuffer is never sized past the grid.
+    /// Reject an oversized frame before constructing or changing a grid. Existing
+    /// text, presentation state and pixels survive refused resize, chrome and zoom.
     #[test]
-    fn oversized_dims_are_clamped_to_the_grid_bound() {
-        let mut t = crate::system_font_terminal(u16::MAX, u16::MAX, 16.0);
+    fn oversized_frames_are_refused_before_state_changes() {
+        let new = |rows, cols| {
+            AtermGpuTerminal::new(
+                rows,
+                cols,
+                BUNDLED_FACE,
+                16.0,
+                0xffffff,
+                0,
+                0xffffff,
+                0x444444,
+            )
+        };
         assert!(
-            t.rows <= 4096 && t.cols <= 4096,
-            "ctor clamps to grid bound"
+            new(u16::MAX, u16::MAX).is_err(),
+            "constructor refuses before allocating the oversized grid"
         );
-        assert_eq!(t.rows, t.term.grid().rows() as usize, "ctor syncs to grid");
-        assert_eq!(t.cols, t.term.grid().cols() as usize, "ctor syncs to grid");
-
-        // Zero is clamped UP to 1 by the grid, not stored as 0.
-        t.resize(0, 0);
-        assert_eq!(t.rows, 1, "resize(0) → grid clamps rows to 1");
-        assert_eq!(t.cols, 1, "resize(0) → grid clamps cols to 1");
-
-        // And an oversized resize re-syncs to the clamped bound too.
-        t.resize(u16::MAX, u16::MAX);
+        let mut t = new(0, 0).expect("zero dimensions clamp up");
+        assert_eq!((t.rows, t.cols), (1, 1));
+        t.resize(2, 8).expect("small resize");
+        t.process(b"kept");
+        t.render_headless().expect("first frame");
+        t.render_headless().expect("settled frame");
+        let frame_rows = t.frame_scratch.rows;
+        let frame_cols = t.frame_scratch.cols;
+        let metrics = (
+            t.cell_width(),
+            t.cell_height(),
+            t.chrome_pad(),
+            t.chrome_head(),
+        );
+        let key = t.last_frame_key;
+        let generation = t.host_visual_gen;
+        type Change = fn(&mut AtermGpuTerminal) -> Result<(), String>;
+        let attempts: [(&str, Change); 3] = [
+            ("resize", |t| t.resize(u16::MAX, u16::MAX)),
+            ("chrome", |t| t.set_chrome(u16::MAX, u16::MAX)),
+            ("zoom", |t| t.set_px(1_000_000.0)),
+        ];
+        for (name, change) in attempts {
+            assert!(change(&mut t).is_err(), "{name}");
+            assert_eq!((t.rows, t.cols), (2, 8), "{name}");
+            assert_eq!(t.row_text(0).as_deref(), Some("kept"), "{name}");
+            assert_eq!(
+                (t.term.grid().rows(), t.term.grid().cols()),
+                (2, 8),
+                "{name}"
+            );
+            assert_eq!(
+                (
+                    t.cell_width(),
+                    t.cell_height(),
+                    t.chrome_pad(),
+                    t.chrome_head()
+                ),
+                metrics,
+                "{name}"
+            );
+            assert_eq!(t.host_visual_gen, generation, "{name}");
+            assert_eq!(t.last_frame_key, key, "{name}");
+            assert!(
+                !t.needs_frame(),
+                "{name} did not consume or invalidate the settled frame"
+            );
+            assert_eq!(
+                (t.frame_scratch.rows, t.frame_scratch.cols),
+                (frame_rows, frame_cols),
+                "{name}: previous frame remains"
+            );
+        }
+        t.set_line_height(1_000_000.0);
         assert!(
-            t.rows <= 4096 && t.cols <= 4096,
-            "resize clamps to grid bound"
+            t.render_headless().is_err(),
+            "oversized geometry is refused before building a frame"
         );
         assert_eq!(
-            t.rows,
-            t.term.grid().rows() as usize,
-            "resize syncs to grid"
+            (t.frame_scratch.rows, t.frame_scratch.cols),
+            (frame_rows, frame_cols)
         );
-        assert_eq!(
-            t.cols,
-            t.term.grid().cols() as usize,
-            "resize syncs to grid"
+        t.set_line_height(1.0);
+        t.render_headless()
+            .expect("corrected geometry builds again");
+        t.resize(0, 0).expect("zero resize clamps up");
+        assert_eq!((t.rows, t.cols), (1, 1));
+
+        // The message band belongs to the same physical framebuffer budget.
+        // This builds only a tiny grid; no large glyph or pixel raster is made.
+        let mut banded =
+            AtermGpuTerminal::new(2, 1, BUNDLED_FACE, 6_000.0, 0xffffff, 0, 0xffffff, 0x444444)
+                .expect("the grid alone fits the frame budget");
+        assert!(banded.checked_surface_size().is_ok());
+        let reply = banded.notice_at(
+            "post ci sev=warn Attention",
+            aterm_time::Instant::now(),
+            aterm_messages::WallStamp { unix_ms: 0 },
         );
+        assert!(reply.starts_with("OK"), "{reply}");
+        assert_eq!(banded.band_rows(), 1);
+        assert!(
+            banded.render_headless().is_err(),
+            "the added physical band row exceeds the budget"
+        );
+        assert_eq!(banded.frame_scratch.rows, 0, "no frame was built");
     }
 
     /// Shrinking retention invalidates the search index like any content
@@ -2721,7 +2855,7 @@ mod tests {
         t.scroll_lines(-3);
         t.build_frame();
         check(&mut t, "back to the live bottom");
-        t.resize(10, 30);
+        t.resize(10, 30).expect("admitted geometry");
         t.build_frame();
         check(&mut t, "resize");
         t.process(b"after resize");
@@ -2787,7 +2921,8 @@ mod tests {
         assert_eq!(t.spill_rev(), 0);
 
         let (pad, head) = (12usize, 30usize);
-        t.set_chrome(pad as u16, head as u16);
+        t.set_chrome(pad as u16, head as u16)
+            .expect("admitted geometry");
         t.set_cursor_glow(true, "water", None, None, 400, 64, 1.0, 2.0, true);
         // Seed the just-enabled engines' cursor anchor so the first witness
         // below has an owner to check against (apply is the anchor authority).
@@ -2941,7 +3076,7 @@ mod tests {
         assert_eq!(t.spill_rect_count(), 0);
 
         // 0/0 restore: the identity law again — bytes drop with the band.
-        t.set_chrome(0, 0);
+        t.set_chrome(0, 0).expect("admitted geometry");
         fill_frame(&mut t);
         assert_eq!(t.spill_len(), 0);
         let rev = t.spill_rev();
@@ -2955,13 +3090,13 @@ mod tests {
     fn set_chrome_sticks_pre_init_and_zero_restores() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
         assert_eq!((t.cpu.pad(), t.cpu.head()), (0, 0), "exact-fit by default");
-        t.set_chrome(8, 24);
+        t.set_chrome(8, 24).expect("admitted geometry");
         assert_eq!((t.cpu.pad(), t.cpu.head()), (8, 24));
         let (cw, ch) = t.cpu.cell_size();
         let (w, h) = t.cpu.frame_size(24, 80);
         assert_eq!(w, 80 * cw + 16, "frame gains 2*pad in width");
         assert_eq!(h, 24 * ch + 16 + 24, "frame gains 2*pad + head in height");
-        t.set_chrome(0, 0);
+        t.set_chrome(0, 0).expect("admitted geometry");
         assert_eq!(t.cpu.frame_size(24, 80), (80 * cw, 24 * ch));
     }
 
@@ -3061,7 +3196,7 @@ mod tests {
         for i in 0..50 {
             t.process(format!("line {i}\r\n").as_bytes());
         }
-        t.resize(24, 40);
+        t.resize(24, 40).expect("admitted geometry");
         assert!(!t.reflow_pending(), "no tiered store → no deferred job");
         assert!(!t.pump_reflow(), "nothing to pump");
         assert_eq!(t.cols, 40, "resize applied synchronously");
@@ -3080,7 +3215,7 @@ mod tests {
         t.process(format!("{b}\r\n").as_bytes());
         t.process(c.as_bytes());
 
-        t.resize(3, 20);
+        t.resize(3, 20).expect("admitted geometry");
         while t.pump_reflow() {}
 
         t.scroll_to_top();
@@ -3154,7 +3289,7 @@ mod tests {
         let before = t.term.grid().scrollback_lines();
         assert!(before > INLINE_REFLOW_MAX_LINES, "precondition: {before}");
 
-        t.resize(24, 40);
+        t.resize(24, 40).expect("admitted geometry");
         assert!(t.reflow_pending(), "a deep history defers its rewrap");
         assert_eq!(t.cols, 40, "the visible grid resized synchronously");
         let during = t.term.grid().scrollback_lines();
@@ -3203,7 +3338,7 @@ mod tests {
         install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
         let before = t.term.grid().scrollback_lines();
 
-        t.resize(24, 40);
+        t.resize(24, 40).expect("admitted geometry");
         assert!(t.reflow_pending());
         t.pump_reflow_budget(500);
         for _ in 0..3 {
@@ -3211,7 +3346,7 @@ mod tests {
         }
         assert!(t.reflow_pending(), "job is half-stepped");
 
-        t.resize(24, 60); // supersede mid-stepping
+        t.resize(24, 60).expect("admitted geometry"); // supersede mid-stepping
         assert!(
             t.reflow_pending(),
             "the half-stepped job survives a re-resize"
@@ -3237,7 +3372,7 @@ mod tests {
         install_tiered_history(&mut t, 24, 80, 500);
         let before = t.term.grid().scrollback_lines();
         assert!(before > 100, "precondition: deep history ({before} lines)");
-        t.resize(24, 40);
+        t.resize(24, 40).expect("admitted geometry");
         assert!(
             !t.reflow_pending(),
             "≤ INLINE_REFLOW_MAX_LINES rewraps inline, mirroring the native bound"
@@ -3255,7 +3390,7 @@ mod tests {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
         install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
         let before = t.term.grid().scrollback_lines();
-        t.resize(24, 40);
+        t.resize(24, 40).expect("admitted geometry");
         assert!(t.reflow_pending());
         t.pump_reflow_on_render_tick();
         assert!(t.reflow_pending(), "no pump inside the grace window");
@@ -3289,7 +3424,7 @@ mod tests {
         // closes after finitely many calls.
         let mut t = crate::system_font_terminal(24, 80, 16.0);
         install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
-        t.resize(24, 40);
+        t.resize(24, 40).expect("admitted geometry");
         assert!(t.reflow_pending());
         let mut buf = Vec::new();
         for i in 0..(REFLOW_BACKLOG_MAX_LINES + 2_000) {

@@ -22,16 +22,16 @@
 //!   it decoded something else (or a refusal, in the one way the decoders
 //!   are allowed to part; see [`bit_flips_get_libzstd_s_recorded_verdicts`]).
 
-mod support;
+use crate::support;
 
 use std::io::{self, Read};
 
-use aterm_digest::Sha256;
-use aterm_zstd::Decoder;
-use support::{
+use crate::support::{
     Census, FLIP_ROWS, FLIP_SEED, SWEEP, SweepRow, XorShift, flip_bits, input, sweep,
     without_checksum,
 };
+use aterm_digest::Sha256;
+use aterm_zstd::Decoder;
 
 fn ours(zst: &[u8]) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
@@ -190,7 +190,7 @@ fn the_sweep_reaches_every_block_literals_and_table_mode() {
 /// last 16.
 #[test]
 fn every_cut_of_a_sweep_frame_is_an_early_end() {
-    for r in sweep() {
+    support::on_every_core(&sweep(), |r| {
         let zst = r.frame();
         let len = zst.len();
         let mut cuts: Vec<usize> = (0..len.min(64))
@@ -208,7 +208,7 @@ fn every_cut_of_a_sweep_frame_is_an_early_end() {
                 r.row
             );
         }
-    }
+    });
 }
 
 /// One frame of the flip lane and libzstd's recorded verdict on each flip.
@@ -319,7 +319,11 @@ fn verdict(decoded: &io::Result<Vec<u8>>, input: &[u8]) -> (u8, Option<String>) 
 fn bit_flips_get_libzstd_s_recorded_verdicts() {
     let mut mismatches = Vec::new();
     let (mut agreed, mut accepted, mut refused_damage) = (0, 0, 0);
-    for f in flips() {
+    // Each frame's flips decode on their own core; the tallies and the
+    // disagreements are summed in the frames' order.
+    for (a, b, c, m) in support::on_every_core(&flips(), |f| {
+        let mut mismatches = Vec::new();
+        let (mut agreed, mut accepted, mut refused_damage) = (0, 0, 0);
         let mut wrong = f.wrong.iter();
         for (&bit, &want) in f.bits.iter().zip(&f.verdicts) {
             let decoded = ours(&flipped(&f.zst, bit));
@@ -357,6 +361,12 @@ fn bit_flips_get_libzstd_s_recorded_verdicts() {
                 )),
             }
         }
+        (agreed, accepted, refused_damage, mismatches)
+    }) {
+        agreed += a;
+        accepted += b;
+        refused_damage += c;
+        mismatches.extend(m);
     }
     assert!(
         accepted > 0,

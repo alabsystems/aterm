@@ -250,6 +250,24 @@ pub(crate) struct TerminalLeafRestore {
     /// names what runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervised: Option<Box<AgentRestore>>,
+    /// THE WORD THAT THE TAB'S AGENT CANNOT BE BROUGHT BACK, STANDING (LC-4
+    /// of ATERM-KI-1016-1; additive, absent tolerated): ON A SEAMLESS
+    /// UPDATE'S HANDOFF LAYOUT ONLY, the outgoing host's word for the tab
+    /// (`harness_host::HostHandle::lost_word`), for the successor's host to
+    /// stand again at its Commit, before its first pass
+    /// (`HostHandle::adopt_lost_words`). The tab's mark rides the session
+    /// record with its other escalations; the word is what keeps it — no
+    /// program that merely starts in the tab lowers it — and what ends it
+    /// once its conversation is held again in any tab. Before, the successor
+    /// rebuilt no word: the first program that started in the tab, a Claude
+    /// Code at its first-run screen included, lowered the mark as an earlier
+    /// aterm's, and a conversation resumed elsewhere left it standing until
+    /// then. The Commit compares it with the agents
+    /// (`app_update_handoff::commit_agent_carry`). An older successor ignores
+    /// it; an older producer never writes it. Never on a durable layout: a
+    /// cold restore's reopened tab is another session. Boxed, as `agent` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lost: Option<Box<LostRestore>>,
     /// HELD BY A PROGRAM (audit #8; additive, absent tolerated, written only
     /// when true): at capture a program other than the pane's shell held its
     /// PTY (ssh, a container's shell, vim — the quit confirm's `tcgetpgrp`
@@ -303,6 +321,28 @@ pub(crate) struct TerminalLeafRestore {
     /// is. On a seamless update's layout it goes to the shell the leaf names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<String>,
+}
+
+/// The word that a tab's agent cannot be brought back, as a seamless update's
+/// handoff leaf carries it ([`TerminalLeafRestore::lost`]): the conversation
+/// it is about, the agent that ended (whose publication is never that
+/// conversation held again), whether the word holds the tab's mark, and what
+/// it said — the reason, whether aterm's own restart ended the agent, and
+/// the command that starts it by hand. What the outgoing host read of
+/// another conversation in the tab is not carried: the successor reads it
+/// again.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct LostRestore {
+    pub session: String,
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub marked: bool,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restarted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 /// Whether `sid` is one a restore leaf may carry (`TerminalLeafRestore::sid`):
@@ -410,6 +450,13 @@ pub(crate) enum RunRestore {
     /// A Muse Code TUI's ([`MuseRestore`]), under `muse`: its session goes
     /// in that table, NEVER in the leaf's `session` (see [`MuseRestore`]).
     Muse(MuseRestore),
+    /// An agy TUI's ([`AgyRestore`]), under `agy`: its conversation goes in
+    /// that table, NEVER in the leaf's `session` (see [`AgyRestore`]).
+    Agy(AgyRestore),
+    /// A Gemini CLI TUI's ([`GeminiRestore`]), under `gemini`: its session
+    /// goes in that table, NEVER in the leaf's `session` (see
+    /// [`GeminiRestore`]).
+    Gemini(GeminiRestore),
 }
 
 /// [`AgentRestore`] AS IT IS WRITTEN AND READ: the leaf's table, every field
@@ -452,6 +499,16 @@ mod leaf {
         /// writes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub(super) muse: Option<super::MuseRestore>,
+        /// [`super::RunRestore::Agy`]'s table (2026-10-17; additive, absent
+        /// tolerated, written only when set), after every key an older build
+        /// writes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) agy: Option<super::AgyRestore>,
+        /// [`super::RunRestore::Gemini`]'s table (2026-10-18; additive,
+        /// absent tolerated, written only when set), after every key an older
+        /// build writes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) gemini: Option<super::GeminiRestore>,
     }
 }
 
@@ -467,13 +524,14 @@ impl From<leaf::AgentRestore> for AgentRestore {
             version: leaf.version,
             home: leaf.home,
             login: leaf.login,
-            // One run per leaf: a leaf carrying two lanes' tables (no build
-            // writes one) is read as neither's, its agent then none
-            // ([`AgentRestore::agent`] holds the word to the run).
-            run: match (leaf.codex, leaf.muse) {
-                (Some(codex), None) => Some(RunRestore::Codex(codex)),
-                (None, Some(muse)) => Some(RunRestore::Muse(muse)),
-                (None, None) | (Some(_), Some(_)) => None,
+            // One run per leaf: deserialization rejects two lanes' tables
+            // before conversion. `AgentRestore::agent` holds its word to the run.
+            run: match (leaf.codex, leaf.muse, leaf.agy, leaf.gemini) {
+                (Some(codex), None, None, None) => Some(RunRestore::Codex(codex)),
+                (None, Some(muse), None, None) => Some(RunRestore::Muse(muse)),
+                (None, None, Some(agy), None) => Some(RunRestore::Agy(agy)),
+                (None, None, None, Some(gemini)) => Some(RunRestore::Gemini(gemini)),
+                _ => None,
             },
             word: leaf.word,
             cause: leaf.cause,
@@ -485,10 +543,12 @@ impl From<leaf::AgentRestore> for AgentRestore {
 impl From<AgentRestore> for leaf::AgentRestore {
     fn from(agent: AgentRestore) -> Self {
         // Each lane's run under its own word.
-        let (codex, muse) = match agent.run {
-            Some(RunRestore::Codex(run)) => (Some(run), None),
-            Some(RunRestore::Muse(run)) => (None, Some(run)),
-            None => (None, None),
+        let (codex, muse, agy, gemini) = match agent.run {
+            Some(RunRestore::Codex(run)) => (Some(run), None, None, None),
+            Some(RunRestore::Muse(run)) => (None, Some(run), None, None),
+            Some(RunRestore::Agy(run)) => (None, None, Some(run), None),
+            Some(RunRestore::Gemini(run)) => (None, None, None, Some(run)),
+            None => (None, None, None, None),
         };
         Self {
             pid: agent.pid,
@@ -505,6 +565,8 @@ impl From<AgentRestore> for leaf::AgentRestore {
             cause: agent.cause,
             tab: agent.tab,
             muse,
+            agy,
+            gemini,
         }
     }
 }
@@ -517,7 +579,19 @@ impl Serialize for AgentRestore {
 
 impl<'de> Deserialize<'de> for AgentRestore {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        leaf::AgentRestore::deserialize(deserializer).map(Self::from)
+        let leaf = leaf::AgentRestore::deserialize(deserializer)?;
+        let tables = [
+            leaf.codex.is_some(),
+            leaf.muse.is_some(),
+            leaf.agy.is_some(),
+            leaf.gemini.is_some(),
+        ];
+        if tables.into_iter().filter(|&table| table).count() > 1 {
+            return Err(serde::de::Error::custom(
+                "an agent restore has more than one run table",
+            ));
+        }
+        Ok(Self::from(leaf))
     }
 }
 
@@ -527,6 +601,8 @@ impl RunRestore {
         match self {
             RunRestore::Codex(_) => aterm_agent::harness::upgrade::Agent::Codex,
             RunRestore::Muse(_) => aterm_agent::harness::upgrade::Agent::Muse,
+            RunRestore::Agy(_) => aterm_agent::harness::upgrade::Agent::Agy,
+            RunRestore::Gemini(_) => aterm_agent::harness::upgrade::Agent::Gemini,
         }
     }
 }
@@ -561,6 +637,72 @@ pub(crate) struct MuseRestore {
     /// only when set).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<String>,
+}
+
+/// An agy TUI's run as its leaf's restore carries it
+/// (`aterm_agent::harness::relaunch::AgyRun`), on disk the leaf's `agy`
+/// table. Its workspace is the leaf's own `cwd` (agy's is the directory it
+/// was launched in).
+///
+/// ITS CONVERSATION IS HERE, NEVER IN THE LEAF'S `session`, as Muse Code's
+/// is ([`MuseRestore`]): v0.104.0 reads a leaf with no Codex run as Claude
+/// Code's, and with no `session` relaunches it as nobody's
+/// (`ended:no-conversation`) and tells no line; v0.105.0 reads the word `agy`
+/// as an agent with no lane, relaunched and told by nothing (pinned both ways
+/// by `the_agent_leaf_reads_both_ways_across_0_104_and_0_105`).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct AgyRestore {
+    /// The conversation it held, as its witness proved it (a UUIDv4);
+    /// `None`: none proven, and nothing resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
+    /// The config directory its conversations are under (absent tolerated:
+    /// read as none, and the relaunch then finds no presence lock).
+    #[serde(default)]
+    pub config: String,
+    /// THE HOME ITS RELAUNCH LINE CARRIES (`HOME=…`, where its own exec
+    /// environment set another than the user's; written only when set).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
+}
+
+/// A Gemini CLI TUI's run as its leaf's restore carries it
+/// (`aterm_agent::harness::relaunch::GeminiRun`), on disk the leaf's `gemini`
+/// table. Its project is the leaf's own `cwd` (its sessions are kept under
+/// its working directory).
+///
+/// ITS SESSION IS HERE, NEVER IN THE LEAF'S `session`, as Muse Code's and
+/// agy's are ([`MuseRestore`], [`AgyRestore`]): v0.104.0 reads a leaf with no
+/// Codex run as Claude Code's, and with no `session` relaunches it as
+/// nobody's (`ended:no-conversation`) and tells no line; v0.105.0 reads the
+/// word `gemini` as no agent's, relaunched and told by nothing
+/// (pinned both ways by
+/// `the_agent_leaf_reads_both_ways_across_0_104_and_0_105`). Its parent's
+/// start rides along, so the relaunch after aterm ended reads the start-time
+/// rule again over the session files as they are then.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct GeminiRestore {
+    /// The session the start-time rule named for it (a full UUID); `None`:
+    /// none named, and nothing resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// The Gemini directory its sessions are under
+    /// (`<GEMINI_CLI_HOME or HOME>/.gemini`; absent tolerated).
+    #[serde(default)]
+    pub home: String,
+    /// Its project's chats directory (absent tolerated: read as none, and
+    /// then no session is named).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chats: Option<String>,
+    /// THE HOMES ITS RELAUNCH LINE CARRIES (`GEMINI_CLI_HOME=…`, `HOME=…`;
+    /// written only when set).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
+    /// When its parent started, unix milliseconds (`0`: unread): the
+    /// start-time rule's one input from the process, read again at the
+    /// relaunch.
+    #[serde(default)]
+    pub started_ms: u64,
 }
 
 /// A Codex TUI's run as its leaf's restore carries it
@@ -684,11 +826,13 @@ impl AgentRestore {
     }
 
     /// The durable half of the relaunch snapshot `snap`. A Muse Code's
-    /// session goes in its own table, never in `session` ([`MuseRestore`]).
+    /// session, an agy's conversation and a Gemini CLI's session go in their
+    /// own tables, never in `session` ([`MuseRestore`], [`AgyRestore`],
+    /// [`GeminiRestore`]).
     pub(crate) fn of(snap: aterm_agent::harness::relaunch::Snapshot) -> Self {
         let word = snap.agent().word().to_string();
-        let (session, muse_session) = match &snap.run {
-            AgentRun::Muse(_) => (None, snap.session),
+        let (session, lane_session) = match &snap.run {
+            AgentRun::Muse(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => (None, snap.session),
             AgentRun::Claude | AgentRun::Codex(_) => (snap.session, None),
         };
         Self {
@@ -715,10 +859,22 @@ impl AgentRestore {
                     carried: None,
                 })),
                 AgentRun::Muse(run) => Some(RunRestore::Muse(MuseRestore {
-                    session: muse_session,
+                    session: lane_session,
                     workspace: run.workspace,
                     data: run.data.to_string_lossy().into_owned(),
                     env: aterm_agent::harness::upgrade_muse::env_words(&run.env),
+                })),
+                AgentRun::Agy(run) => Some(RunRestore::Agy(AgyRestore {
+                    conversation: lane_session,
+                    config: run.config.to_string_lossy().into_owned(),
+                    env: aterm_agent::harness::upgrade_agy::env_words(&run.env),
+                })),
+                AgentRun::Gemini(run) => Some(RunRestore::Gemini(GeminiRestore {
+                    session: lane_session,
+                    home: run.home.to_string_lossy().into_owned(),
+                    chats: run.chats.map(|c| c.to_string_lossy().into_owned()),
+                    env: aterm_agent::harness::upgrade_gemini::env_words(&run.env),
+                    started_ms: run.started_ms,
                 })),
             },
             cause: None,
@@ -737,7 +893,8 @@ impl AgentRestore {
         use aterm_agent::harness::upgrade::Agent;
         // The run of the agent its word names, each agent by name: one this
         // build has no lane for, or whose run the leaf lost, is none. A Muse
-        // Code's session is its table's ([`MuseRestore`]).
+        // Code's session, an agy's conversation and a Gemini CLI's session are
+        // their tables' ([`MuseRestore`], [`AgyRestore`], [`GeminiRestore`]).
         if !self.relaunched() {
             return None;
         }
@@ -766,11 +923,42 @@ impl AgentRestore {
                 })
             }
             (Agent::Muse, _) => return None,
+            (Agent::Agy, Some(RunRestore::Agy(run))) => {
+                session = run.conversation;
+                AgentRun::Agy(aterm_agent::harness::relaunch::AgyRun {
+                    config: std::path::PathBuf::from(run.config),
+                    env: aterm_agent::harness::upgrade_agy::env_of_words(&run.env),
+                    // Named again by its conversation; not carried.
+                    lock: None,
+                    // No exit of this process is read after a restore: aterm's
+                    // own end is the relaunch's cause.
+                    crash: None,
+                    started_ms: 0,
+                    block: None,
+                })
+            }
+            (Agent::Agy, _) => return None,
+            (Agent::Gemini, Some(RunRestore::Gemini(run))) => {
+                session = run.session;
+                AgentRun::Gemini(aterm_agent::harness::relaunch::GeminiRun {
+                    home: std::path::PathBuf::from(run.home),
+                    chats: run.chats.map(std::path::PathBuf::from),
+                    env: aterm_agent::harness::upgrade_gemini::env_of_words(&run.env),
+                    // Carried: the relaunch reads the start-time rule again.
+                    started_ms: run.started_ms,
+                    // No exit of this process is read after a restore:
+                    // aterm's own end is the relaunch's cause.
+                    child: 0,
+                    unwitnessed: None,
+                    block: None,
+                })
+            }
+            (Agent::Gemini, _) => return None,
             // Its run is another lane's: never read as it.
-            (Agent::Codex, Some(RunRestore::Muse(_))) => return None,
-            // No lane yet (agy, Gemini CLI): read as that agent, relaunched
-            // by nothing — never as Claude Code.
-            (Agent::Agy | Agent::Gemini, _) => return None,
+            (
+                Agent::Codex,
+                Some(RunRestore::Muse(_) | RunRestore::Agy(_) | RunRestore::Gemini(_)),
+            ) => return None,
         };
         Some(aterm_agent::harness::relaunch::Snapshot {
             tab,
@@ -808,11 +996,37 @@ impl AgentRestore {
             // (`relaunch::Snapshot::stored_login`); its first relaunch after
             // that, from a live read, may.
             stored_login: false,
+            profile: None,
         })
     }
 }
 
 impl AgentRestore {
+    /// The relaunch snapshot of this agent, SUPERVISED by the outgoing
+    /// instance and handed across a seamless update
+    /// ([`TerminalLeafRestore::supervised`]), in the tab `tab` whose adopted
+    /// process is `adopted`: the shell, unless the agent IS that process — a
+    /// tab's own program (`aterm -e claude`, `exec claude`), which no shell
+    /// holds — whose snapshot names no shell
+    /// (`aterm_agent::harness::relaunch::NO_SHELL`), as the outgoing host's
+    /// own read did. Only for a live handed agent: a cold restore's leaf has
+    /// a fresh shell, and an owed relaunch's agent is gone, its pid free for
+    /// another process. `None` for an agent this build has no lane for, as
+    /// [`Self::snapshot`]'s.
+    #[cfg(any(unix, test))]
+    pub(crate) fn handed_snapshot(
+        self,
+        tab: String,
+        adopted: u32,
+    ) -> Option<aterm_agent::harness::relaunch::Snapshot> {
+        let shell = if adopted == self.pid {
+            aterm_agent::harness::relaunch::NO_SHELL
+        } else {
+            adopted
+        };
+        self.snapshot(tab, shell)
+    }
+
     /// Whether the relaunch after aterm ended brings this agent back on its
     /// conversation ([`agent_resumes`]), by a relaunch that is anyone's
     /// ([`Self::relaunched`]). Not where its leaf carries the owner's hold
@@ -828,6 +1042,22 @@ impl AgentRestore {
                         .is_some_and(aterm_agent::harness::upgrade_muse::is_session_uuid)
                         && aterm_agent::harness::upgrade_muse::is_tui_argv(&self.argv)
                 }
+                // An agy's conversation is its table's, and its one-shot
+                // launches its own table's ([`AgyRestore`]).
+                Some(RunRestore::Agy(run)) => {
+                    run.conversation
+                        .as_deref()
+                        .is_some_and(aterm_agent::harness::upgrade_agy::is_conversation_uuid)
+                        && aterm_agent::harness::upgrade_agy::is_tui_argv(&self.argv)
+                }
+                // A Gemini CLI's session is its table's, and its one-shot
+                // launches its own table's ([`GeminiRestore`]).
+                Some(RunRestore::Gemini(run)) => {
+                    run.session
+                        .as_deref()
+                        .is_some_and(aterm_agent::harness::upgrade_gemini::is_session_uuid)
+                        && aterm_agent::harness::upgrade_gemini::is_tui_argv(&self.argv)
+                }
                 Some(RunRestore::Codex(_)) | None => {
                     agent_resumes(self.session.as_deref(), &self.argv)
                 }
@@ -838,27 +1068,30 @@ impl AgentRestore {
     /// carries no line aterm's copy of codex-alab's own record validated
     /// ([`CodexRestore::alab`]) — a vendor `codex`, or an older build's
     /// leaf (the Codex screen lane's retirement, 2026-10-16): its tab comes
-    /// back at its shell. Claude Code's and Muse Code's always (a Muse Code's
-    /// resume is read off its own table, [`Self::resumes`]).
+    /// back at its shell. Claude Code's, Muse Code's, agy's and Gemini CLI's
+    /// always (the last three's resume is read off its own table,
+    /// [`Self::resumes`]).
     pub(crate) fn relaunched(&self) -> bool {
         match &self.run {
-            None | Some(RunRestore::Muse(_)) => true,
+            None | Some(RunRestore::Muse(_) | RunRestore::Agy(_) | RunRestore::Gemini(_)) => true,
             Some(RunRestore::Codex(run)) => run.alab.is_some(),
         }
     }
 
     /// The agent as a person names it, the one its relaunch would read
-    /// ([`Self::agent`]): `Claude`, `Codex` or `Muse Code`; `None` for one this
-    /// build has no lane for (agy, Gemini CLI, or a word it does not know),
-    /// which nothing relaunches.
+    /// ([`Self::agent`]): `Claude`, `Codex`, `Muse Code`, `agy` or `Gemini
+    /// CLI`; `None` for a word this build does not know, which nothing
+    /// relaunches.
     pub(crate) fn name(&self) -> Option<&'static str> {
         use aterm_agent::harness::upgrade::Agent;
-        self.agent().and_then(|agent| match agent {
-            Agent::Claude => Some("Claude"),
-            Agent::Codex => Some("Codex"),
-            Agent::Muse => Some(agent.product()),
-            // No lane yet (agy, Gemini CLI): relaunched by nothing.
-            Agent::Agy | Agent::Gemini => None,
+        self.agent().map(|agent| match agent {
+            Agent::Claude => "Claude",
+            Agent::Codex => "Codex",
+            Agent::Muse => agent.product(),
+            // By the name a person types it by, as `Claude` and `Codex` are.
+            Agent::Agy => aterm_agent::harness::upgrade_agy::PROGRAM,
+            // By its product's name: `gemini` alone reads as a word.
+            Agent::Gemini => agent.product(),
         })
     }
 
@@ -897,8 +1130,12 @@ impl AgentRestore {
         };
         // Each agent's line by name. Muse Code's is its own resume line (`muse
         // resume <uuid>`), on the session its table carries, behind the homes
-        // its relaunch carries. No lane yet (agy, Gemini CLI): none told,
-        // never Claude Code's.
+        // its relaunch carries; agy's its own resume hint (`agy
+        // --conversation=<uuid>`), on the conversation its table carries,
+        // after the flags that moved its config and behind its `HOME`; Gemini
+        // CLI's its own `gemini --resume <uuid>` in its project, behind its
+        // homes, only where its resume would load every turn (the pre-check,
+        // read now: a few small files of one session, once per held tab).
         let run = match self.agent()? {
             Agent::Claude | Agent::Codex => &self.run,
             Agent::Muse => {
@@ -910,7 +1147,27 @@ impl AgentRestore {
                     &aterm_agent::harness::upgrade_muse::env_of_words(&run.env),
                 );
             }
-            Agent::Agy | Agent::Gemini => return None,
+            Agent::Agy => {
+                let Some(RunRestore::Agy(run)) = &self.run else {
+                    return None;
+                };
+                return aterm_agent::harness::upgrade_agy::told_line(
+                    run.conversation.as_deref()?,
+                    &aterm_agent::harness::upgrade_agy::env_of_words(&run.env),
+                    &self.argv,
+                );
+            }
+            Agent::Gemini => {
+                let Some(RunRestore::Gemini(run)) = &self.run else {
+                    return None;
+                };
+                return aterm_agent::harness::upgrade_drive::gemini_told(
+                    run.session.as_deref()?,
+                    run.chats.as_deref().map(std::path::Path::new),
+                    &aterm_agent::harness::upgrade_gemini::env_of_words(&run.env),
+                    &self.cwd,
+                );
+            }
         };
         let conversation = self.session.as_deref().filter(|id| is_session_id(id))?;
         let (env, line) = match run {
@@ -945,7 +1202,7 @@ impl AgentRestore {
                     .join(" "),
             ),
             // Told above, on its own table's session.
-            Some(RunRestore::Muse(_)) => return None,
+            Some(RunRestore::Muse(_) | RunRestore::Agy(_) | RunRestore::Gemini(_)) => return None,
             Some(RunRestore::Codex(CodexRestore { alab: None, .. })) => return None,
         };
         let mut said = String::new();
@@ -976,12 +1233,11 @@ impl AgentRestore {
         } else {
             Agent::parse(&self.word)?
         };
-        // The run each agent's leaf carries: Claude Code's none, Codex's and
-        // Muse Code's their own. No lane yet (agy, Gemini CLI): none, its run
-        // unknown to this build.
+        // The run each agent's leaf carries: Claude Code's none, Codex's,
+        // Muse Code's, agy's and Gemini CLI's their own.
         let agrees = match agent {
-            Agent::Claude | Agent::Agy | Agent::Gemini => ran.is_none(),
-            Agent::Codex | Agent::Muse => ran == Some(agent),
+            Agent::Claude => ran.is_none(),
+            Agent::Codex | Agent::Muse | Agent::Agy | Agent::Gemini => ran == Some(agent),
         };
         agrees.then_some(agent)
     }
@@ -1452,6 +1708,14 @@ impl PlaceholderLeafRestore {
 /// Content descriptor at one recursive restore leaf.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the terminal leaf is the common view (it passed the lint's 200-byte line over \
+              the native leaf with its handoff-only `lost` word, 2026-10-17); a layout holds \
+              one view per leaf, its tree already boxed by `Split`, and boxing the terminal \
+              leaf would put a deref on every match over a restored view, as \
+              `RestoredSplitTree` says"
+)]
 pub(crate) enum RestoredView {
     Terminal(TerminalLeafRestore),
     Native(NativeLeafRestore),
@@ -2045,12 +2309,10 @@ pub(crate) struct WindowLayout {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inner_px: Option<[u32; 2]>,
     /// Whether the window had its PRESENCE ROW committed under its chrome, in
-    /// a seamless update's layout only, beside [`Self::inner_px`] and for the
-    /// same reason: that size and `rows` hold the row, which the successor
-    /// reserves before its first attach (`WindowState::take_carried_frame`;
-    /// window 0's rides `WindowCarry::presence_row`). Written only while a
-    /// row stands, so every other layout's wire is unchanged; a sizing fact
-    /// like `inner_px`, so `commit_layout_topology` normalizes it out too.
+    /// an older build's seamless update layout. RETIRED with the row (owner
+    /// surfaces, 2026-10-16): this build never sets it and reads it nowhere;
+    /// it stays on the wire so an older successor's reader is whole. A sizing
+    /// fact like `inner_px`, so `commit_layout_topology` normalizes it out.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub presence_row: bool,
     /// The window's macOS SHOW STATE — full screen, minimized, its place in the
@@ -2257,11 +2519,10 @@ impl WindowLayout {
     }
 
     /// A window [`RestoreManifest::fold_into_caps`] made for a spill from
-    /// `donor`: the donor's grid and the size that holds it (with the
-    /// presence row that size reserves), so the shells moved into it keep
-    /// their grid; no position, show state or maximize, so the window system
-    /// places it; and its first tab in front. No tabs yet: the fold moves
-    /// them in.
+    /// `donor`: the donor's grid and the size that holds it, so the shells
+    /// moved into it keep their grid; no position, show state or maximize,
+    /// so the window system places it; and its first tab in front. No tabs
+    /// yet: the fold moves them in.
     fn spill_of(donor: &Self) -> Self {
         Self {
             rows: donor.rows,
@@ -2369,6 +2630,7 @@ impl RestoredTab {
                         theme: None,
                         agent: None,
                         supervised: None,
+                        lost: None,
                         held: false,
                         holds: Vec::new(),
                     }))
@@ -3318,7 +3580,7 @@ pub(crate) fn write_quit_to(
 /// it (another aterm reading or writing its windows, or stopped while it does)
 /// is a PASSING refusal, never a wait with no end (round eight of the update
 /// audit, U49). Every refusal says whether it passes ([`RestoreFault`]).
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 pub(crate) fn write_quit_to_within(
     path: &Path,
     manifest: &RestoreManifest,
@@ -3361,7 +3623,7 @@ fn write_quit_to_waiting(
 /// first of them. Taking the whole file lost them all. A file that holds no
 /// desk of `run`'s is left as it is; with `run` `None` (an unstamped write,
 /// which replaced the file) the file is taken.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn unwrite_quit_to(path: &Path, run: Option<&str>) -> Result<(), String> {
     unwrite_quit_to_waiting(path, run, LockWait::Unbounded).map_err(String::from)
 }
@@ -3369,7 +3631,7 @@ pub(crate) fn unwrite_quit_to(path: &Path, run: Option<&str>) -> Result<(), Stri
 /// [`unwrite_quit_to`] for the cold update lane on the GUI main thread: the
 /// restore lock is waited for at most `budget`, as its write waits
 /// ([`write_quit_to_within`]; round eight of the update audit, U49).
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 pub(crate) fn unwrite_quit_to_within(
     path: &Path,
     run: Option<&str>,
@@ -3378,7 +3640,7 @@ pub(crate) fn unwrite_quit_to_within(
     unwrite_quit_to_waiting(path, run, LockWait::Within(budget))
 }
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn unwrite_quit_to_waiting(
     path: &Path,
     run: Option<&str>,
@@ -3693,7 +3955,7 @@ impl RestoreFault {
 
     /// The restore lock at `lock_path`, held by another description past
     /// `budget`: passing — its holder lets go, or is resumed.
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     fn busy(lock_path: &Path, budget: std::time::Duration) -> Self {
         Self {
             message: format!(
@@ -3820,7 +4082,7 @@ enum LockWait {
     /// At most this long, then a passing refusal ([`RestoreFault::busy`]): the
     /// GUI main thread's, which may not wait with no end (round eight of the
     /// update audit, U49).
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     Within(std::time::Duration),
 }
 
@@ -3872,7 +4134,7 @@ fn with_restore_lock_waiting<T, E: From<RestoreFault>>(
         LockWait::Unbounded => {
             crate::native_document_host::HeldAdvisoryLock::lock(lock).map_err(|e| locking(&e))?
         }
-        #[cfg(any(unix, test))]
+        #[cfg(unix)]
         LockWait::Within(budget) => {
             match crate::native_document_host::acquire_advisory_lock_within(lock, budget) {
                 Ok(held) => held,
@@ -4583,6 +4845,7 @@ mod tests {
             theme: None,
             agent: None,
             supervised: None,
+            lost: None,
             held: false,
             holds: Vec::new(),
         }))
@@ -5574,7 +5837,7 @@ focused = true
     }
 
     /// D5: A LONE WINDOW PAST THE TAB CAP SPILLS INTO WINDOWS MADE FOR IT —
-    /// at its grid and size, with its presence row, placed by the window
+    /// at its grid and size, placed by the window
     /// system — the first of which shows its front tab, which moved there.
     #[test]
     fn a_lone_window_past_the_tab_cap_spills_into_windows_made_for_it() {
@@ -6057,6 +6320,7 @@ metadata = "opaque=copy-me"
                     land_at: None,
                     agent: None,
                     supervised: None,
+                    lost: None,
                     held: false,
                     holds: Vec::new(),
                 })),
@@ -6160,7 +6424,13 @@ metadata = "opaque=copy-me"
         let back = RestoreManifest::from_toml(&wire(&held)).expect("parses");
         assert_eq!(back, held, "held survives the wire");
 
-        assert_eq!(back.first_leaf_cwd(), None, "the held pane's remote folder");
+        // Off unix no folder is judged before a spawn (`spawn_folder::inherited`):
+        // a Windows spawn whose folder is not there inherits instead.
+        assert_eq!(
+            back.first_leaf_cwd().as_deref(),
+            (!cfg!(unix)).then_some(remote.as_str()),
+            "the held pane's remote folder"
+        );
         assert_eq!(
             unheld.first_leaf_cwd().as_deref(),
             Some(remote.as_str()),
@@ -6410,9 +6680,11 @@ metadata = "opaque=copy-me"
     /// crash markers the journal claim reads — before, an instance on the owner's
     /// `$HOME` with its own state root took the owner's `session.toml` and claimed,
     /// then deleted, the owner's dead journals. A relative seam resolves nothing
-    /// (never the owner's folder), and unset they are `<data_dir>/aterm` exactly as
-    /// before. NEGATIVE CONTROL: the unset arm names the OS data dir, not the scratch
-    /// root, so the scoped arm's pass is the seam's doing.
+    /// (never the owner's folder), and unset they are `aterm_data_dir()`: in a shipped
+    /// process `<data_dir>/aterm` exactly as before (`aterm_types::dirs`' own tests), in
+    /// this test binary its own root's (`aterm_types::dirs::test_root`). NEGATIVE
+    /// CONTROL: the unset arm names that folder, not the scratch root, so the scoped
+    /// arm's pass is the seam's doing.
     #[test]
     fn the_manifest_journals_and_cell_metrics_follow_the_state_home_seam() {
         let scratch = aterm_tempfile::Builder::new()
@@ -6438,7 +6710,12 @@ metadata = "opaque=copy-me"
             assert!(write(&RestoreManifest::new(Vec::new())).is_err());
         });
         crate::test_env::scoped_unset("ATERM_STATE_HOME", || {
-            let data = aterm_types::dirs::data_dir().map(|dir| dir.join("aterm"));
+            let data = aterm_types::dirs::aterm_data_dir();
+            assert_eq!(
+                data,
+                aterm_types::dirs::test_root().map(|root| root.join("state")),
+                "never the person's folder"
+            );
             assert_eq!(
                 manifest_path(),
                 data.as_ref().map(|dir| dir.join("session.toml"))
@@ -6703,6 +6980,7 @@ metadata = "opaque=copy-me"
             home: None,
             claude_dir: None,
             stored_login: false,
+            profile: None,
         };
         let agent = AgentRestore::of(snap(OLD_TAB));
         assert_eq!(agent.tab.as_deref(), Some(OLD_TAB));
@@ -6849,6 +7127,7 @@ metadata = "opaque=copy-me"
         use aterm_agent::harness::upgrade::Agent;
         let claude = Snapshot {
             stored_login: false,
+            profile: None,
             tab: "s-old".into(),
             pid: 5151,
             start: "Sat Sep 27 01:02:03 2026".into(),
@@ -6906,24 +7185,6 @@ metadata = "opaque=copy-me"
             newer.snapshot("s-new".into(), 6161).is_none(),
             "relaunched by nothing"
         );
-        // …and one for an agent it knows with no lane: read as that agent,
-        // relaunched by nothing, told no line, named nowhere.
-        for (word, agent) in [("agy", Agent::Agy), ("gemini", Agent::Gemini)] {
-            let leaf = read(&format!("word = \"{word}\"\n{}", wire(&claude)));
-            assert_eq!(leaf.agent(), Some(agent), "{word}");
-            assert_eq!(leaf.name(), None, "{word}");
-            assert!(
-                leaf.resume_line().is_none(),
-                "{word}: no line, never Claude Code's"
-            );
-            assert!(
-                leaf.clone().snapshot("s-new".into(), 6161).is_none(),
-                "{word}: relaunched by nothing, never as Claude Code"
-            );
-            let mut beside_codex = read(&wire(&codex));
-            beside_codex.word = word.to_string();
-            assert_eq!(beside_codex.agent(), None, "{word} beside a Codex run");
-        }
         // Muse Code's word needs its own run (`[muse]`, where its session
         // is): with none, the word its run contradicts, it is no agent and
         // relaunched by nothing — never as Claude Code. Its leaf with its run
@@ -6932,6 +7193,19 @@ metadata = "opaque=copy-me"
         assert_eq!(muse_no_run.agent(), None, "muse without its run");
         assert!(muse_no_run.resume_line().is_none());
         assert!(muse_no_run.snapshot("s-new".into(), 6161).is_none());
+        // agy's the same way (`[agy]`, where its conversation is), and
+        // Gemini CLI's (`[gemini]`, where its session is); beside a Codex
+        // run, neither is an agent.
+        for word in ["agy", "gemini"] {
+            let no_run = read(&format!("word = \"{word}\"\n{}", wire(&claude)));
+            assert_eq!(no_run.agent(), None, "{word} without its run");
+            assert_eq!(no_run.name(), None, "{word}");
+            assert!(no_run.resume_line().is_none(), "{word}");
+            assert!(no_run.snapshot("s-new".into(), 6161).is_none(), "{word}");
+            let mut beside_codex = read(&wire(&codex));
+            beside_codex.word = word.to_string();
+            assert_eq!(beside_codex.agent(), None, "{word} beside a Codex run");
+        }
         assert!(
             read(&wire(&claude))
                 .snapshot("s-new".into(), 6161)
@@ -6985,7 +7259,13 @@ metadata = "opaque=copy-me"
         use aterm_agent::harness::relaunch::{CodexRun, Snapshot, exit_line};
         use aterm_agent::harness::upgrade::Dialect;
         const SESSION: &str = "0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c";
-        const HOME: &str = "/Users//me/lab home/.claude";
+        // An absolute home (a relative one is refused, `home_carried`): on
+        // Windows an absolute path names its drive.
+        const HOME: &str = if cfg!(windows) {
+            "C:/Users//me/lab home/.claude"
+        } else {
+            "/Users//me/lab home/.claude"
+        };
         const LOGIN: &str = "/Users//me/logins/work-2";
 
         /// `AgentRestore` as 0.101.0 declares it
@@ -7008,6 +7288,7 @@ metadata = "opaque=copy-me"
 
         let ran = |home: Option<&str>, login: Option<&str>| Snapshot {
             stored_login: false,
+            profile: None,
             tab: "s-old".into(),
             pid: 4242,
             start: "Fri Oct  9 01:02:03 2026".into(),
@@ -7246,6 +7527,45 @@ metadata = "opaque=copy-me"
         );
     }
 
+    /// A TAB'S OWN PROGRAM HANDED ACROSS A SEAMLESS UPDATE STILL NAMES NO
+    /// SHELL ([`AgentRestore::handed_snapshot`]): the outgoing host read it
+    /// with `NO_SHELL`, which the leaf does not carry, and the successor's
+    /// adopted process IS the agent (`aterm -e claude`, `exec claude`), so
+    /// its snapshot names no shell again — and an exit during the Commit is
+    /// refused as no shell's job, never "its shell is gone". NEGATIVE
+    /// CONTROL: an agent its adopted shell runs is handed that shell.
+    #[test]
+    fn a_handed_tab_program_names_no_shell_and_a_shells_job_its_shell() {
+        use aterm_agent::harness::relaunch::NO_SHELL;
+        let agent = AgentRestore {
+            word: String::new(),
+            pid: 4242,
+            start: "Sat Sep 27 01:02:03 2026".into(),
+            program: "/Users//me/.local/bin/claude".into(),
+            argv: vec!["/Users//me/.local/bin/claude".into()],
+            session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".into()),
+            cwd: "/Users//me/work".into(),
+            version: Some("2.1.283".into()),
+            home: None,
+            login: None,
+            run: None,
+            cause: None,
+            tab: None,
+        };
+        let own = agent
+            .clone()
+            .handed_snapshot("s-new".into(), 4242)
+            .expect("a Claude Code leaf");
+        assert_eq!(
+            (own.tab.as_str(), own.pid, own.shell),
+            ("s-new", 4242, NO_SHELL)
+        );
+        let under = agent
+            .handed_snapshot("s-new".into(), 4241)
+            .expect("a Claude Code leaf");
+        assert_eq!((under.pid, under.shell), (4242, 4241), "CONTROL: its shell");
+    }
+
     /// THE AGENT LEAF IS A WIRE FORMAT 0.104.0 AND 0.105.0 READ, AND ITS RUN
     /// A SHAPE IN MEMORY ONLY ([`AgentRestore::run`], [`leaf::AgentRestore`]).
     /// Their `AgentRestore` and `CodexRestore` are frozen below
@@ -7257,16 +7577,17 @@ metadata = "opaque=copy-me"
     /// for byte but for the additive keys since (`tab`), and read in both as
     /// the same agent; their leaves read here as they wrote them.
     ///
-    /// AND MUSE CODE'S LEAF, THE FORM A LANE PAST CODEX'S ADDS ITS RUN IN: a
-    /// table under its record word (`[muse]`), its conversation in that table
-    /// and never in `session`. Both older readers take the leaf (the layout
+    /// AND MUSE CODE'S, AGY'S AND GEMINI CLI'S LEAVES, THE FORM A LANE PAST
+    /// CODEX'S ADDS ITS RUN IN: a table under its record word (`[muse]`,
+    /// `[agy]`, `[gemini]`), its conversation in that table and never in
+    /// `session`. Both older readers take the leaf (the layout
     /// around it still restores) and ignore the table; 0.105.0 reads it as no
     /// agent's, and 0.104.0, which has no word and reads it as Claude Code's,
     /// finds no conversation to relaunch it on (`agent_resumes`,
-    /// `ended:no-conversation`) and no line to tell. This build reads it as
-    /// Muse Code's, relaunches it on its table's session and tells Muse Code's
-    /// own line. NEGATIVE CONTROL: the same leaf with its conversation in
-    /// `session` would be one 0.104.0 relaunches as Claude Code.
+    /// `ended:no-conversation`) and no line to tell. This build reads each as
+    /// its agent's, relaunches it on its table's conversation and tells that
+    /// agent's own line. NEGATIVE CONTROL: the same leaf with its conversation
+    /// in `session` would be one 0.104.0 relaunches as Claude Code.
     #[test]
     fn the_agent_leaf_reads_both_ways_across_0_104_and_0_105() {
         use aterm_agent::harness::relaunch::{CodexRun, Snapshot};
@@ -7274,6 +7595,8 @@ metadata = "opaque=copy-me"
         const SESSION: &str = "0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c";
         const THREAD: &str = "01a0e4bd-2b37-75a0-9d52-7f1e2c3a4b5c";
         const MUSE: &str = "01a148f8-9301-7752-96db-fef456f88074";
+        const AGY: &str = "eaeec4fb-4e43-47da-b46f-8a10c0fee186";
+        const GEMINI: &str = "11edd4f1-7048-4ff7-8ff2-83cce0095a7c";
 
         #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
         struct CodexRestore0104 {
@@ -7359,6 +7682,7 @@ metadata = "opaque=copy-me"
 
         let claude = Snapshot {
             stored_login: false,
+            profile: None,
             tab: "s-old".into(),
             pid: 4242,
             start: "Fri Oct 16 01:02:03 2026".into(),
@@ -7575,7 +7899,7 @@ metadata = "opaque=copy-me"
         );
         // A `[muse]` table naming no session (none was proven) resumes
         // nothing and tells no line; one beside a `codex` table (no build
-        // writes both) is no agent's.
+        // writes both) is refused.
         let unproven = wire(&Snapshot {
             session: None,
             ..muse.clone()
@@ -7583,15 +7907,275 @@ metadata = "opaque=copy-me"
         let unproven: AgentRestore = aterm_toml::from_str(&unproven).expect("read");
         assert_eq!(unproven.agent(), Some(Agent::Muse));
         assert!(!unproven.resumes() && unproven.resume_line().is_none());
-        let both = format!(
-            "{}\n[codex]\nhome = \"/Users//me/.codex\"\nembedded = true\nstarted_ms = 1\n",
-            lane.trim_end()
-        );
-        let both: AgentRestore = aterm_toml::from_str(&both).expect("read");
-        assert_eq!(both.agent(), None, "two runs: neither");
+        // Two lane tables must not erase the contradictory run into `None`,
+        // which a missing/default or Claude word reads as Claude Code's.
+        for word in [None, Some(""), Some("claude"), Some("muse"), Some("codex")] {
+            let word = word.map_or_else(String::new, |w| format!("word = {w:?}\n"));
+            let both = format!(
+                "{}\n[codex]\nhome = \"/Users//me/.codex\"\nembedded = true\nstarted_ms = 1\n",
+                lane.replacen(
+                    "word = \"muse\"\n",
+                    &format!("{word}session = {SESSION:?}\n"),
+                    1,
+                )
+                .trim_end()
+            );
+            assert!(
+                aterm_toml::from_str::<AgentRestore>(&both).is_err(),
+                "AMBIGUOUS_AGENT_RUN_TABLES_MUST_NOT_RESUME_AS_CLAUDE: {both}"
+            );
+        }
         // NEGATIVE CONTROL: its conversation in `session` is a leaf 0.104.0
         // relaunches, as Claude Code.
         let in_session = format!("{}word = \"muse\"\n", wire(&claude));
+        let old = aterm_toml::from_str::<AgentRestore0104>(&in_session).expect("0.104.0");
+        assert_eq!((agent_0104(&old), resumes_0104(&old)), ("claude", true));
+
+        // AGY'S LEAF, THE SAME FORM: its table under its word (`[agy]`), its
+        // conversation there and never in `session`; its workspace the leaf's
+        // own `cwd`.
+        let agy = Snapshot {
+            program: "/opt/pkg/store/agy/1000001000004000000/bin/agy".into(),
+            argv: vec![
+                "/opt/pkg/store/agy/1000001000004000000/bin/agy".into(),
+                "--effort=high".into(),
+                "--gemini_dir=/Users//me/alt".into(),
+            ],
+            session: Some(AGY.into()),
+            version: Some("1.4.0".into()),
+            run: AgentRun::Agy(aterm_agent::harness::relaunch::AgyRun {
+                config: "/Users//me/alt/antigravity-cli".into(),
+                env: vec![("HOME".into(), "/Users//me/agy-home".into())],
+                lock: Some(format!("/Users//me/alt/antigravity-cli/presence/{AGY}.lock").into()),
+                crash: Some("/Users//me/alt/antigravity-cli/crashes/crash_7_x.log".into()),
+                started_ms: 1_790_543_997_000,
+                block: Some(7),
+            }),
+            login: None,
+            home: None,
+            ..claude.clone()
+        };
+        let lane = wire(&agy);
+        assert!(
+            lane.contains("word = \"agy\"\n") && lane.contains("[agy]\n"),
+            "{lane}"
+        );
+        let (top, table) = lane.split_once("[agy]").expect("its table");
+        assert!(
+            table.contains(&format!("conversation = \"{AGY}\"")) && !top.contains("session = "),
+            "its conversation in its table alone: {lane}"
+        );
+        let old = aterm_toml::from_str::<AgentRestore0104>(&lane).expect("0.104.0 takes it");
+        assert_eq!(old.session, None, "{lane}");
+        assert_eq!(agent_0104(&old), "claude", "0.104.0 has no word");
+        assert!(
+            !resumes_0104(&old),
+            "0.104.0 finds no conversation to relaunch it on"
+        );
+        let older = aterm_toml::from_str::<AgentRestore0105>(&lane).expect("0.105.0 takes it");
+        assert_eq!(older.word, "agy");
+        assert_eq!(agent_0105(&older), None, "0.105.0: no agent's");
+        let here: AgentRestore = aterm_toml::from_str(&lane).expect("this build takes it");
+        assert_eq!(here.agent(), Some(Agent::Agy), "read as agy's");
+        assert_eq!(here.name(), Some("agy"));
+        assert!(here.resumes(), "its own table's conversation resumes");
+        assert_eq!(
+            here.resume_line().as_deref(),
+            Some(
+                format!(
+                    "HOME=/Users//me/agy-home agy --gemini_dir=/Users//me/alt --conversation={AGY}"
+                )
+                .as_str()
+            ),
+            "agy's own resume hint, after its config flag, behind its HOME"
+        );
+        let back = here
+            .clone()
+            .snapshot("s-new".into(), 6161)
+            .expect("relaunched by its lane");
+        assert_eq!(back.agent(), Agent::Agy);
+        assert_eq!(back.session.as_deref(), Some(AGY));
+        assert_eq!(
+            back.agy().map(|run| (
+                run.config.clone(),
+                run.env.clone(),
+                run.lock.clone(),
+                run.crash.clone(),
+                run.block
+            )),
+            Some((
+                PathBuf::from("/Users//me/alt/antigravity-cli"),
+                vec![("HOME".to_string(), "/Users//me/agy-home".to_string())],
+                None,
+                None,
+                None
+            )),
+            "its run back, its lock, crash file and block never carried"
+        );
+        assert_eq!(
+            aterm_toml::to_string(&here).expect("written back"),
+            lane,
+            "read and written back as written"
+        );
+        let unproven = wire(&Snapshot {
+            session: None,
+            ..agy.clone()
+        });
+        let unproven: AgentRestore = aterm_toml::from_str(&unproven).expect("read");
+        assert_eq!(unproven.agent(), Some(Agent::Agy));
+        assert!(!unproven.resumes() && unproven.resume_line().is_none());
+        // Beside a `[muse]` or a `[codex]` table (no build writes two), as
+        // Muse Code's: refused, never erased into `None` (Claude Code's).
+        for word in [None, Some(""), Some("claude"), Some("agy"), Some("muse")] {
+            let word = word.map_or_else(String::new, |w| format!("word = {w:?}\n"));
+            let top = lane.replacen("word = \"agy\"\n", &word, 1);
+            for other in [
+                "[muse]\ndata = \"/Users//me/.local/share\"\n",
+                "[codex]\nhome = \"/Users//me/.codex\"\nembedded = true\nstarted_ms = 1\n",
+            ] {
+                let both = format!("{}\n{other}", top.trim_end());
+                assert!(
+                    aterm_toml::from_str::<AgentRestore>(&both).is_err(),
+                    "AMBIGUOUS_AGENT_RUN_TABLES_MUST_NOT_RESUME_AS_CLAUDE: {both}"
+                );
+            }
+        }
+        // NEGATIVE CONTROL: its conversation in `session` is a leaf 0.104.0
+        // relaunches, as Claude Code.
+        let in_session = format!("{}word = \"agy\"\n", wire(&claude));
+        let old = aterm_toml::from_str::<AgentRestore0104>(&in_session).expect("0.104.0");
+        assert_eq!((agent_0104(&old), resumes_0104(&old)), ("claude", true));
+
+        // GEMINI CLI'S LEAF, THE SAME FORM: its table under its word
+        // (`[gemini]`), its session there and never in `session`; its project
+        // the leaf's own `cwd`, its parent's start carried (the relaunch reads
+        // the start-time rule again).
+        let chats = aterm_tempfile::tempdir().expect("scratch dir");
+        let chats_dir = chats.path().to_string_lossy().into_owned();
+        let gemini = Snapshot {
+            program: "/opt/homebrew/opt/node/bin/node".into(),
+            argv: vec![
+                "/opt/homebrew/opt/node/bin/node".into(),
+                "/opt/homebrew/bin/gemini".into(),
+                "--model".into(),
+                "gemini-3.5-flash".into(),
+            ],
+            session: Some(GEMINI.into()),
+            cwd: "/Users//me/proj".into(),
+            version: Some("0.46.0".into()),
+            run: AgentRun::Gemini(aterm_agent::harness::relaunch::GeminiRun {
+                home: "/Users//me/g/.gemini".into(),
+                chats: Some(chats.path().to_path_buf()),
+                env: vec![("GEMINI_CLI_HOME".into(), "/Users//me/g".into())],
+                started_ms: 1_792_261_698_000,
+                child: 4242,
+                unwitnessed: None,
+                block: Some(7),
+            }),
+            login: None,
+            home: None,
+            ..claude.clone()
+        };
+        let lane = wire(&gemini);
+        assert!(
+            lane.contains("word = \"gemini\"\n") && lane.contains("[gemini]\n"),
+            "{lane}"
+        );
+        let (top, table) = lane.split_once("[gemini]").expect("its table");
+        assert!(
+            table.contains(&format!("session = \"{GEMINI}\"")) && !top.contains("session = "),
+            "its session in its table alone: {lane}"
+        );
+        let old = aterm_toml::from_str::<AgentRestore0104>(&lane).expect("0.104.0 takes it");
+        assert_eq!(old.session, None, "{lane}");
+        assert_eq!(agent_0104(&old), "claude", "0.104.0 has no word");
+        assert!(
+            !resumes_0104(&old),
+            "0.104.0 finds no conversation to relaunch it on"
+        );
+        let older = aterm_toml::from_str::<AgentRestore0105>(&lane).expect("0.105.0 takes it");
+        assert_eq!(older.word, "gemini");
+        assert_eq!(agent_0105(&older), None, "0.105.0: no agent's");
+        let here: AgentRestore = aterm_toml::from_str(&lane).expect("this build takes it");
+        assert_eq!(here.agent(), Some(Agent::Gemini), "read as Gemini CLI's");
+        assert_eq!(here.name(), Some("Gemini CLI"));
+        assert!(here.resumes(), "its own table's session resumes");
+        // Its told line only where its resume loads every turn: no file of
+        // the session yet, none told; one holding its turn, its own line.
+        assert_eq!(here.resume_line(), None, "no file: nothing vouched for");
+        std::fs::write(
+            chats.path().join(format!("session-2026-10-18T06-40-{}.jsonl", &GEMINI[..8])),
+            format!(
+                "{}\n{}\n{}\n",
+                format_args!(
+                    r#"{{"sessionId":"{GEMINI}","projectHash":"h","startTime":"2026-10-18T06:40:00.000Z","lastUpdated":"2026-10-18T06:40:00.000Z","kind":"main"}}"#
+                ),
+                r#"{"id":"u1","timestamp":"2026-10-18T06:41:00.000Z","type":"user","content":[{"text":"remember DELTA-FOUR"}]}"#,
+                r#"{"id":"g1","timestamp":"2026-10-18T06:41:01.000Z","type":"gemini","content":"ok"}"#,
+            ),
+        )
+        .expect("a session file");
+        assert_eq!(
+            here.resume_line().as_deref(),
+            Some(
+                format!(
+                    "cd /Users//me/proj && GEMINI_CLI_HOME=/Users//me/g gemini --resume {GEMINI}"
+                )
+                .as_str()
+            ),
+            "Gemini CLI's own resume, in its project, behind its home"
+        );
+        let back = here
+            .clone()
+            .snapshot("s-new".into(), 6161)
+            .expect("relaunched by its lane");
+        assert_eq!(back.agent(), Agent::Gemini);
+        assert_eq!(back.session.as_deref(), Some(GEMINI));
+        assert_eq!(back.cwd, "/Users//me/proj");
+        assert_eq!(
+            back.gemini().map(|run| (
+                run.home.clone(),
+                run.chats.clone(),
+                run.env.clone(),
+                run.started_ms,
+                run.child,
+                run.block
+            )),
+            Some((
+                PathBuf::from("/Users//me/g/.gemini"),
+                Some(PathBuf::from(&chats_dir)),
+                vec![("GEMINI_CLI_HOME".to_string(), "/Users//me/g".to_string())],
+                1_792_261_698_000,
+                0,
+                None
+            )),
+            "its run back, its start carried, its child and block never"
+        );
+        assert_eq!(
+            aterm_toml::to_string(&here).expect("written back"),
+            lane,
+            "read and written back as written"
+        );
+        let unproven = wire(&Snapshot {
+            session: None,
+            ..gemini.clone()
+        });
+        let unproven: AgentRestore = aterm_toml::from_str(&unproven).expect("read");
+        assert_eq!(unproven.agent(), Some(Agent::Gemini));
+        assert!(!unproven.resumes() && unproven.resume_line().is_none());
+        for other in [
+            "[agy]\nconfig = \"/Users//me/.gemini/antigravity-cli\"\n",
+            "[codex]\nhome = \"/Users//me/.codex\"\nembedded = true\nstarted_ms = 1\n",
+        ] {
+            let both = format!("{}\n{other}", lane.trim_end());
+            assert!(
+                aterm_toml::from_str::<AgentRestore>(&both).is_err(),
+                "AMBIGUOUS_AGENT_RUN_TABLES_MUST_NOT_RESUME_AS_CLAUDE: {both}"
+            );
+        }
+        // NEGATIVE CONTROL: its session in `session` is a leaf 0.104.0
+        // relaunches, as Claude Code.
+        let in_session = format!("{}word = \"gemini\"\n", wire(&claude));
         let old = aterm_toml::from_str::<AgentRestore0104>(&in_session).expect("0.104.0");
         assert_eq!((agent_0104(&old), resumes_0104(&old)), ("claude", true));
     }

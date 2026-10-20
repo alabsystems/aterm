@@ -455,15 +455,15 @@ pub fn install(
     let installed = layout.agent().join(&rel);
     link_exe(sys, layout, &installed)?;
     chain::check(sys, &layout.exe_link())?;
-    let _ = writeln!(out, "agent: {}", installed.display());
+    // The lines below are what the owner reads at enrollment: what changes for them, in
+    // plain words. Where each thing lives is the design's (§3.2) and `managed.toml`'s.
     let digest = sys.sha256(&installed).map_err(|e| io(&installed, e))?;
     let sudoers = check_sudoers(sys, layout, &args.admin, &digest)?;
     sys.write_file(Path::new(crate::SUDOERS_FILE), sudoers.as_bytes(), 0o440)
         .map_err(|e| io(Path::new(crate::SUDOERS_FILE), e))?;
     let _ = writeln!(
         out,
-        "sudoers: {} (sha256:{digest}, checked by visudo)",
-        crate::SUDOERS_FILE
+        "allowed aterm's helper, and only it, to make admin changes without a password"
     );
     let previous = state::managed(sys, layout).ok();
     let managed = Managed {
@@ -494,8 +494,8 @@ pub fn install(
     )?;
     let _ = writeln!(
         out,
-        "authorized_keys: {} (fleet key, forced command)",
-        keys.display()
+        "this Mac now lets the controller in with its own key, which can only talk to \
+         aterm's helper"
     );
     // Last: this file makes the Mac enrolled (a later install refuses), and until it
     // exists no envelope verifies, so the rule and the key above admit nothing yet. A
@@ -504,14 +504,34 @@ pub fn install(
     state::inherit_floors(sys, layout, &principals)?;
     sys.write_file(&layout.allowed_signers(), signers.as_bytes(), 0o644)
         .map_err(|e| io(&layout.allowed_signers(), e))?;
-    let _ = writeln!(out, "allowed signers: {}", principals.join(", "));
+    let _ = writeln!(
+        out,
+        "this Mac now takes changes only from {}",
+        signed_by(&principals)
+    );
     let _ = super::remove_tree(sys, &layout.staging());
     let _ = writeln!(
         out,
-        "installed aterm machines agent {}",
+        "installed aterm's helper {}",
         env!("CARGO_PKG_VERSION")
     );
     Ok(())
+}
+
+/// Who `principals` (`signing@m14`, `recovery@m14`) are, as the owner knows them: the
+/// controllers they name (`the controller m14`), each once.
+fn signed_by(principals: &[String]) -> String {
+    let mut hosts: Vec<&str> = Vec::new();
+    for p in principals {
+        let host = p.split_once('@').map_or(p.as_str(), |(_, h)| h);
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    match hosts.as_slice() {
+        [one] => format!("the controller {one}"),
+        _ => format!("the controllers {}", hosts.join(", ")),
+    }
 }
 
 /// The `uninstall` envelope (design §4.2): each user's `aterm_github` key, the
@@ -528,18 +548,20 @@ pub fn uninstall(
     let started = sys.now();
     let facts = crate::facts::gather(sys);
     let mut rows: Vec<ItemReport> = Vec::new();
-    let mut step = |id: &str, title: &str, done: Result<Option<String>, String>| {
+    // Each step says whether it removed anything: a key a user never had is `ok`, never a
+    // change.
+    let mut step = |id: &str, title: &str, done: Result<bool, String>| {
         let row = ItemReport {
             id: id.to_owned(),
             family: "agent".to_owned(),
             title: title.to_owned(),
-            outcome: if done.is_ok() {
-                Outcome::Changed
-            } else {
-                Outcome::Failed
+            outcome: match done {
+                Ok(true) => Outcome::Changed,
+                Ok(false) => Outcome::Ok,
+                Err(_) => Outcome::Failed,
             },
             from: None,
-            to: done.as_ref().ok().cloned().flatten(),
+            to: None,
             why: done.err(),
             revert: None,
             effect: Effect::Now,
@@ -553,21 +575,22 @@ pub fn uninstall(
         let key = Path::new(&user.home).join(".ssh/aterm_github_ed25519");
         let mut public = key.clone().into_os_string();
         public.push(".pub");
+        // `rm -v` names each file it removed, so nothing printed is nothing there.
         let ran = sys.run(
             &Cmd::new("/bin/rm")
-                .arg("-f")
+                .arg("-fv")
                 .arg(key.as_os_str())
                 .arg(public)
                 .as_user(user),
         );
         let done = match ran {
-            Ok(r) if r.success() => Ok(None),
+            Ok(r) if r.success() => Ok(!r.out().trim().is_empty()),
             Ok(r) => Err(r.describe()),
             Err(e) => Err(e.to_string()),
         };
         step(
             &format!("uninstall.github-key@{}", user.name),
-            "the aterm_github key",
+            &format!("aterm's GitHub key for {}", user.name),
             done,
         );
     }
@@ -579,11 +602,11 @@ pub fn uninstall(
         if stripped != current {
             put_as(sys, layout, exe, admin, &keys, stripped.as_bytes(), 0o600)?;
         }
-        Ok(Some(keys.display().to_string()))
+        Ok(stripped != current)
     });
     step(
         "uninstall.authorized-keys",
-        "the fleet key's authorized_keys line",
+        "the controller's key, which let it in without a password",
         keys_done,
     );
     // The upload inbox `put` made in the admin's home, removed as the admin.
@@ -592,23 +615,28 @@ pub fn uninstall(
         let ran = sys
             .run(
                 &Cmd::new("/bin/rm")
-                    .arg("-rf")
+                    .arg("-rfv")
                     .arg(dir.as_os_str())
                     .as_user(admin),
             )
             .map_err(|e| e.to_string())?;
         if ran.success() {
-            Ok(Some(dir.display().to_string()))
+            Ok(!ran.out().trim().is_empty())
         } else {
             Err(ran.describe())
         }
     });
-    step("uninstall.inbox", "the admin's upload inbox", inbox_done);
-    let sudoers = sys
-        .remove(Path::new(crate::SUDOERS_FILE))
-        .map(|()| Some(crate::SUDOERS_FILE.to_owned()))
-        .map_err(|e| e.to_string());
-    step("uninstall.sudoers", "the sudoers rule", sudoers);
+    step("uninstall.inbox", "aterm's upload folder", inbox_done);
+    let rule = Path::new(crate::SUDOERS_FILE);
+    let sudoers = match sys.stat(rule) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        _ => sys.remove(rule).map(|()| true).map_err(|e| e.to_string()),
+    };
+    step(
+        "uninstall.sudoers",
+        "the rule that let aterm's helper make admin changes",
+        sudoers,
+    );
     let report = HostReport {
         schema: crate::SCHEMA,
         mode: Mode::Apply,
@@ -1006,6 +1034,86 @@ mod tests {
         assert!(ids.contains(&"uninstall.authorized-keys"), "{ids:?}");
         assert!(ids.contains(&"uninstall.inbox"), "{ids:?}");
         assert_eq!(report.serial, 9);
+    }
+
+    #[test]
+    fn uninstall_says_ok_for_what_was_never_there_and_changed_only_for_what_it_removed() {
+        // The rehearsal: an `unenroll` of a Mac that was only ever renamed printed `Changed
+        // uninstall.github-key@admin`, though no GitHub key had been made there.
+        let fake = Fake::root();
+        let layout = Layout {
+            root: "/Library/Management/aterm".into(),
+        };
+        fake.file("/Library/Management/aterm/managed.toml", b"schema = 1\nadmin = \"admin\"\npayload_sha256 = \"\"\nagent_version = \"\"\nexecutable = \"agent/x\"\ninstalled = 0\n");
+        fake.file("/etc/sudoers.d/aterm-machines", b"rule");
+        let admin = admin();
+        // `rm -fv` printed nothing (no key), and `rm -rfv` named the inbox it removed.
+        fake.on(
+            "admin$ /bin/rm -fv /Users//admin/.ssh/aterm_github_ed25519 /Users//admin/.ssh/aterm_github_ed25519.pub",
+            Ran::ok(""),
+        )
+        .on(
+            "admin$ /bin/rm -rfv /Users//admin/Library/Caches/aterm-machines",
+            Ran::ok("/Users//admin/Library/Caches/aterm-machines\n"),
+        )
+        .on(
+            "admin$ /bin/cat /Users//admin/.ssh/authorized_keys",
+            Ran::ok("ssh-ed25519 OWNKEY admin@laptop\n"),
+        );
+        // The VM's one person, admin (dscl's answers there).
+        fake.on(
+            "/usr/bin/dscl . -list /Users UniqueID",
+            Ran::ok("admin                    501\nroot                     0\n"),
+        )
+        .on(
+            "/usr/bin/dscl . -read /Groups/admin GroupMembership",
+            Ran::ok("GroupMembership: root admin\n"),
+        )
+        .on(
+            "/usr/bin/dscl . -read /Users//admin UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
+            Ran::ok(&format!(
+                "NFSHomeDirectory: {}\nPrimaryGroupID: 20\nUniqueID: 501\nUserShell: /bin/zsh\n",
+                admin.home
+            )),
+        );
+        let opened = Opened {
+            envelope: crate::envelope::parse_body(
+                b"schema = 1\nhost = \"U\"\nhost_name = \"h\"\nserial = 9\nissued = 1\nexpires = 2\naction = \"uninstall\"\n",
+            )
+            .unwrap(),
+            principal: "signing@ctl".into(),
+            key_id: String::new(),
+        };
+        let mut out = Vec::new();
+        let _ = uninstall(
+            &fake,
+            &layout,
+            Path::new("/Library/Management/aterm/bin/aterm"),
+            &opened,
+            "1-9",
+            &mut out,
+        );
+        let text = String::from_utf8(out).unwrap();
+        let Line::Report(report) = aterm_json::from_str(text.lines().last().unwrap()).unwrap()
+        else {
+            panic!("{text}");
+        };
+        let outcome = |id: &str| {
+            report
+                .items
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| r.outcome)
+                .unwrap_or_else(|| panic!("{id}: {:#?}", report.items))
+        };
+        assert_eq!(outcome("uninstall.github-key@admin"), Outcome::Ok);
+        assert_eq!(
+            outcome("uninstall.authorized-keys"),
+            Outcome::Ok,
+            "no line of ours"
+        );
+        assert_eq!(outcome("uninstall.inbox"), Outcome::Changed);
+        assert_eq!(outcome("uninstall.sudoers"), Outcome::Changed);
     }
 
     #[test]

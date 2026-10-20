@@ -4,7 +4,7 @@
 //! Tier-0 of `CrashRestoreJournal`, the crash-restore journal (the crash-restore plan §7.1):
 //! proved at `Buggy = 0` with every action firing, each of the six defects caught on the
 //! invariant written for it, and the hand-traced counterexamples walked step by step. Tier-1 is
-//! `aterm-restore/src/conformance_region_tests.rs`.
+//! `aterm-restore/src/conformance_region.rs`.
 
 use aterm_models_session::crash_restore_journal_model;
 use aterm_spec::walk::{only, walk};

@@ -281,3 +281,64 @@ const ZWJ_TAIL: &str = "\u{1F4BB}x";
 /// A complete flag, two regional indicators (U+1F1FA U+1F1F8): an RI after it
 /// starts a pair of its own.
 const FLAG: &str = "\u{1F1FA}\u{1F1F8}";
+
+/// `payload` in tmux's passthrough wrapper, every ESC doubled, as a program that finds
+/// `TMUX` in its environment writes it.
+fn tmux_wrapped(payload: &[u8]) -> Vec<u8> {
+    let mut out = b"\x1bPtmux;".to_vec();
+    for &byte in payload {
+        if byte == 0x1B {
+            out.push(0x1B);
+        }
+        out.push(byte);
+    }
+    out.extend_from_slice(b"\x1b\\");
+    out
+}
+
+/// A tmux passthrough wrapper that reached aterm itself (a tab that inherited `TMUX`
+/// with no tmux in it; `aterm_parser::TmuxPassthrough`) rides the handoff wherever the
+/// outgoing read stopped: in the wrapper's head, inside it, at the ESC whose follower
+/// decides, inside the payload's own sequence. Through either restore door the successor
+/// draws the same screen and title as one engine fed the whole stream, and answers the
+/// wrapped query once. A cut inside that query is left out of the comparison: no carry
+/// holds a query's reply, and the handoff abandons it as it abandons a bare one.
+#[test]
+fn a_tmux_wrapper_split_anywhere_is_read_as_it_would_have_been() {
+    let stream = [
+        &b"one\r\n"[..],
+        &tmux_wrapped(b"\x1b]2;wrapped\x1b\\")[..],
+        &tmux_wrapped(b"\x1b[3;5Hmid")[..],
+        &tmux_wrapped(b"\x1bP$qm\x1b\\")[..],
+        b"\r\nafter",
+    ]
+    .concat();
+    let mut reference = never_handed_over(&stream, b"");
+    let reply = reference.take_response();
+    assert!(reply.is_some(), "the wrapped query is answered");
+    let want = screen(&reference);
+    assert_eq!(reference.title(), "wrapped");
+    for cut in 0..=stream.len() {
+        let mut outgoing = Terminal::new(ROWS, COLS);
+        outgoing.process(&stream[..cut]);
+        let abandoned = outgoing.checkpoint_carry_abandoning_partial(0).1;
+        let early = outgoing.take_response();
+        for (door, mut successor) in [
+            ("adopted", handed_over(&stream[..cut], &stream[cut..])),
+            (
+                "rebuilt",
+                rebuilt_from_carry(&stream[..cut], &stream[cut..]),
+            ),
+        ] {
+            if abandoned.is_none() {
+                assert_eq!(screen(&successor), want, "{door} cut {cut}");
+                assert_eq!(successor.title(), "wrapped", "{door} cut {cut}");
+                assert_eq!(
+                    early.clone().or_else(|| successor.take_response()),
+                    reply,
+                    "{door} cut {cut}: the wrapped query is answered once"
+                );
+            }
+        }
+    }
+}

@@ -21,6 +21,7 @@ use core::ffi::{
 // ---------------------------------------------------------------- types
 pub type blkcnt_t = i64;
 pub type blksize_t = i32;
+pub type boolean_t = c_uint;
 pub type cc_t = c_uchar;
 pub type clockid_t = c_uint;
 pub type dev_t = i32;
@@ -47,6 +48,8 @@ pub type nfds_t = c_uint;
 pub type nlink_t = u16;
 pub type off_t = i64;
 pub type pid_t = i32;
+pub type processor_flavor_t = c_int;
+pub type processor_info_array_t = *mut integer_t;
 pub type pthread_t = uintptr_t;
 pub type rlim_t = u64;
 pub type rusage_info_t = *mut c_void;
@@ -62,6 +65,10 @@ pub type tcflag_t = c_ulong;
 pub type time_t = c_long;
 pub type uid_t = u32;
 pub type uintptr_t = usize;
+pub type vm_address_t = vm_offset_t;
+pub type vm_map_t = mach_port_t;
+pub type vm_offset_t = uintptr_t;
+pub type vm_size_t = uintptr_t;
 pub type vm_statistics64_t = *mut vm_statistics64;
 
 /// Opaque to callers: libc exposes this as an uninhabited type.
@@ -278,6 +285,13 @@ pub struct proc_bsdinfo {
     pub pbi_nice: i32,
     pub pbi_start_tvsec: u64,
     pub pbi_start_tvusec: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "extra_traits", derive(PartialEq, Eq, Hash))]
+pub struct processor_cpu_load_info {
+    pub cpu_ticks: [c_uint; 4],
 }
 
 /// opaque in libc: 48 bytes, align 8
@@ -629,6 +643,17 @@ pub struct winsize {
     pub ws_col: c_ushort,
     pub ws_xpixel: c_ushort,
     pub ws_ypixel: c_ushort,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "extra_traits", derive(PartialEq, Eq, Hash))]
+pub struct xsw_usage {
+    pub xsu_total: u64,
+    pub xsu_avail: u64,
+    pub xsu_used: u64,
+    pub xsu_pagesize: u32,
+    pub xsu_encrypted: boolean_t,
 }
 
 #[repr(C)]
@@ -1054,6 +1079,7 @@ pub const POLLWRNORM: c_short = 0x004;
 pub const PRIO_PGRP: c_int = 1;
 pub const PRIO_PROCESS: c_int = 0;
 pub const PRIO_USER: c_int = 2;
+pub const PROCESSOR_CPU_LOAD_INFO: c_int = 2;
 pub const PROC_PIDPATHINFO_MAXSIZE: c_int = 4096;
 pub const PROC_PIDTBSDINFO: c_int = 3;
 pub const PROT_EXEC: c_int = 4;
@@ -1411,6 +1437,13 @@ unsafe extern "C" {
         flags: c_int,
     ) -> ssize_t;
     pub fn grantpt(fd: c_int) -> c_int;
+    pub fn host_processor_info(
+        host: host_t,
+        flavor: processor_flavor_t,
+        out_processor_count: *mut natural_t,
+        out_processor_info: *mut processor_info_array_t,
+        out_processor_infoCnt: *mut mach_msg_type_number_t,
+    ) -> kern_return_t;
     pub fn host_statistics(
         host_priv: host_t,
         flavor: host_flavor_t,
@@ -1674,6 +1707,11 @@ unsafe extern "C" {
         flag: c_int,
     ) -> c_int;
     pub fn utimes(filename: *const c_char, times: *const timeval) -> c_int;
+    pub fn vm_deallocate(
+        target_task: vm_map_t,
+        address: vm_address_t,
+        size: vm_size_t,
+    ) -> kern_return_t;
     pub fn waitid(idtype: idtype_t, id: id_t, infop: *mut siginfo_t, options: c_int) -> c_int;
     pub fn waitpid(pid: pid_t, status: *mut c_int, options: c_int) -> pid_t;
     pub fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t;

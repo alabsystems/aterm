@@ -37,6 +37,16 @@
 //!   over every window. A slow `present_latency` with a fast `present_glass` was
 //!   the main thread; a slow `present_glass` was the compositor. A drawable never
 //!   shown counts in `present_glass_skipped`, not in the distribution.
+//! - `gpu_time` (`n_gpu_time` and `gpu_time_p50/p95/p99_ms`) sums completed
+//!   Metal command-buffer or wgpu render-pass execution spans per present, including
+//!   virtual presents. `gpu_time_source=device` names observed device samples;
+//!   `unobserved` means a supported host has no sample, and `unsupported`
+//!   means this build has no device clock wired. A wgpu device must grant
+//!   timestamp queries. GL contributes no device samples; an empty
+//!   distribution is not measured zero time.
+//!   CPU encode is a separate distribution. `passes_last`, built instances
+//!   and bytes describe the last encoded offscreen after a successful GPU
+//!   present, which may reuse it; these are not transfer-completion counts.
 //! - `last_/max_frame_render_ns` — causal CPU wall time: compose plus CPU
 //!   raster/copy, or time spent encoding GPU commands and calling `queue.submit`,
 //!   most recent and worst-since-reset. This is not completed GPU execution;
@@ -128,7 +138,7 @@
 //! responsiveness audit items 2, 3 and 5).
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static FRAMES_PRESENTED: AtomicU64 = AtomicU64::new(0);
@@ -353,6 +363,9 @@ static FX_GLOW_QUADS_LAST: AtomicU64 = AtomicU64::new(0);
 static FX_UNDER_QUADS_LAST: AtomicU64 = AtomicU64::new(0);
 static FX_TRAIL_CELLS_LAST: AtomicU64 = AtomicU64::new(0);
 static FX_UNDER_FRAMES: AtomicU64 = AtomicU64::new(0);
+// Count the final composed input for every effect producer, on either renderer.
+static FX_STREAMS_LAST: [AtomicU64; FX_STREAMS.len()] =
+    [const { AtomicU64::new(0) }; FX_STREAMS.len()];
 // …and WHICH continuity clause refused, per clause. `frame_refills_full` says
 // the chain broke; this says what broke it, which is the difference between an
 // actionable number and a worrying one — a host mutator that forgot its
@@ -667,6 +680,13 @@ pub(crate) fn now_ns() -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// How many frames this process has presented (the `metrics` verb's
+/// `frames_presented`, zeroed by `metrics reset`): the present ordinal the
+/// card engine's dev timeline rows carry (`crate::holder_image::dev_tail`).
+pub(crate) fn frames_presented() -> u64 {
+    FRAMES_PRESENTED.load(Ordering::Acquire)
+}
+
 /// The `Instant` a [`now_us`] stamp was read at — this clock's exact inverse,
 /// floored to the microsecond the stamp kept. The clock is
 /// `PROCESS_START.elapsed()`, so every stamp is an offset from ONE fixed anchor
@@ -802,10 +822,11 @@ deadline_owners! {
     /// THIS observer, was reported as `title_summary` and cost the
     /// investigation its first hour on the wrong module.
     SessionStatus = 35 => "session_status",
-    /// PRESENCE (`crate::presence`): the band's `since` text tick (once a
-    /// second while it prints seconds, once a minute after) and the nine steps
-    /// of the turn-submit ripple — armed only while a band row or a ripple is
-    /// up. A quiet window folds nothing here (`presence_fp == 0`).
+    /// PRESENCE (`crate::presence`, `drive::deadline`): a visible background
+    /// pill's age figure (once a second while it prints seconds, once a
+    /// minute after), a cooperative lease's or a supervisor claim's lapse,
+    /// and an owed notification — armed only while one stands. A quiet
+    /// desktop folds nothing here (`presence_fp == 0`).
     Presence = 37 => "presence",
     /// The late park's gate re-run (`App::try_park_for_prelaunched_successor`):
     /// a prelaunched update attempt waiting for a quiet moment to park.
@@ -898,7 +919,10 @@ deadline_owners! {
     /// `RECHECK_EVERY` and only while an aterm window is focused; the helper
     /// panel's turn every `PANEL_TICK` while it is up (placement, System
     /// Settings still running, one list read); and a worker's slot re-read
-    /// while one is out. Nothing waiting and no panel arm nothing.
+    /// while one is out. The folder warm-up's launch look and the once-per-Mac
+    /// debugger-access launch ask's next look (owner ruling O29) fold under it
+    /// too, each only while an aterm window is focused. Nothing waiting and no
+    /// panel arm nothing.
     DevToolsHandOver = 49 => "devtools_hand_over",
     /// THE HARNESS CARD (`crate::claude_card`, design
     /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §3): a frame ahead while
@@ -939,6 +963,16 @@ deadline_owners! {
     /// parked mark's second, the warm run's `T_READY`, the ages). A parked or
     /// ready spare on an idle machine arms only its age. 55: the next free slot.
     Spare = 55 => "spare",
+    /// AN OUTPUT HOLD's release (`App::release_output_holds`,
+    /// `spawn::OUTPUT_CADENCE_NS`): one wake at the instant a streaming
+    /// session's hold falls due, to run the pass for what its reader fed under
+    /// it. Armed only while output streams; a quiet session holds nothing.
+    /// 56: the next free slot.
+    OutputCadence = 56 => "output_cadence",
+    /// THE STATS DECK's next reading (`crate::vitals_host`): one a second while
+    /// a focused window shows the Deck, one every five seconds in the
+    /// background, none while no window shows it. 57: the next free slot.
+    SystemVitals = 57 => "system_vitals",
 }
 
 /// Winit's reason for starting the current event-loop iteration.
@@ -991,6 +1025,7 @@ pub(crate) enum PresentDropReason {
     CpuCommit = 7,
     TargetMismatch = 8,
     Virtual = 9,
+    CpuRaster = 10,
 }
 
 impl PresentDropReason {
@@ -1005,6 +1040,7 @@ impl PresentDropReason {
             7 => Self::CpuCommit,
             8 => Self::TargetMismatch,
             9 => Self::Virtual,
+            10 => Self::CpuRaster,
             _ => Self::None,
         }
     }
@@ -1022,6 +1058,7 @@ impl PresentDropReason {
             Self::CpuCommit => "cpu_commit",
             Self::TargetMismatch => "target_mismatch",
             Self::Virtual => "virtual",
+            Self::CpuRaster => "cpu_raster",
         }
     }
 
@@ -1647,10 +1684,14 @@ pub(crate) enum ClaimStamp {
     ConfigJoined,
     /// The `App` was built.
     AppBuilt,
+    /// The warm prologue has returned (or was joined), and the launch font and grid
+    /// are resolved: session 0's preparation, and where it opens a display the event
+    /// loop's build (`main_entry`'s `loop_before_session0`), begins.
+    Warmed,
 }
 
 impl ClaimStamp {
-    const COUNT: usize = 14;
+    const COUNT: usize = 15;
 }
 
 /// The earliest in-process instant this process stamped: the shipped binary's
@@ -1758,11 +1799,13 @@ fn claim_timeline_points(inputs: &ClaimTimelineInputs) -> Vec<ClaimPoint> {
         ("park", inputs.park),
         ("intake", own(ClaimStamp::Intake)),
         ("worker_spawn", inputs.worker_spawn),
+        // Session 0 before the event loop's build: the boot order wherever a
+        // claim is published (macOS, whose build opens no display before it).
+        ("journal", own(ClaimStamp::Journal)),
+        ("adopt0", own(ClaimStamp::Adopt0)),
         ("loop_build", own(ClaimStamp::LoopBuild)),
         ("event_loop", own(ClaimStamp::EventLoopBuilt)),
         ("services", own(ClaimStamp::Services)),
-        ("journal", own(ClaimStamp::Journal)),
-        ("adopt0", own(ClaimStamp::Adopt0)),
         ("control", own(ClaimStamp::Control)),
         ("config_joined", own(ClaimStamp::ConfigJoined)),
         ("app_built", own(ClaimStamp::AppBuilt)),
@@ -1936,8 +1979,9 @@ pub(crate) fn handoff_claim_fields_json() -> String {
 // [`ClaimStamp`]s cut it into ten exclusive phases on every launch — headless
 // too, whose preparation is the same code up to the event loop's run — read
 // live like the first reveal, so a launch that never presents still answers.
-// Valid only when every cut exists in boot order; the ten then sum to the
-// parent exactly, which `verify perf start` reconciles.
+// Valid only when every cut exists in one of the boot's two orders (session 0
+// before the event loop's build, or after it where the build opens a display);
+// the ten then sum to the parent exactly, which `verify perf start` reconciles.
 
 /// Wire schema for the exclusive split of GUI entry → ready for winit.
 pub(crate) const STARTUP_PREPARE_SCHEMA: u64 = 1;
@@ -1946,26 +1990,31 @@ pub(crate) const STARTUP_PREPARE_SCHEMA: u64 = 1;
 ///
 /// * `boot`: GUI entry → the intake. The CLI, the logger, the boot apply,
 ///   containment; on a handoff, the claim's hold and the intake's checks.
-/// * `warm`: → the event loop's build. The warm prologue or its join, the
-///   launch font and grid.
+/// * `warm`: → the warm's end. The warm prologue or its join, the launch font
+///   and grid.
+/// * `journal`: → the restore take and the crash-journal claim. The session
+///   factory and the PTY keeper's boot hello before them.
+/// * `session0`: → session 0 spawned or adopted.
 /// * `event_loop`: → built. On a macOS window, `NSApplication` and its
 ///   WindowServer connection; headless, the display-free loop.
 /// * `services`: → the config watcher, update checker and package update check
 ///   started.
-/// * `journal`: → the restore take and the crash-journal claim.
-/// * `session0`: → session 0 spawned or adopted.
 /// * `control`: → the control socket planned and spawned.
 /// * `config_join`: → the config-runtime worker joined. The supervisor host,
 ///   the first window's state, and the join's wait.
 /// * `app`: → the `App` built. The config notices, the native lanes.
 /// * `arm`: → ready for winit. The `App`'s last wiring and the watchdog.
+///
+/// A launch whose event loop opens a display builds it first instead, between
+/// `warm` and `journal` ([`LOOP_FIRST_CUTS`]); its phases are published under
+/// the same names.
 pub(crate) const STARTUP_PREPARE_PHASES: [&str; PREPARE_PHASES] = [
     "boot",
     "warm",
-    "event_loop",
-    "services",
     "journal",
     "session0",
+    "event_loop",
+    "services",
     "control",
     "config_join",
     "app",
@@ -1977,15 +2026,44 @@ const PREPARE_PHASES: usize = 10;
 /// The cuts between GUI entry and ready for winit, in boot order.
 const STARTUP_PREPARE_CUTS: [ClaimStamp; PREPARE_PHASES - 1] = [
     ClaimStamp::Intake,
-    ClaimStamp::LoopBuild,
-    ClaimStamp::EventLoopBuilt,
-    ClaimStamp::Services,
+    ClaimStamp::Warmed,
     ClaimStamp::Journal,
     ClaimStamp::Adopt0,
+    ClaimStamp::EventLoopBuilt,
+    ClaimStamp::Services,
     ClaimStamp::Control,
     ClaimStamp::ConfigJoined,
     ClaimStamp::AppBuilt,
 ];
+
+/// The cuts of a launch that builds its event loop before session 0 (a free-unix
+/// window, whose build opens the display: `main_entry`'s `loop_before_session0`).
+/// Its phases come as `boot`, `warm`, `event_loop`, `journal`, `session0`, then as
+/// [`STARTUP_PREPARE_CUTS`]'s.
+const LOOP_FIRST_CUTS: [ClaimStamp; PREPARE_PHASES - 1] = [
+    ClaimStamp::Intake,
+    ClaimStamp::Warmed,
+    ClaimStamp::EventLoopBuilt,
+    ClaimStamp::Journal,
+    ClaimStamp::Adopt0,
+    ClaimStamp::Services,
+    ClaimStamp::Control,
+    ClaimStamp::ConfigJoined,
+    ClaimStamp::AppBuilt,
+];
+
+/// The split of whichever boot order `stamp` was taken in ([`STARTUP_PREPARE_CUTS`],
+/// else [`LOOP_FIRST_CUTS`]), its phases in [`STARTUP_PREPARE_PHASES`]' order.
+fn derive_startup_prepare_of(
+    entry: Option<Instant>,
+    stamp: impl Fn(ClaimStamp) -> Option<Instant>,
+    ready: Option<Instant>,
+) -> Option<[u64; PREPARE_PHASES]> {
+    derive_startup_prepare(entry, STARTUP_PREPARE_CUTS.map(&stamp), ready).or_else(|| {
+        derive_startup_prepare(entry, LOOP_FIRST_CUTS.map(&stamp), ready)
+            .map(|p| [p[0], p[1], p[3], p[4], p[2], p[5], p[6], p[7], p[8], p[9]])
+    })
+}
 
 /// The phases between `entry`, the `cuts` and `ready`, in ns, or `None`
 /// unless every boundary exists in that order.
@@ -2010,9 +2088,9 @@ fn derive_startup_prepare(
 }
 
 fn startup_prepare_sample(gui_prepare_ns: u64) -> Option<[u64; PREPARE_PHASES]> {
-    derive_startup_prepare(
+    derive_startup_prepare_of(
         PROCESS_START.get().copied(),
-        STARTUP_PREPARE_CUTS.map(|cut| CLAIM_STAMPS[cut as usize].get().copied()),
+        |cut| CLAIM_STAMPS[cut as usize].get().copied(),
         GUI_READY_FOR_WINIT.get().copied(),
     )
     // The control thread can read the parent just before readiness is
@@ -3203,10 +3281,175 @@ fn tag_pairs(
         .collect()
 }
 
-/// Install this ledger as `aterm_gpu`'s present→glass sink, once per process at
-/// GUI entry. Until it runs no presented handler is registered at all.
+/// Install the compositor and device-execution ledgers once at GUI entry.
+/// Until then neither Metal timing handler is registered.
 pub(crate) fn install_present_glass_sink() {
     let _ = aterm_gpu::present_glass::install_sink(note_present_glass);
+    let _ = aterm_gpu::gpu_time::install_sink(note_gpu_time);
+}
+
+// Device execution is separate from CPU encode and compositor timing. A supported
+// backend supplies it; no synthetic zero sample stands in for a missing clock.
+static H_GPU_TIME: Histogram = Histogram::new();
+static LAST_GPU_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static MAX_GPU_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static LAST_GPU_TIME_PARTS: AtomicU64 = AtomicU64::new(0);
+static H_GPU_ENCODE: Histogram = Histogram::new();
+static LAST_GPU_ENCODE_NS: AtomicU64 = AtomicU64::new(0);
+static LAST_GPU_PASSES: AtomicU64 = AtomicU64::new(0);
+static LAST_GPU_INSTANCE_BYTES: AtomicU64 = AtomicU64::new(0);
+static LAST_GPU_BUILD_NS: AtomicU64 = AtomicU64::new(0);
+static LAST_GPU_STAGE_NS: AtomicU64 = AtomicU64::new(0);
+// The pass-economy ablation the frame ran under (`aterm_gpu::UnormAblation`,
+// a dev seam), as its index in `UNORM_ABLATIONS`: `off` in every shipped
+// binary, so a reading that says otherwise names a build measuring itself.
+static LAST_GPU_UNORM_ABLATION: AtomicU8 = AtomicU8::new(0);
+const UNORM_ABLATIONS: [aterm_gpu::UnormAblation; 3] = [
+    aterm_gpu::UnormAblation::Off,
+    aterm_gpu::UnormAblation::Drop,
+    aterm_gpu::UnormAblation::Thin,
+];
+static LAST_GPU_INSTANCES: [AtomicU64; aterm_gpu::FrameShape::STREAMS.len()] =
+    [const { AtomicU64::new(0) }; aterm_gpu::FrameShape::STREAMS.len()];
+
+/// Called on a Metal completion thread, or on the UI thread when the wgpu arm
+/// harvests its timestamp readback: the existing metrics histogram owns the
+/// distribution; no UI lock, allocation or application callback is needed.
+fn note_gpu_time(frame: aterm_gpu::gpu_time::GpuFrameTime) {
+    H_GPU_TIME.record(frame.gpu_ns);
+    LAST_GPU_TIME_NS.store(frame.gpu_ns, Ordering::Relaxed);
+    MAX_GPU_TIME_NS.fetch_max(frame.gpu_ns, Ordering::Relaxed);
+    LAST_GPU_TIME_PARTS.store(u64::from(frame.parts), Ordering::Relaxed);
+}
+
+/// Snapshot after a successful GPU present, including virtual presents. The
+/// shape describes the latest encoded offscreen, which a present can reuse;
+/// instance bytes are built bytes, not proof of successful device transfer.
+pub(crate) fn note_gpu_frame(shape: aterm_gpu::FrameShape, encode_ns: u64) {
+    H_GPU_ENCODE.record(encode_ns);
+    LAST_GPU_ENCODE_NS.store(encode_ns, Ordering::Relaxed);
+    LAST_GPU_PASSES.store(u64::from(shape.passes), Ordering::Relaxed);
+    LAST_GPU_INSTANCE_BYTES.store(shape.instance_bytes, Ordering::Relaxed);
+    LAST_GPU_BUILD_NS.store(shape.build_ns, Ordering::Relaxed);
+    LAST_GPU_STAGE_NS.store(shape.stage_ns, Ordering::Relaxed);
+    let ablation = UNORM_ABLATIONS
+        .iter()
+        .position(|&mode| mode == shape.ablation)
+        .unwrap_or(0);
+    LAST_GPU_UNORM_ABLATION.store(ablation as u8, Ordering::Relaxed);
+    for (slot, count) in LAST_GPU_INSTANCES.iter().zip(shape.instances) {
+        slot.store(u64::from(count), Ordering::Relaxed);
+    }
+}
+
+fn gpu_instance_pairs() -> Vec<(&'static str, u64)> {
+    aterm_gpu::FrameShape::STREAMS
+        .iter()
+        .zip(&LAST_GPU_INSTANCES)
+        .filter_map(|(&name, count)| {
+            let count = count.load(Ordering::Relaxed);
+            (count != 0).then_some((name, count))
+        })
+        .collect()
+}
+
+/// The last frame's ablation word (`off`, `drop`, `thin`).
+fn gpu_unorm_ablation() -> &'static str {
+    UNORM_ABLATIONS
+        .get(usize::from(LAST_GPU_UNORM_ABLATION.load(Ordering::Relaxed)))
+        .copied()
+        .unwrap_or_default()
+        .name()
+}
+
+/// Whether the distribution holds device samples (`device`), or why it holds
+/// none: this build has no device clock (`unsupported`), or no frame was timed
+/// (`unobserved`: no present yet, the CPU fallback, or a wgpu adapter without
+/// timestamp queries).
+fn gpu_time_source(samples: u64) -> &'static str {
+    if !aterm_gpu::gpu_time::SUPPORTED {
+        "unsupported"
+    } else if samples == 0 {
+        "unobserved"
+    } else {
+        "device"
+    }
+}
+
+/// Device execution and CPU encode distributions, with the latest encoded
+/// shape. The device's drop/skip totals are process lifetime; distributions
+/// and the latest shape follow `metrics reset` like the other GUI counters.
+pub(crate) fn gpu_fields_text() -> String {
+    let samples = H_GPU_TIME.count();
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let p = |h: &Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
+    format!(
+        " gpu_time_source={} n_gpu_time={} gpu_time_p50_ms={:.2} gpu_time_p95_ms={:.2} \
+         gpu_time_p99_ms={:.2} last_gpu_time_ms={:.2} max_gpu_time_ms={:.2} \
+         gpu_time_parts_last={} gpu_time_dropped_total={} gpu_time_skipped_total={} \
+         n_gpu_encode={} gpu_encode_p50_ms={:.2} gpu_encode_p95_ms={:.2} \
+         gpu_encode_p99_ms={:.2} gpu_encode_last_ms={:.2} passes_last={} \
+         instances_by_stream={} instance_bytes_last={} gpu_build_last_ms={:.2} \
+         gpu_stage_last_ms={:.2} gpu_unorm_ablation={}",
+        gpu_time_source(samples),
+        samples,
+        p(&H_GPU_TIME, 0.50),
+        p(&H_GPU_TIME, 0.95),
+        p(&H_GPU_TIME, 0.99),
+        ms(LAST_GPU_TIME_NS.load(Ordering::Relaxed)),
+        ms(MAX_GPU_TIME_NS.load(Ordering::Relaxed)),
+        LAST_GPU_TIME_PARTS.load(Ordering::Relaxed),
+        aterm_gpu::gpu_time::dropped(),
+        aterm_gpu::gpu_time::skipped(),
+        H_GPU_ENCODE.count(),
+        p(&H_GPU_ENCODE, 0.50),
+        p(&H_GPU_ENCODE, 0.95),
+        p(&H_GPU_ENCODE, 0.99),
+        ms(LAST_GPU_ENCODE_NS.load(Ordering::Relaxed)),
+        LAST_GPU_PASSES.load(Ordering::Relaxed),
+        sparse_pairs(&gpu_instance_pairs()),
+        LAST_GPU_INSTANCE_BYTES.load(Ordering::Relaxed),
+        ms(LAST_GPU_BUILD_NS.load(Ordering::Relaxed)),
+        ms(LAST_GPU_STAGE_NS.load(Ordering::Relaxed)),
+        gpu_unorm_ablation(),
+    )
+}
+
+/// Field-for-field JSON twin of [`gpu_fields_text`].
+pub(crate) fn gpu_fields_json() -> String {
+    let samples = H_GPU_TIME.count();
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let p = |h: &Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
+    format!(
+        ",\"gpu_time_source\":\"{}\",\"n_gpu_time\":{},\"gpu_time_p50_ms\":{:.2},\
+         \"gpu_time_p95_ms\":{:.2},\"gpu_time_p99_ms\":{:.2},\"last_gpu_time_ms\":{:.2},\
+         \"max_gpu_time_ms\":{:.2},\"gpu_time_parts_last\":{},\"gpu_time_dropped_total\":{},\
+         \"gpu_time_skipped_total\":{},\"n_gpu_encode\":{},\"gpu_encode_p50_ms\":{:.2},\
+         \"gpu_encode_p95_ms\":{:.2},\"gpu_encode_p99_ms\":{:.2},\"gpu_encode_last_ms\":{:.2},\
+         \"passes_last\":{},\"instances_by_stream\":{},\"instance_bytes_last\":{},\
+         \"gpu_build_last_ms\":{:.2},\"gpu_stage_last_ms\":{:.2},\"gpu_unorm_ablation\":\"{}\"",
+        gpu_time_source(samples),
+        samples,
+        p(&H_GPU_TIME, 0.50),
+        p(&H_GPU_TIME, 0.95),
+        p(&H_GPU_TIME, 0.99),
+        ms(LAST_GPU_TIME_NS.load(Ordering::Relaxed)),
+        ms(MAX_GPU_TIME_NS.load(Ordering::Relaxed)),
+        LAST_GPU_TIME_PARTS.load(Ordering::Relaxed),
+        aterm_gpu::gpu_time::dropped(),
+        aterm_gpu::gpu_time::skipped(),
+        H_GPU_ENCODE.count(),
+        p(&H_GPU_ENCODE, 0.50),
+        p(&H_GPU_ENCODE, 0.95),
+        p(&H_GPU_ENCODE, 0.99),
+        ms(LAST_GPU_ENCODE_NS.load(Ordering::Relaxed)),
+        LAST_GPU_PASSES.load(Ordering::Relaxed),
+        sparse_object(&gpu_instance_pairs()),
+        LAST_GPU_INSTANCE_BYTES.load(Ordering::Relaxed),
+        ms(LAST_GPU_BUILD_NS.load(Ordering::Relaxed)),
+        ms(LAST_GPU_STAGE_NS.load(Ordering::Relaxed)),
+        gpu_unorm_ablation(),
+    )
 }
 
 /// Book one presented-handler sample (runs on a Metal/CoreAnimation thread).
@@ -3254,6 +3497,26 @@ pub(crate) const OUTPUT_REDRAW_REQUEST_CAP_NS: u64 = 5_000_000_000;
 // and is counted as cancelled.
 static H_IME_COMPOSE: Histogram = Histogram::new();
 static IME_CANCELLED: AtomicU64 = AtomicU64::new(0);
+// THE MENU-BAR ITEM'S GLANCE: what one build of it costs on the main thread
+// (`App::status_glance`, every session's published verdict and task record),
+// the cost the dirty flag pays once per loop turn rather than
+// once per change (`docs/DESIGN-owner-surfaces-2026-10-16.md` §9 S3).
+static H_STATUS_GLANCE: Histogram = Histogram::new();
+static MAX_STATUS_GLANCE_NS: AtomicU64 = AtomicU64::new(0);
+// ONE SESSION'S NEED PUBLICATION: what one `App::publish_need` costs on the
+// main thread (the host's reach, the session's leaf locks, the classifier and
+// the timeline write), paid at every presence refresh of the session.
+static H_NEED_PUBLISH: Histogram = Histogram::new();
+static MAX_NEED_PUBLISH_NS: AtomicU64 = AtomicU64::new(0);
+// THE TRANSCRIPT APPLY'S HOLD (session log, ruling T31): how long one chunk
+// of a transcript batch holds a session's timeline lock on the footer
+// resolver's thread (`session_log::transcript::apply_batch`), the lock the
+// composer and the sweep take. A full chunk (`CHUNK` events, more to follow)
+// apart from a batch's last hold, which also judges the wall, flushes and
+// takes the wake — a read that found no new rows books that one hold too.
+static H_TX_CHUNK: Histogram = Histogram::new();
+static H_TX_LAST: Histogram = Histogram::new();
+static MAX_TX_HOLD_NS: AtomicU64 = AtomicU64::new(0);
 // Input REFUSED because its session's input queue was full: the program has
 // stopped reading and the key (or paste) was refused — said once per session,
 // `App::refuse_input` — instead of parking the event loop or queueing without
@@ -3279,6 +3542,27 @@ pub(crate) fn note_ime_compose(ns: u64) {
     H_IME_COMPOSE.record(ns);
 }
 
+/// Book one build of the menu-bar item's glance, in ns.
+pub(crate) fn note_status_glance(ns: u64) {
+    H_STATUS_GLANCE.record(ns);
+    MAX_STATUS_GLANCE_NS.fetch_max(ns, Ordering::Relaxed);
+}
+
+/// Book one session's need publication, in ns.
+pub(crate) fn note_need_publish(ns: u64) {
+    H_NEED_PUBLISH.record(ns);
+    MAX_NEED_PUBLISH_NS.fetch_max(ns, Ordering::Relaxed);
+}
+
+/// Book one transcript apply hold of `kind`, in ns (see `H_TX_CHUNK`).
+pub(crate) fn note_tx_hold(kind: crate::session_log::transcript::Hold, ns: u64) {
+    match kind {
+        crate::session_log::transcript::Hold::Full => H_TX_CHUNK.record(ns),
+        crate::session_log::transcript::Hold::Last => H_TX_LAST.record(ns),
+    }
+    MAX_TX_HOLD_NS.fetch_max(ns, Ordering::Relaxed);
+}
+
 /// A composition ended without a commit.
 pub(crate) fn note_ime_cancelled() {
     IME_CANCELLED.fetch_add(1, Ordering::Relaxed);
@@ -3298,28 +3582,28 @@ pub(crate) fn note_reply_dropped() {
 }
 
 /// Replies dropped by a full reply lane since the last reset.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[must_use]
 pub(crate) fn reply_dropped() -> u64 {
     REPLY_DROPPED.load(Ordering::Relaxed)
 }
 
 /// Inputs refused by a full input queue since the last reset.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[must_use]
 pub(crate) fn input_refused() -> u64 {
     INPUT_REFUSED.load(Ordering::Relaxed)
 }
 
 /// The output→redraw-request distribution (see `H_OUTPUT_REDRAW_REQUEST`).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[must_use]
 pub(crate) fn output_redraw_request_distribution() -> &'static Histogram {
     &H_OUTPUT_REDRAW_REQUEST
 }
 
 /// The IME preedit→commit distribution (see `H_IME_COMPOSE`).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[must_use]
 pub(crate) fn ime_compose_distribution() -> &'static Histogram {
     &H_IME_COMPOSE
@@ -3327,19 +3611,34 @@ pub(crate) fn ime_compose_distribution() -> &'static Histogram {
 
 /// The input-leg fields of `metrics percentiles`, text form: the
 /// output→redraw-request leg with its last/max, the IME composition clock
-/// with its cancel count, and the refused-input count. One fragment, so the
+/// with its cancel count, and the refused-input count — then the menu-bar
+/// item's glance build (`n_status_glance status_glance_p50/p95/p99_ms
+/// max_status_glance_ms`), one session's need publication
+/// (`n_need_publish need_publish_p50/p95/p99_ms max_need_publish_ms`) and
+/// the transcript apply's holds (`n_tx_chunk tx_chunk_p50/p95/p99_ms
+/// n_tx_last tx_last_p50/p95/p99_ms max_tx_hold_ms`). One fragment, so the
 /// text and JSON forms cannot drift apart.
 #[must_use]
 pub(crate) fn input_legs_fields_text() -> String {
     let ms = |ns: u64| ns as f64 / 1e6;
     let out = &H_OUTPUT_REDRAW_REQUEST;
     let ime = &H_IME_COMPOSE;
+    let glance = &H_STATUS_GLANCE;
+    let publish = &H_NEED_PUBLISH;
+    let (chunk, last) = (&H_TX_CHUNK, &H_TX_LAST);
     let p = |h: &Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
     format!(
         " n_out_req={} out_req_p50_ms={:.2} out_req_p95_ms={:.2} out_req_p99_ms={:.2} \
          last_out_req_ms={:.2} max_out_req_ms={:.2} \
          n_ime={} ime_p50_ms={:.2} ime_p95_ms={:.2} ime_p99_ms={:.2} ime_cancelled={} \
-         input_refused={} reply_dropped={}",
+         input_refused={} reply_dropped={} \
+         n_status_glance={} status_glance_p50_ms={:.3} status_glance_p95_ms={:.3} \
+         status_glance_p99_ms={:.3} max_status_glance_ms={:.3} \
+         n_need_publish={} need_publish_p50_ms={:.3} need_publish_p95_ms={:.3} \
+         need_publish_p99_ms={:.3} max_need_publish_ms={:.3} \
+         n_tx_chunk={} tx_chunk_p50_ms={:.3} tx_chunk_p95_ms={:.3} tx_chunk_p99_ms={:.3} \
+         n_tx_last={} tx_last_p50_ms={:.3} tx_last_p95_ms={:.3} tx_last_p99_ms={:.3} \
+         max_tx_hold_ms={:.3}",
         out.count(),
         p(out, 0.50),
         p(out, 0.95),
@@ -3353,6 +3652,25 @@ pub(crate) fn input_legs_fields_text() -> String {
         IME_CANCELLED.load(Ordering::Relaxed),
         INPUT_REFUSED.load(Ordering::Relaxed),
         REPLY_DROPPED.load(Ordering::Relaxed),
+        glance.count(),
+        p(glance, 0.50),
+        p(glance, 0.95),
+        p(glance, 0.99),
+        ms(MAX_STATUS_GLANCE_NS.load(Ordering::Relaxed)),
+        publish.count(),
+        p(publish, 0.50),
+        p(publish, 0.95),
+        p(publish, 0.99),
+        ms(MAX_NEED_PUBLISH_NS.load(Ordering::Relaxed)),
+        chunk.count(),
+        p(chunk, 0.50),
+        p(chunk, 0.95),
+        p(chunk, 0.99),
+        last.count(),
+        p(last, 0.50),
+        p(last, 0.95),
+        p(last, 0.99),
+        ms(MAX_TX_HOLD_NS.load(Ordering::Relaxed)),
     )
 }
 
@@ -3362,12 +3680,22 @@ pub(crate) fn input_legs_fields_json() -> String {
     let ms = |ns: u64| ns as f64 / 1e6;
     let out = &H_OUTPUT_REDRAW_REQUEST;
     let ime = &H_IME_COMPOSE;
+    let glance = &H_STATUS_GLANCE;
+    let publish = &H_NEED_PUBLISH;
+    let (chunk, last) = (&H_TX_CHUNK, &H_TX_LAST);
     let p = |h: &Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
     format!(
         ",\"n_out_req\":{},\"out_req_p50_ms\":{:.2},\"out_req_p95_ms\":{:.2},\
          \"out_req_p99_ms\":{:.2},\"last_out_req_ms\":{:.2},\"max_out_req_ms\":{:.2},\
          \"n_ime\":{},\"ime_p50_ms\":{:.2},\"ime_p95_ms\":{:.2},\"ime_p99_ms\":{:.2},\
-         \"ime_cancelled\":{},\"input_refused\":{},\"reply_dropped\":{}",
+         \"ime_cancelled\":{},\"input_refused\":{},\"reply_dropped\":{},\
+         \"n_status_glance\":{},\"status_glance_p50_ms\":{:.3},\"status_glance_p95_ms\":{:.3},\
+         \"status_glance_p99_ms\":{:.3},\"max_status_glance_ms\":{:.3},\
+         \"n_need_publish\":{},\"need_publish_p50_ms\":{:.3},\"need_publish_p95_ms\":{:.3},\
+         \"need_publish_p99_ms\":{:.3},\"max_need_publish_ms\":{:.3},\
+         \"n_tx_chunk\":{},\"tx_chunk_p50_ms\":{:.3},\"tx_chunk_p95_ms\":{:.3},\
+         \"tx_chunk_p99_ms\":{:.3},\"n_tx_last\":{},\"tx_last_p50_ms\":{:.3},\
+         \"tx_last_p95_ms\":{:.3},\"tx_last_p99_ms\":{:.3},\"max_tx_hold_ms\":{:.3}",
         out.count(),
         p(out, 0.50),
         p(out, 0.95),
@@ -3381,6 +3709,25 @@ pub(crate) fn input_legs_fields_json() -> String {
         IME_CANCELLED.load(Ordering::Relaxed),
         INPUT_REFUSED.load(Ordering::Relaxed),
         REPLY_DROPPED.load(Ordering::Relaxed),
+        glance.count(),
+        p(glance, 0.50),
+        p(glance, 0.95),
+        p(glance, 0.99),
+        ms(MAX_STATUS_GLANCE_NS.load(Ordering::Relaxed)),
+        publish.count(),
+        p(publish, 0.50),
+        p(publish, 0.95),
+        p(publish, 0.99),
+        ms(MAX_NEED_PUBLISH_NS.load(Ordering::Relaxed)),
+        chunk.count(),
+        p(chunk, 0.50),
+        p(chunk, 0.95),
+        p(chunk, 0.99),
+        last.count(),
+        p(last, 0.50),
+        p(last, 0.95),
+        p(last, 0.99),
+        ms(MAX_TX_HOLD_NS.load(Ordering::Relaxed)),
     )
 }
 
@@ -4044,6 +4391,97 @@ pub(crate) fn note_fx_composed(glow_quads: usize, under_quads: usize, trail_cell
     }
 }
 
+type FxStream = (&'static str, fn(&aterm_render::RenderInput) -> usize);
+
+static FX_STREAMS: [FxStream; 12] = [
+    ("trail", |i| i.cursor_trail.len()),
+    ("glow_add", |i| i.cursor_glow_add.len()),
+    ("glow_halo", |i| i.glow_halo.len()),
+    ("glow_under", |i| i.glow_under.len()),
+    ("fire_patch", |i| i.fire_patch.len()),
+    ("fire_halo", |i| i.fire_halo.len()),
+    ("nova_add", |i| i.nova_add.len()),
+    ("rain", |i| i.rain_quads.len()),
+    ("rain_add", |i| i.rain_add.len()),
+    ("cat", |i| i.cat_quads.len()),
+    ("free", |i| i.free_sprites.len()),
+    ("wdeco", |i| i.word_decorations.len()),
+];
+
+/// Book every effect stream's length off the final composed `input`, at the
+/// present seam (see `FX_STREAMS_LAST`). Twelve relaxed stores per present.
+pub(crate) fn note_fx_streams(input: &aterm_render::RenderInput) {
+    for (slot, (_, len)) in FX_STREAMS_LAST.iter().zip(FX_STREAMS.iter()) {
+        slot.store(len(input) as u64, Ordering::Relaxed);
+    }
+}
+
+/// The non-zero `(label, value)` pairs of a labelled ledger, in label order.
+fn labelled_pairs<'a>(
+    labels: impl Iterator<Item = &'a str>,
+    slots: &[AtomicU64],
+) -> Vec<(&'a str, u64)> {
+    labels
+        .zip(slots.iter())
+        .filter_map(|(label, slot)| {
+            let n = slot.load(Ordering::Relaxed);
+            (n != 0).then_some((label, n))
+        })
+        .collect()
+}
+
+/// Final composed effect-stream counts. GPU shape and timing retain their
+/// existing measured ledger in `gpu_fields_text`.
+pub(crate) fn frame_fields_text() -> String {
+    format!(
+        " fx_streams_last={}",
+        sparse_pairs(&labelled_pairs(
+            FX_STREAMS.iter().map(|&(label, _)| label),
+            &FX_STREAMS_LAST,
+        ))
+    )
+}
+
+/// Field-for-field JSON twin of `frame_fields_text`.
+pub(crate) fn frame_fields_json() -> String {
+    format!(
+        ",\"fx_streams_last\":{}",
+        sparse_object(&labelled_pairs(
+            FX_STREAMS.iter().map(|&(label, _)| label),
+            &FX_STREAMS_LAST,
+        ))
+    )
+}
+
+#[cfg(test)]
+mod effect_stream_tests {
+    use super::{SCHEDULER_STATE, frame_fields_json, frame_fields_text, note_fx_streams};
+
+    #[test]
+    fn effect_stream_fields_follow_the_final_composed_input() {
+        let _serial = SCHEDULER_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let input = aterm_render::RenderInput {
+            glow_under: vec![aterm_render::GlowQuad::default(); 3],
+            nova_add: vec![aterm_render::GlowQuad::default(); 2],
+            ..aterm_render::RenderInput::default()
+        };
+        note_fx_streams(&input);
+        assert_eq!(
+            frame_fields_text(),
+            " fx_streams_last=glow_under:3,nova_add:2"
+        );
+        assert_eq!(
+            frame_fields_json(),
+            ",\"fx_streams_last\":{\"glow_under\":3,\"nova_add\":2}"
+        );
+        note_fx_streams(&aterm_render::RenderInput::default());
+        assert_eq!(frame_fields_text(), " fx_streams_last=none");
+        assert_eq!(frame_fields_json(), ",\"fx_streams_last\":{}");
+    }
+}
+
 /// A synchronized-output hold intentionally retained the previous frame.
 pub(crate) fn note_redraw_sync_hold() {
     REDRAW_SYNC_HOLDS.fetch_add(1, Ordering::Relaxed);
@@ -4596,16 +5034,39 @@ pub(crate) fn pty_census() -> (usize, usize) {
     )
 }
 
+/// The PTY masters waiting in the spawn-kit pool (`pty_kits=`): opened ahead of
+/// a spawn by `spawn_prep`'s fill (`aterm_pty::fill_spawn_kits`), owned by no
+/// session until a spawn takes one. Raw descriptors in `aterm_pty`, never a
+/// sink's, so `pty_masters` leaves them out; every `/dev/ptmx` the process holds
+/// is a session's, a spare's (`spare_ptys=`) or one of these.
+#[must_use]
+pub(crate) fn pty_kits() -> usize {
+    #[cfg(unix)]
+    {
+        aterm_pty::ready_spawn_kits()
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
 /// The summary line's PTY census, leading space included:
-/// ` pty_masters=<n> pty_sessions=<m>`. Equal at rest. A closing session's
-/// master stays open until its reader has wound down (a hang-up and a wake,
-/// normally well under a second), so `pty_masters` may lead briefly after a
-/// close; a lead that STAYS is a master nothing will close — the leak of
-/// 2026-09-29, where a closed tab 0's master outlived it for the window's life.
+/// ` pty_masters=<n> pty_sessions=<m> pty_kits=<k>`. Masters equal sessions at
+/// rest. A closing session's master stays open until its reader has wound down
+/// (a hang-up and a wake, normally well under a second), so `pty_masters` may
+/// lead briefly after a close; a lead that STAYS is a master nothing will close
+/// — the leak of 2026-09-29, where a closed tab 0's master outlived it for the
+/// window's life. `pty_kits` ([`pty_kits`]) are the masters opened ahead for the
+/// next spawns, so the process's open `/dev/ptmx` descriptors number
+/// `pty_masters + pty_kits + spare_ptys`.
 #[must_use]
 pub(crate) fn pty_census_fields_text() -> String {
     let (masters, sessions) = pty_census();
-    format!(" pty_masters={masters} pty_sessions={sessions}")
+    format!(
+        " pty_masters={masters} pty_sessions={sessions} pty_kits={}",
+        pty_kits()
+    )
 }
 
 /// Field-for-field JSON twin of [`pty_census_fields_text`], with a leading
@@ -4613,7 +5074,10 @@ pub(crate) fn pty_census_fields_text() -> String {
 #[must_use]
 pub(crate) fn pty_census_fields_json() -> String {
     let (masters, sessions) = pty_census();
-    format!(",\"pty_masters\":{masters},\"pty_sessions\":{sessions}")
+    format!(
+        ",\"pty_masters\":{masters},\"pty_sessions\":{sessions},\"pty_kits\":{}",
+        pty_kits()
+    )
 }
 
 /// Zero the measurement-window stats (frame count, maxima, slow count) so a driver
@@ -4657,6 +5121,9 @@ pub(crate) fn reset() {
     PET_WORLD_OBSERVATIONS.store(0, Ordering::Relaxed);
     PET_WORLD_CELLS.store(0, Ordering::Relaxed);
     FX_UNDER_FRAMES.store(0, Ordering::Relaxed);
+    for slot in &FX_STREAMS_LAST {
+        slot.store(0, Ordering::Relaxed);
+    }
     for slot in &FRAME_REFILL_FULL_BY_CAUSE {
         slot.store(0, Ordering::Relaxed);
     }
@@ -4780,6 +5247,20 @@ pub(crate) fn reset() {
     H_RESIZE_PRESENT.reset();
     H_RESIZE_REFLOW.reset();
     H_PRESENT_GLASS.reset();
+    H_GPU_TIME.reset();
+    LAST_GPU_TIME_NS.store(0, Ordering::Relaxed);
+    MAX_GPU_TIME_NS.store(0, Ordering::Relaxed);
+    LAST_GPU_TIME_PARTS.store(0, Ordering::Relaxed);
+    H_GPU_ENCODE.reset();
+    LAST_GPU_ENCODE_NS.store(0, Ordering::Relaxed);
+    LAST_GPU_PASSES.store(0, Ordering::Relaxed);
+    LAST_GPU_INSTANCE_BYTES.store(0, Ordering::Relaxed);
+    LAST_GPU_BUILD_NS.store(0, Ordering::Relaxed);
+    LAST_GPU_STAGE_NS.store(0, Ordering::Relaxed);
+    LAST_GPU_UNORM_ABLATION.store(0, Ordering::Relaxed);
+    for count in &LAST_GPU_INSTANCES {
+        count.store(0, Ordering::Relaxed);
+    }
     LAST_PRESENT_GLASS_NS.store(0, Ordering::Relaxed);
     MAX_PRESENT_GLASS_NS.store(0, Ordering::Relaxed);
     PRESENT_GLASS_SKIPPED.store(0, Ordering::Relaxed);
@@ -4793,6 +5274,13 @@ pub(crate) fn reset() {
     LAST_OUTPUT_REDRAW_REQUEST_NS.store(0, Ordering::Relaxed);
     MAX_OUTPUT_REDRAW_REQUEST_NS.store(0, Ordering::Relaxed);
     H_IME_COMPOSE.reset();
+    H_STATUS_GLANCE.reset();
+    MAX_STATUS_GLANCE_NS.store(0, Ordering::Relaxed);
+    H_NEED_PUBLISH.reset();
+    MAX_NEED_PUBLISH_NS.store(0, Ordering::Relaxed);
+    H_TX_CHUNK.reset();
+    H_TX_LAST.reset();
+    MAX_TX_HOLD_NS.store(0, Ordering::Relaxed);
     IME_CANCELLED.store(0, Ordering::Relaxed);
     INPUT_REFUSED.store(0, Ordering::Relaxed);
     REPLY_DROPPED.store(0, Ordering::Relaxed);
@@ -5316,11 +5804,11 @@ mod claim_timeline_tests {
         let claim = dial + ms(5);
         let mut own = [None; ClaimStamp::COUNT];
         own[ClaimStamp::Intake as usize] = Some(claim + ms(12));
-        own[ClaimStamp::LoopBuild as usize] = Some(claim + ms(48));
-        own[ClaimStamp::Adopt0 as usize] = Some(claim + ms(99));
-        own[ClaimStamp::EventLoopBuilt as usize] = Some(claim + ms(60));
-        own[ClaimStamp::Services as usize] = Some(claim + ms(66));
-        own[ClaimStamp::Journal as usize] = Some(claim + ms(80));
+        own[ClaimStamp::Journal as usize] = Some(claim + ms(48));
+        own[ClaimStamp::Adopt0 as usize] = Some(claim + ms(60));
+        own[ClaimStamp::LoopBuild as usize] = Some(claim + ms(66));
+        own[ClaimStamp::EventLoopBuilt as usize] = Some(claim + ms(80));
+        own[ClaimStamp::Services as usize] = Some(claim + ms(99));
         own[ClaimStamp::Control as usize] = Some(claim + ms(103));
         own[ClaimStamp::ConfigJoined as usize] = Some(claim + ms(104));
         own[ClaimStamp::AppBuilt as usize] = Some(claim + ms(105));
@@ -5359,11 +5847,11 @@ mod claim_timeline_tests {
                 "park",
                 "intake",
                 "worker_spawn",
+                "journal",
+                "adopt0",
                 "loop_build",
                 "event_loop",
                 "services",
-                "journal",
-                "adopt0",
                 "control",
                 "config_joined",
                 "app_built",
@@ -5439,7 +5927,10 @@ mod claim_timeline_tests {
 
 #[cfg(test)]
 mod startup_prepare_tests {
-    use super::{STARTUP_PREPARE_PHASES, birth_to_main_ns, derive_startup_prepare};
+    use super::{
+        ClaimStamp, LOOP_FIRST_CUTS, STARTUP_PREPARE_CUTS, STARTUP_PREPARE_PHASES,
+        birth_to_main_ns, derive_startup_prepare, derive_startup_prepare_of,
+    };
     use std::time::{Duration, Instant, UNIX_EPOCH};
 
     fn ms(n: u64) -> Duration {
@@ -5489,6 +5980,41 @@ mod startup_prepare_tests {
             derive_startup_prepare(Some(entry), cuts(entry), Some(entry + ms(80))),
             None
         );
+    }
+
+    /// The stamps of a boot that offered `order`'s cuts at [`cuts`]' instants, in
+    /// that order, and no other stamp.
+    fn stamped(entry: Instant, order: [ClaimStamp; 9]) -> impl Fn(ClaimStamp) -> Option<Instant> {
+        let at: Vec<(ClaimStamp, Option<Instant>)> = order.into_iter().zip(cuts(entry)).collect();
+        move |stamp| {
+            at.iter()
+                .find(|(cut, _)| *cut == stamp)
+                .and_then(|(_, t)| *t)
+        }
+    }
+
+    /// LAG-11: session 0 is spawned before the event loop is built, except where the
+    /// build opens a display and goes first. Either order is a split, published under
+    /// the same names; a boot in neither order is none.
+    #[test]
+    fn either_boot_order_is_split_under_the_same_names() {
+        let entry = Instant::now();
+        let ready = Some(entry + ms(110));
+        let of = |order| derive_startup_prepare_of(Some(entry), stamped(entry, order), ready);
+        assert_eq!(
+            of(STARTUP_PREPARE_CUTS),
+            Some([4, 10, 20, 2, 5, 11, 8, 15, 15, 20].map(|n| n * 1_000_000)),
+            "session 0 first: journal 20, session0 2, event_loop 5"
+        );
+        assert_eq!(
+            of(LOOP_FIRST_CUTS),
+            Some([4, 10, 2, 5, 20, 11, 8, 15, 15, 20].map(|n| n * 1_000_000)),
+            "the loop first: its 20 ms build is still event_loop's"
+        );
+        // The event loop built between the journal claim and session 0.
+        let mut neither = STARTUP_PREPARE_CUTS;
+        neither.swap(3, 4);
+        assert_eq!(of(neither), None);
     }
 
     /// A birth at boot-clock tick `boot`, with its wall-clock record.
@@ -6412,6 +6938,7 @@ mod histogram_tests {
             PresentDropReason::CpuCommit,
             PresentDropReason::TargetMismatch,
             PresentDropReason::Virtual,
+            PresentDropReason::CpuRaster,
         ] {
             assert!(
                 !drop_taints_present_latency(reason, false),
@@ -6484,7 +7011,8 @@ mod histogram_tests {
 #[cfg(test)]
 mod present_glass_tests {
     use super::{
-        H_PRESENT_GLASS, MAX_PRESENT_GLASS_NS, PRESENT_GLASS_SKIPPED, SCHEDULER_STATE,
+        H_GPU_ENCODE, H_GPU_TIME, H_PRESENT_GLASS, MAX_PRESENT_GLASS_NS, PRESENT_GLASS_SKIPPED,
+        SCHEDULER_STATE, gpu_fields_json, gpu_fields_text, note_gpu_frame, note_gpu_time,
         note_present_glass, present_glass_fields_json, present_glass_fields_text, reset,
     };
     use aterm_gpu::present_glass::{GlassReport, GlassSample, PresentTag};
@@ -6516,6 +7044,65 @@ mod present_glass_tests {
         );
         let json = present_glass_fields_json();
         assert!(json.ends_with(",\"present_glass_skipped_by\":{}"), "{json}");
+        assert_eq!(H_GPU_TIME.count(), 0);
+        assert_eq!(H_GPU_ENCODE.count(), 0);
+        let empty_source = if aterm_gpu::gpu_time::SUPPORTED {
+            "unobserved"
+        } else {
+            "unsupported"
+        };
+        assert!(gpu_fields_text().contains(&format!("gpu_time_source={empty_source} ")));
+
+        let mut shape = aterm_gpu::FrameShape {
+            passes: 3,
+            instance_bytes: 512,
+            build_ns: 2_000_000,
+            stage_ns: 3_000_000,
+            ablation: aterm_gpu::UnormAblation::Thin,
+            ..aterm_gpu::FrameShape::default()
+        };
+        let glyph = aterm_gpu::FrameShape::STREAMS
+            .iter()
+            .position(|&name| name == "glyph")
+            .unwrap();
+        shape.instances[glyph] = 8;
+        note_gpu_frame(shape, 5_000_000);
+        note_gpu_time(aterm_gpu::gpu_time::GpuFrameTime {
+            serial: 1,
+            gpu_ns: 7_000_000,
+            parts: 2,
+        });
+        assert_eq!(H_GPU_TIME.count(), 1);
+        assert_eq!(H_GPU_ENCODE.count(), 1);
+        let gpu_text = gpu_fields_text();
+        for field in [
+            "n_gpu_time=1",
+            "max_gpu_time_ms=7.00",
+            "gpu_time_parts_last=2",
+            "gpu_encode_last_ms=5.00",
+            "passes_last=3",
+            "instances_by_stream=glyph:8",
+            "instance_bytes_last=512",
+            "gpu_unorm_ablation=thin",
+        ] {
+            assert!(
+                gpu_text.split_whitespace().any(|token| token == field),
+                "{gpu_text}"
+            );
+        }
+        let gpu_json: aterm_json::Value =
+            aterm_json::from_str(&format!("{{\"sentinel\":0{}}}", gpu_fields_json())).unwrap();
+        assert_eq!(gpu_json["n_gpu_time"].as_u64(), Some(1));
+        assert_eq!(gpu_json["instances_by_stream"]["glyph"].as_u64(), Some(8));
+        assert_eq!(gpu_json["gpu_unorm_ablation"].as_str(), Some("thin"));
+        assert_eq!(
+            gpu_json["gpu_time_source"].as_str(),
+            Some(if aterm_gpu::gpu_time::SUPPORTED {
+                "device"
+            } else {
+                "unsupported"
+            })
+        );
 
         note_present_glass(report(
             GlassSample::OnGlass { ns: 7_000_000 },
@@ -6556,6 +7143,17 @@ mod present_glass_tests {
         assert_eq!(MAX_PRESENT_GLASS_NS.load(Ordering::Relaxed), 0);
         assert_eq!(PRESENT_GLASS_SKIPPED.load(Ordering::Relaxed), 0);
         assert!(present_glass_fields_text().ends_with(" present_glass_skipped_by=none"));
+        assert_eq!(H_GPU_TIME.count(), 0);
+        assert_eq!(H_GPU_ENCODE.count(), 0);
+        let gpu_json: aterm_json::Value =
+            aterm_json::from_str(&format!("{{\"sentinel\":0{}}}", gpu_fields_json())).unwrap();
+        assert_eq!(gpu_json["passes_last"].as_u64(), Some(0));
+        assert_eq!(
+            gpu_json["instances_by_stream"].as_object().unwrap().len(),
+            0
+        );
+        assert_eq!(gpu_json["gpu_unorm_ablation"].as_str(), Some("off"));
+        assert_eq!(gpu_json["gpu_time_source"].as_str(), Some(empty_source));
     }
 }
 

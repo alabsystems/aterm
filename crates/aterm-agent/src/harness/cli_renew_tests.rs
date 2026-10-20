@@ -18,13 +18,17 @@ const OWNER: &str = "owner@example.com";
 const WORK: &str = "w2@example.com";
 
 /// This machine's own login (renewable, a browser profile of its own), a
-/// renewable second account, and one with no email.
+/// renewable second account, and one with no email. Each dir is spelled as
+/// the parser spells a string, so a Windows path's backslashes are escaped.
 fn roster_text(work_dir: &str) -> String {
+    let dir = |d: &str| aterm_toml::Value::from(d).to_string();
     format!(
         "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"{OWNER}\"\nbrowser = \
          \"Claude main\"\n\n[[account]]\nlabel = \"work-2\"\nclass = \"dedicated\"\ndir = \
-         \"{work_dir}\"\nemail = \"{WORK}\"\n\n[[account]]\nlabel = \"plain\"\nclass = \
-         \"shared\"\ndir = \"{work_dir}-plain\"\n"
+         {}\nemail = \"{WORK}\"\n\n[[account]]\nlabel = \"plain\"\nclass = \"shared\"\ndir = \
+         {}\n",
+        dir(work_dir),
+        dir(&format!("{work_dir}-plain"))
     )
 }
 
@@ -260,16 +264,19 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
     let staging = store.logins_dir().join("main+1");
     let staging = staging.to_str().expect("utf-8").to_string();
     let opener = store.dir.join("bin").join(crate::harness::open_url::OPENER);
+    // The opener is a link to this program that only Unix makes
+    // (`opener_link`): elsewhere the page opens in the default browser.
+    let browser = if cfg!(unix) {
+        RenewBrowser::Profile {
+            opener: opener.clone(),
+            profile: "Claude main".into(),
+        }
+    } else {
+        RenewBrowser::Default
+    };
     assert_eq!(
         *host.flows.borrow(),
-        vec![(
-            staging.clone(),
-            OWNER.to_string(),
-            RenewBrowser::Profile {
-                opener: opener.clone(),
-                profile: "Claude main".into(),
-            }
-        )]
+        vec![(staging.clone(), OWNER.to_string(), browser)]
     );
     assert_eq!(
         *host.checked.borrow(),
@@ -297,10 +304,12 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
     assert_eq!(kinds, [accounts::Kind::Auth, accounts::Kind::Renewed]);
     assert!(store.wake_path().exists(), "the waiting decide again");
     assert!(out.contains("main: renewed"), "{out}");
-    assert!(
-        out.contains("it opens in browser profile 'Claude main'"),
-        "{out}"
-    );
+    let opens = if cfg!(unix) {
+        "it opens in browser profile 'Claude main'"
+    } else {
+        "it opens in your default browser"
+    };
+    assert!(out.contains(opens), "{out}");
     no_address(&env, &[&out, &err]);
     // The report reads the roster through the binding.
     let (code, report, _) = acc(AccountsCmd::Report { json: false }, &env, &host);
@@ -319,7 +328,8 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
         "a row with no email is as it was: {plain}"
     );
     let (_, json, _) = acc(AccountsCmd::Report { json: true }, &env, &host);
-    assert!(json.contains(&format!("\"dir\":\"{staging}\"")), "{json}");
+    let dir = crate::harness::host_path::json(Path::new(&staging));
+    assert!(json.contains(&format!("\"dir\":\"{dir}\"")), "{json}");
     assert!(json.contains("\"renews\":true") && json.contains("\"login\":\"idle\""));
     no_address(&env, &[&report, &json]);
 
@@ -552,7 +562,8 @@ fn over_ssh_the_paste_code_flow_runs_and_the_profile_is_named() {
     assert_eq!(
         host.flows.borrow()[0].2,
         RenewBrowser::Remote {
-            opener: Some(opener),
+            // Only Unix makes the opener's link (`opener_link`).
+            opener: cfg!(unix).then_some(opener),
         },
         "nothing opens on the machine the owner is not at"
     );

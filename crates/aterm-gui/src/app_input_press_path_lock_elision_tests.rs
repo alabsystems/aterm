@@ -5,18 +5,18 @@ use super::{publish_release_relevance, sampled_release_relevance};
 use crate::input::{InputEvent, Source};
 use crate::{App, WindowId, term_lock};
 use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
-use winit::event::ElementState;
-use winit::keyboard::{KeyCode, PhysicalKey};
+use aterm_window::event::ElementState;
+use aterm_window::keyboard::{KeyCode, PhysicalKey};
 
 /// A real winit key event, so the tests below drive the shipping `on_key`
 /// routing (where the press-path snap lives) rather than the seam alone.
-fn character_event(ch: char, state: ElementState) -> winit::event::KeyEvent {
-    let text = winit::keyboard::SmolStr::new(ch.to_string());
-    winit::event::KeyEvent::synthetic_for_test(
+fn character_event(ch: char, state: ElementState) -> aterm_window::event::KeyEvent {
+    let text = aterm_window::keyboard::SmolStr::new(ch.to_string());
+    aterm_window::event::KeyEvent::synthetic_for_test(
         PhysicalKey::Code(KeyCode::KeyA),
-        winit::keyboard::Key::Character(text.clone()),
+        aterm_window::keyboard::Key::Character(text.clone()),
         (state == ElementState::Pressed).then_some(text),
-        winit::keyboard::KeyLocation::Standard,
+        aterm_window::keyboard::KeyLocation::Standard,
         state,
         false,
     )
@@ -70,12 +70,12 @@ fn a_keypad_press_and_its_release_report_the_same_keypad_key() {
     let term = app.front_terminal(wid).expect("terminal").term.clone();
     term_lock(&term).process(b"\x1b[>3u");
     let kp5 = |state: ElementState| {
-        let five = winit::keyboard::SmolStr::new("5");
-        winit::event::KeyEvent::synthetic_for_test(
+        let five = aterm_window::keyboard::SmolStr::new("5");
+        aterm_window::event::KeyEvent::synthetic_for_test(
             PhysicalKey::Code(KeyCode::Numpad5),
-            winit::keyboard::Key::Character(five.clone()),
+            aterm_window::keyboard::Key::Character(five.clone()),
             (state == ElementState::Pressed).then_some(five),
-            winit::keyboard::KeyLocation::Numpad,
+            aterm_window::keyboard::KeyLocation::Numpad,
             state,
             false,
         )
@@ -290,7 +290,7 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
 
     use aterm_effects::rainbow_kitty::TypedClass;
     use aterm_types::keyboard::NamedKey;
-    use winit::keyboard::{
+    use aterm_window::keyboard::{
         Key as WinitKey, KeyLocation, ModifiersState, NamedKey as WinitNamed, SmolStr,
     };
 
@@ -470,7 +470,7 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
                 };
                 app.on_key(
                     wid,
-                    winit::event::KeyEvent::synthetic_for_test(
+                    aterm_window::event::KeyEvent::synthetic_for_test(
                         PhysicalKey::Code(code),
                         key,
                         text,
@@ -585,7 +585,7 @@ use std::sync::{Arc, Mutex};
 
 use aterm_core::selection::SelectionType;
 use aterm_core::terminal::Terminal;
-use winit::keyboard::ModifiersState;
+use aterm_window::keyboard::ModifiersState;
 
 /// kitty reports a modifier's release with the state it leaves: with both
 /// Shifts down and one let go, `shift` is still in force, so the release
@@ -600,14 +600,14 @@ fn a_modifier_release_keeps_its_bit_while_the_other_side_is_held() {
     let wid = WindowId(0);
     let term = app.front_terminal(wid).expect("terminal").term.clone();
     let shift = |code: KeyCode, state: ElementState| {
-        winit::event::KeyEvent::synthetic_for_test(
+        aterm_window::event::KeyEvent::synthetic_for_test(
             PhysicalKey::Code(code),
-            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Shift),
+            aterm_window::keyboard::Key::Named(aterm_window::keyboard::NamedKey::Shift),
             None,
             if code == KeyCode::ShiftRight {
-                winit::keyboard::KeyLocation::Right
+                aterm_window::keyboard::KeyLocation::Right
             } else {
-                winit::keyboard::KeyLocation::Left
+                aterm_window::keyboard::KeyLocation::Left
             },
             state,
             false,
@@ -656,21 +656,21 @@ fn caps_lock_reaches_legacy_and_kitty_while_unmapped_keys_write_nothing() {
         Modifiers::CAPS_LOCK
     }
     let arrow = |state| {
-        winit::event::KeyEvent::synthetic_for_test(
+        aterm_window::event::KeyEvent::synthetic_for_test(
             PhysicalKey::Code(KeyCode::ArrowUp),
-            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp),
+            aterm_window::keyboard::Key::Named(aterm_window::keyboard::NamedKey::ArrowUp),
             None,
-            winit::keyboard::KeyLocation::Standard,
+            aterm_window::keyboard::KeyLocation::Standard,
             state,
             false,
         )
     };
     let unmapped = || {
-        winit::event::KeyEvent::synthetic_for_test(
+        aterm_window::event::KeyEvent::synthetic_for_test(
             PhysicalKey::Code(KeyCode::BrowserBack),
-            winit::keyboard::Key::Named(winit::keyboard::NamedKey::BrowserBack),
+            aterm_window::keyboard::Key::Named(aterm_window::keyboard::NamedKey::BrowserBack),
             None,
-            winit::keyboard::KeyLocation::Standard,
+            aterm_window::keyboard::KeyLocation::Standard,
             ElementState::Pressed,
             false,
         )
@@ -721,11 +721,11 @@ fn mapped_press_keeps_caps_when_kitty_arrives_between_hid_and_egress() {
     app.lock_modifiers = read_caps_and_switch_mode;
     app.on_key(
         wid,
-        winit::event::KeyEvent::synthetic_for_test(
+        aterm_window::event::KeyEvent::synthetic_for_test(
             PhysicalKey::Code(KeyCode::ArrowUp),
-            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp),
+            aterm_window::keyboard::Key::Named(aterm_window::keyboard::NamedKey::ArrowUp),
             None,
-            winit::keyboard::KeyLocation::Standard,
+            aterm_window::keyboard::KeyLocation::Standard,
             ElementState::Pressed,
             false,
         ),
@@ -735,15 +735,15 @@ fn mapped_press_keeps_caps_when_kitty_arrives_between_hid_and_egress() {
 
 /// A bare modifier or lock key as winit really delivers it.
 fn modifier_event(
-    named: winit::keyboard::NamedKey,
+    named: aterm_window::keyboard::NamedKey,
     code: KeyCode,
     state: ElementState,
-) -> winit::event::KeyEvent {
-    winit::event::KeyEvent::synthetic_for_test(
+) -> aterm_window::event::KeyEvent {
+    aterm_window::event::KeyEvent::synthetic_for_test(
         PhysicalKey::Code(code),
-        winit::keyboard::Key::Named(named),
+        aterm_window::keyboard::Key::Named(named),
         None,
-        winit::keyboard::KeyLocation::Standard,
+        aterm_window::keyboard::KeyLocation::Standard,
         state,
         false,
     )
@@ -818,7 +818,7 @@ fn select_all_selects_the_visible_screen_without_snapping() {
 #[test]
 fn cmd_arrows_are_the_deliberate_return_to_live() {
     use crate::input::ScrollIntent;
-    use winit::keyboard::NamedKey as WNamed;
+    use aterm_window::keyboard::NamedKey as WNamed;
     let down = modifier_event(WNamed::ArrowDown, KeyCode::ArrowDown, ElementState::Pressed);
     let up = modifier_event(WNamed::ArrowUp, KeyCode::ArrowUp, ElementState::Pressed);
 
@@ -840,12 +840,34 @@ fn cmd_arrows_are_the_deliberate_return_to_live() {
         super::scrollback_chord(ModifiersState::SUPER | ModifiersState::ALT, &down).is_none(),
         "cmd+alt+arrow belongs to pane focus"
     );
-    // …and the existing Shift forms are untouched.
+    // …and the existing Shift forms are untouched: Shift+End off Windows, and
+    // Windows Terminal's Ctrl+Shift+End on Windows, where Shift+End is
+    // PSReadLine's SelectLine and reaches the shell.
     let end = modifier_event(WNamed::End, KeyCode::End, ElementState::Pressed);
+    let jump = if cfg!(windows) {
+        ModifiersState::CONTROL | ModifiersState::SHIFT
+    } else {
+        ModifiersState::SHIFT
+    };
     assert!(matches!(
-        super::scrollback_chord(ModifiersState::SHIFT, &end),
+        super::scrollback_chord(jump, &end),
         Some(ScrollIntent::Bottom)
     ));
+    assert_eq!(
+        super::scrollback_chord(ModifiersState::SHIFT, &end).is_none(),
+        cfg!(windows)
+    );
+    let page_up = modifier_event(WNamed::PageUp, KeyCode::PageUp, ElementState::Pressed);
+    assert!(matches!(
+        super::scrollback_chord(ModifiersState::SHIFT, &page_up),
+        Some(ScrollIntent::Up)
+    ));
+    assert_eq!(
+        super::scrollback_chord(ModifiersState::CONTROL | ModifiersState::SHIFT, &page_up)
+            .is_some(),
+        cfg!(windows),
+        "Ctrl+Shift+PageUp pages on Windows only"
+    );
     // A bare arrow still belongs to the PTY.
     assert!(super::scrollback_chord(ModifiersState::empty(), &down).is_none());
 }
@@ -871,7 +893,7 @@ fn a_swallowed_cmd_chord_no_longer_snaps_the_viewport() {
         off
     };
     app.windows.get_mut(&wid).expect("window").scroll_frac_px = 7;
-    app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::SUPER);
+    app.on_modifiers_changed(wid, aterm_window::keyboard::ModifiersState::SUPER);
 
     app.on_key(wid, character_event('j', ElementState::Pressed));
 
@@ -944,7 +966,7 @@ fn a_held_literal_payload_repeats_without_re_taking_the_reading_position() {
         // The press still takes custody: the control proving this payload
         // reaches the press path, so the repeat assertion cannot pass by
         // absence.
-        app.forward_literal_press(wid, physical, payload.clone());
+        app.forward_literal_press(wid, physical, payload.clone(), None);
         {
             let t = term_lock(&term);
             assert_eq!(
@@ -994,7 +1016,7 @@ fn a_held_literal_payload_repeats_without_re_taking_the_reading_position() {
 /// restarts the blink, while an intent-bearing chord revokes the licence.
 #[test]
 fn a_bare_modifier_or_lock_key_is_inert() {
-    use winit::keyboard::NamedKey as WNamed;
+    use aterm_window::keyboard::NamedKey as WNamed;
     // Park the cursor mid-blink-OFF with a live blink deadline, bank a
     // sub-row scroll residual, as an in-flight wheel glide would, and stamp
     // the only licence a word move gets (Option+Left, echo not landed yet).
@@ -1062,8 +1084,8 @@ fn a_bare_modifier_or_lock_key_is_inert() {
         app.on_key(wid, modifier_event(named, code, ElementState::Pressed));
         // Option released before the echo lands (was: `on_modifiers_changed`
         // revoked the `nav_hint`, and the word move failed `no-fresh-hint`).
-        app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::ALT);
-        app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::empty());
+        app.on_modifiers_changed(wid, aterm_window::keyboard::ModifiersState::ALT);
+        app.on_modifiers_changed(wid, aterm_window::keyboard::ModifiersState::empty());
         assert_inert(&app, &format!("bare {named:?}"));
     }
 
@@ -1258,7 +1280,7 @@ fn a_pinned_view_gesture_for_a_hidden_session_is_dropped() {
 /// and `a_swallowed_cmd_chord_no_longer_snaps_the_viewport`).
 #[test]
 fn cmd_down_returns_to_live_through_on_key_without_clearing_the_selection() {
-    use winit::keyboard::NamedKey as WNamed;
+    use aterm_window::keyboard::NamedKey as WNamed;
 
     if !super::HARDCODED_SUPER_CHORDS {
         return;

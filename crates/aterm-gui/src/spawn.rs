@@ -14,7 +14,7 @@ use std::time::Instant;
 use aterm_core::terminal::{ClipboardAccess, ClipboardOperation, Terminal};
 use aterm_session::sink::SinkWriter;
 use aterm_session::{EdgeTable, EdgeToken, LaunchNonce, Op, SessionId};
-use winit::event_loop::EventLoopProxy;
+use aterm_window::event_loop::EventLoopProxy;
 
 use crate::{
     Session, SessionCtx, Wake, WindowId, control, control_auth, notify, proxy, session_store,
@@ -240,28 +240,31 @@ type ShellIntegrationSetup = (
 
 /// The shell this tab will actually spawn, as the integration layer sees it.
 ///
-/// Detected from the selected shell (config `shell` / `--shell`) so a
-/// non-default shell gets its own integration script. On Unix that is the
-/// program the spawn itself resolves ([`aterm_pty::select_shell_with_origin`]):
-/// with `$SHELL` unset it is the account's login shell, which must get bash's
-/// integration when it is bash, and never bash's `--rcfile` when it is not.
-/// Elsewhere `detect_current()` sees the platform default (PowerShell on
-/// Windows).
+/// Detected from the program the spawn itself resolves
+/// ([`aterm_pty::select_shell_with_origin`], over config `shell` / `--shell`),
+/// so every shell gets its own integration script. On Unix, with `$SHELL`
+/// unset, that is the account's login shell, which must get bash's integration
+/// when it is bash, and never bash's `--rcfile` when it is not. On Windows, with
+/// neither PowerShell on PATH, it is `%COMSPEC%`'s cmd.exe, which gets cmd's
+/// prompt marks: a platform guess of PowerShell gave that cmd.exe pwsh's
+/// `-NoExit -Command` line and no marks at all. An alias resolves first too:
+/// `shell = "gitbash"` is Git's bash.exe and gets bash's integration.
 pub(crate) fn detect_spawn_shell(
     shell_hint: Option<&str>,
 ) -> aterm_core::shell_integration::ShellType {
-    use aterm_core::shell_integration as si;
-    #[cfg(unix)]
-    {
-        let (program, _) =
-            aterm_pty::select_shell_with_origin(shell_hint.map(std::ffi::OsStr::new));
-        si::ShellType::detect(&program.to_string_lossy())
-    }
-    #[cfg(not(unix))]
-    match shell_hint.filter(|s| !s.is_empty()) {
-        Some(h) => si::ShellType::detect(h),
-        None => si::ShellType::detect_current(),
-    }
+    spawn_shell_type(shell_hint, |hint| {
+        aterm_pty::select_shell_with_origin(hint).0
+    })
+}
+
+/// [`detect_spawn_shell`] over the resolver `select`: the integration is the
+/// one for the program `select` names, never for the hint or a default beside it.
+fn spawn_shell_type(
+    shell_hint: Option<&str>,
+    select: impl FnOnce(Option<&std::ffi::OsStr>) -> std::ffi::OsString,
+) -> aterm_core::shell_integration::ShellType {
+    let program = select(shell_hint.map(std::ffi::OsStr::new));
+    aterm_core::shell_integration::ShellType::detect(&program.to_string_lossy())
 }
 
 /// The tab's own shell (Windows), handed to a fresh shell tab as
@@ -281,6 +284,23 @@ fn tab_shell_env(exec: bool, shell_override: Option<&str>) -> Option<(String, St
         aterm_types::domain::ENV_TAB_SHELL.to_string(),
         program.to_string_lossy().into_owned(),
     ))
+}
+
+/// `COLORFGBG` for a Windows session whose palette reads as `appearance`
+/// (`SessionFactory::shell_colorfgbg`; unknown is aterm's default, dark): rxvt's
+/// `<fg>;<bg>` palette indices, `15;0` dark and `0;15` light, which vim's
+/// `term_bg_default`, neovim and others read for `background`. Under the inbox
+/// console host the OSC 11 query that would tell them never reaches aterm, so
+/// Git Bash's vim drew its light-background palette on the dark theme. An
+/// inherited copy describes the terminal aterm was started from and is
+/// stripped (`aterm_pty`'s foreign-terminal list); this one is set after that.
+#[cfg(any(windows, test))]
+fn colorfgbg_env(appearance: Option<aterm_types::Appearance>) -> (String, String) {
+    let value = match appearance {
+        Some(aterm_types::Appearance::Light) => "0;15",
+        Some(aterm_types::Appearance::Dark) | None => "15;0",
+    };
+    ("COLORFGBG".to_string(), value.to_string())
 }
 
 /// Prepare OSC 133/633 shell integration for the spawned shell: env additions,
@@ -394,13 +414,20 @@ pub(crate) fn selected_shell_name(shell_hint: Option<&str>) -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "the default shell".to_string())
 }
 
-/// The name of the interactive shell a fresh spawn runs, resolved the way the
-/// spawn resolves it: config `shell` / `--shell`, else `$SHELL`, else the
+/// The interactive shell a fresh spawn runs, resolved the way the spawn
+/// resolves it: config `shell` / `--shell`, else `$SHELL`, else the
 /// account's login shell (`aterm_pty::select_shell_with_origin`, the same
 /// resolution on every platform's own terms; Windows: its default chain).
+/// A worker's line is written for it (`task_launch::worker_dialect`).
+pub(crate) fn interactive_shell_program(shell_override: Option<&str>) -> std::path::PathBuf {
+    aterm_pty::select_shell_with_origin(shell_override.map(std::ffi::OsStr::new))
+        .0
+        .into()
+}
+
+/// The name [`interactive_shell_program`] goes by: its basename.
 pub(crate) fn interactive_shell_name(shell_override: Option<&str>) -> String {
-    let program = aterm_pty::select_shell_with_origin(shell_override.map(std::ffi::OsStr::new)).0;
-    std::path::Path::new(&program)
+    interactive_shell_program(shell_override)
         .file_name()
         .map_or_else(|| "shell".to_string(), |n| n.to_string_lossy().into_owned())
 }
@@ -662,6 +689,52 @@ pub(crate) struct SessionFactory {
     /// (`kill(-pgid, 0)`). Called as `fg_gone(master, pgid, role)`, only outside
     /// the term lock ([`crate::foreground_handback::FgOwners::probe_edge`]).
     pub(crate) fg_gone: crate::foreground_handback::FgGone,
+    /// Whether the shell `pid` runs a program it started at or after a
+    /// wall-clock instant (unix epoch ms) where the foreground group cannot
+    /// show it: in the shell's own group on unix (PowerShell keeps every
+    /// program there), any child under ConPTY. Shipping is
+    /// [`crate::quit_safety::shell_runs_program_since`]; each reader installs
+    /// it on its engine (`Terminal::set_program_probe`), which asks it only
+    /// for a cwd report no one signed at the shell's prompt and while one it
+    /// let land shows. A plain `fn`, so a test scripts its own.
+    pub(crate) program_probe: fn(i32, u64) -> bool,
+    /// The kernel's name for the leader of foreground group `pgid` when no other
+    /// process is in its group, read when a file citation asks whether a shell in
+    /// front is the one a person types into (`path_link::runs_here`). Shipping is
+    /// [`crate::path_link::lone_leader`] (`aterm_sysprobe::lone_group_leader`); a
+    /// plain `fn`, so a test whose groups lead no process puts in its own.
+    pub(crate) lone_leader: fn(i32) -> Option<String>,
+    /// The image of foreground group `pgid`'s leader (card engine §3.4), read by
+    /// each PTY gather at a foreground edge and by the parse stage's byte arm:
+    /// shipping is [`crate::holder_image::read`] (the kernel's executable, start
+    /// and, for a script shell, first argument); the test App carries the inert
+    /// [`crate::holder_image::unread`], and a test scripts its own.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "ConPTY has no foreground group: no edge, no byte arm"
+        )
+    )]
+    pub(crate) edge_image: fn(i32) -> crate::holder_image::HolderImage,
+    /// THE EDGED INBOX (card engine §3.5): every session's parse stage pushes
+    /// its id once per published holder edge, and the status sweep visits those
+    /// first (`App::observe_session_statuses`). One per App: every copy of this
+    /// factory shares it.
+    pub(crate) edge_inbox: crate::holder_image::EdgeInbox,
+    /// Whether each PTY reader runs the byte-driven arm (card engine §3.6): the
+    /// initial holder observed once, unresolved signed-C shell/Launcher once
+    /// per batch, and a read after each accepted C boundary. Settled agent
+    /// output adds no image reads. Every unix in A1; lane A2 turns it off
+    /// where its kqueue edges see an `exec`.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "ConPTY has no foreground group: no edge, no byte arm"
+        )
+    )]
+    pub(crate) byte_arm: bool,
     /// Overlap handoff (incoming side), armed like
     /// [`Self::defer_adopted_readers`]: re-key files of adopted shells are held
     /// here until the update's Commit (`shell_rekey::Deferred`), released after
@@ -674,6 +747,14 @@ pub(crate) struct SessionFactory {
     /// attaches live through the spare's own post (which swallows every wake
     /// until adoption), and the primer and the keeper wait for the adoption.
     pub(crate) spare: Option<crate::spare::SpareSpawn>,
+    /// The light/dark side of the theme this spawn's session will draw, where
+    /// it draws one of its own (`App::spawn_shell_appearance`): what its shell's
+    /// `COLORFGBG` names ([`SessionFactory::shell_colorfgbg`]). `None` names the
+    /// instance palette's side (`terminal_config.color_scheme`). Set only on a
+    /// spawn's copy of the factory, at booking: the session's theme itself lands
+    /// after its shell has started.
+    #[cfg(windows)]
+    pub(crate) shell_appearance: Option<aterm_types::Appearance>,
 }
 
 impl SessionFactory {
@@ -704,11 +785,23 @@ impl SessionFactory {
             reader_after_install: _,
             fg_probe: _,
             fg_gone: _,
+            program_probe: _,
+            lone_leader: _,
+            edge_image: _,
+            edge_inbox: _,
+            byte_arm: _,
             rekey_deferred: _,
             spare: _,
+            // Hashed as the `COLORFGBG` it names, below.
+            #[cfg(windows)]
+                shell_appearance: _,
         } = self;
         let mut h = std::collections::hash_map::DefaultHasher::new();
         "aterm-spawn-fingerprint-v1".hash(&mut h);
+        // The side a Windows shell is told its terminal is on: a spare started
+        // under the other side would tell its programs the wrong background.
+        #[cfg(windows)]
+        self.shell_colorfgbg().hash(&mut h);
         env_add.hash(&mut h);
         exec_command.hash(&mut h);
         shell_override.hash(&mut h);
@@ -739,6 +832,18 @@ impl SessionFactory {
             })
             .hash(&mut h);
         h.finish()
+    }
+
+    /// The `COLORFGBG` this factory's shell starts with ([`colorfgbg_env`]): the
+    /// side of its session's own theme ([`Self::shell_appearance`]), else the
+    /// instance palette's. A shell already running keeps the value it started
+    /// with when its theme or the OS appearance later moves.
+    #[cfg(windows)]
+    pub(crate) fn shell_colorfgbg(&self) -> (String, String) {
+        colorfgbg_env(
+            self.shell_appearance
+                .or_else(|| self.terminal_config.as_ref().and_then(|tc| tc.color_scheme)),
+        )
     }
 }
 
@@ -1007,13 +1112,32 @@ fn append_edge_token_channel(
 /// The returned [`proxy::ChildProxy`] owns that registration and the file and
 /// retires both when dropped: at the session's close, or when a spawn fails
 /// after provisioning.
+///
+/// The identity and its file come ready from [`crate::spawn_prep`] when it holds
+/// one written under `sock_dir`: minted and written ahead, so the spawn waits for
+/// no file create. Either way it is registered here, by the spawn.
 pub(crate) fn provision_child_proxy(
     sock_dir: Option<&Path>,
 ) -> (Vec<(String, String)>, proxy::ChildProxy) {
-    let (mut env, prov) = provision_child_recursion_env();
-    let edge_file = append_edge_token_channel(&mut env, &prov, sock_dir);
+    let (env, prov, edge_file) = crate::spawn_prep::take_provision(sock_dir)
+        .unwrap_or_else(|| provision_child_files(sock_dir));
     let child = proxy::ChildProxy::register(prov.child_sid.clone(), (&prov).into(), edge_file);
     (env, child)
+}
+
+/// The files half of [`provision_child_proxy`], before any registration: the
+/// child's identity env and tokens ([`provision_child_recursion_env`]) and its
+/// edge-token file ([`append_edge_token_channel`]).
+pub(crate) fn provision_child_files(
+    sock_dir: Option<&Path>,
+) -> (
+    Vec<(String, String)>,
+    ChildProvision,
+    Option<proxy::EdgeFile>,
+) {
+    let (mut env, prov) = provision_child_recursion_env();
+    let edge_file = append_edge_token_channel(&mut env, &prov, sock_dir);
+    (env, prov, edge_file)
 }
 
 /// Insert the parent-preminted edges into a child-side [`EdgeTable`] from the
@@ -1259,15 +1383,15 @@ pub(crate) struct Adopted {
     /// `keeper_link::register`; dropped unregistered, it releases the keeper's
     /// copy. `None` for an update's handoff.
     pub keeper: Option<crate::keeper_link::Claim>,
-    /// THE RENDER DEBT (R08): `(shift, pushed)`, the rows the outgoing engine
-    /// owed the alternate screen this session restores onto
+    /// THE RENDER DEBT (R08): what the outgoing engine owed the alternate
+    /// screen this session restores onto (rows moved, drawn columns cut)
     /// (`SessionRecord::render_debt`), only when non-zero and the screen was
     /// carried. [`spawn_session`] seeds the adopting engine with it
     /// (`Terminal::seed_render_debt`) and books the judgement of it from
     /// attach, so the epoch judge and the repaint nudge treat the tab exactly
     /// as they would have in the parent. `None`: owes nothing, or the producer
     /// predates the field, and nothing happens.
-    pub render_debt: Option<(i32, i32)>,
+    pub render_debt: Option<aterm_core::terminal::RenderDebt>,
     /// THE MAILBOX THE HANDOFF CARRIED (round seven of the update audit,
     /// findings 6, 8 and 28): the record's posts still waiting, receipts still
     /// owed and id counters, put back by [`seed_adopted_fabric`]. Empty for
@@ -1287,6 +1411,11 @@ pub(crate) struct Adopted {
     /// Named by this window's keeper registration and its own images
     /// ([`crate::keeper_link::Tag::keyed`]). `None` for everything else.
     pub journal_key: Option<(u32, u64)>,
+    /// The record's task row (`SessionRecord::task`), unparsed;
+    /// `task_record::seed_carried` reads it before registration, so a worker
+    /// keeps its task record — rev, state and since — across the update.
+    /// `None`: no task, or a producer that predates the carry.
+    pub task: Option<String>,
 }
 
 /// Mark an adopted session's timeline, cast and temporal recorder as starting
@@ -1633,14 +1762,25 @@ pub(crate) fn seed_adopted_title(
 /// conhost forwards a program's kitty push but cannot turn our CSI-u reports
 /// into the key records a console program reads, so keys such as Ctrl+L and
 /// Alt+a would arrive as nothing. A program with ENABLE_VIRTUAL_TERMINAL_INPUT
-/// loses only kitty's extras.
+/// loses only kitty's extras. OpenConsole is no different, so both hosts get
+/// this posture: with the protocol on for an OpenConsole session (1.24.2610.01001
+/// and 1.25.2609.30003, 2026-10-17), a VT-input reader got every report intact,
+/// but a record reader got Ctrl+L, Alt+a, Ctrl+A, Alt+Shift+B, Ctrl+Backspace
+/// and Shift+Tab as the report's characters typed one by one. Only the host
+/// knows which kind of reader reads next.
 ///
 /// Gated on the backend (`aterm_pty::backend_is_conpty`), not `cfg(windows)`:
 /// stub/replay sessions and Unix PTYs get the native posture. A conhost that
 /// encodes key records as CSI-u would make this unnecessary for that backend.
+///
+/// In the same hold, the one recovery the two Windows hosts need differently,
+/// keyed on the host this session's spawn really got (after any fallback to
+/// conhost): under OpenConsole a dead app's alternate screen is left by the
+/// host, not locally (`crate::alt_screen_resync`).
 pub(crate) fn apply_pty_keyboard_posture(term: &Mutex<Terminal>, master: i32) {
     let policy = crate::app_render::pty_resize_policy(master);
-    term_lock(term).set_console_host_posture(policy);
+    let host = aterm_pty::conpty_host(master);
+    crate::alt_screen_resync::apply_posture(&mut term_lock(term), policy, host);
 }
 
 /// The `rlimit` set a daily-driver (`user`) shell is spawned with:
@@ -1653,9 +1793,9 @@ pub(crate) fn apply_pty_keyboard_posture(term: &Mutex<Terminal>, master: i32) {
 /// launched with (launchd's 256), as a Dock-launched aterm's tab does. The
 /// hard limit is never touched.
 pub(crate) fn daily_driver_limits() -> aterm_sandbox::Limits {
-    #[cfg(target_os = "macos")]
-    let open_files = crate::handoff_rendezvous::launcher_soft_descriptor_limit();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(unix)]
+    let open_files = crate::descriptor_limit::launcher_soft_descriptor_limit();
+    #[cfg(not(unix))]
     let open_files = None;
     aterm_sandbox::Limits {
         open_files,
@@ -1685,7 +1825,7 @@ pub(crate) fn spawn_session(
     // resize. See [`new_live_terminal`] for why the boot session passes `None`.
     cell_px: Option<(u16, u16)>,
     factory: &SessionFactory,
-    proxy: &EventLoopProxy<Wake>,
+    proxy: &dyn WakeTarget,
     // Per-spawn working directory: a new tab / split / window passes the focused
     // pane's OSC 7 cwd here without mutating the shared `factory`. `None` falls
     // back to `factory.cwd` (the `-d <dir>` flag, else the launch directory).
@@ -1702,6 +1842,11 @@ pub(crate) fn spawn_session(
     // spawn. `None` is the user's own agent config. Ignored on an adopted shell
     // (its label comes from `Adopted::identity`).
     identity: Option<&str>,
+    // A WORKER's task (`spawn agent=claude`, `task_launch`): written to its
+    // task file once the newborn's sid is known, the file named to the shell
+    // as `ATERM_TASK_FILE`. `None` for every other spawn; ignored on an
+    // adopted shell (its env is what it was).
+    task: Option<&crate::task_launch::TaskSeed>,
     // `Some(_)` re-adopts a live shell handed across a seamless-update re-exec
     // (its PTY master fd, pid and identity) instead of forking a fresh one.
     mut adopt: Option<Adopted>,
@@ -1786,6 +1931,8 @@ pub(crate) fn spawn_session(
         .as_ref()
         .map(|adopted| (adopted.supervisor.clone(), adopted.attention_owners.clone()))
         .unwrap_or_default();
+    // …and the task record (a worker's), re-seeded onto `ctx.timeline`.
+    let adopt_task: Option<String> = adopt.as_ref().and_then(|adopted| adopted.task.clone());
     // The identity LABEL this session wears: the name it is spawned under, or —
     // for an adopted shell, whose env is what it was — the one its record
     // carried across the handoff.
@@ -1943,11 +2090,25 @@ pub(crate) fn spawn_session(
                 .map_err(|e| std::io::Error::new(e.kind(), format!("identity {name}: {e}")))?;
             env_add.extend(crate::agent_identity::env(&dir));
         }
+        // A WORKER: its task file, written now that the sid naming it is
+        // known. A file that cannot be written fails the spawn: a worker
+        // without its task is no worker.
+        if let Some(task) = task {
+            let path = task
+                .write_for(&self_id)
+                .map_err(|e| std::io::Error::new(e.kind(), format!("the task file: {e}")))?;
+            env_add.push((
+                aterm_types::domain::ENV_TASK_FILE.to_string(),
+                path.to_string_lossy().into_owned(),
+            ));
+        }
         #[cfg(windows)]
         env_add.extend(tab_shell_env(
             factory.exec_command.is_some(),
             factory.shell_override.as_deref(),
         ));
+        #[cfg(windows)]
+        env_add.push(factory.shell_colorfgbg());
     }
     // A one-shot `-e <cmd>` session never hosts an inner aterm, so skip child
     // recursion provisioning entirely — the injected tokens + the retained
@@ -1982,6 +2143,9 @@ pub(crate) fn spawn_session(
     let carried_fg_holder = adopt.as_ref().map_or(0, |a| a.fg_holder);
     // THE RENDER DEBT the outgoing engine owed the screen (R08), seeded below.
     let carried_render_debt = adopt.as_ref().and_then(|a| a.render_debt);
+    // A fresh shell's pid version at its spawn, for the spare gate
+    // (`Witness::note_shell`); none for an adopted one.
+    let mut shell_version = None;
     // THE HISTORY CARRY (`crate::handoff_history`): the sidecar opened before
     // the proof rides the session to Commit, when it is imported; its keys are
     // reserved as the engine is hydrated below. `None` for every fresh shell.
@@ -2024,8 +2188,13 @@ pub(crate) fn spawn_session(
                 // A spare whose folder would fall back is no spare: nothing is
                 // said for a shell nobody asked for.
                 if spare.is_some() && start.fell_back.is_some() {
-                    return Err(std::io::Error::other("the spare's folder would fall back"));
+                    return Err(std::io::Error::other(crate::spare::FolderFallsBack));
                 }
+                // The fork waits here for the event loop to park, within the bound
+                // the spawning thread asked for (`watchdog::forks_wait_for_park`;
+                // none on the main thread): by now, past this spawn's own work,
+                // the loop has parked.
+                crate::watchdog::park_before_fork();
                 // Capture the child pid (`spawn_shell_with_pid`) so `Session::drop` can HANG
                 // UP the session (SIGHUP) before closing the master — the non-blocking
                 // teardown that keeps the UI thread off the tty lock (see `Session::drop`).
@@ -2055,7 +2224,17 @@ pub(crate) fn spawn_session(
                 if let Some(note) = aterm_pty::take_console_host_fallback() {
                     aterm_log::warn!("console host: {note}");
                 }
+                // The kit and the provision this spawn took are replaced off this
+                // thread, ready for the next (`spawn_prep`).
+                crate::spawn_prep::poke();
                 let aterm_pty::SpawnedShell { master, pid } = spawned?;
+                // The shell's pid version for the spare gate, read first, the
+                // moment its exec is confirmed: an `exec` in its startup files
+                // takes a newer one than the launcher of anything the rc left
+                // running before it (`spare::launched_before`).
+                if integrated_shell.is_some() {
+                    shell_version = crate::spare::shell_version(pid);
+                }
                 start.say();
                 // SAFETY: `master` is this session's forkpty master, freshly returned
                 // and owned solely here; the sink takes it over.
@@ -2135,9 +2314,9 @@ pub(crate) fn spawn_session(
         rewrap_gauge: std::sync::Arc::default(),
         human_input: Default::default(),
         launch: Default::default(),
-        generation_look: Default::default(),
         reset_lane: Default::default(),
         crash_journal: Default::default(),
+        typed: Default::default(),
         update_parked: Default::default(),
         fenced_writes: Default::default(),
         // A spare's is its link's, which its reader and the main thread share.
@@ -2146,7 +2325,7 @@ pub(crate) fn spawn_session(
     // The shell this session runs, for the spare's gate (its start record is
     // judged against it); a spare also holds its FIFO from here.
     if !adopted && integrated_shell.is_some() {
-        ctx.witness.note_shell(pid);
+        ctx.witness.note_shell(pid, shell_version);
     }
     if let Some(fifo) = spare_fifo {
         ctx.witness.hold_fifo(fifo);
@@ -2192,6 +2371,11 @@ pub(crate) fn spawn_session(
         &adopt_attention,
         crate::metrics::now_us(),
     );
+    // …and the task record a worker carried, after the claims (its attention
+    // flag is the seeded meta's): a manager parked in `await task` re-arms on
+    // the successor past each worker's rev from the start of its wait.
+    // Nothing for a fresh spawn.
+    crate::task_record::seed_carried(&ctx, adopt_task.as_deref());
 
     // SEAMLESS SCREEN CARRY: hydrate the adopted engine with the outgoing
     // process's checkpoint BEFORE the reader starts (no engine race) and before
@@ -2442,7 +2626,7 @@ pub(crate) fn spawn_session(
             // posts through the spare's link, which swallows every wake until
             // the adoption.
             Some(s) => attach_reader_with_post(&mut session, window, s.link.post(), factory),
-            None => attach_reader(&mut session, window, proxy, factory),
+            None => attach_reader_with_post(&mut session, window, proxy.wake_post(), factory),
         }
         .map_err(std::io::Error::other)?;
     }
@@ -2721,11 +2905,11 @@ impl Drop for PulseRestore {
 pub(crate) fn seed_adopted_render_debt(
     term: &Arc<Mutex<aterm_core::terminal::Terminal>>,
     timeline: &Mutex<crate::session_timeline::SessionTimeline>,
-    (shift, pushed): (i32, i32),
+    debt: aterm_core::terminal::RenderDebt,
 ) {
     let probe = {
         let mut engine = crate::term_lock(term);
-        engine.seed_render_debt(shift, pushed);
+        engine.seed_render_debt(debt);
         crate::resize_ledger::EngineProbe::sample(&engine)
     };
     timeline
@@ -2998,6 +3182,30 @@ mod pty_keyboard_posture_tests {
                 .keyboard_mode()
                 .contains(KeyboardMode::WIN32_INPUT)
         );
+    }
+
+    /// The posture a session whose spawn got OpenConsole takes is conhost's:
+    /// OpenConsole forwards the push, but a record reader (pwsh, cmd.exe) got
+    /// each CSI-u report as its characters typed one by one (1.24.2610.01001
+    /// and 1.25.2609.30003, 2026-10-17), so the protocol stays off there too.
+    #[test]
+    fn an_openconsole_session_does_not_advertise_the_kitty_keyboard_protocol() {
+        let term = live_engine();
+        crate::alt_screen_resync::apply_posture(
+            &mut term_lock(&term),
+            aterm_core::grid::ResizePolicy::ConPty,
+            Some(aterm_pty::ConsoleHostKind::OpenConsole),
+        );
+        let (reply, kitty, keys) = probe_then_push(&term);
+        assert_eq!(
+            reply, None,
+            "an OpenConsole session must not answer CSI ? u"
+        );
+        assert!(
+            kitty.is_empty(),
+            "a push must not reach the encoder: {kitty:?}"
+        );
+        assert_eq!(keys, [vec![0x0c], b"\x1ba".to_vec()]);
     }
 }
 
@@ -3447,6 +3655,60 @@ mod tab_shell_env_tests {
     }
 }
 
+/// A tab's integration is the one for the program its spawn resolves. On a
+/// Windows machine with neither PowerShell on PATH the default tab is
+/// `%COMSPEC%`'s cmd.exe, and it gets cmd's integration, not pwsh's; an alias
+/// is resolved before it is named, so Git Bash's `gitbash` is bash.
+#[cfg(test)]
+mod spawn_shell_type_tests {
+    use aterm_core::shell_integration::ShellType;
+    use std::ffi::{OsStr, OsString};
+
+    #[test]
+    fn the_integration_is_the_resolved_programs() {
+        let comspec = |hint: Option<&OsStr>| {
+            assert_eq!(hint, None);
+            OsString::from(r"C:\WINDOWS\system32\cmd.exe")
+        };
+        assert_eq!(super::spawn_shell_type(None, comspec), ShellType::Cmd);
+        let git_bash = |hint: Option<&OsStr>| {
+            assert_eq!(hint, Some(OsStr::new("gitbash")));
+            OsString::from(r"C:\Program Files\Git\bin\bash.exe")
+        };
+        assert_eq!(
+            super::spawn_shell_type(Some("gitbash"), git_bash),
+            ShellType::Bash
+        );
+        let pwsh = |_: Option<&OsStr>| OsString::from(r"C:\Program Files\PowerShell\7\pwsh.exe");
+        assert_eq!(super::spawn_shell_type(None, pwsh), ShellType::PowerShell);
+    }
+
+    /// The live resolver: what a default tab runs is what it is integrated as.
+    #[test]
+    fn the_default_tab_is_integrated_as_the_program_it_runs() {
+        let (program, _) = aterm_pty::select_shell_with_origin(None);
+        assert_eq!(
+            super::detect_spawn_shell(None),
+            ShellType::detect(&program.to_string_lossy())
+        );
+    }
+}
+
+/// vim's `term_bg_default` calls a background dark when `COLORFGBG`'s last
+/// field is 0-6 or 8, so a dark theme says `15;0`, a light one `0;15`, and an
+/// unknown appearance is aterm's default, dark.
+#[cfg(test)]
+mod colorfgbg_env_tests {
+    #[test]
+    fn colorfgbg_names_the_themes_background() {
+        use aterm_types::Appearance;
+        let pair = |a| super::colorfgbg_env(a);
+        assert_eq!(pair(None), ("COLORFGBG".to_string(), "15;0".to_string()));
+        assert_eq!(pair(Some(Appearance::Dark)).1, "15;0");
+        assert_eq!(pair(Some(Appearance::Light)).1, "0;15");
+    }
+}
+
 #[cfg(test)]
 mod child_identity_env_tests {
     use super::{provision_child_identity_env, provision_child_recursion_env};
@@ -3679,7 +3941,8 @@ pub(crate) fn attach_reader(
 }
 
 /// [`attach_reader`] with the reader's posts going to `post` (a warm spare's
-/// link, `crate::spare::SpareLink::post`): live, no start gate.
+/// link, `crate::spare::SpareLink::post`, or a spawn's [`WakeTarget`]): live, no
+/// start gate.
 pub(crate) fn attach_reader_with_post(
     session: &mut Session,
     window: WindowId,
@@ -3745,6 +4008,20 @@ pub(crate) fn post_to(proxy: &EventLoopProxy<Wake>) -> WakePost {
     Arc::new(move |wake| proxy.send_event(wake).is_ok())
 }
 
+/// Where [`spawn_session`] wires a session's reader and host callbacks to post: the
+/// event loop's proxy, or, for session 0, which is spawned before the loop is built
+/// (`main_entry`), a sink that holds every post until the loop exists (`LaneSink`).
+pub(crate) trait WakeTarget {
+    /// A [`WakePost`] onto this target.
+    fn wake_post(&self) -> WakePost;
+}
+
+impl WakeTarget for EventLoopProxy<Wake> {
+    fn wake_post(&self) -> WakePost {
+        post_to(self)
+    }
+}
+
 fn attach_reader_inner(
     session: &mut Session,
     window: WindowId,
@@ -3758,6 +4035,14 @@ fn attach_reader_inner(
     // old thread is past its last blocking read.
     if let Some(join) = session.reader_join.take() {
         let _ = join.join();
+    }
+    // The engine asks the host, lazily, whether the shell runs a program it
+    // started since its prompt where no foreground group shows one
+    // (`SessionFactory::program_probe`): an adopted engine gets it here too.
+    {
+        let (probe, shell) = (factory.program_probe, session.pid);
+        crate::term_lock(&session.term)
+            .set_program_probe(Some(Box::new(move |since_ms| probe(shell, since_ms))));
     }
     let cast_tx = spawn_cast_writer(session.ctx.cast.clone())?;
     // The reader's handle on the recorder's DROP count and its epoch: taken
@@ -3778,9 +4063,12 @@ fn attach_reader_inner(
     let (temporal_tx, temporal_writer_join, spine_mark) = if factory.temporal_recording {
         // The spine records each resize's geometry only; the seam policy the
         // engine resizes with is the backend's, so the replay takes it from
-        // here. Asked BEFORE the recorder lock: the answer takes the PTY
-        // registry's own lock, which must not nest under this one.
+        // here, and the host's alternate-screen recovery with it. Asked BEFORE
+        // the recorder lock: each answer takes the PTY registry's own lock,
+        // which must not nest under this one.
         let policy = crate::app_render::pty_resize_policy(session.master);
+        let host_resyncs =
+            crate::alt_screen_resync::host_resyncs(aterm_pty::conpty_host(session.master));
         // This reader's resize watermark starts where the session's previous
         // reader left the spine (both it and its writer were joined above), so
         // a resize that landed while no reader was attached is recorded from
@@ -3792,6 +4080,7 @@ fn attach_reader_inner(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             rec.set_resize_policy(policy);
+            rec.set_host_resyncs_alt_screen(host_resyncs);
             crate::temporal::SpineMark::attach(rec.spine_watermark())
         };
         let (tx, join) = spawn_temporal_writer(session.ctx.temporal.clone())?;
@@ -3803,7 +4092,10 @@ fn attach_reader_inner(
     // of writing them inline, so it never parks on the input-pipe write.
     // The join handle is dropped (detached): the thread ends on its own when its
     // reader drops the sender or the sink drops (see `spawn_reply_writer`).
-    let (reply_tx, _reply_writer_join) = spawn_reply_writer(session.ctx.sink.clone())?;
+    let (reply_tx, _reply_writer_join) = spawn_reply_writer(
+        session.ctx.sink.clone(),
+        ReportRoute::of(&session.term, &session.ctx.modes),
+    )?;
     // Input watch: a write that lands in the kernel's input queue while the
     // watch is unarmed posts `Wake::InputWatch` once, and the main thread probes
     // whether the program reads it (`App::observe_input_stalls`); this attach
@@ -3870,6 +4162,10 @@ fn attach_reader_inner(
             probe: factory.fg_probe,
             gone: factory.fg_gone,
             holder: session.fg_holder.clone(),
+            shell: session.pid,
+            image: factory.edge_image,
+            inbox: factory.edge_inbox.clone(),
+            byte_arm: factory.byte_arm,
         },
         timeline: session.ctx.timeline.clone(),
         person: session.ctx.human_input.clone(),
@@ -3996,6 +4292,19 @@ mod dsu_quiescence_conformance;
 #[cfg(all(test, unix))]
 #[path = "foreground_handback_conformance.rs"]
 mod foreground_handback_conformance;
+
+/// Which cwd report sets a tab's folder, through the real reader: its
+/// per-slice foreground word and the program probe it installs.
+#[cfg(all(test, unix))]
+#[path = "cwd_report_reader_tests.rs"]
+mod cwd_report_reader_tests;
+
+/// The holder image through the real reader (card engine I1): published
+/// before the hold of its first byte, by a group edge, an `exec` after a
+/// signed C and a launcher's `exec`.
+#[cfg(all(test, unix))]
+#[path = "holder_image_reader_tests.rs"]
+mod holder_image_reader_tests;
 
 /// THE TAB ENDS WITH ITS SHELL (docs/AUDIT-pty-render-2026-10-09.md P3, in the
 /// window's reader). The real reader on a real pseudo-terminal whose slave the
@@ -4235,6 +4544,7 @@ mod park_reader_tests {
             &session.output_wake_pending,
             1_001,
             0,
+            false,
             || tx.send(()).is_ok(),
             || 1_002,
         );
@@ -4629,7 +4939,7 @@ pub(crate) fn arm_host_reach(
     term: &Arc<Mutex<Terminal>>,
     reach: HostReach,
     factory: &SessionFactory,
-    proxy: &EventLoopProxy<Wake>,
+    proxy: &dyn WakeTarget,
     id: u64,
     window: WindowId,
     witness: &Arc<crate::spare::Witness>,
@@ -4671,7 +4981,7 @@ fn deliver_clip_write(write: ClipWrite) {
 fn install_clipboard(
     term: &Arc<Mutex<Terminal>>,
     reach: HostReach,
-    mut deliver: impl FnMut(ClipWrite) + Send + 'static,
+    deliver: impl FnMut(ClipWrite) + Send + 'static,
 ) {
     if reach == HostReach::Refused {
         // No worker, no callback: `deliver` drops here, unused.
@@ -4681,14 +4991,30 @@ fn install_clipboard(
         return;
     }
     let (clip_tx, clip_rx) = clip_mailbox();
-    std::thread::spawn(move || {
-        // The mailbox keeps at most one pending update while a platform call is
-        // blocked. Each selection is last-writer-wins, so a flood collapses to
-        // the latest value per destination without retaining every payload.
-        while let Some(write) = clip_rx.recv() {
-            deliver(write);
-        }
-    });
+    // The worker starts with the session's first clipboard write, not with the
+    // session: OSC 52 is rare, and a parked thread per tab is a stack every
+    // later fork of this process copies into the child's VM map (a new tab's
+    // fork grew about 10 µs per open tab, measured 2026-10-17). One that cannot
+    // start leaves the writes unsent, as a refused reach does.
+    let mut idle = Some((clip_rx, deliver));
+    let mut start_worker = move || {
+        let Some((clip_rx, mut deliver)) = idle.take() else {
+            return;
+        };
+        #[cfg(test)]
+        crate::work_counts::clipboard_worker_started();
+        let _ = std::thread::Builder::new()
+            .name("aterm-clipboard".into())
+            .spawn(move || {
+                // The mailbox keeps at most one pending update while a platform
+                // call is blocked. Each selection is last-writer-wins, so a
+                // flood collapses to the latest value per destination without
+                // retaining every payload.
+                while let Some(write) = clip_rx.recv() {
+                    deliver(write);
+                }
+            });
+    };
     let mut t = term_lock(term);
     t.authorize_clipboard_access(ClipboardAccess::Write);
     // Off X11, `route_osc52_write` folds 'p' into the clipboard instead — the
@@ -4701,10 +5027,12 @@ fn install_clipboard(
             content,
         } => {
             clip_tx.publish(route_osc52_write(&selections, &content, primary_supported));
+            start_worker();
             None
         }
         ClipboardOperation::Clear { selections } => {
             clip_tx.publish(route_osc52_write(&selections, "", primary_supported));
+            start_worker();
             None
         }
         // Reached only through a minted `ClipboardQueryCapability`
@@ -4815,16 +5143,16 @@ fn configure_palette_refusal(term: &Arc<Mutex<Terminal>>) {
 /// beeps/flashes.
 fn configure_bell(
     term: &Arc<Mutex<Terminal>>,
-    proxy: &EventLoopProxy<Wake>,
+    proxy: &dyn WakeTarget,
     id: u64,
     window: WindowId,
     witness: &Arc<crate::spare::Witness>,
 ) {
-    let proxy = proxy.clone();
+    let post = proxy.wake_post();
     let witness = Arc::clone(witness);
     term_lock(term).set_bell_callback(move || {
         witness.host_effects.fetch_add(1, Ordering::Relaxed);
-        let _ = proxy.send_event(Wake::Bell {
+        let _ = post(Wake::Bell {
             session: id,
             window,
         });
@@ -4844,14 +5172,14 @@ fn configure_bell(
 #[cfg(target_os = "linux")]
 fn configure_window_ops(
     term: &Arc<Mutex<Terminal>>,
-    proxy: &EventLoopProxy<Wake>,
+    proxy: &dyn WakeTarget,
     id: u64,
     window: WindowId,
 ) {
-    let proxy = proxy.clone();
+    let post = proxy.wake_post();
     term_lock(term).set_window_callback(move |op| {
         if let Some(wake) = window_op_wake(op, id, window) {
-            let _ = proxy.send_event(wake);
+            let _ = post(wake);
         }
         // Manipulations answer no bytes; reports keep the engine's fallbacks —
         // so the callback's reply is `None` either way.
@@ -4911,9 +5239,14 @@ pub(crate) const MAX_KITTY_MEDIUM_BYTES: u64 = 4 * 1024 * 1024;
 /// fail-closed policy and return the raw image bytes:
 /// - `t=f` (file): read a regular file, size-capped.
 /// - `t=t` (temp file): read it, then delete it — only as the protocol allows
-///   ([`read_kitty_temp_file`]).
+///   ([`consume_kitty_temp_file`]).
 /// - `t=s` (shared memory): `shm_open(O_RDONLY)` + `mmap`, copy out, then
 ///   `shm_unlink`.
+///
+/// A `t=t` file or `t=s` object is consumed only once the engine has taken
+/// what was read for it ([`consume_kitty_medium`], after the hold): one the
+/// engine refuses before asking (a size it does not load, a resolver gone, the
+/// string budget) is left where the program put it.
 ///
 /// Readability is bounded by our uid and size by the cap. The engine never
 /// touches the filesystem or shm itself.
@@ -4931,19 +5264,35 @@ fn configure_kitty_file_transfer(term: &Arc<Mutex<Terminal>>, reach: HostReach) 
 }
 
 /// One Kitty non-direct medium's bytes, read under [`configure_kitty_file_transfer`]'s
-/// policy: `t=f` a regular file, `t=t` a temporary file (deleted as the protocol
-/// allows), `t=s` a shared-memory object. Direct is the engine's own; any future
-/// medium fails closed.
+/// policy: `t=f` a regular file, `t=t` a temporary file, `t=s` a shared-memory
+/// object. It consumes nothing ([`consume_kitty_medium`] does, once the engine has
+/// taken the bytes). Direct is the engine's own; any future medium fails closed.
 pub(crate) fn read_kitty_medium(
     medium: aterm_core::terminal::kitty_graphics::KittyMedium,
     name: &str,
 ) -> Option<Vec<u8>> {
     use aterm_core::terminal::kitty_graphics::KittyMedium;
     match medium {
-        KittyMedium::File => read_kitty_file(Path::new(name)),
-        KittyMedium::TempFile => read_kitty_temp_file(Path::new(name)),
+        KittyMedium::File | KittyMedium::TempFile => read_kitty_file(Path::new(name)),
         KittyMedium::SharedMemory => read_posix_shm(name),
         _ => None,
+    }
+}
+
+/// Consume a medium the engine took ([`read_kitty_medium`]'s read of it, `read`
+/// whether that read returned bytes): a `t=t` file read is deleted as the protocol
+/// allows ([`consume_kitty_temp_file`]), and a `t=s` object is unlinked, read or not
+/// (the client handed it over). A `t=f` file is never the terminal's to remove.
+pub(crate) fn consume_kitty_medium(
+    medium: aterm_core::terminal::kitty_graphics::KittyMedium,
+    name: &str,
+    read: bool,
+) {
+    use aterm_core::terminal::kitty_graphics::KittyMedium;
+    match medium {
+        KittyMedium::TempFile if read => consume_kitty_temp_file(Path::new(name)),
+        KittyMedium::SharedMemory => unlink_posix_shm(name),
+        _ => {}
     }
 }
 
@@ -4984,27 +5333,25 @@ fn read_kitty_file(path: &Path) -> Option<Vec<u8>> {
 /// temporary file before the terminal may delete it.
 const KITTY_TEMP_FILE_MARKER: &str = "tty-graphics-protocol";
 
-/// Read a Kitty `t=t` temporary file as `t=f` reads any file, and delete it
-/// only where the protocol's security rule allows: in a known temporary
+/// Delete a Kitty `t=t` temporary file the engine took (read as `t=f` reads any
+/// file), only where the protocol's security rule allows: in a known temporary
 /// directory ([`kitty_temp_dirs`]), with [`KITTY_TEMP_FILE_MARKER`] in its
-/// path. Any other file is read and kept, as kitty keeps it.
+/// path. Any other file is kept, as kitty keeps it.
 ///
 /// The path comes from the program in the tab, which may be a remote host or
 /// a file being `cat`, so without this rule a transmission naming any file
 /// the user can write deletes it.
-fn read_kitty_temp_file(path: &Path) -> Option<Vec<u8>> {
-    read_kitty_temp_file_with(path, || {})
+fn consume_kitty_temp_file(path: &Path) {
+    consume_kitty_temp_file_with(path, || {});
 }
 
-/// [`read_kitty_temp_file`], running `before_unlink` once the entry has been
+/// [`consume_kitty_temp_file`], running `before_unlink` once the entry has been
 /// judged deletable and just before it is unlinked: the window a test swaps a
 /// directory in.
-fn read_kitty_temp_file_with(path: &Path, before_unlink: impl FnOnce()) -> Option<Vec<u8>> {
-    let bytes = read_kitty_file(path)?;
+fn consume_kitty_temp_file_with(path: &Path, before_unlink: impl FnOnce()) {
     if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
         consume_kitty_temp_entry(dir, name, before_unlink); // the client's temp file
     }
-    Some(bytes)
 }
 
 /// Whether the protocol lets a `t=t` entry at `entry` (its directory resolved)
@@ -5102,8 +5449,8 @@ fn kitty_temp_dirs() -> Vec<std::path::PathBuf> {
 }
 
 /// Read a POSIX shared-memory object by name (`shm_open` + `mmap`, size-capped),
-/// then `shm_unlink` it (the Kitty client expects the terminal to consume + remove
-/// it). Returns `None` on any error. `unix`-only; a no-op stub elsewhere.
+/// leaving it in place ([`unlink_posix_shm`] removes it once the engine took it).
+/// Returns `None` on any error. `unix`-only; a no-op stub elsewhere.
 #[cfg(unix)]
 fn read_posix_shm(name: &str) -> Option<Vec<u8>> {
     let cname = std::ffi::CString::new(name).ok()?;
@@ -5148,9 +5495,6 @@ fn read_posix_shm(name: &str) -> Option<Vec<u8>> {
     })();
     // SAFETY: `fd` is valid; closing once.
     unsafe { libc::close(fd) };
-    // Remove the object name regardless (the client handed ownership to us).
-    // SAFETY: `cname` is a valid C string; `shm_unlink` tolerates an absent name.
-    unsafe { libc::shm_unlink(cname.as_ptr()) };
     result
 }
 
@@ -5158,6 +5502,21 @@ fn read_posix_shm(name: &str) -> Option<Vec<u8>> {
 fn read_posix_shm(_name: &str) -> Option<Vec<u8>> {
     None
 }
+
+/// Remove a POSIX shared-memory object's name: the Kitty client handed the object
+/// to the terminal, which consumes it once the engine took it, whether or not its
+/// read succeeded. `unix`-only; a no-op elsewhere.
+#[cfg(unix)]
+fn unlink_posix_shm(name: &str) {
+    let Ok(cname) = std::ffi::CString::new(name) else {
+        return;
+    };
+    // SAFETY: `cname` is a valid C string; `shm_unlink` tolerates an absent name.
+    unsafe { libc::shm_unlink(cname.as_ptr()) };
+}
+
+#[cfg(not(unix))]
+fn unlink_posix_shm(_name: &str) {}
 
 /// Bound on the asciicast writer's queue: the reader `try_send`s and drops on a
 /// full queue, so a stalled writer cannot accumulate bursts (each up to a 64 KiB
@@ -5241,7 +5600,9 @@ fn spawn_temporal_writer(
 }
 
 /// PTY query-reply writer thread: the reader hands DA/DSR/CPR replies
-/// (`take_response()`) here lock-free and never writes them inline. An inline
+/// (`take_response()`), and behind them the reports the engine sent unasked
+/// (`take_reports()`, handed on by their [`ReportRoute`]), here lock-free and
+/// never writes them inline. An inline
 /// write to the PTY input can block when the child is not reading input, which
 /// would stop the reader draining output and deadlock the session (on Windows
 /// it would also hang `ClosePseudoConsole`, which drains through the reader).
@@ -5264,6 +5625,9 @@ pub(crate) enum ReplyJob {
     /// A DA/DSR/CPR/kitty-query reply from the parser, written in order, with
     /// its bytes held against the sink's reply budget until it is written.
     Bytes(std::sync::Arc<[u8]>, aterm_session::sink::ReplyPermit),
+    /// A report the engine sent unasked (`Terminal::take_reports`: a resize's
+    /// DEC 2048 report, a DSR 997 push), handed on by its [`ReportRoute`].
+    Report(std::sync::Arc<[u8]>, aterm_session::sink::ReplyPermit),
     /// A non-parking writer spilled with no drainer live: spawn it from here.
     ArrangeSpillDrainer,
 }
@@ -5283,10 +5647,25 @@ impl ReplyLane {
     /// `try_send`. A full budget, a full queue or a closing session drops the
     /// reply, counted as `reply_dropped`. `true` when queued.
     pub(crate) fn submit(&self, reply: std::sync::Arc<[u8]>) -> bool {
+        self.queue(reply, ReplyJob::Bytes)
+    }
+
+    /// [`Self::submit`] for a report the engine sent unasked, which the writer
+    /// hands to its [`ReportRoute`] instead of writing it as a reply. Behind the
+    /// replies of its burst, on the same FIFO and budget.
+    pub(crate) fn submit_report(&self, report: std::sync::Arc<[u8]>) -> bool {
+        self.queue(report, ReplyJob::Report)
+    }
+
+    fn queue(
+        &self,
+        bytes: std::sync::Arc<[u8]>,
+        job: fn(std::sync::Arc<[u8]>, aterm_session::sink::ReplyPermit) -> ReplyJob,
+    ) -> bool {
         let queued = self
             .budget
-            .try_reserve(reply.len())
-            .is_some_and(|permit| self.tx.try_send(ReplyJob::Bytes(reply, permit)).is_ok());
+            .try_reserve(bytes.len())
+            .is_some_and(|permit| self.tx.try_send(job(bytes, permit)).is_ok());
         if !queued {
             crate::metrics::note_reply_dropped();
         }
@@ -5294,8 +5673,62 @@ impl ReplyLane {
     }
 }
 
+/// Where the reply writer sends a report the engine sent unasked
+/// ([`ReplyJob::Report`]). On Windows: the input's way, the session's ordered
+/// input writer, as a mouse or focus report goes
+/// (`app_input::write_ui_report`). A report is input the program asked for in
+/// advance, so the ConPTY resize guard must lead it (`aterm_pty`'s
+/// `resize_guard`: the MSYS2 runtime drops the record after a size event, and
+/// a resize's DEC 2048 report was that record, its ESC lost, `[48;30;100;…t`
+/// typed into vim), and the guard's OpenConsole client may wait on the console
+/// host, which may be waiting for a reply queued behind the report on the
+/// reply writer's FIFO: the input writer waits, the reply writer never does.
+/// Elsewhere nothing guards a PTY's input, and a report is written as a reply.
+#[derive(Clone, Default)]
+pub(crate) struct ReportRoute {
+    /// The session's engine (weakly: this writer must not keep a closed
+    /// session's engine alive) and its mode mirror, which the input route
+    /// takes.
+    #[cfg(windows)]
+    input: Option<(
+        std::sync::Weak<Mutex<Terminal>>,
+        Arc<aterm_core::terminal::ModeMirror>,
+    )>,
+}
+
+impl ReportRoute {
+    /// The route of the session whose engine and mode mirror these are.
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    pub(crate) fn of(
+        term: &Arc<Mutex<Terminal>>,
+        modes: &Arc<aterm_core::terminal::ModeMirror>,
+    ) -> Self {
+        Self {
+            #[cfg(windows)]
+            input: Some((Arc::downgrade(term), Arc::clone(modes))),
+        }
+    }
+
+    /// Hand `report` to the input route; `false` when there is none (off
+    /// Windows, a route made by `Default`, an engine already gone) and the
+    /// caller writes it as a reply.
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    fn send(&self, sink: &Arc<SinkWriter>, report: &[u8]) -> bool {
+        #[cfg(windows)]
+        if let Some((term, modes)) = &self.input
+            && let Some(term) = term.upgrade()
+        {
+            let ev = crate::input::InputEvent::KeySequence(report.to_vec());
+            crate::app_input::write_ui_report(&term, modes, sink, &ev);
+            return true;
+        }
+        false
+    }
+}
+
 fn spawn_reply_writer(
     sink: Arc<SinkWriter>,
+    reports: ReportRoute,
 ) -> Result<(ReplyLane, std::thread::JoinHandle<()>), String> {
     let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel::<ReplyJob>(REPLY_QUEUE_CAP);
     // The spill-arranger `poke` installed below is a sender of this thread's
@@ -5322,11 +5755,22 @@ fn spawn_reply_writer(
                 // ordered drainer instead of parking here with the lock held.
                 // Oversized replies fall back to the blocking path inside.
                 // A reply, not driven input: a shell that was only answered
-                // has still not been used (`ShellStart::input`).
+                // has still not been used (`ShellStart::input`), and on
+                // Windows it passes the ConPTY resize guard, which stays owed
+                // to the next input (`aterm_pty::as_reply`: OpenConsole waits
+                // for its own cursor query's answer after a resize).
                 ReplyJob::Bytes(resp, permit) => {
-                    let _ = sink.write_reply(&resp);
+                    let _ = aterm_pty::as_reply(|| sink.write_reply(&resp));
                     // Written (or failed with a dying session): the reply
                     // budget has these bytes back.
+                    drop(permit);
+                }
+                // Handed on without waiting for it to be written (`ReportRoute`),
+                // or, with no route, written as a reply is.
+                ReplyJob::Report(report, permit) => {
+                    if !reports.send(&sink, &report) {
+                        let _ = aterm_pty::as_reply(|| sink.write_reply(&report));
+                    }
                     drop(permit);
                 }
                 ReplyJob::ArrangeSpillDrainer => sink.arrange_pending_drainer(),
@@ -5361,11 +5805,11 @@ fn spawn_reply_writer(
 
 /// Test seam: a real reply writer over `sink`, for the egress-contract tests
 /// that drive replies and pastes through one session's sink.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn spawn_reply_writer_for_test(
     sink: Arc<SinkWriter>,
 ) -> (ReplyLane, std::thread::JoinHandle<()>) {
-    spawn_reply_writer(sink).expect("spawn the reply writer")
+    spawn_reply_writer(sink, ReportRoute::default()).expect("spawn the reply writer")
 }
 
 /// The reply writer's ONE thread creation, behind a seam
@@ -5401,12 +5845,72 @@ fn take_injected_reply_writer_spawn_fault() -> bool {
     false
 }
 
+/// Where the reply writer puts a report the engine sent unasked, on Windows.
+#[cfg(all(test, windows))]
+mod report_route_tests {
+    use super::{ReportRoute, new_live_terminal, spawn_reply_writer};
+    use aterm_session::sink::SinkWriter;
+    use aterm_spec::wait::{MUST_HAPPEN, within};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// A sink on a key no ConPTY session has: its writes fail, but every
+    /// attempt is counted first, which is what these tests read.
+    fn sink() -> Arc<SinkWriter> {
+        Arc::new(SinkWriter::new(0x7fff_0f0f))
+    }
+
+    /// With its session's route a report goes the input's way, through the
+    /// ordered input writer, as a focus report does: it is input someone drove
+    /// (`driven_input` moves), so the ConPTY resize guard leads it. Written as
+    /// a reply (the old way, which left the record the MSYS2 runtime drops after
+    /// a size event to the report's ESC, `[48;30;100;600;900t` typed into vim)
+    /// it never moves `driven_input`.
+    #[test]
+    fn a_report_goes_the_input_way() {
+        let term = Arc::new(Mutex::new(new_live_terminal(24, 80, None, None)));
+        let modes = Arc::clone(crate::term_lock(&term).mode_mirror());
+        let sink = sink();
+        let before = sink.driven_input();
+        let (lane, _join) = spawn_reply_writer(sink.clone(), ReportRoute::of(&term, &modes))
+            .expect("the reply writer");
+        assert!(lane.submit_report(Arc::from(&b"\x1b[48;30;100;600;900t"[..])));
+        let driven = within(MUST_HAPPEN, Duration::from_millis(1), || {
+            (sink.driven_input() != before).then_some(())
+        });
+        assert!(driven.is_some(), "the report was never input");
+    }
+
+    /// Negative control: a reply moves the input epoch and not `driven_input`,
+    /// and so does a report with no route (a route made by `Default`).
+    #[test]
+    fn a_reply_and_a_routeless_report_are_not_input() {
+        for reply in [true, false] {
+            let sink = sink();
+            let (epoch, driven) = (sink.input_epoch(), sink.driven_input());
+            let (lane, _join) =
+                spawn_reply_writer(sink.clone(), ReportRoute::default()).expect("the reply writer");
+            let bytes = Arc::from(&b"\x1b[1;1R"[..]);
+            assert!(if reply {
+                lane.submit(bytes)
+            } else {
+                lane.submit_report(bytes)
+            });
+            let written = within(MUST_HAPPEN, Duration::from_millis(1), || {
+                (sink.input_epoch() != epoch).then_some(())
+            });
+            assert!(written.is_some(), "the writer wrote it");
+            assert_eq!(sink.driven_input(), driven, "not input anyone drove");
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod reply_writer_lifetime_tests {
     //! The reply writer's spill-arranger duty must not pin the session: the
     //! arranger's sender lives inside the sink, so a writer holding the sink
     //! strongly would keep its channel, spill state and PTY master alive.
-    use super::spawn_reply_writer;
+    use super::{ReportRoute, spawn_reply_writer};
     use aterm_session::sink::SinkWriter;
     use std::io::Read as _;
     use std::os::unix::net::UnixStream;
@@ -5473,7 +5977,8 @@ mod reply_writer_lifetime_tests {
     fn the_reply_writer_runs_at_the_class_the_keystroke_path_needs() {
         use std::os::unix::thread::JoinHandleExt as _;
         let (sink, mut peer) = sink_and_peer();
-        let (reply_tx, join) = spawn_reply_writer(sink.clone()).expect("spawn");
+        let (reply_tx, join) =
+            spawn_reply_writer(sink.clone(), ReportRoute::default()).expect("spawn");
         let thread = join.as_pthread_t() as libc::pthread_t;
         // The class is the inherited default until the closure's first statement
         // runs, so read it only once that statement has run — BY ORDER, not by
@@ -5498,8 +6003,10 @@ mod reply_writer_lifetime_tests {
     #[test]
     fn a_reattached_writer_ends_with_its_reader_and_the_first_with_the_sink() {
         let (sink, mut peer) = sink_and_peer();
-        let (first_tx, first_join) = spawn_reply_writer(sink.clone()).expect("spawn");
-        let (second_tx, second_join) = spawn_reply_writer(sink.clone()).expect("re-attach");
+        let (first_tx, first_join) =
+            spawn_reply_writer(sink.clone(), ReportRoute::default()).expect("spawn");
+        let (second_tx, second_join) =
+            spawn_reply_writer(sink.clone(), ReportRoute::default()).expect("re-attach");
         drop(first_tx);
         drop(second_tx);
         // The re-attach's writer holds nothing but its reader's sender: gone now.
@@ -5523,13 +6030,15 @@ mod reply_writer_lifetime_tests {
     fn a_failed_spawn_leaves_the_arranger_slot_to_the_retried_attach() {
         let (sink, mut peer) = sink_and_peer();
         super::REPLY_WRITER_SPAWN_FAULT.with(|f| f.set(true));
-        spawn_reply_writer(sink.clone()).expect_err("the injected spawn failure surfaces");
+        spawn_reply_writer(sink.clone(), ReportRoute::default())
+            .expect_err("the injected spawn failure surfaces");
         assert!(
             !super::take_injected_reply_writer_spawn_fault(),
             "the fault is one-shot: consumed by the failed attempt"
         );
         // The retry — a fresh writer into the same sink.
-        let (retry_tx, retry_join) = spawn_reply_writer(sink.clone()).expect("the retry spawns");
+        let (retry_tx, retry_join) =
+            spawn_reply_writer(sink.clone(), ReportRoute::default()).expect("the retry spawns");
         assert!(retry_tx.submit(Arc::from(&b"ok"[..])), "queued");
         let mut buf = [0u8; 2];
         peer.read_exact(&mut buf)
@@ -5908,14 +6417,17 @@ pub(crate) enum GatherMsg {
     /// The deferred start gate released — the parse stage may post `Ready`.
     Started,
     /// One gathered batch (buffer, filled length, the foreground change it
-    /// carries, and the group whose bytes END it — `edge.to` with an edge). The
-    /// parse stage returns the buffer on the free channel after processing, and
-    /// runs the foreground handback at the edge's offset.
+    /// carries, the group whose bytes END it — `edge.to` with an edge — and,
+    /// with an edge, `edge.to`'s image as the gather read it at the edge,
+    /// `crate::holder_image`). The parse stage returns the buffer on the free
+    /// channel after processing, offers the image before the hold of the slice
+    /// at the edge's offset, and runs the foreground handback in that hold.
     Data(
         Vec<u8>,
         usize,
         Option<crate::foreground_handback::FgEdge>,
         i32,
+        Option<Arc<crate::holder_image::HolderImage>>,
     ),
     /// The master EOF'd on its own (shell exited).
     Eof,
@@ -5975,6 +6487,9 @@ fn spawn_pty_gather(
     // `Session::fg_holder`: the holder the previous reader last saw (the seed)
     // and where this one leaves its own.
     fg_holder: Arc<std::sync::atomic::AtomicI32>,
+    // `SessionFactory::edge_image`: the new holder's image, read at each edge
+    // the cut finds (card engine §3.4).
+    edge_image: fn(i32) -> crate::holder_image::HolderImage,
     // The manual reset's lane generation (`crate::manual_reset`), held for the
     // thread's life: its drop removes the lane's clone of `filled_tx` on every
     // exit path, so the channel ends with this thread and the parse stage's
@@ -6131,6 +6646,13 @@ fn spawn_pty_gather(
                             aterm_pty::drain_more(master, &mut buf, n)
                         };
                         let edge = cutter.finish(|| fg_probe(master), filled);
+                        // THE HOLDER'S IMAGE AT THE EDGE (card engine §3.4): read
+                        // here, at the sample that found the new group, not when
+                        // the parse stage reaches the cut, so a lagging parse
+                        // stage never pairs a later image with this cut.
+                        let image = edge
+                            .filter(|e| e.to > 0)
+                            .map(|e| Arc::new(edge_image(e.to)));
                         let holder = cutter.holder();
                         if holder > 0 {
                             fg_holder.store(holder, Ordering::Release);
@@ -6154,7 +6676,7 @@ fn spawn_pty_gather(
                             journal.gathered(filled);
                         }
                         if filled_tx
-                            .send(GatherMsg::Data(buf, filled, edge, holder))
+                            .send(GatherMsg::Data(buf, filled, edge, holder, image))
                             .is_err()
                         {
                             break; // parse stage gone (session torn down)
@@ -6187,6 +6709,16 @@ struct ForegroundWiring {
     gone: crate::foreground_handback::FgGone,
     /// `Session::fg_holder`: the gather's seed, and where it leaves its holder.
     holder: Arc<std::sync::atomic::AtomicI32>,
+    /// The shell's pid, which is its group's: a slice another group holds is a
+    /// job's output (`Terminal::set_foreground_job`).
+    shell: i32,
+    /// [`SessionFactory::edge_image`]: read by the gather at an edge and by the
+    /// parse stage's byte arm.
+    image: fn(i32) -> crate::holder_image::HolderImage,
+    /// [`SessionFactory::edge_inbox`].
+    inbox: crate::holder_image::EdgeInbox,
+    /// [`SessionFactory::byte_arm`].
+    byte_arm: bool,
 }
 
 /// The owned wiring [`spawn_pty_reader`] moves into THIS session's reader thread:
@@ -6355,9 +6887,20 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
     // The parse stage's liveness probe (the orphan half of the foreground
     // handback). ConPTY has no foreground group, so off unix nothing is gone.
     #[cfg(unix)]
-    let fg_gone = fg.gone;
+    let (fg_gone, fg_shell) = (fg.gone, fg.shell);
     #[cfg(not(unix))]
-    let fg_gone: crate::foreground_handback::FgGone = |_, _, _| false;
+    let (fg_gone, fg_shell): (crate::foreground_handback::FgGone, i32) = (|_, _, _| false, 0);
+    // The holder image's half of the edge (card engine §3.4-§3.6): the reader
+    // the byte arm re-reads with, the App's edged inbox, and whether the arm
+    // runs. ConPTY has no foreground group: no edge, no arm.
+    #[cfg(unix)]
+    let (fg_image, edge_inbox, byte_arm) = (fg.image, fg.inbox.clone(), fg.byte_arm);
+    #[cfg(not(unix))]
+    let (fg_image, edge_inbox, byte_arm): (
+        fn(i32) -> crate::holder_image::HolderImage,
+        crate::holder_image::EdgeInbox,
+        bool,
+    ) = (crate::holder_image::unread, Default::default(), false);
     // The unix pipeline's two stages: this thread becomes the parse stage, fed
     // recycled 64 KiB batches over a bounded channel by the gather. The gather
     // is wired here and spawned LAST: it owns the wake pipe's read end and
@@ -6411,6 +6954,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 sink,
                 fg.probe,
                 fg.holder,
+                fg.image,
                 lane_guard,
                 gather_journal,
             )
@@ -6492,9 +7036,62 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
             // The platform reads a slice can ask for, done before its hold
             // (`crate::host_io_prefetch`), and what the session admits of them.
             let mut prefetch = crate::host_io_prefetch::Prefetch::default();
+            // This reader's `Wake::Output` posts: whether its next one is a
+            // streaming session's ([`PostCadence`]).
+            let mut cadence = PostCadence::default();
+            // THE BYTE-DRIVEN ARM (card engine §3.6, `crate::holder_image`),
+            // when this reader runs it: seeded from the timeline, so a reader
+            // re-attached mid-launch still re-reads a published Launcher.
+            let mut arm = byte_arm.then(|| {
+                let executing = {
+                    let t = term_lock(&term);
+                    t.is_require_shell_integration_nonce()
+                        && t.shell_state() == aterm_core::terminal::ShellState::Executing
+                };
+                crate::holder_image::ByteArm::seeded(&timeline, executing)
+            });
+            // The dev `card-seen` probe's budget per drawer token: how many
+            // more batches may look for its card (`DEV_ROWS` builds only).
+            let mut card_probe: Option<(u64, u16)> = None;
+            // THE HOLDER IMAGE'S PUBLICATION (card engine §3.4 step 2), before
+            // the hold of the slice it is offered at: the timeline (a leaf lock,
+            // nothing else held), then, when it published, this session's id in
+            // the App's edged inbox and the coalesced output wake, so the status
+            // sweep names the program on its next turn (§3.5).
+            let publish_holder =
+                |image: Arc<crate::holder_image::HolderImage>,
+                 kind: crate::holder_image::EdgeKind,
+                 arm: Option<&mut crate::holder_image::ByteArm>| {
+                    let offer = timeline
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .offer_holder_image(Arc::clone(&image), kind);
+                    if let Some(arm) = arm {
+                        arm.note_read(&image);
+                    }
+                    if offer == crate::holder_image::Offer::Published {
+                        edge_inbox.push(id);
+                        let now = (lat_epoch.elapsed().as_nanos() as u64).max(1);
+                        let _ = gated_output_wake(
+                            &output_wake_pending,
+                            now,
+                            loop_idle.since_ns(),
+                            false,
+                            || {
+                                post(Wake::Output {
+                                    session: id,
+                                    window,
+                                })
+                            },
+                            || lat_epoch.elapsed().as_nanos() as u64,
+                        );
+                    }
+                };
             let mut ingest = |buf: &[u8],
                               edge: Option<crate::foreground_handback::FgEdge>,
-                              holder: i32| {
+                              holder: i32,
+                              image: Option<Arc<crate::holder_image::HolderImage>>,
+                              read_at: Option<Instant>| {
                 // Stamp the leading edge of this output burst (a load and at most
                 // one CAS) for output-to-present latency in `metrics` and the
                 // `$ATERM_TRACE_LATENCY` log. `compare_exchange(0, …)` keeps the
@@ -6506,8 +7103,10 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 // A manual reset arrives as an empty batch and stamps neither an
                 // output edge nor an echo round trip.
                 // The same reading is the burst's time on the cast timeline,
-                // taken outside every term-lock hold.
-                let arrived = (!buf.is_empty()).then(Instant::now);
+                // taken outside every term-lock hold. `read_at`: when the batch's
+                // first read returned, where it was gathered before being fed
+                // (the Windows reader's held gather, `gather_held_output`).
+                let arrived = (!buf.is_empty()).then(|| read_at.unwrap_or_else(Instant::now));
                 if let Some(at) = arrived {
                     stamp_output_arrival(
                         &last_output_ns,
@@ -6528,6 +7127,11 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 // A command start this batch parsed whose screen is still to be
                 // read, after the lock (`crate::launch_witness`).
                 let mut launch_unread: Option<crate::launch_witness::Unread> = None;
+                // A dead app's alternate screen the engine asks this session's
+                // console host to leave (OpenConsole only), taken in the hold
+                // that parsed the prompt and acted on after the last one
+                // (`crate::alt_screen_resync`).
+                let mut resync_due = false;
                 // The manual reset this call ran, if any, with its bytes.
                 let mut manual_run: Option<(
                     crate::manual_reset::ManualReset,
@@ -6548,7 +7152,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 // before the next hold appends to the tail.
                 #[cfg(unix)]
                 let mut journal_keyframe: Option<crate::crash_restore::Captured> = None;
-                let response = {
+                let (response, reports) = {
                     let bytes = buf;
                     // The manual reset, before any byte of `buf` and under one
                     // term-lock hold: the engine resets, the synthesized bytes go on
@@ -6605,18 +7209,43 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                     // byte-identical to one `process()`, and concatenated per-chunk
                     // replies equal the single-call result. Small bursts are one chunk.
                     let mut acc: Option<Vec<u8>> = None;
+                    let mut reports: Option<Vec<u8>> = None;
                     let mut off = 0;
                     // The handback offset, clamped to the batch; consumed once.
                     let mut handback_at = edge.map(|e| e.at.min(bytes.len()));
                     // Whose bytes the next slice holds: the old holder's before
                     // the cut, the batch-end holder's from it on.
                     let mut slice_holder = edge.map_or(holder, |e| e.from);
+                    // The byte arm's batch start (card engine §3.6): where its
+                    // slices end after an OSC 133 C, and the one ordinary
+                    // observation this nonempty batch may owe.
+                    if let Some(a) = arm.as_mut() {
+                        let crate::holder_image::ByteArm { scan, ends, .. } = a;
+                        scan.ends(bytes, ends);
+                        if !bytes.is_empty() {
+                            a.begin_batch();
+                        }
+                    }
                     while off < bytes.len() || handback_at == Some(off) {
                         // A slice never crosses the handback offset.
                         let limit = match handback_at {
                             Some(at) if at > off => at,
                             _ => bytes.len(),
                         };
+                        // Nor, while the byte arm runs, the end of an OSC 133
+                        // C: the re-read the C owes runs before the next byte.
+                        let limit = arm
+                            .as_ref()
+                            .and_then(|a| a.next_cut(off))
+                            .filter(|_| {
+                                // The arm's no-cut mutant (a control, tests only).
+                                #[cfg(test)]
+                                if crate::holder_image::hold_hook::no_c_cut(id) {
+                                    return false;
+                                }
+                                true
+                            })
+                            .map_or(limit, |cut| cut.min(limit));
                         let end = off
                             + ingest_chunk_width(
                                 || {
@@ -6656,8 +7285,51 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             }
                             _ => None,
                         };
+                        // THE HOLDER IMAGE, published before this slice's hold
+                        // (I1): at the cut, the image the gather read at the
+                        // edge; elsewhere, while the byte arm runs, a re-read
+                        // of an image that may have changed in place (an
+                        // `exec` after a signed C, a Launcher's `exec`), an
+                        // Exec edge at this slice's start.
+                        let offered = if verdicts.is_some() {
+                            image
+                                .clone()
+                                .map(|i| (i, crate::holder_image::EdgeKind::Group))
+                        } else {
+                            arm.as_mut().and_then(|a| {
+                                a.read_due(slice_holder, fg_image).map(|image| {
+                                    (Arc::new(image), crate::holder_image::EdgeKind::Exec)
+                                })
+                            })
+                        };
+                        // Published here, or, under the I1 bind's control
+                        // mutant only, after the hold.
+                        let offered = offered.and_then(|(image, kind)| {
+                            #[cfg(test)]
+                            if crate::holder_image::hold_hook::publish_after_hold(id) {
+                                return Some((image, kind));
+                            }
+                            publish_holder(image, kind, arm.as_mut());
+                            None
+                        });
+                        // A signed C this slice parsed (the byte arm's mark).
+                        let (c_signed, shell_executing);
                         {
                             let mut t = term_lock(&term);
+                            // The I1 bind's look from inside the hold.
+                            #[cfg(test)]
+                            crate::holder_image::hold_hook::at_hold(
+                                id,
+                                off,
+                                &bytes[off..end],
+                                || {
+                                    timeline
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .holder_image()
+                                        .and_then(|i| i.token)
+                                },
+                            );
                             cuts.observe(emitted, &t);
                             // Temporal spine: the engine's resize ordinal and geometry
                             // before this chunk. An external resize (window resize or the
@@ -6720,14 +7392,27 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                     handback = Some(h);
                                 }
                             }
+                            // Whose bytes this slice holds, as the engine's
+                            // OSC 7 prompt rule reads them: a group other than
+                            // the shell's is a job's, one a key binding started
+                            // included (`Terminal::set_foreground_job`). ConPTY
+                            // names no holder: there the program probe alone
+                            // speaks, asked by the engine.
+                            t.set_foreground_job(slice_holder > 0 && slice_holder != fg_shell);
                             // THE LAUNCH MARK, in this same hold: a slice that
                             // starts a command records the person count as it
                             // stands now, before any frame can show a byte of
                             // the slice (`crate::launch_witness`, "The proof").
+                            let started_before = t.started_command_seq();
                             if let Some(unread) = launch.process(&mut t, &bytes[off..end], &person)
                             {
                                 launch_unread = Some(unread);
                             }
+                            c_signed = t.started_command_seq() != started_before
+                                && t.is_require_shell_integration_nonce();
+                            shell_executing =
+                                t.shell_state() == aterm_core::terminal::ShellState::Executing;
+                            resync_due |= t.take_alt_screen_resync_request();
                             // The warm spare's marks, read under this hold
                             // (`crate::spare::witness_after_process`).
                             #[cfg(unix)]
@@ -6743,6 +7428,15 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                 t.program_evidence(),
                                 t.take_evidence_asserted(),
                             );
+                            // The reports the engine sends unasked (a resize's DEC
+                            // 2048 report, a DSR 997 push) first, apart: they go
+                            // the input's way (`ReplyLane::submit_report`).
+                            if let Some(r) = t.take_reports() {
+                                match &mut reports {
+                                    Some(a) => a.extend_from_slice(&r),
+                                    None => reports = Some(r),
+                                }
+                            }
                             if let Some(r) = t.take_response() {
                                 match &mut acc {
                                     Some(a) => a.extend_from_slice(&r),
@@ -6780,6 +7474,16 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         if let (Some(j), Some(captured)) = (&journal, journal_keyframe.take()) {
                             j.write(captured);
                         }
+                        // The control mutant's late publication (tests only).
+                        if let Some((image, kind)) = offered {
+                            publish_holder(image, kind, arm.as_mut());
+                        }
+                        // The accepted C owes an immediate boundary read and
+                        // keeps its unresolved shell watched across batches.
+                        // A signed completion/prompt ends that watch.
+                        if let Some(a) = arm.as_mut() {
+                            a.note_shell(c_signed, shell_executing);
+                        }
                         drop(fetched);
                         off = end;
                         // Lock handoff: on macOS's unfair mutex a parked UI thread
@@ -6789,7 +7493,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         // `filled_rx` starve the UI thread.
                         crate::yield_to_ui_waiter(&ui_waiting);
                     }
-                    acc
+                    (acc, reports)
                 };
                 // Report the handback (term lock released; the timeline is a
                 // strict leaf, taken here with no other lock held).
@@ -6803,9 +7507,54 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             h.bytes.len(),
                         );
                         tl.record("modes-restored", payload.clone());
+                        // The session log's `modes` mark: its wake rides this
+                        // reader's coalesced `Wake::Output`, whose sweep takes it
+                        // (ruling S29).
+                        if !h.reverted.is_empty() {
+                            let at = tl.slog().now();
+                            tl.slog_mut().observe_modes(
+                                h.reverted.len(),
+                                aterm_slog::Actor::Nobody,
+                                at,
+                            );
+                        }
                         payload
                     };
                     aterm_log::info!("session {id}: foreground handback: {payload}");
+                }
+                // The dev `card-seen` probe (`holder_image::DEV_ROWS` builds
+                // only): while the holder image is a drawer whose card has not
+                // been seen, a matching family and known version on screen is
+                // recorded. This does not prove who wrote those cells, nor
+                // distinguish stale same-build cards. At most
+                // `CARD_PROBE_BATCHES` batches per snapshot token.
+                if crate::holder_image::DEV_ROWS && !buf.is_empty() {
+                    let unseen = timeline
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .card_unseen();
+                    if let Some(token) = unseen {
+                        let left = match card_probe {
+                            Some((t, left)) if t == token => left,
+                            _ => crate::holder_image::CARD_PROBE_BATCHES,
+                        };
+                        if left > 0 {
+                            card_probe = Some((token, left - 1));
+                            let rows: Vec<String> = {
+                                let t = term_lock(&term);
+                                (0..usize::from(t.rows()))
+                                    .map(|r| crate::control::visible_row(&t, r))
+                                    .collect()
+                            };
+                            let reading = crate::claude_card::read_card(id, &rows, None);
+                            if let Some(card) = &reading.read {
+                                timeline
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .note_card_seen(token, reading.rows_kind(), &card.version);
+                            }
+                        }
+                    }
                 }
                 // Report a manual reset the same way (term lock released, the
                 // timeline a strict leaf), then answer whoever asked.
@@ -6840,6 +7589,17 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                     // drops the reply.
                     let _ = reply_tx.submit(resp);
                 }
+                // The reports the engine sent unasked, behind this burst's replies:
+                // the console host may be waiting for one of those (its cursor
+                // query after a resize), and a report waits for the ConPTY resize
+                // guard (`ReplyLane::submit_report`). Recorded like a reply.
+                if let Some(report) = reports {
+                    let report: std::sync::Arc<[u8]> = report.into();
+                    if let Some(tx) = &temporal_tx {
+                        let _ = tx.try_send(crate::temporal::TemporalMsg::Reply(report.clone()));
+                    }
+                    let _ = reply_tx.submit_report(report);
+                }
                 // Coalesce wakes: post `Wake::Output` only on the latch's clear-to-
                 // armed edge ([`gated_output_wake`]). The arm timestamp is read here,
                 // not the burst's arrival stamp, so the latch's expiry measures only
@@ -6851,12 +7611,18 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 //
                 // An armed latch is re-posted only when its wake was stranded while
                 // the loop slept, never one queued behind a long frame.
+                //
+                // A post in a burst that has run a frame says the session is
+                // streaming, and its pass takes a hold ([`PostCadence`],
+                // [`OUTPUT_CADENCE_NS`]): a line-at-a-time writer then costs the
+                // loop one turn per cadence, not one per read.
                 let woke = Instant::now();
                 let now = (woke.saturating_duration_since(lat_epoch).as_nanos() as u64).max(1);
                 let gate = gated_output_wake(
                     &output_wake_pending,
                     now,
                     loop_idle.since_ns(),
+                    cadence.streaming(now),
                     || {
                         post(Wake::Output {
                             session: id,
@@ -6865,6 +7631,11 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                     },
                     || lat_epoch.elapsed().as_nanos() as u64,
                 );
+                match gate {
+                    WakeGate::Posted | WakeGate::Reposted => cadence.posted(now),
+                    WakeGate::Held => cadence.held(now),
+                    WakeGate::Coalesced => {}
+                }
                 if gate == WakeGate::Reposted {
                     crate::metrics::note_output_wake_repost();
                     aterm_log::info!(
@@ -6927,6 +7698,12 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                     // subscribers — one refcount bump, never blocks the reader.
                     byte_fanout.tee(&burst);
                 }
+                // The host's leave of the dead app's screen, last and outside the
+                // read's hold: its `?1049l` arrives on a later read and leaves ours
+                // there, with the prompt the shell drew on that screen carried along.
+                if resync_due {
+                    crate::alt_screen_resync::start(&term, master);
+                }
             };
             #[cfg(windows)]
             loop {
@@ -6969,16 +7746,44 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                     // outq) before processing, so lock/tap/wake costs are paid per
                     // ~64 KiB batch. Interactive bursts return on the first quiet poll.
                     aterm_pty::ReadOutcome::Data(n) => {
-                        let filled = aterm_pty::drain_more(master, &mut buf, n);
-                        let output_activity_now =
-                            u64::try_from(lat_epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                        latest_output_activity_ns
-                            .store(output_activity_now.max(1), Ordering::Release);
-                        filled as isize
+                        let read_at = Instant::now();
+                        let mut filled = aterm_pty::drain_more(master, &mut buf, n);
+                        let since_epoch = |at: Instant| {
+                            u64::try_from(at.saturating_duration_since(lat_epoch).as_nanos())
+                                .unwrap_or(u64::MAX)
+                        };
+                        let read_ns = since_epoch(read_at);
+                        latest_output_activity_ns.store(read_ns.max(1), Ordering::Release);
+                        // A held stream's read gathers what follows it before it is
+                        // fed (`begin_held_gather`): a line-per-call writer then
+                        // costs this reader one batch per hold, not one per line,
+                        // and its lines still reach the pass the hold owes them.
+                        if let Some(until) = begin_held_gather(
+                            &output_wake_pending,
+                            read_ns,
+                            filled,
+                            crate::metrics::input_pending(),
+                        ) {
+                            filled = gather_held_output(
+                                &mut buf,
+                                filled,
+                                until,
+                                || since_epoch(Instant::now()),
+                                |b, f| aterm_pty::drain_available(master, b, f),
+                                std::thread::sleep,
+                                || {
+                                    !stop.load(std::sync::atomic::Ordering::Acquire)
+                                        && !crate::metrics::input_pending()
+                                },
+                            );
+                            latest_output_activity_ns
+                                .store(since_epoch(Instant::now()).max(1), Ordering::Release);
+                        }
+                        (filled, read_at)
                     }
                 };
                 // ConPTY has no foreground process group: no handback.
-                ingest(&buf[..r as usize], None, 0);
+                ingest(&buf[..r.0], None, 0, None, Some(r.1));
             }
             // Unix parse loop: batches from the gather stage. Data batches have
             // left the kernel queue, so they are always processed; the gather
@@ -7012,8 +7817,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             window,
                         });
                     }
-                    Ok(GatherMsg::Data(batch, len, edge, holder)) => {
-                        ingest(&batch[..len], edge, holder);
+                    Ok(GatherMsg::Data(batch, len, edge, holder, image)) => {
+                        ingest(&batch[..len], edge, holder, image, None);
                         // Recycle the buffer; a no-op after the gather exits.
                         let _ = free_tx.try_send(batch);
                         // Ingest done: only now does this batch stop counting as
@@ -7044,7 +7849,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                     // credited.
                     Ok(GatherMsg::Reset(req)) => {
                         pending_reset.set(Some(req));
-                        ingest(&[], None, 0);
+                        ingest(&[], None, 0, None, None);
                     }
                     // A host resize or settings change with no output to follow:
                     // the journal records it now (`crate::crash_restore`).
@@ -7149,9 +7954,49 @@ pub(crate) const WAKE_LATCH_EXPIRY_NS: u64 = 100_000_000;
 
 /// Bit 63 of an armed latch word: the wake the arm stands for has been POSTED,
 /// and the rest of the word is a `lat_epoch` stamp read AFTER the post returned.
-/// Clear: the reader has armed and is still posting. Nanoseconds since the
-/// epoch reach bit 63 after 292 years, so the bit never collides with a time.
+/// Clear: the reader has armed and is still posting. The stamp lives below the
+/// four flag bits ([`WAKE_LATCH_STAMP`]), so no flag ever collides with a time.
 pub(crate) const WAKE_LATCH_SENT: u64 = 1 << 63;
+
+/// Bit 62 of a latch word: the UI thread HOLDS the latch after a pass on a
+/// streaming session ([`output_latch_after_pass`]), and the stamp is the
+/// `lat_epoch` instant the hold falls due. Readers post nothing on a held latch:
+/// the first chunk fed after the pass marks it [`WAKE_LATCH_DIRTY`], and the
+/// hold's release ([`release_output_hold`], at the deadline `about_to_wait`
+/// folds) runs that session's pass. Never set with [`WAKE_LATCH_SENT`], so the
+/// lost-wake watchdog never judges a hold.
+pub(crate) const WAKE_LATCH_HELD: u64 = 1 << 62;
+
+/// Bit 61 of a held latch word: a reader fed the engine after the pass that
+/// took the hold, so its release owes the session a pass.
+pub(crate) const WAKE_LATCH_DIRTY: u64 = 1 << 61;
+
+/// Bit 60 of an armed latch word: the session is streaming ([`PostCadence`]),
+/// so the pass this wake buys takes a hold instead of clearing the latch.
+pub(crate) const WAKE_LATCH_STREAMING: u64 = 1 << 60;
+
+/// The stamp bits of a latch word: `lat_epoch` nanoseconds, which reach the
+/// lowest flag bit after 36 years.
+pub(crate) const WAKE_LATCH_STAMP: u64 = WAKE_LATCH_STREAMING - 1;
+
+/// The shortest interval between two `Wake::Output` passes for one streaming
+/// session. A program that writes line by line (a pwsh pipeline, cmd's `type`, a
+/// build log) gives its reader one line per read, and each read used to buy its
+/// own loop turn: 19,133 wakes for 20,000 lines of `Get-Content`, about 100 µs of
+/// aterm CPU per line. Once a session streams ([`STREAM_AFTER_NS`]), each pass
+/// takes a hold this long, and output fed under it waits for the hold's release,
+/// at most this long. Below the half-frame floor that paces a frame at up to
+/// 120 Hz (`content_pace_floor`), so a frame rarely waits on a hold.
+pub(crate) const OUTPUT_CADENCE_NS: u64 = 4_000_000;
+
+/// How long a burst of posts (each under [`OUTPUT_CADENCE_NS`] after the one
+/// before) must have run before its session counts as streaming: one 60 Hz
+/// frame. A key's echo is never held: under OpenConsole a PSReadLine echo is
+/// about seven reads in 0.2 ms (cursor off, text, colours, cursor on), and a
+/// held tail would wait for its release. A flood is held from its 17th
+/// millisecond on, and through any stall of its writer shorter than this
+/// ([`PostCadence`]).
+pub(crate) const STREAM_AFTER_NS: u64 = 16_000_000;
 
 /// The event loop's turn state as the PTY readers see it: the `lat_epoch`
 /// stamp of the `about_to_wait` that last put the loop to sleep, or `0` while a
@@ -7199,6 +8044,9 @@ pub(crate) enum WakeGate {
     /// A stranded wake re-posted (see [`wake_stranded`]): not a heal — the
     /// watchdog never saw it — and counted apart (`output_wake_reposts`).
     Reposted,
+    /// Nothing posted: the UI thread holds the latch ([`WAKE_LATCH_HELD`]) and
+    /// the chunk left it dirty, so the hold's release runs the pass.
+    Held,
 }
 
 /// Whether an armed latch `word` is a wake stranded with its loop wake-up:
@@ -7207,11 +8055,22 @@ pub(crate) enum WakeGate {
 /// possibly queued behind a long frame, one an `about_to_wait` already saw, and
 /// an unsent arm never qualify.
 pub(crate) fn wake_stranded(word: u64, idle_since_ns: u64, now_ns: u64) -> bool {
-    let at = word & !WAKE_LATCH_SENT;
+    let at = word & WAKE_LATCH_STAMP;
     word & WAKE_LATCH_SENT != 0
         && idle_since_ns != 0
         && idle_since_ns < at
         && now_ns.saturating_sub(at) > WAKE_LATCH_EXPIRY_NS
+}
+
+/// [`gated_output_wake`] for a test of a post that refuses (a warm spare's,
+/// `crate::spare::SpareLink::decide`).
+#[cfg(test)]
+pub(crate) fn gated_output_wake_for_test(
+    flag: &AtomicU64,
+    now_ns: u64,
+    send: impl FnOnce() -> bool,
+) -> WakeGate {
+    gated_output_wake(flag, now_ns, 0, false, send, || now_ns)
 }
 
 /// Edge-triggered `Wake::Output` gate: invoke `send` only when the latch goes
@@ -7224,7 +8083,15 @@ pub(crate) fn wake_stranded(word: u64, idle_since_ns: u64, now_ns: u64) -> bool 
 ///
 /// Two-phase arm: the arm stores `now_ns` without [`WAKE_LATCH_SENT`]; once
 /// `send` returns, the word is re-stamped with `sent_ns()` and the bit, which
-/// lets the watchdog tell a lost wake from a late one.
+/// lets the watchdog tell a lost wake from a late one. `streaming`
+/// ([`PostCadence::streaming`]) rides both words as [`WAKE_LATCH_STREAMING`], so
+/// the pass takes a hold.
+///
+/// A HELD latch ([`WAKE_LATCH_HELD`]) posts nothing: the chunk marks it dirty
+/// (one CAS per hold; a held word that is already dirty is a load), and the
+/// hold's release runs the pass. A CAS that loses to the UI thread releasing or
+/// re-taking the hold looks again, so the chunk is always covered by a dirty
+/// mark or a fresh post.
 ///
 /// The reader never re-sends a wake that may be queued: an armed latch
 /// coalesces however old, unless [`wake_stranded`] (posted after the loop last
@@ -7232,50 +8099,299 @@ pub(crate) fn wake_stranded(word: u64, idle_since_ns: u64, now_ns: u64) -> bool 
 /// to heal ([`OutputWakeWatch::pass`]); a stranded one is re-posted here (by CAS,
 /// not counted as a heal) while output streams. A wake stranded on the last
 /// chunk of a burst waits for the loop's next unrelated turn.
-/// [`gated_output_wake`] for a test of a post that refuses (a warm spare's,
-/// `crate::spare::SpareLink::decide`).
-#[cfg(test)]
-pub(crate) fn gated_output_wake_for_test(
-    flag: &AtomicU64,
-    now_ns: u64,
-    send: impl FnOnce() -> bool,
-) -> WakeGate {
-    gated_output_wake(flag, now_ns, 0, send, || now_ns)
-}
-
 fn gated_output_wake(
     flag: &AtomicU64,
     now_ns: u64,
     idle_since_ns: u64,
+    streaming: bool,
     send: impl FnOnce() -> bool,
     sent_ns: impl FnOnce() -> u64,
 ) -> WakeGate {
-    let word = flag.load(Ordering::Relaxed);
-    let (from, posted) = if word == 0 {
-        (0, WakeGate::Posted)
-    } else if wake_stranded(word, idle_since_ns, now_ns) {
-        (word, WakeGate::Reposted)
-    } else {
-        return WakeGate::Coalesced; // armed: this chunk rides the wake already posted
+    let flags = if streaming { WAKE_LATCH_STREAMING } else { 0 };
+    let arm = (now_ns & WAKE_LATCH_STAMP).max(1) | flags;
+    let mut word = flag.load(Ordering::Relaxed);
+    let posted = loop {
+        let (from, posted) = if word == 0 {
+            (0, WakeGate::Posted)
+        } else if word & WAKE_LATCH_HELD != 0 {
+            if word & WAKE_LATCH_DIRTY != 0 {
+                return WakeGate::Held;
+            }
+            match flag.compare_exchange(
+                word,
+                word | WAKE_LATCH_DIRTY,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return WakeGate::Held,
+                // Released or re-taken meanwhile: look again.
+                Err(now) => {
+                    word = now;
+                    continue;
+                }
+            }
+        } else if wake_stranded(word, idle_since_ns, now_ns) {
+            (word, WakeGate::Reposted)
+        } else {
+            return WakeGate::Coalesced; // armed: this chunk rides the wake already posted
+        };
+        // CAS from the observed word so concurrent readers arm exactly once, and a
+        // handler clear (or a watchdog heal) that lands first stands. A hold that
+        // lands first is looked at again: this chunk must leave it dirty.
+        match flag.compare_exchange(from, arm, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break posted,
+            Err(now) if now & WAKE_LATCH_HELD != 0 => word = now,
+            Err(_) => return WakeGate::Coalesced,
+        }
     };
-    let arm = (now_ns & !WAKE_LATCH_SENT).max(1);
-    // CAS from the observed word so concurrent readers arm exactly once, and a
-    // handler clear (or a watchdog heal) that lands first stands.
-    if flag
-        .compare_exchange(from, arm, Ordering::Relaxed, Ordering::Relaxed)
-        .is_err()
-    {
-        return WakeGate::Coalesced;
-    }
     if send() {
         // CAS from the arm: a handler that already consumed the event cleared
-        // the latch, and that clear must stand.
-        let stamp = (sent_ns() & !WAKE_LATCH_SENT).max(arm) | WAKE_LATCH_SENT;
+        // the latch (or took a hold), and that must stand.
+        let stamp =
+            (sent_ns() & WAKE_LATCH_STAMP).max(arm & WAKE_LATCH_STAMP) | WAKE_LATCH_SENT | flags;
         let _ = flag.compare_exchange(arm, stamp, Ordering::Relaxed, Ordering::Relaxed);
         posted
     } else {
         let _ = flag.compare_exchange(arm, 0, Ordering::Relaxed, Ordering::Relaxed);
         WakeGate::Coalesced
+    }
+}
+
+/// A reader's memory of its own output (`lat_epoch` ns): its `Wake::Output`
+/// posts and the chunks it fed under a hold, which says whether its next post
+/// carries [`WAKE_LATCH_STREAMING`]. A BURST is a run of that output, each under
+/// [`OUTPUT_CADENCE_NS`] after the one before; a post is streaming once its burst
+/// has run [`STREAM_AFTER_NS`]. A quiet spell of a cadence ends a burst that has
+/// not streamed yet, and a quiet frame ([`STREAM_AFTER_NS`]) one that has.
+///
+/// A held latch takes no posts, so a hold chain ends at a clean release: a
+/// cadence with no output. On a busy Mac that is the writer descheduled for 4 ms,
+/// not the end of its stream: a `seq` run beside a build (a default-band process,
+/// as every program a shell starts is) stalls that long dozens of times a second.
+/// Ended at each stall, the stream bought a pass per read for the next frame
+/// again. A stream that resumes within a frame now posts as streaming at once:
+/// its first chunk still gets its pass at once, and the chunks behind it a hold.
+/// The window is no longer than a frame because a key's echo just after a stream
+/// continues it, and so does each next key inside the window: one as long as a
+/// fast typist's gap between keys (tens of milliseconds) would keep a finished
+/// stream going under the typing and hold each echo's reads behind its first.
+/// Measured 2026-10-19 (CTL-1), ten tabs flooding beside eight default-band
+/// spinners (medians of 4): 143,000 `Wake::Output`s and 45 ms/s of UI-thread
+/// work before, 40,000 and 20 ms/s after, the flood done in 13.45 s instead of
+/// 14.07; on a quieter machine (medians of 10), 6,300 and 12.1 ms/s before,
+/// 3,500 and 10.7 after.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct PostCadence {
+    /// The last post or held chunk (`0` = none yet).
+    last_ns: u64,
+    /// The first post of the burst the last one belongs to.
+    burst_from_ns: u64,
+}
+
+impl PostCadence {
+    /// Whether output at `now_ns` continues the current burst.
+    fn continues(&self, now_ns: u64) -> bool {
+        if self.last_ns == 0 {
+            return false;
+        }
+        let quiet = now_ns.saturating_sub(self.last_ns);
+        let streamed = self.last_ns.saturating_sub(self.burst_from_ns) >= STREAM_AFTER_NS;
+        quiet < OUTPUT_CADENCE_NS || (streamed && quiet < STREAM_AFTER_NS)
+    }
+
+    /// Whether a post at `now_ns` is a streaming session's.
+    pub(crate) fn streaming(&self, now_ns: u64) -> bool {
+        self.continues(now_ns) && now_ns.saturating_sub(self.burst_from_ns) >= STREAM_AFTER_NS
+    }
+
+    /// A post went out at `now_ns`.
+    pub(crate) fn posted(&mut self, now_ns: u64) {
+        if !self.continues(now_ns) {
+            self.burst_from_ns = now_ns;
+        }
+        self.last_ns = now_ns;
+    }
+
+    /// A chunk fed at `now_ns` left a held latch dirty ([`WakeGate::Held`]): the
+    /// stream goes on under its hold, with no post.
+    pub(crate) fn held(&mut self, now_ns: u64) {
+        self.last_ns = now_ns;
+    }
+}
+
+/// The latch word a `Wake::Output` pass stores before its work, from the
+/// `word` it found, so a chunk fed after the store posts again or leaves the
+/// hold dirty. A streaming session's pass ([`WAKE_LATCH_STREAMING`] on its
+/// wake, or a pass that ran on a hold: its release, or another wake meanwhile)
+/// takes a hold due [`OUTPUT_CADENCE_NS`] after `now_ns`; any other pass clears
+/// the latch, so the session's next output posts at once.
+pub(crate) fn output_latch_after_pass(word: u64, now_ns: u64) -> u64 {
+    if word & (WAKE_LATCH_STREAMING | WAKE_LATCH_HELD) == 0 {
+        return 0;
+    }
+    WAKE_LATCH_HELD | (now_ns.saturating_add(OUTPUT_CADENCE_NS) & WAKE_LATCH_STAMP).max(1)
+}
+
+/// What [`release_output_hold`] found on one session's latch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoldRelease {
+    /// Not held: clear, armed or posted, which is the wake protocol's business.
+    NotHeld,
+    /// Held until `due_ns` (`lat_epoch` ns): fold a deadline there.
+    Pending { due_ns: u64 },
+    /// Due, and nothing was fed since the pass that took it: cleared, so the
+    /// session's next output posts at once.
+    Released,
+    /// Due and dirty: the caller runs the session's pass, which takes the
+    /// hold again ([`output_latch_after_pass`]).
+    Due,
+}
+
+/// Release one session's output hold if it is due at `now_ns`. A clean hold is
+/// cleared by CAS; one a reader dirtied meanwhile is looked at again, so a
+/// chunk fed while it was held is never dropped with it.
+pub(crate) fn release_output_hold(latch: &AtomicU64, now_ns: u64) -> HoldRelease {
+    let mut word = latch.load(Ordering::Relaxed);
+    loop {
+        if word & WAKE_LATCH_HELD == 0 {
+            return HoldRelease::NotHeld;
+        }
+        let due_ns = word & WAKE_LATCH_STAMP;
+        if now_ns < due_ns {
+            return HoldRelease::Pending { due_ns };
+        }
+        if word & WAKE_LATCH_DIRTY != 0 {
+            return HoldRelease::Due;
+        }
+        match latch.compare_exchange(word, 0, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return HoldRelease::Released,
+            Err(now) => word = now,
+        }
+    }
+}
+
+/// A read at least this big is fed as it is, and a held gather
+/// ([`gather_held_output`]) stops once it holds this much: the costs a reader
+/// pays per batch (the term-lock hold and the engine's per-call work, the cast
+/// and byte taps, the wake gate, the compress signal, a blocking read's
+/// wake-up) are then paid per 16 KiB, as a bulk writer's are.
+#[cfg(any(windows, test))]
+pub(crate) const HELD_GATHER_ENOUGH: usize = 16 * 1024;
+
+/// How long before its hold falls due a held gather is fed, so its bytes are
+/// in the engine when the hold's release runs the session's pass.
+#[cfg(any(windows, test))]
+pub(crate) const HELD_GATHER_MARGIN_NS: u64 = 500_000;
+
+/// The shortest held gather. A read near or past its hold's due instant (the
+/// release is about to run, or is late) still gathers this long, so the reads
+/// around each release are not fed one by one.
+#[cfg(any(windows, test))]
+pub(crate) const HELD_GATHER_MIN_NS: u64 = 1_000_000;
+
+/// How often a held gather looks at the pipe while it waits: what a fast
+/// writer puts there is collected well before the pipe's 64 KiB would fill and
+/// stall it.
+#[cfg(any(windows, test))]
+pub(crate) const HELD_GATHER_STEP_NS: u64 = 1_000_000;
+
+/// How far past its request a held gather's wait is taken to wake, so the
+/// gather asks that much less and ends on time. Windows' high-resolution wait
+/// (`std::thread::sleep`) overshoots by about half a millisecond: measured
+/// 2026-10-18 on the stock 1.97.1 build, 200 asks each, 1 ms woke after 1.53 ms
+/// at the median (1.84 at p99), 0.5 ms after 1.01 and 3.5 ms after 4.01. A
+/// gather with less than this left ends instead of waiting.
+#[cfg(any(windows, test))]
+pub(crate) const HELD_GATHER_WAIT_SLACK_NS: u64 = 500_000;
+
+/// Whether a reader that has just read `filled` bytes at `now_ns` gathers more
+/// before it feeds them ([`gather_held_output`]), and until when (`lat_epoch`
+/// ns). A writer that makes one call per line (pwsh's `Get-Content`) hands the
+/// reader one line per read, and each fed read pays the reader's per-batch
+/// costs: 200,000 lines cost about 7.5 s of aterm CPU where `cat` of the same
+/// bytes costs 0.3 s.
+///
+/// Only while the UI thread HOLDS the session's latch ([`WAKE_LATCH_HELD`]):
+/// its pass reads the engine when the hold falls due and not before, so bytes
+/// fed then show no later than bytes fed now. Never for a read of
+/// [`HELD_GATHER_ENOUGH`] or more, and never while a key waits for its echo
+/// (`typing`, [`crate::metrics::input_pending`]). The gather ends
+/// [`HELD_GATHER_MARGIN_NS`] before the hold is due, and runs at least
+/// [`HELD_GATHER_MIN_NS`] and at most [`OUTPUT_CADENCE_NS`].
+///
+/// A gather marks the hold DIRTY as it begins, before its bytes are fed, so the
+/// hold's release runs the session's pass and holds again even when the
+/// gather is fed after it (a late wake-up): the hold chain never breaks into a
+/// pass per read. Bytes fed after that release mark the next hold dirty
+/// through [`gated_output_wake`], as every chunk does.
+#[cfg(any(windows, test))]
+pub(crate) fn begin_held_gather(
+    latch: &AtomicU64,
+    now_ns: u64,
+    filled: usize,
+    typing: bool,
+) -> Option<u64> {
+    if typing || filled >= HELD_GATHER_ENOUGH {
+        return None;
+    }
+    let mut word = latch.load(Ordering::Relaxed);
+    while word & WAKE_LATCH_DIRTY == 0 {
+        if word & WAKE_LATCH_HELD == 0 {
+            return None;
+        }
+        match latch.compare_exchange(
+            word,
+            word | WAKE_LATCH_DIRTY,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            // Released, re-taken or dirtied meanwhile: look again.
+            Err(now) => word = now,
+        }
+    }
+    if word & WAKE_LATCH_HELD == 0 {
+        return None;
+    }
+    let due_ns = word & WAKE_LATCH_STAMP;
+    Some(due_ns.saturating_sub(HELD_GATHER_MARGIN_NS).clamp(
+        now_ns.saturating_add(HELD_GATHER_MIN_NS),
+        now_ns.saturating_add(OUTPUT_CADENCE_NS),
+    ))
+}
+
+/// Gather a held session's output into `buf[..filled]` until `until_ns`
+/// ([`begin_held_gather`]): `top_up` collects what the pipe already holds
+/// without blocking, then the gather waits a step ([`HELD_GATHER_STEP_NS`]),
+/// asking [`HELD_GATHER_WAIT_SLACK_NS`] short of `until_ns` for the wait's
+/// overshoot, and looks again. It ends once less than that slack is left before
+/// `until_ns`, once it holds [`HELD_GATHER_ENOUGH`] (or the buffer is full), or
+/// when `go_on` says no (a key now waits for its echo, or the reader is told to
+/// stop), and returns the fill. Every byte it read is fed: it never ends
+/// between a read and its return.
+#[cfg(any(windows, test))]
+pub(crate) fn gather_held_output(
+    buf: &mut [u8],
+    mut filled: usize,
+    until_ns: u64,
+    mut now_ns: impl FnMut() -> u64,
+    mut top_up: impl FnMut(&mut [u8], usize) -> usize,
+    mut wait: impl FnMut(std::time::Duration),
+    mut go_on: impl FnMut() -> bool,
+) -> usize {
+    let enough = HELD_GATHER_ENOUGH.min(buf.len());
+    loop {
+        filled = top_up(buf, filled);
+        if filled >= enough || !go_on() {
+            return filled;
+        }
+        let left = until_ns.saturating_sub(now_ns());
+        if left <= HELD_GATHER_WAIT_SLACK_NS {
+            return filled;
+        }
+        wait(std::time::Duration::from_nanos(
+            (left - HELD_GATHER_WAIT_SLACK_NS).min(HELD_GATHER_STEP_NS),
+        ));
     }
 }
 
@@ -7312,15 +8428,18 @@ pub(crate) enum OutputWakeVerdict {
 /// out a long frame is still queued and turns the loop itself, and a past
 /// deadline would trip the scheduler's stale-arm backstop
 /// (`metrics::record_deadline`) on every long frame.
+///
+/// A held latch ([`WAKE_LATCH_HELD`]) is `Clear`: no wake stands behind it, and
+/// its release has its own deadline (`OutputCadence`).
 pub(crate) fn judge_output_wake(
     word: u64,
     drained_through_ns: u64,
     now_ns: u64,
 ) -> OutputWakeVerdict {
-    if word == 0 {
+    if word == 0 || word & WAKE_LATCH_HELD != 0 {
         return OutputWakeVerdict::Clear;
     }
-    let at = word & !WAKE_LATCH_SENT;
+    let at = word & WAKE_LATCH_STAMP;
     let age_ns = now_ns.saturating_sub(at);
     let late = age_ns > WAKE_LATCH_EXPIRY_NS;
     if word & WAKE_LATCH_SENT == 0 {
@@ -7407,7 +8526,7 @@ impl OutputWakeWatch {
                             aterm_log::debug!(
                                 "output wake late ({} ms; session {}): queued behind the \
                                  main thread's turn, not lost",
-                                now_ns.saturating_sub(word & !WAKE_LATCH_SENT) / 1_000_000,
+                                now_ns.saturating_sub(word & WAKE_LATCH_STAMP) / 1_000_000,
                                 session
                             );
                         }
@@ -7493,11 +8612,39 @@ impl crate::App {
 /// when running from a macOS .app bundle (`Contents/MacOS`), put on child
 /// sessions' PATH so the bundled Help's workflows run with no install step.
 /// `None` outside a bundle.
+///
+/// On Windows it is the running image's folder when that folder holds the
+/// console image `aterm.exe` ([`windows_app_dir`]): an installed or portable
+/// app folder, or a build tree's `target\<profile>`. Without it a tab's `aterm`
+/// ran whichever copy the user PATH named, or none at all from a portable
+/// folder (measured 2026-10-17: a scratch 0.106 build's tabs resolved `aterm`
+/// to the installed 0.101 in pwsh, cmd and Git Bash).
 pub(crate) fn bundle_dir(exe: Option<&std::path::Path>) -> Option<String> {
+    if cfg!(windows) {
+        return windows_app_dir(exe?, |path| path.is_file());
+    }
     let dir = exe?.parent()?;
     // Component-wise suffix match: only a real `<Name>.app/Contents/MacOS` layout
     // qualifies (the shape codesign seals), so this is inert for dev/CI binaries.
     if !dir.ends_with("Contents/MacOS") {
+        return None;
+    }
+    dir.to_str().map(str::to_owned)
+}
+
+/// [`bundle_dir`]'s Windows rule: the folder of `exe` when `is_file` finds the
+/// console image `aterm.exe` in it, so a tab's `aterm`, `aterm-ctl` and `atpkg`
+/// are this build's own — whichever image runs the window (`aterm-gui.exe`,
+/// a build tree's `aterm-windowed.exe`, or `aterm.exe --headless`). A folder
+/// without the console image puts nothing on PATH: nothing in it answers a
+/// bare `aterm` at a prompt. `is_file` is injected so the rule is tested
+/// without laying out a folder.
+pub(crate) fn windows_app_dir(
+    exe: &std::path::Path,
+    is_file: impl Fn(&std::path::Path) -> bool,
+) -> Option<String> {
+    let dir = exe.parent()?;
+    if dir.as_os_str().is_empty() || !is_file(&dir.join("aterm.exe")) {
         return None;
     }
     dir.to_str().map(str::to_owned)
@@ -7651,8 +8798,44 @@ pub(crate) fn managed_agents_dir(layout: &atpkg::store::Layout) -> Option<String
 /// pass — so neither a pass nor a page refresh runs the login shell again. A person's
 /// Settings verb still asks afresh.
 pub(crate) fn atpkg_child_path_once() -> &'static str {
-    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PATH.get_or_init(atpkg_child_path)
+    ATPKG_CHILD_PATH.get_or_init(atpkg_child_path)
+}
+
+/// [`atpkg_child_path_once`]'s answer, once the login shell has given it.
+static ATPKG_CHILD_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The PATH the package lane hands an update child (`PkgLane::child_path`). A routine pass
+/// waits for the login shell's ([`atpkg_child_path_once`]). The FIRST RUN a person waits on
+/// (`waited`, `crate::pass_is_waited_on`) never does: it takes that answer if the shell has
+/// already given it, else at once the fallback the probe would fall back to
+/// ([`atpkg_fallback_path`]). A heavy rc (nvm, conda, oh-my-zsh) otherwise held the first
+/// ALab install by the rc's own time, up to [`LOGIN_PATH_BUDGET`].
+/// An update reads PATH only for the foreign copies it would shadow and for a member a
+/// system copy satisfies, and every pass reads both again: the fallback holds the places
+/// such a copy measurably lives, and a copy only the login PATH finds is seen by the next
+/// pass, which retires a managed twin the first run laid.
+pub(crate) fn atpkg_update_path(waited: bool) -> std::borrow::Cow<'static, str> {
+    update_path_with(
+        waited,
+        ATPKG_CHILD_PATH.get().map(String::as_str),
+        atpkg_child_path_once,
+        atpkg_fallback_path,
+    )
+}
+
+/// [`atpkg_update_path`] over the login shell's answer as it stands (`ready`), the wait for
+/// it and the fallback. Pure for the test.
+fn update_path_with(
+    waited: bool,
+    ready: Option<&'static str>,
+    wait: impl FnOnce() -> &'static str,
+    fallback: impl FnOnce() -> String,
+) -> std::borrow::Cow<'static, str> {
+    match ready {
+        Some(path) => std::borrow::Cow::Borrowed(path),
+        None if waited => std::borrow::Cow::Owned(fallback()),
+        None => std::borrow::Cow::Borrowed(wait()),
+    }
 }
 
 /// The PATH the co-located atpkg children run with. A Finder-launched app
@@ -7663,23 +8846,26 @@ pub(crate) fn atpkg_child_path_once() -> &'static str {
 /// back to the process PATH plus `~/.local/bin` (and `/opt/homebrew/bin` on
 /// macOS) when the shell does not answer.
 pub(crate) fn atpkg_child_path() -> String {
-    login_shell_path().unwrap_or_else(|| {
-        // The managed dirs the shell hook would place (`agents/` first, `bin/`
-        // last), so a fallback PATH cannot report a false shadowed row for a
-        // `claude` the managed twin outranks.
-        let layout = atpkg::store::resolve_configured();
-        let managed = layout.as_ref().and_then(|l| {
-            Some((
-                l.agents_dir().to_str()?.to_owned(),
-                l.bin_dir().to_str()?.to_owned(),
-            ))
-        });
-        fallback_child_path(
-            std::env::var("PATH").ok().as_deref(),
-            aterm_types::dirs::home_dir().as_deref(),
-            managed.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
-        )
-    })
+    login_shell_path().unwrap_or_else(atpkg_fallback_path)
+}
+
+/// [`atpkg_child_path`] when the login shell does not answer: [`fallback_child_path`] over
+/// this process's PATH and home, with the managed dirs the shell hook would place
+/// (`agents/` first, `bin/` last), so a fallback PATH cannot report a false shadowed row
+/// for a `claude` the managed twin outranks.
+fn atpkg_fallback_path() -> String {
+    let layout = atpkg::store::resolve_configured();
+    let managed = layout.as_ref().and_then(|l| {
+        Some((
+            l.agents_dir().to_str()?.to_owned(),
+            l.bin_dir().to_str()?.to_owned(),
+        ))
+    });
+    fallback_child_path(
+        std::env::var("PATH").ok().as_deref(),
+        aterm_types::dirs::home_dir().as_deref(),
+        managed.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+    )
 }
 
 /// How long [`atpkg_child_path`] waits for the login shell before falling back: an
@@ -8214,6 +9400,32 @@ mod reroute_path_env_tests {
         }
     }
 
+    /// PKG-6 #9 — A FIRST RUN'S UPDATE NEVER WAITS ON THE PERSON'S RC CHAIN. With the login
+    /// shell still out (a heavy rc), a first run takes the fallback at once and never
+    /// waits; a routine pass waits for the shell's answer; once the shell has answered,
+    /// both take it.
+    #[test]
+    fn a_first_run_update_takes_the_fallback_rather_than_wait_for_the_login_shell() {
+        use super::update_path_with;
+        let never = || -> &'static str { panic!("a first run waited for the login shell") };
+        assert_eq!(
+            update_path_with(true, None, never, || "/fallback".to_string()),
+            "/fallback"
+        );
+        assert_eq!(
+            update_path_with(false, None, || "/login", || unreachable!()),
+            "/login",
+            "a routine pass waits for the login shell"
+        );
+        for first_run in [true, false] {
+            assert_eq!(
+                update_path_with(first_run, Some("/login"), never, || unreachable!()),
+                "/login",
+                "the login shell's answer, once it is in"
+            );
+        }
+    }
+
     /// NO LOGIN SHELL IS ASKED ON WINDOWS (2026-09-30). The window has no
     /// console, so a console `bash` it starts puts a console window on screen
     /// for its whole rc chain, and the `PATH` a Git Bash prints
@@ -8404,8 +9616,7 @@ mod reroute_path_env_tests {
             return;
         }
         if !std::path::Path::new(ZSH).exists() {
-            eprintln!("skipped: no {ZSH} on this host");
-            return;
+            aterm_spec::host::could_not_run(format!("no {ZSH} on this host; install zsh"));
         }
         // The re-exec is this test as a stand-in on the slave of a fresh pty:
         // session leader of its own session, the pty its controlling terminal,
@@ -8507,6 +9718,7 @@ mod reroute_path_env_tests {
 
     /// Inside a .app bundle the executable's own directory is the bundle dir; inert
     /// outside one (dev builds) and safe with no exe at all.
+    #[cfg(not(windows))]
     #[test]
     fn bundle_dir_is_only_a_real_app_layout() {
         assert_eq!(
@@ -8521,6 +9733,46 @@ mod reroute_path_env_tests {
             None
         );
         assert_eq!(bundle_dir(None), None);
+    }
+
+    /// On Windows the app folder is the running image's folder when the console
+    /// image `aterm.exe` sits in it, whichever image runs the window; a folder
+    /// without it, or no exe at all, is nothing. The folder then leads the
+    /// inherited PATH behind the reroute and agents dirs, once.
+    #[test]
+    fn a_windows_app_folder_with_the_console_image_qualifies() {
+        use super::windows_app_dir;
+        const APP: &str = r"C:\Users\u\AppData\Local\Programs\aterm";
+        let holds = |dir: &'static str| move |path: &Path| path == Path::new(dir).join("aterm.exe");
+        for image in ["aterm-gui.exe", "aterm.exe", "aterm-windowed.exe"] {
+            let exe = Path::new(APP).join(image);
+            assert_eq!(
+                windows_app_dir(&exe, holds(APP)).as_deref(),
+                Some(APP),
+                "{image}"
+            );
+        }
+        // NEGATIVE CONTROL: no console image beside the window's image.
+        assert_eq!(
+            windows_app_dir(&Path::new(APP).join("aterm-gui.exe"), |_| false),
+            None
+        );
+        assert_eq!(windows_app_dir(Path::new("aterm.exe"), |_| true), None);
+        #[cfg(windows)]
+        {
+            assert_eq!(bundle_dir(None), None);
+            let dir = aterm_tempfile::tempdir().expect("an app folder");
+            let gui = dir.path().join("aterm-gui.exe");
+            std::fs::write(&gui, b"").expect("the windowed image");
+            assert_eq!(bundle_dir(Some(&gui)), None, "no console image yet");
+            std::fs::write(dir.path().join("aterm.exe"), b"").expect("the console image");
+            assert_eq!(bundle_dir(Some(&gui)).as_deref(), dir.path().to_str());
+            let inherited = path(&[r"C:\Windows\system32", r"C:\Windows"]);
+            assert_eq!(
+                reroute_path_env(None, None, Some(APP), Some(&inherited), None).map(|p| p.1),
+                Some(path(&[APP, r"C:\Windows\system32", r"C:\Windows"]))
+            );
+        }
     }
 }
 
@@ -8819,6 +10071,32 @@ mod host_reach_tests {
         );
     }
 
+    /// A session's clipboard worker starts with its first OSC 52 write, never
+    /// with the session: a tab that never writes the clipboard holds no parked
+    /// thread, one more stack in every later fork's VM map. The first write
+    /// still arrives, and a second starts no second worker. NEGATIVE CONTROL:
+    /// before any write, no worker started.
+    #[test]
+    fn the_clipboard_worker_starts_with_the_first_write() {
+        crate::work_counts::take_clipboard_workers_started();
+        let (term, writes) = session(Cm::User);
+        assert_eq!(
+            crate::work_counts::take_clipboard_workers_started(),
+            0,
+            "no worker for a session that wrote nothing"
+        );
+        term_lock(&term).process(SET);
+        let first = writes.recv_timeout(HANG).expect("the first write arrives");
+        assert_eq!(first.clipboard.as_deref(), Some("planted"));
+        term_lock(&term).process(SET);
+        writes.recv_timeout(HANG).expect("the second write arrives");
+        assert_eq!(
+            crate::work_counts::take_clipboard_workers_started(),
+            1,
+            "one worker, started by the first write"
+        );
+    }
+
     /// A program in a Containment tab neither sets nor reads the clipboard
     /// through OSC 52, even after a later grant of the query (a config
     /// reload); a program in any other mode's tab still does both, which is
@@ -8927,14 +10205,818 @@ mod host_reach_tests {
 }
 
 #[cfg(test)]
+mod held_gather_tests {
+    //! The reader's held gather (`begin_held_gather`, `gather_held_output`): a
+    //! line-per-call writer's reads are gathered while the UI thread holds the
+    //! session's latch, and fed once per hold instead of once per line.
+    use super::{
+        HELD_GATHER_ENOUGH, HELD_GATHER_MARGIN_NS, HELD_GATHER_MIN_NS, HELD_GATHER_STEP_NS,
+        HELD_GATHER_WAIT_SLACK_NS, HoldRelease, OUTPUT_CADENCE_NS, PostCadence, STREAM_AFTER_NS,
+        WAKE_LATCH_DIRTY, WAKE_LATCH_HELD, WAKE_LATCH_SENT, WAKE_LATCH_STREAMING, WakeGate,
+        begin_held_gather, gated_output_wake, gather_held_output, output_latch_after_pass,
+        release_output_hold,
+    };
+    use std::cell::{Cell, RefCell};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const MS: u64 = 1_000_000;
+    const US: u64 = 1_000;
+
+    /// A gather begins only on a held latch, below a batch's worth, with no
+    /// key waiting; it marks the hold dirty as it begins, and ends a margin
+    /// before the hold is due, never sooner than the shortest gather and never
+    /// later than a cadence.
+    #[test]
+    fn a_gather_begins_only_on_a_held_latch_and_ends_before_its_due() {
+        let now = 100 * MS;
+        // Clear, armed and posted latches: the wake protocol's, fed at once.
+        for word in [
+            0,
+            now,
+            now | WAKE_LATCH_SENT,
+            now | WAKE_LATCH_SENT | WAKE_LATCH_STREAMING,
+        ] {
+            let latch = AtomicU64::new(word);
+            assert_eq!(begin_held_gather(&latch, now, 100, false), None);
+            assert_eq!(latch.load(Ordering::Relaxed), word, "untouched");
+        }
+        let due = now + OUTPUT_CADENCE_NS;
+        let held = WAKE_LATCH_HELD | due;
+        // A key waiting for its echo, or a read already a batch: fed at once.
+        for (filled, typing) in [(100, true), (HELD_GATHER_ENOUGH, false)] {
+            let latch = AtomicU64::new(held);
+            assert_eq!(begin_held_gather(&latch, now, filled, typing), None);
+            assert_eq!(latch.load(Ordering::Relaxed), held, "untouched");
+        }
+        // Held: gathered until a margin before the due instant, the hold marked
+        // dirty so its release runs the pass whenever the gather is fed.
+        let latch = AtomicU64::new(held);
+        assert_eq!(
+            begin_held_gather(&latch, now, 100, false),
+            Some(due - HELD_GATHER_MARGIN_NS)
+        );
+        assert_eq!(latch.load(Ordering::Relaxed), held | WAKE_LATCH_DIRTY);
+        // Already dirty: the same answer, the word unchanged.
+        assert_eq!(
+            begin_held_gather(&latch, now, 100, false),
+            Some(due - HELD_GATHER_MARGIN_NS)
+        );
+        assert_eq!(latch.load(Ordering::Relaxed), held | WAKE_LATCH_DIRTY);
+        // Near or past due (a late release): the shortest gather.
+        for at in [due - HELD_GATHER_MARGIN_NS, due, due + 7 * MS] {
+            let latch = AtomicU64::new(held);
+            assert_eq!(
+                begin_held_gather(&latch, at, 100, false),
+                Some(at + HELD_GATHER_MIN_NS)
+            );
+        }
+        // Never longer than a cadence.
+        let far = AtomicU64::new(WAKE_LATCH_HELD | (now + 50 * MS));
+        assert_eq!(
+            begin_held_gather(&far, now, 100, false),
+            Some(now + OUTPUT_CADENCE_NS)
+        );
+    }
+
+    /// A pipe a writer fills one line every `gap` from `first` on, read with a
+    /// clock the gather's waits move: what [`gather_held_output`] collects.
+    struct Pipe {
+        first: u64,
+        gap: u64,
+        len: usize,
+        lines: usize,
+        taken: Cell<usize>,
+        clock: Cell<u64>,
+    }
+
+    impl Pipe {
+        /// Every line written by the clock and not yet read, into `buf[filled..]`
+        /// as far as it reaches.
+        fn top_up(&self, buf: &mut [u8], filled: usize) -> usize {
+            let written = if self.clock.get() < self.first {
+                0
+            } else {
+                (((self.clock.get() - self.first) / self.gap) as usize + 1).min(self.lines)
+            };
+            let fit = (buf.len() - filled) / self.len;
+            let n = written.saturating_sub(self.taken.get()).min(fit);
+            self.taken.set(self.taken.get() + n);
+            filled + n * self.len
+        }
+    }
+
+    /// A gather collects each line the pipe holds by its end, waiting in steps
+    /// no longer than [`HELD_GATHER_STEP_NS`] and asking short of its deadline
+    /// by the wait's overshoot, so it ends on time; a key arriving ends it at
+    /// once; a fast writer ends it at a batch's worth.
+    #[test]
+    fn a_gather_collects_until_its_deadline_a_key_or_a_batch() {
+        let pipe = Pipe {
+            first: 0,
+            gap: 100 * US,
+            len: 100,
+            lines: 1_000,
+            taken: Cell::new(1),
+            clock: Cell::new(0),
+        };
+        let mut buf = vec![0u8; 65_536];
+        let until = 3_500 * US;
+        // Each wait overshoots as Windows' does (`HELD_GATHER_WAIT_SLACK_NS`).
+        for overshoot in [HELD_GATHER_WAIT_SLACK_NS, 0] {
+            pipe.taken.set(1);
+            pipe.clock.set(0);
+            let waits = RefCell::new(Vec::new());
+            let filled = gather_held_output(
+                &mut buf,
+                100,
+                until,
+                || pipe.clock.get(),
+                |b, f| pipe.top_up(b, f),
+                |d| {
+                    waits.borrow_mut().push(d);
+                    pipe.clock
+                        .set(pipe.clock.get() + d.as_nanos() as u64 + overshoot);
+                },
+                || true,
+            );
+            let end = pipe.clock.get();
+            assert!(
+                end <= until && until - end <= HELD_GATHER_WAIT_SLACK_NS,
+                "overshoot {overshoot}: it ends on its deadline, not after (at {end})"
+            );
+            let written = (end / pipe.gap + 1) as usize;
+            assert_eq!(
+                filled,
+                written * 100,
+                "each line written by its end, in one batch"
+            );
+            assert!(
+                waits
+                    .borrow()
+                    .iter()
+                    .all(|d| d.as_nanos() as u64 <= HELD_GATHER_STEP_NS),
+                "{waits:?}"
+            );
+        }
+        // A key arriving mid-gather ends it at once: the echo is fed now.
+        let pipe = Pipe {
+            taken: Cell::new(1),
+            clock: Cell::new(0),
+            ..pipe
+        };
+        let steps = Cell::new(0);
+        let filled = gather_held_output(
+            &mut buf,
+            100,
+            until,
+            || pipe.clock.get(),
+            |b, f| pipe.top_up(b, f),
+            |d| pipe.clock.set(pipe.clock.get() + d.as_nanos() as u64),
+            || {
+                steps.set(steps.get() + 1);
+                steps.get() < 2
+            },
+        );
+        assert_eq!(
+            pipe.clock.get(),
+            HELD_GATHER_STEP_NS,
+            "one step, then the key"
+        );
+        assert_eq!(filled, 11 * 100);
+        // A writer faster than the gather fills a batch's worth at the first look.
+        let fast = Pipe {
+            first: 0,
+            gap: US,
+            len: 100,
+            lines: 1_000,
+            taken: Cell::new(1),
+            clock: Cell::new(1_000 * US),
+        };
+        let filled = gather_held_output(
+            &mut buf,
+            100,
+            until,
+            || fast.clock.get(),
+            |b, f| fast.top_up(b, f),
+            |_| panic!("no wait: the pipe already held a batch"),
+            || true,
+        );
+        assert!(filled >= HELD_GATHER_ENOUGH, "{filled}");
+        assert_eq!(fast.clock.get(), 1_000 * US);
+    }
+
+    /// The UI thread's side, as `output_wake_coalesce_tests::drive` models it:
+    /// a posted wake's pass 20 µs after the post, and each hold's release
+    /// `late` after its due instant (a dirty one runs the pass and holds again).
+    struct Ui {
+        latch: AtomicU64,
+        queued: Cell<Option<u64>>,
+        deadline: Cell<Option<u64>>,
+        late: u64,
+        passes: RefCell<Vec<u64>>,
+    }
+
+    impl Ui {
+        fn pass(&self, now: u64) {
+            let word = self.latch.load(Ordering::Relaxed);
+            self.latch
+                .store(output_latch_after_pass(word, now), Ordering::Relaxed);
+            self.passes.borrow_mut().push(now);
+        }
+
+        /// Every turn due at or before `t`, in order.
+        fn turns_until(&self, t: u64) {
+            loop {
+                let release_at = self.deadline.get().map(|d| d + self.late);
+                let wake_turn = self
+                    .queued
+                    .get()
+                    .filter(|&q| release_at.is_none_or(|d| q <= d));
+                let Some(now) = wake_turn.or(release_at).filter(|&at| at <= t) else {
+                    return;
+                };
+                if wake_turn.is_some() {
+                    self.queued.set(None);
+                    self.pass(now);
+                }
+                self.deadline
+                    .set(match release_output_hold(&self.latch, now) {
+                        HoldRelease::Pending { due_ns } => Some(due_ns),
+                        HoldRelease::Due => {
+                            self.pass(now);
+                            Some(now + OUTPUT_CADENCE_NS)
+                        }
+                        HoldRelease::NotHeld | HoldRelease::Released => None,
+                    });
+            }
+        }
+    }
+
+    /// How a driven reader's machine keeps time: each feed costs `feed`, each
+    /// gather wait wakes `overshoot` past its ask, and each hold is released
+    /// `late` after it falls due.
+    #[derive(Clone, Copy, Debug)]
+    struct Timing {
+        feed: u64,
+        overshoot: u64,
+        late: u64,
+    }
+
+    /// Drive a reader over `pipe` through the real gate, pass, release and (when
+    /// `gather`) held gather: a blocking read takes every line written by the
+    /// clock, and the UI turns as [`Ui`] says, all on `timing`'s clocks.
+    /// Returns, per line, when it was fed, the feeds, and the UI's passes.
+    fn drive_reader(pipe: &Pipe, gather: bool, timing: Timing) -> (Vec<u64>, usize, Vec<u64>) {
+        let ui = Ui {
+            latch: AtomicU64::new(0),
+            queued: Cell::new(None),
+            deadline: Cell::new(None),
+            late: timing.late,
+            passes: RefCell::new(Vec::new()),
+        };
+        let mut cadence = PostCadence::default();
+        let mut fed_at = Vec::new();
+        let mut feeds = 0;
+        let mut buf = vec![0u8; 65_536];
+        while pipe.taken.get() < pipe.lines {
+            // The blocking read returns once the next line is written.
+            let next = pipe.first + pipe.taken.get() as u64 * pipe.gap;
+            pipe.clock.set(pipe.clock.get().max(next));
+            ui.turns_until(pipe.clock.get());
+            let before = pipe.taken.get();
+            let mut filled = pipe.top_up(&mut buf, 0);
+            if gather
+                && let Some(until) = begin_held_gather(&ui.latch, pipe.clock.get(), filled, false)
+            {
+                filled = gather_held_output(
+                    &mut buf,
+                    filled,
+                    until,
+                    || pipe.clock.get(),
+                    |b, f| pipe.top_up(b, f),
+                    |d| {
+                        pipe.clock
+                            .set(pipe.clock.get() + d.as_nanos() as u64 + timing.overshoot);
+                        ui.turns_until(pipe.clock.get());
+                    },
+                    || true,
+                );
+            }
+            assert_eq!(filled, (pipe.taken.get() - before) * pipe.len);
+            // Fed: the engine has the lines, then the gate runs.
+            ui.turns_until(pipe.clock.get());
+            let now = pipe.clock.get();
+            fed_at.extend(std::iter::repeat_n(now, pipe.taken.get() - before));
+            feeds += 1;
+            let gate =
+                gated_output_wake(&ui.latch, now, 0, cadence.streaming(now), || true, || now);
+            match gate {
+                WakeGate::Posted | WakeGate::Reposted => {
+                    cadence.posted(now);
+                    ui.queued.set(Some(now + 20 * US));
+                }
+                WakeGate::Held => cadence.held(now),
+                WakeGate::Coalesced => {}
+            }
+            pipe.clock.set(now + timing.feed);
+        }
+        ui.turns_until(u64::MAX);
+        assert_eq!(ui.latch.load(Ordering::Relaxed), 0, "quiet: nothing held");
+        (fed_at, feeds, ui.passes.into_inner())
+    }
+
+    /// The finding (re-judge, 2026-10-18): after the holds, 200,000 lines of
+    /// pwsh `Get-Content` still cost aterm 7.5-8.9 s of CPU against 0.3 s for
+    /// `cat`, because the reader still fed, locked, taped and gated each line on
+    /// its own. 200 ms of lines 100 µs apart now cost a feed per line only for
+    /// the first frame and then at most four per hold, and every line still
+    /// reaches a pass within a cadence plus the gather's margin and its
+    /// shortest wait (plus the release's own lateness).
+    ///
+    /// On exact clocks, and on Windows-like ones: waits that overshoot by
+    /// [`HELD_GATHER_WAIT_SLACK_NS`] and releases up to a millisecond late.
+    #[test]
+    fn a_held_stream_is_fed_once_per_hold_not_once_per_line() {
+        let pipe = || Pipe {
+            first: 1_000 * MS,
+            gap: 100 * US,
+            len: 100,
+            lines: 2_000,
+            taken: Cell::new(0),
+            clock: Cell::new(0),
+        };
+        for (overshoot, late) in [
+            (0, 0),
+            (HELD_GATHER_WAIT_SLACK_NS, 0),
+            (HELD_GATHER_WAIT_SLACK_NS, 500 * US),
+            (0, MS),
+        ] {
+            let timing = Timing {
+                feed: 20 * US,
+                overshoot,
+                late,
+            };
+            let p = pipe();
+            let (fed_at, feeds, passes) = drive_reader(&p, true, timing);
+            // At most four feeds per hold: the long gather, and the short ones
+            // around the release (measured on these clocks: 253 to 344 feeds).
+            let bound = (STREAM_AFTER_NS / (100 * US)
+                + 4 * (200 * MS - STREAM_AFTER_NS) / OUTPUT_CADENCE_NS
+                + 8) as usize;
+            assert!(
+                feeds <= bound,
+                "{timing:?}: {feeds} feeds for 2,000 lines (at most {bound})"
+            );
+            let lag = OUTPUT_CADENCE_NS + HELD_GATHER_MARGIN_NS + HELD_GATHER_MIN_NS + late;
+            for (i, &fed) in fed_at.iter().enumerate() {
+                let written = p.first + i as u64 * p.gap;
+                let pass = passes.iter().find(|&&at| at > fed).copied();
+                assert!(
+                    pass.is_some_and(|at| at - written <= lag),
+                    "{timing:?}: line {i}, written at {} µs and fed at {} µs, waits for {pass:?}",
+                    written / US,
+                    fed / US
+                );
+            }
+            // Without the gather, the same writer is fed line by line.
+            let (_, feeds_ungathered, _) = drive_reader(&pipe(), false, timing);
+            assert_eq!(feeds_ungathered, 2_000, "{timing:?}");
+        }
+    }
+
+    /// A typed echo meets no hold, so nothing is gathered: under OpenConsole a
+    /// PSReadLine echo is about seven reads 40 µs apart, each fed as it comes.
+    #[test]
+    fn a_typed_echo_is_never_gathered() {
+        for key in 0..40u64 {
+            let p = Pipe {
+                first: 1_000 * MS + key * 80 * MS,
+                gap: 40 * US,
+                len: 12,
+                lines: 7,
+                taken: Cell::new(0),
+                clock: Cell::new(0),
+            };
+            let timing = Timing {
+                feed: 20 * US,
+                overshoot: HELD_GATHER_WAIT_SLACK_NS,
+                late: 0,
+            };
+            let (fed_at, feeds, _) = drive_reader(&p, true, timing);
+            assert_eq!(feeds, 7, "key {key}: a feed per read");
+            for (i, &fed) in fed_at.iter().enumerate() {
+                assert_eq!(fed, p.first + i as u64 * p.gap, "key {key}: fed as read");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod output_wake_coalesce_tests {
     use super::{
-        LoopIdle, OutputWakeVerdict, OutputWakeWatch, WAKE_LATCH_EXPIRY_NS, WAKE_LATCH_SENT,
-        WakeGate, gated_output_wake, judge_output_wake, wake_stranded,
+        HoldRelease, LoopIdle, OUTPUT_CADENCE_NS, OutputWakeVerdict, OutputWakeWatch, PostCadence,
+        STREAM_AFTER_NS, WAKE_LATCH_DIRTY, WAKE_LATCH_EXPIRY_NS, WAKE_LATCH_HELD, WAKE_LATCH_SENT,
+        WAKE_LATCH_STAMP, WAKE_LATCH_STREAMING, WakeGate, gated_output_wake, judge_output_wake,
+        output_latch_after_pass, release_output_hold, wake_stranded,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const MS: u64 = 1_000_000;
+    const US: u64 = 1_000;
+
+    /// A burst of posts, each under a cadence after the one before, streams
+    /// once it has run [`STREAM_AFTER_NS`]. A quiet cadence ends a burst that has
+    /// not streamed yet; one that has outlives it, and its held chunks carry it,
+    /// until a quiet frame ends it.
+    #[test]
+    fn a_burst_streams_after_a_frame_and_a_quiet_frame_ends_it() {
+        let mut c = PostCadence::default();
+        assert!(!c.streaming(5 * MS), "a reader's first post");
+        let mut t = 5 * MS;
+        c.posted(t);
+        // Ended by a quiet cadence before it streamed.
+        assert!(!c.streaming(t + OUTPUT_CADENCE_NS));
+        t += OUTPUT_CADENCE_NS;
+        c.posted(t);
+        let from = t;
+        while t + 100 * US < from + STREAM_AFTER_NS {
+            t += 100 * US;
+            assert!(!c.streaming(t), "+{} µs into the burst", (t - from) / US);
+            c.posted(t);
+        }
+        t += 100 * US;
+        assert!(c.streaming(t), "a frame into the burst");
+        c.posted(t);
+        // Under its hold the stream feeds without posting.
+        t += 30 * MS;
+        c.held(t);
+        assert!(
+            c.streaming(t + STREAM_AFTER_NS - 1),
+            "a stream that stalled under a frame resumes as one"
+        );
+        assert!(
+            !c.streaming(t + STREAM_AFTER_NS),
+            "a quiet frame ends the burst"
+        );
+        c.posted(t + STREAM_AFTER_NS);
+        assert!(!c.streaming(t + STREAM_AFTER_NS + 100 * US), "a new burst");
+    }
+
+    /// A post that is not streaming clears the latch at its pass; a streaming
+    /// one carries the streaming bit, and its pass holds the latch for the
+    /// cadence instead.
+    #[test]
+    fn a_streaming_post_takes_a_hold_and_a_lone_one_clears() {
+        let lone = AtomicU64::new(0);
+        assert_eq!(
+            gated_output_wake(&lone, 10 * MS, 0, false, || true, || 10 * MS),
+            WakeGate::Posted
+        );
+        let word = lone.load(Ordering::Relaxed);
+        assert_eq!(word, (10 * MS) | WAKE_LATCH_SENT);
+        assert_eq!(
+            output_latch_after_pass(word, 10 * MS),
+            0,
+            "a lone pass clears"
+        );
+
+        let streaming = AtomicU64::new(0);
+        let mut during = 0;
+        assert_eq!(
+            gated_output_wake(
+                &streaming,
+                20 * MS,
+                0,
+                true,
+                || {
+                    during = streaming.load(Ordering::Relaxed);
+                    true
+                },
+                || 20 * MS + 1,
+            ),
+            WakeGate::Posted
+        );
+        assert_eq!(during, (20 * MS) | WAKE_LATCH_STREAMING, "the unsent arm");
+        let word = streaming.load(Ordering::Relaxed);
+        assert_eq!(word, (20 * MS + 1) | WAKE_LATCH_SENT | WAKE_LATCH_STREAMING);
+        let held = output_latch_after_pass(word, 20 * MS + 50 * US);
+        assert_eq!(
+            held,
+            WAKE_LATCH_HELD | (20 * MS + 50 * US + OUTPUT_CADENCE_NS)
+        );
+        assert_eq!(
+            held & WAKE_LATCH_SENT,
+            0,
+            "a hold is never a sent wake, so the watchdog never judges it"
+        );
+        // A pass that runs on a hold (its release, or a redraw nudge meanwhile)
+        // holds again from its own instant.
+        assert_eq!(
+            output_latch_after_pass(held | WAKE_LATCH_DIRTY, 30 * MS),
+            WAKE_LATCH_HELD | (30 * MS + OUTPUT_CADENCE_NS)
+        );
+    }
+
+    /// A held latch posts nothing: the first chunk marks it dirty, the next ones
+    /// find it so. Released while clean, it clears and the next chunk posts at
+    /// once; due and dirty, the release asks for the pass.
+    #[test]
+    fn a_held_latch_coalesces_into_its_release() {
+        let due = 50 * MS;
+        let latch = AtomicU64::new(WAKE_LATCH_HELD | due);
+        assert_eq!(
+            release_output_hold(&latch, due - 1),
+            HoldRelease::Pending { due_ns: due }
+        );
+        let mut sends = 0;
+        for at in [47 * MS, 48 * MS, 49 * MS] {
+            let gate = gated_output_wake(
+                &latch,
+                at,
+                0,
+                true,
+                || {
+                    sends += 1;
+                    true
+                },
+                || at,
+            );
+            assert_eq!(gate, WakeGate::Held);
+        }
+        assert_eq!(sends, 0, "a hold posts nothing");
+        assert_eq!(
+            latch.load(Ordering::Relaxed),
+            WAKE_LATCH_HELD | WAKE_LATCH_DIRTY | due
+        );
+        assert_eq!(
+            release_output_hold(&latch, due - 1),
+            HoldRelease::Pending { due_ns: due },
+            "dirty, but not due"
+        );
+        assert_eq!(release_output_hold(&latch, due), HoldRelease::Due);
+        // The pass the release asks for holds again.
+        let word = latch.load(Ordering::Relaxed);
+        latch.store(output_latch_after_pass(word, due), Ordering::Relaxed);
+        let due2 = due + OUTPUT_CADENCE_NS;
+        assert_eq!(latch.load(Ordering::Relaxed), WAKE_LATCH_HELD | due2);
+        // Nothing fed under the second hold: released clean.
+        assert_eq!(release_output_hold(&latch, due2), HoldRelease::Released);
+        assert_eq!(latch.load(Ordering::Relaxed), 0);
+        assert_eq!(release_output_hold(&latch, due2), HoldRelease::NotHeld);
+        // The next chunk posts at once.
+        assert_eq!(
+            gated_output_wake(&latch, due2 + MS, 0, false, || true, || due2 + MS),
+            WakeGate::Posted
+        );
+        assert_eq!(release_output_hold(&latch, u64::MAX), HoldRelease::NotHeld);
+    }
+
+    /// The lost-wake watchdog and the stranded re-post leave a hold alone: no
+    /// wake stands behind it, and its release has its own deadline.
+    #[test]
+    fn the_watchdog_never_judges_a_hold() {
+        let mut watch = OutputWakeWatch::default();
+        for word in [
+            WAKE_LATCH_HELD | (5 * MS),
+            WAKE_LATCH_HELD | WAKE_LATCH_DIRTY | (5 * MS),
+        ] {
+            assert_eq!(
+                judge_output_wake(word, u64::MAX, 900 * MS),
+                OutputWakeVerdict::Clear
+            );
+            assert!(!wake_stranded(word, 1, 900 * MS));
+            let latch = AtomicU64::new(word);
+            watch.pass(1_000 * MS, [(4, &latch)]);
+            let pass = watch.pass(2_000 * MS, [(4, &latch)]);
+            assert_eq!((pass.healed, pass.late, pass.recheck_ns), (0, 0, None));
+            assert_eq!(latch.load(Ordering::Relaxed), word, "untouched");
+        }
+        // A streaming wake that IS lost is still the watchdog's to heal.
+        let lost = AtomicU64::new((5 * MS) | WAKE_LATCH_SENT | WAKE_LATCH_STREAMING);
+        let mut watch = OutputWakeWatch::default();
+        watch.pass(10 * MS, [(4, &lost)]);
+        assert_eq!(watch.pass(20 * MS, [(4, &lost)]).healed, 1);
+        assert_eq!(lost.load(Ordering::Relaxed), 0);
+        assert!(
+            wake_stranded(
+                (5 * MS) | WAKE_LATCH_SENT | WAKE_LATCH_STREAMING,
+                1,
+                900 * MS
+            ),
+            "the streaming bit is not part of the stamp"
+        );
+        assert_eq!(WAKE_LATCH_STAMP & (WAKE_LATCH_HELD | WAKE_LATCH_DIRTY), 0);
+    }
+
+    /// Drive the real gate, pass and release: a reader feeds a chunk at each of
+    /// `reads` (ascending ns), and the UI thread turns 20 µs after each post (the
+    /// pass, then `about_to_wait`'s release) and at each hold deadline it folded.
+    /// Returns the instants of the passes, how many hold deadlines were folded,
+    /// and the latch word once the loop has nothing left to do.
+    fn drive(reads: &[u64]) -> (Vec<u64>, usize, u64) {
+        fn pass(latch: &AtomicU64, now: u64, passes: &mut Vec<u64>) {
+            let word = latch.load(Ordering::Relaxed);
+            latch.store(output_latch_after_pass(word, now), Ordering::Relaxed);
+            passes.push(now);
+        }
+        let latch = AtomicU64::new(0);
+        let mut cadence = PostCadence::default();
+        let (mut passes, mut folds) = (Vec::new(), 0);
+        let (mut queued, mut deadline): (Option<u64>, Option<u64>) = (None, None);
+        for &read in reads.iter().chain(std::iter::once(&u64::MAX)) {
+            // Every turn due by this read runs before it.
+            loop {
+                let wake_turn = queued.filter(|&q| deadline.is_none_or(|d| q <= d));
+                let Some(now) = wake_turn.or(deadline).filter(|&at| at <= read) else {
+                    break;
+                };
+                if wake_turn.is_some() {
+                    queued = None;
+                    pass(&latch, now, &mut passes);
+                }
+                deadline = match release_output_hold(&latch, now) {
+                    HoldRelease::Pending { due_ns } => Some(due_ns),
+                    HoldRelease::Due => {
+                        pass(&latch, now, &mut passes);
+                        Some(now + OUTPUT_CADENCE_NS)
+                    }
+                    HoldRelease::NotHeld | HoldRelease::Released => None,
+                };
+                folds += usize::from(deadline.is_some());
+            }
+            if read == u64::MAX {
+                break;
+            }
+            let gate =
+                gated_output_wake(&latch, read, 0, cadence.streaming(read), || true, || read);
+            match gate {
+                WakeGate::Posted | WakeGate::Reposted => {
+                    cadence.posted(read);
+                    queued = Some(read + 20 * US);
+                }
+                WakeGate::Held => cadence.held(read),
+                WakeGate::Coalesced => {}
+            }
+        }
+        (passes, folds, latch.load(Ordering::Relaxed))
+    }
+
+    /// Every chunk is read by a pass at most `bound` after it was fed.
+    fn assert_covered(reads: &[u64], passes: &[u64], bound: u64) {
+        for &read in reads {
+            let pass = passes.iter().find(|&&p| p > read).copied();
+            assert!(
+                pass.is_some_and(|p| p - read <= bound),
+                "the chunk fed at {} µs waits for {pass:?}",
+                read / US
+            );
+        }
+    }
+
+    /// The finding (judge, 2026-10-18): a writer that hands its reader one line
+    /// every 100 µs bought one loop turn per read, 19,133 `Wake::Output`s for
+    /// 20,000 lines of pwsh `Get-Content`. Through the real gate, pass and
+    /// release, 200 ms of such output now costs a pass per read for its first
+    /// frame and one per cadence after it, and every line, the last included,
+    /// still reaches a pass within one cadence.
+    #[test]
+    fn a_line_per_read_writer_costs_one_pass_per_cadence() {
+        let start = 1_000 * MS;
+        let reads: Vec<u64> = (0..2_000).map(|i| start + i * 100 * US).collect();
+        let (passes, folds, latch) = drive(&reads);
+        let bound = (STREAM_AFTER_NS / (100 * US)
+            + (200 * MS - STREAM_AFTER_NS) / OUTPUT_CADENCE_NS
+            + 4) as usize;
+        assert!(
+            passes.len() <= bound,
+            "{} passes for {} reads (at most {bound})",
+            passes.len(),
+            reads.len()
+        );
+        assert!(folds > 0, "the holds folded their deadlines");
+        assert_covered(&reads, &passes, OUTPUT_CADENCE_NS);
+        assert_eq!(latch, 0, "quiet: nothing held");
+    }
+
+    /// The finding (CTL-1, 2026-10-19): on a busy Mac the writer of a flood is
+    /// descheduled for 4 ms and more, dozens of times a second, and each such
+    /// stall ended its hold chain with a clean release; the stream then bought a
+    /// pass per read for a frame again. 4,000 lines 100 µs apart, the writer
+    /// stalled 6 ms after every 200 of them, now cost one pass per read for the
+    /// first frame, then one per cadence and one at each stall's end (276
+    /// passes), and every line still reaches a pass within a cadence. NEGATIVE
+    /// CONTROL: a burst ended at each stall (the old `PostCadence`) makes 3,240
+    /// passes, against the bound of 332 here.
+    #[test]
+    fn a_stream_whose_writer_stalls_keeps_its_holds() {
+        let start = 1_000 * MS;
+        let reads: Vec<u64> = (0..4_000u64)
+            .map(|i| start + i * 100 * US + (i / 200) * 6 * MS)
+            .collect();
+        let (passes, folds, latch) = drive(&reads);
+        let span = reads.last().copied().unwrap_or(start) - start;
+        let stalls = (reads.len() / 200) as u64;
+        let bound =
+            (STREAM_AFTER_NS / (100 * US) + span / OUTPUT_CADENCE_NS + 2 * stalls + 4) as usize;
+        assert!(
+            passes.len() <= bound,
+            "{} passes for {} reads (at most {bound})",
+            passes.len(),
+            reads.len()
+        );
+        assert!(folds > 0, "the holds folded their deadlines");
+        assert_covered(&reads, &passes, OUTPUT_CADENCE_NS);
+        assert_eq!(latch, 0, "quiet: nothing held");
+    }
+
+    /// A key's echo is never held. Under OpenConsole a PSReadLine echo is about
+    /// seven reads 40 µs apart (cursor off, text, colours, cursor on; measured
+    /// in a typing cast, 2026-10-18): each still buys its pass at once, and no
+    /// hold deadline is ever folded.
+    #[test]
+    fn a_typed_echo_is_never_held() {
+        let reads: Vec<u64> = (0..40)
+            .flat_map(|key| (0..7).map(move |r| 1_000 * MS + key * 80 * MS + r * 40 * US))
+            .collect();
+        let (passes, folds, latch) = drive(&reads);
+        assert_eq!(passes.len(), reads.len(), "a pass per read, as before");
+        assert_eq!(folds, 0, "no hold, so no extra turn");
+        assert_covered(&reads, &passes, 20 * US);
+        assert_eq!(latch, 0);
+    }
+
+    /// Through the real `App`: a streaming wake's pass holds session 0's latch,
+    /// and `release_output_holds` folds the hold's due instant, runs the
+    /// session's pass at it for a chunk fed under the hold (its window admitted
+    /// again), holds again, and clears once nothing more was fed.
+    #[test]
+    fn the_app_runs_a_dirty_holds_pass_at_its_release() {
+        use std::time::{Duration, Instant};
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let epoch = app.lat_epoch;
+        let ns = |t: Instant| u64::try_from(t.duration_since(epoch).as_nanos()).expect("ns");
+        let latch = app
+            .pool
+            .get(0)
+            .expect("session 0")
+            .output_wake_pending
+            .clone();
+        let t0 = Instant::now();
+        // A streaming wake, posted and delivered.
+        latch.store(
+            ns(t0) | WAKE_LATCH_SENT | WAKE_LATCH_STREAMING,
+            Ordering::Relaxed,
+        );
+        app.on_output_wake(0, t0);
+        let due = ns(t0) + OUTPUT_CADENCE_NS;
+        assert_eq!(latch.load(Ordering::Relaxed), WAKE_LATCH_HELD | due);
+        assert_eq!(
+            app.release_output_holds(t0).map(ns),
+            Some(due),
+            "a standing hold folds its due instant"
+        );
+        // A chunk fed under the hold posts nothing.
+        assert_eq!(
+            crate::spawn::gated_output_wake_for_test(&latch, ns(t0) + 1, || {
+                panic!("a hold posts nothing")
+            }),
+            WakeGate::Held
+        );
+        app.windows
+            .get_mut(&wid)
+            .expect("window 0")
+            .pending_deco_birth = None;
+        let at_due = epoch + Duration::from_nanos(due);
+        assert_eq!(
+            app.release_output_holds(at_due).map(ns),
+            Some(due + OUTPUT_CADENCE_NS),
+            "the release's pass holds again"
+        );
+        assert_eq!(
+            app.windows[&wid].pending_deco_birth,
+            Some(at_due),
+            "the release ran the session's pass"
+        );
+        assert_eq!(
+            latch.load(Ordering::Relaxed),
+            WAKE_LATCH_HELD | (due + OUTPUT_CADENCE_NS)
+        );
+        // Nothing more was fed: released clean, with no pass and no deadline.
+        app.windows
+            .get_mut(&wid)
+            .expect("window 0")
+            .pending_deco_birth = None;
+        let at_due2 = at_due + Duration::from_nanos(OUTPUT_CADENCE_NS);
+        assert_eq!(app.release_output_holds(at_due2), None);
+        assert_eq!(latch.load(Ordering::Relaxed), 0);
+        assert_eq!(app.windows[&wid].pending_deco_birth, None);
+        // A lone wake on the cleared latch clears it again: no hold, no deadline.
+        latch.store(ns(at_due2) | WAKE_LATCH_SENT, Ordering::Relaxed);
+        app.on_output_wake(0, at_due2);
+        assert_eq!(latch.load(Ordering::Relaxed), 0);
+        assert_eq!(app.release_output_holds(at_due2), None);
+    }
 
     /// A failed send (headless: no event loop) must RESET the latch — an arm
     /// left behind would suppress wakes until the watchdog proved it lost.
@@ -8943,7 +11025,7 @@ mod output_wake_coalesce_tests {
         let flag = AtomicU64::new(0);
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         drop(rx); // no event loop: every send errors
-        let gate = gated_output_wake(&flag, 1, 0, || tx.send(()).is_ok(), || 2);
+        let gate = gated_output_wake(&flag, 1, 0, false, || tx.send(()).is_ok(), || 2);
         assert_eq!(gate, WakeGate::Coalesced, "nothing was posted");
         assert_eq!(
             flag.load(Ordering::Relaxed),
@@ -8952,7 +11034,7 @@ mod output_wake_coalesce_tests {
         );
         // A later live receiver is still woken.
         let (tx2, rx2) = std::sync::mpsc::channel::<()>();
-        let gate = gated_output_wake(&flag, 3, 0, || tx2.send(()).is_ok(), || 4);
+        let gate = gated_output_wake(&flag, 3, 0, false, || tx2.send(()).is_ok(), || 4);
         assert_eq!(gate, WakeGate::Posted);
         assert_eq!(rx2.try_iter().count(), 1);
     }
@@ -8969,6 +11051,7 @@ mod output_wake_coalesce_tests {
             &flag,
             10 * MS,
             0,
+            false,
             || {
                 during = flag.load(Ordering::Relaxed);
                 true
@@ -8988,6 +11071,7 @@ mod output_wake_coalesce_tests {
             &flag,
             5,
             0,
+            false,
             || {
                 flag.store(0, Ordering::Relaxed); // the handler ran already
                 true
@@ -9077,6 +11161,7 @@ mod output_wake_coalesce_tests {
                 &flag,
                 now_ns,
                 idle_since(&st),
+                false,
                 || {
                     sent = true;
                     true
@@ -9225,6 +11310,7 @@ mod output_wake_coalesce_tests {
                 &latch,
                 t0 + at * MS,
                 loop_idle.since_ns(),
+                false,
                 || tx.send(()).is_ok(),
                 || t0 + at * MS,
             );
@@ -9255,6 +11341,7 @@ mod output_wake_coalesce_tests {
             &latch,
             end + MS,
             loop_idle.since_ns(),
+            false,
             || tx.send(()).is_ok(),
             || end + MS,
         );
@@ -9297,7 +11384,7 @@ mod output_wake_coalesce_tests {
             // 5 ms in, output posts a wake; the frame runs 400 ms.
             let post = t + 5 * MS;
             assert_eq!(
-                gated_output_wake(&latch, post, 0, || true, || post),
+                gated_output_wake(&latch, post, 0, false, || true, || post),
                 WakeGate::Posted
             );
             t += 400 * MS;
@@ -9332,7 +11419,7 @@ mod output_wake_coalesce_tests {
         let t0 = 1_000 * MS;
         watch.pass(t0, [(3, &latch)]);
         let sent = t0 + 10 * MS;
-        gated_output_wake(&latch, sent, 0, || tx.send(()).is_ok(), || sent);
+        gated_output_wake(&latch, sent, 0, false, || tx.send(()).is_ok(), || sent);
         // Turn k drains the event but it never reaches a handler: LOST.
         assert_eq!(rx.try_iter().count(), 1);
         let pass_at = t0 + 12 * MS;
@@ -9358,6 +11445,7 @@ mod output_wake_coalesce_tests {
             &latch,
             recheck + 1,
             0,
+            false,
             || tx.send(()).is_ok(),
             || recheck + 1,
         );
@@ -9730,8 +11818,11 @@ mod kitty_transfer_tests {
         let outside_scratch = scratch_in(target, "kept");
         let outside = &outside_scratch.0;
         let canonical = std::fs::canonicalize(outside).unwrap();
-        let temp_dirs = [std::path::PathBuf::from("/tmp"), std::env::temp_dir()]
-            .map(|dir| std::fs::canonicalize(dir).unwrap());
+        // `/tmp` where the host has one (Windows has none).
+        let temp_dirs: Vec<_> = [std::path::PathBuf::from("/tmp"), std::env::temp_dir()]
+            .into_iter()
+            .filter_map(|dir| std::fs::canonicalize(dir).ok())
+            .collect();
         assert!(
             !temp_dirs.iter().any(|tmp| canonical.starts_with(tmp)),
             "the target directory must not be a temporary directory"
@@ -9770,7 +11861,13 @@ mod kitty_transfer_tests {
         for _ in 0..64 {
             escaped.push("..");
         }
-        escaped.push(canonical.strip_prefix("/").unwrap());
+        // Down again from the root: the target's path without its root (and,
+        // on Windows, without its drive prefix; the two share a drive).
+        escaped.extend(
+            canonical
+                .components()
+                .filter(|part| matches!(part, std::path::Component::Normal(_))),
+        );
         escaped.push("victim.rgba");
         let placed = transmit_temp_file(&escaped);
         assert!(victim.exists(), "`..` cannot carry the delete out of /tmp");
@@ -9811,7 +11908,8 @@ mod kitty_transfer_tests {
         let held = temp_scratch.0.join("held");
 
         let mut swapped = false;
-        let read = read_kitty_temp_file_with(&sent, || {
+        let read = read_kitty_file(&sent);
+        consume_kitty_temp_file_with(&sent, || {
             std::fs::rename(&marked, &held).unwrap();
             std::os::unix::fs::symlink(&outside_scratch.0, &marked).unwrap();
             swapped = true;
@@ -9881,6 +11979,75 @@ mod kitty_transfer_tests {
         }
     }
 
+    /// A `t=t` FILE OR `t=s` OBJECT THE ENGINE REFUSES IS LEFT WHERE THE PROGRAM
+    /// PUT IT (ATERM-KI-1014-6): the reader reads a medium before its hold, and
+    /// the engine refuses a raw transmission that declares no size before it
+    /// asks for the bytes; before, the read had already deleted the file and
+    /// unlinked the object. CONTROL: the same transmission with its size
+    /// declared is placed, and its medium consumed.
+    #[test]
+    fn a_temp_medium_the_engine_refuses_is_not_consumed() {
+        let scratch = scratch_in(&std::env::temp_dir(), "refused");
+        let marked = scratch.0.join("tty-graphics-protocol");
+        std::fs::create_dir_all(&marked).unwrap();
+        let path = cell_file(&marked, "sent.rgba");
+        let placed =
+            |term: &Arc<Mutex<Terminal>>| !term_lock(term).cell_frame(24, 80).images[0].is_empty();
+        let name = path.to_str().unwrap().as_bytes();
+        let term = term_with_resolver();
+        crate::host_io_prefetch::feed_as_reader(&term, &apc("a=T,f=32,t=t", name));
+        assert!(!placed(&term), "PRECONDITION: the engine refused it");
+        assert!(path.exists(), "a t=t file the engine refused was consumed");
+        crate::host_io_prefetch::feed_as_reader(&term, &apc("a=T,f=32,s=10,v=20,t=t", name));
+        assert!(placed(&term), "CONTROL: the sized transmission is placed");
+        assert!(!path.exists(), "CONTROL: and its t=t file consumed");
+
+        #[cfg(unix)]
+        {
+            let shm = format!("/aterm-kft-{}", std::process::id());
+            let cname = std::ffi::CString::new(shm.clone()).unwrap();
+            let exists = || {
+                // SAFETY: a valid C string; the fd, when one opens, is closed.
+                let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
+                if fd >= 0 {
+                    unsafe { libc::close(fd) };
+                }
+                fd >= 0
+            };
+            // One page, as a 16-row RGBA raster: Darwin reports a shared-memory
+            // object's size in whole pages.
+            // SAFETY: `sysconf` takes no pointers.
+            let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+            // SAFETY: a valid C string; the object is sized and closed.
+            unsafe {
+                let fd = libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600);
+                assert!(fd >= 0, "the shared-memory object opens");
+                assert_eq!(libc::ftruncate(fd, page as libc::off_t), 0);
+                libc::close(fd);
+            }
+            let term = term_with_resolver();
+            crate::host_io_prefetch::feed_as_reader(&term, &apc("a=T,f=32,t=s", shm.as_bytes()));
+            let kept = exists();
+            crate::host_io_prefetch::feed_as_reader(
+                &term,
+                &apc(
+                    &format!("a=T,f=32,s={},v=16,t=s", page / 64),
+                    shm.as_bytes(),
+                ),
+            );
+            let taken_placed = placed(&term);
+            let left = exists();
+            // SAFETY: a valid C string; removing the test's own object if still there.
+            unsafe { libc::shm_unlink(cname.as_ptr()) };
+            assert!(kept, "a t=s object the engine refused was unlinked");
+            assert!(
+                taken_placed,
+                "CONTROL: the sized t=s transmission is placed"
+            );
+            assert!(!left, "CONTROL: and its object unlinked");
+        }
+    }
+
     #[test]
     fn file_medium_rejects_oversized_file() {
         let dir = std::env::temp_dir().join(format!("aterm-kft-big-{}", std::process::id()));
@@ -9908,7 +12075,7 @@ mod kitty_transfer_tests {
 mod adoption_render_debt_tests {
     use std::sync::{Arc, Mutex};
 
-    use aterm_core::terminal::Terminal;
+    use aterm_core::terminal::{RenderDebt, Terminal};
 
     use super::seed_adopted_render_debt;
     use crate::resize_epoch::EpochVerdict;
@@ -9935,8 +12102,11 @@ mod adoption_render_debt_tests {
     fn a_seeded_debt_opens_an_epoch_that_is_judged_from_attach() {
         let term = restored();
         let tl = timeline();
-        seed_adopted_render_debt(&term, &tl, (-1, 0));
-        assert_eq!(term.lock().unwrap().render_debt(), (-1, 0));
+        seed_adopted_render_debt(&term, &tl, RenderDebt::of_rows(-1, 0));
+        assert_eq!(
+            term.lock().unwrap().render_debt(),
+            RenderDebt::of_rows(-1, 0)
+        );
         let probe = {
             let t = term.lock().unwrap();
             crate::resize_ledger::EngineProbe::sample(&t)
@@ -9958,6 +12128,36 @@ mod adoption_render_debt_tests {
         guard.evaluate_resizes(probe, after + 1);
         let view = guard.resize_nudge_view().expect("at risk, agent, untried");
         assert_eq!((view.shift, view.pushed), (-1, 0));
+    }
+
+    /// A carried cut (S2R-F3: a column flap cut drawn cells in the parent) is
+    /// judged from attach as rows are: the nudge is owed though no row moved.
+    #[test]
+    fn a_seeded_cut_is_judged_from_attach_as_rows_are() {
+        let term = restored();
+        let tl = timeline();
+        let cut = RenderDebt {
+            cut: 2,
+            ..RenderDebt::default()
+        };
+        seed_adopted_render_debt(&term, &tl, cut);
+        assert_eq!(term.lock().unwrap().render_debt(), cut);
+        let probe = {
+            let t = term.lock().unwrap();
+            crate::resize_ledger::EngineProbe::sample(&t)
+        };
+        let mut guard = tl.lock().unwrap();
+        guard.set_agent_reader_for_test(true);
+        let epoch = guard
+            .resizes()
+            .epochs()
+            .current()
+            .cloned()
+            .expect("an epoch on a cut alone");
+        let after = epoch.last_resize_ms + crate::resize_ledger::RISK_AFTER_MS;
+        guard.evaluate_resizes(probe, after + 1);
+        let view = guard.resize_nudge_view().expect("at risk, agent, untried");
+        assert_eq!((view.shift, view.pushed, view.cut), (0, 0, 2));
     }
 }
 

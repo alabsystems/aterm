@@ -94,7 +94,9 @@ fn a_hung_up_caller_releases_a_parked_await_within_a_poll() {
 
 /// THE NEGATIVE CONTROL: a caller that only HALF-closed (sent its request and
 /// shut its write side) is still waiting for the answer, so the same await
-/// runs to its own deadline and answers it.
+/// runs to its own deadline and answers it. That deadline is just past one
+/// [`HANGUP_POLL`] slice: the await asks after its caller before it parks and
+/// again after each slice, so a half-close read as a hangup fails at once.
 #[test]
 fn a_half_closed_caller_still_gets_its_answer() {
     let (client, server) = CtlStream::pair().expect("socket pair");
@@ -104,7 +106,7 @@ fn a_half_closed_caller_still_gets_its_answer() {
     let waiter = await_while_serving(
         server,
         crate::subscribe::new_registry(),
-        "match never-on-this-screen-xyzzy timeout=600",
+        "match never-on-this-screen-xyzzy timeout=250",
     );
     let reply = join_await(waiter, "the half-closed caller's await to time out");
     assert_eq!(
@@ -298,11 +300,11 @@ fn a_turn_whose_caller_hung_up_before_typing_types_nothing() {
 /// A `turn` whose caller hangs up AFTER its submit landed: the settle gives
 /// the lane back at once (nothing is left half-typed), and the turn — typed
 /// AND submitted — is still in the turn ledger, as `status=hangup`, because
-/// `history`, the events digest and `aterm drive report` read it back. Its
-/// verdict still says `submitted=1`. The old code returned `ERR exited` from
-/// the settle ahead of the ledger push, so a submitted turn vanished from `history`
-/// (2026-09-28 review). The negative control keeps its caller and settles:
-/// `status=settled`.
+/// `history`, the events digest and the harness's report reader read it back. Its
+/// verdict still says `submitted=1`, for an in-process reader. The old code
+/// returned `ERR exited` from the settle ahead of the ledger push, so a
+/// submitted turn vanished from `history` (2026-09-28 review). The negative
+/// control keeps its caller and settles: `status=settled`.
 #[test]
 fn a_turn_whose_caller_hangs_up_after_its_submit_is_still_recorded() {
     let handle = crate::session_store::test_handle(0);
@@ -480,6 +482,10 @@ impl LaneService for ParkingService {
     fn subscribe(&self, _line: String, _scope: Scope, _stream: CtlStream) {}
 
     fn release(&self, _id: u64) {}
+
+    fn has_live_claim(&self, _id: u64) -> bool {
+        false
+    }
 }
 
 /// THE LANES TELL A VERB WHOSE CALLER IT SERVES. A wait handed to a wait lane

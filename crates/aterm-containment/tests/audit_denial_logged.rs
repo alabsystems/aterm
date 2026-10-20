@@ -265,4 +265,19 @@ fn posture_claims_resource_limits_only_for_the_mode_that_has_them() {
             "{message}"
         );
     }
+    // Containment, where this platform sandboxes it, records the posture it applied.
+    if aterm_containment::os_sandbox_actuated() {
+        captured().lock().unwrap().clear();
+        let decision = aterm_containment::decide_spawn(ContainmentMode::Containment);
+        let aterm_containment::SpawnDecision::Permit { home_scoped, .. } = decision else {
+            panic!("a sandboxed Containment spawn is permitted: {decision:?}");
+        };
+        let records = captured().lock().unwrap();
+        assert_eq!(records.len(), 1, "one posture line for Containment");
+        let message = &records[0].message;
+        assert!(
+            message.contains(aterm_containment::applied_posture(home_scoped)),
+            "{message}"
+        );
+    }
 }

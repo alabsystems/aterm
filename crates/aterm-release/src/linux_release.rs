@@ -824,6 +824,7 @@ pub fn run_worker(
         short_version: version.into(),
         expected_update_pin_sha256: None,
         one_slice_at_a_time: true,
+        index_hint: super::index_hint_now(),
     };
     super::build_one(&plan, &take, "aterm", None, None)?;
     take.verify()?;

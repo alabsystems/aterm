@@ -74,7 +74,7 @@ impl SubjectBudget {
     /// How many NEW subjects the producer may still introduce: `max - subjects -
     /// reserved`, saturating at 0. A snapshot — another connection publishing as the
     /// same producer spends from it at once.
-    pub fn remaining(&self) -> u64 {
+    pub const fn remaining(&self) -> u64 {
         self.max
             .saturating_sub(self.subjects)
             .saturating_sub(self.reserved)
@@ -160,7 +160,7 @@ impl CreditWindow {
     /// Whether a send is permitted under the current credit horizon
     /// (`can_send_in_window(self.credit_horizon, self.next_send)`).
     #[must_use]
-    pub fn can_send(&self) -> bool {
+    pub const fn can_send(&self) -> bool {
         crate::proto::can_send_in_window(self.credit_horizon, self.next_send)
     }
 
@@ -168,7 +168,7 @@ impl CreditWindow {
     /// `Astream.Broker.TlaCreditFlowWindow`) via the 4-parameter Clean-origin
     /// [`crate::proto::windowed_send_advance`] kernel. Returns `true` and advances
     /// `next_send` by 1 if `self.can_send()` holds, or `false` if the credit window is full.
-    pub fn try_send(&mut self) -> bool {
+    pub const fn try_send(&mut self) -> bool {
         if !self.can_send() {
             return false;
         }
@@ -189,7 +189,7 @@ impl CreditWindow {
 
     /// Advance `next_send` toward `cand_seq` clamped by `credit_horizon` via the
     /// 4-parameter Clean-origin [`crate::proto::windowed_send_advance`] kernel.
-    pub fn advance_send_to(&mut self, cand_seq: u64) -> u64 {
+    pub const fn advance_send_to(&mut self, cand_seq: u64) -> u64 {
         self.next_send = crate::proto::windowed_send_advance(
             self.next_send,
             self.acked_seq,
@@ -203,7 +203,7 @@ impl CreditWindow {
     /// `Astream.Broker.TlaCreditFlowWindow`), clamped to `self.next_send` via
     /// [`crate::proto::committed_watermark`] and advanced monotonically via
     /// [`crate::proto::replica_ack_monotone`].
-    pub fn record_ack(&mut self, ack: u64) -> u64 {
+    pub const fn record_ack(&mut self, ack: u64) -> u64 {
         let bounded = crate::proto::committed_watermark(self.next_send, ack);
         self.acked_seq = crate::proto::replica_ack_monotone(self.acked_seq, bounded);
         self.acked_seq
@@ -212,17 +212,20 @@ impl CreditWindow {
     /// Advance the credit horizon monotonically (`GrantCreditStep` in
     /// `Astream.Broker.TlaCreditFlowWindow`) via Clean-origin
     /// [`crate::proto::credit_horizon_monotone`].
-    pub fn grant_credit(&mut self, new_horizon: u64) -> u64 {
+    pub const fn grant_credit(&mut self, new_horizon: u64) -> u64 {
         self.credit_horizon =
             crate::proto::credit_horizon_monotone(self.credit_horizon, new_horizon);
         self.credit_horizon
     }
 
     /// Grant sliding-window credit so the horizon covers `acked_seq + window`.
-    pub fn grant_window(&mut self, window: u64) -> u64 {
+    pub const fn grant_window(&mut self, window: u64) -> u64 {
         self.grant_credit(self.acked_seq.saturating_add(window))
     }
 }
+
+const ATTACH_WINDOW: usize = 16;
+const MAX_PIPELINE_WINDOW: usize = 512;
 
 /// A connection to a broker over a byte stream. Three transports:
 ///
@@ -501,7 +504,8 @@ impl<S: Read + Write> Client<S> {
     /// one client works against either. The log identity the answer carries is kept
     /// ([`seen_log_identity`](Self::seen_log_identity)).
     pub fn hello(&mut self) -> io::Result<[u8; 32]> {
-        self.hello_identity().map(|(nonce, _)| nonce)
+        let (nonce, _) = self.hello_identity()?;
+        Ok(nonce)
     }
 
     /// [`hello`](Self::hello), returning beside the nonce the [`LogIdentity`] of the
@@ -540,7 +544,8 @@ impl<S: Read + Write> Client<S> {
     /// computed over an earlier one no longer verifies ([`attach`](Self::attach) and
     /// [`attach_all`](Self::attach_all) fetch their own).
     pub fn log_identity(&mut self) -> io::Result<Option<LogIdentity>> {
-        self.hello_identity().map(|(_, log)| log)
+        let (_, log) = self.hello_identity()?;
+        Ok(log)
     }
 
     /// The [`LogIdentity`] this connection's latest `Hello` answer carried — the one
@@ -549,7 +554,7 @@ impl<S: Read + Write> Client<S> {
     /// on this connection, or from a broker that predates log identity
     /// ([`log_identity`](Self::log_identity) asks). A connection to a REPLICA can see
     /// it change, when the replica adopts its leader's: ask again for the current one.
-    pub fn seen_log_identity(&self) -> Option<LogIdentity> {
+    pub const fn seen_log_identity(&self) -> Option<LogIdentity> {
         self.identity
     }
 
@@ -558,7 +563,7 @@ impl<S: Read + Write> Client<S> {
     /// [`LogIdentity::continues`] instead of being forgotten. `None` before any
     /// `Hello`, or from a broker that predates lineage (which says nothing either way:
     /// forget, as before).
-    pub fn log_lineage(&self) -> Option<&Lineage> {
+    pub const fn log_lineage(&self) -> Option<&Lineage> {
         self.ext.lineage.as_ref()
     }
 
@@ -566,7 +571,7 @@ impl<S: Read + Write> Client<S> {
     /// ([`ServedInfo`]) — read from the broker itself, so a status line never infers it
     /// from how the broker was started. `None` before any `Hello`, or from a broker that
     /// predates the extension block.
-    pub fn served_durability(&self) -> Option<ServedInfo> {
+    pub const fn served_durability(&self) -> Option<ServedInfo> {
         self.ext.durability
     }
 
@@ -575,13 +580,13 @@ impl<S: Read + Write> Client<S> {
     /// `Mark` (an `Attach`'s, a `Fetch`'s or a `Last` page's), or from a broker that
     /// predates the field. To ask about an offset now, a `Fetch` head query (`max = 0`)
     /// answers with a fresh `Mark`.
-    pub fn seen_durable(&self) -> Option<u64> {
+    pub const fn seen_durable(&self) -> Option<u64> {
         self.durable
     }
 
     /// Keep what a `Mark` said about durability (an older broker's says nothing, which
     /// leaves the last word standing).
-    fn saw_durable(&mut self, durable: Option<u64>) {
+    const fn saw_durable(&mut self, durable: Option<u64>) {
         if durable.is_some() {
             self.durable = durable;
         }
@@ -618,10 +623,13 @@ impl<S: Read + Write> Client<S> {
     /// The socket errors, or the broker refuses the attach (a proof that does not
     /// verify, a producer-id collision in the binding table, or a full keyring).
     pub fn attach(&mut self, grant: &str, tag: &[u8]) -> io::Result<(u64, u64)> {
-        self.attach_all([(grant, tag)])?.ok_or_else(|| {
-            // Unreachable: a one-grant ring is acknowledged or refused, never empty.
-            io::Error::new(io::ErrorKind::InvalidData, "no attach was acknowledged")
-        })
+        match self.attach_all([(grant, tag)])? {
+            Some(mark) => Ok(mark),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "no attach was acknowledged",
+            )),
+        }
     }
 
     /// Add every capability in `ring` — `(grant, tag)` pairs, in order — to this
@@ -647,18 +655,17 @@ impl<S: Read + Write> Client<S> {
         &mut self,
         ring: impl IntoIterator<Item = (&'a str, &'a [u8])>,
     ) -> io::Result<Option<(u64, u64)>> {
-        let ring = ring
-            .into_iter()
-            .map(|(grant, tag)| {
-                let tag: [u8; 32] = tag.try_into().map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("capability tag is {} bytes, expected 32", tag.len()),
-                    )
-                })?;
-                Ok((grant, tag))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
+        let mut parsed_ring = Vec::new();
+        for (grant, tag) in ring {
+            let Ok(tag_arr): Result<[u8; 32], _> = tag.try_into() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("capability tag is {} bytes, expected 32", tag.len()),
+                ));
+            };
+            parsed_ring.push((grant, tag_arr));
+        }
+        let ring = parsed_ring;
         if ring.is_empty() {
             return Ok(None);
         }
@@ -670,7 +677,7 @@ impl<S: Read + Write> Client<S> {
         loop {
             while failure.is_none()
                 && sent < ring.len()
-                && sent.saturating_sub(received) < Self::ATTACH_WINDOW
+                && sent.saturating_sub(received) < ATTACH_WINDOW
             {
                 let (grant, tag) = &ring[sent];
                 let proof = astream_cap::attach_proof(tag, &nonce, grant);
@@ -727,7 +734,7 @@ impl<S: Read + Write> Client<S> {
     /// reading an acknowledgement — a keyring's worth (`MAX_KEYRING`, past which the
     /// broker refuses anyway), so a ring of any length cannot fill both directions'
     /// socket buffers and wedge the connection.
-    pub const ATTACH_WINDOW: usize = 16;
+    pub const ATTACH_WINDOW: usize = ATTACH_WINDOW;
 
     /// Publish `body` to `subject`, deduped by `(producer_id, producer_seq)`. Blocks
     /// for the ack; returns `(offset, deduped)` — `deduped` true means a re-send
@@ -778,7 +785,9 @@ impl<S: Read + Write> Client<S> {
         self.in_step()?;
         let mut out = Vec::new();
         append_publish_frame(&mut out, producer_id, producer_seq, subject, body)?;
-        self.stream.write_all(&out).map_err(|e| self.lose(e))?;
+        if let Err(e) = self.stream.write_all(&out) {
+            return Err(self.lose(e));
+        }
         self.sent_at = Instant::now();
         Ok(())
     }
@@ -819,7 +828,7 @@ impl<S: Read + Write> Client<S> {
         window: usize,
     ) -> io::Result<Vec<(u64, bool)>> {
         self.in_step()?;
-        let window = window.clamp(1, Self::MAX_PIPELINE_WINDOW);
+        let window = window.clamp(1, MAX_PIPELINE_WINDOW);
         let mut credit = CreditWindow::new(window as u64);
         let mut acks = Vec::new();
         let mut tx = Vec::new();
@@ -963,7 +972,7 @@ impl<S: Read + Write> Client<S> {
         self.send(&Request::Keepalive)?;
         match self.read_mark() {
             Ok(_) => Ok(true),
-            Err(e) if broker_refusal(&e).is_some_and(|r| r.code == ERR_REFUSED) => {
+            Err(e) if is_refused_error(&e) => {
                 self.keepalive_unknown = true;
                 Ok(false)
             }
@@ -988,7 +997,8 @@ impl<S: Read + Write> Client<S> {
         if self.keepalive_unknown || self.sent_at.elapsed() < interval {
             return Ok(false);
         }
-        self.keepalive().map(|_| true)
+        let _ = self.keepalive()?;
+        Ok(true)
     }
 
     /// READ `producer_id`'s DISTINCT-SUBJECT BUDGET: one [`Request::Budget`], answered
@@ -1023,7 +1033,7 @@ impl<S: Read + Write> Client<S> {
                 max,
             })),
             other => match self.reply_error(other) {
-                e if broker_refusal(&e).is_some_and(|r| r.code == ERR_REFUSED) => Ok(None),
+                e if is_refused_error(&e) => Ok(None),
                 e => Err(e),
             },
         }
@@ -1041,7 +1051,7 @@ impl<S: Read + Write> Client<S> {
         self.send(&Request::IdleMarks)?;
         match self.read_mark() {
             Ok(_) => Ok(true),
-            Err(e) if broker_refusal(&e).is_some_and(|r| r.code == ERR_REFUSED) => Ok(false),
+            Err(e) if is_refused_error(&e) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -1070,8 +1080,8 @@ impl<S: Read + Write> Client<S> {
     /// Non-terminal: the connection is fully usable afterwards (this is the one read
     /// verb that does NOT consume the client).
     pub fn last(&mut self, filter: &str, after: &str, max: u32) -> io::Result<Page> {
-        self.last_page(filter, after, max)
-            .map(|(page, mark, _)| (page, mark))
+        let (page, mark, _) = self.last_page(filter, after, max)?;
+        Ok((page, mark))
     }
 
     /// [`last`](Self::last) with the RESUME CURSOR: `(page, (next, head), resume)`.
@@ -1216,20 +1226,37 @@ impl<S: Read + Write> Client<S> {
     /// whole face; a reader that can act row by row walks instead.
     pub fn last_all(&mut self, filter: &str) -> io::Result<Page> {
         let mut rows = Vec::new();
-        let (mark, rest) = self.last_walk(filter, "", u32::MAX, |row| {
-            rows.push(row);
-            Ok(Walk::Continue)
-        })?;
-        match rest {
-            None => Ok((rows, mark)),
-            // Unreachable against a broker that honours its own page clamp (the page
-            // bound ends the walk long before u32::MAX rows), and still not a reason
-            // to hand back a list that is short without saying so.
-            Some(_) => Err(io::Error::other(format!(
-                "the last-value face of {filter} did not end within {} rows",
-                u32::MAX
-            ))),
+        let mut cursor = String::new();
+        let mut remaining = u32::MAX;
+        let mut first: Option<(u64, u64)> = None;
+        for _ in 0..LAST_WALK_PAGES_MAX {
+            let ask = remaining;
+            let (page, page_mark, resume) = self.last_page(filter, &cursor, ask)?;
+            let mark = *first.get_or_insert(page_mark);
+            let page_rows = page.len();
+            let mut taken = 0usize;
+            for row in page {
+                if remaining == 0 {
+                    break;
+                }
+                remaining -= 1;
+                taken = taken.saturating_add(1);
+                rows.push(row);
+            }
+            if resume.is_empty() && taken == page_rows && ask > 0 {
+                return Ok((rows, mark));
+            }
+            if remaining == 0 {
+                return Err(io::Error::other(format!(
+                    "the last-value face of {filter} did not end within {} rows",
+                    u32::MAX
+                )));
+            }
+            cursor = resume;
         }
+        Err(io::Error::other(format!(
+            "the last-value walk of {filter} did not end within {LAST_WALK_PAGES_MAX} pages"
+        )))
     }
 
     /// BOUNDED READ: at most `max` records matching `filter` with offset >= `from`,
@@ -1246,8 +1273,8 @@ impl<S: Read + Write> Client<S> {
             filter: filter.to_string(),
             max,
         })?;
-        self.read_page_resumable(max)
-            .map(|(page, mark, _)| (page, mark))
+        let (page, mark, _) = self.read_page_resumable(max)?;
+        Ok((page, mark))
     }
 
     /// Read `Delivery*` then the closing `Mark` of a bounded, non-terminal read,
@@ -1310,7 +1337,8 @@ impl<S: Read + Write> Client<S> {
             group: group.to_string(),
             upto,
         })?;
-        self.recv_publish_ack().map(|(offset, _)| offset)
+        let (offset, _) = self.recv_publish_ack()?;
+        Ok(offset)
     }
 
     /// The read-process-write TRANSACTION: append `out_body` to `out_subject` AND
@@ -1375,7 +1403,9 @@ impl<S: Read + Write> Client<S> {
         self.in_step()?;
         let mut out = Vec::new();
         append_frame(&mut out, &encode_request(req))?;
-        self.stream.write_all(&out).map_err(|e| self.lose(e))?;
+        if let Err(e) = self.stream.write_all(&out) {
+            return Err(self.lose(e));
+        }
         self.sent_at = Instant::now();
         Ok(())
     }
@@ -1395,7 +1425,10 @@ impl<S: Read + Write> Client<S> {
             )),
             Err(e) => Err(e),
         };
-        read.map_err(|e| self.lose(e))
+        match read {
+            Ok(resp) => Ok(resp),
+            Err(e) => Err(self.lose(e)),
+        }
     }
 
     /// Read the `Mark` that acknowledges an `Attach` or a `Will`: its `(next, head)`.
@@ -1465,6 +1498,13 @@ fn unexpected_response() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "unexpected response")
 }
 
+fn is_refused_error(e: &io::Error) -> bool {
+    match broker_refusal(e) {
+        Some(r) => r.code == ERR_REFUSED,
+        None => false,
+    }
+}
+
 /// A reply payload as the response it carries — or, from a broker that speaks another
 /// protocol, the [`ProtocolMismatch`] it is. Asked FIRST, so a reply this build cannot
 /// decode for that reason is never reported as a garbled one.
@@ -1476,7 +1516,10 @@ fn decode_reply(p: &[u8]) -> io::Result<Response> {
         }
         .into());
     }
-    decode_response(p).ok_or_else(unexpected_response)
+    match decode_response(p) {
+        Some(resp) => Ok(resp),
+        None => Err(unexpected_response()),
+    }
 }
 
 /// The broker and this client speak DIFFERENT astream protocols (`PROTO_VERSION`s), so
@@ -1568,7 +1611,7 @@ impl BrokerRefusal {
     /// answered every refusal but 2, 3 and 6 with `ERR_REFUSED`, so against it this is
     /// `false` for a permanent refusal too: the fail-safe reading, under which a
     /// caller retries rather than drops.
-    pub fn is_permanent(&self) -> bool {
+    pub const fn is_permanent(&self) -> bool {
         matches!(
             self.code,
             ERR_BAD_SUBJECT | ERR_BAD_FILTER | ERR_RECORD_REFUSED | ERR_UNAUTHORIZED | ERR_PROTOCOL
@@ -1587,7 +1630,7 @@ impl BrokerRefusal {
     ///
     /// `false` against a broker that predates the code, which sends [`ERR_REFUSED`]
     /// for this refusal: the fail-safe reading, under which a caller retries.
-    pub fn is_subject_bound(&self) -> bool {
+    pub const fn is_subject_bound(&self) -> bool {
         self.code == ERR_SUBJECT_BOUND
     }
 
@@ -1879,7 +1922,7 @@ pub type SubscriptionCloser = Closer;
 /// again after each [`IDLE_MARK`](crate::broker::IDLE_MARK) with nothing written —
 /// so a live idle subscription is never silent for long, and a silent one is a link
 /// that has died.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub enum Event {
     /// One delivered record: `(offset, subject, body)`.
     Delivery {
@@ -1903,6 +1946,38 @@ pub enum Event {
         head: u64,
         durable: Option<u64>,
     },
+}
+
+impl PartialEq for Event {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Event::Delivery {
+                    offset: a_o,
+                    subject: a_s,
+                    body: a_b,
+                },
+                Event::Delivery {
+                    offset: b_o,
+                    subject: b_s,
+                    body: b_b,
+                },
+            ) => *a_o == *b_o && a_s.as_str() == b_s.as_str() && a_b.as_slice() == b_b.as_slice(),
+            (
+                Event::Mark {
+                    next: a_n,
+                    head: a_h,
+                    durable: a_d,
+                },
+                Event::Mark {
+                    next: b_n,
+                    head: b_h,
+                    durable: b_d,
+                },
+            ) => *a_n == *b_n && *a_h == *b_h && *a_d == *b_d,
+            _ => false,
+        }
+    }
 }
 
 /// Bytes a subscription asks its stream for per read, and the size its receive
@@ -1957,8 +2032,19 @@ impl RecvBuf {
             if self.end == self.buf.len() {
                 // Full: slide the unfinished frame to the front, and grow only when it
                 // already fills the whole buffer.
-                self.buf.copy_within(self.start..self.end, 0);
-                self.end = self.end.saturating_sub(self.start);
+                let len = self.end.saturating_sub(self.start);
+                if self.start > 0 {
+                    let mut i = 0usize;
+                    while i < len {
+                        if let Some(&b) = self.buf.get(self.start.saturating_add(i)) {
+                            if let Some(dst) = self.buf.get_mut(i) {
+                                *dst = b;
+                            }
+                        }
+                        i = i.saturating_add(1);
+                    }
+                }
+                self.end = len;
                 self.start = 0;
                 if self.end == self.buf.len() {
                     for _ in 0..8 {
@@ -2026,13 +2112,13 @@ impl<S: Read + Write> Subscription<S> {
     /// the stream itself — a subscription holds the bytes it has already read (the
     /// rest of a frame a timeout interrupted, and frames queued behind it), and
     /// bytes taken from underneath it are gone from the stream it resumes.
-    pub fn get_ref(&self) -> &S {
+    pub const fn get_ref(&self) -> &S {
         &self.stream
     }
 
     /// The broker's durable head as the newest `Mark` on this stream told it (see
     /// [`Event::Mark`]) — or the client's before it subscribed. `None` before any.
-    pub fn seen_durable(&self) -> Option<u64> {
+    pub const fn seen_durable(&self) -> Option<u64> {
         self.durable
     }
 
@@ -2406,8 +2492,8 @@ pub fn connect(
             let closer = Closer::tcp(&s)?;
             Ok(erase(s, closer))
         }
-        Transport::Sealed(key) => connect_sealed(endpoint, key, connect_timeout),
-        Transport::Handshake(key) => connect_handshake(endpoint, key, connect_timeout),
+        Transport::Sealed(key) => connect_sealed(endpoint, key.as_ref(), connect_timeout),
+        Transport::Handshake(key) => connect_handshake(endpoint, key.as_ref(), connect_timeout),
     }
 }
 

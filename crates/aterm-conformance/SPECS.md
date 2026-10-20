@@ -140,7 +140,7 @@ vt-insert-delete	contract	aterm-grid, aterm-core	aterm-core ICH/DCH/IL/DL handle
 index-and-scroll-region	contract	aterm-grid, aterm-core	aterm_grid::Grid::{line_feed,line_feed_margined,reverse_index,scroll_region_up,scroll_region_down}; LF/IND/RI dispatch; write_char autowrap (CR+Index)	Let (t,b) = Reg and r = Cur.row. Index: if r < b then r' = r+1 and no cell changes; if r = b then rows t..b−1 := old rows t+1..b in every channel (glyph, flags, truecolour, extras), row b := BCE, and rows outside [t,b] are unchanged; if r > b then r' = min(r+1, R−1) and no cell changes, so on the last screen row below the region Index is the identity on cells and cursor. Autowrap is CR then Index (so it overwrites the bottom row in place there). RevIndex mirrors Index (at r = t it scrolls t..=b down, row b lost, row t BCE). Scrolling never touches CS, Sty or any mode, so a locking shift and the pen stay in force for later output.	tests/conformance.rs::newline_at_bottom_scrolls, tests/vt_categories.rs::scroll_region_index_scrolls_only_the_region, tests/vt_categories2.rs::ri_at_top_scrolls_down, tests/vt_categories3.rs::so_shift_and_truecolor_survive_a_scroll_region_scroll, tests/xterm_differential_regressions.rs::autowrap_below_scroll_region_at_bottom_row_does_not_scroll, tests/xterm_differential_regressions.rs::lf_below_scroll_region_at_bottom_row_does_not_scroll	&mut self on Grid; ring row rotation; extras rekeying; BCE template; Ordering match; u16 saturating ops; scrollback push	0,1,2,3,4,5,7,12	aterm-grid line-feed, reverse-line-feed, scroll-region-shift
 decstbm-validity	contract	aterm-grid, aterm-core	aterm-core CsiHandler::SetScrollRegion, aterm_grid::Grid::set_scroll_region	∀ T and params p: top = max(p0 or 1, 1) − 1; bot = (p1 absent or 0 ? R : p1) − 1 (saturating); mb = R−1. If top < min(bot, mb): Reg' = (top, min(bot, mb)), the cursor homes ((Reg.top, HM.left or 0) under OM, else (0,0)) and PW' = false. Otherwise T·CSI p r ≡ T: margins, cursor and the previous region are all unchanged. Instances on 24 rows: 10;10r, 20;5r, 28r and 114r are no-ops; 4;14r homes.	tests/xterm_differential_regressions.rs::invalid_decstbm_keeps_previous_region, tests/xterm_differential_regressions.rs::valid_decstbm_still_sets_region_and_homes	&[u16] first/get; Option map/unwrap_or; u16 max/saturating_sub/min; whole-state frame condition for the no-op clause (the scalar validity predicate can be factored into a pure fn)	0,1,2,3,6	aterm-grid region-and-margin-setters
 decsc-decrc	contract	aterm-core	aterm-core CursorStateHandler::{save_cursor_state,restore_cursor_state}, restore_cursor_snapshot, ESC 7 / ESC 8 dispatch	DECSC: Slot(Act)' = Some{cursor, style, origin_mode, charset, pending_wrap, underline_color}. DECRC with Slot(Act) = Some(s): OM' = s.origin_mode, Sty' = s.style, CS' = s.charset, underline' = s.underline_color, Cur' = s.cursor (clamped to Reg, and to HM under LR, when s.origin_mode), PW' = s.pending_wrap ∧ col' ≥ MaxCol(row'); the slot is kept. DECRC with Slot(Act) = None: OM' = false, Sty' = default, CS' = default, underline' = None, Cur' = (0,0). In both cases AW' = AW (DECAWM is never saved, restored or reset) and Reg/HM are unchanged. Corollary: ∀ y without ESC 7, RIS or a screen switch, T·ESC 7·y·ESC 8 restores the Cur, pen, OM and CS of T, while the cell effects of y persist.	tests/vt_categories.rs::decsc_decrc_save_and_restore_cursor, tests/vt_categories3.rs::decsc_decrc_saves_and_restores_charset, tests/xterm_differential_regressions.rs::unsaved_decrc_leaves_decawm_unchanged, tests/xterm_differential_regressions.rs::saved_decrc_does_not_restore_decawm, tests/xterm_differential_regressions.rs::unsaved_decrc_still_resets_origin_and_homes	&mut self over several borrowed handler-view fields; Option<Copy struct>; u16 clamp; two-state reasoning	0,1,2,3,4,12	-
-alt-screen-trio-model	refinement	aterm-core	aterm-core TerminalHandler::{enter_alternate_screen_raw,enter_alternate_screen,exit_alternate_screen,exit_alternate_screen_1047}, DECSET/DECRST 47/1047/1049 dispatch, CursorStateHandler::{save_cursor_state,restore_cursor_state}	Let P(T) = ⟨Act, Main, Alt, Cur, Slot(main), Slot(alt)⟩. ∀ T ∈ Reach: 47h: if Act = Main then Act' = Alt, Alt kept (never cleared), Main and Cur kept; otherwise identity. 47l: Act' = Main, Main as it was before entry, Alt and Cur kept. 1047h = 47h. 1047l: if Act = Alt then Alt' = all BCE and otherwise as 47l (no cursor restore); else identity. 1049h: Slot(main)' := the DECSC snapshot of T (the slot ESC 7 writes, so it overwrites an earlier DECSC); then Act' = Alt, Alt' all BCE, PW' = false, Cur' = Cur (no home). 1049l: Act' = Main and DECRC from Slot(main); the slot is not consumed, so a later bare ESC 8 restores it again. Corollary: ∀ x free of 47/1047/1049/RIS/resize, Main and Cur after T·ESC[?1049h·x·ESC[?1049l equal those of T, and no cell written in x is visible in Main.	tests/vt_categories.rs::alt_screen_isolates_then_restores, tests/vt_categories3.rs::mode_1049_saves_cursor_switches_and_clears_alt, tests/vt_categories3.rs::mode_1047_exit_clears_the_alt_screen, tests/vt_categories3.rs::mode_1047_does_not_save_or_restore_cursor, tests/vt_categories3.rs::mode_47_round_trip_keeps_primary_content, tests/vt_categories3.rs::mode_47_swap_does_not_move_cursor, tests/vt_categories3.rs::mode_47_alt_content_persists_across_reentry, tests/xterm_differential_regressions.rs::mode_1049_enter_keeps_cursor_position, tests/xterm_differential_regressions.rs::mode_1049_round_trip_still_restores_cursor, tests/xterm_differential_regressions.rs::bare_decrc_after_1049_round_trip_restores_saved_cursor, tests/xterm_differential_regressions.rs::mode_1049_save_overwrites_decsc_slot	&mut self over handler views; two swapped Grid values; Option<SavedCursorState>; whole-grid clear loop; quantification over an arbitrary byte stream x. Best authored as a ty_model! AltScreen model with a conformance binding and a negative control.	0,1,2,3,4,5,7,10,12	aterm-core alt-screen-switch-wrap-and-save, alt-1049-roundtrip
+alt-screen-trio-model	refinement	aterm-core	aterm-core TerminalHandler::{enter_alternate_screen_raw,enter_alternate_screen,exit_alternate_screen,exit_alternate_screen_1047}, DECSET/DECRST 47/1047/1049 dispatch, CursorStateHandler::{save_cursor_state,restore_cursor_state}	Let P(T) = ⟨Act, Main, Alt, Cur, Slot(main), Slot(alt)⟩. ∀ T ∈ Reach: 47h: if Act = Main then Act' = Alt, Alt kept (never cleared), Main and Cur kept; otherwise identity. 47l: Act' = Main, Main as it was before entry, Alt and Cur kept. 1047h = 47h. 1047l: if Act = Alt then Alt' = all BCE and otherwise as 47l (no cursor restore); else identity. 1049h: Slot(main)' := the DECSC snapshot of T (the slot ESC 7 writes, so it overwrites an earlier DECSC); then Act' = Alt, Alt' all BCE, PW' = false, Cur' = Cur (no home). 1049l: Act' = Main and DECRC from Slot(main); the slot is not consumed, so a later bare ESC 8 restores it again. Corollary: ∀ x free of 47/1047/1049/RIS/resize, Main and Cur after T·ESC[?1049h·x·ESC[?1049l equal those of T, and no cell written in x is visible in Main.	tests/vt_categories.rs::alt_screen_isolates_then_restores, tests/vt_categories3.rs::mode_1049_saves_cursor_switches_and_clears_alt, tests/vt_categories3.rs::mode_1047_exit_clears_the_alt_screen, tests/vt_categories3.rs::mode_1047_does_not_save_or_restore_cursor, tests/vt_categories3.rs::mode_47_round_trip_keeps_primary_content, tests/vt_categories3.rs::mode_47_swap_does_not_move_cursor, tests/vt_categories3.rs::mode_47_alt_content_persists_across_reentry, tests/xterm_differential_regressions.rs::mode_1049_enter_keeps_cursor_position, tests/xterm_differential_regressions.rs::bare_decrc_after_1049_round_trip_restores_saved_cursor, tests/xterm_differential_regressions.rs::mode_1049_save_overwrites_decsc_slot	&mut self over handler views; two swapped Grid values; Option<SavedCursorState>; whole-grid clear loop; quantification over an arbitrary byte stream x. Best authored as a ty_model! AltScreen model with a conformance binding and a negative control.	0,1,2,3,4,5,7,10,12	aterm-core alt-screen-switch-wrap-and-save, alt-1049-roundtrip
 alt-switch-keeps-margins	invariant	aterm-core	aterm-core DECSET/DECRST 47/1047/1049 handlers, aterm_grid::Grid::{scroll_region,horizontal_margins,reverse_index}	∀ T ∈ Reach, m ∈ {47, 1047, 1049}, s ∈ {h, l}: Reg, HM, LR and Stops after T·CSI ? m s equal those of T, because one margin state is shared by both buffers. Hence, before and after any switch, RI with Cur.row < Reg.top only moves the cursor up (clamped at 0) and never scrolls.	tests/xterm_differential_regressions.rs::scroll_region_persists_into_alt_screen, tests/xterm_differential_regressions.rs::scroll_region_set_in_alt_screen_persists_after_exit	&mut self; a frame condition across a grid swap; u16 comparisons	0,1,2,3,4,12	-
 charset-designate-shift-translate	contract	aterm-core	aterm-core CharacterSetState::{default,translate,designate,invoke,single_shift}, ESC ( ) * + designator dispatch, SO/SI/SS2 dispatch, write_char_body (translate)	CS(fresh) = G0..G3 all ASCII, GL = G0, no pending single shift. ESC ( F / ) F / * F / + F set G0/G1/G2/G3 to charset(F) ('0' = DEC Special Graphics, 'B' = ASCII). SO sets GL = G1; SI sets GL = G0. SS2 (ESC N) makes exactly the next graphic char use G2, then GL is back in force. Every print c lands translate(G_active, c), where translate(ASCII, c) = c and translate(DecSpecial, c) is the VT100 table on 0x5F..=0x7E ('q' ↦ U+2500, 'x' ↦ U+2502, …) and c elsewhere. Consequently SO with no prior SCS prints plain ASCII. The table half is decidable by evaluation over 128 code points.	tests/vt_categories2.rs::dec_line_drawing_maps_glyphs, tests/vt_categories3.rs::so_si_locking_shift_g1_line_drawing, tests/vt_categories3.rs::ss2_single_shifts_exactly_one_char_from_g2, tests/xterm_differential_regressions.rs::g1_defaults_to_ascii_so_prints_plain_text	Copy struct with an enum per G slot; literal-char match table; char; the end-to-end clause composes parser ESC dispatch with write_char	0,1,2,3,4,12	-
 rep-is-repeated-write	equivalence	aterm-core	aterm-core CsiHandler::RepeatChar (bulk write_cell_run arm and write_char arm), write_char_body (last_graphic_char), aterm_grid::Grid::write_cell_run	∀ T with last_graphic_char = Some(c), c the raw scalar before charset translation, ∀ n: T·CSI n b ≡ T·print(c)^max(n,1) modulo the ZWJ flag, so each repeat re-translates c through the GL charset in force at REP time. The bulk arm (ASCII c, passthrough charset, no extras, AW, ¬IRM, n ≥ 4, cursor within the margin span) gives the same Obs as the write_char loop. With last_graphic_char = None, REP is a no-op.	tests/vt_categories3.rs::rep_repeats_preceding_graphic_char, tests/xterm_differential_regressions.rs::rep_translates_raw_char_through_current_charset, tests/xterm_differential_regressions.rs::rep_after_charset_switch_back_repeats_ascii, tests/xterm_differential_regressions.rs::rep_plain_ascii_bulk_path_still_repeats	&mut self; a write_char loop against a bulk fill (a loop invariant relates them); Option<char>; charset translate; damage bracket	0,1,2,3,4,5,7,12	aterm-core rep-repeats-the-last-graphic-character
@@ -328,29 +328,6 @@ tests/osc8_schemes.rs	osc8_overlength_uri_rejected_independently	osc8-admission
 tests/osc8_schemes.rs	osc8_control_char_in_uri_rejected_independently	osc8-admission	
 tests/osc8_schemes.rs	osc8_bidi_override_in_uri_rejected_independently	osc8-admission	
 tests/osc8_schemes.rs	osc8_link_applies_only_while_open	hyperlink-attaches-while-open	
-tests/paint.rs	main_screen_prompt_typing_paints_trail_ink	(§4: move to a bench)	
-tests/paint.rs	main_screen_prompt_with_effect_off_has_no_ribbon	(§4: move to a bench)	
-tests/paint.rs	alt_screen_fake_claude_typing_paints_trail_ink	(§4: move to a bench)	
-tests/paint.rs	alt_screen_cold_spinner_paints_zero_ink	(§4: move to a bench)	
-tests/paint.rs	alt_screen_esc7_esc8_streamer_typing_paints_trail_ink	(§4: move to a bench)	
-tests/paint.rs	unfocused_typed_window_paints_its_trail_under_an_unpinned_capture	(§4: move to a bench)	
-tests/paint.rs	unfocused_typed_window_with_effect_off_has_no_ribbon	(§4: move to a bench)	
-tests/paint.rs	unfocused_idle_window_paints_nothing_under_an_unpinned_capture	(§4: move to a bench)	
-tests/paint.rs	focused_alt_screen_typing_paints_trail_ink_without_a_recording_pin	(§4: move to a bench)	
-tests/paint.rs	focused_typed_window_with_effect_off_has_no_ribbon	(§4: move to a bench)	
-tests/paint.rs	focused_streamer_typing_paints_trail_ink_without_a_recording_pin	(§4: move to a bench)	
-tests/paint.rs	focused_cold_spinner_paints_zero_ink_without_a_recording_pin	(§4: move to a bench)	
-tests/paint.rs	shipped_default_first_still_and_typing_carry_the_resident_pet	(§4: move to a bench)	
-tests/paint.rs	explicit_underline_spelling_paints_an_underline_ribbon	(§4: move to a bench)	
-tests/paint.rs	explicit_tall_short_word_paints_four_hues	(§4: move to a bench)	
-tests/paint.rs	explicit_tall_short_word_control_has_no_ribbon_when_effect_is_off	(§4: move to a bench)	
-tests/paint.rs	cold_output_paints_literally_nothing_for_a_companion_free_style	(§4: move to a bench)	
-tests/paint.rs	flying_style_sustained_typing_earns_and_paints_the_flying_kitty	(§4: move to a bench)	
-tests/paint.rs	alt_screen_cold_token_streamer_with_a_walking_caret_paints_zero_ink	(§4: move to a bench)	
-tests/paint.rs	the_owners_rainbow_kitty_spelling_carries_the_resident_pet	(§4: move to a bench)	
-tests/paint.rs	the_owners_spelling_never_draws_two_companions_in_one_frame	(§4: move to a bench)	
-tests/paint.rs	split_window_typing_paints_the_rainbow_body_in_the_focused_pane	(§4: move to a bench)	
-tests/paint.rs	split_window_typing_with_effect_off_has_no_ribbon	(§4: move to a bench)	
 tests/rect_ops.rs	decfra_fills_exact_rect_and_leaves_outside_untouched	decfra-fill	
 tests/rect_ops.rs	decfra_default_coords_fill_full_screen	rect-coords-resolution	
 tests/rect_ops.rs	decfra_rejects_non_printable_fill_char	decfra-fill	
@@ -412,8 +389,6 @@ tests/sixel.rs	sixel_mid_line_does_not_overprint_cells_to_its_left	sixel-placeme
 tests/sixel.rs	sixel_mid_line_anchors_at_cursor_in_display_mode	sixel-placement	
 tests/sixel.rs	sixel_image_decodes_to_expected_raster_and_is_placed	sixel-placement	
 tests/sixel.rs	sixel_placement_is_pixel_exact_not_scaled_to_its_footprint	sixel-placement	
-tests/spin.rs	an_idle_claude_shaped_client_banks_no_past_deadline_arms	(§4: move to a bench)	
-tests/spin.rs	a_bare_idle_instance_banks_no_past_deadline_arms	(§4: move to a bench)	
 tests/vt_categories.rs	decsc_decrc_save_and_restore_cursor	decsc-decrc	
 tests/vt_categories.rs	ich_inserts_blanks_shifting_right	vt-insert-delete	
 tests/vt_categories.rs	dch_deletes_char_shifting_left	vt-insert-delete	
@@ -468,7 +443,6 @@ tests/xterm_differential_regressions.rs	ht_preserves_pending_wrap_next_printable
 tests/xterm_differential_regressions.rs	ht_at_pending_wrap_keeps_cursor_at_margin	pending-wrap-transitions	
 tests/xterm_differential_regressions.rs	ht_ride_to_last_stop_matches_xterm_layout	pending-wrap-transitions	
 tests/xterm_differential_regressions.rs	mode_1049_enter_keeps_cursor_position	alt-screen-trio-model	
-tests/xterm_differential_regressions.rs	mode_1049_round_trip_still_restores_cursor	alt-screen-trio-model	
 tests/xterm_differential_regressions.rs	invalid_decstbm_keeps_previous_region	decstbm-validity	
 tests/xterm_differential_regressions.rs	valid_decstbm_still_sets_region_and_homes	decstbm-validity	
 tests/xterm_differential_regressions.rs	autowrap_below_scroll_region_at_bottom_row_does_not_scroll	index-and-scroll-region	
@@ -493,9 +467,9 @@ tests/xterm_differential_regressions.rs	scroll_region_set_in_alt_screen_persists
 
 ## 3. Coverage
 
-- 412 tests read. 385 map to one of the 86 specs; 27 are not spec samples (§4).
+- The 2026-10-16 survey read 412 tests: 385 mapped to one of the 86 specs; 27 were not spec samples. Section 4 records the subsequent deletions and measurement migration.
 - Measurement half: 38 specs cover 170 tests (all of `src/measure` except one constant pin, since deleted).
-  VT half: 48 specs cover 215 tests (all of `tests/*.rs` except the 25 `#[ignore]` bench rows and one duplicate).
+  VT half: 48 specs covered 215 tests (excluding the 25 acceptance measurements now in `benches/` and the duplicate since deleted).
 - The biggest collapses (primary tests): `driven-window-darkness` 20, `paint-judge-denotation` 12,
   `scan-companion-accounting` 12, `alt-screen-trio-model` 11, `pending-wrap-transitions` 11,
   `decrara-reverse-involution` 11, `rect-coords-resolution` 10, and 9 each for `band-ink-partition`,
@@ -508,17 +482,24 @@ tests/xterm_differential_regressions.rs	scroll_region_set_in_alt_screen_persists
   `decsc-decrc` and `pending-wrap-transitions` share the DECSC snapshot and the PW frame condition, so
   proving those first makes the dependent proofs short.
 
-## 4. Tests that are not spec samples
+## 4. Measurements outside the ordinary test suite
 
-Status 2026-10-16: the 2 tests this table marked **delete** (a constant pin and a duplicate) are deleted, and
-their rows are gone from it and from §2.
+The 23 paint rows and 2 spin rows are explicit `harness = false` benchmarks in
+`benches/paint.rs` and `benches/spin.rs`. `verify measure --app <aterm.app>` runs both
+with the test profile against the handed release binary. Each matrix executes its
+canonical row table once, sequentially, and reports passed, failed and undecided
+counts. A host refusal or an incomplete matrix never passes the check. Ordinary
+`--tests` runs do not select these acceptance measurements and report no ignored
+paint or spin rows.
 
-| test | why | action |
-|---|---|---|
-| `tests/paint.rs` (all 23: `main_screen_prompt_typing_paints_trail_ink`, `main_screen_prompt_with_effect_off_has_no_ribbon`, `alt_screen_fake_claude_typing_paints_trail_ink`, `alt_screen_cold_spinner_paints_zero_ink`, `alt_screen_esc7_esc8_streamer_typing_paints_trail_ink`, `unfocused_typed_window_paints_its_trail_under_an_unpinned_capture`, `unfocused_typed_window_with_effect_off_has_no_ribbon`, `unfocused_idle_window_paints_nothing_under_an_unpinned_capture`, `focused_alt_screen_typing_paints_trail_ink_without_a_recording_pin`, `focused_typed_window_with_effect_off_has_no_ribbon`, `focused_streamer_typing_paints_trail_ink_without_a_recording_pin`, `focused_cold_spinner_paints_zero_ink_without_a_recording_pin`, `shipped_default_first_still_and_typing_carry_the_resident_pet`, `explicit_underline_spelling_paints_an_underline_ribbon`, `explicit_tall_short_word_paints_four_hues`, `explicit_tall_short_word_control_has_no_ribbon_when_effect_is_off`, `cold_output_paints_literally_nothing_for_a_companion_free_style`, `flying_style_sustained_typing_earns_and_paints_the_flying_kitty`, `alt_screen_cold_token_streamer_with_a_walking_caret_paints_zero_ink`, `the_owners_rainbow_kitty_spelling_carries_the_resident_pet`, `the_owners_spelling_never_draws_two_companions_in_one_frame`, `split_window_typing_paints_the_rainbow_body_in_the_focused_pane`, `split_window_typing_with_effect_off_has_no_ribbon`) | `#[ignore]` MEASURE rows. Each boots a release aterm headless, types real keys and judges captured pixels in real time (process, socket, capture, scheduling). They are acceptance measurements of the shipped binary, not samples of a function's spec. Their pure halves are `paint-judge-denotation`, `starvation-classify` and the scan specs. | **move to a bench** |
-| `tests/spin.rs::an_idle_claude_shaped_client_banks_no_past_deadline_arms`, `tests/spin.rs::a_bare_idle_instance_banks_no_past_deadline_arms` | `#[ignore]` MEASURE spin rows. They launch a release instance and count past-deadline arms over a 10 s / 6 s wall-clock window. Their pure half is `spin-judge`. | **move to a bench** |
+Paint rows boot a private headless instance, type real keys and judge captured
+pixels. Their pure halves remain `paint-judge-denotation`, `starvation-classify`
+and the scan specs. Spin rows count past-deadline arms over 10 s / 6 s windows;
+their pure half remains `spin-judge`. Runner fixtures exercise complete execution,
+panics, refusals and empty plans without launching an instance.
 
-Totals: 25 move to a bench (the 2 deletions are done).
+The two tests previously marked for deletion (a constant pin and a duplicate)
+remain deleted.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -560,9 +541,6 @@ Totals: 25 move to a bench (the 2 deletions are done).
      `CSI 1;999H` lands at col 79) cannot detect a broken gate, because `set_column_mode_132` never resizes
      the grid even when DECCOLM is honoured. Only the no-clear and no-home assertions sample the gate.
 4. **Duplicates and redundant assertions**
-   - `tests/xterm_differential_regressions.rs::mode_1049_round_trip_still_restores_cursor` nearly duplicates
-     the final cursor assertion of `tests/vt_categories3.rs::mode_1049_saves_cursor_switches_and_clears_alt`.
-     Both are subsumed by `alt-screen-trio-model`.
    - `tests/xterm_differential_regressions.rs::scrolling_lf_clears_pending_wrap` says it mirrors aterm-grid's
      `each_operation_keeps_or_consumes_the_parked_wrap`
      (`crates/aterm-grid/src/grid/tests/algorithm_boundary/pending_wrap.rs`). One `pending-wrap-transitions`

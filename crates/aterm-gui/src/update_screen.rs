@@ -15,7 +15,11 @@
 //! update bar's press all land on the one-click apply
 //! (`App::apply_update_or_details`) or on that route.
 
+use crate::native_updater_service::UpdateInstallability;
 use crate::update_apply_trouble::{ApplyRetry, ApplyTrouble};
+
+/// The headline while nothing has read whether this copy can replace itself.
+pub(crate) const UPDATE_UNOBSERVED_HEADLINE: &str = "Checking this copy\u{2026}";
 
 /// The per-process Software Update snapshot every update surface reads. A SNAPSHOT of
 /// the updater state captured when the route opens (or after a check), so what is painted
@@ -92,8 +96,9 @@ pub(crate) struct UpdateState {
     /// boot trial rolls back. Event-loop state like [`Self::apply_retry`], and
     /// true whether or not the ledger still names the failures.
     staged_on_hold: bool,
-    /// This launch has a bundle the updater could replace at all.
-    installable: bool,
+    /// Whether this launch has a bundle the updater could replace at all, as far
+    /// as a read has observed.
+    installable: UpdateInstallability,
     /// The STRANDED verdict: checks complete but the release channel cannot be
     /// read (401/403/404 with nothing to try, or a renamed repo). Deliberately
     /// records ZERO ledger failures, so `failing_persistent` can never carry it —
@@ -237,8 +242,10 @@ pub(crate) struct UpdateProjection {
     /// the headline an honest sentence and left the rest of the page alone, so the
     /// release-notes card went on printing "aterm X is the latest build" directly
     /// under "This copy of aterm can't update itself" — a claim about a release
-    /// list this process never fetched (2026-08-19 round-6 audit).
-    pub(crate) installable: bool,
+    /// list this process never fetched (2026-08-19 round-6 audit). Until a read has
+    /// observed it ([`UpdateInstallability::Unobserved`]) no surface claims either
+    /// answer.
+    pub(crate) installable: UpdateInstallability,
     /// This copy is DEV-MARKED (`ship dev-app`, gap #30): `installable` is false on
     /// purpose, so every card that would say "can't update" or "reinstall" says it is a
     /// dev build instead.
@@ -416,7 +423,10 @@ impl UpdateState {
             // one error that costs the reader real time.
             apply_retry: ApplyRetry::ManualOnly,
             staged_on_hold: false,
-            installable: status.is_none_or(|s| s.installable),
+            // No status is no read: a fixture without one has observed nothing.
+            installable: status.map_or(UpdateInstallability::Unobserved, |s| {
+                UpdateInstallability::observed(s.installable)
+            }),
             channel_unreadable: status.is_some_and(|s| s.enabled && s.channel_unreadable),
             checking,
             checked_at: status
@@ -481,7 +491,7 @@ impl UpdateState {
         self.downloading.as_ref().filter(|_| {
             !self.linux_host
                 && self.enabled
-                && self.installable
+                && self.installable.is_installable()
                 && self.staged.is_none()
                 && !self.checking
         })
@@ -511,7 +521,9 @@ impl UpdateState {
             self.changelog.clear();
             return self;
         }
-        if !self.installable {
+        // Not only a copy that CANNOT apply it: one nothing has read yet may not be
+        // told a build is ready for it either.
+        if !self.installable.is_installable() {
             self.staged = None;
             self.changelog.clear();
             // The ledger's own sentence describes the check the INSTALLED copy ran;
@@ -630,7 +642,7 @@ impl UpdateState {
     /// detail that painted the timing sentence and ellipsized the trial it named).
     fn linux_fact_headline(&self) -> Option<&'static str> {
         let linux = self.linux.as_ref();
-        if !self.installable {
+        if self.installable.cannot_install() {
             Some("Update unavailable.")
         } else if !self.enabled {
             Some("Updates are off.")
@@ -651,6 +663,12 @@ impl UpdateState {
     fn headline(&self) -> String {
         if self.checking {
             "Checking for updates\u{2026}".to_string()
+        } else if self.installable == UpdateInstallability::Unobserved {
+            // NOTHING HAS READ THIS COPY YET (the startup or first-open reconcile is
+            // in flight): it may be an installed copy or one that can't replace
+            // itself, so the page claims neither — no "up to date", no "can't update
+            // itself", no timing for the switches.
+            UPDATE_UNOBSERVED_HEADLINE.to_string()
         } else if self.linux_host {
             if let Some(fact) = self.linux_fact_headline() {
                 fact.to_string()
@@ -693,7 +711,7 @@ impl UpdateState {
             // The automatic lane's download: the band stays quiet (design ruling
             // 220), so this is where it is seen — `Downloading aterm v0.92.0…`.
             format!("{}\u{2026}", quiet.title)
-        } else if !self.installable {
+        } else if self.installable.cannot_install() {
             // NOT "You're up to date": this copy cannot be replaced at all — it is
             // running from the mounted disk image, from a Gatekeeper-translocated
             // location, or from a dev-marked install, so no check thread ever starts
@@ -803,7 +821,7 @@ impl UpdateState {
             let outcome = self.outcome.trim().trim_end_matches('.');
             let own_facts = self.linux_error || outcome.is_empty();
             let direction = if own_facts
-                && self.installable
+                && self.installable.is_installable()
                 && self
                     .linux
                     .as_ref()
@@ -859,7 +877,12 @@ impl UpdateState {
             };
             return (!detail.is_empty()).then_some(detail);
         }
-        if !self.installable {
+        if self.installable == UpdateInstallability::Unobserved {
+            // The headline says the copy is being read; no detail claims anything
+            // about it before that read lands.
+            return None;
+        }
+        if self.installable.cannot_install() {
             // The one cause, never a guess between the disk image, a translocated
             // download and a local build (which has no aterm.app to move); and never
             // "only Applications" — any bundle outside a disk image updates.
@@ -1021,14 +1044,12 @@ mod tests {
             trial_starts: 0,
             trial_healthy: false,
             refused_newer: false,
-            refused_unstarted: false,
-            kept_unproven: false,
         }
     }
 
     /// The held download's ledger sentence (`aterm_update::linux`).
-    const LINUX_HELD: &str = "aterm 0.5.15 is downloaded \u{2014} `aterm update apply` installs it (`[update] \
-         auto_apply` is off)";
+    const LINUX_HELD: &str = "aterm 0.5.15 is downloaded \u{2014} `aterm update apply` installs it \
+         (\u{201c}Install updates automatically\u{201d} is off)";
     /// A replaced executable's ledger sentence while it waits for its first start.
     const LINUX_PENDING: &str = "aterm 0.5.15 is installed \u{2014} the next aterm you start \
                                  finishes it; existing sessions continue unchanged";
@@ -1117,7 +1138,7 @@ mod tests {
     fn linux_update_status_unenrolled_copy_keeps_exact_reason_and_linux_advice() {
         let mut state = linux_state(None, 0);
         state.enabled = false;
-        state.installable = false;
+        state.installable = UpdateInstallability::NotInstallable;
         state.outcome = "installed prefix is group writable before a private ancestor".into();
         let state = state.without_inapplicable_stage();
         let projection = state.projection();
@@ -1376,14 +1397,15 @@ mod tests {
         st.installable = false;
         let projected = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
         assert!(
-            !projected.installable,
+            projected.installable.cannot_install(),
             "a copy with no replaceable bundle must project that fact, not just headline it"
         );
         st.installable = true;
         assert!(
             UpdateState::from_status(828, "0.5.14", Some(&st), false)
                 .projection()
-                .installable,
+                .installable
+                .is_installable(),
             "an ordinary install must stay installable"
         );
     }
@@ -1602,6 +1624,8 @@ mod tests {
             let mut snapshot = NativeUpdaterService::new(828, "0.5.14", true)
                 .snapshot()
                 .clone();
+            // An installed copy a read found replaceable.
+            snapshot.installable = UpdateInstallability::Installable;
             snapshot.staged = Some(StagedUpdate {
                 build: 830,
                 version: "0.5.15".to_string(),

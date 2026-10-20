@@ -35,19 +35,49 @@ impl IdleHost for Present {
     }
 }
 
-/// A CLI `watch`'s setup for `@s-1`, its ledger under `/st/drive`, the
-/// approval policy's home `/h` and `$TMPDIR` `/tmpd`.
+/// `posix` (`/st/drive`) as an absolute path of this host: itself on unix, on
+/// drive `C:` on Windows (where a `/`-rooted path names no drive, and a header
+/// takes it for a relative one).
+fn abs(posix: &str) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(format!("C:{posix}"))
+    } else {
+        PathBuf::from(posix)
+    }
+}
+
+/// Where a remapped decode puts the recorded absolute path `recorded` beneath
+/// `base`: its names, on Windows under its drive's own namespace first
+/// (`disk-43/path` for `C:`, [`Roots::remapped`]).
+fn remapped_at(base: &Path, recorded: &Path) -> PathBuf {
+    let mut at = base.to_path_buf();
+    for c in recorded.components() {
+        match c {
+            std::path::Component::Prefix(p) => {
+                if let std::path::Prefix::Disk(drive) = p.kind() {
+                    at.push(format!("disk-{drive:02x}"));
+                    at.push("path");
+                }
+            }
+            std::path::Component::Normal(name) => at.push(name),
+            _ => {}
+        }
+    }
+    at
+}
+
+/// A loop's setup for `@s-1`, its ledger under `/st/drive`, the approval
+/// policy's home `/h` and `$TMPDIR` `/tmpd`.
 fn watched() -> SessionSetup {
     let mut ctl = NoCtl;
     let mut s = Session::new(&mut ctl, Some("@s-1".to_string()));
     s.set_approval_env(ApprovalEnv {
-        home: Some(PathBuf::from("/h")),
+        home: Some(abs("/h")),
         uid: 501,
         tmpdir: Some(PathBuf::from("/tmpd")),
         worker: WorkerSource::Session,
     });
-    s.set_approval_ledger(Some(PathBuf::from("/st/drive/s-1.jsonl")));
-    s.set_manager(Some("@s-manager".to_string()));
+    s.set_approval_ledger(Some(abs("/st/drive/s-1.jsonl")));
     s.setup().clone()
 }
 
@@ -56,26 +86,23 @@ fn every_option() -> SuperviseOpts {
     let mut policy = SupervisorConfig::default();
     policy.set("approve", "safe").expect("approve");
     policy
-        .set("rules_file", "/st/rules/standing.md")
+        .set(
+            "rules_file",
+            &abs("/st/rules/standing.md").display().to_string(),
+        )
         .expect("rules");
     policy.set("trust_roots", "~/src/app*,~/w").expect("roots");
     policy.set("codex.enabled", "false").expect("codex");
     SuperviseOpts {
         max: Duration::from_secs(3600),
         python_allow: vec!["scripts/*.py".to_string(), "a\nb\\c\t\u{7}é".to_string()],
-        notes: Some(PathBuf::from("/n/notes.txt")),
-        report: true,
         context_warn: 25,
-        journal: Some(PathBuf::from("/j/journal.jsonl")),
-        ledger: Some(PathBuf::from("/st/drive/s-1.jsonl")),
-        mail: Some(MailOpts {
-            inbox: Some("@s-manager".to_string()),
-            report_window: Duration::from_millis(1500),
-            idle_grace: Duration::from_nanos(7),
-        }),
+        journal: Some(abs("/j/journal.jsonl")),
+        ledger: Some(abs("/st/drive/s-1.jsonl")),
         policy,
         yield_when_held: true,
         idle_host: Some(Arc::new(Present)),
+        tasks: Some(abs("/st/tasks")),
     }
 }
 
@@ -85,26 +112,22 @@ fn assert_same_opts(a: &SuperviseOpts, b: &SuperviseOpts) {
     let SuperviseOpts {
         max,
         python_allow,
-        notes,
-        report,
         context_warn,
         journal,
         ledger,
-        mail,
         policy,
         yield_when_held,
         idle_host: _,
+        tasks,
     } = a;
     assert_eq!(*max, b.max);
     assert_eq!(*python_allow, b.python_allow);
-    assert_eq!(*notes, b.notes);
-    assert_eq!(*report, b.report);
     assert_eq!(*context_warn, b.context_warn);
     assert_eq!(*journal, b.journal);
     assert_eq!(*ledger, b.ledger);
-    assert_eq!(*mail, b.mail);
     assert_eq!(*policy, b.policy);
     assert_eq!(*yield_when_held, b.yield_when_held);
+    assert_eq!(*tasks, b.tasks);
 }
 
 /// THE HEADER ROUND TRIP: the run's facts, the setup, every option and the
@@ -114,7 +137,7 @@ fn assert_same_opts(a: &SuperviseOpts, b: &SuperviseOpts) {
 fn a_header_gives_back_what_the_run_was_given() {
     let setup = watched();
     let opts = every_option();
-    let h = Header::capture("t-7", Entry::Hosted, Some(Path::new("/st")), &setup, &opts);
+    let h = Header::capture("t-7", Entry::Hosted, Some(&abs("/st")), &setup, &opts);
     assert!(h.idle_host && h.opts.idle_host.is_none());
     assert!(
         h.policy_exact,
@@ -145,8 +168,8 @@ fn a_header_gives_back_what_the_run_was_given() {
 /// any one thing moved off the default — each key to a value of its own
 /// ([`SupervisorConfig::moved_off_default`], so every key is written at a
 /// value that is not its default's and none merely round-trips the default
-/// again), each agent switched off, each withheld rule, a session's word —
-/// with nothing supplied. The standing rules' file is the one value the
+/// again), each agent switched off, each withheld rule — with nothing
+/// supplied. The standing rules' file is the one value the
 /// header holds as the loop opens it: a relative one by its absolute path.
 #[test]
 fn the_policy_comes_back_through_the_header_for_any_one_key_moved() {
@@ -167,10 +190,6 @@ fn the_policy_comes_back_through_the_header_for_any_one_key_moved() {
     let mut read = full.clone();
     read.withheld.read_outside_cwd = true;
     policies.push(read);
-    policies.push(SupervisorConfig {
-        session_questions: false,
-        ..full.clone()
-    });
     for policy in policies {
         assert_ne!(policy, full);
         let opts = SuperviseOpts {
@@ -219,22 +238,18 @@ fn a_policy_its_texts_cannot_give_back_is_marked_inexact() {
 #[test]
 fn paths_are_written_under_their_roots_and_move_with_them() {
     let setup = watched();
-    let mut opts = every_option();
-    opts.notes = Some(PathBuf::from("/n/notes.txt"));
-    let h = Header::capture("t", Entry::Watch, Some(Path::new("/st")), &setup, &opts);
+    let opts = every_option();
+    let h = Header::capture("t", Entry::Watch, Some(&abs("/st")), &setup, &opts);
     let ids: Vec<&str> = h.roots.iter().map(|(id, _)| id).collect();
     // `/st/drive` holds the ledger (and `opts.ledger`, the same file): one
-    // root; the notes have their own absolute root.
-    assert_eq!(
-        ids,
-        ["ledger", "journal", "notes", "rules", "state", "home"]
-    );
+    // root; the tasks directory is under the state root.
+    assert_eq!(ids, ["ledger", "journal", "rules", "state", "home"]);
     let text = h.encode();
     for line in [
         "ledger=@ledger/s-1.jsonl",
         "journal=@journal/journal.jsonl",
         "rules_file=@rules/standing.md",
-        "notes=@notes/notes.txt",
+        "tasks=@state/tasks",
     ] {
         assert!(text.lines().any(|l| l == line), "{line} in\n{text}");
     }
@@ -242,17 +257,18 @@ fn paths_are_written_under_their_roots_and_move_with_them() {
     let back = Header::decode_remapped(&text, base).expect("decodes");
     // Each root at its recorded path beneath the base: the ledger's directory
     // keeps its name (`drive`) and its place in the state root.
+    let under = |posix: &str| remapped_at(base, &abs(posix));
     assert_eq!(
         back.setup.ledger_path(),
-        Some(base.join("st/drive/s-1.jsonl").as_path())
+        Some(under("/st/drive/s-1.jsonl").as_path())
     );
-    assert_eq!(back.opts.ledger, Some(base.join("st/drive/s-1.jsonl")));
-    assert_eq!(back.opts.journal, Some(base.join("j/journal.jsonl")));
+    assert_eq!(back.opts.ledger, Some(under("/st/drive/s-1.jsonl")));
+    assert_eq!(back.opts.journal, Some(under("/j/journal.jsonl")));
     assert_eq!(
         back.opts.policy.rules_file,
-        Some(base.join("st/rules/standing.md"))
+        Some(under("/st/rules/standing.md"))
     );
-    assert_eq!(back.opts.notes, Some(base.join("n/notes.txt")));
+    assert_eq!(back.opts.tasks, Some(under("/st/tasks")));
     assert_eq!(back.roots, h.roots.remapped(base));
     assert_eq!(back.setup.approval_env(), setup.approval_env());
     // Written again under the remapped roots, the paths are the same text.
@@ -404,7 +420,7 @@ fn a_header_this_build_did_not_write_is_refused_by_name() {
         "names no reconnect",
     );
     refused(
-        text.replacen("[opts]\n", "[opts]\nreport=true\n", 1),
+        text.replacen("[opts]\n", "[opts]\ncontext_warn=1\n", 1),
         "said twice",
     );
     refused(
@@ -455,14 +471,13 @@ fn replace_header_field(text: &str, section: &str, key: &str, value: &str) -> St
 fn remapped_file_paths_cannot_escape_the_named_roots() {
     let setup = watched();
     let opts = every_option();
-    let text = Header::capture("t", Entry::Watch, Some(Path::new("/st")), &setup, &opts).encode();
+    let text = Header::capture("t", Entry::Watch, Some(&abs("/st")), &setup, &opts).encode();
     let base = Path::new("/nonexistent/private-replay");
     let good = Header::decode_remapped(&text, base).expect("ordinary rooted files");
     assert_eq!(
         good.setup.ledger_path(),
-        Some(base.join("st/drive/s-1.jsonl").as_path())
+        Some(remapped_at(base, &abs("/st/drive/s-1.jsonl")).as_path())
     );
-    assert_eq!(good.opts.notes, Some(base.join("n/notes.txt")));
     assert_eq!(
         good.setup.approval_env(),
         setup.approval_env(),
@@ -471,7 +486,6 @@ fn remapped_file_paths_cannot_escape_the_named_roots() {
     let mut admitted = Vec::new();
     for (section, key) in [
         ("[setup]", "ledger"),
-        ("[opts]", "notes"),
         ("[opts]", "journal"),
         ("[opts]", "ledger"),
         ("[policy]", "rules_file"),
@@ -495,20 +509,18 @@ fn remapped_file_paths_cannot_escape_the_named_roots() {
     );
 }
 
-/// A FILE GIVEN RELATIVE (`--journal run.jsonl`, `--notes n.txt`, a
-/// `rules_file` of `standing.md`, a ledger) is one the loop opens from its
-/// own directory: the header names it from there, under a root, so a replay
-/// moves it under its base like every other — never hands the relative path
-/// back, which a replay started in the recording's directory would open as
-/// the live journal. A name that only looks rooted (`@odd/notes`, a relative
-/// path) is a file too. An absolute path under no root still decodes as it
-/// was, but no remapped decode admits it.
+/// A FILE GIVEN RELATIVE (a journal of `run.jsonl`, a `rules_file` of
+/// `standing.md`, a ledger) is one the loop opens from its own directory: the
+/// header names it from there, under a root, so a replay moves it under its
+/// base like every other — never hands the relative path back, which a
+/// replay started in the recording's directory would open as the live
+/// journal. An absolute path under no root still decodes as it was, but no
+/// remapped decode admits it.
 #[test]
 fn relative_file_paths_are_rooted_and_move_with_a_remap() {
     let setup = watched().with_ledger_path(Some(PathBuf::from("drive/s-1.jsonl")));
     let opts = SuperviseOpts {
         journal: Some(PathBuf::from("run.jsonl")),
-        notes: Some(PathBuf::from("@odd/notes")),
         policy: {
             let mut p = SupervisorConfig::default();
             p.set("rules_file", "standing.md")
@@ -517,13 +529,12 @@ fn relative_file_paths_are_rooted_and_move_with_a_remap() {
         },
         ..SuperviseOpts::default()
     };
-    let h = Header::capture("t", Entry::Watch, Some(Path::new("/st")), &setup, &opts);
+    let h = Header::capture("t", Entry::Watch, Some(&abs("/st")), &setup, &opts);
     let here = std::env::current_dir().expect("this test's directory");
     let text = h.encode();
     for line in [
         "ledger=@ledger/s-1.jsonl",
         "journal=@journal/run.jsonl",
-        "notes=@notes/notes",
         "rules_file=@journal/standing.md",
     ] {
         assert!(text.lines().any(|l| l == line), "{line} in\n{text}");
@@ -538,34 +549,21 @@ fn relative_file_paths_are_rooted_and_move_with_a_remap() {
     let moved = Header::decode_remapped(&text, base).expect("every file rooted");
     // Each root at its recorded path beneath the base: here, this test's own
     // directory.
-    let under: PathBuf = here
-        .components()
-        .filter(|c| matches!(c, std::path::Component::Normal(_)))
-        .collect();
-    let at = base.join(under);
+    let at = remapped_at(base, &here);
     assert_eq!(
         moved.setup.ledger_path(),
         Some(at.join("drive/s-1.jsonl").as_path())
     );
     assert_eq!(moved.opts.journal, Some(at.join("run.jsonl")));
-    assert_eq!(moved.opts.notes, Some(at.join("@odd/notes")));
     assert_eq!(moved.opts.policy.rules_file, Some(at.join("standing.md")));
 
     // `opts.ledger` beside a different setup ledger has no root of its own.
     let mut elsewhere = every_option();
-    elsewhere.ledger = Some(PathBuf::from("/elsewhere/other-ledger"));
-    let text = Header::capture(
-        "t",
-        Entry::Watch,
-        Some(Path::new("/st")),
-        &watched(),
-        &elsewhere,
-    )
-    .encode();
-    assert!(
-        text.lines().any(|l| l == "ledger=/elsewhere/other-ledger"),
-        "{text}"
-    );
+    elsewhere.ledger = Some(abs("/elsewhere/other-ledger"));
+    let text =
+        Header::capture("t", Entry::Watch, Some(&abs("/st")), &watched(), &elsewhere).encode();
+    let line = format!("ledger={}", abs("/elsewhere/other-ledger").display());
+    assert!(text.lines().any(|l| l == line), "{text}");
     let ordinary = Header::decode(&text).expect("the ordinary codec reads it");
     assert_eq!(ordinary.opts.ledger, elsewhere.ledger);
     Header::decode_remapped(&text, base).expect_err("no root holds it");
@@ -574,8 +572,9 @@ fn relative_file_paths_are_rooted_and_move_with_a_remap() {
 /// A TAPE AN OLDER BUILD WROTE: it lacks every key that build did not have
 /// yet — here a `[harness]` key (`land_at` came after the first tapes), an
 /// agent's switch, the two setup knobs a shipped build did not write
-/// before every build carried them, and the two timings that came after the
-/// format (the box call's lag step and the refusal's back-off rungs). It
+/// before every build carried them, the two timings that came after the
+/// format (the box call's lag step and the refusal's back-off rungs), the
+/// hand the loop types under, and the tasks directory. It
 /// decodes: each policy key at its full-power default, each knob at this
 /// build's shipped value, everything the tape said as it said it, and every
 /// key supplied named.
@@ -587,7 +586,7 @@ fn a_tape_an_older_build_wrote_decodes_with_what_it_lacked_named() {
     let mut s = Session::from_setup(&mut ctl, watched());
     s.set_person_hold_wait(Duration::from_millis(5));
     let setup = s.setup().clone();
-    let text = Header::capture("t", Entry::Watch, Some(Path::new("/st")), &setup, &opts).encode();
+    let text = Header::capture("t", Entry::Watch, Some(&abs("/st")), &setup, &opts).encode();
     for line in [
         "person_hold_wait=5ms",
         "beside_idle_min=20s",
@@ -605,6 +604,8 @@ fn a_tape_an_older_build_wrote_decodes_with_what_it_lacked_named() {
                 "beside_idle_min=",
                 "box_call_step=",
                 "turn_end.refused_backoff=",
+                "types_under_hand=",
+                "tasks=",
             ]
             .iter()
             .any(|k| l.starts_with(k))
@@ -615,10 +616,12 @@ fn a_tape_an_older_build_wrote_decodes_with_what_it_lacked_named() {
     assert_eq!(
         back.supplied,
         [
+            "[setup] types_under_hand",
             "[setup] box_call_step",
             "[setup] turn_end.refused_backoff",
             "[setup] person_hold_wait",
             "[setup] beside_idle_min",
+            "[opts] tasks",
             "[policy] land_at",
             "[policy] codex.enabled",
         ]

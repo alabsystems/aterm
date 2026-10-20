@@ -1,102 +1,54 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The per-window view the frame path reads without allocating: the level,
-//! the rim, the row's words, the change seed the repaint key folds
-//! ([`View::fp`]), the edge ripple and the words' own clock.
+//! The per-window view the frame path reads without allocating: the border
+//! ([`Rim`]), the session it is lit for, the needs pill's model ([`Pill`]),
+//! the change seed the repaint key folds ([`View::fp`]), the pill's own age
+//! clock, and the story watermarks `status level=` reads.
 
 use std::collections::HashMap;
 
-use super::{
-    ChipLevel, HOLD_WASH_ALPHA, Level, PresenceTones, RIM_BORDER_ALPHA, RIPPLE, RIPPLE_STEPS,
-    RIPPLE_WASH_PEAK, Rim, Words,
-};
-use crate::{Duration, Instant};
+use super::{ChipLevel, PresenceTones, RIM_BORDER_ALPHA, Rim, YOURS_BORDER_SCALE_Q4, pill::Pill};
+use crate::Instant;
 
 /// One window's presence, as the last refresh left it. Every field the frame
-/// path reads is plain data; the words are recomposed only on change.
-#[derive(Clone, Debug)]
+/// path reads is plain data; the pill is recomposed only on change.
+#[derive(Clone, Debug, Default)]
 pub struct View {
     /// The story watermarks, one per session shown in this window: the newest
-    /// story seq the human has seen of that session here, moved only by the
-    /// fold law. Per session, so reading one tab's story neither folds
-    /// another's nor brings back one already read.
+    /// story seq the human has seen of that session here, moved only by a
+    /// person's key in a calm session ([`super::drive::human_acted_on`]).
+    /// `status level=story` reads the highest any window holds.
     pub watermarks: HashMap<u64, u64>,
-    /// The row count committed to this window's geometry (0 or 1), moved only
-    /// by the host's re-grid.
-    pub rows: u16,
-    /// The level shown.
-    pub level: Level,
-    /// The rim shown.
+    /// The border shown.
     pub rim: Rim,
-    /// The row's words, when the row exists.
-    pub words: Option<Words>,
+    /// The session the border is lit for: the window's most pressing need's,
+    /// or the front session the person holds. `None` with no border.
+    pub pressing: Option<u64>,
+    /// The needs pill: exactly while the border is lit.
+    pub pill: Option<Pill>,
     /// Bumped on every change the painter can see; folded into [`Self::fp`].
-    /// Never 0 once anything has shown, but `fp` maps a quiet window to 0.
     pub seed: u64,
-    /// A turn submit's edge ripple: when it started, `None` when none runs
-    /// (always `None` under reduced motion: the ripple never starts).
-    pub ripple_at: Option<Instant>,
-    /// The running ripple is a choice pulse: the harness answered a question
-    /// box in the session this window's front tab shows. It paints in the
-    /// story tone, even on a window with no rim. Reset with `ripple_at`.
-    pub ripple_chose: bool,
-    /// When the words' `since` figures next move ([`words_step`]: 1 s while
-    /// they print seconds, 60 s after); `None` until a row's first tick. The
-    /// host recomposes a window only when this is due, so other wakes never
-    /// re-read presence facts at their own rate.
-    pub words_due: Option<Instant>,
-    /// Since when the committed row has wanted no row (its words went away)
-    /// while [`FOLD_QUIET`](super::FOLD_QUIET) holds its fold back. The row
-    /// stays committed and paints blank meanwhile, and the wire reports it
-    /// with no words (`band=""`, `sentence=""`), as the human sees it. `None`
-    /// when no fold is pending; a want that returns clears it.
-    pub fold_since: Option<Instant>,
-    /// The pending fold is a person's read (the fold law's keystroke; a tab
-    /// switch is not one, since switching back would re-bear the row, a
-    /// net-zero re-grid): it skips [`FOLD_QUIET`](super::FOLD_QUIET) from the
-    /// want's drop and waits only the row's minimum life from
-    /// [`Self::born_at`]. Sticky until the fold commits or the want returns,
-    /// so a read under a hold folds as the hold lifts.
-    pub fold_read: bool,
-    /// When the committed row was born (its last 0 -> 1 re-grid); `None`
-    /// before it ever was. A read folds a row only once it has stood
-    /// [`FOLD_QUIET`](super::FOLD_QUIET): a story born while a person types
-    /// would otherwise fold on their next key, a net-zero re-grid pair.
-    pub born_at: Option<Instant>,
+    /// When the pill's age next moves (1 s under a minute, 60 s after);
+    /// `None` without a pill or before its first tick. Armed only for a
+    /// window someone can see the pill on.
+    pub pill_due: Option<Instant>,
 }
 
-impl Default for View {
-    fn default() -> Self {
-        Self {
-            watermarks: HashMap::new(),
-            rows: 0,
-            level: Level::Quiet,
-            rim: Rim::None,
-            words: None,
-            seed: 0,
-            ripple_at: None,
-            ripple_chose: false,
-            words_due: None,
-            fold_since: None,
-            fold_read: false,
-            born_at: None,
-        }
-    }
-}
-
-/// The rim as the frame path draws it: the accent and the three alphas an
-/// inset border and its wash take ([`View::rim_glow`]).
+/// The border as the frame path draws it: the accent and the alphas an
+/// inset border takes ([`View::rim_glow`]). Steady: no wash, no ripple.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RimGlow {
-    /// The border's and the wash's colour.
+    /// The border's colour.
     pub accent: [u8; 3],
-    /// The interior wash's alpha (0..255).
+    /// The interior wash's alpha (0..255): always 0, nothing washes the
+    /// glass.
     pub wash_a: u8,
     /// The inset border's alpha (0..255).
     pub border_a: u8,
     /// The border's thickness in 1/16 units of the host's size law (16 = the
-    /// plain law, 32 = doubled under a hold).
+    /// plain law); the yours outline's [`YOURS_BORDER_SCALE_Q4`] is one pixel
+    /// at every size the law gives (the host floors it at one).
     pub border_scale_q4: u8,
 }
 
@@ -107,156 +59,68 @@ impl View {
         self.watermarks.get(&session).copied().unwrap_or(0)
     }
 
-    /// Show `level`, `rim` and `words` (the row's words, `None` without a
-    /// row): `true` when anything the painter reads moved, which bumps the
-    /// seed. New words re-arm their own clock ([`words_step`]): a minutes
-    /// row's +60 s must not hold back a seconds row that replaced it. The
-    /// earlier of the two wins, so a figure already due is never pushed back.
-    pub fn show(&mut self, level: Level, rim: Rim, words: Option<Words>, now: Instant) -> bool {
-        if self.level == level && self.rim == rim && self.words == words {
+    /// Show `rim` lit for `pressing` with `pill`: `true` when anything the
+    /// painter reads moved, which bumps the seed. A pill that moved restarts
+    /// its age clock at `now`'s step; one that went clears it.
+    pub fn show(&mut self, rim: Rim, pressing: Option<u64>, pill: Option<Pill>) -> bool {
+        if self.rim == rim && self.pressing == pressing && self.pill == pill {
             return false;
         }
-        if self.words != words {
-            let next = words.as_ref().map(|w| now + words_step(w));
-            self.words_due = match (self.words_due, next) {
-                (Some(old), Some(new)) => Some(old.min(new)),
-                (_, next) => next,
-            };
+        if self.pill != pill {
+            self.pill_due = None;
         }
-        self.level = level;
         self.rim = rim;
-        self.words = words;
+        self.pressing = pressing;
+        self.pill = pill;
         self.seed = self.seed.wrapping_add(1).max(1);
         true
     }
 
-    /// The ripple's step at `now`: `Some(0..RIPPLE_STEPS)` while it runs,
-    /// `None` after.
+    /// The repaint-key term: exactly 0 on a quiet window (no border, no
+    /// pill), else a nonzero fold of the seed. No clock is read and nothing
+    /// allocates.
     #[must_use]
-    pub fn ripple_step(&self, now: Instant) -> Option<u32> {
-        let t0 = self.ripple_at?;
-        let elapsed = now.saturating_duration_since(t0);
-        if elapsed >= RIPPLE {
-            return None;
-        }
-        // In nanoseconds, as `ripple_deadline` computes: whole milliseconds
-        // would leave the step behind the instant the deadline names for it.
-        let step = elapsed.as_nanos() * u128::from(RIPPLE_STEPS) / RIPPLE.as_nanos();
-        // `elapsed < RIPPLE`, so `step < RIPPLE_STEPS`: the conversion is exact.
-        Some(u32::try_from(step).map_or(RIPPLE_STEPS - 1, |s| s.min(RIPPLE_STEPS - 1)))
-    }
-
-    /// The repaint-key term: exactly 0 on a quiet window (no rim, no row, no
-    /// ripple), else a nonzero fold of the seed (floored at 1) and the ripple
-    /// step (0 = none, else `step + 1`). No clock is read unless a ripple is
-    /// live, and nothing allocates.
-    #[must_use]
-    pub fn fp(&self, now: Instant) -> u64 {
-        if self.rows == 0 && matches!(self.rim, Rim::None) && self.ripple_at.is_none() {
+    pub fn fp(&self) -> u64 {
+        if matches!(self.rim, Rim::None) && self.pill.is_none() {
             return 0;
         }
-        let step = self
-            .ripple_at
-            .and_then(|_| self.ripple_step(now))
-            .map_or(0, |s| u64::from(s) + 1);
-        (self.seed.max(1) << 8) | step
+        self.seed.max(1)
     }
 
-    /// The next instant this view's pixels change on their own, only while a
-    /// ripple runs. Steady rims and rows have no deadline; the row's `since`
-    /// text ticks through the host's deadline fold.
+    /// The border as the frame path draws it, with no allocation; `None` on
+    /// a quiet window. `tones` are read only when a border paints, so a quiet
+    /// frame answers before the host derives them. The stuck and decide
+    /// borders take the host's inset width at the drop target's alpha; the
+    /// yours outline is one pixel of the theme's dim ink. No wash, ever.
     #[must_use]
-    pub fn ripple_deadline(&self, now: Instant) -> Option<Instant> {
-        let t0 = self.ripple_at?;
-        let end = t0 + RIPPLE;
-        if now >= end {
-            return Some(now);
-        }
-        let step = self.ripple_step(now).unwrap_or(0);
-        // The first nanosecond of the next step, rounded up, so it is after
-        // `now`.
-        let next = (u128::from(step + 1) * RIPPLE.as_nanos()).div_ceil(u128::from(RIPPLE_STEPS));
-        let next = Duration::from_nanos(u64::try_from(next).unwrap_or(u64::MAX));
-        Some((t0 + next).min(end))
-    }
-
-    /// The rim at `now` as the frame path draws it, with no allocation; `None`
-    /// on a quiet window. `rim_on` is the host's rim toggle (a choice pulse is
-    /// a rim flash, so it needs it too); `tones` are read only when a rim or a
-    /// pulse paints, so a quiet frame answers before the host derives them.
-    #[must_use]
-    pub fn rim_glow(
-        &self,
-        now: Instant,
-        rim_on: bool,
-        tones: impl FnOnce() -> PresenceTones,
-    ) -> Option<RimGlow> {
-        let step = self.ripple_step(now);
-        let pulse = self.ripple_chose && step.is_some() && rim_on;
-        if matches!(self.rim, Rim::None) && !pulse {
+    pub fn rim_glow(&self, tones: impl FnOnce() -> PresenceTones) -> Option<RimGlow> {
+        if matches!(self.rim, Rim::None) {
             return None;
         }
         let tones = tones();
-        let (accent, mut wash_a, scale) = match self.rim {
-            Rim::None => (tones.story, 0u8, 16u8),
-            Rim::Drive => (tones.drive, 0u8, 16u8),
-            Rim::Wait => (tones.wait, 0, 16),
-            Rim::Stop { hold: false } => (tones.stop, 0, 16),
-            Rim::Stop { hold: true } => (tones.stop, HOLD_WASH_ALPHA, 32),
+        let (accent, scale) = match self.rim {
+            Rim::None | Rim::Stuck => (tones.stop, 16),
+            Rim::Decide => (tones.wait, 16),
+            Rim::Yours => (tones.yours, YOURS_BORDER_SCALE_Q4),
         };
-        // The pulse speaks in the story tone whatever rim it crosses: the
-        // rim's own colour returns with the steady frame after it.
-        let accent = if pulse { tones.story } else { accent };
-        let mut border_a = RIM_BORDER_ALPHA;
-        if let Some(step) = step {
-            // One edge flash, decaying over nine frames: the border to full and
-            // a wash that fades out — the pixels change, the fact does not.
-            border_a = 255;
-            let remaining = RIPPLE_STEPS.saturating_sub(step);
-            // At most `RIPPLE_WASH_PEAK` (24): the conversion is exact.
-            let ripple =
-                u8::try_from(RIPPLE_WASH_PEAK * remaining / RIPPLE_STEPS).unwrap_or(u8::MAX);
-            wash_a = wash_a.max(ripple);
-        }
         Some(RimGlow {
             accent,
-            wash_a,
-            border_a,
+            wash_a: 0,
+            border_a: RIM_BORDER_ALPHA,
             border_scale_q4: scale,
         })
     }
 }
 
-/// How often a row's words move: every second while any `since` clause
-/// prints seconds (`12s`, `3m12s`, `held 1m00s, resumed 40s ago`), once a
-/// minute when it prints only minutes, hours or days.
-#[must_use]
-pub fn words_step(words: &Words) -> Duration {
-    if words.since.iter().any(|c| prints_seconds(c)) {
-        Duration::from_secs(1)
-    } else {
-        Duration::from_secs(60)
-    }
-}
-
-/// Whether a `since` clause prints a seconds figure (`12s`, `3m12s`, `since
-/// 40s`, `held 1m00s, resumed 5s ago`) — a token ending in `s` right after a
-/// digit; `3 turns`, `2h05m` and `1d 22h` do not.
-#[must_use]
-pub(crate) fn prints_seconds(clause: &str) -> bool {
-    clause
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|tok| {
-            tok.strip_suffix('s')
-                .is_some_and(|head| head.chars().last().is_some_and(|c| c.is_ascii_digit()))
-        })
-}
-
-/// The chip level an attention bit spells: `Wait` when set, else `Off`.
+/// The chip level the tab's own indicator bit spells (a native leaf's
+/// out-of-band attention, a failed last outcome not yet seen): a
+/// [`ChipLevel::Note`] when set, else `Off`. Never a need mark: `◆` and `◇`
+/// come only from the published verdict ([`super::Slot::chip`]), which the
+/// host folds over this.
 #[must_use]
 pub const fn chip_of_attention(attention: bool) -> ChipLevel {
     if attention {
-        ChipLevel::Wait
+        ChipLevel::Note
     } else {
         ChipLevel::Off
     }

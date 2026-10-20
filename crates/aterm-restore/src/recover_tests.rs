@@ -115,6 +115,22 @@ fn a_restore_is_the_live_session() {
     assert_eq!(r.header.writer_pid, 7);
     assert_eq!(r.header.sid, "s-recover");
     assert_eq!(r.other_slot, SlotVerdict::Valid(1));
+    // Across the ring's end past a gap under a header, which the writer leaves as it is
+    // and the walk skips unread, the restore is the live session too.
+    let geometry = Geometry::custom(64 * 1024, 96, 4096).expect("a test layout");
+    let mut small = Live::new(4, 30, geometry);
+    small.slice(b"abcdefgh"); // [0, 24)
+    small.keyframe(0); // tail_from 24
+    for bytes in [&b"0123456789abcdef"[..], b"\r\n0123456789abcd", b"t"] {
+        small.slice(bytes); // [24, 56), [56, 88), an 8-byte gap, then [96, 120)
+    }
+    let r = restored(small.recover(true));
+    assert!(r.exact, "{:?}", r.losses);
+    assert_eq!(r.replayed_records, 3);
+    assert_eq!(
+        visible(&r.checkpoint),
+        visible(&small.term.checkpoint_journal(0).expect("g"))
+    );
 }
 
 /// The cursor and the visible rows a person sees.
@@ -426,7 +442,8 @@ fn gathered_but_unprocessed_bytes_are_counted() {
 /// A region a memory shed superseded is never called exact, whichever rung reads it: the
 /// SUPERSEDED record it ends with is counted where the walk meets it, replayed or not, and
 /// the screen it held is still the screen it restores (what a window that died before the
-/// keeper took the new region's COMPANION gets back, pulsed to redraw over it).
+/// keeper took the new region's COMPANION gets back, pulsed to redraw over it), wherever
+/// in the ring it lands.
 #[test]
 fn a_superseded_region_restores_its_screen_and_is_never_exact() {
     let mut live = Live::v1(4, 30);
@@ -456,6 +473,15 @@ fn a_superseded_region_restores_its_screen_and_is_never_exact() {
     // marker is still in the walk's window, and still counted.
     live.keyframe(0);
     assert!(restored(live.recover(true)).losses.superseded);
+    // Filling the ring's last 16 bytes exactly, the marker is a record the walk reads, not
+    // a gap under a header it skips.
+    let geometry = Geometry::custom(64 * 1024, 96, 4096).expect("a test layout");
+    let mut small = Live::new(4, 30, geometry);
+    for bytes in [&b"ab"[..], b"cd", b"0123456789"] {
+        small.slice(bytes); // 24, 24 and 32 bytes: [0, 80)
+    }
+    small.writer.append_superseded().expect("[80, 96)");
+    assert!(restored(small.recover(true)).losses.superseded);
 }
 
 /// A region that takes a session's journal over mid-stream (the memory shed's replacement)
@@ -483,6 +509,29 @@ fn a_region_resumed_mid_stream_counts_in_flight_only_what_it_missed() {
         Err(WriteError::Sequence),
         "a keyframe was stamped"
     );
+    // Refused as well with a keyframe begun and not finished, or a tail record written.
+    let checkpoint = live.term.checkpoint_journal(0).expect("ground");
+    for begun in [true, false] {
+        let mut early =
+            JournalWriter::create(VecStore::new(geometry.region_len), geometry, &WRITER)
+                .expect("created");
+        if begun {
+            early
+                .begin_keyframe(&KeyframeInput {
+                    checkpoint: &checkpoint,
+                    fence: live.term.history_fence(),
+                    resize_lifetime: 0,
+                    resize_ordinal: 0,
+                    bridge_lines: 0,
+                    config_fp: CONFIG,
+                    integration_on: false,
+                })
+                .expect("begun");
+        } else {
+            early.append_slice(b"read").expect("a record");
+        }
+        assert_eq!(early.resume_stream(1), Err(WriteError::Sequence), "{begun}");
+    }
     live.slice(b"after it\r\n");
     let r = restored(live.recover(true));
     assert!(r.exact, "nothing missed: {:?}", r.losses);
@@ -560,6 +609,15 @@ fn unjournaled_resizes_lost_resizes_and_left_marks_are_counted() {
     let r = restored(live.recover(true));
     assert_eq!(r.losses.resizes_unjournaled, 1);
     assert!(!r.exact);
+    // A word from another engine lifetime counts every resize of that lifetime, one at
+    // least.
+    for (ordinal, unjournaled) in [(0, 1), (3, 3)] {
+        live.writer
+            .set_resize_word(live.term.resize_lifetime() + 1, ordinal)
+            .expect("a replaced engine's word");
+        let r = restored(live.recover(true));
+        assert_eq!(r.losses.resizes_unjournaled, unjournaled, "{ordinal}");
+    }
 
     // A journaled shrink replays exactly; a journaled grow is replayed too, and counted
     // (it depends on where the history sits, which no checkpoint carries).
@@ -653,29 +711,66 @@ fn no_header_or_no_keyframe_is_the_meta_rung() {
         Recovery::Meta(MetaWhy::NoKeyframe([SlotVerdict::Empty, SlotVerdict::Empty])) => {}
         other => panic!("{other:?}"),
     }
-    let live = Live::v1(4, 20);
-    let dead = live.writer.store().snapshot();
-    dead.store_u64_release(crate::layout::OFF_MAGIC, {
-        let mut magic = [0u8; 8];
-        magic[..4].copy_from_slice(&crate::layout::MAGIC);
-        magic[4] = crate::layout::LAYOUT_VERSION + 1;
-        u64::from_le_bytes(magic)
-    })
-    .expect("store");
-    assert_eq!(
-        recover(
+    // A valid region (one keyframe, seq 1 in slot 1) with one header word changed: the
+    // rung each refusal names, or the verdict of the slot it damaged.
+    let geometry = Geometry::custom(64 * 1024, 4096, 4096).expect("a small region");
+    let live = Live::new(4, 20, geometry);
+    let magic = |version: u8, pad: u8| {
+        u64::from_le_bytes([MAGIC[0], MAGIC[1], MAGIC[2], MAGIC[3], version, pad, 0, 0])
+    };
+    let len = geometry.region_len as u64;
+    let kf_cap = geometry.kf_cap as u64;
+    let header = |f| Err(MetaWhy::Header(f));
+    let no_keyframe = |v| Err(MetaWhy::NoKeyframe([SlotVerdict::Empty, v]));
+    #[rustfmt::skip]
+    let rows = [
+        (OFF_MAGIC, magic(LAYOUT_VERSION, 1), header(HeaderFault::Magic)),
+        (OFF_MAGIC, magic(0, 0), header(HeaderFault::Version(0))),
+        (OFF_MAGIC, magic(LAYOUT_VERSION + 1, 0), header(HeaderFault::Version(LAYOUT_VERSION + 1))),
+        (OFF_REGION_LEN, len + 8, header(HeaderFault::RegionLen(len + 8))),
+        (OFF_REGION_LEN, len - 8, header(HeaderFault::RegionLen(len - 8))),
+        (OFF_TAIL_CAP, 0, header(HeaderFault::Layout(LayoutError::TooSmall))),
+        (kf_commit_word(0), 1, Ok(SlotVerdict::WrongSlot(1))),
+        (kf_len_word(1), 0, no_keyframe(SlotVerdict::Length(0))),
+        (kf_len_word(1), kf_cap + 8, no_keyframe(SlotVerdict::Length(kf_cap + 8))),
+    ];
+    for (word, value, want) in rows {
+        let dead = live.writer.store().snapshot();
+        dead.store_u64_release(word, value).expect("a header word");
+        let got = match recover(
             &dead,
             RecoverPolicy {
                 tail: true,
                 config_fp: 0,
                 scratch_nonce: [0xA5; 32],
             },
-            Terminal::new
-        ),
-        Recovery::Meta(MetaWhy::Header(HeaderFault::Version(
-            crate::layout::LAYOUT_VERSION + 1
-        )))
-    );
+            Terminal::new,
+        ) {
+            Recovery::Restored(r) => Ok(r.other_slot),
+            Recovery::Meta(why) => Err(why),
+        };
+        assert_eq!(got, want, "word {word} = {value:#x}");
+    }
+    // Views of the largest region a reader maps and a page past it, whose length words
+    // agree with them: the largest passes the length check (its zero section words then
+    // fail the layout), the next is refused by its length.
+    let past = MAX_REGION_LEN + crate::layout::PAGE;
+    for (huge, want) in [
+        (MAX_REGION_LEN, HeaderFault::Layout(LayoutError::TooSmall)),
+        (past, HeaderFault::RegionLen(past as u64)),
+    ] {
+        let view = VecStore::new(huge); // zeroed on demand: only the header's page is touched
+        view.store_u64_release(OFF_MAGIC, magic(LAYOUT_VERSION, 0))
+            .expect("magic");
+        view.store_u64_release(OFF_REGION_LEN, huge as u64)
+            .expect("length");
+        assert_eq!(read_header(&view), Err(want), "{huge}");
+    }
+    // The session id is reported as the printable ASCII before its first NUL.
+    let dead = live.writer.store().snapshot();
+    dead.write(OFF_SID, b"s 1\x07\xc3\xa9x\0tail")
+        .expect("the id");
+    assert_eq!(read_header(&dead).map(|h| h.sid), Ok("s1x".to_owned()));
 }
 
 /// The history ring's run comes back across its wrap, in order, under its identity; its
@@ -725,6 +820,23 @@ fn the_ring_run_reads_back_and_its_admission_checks_identity() {
         assert!(chunk.n_lines as usize <= CHUNK_LINES);
     }
     assert!(r.history_admissible());
+    // A fence taken while a reflow held the store (the keyframe's, as its body says, or
+    // the scratch engine's on either side of the replay) admits no history and leaves no
+    // head to join it below.
+    for detached in 0..3 {
+        let mut moved = r.clone();
+        [
+            &mut moved.keyframe.fence,
+            &mut moved.fence_before,
+            &mut moved.fence_after,
+        ][detached]
+            .detached = true;
+        assert!(!moved.history_admissible(), "fence {detached}");
+        assert!(
+            matches!(moved.join_facts(), Err(HeadLost::Moved { .. })),
+            "fence {detached}"
+        );
+    }
 
     // A clear inside the replayed tail: the scratch engine's identity moved.
     live.slice(b"\x1b[3J");
@@ -910,6 +1022,142 @@ fn a_death_after_a_floor_that_evicted_everything_is_an_overflow() {
     );
 }
 
+/// A tail damaged or torn where corruption or a stopped writer leaves it: each row is a
+/// valid region (a keyframe at tail position 24, stream 8, a 96-byte ring) whose tail
+/// words and bytes are replaced. The walk replays up to the first record it cannot trust,
+/// stops there with that record's fault, never skips it or reads past the commit word or
+/// the ring's end, and counts what it did not replay; a resize it cannot apply is a fault
+/// too, and one that changes nothing is no regrid.
+#[test]
+fn a_damaged_tail_stops_at_its_first_fault_and_counts_the_rest() {
+    use aterm_core::grid::ResizePolicy;
+    let geometry = Geometry::custom(64 * 1024, 96, 4096).expect("a 96-byte tail");
+    let mut live = Live::new(4, 30, geometry);
+    live.slice(b"abcdefgh"); // [0, 24), stream 8
+    live.keyframe(0); // tail_from 24, stream_at 8
+    let bytes = |n: usize, end: u64| {
+        let mut record = Vec::new();
+        let payload = vec![b'x'; n];
+        TailRecord::Bytes {
+            synthesized: false,
+            bytes: &payload,
+        }
+        .encode(end, &mut record);
+        record
+    };
+    let resize = |rows: u16, cols: u16| {
+        let mut record = Vec::new();
+        TailRecord::Resize {
+            rows,
+            cols,
+            policy: ResizePolicy::Native,
+            lifetime: 1,
+            ordinal: 1,
+        }
+        .encode(24, &mut record);
+        record
+    };
+    // A bare header: kind, flags, reserved, payload length, stream end.
+    let head = |kind: u8, flags: u8, reserved: u16, len: u32, end: u64| {
+        let mut h = vec![kind, flags];
+        h.extend(reserved.to_le_bytes());
+        h.extend(len.to_le_bytes());
+        h.extend(end.to_le_bytes());
+        h
+    };
+    let pad = || crate::records::pad_header(24, 24).to_vec();
+    let b = || bytes(8, 24);
+    // The tail [24, 96): a BYTES record, then the two given at 48 and at 72.
+    let tail = |at48: Vec<u8>, at72: Vec<u8>| vec![(24, bytes(8, 16)), (48, at48), (72, at72)];
+    // [24, 56), then a RESIZE to the ring's end.
+    let grow = |r| vec![(24, bytes(16, 24)), (56, r)];
+    let fault = |f| Losses {
+        tail_fault: Some(f),
+        ..Losses::default()
+    };
+    let unreplayed = |f, n| Losses {
+        tail_fault: Some(f),
+        tail_unreplayed: n,
+        ..Losses::default()
+    };
+    let regrid = || Losses {
+        regrids_replayed: 1,
+        ..Losses::default()
+    };
+    let kind9 = || head(9, 0, 0, 8, 24);
+    use TailFault::{BadLength, BadPad, Misplaced, PastCommit, StreamBackwards, UnknownKind};
+    let (max_rows, max_cols) = (MAX_GRID_ROWS, MAX_GRID_COLS);
+    // A name, the floor and commit words, the records at their tail positions, and what
+    // the restore counts and replays.
+    type Row = (&'static str, u64, u64, Vec<(u64, Vec<u8>)>, Losses, u64);
+    #[rustfmt::skip]
+    let rows: Vec<Row> = vec![
+        ("whole", 24, 96, tail(b(), pad()), Losses::default(), 2),
+        ("a PAD short of the ring's end", 24, 96, tail(b(), head(KIND_PAD, 0, 0, 0, 24)), fault(BadPad), 2),
+        ("a PAD with flags", 24, 96, tail(b(), head(KIND_PAD, 1, 0, 8, 24)), fault(BadPad), 2),
+        ("a PAD with reserved bits", 24, 96, tail(b(), head(KIND_PAD, 0, 1, 8, 24)), fault(BadPad), 2),
+        ("a PAD past the ring's end", 24, 96, tail(b(), head(KIND_PAD, 0, 0, 16, 24)), fault(BadPad), 2),
+        ("a PAD past the commit", 24, 88, tail(b(), pad()), fault(PastCommit), 2),
+        ("a header past the commit", 24, 80, tail(b(), head(9, 0, 0, 100, 24)), fault(PastCommit), 2),
+        ("a record past the ring's end", 24, 104, tail(b(), head(1, 0, 0, 16, 32)), fault(BadLength), 2),
+        ("a record past the commit", 24, 88, tail(b(), bytes(8, 32)), fault(PastCommit), 2),
+        ("a gap under a header past the commit", 24, 92,
+            vec![(24, bytes(8, 16)), (48, bytes(24, 24))], fault(PastCommit), 2),
+        ("a gap under a header up to the commit", 24, 96,
+            vec![(24, bytes(16, 16)), (56, bytes(16, 24))], Losses::default(), 2),
+        ("an unknown kind", 24, 96, tail(kind9(), pad()), unreplayed(UnknownKind(9), 8), 1),
+        ("a stream that goes back", 24, 96, tail(bytes(8, 12), pad()), unreplayed(StreamBackwards, 8), 1),
+        ("a stream behind the keyframe's", 24, 96,
+            vec![(24, bytes(8, 4)), (48, b()), (72, pad())], unreplayed(StreamBackwards, 16), 0),
+        ("a record across tail_from", 0, 56,
+            vec![(0, bytes(16, 8)), (32, kind9())], unreplayed(Misplaced, 16), 0),
+        ("tail_from inside the last record", 0, 32, vec![(0, bytes(16, 8))], unreplayed(Misplaced, 16), 0),
+        ("tail_from past the commit", 0, 16, vec![(0, head(9, 0, 0, 0, 8))], unreplayed(Misplaced, 16), 0),
+        ("a window wider than the ring", 0, 104, tail(b(), pad()), unreplayed(PastCommit, 16), 0),
+        ("a floor a whole ring past the commit", 120, 24, vec![],
+            Losses { tail_overflow: true, tail_unreplayed: 16, ..Losses::default() }, 0),
+        ("a floor more than a ring past the commit", 128, 24, vec![], unreplayed(PastCommit, 16), 0),
+        ("a floor past tail_from, walked to the commit", 48, 96, tail(b(), pad()),
+            Losses { tail_overflow: true, tail_unreplayed: 16, ..Losses::default() }, 0),
+        ("a record ahead of the stream word, read before a fault", 48, 96, tail(bytes(8, 32), kind9()),
+            Losses { tail_overflow: true, tail_fault: Some(UnknownKind(9)), tail_unreplayed: 24, ..Losses::default() }, 0),
+        ("a record before tail_from behind the keyframe", 0, 24, vec![(0, bytes(8, 4))],
+            Losses { in_flight_lost: 16, ..Losses::default() }, 0),
+        ("a resize to no rows", 24, 96, grow(resize(0, 30)), fault(BadLength), 1),
+        ("a resize to no columns", 24, 96, grow(resize(4, 0)), fault(BadLength), 1),
+        ("a resize past the most rows", 24, 96, grow(resize(max_rows + 1, 30)), fault(BadLength), 1),
+        ("a resize past the most columns", 24, 96, grow(resize(4, max_cols + 1)), fault(BadLength), 1),
+        ("a resize to the most rows", 24, 96, grow(resize(max_rows, 30)), regrid(), 2),
+        ("a resize to the most columns", 24, 96, grow(resize(4, max_cols)), regrid(), 2),
+        ("a resize to the same size", 24, 96, grow(resize(4, 30)), Losses::default(), 2),
+    ];
+    for (name, floor, commit, records, losses, replayed) in rows {
+        let dead = live.writer.store().snapshot();
+        for (pos, record) in &records {
+            let at = geometry.tail_off + usize::try_from(*pos).expect("in the ring");
+            dead.write(at, record).expect("inside the region");
+        }
+        for (word, value) in [
+            (OFF_TAIL_FLOOR, floor),
+            (OFF_TAIL_COMMIT, commit),
+            (OFF_STREAM_PROCESSED, 24),
+            (OFF_STREAM_GATHERED, 24),
+        ] {
+            dead.store_u64_release(word, value).expect("a header word");
+        }
+        let r = restored(recover(
+            &dead,
+            RecoverPolicy {
+                tail: true,
+                config_fp: CONFIG,
+                scratch_nonce: [0xA5; 32],
+            },
+            Terminal::new,
+        ));
+        assert_eq!((r.losses, r.replayed_records), (losses, replayed), "{name}");
+    }
+}
+
 /// Header words are absolute counters, not wrapping ring offsets. Both the skipped
 /// tail gap and history wrap must refuse an unrepresentable next boundary.
 #[test]
@@ -918,28 +1166,37 @@ fn absolute_ring_counters_refuse_wraparound_without_reading_it() {
     let live = Live::new(4, 24, geometry);
     assert!(restored(live.recover(true)).exact, "ordinary zero counters");
     let mut outcomes = Vec::new();
-    for (remaining, pad) in [(7, false), (15, false), (31, false), (31, true)] {
+    let mut whole = Vec::new();
+    TailRecord::Bytes {
+        synthesized: false,
+        bytes: &[0; 16],
+    }
+    .encode(0, &mut whole);
+    // A header in the last 16 bytes below the top claiming more than its room: its own
+    // end overflows first, whatever it claims.
+    let claims_more = TailRecord::Bytes {
+        synthesized: false,
+        bytes: &[0; 100],
+    }
+    .header(0)
+    .to_vec();
+    let pad = crate::records::pad_header(32, 0).to_vec();
+    for (remaining, record) in [
+        (7, vec![]),
+        (15, vec![]),
+        (15, claims_more),
+        (31, whole),
+        (31, pad),
+    ] {
         let dead = live.writer.store().snapshot();
         let floor = u64::MAX - remaining;
         dead.store_u64_release(OFF_TAIL_FLOOR, floor)
             .expect("floor");
         dead.store_u64_release(OFF_TAIL_COMMIT, u64::MAX)
             .expect("commit");
-        if remaining == 31 {
-            let mut record = Vec::new();
-            if pad {
-                record.extend_from_slice(&crate::records::pad_header(32, 0));
-            } else {
-                TailRecord::Bytes {
-                    synthesized: false,
-                    bytes: &[0; 16],
-                }
-                .encode(0, &mut record);
-            }
-            let off = usize::try_from(floor % geometry.tail_cap as u64).expect("offset");
-            dead.write(geometry.tail_off + off, &record)
-                .expect("bounded record");
-        }
+        let off = usize::try_from(floor % geometry.tail_cap as u64).expect("offset");
+        dead.write(geometry.tail_off + off, &record)
+            .expect("bounded record");
         let result = std::panic::catch_unwind(|| {
             recover(
                 &dead,
@@ -994,7 +1251,7 @@ fn absolute_ring_counters_refuse_wraparound_without_reading_it() {
         result.is_ok_and(|r| r.fault == Some(RingFault::Words))
             && fenced.reads.load(std::sync::atomic::Ordering::Relaxed) == 0,
     );
-    assert_eq!(outcomes, vec![true; 5]);
+    assert_eq!(outcomes, vec![true; 6]);
 }
 
 /// An early damaged record may salvage a validated prefix, never an unchecked
@@ -1085,6 +1342,73 @@ fn every_salvaged_history_prefix_is_valid_before_admission() {
         ),
         (1, true, true, true, true)
     );
+
+    // Runs whose words or bytes are damaged (the ring's modulus is 2048): chunks placed
+    // at ring offsets, then the run's words; what the read kept, and the kind of fault
+    // that ended it. A run that wraps reads from `wrap_at` to the ring's end over a zero
+    // gap, then from the ring's start.
+    let ring_of = |parts: &[(usize, &[u8])], words: &[(usize, u64)]| {
+        let dead = live.writer.store().snapshot();
+        for (at, bytes) in parts {
+            dead.write(geometry.hist_off + at, bytes)
+                .expect("in the ring");
+        }
+        for (word, value) in [
+            (OFF_HIST_LO, 0),
+            (OFF_HIST_LO_SEQ, 0),
+            (OFF_HIST_END_ROW, 2),
+        ]
+        .iter()
+        .chain(words)
+        {
+            dead.store_u64_release(*word, *value).expect("header");
+        }
+        let r = read_ring(&dead, &geometry);
+        (r.lines(), r.fault.as_ref().map(std::mem::discriminant))
+    };
+    let first = encode_history_chunk(0, 0, identity, &line).expect("first");
+    let next = encode_history_chunk(1, 1, identity, &line).expect("next");
+    let stale = encode_history_chunk(0, 1, identity, &line).expect("a step behind");
+    let late = encode_history_chunk(5, 0, identity, &line).expect("a step ahead");
+    let one = encode_history_chunk(1, 0, identity, &line).expect("the run's first, step 1");
+    let (both, after) = (first.len() + next.len(), first.len());
+    let wrap_at = 2048 - 256;
+    let wrapped = [
+        (OFF_HIST_LO, wrap_at as u64),
+        (OFF_HIST_HI, (2048 + next.len()) as u64),
+    ];
+    let chunk = Some(std::mem::discriminant(&RingFault::Chunk(StepEnd::Clean)));
+    let words = Some(std::mem::discriminant(&RingFault::Words));
+    let wide = u64::from(identity.cols) | 1 << 16;
+    type Row<'a> = (
+        &'static str,
+        Vec<(usize, &'a [u8])>,
+        Vec<(usize, u64)>,
+        (u64, Option<Fault>),
+    );
+    type Fault = std::mem::Discriminant<RingFault>;
+    #[rustfmt::skip]
+    let rows: [Row<'_>; 8] = [
+        ("a run longer than the ring", vec![(0, &first[..]), (after, &next[..])],
+            vec![(OFF_HIST_HI, 2048 + 8)], (0, words)),
+        ("a width past a column count", vec![(0, &first[..]), (after, &next[..])],
+            vec![(OFF_HIST_HI, both as u64), (OFF_HIST_IDENTITY + 24, wide)], (0, words)),
+        ("a first step above the run's", vec![(0, &late[..])],
+            vec![(OFF_HIST_HI, late.len() as u64)], (0, chunk)),
+        ("a step behind the run's after its first", vec![(0, &one[..]), (one.len(), &stale[..])],
+            vec![(OFF_HIST_LO_SEQ, 1), (OFF_HIST_HI, (one.len() + stale.len()) as u64)], (1, chunk)),
+        ("a run across the ring's end", vec![(wrap_at, &first[..]), (0, &next[..])],
+            wrapped.to_vec(), (2, None)),
+        ("a step behind past the ring's end", vec![(wrap_at, &first[..]), (0, &stale[..])],
+            wrapped.to_vec(), (1, chunk)),
+        ("a gap that is not zero", vec![(wrap_at, &first[..]), (2047, &[0x5A][..]), (0, &next[..])],
+            wrapped.to_vec(), (1, chunk)),
+        ("a commit word on zeros at the ring's end", vec![(0, &first[..]), (after, &next[..])],
+            vec![(OFF_HIST_HI, 2048)], (2, chunk)),
+    ];
+    for (name, parts, words, want) in rows {
+        assert_eq!(ring_of(&parts, &words), want, "{name}");
+    }
 }
 
 /// A verified mark's slice is counted before its append, so a writer that dies after the
@@ -1480,6 +1804,16 @@ fn the_join_never_reaches_below_the_head_s_oldest_row() {
     );
     assert_eq!(export.first, facts.head.oldest);
     assert_eq!(export.skip, facts.head.oldest - exported.oldest);
+    // A ring the engine evicted past entirely (no export since): nothing to join.
+    for i in 180..300 {
+        live.slice(format!("line {i}\r\n").as_bytes());
+    }
+    live.keyframe(40);
+    let r = restored(live.recover(true));
+    let facts = r.join_facts().expect("held");
+    assert!(r.ring.end_row < facts.head.oldest, "premise: all evicted");
+    let export = facts.export.expect("a ring");
+    assert_eq!((export.first, export.lines), (facts.head.oldest, 0));
 }
 
 /// A ring far older than the engine (it kept exporting while the engine's line limit
@@ -1557,6 +1891,11 @@ fn an_import_decodes_only_the_chunks_it_takes_within_the_newest_bound() {
         live_lines(export.first, take),
         "the live history below the carried lines"
     );
+    assert_eq!(r.ring_chunks_for(&export, 0), (0..0, 0), "nothing to take");
+    // A take that ends on a chunk's last line decodes no chunk past it.
+    let (range, skip) = r.ring_chunks_for(&export, 1);
+    let to_end = u64::from(r.ring.chunks[range.start].n_lines) - skip;
+    assert_eq!(r.ring_chunks_for(&export, to_end), (range, skip));
 
     // The newest 80 lines: 40 of the ring's below the 40 the checkpoint carries.
     let newest = export.newest(80);

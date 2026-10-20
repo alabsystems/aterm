@@ -146,7 +146,7 @@ fn wait_readable(path: &str) -> io::Result<()> {
     }
     const POLLIN: c_short = 0x1;
     // `nfds_t`: `unsigned long` in glibc and musl, `unsigned int` on Darwin,
-    // the BSDs and Android's bionic (as `hangup::fd_peer_closed` declares it).
+    // the BSDs and Android's bionic (as `hangup::poll_now` declares it).
     #[cfg(target_os = "linux")]
     type Nfds = core::ffi::c_ulong;
     #[cfg(not(target_os = "linux"))]

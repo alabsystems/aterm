@@ -25,6 +25,7 @@
 use aterm_render::{GlowQuad, HaloMode, RainHalo, add_sat, halo_row_ny, halo_weight, premul_rgb};
 use aterm_time::Instant;
 
+use super::ribbon::paper_mark_ink;
 use super::timing::{
     CHROMA_CULL_ALPHA, EDGE_IN_S, FIELD_STAR_COV_CEIL, GLINT_CAP, GLINT_REFILL_PER_S,
     KILL_RETRACT_BASE_MS, REDUCED_MOTION_FADE_MS, STAR_CULL_ALPHA, STAR_STACK_ADD,
@@ -2500,7 +2501,7 @@ impl Stardust {
                 if ctx.cfg.dark_theme {
                     paint.draw_add(ctx, frame, star_cap, &mut haloed, &mut index);
                 } else {
-                    paint.draw_over(ctx.geom, frame, halo_cap);
+                    paint.draw_over(ctx.geom, ctx.cfg, frame, halo_cap);
                 }
             }
         }
@@ -3759,7 +3760,7 @@ impl Stardust {
             } else {
                 let a = u32::from(byte).clamp(1, InkRole::OverText.alpha_cap() as u32);
                 (
-                    (InkRole::OverText.ink(rgb) & 0x00FF_FFFF) | (a << 24),
+                    paper_mark_ink(rgb, ctx.cfg.theme_bg) | (a << 24),
                     HaloMode::Over,
                 )
             };
@@ -4150,7 +4151,7 @@ impl Paint {
     /// paper-white a mark's ink area is its luminance, so a body sized from
     /// the clocked arm flickers the whole star at 16–24 Hz: the grain's dot
     /// went 3 ↔ 5 px in radius at the 15×28 cell, 2.9× its ink.
-    fn draw_over(&self, geom: Geom, frame: &mut Frame<'_>, halo_cap: usize) {
+    fn draw_over(&self, geom: Geom, cfg: &Config, frame: &mut Frame<'_>, halo_cap: usize) {
         if frame.halos.len() >= halo_cap {
             return;
         }
@@ -4158,9 +4159,10 @@ impl Paint {
         let step = (self.arm - self.arm_lo).max(0);
         match self.class {
             StarClass::M3 => {
+                let rgb = star_ink_on_paper(self.tint, cfg);
                 let ink = |cov: u8, cap: f32| {
                     let a = stacked_ink_alpha(cov, InkRole::OverText).min(cap as u32);
-                    (InkRole::OverText.ink(self.tint) & 0x00FF_FFFF) | (a << 24)
+                    rgb | (a << 24)
                 };
                 let r = (mass.round() as i32).max(1);
                 push_halo_quads(
@@ -4205,7 +4207,7 @@ impl Paint {
                         centre: (self.x, self.y),
                         mass,
                         step,
-                        rgb: self.tint,
+                        rgb: star_ink_on_paper(self.tint, cfg),
                         gold: self.glints,
                         cov: cov_byte(self.c * self.core),
                     },
@@ -5269,8 +5271,8 @@ struct LightStar {
     /// The arm clock's integer step above its trough (§5.5): only the tip
     /// lays take it.
     step: i32,
-    /// The star's tint — the ink roles derive their deep and over-text inks
-    /// from it.
+    /// The star's ink on the page ([`star_ink_on_paper`]); the ink roles
+    /// price its alpha.
     rgb: u32,
     /// Whether to lay the four diagonal glint dots (gold, at twinkle peak).
     gold: bool,
@@ -5278,11 +5280,24 @@ struct LightStar {
     cov: u8,
 }
 
+/// A star's ink on a light page (§3.3, C1): a stop's or gold's point-mark ink
+/// ([`paper_mark_ink`]), and for the white tint, which names no stop, the
+/// theme's INK, as white is on a dark ground.
+fn star_ink_on_paper(tint: u32, cfg: &Config) -> u32 {
+    let (r, g, b) = ((tint >> 16) & 0xff, (tint >> 8) & 0xff, tint & 0xff);
+    if r == g && g == b {
+        cfg.theme_fg & 0x00FF_FFFF
+    } else {
+        paper_mark_ink(tint, cfg.theme_bg)
+    }
+}
+
 /// The light-theme star (§3.3, §5.2): a horizontal and a vertical arm (each a
 /// full-length tip lay and a shorter body lay) on a round nucleus, plus four
-/// diagonal glint dots when gold, all source-over falloff ellipses. The
-/// nucleus is in the tint's deep ink (`InkRole::Leading`), the arms in
-/// over-text ink (`InkRole::OverText`, 190) since they can cross a letterform.
+/// diagonal glint dots when gold, all source-over falloff ellipses in the
+/// star's ink on the page. The nucleus takes the deep alpha ceiling
+/// (`InkRole::Leading`), the arms the over-text one (`InkRole::OverText`, 190)
+/// since they can cross a letterform.
 /// The per-lay alpha solves for the three-lay centre stack, so the crossing
 /// matches the family's plus. Everything but the tip lays' reach is sized
 /// from `mass`, so the size clock moves only the points.
@@ -5302,7 +5317,7 @@ fn push_twinkle_over_twin(halos: &mut Vec<RainHalo>, geom: Geom, cap: usize, sta
         let cap_a = u32::from(cov).clamp(1, role.alpha_cap() as u32);
         let a = cap_a as f32 / 255.0;
         let lay = (1.0 - (1.0 - a).powf(STAR_OVER_CENTRE_LAYS / STAR_OVER_LAYS as f32)) * 255.0;
-        (role.ink(rgb) & 0x00FF_FFFF) | ((lay.round() as u32).clamp(1, cap_a) << 24)
+        (rgb & 0x00FF_FFFF) | ((lay.round() as u32).clamp(1, cap_a) << 24)
     };
     let core_ink = lay_of(InkRole::Leading);
     let arm_ink = lay_of(InkRole::OverText);
@@ -5363,7 +5378,7 @@ fn push_twinkle_over_twin(halos: &mut Vec<RainHalo>, geom: Geom, cap: usize, sta
         let d = px(mass * STAR_GLINT);
         let gcap = ((f32::from(cov) * STAR_GLINT_COV) as u32)
             .clamp(1, InkRole::OverText.alpha_cap() as u32);
-        let glint = (InkRole::OverText.ink(rgb) & 0x00FF_FFFF) | (gcap << 24);
+        let glint = (rgb & 0x00FF_FFFF) | (gcap << 24);
         for (ox, oy) in [(-d, -d), (d, -d), (-d, d), (d, d)] {
             push_halo_quads(
                 halos,
@@ -5427,8 +5442,9 @@ mod tests {
             duration: Duration::from_millis(900),
             ribbon_tall: true,
             ribbon_flat: false,
-            theme_fg: 0x00FF_FFFF,
-            theme_bg: 0x0000_0000,
+            // A light config is ink on paper: its stars are solved against it.
+            theme_fg: if dark { 0x00FF_FFFF } else { 0x0016_161C },
+            theme_bg: if dark { 0x0000_0000 } else { 0x00FF_FFFF },
             reduced_motion: false,
         }
     }

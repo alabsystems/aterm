@@ -10,7 +10,7 @@
 use crate::support::{Token, assert_ser_tokens, assert_ser_tokens_error};
 use serde_derive::Serialize;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 //////////////////////////////////////////////////////////////////////////
 
@@ -334,6 +334,7 @@ fn test_path_buf() {
 fn test_cannot_serialize_paths() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
 
     assert_ser_tokens_error(
         &Path::new(OsStr::from_bytes(b"Hello \xF0\x90\x80World")),

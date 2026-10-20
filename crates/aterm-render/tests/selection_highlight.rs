@@ -182,7 +182,13 @@ fn selected_sparse_tail_paints_implicit_blanks_and_covers_deepest_image() {
 
 #[test]
 fn multiline_selection_clip_blocks_sibling_and_divider_backgrounds() {
-    let mut rend = renderer();
+    let mut rend = Renderer::from_bytes(
+        include_bytes!("../assets/bundled/JetBrainsMono-Regular.ttf"),
+        18.0,
+        Theme::default(),
+    )
+    .expect("the committed mono face");
+    let _ = rend.set_runtime_font_discovery(false);
     let (cw, ch) = rend.cell_size();
     let (rows, cols) = (3usize, 9usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -213,6 +219,114 @@ fn multiline_selection_clip_blocks_sibling_and_divider_backgrounds() {
             "sibling/divider cell ({row},{col}) must not receive selection tint"
         );
         assert_eq!(count_eq(&pixels, input.selection_bg), 0);
+    }
+
+    // A card can cover a selected wide lead but leave its continuation just
+    // outside its right edge. The host keeps that selected half and clips
+    // the selection to it. The logical row span is then empty; the actual
+    // cell predicate and the pixels must still keep the continuation.
+    let mut term = Terminal::new(1, 6);
+    term.process("日 ".as_bytes());
+    let selection = term.text_selection_mut();
+    selection.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+    selection.update_selection(0, 0, SelectionSide::Right);
+    selection.complete_selection();
+    let mut wide = term.cell_frame(1, 6);
+    wide.cursor_visible = false;
+    wide.selection_bg = 0x0021_4365;
+    // The card overwrites its lead cell; blank ink keeps this fill test
+    // independent of CJK font routing. The continuation remains materialized.
+    wide.cells[0][0].ch = ' ';
+    assert!(wide.cells[0][1].wide);
+    for (clip, lead, continuation) in [
+        (Some(SelectionClip::new(0, 1, 1, 6)), false, true),
+        (None, true, true),
+        (Some(SelectionClip::new(0, 1, 0, 1)), true, false),
+    ] {
+        wide.selection_clip = clip;
+        assert_eq!(wide.selection_hit(0, 0, true, false).is_some(), lead);
+        assert_eq!(
+            wide.selection_hit(0, 1, false, true).is_some(),
+            continuation
+        );
+        if !lead {
+            assert_eq!(wide.selection_row_span(0), None, "the sparse-tail window");
+        }
+        let frame = rend.render_input(&wide);
+        for (col, selected) in [(0, lead), (1, continuation)] {
+            let pixels = cell_pixels(&frame, cw, ch, 0, col);
+            assert_eq!(
+                count_eq(&pixels, wide.selection_bg),
+                if selected { pixels.len() } else { 0 },
+                "clipped wide half at column {col}: {clip:?}"
+            );
+        }
+    }
+    // The same edge on the shipping persistent-cache path: both logical keys
+    // are empty, but a colour change and then a clip that removes the half
+    // must repaint it, byte-identically to a fresh full draw.
+    let mut cache = aterm_render::WindowCpu::new();
+    let cached = |renderer: &mut Renderer,
+                  cache: &mut aterm_render::WindowCpu,
+                  input: &aterm_render::RenderInput| {
+        let view = renderer.render_input_cached(cache, input);
+        Frame {
+            width: view.width(),
+            height: view.height(),
+            pixels: view.pixels().to_vec(),
+        }
+    };
+    wide.selection_clip = Some(SelectionClip::new(0, 1, 1, 6));
+    let first = cached(&mut rend, &mut cache, &wide);
+    let pixels = cell_pixels(&first, cw, ch, 0, 1);
+    assert_eq!(count_eq(&pixels, wide.selection_bg), pixels.len());
+    wide.selection_bg = 0x0065_4321;
+    let recoloured = cached(&mut rend, &mut cache, &wide);
+    let pixels = cell_pixels(&recoloured, cw, ch, 0, 1);
+    assert_eq!(count_eq(&pixels, wide.selection_bg), pixels.len());
+    assert_eq!(recoloured.pixels, rend.render_input(&wide).pixels);
+    wide.selection_clip = Some(SelectionClip::new(0, 1, 2, 6));
+    assert_eq!(wide.selection_row_span(0), None);
+    let cleared = cached(&mut rend, &mut cache, &wide);
+    assert_eq!(
+        count_eq(&cell_pixels(&cleared, cw, ch, 0, 1), wide.selection_bg),
+        0
+    );
+    assert_eq!(cleared.pixels, rend.render_input(&wide).pixels);
+
+    // BiDi moves the wide pair as a unit from logical 0/1 to painted 2/3.
+    // A painted clip beginning at 3 is farther than one column from the
+    // selected logical lead, so widening that logical window by one is not
+    // enough. Its continuation-only -> empty transition still repaints.
+    wide.cells[0].resize(6, term.implicit_blank_render_cell());
+    wide.cells[0].swap(0, 2);
+    wide.cells[0].swap(1, 3);
+    wide.visual_to_logical = vec![vec![2, 3, 0, 1, 4, 5]];
+    wide.selection_clip = Some(SelectionClip::new(0, 1, 3, 6));
+    assert_eq!(wide.selection_row_span(0), None);
+    assert_eq!(wide.selection_hit(0, 3, false, true), Some(0));
+    let moved = cached(&mut rend, &mut cache, &wide);
+    let pixels = cell_pixels(&moved, cw, ch, 0, 3);
+    assert_eq!(count_eq(&pixels, wide.selection_bg), pixels.len());
+    wide.selection_clip = Some(SelectionClip::new(0, 1, 4, 6));
+    let moved_clear = cached(&mut rend, &mut cache, &wide);
+    assert_eq!(
+        count_eq(&cell_pixels(&moved_clear, cw, ch, 0, 3), wide.selection_bg),
+        0
+    );
+    assert_eq!(moved_clear.pixels, rend.render_input(&wide).pixels);
+
+    // No selection still takes the fast path and paints neither half.
+    // Remove the prior empty clip first, or this control would be vacuous.
+    wide.selection_clip = None;
+    assert_eq!(wide.selection_hit(0, 2, true, false), Some(0));
+    wide.selection.clear();
+    let frame = rend.render_input(&wide);
+    for col in 2..=3 {
+        assert_eq!(
+            count_eq(&cell_pixels(&frame, cw, ch, 0, col), wide.selection_bg),
+            0
+        );
     }
 }
 

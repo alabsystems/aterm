@@ -397,8 +397,10 @@ fn a_tty_that_will_not_echo_is_never_predicted() {
         // SAFETY: both fds are ours and open; the borrowed-fd sink did not
         // close the master.
         unsafe {
-            libc::close(slave);
+            // The master first: a slave closed over output its master never read
+            // waits out the tty's drain (0.6 s on macOS).
             libc::close(master);
+            libc::close(slave);
         }
     }
 
@@ -425,8 +427,10 @@ fn a_tty_that_will_not_echo_is_never_predicted() {
     drop(sink);
     // SAFETY: as above.
     unsafe {
-        libc::close(slave);
+        // The master first: a slave closed over output its master never read
+        // waits out the tty's drain (0.6 s on macOS).
         libc::close(master);
+        libc::close(slave);
     }
 }
 

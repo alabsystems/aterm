@@ -304,6 +304,23 @@ impl Rig {
         self.restored()
     }
 
+    /// The session log's `modes` marks (phase 3B), written in the same
+    /// timeline hold as each `modes-restored` event.
+    fn modes_marks(&self) -> Vec<String> {
+        let g = self
+            .session
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        g.slog()
+            .log()
+            .window()
+            .filter(|r| r.k == aterm_slog::Kind::Modes)
+            .filter_map(|r| aterm_slog::encode(r, aterm_slog::Tier::Content).ok())
+            .collect()
+    }
+
     /// Every `modes-restored` payload the reader recorded.
     fn restored(&self) -> Vec<String> {
         self.session
@@ -560,6 +577,14 @@ fn foreground_handback_the_incident_is_handed_back_at_the_cut() {
     assert!(
         reverted.iter().any(|r| r.starts_with("kitty")),
         "{reverted:?}"
+    );
+    // The session log's `modes` mark, from the reader's same hold (phase 3B).
+    let marks = rig.modes_marks();
+    assert_eq!(marks.len(), 1, "{marks:?}");
+    assert!(
+        marks[0].contains(&format!(" mark - modes n={} ", reverted.len()))
+            && marks[0].contains(" src=engine conf=exact "),
+        "{marks:?}"
     );
 }
 
@@ -1746,6 +1771,15 @@ fn manual_reset_hands_back_what_the_shell_armed_and_the_handback_never_will() {
         )),
         "{events:?}"
     );
+    // The session log's `modes` mark: the verb's, so nobody's by name (the
+    // menu's reads `by=human`).
+    let marks = rig.modes_marks();
+    assert_eq!(marks.len(), 1, "{marks:?}");
+    assert!(
+        marks[0].contains(&format!(" mark - modes n={} ", reverted.split(',').count()))
+            && !marks[0].contains(" by="),
+        "{marks:?}"
+    );
     // The `bytes` tap got the synthesized bytes: they ride the stream.
     let mut tapped = Vec::new();
     wait_for("the reset's bytes on the tap", || {
@@ -1801,27 +1835,6 @@ fn manual_reset_hands_back_what_the_shell_armed_and_the_handback_never_will() {
 // not.
 
 const OWNERSHIP_PROJECTED: [&str; 4] = ["life", "n", "bit", "backs"];
-
-// The machine's other four actions carry `#[refines]` anchors on the shipping
-// code: `Arm` and `ShellArm` on `FgOwners::observe` (whose slice holder decides
-// which), `Reclaim` on `FgOwners::orphaned_by`, `Sample` on `FgCutter::sample`.
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback_ownership",
-    action = "Launch",
-    reason = "The shell's `tcsetpgrp` giving a job the terminal: an environment step. The \
-              Tier-1 rows move the scripted foreground probe exactly there."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback_ownership",
-    action = "Die",
-    reason = "A process's death: an environment step. The Tier-1 rows add the job to the \
-              scripted liveness probe's dead set exactly there."
-)]
-#[expect(
-    dead_code,
-    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it"
-)]
-fn ownership_scope_waivers() {}
 
 /// The real reader's ownership projection once `backs` events are recorded
 /// (the reader records an event just after it releases the term lock), or

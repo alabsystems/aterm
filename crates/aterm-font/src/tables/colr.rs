@@ -1766,6 +1766,8 @@ impl RecursionStack {
 
     #[inline]
     pub fn push(&mut self, offset: usize) -> Result<(), ()> {
+        #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
+        crate::work::note(|s| s.paint_tables += 1);
         if self.visits >= MAX_PAINT_VISITS {
             return Err(());
         }

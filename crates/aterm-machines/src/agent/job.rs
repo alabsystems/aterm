@@ -643,7 +643,11 @@ fn upgrade(
     m.executable = Path::new("agent").join(&rel).to_string_lossy().into_owned();
     m.upgraded = sys.now();
     state::save_managed(sys, layout, &m)?;
-    let mut r = row("agent.upgrade", "agent", "the agent".into());
+    let mut r = row(
+        "agent.upgrade",
+        "agent",
+        "aterm's helper on this Mac, switched to the controller's build".into(),
+    );
     // Two builds of one version differ only by their executables' hashes.
     let build = |version: &str, digest: &str| match digest.get(..12) {
         Some(short) => format!("{version} ({short})"),

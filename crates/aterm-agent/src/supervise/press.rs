@@ -33,6 +33,7 @@
 //! ([`Pressing::Refused`], `busy sink` among them) back it off; in both the
 //! box is read and decided again after, never pressed again as it was.
 
+use super::super::policy::KeyAct;
 use super::super::policy::approval::{
     Answer, AnswerTarget, DeclineStep, QuestionPriority, decline_step,
 };
@@ -123,7 +124,7 @@ fn keystroke_name(step: &DeclineStep) -> &'static str {
 fn person_quiet(human: HumanInput, grace: Duration) -> bool {
     match human {
         HumanInput::Ago(ms) => u128::from(ms) >= grace.as_millis(),
-        HumanInput::Never | HumanInput::Unknown => true,
+        HumanInput::Never | HumanInput::NeverFor(_) | HumanInput::Unknown => true,
     }
 }
 
@@ -384,7 +385,7 @@ impl<C: Ctl> Session<'_, C> {
             );
         }
         let guard = super::super::policy::row_guard(&now.rows[row]);
-        let at = match self.question_key(&guard, "enter", &now)? {
+        let at = match self.question_key(&guard, "enter", &now, Some(KeyAct::Answer))? {
             Keyed::Written(at) => at,
             Keyed::Not(p) => return Ok(p),
         };
@@ -499,7 +500,7 @@ impl<C: Ctl> Session<'_, C> {
                 return unconfirmed("the dialog shows no focus to move");
             };
             let guard = super::super::policy::row_guard(&now.rows[row]);
-            let at = match self.question_key(&guard, arrow, &now)? {
+            let at = match self.question_key(&guard, arrow, &now, None)? {
                 Keyed::Written(at) => at,
                 Keyed::Not(p) => return Ok(Moved::Stopped(p)),
             };
@@ -729,7 +730,13 @@ impl<C: Ctl> Session<'_, C> {
     /// with no count sends the key with no person fence, so the recommended
     /// option of a dialog a text word fell back on stays answerable on such a
     /// host (the policy text is refused there instead, [`Self::question_text`]).
-    fn question_key(&mut self, guard: &str, key: &str, now: &Screen) -> Result<Keyed, Fail> {
+    fn question_key(
+        &mut self,
+        guard: &str,
+        key: &str,
+        now: &Screen,
+        act: Option<KeyAct>,
+    ) -> Result<Keyed, Fail> {
         debug_assert!(
             matches!(key, "up" | "down" | "enter"),
             "a question is keyed with arrows and Enter only, never {key:?}"
@@ -745,6 +752,7 @@ impl<C: Ctl> Session<'_, C> {
             Some(n) => format!("if-human={n} {args}"),
             None => args,
         };
+        let args = self.acting(act, args);
         let mut words: Vec<&str> = vec!["key"];
         words.extend(args.split(' '));
         let r = self.call(&words)?;
@@ -883,7 +891,9 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Whether the server fences a press on the screen generation: `help
-    /// key` asked once (and again after an outage forgot the caps).
+    /// key` asked once (and again after an outage forgot the caps). The same
+    /// reply says whether `key` takes `act=` ([`Caps::act_word`]): no request
+    /// of its own.
     pub(super) fn gen_fence_known(&mut self) -> Result<bool, Fail> {
         if let Some(known) = self.caps.gen_fence {
             return Ok(known);
@@ -894,7 +904,26 @@ impl<C: Ctl> Session<'_, C> {
         }
         let known = r.ok() && super::super::policy::server_fences_gen(&r.stdout);
         self.caps.gen_fence = Some(known);
+        self.caps.act_word = Some(r.ok() && super::super::policy::server_takes_act(&r.stdout));
         Ok(known)
+    }
+
+    /// The leading `act=<word>` a dismissing key carries (session log phase
+    /// 5, ruling T1), only where the `help key` reply named it
+    /// ([`Caps::act_word`]): an older server would refuse it, and a host
+    /// whose reply was never read sends none.
+    fn act_option(&self, act: Option<KeyAct>) -> Option<&'static str> {
+        act.filter(|_| self.caps.act_word == Some(true))
+            .map(KeyAct::option)
+    }
+
+    /// `args` with the dismissing key's `act=` in front, where the host
+    /// takes it ([`Self::act_option`]).
+    fn acting(&self, act: Option<KeyAct>, args: String) -> String {
+        match self.act_option(act) {
+            Some(option) => format!("{option} {args}"),
+            None => args,
+        }
     }
 
     /// One digit choosing an option, bound to the judged read's row,
@@ -910,6 +939,7 @@ impl<C: Ctl> Session<'_, C> {
         guard: &str,
         digit: &str,
         seen: &Screen,
+        act: KeyAct,
     ) -> Result<Pressing, Fail> {
         let cannot = |why: &str| {
             Ok(Pressing::Unconfirmed {
@@ -930,7 +960,8 @@ impl<C: Ctl> Session<'_, C> {
             return cannot("the digit's read carried no screen generation to fence on");
         };
         let person = format!("if-human={person}");
-        let (r, args) = self.fenced_key(guard, digit, generation, Some(&person))?;
+        let (r, args) =
+            self.fenced_key_acting(guard, digit, generation, Some(&person), Some(act))?;
         if r.ok() {
             let seq = r.seq().unwrap_or(seen.seq);
             return Ok(Pressing::Done(if r.skipped_person() {
@@ -971,15 +1002,19 @@ impl<C: Ctl> Session<'_, C> {
     /// (`await seq`, then `await idle`); then, once a fresh read shows the same
     /// dialog (kind, and its folder, subject or wait row) with the focus on
     /// the option labelled `label`, press `key` (Enter, or the autocompact
-    /// offer's `left`/`right`),
+    /// offer's `left`/`right`, or the credits consent's Esc, which saves
+    /// nothing: `credits-decline@v1`),
     /// fenced on that read's generation and guarded on the focused row itself,
     /// `❯` and all. Never without the generation fence
-    /// ([`Pressing::Unconfirmed`]), and never Esc (the trust dialog's cancel exits Claude Code; the
-    /// usage-limit dialog's cancels the wait). A focus that did not land where
+    /// ([`Pressing::Unconfirmed`]), and never another box's Esc (the trust dialog's cancel exits
+    /// Claude Code; the usage-limit dialog's cancels the wait). A focus that did not land where
     /// it was sent, or a dialog that changed under the moves, is
     /// [`Pressing::Unconfirmed`]: the box is the manager's under the safe
     /// rules, and at full power read and tried again
-    /// ([`Session::press_missed`]).
+    /// ([`Session::press_missed`]). The usage-limit dialog's grant row whose
+    /// fresh read no longer reads it as the one reset on offer
+    /// ([`aterm_phase::reset_row`]: another kind's row drawn under it) is
+    /// [`Press::Changed`]: decided again, never entered.
     ///
     /// `person`: the person count of the read the dialog was judged on, for
     /// a press whose EVERY key is fenced on it as well (`key if-human=<n>
@@ -1001,6 +1036,7 @@ impl<C: Ctl> Session<'_, C> {
         guard: &str,
         seen: &Screen,
         person: Option<u64>,
+        act: Option<KeyAct>,
     ) -> Result<Pressing, Fail> {
         self.focus_key_tried = false;
         let fenced = |args: String| match person {
@@ -1088,15 +1124,31 @@ impl<C: Ctl> Session<'_, C> {
             }
             return unconfirmed("the focus did not land on the option it was moved to");
         };
+        // THE GRANT ROW IS ENTERED ONLY WHILE IT IS STILL THE ONE RESET ON
+        // OFFER ([`aterm_phase::reset_row`]), as on the read it was decided
+        // on. Claude Code 2.1.304 draws a row per kind of reset as its offers
+        // come in, while the dialog is up: one drawn under the row as the
+        // arrows moved makes it one of several, and which kind to spend is
+        // then the owner's (SPEC R2). The screen moved past the judged read:
+        // read and decided again, where the reset's rule takes nothing.
+        let grant = |q: &aterm_phase::PromptV2| {
+            aterm_phase::reset_row(q).is_some_and(|row| row.label == label)
+        };
+        if grant(prompt) && !reading.prompt.as_ref().is_some_and(grant) {
+            return Ok(Pressing::Done(Press::Changed { seq: now.seq }));
+        }
         let Some(generation) = now.generation.clone() else {
             return unconfirmed("the read carried no screen generation to fence on");
         };
         let enter_guard = super::super::policy::row_guard(&now.rows[focused.row]);
-        let args = fenced(super::super::policy::key_args(
-            &enter_guard,
-            key,
-            Some(&generation),
-        ));
+        let args = self.acting(
+            act,
+            fenced(super::super::policy::key_args(
+                &enter_guard,
+                key,
+                Some(&generation),
+            )),
+        );
         let mut words: Vec<&str> = vec!["key"];
         words.extend(args.split(' '));
         self.focus_key_tried = true;
@@ -1268,9 +1320,13 @@ impl<C: Ctl> Session<'_, C> {
                 DeclineStep::Amend { guard } => {
                     self.fenced_key(guard, "tab", &generation, person.as_deref())?
                 }
-                DeclineStep::Submit { guard } => {
-                    self.fenced_key(guard, "enter", &generation, person.as_deref())?
-                }
+                DeclineStep::Submit { guard } => self.fenced_key_acting(
+                    guard,
+                    "enter",
+                    &generation,
+                    person.as_deref(),
+                    Some(KeyAct::Deny),
+                )?,
             };
             if let Some(p) = self.refused_press(&r, &sent)? {
                 if !matches!(p, Pressing::Lost { .. }) {
@@ -1467,8 +1523,13 @@ impl<C: Ctl> Session<'_, C> {
                     self.note_keyed(&r, &args, now.seq)?
                 }
                 NoteStep::Enter { guard, .. } => {
-                    let (r, args) =
-                        self.fenced_key(guard, "enter", &generation, Some(person.as_str()))?;
+                    let (r, args) = self.fenced_key_acting(
+                        guard,
+                        "enter",
+                        &generation,
+                        Some(person.as_str()),
+                        Some(KeyAct::Answer),
+                    )?;
                     self.note_keyed(&r, &args, now.seq)?
                 }
             };
@@ -1519,11 +1580,26 @@ impl<C: Ctl> Session<'_, C> {
         generation: &str,
         person: Option<&str>,
     ) -> Result<(CtlReply, String), Fail> {
+        self.fenced_key_acting(guard, key, generation, person, None)
+    }
+
+    /// [`Self::fenced_key`] for a key that dismisses a box, carrying what it
+    /// means (`act=`) where the host takes it ([`Self::act_option`]):
+    /// `key [act=<w>] [if-human=<n>] if-gen=<generation> if=<guard> <key>`.
+    pub(super) fn fenced_key_acting(
+        &mut self,
+        guard: &str,
+        key: &str,
+        generation: &str,
+        person: Option<&str>,
+        act: Option<KeyAct>,
+    ) -> Result<(CtlReply, String), Fail> {
         let args = super::super::policy::key_args(guard, key, Some(generation));
         let args = match person {
             Some(fence) => format!("{fence} {args}"),
             None => args,
         };
+        let args = self.acting(act, args);
         let mut words: Vec<&str> = vec!["key"];
         words.extend(args.split(' '));
         let r = self.call(&words)?;

@@ -244,8 +244,10 @@ fn middle_click_primary_paste_runs_the_same_guard() {
 #[cfg(target_os = "linux")]
 #[test]
 fn shift_insert_pastes_the_primary_selection() {
-    use winit::event::{ElementState, KeyEvent};
-    use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey};
+    use aterm_window::event::{ElementState, KeyEvent};
+    use aterm_window::keyboard::{
+        Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey,
+    };
     let (mut app, rx) = app_with_pty_observer();
     let wid = WindowId(0);
     app.keybindings = crate::keybinding::Keybindings::platform_defaults();

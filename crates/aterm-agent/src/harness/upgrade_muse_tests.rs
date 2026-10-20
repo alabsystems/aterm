@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::harness::host_path::abs;
 
 fn argv(words: &[&str]) -> Vec<String> {
     words.iter().map(|w| (*w).to_string()).collect()
@@ -198,15 +199,16 @@ fn the_exit_table_is_muse_codes_own() {
 
 /// The lines of a session log, its lifecycle records in the shape 1.4.10
 /// writes them (the measured `session-main.jsonl`), the frame and other
-/// records between.
+/// records between. Its workspaces are this host's absolute paths.
 fn log_of(events: &[&str]) -> String {
+    let (proj, other) = (abs("/private/tmp/at.DKNx/proj"), abs("/w/other"));
     let mut out = vec![
         r#"{"retained_frame":"session_permission_transaction","children":[{"record_json":"{\"payload_type\":\"session.started\"}"}]}"#.to_string(),
     ];
     for (i, e) in events.iter().enumerate() {
         let line = match *e {
             "start" => format!(
-                r#"{{"schema_version":1,"sequence":{i},"record_type":"event","payload_type":"runtime.session_start.intake_v3","payload":{{"kind":"session_start_intake_v3","payload":{{"schema_version":3,"session_metadata":{{"workspace_root":"/private/tmp/at.DKNx/proj","provider_id":"meta"}}}}}}}}"#
+                r#"{{"schema_version":1,"sequence":{i},"record_type":"event","payload_type":"runtime.session_start.intake_v3","payload":{{"kind":"session_start_intake_v3","payload":{{"schema_version":3,"session_metadata":{{"workspace_root":"{proj}","provider_id":"meta"}}}}}}}}"#
             ),
             "started" => format!(
                 r#"{{"schema_version":1,"sequence":{i},"record_type":"event","payload_type":"session.started","payload":{{"kind":"session_started","previous_session_stream":null}}}}"#
@@ -218,7 +220,7 @@ fn log_of(events: &[&str]) -> String {
                 r#"{{"schema_version":1,"sequence":{i},"record_type":"event","payload_type":"runtime.session","payload":{{"kind":"x"}}}}"#
             ),
             "moved" => format!(
-                r#"{{"schema_version":1,"sequence":{i},"record_type":"event","payload_type":"runtime.session.metadata","payload":{{"kind":"metadata","record":{{"workspace_root":"/w/other"}}}}}}"#
+                r#"{{"schema_version":1,"sequence":{i},"record_type":"event","payload_type":"runtime.session.metadata","payload":{{"kind":"metadata","record":{{"workspace_root":"{other}"}}}}}}"#
             ),
             reason => format!(
                 r#"{{"schema_version":1,"sequence":{i},"record_type":"event","payload_type":"session.end","payload":{{"kind":"session_end","record":{{"exit_reason":"{reason}","uptime_ms":5}}}}}}"#
@@ -279,12 +281,12 @@ fn the_session_log_tells_a_clean_end_from_a_crash() {
 #[test]
 fn the_workspace_is_the_newest_the_log_names() {
     assert_eq!(
-        log_workspace(&log_of(&["start", "started"])).as_deref(),
-        Some("/private/tmp/at.DKNx/proj")
+        log_workspace(&log_of(&["start", "started"])),
+        Some(abs("/private/tmp/at.DKNx/proj"))
     );
     assert_eq!(
-        log_workspace(&log_of(&["start", "started", "moved"])).as_deref(),
-        Some("/w/other")
+        log_workspace(&log_of(&["start", "started", "moved"])),
+        Some(abs("/w/other"))
     );
     assert_eq!(log_workspace(&log_of(&["started", "turn"])), None);
 }
@@ -334,23 +336,23 @@ fn only_a_session_depth_lock_names_a_session() {
 /// `XDG_DATA_HOME` names none; an empty one is unset.
 #[test]
 fn the_data_home_is_the_processs_own() {
-    let fb = Path::new("/fallback");
+    let (data, h, fb) = (abs("/x/data"), abs("/h"), PathBuf::from(abs("/fallback")));
     assert_eq!(
-        data_home(Some("/x/data"), Some("/h"), fb),
-        Some(PathBuf::from("/x/data"))
+        data_home(Some(&data), Some(&h), &fb),
+        Some(PathBuf::from(&data))
     );
     assert_eq!(
-        data_home(None, Some("/h"), fb),
-        Some(PathBuf::from("/h/.local/share"))
+        data_home(None, Some(&h), &fb),
+        Some(PathBuf::from(abs("/h/.local/share")))
     );
     assert_eq!(
-        data_home(Some(""), None, fb),
-        Some(PathBuf::from("/fallback/.local/share"))
+        data_home(Some(""), None, &fb),
+        Some(PathBuf::from(abs("/fallback/.local/share")))
     );
-    assert_eq!(data_home(Some("rel/data"), Some("/h"), fb), None);
+    assert_eq!(data_home(Some("rel/data"), Some(&h), &fb), None);
     assert_eq!(
-        data_home(None, Some("rel"), fb),
-        Some(PathBuf::from("/fallback/.local/share"))
+        data_home(None, Some("rel"), &fb),
+        Some(PathBuf::from(abs("/fallback/.local/share")))
     );
 }
 
@@ -362,12 +364,13 @@ fn the_data_home_is_the_processs_own() {
 /// carried or read back.
 #[test]
 fn the_relaunch_carries_the_homes_the_process_had() {
-    let user = Path::new("/h");
+    let (h, data, scratch) = (abs("/h"), abs("/h/.local/share"), abs("/scratch/home"));
+    let user = Path::new(&h);
     let env = relaunch_env(
         |name| match name {
-            "XDG_DATA_HOME" => Some("/h/.local/share"),
+            "XDG_DATA_HOME" => Some(data.as_str()),
             "XDG_CONFIG_HOME" => Some(""),
-            "HOME" => Some("/h"),
+            "HOME" => Some(h.as_str()),
             _ => None,
         },
         user,
@@ -375,7 +378,7 @@ fn the_relaunch_carries_the_homes_the_process_had() {
     assert_eq!(
         env,
         vec![
-            ("XDG_DATA_HOME".to_string(), "/h/.local/share".to_string()),
+            ("XDG_DATA_HOME".to_string(), data.clone()),
             ("XDG_CONFIG_HOME".to_string(), String::new()),
         ]
     );
@@ -383,23 +386,21 @@ fn the_relaunch_carries_the_homes_the_process_had() {
     // Another HOME, and no XDG variable: its HOME is what names its data.
     let other = relaunch_env(
         |name| match name {
-            "HOME" => Some("/scratch/home"),
+            "HOME" => Some(scratch.as_str()),
             "PATH" => Some("/bin"),
             _ => None,
         },
         user,
     );
-    assert_eq!(
-        other,
-        vec![("HOME".to_string(), "/scratch/home".to_string())]
-    );
+    assert_eq!(other, vec![("HOME".to_string(), scratch.clone())]);
     assert_eq!(env_of_words(&env_words(&other)), other);
     assert_eq!(
-        told_line(S1, &other).as_deref(),
-        Some(format!("HOME=/scratch/home muse resume {S1}").as_str())
+        told_line(S1, &other),
+        Some(format!("HOME={scratch} muse resume {S1}"))
     );
+    let slashed = abs("/h/");
     assert_eq!(
-        relaunch_env(|n| (n == "HOME").then_some("/h/"), user),
+        relaunch_env(|n| (n == "HOME").then_some(slashed.as_str()), user),
         Vec::new(),
         "the user's own HOME, however written"
     );

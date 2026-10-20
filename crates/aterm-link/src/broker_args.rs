@@ -12,12 +12,8 @@ pub(crate) enum ParseError {
 
 /// Borrow the words without making a filename into flags or losing its bytes.
 pub(crate) struct BrokerArgs<'a, S> {
-    pub tcp: Option<&'a S>,
-    pub key_file: Option<&'a S>,
     pub secret_file: Option<&'a S>,
-    pub unix: Option<&'a S>,
     pub durability: Option<&'a S>,
-    pub allow_remote: bool,
     pub repair: bool,
     pub words: Vec<&'a S>,
 }
@@ -44,12 +40,8 @@ impl<'a, S: AsRef<OsStr>> BrokerArgs<'a, S> {
 
     pub fn parse(args: &'a [S]) -> Result<Self, ParseError> {
         let mut out = Self {
-            tcp: None,
-            key_file: None,
             secret_file: None,
-            unix: None,
             durability: None,
-            allow_remote: false,
             repair: false,
             words: Vec::new(),
         };
@@ -58,15 +50,8 @@ impl<'a, S: AsRef<OsStr>> BrokerArgs<'a, S> {
             let word = arg.as_ref();
             let slot = match word.to_str() {
                 Some("-h" | "--help") => return Err(ParseError::Help),
-                Some("--tcp") => Some((&mut out.tcp, "--tcp")),
-                Some("--key-file") => Some((&mut out.key_file, "--key-file")),
                 Some("--secret-file") => Some((&mut out.secret_file, "--secret-file")),
-                Some("--unix") => Some((&mut out.unix, "--unix")),
                 Some("--durability") => Some((&mut out.durability, "--durability")),
-                Some("--allow-remote") => {
-                    out.allow_remote = true;
-                    None
-                }
                 Some("--repair") => {
                     out.repair = true;
                     None
@@ -98,25 +83,17 @@ impl<'a, S: AsRef<OsStr>> BrokerArgs<'a, S> {
     }
 
     /// Confirm a display-discovered candidate against the actual option
-    /// boundaries before attributing a tier to this endpoint.
-    pub fn serves_endpoint(&self, unix: bool, endpoint: &str) -> bool {
-        if unix {
-            let socket = if self.tcp.is_some() {
-                self.unix
-            } else {
-                self.words.first().copied()
-            };
-            socket.is_some_and(|word| word.as_ref() == endpoint)
-        } else {
-            self.tcp
-                .and_then(|word| word.as_ref().to_str())
-                .is_some_and(|bind| crate::transport::dial_for_bind(bind) == endpoint)
-        }
+    /// boundaries before attributing a tier to this endpoint: the broker's
+    /// socket is its first word.
+    pub fn serves_endpoint(&self, endpoint: &str) -> bool {
+        self.words
+            .first()
+            .is_some_and(|word| word.as_ref() == endpoint)
     }
 
-    /// Pure serving syntax only. Network reachability, key bytes and the
-    /// build's sealed transport remain the execution lane's checks. A bare
-    /// argv runs the build's default ([`crate::durability::resolve`]).
+    /// Pure serving syntax only; the secret's bytes remain the execution
+    /// lane's check. A bare argv runs the build's default
+    /// ([`crate::durability::resolve`]).
     pub fn serving_durability(&self) -> Option<crate::durability::Durability> {
         self.named_durability().map(crate::durability::resolve)
     }
@@ -125,19 +102,8 @@ impl<'a, S: AsRef<OsStr>> BrokerArgs<'a, S> {
     /// `--durability` (the build's default), `Some(Some(tier))` for a named
     /// one, `None` for an argv that is not a recognised serving one.
     pub fn named_durability(&self) -> Option<Option<crate::durability::Durability>> {
-        if self.repair {
+        if self.repair || !matches!(self.words.len(), 1 | 2) {
             return None;
-        }
-        match self.tcp {
-            None if self.key_file.is_none()
-                && self.unix.is_none()
-                && !self.allow_remote
-                && matches!(self.words.len(), 1 | 2) => {}
-            Some(_)
-                if self.key_file.is_some()
-                    && self.secret_file.is_some()
-                    && self.words.len() == 1 => {}
-            _ => return None,
         }
         match self.durability {
             None => Some(None),
@@ -164,27 +130,27 @@ mod tests {
             parsed.serving_durability(),
             Some(crate::durability::Durability::Strict)
         );
-        let tcp = [
-            "--tcp",
-            "127.0.0.1:7",
-            "--key-file",
-            "--durability",
+        assert!(parsed.serves_endpoint("socket"));
+        assert!(!parsed.serves_endpoint("relaxed"));
+        let opaque = [
             "--secret-file",
-            "secret",
-            "--unix",
             "--help",
-            "log",
+            "--durability",
+            "--repair",
+            "sock",
         ];
-        let parsed = BrokerArgs::parse(&tcp)
+        let parsed = BrokerArgs::parse(&opaque)
             .ok()
             .expect("values are opaque words");
-        assert_eq!(parsed.key_file.copied(), Some("--durability"));
-        assert_eq!(parsed.unix.copied(), Some("--help"));
-        assert_eq!(parsed.words, vec![&"log"]);
-        assert_eq!(
-            parsed.serving_durability(),
-            Some(crate::durability::Durability::Strict)
-        );
+        assert_eq!(parsed.secret_file.copied(), Some("--help"));
+        assert_eq!(parsed.durability.copied(), Some("--repair"));
+        assert_eq!(parsed.words, vec![&"sock"]);
+        assert!(!parsed.repair);
+        // A retired flag (the sealed wire's `--tcp`) is an unknown one.
+        assert!(matches!(
+            BrokerArgs::parse(&["--tcp", "127.0.0.1:7", "log"]),
+            Err(ParseError::Usage(_))
+        ));
         assert!(matches!(
             BrokerArgs::parse(&["sock", "--secret-file"]),
             Err(ParseError::Usage(_))

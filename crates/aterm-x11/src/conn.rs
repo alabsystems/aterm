@@ -73,6 +73,21 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl Error {
+    /// Whether this is the connection's transport failing: libxcb's
+    /// `XCB_CONN_ERROR`, which it sets when a read finds end of file or a read
+    /// or write on the socket fails (the server died, was killed or reset the
+    /// connection). Its other `XCB_CONN_CLOSED_*` codes are reasons of its own
+    /// to close a connection whose server is still there.
+    #[must_use]
+    pub const fn is_transport_failure(&self) -> bool {
+        matches!(self, Error::Connection(XCB_CONN_ERROR))
+    }
+}
+
+/// libxcb's `XCB_CONN_ERROR` (`xcb.h`): a socket, pipe or stream error.
+const XCB_CONN_ERROR: c_int = 1;
+
 impl From<ParseError> for Error {
     fn from(e: ParseError) -> Self {
         Error::Parse(e)
@@ -82,7 +97,7 @@ impl From<ParseError> for Error {
 /// libxcb's names for `xcb_connection_has_error`'s codes.
 fn connection_error_name(code: c_int) -> &'static str {
     match code {
-        1 => "XCB_CONN_ERROR",
+        XCB_CONN_ERROR => "XCB_CONN_ERROR",
         2 => "XCB_CONN_CLOSED_EXT_NOTSUPPORTED",
         3 => "XCB_CONN_CLOSED_MEM_INSUFFICIENT",
         4 => "XCB_CONN_CLOSED_REQ_LEN_EXCEED",
@@ -592,5 +607,21 @@ impl VoidCookie<'_> {
 impl Drop for VoidCookie<'_> {
     fn drop(&mut self) {
         self.conn.discard(self.sequence);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    /// Only libxcb's stream error is the transport failing: its own closes
+    /// (codes 2 to 7) and a request it refused leave the server there.
+    #[test]
+    fn only_the_stream_error_is_the_transport_failing() {
+        assert!(Error::Connection(1).is_transport_failure());
+        for code in 2..=7 {
+            assert!(!Error::Connection(code).is_transport_failure(), "{code}");
+        }
+        assert!(!Error::RequestTooLarge.is_transport_failure());
     }
 }

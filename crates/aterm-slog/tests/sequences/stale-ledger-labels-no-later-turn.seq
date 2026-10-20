@@ -1,0 +1,15 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# P8c: a ctl turn queued while the agent is busy labels only a turn that
+# opens within the attribution window: an hour later, the human's turn is
+# the human's.
+see busy
+ctl
+see idle
+half
+half
+expect close t1 turn out=done
+pass 3600000
+input human
+see busy
+expect open t1 turn
+expect open t2 turn by=human at=3601000

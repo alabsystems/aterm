@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 //
-// What an index of non-ASCII scrollback holds, measured as REAL net heap (a
-// counting global allocator, as `index_release_memory.rs` does), against its
-// text and against the same rows in ASCII.
+// What an index of non-ASCII scrollback holds, measured as REAL net heap (the
+// suite's counting global allocator, `search_suite.rs`), against its text and
+// against the same rows in ASCII.
 //
 // Every indexed line keeps a column map. One entry of three `usize` per
 // grapheme, in a doubling `Vec`, made a non-ASCII row's index 10-25 times its
@@ -12,36 +12,10 @@
 // accents 663 MiB), and ONE box-drawing glyph in an ASCII agent row made the
 // row cost 9 times the plain one. The bounds below sit between that and the
 // run-length encoded map.
-//
-// ONE test function on purpose: the counting allocator is a single global
-// counter, so a second #[test] running in parallel would pollute every
-// reading.
-
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicI64, Ordering};
 
 use aterm_search::TerminalSearch;
 
-static NET: AtomicI64 = AtomicI64::new(0);
-
-struct Counting;
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        NET.fetch_add(l.size() as i64, Ordering::Relaxed);
-        unsafe { System.alloc(l) }
-    }
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        NET.fetch_sub(l.size() as i64, Ordering::Relaxed);
-        unsafe { System.dealloc(p, l) }
-    }
-    unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-        NET.fetch_add(n as i64 - l.size() as i64, Ordering::Relaxed);
-        unsafe { System.realloc(p, l, n) }
-    }
-}
-
-#[global_allocator]
-static ALLOC: Counting = Counting;
+use crate::heap::net;
 
 const ROWS: usize = 20_000;
 
@@ -98,10 +72,10 @@ fn rows(shape: &str) -> Vec<String> {
 fn held(shape: &str) -> (f64, f64) {
     let rows = rows(shape);
     let text: usize = rows.iter().map(String::len).sum();
-    let before = NET.load(Ordering::Relaxed);
+    let before = net();
     let mut index = TerminalSearch::with_capacity_and_max(rows.len(), 100_000);
     index.index_visible_content(0, &rows);
-    let held = NET.load(Ordering::Relaxed) - before;
+    let held = net() - before;
     assert_eq!(index.indexed_line_count(), ROWS);
     drop(rows);
     let held = held as f64;

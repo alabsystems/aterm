@@ -36,6 +36,12 @@ aterm-log = { workspace = true }
 aterm-time = { workspace = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
 
+# A Cargo test binary's own per-user root (`aterm_uds::test_binary`): in a test the
+# state, data, log and config folders (`dirs`) answer under it, never the person's.
+# Not on wasm, which has none of those folders.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+aterm-uds = { workspace = true }
+
 [dev-dependencies]
 aterm-spec = { workspace = true }
 # Test-only: a serializer for the `serde` feature's round-trip tests.

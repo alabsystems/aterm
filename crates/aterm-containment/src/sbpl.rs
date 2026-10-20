@@ -497,8 +497,7 @@ fn profile_scoped(
         .and_then(|h| std::fs::canonicalize(h).ok());
 
     // Assembled without `format!`: `format_args!` puts the unsafe
-    // `fmt::Arguments::new` in this MIR, which the Trust strict gate fails
-    // closed on.
+    // `fmt::Arguments::new` in this MIR, which the Trust lane fails closed on.
     let mut profile = String::new();
     profile.push_str(BASE_PROFILE);
     if tmp_only {
@@ -912,6 +911,8 @@ mod tests {
             write_allows(&profile).contains(&expect),
             "a plain history file keeps {expect}; got {profile}"
         );
+        // A type that cannot be read (the path runs through a file) is not plain.
+        assert!(!plain_or_absent(&canon_home.join(".zsh_history").join("x")));
     }
 
     /// Only the user's own `$TMPDIR` (`/private/var/folders/<xx>/<id>/T`) is
@@ -922,10 +923,14 @@ mod tests {
     fn only_the_users_own_tmpdir_joins_the_write_roots() {
         let home = aterm_tempfile::tempdir().unwrap();
         let canon_home = std::fs::canonicalize(home.path()).unwrap();
+        // Named `T` at the right depth, but not under the per-user folders.
+        let lookalike = canon_home.join("a/b/T");
+        std::fs::create_dir_all(&lookalike).unwrap();
         for elsewhere in [
             canon_home.as_path(),
             Path::new(USER_TEMP_PARENT),
             Path::new("/"),
+            lookalike.as_path(),
         ] {
             assert_eq!(
                 admitted_user_temp(elsewhere),
@@ -979,11 +984,18 @@ mod tests {
     fn broader_fs_tiers_get_no_write_confinement() {
         let home = aterm_tempfile::tempdir().unwrap();
         let canon_home = std::fs::canonicalize(home.path()).unwrap();
+        // `Library` holds private stores only `TmpOnly` guards; its node is not write-denied.
+        std::fs::create_dir_all(canon_home.join("Library")).unwrap();
+        let library = format!("(literal \"{}\")", sbpl_str(&canon_home.join("Library")));
         for fs in [FsCapability::ProjectReadWrite, FsCapability::HomeReadWrite] {
             let profile = profile_for_home(canon_home.to_str(), None, fs);
             assert!(
                 !profile.contains("(allow file-write*") && !profile.contains("(deny file-write*)"),
                 "{fs:?} must not be write-confined; got {profile}"
+            );
+            assert!(
+                !profile.contains(&library),
+                "{fs:?} guards no private store; got {profile}"
             );
             // Negative control: the probe reads a real generated profile.
             assert!(
@@ -1166,6 +1178,13 @@ mod tests {
             profile.contains(&resolved_prefix),
             "a secret path under symlinked ~/.config must be denied at its resolved target ({resolved_prefix}); got {profile}"
         );
+        // A store outside `$HOME` keeps its leaf denies but no node of it, or above it, is
+        // write-denied: the relocation guard stays inside the home.
+        let outside = format!("(literal \"{}\")", sbpl_str(&canon_store));
+        assert!(
+            !profile.contains(&outside),
+            "{outside} is outside the home; got {profile}"
+        );
     }
 
     #[test]
@@ -1261,31 +1280,29 @@ mod tests {
         // parent must be write-denied too, not just the lexical symlink node.
         let home = aterm_tempfile::tempdir().unwrap();
         let canon_home = std::fs::canonicalize(home.path()).unwrap();
-        // Real store under home, with a secret inside it, reached via the ~/.config symlink.
+        // Real store under home, reached via the ~/.config symlink: the secret inside it absent
+        // (it may be made later in the session), then present.
         let store = canon_home.join("dotfiles/config");
-        std::fs::create_dir_all(store.join("gh")).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
         symlink(&store, canon_home.join(".config")).unwrap();
 
-        let profile = profile_for_home(canon_home.to_str(), None, FsCapability::HomeReadWrite);
-
-        // (1) The lexical symlink node is write-denied.
+        // (1) The lexical symlink node is write-denied, (2) and the resolved real store + its
+        // parent — closing the rename-the-real-ancestor bypass codex flagged.
         let lex = format!("(literal \"{}\")", canon_home.join(".config").display());
-        assert!(
-            profile.contains(&lex),
-            "lexical ~/.config symlink node must be write-denied; got {profile}"
-        );
-        // (2) and the resolved real store + its parent — closing the rename-the-real-
-        // ancestor bypass codex flagged.
         let real_store = format!("(literal \"{}\")", store.display());
         let real_parent = format!("(literal \"{}\")", canon_home.join("dotfiles").display());
-        assert!(
-            profile.contains(&real_store),
-            "resolved store node {real_store} must be write-denied; got {profile}"
-        );
-        assert!(
-            profile.contains(&real_parent),
-            "resolved store PARENT {real_parent} must be write-denied; got {profile}"
-        );
+        for present in [false, true] {
+            if present {
+                std::fs::create_dir_all(store.join("gh")).unwrap();
+            }
+            let profile = profile_for_home(canon_home.to_str(), None, FsCapability::HomeReadWrite);
+            for node in [&lex, &real_store, &real_parent] {
+                assert!(
+                    profile.contains(node.as_str()),
+                    "{node} must be write-denied (secret present: {present}); got {profile}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1305,6 +1322,17 @@ mod tests {
             1,
             "the shared Library ancestor node must be write-denied exactly once; got {profile}"
         );
+        // A leaf whose path needs no resolving is denied once, present or not.
+        std::fs::create_dir_all(canon_home.join(".ssh")).unwrap();
+        let profile = profile_for_home(canon_home.to_str(), None, FsCapability::TmpOnly);
+        for leaf in [".ssh", ".aws"] {
+            let clause = format!("(subpath \"{}\")", sbpl_str(&canon_home.join(leaf)));
+            assert_eq!(
+                profile.matches(&clause).count(),
+                1,
+                "{clause}; got {profile}"
+            );
+        }
     }
 
     #[test]
@@ -1316,6 +1344,9 @@ mod tests {
         assert_eq!(out, "/a\\\"b\\\\c");
     }
 
+    /// Unix-only: the profile is scoped under `$HOME` ([`home_dir`]), which a native
+    /// Windows process does not have, and only macOS ever applies one.
+    #[cfg(unix)]
     #[test]
     fn private_data_is_gated_on_the_fs_capability_not_network() {
         // The private-data deny is keyed on `fs == TmpOnly`, not on

@@ -432,7 +432,7 @@ impl Drop for CandidateRegistration {
 /// candidate, 2 another live process), `pred` 1, and no request answered yet.
 /// The Tier-1 binds fire `Request` on it and compare `refused` with the real
 /// probe.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn project_handoff_address_owner(
     dir: &Path,
     sid: &SessionId,
@@ -462,7 +462,7 @@ pub(crate) fn project_handoff_address_owner(
 }
 
 /// Test-only: the pid registered now (`0`: none).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn registered_handoff_candidate() -> u32 {
     HANDOFF_CANDIDATE.load(Ordering::SeqCst)
 }
@@ -968,28 +968,6 @@ mod tests {
         );
     }
 
-    // `HandoffAddressOwner`'s other actions are no function of this process's
-    // dispatch: explicit scope boundaries, not silent coverage holes.
-    // (`SuccessorPublishes` is anchored on the candidate's own gated publication,
-    // `control::publish_when_committed`, and driven by its Tier-1 bind.)
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "HandoffAddressOwner",
-        action = "StrangerPublishes",
-        reason = "An unrelated instance's discovery entry; the Tier-1 binds plant one naming \
-                  a live pid that is not this process."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "HandoffAddressOwner",
-        action = "Commit",
-        reason = "`seamless::commit_and_exit` `_exit`s this process: nothing it answers \
-                  afterwards exists to project."
-    )]
-    #[expect(
-        dead_code,
-        reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it"
-    )]
-    fn handoff_address_owner_scope_waivers() {}
-
     /// The candidate registration (`register_handoff_candidate`, bound to
     /// `HandoffAddressOwner`'s `Launch` and `Reject`): while it lives, an adopted
     /// id whose entry names that pid is served here, and its drop clears only its
@@ -1072,3 +1050,29 @@ mod tests {
         set_rendezvous_override(None);
     }
 }
+
+/// `HandoffAddressOwner` environment actions, each waived where its Tier-1 (`tests`)
+/// binds it.
+// `HandoffAddressOwner`'s other actions are no function of this process's
+// dispatch: explicit scope boundaries, not silent coverage holes.
+// (`SuccessorPublishes` is anchored on the candidate's own gated publication,
+// `control::publish_when_committed`, and driven by its Tier-1 bind.)
+#[cfg(any(test, debug_assertions))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "HandoffAddressOwner",
+    action = "StrangerPublishes",
+    reason = "An unrelated instance's discovery entry; the Tier-1 binds plant one naming \
+              a live pid that is not this process."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "HandoffAddressOwner",
+    action = "Commit",
+    reason = "`seamless::commit_and_exit` `_exit`s this process: nothing it answers \
+              afterwards exists to project."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn handoff_address_owner_scope_waivers() {}

@@ -42,6 +42,7 @@ pub(crate) struct State {
     pub(crate) data: TreeData,
     pub(crate) focus: NodeId,
     is_host_focused: bool,
+    next_incarnation: u64,
 }
 
 /// The nodes an update touched, in node order so the events they cause come
@@ -51,6 +52,14 @@ struct Changes {
     added: BTreeSet<NodeId>,
     updated: BTreeSet<NodeId>,
     removed: BTreeSet<NodeId>,
+}
+
+/// Never reuse an exported object incarnation after removal or owner replacement.
+fn fresh_incarnation(next: &mut u64) -> u64 {
+    *next = next
+        .checked_add(1)
+        .expect("accessibility object incarnation exhausted");
+    *next
 }
 
 impl State {
@@ -89,6 +98,7 @@ impl State {
         fn add_node(
             nodes: &mut HashMap<NodeId, NodeState>,
             changes: &mut Option<&mut Changes>,
+            next_incarnation: &mut u64,
             parent_and_index: Option<ParentAndIndex>,
             id: NodeId,
             data: NodeData,
@@ -97,6 +107,11 @@ impl State {
                 id,
                 NodeState {
                     parent_and_index,
+                    incarnation: if changes.is_some() {
+                        fresh_incarnation(next_incarnation)
+                    } else {
+                        0
+                    },
                     data,
                 },
             );
@@ -127,6 +142,7 @@ impl State {
                     add_node(
                         &mut self.nodes,
                         &mut changes,
+                        &mut self.next_incarnation,
                         Some(parent_and_index),
                         child_id,
                         child_data,
@@ -147,6 +163,9 @@ impl State {
                     }
                 }
                 if node_state.data != node_data {
+                    if node_state.data.action_context() != node_data.action_context() {
+                        node_state.incarnation = fresh_incarnation(&mut self.next_incarnation);
+                    }
                     node_state.data.clone_from(&node_data);
                     if let Some(changes) = &mut changes {
                         changes.updated.insert(node_id);
@@ -156,12 +175,20 @@ impl State {
                 add_node(
                     &mut self.nodes,
                     &mut changes,
+                    &mut self.next_incarnation,
                     Some(parent_and_index),
                     node_id,
                     node_data,
                 );
             } else if local_node_id == root {
-                add_node(&mut self.nodes, &mut changes, None, node_id, node_data);
+                add_node(
+                    &mut self.nodes,
+                    &mut changes,
+                    &mut self.next_incarnation,
+                    None,
+                    node_id,
+                    node_data,
+                );
             } else {
                 pending_nodes.insert(node_id, node_data);
             }
@@ -302,6 +329,7 @@ impl Tree {
             focus: NodeId(initial_state.focus),
             data: tree,
             is_host_focused,
+            next_incarnation: 0,
         };
         state.update(initial_state, is_host_focused, None);
         Self {
@@ -347,7 +375,9 @@ impl Tree {
         }
         let old_focus = self.state.focus();
         let new_focus = self.next_state.focus();
-        if old_focus.as_ref().map(|n| n.id()) != new_focus.as_ref().map(|n| n.id()) {
+        if old_focus.as_ref().map(|n| (n.id(), n.incarnation()))
+            != new_focus.as_ref().map(|n| (n.id(), n.incarnation()))
+        {
             if let Some(old_node) = &old_focus {
                 let id = old_node.id();
                 if !changes.updated.contains(&id)
@@ -392,6 +422,7 @@ impl Tree {
         if self.state.data != self.next_state.data {
             self.state.data.clone_from(&self.next_state.data);
         }
+        self.state.next_incarnation = self.next_state.next_incarnation;
         self.state.focus = self.next_state.focus;
         self.state.is_host_focused = self.next_state.is_host_focused;
     }

@@ -1831,7 +1831,7 @@ mod tests {
         let path = file_panic_report(
             &dir,
             "src/run.rs",
-            Some("aterm-operator-observer"),
+            Some("aterm-control-listener"),
             "boom",
             &"i",
             &"bt",

@@ -27,6 +27,54 @@ pub struct HostCapabilities {
     pub input_sink: bool,
 }
 
+impl HostCapabilities {
+    /// Headless daemon capabilities (`roster` and `input_sink` enabled, no windowing or clipboard).
+    #[must_use]
+    pub const fn headless_daemon() -> Self {
+        Self {
+            frame_source: false,
+            event_loop: false,
+            clipboard: false,
+            roster: true,
+            input_sink: true,
+        }
+    }
+
+    /// Full GUI capabilities (all 5 facilities enabled).
+    #[must_use]
+    pub const fn full_gui() -> Self {
+        Self {
+            frame_source: true,
+            event_loop: true,
+            clipboard: true,
+            roster: true,
+            input_sink: true,
+        }
+    }
+
+    /// Whether the host can resolve a session and write input to it (`roster && input_sink`).
+    #[must_use]
+    pub const fn can_drive_session(self) -> bool {
+        self.roster && self.input_sink
+    }
+
+    /// Whether the host can capture rendered window frames (`frame_source && event_loop`).
+    #[must_use]
+    pub const fn can_capture_frames(self) -> bool {
+        self.frame_source && self.event_loop
+    }
+
+    /// Count of enabled host facilities (`0..=5`).
+    #[must_use]
+    pub const fn enabled_count(self) -> u8 {
+        (self.frame_source as u8)
+            + (self.event_loop as u8)
+            + (self.clipboard as u8)
+            + (self.roster as u8)
+            + (self.input_sink as u8)
+    }
+}
+
 /// A session's lifecycle as its host observes it: the `sessions` wire
 /// vocabulary, onto which each host maps its own states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +85,30 @@ pub enum SessionState {
     Alive,
     /// The command exited; the engine is still readable.
     Exited,
+}
+
+impl SessionState {
+    /// Wire token for this session state (`"spawning"`, `"alive"`, or `"exited"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Spawning => "spawning",
+            Self::Alive => "alive",
+            Self::Exited => "exited",
+        }
+    }
+
+    /// Whether the session's input sink can accept bytes (`Spawning` or `Alive`).
+    #[must_use]
+    pub const fn can_accept_input(self) -> bool {
+        matches!(self, Self::Spawning | Self::Alive)
+    }
+
+    /// Whether the session has exited.
+    #[must_use]
+    pub const fn is_exited(self) -> bool {
+        matches!(self, Self::Exited)
+    }
 }
 
 /// One row of [`SessionHost::sessions`]: exactly the fields a `sessions`/`ls`
@@ -83,9 +155,11 @@ pub struct SessionPlacement {
     pub detail: Option<String>,
 }
 
-/// A wire `@<selector>` target the roster can answer. `@`/`@.` (self) is
-/// absent: self is the connection's own session, which the dispatcher knows
-/// and the roster does not.
+/// A wire `@<selector>` target the roster can answer. `@.` (self) is absent:
+/// self is the connection's own session, which the dispatcher knows and the
+/// roster does not. So is a bare `@`, which names nothing: the dispatcher
+/// refuses it (`aterm_types::control_verbs::EMPTY_SELECTOR`), never reading
+/// it as self.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Selector<'a> {
     /// `@<n>` — the process-local sid.
@@ -96,13 +170,33 @@ pub enum Selector<'a> {
 
 impl<'a> Selector<'a> {
     /// Classify the body after the leading `@`: all-digits is a local sid,
-    /// anything else a stable id. `None` for the self token (`.` or empty).
-    /// One parser, so hosts cannot disagree about what `@12` addresses.
+    /// anything else a stable id. `None` for the self token `.` and for an
+    /// empty body, neither of which the roster answers (an empty one is
+    /// refused, not self: see [`Selector`]). One parser, so hosts cannot
+    /// disagree about what `@12` addresses.
     #[must_use]
     pub fn parse(body: &'a str) -> Option<Self> {
         match body {
             "" | "." => None,
             b => Some(b.parse::<u64>().map_or(Selector::Id(b), Selector::Local)),
+        }
+    }
+
+    /// Return the local sid if `self` is [`Selector::Local`].
+    #[must_use]
+    pub const fn local_sid(self) -> Option<u64> {
+        match self {
+            Self::Local(sid) => Some(sid),
+            Self::Id(_) => None,
+        }
+    }
+
+    /// Return the stable id string if `self` is [`Selector::Id`].
+    #[must_use]
+    pub const fn stable_id(self) -> Option<&'a str> {
+        match self {
+            Self::Local(_) => None,
+            Self::Id(id) => Some(id),
         }
     }
 }
@@ -136,9 +230,13 @@ pub trait ChangeWait {
 /// `None` (a no-op for returnless methods), never its own session under a
 /// borrowed number, which keeps the cross-host sequence safe:
 ///
-/// ```ignore
-/// let sid = host.resolve(sel)?;      // fleet-wide answer
-/// host.write_input(sid, bytes);      // None unless THIS host serves that sid
+/// ```
+/// use aterm_control::{Selector, SessionHost};
+///
+/// fn write_selected(host: &impl SessionHost, sel: Selector<'_>, bytes: &[u8]) -> Option<bool> {
+///     let sid = host.resolve(sel)?;  // fleet-wide answer
+///     host.write_input(sid, bytes)   // None unless THIS host serves that sid
+/// }
 /// ```
 ///
 /// Resolve to pick a target, then obtain a host bound to it.
@@ -238,8 +336,9 @@ pub trait SessionHost {
 mod tests {
     use super::*;
 
-    /// The selector grammar: `.`/empty is the connection's own session (not a
-    /// roster lookup), all-digits is a local sid, anything else a stable id.
+    /// The selector grammar: `.` is the connection's own session and an empty
+    /// body names nothing (neither is a roster lookup), all-digits is a local
+    /// sid, anything else a stable id.
     #[test]
     fn selector_parses_the_wire_forms() {
         assert_eq!(Selector::parse(""), None);
@@ -249,5 +348,20 @@ mod tests {
         // Too big for a u64 local id ⇒ a stable id, never a silent wrap.
         let huge = "99999999999999999999";
         assert_eq!(Selector::parse(huge), Some(Selector::Id(huge)));
+        assert_eq!(Selector::Local(12).local_sid(), Some(12));
+        assert_eq!(Selector::Id("s-0f1e").stable_id(), Some("s-0f1e"));
+    }
+
+    #[test]
+    fn host_capabilities_and_session_state_const_helpers() {
+        let daemon = HostCapabilities::headless_daemon();
+        assert!(daemon.can_drive_session() && !daemon.can_capture_frames());
+        assert_eq!(daemon.enabled_count(), 2);
+        let gui = HostCapabilities::full_gui();
+        assert!(gui.can_drive_session() && gui.can_capture_frames());
+        assert_eq!(gui.enabled_count(), 5);
+        assert_eq!(SessionState::Spawning.as_str(), "spawning");
+        assert!(SessionState::Alive.can_accept_input() && !SessionState::Alive.is_exited());
+        assert!(SessionState::Exited.is_exited() && !SessionState::Exited.can_accept_input());
     }
 }

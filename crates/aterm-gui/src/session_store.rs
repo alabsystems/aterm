@@ -28,7 +28,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 
-use aterm_core::terminal::Terminal;
+use aterm_core::terminal::{RenderDebt, Terminal};
 use aterm_session::{LaunchNonce, SessionId};
 
 use crate::SessionCtx;
@@ -331,8 +331,10 @@ pub(crate) struct SessionRecord {
     )]
     pub claim_known: bool,
     /// THE KEYED ESCALATIONS (additive, absent ⇒ none; the round-four plan,
-    /// item 9): each attention owner's line, `"<owner> <pct-text>"`, in write
-    /// order (`SessionMeta::handoff_attention_owners`). The restore leaf
+    /// item 9): each attention owner's line, `"<owner> [kind=<ask|wait>]
+    /// <pct-text>"`, in write order (`SessionMeta::handoff_attention_owners`;
+    /// the kind only where its writer named one, so a row of a kind-less
+    /// entry is what every producer before the kind wrote). The restore leaf
     /// carries the bare entry alone, so an update used to erase every
     /// supervisor's "needs you" from the menu bar with nobody having
     /// answered it. Re-validated row by row on the way in
@@ -367,16 +369,32 @@ pub(crate) struct SessionRecord {
     /// that: the successor seeds its engine with the debt
     /// (`Terminal::seed_render_debt`), and the SAME epoch judge and repaint
     /// nudge that would have judged the tab in the parent judge it. Absent
-    /// means "owes nothing, or the producer predates the field" and nothing
+    /// means "owes no rows, or the producer predates the field" and nothing
     /// happens: the debt is carried, never a verdict about the program. In
     /// neither proof digest; a value that does not read (`lenient_row`) seeds
     /// nothing and never costs the manifest. An older reader skips the key.
+    /// The columns owed ride [`Self::render_debt_cut`]; both are read and
+    /// written together ([`Self::carried_render_debt`],
+    /// [`Self::carry_render_debt`]).
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "lenient_row"
     )]
     pub render_debt: Option<String>,
+    /// THE COLUMNS OF THE RENDER DEBT (additive, absent ⇒ 0; S2R-F3): the
+    /// drawn columns a narrowing with no rewrap cut off this session's
+    /// alternate screen (`RenderDebt::cut`), carried as [`Self::render_debt`]
+    /// is and judged with it. A key of its own, so a reader older than the
+    /// column judge skips it and still reads the rows [`Self::render_debt`]
+    /// owes, which one row with both would have read as no debt at all. `0` is
+    /// not written; a value that is not a count ([`lenient_count`]) is 0.
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero",
+        deserialize_with = "lenient_count"
+    )]
+    pub render_debt_cut: u64,
     /// THE MAILBOX'S OUTBOUND HALF AND ITS ID COUNTERS (additive, absent ⇒
     /// none; round seven of the update audit, findings 6, 8 and 28): the posts
     /// still waiting for a bridge, the receipts still owed, and the last inbox,
@@ -419,6 +437,26 @@ pub(crate) struct SessionRecord {
     /// none ([`parse_journal_key`]); in neither proof digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_key: Option<String>,
+    /// THE TASK RECORD (additive, absent ⇒ none; the worker pillar,
+    /// 2026-10-15): the session's [`crate::task_record::TaskRecord`] as one
+    /// row (`TaskRecord::carry_row`: `rev= state= from= since=<unix ms>
+    /// result_bytes= attention=` and the optional facts). A manager parked
+    /// in `await task` across a self-update re-arms with the revs it was
+    /// answered with, so the successor must hold the same record — rev,
+    /// state and the wall-clock instant the state was entered — or a worker
+    /// that finished during the update would read as never tasked. The
+    /// successor seeds it before the session is registered
+    /// (`task_record::seed_carried`), re-validated as `task mark` validates;
+    /// a row that does not read seeds nothing (`lenient_row`), never costs
+    /// the manifest. Per record, like `topics`, so it survives every later
+    /// handoff; in neither proof digest; `None` is not written, so an older
+    /// reader sees the wire it always saw.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_row"
+    )]
+    pub task: Option<String>,
     /// THE SESSION LOG'S EPOCH AND NODE-ID COUNTERS (additive, absent ⇒ none;
     /// the session log's slice 1, 2026-10-15): `"<ep> <run> <turn> <step>"`
     /// (`session_log::LogCarry`), the outgoing log's epoch and its last run,
@@ -438,6 +476,26 @@ pub(crate) struct SessionRecord {
         deserialize_with = "lenient_row"
     )]
     pub log_ids: Option<String>,
+    /// WHAT THE OWNER WAS TOLD AND HAS LOOKED AT (additive, absent ⇒
+    /// nothing; `docs/DESIGN-owner-surfaces-2026-10-16.md` §3): the status
+    /// item's memory of this session as one row
+    /// (`status_item::StatusCarry::row`: `need=<word>@<unix s>`, `told=1`,
+    /// `hold=<word>@<unix s>`, `done=<unix ms>`), stamped by the park
+    /// (`App::status_carry_rows`). Before this carry everything that said
+    /// "already told" or "already seen" lived only in the process, so every
+    /// seamless update posted each standing need's desktop notice again,
+    /// brought back every Done for you row the owner had read, and restarted
+    /// every age. The successor reads it at each adopted session's first
+    /// publication (`App::adopt_status_carry`). A plain string an older
+    /// reader skips; a value that does not read ([`lenient_row`],
+    /// `StatusCarry::parse`) carries nothing — at worst a notice is told
+    /// again — never failing the manifest. In neither proof digest.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_row"
+    )]
+    pub status_seen: Option<String>,
     /// THE SESSION LOG'S SEQ COUNT (additive, absent ⇒ 0; Phase 2A of the
     /// session log, design §2.2): the outgoing log's last seq plus its overlap
     /// reserve (`session_log::LOG_SEQ_RESERVE`). The successor's log starts
@@ -473,27 +531,62 @@ pub(crate) fn parse_journal_key(row: &str) -> Option<(u32, u64)> {
     ))
 }
 
-/// The wire spelling of a render debt (`<shift>,<pushed>`).
+/// The keys a carried render debt rides ([`SessionRecord::render_debt`],
+/// [`SessionRecord::render_debt_cut`]): its rows as `<shift>,<pushed>`, only
+/// when it owes rows, and its columns. None, or a debt of nothing, is neither.
 #[cfg(any(unix, test))]
-pub(crate) fn render_debt_row(shift: i32, pushed: i32) -> String {
-    format!("{shift},{pushed}")
+pub(crate) fn render_debt_keys(debt: Option<RenderDebt>) -> (Option<String>, u64) {
+    let RenderDebt { shift, pushed, cut } = debt.filter(|debt| debt.owed()).unwrap_or_default();
+    (
+        (shift != 0 || pushed != 0).then(|| format!("{shift},{pushed}")),
+        u64::from(cut),
+    )
 }
 
-/// Read a carried render debt. Anything but two integers, or a debt of zero,
-/// is no debt: the successor owes the program nothing it was not told.
-pub(crate) fn parse_render_debt(row: &str) -> Option<(i32, i32)> {
-    let (shift, pushed) = row.split_once(',')?;
-    let debt = (
-        shift.trim().parse::<i32>().ok()?,
-        pushed.trim().parse::<i32>().ok()?,
-    );
-    // The engine's debt is a handful of rows; a value past a screen is a bad
-    // row, not a debt (`seed_render_debt` would take any i32).
-    (debt != (0, 0) && debt.0.unsigned_abs() <= 4096 && debt.1.unsigned_abs() <= 4096)
+/// Read a carried render debt: the rows `row` owes (`<shift>,<pushed>`, absent
+/// for none) and the columns `cut` owes. A row that is not two integers, a
+/// value past a screen, or a debt of nothing is no debt: the successor owes
+/// the program nothing it was not told.
+pub(crate) fn parse_render_debt(row: Option<&str>, cut: u64) -> Option<RenderDebt> {
+    let (shift, pushed) = match row {
+        Some(row) => {
+            let (shift, pushed) = row.split_once(',')?;
+            (
+                shift.trim().parse::<i32>().ok()?,
+                pushed.trim().parse::<i32>().ok()?,
+            )
+        }
+        None => (0, 0),
+    };
+    let debt = RenderDebt {
+        shift,
+        pushed,
+        cut: u16::try_from(cut).ok()?,
+    };
+    // The engine's debt is a handful of rows and columns; a value past a screen
+    // is a bad row, not a debt (`seed_render_debt` would take any value).
+    (debt.owed()
+        && shift.unsigned_abs() <= 4096
+        && pushed.unsigned_abs() <= 4096
+        && debt.cut <= 4096)
         .then_some(debt)
 }
 
 impl SessionRecord {
+    /// Carry `debt` on this record: its rows as [`Self::render_debt`]
+    /// (`<shift>,<pushed>`, only when it owes rows), its columns as
+    /// [`Self::render_debt_cut`]. None, or a debt of nothing, carries neither.
+    #[cfg(unix)]
+    pub(crate) fn carry_render_debt(&mut self, debt: Option<RenderDebt>) {
+        (self.render_debt, self.render_debt_cut) = render_debt_keys(debt);
+    }
+
+    /// The render debt this record carries ([`parse_render_debt`] of
+    /// [`Self::render_debt`] and [`Self::render_debt_cut`]).
+    pub(crate) fn carried_render_debt(&self) -> Option<RenderDebt> {
+        parse_render_debt(self.render_debt.as_deref(), self.render_debt_cut)
+    }
+
     /// Every hold row this record carries, the first one first: [`Self::hold`]
     /// and then [`Self::more_holds`]. A record from before the two slots
     /// carries at most the one, which reads as exactly that hold.
@@ -836,6 +929,9 @@ pub(crate) struct WindowCarry {
     /// cell taller than the frame it measured and was refused, and the
     /// Commit's lift then re-gridded the window a row shorter than its
     /// parent's. Written only while a row stands; no digest covers it.
+    /// RETIRED with the row (owner surfaces, 2026-10-16): this build never
+    /// sets it and reads it nowhere; it stays on the wire for an older
+    /// successor.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub presence_row: bool,
     /// THE MESSAGE BAND'S ROWS the outgoing window had committed above its
@@ -871,10 +967,13 @@ pub(crate) struct WindowCarry {
     pub update_verified_unix_ms: Option<u64>,
     /// THE LIVE FONT ZOOM (additive, absent ⇒ none; the round-four plan, item
     /// 15): the glyph size the outgoing process drew at, in thousandths of a
-    /// physical px, when a person had zoomed it (Cmd-= / Cmd--) away from its
+    /// DEVICE px, when a person had zoomed it (Cmd-= / Cmd--) away from its
     /// reset size. Written with [`Self::font_reset_px_milli`] as ONE pair, and
     /// only while zoomed, so an unzoomed window's carry is the wire it always
-    /// was.
+    /// was. A build that has one font-size unit writes the zoom in px at 1×
+    /// ([`Self::font_size_milli`]) and keeps this device pair for an older
+    /// successor; a successor reads the px-at-1× pair first and turns a lone
+    /// device pair into sizes with its first window's scale.
     ///
     /// Why: `rows`/`cols` above are the zoomed grid. A successor that sized
     /// them at the config's font drew a smaller (or larger) window with
@@ -886,13 +985,24 @@ pub(crate) struct WindowCarry {
     /// config, today's behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_px_milli: Option<u32>,
-    /// The size Cmd-0 resets to in the outgoing process (`App::default_font_px`),
-    /// in thousandths of a physical px — the other half of the pair. Carried
-    /// rather than re-derived because a Retina display's reset size is the
-    /// auto-scaled one, which the successor derives only for an UNZOOMED
-    /// window: without it, Cmd-0 after an update reset to the zoom itself.
+    /// The size Cmd-0 resets to in the outgoing process, in thousandths of a
+    /// device px — the other half of the pair. Carried rather than re-derived
+    /// because the successor derives a reset size only for an UNZOOMED window:
+    /// without it, Cmd-0 after an update reset to the zoom itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_reset_px_milli: Option<u32>,
+    /// The live font zoom in thousandths of a px at 1× (points on macOS), the
+    /// one font-size unit (additive, absent ⇒ none): the size the outgoing
+    /// process drew at, written with [`Self::font_reset_size_milli`] as ONE
+    /// pair and only while zoomed. Independent of the display, so a successor
+    /// whose first window opens on another scale still draws the same size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size_milli: Option<u32>,
+    /// The size Cmd-0 resets to in the outgoing process
+    /// (`App::default_font_size`), in thousandths of a px at 1× — the other
+    /// half of [`Self::font_size_milli`]'s pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_reset_size_milli: Option<u32>,
     /// WHAT THE OUTGOING PROCESS'S UPDATE-HEALTH WARNINGS SAID (additive,
     /// absent ⇒ none; round six, finding 54): one entry per kind it announced
     /// and no proof has answered since (`App::update_health_said`), so the
@@ -1224,6 +1334,25 @@ pub(crate) struct SessionHandoff {
         deserialize_with = "lenient_rows"
     )]
     pub fabric_attached: Vec<String>,
+    /// THE FLEET NEEDS THE OUTGOING HERALD HAD TOLD (additive, absent ⇒
+    /// none; `docs/DESIGN-owner-surfaces-2026-10-16.md` §3): one row per
+    /// fleet need whose desktop notice the outgoing status item had posted
+    /// and owed nothing for, `<herald key, 16 hex>=<need word>`
+    /// (`fleet_glance::told_row`, `App::fleet_told_rows`), stamped by the
+    /// park. A fleet need's notice is keyed by its Mac and session, not by a
+    /// handed session, so it rides here rather than on a record. The
+    /// successor's first fresh fleet read takes exactly these as told
+    /// (`App::herald_fleet`), so a standing need is one notice across the
+    /// update while a need the carry does not name — one that arose during
+    /// it, or one the outgoing process never told — is told. Bounded
+    /// (`fleet_glance::FLEET_TOLD_MAX`); a row that does not read is dropped
+    /// (at worst a notice is told again). Outside every proof digest.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_rows"
+    )]
+    pub fleet_told: Vec<String>,
     /// THE BUS MIRROR's closed sessions (additive, absent tolerated; session
     /// log phase 4, ruling Q4): one `<sid> <ep>:<seq>:<ms>:<head>` row per
     /// closed session whose mirrored records the bus does not hold yet, which
@@ -1243,6 +1372,20 @@ pub(crate) struct SessionHandoff {
     /// not written, while no bridge mirrors.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mirror_served: bool,
+    /// THIS MACHINE'S NAMES (additive, absent tolerated; 2026-10-17): every name
+    /// the kernel gave the machine while the outgoing process looked
+    /// (`tab_label::machine_names_for_handoff`). A carried shell's OSC 7 names the
+    /// host it STARTED under (zsh's `$HOST`, bash's `$HOSTNAME`), which the network
+    /// may have renamed since, and which the successor never read: it keeps these
+    /// beside its own (`tab_label::adopt_machine_names`), so a citation in a carried
+    /// tab is not refused as another machine's. Not written when empty; an older
+    /// reader skips it; a value that does not read is none ([`lenient_rows`]).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_rows"
+    )]
+    pub machine_names: Vec<String>,
 }
 
 /// One held pane's final screen on the wire (round five, item 19): the
@@ -1308,7 +1451,7 @@ pub(crate) struct HeldPaneCarry {
     /// audit, finding 730): `"<len> <sha256hex>"` of this pane's
     /// `seamless-<pid>-<nonce>.h<id>.ctl` sidecar — its turn ledger and archive
     /// tail, exactly as a handed session's `SessionRecord::control` carries them
-    /// (`crate::handoff_carry`), so `history` and `aterm drive report` still read
+    /// (`crate::handoff_carry`), so `history` and the harness's report reader still read
     /// the turns a manager drove into the pane before its command ended. An
     /// older reader skips it and leaves the sidecar, which the outgoing process
     /// retires once the proof checks out; in neither proof digest, like the
@@ -1359,12 +1502,15 @@ struct Drawn {
     attention_owners: Vec<String>,
     /// The broadcast opt-ins.
     topics: Vec<String>,
+    /// The task record's carried row ([`SessionRecord::task`]).
+    task: Option<String>,
 }
 
 #[cfg(any(unix, test))]
 impl Drawn {
     /// `ctx`'s draw at `now_us`, its own host `own_holder`: the meta's leaf
-    /// lock, then the topics' — never across a `Terminal` lock or each other.
+    /// lock, then the topics', then the timeline's (the task record) — never
+    /// across a `Terminal` lock or each other.
     fn of(ctx: &SessionCtx, now_us: u64, own_holder: &str) -> Self {
         let (meta, (supervisor, claim_known), attention_owners) = {
             let live = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
@@ -1380,6 +1526,11 @@ impl Drawn {
             claim_known,
             attention_owners,
             topics: crate::fabric::render_topics(&ctx.fabric.topics()),
+            task: ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .task_carry_row(),
         }
     }
 }
@@ -1387,10 +1538,11 @@ impl Drawn {
 /// What a handoff record carries of a session that a control verb can move
 /// after the park drew it, and that no other Commit fact compares (round eight
 /// of the update audit, finding 751): its broadcast opt-ins (`topic add` /
-/// `drop`), its keyed escalations (`meta set attention owner=…`) and its
+/// `drop`), its keyed escalations (`meta set attention owner=…`), its
 /// supervisor claim (`meta set supervisor …`) — the holder and whether the
 /// producer vouches for the claim, never a lease's remaining time, which moves
-/// by itself. A change answered `OK` between the park's draw and the Commit
+/// by itself — and its task record (`task mark`: a worker the harness marks
+/// `done` inside the window would otherwise cross still `working`). A change answered `OK` between the park's draw and the Commit
 /// was in no manifest, and a Commit that landed lost it with this process.
 ///
 /// The rest of a record is compared elsewhere: the six bare meta fields ride
@@ -1402,7 +1554,7 @@ impl Drawn {
 /// lossless retry, whose next draw carries the change. Compared as final
 /// state, so a change made and undone inside the window costs nothing, and a
 /// change made just before the draw and undone after it is still caught.
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CarriedClaims {
     pub local_id: u64,
@@ -1411,9 +1563,11 @@ pub(crate) struct CarriedClaims {
     /// The claim's holder, without the lease's remaining time.
     supervisor: Option<String>,
     claim_known: bool,
+    /// The task record's carried row.
+    task: Option<String>,
 }
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 impl CarriedClaims {
     /// What `record` carries, as the park drew it.
     #[must_use]
@@ -1424,6 +1578,7 @@ impl CarriedClaims {
             attention_owners: record.attention_owners.clone(),
             supervisor: record.supervisor.as_deref().map(lease_holder),
             claim_known: record.claim_known,
+            task: record.task.clone(),
         }
     }
 
@@ -1443,12 +1598,13 @@ impl CarriedClaims {
             attention_owners: drawn.attention_owners,
             supervisor: drawn.supervisor.as_deref().map(lease_holder),
             claim_known: drawn.claim_known,
+            task: drawn.task,
         }
     }
 }
 
 /// A carried supervisor row's holder (`"<holder> <remaining_ms>"`).
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn lease_holder(row: &str) -> String {
     row.split_once(' ')
         .map_or(row, |(holder, _)| holder)
@@ -1529,10 +1685,16 @@ impl SessionHandoff {
             fabric_attached: crate::fabric_launch::handoff_attached(),
             #[cfg(not(unix))]
             fabric_attached: Vec::new(),
+            // Stamped by the park from the App's fleet herald
+            // (`app_update_handoff::stamp_fleet_told`).
+            fleet_told: Vec::new(),
             // Drawn with the manifest; a landing past the draw before the
             // Commit stands it down (`StoreMirror::past_draw`).
             mirror_dropped: store.mirror.draw_tombstones(),
             mirror_served: store.mirror.served(),
+            // Every name the kernel gave this machine while this process looked: a
+            // carried shell still reports the one it started under.
+            machine_names: crate::tab_label::machine_names_for_handoff(),
             sessions: handles
                 .into_iter()
                 .map(|h| {
@@ -1549,6 +1711,7 @@ impl SessionHandoff {
                         claim_known,
                         attention_owners,
                         topics,
+                        task,
                     } = Drawn::of(&h.ctx, now_us, &own_holder);
                     // The id the successor's timeline counts on from (the
                     // newest one plus the overlap's reserve: round seven,
@@ -1620,6 +1783,7 @@ impl SessionHandoff {
                         // (`handoff_history::stamp_manifest`).
                         viewport_from_bottom: None,
                         render_debt: None,
+                        render_debt_cut: 0,
                         // The outbound mailbox and the id counters, under the
                         // fabric's leaf lock (round seven, findings 6/8/28).
                         fabric: h.ctx.fabric.handoff_carry(&mut post_budget),
@@ -1627,7 +1791,12 @@ impl SessionHandoff {
                         // Stamped by the park from the crash journal's state
                         // (`app_update_handoff::stamp_journal_keys`).
                         journal_key: None,
+                        // The task record, in the draw the Commit compares.
+                        task,
                         log_ids: Some(log_ids),
+                        // Stamped by the park from the App's status item
+                        // (`app_update_handoff::stamp_status_seen`).
+                        status_seen: None,
                         log_seq,
                     }
                 })
@@ -1668,14 +1837,13 @@ impl SessionHandoff {
 /// break the 1a round-trip identity proof (`session_handoff_roundtrips_the_whole_set`).
 /// They ride an env string (`ATERM_SEAMLESS_FDS`) and JOIN the manifest on `local_id`.
 ///
-/// Wire form: `"<local_id>=<fd>:<pid>,..."` (e.g. `"0=6:12345,1=7:12346"`). Encode/parse
-/// are total + fail-safe: an unparseable entry is skipped (that tab cold-restarts) so a
-/// corrupt/spoofed value can never fabricate a session — it can only fail closed.
+/// Wire form: `"<local_id>=<fd>:<pid>,..."` (e.g. `"0=6:12345,1=7:12346"`). The
+/// receiver refuses a wire with any unparseable entry whole, so a corrupt/spoofed
+/// value can never fabricate a session — it can only fail closed.
 // LOAD-BEARING: this is the LIVE `ATERM_SEAMLESS_FDS` channel. The handoff
 // worker builds it (`app_update_handoff`) and `seamless::write_outgoing` encodes
-// it; the receiver parses each entry with `seamless`'s own stricter
-// `parse_fd_entry` and joins it to the manifest on `local_id`. `decode` and
-// `lookup` are this wire's test-side reading.
+// it; the receiver parses it with `seamless::decode_fds_bounded` and joins each
+// entry to the manifest on `local_id`.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub(crate) struct HandoffFds {
     /// `(local_id, master fd number, child pid)` for each session handed across the exec.
@@ -1692,33 +1860,6 @@ impl HandoffFds {
             .map(|(lid, fd, pid)| format!("{lid}={fd}:{pid}"))
             .collect::<Vec<_>>()
             .join(",")
-    }
-
-    /// Parse the wire string; malformed entries are SKIPPED (fail-safe), never fabricated.
-    #[must_use]
-    #[cfg(test)]
-    pub fn decode(s: &str) -> Self {
-        let entries = s
-            .split(',')
-            .filter(|e| !e.is_empty())
-            .filter_map(|e| {
-                let (lid, rest) = e.split_once('=')?;
-                let (fd, pid) = rest.split_once(':')?;
-                Some((lid.parse().ok()?, fd.parse().ok()?, pid.parse().ok()?))
-            })
-            .collect();
-        Self { entries }
-    }
-
-    /// The `(fd, pid)` for a manifest record's `local_id`, if handed off. `None` ⇒ that
-    /// session must cold-restart a fresh shell (never silently dropped).
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) fn lookup(&self, local_id: u64) -> Option<(i32, i32)> {
-        self.entries
-            .iter()
-            .find(|(lid, _, _)| *lid == local_id)
-            .map(|(_, fd, pid)| (*fd, *pid))
     }
 }
 
@@ -1764,9 +1905,11 @@ impl SessionHandle {
     /// THE SESSION'S NAME AS A SNAPSHOT SHOWS IT: the person's `meta set
     /// title`, whole, else the registry title without an agent's spinner frame
     /// (`chrome_label::without_spinner_frame`). Every surface that copies a
-    /// session's name once — a connection card or picker, the tab menu's
-    /// connection lines, the connection map — reads it here, so none of them
-    /// freezes one frame of a title animation (the Together run's D7).
+    /// session's name once — the tab tooltip's connection lines, Settings ▸
+    /// Harness's rows — reads it here, so none of them freezes one frame of a
+    /// title animation (the Together run's D7); the Agents surfaces (the
+    /// Overview, the ❯ rows, the needs pill) name a tab by the same rule
+    /// (`App::tab_label_of_session`).
     pub(crate) fn display_title(&self) -> String {
         self.ctx
             .meta
@@ -1805,6 +1948,13 @@ pub(crate) enum RosterChange {
     /// bridge holds (`EVENT * …`); every other reader filters on the two
     /// membership variants and never sees it.
     RetireRequested,
+    /// NOT a membership change either: this instance's last word to its
+    /// bridge before the lanes close (`EVENT * bye <quit|handoff>`,
+    /// [`crate::fabric_launch::bye`]) — a quit withdraws its sessions from the
+    /// roster, a handoff leaves them for the successor. It rides this journal
+    /// for the reason `RetireRequested` does; the record's sid is `*`.
+    #[cfg(any(unix, test))]
+    Bye(aterm_types::fabric_grammar::Bye),
 }
 
 /// WHY a session left the registry — the `reason=` token of an `exits` row, a
@@ -2034,6 +2184,19 @@ pub(crate) struct SessionStore {
     closed_logs: crate::session_log::ClosedLogs,
     /// Only an active journal arms this bounded writer handoff. Off stays None.
     journal_retirements: Option<crate::session_log_journal::Retirements>,
+    /// WHAT THE CRASH JOURNAL HOLDS ON DISK OF THE WORDS ABOUT TYPING
+    /// ([`crate::crash_journal::Durable`]): the window's lane installs it at
+    /// launch (`App::arm_word_durability`), and the control verbs that move a
+    /// word (`hold`, `meta set|unset autopilot`) answer once the image that
+    /// carries it is durable. Unarmed (a registry no journaling lane runs), it
+    /// answers at once. Not carried: the successor arms its own.
+    journal_durable: crate::crash_journal::Durable,
+    /// THE REPLIES OWED FOR INPUT WRITTEN INTO THESE SESSIONS
+    /// ([`crate::control::InputReplies`]): counted by the control server's lanes
+    /// from before an input verb's dispatch until its reply is delivered, and read
+    /// by the App's update Commit and exit, which do not end the process over one.
+    /// Not carried.
+    input_replies: crate::control::InputReplies,
     /// THE BUS MIRROR's closed-session tails, tombstones and adoption latch
     /// (`session_log_mirror`, session log phase 4). Empty, holding no heap,
     /// while no bridge mirrors.
@@ -2067,6 +2230,9 @@ impl SessionStore {
             // log (`session_log_mirror::Shared`): nothing is engaged by it
             // while the node does not mirror.
             tl.slog_mut().bind_mirror(self.mirror.shared());
+            // THE PERSON'S COUNT the log reconciles against (ruling T2).
+            tl.slog_mut()
+                .bind_person(std::sync::Arc::clone(&handle.ctx.human_input));
             tl.record("spawned", format!("state={}", handle.state.as_str()));
             // THE SESSION LOG's session node: `open - spawn|adopt|restore
             // parent=<sid> epoch=<ep>` (an adopted session's log already
@@ -2146,6 +2312,21 @@ impl SessionStore {
         true
     }
 
+    /// Tell this instance's bridge how the instance is leaving: a journal row
+    /// the events lane pushes as `EVENT * bye <quit|handoff>`
+    /// ([`crate::fabric_launch::bye`] waits for the bridge to take it).
+    #[cfg(any(unix, test))]
+    pub(crate) fn say_bye(&mut self, bye: aterm_types::fabric_grammar::Bye) {
+        self.record_roster(
+            "*".to_string(),
+            0,
+            RosterChange::Bye(bye),
+            ExitReason::Unknown,
+            None,
+            ExitActor::Unknown,
+        );
+    }
+
     /// Mark the session with local id `local_id` as having a FROZEN PATH (see the
     /// field): an adopted shell that predates the self-healing sessions, or
     /// one the outgoing process carried as frozen. Idempotent; an unknown id is
@@ -2214,6 +2395,22 @@ impl SessionStore {
     /// Publish the window's harness posture (see the field).
     pub(crate) fn set_harness_posture(&mut self, posture: crate::autopilot::HarnessPosture) {
         self.harness_posture = posture;
+    }
+
+    /// The replies owed for input written into these sessions (see the field).
+    pub(crate) fn input_replies(&self) -> crate::control::InputReplies {
+        self.input_replies.clone()
+    }
+
+    /// What the crash journal holds on disk of the words about typing (see
+    /// the field), for a verb that waits on it outside this lock.
+    pub(crate) fn journal_durable(&self) -> crate::crash_journal::Durable {
+        self.journal_durable.clone()
+    }
+
+    /// Arm the journal's durability for the verbs (see the field).
+    pub(crate) fn set_journal_durable(&mut self, durable: crate::crash_journal::Durable) {
+        self.journal_durable = durable;
     }
 
     /// Mark the session with local id `local_id` as carrying the RE-KEY CHANNEL
@@ -2309,7 +2506,7 @@ impl SessionStore {
 
     /// The exit code [`Self::note_exit_code`] holds for `local_id` until its
     /// deregister moves it onto the journal row. TEST-ONLY.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn noted_exit_code(&self, local_id: u64) -> Option<i32> {
         self.exit_codes.get(&local_id).copied()
     }
@@ -2869,9 +3066,9 @@ fn handle_alive(local_id: u64, parent: Option<SessionId>, master: i32) -> Sessio
         rewrap_gauge: std::sync::Arc::default(),
         human_input: Default::default(),
         launch: Default::default(),
-        generation_look: Default::default(),
         reset_lane: Default::default(),
         crash_journal: Default::default(),
+        typed: Default::default(),
         update_parked: Default::default(),
         witness: Default::default(),
         fenced_writes: Default::default(),
@@ -2896,16 +3093,42 @@ mod tests {
 
     /// A carried render debt round-trips, and a bad row is no debt: not two
     /// integers, zero, past a screen, or `i32::MIN` (whose `abs` overflows).
+    /// The columns owed ride their own key, so the rows key stays the
+    /// `<shift>,<pushed>` an older reader reads.
     #[test]
     fn a_carried_render_debt_round_trips_and_a_bad_row_is_none() {
-        assert_eq!(parse_render_debt(&render_debt_row(-1, 3)), Some((-1, 3)));
-        assert_eq!(parse_render_debt(&render_debt_row(0, 0)), None);
-        assert_eq!(parse_render_debt("1"), None);
-        assert_eq!(parse_render_debt("a,b"), None);
-        assert_eq!(parse_render_debt("4096,-4096"), Some((4096, -4096)));
-        assert_eq!(parse_render_debt("4097,0"), None);
-        assert_eq!(parse_render_debt("-2147483648,0"), None);
-        assert_eq!(parse_render_debt("0,-2147483648"), None);
+        let debt = |shift, pushed, cut| RenderDebt { shift, pushed, cut };
+        for d in [
+            debt(-1, 3, 0),
+            debt(-1, 0, 2),
+            debt(0, 0, 2),
+            debt(4096, -4096, 4096),
+        ] {
+            let (row, cut) = render_debt_keys(Some(d));
+            assert_eq!(parse_render_debt(row.as_deref(), cut), Some(d), "{d:?}");
+        }
+        assert_eq!(
+            render_debt_keys(Some(debt(-1, 0, 3))),
+            (Some("-1,0".to_string()), 3),
+            "the rows as ever, the columns beside them"
+        );
+        assert_eq!(render_debt_keys(Some(debt(0, 0, 2))), (None, 2));
+        assert_eq!(render_debt_keys(Some(RenderDebt::default())), (None, 0));
+        assert_eq!(render_debt_keys(None), (None, 0));
+
+        let rows = |row| parse_render_debt(Some(row), 0);
+        assert_eq!(rows("-1,0"), Some(debt(-1, 0, 0)));
+        assert_eq!(rows("1"), None);
+        assert_eq!(rows("a,b"), None);
+        assert_eq!(rows("0,0"), None, "owes nothing");
+        assert_eq!(rows("4097,0"), None);
+        assert_eq!(rows("-2147483648,0"), None);
+        assert_eq!(rows("0,-2147483648"), None);
+        assert_eq!(rows("0,0,2"), None, "three fields");
+        assert_eq!(parse_render_debt(None, 0), None);
+        assert_eq!(parse_render_debt(None, 4097), None);
+        assert_eq!(parse_render_debt(Some("1,0"), 4097), None);
+        assert_eq!(parse_render_debt(Some("bad"), 2), None, "a bad row is none");
     }
 
     /// A carried crash journal key round-trips, and a bad one is none (round
@@ -3294,8 +3517,18 @@ title = \"zsh\"
             ("supervisor", "claude box (Bash: rm -rf x) — needs you"),
             ("ci@host", "red 100%"),
         ] {
-            write_attention_owned(&s0.ctx, owner, MetaEdit::Set(text)).unwrap();
+            write_attention_owned(&s0.ctx, owner, MetaEdit::Set(text), aterm_slog::Actor::Ctl)
+                .unwrap();
         }
+        // The newest says it is a wait: its kind crosses with it.
+        crate::session_timeline::write_attention_kind(
+            &s0.ctx,
+            "ci@host",
+            MetaEdit::Set("red 100%"),
+            Some(aterm_types::needs::AttentionKind::Wait),
+            aterm_slog::Actor::Ctl,
+        )
+        .unwrap();
         assert!(write_server_attention(
             &s0.ctx,
             crate::input_stall::SERVER_ATTENTION_OWNER,
@@ -3336,9 +3569,10 @@ title = \"zsh\"
             [
                 "- check%20the%20build",
                 "supervisor claude%20box%20(Bash:%20rm%20-rf%20x)%20%E2%80%94%20needs%20you",
-                "ci@host red%20100%25",
+                "ci@host kind=wait red%20100%25",
             ],
-            "every owner's line in write order, the server's own left behind"
+            "every owner's line in write order, with the kind its writer named, \
+             the server's own left behind"
         );
         let claims: Vec<(Option<&str>, bool, bool)> = r
             .iter()
@@ -3405,6 +3639,11 @@ title = \"zsh\"
                 Some("claude box (Bash: rm -rf x) — needs you")
             );
             assert_eq!(meta.attention_owners.get("-"), Some("check the build"));
+            assert_eq!(
+                meta.attention_owners.kinds_field(),
+                "ask:-,-:supervisor,wait:ci@host",
+                "a wait is still a wait in the successor"
+            );
             assert_eq!(
                 meta.attention_owners
                     .get(crate::input_stall::SERVER_ATTENTION_OWNER),
@@ -3481,16 +3720,32 @@ title = \"zsh\"
         ] {
             assert_eq!(parse_carried_supervisor(row), want, "{row:?}");
         }
+        use aterm_types::needs::AttentionKind::{Ask, Wait};
         for (row, want) in [
-            ("ci red", Some(("ci", "red".to_string()))),
+            ("ci red", Some(("ci", None, "red".to_string()))),
             (
                 "ci x%1B%5B31mred%E2%80%AEx",
-                Some(("ci", "x[31mredx".to_string())),
+                Some(("ci", None, "x[31mredx".to_string())),
             ),
+            // The kind its writer named crosses; a kind outside the set, or
+            // on the bare owner's row, is dropped and the entry kept.
+            (
+                "ci kind=wait limited:%20resets%207pm",
+                Some(("ci", Some(Wait), "limited: resets 7pm".to_string())),
+            ),
+            (
+                "ci kind=ask red",
+                Some(("ci", Some(Ask), "red".to_string())),
+            ),
+            ("ci kind=later red", Some(("ci", None, "red".to_string()))),
+            ("- kind=wait red", Some(("-", None, "red".to_string()))),
+            // A kind-less entry whose text opens `kind=` is all text.
+            ("ci kind=wait", Some(("ci", None, "kind=wait".to_string()))),
             ("aterm stalled", None),
             ("bad%20owner text", None),
             ("ci ", None),
             ("ci %0A%09", None),
+            ("ci kind=wait %0A", None),
             ("ci", None),
         ] {
             assert_eq!(parse_carried_attention(row), want, "{row:?}");
@@ -3500,11 +3755,11 @@ title = \"zsh\"
             format!("- {}", "a".repeat(400)),
         );
         assert_eq!(
-            parse_carried_attention(&long).unwrap().1.len(),
+            parse_carried_attention(&long).unwrap().2.len(),
             crate::session_timeline::META_ATTENTION_KEYED_MAX
         );
         assert_eq!(
-            parse_carried_attention(&bare).unwrap().1.len(),
+            parse_carried_attention(&bare).unwrap().2.len(),
             crate::session_timeline::META_ATTENTION_MAX
         );
         // Past the owners' bound, a new owner is refused as a live write is.
@@ -3721,6 +3976,136 @@ title = \"zsh\"
             Some("worker"),
             "and the registry answers the label by local id — what `@<sid> spawn` inherits"
         );
+    }
+
+    /// THE TASK RECORD rides per record (the worker pillar, 2026-10-15): a
+    /// manifest from before the field reads none, and so does a value of the
+    /// wrong type; a worker's record projects as its one row and only its,
+    /// crosses the wire, is in the draw the Commit compares — a mark between
+    /// the park and the Commit stands the Commit down — and seeds the adopting
+    /// session's timeline with the same rev, state, facts and since. A row that
+    /// does not read seeds nothing. Unix's: the Commit's draw
+    /// ([`CarriedClaims`]) is.
+    #[cfg(unix)]
+    #[test]
+    fn the_task_record_rides_per_record_and_absent_reads_none() {
+        use std::time::Duration;
+
+        use crate::task_record::{
+            MarkFenced, TaskMark, TaskState, mark_session_task, mark_session_task_within,
+            seed_carried,
+        };
+        let old_wire = "schema = 1
+
+[[sessions]]
+local_id = 3
+sid = \"s-old\"
+state = \"alive\"
+title = \"zsh\"
+";
+        let read = SessionHandoff::from_toml(old_wire).expect("this build reads an old manifest");
+        assert_eq!(read.sessions[0].task, None, "absent reads None");
+        let typo = SessionHandoff::from_toml(&format!("{old_wire}task = 5\n"))
+            .expect("a wrong-typed row costs the row, never the manifest");
+        let unread = handle(7, None);
+        seed_carried(&unread.ctx, typo.sessions[0].task.as_deref());
+        assert!(
+            unread.ctx.timeline.lock().unwrap().task().is_none(),
+            "and seeds nothing"
+        );
+
+        let subscribers = crate::subscribe::new_registry();
+        let mut store = SessionStore::default();
+        store.register(handle(0, None));
+        let worker = handle(1, None);
+        mark_session_task(
+            &worker.ctx,
+            1,
+            &TaskMark::new(TaskState::Working),
+            &subscribers,
+        )
+        .expect("unfenced");
+        let mut done = TaskMark::new(TaskState::Done);
+        done.why = Some("marker");
+        done.result_bytes = 5;
+        let (record, _) = mark_session_task(&worker.ctx, 1, &done, &subscribers).expect("unfenced");
+        store.register(worker.clone());
+        let manifest = SessionHandoff::from_store(&store);
+        assert_eq!(manifest.sessions[0].task, None);
+        let row = manifest.sessions[1].task.clone().expect("the worker's row");
+        assert!(row.starts_with("rev=2 state=done from=ctl since="), "{row}");
+        let wire = manifest.to_toml().expect("serializes");
+        assert_eq!(
+            wire.matches("\ntask = ").count(),
+            1,
+            "None stays off the wire: {wire}"
+        );
+        assert!(manifest.roundtrips());
+        let back = SessionHandoff::from_toml(&wire).expect("round-trips");
+        assert_eq!(back.sessions[1].task.as_deref(), Some(row.as_str()));
+
+        let now = crate::metrics::now_us();
+        let holder = crate::harness_host::holder();
+        let drawn = CarriedClaims::of_record(&manifest.sessions[1]);
+        assert_eq!(
+            CarriedClaims::of_session(1, &worker.ctx, now, &holder),
+            drawn
+        );
+
+        let adopted = handle(8, None);
+        seed_carried(&adopted.ctx, back.sessions[1].task.as_deref());
+        let seeded = adopted.ctx.timeline.lock().unwrap().task().cloned();
+        let seeded = seeded.expect("seeded");
+        assert_eq!(
+            crate::task_record::TaskRecord {
+                since: record.since,
+                ..seeded
+            },
+            record,
+            "the same record, its since re-anchored"
+        );
+        // The attention flag is the SEEDED META's, never the row's: a row
+        // saying `attention=1` over a meta whose supervisor entry the claims
+        // seed refused reports no news.
+        let raised = back.sessions[1]
+            .task
+            .as_deref()
+            .expect("the row")
+            .replace(" attention=0", " attention=1");
+        let unclaimed = handle(9, None);
+        seed_carried(&unclaimed.ctx, Some(&raised));
+        let seeded = unclaimed.ctx.timeline.lock().unwrap().task().cloned();
+        assert!(!seeded.expect("seeded").attention, "no entry, no flag");
+
+        mark_session_task(
+            &worker.ctx,
+            1,
+            &TaskMark::new(TaskState::Stalled),
+            &subscribers,
+        )
+        .expect("unfenced");
+        assert_ne!(
+            CarriedClaims::of_session(1, &worker.ctx, now, &holder),
+            drawn,
+            "a mark after the park's draw stands the Commit down"
+        );
+        // UNDER THE COMMIT'S FENCE a mark waits (here, not at all) and moves
+        // nothing, so the draw the Commit compares is the one the successor
+        // carries; once the attempt stands down and lifts it, the mark lands.
+        let fenced = CarriedClaims::of_session(1, &worker.ctx, now, &holder);
+        let _ = worker.ctx.fabric.fence_hold(false);
+        let done = TaskMark::new(TaskState::Done);
+        assert_eq!(
+            mark_session_task_within(&worker.ctx, 1, &done, &subscribers, Duration::ZERO),
+            Err(MarkFenced)
+        );
+        assert_eq!(
+            CarriedClaims::of_session(1, &worker.ctx, now, &holder),
+            fenced
+        );
+        worker.ctx.fabric.lift_hold_fence();
+        let landed = mark_session_task_within(&worker.ctx, 1, &done, &subscribers, Duration::ZERO);
+        assert!(landed.is_ok_and(|(_, moved)| moved), "lifted, it lands");
     }
 
     /// The re-key channel rides per record like `frozen_path`: an old manifest
@@ -3953,38 +4338,6 @@ title = \"zsh\"
         assert!(SessionHandoff::from_toml("schema = 999\nsessions = []").is_none());
     }
 
-    /// RFC Rung 1b — the fd/pid channel round-trips and is fail-safe. It is SEPARATE
-    /// from the manifest (so the 1a proof holds); malformed entries are skipped, never
-    /// fabricated, so a corrupt/spoofed `ATERM_SEAMLESS_FDS` fails closed.
-    #[test]
-    fn handoff_fds_encode_decode_roundtrips_and_fails_safe() {
-        let fds = HandoffFds {
-            entries: vec![(0, 6, 12345), (1, 7, 12346), (2, 9, 12347)],
-        };
-        let wire = fds.encode();
-        assert_eq!(wire, "0=6:12345,1=7:12346,2=9:12347");
-        assert_eq!(
-            HandoffFds::decode(&wire),
-            fds,
-            "encode -> decode is the identity"
-        );
-        assert_eq!(fds.lookup(1), Some((7, 12346)));
-        assert_eq!(
-            fds.lookup(99),
-            None,
-            "an unlisted session has no fd (cold-restarts)"
-        );
-
-        // Fail-safe parsing: garbage / partial entries are dropped, not fabricated.
-        let mixed = HandoffFds::decode("0=6:100,junk,1=7,2=x:y,3=8:200,");
-        assert_eq!(
-            mixed.entries,
-            vec![(0, 6, 100), (3, 8, 200)],
-            "only well-formed entries survive"
-        );
-        assert_eq!(HandoffFds::decode(""), HandoffFds::default());
-    }
-
     #[test]
     fn mark_alive_is_monotonic_idempotent_and_fail_safe() {
         let mut store = SessionStore::default();
@@ -4076,7 +4429,7 @@ title = \"zsh\"
                     RosterChange::Exited => {
                         set.remove(&r.sid);
                     }
-                    RosterChange::RetireRequested => {}
+                    RosterChange::RetireRequested | RosterChange::Bye(_) => {}
                 }
             }
             set

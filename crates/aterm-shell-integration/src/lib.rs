@@ -20,7 +20,7 @@
 //! | Shell | Mechanism | How |
 //! |-------|-----------|-----|
 //! | zsh   | ZDOTDIR override | Wrapper `.zshenv` sources user config then ours |
-//! | bash  | `--rcfile` | Loader reads `~/.bashrc` (macOS: the login profiles too) then ours |
+//! | bash  | `--rcfile` (Git Bash: `--login --posix` + `ENV`) | Loader reads `~/.bashrc` (macOS: the login profiles too; Git Bash: what a login shell reads) then ours |
 //! | fish  | `XDG_DATA_DIRS` | Vendor conf.d auto-loading |
 //! | pwsh/powershell | `-NoExit -Command` | Argv override dot-sources our `.ps1` after profiles, then lays readline's chords over PSReadLine's Windows mode (`prepare_powershell`) |
 //! | wsl   | `WSLENV` + `wsl.exe --exec` | `/p` path-translates our dir, then bash's `--rcfile` runs INSIDE the distro |
@@ -118,6 +118,14 @@ pub const BODY_POINTER_VAR: &str = "ATERM_INTEGRATION_POINTER";
 /// `633;P;AtermIntegration=<16-hex folder address>;id=<nonce>` — which body the
 /// shell runs (`status integration_rev=`).
 pub const INTEGRATION_REV_KEY: &str = "AtermIntegration";
+
+/// The OSC 633 `P` property every integration signs right after the OSC 7 it
+/// sends before each prompt: `633;P;AtermCwd=<that OSC 7's URI>;id=<nonce>`,
+/// the shell's own word for its cwd, which a report a program writes cannot
+/// forge (docs/DESIGN-cwd-reports-2026-10-19.md). The OSC 7 itself carries no
+/// nonce: an engine from before the property ignores it and reads the OSC 7
+/// as it always did, so the nonce never reaches a path an older engine stores.
+pub const CWD_REPORT_KEY: &str = "AtermCwd";
 
 /// The shells whose scripts have a LOADER that re-sources a newer body — the
 /// ones a host exports [`BODY_POINTER_VAR`] to.
@@ -218,6 +226,87 @@ impl ShellType {
             Self::PowerShell
         }
     }
+
+    /// Return the canonical lowercase name of this shell type.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Zsh => "zsh",
+            Self::Bash => "bash",
+            Self::Fish => "fish",
+            Self::PowerShell => "powershell",
+            Self::Wsl => "wsl",
+            Self::Cmd => "cmd",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Return `true` when this shell has a supported integration strategy (`!Unknown`).
+    #[must_use]
+    pub const fn is_known(self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+
+    /// Return `true` when this shell is a POSIX/Unix shell (`Zsh`, `Bash`, or `Fish`).
+    #[must_use]
+    pub const fn is_posix_shell(self) -> bool {
+        matches!(self, Self::Zsh | Self::Bash | Self::Fish)
+    }
+
+    /// Return `true` when this shell is a Windows host shell (`PowerShell`, `Wsl`, or `Cmd`).
+    #[must_use]
+    pub const fn is_windows_shell(self) -> bool {
+        matches!(self, Self::PowerShell | Self::Wsl | Self::Cmd)
+    }
+}
+
+/// Encode a shell integration revision record (`rev_hash`, `shell_kind`, `nonce_prefix`) into 16 LE bytes.
+#[must_use]
+pub const fn encode_integration_rev_le(
+    rev_hash: u64,
+    shell_kind: u32,
+    nonce_prefix: u32,
+) -> [u8; 16] {
+    [
+        rev_hash as u8,
+        (rev_hash >> 8) as u8,
+        (rev_hash >> 16) as u8,
+        (rev_hash >> 24) as u8,
+        (rev_hash >> 32) as u8,
+        (rev_hash >> 40) as u8,
+        (rev_hash >> 48) as u8,
+        (rev_hash >> 56) as u8,
+        shell_kind as u8,
+        (shell_kind >> 8) as u8,
+        (shell_kind >> 16) as u8,
+        (shell_kind >> 24) as u8,
+        nonce_prefix as u8,
+        (nonce_prefix >> 8) as u8,
+        (nonce_prefix >> 16) as u8,
+        (nonce_prefix >> 24) as u8,
+    ]
+}
+
+/// Decode 16 LE bytes into a shell integration revision record (`rev_hash`, `shell_kind`, `nonce_prefix`).
+#[must_use]
+pub const fn decode_integration_rev_le(bytes: [u8; 16]) -> (u64, u32, u32) {
+    let rev_hash = (bytes[0] as u64)
+        | ((bytes[1] as u64) << 8)
+        | ((bytes[2] as u64) << 16)
+        | ((bytes[3] as u64) << 24)
+        | ((bytes[4] as u64) << 32)
+        | ((bytes[5] as u64) << 40)
+        | ((bytes[6] as u64) << 48)
+        | ((bytes[7] as u64) << 56);
+    let shell_kind = (bytes[8] as u32)
+        | ((bytes[9] as u32) << 8)
+        | ((bytes[10] as u32) << 16)
+        | ((bytes[11] as u32) << 24);
+    let nonce_prefix = (bytes[12] as u32)
+        | ((bytes[13] as u32) << 8)
+        | ((bytes[14] as u32) << 16)
+        | ((bytes[15] as u32) << 24);
+    (rev_hash, shell_kind, nonce_prefix)
 }
 
 /// Result of preparing shell integration injection.
@@ -385,6 +474,14 @@ pub fn augment_with_nonce(injection: &mut InjectionEnv, hex: &str) {
 /// one fresh 64-hex nonce the host has already authorized.
 pub const REKEY_PATH_VAR: &str = "ATERM_REKEY_PATH";
 
+/// What a fresh bash's wrapper appends to its [`REKEY_PATH_VAR`] for the one
+/// file the shell writes itself: `<re-key path>.trap`, the DEBUG trap its
+/// startup files set, handed to the integration (which chains it) without the
+/// fork a command substitution takes (`bash_debug_trap_handover!`). Nothing
+/// reads it after that load; the host removes it with the session, or its
+/// sweep once it is stale (a session the final exit or a crash dropped unrun).
+pub const DEBUG_TRAP_SUFFIX: &str = ".trap";
+
 /// The shells whose scripts carry the re-key hook — the ones a host exports
 /// [`REKEY_PATH_VAR`] to.
 #[must_use]
@@ -418,12 +515,49 @@ pub const START_RC_KEY: &str = "AtermStartRc";
 /// periodic hooks.
 pub const START_FLAGS_KEY: &str = "AtermStartFlags";
 
-/// The shells whose wrapper and integration carry the spare's holds. macOS
-/// only: the host's escape scan, which a WARM spare needs, reads XNU's
-/// process table.
+/// The START record's other startup roots, fish's alone: its sysconf folder,
+/// then each vendor conf.d folder its conf.d loop walks, joined by `\x00` (the
+/// one byte no path holds), each one's backslashes, `;` and control bytes
+/// escaped as [`START_RC_KEY`]'s are (a space may stay as it is).
+pub const START_ROOTS_KEY: &str = "AtermStartRoots";
+
+/// The shells whose integration carries a spare's WARM hold (at its first
+/// prompt). macOS and Linux: the host's escape scan, which a WARM spare needs,
+/// reads XNU's process table there, and `/proc` here (aterm-gui
+/// `spare::escape_scan`); Windows has neither.
 #[must_use]
 pub const fn has_spare_hold(shell: ShellType) -> bool {
-    cfg!(target_os = "macos") && matches!(shell, ShellType::Zsh | ShellType::Bash)
+    cfg!(any(target_os = "macos", target_os = "linux"))
+        && matches!(shell, ShellType::Zsh | ShellType::Bash | ShellType::Fish)
+}
+
+/// The shells whose wrapper also carries the PARKED hold, ahead of every
+/// startup file of the person's: zsh's `.zshenv` and bash's `--rcfile`. fish
+/// reads no file of aterm's ahead of the user's (its vendor conf.d runs with
+/// theirs), so a fish spare is spawned WARM or not at all. A system file the
+/// shell reads before aterm's ([`pre_hold_files`]) runs before the hold.
+#[must_use]
+pub const fn has_parked_hold(shell: ShellType) -> bool {
+    has_spare_hold(shell) && matches!(shell, ShellType::Zsh | ShellType::Bash)
+}
+
+/// The system files `shell` reads BEFORE aterm's parked hold, wherever it was
+/// built to: zsh's global zshenv, which no option skips (compiled in:
+/// `/etc/zshenv` on macOS, `/etc/zsh/zshenv` on Debian, Ubuntu and Arch), and
+/// on Linux bash's system bashrc, which a non-login bash reads before its
+/// `--rcfile` (`/etc/bash.bashrc` there; macOS's bash has none). Measured on
+/// Ubuntu 24.04 (zsh 5.9, bash 5.2.21): `zsh -o sourcetrace` read
+/// `/etc/zsh/zshenv` before `$ZDOTDIR/.zshenv`, and `strace` of `bash --rcfile`
+/// opened `/etc/bash.bashrc` before the rcfile. One that exists has run in a
+/// parked spare before anyone asked: parking it needs the warm gate, and its
+/// folder is the spare's own (aterm-gui `spare`).
+#[must_use]
+pub const fn pre_hold_files(shell: ShellType) -> &'static [&'static str] {
+    match shell {
+        ShellType::Zsh => &["/etc/zshenv", "/etc/zsh/zshenv"],
+        ShellType::Bash if cfg!(target_os = "linux") => &["/etc/bash.bashrc"],
+        _ => &[],
+    }
 }
 
 /// THE TYPED RE-KEY: what a line typed at a shell's prompt runs to
@@ -829,24 +963,44 @@ fn strip_comment_lines(script: &str) -> String {
     out
 }
 
-/// The name of this build's script folder: the first 16 hex digits of a SHA-256
-/// over every (path, bytes) pair of [`script_set`], length-prefixed so no two
-/// sets can concatenate alike. Computed once per process.
+/// The name of this build's script folder: the `aterm_hash::FxHasher` (the
+/// workspace's fixed-key hash, wyhash-style over 16 bytes a step) of every
+/// (path, bytes) pair of [`script_set`], length-prefixed so no two sets can
+/// concatenate alike, as 16 hex digits. Computed once per process, by the
+/// first `prepare`, which a launch's session 0 waits on.
+///
+/// WHY NOT SHA-256 OR FNV-1a/64, as it was before: the name is no security
+/// boundary (the folder is verified byte for byte before any shell is pointed
+/// at it, [`script_set_matches`]) and the set is this build's own embedded
+/// text, so nothing chooses colliding inputs; 64 bits make a chance collision
+/// between the few sets one machine holds no likelier than with SHA-256's first
+/// 64. Measured 2026-10-19 over the 365,188 bytes of this set (profiling build,
+/// one test thread, six rounds): FNV-1a/64 0.56-0.66 ms, FxHasher 0.028 ms
+/// (SHA-256 was 2.2-2.9 ms). Session 0's spawn waits for this warm: it reaches
+/// its fork about 0.5 ms after the intake, before the event loop is built.
+///
+/// THE NAME OUTLIVES THE PROCESS, though `aterm_hash` fixes `FxHasher`'s values
+/// only in-process (FNV-1a/64 is its one hash stable across releases): it is a
+/// folder on disk and the revision an adopted shell carries to the next build
+/// (`shell_body::own_rev`, `status integration_rev=`). That is safe because a
+/// name is never trusted for content: a build whose hash differs only names
+/// the same set differently, so it installs its folder once and re-points each
+/// adopted shell once, as any build with new scripts does.
 #[must_use]
 pub fn script_set_address() -> &'static str {
     static ADDRESS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ADDRESS.get_or_init(|| {
-        let mut hash = aterm_digest::Sha256::new();
-        hash.update(b"aterm shell-integration script set v1\0");
+        use std::hash::Hasher as _;
+        let mut hash = aterm_hash::FxHasher::default();
+        hash.write(b"aterm shell-integration script set v3\0");
         for (path, bytes) in script_set() {
             for part in [path.as_bytes(), bytes.as_bytes()] {
-                hash.update((part.len() as u64).to_be_bytes());
-                hash.update(part);
+                hash.write_u64(part.len() as u64);
+                hash.write(part);
             }
         }
-        let digest = hash.finalize();
         let mut out = String::with_capacity(16);
-        for &b in &digest[..8] {
+        for b in hash.finish().to_be_bytes() {
             out.push(nibble_to_hex(b >> 4));
             out.push(nibble_to_hex(b & 0x0F));
         }
@@ -1029,7 +1183,23 @@ fn injection_for(shell: ShellType, base: &Path) -> Option<InjectionEnv> {
 /// the contained shell
 /// (or by another user, in the shared `/tmp`) and sourced by the next tab's
 /// unsandboxed shell.
+///
+/// In a Cargo test binary, `<its scratch root>/cache/aterm/shell-integration`
+/// (`aterm_uds::test_binary`) unless the test set `$XDG_CACHE_HOME` (Unix), so a
+/// test never writes the person's cache; [`per_user_cache_dir`] is the rule
+/// everywhere else.
 fn cache_dir() -> PathBuf {
+    #[cfg(any(unix, windows))]
+    if let Some(root) = aterm_uds::test_binary::scratch_root()
+        && (cfg!(windows) || std::env::var_os("XDG_CACHE_HOME").is_none())
+    {
+        return root.join("cache").join("aterm").join("shell-integration");
+    }
+    per_user_cache_dir()
+}
+
+/// [`cache_dir`] in every process but a Cargo test binary: the per-user cache.
+fn per_user_cache_dir() -> PathBuf {
     #[cfg(windows)]
     {
         match std::env::var_os("LOCALAPPDATA") {
@@ -1121,6 +1291,13 @@ fn ensure_scripts(base: &Path) -> Result<(), std::io::Error> {
 /// and a FIFO that is gone, or 50 failed reads, ends the shell. A cold shell
 /// pays one `[ -n ]`, two expansions and one `[ -p ]`, and is left with no new
 /// variable.
+///
+/// `go <folder>` (2026-10-18) continues as a cold shell started now in that
+/// absolute folder: the host names it only where every shell's start would
+/// name it so (`$PWD` the kernel's path; aterm-gui `spawn_folder::retarget_folder`),
+/// and the `cd` leaves `$OLDPWD` as that start does: zsh sets it to `$PWD`,
+/// bash keeps the one it inherited, else leaves it unset and exported. Quiet:
+/// nothing of the person's has run to hook a `cd`.
 macro_rules! spare_parked_hold {
     () => {
         "\
@@ -1129,20 +1306,78 @@ if [ -n \"${ATERM_REKEY_PATH:-}\" ]; then
   __aterm_spare_fifo=\"${ATERM_REKEY_PATH%/rekey/*}/spare/${ATERM_REKEY_PATH##*/}\"
   if [ -p \"$__aterm_spare_fifo\" ]; then
     printf '\\033]633;P;AtermSpare=parked;id=%s\\a' \"${ATERM_SHELL_NONCE:-}\" >/dev/tty 2>/dev/null
-    __aterm_spare_n=0
+    __aterm_spare_n=0 __aterm_spare_cd=
     while :; do
       if IFS= read -r __aterm_spare_go < \"$__aterm_spare_fifo\"; then
-        case $__aterm_spare_go in run) __aterm_spare_mode=warm; break ;; go) break ;; esac
+        case $__aterm_spare_go in
+          run) __aterm_spare_mode=warm; break ;;
+          go) break ;;
+          'go /'*) __aterm_spare_cd=${__aterm_spare_go#go }; break ;;
+        esac
       else
         __aterm_spare_n=$((__aterm_spare_n + 1))
         { [ \"$__aterm_spare_n\" -lt 50 ] && [ -p \"$__aterm_spare_fifo\" ]; } || exit 0
       fi
     done 2>/dev/null
+    if [ -n \"${__aterm_spare_cd:-}\" ]; then
+      if [ -n \"${ZSH_VERSION:-}\" ]; then
+        builtin cd -q -L -- \"$__aterm_spare_cd\" 2>/dev/null && OLDPWD=$PWD
+      elif [ -n \"${OLDPWD+1}\" ]; then
+        __aterm_spare_o=$OLDPWD
+        builtin cd -L -- \"$__aterm_spare_cd\" 2>/dev/null && OLDPWD=$__aterm_spare_o
+      else
+        builtin cd -L -- \"$__aterm_spare_cd\" 2>/dev/null && { unset OLDPWD; export OLDPWD; }
+      fi
+    fi
     SECONDS=0
   fi
 fi
 [ -n \"${__aterm_spare_mode:-}\" ] || unset __aterm_spare_fifo __aterm_spare_mode
-unset __aterm_spare_n __aterm_spare_go
+unset __aterm_spare_n __aterm_spare_go __aterm_spare_cd __aterm_spare_o
+"
+    };
+}
+
+/// THE RC'S DEBUG TRAP, HANDED OVER (2026-10-17): the last lines before both
+/// bash wrappers source the integration. bash hides the DEBUG trap from a
+/// sourced file — `.` unsets it for the file unless functrace is on — so the
+/// integration's own `trap -p DEBUG` never saw a trap the user's startup files
+/// set (bash-preexec, atuin), and what the `.` did on return finished the job:
+/// bash 4.4 and later kept the integration's trap and dropped the user's,
+/// bash 3.2 put the user's back over the integration's, losing every command
+/// mark (both measured, 3.2.57 and 5.3.0). Here, at the rcfile's own level,
+/// the trap is visible: its text goes to `<re-key path>.trap`
+/// ([`DEBUG_TRAP_SUFFIX`]; into a variable, by a fork, only for a shell with no
+/// re-key path or a file it cannot open), then the trap is cleared, so the `.`
+/// has nothing to put back, and the integration chains the text. Untraced, as
+/// the integration is (its THE TRACE): a user's XTRACE and VERBOSE go off for
+/// these lines and come back for the `.`.
+///
+/// Only ahead of a FRESH load, the one that wires the trap: with the loaded
+/// guard set — a startup file sourced the integration itself, the line its
+/// header gives for a shell aterm did not start — the `.` below is an upgrade
+/// in place or a skip, which wires nothing, and the trap there is that load's
+/// own. Cleared, it was gone for good: every command lost its marks (review,
+/// 2026-10-17; `an_integrated_bash_whose_rc_sources_the_integration_keeps_its_marks`).
+macro_rules! bash_debug_trap_handover {
+    () => {
+        "\
+# The DEBUG trap the startup files set, handed to the integration: a `.` hides it.
+{ __aterm_rc_flags=$-; builtin set +xv; } 2>/dev/null
+if [ -z \"${ATERM_SHELL_INTEGRATION_INSTALLED:-}\" ]; then
+  __aterm_rc_debug_handed=1
+  if [ -z \"${ATERM_REKEY_PATH:-}\" ] ||
+     ! { builtin trap -p DEBUG; } 2>/dev/null >|\"$ATERM_REKEY_PATH.trap\"; then
+    __aterm_rc_debug_trap=$(builtin trap -p DEBUG 2>/dev/null)
+  fi
+  builtin trap - DEBUG
+fi
+case $__aterm_rc_flags in
+  *x*v*|*v*x*) builtin unset __aterm_rc_flags; builtin set -xv ;;
+  *x*) builtin unset __aterm_rc_flags; builtin set -x ;;
+  *v*) builtin unset __aterm_rc_flags; builtin set -v ;;
+  *) builtin unset __aterm_rc_flags ;;
+esac
 "
     };
 }
@@ -1173,9 +1408,10 @@ source \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.zsh\"
 );
 
 /// bash wrapper rcfile that sources standard profile chain then our integration:
-/// the loader on macOS, under Git Bash, and inside WSL ([`WSL_LAUNCH_SH`]), whose
-/// terminals start LOGIN shells. Every other Unix starts bash with
-/// [`BASH_LOADER`] instead ([`prepare_bash`]).
+/// the loader on macOS and inside WSL ([`WSL_LAUNCH_SH`]), whose terminals start
+/// LOGIN shells. Every other Unix starts bash with [`BASH_LOADER`] instead
+/// ([`prepare_bash`]), and so does Git Bash, as a login shell
+/// ([`BASH_LOGIN_START`]).
 ///
 /// `bash --rcfile` launches an interactive non-login shell which normally reads
 /// only `.bashrc`. We source the login profile chain (since terminal sessions
@@ -1202,6 +1438,9 @@ elif [ -f \"$HOME/.profile\" ]; then
 fi
 # Source .bashrc (--rcfile skips it; .bash_profile may or may not source it)
 [ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"
+",
+    bash_debug_trap_handover!(),
+    "\
 # Load aterm integration
 . \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.bash\"
 "
@@ -1230,10 +1469,12 @@ fi
 /// POSIX mode would have moved to `~/.sh_history`, the caller's own `ENV`) and
 /// reads what bash would have — for a login shell `/etc/profile` and the first of
 /// `~/.bash_profile`, `~/.bash_login`, `~/.profile` (unless `--noprofile`), for
-/// `--norc` nothing. The same start kitty and Ghostty use.
+/// `--norc` nothing. The same start kitty and Ghostty use. Git Bash starts every
+/// tab that way, as a login shell ([`BASH_LOGIN_START`]).
 ///
 /// Like the wrappers it opens with [`spare_parked_hold!`]: a warm spare bash
-/// parks before any startup file on Linux as it does on macOS.
+/// parks before any startup file of the person's on Linux as it does on macOS;
+/// the system bashrc it read first is one of [`pre_hold_files`].
 const BASH_LOADER: &str = concat!(
     spare_parked_hold!(),
     "\
@@ -1247,7 +1488,11 @@ if [ -n \"${ATERM_BASH_POSIX:-}\" ]; then
   fi
   builtin set +o posix
   builtin shopt -u inherit_errexit 2>/dev/null
-  if [ -n \"${ATERM_BASH_HISTFILE:-}\" ]; then
+  if [ \"${ATERM_BASH_HISTFILE:-}\" = home ]; then
+    # Git Bash: the history file bash names outside POSIX mode, from its own HOME.
+    HISTFILE=$HOME/.bash_history
+    builtin unset ATERM_BASH_HISTFILE
+  elif [ -n \"${ATERM_BASH_HISTFILE:-}\" ]; then
     builtin export -n HISTFILE
     builtin unset ATERM_BASH_HISTFILE
   fi
@@ -1293,6 +1538,9 @@ else
   # bash has read its system bashrc already: ~/.bashrc is what it reads next.
   [ -f \"$HOME/.bashrc\" ] && builtin source \"$HOME/.bashrc\"
 fi
+",
+    bash_debug_trap_handover!(),
+    "\
 # Load aterm integration
 builtin source \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.bash\"
 "
@@ -1307,8 +1555,8 @@ builtin source \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.bash\"
 /// exactly this `utf8_chunks` loop (each maximal valid run is kept, each
 /// non-empty invalid subpart becomes one U+FFFD). Spelled out because
 /// `Path::to_string_lossy` (and `String::from_utf8_lossy`) are hardened
-/// `byte_loss` boundaries under the Trust L0 strict gate; the explicit loop
-/// carries ordinary provable obligations instead.
+/// `byte_loss` boundaries under the Trust lane (`ship trust run`); the explicit
+/// loop carries ordinary provable obligations instead.
 ///
 /// [`OsStr::as_encoded_bytes`]: std::ffi::OsStr::as_encoded_bytes
 // Skip: the remaining rows are the `Utf8Chunks` iterator's `next` (a pure
@@ -1377,22 +1625,53 @@ fn prepare_zsh(base: &Path) -> InjectionEnv {
     }
 }
 
+/// Whether this platform starts an integrated bash as a LOGIN shell in POSIX mode,
+/// `bash --login --posix` with `$ENV` naming [`BASH_LOADER`]: Git Bash on Windows
+/// (2026-10-18). Every Windows terminal starts Git Bash as a login shell (Windows
+/// Terminal's profile `bash.exe -i -l`, Git's own `git-bash.exe`, VS Code), which
+/// reads `/etc/profile` and the first of `~/.bash_profile`, `~/.bash_login`,
+/// `~/.profile`, and loads Git's prompt and completion (`profile.d/git-prompt.sh`)
+/// ONCE. The `--rcfile` start [`BASH_WRAPPER`] gave it is a non-login shell, for
+/// which Git's `/etc/bash.bashrc` loads them again, and bash read that file twice
+/// (as its system bashrc, then from `/etc/profile`, whose guard against a second
+/// read sets its variable in a subshell): three loads of git-completion.bash and
+/// git-prompt.sh, about 0.27 s each, and a tab at its prompt 0.5 s after a login
+/// Git Bash (1.28 s against 0.74 s; the 2026-10-18 verifier's
+/// v4-gitbash-start-loads-git-prompt-three-times). POSIX mode reads `$ENV` and
+/// nothing else, and the loader puts bash back and reads what a login bash reads
+/// (the start kitty and Ghostty give a login bash on Linux).
+pub(crate) const BASH_LOGIN_START: bool = cfg!(windows);
+
 /// The bash loader this platform starts bash on: [`BASH_LOADER`] (`bash/bashrc`)
-/// on every Unix but macOS, whose terminals start non-login shells; elsewhere
-/// (macOS, Git Bash on Windows) the login-style [`BASH_WRAPPER`] (`bash/rcfile`).
-pub(crate) const BASH_LOADER_FILE: &str = if cfg!(all(unix, not(target_os = "macos"))) {
-    "bashrc"
-} else {
-    "rcfile"
-};
+/// on every Unix but macOS, whose terminals start non-login shells, and under Git
+/// Bash, which reads it as a login shell's `$ENV` ([`BASH_LOGIN_START`]); on macOS
+/// the login-style [`BASH_WRAPPER`] (`bash/rcfile`).
+pub(crate) const BASH_LOADER_FILE: &str =
+    if cfg!(all(unix, not(target_os = "macos"))) || BASH_LOGIN_START {
+        "bashrc"
+    } else {
+        "rcfile"
+    };
 
 fn prepare_bash(base: &Path) -> InjectionEnv {
+    let mut env_add = vec![(
+        "ATERM_SHELL_INTEGRATION_DIR".to_string(),
+        path_env_value(base),
+    )];
+    if BASH_LOGIN_START {
+        shell_args::posix_start_env(&mut env_add, false, &|key| std::env::var(key).ok());
+        return InjectionEnv {
+            env_add,
+            argv_override: Some(vec![
+                "bash".to_string(),
+                "--login".to_string(),
+                "--posix".to_string(),
+            ]),
+        };
+    }
     let rcfile = base.join("bash").join(BASH_LOADER_FILE);
     InjectionEnv {
-        env_add: vec![(
-            "ATERM_SHELL_INTEGRATION_DIR".to_string(),
-            path_env_value(base),
-        )],
+        env_add,
         argv_override: Some(vec![
             "bash".to_string(),
             "--rcfile".to_string(),
@@ -1628,6 +1907,14 @@ const CMD_DEFAULT_PROMPT: &str = "$P$G";
 /// directory — see [`prepare_cmd`] for why and for what it measurably does.
 const CMD_PROMPT_TITLE: &str = "$e]0;$P$e\\";
 
+/// Bracketed paste (2004) and in-band size reports (2048) off at every cmd
+/// prompt: cmd reads neither, and a program killed with them on left every
+/// later paste in `ESC [ 200 ~` brackets (which cmd then ran as a command) and
+/// every resize typed as `ESC [ 48 ; … t` (measured 2026-10-18 under
+/// OpenConsole, which forwards a program's requests). The pwsh prompt does the
+/// same.
+const CMD_PROMPT_MODES: &str = "$e[?2004l$e[?2048l";
+
 /// cmd.exe injection: a title, prompt marks and cwd, woven into `%PROMPT%`.
 ///
 /// cmd has no profile, no preexec hook and no scripting seam, so this is a
@@ -1659,7 +1946,10 @@ const CMD_PROMPT_TITLE: &str = "$e]0;$P$e\\";
 ///   from its environment — the owner's rule.) `$P`
 ///   needs no sanitising, unlike the pwsh title: a Win32 file name cannot hold
 ///   a character from 1 through 31, so no directory can end the OSC early. It
-///   is the full path, not `~\…` — cmd's prompt has no string operations.
+///   is the full path, not `~\…` — cmd's prompt has no string operations — and
+///   the tab reads the profile folder at its head as `~` (`~\aterm`, as a pwsh
+///   tab's title says), in aterm-gui's title rung (`tab_label::informative`);
+///   `ctl title` keeps the path as cmd set it.
 /// * `OSC 633;P;Cwd=` — the cwd, so the tab label tracks `cd` and a new tab
 ///   opens where this one is. `$P` yields a native `C:\dir`, which the engine
 ///   stores verbatim; building a `file://` URI would need percent-encoding cmd
@@ -1670,6 +1960,8 @@ const CMD_PROMPT_TITLE: &str = "$e]0;$P$e\\";
 ///   `cwd=C:\Windows\Temp`, the directory the command moved TO.
 /// * `OSC 133;A` / `133;B` — prompt start/end, which is what jump-to-prompt
 ///   (Ctrl+Shift+Up/Down) navigates by.
+/// * `CSI ? 2004 l` / `CSI ? 2048 l` — bracketed paste and in-band size reports
+///   off ([`CMD_PROMPT_MODES`]), which a killed program would otherwise leave on.
 ///
 /// NOT emitted: `133;C` and `133;D`. `C` marks the moment a command starts
 /// EXECUTING, and cmd gives no hook between "Enter pressed" and "command
@@ -1712,8 +2004,11 @@ fn cmd_prompt(inherited: Option<&str>) -> String {
         return user.to_string();
     }
     let title = CMD_PROMPT_TITLE;
+    let modes = CMD_PROMPT_MODES;
     let id = NONCE_PLACEHOLDER;
-    format!("{title}$e]133;A;id={id}$e\\$e]633;P;Cwd=$P;id={id}$e\\{user}$e]133;B;id={id}$e\\")
+    format!(
+        "{title}{modes}$e]133;A;id={id}$e\\$e]633;P;Cwd=$P;id={id}$e\\{user}$e]133;B;id={id}$e\\"
+    )
 }
 
 #[cfg(test)]
@@ -1723,4 +2018,5 @@ mod tests {
     include!("tests_tty.rs");
     include!("tests_spare.rs");
     include!("tests_pwsh_keys.rs");
+    include!("tests_windows_marks.rs");
 }

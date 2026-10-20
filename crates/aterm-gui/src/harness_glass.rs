@@ -228,6 +228,98 @@ impl Stamp {
     }
 }
 
+/// THE LOOP'S PAUSE ON THE GLASS (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §10.5.3, item 4; [`on_pause`]): when it ends, as the local clock and day
+/// its unix second falls on — read once, where the fact arrived — and how
+/// many short turns in a row it follows. A clock time, never a countdown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PauseGlass {
+    /// When the pause ends.
+    pub(crate) until: Stamp,
+    /// The short turns in a row it follows (the first point seen is one).
+    pub(crate) short: u8,
+}
+
+impl PauseGlass {
+    /// The glass of `plan`: its end's clock and day in the zone's offset at
+    /// that instant, UTC's where the zone cannot be read (the trail's rule).
+    #[must_use]
+    pub(crate) fn of(plan: crate::PausePlan) -> Self {
+        let until = Stamp::at(plan.at_unix).unwrap_or_else(|| {
+            let minute = plan.at_unix.rem_euclid(86_400) / 60;
+            Stamp {
+                clock: Clock::of_minute(u16::try_from(minute).unwrap_or(0)),
+                day: plan.at_unix.div_euclid(86_400),
+            }
+        });
+        Self {
+            until,
+            short: plan.short,
+        }
+    }
+
+    /// When it ends as a title says it: `18:41`, and on another local day
+    /// than `today` (a pause past midnight) its weekday, `Sat 00:12`, as an
+    /// armed timer names a later day; the clock alone with no day read for
+    /// the build (`None`).
+    #[must_use]
+    pub(crate) fn until_words(self, today: Option<i64>) -> String {
+        match today.filter(|today| *today != self.until.day) {
+            Some(_) => format!(
+                "{} {}",
+                Weekday::of_days(self.until.day).short(),
+                self.until.clock.as_str()
+            ),
+            None => self.until.clock.as_str().to_owned(),
+        }
+    }
+
+    /// The chip's title's part (§10.5.1): `pausing until 18:41 after 3
+    /// short turns`, `… after a short turn` for one.
+    #[must_use]
+    pub(crate) fn title_words(self, today: Option<i64>) -> String {
+        let until = self.until_words(today);
+        match self.short {
+            0 | 1 => format!("pausing until {until} after a short turn"),
+            n => format!("pausing until {until} after {n} short turns"),
+        }
+    }
+
+    /// Settings ▸ Harness's state line (§10.5.1): `pausing until 18:41 (3
+    /// short turns in a row)`, `(a short turn)` for one.
+    #[must_use]
+    pub(crate) fn state_words(self, today: Option<i64>) -> String {
+        let until = self.until_words(today);
+        match self.short {
+            0 | 1 => format!("pausing until {until} (a short turn)"),
+            n => format!("pausing until {until} ({n} short turns in a row)"),
+        }
+    }
+
+    /// The Autopilot node's description's lead, as a screen reader says it
+    /// (§10.5.1): `Pausing until 18:41.`, on another local day `Pausing
+    /// until Saturday at 00:12.`
+    #[cfg_attr(
+        not(any(test, a11y_tree)),
+        allow(
+            dead_code,
+            reason = "the chips' accessibility nodes describe it; the tree is built only under \
+                      the `a11y_tree` cfg (Linux)"
+        )
+    )]
+    #[must_use]
+    pub(crate) fn spoken(self, today: Option<i64>) -> String {
+        match today.filter(|today| *today != self.until.day) {
+            Some(_) => format!(
+                "Pausing until {} at {}.",
+                Weekday::of_days(self.until.day).long(),
+                self.until.clock.as_str()
+            ),
+            None => format!("Pausing until {}.", self.until.clock.as_str()),
+        }
+    }
+}
+
 /// The local day number at wall second `unix` (the trail's rule: UTC's day
 /// where the zone cannot be read).
 #[must_use]
@@ -287,6 +379,9 @@ pub(crate) struct SessionGlass {
     /// that moves under the same face ([`on_task`]): a title someone reads
     /// is built again ([`ChipGlass::trail`], its low byte).
     trail_gen: u64,
+    /// The loop's pause after short turns (§10.5.3, item 4), while one
+    /// stands.
+    pause: Option<PauseGlass>,
     /// The label lit now, and the instant its dwell ends.
     lit: Option<(Act, Instant)>,
     /// Nothing lights again before this: [`QUIET`] after the last label
@@ -312,6 +407,7 @@ impl SessionGlass {
                 )
             }),
             trail: self.trail_gen.to_le_bytes()[0],
+            pause: self.pause,
             ..ChipGlass::default()
         }
     }
@@ -470,8 +566,8 @@ pub(crate) fn wall_today() -> (i64, i64) {
 /// clock is read against (§10.2.3, item 3): ONE wall read, for the date and
 /// the day's age — an event's (a hover's start, an act's arrival under one,
 /// a face's move under one), never a frame's — and none at all where the
-/// session has no trail and the title names no face clock (`stamped`).
-/// Empty, and no day, where neither.
+/// session has no trail and the title names no face clock or pause
+/// (`stamped`). Empty, and no day, where neither.
 pub(crate) fn trail_title(
     glass: &std::collections::HashMap<u64, SessionGlass>,
     session: u64,
@@ -562,6 +658,27 @@ pub(crate) fn on_task(app: &mut App, session: u64, face: Option<TaskFace>, at_ms
     } else {
         app.harness_glass.insert(session, now);
     }
+    true
+}
+
+/// THE LOOP'S PAUSE of session `session` moved to `plan` (`None`: none
+/// stands; `HarnessFact::Pause`, §10.5.3 item 4): kept for the chip's title
+/// and the page with its end's local clock and day ([`PauseGlass::of`], read
+/// here once). The pause moves no face and nothing the chip draws at rest,
+/// so the trail's generation moves instead: a title someone is reading is
+/// built again ([`ChipGlass::trail`], folded into the footer's term only
+/// while it is read), and a frame at rest keys nothing new. Whether the
+/// glass moved.
+pub(crate) fn on_pause(app: &mut App, session: u64, plan: Option<crate::PausePlan>) -> bool {
+    let pause = plan.map(PauseGlass::of);
+    let was = app.harness_glass.get(&session).copied().unwrap_or_default();
+    if was.pause == pause {
+        return false;
+    }
+    let mut now = was;
+    now.pause = pause;
+    now.trail_gen = now.trail_gen.wrapping_add(1);
+    app.harness_glass.insert(session, now);
     true
 }
 

@@ -105,10 +105,10 @@ pub(super) fn frame_key(
         scroll_frac_px: 0,
         relaunch_fp: 0,
         badge_fp: 0,
+        deck_fp: 0,
         level_up_fp: 0,
         band_fp: 0,
         presence_fp: 0,
-        conn_wire_fp: 0,
         system_dark: false,
         link_caption: None,
         claude_footer_fp: 0,
@@ -235,8 +235,15 @@ fn explicit_inactive_selection_focus_flip_invalidates_and_repaints() {
 }
 
 /// Drives the `AsymmetricPadLayout` cache actions against the real `RepaintKey` comparison.
-/// The spec xref gate is its only caller.
-pub(super) fn run_asymmetric_pad_layout_conformance() {
+#[test]
+fn the_real_asymmetric_pad_layout_conforms() {
+    crate::conformance_support::on_conformance_stack(
+        "AsymmetricPadLayout",
+        run_asymmetric_pad_layout_conformance,
+    );
+}
+
+fn run_asymmetric_pad_layout_conformance() {
     let model = aterm_models_render::asymmetric_pad_layout_model();
     let picked = model
         .successors("PickLayout", &model.init_state())

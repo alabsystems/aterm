@@ -40,16 +40,25 @@
 > the naming of busy processes), as did three tests that sampled no spec. Three specs were narrowed to
 > what remains (`pressure-level-table`, `swapped-kib-counter`, and `meminfo-facts`, whose `MemInfo`
 > methods had served only the sampler). This file states the 13 specs that remain over the 12 tests
-> that remain. `scaled-ticks-saturating` left with the
+> that remain. On 2026-10-17 `lone_group_leader` (and its Linux parser `stat_pgrp`) joined, for a
+> file citation's shell in front, with a spec and a test each: 15 specs over 14 tests. `scaled-ticks-saturating` left with the
 > sampler; the slimmed crate no longer depends on `aterm-objc`, so the re-measure's third blocker
 > (its `global_asm!`) no longer applies to the rows that remain.
+>
+> On 2026-10-19 the system-awareness readers joined (`Probe::core_ticks`, `cpu_layout`, `memory_detail`,
+> `gpu`, `volume`; the pure `CoreTicks::{busy,total}`, `machine::{layout_of, dt_assignment,
+> conventional_assignment, memory_detail_of, percent_of, volume_of, c_path}`, `macos::{cores_of, le_u64,
+> cluster_kind}`, `linux::{proc_stat_cores, cpulist, memory_detail}` and `read_into`), with 19 tests in
+> `src/tests.rs` and the IOKit declaration probe in `tests/iokit_sdk.rs`. Their specs are not recovered
+> here yet; the tables below still state the 15 specs over the 14 tests that predate them (the volume
+> tests, which joined on 2026-10-17 with `volumes`, are not recovered either).
 
-Source: `crates/aterm-sysprobe`. Every `#[test]` is in `crates/aterm-sysprobe/src/tests.rs` (12 tests: 7 run
-on every host, 1 needs `unix`, 1 needs `macos` or `linux`, 3 need `macos`). Each was read together with the
+Source: `crates/aterm-sysprobe`. Every `#[test]` is in `crates/aterm-sysprobe/src/tests.rs` (14 tests: 8 run
+on every host, 1 needs `unix`, 1 needs `macos` or `linux`, 4 need `macos`). Each was read together with the
 code it reaches in `src/lib.rs`, `src/linux.rs` and `src/macos.rs`. Nothing was compiled or run for this
 file. The claims come from reading the code.
 
-Result: **13 specs**, covering **12 tests**. Every test is a spec sample (§4).
+Result: **15 specs**, covering **14 tests**. Every test is a spec sample (§4).
 
 ## 0. Notation used in the statements
 
@@ -91,41 +100,43 @@ process-cwd-path-own	other	process_cwd, process_path, macos::process_cwd, macos:
 group-memory-members	other	group_memory, macos::group_memory, macos::footprint_kib	Effects(libproc). ∀ pid: group_memory(pid) = None if pid = 0, if pid > i32::MAX, if the short info is unreadable, if pgid = 0, or if no member was measured. Otherwise it is Some{pgid = pbsi_pgid(pid), measured = the number of the first min(n, MAX_GROUP_PIDS) listed group members > 0 whose footprint_kib is Some, footprint_mib = (sat-sum of those footprint_kib)/1024}, where footprint_kib(m) = proc_pid_rusage(m, RUSAGE_INFO_V4).ri_phys_footprint / 1024 when the call succeeds. So a child that took its own process group is never counted in its parent's group. On every platform but macOS it is always None.	T::a_groups_memory_is_its_own_members_footprint	FFI proc_listpids into a fixed array, unsafe, loop with a saturating sum	0,7,8
 machine-memory-within-physical	other	physical_memory_mib, machine_memory, memory_pressure, macos::machine_memory, macos::physical_memory_mib, macos::memory_pressure	Effects(sysctl and HOST_VM_INFO64, or /proc/meminfo). machine_memory() = Some(m) ∧ physical_memory_mib() = Some(p) ⇒ m.available_mib ≤ p, and on Linux also m.used_mib ≤ p. On macOS used_mib ≤ p holds only empirically, because used_mib_of is not capped (§5). Pure cores: macOS uses available_mib_of(free, inactive, purgeable, page, physical) and used_mib_of(internal, purgeable, wire, compressor, page); Linux uses available = min(avail/1024, total/1024) and used = (total sat- avail)/1024 over meminfo-facts' (total, avail). physical_memory_mib is (hw.memsize >> 20).filter(> 0) on macOS and (total_kib ≥ 1024).then(total_kib/1024) on Linux. memory_pressure is kern.memorystatus_vm_pressure_level through pressure_of on macOS and None elsewhere.	T::the_machines_memory_and_pressure_are_read_on_this_host	FFI, OnceLock, composition of pure callees	0,4,8
 swapped-kib-counter	other	swapped_kib, macos::swapped_kib	Effects(HOST_VM_INFO64 and vm.pagesize, or /proc/vmstat and /proc/self/auxv). On macOS swapped_kib() = (swapins sat+ swapouts) sat* page_kib with page_kib = vm.pagesize div 1024, and None when that is 0 or unread or the kernel refuses the statistics. On Linux it is swap_pages(read_bounded(/proc/vmstat)) sat* page_kib, with page_kib = auxv_value(read_bounded_bytes(/proc/self/auxv), 6 = AT_PAGESZ) div 1024 when that is > 0, else 4, read once per process. Every other platform answers None. The kernel's counters only grow, so two reads k1 then k2 on one host satisfy k1 ≤ k2.	T::the_swap_counter_reads_on_this_host_and_never_runs_backwards	FFI, OnceLock, composition with swap-pages-sum and auxv-lookup	0,4,8
+stat-pgrp	contract	linux::stat_pgrp	∀ stat: stat_pgrp(stat) = the third whitespace token after the LAST ')' of stat, parsed as u32 (the pgrp field after state and ppid), or None when stat has no ')', fewer than three tokens follow it, or that token does not parse. So a command name holding spaces or ')' cannot move the field.	T::a_stat_line_gives_its_group_past_any_command_name	&str rsplit_once, iterator nth, u32 parse	0,1,3,5,7,13
+lone-group-leader	other	lone_group_leader, macos::lone_group_leader, macos::complete_lone_group, macos::short_info	Effects(libproc). macOS returns a nonempty kernel name only for a readable positive leader whose aligned, nonempty, nonfull listing contains exactly that one positive pid (zero padding permitted). Failed, empty, misaligned, full, overlong, absent-leader or extra-member listings return None. The pure complete_lone_group predicate enforces the listing rule and its test reads captured arrays only. Every non-macOS platform returns None: Linux direct children are not a complete group census. All observations are snapshots, without a process-lifetime guarantee.	T::only_a_complete_group_census_admits_its_leader	FFI proc_pidinfo and proc_listpids into fixed arrays; pure byte-count and membership adapter	0,7,8
 ```
 
 ### Kinds
 
 | kind | count | ids |
 |---|---|---|
-| contract | 6 | meminfo-facts, swap-pages-sum, auxv-lookup, read-bounded-cap, used-mib-of, available-mib-of |
+| contract | 7 | meminfo-facts, swap-pages-sum, auxv-lookup, read-bounded-cap, used-mib-of, available-mib-of, stat-pgrp |
 | table-property | 1 | pressure-level-table |
 | invariant | 1 | whole-lines-torn-tail-ignored |
 | refinement | 1 | swap-meter-rate |
-| other (effectful host facts) | 4 | process-cwd-path-own, group-memory-members, machine-memory-within-physical, swapped-kib-counter |
+| other (effectful host facts) | 5 | process-cwd-path-own, group-memory-members, machine-memory-within-physical, swapped-kib-counter, lone-group-leader |
 
-Total: 6 + 1 + 1 + 1 + 4 = 13.
+Total: 7 + 1 + 1 + 1 + 5 = 15.
 
-### Gap histogram (number of the 13 specs each gap blocks)
+### Gap histogram (number of the 15 specs each gap blocks)
 
 | gap | specs blocked |
 |---|---|
-| 0 | 13 |
-| 1 | 9 |
+| 0 | 15 |
+| 1 | 10 |
 | 2 | 2 |
-| 3 | 8 |
+| 3 | 9 |
 | 4 | 3 |
-| 5 | 4 |
-| 7 | 6 |
-| 8 | 5 |
+| 5 | 5 |
+| 7 | 8 |
+| 8 | 6 |
 | 11 | 1 |
-| 13 | 5 |
+| 13 | 6 |
 
 Gaps 6, 9, 10, 12, 14, 15, 16 and 17 are not listed per spec. Gap 6 (plain-Rust clause publication) and
 gap 14 (Clean elaborator coverage) apply to every spec, depending on which lane discharges it, and gap 16
 (soundness) applies to every proof. No spec here cites another crate's types any more, so gap 12 blocks
 none.
 
-## 2. Test → spec map (TSV; all 12)
+## 2. Test → spec map (TSV; all 14)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 
@@ -143,20 +154,24 @@ src/tests.rs	a_groups_memory_is_its_own_members_footprint	group-memory-members
 src/tests.rs	the_machines_memory_and_pressure_are_read_on_this_host	machine-memory-within-physical	available-mib-of, used-mib-of, pressure-level-table
 src/tests.rs	the_swap_counter_reads_on_this_host_and_never_runs_backwards	swapped-kib-counter	
 src/tests.rs	the_swap_meter_reads_a_rate_over_a_span_of_its_readings	swap-meter-rate	
+src/tests.rs	a_stat_line_gives_its_group_past_any_command_name	stat-pgrp	
+src/tests.rs	only_a_complete_group_census_admits_its_leader	lone-group-leader	
 ```
 
 ## 3. Coverage
 
-- 12 tests read. All 12 map to one of the 13 specs.
+- 14 tests read. All 14 map to one of the 15 specs.
 - One spec has no primary test of its own (`whole-lines-torn-tail-ignored`). It is sampled as a secondary
   part of `every_proc_read_is_bounded_to_4_kib`, whose primary spec is `read-bounded-cap`. That test is
   deleted only when both of its specs are proved.
 - Every spec has at most one primary test. The value of this crate's migration is the generalisation:
   each test samples one or two inputs of a total function over all inputs.
-- Four tests (the 3 `macos` ones and the `macos`/`linux` one) read the live host, and
+- Four tests (3 `macos` ones and the `macos`/`linux` one) read the live host, and
   `every_proc_read_is_bounded_to_4_kib` reads `/dev/zero` and files of its own. Their specs are the five
   `Effects(...)` rows. They retire only with a platform model (gap 8). Until then, the pure-core halves
-  can be proved and the host test can be cut down to the effectful part. The `unix` test builds its
+  can be proved and the host test can be cut down to the effectful part. The new lone-group test exercises
+  its production pure census adapter, not libproc. The unsafe child-process fixture was removed because
+  its cleanup did not run on assertion failure and could signal a recycled group id. The `unix` test builds its
   auxiliary vector from fixed pairs and reads nothing of the host.
 
 ## 4. Tests that are not spec samples

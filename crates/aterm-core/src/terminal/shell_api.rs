@@ -200,7 +200,7 @@ impl Terminal {
         let after = self.iterm2.host_cell_px();
         if self.modes.in_band_size_reports && after != before {
             super::state_accessors::push_in_band_size_report(
-                &mut self.transient.response_buffer,
+                &mut self.transient,
                 self.grid.rows(),
                 self.grid.cols(),
                 after,

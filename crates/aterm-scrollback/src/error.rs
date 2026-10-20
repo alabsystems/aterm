@@ -45,7 +45,7 @@ pub enum ScrollbackError {
 /// for zero).
 ///
 /// Deliberately LOOP-FREE, digit-by-constant-power-of-ten: an earlier spelling
-/// with the classic `v % 10` / `v /= 10` loop sent the strict gate's integer
+/// with the classic `v % 10` / `v /= 10` loop sent the Trust lane's integer
 /// engine into a non-terminating solve (loop-carried division; observed 40+
 /// CPU-minutes before being killed). Twenty straight-line constant divisions
 /// carry no loop invariant to infer and no panic obligations at all (constant

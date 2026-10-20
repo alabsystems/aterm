@@ -408,13 +408,25 @@ fn x3_a_reply_to_another_session_does_not_cancel_my_expired() {
 
 /// X3, reached by a stranger: an `answer re=<X>` published onto B's lane (not
 /// A's) settles nothing of A's.
+///
+/// THE DEADLINE IS NEVER WAITED OUT, as in X3: the scenario runs under one the
+/// hang detector outlasts, and the `expire-deadlines-at-once` marker, written
+/// once the stranger's answer is at B, fires the sweep. A real `dl=2000` both
+/// cost the test its two seconds and raced the answer's delivery: an answer
+/// landing after the sweep tests nothing.
 #[test]
 fn a_strangers_reply_to_someone_else_does_not_settle_the_askers_deadline() {
-    let w = World::boot("r15st", &[]);
+    const DL_MS: u64 = 600_000;
+    let w = World::boot_with(
+        "r15st",
+        &[],
+        &[("ATERM_LINK_FAULT", "expire-deadlines-at-once-while-marked")],
+    );
     w.wait_ready();
     let (a, b) = w.two_sessions();
+    let expired_lane = format!("/f/{FLEET}/in/{}/{a}/{}/expired", w.node, w.node);
     let r = w.verb(&format!(
-        "@{a} post to=@{b} kind=ask dl=2000 --wait=60000 unanswered"
+        "@{a} post to=@{b} kind=ask dl={DL_MS} --wait=60000 unanswered"
     ));
     assert!(r.ok(), "{}", r.header());
     let x = off_of(r.header());
@@ -432,6 +444,15 @@ fn a_strangers_reply_to_someone_else_does_not_settle_the_askers_deadline() {
         )
         .expect("answer to B");
     until("the stranger's answer at B", || id_at_off(&w, &b, ans));
+    // THE ORDER THE BUG NEEDS, PINNED: the answer was delivered before any
+    // sweep could judge X.
+    assert_eq!(
+        lane_re(&w, &expired_lane, x),
+        0,
+        "no sweep may have run before the marker"
+    );
+    std::fs::write(w.state.join("expire-deadlines-now"), b"1\n")
+        .expect("arm the impatient deadline sweep");
     let expired = until_within(PERIODIC_DEADLINE, "A's expired row", || {
         w.inbox(&a)
             .into_iter()
@@ -444,7 +465,7 @@ fn a_strangers_reply_to_someone_else_does_not_settle_the_askers_deadline() {
     // ask's `expired` is in A's inbox, a repeat for X would be there before it.
     let y = off_of(
         w.verb(&format!(
-            "@{a} post to=@{b} kind=ask dl=300 --wait=60000 barrier"
+            "@{a} post to=@{b} kind=ask dl={DL_MS} --wait=60000 barrier"
         ))
         .header(),
     );
@@ -519,23 +540,44 @@ fn x5_wait_ack_past_its_deadline_answers_expired() {
     let w = World::boot_flags("rvx5", &["--receipts"]);
     w.wait_ready();
     let (a, b) = w.two_sessions();
-    let expired_lane = format!("/f/{FLEET}/in/{}/{a}/{}/expired", w.node, w.node);
-    let mut answers = Vec::new();
-    for (i, dl) in [700u64, 1500].into_iter().enumerate() {
-        let t = Instant::now();
-        let r = w.verb(&format!(
-            "@{a} post to=@{b} kind=ask dl={dl} --wait-ack nobody-acks-{i}"
-        ));
-        let took = t.elapsed();
-        let exp = kv(r.header(), "off")
-            .and_then(|n| n.parse::<u64>().ok())
-            .map(|o| lane_re(&w, &expired_lane, o));
-        eprintln!(
-            "--wait-ack dl={dl} #{i}: {} after {took:?} ; expired records re=off: {exp:?}",
-            r.header()
-        );
-        answers.push(r.header().to_string());
-    }
+    // THE TWO DEADLINES RUN AT ONCE, each post on its own control connection:
+    // both are real wall-clock `dl=`s (the bound under test is the endpoint's
+    // `dl=` plus grace), so in sequence the test sat out their sum.
+    //
+    // AND EACH WAIT IS RELEASED BY ITS OWN VERDICT. Two waits parked on A's
+    // endpoint at once are a case the sequence never had: the first `expired`
+    // must not answer the second. So at the moment of each answer, A's inbox
+    // holds an `expired` naming THAT post's offset — the row the wait matched.
+    let answers: Vec<(String, bool)> = std::thread::scope(|scope| {
+        let posts: Vec<_> = [700u64, 1500]
+            .into_iter()
+            .enumerate()
+            .map(|(i, dl)| {
+                let (w, a, b) = (&w, &a, &b);
+                scope.spawn(move || {
+                    let t = Instant::now();
+                    let r = w.verb(&format!(
+                        "@{a} post to=@{b} kind=ask dl={dl} --wait-ack nobody-acks-{i}"
+                    ));
+                    let took = t.elapsed();
+                    let own = kv(r.header(), "off").is_some_and(|off| {
+                        w.inbox(a).iter().any(|row| {
+                            kv(row, "kind") == Some("expired") && kv(row, "re") == Some(off)
+                        })
+                    });
+                    eprintln!(
+                        "--wait-ack dl={dl} #{i}: {} after {took:?}; its own expired in A's inbox: {own}",
+                        r.header()
+                    );
+                    (r.header().to_string(), own)
+                })
+            })
+            .collect();
+        posts
+            .into_iter()
+            .map(|post| post.join().expect("a --wait-ack post"))
+            .collect()
+    });
     // A verdict given to a node that is not here: the ack is still queued on
     // the bus.
     {
@@ -559,8 +601,10 @@ fn x5_wait_ack_past_its_deadline_answers_expired() {
         assert!(got.is_some(), "the ack to a gone node is queued on the bus");
     }
     assert!(
-        answers.iter().all(|h| h.starts_with("ERR expired")),
-        "--wait-ack bounded by dl= answers: {answers:?}"
+        answers
+            .iter()
+            .all(|(h, own)| h.starts_with("ERR expired") && *own),
+        "--wait-ack bounded by dl= answers, each released by its own `expired`: {answers:?}"
     );
 }
 

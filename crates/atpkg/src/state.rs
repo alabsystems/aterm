@@ -20,6 +20,10 @@
 //!   installed member whose group's new pin has no artifact for this target (a sibling's
 //!   row reads `held: <owner>'s pinned build …`); deferred, never a fault.
 //!
+//! A program BUILT INTO aterm ([`crate::builtin`]) is in none of these: no pass installs it,
+//! so it never has a row, and only `which` names its state, `built in: aterm <version>`
+//! (`— SHADOWED by <path>` when a copy earlier on `PATH` runs instead).
+//!
 //! A row in a retired spelling (`extra —`, `installed via`, `needs admin`, `blocked by`) is
 //! unknown, and the next pass rewrites it.
 //!
@@ -223,6 +227,29 @@ pub fn system(path: &Path, retired: Option<&str>) -> String {
 pub fn shadowed(build: u64, path: &Path) -> String {
     let mut s = String::from(MANAGED_PREFIX);
     s.push_str(&crate::vendor_direct::build_label(build));
+    s.push_str(" — SHADOWED by ");
+    s.push_str(&path.display().to_string());
+    s
+}
+
+/// The head of a program built into aterm's state ([`built_in`]).
+pub const BUILT_IN_PREFIX: &str = "built in: aterm ";
+
+/// `built in: aterm <version>`: a program the one `aterm` binary serves under an argv0
+/// alias ([`crate::builtin`]), updated with aterm and never from the store.
+#[must_use]
+pub fn built_in(version: &str) -> String {
+    let mut s = String::from(BUILT_IN_PREFIX);
+    s.push_str(version);
+    s
+}
+
+/// `built in: aterm <version> — SHADOWED by <path>`: [`built_in`], with a copy earlier on
+/// `PATH` that runs instead. Its head is not [`MANAGED_PREFIX`], so [`shadowed_by`] never
+/// reads it as a managed copy's shadow.
+#[must_use]
+pub fn built_in_shadowed(version: &str, path: &Path) -> String {
+    let mut s = built_in(version);
     s.push_str(" — SHADOWED by ");
     s.push_str(&path.display().to_string());
     s

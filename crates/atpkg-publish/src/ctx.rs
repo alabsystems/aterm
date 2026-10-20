@@ -55,8 +55,8 @@ pub struct IdentityPaths {
 pub struct Ctx {
     /// `$HOME`.
     pub home: PathBuf,
-    /// The aterm checkout this binary was built from (for `build-local`, `lane install`
-    /// and the candidate gate); the snapshot lanes never read it.
+    /// The aterm checkout this binary was built from (for `build-local` and `lane
+    /// install`); the snapshot lanes never read it.
     pub repo_root: PathBuf,
     /// The lanes' state root (`$XDG_STATE_HOME/aterm-auto`, else
     /// `~/.local/state/aterm-auto`).

@@ -63,8 +63,9 @@
 //! worker FINISHED its task — its token, or a done reply to the done check,
 //! with no prompt of a person's or an orchestrator's since
 //! (`super::upgrade::FinishedScan`; `done:finished`), read once a restart
-//! from `upgrade_drive::FINISHED_ONCE_BYTES` before the record's end — a
-//! token older than that reads open, and the carry-on is typed as before.
+//! from `upgrade_drive::FINISHED_ONCE_BYTES` before the record's end, and
+//! from further back where that window settles nothing (a token behind more
+//! wakes than that is still read).
 //! The restart itself is still made (the memory banner's included); only the
 //! carry-on is not. A conversation whose LAST WORDS ARE A DONE REPORT in
 //! words, its task not finished by its record, is typed the carry-on's facts
@@ -179,15 +180,15 @@ use super::accounts;
 use super::upgrade::{self, Dialect, SessionFile, Version};
 use super::upgrade_drive::{
     Client, Hand, Job, Kernel, Live, Opts, Records, Report, SAME_PROGRAM, Screen,
-    SessionRosterCache, St, TAIL_BYTES, Targets, Terminated, Typed, alive, composer_clear,
-    composer_empty, connect, continuation_composer_empty, conversation_live, conversation_typed_by,
-    cwd_of, earlier_tabs, exe_of, finished_where_written, first_word, foreground_shell, held,
-    home_carried, host_roster, ids, is_our_ancestor, kernel_start, launch_kept, ledger,
-    lefts_through, line_model_of, live_background, load, model_and_mark, native_root, note_stuck,
-    now_s, owned_by_aterm, process_in_tab, record_asked, restart_models, restore, roster, said,
-    said_done_where_written, save, screen, since, squash, state_dir, sweep_lock, table,
-    tail_to_end, take_back_ask, terminate, turn, turn_fenced, turn_key_where_written, type_line,
-    typing_fence, under_hand, unique_tab_for_group,
+    SessionRosterCache, St, TAIL_BYTES, Targets, Terminated, Typed, WhereWritten, alive,
+    composer_clear, composer_empty, connect, continuation_composer_empty, conversation_live,
+    conversation_typed_by, credits_billed_for, cwd_of, earlier_tabs, exe_of,
+    finished_where_written, first_word, foreground_shell, held, home_carried, host_roster, ids,
+    is_our_ancestor, kept_move, kernel_start, launch_kept, ledger, left_to_person, line_model_of,
+    live_background, load, model_and_mark, native_root, note_stuck, now_s, owned_by_aterm,
+    process_in_tab, record_asked, restart_models, restore, roster, said, save, screen, since,
+    squash, state_dir, sweep_lock, table, tail_to_end, take_back_ask, terminate, turn, turn_fenced,
+    type_line, typing_fence, under_hand, unique_tab_for_group,
 };
 use crate::supervise::approvals;
 use crate::supervise::limit::one_line;
@@ -230,6 +231,7 @@ pub(super) const CLAUDE_LAUNCH_ENV: [(&str, &str); 1] = [(SURVEY_SWITCH_VAR, "1"
 pub(super) const SURVEY_SWITCH_VAR: &str = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY";
 
 /// What a relaunch line is made from.
+#[derive(Clone, Copy)]
 pub(super) struct Launch<'a> {
     /// The conversation `--resume` names.
     pub(super) session: &'a str,
@@ -270,13 +272,45 @@ pub(super) struct Launch<'a> {
     /// process it replaces had in its own exec environment
     /// ([`Snapshot::login`]: set and empty is the default login NAMED, which
     /// is not the same line as none), or an account move's target. `None`
-    /// adds nothing: the process had no such variable, and the new one takes
-    /// its shell's, as every relaunch did before accounts existed.
+    /// adds nothing on an ordinary retained-model/opted-in line: the new
+    /// process takes its shell's, as before. A new model with billing off
+    /// instead explicitly removes a captured-absent selector with its full
+    /// profile context; it cannot inherit a changed shell login.
     pub(super) login: Option<&'a str>,
     /// THE PROCESS IT REPLACES AUTHENTICATED BY ITS STORED LOGIN, by its own
     /// exec environment ([`Snapshot::stored_login`]): the usage tap's first
     /// question ([`super::tap::gate`]). `false` puts no tap on the line.
     pub(super) stored_login: bool,
+    /// New model selection requires target-context equality before any signal.
+    pub(super) billing: ModelBilling<'a>,
+}
+
+/// Whether a planned line requests a new model, rather than retaining the
+/// session's existing choice. Unknown live context remains explicit.
+#[derive(Clone, Copy)]
+pub(super) enum ModelBilling<'a> {
+    Keep,
+    Move(Option<&'a super::profile::Context>),
+}
+
+/// A new model under the key off needs known matching target context and a
+/// named model. An unrepresented/default target is not a free entitlement.
+fn billing_allows_launch(
+    usage_credits: bool,
+    billing: ModelBilling<'_>,
+    model: Option<&str>,
+    target: Option<&super::profile::Context>,
+) -> bool {
+    match billing {
+        ModelBilling::Keep => true,
+        ModelBilling::Move(_) if usage_credits => true,
+        ModelBilling::Move(from) => {
+            model.is_some_and(|model| !model.is_empty())
+                && from.zip(target).is_some_and(|(from, target)| {
+                    from.selection == super::profile::Selection::Standard && from == target
+                })
+        }
+    }
 }
 
 /// The REQUIRED environment of a relaunch line for `login`
@@ -307,17 +341,42 @@ pub(super) fn required_env<'a>(
         .collect()
 }
 
+/// The [`Snapshot::shell`] of an agent no shell holds: an aterm tab's own
+/// program (`aterm -e claude`, `exec muse` in a tab; `Job::TabProgram`), a
+/// Claude Code's, a codex-alab's, a Muse Code's, an agy's or a Gemini CLI's.
+/// Its snapshot is kept for every reader of the agent (its transcript, its
+/// limit and its reset's zone, its exit, the crash journal), and nothing
+/// relaunches it in its own tab: every plan, restart and relaunch on exit of
+/// it is refused `not-a-shell-job`, and it promises none
+/// ([`resumes_on_exit`], [`carries_restart`]). The crash journal and a quit's
+/// layout carry it like any agent, so a cold restore brings its conversation
+/// back in the reopened tab's fresh shell. Pid 0 is no process: the harness's
+/// `alive` reads it gone.
+pub const NO_SHELL: u32 = 0;
+
+/// The ledger's words for a plan [`NO_SHELL`] refuses.
+pub(super) const NO_SHELL_DETAIL: &str =
+    "the agent is its tab's own program, no shell's job: nothing would read a relaunch line";
+
 /// Plan the relaunch from the live process: `shell` (the parent the job read
 /// proved holds the agent, [`foreground_shell`]; never re-derived), its
 /// dialect, the heal it needs, the resume directory, and the line
 /// ([`line_for`]). The upgrade plans twice: before its announcement, so an
-/// uncarryable launch is refused early, and again before its signal.
+/// uncarryable launch is refused early, and again before its signal. No
+/// shell ([`NO_SHELL`]) is refused for good: nothing would read the line.
 pub(super) fn plan(
     opts: &Opts,
     launch: &Launch<'_>,
     shell: u32,
     t: &[(u32, u32, String)],
 ) -> Result<Plan, NoPlan> {
+    if shell == NO_SHELL {
+        return Err(NoPlan::Refused {
+            why: "not-a-shell-job".to_string(),
+            what: "not-a-shell-job".to_string(),
+            detail: NO_SHELL_DETAIL.to_string(),
+        });
+    }
     let Some(dialect) = shell_dialect(shell, t) else {
         return Err(NoPlan::Wait("shell-dialect"));
     };
@@ -333,6 +392,25 @@ pub(super) fn plan(
     // A line that asks no model of its own never carries a `--model` the
     // record marks FAILED ([`line_model_of`]).
     let model = line_model_of(opts, launch.session, launch.argv, launch.model);
+    let required = required_env(launch.home, launch.homedir, launch.login);
+    let exact = match launch.billing {
+        ModelBilling::Move(Some(from)) if !opts.usage_credits => {
+            from.for_launch(&opts.home, &want, &required)
+        }
+        _ => None,
+    };
+    if !billing_allows_launch(
+        opts.usage_credits,
+        launch.billing,
+        model,
+        exact.as_ref().map(|env| &env.context),
+    ) {
+        return Err(NoPlan::Refused {
+            why: "model-billing-context".to_string(),
+            what: "model-billing-context".to_string(),
+            detail: "the target model's profile context is unknown or differs from the captured billing context".to_string(),
+        });
+    }
     // The usage tap, where `[harness] usage_tap` names this aterm
     // ([`Opts::usage_tap`]) and its gate holds for the relaunched process in
     // the directory it starts in ([`tap_of`]).
@@ -340,7 +418,13 @@ pub(super) fn plan(
         .usage_tap
         .as_ref()
         .and_then(|armed| tap_of(opts, launch, armed, &want));
-    let line = line_tapped(
+    let exact_values: Vec<(&str, &str)> = exact.as_ref().map_or_else(Vec::new, |env| {
+        env.values
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect()
+    });
+    let line = line_tapped_clear(
         dialect,
         heal.as_deref(),
         cd.as_deref(),
@@ -349,7 +433,12 @@ pub(super) fn plan(
         launch.resume.then_some(launch.session),
         model,
         launch.mode,
-        &required_env(launch.home, launch.homedir, launch.login),
+        if exact.is_some() {
+            &exact_values
+        } else {
+            &required
+        },
+        exact.as_ref().map(|env| env.unset.as_slice()),
         tap.as_deref(),
     )?;
     Ok(Plan {
@@ -468,6 +557,26 @@ pub(super) fn line_tapped(
     required: &[(&str, &str)],
     tap: Option<&str>,
 ) -> Result<String, NoPlan> {
+    line_tapped_clear(
+        dialect, heal, cd, exe, argv, session, model, mode, required, None, tap,
+    )
+}
+
+/// Every fallback retains the explicit removals along with required values.
+#[allow(clippy::too_many_arguments)]
+fn line_tapped_clear(
+    dialect: Dialect,
+    heal: Option<&Path>,
+    cd: Option<&str>,
+    exe: &Path,
+    argv: &[String],
+    session: Option<&str>,
+    model: Option<&str>,
+    mode: Option<&str>,
+    required: &[(&str, &str)],
+    unset: Option<&[&str]>,
+    tap: Option<&str>,
+) -> Result<String, NoPlan> {
     let mut flags =
         upgrade::rewrite_argv(argv, session.unwrap_or("-")).map_err(|e| NoPlan::Refused {
             why: format!("argv:{e}"),
@@ -485,8 +594,9 @@ pub(super) fn line_tapped(
     // is REQUIRED stays on every try, first on the line.
     let both: Vec<(&str, &str)> = required.iter().copied().chain(CLAUDE_LAUNCH_ENV).collect();
     let tapped = tap.map(|value| with_tap(flags.clone(), value));
-    let line = |env: &[(&str, &str)], flags: &[String]| {
-        upgrade::relaunch_line_env(dialect, heal, cd, env, exe, flags)
+    let line = |env: &[(&str, &str)], flags: &[String]| match unset {
+        Some(unset) => upgrade::relaunch_line_env_clear(dialect, heal, cd, env, unset, exe, flags),
+        None => upgrade::relaunch_line_env(dialect, heal, cd, env, exe, flags),
     };
     tapped
         .as_deref()
@@ -516,6 +626,139 @@ pub(super) fn with_tap(mut flags: Vec<String>, value: &str) -> Vec<String> {
         .unwrap_or(flags.len());
     flags.splice(at..at, ["--settings".to_string(), value.to_string()]);
     flags
+}
+
+// ------------------------------------------------------- a worker's first line
+
+/// The Claude Code a MANAGER runs, as a worker it starts must run it (`spawn
+/// agent=claude`): the program its process runs ([`launched`]) and the Claude
+/// home and login its own exec environment names — the pairs a relaunch of
+/// that process carries ([`required_env`]). aterm strips `CLAUDE*` from every
+/// shell it spawns, so a manager under a Claude home of its own would
+/// otherwise start workers under the default one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallerClaude {
+    /// The program the manager's process runs: aterm's managed twin or the
+    /// native install's build, as [`launched`] reads it.
+    pub exe: PathBuf,
+    /// [`accounts::HOME_ENV`] the worker's line carries: the manager's own
+    /// where it is absolute; a relative one (empty included) as the
+    /// directory it names from where the manager filed its record, absolute,
+    /// since the worker runs in another directory ([`worker_homes`]).
+    pub home: Option<String>,
+    /// The `HOME` the worker's line carries: the manager's own where it has
+    /// no `CLAUDE_CONFIG_DIR` and that `HOME` is not the user's, whose
+    /// `.claude` then holds its records ([`worker_homes`], the rule of
+    /// [`home_carried`]); `None` for a manager under the user's own.
+    pub homedir: Option<String>,
+    /// [`accounts::LOGIN_ENV`] likewise (set and empty is the default login
+    /// named).
+    pub login: Option<String>,
+}
+
+/// [`CallerClaude`] of process `pid`, a session's foreground job, under the
+/// user's `home`: `None` when its argv cannot be read or it runs no Claude
+/// program.
+#[must_use]
+pub fn caller_claude(pid: u32, home: &Path) -> Option<CallerClaude> {
+    let args = atpkg::caller_shell::process_args(pid)?;
+    let (exe, _) = launched(
+        &args.argv,
+        exe_of(pid).as_deref(),
+        &native_root(home),
+        false,
+    )?;
+    let vars = super::upgrade_drive::HomeVars::of(&args);
+    // Where the manager's Claude Code keeps its records, by the one resolver
+    // its relaunch reads them with ([`Records::of_process`]).
+    let records = Records::of_process(
+        home,
+        vars,
+        pid,
+        || aterm_sysprobe::process_cwd(pid),
+        args.env_var("PWD"),
+    );
+    let (claude_home, homedir) = worker_homes(home, vars, records.dir());
+    Some(CallerClaude {
+        exe,
+        home: claude_home,
+        homedir,
+        login: args.env_var(accounts::LOGIN_ENV).map(str::to_owned),
+    })
+}
+
+/// WHAT A WORKER'S LINE CARRIES OF ITS MANAGER'S CLAUDE HOME, `(home,
+/// homedir)` ([`CallerClaude::home`], [`CallerClaude::homedir`]), from the
+/// manager's exec environment `vars` and the directory its records were
+/// found in (`dir`, [`Records::dir`]), for a user whose home is `user_home`.
+/// The worker starts in its own `cwd=`, never the manager's: so an absolute
+/// `CLAUDE_CONFIG_DIR` is carried as it is, a relative one (empty included)
+/// as the absolute directory it named for the manager — left raw where that
+/// was not read, which [`task_launch_line`] refuses rather than resolve
+/// under the worker's directory. With no `CLAUDE_CONFIG_DIR`, Claude Code
+/// keeps its records in `<HOME>/.claude`, the process's own `HOME`: a
+/// manager under another `HOME` than the user's has that `HOME` carried
+/// ([`home_carried`]'s rule, ATERM-KI-1015-1 LC-4), as the worker's shell
+/// is the server's, under the user's.
+pub(super) fn worker_homes(
+    user_home: &Path,
+    vars: super::upgrade_drive::HomeVars<'_>,
+    dir: Option<&Path>,
+) -> (Option<String>, Option<String>) {
+    match vars.config {
+        Some(config) if Path::new(config).is_absolute() => (Some(config.to_owned()), None),
+        Some(config) => {
+            let placed = dir
+                .filter(|dir| dir.is_absolute())
+                .and_then(Path::to_str)
+                .unwrap_or(config);
+            (Some(placed.to_owned()), None)
+        }
+        None => (
+            None,
+            dir.filter(|dir| !super::upgrade_drive::same_dir(dir, &user_home.join(".claude")))
+                .and_then(super::upgrade_drive::homedir_holding),
+        ),
+    }
+}
+
+/// THE LINE A WORKER'S SHELL RUNS AT ITS FIRST PROMPT (`spawn agent=claude`):
+/// `exe` started fresh, `--model <model>` when one is named, under the Claude
+/// home, `HOME` and login it must carry ([`required_env`], refused rather
+/// than dropped) and the survey switch ([`CLAUDE_LAUNCH_ENV`], a nicety
+/// dropped first, as on every relaunch line), its task the fixed operand
+/// [`upgrade::TASK_OPERAND`]. So the task is argv — the agent's first prompt —
+/// and the shell stays under the agent, as a relaunch needs it.
+///
+/// # Errors
+/// The line cannot be written ([`upgrade::task_line_env`]), or `home` is
+/// relative: it would name another directory under the worker's `cwd=` than
+/// it named for the manager ([`worker_homes`]).
+pub fn task_launch_line(
+    dialect: Dialect,
+    exe: &Path,
+    model: Option<&str>,
+    home: Option<&str>,
+    homedir: Option<&str>,
+    login: Option<&str>,
+) -> Result<String, String> {
+    // Rootless: under the worker's own directory (a root alone, as Windows
+    // spells one with no drive, is not the worker's).
+    if let Some(home) = home.filter(|home| !Path::new(home).has_root()) {
+        return Err(format!(
+            "the starter's Claude home ({home:?}) is relative and the directory it names could \
+             not be read"
+        ));
+    }
+    let flags: Vec<String> = model
+        .map(|m| vec!["--model".to_string(), m.to_string()])
+        .unwrap_or_default();
+    // A `HOME` only where the manager's records are under its own, not the
+    // user's: the worker's shell is the server's, under the user's `HOME`.
+    let required = required_env(home, homedir, login);
+    let both: Vec<(&str, &str)> = required.iter().copied().chain(CLAUDE_LAUNCH_ENV).collect();
+    upgrade::task_line_env(dialect, &both, exe, &flags)
+        .or_else(|_| upgrade::task_line_env(dialect, &required, exe, &flags))
 }
 
 /// `flags` with every `--model` spelling replaced by `model` (before the
@@ -942,13 +1185,32 @@ fn relaunch_held(
             return r;
         }
     }
+    typed_recorded(opts, st, session, block, |st| {
+        ledger(opts, &said(r.clone(), "relaunched"), &st.line);
+    });
+    await_held(opts, r, st, c, hand, session, k)
+}
+
+/// A RELAUNCH LINE TYPED IS RECORDED BEFORE ANYTHING ELSE IS DONE
+/// (ATERM-KI-1016-1 host-5): `st` relaunched now, its command block `block`
+/// and no process of the new line adopted yet ([`St::relaunched_pid`]),
+/// saved for `session` — and only then `after` (the ledger's line). The
+/// ledger's line came first: a step that panicked between the two left the
+/// record `Exiting` with its line typed, and the next step, reading a line
+/// not typed yet, typed it once more wherever the shell had its prompt back
+/// (the line's agent ended at once) and nothing held the conversation.
+fn typed_recorded(
+    opts: &Opts,
+    st: &mut St,
+    session: &str,
+    block: Option<u64>,
+    after: impl FnOnce(&St),
+) {
     st.relaunched(now_s());
     st.line_block = block;
-    // A new line: no process of it is adopted yet ([`St::relaunched_pid`]).
     st.relaunched_pid = 0;
-    ledger(opts, &said(r.clone(), "relaunched"), &st.line);
     save(opts, session, st);
-    await_held(opts, r, st, c, hand, session, k)
+    after(st);
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1350,9 +1612,15 @@ fn type_at_prompt(
 /// Before all three, A HAND THAT HELD THE LINE (`held_since_s`,
 /// [`hand_held_since`]): no person's input since its record began waiting,
 /// by the read's own stamp, else the wait `keyed-while-held` — a key since,
-/// or a stamp that cannot say (a seamless update's successor reads every
-/// session as never keyed). Counted, so the restart's stale bound ends it
-/// and its row asks the person, as it did before a hand was waited out.
+/// or a stamp that cannot say. A session nobody keyed says since when its
+/// host served it so ([`HumanInput::NeverFor`]; the review of LC-4, KR-2):
+/// from before the record began, nobody keyed it since — a driver's tab no
+/// person ever keyed is typed at once its lease lifts; from after (a
+/// seamless successor's adopted shell nothing was carried for begins at its
+/// Commit), or a host that does not say, it cannot. A seamless update's
+/// successor carries the outgoing instance's stamp and serving age (LC-4 of
+/// ATERM-KI-1016-1). Counted, so the restart's stale bound ends it and its
+/// row asks the person, as it did before a hand was waited out.
 ///
 /// `Ok(None)`: a read with no cursor, typed at as before.
 fn first_mark(
@@ -1707,7 +1975,8 @@ fn await_held(
                 st,
                 || {
                     let ours = conversation_typed_by(opts, &tab, session, st);
-                    nothing_owed(opts, &records, &tab, session, st, &ours).map(|(_, why)| why)
+                    let written = WhereWritten::new(opts, &records, session, &ours);
+                    nothing_owed(opts, &written, &tab, st).map(|(_, why)| why)
                 },
                 || opts.land || tab_under_land(c, &tab),
             );
@@ -1724,6 +1993,32 @@ fn await_held(
         // Said now (day six, D30: the wait went on 90 s at a time for five
         // minutes, the harness's hand on the tab throughout), with the stale
         // relaunch's word and stop — what it printed is on the tab.
+        //
+        // A MOVE ONTO ANOTHER BUILD IS TAKEN BACK first (LC-5 of
+        // ATERM-KI-1016-1, [`St::roll_back`]): its failure kept against the
+        // build, the line back — the same resume on the program the agent ran
+        // ([`St::back_line`]) — is typed at the prompt the shell has back,
+        // saved first as every relaunch line is, and the agent is carried on
+        // there. Stopped instead, the one working agent the move ended stayed
+        // down until a person resumed it.
+        None if ended && st.roll_back(now_s()) => {
+            let failed = said(r.clone(), "failed:no-resume");
+            ledger(
+                opts,
+                &failed,
+                &format!(
+                    "the relaunched agent ended without registering the conversation: its shell \
+                     has the tab back; resumed on {}, the build it ran",
+                    one_line(&st.to)
+                ),
+            );
+            save(opts, session, st);
+            let r = Report {
+                to: format!("{}({})", st.to, st.source),
+                ..r
+            };
+            relaunch_held(opts, r, st, c, hand, session, k)
+        }
         None if ended => {
             st.stop("no-resume", now_s());
             let r = said(r, "failed:no-resume");
@@ -1827,7 +2122,7 @@ impl Adopted {
 /// restore's, an exit's, a restart's — carries no Autopilot of its own (the
 /// window's host hands one to the carry-on alone, [`resume_as`]); a
 /// `status` that cannot be read says no Land.
-fn tab_under_land(c: &mut Client, tab: &str) -> bool {
+pub(super) fn tab_under_land(c: &mut Client, tab: &str) -> bool {
     super::upgrade_drive::status_line(c, tab).is_some_and(|line| land_by_status(&line))
 }
 
@@ -1835,11 +2130,30 @@ fn tab_under_land(c: &mut Client, tab: &str) -> bool {
 /// (its `autopilot=` field, the first; an older server prints none, and
 /// nothing then reads as Land). Anything but `OK` is no Land.
 fn land_by_status(line: &str) -> bool {
-    crate::is_ok_reply(line)
-        && line
-            .split_whitespace()
-            .find_map(|w| w.strip_prefix("autopilot="))
-            == Some("land")
+    autopilot_by_status(line) == Some("land")
+}
+
+/// The tab's EFFECTIVE Autopilot as one `status` reply says it (its
+/// `autopilot=` field, the first: `off`, `cruise` or `land`); `None` for a
+/// reply that is not `OK`, an older server's that prints none, and `-` (no
+/// agent tab).
+fn autopilot_by_status(line: &str) -> Option<&str> {
+    if !crate::is_ok_reply(line) {
+        return None;
+    }
+    line.split_whitespace()
+        .find_map(|w| w.strip_prefix("autopilot="))
+        .filter(|a| *a != "-")
+}
+
+/// Whether the harness's hands are on tab `tab` by its own `status`, read
+/// now: its effective Autopilot is Cruise or Land ([`autopilot_by_status`]).
+/// Off is the owner's ("the harness keeps its hands off this session",
+/// docs/DESIGN-harness-autopilot-2026-10-15.md:42); `-`, none, or a
+/// `status` that cannot be read says no.
+fn autopilot_on(c: &mut Client, tab: &str) -> bool {
+    super::upgrade_drive::status_line(c, tab)
+        .is_some_and(|line| matches!(autopilot_by_status(&line), Some("cruise" | "land")))
 }
 
 /// Whether a restart of `cause` is carried on with NOTHING typed: EVERY MOVE
@@ -2034,6 +2348,22 @@ pub(super) fn line_block(c: &mut Client, tab: &str) -> Option<u64> {
     matches!(state, "prompt" | "entering")
         .then(|| newest.get("id").and_then(Value::as_u64))
         .flatten()
+}
+
+/// THE COMMAND LINE THE TAB'S SHELL RUNS NOW, as its integration recorded it
+/// (typed): the newest block's `cmdline` where that block is `executing`.
+/// `None` when nothing is read, the newest block runs nothing, or its line
+/// was not recorded.
+pub(super) fn running_cmdline(c: &mut Client, tab: &str) -> Option<String> {
+    let newest = newest_block(c, tab)?;
+    if newest.get("state").and_then(Value::as_str) != Some("executing") {
+        return None;
+    }
+    newest
+        .get("cmdline")
+        .and_then(Value::as_str)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
 }
 
 /// Whether the command the relaunch line ran in block `block` is OVER, by the
@@ -2237,11 +2567,14 @@ fn carry_on_once(
     // earlier tabs that held it (a cold restore's reopened tab has a new sid:
     // [`conversation_typed`], XREV-LC-1) — no one else's prompt.
     let ours = conversation_typed_by(opts, tab, key, st);
+    // The conversation's record, read once for every question below
+    // ([`WhereWritten`]).
+    let written = WhereWritten::new(opts, &records, key, &ours);
     // Carried on with NOTHING where the conversation's own records say a
     // carry-on is owed no longer ([`nothing_owed`]: nobody asked it anything,
     // its worker finished, its last turn is a person's own exchange, or the
     // tab's loop resumed it first).
-    if settled && let Some((word, why)) = nothing_owed(opts, &records, tab, key, st, &ours) {
+    if settled && let Some((word, why)) = nothing_owed(opts, &written, tab, st) {
         return done_with_nothing(opts, r, st, key, word, why, &latest.version, new.pid);
     }
     // AUTOPILOT LAND (`Opts::land`, F2): no continuation of Cruise's is
@@ -2251,8 +2584,11 @@ fn carry_on_once(
     // point under Land (ddd3452dd made a limit's end Land's the same way).
     // Typed, a spent landing's memory restart started the work again, the
     // very reason a spent landing is wrapped in no other relaunch. The one
-    // look at what did not come back stays.
-    if opts.land {
+    // look at what did not come back stays. A pass that carries no Autopilot
+    // of its own (the CLI's hand-run sweep, `Opts::land` false) reads the
+    // tab's own `status`, as an adopting pass does ([`tab_under_land`];
+    // ATERM-KI-1016-1: it typed Cruise's carry-on into a Land tab).
+    if opts.land || tab_under_land(c, tab) {
         st.phase = upgrade::Phase::Done;
         r.from.clone_from(&st.from);
         r.to = format!("{}({})", latest.version, st.source);
@@ -2277,7 +2613,7 @@ fn carry_on_once(
     // Where that report names an irreversible act, the check says to
     // approve nothing irreversible, as the policy's does (RR4-RL-3).
     let (said_done, irreversible) = if settled {
-        said_done_where_written(opts, &records, key, &ours).unwrap_or_default()
+        written.said_done().unwrap_or_default()
     } else {
         (false, false)
     };
@@ -2397,16 +2733,16 @@ pub(super) const NOBODY_ASKED: &str = "nobody has asked this conversation anythi
 /// by what the conversation's own records say — in [`carry_on_once`]'s
 /// order, the word it ends on and why — or `None` where it is still owed.
 /// It types nothing and reads no screen, so it is asked off the host's
-/// point too ([`settle`]). `ours`: what the harness typed into the
-/// conversation ([`conversation_typed_by`]).
+/// point too ([`settle`]). `written`: the conversation's record, with what
+/// the harness typed into it ([`conversation_typed_by`]), read once
+/// ([`WhereWritten`]).
 fn nothing_owed(
     opts: &Opts,
-    records: &Records,
+    written: &WhereWritten<'_>,
     tab: &str,
-    key: &str,
     st: &St,
-    ours: &[approvals::Typed],
 ) -> Option<(&'static str, &'static str)> {
+    let (records, key, ours) = (written.records(), written.session(), written.ours());
     // A conversation nobody but the harness asked anything is carried on with
     // nothing: a carry-on would start a task nobody asked for.
     if records.tasked(key, ours) == Some(false) {
@@ -2420,9 +2756,9 @@ fn nothing_owed(
     // 2026-09-27: nothing is typed until a person's or an orchestrator's
     // turn). The tab's loop reads the same record at its point
     // ([`upgrade::FinishedScan`]); this one read starts
-    // `upgrade_drive::FINISHED_ONCE_BYTES` back, and a token older than that
-    // reads open (the carry-on is typed, as before this rule).
-    if finished_where_written(opts, records, key, ours) == Some(true) {
+    // `upgrade_drive::FINISHED_ONCE_BYTES` back, and further back where that
+    // window settles nothing ([`upgrade::FinishedScan::settled`]).
+    if written.finished() == Some(true) {
         return Some((
             "done:finished",
             "its worker finished its task and nobody has asked anything since",
@@ -2477,17 +2813,6 @@ fn done_with_nothing(
     ledger(opts, &r, &st.outcome);
     save(opts, key, st);
     r
-}
-
-/// Whether conversation `key` of record `st`, now in tab `tab`, ends on a
-/// person's own exchange a loop left to them: an open `left-to-person@v1`
-/// row of any tab that held it ([`lefts_through`]) names its last turn
-/// ([`turn_key_where_written`]). A turn since — anyone's prompt, a new
-/// answer — names another, and a loop's act since closed the row.
-fn left_to_person(opts: &Opts, records: &Records, tab: &str, key: &str, st: &St) -> bool {
-    let lefts = lefts_through(opts, tab, key, st);
-    !lefts.is_empty()
-        && turn_key_where_written(opts, records, key).is_some_and(|now| lefts.contains(&now))
 }
 
 /// When the relaunch line of the restart `st` records was typed (unix
@@ -2562,9 +2887,12 @@ pub(super) const CONTINUE_FENCE_TRIES: usize = 3;
 /// the words (a session without `--model` takes the current default).
 pub(super) fn confirm(opts: &Opts, r: &Report, st: &mut St, key: &str, now: u64) -> Option<Report> {
     // A quiet restart's look, or that of a carry-on that typed nothing
-    // ([`restore_look`]): a sweep reads it, and types nothing.
+    // ([`restore_look`]): a sweep reads it, and types its line only into a
+    // tab whose own Autopilot is on, under the tab's own guards.
     if looks_back(st) {
-        return restore_look(opts, r, st, key, now, None, |_, _, _| false);
+        return restore_look(opts, r, st, key, now, None, |c, pid, tab| {
+            process_in_tab(c, pid, tab, None, None)
+        });
     }
     let after = resumed_model(&st.agent_records(&opts.home), key, st.mark, &st.resumed_on);
     if after.is_none() && st.mark != 0 && now < st.confirm_by {
@@ -2643,13 +2971,21 @@ const RESTORE_LOST: &str =
 /// ([`upgrade::restore_prompt`], `continued:restore`), typed under every
 /// guard the carry-on's is: the process still holds the conversation, idle,
 /// in its tab, no person or other hand on it. Its answer is the harness's own
-/// turn. A sweep (`tab` `None`) types and decides nothing: the tab's look at
-/// its next idle point does, until [`RESTORE_TYPE_WITHIN_S`] past the look,
-/// after which the fact is recorded instead. `None`: the look is still open. `tab_probe` is the seam for the
-/// tab's claim on the process, as [`carry_on_with_tab_probe`]'s. Whether the
-/// task is finished is read once, from `upgrade_drive::FINISHED_ONCE_BYTES`
-/// before the transcript's end: a token with more of Claude Code's wakes
-/// after it than that reads open, and the line is typed.
+/// turn. A sweep (`tab` `None`) decides nothing a tab's look still can: the
+/// tab's look at its next idle point does, until [`RESTORE_TYPE_WITHIN_S`]
+/// past the look, after which the fact is recorded instead. A sweep types
+/// the open task's line itself only into a tab whose own `status` reads its
+/// effective Autopilot Cruise or Land, read then ([`autopilot_on`]; the
+/// review of the cold restore's restore line, KR-3), under every guard the
+/// tab's look types under and the sweep's lock: that tab is the harness's to
+/// type into, and a CLI-only sweep (no window host, so no tab look) said it
+/// only once the bound passed. Off, `-` or an unreadable status: nothing
+/// typed, as before. `None`: the look is still open. `tab_probe` is the seam
+/// for the tab's claim on the process, as [`carry_on_with_tab_probe`]'s.
+/// Whether the task is finished is read once, from
+/// `upgrade_drive::FINISHED_ONCE_BYTES` before the transcript's end and from
+/// further back where that window settles nothing: a token with more of
+/// Claude Code's wakes after it than that is still read.
 pub(super) fn restore_look(
     opts: &Opts,
     r: &Report,
@@ -2676,19 +3012,29 @@ pub(super) fn restore_look(
     }
     let quiet = told_nothing(opts, &records, key, st);
     let late = now >= st.confirm_by.saturating_add(RESTORE_TYPE_WITHIN_S);
-    // A SWEEP (no tab) types nothing, and records nothing the tab's host can
-    // still say at its idle point — the owner's fact is the host's to raise
-    // (XREV-LC-2) — until the look's bound has passed with no idle point.
+    // A SWEEP (no tab) records nothing the tab's host can still say at its
+    // idle point — the owner's fact is the host's to raise (XREV-LC-2) —
+    // until the look's bound has passed with no idle point; it types an
+    // open task's line only into a tab whose own Autopilot is on.
     let Some(tab) = tab else {
-        return late.then(|| {
-            restore_lost(
+        if late {
+            return Some(restore_lost(
                 opts,
                 r,
                 st,
                 key,
                 quiet.unwrap_or("no idle point came to say so at"),
-            )
-        });
+            ));
+        }
+        let tab = st.tab.clone();
+        if quiet.is_some() || !super::tap::is_tab_id(&tab) {
+            return None;
+        }
+        let mut c = connect(opts, &tab).ok()?;
+        if !autopilot_on(&mut c, &tab) {
+            return None;
+        }
+        return restore_line(opts, r, st, key, &records, &mut c, &tab, &mut tab_probe).ok();
     };
     if let Some(why) = quiet {
         return Some(restore_lost(opts, r, st, key, why));
@@ -2703,25 +3049,52 @@ pub(super) fn restore_look(
     let Ok(mut c) = connect(opts, tab) else {
         return Some(wait(st, "wait:no-socket"));
     };
-    let idle = continuation_session(&records, st.resumed_pid, key).is_some_and(|sf| {
+    Some(
+        match restore_line(opts, r, st, key, &records, &mut c, tab, &mut tab_probe) {
+            Ok(r) => r,
+            Err(word) => wait(st, word),
+        },
+    )
+}
+
+/// [`restore_look`]'s ONE LINE, typed into tab `tab` over `c` under every
+/// guard a carry-on's is: the process still holds the conversation, idle, in
+/// its tab (`tab_probe`), no person or other hand on it. `Ok` once decided —
+/// typed (`continued:restore`), or a line that could not be typed (the fact
+/// recorded, `done:lost`) — and `Err` the wait's word where a guard stands.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the look's record and its tab's connection, as restore_look holds them"
+)]
+fn restore_line(
+    opts: &Opts,
+    r: &Report,
+    st: &mut St,
+    key: &str,
+    records: &Records,
+    c: &mut Client,
+    tab: &str,
+    tab_probe: &mut impl FnMut(&mut Client, u32, &str) -> bool,
+) -> Result<Report, &'static str> {
+    let idle = continuation_session(records, st.resumed_pid, key).is_some_and(|sf| {
         sf.status == "idle"
             && kernel_start(sf.pid).as_deref() == Some(squash(&sf.proc_start).as_str())
     });
     if !idle {
-        return Some(wait(st, "wait:changed"));
+        return Err("wait:changed");
     }
-    if !tab_probe(&mut c, st.resumed_pid, tab) {
-        return Some(wait(st, "wait:tab-ownership-changed"));
+    if !tab_probe(c, st.resumed_pid, tab) {
+        return Err("wait:tab-ownership-changed");
     }
-    if held(&mut c, tab, opts.human_grace_s) {
-        return Some(wait(st, "wait:held"));
+    if held(c, tab, opts.human_grace_s) {
+        return Err("wait:held");
     }
     let text = upgrade::restore_prompt(Version::parse(&st.resumed_on).as_ref(), st.is_upgrade());
-    match under_hand(&mut c, tab, None, |c| {
+    match under_hand(c, tab, None, |c| {
         type_continuation(c, tab, &text, opts.timings.fence_every)
     }) {
-        None => Some(wait(st, "wait:held")),
-        Some(false) => Some(restore_lost(
+        None => Err("wait:held"),
+        Some(false) => Ok(restore_lost(
             opts,
             r,
             st,
@@ -2738,7 +3111,7 @@ pub(super) fn restore_look(
             let r = said(r.clone(), "continued:restore");
             ledger(opts, &r, &st.outcome);
             save(opts, key, st);
-            Some(r)
+            Ok(r)
         }
     }
 }
@@ -2990,6 +3363,25 @@ pub(super) struct ModelRestart {
     pub(super) launch_model: String,
     /// [`St::fallback_from`].
     pub(super) fallback_from: Option<String>,
+}
+
+/// WHETHER A RESTART MOVES THE SESSION ONTO A MODEL BILLED TO USAGE CREDITS:
+/// a model switch — the fallback ([`Restart::Model`]) or the return
+/// ([`Restart::ModelBack`]) — whose line asks for `model` ([`model_restart`])
+/// of a family in `billed` ([`super::upgrade_models::credits_billed`], read
+/// only under `[harness] usage_credits = false`). A restart for any other
+/// reason keeps the model the session rides, and moves it onto nothing.
+/// Unknown billing (`None`) cannot authorize either kind of model move.
+#[must_use]
+pub(super) fn moves_onto_credits(
+    why: &Restart,
+    model: Option<&str>,
+    billed: Option<&[String]>,
+) -> bool {
+    matches!(why, Restart::Model { .. } | Restart::ModelBack { .. })
+        && model.is_some_and(|m| {
+            billed.is_none_or(|billed| super::upgrade_models::billed_to_credits(m, billed))
+        })
 }
 
 /// The fallback origin on `st` ([`St::fallback_from`]), or for an older
@@ -3280,6 +3672,13 @@ pub(super) fn restart_as(
         Err(why) => return said(r, format!("wait:{why}")),
     };
     r.pid = snap.pid;
+    // The tab's own program ([`NO_SHELL`]): ended, it would come back in no
+    // shell, so it is never ended to be restarted. Defence in depth: [`plan`]
+    // refuses it too, with the same word and before any signal; this answers
+    // before a record is read or a lock contended.
+    if snap.shell == NO_SHELL {
+        return said(r, "refused:not-a-shell-job");
+    }
     // Claude's own record of this process names the conversation, the build
     // and whether it is idle — kept under the Claude home it runs under.
     let records = Records::of_snapshot(&opts.home, &snap);
@@ -3325,15 +3724,28 @@ pub(super) fn restart_as(
         &session,
         &snap.argv,
         matches!(why, Restart::Memory | Restart::Account { .. }),
+        snap.profile.as_ref(),
     );
     let model_list = riding.clone().unwrap_or_default();
     let launched = launch_kept(opts, &session, &snap.argv).unwrap_or_default();
+    let riding_move = riding.is_some();
     let ModelRestart {
         model,
         cause,
         launch_model,
         fallback_from,
     } = model_restart(why, prior.as_ref(), launched, riding, hand);
+    // A MODEL THE ACCOUNT BILLS TO USAGE CREDITS, under `[harness]
+    // usage_credits = false`: no fallback and no return is made onto it
+    // ([`moves_onto_credits`]); the policy waits, as at a fallback the host
+    // cannot make.
+    if moves_onto_credits(
+        why,
+        model.as_deref(),
+        credits_billed_for(opts, snap.profile.as_ref()).as_deref(),
+    ) {
+        return said(r, "refused:model-on-credits");
+    }
     let mode = resume_mode(&records, &session, tab_mode(opts, &tab));
     // The login the line carries: an account move's target, else exactly
     // what this process had (unset: nothing is added).
@@ -3353,6 +3765,12 @@ pub(super) fn restart_as(
         homedir: None,
         login: login.as_deref(),
         stored_login: snap.stored_login,
+        billing: if riding_move || matches!(why, Restart::Model { .. } | Restart::ModelBack { .. })
+        {
+            ModelBilling::Move(snap.profile.as_ref())
+        } else {
+            ModelBilling::Keep
+        },
     };
     let mut st = St {
         from: sf.version.clone(),
@@ -3376,13 +3794,32 @@ pub(super) fn restart_as(
     if let Some(prior) = prior.as_ref() {
         prior.kept_by_restart(&tab, &mut st);
     }
+    let tap_opts;
+    let plan_opts = match (&opts.usage_tap, launch.login) {
+        (Some(armed), Some(dir))
+            if !dir.is_empty()
+                && armed.lone_login.is_none()
+                && (roster.row_for_login(Some(dir)).is_some()
+                    || roster.row_left(Some(dir)).is_some()) =>
+        {
+            tap_opts = Opts {
+                usage_tap: Some(super::tap::Armed {
+                    exe: armed.exe.clone(),
+                    lone_login: Some(dir.to_owned()),
+                }),
+                ..opts.clone()
+            };
+            &tap_opts
+        }
+        _ => opts,
+    };
     let planned =
         home_carried(&opts.home, snap.home.as_deref(), &sf.cwd, &records).and_then(|homedir| {
             let launch = Launch {
                 homedir: homedir.as_deref(),
                 ..launch
             };
-            plan(opts, &launch, snap.shell, &t)
+            plan(plan_opts, &launch, snap.shell, &t)
         });
     let Plan { shell, line, .. } = match planned {
         Ok(p) => p,
@@ -3439,6 +3876,11 @@ pub(super) fn restart_as(
         st.tab.clone_from(&tab);
         st.line = line;
         st.phase = upgrade::Phase::Exiting { at_s: now_s() };
+        // Where it writes its conversation now, while its process still says
+        // (a worktree's home under a relative one): its carry-on reads its
+        // finish there once it is gone
+        // ([`super::upgrade_drive::note_moved_writes`]).
+        super::upgrade_drive::note_moved_writes(opts, &snap, &session, &sf.cwd);
         save(opts, &session, &st);
         match terminate(&mut c, &tab, pid, opts.human_grace_s) {
             Terminated::Sent => None,
@@ -3478,7 +3920,9 @@ pub struct Snapshot {
     pub pid: u32,
     /// Its kernel start, as Claude renders `procStart`: the pid-reuse guard.
     pub start: String,
-    /// The job-control shell it is the foreground job of.
+    /// The job-control shell it is the foreground job of; [`NO_SHELL`] for
+    /// an aterm tab's own program, which no shell holds and nothing
+    /// relaunches in its tab.
     pub shell: u32,
     /// What it runs ([`launched`]): an absolute path.
     pub program: PathBuf,
@@ -3501,8 +3945,8 @@ pub struct Snapshot {
     /// THE LOGIN THE PROCESS RUNS UNDER, as its own exec environment names
     /// it: the RAW value of [`accounts::LOGIN_ENV`]. Three states, kept
     /// apart because they are three relaunch lines: `None`, the variable is
-    /// unset (the process took its shell's login, and so does its relaunch:
-    /// nothing is added); `Some("")`, set and empty (the default login,
+    /// unset (an ordinary retained-model/opted-in relaunch adds nothing; a
+    /// new model with billing off explicitly removes it); `Some("")`, set and empty (the default login,
     /// NAMED — what a move back to the default account writes, so the
     /// shell's own variable cannot decide); `Some(dir)`, that login's
     /// directory, verbatim. Every relaunch of the agent re-applies exactly
@@ -3541,6 +3985,12 @@ pub struct Snapshot {
     /// gave back was not read so, and is `false`: a cold restore carries no
     /// tap.
     pub stored_login: bool,
+    /// The exact profile paths and filename selector captured from this
+    /// process's own exec environment and resolved records. None is unknown;
+    /// it cannot establish billing permission under the key being off.
+    /// Live-only: durable and handoff layouts preserve their existing wire
+    /// format and restore this as None.
+    pub profile: Option<super::profile::Context>,
 }
 
 impl Snapshot {
@@ -3560,7 +4010,7 @@ impl Snapshot {
     pub fn codex(&self) -> Option<&CodexRun> {
         match &self.run {
             AgentRun::Codex(run) => Some(run),
-            AgentRun::Claude | AgentRun::Muse(_) => None,
+            AgentRun::Claude | AgentRun::Muse(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => None,
         }
     }
 
@@ -3568,7 +4018,7 @@ impl Snapshot {
     pub fn codex_mut(&mut self) -> Option<&mut CodexRun> {
         match &mut self.run {
             AgentRun::Codex(run) => Some(run),
-            AgentRun::Claude | AgentRun::Muse(_) => None,
+            AgentRun::Claude | AgentRun::Muse(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => None,
         }
     }
 
@@ -3578,7 +4028,27 @@ impl Snapshot {
     pub fn muse(&self) -> Option<&MuseRun> {
         match &self.run {
             AgentRun::Muse(run) => Some(run),
-            AgentRun::Claude | AgentRun::Codex(_) => None,
+            AgentRun::Claude | AgentRun::Codex(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => None,
+        }
+    }
+
+    /// An agy's run, `None` for any other agent's: the agy lane's own read of
+    /// a snapshot it took ([`AgentRun::Agy`]).
+    #[must_use]
+    pub fn agy(&self) -> Option<&AgyRun> {
+        match &self.run {
+            AgentRun::Agy(run) => Some(run),
+            AgentRun::Claude | AgentRun::Codex(_) | AgentRun::Muse(_) | AgentRun::Gemini(_) => None,
+        }
+    }
+
+    /// A Gemini CLI's run, `None` for any other agent's: the Gemini CLI lane's
+    /// own read of a snapshot it took ([`AgentRun::Gemini`]).
+    #[must_use]
+    pub fn gemini(&self) -> Option<&GeminiRun> {
+        match &self.run {
+            AgentRun::Gemini(run) => Some(run),
+            AgentRun::Claude | AgentRun::Codex(_) | AgentRun::Muse(_) | AgentRun::Agy(_) => None,
         }
     }
 }
@@ -3595,9 +4065,17 @@ pub enum AgentRun {
     Claude,
     /// A Codex TUI ([`CodexRun`]).
     Codex(CodexRun),
-    /// A Muse Code TUI ([`MuseRun`]): relaunched on exit and restored, never
-    /// upgraded live ([`super::lanes::lanes`]).
+    /// A Muse Code TUI ([`MuseRun`]): relaunched on exit and restored, and
+    /// moved onto a newer build live by the quiet flow alone
+    /// ([`super::lanes::lanes`], [`super::upgrade_muse_live`]).
     Muse(MuseRun),
+    /// An agy TUI ([`AgyRun`]): relaunched on exit and restored, and moved
+    /// onto a newer build live by the quiet flow alone
+    /// ([`super::lanes::lanes`], [`super::upgrade_agy_live`]).
+    Agy(AgyRun),
+    /// A Gemini CLI TUI ([`GeminiRun`]): relaunched on exit and restored,
+    /// never upgraded live ([`super::lanes::lanes`]).
+    Gemini(GeminiRun),
 }
 
 impl AgentRun {
@@ -3608,6 +4086,8 @@ impl AgentRun {
             AgentRun::Claude => upgrade::Agent::Claude,
             AgentRun::Codex(_) => upgrade::Agent::Codex,
             AgentRun::Muse(_) => upgrade::Agent::Muse,
+            AgentRun::Agy(_) => upgrade::Agent::Agy,
+            AgentRun::Gemini(_) => upgrade::Agent::Gemini,
         }
     }
 }
@@ -3651,6 +4131,86 @@ pub struct MuseRun {
     pub block: Option<u64>,
 }
 
+/// What an agy TUI's relaunch on exit needs beside the [`Snapshot`], whose
+/// `session` is the conversation its witness proved it holds (the presence
+/// lock `<config>/presence/<uuid>.lock` its process holds open,
+/// `upgrade_drive`'s `agy::witness`; `None`: none proven — a fresh agy that
+/// took no turn has none — and no relaunch then resumes anything) and whose
+/// `cwd` is its workspace (agy's is its launch directory, measured) —
+/// measured on 1.4.0 ([`super::upgrade_agy`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgyRun {
+    /// THE CONFIG DIRECTORY ITS CONVERSATIONS ARE UNDER (canonical):
+    /// `$HOME/.gemini/antigravity-cli`, as its own `HOME` and the hidden
+    /// `--gemini_dir`/`--app_data_dir` of its argv place it
+    /// ([`super::upgrade_agy::config_dir`]). Its presence locks are
+    /// `<config>/presence/`, its crash files `<config>/crashes/`.
+    pub config: PathBuf,
+    /// THE HOME ITS RELAUNCH LINE CARRIES (`HOME=<dir>`, where its own exec
+    /// environment set another than the user's;
+    /// [`super::upgrade_agy::relaunch_env`]): an agy under another `HOME`
+    /// keeps its conversations there, and a line without it starts fresh.
+    pub env: Vec<(String, String)>,
+    /// The conversation's presence lock the witness read; `None` for none, or
+    /// a snapshot a restored layout gave back (named again by its
+    /// conversation).
+    pub lock: Option<PathBuf>,
+    /// THE CRASH FILE IT HOLDS OPEN (`<config>/crashes/crash_<pid>_<uuid>.log`,
+    /// read with its open files): its exit is a crash only where this very
+    /// file is left ([`super::upgrade_agy::exit_kind`]). `None`: not read —
+    /// its exit's look then reads any crash file of its pid written since it
+    /// started.
+    pub crash: Option<PathBuf>,
+    /// When it started, unix milliseconds (to the second; `0`: unread): a
+    /// crash file of its pid written before it started is an earlier
+    /// process's, never its.
+    pub started_ms: u64,
+    /// THE SHELL-INTEGRATION COMMAND BLOCK IT RUNS IN (its `id`, read while
+    /// it runs), or `None` where none could be read: its exit's word is THAT
+    /// block's. Never carried across a restore.
+    pub block: Option<u64>,
+}
+
+/// What a Gemini CLI TUI's relaunch on exit needs beside the [`Snapshot`],
+/// whose `pid` is the PARENT node (the tab's foreground job, `node <gemini
+/// script>`), whose `session` is the session the start-time rule named (the
+/// one session header of its project begun since it started,
+/// `upgrade_drive`'s `gemini::witness_of`; `None`: none named, and no
+/// relaunch then resumes anything) and whose `cwd` is its project (the
+/// directory its sessions are kept under) — measured on 0.46.0
+/// ([`super::upgrade_gemini`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GeminiRun {
+    /// THE GEMINI DIRECTORY ITS SESSIONS ARE UNDER (canonical):
+    /// `<GEMINI_CLI_HOME or HOME>/.gemini`, as its own exec environment
+    /// places it ([`super::upgrade_gemini::gemini_dir`]).
+    pub home: PathBuf,
+    /// ITS PROJECT'S CHATS DIRECTORY (`<home>/tmp/<slug>/chats`, the slug
+    /// whose `.project_root` names its project); `None`: none found, and no
+    /// session is named.
+    pub chats: Option<PathBuf>,
+    /// THE HOMES ITS RELAUNCH LINE CARRIES (`GEMINI_CLI_HOME` where set,
+    /// `HOME` where another than the user's;
+    /// [`super::upgrade_gemini::relaunch_env`]): a Gemini CLI under another
+    /// home keeps its sessions there, and a resume without it exits 42.
+    pub env: Vec<(String, String)>,
+    /// WHEN THE PARENT STARTED, unix milliseconds, never later than it did
+    /// (`0`: unread): the start-time rule's one input from the process.
+    /// Carried across a restore, so the rule is read again there.
+    pub started_ms: u64,
+    /// The child node it started (`0`: none found): orphaned when the parent
+    /// is SIGKILLed, it reads the terminal until its shell takes it back.
+    pub child: u32,
+    /// WHY THE START-TIME RULE NAMED NO SESSION, where it named none
+    /// ([`super::upgrade_gemini::NoWitness`]); `None` where it named one, or
+    /// a snapshot a restored layout gave back.
+    pub unwitnessed: Option<super::upgrade_gemini::NoWitness>,
+    /// THE SHELL-INTEGRATION COMMAND BLOCK IT RUNS IN (its `id`, read while
+    /// it runs), or `None` where none could be read: its exit's word is THAT
+    /// block's. Never carried across a restore.
+    pub block: Option<u64>,
+}
+
 /// What a codex-alab's relaunch needs beside the [`Snapshot`] (whose
 /// `session` is its thread, when nameable). Only an ALab build is
 /// snapshotted as a Codex ([`snapshot`]; a vendor `codex` is `no-lane`, the
@@ -3685,13 +4245,22 @@ pub struct CodexRun {
 /// Whether the host's relaunch would bring back what the EXPLICIT RESTART of
 /// `snap`'s agent ends (`ExitCause::Asked`, `ExitCause::Stall`), as far
 /// as a live read can tell — the act refuses where not (aterm's
-/// `restart_act`, `not-relaunchable`), and no word names it. Pure.
+/// `restart_act`, `not-relaunchable`), and no word names it. No process is
+/// read; a Claude Code's reads as [`resumes_on_exit`] does, and an agy's
+/// store build reads the managed twin in atpkg's store (`aterm.toml`'s
+/// prefix and the twin's script).
 ///
 /// A Claude Code's where [`resumes_on_exit`]. A Codex's only where its
 /// snapshot carries the line aterm's copy of codex-alab's own record
 /// validated ([`self_claimed_line`]): the one line a Codex is ever
 /// relaunched on (the Codex screen lane's retirement, 2026-10-16). With no
-/// such line the act would end what nothing brings back.
+/// such line the act would end what nothing brings back. An agy's where its
+/// lane's relaunch would bring the conversation back
+/// ([`super::upgrade_drive::agy_carries_restart`]), the program its line types
+/// included: a store build with no managed twin is refused by its relaunch
+/// (`refused:no-managed-agy`), so not ended for it. A Muse Code's never yet.
+/// Never a tab's own program's ([`NO_SHELL`]): nothing relaunches it in its
+/// tab.
 ///
 /// ONE PREDICATE WITH THE RELAUNCH (LC-3 of ATERM-KI-1015-1): a Claude
 /// Code's is [`exit_line`]'s, which asks everything the relaunch refuses on
@@ -3704,7 +4273,7 @@ pub struct CodexRun {
 pub fn carries_restart(user_home: &Path, snap: &Snapshot) -> bool {
     match &snap.run {
         AgentRun::Claude => resumes_on_exit(user_home, snap),
-        AgentRun::Codex(_) => self_claimed_line(snap).is_some(),
+        AgentRun::Codex(_) => snap.shell != NO_SHELL && self_claimed_line(snap).is_some(),
         // A Muse Code's never yet: the act ends its agent with SIGTERM, and
         // what a SIGTERM does to a Muse Code in the middle of a turn — the
         // stall's very case — is unmeasured (its exit table was measured on
@@ -3713,16 +4282,40 @@ pub fn carries_restart(user_home: &Path, snap: &Snapshot) -> bool {
         // its place, never ending it (review of the Muse Code lane,
         // 2026-10-17). Its relaunch on exit and its restore are its lane's.
         AgentRun::Muse(_) => false,
+        // An agy's where its relaunch would bring its conversation back: the
+        // act's SIGTERM is one of agy's graceful ways out, MEASURED in the
+        // middle of a turn too (exit 0 in about half a second, its lock
+        // released, its crash file removed, the conversation keeping the
+        // partial turn, drawn `Interrupted` on its resume), so the stall's
+        // very case ends it cleanly and the relaunch resumes it. As far as a
+        // live read tells, on the lane's own predicate: a witnessed
+        // conversation, a shell a line is written for, a launch whose flags
+        // its line carries, a program it can type (a store build only through
+        // a managed twin) and a line that holds its `HOME` within the tty's
+        // bound, with its heal and, at zsh and bash, its `cd`
+        // (`upgrade_agy_drive::carries_restart_onto`).
+        // Never a tab's own agy ([`NO_SHELL`]), as a Codex's: no shell is
+        // left to type its relaunch into.
+        AgentRun::Agy(_) => {
+            snap.shell != NO_SHELL && super::upgrade_drive::agy_carries_restart(user_home, snap)
+        }
+        // A Gemini CLI's never: the act signals the tab's foreground job, its
+        // PARENT node, which ignores SIGTERM, SIGHUP and SIGINT (measured:
+        // both processes still running 12 s on), so the act would escalate
+        // to a SIGKILL that orphans its child. Its relaunch on exit and its
+        // restore are its lane's.
+        AgentRun::Gemini(_) => false,
     }
 }
 
 /// Whether an exit of `snap`'s agent now would be relaunched on its own
 /// conversation ([`after_exit`]), as far as a live read can tell: a held
-/// conversation ([`upgrade::is_session_id`]), not a one-shot launch, a
-/// supported shell dialect, a line [`line_for`] can make from the argv, and
-/// one that carries the Claude home its records are in, for a user whose
-/// home is `user_home` ([`exit_line`]). Pure but for that home's rule: the
-/// dialect is in the snapshot.
+/// conversation ([`upgrade::is_session_id`]), not a one-shot launch, a shell
+/// holding the agent ([`NO_SHELL`]: an aterm tab's own program is relaunched
+/// in its tab by nothing) of a supported dialect, a line [`line_for`] can
+/// make from the argv, and one that carries the Claude home its records are
+/// in, for a user whose home is `user_home` ([`exit_line`]). Pure but for
+/// that home's rule: the dialect is in the snapshot.
 ///
 /// A frozen Claude Code's remedy says "aterm relaunches it" instead of naming a
 /// `claude --resume <id>` command, so this must be true when it says so;
@@ -3740,10 +4333,10 @@ pub fn resumes_on_exit(user_home: &Path, snap: &Snapshot) -> bool {
 /// THE RESUME LINE `snap` ALONE IMPLIES for a relaunch of its agent on its
 /// own conversation ([`after_exit`], [`after_host_ended`]) — `None` where
 /// [`resumes_on_exit`] promises nothing: no held conversation, a one-shot
-/// launch, no shell dialect, a Codex, a line [`line_for`] refuses, or a line
-/// that would start it under another Claude home than the one its records
-/// are in (the plan's `refused:home`, below). It
-/// carries everything the relaunch must: the Claude home and the login the
+/// launch, no shell ([`NO_SHELL`]) or no shell dialect, a Codex, a line
+/// [`line_for`] refuses, or a line that would start it under another Claude
+/// home than the one its records are in (the plan's `refused:home`, below).
+/// It carries everything the relaunch must: the Claude home and the login the
 /// snapshot names ([`required_env`]), so a snapshot a restored layout gave
 /// back (`aterm-gui`'s `AgentRestore::snapshot`) shows here the environment
 /// and the flags its relaunch carries. It is NOT the line the relaunch
@@ -3763,11 +4356,16 @@ pub fn resumes_on_exit(user_home: &Path, snap: &Snapshot) -> bool {
 /// `CLAUDE_CONFIG_DIR` is promised: its line carries that `HOME` (LC-4).
 #[must_use]
 pub fn exit_line(user_home: &Path, snap: &Snapshot) -> Option<String> {
+    if snap.shell == NO_SHELL {
+        return None;
+    }
     match &snap.run {
         AgentRun::Claude => {}
         // Their lanes resume only what is still there at exit, which cannot
         // be promised in advance.
-        AgentRun::Codex(_) | AgentRun::Muse(_) => return None,
+        AgentRun::Codex(_) | AgentRun::Muse(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => {
+            return None;
+        }
     }
     let dialect = snap.dialect?;
     let session = snap
@@ -3824,7 +4422,9 @@ pub fn told_command(user_home: &Path, state: Option<&Path>, snap: &Snapshot) -> 
     match &snap.run {
         AgentRun::Claude => {}
         // Each tells its own line (`aterm-gui`'s `resume_told`).
-        AgentRun::Codex(_) | AgentRun::Muse(_) => return None,
+        AgentRun::Codex(_) | AgentRun::Muse(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => {
+            return None;
+        }
     }
     let records = Records::of_snapshot(user_home, snap);
     let homedir = home_carried(user_home, snap.home.as_deref(), &snap.cwd, &records).ok()?;
@@ -3887,9 +4487,13 @@ pub fn launched(
     Some((image.to_path_buf(), out))
 }
 
-/// Read the [`Snapshot`] of the Claude Code in tab `opts.only_sid` on
-/// `opts.sock`: the tab's foreground job must be a job-control shell's job on a
-/// terminal only this aterm tab claims, and a Claude program.
+/// Read the [`Snapshot`] of the Claude Code (or codex-alab, Muse Code, agy or
+/// Gemini CLI) in tab `opts.only_sid` on `opts.sock`: the tab's foreground job
+/// must be a job-control shell's job on a terminal only this aterm tab claims
+/// — or that tab's own program (`aterm -e claude`, `exec muse`, `exec agy`,
+/// `exec gemini`), read with
+/// no shell ([`NO_SHELL`]): its readers have it, and nothing relaunches it in
+/// its tab.
 ///
 /// # Errors
 /// The word naming the first fact that could not be read or did not hold.
@@ -3907,16 +4511,27 @@ pub(super) enum SnapshotLane {
     CodexAlab,
     /// The Muse Code lane's.
     Muse,
+    /// The agy lane's.
+    Agy,
+    /// The Gemini CLI lane's: a `node` image whose `argv[1]` is Gemini CLI's
+    /// script ([`super::upgrade_gemini::is_gemini_process`]).
+    Gemini,
     /// No lane relaunches it — a vendor `codex` (the Codex screen lane's
-    /// retirement, 2026-10-16), agy, Gemini CLI: refused ([`NO_LANE`]), never
-    /// read as Claude Code, nor as another lane's agent.
+    /// retirement, 2026-10-16), an image itself named `gemini` (no such build
+    /// was measured): refused ([`NO_LANE`]), never read as Claude Code, nor
+    /// as another lane's agent.
     None,
 }
 
 /// THE LANE A FOREGROUND PROCESS IS READ BY, from the basename of the image
 /// the kernel mapped for it (`image`; `None`: unreadable), and for a Codex
-/// whether that image is an ALab build.
-pub(super) fn snapshot_lane(image: Option<&Path>) -> SnapshotLane {
+/// whether that image is an ALab build — or, for a script runtime's image,
+/// from its `argv` (`argv[1]`: Gemini CLI runs as `node <its script>`, a
+/// parent and a child, and `program=` never names it).
+pub(super) fn snapshot_lane(image: Option<&Path>, argv: &[String]) -> SnapshotLane {
+    if super::upgrade_gemini::is_gemini_process(image, argv) {
+        return SnapshotLane::Gemini;
+    }
     match image
         .and_then(Path::file_name)
         .and_then(|n| n.to_str())
@@ -3926,9 +4541,8 @@ pub(super) fn snapshot_lane(image: Option<&Path>) -> SnapshotLane {
             SnapshotLane::CodexAlab
         }
         Some(aterm_phase::Program::Muse) => SnapshotLane::Muse,
-        Some(
-            aterm_phase::Program::Codex | aterm_phase::Program::Agy | aterm_phase::Program::Gemini,
-        ) => SnapshotLane::None,
+        Some(aterm_phase::Program::Agy) => SnapshotLane::Agy,
+        Some(aterm_phase::Program::Codex | aterm_phase::Program::Gemini) => SnapshotLane::None,
         Some(aterm_phase::Program::Claude | aterm_phase::Program::Generic) | None => {
             SnapshotLane::Claude
         }
@@ -4034,6 +4648,7 @@ pub fn snapshot_of_copy(
         home: None,
         claude_dir: None,
         stored_login: false,
+        profile: None,
     }
 }
 
@@ -4058,12 +4673,17 @@ pub(super) fn snapshot_with(opts: &Opts, k: &dyn Kernel) -> Result<Snapshot, &'s
     let pid = u32::try_from(group).map_err(|_| "no-foreground")?;
     let shell = match k.job(pid) {
         Some((Job::NoJobControl, _)) => return Err("not-a-shell-job"),
+        // The tab's own program, on the terminal the aterm that is its
+        // parent opened (the job read proved both): read, with no shell to
+        // relaunch it into.
+        Some((Job::TabProgram { .. }, _)) => NO_SHELL,
         job => foreground_shell(job)?,
     };
-    let owner = k.terminal(pid);
-    if !owner
-        .as_ref()
-        .is_some_and(|(p, name)| owned_by_aterm((*p, name.as_str())))
+    if shell != NO_SHELL
+        && !k
+            .terminal(pid)
+            .as_ref()
+            .is_some_and(|(p, name)| owned_by_aterm((*p, name.as_str())))
     {
         return Err("terminal");
     }
@@ -4076,16 +4696,24 @@ pub(super) fn snapshot_with(opts: &Opts, k: &dyn Kernel) -> Result<Snapshot, &'s
     }
     let start = kernel_start(pid).ok_or("start")?;
     let image = exe_of(pid);
-    // A codex-alab: its own path reads its run; a Muse Code: its lane's. A
-    // vendor `codex` (the Codex screen lane's retirement, 2026-10-16) and an
-    // agent no lane relaunches (agy, Gemini CLI) are refused here, never read
-    // as Claude Code.
-    match snapshot_lane(image.as_deref()) {
+    // A codex-alab: its own path reads its run; a Muse Code, an agy and a
+    // Gemini CLI (a `node` whose `argv[1]` is its script): their lanes'. A
+    // vendor `codex` (the Codex screen lane's retirement, 2026-10-16) is
+    // refused here, never read as Claude Code. A tab's own codex-alab, Muse
+    // Code, agy or Gemini CLI ([`NO_SHELL`]) is read too, for its readers: no
+    // shell's block names its exit, and its lane relaunches nothing from it.
+    match snapshot_lane(image.as_deref(), &args.argv) {
         SnapshotLane::CodexAlab => {
             return super::upgrade_drive::codex_alab_snapshot(opts, tab, pid, start, shell, &args);
         }
         SnapshotLane::Muse => {
             return super::upgrade_drive::muse_snapshot(opts, tab, pid, start, shell, &args);
+        }
+        SnapshotLane::Agy => {
+            return super::upgrade_drive::agy_snapshot(opts, tab, pid, start, shell, &args);
+        }
+        SnapshotLane::Gemini => {
+            return super::upgrade_drive::gemini_snapshot(opts, tab, pid, start, shell, &args);
         }
         SnapshotLane::None => return Err(NO_LANE),
         SnapshotLane::Claude => {}
@@ -4131,8 +4759,11 @@ pub(super) fn snapshot_with(opts: &Opts, k: &dyn Kernel) -> Result<Snapshot, &'s
         version: file.map(|sf| sf.version),
         run: AgentRun::Claude,
         // The shell's kernel argv only; an unreadable one only costs the
-        // remedy its relaunch wording ([`resumes_on_exit`]).
-        dialect: shell_dialect(shell, &[]),
+        // remedy its relaunch wording ([`resumes_on_exit`]). None without
+        // a shell.
+        dialect: (shell != NO_SHELL)
+            .then(|| shell_dialect(shell, &[]))
+            .flatten(),
         // READ off the process's own exec environment, the same read that
         // gave its argv: what the vendor's runtime was started with, which
         // is what chose its keychain item (the accounts design, §1).
@@ -4143,6 +4774,7 @@ pub(super) fn snapshot_with(opts: &Opts, k: &dyn Kernel) -> Result<Snapshot, &'s
         claude_dir: records.dir().map(Path::to_path_buf),
         stored_login: accounts::ProcessLogin::of_exec_env(&args.env)
             .is_some_and(|who| who.stored_login),
+        profile: records.billing_context(&opts.home, &args),
     })
 }
 
@@ -4180,27 +4812,45 @@ pub fn foreground(snap: &Snapshot, fg: i64) -> Foreground {
 /// user's). Returns whether anything moved.
 pub fn follow(home: &Path, snap: &mut Snapshot) -> bool {
     // A Codex keeps no record of its process to follow: its snapshot is
-    // taken again at the loop's idle points. A Muse Code's session is
-    // followed by its lock ([`follow_muse`]).
+    // taken again at the loop's idle points, and so is an agy's (its lock
+    // names no pid: only `lsof` reads whose it is, never on this cheap
+    // follow) and a Gemini CLI's (no file names its pid: the start-time rule
+    // reads its project's session files, read again at its exit). A Muse
+    // Code's session is followed by its lock ([`follow_muse`]).
     match &snap.run {
         AgentRun::Claude => {}
-        AgentRun::Codex(_) | AgentRun::Muse(_) => return false,
+        AgentRun::Codex(_) | AgentRun::Muse(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => {
+            return false;
+        }
     }
-    let Some(sf) = Records::of_snapshot(home, snap)
+    Records::of_snapshot(home, snap)
         .session_file(snap.pid)
-        .filter(|sf| squash(&sf.proc_start) == snap.start)
-    else {
+        .is_some_and(|sf| follow_record(snap, &sf))
+}
+
+/// FOLLOW `snap` THROUGH ONE RECORD OF ITS OWN PROCESS, as [`follow`] does
+/// through the one on disk: the conversation, build and directory `sf` names
+/// — a record read elsewhere, such as the one a crash left
+/// ([`ExitRecord::Survived`], read at the exit). A Claude Code's snapshot
+/// only, and only a record of that very process (its pid and kernel start):
+/// another process's names nothing of this one. Returns whether anything
+/// moved.
+pub fn follow_record(snap: &mut Snapshot, sf: &SessionFile) -> bool {
+    if !matches!(snap.run, AgentRun::Claude)
+        || sf.pid != snap.pid
+        || squash(&sf.proc_start) != snap.start
+    {
         return false;
-    };
+    }
     let before = snap.clone();
     if upgrade::is_session_id(&sf.session_id) {
-        snap.session = Some(sf.session_id);
+        snap.session = Some(sf.session_id.clone());
     }
     if !sf.version.is_empty() {
-        snap.version = Some(sf.version);
+        snap.version = Some(sf.version.clone());
     }
     if !sf.cwd.is_empty() {
-        snap.cwd = sf.cwd;
+        snap.cwd.clone_from(&sf.cwd);
     }
     *snap != before
 }
@@ -4264,20 +4914,25 @@ pub enum ExitRecord {
     /// was ever registered).
     Removed,
     /// The agent CRASHED, by its shell's exit status: a Muse Code's, by its
-    /// own table ([`super::upgrade_muse::exit_kind`]); the session is the
+    /// own table ([`super::upgrade_muse::exit_kind`]), or an agy's, by its
+    /// own table and the crash file its dead pid left
+    /// ([`super::upgrade_agy::exit_kind`]); the conversation is the
     /// snapshot's. No other agent's end is read this way.
     Crashed,
     /// The agent REFUSED ITS OWN START, by its shell's exit status: a Muse
     /// Code's `1` (its session not found, an unknown session name) or `2`
-    /// (its arguments; [`super::upgrade_muse::ExitKind::Refused`]). Never a
-    /// crash and never someone's end: a relaunch would meet the same refusal,
-    /// so none is made (critic X4 of the lanes research, 2026-10-17).
+    /// (its arguments; [`super::upgrade_muse::ExitKind::Refused`]), or an
+    /// agy's `2` with no crash file left (its arguments;
+    /// [`super::upgrade_agy::ExitKind::Refused`]). Never a crash and never
+    /// someone's end: a relaunch would meet the same refusal, so none is made
+    /// (critic X4 of the lanes research, 2026-10-17).
     Refused,
 }
 
 impl ExitRecord {
     /// THE EXIT WAS A CRASH, read at the exit: a Claude Code's record
-    /// survived it, or a Muse Code's shell told one ([`Self::Crashed`]). The
+    /// survived it, or a Muse Code's or an agy's shell told one
+    /// ([`Self::Crashed`]). The
     /// ONE rule both what [`after_exit`] relaunches on and what the window's
     /// host owes through a back-off read (its `Kept::owed`, which a seamless
     /// update carries). An exit nothing read ([`Self::Unread`]) is no crash
@@ -4314,10 +4969,16 @@ impl ExitRecord {
 pub fn launch_ended(snap: &Snapshot, left: &ExitRecord) -> Option<&'static str> {
     // Each agent's one-shot launches by its own table: a Muse Code's `exec`,
     // tools, `--help` and `--version` ([`super::upgrade_muse::is_tui_argv`]),
-    // never Claude Code's flags read over its argv.
+    // an agy's `-p`, `--output-format`, `--version` and subcommands
+    // ([`super::upgrade_agy::is_tui_argv`]), a Gemini CLI's `-p`, `-o`,
+    // `--acp`, `--list-sessions`, `-v` and subcommands
+    // ([`super::upgrade_gemini::is_tui_argv`]), never Claude Code's flags read
+    // over its argv.
     let one_shot = match &snap.run {
         AgentRun::Claude | AgentRun::Codex(_) => upgrade::one_shot(&snap.argv),
         AgentRun::Muse(_) => !super::upgrade_muse::is_tui_argv(&snap.argv),
+        AgentRun::Agy(_) => !super::upgrade_agy::is_tui_argv(&snap.argv),
+        AgentRun::Gemini(_) => !super::upgrade_gemini::is_tui_argv(&snap.argv),
     };
     if one_shot {
         Some("one-shot")
@@ -4338,17 +4999,20 @@ pub struct ExitLook {
     pub running: bool,
     /// Its record, when one of its own start is on disk (Claude Code's).
     pub record: Option<SessionFile>,
-    /// Whose look it is ([`Snapshot::agent`]): a Muse Code's never reads
-    /// `record`, its shell's word (`crashed`, `refused`) decides; a Claude
-    /// Code's is its `record`.
+    /// Whose look it is ([`Snapshot::agent`]): a Muse Code's and an agy's
+    /// never read `record`, their shell's word (`crashed`, `refused`) decides;
+    /// a Claude Code's is its `record`.
     pub agent: upgrade::Agent,
-    /// A Muse Code's exit per its shell, by its own table
-    /// ([`super::upgrade_muse::exit_kind`]): `Some(true)` a crash,
-    /// `Some(false)` its own exit, someone's signal or a refused start, `None`
-    /// not told yet. `None` for every other agent's look.
+    /// A Muse Code's or an agy's exit per its shell, by its own table
+    /// ([`super::upgrade_muse::exit_kind`]; an agy's with its crash file,
+    /// [`super::upgrade_agy::exit_kind`]): `Some(true)` a crash, `Some(false)`
+    /// its own exit, someone's signal or a refused start, `None` not told yet
+    /// — or told, but deciding nothing at the exit (an agy stopped, or ended
+    /// with no witness: read again at the attempt). `None` for every other
+    /// agent's look.
     pub crashed: Option<bool>,
-    /// A Muse Code's shell says it REFUSED ITS START (`1`, `2`:
-    /// [`ExitRecord::Refused`]), with `crashed` `Some(false)`. `false` for
+    /// A Muse Code's or an agy's shell says it REFUSED ITS START
+    /// ([`ExitRecord::Refused`]), with `crashed` `Some(false)`. `false` for
     /// every other look and agent.
     pub refused: bool,
 }
@@ -4395,7 +5059,7 @@ pub fn look_at_exit(home: &Path, snap: &Snapshot) -> ExitLook {
 pub fn follow_muse(snap: &mut Snapshot) -> bool {
     let muse = match &snap.run {
         AgentRun::Muse(_) => true,
-        AgentRun::Claude | AgentRun::Codex(_) => false,
+        AgentRun::Claude | AgentRun::Codex(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => false,
     };
     muse && super::upgrade_drive::muse_follow(snap)
 }
@@ -4406,6 +5070,25 @@ pub fn follow_muse(snap: &mut Snapshot) -> bool {
 #[must_use]
 pub fn look_at_muse_exit(opts: &Opts, snap: &Snapshot) -> ExitLook {
     super::upgrade_drive::muse_look_at_exit(opts, snap)
+}
+
+/// [`ExitLook`] of an agy `snap` ([`AgyRun`]), live: its shell's exit status
+/// for the command it ran in, read over `opts.sock`, and whether its dead
+/// pid's crash file is left — read NOW, as the exit is seen, since the next
+/// agy start deletes it — by agy's own table
+/// ([`super::upgrade_agy::exit_kind`]).
+#[must_use]
+pub fn look_at_agy_exit(opts: &Opts, snap: &Snapshot) -> ExitLook {
+    super::upgrade_drive::agy_look_at_exit(opts, snap)
+}
+
+/// [`ExitLook`] of a Gemini CLI `snap` ([`GeminiRun`]), live: its shell's
+/// exit status for the command its parent ran in, read over `opts.sock` by
+/// Gemini CLI's own table ([`super::upgrade_gemini::exit_kind`]: a start it
+/// refused, `41`/`42`/`52`…, is no crash).
+#[must_use]
+pub fn look_at_gemini_exit(opts: &Opts, snap: &Snapshot) -> ExitLook {
+    super::upgrade_drive::gemini_look_at_exit(opts, snap)
 }
 
 /// Read what the exit left, once, as it is seen, independent of the back-off.
@@ -4430,16 +5113,20 @@ pub fn exit_record(
             }
         } else {
             match now.agent {
-                // Muse Code: its shell's word by its own table, a refused
-                // start apart; no word within the wait is read again at the
-                // attempt (its block, then its session's log).
-                upgrade::Agent::Muse => match now.crashed {
-                    Some(true) => return ExitRecord::Crashed,
-                    Some(false) if now.refused => return ExitRecord::Refused,
-                    Some(false) => return ExitRecord::Removed,
-                    None if waited >= EXIT_GONE => return ExitRecord::Unread,
-                    None => {}
-                },
+                // Muse Code, agy and Gemini CLI: the shell's word by each
+                // one's own table (an agy's with its crash file), a refused
+                // start apart; no verdict within the wait is read again at the
+                // attempt (the block, then a Muse Code's session log, an agy's
+                // crash file).
+                upgrade::Agent::Muse | upgrade::Agent::Agy | upgrade::Agent::Gemini => {
+                    match now.crashed {
+                        Some(true) => return ExitRecord::Crashed,
+                        Some(false) if now.refused => return ExitRecord::Refused,
+                        Some(false) => return ExitRecord::Removed,
+                        None if waited >= EXIT_GONE => return ExitRecord::Unread,
+                        None => {}
+                    }
+                }
                 upgrade::Agent::Claude => match now.record {
                     None => return ExitRecord::Removed,
                     Some(sf) if waited >= EXIT_SETTLE => {
@@ -4449,10 +5136,9 @@ pub fn exit_record(
                 },
                 // A Codex's end is never looked at here: aterm's copy of
                 // codex-alab's own record decides it (the Codex screen lane's
-                // retirement, 2026-10-16). No lane yet (agy, Gemini CLI): no
-                // snapshot of one is taken, so no look. Were one handed in,
-                // nothing reads its exit, never as Claude Code's record.
-                upgrade::Agent::Codex | upgrade::Agent::Agy | upgrade::Agent::Gemini => {
+                // retirement, 2026-10-16). Were one handed in, nothing reads
+                // its exit, never as Claude Code's record.
+                upgrade::Agent::Codex => {
                     return ExitRecord::Unread;
                 }
             }
@@ -4565,7 +5251,7 @@ pub fn after_host_ended_from(
 pub fn self_claimed_line(snap: &Snapshot) -> Option<&super::self_claimed::Resume> {
     match &snap.run {
         AgentRun::Codex(run) => run.self_claimed.as_ref(),
-        AgentRun::Claude | AgentRun::Muse(_) => None,
+        AgentRun::Claude | AgentRun::Muse(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => None,
     }
 }
 
@@ -4611,6 +5297,15 @@ fn after_exit_as(
         AgentRun::Muse(_) => {
             return super::upgrade_drive::muse_after_exit(opts, snap, left, upgrade, cause);
         }
+        // An agy by its own lane, on the conversation its witness proved.
+        AgentRun::Agy(_) => {
+            return super::upgrade_drive::agy_after_exit(opts, snap, left, upgrade, cause);
+        }
+        // A Gemini CLI by its own lane, on the session the start-time rule
+        // names at the attempt, pre-checked.
+        AgentRun::Gemini(_) => {
+            return super::upgrade_drive::gemini_after_exit(opts, snap, left, upgrade, cause);
+        }
         AgentRun::Claude => {}
     }
     let mut r = Report {
@@ -4645,8 +5340,8 @@ fn after_exit_as(
     let survivor = match left {
         ExitRecord::Survived(sf) => Some(SessionFile::clone(sf)),
         ExitRecord::Removed => None,
-        // (`Crashed` and `Refused` are a Muse Code's words; a Claude Code
-        // look never says them.)
+        // (`Crashed` and `Refused` are a Muse Code's and an agy's words; a
+        // Claude Code look never says them.)
         ExitRecord::Unread | ExitRecord::Crashed | ExitRecord::Refused => records
             .session_file(snap.pid)
             .filter(|sf| squash(&sf.proc_start) == snap.start),
@@ -4758,6 +5453,20 @@ fn after_exit_as(
     if survivor.is_none() && cause == ExitCause::Exit && !read_before {
         return said(r, "ended:graceful-exit");
     }
+    // WHERE THE GONE AGENT WENT ON WRITING ITS CONVERSATION (a worktree's
+    // home under a relative one), noted before anything reads its finish
+    // ([`super::upgrade_drive::note_moved_writes`], ATERM-KI-1016-1): the
+    // host's own note may never have been written, its finished read
+    // overtaken by the crash.
+    if !opts.dry_run {
+        super::upgrade_drive::note_moved_writes(opts, snap, &session, &cwd);
+    }
+    // The tab's own program ([`NO_SHELL`]): no shell is left to type its
+    // relaunch into. Defence in depth: [`plan`] refuses it too, with the same
+    // word; this answers before the targets are read.
+    if snap.shell == NO_SHELL {
+        return said(r, "refused:not-a-shell-job");
+    }
     if !alive(snap.shell) {
         return said(r, "refused:shell-gone");
     }
@@ -4807,6 +5516,7 @@ fn after_exit_as(
             &session,
             &snap.argv,
             true,
+            snap.profile.as_ref(),
         )
     } else {
         (None, None)
@@ -4828,6 +5538,11 @@ fn after_exit_as(
         homedir: None,
         login: snap.login.as_deref(),
         stored_login: snap.stored_login,
+        billing: if riding.is_some() {
+            ModelBilling::Move(snap.profile.as_ref())
+        } else {
+            ModelBilling::Keep
+        },
     };
     let mut st = St {
         from: version.unwrap_or_default(),
@@ -4976,7 +5691,7 @@ fn carry_in_flight(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str)
 /// stopped restart still counts as the one that ended an agent leaving its
 /// tab: twice [`STALE_S`], the longest a carry lives once nothing holds it,
 /// so a reused pid is never read as it.
-const STOPPED_OWN_S: u64 = 2 * STALE_S;
+pub(super) const STOPPED_OWN_S: u64 = 2 * STALE_S;
 
 /// Whether `st` is the record of a restart of the harness's own that ENDED
 /// `agent` process `pid` in tab `tab` — THE ONE IDENTITY BOTH LANES READ A
@@ -5012,7 +5727,16 @@ pub(super) fn ended_by_restart(
 ) -> bool {
     restart_of(st, agent, tab, pid)
         && match agent {
-            upgrade::Agent::Claude => {
+            // Claude Code's upgrade and restart in place, and Muse Code's and
+            // agy's live upgrades (their quiet flows, `upgrade_muse_live`,
+            // `upgrade_agy_live`): the record its step wrote BEFORE the
+            // SIGTERM (cause the upgrade's, [`ends_its_agent`]) claims the
+            // exit the signal makes — for Muse Code a `143` and a clean
+            // `session.end`, for agy a `0` with its crash file removed, each
+            // of which its relaunch on exit would read as someone's end and
+            // never relaunch. In flight, or stopped a short while after its
+            // agent was seen gone.
+            upgrade::Agent::Claude | upgrade::Agent::Muse | upgrade::Agent::Agy => {
                 st.in_flight()
                     || (matches!(st.phase, upgrade::Phase::Failed(_))
                         && st.exited_at != 0
@@ -5020,14 +5744,14 @@ pub(super) fn ended_by_restart(
                             <= STOPPED_OWN_S)
             }
             upgrade::Agent::Codex => false,
-            // Muse Code: relaunch on exit only — no upgrade or restart in
-            // place of the harness's ever ends it (its lanes), so no record
-            // of its lane is a restart's ([`ends_its_agent`] is never true
-            // of a relaunch's cause).
-            upgrade::Agent::Muse => false,
-            // No lane yet (agy, Gemini CLI): no restart of theirs ends them,
-            // and no record of one is read (`St::from_json`).
-            upgrade::Agent::Agy | upgrade::Agent::Gemini => false,
+            // Gemini CLI: relaunch on exit only — no upgrade or restart in
+            // place of the harness's ever ends it (its lane), so no record of
+            // its lane is a restart's ([`ends_its_agent`] is never true of a
+            // relaunch's cause). The explicit restart's act an agy carries is
+            // read by its stamp, never here: its records' causes are no
+            // restart's that ended its agent ([`CAUSE_STALL`],
+            // [`CAUSE_ASKED`]).
+            upgrade::Agent::Gemini => false,
         }
 }
 
@@ -5084,6 +5808,26 @@ fn landed(opts: &Opts, pid: u32) -> Option<(String, St)> {
         .filter(|sf| sf.pid != pid)
         .collect();
     conversation_live(&others, &session).then_some((session, st))
+}
+
+/// A QUIET UPGRADE'S RESTART THAT FINISHED — Muse Code's or agy's, `agent` —
+/// since the host read the exit of process `pid` in tab `opts.only_sid` as its
+/// own ([`landed`]'s half of the lanes past Claude Code's): its tab's record
+/// names that process, ended it (the upgrade's cause), saw it gone at most
+/// [`STOPPED_OWN_S`] ago and is done, and the process its relaunch resumed
+/// ([`St::resumed_pid`]) still runs. Neither agent keeps a session file a live
+/// holder is read from, so the resumed process itself is the witness.
+fn quiet_landed(opts: &Opts, agent: upgrade::Agent, pid: u32) -> Option<(String, St)> {
+    let tab = opts.only_sid.as_deref()?;
+    let now = now_s();
+    record_where(opts, |st| {
+        restart_of(st, agent, tab, pid)
+            && st.phase == upgrade::Phase::Done
+            && st.exited_at != 0
+            && now.saturating_sub(exit_clock(0, st.exited_at, st.hand_seen_s)) <= STOPPED_OWN_S
+            && st.resumed_pid != 0
+            && alive(st.resumed_pid)
+    })
 }
 
 /// Whether the restart `st` (filed under `session`) was ADOPTED and its
@@ -5184,12 +5928,13 @@ pub fn carry_restart(
         let found = pid.and_then(|pid| match agent {
             upgrade::Agent::Codex => None,
             upgrade::Agent::Claude => landed(opts, pid),
-            // Muse Code: no restart of the harness's ends it ([`ended_by_restart`]),
-            // so none landed; never one of Claude Code's read for it.
-            upgrade::Agent::Muse => None,
-            // No lane yet (agy, Gemini CLI): no restart of theirs landed;
-            // never one of Claude Code's read for them.
-            upgrade::Agent::Agy | upgrade::Agent::Gemini => None,
+            // Muse Code and agy: an upgrade's restart that finished meanwhile
+            // is closed `done` in its tab's own record, which names the new
+            // process; never one of Claude Code's read for it. Gemini CLI: no
+            // restart of the harness's ends it ([`ended_by_restart`]), so
+            // none landed.
+            upgrade::Agent::Muse | upgrade::Agent::Agy => quiet_landed(opts, agent, pid),
+            upgrade::Agent::Gemini => None,
         });
         let Some((session, st)) = found else {
             return said(r, "refused:no-restart-in-flight");
@@ -5350,14 +6095,16 @@ fn carry_own_step(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str) 
     let r = match st.agent {
         upgrade::Agent::Codex => super::upgrade_drive::codex_carry_in_flight(opts, r, st, session),
         upgrade::Agent::Claude => carry_in_flight(opts, r, st, session, tab),
-        // Muse Code: no restart of the harness's ends it, so a restart's
-        // carry never finds its record ([`ended_by_restart`]); one handed in
-        // is its lane's to carry, by its lane's rules.
+        // Muse Code's and agy's quiet upgrades: a restart's record is carried
+        // by its lane's own rules (the stale bound counted from its exit, its
+        // line, the adoption by its session's or conversation's lock, nothing
+        // typed after). Gemini CLI: no restart of the harness's ends it, so a
+        // restart's carry never finds its records ([`ended_by_restart`]); one
+        // handed in is its lane's to carry, by its lane's rules.
         upgrade::Agent::Muse => super::upgrade_drive::muse_carry_in_flight(opts, r, st, session),
-        // No lane yet (agy, Gemini CLI): nothing of theirs is carried, nor
-        // typed into them.
-        upgrade::Agent::Agy | upgrade::Agent::Gemini => {
-            return refused(r, NO_LANE);
+        upgrade::Agent::Agy => super::upgrade_drive::agy_carry_in_flight(opts, r, st, session),
+        upgrade::Agent::Gemini => {
+            super::upgrade_drive::gemini_carry_in_flight(opts, r, st, session)
         }
     };
     match r.step.strip_prefix("failed:").map(str::to_string) {
@@ -5446,41 +6193,48 @@ pub fn standing_limit(opts: &Opts, snap: &Snapshot, tail: &str) -> Option<upgrad
 /// -r` under the old login in any tab: the record is the conversation's)
 /// stands at that limit, and the wall's own rule acts on it — a move again,
 /// or a wait. A live agent with no login variable runs its home's login:
-/// the default one under the default home (the review's RR3-R4-1), none a
-/// move names under another. A record naming no target (an older build's, a
-/// move back) is the move, as before.
+/// the default one under the default home (the review's RR3-R4-1), the one
+/// its home's directory names under another ([`runs_moved`]). A record
+/// naming no target (an older build's, a move back) is the move, as before.
 /// Read-only.
 #[must_use]
 pub fn moved_off(opts: &Opts, session: &str, at: Option<u64>, live: &Snapshot) -> bool {
-    load(opts, session).is_some_and(|st| {
-        let (login, left) = own_move_target(&st);
-        let own = moves(&st.cause)
-            && at.is_none_or(|at| st.relaunched_at == 0 || at <= st.relaunched_at)
-            && runs_moved(live, login.as_deref(), left.as_deref());
-        let kept = st.moved_at != 0
+    let kept = |st: &St| {
+        st.moved_at != 0
             && at.is_none_or(|at| at <= st.moved_at)
             && runs_moved(
                 live,
                 st.moved_login.as_deref(),
                 st.moved_left_model.as_deref(),
-            );
-        own || kept
-    })
+            )
+    };
+    let record = load(opts, session).is_some_and(|st| {
+        let (login, left) = own_move_target(&st);
+        let own = moves(&st.cause)
+            && at.is_none_or(|at| st.relaunched_at == 0 || at <= st.relaunched_at)
+            && runs_moved(live, login.as_deref(), left.as_deref());
+        own || kept(&st)
+    });
+    // …or the move kept beside a record removed since
+    // ([`super::upgrade_drive::kept_move`], ATERM-KI-1016-1).
+    record || kept_move(opts, session).is_some_and(|st| kept(&st))
 }
 
 /// Whether agent `live` runs under a move's target: the login `login` an
 /// account move required (its own login read the same), and a model other
 /// than `left`, the one a fallback left (its argv's `--model` or
-/// `--model=`; none named reads `""`). `None` checks nothing. A login
-/// variable unset under the default home ([`accounts::HOME_ENV`] unset or
-/// empty) is the default login, as set and empty is ([`accounts::LOGIN_ENV`],
-/// what `accounts::login_env` names a move to the default account): the
-/// review's RR3-R4-1. Unset under another home is that home's login, which
-/// no move names.
+/// `--model=`; none named reads `""`). `None` checks nothing. ITS LOGIN IS
+/// THE DIRECTORY ITS KEYCHAIN ITEM IS NAMED BY (READ in the vendor's
+/// bundle, the accounts design §1): [`accounts::LOGIN_ENV`] where set
+/// (empty: the default item, what `accounts::login_env` names a move to the
+/// default account), else [`accounts::HOME_ENV`] verbatim, else — or that
+/// empty — the default. So an unset variable under the default home is the
+/// default login (the review's RR3-R4-1), and unset under another home is
+/// the login that home's own string names (ATERM-KI-1016-1): a move to that
+/// login is met by it, never by a move to the default one.
 fn runs_moved(live: &Snapshot, login: Option<&str>, left: Option<&str>) -> bool {
-    let default_home = live.home.as_deref().is_none_or(str::is_empty);
-    let runs = live.login.as_deref().or(default_home.then_some(""));
-    login.is_none_or(|l| runs == Some(l)) && left.is_none_or(|m| launch_model_of(&live.argv) != m)
+    let runs = live.login.as_deref().or(live.home.as_deref()).unwrap_or("");
+    login.is_none_or(|l| runs == l) && left.is_none_or(|m| launch_model_of(&live.argv) != m)
 }
 
 /// The model the relaunch's canonical launch parser keeps. The existing
@@ -5552,6 +6306,16 @@ pub fn adopted_gone(opts: &Opts, tab: &str, session: &str) -> Option<bool> {
     (st.relaunched_pid != 0).then(|| st.relaunched_gone(alive))
 }
 
+/// WHETHER A RELAUNCH OF CONVERSATION `session` IS IN FLIGHT IN TAB `tab`
+/// ([`St::in_flight`]): a relaunch saves its record so before it types its
+/// line ([`after_exit_as`]), so a step that ended without saying how — it
+/// panicked — may have typed it. Another tab's record says nothing of this
+/// one (F1-R9-G6). Read-only.
+#[must_use]
+pub fn in_flight_here(opts: &Opts, tab: &str, session: &str) -> bool {
+    load(opts, session).is_some_and(|st| st.in_flight() && st.tab == tab)
+}
+
 /// Whether a restart of `agent`'s lane is carried by this module's own rules
 /// ([`carry_restart`], [`carry_own_step`]: the stale-exit bound counted from
 /// the carry, the adopted process, the relaunched agent gone, the age limit)
@@ -5561,11 +6325,11 @@ pub fn adopted_gone(opts: &Opts, tab: &str, session: &str) -> Option<bool> {
 fn carried_here(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
-        // Muse Code: its lane keeps its own rules for the relaunch it files
-        // (`upgrade_drive`'s `muse::carry_in_flight`: the stale bound counted
-        // from its exit, the adopted process, its age). No lane yet (agy,
-        // Gemini CLI): none of their restarts exists, and Claude Code's rules
-        // are never theirs.
+        // Muse Code, agy and Gemini CLI: each lane keeps its own rules for
+        // the relaunch it files (`upgrade_drive`'s `muse::carry_in_flight`,
+        // `agy::carry_in_flight` and `gemini::carry_in_flight`: the stale
+        // bound counted from its exit, the adopted process, its age), and
+        // Claude Code's rules are never theirs.
         upgrade::Agent::Codex
         | upgrade::Agent::Muse
         | upgrade::Agent::Agy
@@ -5573,8 +6337,9 @@ fn carried_here(agent: upgrade::Agent) -> bool {
     }
 }
 
-/// The word of a step asked of an agent with no lane (agy, Gemini CLI;
-/// [`super::lanes::lanes`]): nothing read, typed or relaunched.
+/// The word of a step asked of a process no lane relaunches (a vendor
+/// `codex`, an image no lane reads; [`super::lanes::lanes`]): nothing read,
+/// typed or relaunched.
 pub const NO_LANE: &str = "no-lane";
 
 /// The continuation owed to tab `opts.only_sid`: an adopted relaunch not yet
@@ -5587,7 +6352,8 @@ pub fn owed(opts: &Opts) -> bool {
 }
 
 /// [`owed`], of `only`'s record alone where it names an agent: the window's
-/// host asks so for the worker of a relaunch-only lane (Muse Code), which
+/// host asks so for the worker of a relaunch-only lane (Muse Code, agy,
+/// Gemini CLI), which
 /// carries its own agent's relaunch and never one the sweep carries — a
 /// codex-alab's left owed in the same tab is the sweep's alone
 /// ([`super::lanes::sweep_carries_relaunch`]). `None`: any agent's record.
@@ -5701,9 +6467,11 @@ pub fn resume_as(opts: &Opts, done_under_land: bool, only: Option<upgrade::Agent
         // A Muse Code relaunch's continuation is its lane's to type, over the
         // TUI its relaunch line brought back.
         upgrade::Agent::Muse => super::upgrade_drive::muse_carry_in_flight(&carry, r, st, &session),
-        // No lane yet (agy, Gemini CLI): nothing typed into them.
-        upgrade::Agent::Agy | upgrade::Agent::Gemini => {
-            return said(r, format!("refused:{NO_LANE}"));
+        // An agy relaunch's continuation is its lane's to type, the same way,
+        // and so is a Gemini CLI's.
+        upgrade::Agent::Agy => super::upgrade_drive::agy_carry_in_flight(&carry, r, st, &session),
+        upgrade::Agent::Gemini => {
+            super::upgrade_drive::gemini_carry_in_flight(&carry, r, st, &session)
         }
     };
     if done_under_land && r.step == "adopted" {
@@ -5743,11 +6511,12 @@ fn carried_done(opts: &Opts, r: Report, session: &str) -> Report {
             "muse on {} · the same conversation resumed; {why}",
             one_line(&st.to)
         ),
-        // No lane yet (agy, Gemini CLI): never relaunched, so never here;
-        // said by its own name, never as another agent's.
-        upgrade::Agent::Agy | upgrade::Agent::Gemini => format!(
-            "{} on {} · {why}",
-            st.agent.program().name(),
+        upgrade::Agent::Agy => format!(
+            "agy on {} · the same conversation resumed; {why}",
+            one_line(&st.to)
+        ),
+        upgrade::Agent::Gemini => format!(
+            "gemini on {} · the same session resumed; {why}",
             one_line(&st.to)
         ),
     };
@@ -5868,7 +6637,8 @@ pub fn settle(opts: &Opts) -> Report {
         done_quietly(opts, r, &mut st, &session, &sf.version, sf.pid)
     } else {
         let ours = conversation_typed_by(opts, &tab, &session, &st);
-        let Some((word, why)) = nothing_owed(opts, &records, &tab, &session, &st, &ours) else {
+        let written = WhereWritten::new(opts, &records, &session, &ours);
+        let Some((word, why)) = nothing_owed(opts, &written, &tab, &st) else {
             return said(r, "wait:owed");
         };
         done_with_nothing(opts, r, &mut st, &session, word, why, &sf.version, sf.pid)
@@ -6010,11 +6780,21 @@ pub fn outcome(step: &str) -> Outcome {
     // continuation at its first idle point, [`resume`]) or `done:fresh` (a
     // fresh start, nothing to carry on) — or, for the carry of a restart's
     // exit, `landed` (another actor finished the move, or its relaunched
-    // agent is gone already, [`carry_restart`]).
+    // agent is gone already, [`carry_restart`]) — or `done:resumed`, the
+    // crash rule's relaunch of a proven self-claimed codex-alab
+    // ([`super::upgrade_drive::self_claimed_after_exit`]: its new TUI leads
+    // the tab, and codex-alab carries its own thread on, nothing typed
+    // after). That word was `adopted` until the codex-alab carve
+    // (3999d9adc6); read as a miss since, the host's relaunch loop never read
+    // the agent it had just started and tried the crash again on its back-off
+    // with the CRASHED process's snapshot and line — `ended:handled`, its
+    // witness already relaunched — so a relaunched codex-alab that crashed
+    // before the host's next pass named it was never relaunched (the second
+    // crash of the codex-alab proof, 2026-10-17).
     // The host hands every relaunched agent to its loop
     // ([`Opts::hand_back`]), so no other word lands — and a carry-on that
     // typed nothing (`done:no-continue`) is never one.
-    if matches!(step, "adopted" | "done:fresh" | "landed") {
+    if matches!(step, "adopted" | "done:fresh" | "landed" | "done:resumed") {
         Outcome::Relaunched
     } else if step == "wait:not-exited" {
         Outcome::Left("not-exited".to_string())

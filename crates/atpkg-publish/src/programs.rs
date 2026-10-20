@@ -32,9 +32,8 @@ pub const DUAL_DARWIN: &[Triple] = &[AARCH64_APPLE_DARWIN, X86_64_APPLE_DARWIN];
 /// move with the bundle or not at all.
 pub const ARM_DARWIN: &[Triple] = &[AARCH64_APPLE_DARWIN];
 
-// The tools the trust bundle shims, from the client (the candidate gate checks the same
-// list): a seal is publishable only with every one in its `bin/` (the five trust-wp
-// drivers are staged into a copy of the seal).
+// The tools the trust bundle shims, from the client: a seal is publishable only with every
+// one in its `bin/` (the five trust-wp drivers are staged into a copy of the seal).
 pub use atpkg::manifest::TRUST_EXPOSES;
 
 /// One program.
@@ -63,8 +62,8 @@ pub enum Shape {
         /// The Apple targets one build carries.
         darwin: &'static [Triple],
     },
-    /// A whole sysroot (bin/ + lib/), packed from a staged toolchain. A person cuts it;
-    /// the lanes only say what is owed.
+    /// A whole sysroot (bin/ + lib/), packed from a staged toolchain. The agent cutting it
+    /// packs it on a release-credential machine; the lanes only say what is owed.
     Bundle(BundleDef),
     /// A prebuilt PACKAGE TREE another pipeline built, signed and smoke-tested (layout v1:
     /// `codex-package.json` + `alab-build.json` at its root), packed whole by

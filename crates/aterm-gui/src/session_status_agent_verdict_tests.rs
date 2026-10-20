@@ -199,7 +199,7 @@ fn a_box_under_a_ticking_row_is_published_though_the_status_revision_never_moves
     paint(&app, sid, &box_screen(1));
     let changed = app.observe_session_statuses(t);
     for id in &changed {
-        app.refresh_presence_session(*id, false);
+        app.refresh_presence_session(*id);
     }
     t += step;
     let prompt = published(&app, sid);
@@ -1367,7 +1367,7 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
     assert!(
         record.contains(
             " history_lost=0 journal=off journal_off=keeper-off integration_rev=- born=cold render=ok \
-             resizes=0 flaps=0 land_at=- task=- \
+             resizes=0 flaps=0 land_at=- task=- pause=- task_state=- task_rev=0 \
              log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=- gen="
         ),
         "{record}"
@@ -1410,7 +1410,7 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
     assert!(
         record.contains(
             " history_lost=1234 journal=off journal_off=keeper-off integration_rev=- born=cold render=ok \
-             resizes=0 flaps=0 land_at=- task=- \
+             resizes=0 flaps=0 land_at=- task=- pause=- task_state=- task_rev=0 \
              log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=- gen="
         ),
         "{record}"
@@ -1942,7 +1942,7 @@ fn a_shell_ending_in_a_question_mark_is_not_an_agent() {
     let t0 = Instant::now();
     let changed = app.observe_session_statuses(t0);
     for id in changed {
-        app.refresh_presence_session(id, false);
+        app.refresh_presence_session(id);
     }
     assert_eq!(published(&app, sid).word, "-");
     let record = app.session_status_record(sid).expect("live");
@@ -1964,7 +1964,7 @@ fn a_shell_ending_in_a_question_mark_is_not_an_agent() {
     }
     let changed = app.observe_session_statuses(t0 + Duration::from_millis(300));
     for id in changed {
-        app.refresh_presence_session(id, false);
+        app.refresh_presence_session(id);
     }
     let p = published(&app, sid);
     assert_eq!(p.program.as_deref(), Some("claude"));
@@ -2034,7 +2034,7 @@ fn take_posts() -> Vec<crate::status_item::HeraldNotice> {
 /// One sweep plus the presence fan-out the event loop runs after it.
 fn sweep(app: &mut App, t: Instant) {
     for id in app.observe_session_statuses(t) {
-        app.refresh_presence_session(id, false);
+        app.refresh_presence_session(id);
     }
 }
 
@@ -2086,18 +2086,65 @@ fn a_box_the_zone_cuts_is_read_whole_and_a_hosted_agent_raises_no_row() {
         "{agent:?}"
     );
     let (hosted, bare) = {
-        let store = app.store.read().unwrap();
-        let handle = store.by_local(sid).expect("the session");
+        // Copied out of the store's guard, as `App::publish_need` does.
+        let handle = app.store.read().unwrap().by_local(sid).cloned();
+        let handle = handle.as_ref().expect("the session");
+        let now_us = crate::metrics::now_us();
         (
-            App::status_session_row(handle, |_| true, &Default::default()),
-            App::status_session_row(handle, |_| false, &Default::default()),
+            app.need_facts_with(handle, |_| true, &Default::default(), now_us, 0),
+            app.need_facts_with(handle, |_| false, &Default::default(), now_us, 0),
         )
     };
     assert!(hosted.supervised, "{hosted:?}");
-    assert_eq!(crate::status_item::escalation(&hosted), None);
-    // NEGATIVE CONTROL: no host supervising — the verdict's row.
+    assert_eq!(crate::needs::of(&hosted).need, None);
+    // NEGATIVE CONTROL: no host supervising — the verdict's need.
     assert!(!bare.supervised);
-    assert!(crate::status_item::escalation(&bare).is_some());
+    assert!(crate::needs::of(&bare).need.is_some());
+}
+
+/// ANOTHER HOLDER'S LIVE CLAIM IS NAMED APART FROM THIS HOST'S
+/// (`NeedFacts::other_supervisor`, the walls another holder's `meta set
+/// supervisor` claim retries, a manager session's or codex-alab's own):
+/// its claim makes the session supervised and names the loop. Either claim
+/// is a live claim (`NeedFacts::claim_live`, what the supervisor loop's
+/// `kind=wait` waits a wall out under). NEGATIVE CONTROLS: no claim names
+/// none and is no live claim, and this host's own claim names no other
+/// supervisor, its answer to a wall being `wall_answer`'s, never presumed.
+#[test]
+fn another_holders_claim_is_named_apart_from_this_hosts() {
+    let (app, sid) = app_with_stub();
+    let ctx = app.pool.get(sid).expect("pooled").ctx.clone();
+    let read = |app: &App| {
+        let handle = app.store.read().unwrap().by_local(sid).cloned();
+        let handle = handle.as_ref().expect("the session");
+        let f = app.need_facts_with(
+            handle,
+            |_| false,
+            &Default::default(),
+            crate::metrics::now_us(),
+            0,
+        );
+        (f.supervised, f.other_supervisor, f.claim_live)
+    };
+    assert_eq!(read(&app), (false, false, false), "no claim");
+    let now_us = crate::metrics::now_us();
+    let host = crate::harness_host::holder();
+    assert_eq!(
+        crate::session_timeline::claim_supervisor(&ctx, &host, None, None, now_us),
+        Ok(true)
+    );
+    assert_eq!(read(&app), (false, false, true), "this host's own claim");
+    assert!(crate::session_timeline::release_supervisor_held_by(
+        &ctx,
+        &host,
+        now_us,
+        aterm_slog::Actor::Ctl
+    ));
+    assert_eq!(
+        crate::session_timeline::claim_supervisor(&ctx, "drive-watch", None, None, now_us),
+        Ok(true)
+    );
+    assert_eq!(read(&app), (true, true, true), "another holder's claim");
 }
 
 /// ONE PLACE FOR ANDREW, end to end on the measured rm box: the sweep
@@ -2116,7 +2163,13 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
     {
         use crate::session_timeline::{MetaEdit, MetaField, write_session_meta};
         let ctx = app.pool.get(sid).expect("pooled").ctx.clone();
-        write_session_meta(&ctx, MetaField::Title, MetaEdit::Set("build")).expect("title");
+        write_session_meta(
+            &ctx,
+            MetaField::Title,
+            MetaEdit::Set("build"),
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("title");
     }
     let _ = take_posts();
     looking_at(&app, &[]);
@@ -2128,7 +2181,7 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
         t += step;
     }
     assert!(take_posts().is_empty(), "a busy agent needs nobody");
-    assert!(app.operator_fleet_glance().warnings.is_empty());
+    assert!(app.status_glance().needs.is_empty());
 
     paint(&app, sid, &box_screen(1));
     sweep(&mut app, t);
@@ -2143,13 +2196,18 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
         "the body names the command: {}",
         posts[0].body
     );
-    let glance = app.operator_fleet_glance();
-    assert_eq!(glance.warnings.len(), 1, "{:?}", glance.warnings);
-    let (row_sid, label) = &glance.warnings[0];
-    assert_eq!(*row_sid, sid, "a click on the row focuses this tab");
+    let glance = app.status_glance();
+    assert_eq!(glance.need_count(), 1, "{:?}", glance.needs);
+    assert_eq!(
+        glance.local_need_sessions(),
+        vec![sid],
+        "a click on the row focuses this tab"
+    );
+    assert_eq!(glance.needs[0].label, "build", "the row names its tab");
     assert!(
-        label.contains("build") && label.contains("S=$PWD/tmp;"),
-        "the row names the tab and the command: {label}"
+        posts[0].body.starts_with("build: bash "),
+        "{}",
+        posts[0].body
     );
     let rev = published(&app, sid).rev;
 
@@ -2163,20 +2221,20 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
         rev,
         "the same box is the same rev"
     );
-    app.refresh_presence_session(sid, false);
+    app.refresh_presence_session(sid);
     assert!(take_posts().is_empty(), "no second notification");
     assert_eq!(
         app.presence.herald.last_quiet(),
         Some(crate::status_item::HeraldQuiet::Same)
     );
-    assert_eq!(app.operator_fleet_glance().warnings.len(), 1);
+    assert_eq!(app.status_glance().need_count(), 1);
 
     // The box is answered, and a NEW one comes up while the human is
     // looking at this tab in the active app: listed, not announced.
     paint(&app, sid, &busy_screen(9));
     sweep(&mut app, t);
     t += step;
-    assert!(app.operator_fleet_glance().warnings.is_empty(), "row gone");
+    assert!(app.status_glance().needs.is_empty(), "row gone");
     looking_at(&app, &[sid]);
     paint(&app, sid, &box_screen(3));
     sweep(&mut app, t);
@@ -2186,7 +2244,7 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
         app.presence.herald.last_quiet(),
         Some(crate::status_item::HeraldQuiet::Looking)
     );
-    assert_eq!(app.operator_fleet_glance().warnings.len(), 1);
+    assert_eq!(app.status_glance().need_count(), 1);
 
     // NEGATIVE CONTROL: the same first transition in a headless instance
     // reaches the published verdict and posts nothing.
@@ -2236,7 +2294,7 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
         Ok(true)
     );
     // The `meta set` arm's `Wake::MetaChanged` refresh.
-    app.refresh_presence_session(sid, false);
+    app.refresh_presence_session(sid);
     let step = Duration::from_millis(300);
     let mut t = Instant::now();
     paint(&app, sid, &busy_screen(0));
@@ -2282,4 +2340,171 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
     assert!(ctx.meta.lock().unwrap().supervisor_expiry().is_none());
     let _ = app.presence_tick(Instant::now());
     assert!(take_posts().is_empty(), "announced once");
+}
+
+/// A RE-GRID IS NO MOVE OF THE PROGRAM'S (`AgentPublication::text_moves` and
+/// `verdict_moves`, the held deadline's screen evidence; the reviews of its
+/// third cut): a worker's held stall raises the supervisor's attention, the
+/// presence row it bears is born and re-grids the tab one row shorter, and
+/// Claude Code repaints for the new size — the screen's text changes at the
+/// sweep's read of the resized grid and again at its read of the repaint,
+/// and the program did nothing, so neither change is counted, nor the row's
+/// fold back after it. Counted, the stall's own row would end the stall
+/// (`working why=moved`), fold, and stall it again two minutes later, a fresh
+/// `stalled` to the manager's `await task` each time. A WIDTH change (the
+/// window dragged narrower, a pane split, the font zoomed) reflows the box,
+/// and the read of the reflowed grid parses it otherwise until the repaint:
+/// the verdict moves and moves back, `agent_rev` with it, and that is no move
+/// either. NEGATIVE CONTROLS: the stamp moved at every read (a count of every
+/// text change would have counted each) and the rev at the width's (a count
+/// of the rev would have counted both); the program's own change at the same
+/// grid past the settle is a text move, and a verdict it moves to — within a
+/// re-grid's settle and kept, or past it — is a verdict move.
+#[test]
+fn a_regrid_and_the_programs_repaint_are_no_text_move() {
+    let (mut app, sid) = app_with_stub();
+    let mut t = Instant::now();
+    let step = Duration::from_millis(300);
+    let sweep = |app: &mut App, t: &mut Instant| {
+        let _ = app.observe_session_statuses(*t);
+        *t += step;
+    };
+    // The program's repaint for the grid it now has: the screen cleared and
+    // the box drawn again at its foot (the transcript rows above it are not),
+    // its rule as wide as the grid and a bordered row too long for it
+    // word-wrapped inside its border.
+    let repaint = |app: &App| {
+        let pooled = app.pool.get(sid).expect("pooled");
+        let mut term = crate::term_lock(&pooled.term);
+        let cols = usize::from(term.cols());
+        let border = " \u{2502} ";
+        let mut frame = Vec::new();
+        for row in &box_screen(1)[10..] {
+            if row.starts_with('\u{2500}') {
+                frame.push("\u{2500}".repeat(cols));
+                continue;
+            }
+            let Some(text) = row
+                .strip_prefix(border)
+                .filter(|_| row.chars().count() > cols)
+            else {
+                frame.push(row.clone());
+                continue;
+            };
+            let mut line = String::new();
+            for word in text.split(' ') {
+                if !line.is_empty() && 3 + line.chars().count() + 1 + word.chars().count() > cols {
+                    frame.push(format!("{border}{line}"));
+                    line.clear();
+                }
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(word);
+            }
+            frame.push(format!("{border}{line}"));
+        }
+        let top = usize::from(term.rows()) - frame.len();
+        let mut bytes = String::from("\x1b[H\x1b[2J");
+        for (i, row) in frame.iter().enumerate() {
+            bytes.push_str(&format!("\x1b[{};1H{row}", top + i + 1));
+        }
+        term.process(bytes.as_bytes());
+    };
+    let regrid = |app: &App, rows: u16, cols: u16| {
+        let pooled = app.pool.get(sid).expect("pooled");
+        crate::term_lock(&pooled.term).resize(rows, cols);
+    };
+    let fp = |app: &App| published(app, sid).stamp.expect("read").fp;
+    paint(&app, sid, &busy_screen(0));
+    sweep(&mut app, &mut t);
+    paint(&app, sid, &box_screen(1));
+    sweep(&mut app, &mut t);
+    let held = published(&app, sid);
+    assert_eq!(held.word, "prompt");
+
+    let settle = crate::session_timeline::REGRID_SETTLE;
+    // The row is born (23 rows), then folds past the settle (24); then the
+    // window is dragged narrower and back: each time the tab re-gridded,
+    // read, then the program's repaint, read. Widening wraps nothing back,
+    // so there the repaint alone moves the text.
+    for (rows, cols, reflows) in [
+        (23, 120, true),
+        (24, 120, true),
+        (24, 100, true),
+        (24, 120, false),
+    ] {
+        let before = fp(&app);
+        let rev = published(&app, sid).rev;
+        regrid(&app, rows, cols);
+        sweep(&mut app, &mut t);
+        let resized = fp(&app);
+        assert_eq!(
+            resized != before,
+            reflows,
+            "{rows}x{cols}: the resize moved the text"
+        );
+        repaint(&app);
+        sweep(&mut app, &mut t);
+        assert_ne!(
+            fp(&app),
+            resized,
+            "{rows}x{cols}: the repaint moved it again"
+        );
+        let now = published(&app, sid);
+        assert_eq!(
+            (now.text_moves, now.verdict_moves, now.word),
+            (held.text_moves, held.verdict_moves, "prompt"),
+            "{rows}x{cols}: a re-grid and its repaint are no move"
+        );
+        assert_eq!(now.detail, held.detail, "{rows}x{cols}: repainted");
+        if cols == 100 {
+            assert_eq!(
+                now.rev,
+                rev + 2,
+                "the reflowed read moved the verdict and back"
+            );
+        }
+        t += settle;
+    }
+
+    // NEGATIVE CONTROLS: the program's own change at the same grid, once the
+    // settle is past, is a move of its text; the verdict it keeps is none.
+    let before = fp(&app);
+    paint(&app, sid, &box_screen(2));
+    sweep(&mut app, &mut t);
+    assert_ne!(fp(&app), before);
+    let moved = published(&app, sid);
+    assert_eq!(moved.text_moves, held.text_moves + 1, "the program moved");
+    assert_eq!(moved.verdict_moves, held.verdict_moves, "its verdict stood");
+    // A verdict the program moves to within a re-grid's settle, and keeps,
+    // counts at the first read of the screen past the settle (`paint` draws
+    // at 120 columns again: the same burst; the paint after the settle moves
+    // the text, which is what has the sweep read it).
+    regrid(&app, 24, 100);
+    sweep(&mut app, &mut t);
+    paint(&app, sid, &busy_screen(1));
+    sweep(&mut app, &mut t);
+    let within = published(&app, sid);
+    assert_eq!(
+        (within.word, within.verdict_moves),
+        ("busy", held.verdict_moves),
+        "within the settle"
+    );
+    t += settle;
+    paint(&app, sid, &busy_screen(2));
+    sweep(&mut app, &mut t);
+    assert_eq!(
+        published(&app, sid).verdict_moves,
+        held.verdict_moves + 1,
+        "rested: the verdict is not the one before the re-grid"
+    );
+    // And one it moves to past the settle counts at once.
+    paint(&app, sid, &box_screen(3));
+    sweep(&mut app, &mut t);
+    let back = published(&app, sid);
+    assert_eq!(
+        (back.word, back.verdict_moves),
+        ("prompt", held.verdict_moves + 2)
+    );
 }

@@ -10,8 +10,9 @@
 use std::sync::Arc;
 
 use aterm_core::render::{
-    CharFg, FreeSampler, FreeSprite, FreeZ, GlowQuad, InkCell, RainHalo, RenderInput, SceneAtlas,
-    SpriteQuad,
+    CharFg, FreeSampler, FreeSprite, FreeZ, FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer,
+    FxRect, FxSlot, FxSpace, FxTexels, GlowQuad, InkCell, PxRect, RainHalo, RenderInput,
+    SceneAtlas, SpriteQuad,
 };
 use aterm_core::terminal::Terminal;
 use aterm_render::{Renderer, Theme, premul_rgb};
@@ -278,6 +279,59 @@ const CHANNELS: &[Channel] = &[
         }),
         must_paint: true,
         is_empty: |i| i.rain_quads.is_empty() && i.rain_atlas.is_none() && i.rain_add.is_empty(),
+    },
+    Channel {
+        name: "fx_layers + fx_occluders + fx_prefetch",
+        text: b"\x1b[?25lcard on a row",
+        empties: &[
+            ("every fx channel explicitly empty", |i, _, _| {
+                i.fx_layers = Vec::new();
+                i.fx_occluders = Vec::new();
+                i.fx_prefetch = Vec::new();
+            }),
+            (
+                "occluders and a prefetch with no layer draw nothing",
+                |i, _, _| {
+                    i.fx_occluders = vec![PxRect::new(0, 0, 40, 40)];
+                    i.fx_prefetch = vec![Arc::new(
+                        FxArt::new(1, 1, FxTexels::Index8, vec![1]).expect("sized"),
+                    )];
+                },
+            ),
+            ("a layer with no items draws nothing", |i, _, _| {
+                i.fx_layers = vec![FxLayer::new(
+                    1,
+                    Arc::new(FxContent::default()),
+                    FxSlot::Over,
+                    FxSpace::Grid,
+                    FxBlend::Exact,
+                )];
+            }),
+        ],
+        populate: Some(|i, cw, ch| {
+            let content = FxContent::new(
+                vec![FxItem::Rect(FxRect {
+                    x: 0,
+                    y: 0,
+                    w: (2 * cw) as u16,
+                    h: (2 * ch) as u16,
+                    ink: 0,
+                })],
+                vec![FxInk::add(0x0030_2010); 2],
+            );
+            i.fx_layers = vec![FxLayer::new(
+                1,
+                Arc::new(content),
+                FxSlot::Under,
+                FxSpace::Grid,
+                FxBlend::Exact,
+            )];
+            i.fx_occluders = vec![PxRect::new(0, 0, 1, 1)];
+        }),
+        must_paint: true,
+        is_empty: |i| {
+            i.fx_layers.is_empty() && i.fx_occluders.is_empty() && i.fx_prefetch.is_empty()
+        },
     },
     Channel {
         name: "word_decorations",

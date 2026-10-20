@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm machines scan`: Macs on the LAN, from Bonjour (`_ssh._tcp`, `_rfb._tcp`) and an
-//! optional sweep of a subnet's port 22 (design §4.3).
+//! `aterm machines scan`: Macs on the LAN, from Bonjour (`_ssh._tcp`, `_sftp-ssh._tcp`,
+//! `_rfb._tcp`) and an optional sweep of a subnet's port 22 (design §4.3).
 //!
 //! Bonjour comes from `/usr/bin/dns-sd`, which never exits on its own: each run is bounded
 //! by the port's deadline and kept to it ([`Cmd::until_deadline`]), so what it printed by
@@ -29,6 +29,12 @@ pub const SSH_SERVICE: &str = "_ssh._tcp";
 
 /// Screen Sharing's service type.
 pub const RFB_SERVICE: &str = "_rfb._tcp";
+
+/// The SFTP service type macOS's Remote Login advertises beside [`SSH_SERVICE`], under the
+/// same instance name (`/System/Library/LaunchDaemons/ssh.plist` lists both in its Bonjour
+/// key; measured in the VM): what tells a Mac from another host advertising `_ssh._tcp` (a
+/// Linux box's Avahi advertises that alone).
+pub const SFTP_SERVICE: &str = "_sftp-ssh._tcp";
 
 /// How long one `dns-sd -L` resolve runs. A resolve answers in milliseconds when the
 /// instance is there (measured in the VM: under 2 ms); this bounds one that is not.
@@ -74,6 +80,8 @@ pub struct Found {
     pub ssh: bool,
     /// Screen Sharing is advertised (`_rfb._tcp`).
     pub screen_sharing: bool,
+    /// macOS's SFTP is advertised under the same name (`_sftp-ssh._tcp`, [`SFTP_SERVICE`]).
+    pub sftp: bool,
     /// Bonjour or the sweep.
     pub source: Source,
 }
@@ -95,31 +103,47 @@ pub struct Browse {
     /// Advertised instances no resolve answered for within [`RESOLVE_BUDGET`]: seen, but
     /// not located. Never dropped silently.
     pub unresolved: Vec<String>,
+    /// Why the `_sftp-ssh._tcp` browse failed, when it did: then no row's `sftp` says
+    /// anything, and `enroll --found` takes only the Macs Screen Sharing marks. The other two
+    /// browses' failures fail the whole browse, as before.
+    pub sftp_failed: Option<String>,
 }
 
-/// Browse `_ssh._tcp` and `_rfb._tcp` for `wait`, then resolve each instance.
+/// Browse `_ssh._tcp`, `_sftp-ssh._tcp` and `_rfb._tcp` for `wait`, then resolve each
+/// instance.
 ///
-/// A Mac that advertises both is one row (`ssh` and `screen_sharing`); one that advertises
-/// only Screen Sharing is a row with `ssh: false` (Remote Login off, or turned on without
-/// the Sharing pane, which does not advertise it).
+/// A Mac that advertises Remote Login and Screen Sharing is one row (`ssh` and
+/// `screen_sharing`); one that advertises only Screen Sharing is a row with `ssh: false`
+/// (Remote Login off, or turned on without the Sharing pane, which does not advertise it).
+/// `sftp` marks a Remote Login row whose instance also advertises `_sftp-ssh._tcp`, as
+/// macOS's does; it needs no resolve of its own.
 ///
 /// # Errors
 /// One line when `dns-sd` could not run, or quit on its own with an error (Bonjour's
 /// refusal of this process names Local Network privacy).
 pub fn browse(sys: &dyn System, wait: Duration) -> Result<Browse, String> {
-    let services = [SSH_SERVICE, RFB_SERVICE];
+    let services = [SSH_SERVICE, RFB_SERVICE, SFTP_SERVICE];
     let mut seen = fan_out(&services, services.len(), |service| {
         browse_one(sys, service, wait)
     })
     .into_iter();
     let ssh = seen.next().unwrap_or_else(|| Ok(Vec::new()))?;
     let rfb = seen.next().unwrap_or_else(|| Ok(Vec::new()))?;
+    // A browse aterm's Info.plist did not declare (an older build's) may be refused by Local
+    // Network privacy on its own: `scan` goes on without it.
+    let (sftp, sftp_failed) = match seen.next().unwrap_or_else(|| Ok(Vec::new())) {
+        Ok(sftp) => (sftp, None),
+        Err(why) => (Vec::new(), Some(why)),
+    };
 
     let budget = wait.min(RESOLVE_BUDGET);
     let resolved = fan_out(&ssh, RESOLVE_PARALLEL, |inst| {
         resolve(sys, &inst.name, SSH_SERVICE, budget)
     });
-    let mut out = Browse::default();
+    let mut out = Browse {
+        sftp_failed,
+        ..Browse::default()
+    };
     for (inst, targets) in ssh.iter().zip(resolved) {
         if targets.is_empty() {
             out.unresolved.push(inst.name.clone());
@@ -136,6 +160,7 @@ pub fn browse(sys: &dyn System, wait: Duration) -> Result<Browse, String> {
                     port,
                     ssh: true,
                     screen_sharing: false,
+                    sftp: sftp.iter().any(|s| s.name == inst.name),
                     source: Source::Bonjour,
                 });
             }
@@ -176,6 +201,7 @@ pub fn browse(sys: &dyn System, wait: Duration) -> Result<Browse, String> {
                     port,
                     ssh: false,
                     screen_sharing: true,
+                    sftp: false,
                     source: Source::Bonjour,
                 });
             }
@@ -436,6 +462,7 @@ pub fn subnet(knock: &dyn Knock, cidr: &str, timeout: Duration) -> Result<Vec<Fo
             port: 22,
             ssh: true,
             screen_sharing: false,
+            sftp: false,
             source: Source::Subnet,
         })
         .collect())
@@ -458,11 +485,22 @@ pub fn pinned_host(
     inv: &Inventory,
     found: &Found,
 ) -> Read<String> {
+    match offered_keys(sys, found) {
+        Ok(offered) => pinned_name(sys, paths, inv, &offered),
+        Err(why) => Read::Unusable(why),
+    }
+}
+
+/// The ed25519 key blobs `found` presents (`ssh-keyscan`, three seconds).
+///
+/// # Errors
+/// One line: Remote Login is off, the address is not one, or no key came back.
+pub fn offered_keys(sys: &dyn System, found: &Found) -> Result<Vec<String>, String> {
     if !found.ssh {
-        return Read::Unusable("Remote Login is not on, so it shows no host key".into());
+        return Err("Remote Login is not on, so it shows no host key".into());
     }
     if found.address.is_empty() || found.address.starts_with('-') {
-        return Read::Unusable(format!("{:?} is not an address", found.address));
+        return Err(format!("{:?} is not an address", found.address));
     }
     let cmd = Cmd::new(SSH_KEYSCAN)
         .args(["-T", "3", "-t", "ed25519", "-p"])
@@ -470,19 +508,28 @@ pub fn pinned_host(
         .arg("--")
         .arg(&found.address)
         .budget(Duration::from_secs(10));
-    let ran = match sys.run(&cmd) {
-        Ok(ran) => ran,
-        Err(e) => return Read::Unusable(format!("ssh-keyscan: {e}")),
-    };
+    let ran = sys.run(&cmd).map_err(|e| format!("ssh-keyscan: {e}"))?;
     let offered = host_keys(&ran.out());
     if offered.is_empty() {
-        return Read::Unusable(format!(
+        return Err(format!(
             "no host key from {}:{} ({})",
             found.address,
             found.port,
             ran.describe()
         ));
     }
+    Ok(offered)
+}
+
+/// Which inventory host pins one of the `offered` key blobs: `Value(name)`, `Absent` for
+/// none, `Unusable` when `known_hosts` cannot be read.
+#[must_use]
+pub fn pinned_name(
+    sys: &dyn System,
+    paths: &Paths,
+    inv: &Inventory,
+    offered: &[String],
+) -> Read<String> {
     let pins = match sys.read_file(&paths.known_hosts()) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Read::Absent,
@@ -532,7 +579,7 @@ fn host_keys_with_patterns(text: &str) -> Vec<(String, String)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::port::{Fake, Ran};
     use std::collections::BTreeMap;
@@ -607,6 +654,51 @@ DATE: ---Fri 16 Oct 2026---
     /// A resolve of a name nobody advertises, killed at its deadline: dns-sd flushes its
     /// header only with a result, so nothing at all was captured.
     const RESOLVE_NOBODY: &str = "";
+
+    /// A later capture in the VM (macOS 27.0, then named lab-02), while `dns-sd -R spark-1
+    /// _ssh._tcp local. 22` advertised a host with Remote Login alone, as a Linux box's Avahi
+    /// does: `dns-sd -B _ssh._tcp local.`, then `_sftp-ssh._tcp` and `_rfb._tcp`. This Mac
+    /// (m14) shows on interface 5 in the first two.
+    const BROWSE_SSH_LAB: &str = "Browsing for _ssh._tcp.local.
+DATE: ---Sun 18 Oct 2026---
+ 6:21:48.496  ...STARTING...
+Timestamp     A/R    Flags  if Domain               Service Type         Instance Name
+ 6:21:48.497  Add        3   1 local.               _ssh._tcp.           lab-02
+ 6:21:48.497  Add        3   5 local.               _ssh._tcp.           lab-02
+ 6:21:48.497  Add        3   1 local.               _ssh._tcp.           spark-1
+ 6:21:48.497  Add        2   5 local.               _ssh._tcp.           spark-1
+ 6:21:48.702  Add        2   5 local.               _ssh._tcp.           m14 Air M5 32GB 4TB prime
+";
+    const BROWSE_SFTP_LAB: &str = "Browsing for _sftp-ssh._tcp.local.
+DATE: ---Sun 18 Oct 2026---
+ 6:21:51.515  ...STARTING...
+Timestamp     A/R    Flags  if Domain               Service Type         Instance Name
+ 6:21:51.516  Add        3   1 local.               _sftp-ssh._tcp.      lab-02
+ 6:21:51.516  Add        3   5 local.               _sftp-ssh._tcp.      lab-02
+ 6:21:51.516  Add        2   5 local.               _sftp-ssh._tcp.      m14 Air M5 32GB 4TB prime
+";
+    const BROWSE_RFB_LAB: &str = "Browsing for _rfb._tcp.local.
+DATE: ---Sun 18 Oct 2026---
+ 6:21:54.535  ...STARTING...
+Timestamp     A/R    Flags  if Domain               Service Type         Instance Name
+ 6:21:54.542  Add        3   1 local.               _rfb._tcp.           lab-02
+ 6:21:54.542  Add        2   5 local.               _rfb._tcp.           lab-02
+";
+    /// `dns-sd -L lab-02 _ssh._tcp local.` in that session.
+    const RESOLVE_LAB: &str = "Lookup lab-02._ssh._tcp.local.
+DATE: ---Sun 18 Oct 2026---
+ 6:21:59.636  ...STARTING...
+ 6:21:59.637  lab-02._ssh._tcp.local. can be reached at lab-02.local.:22 (interface 5) Flags: 1
+ 6:21:59.637  lab-02._ssh._tcp.local. can be reached at lab-02.local.:22 (interface 5)
+";
+    /// `dns-sd -L spark-1 _ssh._tcp local.` in that session, its target the box's own name
+    /// (registered in the VM, it named the VM's, lab-02.local, which a Linux box would not).
+    const RESOLVE_SPARK: &str = "Lookup spark-1._ssh._tcp.local.
+DATE: ---Sun 18 Oct 2026---
+ 6:21:57.613  ...STARTING...
+ 6:21:57.613  spark-1._ssh._tcp.local. can be reached at spark-1.local.:22 (interface 5) Flags: 1
+ 6:21:57.613  spark-1._ssh._tcp.local. can be reached at spark-1.local.:22 (interface 5)
+";
 
     fn killed(stdout: &str) -> Ran {
         Ran {
@@ -695,11 +787,13 @@ DATE: ---Fri 16 Oct 2026---
         assert!(parse_resolve(RESOLVE_NOBODY).is_empty());
     }
 
-    /// The fake answering the VM's captures.
+    /// The fake answering the VM's captures (the SFTP browse is a later session's, when the
+    /// VM was named lab-02: only this Mac's row there matches a row here).
     fn vm(browse_ssh: &str) -> Fake {
         let fake = Fake::root();
         fake.on(&browse_key(SSH_SERVICE), killed(browse_ssh));
         fake.on(&browse_key(RFB_SERVICE), killed(BROWSE_RFB));
+        fake.on(&browse_key(SFTP_SERVICE), killed(BROWSE_SFTP_LAB));
         fake.on(
             &resolve_key("m14 Air M5 32GB 4TB prime", SSH_SERVICE),
             killed(RESOLVE_AIR),
@@ -728,6 +822,7 @@ DATE: ---Fri 16 Oct 2026---
                     port: 22,
                     ssh: true,
                     screen_sharing: false,
+                    sftp: true,
                     source: Source::Bonjour,
                 },
                 Found {
@@ -736,20 +831,68 @@ DATE: ---Fri 16 Oct 2026---
                     port: 22,
                     ssh: true,
                     screen_sharing: true,
+                    sftp: false,
                     source: Source::Bonjour,
                 },
             ]
         );
         assert!(got.unresolved.is_empty());
-        // Both browses and one resolve per Remote Login Mac; Screen Sharing on the same Mac
-        // needs none.
+        // The three browses and one resolve per Remote Login Mac; Screen Sharing and SFTP on
+        // the same Mac need none.
         let calls = fake.calls();
-        assert_eq!(calls.len(), 4, "{calls:?}");
+        assert_eq!(calls.len(), 5, "{calls:?}");
         assert!(
             !calls
                 .iter()
                 .any(|c| c.contains("-L") && c.contains(RFB_SERVICE))
         );
+    }
+
+    /// The fake answering the lab-02 session's captures.
+    pub(crate) fn lab_session() -> Fake {
+        lab_session_with(killed(BROWSE_SFTP_LAB))
+    }
+
+    /// [`lab_session`] with the SFTP browse answering `sftp`.
+    pub(crate) fn lab_session_with(sftp: Ran) -> Fake {
+        let fake = Fake::root();
+        fake.on(&browse_key(SSH_SERVICE), killed(BROWSE_SSH_LAB));
+        fake.on(&browse_key(SFTP_SERVICE), sftp);
+        fake.on(&browse_key(RFB_SERVICE), killed(BROWSE_RFB_LAB));
+        fake.on(&resolve_key("lab-02", SSH_SERVICE), killed(RESOLVE_LAB));
+        fake.on(&resolve_key("spark-1", SSH_SERVICE), killed(RESOLVE_SPARK));
+        fake.on(
+            &resolve_key("m14 Air M5 32GB 4TB prime", SSH_SERVICE),
+            killed(RESOLVE_AIR),
+        );
+        fake
+    }
+
+    #[test]
+    fn a_mac_shows_macos_sftp_beside_remote_login_and_an_ssh_only_box_does_not() {
+        let got = browse(&lab_session(), Duration::from_secs(3)).unwrap();
+        let flags: Vec<(&str, bool, bool, bool)> = got
+            .found
+            .iter()
+            .map(|f| (f.address.as_str(), f.ssh, f.sftp, f.screen_sharing))
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                ("lab-02.local", true, true, true),
+                ("m14-Air-M5-32GB-4TB-prime.local", true, true, false),
+                ("spark-1.local", true, false, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_sftp_browse_is_noted_and_the_scan_goes_on() {
+        let fake = lab_session_with(Ran::exit(255, "DNSService call failed -65570"));
+        let got = browse(&fake, Duration::from_secs(3)).unwrap();
+        assert_eq!(got.found.len(), 3);
+        assert!(got.found.iter().all(|f| !f.sftp));
+        assert!(got.sftp_failed.unwrap().contains("-65570"));
     }
 
     #[test]
@@ -775,6 +918,7 @@ DATE: ---Fri 16 Oct 2026---
         let lost = Fake::root();
         lost.on(&browse_key(SSH_SERVICE), killed(BROWSE_SSH_ADD_RMV));
         lost.on(&browse_key(RFB_SERVICE), killed(""));
+        lost.on(&browse_key(SFTP_SERVICE), killed(""));
         lost.on(
             &resolve_key("m14 Air M5 32GB 4TB prime", SSH_SERVICE),
             killed(RESOLVE_AIR),
@@ -805,6 +949,7 @@ DATE: ---Fri 16 Oct 2026---
             Ran::exit(255, "DNSService call failed -65537"),
         );
         fake.on(&browse_key(RFB_SERVICE), killed(BROWSE_RFB));
+        fake.on(&browse_key(SFTP_SERVICE), killed(""));
         let err = browse(&fake, Duration::from_secs(1)).unwrap_err();
         assert!(err.contains("-65537"), "{err}");
         let denied = Fake::root();
@@ -813,6 +958,7 @@ DATE: ---Fri 16 Oct 2026---
             Ran::exit(255, "DNSService call failed -65570"),
         );
         denied.on(&browse_key(RFB_SERVICE), killed(""));
+        denied.on(&browse_key(SFTP_SERVICE), killed(""));
         let err = browse(&denied, Duration::from_secs(1)).unwrap_err();
         assert!(err.contains("Local Network"), "{err}");
         // A Mac named with that number is a Mac, not a refusal.
@@ -824,6 +970,7 @@ DATE: ---Fri 16 Oct 2026---
             )),
         );
         named.on(&browse_key(RFB_SERVICE), killed(""));
+        named.on(&browse_key(SFTP_SERVICE), killed(""));
         assert!(browse(&named, Duration::from_secs(1)).is_ok());
         let missing = Fake::root();
         assert!(browse(&missing, Duration::from_secs(1)).is_err());
@@ -960,6 +1107,7 @@ manageds-virtual-machine.local ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHv2Xf9kgkNkp
             port: 22,
             ssh: true,
             screen_sharing: true,
+            sftp: true,
             source: Source::Bonjour,
         }
     }

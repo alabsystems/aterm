@@ -6,7 +6,7 @@
 //! `aterm-session-log`, so `log @<sid>` and `brief @<sid>` answer for a
 //! session from an earlier run or a crash (`session_log_journal_read`).
 //!
-//! OFF BY DEFAULT (owner decision D3 is open; ruling R10). With `[session_log]
+//! OFF BY DEFAULT (D3, decided 2026-10-19: opt-in; ruling R10). With `[session_log]
 //! journal = false`, the default, [`Lane::new`] makes an inert lane: no
 //! directory, no file, no thread, no wake installed in any log, no read, no
 //! deletion, on every path. `journal = true` opts in, and then the journal
@@ -41,8 +41,9 @@
 //! tail). The instance's liveness is its `<inst>.lock`, taken before any
 //! segment and held for the journal's life (ruling R2); no `flock`, no
 //! journal. Retention (ruling R9) runs at start and at each rotation, under
-//! `prune.lock`, and keeps the journal's own files within
-//! `journal::BUDGET_BYTES` and `journal::FILES_MAX`.
+//! `prune.lock`, removing eligible inactive files toward
+//! `journal::BUDGET_BYTES` and `journal::FILES_MAX`. Live or locked files
+//! can keep the directory above those targets.
 //!
 //! ERRORS. EINTR is retried (at most three times); EINTR past that and
 //! EAGAIN wrote nothing, so the segment is kept and the pass retried at the
@@ -160,11 +161,55 @@ const IO_ERRORS_TO_STOP: u32 = 3;
 /// How often a running journal looks at the volume's free space.
 const FREE_CHECK_EVERY: Duration = Duration::from_secs(60);
 
-/// Whether this launch keeps a journal: asked for (`[session_log] journal =
-/// true`), on a desk-keeping instance (a window, or the lab's headless seam),
-/// with `restore_session` on, on macOS or Linux. Read at launch.
+/// Why a requested journal cannot run on the launch's configuration and desk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Inactive {
+    Disabled,
+    Unsupported,
+    RestoreOff,
+    NoDesk,
+}
+
+impl Inactive {
+    pub(crate) const fn reason(self) -> &'static str {
+        match self {
+            Self::Disabled => "the journal switch is off",
+            Self::Unsupported => "this platform has no journal writer",
+            Self::RestoreOff => "session restore is off",
+            Self::NoDesk => "this instance does not save a desktop",
+        }
+    }
+}
+
+/// One admission policy for the writer and Settings' next-launch disclosure.
+pub(crate) fn eligibility(
+    requested: bool,
+    restore: bool,
+    desk: crate::desk::Desk,
+    supported: bool,
+) -> Option<Inactive> {
+    if !requested {
+        Some(Inactive::Disabled)
+    } else if !supported {
+        Some(Inactive::Unsupported)
+    } else if !restore {
+        Some(Inactive::RestoreOff)
+    } else if !desk.kept() {
+        Some(Inactive::NoDesk)
+    } else {
+        None
+    }
+}
+
+/// Read once at launch; changing the switch does not stop an existing writer.
 pub(crate) fn gate(config: &crate::app_config::Config, desk: crate::desk::Desk) -> bool {
-    cfg!(unix) && config.session_log_journal() && desk.kept() && config.restore_session_or_default()
+    eligibility(
+        config.session_log_journal(),
+        config.restore_session_or_default(),
+        desk,
+        cfg!(unix),
+    )
+    .is_none()
 }
 
 // ---- the wake and the lane's shared state ----------------------------
@@ -217,6 +262,8 @@ pub(crate) enum Cause {
     Unsupported,
     /// The writer panicked.
     Panic,
+    /// The writer thread could not start.
+    Spawn,
 }
 
 impl Cause {
@@ -228,6 +275,7 @@ impl Cause {
             Cause::Denied => "its folder or a file was refused",
             Cause::Unsupported => "the folder's filesystem has no file locks",
             Cause::Panic => "its writer failed",
+            Cause::Spawn => "its writer could not start",
         }
     }
 
@@ -238,6 +286,7 @@ impl Cause {
             Cause::Denied => 3,
             Cause::Unsupported => 4,
             Cause::Panic => 5,
+            Cause::Spawn => 6,
         }
     }
 
@@ -248,6 +297,7 @@ impl Cause {
             3 => Some(Cause::Denied),
             4 => Some(Cause::Unsupported),
             5 => Some(Cause::Panic),
+            6 => Some(Cause::Spawn),
             _ => None,
         }
     }
@@ -313,7 +363,7 @@ const REQ_STOOD_DOWN: u8 = 8;
 
 /// The lane's phase as the thread publishes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Phase {
+pub(crate) enum Phase {
     Armed = 0,
     Running = 1,
     Backoff = 2,
@@ -354,7 +404,6 @@ impl Shared {
         }
     }
 
-    #[cfg(any(unix, test))]
     fn phase(&self) -> Phase {
         match self.phase.load(Ordering::Acquire) {
             1 => Phase::Running,
@@ -410,6 +459,14 @@ pub(crate) fn journals_to_fence() -> bool {
         .is_some_and(|s| matches!(s.phase(), Phase::Running | Phase::Backoff))
 }
 
+/// A memory-only observation. Running says the writer is active, not that every
+/// dirty record has already reached disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Status {
+    pub(crate) phase: Option<Phase>,
+    pub(crate) attention: Attention,
+}
+
 /// The App's handle on its journal lane (`App::session_log_journal`).
 pub(crate) struct Lane {
     shared: Option<Arc<Shared>>,
@@ -456,6 +513,19 @@ impl Lane {
     /// Start the writer thread over `store`'s sessions. A spawn failure
     /// leaves the lane stopped.
     pub(crate) fn start(&mut self, store: crate::session_store::Store) {
+        self.start_with(store, |writer| {
+            std::thread::Builder::new()
+                .name("aterm-session-log".to_string())
+                .spawn(writer)
+                .map(|_| ())
+        });
+    }
+
+    fn start_with(
+        &mut self,
+        store: crate::session_store::Store,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>,
+    ) {
         let (Some(shared), Some(logs)) = (self.shared.clone(), self.logs.clone()) else {
             return;
         };
@@ -472,14 +542,23 @@ impl Lane {
         // The guard moves into the closure; a failed spawn drops it here.
         let retirement = RetirementLease::arm(Arc::clone(&store), shared.notify.clone());
         let armed = self.armed;
-        let spawned = std::thread::Builder::new()
-            .name("aterm-session-log".to_string())
-            .spawn(move || {
-                let _retirement = retirement;
-                run(&shared, &logs, store, inst, armed);
-            });
-        if let Err(error) = spawned {
+        let worker_shared = Arc::clone(&shared);
+        if let Err(error) = spawn(Box::new(move || {
+            let _retirement = retirement;
+            run(&worker_shared, &logs, store, inst, armed);
+        })) {
+            shared.report.say(Attention::Stopped(Cause::Spawn));
+            shared.phase.store(Phase::Stopped as u8, Ordering::Release);
             aterm_log::warn!("session journal: the writer did not start ({error}); no journal");
+        }
+    }
+
+    pub(crate) fn status(&self) -> Status {
+        Status {
+            phase: self.shared.as_ref().map(|shared| shared.phase()),
+            attention: self
+                .attention()
+                .map_or(Attention::None, |(_, attention)| attention),
         }
     }
 

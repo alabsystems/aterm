@@ -16,15 +16,18 @@
 //!
 //! **Fail closed by construction:**
 //! * absolute paths, `..` components, and root/prefix components are refused;
-//! * any non-regular/non-directory/non-link entry type is refused outright;
+//! * any non-regular/non-directory/non-link entry type is refused, except
+//!   explicitly admitted descriptive global PAX metadata, which creates no file;
 //! * a SYMLINK is refused outright by the release-bundle lane (`binary`,
 //!   `sysroot-bundle`: the `exposes` shims are created by `atpkg` *after* extraction,
 //!   never unpacked from the archive). The `https` payload lanes
-//!   ([`ExtractOptions::in_root_symlinks`]) admit one ONLY when its target resolves
+//!   ([`SymlinkPolicy::InRoot`]) admit one ONLY when its target resolves
 //!   *lexically inside the stage root* ([`vet_symlink`]), and then refuse any later entry
 //!   that would write THROUGH it ([`ExtractReject::ThroughSymlink`] /
 //!   [`ExtractReject::Occupied`]) — so a link can never redirect a write, and the tree
-//!   the digest describes is the tree on disk;
+//!   the digest describes is the tree on disk. The verified Homebrew bundle alone
+//!   preserves external targets as opaque leaf links ([`SymlinkPolicy::ExternalLeaf`]);
+//!   the same guards forbid writing on or through every link;
 //! * an in-root HARDLINK is admitted only after [`vet_hardlink_stripped`] walks BOTH ends through
 //!   the same component vet, NEITHER path passes through a link laid earlier (`lstat`
 //!   and `link` decline to follow only the LAST component, so the target's ancestors are
@@ -140,11 +143,25 @@ pub struct ExtractOptions {
     /// stripped the same way. The FULL path is vetted BEFORE stripping, so `..` above the
     /// strip depth is still a refusal, never a way in.
     pub strip_components: u32,
-    /// Admit symlink entries whose target resolves lexically inside the stage root
-    /// ([`vet_symlink`]); the digest records them by target bytes
-    /// ([`crate::tree::symlink_line`]). Off: every symlink is
-    /// [`ExtractReject::DisallowedKind`].
-    pub in_root_symlinks: bool,
+    /// Which symlink targets may be preserved. All admitted links are leaves:
+    /// later entries may never write on or through them.
+    pub symlinks: SymlinkPolicy,
+    /// Admit strictly parsed descriptive global PAX metadata. No global path,
+    /// link, size, sparse or unknown semantics are accepted or applied.
+    pub allow_global_pax: bool,
+}
+
+/// A link target is stored verbatim and hashed as bytes, never followed while
+/// extracting. The destination is always vetted beneath the staging root.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SymlinkPolicy {
+    #[default]
+    Refuse,
+    /// Relative targets must resolve lexically within the stage.
+    InRoot,
+    /// Preserve nonempty targets as opaque leaf links, including external ones.
+    /// Only the checksum-verified Homebrew bundle selects this policy.
+    ExternalLeaf,
 }
 
 /// Whether a `.tar.zst` stage demands each zstd frame's content checksum. The decoder
@@ -1395,8 +1412,8 @@ impl<'a> Layer<'a> {
         Ok(())
     }
 
-    /// Lay down a symlink — only where the lane admits them, only in-root
-    /// ([`vet_symlink`]), only onto a path nothing occupies, created with the VERBATIM
+    /// Lay down a symlink under the selected target policy, only onto a path
+    /// nothing occupies, created with the VERBATIM
     /// target so the digest and the disk agree. `declared_size` is the entry's body
     /// size as the container declared it: a tar symlink carries no body (a non-zero
     /// declaration is the same skip-bomb as a directory's); the zip lane reads the
@@ -1407,7 +1424,7 @@ impl<'a> Layer<'a> {
         target: &Path,
         declared_size: u64,
     ) -> Result<(), ExtractError> {
-        if !self.opts.in_root_symlinks {
+        if self.opts.symlinks == SymlinkPolicy::Refuse {
             return Err(ExtractError::Rejected(
                 ExtractReject::DisallowedKind,
                 raw.to_path_buf(),
@@ -1418,8 +1435,15 @@ impl<'a> Layer<'a> {
                 raw.to_path_buf(),
             )));
         }
-        let Some(dest) = vet_symlink(self.root, raw, target, self.strip())
-            .map_err(|r| ExtractError::Rejected(r, raw.to_path_buf()))?
+        let destination = match self.opts.symlinks {
+            SymlinkPolicy::InRoot => vet_symlink(self.root, raw, target, self.strip()),
+            SymlinkPolicy::ExternalLeaf if !target.as_os_str().is_empty() => {
+                vet_entry_stripped(self.root, raw, EntryKind::Regular, self.strip())
+            }
+            SymlinkPolicy::ExternalLeaf => Err(ExtractReject::EmptyPath),
+            SymlinkPolicy::Refuse => Err(ExtractReject::DisallowedKind),
+        };
+        let Some(dest) = destination.map_err(|r| ExtractError::Rejected(r, raw.to_path_buf()))?
         else {
             return Ok(());
         };
@@ -1571,6 +1595,26 @@ pub(crate) fn extract_tar_gz_tree(
     )?)
 }
 
+/// Uncompressed tar, using the same per-entry vet, caps and writer as the
+/// gzip/zstd lanes. Abrew uses this instead of handing archive paths to system tar.
+pub(crate) fn extract_tar_tree(
+    archive: &Path,
+    dest_root: &Path,
+    max_total_bytes: u64,
+    max_entries: u64,
+    opts: ExtractOptions,
+) -> Result<TreeAccumulator, ExtractError> {
+    folded(extract_stream(
+        std::fs::File::open(archive)?,
+        dest_root,
+        max_total_bytes,
+        max_entries,
+        true,
+        opts,
+        Trailer::Drained,
+    )?)
+}
+
 /// The `zip` vendor lane: the first-party central-directory reader in `zipread`, laying
 /// every member through the same [`Layer`] as the tar lanes (see that module for what
 /// it supports and refuses, and why it is first-party rather than `ditto -x -k`).
@@ -1683,7 +1727,7 @@ fn extract_stream(
                 layer.hardlink(&raw, &target, declared)?;
             }
             EntryKind::Symlink => {
-                if !opts.in_root_symlinks {
+                if opts.symlinks == SymlinkPolicy::Refuse {
                     return Err(ExtractError::Rejected(ExtractReject::DisallowedKind, raw));
                 }
                 // An absent link name is an EMPTY target, which the vet refuses as
@@ -1699,6 +1743,14 @@ fn extract_stream(
                 // The reader hands out content bytes through the CappedReader; the
                 // per-file cap and the structural refund happen in write_capped.
                 layer.regular(&raw, mode, &mut entry)?;
+            }
+            EntryKind::Other if opts.allow_global_pax && entry.header().is_global_pax() => {
+                let _ =
+                    vet_entry_stripped(dest_root, &raw, EntryKind::Regular, opts.strip_components)
+                        .map_err(|reject| ExtractError::Rejected(reject, raw.clone()))?;
+                let before = budget.get();
+                entry.read_descriptive_global_pax().map_err(map_tar_io)?;
+                layer.charge_structure(before.saturating_sub(budget.get()))?;
             }
             EntryKind::Other => {
                 return Err(ExtractError::Rejected(ExtractReject::DisallowedKind, raw));
@@ -2749,10 +2801,11 @@ mod tests {
     /// Structure and content are two allowances of the signed size, never one counter: a
     /// tree of small files carries more structure than content (a 512-byte header and the
     /// padding to the next block per file), and the packers signed `disk_installed` as the
-    /// content's apparent size. 2,000 files of 600 bytes are 1.2 MB of content and
-    /// 1.87 MB of structure: against `install::size_cap`'s 2 x 1.2 MB each fits and their
-    /// sum does not — the shape of `/usr/share/terminfo` (2.9 MB of content, 6.4 MB
-    /// stream, 5.9 MB cap), which one shared counter refused at every install.
+    /// content's apparent size. 700 files of 760 bytes are 532 kB of content and 544 kB of
+    /// structure: against `install::size_cap`'s 2 x 532 kB (just past its 1 MiB floor)
+    /// each fits and their sum does not — the shape of `/usr/share/terminfo` (2.9 MB of
+    /// content, 6.4 MB stream, 5.9 MB cap), which one shared counter refused at every
+    /// install.
     ///
     /// Pinned by count: a cap equal to the structure admits the whole tree (its content,
     /// smaller, fits its own allowance; one counter would need the sum), and one byte less
@@ -2760,7 +2813,7 @@ mod tests {
     #[test]
     fn a_small_file_tree_spends_structure_and_content_apart() {
         let d = dest("small-files");
-        let (files, size) = (2_000usize, 600usize);
+        let (files, size) = (700usize, 760usize);
         let mut tar = Vec::new();
         for i in 0..files {
             tar.extend_from_slice(&raw_header(&format!("share/{i:05}"), b'0', "", size));
@@ -2778,6 +2831,11 @@ mod tests {
         let archive = d.join("small.tar.zst");
         std::fs::write(&archive, zstd_bytes(&tar)).unwrap();
         let signed_cap = (2 * content).max(1 << 20);
+        assert!(
+            content + structure > signed_cap,
+            "one shared counter must refuse what two allowances admit: {content} + \
+             {structure} vs {signed_cap}"
+        );
         let root = d.join("signed-cap");
         let tree = extract_tar_zst_tree(
             &archive,
@@ -2794,7 +2852,7 @@ mod tests {
             tree.map(|_| ())
         );
         assert_eq!(
-            std::fs::read(root.join("share/01999")).unwrap(),
+            std::fs::read(root.join("share/00699")).unwrap(),
             vec![b'x'; size]
         );
         let at = |cap: u64| {
@@ -3305,8 +3363,166 @@ mod tests {
     fn vendor(strip: u32) -> ExtractOptions {
         ExtractOptions {
             strip_components: strip,
-            in_root_symlinks: true,
+            symlinks: SymlinkPolicy::InRoot,
+            allow_global_pax: false,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_leaf_links_preserve_targets_without_redirecting_extraction() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let outside = scratch.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("owner"), b"keep").unwrap();
+        let target = outside.to_str().unwrap();
+        let opts = ExtractOptions {
+            symlinks: SymlinkPolicy::ExternalLeaf,
+            ..ExtractOptions::default()
+        };
+        let extract = |entries: &[(&str, u8, &str, &[u8], u32)], label: &str, options| {
+            let archive = scratch.path().join(format!("{label}.gz"));
+            std::fs::write(&archive, gzip_bytes(&tar_bytes(entries))).unwrap();
+            extract_tar_gz_tree(&archive, &scratch.path().join(label), 1 << 20, 20, options)
+        };
+        let leaf = ("leaf", b'2', target, b"".as_slice(), 0o755);
+        for (label, options, reason) in [
+            (
+                "refused",
+                ExtractOptions::default(),
+                ExtractReject::DisallowedKind,
+            ),
+            ("in-root", vendor(0), ExtractReject::AbsolutePath),
+        ] {
+            assert!(matches!(extract(&[leaf], label, options),
+                Err(ExtractError::Rejected(got, _)) if got == reason));
+        }
+        let tree = extract(&[leaf], "external", opts).unwrap();
+        let root = scratch.path().join("external");
+        assert_eq!(std::fs::read_link(root.join("leaf")).unwrap(), outside);
+        let (fused, walked) = fused_and_walked(tree, &root);
+        assert_eq!(fused, walked);
+        let relative = ("leaf", b'2', "../outside", b"".as_slice(), 0o755);
+        extract(&[relative], "relative", opts).unwrap();
+        assert_eq!(
+            std::fs::read_link(scratch.path().join("relative/leaf")).unwrap(),
+            Path::new("../outside")
+        );
+
+        for (label, next, reason) in [
+            (
+                "on",
+                ("leaf", b'0', "", b"overwrite".as_slice(), 0o644),
+                ExtractReject::Occupied,
+            ),
+            (
+                "through",
+                ("leaf/owner", b'0', "", b"overwrite".as_slice(), 0o644),
+                ExtractReject::ThroughSymlink,
+            ),
+            (
+                "link-through",
+                ("alias", b'1', "leaf/owner", b"".as_slice(), 0o644),
+                ExtractReject::ThroughSymlink,
+            ),
+            (
+                "new-link-through",
+                ("leaf/alias", b'2', "owner", b"".as_slice(), 0o644),
+                ExtractReject::ThroughSymlink,
+            ),
+        ] {
+            assert!(
+                matches!(extract(&[leaf, next], label, opts),
+                Err(ExtractError::Rejected(got, _)) if got == reason),
+                "{label}"
+            );
+            assert_eq!(std::fs::read(outside.join("owner")).unwrap(), b"keep");
+            assert!(!outside.join("alias").exists());
+        }
+        for (label, name) in [("traversal", "../outside/alias"), ("absolute", target)] {
+            assert!(extract(&[(name, b'2', target, b"", 0o755)], label, opts).is_err());
+            assert_eq!(std::fs::read(outside.join("owner")).unwrap(), b"keep");
+        }
+    }
+
+    fn global_pax_record(key: &str, value: &str) -> Vec<u8> {
+        let payload = format!("{key}={value}\n");
+        let mut len = payload.len() + 2;
+        loop {
+            let record = format!("{len} {payload}");
+            if record.len() == len {
+                return record.into_bytes();
+            }
+            len = record.len();
+        }
+    }
+
+    #[test]
+    fn descriptive_global_pax_is_explicit_strict_and_charged_to_the_same_caps() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let opts = ExtractOptions {
+            allow_global_pax: true,
+            ..ExtractOptions::default()
+        };
+        let record = global_pax_record("comment", &"a".repeat(800));
+        let tar = tar_bytes(&[
+            ("pax_global_header", b'g', "", &record, 0o644),
+            ("plain", b'0', "", b"", 0o644),
+        ]);
+        let archive = scratch.path().join("global.zst");
+        std::fs::write(&archive, zstd_bytes(&tar)).unwrap();
+        let extract = |label: &str, cap, count, options| {
+            extract_tar_zst_tree(
+                &archive,
+                &scratch.path().join(label),
+                cap,
+                count,
+                options,
+                FrameChecksum::IfPresent,
+            )
+        };
+        assert!(matches!(
+            extract("default", 1 << 20, 2, ExtractOptions::default()),
+            Err(ExtractError::Rejected(ExtractReject::DisallowedKind, _))
+        ));
+        extract("complete", tar.len() as u64, 2, opts).unwrap();
+        assert!(scratch.path().join("complete/plain").is_file());
+        assert!(!scratch.path().join("complete/pax_global_header").exists());
+        assert!(matches!(
+            extract("one-byte-less", tar.len() as u64 - 1, 2, opts),
+            Err(ExtractError::TooLarge(TooLargeReason::StructureCap))
+        ));
+        assert!(matches!(
+            extract("one-entry-less", 1 << 20, 1, opts),
+            Err(ExtractError::TooLarge(TooLargeReason::EntryCap))
+        ));
+
+        for (index, body) in [
+            global_pax_record("path", "../outside"),
+            global_pax_record("linkpath", "/outside"),
+            global_pax_record("size", "0"),
+            global_pax_record("GNU.sparse.map", "0,1"),
+            global_pax_record("hdrcharset", "BINARY"),
+            global_pax_record("unknown", "value"),
+            b"12 comment=bad\n".to_vec(),
+            b"15 comment=bad".to_vec(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let bytes = tar_bytes(&[
+                ("pax_global_header", b'g', "", &body, 0o644),
+                ("plain", b'0', "", b"never", 0o644),
+            ]);
+            std::fs::write(&archive, zstd_bytes(&bytes)).unwrap();
+            let label = format!("bad-{index}");
+            assert!(extract(&label, 1 << 20, 2, opts).is_err(), "{index}");
+            assert!(!scratch.path().join(label).join("plain").exists());
+        }
+        let mut bytes = raw_header("pax_global_header", b'g', "", record.len()).to_vec();
+        bytes.extend_from_slice(&record[..record.len() - 1]);
+        std::fs::write(&archive, zstd_bytes(&bytes)).unwrap();
+        assert!(extract("truncated", 1 << 20, 2, opts).is_err());
     }
 
     /// An upstream tarball written as `tar -C dir -c .` — the shape both bsdtar and GNU

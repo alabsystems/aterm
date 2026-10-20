@@ -86,14 +86,17 @@ impl KeeperEnv for World<'_> {
             .iter()
             .any(|(who, p)| *p == pid && self.st[format!("{who}_live").as_str()] == 1)
     }
-    /// The window's crash marker, named in each of its HELLOs: held by the
-    /// live window, gone once it ended through its exit path — the Commit's
+    /// A window's crash marker (the window's and the relaunched window's), named in each of its
+    /// HELLOs: held by the live window, gone once it ended through its exit path — the Commit's
     /// `clean_exit_now` and the quit alike (a crash's status says otherwise).
     fn marker(&mut self, pid: u32, _marker: &MarkerRef) -> MarkerEvidence {
-        match (pid == self.pids.w, self.st["w_live"] == 1) {
-            (false, _) => MarkerEvidence::Unknown,
-            (true, true) => MarkerEvidence::Held,
-            (true, false) => MarkerEvidence::Released,
+        let role = [("w", self.pids.w), ("r", self.pids.r)]
+            .into_iter()
+            .find(|(_, p)| *p == pid);
+        match role {
+            None => MarkerEvidence::Unknown,
+            Some((who, _)) if self.st[format!("{who}_live").as_str()] == 1 => MarkerEvidence::Held,
+            Some(_) => MarkerEvidence::Released,
         }
     }
 }
@@ -138,6 +141,12 @@ const QUIET_COMMIT: &str = "CommitQuiet";
 const LINK_DROPS_CLOSE_TAB_A: &str = "LinkDropsCloseTabA";
 const LINK_DROPS_CLOSE_TAB_B: &str = "LinkDropsCloseTabB";
 
+/// The runner's move for the model's `RelaunchedWindowQuits` with the BYE lost: the window wrote
+/// it, but no keeper read it (the link was down, or the keeper dropped the connection with the
+/// BYE unread). Its `exit(0)` with its crash marker gone is the quit the keeper reads, for the
+/// offers its dropped link returned as for the masters it claimed.
+const RELAUNCHED_WINDOW_QUITS_BYE_LOST: &str = "RelaunchedWindowQuitsByeLost";
+
 impl Rig {
     fn new(model: &Model) -> Self {
         let mut rig = Rig {
@@ -173,7 +182,7 @@ impl Rig {
             st: env_st,
             pids: &self.pids,
         };
-        if role == "w" {
+        if role == "w" || role == "r" {
             assert!(
                 core.name_marker(id, window_marker(), &mut env),
                 "the live window's marker is held"
@@ -402,7 +411,11 @@ fn env_move(model: &Model, rig: &mut Rig, mv: &'static str) -> Vec<Step> {
         LINK_DROPS_CLOSE_TAB_B => return link_drops_close_tab(model, rig, "CloseTabB"),
         _ => {}
     }
-    let action = if mv == QUIET_COMMIT { "Commit" } else { mv };
+    let action = match mv {
+        QUIET_COMMIT => "Commit",
+        RELAUNCHED_WINDOW_QUITS_BYE_LOST => "RelaunchedWindowQuits",
+        _ => mv,
+    };
     let before = rig.st.clone();
     let mut next = before.clone();
     assert!(model.fire(action, &mut next), "{action} was enabled");
@@ -664,11 +677,13 @@ fn env_move(model: &Model, rig: &mut Rig, mv: &'static str) -> Vec<Step> {
                 }
             }
         }
-        "RelaunchedWindowQuits" => {
-            // BYE on the relaunched window's current link, then its EOF and
-            // `exit(0)`: the keeper judges every link of the process at that
-            // exit, a dropped one included.
-            if let (Some(core), Some(conn)) = (rig.core.as_mut(), rig.conn.get("r").copied()) {
+        "RelaunchedWindowQuits" | RELAUNCHED_WINDOW_QUITS_BYE_LOST => {
+            // BYE on the relaunched window's current link (or lost), then its EOF and
+            // `exit(0)` with its marker gone: the keeper judges every link of the process at
+            // that exit, a dropped one included.
+            if mv == "RelaunchedWindowQuits"
+                && let (Some(core), Some(conn)) = (rig.core.as_mut(), rig.conn.get("r").copied())
+            {
                 core.bye(conn);
             }
             rig.die("r", 0, &next);
@@ -794,16 +809,22 @@ struct Explored {
     sequences: usize,
 }
 
+/// Every move sequence of up to `depth` steps from `rig`. `seen` holds the most steps each
+/// (model state, real shape) has been explored with: a node explored with `n` steps left has
+/// already walked every sequence a later visit with `n` or fewer could, so that visit is
+/// skipped and only a visit with more steps left walks it again.
 fn explore(
     model: &Model,
     rig: Rig,
     depth: usize,
-    seen: &mut BTreeSet<(State, String, usize)>,
+    seen: &mut BTreeMap<(State, String), usize>,
     out: &mut Explored,
 ) {
-    if !seen.insert((rig.st.clone(), rig.shape(), depth)) {
+    let node = (rig.st.clone(), rig.shape());
+    if seen.get(&node).is_some_and(|&walked| walked >= depth) {
         return;
     }
+    seen.insert(node, depth);
     out.sequences += 1;
     if depth == 0 {
         return;
@@ -817,6 +838,9 @@ fn explore(
         .collect();
     if moves.contains(&"Commit") {
         moves.push(QUIET_COMMIT);
+    }
+    if moves.contains(&"RelaunchedWindowQuits") {
+        moves.push(RELAUNCHED_WINDOW_QUITS_BYE_LOST);
     }
     if moves.contains(&"LinkDrops") {
         let mut dropped = rig.st.clone();
@@ -870,7 +894,7 @@ fn the_real_keeper_conforms_to_the_custody_model() {
         fired: BTreeSet::new(),
         sequences: 0,
     };
-    let mut seen = BTreeSet::new();
+    let mut seen = BTreeMap::new();
     explore(&model, Rig::new(&model), 18, &mut seen, &mut out);
     let every: Vec<&str> = model.actions.iter().map(|a| a.name).collect();
     for action in &every {

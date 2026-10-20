@@ -216,9 +216,23 @@ impl CursorGlow {
                         (full_life * 2.0).clamp(0.40, 0.75)
                     }
                 }
-                // Water at speed stretches its wake up to ~4× so the deep palette
-                // reads as a trail of water, not a stub.
-                GlowStyle::Water => (full_life * 0.42).clamp(0.06, 0.14) * (1.0 + 3.0 * self.heat),
+                // Water: inside a rhythm the wake's life is
+                // [`Self::WATER_CHAIN_KEYS`] inter-key gaps, so about three
+                // cells of water trail the drop at any human cadence; heat
+                // stretches it up to ~4× at speed, so a fast run is the
+                // torpedo. A burst's first key and a slow trickle (a gap past
+                // the window) take the heat life alone.
+                GlowStyle::Water => {
+                    let heat_life = (full_life * 0.42).clamp(0.06, 0.14) * (1.0 + 3.0 * self.heat);
+                    if gap <= Self::CHAIN_GAP_MAX {
+                        heat_life.max(
+                            (Self::WATER_CHAIN_KEYS * gap + Self::CHAIN_MARGIN)
+                                .min(Self::WATER_CHAIN_LIFE_MAX),
+                        )
+                    } else {
+                        heat_life
+                    }
+                }
                 // Fire burns on: embers die down, leaving a trail of fire. The
                 // ceiling honours a long `cursor_trail_ms` (up to ~0.45 s base,
                 // ~1.4 s at full heat) while the early-fade envelope keeps the
@@ -373,17 +387,17 @@ impl CursorGlow {
         } else if navigation && (!water || dist < 2.0) {
         } else {
             let cap = Self::MAX_SPARKS;
-            // Laser, beam and water jumps ignore the configured typing-tail
-            // length: their streak spans the whole leap. The resident cap still
-            // bounds the destination-nearest suffix of an outlier vector.
-            let max_len = if matches!(
-                cfg.style,
-                GlowStyle::Laser | GlowStyle::Beam | GlowStyle::Water
-            ) && !typing
+            // The knob law (`GlowStyle::reads_knob`): Laser, Beam and Water
+            // streaks span the whole move, so they read no `Length`. The
+            // resident cap still bounds the destination-nearest suffix of an
+            // outlier vector.
+            let max_len = if cfg
+                .style
+                .reads_knob(TrailKnob::Length, KnobContext::widest(false))
             {
-                cap
-            } else {
                 cfg.length.clamp(1, cap)
+            } else {
+                cap
             };
             self.path_scratch.clear();
             if shape_wrap {
@@ -636,8 +650,13 @@ impl CursorGlow {
             ..
         } = mv;
         // Landing ring on a real jump (>1 cell), if enabled; fire meteors ring
-        // at arrival instead (see `tick`).
-        if cfg.ring && dist >= 2.0 && !fire_meteor && !navigation {
+        // at arrival instead (see `tick`). The knob law gates the ring as it
+        // gates the crown.
+        let ring_on = cfg.ring
+            && cfg
+                .style
+                .reads_knob(TrailKnob::Ring, KnobContext::widest(false));
+        if ring_on && dist >= 2.0 && !fire_meteor && !navigation {
             let (cx, cy) = geom.cell_center(cr, cc);
             let scale = crate::rainbow_kitty::timing::impact(dist);
             self.ring = Some(Ring {

@@ -62,8 +62,7 @@ fn specs(manifest: &str) -> Vec<String> {
 }
 
 /// WHAT THE EXPORT SELECTS: no gitlink (the engine dies on one before the transforms
-/// run), never publish/, not a test whose fixture is withheld, not the real-Claude lab
-/// (`crates/aterm-lab`) — and none of the art
+/// run), never publish/, not a test whose fixture is withheld — and none of the art
 /// whose rights were never established, each excluded path tracked (so no exclusion is
 /// vacuous), while the roster the product is generated from and the man page the
 /// crates embed ship.
@@ -90,8 +89,6 @@ fn the_export_selects_no_gitlink_and_none_of_the_withheld_files() {
     for withheld in [
         "publish/manifest.txt",
         "crates/aterm-release/tests/changelog.rs",
-        // the real-Claude lab: the owner-data list and its documented jail gaps
-        "crates/aterm-lab/Cargo.toml",
     ] {
         assert!(!exported.contains(withheld), "{withheld} is exported");
     }

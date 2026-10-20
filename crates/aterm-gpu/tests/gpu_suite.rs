@@ -9,7 +9,8 @@
 //! The files share a process, so none writes the process environment (the
 //! ligature files pass their font as a family), installs a hook or an
 //! allocator, or re-executes itself. Files that force the fontdue rasterizer
-//! through the environment belong to `gpu_fontdue`.
+//! through the environment belong to `gpu_fontdue`; `frame_instrumentation`
+//! owns the GPU-time sink and serial lookups in its own target.
 //!
 //! `autotests = false`: a `tests/*.rs` file that is neither a `mod` here, a
 //! `mod` of `gpu_fontdue.rs`, nor a `[[test]]` of its own never compiles. Run

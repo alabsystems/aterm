@@ -341,6 +341,9 @@ fn zero_width_commits_and_stationary_kills_arm_no_cursor_move() {
     }
 }
 
+/// Unix only: Windows writes no key inline (`ui_writes_can_block`), so every
+/// press is queued to the session's ordered writer and no inline write fails.
+#[cfg(unix)]
 #[test]
 fn failed_inline_key_write_revokes_every_new_movement_licence() {
     use std::time::Duration;

@@ -1821,6 +1821,12 @@ pub(crate) mod world {
         }
     }
 
+    /// `bin/<name>` as this host's shim runs it: `bin/<name>.exe` on Windows, where a
+    /// payload lands under the executable spelling (`ToolName::exe_file`).
+    pub(crate) fn bin(name: &str) -> String {
+        format!("bin/{name}{}", crate::platform::EXE_SUFFIX)
+    }
+
     /// A "binary" in this platform's native executable format, distinct per `tag`.
     pub(crate) fn native_exe(tag: &str) -> Vec<u8> {
         let mut bytes = if cfg!(target_os = "macos") {
@@ -2184,7 +2190,7 @@ pub(crate) mod world {
             self.publish_codex(
                 version,
                 &[
-                    ("bin/codex", &codex, 0o755),
+                    (&bin("codex"), &codex, 0o755),
                     ("codex-path/rg", &helper, 0o755),
                     ("codex-resources/voice/runtime.json", b"{\"a\": 1}\n", 0o755),
                     ("codex-resources/voice/NOTICE.md", b"# Notices\n", 0o644),
@@ -2487,7 +2493,7 @@ mod tests {
     fn legacy_claude(l: &Layout, build: u64) {
         let legacy = l.build_dir("claude", build);
         std::fs::create_dir_all(legacy.join("bin")).unwrap();
-        std::fs::write(legacy.join("bin/claude"), native_exe("legacy")).unwrap();
+        std::fs::write(legacy.join(world::bin("claude")), native_exe("legacy")).unwrap();
         crate::activate::install_shims(
             l,
             &legacy,
@@ -2531,11 +2537,20 @@ mod tests {
         );
         let dir = world::build_dir(&l, "claude", "2.1.281");
         assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
-        assert_eq!(std::fs::read(dir.join("bin/claude")).unwrap(), payload);
+        assert_eq!(
+            std::fs::read(dir.join(world::bin("claude"))).unwrap(),
+            payload
+        );
         // The record is the staged tree's, and complete beside the ready build.
         let record = complete_record(&dir).expect("a complete record");
         assert_eq!(record.version, v("2.1.281"));
-        assert_eq!(record.tree_root, crate::tree::tree_root(&dir).unwrap());
+        // The walk folds the stage's declared modes where the filesystem keeps none
+        // (Windows); on Unix it is `tree_root`.
+        let modes = crate::store::declared_modes(&dir).unwrap();
+        assert_eq!(
+            record.tree_root,
+            crate::tree::tree_root_declared(&dir, &modes).unwrap()
+        );
         assert_eq!(record.sha256, world::sha(&payload));
         assert_eq!(
             record.apple_team.as_deref(),
@@ -2650,7 +2665,7 @@ mod tests {
             "{o:?}"
         );
         let build = world::build_dir(&l, "agy", "1.3.7");
-        assert_eq!(std::fs::read(build.join("bin/agy")).unwrap(), exe);
+        assert_eq!(std::fs::read(build.join(world::bin("agy"))).unwrap(), exe);
         let record = complete_record(&build).expect("a complete record");
         assert_eq!(
             (record.sha256.as_str(), record.sha512.as_str()),
@@ -3276,7 +3291,10 @@ mod tests {
         );
         assert!(!stale.exists(), "the other version's partial was reclaimed");
         let dir = world::build_dir(&l, "claude", "2.1.282");
-        assert_eq!(std::fs::read(dir.join("bin/claude")).unwrap(), payload);
+        assert_eq!(
+            std::fs::read(dir.join(world::bin("claude"))).unwrap(),
+            payload
+        );
     }
 
     /// A legacy index build whose version cannot be read (no index verifies) is replaced by

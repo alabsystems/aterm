@@ -347,7 +347,12 @@ impl Grid {
             Ok(delta) => {
                 self.damage_selection_scroll_region_as_band(cursor_row, region.bottom, delta);
             }
-            Err(_) => self.damage_selection_scroll_region(),
+            Err(_) => {
+                self.damage_selection_scroll_region();
+                // The anchors take the move exactly, past `i16` too.
+                let delta = i64::try_from(shift_n).unwrap_or(i64::MAX);
+                self.anchors_band_move(cursor_row, region.bottom, delta);
+            }
         }
 
         // Mark only affected rows: cursor_row through region bottom.
@@ -413,20 +418,20 @@ impl Grid {
             let dst_row = row_u16(top + dst_offset);
             let src_row = row_u16(top + dst_offset - n);
             buf.fill(super::Cell::EMPTY);
-            let src_hole = if let Some(src) = self.row(src_row) {
+            let src_marks = if let Some(src) = self.row(src_row) {
                 for (i, col) in (left_usize..=right_usize).enumerate() {
                     if let Some(c) = src.get(row_u16(col)) {
                         buf[i] = *c;
                     }
                 }
-                src.has_early_wrap_hole()
+                src.end_marks()
             } else {
-                false
+                crate::RowFlags::empty()
             };
             if let Some(dst) = self.row_mut(dst_row) {
                 dst.overwrite_span(left_usize, &buf);
                 if right_usize + 1 >= cols {
-                    dst.set_early_wrap_hole(src_hole);
+                    dst.set_end_marks(src_marks);
                 }
                 // Whole-row rect copy: no per-cell authoritative signal, so the
                 // fixup keeps the char == ' ' spacer heuristic (true).
@@ -443,7 +448,7 @@ impl Grid {
             let clear_row = row_u16(top + clear_offset);
             if let Some(r) = self.row_mut(clear_row) {
                 if right_usize + 1 >= cols {
-                    r.set_early_wrap_hole(false);
+                    r.set_end_marks(crate::RowFlags::empty());
                 }
                 for col in left_usize..=right_usize {
                     if let Some(c) = r.get_mut(row_u16(col)) {
@@ -494,6 +499,8 @@ impl Grid {
 
         // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
+        // A rectangle moved across rows, which no anchor rule describes.
+        self.lose_anchors();
         self.storage
             .mark_content_rows(cursor_row, region.bottom.saturating_add(1));
     }
@@ -508,10 +515,6 @@ impl Grid {
         if count == 0 {
             return;
         }
-        // DL mints genuine blank rows below the cursor: a deficit fill armed
-        // before this must not repopulate them with pre-delete history.
-        self.invalidate_pending_fill_target();
-
         let cursor_row = self.storage.cursor.row;
         let region = self.storage.scroll_region;
 
@@ -567,7 +570,11 @@ impl Grid {
             Ok(rows) => {
                 self.damage_selection_scroll_region_as_band(cursor_row, region.bottom, -rows);
             }
-            Err(_) => self.damage_selection_scroll_region(),
+            Err(_) => {
+                self.damage_selection_scroll_region();
+                let delta = i64::try_from(shift_n).unwrap_or(i64::MAX);
+                self.anchors_band_move(cursor_row, region.bottom, -delta);
+            }
         }
 
         // Mark only affected rows: cursor_row through region bottom.
@@ -629,20 +636,20 @@ impl Grid {
             let dst_row = row_u16(top + dst_offset);
             let src_row = row_u16(top + dst_offset + n);
             buf.fill(super::Cell::EMPTY);
-            let src_hole = if let Some(src) = self.row(src_row) {
+            let src_marks = if let Some(src) = self.row(src_row) {
                 for (i, col) in (left_usize..=right_usize).enumerate() {
                     if let Some(c) = src.get(row_u16(col)) {
                         buf[i] = *c;
                     }
                 }
-                src.has_early_wrap_hole()
+                src.end_marks()
             } else {
-                false
+                crate::RowFlags::empty()
             };
             if let Some(dst) = self.row_mut(dst_row) {
                 dst.overwrite_span(left_usize, &buf);
                 if right_usize + 1 >= cols {
-                    dst.set_early_wrap_hole(src_hole);
+                    dst.set_end_marks(src_marks);
                 }
                 // As in `insert_lines_margined`.
                 dst.fixup_wide_boundary(left_usize, right_usize, cols, true);
@@ -657,7 +664,7 @@ impl Grid {
             let clear_row = row_u16(top + clear_offset);
             if let Some(r) = self.row_mut(clear_row) {
                 if right_usize + 1 >= cols {
-                    r.set_early_wrap_hole(false);
+                    r.set_end_marks(crate::RowFlags::empty());
                 }
                 for col in left_usize..=right_usize {
                     if let Some(c) = r.get_mut(row_u16(col)) {
@@ -708,6 +715,8 @@ impl Grid {
 
         // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
+        // A rectangle moved across rows, which no anchor rule describes.
+        self.lose_anchors();
         self.storage
             .mark_content_rows(cursor_row, region.bottom.saturating_add(1));
     }
@@ -1293,45 +1302,38 @@ mod tests {
     // =========================================================================
     // DECLRMM IL/DL horizontal containment
 
-    /// IL with DECLRMM active is a no-op when the cursor column is outside the
-    /// horizontal margins, even when the cursor row is inside the vertical
-    /// scroll region. It must not shift content nor move the cursor column.
+    /// IL and DL with DECLRMM active are no-ops when the cursor column is
+    /// outside the horizontal margins, even when the cursor row is inside the
+    /// vertical scroll region. They must not shift content nor move the cursor
+    /// column (it must not jump to `margins.left == 10`).
     #[test]
-    fn test_il_margined_cursor_col_outside_margins_is_noop() {
-        let mut grid = Grid::new(24, 80);
-        for r in 0..5u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("ROW{r}"));
+    fn test_il_and_dl_margined_cursor_col_outside_margins_are_noops() {
+        type Op = fn(&mut Grid);
+        let ops: [(&str, Op); 2] = [
+            ("IL", |g| g.insert_lines_margined(1, true)),
+            ("DL", |g| g.delete_lines_margined(1, true)),
+        ];
+        for (name, op) in ops {
+            let mut grid = Grid::new(24, 80);
+            for r in 0..5u16 {
+                grid.move_cursor_to(r, 0);
+                write_text(&mut grid, &format!("ROW{r}"));
+            }
+            grid.set_horizontal_margins(10, 50);
+            // Cursor row 2 is inside the (default full) vertical region, but
+            // col 70 is outside [10, 50].
+            grid.move_cursor_to(2, 70);
+            op(&mut grid);
+            // No content shift: rows still in original order.
+            assert!(row_trimmed(&grid, 2).starts_with("ROW2"), "{name}");
+            assert!(row_trimmed(&grid, 3).starts_with("ROW3"), "{name}");
+            assert_eq!(
+                grid.cursor_col(),
+                70,
+                "no-op {name} must not move cursor col"
+            );
+            assert_eq!(grid.cursor_row(), 2, "{name}");
         }
-        grid.set_horizontal_margins(10, 50);
-        // Cursor row 2 is inside the (default full) vertical region, but col 70
-        // is outside [10, 50].
-        grid.move_cursor_to(2, 70);
-        grid.insert_lines_margined(1, true);
-        // No content shift: rows still in original order.
-        assert!(row_trimmed(&grid, 2).starts_with("ROW2"));
-        assert!(row_trimmed(&grid, 3).starts_with("ROW3"));
-        // Cursor column unchanged (it must not jump to margins.left == 10).
-        assert_eq!(grid.cursor_col(), 70, "no-op IL must not move cursor col");
-        assert_eq!(grid.cursor_row(), 2);
-    }
-
-    /// DL with DECLRMM active is a no-op when the cursor column is outside the
-    /// horizontal margins.
-    #[test]
-    fn test_dl_margined_cursor_col_outside_margins_is_noop() {
-        let mut grid = Grid::new(24, 80);
-        for r in 0..5u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("ROW{r}"));
-        }
-        grid.set_horizontal_margins(10, 50);
-        grid.move_cursor_to(2, 70);
-        grid.delete_lines_margined(1, true);
-        assert!(row_trimmed(&grid, 2).starts_with("ROW2"));
-        assert!(row_trimmed(&grid, 3).starts_with("ROW3"));
-        assert_eq!(grid.cursor_col(), 70, "no-op DL must not move cursor col");
-        assert_eq!(grid.cursor_row(), 2);
     }
 
     /// Inside both margins and region, margined IL still shifts (guard does not
@@ -1383,55 +1385,46 @@ mod tests {
 
     // DECIC/DECDC vertical-region containment
 
-    /// DECIC is a no-op when the cursor row is outside the vertical scroll
-    /// region, even when the cursor column is within the horizontal margins.
+    /// DECIC and DECDC shift the rows of the vertical scroll region (rows
+    /// 0..=10) and are no-ops when the cursor row is outside it, even when the
+    /// cursor column is within the horizontal margins; inside it DECIC still
+    /// inserts (the guard does not over-fire). `ABCDE` stands on row 5, inside
+    /// the region, and on row 15, outside it.
     #[test]
-    fn test_decic_cursor_row_outside_region_is_noop() {
-        let mut grid = Grid::new(24, 80);
-        grid.move_cursor_to(15, 0);
-        write_text(&mut grid, "ABCDE");
-        grid.set_scroll_region(0, 10); // region rows [0, 10]
-        grid.move_cursor_to(15, 2); // row 15 outside region; col inside full margins
-        grid.insert_columns(3);
-        // Row 15 must be untouched.
-        assert_eq!(char_at(&grid, 15, 0), 'A');
-        assert_eq!(char_at(&grid, 15, 1), 'B');
-        assert_eq!(char_at(&grid, 15, 2), 'C');
-        assert_eq!(char_at(&grid, 15, 3), 'D');
-        assert_eq!(char_at(&grid, 15, 4), 'E');
-    }
-
-    /// DECDC is a no-op when the cursor row is outside the vertical scroll
-    /// region.
-    #[test]
-    fn test_decdc_cursor_row_outside_region_is_noop() {
-        let mut grid = Grid::new(24, 80);
-        grid.move_cursor_to(15, 0);
-        write_text(&mut grid, "ABCDE");
-        grid.set_scroll_region(0, 10);
-        grid.move_cursor_to(15, 2);
-        grid.delete_columns(3);
-        assert_eq!(char_at(&grid, 15, 0), 'A');
-        assert_eq!(char_at(&grid, 15, 1), 'B');
-        assert_eq!(char_at(&grid, 15, 2), 'C');
-        assert_eq!(char_at(&grid, 15, 3), 'D');
-        assert_eq!(char_at(&grid, 15, 4), 'E');
-    }
-
-    /// DECIC inside the vertical region still inserts (guard does not over-fire).
-    #[test]
-    fn test_decic_cursor_row_inside_region_still_inserts() {
-        let mut grid = Grid::new(24, 80);
-        grid.move_cursor_to(5, 0);
-        write_text(&mut grid, "ABCDE");
-        grid.set_scroll_region(0, 10);
-        grid.move_cursor_to(5, 2); // inside region
-        grid.insert_columns(2);
-        // Two blank columns inserted at col 2: "AB  CDE".
-        assert_eq!(char_at(&grid, 5, 0), 'A');
-        assert_eq!(char_at(&grid, 5, 1), 'B');
-        assert_eq!(char_at(&grid, 5, 2), ' ');
-        assert_eq!(char_at(&grid, 5, 3), ' ');
-        assert_eq!(char_at(&grid, 5, 4), 'C');
+    fn test_decic_and_decdc_act_only_inside_the_vertical_region() {
+        type Op = fn(&mut Grid);
+        let cases: [(&str, Op, u16, [&str; 2]); 3] = [
+            (
+                "DECIC outside",
+                |g| g.insert_columns(3),
+                15,
+                ["ABCDE", "ABCDE"],
+            ),
+            (
+                "DECDC outside",
+                |g| g.delete_columns(3),
+                15,
+                ["ABCDE", "ABCDE"],
+            ),
+            // Two blank columns inserted at col 2: "AB  CDE".
+            (
+                "DECIC inside",
+                |g| g.insert_columns(2),
+                5,
+                ["AB  C", "ABCDE"],
+            ),
+        ];
+        for (name, op, row, want) in cases {
+            let mut grid = Grid::new(24, 80);
+            for text_row in [5, 15] {
+                grid.move_cursor_to(text_row, 0);
+                write_text(&mut grid, "ABCDE");
+            }
+            grid.set_scroll_region(0, 10);
+            grid.move_cursor_to(row, 2);
+            op(&mut grid);
+            let got = [5, 15].map(|r| (0..5).map(|col| char_at(&grid, r, col)).collect::<String>());
+            assert_eq!(got, want.map(String::from), "{name}: rows 5 and 15");
+        }
     }
 }

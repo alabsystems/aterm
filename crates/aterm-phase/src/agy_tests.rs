@@ -7,7 +7,7 @@
 use super::fixtures::*;
 use super::*;
 use crate::prompt::fixtures::{cursor, provenance, rows, screen};
-use crate::reader::{ClaudeReader, CodexReader, Program, ScreenReader, identify, read};
+use crate::reader::{AgyReader, ClaudeReader, CodexReader, Program, ScreenReader, identify, read};
 use crate::wall::WallKind;
 
 fn agy(text: &str) -> crate::reader::Reading {
@@ -34,9 +34,11 @@ fn edited(rows: &[String], head: &str, with: &str) -> Vec<String> {
 }
 
 /// The screens agy LEFT — its last frame, its resume line and the shell
-/// under them — signed in and in the lab: nothing on them is agy's to read.
+/// under them — signed in and in the lab (one ended by SIGTERM with its
+/// background work running, the panel's rows in its last frame): nothing on
+/// them is agy's to read.
 fn left(text: &str) -> bool {
-    [EXITED, lab::EXIT].contains(&text)
+    [EXITED, lab::EXIT, lab::BG_EXITED].contains(&text)
 }
 
 /// Every agy capture under `src/fixtures/`, by file name.
@@ -792,6 +794,7 @@ fn the_agy_sniff_claims_no_other_programs_screen() {
         assert!(!is_agy_screen(&r), "{name}");
         assert_ne!(identify(None, &r).program(), Program::Agy, "{name}");
         assert_eq!(prompt(&r), None, "{name}");
+        assert_eq!(background_wait(&r), None, "{name}");
     }
     assert!(swept > 150, "only {swept} other captures");
 }
@@ -1348,6 +1351,8 @@ struct Lab {
     survey: bool,
     /// What the sniff names with no program name.
     sniffed: Program,
+    /// The agent's own background work ([`background_wait`]).
+    background: Option<&'static str>,
 }
 
 const fn lab(text: &'static str, phase: &'static str, evidence: bool) -> Lab {
@@ -1359,6 +1364,7 @@ const fn lab(text: &'static str, phase: &'static str, evidence: bool) -> Lab {
         wall: None,
         survey: false,
         sniffed: Program::Agy,
+        background: None,
     }
 }
 
@@ -1371,6 +1377,10 @@ fn lab_readings() -> Vec<Lab> {
     let walled = |text, phase, wall| Lab {
         wall: Some(wall),
         ..lab(text, phase, true)
+    };
+    let working = |text, what| Lab {
+        background: Some(what),
+        ..lab(text, "busy", true)
     };
     vec![
         boxed(lab::FIRST_RUN_SCHEME, PromptKind::Other),
@@ -1413,12 +1423,349 @@ fn lab_readings() -> Vec<Lab> {
         walled(lab::ERROR_429_BARE, "limited", "api-error"),
         walled(lab::ERROR_429_PER_MINUTE, "limited", "api-error"),
         walled(lab::ERROR_429_LONG, "limited", "spend"),
+        working(lab::BG_TASK, TASK_RUNNING),
+        working(lab::BG_TIMER, TASK_RUNNING),
+        working(lab::BG_SUBAGENT, SUBAGENT_WORKING),
+        working(lab::BG_TASK_AND_SUBAGENT, SUBAGENT_WORKING),
+        working(lab::BG_DAEMON, TASK_RUNNING),
+        working(lab::BG_DRAFT, TASK_RUNNING),
+        working(lab::BG_PANEL_OFF_TASK, TASK_RUNNING),
+        working(lab::BG_PANEL_OFF_SUBAGENT, SUBAGENT_WORKING),
+        working(lab::BG_PANEL_OFF_DAEMON, TASK_RUNNING),
+        lab(lab::BG_BUSY, "busy", true),
+        lab(lab::BG_TASK_ENDED, "idle", true),
+        Lab {
+            sniffed: Program::Generic,
+            ..lab(lab::BG_EXITED, "idle", false)
+        },
     ]
 }
 
+/// THE BACKGROUND-WORK PANEL IS NO PART OF THE COMPOSER, AND ITS WORK IS THE
+/// AGENT'S OWN (agy 1.4.0, measured in the lab on 2026-10-17): under the
+/// composer's bottom rule agy draws one row an item — a command task or a
+/// timer `  ● [hh:mm:ss] <what> running`, a subagent `  ● Agent(<kind>:
+/// <name>)  Working · Ns` — then a second rule, then the footer counting
+/// them. The composer reads over it as without it: the empty caret on the
+/// row the cursor parks on, a held draft the draft, the spinner of a turn
+/// sent meanwhile busy as evidence and no background work (the turn is the
+/// agent's live one), the reply the last words. An ended turn over it is
+/// the agent's own background work, named, and busy as evidence — as Claude
+/// Code's reader reads a shell, a workflow or a background agent it left
+/// running, over a question it ended on too (the hard rule) — so no
+/// continuation is typed into a session agy wakes itself. Each of the
+/// panel's rows says so alone (its footer's count stripped), and so does
+/// the count alone (agy's setting that hides the panel, `hideActiveItems`:
+/// measured, [`lab::BG_PANEL_OFF_TASK`] and its siblings). Before,
+/// every one of these read as no composer: idle NOT as evidence, the draft
+/// unseen, the running turn idle. NEGATIVE CONTROLS: the panel gone and the
+/// count gone (as the work's end leaves the screen: the question then a
+/// question), the panel with no running row and no count, a task's row
+/// stamped with no clock, a count of `0`, a panel no rule closes or one
+/// closed by a rule of another width, and the screen agy left with the
+/// panel's rows in its last frame read no background work. Claude Code's
+/// reader reads none of it.
+#[test]
+fn the_background_panel_is_no_part_of_the_composer_and_its_work_is_the_agents() {
+    let uncounted = |rows: &[String]| -> Vec<String> {
+        rows.iter()
+            .map(|r| {
+                r.replace(" · 1 task(s) · /tasks", "")
+                    .replace(" · 1 subagent(s)", "")
+            })
+            .collect()
+    };
+    for (text, what) in [
+        (lab::BG_TASK, TASK_RUNNING),
+        (lab::BG_TIMER, TASK_RUNNING),
+        (lab::BG_SUBAGENT, SUBAGENT_WORKING),
+        (lab::BG_TASK_AND_SUBAGENT, SUBAGENT_WORKING),
+        (lab::BG_DAEMON, TASK_RUNNING),
+    ] {
+        let name = provenance(text).unwrap_or_default();
+        let rows = screen(text);
+        let r = agy(text);
+        assert_eq!(
+            (r.phase.clone(), r.phase_authoritative),
+            (Phase::Busy, true),
+            "{name}"
+        );
+        let (row, col) = cursor(text).expect("measured");
+        assert_eq!(r.composer, Some((row, vec![String::new()])), "{name}");
+        assert_eq!(col, 2, "{name}");
+        assert_eq!(r.said_tail.as_deref(), Some("Tool call done."), "{name}");
+        assert_eq!(background_wait(&rows), Some(what), "{name}");
+        assert_eq!(ClaudeReader.background_wait(&rows), None, "{name}");
+        // The panel's rows with no count under them.
+        let counted_not = uncounted(&rows);
+        assert_ne!(counted_not, rows, "{name}: the count stripped");
+        assert_eq!(phase(&counted_not), (Phase::Busy, true), "{name}");
+        assert_eq!(background_wait(&counted_not), Some(what), "{name}");
+        // The footer's count with no panel over it.
+        let panel: Vec<usize> = (0..rows.len())
+            .filter(|&i| is_panel_row(&rows[i]))
+            .collect();
+        let close = panel.last().expect("a panel row") + 1;
+        let bare: Vec<String> = rows
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| !panel.contains(&i) && i != close)
+            .map(|(_, r)| r.clone())
+            .collect();
+        assert_eq!(phase(&bare), (Phase::Busy, true), "{name}");
+        assert_eq!(background_wait(&bare), Some(what), "{name}");
+        // THE CONTROLS. No panel and no count: the turn's end as without it.
+        let plain = uncounted(&bare);
+        assert_eq!(phase(&plain), (Phase::Idle, true), "{name}");
+        assert_eq!(background_wait(&plain), None, "{name}");
+        assert_eq!(said_tail(&plain), r.said_tail, "{name}");
+        // The panel's rows saying nothing runs, and no count.
+        let mut idle = uncounted(&rows);
+        for &i in &panel {
+            idle[i] = idle[i]
+                .replace(" running", " ended")
+                .replace("Working", "Idle");
+        }
+        assert_eq!(phase(&idle), (Phase::Idle, true), "{name}");
+        assert_eq!(background_wait(&idle), None, "{name}");
+        assert!(composer(&idle).is_some(), "{name}");
+        // A count of none is no work.
+        let none: Vec<String> = bare
+            .iter()
+            .map(|r| {
+                r.replace(" 1 task(s)", " 0 task(s)")
+                    .replace(" 1 subagent(s)", " 0 subagent(s)")
+            })
+            .collect();
+        assert_ne!(none, bare, "{name}: the count zeroed");
+        assert_eq!(phase(&none), (Phase::Idle, true), "{name}");
+        assert_eq!(background_wait(&none), None, "{name}");
+        // A panel no rule closes is no frame of agy's, nor one closed by a
+        // rule of another width (the transcript's separators are 60).
+        let mut open = rows.clone();
+        open.remove(close);
+        let mut narrow = rows.clone();
+        narrow[close] = "─".repeat(60);
+        for shape in [&open, &narrow] {
+            assert_eq!(composer(shape), None, "{name}");
+            assert_eq!(phase(shape), (Phase::Idle, false), "{name}");
+            assert_eq!(background_wait(shape), None, "{name}");
+        }
+    }
+    // A task's row is stamped with the clock: `[hh:mm:ss]`, nothing else.
+    let rows = uncounted(&screen(lab::BG_TASK));
+    for stamp in ["[17:50]", "[17-50-42]", "[1750:42]", "[ab:cd:ef]"] {
+        let unclocked: Vec<String> = rows
+            .iter()
+            .map(|r| r.replace("[17:50:42]", stamp))
+            .collect();
+        assert_ne!(unclocked, rows, "{stamp}");
+        assert_eq!(phase(&unclocked), (Phase::Idle, true), "{stamp}");
+        assert_eq!(background_wait(&unclocked), None, "{stamp}");
+    }
+    // A question the turn ended on: the work holds it, as a shell left
+    // running holds Claude Code's (the hard rule); the work gone, it asks.
+    let rows = screen(lab::BG_TASK);
+    let asks = edited(
+        &rows,
+        "  Tool call done.",
+        "  Should I wait for it to finish?",
+    );
+    assert_eq!(phase(&asks), (Phase::Busy, true));
+    assert_eq!(background_wait(&asks), Some(TASK_RUNNING));
+    let r = read(Some("agy"), &asks, None);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Busy, true));
+    let panel: Vec<usize> = (0..asks.len())
+        .filter(|&i| is_panel_row(&asks[i]))
+        .collect();
+    let close = panel.last().expect("a panel row") + 1;
+    let asked: Vec<String> = asks
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| !panel.contains(&i) && i != close)
+        .map(|(_, r)| r.replace(" · 1 task(s) · /tasks", ""))
+        .collect();
+    assert_eq!(phase(&asked), (Phase::Question, true), "the control");
+    assert_eq!(background_wait(&asked), None, "the control");
+    // A draft held over the panel is the draft, the cursor after it.
+    let r = agy(lab::BG_DRAFT);
+    let (row, col) = cursor(lab::BG_DRAFT).expect("measured");
+    assert_eq!(
+        r.composer,
+        Some((row, vec!["busy while a task runs".to_string()]))
+    );
+    assert_eq!(col, 2 + "busy while a task runs".len());
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Busy, true));
+    // A turn sent meanwhile: its spinner, the agent's live turn.
+    let busy = screen(lab::BG_BUSY);
+    let r = agy(lab::BG_BUSY);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Busy, true));
+    assert_eq!(background_wait(&busy), None);
+    assert_eq!(busy.iter().filter(|r| is_spinner_row(r)).count(), 1);
+    let (row, _) = cursor(lab::BG_BUSY).expect("measured");
+    assert_eq!(r.composer, Some((row, vec![String::new()])));
+    // The work over, and agy gone with its work running.
+    let r = agy(lab::BG_TASK_ENDED);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, true));
+    assert_eq!(background_wait(&screen(lab::BG_TASK_ENDED)), None);
+    let gone = screen(lab::BG_EXITED);
+    assert!(
+        gone.iter().any(|r| is_panel_row(r)),
+        "the panel's rows stand"
+    );
+    let r = agy(lab::BG_EXITED);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, false));
+    assert_eq!((r.composer, r.said_tail), (None, None));
+    assert_eq!(background_wait(&gone), None);
+}
+
+/// WHAT THE SCREEN SHOWS OF THE AGENT'S OWN BACKGROUND WORK, WHATEVER ITS
+/// TURN DOES ([`background_shown`], the live upgrade's quiet restart's screen
+/// witness): every panel row of the lab's captures — a task, a timer, a
+/// subagent, a daemon task, both at once, under a draft, and under a turn
+/// running (whose reading is busy with no background work named) — and the
+/// footer's count alone where the panel is turned off (`hideActiveItems`,
+/// measured), and a subagent's row in a state the reader names no work for
+/// (`Processing...`, measured for a moment as it starts) with the count
+/// stripped. NEGATIVE CONTROLS: the work over (no panel, no count), an idle
+/// and a fresh screen, a box, the screen agy left with the panel's rows in
+/// its last frame, and a count of `0` show none.
+#[test]
+fn every_panel_row_and_every_count_shows_background_work() {
+    for (text, what) in [
+        (lab::BG_TASK, TASK_RUNNING),
+        (lab::BG_TIMER, TASK_RUNNING),
+        (lab::BG_SUBAGENT, SUBAGENT_WORKING),
+        (lab::BG_TASK_AND_SUBAGENT, SUBAGENT_WORKING),
+        (lab::BG_DAEMON, TASK_RUNNING),
+        (lab::BG_DRAFT, TASK_RUNNING),
+        (lab::BG_BUSY, TASK_RUNNING),
+        (lab::BG_PANEL_OFF_TASK, TASK_RUNNING),
+        (lab::BG_PANEL_OFF_SUBAGENT, SUBAGENT_WORKING),
+        (lab::BG_PANEL_OFF_DAEMON, TASK_RUNNING),
+    ] {
+        assert_eq!(
+            background_shown(&screen(text)),
+            Some(what),
+            "{:?}",
+            provenance(text)
+        );
+    }
+    let processing: Vec<String> = screen(lab::BG_SUBAGENT)
+        .iter()
+        .map(|r| {
+            r.replace("Working · 1s", "Processing... · 0s")
+                .replace(" · 1 subagent(s)", "")
+        })
+        .collect();
+    assert_eq!(background_shown(&processing), Some(BACKGROUND_ITEM));
+    assert_eq!(
+        background_wait(&processing),
+        None,
+        "the reader names no work for a state it does not know"
+    );
+    let zero: Vec<String> = screen(lab::BG_PANEL_OFF_TASK)
+        .iter()
+        .map(|r| r.replace(" · 1 task(s)", " · 0 task(s)"))
+        .collect();
+    for (name, rows) in [
+        ("ended", screen(lab::BG_TASK_ENDED)),
+        ("idle", screen(lab::IDLE)),
+        ("end of turn", screen(lab::END_OF_TURN)),
+        ("box", screen(lab::BOX_SHELL)),
+        ("exited", screen(lab::BG_EXITED)),
+        ("zero", zero),
+    ] {
+        assert_eq!(background_shown(&rows), None, "{name}");
+    }
+}
+
+/// A LIMIT OR A WALL THE TURN ENDED ON STANDS OVER THE AGENT'S OWN
+/// BACKGROUND WORK (agy 1.4.0's lab screens): the panel and its running task
+/// spliced under the composer of a turn that ended on the stub's 500, on
+/// the key's 401 and on a per-day 429 read as those walls still — idle on
+/// the error and on the key (so the retry ladder and the login's escalation
+/// run), limited until the reset — while [`background_wait`] names the
+/// work, as Claude Code's reader reads the wall a turn ended on behind a
+/// shell it left running (`phase::background_wall`). Read busy, the ladder
+/// and the escalation would never run. NEGATIVE CONTROL: the same splice
+/// under a turn that ended on no wall reads busy.
+#[test]
+fn a_wall_the_turn_ended_on_stands_over_the_background_work() {
+    let splice = |text: &str| -> Vec<String> {
+        let mut rows = screen(text);
+        let f = frame(&rows).expect("the composer");
+        let width = plain_rule_width(&rows[f.bottom]).expect("the bottom rule");
+        rows.insert(
+            f.bottom + 1,
+            "  ● [17:50:42] sleep 150; echo LAB-BG-DONE running".to_string(),
+        );
+        rows.insert(f.bottom + 2, "─".repeat(width));
+        rows
+    };
+    for (text, read_as, kind) in [
+        (lab::ERROR_500, "idle", "api-error"),
+        (lab::ERROR_401, "idle", "auth"),
+        (lab::ERROR_429_LONG, "limited", "spend"),
+    ] {
+        let name = provenance(text).unwrap_or_default();
+        let rows = splice(text);
+        let r = read(Some("agy"), &rows, None);
+        assert_eq!(
+            (r.phase.name(), r.phase_authoritative),
+            (read_as, true),
+            "{name}"
+        );
+        assert_eq!(r.wall.map(|w| w.kind.name()), Some(kind), "{name}");
+        assert!(r.composer.is_some(), "{name}");
+        assert_eq!(background_wait(&rows), Some(TASK_RUNNING), "{name}");
+    }
+    let ended = splice(lab::BG_TASK_ENDED);
+    assert_eq!(phase(&ended), (Phase::Busy, true), "the control");
+    assert_eq!(background_wait(&ended), Some(TASK_RUNNING), "the control");
+}
+
+/// ONLY AN ENDED TURN THE READER VOUCHES FOR IS HELD BY THE WORK, AND THE
+/// PANEL'S ROWS SIT TWO COLUMNS IN (the review of the hard rule's guards).
+/// An exit pending (`press ctrl+c again to exit`) over a running task is
+/// `idle` NOT as evidence still, no background work named: agy is one key
+/// from gone, and read busy its exit would be waited through. A `● ` row one
+/// column in or four under the bottom rule is no panel row of agy's (one
+/// item, `● ` two columns in, measured), so the screen has no frame and no
+/// work is named. NEGATIVE CONTROL: the measured screen, its task's row two
+/// columns in under `? for shortcuts`, is busy on its task.
+#[test]
+fn an_exit_pending_over_work_is_no_evidence_and_a_panel_row_sits_two_columns_in() {
+    let rows = screen(lab::BG_TASK);
+    assert_eq!(phase(&rows), (Phase::Busy, true), "the control");
+    assert_eq!(background_wait(&rows), Some(TASK_RUNNING), "the control");
+    let footer = rows
+        .iter()
+        .rposition(|r| r.starts_with("? for shortcuts"))
+        .expect("the footer");
+    let mut exiting = rows.clone();
+    exiting[footer] = exiting[footer].replacen("? for shortcuts", "press ctrl+c again to exit", 1);
+    assert_eq!(phase(&exiting), (Phase::Idle, false));
+    assert_eq!(background_wait(&exiting), None);
+    let r = read(Some("agy"), &exiting, None);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, false));
+    let task = rows
+        .iter()
+        .position(|r| is_panel_row(r))
+        .expect("the task's row");
+    for indent in [1, 4] {
+        let mut shifted = rows.clone();
+        shifted[task] = format!("{}{}", " ".repeat(indent), rows[task].trim_start());
+        assert!(!is_panel_row(&shifted[task]), "{indent}");
+        assert_eq!(background_wait(&shifted), None, "{indent}");
+        assert_eq!(composer(&shifted), None, "{indent}");
+        assert_eq!(phase(&shifted), (Phase::Idle, false), "{indent}");
+    }
+}
+
 /// EVERY LAB CAPTURE READS AS IT MUST — its phase and whether that is
-/// evidence, its box's kind, its wall's, its survey, and the program its
-/// layout names — and the table covers every `agy-1.4.0-lab-*` file, so a
+/// evidence, its box's kind, its wall's, its survey, the program its layout
+/// names and the background work it shows — and the table covers every `agy-1.4.0-lab-*` file, so a
 /// capture added later is never left unread. NEGATIVE CONTROL: the generic
 /// reader, handed the same screens, reads none of it.
 #[test]
@@ -1448,6 +1795,8 @@ fn every_lab_capture_reads_as_it_must() {
         assert_eq!(r.wall.as_ref().map(|w| w.kind.name()), l.wall, "{what}");
         assert_eq!(r.survey, l.survey, "{what}");
         assert_eq!(identify(None, &rows).program(), l.sniffed, "{what}");
+        assert_eq!(background_wait(&rows), l.background, "{what}");
+        assert_eq!(AgyReader.background_wait(&rows), l.background, "{what}");
         let generic = read(Some("zsh"), &rows, None);
         assert_eq!(
             (generic.prompt, generic.wall, generic.survey),

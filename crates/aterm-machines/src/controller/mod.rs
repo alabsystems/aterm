@@ -9,6 +9,7 @@ pub mod discover;
 pub mod enroll;
 pub mod github;
 pub mod inventory;
+pub mod naming;
 pub mod screen;
 pub mod ssh;
 pub mod templates;

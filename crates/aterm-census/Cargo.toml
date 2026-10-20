@@ -18,7 +18,10 @@ name = "aterm-census"
 path = "src/main.rs"
 
 [dependencies]
-# None: pure std, so the censuses run offline and build in seconds.
+# Only aterm's own std-only regex engine (no dependencies of its own), which
+# runs the export's grep -E rows over decoded test captures (capture-privacy):
+# the censuses still run offline and build in seconds.
+aterm-regex = { workspace = true }
 
 [dev-dependencies]
 # None: tests use only std (synthetic sources and trees under a temp dir).

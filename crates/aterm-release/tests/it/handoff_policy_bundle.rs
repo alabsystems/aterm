@@ -51,9 +51,7 @@ fn the_cutter_seals_the_handoff_policy_into_the_bundle_before_it_signs() {
     };
 
     // Signing and verifying a copy of an Apple binary wait on trustd.
-    if aterm_uds::deadline::trust_service_silent() {
-        return;
-    }
+    aterm_uds::deadline::require_trust_service();
     let repo = repo_root();
     let scratch = std::env::temp_dir().join(format!(
         "aterm-release-policy-bundle-{}",

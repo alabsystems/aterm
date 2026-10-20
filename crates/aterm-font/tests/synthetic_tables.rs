@@ -251,3 +251,33 @@ fn mvar_moves_the_line_metrics_with_the_instance() {
     // The table is what moves them.
     assert_eq!(metrics(false, Some(900.0)), (800, -100, 50));
 }
+
+/// A face with no `OS/2` table states its style only in `head.macStyle`
+/// (Apple's `Courier.ttc`: Bold, Oblique and Bold Oblique are bits 0b01,
+/// 0b10 and 0b11 there). Without the fallback every such face read as a
+/// Regular, so a bold face was filed and loaded as one.
+#[test]
+fn a_face_without_os2_takes_its_style_from_mac_style() {
+    let face_with = |mac_style: u16| {
+        let mut bytes = sfnt(1, &[]);
+        let tables = usize::from(u16::from_be_bytes([bytes[4], bytes[5]]));
+        let record = (0..tables)
+            .map(|index| 12 + 16 * index)
+            .find(|record| &bytes[*record..*record + 4] == b"head")
+            .expect("the synthetic face has a head table");
+        let offset =
+            u32::from_be_bytes(bytes[record + 8..record + 12].try_into().unwrap()) as usize;
+        bytes[offset + 44..offset + 46].copy_from_slice(&be16(mac_style));
+        bytes
+    };
+    let style = |mac_style: u16| {
+        let bytes = face_with(mac_style);
+        let face = Face::parse(&bytes, 0).expect("the synthetic face parses");
+        assert!(face.tables().os2.is_none());
+        (face.is_bold(), face.is_italic(), face.weight().to_number())
+    };
+    assert_eq!(style(0b00), (false, false, 400));
+    assert_eq!(style(0b01), (true, false, 700));
+    assert_eq!(style(0b10), (false, true, 400));
+    assert_eq!(style(0b11), (true, true, 700));
+}

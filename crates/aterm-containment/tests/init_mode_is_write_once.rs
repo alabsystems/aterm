@@ -14,9 +14,16 @@ fn init_mode_is_write_once() {
     crate::in_fresh_process(module_path!(), "init_mode_is_write_once", || {
         aterm_containment::init_mode(ContainmentMode::Containment)
             .expect("first init should succeed");
+        let refused = aterm_containment::init_mode(ContainmentMode::User);
         assert!(
-            aterm_containment::init_mode(ContainmentMode::User).is_err(),
-            "escalation from Containment to User must be rejected"
+            matches!(
+                refused,
+                Err(aterm_containment::InitError::AlreadyInitialized {
+                    existing: ContainmentMode::Containment,
+                    attempted: ContainmentMode::User,
+                })
+            ),
+            "escalation from Containment to User must be rejected, naming both: {refused:?}"
         );
         assert_eq!(
             aterm_containment::try_current_mode(),

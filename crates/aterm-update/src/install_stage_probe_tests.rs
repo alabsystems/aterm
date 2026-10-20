@@ -31,7 +31,7 @@ fn manifest(build: u64, commit: &str) -> Manifest {
 }
 
 /// An ad-hoc-signed `staged/aterm.app.incoming` sealed as [`BUILD`] / [`COMMIT`],
-/// whose executable writes `ran` each time it starts and exits `exit`.
+/// whose executable writes its pid to `ran` each time it starts and exits `exit`.
 fn incoming(staging: &Staging, ran: &Path, exit: i32) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     ensure_private_dir(&staging.staged_dir()).unwrap();
@@ -40,7 +40,10 @@ fn incoming(staging: &Staging, ran: &Path, exit: i32) -> PathBuf {
     std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
     std::fs::write(
         &exe,
-        format!("#!/bin/sh\nprintf ran > '{}'\nexit {exit}\n", ran.display()),
+        format!(
+            "#!/bin/sh\nprintf %s $$ > '{}'\nexit {exit}\n",
+            ran.display()
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -74,9 +77,7 @@ fn stage(staging: &Staging, incoming: &Path, manifest: &Manifest) -> Result<(), 
 #[test]
 fn the_stage_starts_the_candidate_only_after_its_whole_gate_passes() {
     // Signing and judging a bundle wait on trustd.
-    if aterm_uds::deadline::trust_service_silent() {
-        return;
-    }
+    aterm_uds::deadline::require_trust_service();
     /// What the case does to the bundle's executable, and the manifest it stages under.
     type Prepare = fn(&Path) -> Manifest;
     let refusals: [(&str, Prepare); 3] = [
@@ -117,15 +118,62 @@ fn the_stage_starts_the_candidate_only_after_its_whole_gate_passes() {
     assert!(staging.staged_app.join("Contents/MacOS/aterm").is_file());
 }
 
+/// THE PROBE RUNS THE CANDIDATE HELD AT ITS EXEC, AND ONLY WHEN ASKED. Held
+/// (`verify::hold_staged_start`, which the stage calls before its gate), the
+/// candidate is stopped at its exec (`ps`: `T`) and has not run; the probe resumes
+/// that very process — the pid it reports is the held one, not a second start's —
+/// and judges its answer as it judges a plain start's. A held candidate dropped
+/// instead, as every refusal before the probe kills it, is gone without having run.
+#[test]
+fn the_stage_probe_runs_the_candidate_held_at_its_exec() {
+    // The fixture is signed ad hoc, which waits on trustd.
+    aterm_uds::deadline::require_trust_service();
+    let staging = Staging::scratch("stage-probe-held");
+    let ran = staging.root.join("ran");
+    let app = incoming(&staging, &ran, 0);
+    let held = verify::hold_staged_start(&app);
+    let pid = held.id().expect("the candidate is held");
+    let state = aterm_uds::spawnfd::command("/bin/ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("run ps");
+    let state = String::from_utf8_lossy(&state.stdout);
+    assert!(
+        state.trim().starts_with('T'),
+        "the candidate is stopped at its exec: {state:?}"
+    );
+    assert!(!ran.exists(), "a held candidate ran");
+    verify::probe_staged_bundle_starts(&app, BUILD, held).expect("the held candidate starts");
+    assert_eq!(
+        std::fs::read_to_string(&ran).expect("the probe started it"),
+        pid.to_string(),
+        "the probe ran the held process"
+    );
+
+    let staging = Staging::scratch("stage-probe-held-dropped");
+    let ran = staging.root.join("ran");
+    let app = incoming(&staging, &ran, 0);
+    let held = verify::hold_staged_start(&app);
+    let pid = held.id().expect("the candidate is held");
+    drop(held);
+    let since = std::time::Instant::now();
+    while aterm_uds::process::pid_alive(pid) {
+        assert!(
+            since.elapsed() < std::time::Duration::from_secs(60),
+            "the dropped held candidate {pid} outlived its drop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!ran.exists(), "a held candidate dropped unrun ran");
+}
+
 /// A BUILD THE RECORDS WITHDREW WHILE IT DOWNLOADED IS NEVER STARTED. A sibling's
 /// check recorded the revocation of the machine that signed it; the stage refuses
 /// it with the publish's words, and its executable never ran, though every check
 /// of the bundle itself passed.
 #[test]
 fn a_build_withdrawn_while_it_downloaded_is_never_started() {
-    if aterm_uds::deadline::trust_service_silent() {
-        return;
-    }
+    aterm_uds::deadline::require_trust_service();
     let staging = Staging::scratch("stage-probe-withdrawn");
     let revoked = vec!["m11".to_string()];
     crate::manifest::Floor::observe_and_write(
@@ -156,9 +204,7 @@ fn a_build_withdrawn_while_it_downloaded_is_never_started() {
 /// moment, so the check books it against the build like any other verdict.
 #[test]
 fn a_candidate_that_cannot_start_is_refused_before_any_marker() {
-    if aterm_uds::deadline::trust_service_silent() {
-        return;
-    }
+    aterm_uds::deadline::require_trust_service();
     let staging = Staging::scratch("stage-probe-fails");
     let ran = staging.root.join("ran");
     let app = incoming(&staging, &ran, 1);
@@ -172,40 +218,46 @@ fn a_candidate_that_cannot_start_is_refused_before_any_marker() {
     assert!(!staging.staged_app.exists());
 }
 
-/// A PROBE THAT DOES NOT FINISH IS NO VERDICT: a candidate still running at the
-/// deadline (a loaded machine, a slow first-exec scan) is killed, and the stage
-/// publishes — the apply's own probe still has to pass before any swap, so
-/// nothing is trusted that was not, and the download is not thrown away.
+/// A PROBE THAT RUNS TO NO ANSWER IS NO VERDICT: a candidate the probe could not
+/// start just then (`EAGAIN`: the process table full — a passing refusal, like a
+/// probe killed at its deadline on a loaded machine, `verify::timed_out`) publishes,
+/// and the apply's own probe still has to pass before any swap, so nothing is trusted
+/// that was not, and the download is not thrown away. The same spawn refused for a
+/// cause that comes back every time (`EACCES`) is a verdict, refused before any
+/// marker with the bundle gone: the stage tells the two apart by the refusal alone.
+/// Negative control: a stage that books every probe failure as a verdict refuses the
+/// first.
 #[test]
-fn a_stage_probe_that_does_not_finish_publishes_for_the_apply_to_judge() {
-    if aterm_uds::deadline::trust_service_silent() {
-        return;
-    }
-    use std::os::unix::fs::PermissionsExt as _;
-    let staging = Staging::scratch("stage-probe-slow");
+fn a_stage_probe_that_runs_to_no_answer_publishes_for_the_apply_to_judge() {
+    aterm_uds::deadline::require_trust_service();
+    let refuse_next_probe = |errno| {
+        verify::STAGE_PROBE_SPAWN_REFUSAL.with(|refusal| refusal.set(Some(errno)));
+    };
+    let staging = Staging::scratch("stage-probe-no-answer");
     let ran = staging.root.join("ran");
     let app = incoming(&staging, &ran, 0);
-    // Re-sealed as a candidate that never answers `--version`.
-    let exe = app.join("Contents/MacOS/aterm");
-    std::fs::write(
-        &exe,
-        format!(
-            "#!/bin/sh\nprintf ran > '{}'\nexec sleep 600\n",
-            ran.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-    aterm_uds::deadline::sign_ad_hoc(&app);
-    let staged = {
-        // The deadline the probe outlives; the gate before it needs a fraction.
-        let _budget = verify::ApplyBudget::start(std::time::Duration::from_secs(5));
-        stage(&staging, &app, &manifest(BUILD, COMMIT))
-    };
-    staged.expect("a probe that did not finish is no verdict");
-    assert!(ran.exists(), "the candidate was started");
+    refuse_next_probe(libc::EAGAIN);
+    stage(&staging, &app, &manifest(BUILD, COMMIT))
+        .expect("a probe that ran to no answer is no verdict");
+    assert!(!ran.exists(), "the refused spawn started nothing");
     assert_eq!(
         Ready::read(&staging.ready).map(|r| r.build_number),
         Some(BUILD)
     );
+    assert!(staging.staged_app.join("Contents/MacOS/aterm").is_file());
+
+    let staging = Staging::scratch("stage-probe-refused");
+    let ran = staging.root.join("ran");
+    let app = incoming(&staging, &ran, 0);
+    refuse_next_probe(libc::EACCES);
+    let error = stage(&staging, &app, &manifest(BUILD, COMMIT))
+        .expect_err("a probe refused for good is a verdict");
+    assert!(
+        error.starts_with("staged bundle cannot start: spawn candidate --version probe"),
+        "{error}"
+    );
+    assert!(!crate::is_passing_refusal(&error), "{error}");
+    assert!(!staging.ready.exists());
+    assert!(!app.exists());
+    assert!(!staging.staged_app.exists());
 }

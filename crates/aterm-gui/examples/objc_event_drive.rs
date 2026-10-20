@@ -99,11 +99,11 @@ mod macos {
         Bool, CGPoint, CGRect, Id, MainThread, Sel, autoreleasepool, checked_msg, class, ns_string,
         sel,
     };
-    use winit::application::ApplicationHandler;
-    use winit::event::{ElementState, WindowEvent};
-    use winit::event_loop::ActiveEventLoop;
-    use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
-    use winit::window::{Window, WindowId};
+    use aterm_window::application::ApplicationHandler;
+    use aterm_window::event::{ElementState, WindowEvent};
+    use aterm_window::event_loop::ActiveEventLoop;
+    use aterm_window::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
+    use aterm_window::window::{Window, WindowId};
 
     use super::{ABORTED, FAIL, NOT_RUN, PASS};
 
@@ -891,7 +891,7 @@ mod macos {
             }
             let attrs = Window::default_attributes()
                 .with_title("objc-event-drive")
-                .with_inner_size(winit::dpi::LogicalSize::new(480.0, 320.0))
+                .with_inner_size(aterm_window::dpi::LogicalSize::new(480.0, 320.0))
                 .with_visible(false);
             match el.create_window(attrs) {
                 Ok(w) => self.window = Some(w),

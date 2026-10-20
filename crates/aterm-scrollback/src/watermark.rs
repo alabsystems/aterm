@@ -31,13 +31,13 @@ pub(crate) const YELLOW_EXIT_PERCENT: usize = 50;
 /// Compute an absolute byte threshold from a percentage and a budget.
 ///
 /// `saturating_mul`: the u128 product of two values `< 2^64` cannot saturate,
-/// but the plain multiply's 128-bit overflow obligation makes the strict gate's
+/// but the plain multiply's 128-bit overflow obligation makes the Trust lane's
 /// bit-vector solver hang, while the saturating form has no panic path.
 pub(crate) fn threshold_bytes(percent: usize, budget: usize) -> usize {
     let threshold = (budget as u128).saturating_mul(percent as u128) / 100;
     // The quotient is <= budget (callers clamp percent to 1..=100), so the `min`
     // never changes it; it makes the narrowing cast provably lossless for the
-    // strict gate, which cannot carry the division bound.
+    // Trust lane, which cannot carry the division bound.
     threshold.min(usize::MAX as u128) as usize
 }
 

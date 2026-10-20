@@ -1,0 +1,32 @@
+seq v=1 rig=transcript program=claude build=2.1.294
+# REAL ROWS (5B-2): the rows a real Claude Code 2.1.294 wrote for a turn
+# that ran one Bash call and ended on its context-limit notice (aterm-agent's
+# fixture, lines 2-6, folded whole there): each row at the offset and time
+# the real reader hands it on (dated= relative, the prompt at 0), read the
+# instant it was written. 2.1.294 is no measured build (aterm-agent's
+# MEASURED_BUILDS names 2.1.303 alone), so the reader hands every row on Partial
+# (S9): the transcript adds at strong and never opens or closes the turn
+# nor names its wall. The screen lines are this test's own (no fixture):
+# busy as the prompt is written, at rest after the turn end.
+state partial
+bind 0
+see busy
+expect open t1 turn par=r1 src=screen conf=strong
+tx prompt v1 dated=0 off=1022 slice=claude-2.1.294-transcript-bash-output-then-context:2-6
+expect amend t1 turn vref=v1 by=vendor src=transcript conf=strong
+at 15 tx model model=claude-opus-5-5 effort=medium ver=2.1.294 dated=15 off=2236 slice=claude-2.1.294-transcript-bash-output-then-context:2-6
+expect amend r1 agent model=claude-opus-5-5 effort=medium ver=2.1.294 by=vendor
+at 15 tx tool c1 dated=15 off=2237 slice=claude-2.1.294-transcript-bash-output-then-context:2-6
+expect open p1 tool par=t1 cls=shell tool=Bash vref=c1 by=vendor src=transcript conf=strong
+at 3081 tx result c1 dated=3081 off=3086 slice=claude-2.1.294-transcript-bash-output-then-context:2-6
+expect close p1 tool out=ok by=vendor
+at 3120 tx end vdur=3123 in=21272 out=30 dated=3120 off=4907 slice=claude-2.1.294-transcript-bash-output-then-context:2-6
+expect amend t1 turn vdur_ms=3123 tok_in=21272 tok_out=30 by=vendor conf=strong
+expect turn=t1
+at 3120 tx endwall context dated=3120 off=4908 slice=claude-2.1.294-transcript-bash-output-then-context:2-6
+# Under Partial the context wall's row names no wall (no `out=` amend:
+# the turn's amends are exactly the two above).
+at 3200 see idle
+wait 1000
+expect close t1 turn out=done steps=1 tools=shell:1 src=screen
+expect turn=none

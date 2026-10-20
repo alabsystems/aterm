@@ -277,6 +277,7 @@ fn clear_selection_if_content_is_mutable(term: &mut crate::TermGuard<'_>) -> boo
 /// while find is open, and `scroll_to_absolute_row` then clamps to the oldest
 /// retained row ("as far back as history goes"). `Grid::oldest_absolute_row` is
 /// the predicate if that is ever worth refusing too.
+#[derive(Clone, Copy)]
 pub(crate) struct FindOrigin {
     /// The absolute row that was at the TOP of the viewport when find opened.
     pub(crate) top_visible_absolute_row: u64,
@@ -1500,7 +1501,7 @@ impl App {
             }
         }
         if let Some(w) = &ws.os_window {
-            w.set_title(&search_title);
+            crate::elevated_caption::set_title(w, &search_title);
             w.request_redraw();
         }
     }
@@ -1866,13 +1867,13 @@ impl App {
                     anchor,
                 )
             });
-        if let Some((q, revision, epoch, anchor)) = accepted
+        if let Some((q, revision, epoch, anchor)) = accepted.as_ref()
             && !q.is_empty()
         {
-            self.search_last_query = q;
+            self.search_last_query = q.clone();
             self.search_last_anchor = session
-                .zip(anchor)
-                .map(|(session, (row, start, end))| (session, revision, epoch, row, start, end));
+                .zip(*anchor)
+                .map(|(session, (row, start, end))| (session, *revision, *epoch, row, start, end));
         }
         // ⏎ is a user EXIT: the origin has served its purpose and must not outlive it,
         // or the next ⌘F would silently inherit this find's origin instead of the
@@ -1978,7 +1979,10 @@ impl App {
             term_lock(&term).text_selection_mut().clear();
         }
         if was_open && let Some(w) = &ws.os_window {
-            w.set_title(&ws.current_title);
+            crate::elevated_caption::set_title(
+                w,
+                crate::app_window::os_window_title(&ws.current_title),
+            );
             w.request_redraw();
         }
     }
@@ -3478,7 +3482,7 @@ mod tests {
         model: &aterm_spec::derive::Model,
         patch: NavPatch,
     ) -> Result<(), String> {
-        use winit::keyboard::{KeyCode, PhysicalKey};
+        use aterm_window::keyboard::{KeyCode, PhysicalKey};
 
         let (app, pipe) = app_observing_pty();
         let mut run = NavRun {

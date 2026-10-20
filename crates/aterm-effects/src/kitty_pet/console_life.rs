@@ -424,6 +424,9 @@ pub(super) struct ConsoleLife {
     /// perch owns the resident with nothing live to attend. Its dwell end is
     /// offered by [`PetBrain::console_deadline`].
     perched_since: Option<Instant>,
+    /// Synthesized composer caret when a TUI parks its hidden DECTCEM cursor
+    /// at the bottom-left corner and draws an inverse/block cursor in the prompt.
+    faux_caret: Option<(u16, u16)>,
 }
 
 impl ConsoleLife {
@@ -644,7 +647,17 @@ impl PetBrain {
             self.console.source_seq = 0;
             self.console.completion = None;
             self.console.failure_quiet_until = None;
+            self.console.faux_caret = None;
         }
+        self.console.faux_caret = if !input.cursor_visible
+            && input.display_offset == 0
+            && input.cursor_row + 2 >= pane.row + pane.rows
+        {
+            detect_faux_composer_caret(input, pane)
+                .filter(|&(r, _)| pane.row + usize::from(r) < input.cursor_row)
+        } else {
+            None
+        };
     }
 
     /// Exact locomotion occupancy where the map covers the whole footprint.
@@ -1135,9 +1148,29 @@ impl PetBrain {
             } else {
                 stamp.content_seq
             };
-            self.console.gaze = Some((subject.row, subject.col));
+            let interactive_caret = sense.caret.filter(|&(cr, _)| {
+                sense.caret_drawn
+                    && (subject.row > f32::from(cr) + 0.5
+                        || self.console.input.is_some_and(|e| {
+                            age(e.at) < LOAF_AFTER
+                                && matches!(
+                                    e.kind,
+                                    PetInputKind::Text
+                                        | PetInputKind::Delete
+                                        | PetInputKind::Navigate
+                                        | PetInputKind::Paste
+                                )
+                        }))
+            });
+            self.console.gaze = Some(if let Some((cr, cc)) = interactive_caret {
+                (f32::from(cr), f32::from(cc))
+            } else {
+                (subject.row, subject.col)
+            });
             self.console.pose = Some(if progress {
                 PetGlyphId::PetPerkTurn
+            } else if interactive_caret.is_some() {
+                PetGlyphId::PetSit
             } else if subject.row < self.row - 0.5 {
                 PetGlyphId::PetEdgeLookUp
             } else if subject.row > self.row + 0.5 {
@@ -1326,17 +1359,36 @@ impl PetBrain {
             return sense;
         }
         self.console.hidden_hold += dt.max(0.0);
+        if self.console.presentable
+            && let Some(faux) = self.console.faux_caret
+        {
+            self.console.cursor_home = Some(faux);
+            self.console.caret_held = true;
+            return PetSense {
+                caret: Some(faux),
+                caret_drawn: true,
+                ..sense
+            };
+        }
         let vouched = || {
             let now = self.console.world.as_ref().and_then(|w| w.stamp());
             now.zip(self.console.tick_stamp)
                 .is_some_and(|(now, prior)| now.preserves_cursor_home(prior))
         };
+        let corner_park = |home: (u16, u16)| {
+            let now = self.console.world.as_ref().and_then(|w| w.stamp());
+            now.zip(self.console.tick_stamp)
+                .is_some_and(|(now, prior)| now.top_absolute_row == prior.top_absolute_row)
+                && sense.caret.is_some_and(|(cr, cc)| {
+                    cc == 0 && cr.saturating_add(1) >= sense.rows && (cr, cc) != home
+                })
+        };
         match self.console.cursor_home {
             Some(home)
                 if sense.caret.is_some()
                     && self.console.presentable
-                    && self.console.hidden_hold <= HIDDEN_HOLD_MAX
-                    && vouched() =>
+                    && ((self.console.hidden_hold <= HIDDEN_HOLD_MAX && vouched())
+                        || corner_park(home)) =>
             {
                 self.console.caret_held = true;
                 PetSense {
@@ -1663,7 +1715,8 @@ impl PetBrain {
                 if matches!(
                     self.console.attention,
                     PetAttention::Reading | PetAttention::Output
-                ) {
+                ) && self.console.pose != Some(PetGlyphId::PetSit)
+                {
                     self.console.pose = Some(if r < self.row - 0.5 {
                         PetGlyphId::PetEdgeLookUp
                     } else if r > self.row + 0.5 {
@@ -2465,6 +2518,112 @@ fn local_ink(
         }
     }
     Some(bits)
+}
+
+/// Detect a TUI composer's painted cursor (or boxed prompt text tail) when the
+/// program hides the hardware DECTCEM cursor and parks it on the status bar
+/// below the composer.
+fn detect_faux_composer_caret(
+    input: &aterm_core::render::RenderInput,
+    pane: PetPane,
+) -> Option<(u16, u16)> {
+    let start_r = pane.rows / 2;
+    let end_r = pane.rows.saturating_sub(1);
+    for local_r in (start_r..end_r).rev() {
+        let frame_r = pane.row + local_r;
+        let Some(row) = input.cells.get(frame_r) else {
+            continue;
+        };
+        let mut prompt_c = None;
+        let mut boxed = false;
+        for local_c in 0..6.min(pane.cols) {
+            let Some(cell) = row.get(pane.col + local_c) else {
+                break;
+            };
+            match cell.ch {
+                '│' | '┃' | '║' | '|' if local_c == 0 => boxed = true,
+                ' ' => {}
+                '>' | '❯' | '›' => {
+                    prompt_c = Some(local_c);
+                    break;
+                }
+                _ => break,
+            }
+        }
+        let Some(prompt_c) = prompt_c else {
+            continue;
+        };
+        let base_bg = row.get(pane.col + prompt_c).map(|c| c.bg);
+        let mut last_text: Option<(usize, usize, usize)> = None;
+        for comp_r in local_r..end_r {
+            let Some(comp_row) = input.cells.get(pane.row + comp_r) else {
+                break;
+            };
+            let Some(first_cell) = comp_row.get(pane.col) else {
+                break;
+            };
+            if matches!(first_cell.ch, '╰' | '└' | '╭' | '┌' | '─' | '━' | '═' | '+')
+            {
+                break;
+            }
+            if comp_r > local_r {
+                if boxed {
+                    if !matches!(first_cell.ch, '│' | '┃' | '║' | '|') {
+                        break;
+                    }
+                } else {
+                    let indented = (0..=prompt_c).all(|c| {
+                        comp_row
+                            .get(pane.col + c)
+                            .is_some_and(|cell| cell.ch == ' ')
+                    });
+                    if !indented {
+                        break;
+                    }
+                }
+            }
+            let mut right_limit = pane.cols.saturating_sub(1);
+            if boxed {
+                for c in ((prompt_c + 1)..pane.cols).rev() {
+                    let Some(cell) = comp_row.get(pane.col + c) else {
+                        continue;
+                    };
+                    if cell.ch == ' ' {
+                        continue;
+                    }
+                    if matches!(cell.ch, '│' | '┃' | '║' | '|') {
+                        right_limit = c;
+                    }
+                    break;
+                }
+            }
+            let start_c = prompt_c + 1;
+            for local_c in start_c..right_limit {
+                let Some(cell) = comp_row.get(pane.col + local_c) else {
+                    break;
+                };
+                let inverse_caret = base_bg.is_some_and(|bg| cell.bg != bg)
+                    && comp_row
+                        .get(pane.col + local_c + 1)
+                        .is_none_or(|next| next.bg != cell.bg);
+                if cell.ch == '█' || inverse_caret {
+                    return Some((comp_r as u16, local_c as u16));
+                }
+                if cell.ch != ' ' && cell.ch != '\0' {
+                    last_text = Some((comp_r, local_c, right_limit));
+                }
+            }
+        }
+        if boxed {
+            if let Some((tr, tc, right_limit)) = last_text {
+                let col = (tc + 1).min(right_limit.saturating_sub(1));
+                return Some((tr as u16, col as u16));
+            }
+            let col = (prompt_c + 2).min(pane.cols.saturating_sub(1));
+            return Some((local_r as u16, col as u16));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -3837,5 +3996,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn faux_composer_caret_and_corner_park_prevent_bottom_left_stuck_kitty() {
+        let mut s = Scene::new();
+        // Draw a boxed composer at rows 15..=17 (1-indexed 16..=18) and a status bar on row 19 (20),
+        // then hide DECTCEM and park the hardware cursor at the bottom-left cell (row 19, col 0).
+        s.term.process(
+            b"\x1b[16;1H\xe2\x95\xad\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x95\xae\
+              \x1b[17;1H\xe2\x94\x82 > hello world             \xe2\x94\x82\
+              \x1b[18;1H\xe2\x95\xb0\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x95\xaf\
+              \x1b[20;1H  26 files changed\x1b[20;1H\x1b[?25l",
+        );
+        // Run well past HIDDEN_HOLD_MAX (0.25s) feeding the unpainted caret at (19, 0) as CompanionOwner does:
+        // the kitty must never chase the hidden bottom-left corner cursor and get stuck there.
+        let mut last = s.frame(0.016);
+        for _ in 0..120 {
+            s.now += Duration::from_secs_f32(0.02);
+            let input = s.term.cell_frame(20, 80);
+            let facts = PetWorldFacts::read(&s.term, 17);
+            s.pet.observe_console(&input, &facts, PetPane::full(&input));
+            s.pet.set_console_presentable(true);
+            let c = s.term.cursor();
+            last = s.pet.tick(PetSense {
+                caret_drawn: s.term.cursor_visible(),
+                now: s.now,
+                caret: Some((c.row, c.col)),
+                wrapped: false,
+                rows: 20,
+                cols: 80,
+                cell_w: 10,
+                cell_h: 20,
+                reduced_motion: false,
+                output_burst: false,
+                pointer: None,
+            });
+        }
+        assert!(
+            !(last.row >= 18.5 && last.col <= 2.5),
+            "kitty must not get stuck in bottom-left corner over status bar: got ({}, {})",
+            last.col,
+            last.row
+        );
+        assert!(
+            (last.row - 16.0).abs() <= 1.5,
+            "kitty should station at the boxed composer row (row 16), got ({}, {})",
+            last.col,
+            last.row
+        );
+
+        // Now wrap the boxed composer onto a second line with a block cursor `█` on row 17 (1-indexed 18)
+        // and park the hidden hardware cursor at the end of the status bar (row 19, col 18).
+        s.term.process(
+            b"\x1b[16;1H\xe2\x95\xad\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x95\xae\
+              \x1b[17;1H\xe2\x94\x82 > first line of prompt     \xe2\x94\x82\
+              \x1b[18;1H\xe2\x94\x82   second line\xe2\x96\x88            \xe2\x94\x82\
+              \x1b[19;1H\xe2\x95\xb0\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x95\xaf\
+              \x1b[20;1H  26 files changed\x1b[?25l",
+        );
+        let input = s.term.cell_frame(20, 80);
+        assert_eq!(
+            detect_faux_composer_caret(&input, PetPane::full(&input)),
+            Some((17, 15)),
+            "multiline composer should locate the block cursor on the second composer line"
+        );
+    }
+
+    #[test]
+    fn bordered_tui_box_places_station_in_interior_blank_gap_instead_of_on_words() {
+        let mut s = Scene::new();
+        // Draw a full-width 80-column walled composer box on row 10 (1-indexed 11)
+        // with top and bottom borders on rows 9 and 11, and put the caret at `hello` (col 6).
+        let border = format!("+{}+", "-".repeat(78));
+        let composer = format!("| > hello world{}|", " ".repeat(63));
+        s.term.process(
+            format!("\x1b[10;1H{border}\x1b[11;1H{composer}\x1b[12;1H{border}\x1b[11;7H")
+                .as_bytes(),
+        );
+        // Feed the per-row hull spans (0..80 on all three rows because of the outer box walls).
+        s.pet.sense_ink(9, &[(0, 80), (0, 80), (0, 80)], None);
+        let frames = s.watch(1.5);
+        let last = frames.last().copied().expect("frame");
+        // Words `> hello world` occupy cols 2..15 on row 10. Inside the box, cols 16..79 are blank!
+        assert!(
+            last.col >= 15.0 && last.col <= 74.0,
+            "kitty inside walled TUI box should step past the words into the interior blank space (col >= 15), got col {} row {}",
+            last.col,
+            last.row
+        );
     }
 }

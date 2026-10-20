@@ -14,13 +14,11 @@ fn writes(m: &Mock) -> Vec<&String> {
         .collect()
 }
 
-/// The badge and mail requests, in order.
+/// The badge requests, in order.
 fn badge_acts(m: &Mock) -> Vec<String> {
     m.requests
         .iter()
-        .filter(|r| {
-            r.starts_with("meta set") || r.starts_with("meta unset") || r.starts_with("post")
-        })
+        .filter(|r| r.starts_with("meta set") || r.starts_with("meta unset"))
         .cloned()
         .collect()
 }
@@ -34,35 +32,25 @@ fn journal_lines(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The loop's `watch` over `m` with a manager to mail and a journal: the
-/// printed lines, the exit code and the journal's lines.
+/// The loop's `watch` over `m` with a journal: the printed lines, the exit
+/// code and the journal's lines.
 fn watch_journaled(m: &mut Mock, tag: &str) -> (Vec<String>, u8, Vec<String>) {
     let (dir, path) = journal_file(tag);
     let opts = SuperviseOpts {
         journal: Some(path.clone()),
-        ..auto(30, None)
+        ..auto(30)
     };
-    let (lines, code) = watch_lines_with(m, &opts, |s| {
-        s.set_manager(Some("@s-9".to_string()));
-    });
+    let (lines, code) = watch_lines(m, &opts);
     let journal = journal_lines(&path);
     let _ = std::fs::remove_dir_all(&dir);
     (lines, code, journal)
 }
 
 /// A worker showing a box no rule approves (a Read of `~/.ssh/config`) that never leaves the
-/// screen, three post replies in hand.
+/// screen.
 fn box_that_sits() -> Mock {
     let mut m = Mock::new(vec![busy_screen(), read_box()]);
     m.vanish_after = Some(4);
-    m.verb_replies.insert(
-        "post",
-        VecDeque::from([
-            ok("OK 7 off=91\n"),
-            ok("OK 8 off=92\n"),
-            ok("OK 9 off=93\n"),
-        ]),
-    );
     m
 }
 
@@ -78,37 +66,30 @@ fn ended_with_the_session(lines: &[String], code: u8) {
 }
 
 /// A worker that stops reading under an escalated box: the first probe that reads
-/// `input=stalled` unsets the badge, mails the manager one `kind=ask` and journals `FROZEN …`;
-/// nothing is pressed, typed or escalated while it stands.
+/// `input=stalled` unsets the badge and journals `FROZEN …`; nothing is pressed, typed,
+/// posted or escalated while it stands.
 #[test]
-fn a_frozen_worker_is_held_its_badge_withdrawn_and_the_manager_told_once() {
+fn a_frozen_worker_is_held_and_its_badge_withdrawn() {
     let mut m = box_that_sits();
-    // Read 1 is the box's program, read 2 the escalation's fabric: the
-    // worker reads its input until then, and from the wait's first probe on
-    // it does not.
+    // Read 1 is the box's program, read 2 the escalation's own stall check:
+    // the worker reads its input until then, and from the wait's first probe
+    // on it does not.
     m.input_after = vec![(2, INPUT_STALLED)];
     let (lines, code, journal) = watch_journaled(&mut m, "stall-held");
     assert!(writes(&m).is_empty(), "{:?}", m.requests);
     let acts = badge_acts(&m);
-    assert_eq!(acts.len(), 4, "{acts:#?}");
+    assert_eq!(acts.len(), 2, "{acts:#?}");
     assert!(
         acts[0].starts_with("meta set attention owner=supervisor claude read: ~/.ssh/config ("),
         "{acts:#?}"
     );
-    assert!(acts[1].starts_with("post to=@s-9 kind=ask --wait=0 claude read: "));
-    assert_eq!(acts[2], "meta unset attention owner=supervisor");
-    assert!(
-        acts[3].starts_with("post to=@s-9 kind=ask --wait=0 claude frozen: "),
-        "{acts:#?}"
-    );
+    assert_eq!(acts[1], "meta unset attention owner=supervisor");
     let probes = m.requests.iter().filter(|r| *r == "status").count();
     assert!(probes >= 5, "a probe per step: {:?}", m.requests);
     let frozen: Vec<&String> = journal.iter().filter(|l| l.starts_with("FROZEN")).collect();
     assert_eq!(frozen.len(), 1, "{journal:#?}");
     assert!(
-        frozen[0].ends_with(
-            " input=stalled wait_ms=161000 bytes=1 rss_mb=39731 attention=OK mail=OK 8 off=92"
-        ),
+        frozen[0].ends_with(" input=stalled wait_ms=161000 bytes=1 rss_mb=39731 attention=OK"),
         "{}",
         frozen[0]
     );
@@ -121,30 +102,8 @@ fn a_frozen_worker_is_held_its_badge_withdrawn_and_the_manager_told_once() {
     ended_with_the_session(&lines, code);
 }
 
-/// The fabric is not connected: the badge still goes, and the mail is
-/// journaled skipped, never posted (the rule every escalation's mail keeps).
-#[test]
-fn a_frozen_worker_with_no_fabric_is_told_to_no_one_by_mail() {
-    let mut m = box_that_sits();
-    m.fabric = "absent";
-    m.input_after = vec![(2, INPUT_STALLED)];
-    let (lines, code, journal) = watch_journaled(&mut m, "stall-nofabric");
-    assert!(writes(&m).is_empty(), "{:?}", m.requests);
-    assert!(!m.requests.iter().any(|r| r.starts_with("post")));
-    assert_eq!(count(&m, "meta unset attention owner=supervisor"), 1);
-    let frozen = journal
-        .iter()
-        .find(|l| l.starts_with("FROZEN"))
-        .expect("FROZEN");
-    assert!(
-        frozen.ends_with("attention=OK mail=skipped: no fabric (fabric=absent)"),
-        "{frozen}"
-    );
-    ended_with_the_session(&lines, code);
-}
-
 /// The stall lifts (`input=clear`) while the box is still on screen: `THAWED …` is journaled and
-/// the box decided afresh, escalated again with badge and ask. Nothing is pressed meanwhile.
+/// the box decided afresh, badged again. Nothing is pressed meanwhile.
 #[test]
 fn a_thawed_worker_has_its_point_decided_again() {
     let mut m = box_that_sits();
@@ -155,13 +114,10 @@ fn a_thawed_worker_has_its_point_decided_again() {
     let (lines, code, journal) = watch_journaled(&mut m, "stall-thawed");
     assert!(writes(&m).is_empty(), "{:?}", m.requests);
     let acts = badge_acts(&m);
-    assert_eq!(acts.len(), 6, "{acts:#?}");
+    assert_eq!(acts.len(), 3, "{acts:#?}");
     assert!(acts[0].starts_with("meta set attention owner=supervisor claude read: "));
-    assert!(acts[1].starts_with("post to=@s-9 kind=ask --wait=0 claude read: "));
-    assert_eq!(acts[2], "meta unset attention owner=supervisor");
-    assert!(acts[3].starts_with("post to=@s-9 kind=ask --wait=0 claude frozen: "));
-    assert_eq!(acts[4], acts[0], "the same box, escalated again");
-    assert_eq!(acts[5], acts[1]);
+    assert_eq!(acts[1], "meta unset attention owner=supervisor");
+    assert_eq!(acts[2], acts[0], "the same box, escalated again");
     let at = |word: &str| journal.iter().position(|l| l.starts_with(word));
     let (frozen, thawed) = (at("FROZEN"), at("THAWED"));
     assert!(
@@ -209,82 +165,10 @@ fn the_host_is_told_the_stall_it_holds_and_that_it_lifted() {
         }
         let opts = SuperviseOpts {
             idle_host: Some(Arc::clone(&told) as Arc<dyn IdleHost>),
-            ..auto(30, None)
+            ..auto(30)
         };
-        let _ = watch_lines_with(&mut m, &opts, |s| {
-            s.set_manager(Some("@s-9".to_string()));
-        });
+        let _ = watch_lines(&mut m, &opts);
         assert_eq!(*told.0.lock().unwrap(), want, "{:#?}", m.requests);
-    }
-}
-
-/// The frozen mail's remedy: the agent's resume line where the host would not carry the explicit
-/// restart; the restart and the relaunch where it would ([`IdleHost::restart_offered`]), whatever
-/// `[harness] relaunch` says; the restart alone where the conversation is not promised. Never
-/// `claude --continue`.
-#[test]
-fn the_frozen_mail_names_the_workers_own_conversation_or_the_hosts_relaunch() {
-    #[derive(Debug)]
-    struct Host {
-        restarts: bool,
-        offered: Option<bool>,
-    }
-    impl IdleHost for Host {
-        fn wants(&self) -> bool {
-            false
-        }
-        fn at_idle(&self) -> Option<HostStep> {
-            None
-        }
-        fn owns_turn_end(&self) -> bool {
-            false
-        }
-        fn can_restart(&self) -> bool {
-            self.restarts
-        }
-        fn restart_offered(&self) -> Option<bool> {
-            self.offered
-        }
-        fn resume_command(&self) -> Option<String> {
-            Some("claude --model opus --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f".to_string())
-        }
-    }
-    let command = "signal term (signal kill if it survives), then claude --model opus --resume \
-                   5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
-    let carried = "restart if-stalled; aterm relaunches it on its conversation";
-    for (restarts, offered, tail) in [
-        (false, None, command),
-        // The host carries the act: the explicit restart, which ends a
-        // survivor itself.
-        (true, Some(true), carried),
-        // ...under `[harness] relaunch = false` too.
-        (false, Some(true), carried),
-        // Restarts Claude Code, but its relaunch would refuse this launch.
-        (true, None, command),
-        // Carried, its conversation not promised: the restart alone.
-        (false, Some(false), "restart it: restart if-stalled"),
-    ] {
-        let relaunches = (restarts, offered);
-        let mut m = box_that_sits();
-        m.input_after = vec![(2, INPUT_STALLED)];
-        let host = Host { restarts, offered };
-        let opts = SuperviseOpts {
-            idle_host: Some(Arc::new(host) as Arc<dyn IdleHost>),
-            ..auto(30, None)
-        };
-        let _ = watch_lines_with(&mut m, &opts, |s| {
-            s.set_manager(Some("@s-9".to_string()));
-        });
-        let acts = badge_acts(&m);
-        let mail = acts
-            .iter()
-            .find(|a| a.contains(" claude frozen: "))
-            .unwrap_or_else(|| panic!("the frozen mail: {acts:#?}"));
-        assert!(
-            mail.ends_with(tail),
-            "(restarts, offered)={relaunches:?}: {mail}"
-        );
-        assert!(!mail.contains("--continue"), "{mail}");
     }
 }
 
@@ -412,8 +296,6 @@ fn a_continuation_warned_input_unread_reads_status_at_the_next_look() {
         ended.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
         let mut m = Mock::new(vec![busy_screen(), ended, busy_screen()]);
         m.vanish_after = Some(3);
-        m.verb_replies
-            .insert("post", VecDeque::from([ok("OK 7 off=91\n")]));
         let header = if warned {
             WARNED_TURN
         } else {
@@ -430,11 +312,9 @@ fn a_continuation_warned_input_unread_reads_status_at_the_next_look() {
         let opts = SuperviseOpts {
             journal: Some(path.clone()),
             policy: SupervisorConfig::default(),
-            ..auto(30, None)
+            ..auto(30)
         };
-        let (lines, code) = watch_lines_with(&mut m, &opts, |s| {
-            s.set_manager(Some("@s-9".to_string()));
-        });
+        let (lines, code) = watch_lines(&mut m, &opts);
         let journal = journal_lines(&path);
         let _ = std::fs::remove_dir_all(&dir);
         (m, lines, code, journal)
@@ -477,14 +357,15 @@ fn a_continuation_warned_input_unread_reads_status_at_the_next_look() {
 }
 
 /// Negative control: a host that publishes no `input=`, or `input=-` (not macOS, not a tty), gets
-/// no probe and no hold: `status` only where the box and the escalation read it.
+/// no probe and no hold: `status` only where the box's program is read, once
+/// (the escalation's own read went with the manager's mail).
 #[test]
 fn a_host_that_does_not_measure_input_is_probed_on_no_step() {
     for input in ["", "input=- input_bytes=- input_wait_ms=- fg_rss_mb=-"] {
         let mut m = box_that_sits();
         m.input = input;
         let (lines, code, journal) = watch_journaled(&mut m, "stall-none");
-        assert_eq!(count(&m, "status"), 2, "input={input:?}: {:#?}", m.requests);
+        assert_eq!(count(&m, "status"), 1, "input={input:?}: {:#?}", m.requests);
         let first_step = m
             .requests
             .iter()
@@ -516,18 +397,10 @@ fn a_worker_already_stalled_when_the_loop_looks_is_neither_pressed_nor_badged() 
     ] {
         let mut m = Mock::new(vec![busy_screen(), screen]);
         m.vanish_after = Some(4);
-        m.verb_replies
-            .insert("post", VecDeque::from([ok("OK 7 off=91\n")]));
         m.input = INPUT_STALLED;
         let (lines, code, journal) = watch_journaled(&mut m, tag);
         assert!(writes(&m).is_empty(), "{tag}: {:?}", m.requests);
-        let acts = badge_acts(&m);
-        assert!(
-            acts.len() == 1
-                && acts[0].starts_with("post to=@s-9 kind=ask --wait=0 claude frozen: "),
-            "{tag}: {:#?}",
-            m.requests
-        );
+        assert!(badge_acts(&m).is_empty(), "{tag}: {:#?}", m.requests);
         assert!(
             !journal
                 .iter()
@@ -537,7 +410,7 @@ fn a_worker_already_stalled_when_the_loop_looks_is_neither_pressed_nor_badged() 
         let frozen: Vec<&String> = journal.iter().filter(|l| l.starts_with("FROZEN")).collect();
         assert_eq!(frozen.len(), 1, "{tag}: {journal:#?}");
         assert!(
-            frozen[0].ends_with(" attention=none mail=OK 7 off=91"),
+            frozen[0].ends_with(" attention=none"),
             "{tag}: {}",
             frozen[0]
         );
@@ -547,61 +420,6 @@ fn a_worker_already_stalled_when_the_loop_looks_is_neither_pressed_nor_badged() 
         );
         ended_with_the_session(&lines, code);
     }
-}
-
-/// The same for a point with no `status` before its escalation (a question): the badge goes up
-/// before the escalation's own read reports the stall, but that read is acted on: no ask is mailed
-/// and the hold withdraws the badge before the wait's first step. One mail, the frozen one.
-#[test]
-fn a_stall_the_escalations_own_read_reports_withholds_the_ask_and_holds_at_once() {
-    let mut m = Mock::new(vec![busy_screen(), question_screen()]);
-    m.vanish_after = Some(3);
-    m.verb_replies
-        .insert("post", VecDeque::from([ok("OK 7 off=91\n")]));
-    m.input = INPUT_STALLED;
-    let (lines, code, journal) = watch_journaled(&mut m, "stall-first-question");
-    assert!(writes(&m).is_empty(), "{:?}", m.requests);
-    let acts = badge_acts(&m);
-    assert_eq!(acts.len(), 3, "{acts:#?}");
-    assert!(
-        acts[0].starts_with("meta set attention owner=supervisor claude "),
-        "{acts:#?}"
-    );
-    assert_eq!(acts[1], "meta unset attention owner=supervisor");
-    assert!(
-        acts[2].starts_with("post to=@s-9 kind=ask --wait=0 claude frozen: "),
-        "{acts:#?}"
-    );
-    // The unset comes before the wait's first step.
-    let unset_at = m
-        .requests
-        .iter()
-        .position(|r| r.starts_with("meta unset"))
-        .expect("the unset");
-    assert!(
-        !m.requests[..unset_at]
-            .iter()
-            .any(|r| r.starts_with("await seq")),
-        "{:#?}",
-        m.requests
-    );
-    let escalated = journal
-        .iter()
-        .find(|l| l.starts_with("ESCALATED"))
-        .expect("ESCALATED");
-    assert!(
-        escalated.contains(" attention=OK mail=skipped: "),
-        "{escalated}"
-    );
-    let frozen = journal
-        .iter()
-        .find(|l| l.starts_with("FROZEN"))
-        .expect("FROZEN");
-    assert!(
-        frozen.ends_with(" attention=OK mail=OK 7 off=91"),
-        "{frozen}"
-    );
-    ended_with_the_session(&lines, code);
 }
 
 /// A continuation over a worker already frozen: the `status` read before typing reports the stall,
@@ -617,18 +435,14 @@ fn a_continuation_over_a_worker_already_stalled_types_nothing() {
     ended.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
     let mut m = Mock::new(vec![busy_screen(), ended]);
     m.vanish_after = Some(2);
-    m.verb_replies
-        .insert("post", VecDeque::from([ok("OK 7 off=91\n")]));
     m.input = INPUT_STALLED;
     let (dir, path) = journal_file("stall-first-continue");
     let opts = SuperviseOpts {
         journal: Some(path.clone()),
         policy: SupervisorConfig::default(),
-        ..auto(30, None)
+        ..auto(30)
     };
-    let (lines, code) = watch_lines_with(&mut m, &opts, |s| {
-        s.set_manager(Some("@s-9".to_string()));
-    });
+    let (lines, code) = watch_lines(&mut m, &opts);
     let journal = journal_lines(&path);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(writes(&m).is_empty(), "{:?}", m.requests);
@@ -640,20 +454,16 @@ fn a_continuation_over_a_worker_already_stalled_types_nothing() {
         .iter()
         .find(|l| l.starts_with("FROZEN"))
         .expect("FROZEN");
+    assert!(frozen.ends_with(" attention=none"), "{frozen}");
     assert!(
-        frozen.ends_with(" attention=none mail=OK 7 off=91"),
-        "{frozen}"
-    );
-    assert_eq!(
-        badge_acts(&m).len(),
-        1,
-        "the frozen mail only: {:#?}",
+        badge_acts(&m).is_empty(),
+        "nothing raised: {:#?}",
         m.requests
     );
     ended_with_the_session(&lines, code);
 }
 
-/// The window's host over `m` ([`SuperviseOpts::hosted_with`], no manager) with
+/// The window's host over `m` ([`SuperviseOpts::hosted_with`]) with
 /// `answer_questions = false`, the one limit that makes it escalate a question: the printed lines,
 /// the loop's end and the journal's lines.
 fn hosted_journaled(m: &mut Mock, tag: &str) -> (Vec<String>, Result<(), String>, Vec<String>) {
@@ -708,9 +518,9 @@ fn before_the_badge(m: &Mock) -> &[String] {
     &m.requests[..at]
 }
 
-/// The window's host has no manager, so a point it badges (a question, an idle point the turn-end
-/// policy escalates) reads `status` itself before the badge, and a stall that read reports raises
-/// none; the hold follows before the wait's first step.
+/// A point the window's host badges (a question, an idle point the turn-end policy escalates)
+/// reads `status` itself before the badge, and a stall that read reports raises none; the hold
+/// follows before the wait's first step.
 #[test]
 fn the_windows_host_raises_no_badge_over_a_worker_frozen_under_its_point() {
     for (screen, tag) in [
@@ -724,7 +534,7 @@ fn the_windows_host_raises_no_badge_over_a_worker_frozen_under_its_point() {
         assert!(writes(&m).is_empty(), "{tag}: {:?}", m.requests);
         assert!(
             badge_acts(&m).is_empty(),
-            "{tag}: no badge, no mail: {:#?}",
+            "{tag}: no badge: {:#?}",
             m.requests
         );
         let escalated = journal
@@ -732,14 +542,16 @@ fn the_windows_host_raises_no_badge_over_a_worker_frozen_under_its_point() {
             .find(|l| l.starts_with("ESCALATED"))
             .unwrap_or_else(|| panic!("{tag}: ESCALATED: {journal:#?}"));
         assert!(
-            escalated.contains(" attention=skipped: ") && escalated.contains(" mail=skipped: "),
+            escalated.ends_with(
+                " attention=skipped: the same status says the worker is not reading its input"
+            ),
             "{tag}: {escalated}"
         );
         let frozen: Vec<&String> = journal.iter().filter(|l| l.starts_with("FROZEN")).collect();
         assert_eq!(frozen.len(), 1, "{tag}: {journal:#?}");
         assert!(
             frozen[0]
-                .contains(" input=stalled wait_ms=161000 bytes=1 rss_mb=39731 attention=none "),
+                .ends_with(" input=stalled wait_ms=161000 bytes=1 rss_mb=39731 attention=none"),
             "{tag}: {}",
             frozen[0]
         );
@@ -796,11 +608,7 @@ fn the_windows_host_withdraws_the_badge_of_a_worker_that_freezes_under_it() {
     assert_eq!(acts[1], "meta unset attention owner=supervisor");
     let frozen: Vec<&String> = journal.iter().filter(|l| l.starts_with("FROZEN")).collect();
     assert_eq!(frozen.len(), 1, "{journal:#?}");
-    assert!(
-        frozen[0].contains(" attention=OK mail=skipped"),
-        "{}",
-        frozen[0]
-    );
+    assert!(frozen[0].ends_with(" attention=OK"), "{}", frozen[0]);
     assert!(end.is_err(), "{end:?}");
     assert!(
         lines
@@ -816,17 +624,10 @@ fn the_windows_host_withdraws_the_badge_of_a_worker_that_freezes_under_it() {
 fn a_wait_that_never_read_status_probes_and_holds() {
     let mut m = Mock::new(vec![busy_screen(), idle_screen()]);
     m.vanish_after = Some(3);
-    m.verb_replies
-        .insert("post", VecDeque::from([ok("OK 7 off=91\n")]));
     m.input = INPUT_STALLED;
     let (lines, code, journal) = watch_journaled(&mut m, "stall-unread-idle");
     assert!(writes(&m).is_empty(), "{:?}", m.requests);
-    let acts = badge_acts(&m);
-    assert!(
-        acts.len() == 1 && acts[0].starts_with("post to=@s-9 kind=ask --wait=0 claude frozen: "),
-        "{:#?}",
-        m.requests
-    );
+    assert!(badge_acts(&m).is_empty(), "{:#?}", m.requests);
     let first_status = m
         .requests
         .iter()
@@ -841,10 +642,7 @@ fn a_wait_that_never_read_status_probes_and_holds() {
         .iter()
         .find(|l| l.starts_with("FROZEN"))
         .expect("FROZEN");
-    assert!(
-        frozen.ends_with(" attention=none mail=OK 7 off=91"),
-        "{frozen}"
-    );
+    assert!(frozen.ends_with(" attention=none"), "{frozen}");
     ended_with_the_session(&lines, code);
 }
 
@@ -985,13 +783,11 @@ fn remedy_run_as(
     let host = Arc::new(Relaunching(relaunches, Mutex::new(Vec::new()), after));
     let mut opts = SuperviseOpts {
         idle_host: Some(host.clone() as Arc<dyn IdleHost>),
-        ..auto(30, None)
+        ..auto(30)
     };
     opts.policy.stall_term_after_s = term_after_s;
     opts.policy.stall_term = stall_term;
-    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
-        s.set_manager(Some("@s-9".to_string()));
-    });
+    let (lines, _) = watch_lines(&mut m, &opts);
     let signals = m
         .requests
         .iter()
@@ -1381,7 +1177,7 @@ fn beside_remedy_run(
     });
     let mut opts = SuperviseOpts {
         idle_host: Some(host.clone() as Arc<dyn IdleHost>),
-        ..auto(30, None)
+        ..auto(30)
     };
     opts.policy.stall_term_after_s = term_after_s;
     opts.policy.stall_term = stall_term;
@@ -1426,7 +1222,7 @@ fn beside_a_proven_self_claim_the_stalls_remedy_stands_and_nothing_is_typed() {
         let asked = Arc::clone(&host);
         let mut opts = SuperviseOpts {
             idle_host: Some(host as Arc<dyn IdleHost>),
-            ..auto(30, None)
+            ..auto(30)
         };
         opts.policy.stall_term_after_s = default;
         opts.policy.stall_term = true;
@@ -1526,7 +1322,7 @@ fn beside_a_proven_self_claim_the_memory_restart_waits_for_the_records_idle_poin
         let asked = Arc::clone(&host);
         let mut opts = SuperviseOpts {
             idle_host: Some(host as Arc<dyn IdleHost>),
-            ..auto(30, None)
+            ..auto(30)
         };
         opts.policy.relaunch = relaunch;
         let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
@@ -1585,7 +1381,7 @@ fn beside_a_proven_self_claim_the_memory_restart_waits_for_the_records_idle_poin
         let asked = Arc::clone(&host);
         let opts = SuperviseOpts {
             idle_host: Some(host as Arc<dyn IdleHost>),
-            ..auto(30, None)
+            ..auto(30)
         };
         let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
             s.set_beside(Some("codex-alab@4242".to_string()));
@@ -1646,7 +1442,7 @@ fn under_a_hold_beside_a_proven_self_claim_the_remedies_stand_and_nothing_is_typ
         };
         let mut opts = SuperviseOpts {
             idle_host: Some(host as Arc<dyn IdleHost>),
-            ..auto(30, None)
+            ..auto(30)
         };
         opts.policy.stall_term_after_s = SupervisorConfig::default().stall_term_after_s;
         opts.policy.stall_term = true;
@@ -1719,12 +1515,7 @@ impl Review for IdleMemoryReview {
     fn approved(&mut self, _seq: u64, _command: &str) -> Result<(), String> {
         Ok(())
     }
-    fn review(
-        &mut self,
-        _turn: &Turn,
-        _report: Option<ReportBrief>,
-        _fold: Option<Fold>,
-    ) -> Result<bool, String> {
+    fn review(&mut self, _turn: &Turn) -> Result<bool, String> {
         Ok(true)
     }
     fn say(&mut self, _line: &str) -> Result<(), String> {
@@ -1766,7 +1557,7 @@ fn a_beside_memory_restart_waits_for_elapsed_observation_not_just_two_reads() {
         let mut s = session(&mut m, None);
         s.set_beside(Some("codex-alab@4242".to_string()));
         s.stall_host = Some(Beside::new(true, None) as Arc<dyn IdleHost>);
-        let opts = auto(30, None);
+        let opts = auto(30);
         let mut review = IdleMemoryReview { unattended: true };
         let first = Instant::now();
         for now in [first, first + second] {
@@ -1793,7 +1584,7 @@ fn a_beside_memory_restart_discards_a_candidate_across_ineligibility() {
         s.set_beside(Some("codex-alab@4242".to_string()));
         let host = Beside::new(true, None) as Arc<dyn IdleHost>;
         s.stall_host = Some(Arc::clone(&host));
-        let mut opts = auto(30, None);
+        let mut opts = auto(30);
         let mut review = IdleMemoryReview { unattended: true };
         let first = Instant::now();
         s.beside_memory_remedy_at(actionable_memory(), 7, || first, &opts, &mut review)
@@ -1848,7 +1639,7 @@ fn a_beside_memory_restart_rechecks_the_current_screen_sequence() {
     let mut s = session(&mut m, None);
     s.set_beside(Some("codex-alab@4242".to_string()));
     s.stall_host = Some(Beside::new(true, None) as Arc<dyn IdleHost>);
-    let opts = auto(30, None);
+    let opts = auto(30);
     let mut review = IdleMemoryReview { unattended: true };
     let first = Instant::now();
     s.beside_memory_remedy_at(actionable_memory(), 7, || first, &opts, &mut review)

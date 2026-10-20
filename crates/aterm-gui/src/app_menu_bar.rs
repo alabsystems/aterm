@@ -135,11 +135,10 @@ fn read_app_menu_bar(mtm: MainThread) -> Vec<String> {
                     } else {
                         appkit::send_usize(kids, sel!(count))
                     };
-                    // One level of SUBMENU (round 19, File ▸ Driving) prints
-                    // exactly as the model serialiser prints it
-                    // (`menu::menu_chrome_lines`): `<label> ▸` in this line,
-                    // then the submenu as its own `menu "<parent> ▸ <label>"`
-                    // line right after.
+                    // One level of SUBMENU — none in the model since File ▸
+                    // Driving went (2026-10-16), but AppKit may add one —
+                    // prints `<label> ▸` in this line, then the submenu as its
+                    // own `menu "<parent> ▸ <label>"` line right after.
                     let mut names: Vec<String> = Vec::with_capacity(kn);
                     let mut nested: Vec<String> = Vec::new();
                     for j in 0..kn {

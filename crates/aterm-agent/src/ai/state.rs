@@ -56,6 +56,13 @@ impl State {
             State::Ok | State::Idle | State::Due(_) | State::Unproven
         )
     }
+
+    /// Whether a wanted CLI has a definite install or sign-in action.
+    /// Unknown login evidence and intentional exclusions need no action.
+    #[must_use]
+    pub const fn needs_person(self, wanted: bool) -> bool {
+        wanted && matches!(self, State::NotInstalled | State::SignedOut | State::Due(_))
+    }
 }
 
 /// How much a row matters.
@@ -158,7 +165,6 @@ fn login_seen(f: &Facts) -> Option<bool> {
 pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
     let c = f.connector;
     let version = f.managed.as_ref().and_then(|m| m.version.clone());
-    let fail = if c.measured { Mark::Fail } else { Mark::Note };
     let unmeasured = if c.measured {
         ""
     } else {
@@ -212,7 +218,7 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
     }
     if f.managed.is_none() {
         row.state = State::NotInstalled;
-        row.mark = fail;
+        row.mark = Mark::Fail;
         row.fact = match &f.foreign {
             Some(p) => format!(
                 "not installed by aterm (a copy it does not manage is at {}){unmeasured}",
@@ -268,7 +274,7 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
     .max_by_key(|(t, _)| *t);
     let signed_out = |row: &mut Row, fact: String| {
         row.state = State::SignedOut;
-        row.mark = fail;
+        row.mark = Mark::Fail;
         row.fact = format!("{fact}{unmeasured}");
         row.fix = Some(format!("aterm ai login {}", c.id));
     };

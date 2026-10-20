@@ -7,8 +7,8 @@
 //! window, so what the window system would do (the interactive resize, the
 //! minimize) is not run; what aterm decides is.
 
-use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, MouseButton};
+use aterm_window::dpi::PhysicalSize;
+use aterm_window::event::{ElementState, MouseButton};
 
 use crate::client_frame::{ClientFrame, FrameEdge};
 #[cfg(any(windows, target_os = "linux"))]

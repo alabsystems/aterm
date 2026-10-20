@@ -445,6 +445,27 @@ mod tests {
         assert_eq!((grow.restored_bottom, grow.appended), (1, 1));
     }
 
+    /// A blank band mid-screen that the first shrink leaves trailing below the
+    /// cursor is trimmed by the second, two rows at once: the undo keeps a
+    /// place for each, so the grow back puts every row where it was.
+    #[test]
+    fn a_blank_band_the_first_shrink_leaves_trailing_unwinds_through_its_trim() {
+        let mut grid = labelled(15, 10, 1, 0);
+        for r in [11, 12] {
+            grid.set_cursor(r, 0);
+            grid.erase_line();
+        }
+        grid.set_cursor(1, 2);
+        let before = picture(&grid);
+        grid.resize_no_reflow(12, 10);
+        grid.resize_no_reflow(9, 10);
+        assert_eq!(grid.take_last_resize_shape().trimmed, 2);
+        grid.resize_no_reflow(15, 10);
+        assert_eq!(picture(&grid), before);
+        assert_eq!(grid.resize_undo_rows(), 0);
+        grid.assert_invariants();
+    }
+
     /// Anything between the halves that could have shown or changed the smaller
     /// screen drops the undo: the grow appends and the screen stays shifted.
     #[test]

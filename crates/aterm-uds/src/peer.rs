@@ -212,4 +212,16 @@ mod tests {
         }
         let _ = a;
     }
+
+    /// A socket with no peer: the kernel refuses both questions, so neither answers, never
+    /// the untouched out-parameter (a uid of 0 is root's). Darwin: Linux answers an
+    /// unconnected socket's `SO_PEERCRED` with the overflow uid.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_socket_with_no_peer_names_nobody() {
+        let lone = std::os::unix::net::UnixDatagram::unbound().expect("socket");
+        let lone = crate::CtlStream::from(std::os::fd::OwnedFd::from(lone));
+        assert_eq!(super::peer_uid(&lone), None);
+        assert_eq!(super::peer_audit_token(&lone), None);
+    }
 }

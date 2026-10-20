@@ -31,8 +31,8 @@
 //! * A malformed PAX record is skipped, not fatal, and later records still apply (for
 //!   `size` alone the lookup stops at the first malformed record).
 //! * A `g` (PAX global) header is an ordinary entry, [`EntryType::Other`], refused
-//!   upstream; it never supplies a `path`, since honouring it would give a crafted archive
-//!   a name override `vet_entry` was never exercised against.
+//!   by default; it never supplies a `path`. An extractor may explicitly consume
+//!   strictly descriptive metadata with [`Entry::read_descriptive_global_pax`].
 //! * `L`/`K`/`x` are extension headers only with ustar or GNU magic; without either the
 //!   header is `Other` and refused, so a magic-less `L` cannot rename the next entry.
 //! * A second `L`, `K` or `x` before the same member is rejected: two answers to "what is
@@ -186,6 +186,12 @@ impl Header {
     #[must_use]
     pub fn entry_type(&self) -> EntryType {
         EntryType::from_byte(self.raw.get(field::TYPEFLAG).copied().unwrap_or(0))
+    }
+
+    /// A recognized PAX global header, still yielded as an ordinary `Other`
+    /// entry. It never changes the parser's name, size or link interpretation.
+    pub(crate) fn is_global_pax(&self) -> bool {
+        self.is_recognized() && self.raw.get(field::TYPEFLAG) == Some(&b'g')
     }
 
     /// The archive's recorded permission bits.
@@ -798,6 +804,40 @@ impl<R: Read> Entry<'_, '_, R> {
     /// Never, for the same reason as [`path`](Self::path).
     pub fn link_name(&self) -> io::Result<Option<std::borrow::Cow<'_, Path>>> {
         Ok(self.link_name.as_deref().map(std::borrow::Cow::Borrowed))
+    }
+
+    /// Consume bounded global metadata without applying it to later entries.
+    /// Unknown keys and records that can affect names, content layout or encoding
+    /// refuse the archive. The caller explicitly opts in; ordinary parsing and
+    /// the reference corpus continue to expose `g` as `Other`.
+    pub(crate) fn read_descriptive_global_pax(&mut self) -> io::Result<()> {
+        if !self.header.is_global_pax() {
+            return Err(bad("not a recognized global PAX header"));
+        }
+        if self.size > MAX_EXTENSION_BODY {
+            return Err(bad("global PAX body is implausibly large"));
+        }
+        let mut body = Vec::new();
+        self.read_to_end(&mut body)?;
+        if body.len() as u64 != self.size {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "tar: truncated global PAX body",
+            ));
+        }
+        for record in body.split_inclusive(|&byte| byte == b'\n') {
+            let line = record
+                .strip_suffix(b"\n")
+                .ok_or_else(|| bad("unterminated global PAX record"))?;
+            let (key, _) = pax_record(line).ok_or_else(|| bad("malformed global PAX record"))?;
+            if !matches!(
+                key,
+                b"comment" | b"uid" | b"gid" | b"uname" | b"gname" | b"mtime" | b"atime" | b"ctime"
+            ) {
+                return Err(bad("unsupported global PAX key"));
+            }
+        }
+        Ok(())
     }
 }
 

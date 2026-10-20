@@ -595,6 +595,24 @@ impl Log {
         if last > super::SEQ_LIMIT || a.next_seq > super::SEQ_LIMIT.saturating_add(1) {
             return Err(CarryError::Bound("a seq past the limit"));
         }
+        // A bus-class count cannot exceed the sequence head it counts.
+        // Read these bounds before a carried number enters a live Log:
+        // bus_copy uses ms + 1, and a prior-space cover uses its head too.
+        if ms_head.is_some_and(|head| head > last) {
+            return Err(CarryError::Bound("a mirror count past the sequence head"));
+        }
+        if let Some((_, snap_ms, prior)) = mirror {
+            if snap_ms > ms_head.unwrap_or(0) {
+                return Err(CarryError::Shape("a snapshot past the mirror head"));
+            }
+            if let Some(p) = prior
+                && (p.ms_head > super::SEQ_LIMIT
+                    || p.landed.seq > super::SEQ_LIMIT
+                    || p.landed.ms > p.ms_head)
+            {
+                return Err(CarryError::Bound("a prior mirror space past its domain"));
+            }
+        }
         if last >= a.next_seq {
             return Err(CarryError::Shape(
                 "a carry's head at or past the manifest's seq count",
@@ -1024,7 +1042,10 @@ impl Log {
                 },
             );
         }
+        // The session's own open is pinned as `session_bytes`, below, as
+        // `index_push` counts it: never its node's `open_bytes` too.
         if rec.op == Op::Open
+            && rec.node != Node::SESSION
             && let Some(info) = self.nodes.get_mut(&rec.node)
             && info.open
         {

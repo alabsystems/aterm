@@ -1902,9 +1902,9 @@ fn the_request_word_round_trips_and_an_unknown_word_asks_for_nothing() {
 /// this build does not know reads as no agent; an agent's program names it
 /// back, and a program that is no agent names none. agy, Muse Code and Gemini
 /// CLI read as themselves, by the program's own name (`agy`, `muse`,
-/// `gemini`); agy and Gemini CLI with no lane (nothing relaunches, upgrades
-/// or restarts them, no record keyed), Muse Code relaunched on exit alone,
-/// its records keyed `muse-<tab>`.
+/// `gemini`), Gemini CLI relaunched on exit alone, Muse Code and agy also
+/// upgraded live (their quiet flows), their records keyed `muse-<tab>`,
+/// `agy-<tab>` and `gemini-<tab>`.
 #[test]
 fn the_agent_word_round_trips_and_an_unknown_word_is_no_agent() {
     use super::super::lanes::{Lanes, lanes};
@@ -1914,24 +1914,46 @@ fn the_agent_word_round_trips_and_an_unknown_word_is_no_agent() {
         assert_eq!(Agent::of(agent.program()), Some(agent), "{agent:?}");
     }
     assert_eq!(Agent::parse("claude"), Some(Agent::Claude));
-    for (word, agent) in [("agy", Agent::Agy), ("gemini", Agent::Gemini)] {
-        assert_eq!(Agent::parse(word), Some(agent), "{word}");
-        assert_eq!(agent.word(), agent.program().name(), "{word}");
-        assert_eq!(lanes(agent.program()), Lanes::NONE, "{word}: no lane yet");
-        assert_eq!(agent.record_key("s-0"), None, "{word}: no record keyed");
-    }
     assert_eq!(Agent::parse("muse"), Some(Agent::Muse));
     assert_eq!(Agent::Muse.word(), Agent::Muse.program().name());
     assert_eq!(
         lanes(Agent::Muse.program()),
         Lanes {
             relaunch: true,
-            upgrade: false,
+            upgrade: true,
             restart_in_place: false,
         },
-        "muse: relaunch on exit alone"
+        "muse: relaunch on exit and the live upgrade's quiet flow"
     );
     assert_eq!(Agent::Muse.record_key("s-0").as_deref(), Some("muse-s-0"));
+    assert_eq!(Agent::parse("agy"), Some(Agent::Agy));
+    assert_eq!(Agent::Agy.word(), Agent::Agy.program().name());
+    assert_eq!(
+        lanes(Agent::Agy.program()),
+        Lanes {
+            relaunch: true,
+            upgrade: true,
+            restart_in_place: false,
+        },
+        "agy: relaunch on exit and the live upgrade's quiet flow"
+    );
+    let relaunch_alone = Lanes {
+        relaunch: true,
+        upgrade: false,
+        restart_in_place: false,
+    };
+    assert_eq!(Agent::Agy.record_key("s-0").as_deref(), Some("agy-s-0"));
+    assert_eq!(Agent::parse("gemini"), Some(Agent::Gemini));
+    assert_eq!(Agent::Gemini.word(), Agent::Gemini.program().name());
+    assert_eq!(
+        lanes(Agent::Gemini.program()),
+        relaunch_alone,
+        "gemini: relaunch on exit alone"
+    );
+    assert_eq!(
+        Agent::Gemini.record_key("s-0").as_deref(),
+        Some("gemini-s-0")
+    );
     for bad in [
         "opencode",
         "Codex",
@@ -2475,14 +2497,15 @@ fn a_local_commands_output_in_a_system_row_starts_no_task() {
 fn the_supervisors_own_turns_by_its_ledger_are_no_task() {
     let cfg = crate::supervise::SupervisorConfig::default();
     let ours: Vec<Typed> = [
-        cfg.continue_text.as_str(),
-        cfg.answer_text.as_str(),
-        "/compact",
+        (cfg.continue_text.as_str(), turn_end::RULE_CONTINUE),
+        (cfg.answer_text.as_str(), turn_end::RULE_ANSWER),
+        ("/compact", turn_end::RULE_COMPACT),
     ]
     .into_iter()
-    .map(|text| Typed {
+    .map(|(text, rule)| Typed {
         at_ms: 1_000,
         text: text.to_string(),
+        rule: rule.to_string(),
     })
     .collect();
     // Recorded as the loop typed it (its ledger's `ts` 1 000 ms).
@@ -2532,6 +2555,63 @@ fn notification_row() -> String {
         false,
         "<task-notification>\n<task-id>b3e5x3wn5</task-id>\n<status>completed</status>\n</task-notification>",
     )
+}
+
+/// A CONVERSATION ONLY A PEER DIRECTED HAS A TASK (ATERM-KI-1016-1, the done
+/// report's seventh item): Claude Code records a peer session's message
+/// `isMeta`, so [`TaskScan`] read it as no prompt, and a conversation whose
+/// only asks were a peer's read taskless to the upgrade, which restarted it
+/// afresh and left the conversation behind. Read by its origin's kind first,
+/// as [`FinishedScan`] reads it, it is someone's ask; so is a row of a kind
+/// this build does not know. NEGATIVE CONTROLS: Claude Code's own expansion
+/// (`isMeta`, a person's origin) and the harness's own lines are still no
+/// task, and a background task's notification is still read as one (in
+/// doubt the conversation is kept).
+#[test]
+fn a_conversation_only_a_peer_directed_has_a_task() {
+    let peer = asked_by_row(
+        "peer",
+        true,
+        "Another Claude session sent a message:\n<agent-message from=\"a6ab\">rebase onto main</agent-message>",
+    );
+    let unknown_meta = asked_by_row("brand-new-kind", true, "Run the benchmarks again.");
+    let ready = answer_row("claude-haiku-4-5-20251001");
+    let carry = prompt_row("[aterm harness] Upgraded: this session was restarted on 2.1.283.");
+    let expansion = asked_by_row("human", true, "Please analyze this codebase");
+    for (what, rows) in [
+        ("a peer's message, answered", vec![&peer, &ready]),
+        ("a peer's message, not answered yet", vec![&peer]),
+        (
+            "an unknown kind, recorded isMeta",
+            vec![&unknown_meta, &ready],
+        ),
+        (
+            "a peer's message after the harness's line",
+            vec![&carry, &ready, &peer, &ready],
+        ),
+    ] {
+        let jsonl = rows
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(transcript_tasked(&jsonl, &[]), "{what}");
+    }
+    for (what, rows) in [
+        ("an expansion of the person's", vec![&expansion, &ready]),
+        ("the harness's carry-on", vec![&carry, &ready]),
+    ] {
+        let jsonl = rows
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!transcript_tasked(&jsonl, &[]), "NEGATIVE CONTROL: {what}");
+    }
+    assert!(
+        transcript_tasked(&notification_row(), &[]),
+        "a notification is kept"
+    );
 }
 
 /// A main-chain user row of the session's own (no origin), `extra` fields
@@ -2588,6 +2668,14 @@ fn a_restarts_check_is_the_done_check_to_the_record() {
             "CONTROL: an idle report is the work going on"
         );
     }
+    let legacy_check = carry_on.replace(CARRY_ON, TOKEN_CHECK_FIXTURE);
+    assert!(
+        finished(&answered(
+            &legacy_check,
+            "The task is complete. All checks passed."
+        )),
+        "a restart's earlier completion check remains recognizable"
+    );
     let quoted = format!("Please read this: {}", turn_end::DONE_CHECK);
     assert!(
         !finished(&answered(&quoted, "All done.")),
@@ -2622,13 +2710,18 @@ fn a_walls_retry_delivers_the_check_it_cut_again_to_the_record() {
         aterm_phase::WallKind::Overloaded,
         aterm_phase::Program::Claude,
     );
-    let ours: Vec<Typed> = [retry.as_str(), "keep going", "/compact"]
-        .into_iter()
-        .map(|text| Typed {
-            at_ms: 1_000,
-            text: text.to_string(),
-        })
-        .collect();
+    let ours: Vec<Typed> = [
+        (retry.as_str(), turn_end::RULE_API_RETRY),
+        ("keep going", turn_end::RULE_CONTINUE),
+        ("/compact", turn_end::RULE_COMPACT),
+    ]
+    .into_iter()
+    .map(|(text, rule)| Typed {
+        at_ms: 1_000,
+        text: text.to_string(),
+        rule: rule.to_string(),
+    })
+    .collect();
     let wall = r#"{"isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: 529 Overloaded"}]},"isApiErrorMessage":true,"error":"unknown"}"#.to_string();
     let closed = r#"{"isSidechain":false,"type":"system","subtype":"turn_duration","durationMs":180000,"messageCount":4,"isMeta":false}"#.to_string();
     let retried = at(typed_row(&retry));
@@ -2764,6 +2857,210 @@ fn a_walls_retry_delivers_the_check_it_cut_again_to_the_record() {
         !s.finished() && s.said_done(),
         "CONTROL: an idle report answering the retried LAND"
     );
+}
+
+/// ONLY A WALL'S RETRY BY ITS LEDGER RULE DELIVERS AGAIN THE CHECK A WALL CUT
+/// (ATERM-KI-1016-1, the done report's tenth item): the usage resume types
+/// `keep going` (`usage-resume@v1`), and so does the continue policy
+/// (`continue@v1`). The record read the next plain line the loop typed after
+/// a wall in the check's turn as the retry whatever rule typed it, so a done
+/// reply in words to a plain `keep going` there finished the task, where the
+/// turn-end policy reads that reply as a first done report and asks the
+/// check once more (`TurnEndState::acted`: only `is_wall_retry` rules carry
+/// `cut_check`). Now the ledger row's rule decides: the same words under the
+/// usage resume's rule deliver the check again and finish the task; under
+/// `continue@v1` they do not, and the reply stays a done report. NEGATIVE
+/// CONTROL: the retry's own text under its rule still finishes it.
+#[test]
+fn only_a_walls_retry_by_its_ledger_rule_delivers_the_cut_check_again() {
+    let at = |row: String| row.replacen('{', r#"{"timestamp":"1970-01-01T00:00:01.000Z","#, 1);
+    let wall = r#"{"isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"You've hit your limit · resets 3pm"}]},"isApiErrorMessage":true,"error":"rate_limit"}"#.to_string();
+    let scan = |rule: &str| {
+        let ours = [Typed {
+            at_ms: 1_000,
+            text: "keep going".to_string(),
+            rule: rule.to_string(),
+        }];
+        let mut scan = FinishedScan::default();
+        scan.supervisor_typed(&ours);
+        for row in [
+            typed_row("Fix the lexer and land it."),
+            model_row("All done: the parser and the lexer are in."),
+            typed_row(turn_end::DONE_CHECK),
+            wall.clone(),
+            at(typed_row("keep going")),
+            model_row("All done. Nothing left to do."),
+        ] {
+            scan.line(&row);
+        }
+        scan
+    };
+    let resumed = scan(turn_end::RULE_LIMIT_RESUME);
+    assert!(
+        resumed.finished(),
+        "the usage resume delivers the check again"
+    );
+    let continued = scan(turn_end::RULE_CONTINUE);
+    assert!(
+        !continued.finished(),
+        "a plain continuation after the wall delivers no check"
+    );
+    assert!(continued.said_done(), "its done reply is a done report");
+    assert!(
+        !scan("").finished(),
+        "a ledger row that names no rule is no retry"
+    );
+    assert!(
+        scan(turn_end::RULE_API_RETRY).finished(),
+        "NEGATIVE CONTROL: a retry's rule"
+    );
+}
+
+/// THE VENDOR'S OWN CONTINUATION DELIVERS AGAIN THE CHECK A LIMIT CUT, TO
+/// THE RECORD TOO (ATERM-KI-1016-1, the Land item): the done check or
+/// Land's instruction typed, the usage limit's row in its turn, and Claude
+/// Code's own continuation at the reset (`origin.kind`
+/// `auto-continuation`): the reply under it is the cut act's answer, as the
+/// turn-end policy reads it (`TurnEndState::observe`), and the worker's own
+/// done word finishes the task. Read as a turn nobody asked, the check stood
+/// no more, the reply was a first done report, and a relaunch or the upgrade
+/// asked the check (under Land a nudge) once more. NEGATIVE CONTROLS: with no
+/// act before the limit, the continuation's done reply is a done report and
+/// nothing more; a wake of a background task after the limit is no
+/// continuation of it.
+#[test]
+fn the_vendors_own_continuation_delivers_the_cut_check_again_to_the_record() {
+    let wall = r#"{"isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"You've hit your limit · resets 3pm"}]},"isApiErrorMessage":true,"error":"rate_limit"}"#.to_string();
+    let auto = asked_by_row(
+        "auto-continuation",
+        true,
+        "Your claude.ai usage limit has reset. Continue the task you were working on when the \
+         limit was reached; do not repeat work that is already complete.",
+    );
+    let done = model_row("All done. Nothing left to do.");
+    let scan = |rows: &[String]| {
+        let mut scan = FinishedScan::default();
+        for row in [
+            typed_row("Fix the lexer and land it."),
+            model_row("All done: the parser and the lexer are in."),
+        ]
+        .iter()
+        .chain(rows)
+        {
+            scan.line(row);
+        }
+        scan
+    };
+    for (what, asked) in [
+        ("the check", typed_row(turn_end::DONE_CHECK)),
+        ("LAND", typed_row(&turn_end::land_text(None))),
+    ] {
+        let s = scan(&[asked, wall.clone(), auto.clone(), done.clone()]);
+        assert!(s.finished(), "{what}: the continuation delivers it again");
+    }
+    for (what, rows) in [
+        (
+            "nothing asked before the limit",
+            vec![wall.clone(), auto.clone(), done.clone()],
+        ),
+        (
+            "a background task's wake after the limit",
+            vec![
+                typed_row(turn_end::DONE_CHECK),
+                wall.clone(),
+                notification_row(),
+                done.clone(),
+            ],
+        ),
+    ] {
+        let s = scan(&rows);
+        assert!(!s.finished(), "CONTROL, {what}");
+        assert!(s.said_done(), "CONTROL, {what}: a done report");
+    }
+}
+
+/// LAND'S ANSWER TO A QUESTION IS LAND'S CHECK TO THE RECORD ONCE THE LAND
+/// INSTRUCTION WAS TYPED (ATERM-KI-1016-1, the Land item): the turn-end
+/// policy lands a done reply to its `land-answer@v1` once the instruction
+/// was typed (`TurnEndState::acted`: `landing`), and the record read that
+/// answer as the harness's own line, so the done reply was a first done
+/// report and a relaunch or the upgrade asked the check once more. By the
+/// ledger row's rule, and the instruction read before it, the answer is
+/// Land's: the worker's own done word finishes the task, and the closed
+/// answer speaks as at the check. NEGATIVE CONTROLS: no instruction before
+/// it (the policy lands nothing there either), a person's prompt between
+/// (their task), and the answer's words under another rule, are the
+/// harness's own line, the reply a done report; an idle report answering it
+/// finishes nothing.
+#[test]
+fn lands_answer_after_the_instruction_is_lands_check_to_the_record() {
+    let at = |row: String| row.replacen('{', r#"{"timestamp":"1970-01-01T00:00:01.000Z","#, 1);
+    let land = || typed_row(&turn_end::land_text(None));
+    let question = || model_row("Should I squash the two commits or keep them apart?");
+    let answer = || at(typed_row(turn_end::LAND_ANSWER));
+    let done = || model_row("Kept them apart and pushed. All done. Nothing left to do.");
+    let scan = |rows: &[String], rule: &str| {
+        let ours = [Typed {
+            at_ms: 1_000,
+            text: turn_end::LAND_ANSWER.to_string(),
+            rule: rule.to_string(),
+        }];
+        let mut scan = FinishedScan::default();
+        scan.supervisor_typed(&ours);
+        for row in [
+            typed_row("Fix the lexer and land it."),
+            model_row("Stage 1 of 3 is in."),
+        ]
+        .iter()
+        .chain(rows)
+        {
+            scan.line(row);
+        }
+        scan
+    };
+    let closed = r#"{"isSidechain":false,"type":"system","subtype":"turn_duration","durationMs":180000,"messageCount":4,"isMeta":false}"#.to_string();
+    let landed = scan(
+        &[land(), question(), answer(), done(), closed],
+        turn_end::RULE_LAND_ANSWER,
+    );
+    assert!(
+        landed.finished(),
+        "the answer after the instruction lands it"
+    );
+    assert_eq!(landed.check_answer(), Some(true), "its closed answer");
+    for (what, rows, rule) in [
+        (
+            "no instruction before it",
+            vec![question(), answer(), done()],
+            turn_end::RULE_LAND_ANSWER,
+        ),
+        (
+            "a person's prompt between",
+            vec![
+                land(),
+                typed_row("Also fix the docs."),
+                question(),
+                answer(),
+                done(),
+            ],
+            turn_end::RULE_LAND_ANSWER,
+        ),
+        (
+            "its words under another rule",
+            vec![land(), question(), answer(), done()],
+            turn_end::RULE_ANSWER,
+        ),
+    ] {
+        let s = scan(&rows, rule);
+        assert!(!s.finished(), "CONTROL, {what}");
+        assert!(s.said_done(), "CONTROL, {what}: a done report");
+    }
+    let idle = model_row("No lander is running, so I'm not re-arming that watch.");
+    let s = scan(
+        &[land(), question(), answer(), idle],
+        turn_end::RULE_LAND_ANSWER,
+    );
+    assert!(!s.finished(), "CONTROL: an idle report answering it");
 }
 
 /// The worker's report, ending its task with the token.
@@ -2940,6 +3237,340 @@ fn finished_holds_until_someone_asks() {
     assert!(!finished(&with(&[summary, reply("And the changelog.")])));
 }
 
+/// THE CHECK TYPED AGAIN AFTER A `/compact` IS THE CHECK TO THE RECORD
+/// (ATERM-KI-1016-1, done-3): where a full context cut the done check's turn,
+/// the turn-end policy types the check again as the compaction's
+/// continuation (`TurnEndState::compact_owes`), and the record reads that row
+/// by its words as the check, so its done answer finishes the task at the
+/// check, as the policy ends it — whatever the compaction's summary kept.
+/// NEGATIVE CONTROL: `keep going` after the compaction delivers no check, and
+/// the done reply to it is a first done report (the record never reads a
+/// check across the `/compact`).
+#[test]
+fn the_check_typed_again_after_a_compaction_is_the_check_to_the_record() {
+    let wall = r#"{"isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"Prompt is too long"}]},"isApiErrorMessage":true,"error":"invalid_request"}"#.to_string();
+    let compact = typed_row(
+        "<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>",
+    );
+    let summary = r#"{"type":"user","uuid":"s-1","isSidechain":false,"isCompactSummary":true,"message":{"role":"user","content":"This session is being continued."}}"#.to_string();
+    let done = model_row("All done: committed and pushed.");
+    let scan = |continuation: &str| {
+        let mut s = FinishedScan::default();
+        for row in [
+            typed_row("Fix the lexer and land it."),
+            model_row("All tasks are complete and verified; nothing is left to do."),
+            typed_row(turn_end::DONE_CHECK),
+            wall.clone(),
+            compact.clone(),
+            summary.clone(),
+            typed_row(continuation),
+            done.clone(),
+        ] {
+            s.line(&row);
+        }
+        s
+    };
+    let again = scan(turn_end::DONE_CHECK);
+    assert!(again.finished() && again.finished_at_check(), "{again:?}");
+    let going = scan("keep going");
+    assert!(!going.finished() && going.said_done(), "{going:?}");
+}
+
+/// THE DONE CHECK IS READ BY ITS WORDS, WHOEVER TYPED THEM (ATERM-KI-1016-1,
+/// done-2, the product's rule): a user row that opens with the check's words
+/// is the check to the record whether or not the session's ledger names it,
+/// so its done answer in the worker's words finishes the task at the check.
+/// The alternative, the ledger alone, misses a real check wherever the
+/// ledger has no row of it — a hand `/resume` tab whose ledger
+/// `conversation_typed` does not join, a row past `TYPED_WITHIN_MS` or cut
+/// at `KEEP_ROWS` (here: no ledger at all): its done answer would be a first
+/// done report under someone's prompt, the task read reopened, and a
+/// relaunch would type its carry-on into a finished task. Its one other
+/// case, a person who types the check word for word, gets what the check's
+/// words ask: a done answer ends the task, and nothing is typed after it (a
+/// person can always type). NEGATIVE CONTROL: a person's prompt that quotes
+/// the check after words of their own is theirs, and a done answer to it is
+/// a first done report, never a finish.
+#[test]
+fn the_done_check_is_read_by_its_words_whoever_typed_them() {
+    let ask = typed_row("Fix the lexer and land it.");
+    let report = model_row("All tasks are complete and verified; nothing is left to do.");
+    let scan = |rows: &[String]| {
+        let mut s = FinishedScan::default();
+        for row in rows {
+            s.line(row);
+        }
+        s
+    };
+    for check in [
+        turn_end::DONE_CHECK.to_string(),
+        turn_end::done_check_text(Some("never push to main"), true),
+    ] {
+        let s = scan(&[
+            ask.clone(),
+            report.clone(),
+            typed_row(&check),
+            report.clone(),
+        ]);
+        assert!(s.finished() && s.finished_at_check(), "no ledger: {check}");
+        assert!(!s.said_done(), "the check's answer: {check}");
+    }
+    // NEGATIVE CONTROL: the check quoted after a person's own words.
+    let quoted = format!("Is this wording right? {}", turn_end::DONE_CHECK);
+    let s = scan(&[ask, report.clone(), typed_row(&quoted), report]);
+    assert!(!s.finished() && s.said_done(), "{s:?}");
+}
+
+/// AN IDLE REPORT ALONE ANSWERING THE CHECK IN A SHORT TURN FINISHES THE TASK
+/// BY THE RECORD TOO (ATERM-KI-1016-1, done-1), as the turn-end policy ends
+/// it (`turn_end::check_answer_ends`): the check's turn's work by Claude
+/// Code's own measure — the `durationMs` of each `turn_duration` row that
+/// closes it, a wall's turn and its retry's summed — within
+/// `turn_end::MIN_WORK`, its answer only that nothing of the worker's runs: a
+/// finish at the check ([`FinishedScan::finished_at_check`]), its closed
+/// answer `Some(true)`. FAILS WITHOUT THE FIX: the record read it as the
+/// check's work going on, and a relaunch or a new loop carried on into a task
+/// the policy ended. The work is the vendor's, never the clock's (the
+/// review's DR-3): twenty seconds to a 529 and twenty after the retry typed
+/// ten minutes later are short, as the policy sums them; measured from the
+/// check's row to the end, the retry's wait read as work, and the record's
+/// `Some(false)` continued a task the screen's sum ends. A row that names no
+/// `durationMs` is measured from the row that asked the turn to it.
+/// NEGATIVE CONTROLS: the same answer closing a turn of real work, a check's
+/// turn a wall's retry split after real work, a turn whose rows name neither
+/// a duration nor a time, a land act's answer (Land's nudges are bounded),
+/// and an idle report outside the check finish nothing.
+#[test]
+fn an_idle_report_alone_answering_the_check_in_a_short_turn_finishes_it_by_the_record() {
+    let stamped = |row: String, secs: u64| {
+        let at = format!(
+            "1970-01-01T{:02}:{:02}:{:02}.000Z",
+            secs / 3600,
+            secs / 60 % 60,
+            secs % 60
+        );
+        row.replacen('{', &format!(r#"{{"timestamp":"{at}","#), 1)
+    };
+    let closed_after = |secs: u64, ms: u64| {
+        stamped(
+            format!(
+                r#"{{"isSidechain":false,"type":"system","subtype":"turn_duration","durationMs":{ms},"messageCount":4,"isMeta":false}}"#
+            ),
+            secs,
+        )
+    };
+    let closed = |secs: u64| closed_after(secs, 20_000);
+    let unmeasured = |secs: u64| {
+        stamped(
+            r#"{"isSidechain":false,"type":"system","subtype":"turn_duration","messageCount":4,"isMeta":false}"#.to_string(),
+            secs,
+        )
+    };
+    let idle = "Both branches have landed and no lander is running, so I'm leaving the watch off.";
+    let ask = typed_row("Fix the lexer and land it.");
+    let report = model_row(idle);
+    let check = stamped(typed_row(turn_end::DONE_CHECK), 100);
+    let scan = |rows: &[String], ours: &[Typed]| {
+        let mut s = FinishedScan::default();
+        s.supervisor_typed(ours);
+        for row in rows {
+            s.line(row);
+        }
+        s
+    };
+    let short = scan(
+        &[
+            ask.clone(),
+            report.clone(),
+            check.clone(),
+            report.clone(),
+            closed(120),
+        ],
+        &[],
+    );
+    assert!(short.finished() && short.finished_at_check(), "{short:?}");
+    assert_eq!(short.check_answer(), Some(true));
+    // …and not before the turn is closed: the record lags the screen.
+    let open = scan(
+        &[ask.clone(), report.clone(), check.clone(), report.clone()],
+        &[],
+    );
+    assert!(!open.finished());
+    assert_eq!(open.check_answer(), None);
+    // The vendor's measure, not the clock's: a turn the worker spent twenty
+    // seconds of work in, closed ten minutes after the check (a box it
+    // waited at), is short…
+    let paused = scan(
+        &[
+            ask.clone(),
+            report.clone(),
+            check.clone(),
+            report.clone(),
+            closed(700),
+        ],
+        &[],
+    );
+    assert!(paused.finished(), "{paused:?}");
+    // …and a row that names no duration is measured by the clock.
+    for (end, ends) in [(120, true), (100 + 121, false)] {
+        let s = scan(
+            &[
+                ask.clone(),
+                report.clone(),
+                check.clone(),
+                report.clone(),
+                unmeasured(end),
+            ],
+            &[],
+        );
+        assert_eq!(s.finished(), ends, "no durationMs, closed at {end}: {s:?}");
+    }
+    // NEGATIVE CONTROLS.
+    let long = scan(
+        &[
+            ask.clone(),
+            report.clone(),
+            check.clone(),
+            report.clone(),
+            closed_after(100 + 121, 121_000),
+        ],
+        &[],
+    );
+    assert!(!long.finished(), "a turn of real work");
+    assert_eq!(long.check_answer(), Some(false));
+    let unstamped = r#"{"isSidechain":false,"type":"system","subtype":"turn_duration","messageCount":4,"isMeta":false}"#.to_string();
+    let untimed = scan(
+        &[
+            ask.clone(),
+            report.clone(),
+            typed_row(turn_end::DONE_CHECK),
+            report.clone(),
+            unstamped,
+        ],
+        &[],
+    );
+    assert!(
+        !untimed.finished(),
+        "no duration and no times: no short turn"
+    );
+    let retry = turn_end::wall_retry_text(
+        turn_end::RULE_API_RETRY,
+        aterm_phase::WallKind::Overloaded,
+        aterm_phase::Program::Claude,
+    );
+    let ours = [Typed {
+        at_ms: 700_000,
+        text: retry.clone(),
+        rule: turn_end::RULE_API_RETRY.to_string(),
+    }];
+    let wall = r#"{"isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: 529 Overloaded"}]},"isApiErrorMessage":true,"error":"unknown"}"#.to_string();
+    let split = |before_wall: u64| {
+        scan(
+            &[
+                ask.clone(),
+                report.clone(),
+                check.clone(),
+                wall.clone(),
+                closed_after(120, before_wall),
+                stamped(typed_row(&retry), 700),
+                report.clone(),
+                closed(720),
+            ],
+            &ours,
+        )
+    };
+    // Twenty seconds to the wall and twenty after its retry: short in all,
+    // the retry's ten-minute wait no work (the review's DR-3).
+    let short_split = split(20_000);
+    assert!(
+        short_split.finished() && short_split.finished_at_check(),
+        "{short_split:?}"
+    );
+    // …and so are they where the rows name no duration: each measured from
+    // the row that asked it, the retry's from the retry's.
+    let unmeasured_split = scan(
+        &[
+            ask.clone(),
+            report.clone(),
+            check.clone(),
+            wall.clone(),
+            unmeasured(120),
+            stamped(typed_row(&retry), 700),
+            report.clone(),
+            unmeasured(720),
+        ],
+        &ours,
+    );
+    assert!(unmeasured_split.finished(), "{unmeasured_split:?}");
+    // NEGATIVE CONTROL: the idle line said before a wall cut the turn is no
+    // whole answer: the record finishes nothing at the wall's own close, only
+    // at the retry's answer.
+    let mut cut = FinishedScan::default();
+    cut.supervisor_typed(&ours);
+    for row in [
+        ask.clone(),
+        report.clone(),
+        check.clone(),
+        report.clone(),
+        wall.clone(),
+        closed_after(120, 20_000),
+    ] {
+        cut.line(&row);
+    }
+    assert!(!cut.finished(), "closed by a wall: {cut:?}");
+    for row in [stamped(typed_row(&retry), 700), report.clone(), closed(720)] {
+        cut.line(&row);
+    }
+    assert!(cut.finished() && cut.finished_at_check(), "{cut:?}");
+    // NEGATIVE CONTROL: five minutes of work to the wall, then the retry's
+    // twenty seconds: real work in all.
+    let long_split = split(300_000);
+    assert!(
+        !long_split.finished(),
+        "a check's turn a wall split: {long_split:?}"
+    );
+    assert_eq!(long_split.check_answer(), Some(false));
+    let land = scan(
+        &[
+            ask.clone(),
+            report.clone(),
+            stamped(typed_row(&turn_end::land_text(None)), 100),
+            report.clone(),
+            closed(120),
+        ],
+        &[],
+    );
+    assert!(
+        !land.finished() && land.said_done(),
+        "a land act's: {land:?}"
+    );
+    // NEGATIVE CONTROL: an idle line beside work it names to come or left is
+    // no idle report alone (the review's DR-1: each finished the task).
+    for reply in [
+        "OD-1 phase 1 has landed and no lander is running. OD-1 phase 2 is left; I'll start it now.",
+        "No lander is running. Remaining: OD-1 phase 2 (the parser rewrite) and the docs update.",
+        "No lander is running, so I'm not re-arming the watch. Starting OD-1 phase 2 now.",
+        "No lander is running. OD-1 phase 2 still needs doing.",
+        "Phase 1 landed and no lander is running. I'll do phase 2 next.",
+        "Phase 1 landed and no lander is running. Two tests still fail; fixing them now.",
+    ] {
+        let s = scan(
+            &[
+                ask.clone(),
+                report.clone(),
+                check.clone(),
+                model_row(reply),
+                closed(120),
+            ],
+            &[],
+        );
+        assert!(!s.finished(), "{reply}: {s:?}");
+        assert_eq!(s.check_answer(), Some(false), "{reply}");
+    }
+    let outside = scan(&[stamped(ask, 100), report, closed(120)], &[]);
+    assert!(!outside.finished() && outside.said_done(), "{outside:?}");
+}
+
 /// A FINISH BY THE DONE CHECK IS KEPT APART FROM THE TOKEN'S (F2 of the live
 /// lab of 2026-10-16, Claude Code 2.1.301): the record ends the task on a
 /// done reply in the worker's words to the check as it does on the token,
@@ -2996,23 +3627,27 @@ fn a_finish_by_the_done_check_is_kept_apart_from_the_tokens() {
     );
 }
 
-/// THE OPEN-ITEMS CHALLENGE TAKES THE TOKEN'S FINISH BACK, IN THE RECORD TOO
-/// (the merge review's MG7-A1). A report that ends with the token while its
-/// own words name open work gets the challenge (`turn_end::RULE_OPEN_ITEMS`),
-/// which the turn-end policy reads as the done check's kin; the record reads
-/// it so ([`Asked::Challenge`], by its opening words, whatever it names and
-/// whether or not the reversible clause rides it, and in the words main's
-/// first challenge used): its answer of work leaves the task open, a done
-/// reply in the worker's own word finishes it at the check, the token
-/// finishes it as the token's, and an idle report is the work going on.
-/// Unanswered, the report it followed stays the last words' done report, so
-/// a relaunch asks the check after it. FAILS WITHOUT THE FIX: read as the
-/// harness's own line (the ledger's), the challenge left the token's finish
-/// standing, so a loop that reads the record ended the challenged job on
-/// any answer, journalled as the worker's token. NEGATIVE CONTROLS: the
-/// loop's own `keep going` after the token, by its ledger, takes nothing
-/// back; a person's prompt that quotes the challenge after words of their
-/// own is theirs, and a done reply in words to it is a first done report.
+/// THE CHALLENGE IN THE RECORD ([`Asked::Challenge`]): a FINISHED whose own
+/// words name open work finishes nothing by the record (the owner's rule of
+/// 2026-10-19: the turn-end policy challenges such a report at every token,
+/// `turn_end::RULE_OPEN_ITEMS`), so a relaunch or the upgrade reads the job
+/// as going on; and the challenge, which the turn-end policy reads as the
+/// done check's kin, the record reads so too — by its opening words,
+/// whatever it names and whether or not the reversible clause rides it, and
+/// in the words main's first challenge used: its answer of work leaves the
+/// task open, a done reply in the worker's own word finishes it at the
+/// check, the token over a report with nothing left finishes it as the
+/// token's, the token over open work again finishes nothing, and an idle
+/// report is the work going on. Unanswered, the report it followed stays
+/// the last words' done report, so a relaunch asks the check after it. And
+/// a FINISHED with nothing left that a challenge follows has its finish
+/// taken back: read as the harness's own line (the ledger's), the challenge
+/// left the token's finish standing, so a loop that reads the record ended
+/// the job on any answer, journalled as the worker's token (the merge
+/// review's MG7-A1). NEGATIVE CONTROLS: the loop's own `keep going` after
+/// the token, by its ledger, takes nothing back; a person's prompt that
+/// quotes the challenge after words of their own is theirs, and a done
+/// reply in words to it is a first done report.
 #[test]
 fn the_open_items_challenge_takes_the_tokens_finish_back_in_the_record() {
     let open = model_row(
@@ -3021,17 +3656,21 @@ fn the_open_items_challenge_takes_the_tokens_finish_back_in_the_record() {
     );
     let at = |row: String| row.replacen('{', r#"{"timestamp":"1970-01-01T00:00:01.000Z","#, 1);
     let challenge = turn_end::open_items_text(&["still open"], None, false);
-    let ours: Vec<Typed> = [challenge.as_str(), "keep going"]
-        .into_iter()
-        .map(|text| Typed {
-            at_ms: 1_000,
-            text: text.to_string(),
-        })
-        .collect();
-    let scan = |rows: &[String]| {
+    let ours: Vec<Typed> = [
+        (challenge.as_str(), turn_end::RULE_OPEN_ITEMS),
+        ("keep going", turn_end::RULE_CONTINUE),
+    ]
+    .into_iter()
+    .map(|(text, rule)| Typed {
+        at_ms: 1_000,
+        text: text.to_string(),
+        rule: rule.to_string(),
+    })
+    .collect();
+    let scan_after = |report: &String, rows: &[String]| {
         let mut s = FinishedScan::default();
         s.supervisor_typed(&ours);
-        for row in [typed_row("Fix the parser and land it."), open.clone()]
+        for row in [typed_row("Fix the parser and land it."), report.clone()]
             .iter()
             .chain(rows)
         {
@@ -3039,19 +3678,47 @@ fn the_open_items_challenge_takes_the_tokens_finish_back_in_the_record() {
         }
         s
     };
-    assert!(scan(&[]).finished(), "the token finished the task");
+    let scan = |rows: &[String]| scan_after(&open, rows);
+    let s = scan(&[]);
+    assert!(
+        !s.finished() && s.said_done(),
+        "the token over open work finishes nothing"
+    );
+    let clean = model_row(FINISHED_REPORT);
+    assert!(scan_after(&clean, &[]).finished(), "the token finished it");
     let work = model_row("Ran the e2e suite: two tests fail. Investigating the timeout now.");
     let words = model_row("All done; nothing left to do.");
     let idle = model_row("No lander is running, so I'm not re-arming that watch.");
-    let earlier = challenge.replace("End your reply with", "Reply with");
+    let earlier = "Your report ends with ATERM-TASK-DONE but still names open work (still open). \
+                   Do each of those items you can still do yourself now, and verify it. End your \
+                   reply with ATERM-TASK-DONE on a line by itself only when every item left needs \
+                   a person (a credential, a decision, physical access) or cannot be done on this \
+                   host, each named with its blocker; a slow check is not a blocker.";
+    // The challenge as `69a8f68178` typed it (ordinary language, a blocked
+    // item exempt), until the owner's rule of 2026-10-19.
+    let ordinary = "Your report still names open work (still open). Do each of those items you \
+                    can still do yourself now, and verify it. Report whether the task is \
+                    complete, the outcome, verification, and any remaining blockers in ordinary \
+                    language.";
+    let dirty = crate::harness::repo_work::RepoWork {
+        repo: "/Users//a/Developer/parser".to_string(),
+        changed: 1,
+        paths: vec!["src/lexer.rs".to_string()],
+        ..Default::default()
+    };
     for asked in [
         challenge.clone(),
         turn_end::open_items_text(&["still open"], None, true),
-        earlier,
+        turn_end::uncommitted_text(&dirty, None, false),
+        earlier.to_string(),
+        earlier.replace("End your reply with", "Reply with"),
+        ordinary.to_string(),
     ] {
         let asked = at(typed_row(&asked));
         let s = scan(std::slice::from_ref(&asked));
         assert!(!s.finished() && s.said_done(), "unanswered: {asked}");
+        let s = scan_after(&clean, std::slice::from_ref(&asked));
+        assert!(!s.finished(), "the finish taken back: {asked}");
         let s = scan(&[asked.clone(), work.clone()]);
         assert!(!s.finished(), "work goes on: {asked}");
         let s = scan(&[asked.clone(), words.clone()]);
@@ -3061,11 +3728,13 @@ fn the_open_items_challenge_takes_the_tokens_finish_back_in_the_record() {
         );
         let s = scan(&[asked.clone(), model_row(FINISHED_REPORT)]);
         assert!(s.finished() && !s.finished_at_check(), "the token: {asked}");
+        let s = scan(&[asked.clone(), open.clone()]);
+        assert!(!s.finished(), "the token over open work again: {asked}");
         let s = scan(&[asked.clone(), idle.clone()]);
         assert!(!s.finished(), "an idle report is work going on: {asked}");
     }
     // NEGATIVE CONTROLS.
-    let s = scan(&[at(typed_row("keep going")), work.clone()]);
+    let s = scan_after(&clean, &[at(typed_row("keep going")), work.clone()]);
     assert!(s.finished(), "the loop's own line reopens nothing");
     let quoted = at(typed_row(&format!("Please read this: {challenge}")));
     let s = scan(&[quoted, words]);
@@ -3073,6 +3742,42 @@ fn the_open_items_challenge_takes_the_tokens_finish_back_in_the_record() {
         !s.finished() && s.said_done(),
         "a person's prompt: a first done report"
     );
+}
+
+/// The immediately preceding check wording is a transcript fixture only:
+/// current prompts ask agents for ordinary completion reports.
+const TOKEN_CHECK_FIXTURE: &str = "Before you stop: do every open item, skipped check, follow-up and \
+     next step you can still do yourself now, and verify it (build, test, measure where numbers \
+     were asked for, commit and land where this repository lands work). End your reply with \
+     ATERM-TASK-DONE on a line by itself only when everything left needs a person (a credential, \
+     a decision, physical access) or cannot be done on this host, each item named with its \
+     blocker; a slow check is not a blocker. Otherwise continue.";
+
+/// Old land instructions can remain in an existing conversation after an
+/// upgrade. Their ordinary completion replies still land the task.
+#[test]
+fn legacy_land_instructions_accept_ordinary_completion_reports() {
+    let instruction = "[aterm harness] Autopilot is set to Land: wrap up this work cleanly. \
+                       Finish only the step in hand and start nothing new. Make sure what is \
+                       done is verified, and leave it committed (and pushed, if that is how \
+                       this repository works). Then write a short summary of what is done \
+                       and what is left, and reply with ATERM-TASK-DONE on a line by itself.";
+    let nudge = "[aterm harness] Still landing: finish only what leaves the work clean, then \
+                 reply with ATERM-TASK-DONE on a line by itself.";
+    for prompt in [
+        instruction,
+        nudge,
+        turn_end::LAND_BEFORE,
+        turn_end::LAND_NUDGE_BEFORE,
+    ] {
+        let rows = [
+            typed_row("Fix the lexer and land it."),
+            model_row("The lexer is fixed; running its tests now."),
+            typed_row(prompt),
+            model_row("The task is complete. The tests passed and the fix is committed."),
+        ];
+        assert!(transcript_finished(&rows.join("\n"), &[]), "{prompt}");
+    }
 }
 
 /// THE RECORD READS THE CHECK'S ANSWER AS THE SCREEN DOES AT THE CHECK
@@ -3105,6 +3810,7 @@ fn the_records_done_check_ends_the_task_only_on_the_workers_own_word() {
         turn_end::DONE_CHECK,
         reversible.as_str(),
         rules.as_str(),
+        TOKEN_CHECK_FIXTURE,
         DONE_CHECK_TOKEN_BEFORE,
         DONE_CHECK_BEFORE,
     ];
@@ -3113,6 +3819,7 @@ fn the_records_done_check_ends_the_task_only_on_the_workers_own_word() {
         "ATERM-TASK-DONE\n\nThe suite passes on main.",
         "DONE",
         "I'm stopping here.",
+        "The task is complete. All checks passed and the fix is committed.",
     ];
     let goes_on = [
         "No lander is running, so I'm not re-arming that watch. All queued work has landed.",
@@ -3265,6 +3972,71 @@ fn a_turn_its_own_goal_keeps_going_takes_the_finish_back() {
         model_row("The land log shows nothing new."),
     ];
     assert!(finished(&rows), "a /loop wake under a new promptId");
+    // A `/loop`'s wake on a build that numbers no turn is a turn of its own
+    // by its `scheduledTaskId` (ATERM-KI-1016-1: the 2.1.252 and 2.1.267
+    // bundles stamp it on the wake's user row): its answer without the
+    // token leaves the finish standing. Read as part of the token's turn,
+    // it took the finish back.
+    let unnumbered_wake = bare_user_row(
+        r#","isMeta":true,"promptSource":"system","scheduledTaskId":"t1""#,
+        r#""keep going: check the land log""#,
+    );
+    let rows = [
+        typed_row("Make the compiler build itself."),
+        token.clone(),
+        unnumbered_wake,
+        model_row("The land log shows nothing new."),
+    ];
+    assert!(finished(&rows), "a /loop wake with no promptId");
+}
+
+/// A TURN CLAUDE CODE BEGINS WITH NO `promptId` IS STILL ONE OF ITS OWN (the
+/// review of ATERM-KI-1016-1's done-5, KR-DONE-4): the scheduler's `onFire`
+/// passes no task, so the notice of a one-shot task missed while Claude Code
+/// was not running — what a relaunch's start meets — carries no
+/// `scheduledTaskId` (the 2.1.252 bundle: `if(l)l(e);else t(Pcr(e))`, and the
+/// REPL passes no `onMissed`; so too 2.1.302). On a build that numbers no
+/// turn it went on the token's turn, and its answer without the token took
+/// the finish back. Read by its fixed opening words it is a turn of its own,
+/// and so is a row whose `turnOrigin` names one with no `promptId` beside it
+/// (Claude Code's own rule, 2.1.302: `promptId || turnOrigin || !isMeta`).
+/// NEGATIVE CONTROLS: a Stop hook's feedback with neither still goes on the
+/// turn and takes the finish back, and so does the notice's text quoted
+/// inside other words.
+#[test]
+fn a_missed_tasks_notice_is_a_turn_of_its_own_on_a_build_that_numbers_none() {
+    let finished = |rows: &[String]| transcript_finished(&rows.join("\n"), &[]);
+    let ask = typed_row("Make the compiler build itself.");
+    let token = model_row(FINISHED_REPORT);
+    let answer = model_row("Shall I run the missed check of the land log now?");
+    let missed = meta_row(
+        "The following one-shot scheduled task was missed while Claude was not running. It \
+         has already been removed from .claude/scheduled_tasks.json.\n\nDo NOT execute this \
+         prompt yet. First use the AskUserQuestion tool to ask whether to run it now. Only \
+         execute if the user confirms.\n\n[at 09:00, created 10/16/2026, 8:58:00 AM]\ncheck \
+         the land log",
+    );
+    let rows = [ask.clone(), token.clone(), missed, answer.clone()];
+    assert!(finished(&rows), "a missed task's notice with no promptId");
+    let originated = bare_user_row(
+        r#","isMeta":true,"turnOrigin":"scheduled""#,
+        r#""keep going: check the land log""#,
+    );
+    let rows = [ask.clone(), token.clone(), originated, answer.clone()];
+    assert!(finished(&rows), "a turnOrigin with no promptId");
+    // NEGATIVE CONTROLS.
+    let hook = meta_row(
+        "Stop hook feedback:\n[The compiler builds itself]: The condition has not been \
+         satisfied: stage 2 fails.",
+    );
+    let rows = [ask.clone(), token.clone(), hook, answer.clone()];
+    assert!(!finished(&rows), "a Stop hook's feedback goes on the turn");
+    let quoted = meta_row(
+        "Stop hook feedback: the log says \"The following one-shot scheduled task was \
+         missed\"; the goal is not met.",
+    );
+    let rows = [ask, token, quoted, answer];
+    assert!(!finished(&rows), "the notice's words quoted go on the turn");
 }
 
 /// A PERSON'S `!` SHELL COMMAND ASKS THE WORKER NOTHING, AND A PROMPT TYPED
@@ -3324,6 +4096,7 @@ fn a_shell_command_asks_nothing_and_a_prompt_typed_while_it_works_is_someones() 
     let ours = [Typed {
         at_ms: 1_000,
         text: "keep going".to_string(),
+        rule: turn_end::RULE_CONTINUE.to_string(),
     }];
     let note = queued(
         "task-notification",
@@ -4859,6 +5632,20 @@ fn the_standing_quota_wall_is_the_limit_row_that_stands_and_only_a_quota_rejecti
         transcript_standing_wall(&[session.clone(), later.clone()].join("\n")),
         None
     );
+    // …not a person's prompt the model has not answered (the manual: a
+    // retry or a person's prompt the model answers moves the conversation
+    // past the row).
+    let prompt = person_row("2026-09-27T19:50:00Z", "carry on with the parser");
+    assert_eq!(
+        transcript_standing_wall(&[session.clone(), prompt.clone()].join("\n")),
+        wall("five_hour", 1_790_532_000),
+        "a person's prompt alone"
+    );
+    assert_eq!(
+        transcript_standing_wall(&[session.clone(), prompt.clone(), later.clone()].join("\n")),
+        None,
+        "the person's prompt the model answered"
+    );
     // …and so does a `/login` that finished; a wall hit after either stands.
     let login = person_row(
         "2026-09-27T19:57:47Z",
@@ -5411,6 +6198,7 @@ fn the_newest_answer_is_the_last_response_row() {
 /// to a person never carries it; a person's own `--settings` — inline or a
 /// file — is carried verbatim, in its spelling. NEGATIVE CONTROL: a near
 /// miss of the tap (a key more, another refresh) is a person's, kept.
+#[cfg(unix)]
 #[test]
 fn the_rewrite_sheds_only_aterms_own_tap() {
     let ours = super::super::tap::settings_value(std::path::Path::new(
@@ -5452,12 +6240,304 @@ fn the_rewrite_sheds_only_aterms_own_tap() {
     );
 }
 
+/// THE TURN A CONVERSATION ENDS ON, BY THE PROMPT THAT OPENED IT TOO
+/// (ATERM-KI-1016-1): [`LastTurn`] names the turn by its last row's key and
+/// by its prompt's, and a left exchange's row keyed by the prompt
+/// ([`LastTurn::key`]) is named by every reading of that turn however much
+/// of its reply the tail holds — the prompt alone, a tool's call and its
+/// result, the whole reply, an idle compaction's summary after it, a Stop
+/// hook's feedback under the turn's own `promptId` and the work after it.
+/// So too A COMMAND OF THE PERSON'S THAT NO ANSWER FOLLOWED (the review's
+/// KR-P5-CMD): `/config` as Claude Code 2.1.294 records it (its caveat, the
+/// command row and its output, under a fresh `promptId`:
+/// `claude-2.1.294-transcript-local-commands.jsonl`) and a `!` shell
+/// command (`<bash-input>`, `<bash-stdout>`) ask the model nothing, as
+/// [`FinishedScan`] reads them: the exchange is still the conversation's
+/// last turn, by its prompt and by its answer, and by the command's key
+/// too (what a loop that leaves a turn the moment it ends ledgers, the
+/// command's answer maybe not on the record yet: [`LastTurn::key`]).
+/// NEGATIVE CONTROLS, the prompt no longer named: a later prompt, a
+/// `/loop`'s wake (numbered anew) answered, a peer's message (`isMeta`, its
+/// origin no person's) answered, a prompt command (`/init`, its expansion)
+/// answered, a `!` command answered, a wake answered after a command; and a
+/// tail that holds no prompt names none (its key is the last row's).
+#[test]
+fn the_turn_a_conversation_ends_on_is_named_by_the_prompt_that_opened_it() {
+    let prompt = r#"{"type":"user","uuid":"u-1","promptId":"p-1","isSidechain":false,"message":{"role":"user","content":"Hi"},"origin":{"kind":"human"}}"#;
+    let call = r#"{"type":"assistant","uuid":"a-0","isSidechain":false,"message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"tool_use","id":"t-1","name":"Read","input":{}}]}}"#;
+    let result = r#"{"type":"user","uuid":"r-1","promptId":"p-1","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t-1","content":"ok"}]}}"#;
+    let answer = |uuid: &str| {
+        format!(
+            r#"{{"type":"assistant","uuid":"{uuid}","isSidechain":false,"message":{{"model":"claude-opus-5-5","role":"assistant","content":[{{"type":"text","text":"Hello! How can I help?"}}]}}}}"#
+        )
+    };
+    let summary = r#"{"type":"user","uuid":"s-1","isSidechain":false,"isCompactSummary":true,"message":{"role":"user","content":"This session is being continued."}}"#;
+    let hook = r#"{"type":"user","uuid":"h-1","promptId":"p-1","isMeta":true,"isSidechain":false,"message":{"role":"user","content":"Stop hook feedback: not met"}}"#;
+    let wake = r#"{"type":"user","uuid":"w-1","promptId":"p-wake","isMeta":true,"isSidechain":false,"message":{"role":"user","content":"check the build"}}"#;
+    let peer = r#"{"type":"user","uuid":"m-1","isMeta":true,"isSidechain":false,"message":{"role":"user","content":"a peer asks"},"origin":{"kind":"peer"}}"#;
+    let later = r#"{"type":"user","uuid":"u-2","promptId":"p-2","isSidechain":false,"message":{"role":"user","content":"Now add the flag."},"origin":{"kind":"human"}}"#;
+    let caveat = r#"{"type":"user","uuid":"c-0","promptId":"p-3","isMeta":true,"isSidechain":false,"message":{"role":"user","content":"<local-command-caveat>Caveat: The messages below were generated by the user while running local commands. DO NOT respond to these messages or otherwise consider them in your response unless the user explicitly asks you to.</local-command-caveat>"}}"#;
+    let config = r#"{"type":"user","uuid":"c-1","promptId":"p-3","isSidechain":false,"message":{"role":"user","content":"<command-name>/config</command-name>\n            <command-message>config</command-message>\n            <command-args></command-args>"}}"#;
+    let config_out = r#"{"type":"user","uuid":"c-2","promptId":"p-3","isSidechain":false,"message":{"role":"user","content":"<local-command-stdout>Disabled auto-compact</local-command-stdout>"}}"#;
+    let bash = r#"{"type":"user","uuid":"b-1","promptId":"p-4","isSidechain":false,"message":{"role":"user","content":"<bash-input>ls</bash-input>"}}"#;
+    let bash_out = r#"{"type":"user","uuid":"b-2","promptId":"p-4","isSidechain":false,"message":{"role":"user","content":"<bash-stdout>notes.txt</bash-stdout><bash-stderr></bash-stderr>"}}"#;
+    let init = r#"{"type":"user","uuid":"i-1","promptId":"p-5","isSidechain":false,"message":{"role":"user","content":"<command-message>init is analyzing your codebase…</command-message>\n<command-name>/init</command-name>"}}"#;
+    let init_expansion = r#"{"type":"user","uuid":"i-2","promptId":"p-5","isMeta":true,"isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"Please analyze this codebase and create a CLAUDE.md file"}]}}"#;
+    let turn = |rows: &[&str]| LastTurn::of(&rows.join("\n"));
+    let a1 = answer("a-1");
+    let a2 = answer("a-2");
+    let whole = [prompt, call, result, a1.as_str()];
+    assert_eq!(turn(&whole).key().as_deref(), Some("prompt:u-1"));
+    assert_eq!(turn(&whole).last.as_deref(), Some("answer:a-1"));
+    for (what, rows) in [
+        ("the prompt alone", vec![prompt]),
+        ("a tool's call", vec![prompt, call, result]),
+        ("the whole reply", whole.to_vec()),
+        (
+            "an idle compaction after it",
+            vec![prompt, a1.as_str(), summary],
+        ),
+        (
+            "a Stop hook's feedback, the work after it",
+            vec![prompt, a1.as_str(), hook, a2.as_str()],
+        ),
+    ] {
+        let t = turn(&rows);
+        assert!(t.names("prompt:u-1"), "{what}: {t:?}");
+        assert_eq!(t.key().as_deref(), Some("prompt:u-1"), "{what}");
+    }
+    assert!(turn(&whole).names("answer:a-1"), "an earlier build's key");
+    // A command of the person's no answer followed.
+    for (what, rows, command) in [
+        (
+            "/config, as 2.1.294 records it",
+            vec![prompt, a1.as_str(), caveat, config, config_out],
+            "prompt:c-1",
+        ),
+        (
+            "a `!` shell command",
+            vec![prompt, a1.as_str(), bash, bash_out],
+            "prompt:b-1",
+        ),
+        (
+            "/config, then a `!` command",
+            vec![
+                prompt,
+                a1.as_str(),
+                caveat,
+                config,
+                config_out,
+                bash,
+                bash_out,
+            ],
+            "prompt:b-1",
+        ),
+    ] {
+        let t = turn(&rows);
+        assert!(t.names("prompt:u-1"), "{what}: {t:?}");
+        assert!(
+            t.names("answer:a-1"),
+            "{what}: an earlier build's key {t:?}"
+        );
+        assert!(t.names(command), "{what}: the command's key {t:?}");
+        assert_eq!(t.key().as_deref(), Some(command), "{what}");
+        assert_eq!(t.opened.as_deref(), Some("prompt:u-1"), "{what}");
+    }
+    assert!(
+        turn(&[
+            prompt,
+            a1.as_str(),
+            caveat,
+            config,
+            config_out,
+            bash,
+            bash_out
+        ])
+        .names("prompt:c-1"),
+        "every command since the answer"
+    );
+    // A command the model answers opens its turn.
+    for (what, rows, opened) in [
+        (
+            "a prompt command answered",
+            vec![prompt, a1.as_str(), init, init_expansion, a2.as_str()],
+            Some("prompt:i-1"),
+        ),
+        (
+            "a `!` command answered",
+            vec![prompt, a1.as_str(), bash, bash_out, a2.as_str()],
+            Some("prompt:b-1"),
+        ),
+        (
+            "a wake answered after a command",
+            vec![prompt, a1.as_str(), config, config_out, wake, a2.as_str()],
+            None,
+        ),
+    ] {
+        let t = turn(&rows);
+        assert!(!t.names("prompt:u-1"), "{what}: {t:?}");
+        assert!(!t.names("answer:a-1"), "{what}: {t:?}");
+        assert!(!t.names("prompt:c-1"), "{what}: {t:?}");
+        assert_eq!(t.opened.as_deref(), opened, "{what}");
+    }
+    // NEGATIVE CONTROLS.
+    for (what, rows) in [
+        ("a later prompt", vec![prompt, a1.as_str(), later]),
+        (
+            "a wake answered",
+            vec![prompt, a1.as_str(), wake, a2.as_str()],
+        ),
+        (
+            "a peer's message answered",
+            vec![prompt, a1.as_str(), peer, a2.as_str()],
+        ),
+    ] {
+        let t = turn(&rows);
+        assert!(!t.names("prompt:u-1"), "{what}: {t:?}");
+        assert!(!t.names("answer:a-1"), "{what}: {t:?}");
+    }
+    // The same no-promptId wakes FinishedScan recognizes also open their own exchange.
+    for wake in [
+        r#"{"type":"user","uuid":"w-2","isMeta":true,"scheduledTaskId":"t1","message":{"content":"check the build"}}"#,
+        r#"{"type":"user","uuid":"w-3","isMeta":true,"turnOrigin":"scheduled","message":{"content":"check the build"}}"#,
+        r#"{"type":"user","uuid":"w-4","isMeta":true,"message":{"content":"The following one-shot scheduled task was missed while Claude was not running."}}"#,
+    ] {
+        let t = turn(&[prompt, a1.as_str(), wake, a2.as_str()]);
+        assert!(
+            !t.names("prompt:u-1") && !t.names("answer:a-1"),
+            "UNNUMBERED_WAKE_MUST_END_OLD_EXCHANGE: {t:?}"
+        );
+        assert_eq!(t.opened, None);
+        assert_eq!(t.last.as_deref(), Some("answer:a-2"));
+    }
+    let unopened = turn(&[call, result, a1.as_str()]);
+    assert_eq!(unopened.opened, None);
+    assert_eq!(unopened.key().as_deref(), Some("answer:a-1"));
+    assert_eq!(turn(&[]), LastTurn::default());
+}
+
+/// A PERSON'S EXCHANGE AT A WALL, ITS RETRY TYPED, NAMES THE RETRY'S TURN
+/// (ATERM-KI-1016-1, [`crate::supervise::approvals::LEFT_RETRIED`]): the
+/// person's prompt met a 529, the loop typed the retry, and the retry's
+/// short answer ended (its `turn_duration`): the row names that turn, the
+/// work before the wall counted with the retry's. NEGATIVE CONTROLS: the
+/// retry's turn not ended yet (a crash mid-answer), its work and the work
+/// before the wall past the exchange's bound, a prompt of someone's after
+/// it, and a retry in other words.
+#[test]
+fn a_persons_exchange_retried_at_a_wall_names_the_retrys_turn() {
+    use crate::supervise::approvals::{left_at_wall_key, left_retried_key};
+    let retry = "Claude Code reported an overloaded API (529). Carry on.";
+    let prompt = r#"{"type":"user","uuid":"u-1","promptId":"p-1","isSidechain":false,"message":{"role":"user","content":"Hi"},"origin":{"kind":"human"}}"#.to_string();
+    let error = r#"{"type":"assistant","uuid":"e-1","isSidechain":false,"isApiErrorMessage":true,"message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"API Error: 529"}]}}"#.to_string();
+    let ended = |ms: u64| {
+        format!(
+            r#"{{"type":"system","subtype":"turn_duration","durationMs":{ms},"isSidechain":false}}"#
+        )
+    };
+    let typed = |uuid: &str, text: &str| {
+        format!(
+            r#"{{"type":"user","uuid":"{uuid}","promptId":"p-{uuid}","isSidechain":false,"message":{{"role":"user","content":"{text}"}}}}"#
+        )
+    };
+    let answer = r#"{"type":"assistant","uuid":"a-1","isSidechain":false,"message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"Hello! How can I help?"}]}}"#.to_string();
+    let wall = left_at_wall_key("prompt:u-1", std::time::Duration::from_secs(120));
+    let key = left_retried_key(&wall, retry);
+    let turn = |rows: &[String]| LastTurn::of(&rows.join("\n"));
+    let base = vec![prompt, error, ended(1_800), typed("r-1", retry), answer];
+    let with = |more: &[String]| base.iter().chain(more).cloned().collect::<Vec<_>>();
+    assert!(
+        turn(&with(&[ended(20_000)])).names(&key),
+        "the retry's short answer"
+    );
+    // NEGATIVE CONTROLS.
+    assert!(!turn(&base).names(&key), "not ended yet");
+    assert!(
+        !turn(&with(&[ended(9 * 60 * 1000)])).names(&key),
+        "past the bound with the work before the wall"
+    );
+    assert!(
+        !turn(&with(&[ended(20_000), typed("u-2", "Now add the flag.")])).names(&key),
+        "a prompt since"
+    );
+    assert!(
+        !turn(&with(&[ended(20_000)])).names(&left_retried_key(&wall, "keep going")),
+        "a retry in other words"
+    );
+}
+
+/// AN OLDER BUILD'S NOTE OF A PERSON'S EXCHANGE LEFT NAMES THE TURN NO
+/// PROMPT OPENED SINCE (ATERM-KI-1016-1, done-5,
+/// [`crate::supervise::approvals::LEFT_BEFORE`]): that build journals the
+/// exchange left at a time and names no turn; the conversation's last turn,
+/// opened by a prompt recorded at or before the note, is the one it left —
+/// and still is with a person's `/config` after it that nothing answered.
+/// NEGATIVE CONTROLS: a prompt recorded after the note, a prompt command
+/// answered after it (`/init`: its answer opens a turn at the command), a
+/// `/loop`'s wake answered (a turn no prompt opened), and a prompt row that
+/// names no time.
+#[test]
+fn an_older_builds_note_of_a_left_exchange_names_the_turn_no_prompt_opened_since() {
+    use crate::supervise::approvals::left_before_key;
+    let at = |s: u64| format!("1970-01-01T00:00:{s:02}.000Z");
+    let prompt = |stamp: Option<u64>| {
+        let t = stamp.map_or_else(String::new, |s| format!(r#","timestamp":"{}""#, at(s)));
+        format!(
+            r#"{{"type":"user","uuid":"u-1","promptId":"p-1"{t},"isSidechain":false,"message":{{"role":"user","content":"Hi"}},"origin":{{"kind":"human"}}}}"#
+        )
+    };
+    let answer = |uuid: &str| {
+        format!(
+            r#"{{"type":"assistant","uuid":"{uuid}","isSidechain":false,"message":{{"model":"claude-opus-5-5","role":"assistant","content":[{{"type":"text","text":"Hello! How can I help?"}}]}}}}"#
+        )
+    };
+    let config = format!(
+        r#"{{"type":"user","uuid":"c-1","promptId":"p-3","timestamp":"{}","isSidechain":false,"message":{{"role":"user","content":"<command-name>/config</command-name>\n            <command-message>config</command-message>\n            <command-args></command-args>"}}}}"#,
+        at(30)
+    );
+    let init = format!(
+        r#"{{"type":"user","uuid":"i-1","promptId":"p-5","timestamp":"{}","isSidechain":false,"message":{{"role":"user","content":"<command-message>init is analyzing your codebase…</command-message>\n<command-name>/init</command-name>"}}}}"#,
+        at(30)
+    );
+    let wake = format!(
+        r#"{{"type":"user","uuid":"w-1","promptId":"p-wake","timestamp":"{}","isMeta":true,"isSidechain":false,"message":{{"role":"user","content":"check the build"}}}}"#,
+        at(30)
+    );
+    let turn = |rows: &[String]| LastTurn::of(&rows.join("\n"));
+    let noted = left_before_key(20_000);
+    let exchange = vec![prompt(Some(10)), answer("a-1")];
+    let with = |more: &[String]| exchange.iter().chain(more).cloned().collect::<Vec<_>>();
+    assert!(turn(&exchange).names(&noted), "the exchange it left");
+    assert!(
+        turn(&with(&[config])).names(&noted),
+        "a /config after it, unanswered"
+    );
+    // NEGATIVE CONTROLS.
+    assert!(
+        !turn(&exchange).names(&left_before_key(5_000)),
+        "a prompt recorded after the note"
+    );
+    assert!(
+        !turn(&with(&[init, answer("a-2")])).names(&noted),
+        "/init answered since"
+    );
+    assert!(
+        !turn(&with(&[wake, answer("a-3")])).names(&noted),
+        "a wake answered since"
+    );
+    assert!(
+        !turn(&[prompt(None), answer("a-1")]).names(&noted),
+        "a prompt with no time"
+    );
+}
+
 /// THE TURN A CONVERSATION ENDS ON, BY ITS KEY (the review's RR3-TE-2):
 /// its model's last answer (`answer:<uuid>`), or a prompt after it
 /// (`prompt:<uuid>`) — what a person's own exchange left to them is
 /// ledgered under and matched by. Read past what asks and answers nothing:
 /// a tool's result, Claude Code's expansions, a subagent's rows, an API
-/// error's synthetic row, a system row. NEGATIVE CONTROLS: a prompt after
+/// error's synthetic row, a system row, a local command and its output, a
+/// `!` shell command (the review's KR-P5-CMD). NEGATIVE CONTROLS: a prompt after
 /// the answer names the prompt, a new answer names itself, and an answer
 /// with no `uuid`, or no row at all, names none.
 #[test]
@@ -5503,6 +6583,24 @@ fn the_turn_a_conversation_ends_on_is_named_by_its_last_answer_or_prompt() {
         (
             "a system row",
             r#"{"type":"system","uuid":"s-1","subtype":"turn_duration"}"#.to_string(),
+        ),
+        (
+            "a local command",
+            user(
+                "u-5",
+                r#""<command-name>/config</command-name>\n<command-message>config</command-message>""#,
+            ),
+        ),
+        (
+            "a local command's output",
+            user(
+                "u-6",
+                r#""<local-command-stdout>Disabled auto-compact</local-command-stdout>""#,
+            ),
+        ),
+        (
+            "a `!` shell command",
+            user("u-7", r#""<bash-input>ls</bash-input>""#),
         ),
     ] {
         assert_eq!(key(&past(&[row])).as_deref(), Some("answer:a-1"), "{what}");

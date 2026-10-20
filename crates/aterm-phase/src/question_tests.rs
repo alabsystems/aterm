@@ -2156,6 +2156,10 @@ const REFLOW_39_2_1_300: &str =
     include_str!("fixtures/claude-2.1.300-question-multi-reflow-39col.txt");
 const REFLOW_47_2_1_300: &str =
     include_str!("fixtures/claude-2.1.300-question-multi-reflow-47col.txt");
+/// At 57 columns `Submit` is drawn over the text's last row and the residue
+/// of that row is glued to it, one word: `❯    Submitked.)`.
+const REFLOW_57_2_1_300: &str =
+    include_str!("fixtures/claude-2.1.300-question-multi-reflow-57col.txt");
 
 /// `text` in rows `width` cells wide as 2.1.300 draws a multi-select's
 /// unfocused free-text row (Ink's `wrap-ansi` with `trim: false`, MEASURED
@@ -2400,4 +2404,172 @@ fn a_ticked_free_text_row_drawn_without_a_space_is_read_whole() {
          by policy. The user was not asked.)"
     );
     assert_eq!(d.focus(), QuestionFocus::Button);
+}
+
+/// ATERM-KI-1015-1's F2 residual: only a person's keys put the focus on a
+/// dialog's `Chat about this` row (the loop never moves it there), and a
+/// tail cut AT that row is the dialog with its head off the screen, focused
+/// or not: the walk up from the footer finds no divider over the chat row,
+/// so it is the fallback ([`QShape::fallback`]) or the footer alone, both
+/// with the head off. So the supervisor reads the grid whole
+/// (`tail_misses_the_live_rows`), where the dialog reads whole with the
+/// focus on its chat row, and the policy moves the focus off it
+/// (`run_question_text_tests.rs`, the tail cut at the focused chat row).
+/// Every multi-select frame the cut tests above cut, and the 2.1.283
+/// single-select (`4. Chat about this`).
+#[test]
+fn a_cut_at_the_chat_row_a_person_focused_is_the_dialog_with_its_head_off() {
+    let mut frames: Vec<(String, &str)> = vec![
+        (
+            "typed 41x60".to_string(),
+            QUESTION_MULTI_TYPED_41X60_2_1_302,
+        ),
+        (
+            "2.1.283 typed".to_string(),
+            QUESTION_283_MULTISELECT_TYPED_LONG_TERM,
+        ),
+        (
+            "2.1.283 Submit".to_string(),
+            QUESTION_283_MULTISELECT_TYPED_BUTTON,
+        ),
+        (
+            "2.1.283 pristine".to_string(),
+            QUESTION_283_MULTISELECT_FREE_TEXT_FOCUSED,
+        ),
+        ("2.1.283 single".to_string(), QUESTION_283_FREE_TEXT_FOCUSED),
+    ];
+    for (cols, capture) in QUESTION_MULTI_PRISTINE_2_1_302 {
+        frames.push((format!("pristine at {cols}"), capture));
+    }
+    for (cols, capture) in QUESTION_MULTI_REFLOW_LONG_KEPT_2_1_302 {
+        frames.push((format!("Submit at {cols}"), capture));
+    }
+    let mut misread: Vec<String> = Vec::new();
+    for (what, capture) in frames {
+        let r = screen(capture);
+        let chat = r
+            .iter()
+            .position(|x| {
+                x.trim_start_matches('❯')
+                    .trim_end()
+                    .ends_with(". Chat about this")
+            })
+            .unwrap_or_else(|| panic!("{what}: the chat row"));
+        // The person's `↓`s: the focus moved from wherever it was onto the
+        // chat row.
+        let focused: Vec<String> = r
+            .iter()
+            .enumerate()
+            .map(|(i, x)| {
+                let x = x
+                    .strip_prefix('❯')
+                    .map_or_else(|| x.clone(), |rest| format!(" {rest}"));
+                if i == chat {
+                    format!("❯{}", &x[1..])
+                } else {
+                    x
+                }
+            })
+            .collect();
+        let whole = parse_prompt_v2(&focused).unwrap_or_else(|| panic!("{what}: no box"));
+        let d = whole.question_dialog.expect("the dialog");
+        assert!(
+            !whole.head_off_screen
+                && d.focus() == QuestionFocus::Chat
+                && matches!(
+                    d.form,
+                    QuestionForm::Single { .. } | QuestionForm::Multi { .. }
+                ),
+            "{what}: PRECONDITION: read whole, the focus on the chat row: {:?}",
+            d.form
+        );
+        for (grid, focus) in [(&r, "elsewhere"), (&focused, "on it")] {
+            let t = grid[chat..].to_vec();
+            let at = format!("{what}, cut at {:?}, the focus {focus}", grid[chat]);
+            let p = parse_prompt_v2(&t).unwrap_or_else(|| panic!("{at}: no box"));
+            assert_eq!(p.kind, PromptKind::Question, "{at}");
+            assert_eq!(worker_phase(&t), Phase::Prompt, "{at}");
+            let form = p.question_dialog.expect("the dialog").form;
+            if !p.head_off_screen || !matches!(form, QuestionForm::Unknown { .. }) {
+                misread.push(format!(
+                    "{at}: head_off_screen={} {form:?}",
+                    p.head_off_screen
+                ));
+            }
+        }
+    }
+    assert!(
+        misread.is_empty(),
+        "read with the head on the screen: {misread:#?}"
+    );
+}
+
+/// ATERM-KI-1016-1 (Questions): `Submit` drawn over the text's last row
+/// leaves the rest of that row on the button row. Where the rest has a
+/// space (`❯    Submit asked.)`, 39 columns) the row is no button and the
+/// dialog is not read whole; where it has none (`❯    Submitked.)`, 57
+/// columns: the row ended `… not` / `asked.)` from column 9) the row was
+/// read as a button labelled `Submitked.)`, the dialog read whole, and the
+/// text one row short. The loop then said it "did not write" a text it had
+/// typed. A button's label is a word of letters (`Submit`, `Next`): a row
+/// with any other mark on it is the text's residue under the button, and
+/// the dialog is not read whole — the measured frame, and every frame of
+/// the 2.1.302 reflow sweeps whose button row is `Submit` glued to a
+/// residue. NEGATIVE CONTROL: every sweep frame whose button row is
+/// `❯    Submit` alone still reads whole.
+#[test]
+fn a_button_row_a_residue_is_glued_to_is_never_read_whole() {
+    let (r, p, d) = read(REFLOW_57_2_1_300);
+    assert!(
+        r.iter().any(|x| x == "❯    Submitked.)"),
+        "PRECONDITION: the residue"
+    );
+    assert_eq!(p.kind, PromptKind::Question);
+    assert!(
+        matches!(d.form, QuestionForm::Unknown { .. }),
+        "57 columns: {:?}",
+        d.form
+    );
+    assert_eq!(worker_phase(&r), Phase::Prompt);
+    let template = QUESTION_MULTI_REFLOW_LONG_KEPT_2_1_302[1].1;
+    let (mut glued, mut clean) = (0, 0);
+    let mut misread: Vec<String> = Vec::new();
+    for sweep in [
+        QUESTION_MULTI_REFLOW_LONG_SWEEP_2_1_302,
+        QUESTION_MULTI_REFLOW_LONG_WIDE_2_1_302,
+        QUESTION_MULTI_REFLOW_SHORT_SWEEP_2_1_302,
+        QUESTION_MULTI_REFLOW_SHORT_WIDE_2_1_302,
+    ] {
+        for (cols, frame) in reflow_frames(sweep) {
+            if cols < 33 {
+                continue;
+            }
+            let button = &frame[frame.len() - 2];
+            let Some(rest) = button.strip_prefix("❯    Submit") else {
+                continue;
+            };
+            let r = reflow_dialog(template, &frame, cols);
+            let p = parse_prompt_v2(&r).unwrap_or_else(|| panic!("{cols}: no box"));
+            assert_eq!(p.kind, PromptKind::Question, "{cols}");
+            assert_eq!(worker_phase(&r), Phase::Prompt, "{cols}");
+            let form = p.question_dialog.expect("the dialog").form;
+            let whole = !matches!(form, QuestionForm::Unknown { .. });
+            if rest.is_empty() {
+                clean += 1;
+                if !whole {
+                    misread.push(format!("{cols}: `Submit` alone, not read whole"));
+                }
+            } else if !rest.contains(' ') {
+                glued += 1;
+                if whole {
+                    misread.push(format!("{cols}: {button:?} read whole"));
+                }
+            }
+        }
+    }
+    assert!(
+        glued > 0 && clean > 0,
+        "PRECONDITION: both kinds of frame ({glued} glued, {clean} clean)"
+    );
+    assert!(misread.is_empty(), "{misread:#?}");
 }

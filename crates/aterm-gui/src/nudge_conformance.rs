@@ -114,8 +114,15 @@ impl Rig {
         if debt {
             // The predecessor's engine owed a row: what `spawn_session` seeds
             // from the handoff record (R08), and books the ledger's first look.
-            crate::spawn::seed_adopted_render_debt(&session.term, &session.ctx.timeline, (-1, 0));
-            assert_eq!(crate::term_lock(&session.term).render_debt(), (-1, 0));
+            crate::spawn::seed_adopted_render_debt(
+                &session.term,
+                &session.ctx.timeline,
+                aterm_core::terminal::RenderDebt::of_rows(-1, 0),
+            );
+            assert_eq!(
+                crate::term_lock(&session.term).render_debt(),
+                aterm_core::terminal::RenderDebt::of_rows(-1, 0)
+            );
         }
         Self {
             app,
@@ -235,7 +242,9 @@ impl Rig {
     }
 
     fn debt(&self) -> (i32, i32) {
-        crate::term_lock(&self.app.pool.get(0).unwrap().term).render_debt()
+        crate::term_lock(&self.app.pool.get(0).unwrap().term)
+            .render_debt()
+            .rows()
     }
 
     fn pty(&self) -> Option<(u16, u16)> {

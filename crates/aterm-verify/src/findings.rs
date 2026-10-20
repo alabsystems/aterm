@@ -23,9 +23,27 @@ pub const MESSAGE_LINES: usize = 12;
 /// Each rerun line is prefixed with the variables the child ran under
 /// ([`rerun_env`]). A log that cannot account for every failure (a crashed
 /// binary, a torn log, a ceiling kill) is one finding for the whole row: a list
-/// that silently misses a failure is worse than no list.
+/// that silently misses a failure is worse than no list. A test that refused
+/// the machine beside one that failed for the tree is no finding
+/// ([`split_test_findings`]).
 #[must_use]
 pub fn test_findings(label: &str, output: &str, env: &[(OsString, OsString)]) -> Vec<Finding> {
+    split_test_findings(label, output, env).0
+}
+
+/// [`test_findings`], and the names of the failed tests it leaves out: those
+/// that carry [`crate::libtest::COULD_NOT_RUN_SENTINEL`] (a host with no fish,
+/// no node) beside at least one that failed for the tree. They decided
+/// nothing, so they are no finding, and the caller records them as COULD NOT
+/// RUN. Only a log that accounts for every failure is split, and one whose
+/// every failure refused the machine leaves nothing out (that child is
+/// [`crate::exec::Run::environment_failure`]'s; here it fails closed).
+#[must_use]
+pub fn split_test_findings(
+    label: &str,
+    output: &str,
+    env: &[(OsString, OsString)],
+) -> (Vec<Finding>, Vec<String>) {
     let plain = strip(output);
     let tests = if plain.contains(CEILING_KILL) {
         None
@@ -33,8 +51,13 @@ pub fn test_findings(label: &str, output: &str, env: &[(OsString, OsString)]) ->
         crate::libtest::failed_tests(&plain)
     };
     let Some(tests) = tests else {
-        return vec![row_finding(label, output)];
+        return (vec![row_finding(label, output)], Vec::new());
     };
+    let mixed = tests.iter().any(|t| t.refused) && tests.iter().any(|t| !t.refused);
+    let (refused, tests): (Vec<_>, Vec<_>) = tests.into_iter().partition(|t| mixed && t.refused);
+    let mut refused: Vec<String> = refused.into_iter().map(|t| t.name).collect();
+    refused.sort_unstable();
+    refused.dedup();
     let prefix: String = env
         .iter()
         .map(|(k, v)| {
@@ -45,7 +68,7 @@ pub fn test_findings(label: &str, output: &str, env: &[(OsString, OsString)]) ->
             )
         })
         .collect();
-    tests
+    let found = tests
         .into_iter()
         .map(|t| Finding {
             id: one_line(&format!("{} -- {}", t.spec, t.name)),
@@ -56,7 +79,8 @@ pub fn test_findings(label: &str, output: &str, env: &[(OsString, OsString)]) ->
             )),
             message: test_message(&t.block),
         })
-        .collect()
+        .collect();
+    (found, refused)
 }
 
 /// The variables a rerun of a test child's failures must set: the child's own
@@ -300,6 +324,23 @@ mod tests {
                 "assertion failed"
             ]
         );
+    }
+
+    /// A refusal beside a failure is left out of the findings and named; a log
+    /// whose every failure is a refusal leaves nothing out (fails closed).
+    #[test]
+    fn a_refusal_beside_a_failure_is_no_finding() {
+        let sentinel = crate::libtest::COULD_NOT_RUN_SENTINEL;
+        let refused = failed_log("fish::live", &format!("{sentinel} — no fish on this host"));
+        let real = failed_log("tar::ustar_is_pinned", "assertion failed");
+        let (found, left) = split_test_findings("t", &format!("{refused}{real}"), &[]);
+        let ids: Vec<&str> = found.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, ["-p atpkg --test x -- tar::ustar_is_pinned"]);
+        assert_eq!(left, ["fish::live"]);
+        // NEGATIVE CONTROL: the refusal alone is a finding here.
+        let (found, left) = split_test_findings("t", &refused, &[]);
+        assert_eq!(found.len(), 1);
+        assert!(left.is_empty());
     }
 
     #[test]

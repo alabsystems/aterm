@@ -228,6 +228,8 @@ impl Terminal {
         // chords at its prompt.
         let main_parked = m.alternate_screen
             && (k.main_saved_flags.is_some_and(|f| f.bits() != 0) || k.main_sp > 0);
+        // Behind a console host the xterm modifier family is not offered, as kitty is not.
+        let xk = super::keyboard_mode::offered_xterm_keyboard(m, self.xterm_keyboard);
         let bit = |on: bool, b: u16| if on { b } else { 0 };
         bit(m.alternate_screen, evidence::ALT_SCREEN)
             | bit(m.vt52_mode, evidence::VT52)
@@ -249,13 +251,10 @@ impl Terminal {
                 evidence::KITTY,
             )
             | bit(
-                self.xterm_keyboard.modify_other_keys().unwrap_or(0) != 0,
+                xk.modify_other_keys().unwrap_or(0) != 0,
                 evidence::MODIFY_OTHER_KEYS,
             )
-            | bit(
-                self.xterm_keyboard.format_other_keys() != 0,
-                evidence::FORMAT_OTHER_KEYS,
-            )
+            | bit(xk.format_other_keys() != 0, evidence::FORMAT_OTHER_KEYS)
     }
 
     /// The evidence bits whose setter was parsed since the last call, clearing
@@ -294,7 +293,8 @@ impl Terminal {
     /// its target ([`TerminalModes::new`](aterm_types::TerminalModes::new), the
     /// host-configured DECAWM/1004/2004/1007, and `XtermKeyboardState::new`):
     ///
-    /// 0. `CAN` if the parser is mid-sequence, even with the gate closed.
+    /// 0. `CAN` if the parser is mid-sequence, even with the gate closed,
+    ///    then `ESC \` if a tmux passthrough wrapper is open.
     /// 1. `ESC <` to leave VT52 (before any CSI, which VT52 would not parse).
     /// 2. `CSI ? 2026 l`.
     /// 3. On the alt screen: `CSI < 8 u` (clears the alt kitty stack; depth is
@@ -367,7 +367,15 @@ impl Terminal {
         let mut bytes: Vec<u8> = Vec::new();
         let mut reverted: Vec<&'static str> = Vec::new();
         if !self.parser_is_ground() {
+            // The CAN ends the torn sequence, inside an open tmux passthrough
+            // wrapper too (where it is payload, and a pending ESC is the
+            // payload's), so the `ESC \` after it ends only the wrapper: the
+            // wrapper's end would end a torn string as at its ST, and the next
+            // holder's own ESCs would otherwise still be read through it.
             bytes.push(0x18);
+            if self.parser.tmux_passthrough().is_open() {
+                bytes.extend_from_slice(b"\x1b\\");
+            }
             reverted.push("parser");
         }
         if owned {
@@ -448,6 +456,7 @@ impl Terminal {
         let cfg = self.configured_modes;
         let k = self.kitty_keyboard.snapshot();
         let kitty = m.kitty_keyboard_enabled;
+        let xk = super::keyboard_mode::offered_xterm_keyboard(&m, self.xterm_keyboard);
         let mut put = |on: bool, seq: &str, name: &'static str| {
             if on {
                 bytes.extend_from_slice(seq.as_bytes());
@@ -506,16 +515,8 @@ impl Terminal {
             set_reset(self.host_alternate_scroll, "\x1b[?1007h", "\x1b[?1007l"),
             "alternate-scroll",
         );
-        put(
-            self.xterm_keyboard.modify_other_keys() != Some(0),
-            "\x1b[>4m",
-            "mok",
-        );
-        put(
-            self.xterm_keyboard.format_other_keys() != 0,
-            "\x1b[>4f",
-            "fok",
-        );
+        put(xk.modify_other_keys() != Some(0), "\x1b[>4m", "mok");
+        put(xk.format_other_keys() != 0, "\x1b[>4f", "fok");
         put(m.application_cursor_keys, "\x1b[?1l", "cursor-keys");
         put(m.application_keypad, "\x1b>", "keypad");
         put(m.backarrow_sends_bs, "\x1b[?67l", "backarrow");

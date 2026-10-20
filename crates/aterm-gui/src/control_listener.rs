@@ -117,7 +117,8 @@ struct ListenerHealth {
     /// `accept` errors other than `EWOULDBLOCK`/`EINTR`.
     accept_errors: AtomicU64,
     /// Peers answered `ERR control server busy; retry` at admission: every
-    /// request lane taken by work, or the open-connection cap reached.
+    /// request lane taken by work, or the open-connection cap reached with no
+    /// parked connection to give way (the parker's turn-aways counted too).
     busy_replies: AtomicU64,
 }
 
@@ -290,9 +291,11 @@ struct Watch {
 
 #[cfg(unix)]
 impl Watch {
+    /// The judgement at the production pace, the one the listener runs: the
+    /// pure tests below hold it to [`WEDGE_AFTER`]'s three seconds.
     #[cfg(test)]
     fn new(now: Instant) -> Self {
-        Self::paced(now, WEDGE_AFTER)
+        Self::paced(now, Pace::PRODUCTION.wedge_after)
     }
 
     fn paced(now: Instant, wedge_after: Duration) -> Self {
@@ -1481,7 +1484,7 @@ mod tests {
     /// rebind, and serve a NEW client on the fresh socket at the SAME path.
     /// The healthy pre-wedge answer is the negative control: the same client
     /// code is served before the wedge. At a test's pace (a 50 ms tick, a
-    /// 300 ms wedge): the stuck thread below keeps the production one.
+    /// 300 ms wedge).
     #[test]
     fn a_stalled_listener_is_detected_and_rebound() {
         let dir = scratch();
@@ -1531,15 +1534,21 @@ mod tests {
     /// THE INCIDENT'S THREAD: stuck INSIDE its accept step, never returning,
     /// while connections queue. Nothing on the accept thread can notice this —
     /// which is why the judge is a different thread that reads only the beat.
-    /// The watchdog must rebind within a few seconds and a NEW client must be
-    /// served at the same path while the old thread is still stuck. Released
-    /// afterwards, the retired thread serves what its old socket queued (and
-    /// the client it holds is not lost) and exits.
+    /// The watchdog must rebind and a NEW client must be served at the same
+    /// path while the old thread is still stuck. Released afterwards, the
+    /// retired thread serves what its old socket queued (and the client it
+    /// holds is not lost) and exits. At a test's pace (a 100 ms tick, a 1 s
+    /// wedge — long enough that a starved healthy thread is not judged stuck
+    /// before the park).
     #[test]
     fn a_listener_stuck_inside_accept_is_detected_and_rebound() {
         let dir = scratch();
         let path = dir.path().join("p.sock");
-        let (stop, seams, thread) = supervised(&path, Pace::PRODUCTION);
+        let pace = Pace {
+            tick: Duration::from_millis(100),
+            wedge_after: Duration::from_secs(1),
+        };
+        let (stop, seams, thread) = supervised(&path, pace);
         let rebinds_before = HEALTH.rebinds.load(Ordering::Relaxed);
         assert_eq!(
             ask(&path, aterm_spec::wait::MUST_HAPPEN).expect("healthy ask"),
@@ -1596,7 +1605,9 @@ mod tests {
     #[test]
     fn the_watch_judges_stuck_stalled_and_healthy() {
         let t0 = Instant::now();
-        let at = |s: u64| t0 + Duration::from_secs(s);
+        // Tick `s` of the production pace (one a second), so the judgement
+        // below is the one the listener runs.
+        let at = |s: u64| t0 + Pace::PRODUCTION.tick * u32::try_from(s).expect("a few ticks");
 
         // Healthy: progress moves every tick, the queue drains.
         let mut watch = Watch::new(t0);

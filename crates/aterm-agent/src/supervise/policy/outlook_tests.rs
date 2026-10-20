@@ -11,7 +11,8 @@ fn cfg() -> SupervisorConfig {
 }
 
 /// A bucket with no reset asks a person, one with a reset does not; a lost
-/// login is a person's; a switched-off key is nobody's.
+/// login is the supervisor's to carry (a person's where API errors are left
+/// to the owner); a switched-off key is nobody's.
 #[test]
 fn every_wall_kind_has_an_outlook() {
     let c = cfg();
@@ -39,8 +40,17 @@ fn every_wall_kind_has_an_outlook() {
     );
     assert_eq!(
         outlook(WallKind::Auth, false, false, &c, true),
-        Outlook::Person(ExceptionKind::Login)
+        Outlook::Carries(ExceptionKind::Login)
     );
+    let mut off = cfg();
+    off.retry_api_errors = false;
+    assert_eq!(
+        outlook(WallKind::Auth, false, false, &off, true),
+        Outlook::Person(ExceptionKind::Login),
+        "a login left to the owner"
+    );
+    assert_eq!(answer(WallKind::Auth, false, &c, true), Answer::Resumes);
+    assert_eq!(answer(WallKind::Auth, false, &off, true), Answer::Nobody);
     assert_eq!(
         outlook(WallKind::Overloaded, false, false, &c, true),
         Outlook::Resumes
@@ -138,8 +148,9 @@ fn a_wall_is_answered_by_the_harness_or_by_nobody() {
         answer(WallKind::Spend, false, &on, true),
         Answer::ResumesAsks("add credits")
     );
-    // Nobody: a lost login, the memory banner, the owner's switches off.
-    assert_eq!(answer(WallKind::Auth, false, &on, true), Answer::Nobody);
+    // A lost login is the loop's to carry (its notice asks the owner's step).
+    assert_eq!(answer(WallKind::Auth, false, &on, true), Answer::Resumes);
+    // Nobody: the memory banner, the owner's switches off.
     assert_eq!(answer(WallKind::Memory, false, &on, true), Answer::Nobody);
     let off = SupervisorConfig {
         resume_limits: false,
@@ -155,4 +166,41 @@ fn a_wall_is_answered_by_the_harness_or_by_nobody() {
         assert_eq!(answer(kind, true, &off, true), Answer::Nobody, "{kind:?}");
     }
     assert_eq!(answer(WallKind::Spend, true, &off, true), Answer::Nobody);
+    assert_eq!(answer(WallKind::Auth, false, &off, true), Answer::Nobody);
+}
+
+/// A session usage credits carry, the key off (the default): it waits for
+/// the subscription's reset where the window they carry past is named, and
+/// is a person's where none is. NEGATIVE CONTROLS: the key on carries it as
+/// work going on, and an unsupervised session is nobody's; neither says a
+/// word on a surface.
+#[test]
+fn a_session_on_usage_credits_waits_for_the_subscriptions_reset() {
+    let off = cfg();
+    let on = SupervisorConfig {
+        usage_credits: true,
+        ..cfg()
+    };
+    assert_eq!(
+        credits_outlook(true, &off, true),
+        CreditsOutlook::WaitsForReset
+    );
+    assert_eq!(credits_outlook(false, &off, true), CreditsOutlook::Person);
+    assert!(CreditsOutlook::WaitsForReset.phrase().is_some());
+    assert_ne!(
+        CreditsOutlook::WaitsForReset.phrase(),
+        CreditsOutlook::Person.phrase()
+    );
+    for has_reset in [true, false] {
+        assert_eq!(
+            credits_outlook(has_reset, &on, true),
+            CreditsOutlook::Carried
+        );
+        assert_eq!(
+            credits_outlook(has_reset, &off, false),
+            CreditsOutlook::Unattended
+        );
+    }
+    assert_eq!(CreditsOutlook::Carried.phrase(), None);
+    assert_eq!(CreditsOutlook::Unattended.phrase(), None);
 }

@@ -29,8 +29,9 @@
 //!   stdout closed hands its first `open` that number (off Darwin std's rule stands). This
 //!   process's end of a pipe never sits on 0..=2, where it would pass for an inherited slot.
 //! * Signals: `SIGPIPE` back to its default, the others as this process has them (both as
-//!   std); the signal mask starts empty, where std copies the spawning thread's, which in the
-//!   window blocks `SIGUSR1` (aterm-gui's snapshot thread).
+//!   std), and `SIGHUP` back to its default for a child started stopped
+//!   ([`Command::start_suspended`]); the signal mask starts empty, where std copies the
+//!   spawning thread's, which in the window blocks `SIGUSR1` (aterm-gui's snapshot thread).
 //! * Process group and session: [`Command::process_group`] and [`Command::setsid`], spawn
 //!   attributes on Darwin; with both, the session wins and the child leads its own group.
 //! * Responsibility, which std has no word for: [`Command::disclaim_responsibility`] starts the
@@ -38,6 +39,9 @@
 //!   TCC and syspolicyd questions about the child's code identity instead of this process's
 //!   responsible app. Fail-closed: off Darwin, where the SPI is missing, and beside `exec` it is
 //!   `Unsupported` and nothing is started.
+//! * A child started stopped at its exec ([`Command::start_suspended`], Darwin's spawn flag),
+//!   for [`Child::resume`] to run; std has no word for it either. Off Darwin and beside `exec`
+//!   it is `Unsupported` and nothing is started.
 //! * No `pre_exec`: code between a fork and an exec is what this type exists to avoid. A
 //!   spawn that needs it (a PTY child's `setrlimit` and controlling terminal, a descriptor
 //!   handed over above stdio) builds a `std::process::Command` with
@@ -221,6 +225,8 @@ pub struct Command {
     /// ([`Self::disclaim_responsibility`]): always [`DISCLAIM_SPI`] but in a
     /// test that names one no image exports.
     disclaim: Option<&'static CStr>,
+    /// Start the child stopped at its exec ([`Self::start_suspended`]).
+    suspended: bool,
 }
 
 /// The stdio a spawn gives a slot the caller left unset.
@@ -247,6 +253,7 @@ impl Command {
             pgroup: None,
             setsid: false,
             disclaim: None,
+            suspended: false,
         }
     }
 
@@ -373,6 +380,32 @@ impl Command {
     /// asks for nothing.
     pub fn disclaim_responsibility(&mut self, disclaim: bool) -> &mut Self {
         self.disclaim = disclaim.then_some(DISCLAIM_SPI);
+        self
+    }
+
+    /// Start the child STOPPED AT ITS EXEC (`true`): `spawn` returns once the kernel has
+    /// exec'd the program — its image mapped and its code signature checked — and not one
+    /// instruction of the program, nor of the dynamic loader before it, runs until
+    /// [`Child::resume`]. What the system does at a binary's first exec, syspolicyd's
+    /// assessment included, goes on while it is stopped (measured on the 96 MB `aterm`: the
+    /// spawn returned in 9.7 ms; resumed at once it exited 898 ms later, resumed after
+    /// 1.2 s stopped 18 ms later). One killed before its resume never runs; one dropped
+    /// neither resumed nor killed stays stopped until its holder exits
+    /// ([`crate::deadline::Held`] kills it on drop).
+    ///
+    /// ITS HOLDER'S DEATH KILLS IT UNRUN, in a process group of its own
+    /// ([`Self::process_group`]`(0)`): the kernel sends a stopped group orphaned by its
+    /// holder's exit `SIGHUP` then `SIGCONT`, and the child starts with `SIGHUP` at its
+    /// default whatever this process has it as, so the hangup ends it before it runs (an
+    /// inherited `SIG_IGN` would let the `SIGCONT` run it).
+    ///
+    /// Darwin's `POSIX_SPAWN_START_SUSPENDED`. FAIL-CLOSED like
+    /// [`Self::disclaim_responsibility`]: off Darwin (where no spawn can stop a child after
+    /// its exec) and beside [`Self::exec`] the spawn answers `Unsupported` and starts
+    /// nothing; it never starts the child running instead. `false` (the default) asks for
+    /// nothing.
+    pub fn start_suspended(&mut self, suspended: bool) -> &mut Self {
+        self.suspended = suspended;
         self
     }
 
@@ -569,6 +602,15 @@ impl Child {
         self.handle.kill()
     }
 
+    /// Run a child started stopped ([`Command::start_suspended`]): `SIGCONT`, which a
+    /// running child carries on through. Never once it is reaped, as [`Self::kill`].
+    ///
+    /// # Errors
+    /// `kill`'s.
+    pub fn resume(&mut self) -> io::Result<()> {
+        self.handle.resume()
+    }
+
     /// Close the child's stdin, then wait for it to exit and reap it (once).
     ///
     /// # Errors
@@ -759,6 +801,14 @@ impl Command {
                 "an exec cannot disclaim responsibility: spawn the disclaimed child instead",
             ));
         }
+        // An exec started stopped would stop THIS process, replaced, with nobody holding it
+        // to resume: refused before anything is built.
+        if replace && self.suspended {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "an exec cannot start suspended: spawn the child instead",
+            ));
+        }
         let mut image = Image::build(&self.program, &self.args, &self.env.capture())?;
         if let Some(arg0) = &self.arg0 {
             image.argv[0] = c_string(arg0.as_bytes())?;
@@ -859,6 +909,7 @@ impl Command {
                 long_entry_ends: !self.env.saw_path(),
                 inherit_all: false,
                 disclaim: self.disclaim,
+                suspended: self.suspended,
             },
         )?;
         drop(handed);
@@ -890,6 +941,19 @@ impl Handle {
             Ok(())
         } else {
             self.child.kill()
+        }
+    }
+
+    fn resume(&mut self) -> io::Result<()> {
+        if self.status.is_some() {
+            return Ok(());
+        }
+        let pid = i32::try_from(self.id()).map_err(io::Error::other)?;
+        // SAFETY: two integers; the pid is our own unreaped child.
+        if unsafe { super::kill(pid, super::SIGCONT) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
 
@@ -976,7 +1040,11 @@ impl Command {
                 command.stderr(std::process::Stdio::piped());
             }
         }
-        let mut child = command.spawn()?;
+        let mut child = super::past_text_busy(
+            super::TEXT_BUSY_FOR,
+            || command.spawn(),
+            super::text_busy_pause,
+        )?;
         Ok(Child {
             stdin: child.stdin.take(),
             stdout: child.stdout.take(),
@@ -1002,6 +1070,14 @@ impl Command {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "disclaiming responsibility is Darwin's: no child is started without it",
+            ));
+        }
+        // A fork can stop its child before the exec, never after it: nothing here gives what
+        // the flag promises, so nothing is started.
+        if self.suspended {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "starting a child stopped at its exec is Darwin's: no child is started",
             ));
         }
         #[expect(

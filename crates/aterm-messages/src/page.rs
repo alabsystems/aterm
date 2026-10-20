@@ -101,7 +101,7 @@ pub const COPY: &str = "Copy";
 pub const COPY_ALL: &str = "Copy All";
 
 /// [`COPY_ALL`]'s spoken name: what it copies.
-pub const COPY_ALL_NAME: &str = "Copy the shown messages";
+pub const COPY_ALL_NAME: &str = "Copy All shown messages";
 
 /// The caption over an expanded entry's technical lines
 /// ([`MessageView::sentence_and_technical`]).
@@ -248,7 +248,8 @@ pub struct MessagesState {
     pub revision: u64,
     /// The wall clock at the build, for the relative times.
     pub now_unix_ms: u64,
-    /// Every record in the ring, newest first; at most `LOG_CAP`.
+    /// Every record in the ring, newest first, but one a later row tells
+    /// the story of on (it stands for it); at most `LOG_CAP`.
     pub entries: Vec<MessageView>,
     /// `(tag, count)` for every tag present, in [`tags::ALL`] then first-seen
     /// order: the page's filter chips.
@@ -291,7 +292,8 @@ impl MessagesState {
         self.entries.iter().find(|e| e.id == id)
     }
 
-    /// The projection, built once from the ring: every record newest first,
+    /// The projection, built once from the ring: every record newest first
+    /// (one a later row replaced is that row's past, not a row of its own),
     /// the live rows in their current words, the band row each is on (echoes
     /// counted), and whether each authored intent can still be pressed
     /// ([`MessageView::of`]). Tag counts in the chips' order: [`tags::ALL`]
@@ -315,6 +317,13 @@ impl MessagesState {
         let mut to_look_at = Vec::new();
         let mut counts: Vec<(String, usize)> = Vec::new();
         for rec in log.records().rev() {
+            // ONE FACT, ONE ROW: a record a later row tells the story of on
+            // (a keyed post in new words, a notice moved to its next state, an
+            // exception taking over a row) is that row's past, not a row of its
+            // own; the `messages` verb still prints it, `superseded`.
+            if told_on(log, rec) {
+                continue;
+            }
             let live = center.live(rec.id);
             let on_glass = glass
                 .iter()
@@ -864,6 +873,14 @@ pub(crate) fn cut_off_mark(glyph: Glyph, severity: Severity, state: &str) -> Gly
     } else {
         glyph
     }
+}
+
+/// Whether `rec` was replaced by a LATER record the ring still holds
+/// ([`Retired::Superseded`]): the row that tells its story on stands for it on
+/// the page. A replacement the ring no longer holds, or one that would point
+/// back (no chain can loop), leaves the record its own row, `replaced`.
+fn told_on(log: &crate::log::MessageLog, rec: &LogRecord) -> bool {
+    matches!(rec.retired(), Some(Retired::Superseded { by }) if *by > rec.id && log.get(*by).is_some())
 }
 
 /// Whether `intent` is a word for a tab whose upgrade this host does not have

@@ -92,6 +92,7 @@ pub(crate) enum Lane {
     CrashRestore,
     Resize,
     Zstd,
+    Effects,
     Wasm,
     Start,
     Compare,
@@ -114,7 +115,7 @@ pub(crate) enum Kind {
 }
 
 impl Lane {
-    pub(crate) const ALL: [Lane; 15] = [
+    pub(crate) const ALL: [Lane; 16] = [
         Lane::Throughput,
         Lane::Pathological,
         Lane::ScrollScrub,
@@ -123,6 +124,7 @@ impl Lane {
         Lane::CrashRestore,
         Lane::Resize,
         Lane::Zstd,
+        Lane::Effects,
         Lane::Wasm,
         Lane::Start,
         Lane::Compare,
@@ -142,6 +144,7 @@ impl Lane {
             Lane::CrashRestore => "crash-restore",
             Lane::Resize => "resize",
             Lane::Zstd => "zstd",
+            Lane::Effects => "effects",
             Lane::Wasm => "wasm",
             Lane::Start => "start",
             Lane::Compare => "compare",
@@ -162,6 +165,7 @@ impl Lane {
             | Lane::CrashRestore
             | Lane::Resize
             | Lane::Zstd
+            | Lane::Effects
             | Lane::Wasm => Kind::Floor,
             Lane::Start | Lane::Compare | Lane::Cat | Lane::Scroll | Lane::Vte => Kind::Arena,
             Lane::Fabric => Kind::Measured,
@@ -189,6 +193,10 @@ impl Lane {
             Lane::Zstd => {
                 "aterm-zstd decode MB/s over recorded zstd CLI frames (atpkg's installer)"
             }
+            Lane::Effects => {
+                "harness card, cursor glow and inline-scroll frames: emission, CPU raster, GPU \
+                 encode and GPU time, and the pass-economy ablation"
+            }
             Lane::Wasm => "the shipped wasm modules under node, plus the module-size ceiling",
             Lane::Start => "fresh-process real-window startup timing of one aterm",
             Lane::Compare => "paired ABBA startup A/B of two aterm binaries",
@@ -213,6 +221,10 @@ impl Lane {
             | Lane::CrashRestore
             | Lane::Resize
             | Lane::Zstd => "targo (release build of aterm-bench)",
+            Lane::Effects => {
+                "targo (release build of aterm-bench with dev-seams), a GPU (its GPU keys need \
+                 Metal, or wgpu with timestamp queries)"
+            }
             Lane::Wasm => "node, rustup stable + wasm32-unknown-unknown, wasm-opt",
             Lane::Start => "macOS, a built aterm (--binary)",
             Lane::Compare => "macOS, two built aterm binaries (--baseline, --candidate)",
@@ -220,7 +232,7 @@ impl Lane {
             Lane::Vte => "macOS on the M4-class bench box (or --dev-smoke), curl, git",
             Lane::Scroll => "macOS on the M4-class bench box (or --dev-smoke)",
             Lane::Fabric => {
-                "unix, targo (builds aterm and its fabric_bench test: dev, or opt-test with \
+                "unix, targo (builds aterm and its fabric_bench bench: test, or opt-test with \
                  --profile opt)"
             }
         }
@@ -771,6 +783,7 @@ fn main(args: &[String]) -> ExitCode {
             Lane::CrashRestore => floors::gate_crash_restore(record),
             Lane::Resize => floors::gate_resize(record),
             Lane::Zstd => floors::gate_keyed(&floors::ZSTD_LANE, record),
+            Lane::Effects => floors::gate_effects(record),
             Lane::Wasm => wasm::gate_wasm(record),
             #[cfg(unix)]
             Lane::Start => arena::start::run(&arena_args),
@@ -909,6 +922,7 @@ mod tests {
                 Lane::CrashRestore,
                 Lane::Resize,
                 Lane::Zstd,
+                Lane::Effects,
                 Lane::Wasm
             ]
         );

@@ -2331,25 +2331,37 @@ fn srgb_over(tint: u32, alpha: u8, bg: u32) -> u32 {
     (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
+/// SGR-2 faint `fg` on `bg` (packed `0x00RRGGBB`) at the default opacity,
+/// exactly as the engine resolves it.
+fn faint_ink(fg: u32, bg: u32) -> u32 {
+    let rgb = |c: u32| aterm_types::Rgb::new((c >> 16) as u8, (c >> 8) as u8, c as u8);
+    let dim = aterm_core::terminal::color_resolve::dim_toward_bg(
+        rgb(fg),
+        rgb(bg),
+        aterm_types::DIM_FACTOR,
+    );
+    (u32::from(dim.r) << 16) | (u32::from(dim.g) << 8) | u32::from(dim.b)
+}
+
 /// Derive `(body_alpha, head_alpha)` from the luminance constraint: the largest
 /// coverages keeping every composited rain level closer to the background than
 /// SGR-2 dim text, using the theme's real fg.
 ///
-/// Faint text is `color_resolve::dim_toward_bg`: a linear-light mix
-/// `L(dim) = L(bg) + m·(L(fg)-L(bg))` whose mix `m` is `color_resolve::faint_mix`,
-/// the opacity (default 0.5) raised, when needed, to the larger of the
-/// log-share floor `contrast(fg, bg)^opacity` and the readable floor
-/// `9^opacity` capped at `contrast^((1+opacity)/2)` (dark ink on a light
-/// ground would otherwise sink into the mid-greys). The bound here still takes
-/// `m = 0.5`, the plain blend: `faint_mix` only ever raises the mix, so faint text sits at least that far
-/// from the background, and rain held under the plain blend stays closer to the
-/// background than faint text on every theme. It is conservative (tighter than
-/// the real faint ink on light themes, where the floor lifts `m`), never
-/// optimistic, and needs no contrast solve per theme.
+/// Faint text is `color_resolve::dim_toward_bg`, which is not a fixed blend:
+/// light ink on a dark ground recedes as an sRGB (alpha) blend, further than
+/// the plain linear one (`m = 0.5`), and dark ink on a light ground is raised
+/// to a readable floor, short of it. The bound is the nearer of the two to the
+/// background — the plain blend's luminance distance, or that of the theme fg
+/// actually dimmed at the default opacity — so rain stays closer to the
+/// background than faint text on every theme, and on a light theme exactly
+/// as conservative as the plain blend always was. One faint resolve per
+/// theme change.
 fn derive_alphas(cfg: &RainConfig, ramp: &[u32; 16]) -> (u8, u8) {
     let bg = cfg.default_bg;
     let lb = relative_luminance(bg);
-    let bound = (0.5 * (relative_luminance(cfg.theme_fg) - lb)).abs();
+    let plain = (0.5 * (relative_luminance(cfg.theme_fg) - lb)).abs();
+    let faint = (relative_luminance(faint_ink(cfg.theme_fg, bg)) - lb).abs();
+    let bound = plain.min(faint);
     let level_ok = |body: u8| {
         (0..=15u32).all(|lvl| {
             let a = ((u32::from(body) * (lvl + 1)) / 16).max(1) as u8;
@@ -2832,20 +2844,26 @@ mod tests {
         }
     }
 
-    /// The plain-blend bound is conservative against the faint ink aterm-core
-    /// actually draws (`dim_toward_bg`, whose `faint_mix` raises the mix to the
-    /// larger of the log-share floor and the capped readable floor, and only
-    /// ever raises it): every rain level stays closer to the background than
-    /// real faint text, dark and light. The control: on a light theme the floor
-    /// lifts faint ink well past the plain blend, so the two are not the same
-    /// rule.
+    /// Rain stays under the faint ink aterm-core actually draws
+    /// (`dim_toward_bg`): every rain level stays closer to the background
+    /// than real faint text, dark and light. The controls: a fixed plain
+    /// blend is not that ink — on a light theme the floor lifts faint dark
+    /// ink well past it, and where faint light ink is the sRGB blend
+    /// (`FAINT_SRGB_BLEND`: Windows) it recedes past it on a dark theme;
+    /// macOS and Linux keep the linear lerp, which sits on the plain blend.
     #[test]
-    fn plain_blend_bound_is_conservative_against_real_faint_ink() {
+    fn rain_stays_under_real_faint_ink() {
         use aterm_core::terminal::color_resolve::dim_toward_bg;
         let pack =
             |c: aterm_types::Rgb| (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b);
-        let mut lifted = false;
-        for name in ["Default", "Aterm Day", "Linen", "Default Light"] {
+        let (mut lifted, mut receded) = (false, false);
+        for name in [
+            "Default",
+            "Aterm Night",
+            "Aterm Day",
+            "Linen",
+            "Default Light",
+        ] {
             let scheme = aterm_types::scheme::builtin(name).expect("built-in");
             let (fg, bg) = (scheme.foreground, scheme.background);
             let faint = dim_toward_bg(fg, bg, aterm_types::DIM_FACTOR);
@@ -2853,12 +2871,8 @@ mod tests {
             let lb = relative_luminance(bg);
             let plain = (0.5 * (relative_luminance(fg) - lb)).abs();
             let real = (relative_luminance(faint) - lb).abs();
-            // u8 quantization may land a hair under the exact blend.
-            assert!(
-                real >= plain - 0.005,
-                "{name}: faint {real} < plain {plain}"
-            );
             lifted |= real > plain * 1.5;
+            receded |= real < plain * 0.7;
             let e = MatrixRain::new(RainConfig {
                 default_bg: bg,
                 theme_fg: fg,
@@ -2876,6 +2890,12 @@ mod tests {
         assert!(
             lifted,
             "a light theme's faint ink sits past the plain blend"
+        );
+        assert_eq!(
+            receded,
+            aterm_core::terminal::color_resolve::FAINT_SRGB_BLEND,
+            "a dark theme's faint ink sits short of the plain blend exactly where it is the \
+             sRGB blend"
         );
     }
 

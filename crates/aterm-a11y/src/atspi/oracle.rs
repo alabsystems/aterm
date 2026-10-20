@@ -25,6 +25,7 @@ mod model {
 
 /// The semantics the transcript plays: this crate's.
 mod sem {
+    pub(crate) use crate::atspi::semantics::NodeIdentity as NodeId;
     pub(crate) use crate::atspi::semantics::*;
 
     /// The application context's handle.
@@ -92,38 +93,71 @@ fn compare(scenarios: Vec<corpus::Scenario>) -> Vec<String> {
             want.len()
         ));
     }
-    for (index, (scenario, want)) in scenarios.into_iter().zip(&want).enumerate() {
-        let got = transcript::play(scenario, false);
-        if let Some((line, g, w)) = first_difference(&got, want) {
-            // Replay that scenario in full, for the text behind the digest.
-            let full = corpus::scenarios()
-                .into_iter()
-                .nth(index)
-                .map(|s| transcript::play(s, true))
-                .unwrap_or_default();
-            let step = got
-                .lines()
-                .take(line)
-                .filter(|l| l.starts_with("step "))
-                .count();
-            let shown: String = full
-                .lines()
-                .take_while(|l| {
-                    !l.starts_with("step ")
-                        || l.split(' ')
-                            .nth(1)
-                            .and_then(|n| n.parse::<usize>().ok())
-                            .is_some_and(|n| n < step)
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            failures.push(format!(
-                "{}: line {line}\n  got:  {g}\n  want: {w}\n{shown}",
-                got.lines().next().unwrap_or("?")
-            ));
+    // Each scenario plays on its own player, so they play on every core; the
+    // reports keep the recording's order.
+    let jobs = std::sync::Mutex::new(scenarios.into_iter().zip(&want).enumerate());
+    let found = std::sync::Mutex::new(Vec::new());
+    let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let next = jobs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .next();
+                    let Some((index, (scenario, want))) = next else {
+                        break;
+                    };
+                    if let Some(report) = difference(index, scenario, want) {
+                        found
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((index, report));
+                    }
+                }
+            });
         }
-    }
+    });
+    let mut found = found
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    found.sort_by_key(|(index, _)| *index);
+    failures.extend(found.into_iter().map(|(_, report)| report));
     failures
+}
+
+/// How scenario `index` plays against `want`, its recording: `None` when they
+/// agree, else the report.
+fn difference(index: usize, scenario: corpus::Scenario, want: &str) -> Option<String> {
+    let got = transcript::play(scenario, false);
+    let (line, g, w) = first_difference(&got, want)?;
+    // Replay that scenario in full, for the text behind the digest.
+    let full = corpus::scenarios()
+        .into_iter()
+        .nth(index)
+        .map(|s| transcript::play(s, true))
+        .unwrap_or_default();
+    let step = got
+        .lines()
+        .take(line)
+        .filter(|l| l.starts_with("step "))
+        .count();
+    let shown: String = full
+        .lines()
+        .take_while(|l| {
+            !l.starts_with("step ")
+                || l.split(' ')
+                    .nth(1)
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .is_some_and(|n| n < step)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "{}: line {line}\n  got:  {g}\n  want: {w}\n{shown}",
+        got.lines().next().unwrap_or("?")
+    ))
 }
 
 #[test]

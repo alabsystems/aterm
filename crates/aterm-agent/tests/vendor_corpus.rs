@@ -93,11 +93,14 @@ fn collect(base: &Path, dir: &Path, out: &mut Vec<Fixture>) {
         if name == "manifest.toml" || name.starts_with('.') {
             continue;
         }
+        // Spelled with `/` on every host, as the corpus names its files.
         let rel = path
             .strip_prefix(base)
             .unwrap_or(&path)
-            .to_string_lossy()
-            .into_owned();
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
         let kind = rel.split('/').next().unwrap_or_default().to_string();
         let Ok(bytes) = fs::read(&path) else { continue };
         out.push(Fixture { rel, kind, bytes });

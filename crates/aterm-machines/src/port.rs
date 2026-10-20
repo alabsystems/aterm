@@ -17,10 +17,12 @@ use std::time::Duration;
 mod relay;
 mod scratch;
 mod screen_lock;
+mod secret;
 mod staged_child;
 mod stops;
 
 pub use scratch::Scratch;
+pub use secret::{SECRET_MAX, Secret, no_core_dumps};
 pub use staged_child::{START_BYTE, START_LIMIT, StagedChild};
 pub use stops::name as stop_name;
 
@@ -370,6 +372,30 @@ pub trait System: Sync {
     /// [`RunFailed`] when the program could not be started.
     fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed>;
 
+    /// Run `cmd` to completion or its deadline, as [`System::run`] does, with `input` and a
+    /// newline on its standard input: a pipe written and closed before the child starts,
+    /// never a file, an argument or a variable (`enroll` feeds the admin's password to `ssh`
+    /// and `sudo` so). `cmd.stdin` is not used.
+    ///
+    /// # Errors
+    /// [`RunFailed`] when nothing ran to completion.
+    fn run_fed(&self, cmd: &Cmd, input: &Secret) -> Result<Ran, RunFailed> {
+        let _ = (cmd, input);
+        Err(RunFailed::Refused("run_fed: not supported".into()))
+    }
+
+    /// Ask the person at this process's controlling terminal (`/dev/tty`, never standard
+    /// input): write `prompt`, read one line, with the terminal's echo off when `secret`.
+    /// `None` when they typed nothing (an empty line, or the end of input).
+    ///
+    /// # Errors
+    /// No terminal, or the read failed; [`io::ErrorKind::Interrupted`] when they stopped
+    /// the prompt (Ctrl-C).
+    fn ask(&self, prompt: &str, secret: bool) -> io::Result<Option<Secret>> {
+        let _ = (prompt, secret);
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
     /// The bytes of `path`.
     ///
     /// # Errors
@@ -597,6 +623,17 @@ pub trait System: Sync {
     /// The first signal [`System::catch_stops`] noted while its handle lives. The default:
     /// none.
     fn stopped(&self) -> Option<i32> {
+        None
+    }
+
+    /// Ignore SIGHUP and SIGPIPE from here on, for the whole process: the host's screen
+    /// watcher (`crate::agent::watch`) outlives the run that started it, and neither a hang-up
+    /// nor a log it cannot write may end it before it locks. [`Live`] sets both to `SIG_IGN`
+    /// (`port/stops.rs`); the default ignores nothing; the test arm records the call.
+    fn ignore_hangups(&self) {}
+
+    /// This Mac's own `IOPlatformUUID` on the live system; `None` in tests.
+    fn own_uuid(&self) -> Option<String> {
         None
     }
 }
@@ -943,6 +980,47 @@ impl System for Live {
         Ok(status.code())
     }
 
+    fn run_fed(&self, cmd: &Cmd, input: &Secret) -> Result<Ran, RunFailed> {
+        use std::io::Write as _;
+        if !cmd.program.is_absolute() || cmd.keep_on_timeout {
+            return Err(RunFailed::Refused(format!(
+                "{}: a fed run takes an absolute program and its deadline as a failure",
+                cmd.program.display()
+            )));
+        }
+        let (program, args) = self.argv(cmd)?;
+        let mut child = fixed_command(&program, &args, &self.child_env(cmd));
+        // Written whole before the child starts, so no thread is needed: a pipe holds 16 KiB
+        // at least and a secret is at most SECRET_MAX. The writer's close is the child's end
+        // of input.
+        let (reader, mut writer) = io::pipe().map_err(|e| RunFailed::Spawn(e.to_string()))?;
+        writer
+            .write_all(input.bytes())
+            .and_then(|()| writer.write_all(b"\n"))
+            .map_err(|e| RunFailed::Spawn(format!("the input pipe: {e}")))?;
+        drop(writer);
+        let deadline = std::time::Instant::now() + cmd.budget;
+        match aterm_uds::deadline::output_until_from(
+            &mut child,
+            aterm_uds::spawnfd::Stdio::from(reader),
+            deadline,
+        ) {
+            Ok(out) => Ok(Ran {
+                status: out.status.code(),
+                stdout: out.stdout,
+                stderr: out.stderr,
+            }),
+            Err(aterm_uds::deadline::RunError::TimedOut) => Err(RunFailed::TimedOut(cmd.budget)),
+            Err(
+                aterm_uds::deadline::RunError::Spawn(e) | aterm_uds::deadline::RunError::Wait(e),
+            ) => Err(RunFailed::Spawn(e.to_string())),
+        }
+    }
+
+    fn ask(&self, prompt: &str, secret: bool) -> io::Result<Option<Secret>> {
+        secret::ask_tty(prompt, secret)
+    }
+
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
         std::fs::read(path)
     }
@@ -1201,6 +1279,10 @@ impl System for Live {
         stops::caught()
     }
 
+    fn ignore_hangups(&self) {
+        stops::ignore_hangups();
+    }
+
     fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
         std::os::unix::fs::symlink(target, link)
     }
@@ -1247,6 +1329,13 @@ impl System for Live {
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
         Ok(Box::new(Exclusive::within(file, limit, path)?))
+    }
+
+    fn own_uuid(&self) -> Option<String> {
+        let ran = self
+            .run(&Cmd::new("/usr/sbin/ioreg").args(["-rd1", "-c", "IOPlatformExpertDevice"]))
+            .ok()?;
+        crate::agent::platform::ioreg_value(&ran.out(), "IOPlatformUUID")
     }
 }
 
@@ -1359,7 +1448,7 @@ pub use fake::Fake;
 #[cfg(test)]
 mod fake {
     use super::scratch::{OwnedDirectory, prefix};
-    use super::{Cmd, Ran, Relaying, RunFailed, Scratch, StagedChild, Stat, System, User};
+    use super::{Cmd, Ran, Relaying, RunFailed, Scratch, Secret, StagedChild, Stat, System, User};
     use std::collections::BTreeMap;
     use std::io;
     use std::path::{Path, PathBuf};
@@ -1403,6 +1492,10 @@ mod fake {
         pub stop_after: Option<usize>,
         /// The [`System::stopped`] readings so far.
         stop_readings: Mutex<usize>,
+        /// What [`System::ask`] answers, in order ([`Fake::answer`]).
+        answers: Mutex<std::collections::VecDeque<Option<String>>>,
+        /// Each [`System::run_fed`] run's key and the bytes it was fed ([`Fake::fed`]).
+        fed: Mutex<Vec<(String, Vec<u8>)>>,
     }
 
     #[derive(Clone)]
@@ -1631,6 +1724,25 @@ mod fake {
             self
         }
 
+        /// Queue what the next [`System::ask`] answers: `Some(line)` as typed, `None` for
+        /// nothing typed. An ask with nothing queued fails, so a test notices a prompt it
+        /// did not expect.
+        pub fn answer(&self, line: Option<&str>) -> &Self {
+            self.answers
+                .lock()
+                .unwrap()
+                .push_back(line.map(str::to_owned));
+            self
+        }
+
+        /// Every [`System::run_fed`] run so far: its key (`fed <display>`, the key its reply
+        /// is scripted under) and what it was fed. Only here does a fed secret show: the
+        /// run's display, which [`Fake::calls`] records, never holds it.
+        #[must_use]
+        pub fn fed(&self) -> Vec<(String, Vec<u8>)> {
+            self.fed.lock().unwrap().clone()
+        }
+
         /// Script `reply` for the command whose display is `key`.
         pub fn on(&self, key: &str, reply: Ran) -> &Self {
             self.replies
@@ -1664,6 +1776,28 @@ mod fake {
                 .unwrap()
                 .insert(PathBuf::from(path), kind);
             self
+        }
+
+        /// What the commands scripted under `key` leave behind ([`Fake::on_write`],
+        /// [`Fake::on_stat`]), once one of them ran.
+        fn produce(&self, key: &str) {
+            let outputs = self
+                .outputs
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .unwrap_or_default();
+            for output in outputs {
+                match output {
+                    Output::File(path, bytes) => {
+                        self.files.lock().unwrap().insert(path, (bytes, 0o600));
+                    }
+                    Output::Stat(path, stat) => {
+                        self.stats.lock().unwrap().insert(path, stat);
+                    }
+                }
+            }
         }
 
         /// Every command run so far, by display, in order.
@@ -1769,23 +1903,7 @@ mod fake {
             };
             drop(replies);
             if reply.is_ok() {
-                let outputs = self
-                    .outputs
-                    .lock()
-                    .unwrap()
-                    .get(&key)
-                    .cloned()
-                    .unwrap_or_default();
-                for output in outputs {
-                    match output {
-                        Output::File(path, bytes) => {
-                            self.files.lock().unwrap().insert(path, (bytes, 0o600));
-                        }
-                        Output::Stat(path, stat) => {
-                            self.stats.lock().unwrap().insert(path, stat);
-                        }
-                    }
-                }
+                self.produce(&key);
             }
             reply
         }
@@ -1811,17 +1929,56 @@ mod fake {
             Ok(reply)
         }
 
+        fn run_fed(&self, cmd: &Cmd, input: &Secret) -> Result<Ran, RunFailed> {
+            let key = format!("fed {}", cmd.display());
+            self.calls.lock().unwrap().push(key.clone());
+            self.fed
+                .lock()
+                .unwrap()
+                .push((key.clone(), input.bytes().to_vec()));
+            let mut replies = self.replies.lock().unwrap();
+            let reply = match replies.get_mut(&key) {
+                Some(list) if list.len() > 1 => Ok(list.remove(0)),
+                Some(list) if list.len() == 1 => Ok(list[0].clone()),
+                _ => Err(RunFailed::Spawn(format!(
+                    "fake: no reply scripted for `{key}`"
+                ))),
+            };
+            drop(replies);
+            if reply.is_ok() {
+                self.produce(&key);
+            }
+            reply
+        }
+
+        fn ask(&self, prompt: &str, secret: bool) -> io::Result<Option<Secret>> {
+            let kind = if secret { "ask secret" } else { "ask" };
+            self.calls.lock().unwrap().push(format!("{kind} {prompt}"));
+            match self.answers.lock().unwrap().pop_front() {
+                Some(Some(line)) => Secret::new(line.as_bytes()).map(Some),
+                Some(None) => Ok(None),
+                None => Err(io::Error::other(format!(
+                    "fake: no answer scripted for `{prompt}`"
+                ))),
+            }
+        }
+
         fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed> {
             let key = format!("tty {}", cmd.display());
             self.calls.lock().unwrap().push(key.clone());
             let mut replies = self.replies.lock().unwrap();
-            match replies.get_mut(&key) {
+            let status = match replies.get_mut(&key) {
                 Some(list) if list.len() > 1 => Ok(list.remove(0).status),
                 Some(list) if list.len() == 1 => Ok(list[0].status),
                 _ => Err(RunFailed::Spawn(format!(
                     "fake: no reply scripted for `{key}`"
                 ))),
+            };
+            drop(replies);
+            if status.is_ok() {
+                self.produce(&key);
             }
+            status
         }
 
         fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
@@ -2122,6 +2279,10 @@ mod fake {
             self.stop_after
                 .is_some_and(|after| *readings > after)
                 .then_some(libc::SIGINT)
+        }
+
+        fn ignore_hangups(&self) {
+            self.calls.lock().unwrap().push("ignore hangups".into());
         }
     }
 

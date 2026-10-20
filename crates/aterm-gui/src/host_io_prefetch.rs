@@ -97,6 +97,9 @@ struct Fetched {
     clipboard: Option<String>,
     queries: usize,
     kitty: Vec<(KittyMedium, String, Option<Vec<u8>>)>,
+    /// The media the engine took ([`take_kitty_medium`]) and whether their read
+    /// returned bytes: consumed once the slice is fed ([`Burst`]'s drop).
+    taken: Vec<(KittyMedium, String, bool)>,
     carry: Vec<u8>,
 }
 
@@ -129,9 +132,14 @@ impl Prefetch {
 }
 
 /// The reads one slice asked for, held until it has been fed: dropping it
-/// discards whatever the engine did not take.
+/// discards whatever the engine did not take, and consumes the `t=t` files and
+/// `t=s` objects it did (`spawn::consume_kitty_medium`), after the hold. A medium
+/// the engine refused before asking for it (a size it does not load, its resolver
+/// gone with a reload, a string past its budget) is left where the program put
+/// it: before (2026-10-14), the read consumed it.
 pub(crate) struct Burst {
     covered: usize,
+    consume: fn(KittyMedium, &str, bool),
 }
 
 impl Burst {
@@ -145,15 +153,18 @@ impl Burst {
             flags,
             || crate::control::pbpaste().unwrap_or_default(),
             crate::spawn::read_kitty_medium,
+            crate::spawn::consume_kitty_medium,
         )
     }
 
-    /// [`Self::begin`] with the readers as parameters.
+    /// [`Self::begin`] with the readers, and what consumes a taken medium, as
+    /// parameters.
     fn begin_with(
         slice: &[u8],
         flags: Flags,
         mut pasteboard: impl FnMut() -> String,
         mut medium: impl FnMut(KittyMedium, &str) -> Option<Vec<u8>>,
+        consume: fn(KittyMedium, &str, bool),
     ) -> Self {
         let covered = FETCHED.with(|cell| {
             let Ok(mut fetched) = cell.try_borrow_mut() else {
@@ -217,7 +228,7 @@ impl Burst {
                 }
             }
         });
-        Self { covered }
+        Self { covered, consume }
     }
 
     /// How much of the slice its reads cover, from its start: the bytes the
@@ -230,13 +241,18 @@ impl Burst {
 
 impl Drop for Burst {
     fn drop(&mut self) {
-        FETCHED.with(|cell| {
-            if let Ok(mut fetched) = cell.try_borrow_mut() {
-                fetched.clipboard = None;
-                fetched.queries = 0;
-                fetched.kitty.clear();
-            }
+        let taken = FETCHED.with(|cell| {
+            let Ok(mut fetched) = cell.try_borrow_mut() else {
+                return Vec::new();
+            };
+            fetched.clipboard = None;
+            fetched.queries = 0;
+            fetched.kitty.clear();
+            std::mem::take(&mut fetched.taken)
         });
+        for (medium, name, read) in taken {
+            (self.consume)(medium, &name, read);
+        }
     }
 }
 
@@ -257,7 +273,8 @@ pub(crate) fn take_clipboard_query() -> Option<String> {
 }
 
 /// The Kitty medium resolver: the bytes read for `(medium, name)` in the slice
-/// being fed on this thread, or `None` (the image refused) when none were.
+/// being fed on this thread, or `None` (the image refused) when none were. A
+/// medium taken is consumed once the slice is fed ([`Burst`]).
 pub(crate) fn take_kitty_medium(medium: KittyMedium, name: &str) -> Option<Vec<u8>> {
     FETCHED.with(|cell| {
         let mut fetched = cell.try_borrow_mut().ok()?;
@@ -265,7 +282,9 @@ pub(crate) fn take_kitty_medium(medium: KittyMedium, name: &str) -> Option<Vec<u
             .kitty
             .iter()
             .position(|(kind, fetched_name, _)| *kind == medium && fetched_name == name)?;
-        fetched.kitty.remove(at).2
+        let (kind, name, bytes) = fetched.kitty.remove(at);
+        fetched.taken.push((kind, name, bytes.is_some()));
+        bytes
     })
 }
 
@@ -406,6 +425,7 @@ mod tests {
                 media.push(name.to_string());
                 Some(vec![1])
             },
+            |_, _, _| {},
         );
         let answered = std::iter::from_fn(take_clipboard_query)
             .inspect(|board| assert_eq!(board, "board"))
@@ -463,6 +483,56 @@ mod tests {
         }
     }
 
+    thread_local! {
+        /// What [`record`] was asked to consume on this thread.
+        static CONSUMED: RefCell<Vec<(String, bool)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// A consumer that records what it is asked to consume.
+    fn record(_: KittyMedium, name: &str, read: bool) {
+        CONSUMED.with(|consumed| consumed.borrow_mut().push((name.to_string(), read)));
+    }
+
+    /// A MEDIUM IS CONSUMED ONLY ONCE THE ENGINE TOOK IT, AFTER THE SLICE IS
+    /// FED (ATERM-KI-1014-6): of the `t=t` files read for a slice, the one the
+    /// engine asks for is consumed, with whether its read returned bytes, when
+    /// the burst drops (after the hold), never at the read or under the hold;
+    /// the one it never asks for (a raw transmission declaring no size, which
+    /// the engine refuses before resolving) is not consumed at all.
+    #[test]
+    fn only_a_medium_the_engine_took_is_consumed_after_the_slice() {
+        let mut burst = file("a=T,f=32,s=1,v=1,t=t", "/tmp/taken");
+        burst.extend_from_slice(&file("a=T,f=32,s=1,v=1,t=t", "/tmp/unreadable"));
+        burst.extend_from_slice(&file("a=T,f=32,t=t", "/tmp/refused"));
+        let fetched = Burst::begin_with(
+            &burst,
+            ALL,
+            String::new,
+            |_, name| (name != "/tmp/unreadable").then(|| vec![1]),
+            record,
+        );
+        let consumed = || CONSUMED.with(|consumed| consumed.borrow().clone());
+        assert_eq!(consumed(), [], "nothing is consumed at the read");
+        assert_eq!(
+            take_kitty_medium(KittyMedium::TempFile, "/tmp/taken"),
+            Some(vec![1])
+        );
+        assert_eq!(
+            take_kitty_medium(KittyMedium::TempFile, "/tmp/unreadable"),
+            None
+        );
+        assert_eq!(consumed(), [], "nor where the engine takes it");
+        drop(fetched);
+        assert_eq!(
+            CONSUMED.take(),
+            [
+                ("/tmp/taken".to_string(), true),
+                ("/tmp/unreadable".to_string(), false)
+            ],
+            "the refused medium is not consumed"
+        );
+    }
+
     /// The largest medium a read returns.
     const LARGEST: usize = crate::spawn::MAX_KITTY_MEDIUM_BYTES as usize;
 
@@ -476,11 +546,17 @@ mod tests {
             let mut off = 0;
             while off < part.len() {
                 let mut held = 0;
-                let fetched = Burst::begin_with(&part[off..], ALL, String::new, |_, name| {
-                    names.push(name.to_string());
-                    held += LARGEST;
-                    Some(vec![0; LARGEST])
-                });
+                let fetched = Burst::begin_with(
+                    &part[off..],
+                    ALL,
+                    String::new,
+                    |_, name| {
+                        names.push(name.to_string());
+                        held += LARGEST;
+                        Some(vec![0; LARGEST])
+                    },
+                    |_, _, _| {},
+                );
                 most = most.max(held);
                 assert!(fetched.covered() > 0, "a slice that feeds nothing");
                 off += fetched.covered();

@@ -1,0 +1,24 @@
+# claude-code 2.1.302 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (26x30, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab), the harness held off by a person-sim lease · the single-server .mcp.json approval dialog (one new server lab-probe), cursor on its default, the 144x50 pane resized to 26x30 (`ctl resize 30 26`): `Use this and all` over `future MCP servers in` (21 cells from column 4, one cell short of the pane's edge) over `this project`
+
+──────────────────────────
+  New MCP server found
+  in this project:
+  lab-probe
+
+  MCP servers may
+  execute code or access
+  system resources. All
+  tool calls require
+  approval. Learn more
+  in the MCP
+  documentation.
+
+    Use this MCP server
+    Use this and all
+    future MCP servers in
+    this project
+  ❯ Continue without using
+    this MCP server
+
+  Enter to confirm · Esc
+  to cancel

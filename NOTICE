@@ -2,19 +2,19 @@ aterm
 Copyright 2026 Andrew Yates
 
 Unless a file or component says otherwise, aterm source is licensed under the
-Apache License, Version 2.0. See LICENSE.
+Apache License, Version 2.0. See `LICENSE`.
 
 The aterm-gpu-web and aterm-wasm crates, and individual files marked with
 `SPDX-License-Identifier: MIT`, are licensed under the MIT License. See
-LICENSE-MIT.
+`LICENSE-MIT`.
 
 This source distribution includes a modified copy of this upstream crate:
 
 - winit 0.30.13, Apache-2.0 (`crates/aterm-window/`)
 
 It retains its upstream license text. The winit copy is
-absorbed: it is `crates/aterm-window/` (its cargo package is still named
-`winit`), a workspace member aterm owns and changes like its own code. It
+absorbed: it is `crates/aterm-window/` (the cargo package `aterm-window`), a
+workspace member aterm owns and changes like its own code. It
 contains aterm modifications to macOS application behavior, Wayland
 seat/data-device handling, and Windows modal size/move event delivery (a
 WM_TIMER pump so timed events keep flowing during caption drags and edge
@@ -116,6 +116,22 @@ aterm's Windows graph reads, and its `link!` macro is derived from windows-link
 0.2.1 (the same project, under the same terms). Each generated file names the
 upstream file it came from. See `crates/aterm-win32/LICENSE-MIT` and
 `crates/aterm-win32/LICENSE-APACHE`.
+
+`crates/aterm-pty/src/windows/openconsole.rs` is a port of
+`src/winconpty/winconpty.cpp` from microsoft/terminal (Windows Terminal and
+the Windows console host, Copyright (c) Microsoft Corporation), licensed MIT:
+the launch of an OpenConsole.exe as a pseudoconsole's host. See
+`apps/aterm-win/licenses/OpenConsole.LICENSE.txt`.
+
+The Windows app folder `apps/aterm-win/build.ps1` lays out (and the portable
+zip, the MSIX and the `install.ps1` install made from it) carries
+`OpenConsole.exe`, the console host microsoft/terminal builds, unmodified and
+signed by Microsoft, taken from the Microsoft.Windows.Console.ConPTY package on
+nuget.org at the version and SHA-256 `build.ps1` pins, Copyright (c) Microsoft
+Corporation, licensed MIT. The folder's `licenses\` holds its licence
+(`OpenConsole.LICENSE.txt`) and microsoft/terminal's notices for the third-party
+code it incorporates (`OpenConsole.NOTICE.txt`), both from
+`apps/aterm-win/licenses/`.
 
 `crates/aterm-font/` is a modified subset derived from ttf-parser 0.25.1 by
 Yevhenii Reizner and contributors, licensed MIT OR Apache-2.0: its sfnt,
@@ -236,7 +252,7 @@ Apache-2.0. contrib/themes/pack/ATTRIBUTION.md and `aterm theme pack
 
 Generated Unicode segmentation, width, emoji-presentation, and compatibility
 tables derive from Unicode data. Unicode copyright and permission terms are in
-UNICODE-LICENSE.txt.
+`UNICODE-LICENSE.txt`.
 
 The public source snapshot contains no executable binary, no updater payload
 and no managed ALab tool package; PUBLICATION.md describes its boundary.

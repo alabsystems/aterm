@@ -93,6 +93,8 @@ const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
 const HANG_MS: &str = "timeout=60000";
 /// Wide enough that no drawn row wraps (the 529 notice is 152 columns).
 const COLUMNS: &str = "170";
+/// The loop's approvals ledger, under the scratch root.
+const LEDGER: &str = "state/drive.jsonl";
 
 fn ctl_ok(inst: &Instance, args: &[&str]) -> String {
     let out = ctl(inst, args);
@@ -168,7 +170,7 @@ fn awaited(inst: &Instance, sid: &str, re: &str) -> Result<(), String> {
 ///
 /// This, not [`await_match`], is how a test waits for a screen the loop
 /// under test REPLACES — the end of turn it continues, the box it answers,
-/// the busy screen of a two-second turn. `await match` sees the screen as it
+/// the busy screen of a one-second turn. `await match` sees the screen as it
 /// is when the watcher is armed and every change after, never one that came
 /// and went before: armed after the loop had already continued (a test
 /// process stalled for a few seconds between its `key enter` and its
@@ -418,10 +420,12 @@ const DONE: &str = "Fixed the parser; the suite is green.";
 /// composer text over 40 characters as a pasted-text placeholder, `$7`
 /// `loop` to end EVERY turn on `$4` (else the turns after the first end on
 /// the decision), `$8` the event directory ([`drawn`]), `$9` the directory
-/// the loop's connection marks its busy reads in ([`Tap`]).
+/// the loop's connection marks its busy reads in ([`Tap`]), `$10` the loop's
+/// approvals ledger (the `wallscroll` end scrolls once the loop has written
+/// its wait on the wall there).
 ///
-/// A line taken is a 2 s busy spell of work THE LOOP READ: while a loop
-/// watches, the 2 s run from its read of the busy screen, not from the
+/// A line taken is a 1 s busy spell of work THE LOOP READ: while a loop
+/// watches, the 1 s runs from its read of the busy screen, not from the
 /// drawing (`work`). The loop judges a turn by the busy work it read
 /// (`TurnEndState::observe`), and a spell of a fixed 2 s from the drawing
 /// came and went unread under a read stalled past it — the goal end then
@@ -450,7 +454,7 @@ const DONE: &str = "Fixed the parser; the suite is green.";
 /// `await idle 500 timeout 1500` exchanges in `aterm-agent`'s supervise tests.
 const FAKE_WORKER: &str = r#"#!/bin/sh
 dir="$1"; keys="$2"; subs="$3"; after="$4"; cols="$5"; mangle="$6"; mode="$7"
-events="$8"; seen="$9"
+events="$8"; seen="$9"; ledger="${10}"
 stty raw -echo
 : > "$keys"; : > "$subs"
 exec 3<&0
@@ -476,7 +480,7 @@ draw() {
 # before this spell began, `Tap`), the seconds run from when the loop has READ
 # the busy screen — the request it makes only after a read that counted the
 # turn's work marks "$seen/<n>" for the spell drawn as event n — so a loop
-# whose read stalls past the spell still reads it, and reads 2 s of work.
+# whose read stalls past the spell still reads it, and reads $1 s of work.
 # Unwatched, they run from the drawing.
 work() {
   watched=0; [ -d "$seen" ] && watched=1
@@ -524,12 +528,17 @@ while :; do
       printf 'SUBMIT:%s\n' "$buf" >> "$subs"; mark submit
       buf=""; typed=0
       n=$(wc -l < "$subs" | tr -d ' ')
-      work 2
+      work 1
       if [ "$n" = 1 ] || [ "$mode" = loop ]; then
-        # `wallscroll`: the wall (its reset 12 s off), then, six seconds later,
-        # the same screen with the wall's rows scrolled out of view (the owner
-        # reading back up): six seconds for a loaded machine to look at it.
-        if [ "$after" = wallscroll ]; then draw wallslow; sleep 6; draw wallscrolled; else draw "$after"; fi
+        # `wallscroll`: the wall (its reset 6 s off), then, once the loop has
+        # written its wait on it down (`wall-wait@v1` in its ledger: it has
+        # read the wall, however late it looked), the same screen with the
+        # wall's rows scrolled out of view (the owner reading back up).
+        if [ "$after" = wallscroll ]; then
+          draw wallslow
+          until grep -q 'wall-wait@v1' "$ledger" 2>/dev/null; do sleep 0.05; done
+          draw wallscrolled
+        else draw "$after"; fi
       else draw stop; fi
     elif [ "$c" = "$esc" ]; then
       while [ ${#chunk} -lt 2 ]; do fill; done
@@ -596,9 +605,11 @@ fn start_worker_in(
         // The same wall on a grid drawn one row high: the cursor on the row
         // BELOW the prompt, as tab 1's screen sat after its flap of 2026-09-28.
         ("walldisplaced", wall_behind_a_shell()),
-        // The wall the scroll test draws: its reset 12 s off, so the loop has
-        // seconds, not a second, to look at it before it is scrolled away.
-        ("wallslow", wall_behind_a_shell_in(12)),
+        // The wall the scroll tests draw: scrolled away once the loop has
+        // written its wait on it down ([`FAKE_WORKER`]), its reset 6 s off so
+        // a loop replaced after the scroll is stopped well before the reset
+        // (the 0.8 s it is given to read the scrolled screen, and its stop).
+        ("wallslow", wall_behind_a_shell_in(6)),
         ("wallscrolled", wall_scrolled_out_of_view()),
         // The wall with a person's draft in the composer (not dim: typed).
         ("walldraft", wall_with_a_draft()),
@@ -666,7 +677,7 @@ fn start_worker_in(
         inst,
         sid,
         &format!(
-            "/bin/bash -c 'exec -a claude /bin/sh {} {} {} {} {after} {columns} {} {} {} {}'",
+            "/bin/bash -c 'exec -a claude /bin/sh {} {} {} {} {after} {columns} {} {} {} {} {}'",
             script.display(),
             dir.display(),
             keys.display(),
@@ -675,6 +686,7 @@ fn start_worker_in(
             if looping { "loop" } else { "once" },
             events.display(),
             inst.tmp.join("seen").display(),
+            inst.tmp.join(LEDGER).display(),
         ),
     );
     // The ready screen stays until a line is typed: watching it is sound.
@@ -776,7 +788,7 @@ impl Supervisor {
             read_busy: false,
         };
         let cut = ctl.interrupter();
-        let ledger = inst.tmp.join("state/drive.jsonl");
+        let ledger = inst.tmp.join(LEDGER);
         let journal = inst.tmp.join("state/journal.jsonl");
         let sid = format!("@{sid}");
         let flag = Arc::clone(&stop);
@@ -806,7 +818,7 @@ impl Supervisor {
     /// default) before anything is typed (`TurnEndState::observe`, "the
     /// first point seen"). `start` used to return once the thread was
     /// spawned, and the test typed `go` at once; a loop thread that took
-    /// longer than the worker's 2 s turn to make its first read (the
+    /// longer than the worker's (then 2 s) turn to make its first read (the
     /// suggestion test at a load of 35-41) read the
     /// goal end as its first point and waited 2 min, and the decision never
     /// came (`OK timeout`). Watching from the ready screen, the loop reads
@@ -1181,7 +1193,7 @@ fn a_short_turn_loop_is_continued_and_never_escalates() {
     let sec = Duration::from_secs(1);
     submit(&inst, &sid, "go");
     // `go` taken: the loop must not start on the ready screen. Not the busy
-    // screen itself — it lasts the worker's 2 s turn ([`stamps_when`]): drawn
+    // screen itself — it lasts the worker's 1 s turn ([`stamps_when`]): drawn
     // before the loop's connection is made, it waits for no read of it
     // ([`FAKE_WORKER`]), so the loop starts on it or on its end. Every spell
     // after it, a continuation's, lasts until the loop has read it.
@@ -1191,8 +1203,8 @@ fn a_short_turn_loop_is_continued_and_never_escalates() {
     // and the instance parses them, and a loop that connected in that gap
     // read the ready screen as its first point (seq 531 in the stress
     // run that caught it, 2026-10-10). That first point counts as a short
-    // turn, so `go`'s own turn made the second and the back-offs read
-    // 2, 2, 2 for 1, 2, 2. The instance's screen is read by the loop too, so
+    // turn, so `go`'s own turn made the second and every back-off read the
+    // cap, not the base first. The instance's screen is read by the loop too, so
     // it can only have left ready by the time the loop looks.
     await_match(&inst, &sid, "Deliberating|suite.is.green");
     let sup = Supervisor::start_with(
@@ -1200,8 +1212,8 @@ fn a_short_turn_loop_is_continued_and_never_escalates() {
         &sid,
         TurnEndTiming {
             min_work: 3600 * sec,
-            short_backoff: sec,
-            short_backoff_max: 2 * sec,
+            short_backoff: sec / 2,
+            short_backoff_max: sec,
             ..TurnEndTiming::default()
         },
         SupervisorConfig::default(),
@@ -1230,13 +1242,13 @@ fn an_esc_interrupt_is_held_then_continued() {
     let inst = boot("i");
     let sid = boot_session(&inst);
     let (_keys, subs, events) = start_worker(&inst, &sid, "interrupted");
-    // The worker's 2 s turn counts as real work here: the point is held for
-    // the person, not backed off as a short turn.
+    // The worker's 1 s turn counts as real work here (`min_work` half of
+    // it): the point is held for the person, not backed off as a short turn.
     let sup = Supervisor::start_with(
         &inst,
         &sid,
         TurnEndTiming {
-            min_work: Duration::from_secs(1),
+            min_work: Duration::from_millis(500),
             ..TurnEndTiming::default()
         },
         SupervisorConfig {
@@ -1390,8 +1402,8 @@ fn a_draft_left_at_the_wall_is_submitted_after_the_reset_not_keep_going() {
 
 /// THE WALL SCROLLED
 /// OUT OF VIEW. The loop reads the wall behind the shell and waits for its reset
-/// (12 s here); six seconds later the owner has scrolled back up the transcript,
-/// the wall's rows are gone and the screen reads `busy` with no wall (the server
+/// (6 s here); once it has written that wait down the owner scrolls back up the
+/// transcript, the wall's rows are gone and the screen reads `busy` with no wall (the server
 /// says `busy`, as it always did). The wait goes on: `keep going` is typed
 /// once, at the reset and its grace, through the fenced write. Before the wall was
 /// remembered, the loop waited on a screen that read
@@ -1426,7 +1438,7 @@ fn a_weekly_wall_scrolled_out_of_view_is_still_continued_at_its_reset() {
 }
 
 /// THE UPDATE THAT APPLIES WHILE THE WALL IS SCROLLED OUT OF VIEW, live. A loop
-/// reads the wall behind the shell and waits for its reset (12 s here); the owner
+/// reads the wall behind the shell and waits for its reset (6 s here); the owner
 /// scrolls back and the wall's rows are gone. The loop is REPLACED then — an
 /// update, a fault — by a new one on the same ledger and the same tab. The
 /// first wrote the wall down; the second starts on a screen that reads `busy`
@@ -1451,13 +1463,14 @@ fn a_loop_that_replaces_another_at_a_scrolled_wall_goes_on_waiting_for_its_reset
     if let Ok(left) = (scrolled_at + Duration::from_millis(800)).duration_since(SystemTime::now()) {
         std::thread::sleep(left);
     }
-    let ledger = std::fs::read_to_string(inst.tmp.join("state/drive.jsonl")).unwrap_or_default();
+    let ledger = std::fs::read_to_string(inst.tmp.join(LEDGER)).unwrap_or_default();
     let said_first = first.stop();
     assert!(
         ledger.contains("wall-wait@v1"),
         "the first loop wrote the wall down:\n{ledger}\n{said_first}"
     );
-    // The successor: the reset is still ahead (it is 12 s after the print).
+    // The successor: the reset is still ahead (it is 6 s after the first
+    // loop's read, and the scroll came at its record of that read).
     let second = Supervisor::start(&inst, &sid, timing());
     let submitted = lines_when(&subs, 2, Duration::from_secs(60));
     let said_second = second.stop();

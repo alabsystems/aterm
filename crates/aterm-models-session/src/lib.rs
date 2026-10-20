@@ -19,6 +19,7 @@
 mod models_broadcast_checkpoint;
 mod models_broadcast_head;
 mod models_crash_restore;
+mod models_engine_corpus;
 mod models_exceptions_digest;
 mod models_exceptions_ends;
 mod models_exceptions_once;
@@ -40,6 +41,7 @@ mod models_write_all;
 pub use models_broadcast_checkpoint::broadcast_cursor_checkpoint_model;
 pub use models_broadcast_head::broadcast_head_subscription_model;
 pub use models_crash_restore::crash_restore_journal_model;
+pub use models_engine_corpus::*;
 pub use models_exceptions_digest::exceptions_digest_model;
 pub use models_exceptions_ends::{exceptions_digest_ends_liveness, exceptions_digest_ends_model};
 pub use models_exceptions_once::exceptions_once_model;
@@ -56,9 +58,13 @@ pub use models_notify_follow::notify_follow_checkpoint_model;
 pub use models_paste_order::*;
 pub use models_say_replay_budget::say_replay_budget_model;
 pub use models_session::*;
+// The engine corpus carries its own copy for aterm-spec's mounts; the
+// session file's is this crate's.
+pub use models_session::forward_handshake_model;
 pub use models_session_log::{
-    session_log_claims_model, session_log_cursor_model, session_log_journal_model,
-    session_log_mark_quota_model, session_log_ring_model, turn_tracker_model,
+    session_log_claims_model, session_log_cursor_model, session_log_fold_model,
+    session_log_journal_model, session_log_mail_link_model, session_log_mark_quota_model,
+    session_log_ring_model, transcript_join_model, turn_tracker_model,
 };
 pub use models_subscribe_announcement::subscribe_announcement_order_model;
 pub use models_write_all::write_all_model;

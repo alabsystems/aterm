@@ -414,14 +414,23 @@ pub fn generate_master() -> Result<MasterPhrase, String> {
     SystemRandom::new()
         .fill(&mut raw)
         .map_err(|_| "the system CSPRNG refused; refusing to mint a weak master".to_string())?;
+    let phrase = encode_phrase(&raw);
+    scrub(&mut raw);
+    Ok(phrase)
+}
+
+/// Spell 32 seed bytes as the 52-character phrase [`MasterPhrase::seed`] decodes back to
+/// exactly those bytes. Borrowed, never moved, so the caller's array stays the only copy
+/// of the seed and the caller scrubs it.
+fn encode_phrase(raw: &[u8; 32]) -> MasterPhrase {
     let mut chars = [0u8; MASTER_PHRASE_LEN];
     let mut acc: u32 = 0;
     let mut nbits: u32 = 0;
     let mut out = 0usize;
-    // `for b in raw` would move a COPY of the whole seed into `array::IntoIter`'s
-    // backing storage, which nothing scrubs;
-    // iterate by reference so the only seed copy is `raw`, which is scrubbed below.
-    for &b in &raw {
+    // `for b in *raw` would move a COPY of the whole seed into `array::IntoIter`'s
+    // backing storage, which nothing scrubs; iterate by reference so the only seed copy
+    // is the caller's, which it scrubs.
+    for &b in raw {
         acc = (acc << 8) | u32::from(b);
         nbits += 8;
         while nbits >= 5 {
@@ -433,11 +442,10 @@ pub fn generate_master() -> Result<MasterPhrase, String> {
     // 256 bits leave one significant bit for the 52nd character; its low four bits are
     // padding, written as zero (and masked off again by `seed`).
     chars[out] = ALPHABET[((acc << (5 - nbits)) & 31) as usize];
-    scrub(&mut raw);
     scrub_u32(&mut acc);
     let phrase = MasterPhrase { chars };
     try_lock(&phrase.chars);
-    Ok(phrase)
+    phrase
 }
 
 /// The short verification fingerprint: the first 8 hex characters of SHA-256 over the
@@ -858,6 +866,40 @@ mod tests {
         assert_ne!(a.as_str(), b.as_str(), "two masters must not be the same");
         // ...and a generated phrase round-trips through the reader the owner will use.
         assert_eq!(parse_master(a.as_str()).unwrap().as_str(), a.as_str());
+    }
+
+    /// THE PAPER IS THE SEED. A phrase decodes to exactly the 32 bytes it was spelled
+    /// from, its last character carries zero padding bits (one canonical spelling), and
+    /// the derivation is a cross-version contract: paper written under an earlier build
+    /// names the same master in this one. The pinned key was derived outside this crate
+    /// (a Crockford decode, then OpenSSL's Ed25519).
+    #[test]
+    fn a_phrase_decodes_to_exactly_the_seed_it_spells() {
+        for raw in [
+            [0x00; 32],
+            [0xFF; 32],
+            [0x01; 32],
+            *b"0123456789abcdefghijklmnopqrstuv",
+        ] {
+            let phrase = encode_phrase(&raw);
+            assert!(
+                matches!(phrase.chars[51], b'0' | b'g'),
+                "padding bits are zero"
+            );
+            let spelled = Ed25519KeyPair::from_seed_unchecked(&raw).unwrap();
+            assert_eq!(
+                phrase.seed().pubkey_b64().unwrap(),
+                aterm_codec::base64::encode(spelled.public_key().as_ref()).unwrap()
+            );
+        }
+        assert_eq!(
+            parse_master(SYNTHETIC)
+                .unwrap()
+                .seed()
+                .pubkey_b64()
+                .unwrap(),
+            "+K4Suo6CHtd/Se3P/nIfZ/FpgUX0kUMJafiLDrxMius="
+        );
     }
 
     /// The final character's LOW FOUR BITS are padding: spellings that differ only there

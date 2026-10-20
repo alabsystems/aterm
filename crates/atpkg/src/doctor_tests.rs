@@ -2057,6 +2057,40 @@ fn a_workspace_policy_the_installed_targo_refuses_is_a_problem_that_names_the_cu
     );
 }
 
+/// A workspace still naming a `[trust]` key the installed targo RETIRED fails the report
+/// with targo's own replacement, and the cure is the workspace's: nothing to publish, so no
+/// publish act.
+#[test]
+fn a_workspace_policy_key_the_installed_targo_retired_names_the_workspace_as_behind() {
+    let l = layout("wsretired");
+    install(&l, "trust", 6808);
+    let home = synthetic_home("wsretired");
+    let path = on_bin(&l);
+    let replacement = "retired on 2026-10-11: `[trust] backstop` in the workspace root's \
+                       table is the one wall-clock backstop";
+    let probes = Probes {
+        workspace: Some(WorkspacePolicyProbe {
+            workspace: PathBuf::from("/work/ay"),
+            policy: WorkspacePolicy::RetiredKey {
+                key: "compiler_timeout_secs".into(),
+                replacement: replacement.into(),
+            },
+        }),
+        ..Probes::default()
+    };
+    let (ok, out, err) = report_of(&l, &home, Some(&path), &probes);
+    assert!(!ok, "{out}{err}");
+    assert!(
+        err.contains(&format!("`compiler_timeout_secs` was {replacement}"))
+            && err.contains("/work/ay"),
+        "names the retired key and what replaced it: {err}"
+    );
+    assert!(
+        !err.contains(PUBLISH_RUSTC_GROUP) && !out.contains("next — publish"),
+        "nothing to publish: {out}{err}"
+    );
+}
+
 /// An accepted policy beside a rustup `trust` naming a LOCAL toolchain is healthy — the
 /// local seal only warns — and with the entry really laid at that toolchain, the one
 /// entry gets one warning, not a second re-point line from (9).
@@ -2235,6 +2269,42 @@ fn targo_refusal_text_yields_the_field_name() {
         None
     );
     assert_eq!(unknown_field_in(""), None);
+}
+
+/// Trust main refuses a retired `[trust]` key naming its replacement, in the manifest
+/// reader's words and in `targo-trust`'s loader's; neither is an unknown field.
+#[test]
+fn targo_retired_key_text_yields_the_key_and_its_replacement() {
+    let replacement = "retired on 2026-10-11: `[trust] backstop` in the workspace root's table \
+                       is the one wall-clock backstop, and it scales the compiler-process \
+                       ceiling (8 hours at the builtin 1000 per mille) with the per-query and \
+                       per-function clocks. Delete this key, and raise `backstop` in the \
+                       workspace root's [trust] table if a run needs a longer ceiling";
+    let key = "compiler_timeout_secs".to_string();
+    let want = Some((key, replacement.to_string()));
+    let manifest = format!(
+        "error: `[trust]` key `compiler_timeout_secs` was {replacement}\n \
+         --> Cargo.toml:467:1\n    |\n467 | compiler_timeout_secs = 72000\n"
+    );
+    assert_eq!(retired_key_in(&manifest), want);
+    assert_eq!(unknown_field_in(&manifest), None);
+    let loader = format!(
+        "error: failed to validate /work/ay/Cargo.toml: [trust] `compiler_timeout_secs` was \
+         {replacement}\n"
+    );
+    assert_eq!(retired_key_in(&loader), want);
+    assert_eq!(unknown_field_in(&loader), None);
+    assert_eq!(
+        retired_key_in(
+            "error: unknown field `function_budget_ms`, expected one of `enabled`, `level`\n"
+        ),
+        None
+    );
+    assert_eq!(
+        retired_key_in("warning: unused manifest key: trust\n"),
+        None
+    );
+    assert_eq!(retired_key_in(""), None);
 }
 
 /// A store with trust 8589 active, a synthetic home, and PATH on the store's bin —

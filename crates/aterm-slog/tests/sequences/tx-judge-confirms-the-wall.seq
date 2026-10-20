@@ -1,0 +1,9 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# §2.6: the judge confirms the screen's wall once, at exact.
+bind 0
+see busy
+see wall:usage-session
+expect need=wall:usage-session
+tx wall usage-session confirm
+expect amend p1 wall confirmed=1 by=vendor src=transcript conf=exact
+tx wall usage-session confirm

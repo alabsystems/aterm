@@ -17,6 +17,14 @@
 //! configurations, the `rc` and `unstable` features, and the std types no
 //! aterm model carries.
 //!
+//! Two additions are aterm's own, and a format written against registry serde
+//! needs neither. [`de::value::TextKeyDeserializer`] reads a map key a
+//! string-keyed format wrote (`"7"`, `"true"`) back as the integer or `bool` it
+//! was, and serde's buffered maps (`flatten`, `untagged`, `tag`) read their
+//! keys through it too. [`ser::SerializeMap::serialize_field_entry`] is where a
+//! struct's field reaches a map, which a format that leaves a `None` field out
+//! but refuses a `None` map value (TOML) needs to tell apart.
+//!
 //! Dependents name it `serde` (the workspace row's `package = "aterm-serde"`).
 
 ////////////////////////////////////////////////////////////////////////////////

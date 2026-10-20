@@ -469,12 +469,10 @@ fn claude_code_switched_off_turns_the_accounts_off() {
 /// THE REOPENED LAYOUT'S ROW ASKS THE ADMISSION OF EACH AGENT IT CARRIED
 /// ([`HostHandle::relaunches_restored_of`]): with Codex switched off, a
 /// restored Claude Code is relaunched and a restored Codex is not, as the
-/// restored queue decides ([`restored_allowed`]). Muse Code is relaunched
-/// (its relaunch lane), and with Muse Code switched off it is not. agy and
-/// Gemini CLI, which a leaf may name, are relaunched never: switched on and
-/// admitted, they have no lane (`lanes()`), so the row says them lost, never
-/// resuming. NEGATIVE CONTROLS: with all on, Claude Code, Codex and Muse Code
-/// are; with `[harness] relaunch = false`, none is.
+/// restored queue decides ([`restored_allowed`]). Muse Code, agy and Gemini
+/// CLI are relaunched (their relaunch lanes), and each switched off is not.
+/// NEGATIVE CONTROLS: with all on, every agent is; with `[harness] relaunch =
+/// false`, none is.
 #[test]
 fn the_reopened_row_asks_each_agents_admission() {
     use aterm_agent::harness::upgrade::Agent;
@@ -488,16 +486,22 @@ fn the_reopened_row_asks_each_agents_admission() {
     };
     let mut codex_off = on();
     codex_off.off.push(Program::Codex);
-    let ([_, _, unlaned @ ..], told) = of(codex_off);
+    let ([_, _, lanes @ ..], told) = of(codex_off);
     assert_eq!(
-        unlaned, [true; 3],
+        lanes, [true; 3],
         "PRECONDITION: agy, Muse Code, Gemini CLI admitted"
     );
-    assert_eq!(told, [true, false, false, true, false]);
-    assert_eq!(of(on()).1, [true, true, false, true, false]);
+    assert_eq!(told, [true, false, true, true, true]);
+    assert_eq!(of(on()).1, [true; 5]);
     let mut muse_off = on();
     muse_off.off.push(Program::Muse);
-    assert_eq!(of(muse_off).1, [true, true, false, false, false]);
+    assert_eq!(of(muse_off).1, [true, true, true, false, true]);
+    let mut agy_off = on();
+    agy_off.off.push(Program::Agy);
+    assert_eq!(of(agy_off).1, [true, true, false, true, true]);
+    let mut gemini_off = on();
+    gemini_off.off.push(Program::Gemini);
+    assert_eq!(of(gemini_off).1, [true, true, true, true, false]);
     let mut limited = on();
     limited.set("relaunch", "false").unwrap();
     assert_eq!(of(limited).1, [false; 5]);
@@ -650,6 +654,88 @@ fn revocation_fixture() -> (HostHandle, WorkerJob, Workers, Hooks) {
     (host, job, workers, hooks)
 }
 
+/// A WORKER IS REFUSED EXACTLY WHERE THIS HOST WOULD NOT CARRY IT
+/// ([`worker_unsupervised`]: `spawn agent=claude`'s `ERR unsupervised:
+/// <switch>`). For each table the verdict is what the real host does with a
+/// newborn worker, a Claude Code session with no `autopilot` word of its
+/// own: under each switch named no worker runs for it — the master switch
+/// (and `headless = false` in a headless instance) starts no host at all,
+/// Claude Code's own table admits none, an Autopilot default of `off` reads
+/// it Off — while the same host carries the session beside it that the
+/// switch leaves on (a Codex tab; a Claude tab whose own word is `cruise`).
+/// NEGATIVE CONTROLS: the default, a headless instance under it, `headless =
+/// false` in a windowed one, another agent's table off and a `land` default
+/// all carry the worker.
+#[test]
+fn a_worker_is_refused_exactly_where_the_host_would_not_carry_it() {
+    const WORKER: &str = "s-worker";
+    let codex = Some(("s-codex", Program::Codex, None));
+    let opted = Some(("s-opted", Program::Claude, Some(Autopilot::Cruise)));
+    for (text, headless, refused, beside) in [
+        (
+            "[harness]\nenabled = false\n",
+            false,
+            Some("[harness] enabled = false"),
+            None,
+        ),
+        (
+            "[harness]\nheadless = false\n",
+            true,
+            Some("[harness] headless = false"),
+            None,
+        ),
+        (
+            "[harness.claude]\nenabled = false\n",
+            false,
+            Some("[harness.claude] enabled = false"),
+            codex,
+        ),
+        (
+            "[harness]\nautopilot = \"off\"\n",
+            false,
+            Some("[harness] autopilot = \"off\""),
+            opted,
+        ),
+        ("", false, None, None),
+        ("", true, None, None),
+        ("[harness]\nheadless = false\n", false, None, None),
+        ("[harness.codex]\nenabled = false\n", false, None, None),
+        ("[harness]\nautopilot = \"land\"\n", false, None, None),
+    ] {
+        let case = format!("{text:?} headless={headless}");
+        let (cfg, notes) = SupervisorConfig::from_aterm_toml(text);
+        assert!(notes.is_empty(), "{case}: {notes:?}");
+        assert_eq!(worker_unsupervised(&cfg, headless), refused, "{case}");
+        let world = Arc::new(World::default());
+        let mut roster = vec![(WORKER, Program::Claude)];
+        if let Some((sid, program, word)) = beside {
+            roster.push((sid, program));
+            world.word(sid, word);
+        }
+        world.set(&roster);
+        let host = HostHandle::start(cfg, headless, false, hooks(&world, parking_body(&world)));
+        match (refused, beside) {
+            (None, _) => until(&format!("{case}: the worker carried"), || {
+                host.live() == [WORKER]
+            }),
+            (Some(_), Some((sid, ..))) => {
+                until(&format!("{case}: {sid} carried beside it"), || {
+                    host.live() == [sid]
+                });
+                world.passes();
+                assert_eq!(host.live(), [sid], "{case}: no worker for {WORKER}");
+                assert_eq!(world.runs.load(Ordering::SeqCst), 1, "{case}");
+            }
+            (Some(_), None) => {
+                assert!(!host.supervising(), "{case}: no host at all");
+                assert!(host.live().is_empty(), "{case}: {:?}", host.live());
+                assert_eq!(world.runs.load(Ordering::SeqCst), 0, "{case}");
+            }
+        }
+        host.shutdown_and_join();
+    }
+}
+
 /// AN AGENT ITS OWN SWITCH LEAVES UNSUPERVISED STILL RAN IN ITS TAB
 /// ([`note_agents_in_restored_tabs`]): a restored relaunch queued for a tab
 /// the roster names a Codex in, under Codex switched off, is marked
@@ -664,20 +750,23 @@ fn an_agent_switched_off_overtakes_a_restored_relaunch_of_its_tab() {
         let a = Arc::new(Acting::default());
         a.open.lock().unwrap().insert("s-a".to_string());
         let mut h = a.hooks();
-        h.acts.relaunch_restored = Arc::new(|_, _, _, _| "wait:shell-prompt".to_string());
+        // Its retry held an hour ([`holding_retries`]), so the passes below
+        // look at it between its steps.
+        h.acts.relaunch_restored = Arc::new(|_, _, _, _| {
+            hold_this_steps_retry();
+            "wait:shell-prompt".to_string()
+        });
+        h.pause = holding_retries(Arc::clone(&h.pause));
         let mut codex_off = on();
         codex_off.off.push(Program::Codex);
         let host = HostHandle::start(codex_off, false, false, h);
         host.relaunch_restored(vec![restored("s-a", "in tab 1")]);
         until("the relaunch between its steps, its retry put off", || {
-            let mut queue = host.shared.restored.lock().unwrap();
-            match queue.attempts.front_mut() {
-                Some(attempt) if !attempt.acting && attempt.tried >= 1 => {
-                    attempt.due = Instant::now() + Duration::from_secs(3600);
-                    true
-                }
-                _ => false,
-            }
+            let queue = host.shared.restored.lock().unwrap();
+            queue
+                .attempts
+                .front()
+                .is_some_and(|attempt| !attempt.acting && attempt.tried >= 1)
         });
         if named {
             a.set(&[("s-a", Program::Codex)]);

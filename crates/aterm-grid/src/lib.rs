@@ -6,6 +6,9 @@
 // missing per-module allow cannot slip past clippy.
 #![warn(clippy::unwrap_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
+// The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
+// under them (crates/aterm-spec-anchor/anchor_rules.rs).
+#![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
 //! Terminal grid model: `Grid`, `GridStorage`, `MaterializedRow`, cells, rows,
 //! damage tracking and page storage.
@@ -37,7 +40,9 @@ pub(crate) mod test_counters;
 pub mod test_counters;
 
 pub use grid::Grid;
+pub use grid::ResizeLaw;
 pub use grid::scroll_convert::{scrollback_text_only, set_scrollback_text_only};
+pub use grid::{AnchorLend, LendReach};
 pub use grid::{CellDataView, HistoryLines, VisibleRowView};
 pub use grid::{
     HistoryFence, HistoryFenceBroken, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal,
@@ -66,10 +71,12 @@ pub use page::PageId;
 // Cursor, scroll region, and grid state types.
 pub use cursor::{Cursor, SavedCursor};
 pub use scroll_region::{HorizontalMargins, ScrollRegion};
+#[cfg(any(test, debug_assertions))]
+pub use state::with_knob;
 pub use state::{
-    AbsoluteRowUpdate, BandSet, GridCursorState, GridPresentationState, MAX_SELECTION_DAMAGE_BANDS,
-    OutputOrigin, ROW_BAND_MOVES_PER_BATCH, ResizeShape, RowBandMove, RowBandMoves,
-    SelectionDamage,
+    AbsoluteRowUpdate, Anchor, AnchorId, AnchorRole, AnchorSet, BandSet, FenceKnob,
+    GridCursorState, GridPresentationState, MAX_ANCHORS, MAX_SELECTION_DAMAGE_BANDS, OutputOrigin,
+    ROW_BAND_MOVES_PER_BATCH, ResizeShape, RowBandMove, RowBandMoves, SelectionDamage, knob,
 };
 
 // Terminal style types shared with checkpoint system.

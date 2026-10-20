@@ -421,10 +421,14 @@ impl App {
         self.write_session_meta_field(session, MetaField::Title, text)
     }
 
-    /// [`Self::write_session_title_pin`] for any presentation field. A role write also
-    /// re-projects the presence band (the role is its first slot, and the name a driven peer's
-    /// band prints for its driver) and the operator status item, as the `Wake::MetaChanged`
-    /// arm does for a wire `meta set role`.
+    /// [`Self::write_session_title_pin`] for any presentation field. A write
+    /// that moved one renames the session where its label is read: the
+    /// workers' Team chips and strip marks of a manager
+    /// ([`Self::rebuild_teams`]) and a needs pill naming it
+    /// ([`Self::reproject_pill_of`]); a ROLE write additionally refreshes its
+    /// presence and the operator status item — the same fan-out the
+    /// `Wake::MetaChanged` arm runs for a wire `meta set`, called directly for
+    /// the reason the title path gives above.
     pub(crate) fn write_session_meta_field(
         &mut self,
         session: u64,
@@ -440,15 +444,18 @@ impl App {
         } else {
             MetaEdit::Set(text)
         };
-        let changed = write_session_meta(&ctx, field, edit)?;
+        // The window's own editor: the person's.
+        let changed = write_session_meta(&ctx, field, edit, aterm_slog::Actor::Human)?;
         if changed {
             // The record landed under the meta guard, so the chrome cache's `high_id` gate
             // moved and the tooltip and context menu recompose with the label.
             self.refresh_meta_dependent_chrome(session);
+            self.rebuild_teams();
             if field != MetaField::Title {
-                self.refresh_presence_session(session, false);
-                self.refresh_operator_status_item();
+                self.refresh_presence_session(session);
+                self.mark_status_dirty();
             }
+            self.reproject_pill_of(session);
             if self.subscribers.any() {
                 self.subscribers
                     .lock()

@@ -7,14 +7,20 @@
 
 use super::*;
 use crate::autopilot::{AutopilotView, HarnessPosture};
+use crate::harness_ab::{AbArm, AbArmTotals};
 use crate::harness_screen::{
-    AbArmTotals, AbTotals, HarnessSession, HarnessStatsReport, HarnessStatsSlot, config_rows,
+    AbWeek, HarnessSession, HarnessStatsReport, HarnessStatsSlot, config_rows,
 };
 use crate::native_settings::harness_page::{
     HARNESS_CONFIG_TOGGLE, HARNESS_OPEN_CONFIG, HARNESS_REFRESH, harness_page_rows,
 };
 use aterm_agent::harness::stats::HarnessStats;
 use aterm_agent::supervise::{Autopilot, SupervisorConfig};
+
+/// SESSIONS' `Every session` row (design §11.5), with this module's
+/// fixtures and readers.
+#[path = "native_settings_harness_every_tests.rs"]
+mod every;
 
 /// A harness snapshot as the host publishes one: one supervised Claude Code
 /// session on Land by its own word, a reading of the ledgers and a later one
@@ -64,29 +70,76 @@ fn fixture() -> HarnessState {
             unavailable: Some("the ledgers' reader failed".to_string()),
             stale: false,
         },
-        ab: AbTotals {
-            cruise: AbArmTotals {
-                busy_ms: 97_000,
-                waiting_ms: 3_000,
-            },
-            land: AbArmTotals {
-                busy_ms: 60_000,
-                waiting_ms: 3_540_000,
-            },
-            off: AbArmTotals {
-                busy_ms: 59_000,
-                waiting_ms: 41_000,
-            },
-            unsupervised: AbArmTotals {
-                busy_ms: 30_000,
-                waiting_ms: 30_000,
-            },
-        },
+        ab: ab_week(),
         config: config_rows(&policy),
         land_at_offer: None,
         ai: crate::ai_screen::AiState::default(),
+        tabs: crate::harness_screen::TabControlState::default(),
+        decided_open: Vec::new(),
         today: 0,
     }
+}
+
+/// The A/B book's week the fixture publishes: each arm's time, a few boxes
+/// on each side, begun today.
+fn ab_week() -> AbWeek {
+    let mut week = AbWeek::default();
+    week.arms[AbArm::Cruise.index()] = AbArmTotals {
+        busy_ms: 97_000,
+        at_prompt_ms: 3_000,
+        ..AbArmTotals::default()
+    };
+    week.arms[AbArm::Land.index()] = AbArmTotals {
+        busy_ms: 60_000,
+        at_prompt_ms: 3_540_000,
+        finished_ms: 3_000_000,
+        ..AbArmTotals::default()
+    };
+    week.arms[AbArm::Off.index()] = AbArmTotals {
+        busy_ms: 59_000,
+        at_box_ms: 1_000,
+        at_prompt_ms: 40_000,
+        ..AbArmTotals::default()
+    };
+    week.arms[AbArm::Unsupervised.index()] = AbArmTotals {
+        busy_ms: 30_000,
+        at_prompt_ms: 30_000,
+        ..AbArmTotals::default()
+    };
+    week.holds[0][0][1] = 3;
+    week.holds[2][0][9] = 4;
+    week.first = Some((0, 0));
+    week
+}
+
+/// [`fixture`] whose A/B week leads (§11.6.1): Cruise with 6h 10m of
+/// working time, <1% of it held, beside Off's 25m, 14% held — or, where
+/// not `both`, Cruise alone, under the note — and ends counted: five
+/// landings with their spans and one quiet end.
+fn fixture_led(both: bool) -> HarnessState {
+    let mut state = fixture();
+    let mut week = ab_week();
+    week.arms[AbArm::Cruise.index()] = AbArmTotals {
+        busy_ms: 369 * 60_000,
+        at_box_ms: 60_000,
+        at_prompt_ms: 40 * 60_000,
+        ..AbArmTotals::default()
+    };
+    week.arms[AbArm::Off.index()] = if both {
+        AbArmTotals {
+            busy_ms: 21 * 60_000 + 30_000,
+            at_box_ms: 3 * 60_000 + 30_000,
+            at_prompt_ms: 5 * 60_000,
+            ..AbArmTotals::default()
+        }
+    } else {
+        AbArmTotals::default()
+    };
+    week.ends.landed = 5;
+    week.ends.quiet = 1;
+    week.ends.landing[crate::harness_ab::bucket(6 * 60_000)] = 5;
+    state.ab = week;
+    state
 }
 
 /// A Settings controller holding `state`, its view on Settings ▸ Harness.
@@ -301,27 +354,31 @@ fn the_harness_route_renders_its_cards_and_controls() {
         node(&pages, "harness/did/row/last-check").label,
         "Last check: failed: the ledgers' reader failed"
     );
-    // With and without: each state's share, and Cruise beside Off.
-    assert_eq!(
-        node(&pages, "harness/ab/row/cruise").label,
-        "Cruise: waited for input 3% of the time \u{b7} 1m measured"
-    );
-    assert_eq!(
-        node(&pages, "harness/ab/row/land").label,
-        "Land: waited for input 98% of the time \u{b7} 1h measured"
-    );
-    assert_eq!(
-        node(&pages, "harness/ab/row/unsupervised").label,
-        "Unsupervised: waited for input 50% of the time \u{b7} 1m measured"
-    );
-    assert_eq!(
-        node(&pages, "harness/ab/row/this-run").label,
-        "This run: agents waited for input 3% of the time on Cruise vs 41% with the harness off"
-    );
-    assert_eq!(
-        node(&pages, "harness/ab/row/finished").label,
-        "Finished: an agent done with its work still waits for input; each share counts that wait"
-    );
+    // The effect of each Autopilot: the holds' medians with n on each side,
+    // the shares, Land on its own row, and how long it measured.
+    for (row, label) in [
+        (
+            "boxes",
+            "Boxes: about 0.7 s on Cruise \u{b7} about 3m off \u{b7} median of 3 and 4 boxes seen",
+        ),
+        ("questions", "Questions: none seen yet"),
+        ("held", "Held: 0% of working time on Cruise \u{b7} 2% off"),
+        (
+            "at-its-prompt",
+            "At its prompt: Cruise 3% of 1m: finished 0%, pausing 0% \u{b7} Off 40% of 1m",
+        ),
+        (
+            "land",
+            "Land: held 0% \u{b7} at its prompt 98%, finished 83%",
+        ),
+        (
+            "unsupervised",
+            "Unsupervised: at its prompt 50% of 1m, in no comparison",
+        ),
+        ("measured", "Measured: today"),
+    ] {
+        assert_eq!(node(&pages, &format!("harness/ab/row/{row}")).label, label);
+    }
     // The effective table: the person's own key and how many more are at
     // their defaults; its disclosure opens every key.
     assert_eq!(
@@ -363,7 +420,7 @@ fn the_harness_route_renders_its_cards_and_controls() {
     );
     let toggle = node(&pages, HARNESS_CONFIG_TOGGLE);
     assert_eq!(toggle.state.and_then(|state| state.expanded), Some(true));
-    assert_eq!(toggle.label, "Show only the settings you changed");
+    assert_eq!(toggle.label, "Show only yours: the settings you changed");
 
     // Whole on every page, at three hosts.
     for (width, height) in [(1_200.0, 820.0), (900.0, 600.0), (320.0, 568.0)] {
@@ -380,9 +437,10 @@ fn the_harness_route_renders_its_cards_and_controls() {
 }
 
 /// THE QUIET STATES: no agent session open says so, once (the SESSIONS
-/// card, not STATUS too); an A/B arm with no time
-/// says "not measured yet", and no side-by-side sentence nor the finished
-/// agent's caveat is drawn; an
+/// card, not STATUS too); an A/B book with no time says so on each row
+/// (`none seen yet`, `not measured yet`, `none yet`, `none`, `nothing yet`:
+/// the Ends and Unsupervised rows stand, §11.6.7), with none of the old
+/// run's rows; an
 /// unread page says it is reading. Where the harness runs no mode (the
 /// master switch off), a session's three buttons are inert and none is
 /// selected.
@@ -390,7 +448,7 @@ fn the_harness_route_renders_its_cards_and_controls() {
 fn the_harness_route_says_what_it_has_not_got() {
     let mut empty = fixture();
     empty.sessions.clear();
-    empty.ab = AbTotals::default();
+    empty.ab = AbWeek::default();
     let (mut runtime, instance, view) = harness_route(empty);
     let pages = every_page(&mut runtime, instance, view, &view_cx());
     assert_eq!(
@@ -404,12 +462,21 @@ fn the_harness_route_says_what_it_has_not_got() {
             .is_none()),
         "no session open is said once, by the SESSIONS card"
     );
-    for arm in ["cruise", "land", "off"] {
+    for (row, words) in [
+        ("boxes", "none seen yet"),
+        ("questions", "none seen yet"),
+        ("held", "not measured yet"),
+        ("at-its-prompt", "not measured yet"),
+        ("land", "not measured yet"),
+        ("ends", "none yet"),
+        ("unsupervised", "none"),
+        ("measured", "nothing yet"),
+    ] {
         assert!(
-            node(&pages, &format!("harness/ab/row/{arm}"))
+            node(&pages, &format!("harness/ab/row/{row}"))
                 .label
-                .ends_with(": not measured yet"),
-            "{arm}"
+                .ends_with(&format!(": {words}")),
+            "{row}"
         );
     }
     for row in ["this-run", "finished"] {
@@ -417,7 +484,7 @@ fn the_harness_route_says_what_it_has_not_got() {
             pages.iter().all(|page| page
                 .semantic(&UiKey::new(format!("harness/ab/row/{row}")))
                 .is_none()),
-            "{row}: no side by side without both arms, no caveat without time"
+            "{row}: the run's rows are gone"
         );
     }
 
@@ -543,7 +610,7 @@ fn the_harness_routes_presses_are_typed_host_requests() {
 
 /// THE SESSION ROW'S STATE LINE AND TIMER (§9.3.4): an armed timer reads
 /// `lands at 18:00` under the row's detail (clock times only); the row's
-/// `Timer` disclosure opens `1 h`, `2 h`, `4 h`, `at 18:00` (with `[harness]
+/// `Timer` disclosure opens `1 hour`, `2 hours`, `4 hours`, `at 18:00` (with `[harness]
 /// land_at` set) and `Cancel` (while armed), each a typed host request
 /// (`HarnessTimerRequest`), and closes again. NEGATIVE CONTROLS: with no
 /// `land_at` there is no `at` button and with no timer armed no `Cancel`; a
@@ -633,7 +700,7 @@ fn a_sessions_timer_disclosure_arms_and_cancels_its_timed_cruise() {
             "Cruise for 4 hours, then land",
             TimerChoice::In(240),
         ),
-        ("land-at", "Cruise until 18:00, then land", TimerChoice::At),
+        ("land-at", "Cruise, then land at 18:00", TimerChoice::At),
         (
             "land-cancel",
             "Cancel the landing time",
@@ -796,9 +863,9 @@ fn a_sessions_buttons_follow_its_agents_own_switch() {
 }
 
 /// THE TIMER BY ITS SESSION'S OWN POSTURE, as the mode buttons (above): with
-/// Codex's switch Off, a Codex row's `Timer` is drawn inert and its `1 h`
+/// Codex's switch Off, a Codex row's `Timer` is drawn inert and its `1 hour`
 /// asks the host for nothing and names the switch; the Claude Code row
-/// beside it stays live and its `1 h` is a typed timer request.
+/// beside it stays live and its `1 hour` is a typed timer request.
 #[test]
 fn a_sessions_timer_follows_its_agents_own_switch() {
     use crate::autopilot_timers::TimerChoice;
@@ -932,7 +999,9 @@ fn the_harness_route_is_whole_on_every_host() {
         ]);
     let hosts: Vec<(f32, f32, bool)> = hosts.collect();
     at_each_text_scale(&[1.0, 1.25, 2.0], "Harness page", |scale| {
-        let (mut runtime, instance, view) = harness_route(fixture());
+        // With EFFECT's lead (§11.6.5 "The route"): Hero where it is whole,
+        // plain lines where not.
+        let (mut runtime, instance, view) = harness_route(fixture_led(true));
         for &(width, height, open) in &hosts {
             {
                 let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -1035,11 +1104,13 @@ fn an_off_defaults_button_does_not_say_it_follows_the_default() {
 
 /// THE SWITCHES EXPLAIN THEMSELVES on their own page, as every page's rows
 /// do ([`prefs::row_notes`]): what supervision does under Supervise coding
-/// agents, what an agent's own switch does once, under the last of them,
-/// Cruise/Land/Off under Default autopilot, All/Safe/None under
-/// Approve permission boxes, and the question priorities once, under
-/// Question priority, never under Answer questions as well. At a roomy
-/// window, the 80×24 one and the 102×29 one.
+/// agents, Cruise/Land/Off under Default autopilot, All/Safe/None under
+/// Approve permission boxes, each inside its row; what an agent's own switch
+/// does once, after the last of them, and the question priorities once,
+/// after Question priority, each the run's own stop
+/// (`settings/shared-note/…`), never inside that row's lines, as if its
+/// alone, nor under Answer questions as well. At a roomy window, the 80×24
+/// one and the 102×29 one.
 #[test]
 fn the_harness_switches_draw_their_notes() {
     // Every agent's switch, in the card's order: the agents' note is the
@@ -1058,11 +1129,7 @@ fn the_harness_switches_draw_their_notes() {
         // The note lines painted for `key`'s row — inside it, or as the
         // stops right after it — in line order, over every page (not as the
         // list's peek).
-        let painted = |key: &str| -> String {
-            let prefixes = [
-                format!("settings/detail/{key}/line-"),
-                format!("settings/note/{key}/line-"),
-            ];
+        let lines_of = |prefixes: &[String]| -> String {
             let mut lines = std::collections::BTreeMap::new();
             for node in pages.iter().flat_map(|page| page.paint.iter()) {
                 let Some(line) = prefixes
@@ -1078,21 +1145,40 @@ fn the_harness_switches_draw_their_notes() {
             }
             lines.into_values().collect::<Vec<_>>().join(" ")
         };
+        let painted = |key: &str| {
+            lines_of(&[
+                format!("settings/detail/{key}/line-"),
+                format!("settings/note/{key}/line-"),
+            ])
+        };
+        let shared = |key: &str| lines_of(&[format!("settings/shared-note/{key}/line-")]);
         let context = format!("{width}\u{d7}{height}");
         for (key, note) in [
             (prefs::EDIT_HARNESS_ENABLED, prefs::HARNESS_NOTE),
-            (last_agent.0.as_str(), prefs::HARNESS_AGENT_NOTE),
             (prefs::EDIT_HARNESS_AUTOPILOT, prefs::HARNESS_AUTOPILOT_NOTE),
             (prefs::EDIT_HARNESS_APPROVE, prefs::HARNESS_APPROVE_NOTE),
+        ] {
+            assert!(
+                words(&painted(key)).contains(&words(note)),
+                "{context}: {key} draws its note; painted {:?}",
+                painted(key)
+            );
+        }
+        for (key, note) in [
+            (last_agent.0.as_str(), prefs::HARNESS_AGENT_NOTE),
             (
                 prefs::EDIT_HARNESS_QUESTION_PRIORITY,
                 prefs::HARNESS_QUESTIONS_NOTE,
             ),
         ] {
             assert!(
-                words(&painted(key)).contains(&words(note)),
-                "{context}: {key} draws its note; painted {:?}",
-                painted(key)
+                words(&shared(key)).contains(&words(note)),
+                "{context}: the run {key} closes draws its note after it; shared {:?}",
+                shared(key)
+            );
+            assert!(
+                !words(&painted(key)).contains(&words(note)),
+                "{context}: the run's note is not {key}'s own lines"
             );
         }
         assert!(
@@ -1176,8 +1262,8 @@ fn the_harness_rows_say_when_they_are_inactive() {
 
 /// AN IDLE ROW'S CONTROL IS MUTED, every segment of it: with Supervise
 /// coding agents Off, every finer row's control — Default autopilot's and
-/// Approve permission boxes' segments, the agents' switches, Question
-/// priority's popup — carries `muted`, so the painter draws it in quiet ink
+/// Approve permission boxes' and Question priority's segments, the agents'
+/// switches — carries `muted`, so the painter draws it in quiet ink
 /// rather than the live accent (`native_ui`'s
 /// `a_muted_selected_segment_paints_no_accent`); the master switch does not.
 /// NEGATIVE CONTROL: at the defaults no control is muted.
@@ -1221,11 +1307,18 @@ fn an_idle_rows_control_is_muted_every_segment_of_it() {
     );
     assert_eq!(
         muted(Some("[harness]\nanswer_questions = false\n")),
-        [format!(
-            "settings/control/{}",
-            prefs::EDIT_HARNESS_QUESTION_PRIORITY
-        )],
-        "only the row Answer questions Off idles"
+        [
+            format!("settings/control/{}", prefs::EDIT_HARNESS_QUESTION_PRIORITY),
+            format!(
+                "settings/segment/{}/1",
+                prefs::EDIT_HARNESS_QUESTION_PRIORITY
+            ),
+            format!(
+                "settings/segment/{}/2",
+                prefs::EDIT_HARNESS_QUESTION_PRIORITY
+            ),
+        ],
+        "only the row Answer questions Off idles, every segment of it"
     );
 }
 
@@ -1352,7 +1445,17 @@ fn the_timers_at_button_names_the_day_it_would_arm() {
             .unwrap();
         let pages = every_page(&mut runtime, instance, view, &view_cx());
         let key = "harness/session/7/land-at";
-        assert_eq!(node(&pages, key).label, spoken, "{day:?}");
+        // Named by the words it paints; the day in full, its description.
+        assert_eq!(
+            node(&pages, key).label,
+            format!("Cruise, then land {face}"),
+            "{day:?}"
+        );
+        assert_eq!(
+            node(&pages, key).description.as_deref(),
+            Some(spoken),
+            "{day:?}"
+        );
         assert_eq!(button_face(&pages, key), face, "{day:?}");
     }
 }
@@ -1399,8 +1502,12 @@ fn painted<'a>(
 /// lines take what the first screen has left: Hero type where it has the
 /// room (744 × 420, at 1× and 2×), the page's plain type where it has not
 /// (584 × 348 at 1×), and at 2× on the short page, none (WHAT THE HARNESS DID still says
-/// every count today). CONTROL: on a tall page the lines are drawn whole in
-/// Hero type, the label both lines whole.
+/// every count today) — under macOS's UI face; Windows' measures leave that page
+/// the room for the plain type. Linux's UI face is the host's, Noto Sans on a stock
+/// desktop, wider than both: at 2× its Hero line (716pt in Noto Sans SemiBold, 730pt
+/// in its Bold) is not whole on the 744pt page's card, so there the face decides,
+/// Hero exactly where the line is whole at the card's width. CONTROL: on a tall page
+/// the lines are drawn whole in Hero type, the label both lines whole.
 #[test]
 fn sessions_stays_on_the_first_screen_under_todays_lines() {
     use crate::native_ui::{StyleRef, UiContent};
@@ -1411,18 +1518,41 @@ fn sessions_stays_on_the_first_screen_under_todays_lines() {
         })
     };
     let first = "3 approved today \u{b7} 1 answered";
-    for (scale, width, height, want) in [
-        (1.0, 584.0, 348.0, Some(StyleRef::Primary)),
-        (1.0, 744.0, 420.0, Some(StyleRef::Hero)),
-        (1.0, 849.0, 900.0, Some(StyleRef::Hero)),
-        (2.0, 584.0, 348.0, None),
-        (2.0, 744.0, 420.0, Some(StyleRef::Hero)),
+    // The last column: on Linux the host's face decides between Hero and plain.
+    for (scale, width, height, want, face_decides) in [
+        (1.0, 584.0, 348.0, Some(StyleRef::Primary), false),
+        (1.0, 744.0, 420.0, Some(StyleRef::Hero), false),
+        (1.0, 849.0, 900.0, Some(StyleRef::Hero), false),
+        (
+            2.0,
+            584.0,
+            348.0,
+            cfg!(windows).then_some(StyleRef::Primary),
+            false,
+        ),
+        (2.0, 744.0, 420.0, Some(StyleRef::Hero), true),
     ] {
         at_each_text_scale(&[scale], "Harness first screen", |_| {
             let (mut runtime, instance, view) = harness_route(fixture());
             let pages = every_page(&mut runtime, instance, view, &view_cx_at(width, height));
             let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
             let page = &pages[0];
+            let want = if face_decides && cfg!(target_os = "linux") {
+                let line = painted(page, "harness/status/today/hero")
+                    .unwrap_or_else(|| panic!("{context}: today's first line is drawn"));
+                let (px, face) = crate::native_ui::text_paint_metrics(
+                    crate::native_ui::SemanticRole::Heading,
+                    StyleRef::Hero,
+                );
+                let hero = crate::tray_raster::ui_text_width_for(face, first, px);
+                Some(if hero <= line.rect.width {
+                    StyleRef::Hero
+                } else {
+                    StyleRef::Primary
+                })
+            } else {
+                want
+            };
             assert!(
                 page.semantic(&UiKey::new("harness/sessions/heading"))
                     .is_some(),
@@ -1527,6 +1657,127 @@ fn todays_lines_give_way_hero_then_plain_then_the_second_line() {
     });
 }
 
+/// A NOTE IS NEVER DRAWN IN HERO TYPE, AND KEEPS THE COUNTS' ROOM (the
+/// post-check of wave 1, owner-eye-7, and its review): Hero type is for a
+/// line of counts; `nothing yet today` and `reading…` say no count, and are
+/// drawn in the page's plain type — in the Hero line's slot wherever Hero
+/// would hold them, so the counts that replace them (the first reading, the
+/// day's first act) move nothing under STATUS: SESSIONS' heading stands where
+/// it stood, at 1× and 2× text. Where the budget holds no Hero line, the
+/// note and the counts are both plain, as tall. CONTROLS: a line of counts in
+/// the same budget and width is drawn in Hero type; a note too wide for Hero
+/// type at the width is as short as a plain line. NEGATIVE CONTROL: a note at
+/// plain height in a page with room for Hero moves SESSIONS when the counts
+/// come (6 px at 1×, 32 px at 2×).
+#[test]
+fn todays_notes_are_drawn_in_the_pages_plain_type() {
+    use crate::harness_screen::{TODAY_NOTHING_YET, TODAY_READING};
+    use crate::native_settings::harness_page::today_block;
+    use crate::native_ui::{StyleRef, UiContent};
+    let drawn = |first: &str, inner: f32, budget: f32| {
+        let (node, height) =
+            today_block(&(first.to_string(), String::new()), inner, budget).expect("a block");
+        let styles: Vec<(SemanticRole, StyleRef, f32)> = node
+            .children
+            .iter()
+            .map(|child| match &child.content {
+                UiContent::Text(text) => (
+                    text.role,
+                    text.style,
+                    match child.layout.height {
+                        crate::native_ui::Length::Fixed(height) => height,
+                        other => panic!("a fixed height: {other:?}"),
+                    },
+                ),
+                other => panic!("a text: {other:?}"),
+            })
+            .collect();
+        (styles, height)
+    };
+    // Where SESSIONS' heading is drawn on the page for `state`, at 849 × 900.
+    let sessions_at = |state: HarnessState| {
+        let (runtime, instance, view) = harness_route(state);
+        let page = compile_settings_view(&runtime, instance, view, &view_cx_at(849.0, 900.0));
+        let style = painted(&page, "harness/status/today/hero").map(|n| match &n.content {
+            UiContent::Text(text) => text.style,
+            other => panic!("a text: {other:?}"),
+        });
+        let heading = painted(&page, "harness/sessions/heading").map(|n| n.rect.y);
+        (style, heading.expect("SESSIONS is drawn"))
+    };
+    let reading = || {
+        let mut state = fixture();
+        state.stats.report = None;
+        state.stats.collecting = true;
+        state.stats.unavailable = None;
+        state
+    };
+    let read = |approved: u64| {
+        let mut today = HarnessStats::new(0);
+        today.approved = approved;
+        today.rows = approved;
+        let mut state = fixture();
+        state.stats.report = Some(std::sync::Arc::new(HarnessStatsReport::new(
+            today.clone(),
+            today,
+            1_000_000_000,
+            Some(0),
+            &|_| Some(0),
+        )));
+        state.stats.unavailable = None;
+        state
+    };
+    at_each_text_scale(&[1.0, 2.0], "today's notes", |scale| {
+        let (counts, hero_height) = drawn("3 approved today", 1_000.0, 400.0);
+        assert_eq!(
+            counts,
+            [(SemanticRole::Heading, StyleRef::Hero, hero_height)],
+            "control"
+        );
+        for note in [TODAY_NOTHING_YET, TODAY_READING] {
+            let (styles, height) = drawn(note, 1_000.0, 400.0);
+            assert_eq!(
+                styles,
+                [(SemanticRole::Text, StyleRef::Primary, hero_height)],
+                "{note}: plain type in the Hero line's slot"
+            );
+            assert_eq!(height, hero_height, "{note}: the counts' room");
+            // No room for a Hero line: both plain, as tall.
+            let short = hero_height - 1.0;
+            let (_, plain) = drawn("3 approved today", 1_000.0, short);
+            assert_eq!(drawn(note, 1_000.0, short).1, plain, "{note}: short");
+            assert!(plain < hero_height, "{note}: {plain} under {hero_height}");
+            // Too narrow for Hero type: a plain line's height (the counts go
+            // plain there too).
+            assert_eq!(drawn(note, 40.0, 400.0).1, plain, "{note}: narrow");
+        }
+        let context = format!("{scale}\u{d7}");
+        let (style, before) = sessions_at(reading());
+        assert_eq!(
+            style,
+            Some(StyleRef::Primary),
+            "{context}: reading… is plain"
+        );
+        let (style, empty) = sessions_at(read(0));
+        assert_eq!(
+            style,
+            Some(StyleRef::Primary),
+            "{context}: nothing yet is plain"
+        );
+        let (style, after) = sessions_at(read(3));
+        assert_eq!(
+            style,
+            Some(StyleRef::Hero),
+            "{context}: the counts are Hero"
+        );
+        assert_eq!(
+            (before, empty),
+            (after, after),
+            "{context}: SESSIONS stands where it stood as the counts come"
+        );
+    });
+}
+
 /// A fixture whose session 7 has a day of its own today, and a second row
 /// whose title it shares where `twin`.
 fn fixture_with_a_day(twin: bool) -> HarnessState {
@@ -1623,7 +1874,7 @@ fn a_rows_day_its_show_and_its_landing() {
             .state
             .expect("a control")
             .selected;
-        let accent = pages.iter().find_map(|page| painted(page, "harness/session/7")).map(|n| {
+        let accent = pages.iter().find_map(|page| painted(page, "harness/session/7/block")).map(|n| {
             matches!(&n.content, UiContent::Group(group) if group.style == StyleRef::Primary)
         });
         (selected, accent)
@@ -1651,6 +1902,249 @@ fn a_rows_day_its_show_and_its_landing() {
         land(&mut runtime, None),
         (false, Some(false)),
         "no words, no landing"
+    );
+}
+
+/// THE LANDED ROW'S CARD HOLDS ITS WHOLE BLOCK, CLEAR OF ITS WORDS (the
+/// post-check of wave 1, owner-eye-3): the accent card is drawn around the
+/// row's whole block — its title and detail, its buttons, its state line,
+/// its day and its open timer's buttons — inset so its outline touches no
+/// glyph and no button: 8 px beside them, half the gap between rows over and
+/// under them; never cut by its card. At every row layout (one line, the
+/// words over the buttons, the buttons on two lines or more; Compact to
+/// wide; 1× and 2× text) and with and without the lines under the row. And
+/// nothing moves when it lands: each of its words stands where it stood
+/// unlanded, the row's title at the SESSIONS heading's left edge.
+/// NEGATIVE CONTROL: unlanded, no block is drawn on the accent.
+#[test]
+fn a_landed_rows_card_holds_its_whole_block_clear_of_its_words() {
+    use crate::harness_glass::Stamp;
+    use crate::native_app::SemanticInput;
+    use crate::native_ui::{StyleRef, UiContent};
+    use aterm_agent::harness::acts::Act;
+    let bare = fixture();
+    let mut full = fixture_with_a_day(true);
+    full.sessions[0].glass.last = Some((
+        Act::Approved,
+        Stamp {
+            clock: crate::claude_lights::Clock::of_minute(14 * 60 + 5),
+            day: 0,
+        },
+    ));
+    let shapes = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    for (name, state, timer) in [("bare", &bare, false), ("full", &full, true)] {
+        at_each_text_scale(&[1.0, 2.0], "the landed row", |scale| {
+            for width in [320.0, 584.0, 760.0, 1_200.0, 2_400.0] {
+                let context = format!("{name} {scale}\u{d7} {width}");
+                let (mut runtime, instance, view) = harness_route(state.clone());
+                if timer {
+                    press_for_requests(
+                        &mut runtime,
+                        instance,
+                        view,
+                        "harness/session/7/timer",
+                        None,
+                    );
+                }
+                // Tall enough that the whole row is on the first screen at
+                // every width and scale: the landing has nothing to scroll.
+                let cx = view_cx_at(width, 1_400.0);
+                let rects = |pages: &[crate::native_ui::CompiledUi]| {
+                    pages
+                        .iter()
+                        .flat_map(|page| page.paint.iter())
+                        .filter(|n| n.key.as_str().starts_with("harness/session/7/"))
+                        .map(|n| (n.key.as_str().to_string(), n.rect))
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                };
+                let accent = |pages: &[crate::native_ui::CompiledUi]| {
+                    pages
+                        .iter()
+                        .flat_map(|page| page.paint.iter())
+                        .filter(|n| {
+                            matches!(&n.content, UiContent::Group(g) if g.style == StyleRef::Primary)
+                                && n.key.as_str().starts_with("harness/session/")
+                        })
+                        .map(|n| n.key.as_str().to_string())
+                        .collect::<Vec<_>>()
+                };
+                let before = [compile_settings_view(&runtime, instance, view, &cx)];
+                assert!(
+                    accent(&before).is_empty(),
+                    "{context}: control, nothing landed"
+                );
+                let unlanded = rects(&before);
+                press_for_requests(
+                    &mut runtime,
+                    instance,
+                    view,
+                    crate::harness_screen::HARNESS_LAND,
+                    Some(SemanticInput::Text("session/7".to_string())),
+                );
+                let pages = [compile_settings_view(&runtime, instance, view, &cx)];
+                assert_eq!(
+                    accent(&pages),
+                    ["harness/session/7/block"],
+                    "{context}: the block alone is on the accent"
+                );
+                let block = pages
+                    .iter()
+                    .find_map(|page| painted(page, "harness/session/7/block"))
+                    .expect("the block is drawn");
+                assert_eq!(block.clip, block.rect, "{context}: the card is drawn whole");
+                let landed = rects(&pages);
+                assert_eq!(landed, unlanded, "{context}: nothing moved when it landed");
+                let inside = |key: &str| landed.keys().any(|k| k == key);
+                let mut lines = vec!["title", "detail", "show"];
+                if name == "full" {
+                    lines.extend(["state", "today", "timer-row/0"]);
+                }
+                for line in lines {
+                    let key = format!("harness/session/7/{line}");
+                    assert!(inside(&key), "{context}: {key} is drawn");
+                }
+                let (b, r) = (block.rect, block.rect.right());
+                for (key, rect) in &landed {
+                    if key.ends_with("/block") {
+                        continue;
+                    }
+                    assert!(
+                        rect.x >= b.x + 8.0 - 0.01
+                            && rect.right() <= r - 8.0 + 0.01
+                            && rect.y >= b.y + 3.0 - 0.01
+                            && rect.y + rect.height <= b.y + b.height - 3.0 + 0.01,
+                        "{context}: {key} {rect:?} clear of the card's outline {b:?}"
+                    );
+                }
+                // The words stand where the card's heading does.
+                let heading = pages
+                    .iter()
+                    .find_map(|page| painted(page, "harness/sessions/heading"))
+                    .expect("SESSIONS' heading");
+                let title = landed["harness/session/7/title"];
+                assert!(
+                    (title.x - heading.rect.x).abs() < 0.01,
+                    "{context}: the title at the heading's edge, {title:?} {:?}",
+                    heading.rect
+                );
+                let cruise = landed["harness/session/7/autopilot/cruise"];
+                shapes
+                    .lock()
+                    .unwrap()
+                    .insert(if cruise.y >= title.y + title.height - 0.01 {
+                        "stacked"
+                    } else {
+                        "one line"
+                    });
+            }
+        });
+    }
+    assert_eq!(
+        shapes.into_inner().unwrap().into_iter().collect::<Vec<_>>(),
+        ["one line", "stacked"],
+        "both row layouts were drawn"
+    );
+}
+
+/// THE LANDING DRAWS ALL OF THE BLOCK IT SELECTS (the review of
+/// v3/polish-page's fixes, finding 2): `⚙` lands Settings ▸ Harness on a
+/// SESSIONS row and draws its whole block — the row, its state, its day, its
+/// open timer — on the accent, so the page scrolls until all of that block
+/// is whole in the list's room (live, not cut by its edge nor a fading
+/// picture in the strip kept for a status bar) wherever the room holds it,
+/// and to the block's top where it is taller than the list: on the 80 × 24
+/// window's page (584 × 348), the shipped 744 × 420, a short wide host
+/// (1200 × 348), taller ones (480, 528, 600) and a 1200 × 456, at 1× and 2×
+/// text, its timer closed and open. Its words stand clear of the outline by
+/// half the card's padding at least: 8 px, 4 px where a short page's card
+/// takes its tight padding. NEGATIVE CONTROL: a landing that stops once the
+/// row's buttons are whole in the room (`reveal_controls`, the fix's
+/// absence) leaves the 744 × 480 page's block at 1× with its state and day
+/// lines in the fading strip under the room, and at 2× cut by the list's
+/// edge.
+#[test]
+fn a_landing_draws_all_of_the_block_it_selects() {
+    use crate::native_app::SemanticInput;
+    let full = fixture_with_a_day(true);
+    let tall = std::sync::Mutex::new(0_usize);
+    at_each_text_scale(&[1.0, 2.0], "the landed block", |scale| {
+        for (width, height) in [
+            (584.0, 348.0),
+            (744.0, 420.0),
+            (1_200.0, 348.0),
+            (584.0, 600.0),
+            (744.0, 480.0),
+            (744.0, 528.0),
+            (744.0, 600.0),
+            (1_200.0, 456.0),
+        ] {
+            for timer in [false, true] {
+                let context = format!("{scale}\u{d7} {width}\u{d7}{height}, timer open={timer}");
+                let (mut runtime, instance, view) = harness_route(full.clone());
+                if timer {
+                    press_for_requests(
+                        &mut runtime,
+                        instance,
+                        view,
+                        "harness/session/7/timer",
+                        None,
+                    );
+                }
+                press_for_requests(
+                    &mut runtime,
+                    instance,
+                    view,
+                    crate::harness_screen::HARNESS_LAND,
+                    Some(SemanticInput::Text("session/7".to_string())),
+                );
+                let page =
+                    compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+                let block = painted(&page, "harness/session/7/block")
+                    .unwrap_or_else(|| panic!("{context}: the landed block is drawn"));
+                let list = painted(&page, "settings/list").expect("the page's list");
+                assert!(
+                    (block.clip.y - block.rect.y).abs() < 0.01,
+                    "{context}: the block's top is drawn, {:?} of {:?}",
+                    block.clip,
+                    block.rect
+                );
+                // All of it, whole and live in the list's room (never cut,
+                // never a fading picture in the strip under the room) —
+                // except a block taller than the room, which lands at the
+                // list's top.
+                let whole = block.clip == block.rect && !block.peek && block.fade.is_none();
+                if !whole {
+                    assert!(
+                        block.rect.height > list.clip.height - 60.0
+                            && block.rect.y < list.clip.y + 60.0,
+                        "{context}: a block {:?} (drawn {:?}, peek={}, fade={:?}) is whole in \
+                         the list's room, or about as tall as the list {:?} and at its top",
+                        block.rect,
+                        block.clip,
+                        block.peek,
+                        block.fade,
+                        list.clip
+                    );
+                    *tall.lock().unwrap() += 1;
+                }
+                let b = block.rect;
+                for node in page.paint.iter().filter(|n| {
+                    let key = n.key.as_str();
+                    key.starts_with("harness/session/7/") && !key.ends_with("/block")
+                }) {
+                    let r = node.rect;
+                    assert!(
+                        r.x >= b.x + 4.0 - 0.01 && r.right() <= b.right() - 4.0 + 0.01,
+                        "{context}: {} {r:?} clear of the outline {b:?}",
+                        node.key.as_str()
+                    );
+                }
+            }
+        }
+    });
+    assert!(
+        *tall.lock().unwrap() < 16,
+        "most of the hosts hold the whole block (32 drawn)"
     );
 }
 
@@ -1778,10 +2272,11 @@ fn a_rows_words_keep_its_place_whole_and_its_buttons_their_faces() {
                             "{context}: {face}'s face whole, {painted:?}"
                         );
                     }
-                    // CONTROL: roomy, the words beside the buttons. (At 2×
-                    // the page's column never holds a place beside five
-                    // buttons: the rows stay stacked.)
-                    if width > 2_000.0 && scale < 2.0 {
+                    // CONTROL: roomy, the words beside the buttons. (The
+                    // page's column is the form measure: from 1.25× it never
+                    // holds a place beside five buttons, and the rows stay
+                    // stacked.)
+                    if width > 2_000.0 && scale < 1.25 {
                         let cruise = find(&format!("harness/session/{id}/autopilot/cruise"));
                         assert!(
                             cruise.rect.y < detail.rect.y + detail.rect.height
@@ -1795,4 +2290,893 @@ fn a_rows_words_keep_its_place_whole_and_its_buttons_their_faces() {
             }
         });
     }
+}
+
+/// The fixture with `n` refusals today (oldest first, a minute apart from
+/// 18:00 UTC), every other one session 7's and the rest a closed session's,
+/// and `total` today in all.
+fn fixture_deciding(n: usize, total: u64) -> HarnessState {
+    use aterm_agent::harness::stats::{Decision, DecisionKind};
+    let mut state = fixture();
+    let report = state.stats.report.take().expect("a reading");
+    let mut report = (*report).clone();
+    let mut today = HarnessStats::per_session(0);
+    today.declined = total;
+    let decided = today.decided.as_mut().expect("per session");
+    decided.total = total;
+    decided.rows = (0..n)
+        .map(|k| Decision {
+            t_ms: (18 * 3_600 + i64::try_from(k).expect("few") * 60) * 1_000,
+            sid: if k % 2 == 0 { "s-7" } else { "s-gone" }.to_string(),
+            kind: DecisionKind::Declined,
+            asked: Box::from(format!("rm -rf build-{k}")),
+            said: false,
+            did: Box::from(""),
+            why: Some(Box::from("Nothing outside the worktree is removed.")),
+            times: 1,
+        })
+        .collect();
+    report.today = today;
+    report = HarnessStatsReport::new(
+        report.today,
+        report.week,
+        report.collected_unix_ms,
+        report.offset_s,
+        &|_| Some(0),
+    );
+    state.stats.report = Some(std::sync::Arc::new(report));
+    state
+}
+
+/// The keys of `state`'s DECIDED FOR YOU rows, oldest first:
+/// `harness/decided/<id>`, each its decision's id.
+fn decided_keys(state: &HarnessState) -> Vec<String> {
+    state
+        .stats
+        .report
+        .as_deref()
+        .and_then(|report| report.today.decided.as_ref())
+        .map(|decided| {
+            decided
+                .rows
+                .iter()
+                .map(|decision| format!("harness/decided/{}", decision.id()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// DECIDED FOR YOU ON THE PAGE (§10.4.2, item 4; §10.4.3 "controls prefs
+/// lists the keys"): the card comes right after SESSIONS, keyed
+/// `harness/decided`; it lists the newest three rows (`harness/decided/<id>`,
+/// each its decision's id), each labelled with its clock and sentence, the
+/// open session's with `Show tab` (`harness/decided/<id>/show`), whose action is
+/// the SESSIONS row's own Show (behind its one Owner fence) and asks the
+/// host to raise it; then `Show all 5` (`harness/decided/all`, collapsed),
+/// which opens the rest. STATUS's second line counts them. NEGATIVE
+/// CONTROLS: the closed session's rows have no `Show tab`; the two oldest
+/// are not listed until the disclosure opens.
+#[test]
+fn decided_for_you_lists_its_keys_after_sessions() {
+    use crate::native_app::HarnessRequest;
+    let state = fixture_deciding(5, 5);
+    let k = decided_keys(&state);
+    let (mut runtime, instance, view) = harness_route(state);
+    let keys = |pages: &[crate::native_ui::CompiledUi]| -> Vec<String> {
+        pages
+            .iter()
+            .flat_map(|page| page.semantics.iter())
+            .map(|node| node.key.as_str().to_string())
+            .collect()
+    };
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    let all = keys(&pages);
+    let at = |key: &str| all.iter().position(|k| k == key);
+    let sessions = at("harness/sessions").expect("SESSIONS");
+    let decided = at("harness/decided").expect("DECIDED FOR YOU");
+    let switches = at("harness/switches").expect("SUPERVISION");
+    assert!(sessions < decided && decided < switches, "{all:#?}");
+    assert_eq!(
+        node(&pages, "harness/decided/heading").label,
+        "DECIDED FOR YOU"
+    );
+    for key in &k[2..] {
+        assert!(at(key).is_some(), "row {key}");
+    }
+    assert!(at(&k[1]).is_none() && at(&k[0]).is_none());
+    assert_eq!(
+        node(&pages, &k[4]).label,
+        "18:04 fix the build: declined rm -rf build-4: Nothing outside the worktree is removed."
+    );
+    assert_eq!(
+        node(&pages, &k[3]).label,
+        "18:03 A closed session: declined rm -rf build-3: Nothing outside the worktree is removed."
+    );
+    let show = node(&pages, &format!("{}/show", k[4]));
+    assert_eq!(show.label, "Show tab of fix the build");
+    assert_eq!(
+        show.action.as_ref().map(ActionId::as_str),
+        Some("harness/session/7/show"),
+        "the SESSIONS row's own action, behind the prefix's Owner fence"
+    );
+    assert!(at(&format!("{}/show", k[3])).is_none(), "CONTROL: closed");
+    let disclosure = node(&pages, "harness/decided/all");
+    assert_eq!(disclosure.label, "Show all 5 choices made for you today");
+    assert_eq!(disclosure.state.expect("a control").expanded, Some(false));
+    assert!(
+        node(&pages, "harness/status/today")
+            .label
+            .ends_with("5 choices made for you"),
+        "{}",
+        node(&pages, "harness/status/today").label
+    );
+    assert_eq!(
+        press_for_requests(&mut runtime, instance, view, "harness/session/7/show", None),
+        [HarnessRequest::Show { session: 7 }]
+    );
+    // The disclosure opens the rest.
+    press_for_requests(
+        &mut runtime,
+        instance,
+        view,
+        crate::native_settings::harness_page::HARNESS_DECIDED_ALL,
+        None,
+    );
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    let all = keys(&pages);
+    for key in &k {
+        assert!(all.contains(key), "row {key}: {all:#?}");
+    }
+    let disclosure = node(&pages, "harness/decided/all");
+    assert_eq!(disclosure.state.expect("a control").expanded, Some(true));
+    assert_eq!(
+        disclosure.label,
+        "Show the newest 3 choices made for you, only"
+    );
+}
+
+/// THE CAP SAID (§10.4.1, "at most 64"): with more choices today than are
+/// kept, the disclosure says the newest it lists of how many. NEGATIVE
+/// CONTROL: three or fewer have no disclosure.
+#[test]
+fn decided_for_you_says_the_newest_of_how_many() {
+    let (mut runtime, instance, view) = harness_route(fixture_deciding(64, 80));
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    assert_eq!(
+        node(&pages, "harness/decided/all").label,
+        "Show the newest 64 of 80 choices made for you today"
+    );
+    let state = fixture_deciding(3, 3);
+    let k = decided_keys(&state);
+    let (mut runtime, instance, view) = harness_route(state);
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    assert!(
+        pages
+            .iter()
+            .all(|page| page.semantic(&UiKey::new("harness/decided/all")).is_none()),
+        "CONTROL: no disclosure for three"
+    );
+    assert!(
+        pages
+            .iter()
+            .any(|page| page.semantic(&UiKey::new(k[0].as_str())).is_some())
+    );
+}
+
+/// NO CARD ON AN EMPTY DAY (§10.4.1, "present only when today holds a
+/// decision"): the fixture's day has counts but no decision, so no
+/// `harness/decided` key is on any page, and STATUS counts none. NEGATIVE
+/// CONTROL: one decision draws the card.
+#[test]
+fn no_decided_card_on_a_day_without_a_choice() {
+    let (mut runtime, instance, view) = harness_route(fixture_deciding(0, 0));
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    assert!(
+        pages
+            .iter()
+            .flat_map(|page| page.semantics.iter())
+            .all(|node| !node.key.as_str().starts_with("harness/decided")),
+        "no card"
+    );
+    let (mut runtime, instance, view) = harness_route(fixture());
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    assert!(
+        pages
+            .iter()
+            .all(|page| page.semantic(&UiKey::new("harness/decided")).is_none()),
+        "a reading with no decisions kept"
+    );
+    let (mut runtime, instance, view) = harness_route(fixture_deciding(1, 1));
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    assert!(
+        pages
+            .iter()
+            .any(|page| page.semantic(&UiKey::new("harness/decided")).is_some()),
+        "CONTROL: one decision, one card"
+    );
+}
+
+/// SHOW TAB FOR A SESSION SESSIONS DOES NOT LIST (§10.4.2, item 4): the
+/// agent has exited, its tab is open, so the decision's row names it by its
+/// title and its `Show tab` asks the host to raise it — the reducer takes
+/// the id from [`HarnessState::decided_open`] as well as from SESSIONS.
+/// NEGATIVE CONTROL: an id neither lists asks for nothing.
+#[test]
+fn a_decided_show_tab_raises_a_session_sessions_does_not_list() {
+    use crate::native_app::HarnessRequest;
+    let mut state = fixture_deciding(2, 2);
+    state.decided_open = vec![crate::harness_screen::OpenSession {
+        sid: "s-gone".to_string(),
+        local_id: 9,
+        title: "zsh".to_string(),
+    }];
+    let k = decided_keys(&state);
+    let (mut runtime, instance, view) = harness_route(state);
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    let show = node(&pages, &format!("{}/show", k[1]));
+    assert_eq!(show.label, "Show tab of zsh");
+    assert_eq!(
+        show.action.as_ref().map(ActionId::as_str),
+        Some("harness/session/9/show")
+    );
+    assert_eq!(
+        press_for_requests(&mut runtime, instance, view, "harness/session/9/show", None),
+        [HarnessRequest::Show { session: 9 }]
+    );
+    assert!(
+        press_for_requests(
+            &mut runtime,
+            instance,
+            view,
+            "harness/session/11/show",
+            None
+        )
+        .is_empty(),
+        "CONTROL: a session neither lists"
+    );
+}
+
+/// DECIDED FOR YOU IS WHOLE ON EVERY HOST: open with every kept row of
+/// long sentences, on a phone page, the 80 × 24 window's, a Medium and a
+/// wide one, at 1×, 1.25× and 2× text: no text overflows or is clipped, and
+/// every hit target is material and inside its parent; a sentence wraps
+/// (its label whole). CONTROL: the same rows closed list three.
+#[test]
+fn decided_for_you_is_whole_on_every_host() {
+    use aterm_agent::harness::stats::{Decision, DecisionKind};
+    let long = "Should divide() return true division (float) or floor division, and what about \
+                negative operands, rounding toward zero or toward negative infinity?";
+    let mut state = fixture_deciding(0, 0);
+    let report = state.stats.report.take().expect("a reading");
+    let mut report = (*report).clone();
+    let decided = report.today.decided.as_mut().expect("decisions");
+    decided.rows = (0..12)
+        .map(|k| Decision {
+            t_ms: (9 * 3_600 + k * 60) * 1_000,
+            sid: if k % 3 == 0 { "s-gone" } else { "s-7" }.to_string(),
+            kind: DecisionKind::Chose,
+            asked: aterm_agent::harness::stats::agent_words(long),
+            said: false,
+            did: aterm_agent::harness::stats::agent_words(long),
+            why: Some(Box::from(
+                "no option was marked Recommended, so it took the first",
+            )),
+            times: 1,
+        })
+        .collect();
+    decided.total = 12;
+    report.today.answered = 12;
+    report = HarnessStatsReport::new(
+        report.today,
+        report.week,
+        report.collected_unix_ms,
+        report.offset_s,
+        &|_| Some(0),
+    );
+    state.stats.report = Some(std::sync::Arc::new(report));
+    let k = decided_keys(&state);
+    let hosts = [
+        (320.0, 568.0),
+        (584.0, 348.0),
+        (849.0, 513.0),
+        (1_200.0, 900.0),
+    ];
+    at_each_text_scale(&[1.0, 1.25, 2.0], "Decided for you", |scale| {
+        let (mut runtime, instance, view) = harness_route(state.clone());
+        {
+            let Some(AppViewState::Settings(view_state)) = runtime.view_state_mut(view) else {
+                unreachable!()
+            };
+            view_state.harness_decided_open = true;
+        }
+        for &(width, height) in &hosts {
+            let cx = view_cx_at(width, height);
+            let pages = every_page(&mut runtime, instance, view, &cx);
+            for (page, compiled) in pages.iter().enumerate() {
+                let context = format!("{scale}\u{d7} {width}\u{d7}{height} page {page}");
+                compiled
+                    .validate_parity()
+                    .unwrap_or_else(|error| panic!("{context}: {error:?}"));
+                let failures: Vec<String> = compiled
+                    .fit_failures()
+                    .into_iter()
+                    .filter(|line| !line.contains("key=\"settings/nav/"))
+                    .collect();
+                assert!(
+                    failures.is_empty(),
+                    "{context}: text overflow or clip:\n{}",
+                    failures.join("\n")
+                );
+                assert_all_hits_material_and_contained(compiled, &context);
+            }
+            for key in &k {
+                assert!(
+                    pages
+                        .iter()
+                        .any(|page| page.semantic(&UiKey::new(key.as_str())).is_some()),
+                    "{scale}\u{d7} {width}\u{d7}{height}: row {key}"
+                );
+            }
+            let wrapped = pages
+                .iter()
+                .any(|page| painted(page, &format!("{}/line/1", k[11])).is_some());
+            assert!(
+                wrapped,
+                "{scale}\u{d7} {width}\u{d7}{height}: the sentence wraps"
+            );
+        }
+        // CONTROL: closed, three.
+        {
+            let Some(AppViewState::Settings(view_state)) = runtime.view_state_mut(view) else {
+                unreachable!()
+            };
+            view_state.harness_decided_open = false;
+        }
+        let pages = every_page(&mut runtime, instance, view, &view_cx());
+        let listed = k
+            .iter()
+            .filter(|key| {
+                pages
+                    .iter()
+                    .any(|page| page.semantic(&UiKey::new(key.as_str())).is_some())
+            })
+            .count();
+        assert_eq!(listed, 3);
+    });
+}
+
+/// SETTINGS ▸ HARNESS ▸ TAB CONTROL (`/tabs`): renders the Fleet & Tab
+/// Summary card, Accessible Computers spreadsheet, and Sessions & Tabs
+/// spreadsheet with live AI CLI status and `Show tab` buttons, whole across
+/// desktop and compact hosts.
+#[test]
+fn tab_control_route_renders_computers_sessions_and_live_ai_cli_status() {
+    use crate::harness_screen::{TabComputer, TabControlState, TabSpreadsheetRow};
+    use crate::native_app::HarnessRequest;
+    let mut state = fixture();
+    state.tabs = TabControlState {
+        computers: vec![
+            TabComputer {
+                id: "local".to_string(),
+                name: "MacBook-Pro (this Mac)".to_string(),
+                address: "local".to_string(),
+                os_version: "macos".to_string(),
+                status: "online".to_string(),
+                instances: 1,
+                tabs: 2,
+                ai_clis: 1,
+                active_ai: 1,
+            },
+            TabComputer {
+                id: "studio-m4".to_string(),
+                name: "studio-m4".to_string(),
+                address: "192.168.1.42".to_string(),
+                os_version: "macOS 15.4".to_string(),
+                status: "online".to_string(),
+                instances: 1,
+                tabs: 1,
+                ai_clis: 1,
+                active_ai: 0,
+            },
+        ],
+        tabs: vec![
+            TabSpreadsheetRow {
+                key: "local/7".to_string(),
+                computer: "this Mac".to_string(),
+                instance: "this aterm (pid 1000)".to_string(),
+                place: "Tab 2".to_string(),
+                sid: "s-7".to_string(),
+                title: "fix the build".to_string(),
+                state: "Running".to_string(),
+                program: "Claude Code".to_string(),
+                is_ai_cli: true,
+                ai_status: "working: Bash · targo test (14s)".to_string(),
+                autopilot: "land (supervised)".to_string(),
+                human: "12s ago".to_string(),
+                show_local_id: Some(7),
+            },
+            TabSpreadsheetRow {
+                key: "remote/studio-m4/4120/1".to_string(),
+                computer: "studio-m4".to_string(),
+                instance: "aterm-4120".to_string(),
+                place: "Tab 1*".to_string(),
+                sid: "s-1".to_string(),
+                title: "verify fleet".to_string(),
+                state: "Idle".to_string(),
+                program: "Codex".to_string(),
+                is_ai_cli: true,
+                ai_status: "waiting for a person".to_string(),
+                autopilot: "cruise".to_string(),
+                human: "3m ago".to_string(),
+                show_local_id: None,
+            },
+        ],
+    };
+    let (mut runtime, instance, view) = setup();
+    assert!(runtime.replace_settings_harness(state.clone(), 1));
+    let outcome = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: route_action(SettingsRoute::Tabs),
+                value: None,
+            }),
+        )
+        .unwrap();
+    assert!(
+        outcome
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, AppEffect::Harness(HarnessRequest::Refresh))),
+        "{:?}",
+        outcome.effects
+    );
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    assert_eq!(
+        node(&pages, "tabs/summary/row/computers").label,
+        "Computers: 2 known · 2 online"
+    );
+    assert_eq!(
+        node(&pages, "tabs/summary/row/sessions").label,
+        "Sessions: 2 aterm instances · 2 open tabs"
+    );
+    assert_eq!(
+        node(&pages, "tabs/summary/row/ai-clis").label,
+        "AI CLIs: 2 running · 1 active"
+    );
+    assert!(
+        node(&pages, "tabs/computer/studio-m4")
+            .label
+            .contains("1 aterm instance · 1 open tab · 1 AI CLI (0 active)")
+    );
+    assert!(
+        node(&pages, "tabs/row/local/7")
+            .label
+            .contains("working: Bash · targo test (14s)"),
+        "{}",
+        node(&pages, "tabs/row/local/7").label
+    );
+    assert!(
+        node(&pages, "tabs/row/remote/studio-m4/4120/1")
+            .label
+            .contains("waiting for a person"),
+        "{}",
+        node(&pages, "tabs/row/remote/studio-m4/4120/1").label
+    );
+    let show = node(&pages, "tabs/show/7");
+    assert_eq!(
+        show.action.as_ref().map(ActionId::as_str),
+        Some("tabs/show/7")
+    );
+    assert_eq!(
+        press_for_requests(&mut runtime, instance, view, "tabs/show/7", None),
+        [HarnessRequest::Show { session: 7 }]
+    );
+    for (width, height) in [(1_200.0, 820.0), (849.0, 513.0), (320.0, 568.0)] {
+        let cx = view_cx_at(width, height);
+        for (page, compiled) in every_page(&mut runtime, instance, view, &cx)
+            .iter()
+            .enumerate()
+        {
+            let context = format!("tabs {width}\u{d7}{height} page {page}");
+            assert_zero_top_paint(compiled, &context);
+            assert_all_hits_material_and_contained(compiled, &context);
+        }
+    }
+    state.tabs.computers.push(TabComputer {
+        id: "lan/advertised-peer".to_string(),
+        name: "advertised-peer".to_string(),
+        address: "observed-peer.local".to_string(),
+        os_version: "OS version unknown".to_string(),
+        status: "advertised (lan)".to_string(),
+        instances: 0,
+        tabs: 0,
+        ai_clis: 0,
+        active_ai: 0,
+    });
+    assert!(runtime.replace_settings_harness(state, 2));
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    assert_eq!(
+        node(&pages, "tabs/computer/lan/advertised-peer").label,
+        "advertised-peer · advertised (lan) · observed-peer.local — OS version unknown · sessions unobserved"
+    );
+    assert_eq!(
+        node(&pages, "tabs/summary/row/computers").label,
+        "Computers: 3 known · 2 online"
+    );
+    assert_eq!(
+        node(&pages, "tabs/summary/row/sessions").label,
+        "Sessions: 2 aterm instances · 2 open tabs observed"
+    );
+    assert_eq!(
+        node(&pages, "tabs/summary/row/ai-clis").label,
+        "AI CLIs: 2 observed · 1 active"
+    );
+}
+
+/// The keys of every semantic node on `pages`, in order.
+fn semantic_keys(pages: &[crate::native_ui::CompiledUi]) -> Vec<String> {
+    pages
+        .iter()
+        .flat_map(|page| page.semantics.iter())
+        .map(|node| node.key.as_str().to_string())
+        .collect()
+}
+
+/// THE VERDICT UP FRONT (§11.6.1, §11.6.5 "The order"): EFFECT OF EACH
+/// AUTOPILOT comes right after the page's actions, ahead of SUPERVISION and
+/// WHAT THE HARNESS DID, after SESSIONS and DECIDED FOR YOU; nothing above
+/// SESSIONS moves (`sessions_stays_on_the_first_screen_under_todays_lines`
+/// holds it, unchanged). NEGATIVE CONTROL: the old order (EFFECT last but
+/// for the table) fails the first comparison.
+#[test]
+fn effect_comes_right_after_the_pages_actions() {
+    let (mut runtime, instance, view) = harness_route(fixture_deciding(5, 5));
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    let all = semantic_keys(&pages);
+    let at = |key: &str| {
+        all.iter()
+            .position(|k| k == key)
+            .unwrap_or_else(|| panic!("{key}: {all:#?}"))
+    };
+    let order = [
+        "harness/sessions",
+        "harness/decided",
+        "harness/actions",
+        "harness/ab",
+        "harness/switches",
+        "harness/did",
+        "harness/config",
+    ]
+    .map(at);
+    assert!(order.is_sorted(), "{order:?}: {all:#?}");
+}
+
+/// THE LEAD SAYS WHAT IT MEASURES (§11.6.1, §11.6.5 "The caption"): with
+/// both sides past the floor, EFFECT opens with `Working time held at a box
+/// or a question`
+/// drawn in the page's plain type, the two shares under it in Hero type,
+/// each with its working time beside it plain, and the block spoken whole
+/// (`harness/ab/lead`, as `controls prefs` lists it); the Held row is not
+/// drawn. Under the note (Cruise time, no Off time), the Held row stands.
+/// The Ends row reads the ends. NEGATIVE CONTROLS: the caption only in the
+/// group's spoken label fails the painted text; Held drawn always fails its
+/// absence.
+#[test]
+fn the_lead_says_what_it_measures_and_the_held_row_gives_way() {
+    use crate::native_ui::{StyleRef, UiContent};
+    let drawn = |pages: &[crate::native_ui::CompiledUi], key: &str| {
+        pages
+            .iter()
+            .find_map(|page| painted(page, key))
+            .map(|node| match &node.content {
+                UiContent::Text(text) => (text.style, text.text.clone()),
+                other => panic!("a text: {other:?}"),
+            })
+    };
+    let (mut runtime, instance, view) = harness_route(fixture_led(true));
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    assert_eq!(
+        node(&pages, "harness/ab/lead").label,
+        "Working time held at a box or a question: <1% of 6h 10m on Cruise \u{b7} 14% of \
+         25m off"
+    );
+    assert_eq!(
+        drawn(&pages, "harness/ab/lead/caption"),
+        Some((
+            StyleRef::Primary,
+            "Working time held at a box or a question".to_string()
+        ))
+    );
+    for (key, want) in [
+        ("cruise/share", (StyleRef::Hero, "<1%")),
+        ("cruise/of", (StyleRef::Primary, "of 6h 10m on Cruise")),
+        ("off/share", (StyleRef::Hero, "14%")),
+        ("off/of", (StyleRef::Primary, "of 25m off")),
+    ] {
+        assert_eq!(
+            drawn(&pages, &format!("harness/ab/lead/{key}")),
+            Some((want.0, want.1.to_string())),
+            "{key}"
+        );
+    }
+    let all = semantic_keys(&pages);
+    assert!(!all.iter().any(|k| k == "harness/ab/row/held"), "{all:#?}");
+    assert_eq!(
+        node(&pages, "harness/ab/row/ends").label,
+        "Ends: Land landed 5, quiet 1 \u{b7} Land to landed: about 6m (5)"
+    );
+    assert!(
+        all.iter().position(|k| k == "harness/ab/lead")
+            < all.iter().position(|k| k == "harness/ab/row/boxes"),
+        "the lead is the card's first block"
+    );
+    // Under the note: plain, and the Held row stands.
+    let (mut runtime, instance, view) = harness_route(fixture_led(false));
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    assert_eq!(
+        node(&pages, "harness/ab/lead").label,
+        crate::harness_ab::LEAD_NOTE
+    );
+    assert_eq!(
+        drawn(&pages, "harness/ab/lead/line-0"),
+        Some((StyleRef::Primary, crate::harness_ab::LEAD_NOTE.to_string()))
+    );
+    assert!(drawn(&pages, "harness/ab/lead/caption").is_none());
+    assert_eq!(
+        node(&pages, "harness/ab/row/held").label,
+        "Held: <1% of working time on Cruise \u{b7} not measured yet off"
+    );
+    // No lead: none drawn, Held stands (the fixture's 97 s of Cruise).
+    let (mut runtime, instance, view) = harness_route(fixture());
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    let all = semantic_keys(&pages);
+    assert!(!all.iter().any(|k| k == "harness/ab/lead"));
+    assert!(all.iter().any(|k| k == "harness/ab/row/held"));
+}
+
+/// THE LEAD GIVES WAY HERO TO PLAIN (§11.6.3 item 2, §11.6.4 "2× text on
+/// the 584 × 348 page"; as `todays_lines_give_way_hero_then_plain_then_the_second_line`):
+/// the shares in Hero type where the row is whole at the card's width;
+/// else the whole lead in plain lines, broken only at its joins, every word
+/// of both sides drawn; the note plain at plain height, broken between
+/// words where it must be. On the 80 × 24 window's page at 2× text the lead
+/// is plain and whole. NEGATIVE CONTROL: the note in Hero type, the defect
+/// `4fd0909852` fixed, fails the note's style and height.
+#[test]
+fn the_lead_gives_way_hero_then_plain() {
+    use crate::harness_ab::{AbLead, LeadShare, ab_lead};
+    use crate::native_settings::harness_page::ab_lead_block;
+    use crate::native_ui::{StyleRef, UiContent};
+    fn texts(node: &UiNode, out: &mut Vec<(StyleRef, String, f32)>) {
+        if let UiContent::Text(text) = &node.content {
+            let height = match node.layout.height {
+                crate::native_ui::Length::Fixed(height) => height,
+                other => panic!("a fixed height: {other:?}"),
+            };
+            out.push((text.style, text.text.clone(), height));
+        }
+        for child in &node.children {
+            texts(child, out);
+        }
+    }
+    let drawn = |lead: &AbLead, inner: f32| {
+        let (node, height) = ab_lead_block(lead, inner);
+        let mut out = Vec::new();
+        texts(&node, &mut out);
+        (out, height)
+    };
+    let both = AbLead::Both {
+        cruise: LeadShare {
+            share: "<1%".to_string(),
+            of: "of 6h 10m on Cruise".to_string(),
+        },
+        off: LeadShare {
+            share: "14%".to_string(),
+            of: "of 25m off".to_string(),
+        },
+    };
+    at_each_text_scale(&[1.0, 2.0], "the lead", |scale| {
+        let plain = 28.0_f32.max(18.0 * scale);
+        let (wide, _) = drawn(&both, 2_000.0);
+        assert_eq!(
+            wide.iter()
+                .map(|(style, text, _)| (*style, text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    StyleRef::Primary,
+                    "Working time held at a box or a question"
+                ),
+                (StyleRef::Hero, "<1%"),
+                (StyleRef::Primary, "of 6h 10m on Cruise"),
+                (StyleRef::Hero, "14%"),
+                (StyleRef::Primary, "of 25m off"),
+            ],
+            "{scale}\u{d7}"
+        );
+        // The edge: the narrowest card the Hero row is whole in.
+        let hero_at = |inner: f32| {
+            drawn(&both, inner)
+                .0
+                .iter()
+                .any(|(s, _, _)| *s == StyleRef::Hero)
+        };
+        let (mut low, mut high) = (1.0_f32, 2_000.0_f32);
+        while high - low > 1.0 {
+            let mid = (low + high) / 2.0;
+            if hero_at(mid) { high = mid } else { low = mid }
+        }
+        assert!(
+            hero_at(high) && !hero_at(low),
+            "{scale}\u{d7}: an edge at {high}"
+        );
+        // Narrow: plain lines, broken at the joins, every word drawn.
+        for inner in [low, 300.0_f32.min(low), 200.0_f32.min(low)] {
+            let (narrow, height) = drawn(&both, inner);
+            assert!(
+                narrow
+                    .iter()
+                    .all(|(style, _, h)| *style == StyleRef::Primary && *h == plain),
+                "{scale}\u{d7} {inner}: {narrow:?}"
+            );
+            let lines = narrow
+                .iter()
+                .map(|(_, text, _)| text.as_str())
+                .collect::<Vec<_>>();
+            let words = |text: &str| {
+                text.replace(" \u{b7} ", " ")
+                    .split(' ')
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                words(&lines.join(" ")),
+                words(&both.words()),
+                "{scale}\u{d7} {inner}: whole, {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| !line.ends_with('\u{b7}') && !line.contains('\u{2026}')),
+                "{scale}\u{d7} {inner}: {lines:?}"
+            );
+            let n = lines.len() as f32;
+            assert_eq!(height, n * plain + (n - 1.0) * 4.0);
+        }
+        // The note: always plain, at plain height.
+        for inner in [2_000.0, 200.0] {
+            let (note, height) = drawn(&AbLead::NoOff, inner);
+            assert!(
+                note.iter()
+                    .all(|(style, _, h)| *style == StyleRef::Primary && *h == plain),
+                "{scale}\u{d7} {inner}: {note:?}"
+            );
+            if inner > 1_000.0 {
+                assert_eq!(height, plain, "one line");
+            }
+        }
+        assert!(ab_lead(&crate::harness_ab::AbWeek::default()).is_none());
+    });
+    // 2× text on the 80 × 24 window's page (584 × 348) and a phone's: plain,
+    // and every page whole.
+    at_each_text_scale(&[2.0], "the lead on a narrow page", |_| {
+        for (width, height) in [(584.0, 348.0), (320.0, 568.0)] {
+            let (mut runtime, instance, view) = harness_route(fixture_led(true));
+            let pages = every_page(&mut runtime, instance, view, &view_cx_at(width, height));
+            assert!(
+                pages
+                    .iter()
+                    .all(|page| painted(page, "harness/ab/lead/cruise/share").is_none()),
+                "{width}\u{d7}{height}: no Hero share"
+            );
+            assert!(
+                pages
+                    .iter()
+                    .any(|page| painted(page, "harness/ab/lead/line-0").is_some()),
+                "{width}\u{d7}{height}: plain"
+            );
+            for (index, page) in pages.iter().enumerate() {
+                let failures = page
+                    .fit_failures()
+                    .into_iter()
+                    .filter(|line| !line.contains("key=\"settings/nav/"))
+                    .collect::<Vec<_>>();
+                assert!(
+                    failures.is_empty(),
+                    "{width}\u{d7}{height} page {index}: {failures:#?}"
+                );
+            }
+        }
+    });
+}
+
+/// THE LEAD'S WORDS STAND ON ITS FIGURES' BASELINE (§11.6.1): on the
+/// compiled page at 1× and 2× text, each side's plain working time is painted
+/// on the same baseline as its Hero share, and the two sides share one — as
+/// a line of type reads, never the words floating at the figure's middle.
+/// NEGATIVE CONTROL: the words at the plain line's height (the first build)
+/// paint them 7 px above the figure's baseline at 1×.
+#[test]
+fn the_leads_words_stand_on_its_figures_baseline() {
+    use crate::native_ui::{SemanticRole, StyleRef, UiContent, text_paint_metrics};
+    at_each_text_scale(&[1.0, 2.0], "the lead's baseline", |scale| {
+        let (mut runtime, instance, view) = harness_route(fixture_led(true));
+        let pages = every_page(&mut runtime, instance, view, &view_cx());
+        let baseline = |key: &str| {
+            let node = pages
+                .iter()
+                .find_map(|page| painted(page, &format!("harness/ab/lead/{key}")))
+                .unwrap_or_else(|| panic!("{scale}\u{d7}: {key} is painted"));
+            let UiContent::Text(text) = &node.content else {
+                panic!("{key}: a text");
+            };
+            let role = if text.style == StyleRef::Hero {
+                SemanticRole::Heading
+            } else {
+                SemanticRole::Text
+            };
+            let (px, _) = text_paint_metrics(role, text.style);
+            crate::tray_raster::row_baseline(node.rect.y, node.rect.height, px)
+        };
+        let share = baseline("cruise/share");
+        for key in ["cruise/of", "off/share", "off/of"] {
+            assert!(
+                (baseline(key) - share).abs() <= 0.5,
+                "{scale}\u{d7}: {key} at {} against the share's {share}",
+                baseline(key)
+            );
+        }
+        assert!(
+            baseline("caption") + 8.0 < share,
+            "{scale}\u{d7}: the caption stands above the shares"
+        );
+    });
+}
+
+/// A BACKGROUND LANDING MOVES NO SWITCH (§11.6.7): EFFECT sits above
+/// SUPERVISION, so the week's first landing — a session's loop telling it
+/// while Settings ▸ Harness is shown — changes the Ends row's words, never
+/// the card's rows: on the shipped 744 × 420 page and the 80 × 24 window's
+/// 584 × 348, at 1× text, every SUPERVISION control is on the same page at
+/// the same rect before and after, and EFFECT's card is as tall. NEGATIVE
+/// CONTROL: the Ends row drawn only once something counted (the first build)
+/// moves every switch down by the row.
+#[test]
+fn a_background_landing_moves_no_switch() {
+    let controls = |state: HarnessState, (width, height): (f32, f32)| {
+        let (mut runtime, instance, view) = harness_route(state);
+        let pages = every_page(&mut runtime, instance, view, &view_cx_at(width, height));
+        let mut out = Vec::new();
+        for (index, page) in pages.iter().enumerate() {
+            for node in &page.semantics {
+                let key = node.key.as_str();
+                if key.starts_with("settings/control/") || key == "harness/ab" {
+                    let rect = node.rect;
+                    let at = (rect.x, rect.y, rect.width, rect.height);
+                    out.push((index, key.to_string(), at));
+                }
+            }
+        }
+        out
+    };
+    let before = fixture();
+    let mut after = fixture();
+    after.ab.ends.landed = 1;
+    after.ab.ends.landing[crate::harness_ab::bucket(2 * 60_000)] = 1;
+    at_each_text_scale(&[1.0], "a background landing", |_| {
+        for host in [(744.0, 420.0), (584.0, 348.0)] {
+            let (was, now) = (
+                controls(before.clone(), host),
+                controls(after.clone(), host),
+            );
+            assert!(
+                was.iter()
+                    .any(|(_, key, _)| key == "settings/control/harness.enabled"),
+                "{host:?}: {was:#?}"
+            );
+            assert_eq!(was, now, "{host:?}");
+        }
+    });
 }

@@ -474,7 +474,11 @@ impl App {
                 }),
                 AutoApplySetting::On => None,
             };
-            return P::HandoffDisabled { why, veto };
+            return P::HandoffDisabled {
+                why,
+                veto,
+                image_kept: self.launch_keeps_image(),
+            };
         }
         match env.auto_apply {
             AutoApplySetting::OffByConfig => return P::ManualByConfig,
@@ -504,6 +508,9 @@ impl App {
             return P::ManualOnlyLatched {
                 lapses: manual.retry_at.is_some(),
             };
+        }
+        if self.kept_image_waits_for_terminal() {
+            return P::WaitsForTerminal;
         }
         P::Automatic
     }
@@ -2166,7 +2173,7 @@ pub(crate) mod tests {
             staged_dmg_sha256: Some("ab".repeat(32)),
             changelog: None,
             outcome: "staged".to_string(),
-            installable: true,
+            installable: Some(true),
             channel_unreadable: false,
             ..base
         };
@@ -2543,7 +2550,8 @@ pub(crate) mod tests {
             app.apply_posture_for(build),
             P::HandoffDisabled {
                 why: HandoffUnavailable::Headless,
-                veto: None
+                veto: None,
+                image_kept: false,
             },
             "a headless App has no seamless lane, and the bar says so"
         );
@@ -2620,7 +2628,8 @@ pub(crate) mod tests {
                 ),
                 P::HandoffDisabled {
                     why,
-                    veto: Some(crate::update_words::AutoApplyVeto::Config)
+                    veto: Some(crate::update_words::AutoApplyVeto::Config),
+                    image_kept: false,
                 }
             );
         }
@@ -2638,7 +2647,8 @@ pub(crate) mod tests {
                 why: HandoffUnavailable::Headless,
                 veto: Some(crate::update_words::AutoApplyVeto::Env {
                     var: "ATERM_DEBUG_RELAUNCH_NUDGE"
-                })
+                }),
+                image_kept: false,
             }
         );
         // …and an armed lane carries none.
@@ -2652,7 +2662,8 @@ pub(crate) mod tests {
             ),
             P::HandoffDisabled {
                 why: HandoffUnavailable::Headless,
-                veto: None
+                veto: None,
+                image_kept: false,
             }
         );
 
@@ -2680,7 +2691,8 @@ pub(crate) mod tests {
             app.apply_posture_for(build),
             P::HandoffDisabled {
                 why: HandoffUnavailable::Headless,
-                veto: Some(crate::update_words::AutoApplyVeto::Config)
+                veto: Some(crate::update_words::AutoApplyVeto::Config),
+                image_kept: false,
             }
         );
     }
@@ -2730,6 +2742,7 @@ pub(crate) mod tests {
         let headless = ApplyPosture::HandoffDisabled {
             why: HandoffUnavailable::Headless,
             veto: None,
+            image_kept: false,
         };
         assert_eq!(staged_record(&app), staged_detail(headless));
         assert_eq!(app.message_band_rows, 0, "…and no row is reserved");
@@ -3036,7 +3049,7 @@ pub(crate) mod tests {
                     apply_failure: String::new(),
                     apply_failure_build: 0,
                     apply_failures_for_target: 0,
-                    installable: true,
+                    installable: Some(true),
                     channel_unreadable: false,
                     checked_at: None,
                 },

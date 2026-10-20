@@ -9,9 +9,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use winit::dpi::{LogicalPosition, PhysicalSize};
-use winit::event_loop::ActiveEventLoop;
-use winit::window::Window;
+use aterm_window::dpi::{LogicalPosition, PhysicalSize};
+use aterm_window::event_loop::ActiveEventLoop;
+use aterm_window::window::Window;
 
 #[cfg(windows)]
 use crate::GpuBackend;
@@ -176,14 +176,12 @@ pub(crate) fn restored_position_on_screen(window: &Window, x: i32, y: i32) -> bo
 /// A restored window's FRAME, as its layout row carried it — an update's (P6
 /// finding 4) or a cold restore's: the grid the window is created at, and the
 /// raw inner size it had, which its first attach takes when that size holds the
-/// grid ([`App::attach_frame_px`]), with the presence row both hold (an update's
-/// only, [`crate::WindowState::take_carried_frame`]).
+/// grid ([`App::attach_frame_px`], [`crate::WindowState::take_carried_frame`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CarriedFrame {
     pub(crate) rows: u16,
     pub(crate) cols: u16,
     pub(crate) inner_px: PhysicalSize<u32>,
-    pub(crate) presence_row: bool,
 }
 
 impl CarriedFrame {
@@ -203,8 +201,47 @@ impl CarriedFrame {
             rows: layout.rows.clamp(5, 300),
             cols: layout.cols.clamp(20, 500),
             inner_px: PhysicalSize::new(width, height),
-            presence_row: layout.presence_row,
         })
+    }
+}
+
+/// Where a restored window goes before it is first shown (Windows): the outer
+/// position its layout row persisted, validated against the live monitors when
+/// the attach applies it, and whether it was maximized. Staged on the window
+/// ([`App::stage_restore_placement`]) and taken by its first
+/// [`App::attach_os_window`], which places the window while it is still hidden.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RestorePlacement {
+    pub(crate) outer: Option<(i32, i32)>,
+    pub(crate) maximized: bool,
+}
+
+#[cfg(windows)]
+impl App {
+    /// Stage window `wid`'s persisted place (`outer`, and `maximized` when
+    /// `Some(true)`; `None` never forces a change) for its first attach, which
+    /// applies it before the reveal. `true` when there was a place to stage: the
+    /// caller then leaves it to the attach rather than moving the window on
+    /// glass afterwards.
+    pub(crate) fn stage_restore_placement(
+        &mut self,
+        wid: WindowId,
+        outer: (Option<i32>, Option<i32>),
+        maximized: Option<bool>,
+    ) -> bool {
+        let placement = RestorePlacement {
+            outer: outer.0.zip(outer.1),
+            maximized: maximized == Some(true),
+        };
+        if placement.outer.is_none() && !placement.maximized {
+            return false;
+        }
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return false;
+        };
+        ws.restore_placement = Some(placement);
+        true
     }
 }
 
@@ -212,22 +249,13 @@ impl crate::WindowState {
     /// Take a restored window's CARRIED FRAME before its first attach sizes
     /// it: the raw inner size it had — an update's parent's, or a cold
     /// restore's quit ([`App::attach_frame_px`] takes it when it holds the
-    /// carried grid) — and whether its presence row stood (an update's only).
-    ///
-    /// The presence row is reserved here: the parent's size and grid include it,
-    /// but a successor's presence engine does not commit rows before Commit, so
-    /// without the reservation the carried size would be refused and the window
-    /// come up a row short. The reserved row paints blank until this process
-    /// projects its story.
-    pub(crate) fn take_carried_frame(
-        &mut self,
-        inner_px: Option<PhysicalSize<u32>>,
-        presence_row: bool,
-    ) {
+    /// carried grid). Presence reserves no row (it owns none since the owner
+    /// surfaces, 2026-10-16): an older parent's carried `presence_row` is read
+    /// by nobody, so its size holds a grid one row shorter than this build's
+    /// and is refused, and the window comes up at its grid's own frame — one
+    /// re-grid, once, on the update off that build.
+    pub(crate) fn take_carried_frame(&mut self, inner_px: Option<PhysicalSize<u32>>) {
         self.carried_inner_px = inner_px;
-        if presence_row {
-            self.presence.rows = 1;
-        }
     }
 }
 
@@ -270,6 +298,16 @@ pub(crate) const fn window_title_authority(search_active: bool) -> WindowTitleAu
     } else {
         WindowTitleAuthority::Canonical
     }
+}
+
+/// The text the OS shows for a window's canonical title (caption, taskbar,
+/// Alt+Tab): `title` without a leading busy-spinner frame
+/// ([`crate::chrome_label::without_spinner_frame`]). Phase-only title changes are
+/// coalesced (`toolbar::busy_spinner_phase_only_change`), so the OS label would
+/// otherwise hold one frame of the animation for as long as the agent works.
+#[must_use]
+pub(crate) fn os_window_title(title: &str) -> &str {
+    crate::chrome_label::without_spinner_frame(title)
 }
 
 /// Push a session's cwd onto `slot` in `~`-abbreviated tab-label form; `false`
@@ -527,18 +565,16 @@ impl App {
     /// so a Foreground or Background picked for the terminal does not recolor
     /// the app's own pages. The terminal theme still reaches the pages' live
     /// previews.
+    ///
+    /// Read off the installed resolution ([`Self::install_colors`] is the one
+    /// install path, for a config or catalog reload, an OS flip and a theme
+    /// trial alike), so a paint costs a copy and the page and the terminal
+    /// theme always come from the same install.
     pub(crate) fn native_page_palette_theme(&self) -> aterm_render::Theme {
-        let theme = self
-            .config
-            .theme_before_color_overrides(
-                self.os_appearance,
-                &self.config_assets.themes,
-                self.theme_preview
-                    .as_ref()
-                    .map(|preview| preview.id.as_str()),
-            )
-            .unwrap_or(self.theme);
-        crate::native_appearance::resolve_chrome_palette(self.window_theme, theme)
+        crate::native_appearance::resolve_chrome_palette(
+            self.window_theme,
+            self.installed_colors.theme_before_overrides(),
+        )
     }
 
     pub(crate) fn front_mut(&mut self) -> Option<&mut WindowState> {
@@ -588,6 +624,15 @@ impl App {
         let cwd = cwd_override
             .map(str::to_owned)
             .or_else(|| self.frontmost_window.and_then(|w| self.focused_pane_cwd(w)));
+        // A fresh shell under an identity with a theme of its own starts on that
+        // theme's side (`COLORFGBG`); an adopted one keeps the env it has.
+        #[cfg(windows)]
+        let shell_factory =
+            (adopt.is_none() && identity.is_some()).then(|| self.shell_factory(None, identity));
+        #[cfg(windows)]
+        let factory = shell_factory.as_ref().unwrap_or(&self.session_factory);
+        #[cfg(not(windows))]
+        let factory = &self.session_factory;
         let session = match spawn_session(
             sid,
             wid,
@@ -597,11 +642,12 @@ impl App {
             // unknown-window fallback (the shared backend); `apply_window_scale`'s
             // `sync_cell_pixel_size` corrects it after attach.
             self.spawn_cell_px(wid),
-            &self.session_factory,
+            factory,
             &proxy,
             cwd.as_deref(),
             observe,
             identity,
+            None,  // no worker's task
             adopt, // SEAMLESS: `Some` re-adopts this window's handed-off first-leaf shell
         ) {
             Ok(s) => s,
@@ -686,7 +732,7 @@ impl App {
         self.sync_active_session();
         // The status-item glance lists windows now, so a create moves it
         // (fingerprint-gated; runs after every structural mutation above).
-        self.refresh_operator_status_item();
+        self.mark_status_dirty();
         debug_assert!(
             self.structural_invariants_ok(),
             "window/session structural invariants violated after create_window_logical: {}",
@@ -740,12 +786,15 @@ impl App {
     /// `carried` is a restored window's frame ([`CarriedFrame`], an update's or
     /// a cold restore's): the window is created at its grid instead of the
     /// front window's, and first attached at its raw inner size when that holds
-    /// the grid. `None` for every other open.
+    /// the grid. `None` for every other open. `placement` is its row's persisted
+    /// outer position and maximized state: Windows places the window there while
+    /// it is still hidden ([`Self::stage_restore_placement`]); elsewhere the
+    /// caller moves it after the attach.
     #[allow(
         clippy::too_many_arguments,
         reason = "the window's birth facts — cwd, the seamless adoptee, the connection \
-                  lineage, the agent identity and an update's carried frame — are each a \
-                  per-open datum, as in `create_window_logical`"
+                  lineage, the agent identity and an update's carried frame and place — \
+                  are each a per-open datum, as in `create_window_logical`"
     )]
     pub(crate) fn create_window_internal_connected(
         &mut self,
@@ -756,6 +805,7 @@ impl App {
         observe: Option<&aterm_session::SessionId>,
         identity: Option<&str>,
         carried: Option<CarriedFrame>,
+        placement: ((Option<i32>, Option<i32>), Option<bool>),
     ) -> Option<WindowId> {
         let ((rows, cols), carried_inner_px) = self.new_window_frame(carried);
         let wid = self.create_window_logical(
@@ -768,11 +818,12 @@ impl App {
             identity,
         )?;
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.take_carried_frame(
-                carried_inner_px,
-                carried.is_some_and(|frame| frame.presence_row),
-            );
+            ws.take_carried_frame(carried_inner_px);
         }
+        #[cfg(windows)]
+        self.stage_restore_placement(wid, placement.0, placement.1);
+        #[cfg(not(windows))]
+        let _ = placement;
         if !self.headless && !self.attach_os_window(el, wid) {
             // GPU surface failed: roll back the just-created window + its fresh
             // session rather than leave a present-less black window.
@@ -1167,29 +1218,38 @@ impl App {
             self.window_frame_px_for(wid, rows, cols)
         };
         let attrs = Window::default_attributes()
-            .with_title("aterm")
+            .with_title(
+                crate::elevated_caption::caption("aterm", aterm_uds::elevation::is_elevated())
+                    .into_owned(),
+            )
             .with_inner_size(size);
         // Windows: point the window at the icon compiled into this exe. DWM reads
         // the window's icon via WM_GETICON / the class GCLP_HICON, and winit
         // registers its class with no icon, so without WM_SETICON the caption and
         // Alt-Tab show the generic exe glyph.
         //
-        // `None` loads the SM_CXICON-sized frame for the big icon; the small icon
-        // asks for the .ico's hand-tuned 16 px frame explicitly.
+        // Both icons are the .ico's frames of exactly SM_CXSMICON / SM_CXICON at
+        // the system DPI (`win_icon`); a window that opens on a display of another
+        // DPI, or moves to one, is sent that display's below and on
+        // `ScaleFactorChanged`.
         //
         // Failure is silent: `from_resource` fails only when the build had no
         // resource compiler (build.rs already warned), and this is a GUI-subsystem
         // binary with no useful stderr.
+        //
+        // The class is aterm's own, `aterm` (the Linux `WM_CLASS` too), not winit's
+        // shared "Window Class", so window managers, FancyZones rules, AutoHotkey
+        // (`ahk_class aterm`) and accessibility tools can name aterm's windows.
+        // Nothing looks windows up by the old name (the installer and uninstaller
+        // enumerate by process id).
         #[cfg(windows)]
         let attrs = {
-            use winit::platform::windows::{IconExtWindows as _, WindowAttributesExtWindows as _};
-            // Ordinal 1 — the `1 ICON` in the resource script generated by
-            // crates/aterm/build.rs. The two ends are coupled by that number.
-            let big = winit::window::Icon::from_resource(1, None).ok();
-            let small = winit::window::Icon::from_resource(1, Some(PhysicalSize::new(16, 16)))
-                .ok()
-                .or_else(|| big.clone());
-            let attrs = attrs.with_window_icon(small).with_taskbar_icon(big);
+            use aterm_window::platform::windows::WindowAttributesExtWindows as _;
+            let (small, big) = crate::win_icon::window_icons(crate::win_icon::system_dpi());
+            let attrs = attrs
+                .with_window_icon(small)
+                .with_taskbar_icon(big)
+                .with_class_name("aterm");
             // A window presented through the DirectComposition visual swapchain is
             // created without the GDI redirection bitmap
             // (`WS_EX_NOREDIRECTIONBITMAP`); DWM would composite it, filled with
@@ -1216,13 +1276,13 @@ impl App {
         // (`startup_token`), which ends the launch's busy cursor or spinner.
         #[cfg(target_os = "linux")]
         let attrs = {
-            use winit::platform::wayland::{
+            use aterm_window::platform::wayland::{
                 ActiveEventLoopExtWayland as _, WindowAttributesExtWayland,
             };
             let wayland = el.is_wayland();
             let attrs = attrs
                 .with_name("aterm", "aterm")
-                .with_min_inner_size(winit::dpi::LogicalSize::new(164.0, 98.0));
+                .with_min_inner_size(aterm_window::dpi::LogicalSize::new(164.0, 98.0));
             let attrs = if wayland {
                 attrs
             } else {
@@ -1239,8 +1299,13 @@ impl App {
         // flash. `about_to_wait` force-reveals at a deadline.
         let defer_reveal = self.handoff_ready.is_some();
         // Deferred-join first window: created hidden, shown once the joined
-        // backend's metrics have resized it.
-        let attrs = if pending_join || defer_reveal {
+        // backend's metrics have resized it. Windows creates EVERY window hidden
+        // and shows it below once it has its size, place and chrome: a window
+        // created visible appears at the OS default spot with the OS's own
+        // caption (a light one on a light desktop) and is then resized,
+        // cascaded and re-tinted on glass.
+        let reveal_after_chrome = pending_join || cfg!(windows);
+        let attrs = if reveal_after_chrome || defer_reveal {
             attrs.with_visible(false)
         } else {
             attrs
@@ -1256,6 +1321,9 @@ impl App {
             }
         };
         let startup_after_window_create = Instant::now();
+        // Opened on a display whose DPI is not the system's: that display's icons.
+        #[cfg(windows)]
+        crate::win_icon::fit_new_window(&window);
         // Meta mode's Option is an Alt from the window's first key event: without it
         // AppKit composes Option+a into "å" and starts a dead key on Option+e, which
         // the encoder never sees as Meta. A new view's Option composes, so the window
@@ -1265,16 +1333,16 @@ impl App {
         if let Some(ws) = self.windows.get(&wid) {
             ws.option_as_alt.set(option_is_alt);
         }
-        // Attach this window's AT-SPI adapter; its events arrive as
+        // Attach this real window's native accessibility adapter; its events arrive as
         // `Wake::Accessibility`.
         #[cfg(a11y_tree)]
         let a11y_adapter = self
             .proxy
             .clone()
-            .map(|proxy| crate::a11y_adapter::Adapter::new(&window, proxy));
-        // A non-deferred window with a Ready backend is on glass here. Offer the
-        // process-wide first-reveal stamp (first write wins).
-        if !pending_join && !defer_reveal {
+            .and_then(|proxy| crate::a11y_adapter::Adapter::new(&window, proxy));
+        // A non-deferred window with a Ready backend is on glass here (off
+        // Windows). Offer the process-wide first-reveal stamp (first write wins).
+        if !reveal_after_chrome && !defer_reveal {
             crate::metrics::mark_first_window_visible();
         }
         // Install the shared NSApp.mainMenu once, with the first window;
@@ -1283,27 +1351,22 @@ impl App {
         if self._menu.is_none()
             && let Some(proxy) = self.proxy.as_ref()
         {
+            // Its items and the toolbar's buttons mark what they post, so keys
+            // typed before the loop dispatches it wait for it (`tab_spawn`).
+            crate::tab_spawn::serve_native_menu_marks(&self.tab_spawns.menu);
             self._menu = self.apprt.install_menu(proxy);
             // Route AppKit `terminate:` quits that bypass the menu (Dock Quit,
             // AppleScript, logout) through the App lane's Cmd-Q confirmation and
             // document barrier. Registered once; no-op off macOS.
             self.apprt.install_quit_confirm();
         }
-        // The menu-bar operator status item (status_item.rs), created once with the
+        // The menu-bar status item (status_item.rs), created once with the
         // first window and retained for the process life (releasing the
-        // NSStatusItem removes it). No-op off macOS.
+        // NSStatusItem removes it), its sibling rows seeded. No-op off macOS.
         if self._status_item.is_none()
-            && let Some(proxy) = self.proxy.as_ref()
+            && let Some(proxy) = self.proxy.clone()
         {
-            let glance = self.operator_fleet_glance();
-            self._status_item = self.apprt.install_status_item(proxy, &glance);
-            self.operator_status_fingerprint = Some(glance.fingerprint());
-            self.operator_local_id = glance.operator_session;
-            // Seed the sibling-instances section so the FIRST menu open has
-            // fleet rows (menu opens kick refreshes thereafter).
-            if self._status_item.is_some() {
-                crate::fleet_watch::request_scan(proxy.clone());
-            }
+            self.install_status_item(&proxy);
         }
         // Seed the OS "Reduce Motion" flag at attach and subscribe to its change
         // notification once (macOS). Windows and Linux (GNOME
@@ -1323,7 +1386,7 @@ impl App {
         // and on-screen keyboards drop autocapitalisation and prediction. Stored on
         // the window so every `text_input.enter` re-announces it. No-op on other
         // platforms.
-        window.set_ime_purpose(winit::window::ImePurpose::Terminal);
+        window.set_ime_purpose(aterm_window::window::ImePurpose::Terminal);
         // The desktop light/dark appearance: start its observer once, then
         // install what it reads now. It picks the side of a `dark:…,light:…`
         // `theme`, and the engine reports that palette's appearance to apps (DEC
@@ -1380,12 +1443,10 @@ impl App {
             // The same scale resolution the post-join sizing uses (force-scale
             // override included), so the two frame derivations cannot diverge.
             let scale = resolve_force_scale().unwrap_or_else(|| window.scale_factor());
-            // Predict the font px the post-join HiDPI block settles on (auto-scale
-            // target, or the explicit size); deterministic, so a cache hit means
-            // the joined backend activates the cached size.
-            let target_font_px =
-                hidpi_target_font_px(self.font_px_explicit, scale, self.font_size_scale_milli)
-                    .unwrap_or(self.font_px);
+            // Predict the font px the post-join block settles on (the size at this
+            // scale); deterministic, so a cache hit means the joined backend
+            // activates the cached size.
+            let target_font_px = self.attach_font_px(scale);
             let cached = (!restore_maximized)
                 .then(|| {
                     crate::restore::load_cell_metrics(
@@ -1430,13 +1491,17 @@ impl App {
                     bootstrap_restore.and_then(|wl| Some((wl.outer_x?, wl.outer_y?)))
                     && restored_position_on_screen(&window, x, y)
                 {
-                    window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+                    window.set_outer_position(aterm_window::dpi::PhysicalPosition::new(x, y));
                 }
                 // The backend-independent chrome calls, hoisted above the join
                 // (re-applied idempotently after it): the themed class brush, so
                 // the client area erases to the first frame's colour
                 // (`early_reveal_backdrop`), and the caption dark-mode resolution.
                 let backdrop = self.early_reveal_backdrop();
+                // The caption's surface (the tab band), so it is tinted right
+                // before the window is first on glass.
+                #[cfg(windows)]
+                crate::platform_win::note_caption_surface(&window, self.caption_surface_tone(wid));
                 self.apprt.window_set_background_color(&window, backdrop);
                 self.apprt
                     .window_set_appearance(&window, self.window_theme_for_chrome());
@@ -1504,10 +1569,9 @@ impl App {
             ws.head_pts = head_pts;
             ws.last_windowed_band_pts = band_memory_pts;
         }
-        // HiDPI auto-scale. Glyphs are rasterized at `font_px` physical pixels, so
-        // the default size is scaled to `round(FONT_PX × scale)` once the window's
-        // scale is known; an explicit size (`--font-px`, `config.font_px`) is used
-        // verbatim.
+        // HiDPI scale. Glyphs are rasterized at `font_px` device pixels, so the
+        // font size (px at 1×, whatever named it) draws at `round(size × scale)`
+        // once the window's scale is known ([`crate::font_px_for_scale`]).
         //
         // The size is selected on the shared renderer via the light `activate_px`,
         // not a rebuild, so other windows keep their glyph atlases; this is the
@@ -1519,17 +1583,19 @@ impl App {
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.scale = scale;
         }
-        if let Some(scaled) =
-            hidpi_target_font_px(self.font_px_explicit, scale, self.font_size_scale_milli)
-        {
-            // Switch only on a real change. Faces and shaping config are unchanged
-            // by a size switch. Cmd-0 resets to this scaled default.
-            if (scaled - self.font_px).abs() >= 0.5 {
-                self.backend.activate_px(scaled);
-            }
-            self.font_px = scaled;
-            self.default_font_px = scaled;
+        // A zoom an older outgoing build carried in device px becomes sizes at
+        // this, the first, window's scale.
+        if let Some((px, reset)) = self.font_size_from_device.take() {
+            self.font_size = font_size_of_device_px(px, scale);
+            self.default_font_size = font_size_of_device_px(reset, scale);
         }
+        let scaled = self.attach_font_px(scale);
+        // Switch only on a real change. Faces and shaping config are unchanged
+        // by a size switch.
+        if (scaled - self.font_px).abs() >= 0.5 {
+            self.backend.activate_px(scaled);
+        }
+        self.font_px = scaled;
         // Apply the padding at the real scale and recompute `size` so the window
         // and its swapchain fit grid, border, new cell metrics and tab strip.
         let pad = self.cfg_pad_for_scale(scale);
@@ -1553,7 +1619,8 @@ impl App {
         }
         // FIRE-INTO-CHROME: the titlebar band in device px.
         let head_pts = self.windows.get(&wid).map_or(0.0, |ws| ws.head_pts);
-        let head = (head_pts * scale).round() as usize;
+        // …plus the stats Deck under it (`crate::stats_deck`), on by default.
+        let head = crate::stats_deck::chrome_head_px(head_pts, scale, self.stats_bars_form());
         self.backend.set_head(head);
         // Record this window's resolved metrics from its own scale (kept current by
         // `on_scale_factor_changed`), using the live `font_px`.
@@ -1644,7 +1711,7 @@ impl App {
             // zoomed Cmd-N attach never stores transient metrics. All platforms
             // record; only the lookup is Windows-gated. Off-thread, and unchanged
             // metrics write nothing.
-            if (self.font_px - self.default_font_px).abs() < 0.5 {
+            if (self.font_size - self.default_font_size).abs() < 0.5 {
                 crate::restore::store_cell_metrics(
                     self.cell_metrics_font_key(),
                     scale,
@@ -1657,8 +1724,12 @@ impl App {
         // Step the frame down-right so the parent window stays visible. After the
         // size correction (the frame decides where the cascade wraps) and before
         // any present. No-op for the first window; restore/update positions
-        // applied after the attach win.
+        // applied after the attach (on Windows, the staged `RestorePlacement`
+        // below, before the reveal) win.
         self.cascade_window_placement(wid, &window);
+        // The caption's surface (the tab band) before the window is revealed.
+        #[cfg(windows)]
+        crate::platform_win::note_caption_surface(&window, self.caption_surface_tone(wid));
         // Paint the window background the theme background so the transparent
         // titlebar reads as part of the terminal body. Before the GPU/CPU split,
         // since the GPU arm returns. No-op off macOS.
@@ -1670,15 +1741,44 @@ impl App {
         // NSWindow colour space to the content (see the apprt method).
         self.apprt
             .window_set_appearance(&window, self.chrome_theme_for_apprt());
-        // Reveal the deferred-join first window now, unless the early path already
-        // showed it (`early_reveal_size`). By now it has its real size and themed
+        // Windows: a restored window takes its persisted place while still hidden
+        // (`RestorePlacement`, staged by the restore) — position first, validated
+        // against the live monitors, then maximized LAST, since winit clears its
+        // MAXIMIZED flag on every move and resize. aterm-window keeps a hidden
+        // window's maximize for its reveal, so it appears there, maximized when it
+        // was, instead of at the cascade or the OS default and then hopping and
+        // playing the maximize animation on glass. An early-revealed window
+        // already took its position before the join (and is never maximized).
+        #[cfg(windows)]
+        if let Some(placement) = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.restore_placement.take())
+            && early_reveal_size.is_none()
+        {
+            if let Some((x, y)) = placement.outer
+                && restored_position_on_screen(&window, x, y)
+            {
+                window.set_outer_position(aterm_window::dpi::PhysicalPosition::new(x, y));
+            }
+            if placement.maximized {
+                window.set_maximized(true);
+            }
+        }
+        // Reveal the deferred-join first window now (and on Windows every window,
+        // created hidden above), unless the early path already showed it
+        // (`early_reveal_size`). By now it has its real size, place and themed
         // background.
-        if pending_join {
+        if reveal_after_chrome {
             // Handoff boots stay hidden here — the post-present hook is the one
             // reveal site (carried pixels first, never a bg-only frame).
             if !defer_reveal && early_reveal_size.is_none() {
                 window.set_visible(true);
                 crate::metrics::mark_first_window_visible();
+                // The surface is built synchronously below, before the loop turns:
+                // put the themed erase on glass now, not an unpainted client area.
+                #[cfg(windows)]
+                self.apprt.window_flush_backdrop(&window);
             }
             // Request the first redraw explicitly rather than waiting for WM_PAINT;
             // the themed class-brush erase covers the gap. A duplicate coalesces.
@@ -2235,10 +2335,14 @@ impl App {
             self.paste_banner = None;
         }
         // The close/quit banner (Windows) asked about this very window, so it is
-        // moot; dropping it frees the slot.
+        // moot; dropping it frees the slot, and so is a question that waited over
+        // it. The next one that waited asks now, in words that see this close
+        // (this window is already out of `windows`).
         if self.close_banner.as_ref().is_some_and(|p| p.wid == wid) {
             self.close_banner = None;
         }
+        self.close_banner_queue.retain(|q| q.wid != wid);
+        self.ask_next_queued_close();
         // Clear the winit→logical mapping for this window (its OS id is gone).
         self.winit_to_window.retain(|_, &mut v| v != wid);
         // Drop the closed window from the focus-order stack so it can never be picked
@@ -2270,7 +2374,7 @@ impl App {
         }
         // Refresh the status item after deregistration so it shows post-close
         // state.
-        self.refresh_operator_status_item();
+        self.mark_status_dirty();
         if self.windows.is_empty() {
             CloseOutcome::Exit
         } else {
@@ -2286,7 +2390,7 @@ impl App {
         self.focus_order.push(wid);
         // The status item marks the frontmost window; this sees every focus gain,
         // including same-window re-focus (fingerprint-gated).
-        self.refresh_operator_status_item();
+        self.mark_status_dirty();
     }
 
     /// The window to make frontmost when the front window closes: the most
@@ -2386,15 +2490,19 @@ impl App {
     /// [`Self::apply_window_resized_grid`]). Fitting it there runs the initial-frame
     /// settle first, so a header row that arrives with the first configure is added
     /// to the window rather than taken from the terminal, and the PTY sees one size,
-    /// not the net-zero pair the settle exists to prevent.
+    /// not the net-zero pair the settle exists to prevent. It resolves the strip
+    /// from the live config, so a Settings edit's fall still waiting the regrow
+    /// floor ([`Self::set_tab_strip_rows`]) is settled here: taken with the frame's
+    /// own change, or dropped when the header keeps the row.
     #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn sync_strip_header_row(&mut self, settling: WindowId) -> bool {
+        self.strip_fall = None;
         let rows = self.strip_rows_for(crate::app_config::resolve_tab_strip_rows(&self.config));
         if rows == self.tab_strip_rows {
             return false;
         }
-        // A rise is noted like the reload's, so no presence fold or band shrink
-        // re-grids inside it.
+        // A rise is noted like the reload's (`set_tab_strip_rows`), so no band
+        // shrink re-grids inside it.
         if aterm_messages::chrome::is_rise(self.tab_strip_rows, rows) {
             self.note_chrome_rise_everywhere(Instant::now());
         }
@@ -2596,6 +2704,44 @@ impl App {
             }
             CloseConfirm::Interactive => {}
         }
+        let Some(prompt) = self.destructive_prompt(wid, exits_app, busy, replay) else {
+            // Nothing worth interrupting for (macOS: app keeps running and nothing
+            // is busy; Windows: also a single idle tab): the close needs no confirm.
+            return true;
+        };
+        // Windows: park the question on the in-window banner and refuse for now,
+        // never `apprt.confirm` (see the doc above and `close_confirm`). `cfg!`
+        // rather than `#[cfg]` keeps both arms compiled on every host.
+        if cfg!(windows) {
+            return self.present_close_banner(wid, prompt, replay);
+        }
+        if let Some(proceed) = self
+            .apprt
+            .confirm(prompt.title, prompt.body, prompt.proceed)
+        {
+            return proceed;
+        }
+        // No native dialog (Linux): only a gesture that would end a job asks, and
+        // it asks in the window. The always-ask quit above is macOS's ⌘Q rule.
+        if !busy {
+            return true;
+        }
+        self.present_close_banner(wid, prompt, replay)
+    }
+
+    /// The question a destructive gesture over `wid` asks, or `None` when it is
+    /// worth no interruption. `replay` names the gesture: a tab or pane close
+    /// asks only while `busy`, in its own words; a window close or a quit asks by
+    /// the platform's policy. Linux's banner additionally asks only while busy
+    /// (see [`Self::confirm_destructive_gesture`]); this is the question, not
+    /// that gate.
+    fn destructive_prompt(
+        &self,
+        wid: WindowId,
+        exits_app: bool,
+        busy: bool,
+        replay: crate::close_confirm::CloseReplay,
+    ) -> Option<crate::quit_safety::ConfirmPrompt> {
         // Windows follows Windows Terminal's convention, not macOS's: prompt when
         // the gesture closes MULTIPLE tabs or a running job, never for a single
         // idle tab — see `quit_safety::confirm_prompt_windows`. The tab count is
@@ -2623,81 +2769,150 @@ impl App {
             crate::quit_safety::confirm_prompt_windows(exits_app, tabs_closing, busy, reopens)
         };
         #[cfg(not(windows))]
-        let prompt = crate::quit_safety::confirm_prompt(exits_app, busy, reopens);
-        let prompt = match view_close {
+        let prompt = {
+            let _ = wid;
+            crate::quit_safety::confirm_prompt(exits_app, busy, reopens)
+        };
+        match view_close {
             Some(pane) => busy.then(|| crate::quit_safety::busy_view_close_prompt(pane)),
             None => prompt,
-        };
-        let Some(prompt) = prompt else {
-            // Nothing worth interrupting for (macOS: app keeps running and nothing
-            // is busy; Windows: also a single idle tab): the close needs no confirm.
-            return true;
-        };
-        // Windows: park the question on the in-window banner and refuse for now,
-        // never `apprt.confirm` (see the doc above and `close_confirm`). `cfg!`
-        // rather than `#[cfg]` keeps both arms compiled on every host.
-        if cfg!(windows) {
-            return self.present_close_banner(wid, prompt, replay);
         }
-        if let Some(proceed) = self
-            .apprt
-            .confirm(prompt.title, prompt.body, prompt.proceed)
-        {
-            return proceed;
-        }
-        // No native dialog (Linux): only a gesture that would end a job asks, and
-        // it asks in the window. The always-ask quit above is macOS's ⌘Q rule.
-        if !busy {
-            return true;
-        }
-        self.present_close_banner(wid, prompt, replay)
     }
 
     /// Park a destructive question on the in-window banner over `wid` and refuse
     /// the gesture for now (always `false`), so the event loop keeps turning
-    /// (`close_confirm`). One at a time: a second gesture while one stands is
-    /// refused and logged, and the standing question stays.
+    /// (`close_confirm`). One question shows at a time. A person's gesture over
+    /// ANOTHER window while one stands waits its turn (`close_banner_queue`, one
+    /// per window) and is asked once the standing question is answered or
+    /// dropped ([`Self::ask_next_queued_close`]): the taskbar's "Close all
+    /// windows" closes every window at once, and a dropped gesture left the
+    /// second window open after the first was answered. Every other second
+    /// gesture (over the same window, or a control client's) is refused with
+    /// the standing question named, as before.
     ///
     /// The gesture's exit-ledger attribution is stashed on the window now, while
     /// its `CloseAttribution` scope is open, because the replay runs later with no
     /// scope.
     ///
-    /// A minimized window is restored first, so the banner is visible.
+    /// The window holding the question is brought forward
+    /// ([`Self::raise_close_question`]) whenever a person's gesture lands on it,
+    /// first or later, so a question over a background or minimized window is
+    /// seen.
     pub(crate) fn present_close_banner(
         &mut self,
         wid: WindowId,
         prompt: crate::quit_safety::ConfirmPrompt,
         replay: crate::close_confirm::CloseReplay,
     ) -> bool {
-        if let Some(standing) = self.close_banner.as_ref() {
-            aterm_log::info!(
-                "close confirm already open over window {}; refusing the new {} gesture \
-                 until it is answered",
-                standing.wid.0,
-                crate::close_confirm::kind(&prompt),
-            );
-            // The STANDING question is what a wire caller must answer.
-            self.pending_action_refusal = Some(standing.wire_refusal());
-            return false;
-        }
         // Who asked decides who may answer (`PendingClose::wire_may_answer`): read
         // the gesture's attribution scope (`ctl-close` for `invoke`, `ui-close` /
         // `window-close` for the human, none for Quit) while it is still open.
         let (_, asked_by) = crate::session_store::current_close_attribution();
         let pending = crate::close_confirm::PendingClose::new(wid, prompt, replay, asked_by);
+        let by_person = !pending.wire_may_answer();
+        if let Some(standing) = self.close_banner.as_ref() {
+            let standing_wid = standing.wid;
+            // The STANDING question is what a wire caller must answer.
+            self.pending_action_refusal = Some(standing.wire_refusal());
+            let waits = by_person
+                && wid != standing_wid
+                && self.windows.contains_key(&wid)
+                && !self.close_banner_queue.iter().any(|q| q.wid == wid);
+            if waits {
+                aterm_log::info!(
+                    "close confirm open over window {}; the {} gesture over window {} \
+                     is asked next",
+                    standing_wid.0,
+                    crate::close_confirm::kind(&pending.prompt),
+                    wid.0,
+                );
+                self.stash_deferred_close_attribution(wid);
+                self.close_banner_queue.push(pending);
+            } else {
+                aterm_log::info!(
+                    "close confirm already open over window {}; refusing the new {} gesture \
+                     until it is answered",
+                    standing_wid.0,
+                    crate::close_confirm::kind(&pending.prompt),
+                );
+            }
+            // A person whose gesture is held up is shown what holds it up.
+            if by_person {
+                self.raise_close_question(standing_wid, true);
+            }
+            return false;
+        }
         // A gesture that mints a reply (`invoke CloseTab`, the `tab` verb) reports
         // the pending question and how to answer it. Wire consumers clear this
         // before their own action.
         self.pending_action_refusal = Some(pending.wire_refusal());
         self.stash_deferred_close_attribution(wid);
         self.close_banner = Some(pending);
-        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-            if w.is_minimized() == Some(true) {
-                w.set_minimized(false);
-            }
-            w.request_redraw();
-        }
+        self.raise_close_question(wid, by_person);
         false
+    }
+
+    /// Bring the window holding the close question into view: restored when
+    /// minimized, and, for a person (`focus`), raised and given the keyboard
+    /// that answers it, with the taskbar button flashing when the OS refuses the
+    /// focus change. A control client's question only un-minimizes and repaints:
+    /// an agent's gesture never takes the person's focus.
+    fn raise_close_question(&mut self, wid: WindowId, focus: bool) {
+        let Some((w, focused)) = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| Some((ws.os_window.clone()?, ws.focused)))
+        else {
+            return;
+        };
+        if w.is_minimized() == Some(true) {
+            // `focus_window` no-ops on a minimized window and the restore is
+            // asynchronous: the `Occluded(false)` arm finishes the raise.
+            if focus {
+                self.pending_deminiaturize_focus = Some(wid);
+            }
+            w.set_minimized(false);
+        }
+        if focus && !focused {
+            w.focus_window();
+            // Windows skips this when the focus change took (the window is active).
+            w.request_user_attention(Some(aterm_window::window::UserAttentionType::Critical));
+        }
+        w.request_redraw();
+    }
+
+    /// Ask the first question that waited behind the one just answered or
+    /// dropped (`close_banner_queue`), over a window that still exists. A window
+    /// close is asked again in the words that are true NOW: the first window's
+    /// close may have made this one the last (its close now quits), or its job
+    /// may have ended. One that no longer needs asking proceeds as its gesture
+    /// would have (`Wake::ConfirmedClose`). A no-op while a question stands.
+    pub(crate) fn ask_next_queued_close(&mut self) {
+        while self.close_banner.is_none() && !self.close_banner_queue.is_empty() {
+            let mut next = self.close_banner_queue.remove(0);
+            if !self.windows.contains_key(&next.wid) {
+                continue;
+            }
+            if let crate::close_confirm::CloseReplay::Window(wid) = next.replay {
+                let exits_app = self.exits_app_when_closing(wid);
+                let busy = self.window_has_foreground_job(wid);
+                let asks = self
+                    .destructive_prompt(wid, exits_app, busy, next.replay)
+                    .filter(|_| cfg!(windows) || busy);
+                let Some(prompt) = asks else {
+                    if let Some(proxy) = self.proxy.as_ref() {
+                        let _ = proxy.send_event(crate::Wake::ConfirmedClose {
+                            replay: next.replay,
+                        });
+                    }
+                    continue;
+                };
+                next.prompt = prompt;
+            }
+            let (wid, focus) = (next.wid, !next.wire_may_answer());
+            self.close_banner = Some(next);
+            self.raise_close_question(wid, focus);
+        }
     }
 
     /// Answer the in-window close/quit banner: `proceed` replays the parked gesture
@@ -2724,6 +2939,10 @@ impl App {
             if let Some(ws) = self.windows.get_mut(&pending.wid) {
                 ws.pending_close_attribution = None;
             }
+            // A cancel answers this question only: one that waited asks now. A
+            // `yes` asks it once its replay has run (`replay_confirmed_close`),
+            // so the next question's words see that close.
+            self.ask_next_queued_close();
             return None;
         }
         if let Some(proxy) = self.proxy.as_ref() {
@@ -2778,7 +2997,12 @@ impl App {
                     );
                 }
             }
-            crate::close_confirm::CloseReplay::Quit => self.on_quit_requested(el),
+            crate::close_confirm::CloseReplay::Quit => {
+                // A confirmed quit answers every close that waited behind it:
+                // the windows go with the app.
+                self.close_banner_queue.clear();
+                self.on_quit_requested(el);
+            }
             crate::close_confirm::CloseReplay::Tab { .. }
             | crate::close_confirm::CloseReplay::Pane { .. } => {
                 if let Some(wid) = self.replay_confirmed_view_close(replay) {
@@ -2787,6 +3011,9 @@ impl App {
             }
         }
         self.close_confirm = policy;
+        // The next question that waited, now that this close has run (a window
+        // close already asked it from `close_window_logical`).
+        self.ask_next_queued_close();
     }
 
     /// The tab or pane close a banner stood for, re-run under the caller's
@@ -2833,12 +3060,19 @@ impl App {
 
     /// The `controls front` line for the close/quit confirm: the pending question
     /// and the wire way to answer it, or `confirm open=false`. Reported for the
-    /// instance regardless of which window the banner is over.
+    /// instance regardless of which window the banner is over. ` waiting=<n>`
+    /// ends it while `n` of a person's gestures over other windows wait their
+    /// turn ([`Self::present_close_banner`]).
     ///
     /// `None` on macOS, which never parks a close question (its `NSAlert`
     /// answers inside the gesture).
     pub(crate) fn close_confirm_controls_line(&self) -> Option<String> {
         match self.close_banner.as_ref() {
+            Some(pending) if !self.close_banner_queue.is_empty() => Some(format!(
+                "{} waiting={}",
+                pending.controls_line(),
+                self.close_banner_queue.len()
+            )),
             Some(pending) => Some(pending.controls_line()),
             None if cfg!(not(target_os = "macos")) => {
                 Some(crate::close_confirm::CONTROLS_CLOSED.to_string())
@@ -3016,6 +3250,25 @@ impl App {
             // `cli::lifeline_request` refuses the flag on a window, so this is not
             // reached; were it, a window is a person's to close, not a harness's.
             aterm_log::warn!("lifeline cut in a windowed instance; leaving it open");
+            return;
+        }
+        self.on_quit_requested(el);
+    }
+
+    /// A headless instance was sent a terminating signal
+    /// (`owned_endpoint::arm_orderly_quit`): quit as the Quit verb does — its
+    /// barriers, `el.exit()`, then the final exit's teardown (subscribers told
+    /// `bye quit`, task files and the crash marker removed, every shell hung
+    /// up), after which the process dies of `sig`. A barrier holding the quit is
+    /// left to finish; the watcher's backstop ends the process if it never does.
+    #[cfg(unix)]
+    pub(crate) fn on_exit_signal(&mut self, el: &ActiveEventLoop, sig: i32) {
+        if !self.headless {
+            // Only a headless instance arms the orderly path; were a window's
+            // reached, its quit would ask a person, so the signal ends it as
+            // before.
+            aterm_log::warn!("signal {sig} reached a windowed instance's quit path; ending now");
+            crate::owned_endpoint::die_of_quit_signal();
             return;
         }
         self.on_quit_requested(el);
@@ -3240,8 +3493,13 @@ impl App {
             if ws.current_title != scratch
                 && !crate::toolbar::busy_spinner_phase_only_change(&ws.current_title, &scratch)
             {
+                // The OS caption, taskbar button and Alt+Tab label show the
+                // subject without a leading spinner frame: they keep one frame of
+                // an animation the coalescing above never advances, and a frozen
+                // `◐` reads as a stray glyph. The tab chip keeps its activity mark;
+                // `current_title` keeps the frame for the strip and accessibility.
                 if title_authority == WindowTitleAuthority::Canonical {
-                    window.set_title(&scratch);
+                    crate::elevated_caption::set_title(window, os_window_title(&scratch));
                 }
                 ws.current_title.clear();
                 ws.current_title.push_str(&scratch);
@@ -3335,13 +3593,13 @@ impl App {
             W::MaximizeWindow => w.set_maximized(true),
             W::UndoFullscreen => w.set_fullscreen(None),
             W::EnterFullscreen => {
-                w.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                w.set_fullscreen(Some(aterm_window::window::Fullscreen::Borderless(None)));
             }
             W::ToggleFullscreen => {
                 if w.fullscreen().is_some() {
                     w.set_fullscreen(None);
                 } else {
-                    w.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                    w.set_fullscreen(Some(aterm_window::window::Fullscreen::Borderless(None)));
                 }
             }
             // No winit mapping (lower/axis-maximize). Reports never ride this wake
@@ -3417,15 +3675,19 @@ impl App {
             .front_terminal(wid)
             .and_then(|terminal| crate::term_lock(&terminal.term).taskbar_progress());
         taskbar::set_progress(hwnd, progress);
+        // The bell's overlay badge and the jump list's Recent sampler ride this
+        // same per-frame seam (`taskbar_badge_win`, `jumplist_recent`).
+        self.sync_taskbar_extras(wid, hwnd);
     }
 }
 
 /// Hand-rolled COM FFI for the Windows taskbar progress indicator
-/// (`ITaskbarList3`), behind ConEmu's `OSC 9;4`. Direct `ole32` declarations and a
-/// by-hand vtable, like [`super::win32`]. One COM object is created lazily on the
-/// UI/STA thread, cached in a `thread_local`, shared by every window and leaked
-/// for the process life. Each window's last state is cached so COM is reached
-/// only on change.
+/// (`ITaskbarList3`), behind ConEmu's `OSC 9;4`, and for the bell's overlay
+/// badge (`SetOverlayIcon`, driven by `taskbar_badge_win`). Direct `ole32`
+/// declarations and a by-hand vtable, like [`super::win32`]. One COM object is
+/// created lazily on the UI/STA thread, cached in a `thread_local`, shared by
+/// every window and leaked for the process life. Each window's last state is
+/// cached so COM is reached only on change.
 #[cfg(windows)]
 pub(crate) mod taskbar {
     use std::cell::RefCell;
@@ -3468,8 +3730,10 @@ pub(crate) mod taskbar {
     const TBPF_PAUSED: u32 = 0x8;
 
     /// The `ITaskbarList3` vtable in COM inheritance order (IUnknown → ITaskbarList
-    /// → ITaskbarList2 → ITaskbarList3), truncated after `set_progress_state`. The
-    /// unused leading slots must stay for the offsets of the ones called.
+    /// → ITaskbarList2 → ITaskbarList3), truncated after `set_overlay_icon` (the
+    /// bell's badge, `taskbar_badge_win`). The unused slots must stay for the
+    /// offsets of the ones called; the order is `shobjidl_core.h`'s, checked
+    /// against `windows` 0.62's `ITaskbarList3_Vtbl`.
     #[repr(C)]
     struct ITaskbarList3Vtbl {
         query_interface:
@@ -3484,6 +3748,18 @@ pub(crate) mod taskbar {
         mark_fullscreen_window: unsafe extern "system" fn(*mut ITaskbarList3, isize, i32) -> i32,
         set_progress_value: unsafe extern "system" fn(*mut ITaskbarList3, isize, u64, u64) -> i32,
         set_progress_state: unsafe extern "system" fn(*mut ITaskbarList3, isize, u32) -> i32,
+        register_tab: unsafe extern "system" fn(*mut ITaskbarList3, isize, isize) -> i32,
+        unregister_tab: unsafe extern "system" fn(*mut ITaskbarList3, isize) -> i32,
+        set_tab_order: unsafe extern "system" fn(*mut ITaskbarList3, isize, isize) -> i32,
+        set_tab_active: unsafe extern "system" fn(*mut ITaskbarList3, isize, isize, u32) -> i32,
+        thumb_bar_add_buttons:
+            unsafe extern "system" fn(*mut ITaskbarList3, isize, u32, *const c_void) -> i32,
+        thumb_bar_update_buttons:
+            unsafe extern "system" fn(*mut ITaskbarList3, isize, u32, *const c_void) -> i32,
+        thumb_bar_set_image_list:
+            unsafe extern "system" fn(*mut ITaskbarList3, isize, isize) -> i32,
+        set_overlay_icon:
+            unsafe extern "system" fn(*mut ITaskbarList3, isize, isize, *const u16) -> i32,
     }
 
     #[repr(C)]
@@ -3603,12 +3879,97 @@ pub(crate) mod taskbar {
         });
     }
 
+    /// Show (`icon` non-zero, with its accessible `description`, NUL-terminated)
+    /// or clear (`icon` 0) the overlay badge on `hwnd`'s taskbar button
+    /// (`SetOverlayIcon`). The taskbar keeps its own copy of the icon. Whether
+    /// the taskbar took it; `false` with no taskbar interface. The badge's state
+    /// lives in `taskbar_badge_win`, which calls this only on a change.
+    pub(crate) fn set_overlay_icon(hwnd: isize, icon: isize, description: &[u16]) -> bool {
+        CACHE.with(|c| {
+            let Some(obj) = c.borrow_mut().object() else {
+                return false;
+            };
+            let description = overlay_description(icon, description);
+            // SAFETY: `obj` is a live `ITaskbarList3` created on this thread,
+            // `hwnd` a live top-level window (0 rejected by the caller), `icon`
+            // a live HICON or 0, and `description` null or a NUL-terminated
+            // UTF-16 string that outlives this synchronous call.
+            unsafe { ((*(*obj).vtbl).set_overlay_icon)(obj, hwnd, icon, description) >= 0 }
+        })
+    }
+
+    /// The `pszDescription` [`set_overlay_icon`] hands the taskbar: null for a
+    /// clear (`icon` 0) and for text that is not NUL-terminated (the shell
+    /// reads a C string), else the text itself.
+    fn overlay_description(icon: isize, description: &[u16]) -> *const u16 {
+        if icon == 0 || description.last() != Some(&0) {
+            std::ptr::null()
+        } else {
+            description.as_ptr()
+        }
+    }
+
     /// Drop the cache entry for a closing window's `hwnd`, so a later window
-    /// reusing the value is not skipped. The button disappears with the window.
+    /// reusing the value is not skipped, and clear its overlay badge. The button
+    /// disappears with the window.
     pub(crate) fn forget(hwnd: isize) {
+        crate::taskbar_badge_win::forget(hwnd);
         CACHE.with(|c| {
             c.borrow_mut().applied.remove(&hwnd);
         });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// What `SetOverlayIcon` reads as the badge's spoken text: the
+        /// description on a show, nothing on a clear, and nothing for text
+        /// without its NUL (the shell would read past it).
+        #[test]
+        fn a_show_passes_its_text_and_a_clear_passes_none() {
+            let text = crate::win_ffi::wide("A tab rang the bell");
+            assert_eq!(overlay_description(0x7010, &text), text.as_ptr());
+            assert!(overlay_description(0, &text).is_null(), "a clear");
+            assert!(overlay_description(0, &[]).is_null());
+            let unterminated: Vec<u16> = "A tab".encode_utf16().collect();
+            assert!(overlay_description(0x7010, &unterminated).is_null());
+        }
+
+        /// The ConEmu progress states map to the TBPFLAG and value the taskbar
+        /// takes; nothing set clears the button.
+        #[test]
+        fn progress_maps_to_the_taskbar_flag_and_value() {
+            assert_eq!(encode(None), (TBPF_NOPROGRESS, 0));
+            assert_eq!(encode(Some(TaskbarProgress::Hidden)), (TBPF_NOPROGRESS, 0));
+            assert_eq!(
+                encode(Some(TaskbarProgress::Indeterminate)),
+                (TBPF_INDETERMINATE, 0)
+            );
+            assert_eq!(encode(Some(TaskbarProgress::Normal(42))), (TBPF_NORMAL, 42));
+            assert_eq!(encode(Some(TaskbarProgress::Error(7))), (TBPF_ERROR, 7));
+            assert_eq!(encode(Some(TaskbarProgress::Paused(99))), (TBPF_PAUSED, 99));
+        }
+
+        /// The vtable reaches `SetOverlayIcon` at slot 18 and the progress
+        /// calls at 9 and 10, `shobjidl_core.h`'s order: IUnknown (3),
+        /// ITaskbarList (5), ITaskbarList2 (1), then ITaskbarList3.
+        #[test]
+        fn the_vtable_slots_are_the_headers() {
+            let slot = |offset: usize| offset / std::mem::size_of::<usize>();
+            assert_eq!(
+                slot(std::mem::offset_of!(ITaskbarList3Vtbl, set_progress_value)),
+                9
+            );
+            assert_eq!(
+                slot(std::mem::offset_of!(ITaskbarList3Vtbl, set_progress_state)),
+                10
+            );
+            assert_eq!(
+                slot(std::mem::offset_of!(ITaskbarList3Vtbl, set_overlay_icon)),
+                18
+            );
+        }
     }
 }
 
@@ -3677,8 +4038,8 @@ pub(crate) mod placement {
     /// `rcNormalPosition` is in workspace coordinates (screen shifted by the
     /// primary work-area origin); they coincide only with a bottom taskbar.
     /// `SPI_GETWORKAREA` supplies the offset; a failed read uses (0,0).
-    pub(crate) fn read(window: &winit::window::Window) -> Option<(bool, (i32, i32))> {
-        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    pub(crate) fn read(window: &aterm_window::window::Window) -> Option<(bool, (i32, i32))> {
+        use aterm_window::raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let hwnd = match window.window_handle().ok()?.as_raw() {
             RawWindowHandle::Win32(h) => h.hwnd.get(),
             _ => return None,
@@ -3731,26 +4092,33 @@ pub(crate) mod placement {
     }
 }
 
-/// HiDPI auto-scale target for [`App::attach_os_window`]: the `font_px` the
-/// default font size renders at on a display of `scale`, or `None` when an
-/// explicit size is set or the display is 1×. Deterministic, so callers can
-/// compare with `==` to skip a rebuild. Also used by `first_window_prewarm_px`,
-/// so the worker's glyph warm and the attach agree.
-/// `scale_milli` is the text size scale (`font_size_scale`, `1000` for
-/// none), applied to the derived default.
-pub(crate) fn hidpi_target_font_px(
-    font_px_explicit: bool,
-    scale: f64,
-    scale_milli: u16,
-) -> Option<f32> {
-    (!font_px_explicit && scale > 1.0).then(|| {
-        crate::scaled_font_px(
-            (FONT_PX * scale as f32)
-                .round()
-                .clamp(FONT_PX_MIN, FONT_PX_MAX),
-            scale_milli,
-        )
-    })
+impl App {
+    /// The device px a window attaching at `scale` draws the live font size
+    /// at ([`crate::font_px_for_scale`]); a zoom still carried in an older
+    /// build's device px is that px. Deterministic, so the early reveal's
+    /// prediction and the post-join activation agree.
+    fn attach_font_px(&self, scale: f64) -> f32 {
+        match self.font_size_from_device {
+            Some((px, _)) => px,
+            None => crate::font_px_for_scale(self.font_size, scale),
+        }
+    }
+}
+
+/// The font size (px at 1×) a device px drew at on a display of `scale`: the
+/// inverse of [`crate::font_px_for_scale`], for a zoom an older build carried in
+/// device px, clamped to the font bounds.
+pub(crate) fn font_size_of_device_px(px: f32, scale: f64) -> f32 {
+    let size = if scale.is_finite() && scale > 0.0 {
+        px / scale as f32
+    } else {
+        px
+    };
+    if size.is_finite() {
+        size.clamp(FONT_PX_MIN, FONT_PX_MAX)
+    } else {
+        FONT_PX
+    }
 }
 
 #[cfg(test)]
@@ -3758,6 +4126,22 @@ mod tests {
     use super::*;
 
     use crate::feed_session_for_test as feed;
+
+    /// The OS caption never holds a frozen spinner frame: Claude Code's moon and
+    /// Codex's braille dots are dropped with the blank after them, the subject
+    /// stays, and a title that is only a frame, or a glyph not followed by a
+    /// blank, is the title's own text.
+    #[test]
+    fn the_os_caption_drops_a_leading_spinner_frame() {
+        assert_eq!(
+            os_window_title("\u{25d0} Aterm OSX shortcuts and font — Running claude"),
+            "Aterm OSX shortcuts and font — Running claude"
+        );
+        assert_eq!(os_window_title("\u{280b} cargo build"), "cargo build");
+        assert_eq!(os_window_title("cargo build"), "cargo build");
+        assert_eq!(os_window_title("\u{25d0}"), "\u{25d0}");
+        assert_eq!(os_window_title("\u{25d0}x"), "\u{25d0}x");
+    }
 
     /// A cmdlet or script inside `pwsh.exe` spawns no child, so only the block
     /// state can mark the session busy. The stub PTY says nothing (`master`/`pid`
@@ -4175,9 +4559,7 @@ mod tests {
         let base = app.theme;
         app.config.foreground = Some("#FFAA00".to_string());
         app.config.background = Some("#202040".to_string());
-        app.theme = app
-            .config
-            .theme_for_with_assets(app.os_appearance, &app.config_assets.themes);
+        app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
         assert_eq!(app.theme.fg, 0x00FF_AA00, "the terminal takes the override");
         let page = app.native_page_palette_theme();
         assert_eq!(
@@ -4189,6 +4571,32 @@ mod tests {
         assert_eq!(
             app.native_page_palette_theme().bg,
             crate::native_appearance::FORCED_LIGHT_CHROME_BG
+        );
+    }
+
+    /// The page palette and the terminal theme come from one install: a config
+    /// assigned but not yet installed moves neither, and the next install
+    /// moves both together.
+    #[test]
+    fn the_page_palette_follows_the_installed_resolution_not_the_live_config() {
+        let mut app = App::headless_for_test();
+        app.config.foreground = Some("#FFAA00".to_string());
+        app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
+        let (terminal, page) = (app.theme, app.native_page_palette_theme());
+        app.config.theme = Some("Nord".to_string());
+        assert_eq!(app.theme, terminal, "nothing installed yet");
+        assert_eq!(
+            app.native_page_palette_theme(),
+            page,
+            "the page waits for the same install the terminal waits for"
+        );
+        app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
+        let nord = aterm_render::Theme::from(&aterm_types::scheme::builtin("Nord").expect("Nord"));
+        assert_eq!(app.theme.fg, 0x00FF_AA00, "the terminal keeps its override");
+        assert_eq!(
+            app.native_page_palette_theme(),
+            crate::native_appearance::resolve_chrome_palette(app.window_theme, nord),
+            "the page moves to the new theme with the install"
         );
     }
 
@@ -4338,31 +4746,44 @@ mod tests {
         ));
     }
 
-    /// An explicit font size is never auto-scaled, a 1× (or sub-1×) display
-    /// keeps the built-in default, and the Retina target is
-    /// `round(FONT_PX × scale)` clamped to the zoom ceiling.
+    /// One font-size unit: every size — the default and one someone named —
+    /// draws at `round(size × scale)` on a window of that scale, the size
+    /// itself at 1×, so Settings' "12 px" is Automatic on every display and one
+    /// step up from it is one step up in every window. Negative control: the
+    /// old rule drew a named 13 at 13 device px on a 2× display, half of
+    /// Automatic's 24.
     #[test]
-    fn hidpi_target_font_px_scales_only_the_default_on_a_dense_display() {
-        for scale in [1.0, 2.0, 3.0] {
+    fn every_font_size_draws_at_its_window_scale() {
+        assert_eq!(crate::font_px_for_scale(FONT_PX, 1.0), FONT_PX);
+        for scale in [1.25, 1.5, 2.0, 3.0] {
             assert_eq!(
-                hidpi_target_font_px(true, scale, 1000),
-                None,
-                "explicit at {scale}"
+                crate::font_px_for_scale(FONT_PX, scale),
+                (FONT_PX * scale as f32).round(),
+                "the default at {scale}"
             );
         }
-        assert_eq!(hidpi_target_font_px(false, 1.0, 1000), None);
-        assert_eq!(hidpi_target_font_px(false, 0.75, 1000), None);
+        assert_eq!(crate::font_px_for_scale(13.0, 2.0), 26.0);
+        assert!(crate::font_px_for_scale(13.0, 2.0) > crate::font_px_for_scale(FONT_PX, 2.0));
         assert_eq!(
-            hidpi_target_font_px(false, 2.0, 1000),
-            Some((FONT_PX * 2.0).round())
+            crate::font_px_for_scale(12.5, 1.0),
+            12.5,
+            "1× keeps a fraction"
         );
-        let frac = hidpi_target_font_px(false, 1.25, 1000).unwrap();
-        assert_eq!(
-            frac,
-            frac.round(),
-            "a fractional scale rounds to a whole px"
-        );
-        assert_eq!(hidpi_target_font_px(false, 1000.0, 1000), Some(FONT_PX_MAX));
+        for scale in [1.25, 2.0] {
+            for size in 8..36 {
+                let (a, b) = (size as f32, (size + 1) as f32);
+                assert!(
+                    crate::font_px_for_scale(b, scale) > crate::font_px_for_scale(a, scale),
+                    "a step up from {a} at {scale} grows the text"
+                );
+            }
+        }
+        assert_eq!(crate::font_px_for_scale(150.0, 2.0), FONT_PX_MAX);
+        assert_eq!(crate::font_px_for_scale(f32::NAN, 2.0), FONT_PX);
+        // An older build's device-px zoom reads back as the size it drew.
+        assert_eq!(font_size_of_device_px(26.0, 2.0), 13.0);
+        assert_eq!(font_size_of_device_px(15.0, 1.25), 12.0);
+        assert_eq!(font_size_of_device_px(13.0, 1.0), 13.0);
     }
 
     #[test]
@@ -5394,24 +5815,24 @@ mod close_confirm_tests {
         }
     }
 
-    fn named_key(key: winit::keyboard::NamedKey) -> winit::event::KeyEvent {
-        winit::event::KeyEvent::synthetic_for_test(
-            winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Enter),
-            winit::keyboard::Key::Named(key),
-            key.to_text().map(winit::keyboard::SmolStr::new),
-            winit::keyboard::KeyLocation::Standard,
-            winit::event::ElementState::Pressed,
+    fn named_key(key: aterm_window::keyboard::NamedKey) -> aterm_window::event::KeyEvent {
+        aterm_window::event::KeyEvent::synthetic_for_test(
+            aterm_window::keyboard::PhysicalKey::Code(aterm_window::keyboard::KeyCode::Enter),
+            aterm_window::keyboard::Key::Named(key),
+            key.to_text().map(aterm_window::keyboard::SmolStr::new),
+            aterm_window::keyboard::KeyLocation::Standard,
+            aterm_window::event::ElementState::Pressed,
             false,
         )
     }
 
-    fn char_key(c: &str) -> winit::event::KeyEvent {
-        winit::event::KeyEvent::synthetic_for_test(
-            winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyA),
-            winit::keyboard::Key::Character(winit::keyboard::SmolStr::new(c)),
-            Some(winit::keyboard::SmolStr::new(c)),
-            winit::keyboard::KeyLocation::Standard,
-            winit::event::ElementState::Pressed,
+    fn char_key(c: &str) -> aterm_window::event::KeyEvent {
+        aterm_window::event::KeyEvent::synthetic_for_test(
+            aterm_window::keyboard::PhysicalKey::Code(aterm_window::keyboard::KeyCode::KeyA),
+            aterm_window::keyboard::Key::Character(aterm_window::keyboard::SmolStr::new(c)),
+            Some(aterm_window::keyboard::SmolStr::new(c)),
+            aterm_window::keyboard::KeyLocation::Standard,
+            aterm_window::event::ElementState::Pressed,
             false,
         )
     }
@@ -5423,7 +5844,7 @@ mod close_confirm_tests {
     /// epoch, which every PTY write moves.
     #[test]
     fn the_keyboard_answers_a_standing_question_and_nothing_leaks_under_it() {
-        use winit::keyboard::NamedKey;
+        use aterm_window::keyboard::NamedKey;
         let sink = std::sync::Arc::new(aterm_session::sink::SinkWriter::new(-1));
         let mut app = App::headless_for_test_with_sink(std::sync::Arc::clone(&sink));
         app.headless = false;
@@ -5536,6 +5957,117 @@ mod close_confirm_tests {
         // A single idle tab: instant, unasked.
         app.close_confirm = CloseConfirm::Interactive;
         assert!(app.confirm_destructive_close(wid, false, false));
+        assert!(app.close_banner.is_none());
+    }
+
+    /// The taskbar's "Close all windows": a person's close of a SECOND window
+    /// while the first window's question stands waits its turn instead of being
+    /// dropped (which left that window open once the first was answered). It is
+    /// asked once the first is answered, in the words true then: the first
+    /// window's close made this one the last, so on Windows its close now quits.
+    /// A repeat over either window adds nothing, a control client's gesture is
+    /// still refused, and a cancel asks the next question at once.
+    #[test]
+    fn a_second_window_close_waits_its_turn_and_is_asked_next() {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        let a = WindowId(0);
+        let sid = app.next_session_id;
+        let b = app.insert_logical_window(crate::stub_session(sid), 24, 80);
+        let sid = app.next_session_id;
+        app.push_stub_tab(b, crate::stub_session(sid));
+        assert!(!app.present_close_banner(a, busy_close_prompt(), CloseReplay::Window(a)));
+        assert!(!app.present_close_banner(b, busy_close_prompt(), CloseReplay::Window(b)));
+        assert_eq!(
+            app.close_banner.as_ref().map(|p| p.wid),
+            Some(a),
+            "one question shows at a time"
+        );
+        assert_eq!(app.close_banner_queue.len(), 1, "the second waits its turn");
+        assert!(
+            app.windows[&b].pending_close_attribution.is_some(),
+            "the waiting gesture's attribution rides to its replay"
+        );
+        let line = app
+            .close_confirm_controls_line()
+            .expect("a question stands");
+        assert!(line.ends_with(" waiting=1"), "{line}");
+        // A repeat over either window adds nothing.
+        app.present_close_banner(b, busy_close_prompt(), CloseReplay::Window(b));
+        app.present_close_banner(a, busy_close_prompt(), CloseReplay::Window(a));
+        assert_eq!(app.close_banner_queue.len(), 1);
+        // A control client's gesture is refused, never queued.
+        {
+            let _closing = crate::session_store::CloseAttribution::enter(
+                crate::session_store::ExitReason::CtlClose,
+                crate::session_store::ExitActor::Ctl,
+            );
+            let sid = app.next_session_id;
+            let c = app.insert_logical_window(crate::stub_session(sid), 24, 80);
+            assert!(!app.present_close_banner(c, busy_close_prompt(), CloseReplay::Window(c)));
+            assert!(
+                app.pending_action_refusal
+                    .take()
+                    .is_some_and(|why| why.starts_with("a window close ")),
+                "the wire is told what stands"
+            );
+            assert_eq!(app.close_banner_queue.len(), 1);
+            assert_eq!(app.close_window_logical(c), CloseOutcome::Stay);
+        }
+        // `yes` over A: nothing is asked until its replay has run, which ends
+        // in A's logical close.
+        assert_eq!(app.answer_close_banner(true), Some(CloseReplay::Window(a)));
+        assert!(
+            app.close_banner.is_none(),
+            "asked after the replay, not before"
+        );
+        assert_eq!(app.close_window_logical(a), CloseOutcome::Stay);
+        if cfg!(windows) {
+            let pending = app
+                .close_banner
+                .as_ref()
+                .expect("B's question is asked next");
+            assert_eq!(pending.wid, b);
+            assert_eq!(
+                crate::close_confirm::kind(&pending.prompt),
+                "quit",
+                "B is the last window now, so its close quits and its question says so"
+            );
+            assert!(app.close_banner_queue.is_empty());
+            assert!(
+                !app.close_confirm_controls_line()
+                    .unwrap()
+                    .contains("waiting=")
+            );
+        } else {
+            // Linux asks only while a job runs: B's idle tabs need no question
+            // now, and its close proceeds as the gesture would have.
+            assert!(app.close_banner.is_none());
+            assert!(app.close_banner_queue.is_empty());
+        }
+
+        // A cancel asks the next question at once.
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        let sid = app.next_session_id;
+        let b = app.insert_logical_window(crate::stub_session(sid), 24, 80);
+        let sid = app.next_session_id;
+        app.push_stub_tab(b, crate::stub_session(sid));
+        app.present_close_banner(a, busy_quit_prompt(), CloseReplay::Quit);
+        app.present_close_banner(b, busy_close_prompt(), CloseReplay::Window(b));
+        assert_eq!(app.answer_close_banner(false), None);
+        if cfg!(not(windows)) {
+            // Linux re-asks a window close only while a job runs.
+            return;
+        }
+        let pending = app
+            .close_banner
+            .as_ref()
+            .expect("the waiting question asks");
+        assert_eq!(pending.wid, b);
+        assert!(app.windows.contains_key(&a), "the cancel closed nothing");
+        // Its window closing drops it, and nothing else asks.
+        assert_eq!(app.close_window_logical(b), CloseOutcome::Stay);
         assert!(app.close_banner.is_none());
     }
 }

@@ -4,7 +4,7 @@
 //! `targo --unverified forge check`: the `forge` check of `targo --unverified verify`, which
 //! calls it in-process.
 //!
-//! [`check_report`] answers whether aterm's third-party surface is still the surface this
+//! [`run`] answers whether aterm's third-party surface is still the surface this
 //! repository declares, with no compilation and no network: one `cargo tree` resolution per cell
 //! plus file reads, so it is cheap to run on any change.
 //!
@@ -74,22 +74,12 @@ struct Carved {
     reason: String,
 }
 
-/// The check's verdict. `could_not_run` is kept apart from `ok`:
-/// [`check_report`] folds it into red, while [`run`] maps it onto exit code 3.
+/// The check's verdict. `could_not_run` is kept apart from `ok`: [`run`] maps
+/// it onto exit code 3.
 struct Verdict {
     ok: bool,
     log: String,
     could_not_run: Option<String>,
-}
-
-/// Every obligation over `root` across the cell matrix, as
-/// `(green, transcript)`.
-///
-/// Fail-closed: an unreadable manifest, an unresolvable cell or a missing
-/// `cargo` all produce `false`.
-pub fn check_report(root: &Path) -> (bool, String) {
-    let v = report_over(&Cargo::from_env(), root, &resolve::default_cells());
-    (v.ok, v.log)
 }
 
 /// The verb behind `targo --unverified forge check [--cell NAME]...`, asking
@@ -147,11 +137,13 @@ fn report_over(cargo: &Cargo, root: &Path, cells: &[Cell]) -> Verdict {
         log,
         "  [OB-1..OB-10] PROVENANCE, LICENSE & NOTICE — delegated to `targo --unverified forge attest`:"
     );
-    let (attest_ok, attest_log) = attest::report_with(cargo, root);
-    for line in attest_log.lines() {
+    let attested = attest::report_with(cargo, root);
+    for line in attested.log.lines() {
         let _ = writeln!(log, "    {line}");
     }
-    if !attest_ok {
+    if let Some(why) = attested.could_not_run {
+        could_not_run.get_or_insert(why);
+    } else if !attested.ok {
         fails += 1;
         let _ = writeln!(
             log,
@@ -1501,5 +1493,92 @@ windows-sys-052 = { package = \"windows-sys\", path = \"crates/aterm-windows-sys
             memchr.len() == 1 && memchr[0].0.contains("plain") && memchr[0].1 == "2",
             "the target-gated oracle, and only it, must be found: {memchr:?}"
         );
+    }
+
+    /// `[OB-12]` through the verb over a fake cargo: `sh` runs the root's
+    /// `tree` script as cargo's `tree` verb, printing per root package, triple
+    /// and edge kind. The patched `foo` resolves from its fork under `aterm`
+    /// and `web`, beside a registry `foo` only for `web` on wasm32; under
+    /// `tool` only in the build closure, and under `mixed` there beside a
+    /// registry `foo`; under `bare` and `nobuild` nowhere. `broken` does not
+    /// resolve, and `nobuild`'s build closure does not. Each cell's name is not
+    /// its package, as in the real cells. Each row is a selection of cells and
+    /// its verdict as `(green, could not run)`; the first two are green.
+    #[cfg(unix)]
+    #[test]
+    fn patch_liveness_is_judged_in_every_cell_at_its_own_root() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        for (rel, text) in [
+            (
+                "Cargo.toml",
+                "[workspace]\n\n[patch.crates-io]\nfoo = { path = \"crates/foo\" }\n",
+            ),
+            (
+                "crates/foo/Cargo.toml",
+                "[package]\nname = \"foo\"\nversion = \"1.0.0\"\nlicense = \"Apache-2.0\"\n",
+            ),
+            ("crates/foo/src/lib.rs", ""),
+            (
+                "Cargo.lock",
+                "version = 4\n\n[[package]]\nname = \"foo\"\nversion = \"1.0.0\"\n",
+            ),
+            ("NOTICE", ""),
+            ("deny.toml", "[licenses]\nallow = []\n"),
+            (
+                "tree",
+                "while [ $# -gt 0 ]; do\n\
+                 case $1 in -p) pkg=$2 ;; --target) triple=$2 ;; --edges) edges=$2 ;; esac\n\
+                 shift\n\
+                 done\n\
+                 case \"$pkg $edges\" in broken*|'nobuild normal,build') exit 101 ;; esac\n\
+                 echo \"0$pkg v0.1.0\"\n\
+                 case \"$pkg $edges\" in\n\
+                 aterm*|web*|'tool normal,build'|'mixed normal,build')\n\
+                 echo \"1foo v1.0.0 ($(pwd -P)/crates/foo)\" ;;\n\
+                 esac\n\
+                 case \"$pkg $triple $edges\" in\n\
+                 'web wasm32-unknown-unknown '*|'mixed '*' normal,build') echo '1foo v0.9.0' ;;\n\
+                 esac\n",
+            ),
+        ] {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("fixture dir");
+            std::fs::write(&path, text).expect("fixture file");
+        }
+        let cargo = Cargo::pinned("/bin/sh", "/usr/bin:/bin");
+        let cell = |package: &str, triple: &str| Cell {
+            name: format!("{package}-cell"),
+            triple: triple.into(),
+            package: package.into(),
+        };
+        let native = cell("aterm", "aarch64-apple-darwin");
+        let web = cell("web", "wasm32-unknown-unknown");
+        let tool = cell("tool", "aarch64-apple-darwin");
+        let mixed = cell("mixed", "aarch64-apple-darwin");
+        let bare = cell("bare", "aarch64-apple-darwin");
+        let broken = cell("broken", "aarch64-apple-darwin");
+        let nobuild = cell("nobuild", "aarch64-apple-darwin");
+        let rows: [(&[&Cell], (bool, bool)); 7] = [
+            // Live in the last cell only: a platform fact, not a dead patch.
+            (&[&bare, &native], (true, false)),
+            // Live only in the first cell's build closure: not dead.
+            (&[&tool, &bare], (true, false)),
+            // An unpatched sibling in the first cell.
+            (&[&web, &native], (false, false)),
+            // Live nowhere: a dead patch.
+            (&[&bare], (false, false)),
+            // An unpatched sibling in the build closure.
+            (&[&mixed], (false, false)),
+            // A cell cargo cannot resolve, then a build closure it cannot.
+            (&[&broken, &native], (false, true)),
+            (&[&nobuild], (false, true)),
+        ];
+        for (cells, want) in rows {
+            let cells: Vec<Cell> = cells.iter().copied().cloned().collect();
+            let v = report_over(&cargo, root, &cells);
+            assert_eq!((v.ok, v.could_not_run.is_some()), want, "{}", v.log);
+            assert!(v.ok || v.log.contains("FAIL [OB-12]"), "{}", v.log);
+        }
     }
 }

@@ -70,18 +70,27 @@ fn control_serious_mode_intent(key: &str, value: Option<&str>) -> Option<bool> {
     }
 }
 
+/// The `settings` verb's answer, from what the write did: `written` is the
+/// value `key` holds once it lands (`None` where the key is absent — an
+/// `unset`, or a value equal to its default, which the service writes as a
+/// removal), and `now` what a removed key reads as (the words its Settings
+/// row shows). An applied write says `saved: k = v` or `removed: k; now w`; a
+/// write that changed nothing says so, never "saved" with an empty value.
+/// Whether the save still needs reconciling comes last, after what it did.
 fn control_settings_completion_reply(
     key: &str,
-    value: Option<&str>,
+    written: Option<&str>,
+    now: Option<&str>,
     outcome: &ConfigPatchOutcome,
     synchronization_error: Option<&str>,
 ) -> Result<String, String> {
     match outcome {
         ConfigPatchOutcome::Applied { undo, .. } => {
-            let mut status = if undo.is_some() {
-                format!("saved: {key} = {}", value.unwrap_or(""))
-            } else {
-                format!("{key}: unchanged")
+            let mut status = match (undo, written, now) {
+                (None, _, _) => format!("{key}: unchanged"),
+                (Some(_), Some(value), _) => format!("saved: {key} = {value}"),
+                (Some(_), None, Some(now)) => format!("removed: {key}; now {now}"),
+                (Some(_), None, None) => format!("removed: {key}"),
             };
             if let Some(error) = synchronization_error {
                 // The worker produced a durable proof, so the save succeeded, but
@@ -186,7 +195,7 @@ impl NativeUpdateSafetyToken {
 
     /// A token certifying exactly these counts, as the preflight would have
     /// minted it — for the lane gate's own tests.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     #[must_use]
     pub(crate) fn carrying_for_test(
         carried_drafts: usize,
@@ -448,6 +457,10 @@ pub(crate) struct NativeUpdateReconcileFacts {
     /// about the installed facts, so it is no evidence the boot trial's count is
     /// gone (round eight, #80).
     pub(crate) installed_unproven: bool,
+    /// Whether this copy can replace itself, as this read observed it: the durable
+    /// status's own answer, or — where that read found no ledger — the bundle probe
+    /// alone (`aterm_update::running_copy_installable`). `None` observes nothing.
+    pub(crate) installable: Option<bool>,
 }
 
 /// One retire of a latched installed activation for a newer verified release
@@ -481,7 +494,7 @@ pub(crate) struct ActivationSupersedeCompletion {
 enum NativeUpdateFactDestination {
     Wake {
         purpose: NativeUpdateReconcilePurpose,
-        proxy: winit::event_loop::EventLoopProxy<Wake>,
+        proxy: aterm_window::event_loop::EventLoopProxy<Wake>,
     },
     #[cfg(any(unix, test))]
     Reply(std::sync::mpsc::SyncSender<NativeUpdateReconcileFacts>),
@@ -539,7 +552,7 @@ fn read_native_update_reconcile_facts(
 ) -> NativeUpdateReconcileFacts {
     #[cfg(test)]
     UPDATE_FACT_PROBES_ON_THREAD.with(|count| count.set(count.get().saturating_add(1)));
-    read_native_update_reconcile_facts_with(
+    let mut facts = read_native_update_reconcile_facts_with(
         ticket,
         observation_sequence,
         || aterm_update::status(current_build).map(durable_update_status),
@@ -567,7 +580,13 @@ fn read_native_update_reconcile_facts(
                     })
             })
         },
-    )
+    );
+    // A ledger that could not be read (no resolvable HOME) still has a copy to
+    // ask: the bundle probe alone answers whether it can replace itself.
+    if facts.installable.is_none() {
+        facts.installable = aterm_update::running_copy_installable();
+    }
+    facts
 }
 
 /// Read the facts: the durable status, then the installed bundle — `Ok(None)` when
@@ -585,6 +604,7 @@ fn read_native_update_reconcile_facts_with(
     // surviving-marker case.
     let observed_at = std::time::Instant::now();
     let durable = read_durable();
+    let installable = durable.as_ref().and_then(|durable| durable.installable);
     // A refusal that is a VERDICT (an unsigned or tampered bundle) is a fact: the
     // installed facts name no verified bundle. Only a check that did not finish is
     // the absence of an observation.
@@ -599,13 +619,14 @@ fn read_native_update_reconcile_facts_with(
         durable,
         installed,
         installed_unproven,
+        installable,
     }
 }
 
 /// Start the one process-wide, bounded FIFO facts worker. Every ledger/provenance
 /// observation is serialized here, and freshness is stamped at read time.
 pub(crate) fn spawn_native_update_reconcile_worker(
-    drain_proxy: winit::event_loop::EventLoopProxy<Wake>,
+    drain_proxy: aterm_window::event_loop::EventLoopProxy<Wake>,
 ) -> Result<NativeUpdateReconcileSender, String> {
     let (sender, receiver) =
         std::sync::mpsc::sync_channel::<NativeUpdateWorkerRequest>(NATIVE_UPDATE_WORKER_CAPACITY);
@@ -1375,6 +1396,8 @@ pub(crate) enum HandoffFailureLane {
     /// nothing is charged, latched or booked as one; the automatic lane holds for
     /// the check ([`crate::AutoApplyRosterWait`]) and the outcome is a deferral,
     /// which the ledger keeps as the standing refusal that names the wait.
+    /// Unix: only [`Self::classify`] (the unix handoff's) files one.
+    #[cfg(unix)]
     AwaitsRosterConfirmation { automatic: bool },
 }
 
@@ -1428,7 +1451,12 @@ impl HandoffFailureLane {
     #[must_use]
     #[cfg(any(unix, test))]
     fn charges_the_automatic_lane(self) -> bool {
-        !matches!(self, Self::Manual | Self::AwaitsRosterConfirmation { .. })
+        match self {
+            Self::Manual => false,
+            #[cfg(unix)]
+            Self::AwaitsRosterConfirmation { .. } => false,
+            _ => true,
+        }
     }
 }
 
@@ -1587,7 +1615,9 @@ pub(crate) fn decode_dmg_sha256(digest: &str) -> Option<[u8; 32]> {
 /// Seed the process service from the durable status marker every update
 /// surface reads. A missing marker yields an enabled/idle (or disabled)
 /// service; no network work occurs here.
-pub(crate) fn load_native_updater_service() -> NativeUpdaterService {
+pub(crate) fn load_native_updater_service(
+    launch_installability: crate::native_updater_service::UpdateInstallability,
+) -> NativeUpdaterService {
     let build = crate::build_info::build_number()
         .parse::<u64>()
         .unwrap_or(0);
@@ -1595,6 +1625,29 @@ pub(crate) fn load_native_updater_service() -> NativeUpdaterService {
     // Startup ledger reconciliation is posted by an off-loop worker, so first
     // input never queues behind TOML or PlistBuddy work on the event loop.
     NativeUpdaterService::new(build, version, aterm_update::enabled())
+        .seed_installability(launch_installability)
+}
+
+/// What the launch's own path already says about whether this copy can replace
+/// itself: a disk image, a translocated download, a bare binary and a dev-marked
+/// build cannot, read before the event loop runs. An ordinary install stays
+/// unobserved until the reconcile reads its bundle.
+#[must_use]
+pub(crate) fn launch_installability(
+    posture: Option<aterm_update::which_copy::InstallPosture>,
+    dev_marked: bool,
+) -> crate::native_updater_service::UpdateInstallability {
+    use crate::native_updater_service::UpdateInstallability;
+    use aterm_update::which_copy::InstallPosture;
+    match posture {
+        _ if dev_marked => UpdateInstallability::NotInstallable,
+        Some(
+            InstallPosture::MountedImage
+            | InstallPosture::Translocated
+            | InstallPosture::NotABundle,
+        ) => UpdateInstallability::NotInstallable,
+        Some(InstallPosture::Installed) | None => UpdateInstallability::Unobserved,
+    }
 }
 
 /// Bounded, owned result suitable for a typed event-loop wake.
@@ -1623,7 +1676,7 @@ pub(crate) fn durable_update_status(status: aterm_update::UpdateStatus) -> Durab
         apply_failure: apply_lane.last_failure,
         apply_failure_build: apply_lane.last_failure_target_build,
         apply_failures_for_target: apply_lane.failures_for_target,
-        installable: status.installable,
+        installable: Some(status.installable),
         channel_unreadable: status.channel_unreadable,
         checked_at: aterm_update_core::pkg_check::rfc3339_to_unix(&status.updated_at),
     }
@@ -1652,7 +1705,7 @@ fn failed_update_status(build: u64, message: String) -> DurableUpdateStatus {
         apply_failures_for_target: 0,
         // A worker failure says nothing about the bundle; the installable claim is
         // only ever made by a real observation.
-        installable: true,
+        installable: None,
         // Likewise: only a completed check can pronounce the channel unreadable.
         channel_unreadable: false,
         checked_at: None,
@@ -1808,24 +1861,24 @@ struct NativeConfigPersistenceJob {
     plan: crate::native_config_service::ConfigPersistencePlan,
     undo: Option<u64>,
     origin: NativeConfigOrigin,
-    proxy: winit::event_loop::EventLoopProxy<Wake>,
+    proxy: aterm_window::event_loop::EventLoopProxy<Wake>,
 }
 
 struct NativeConfigReconciliationJob {
     path: std::path::PathBuf,
     themes: std::sync::Arc<crate::app_config::ThemeCatalog>,
     pending_sequence: u64,
-    proxy: winit::event_loop::EventLoopProxy<Wake>,
+    proxy: aterm_window::event_loop::EventLoopProxy<Wake>,
 }
 
 struct NativeConfigExternalPreparationJob {
     observation: crate::native_config_service::ConfigDiskObservation,
     themes: std::sync::Arc<crate::app_config::ThemeCatalog>,
-    proxy: winit::event_loop::EventLoopProxy<Wake>,
+    proxy: aterm_window::event_loop::EventLoopProxy<Wake>,
 }
 
 enum NativeConfigJob {
-    Persist(NativeConfigPersistenceJob),
+    Persist(Box<NativeConfigPersistenceJob>),
     Reconcile(NativeConfigReconciliationJob),
     PrepareExternal(NativeConfigExternalPreparationJob),
 }
@@ -1888,9 +1941,9 @@ pub(crate) enum NativeConfigOrigin {
     SeriousMode {
         desired: bool,
     },
-    /// A View ▸ Presence Band / Rim toggle's durable write: `key` is the
-    /// `[presence]` leaf (`presence.band` / `presence.rim`), `desired` the chosen
-    /// bit. The live bit flipped at the click (`App::user_toggle_presence`); this
+    /// A `[presence]` leaf's durable write (View ▸ Show Needs in Windows writes
+    /// `presence.rim`): `key` is the leaf, `desired` the chosen bit. The live
+    /// bit flipped at the click (`App::user_toggle_needs_in_windows`); this
     /// completion adopts the durable truth or, on a refused write, reverts to it.
     Presence {
         key: &'static str,
@@ -2254,7 +2307,10 @@ impl App {
     /// proxy side effect itself, not just the worker dispatch below it.
     fn retry_pending_native_update_reconcile_via(
         &mut self,
-        materialize_proxy: impl FnOnce(&Self) -> Option<winit::event_loop::EventLoopProxy<crate::Wake>>,
+        materialize_proxy: impl FnOnce(
+            &Self,
+        )
+            -> Option<aterm_window::event_loop::EventLoopProxy<crate::Wake>>,
     ) {
         if !self.has_pending_native_update_reconcile() {
             return;
@@ -2393,6 +2449,7 @@ impl App {
                     .as_ref()
                     .is_some_and(|stage| announced_before != Some(stage.build));
                 self.publish_native_update_state();
+                self.say_linux_held_stage();
 
                 if let Some(stage) = effective_stage {
                     if newly_announced
@@ -2446,6 +2503,39 @@ impl App {
                         },
                         false,
                     );
+                }
+            }
+        }
+    }
+
+    /// A LINUX BUILD HELD FOR A PERSON IS ON THE BAND (ATERM-KI-1015-2, U21).
+    /// With automatic install off, a Linux check downloads a newer build and
+    /// holds it for `aterm update apply`; the macOS apply authority takes no
+    /// Linux stage (`staged_from_status`), so Settings ▸ Software Update showed
+    /// it and the band never did. Every reduced reconcile reads the copy's
+    /// facts: a held build newer than this process is said once per build
+    /// ([`crate::update_words::linux_held`]) — found at launch or after a pass —
+    /// and owed to a band that can show it; its row leaves with the stage
+    /// (installed by the command, or replaced). Reads nothing on macOS.
+    pub(crate) fn say_linux_held_stage(&mut self) {
+        let snapshot = self.native_updater_service.snapshot();
+        let running = snapshot.current_build;
+        let held = snapshot.linux.as_ref().and_then(|linux| {
+            let build = linux.staged_build.filter(|build| *build > running)?;
+            Some((build, linux.staged_version.clone().unwrap_or_default()))
+        });
+        match held {
+            Some((build, _)) if self.linux_held_said == Some(build) => {}
+            Some((build, version)) => {
+                self.linux_held_said = Some(build);
+                aterm_log::info!(
+                    "update: aterm {version} (build {build}) is held for `aterm update apply`"
+                );
+                self.say_owed_unless_seen(crate::update_words::linux_held(&version));
+            }
+            None => {
+                if self.linux_held_said.take().is_some() {
+                    self.withdraw_owed_row(crate::update_words::KEY_HELD);
                 }
             }
         }
@@ -2630,6 +2720,7 @@ impl App {
         self.font_config.fallback_fonts.hash(&mut paint);
         self.font_config.symbol_font.hash(&mut paint);
         self.font_config.emoji_font.hash(&mut paint);
+        self.font_config.display_faces.hash(&mut paint);
         for (tag, value) in &self.font_variations {
             tag.hash(&mut paint);
             value.to_bits().hash(&mut paint);
@@ -2637,7 +2728,11 @@ impl App {
         self.font_weight_dark_nudge.to_bits().hash(&mut paint);
         native_appearance_revision(crate::native_appearance::current_preferences())
             .hash(&mut paint);
-        native_motion_revision(self.native_view_motion_cx(wid, view)).hash(&mut paint);
+        let motion = self.native_view_motion_cx(wid, view);
+        native_motion_revision(motion).hash(&mut paint);
+        // The automatic selected-tab colour Settings shows follows the chrome
+        // theme, High Contrast and the system accent.
+        motion.automatic_tab_color.hash(&mut paint);
         Ok(NativeUiCompileStamp {
             instance,
             view,
@@ -2784,6 +2879,10 @@ impl App {
             system_dark: self.os_appearance == aterm_types::Appearance::Dark,
             serious: self.serious_mode_enabled(),
             backend_gpu: self.gpu_capable(),
+            display_edr: self
+                .windows
+                .get(&wid)
+                .is_some_and(|window| window.screen_edr_potential),
             // The companion verdict's three rungs, read without advancing the
             // tenure gate (`promotable_kitty`'s read).
             companion_look: aterm_effects::companion_look::companion_precedence(
@@ -2794,6 +2893,7 @@ impl App {
                 self.launch_kitty,
             )
             .0,
+            automatic_tab_color: self.automatic_tab_color(wid),
         }
     }
 
@@ -3056,9 +3156,16 @@ impl App {
             })
             .or_else(|| self.shown_config_assist_rows(instance, view))
             .unwrap_or(crate::native_ui::EditorPalette::None);
+        // The toolbar the view draws, so the rows it leaves the file are the
+        // rows the caret is kept within.
+        let toolbar = match self.native_runtime.app(instance) {
+            Some(crate::native_app::NativeApp::Editor(editor)) => editor.toolbar(),
+            _ => crate::native_ui::EditorToolbar::default(),
+        };
         let visible_lines = crate::native_ui::editor_visible_line_capacity_with_palette(
             self.native_ui_viewport(wid)?,
             palette_candidates,
+            toolbar,
         );
         if matches!(
             self.native_runtime.view_state(view),
@@ -3086,6 +3193,16 @@ impl App {
         wid: WindowId,
         event: AppEvent,
     ) -> Result<EventResult, String> {
+        // A scroll the person asked for (a wheel, a page key) moves the page
+        // under a still pointer while they watch it: what the pointer rests on
+        // afterwards is theirs to press (`app_mouse::NativePointerRest`).
+        if matches!(
+            event,
+            AppEvent::ScrollLines(_) | AppEvent::ScrollPage(_) | AppEvent::ScrollAt { .. }
+        ) && let Some(ws) = self.windows.get_mut(&wid)
+        {
+            ws.native_rest = None;
+        }
         let (instance, view) = self
             .active_native_view(wid)
             .ok_or_else(|| "active tab is not a native app".to_string())?;
@@ -3094,6 +3211,15 @@ impl App {
             .app(instance)
             .map(crate::native_app::NativeApp::kind)
             .ok_or_else(|| "active native app disappeared".to_string())?;
+        // Only Settings scrolls a second region (its sidebar): every other
+        // view's aimed scroll is its one list's, lowered before its own
+        // mappings (Markdown's measured scroll, the editor's view scroll).
+        let event = match event {
+            AppEvent::ScrollAt { lines, .. } if kind != crate::native_app::AppKind::Settings => {
+                AppEvent::ScrollLines(lines)
+            }
+            event => event,
+        };
         if kind == crate::native_app::AppKind::Editor
             && !matches!(event, AppEvent::EditorViewportChanged { .. })
         {
@@ -3220,9 +3346,12 @@ impl App {
         };
         if let Some(result) = self.dispatch_editor_event(instance, view, &event)? {
             // The editor workspace is an independent reducer and currently has
-            // no regional-damage effect lane. Invalidate its exact leaf only.
-            self.invalidate_native_view_cache(wid, view, DamageRegion::All);
-            self.refresh_native_presentation(wid, instance, view);
+            // no regional-damage effect lane. Invalidate its exact leaf only,
+            // and not for an input it declined, which changed nothing.
+            if result == EventResult::Handled {
+                self.invalidate_native_view_cache(wid, view, DamageRegion::All);
+                self.refresh_native_presentation(wid, instance, view);
+            }
             return Ok(result);
         }
         let outcome = self
@@ -3298,17 +3427,6 @@ impl App {
                         .buffer
                         .as_ref()
                         .is_some_and(crate::native_editor::EditorBufferView::chord_pending)
-            );
-        let editor_command_palette_active = editor_active
-            && matches!(
-                self.native_runtime.view_state(active_view),
-                Some(crate::native_app::AppViewState::Editor(state))
-                    if state.buffer.as_ref().is_some_and(|buffer| {
-                        matches!(
-                            buffer.minibuffer,
-                            crate::native_editor::Minibuffer::Command { .. }
-                        )
-                    })
             );
         let editor_minibuffer_active = editor_active
             && matches!(
@@ -3410,24 +3528,24 @@ impl App {
             return true;
         }
 
+        // Tab moves keyboard focus between a native page's controls, except
+        // in an Editor, where it is the buffer's (indent-for-tab-command, or
+        // M-x completion) unless the config editor's completion list takes it.
+        // A modified Tab the Editor declines moves focus, below.
         if !editor_chord_pending
             && let InputEvent::Key {
                 key: Key::Named(NamedKey::Tab),
                 mods,
-                event_type: KeyEventType::Press,
+                event_type: event_type @ (KeyEventType::Press | KeyEventType::Repeat),
                 ..
             } = event
         {
-            if editor_command_palette_active {
-                let _ = self.dispatch_native_event(
-                    wid,
-                    AppEvent::EditorCompletion(
-                        crate::native_editor::EditorCompletionAction::Complete,
-                    ),
-                );
-                return true;
-            }
             if editor_config_completion_active && !mods.contains(Modifiers::SHIFT) {
+                // A held Tab pages the list once: its repeats neither page on
+                // nor indent the buffer behind the list.
+                if *event_type == KeyEventType::Repeat {
+                    return true;
+                }
                 let Some(context) = editor_config_completion_context else {
                     return true;
                 };
@@ -3441,6 +3559,29 @@ impl App {
                 // document; arrows choose, Enter or a second Tab accepts.
                 return true;
             }
+            if !editor_active && *event_type == KeyEventType::Press {
+                let _ = self.move_native_focus(wid, mods.contains(Modifiers::SHIFT));
+                return true;
+            }
+        }
+        // F6 and Shift+F6 move keyboard focus between a native page's
+        // controls in every app, and in an Editor, whose Tab indents, they are
+        // how focus moves at all (design D-15). Ctrl+Tab stays the host's
+        // next tab.
+        if let InputEvent::Key {
+            key: Key::Named(NamedKey::F6),
+            mods,
+            event_type: KeyEventType::Press,
+            ..
+        } = event
+            && !mods.intersects(
+                Modifiers::CTRL
+                    | Modifiers::ALT
+                    | Modifiers::SUPER
+                    | Modifiers::HYPER
+                    | Modifiers::META,
+            )
+        {
             let _ = self.move_native_focus(wid, mods.contains(Modifiers::SHIFT));
             return true;
         }
@@ -3511,13 +3652,17 @@ impl App {
             );
             return true;
         }
+        // THE KEY IS TESTED BEFORE THE PAGE IS: only a Return or Space press
+        // asks whether a text field has the keyboard (a lookup in the page's
+        // compiled tree), so an arrow, a page key or a typed letter never
+        // reaches that lookup at all.
         if !editor_active
-            && !self.native_text_field_has_focus(wid)
             && let InputEvent::Key {
                 key: Key::Named(key @ (NamedKey::Enter | NamedKey::Space)),
                 event_type: KeyEventType::Press,
                 ..
             } = event
+            && !self.native_text_field_has_focus(wid)
             // A font list being searched takes Space as part of the name.
             && !(matches!(key, NamedKey::Space) && self.native_space_types_into_search(wid))
         {
@@ -3533,6 +3678,34 @@ impl App {
             }
         }
 
+        // A SEGMENTED CONTROL'S ARROWS ([`crate::native_ui::UiNode::segmented`]):
+        // Left and Right move the keyboard between its segments, and stop at
+        // its ends; Return or Space (above) chooses the one it is on. Read
+        // from the page's compiled tree, so every segmented control on every
+        // native page answers the same way.
+        if !editor_active
+            && let InputEvent::Key {
+                key: Key::Named(arrow @ (NamedKey::ArrowLeft | NamedKey::ArrowRight)),
+                mods,
+                event_type: KeyEventType::Press,
+                ..
+            } = event
+            && mods.is_empty()
+            && let Some(target) = self.native_segment_step(
+                wid,
+                if matches!(arrow, NamedKey::ArrowLeft) {
+                    -1
+                } else {
+                    1
+                },
+            )
+        {
+            if let Some(target) = target {
+                let _ = self.focus_native_control(wid, target);
+            }
+            return true;
+        }
+
         let app_event = match event {
             // Geometry and focus are window-level facts, not text input, so they
             // fall through to the ordinary path; `ResizeWindowPx` only requests an
@@ -3540,6 +3713,15 @@ impl App {
             InputEvent::Resize { .. }
             | InputEvent::ResizeWindowPx { .. }
             | InputEvent::Focus(_) => return false,
+            // An Editor's keys, text and pastes go to amacs's input reducer
+            // whole (`EditorWorkspace::handle_input`), which alone decides what
+            // a key does there.
+            InputEvent::Text(text) if editor_active => Some(AppEvent::EditorInput(
+                amacs::input::EditorInput::Text(text.clone()),
+            )),
+            InputEvent::Paste(text, _) if editor_active => Some(AppEvent::EditorInput(
+                amacs::input::EditorInput::Paste(text.clone()),
+            )),
             InputEvent::Text(text) | InputEvent::Paste(text, _) => {
                 Some(AppEvent::TextInput(TextInputEvent::Commit(text.clone())))
             }
@@ -3547,6 +3729,53 @@ impl App {
                 event_type: KeyEventType::Release,
                 ..
             } => None,
+            InputEvent::Key {
+                key,
+                mods,
+                layout_text,
+                event_type: KeyEventType::Press | KeyEventType::Repeat,
+                ..
+            } if editor_active => {
+                // The config editor's completion list, while it holds focus,
+                // takes the vertical arrows: it is this host's panel, not the
+                // buffer's.
+                let navigation = match key {
+                    Key::Named(NamedKey::ArrowUp) => {
+                        Some(crate::native_app::ConfigCompletionNavigation::Previous)
+                    }
+                    Key::Named(NamedKey::ArrowDown) => {
+                        Some(crate::native_app::ConfigCompletionNavigation::Next)
+                    }
+                    _ => None,
+                };
+                if let Some(navigation) = navigation
+                    && editor_config_completion_active
+                    && editor_config_completion_focused
+                    && !editor_chord_pending
+                    && !mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::META)
+                {
+                    editor_config_completion_context.map(|context| AppEvent::EditorConfigNavigate {
+                        navigation,
+                        candidates: editor_config_completion_count,
+                        context,
+                    })
+                } else {
+                    // The text a character key types is the layout's: `key`
+                    // is its UNSHIFTED key (Shift+a is `a`, German Shift+2 is
+                    // `2`).
+                    let text = match key {
+                        Key::Character(character) => Some(
+                            crate::input::typed_glyph(*character, *mods, *layout_text).to_string(),
+                        ),
+                        _ => None,
+                    };
+                    Some(AppEvent::EditorInput(amacs::input::EditorInput::Key {
+                        key: key.clone(),
+                        mods: *mods,
+                        text,
+                    }))
+                }
+            }
             InputEvent::Key {
                 key,
                 mods,
@@ -3564,13 +3793,6 @@ impl App {
                         id: crate::native_ui::ActionId::new("settings/search"),
                         value: None,
                     }))
-                } else if editor_active
-                    && mods.contains(Modifiers::SUPER)
-                    && matches!(key, Key::Character('s' | 'S'))
-                {
-                    Some(AppEvent::EditorCommand(
-                        crate::native_editor::EditorCommand::Save,
-                    ))
                 } else if markdown_active && command && matches!(key, Key::Character('[')) {
                     Some(AppEvent::Action(crate::native_app::ActionInvocation {
                         id: crate::native_ui::ActionId::new("markdown/back"),
@@ -3586,34 +3808,6 @@ impl App {
                         id: crate::native_ui::ActionId::new("markdown/edit"),
                         value: None,
                     }))
-                } else if editor_active
-                    && (editor_chord_pending
-                        || mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::META))
-                {
-                    let key = match key {
-                        Key::Character(character) => {
-                            Some(character.to_ascii_lowercase().to_string())
-                        }
-                        Key::Named(NamedKey::Space) => Some("space".to_string()),
-                        Key::Named(NamedKey::Backspace) => Some("backspace".to_string()),
-                        Key::Named(NamedKey::Delete) => Some("delete".to_string()),
-                        Key::Named(NamedKey::Enter) => Some("enter".to_string()),
-                        Key::Named(NamedKey::Escape) => Some("escape".to_string()),
-                        Key::Named(NamedKey::Tab) => Some("tab".to_string()),
-                        // Word motion on modified arrows, matching `M-b` / `M-f`.
-                        // Plain arrows never enter this arm.
-                        Key::Named(NamedKey::ArrowLeft) => Some("left".to_string()),
-                        Key::Named(NamedKey::ArrowRight) => Some("right".to_string()),
-                        _ => None,
-                    };
-                    key.map(|key| {
-                        AppEvent::EditorChord(crate::native_editor::KeyChord {
-                            control: mods.contains(Modifiers::CTRL),
-                            meta: mods.intersects(Modifiers::ALT | Modifiers::META),
-                            shift: mods.contains(Modifiers::SHIFT),
-                            key,
-                        })
-                    })
                 } else {
                     // Readline caret bindings for the Settings text fields:
                     // Ctrl-A/E home/end, Ctrl-B/F left/right, Ctrl-D delete
@@ -3737,60 +3931,6 @@ impl App {
                         Key::Named(NamedKey::ArrowRight) => {
                             Some(AppEvent::TextInput(TextInputEvent::Right { extend }))
                         }
-                        Key::Named(NamedKey::ArrowUp) if editor_active => {
-                            if editor_command_palette_active {
-                                Some(AppEvent::EditorCompletion(
-                                    crate::native_editor::EditorCompletionAction::Previous,
-                                ))
-                            } else if editor_config_completion_active
-                                && editor_config_completion_focused
-                            {
-                                editor_config_completion_context.map(|context| {
-                                    AppEvent::EditorConfigNavigate {
-                                        navigation:
-                                            crate::native_app::ConfigCompletionNavigation::Previous,
-                                        candidates: editor_config_completion_count,
-                                        context,
-                                    }
-                                })
-                            } else {
-                                Some(AppEvent::EditorCommand(
-                                    crate::native_editor::EditorCommand::MoveLineUp,
-                                ))
-                            }
-                        }
-                        Key::Named(NamedKey::ArrowDown) if editor_active => {
-                            if editor_command_palette_active {
-                                Some(AppEvent::EditorCompletion(
-                                    crate::native_editor::EditorCompletionAction::Next,
-                                ))
-                            } else if editor_config_completion_active
-                                && editor_config_completion_focused
-                            {
-                                editor_config_completion_context.map(|context| {
-                                    AppEvent::EditorConfigNavigate {
-                                        navigation:
-                                            crate::native_app::ConfigCompletionNavigation::Next,
-                                        candidates: editor_config_completion_count,
-                                        context,
-                                    }
-                                })
-                            } else {
-                                Some(AppEvent::EditorCommand(
-                                    crate::native_editor::EditorCommand::MoveLineDown,
-                                ))
-                            }
-                        }
-                        Key::Named(NamedKey::Home) if editor_active => {
-                            Some(AppEvent::EditorCommand(
-                                crate::native_editor::EditorCommand::MoveLineStart,
-                            ))
-                        }
-                        Key::Named(NamedKey::End) if editor_active => {
-                            Some(AppEvent::EditorCommand(
-                                crate::native_editor::EditorCommand::MoveLineEnd,
-                            ))
-                        }
                         Key::Named(NamedKey::Enter) => {
                             Some(AppEvent::TextInput(TextInputEvent::Submit))
                         }
@@ -3885,58 +4025,147 @@ impl App {
             | InputEvent::MouseMove { .. } => None,
         };
 
-        if let Some(event) = app_event {
-            let _ = self.dispatch_native_event(wid, event);
+        if let Some(app_event) = app_event {
+            let declined = matches!(
+                self.dispatch_native_event(wid, app_event),
+                Ok(EventResult::Bubble)
+            );
+            // A Tab an Editor declines (a modified Tab with no M-x query or
+            // key sequence open) is focus traversal, as on every native
+            // page: Shift+Tab back, and Ctrl+Tab no host binding took
+            // (`next_tab` is seeded off macOS) forward, Cocoa's Control-Tab
+            // out of a view whose Tab is its own.
+            if declined
+                && editor_active
+                && let InputEvent::Key {
+                    key: Key::Named(NamedKey::Tab),
+                    mods,
+                    event_type: KeyEventType::Press,
+                    ..
+                } = event
+            {
+                let _ = self.move_native_focus(wid, mods.contains(Modifiers::SHIFT));
+            }
         }
         true
+    }
+
+    /// The active native page's compiled tree as the window holds it now:
+    /// the compile its last redraw retained, while every input still matches
+    /// the stamp taken with it ([`Self::cached_native_ui`]), else a fresh
+    /// one. Input reads the page through this, so a key never compiles a
+    /// page the window has already compiled.
+    pub(crate) fn current_native_ui(
+        &self,
+        wid: WindowId,
+    ) -> Result<std::borrow::Cow<'_, crate::native_ui::CompiledUi>, String> {
+        match self.cached_native_ui(wid) {
+            Some(frame) => Ok(std::borrow::Cow::Borrowed(&frame.compiled)),
+            None => self.compiled_native_ui(wid).map(std::borrow::Cow::Owned),
+        }
+    }
+
+    /// From the segment the keyboard is on, `step` segments on in its
+    /// segmented control ([`crate::native_ui::CompiledUi::segment_step`]):
+    /// `None` where the keyboard is on no segment.
+    fn native_segment_step(
+        &self,
+        wid: WindowId,
+        step: isize,
+    ) -> Option<Option<crate::native_ui::UiKey>> {
+        let (_, view) = self.active_native_view(wid)?;
+        let focus = self
+            .native_runtime
+            .view_state(view)?
+            .common()
+            .last_focus
+            .clone()?;
+        self.current_native_ui(wid).ok()?.segment_step(&focus, step)
+    }
+
+    /// Put the keyboard on control `key` of the active native page, ringed,
+    /// as Tab does ([`Self::move_native_focus`]).
+    fn focus_native_control(
+        &mut self,
+        wid: WindowId,
+        key: crate::native_ui::UiKey,
+    ) -> Result<(), String> {
+        let (instance, view) = self
+            .active_native_view(wid)
+            .ok_or_else(|| "active tab is not a native app".to_string())?;
+        self.invalidate_native_view_cache(wid, view, DamageRegion::All);
+        let outcome = self
+            .native_runtime
+            .dispatch(instance, view, AppEvent::FocusChanged(Some(key)))
+            .map_err(|error| format!("native focus failed: {error:?}"))?;
+        for effect in outcome.effects {
+            self.execute_native_effect(wid, instance, view, effect)?;
+        }
+        if let Some(state) = self.native_runtime.view_state_mut(view) {
+            state.common_mut().focus_visible = true;
+        }
+        self.request_redraw_all_windows();
+        Ok(())
     }
 
     fn move_native_focus(&mut self, wid: WindowId, backwards: bool) -> Result<(), String> {
         let (instance, view) = self
             .active_native_view(wid)
             .ok_or_else(|| "active tab is not a native app".to_string())?;
-        let compiled = self.compiled_native_ui(wid)?;
-        if compiled.focus_order.is_empty() {
-            return Ok(());
-        }
         let current = self
             .native_runtime
             .view_state(view)
             .and_then(|state| state.common().last_focus.clone());
-        let next = current
-            .as_ref()
-            .and_then(|key| {
-                compiled
-                    .focus_order
-                    .iter()
-                    .position(|candidate| candidate == key)
-            })
-            .map_or_else(
-                || {
-                    if backwards {
-                        compiled.focus_order.len() - 1
-                    } else {
-                        0
-                    }
-                },
-                |index| {
-                    if backwards {
-                        index
-                            .checked_sub(1)
-                            .unwrap_or(compiled.focus_order.len() - 1)
-                    } else {
-                        (index + 1) % compiled.focus_order.len()
-                    }
-                },
-            );
-        let mut key = compiled.focus_order[next].clone();
+        let (focus_order, next) = {
+            let compiled = self.current_native_ui(wid)?;
+            let focus_order = &compiled.focus_order;
+            if focus_order.is_empty() {
+                return Ok(());
+            }
+            // Where a key stands in the page's reading order, focusable or not.
+            let order_of = |key: &crate::native_ui::UiKey| {
+                compiled.semantics.iter().position(|node| &node.key == key)
+            };
+            let next = current
+                .as_ref()
+                .and_then(|key| focus_order.iter().position(|candidate| candidate == key))
+                .map_or_else(
+                    || {
+                        // A focus that left the focus order (its control disabled
+                        // itself under the keyboard, s-25) resumes from where it
+                        // stood: the nearest focusable after it, or before it going
+                        // back — never the page's first or last control.
+                        let resume = current.as_ref().and_then(order_of).and_then(|at| {
+                            if backwards {
+                                focus_order
+                                    .iter()
+                                    .rposition(|key| order_of(key).is_some_and(|p| p < at))
+                            } else {
+                                focus_order
+                                    .iter()
+                                    .position(|key| order_of(key).is_some_and(|p| p > at))
+                            }
+                        });
+                        resume.unwrap_or(if backwards { focus_order.len() - 1 } else { 0 })
+                    },
+                    |index| {
+                        if backwards {
+                            index.checked_sub(1).unwrap_or(focus_order.len() - 1)
+                        } else {
+                            (index + 1) % focus_order.len()
+                        }
+                    },
+                );
+            (focus_order.clone(), next)
+        };
+        let mut key = focus_order[next].clone();
         // The Settings sidebar is one Tab stop: Tab leaves it for the page
         // in one step, and entering it lands on the selected row (its arrow
         // keys move between rows).
         if let Some(crate::native_app::AppViewState::Settings(state)) =
             self.native_runtime.view_state(view)
             && let Some(target) =
-                state.tab_past_navigation(current.as_ref(), &key, !backwards, &compiled.focus_order)
+                state.tab_past_navigation(current.as_ref(), &key, !backwards, &focus_order)
         {
             key = target;
         }
@@ -3948,6 +4177,15 @@ impl App {
             && let Some(beyond) = state.tab_past_screen(current, &key, !backwards)
         {
             key = beyond;
+        }
+        // Settings ▸ Themes' list is one Tab stop: in at the highlighted
+        // row, out in one step.
+        if let Some(crate::native_app::AppViewState::Settings(state)) =
+            self.native_runtime.view_state(view)
+            && let Some(target) =
+                state.tab_past_options(current.as_ref(), &key, !backwards, &focus_order)
+        {
+            key = target;
         }
         self.invalidate_native_view_cache(wid, view, DamageRegion::All);
         let outcome = self
@@ -3988,7 +4226,7 @@ impl App {
         else {
             return false;
         };
-        self.compiled_native_ui(wid).ok().and_then(|compiled| {
+        self.current_native_ui(wid).ok().and_then(|compiled| {
             compiled.semantic(key).map(|semantic| {
                 semantic.role == crate::native_ui::SemanticRole::TextField
                     && semantic.state.is_none_or(|state| state.enabled)
@@ -4007,7 +4245,7 @@ impl App {
         else {
             return Ok(false);
         };
-        let compiled = self.compiled_native_ui(wid)?;
+        let compiled = self.current_native_ui(wid)?;
         let Some(semantic) = compiled.semantic(&key) else {
             return Ok(false);
         };
@@ -4017,6 +4255,7 @@ impl App {
         let Some(action) = semantic.action.clone() else {
             return Ok(false);
         };
+        drop(compiled);
         self.dispatch_native_event(
             wid,
             AppEvent::Action(crate::native_app::ActionInvocation {
@@ -4032,8 +4271,7 @@ impl App {
     /// the page declares no enabled Primary button; the key then flows on to
     /// the text-input lowering.
     fn activate_native_default(&mut self, wid: WindowId) -> Result<bool, String> {
-        let compiled = self.compiled_native_ui(wid)?;
-        let Some((_, action)) = compiled.default_action else {
+        let Some((_, action)) = self.current_native_ui(wid)?.default_action.clone() else {
             return Ok(false);
         };
         self.dispatch_native_event(
@@ -4424,14 +4662,9 @@ impl App {
             // compatibility) gets the band's and Manual's own story, never
             // "unknown": a script that set it before its feature went is told
             // why it no longer can, not sent to a Settings search that finds
-            // nothing.
-            let message = if crate::native_config_language::is_compatibility_only_key(&key) {
-                crate::native_config_language::compatibility_only_message(&key)
-            } else {
-                format!(
-                    "unknown key {key:?} (search Settings or use Manual for the complete schema)"
-                )
-            };
+            // nothing. A key written by hand (`conpty`) is told where it is
+            // written.
+            let message = crate::native_config_language::control_settings_refusal(&key);
             let _ = reply.send(Err(message));
             return None;
         };
@@ -4577,7 +4810,7 @@ impl App {
         outcome: &ConfigPatchOutcome,
         authoritative: Option<&crate::native_config_service::ConfigSnapshot>,
     ) {
-        let label = crate::app_fabric_menu::presence_key_label(key);
+        let label = crate::app_take_over::PRESENCE_RIM_LABEL;
         // `(cause, indeterminate)`: the toggle reverted, or may not have
         // persisted.
         let feedback = match outcome {
@@ -4593,9 +4826,15 @@ impl App {
             )),
             ConfigPatchOutcome::Indeterminate { message } => Some((message.clone(), true)),
             other => Some((
-                control_settings_completion_reply(key, Some(&desired.to_string()), other, None)
-                    .err()
-                    .unwrap_or_else(|| "the write was refused".to_string()),
+                control_settings_completion_reply(
+                    key,
+                    Some(&desired.to_string()),
+                    None,
+                    other,
+                    None,
+                )
+                .err()
+                .unwrap_or_else(|| "the write was refused".to_string()),
                 false,
             )),
         };
@@ -4603,10 +4842,12 @@ impl App {
             // The durable truth wins over the click: from the authoritative
             // snapshot when there is one, else the config the App last adopted.
             let durable = authoritative.map_or_else(
-                || crate::app_fabric_menu::presence_key_resolve(key, &self.config),
-                |snapshot| crate::app_fabric_menu::presence_key_resolve(key, &snapshot.config),
+                || self.config.presence_rim_enabled(),
+                |snapshot| snapshot.config.presence_rim_enabled(),
             );
-            self.set_presence_bit(key, durable);
+            if key == crate::app_take_over::PRESENCE_RIM_KEY {
+                self.set_presence_bit(durable);
+            }
             self.post_message(crate::message_reporters::presence_not_saved(
                 key,
                 label,
@@ -4616,8 +4857,8 @@ impl App {
         }
     }
 
-    /// Queue the durable write for a presence toggle (`presence.band` /
-    /// `presence.rim` set to `desired`) through the lane and OCC
+    /// Queue the durable write for the needs switch (`presence.rim` set to
+    /// `desired`, View ▸ Show Needs in Windows) through the lane and OCC
     /// materialization Serious Mode uses, so rapid clicks cannot conflict with
     /// each other's completions.
     pub(crate) fn queue_presence_write(
@@ -4736,9 +4977,15 @@ impl App {
             )),
             ConfigPatchOutcome::Indeterminate { message } => Some((message.clone(), true)),
             other => Some((
-                control_settings_completion_reply(crate::prefs::EDIT_THEME, Some(id), other, None)
-                    .err()
-                    .unwrap_or_else(|| "the write was refused".to_string()),
+                control_settings_completion_reply(
+                    crate::prefs::EDIT_THEME,
+                    Some(id),
+                    None,
+                    other,
+                    None,
+                )
+                .err()
+                .unwrap_or_else(|| "the write was refused".to_string()),
                 false,
             )),
         };
@@ -4950,12 +5197,12 @@ impl App {
             match result {
                 ConfigPatchResult::Applied { snapshot, undo } => {
                     let plan = self.native_config_service.persistence_plan(snapshot);
-                    let job = NativeConfigJob::Persist(NativeConfigPersistenceJob {
+                    let job = NativeConfigJob::Persist(Box::new(NativeConfigPersistenceJob {
                         plan,
                         undo: Some(undo.get()),
                         origin,
                         proxy,
-                    });
+                    }));
                     if let Err(error) = queue.send(job) {
                         // The reducer advanced but no worker owns the candidate.
                         // Restore from durable authority before completing; a
@@ -5459,6 +5706,12 @@ impl App {
         // to the arm that was in force; Settings ▸ Harness shows the policy.
         self.note_harness_arms();
         self.harness_screen_moved();
+        // Every need verdict reads whose boxes the host answers under the
+        // policy in force (`HarnessHosting::hosts`): each is published again.
+        self.publish_needs_all();
+        // Summarize in a New Tab's row reads the policy too
+        // (`App::summarize_start_block`).
+        self.mark_status_dirty();
         self.request_redraw_all_windows();
     }
 
@@ -5575,9 +5828,34 @@ impl App {
                 if serious_mode && let Some(snapshot) = authoritative.as_ref() {
                     self.apply_serious_mode_config_snapshot(snapshot);
                 }
+                // What the key holds once the write landed: a removal, or a
+                // value its default made one, is answered as removed, with
+                // what it now reads as — the words its Settings row shows.
+                // Read from the authoritative snapshot, or, where the write
+                // is durable but the disk generation after it could not be
+                // admitted, from the candidate the service wrote, which is
+                // what the worker proved on disk (it stays the service's
+                // state, and the lane runs one write at a time). Never the
+                // requested text: a value equal to its default was written
+                // as a removal, and a number as its kind spells it.
+                let landed = authoritative.clone().or_else(|| {
+                    matches!(outcome, ConfigPatchOutcome::Applied { .. })
+                        .then(|| self.native_config_service.snapshot())
+                });
+                let written = landed.as_ref().map_or_else(
+                    || value.clone(),
+                    |snapshot| snapshot.semantic_values.get(&key).cloned(),
+                );
+                let now = landed
+                    .as_ref()
+                    .filter(|_| written.is_none())
+                    .and_then(|snapshot| {
+                        crate::prefs::effective_value_label(&snapshot.config, &key)
+                    });
                 let mut response = control_settings_completion_reply(
                     &key,
-                    value.as_deref(),
+                    written.as_deref(),
+                    now.as_deref(),
                     &outcome,
                     synchronization_error.as_deref(),
                 );
@@ -5770,6 +6048,7 @@ impl App {
         &mut self,
         snapshot: &crate::native_config_service::ConfigSnapshot,
     ) {
+        self.note_config_keys(snapshot);
         self.dispatch_settings_event(&AppEvent::ConfigChanged(snapshot.clone()));
         // Stable observations also refresh host semantics for an open Manual
         // buffer. `analysis_generation` advances on byte-identical observations,
@@ -5777,6 +6056,24 @@ impl App {
         if let Some(document) = self.native_runtime.config_editor_document() {
             self.request_config_host_diagnostics(document);
         }
+    }
+
+    /// The node log's `config key=` (session log 5J-2): the schema keys whose
+    /// authored values `snapshot` moved since the last one this App
+    /// compared, by NAME only. Every admitted snapshot is published here, so
+    /// this is the one place a config change reaches the node log.
+    fn note_config_keys(&mut self, snapshot: &crate::native_config_service::ConfigSnapshot) {
+        if std::sync::Arc::ptr_eq(&self.node_log_values, &snapshot.semantic_values) {
+            return;
+        }
+        let (names, unnamed) = crate::session_log_node::changed_config_keys(
+            &self.node_log_values,
+            &snapshot.semantic_values,
+        );
+        if !names.is_empty() || unnamed > 0 {
+            self.node_log.note_config(&names, unnamed);
+        }
+        self.node_log_values = std::sync::Arc::clone(&snapshot.semantic_values);
     }
 
     fn dispatch_native_completion(
@@ -5928,7 +6225,7 @@ impl App {
                     // Stdout is null unless the verb may apply host settings: the
                     // machine apply, `packages/check` and every install print the
                     // `machine-settings:` marker (wanted by the pull-down and the
-                    // Security card), parsed by the launch pass's marker parser
+                    // This Mac status), parsed by the launch pass's marker parser
                     // (`spawn_machine_settings_once`). Otherwise the install passes
                     // stream a marker contract this worker does not read.
                     let reads_stdout = machine_apply || busy.applies_machine_settings();
@@ -6113,18 +6410,32 @@ impl App {
         }
     }
 
+    /// Note what this copy's package tool IS (the co-located `atpkg` stat: cheap
+    /// `current_exe`-sibling metadata, and the compiled root key) before any
+    /// status read, so the package rows' admission is drawn from what is known
+    /// on the first frame — never "not read yet" while an unrelated read runs.
+    /// Returns the stat for the worker that follows.
+    pub(crate) fn note_native_package_tool(&mut self) -> bool {
+        let available = crate::co_located_atpkg().is_some();
+        self.native_packages_service.note_tool(available);
+        available
+    }
+
     /// Start one status-collection worker (no verb). A running worker makes
     /// this a no-op join; headless hosts (no proxy) skip silently.
     pub(crate) fn start_native_packages_refresh(&mut self) {
+        // The tool's facts first, whatever happens to the read: a host with no
+        // proxy, or a refresh joining one already running, still admits on them.
+        let available = self.note_native_package_tool();
         let Some(proxy) = self.proxy.clone() else {
+            self.publish_native_packages_state();
             return;
         };
         let Some(sequence) = self.native_packages_service.begin(None) else {
+            self.publish_native_packages_state();
             return;
         };
-        // The stat is `current_exe`-sibling metadata (cheap); the status.toml
-        // parse stays on the worker.
-        let available = crate::co_located_atpkg().is_some();
+        // The status.toml parse stays on the worker.
         let spawn = crate::qos::spawn_lane_thread(
             "aterm-packages-status",
             crate::qos::Role::Background,
@@ -6149,12 +6460,12 @@ impl App {
     }
 
     /// Start one machine read (bare `atpkg machine`, no verb, no store lock) so
-    /// the Security page's "This Mac" card confirms the `[machine]` settings from
+    /// Security's This Mac status confirms the `[machine]` settings from
     /// what the co-located atpkg measured; the atpkg child is the one seam that
     /// touches the machine. A read requested while one runs is queued behind it
     /// (`PackagesService::request_machine_read`), never joined, since the running
     /// read may predate an apply. Headless hosts and non-macOS builds skip
-    /// silently; the card is absent there.
+    /// silently and draw no status (the This Mac group and its row stay).
     pub(crate) fn start_native_machine_refresh(&mut self) {
         if !cfg!(target_os = "macos") {
             return;
@@ -6172,7 +6483,7 @@ impl App {
 
     /// A queued rerun is already admitted by the completion reducer; dispatch
     /// it directly, since requesting admission again would read the reservation
-    /// as a running worker and leave the card refreshing forever.
+    /// as a running worker and leave the status refreshing forever.
     pub(crate) fn finish_native_machine_refresh(
         &mut self,
         result: Result<atpkg::machine::MachineState, String>,
@@ -6194,7 +6505,7 @@ impl App {
     /// of [`Self::finish_native_update_check`]); stale sequences are inert. A
     /// finished verb that ran atpkg's machine pass
     /// ([`PackagesBusy::applies_machine_settings`]) re-reads the machine so the
-    /// card confirms rather than assumes, except `machine apply` when its
+    /// status confirms rather than assumes, except `machine apply` when its
     /// completion carries the apply's own `machine-state:` record. The collected
     /// lanes (`update`, every `install`) post no record, so the completion's one
     /// read closes the expectation their change line opened.
@@ -6297,20 +6608,30 @@ impl App {
         )
     }
 
-    /// The publish an on-screen Settings view on the Messages route asks for
-    /// with the center quiet (on screen: a pane of the active tab of a window
-    /// whose content is on glass, `band_on_screen`): the
-    /// [`MESSAGES_PUBLISH_TICK`], so relative times move; and while its status
-    /// line is transient (`Copied`), the publish that starts its clock and the
-    /// one [`MESSAGES_FEEDBACK_WAIT`] later that clears it. The shortest over
-    /// all such views. A background tab or hidden window arms nothing; once
+    /// The publish an on-screen Settings view asks for with the center quiet
+    /// (on screen: a pane of the active tab of a window whose content is on
+    /// glass, `band_on_screen`): on the Messages route the
+    /// [`MESSAGES_PUBLISH_TICK`], so relative times move; and on any page, while
+    /// its status line is transient (`Copied`, `Build information copied`), the
+    /// publish that starts its clock and the one [`MESSAGES_FEEDBACK_WAIT`]
+    /// later that clears it (xa-13). The shortest over all such views. A background tab or hidden window arms nothing; once
     /// revealed, what it owes is overdue and publishes at once.
     fn settings_messages_quiet_gap(&self) -> Option<std::time::Duration> {
         let mut gap: Option<std::time::Duration> = None;
+        // A headless instance has no glass, but what its active tab shows is
+        // what a capture of it shows — the lane UI is validated in — so its
+        // status lines run the same clock as a window's (xa-13).
+        let shown = |ws: &crate::WindowState| {
+            crate::messages_host::band_on_screen(ws)
+                || (self.headless
+                    && ws.os_window.is_none()
+                    && ws.pending_reveal.is_none()
+                    && !ws.occluded)
+        };
         for tab in self
             .windows
             .values()
-            .filter(|ws| crate::messages_host::band_on_screen(ws))
+            .filter(|ws| shown(ws))
             .filter_map(|ws| ws.tab_set.active())
         {
             // Runs before parking and while selecting the next deadline, so visit
@@ -6324,14 +6645,19 @@ impl App {
                 }
                 if let Some(crate::native_app::AppViewState::Settings(state)) =
                     self.native_runtime.view_state(*view)
-                    && state.route == crate::native_settings::SettingsRoute::Messages
                 {
-                    let next = match state.messages_feedback_clock() {
-                        Some(false) => MESSAGES_PUBLISH_MIN_GAP,
-                        Some(true) => MESSAGES_FEEDBACK_WAIT,
-                        None => MESSAGES_PUBLISH_TICK,
+                    // A transient status line's publishes, on every page
+                    // (xa-13); the minute tick on Messages, whose times move.
+                    let clock = match state.status_clock() {
+                        Some(false) => Some(MESSAGES_PUBLISH_MIN_GAP),
+                        Some(true) => Some(MESSAGES_FEEDBACK_WAIT),
+                        None => None,
                     };
-                    gap = Some(gap.map_or(next, |gap| gap.min(next)));
+                    let tick = (state.route == crate::native_settings::SettingsRoute::Messages)
+                        .then_some(MESSAGES_PUBLISH_TICK);
+                    for next in [clock, tick].into_iter().flatten() {
+                        gap = Some(gap.map_or(next, |gap| gap.min(next)));
+                    }
                 }
             });
         }
@@ -7720,7 +8046,9 @@ impl App {
     /// a person has to save ([`Self::update_blocker_for_person`]), whose own row
     /// STANDS while it holds the lane ([`crate::update_words::waits_for_you`];
     /// round eight, lead U38: it was a 45-s warning, and after it folded nothing
-    /// said why the update never landed).
+    /// said why the update never landed), or a process that keeps its image with
+    /// no terminal open, whose only lane waits for one
+    /// ([`Self::kept_image_waits_for_terminal`]).
     pub(crate) fn update_lands_by_itself(&self, auto_apply_on: bool) -> bool {
         self.update_lands_by_itself_with(auto_apply_on, self.seamless_handoff_unavailable())
     }
@@ -7732,7 +8060,10 @@ impl App {
         auto_apply_on: bool,
         handoff_unavailable: Option<crate::app_update_handoff::HandoffUnavailable>,
     ) -> bool {
-        auto_apply_on && handoff_unavailable.is_none() && self.update_waits_on_person.is_none()
+        auto_apply_on
+            && handoff_unavailable.is_none()
+            && self.update_waits_on_person.is_none()
+            && !self.kept_image_waits_for_terminal()
     }
 
     /// The update row for a close-preflight refusal the person can clear
@@ -9003,7 +9334,15 @@ impl App {
             durable,
             installed,
             installed_unproven,
+            installable,
         } = facts;
+        // Whether this copy can replace itself, the moment any read observed it —
+        // the page says "not read yet" until then, never a guess either way.
+        if let Some(installable) = installable
+            && self.native_updater_service.note_installability(installable)
+        {
+            self.publish_native_update_state();
+        }
         // When the last check completed, whoever ran it (Settings says "Checked 12 min ago").
         if self
             .native_updater_service
@@ -9483,7 +9822,7 @@ impl App {
             if facts
                 .durable
                 .as_ref()
-                .is_some_and(|status| status.enabled && status.installable)
+                .is_some_and(|status| status.enabled && status.installable == Some(true))
                 && self.install_location_answered_since(&blocked)
             {
                 self.auto_apply_environment_block = None;
@@ -9501,7 +9840,7 @@ impl App {
             || !facts
                 .durable
                 .as_ref()
-                .is_some_and(|status| status.enabled && status.installable)
+                .is_some_and(|status| status.enabled && status.installable == Some(true))
             || !facts.installed.as_ref().is_some_and(|installed| {
                 installed.build == snapshot.current_build
                     && aterm_update::commit_matches(&installed.commit, running_commit)
@@ -10962,7 +11301,8 @@ impl App {
             }
             ReturnedApplyDisposition::InstalledNeedsRelaunch { build } => {
                 self.auto_apply_intent = None;
-                // Our own candidate swapped the bundle and then failed. The failure
+                // Our attempt swapped the bundle (this process before the launch, or
+                // a fork-lane child) and then failed. The failure
                 // is charged like every returned one (the budget folds download and
                 // activation into one count), and the latch is carried to the
                 // activation it now guards, so the imported activation does not
@@ -11510,7 +11850,7 @@ fn dispatch_native_machine_read(
 }
 
 fn launch_native_machine_read(
-    proxy: winit::event_loop::EventLoopProxy<Wake>,
+    proxy: aterm_window::event_loop::EventLoopProxy<Wake>,
 ) -> Result<(), String> {
     let atpkg = crate::co_located_atpkg()
         .ok_or_else(|| "the package tool is not installed beside aterm".to_string())?;
@@ -11522,7 +11862,7 @@ fn launch_native_machine_read(
 /// posted back as [`Wake::NativeMachineStateFinished`]. Serves an admitted initial
 /// request and a reserved completion rerun; `Err` is a thread-spawn failure.
 fn spawn_native_machine_read(
-    proxy: winit::event_loop::EventLoopProxy<Wake>,
+    proxy: aterm_window::event_loop::EventLoopProxy<Wake>,
     atpkg: std::path::PathBuf,
 ) -> std::io::Result<()> {
     crate::qos::spawn_lane_thread(
@@ -11556,7 +11896,7 @@ fn read_machine_state(atpkg: &std::path::Path) -> Result<atpkg::machine::Machine
     parse_machine_state_output(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
         if output.status.success() {
             // The line prints after atpkg's platform check, so its absence means
-            // no state was measured, which the card must say, never "nothing to
+            // no state was measured, which the status must say, never "nothing to
             // apply".
             "atpkg machine printed no state".to_string()
         } else {
@@ -11824,7 +12164,7 @@ fn machine_apply_completion(
 /// What an `atpkg machine apply` child's stdout said, sorted for the worker.
 pub(crate) struct MachineApplyStdout {
     /// The marker rows to raise (`machine-settings:` → the pull-down row, the
-    /// appstatus ledger and the card's "Last change").
+    /// appstatus ledger and the status's "Last change").
     pub(crate) events: Vec<Wake>,
     /// The last verdict sentence after [`atpkg::cli::MACHINE_VERDICT_PREFIX`]:
     /// `applied — …`, `nothing changed — …` or `not applied — …`.
@@ -11834,7 +12174,7 @@ pub(crate) struct MachineApplyStdout {
     /// failed. Either is a failure even when the command exits successfully.
     pub(crate) refusal: Option<String>,
     /// The apply's own parsed `machine-state:` record, carried on the completion
-    /// rather than posted as an event, so only this verb confirms the card.
+    /// rather than posted as an event, so only this verb confirms the status.
     pub(crate) record: Option<atpkg::machine::MachineState>,
 }
 
@@ -11970,6 +12310,10 @@ pub(crate) fn packages_request_refusal(
 #[cfg(test)]
 #[path = "app_native_packages_argv_tests.rs"]
 mod packages_argv_tests;
+
+#[cfg(test)]
+#[path = "editor_input_characterization.rs"]
+mod editor_input_characterization;
 
 #[cfg(test)]
 #[path = "app_native_tests.rs"]

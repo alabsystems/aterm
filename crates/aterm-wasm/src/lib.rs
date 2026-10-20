@@ -11,6 +11,13 @@
 //! blits to a `<canvas>`. No GPU/winit/DOM dependency — everything compiles to
 //! `wasm32-unknown-unknown`. Fonts are injected as bytes (fetched in JS) so there
 //! is no `std::fs` font discovery.
+//!
+//! Construction, resize, zoom, chrome and rendering return errors for frames over
+//! the renderer's 256 MiB per-frame limit. The browser ABI throws those strings;
+//! successful void operations still return `undefined`. Rejected resize, zoom or
+//! chrome requests preserve the terminal and last frame. Font and line-height
+//! setters can change geometry independently; render refuses an oversized result
+//! until the host corrects it, retaining the last exported pixels.
 
 // What JS sees is marked `#[export]` (aterm-wasm-abi, which replaces
 // wasm-bindgen: docs/AUDIT-third-party-2026-10-15.md, wasm-platform WP.7), and
@@ -28,8 +35,7 @@ mod dirty_band_present_api;
 use crate::AtermTerminal as WebTerminal;
 
 // Expands a shared module's `bind!` — its exported impl — onto this crate's
-// terminal under this crate's export attribute (`aterm-gpu-web` still binds
-// with wasm-bindgen). The attribute names the JS class after the impl's
+// terminal under this crate's export attribute. The attribute names the JS class after the impl's
 // type, a bare identifier, so the name is brought into the shared module here.
 macro_rules! web_terminal_impl {
     ($bind:ident) => {
@@ -42,6 +48,7 @@ macro_rules! web_terminal_impl {
 
 mod effects_api;
 mod facade_api;
+mod frame_geometry_api;
 #[cfg(test)]
 use facade_api::selection_range_for;
 mod host;
@@ -447,7 +454,7 @@ impl AtermTerminal {
     /// TEST BUILDS ONLY: render once, so the frame gate settles.
     #[cfg(test)]
     pub(crate) fn settle_frame(&mut self) {
-        self.render();
+        self.render().expect("renderable frame");
     }
 }
 
@@ -498,11 +505,8 @@ impl AtermTerminal {
             ligature_mode: aterm_render::LigatureMode::Enabled,
             ..Default::default()
         });
-        // The engine clamps rows/cols to the grid's 1..=4096 ingress bound;
-        // read the CLAMPED dims back so `render()` (which sizes the framebuffer
-        // from `self.rows`/`self.cols`) can never be driven past the grid by a raw
-        // JS u16. Storing the args verbatim would leave a 65535×65535 framebuffer
-        // request → unbounded alloc / wasm32 u32 overflow → OOB.
+        // Check the clamped dimensions before the engine allocates its grids.
+        let (rows, cols) = frame_geometry_api::checked_grid_size(&renderer, rows, cols, 0)?;
         // Tiered store attached at construction (audit E1) — deep history lives
         // in the hot/warm LZ4 tiers, not raw ring cells; compression is drained
         // at the render frame boundary (see scrollback_tiers_api).
@@ -664,12 +668,16 @@ impl AtermTerminal {
     /// the grid stays put) and effect emissions (glow, trail, fire) become
     /// window-absolute, escaping the grid into the chrome instead of clipping
     /// at the cell edge. `0/0` (the default) is byte-identical to the
-    /// historical exact-fit frame.
-    pub fn set_chrome(&mut self, pad: u16, head: u16) {
+    /// historical exact-fit frame. Throws before changing anything if the
+    /// proposed physical frame exceeds the framebuffer limit.
+    pub fn set_chrome(&mut self, pad: u16, head: u16) -> Result<(), String> {
+        let (cw, ch) = self.renderer.cell_size();
+        self.checked_surface_geometry(cw, ch, usize::from(pad), usize::from(head))?;
         self.force_full_repaint = true;
         self.renderer.set_pad(pad as usize);
         self.renderer.set_head(head as usize);
         self.effects.set_chrome(pad, head);
+        Ok(())
     }
 
     /// The chrome interior padding set via [`Self::set_chrome`] (px; 0 = exact fit).
@@ -865,9 +873,13 @@ impl AtermTerminal {
     /// Re-rasterize at a new cell font px (host DPI / devicePixelRatio change) so the
     /// pane rebuilds its cell metrics instead of staying frozen at the construction
     /// dpr. The host re-reads cell_width/cell_height + recomputes the grid after.
-    pub fn set_px(&mut self, px: f32) {
+    /// Throws before changing anything if the proposed physical frame is too large.
+    pub fn set_px(&mut self, px: f32) -> Result<(), String> {
+        let (cw, ch, _) = self.renderer.cell_geometry(px);
+        self.checked_surface_geometry(cw, ch, self.renderer.pad(), self.renderer.head())?;
         self.force_full_repaint = true;
         self.renderer.set_px(px);
+        Ok(())
     }
 
     /// Resize the grid (after the host recomputes cols/rows for the canvas).
@@ -883,7 +895,15 @@ impl AtermTerminal {
     /// synchronous cost of a resize independent of session history — the
     /// browser-tab analog of the native L0 whole-Mac-freeze fix, on a loop
     /// with no worker thread to offload to.
-    pub fn resize(&mut self, rows: u16, cols: u16) {
+    /// Dimensions clamp to the engine's bounds; an oversized physical frame is
+    /// refused before grid changes, reflow, prediction or presentation state moves.
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), String> {
+        let (rows, cols) = frame_geometry_api::checked_grid_size(
+            &self.renderer,
+            rows,
+            cols,
+            self.band.committed(),
+        )?;
         if let Some(pending) = self.term.resize_offloading_scrollback(rows, cols) {
             if pending.line_count() <= INLINE_REFLOW_MAX_LINES {
                 // Small-history fast path: rewrap now (bounded by the inline cap).
@@ -921,6 +941,7 @@ impl AtermTerminal {
         // The prediction coordinate space just changed: drop in-flight guesses
         // rather than ghost-paint them at stale coords (the native resize rule).
         self.predict.reset();
+        Ok(())
     }
 
     /// Safety net #1 (see `REFLOW_PUMP_GRACE_RENDERS`): called by `render`.
@@ -952,7 +973,15 @@ impl AtermTerminal {
     /// damage-tracked path: only rows that changed since the last frame are
     /// re-rendered (the rest reuse the persistent cache), so streaming output and
     /// single-keystroke edits don't re-rasterize the whole grid every frame.
-    pub fn render(&mut self) {
+    /// Throws on an oversized physical frame or a failed framebuffer reservation.
+    /// Geometry and host RGBA admission precede damage consumption; a packed-frame
+    /// reservation failure also retains the last cache and exported pixels.
+    pub fn render(&mut self) -> Result<(), String> {
+        let (width, height) = self.checked_surface_size()?;
+        let bytes = width * height * 4;
+        self.rgba
+            .try_reserve_exact(bytes.saturating_sub(self.rgba.len()))
+            .map_err(|e| format!("cannot reserve RGBA framebuffer: {e}"))?;
         // Deferred-reflow safety net #1: a host that never calls `pump_reflow`
         // still re-attaches its rewrapped history within the grace window (the
         // countdown gives an updated host's idle-scheduled pump time to win).
@@ -1002,16 +1031,14 @@ impl AtermTerminal {
             // (the documented present_band_count contract). Nothing else moves.
             self.present_bands.clear();
             self.last_render_gated = true;
-            return;
+            return Ok(());
         }
         self.last_render_gated = false;
         // ---- END WF-1 FRAME GATE ----------------------------------------------
-        // An appearance-only change (theme/palette/font) doesn't move any cell, so
-        // the row-diff wouldn't repaint it — drop the cache to force one full frame.
-        if self.force_full_repaint {
-            self.win.invalidate();
-            self.force_full_repaint = false;
-        }
+        // An appearance-only change needs a full frame. Keep the old cache until
+        // the fallible packed-frame reservation succeeds; a refusal must leave
+        // the previous pixels available and the forced repaint still pending.
+        let mut fresh_win = self.force_full_repaint.then(WindowCpu::new);
         // E8 + DMG-1: refill the kept scratch in place (the gpu-web/native
         // kept-scratch pattern), re-resolving only the damaged rows when the
         // continuity proof holds; the effects/stamp passes below re-fill the
@@ -1059,11 +1086,11 @@ impl AtermTerminal {
         // expanded to straight RGBA8 for ImageData, band-scoped.
         let frac_px = self.frame_scratch.scroll_frac_px;
         let frac_full = frac_px != 0 || self.last_present_frac != 0;
-        self.last_present_frac = frac_px;
         {
+            let win = fresh_win.as_mut().unwrap_or(&mut self.win);
             let view = self
                 .renderer
-                .render_input_cached(&mut self.win, &self.frame_scratch);
+                .try_render_input_cached(win, &self.frame_scratch)?;
             self.width = view.width();
             self.height = view.height();
             if frac_full {
@@ -1077,6 +1104,11 @@ impl AtermTerminal {
                 );
             }
         }
+        if let Some(win) = fresh_win {
+            self.win = win;
+        }
+        self.force_full_repaint = false;
+        self.last_present_frac = frac_px;
         if !frac_full {
             self.expand_damage_to_rgba();
         }
@@ -1090,6 +1122,7 @@ impl AtermTerminal {
         // and `take_damage` never changes the epoch VALUE — only re-arms it —
         // so an idle successor re-reads the same number and matches.)
         self.last_frame_key = Some(gate_key);
+        Ok(())
     }
 
     /// Whether the next [`render`](Self::render) would actually draw — the
@@ -1341,9 +1374,9 @@ impl AtermTerminal {
 /// `KeyboardEvent.key`; `mods` = SHIFT=1, ALT=2, CTRL=4, SUPER=8;
 /// `event_type` = 0=Press, 1=Repeat, 2=Release; `base_layout_key` = US-QWERTY
 /// char for Kitty `REPORT_ALTERNATE_KEYS`), plus `mode_bits` from
-/// `keyboard_mode_bits` (a `u16` bitflags value zero-extended to `u32`;
-/// undefined bits are truncated away). With fresh bits the output is
-/// byte-identical to the instance method.
+/// `keyboard_mode_bits` (the `u32` `KeyboardMode` word; undefined bits are
+/// truncated away). With fresh bits the output is byte-identical to the
+/// instance method.
 #[cfg_attr(target_arch = "wasm32", export)]
 #[must_use]
 pub fn encode_key_with_mode(
@@ -1354,7 +1387,7 @@ pub fn encode_key_with_mode(
     mode_bits: u32,
 ) -> Option<Vec<u8>> {
     use aterm_types::keyboard::{encode_dom_key, KeyboardMode};
-    let mode = KeyboardMode::from_bits_truncate(mode_bits as u16);
+    let mode = KeyboardMode::from_bits_truncate(mode_bits);
     encode_dom_key(key, mods, event_type, base_layout_key, mode)
 }
 
@@ -1483,6 +1516,7 @@ fn classify(s: &str) -> u8 {
 impl AtermTerminal {
     pub fn new_from_system(rows: u16, cols: u16, px: f32) -> Option<AtermTerminal> {
         let renderer = Renderer::from_system(px, Theme::default())?;
+        let (rows, cols) = frame_geometry_api::checked_grid_size(&renderer, rows, cols, 0).ok()?;
         // Same clamp-sync as `new`: store the grid's CLAMPED dims, never the raw
         // args, so the framebuffer can't be sized past the 1..=4096 grid bound.
         // Same tiered-store attachment as `new` (audit E1) so tests/benches
@@ -1878,26 +1912,116 @@ mod tests {
         );
     }
 
-    /// JS hands the binding raw u16 rows/cols; the grid clamps them to 1..=4096.
-    /// Construction and `resize` must both re-sync `self.rows`/`self.cols` to the
-    /// CLAMPED grid dims: sizing the framebuffer from the raw 65535×65535 is an
-    /// unbounded alloc / wasm32 u32 overflow → OOB.
+    /// Reject an oversized frame before constructing or changing a grid. Existing
+    /// text, presentation state and pixels survive refused resize, chrome and zoom.
     #[test]
-    fn oversized_dims_are_clamped_to_the_grid_bound() {
-        let mut t = crate::system_font_terminal(u16::MAX, u16::MAX, 16.0);
+    fn oversized_frames_are_refused_before_state_changes() {
+        let new = |rows, cols| {
+            AtermTerminal::new(
+                rows,
+                cols,
+                BUNDLED_FACE,
+                16.0,
+                0xffffff,
+                0,
+                0xffffff,
+                0x444444,
+            )
+        };
         assert!(
-            t.rows <= 4096 && t.cols <= 4096,
-            "ctor clamps to grid bound"
+            new(u16::MAX, u16::MAX).is_err(),
+            "constructor refuses before allocating the oversized grid"
         );
-        assert_eq!(t.rows, t.term.grid().rows() as usize, "ctor syncs to grid");
-        assert_eq!(t.cols, t.term.grid().cols() as usize, "ctor syncs to grid");
-        t.resize(0, 0);
-        assert_eq!((t.rows, t.cols), (1, 1), "resize(0) is clamped UP to 1");
-        t.resize(u16::MAX, u16::MAX);
+        let mut t = new(0, 0).expect("zero dimensions clamp up");
+        assert_eq!((t.rows, t.cols), (1, 1));
+        t.resize(2, 8).expect("small resize");
+        t.process(b"kept");
+        t.render().expect("first frame");
+        t.render().expect("settled frame");
+        let pixels = t.rgba();
+        let bands = t.present_bands.clone();
+        let size = (t.width(), t.height());
+        let metrics = (
+            t.cell_width(),
+            t.cell_height(),
+            t.chrome_pad(),
+            t.chrome_head(),
+        );
+        let key = t.last_frame_key;
+        let generation = t.host_visual_gen;
+        type Change = fn(&mut AtermTerminal) -> Result<(), String>;
+        let attempts: [(&str, Change); 3] = [
+            ("resize", |t| t.resize(u16::MAX, u16::MAX)),
+            ("chrome", |t| t.set_chrome(u16::MAX, u16::MAX)),
+            ("zoom", |t| t.set_px(1_000_000.0)),
+        ];
+        for (name, change) in attempts {
+            assert!(change(&mut t).is_err(), "{name}");
+            assert_eq!((t.rows, t.cols), (2, 8), "{name}");
+            assert_eq!(t.row_text(0).as_deref(), Some("kept"), "{name}");
+            assert_eq!(
+                (t.term.grid().rows(), t.term.grid().cols()),
+                (2, 8),
+                "{name}"
+            );
+            assert_eq!(
+                (
+                    t.cell_width(),
+                    t.cell_height(),
+                    t.chrome_pad(),
+                    t.chrome_head()
+                ),
+                metrics,
+                "{name}"
+            );
+            assert_eq!(t.host_visual_gen, generation, "{name}");
+            assert_eq!(t.last_frame_key, key, "{name}");
+            assert!(
+                !t.needs_frame(),
+                "{name} did not consume or invalidate the settled frame"
+            );
+            assert_eq!(t.rgba(), pixels, "{name}: previous RGBA remains");
+            assert_eq!(t.present_bands, bands, "{name}: previous damage remains");
+            assert_eq!((t.width(), t.height()), size, "{name}");
+        }
+        t.set_line_height(1_000_000.0);
         assert!(
-            t.rows <= 4096 && t.cols <= 4096,
-            "resize clamps to grid bound"
+            t.render().is_err(),
+            "a later geometry-changing setter can exceed the frame cap"
         );
+        assert!(t.force_full_repaint, "a refusal keeps the repaint pending");
+        assert!(
+            !t.win.frame_pixels().is_empty(),
+            "the previous packed frame remains"
+        );
+        assert_eq!(t.rgba(), pixels);
+        assert_eq!(t.present_bands, bands);
+        assert_eq!((t.width(), t.height()), size);
+        t.set_line_height(1.0);
+        t.render().expect("corrected geometry renders again");
+        assert!(!t.force_full_repaint, "a successful repaint settles it");
+        assert_eq!(t.rgba(), pixels);
+        t.resize(0, 0).expect("zero resize clamps up");
+        assert_eq!((t.rows, t.cols), (1, 1));
+
+        // The message band belongs to the same physical framebuffer budget.
+        // This builds only a tiny grid; no large glyph or pixel raster is made.
+        let mut banded =
+            AtermTerminal::new(2, 1, BUNDLED_FACE, 6_000.0, 0xffffff, 0, 0xffffff, 0x444444)
+                .expect("the grid alone fits the frame budget");
+        assert!(banded.checked_surface_size().is_ok());
+        let reply = banded.notice_at(
+            "post ci sev=warn Attention",
+            aterm_time::Instant::now(),
+            aterm_messages::WallStamp { unix_ms: 0 },
+        );
+        assert!(reply.starts_with("OK"), "{reply}");
+        assert_eq!(banded.band_rows(), 1);
+        assert!(
+            banded.render().is_err(),
+            "the added physical band row exceeds the budget"
+        );
+        assert_eq!(banded.frame_scratch.rows, 0, "no frame was built");
     }
 
     /// The persistent WindowCpu reuses unchanged rows across frames and the
@@ -1911,15 +2035,15 @@ mod tests {
         let steps: &[&[u8]] = &[b"$ ", b"ls -la\r\n", b"file one\r\n", b"\x1b[1;1HX"];
         for s in steps {
             warm.process(s);
-            warm.render();
-            warm.render();
+            warm.render().expect("renderable frame");
+            warm.render().expect("renderable frame");
             assert!(
                 warm.last_render_skipped(),
                 "the settled re-render takes the gate"
             );
             fresh.process(s);
         }
-        fresh.render();
+        fresh.render().expect("renderable frame");
         assert_eq!(
             (warm.width(), warm.height()),
             (fresh.width(), fresh.height())
@@ -1945,14 +2069,14 @@ mod tests {
         // Clear, then park the cursor in the far corner so the sampled centre cell
         // is pure background (no glyph, no cursor).
         t.process(b"\x1b[2J\x1b[24;80H");
-        t.render();
+        t.render().expect("renderable frame");
         let w = t.width();
         let centre = ((t.height() / 2) * w + w / 2) * 4;
         let before = t.rgba()[centre..centre + 3].to_vec();
 
         let new_bg = 0x0012_3456u32; // distinctive, unlike the default theme bg
         t.set_theme(0x00ff_ffff, new_bg, 0x0050_fa7b, 0x0026_4f78);
-        t.render(); // idle frame: no content changed, only the theme
+        t.render().expect("renderable frame"); // idle frame: no content changed, only the theme
         let want = [(new_bg >> 16) as u8, (new_bg >> 8) as u8, new_bg as u8];
         assert_ne!(
             before.as_slice(),
@@ -2326,20 +2450,20 @@ mod tests {
         let mut toggled = crate::system_font_terminal(24, 80, 16.0);
         let content = b"a curious cat watched the build fail: fuck\r\n$ ";
         plain.process(content);
-        plain.render();
+        plain.render().expect("renderable frame");
 
         toggled.process(content);
         toggled.set_sparkle_words_enabled(true);
         toggled.set_cursor_glow(true, "phaser", None, None, 260, 24, 0.7, 0.6, true);
         toggled.set_cursor_trail(true, 260, 24, None);
         toggled.advance_effects(50.0);
-        toggled.render();
+        toggled.render().expect("renderable frame");
         // A FIRE burn: type-then-erase ignites a REAL burn while leaving the
         // cell bytes and the cursor position identical to the plain engine.
         toggled.set_cursor_glow(true, "ember", None, None, 400, 64, 1.0, 2.0, true);
         toggled.process(b"z\x1b[D \x1b[D");
         toggled.advance_effects(50.0);
-        toggled.render();
+        toggled.render().expect("renderable frame");
         assert_ne!(
             plain.rgba(),
             toggled.rgba(),
@@ -2349,13 +2473,13 @@ mod tests {
         // the glass by a witnessed type-then-erase.
         toggled.set_cursor_glow(true, "rainbow kitty", None, None, 260, 24, 0.7, 0.6, true);
         toggled.set_cursor_pet(true, 7);
-        toggled.render();
+        toggled.render().expect("renderable frame");
         toggled.note_typed_char('p');
         toggled.process(b"p\x1b[D \x1b[D");
         let mut on_glass = false;
         for _ in 0..240 {
             toggled.advance_effects(33.0);
-            toggled.render();
+            toggled.render().expect("renderable frame");
             if toggled.cursor_pet_alpha() > 0 {
                 on_glass = true;
                 break;
@@ -2372,7 +2496,7 @@ mod tests {
         toggled.set_cursor_glow(false, "lumen", None, None, 260, 24, 0.7, 0.6, true);
         toggled.set_cursor_trail(false, 260, 24, None);
         toggled.advance_effects(50.0);
-        toggled.render();
+        toggled.render().expect("renderable frame");
 
         assert_eq!(plain.width(), toggled.width());
         assert_eq!(
@@ -2392,12 +2516,12 @@ mod tests {
         let mut chromed = crate::system_font_terminal(24, 80, 16.0);
         let content = b"chrome test\r\n$ ";
         plain.process(content);
-        plain.render();
+        plain.render().expect("renderable frame");
         let (w, h) = (plain.width(), plain.height());
 
         chromed.process(content);
-        chromed.set_chrome(12, 30);
-        chromed.render();
+        chromed.set_chrome(12, 30).expect("admitted geometry");
+        chromed.render().expect("renderable frame");
         assert_eq!(chromed.width(), w + 24, "frame gains 2*pad in width");
         assert_eq!(
             chromed.height(),
@@ -2405,8 +2529,8 @@ mod tests {
             "frame gains 2*pad + head in height"
         );
 
-        chromed.set_chrome(0, 0);
-        chromed.render();
+        chromed.set_chrome(0, 0).expect("admitted geometry");
+        chromed.render().expect("renderable frame");
         assert_eq!((chromed.width(), chromed.height()), (w, h));
         assert_eq!(
             plain.rgba(),
@@ -2425,7 +2549,8 @@ mod tests {
     fn spill_exports_track_band_content_through_the_real_pipeline() {
         let mut t = crate::system_font_terminal(12, 40, 16.0);
         let (pad, head) = (12usize, 30usize);
-        t.set_chrome(pad as u16, head as u16);
+        t.set_chrome(pad as u16, head as u16)
+            .expect("admitted geometry");
         // The glow observes cursor motion FRAME-TO-FRAME, so keystrokes
         // interleave with renders, each WITNESSED through the committed-char
         // seam as a JS keydown handler would: the movement-admission gate
@@ -2433,7 +2558,7 @@ mod tests {
         t.set_cursor_glow(true, "ember", None, None, 400, 64, 1.0, 2.0, true);
         // Seed the just-enabled engines' cursor anchor (apply is the anchor
         // authority) so the first witness has an owner to check against.
-        t.render();
+        t.render().expect("renderable frame");
         for (ch, bytes) in [('a', b"a"), ('b', b"b"), ('c', b"c"), ('d', b"d")] {
             assert!(
                 t.note_typed_char(ch),
@@ -2441,7 +2566,7 @@ mod tests {
             );
             t.process(bytes);
             t.advance_effects(30.0);
-            t.render();
+            t.render().expect("renderable frame");
         }
         // A frame whose band coverage is LIVE (nonzero alpha), not merely
         // rev-ticked, or the parity below proves nothing.
@@ -2460,7 +2585,7 @@ mod tests {
                 break;
             }
             t.advance_effects(16.0);
-            t.render();
+            t.render().expect("renderable frame");
         }
         assert!(lit_frame, "the witnessed burn must reach the band live");
         let (w, h) = (t.width(), t.height());
@@ -2533,7 +2658,7 @@ mod tests {
         t.set_cursor_pet(true, seed);
         // Seed the just-enabled engines' cursor anchor (apply is the anchor
         // authority) so the first witness below has an owner to check against.
-        t.render();
+        t.render().expect("renderable frame");
         for frame in 0..240u32 {
             if frame % 6 == 0 {
                 let ch = char::from(b'a' + u8::try_from(frame / 6 % 26).unwrap_or(0));
@@ -2541,7 +2666,7 @@ mod tests {
                 t.process(&[ch as u8]);
             }
             t.advance_effects(33.0);
-            t.render();
+            t.render().expect("renderable frame");
             if t.cursor_pet_alpha() > 0 {
                 return Some(frame);
             }
@@ -2560,9 +2685,9 @@ mod tests {
     fn settle(t: &mut AtermTerminal, budget_frames: u32) -> bool {
         for _ in 0..budget_frames {
             t.advance_effects(100.0);
-            t.render();
+            t.render().expect("renderable frame");
             if !t.is_effects_active() {
-                t.render();
+                t.render().expect("renderable frame");
                 return true;
             }
         }
@@ -2607,7 +2732,7 @@ mod tests {
                 t.note_typed_char(ch);
                 t.process(&[ch as u8]);
                 t.advance_effects(33.0);
-                t.render();
+                t.render().expect("renderable frame");
             }
             assert_eq!(
                 a.rgba(),
@@ -2639,24 +2764,24 @@ mod tests {
             "the pet must reach the glass through the binding"
         );
         assert!(settle(&mut t, 600), "the pet must sleep first");
-        t.render();
+        t.render().expect("renderable frame");
         assert!(t.last_render_skipped(), "settled frame must take the gate");
 
         // A moved pointer reopens; the same sample again does not.
         let (px, py) = (t.width() as f32 * 0.5, t.height() as f32 * 0.5);
         t.note_pointer_px(px, py);
         assert!(t.needs_frame(), "a moved pointer must reopen the gate");
-        t.render();
+        t.render().expect("renderable frame");
         assert!(!t.last_render_skipped(), "the pointer frame must draw");
         assert!(settle(&mut t, 600), "a watching cat settles again");
-        t.render();
+        t.render().expect("renderable frame");
         assert!(t.last_render_skipped(), "re-settled after the pointer");
         t.note_pointer_px(px, py);
         assert!(
             !t.needs_frame(),
             "an identical pointer sample is value-shadowed and must not reopen the gate"
         );
-        t.render();
+        t.render().expect("renderable frame");
         assert!(t.last_render_skipped(), "an idle hover must gate");
         t.note_pointer_px(f32::NAN, py);
         assert!(!t.needs_frame(), "a non-finite sample is dropped");
@@ -2664,10 +2789,10 @@ mod tests {
         // A leave reopens once.
         t.note_pointer_leave();
         assert!(t.needs_frame(), "the pointer leaving must reopen the gate");
-        t.render();
+        t.render().expect("renderable frame");
         assert!(!t.last_render_skipped(), "the leave frame must draw");
         assert!(settle(&mut t, 600), "the cat settles after the leave");
-        t.render();
+        t.render().expect("renderable frame");
         assert!(t.last_render_skipped(), "re-settled after the leave");
         t.note_pointer_leave();
         assert!(!t.needs_frame(), "a second leave is value-shadowed");
@@ -2683,7 +2808,7 @@ mod tests {
             !t.needs_frame(),
             "a pass changed nothing the gate cannot see"
         );
-        t.render();
+        t.render().expect("renderable frame");
         assert!(t.last_render_skipped(), "a passed press must gate");
         let inside = (((x0 + x1) / 2) as f32, ((y0 + y1) / 2) as f32);
         assert_eq!(t.pet_press_px(inside.0, inside.1), 1, "inside pets");
@@ -2691,7 +2816,7 @@ mod tests {
             t.needs_frame(),
             "a petted cat needs the frame that runs the purr"
         );
-        t.render();
+        t.render().expect("renderable frame");
         assert!(!t.last_render_skipped(), "the petting frame must draw");
     }
 
@@ -2725,7 +2850,7 @@ mod tests {
             t.note_typed_char(ch);
             t.process(ch.to_string().as_bytes());
             t.advance_effects(33.0);
-            t.render();
+            t.render().expect("renderable frame");
             assert!(!t.last_render_skipped(), "a walking cat never gates");
             let banded_px: i32 = t
                 .present_bands
@@ -2796,7 +2921,7 @@ mod tests {
         install_tiered_history(&mut t, 24, 80, 500);
         let before = t.term.grid().scrollback_lines();
         assert!(before > 100, "precondition: deep history ({before} lines)");
-        t.resize(24, 40);
+        t.resize(24, 40).expect("admitted geometry");
         assert!(!t.reflow_pending(), "a small history rewraps inline");
         assert!(
             t.term.grid().scrollback_lines() >= before,
@@ -2807,7 +2932,7 @@ mod tests {
         install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
         let before = t.term.grid().scrollback_lines();
         assert!(before > INLINE_REFLOW_MAX_LINES, "precondition: {before}");
-        t.resize(24, 40);
+        t.resize(24, 40).expect("admitted geometry");
         assert!(t.reflow_pending(), "a deep history defers its rewrap");
         assert_eq!(t.cols, 40, "the visible grid resized synchronously");
         let during = t.term.grid().scrollback_lines();
@@ -2863,7 +2988,7 @@ mod tests {
             let mut t = crate::system_font_terminal(24, 80, 16.0);
             install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
             let before = t.term.grid().scrollback_lines();
-            t.resize(24, 40);
+            t.resize(24, 40).expect("admitted geometry");
             assert!(t.reflow_pending());
             if half_stepped {
                 t.pump_reflow_budget(500);
@@ -2871,7 +2996,7 @@ mod tests {
                     assert!(t.pump_reflow(), "mid-stepping: work must remain");
                 }
             }
-            t.resize(24, 60);
+            t.resize(24, 60).expect("admitted geometry");
             assert!(
                 t.reflow_pending(),
                 "half_stepped={half_stepped}: the job survives"
@@ -2884,7 +3009,7 @@ mod tests {
                 "half_stepped={half_stepped}: no history lost across the supersede \
                  (before={before}, after={after})"
             );
-            t.resize(24, 30);
+            t.resize(24, 30).expect("admitted geometry");
             assert!(
                 t.reflow_pending(),
                 "stale wrapping re-detaches and re-wraps"
@@ -2906,16 +3031,16 @@ mod tests {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
         install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
         let before = t.term.grid().scrollback_lines();
-        t.resize(24, 40);
+        t.resize(24, 40).expect("admitted geometry");
         assert!(t.reflow_pending());
         // Grace window: the deferred job must NOT run on the first frames (an
         // updated host's idle pump gets its chance to win the race)…
-        t.render();
+        t.render().expect("renderable frame");
         assert!(t.reflow_pending(), "no pump inside the grace window");
         // …then one budgeted step per frame: > 25k input lines at 2_000/step
         // (plus the refill steps) needs a couple dozen frames beyond grace.
         for _ in 0..REFLOW_PUMP_GRACE_RENDERS {
-            t.render();
+            t.render().expect("renderable frame");
         }
         assert!(
             t.reflow_pending(),
@@ -2924,7 +3049,7 @@ mod tests {
         );
         let mut frames = 0usize;
         while t.reflow_pending() {
-            t.render();
+            t.render().expect("renderable frame");
             frames += 1;
             assert!(
                 frames < 10_000,
@@ -2947,7 +3072,7 @@ mod tests {
         // catch-up task).
         let mut t = crate::system_font_terminal(24, 80, 16.0);
         install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
-        t.resize(24, 40);
+        t.resize(24, 40).expect("admitted geometry");
         assert!(t.reflow_pending());
 
         // Blow past the backlog cap in one burst (no single pump can close
@@ -3077,7 +3202,7 @@ mod tests {
         for step in steps {
             t.process(step);
             t.advance_effects(16.0);
-            t.render();
+            t.render().expect("renderable frame");
             if *step == b"e" || *step == b"c" {
                 assert_eq!(
                     t.last_refill,
@@ -3088,16 +3213,16 @@ mod tests {
             check(&mut t, &String::from_utf8_lossy(step));
         }
         t.scroll_lines(3);
-        t.render();
+        t.render().expect("renderable frame");
         check(&mut t, "history viewport");
         t.scroll_lines(-3);
-        t.render();
+        t.render().expect("renderable frame");
         check(&mut t, "back to the live bottom");
-        t.resize(10, 30);
-        t.render();
+        t.resize(10, 30).expect("admitted geometry");
+        t.render().expect("renderable frame");
         check(&mut t, "resize");
         t.process(b"after resize");
-        t.render();
+        t.render().expect("renderable frame");
         check(&mut t, "echo after resize");
         assert!(scoped >= 5, "the scoped arm must be reached ({scoped})");
         assert!(full >= 2, "the full arm must be reached ({full})");
@@ -3113,12 +3238,12 @@ mod tests {
     fn frame_gate_skips_settled_frames_and_reopens_on_every_change_class() {
         let mut t = crate::system_font_terminal(8, 40, 14.0);
         t.process(b"hello gate");
-        t.render();
+        t.render().expect("renderable frame");
         assert!(!t.last_render_skipped(), "first render must draw");
         let baseline = t.rgba();
 
         // SKIP side: settled frame -> gated, zero bands, bytes retained.
-        t.render();
+        t.render().expect("renderable frame");
         assert!(t.last_render_skipped(), "settled frame must take the gate");
         assert_eq!(t.present_band_count(), 0, "gated frame exports zero bands");
         assert_eq!(t.rgba(), baseline, "gated frame retains the framebuffer");
@@ -3127,17 +3252,17 @@ mod tests {
         // REOPEN side 1: grid damage (echo).
         t.process(b"!");
         assert!(t.needs_frame(), "damage must reopen the gate");
-        t.render();
+        t.render().expect("renderable frame");
         assert!(!t.last_render_skipped(), "an echo frame must draw");
 
         // REOPEN side 2: renderer-held blink phase (no grid damage).
-        t.render();
+        t.render().expect("renderable frame");
         assert!(t.last_render_skipped(), "re-settled before blink");
         t.set_cursor_blink_phase(false);
-        t.render();
+        t.render().expect("renderable frame");
         assert!(!t.last_render_skipped(), "a blink flip must draw");
         t.set_cursor_blink_phase(false); // same phase again: shadow de-dups
-        t.render();
+        t.render().expect("renderable frame");
         assert!(
             t.last_render_skipped(),
             "an idempotent blink re-assert must gate"
@@ -3146,18 +3271,18 @@ mod tests {
         // REOPEN side 3: selection (Terminal-held, no grid damage).
         t.selection_start(2, 1);
         t.selection_extend(2, 8);
-        t.render();
+        t.render().expect("renderable frame");
         assert!(!t.last_render_skipped(), "a selection change must draw");
 
         // REOPEN side 4: viewport scroll (display-offset damage).
         for _ in 0..12 {
             t.process(b"line\r\n");
         }
-        t.render();
-        t.render();
+        t.render().expect("renderable frame");
+        t.render().expect("renderable frame");
         assert!(t.last_render_skipped(), "re-settled before scroll");
         t.scroll_lines(3);
-        t.render();
+        t.render().expect("renderable frame");
         assert!(
             !t.last_render_skipped(),
             "a viewport scroll must draw (display-offset damage -> epoch)"
@@ -3177,12 +3302,12 @@ mod tests {
         for _ in 0..20 {
             t.process(b"a line of selectable text\r\n");
         }
-        t.render();
+        t.render().expect("renderable frame");
 
         // ---- SKIP side: cell-identical jitter ------------------------------
         t.selection_start(2, 4);
         t.selection_extend(2, 10);
-        t.render();
+        t.render().expect("renderable frame");
         assert!(!t.last_render_skipped(), "the first extend must draw");
         let baseline = t.rgba();
         let span = t.selection_text();
@@ -3191,7 +3316,7 @@ mod tests {
             !t.needs_frame(),
             "a redundant extend must not reopen the gate"
         );
-        t.render();
+        t.render().expect("renderable frame");
         assert!(
             t.last_render_skipped(),
             "a cell-identical extend must be gated away"
@@ -3203,7 +3328,7 @@ mod tests {
         // ---- DRAW side 1: a genuine one-cell move --------------------------
         t.selection_extend(2, 11);
         assert!(t.needs_frame(), "a one-cell move must reopen the gate");
-        t.render();
+        t.render().expect("renderable frame");
         assert!(!t.last_render_skipped(), "a one-cell move must draw");
         assert_ne!(t.selection_text(), span, "and it really moved");
 
@@ -3212,23 +3337,23 @@ mod tests {
         // terminal-relative anchor under an unmoved display row, so the SAME
         // arguments name a different cell of the buffer.
         t.selection_finish();
-        t.render();
-        t.render();
+        t.render().expect("renderable frame");
+        t.render().expect("renderable frame");
         assert!(t.last_render_skipped(), "re-settled before the scroll");
         t.selection_start(3, 2);
         t.selection_extend(3, 12);
-        t.render();
+        t.render().expect("renderable frame");
         let before_scroll = t.selection_text();
         t.scroll_lines(2);
-        t.render();
-        t.render();
+        t.render().expect("renderable frame");
+        t.render().expect("renderable frame");
         assert!(t.last_render_skipped(), "re-settled after the scroll");
         t.selection_extend(3, 12); // identical ARGUMENTS, different cell
         assert!(
             t.needs_frame(),
             "a scroll under a stationary pointer must still reopen the gate"
         );
-        t.render();
+        t.render().expect("renderable frame");
         assert!(
             !t.last_render_skipped(),
             "an extend whose terminal-relative anchor moved must draw"
@@ -3250,7 +3375,7 @@ mod tests {
         fresh.selection_extend(3, 12);
         fresh.scroll_lines(2);
         fresh.selection_extend(3, 12);
-        fresh.render();
+        fresh.render().expect("renderable frame");
         assert_eq!(
             t.rgba(),
             fresh.rgba(),
@@ -3280,7 +3405,7 @@ mod tests {
             .expect("the bundled face parses");
             t.set_background_opacity(opacity);
             t.process(b"\x1b[?25l\x1b[38;2;42;45;53mXXXX");
-            t.render();
+            t.render().expect("renderable frame");
             let rgba = t.rgba();
             rgba.as_chunks::<4>()
                 .0

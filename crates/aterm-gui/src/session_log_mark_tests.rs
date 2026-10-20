@@ -114,7 +114,8 @@ fn ctl_input_marks_one_burst_per_actor() {
     let send = |by: Actor| {
         let mut g = tl.lock().unwrap();
         let at = g.slog().now();
-        g.slog_mut().ctl_input(by, InputVerb::Send, None, at);
+        g.slog_mut()
+            .ctl_input(by, InputVerb::Send, None, super::InputAct::default(), at);
     };
     send(Actor::Harness);
     hand.advance(10_000);
@@ -149,7 +150,8 @@ fn input_marks_from_many_authors_are_bounded() {
             let by = Actor::Sid(aterm_slog::ShortId::new(&format!("s-{i:020x}")).expect("sid"));
             let mut g = tl.lock().unwrap();
             let at = g.slog().now();
-            g.slog_mut().ctl_input(by, InputVerb::Key, None, at);
+            g.slog_mut()
+                .ctl_input(by, InputVerb::Key, None, super::InputAct::default(), at);
             drop(g);
             hand.advance(10);
         }
@@ -174,7 +176,8 @@ fn a_flood_of_edges_never_silences_a_trusted_actors_input() {
     let send = |by: Actor| {
         let mut g = tl.lock().unwrap();
         let at = g.slog().now();
-        g.slog_mut().ctl_input(by, InputVerb::Send, None, at);
+        g.slog_mut()
+            .ctl_input(by, InputVerb::Send, None, super::InputAct::default(), at);
     };
     let by_of = |by: &str| {
         input_marks(&tl)
@@ -208,6 +211,113 @@ fn a_flood_of_edges_never_silences_a_trusted_actors_input() {
     );
 }
 
+/// T1'S ACTED MARKS ARE BOUND: one control client's 3000 acted keys (`key
+/// act=deny`, no agent, no box) write the burst's mark, then one per mark
+/// token of the author's (twenty), the rest counted, not marked; a second on
+/// the next acted mark says how many (`dropped=`); and the need and the task
+/// marks written before the flood are still in the session's ring.
+/// NEGATIVE CONTROL (by scratch revert): unbounded, the flood evicts them.
+#[test]
+fn a_flood_of_acted_keys_keeps_the_sessions_records() {
+    use crate::task_record::{TaskMark, TaskState};
+    let h = crate::session_store::test_handle(71);
+    let hand = super::tests::hand_clock(&h.ctx.timeline);
+    let store = crate::session_store::new_store();
+    store.write().unwrap().register(h.clone());
+    let (reply, _) = super::cmd_mark(&h.ctx, Actor::Harness, true, "- need word=review");
+    assert!(reply.starts_with("OK"), "{reply}");
+    let _ = h.ctx.timeline.lock().unwrap().mark_task(
+        &TaskMark::new(TaskState::Working),
+        false,
+        std::time::Instant::now(),
+        1,
+    );
+    let deny = super::InputAct {
+        act: Some(aterm_slog::ActWord::Deny),
+        re: None,
+    };
+    let key = || {
+        let mut g = h.ctx.timeline.lock().unwrap();
+        let at = g.slog().now();
+        g.slog_mut()
+            .ctl_input(Actor::Ctl, InputVerb::Key, None, deny, at);
+    };
+    for _ in 0..3000 {
+        key();
+    }
+    let acted = || -> Vec<String> {
+        input_marks(&h.ctx.timeline)
+            .into_iter()
+            .filter(|l| l.contains(" act=deny "))
+            .collect()
+    };
+    let burst = usize::try_from(aterm_slog::MARK_BURST).expect("small");
+    assert_eq!(
+        acted().len(),
+        1 + burst,
+        "the burst's mark and twenty tokens"
+    );
+    hand.advance(1_000);
+    key();
+    let marks = acted();
+    assert_eq!(marks.len(), 2 + burst, "a token a second");
+    let dropped = 3000 - 1 - burst;
+    assert!(
+        marks
+            .last()
+            .is_some_and(|l| l.contains(&format!(" dropped={dropped} "))),
+        "the unmarked keys counted: {:?}",
+        marks.last()
+    );
+    let lines = super::tests::lines_of(&h.ctx.timeline);
+    for kind in [" mark - need ", " mark - task "] {
+        assert!(
+            lines.iter().any(|l| l.contains(kind)),
+            "the flood evicted{kind}"
+        );
+    }
+}
+
+/// T1'S DROPPED COUNT IS ITS OWN AUTHOR'S: edge A's 100 acted keys write the
+/// burst's mark and twenty more, 79 counted; edge B's one acted key then
+/// says nothing of them (no `dropped=`), and A's next acted key, a second
+/// on, says all 79. NEGATIVE CONTROL (by scratch revert): with one count
+/// for every author outside the trusted four, as 5D-2 kept it, B's mark
+/// reads `dropped=79` and A's none.
+#[test]
+fn an_edges_dropped_count_rides_only_its_own_mark() {
+    let (tl, hand) = opened();
+    let edge = |i: u32| Actor::Sid(aterm_slog::ShortId::new(&format!("s-{i:020x}")).expect("sid"));
+    let deny = super::InputAct {
+        act: Some(aterm_slog::ActWord::Deny),
+        re: None,
+    };
+    let key = |by: Actor| {
+        let mut g = tl.lock().unwrap();
+        let at = g.slog().now();
+        g.slog_mut().ctl_input(by, InputVerb::Key, None, deny, at);
+    };
+    let last_by = |by: &str| {
+        input_marks(&tl)
+            .into_iter()
+            .rfind(|l| l.contains(&format!(" by={by} ")))
+            .expect("a mark by the author")
+    };
+    for _ in 0..100 {
+        key(edge(1));
+    }
+    let burst = usize::try_from(aterm_slog::MARK_BURST).expect("small");
+    assert_eq!(input_marks(&tl).len(), 1 + burst, "A's burst and tokens");
+    key(edge(2));
+    let b = last_by("s-00000000000000000002");
+    assert!(!b.contains(" dropped="), "B dropped nothing: {b}");
+    hand.advance(1_000);
+    key(edge(1));
+    let a = last_by("s-00000000000000000001");
+    let dropped = 100 - 1 - burst;
+    assert!(a.contains(&format!(" dropped={dropped} ")), "A's own: {a}");
+}
+
 /// A turn is the last author's within five seconds: the harness's `send`
 /// then `busy` 4 s on opens `by=harness`; NEGATIVE at 6 s the turn is
 /// nobody's; a person's keys after the harness's input take the turn.
@@ -219,8 +329,13 @@ fn a_turn_is_the_last_actors_within_five_seconds() {
         {
             let mut g = tl.lock().unwrap();
             let at = g.slog().now();
-            g.slog_mut()
-                .ctl_input(Actor::Harness, InputVerb::Send, None, at);
+            g.slog_mut().ctl_input(
+                Actor::Harness,
+                InputVerb::Send,
+                None,
+                super::InputAct::default(),
+                at,
+            );
             if person_after {
                 hand.advance(1_000);
                 let at = g.slog().now();
@@ -260,6 +375,7 @@ fn a_caused_send_names_its_turn() {
             Actor::Ctl,
             InputVerb::Send,
             aterm_slog::ShortId::new("@88231"),
+            super::InputAct::default(),
             at,
         );
         hand.advance(1_000);
@@ -474,8 +590,13 @@ fn control_input_owes_a_wake_only_when_it_wrote() {
     let input = |tl: &std::sync::Mutex<crate::session_timeline::SessionTimeline>| {
         let mut g = tl.lock().unwrap();
         let at = g.slog().now();
-        g.slog_mut()
-            .ctl_input(Actor::Ctl, InputVerb::Send, None, at);
+        g.slog_mut().ctl_input(
+            Actor::Ctl,
+            InputVerb::Send,
+            None,
+            super::InputAct::default(),
+            at,
+        );
         g.slog_take_wake()
     };
     assert!(input(&tl), "the burst's mark");
@@ -540,4 +661,62 @@ fn the_await_look_reads_a_close_with_the_flag_it_cleared() {
         ),
         "no close is coming"
     );
+}
+
+// ---- a predicate list (session log 5F-1) ------------------------------------
+
+/// `await log` TAKES A LIST: `close=turn,kind=note` is answered by a note
+/// (its second member), and by the first member's record too. NEGATIVE
+/// CONTROL: the list's first member alone, which is what a matcher that tests
+/// only the first member sees, leaves the note unanswered. The grammar: one
+/// list of up to four distinct members, each a predicate; a second list, a
+/// repeated or unknown member, an empty one or a fifth is the usage.
+#[test]
+fn an_await_log_list_answers_on_any_member() {
+    use super::{AWAIT_LOG_USAGE, LogAwait, LogAwaitStep};
+    let list = LogAwait::parse(&["close=turn,kind=note"]).expect("a list");
+    assert_eq!(list.what.members().len(), 2);
+    let first_only = LogAwait::parse(&["close=turn"]).expect("one").what;
+    assert_eq!(list.what.members()[0], first_only.members()[0]);
+    let (tl, _hand) = opened();
+    let mut g = tl.lock().unwrap();
+    let cursor = aterm_slog::Cursor::new(g.slog().log().ep(), g.slog().log().reader_last_seq());
+    let now = g.slog().now();
+    g.slog_mut()
+        .log_mut_for_journal()
+        .mark(
+            Mark::new(Kind::Note, Src::Mark, Conf::Claim)
+                .at(aterm_slog::Node::SESSION)
+                .fields(Fields::new().text(Key::Text, "second").expect("text")),
+            now,
+        )
+        .expect("a note");
+    match g.slog().await_check(list.what, cursor) {
+        LogAwaitStep::Answer(reply) => assert!(reply.contains(" mark - note "), "{reply}"),
+        LogAwaitStep::Wait(_) => panic!("the second member's record answers the list"),
+    }
+    assert!(
+        matches!(
+            g.slog().await_check(first_only, cursor),
+            LogAwaitStep::Wait(_)
+        ),
+        "NEGATIVE CONTROL: the first member alone does not answer a note"
+    );
+    for bad in [
+        &["need,need"][..],
+        &["need,close=turn,open=run,kind=note,kind=bell"],
+        &["need", "close=turn"],
+        &["need,bogus"],
+        &["need,"],
+        &[",need"],
+        &["close=turn,kind=nope"],
+        &["since=1", "ep=1"],
+        &["need", "since=1", "since=2", "ep=1"],
+    ] {
+        assert_eq!(LogAwait::parse(bad), Err(AWAIT_LOG_USAGE), "{bad:?}");
+    }
+    let four =
+        LogAwait::parse(&["need,close=turn,open=run,kind=note", "since=3", "ep=1"]).expect("four");
+    assert_eq!(four.what.members().len(), 4);
+    assert!(four.what.has_need());
 }

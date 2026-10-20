@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
+// under them (crates/aterm-spec-anchor/anchor_rules.rs).
+#![cfg_attr(anchor_rules, feature(macro_attr))]
+
 //! aterm's crash restore, headless: exact screens and scrollback after an unplanned window
 //! death.
 //!
@@ -53,7 +57,7 @@
 //!
 //! The formal model is `CrashRestoreJournal`
 //! (`aterm_models_session::crash_restore_journal_model`): Tier-0 in aterm-models-session, Tier-1
-//! in `conformance_region_tests.rs`, which drives the real writer over a store that dies at
+//! in `conformance_region.rs`, which drives the real writer over a store that dies at
 //! every primitive store and runs the real recovery.
 
 #![forbid(unsafe_code)]
@@ -65,10 +69,7 @@ pub mod recover;
 pub mod store;
 pub mod writer;
 
-// Named as a test file (`*_tests.rs`), which is how the source guards know one;
-// the module keeps the name the `#[refines]` anchors project through.
 #[cfg(test)]
-#[path = "conformance_region_tests.rs"]
 mod conformance_region;
 
 pub use layout::{Geometry, LayoutError, REGION_LEN};

@@ -37,13 +37,13 @@
 //!
 //! # The rest of the chrome
 //!
-//! The per-tab presence row (who drives the session, what its agent is doing, its mail
-//! and link) and the window's rim are [`presence`]: what only a host knows comes in
-//! through [`presence::Host`], and sequencing is [`presence::drive`] over the host's
-//! [`presence::drive::Desk`]. The strip, the band and the presence row share one
-//! window's grid, and [`chrome`] is the floor across them: after any rise, no source's
-//! quiet fall re-grids the window back inside [`chrome::CHROME_REGROW_SETTLE`]. The host
-//! hands the floor in ([`drive::Commit::floor`], [`presence::drive::Desk::chrome_floor`]).
+//! The window's needs border, its titlebar pill and the tab marks are [`presence`]: they
+//! draw the host's published need verdict, what only a host knows comes in through
+//! [`presence::Host`], and sequencing is [`presence::drive`] over the host's
+//! [`presence::drive::Desk`]. Presence owns no chrome row. The strip and the band share
+//! one window's grid, and [`chrome`] is the floor across them: after any rise, the band's
+//! quiet fall does not re-grid the window back inside [`chrome::CHROME_REGROW_SETTLE`].
+//! The host hands the floor in ([`drive::Commit::floor`]).
 //!
 //! [`page`] builds the Settings ▸ Messages page's model over the center
 //! ([`page::MessagesState::of`]); host facts come in through [`page::Host`], and the host

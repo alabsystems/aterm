@@ -62,41 +62,6 @@ fn assert_invariants(model: &Model, state: &State, context: &str) {
     }
 }
 
-// These four actions select facts supplied by the filesystem/OS environment;
-// no shipping state transition implements the observation itself. The real
-// sweeper produces those facts and `Decide` consumes them. Keep that boundary
-// explicit rather than attaching a refinement to a function that does not own
-// the transition.
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ExactInstanceRetention",
-    action = "SelectHeld",
-    reason = "environment observation: advisory-lock contention supplies Held; the exhaustive \
-              Tier-1 matrix projects that real decision input and validates its consumption"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ExactInstanceRetention",
-    action = "SelectFree",
-    reason = "environment observation: successful advisory-lock acquisition supplies Free; the \
-              exhaustive Tier-1 matrix projects that real decision input and validates it"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ExactInstanceRetention",
-    action = "SelectMalformed",
-    reason = "environment observation: link/type/I/O failures supply Invalid; the exhaustive \
-              Tier-1 matrix projects that fail-closed decision input and validates it"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ExactInstanceRetention",
-    action = "ObservePidAlive",
-    reason = "environment observation: the OS liveness probe supplies this compatibility fact \
-              only for a missing legacy lease; the Tier-1 matrix covers both values"
-)]
-#[expect(
-    dead_code,
-    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it"
-)]
-fn explicit_environment_scope_waivers() {}
-
 #[test]
 fn real_instance_sweep_decision_conforms_for_entire_lease_pid_matrix() {
     use InstanceLeaseState::{Acquirable, Held, Invalid, Missing};

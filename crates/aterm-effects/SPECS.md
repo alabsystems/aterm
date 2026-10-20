@@ -3,6 +3,13 @@
 
 # aterm-effects: spec recovery from its 3027 unit tests
 
+> 2026-10-19: `tests/the_owners_composer_gaps/shipping_present.rs` exercises the shared
+> `EffectsPipeline::cursor_step`; its finite F1–F5 laws are ordinary deterministic tests.
+> Established-hand repaint proofs compare prior/retained row content and exact ordered unpaid
+> keys; split insertions also preserve the whole old prefix and tail. The classifier spends
+> those keys once and paints only observed spans. Committed takes are headless terminal-byte
+> replays through that pipeline, not evidence of native presentation.
+
 > Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 863 tests
 > it deleted and 19 specs whose functions it deleted are gone. Counts elsewhere in this file
 > were taken before.
@@ -129,7 +136,7 @@ codegen-schema-fail-closed	contract	cat_glyphs_codegen::{glyph_from_doc,reject_u
 cw-motion-spawns	contract	classic_wake::ClassicWake::{tick,spawn}	With last = Some(p), enabled, intensity > 0, cw,ch > 0: a tick with cur = Some(q), q != p in the grid, appends a non-empty set of quads ending at q; no licence input is read. Every quad is inside the effects box and one cell-row band with matching row tag, alpha = 0, and |out| <= MAX_QUADS.	0,1,2,3,7,13	2
 cw-rest	contract	ClassicWake::{tick,reset,is_active}	(a) disabled, intensity <= 0, cw = 0 or ch = 0 gives empty out, return 0, state cleared, !is_active. (b) With no move after the last spawn at t, every tick at now >= t + max(spark life, 0.18 s, CROWN_TYPING_MS) is empty, returns 0, !is_active. (c) After reset(), last = None and the next tick only re-observes.	0,1,2,3,7	3
 cw-time-shift	equivalence	ClassicWake::tick	Time-translation invariance: a fresh ClassicWake run on (cur_i, t_i + d) gives the same fingerprints and quads as on (cur_i, t_i); tick reads time only through differences.	0,1,2,3,7	1
-cw-color-faces	other	ClassicWake::{comet_color,emit_crown,emit_ring}	Quad geometry is independent of (classic_mono, color, accent). With classic_mono = false and no landing ring the colours are independent of color and accent; with classic_mono = true comet colour = lerp_rgb(accent, color, pos) and the crown is color.	0,1,3,5,13	1
+cw-color-faces	other	ClassicWake::{comet_color,emit_crown,emit_ring}	Quad geometry is independent of (classic_mono, color, accent). With classic_mono = false and no landing ring the colours are independent of color and accent; with classic_mono = true comet colour = lerp_rgb(accent, color, pos) and the crown is color. resolve_glow_config sets classic_mono for a Classic trail whenever cursor_trail_color is set (the one-colour face is a colour choice) or the authored spelling is a `classic mono` alias.	0,1,3,5,13	1
 cw-run-pool-monotone	invariant	ClassicWake::emit_comet	Across every tick sequence comet_runs.len() never decreases and no pooled slot's capacity decreases.	0,1,2,7	1
 companion-gates	contract	companion::{resident_pet_owner_present,cursor_companion_presentable,resident_pet_surface_presentable,pet_output_burst,sing_face_live,shed_companion_presentable,shed_envelope_transitioning}	resident_pet_owner_present(p,e,s) = p and e and s = RainbowKitty; cursor_companion_presentable(d,l) = d and l; resident_pet_surface_presentable(f,u,l,r) = f and u and (l or r); pet_output_burst(sc,adv,ex,live,alt) = (sc or adv) and ex and live and not alt; sing_face_live(d) = d >= 0.33 (false for NaN); shed_companion_presentable(b,e) = b and e finite and e > 0; shed_envelope_transitioning(a,e) = e finite and (a ? e > 0 : e < 1).	0,3	4
 shed-companion-alpha	contract	companion::{shed_companion_alpha,shed_companion_presentable,shed_envelope_transitioning}	shed_companion_alpha(a,e) = round(a*clamp(e,0,1)) for finite e, 0 otherwise: <= a, non-decreasing in e, a for e >= 1, 0 for e <= 0. Single-grid and composed paths share these two functions.	0,3	1
@@ -390,7 +397,7 @@ ks-arm-threshold	contract	KittySing::{note_char,note_backspace,note_break,rekey,
 ks-key-switch-handover	contract	KittySing::{note_char,signature,bar,drive}	While armed, a different key starts a provisional hand-over (drive stays 1, signature becomes the new key's) that commits after KEY_SWITCH_REPS repeats; a second distinct key before the commit releases into a wind-down. signature is the external run's, else the run char's, else NEUTRAL_SIGNATURE. A chain of held keys keeps drive 1 on one bar grid.	0,1,2,3,4,5	6
 ks-drive-envelope	contract	KittySing::{drive,wind_start,is_armed,beat,settle,lazy_release}	drive is 0 unarmed, 1 while held, and SMOOTHSTEP_DOWN of the elapsed wind-down (from the eager stamp, the external run's end, or last + SING_REPEAT_GAP) otherwise, 0 after SING_WIND_DOWN: in [0,1] and non-increasing; settle at 0 clears the arm.	0,1,3,5	2
 ks-external-arm-admission	contract	KittySing::{arm_external,cooldown_remaining,armed_external}; ArmRefusal::fmt	arm_external refuses bars outside 1..=4, a pending arm, or a cooldown under 30 s (reporting the remaining ms) and then changes nothing; otherwise it stores the arm and stamps the cooldown.	0,1,2,3	1
-ks-external-fire	contract	KittySing::{note_green_block,note_keyed_enter,fire_external,bar,is_armed}	A green block (or keyed Enter) fires iff a pending arm of that trigger is in that session: it clears the arm and starts an external run with its signature for bars x SING_BAR_SECONDS; with no pending arm both edges are no-ops.	0,1,2,3	2
+ks-external-fire	contract	KittySing::{note_green_block,note_keyed_enter,note_program_done,fire_external,bar,is_armed}	A green block, a keyed Enter or a program's `done` fires iff a pending arm of that trigger (Green, Enter, Done) is in that session: it clears the arm and starts an external run with its signature for bars x SING_BAR_SECONDS (note_program_done answers whether it fired); with no pending arm of that trigger every edge is a no-op.	0,1,2,3	3
 ks-external-run-events	contract	KittySing::{take_bar_fan,take_outro,bar}	take_bar_fan yields bar_fan(k) once on the first frame at bar k (missed bars are not replayed); take_outro yields once at the run's end; a human hold never yields an outro.	0,1,2,4	1
 ks-external-deadline-refinement	refinement	KittySing::{next_external_deadline,take_bar_fan,take_outro,settle}	The external run refines ExternalCelebrationDeadline: no deadline without a run, now while an event is due, strictly future after it is taken, stable across unrelated queries; a consumed event never re-arms now and missed bars are skipped.	0,1,2,10	3
 ks-notes-cull-and-spawn	contract	MusicNotes::{update,is_active}	update removes notes older than NOTE_LIFE and spawns exactly one note per new half beat only while streaming; non-streaming updates over NOTE_LIFE leave the field inactive.	0,1,2,3,7	1
@@ -939,11 +946,12 @@ sound-seam-independent-of-amplitude	contract	CursorGlow::{tick,sound_seam_open,c
 licence-is-precondition	equivalence	CursorGlow::tick; licence seam; GlowConfig::ribbon_flat	For every style and fully licensed script, the frames, counters, momentum and cues equal those with the licence gate forced open; earned light survives unlicensed moves; only a key's first move takes the licence; ribbon_flat collapses the comet terms.	0,1,2,4,5	4
 word-deco-rekey-preserves-spent-guard	contract	WordDecorations::{rescan,tick}; Lexicon	A same-width redraw that moves a matched word is one episode: a spent supernova is not re-armed and the ink follows; a genuinely fresh occurrence still bursts.	0,1,2,7	1
 minibuffer-gate	contract	seam::{echo_anchor_pass,glyph_before,refused_below_the_caret,hand_types_at_the_caret,hold_the_live_presses}; custody::forget_typed_credits; probe::{observe_print_anchor_glyph,observe_caret_drawn}	On the anchored lane, with a visible caret parked off the anchor row and either a witness glyph foreign to every live press or the hand typing on the caret row, the advance is refused program-row, lays nothing and spends nothing (forgetting the presses when the row is below and the hand is elsewhere, holding them when it types at the caret); otherwise the arm does nothing, so a hidden caret is judged as no caret. Over a whole replay no cell is laid on the search status row under a foreign glyph or at the program's fake cursor.	0,1,2,3,4,5,7	10
+parked-caret-row-ownership	contract	seam::{echo_anchor_pass,spawn_judged}; custody::{clear_typed,note_return,note_motion,note_navigation}; scroll::translate_row_addressed	After a generic input boundary, its source row cannot acquire visible typed ownership once the drawn caret was observed parked away from output without hand-owned typing there, even when a torn redisplay prints a live key's glyph. Cold setup alone establishes no such boundary, and no timer admits a displaced row. Established typing and anchored echoes retain their lanes; classified navigation or shell Return clears the ambiguity, generic input starts a new source-row observation, and coordinate moves carry it.	0,1,2,3,4,5,7	5
 re-anchor-landing-gate	contract	seam::{spawn_judged,classify_move,probe_glyph_before,flush_held_park}; HeldPark::landing_cell; custody::forget_typed_credits	A typed re-anchor on the visible lane whose landing witness glyph is foreign to every live press lays nothing, restores last_licensed_row, forgets the presses and logs one program-row refusal; so a search match walked along its row carries no light.	0,1,2,3,4,5,7	2
 soft-wrap-rejects-left-rewrite	contract	custody::CursorGlow::soft_wrapped_caret	A cross-row move is a soft-wrapped caret only if the origin row left of the origin is unchanged since its last sample; a rewritten prefix (zle's entry switch) is refused and then falls under re-anchor-landing-gate.	0,1,2,3,7	1
 refused-presses-are-forgotten	invariant	custody::forget_typed_credits; seam::{echo_anchor_pass,spawn_judged}; CursorGlow::{note_typed_expected,clear_typed_keeping_hand,note_motion}	After a forgetting refusal no press banked before it ever pays for anything; later moves are licensed only by later presses or gestures, and a navigation key licenses its own hop.	0,1,2,5,7,10	1
 own-glyph-echo-lights	contract	seam::{echo_anchor_pass,spawn,sweep_born}; CursorGlow::{tick,note_typed_expected,note_return}	A one-cell anchored advance witnessed with the press's own glyph (or on the caret row, or hidden, or glyph-less) within TYPE_HINT_FRESH is licensed and lays exactly that cell, born within 100 ms; Enter takes the hand off its row.	0,1,2,3,4,5,7	2
-torn-lay-recall	contract	seam::CursorGlow::recall_torn_lay; torn_lay tracking; rainbow_kitty Event::Rewrite	A torn lay printed off its row, with the hand elsewhere and only its own cells right of the caret, is recalled once the caret has rested TORN_REST_S (a Rewrite back to the caret, the hand restored, one recall record); a key press or a caret resting right of the lay never triggers it; recalled ink is gone within about 330 ms.	0,1,2,3,5,7,10	4
+torn-lay-recall	contract	seam::CursorGlow::recall_torn_lay; torn_lay tracking; rainbow_kitty Event::Rewrite	A torn lay printed off its row, with the hand elsewhere and only its own cells right of the caret, is recalled once the caret has rested TORN_REST_S (a Rewrite back to the caret, the hand restored, one recall record); a key press or a caret resting right of the lay never triggers it; recalled ink is gone within about 330 ms.	0,1,2,3,5,7,10	2
 ```
 
 ## 2. Test → spec map (TSV)
@@ -1763,6 +1771,7 @@ src/kitty_sing.rs	a_missed_gap_recovers_with_three_reps_inside_the_glow	ks-arm-t
 src/kitty_sing.rs	a_six_key_medley_holds_the_stage_end_to_end	ks-key-switch-handover	
 src/kitty_sing.rs	an_armed_celebration_fires_on_the_next_green_block_and_only_once	ks-external-fire	
 src/kitty_sing.rs	an_unarmed_session_never_celebrates_on_a_green_block	ks-external-fire	
+src/kitty_sing.rs	an_on_done_arm_fires_on_the_session_s_next_done_and_only_once	ks-external-fire	
 src/kitty_sing.rs	backspace_never_arms_and_breaks_a_run	ks-arm-threshold	
 src/kitty_sing.rs	cold_arms_still_cost_sixteen	ks-arm-threshold	
 src/kitty_sing.rs	external_deadline_conforms_through_bars_outro_and_settle	ks-external-deadline-refinement	
@@ -3064,10 +3073,13 @@ tests/zsh_isearch_band.rs	a_wrapped_match_lays_nothing_under_zle_s_fake_cursor	m
 tests/zsh_isearch_band.rs	an_entry_switch_shaped_like_a_soft_wrap_lays_nothing_on_the_match	soft-wrap-rejects-left-rewrite	
 tests/zsh_isearch_band.rs	bash_s_reverse_search_retreat_lays_nothing_under_the_match	re-anchor-landing-gate	
 tests/zsh_isearch_band.rs	isearch_ink_retires_within_the_idle_ceiling	glow-idle-to-zero	
-tests/zsh_isearch_band.rs	one_torn_read_at_any_boundary_leaves_no_band_on_the_match_row	torn-lay-recall	
+tests/zsh_isearch_band.rs	one_torn_read_at_any_boundary_leaves_no_band_on_the_match_row	parked-caret-row-ownership
+tests/zsh_isearch_band.rs	one_torn_read_at_any_boundary_lays_no_band_on_the_match_row	parked-caret-row-ownership
+tests/zsh_isearch_band.rs	ordinary_typing_keeps_its_row_and_a_classified_boundary_restores_it	parked-caret-row-ownership
 tests/zsh_isearch_band.rs	plain_prompt_typing_lights_and_retires_on_the_normal_schedule	own-glyph-echo-lights	
 tests/zsh_isearch_band.rs	the_gates_refuse_nothing_in_claude_code_s_or_codex_s_composer	minibuffer-gate	
-tests/zsh_isearch_band.rs	torn_reads_leave_no_band_on_the_match_row	torn-lay-recall	
+tests/zsh_isearch_band.rs	torn_reads_leave_no_band_on_the_match_row	parked-caret-row-ownership
+tests/zsh_isearch_band.rs	torn_reads_lay_no_band_on_the_match_row	parked-caret-row-ownership
 tests/zsh_isearch_band.rs	typeahead_into_the_minibuffer_lays_nothing	minibuffer-gate	
 tests/zsh_isearch_band.rs	whole_reads_lay_no_band_on_the_match_row_or_under_zle_s_fake_cursor	minibuffer-gate	
 ```
@@ -3083,7 +3095,7 @@ tests/zsh_isearch_band.rs	whole_reads_lay_no_band_on_the_match_row_or_under_zle_
 
 ## 4. Tests that are not spec samples
 
-Status 2026-10-15: the 30 rows marked **deleted** below were removed from the crate (spec recovery plus a skeptic confirmed they sample no property of shipped code). The `web_binding_parity.rs` rows went with the file: the six web binding modules and the shared facade are one source each in `crates/aterm-wasm/src`, which aterm-gpu-web mounts, so the two surfaces cannot drift.
+Status 2026-10-15: the 30 rows marked **deleted** below were removed from the crate (spec recovery plus a skeptic confirmed they sample no property of shipped code). The `web_binding_parity.rs` rows went with the file: the six web binding modules and the shared facade are one source each in `crates/aterm-wasm/src`, which aterm-gpu-web mounts, so the two surfaces cannot drift. On 2026-10-17 the twinkle's photosensitivity bound, constant arithmetic, became two const assertions beside its constants, and its row went.
 
 | test | action | why |
 |---|---|---|
@@ -3100,7 +3112,6 @@ Status 2026-10-15: the 30 rows marked **deleted** below were removed from the cr
 | `src/cursor_glow/tests/tint.rs::glyph_tint_box_corner_is_stronger_than_its_endpoints` | **deleted** (was delete) | Negative control on the guard's design; samples nothing beyond glyph-tint-palette. |
 | `src/cursor_glow/tests/water.rs::water_scales_from_trickle_to_torpedo` | **move-to-bench** | Aesthetic ratio between two scripted cadences. |
 | `src/cursor_rainbow.rs::active_rim_reuses_its_warmed_scratch` | **move-to-bench** | Vec capacity property, an allocator-dependent performance budget. |
-| `src/cursor_rainbow.rs::twinkle_flash_rate_stays_under_the_photosensitivity_bound` | **delete** | Constant arithmetic; move the inequality into a const assert beside the constants. |
 | `src/cursor_trail.rs::full_u16_jump_reuses_bounded_spawn_scratch` | **move-to-bench** | Allocation-capacity property; the length bound is line-cells-tail-is-bounded-bresenham-suffix. |
 | `src/cursor_trail.rs::line_cells_includes_both_endpoints` | **deleted** (was delete) | Tests the #[cfg(test)] line_cells, which becomes the model of line-cells-tail-is-bounded-bresenham-suffix. |
 | `src/dog_baker.rs::host_ids_are_stable_distinct_and_namespaced` | **becomes-spec-after-fix** | Stability and the namespace bit are dog-baker-contract; drop the FNV distinctness point checks. |

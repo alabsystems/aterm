@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::pane_chrome::{SplitChrome, with_split_chrome};
 
 /// The four glyphs [`active_pane_edge_cell`] can put in a divider gap. No
 /// terminal in these fixtures ever prints one, so a cell carrying one is the
@@ -177,53 +178,58 @@ fn focus_pure_pane(app: &mut App, wid: WindowId, session: u64) {
 /// ring comes from the layout, so the mark lands only in the divider gaps touching that pane.
 #[test]
 fn a_pure_split_rings_the_pane_that_takes_keystrokes_and_follows_the_focus() {
-    let (mut app, wid, left, right) = pure_split();
-    let t0 = Instant::now();
+    // The Classic half-block ring (macOS, Linux); the Fluent ring is
+    // `pane_chrome`'s hairline.
+    with_split_chrome(SplitChrome::Classic, || {
+        let (mut app, wid, left, right) = pure_split();
+        let t0 = Instant::now();
 
-    assert!(compose_pure(&mut app, wid, t0));
-    let on_the_right = ring(&app, wid);
-    assert_eq!(
-        on_the_right,
-        expected_visible_ring(&app, wid, focused_pane_rect(&app, wid)),
-        "the ring hugs the focused (right) pane"
-    );
-    assert!(
-        on_the_right
-            .iter()
-            .filter(|(row, _, _)| *row >= focused_pane_rect(&app, wid).0)
-            .all(|(_, _, ch)| *ch == '▐'),
-        "a side-by-side split gives the right pane exactly one edge — the \
-         divider column on its LEFT, inked on the side facing it: {on_the_right:?}"
-    );
+        assert!(compose_pure(&mut app, wid, t0));
+        let on_the_right = ring(&app, wid);
+        assert_eq!(
+            on_the_right,
+            expected_visible_ring(&app, wid, focused_pane_rect(&app, wid)),
+            "the ring hugs the focused (right) pane"
+        );
+        assert!(
+            on_the_right
+                .iter()
+                .filter(|(row, _, _)| *row >= focused_pane_rect(&app, wid).0)
+                .all(|(_, _, ch)| *ch == '▐'),
+            "a side-by-side split gives the right pane exactly one edge — the \
+             divider column on its LEFT, inked on the side facing it: {on_the_right:?}"
+        );
 
-    focus_pure_pane(&mut app, wid, left);
-    assert!(compose_pure(&mut app, wid, t0 + Duration::from_millis(16)));
-    let on_the_left = ring(&app, wid);
-    assert_eq!(
-        on_the_left,
-        expected_visible_ring(&app, wid, focused_pane_rect(&app, wid)),
-        "the ring followed the keyboard to the left pane"
-    );
-    assert!(
-        on_the_left
-            .iter()
-            .filter(|(row, _, _)| *row >= focused_pane_rect(&app, wid).0)
-            .all(|(_, _, ch)| *ch == '▌'),
-        "…and swapped to the other side of the SAME divider column, which is \
-         the only thing that says which of two panes sharing it is live: \
-         {on_the_left:?}"
-    );
-    let cells_of =
-        |ring: &[(usize, usize, char)]| ring.iter().map(|(r, c, _)| (*r, *c)).collect::<Vec<_>>();
-    assert_eq!(
-        cells_of(&on_the_left),
-        cells_of(&on_the_right),
-        "the same cells carry both answers"
-    );
+        focus_pure_pane(&mut app, wid, left);
+        assert!(compose_pure(&mut app, wid, t0 + Duration::from_millis(16)));
+        let on_the_left = ring(&app, wid);
+        assert_eq!(
+            on_the_left,
+            expected_visible_ring(&app, wid, focused_pane_rect(&app, wid)),
+            "the ring followed the keyboard to the left pane"
+        );
+        assert!(
+            on_the_left
+                .iter()
+                .filter(|(row, _, _)| *row >= focused_pane_rect(&app, wid).0)
+                .all(|(_, _, ch)| *ch == '▌'),
+            "…and swapped to the other side of the SAME divider column, which is \
+             the only thing that says which of two panes sharing it is live: \
+             {on_the_left:?}"
+        );
+        let cells_of = |ring: &[(usize, usize, char)]| {
+            ring.iter().map(|(r, c, _)| (*r, *c)).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            cells_of(&on_the_left),
+            cells_of(&on_the_right),
+            "the same cells carry both answers"
+        );
 
-    focus_pure_pane(&mut app, wid, right);
-    assert!(compose_pure(&mut app, wid, t0 + Duration::from_millis(32)));
-    assert_eq!(ring(&app, wid), on_the_right, "and back again");
+        focus_pure_pane(&mut app, wid, right);
+        assert!(compose_pure(&mut app, wid, t0 + Duration::from_millis(32)));
+        assert_eq!(ring(&app, wid), on_the_right, "and back again");
+    });
 }
 
 /// A mixed terminal/native split marks a native leaf like a terminal one: the ring is made of
@@ -231,77 +237,81 @@ fn a_pure_split_rings_the_pane_that_takes_keystrokes_and_follows_the_focus() {
 /// are a tray blitted over the composite).
 #[test]
 fn a_mixed_split_rings_the_native_leaf_when_the_native_leaf_takes_keys() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
-    let (_, terminal_view) =
-        app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
-    app.windows.get_mut(&wid).expect("test window").focused = true;
-    let plan = app.active_visible_leaf_plan(wid).expect("a mixed plan");
-    assert_eq!(
-        plan.leaves.len(),
-        2,
-        "one native leaf and one terminal leaf"
-    );
-    let native_view = plan
-        .leaves
-        .iter()
-        .map(|leaf| leaf.view)
-        .find(|view| *view != terminal_view)
-        .expect("the settings leaf");
-    let rect_of = |app: &App, view| {
-        let leaf = app
-            .active_visible_leaf_plan(wid)
-            .expect("a mixed plan")
-            .leaves
-            .into_iter()
-            .find(|leaf| leaf.view == view)
-            .expect("the leaf is visible");
-        (
-            leaf.rect.origin.y.round().max(0.0) as usize,
-            leaf.rect.origin.x.round().max(0.0) as usize,
-            (leaf.rect.size.height.round() as usize).max(1),
-            (leaf.rect.size.width.round() as usize).max(1),
-        )
-    };
-    let focus_leaf = |app: &mut App, view| {
-        assert!(
-            app.windows
-                .get_mut(&wid)
-                .and_then(|window| window.tab_set.active_mut())
-                .is_some_and(|tab| tab.set_focus(view)),
-            "the leaf is live"
+    // The Classic half-block ring (macOS, Linux); the Fluent ring is
+    // `pane_chrome`'s hairline.
+    with_split_chrome(SplitChrome::Classic, || {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (_, terminal_view) =
+            app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        app.windows.get_mut(&wid).expect("test window").focused = true;
+        let plan = app.active_visible_leaf_plan(wid).expect("a mixed plan");
+        assert_eq!(
+            plan.leaves.len(),
+            2,
+            "one native leaf and one terminal leaf"
         );
-        app.sync_window(wid);
-    };
+        let native_view = plan
+            .leaves
+            .iter()
+            .map(|leaf| leaf.view)
+            .find(|view| *view != terminal_view)
+            .expect("the settings leaf");
+        let rect_of = |app: &App, view| {
+            let leaf = app
+                .active_visible_leaf_plan(wid)
+                .expect("a mixed plan")
+                .leaves
+                .into_iter()
+                .find(|leaf| leaf.view == view)
+                .expect("the leaf is visible");
+            (
+                leaf.rect.origin.y.round().max(0.0) as usize,
+                leaf.rect.origin.x.round().max(0.0) as usize,
+                (leaf.rect.size.height.round() as usize).max(1),
+                (leaf.rect.size.width.round() as usize).max(1),
+            )
+        };
+        let focus_leaf = |app: &mut App, view| {
+            assert!(
+                app.windows
+                    .get_mut(&wid)
+                    .and_then(|window| window.tab_set.active_mut())
+                    .is_some_and(|tab| tab.set_focus(view)),
+                "the leaf is live"
+            );
+            app.sync_window(wid);
+        };
 
-    // The split left the terminal leaf focused.
-    assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
-    let terminal_ring = ring(&app, wid);
-    assert_eq!(
-        terminal_ring,
-        expected_visible_ring(&app, wid, rect_of(&app, terminal_view)),
-        "the ring hugs the terminal leaf while the terminal leaf has the keyboard"
-    );
+        // The split left the terminal leaf focused.
+        assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
+        let terminal_ring = ring(&app, wid);
+        assert_eq!(
+            terminal_ring,
+            expected_visible_ring(&app, wid, rect_of(&app, terminal_view)),
+            "the ring hugs the terminal leaf while the terminal leaf has the keyboard"
+        );
 
-    focus_leaf(&mut app, native_view);
-    assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
-    let native_ring = ring(&app, wid);
-    assert_eq!(
-        native_ring,
-        expected_visible_ring(&app, wid, rect_of(&app, native_view)),
-        "and hugs the NATIVE leaf while the native leaf has it — the mark is \
-         the leaf's rectangle, so a leaf whose content the compositor cannot \
-         touch is marked exactly as well as one whose content it owns"
-    );
-    assert_ne!(
-        terminal_ring, native_ring,
-        "the two answers must be different, or the mark says nothing"
-    );
-    assert!(
-        !terminal_ring.is_empty(),
-        "fixture guard: a mixed split has a divider gap to mark"
-    );
+        focus_leaf(&mut app, native_view);
+        assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
+        let native_ring = ring(&app, wid);
+        assert_eq!(
+            native_ring,
+            expected_visible_ring(&app, wid, rect_of(&app, native_view)),
+            "and hugs the NATIVE leaf while the native leaf has it — the mark is \
+             the leaf's rectangle, so a leaf whose content the compositor cannot \
+             touch is marked exactly as well as one whose content it owns"
+        );
+        assert_ne!(
+            terminal_ring, native_ring,
+            "the two answers must be different, or the mark says nothing"
+        );
+        assert!(
+            !terminal_ring.is_empty(),
+            "fixture guard: a mixed split has a divider gap to mark"
+        );
+    });
 }
 
 /// An unfocused window and the setting off each silence the ring (the first compose is the
@@ -309,73 +319,81 @@ fn a_mixed_split_rings_the_native_leaf_when_the_native_leaf_takes_keys() {
 /// a pane.
 #[test]
 fn an_unfocused_window_and_the_setting_off_each_compose_a_plain_seam_grid() {
-    let t0 = Instant::now();
+    // The Classic half-block ring (macOS, Linux); the Fluent ring is
+    // `pane_chrome`'s hairline.
+    with_split_chrome(SplitChrome::Classic, || {
+        let t0 = Instant::now();
 
-    let (mut app, wid, _, _) = pure_split();
-    assert!(compose_pure(&mut app, wid, t0));
-    assert!(
-        !ring(&app, wid).is_empty(),
-        "negative control: the fixture marks a pane"
-    );
+        let (mut app, wid, _, _) = pure_split();
+        assert!(compose_pure(&mut app, wid, t0));
+        assert!(
+            !ring(&app, wid).is_empty(),
+            "negative control: the fixture marks a pane"
+        );
 
-    app.windows.get_mut(&wid).expect("test window").focused = false;
-    assert!(compose_pure(&mut app, wid, t0 + Duration::from_millis(16)));
-    assert!(
-        ring(&app, wid).is_empty(),
-        "a window without the keyboard claims no pane"
-    );
+        app.windows.get_mut(&wid).expect("test window").focused = false;
+        assert!(compose_pure(&mut app, wid, t0 + Duration::from_millis(16)));
+        assert!(
+            ring(&app, wid).is_empty(),
+            "a window without the keyboard claims no pane"
+        );
 
-    let (mut app, wid, _, _) = pure_split();
-    app.config.split_focus_mark = Some(false);
-    assert!(compose_pure(&mut app, wid, t0));
-    assert!(
-        ring(&app, wid).is_empty(),
-        "the setting off composes the plain seam grid"
-    );
+        let (mut app, wid, _, _) = pure_split();
+        app.config.split_focus_mark = Some(false);
+        assert!(compose_pure(&mut app, wid, t0));
+        assert!(
+            ring(&app, wid).is_empty(),
+            "the setting off composes the plain seam grid"
+        );
+    });
 }
 
 /// The mark lives in the divider gap, so composing with it on or off leaves every cell
 /// outside the ring byte-identical.
 #[test]
 fn the_mark_leaves_every_cell_of_every_pane_byte_identical() {
-    let t0 = Instant::now();
-    let compose = |enabled| {
-        let (mut app, wid, _, _) = pure_split();
-        app.config.split_focus_mark = Some(enabled);
-        let term = app.pool.get(0).expect("left pane").term.clone();
-        term_lock(&term).process(b"\x1b[31mLEFT\x1b[m");
-        assert!(compose_pure(&mut app, wid, t0));
-        let rect = focused_pane_rect(&app, wid);
-        let (rows, cols) = window_dims(&app, wid);
-        (
-            app.windows[&wid].input_scratch.cells.clone(),
-            rect,
-            rows,
-            cols,
-        )
-    };
-    let (marked, rect, rows, cols) = compose(true);
-    let (plain, plain_rect, ..) = compose(false);
-    assert_eq!(rect, plain_rect, "same layout either way");
+    // The Classic half-block ring (macOS, Linux); the Fluent ring is
+    // `pane_chrome`'s hairline.
+    with_split_chrome(SplitChrome::Classic, || {
+        let t0 = Instant::now();
+        let compose = |enabled| {
+            let (mut app, wid, _, _) = pure_split();
+            app.config.split_focus_mark = Some(enabled);
+            let term = app.pool.get(0).expect("left pane").term.clone();
+            term_lock(&term).process(b"\x1b[31mLEFT\x1b[m");
+            assert!(compose_pure(&mut app, wid, t0));
+            let rect = focused_pane_rect(&app, wid);
+            let (rows, cols) = window_dims(&app, wid);
+            (
+                app.windows[&wid].input_scratch.cells.clone(),
+                rect,
+                rows,
+                cols,
+            )
+        };
+        let (marked, rect, rows, cols) = compose(true);
+        let (plain, plain_rect, ..) = compose(false);
+        assert_eq!(rect, plain_rect, "same layout either way");
 
-    let ring_cells: std::collections::BTreeSet<_> = expected_ring(rows, cols, rect)
-        .into_iter()
-        .map(|(r, c, _)| (r, c))
-        .collect();
-    assert!(!ring_cells.is_empty(), "fixture guard: there is a ring");
-    for r in 0..rows {
-        for c in 0..cols {
-            if ring_cells.contains(&(r, c)) {
-                assert_ne!(
-                    marked[r][c], plain[r][c],
-                    "({r}, {c}) is the ring and must differ"
-                );
-            } else {
-                assert_eq!(
-                    marked[r][c], plain[r][c],
-                    "({r}, {c}) is not the ring and must not have moved"
-                );
+        let ring_cells: std::collections::BTreeSet<_> = expected_ring(rows, cols, rect)
+            .into_iter()
+            .map(|(r, c, _)| (r, c))
+            .collect();
+        assert!(!ring_cells.is_empty(), "fixture guard: there is a ring");
+        for r in 0..rows {
+            for c in 0..cols {
+                if ring_cells.contains(&(r, c)) {
+                    assert_ne!(
+                        marked[r][c], plain[r][c],
+                        "({r}, {c}) is the ring and must differ"
+                    );
+                } else {
+                    assert_eq!(
+                        marked[r][c], plain[r][c],
+                        "({r}, {c}) is not the ring and must not have moved"
+                    );
+                }
             }
         }
-    }
+    });
 }

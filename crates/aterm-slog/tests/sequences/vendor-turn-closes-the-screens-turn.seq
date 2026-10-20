@@ -1,0 +1,12 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# S2: the vendor turn's end closes the open turn when no screen step holds
+# it (the model's TxClose), then amends its duration and tokens.
+see busy
+vendor-turn
+expect mark r1 source field=transcript state=on skipped=0 by=aterm
+expect amend t1 turn vref=v1 by=vendor src=transcript conf=exact
+expect open t1 turn
+expect close t1 turn out=done by=vendor src=transcript conf=exact
+expect amend t1 turn vdur_ms=900 tok_in=40 tok_out=12
+see idle
+wait 1000

@@ -202,8 +202,7 @@ impl Terminal {
                 .chain(std::iter::repeat_with(|| None))
                 .take(count);
             index.index_numbered_cells_owned(lines.enumerate().map(|(j, line)| {
-                let (text, cells) =
-                    history_row_for_search(&self.grid, start_hist.saturating_add(j), line);
+                let (text, cells) = history_row_for_search(&self.grid, line);
                 (refresh_start.saturating_add(j), text, cells)
             }));
         }
@@ -237,7 +236,7 @@ impl Terminal {
             .chain(std::iter::repeat_with(|| None))
             .take(scrollback);
         search.index_numbered_cells_owned(history.enumerate().map(|(i, line)| {
-            let (text, cells) = history_row_for_search(grid, i, line);
+            let (text, cells) = history_row_for_search(grid, line);
             (hist_base.saturating_add(i), text, cells)
         }));
 
@@ -298,7 +297,7 @@ pub(crate) mod tests {
                     .get_history_line(i)
                     .map(|l| {
                         let text = l.to_string();
-                        let cells = super::super::history_line_text_cells(grid, i, &l, &text);
+                        let cells = super::super::history_line_text_cells(grid, &l, &text);
                         (text, cells)
                     })
                     .unwrap_or_default();

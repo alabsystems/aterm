@@ -3,14 +3,14 @@
 
 //! Windows: chain building and SSL policy verification over `crypt32`.
 //!
-//! # NOT EXECUTED ANYWHERE YET — read this before trusting it
+//! # Measured against the fixture corpus, on one Windows host
 //!
-//! Every claim in this file comes from binding and header inspection plus a
-//! cross-target `cargo check`, done on macOS. **No Windows behaviour has been
-//! observed.** [`super::tests`] does not reach this arm. Treat this as
-//! reviewed-and-compiled, not as verified: the accept/reject matrix that the
-//! Apple arm has been driven through has no counterpart here until someone runs
-//! it on Windows.
+//! The claims below came from binding and header inspection plus a cross-target
+//! `cargo check` on macOS. Since 2026-10-17 [`super::tests`]' corpus also runs on
+//! Windows (11, build 26200) and records this arm's verdicts in its `windows`
+//! column; that first run found crypt32 accepting a leaf with no subjectAltName on
+//! its CN, now refused in [`Verifier::verify`]. Revocation and network fetching
+//! below are still unmeasured.
 //!
 //! # The two traps this code is written around
 //!
@@ -318,7 +318,7 @@ impl Verifier {
         &self,
         end_entity: &CertificateDer<'_>,
         intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
+        server_name: &ServerName<'_>,
         server_text: &str,
         ocsp_response: Option<&[u8]>,
         now: UnixTime,
@@ -428,9 +428,17 @@ impl Verifier {
                 "CertVerifyCertificateChainPolicy could not evaluate the chain",
             ));
         }
-        // THE VERDICT. Acceptance requires an explicit zero.
+        // THE VERDICT. Acceptance requires an explicit zero — and a subjectAltName
+        // that names the server. crypt32's SSL policy still falls back to the subject
+        // CN for a leaf with NO subjectAltName (measured on Windows 11: `nosan.der`
+        // accepted for its CN), which RFC 9525 retired and the Apple and Unix arms
+        // both refuse. So an accepted chain's name is checked again the way the Unix
+        // arm checks it, by webpki over the SAN alone. That parses nothing new: the
+        // handshake's own signature check (`verify_tls13_signature`) parses this
+        // leaf with webpki already.
         if status.dwError == 0 {
-            return Ok(());
+            let leaf = rustls::server::ParsedCertificate::try_from(end_entity)?;
+            return rustls::client::verify_server_name(&leaf, server_name);
         }
 
         Err(match status.dwError as i32 {

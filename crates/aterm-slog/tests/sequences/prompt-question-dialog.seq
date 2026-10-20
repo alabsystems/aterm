@@ -1,0 +1,19 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# §2.4: prompt (question) is the AskUserQuestion dialog: a question step
+# inside the turn, need question; it never ends the turn.
+see busy
+see prompt question fixture=claude-2.1.281-ask-one
+expect open p1 question par=t1 src=screen
+expect need=question
+half
+half
+half
+expect turn=open
+see busy
+expect close p1 question out=passed dur_ms=1500
+expect need=none
+see idle
+half
+half
+expect open t1 turn
+expect close t1 turn out=done steps=1 qs=1 at=1500

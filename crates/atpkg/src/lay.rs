@@ -71,7 +71,7 @@ pub(crate) static PUBLICATION_TURN: std::sync::Mutex<()> = std::sync::Mutex::new
 
 /// The one writer: takes [`PUBLICATION_TURN`], then lays with the caller's flush `sync`.
 fn write_with(file: &Executable, sync: fn(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     if matches!(
         PUBLICATION_TURN.try_lock(),
         Err(std::sync::TryLockError::WouldBlock)

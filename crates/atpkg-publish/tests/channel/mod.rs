@@ -8,7 +8,6 @@
 //! Every host is a [`FakeHost`] (or a wrapper adding one failure mode), every key is
 //! minted in-process by the shipping signer, and every "verified" is the client's chain.
 
-mod candidate;
 mod conformance_index_publish;
 mod gh;
 mod group;
@@ -308,14 +307,46 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// A fresh repository at `dir` with `commits` commits of one file; its HEAD.
+/// A fresh repository at `dir` with `commits` commits of one file, checked out; its
+/// HEAD. The history is one `git fast-import` stream, not a commit per process.
 pub fn repo(dir: &Path, commits: usize) -> String {
+    use std::io::Write as _;
     std::fs::create_dir_all(dir).expect("mkdir repo");
     git(dir, &["init", "-q", "-b", "main"]);
-    for i in 0..commits {
-        std::fs::write(dir.join("f"), format!("{i}\n")).expect("write");
-        git(dir, &["add", "f"]);
-        git(dir, &["commit", "-q", "-m", &format!("c{i}")]);
+    if commits == 0 {
+        return git(dir, &["rev-parse", "HEAD"]);
     }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock past the epoch")
+        .as_secs();
+    let mut stream = String::new();
+    for i in 0..commits {
+        let (msg, body) = (format!("c{i}"), format!("{i}\n"));
+        stream.push_str(&format!(
+            "commit refs/heads/main\nmark :{}\ncommitter fixture <fixture@example.invalid> {now} +0000\ndata {}\n{msg}\n",
+            i + 1,
+            msg.len()
+        ));
+        if i > 0 {
+            stream.push_str(&format!("from :{i}\n"));
+        }
+        stream.push_str(&format!("M 100644 inline f\ndata {}\n{body}\n", body.len()));
+    }
+    let mut child = aterm_uds::spawnfd::command("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["fast-import", "--quiet"])
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .spawn()
+        .expect("spawn git fast-import");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(stream.as_bytes())
+        .expect("feed fast-import");
+    assert!(child.wait().expect("wait fast-import").success());
+    git(dir, &["reset", "-q", "--hard", "main"]);
     git(dir, &["rev-parse", "HEAD"])
 }

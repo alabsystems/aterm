@@ -205,48 +205,295 @@ pub struct LogIdentity {
     pub generation: u64,
 }
 
+const fn decode_lower_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0' => Some(0),
+        b'1' => Some(1),
+        b'2' => Some(2),
+        b'3' => Some(3),
+        b'4' => Some(4),
+        b'5' => Some(5),
+        b'6' => Some(6),
+        b'7' => Some(7),
+        b'8' => Some(8),
+        b'9' => Some(9),
+        b'a' => Some(10),
+        b'b' => Some(11),
+        b'c' => Some(12),
+        b'd' => Some(13),
+        b'e' => Some(14),
+        b'f' => Some(15),
+        _ => None,
+    }
+}
+
+const fn decode_lower_hex_byte(hi: u8, lo: u8) -> Option<u8> {
+    let Some(h) = decode_lower_nibble(hi) else {
+        return None;
+    };
+    let Some(l) = decode_lower_nibble(lo) else {
+        return None;
+    };
+    Some(((h & 0x0f) << 4) | (l & 0x0f))
+}
+
+const fn decode_id_hex(bytes: &[u8; 32]) -> Option<[u8; 16]> {
+    let Some(b0) = decode_lower_hex_byte(bytes[0], bytes[1]) else {
+        return None;
+    };
+    let Some(b1) = decode_lower_hex_byte(bytes[2], bytes[3]) else {
+        return None;
+    };
+    let Some(b2) = decode_lower_hex_byte(bytes[4], bytes[5]) else {
+        return None;
+    };
+    let Some(b3) = decode_lower_hex_byte(bytes[6], bytes[7]) else {
+        return None;
+    };
+    let Some(b4) = decode_lower_hex_byte(bytes[8], bytes[9]) else {
+        return None;
+    };
+    let Some(b5) = decode_lower_hex_byte(bytes[10], bytes[11]) else {
+        return None;
+    };
+    let Some(b6) = decode_lower_hex_byte(bytes[12], bytes[13]) else {
+        return None;
+    };
+    let Some(b7) = decode_lower_hex_byte(bytes[14], bytes[15]) else {
+        return None;
+    };
+    let Some(b8) = decode_lower_hex_byte(bytes[16], bytes[17]) else {
+        return None;
+    };
+    let Some(b9) = decode_lower_hex_byte(bytes[18], bytes[19]) else {
+        return None;
+    };
+    let Some(b10) = decode_lower_hex_byte(bytes[20], bytes[21]) else {
+        return None;
+    };
+    let Some(b11) = decode_lower_hex_byte(bytes[22], bytes[23]) else {
+        return None;
+    };
+    let Some(b12) = decode_lower_hex_byte(bytes[24], bytes[25]) else {
+        return None;
+    };
+    let Some(b13) = decode_lower_hex_byte(bytes[26], bytes[27]) else {
+        return None;
+    };
+    let Some(b14) = decode_lower_hex_byte(bytes[28], bytes[29]) else {
+        return None;
+    };
+    let Some(b15) = decode_lower_hex_byte(bytes[30], bytes[31]) else {
+        return None;
+    };
+    Some([
+        b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15,
+    ])
+}
+
+const fn decode_decimal_digit(b: u8) -> Option<u64> {
+    if b >= b'0' && b <= b'9' {
+        Some((b - b'0') as u64)
+    } else {
+        None
+    }
+}
+
+const fn parse_u64_ascii_bytes(bytes: &[u8]) -> Option<u64> {
+    let mut rest = bytes;
+    if rest.is_empty() {
+        return None;
+    }
+    let mut acc = 0u64;
+    while let &[b, ref tail @ ..] = rest {
+        let Some(d) = decode_decimal_digit(b) else {
+            return None;
+        };
+        let Some(mul) = acc.checked_mul(10) else {
+            return None;
+        };
+        let Some(next) = mul.checked_add(d) else {
+            return None;
+        };
+        acc = next;
+        rest = tail;
+    }
+    Some(acc)
+}
+
+const fn encode_u64_le_bytes(v: u64) -> [u8; 8] {
+    [
+        v as u8,
+        (v >> 8) as u8,
+        (v >> 16) as u8,
+        (v >> 24) as u8,
+        (v >> 32) as u8,
+        (v >> 40) as u8,
+        (v >> 48) as u8,
+        (v >> 56) as u8,
+    ]
+}
+
+const fn decode_u64_le_bytes(b: &[u8; 8]) -> u64 {
+    (b[0] as u64)
+        | ((b[1] as u64) << 8)
+        | ((b[2] as u64) << 16)
+        | ((b[3] as u64) << 24)
+        | ((b[4] as u64) << 32)
+        | ((b[5] as u64) << 40)
+        | ((b[6] as u64) << 48)
+        | ((b[7] as u64) << 56)
+}
+
+const fn encode_u128_le_bytes(v: u128) -> [u8; 16] {
+    [
+        v as u8,
+        (v >> 8) as u8,
+        (v >> 16) as u8,
+        (v >> 24) as u8,
+        (v >> 32) as u8,
+        (v >> 40) as u8,
+        (v >> 48) as u8,
+        (v >> 56) as u8,
+        (v >> 64) as u8,
+        (v >> 72) as u8,
+        (v >> 80) as u8,
+        (v >> 88) as u8,
+        (v >> 96) as u8,
+        (v >> 104) as u8,
+        (v >> 112) as u8,
+        (v >> 120) as u8,
+    ]
+}
+
+const fn encode_lineage_step(g: u64, c: u64) -> [u8; 16] {
+    [
+        g as u8,
+        (g >> 8) as u8,
+        (g >> 16) as u8,
+        (g >> 24) as u8,
+        (g >> 32) as u8,
+        (g >> 40) as u8,
+        (g >> 48) as u8,
+        (g >> 56) as u8,
+        c as u8,
+        (c >> 8) as u8,
+        (c >> 16) as u8,
+        (c >> 24) as u8,
+        (c >> 32) as u8,
+        (c >> 40) as u8,
+        (c >> 48) as u8,
+        (c >> 56) as u8,
+    ]
+}
+
+const fn decode_lineage_step(s: &[u8; 16]) -> (u64, u64) {
+    let g = (s[0] as u64)
+        | ((s[1] as u64) << 8)
+        | ((s[2] as u64) << 16)
+        | ((s[3] as u64) << 24)
+        | ((s[4] as u64) << 32)
+        | ((s[5] as u64) << 40)
+        | ((s[6] as u64) << 48)
+        | ((s[7] as u64) << 56);
+    let c = (s[8] as u64)
+        | ((s[9] as u64) << 8)
+        | ((s[10] as u64) << 16)
+        | ((s[11] as u64) << 24)
+        | ((s[12] as u64) << 32)
+        | ((s[13] as u64) << 40)
+        | ((s[14] as u64) << 48)
+        | ((s[15] as u64) << 56);
+    (g, c)
+}
+
 impl LogIdentity {
     /// Bytes the identity takes on the wire: the `id`, then the generation as a
     /// little-endian `u64`.
     pub const WIRE_LEN: usize = 24;
 
+    const fn to_wire(self) -> [u8; Self::WIRE_LEN] {
+        let g = self.generation;
+        [
+            self.id[0],
+            self.id[1],
+            self.id[2],
+            self.id[3],
+            self.id[4],
+            self.id[5],
+            self.id[6],
+            self.id[7],
+            self.id[8],
+            self.id[9],
+            self.id[10],
+            self.id[11],
+            self.id[12],
+            self.id[13],
+            self.id[14],
+            self.id[15],
+            g as u8,
+            (g >> 8) as u8,
+            (g >> 16) as u8,
+            (g >> 24) as u8,
+            (g >> 32) as u8,
+            (g >> 40) as u8,
+            (g >> 48) as u8,
+            (g >> 56) as u8,
+        ]
+    }
+
+    const fn decode_wire(b: &[u8; Self::WIRE_LEN]) -> LogIdentity {
+        let id = [
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13],
+            b[14], b[15],
+        ];
+        let generation = (b[16] as u64)
+            | ((b[17] as u64) << 8)
+            | ((b[18] as u64) << 16)
+            | ((b[19] as u64) << 24)
+            | ((b[20] as u64) << 32)
+            | ((b[21] as u64) << 40)
+            | ((b[22] as u64) << 48)
+            | ((b[23] as u64) << 56);
+        LogIdentity { id, generation }
+    }
+
     /// Append the wire form to `out`.
     pub(crate) fn put(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.id);
-        out.extend_from_slice(&self.generation.to_le_bytes());
+        out.extend_from_slice(&self.to_wire());
     }
 
     /// Read the wire form from the first [`WIRE_LEN`](Self::WIRE_LEN) bytes of `b`.
-    pub(crate) fn from_wire(b: &[u8]) -> Option<LogIdentity> {
-        let id: [u8; 16] = b.get(..16)?.try_into().ok()?;
-        let generation = u64::from_le_bytes(b.get(16..Self::WIRE_LEN)?.try_into().ok()?);
-        Some(LogIdentity { id, generation })
+    pub(crate) const fn from_wire(b: &[u8]) -> Option<LogIdentity> {
+        let &[b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19, b20, b21, b22, b23, ref _rest @ ..] =
+            b
+        else {
+            return None;
+        };
+        Some(Self::decode_wire(&[
+            b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18,
+            b19, b20, b21, b22, b23,
+        ]))
     }
 
     /// Parse the [`Display`](fmt::Display) form, `<32 lowercase hex>.<generation>`.
     /// Exactly that form: anything else (upper case, a sign, a missing part) is `None`.
-    pub fn parse(s: &str) -> Option<LogIdentity> {
-        let (hex, generation) = s.split_once('.')?;
-        let digits = |s: &str, ok: fn(&u8) -> bool| !s.is_empty() && s.bytes().all(|b| ok(&b));
-        if hex.len() != 32
-            || !digits(hex, |b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
-            || !digits(generation, u8::is_ascii_digit)
-        {
+    pub const fn parse(s: &str) -> Option<LogIdentity> {
+        let &[h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17, h18, h19, h20, h21, h22, h23, h24, h25, h26, h27, h28, h29, h30, h31, b'.', ref gen_bytes @ ..] =
+            s.as_bytes()
+        else {
             return None;
-        }
-        let (pairs, rem) = hex.as_bytes().as_chunks::<2>();
-        if pairs.len() != 16 || !rem.is_empty() {
+        };
+        let Some(id) = decode_id_hex(&[
+            h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17, h18,
+            h19, h20, h21, h22, h23, h24, h25, h26, h27, h28, h29, h30, h31,
+        ]) else {
             return None;
-        }
-        let mut id = [0u8; 16];
-        for (byte, pair) in id.iter_mut().zip(pairs.iter()) {
-            let pair_str = std::str::from_utf8(pair).ok()?;
-            *byte = u8::from_str_radix(pair_str, 16).ok()?;
-        }
-        Some(LogIdentity {
-            id,
-            generation: generation.parse().ok()?,
-        })
+        };
+        let Some(generation) = parse_u64_ascii_bytes(gen_bytes) else {
+            return None;
+        };
+        Some(LogIdentity { id, generation })
     }
 }
 
@@ -289,50 +536,66 @@ impl Lineage {
     /// generation at most as far as it agrees with the newest — and only the newest
     /// [`MAX`](Self::MAX) are kept.
     pub(crate) fn step(&self, generation: u64, common: u64) -> Lineage {
-        let mut steps: Vec<(u64, u64)> = self
-            .steps
-            .iter()
-            .map(|&(g, c)| (g, c.min(common)))
-            .collect();
+        let keep_old = Self::MAX.saturating_sub(1);
+        let skip = self.steps.len().saturating_sub(keep_old);
+        let mut steps = Vec::new();
+        if let Some(tail) = self.steps.get(skip..) {
+            for &(g, c) in tail {
+                steps.push((g, c.min(common)));
+            }
+        }
         steps.push((generation, common));
-        let excess = steps.len().saturating_sub(Self::MAX);
-        steps.drain(..excess);
         Lineage { steps }
     }
 
     /// Append the wire form: `n u8`, then `n × (generation u64 LE, common u64 LE)`.
     pub(crate) fn put(&self, out: &mut Vec<u8>) {
         out.push(self.steps.len() as u8);
-        for (g, c) in &self.steps {
-            out.extend_from_slice(&g.to_le_bytes());
-            out.extend_from_slice(&c.to_le_bytes());
+        for &(g, c) in &self.steps {
+            out.extend_from_slice(&encode_lineage_step(g, c));
         }
     }
 
     /// Read the wire form, which must fill `b` exactly; `None` for a short or long
     /// body, more than [`MAX`](Self::MAX) steps, or generations that do not rise.
     pub(crate) fn from_wire(b: &[u8]) -> Option<Lineage> {
-        let (&n, rest) = b.split_first()?;
-        let n = usize::from(n);
-        if n > Self::MAX || rest.len() != n * 16 {
-            return None;
-        }
+        let rest = validate_lineage_wire(b)?;
         let (chunks, _) = rest.as_chunks::<16>();
-        let steps: Vec<(u64, u64)> = chunks
-            .iter()
-            .map(|s| {
-                let (g, c) = s.split_at(8);
-                Some((
-                    u64::from_le_bytes(g.try_into().ok()?),
-                    u64::from_le_bytes(c.try_into().ok()?),
-                ))
-            })
-            .collect::<Option<_>>()?;
-        steps
-            .windows(2)
-            .all(|w| w.first().zip(w.get(1)).is_some_and(|(a, b)| a.0 < b.0))
-            .then_some(Lineage { steps })
+        let mut steps = Vec::new();
+        for chunk in chunks {
+            steps.push(decode_lineage_step(chunk));
+        }
+        Some(Lineage { steps })
     }
+}
+
+const fn lineage_generations_strictly_increasing(mut rest: &[u8]) -> bool {
+    let mut prev_gen: Option<u64> = None;
+    while let &[b0, b1, b2, b3, b4, b5, b6, b7, _, _, _, _, _, _, _, _, ref tail @ ..] = rest {
+        let g = decode_u64_le_bytes(&[b0, b1, b2, b3, b4, b5, b6, b7]);
+        if let Some(pg) = prev_gen {
+            if g <= pg {
+                return false;
+            }
+        }
+        prev_gen = Some(g);
+        rest = tail;
+    }
+    rest.is_empty()
+}
+
+const fn validate_lineage_wire(b: &[u8]) -> Option<&[u8]> {
+    let &[n, ref rest @ ..] = b else {
+        return None;
+    };
+    let n = n as usize;
+    if n > Lineage::MAX || rest.len() != n * 16 {
+        return None;
+    }
+    if !lineage_generations_strictly_increasing(rest) {
+        return None;
+    }
+    Some(rest)
 }
 
 impl LogIdentity {
@@ -352,7 +615,14 @@ impl LogIdentity {
         }
         let mut agree = u64::MAX;
         for generation in earlier.generation.checked_add(1)?..=self.generation {
-            let &(_, common) = lineage.steps.iter().find(|(g, _)| *g == generation)?;
+            let mut found = None;
+            for &(g, c) in &lineage.steps {
+                if g == generation {
+                    found = Some(c);
+                    break;
+                }
+            }
+            let common = found?;
             agree = agree.min(common);
         }
         Some(agree)
@@ -384,7 +654,7 @@ pub(crate) enum State {
 }
 
 impl State {
-    fn code(self) -> u8 {
+    const fn code(self) -> u8 {
         match self {
             State::Closed => 0,
             State::Open => 1,
@@ -392,17 +662,6 @@ impl State {
             State::Cutting { unclean: false } => 3,
             State::Cutting { unclean: true } => 4,
         }
-    }
-
-    fn from_code(b: u8) -> Option<State> {
-        Some(match b {
-            0 => State::Closed,
-            1 => State::Open,
-            2 => State::Lossy,
-            3 => State::Cutting { unclean: false },
-            4 => State::Cutting { unclean: true },
-            _ => return None,
-        })
     }
 }
 
@@ -464,55 +723,249 @@ const MAGIC: &[u8; 4] = b"ASID";
 const FORMAT: u8 = 2;
 /// FORMAT 1's body: magic, format, identity, base, head, newest.
 const BODY_LEN_1: usize = 4 + 1 + LogIdentity::WIRE_LEN + 8 + 8 + 16;
+/// FORMAT 2's fixed extension before the lineage count: state, served, boot, volume, floor.
+const BODY_V2_EXT_LEN: usize = 1 + 1 + 16 + 1 + 8;
+/// FORMAT 2's fixed prefix before lineage steps: BODY_LEN_1 + BODY_V2_EXT_LEN.
+const BODY_V2_FIXED_LEN: usize = BODY_LEN_1 + BODY_V2_EXT_LEN;
 /// FORMAT 2's fixed part: FORMAT 1's, then state, served, boot, volume, floor and the
 /// lineage count.
-const BODY_LEN_2: usize = BODY_LEN_1 + 1 + 1 + 16 + 1 + 8 + 1;
+const BODY_LEN_2: usize = BODY_V2_FIXED_LEN + 1;
+
+const fn encode_sidecar_fixed(sidecar: &Sidecar, floor: u64) -> [u8; BODY_V2_FIXED_LEN] {
+    let g = sidecar.identity.generation;
+    let b = sidecar.base;
+    let h = sidecar.head;
+    let f = floor;
+    let state_code = sidecar.state.code();
+    let vol_byte = (!sidecar.boot_volume) as u8;
+    [
+        MAGIC[0],
+        MAGIC[1],
+        MAGIC[2],
+        MAGIC[3],
+        FORMAT,
+        sidecar.identity.id[0],
+        sidecar.identity.id[1],
+        sidecar.identity.id[2],
+        sidecar.identity.id[3],
+        sidecar.identity.id[4],
+        sidecar.identity.id[5],
+        sidecar.identity.id[6],
+        sidecar.identity.id[7],
+        sidecar.identity.id[8],
+        sidecar.identity.id[9],
+        sidecar.identity.id[10],
+        sidecar.identity.id[11],
+        sidecar.identity.id[12],
+        sidecar.identity.id[13],
+        sidecar.identity.id[14],
+        sidecar.identity.id[15],
+        g as u8,
+        (g >> 8) as u8,
+        (g >> 16) as u8,
+        (g >> 24) as u8,
+        (g >> 32) as u8,
+        (g >> 40) as u8,
+        (g >> 48) as u8,
+        (g >> 56) as u8,
+        b as u8,
+        (b >> 8) as u8,
+        (b >> 16) as u8,
+        (b >> 24) as u8,
+        (b >> 32) as u8,
+        (b >> 40) as u8,
+        (b >> 48) as u8,
+        (b >> 56) as u8,
+        h as u8,
+        (h >> 8) as u8,
+        (h >> 16) as u8,
+        (h >> 24) as u8,
+        (h >> 32) as u8,
+        (h >> 40) as u8,
+        (h >> 48) as u8,
+        (h >> 56) as u8,
+        sidecar.newest[0],
+        sidecar.newest[1],
+        sidecar.newest[2],
+        sidecar.newest[3],
+        sidecar.newest[4],
+        sidecar.newest[5],
+        sidecar.newest[6],
+        sidecar.newest[7],
+        sidecar.newest[8],
+        sidecar.newest[9],
+        sidecar.newest[10],
+        sidecar.newest[11],
+        sidecar.newest[12],
+        sidecar.newest[13],
+        sidecar.newest[14],
+        sidecar.newest[15],
+        state_code,
+        sidecar.served,
+        sidecar.boot[0],
+        sidecar.boot[1],
+        sidecar.boot[2],
+        sidecar.boot[3],
+        sidecar.boot[4],
+        sidecar.boot[5],
+        sidecar.boot[6],
+        sidecar.boot[7],
+        sidecar.boot[8],
+        sidecar.boot[9],
+        sidecar.boot[10],
+        sidecar.boot[11],
+        sidecar.boot[12],
+        sidecar.boot[13],
+        sidecar.boot[14],
+        sidecar.boot[15],
+        vol_byte,
+        f as u8,
+        (f >> 8) as u8,
+        (f >> 16) as u8,
+        (f >> 24) as u8,
+        (f >> 32) as u8,
+        (f >> 40) as u8,
+        (f >> 48) as u8,
+        (f >> 56) as u8,
+    ]
+}
+
+type SidecarV1Fields = (u8, LogIdentity, u64, u64, [u8; 16]);
+type SidecarV2ExtFields = (State, u8, [u8; 16], bool, u64);
+
+const fn decode_sidecar_v1(raw: &[u8; BODY_LEN_1]) -> Option<SidecarV1Fields> {
+    let format = raw[4];
+    let id = [
+        raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14],
+        raw[15], raw[16], raw[17], raw[18], raw[19], raw[20],
+    ];
+    let generation = (raw[21] as u64)
+        | ((raw[22] as u64) << 8)
+        | ((raw[23] as u64) << 16)
+        | ((raw[24] as u64) << 24)
+        | ((raw[25] as u64) << 32)
+        | ((raw[26] as u64) << 40)
+        | ((raw[27] as u64) << 48)
+        | ((raw[28] as u64) << 56);
+    let identity = LogIdentity { id, generation };
+    let base = (raw[29] as u64)
+        | ((raw[30] as u64) << 8)
+        | ((raw[31] as u64) << 16)
+        | ((raw[32] as u64) << 24)
+        | ((raw[33] as u64) << 32)
+        | ((raw[34] as u64) << 40)
+        | ((raw[35] as u64) << 48)
+        | ((raw[36] as u64) << 56);
+    let head = (raw[37] as u64)
+        | ((raw[38] as u64) << 8)
+        | ((raw[39] as u64) << 16)
+        | ((raw[40] as u64) << 24)
+        | ((raw[41] as u64) << 32)
+        | ((raw[42] as u64) << 40)
+        | ((raw[43] as u64) << 48)
+        | ((raw[44] as u64) << 56);
+    let newest = [
+        raw[45], raw[46], raw[47], raw[48], raw[49], raw[50], raw[51], raw[52], raw[53], raw[54],
+        raw[55], raw[56], raw[57], raw[58], raw[59], raw[60],
+    ];
+    if raw[0] != MAGIC[0] || raw[1] != MAGIC[1] || raw[2] != MAGIC[2] || raw[3] != MAGIC[3] {
+        return None;
+    }
+    Some((format, identity, base, head, newest))
+}
+
+const fn split_sidecar_v1(raw: &[u8]) -> Option<(SidecarV1Fields, &[u8])> {
+    let &[r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16, r17, r18, r19, r20, r21, r22, r23, r24, r25, r26, r27, r28, r29, r30, r31, r32, r33, r34, r35, r36, r37, r38, r39, r40, r41, r42, r43, r44, r45, r46, r47, r48, r49, r50, r51, r52, r53, r54, r55, r56, r57, r58, r59, r60, ref rest @ ..] =
+        raw
+    else {
+        return None;
+    };
+    let Some(fields) = decode_sidecar_v1(&[
+        r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16, r17, r18, r19,
+        r20, r21, r22, r23, r24, r25, r26, r27, r28, r29, r30, r31, r32, r33, r34, r35, r36, r37,
+        r38, r39, r40, r41, r42, r43, r44, r45, r46, r47, r48, r49, r50, r51, r52, r53, r54, r55,
+        r56, r57, r58, r59, r60,
+    ]) else {
+        return None;
+    };
+    Some((fields, rest))
+}
+
+const fn decode_sidecar_v2_ext(raw: &[u8; BODY_V2_EXT_LEN]) -> Option<SidecarV2ExtFields> {
+    let served = raw[1];
+    let boot = [
+        raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11], raw[12],
+        raw[13], raw[14], raw[15], raw[16], raw[17],
+    ];
+    let floor = (raw[19] as u64)
+        | ((raw[20] as u64) << 8)
+        | ((raw[21] as u64) << 16)
+        | ((raw[22] as u64) << 24)
+        | ((raw[23] as u64) << 32)
+        | ((raw[24] as u64) << 40)
+        | ((raw[25] as u64) << 48)
+        | ((raw[26] as u64) << 56);
+    let state = match raw[0] {
+        0 => State::Closed,
+        1 => State::Open,
+        2 => State::Lossy,
+        3 => State::Cutting { unclean: false },
+        4 => State::Cutting { unclean: true },
+        _ => return None,
+    };
+    let boot_volume = match raw[18] {
+        0 => true,
+        1 => false,
+        _ => return None,
+    };
+    Some((state, served, boot, boot_volume, floor))
+}
+
+const fn split_sidecar_v2_ext(raw: &[u8]) -> Option<(SidecarV2ExtFields, &[u8])> {
+    let &[r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16, r17, r18, r19, r20, r21, r22, r23, r24, r25, r26, ref lineage_wire @ ..] =
+        raw
+    else {
+        return None;
+    };
+    let Some(fields) = decode_sidecar_v2_ext(&[
+        r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16, r17, r18, r19,
+        r20, r21, r22, r23, r24, r25, r26,
+    ]) else {
+        return None;
+    };
+    Some((fields, lineage_wire))
+}
 
 /// The identity sidecar's path for a log at `path`: `<log>.id`.
 pub(crate) fn sidecar_path(path: &Path) -> PathBuf {
-    let mut s = path.as_os_str().to_os_string();
-    s.push(".id");
-    PathBuf::from(s)
+    let mut p = path.to_path_buf();
+    p.as_mut_os_string().push(".id");
+    p
 }
 
 impl Sidecar {
     fn encode(&self) -> Vec<u8> {
-        let mut p = Vec::new();
-        p.extend_from_slice(MAGIC);
-        p.push(FORMAT);
-        self.identity.put(&mut p);
-        p.extend_from_slice(&self.base.to_le_bytes());
-        p.extend_from_slice(&self.head.to_le_bytes());
-        p.extend_from_slice(&self.newest);
-        p.push(self.state.code());
-        p.push(self.served);
-        p.extend_from_slice(&self.boot);
-        p.push(u8::from(!self.boot_volume));
-        p.extend_from_slice(&self.floor.unwrap_or(self.head).to_le_bytes());
+        let mut p = Vec::with_capacity(BODY_LEN_2);
+        let fixed = encode_sidecar_fixed(self, self.floor.unwrap_or(self.head));
+        p.extend_from_slice(&fixed);
         self.lineage.put(&mut p);
         p
     }
 
     fn decode(bytes: &[u8]) -> Option<Sidecar> {
-        let d = Frame::decode(bytes).ok()??;
+        let Ok(Some(d)) = Frame::decode(bytes) else {
+            return None;
+        };
         let p = d.frame.payload;
-        if d.consumed != bytes.len() || p.len() < BODY_LEN_1 || p.get(..4) != Some(MAGIC.as_slice())
-        {
+        if d.consumed != bytes.len() {
             return None;
         }
-        let at = 5 + LogIdentity::WIRE_LEN;
-        let u64_at = |i: usize| {
-            p.get(i..i.checked_add(8)?)?
-                .try_into()
-                .ok()
-                .map(u64::from_le_bytes)
-        };
-        let format = *p.get(4)?;
+        let ((format, identity, base, head, newest), rest) = split_sidecar_v1(&p)?;
         let mut sidecar = Sidecar {
-            identity: LogIdentity::from_wire(p.get(5..at)?)?,
-            base: u64_at(at)?,
-            head: u64_at(at + 8)?,
-            newest: p.get(at + 16..BODY_LEN_1)?.try_into().ok()?,
+            identity,
+            base,
+            head,
+            newest,
             format,
             state: State::Closed,
             served: SERVED_STRICT,
@@ -522,18 +975,16 @@ impl Sidecar {
             lineage: Lineage::default(),
         };
         match format {
-            1 if p.len() == BODY_LEN_1 => {}
-            2 if p.len() >= BODY_LEN_2 => {
-                sidecar.state = State::from_code(*p.get(BODY_LEN_1)?)?;
-                sidecar.served = *p.get(BODY_LEN_1 + 1)?;
-                sidecar.boot = p.get(BODY_LEN_1 + 2..BODY_LEN_1 + 18)?.try_into().ok()?;
-                sidecar.boot_volume = match *p.get(BODY_LEN_1 + 18)? {
-                    0 => true,
-                    1 => false,
-                    _ => return None,
-                };
-                sidecar.floor = Some(u64_at(BODY_LEN_1 + 19)?);
-                sidecar.lineage = Lineage::from_wire(p.get(BODY_LEN_1 + 27..)?)?;
+            1 if rest.is_empty() => {}
+            2 => {
+                let ((state, served, boot, boot_volume, floor), lineage_wire) =
+                    split_sidecar_v2_ext(rest)?;
+                sidecar.state = state;
+                sidecar.served = served;
+                sidecar.boot = boot;
+                sidecar.boot_volume = boot_volume;
+                sidecar.floor = Some(floor);
+                sidecar.lineage = Lineage::from_wire(lineage_wire)?;
             }
             _ => return None,
         }
@@ -545,19 +996,23 @@ impl Sidecar {
     /// nothing to compare: it saw no record, or retention has since pruned it (a log
     /// SHORTER than it saw is caught by the head check, not here).
     fn still_names(&self, durable: &[u8], base: u64) -> bool {
-        let Some(index) = self.head.checked_sub(1).and_then(|o| o.checked_sub(base)) else {
+        let Some(prev) = self.head.checked_sub(1) else {
+            return true;
+        };
+        let Some(index) = prev.checked_sub(base) else {
             return true;
         };
         let Ok(index) = usize::try_from(index) else {
             return true;
         };
-        frames(durable)
-            .nth(index)
-            .is_none_or(|frame| fingerprint(frame) == self.newest)
+        match frames(durable).nth(index) {
+            Some(frame) => fingerprint(frame) == self.newest,
+            None => true,
+        }
     }
 
     /// The lineage told beside the identity.
-    pub(crate) fn lineage(&self) -> &Lineage {
+    pub(crate) const fn lineage(&self) -> &Lineage {
         &self.lineage
     }
 
@@ -590,7 +1045,10 @@ impl Sidecar {
 
 /// The fingerprint of the newest of `frames` (all zero when there are none).
 fn newest_of(frames_bytes: &[u8]) -> [u8; 16] {
-    frames(frames_bytes).last().map_or([0u8; 16], fingerprint)
+    match frames(frames_bytes).last() {
+        Some(frame) => fingerprint(frame),
+        None => [0u8; 16],
+    }
 }
 
 /// What an open finds at `<log>.id`.
@@ -606,6 +1064,10 @@ pub(crate) enum Prior {
 }
 
 impl Prior {
+    pub(crate) const fn is_recorded(&self) -> bool {
+        matches!(self, Prior::Recorded(_))
+    }
+
     fn recorded(&self) -> Option<&Sidecar> {
         match self {
             Prior::Recorded(p) => Some(p),
@@ -617,13 +1079,17 @@ impl Prior {
     /// retention base (records below it are gone); `None` — the rules that predate the
     /// floor — for anything else.
     pub(crate) fn floor(&self, base: u64) -> Option<u64> {
-        self.recorded()?.floor.map(|f| f.max(base))
+        let f = self.recorded()?.floor?;
+        Some(f.max(base))
     }
 
     /// Whether the last run served the Relaxed tier, whose power loss can leave holes
     /// across batches (it issues no barrier at all).
     pub(crate) fn served_relaxed(&self) -> bool {
-        self.recorded().is_some_and(|p| p.served == SERVED_RELAXED)
+        match self.recorded() {
+            Some(p) => p.served == SERVED_RELAXED,
+            None => false,
+        }
     }
 
     /// Why the last run may have lost acked records that this open cannot see were
@@ -639,7 +1105,7 @@ impl Prior {
         let p = self.recorded()?;
         let weak_run =
             matches!(p.state, State::Open | State::Cutting { .. }) && p.served != SERVED_STRICT;
-        let known = |b: &[u8; 16]| *b != [0u8; 16];
+        let known_boot = p.boot != [0u8; 16];
         match p.state {
             State::Lossy => Some("a full flush failed while it served".to_string()),
             State::Cutting { unclean: true } => Some(
@@ -647,7 +1113,7 @@ impl Prior {
                     .to_string(),
             ),
             _ if !weak_run => None,
-            _ if !known(&p.boot) => Some("it served in a boot it could not name".to_string()),
+            _ if !known_boot => Some("it served in a boot it could not name".to_string()),
             _ if !p.boot_volume => Some(
                 "it served a log off the boot volume, whose cache a crash can lose".to_string(),
             ),
@@ -668,9 +1134,10 @@ impl Prior {
     /// never finished — never a power loss, never acked. Any tier: the boot is recorded
     /// by every open. False when either boot cannot be named.
     pub(crate) fn same_boot(&self, boot: Option<[u8; 16]>, boot_volume: bool) -> bool {
-        self.recorded().is_some_and(|p| {
-            p.boot != [0u8; 16] && Some(p.boot) == boot && p.boot_volume && boot_volume
-        })
+        match self.recorded() {
+            Some(p) => p.boot != [0u8; 16] && Some(p.boot) == boot && p.boot_volume && boot_volume,
+            None => false,
+        }
     }
 }
 
@@ -711,19 +1178,21 @@ pub(crate) fn read(dir: &Dir) -> io::Result<Prior> {
 /// rename, directory fsync, never following a link planted at either name), naming it
 /// in the error.
 pub(crate) fn write(dir: &Dir, sidecar: &Sidecar) -> io::Result<()> {
-    let framed = Frame::new(sidecar.encode())
-        .encode()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    dir.replace_id(&framed).map_err(|e| {
-        io::Error::new(
+    let framed = match Frame::new(sidecar.encode()).encode() {
+        Ok(f) => f,
+        Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+    };
+    match dir.replace_id(&framed) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(io::Error::new(
             e.kind(),
             format!(
                 "cannot record the identity of {} in {}: {e}",
                 dir.log_path().display(),
                 sidecar_path(dir.log_path()).display()
             ),
-        )
-    })
+        )),
+    }
 }
 
 /// Everything one open knows about the log when it settles the identity: see
@@ -763,25 +1232,28 @@ pub(crate) struct Settled {
     pub(crate) lineage: Lineage,
 }
 
+fn minted_settled(minted: [u8; 16]) -> Settled {
+    Settled {
+        identity: LogIdentity {
+            id: minted,
+            generation: 0,
+        },
+        lineage: Lineage::default(),
+    }
+}
+
 /// Settle the identity of a log as one open finds it — see the module docs for the
 /// rules. Pure: the caller records the result (phase 1 before a cut, phase 2 after the
 /// flush).
 pub(crate) fn settle(prior: &Prior, f: &Facts<'_>) -> Settled {
-    let minted = || Settled {
-        identity: LogIdentity {
-            id: f.minted,
-            generation: 0,
-        },
-        lineage: Lineage::default(),
-    };
     match prior {
         // Never held a record (a created log always): no client can hold an offset
         // into it, so a fresh id is always right — and a sidecar beside it can only be
         // a deleted predecessor's, or this log's own from before it held anything.
-        _ if f.kept_head == 0 => minted(),
+        _ if f.kept_head == 0 => minted_settled(f.minted),
         // Every record pruned: nothing stored to derive from but two numbers, which
         // another such log can share — a fresh id instead.
-        Prior::Absent if frames(f.kept).next().is_none() => minted(),
+        Prior::Absent if frames(f.kept).next().is_none() => minted_settled(f.minted),
         Prior::Absent => Settled {
             identity: LogIdentity {
                 id: derived_id(f.kept, f.base, f.kept_head),
@@ -791,7 +1263,7 @@ pub(crate) fn settle(prior: &Prior, f: &Facts<'_>) -> Settled {
         },
         // It had an identity this cannot read: a derived id could be that very one
         // (or an earlier one), so only a fresh id is certainly a different name.
-        Prior::Unreadable => minted(),
+        Prior::Unreadable => minted_settled(f.minted),
         Prior::Recorded(p) => {
             // A cut the LAST open already announced (it wrote phase 1 and died before
             // the cut was durable): finding the same cut again moves nothing more.
@@ -810,7 +1282,7 @@ pub(crate) fn settle(prior: &Prior, f: &Facts<'_>) -> Settled {
                 // alone: `generation + 1` here could be the name of a rewrite the
                 // leader makes later. A fresh id is no name the leader can give; the
                 // next replicated batch hands the leader's back.
-                return minted();
+                return minted_settled(f.minted);
             }
             let generation = p.identity.generation.saturating_add(1);
             // Lineage only for a loss this log can bound, judged on the bytes BEFORE
@@ -874,14 +1346,26 @@ impl Record<'_> {
     /// floor never rises here (nothing new is durable yet).
     pub(crate) fn cutting(&self, prior: &Prior, unclean: bool) -> Sidecar {
         let last = prior.recorded();
-        let floor = last
-            .and_then(|p| p.floor)
-            .map_or(self.head, |f| f.min(self.head));
+        let (floor, served, boot, boot_volume) = match last {
+            Some(p) => {
+                let fl = match p.floor {
+                    Some(f) => f.min(self.head),
+                    None => self.head,
+                };
+                (fl, p.served, p.boot, p.boot_volume)
+            }
+            None => (
+                self.head,
+                self.served,
+                self.boot.unwrap_or([0u8; 16]),
+                self.boot_volume,
+            ),
+        };
         Sidecar {
             state: State::Cutting { unclean },
-            served: last.map_or(self.served, |p| p.served),
-            boot: last.map_or(self.boot.unwrap_or([0u8; 16]), |p| p.boot),
-            boot_volume: last.map_or(self.boot_volume, |p| p.boot_volume),
+            served,
+            boot,
+            boot_volume,
             floor: Some(floor),
             ..self.serving()
         }
@@ -901,8 +1385,8 @@ pub(crate) fn format1_for_test(
     p.extend_from_slice(MAGIC);
     p.push(1);
     identity.put(&mut p);
-    p.extend_from_slice(&base.to_le_bytes());
-    p.extend_from_slice(&head.to_le_bytes());
+    p.extend_from_slice(&encode_u64_le_bytes(base));
+    p.extend_from_slice(&encode_u64_le_bytes(head));
     p.extend_from_slice(&newest_of(frames_bytes));
     Frame::new(p).encode().expect("a sidecar frames")
 }
@@ -921,28 +1405,60 @@ pub(crate) fn adopt(dir: &Dir, sidecar: &Sidecar, leader: LogIdentity) -> io::Re
     }
     let adopted = Sidecar {
         identity: leader,
+        base: sidecar.base,
+        head: sidecar.head,
+        newest: sidecar.newest,
         format: FORMAT,
-        lineage: Lineage::default(),
-        ..sidecar.clone()
+        state: sidecar.state,
+        served: sidecar.served,
+        boot: sidecar.boot,
+        boot_volume: sidecar.boot_volume,
+        floor: sidecar.floor,
+        lineage: Lineage { steps: Vec::new() },
     };
-    write(dir, &adopted)?;
-    Ok(adopted)
+    write(dir, &adopted).map(|()| adopted)
+}
+
+const fn frame_header_len(header: &[u8; HEADER_SIZE]) -> usize {
+    ((header[4] as u32)
+        | ((header[5] as u32) << 8)
+        | ((header[6] as u32) << 16)
+        | ((header[7] as u32) << 24)) as usize
+}
+
+const fn split_frame_header_len(tail: &[u8]) -> Option<usize> {
+    let &[h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, ref _rest @ ..] = tail else {
+        return None;
+    };
+    Some(frame_header_len(&[
+        h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11,
+    ]))
+}
+
+struct Frames<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Iterator for Frames<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let tail = self.bytes.get(self.pos..)?;
+        let len = split_frame_header_len(tail)?;
+        let end = self.pos.checked_add(HEADER_SIZE)?.checked_add(len)?;
+        let frame = self.bytes.get(self.pos..end)?;
+        self.pos = end;
+        Some(frame)
+    }
 }
 
 /// The stored frames in `bytes`, in order, without decoding a payload. `bytes` is a
 /// prefix the log's recovery scan already accepted, so every header is well formed;
 /// one that is short, or announces more bytes than follow, ends the walk. The length
 /// is the header's `u32` at bytes 4..8 (the layout `astream_wire::frame` documents).
-fn frames(bytes: &[u8]) -> impl Iterator<Item = &[u8]> + '_ {
-    let mut pos = 0usize;
-    std::iter::from_fn(move || {
-        let header = bytes.get(pos..pos.checked_add(HEADER_SIZE)?)?;
-        let len = u32::from_le_bytes(header.get(4..8)?.try_into().ok()?) as usize;
-        let end = pos.checked_add(HEADER_SIZE)?.checked_add(len)?;
-        let frame = bytes.get(pos..end)?;
-        pos = end;
-        Some(frame)
-    })
+fn frames(bytes: &[u8]) -> Frames<'_> {
+    Frames { bytes, pos: 0 }
 }
 
 /// Where the last of `bytes`' stored frames starts, or `None` when it holds none.
@@ -963,12 +1479,15 @@ fn fnv1a_128(parts: &[&[u8]]) -> [u8; 16] {
     const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
     let mut h = OFFSET;
     for part in parts {
-        for &b in (part.len() as u64).to_le_bytes().iter().chain(part.iter()) {
+        for &b in encode_u64_le_bytes(part.len() as u64)
+            .iter()
+            .chain(part.iter())
+        {
             h ^= u128::from(b);
             h = h.wrapping_mul(PRIME);
         }
     }
-    h.to_le_bytes()
+    encode_u128_le_bytes(h)
 }
 
 /// A stored frame's fingerprint — over the bytes as stored, so an encrypted log's is
@@ -981,10 +1500,12 @@ fn fingerprint(frame: &[u8]) -> [u8; 16] {
 /// deterministic in what it stores, so it is the same whichever build derives it and
 /// however often — and different once the log holds anything else.
 fn derived_id(durable: &[u8], base: u64, head: u64) -> [u8; 16] {
+    let base_bytes = encode_u64_le_bytes(base);
+    let head_bytes = encode_u64_le_bytes(head);
     fnv1a_128(&[
         b"astream-log-id/derived/1",
-        &base.to_le_bytes(),
-        &head.to_le_bytes(),
+        &base_bytes,
+        &head_bytes,
         frames(durable).next().unwrap_or(&[]),
         frames(durable).last().unwrap_or(&[]),
     ])
@@ -1000,20 +1521,29 @@ pub(crate) fn minted_id(log: &Path) -> [u8; 16] {
     use std::sync::atomic::{AtomicU64, Ordering};
     static MINTED: AtomicU64 = AtomicU64::new(0);
     let seq = MINTED.fetch_add(1, Ordering::Relaxed);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let mut id = [0u8; 16];
-    for (i, half) in id.chunks_mut(8).enumerate() {
-        let mut h = RandomState::new().build_hasher();
-        h.write_u64(seq);
-        h.write_u64(i as u64);
-        h.write_u128(now);
-        h.write_u32(std::process::id());
-        log.hash(&mut h);
-        half.copy_from_slice(&h.finish().to_le_bytes());
-    }
-    id
+    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_nanos(),
+        Err(_) => 0,
+    };
+    let pid = std::process::id();
+    let mut hasher0 = RandomState::new().build_hasher();
+    hasher0.write_u64(seq);
+    hasher0.write_u64(0);
+    hasher0.write_u128(now);
+    hasher0.write_u32(pid);
+    log.hash(&mut hasher0);
+    let h0 = encode_u64_le_bytes(hasher0.finish());
+    let mut hasher1 = RandomState::new().build_hasher();
+    hasher1.write_u64(seq);
+    hasher1.write_u64(1);
+    hasher1.write_u128(now);
+    hasher1.write_u32(pid);
+    log.hash(&mut hasher1);
+    let h1 = encode_u64_le_bytes(hasher1.finish());
+    [
+        h0[0], h0[1], h0[2], h0[3], h0[4], h0[5], h0[6], h0[7], h1[0], h1[1], h1[2], h1[3], h1[4],
+        h1[5], h1[6], h1[7],
+    ]
 }
 
 #[cfg(test)]
@@ -1213,8 +1743,12 @@ mod tests {
     fn phase_1_remembers_the_verdict_it_cut_under() {
         let boot = [9u8; 16];
         for (prior_state, prepared) in [(State::Lossy, None), (State::Open, Some("mark"))] {
+            // The last open recorded its head, 7, as the floor; its run then wrote
+            // records 7..11, which this open keeps but has not yet flushed.
             let prior = Prior::Recorded(Sidecar {
                 state: prior_state,
+                head: 7,
+                floor: Some(7),
                 ..sidecar(ident(1, 0), Lineage::default())
             });
             let verdict = prior.unclean(prepared, Some(boot));
@@ -1239,7 +1773,7 @@ mod tests {
             );
             assert_eq!(
                 cutting.floor(4),
-                Some(11),
+                Some(7),
                 "the floor never rises in phase 1"
             );
         }

@@ -5,8 +5,8 @@
 // (see the repository NOTICE).
 
 //! Recorded answers for the leaf types this crate absorbs in winit-core step 5
-//! (docs/AUDIT-third-party-2026-10-15.md, WC.5): `winit::dpi` (from `dpi` 0.1.2),
-//! `winit::window::CursorIcon` (from `cursor-icon` 1.2.0, the six icons aterm
+//! (docs/AUDIT-third-party-2026-10-15.md, WC.5): `aterm_window::dpi` (from `dpi` 0.1.2),
+//! `aterm_window::window::CursorIcon` (from `cursor-icon` 1.2.0, the six icons aterm
 //! sets, and the eight edge-resize icons LW.5 added) and the `bitflags!` types
 //! (`bitflags` 2).
 //!
@@ -20,14 +20,14 @@
 
 use std::panic::catch_unwind;
 
-use winit::dpi::{
+use aterm_window::dpi::{
     validate_scale_factor, LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Pixel,
     Position, Size,
 };
-use winit::keyboard::ModifiersState;
-use winit::window::CursorIcon;
+use aterm_window::keyboard::ModifiersState;
+use aterm_window::window::CursorIcon;
 #[cfg(not(target_os = "macos"))]
-use winit::window::WindowButtons;
+use aterm_window::window::WindowButtons;
 
 /// One recorded conversion: `(input, scale factor, output)`, both as `(x, y)`.
 type Row<I, O> = ((I, I), f64, (O, O));

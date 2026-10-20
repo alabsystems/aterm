@@ -1,0 +1,44 @@
+# agy 1.4.0 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Antigravity CLI, launched by path with a scratch `HOME` whose settings name the Gemini API provider, its Google hosts black-holed, a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · a research subagent (`invoke_subagent`) working after the turn ended, its model call held by a loopback forwarder: its panel row `  ● Agent(research: Lab Waiter)  Working · 1s`, the footer counting `1 subagent(s)` · cursor=38,2
+
+      ▄▀▀▄        Antigravity CLI 1.4.0
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     /private/tmp/at.juck/proj
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> hi, remember the word OSPREY-3
+
+  Hi! I am the local lab stub, not a model. (reply 1)
+
+────────────────────────────────────────────────────────────
+> toolstart
+
+● Ran (sleep 150; echo LAB-BG-DONE) (ctrl+o to expand)
+
+  Tool call done.
+
+  Tool call done.
+
+────────────────────────────────────────────────────────────
+> toolstart
+
+● Scheduled 1 timer (90s: lab timer fired) (ctrl+o to expand)
+
+  Tool call done.
+
+  Tool call done.
+
+────────────────────────────────────────────────────────────
+> toolstart
+
+● Spawned 1 subagent (ctrl+o to expand)
+
+  Tool call done.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ● Agent(research: Lab Waiter)  Working · 1s
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                             Gemini 3.1 Pro · low · 1 subagent(s)

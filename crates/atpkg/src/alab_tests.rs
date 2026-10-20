@@ -11,7 +11,6 @@ use super::*;
 use crate::flow::Fetcher;
 use crate::select::Candidate;
 use crate::sig::testkit;
-use crate::store::ToolName;
 
 const ARM_MAC: &str = "aarch64-apple-darwin";
 pub(crate) const BUILD: u64 = 2_026_101_601;
@@ -37,9 +36,20 @@ fn package(root: &Path, version: &str, exe: &[u8], alab: bool) {
 }
 
 fn package_json(version: &str) -> String {
+    package_json_naming(version, "bin/codex")
+}
+
+/// [`package_json`] with `entry` its entrypoint.
+fn package_json_naming(version: &str, entry: &str) -> String {
     format!(
-        r#"{{"layoutVersion":1,"version":"{version}","target":"aarch64-apple-darwin","entrypoint":"bin/codex"}}"#
+        r#"{{"layoutVersion":1,"version":"{version}","target":"aarch64-apple-darwin","entrypoint":"{entry}"}}"#
     )
+}
+
+/// `bin/codex` as this host's shim runs it (`bin/codex.exe` on Windows): what a pack the
+/// index lane installs here holds, and its manifest names.
+fn host_entry() -> String {
+    format!("bin/codex{}", crate::platform::EXE_SUFFIX)
 }
 
 /// A complete, active store build of codex at `build`, an ALab package when `alab`.
@@ -479,6 +489,7 @@ fn a_package_directory_links_its_entrypoint() {
 
 /// The last `exec '<path>' "$@"` line of a twin: what codex-alab's live upgrade and the
 /// harness read.
+#[cfg(unix)]
 fn exec_line(twin: &Path) -> String {
     std::fs::read_to_string(twin)
         .unwrap()
@@ -489,8 +500,9 @@ fn exec_line(twin: &Path) -> String {
         .to_string()
 }
 
+#[cfg(unix)]
 fn twin(l: &Layout) -> PathBuf {
-    l.agent_shim(&ToolName::new("codex").unwrap())
+    l.agent_shim(&crate::store::ToolName::new("codex").unwrap())
 }
 
 /// The symlink inode at `entry` (never followed): a new one means a rename landed there.
@@ -687,12 +699,15 @@ impl Fetcher for Channel {
 }
 
 /// One fetcher for a pass: the ALab channel's index, manifests and packs from `index`, and
-/// every vendor document and payload from `vendor` (the vendor lane's test world).
+/// every vendor document and payload from `vendor` (the vendor lane's test world). Unix,
+/// as its one user (cli's `alab_tests`) is.
+#[cfg(unix)]
 pub(crate) struct Both<'a> {
     pub(crate) index: &'a Channel,
     pub(crate) vendor: &'a crate::vendor_direct::lane::world::Fake,
 }
 
+#[cfg(unix)]
 impl Fetcher for Both<'_> {
     fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
         self.index.index_candidates()
@@ -740,12 +755,13 @@ impl Fetcher for Both<'_> {
 }
 
 /// An ALab pack's archive: `codex-package.json`, `alab-build.json` and `bin/codex` holding
-/// `exe`, as `alab/package.sh` lays them.
+/// `exe`, as `alab/package.sh` lays them ([`host_entry`]).
 pub(crate) fn pack_archive(build: u64, exe: &[u8], alab: bool) -> Vec<u8> {
-    let manifest = package_json(&format!("0.164.0-dev.{build}+gabc"));
+    let entry = host_entry();
+    let manifest = package_json_naming(&format!("0.164.0-dev.{build}+gabc"), &entry);
     let mut entries: Vec<(&str, u8, &str, &[u8], u32)> = vec![
         ("bin/", b'5', "", &[][..], 0o755),
-        ("bin/codex", b'0', "", exe, 0o755),
+        (&entry, b'0', "", exe, 0o755),
         (PACKAGE_JSON, b'0', "", manifest.as_bytes(), 0o644),
     ];
     if alab {
@@ -865,7 +881,7 @@ fn the_index_lane_installs_an_alab_pack_and_the_legacy_row_stays_vendor() {
         [format!("codex-alab/codex@{BUILD}")]
     );
     assert_eq!(active_alab_build(&l, "codex", ARM_MAC), Some(BUILD));
-    assert!(exe_is_alab(&l.build_dir("codex", BUILD).join("bin/codex")));
+    assert!(exe_is_alab(&l.build_dir("codex", BUILD).join(host_entry())));
     #[cfg(unix)]
     assert!(exec_line(&twin(&l)).contains("/store/codex/exec/codex"));
 

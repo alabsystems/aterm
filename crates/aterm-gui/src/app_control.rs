@@ -215,8 +215,26 @@ impl App {
 
         // Compile and validate in this same main-loop turn. A focus change between
         // socket parse and delivery cannot redirect the action to another view.
-        let inspected = self.compile_view(request.view)?;
+        let mut inspected = self.compile_view(request.view)?;
         let key = UiKey::new(request.ui_key.clone());
+        // A Settings list draws one screen of its rows; a row it holds off
+        // screen (absent, or in the tree off the screen) is scrolled into
+        // view first, as a hand would, so `act` reaches every listed control.
+        if inspected
+            .compiled
+            .semantic(&key)
+            .is_none_or(|node| node.offscreen)
+            && let Some(crate::native_app::AppViewState::Settings(state)) =
+                self.native_runtime.view_state_mut(request.view)
+            && state.reveal_listed_control(&key)
+        {
+            self.invalidate_native_view_cache(
+                wid,
+                request.view,
+                crate::native_app::DamageRegion::All,
+            );
+            inspected = self.compile_view(request.view)?;
+        }
         let node = inspected
             .compiled
             .semantic(&key)
@@ -279,11 +297,20 @@ impl App {
     /// Fails open: a non-`file://` URI, an unreadable home or anything unparseable
     /// passes, since this fences one named class and is not an admission check. The
     /// predicate is lexical apart from `canonicalize`, which raises no prompt.
-    fn refuse_file_provider_open(uri: &str) -> Result<(), String> {
+    pub(crate) fn refuse_file_provider_open(uri: &str) -> Result<(), String> {
+        Self::refuse_file_provider_open_in(uri, std::env::var_os("HOME").map(Into::into))
+    }
+
+    /// [`Self::refuse_file_provider_open`] for the home `home`, which a test names so
+    /// it never resolves a path in the person's own folders.
+    fn refuse_file_provider_open_in(
+        uri: &str,
+        home: Option<std::path::PathBuf>,
+    ) -> Result<(), String> {
         let Ok(path) = crate::native_document_host::file_uri_path(uri) else {
             return Ok(());
         };
-        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        let Some(home) = home else {
             return Ok(());
         };
         // Resolve where possible so a symlink into a synced folder is caught; fall
@@ -764,6 +791,10 @@ fn semantic_tree_lines(compiled: &CompiledUi) -> Vec<String> {
             if let Some(description) = &node.description {
                 line.push_str(&format!(" description={description:?}"));
             }
+            // What a reader says for a value, where it is not the bare number.
+            if let Some(words) = &node.value_text {
+                line.push_str(&format!(" value-text={words:?}"));
+            }
             line
         })
         .collect::<Vec<_>>();
@@ -1176,6 +1207,63 @@ fn inspection_revision(fingerprint: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `act` reaches a control a Settings list holds off screen: it scrolls
+    /// the row into view and presses it. A key no list holds stays refused.
+    #[test]
+    fn act_scrolls_a_listed_row_into_view_before_pressing_it() {
+        let mut app = App::headless_for_test();
+        let wid = *app.windows.keys().next().expect("a window");
+        // A 1,120×700pt window, sized in the cell the platform's default face
+        // draws: 160×50 cells is 1,440×1,150pt in Windows' 9×23 cell, tall
+        // enough for the whole list and the disclosure under it.
+        let (cell_width, cell_height) = app.win_cell_size(wid);
+        let pad = app.win_pad(wid);
+        {
+            let window = app.windows.get_mut(&wid).unwrap();
+            let scale = window.scale;
+            let px = |points: f64| (points * scale) as usize;
+            window.cols =
+                u16::try_from(px(1_120.0).saturating_sub(pad * 2) / cell_width.max(1)).unwrap();
+            window.rows =
+                u16::try_from(px(700.0).saturating_sub(pad) / cell_height.max(1)).unwrap();
+        }
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Themes));
+        let (_, view) = app.active_native_view(wid).expect("a native view");
+        let key = "settings/showcase/pack";
+        let drawn = |app: &App| {
+            app.compile_view(view)
+                .unwrap()
+                .compiled
+                .semantic(&UiKey::new(key))
+                .is_some_and(|node| !node.offscreen)
+        };
+        assert!(
+            !drawn(&app),
+            "the disclosure starts below the list's screen"
+        );
+        let refused = app.act_app(ActRequest {
+            view,
+            ui_key: "settings/showcase/card/no-such-theme".to_string(),
+            action: "settings/showcase/card/no-such-theme".to_string(),
+            value: None,
+        });
+        assert_eq!(refused, Err("unknown or stale UI key".to_string()));
+        app.act_app(ActRequest {
+            view,
+            ui_key: key.to_string(),
+            action: key.to_string(),
+            value: None,
+        })
+        .expect("the off-screen disclosure is pressed");
+        assert!(drawn(&app), "the pressed row is on screen");
+        let Some(crate::native_app::AppViewState::Settings(state)) =
+            app.native_runtime.view_state(view)
+        else {
+            panic!("the Settings view stays live");
+        };
+        assert!(state.showcase.pack_open);
+    }
 
     /// A native view's inspected viewport is where the view is drawn: in a split,
     /// below its pane's subtab title row. Checked for both leaves of a two-view split
@@ -1715,7 +1803,9 @@ mod tests {
         let access = MacosAccess {
             enabled: true,
             dr: DrClass::Identity,
-            bundle_id: Some("com.example.fixture".to_string()),
+            bundle_id: Some(crate::native_settings::tests::fixture_subject(
+                "com.example.fixture",
+            )),
             tccutil: aterm_containment::TccutilPresence::Executable,
             warmup_rows: vec![(Folder::Documents, crate::consent_warmup::WarmupRow::Denied)],
             claimants: Some(Claimants {
@@ -1747,9 +1837,11 @@ mod tests {
             ..MacosAccess::default()
         };
         let mut app = App::headless_for_test();
+        // Tall enough that the whole block, its facts wrapped to the card's
+        // measure, and the debugger row's button are on the first screen.
         if let Some(window) = app.windows.get_mut(&WindowId(0)) {
             window.cols = 140;
-            window.rows = 100;
+            window.rows = 160;
         }
         assert!(app.open_settings_tab(SettingsRoute::Security));
         fn state(app: &mut App, view: ViewId) -> &mut crate::native_settings::SettingsViewState {
@@ -2150,9 +2242,12 @@ mod tests {
         let SemanticValue::Text(value) = &preview.value else {
             panic!("Typography preview has a text semantic value");
         };
+        // Spoken in the one font-size unit, px at 1× (the slider's): the
+        // owning 2× window's 36 device px is 18, where the process-global
+        // renderer (12 at 1×) would say 12.
         assert!(
-            value.contains("at 36 pixels"),
-            "inactive inspection must report the owning window's physical font size: {value}"
+            value.contains("at 18 pixels"),
+            "inactive inspection must report the owning window's font size: {value}"
         );
 
         let wire = app
@@ -2162,7 +2257,7 @@ mod tests {
             })
             .unwrap();
         assert!(wire[1].contains("source=inactive-fallback"));
-        assert!(wire.iter().any(|line| line.contains("at 36 pixels")));
+        assert!(wire.iter().any(|line| line.contains("at 18 pixels")));
     }
 
     #[test]
@@ -2361,22 +2456,22 @@ mod tests {
     ///
     /// Unix-only: the domains are macOS's (`Library/Mobile Documents`,
     /// `Library/CloudStorage`), and on Windows the canonical `$HOME` is the `\\?\C:\…`
-    /// spelling the fence does not compare against.
+    /// spelling the fence does not compare against. The home is a scratch one: the
+    /// fence resolves each path it is asked about, and a test asks about paths in the
+    /// person's protected folders only there.
     #[cfg(unix)]
     #[test]
     fn the_control_surface_refuses_only_cloud_storage_opens() {
-        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
-            return; // no home to reason about; the guard fails open by design
-        };
-        let home = std::fs::canonicalize(&home).unwrap_or(home);
+        let scratch = aterm_tempfile::tempdir().expect("a scratch home");
+        let home = std::fs::canonicalize(scratch.path()).expect("the scratch home");
         let uri = |p: &std::path::Path| {
             crate::native_document_host::path_to_file_uri(p).expect("a file uri")
         };
+        let refuse = |uri: &str| crate::App::refuse_file_provider_open_in(uri, Some(home.clone()));
 
         for domain in ["Library/Mobile Documents", "Library/CloudStorage"] {
             let path = home.join(domain).join("provider").join("notes.md");
-            let refused = crate::App::refuse_file_provider_open(&uri(&path));
-            assert!(refused.is_err(), "{}", path.display());
+            assert!(refuse(&uri(&path)).is_err(), "{}", path.display());
         }
 
         // Protected but COVERED classes stay openable — this fence is one named
@@ -2387,19 +2482,14 @@ mod tests {
             "src/aterm/README.md",
         ] {
             let path = home.join(ordinary);
-            assert!(
-                crate::App::refuse_file_provider_open(&uri(&path)).is_ok(),
-                "{}",
-                path.display()
-            );
+            assert!(refuse(&uri(&path)).is_ok(), "{}", path.display());
         }
 
-        // Fails OPEN on anything it cannot classify.
+        // Fails OPEN on anything it cannot classify, and with no home.
         for opaque in ["https://example.invalid/x", "not-a-uri", ""] {
-            assert!(
-                crate::App::refuse_file_provider_open(opaque).is_ok(),
-                "{opaque}"
-            );
+            assert!(refuse(opaque).is_ok(), "{opaque}");
         }
+        let cloud = uri(&home.join("Library/CloudStorage/provider/notes.md"));
+        assert!(crate::App::refuse_file_provider_open_in(&cloud, None).is_ok());
     }
 }

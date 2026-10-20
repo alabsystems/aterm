@@ -31,12 +31,21 @@
 //! |---|---|
 //! | 0 | every check passed |
 //! | 1 | at least one finding; the transcript names each |
-//! | 2 | not run: no event loop, no window, or no toolbar was installed. Never a pass. |
+//! | 2 | not run: no event loop, no window, or no toolbar was installed; or the only failures were clicks that need this drive to be the active app with its window key, made while another app held activation. Never a pass. |
 //! | 3 | the drive hung (a modal tracking loop never returned) and the watchdog killed it |
 //!
 //! `3` has its own code because this driver enters `-mouseDown:` IMPs directly,
 //! and a context menu that really popped would run
 //! `-[NSMenu popUpContextMenu:…]`'s modal tracking loop and never return.
+//!
+//! Stages 3 to 5 click through AppKit's own routing, which reaches the strip
+//! only while the drive is the active app and its window is key; an inactive
+//! app spends the click on activation. macOS can refuse the activation the
+//! drive asks for, or hand it to another app mid-stage: at the desk on
+//! 2026-10-19 a person's trackpad click on another window did, and three clicks
+//! failed with `app active=false` (`docs/measured/desk-appkit-2026-10-19.md`).
+//! Such a click measured nothing about the strip, so it is `2`, never a
+//! finding; a click that fails while the drive held activation is still `1`.
 
 /// Every check passed.
 #[cfg(target_os = "macos")]
@@ -75,10 +84,10 @@ mod macos {
         class_name, class_of, class_protocols, method_types, ns_string, protocol,
         protocol_method_types, sel, strip_method_offsets, superclass_of,
     };
-    use winit::application::ApplicationHandler;
-    use winit::event_loop::{ActiveEventLoop, EventLoop};
-    use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
-    use winit::window::{Window, WindowId as WinitWindowId};
+    use aterm_window::application::ApplicationHandler;
+    use aterm_window::event_loop::{ActiveEventLoop, EventLoop};
+    use aterm_window::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
+    use aterm_window::window::{Window, WindowId as WinitWindowId};
 
     use super::{FINDING, HUNG, NOT_RUN, PASS};
     use crate::session_chrome::{TabChromeExt, TabMenuEntry};
@@ -344,6 +353,11 @@ mod macos {
     /// `NSEventModifierFlagControl`.
     const CTRL: usize = 1 << 18;
 
+    /// How long a stage waits for macOS to make the drive the active app with
+    /// its window key before it clicks anyway. Past it the clicks that need
+    /// activation and fail read as not measured, never as findings.
+    const FOCUS_WAIT: Duration = Duration::from_secs(10);
+
     /// An autoreleased `NSString`, for an event's `-characters`.
     fn nsstr(s: &str) -> Id {
         ns_string(s).map_or(Id::NIL, aterm_objc::Obj::autorelease)
@@ -405,7 +419,7 @@ mod macos {
             attention: crate::tab_bar::ChipLevel::Off,
             conn,
             closable: true,
-            drop_target: false,
+            team: crate::tab_bar::TabTeam::NONE,
         }
     }
 
@@ -445,7 +459,10 @@ mod macos {
                     None
                 },
             ));
-            m.tooltips.push(Some(format!("tip {i}")));
+            // The hover is the session chrome's tooltip with the presence lines
+            // after it (`App::tab_tooltips`); the extension carries the bare one.
+            m.tooltips
+                .push(Some(format!("tip {i}\n{}", presence_line(i))));
             m.ext.push(TabChromeExt {
                 tooltip: Some(format!("tip {i}")),
                 menu: vec![
@@ -462,6 +479,19 @@ mod macos {
         m
     }
 
+    /// The presence line the model's hover for tab `i` ends in, which the
+    /// extension's bare tooltip lacks.
+    fn presence_line(i: usize) -> String {
+        format!("last typed into by worker-{i} at 14:02")
+    }
+
+    /// Whether every chip's hover, as `chrome` reads it, is the strip's tooltip
+    /// with its presence line, not the extension's bare one.
+    fn hovers_keep_presence(handle: &toolbar::ToolbarHandle, n: usize) -> (bool, String) {
+        let chrome = toolbar::read_tab_chrome(handle).unwrap_or_default();
+        ((0..n).all(|i| chrome.contains(&presence_line(i))), chrome)
+    }
+
     fn apply(handle: &toolbar::ToolbarHandle, m: &Model) {
         toolbar::set_window_tabs(
             handle,
@@ -471,6 +501,7 @@ mod macos {
             &m.tooltips,
             &m.ext,
             m.active,
+            None,
         );
     }
 
@@ -489,16 +520,12 @@ mod macos {
             Wake::TabCmd { action, .. } => format!("TabCmd({action:?})"),
             Wake::TabContextMenuOpening { .. } => "TabContextMenuOpening".to_owned(),
             Wake::TabMenuAction { action, .. } => format!("TabMenuAction({action:?})"),
-            Wake::MenuAction { action } => format!("MenuAction({action:?})"),
+            Wake::MenuAction { action, .. } => format!("MenuAction({action:?})"),
             Wake::BeginSessionRename { tab, .. } => format!("BeginSessionRename({tab})"),
             Wake::CommitSessionRename { session, text, .. } => {
                 format!("CommitSessionRename({session},{text:?})")
             }
             Wake::CancelSessionRename { session, .. } => format!("CancelSessionRename({session})"),
-            Wake::ConnDragBegin { .. } => "ConnDragBegin".to_owned(),
-            Wake::ConnDragTo { .. } => "ConnDragTo".to_owned(),
-            Wake::ConnDragCancel { .. } => "ConnDragCancel".to_owned(),
-            Wake::ConnDragDrop { .. } => "ConnDragDrop".to_owned(),
             _ => return None,
         })
     }
@@ -510,8 +537,8 @@ mod macos {
             }
             let attrs = Window::default_attributes()
                 .with_title("objc-toolbar-drive")
-                .with_inner_size(winit::dpi::LogicalSize::new(1200.0, 400.0))
-                .with_position(winit::dpi::LogicalPosition::new(80.0, 80.0))
+                .with_inner_size(aterm_window::dpi::LogicalSize::new(1200.0, 400.0))
+                .with_position(aterm_window::dpi::LogicalPosition::new(80.0, 80.0))
                 .with_visible(true);
             match el.create_window(attrs) {
                 Ok(w) => self.window = Some(w),
@@ -525,7 +552,7 @@ mod macos {
             &mut self,
             _el: &ActiveEventLoop,
             _id: WinitWindowId,
-            _e: winit::event::WindowEvent,
+            _e: aterm_window::event::WindowEvent,
         ) {
         }
         fn user_event(&mut self, _el: &ActiveEventLoop, w: Wake) {
@@ -539,12 +566,28 @@ mod macos {
     /// failing: the transcript is what an A/B between two commits diffs.
     struct Ctx {
         findings: Vec<String>,
+        /// Clicks that failed while another app held activation: they measured
+        /// nothing about the strip (exit 2 when nothing else failed).
+        unmeasured: Vec<String>,
     }
     impl Ctx {
         fn check(&mut self, ok: bool, msg: String) {
             println!("  {} {msg}", if ok { "ok  " } else { "FAIL" });
             if !ok {
                 self.findings.push(msg);
+            }
+        }
+
+        /// A click that reaches the strip only while the drive is the active app
+        /// with its window key. `focused` says whether that held both before its
+        /// events went in and after they were pumped; a failure without it is
+        /// not a finding but a click spent on activation.
+        fn check_focused(&mut self, focused: bool, ok: bool, msg: String) {
+            if ok || focused {
+                self.check(ok, msg);
+            } else {
+                println!("  NOT MEASURED {msg}: another app held activation");
+                self.unmeasured.push(msg);
             }
         }
     }
@@ -897,10 +940,10 @@ mod macos {
             std::process::exit(HUNG);
         });
 
-        // The quiet builder starts inactive. Stages 3 and 4 dispatch to the hit
-        // view/window without stealing focus. Stage 5 activates for its
-        // AppKit-routing and keyboard checks: an inactive app's NSApp click is
-        // consumed as an activation click.
+        // The quiet builder starts inactive. Stage 3 asks to be the active app
+        // with its window key, which its clicks and stage 4's drag need, and
+        // stage 5 asks again for AppKit's own routing: an inactive app's click
+        // is consumed as an activation click (`Ctx::check_focused`).
         let mut el = match crate::quiet_driver_event_loop_builder::<Wake>().build() {
             Ok(el) => el,
             Err(e) => {
@@ -957,6 +1000,7 @@ mod macos {
 
         let mut cx = Ctx {
             findings: Vec::new(),
+            unmeasured: Vec::new(),
         };
         println!("=== objc-toolbar-drive ===");
 
@@ -1017,6 +1061,11 @@ mod macos {
             }
         }
         println!("  --  chrome: {:?}", toolbar::read_tab_chrome(&handle));
+        let (kept, chrome) = hovers_keep_presence(&handle, 3);
+        cx.check(
+            kept,
+            format!("each built chip's hover keeps its presence line: {chrome}"),
+        );
 
         // ---------------------------------------------------------- stage 2
         println!("\n-- stage 2: AppKit draws the strip (cacheDisplayInRect:)");
@@ -1039,19 +1088,41 @@ mod macos {
         // SAFETY: `+sharedApplication` on a linked class; later keyboard
         // events still enter through NSApp's event dispatch.
         let app = unsafe { s_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) };
+        // Whether AppKit routes a click to this drive's window: the app active
+        // and the window key. Another app's activation takes both.
+        // SAFETY: the live NSApp and the drive's own window; `-isActive` and
+        // `-isKeyWindow` are read-only `B16@0:8` getters.
+        let focused =
+            || unsafe { s_bool(app, sel!(isActive)) && s_bool(ns_window, sel!(isKeyWindow)) };
+        // Asks to be the active app with the window key and pumps until macOS
+        // has granted it or `FOCUS_WAIT` has passed; macOS may refuse while a
+        // person is using another app.
+        let take_focus = |d: &mut Driver, el: &mut EventLoop<Wake>| {
+            // SAFETY: the live NSApp and the live window this drive built.
+            unsafe {
+                s_v_bool(app, sel!(activateIgnoringOtherApps:), true);
+                s_v_id(ns_window, sel!(makeKeyAndOrderFront:), Id::NIL);
+            }
+            let t = Instant::now();
+            while !focused() && t.elapsed() < FOCUS_WAIT {
+                let _ = el.pump_app_events(Some(Duration::from_millis(4)), d);
+            }
+            println!(
+                "  --  asked for activation: granted={} after {:.2}s",
+                focused(),
+                t.elapsed().as_secs_f64()
+            );
+        };
         // Active and key first, as stage 5 does. The drive launches under the
         // quiet posture (Accessory, no activation); this stage audits tab
         // selection by click, which needs the key window: otherwise the click
         // hit-tests to the chip's label (`NSTextField`, no first mouse) and
         // AppKit spends it on key-window selection.
-        // SAFETY: the live NSApp and the live window this drive built.
-        unsafe {
-            s_v_bool(app, sel!(activateIgnoringOtherApps:), true);
-            s_v_id(ns_window, sel!(makeKeyAndOrderFront:), Id::NIL);
-        }
+        take_focus(&mut d, &mut el);
         pump(&mut d, &mut el, 250);
         for (i, c) in cs.iter().enumerate() {
             d.wakes.clear();
+            let before = focused();
             // SAFETY: `c` and `strip` are live views, `ns_window` is live;
             // the synthesized events are +0 autoreleased `NSEvent`s.
             unsafe {
@@ -1072,7 +1143,8 @@ mod macos {
                 println!("  --  chip{i} hitTest -> {}", name_of(hit));
             }
             pump(&mut d, &mut el, 120);
-            cx.check(
+            cx.check_focused(
+                before && focused(),
                 d.wakes.iter().any(|w| w == &format!("SelectTab({i})")),
                 format!("chip{i} click posted SelectTab({i}); saw {:?}", d.wakes),
             );
@@ -1081,6 +1153,7 @@ mod macos {
         // ---------------------------------------------------------- stage 4
         println!("\n-- stage 4: drag chip0 across chip2 (down, 6 drags, up)");
         d.wakes.clear();
+        let before = focused();
         // SAFETY: live views and NSWindow, as stage 3.
         unsafe {
             let b0 = s_rect(cs[0], sel!(bounds));
@@ -1127,7 +1200,8 @@ mod macos {
             );
         }
         pump(&mut d, &mut el, 200);
-        cx.check(
+        cx.check_focused(
+            before && focused(),
             d.wakes.iter().any(|w| w.starts_with("TabCmd(Move")),
             format!("the drag posted a reorder; saw {:?}", d.wakes),
         );
@@ -1173,18 +1247,15 @@ mod macos {
         }
         // NSApp's real event routing needs the application active and this
         // window key; otherwise the first click is consumed as an activation
-        // click. Activated here, after the quiet checks in stages 3 and 4.
-        // SAFETY: the live NSApp and the drive's own window.
-        unsafe {
-            s_v_bool(app, sel!(activateIgnoringOtherApps:), true);
-            s_v_id(ns_window, sel!(makeKeyAndOrderFront:), Id::NIL);
-        }
+        // click. Asked again here: another app may have taken it since stage 3.
+        take_focus(&mut d, &mut el);
         pump(&mut d, &mut el, 250);
         // Exercise real NSApp dispatch for every chip as well as stage 3's
         // direct-responder checks. These are plain left clicks; context-menu
         // dispatch below remains guarded by a successful pop-site replacement.
         for (i, c) in cs.iter().enumerate() {
             d.wakes.clear();
+            let before = focused();
             // SAFETY: `c` is a live view, `app` is the live NSApp, and the
             // synthesized events are +0 autoreleased `NSEvent`s.
             unsafe {
@@ -1206,7 +1277,8 @@ mod macos {
                 );
             }
             pump(&mut d, &mut el, 120);
-            cx.check(
+            cx.check_focused(
+                before && focused(),
                 d.wakes.iter().any(|w| w == &format!("SelectTab({i})")),
                 format!(
                     "chip{i} NSApp click posted SelectTab({i}); saw {:?}",
@@ -1250,6 +1322,7 @@ mod macos {
                 // the context clicks must select before those observations count.
                 // The pop site is stubbed, so no route enters a tracking loop.
                 d.wakes.clear();
+                let before = focused();
                 s_v_id(
                     app,
                     sel!(sendEvent:),
@@ -1263,7 +1336,8 @@ mod macos {
                 pump(&mut d, &mut el, 200);
                 let control_arrived = d.wakes.iter().any(|w| w == "SelectTab(1)");
                 println!("  --  [NSApp sendEvent:] plain left -> {:?}", d.wakes);
-                cx.check(
+                cx.check_focused(
+                    before && focused(),
                     control_arrived,
                     "the CONTROL arrived: NSApp routes a plain left click".to_owned(),
                 );
@@ -1460,6 +1534,11 @@ mod macos {
         );
         apply(&handle, &m3);
         pump(&mut d, &mut el, 200);
+        let (kept, chrome) = hovers_keep_presence(&handle, 3);
+        cx.check(
+            kept,
+            format!("each chip's hover keeps its presence line after a re-apply: {chrome}"),
+        );
         // SAFETY: `strip` is live.
         let cs2 = unsafe { chips(strip) };
         cx.check(
@@ -1804,16 +1883,14 @@ mod macos {
             ("dirty", 0usize),
             ("busy", 1),
             ("attention", 2),
-            ("drop_target", 3),
-            ("not-closable", 4),
+            ("not-closable", 3),
         ] {
             let mut mm = model(4);
             for t in &mut mm.metadata {
                 t.dirty = f == 0;
                 t.busy = f == 1;
                 t.attention = crate::app_presence::chip_of_attention(f == 2);
-                t.drop_target = f == 3;
-                t.closable = f != 4;
+                t.closable = f != 3;
                 t.conn = None;
             }
             apply(&handle, &mm);
@@ -1935,10 +2012,47 @@ mod macos {
         }
 
         // Relational checks: absolute hashes are machine-specific, these are
-        // not, and a branch that stopped drawing a state fails them.
+        // not, and a branch that stopped drawing a state fails them. Each group
+        // holds states that must draw differently, and together the groups name
+        // every state the matrix draws, so a row the loops above stopped
+        // capturing, or one no group judges, fails the first check.
+        let groups: [&[&str]; 8] = [
+            &["tabs=1", "tabs=2", "tabs=3", "tabs=5", "tabs=8"],
+            &[
+                "icon=Settings",
+                "icon=Markdown",
+                "icon=Editor",
+                "icon=Recovery",
+            ],
+            &["dirty", "busy", "attention", "not-closable"],
+            &["conn=Outbound", "conn=Inbound", "conn=Both"],
+            &["accent=None", "accent=(220,40,60)", "accent=(20,180,90)"],
+            &["dark=true", "dark=false"],
+            &["chip hover", "chip hover off"],
+            &["plus hover", "plus pressed", "plus idle"],
+        ];
+        let mut named: Vec<&str> = groups.iter().flat_map(|g| g.iter().copied()).collect();
+        named.sort_unstable();
+        let mut captured: Vec<&str> = matrix.iter().map(|(n, _)| n.as_str()).collect();
+        captured.sort_unstable();
+        let unjudged: Vec<&str> = captured
+            .iter()
+            .filter(|n| !named.contains(n))
+            .copied()
+            .collect();
+        let uncaptured: Vec<&str> = named
+            .iter()
+            .filter(|n| !captured.contains(n))
+            .copied()
+            .collect();
         cx.check(
-            matrix.len() == 27,
-            format!("27 states were captured (got {})", matrix.len()),
+            captured == named,
+            format!(
+                "the {} states the groups name were each captured once (got {}; \
+                 never captured: {uncaptured:?}; in no group: {unjudged:?})",
+                named.len(),
+                captured.len()
+            ),
         );
         let missing: Vec<&str> = matrix
             .iter()
@@ -1952,21 +2066,7 @@ mod macos {
         let hash_of = |name: &str| -> Option<u64> {
             matrix.iter().find(|(n, _)| n == name).and_then(|(_, h)| *h)
         };
-        for group in [
-            &["tabs=1", "tabs=2", "tabs=3", "tabs=5", "tabs=8"][..],
-            &[
-                "icon=Settings",
-                "icon=Markdown",
-                "icon=Editor",
-                "icon=Recovery",
-            ][..],
-            &["dirty", "busy", "attention", "drop_target", "not-closable"][..],
-            &["conn=Outbound", "conn=Inbound", "conn=Both"][..],
-            &["accent=None", "accent=(220,40,60)", "accent=(20,180,90)"][..],
-            &["dark=true", "dark=false"][..],
-            &["chip hover", "chip hover off"][..],
-            &["plus hover", "plus pressed", "plus idle"][..],
-        ] {
+        for group in groups {
             let hs: Vec<Option<u64>> = group.iter().map(|n| hash_of(n)).collect();
             let mut uniq = hs.clone();
             uniq.sort_unstable();
@@ -2038,15 +2138,27 @@ mod macos {
         drop(handle);
         drop(d.window.take());
         println!("\n=== VERDICT ===");
-        if cx.findings.is_empty() {
-            println!("objc-toolbar-drive: OK");
-            PASS
-        } else {
-            for f in &cx.findings {
-                println!("  FINDING: {f}");
-            }
+        for f in &cx.findings {
+            println!("  FINDING: {f}");
+        }
+        for u in &cx.unmeasured {
+            println!("  NOT MEASURED: {u}");
+        }
+        if !cx.findings.is_empty() {
             println!("objc-toolbar-drive: {} FINDING(S)", cx.findings.len());
             FINDING
+        } else if !cx.unmeasured.is_empty() {
+            println!(
+                "objc-toolbar-drive: NOT RUN — nothing failed, but {} click(s) that need this \
+                 drive to be the active app ran while another app held activation (macOS \
+                 refused it, or a person used another window), so they measured nothing; \
+                 run it on an idle desktop",
+                cx.unmeasured.len()
+            );
+            NOT_RUN
+        } else {
+            println!("objc-toolbar-drive: OK");
+            PASS
         }
     }
 }

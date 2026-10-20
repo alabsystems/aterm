@@ -265,6 +265,20 @@ font	Monocraft	bfece49853885e3c#0	-	-	lines13	-	asc=11.555555 desc=-1.4444444 ga
 font	Monocraft	bfece49853885e3c#0	-	-	metrics13	-	n=1700 fnv=89dd41383f702e65
 font	Monocraft	bfece49853885e3c#0	-	-	raster13	-	glyphs=195 fnv=ce233b2931772ec4
 font	Monocraft	bfece49853885e3c#0	-	-	raster26	-	glyphs=195 fnv=d931e0297d9e3f8f
+font	NotoColorEmoji	30ead35d90ff0371#0	-	-	cmap	-	probed=1744 mapped=1494 fnv=9b81818fd2c7e85f
+font	NotoColorEmoji	30ead35d90ff0371#0	-	-	kern13	-	glyphs=15 pairs=0 fnv=cbf29ce484222325
+font	NotoColorEmoji	30ead35d90ff0371#0	-	-	ligature_gate	-	0
+font	NotoColorEmoji	30ead35d90ff0371#0	-	-	lines13	-	asc=12.060547 desc=-3.1738281 gap=0.0 new_line=15.234375
+font	NotoColorEmoji	30ead35d90ff0371#0	-	-	metrics13	-	n=3976 fnv=afdb0086d6662605
+font	NotoColorEmoji	30ead35d90ff0371#0	-	-	raster13	-	glyphs=19 fnv=2a9f246710fe849c
+font	NotoColorEmoji	30ead35d90ff0371#0	-	-	raster26	-	glyphs=19 fnv=0802a71e04599275
+font	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	cmap	-	probed=44884 mapped=44810 fnv=c0a982ab6e5ce78b
+font	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	kern13	-	glyphs=189 pairs=0 fnv=cbf29ce484222325
+font	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	ligature_gate	-	1
+font	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	lines13	-	asc=15.08 desc=-3.744 gap=0.0 new_line=18.824001
+font	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	metrics13	-	n=65535 fnv=a3209045b44188b4
+font	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	raster13	-	glyphs=192 fnv=86a6b0f69bc53020
+font	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	raster26	-	glyphs=192 fnv=0e66aab7fafa3654
 font	NotoSansMath-Regular	b20110328668281e#0	-	-	cmap	-	probed=3083 mapped=2919 fnv=7ea2f44b26f6b681
 font	NotoSansMath-Regular	b20110328668281e#0	-	-	kern13	-	glyphs=100 pairs=0 fnv=cbf29ce484222325
 font	NotoSansMath-Regular	b20110328668281e#0	-	-	ligature_gate	-	0
@@ -1263,6 +1277,111 @@ read	Monocraft	bfece49853885e3c#0	-	-	os2	-	weight=400 width=5 style=Normal bold
 read	Monocraft	bfece49853885e3c#0	-	-	outline.0	-	n=1020 fnv=01bd87e6e2a6032e
 read	Monocraft	bfece49853885e3c#0	-	-	outline.1024	-	n=671 fnv=29e2c0e13c70b862
 read	Monocraft	bfece49853885e3c#0	-	-	vmtx	-	n=1700 fnv=13bcecfa7819d7fd
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	bbox	-	n=0 fnv=6591dcde89c8e5fd
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	cmap.index	-	probed=1744 mapped=1494 fnv=06730565b850ac77
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	cmap.sub0	-	p=Unicode e=5 f=14 unicode=1 n=0 fnv=cbf29ce484222325
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	cmap.sub1	-	p=Windows e=10 f=12 unicode=1 n=1494 fnv=c8146ebbf7a96b06
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	cmap.vs	-	n=354 fnv=dbfbc4d3351665f9
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	gpos	-	absent
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	gsub	-	scripts=DFLT features=1 tags=ccmp lookups=6 fv=0 fnv=ac1d82cb6162e9cd
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	gsub.lookups	-	lookups=6 kinds=1:1,2:1,4:2,5:1,6:1 unparsed=0 fnv=e32beeedb33488be
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	head	-	upem=2048 glyphs=3976 bbox=0,-500,2550,1900 variable=0 faces=- italic_angle=0.0 mono=1 tables=CBDT,CBLC,GSUB,OS/2,cmap,head,hhea,hmtx,maxp,name,post,vhea,vmtx
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	hmtx	-	n=3976 fnv=f02177f92c66ef80
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	metrics	-	asc=1900 desc=-500 gap=0 height=2400 typo=1900,-500,0 vert=1275,-1275,0,2550 x=0 cap=1900 ul=-1244,131 st=530,102 sub=1331,1433,0,286 sup=1331,1433,0,983
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	name	-	n=15 fnv=ff89623bb03b6276 family=Noto\u{20}Color\u{20}Emoji
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	os2	-	weight=400 width=5 style=Normal bold=0 italic=0 oblique=0 regular=1 perm=Installable subset=1 outline_embed=1 ranges=00000000000000000000000000000001
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	outline.0	-	n=0 fnv=8ad2812f7bc48125
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	outline.1024	-	n=0 fnv=88f92f2b7c1e5325
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	outline.2048	-	n=0 fnv=08e3977c599dfd25
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	outline.3072	-	n=0 fnv=d52cab93b0df52bd
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	raster.128	-	n=3934 fnv=9d7ab7e1b44771bc
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	raster.16	-	n=3934 fnv=9d7ab7e1b44771bc
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	raster.32	-	n=3934 fnv=9d7ab7e1b44771bc
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	raster.64	-	n=3934 fnv=9d7ab7e1b44771bc
+read	NotoColorEmoji	30ead35d90ff0371#0	-	-	vmtx	-	n=3976 fnv=78d52ea5e87cf9fe
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	bbox	-	n=65524 fnv=3e61936e9a23f83a
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	cmap.index	-	probed=44884 mapped=44810 fnv=4a6f1f3bb016ef7b
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	cmap.sub0	-	p=Unicode e=3 f=4 unicode=1 n=42220 fnv=f039f606d63812ea
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	cmap.sub1	-	p=Unicode e=4 f=12 unicode=1 n=44810 fnv=5a840797497cae3a
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	cmap.sub2	-	p=Unicode e=5 f=14 unicode=1 n=0 fnv=cbf29ce484222325
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	cmap.sub3	-	p=Macintosh e=1 f=6 unicode=0 n=1 fnv=a8c7f832281a39c5
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	cmap.sub4	-	p=Windows e=1 f=4 unicode=1 n=42220 fnv=f039f606d63812ea
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	cmap.sub5	-	p=Windows e=10 f=12 unicode=1 n=44810 fnv=5a840797497cae3a
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	cmap.vs	-	n=13311 fnv=58f8af30e9ad53de
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	gdef	-	classes=1 fnv=7c9f360da521017f
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	gpos	-	scripts=DFLT,cyrl,grek,hang,hani,kana,latn features=296 tags=halt,kern,mark,palt,vert,vhal,vkrn,vpal lookups=11 fv=0 fnv=d92377c3101befa7
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	gsub	-	scripts=DFLT,cyrl,grek,hang,hani,kana,latn features=631 tags=aalt,calt,ccmp,dlig,fwid,hist,hwid,jp78,jp83,jp90,liga,ljmo,locl,nlck,pwid,ruby,tjmo,vert,vjmo,vrt2 lookups=56 fv=0 fnv=4911a195c6971e87
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	gsub.lookups	-	lookups=56 kinds=1:35,3:1,4:6,6:281 unparsed=0 fnv=cf5eebb22cfc2bc6
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	head	-	upem=1000 glyphs=65535 bbox=-1002,-1048,2928,1808 variable=0 faces=10 italic_angle=0.0 mono=0 tables=BASE,CFF ,GDEF,GPOS,GSUB,OS/2,VORG,cmap,head,hhea,hmtx,maxp,name,post,vhea,vmtx
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	hmtx	-	n=65535 fnv=ac6496f08806605e
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	metrics	-	asc=1160 desc=-288 gap=0 height=1448 typo=880,-120,0 vert=500,-500,0,1000 x=543 cap=733 ul=-125,50 st=325,50 sub=650,600,0,75 sup=650,600,0,350
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	name	-	n=18 fnv=610dc983a72c0037 family=Noto\u{20}Sans\u{20}CJK\u{20}JP
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	os2	-	weight=400 width=5 style=Normal bold=0 italic=0 oblique=0 regular=1 perm=Installable subset=1 outline_embed=1 ranges=00000000000000162bdf3c1030000083
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.0	-	n=1021 fnv=703df4f348c30ca8
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.1024	-	n=1023 fnv=dd8a8fe73ed9429c
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.10240	-	n=1024 fnv=78343945359750e9
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.11264	-	n=1024 fnv=ce014ba9bfd9dbb0
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.12288	-	n=1024 fnv=d31949042bac78b8
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.13312	-	n=1024 fnv=a8c5263002df8108
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.14336	-	n=1024 fnv=1e7e536b3b75b48a
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.15360	-	n=1024 fnv=15c786c8919a328b
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.16384	-	n=1024 fnv=b2c55277c7733338
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.17408	-	n=1024 fnv=754216b572b816dd
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.18432	-	n=1024 fnv=2c833de8c35bd69b
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.19456	-	n=1024 fnv=8e94d70589fcd427
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.2048	-	n=1024 fnv=06d90758a5cd71a2
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.20480	-	n=1024 fnv=45edce609a63389d
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.21504	-	n=1024 fnv=3f399553d63eb259
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.22528	-	n=1024 fnv=c75d9ce48dbfee09
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.23552	-	n=1024 fnv=0ce7436b044cd4ef
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.24576	-	n=1024 fnv=425e14dbfdd85abf
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.25600	-	n=1024 fnv=c34b0a76471b0310
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.26624	-	n=1024 fnv=1b1853873844def8
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.27648	-	n=1024 fnv=c9822839abaeda46
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.28672	-	n=1024 fnv=b03a1a6b831d0c2c
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.29696	-	n=1024 fnv=d6f6866a6313d2a1
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.3072	-	n=1024 fnv=854a418c3e14816b
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.30720	-	n=1024 fnv=f46dd344eb5fb976
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.31744	-	n=1024 fnv=e602e8396d174adb
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.32768	-	n=1024 fnv=5bffaf3cb6d13aaa
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.33792	-	n=1024 fnv=b18efe8b1087890d
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.34816	-	n=1024 fnv=57b19a9d1ef694a4
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.35840	-	n=1024 fnv=14eb23ba16f2ebc0
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.36864	-	n=1024 fnv=04c4e0b2eb1b06cd
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.37888	-	n=1024 fnv=a0d9c33354136bf5
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.38912	-	n=1024 fnv=a5a788057f7d0566
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.39936	-	n=1024 fnv=f58299beb9569f8e
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.4096	-	n=1024 fnv=660b074c84ead3bf
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.40960	-	n=1024 fnv=b2f8b2fd29ec0387
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.41984	-	n=1024 fnv=e995d1a35bd700c4
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.43008	-	n=1024 fnv=fdd1c7adf499db54
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.44032	-	n=1024 fnv=8aaecabc1431281d
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.45056	-	n=1024 fnv=3c287d977c3c6d57
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.46080	-	n=1024 fnv=09cc59b84dd81ca4
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.47104	-	n=1024 fnv=4dee12efaf0079fb
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.48128	-	n=1024 fnv=51ce555e9a1e8867
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.49152	-	n=1024 fnv=f458da653f129185
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.50176	-	n=1024 fnv=45de61c1e57b7eb3
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.5120	-	n=1024 fnv=7702c58fd6faf64f
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.51200	-	n=1024 fnv=5f3af1e07e70506d
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.52224	-	n=1024 fnv=8f0c25f944b63950
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.53248	-	n=1024 fnv=44a041a6f8814ed6
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.54272	-	n=1024 fnv=68118e437129d3ef
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.55296	-	n=1024 fnv=bcf1bcc43966d728
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.56320	-	n=1024 fnv=76911d30db06d846
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.57344	-	n=1024 fnv=c1145ad7e298ad44
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.58368	-	n=1024 fnv=084495c00bab02d1
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.59392	-	n=1024 fnv=919c1a5486410ba6
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.60416	-	n=1024 fnv=053d261e43ec7631
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.6144	-	n=1024 fnv=3bf0cc484df44ed4
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.61440	-	n=1024 fnv=b75df71e484152be
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.62464	-	n=1022 fnv=e5998348eb846bf2
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.63488	-	n=1023 fnv=aab04e10edc4349d
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.64512	-	n=1019 fnv=d0668af22f800210
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.7168	-	n=1024 fnv=4118289c3ebce9f8
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.8192	-	n=1024 fnv=5b180adb57b2c0f8
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	outline.9216	-	n=1024 fnv=7b8e864c9f5d28cd
+read	NotoSansCJK-Regular	c7a5a8d18e92effb#0	-	-	vmtx	-	n=65535 fnv=1ae9e43061e83281
 read	NotoSansMath-Regular	b20110328668281e#0	-	-	bbox	-	n=4996 fnv=7593737e4b35f866
 read	NotoSansMath-Regular	b20110328668281e#0	-	-	cmap.index	-	probed=3083 mapped=2919 fnv=38f28d7ccb112cf9
 read	NotoSansMath-Regular	b20110328668281e#0	-	-	cmap.sub0	-	p=Unicode e=3 f=4 unicode=1 n=1691 fnv=425a5fd3225bb6be

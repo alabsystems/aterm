@@ -706,6 +706,9 @@ pub struct LaterAsk {
     then: Then,
     fingerprint: Fingerprint,
     resurface: Resurface,
+    /// Its words move only when its fact does, never every look
+    /// ([`Self::restated_at_once`]).
+    at_once: bool,
 }
 
 impl LaterAsk {
@@ -717,7 +720,26 @@ impl LaterAsk {
             then,
             fingerprint,
             resurface,
+            at_once: false,
         }
+    }
+
+    /// Words that move only when the fact itself does (the tabs an outage
+    /// holds, counted as they join and leave it) are news each time: a
+    /// restatement of this ask is shown at once, never held back by
+    /// [`RESTATE_QUIET`], which is for words that move every look (an age, a
+    /// holder count read at each pass).
+    #[must_use]
+    pub fn restated_at_once(mut self) -> Self {
+        self.at_once = true;
+        self
+    }
+
+    /// Whether a restatement of its words is shown at once
+    /// ([`Self::restated_at_once`]).
+    #[must_use]
+    pub fn restates_at_once(&self) -> bool {
+        self.at_once
     }
 
     /// A self-healing fact, promoted only once it has gone on for `horizon`: `None`
@@ -739,6 +761,7 @@ impl LaterAsk {
             then,
             fingerprint,
             resurface,
+            at_once: false,
         })
     }
 
@@ -750,6 +773,7 @@ impl LaterAsk {
             then: Then::step(then),
             fingerprint: Fingerprint(clip(key, KEY_CAP)),
             resurface: Resurface::WAIT,
+            at_once: false,
         }
     }
 

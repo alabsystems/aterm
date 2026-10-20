@@ -854,8 +854,11 @@ fn a_block_closed_without_a_d_ends_unknown_and_an_older_one_is_not_ours() {
 
 /// `completed_block` carries the block's C and D stamps, and `block_read`
 /// reports, from the cursor on, the running block, each finished one (stamps,
-/// code, its program) and none that ran nothing. NEGATIVE CONTROL: past the
-/// cursor, an older block is not reported again.
+/// code, its program), each a prompt closed with no D (ended at that
+/// prompt's stamp) and none that ran nothing; a block that finished before
+/// the log opened is passed (the cursor goes past it), as is one a prompt
+/// closed before then; one that finished at that instant is read. NEGATIVE
+/// CONTROL: past the cursor, an older block is not reported again.
 #[test]
 fn block_read_reports_every_block_past_the_cursor() {
     let mut term = aterm_core::terminal::Terminal::new(24, 80);
@@ -893,6 +896,38 @@ fn block_read_reports_every_block_past_the_cursor() {
     );
     let done_block = crate::session_status::completed_block(&term);
     assert_eq!(done_block, None, "a running command reports nothing there");
+
+    // A prompt with no D (a Ctrl-C) ends the running block at ITS stamp.
+    let at = |wall_ms: u64| aterm_core::terminal::ClockReading {
+        monotonic: aterm_core::terminal::ClockReading::now().monotonic,
+        wall_ms: Some(wall_ms),
+    };
+    let began = read.facts[2].started_ms.expect("C stamped");
+    term.process_at(prompt, at(began + 1_000));
+    let cut = crate::session_status::block_read(&term, Some(2), None, None);
+    assert_eq!(
+        cut.facts.iter().map(|f| (f.id, f.end)).collect::<Vec<_>>(),
+        [(
+            2,
+            BlockEnd::Unended {
+                ended_ms: Some(began + 1_000)
+            }
+        )]
+    );
+    // A command that finished as an adopted log opened is its own; one
+    // before is passed, the newest too (no prompt yet: it runs nothing
+    // more), so the cursor goes past it.
+    term.process_at(
+        b"make\r\n\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\",
+        at(began + 2_000),
+    );
+    let at_open = crate::session_status::block_read(&term, Some(3), Some(began + 2_000), None);
+    assert_eq!(at_open.facts.iter().map(|f| f.id).collect::<Vec<_>>(), [3]);
+    let before = crate::session_status::block_read(&term, Some(3), Some(began + 2_001), None);
+    assert_eq!((before.facts.len(), before.through), (0, Some(3)));
+    // So is a block a prompt closed before the log opened.
+    let unended = crate::session_status::block_read(&term, Some(2), Some(began + 1_001), None);
+    assert_eq!(unended.facts.iter().map(|f| f.id).collect::<Vec<_>>(), [3]);
 }
 
 // ---- (3) note_foreground_group and set_program ---------------------------
@@ -1415,10 +1450,70 @@ fn every_producer_runs_under_the_timeline_lock_alone() {
             g.slog_mut().failure_seen(now);
             let _ = g.handoff_log_ids();
             // Phase 3A: control input, its owed wake.
-            g.slog_mut()
-                .ctl_input(Actor::Ctl, super::InputVerb::Send, None, now);
+            g.slog_mut().ctl_input(
+                Actor::Ctl,
+                super::InputVerb::Send,
+                None,
+                super::InputAct::default(),
+                now,
+            );
+            let _ = g.slog_take_wake();
+            // Phase 3B: the sweep's and the frame's marks.
+            let engine = super::observed::EngineRead {
+                integration: aterm_core::terminal::ShellIntegrationPosture::On,
+                notify_total: 1,
+                bell_total: 1,
+                progress: None,
+            };
+            g.slog_mut().observe_engine(&engine, now);
+            let facts = super::observed::StatusFacts {
+                phase: "idle",
+                out: Some(("ok", None)),
+                conf: Conf::Strong,
+            };
+            g.slog_mut().observe_status(facts, now);
+            g.slog_mut().agent_interrupted();
+            g.slog_mut().observe_screen_facts(Some(40), Some(true), now);
+            let card = aterm_phase::LaunchCard {
+                version: "2.1.300".into(),
+                model: "Opus 5.5".into(),
+                effort: None,
+            };
+            g.slog_mut().observe_card(&card, now);
+            g.slog_mut().observe_render("healed", now);
+            g.record_cwd_change(Some("/a"));
+            g.slog_mut().observe_title("t", now);
+            let _ = g.slog_take_wake();
+            // Phase 5: a self-claim's act (5C-2) and a worker's task moves
+            // (5C-3), each at the timeline site its verb's caller reaches
+            // under the meta guard the holder thread holds here.
+            let _ = g.note_harness_act("approve-all@v1", "codex-alab@1", Actor::Ctl);
+            let working = crate::task_record::TaskMark::new(crate::task_record::TaskState::Working);
+            let _ = g.mark_task(&working, false, std::time::Instant::now(), 1);
+            let _ = g.note_task_attention(true);
             let _ = g.slog_take_wake();
         }
+        // Phase 3B: a manual reset's and a write in doubt's marks, each through
+        // its own site (the timeline alone).
+        let report = crate::manual_reset::ResetReport {
+            reverted: vec!["mouse"],
+            bytes: 1,
+        };
+        crate::manual_reset::record(
+            1,
+            &ctx.timeline,
+            crate::manual_reset::ResetSource::Menu,
+            &report,
+        );
+        let key = format!("{}:4:1", ctx.nonce.to_hex());
+        let _ = crate::pty_idem::guarded_waking(
+            &ctx,
+            crate::control::Scope::Owner,
+            "send",
+            Some(&key),
+            &|| {},
+            || "ERR write failed\n".to_string(),
+        );
         // The cause check: the inbox lock, then the timeline's, each alone.
         let _ = super::validate_cause(&ctx, super::CauseRef::Rec(1));
         let _ = super::validate_cause(&ctx, super::CauseRef::Mail(7));
@@ -1435,6 +1530,89 @@ fn every_producer_runs_under_the_timeline_lock_alone() {
     worker.join().unwrap();
     done_tx.send(()).unwrap();
     holder.join().unwrap();
+}
+
+/// THE META AND FABRIC PRODUCERS TAKE ONLY THEIR ORDER (plan §3.4): with
+/// the store and the turn ledger held on another thread, every meta writer
+/// (its meta lock, then the timeline: the one `meta-change` writer) and every
+/// per-session fabric producer (its fabric lock, then the timeline: the one
+/// typed hook) still runs, so one that reached for anything else hangs the
+/// one-minute detector. The delivery and the landing are store-routed by
+/// design (`cmd_deliver` finds the session first, never nested): the row
+/// they read is delivered before the holder takes its locks, and their marks
+/// are pinned by `the_fabric_verbs_mark_the_log_and_wake_its_watchers`.
+#[test]
+fn the_meta_and_fabric_producers_take_only_their_order() {
+    use crate::session_timeline::{self as st, MetaEdit, MetaField};
+    use std::sync::mpsc;
+    let h = test_handle(1);
+    let store = crate::session_store::new_store();
+    store.write().unwrap().register(h.clone());
+    let sid = h.ctx.self_id.as_str().to_string();
+    let row = format!("{sid} off=7 from=h-a kind=task trust=human text=x");
+    assert_eq!(crate::fabric::cmd_deliver(&store, &row), "OK 1\n");
+    let (held_tx, held_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let (store2, ctx2) = (Arc::clone(&store), Arc::clone(&h.ctx));
+    let holder = std::thread::spawn(move || {
+        let _s = store2.write().unwrap();
+        let _t = ctx2.turns.lock().unwrap();
+        held_tx.send(()).unwrap();
+        let _ = done_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    });
+    held_rx
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the holder took its locks");
+    assert!(store.try_write().is_err(), "the store is held");
+    assert!(h.ctx.turns.try_lock().is_err(), "the ledger is held");
+    let (ran_tx, ran_rx) = mpsc::channel();
+    let ctx = Arc::clone(&h.ctx);
+    let worker = std::thread::spawn(move || {
+        let now = crate::metrics::now_us();
+        let owner = aterm_agent::supervise::run::ATTENTION_OWNER;
+        // The meta writers.
+        let _ = st::apply_meta_value(&ctx, MetaField::Role, Some("lead".into()), Actor::Ctl);
+        let _ = st::write_session_meta(&ctx, MetaField::Title, MetaEdit::Set("t"), Actor::Human);
+        let _ = st::apply_autopilot(&ctx, Some("cruise".into()), Some(i64::MAX), Actor::Ctl);
+        let _ = st::cancel_land_at(&ctx, Some(i64::MAX));
+        let _ = st::fire_land_at(&ctx, 1, 2);
+        let _ = st::write_attention_owned(&ctx, owner, MetaEdit::Set("stuck"), Actor::Harness);
+        let _ = st::write_server_attention(&ctx, "aterm", Some("stalled".into()));
+        let _ = st::claim_supervisor_as(&ctx, "h", None, Some(now + 1), None, now, Actor::Ctl);
+        let _ = st::lapse_supervisor(&ctx, now + 2);
+        let _ = st::claim_supervisor_as(&ctx, "h", Some(9), None, None, now, Actor::Ctl);
+        let _ = st::release_supervisor_held_by(&ctx, "h", now, Actor::Ctl);
+        let _ = st::claim_supervisor_as(&ctx, "h", Some(9), None, None, now, Actor::Ctl);
+        let _ = st::release_supervisor(&ctx, Some(9), now, Actor::Aterm);
+        st::seed_carried_claims(&ctx.meta, &ctx.timeline, None, &["a=b".to_string()], now);
+        // The fabric's per-session producers.
+        let none = || {};
+        let _ = crate::fabric::cmd_inbox_seen_waking(&*ctx, "1 handled", &none);
+        let _ =
+            crate::fabric::cmd_post_waking(&*ctx, "to=@s-peer kind=ask --wait=0 x", None, &none);
+        let hold = crate::fabric::Hold {
+            reason: "demo".into(),
+            origin: "local".into(),
+        };
+        let _ = crate::fabric::carry_hold_waking(&*ctx, hold, &none);
+        let _ = crate::fabric::apply_hold_for_test(&*ctx, None);
+        ran_tx.send(()).unwrap();
+    });
+    ran_rx
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("a meta or fabric producer waited on a lock outside its order");
+    worker.join().unwrap();
+    done_tx.send(()).unwrap();
+    holder.join().unwrap();
+    let got = lines_of(&h.ctx.timeline);
+    for kind in [
+        " mark - meta ",
+        " mark - mail-seen ",
+        " mark - mail dir=out ",
+        " mark - hold ",
+    ] {
+        assert!(got.iter().any(|l| l.contains(kind)), "{kind}: {got:?}");
+    }
 }
 
 // ---- the `log` verb --------------------------------------------------------
@@ -2235,16 +2413,26 @@ fn input_while_the_name_waits_attributes_the_first_turn() {
             hand.set(by_ms);
             let mut g = h.ctx.timeline.lock().unwrap();
             let now = g.slog().now();
-            g.slog_mut()
-                .ctl_input(Actor::Ctl, super::InputVerb::Send, None, now);
+            g.slog_mut().ctl_input(
+                Actor::Ctl,
+                super::InputVerb::Send,
+                None,
+                super::InputAct::default(),
+                now,
+            );
         }
         blocks(&h.ctx.timeline, &hand, 10, &running(1, 5, "claude"));
         if by_ms >= 10 {
             hand.set(by_ms);
             let mut g = h.ctx.timeline.lock().unwrap();
             let now = g.slog().now();
-            g.slog_mut()
-                .ctl_input(Actor::Ctl, super::InputVerb::Send, None, now);
+            g.slog_mut().ctl_input(
+                Actor::Ctl,
+                super::InputVerb::Send,
+                None,
+                super::InputAct::default(),
+                now,
+            );
         }
         {
             let mut g = h.ctx.timeline.lock().unwrap();
@@ -2384,7 +2572,7 @@ fn a_command_from_before_this_process_measures_its_duration_on_the_wall() {
 /// the node it hangs under (the session node aside: a command carried from
 /// a predecessor began before this log's session opened). `Err` names the
 /// first record that breaks one.
-fn time_order_holds(lines: &[String]) -> Result<(), String> {
+pub(super) fn time_order_holds(lines: &[String]) -> Result<(), String> {
     let field = |l: &str, k: &str| -> Option<u64> {
         l.split(' ')
             .find_map(|w| w.strip_prefix(k))
@@ -3545,11 +3733,12 @@ fn evicted_gaps(tl: &Mutex<SessionTimeline>) -> usize {
 /// add none (the cursor moved past the drop, to the first block still held).
 /// A `clear` keeps its own running block (its D lands there), so it is read
 /// like any command, as is one the sweep saw running (it closes
-/// `out=unknown` after a RIS), and a Cmd-K or RIS at an idle prompt took only
-/// a prompt that ran nothing (no C landed off the held blocks): no gap. In
-/// every case the command run at the new prompt is logged. NEGATIVE CONTROL:
-/// a log with no count from a read before at its cursor cannot tell, and
-/// counts the same RIS's drop as a loss.
+/// `out=unknown` after a RIS: its C was read, the next command's too when
+/// the sweep reads that past the gone block), and a Cmd-K or RIS at an idle
+/// prompt took only a prompt that ran nothing (no C landed off the held
+/// blocks): no gap. In every case the command run at the new prompt is
+/// logged. NEGATIVE CONTROL: a log with no count from a read before at its
+/// cursor cannot tell, and counts the same RIS's drop as a loss.
 #[test]
 fn a_cleared_block_history_is_said_once_and_only_when_it_took_a_command() {
     let prompt = b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\";
@@ -3567,6 +3756,7 @@ fn a_cleared_block_history_is_said_once_and_only_when_it_took_a_command() {
         ("a clear past an unread command", 1, 2, 3),
         ("reset", 1, 2, 2),
         ("reset seen running", 0, 2, 2),
+        ("reset seen running, a command after it", 0, 2, 3),
         ("cmd-k", 0, 0, 2),
         ("ris", 0, 2, 2),
     ] {
@@ -3593,10 +3783,14 @@ fn a_cleared_block_history_is_said_once_and_only_when_it_took_a_command() {
                 term.process(b"\x1b[H\x1b[2J\x1b[3J\x1b]133;D;0\x1b\\");
             }
             "reset" => term.process(b"reset\r\n\x1b]133;C\x1b\\\x1bc\x1b]133;D;0\x1b\\"),
-            "reset seen running" => {
+            "reset seen running" | "reset seen running, a command after it" => {
                 term.process(b"reset\r\n\x1b]133;C\x1b\\");
                 sweep_term(&tl, &hand, &term, 50);
                 term.process(b"\x1bc\x1b]133;D;0\x1b\\");
+                if case.ends_with("after it") {
+                    term.process(prompt);
+                    term.process(b"true\r\n\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\");
+                }
             }
             "cmd-k" => term.clear_scrollback(),
             _ => term.process(b"\x1bc"),
@@ -3655,7 +3849,10 @@ fn a_cleared_block_history_is_said_once_and_only_when_it_took_a_command() {
 /// clear took its block: a RIS does (CONTROL, one gap), while ED 3 and Cmd-K
 /// take only the history and leave its block on the screen to be read. A
 /// command run after a Cmd-K at the prompt runs on the block the Cmd-K left:
-/// read, no gap.
+/// read, no gap. A command seen running under the program in front (a
+/// remote shell's, under `ssh`) that the program's close took (`out=gone`:
+/// `ssh` died, the shell is back in front), and a person's key then dropped,
+/// was read too: a RIS at the prompt after it loses nothing.
 #[test]
 fn an_idle_clear_after_a_seen_command_writes_no_gap() {
     let prompt = b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\";
@@ -3719,6 +3916,42 @@ fn an_idle_clear_after_a_seen_command_writes_no_gap() {
         "ls ran on the prompt's block: {:?}",
         lines_of(&tl)
     );
+    // `sleep` under `ssh`, which dies: its close takes the command.
+    let mut term = aterm_core::terminal::Terminal::new(24, 80);
+    let (tl, hand) = opened();
+    let sweep = |term: &aterm_core::terminal::Terminal, front: i32, ms: u64| {
+        hand.set(ms);
+        let mut g = tl.lock().unwrap();
+        let from = g.slog().block_cursor();
+        let since = g.slog().opened_wall();
+        let read = crate::session_status::block_read(term, from, since, None);
+        let _ = g.sweep_slog(&read, false, 100, front);
+    };
+    {
+        let mut g = tl.lock().unwrap();
+        assert!(g.note_foreground_group(300));
+        assert!(g.set_program(300, Some("ssh".into())));
+    }
+    sweep(&term, 300, 10);
+    term.process(prompt);
+    term.process(b"sleep 9\r\n\x1b]133;C\x1b\\");
+    sweep(&term, 300, 20);
+    sweep(&term, 100, 30);
+    {
+        let mut g = tl.lock().unwrap();
+        let at = g.slog().now();
+        g.slog_mut().human_input(true, at);
+    }
+    term.process(prompt);
+    term.process(b"\x1bc");
+    term.process(prompt);
+    sweep(&term, 100, 40);
+    let got = lines_of(&tl);
+    assert!(
+        got.iter().any(|l| l.contains(" close r2 cmd out=gone ")),
+        "PRECONDITION: ssh's close took sleep: {got:?}"
+    );
+    assert_eq!(evicted_gaps(&tl), 0, "{got:?}");
 }
 
 /// THE CAP OWES A LOOK ONLY FOR A BLOCK THAT MAY YET BE A FACT: `n` commands
@@ -3727,28 +3960,49 @@ fn an_idle_clear_after_a_seen_command_writes_no_gap() {
 /// never be a fact: no look owed (`more` false), and a RIS at that prompt
 /// before the next sweep loses nothing. NEGATIVE CONTROL: at 33 the 33rd
 /// command is past the cap, owed (`more`), and the same RIS takes it unread:
-/// one gap. (A Cmd-K there would not: the 33rd block reaches the screen.)
+/// one gap, whether it had finished at the read or was still running there
+/// (the `reset` that sends the RIS: its C is one the cut left unread). (A
+/// Cmd-K there would not: the 33rd block reaches the screen.)
 #[test]
 fn the_cap_owes_a_look_only_for_a_block_that_may_yet_be_a_fact() {
     use crate::session_status::{BLOCK_READ_MAX, block_read};
     let prompt = b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\";
-    for (n, more, gaps) in [(31, false, 0), (32, false, 0), (33, true, 1)] {
+    for (n, running, more, gaps) in [
+        (31, false, false, 0),
+        (32, false, false, 0),
+        (33, false, true, 1),
+        (33, true, true, 1),
+    ] {
         let mut term = aterm_core::terminal::Terminal::new(24, 80);
         for i in 0..n {
             term.process(prompt);
-            term.process(format!("true {i}\r\n\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\").as_bytes());
+            term.process(format!("true {i}\r\n\x1b]133;C\x1b\\").as_bytes());
+            if !running || i + 1 < n {
+                term.process(b"\x1b]133;D;0\x1b\\");
+            }
         }
-        term.process(prompt);
+        if !running {
+            term.process(prompt);
+        }
         let (tl, hand) = opened();
         let read = block_read(&term, None, None, None);
-        assert_eq!(read.facts.len(), n.min(BLOCK_READ_MAX), "n={n}");
-        assert_eq!(read.more, more, "n={n}");
+        assert_eq!(
+            read.facts.len(),
+            n.min(BLOCK_READ_MAX),
+            "n={n} running={running}"
+        );
+        assert_eq!(read.more, more, "n={n} running={running}");
         blocks(&tl, &hand, 10, &read);
         term.process(b"\x1bc");
         term.process(prompt);
         sweep_term(&tl, &hand, &term, 100);
         sweep_term(&tl, &hand, &term, 200);
-        assert_eq!(evicted_gaps(&tl), gaps, "n={n}: {:?}", lines_of(&tl));
+        assert_eq!(
+            evicted_gaps(&tl),
+            gaps,
+            "n={n} running={running}: {:?}",
+            lines_of(&tl)
+        );
     }
 }
 
@@ -4217,11 +4471,15 @@ fn lost_command_oracle(cfg: OracleCfg) -> OracleTally {
 /// NEGATIVE CONTROLS: the oracle sees a log told no count (it falls back on
 /// the dropped ids, and says a gap for a clear that took no command) and one
 /// told nothing of the drop (it says no gap for a command that went unread).
+/// Each seed is a fresh walk of the same mix. Measured 2026-10-17: every
+/// coverage class above shows in more than a third of a mix's seeds, and each
+/// negative control catches its defect in more than half of its seeds, the
+/// first by seed 3; so a mix runs 50 to 100 seeds, not 200 to 400.
 #[test]
 fn the_block_read_says_every_lost_command_and_nothing_else() {
     let keep: fn(&mut BlockRead) = |_| {};
     let base = OracleCfg {
-        seeds: (1, 400),
+        seeds: (1, 100),
         steps: 60,
         osc633: false,
         nonce: false,
@@ -4234,7 +4492,7 @@ fn the_block_read_says_every_lost_command_and_nothing_else() {
         (
             "633 and the nonce gate",
             OracleCfg {
-                seeds: (1, 200),
+                seeds: (1, 50),
                 steps: 120,
                 osc633: true,
                 nonce: true,
@@ -4244,7 +4502,7 @@ fn the_block_read_says_every_lost_command_and_nothing_else() {
         (
             "seamless updates",
             OracleCfg {
-                seeds: (1, 200),
+                seeds: (1, 50),
                 steps: 120,
                 osc633: true,
                 nonce: true,
@@ -4295,13 +4553,13 @@ fn the_block_read_says_every_lost_command_and_nothing_else() {
 
     // NEGATIVE CONTROLS: the oracle catches a false gap and a missed one.
     let no_count = lost_command_oracle(OracleCfg {
-        seeds: (1, 100),
+        seeds: (1, 25),
         mutate: |r| r.started = None,
         ..base
     });
     assert!(no_count.false_gaps > 0, "{no_count:?}");
     let blind = lost_command_oracle(OracleCfg {
-        seeds: (1, 100),
+        seeds: (1, 25),
         mutate: |r| {
             r.started = None;
             r.dropped = 0;
@@ -4608,7 +4866,7 @@ fn successor_clock(timeline: &Mutex<SessionTimeline>, wall_ms: u64) -> Hand {
 /// successor's adoption (`spawn::mark_handoff_gap`) and registration, its
 /// clock a new process's at `wall_ms`. `carry: false` is an update whose
 /// sidecar has no log (an older sender, or a log that did not cross).
-fn hand_over(
+pub(super) fn hand_over(
     producer: &crate::session_store::SessionHandle,
     store: &SessionStore,
     wall_ms: u64,
@@ -5076,68 +5334,121 @@ fn a_carried_block_cursor_meets_the_engine_the_successor_adopted() {
 /// for good; and with the `state` line mangled the session's open instant is
 /// the adoption's, so a command that finishes between two sweeps after it is
 /// still logged (the review's case: `opened_wall` left unset logged none).
+/// Either line alone still tells what a RIS took: with the command line
+/// gone, the carried count goes on past the command's block (its C was
+/// read), so a RIS that took only the idle prompt after it lost nothing;
+/// with the count gone, a RIS that took the command's own block dropped
+/// only the open run's id. No `gap why=evicted` in any.
 #[test]
 fn a_host_state_that_does_not_reconcile_closes_what_nobody_holds() {
-    let (p, store, hand) = producer();
-    blocks(&p.ctx.timeline, &hand, 200, &running(1, 100, "sleep"));
-    let manifest = SessionHandoff::from_store(&store);
-    let rec = manifest.sessions[0].clone();
-    let src = p.ctx.timeline.lock().unwrap().slog_carry_source();
-    let lines = src
-        .encode(aterm_slog::CarryBudget::SESSION)
-        .expect("carried")
-        .lines;
-    // Line for line (the carry counts its lines): the command's producer
-    // line and the state line no longer read.
-    let mangled: Vec<String> = lines
-        .iter()
-        .map(|l| {
-            if l.starts_with("host cmd ") {
-                "host cmd blk=zz".to_string()
-            } else if l.starts_with("host state ") {
-                "host state v=1 opened=zz".to_string()
-            } else {
-                l.clone()
-            }
-        })
-        .collect();
-    assert_ne!(mangled, lines, "PRECONDITION: both lines were there");
-    let successor = test_handle(1);
-    let hand2 = successor_clock(&successor.ctx.timeline, 5_000);
-    crate::spawn::mark_handoff_gap(
-        &successor.ctx.timeline,
-        &successor.ctx.cast,
-        &successor.ctx.temporal,
-        None,
-        rec.timeline_id,
-        LogAdopt {
-            ids: rec.log_ids.as_deref().and_then(LogCarry::parse),
-            seq: rec.log_seq,
-            lines: Some(mangled),
-            keeper_ep: None,
-            mirror: None,
-        },
-        false,
-    );
-    let got = lines_of(&successor.ctx.timeline);
-    assert!(
-        got.iter()
-            .any(|l| l.contains(" close r1 cmd out=gone ") && l.contains(" by=aterm ")),
-        "the command nobody holds closes at the adoption: {got:?}"
-    );
-    // A command that started and finished after the adoption, between two
-    // sweeps, is logged from its stamps.
-    hand2.set(1_000);
-    {
-        let mut g = successor.ctx.timeline.lock().unwrap();
-        swept_with(&mut g, &finished(2, Some(1), 5_200, 5_600, "make"));
+    for mangle in ["both", "cmd", "state"] {
+        let (p, store, hand) = producer();
+        // `sleep` seen running in block 1, its C counted.
+        let seen = BlockRead {
+            through: Some(1),
+            started: Some(1),
+            started_held: 1,
+            ..running(1, 100, "sleep")
+        };
+        blocks(&p.ctx.timeline, &hand, 200, &seen);
+        let manifest = SessionHandoff::from_store(&store);
+        let rec = manifest.sessions[0].clone();
+        let src = p.ctx.timeline.lock().unwrap().slog_carry_source();
+        let lines = src
+            .encode(aterm_slog::CarryBudget::SESSION)
+            .expect("carried")
+            .lines;
+        // Line for line (the carry counts its lines): the command's producer
+        // line, the state line, or both no longer read.
+        let mangled: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                if l.starts_with("host cmd ") && mangle != "state" {
+                    "host cmd blk=zz".to_string()
+                } else if l.starts_with("host state ") && mangle != "cmd" {
+                    "host state v=1 opened=zz".to_string()
+                } else {
+                    l.clone()
+                }
+            })
+            .collect();
+        assert_ne!(
+            mangled, lines,
+            "{mangle}: PRECONDITION: the lines were there"
+        );
+        let successor = test_handle(1);
+        let hand2 = successor_clock(&successor.ctx.timeline, 5_000);
+        crate::spawn::mark_handoff_gap(
+            &successor.ctx.timeline,
+            &successor.ctx.cast,
+            &successor.ctx.temporal,
+            None,
+            rec.timeline_id,
+            LogAdopt {
+                ids: rec.log_ids.as_deref().and_then(LogCarry::parse),
+                seq: rec.log_seq,
+                lines: Some(mangled),
+                keeper_ep: None,
+                mirror: None,
+            },
+            false,
+        );
+        let got = lines_of(&successor.ctx.timeline);
+        assert_eq!(
+            got.iter()
+                .any(|l| l.contains(" close r1 cmd out=gone ") && l.contains(" by=aterm ")),
+            mangle != "state",
+            "{mangle}: the command nobody holds closes at the adoption: {got:?}"
+        );
+        // The successor's first read, from its cursor, and the record it
+        // writes.
+        let (read, logged): (BlockRead, &[&str]) = match mangle {
+            // A command that started and finished after the adoption, between
+            // two sweeps: logged from its stamps.
+            "both" => (
+                finished(2, Some(1), 5_200, 5_600, "make"),
+                &[" cmd out=fail ", " code=1 "],
+            ),
+            // The sleep ended; a RIS took the idle prompt after it (block 2).
+            "cmd" => (
+                BlockRead {
+                    from: Some(2),
+                    through: Some(2),
+                    dropped: 1,
+                    started: Some(1),
+                    ..BlockRead::default()
+                },
+                &[],
+            ),
+            // A RIS took the sleep's own block: it closes with it.
+            _ => (
+                BlockRead {
+                    from: Some(1),
+                    through: Some(1),
+                    dropped: 1,
+                    started: Some(1),
+                    ..BlockRead::default()
+                },
+                &[" close r1 cmd out=unknown "],
+            ),
+        };
+        hand2.set(1_000);
+        {
+            let mut g = successor.ctx.timeline.lock().unwrap();
+            assert_eq!(g.slog().block_cursor(), read.from, "{mangle}: PRECONDITION");
+            swept_with(&mut g, &read);
+        }
+        let got = lines_of(&successor.ctx.timeline);
+        assert!(
+            logged.is_empty() || got.iter().any(|l| logged.iter().all(|w| l.contains(w))),
+            "{mangle}: {logged:?}: {got:?}"
+        );
+        assert_eq!(
+            evicted_gaps(&successor.ctx.timeline),
+            0,
+            "{mangle}: {got:?}"
+        );
     }
-    let got = lines_of(&successor.ctx.timeline);
-    assert!(
-        got.iter()
-            .any(|l| l.contains(" cmd out=fail ") && l.contains(" code=1 ")),
-        "still logged: {got:?}"
-    );
 }
 
 /// THE READERS' FENCE across the overlap: once the worker took the carry, a
@@ -6008,6 +6319,7 @@ fn the_typed_line_carries_the_inputs_author_and_cause() {
             Actor::Harness,
             super::InputVerb::Send,
             ShortId::new("@5"),
+            super::InputAct::default(),
             at,
         );
         let host = g.slog().host_lines(at);
@@ -6101,5 +6413,182 @@ fn a_turn_a_delivery_route_refuses_keeps_attribution_without_an_input_mark() {
     assert!(
         marks.is_empty(),
         "CTL_TURN_MARKED_UNACCEPTED_INPUT: a callback that accepted no bytes left {marks:?}"
+    );
+}
+
+/// THE HOST LINES AT THEIR WORST (ruling S5; addendum A1, A2): the `state`
+/// line with every `Observed` token at its longest (`u64::MAX` walls, the
+/// widest pgid, the longest word of each table, both fingerprints,
+/// `obs_esc`, a `meta_fp` of every meta field), and every line present
+/// whenever its producer holds state (the journal's, `cmd`, `fg`, `agent`,
+/// the tracker's with every 2A, 3A, S2, S23 and S31 token at its longest,
+/// `typed`), each crosses with its `host ` tag within the carry's line
+/// bound less five, and together within its host bytes, so a carry never
+/// silently drops one of them. The widest `pending` lines come last and
+/// take what is left: at least one crosses beside them (M4 counts how
+/// many).
+#[test]
+fn the_always_present_host_lines_fit_the_carry_at_their_worst() {
+    use crate::session_timeline::{MetaField, SUPERVISOR_FIELD};
+    use aterm_slog::{CARRY_MAX_HOST_BYTES, CARRY_MAX_LINE, ShortId, TurnTracker};
+    let (tl, _hand) = opened();
+    let mut g = tl.lock().unwrap();
+    let s = g.slog_mut();
+    let max = u64::MAX;
+    let now = Stamp::new(max, max);
+    let run = Node::parse("r4294967295").expect("a node");
+    let id40 = "a".repeat(ShortId::MAX);
+    let sid = ShortId::new(&id40).expect("an id");
+    s.origin = Kind::Restore;
+    s.opened_wall = Some(max);
+    s.root_pgid = i32::MIN;
+    s.last_blk = Some(max);
+    s.c_snap = Some(CSnap {
+        base: max,
+        cursor: Some(max),
+    });
+    s.cmd_end = Some(now);
+    s.arrivals = max;
+    let fp = "f".repeat(16);
+    let meta: Vec<String> = MetaField::ALL
+        .iter()
+        .map(|f| f.wire_name())
+        .chain([SUPERVISOR_FIELD])
+        .map(|f| format!("{f}.{fp}"))
+        .collect();
+    let tokens: HashMap<&str, String> = [
+        ("obs_int", "degraded".to_string()),
+        ("obs_ctx", "10".to_string()),
+        ("obs_goal", "1".to_string()),
+        ("obs_prog", "indeterminate.10".to_string()),
+        ("obs_render", "desync-risk".to_string()),
+        ("cwd_fp", fp.clone()),
+        ("title_fp", fp.clone()),
+        ("obs_esc", "1".to_string()),
+        ("meta_fp", meta.join(",")),
+    ]
+    .into_iter()
+    .collect();
+    s.observed.read_carry(|k| tokens.get(k).cloned());
+    let said = s.observed.carry_tokens();
+    for (k, v) in &tokens {
+        assert!(said.contains(&format!(" {k}={v}")), "{k} lost: {said}");
+    }
+    s.cmd = Some(CmdRun {
+        blk: max,
+        node: run,
+        wall_from: Some(max),
+        child_end: Some(now),
+    });
+    s.fg = Some(FgRun {
+        pgid: i32::MIN,
+        node: run,
+        name_fp: max,
+    });
+    let detail = "%E9".repeat(16);
+    let worst = format!(
+        "tracker run=r4294967295 turn=t4294967295 word=wall:usage-session interrupted=1 \
+         step=p4294967295 step_under=1 step_what=wall step_wall=usage-session step_detail={detail} \
+         settle=wall:usage-session settle_wall={max} \
+         ledger={max} ledger_by={id40} ledger_wall={max} ledger_cause={id40} \
+         input_by={id40} input_wall={max} input_cause={id40} \
+         tx_fp={max:016x} tx_off={max} tx_id={max:x}:{max:x} tx_v={id40} tx_vt=t4294967295 \
+         tx_ve={max} tx_vp={max} tx_ref=usage-session tx_st=partial tx_ds=1 tx_dr={max} tx_du=1"
+    );
+    let who = [
+        aterm_phase::Program::Claude,
+        aterm_phase::Program::Codex,
+        aterm_phase::Program::Agy,
+        aterm_phase::Program::Muse,
+        aterm_phase::Program::Gemini,
+        aterm_phase::Program::Generic,
+    ]
+    .into_iter()
+    .max_by_key(|p| p.name().len())
+    .expect("a program");
+    s.agent = Some(AgentRun {
+        pgid: i32::MIN,
+        node: run,
+        who,
+        by_screen: true,
+        tracker: TurnTracker::from_carry_line(&worst, now).expect("the worst line reads"),
+    });
+    s.typed = Typed {
+        input: Some((max, Actor::sid(sid), Some(sid), now)),
+        ctl: Some((max, Actor::sid(sid), max, Some(sid), now)),
+    };
+    let always = |s: &SessionLog| {
+        let mut lines = s.host_lines(now);
+        if lines.first().map(String::as_str) != Some(carry::JOURNAL_HOST_LINE) {
+            lines.insert(0, carry::JOURNAL_HOST_LINE.to_string());
+        }
+        lines
+    };
+    let lines = always(s);
+    let tags = ["journal", "state", "cmd", "fg", "agent", "tracker", "typed"];
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| l.split(' ').next().unwrap_or(""))
+            .collect::<Vec<_>>(),
+        tags,
+        "{lines:#?}"
+    );
+    for l in &lines {
+        assert!(
+            "host ".len() + l.len() <= CARRY_MAX_LINE - 5,
+            "{} bytes: {l}",
+            l.len()
+        );
+    }
+    let bytes: usize = lines.iter().map(|l| l.len() + 1).sum();
+    assert!(bytes <= CARRY_MAX_HOST_BYTES, "{bytes} bytes: {lines:#?}");
+    // The widest waiting names, as many as the log holds, after them.
+    let wide = |n: usize| "%".repeat(n);
+    s.pending = (0..PENDING_NAMES_MAX)
+        .map(|_| PendingName {
+            pgid: i32::MIN,
+            name: Some(wide(carry::PENDING_NAME_MAX)),
+            word: wide(carry::PENDING_WORD_MAX),
+            detail: Some(wide(carry::PENDING_DETAIL_MAX)),
+            at: now,
+            seq: max,
+        })
+        .collect();
+    let host = always(s);
+    let out = s
+        .log
+        .carry(aterm_slog::CarryBudget::SESSION, &host)
+        .expect("carries");
+    let crossed: Vec<&str> = out
+        .lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("host "))
+        .collect();
+    for tag in tags {
+        assert!(
+            crossed.iter().any(|l| l.split(' ').next() == Some(tag)),
+            "{tag} dropped beside the waiting names: {crossed:#?}"
+        );
+    }
+    let pending = crossed.iter().filter(|l| l.starts_with("pending ")).count();
+    assert!(
+        pending >= 1,
+        "no waiting name crosses beside {bytes} bytes of always-present lines"
+    );
+    eprintln!(
+        "M4: {bytes} B of always-present host lines at their worst; {pending} of \
+         {PENDING_NAMES_MAX} widest pending lines fit beside them"
+    );
+    // Whatever the names, the always-present lines go first: as they fit
+    // the host bytes together (above) and the carry takes lines in order,
+    // a burst of names can cost only names.
+    assert_eq!(
+        host.iter()
+            .take(tags.len())
+            .map(|l| l.split(' ').next().unwrap_or(""))
+            .collect::<Vec<_>>(),
+        tags,
+        "the waiting names come after every always-present line: {host:#?}"
     );
 }

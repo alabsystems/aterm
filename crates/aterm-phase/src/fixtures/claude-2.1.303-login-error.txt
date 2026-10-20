@@ -1,0 +1,22 @@
+# claude-code 2.1.303 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the /login dialog after a failed code exchange, 2.1.303
+ ▐▛███▛█   Claude Code v2.1.303
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.26bb/proj
+
+
+❯ hi
+  ⎿  Not logged in · Please run /login
+
+✻ Worked for 1s · done 10:24 AM
+
+❯ /login
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Login
+
+  OAuth error: proxy refused the connection
+
+
+  Press Enter to retry.
+
+  Esc to cancel

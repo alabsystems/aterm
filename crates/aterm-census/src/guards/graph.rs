@@ -270,55 +270,36 @@ fn appkit_door_findings(file: &SourceFile) -> Vec<Finding> {
 /// assertion, an `Option<Windowed>` parameter or return.
 const WINDOWED_TOKEN: &str = "Windowed";
 
-/// The windowed-only functions that may send it without the proof, by file
-/// name and the innermost `fn` holding the send, each for the reason given. A
-/// row goes when the proof reaches its function.
-const APP_SITES: &[(&str, &str)] = &[
-    // The development pre-dial seam, on a successor only a window's updater launches.
-    (
-        "handoff_rendezvous.rs",
-        "debug_check_in_with_launch_services",
-    ),
-];
-
 pub(super) const SHARED_APPLICATION: Rule = Rule {
     id: "shared-application",
     why: "+[NSApplication sharedApplication] creates the application object when none exists, \
           as in a headless process, and its -init checks in with LaunchServices and opens a \
           WindowServer connection; aterm-gui sends it only in a function that holds the \
-          `Windowed` proof a windowed launch mints (takes it, or answers without it first), or \
-          one this rule lists",
+          `Windowed` proof a windowed launch mints (takes it, or answers without it first)",
     scope: GUI_SOURCE,
-    check: listed_sites,
+    check: shared_application,
 };
 
 /// The source the rule reads: aterm-gui's, the window crate's and its
 /// split-out libraries' (`crates/aterm-gui-*`).
 const GUI_SOURCE: &[&str] = &["crates/aterm-gui/src/", "crates/aterm-gui-"];
 
-fn listed_sites(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    shared_application(tree, APP_SITES, out);
-}
-
-/// Every send no proof holds, outside the `sites` (file name, function) rows.
-fn shared_application(tree: &Tree<'_>, sites: &[(&str, &str)], out: &mut Vec<Finding>) {
+/// Every send no proof holds.
+fn shared_application(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for file in tree.corpus.under(GUI_SOURCE) {
         if !file.mentions(&["sharedApplication"]) {
             continue;
         }
         for send in shared_application_sends(&file.lexed().code) {
-            let listed = send
-                .func
-                .is_some_and(|f| sites.iter().any(|&(n, g)| n == file.name() && g == f));
-            if send.windowed || listed {
+            if send.windowed {
                 continue;
             }
             out.push(file.finding(
                 SHARED_APPLICATION.id,
                 send.line,
                 format!(
-                    "sends +[NSApplication sharedApplication] in `{}`, which neither holds the \
-                     `{WINDOWED_TOKEN}` proof nor is on the windowed-only list",
+                    "sends +[NSApplication sharedApplication] in `{}`, which does not hold the \
+                     `{WINDOWED_TOKEN}` proof",
                     send.func.unwrap_or("-")
                 ),
             ));
@@ -744,25 +725,9 @@ mod tests {
         assert!(found.is_empty(), "CRIES WOLF: {found:?}");
     }
 
-    /// The rule over its own windowed-only list, so no case hangs on a row of
-    /// the real one.
-    const LISTED: &[(&str, &str)] = &[
-        ("menu.rs", "install"),
-        ("app_launch_successor.rs", "activate_running"),
-        ("hwkey.rs", "post"),
-    ];
-
-    fn listed(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-        shared_application(tree, LISTED, out);
-    }
-
-    /// The application object's sends no proof or row holds, in `files`.
+    /// The application object's sends no proof holds, in `files`.
     fn app_sends(files: &[(&str, &str)]) -> Vec<Finding> {
-        let rule = Rule {
-            check: listed,
-            ..SHARED_APPLICATION
-        };
-        run(&rule, files)
+        run(&SHARED_APPLICATION, files)
     }
 
     /// The functions named by the findings for one file of `src`.
@@ -780,7 +745,7 @@ mod tests {
     fn a_send_outside_the_windowed_functions_is_found() {
         let cases: &[(&str, &str, String, &str)] = &[
             (
-                "a listed name in another file",
+                "a windowed function's name, without the proof",
                 "crates/aterm-gui/src/status_item.rs",
                 format!(
                     "pub(crate) fn install(p: &Proxy) -> Option<Item> {{\n    let app = {SEND};\n    None\n}}\n"
@@ -796,7 +761,7 @@ mod tests {
                 "in `read_native_chrome`",
             ),
             (
-                "a send after a nested listed name",
+                "a send after a nested fn",
                 "crates/aterm-gui/src/hwkey.rs",
                 format!(
                     "impl App {{\n    fn read_native_chrome(&self) -> Vec<String> {{\n        fn post() -> usize {{\n            0\n        }}\n        let app =\n            {SEND};\n        vec![]\n    }}\n}}\n"
@@ -824,23 +789,9 @@ mod tests {
     }
 
     #[test]
-    fn sends_in_the_listed_functions_prose_and_strings_are_silent() {
-        let menu = format!(
-            "mod macos {{\n    pub(crate) fn install(p: &Proxy) -> Option<Menu> {{\n        let main = build(p)?;\n        unsafe {{\n            let app = {SEND};\n        }}\n        Some(Menu)\n    }}\n}}\n"
-        );
-        let successor = format!(
-            "pub(crate) fn activate_running(pid: i32) -> bool {{\n    unsafe {{\n        let shared: unsafe extern \"C-unwind\" fn(Id, Sel) -> Id = aterm_objc::msg();\n        let app = {SEND};\n        pid > 1\n    }}\n}}\n"
-        );
-        let hwkey = format!(
-            "pub(crate) fn post(spec: &[u8; 4], n: i64) -> Result<u32, String> {{\n    let app = {SEND};\n    Ok(0)\n}}\n"
-        );
+    fn prose_and_strings_are_silent() {
         let prose = "impl App {\n    /// Never `sel!(sharedApplication)` here.\n    fn read_native_chrome(&self) -> Vec<String> {\n        // sel!(sharedApplication) in a trailing note\n        let why = \"sel!(sharedApplication) CREATES NSApp\";\n        vec![why.to_string()]\n    }\n}\n";
-        let found = app_sends(&[
-            ("crates/aterm-gui/src/menu.rs", &menu),
-            ("crates/aterm-gui/src/app_launch_successor.rs", &successor),
-            ("crates/aterm-gui/src/hwkey.rs", &hwkey),
-            ("crates/aterm-gui/src/app_introspect.rs", prose),
-        ]);
+        let found = app_sends(&[("crates/aterm-gui/src/app_introspect.rs", prose)]);
         assert!(found.is_empty(), "CRIES WOLF: {found:?}");
     }
 

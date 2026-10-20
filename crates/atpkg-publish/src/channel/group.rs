@@ -12,8 +12,7 @@
 //!   tool present; room beside the output;
 //! * its SEED-MINT receipt (`atpkg::lineage::seed_mint_refusals`, unless the switch is
 //!   dormant) and, to publish, the re-pin on the trust repo's origin main
-//!   ([`super::seed`]), the candidate gate's pass ([`super::candidate`]) and both owners'
-//!   tokens;
+//!   ([`super::seed`]) and both owners' tokens;
 //! * the trust build and every sibling's (`rev-list --count`, skipping tags published on
 //!   either owner when the compiler moved) against the floor, the verified head's pin for
 //!   that target (`pin` on [`crate::programs::PIN_TRIPLE`], else that target's overlay):
@@ -33,7 +32,6 @@ use std::time::{Duration, Instant};
 
 use atpkg::Channel;
 
-use super::candidate::{CandidateGate, GateAnswer, ShipTrustCandidate};
 use super::{Log, Scratch, flag_value, seed};
 use crate::api::{
     Baseline, BundlePacker, BundleRequest, Delta, HelloGate, IndexRequest, Indexer, PackRequest,
@@ -127,8 +125,6 @@ impl SealProbe for RealProbe {
 pub struct Parts<'a> {
     /// The seal and the switch.
     pub probe: &'a dyn SealProbe,
-    /// The candidate gate.
-    pub gate: &'a dyn CandidateGate,
     /// Packs the bundle.
     pub bundle: &'a dyn BundlePacker,
     /// Packs the siblings.
@@ -487,10 +483,9 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
             pf.problems.push(format!(
                 "the seal's bin/ is missing {} exposed tool(s) — {}. Build them against THIS \
                  seal, copy the seal to a staging dir (a sealed artifact is immutable), drop \
-                 the new bins in its bin/, point --seal at the staging dir, and run the \
-                 candidate gate on THAT directory (its receipt binds the tree_root it \
-                 measured). Never drop a name from TRUST_EXPOSES: the client prunes the shim of \
-                 a name an update stops exposing",
+                 the new bins in its bin/ and point --seal at the staging dir. Never drop a \
+                 name from TRUST_EXPOSES: the client prunes the shim of a name an update stops \
+                 exposing",
                 missing.len(),
                 missing.join(" ")
             ));
@@ -667,23 +662,6 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
                 }
             }
         }
-    }
-
-    // The candidate gate (D27), asked in every mode: the answer is read in-process from
-    // the receipts store, so a dry run says what a publish would be told.
-    match parts.gate.admits(ctx, seal, pf.public_trust_pin) {
-        GateAnswer::Admitted(receipt) => pf.notes.push(format!(
-            "the candidate gate (D27): PASS for this seal — {receipt}"
-        )),
-        GateAnswer::Refused(why) if upload => pf.problems.extend(why),
-        GateAnswer::CannotCheck(why) if upload => pf.problems.push(why),
-        GateAnswer::Refused(why) => pf.notes.push(format!(
-            "the candidate gate (D27): publishing (--upload) is refused until it passes — {}",
-            why.first().cloned().unwrap_or_default()
-        )),
-        GateAnswer::CannotCheck(why) => pf.notes.push(format!(
-            "the candidate gate (D27): publishing (--upload) needs its PASS — {why}"
-        )),
     }
 
     // Identity and tokens, by mode.
@@ -1172,7 +1150,6 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let req = parse_request(ctx, args)?;
     let parts = Parts {
         probe: &RealProbe,
-        gate: &ShipTrustCandidate,
         bundle: &crate::artifact::bundle::PackBundle,
         packer: &crate::artifact::pack::Pack,
         indexer: &super::index::Index,

@@ -352,10 +352,16 @@ fn a_post_that_becomes_unroutable_leaves_no_reservation_and_no_pin() {
     // concurrent runs under load, the losing drain 67 ms ahead of the line).
     // `Bridge::drain_outbox` now re-reads the roster before it resolves
     // anything, so the first drain after the close answers `unroutable` whatever
-    // the bridge remembered — the idle arm's 250 ms, or sooner.
+    // the bridge remembered.
+    //
+    // THAT DRAIN IS PROMPTED, not waited for: a post of A's own wakes it, and
+    // A's queue drains in order, so the barrier landing says the refused post
+    // ahead of it was resolved again first. Left to the roster round it was a
+    // two-second wait for the same drain.
     //
     // `a_post_to_a_session_whose_exit_line_never_arrives_is_still_retired`
     // pins the same door without needing a loaded machine.
+    w.drained(&a);
     let verdict = until(
         "the post to be retired at the door (the first drain after the close)",
         || {
@@ -585,9 +591,7 @@ fn a_record_refused_for_now_holds_back_only_its_own_session() {
     let (a, b) = w.two_sessions();
 
     // A's ASK LANDS FIRST, so B owes A a receipt once the refusal is armed.
-    let first = w.verb(&format!("@{a} post to=@{b} kind=ask --wait=60000 before"));
-    assert!(first.ok(), "A's first ask: {}", first.header());
-    let first_off = harness::off_of(first.header());
+    let (_, first_off) = w.post_landed(&a, &b, "ask", "", "before");
 
     // THE REFUSAL, for A's records alone.
     let marker = w.state.join("fail-post-publish");
@@ -602,14 +606,9 @@ fn a_record_refused_for_now_holds_back_only_its_own_session() {
         .to_string();
 
     // B IS AFTER A IN DRAIN ORDER, and is not held behind it.
-    let ask = w.verb(&format!("@{b} post to=@{a} kind=ask --wait=60000 not-held"));
-    assert!(
-        ask.ok(),
-        "B's ask lands while A's note is refused: {} — log:\n{}",
-        ask.header(),
-        w.log_tail()
-    );
-    let ask_off = harness::off_of(ask.header());
+    // Landed, however slowly: the regression this holds never landed it while A's note
+    // was refused, and fails here by the hang detector.
+    let (_, ask_off) = w.post_landed(&b, &a, "ask", "", "not-held");
     let in_flight = w.verb(&format!("@{a} inbox --peek"));
     assert!(
         in_flight

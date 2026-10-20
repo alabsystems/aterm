@@ -207,7 +207,7 @@ fn an_uninstalled_roster_tool_names_the_install_not_an_unknown_command() {
 /// printing to stdout: Broken pipe", exit 101) — every one of these verbs did,
 /// deterministically, once the reader closed before the first write; only a long
 /// answer did under a `| head -1` that closed mid-way. The verbs a library answers
-/// in-process (drive, fleet, link, fabric, keeper) print through the same writer
+/// in-process (drive, fleet, link, fabric, keeper, caffeine) print through the same writer
 /// (`aterm_uds::stdout`) as the front door's own.
 #[test]
 fn an_answer_into_a_closed_pipe_exits_cleanly() {
@@ -230,6 +230,7 @@ fn an_answer_into_a_closed_pipe_exits_cleanly() {
         &["link", "--help"],
         &["fabric", "--help"],
         &["keeper", "--help"],
+        &["caffeine", "--help"],
     ] {
         let (reader, writer) = std::io::pipe().expect("a pipe");
         drop(reader);
@@ -273,6 +274,7 @@ fn an_answer_a_full_disk_refused_exits_1_and_says_so() {
         &["link", "--help"],
         &["fabric", "--help"],
         &["keeper", "--help"],
+        &["caffeine", "--help"],
     ] {
         let full = std::fs::OpenOptions::new()
             .write(true)
@@ -301,7 +303,8 @@ fn an_answer_a_full_disk_refused_exits_1_and_says_so() {
 }
 
 /// `aterm drive` reaches the control client of the SAME executable (`ctl` is one
-/// of its verbs, and `aterm-ctl` its argv0 alias), with no alias beside it and
+/// of its verbs, and `aterm-ctl` its argv0 alias; `drive phase` dials it, `drive
+/// read` having left with the other driving verbs), with no alias beside it and
 /// none on PATH: a plain `target/debug/aterm` answered "could not run aterm-ctl:
 /// No such file or directory", and with an older install's `aterm-ctl` on PATH it
 /// drove that one instead.
@@ -312,7 +315,7 @@ fn drive_reaches_this_images_own_control_client() {
     let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_aterm")), root.path())
         .args(["drive", "--sock"])
         .arg(&sock)
-        .arg("read")
+        .args(["phase", "@s-1"])
         .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::null())
         .output()

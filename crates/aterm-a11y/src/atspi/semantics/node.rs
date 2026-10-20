@@ -41,6 +41,29 @@ use super::{
     ScrollType, State, StateSet,
 };
 
+/// One exported lifetime of a model node. Content updates keep this identity;
+/// removal/reinsertion and action-owner changes retire it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct NodeIdentity {
+    pub(crate) id: NodeId,
+    pub(crate) incarnation: u64,
+}
+
+impl NodeIdentity {
+    pub(crate) fn of(node: &Node<'_>) -> Self {
+        Self {
+            id: node.id(),
+            incarnation: node.incarnation(),
+        }
+    }
+}
+
+impl From<NodeIdentity> for u128 {
+    fn from(node: NodeIdentity) -> Self {
+        u128::from(node.id) | u128::from(node.incarnation)
+    }
+}
+
 pub(crate) struct NodeWrapper<'a>(pub(crate) &'a Node<'a>);
 
 impl NodeWrapper<'_> {
@@ -60,8 +83,8 @@ impl NodeWrapper<'_> {
         self.0.parent_id()
     }
 
-    pub(crate) fn id(&self) -> NodeId {
-        self.0.id()
+    pub(crate) fn id(&self) -> NodeIdentity {
+        NodeIdentity::of(self.0)
     }
 
     pub(crate) fn cache_node(
@@ -74,7 +97,9 @@ impl NodeWrapper<'_> {
         let parent = self
             .0
             .filtered_parent(&filter)
-            .map_or(NodeIdOrRoot::Root, |node| NodeIdOrRoot::Node(node.id()));
+            .map_or(NodeIdOrRoot::Root, |node| {
+                NodeIdOrRoot::Node(NodeIdentity::of(&node))
+            });
         CacheNode {
             adapter_id,
             id: self.id(),
@@ -89,8 +114,10 @@ impl NodeWrapper<'_> {
         }
     }
 
-    fn filtered_child_ids(&self) -> impl DoubleEndedIterator<Item = NodeId> {
-        self.0.filtered_children(&filter).map(|child| child.id())
+    fn filtered_child_ids(&self) -> impl DoubleEndedIterator<Item = NodeIdentity> {
+        self.0
+            .filtered_children(&filter)
+            .map(|child| NodeIdentity::of(&child))
     }
 
     pub(crate) fn role(&self) -> AtspiRole {
@@ -114,6 +141,7 @@ impl NodeWrapper<'_> {
             Role::Link => AtspiRole::Link,
             Role::List => AtspiRole::List,
             Role::ListBox => AtspiRole::ListBox,
+            Role::ListBoxOption => AtspiRole::ListItem,
             Role::Menu => AtspiRole::Menu,
             Role::MenuItem => AtspiRole::MenuItem,
             Role::MenuItemRadio => AtspiRole::RadioMenuItem,
@@ -159,7 +187,11 @@ impl NodeWrapper<'_> {
         }
         let filter_result = filter(self.0);
         if filter_result == FilterResult::Include {
-            atspi_state.insert(State::Visible | State::Showing);
+            atspi_state.insert(State::Visible);
+            // Off screen in its scrolling container: there, not showing.
+            if !state.is_offscreen() {
+                atspi_state.insert(State::Showing);
+            }
         }
         if let Some(orientation) = state.orientation() {
             atspi_state.insert(if orientation == Orientation::Horizontal {
@@ -379,7 +411,9 @@ impl NodeWrapper<'_> {
             let parent = self
                 .0
                 .filtered_parent(&filter)
-                .map_or(NodeIdOrRoot::Root, |node| NodeIdOrRoot::Node(node.id()));
+                .map_or(NodeIdOrRoot::Root, |node| {
+                    NodeIdOrRoot::Node(NodeIdentity::of(&node))
+                });
             adapter.emit_object_event(
                 self.id(),
                 ObjectEvent::PropertyChanged(Property::Parent(parent)),
@@ -416,8 +450,8 @@ impl NodeWrapper<'_> {
     }
 
     fn notify_children_changes(&self, adapter: &Adapter, old: &NodeWrapper<'_>) {
-        let old_filtered_children = old.filtered_child_ids().collect::<Vec<NodeId>>();
-        let new_filtered_children = self.filtered_child_ids().collect::<Vec<NodeId>>();
+        let old_filtered_children = old.filtered_child_ids().collect::<Vec<NodeIdentity>>();
+        let new_filtered_children = self.filtered_child_ids().collect::<Vec<NodeIdentity>>();
         for (index, child) in new_filtered_children.iter().enumerate() {
             if !old_filtered_children.contains(child) {
                 adapter.emit_object_event(self.id(), ObjectEvent::ChildAdded(index, *child));
@@ -436,15 +470,15 @@ impl NodeWrapper<'_> {
 pub(crate) struct PlatformNode {
     context: Weak<Context>,
     adapter_id: usize,
-    id: NodeId,
+    identity: NodeIdentity,
 }
 
 impl PlatformNode {
-    pub(crate) fn new(context: &Arc<Context>, adapter_id: usize, id: NodeId) -> Self {
+    pub(crate) fn new(context: &Arc<Context>, adapter_id: usize, identity: NodeIdentity) -> Self {
         Self {
             context: Arc::downgrade(context),
             adapter_id,
-            id,
+            identity,
         }
     }
 
@@ -466,7 +500,11 @@ impl PlatformNode {
         for<'a> F: FnOnce(Node<'a>, &'a Tree, &Context) -> Result<T>,
     {
         self.with_tree_and_context(|tree, context| {
-            if let Some(node) = tree.state().node_by_id(self.id) {
+            if let Some(node) = tree
+                .state()
+                .node_by_id(self.identity.id)
+                .filter(|node| NodeIdentity::of(node) == self.identity)
+            {
                 f(node, tree, context)
             } else {
                 Err(Error::Defunct)
@@ -539,7 +577,13 @@ impl PlatformNode {
         make: impl FnOnce(LocalNodeId) -> ActionRequest,
     ) -> Result<()> {
         let local = state.locate_node(target).ok_or(Error::Defunct)?;
-        context.do_action(make(local));
+        let mut request = make(local);
+        request.context = state
+            .node_by_id(target)
+            .ok_or(Error::Defunct)?
+            .data()
+            .action_context();
+        context.do_action(request);
         Ok(())
     }
 
@@ -549,8 +593,13 @@ impl PlatformNode {
     {
         let context = self.upgrade_context()?;
         let tree = context.tree.read();
-        let local = tree.state().locate_node(self.id).ok_or(Error::Defunct)?;
-        let request = f(local);
+        let node = tree
+            .state()
+            .node_by_id(self.identity.id)
+            .filter(|node| NodeIdentity::of(node) == self.identity)
+            .ok_or(Error::Defunct)?;
+        let mut request = f(self.identity.id.0);
+        request.context = node.data().action_context();
         drop(tree);
         context.do_action(request);
         Ok(())
@@ -574,7 +623,9 @@ impl PlatformNode {
         self.resolve(|node| {
             let parent = node
                 .filtered_parent(&filter)
-                .map_or(NodeIdOrRoot::Root, |node| NodeIdOrRoot::Node(node.id()));
+                .map_or(NodeIdOrRoot::Root, |node| {
+                    NodeIdOrRoot::Node(NodeIdentity::of(&node))
+                });
             Ok(parent)
         })
     }
@@ -590,8 +641,8 @@ impl PlatformNode {
         self.adapter_id
     }
 
-    pub(crate) fn id(&self) -> NodeId {
-        self.id
+    pub(crate) fn id(&self) -> NodeIdentity {
+        self.identity
     }
 
     /// AT-SPI's `AccessibleId`: aterm's model names none.
@@ -599,24 +650,24 @@ impl PlatformNode {
         self.resolve(|_| Ok(String::new()))
     }
 
-    pub(crate) fn child_at_index(&self, index: usize) -> Result<Option<NodeId>> {
+    pub(crate) fn child_at_index(&self, index: usize) -> Result<Option<NodeIdentity>> {
         self.resolve(|node| {
             let child = node
                 .filtered_children(&filter)
                 .nth(index)
-                .map(|child| child.id());
+                .map(|child| NodeIdentity::of(&child));
             Ok(child)
         })
     }
 
-    pub(crate) fn map_children<T, I>(&self, f: impl Fn(NodeId) -> I) -> Result<T>
+    pub(crate) fn map_children<T, I>(&self, f: impl Fn(NodeIdentity) -> I) -> Result<T>
     where
         T: FromIterator<I>,
     {
         self.resolve(|node| {
             let children = node
                 .filtered_children(&filter)
-                .map(|child| child.id())
+                .map(|child| NodeIdentity::of(&child))
                 .map(f)
                 .collect();
             Ok(children)
@@ -667,7 +718,7 @@ impl PlatformNode {
     /// AT-SPI's relation set: always empty, aterm's model has no relations.
     pub(crate) fn relation_set<T>(
         &self,
-        _f: impl Fn(NodeId) -> T,
+        _f: impl Fn(NodeIdentity) -> T,
     ) -> Result<HashMap<RelationType, Vec<T>>> {
         self.resolve(|_| Ok(HashMap::new()))
     }
@@ -739,6 +790,7 @@ impl PlatformNode {
             return Ok(false);
         }
         self.do_action_internal(|target_node| ActionRequest {
+            context: None,
             action: Action::Click,
             target_tree: TreeId::ROOT,
             target_node,
@@ -764,7 +816,7 @@ impl PlatformNode {
         x: i32,
         y: i32,
         coord_type: CoordType,
-    ) -> Result<Option<NodeId>> {
+    ) -> Result<Option<NodeIdentity>> {
         self.resolve_with_context(|node, _, context| {
             let window_bounds = context.root_window_bounds.read();
             let point = window_bounds.atspi_point_to_accesskit_point(
@@ -773,7 +825,9 @@ impl PlatformNode {
                 coord_type,
             );
             let point = node.transform().inverse() * point;
-            Ok(node.node_at_point(point, &filter).map(|node| node.id()))
+            Ok(node
+                .node_at_point(point, &filter)
+                .map(|node| NodeIdentity::of(&node)))
         })
     }
 
@@ -795,6 +849,7 @@ impl PlatformNode {
 
     pub(crate) fn grab_focus(&self) -> Result<bool> {
         self.do_action_internal(|target_node| ActionRequest {
+            context: None,
             action: Action::Focus,
             target_tree: TreeId::ROOT,
             target_node,
@@ -805,6 +860,7 @@ impl PlatformNode {
 
     pub(crate) fn scroll_to(&self, scroll_type: ScrollType) -> Result<bool> {
         self.do_action_internal(|target_node| ActionRequest {
+            context: None,
             action: Action::ScrollIntoView,
             target_tree: TreeId::ROOT,
             target_node,
@@ -821,8 +877,9 @@ impl PlatformNode {
                 node.filtered_parent(&filter),
                 coord_type,
             );
-            Self::request(context, tree.state(), self.id, |target_node| {
+            Self::request(context, tree.state(), self.identity.id, |target_node| {
                 ActionRequest {
+                    context: None,
                     action: Action::ScrollToPoint,
                     target_tree: TreeId::ROOT,
                     target_node,
@@ -851,10 +908,10 @@ impl PlatformNode {
         })
     }
 
-    pub(crate) fn hyperlink_object(&self, index: i32) -> Result<Option<NodeId>> {
+    pub(crate) fn hyperlink_object(&self, index: i32) -> Result<Option<NodeIdentity>> {
         self.resolve(|_| {
             if index == 0 {
-                Ok(Some(self.id))
+                Ok(Some(self.identity))
             } else {
                 Ok(None)
             }
@@ -885,13 +942,16 @@ impl PlatformNode {
         })
     }
 
-    pub(crate) fn selected_child(&self, selected_child_index: usize) -> Result<Option<NodeId>> {
+    pub(crate) fn selected_child(
+        &self,
+        selected_child_index: usize,
+    ) -> Result<Option<NodeIdentity>> {
         self.resolve_for_selection(|node| {
             Ok(node
                 .items(filter)
                 .filter(|item| item.is_selected() == Some(true))
                 .nth(selected_child_index)
-                .map(|node| node.id()))
+                .map(|node| NodeIdentity::of(&node)))
         })
     }
 
@@ -970,6 +1030,7 @@ impl PlatformNode {
 
     fn click(context: &Context, state: &TreeState, target: NodeId) -> Result<()> {
         Self::request(context, state, target, |target_node| ActionRequest {
+            context: None,
             action: Action::Click,
             target_tree: TreeId::ROOT,
             target_node,
@@ -1034,6 +1095,7 @@ impl PlatformNode {
             let offset = text_position_from_offset(&node, offset).ok_or(Error::IndexOutOfRange)?;
             Self::request(context, tree.state(), node.id(), |target_node| {
                 ActionRequest {
+                    context: None,
                     action: Action::SetTextSelection,
                     target_tree: TreeId::ROOT,
                     target_node,
@@ -1160,6 +1222,7 @@ impl PlatformNode {
                 .unwrap_or_else(|| node.document_range().start());
             Self::request(context, tree.state(), node.id(), |target_node| {
                 ActionRequest {
+                    context: None,
                     action: Action::SetTextSelection,
                     target_tree: TreeId::ROOT,
                     target_node,
@@ -1187,6 +1250,7 @@ impl PlatformNode {
                 .ok_or(Error::IndexOutOfRange)?;
             Self::request(context, tree.state(), node.id(), |target_node| {
                 ActionRequest {
+                    context: None,
                     action: Action::SetTextSelection,
                     target_tree: TreeId::ROOT,
                     target_node,
@@ -1267,6 +1331,7 @@ impl PlatformNode {
                     tree.state(),
                     position.inner_node().id(),
                     |target_node| ActionRequest {
+                        context: None,
                         action: Action::ScrollIntoView,
                         target_tree: TreeId::ROOT,
                         target_node,
@@ -1301,6 +1366,7 @@ impl PlatformNode {
                 let point = Point::new(target_point.x - rect.x0, target_point.y - rect.y0);
                 Self::request(context, tree.state(), node.id(), |target_node| {
                     ActionRequest {
+                        context: None,
                         action: Action::ScrollToPoint,
                         target_tree: TreeId::ROOT,
                         target_node,
@@ -1334,6 +1400,7 @@ impl PlatformNode {
 
     pub(crate) fn set_current_value(&self, value: f64) -> Result<()> {
         self.do_action_internal(|target_node| ActionRequest {
+            context: None,
             action: Action::SetValue,
             target_tree: TreeId::ROOT,
             target_node,
@@ -1344,7 +1411,7 @@ impl PlatformNode {
 
 impl PartialEq for PlatformNode {
     fn eq(&self, other: &Self) -> bool {
-        self.adapter_id == other.adapter_id && self.id == other.id
+        self.adapter_id == other.adapter_id && self.identity == other.identity
     }
 }
 
@@ -1353,7 +1420,7 @@ impl Eq for PlatformNode {}
 impl Hash for PlatformNode {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.adapter_id.hash(state);
-        self.id.hash(state);
+        self.identity.hash(state);
     }
 }
 
@@ -1409,17 +1476,19 @@ impl PlatformRoot {
         StateSet::empty()
     }
 
-    pub(crate) fn child_id_at_index(&self, index: usize) -> Result<Option<(usize, NodeId)>> {
+    pub(crate) fn child_id_at_index(&self, index: usize) -> Result<Option<(usize, NodeIdentity)>> {
         self.resolve_app_context(|context| {
-            let child = context
-                .adapters
-                .get(index)
-                .map(|(adapter_id, context)| (*adapter_id, context.tree.read().state().root_id()));
+            let child = context.adapters.get(index).map(|(adapter_id, context)| {
+                (
+                    *adapter_id,
+                    NodeIdentity::of(&context.tree.read().state().root()),
+                )
+            });
             Ok(child)
         })
     }
 
-    pub(crate) fn map_child_ids<T, I>(&self, f: impl Fn((usize, NodeId)) -> I) -> Result<T>
+    pub(crate) fn map_child_ids<T, I>(&self, f: impl Fn((usize, NodeIdentity)) -> I) -> Result<T>
     where
         T: FromIterator<I>,
     {
@@ -1427,7 +1496,12 @@ impl PlatformRoot {
             let children = context
                 .adapters
                 .iter()
-                .map(|(adapter_id, context)| (*adapter_id, context.tree.read().state().root_id()))
+                .map(|(adapter_id, context)| {
+                    (
+                        *adapter_id,
+                        NodeIdentity::of(&context.tree.read().state().root()),
+                    )
+                })
                 .map(f)
                 .collect();
             Ok(children)
@@ -1530,14 +1604,14 @@ impl Hash for PlatformRoot {
 /// A node of a window, or the application root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NodeIdOrRoot {
-    Node(NodeId),
+    Node(NodeIdentity),
     Root,
 }
 
 /// A node's `Cache.GetItems` entry.
 pub(crate) struct CacheNode {
     pub(crate) adapter_id: usize,
-    pub(crate) id: NodeId,
+    pub(crate) id: NodeIdentity,
     pub(crate) parent: NodeIdOrRoot,
     pub(crate) index_in_parent: i32,
     pub(crate) child_count: i32,

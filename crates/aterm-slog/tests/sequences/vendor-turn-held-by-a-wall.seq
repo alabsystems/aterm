@@ -1,0 +1,16 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# S2, S4: a turn end with the screen's wall under the turn only amends: the
+# turn and the wall stay; the screen's next word moves the wall on.
+see busy
+see wall:usage-session
+vendor-turn
+expect amend t1 turn vref=v1
+expect amend t1 turn vdur_ms=900 tok_in=40 tok_out=12
+expect turn=open
+expect need=wall:usage-session
+see busy
+expect open p1 wall par=t1 wall=usage-session
+expect close p1 wall out=passed
+see idle
+wait 1000
+expect close t1 turn out=done src=screen

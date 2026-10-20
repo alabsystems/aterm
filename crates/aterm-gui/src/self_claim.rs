@@ -62,8 +62,8 @@ pub(crate) struct Proven {
 
 impl Proven {
     /// Whether the very process the proof named still runs (its pid, alive,
-    /// with the same kernel start). A syscall on macOS (a `ps` elsewhere):
-    /// never asked under a lock.
+    /// with the same kernel start). A syscall on macOS and Windows (a `ps`
+    /// elsewhere): never asked under a lock.
     pub(crate) fn alive(&self) -> bool {
         restart_stamp::alive_as(self.pid, &self.start)
     }
@@ -454,6 +454,72 @@ fn finish_release(
     true
 }
 
+/// A process for a test's proof to name, never the test process itself: a
+/// proven claim reads its process's codex-alab record live
+/// ([`self_claimed::read_copy`]: the exec-time `CODEX_HOME`, else
+/// `$HOME/.codex`), and a test process's own environment names the person's
+/// `~/.codex`.
+#[cfg(test)]
+pub(crate) mod stand_in {
+    use super::Proven;
+
+    /// What tells [`a_stand_in_agent_when_asked`] to stand in.
+    const STAND_IN_ENV: &str = "ATERM_SELF_CLAIM_TEST_STAND_IN";
+
+    /// THE STAND-IN'S BODY: this test binary, which waits for its parent's
+    /// end of the pipe to close. Idle unless asked. Not `/bin/cat`: the
+    /// kernel shows nobody an Apple platform binary's environment, and a
+    /// proven claim reads its process's.
+    #[test]
+    fn a_stand_in_agent_when_asked() {
+        use std::io::Read as _;
+        if std::env::var_os(STAND_IN_ENV).is_none() {
+            return;
+        }
+        let _ = std::io::stdin().read(&mut [0u8; 1]);
+    }
+
+    /// The stand-in's pid: started once, with a scratch `HOME` and
+    /// `CODEX_HOME` under this binary's own root
+    /// (`aterm_types::dirs::test_root`). It reads a stdin only this binary
+    /// holds, so it ends when this binary does.
+    pub(crate) fn pid() -> u32 {
+        use aterm_uds::spawnfd::{Child, Stdio, command};
+        static STAND_IN: std::sync::OnceLock<Child> = std::sync::OnceLock::new();
+        STAND_IN
+            .get_or_init(|| {
+                let root = aterm_types::dirs::test_root().expect("this test binary's root");
+                let home = root.join("stand-in");
+                std::fs::create_dir_all(&home).expect("the stand-in's home");
+                command(std::env::current_exe().expect("the test binary"))
+                    .args([
+                        "self_claim::stand_in::a_stand_in_agent_when_asked",
+                        "--exact",
+                    ])
+                    .env_clear()
+                    .env(STAND_IN_ENV, "1")
+                    .env("HOME", &home)
+                    .env("CODEX_HOME", home.join(".codex"))
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("the stand-in")
+            })
+            .id()
+    }
+
+    /// The proof of a process that runs: the stand-in, by its pid and kernel
+    /// start.
+    pub(crate) fn running() -> Proven {
+        let pid = pid();
+        Proven {
+            pid,
+            start: aterm_agent::harness::restart_stamp::kernel_start(pid).expect("its start"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,11 +660,20 @@ mod tests {
                 exit: None,
                 cwd: None,
                 draft_empty: None,
+                frame: None,
             }))
         };
         forget(sid);
-        let first = claim_supervisor_as(ctx, holder, Some(1), None, Some(proven.clone()), now)
-            .expect("a claim");
+        let first = claim_supervisor_as(
+            ctx,
+            holder,
+            Some(1),
+            None,
+            Some(proven.clone()),
+            now,
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("a claim");
         assert!(refresh_by(
             ctx,
             &proven,
@@ -610,7 +685,7 @@ mod tests {
         // Handback finishes while an earlier disk read is in flight. Its
         // result must not restore the frozen pre-handback record.
         assert!(!refresh_by(ctx, &proven, first.revision, || {
-            assert!(release_supervisor(ctx, None, now));
+            assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
             let revision = ctx.meta.lock().unwrap().supervisor_revision;
             assert!(finish_release(
                 ctx,
@@ -625,8 +700,16 @@ mod tests {
         assert!(copy_of_tab(sid).is_none(), "the old read stayed invalid");
 
         let released_revision = ctx.meta.lock().unwrap().supervisor_revision;
-        let next = claim_supervisor_as(ctx, holder, Some(2), None, Some(proven.clone()), now)
-            .expect("the same identity claims again");
+        let next = claim_supervisor_as(
+            ctx,
+            holder,
+            Some(2),
+            None,
+            Some(proven.clone()),
+            now,
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("the same identity claims again");
         assert!(refresh_by(ctx, &proven, next.revision, || Some(standing())));
         // An older release's final read cannot overwrite the next claim,
         // even when that claim names the same pid and kernel start.
@@ -644,7 +727,7 @@ mod tests {
 
         // Positive control: the current release freezes an orderly end, for
         // the exit reader, while still refusing the earlier claim's read.
-        assert!(release_supervisor(ctx, None, now));
+        assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
         let revision = ctx.meta.lock().unwrap().supervisor_revision;
         assert!(finish_release(
             ctx,
@@ -666,10 +749,18 @@ mod tests {
 
         // A live identity may die while its final read is off-lock. That
         // read cannot vouch for a new copy; retain the old crash record.
-        let next = claim_supervisor_as(ctx, holder, Some(3), None, Some(proven.clone()), now)
-            .expect("a next claim");
+        let next = claim_supervisor_as(
+            ctx,
+            holder,
+            Some(3),
+            None,
+            Some(proven.clone()),
+            now,
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("a next claim");
         assert!(refresh_by(ctx, &proven, next.revision, || Some(standing())));
-        assert!(release_supervisor(ctx, None, now));
+        assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
         let revision = ctx.meta.lock().unwrap().supervisor_revision;
         let alive = std::cell::Cell::new(true);
         assert_eq!(
@@ -693,8 +784,16 @@ mod tests {
         // THE KEPT COPY FOLDS ITS READS (AD-3): a read that finds nothing
         // after one that found the record keeps a REMOVAL; a first read that
         // finds nothing keeps NEVER — no orderly end it never saw.
-        let next = claim_supervisor_as(ctx, holder, Some(4), None, Some(proven.clone()), now)
-            .expect("a next claim");
+        let next = claim_supervisor_as(
+            ctx,
+            holder,
+            Some(4),
+            None,
+            Some(proven.clone()),
+            now,
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("a next claim");
         assert!(refresh_by(ctx, &proven, next.revision, || Some(copy(
             self_claimed::Seen::Never
         ))));
@@ -721,13 +820,7 @@ mod tests {
         let dir = aterm_tempfile::TempDir::new().expect("dir");
         let home = std::fs::canonicalize(dir.path()).expect("canonical");
         let sleep = home.join("sleep");
-        std::fs::copy("/bin/sleep", &sleep).expect("copy sleep");
-        let signed = aterm_uds::spawnfd::command("codesign")
-            .args(["--force", "--sign", "-"])
-            .arg(&sleep)
-            .output()
-            .expect("codesign");
-        assert!(signed.status.success(), "{signed:?}");
+        aterm_uds::deadline::ad_hoc_copy(std::path::Path::new("/bin/sleep"), &sleep);
         let sleep_s = sleep.to_string_lossy().into_owned();
         let mut child = aterm_uds::spawnfd::command(&sleep)
             .arg("60")
@@ -763,7 +856,16 @@ mod tests {
         };
         let holder = format!("{SELF_CLAIM_PREFIX}{pid}");
         let now = crate::metrics::now_us();
-        claim_supervisor_as(ctx, &holder, Some(1), None, Some(proven), now).expect("a claim");
+        claim_supervisor_as(
+            ctx,
+            &holder,
+            Some(1),
+            None,
+            Some(proven),
+            now,
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("a claim");
         plant("idle");
         assert!(idle_now(ctx, pid, &start), "its own record says it rests");
         plant("busy");
@@ -774,7 +876,7 @@ mod tests {
             !idle_now(ctx, pid, "Thu Jan  1 00:00:00 1970"),
             "another identity"
         );
-        assert!(release_supervisor(ctx, None, now));
+        assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
         assert!(!idle_now(ctx, pid, &start), "no proof stands");
         claim_supervisor_as(
             ctx,
@@ -786,6 +888,7 @@ mod tests {
                 start: start.clone(),
             }),
             now,
+            aterm_slog::Actor::Ctl,
         )
         .expect("claimed again");
         assert!(idle_now(ctx, pid, &start), "positive control, again");

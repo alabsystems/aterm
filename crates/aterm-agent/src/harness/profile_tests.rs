@@ -100,9 +100,29 @@ fn composed() -> Value {
         "cachedGrowthBookFeatures": {
             "tengu_saffron_credits_only_tiers": ["enterprise"],
             "tengu_saffron_lattice": {},
+            "tengu_calm_seal": ["Nimbus", format!("{SENTINEL}-seal")],
             "tengu_other_flag": {"token": format!("{SENTINEL}-flag")}
-        }
+        },
+        // The consents, keyed by an organization's or an account's id.
+        "fableOverageConsentV2": keyed(&[
+            (&format!("{SENTINEL}-consent-org"), json!(false)),
+            (&format!("acct:{UUID}"), json!(true)),
+        ]),
+        "usageCreditsOnlyModelConsent": keyed(&[
+            ("Nimbus", keyed(&[(&format!("{SENTINEL}-model-org"), json!(true))])),
+            ("Lyra", keyed(&[("acct:x", json!(false))])),
+            (&format!("{SENTINEL}-family"), keyed(&[("acct:x", json!(true))])),
+        ]),
     })
+}
+
+/// An object of `entries`, its keys computed.
+fn keyed(entries: &[(&str, Value)]) -> Value {
+    let mut map = aterm_json::Map::new();
+    for (key, value) in entries {
+        map.insert((*key).to_string(), value.clone());
+    }
+    Value::Object(map)
 }
 
 fn parsed(v: &Value) -> Profile {
@@ -169,6 +189,9 @@ fn a_composed_profile_reads_every_allowlisted_field() {
     );
     assert_eq!(p.credits, Credits::On);
     assert_eq!(p.fable, FablePlan::Included);
+    // A consent `true` under any id; a family's name, never an id.
+    assert_eq!(p.consented, ["fable", "nimbus"]);
+    assert_eq!(p.credits_only, Some(vec!["nimbus".to_string()]));
     let usage = p.usage.expect("the cached body names this account");
     assert_eq!(usage.fetched_at_ms, 1_792_050_000_000);
     /// A window as compared: bucket, name, tenths, reset.
@@ -278,6 +301,10 @@ fn no_credential_identity_or_id_reaches_what_is_answered() {
         "ana.",
         "-org-uuid",
         "-flag",
+        "-seal",
+        "-consent-org",
+        "-model-org",
+        "-family",
     ] {
         assert!(
             whole.contains(&format!("{SENTINEL}{planted}"))
@@ -796,18 +823,26 @@ fn instants_read_in_every_shape_the_vendor_writes() {
 /// for a process with its own.
 #[test]
 fn the_profile_path_follows_the_home_rule() {
-    let user = Path::new("/home/ana");
-    let work = || Some(PathBuf::from("/work/repo"));
+    use crate::harness::host_path::abs;
+    let (ana, repo, srv, other) = (
+        abs("/home/ana"),
+        abs("/work/repo"),
+        abs("/srv/claude-b"),
+        abs("/home/other"),
+    );
+    let own = format!("{ana}/.claude");
+    let user = Path::new(&ana);
+    let work = || Some(PathBuf::from(&repo));
     assert_eq!(
         path_of(user, None, None, work),
         Some(user.join(".claude.json"))
     );
     assert_eq!(
-        path_of(user, Some("/srv/claude-b"), None, work),
-        Some(PathBuf::from("/srv/claude-b/.claude.json"))
+        path_of(user, Some(&srv), None, work),
+        Some(Path::new(&srv).join(".claude.json"))
     );
     assert_eq!(
-        path_of(user, Some("/home/ana/.claude"), None, work),
+        path_of(user, Some(&own), None, work),
         Some(user.join(".claude/.claude.json")),
         "a set home keeps its profile inside it, the user's own ~/.claude too"
     );
@@ -818,15 +853,15 @@ fn the_profile_path_follows_the_home_rule() {
     );
     assert_eq!(
         path_of(user, Some("rel/claude"), None, work),
-        Some(PathBuf::from("/work/repo/rel/claude/.claude.json"))
+        Some(Path::new(&repo).join("rel/claude/.claude.json"))
     );
     assert_eq!(
         path_of(user, Some(""), None, work),
         Some(user.join(".claude.json"))
     );
     assert_eq!(
-        path_of(user, None, Some("/home/other"), work),
-        Some(PathBuf::from("/home/other/.claude.json"))
+        path_of(user, None, Some(&other), work),
+        Some(Path::new(&other).join(".claude.json"))
     );
     assert_eq!(path_of(user, Some("rel/claude"), None, || None), None);
     assert_eq!(
@@ -834,16 +869,16 @@ fn the_profile_path_follows_the_home_rule() {
         user.join(".claude.json")
     );
     assert_eq!(
-        path_in(user, Some("/home/ana/.claude"), &user.join(".claude")),
+        path_in(user, Some(&own), &user.join(".claude")),
         user.join(".claude/.claude.json"),
         "named explicitly, ~/.claude keeps its own profile inside it"
     );
     assert_eq!(
-        path_in(user, Some("/srv/claude-b"), Path::new("/srv/claude-b")),
-        PathBuf::from("/srv/claude-b/.claude.json")
+        path_in(user, Some(&srv), Path::new(&srv)),
+        Path::new(&srv).join(".claude.json")
     );
     assert_eq!(
-        path_in(user, Some(""), Path::new("/work/repo")),
+        path_in(user, Some(""), Path::new(&repo)),
         user.join(".claude.json"),
         "an empty home's records are where it runs, its profile in $HOME"
     );
@@ -917,6 +952,77 @@ fn the_file_read_is_the_one_claude_code_picks() {
     std::fs::write(&legacy, "{}").expect("legacy");
     assert_eq!(effective(&plain, None, false), plain);
     assert_eq!(effective(&plain, None, true), custom);
+
+    // Billing is more conservative than this informational reader. A usable
+    // legacy file leaves normal versus diskless selection unknown; no legacy
+    // candidate allows the actual captured filename. Selection I/O errors
+    // remain errors instead of taking the informational fallback.
+    assert!(effective_for_billing(&plain, Some(&records), Selection::Standard).is_err());
+    std::fs::remove_file(&legacy).expect("remove billing legacy");
+    assert_eq!(
+        effective_for_billing(&plain, Some(&records), Selection::Standard).expect("standard"),
+        plain
+    );
+    assert_eq!(
+        effective_for_billing(&plain, Some(&records), Selection::CustomOauth).expect("custom"),
+        custom
+    );
+    assert!(effective_for_billing(&plain, Some(&records), Selection::Unknown).is_err());
+    assert!(effective_for_billing(&plain, None, Selection::Standard).is_err());
+    std::os::unix::fs::symlink(".config.json", &legacy).expect("owned selector cycle");
+    assert!(effective_for_billing(&plain, Some(&records), Selection::Standard).is_err());
+    std::fs::remove_file(&legacy).expect("remove selector cycle");
+    std::fs::write(&legacy, "{}").expect("restore legacy control");
+
+    // The picker must read that effective profile too, never the stale plain
+    // file beside it. These profiles and the process HOME are all owned here.
+    let subscription = r#"{"oauthAccount":{"organizationType":"claude_max"}}"#;
+    let console = r#"{"oauthAccount":{"organizationType":"api_console"}}"#;
+    let env = vec![format!("HOME={}", home.display())];
+    let subscribed = Some(aterm_phase::LoginMethod::Subscription);
+    std::fs::write(&plain, subscription).expect("plain subscription");
+    std::fs::remove_file(&legacy).expect("remove legacy");
+    assert_eq!(
+        login_method(&env, &home, false),
+        subscribed,
+        "plain control"
+    );
+    std::fs::write(&legacy, console).expect("effective Console profile");
+    assert_eq!(
+        login_method(&env, &home, false),
+        None,
+        "a stale plain subscription is not the effective login"
+    );
+    std::fs::write(&plain, console).expect("plain Console profile");
+    std::fs::write(&legacy, subscription).expect("effective subscription");
+    assert_eq!(
+        login_method(&env, &home, false),
+        subscribed,
+        "the effective subscription is used"
+    );
+    std::fs::write(&legacy, "not JSON").expect("unreadable effective profile");
+    assert_eq!(login_method(&env, &home, false), None);
+    std::fs::write(&plain, subscription).expect("plain subscription again");
+    std::fs::write(&legacy, "").expect("empty legacy beside plain");
+    assert_eq!(login_method(&env, &home, false), subscribed);
+    let mut unknown = env.clone();
+    unknown.push("CLAUDE_CONFIG_DIR=".to_string());
+    assert_eq!(
+        login_method(&unknown, &home, false),
+        None,
+        "without the records directory its legacy profile cannot be ruled out"
+    );
+    unknown[1] = "CLAUDE_CONFIG_DIR=relative".to_string();
+    assert_eq!(login_method(&unknown, &home, false), None);
+    let mut credential = env.clone();
+    credential.push("ANTHROPIC_API_KEY=invented-test-key".to_string());
+    assert_eq!(login_method(&credential, &home, true), None);
+    assert_eq!(login_method(&[], &home, true), None);
+    assert_eq!(
+        login_method(&env, &home, true),
+        subscribed,
+        "renewable control"
+    );
 }
 
 /// A custom OAuth URL renames the profile when it is set and not empty, as

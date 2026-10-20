@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHERE A TAPE IS KEPT: the file a CLI run's `--tape FILE` names, and the
-//! store a HOSTED run's tapes go to, each made for its run and handed to its
-//! recorder.
-//!
-//! A CLI tape is the person's: it goes where `--tape` says, is made `0600`
-//! (a tape holds the screens the loop judged, as the journal and the ledger
-//! hold what it decided, and is kept as privately), and is never swept. It
-//! is made NEW: a tape already at that path is an earlier run's record, and
-//! a run never writes over it.
+//! WHERE A TAPE IS KEPT: the store a HOSTED run's tapes go to, each made for
+//! its run and handed to its recorder. (The CLI's `--tape FILE` went with
+//! `aterm drive supervise|watch`, removed 2026-10-15: a tape is the window's
+//! own loop's.) A tape is made `0600` — it holds the screens the loop judged,
+//! as the journal and the ledger hold what it decided, and is kept as
+//! privately — and NEW ([`create`]): a tape already at a path is an earlier
+//! run's record, and a run never writes over it.
 //!
 //! A HOSTED run (the window's own loop, [`run_hosted_taped`]) is recorded
 //! only where the development seam [`HOSTED_SEAM`] asks for it — the lab's
@@ -32,10 +30,10 @@
 //!
 //! A tape that cannot be made — the path taken, its directory missing or
 //! not writable, the disk full, or the path one of the files the run writes
-//! itself (its journal, its notes, its ledger: `record_to`) — is said
+//! itself (its journal, its ledger: [`beside_files`]) — is said
 //! once, on the run's warning stream,
 //! and the run goes on untaped, exactly as it would have run with no
-//! `--tape` at all: recording must not change the run it records, and that
+//! tape at all: recording must not change the run it records, and that
 //! includes whether it runs. A tape that fails later is the writer's to say
 //! ([`super::frame::TapeWriter`]); the loop never sees either.
 
@@ -83,63 +81,6 @@ pub fn create(path: &Path) -> std::io::Result<std::fs::File> {
         o.mode(0o600);
     }
     o.open(path)
-}
-
-/// The door a run reads its world through, recording to a new tape at
-/// `path` from now on: `fx`'s clocks, its header `header` written first. A
-/// tape that cannot be made is said to `warn` and `fx` comes back as it was:
-/// the run goes on untaped ([module docs](self)).
-///
-/// `beside` names the files the run itself writes (its journal, its notes,
-/// its ledger), each with what it is: a tape that turns out to BE one of
-/// them is a tape that cannot be made. The tape writes its frames from its
-/// own offset and that file's writer appends, so each would write over the
-/// other — the tape refused at its first overwritten frame, the journal
-/// holding frames. Which file a path names is asked of the file the tape
-/// just made, not of the spelling (`run.log`, `./run.log`, a directory
-/// reached through a link, another case of the same name on a volume that
-/// ignores case): the one just made, still empty, is removed again, and the
-/// loop's own writer makes its file as it always has.
-pub(crate) fn record_to(
-    path: &Path,
-    header: &Header,
-    fx: &Fx,
-    mut warn: Box<dyn Write + Send>,
-    beside: &[(&str, &Path)],
-) -> Fx {
-    let mut refused = |why: &dyn std::fmt::Display| {
-        let _ = writeln!(
-            warn,
-            "aterm drive: tape {}: {why} — the loop goes on without it",
-            path.display()
-        );
-        let _ = warn.flush();
-        fx.clone()
-    };
-    let file = match create(path) {
-        Ok(file) => file,
-        Err(e) => return refused(&format_args!("cannot make it: {e}")),
-    };
-    if let Some((what, _)) = beside.iter().find(|(_, other)| is_file(&file, path, other)) {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-        return refused(&format_args!(
-            "it is the run's {what} too, which the loop writes"
-        ));
-    }
-    let writer = TapeWriter::start(
-        Box::new(held::HeldTape::hold(file)),
-        path.display().to_string(),
-        &header.encode(),
-        warn,
-    );
-    let (origin, _) = fx.peek();
-    fx.recording(TapeCore::start(
-        writer,
-        header.roots.clone(),
-        origin,
-        &header.tape,
-    ))
 }
 
 /// The one way this module takes a lock: [`held::HeldTape`]'s fields are
@@ -255,8 +196,8 @@ pub(crate) fn run_taped<T>(fx: &Fx, body: impl FnOnce() -> T, end: impl FnOnce(&
 }
 
 /// The files a run writes beside its loop, each with what it is: what a tape
-/// must not be ([`record_to`]'s `beside`) — its `--journal`, its `--notes`,
-/// and its approval ledger (the setup's, else a hosted loop's `opts.ledger`).
+/// must not be — its `--journal` and its
+/// approval ledger (the setup's, else a hosted loop's `opts.ledger`).
 pub(crate) fn beside_files(
     setup: &SessionSetup,
     opts: &SuperviseOpts,
@@ -264,7 +205,6 @@ pub(crate) fn beside_files(
     let ledger = setup.ledger_path().or(opts.ledger.as_deref());
     [
         ("--journal", opts.journal.clone()),
-        ("--notes", opts.notes.clone()),
         ("approval ledger", ledger.map(Path::to_path_buf)),
     ]
     .into_iter()

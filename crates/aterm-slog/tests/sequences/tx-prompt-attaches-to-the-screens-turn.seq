@@ -1,0 +1,14 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# §2.5: a prompt confirms the screen's open turn (amend vref= by the vendor,
+# exact); its end closes it, and the screen's later idle closes nothing.
+bind 0
+see busy
+tx prompt v1
+expect amend t1 turn vref=v1 by=vendor src=transcript conf=exact
+tx end
+expect open t1 turn src=screen
+expect close t1 turn out=done by=vendor src=transcript conf=exact
+expect amend t1 turn vdur_ms=4200 tok_in=900 tok_out=120
+see idle
+wait 1000
+expect turn=none

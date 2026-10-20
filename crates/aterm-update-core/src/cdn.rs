@@ -41,7 +41,7 @@ pub fn release_download_url(owner: &str, repo: &str, tag: &str, name: &str) -> O
     {
         return None;
     }
-    // Manual concat rather than `format!`: the strict Trust gate cannot lower `fmt::Arguments`.
+    // Manual concat rather than `format!`: the Trust lane cannot lower `fmt::Arguments`.
     let mut url = String::with_capacity(
         "https://github.com/".len()
             + owner.len()

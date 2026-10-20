@@ -569,23 +569,38 @@ fn topic_offsets(w: &World, sid: &str, topic: &str) -> Vec<u64> {
 
 /// **A LIVE RECORD DOES NOT CANCEL A BACKLOG STILL OWED.**
 ///
-/// A `since=@<off>` deeper than one roster round can walk (four pages of 256)
-/// leaves the cursor BEHIND the live face between rounds. A live shout in that
-/// window must not move the behind cursor to `live + 1`, past everything the
-/// walk had not reached. A behind cursor is not a live recipient;
-/// the catch-up owns it, and delivers the live record too, in offset order.
+/// A `since=@<off>` below the say face's drain position leaves the cursor
+/// BEHIND the face, and the catch-up owns that backlog, one page of 256 at a
+/// time. A live shout in that window must not move the behind cursor to
+/// `live + 1`, past everything the walk had not reached. A behind cursor is not
+/// a live recipient; the catch-up delivers the live record too, in offset order.
+///
+/// THE PREMISE IS MADE, NOT ASSUMED. The face opens at the lowest cursor any
+/// local topic owes, so a face this subscription opened would start AT the
+/// backlog and hand every record over live, and no catch-up would run. So
+/// `s_a` holds the face first, on an unrelated topic, from before the backlog,
+/// and a marker published there after the backlog reaching `s_a` proves the
+/// face has read past all of it: `s_b`'s `since=@<first>` really is behind.
+/// The backlog is one record more than a page: the one page a pushed opt-in
+/// may spend at once leaves the walk owing the rest until the next roster
+/// round, and the shout is posted at once. Exactly where it lands is this
+/// machine's timing; `aterm-link`'s engine test of this name pins that
+/// interleaving round by round, with the negative control (the frontier gate
+/// in `fan_in_say`).
 ///
 /// Sixty-four per sender, to stay under the ring's per-sender quota — the
 /// property under test is the cursor, not the ring.
 #[test]
 fn a_live_record_does_not_cancel_a_backlog_still_owed() {
+    // The catch-up's Fetch page (`aterm-link` `bridge.rs`, `catch_up_topic_page`).
+    const PAGE: u64 = 256;
     let w = World::boot("r23deep", &[]);
     w.wait_ready();
     let (s_a, s_b) = w.two_sessions();
-    // The backlog, pipelined (`harness::publish_pipelined`): the same 1100
-    // records in the same order, without 1100 fsync'd round trips (measured
-    // 2026-10-05: 6.3 s -> 2.6 s alone, 11.6 s -> 1.8 s in a full-suite run).
-    let backlog: Vec<harness::Record> = (0..1100u64)
+    subscribe(&w, &s_a, "r23.mark");
+    // The backlog, pipelined (`harness::publish_pipelined`): one fsync'd
+    // round trip per window, not per record.
+    let backlog: Vec<harness::Record> = (0..=PAGE)
         .map(|i| {
             let node = format!("n-b{:02}", i / 64);
             (
@@ -596,31 +611,43 @@ fn a_live_record_does_not_cancel_a_backlog_still_owed() {
             )
         })
         .collect();
-    let first = harness::publish_pipelined(&mut w.god(), &backlog)[0].0;
+    let mut god = w.god();
+    let first = harness::publish_pipelined(&mut god, &backlog)[0].0;
+    god.publish(
+        8_090,
+        1,
+        &format!("/f/{FLEET}/pub/n-mark/s-mk/say/r23.mark"),
+        b"v=1 t=1 kind=note from=s-mk text=r23mark",
+    )
+    .expect("publish the marker");
+    until("the face to read past the backlog (s_a's marker)", || {
+        topic_rows(&w, &s_a, "r23.mark")
+            .iter()
+            .any(|r| r.contains("text=r23mark"))
+            .then_some(())
+    });
 
     subscribe(&w, &s_b, &format!("r23.deep since=@{first}"));
-    // THE LIVE SHOUT, while the walk still owes most of the backlog.
+    // THE LIVE SHOUT, while the walk still owes the backlog.
     let posted = w.verb(&format!("@{s_a} post to=say:r23.deep kind=note r23live"));
     assert!(posted.ok(), "{}", posted.header());
 
+    let last = format!("text=r23bl-{PAGE}");
     let rows = until("the whole backlog and the live record", || {
         let rows = topic_rows(&w, &s_b, "r23.deep");
-        (rows.iter().any(|r| r.contains("text=r23bl-1099"))
-            && rows.iter().any(|r| r.contains("text=r23live")))
-        .then_some(rows)
+        (rows.iter().any(|r| r.contains(&last)) && rows.iter().any(|r| r.contains("text=r23live")))
+            .then_some(rows)
     });
-    // NOTHING SKIPPED: the ring holds the newest 512, and their offsets are
-    // contiguous on this topic — a jump would show as a hole.
+    // NOTHING SKIPPED, NOTHING TWICE: what arrived is exactly what the topic
+    // holds on the log, and the live record is the newest.
     let mut offs = topic_offsets(&w, &s_b, "r23.deep");
     offs.sort_unstable();
-    for pair in offs.windows(2) {
-        assert!(
-            pair[1] - pair[0] <= 1 + 3,
-            "a gap in what arrived ({} → {}): {rows:?}",
-            pair[0],
-            pair[1]
-        );
-    }
+    let on_log: Vec<u64> = say_records(&w)
+        .into_iter()
+        .filter(|(_, subject, _)| subject.ends_with("/say/r23.deep"))
+        .map(|(off, _, _)| off)
+        .collect();
+    assert_eq!(offs, on_log, "{rows:?}");
     let live_off = offs.last().copied().expect("rows");
     assert!(
         rows.iter()

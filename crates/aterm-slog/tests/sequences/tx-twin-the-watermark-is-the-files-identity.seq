@@ -1,0 +1,11 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of the_watermark_is_keyed_on_the_files_identity (S23, A20).
+bind 0
+see busy
+file 9999
+tx prompt v1 off=10000 dated=0
+bind 10000
+expect mark r1 source skipped=0
+expect mark r1 source skipped=10000
+tx prompt v1 off=10200 dated=0
+expect amend t1 turn vref=v1

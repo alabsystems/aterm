@@ -139,17 +139,22 @@ fn open_regular(path: &Path) -> io::Result<std::fs::File> {
 
 /// Windows' reparse-point flag is the closest equivalent of `O_NOFOLLOW`.
 /// The attribute is checked on the opened handle before any byte is consumed.
+/// Backup semantics let a directory open too, so the handle check refuses it
+/// as not regular, as on unix; without it `CreateFileW` answers a directory
+/// with `ERROR_ACCESS_DENIED`, and a toy pack path naming a folder read
+/// "unreadable (Access is denied.)".
 #[cfg(windows)]
 fn open_regular(path: &Path) -> io::Result<std::fs::File> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
     note_open_attempt(path);
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file()

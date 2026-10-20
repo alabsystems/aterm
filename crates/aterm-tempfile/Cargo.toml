@@ -11,3 +11,10 @@ description = "Zero-dependency temporary directories with RAII cleanup"
 
 [lints]
 workspace = true
+
+[features]
+# `stand_in` in an optimized build. A test or debug build of this crate has it
+# anyway; a dependent whose tests lay stand-ins turns this on from its
+# dev-dependencies, so its `--release` test targets build too, and nothing a
+# shipped binary links ever does.
+test-support = []

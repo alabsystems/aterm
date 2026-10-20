@@ -494,3 +494,76 @@ fn a_quit_after_wait_for_reaps_leaves_no_hup_ignoring_shell() {
          ({holdout:?})"
     );
 }
+
+/// THE CLOSE IS A HANG-UP, AND A JOB THAT IGNORES IT OUTLIVES IT (the manual's
+/// WINDOWING page, CLOSING). A tab's close hangs the shell up and, should it
+/// outlive that, SIGKILLs the shell's own process group; the shell's exit then
+/// hangs up the terminal's foreground job (the kernel's SIGHUP to the
+/// controlling terminal's foreground group). A plain foreground job in its own
+/// group, as a job-control shell runs one, dies of that; one that ignores
+/// SIGHUP (`nohup`, `trap '' HUP`) has opted out and outlives the close, as it
+/// does in kitty and WezTerm (run 2026-10-19, macOS 27.0.1, zsh 5.9) and in
+/// Terminal.app and iTerm2 (their close replayed): the same five survivors
+/// and two deaths in each. The plain
+/// job is the negative control: it shows the close reaches the job's group, so
+/// the survivor is the job's own choice. RED with a teardown that also kills
+/// the terminal's foreground group (the alternative the rule rejects, which
+/// would end every foreground `nohup` job too). macOS only: the rule was
+/// measured there, and `set -m` in a non-interactive `/bin/sh` is that host's.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_close_ends_a_plain_foreground_job_and_leaves_one_that_ignores_sighup() {
+    for ignores in [false, true] {
+        let trap = if ignores { "trap \"\" HUP; " } else { "" };
+        // `set -m`: the job runs in its own group, the terminal's foreground
+        // one, as an interactive shell's job does; `; :` keeps the shell from
+        // exec'ing into it.
+        let sh = parked_session(&format!(
+            "set -m; /bin/sh -c '{trap}printf \"UP\\n\"; exec sleep 600'; :"
+        ));
+        // SAFETY: a read-only ioctl on the master this test owns.
+        let foreground = unsafe { libc::tcgetpgrp(sh.master) };
+        let job = ShellIdentity::from_parts(foreground, process_birth(foreground), false);
+        let shell = record_spawned_shell(sh.pid);
+        let own_group = foreground > 1 && foreground != sh.pid && job.verify();
+        if own_group {
+            let _ = hangup_shell(&shell, sh.master);
+            reap_shell(shell);
+        }
+        // The shell is gone, so the kernel has posted the job its SIGHUP (at
+        // the leader's exit, before its parent could collect it). Ignored, the
+        // signal was discarded as it was posted: alive now is alive for good.
+        let survived = own_group && !is_unreaped_child(sh.pid) && job.verify();
+        let died = own_group
+            && !ignores
+            && aterm_spec::wait::within(HANG_DETECTOR, Duration::from_millis(5), || {
+                (!job.verify()).then_some(())
+            })
+            .is_some();
+        if job.verify() {
+            // SAFETY: SIGKILL to the job this test started, verified just above.
+            unsafe { libc::kill(job.pid, libc::SIGKILL) };
+        }
+        if is_unreaped_child(sh.pid) {
+            // SAFETY: SIGKILL and a blocking reap of the test's own child, so
+            // a failed precondition leaves nothing behind.
+            unsafe {
+                libc::kill(sh.pid, libc::SIGKILL);
+                libc::waitpid(sh.pid, std::ptr::null_mut(), 0);
+            }
+        }
+        // SAFETY: closing the master this test owns.
+        unsafe { libc::close(sh.master) };
+        assert!(
+            own_group,
+            "PRECONDITION: the job is the terminal's foreground group, not the \
+             shell's (foreground={foreground}, shell={})",
+            sh.pid
+        );
+        if ignores {
+            assert!(survived, "a job that ignores SIGHUP outlives the close");
+        } else {
+            assert!(died, "a plain foreground job dies with the close");
+        }
+    }
+}

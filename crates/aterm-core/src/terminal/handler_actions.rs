@@ -177,7 +177,7 @@ impl ActionSink for TerminalHandler<'_> {
                         } else {
                             self.grid.cols().saturating_sub(1)
                         };
-                        self.grid.set_cursor(row - 1, wrap_col);
+                        self.grid.set_cursor_following_content(row - 1, wrap_col);
                     }
                 } else {
                     self.grid
@@ -2502,10 +2502,14 @@ impl TerminalHandler<'_> {
                 .max(1),
             // Kitty z=: negative draws behind text.
             z_index: cmd.z_index.unwrap_or(0),
-            scaling: if cols.is_none() && rows.is_none() {
-                ImageScaling::PixelExact
-            } else {
-                ImageScaling::Fit
+            // Kitty fills a `c=` × `r=` box whole from the cursor cell
+            // (`update_dest_rect` takes both as given); with one of them the
+            // other came from the aspect above, rounded up to a whole cell,
+            // so fitting keeps the raster's aspect exact inside it.
+            scaling: match (cols, rows) {
+                (None, None) => ImageScaling::PixelExact,
+                (Some(_), Some(_)) => ImageScaling::Stretch,
+                _ => ImageScaling::Fit,
             },
             source_rect,
             cell_offset_px,
@@ -3798,16 +3802,19 @@ mod kitty_display_tests {
     /// A transmit's footprint and scaling come from its keys, as kitty
     /// computes them: with neither `c=` nor `r=` (or both `0`, unspecified)
     /// the raster's pixel size rounded up to whole cells, drawn pixel-exact; a
-    /// named cell box is fitted; one of `c=`/`r=` alone takes the other from
-    /// the aspect. `(raster px, keys, (cols, rows), scaling)` at a 10x20 cell.
+    /// box named by both is filled whole (kitty stretches into it); one of
+    /// `c=`/`r=` alone takes the other from the aspect, and is fitted.
+    /// `(raster px, keys, (cols, rows), scaling)` at a 10x20 cell.
     #[test]
     fn a_transmits_footprint_and_scaling_follow_its_keys() {
-        use aterm_grid::ImageScaling::{Fit, PixelExact};
+        use aterm_grid::ImageScaling::{Fit, PixelExact, Stretch};
         for ((w, h), keys, footprint, scaling) in [
             ((15, 25), "", (2, 2), PixelExact),
-            ((15, 25), ",c=4,r=3", (4, 3), Fit),
+            ((15, 25), ",c=4,r=3", (4, 3), Stretch),
+            ((4, 4), ",c=8,r=2", (8, 2), Stretch),
             ((20, 40), ",c=4", (4, 4), Fit),
             ((20, 40), ",r=1", (1, 1), Fit),
+            ((20, 40), ",c=4,r=0", (4, 4), Fit),
             ((20, 40), ",c=0,r=0", (2, 2), PixelExact),
         ] {
             let mut term = Terminal::new(24, 80);
@@ -4125,7 +4132,7 @@ mod kitty_display_tests {
             (4, 3),
             "the put's cell box"
         );
-        assert_eq!(boxed.image.scaling, aterm_grid::ImageScaling::Fit);
+        assert_eq!(boxed.image.scaling, aterm_grid::ImageScaling::Stretch);
         assert_eq!(
             (stored.cols, stored.rows),
             (2, 2),

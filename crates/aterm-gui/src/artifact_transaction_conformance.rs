@@ -13,9 +13,11 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
+use aterm_models_misc::artifact_reader_lease_model;
 use aterm_models_misc::{
-    anchored_artifact_transaction_model, artifact_reader_lease_model,
-    snapshot_generation_commit_model, video_batch_publication_durability_model,
+    anchored_artifact_transaction_model, snapshot_generation_commit_model,
+    video_batch_publication_durability_model,
 };
 use aterm_render::Frame;
 use aterm_spec::derive::Model;
@@ -154,6 +156,7 @@ pub(crate) fn project_video_batch_publication_durability(
 /// `pending`, callback execution -> `sweeping`. `requested` is the caller's history (an arm no
 /// finished sweep has discharged), so a registry that lost an armed entry still owes its sweep.
 /// `replacement_joined` is a negative-control witness, always false for shipping code.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ArtifactReaderObservation {
     leases: i64,
@@ -166,6 +169,7 @@ pub(crate) struct ArtifactReaderObservation {
     replacement_joined: bool,
 }
 
+#[cfg(unix)]
 pub(crate) fn project_artifact_reader_lease(
     model: &Model,
     observed: ArtifactReaderObservation,
@@ -293,197 +297,6 @@ fn marker_generation(path: &Path) -> i64 {
         .parse()
         .expect("numeric generation")
 }
-
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "SnapshotGenerationCommit",
-    action = "SelectCurrent",
-    reason = "environment scheduling: selecting the newest worker changes which queued job the \
-              bounded model drives; begin/old-commit/current-commit are bound to shipping code"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "AnchoredArtifactTransaction",
-    action = "SwapAncestor",
-    reason = "adversarial filesystem environment action: another same-uid process replaces a \
-              pathname ancestor; the Unix Tier-1 test drives the observation explicitly"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "AnchoredArtifactTransaction",
-    action = "BuggyReresolveRead",
-    reason = "Buggy=1 negative-control action only; shipping reads remain relative to the retained \
-              directory handle and the Tier-1 outside-target mutant is rejected"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "AnchoredArtifactTransaction",
-    action = "BuggyReresolveWrite",
-    reason = "Buggy=1 negative-control action only; shipping writes remain relative to the \
-              retained directory handle and never implement this transition"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "AnchoredArtifactTransaction",
-    action = "BuggyCertifySwapped",
-    reason = "Buggy=1 negative-control action only; reply validation fails closed after identity \
-              drift and the Tier-1 false-success mutant is rejected"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactReplyPublication",
-    action = "BuggyPublishAfterCancel",
-    reason = "Buggy=1 negative control only; the real cancellation/authorization CAS has one \
-              winner and the authorized write hook rejects a cancelled final-name publish"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactReplyPublication",
-    action = "BuggyDropBeforeWrite",
-    reason = "Buggy=1 negative control only; ControlReply owns ReplyRetention through write_all, \
-              flush, and either valid ACK release or central-quarantine expiry"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactReplyPublication",
-    action = "BuggyPruneLeased",
-    reason = "Buggy=1 negative control only; retention holds the shared path-lease mutex across its \
-              exact mutation and skips every still-leased image or recording"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactReplyPublication",
-    action = "BuggyReleaseWithoutAck",
-    reason = "Buggy=1 negative control only; only a matching nonce echo releases immediately, \
-              while EOF/timeout/protocol failure transfers the guard to central quarantine"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactReplyPublication",
-    action = "BuggyAcceptPreChallengeAck",
-    reason = "Buggy=1 negative control only; aterm-ctl can echo only the fresh nonce trailer it \
-              reads after the complete response, never a pre-pipelined acknowledgement"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactReplyPublication",
-    action = "BuggyReleaseQuarantineEarly",
-    reason = "Buggy=1 negative control only; failed or half-closed clients retain the publication guard \
-              through the additional 30-second central-quarantine expiry"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactReplyPublication",
-    action = "BuggyChallengeBeforeBody",
-    reason = "Buggy=1 negative control only; the nonce trailer is written after the complete body \
-              in write_control_reply_with_timeout_arm, and the Tier-1 early trailer is rejected"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactReplyPublication",
-    action = "BuggyOkBeforeRevalidation",
-    reason = "Buggy=1 negative control only; write_control_reply_with_timeout_arm revalidates the \
-              guard before any OK byte, and the Tier-1 OK-then-ERR wire is rejected"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactReplyPublication",
-    action = "BuggyTrailerErrorIgnored",
-    reason = "Buggy=1 negative control only; a failed trailer write returns the error and \
-              quarantines the guard, and the Tier-1 partial frame read as written is rejected"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactReplyPublication",
-    action = "BuggyAbortRetainsArtifact",
-    reason = "Buggy=1 negative control only; an uncommitted reply guard removes its exact file on \
-              drop, and the Tier-1 orphaned-file release is rejected"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactHandoffCapacity",
-    action = "BuggyOverbook",
-    reason = "Buggy=1 negative control only; the real locked admission update refuses when the \
-              process-wide handoff count or descriptor-unit budget reaches its fixed limit"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactHandoffCapacity",
-    action = "BuggyReconcileOverbook",
-    reason = "Buggy=1 negative control only; exact-path reconciliation uses the same locked \
-              aggregate descriptor budget and leaves the provisional charge intact on refusal"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactHandoffCapacity",
-    action = "BuggyRefuseLeaksSlot",
-    reason = "Buggy=1 negative control only; try_acquire_from decides admission before it charges \
-              either counter, so a refusal leaves the pool untouched"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactHandoffCapacity",
-    action = "BuggyReleaseProvisionalCharge",
-    reason = "Buggy=1 negative control only; reconciliation records the permit's new charge, so \
-              its drop returns exactly the units it holds"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactHandoffCapacity",
-    action = "SelectOne",
-    reason = "ghost scheduler choice selecting a one-unit permit from the bounded charge multiset"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactHandoffCapacity",
-    action = "SelectTwo",
-    reason = "ghost scheduler choice selecting a two-unit permit from the bounded charge multiset"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactHandoffCapacity",
-    action = "SelectThree",
-    reason = "ghost scheduler choice selecting a three-unit permit from the bounded charge multiset"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "VideoBatchPublicationDurability",
-    action = "BuggyPublishBeforeSync",
-    reason = "Buggy=1 negative control only; the real marker write is reachable only after \
-              ConfinedVideoDir::publish completes the recording-directory batch barrier"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "VideoBatchPublicationDurability",
-    action = "BuggySyncAhead",
-    reason = "Buggy=1 negative control only; every member write clears batch_synced before it \
-              lands, so a barrier never covers a later member \
-              (video_member_write_after_sync_invalidates_marker_guard)"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactReaderLease",
-    action = "BuggyStartSweepEarly",
-    reason = "Buggy=1 negative control only; the concrete registry starts its capability-bound \
-              sweep only on the last refcount release"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactReaderLease",
-    action = "BuggyAcquireDuringSweep",
-    reason = "Buggy=1 negative control only; retain_video_artifact_path fails closed while the \
-              last-release callback owns the registry's sweeping state"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactReaderLease",
-    action = "ReplaceIdentity",
-    reason = "external same-uid recording replacement is an environment transition; the concrete \
-              registry compares the retained child identity before incrementing its lease count"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactReaderLease",
-    action = "BuggyArmedReleaseDropsEntry",
-    reason = "Buggy=1 negative control only; the last release of an armed entry marks it \
-              sweeping and hands its capability to the priority cleanup lane instead of \
-              removing it"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactReaderLease",
-    action = "BuggyReleaseSweepsUnarmed",
-    reason = "Buggy=1 negative control only; the last release starts a sweep only when \
-              video_sweep_requested is set, and otherwise removes the registry entry"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactReaderLease",
-    action = "BuggyFinishKeepsEntry",
-    reason = "Buggy=1 negative control only; finish_video_retention_sweep removes the finished \
-              entry, taking its arm and recorded identity with it"
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ArtifactReaderLease",
-    action = "BuggyAcquireReplacedIdentity",
-    reason = "Buggy=1 negative control only; a mismatched retained recording identity is rejected \
-              without joining the existing lexical-path lease group"
-)]
-#[expect(
-    dead_code,
-    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it"
-)]
-fn explicit_environment_and_mutant_scope() {}
 
 #[test]
 fn real_video_batch_publication_conforms_to_directory_barrier_ordering() {
@@ -814,6 +627,7 @@ fn published_video_batch_rejects_every_late_mutation() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
 fn write_published_recording(root: &Path, name: &str) {
     let recording = root.join(name);
     std::fs::create_dir(&recording).unwrap();
@@ -825,6 +639,7 @@ fn write_published_recording(root: &Path, name: &str) {
     .unwrap();
 }
 
+#[cfg(unix)]
 fn published_recording_count(root: &Path) -> usize {
     std::fs::read_dir(root)
         .unwrap()
@@ -842,6 +657,7 @@ fn published_recording_count(root: &Path) -> usize {
 /// A private recordings root holding `count` published recordings. Returns the
 /// fixture directory, the root, the newest recording's name, and the registry
 /// key `retain_video_artifact_path` files that recording under.
+#[cfg(unix)]
 fn reader_fixture(label: &str, count: usize) -> (PathBuf, PathBuf, std::ffi::OsString, PathBuf) {
     let dir = unique_dir(label);
     let _ = std::fs::remove_dir_all(&dir);
@@ -859,6 +675,7 @@ fn reader_fixture(label: &str, count: usize) -> (PathBuf, PathBuf, std::ffi::OsS
 /// One shipping `video frames` reader lease on `fresh`, with the recording
 /// handle its arm validates against. `None` is the registry refusing a lease
 /// while a sweep owns the entry.
+#[cfg(unix)]
 fn reader_lease(
     root: &Path,
     fresh: &OsStr,
@@ -876,6 +693,7 @@ fn reader_lease(
 /// is idle. `pending` is never observable — the last decrement and the sweep's
 /// start happen under one registry mutex — and `requested`/`identity_mismatch`
 /// are the history this test drove.
+#[cfg(unix)]
 fn observe_reader(model: &Model, key: &Path, requested: bool, identity_mismatch: bool) -> State {
     let entry = crate::control_auth::artifact_lease_registry_for_test(key);
     project_artifact_reader_lease(

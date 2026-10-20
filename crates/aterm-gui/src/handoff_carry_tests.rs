@@ -49,6 +49,12 @@ fn record(id: u64, submitted: bool, arch: ArchMark) -> TurnRecord {
         screen_hash: id,
         seq: id,
         arch,
+        // Every caller the wire names, so the round trip carries each.
+        by: match id % 3 {
+            0 => TurnBy::Harness,
+            1 => TurnBy::Ctl,
+            _ => TurnBy::Sid(format!("s-{id:020x}")),
+        },
         carried: false,
     }
 }
@@ -328,11 +334,12 @@ fn a_sidecar_that_does_not_fit_sheds_rows_then_state_then_history() {
             .unwrap()
             .alt_archive_carry_rows(&mut archive, src.fence, 0, usize::MAX)
     );
-    let full = encode(&turns_v, 0, &archive).unwrap();
-    let no_rows = encode(&turns_v, 0, &counters_only(archive.clone())).unwrap();
+    let whole = Floors::default();
+    let full = encode(&turns_v, whole, &archive).unwrap();
+    let no_rows = encode(&turns_v, whole, &counters_only(archive.clone())).unwrap();
     assert!(no_rows.len() < full.len());
 
-    let (shed, none) = encode_within(&turns_v, 0, archive.clone(), no_rows.len() as u64)
+    let (shed, none) = encode_within(&turns_v, whole, archive.clone(), no_rows.len() as u64)
         .map(|(c, n)| (c.bytes, n))
         .unwrap();
     assert_eq!(none, 0, "no record shed");
@@ -342,7 +349,7 @@ fn a_sidecar_that_does_not_fit_sheds_rows_then_state_then_history() {
     assert_eq!(c.turns.len(), turns_v.len());
     assert_eq!(c.unheld_below, 0, "the whole ledger came");
 
-    let (tiny, shed) = encode_within(&turns_v, 0, archive.clone(), 400)
+    let (tiny, shed) = encode_within(&turns_v, whole, archive.clone(), 400)
         .map(|(c, n)| (c.bytes, n))
         .unwrap();
     let c = decode(&tiny).unwrap();
@@ -371,11 +378,14 @@ fn a_sidecar_that_does_not_fit_sheds_rows_then_state_then_history() {
     );
     let mut bare = counters_only(archive.clone());
     bare.differ = None;
-    let floor = shed.checked_sub(2).map_or(0, |i| turns_v[i].id + 1);
-    let one_fewer = encode(&turns_v[shed - 1..], floor, &bare).unwrap();
+    let floors = Floors {
+        unheld_below: shed.checked_sub(2).map_or(0, |i| turns_v[i].id + 1),
+        ..whole
+    };
+    let one_fewer = encode(&turns_v[shed - 1..], floors, &bare).unwrap();
     assert!(one_fewer.len() > 400, "one record fewer shed would fit");
 
-    assert!(encode_within(&turns_v, 0, archive, 10).is_none());
+    assert!(encode_within(&turns_v, whole, archive, 10).is_none());
 }
 
 /// The codec keeps every carried field, unknown fields are skipped and
@@ -411,9 +421,24 @@ fn the_sidecar_round_trips_and_tolerates_what_it_does_not_know() {
         })
         .collect();
     assert_eq!(carry.turns, want, "every ledger field");
+    assert!(
+        [TurnBy::Harness, TurnBy::Ctl]
+            .iter()
+            .all(|by| want.iter().any(|t| t.by == *by))
+            && want.iter().any(|t| matches!(t.by, TurnBy::Sid(_))),
+        "the fixture carries every kind of caller"
+    );
 
     // A newer sender's extra fields, and an older one's missing ones.
     let text = String::from_utf8(bytes.clone()).unwrap();
+    // A record from a sender before `by=`, or naming a caller this build has
+    // no word for, reads `-`, and the record itself is kept.
+    for (from, to) in [(",\"by\":\"harness\"", ""), ("\"harness\"", "\"fleet\"")] {
+        let older = decode(text.replacen(from, to, 1).as_bytes()).unwrap().turns;
+        assert_eq!(older.len(), want.len(), "{from} -> {to}");
+        let first = want.iter().position(|t| t.by == TurnBy::Harness).unwrap();
+        assert_eq!(older[first].by, TurnBy::Unknown, "{from} -> {to}");
+    }
     let extra = text.replacen('{', "{\"future_field\":[1,2,{\"x\":null}],", 1);
     assert_eq!(decode(extra.as_bytes()).unwrap().archive, carry.archive);
     let bare = decode(br#"{"version":1}"#).unwrap();
@@ -610,6 +635,120 @@ fn a_record_the_receiver_cannot_read_is_not_vouched_for() {
     assert!(to_v0_100.contains("\"status\":\"hangup\""), "{to_v0_100}");
 }
 
+/// THE HARNESS'S `send` AND `key enter` (`status=pressed`) CROSS TO EVERY
+/// SUCCESSOR. The word is newer than every release, so whatever build the
+/// export is for the sidecar says `timeout` with `"pressed":true`: this
+/// build reads the record back as `pressed`, `by=harness`, submitted, and a
+/// build that knows only `settled`, `timeout` and `hangup` (every release to
+/// date, which ignores a field it does not know) holds all three records,
+/// none left out and no floor raised past it. NEGATIVE CONTROL: spelled in
+/// its own word, the older build leaves the record out.
+#[test]
+fn a_pressed_record_crosses_to_a_build_that_never_heard_the_word() {
+    use crate::turn_ledger::STATUS_PRESSED;
+    let (term, turns) = session(30);
+    {
+        let mut ledger = turns.lock().unwrap();
+        let mut records: Vec<TurnRecord> = ledger.records().cloned().collect();
+        let last = records.last_mut().expect("three records");
+        last.status = STATUS_PRESSED;
+        last.by = TurnBy::Harness;
+        let mut pressed = TurnLedger::default();
+        for record in records {
+            pressed.push(record);
+        }
+        *ledger = pressed;
+    }
+    let read_by_v0_104 = |text: &str| -> usize {
+        let wire: Wire = aterm_json::from_slice(text.as_bytes()).unwrap();
+        wire.turns
+            .iter()
+            .filter(|t| matches!(t.status.as_str(), "settled" | "timeout" | "hangup"))
+            .count()
+    };
+    for words in [StatusWords::Current, StatusWords::PreHangup] {
+        let text = String::from_utf8(
+            export_for(&[capture(&term, &turns, true)], ceiling(), words)
+                .remove(0)
+                .1,
+        )
+        .unwrap();
+        assert!(
+            !text.contains("\"status\":\"pressed\""),
+            "{words:?}: {text}"
+        );
+        assert_eq!(text.matches("\"pressed\":true").count(), 1, "{text}");
+        assert_eq!(read_by_v0_104(&text), 3, "{words:?}: every record crosses");
+        let carried = decode(text.as_bytes()).unwrap();
+        assert_eq!(carried.turns.len(), 3);
+        let last = carried.turns.last().unwrap();
+        assert_eq!(
+            (last.id, last.submitted, last.status, &last.by),
+            (21, true, STATUS_PRESSED, &TurnBy::Harness),
+            "{words:?}"
+        );
+        assert!(
+            carried.turns[..2].iter().all(|t| t.status == "settled"),
+            "only the pressed record reads pressed"
+        );
+        // NEGATIVE CONTROL: in its own word.
+        let own_word = text.replacen("\"status\":\"timeout\"", "\"status\":\"pressed\"", 1);
+        assert_ne!(own_word, text);
+        assert_eq!(read_by_v0_104(&own_word), 2, "the older build loses it");
+    }
+}
+
+/// A LEDGER THAT SHED THE HARNESS'S RECORDS FROM INSIDE ITS RING (its
+/// share, `turn_ledger::HARNESS_SHARE`) carries that floor, `shed_below`:
+/// the manager's turn the shedding kept crosses, and the adopted ledger's
+/// low-water is the sender's, so a `since-turn=` resume across the handoff
+/// below it is told it missed records, as it was before. NEGATIVE CONTROL:
+/// a ledger that shed nothing carries no `shed_below` at all, so its
+/// sidecar's bytes are what they were before the field.
+#[test]
+fn a_ledger_that_shed_harness_records_carries_its_low_water() {
+    use crate::turn_ledger::STATUS_PRESSED;
+    let (term, turns) = session(0);
+    let (low, shed) = {
+        let mut ledger = turns.lock().unwrap();
+        ledger.push(TurnRecord {
+            by: TurnBy::Ctl,
+            ..record(1, true, ArchMark::default())
+        });
+        for id in 2..=2 * LEDGER_CAP as u64 {
+            ledger.push(TurnRecord {
+                by: TurnBy::Harness,
+                status: STATUS_PRESSED,
+                ..record(id, true, ArchMark::default())
+            });
+        }
+        (ledger.low_id(), ledger.shed_below())
+    };
+    assert!(shed > 2, "the fixture sheds from inside: {shed}");
+    let text = String::from_utf8(
+        export(&[capture(&term, &turns, false)], ceiling())
+            .remove(0)
+            .1,
+    )
+    .unwrap();
+    assert_eq!(text.matches(&format!("\"shed_below\":{shed}")).count(), 1);
+    let mut carry = decode(text.as_bytes()).unwrap();
+    let adopted = adopted_ledger(Some(&mut carry));
+    assert_eq!(adopted.since(None).next().map(|r| r.id), Some(1), "kept");
+    assert_eq!(adopted.len(), LEDGER_CAP);
+    assert_eq!((adopted.low_id(), adopted.shed_below()), (low, shed));
+    // NEGATIVE CONTROL: nothing shed, no field.
+    let (term, turns) = session(30);
+    let text = String::from_utf8(
+        export(&[capture(&term, &turns, false)], ceiling())
+            .remove(0)
+            .1,
+    )
+    .unwrap();
+    assert!(!text.contains("shed_below"), "{text}");
+    assert_eq!(decode(text.as_bytes()).unwrap().shed_below, 0);
+}
+
 /// A session adopted without its ledger (no sidecar, a bad one) starts with
 /// an empty ledger that no longer vouches for any turn id up to the count
 /// this process continued from; one carried whole vouches for everything.
@@ -624,6 +763,7 @@ fn an_adopted_ledger_says_which_turn_ids_it_cannot_vouch_for() {
     let mut with_records = ControlCarry {
         turns: vec![record(40, true, ArchMark::default())],
         unheld_below: 30,
+        shed_below: 0,
         archive: None,
         log: None,
         log_mirror: None,
@@ -1305,78 +1445,6 @@ fn a_mirrored_log_that_does_not_cross_carries_its_cursor_in_the_sidecar() {
     }
 }
 
-/// §10.1-2 MEASURED, never asserted: the log's share of the handoff freeze
-/// for N sessions at the 128 KiB cap. Both halves are inside the freeze a
-/// person sees: the export's log pass and sidecar encoding run on the worker
-/// while every reader is parked (from the park to the proof, `app_update_
-/// handoff`'s "a terminal that echoed nothing"), against the same export
-/// for a successor that reads no log; then the receiver's decode of every
-/// sidecar and adoption of every log (`decode_why` plus `SessionLog::adopt`).
-/// Two mixes: shell-only (small archives, the logs fill the budget) and
-/// Claude-Code-like (large archives, the rows take the aggregate and the log
-/// detail is shed).
-#[test]
-#[ignore = "measurement: run by name with --ignored --nocapture"]
-fn measure_log_carry_freeze() {
-    for (mix, every, rows) in [("shell-only", 10, 40), ("claude-like", 2000, 8000)] {
-        let (term, turns) = session_every(rows, every);
-        for n in [1usize, 16, 64, 128] {
-            let tls: Vec<_> = (0..n).map(|_| timeline_with_log(2040)).collect();
-            let sources: Vec<CarrySource> = tls
-                .iter()
-                .map(|tl| capture_with_log(&term, &turns, tl))
-                .collect();
-            // The same sources exported as for a successor that reads no log:
-            // what the log pass adds to the export (the worker's, while every
-            // reader is parked, so inside the park->proof freeze).
-            let t0 = Instant::now();
-            let _ = export_noting(&sources, ceiling(), StatusWords::Current, false, |_, _| {});
-            let plain_us = t0.elapsed().as_micros();
-            let t0 = Instant::now();
-            let (out, _) = export_logs(&sources);
-            let export_us = t0.elapsed().as_micros();
-            let bytes: u64 = out.iter().map(|(_, b)| b.len() as u64).sum();
-            let log_bytes: u64 = out
-                .iter()
-                .map(|(_, b)| {
-                    decode(b)
-                        .unwrap()
-                        .log
-                        .map_or(0, |l| l.iter().map(|x| x.len() as u64 + 3).sum())
-                })
-                .sum();
-            let t1 = Instant::now();
-            let mut adopted = 0;
-            for (_, b) in &out {
-                let mut c = decode_why(b).unwrap();
-                let mut log = crate::session_log::SessionLog::default();
-                log.adopt(
-                    crate::session_log::LogAdopt {
-                        ids: crate::session_log::LogCarry::parse("1 3 3 3"),
-                        seq: 10_000_000,
-                        lines: c.take_log(),
-                        keeper_ep: None,
-                        mirror: None,
-                    },
-                    false,
-                    aterm_slog::Stamp::new(1_760_000_000_000, 5),
-                );
-                adopted += usize::from(log.log().ep() == 2);
-            }
-            let freeze_us = t1.elapsed().as_micros();
-            println!(
-                "MEASURE freeze {mix} N={n}: sidecars {bytes} B ({log_bytes} B of log lines), \
-                 export {export_us} us ({plain_us} us without logs); receiver decode+adopt \
-                 {freeze_us} us ({:.0} us a session), {adopted} logs continued",
-                freeze_us as f64 / n as f64
-            );
-            for tl in &tls {
-                tl.lock().unwrap().slog_mut().lift_read_fence();
-            }
-        }
-    }
-}
-
 /// M2 for the log member: a valid sidecar with a log, mangled (bytes
 /// flipped, cut short, numbers swapped for huge ones), either decodes or is
 /// dropped; when it decodes, its log is adopted or refused, never a panic,
@@ -1427,4 +1495,96 @@ fn a_mangled_log_member_never_panics_the_adopting_log() {
         let seqs: Vec<u64> = log.log().window().map(|r| r.seq).collect();
         assert!(seqs.windows(2).all(|w| w[0] < w[1]), "round {round}");
     }
+}
+
+/// Mirror metadata shares the control carry's existing cap. Ordinary cores fill
+/// that cap exactly; engaging the same logs must keep every session's newest
+/// turns and its mirror cursor, shedding older turns before exceeding it.
+#[test]
+fn mirrored_cursors_are_reserved_before_the_control_carry_spends_its_budget() {
+    const SESSIONS: usize = 16;
+    let (term, _) = session(0);
+    let archive = capture(&term, &Arc::new(Mutex::new(TurnLedger::default())), false).head;
+    let share = MAX_AGGREGATE_BYTES / SESSIONS as u64;
+    let mut records: Vec<TurnRecord> = (1..=LEDGER_CAP as u64)
+        .map(|id| {
+            let mut r = record(id, true, ArchMark::default());
+            r.text.clear();
+            r
+        })
+        .collect();
+    let base = core_len(&records, Floors::default(), &archive);
+    let mut left = usize::try_from(share.checked_sub(base).expect("room for text")).unwrap();
+    // A C0 byte occupies six JSON bytes; ASCII occupies one. At most512
+    // input bytes a turn, through the actual ledger and actual JSON encoder.
+    for r in &mut records {
+        let bytes = left.min(3000);
+        let controls = bytes.saturating_sub(512).div_ceil(5);
+        r.text = "\u{1}".repeat(controls) + &"x".repeat(bytes - controls * 6);
+        assert!(r.text.len() <= 512);
+        left -= bytes;
+    }
+    assert_eq!(left, 0, "the bounded ledger can fill its share");
+    let mut ledger = TurnLedger::default();
+    for r in records {
+        ledger.push(r);
+    }
+    let records: Vec<TurnRecord> = ledger.records().cloned().collect();
+    assert_eq!(
+        core_len(&records, Floors::default(), &archive),
+        share,
+        "exact encoded cores"
+    );
+    let ledger = Arc::new(Mutex::new(ledger));
+    let timelines: Vec<_> = (0..SESSIONS).map(|_| timeline_with_log(1)).collect();
+    let sources = || -> Vec<CarrySource> {
+        timelines
+            .iter()
+            .enumerate()
+            .map(|(i, tl)| {
+                let mut source = capture_with_log(&term, &ledger, tl);
+                source.local_id = i as u64 + 1;
+                source
+            })
+            .collect()
+    };
+    let (ordinary, _) = export_logs(&sources());
+    assert_eq!(ordinary.len(), SESSIONS);
+    assert_eq!(
+        ordinary.iter().map(|(_, b)| b.len() as u64).sum::<u64>(),
+        MAX_AGGREGATE_BYTES,
+        "CONTROL: ordinary cores spend the whole cap"
+    );
+    assert!(
+        ordinary
+            .iter()
+            .all(|(_, b)| decode(b).unwrap().log_mirror.is_none())
+    );
+    for tl in &timelines {
+        let mut g = tl.lock().unwrap();
+        g.slog_mut().lift_read_fence();
+        let now = g.slog().now();
+        let _ = g.slog_mut().mirror_log().bus_copy(1, now);
+        assert!(
+            g.slog().log().mirror_landed().is_some(),
+            "the actual take engaged it"
+        );
+    }
+    let (mirrored, _) = export_logs(&sources());
+    assert_eq!(mirrored.len(), SESSIONS, "every session retains a sidecar");
+    for (_, bytes) in &mirrored {
+        assert!(bytes.len() as u64 <= MAX_SIDECAR_BYTES);
+        let c = decode(bytes).expect("the exported control carry reads");
+        assert!(c.log_mirror.is_some(), "the cursor still crosses");
+        assert_eq!(
+            c.turns.last().map(|r| r.id),
+            Some(LEDGER_CAP as u64),
+            "every session keeps its newest turn"
+        );
+    }
+    let total: u64 = mirrored.iter().map(|(_, b)| b.len() as u64).sum();
+    assert!(
+        total <= MAX_AGGREGATE_BYTES,
+        "MIRROR_MEMBER_MUST_SHARE_THE_CONTROL_BUDGET: {total}"
+    );
 }

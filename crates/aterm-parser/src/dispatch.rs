@@ -9,6 +9,7 @@ use aterm_alloc::ArrayVec;
 use aterm_provenance::pty_wrap_ref;
 
 use super::table::{ActionType, TRANSITIONS};
+use super::tmux::{TMUX_HEAD, TmuxPassthrough};
 use super::utf8::Utf8Prefix;
 use super::{ActionSink, MAX_OSC_DATA, MAX_OSC_PARAMS, Parser, State};
 
@@ -168,6 +169,24 @@ macro_rules! process_byte_impl {
             // DCS string an ESC leaves ends only at the next byte (above).
             let canceled = $byte == 0x18 || $byte == 0x1A;
 
+            // Where the byte leaves the parser: the transition's state, unless
+            // it opens a tmux passthrough wrapper (`crate::tmux`), whose payload
+            // starts from Ground.
+            let mut next_state = transition.next_state;
+            // The head of a tmux passthrough wrapper is read in `DcsIgnore`
+            // byte by byte (no bulk path reads that state): `tmux;` whole opens
+            // the wrapper, anything else leaves an ignored DCS.
+            if let TmuxPassthrough::Head(_) = $self.tmux {
+                $self.tmux = $self.tmux.after_head_byte(
+                    $byte,
+                    prev_state == State::DcsIgnore && next_state == State::DcsIgnore,
+                );
+                if $self.tmux == TmuxPassthrough::Open {
+                    next_state = State::Ground;
+                    $self.string_utf8 = Utf8Prefix::NONE;
+                }
+            }
+
             // Handle DCS unhook when leaving DcsPassthrough. An ESC begins ST
             // only when `\` follows, so it leaves the string hooked for the next
             // byte to decide.
@@ -224,6 +243,11 @@ macro_rules! process_byte_impl {
                     $self.add_param_digit($byte);
                 }
                 ActionType::EscDispatch => {
+                    // RIS (`ESC c`) resets the parser whole: a tmux passthrough
+                    // wrapper it arrived in ends with it.
+                    if $byte == b'c' && $self.intermediates.is_empty() {
+                        $self.tmux = TmuxPassthrough::Off;
+                    }
                     $sink.esc_dispatch(pty_wrap_ref($self.intermediates.as_slice()), $byte);
                 }
                 ActionType::CsiDispatch => {
@@ -245,12 +269,23 @@ macro_rules! process_byte_impl {
                 }
                 ActionType::DcsHook => {
                     $self.close_params($self.last_was_colon);
-                    $sink.dcs_hook(
-                        pty_wrap_ref($self.params.as_slice()),
-                        pty_wrap_ref($self.intermediates.as_slice()),
-                        $byte,
-                    );
-                    $self.dcs_active = true;
+                    if $byte == TMUX_HEAD[0]
+                        && $self.tmux == TmuxPassthrough::Off
+                        && $self.params.is_empty()
+                        && $self.intermediates.is_empty()
+                    {
+                        // `ESC P t`: perhaps a tmux passthrough wrapper. Nothing
+                        // is hooked; the rest of its head decides.
+                        $self.tmux = TmuxPassthrough::Head(1);
+                        next_state = State::DcsIgnore;
+                    } else {
+                        $sink.dcs_hook(
+                            pty_wrap_ref($self.params.as_slice()),
+                            pty_wrap_ref($self.intermediates.as_slice()),
+                            $byte,
+                        );
+                        $self.dcs_active = true;
+                    }
                 }
                 ActionType::DcsPut => {
                     $sink.dcs_put($byte);
@@ -283,7 +318,7 @@ macro_rules! process_byte_impl {
                 }
             }
 
-            $self.state = transition.next_state;
+            $self.state = next_state;
         } // end else (C1 ST override)
     }};
 }
@@ -296,11 +331,90 @@ impl Parser {
     /// multi-byte sequences (split across calls too). Never panics for any
     /// input, never reads out of bounds, always terminates.
     pub fn advance_fast<S: ActionSink>(&mut self, input: &[u8], sink: &mut S) {
+        let mut remaining = input;
+        while !remaining.is_empty() {
+            remaining = if self.tmux.is_open() {
+                self.advance_unwrapping(remaining, sink)
+            } else {
+                self.advance_plain(remaining, sink)
+            };
+        }
+    }
+
+    /// Read `input` inside an open tmux passthrough wrapper (`crate::tmux`)
+    /// up to and including its next ESC, or the ESC's follower when one is
+    /// pending, handing the state machine the payload unwrapped. Returns the
+    /// rest.
+    fn advance_unwrapping<'a, S: ActionSink>(&mut self, input: &'a [u8], sink: &mut S) -> &'a [u8] {
+        if self.tmux == TmuxPassthrough::Escape {
+            let Some((&byte, rest)) = input.split_first() else {
+                return input;
+            };
+            match byte {
+                b'\\' => {
+                    self.tmux = TmuxPassthrough::Off;
+                    // A string the payload left open ends with its wrapper,
+                    // as at its ST: a program that did not double its ESCs
+                    // meant this `ESC \` as its own string's end, and a
+                    // string never runs on into what follows the wrapper.
+                    if self.dcs_st_pending {
+                        // The payload already supplied its ESC: finish that
+                        // pending string terminator without canceling it with
+                        // another ESC.
+                        self.advance_plain(b"\\", sink);
+                    } else if matches!(
+                        self.state,
+                        State::OscString
+                            | State::DcsPassthrough
+                            | State::DcsIgnore
+                            | State::SosPmApcString
+                    ) {
+                        self.advance_plain(b"\x1b\\", sink);
+                    }
+                }
+                0x1B => {
+                    self.tmux = TmuxPassthrough::Open;
+                    self.advance_plain(&[0x1B], sink);
+                }
+                _ => {
+                    // An ESC the program did not double: both bytes, as they
+                    // read without a wrapper.
+                    self.tmux = TmuxPassthrough::Open;
+                    self.advance_plain(&[0x1B, byte], sink);
+                }
+            }
+            return rest;
+        }
+        let n = super::simd::find_any_of(input, [0x1B]).unwrap_or(input.len());
+        let (run, rest) = input.split_at(n);
+        if !run.is_empty() {
+            self.advance_plain(run, sink);
+            // A RIS the payload ended its run with ended the wrapper: the ESC
+            // after it reads bare.
+            if !self.tmux.is_open() {
+                return rest;
+            }
+        }
+        match rest.split_first() {
+            Some((_, after)) => {
+                self.tmux = TmuxPassthrough::Escape;
+                after
+            }
+            None => rest,
+        }
+    }
+
+    /// The state machine over `input` as it arrived. Returns the rest
+    /// unread when a tmux passthrough wrapper opens (outside a wrapper only:
+    /// one opens no other), so [`Self::advance_fast`] reads it through the
+    /// wrapper; otherwise nothing.
+    fn advance_plain<'a, S: ActionSink>(&mut self, input: &'a [u8], sink: &mut S) -> &'a [u8] {
         // Every byte/slice access below uses the total `split_first`/`get`
         // spellings (the loop condition and the fast-path scanners guarantee
         // the fallbacks are unreachable at runtime), so this driver carries no
         // panic obligations of its own.
         let mut remaining = input;
+        let wrapped = self.tmux.is_open();
 
         while !remaining.is_empty() {
             // Test instrumentation: count loop iterations for O(n) verification
@@ -397,7 +511,13 @@ impl Parser {
             };
             remaining = tail;
             self.process_byte_inner(byte, sink);
+            // The last byte of a wrapper's head (only this path reads the
+            // `DcsIgnore` it is read in): the rest goes through the wrapper.
+            if !wrapped && self.tmux.is_open() {
+                return remaining;
+            }
         }
+        remaining
     }
 
     /// Process a single byte through the state machine (inner implementation).

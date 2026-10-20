@@ -751,17 +751,17 @@ fn a_wake_after_the_commit_waits_for_the_commit_wake() {
 #[test]
 fn pre_commit_input_is_bounded_counted_and_cannot_strand_a_chord() {
     use super::{MAX_DEFERRED_HANDOFF_INPUT, ModifiersState};
-    use winit::event::WindowEvent;
+    use aterm_window::event::WindowEvent;
 
     let _counters = crate::metrics::HANDOFF_INPUT_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (dropped_before, incoherent_before) = crate::metrics::handoff_input_counts();
     let mut app = App::headless_for_test();
-    let winit_id = winit::window::WindowId::from(0u64);
+    let winit_id = aterm_window::window::WindowId::from(0u64);
     app.incoming_handoff_pending = true;
 
-    let typed = |n: usize| WindowEvent::Ime(winit::event::Ime::Commit(format!("k{n}")));
+    let typed = |n: usize| WindowEvent::Ime(aterm_window::event::Ime::Commit(format!("k{n}")));
     for n in 0..(MAX_DEFERRED_HANDOFF_INPUT + 88) {
         app.queue_pre_commit_input(winit_id, typed(n));
     }
@@ -789,8 +789,8 @@ fn pre_commit_input_is_bounded_counted_and_cannot_strand_a_chord() {
         &app.handoff_deferred_input[511].1,
     ) {
         (
-            WindowEvent::Ime(winit::event::Ime::Commit(first)),
-            WindowEvent::Ime(winit::event::Ime::Commit(last)),
+            WindowEvent::Ime(aterm_window::event::Ime::Commit(first)),
+            WindowEvent::Ime(aterm_window::event::Ime::Commit(last)),
         ) => {
             assert_eq!(first, "k0");
             assert_eq!(last, "k511");
@@ -852,15 +852,15 @@ fn pre_commit_input_is_bounded_counted_and_cannot_strand_a_chord() {
 #[test]
 fn a_focus_loss_after_input_was_queued_for_the_window_marks_it_incoherent() {
     use super::ModifiersState;
-    use winit::event::WindowEvent;
+    use aterm_window::event::WindowEvent;
 
     let _counters = crate::metrics::HANDOFF_INPUT_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let incoherent_before = crate::metrics::handoff_input_counts().1;
     let mut app = App::headless_for_test();
-    let this = winit::window::WindowId::from(0u64);
-    let other = winit::window::WindowId::from(1u64);
+    let this = aterm_window::window::WindowId::from(0u64);
+    let other = aterm_window::window::WindowId::from(1u64);
     app.winit_to_window.insert(this, WindowId(0));
     app.winit_to_window.insert(other, WindowId(1));
     app.incoming_handoff_pending = true;
@@ -915,7 +915,7 @@ fn a_focus_loss_after_input_was_queued_for_the_window_marks_it_incoherent() {
     app.winit_to_window.insert(this, WindowId(0));
     app.incoming_handoff_pending = true;
     app.queue_pre_commit_input(
-        winit::window::WindowId::from(99u64),
+        aterm_window::window::WindowId::from(99u64),
         WindowEvent::ModifiersChanged(Default::default()),
     );
     app.on_focus(WindowId(0), false);
@@ -2106,8 +2106,8 @@ fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
         UpdateHandoffEventClass as Class, Wake, handoff_deferrable_input,
         input_event_handoff_class, update_handoff_wake_class, update_handoff_window_event_class,
     };
-    use winit::dpi::{PhysicalPosition, PhysicalSize};
-    use winit::event::{
+    use aterm_window::dpi::{PhysicalPosition, PhysicalSize};
+    use aterm_window::event::{
         DeviceId, ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent,
     };
 
@@ -2126,7 +2126,7 @@ fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
             device_id: DeviceId::dummy(),
             position: PhysicalPosition::new(4.0, 2.0),
         },
-        WindowEvent::ModifiersChanged(winit::event::Modifiers::default()),
+        WindowEvent::ModifiersChanged(aterm_window::event::Modifiers::default()),
         WindowEvent::MouseInput {
             device_id: DeviceId::dummy(),
             state: ElementState::Pressed,
@@ -2139,7 +2139,7 @@ fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
         },
         WindowEvent::Moved(PhysicalPosition::new(1, 1)),
         WindowEvent::HoveredFileCancelled,
-        WindowEvent::ThemeChanged(winit::window::Theme::Dark),
+        WindowEvent::ThemeChanged(aterm_window::window::Theme::Dark),
     ] {
         assert_eq!(
             update_handoff_window_event_class(&tolerated),
@@ -2155,7 +2155,7 @@ fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
         WindowEvent::CloseRequested,
         WindowEvent::Destroyed,
         WindowEvent::DroppedFile(std::path::PathBuf::from("/tmp/x")),
-        WindowEvent::Ime(winit::event::Ime::Preedit("a".to_string(), None)),
+        WindowEvent::Ime(aterm_window::event::Ime::Preedit("a".to_string(), None)),
     ] {
         assert_eq!(
             update_handoff_window_event_class(&revoking),
@@ -2177,11 +2177,11 @@ fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
     // types, compositions included, since an IME commit is a grapheme's only path to
     // the PTY.
     for deferrable in [
-        WindowEvent::ModifiersChanged(winit::event::Modifiers::default()),
-        WindowEvent::Ime(winit::event::Ime::Preedit("に".to_string(), None)),
-        WindowEvent::Ime(winit::event::Ime::Commit("日本語".to_string())),
-        WindowEvent::Ime(winit::event::Ime::Enabled),
-        WindowEvent::Ime(winit::event::Ime::Disabled),
+        WindowEvent::ModifiersChanged(aterm_window::event::Modifiers::default()),
+        WindowEvent::Ime(aterm_window::event::Ime::Preedit("に".to_string(), None)),
+        WindowEvent::Ime(aterm_window::event::Ime::Commit("日本語".to_string())),
+        WindowEvent::Ime(aterm_window::event::Ime::Enabled),
+        WindowEvent::Ime(aterm_window::event::Ime::Disabled),
     ] {
         assert!(
             handoff_deferrable_input(&deferrable),

@@ -2,13 +2,15 @@
 // Copyright 2026 Andrew Yates
 
 //! Glyph codegen (docs/cat-art-v4-design.md §1): turns the glyph asset TOMLs
-//! under `art/glyphs/` into the checked-in drawlist module [`crate::cat_glyphs_gen`].
+//! under `art/glyphs/` into the checked-in `cat_glyphs_gen` drawlist module.
 //!
 //! [`generate_from_assets`] is a pure function (asset texts → Rust source), run by
 //! the `gen_cat_glyphs` example and pinned byte-for-byte by the
-//! `cat_glyphs_gen_matches_assets` drift test. It opens no file: the shipped
-//! engine names no `std::fs` (docs/ATERM_DESIGN.md §2.7; aterm-census guard
-//! `engine-platform`), so the reader lives in `examples/support/asset_dir.rs`.
+//! `cat_glyphs_gen_matches_assets` drift test. The generator is mounted only in
+//! those dev examples and unit tests; product libraries use the generated
+//! drawlists. It opens no file: the shipped engine names no `std::fs`
+//! (docs/ATERM_DESIGN.md §2.7; aterm-census guard `engine-platform`), so the reader
+//! lives in `examples/support/asset_dir.rs`.
 //!
 //! The pet, dog and animal generators share the parse/quantize/fail-closed
 //! path and emit separate modules that import the cat module's shape types, so one

@@ -33,31 +33,60 @@ USAGE:
                               config directory)
 
 SET UP
-    init                      make this Mac the controller: machines.toml, the fleet SSH
-                              key, the signing and recovery keys
+    init [--passphrase]       make this Mac the controller: machines.toml, the fleet SSH
+                              key, the signing and recovery keys (no passphrase, so plan
+                              and apply sign unattended; --passphrase, then or later, has
+                              ssh-keygen ask one for each signing key)
     scan [--wait <s>] [--subnet <cidr>]
-                              Macs on the LAN: Bonjour's Remote Login and Screen Sharing
-                              advertisements, and port 22 across a subnet (a /22 at most)
-    enroll <address> --user <admin> [--name <n>] (--fingerprint <fp> | --trust-first-use)
-                              install the agent on a Mac (at a terminal: you type the
-                              admin's password to ssh and to sudo)
+                              Macs on the LAN: Bonjour's Remote Login, SFTP and Screen
+                              Sharing advertisements, and port 22 across a subnet (a /22
+                              at most)
+    enroll <address>… [--found] [--user <admin>] [--parallel N]
+    enroll <address> [--user <admin>] [--name <n>] [--fingerprint <fp>]
+                              install the agent on Macs (at a terminal: you type the
+                              admin's password once, for every Mac; it stays in memory
+                              and goes to each Mac's ssh and sudo through pipes);
+                              --found takes every Mac scan sees that is not enrolled
+                              (a Mac: it advertises macOS's SFTP or Screen Sharing
+                              beside Remote Login; never this Mac); the admin is the
+                              one the Macs enrolled before have, else your login name,
+                              unless --user names one (when the Macs refuse it, enroll
+                              asks the name once and tries the password already typed
+                              under it); a Mac enrolled already is nothing to do; a
+                              Mac's host key is trusted on first use unless
+                              --fingerprint checks it (one Mac); a Mac is named by
+                              the tag its Local hostname starts with (m10 of
+                              m10-MacBook-M4-Max-36GB-1TB), or by --name (one Mac)
     unenroll <host> [--unreachable]
                               remove the agent, the Mac's GitHub keys and its entry
+    rename <host> <new-name>  set or rename any host's canonical name in machines.toml
+                              (alias: name)
 
 LOOK
     ls [--json]               the inventory
+    tabs [<host>…] [--json]   every accessible Mac's live aterm instances, tabs, stats and
+                              AI CLI status
     status [<host>…] [--by-item] [--json]
                               each host's newest report, read from state/ alone
-    outstanding               failures, refusals, person steps, deferred items, what the
-                              newest report (an apply's) left for a login or restart,
-                              hosts whose macOS changed, and unreached hosts, as one
-                              to-do list
+    outstanding               failures, refusals, person steps, deferred items, what an
+                              apply left for a login or restart, hosts whose macOS
+                              changed, hosts only --only runs reached, and unreached
+                              hosts, as one to-do list
 
 CHANGE
-    plan  [<host>…|--all] [--now] [--parallel N] [--json]
-    apply [<host>…|--all] [--now] [--parallel N] [--json]
-                              bring hosts to their baseline (plan changes nothing); apply
-                              first upgrades an agent that is not this aterm's build
+    plan  [<host>…|--all] [--now] [--parallel N] [--only <table>,…] [--json]
+    apply [<host>…|--all] [--now] [--parallel N] [--only <table>,…] [--json]
+                              bring hosts to their baseline (plan changes nothing, and
+                              naming no host plans them all); apply first upgrades an
+                              agent that is not this aterm's build, and the default
+                              baseline names each Mac for what it is
+                              (m10-MacBook-Pro-M4-Max-36GB-1TB); --only runs just those
+                              baseline tables (apply --all --only names renames the
+                              fleet), and status keeps the other tables' last results;
+                              a host held by an IP address that does not answer there
+                              is looked for at its Local hostname (lab-07.local), and
+                              moved there only when ssh answers under its pinned host
+                              key
     attach <host> [<run>]     follow a run whose connection dropped
     run <host>…|--all [--user <u>] -- <argv>
                               run one program (no shell) as root, or as the account <u>
@@ -95,19 +124,33 @@ At each Mac, once (the visit no software replaces):
   1. A new Mac: Setup Assistant. Create the lab admin account, sign in to no Apple
      account, and skip the rest.
   2. System Settings ▸ General ▸ Sharing:
-       - set Computer Name and Local hostname to the label on the case (lab-07);
+       - set Computer Name and Local hostname to the label on the case (lab-07); apply
+         adds what the Mac is (lab-07 MacBook Pro M4 Max 36GB 1TB);
        - turn Remote Login on, and in its ⓘ turn on \"Allow full disk access for
          remote users\";
        - turn Screen Sharing on, with access for administrators only.
-  3. Read the SSH host key fingerprint the case label pairs with. In Terminal:
+  3. Optional: to check the Mac's identity, pass --fingerprint to enroll. The SSH host
+     key fingerprint (the case label can carry it) reads, in Terminal:
        ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
-     Or skip this and pass --trust-first-use at enrollment, accepting the risk on a
-     LAN you trust.
+     Without it, enroll trusts the key the Mac first answers with and prints it.
   4. From the controller:
-       aterm machines enroll lab-07.local --user labadmin --fingerprint SHA256:…
+       aterm machines enroll lab-07.local
        aterm machines apply lab-07
-     enroll installs the agent; apply installs aterm.app, whose switches step 5 flips,
-     and the rest of the baseline.
+     enroll logs in as the admin the Macs enrolled before have, else as your login name
+     on this Mac (--user <admin> names another), and installs aterm's helper (the
+     agent); apply installs aterm.app, whose switches step 5 flips, and the rest of the
+     baseline. Many Macs at once, the password typed once for all of them:
+       aterm machines enroll --found        (every Mac scan sees, not yet enrolled)
+       aterm machines enroll lab-07.local lab-08.local
+       aterm machines apply --all --only names
+     Each Mac's ID (its host key fingerprint) is printed before the one password prompt.
+     Trusted on first use, the password goes to whatever answers first (with --found,
+     any machine on the LAN advertising a Mac's Remote Login): enroll on a LAN you
+     control. When the Macs refuse the password and --user named none, enroll asks the
+     admin account's name once and tries the same password under it; a Mac that still
+     refuses is asked for once more, by name. Any other Mac that cannot be enrolled says
+     why on its own line, and the rest go on; running the same command again enrolls
+     the ones left (a Mac enrolled already is nothing to do).
   5. Then, while you are still at the Mac's keyboard:
        aterm machines person lab-07 --here
      It opens the Full Disk Access pane, then the Developer Tools pane, on that Mac's
@@ -122,7 +165,9 @@ const VERBS: &[&str] = &[
     "scan",
     "enroll",
     "unenroll",
+    "rename",
     "ls",
+    "tabs",
     "status",
     "outstanding",
     "plan",
@@ -136,6 +181,130 @@ const VERBS: &[&str] = &[
     "here",
     "agent",
 ];
+
+/// The `launchd` label of the LaunchAgent builds of `main` from 17 October 2026 installed in
+/// each account that ran them (design §14.2).
+const RETIRED_AGENT: &str = "systems.alab.aterm-machines";
+
+/// Where that LaunchAgent kept its copy of aterm and its log, under `$HOME`.
+const RETIRED_AGENT_DIR: &str = ".local/share/aterm-machines";
+
+/// The files that job made, under [`RETIRED_AGENT_DIR`]: its Spotlight marker, the copy of
+/// aterm it ran, its log and its socket.
+const RETIRED_FILES: &[&str] = &[
+    ".metadata_never_index",
+    "bin/aterm",
+    "state/daemon.log",
+    "state/daemon.sock",
+];
+
+/// The directories it made, deepest first.
+const RETIRED_DIRS: &[&str] = &["bin", "state/runs", "state", "cache", "stage", "inbox"];
+
+/// Whether `aterm pkg <args>` retires that job: `shell-setup`, the step that installs aterm,
+/// but not its `--dry-run`, which changes nothing.
+#[must_use]
+pub fn pkg_retires(args: &[OsString]) -> bool {
+    args.first().is_some_and(|a| a == "shell-setup") && !args.iter().any(|a| a == "--dry-run")
+}
+
+/// Take away the LaunchAgent earlier builds installed in this account ([`retire_agent`]).
+///
+/// No-op as root, under a synthetic `$HOME` or a private state root (`ATERM_STATE_HOME`).
+/// It starts no process when there is nothing to take.
+pub fn retire_lan_agent() {
+    let sys = Live::new();
+    if sys.euid() == 0 || !crate::sessions::is_live_account() {
+        return;
+    }
+    // `is_live_account` has shown `$HOME` is the account's own home.
+    if let Some(home) = aterm_types::dirs::home_dir() {
+        retire_agent(&sys, &home);
+    }
+}
+
+/// Unload and delete `~/Library/LaunchAgents/systems.alab.aterm-machines.plist`, then delete
+/// what that job left ([`sweep_retired_dir`]). Main's job was to answer LAN discovery and
+/// management on port 19740; it never did (the agent refused its argv), and launchd ran it
+/// again every ten seconds. Only bounded metadata walks when there is nothing to take.
+fn retire_agent(sys: &dyn System, home: &Path) {
+    if sys.euid() == 0 {
+        return;
+    }
+    if let Some(parent) = physical_directory_below(sys, home, Path::new("Library/LaunchAgents")) {
+        let plist = parent.join(format!("{RETIRED_AGENT}.plist"));
+        if sys.stat(&plist).is_ok() {
+            let _ = sys.run(
+                &crate::port::Cmd::new("/bin/launchctl")
+                    .args(["bootout", &format!("gui/{}/{RETIRED_AGENT}", sys.euid())])
+                    .budget(Duration::from_secs(5)),
+            );
+            let _ = sys.remove(&plist);
+        }
+    }
+    sweep_retired_dir(sys, home, Path::new(RETIRED_AGENT_DIR));
+}
+
+/// Admit every directory from the validated home through `below` without following a
+/// directory alias. Missing, unreadable and non-directory components keep cleanup out.
+fn physical_directory_below(
+    sys: &dyn System,
+    home: &Path,
+    below: &Path,
+) -> Option<std::path::PathBuf> {
+    let real = |p: &Path| sys.stat(p).is_ok_and(|st| st.dir && !st.symlink);
+    if !home.is_absolute() || !real(home) {
+        return None;
+    }
+    let mut dir = home.to_path_buf();
+    for part in below.components() {
+        let std::path::Component::Normal(name) = part else {
+            return None;
+        };
+        dir.push(name);
+        if !real(&dir) {
+            return None;
+        }
+    }
+    Some(dir)
+}
+
+/// Delete [`RETIRED_FILES`] from `dir`, then each of [`RETIRED_DIRS`] that is empty, then
+/// `dir` if it is empty. A name is deleted only when `lstat` shows what the job made there (a
+/// file that is neither a directory nor a link, or a directory), and only when every
+/// directory from `dir` down to it is a real one: the kernel follows a link in the middle of
+/// a path, so a `state` that is a link stops `state/runs` and `state/daemon.log`. A link,
+/// and anything else, stays.
+fn sweep_retired_dir(sys: &dyn System, home: &Path, below: &Path) {
+    let Some(dir) = physical_directory_below(sys, home, below) else {
+        return;
+    };
+    let dir = dir.as_path();
+    let is_dir = |p: &Path| sys.stat(p).is_ok_and(|st| st.dir);
+    let is_file = |p: &Path| sys.stat(p).is_ok_and(|st| !st.dir && !st.symlink);
+    let reached = |rel: &Path| {
+        rel.ancestors()
+            .skip(1)
+            .all(|up| up.as_os_str().is_empty() || is_dir(&dir.join(up)))
+    };
+    if !is_dir(dir) {
+        return;
+    }
+    for rel in RETIRED_FILES {
+        let path = dir.join(rel);
+        if reached(Path::new(rel)) && is_file(&path) {
+            let _ = sys.remove(&path);
+        }
+    }
+    // `remove` takes a directory only when it is empty.
+    for rel in RETIRED_DIRS {
+        let path = dir.join(rel);
+        if reached(Path::new(rel)) && is_dir(&path) {
+            let _ = sys.remove(&path);
+        }
+    }
+    let _ = sys.remove(dir);
+}
 
 /// `aterm machines <args>`.
 #[must_use]
@@ -166,9 +335,19 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
             ExitCode::SUCCESS
         }
         "agent" => crate::agent::main(&args[1..], &sys),
-        "scan" => scan(root, &args[1..]),
-        "here" => here(&sys, &args[1..]),
-        verb if VERBS.contains(&verb) => {
+        "scan" => {
+            #[cfg(not(test))]
+            retire_lan_agent();
+            scan(root, &args[1..])
+        }
+        "here" => {
+            #[cfg(not(test))]
+            retire_lan_agent();
+            here(&sys, &args[1..])
+        }
+        verb if VERBS.contains(&verb) || verb == "name" => {
+            #[cfg(not(test))]
+            retire_lan_agent();
             let Some(paths) = root.or_else(Paths::default_root) else {
                 eprintln!("aterm machines: no config directory to keep the controller in");
                 return ExitCode::FAILURE;
@@ -190,10 +369,12 @@ struct Opts {
     by_item: bool,
     here: bool,
     unreachable: bool,
+    passphrase: bool,
     parallel: Option<usize>,
     user: Option<String>,
     signers: Option<String>,
     key: Option<String>,
+    only: Vec<String>,
     argv: Vec<String>,
 }
 
@@ -202,12 +383,14 @@ fn flags_of(verb: &str) -> &'static [&'static str] {
     match verb {
         // `outstanding` is a to-do list for a person: `status --json` has the reports.
         "ls" | "attach" => &["--json"],
+        "tabs" => &["--all", "--json"],
         "status" => &["--all", "--by-item", "--json"],
-        "plan" | "apply" => &["--all", "--now", "--parallel", "--json"],
+        "plan" | "apply" => &["--all", "--now", "--parallel", "--only", "--json"],
         "run" => &["--all", "--user", "--parallel", "--"],
         "rekey" => &["--all", "--signers", "--key", "--parallel"],
         "person" => &["--all", "--here"],
         "unenroll" => &["--unreachable"],
+        "init" => &["--passphrase"],
         _ => &[],
     }
 }
@@ -241,6 +424,7 @@ fn parse(verb: &str, args: &[String]) -> Result<Opts, String> {
             "--by-item" => o.by_item = true,
             "--here" => o.here = true,
             "--unreachable" => o.unreachable = true,
+            "--passphrase" => o.passphrase = true,
             "--parallel" => {
                 let v = value()?;
                 o.parallel = Some(
@@ -251,6 +435,15 @@ fn parse(verb: &str, args: &[String]) -> Result<Opts, String> {
                 );
             }
             "--user" => o.user = Some(value()?),
+            "--only" => {
+                let tables = value()?;
+                for table in tables.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                    if !o.only.iter().any(|t| t == table) {
+                        o.only.push(table.to_owned());
+                    }
+                }
+                crate::baseline::check_only(&o.only)?;
+            }
             "--signers" => o.signers = Some(value()?),
             "--key" => o.key = Some(value()?),
             _ => return Err(format!("unknown option {flag}")),
@@ -294,6 +487,7 @@ fn controller(sys: &dyn System, paths: Paths, verb: &str, args: &[String]) -> Ex
         "init" | "ls" | "outstanding" => words(&o, 0, 0, "no arguments"),
         "attach" => words(&o, 1, 2, "<host> [<run>]"),
         "unenroll" => words(&o, 1, 1, "one <host>"),
+        "rename" | "name" => words(&o, 2, 2, "<host> <new-name>"),
         "github" => match o.words.first().map(String::as_str) {
             Some("revoke") => words(&o, 2, 2, "revoke <host>"),
             _ => Err("takes revoke <host>".to_owned()),
@@ -308,13 +502,15 @@ fn controller(sys: &dyn System, paths: Paths, verb: &str, args: &[String]) -> Ex
         return refuse(&format!("{verb}: {why}"));
     }
     match verb {
-        "init" => commands::init(&env),
+        "init" => commands::init(&env, o.passphrase, &mut std::io::stdout().lock()),
         "unenroll" => commands::unenroll(&env, &o.words[0], o.unreachable),
+        "rename" | "name" => commands::rename(&env, &o.words[0], &o.words[1]),
         "ls" => commands::ls(&env),
+        "tabs" => commands::tabs(&env, &o.words, o.all),
         "status" => commands::status(&env, &o.words, o.all, o.by_item),
         "outstanding" => commands::outstanding(&env),
-        "plan" => commands::plan_or_apply(&env, &o.words, o.all, Mode::Plan, o.now),
-        "apply" => commands::plan_or_apply(&env, &o.words, o.all, Mode::Apply, o.now),
+        "plan" => commands::plan_or_apply_only(&env, &o.words, o.all, Mode::Plan, o.now, &o.only),
+        "apply" => commands::plan_or_apply_only(&env, &o.words, o.all, Mode::Apply, o.now, &o.only),
         "attach" => commands::attach(&env, &o.words[0], o.words.get(1).map(String::as_str)),
         "run" => commands::run(&env, &o.words, o.all, o.user.as_deref(), &o.argv),
         "github" => commands::github_revoke(&env, &o.words[1]),
@@ -432,11 +628,7 @@ fn scan(root: Option<Paths>, args: &[String]) -> ExitCode {
         None => None,
     };
     let marks = crate::controller::ssh::fan_out(&rows, 16, |row| match (&paths, &inventory) {
-        (Some(p), Some(inv)) => match discover::pinned_host(&sys, p, inv, row) {
-            Read::Value(name) => format!("enrolled {name}"),
-            Read::Absent => "new".to_owned(),
-            Read::Unusable(_) => "?".to_owned(),
-        },
+        (Some(p), Some(inv)) => mark(&sys, p, inv, row),
         _ => "?".to_owned(),
     });
     let width = rows
@@ -469,6 +661,13 @@ fn scan(root: Option<Paths>, args: &[String]) -> ExitCode {
     for name in &browse.unresolved {
         println!("advertised, not located: {}", shown(name));
     }
+    if let Some(why) = &browse.sftp_failed {
+        println!(
+            "macOS's SFTP advertisements could not be browsed ({}): `enroll --found` takes only \
+             the Macs Screen Sharing marks",
+            shown(why)
+        );
+    }
     if rows.is_empty() && browse.unresolved.is_empty() {
         println!(
             "no Mac seen: a Mac advertises Remote Login only when it was turned on in System \
@@ -476,6 +675,17 @@ fn scan(root: Option<Paths>, args: &[String]) -> ExitCode {
         );
     }
     ExitCode::SUCCESS
+}
+
+/// A row's MAC column: `enrolled <host>` only when the key it presents is the one pinned
+/// for that host ([`discover::pinned_host`]), `new` when its key is pinned for none, `?`
+/// when it shows no key (no Remote Login).
+fn mark(sys: &dyn System, paths: &Paths, inv: &Inventory, row: &discover::Found) -> String {
+    match discover::pinned_host(sys, paths, inv, row) {
+        Read::Value(name) => format!("enrolled {name}"),
+        Read::Absent => "new".to_owned(),
+        Read::Unusable(_) => "?".to_owned(),
+    }
 }
 
 /// The inventory `scan` compares host keys against: `Value` when it loads, `Absent` when
@@ -496,7 +706,7 @@ fn scan_inventory(sys: &dyn System, paths: &Paths) -> Read<Inventory> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::port::Fake;
+    use crate::port::{Fake, Ran};
 
     #[test]
     fn an_inventory_that_cannot_be_read_is_unknown_and_a_missing_one_is_empty() {
@@ -519,6 +729,271 @@ mod tests {
         let fine = Fake::root();
         fine.file("/ctl/machines/machines.toml", b"schema = 1\n");
         assert!(matches!(scan_inventory(&fine, &paths), Read::Value(_)));
+    }
+
+    #[test]
+    fn the_lan_agent_earlier_builds_installed_is_unloaded_and_what_it_made_taken_away() {
+        let home = Path::new("/Users//alice");
+        let plist = "/Users//alice/Library/LaunchAgents/systems.alab.aterm-machines.plist";
+        let dir = "/Users//alice/.local/share/aterm-machines";
+        let bootout = "/bin/launchctl bootout gui/501/systems.alab.aterm-machines";
+        let alice = || {
+            let mut sys = Fake::root();
+            sys.euid = 501;
+            sys
+        };
+        let real_dir = crate::port::Stat {
+            uid: 501,
+            gid: 20,
+            mode: 0o700,
+            dir: true,
+            symlink: false,
+            len: 0,
+        };
+        let installed = || {
+            let sys = alice();
+            sys.file(plist, b"<plist/>")
+                .file(&format!("{dir}/.metadata_never_index"), b"")
+                .file(&format!("{dir}/bin/aterm"), b"a copy of aterm")
+                .file(&format!("{dir}/state/daemon.log"), b"refused: \n")
+                .file(&format!("{dir}/state/daemon.sock"), b"")
+                .file(&format!("{dir}/state/notes.txt"), b"not the job's")
+                .on(bootout, Ran::ok(""));
+            for parent in [
+                home.to_path_buf(),
+                home.join(".local"),
+                home.join(".local/share"),
+                home.join("Library"),
+                home.join("Library/LaunchAgents"),
+            ] {
+                sys.stat_of(&parent.to_string_lossy(), real_dir);
+            }
+            for sub in ["", "/bin", "/state", "/state/runs"] {
+                sys.stat_of(&format!("{dir}{sub}"), real_dir);
+            }
+            sys
+        };
+        let sys = installed();
+        retire_agent(&sys, home);
+        let calls = sys.calls();
+        let at = |c: &str| calls.iter().position(|x| x == c);
+        // Unloaded before its plist goes: launchd neither runs it now nor at the next login.
+        assert!(at(bootout).is_some(), "{calls:?}");
+        assert!(at(bootout) < at(&format!("remove {plist}")), "{calls:?}");
+        for gone in [
+            plist.to_owned(),
+            format!("{dir}/.metadata_never_index"),
+            format!("{dir}/bin/aterm"),
+            format!("{dir}/state/daemon.log"),
+            format!("{dir}/state/daemon.sock"),
+        ] {
+            assert_eq!(sys.written(&gone), None, "{gone}");
+        }
+        // Its directories after its files, deepest first, and only those that are there.
+        let removed: Vec<&str> = calls
+            .iter()
+            .filter_map(|c| c.strip_prefix("remove "))
+            .collect();
+        assert_eq!(
+            removed,
+            [
+                plist.to_owned(),
+                format!("{dir}/.metadata_never_index"),
+                format!("{dir}/bin/aterm"),
+                format!("{dir}/state/daemon.log"),
+                format!("{dir}/state/daemon.sock"),
+                format!("{dir}/bin"),
+                format!("{dir}/state/runs"),
+                format!("{dir}/state"),
+                dir.to_owned(),
+            ]
+        );
+        // What the job did not make stays (and `remove` takes no directory that is not
+        // empty: `a_retired_directory_is_swept_only_where_the_job_made_it`).
+        assert!(sys.written(&format!("{dir}/state/notes.txt")).is_some());
+
+        // A `state` that is a link, and a file or a link where a directory of the job's
+        // was: nothing is taken at them or through them.
+        let sys = installed();
+        let link = crate::port::Stat {
+            dir: false,
+            symlink: true,
+            ..real_dir
+        };
+        sys.stat_of(&format!("{dir}/state"), link)
+            .stat_of(&format!("{dir}/bin"), link)
+            .file(&format!("{dir}/cache"), b"a file of mine");
+        retire_agent(&sys, home);
+        let calls = sys.calls();
+        for kept in [
+            "/state",
+            "/state/runs",
+            "/state/daemon.log",
+            "/bin",
+            "/bin/aterm",
+            "/cache",
+        ] {
+            let kept = format!("remove {dir}{kept}");
+            assert!(!calls.contains(&kept), "{kept}: {calls:?}");
+        }
+        assert!(calls.contains(&format!("remove {dir}/.metadata_never_index")));
+
+        // Nothing there: nothing run or removed.
+        let sys = alice();
+        retire_agent(&sys, home);
+        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+        // A link where its directory was is not followed.
+        let sys = installed();
+        sys.stat_of(
+            dir,
+            crate::port::Stat {
+                dir: false,
+                symlink: true,
+                ..real_dir
+            },
+        );
+        retire_agent(&sys, home);
+        assert!(sys.written(&format!("{dir}/bin/aterm")).is_some());
+        assert!(
+            !sys.calls()
+                .iter()
+                .any(|c| c.starts_with(&format!("remove {dir}")))
+        );
+        // Root has no such job.
+        let sys = Fake::root();
+        sys.file(plist, b"<plist/>");
+        retire_agent(&sys, home);
+        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+    }
+
+    #[test]
+    fn only_a_shell_setup_that_is_not_a_dry_run_retires_the_job() {
+        let args = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
+        assert!(pkg_retires(&args(&["shell-setup"])));
+        assert!(pkg_retires(&args(&["shell-setup", "--path"])));
+        assert!(!pkg_retires(&args(&["shell-setup", "--dry-run"])));
+        assert!(!pkg_retires(&args(&["shell-setup", "--path", "--dry-run"])));
+        assert!(!pkg_retires(&args(&["install", "shell-setup"])));
+        assert!(!pkg_retires(&[]));
+    }
+
+    #[test]
+    fn a_retired_directory_is_swept_only_where_the_job_made_it() {
+        use std::os::unix::fs::symlink;
+        // Under /tmp: a socket path must fit in 104 bytes.
+        let tmp = aterm_tempfile::Builder::new()
+            .prefix("at-retire-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let t = tmp.path();
+        let live = Live::new();
+        let write = |p: &Path| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"x").unwrap();
+        };
+        let there = |p: &Path| p.symlink_metadata().is_ok();
+
+        // As the job left it, with a file of the account's in `stage` and a link at `inbox`.
+        let job = t.join("job");
+        for d in ["bin", "state/runs", "cache", "stage"] {
+            std::fs::create_dir_all(job.join(d)).unwrap();
+        }
+        for f in [
+            ".metadata_never_index",
+            "bin/aterm",
+            "state/daemon.log",
+            "stage/notes",
+        ] {
+            write(&job.join(f));
+        }
+        let _sock = std::os::unix::net::UnixListener::bind(job.join("state/daemon.sock")).unwrap();
+        write(&t.join("mine/inbox/keep"));
+        symlink(t.join("mine/inbox"), job.join("inbox")).unwrap();
+        sweep_retired_dir(&live, t, Path::new("job"));
+        for gone in [".metadata_never_index", "bin", "state", "cache"] {
+            assert!(!there(&job.join(gone)), "{gone}");
+        }
+        for kept in ["stage/notes", "inbox", "inbox/keep"] {
+            assert!(there(&job.join(kept)), "{kept}");
+        }
+        // Once nothing else is there, the directory goes too.
+        std::fs::remove_file(job.join("stage/notes")).unwrap();
+        std::fs::remove_file(job.join("inbox")).unwrap();
+        sweep_retired_dir(&live, t, Path::new("job"));
+        assert!(!there(&job));
+        assert!(there(&t.join("mine/inbox/keep")));
+
+        // Links and a file where the job's directories and files were: `state` a link to a
+        // directory holding an empty `runs` and a `daemon.log`, `bin` a link to one holding
+        // an `aterm`, a file at `cache`, a link at the marker.
+        let job = t.join("job2");
+        std::fs::create_dir_all(t.join("elsewhere/runs")).unwrap();
+        write(&t.join("elsewhere/daemon.log"));
+        write(&t.join("mine/bin/aterm"));
+        write(&t.join("marker"));
+        write(&job.join("cache"));
+        symlink(t.join("elsewhere"), job.join("state")).unwrap();
+        symlink(t.join("mine/bin"), job.join("bin")).unwrap();
+        symlink(t.join("marker"), job.join(".metadata_never_index")).unwrap();
+        sweep_retired_dir(&live, t, Path::new("job2"));
+        for kept in [
+            "job2/state",
+            "job2/bin",
+            "job2/cache",
+            "job2/.metadata_never_index",
+            "elsewhere/runs",
+            "elsewhere/daemon.log",
+            "mine/bin/aterm",
+            "marker",
+        ] {
+            assert!(there(&t.join(kept)), "{kept}");
+        }
+
+        // An alias ABOVE the retired directory cannot redirect its whitelist into
+        // external owned data. These call the same gated sweep as retire_agent.
+        for (i, prefix, tail) in [
+            (0, ".local", "share/aterm-machines"),
+            (1, ".local/share", "aterm-machines"),
+            (2, RETIRED_AGENT_DIR, ""),
+        ] {
+            let home = t.join(format!("home-{i}"));
+            let outside = t.join(format!("outside-{i}"));
+            let alias = home.join(prefix);
+            std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+            let marker = outside.join(tail).join("bin/aterm");
+            write(&marker);
+            symlink(&outside, &alias).unwrap();
+            sweep_retired_dir(&live, &home, Path::new(RETIRED_AGENT_DIR));
+            assert!(there(&alias), "the ancestor alias stays");
+            assert_eq!(std::fs::read(&marker).unwrap(), b"x", "external data stays");
+        }
+        // The plist path uses the same admission, without calling launchctl here.
+        for (i, prefix, tail) in [
+            (0, "Library", "LaunchAgents"),
+            (1, "Library/LaunchAgents", ""),
+        ] {
+            let home = t.join(format!("plist-home-{i}"));
+            let outside = t.join(format!("plist-outside-{i}"));
+            let alias = home.join(prefix);
+            std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+            let plist = outside.join(tail).join(format!("{RETIRED_AGENT}.plist"));
+            write(&plist);
+            symlink(&outside, &alias).unwrap();
+            assert!(
+                physical_directory_below(&live, &home, Path::new("Library/LaunchAgents")).is_none()
+            );
+            assert_eq!(std::fs::read(&plist).unwrap(), b"x");
+        }
+        let home = t.join("physical-home");
+        let parent = home.join("Library/LaunchAgents");
+        std::fs::create_dir_all(&parent).unwrap();
+        assert_eq!(
+            physical_directory_below(&live, &home, Path::new("Library/LaunchAgents")),
+            Some(parent)
+        );
+        assert!(physical_directory_below(&live, &home, Path::new("missing")).is_none());
+        write(&home.join("not-a-directory"));
+        assert!(physical_directory_below(&live, &home, Path::new("not-a-directory")).is_none());
     }
 
     #[test]
@@ -551,6 +1026,28 @@ mod tests {
             main_entry(vec![OsString::from("--help")]),
             ExitCode::SUCCESS
         );
+    }
+
+    #[test]
+    fn only_takes_known_table_names_and_refuses_the_rest_with_the_list() {
+        let o = parse(
+            "apply",
+            &[
+                "--all".into(),
+                "--only".into(),
+                "names, power".into(),
+                "--only".into(),
+                "names".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(o.only, ["names", "power"]);
+        let err = parse("plan", &["--only".into(), "nmaes".into()]).unwrap_err();
+        assert!(
+            err.contains("\"nmaes\"") && err.contains("names, sharing"),
+            "{err}"
+        );
+        assert!(parse("status", &["--only".into(), "names".into()]).is_err());
     }
 
     #[test]

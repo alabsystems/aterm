@@ -1,0 +1,23 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of an_interrupted_vendor_turn_is_continued_by_no_later_turn, the
+# partial rig. S9: an unmeasured transcript is additive only. Its interrupt
+# ends its vendor turn (so no later turn continues it), but the screen's
+# ordinary idle settle remains done, not interrupted by transcript evidence.
+state partial
+bind 0
+see busy
+tx prompt v1
+tx tool c1
+tx interrupt
+tx result c1 error
+see idle
+wait 1000
+expect close t1 turn out=done src=screen conf=strong
+expect turn=none
+wait 30000
+see busy
+expect open t1 turn
+expect open t2 turn
+tx prompt v2
+expect amend t1 turn vref=v1
+expect amend t2 turn vref=v2

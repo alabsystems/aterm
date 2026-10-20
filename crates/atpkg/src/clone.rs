@@ -321,6 +321,18 @@ mod tests {
         let dir = scratch("not");
         let src = dir.join("tippy");
         std::fs::write(&src, b"tippy").unwrap();
+        // A store file's time is its build's, long past, so the rewrite below
+        // moves it. Stamped now, the source and a rewrite in the same scheduler
+        // tick shared one time to the nanosecond under Linux's coarse file
+        // clock, and the rewritten clone still read as one (the Linux lane).
+        let built =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(built)
+            .unwrap();
         let link = dir.join("hard");
         std::fs::hard_link(&src, &link).unwrap();
         assert!(

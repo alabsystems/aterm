@@ -37,7 +37,7 @@
 //! same event the development `appearance dark|light` control verb posts.
 
 use aterm_types::Appearance;
-use winit::event_loop::EventLoopProxy;
+use aterm_window::event_loop::EventLoopProxy;
 
 use crate::Wake;
 
@@ -103,7 +103,7 @@ impl OsAppearanceSource {
     #[must_use]
     pub(crate) fn at_attach(
         self,
-        window_theme: impl FnOnce() -> Option<winit::window::Theme>,
+        window_theme: impl FnOnce() -> Option<aterm_window::window::Theme>,
     ) -> Option<Appearance> {
         if self != Self::Platform {
             return None;
@@ -444,7 +444,9 @@ mod desktop {
     /// Start the worker that posts every desktop appearance it reads. `false`
     /// when the thread could not start.
     #[cfg(all(not(target_os = "macos"), not(windows)))]
-    pub(super) fn spawn_watch(proxy: winit::event_loop::EventLoopProxy<crate::Wake>) -> bool {
+    pub(super) fn spawn_watch(
+        proxy: aterm_window::event_loop::EventLoopProxy<crate::Wake>,
+    ) -> bool {
         std::thread::Builder::new()
             .name("aterm-os-appearance".into())
             .spawn(move || {
@@ -522,7 +524,7 @@ mod desktop {
 mod mac {
     use aterm_objc::{Id, class, sel};
     use aterm_types::Appearance;
-    use winit::event_loop::EventLoopProxy;
+    use aterm_window::event_loop::EventLoopProxy;
 
     use crate::Wake;
     use crate::appkit::{self, MainThread};
@@ -865,7 +867,10 @@ mod tests {
     fn the_inert_source_reads_nothing() {
         let inert = OsAppearanceSource::Inert;
         assert_eq!(inert.initial(), None);
-        assert_eq!(inert.at_attach(|| Some(winit::window::Theme::Light)), None);
+        assert_eq!(
+            inert.at_attach(|| Some(aterm_window::window::Theme::Light)),
+            None
+        );
         assert!(!inert.reads_window_theme());
         assert_eq!(OsAppearanceSource::choose(true, None), inert);
         assert_eq!(
@@ -882,7 +887,10 @@ mod tests {
             let source = OsAppearanceSource::choose(headless, Some(Appearance::Light));
             assert_eq!(source, OsAppearanceSource::Injected(Appearance::Light));
             assert_eq!(source.initial(), Some(Appearance::Light));
-            assert_eq!(source.at_attach(|| Some(winit::window::Theme::Dark)), None);
+            assert_eq!(
+                source.at_attach(|| Some(aterm_window::window::Theme::Dark)),
+                None
+            );
             assert!(!source.reads_window_theme());
         }
     }
@@ -917,15 +925,18 @@ mod tests {
 
     /// The tether law: closing the tether ends the watched program, so a
     /// watcher never outlives the process holding it. Negative control: while
-    /// the tether is held, the watcher keeps running and printing. The wait
-    /// for end-of-file is a one-minute hang detector.
+    /// the tether is held, the watcher keeps running and printing, through
+    /// eleven ticks a tenth of a second apart (a second held, as when it ticked
+    /// once a second). The wait for end-of-file is a one-minute hang detector.
+    /// The ticks are short because the watcher's last `sleep` keeps the pipe
+    /// open until it ends.
     #[cfg(unix)]
     #[test]
     fn closing_the_tether_ends_the_watcher() {
         let mut watcher =
-            super::desktop::tethered("/bin/sh", &["-c", "while :; do echo tick; sleep 1; done"])
+            super::desktop::tethered("/bin/sh", &["-c", "while :; do echo tick; sleep 0.1; done"])
                 .expect("spawn a tethered watcher");
-        for _ in 0..2 {
+        for _ in 0..11 {
             let line = watcher.lines.next().expect("a line").expect("utf-8");
             assert_eq!(line, "tick", "the watcher runs while tethered");
         }

@@ -1,0 +1,352 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+//! The anchor attributes as `macro_rules!` attributes (the crate docs say where).
+//!
+//! An attribute expands to the annotated fn as written, with its body prefixed by the
+//! record (a load-time `registry::submit!`, on the targets that have a constructor
+//! section) and, for `refines` on a fn that is not `const`, the `xref::note_entered`
+//! probe carrying the record's `entry_id`. The record is an item inside the body, so it
+//! needs no name: an anchored method sits in an `impl` as a free fn sits in a module.
+//!
+//! Expansions of stacked attributes nest, and one carrier fn holds 31 waivers, so the
+//! common shape (the keys in their documented order, on a fn with no generics, `where`
+//! clause or qualifier but `const`) expands in one step. Every other shape goes through
+//! `__aterm_spec_anchor!`, which reads the keys in any order and walks the item's tokens
+//! to its body, sixteen at a time.
+//!
+//! ```
+//! #![cfg_attr(anchor_rules, feature(macro_attr))]
+//! #[aterm_spec_anchor::refines(machine = "Twin", action = "Up", project = "twin::project")]
+//! fn up(n: u32) -> u32 {
+//!     n + 1
+//! }
+//! #[aterm_spec_anchor::spec_unmodeled(reason = "a platform fast path", machine = "Twin")]
+//! fn fast() {}
+//! # fn main() { assert_eq!(up(1), 2); fast(); }
+//! ```
+//!
+//! A key the attribute does not take:
+//!
+//! ```compile_fail
+//! #![cfg_attr(anchor_rules, feature(macro_attr))]
+//! #[aterm_spec_anchor::refines(machine = "Twin", action = "Up", project = "twin::project", tla = "x")]
+//! fn up(n: u32) -> u32 {
+//!     n + 1
+//! }
+//! # fn main() { assert_eq!(up(1), 2); }
+//! ```
+//!
+//! A value that is not a string literal:
+//!
+//! ```compile_fail
+//! #![cfg_attr(anchor_rules, feature(macro_attr))]
+//! #[aterm_spec_anchor::refines(machine = "Twin", action = Up, project = "twin::project")]
+//! fn up(n: u32) -> u32 {
+//!     n + 1
+//! }
+//! # fn main() { assert_eq!(up(1), 2); }
+//! ```
+//!
+//! A `refines` with an empty `project`, and a waiver with no `reason`:
+//!
+//! ```compile_fail
+//! #![cfg_attr(anchor_rules, feature(macro_attr))]
+//! #[aterm_spec_anchor::refines(machine = "Twin", action = "Up", project = "")]
+//! fn up(n: u32) -> u32 {
+//!     n + 1
+//! }
+//! # fn main() { assert_eq!(up(1), 2); }
+//! ```
+//!
+//! ```compile_fail
+//! #![cfg_attr(anchor_rules, feature(macro_attr))]
+//! #[aterm_spec_anchor::spec_unmodeled(machine = "Twin")]
+//! fn fast() {}
+//! # fn main() { fast(); }
+//! ```
+//!
+//! An item that is not a fn with a body:
+//!
+//! ```compile_fail
+//! #![cfg_attr(anchor_rules, feature(macro_attr))]
+//! #[aterm_spec_anchor::spec_unmodeled(reason = "a struct")]
+//! struct S;
+//! # fn main() {}
+//! ```
+
+/// Bind a fn to the model action it performs: `machine`, `action` and `project` (the fn
+/// Tier-1 reads the real state through), all required.
+#[macro_export]
+macro_rules! refines {
+    attr(machine = $m:literal, action = $a:literal, project = "" $(,)?) ($($item:tt)*) => {
+        ::core::compile_error! {
+            "missing `project` key: name the fn that projects the real state onto the model's \
+             variables"
+        }
+        $($item)*
+    };
+    // A body that opens with an inner attribute takes the general path, which puts the
+    // record after it.
+    attr($($args:tt)*) ($(# $at:tt)* $vis:vis fn $n:ident ($($ps:tt)*) $(-> $r:ty)? { # ! $($b:tt)* }) => {
+        $crate::__aterm_spec_anchor! { @keys refines [] [] [] [] ($($args)*)
+            ($(# $at)* $vis fn $n ($($ps)*) $(-> $r)? { # ! $($b)* }) }
+    };
+    attr($($args:tt)*)
+        ($(# $at:tt)* $vis:vis const fn $n:ident ($($ps:tt)*) $(-> $r:ty)? { # ! $($b:tt)* }) => {
+        $crate::__aterm_spec_anchor! { @keys refines [] [] [] [] ($($args)*)
+            ($(# $at)* $vis const fn $n ($($ps)*) $(-> $r)? { # ! $($b)* }) }
+    };
+    attr(machine = $m:literal, action = $a:literal, project = $p:literal $(,)?)
+        ($(# $at:tt)* $vis:vis fn $n:ident ($($ps:tt)*) $(-> $r:ty)? { $($b:tt)* }) => {
+        $(# $at)* $vis fn $n ($($ps)*) $(-> $r)? {
+            $crate::__aterm_spec_anchor! { @record refines $m $a $p $n
+                (::core::concat!($m, "::", $a, " @ ", ::core::stringify!($n))) }
+            $crate::xref::note_entered(::core::concat!($m, "::", $a, " @ ", ::core::stringify!($n)));
+            $($b)*
+        }
+    };
+    // A `const fn` body may not call `note_entered`: the record says so with an empty
+    // `entry_id`, which a gate demanding execution evidence fails on.
+    attr(machine = $m:literal, action = $a:literal, project = $p:literal $(,)?)
+        ($(# $at:tt)* $vis:vis const fn $n:ident ($($ps:tt)*) $(-> $r:ty)? { $($b:tt)* }) => {
+        $(# $at)* $vis const fn $n ($($ps)*) $(-> $r)? {
+            $crate::__aterm_spec_anchor! { @record refines $m $a $p $n ("") }
+            $($b)*
+        }
+    };
+    attr($($args:tt)*) ($($item:tt)*) => {
+        $crate::__aterm_spec_anchor! { @keys refines [] [] [] [] ($($args)*) ($($item)*) }
+    };
+}
+
+/// Waive a fn the model does not describe: `reason` required, and `machine`/`action`
+/// when the waiver discharges that action.
+#[macro_export]
+macro_rules! spec_unmodeled {
+    attr($($args:tt)*) ($(# $at:tt)* $vis:vis fn $n:ident ($($ps:tt)*) $(-> $r:ty)? { # ! $($b:tt)* }) => {
+        $crate::__aterm_spec_anchor! { @keys unmodeled [] [] [] [] ($($args)*)
+            ($(# $at)* $vis fn $n ($($ps)*) $(-> $r)? { # ! $($b)* }) }
+    };
+    attr(machine = $m:literal, action = $a:literal, reason = $why:literal $(,)?)
+        ($(# $at:tt)* $vis:vis fn $n:ident ($($ps:tt)*) $(-> $r:ty)? { $($b:tt)* }) => {
+        $(# $at)* $vis fn $n ($($ps)*) $(-> $r)? {
+            $crate::__aterm_spec_anchor! { @record unmodeled $m $a $why $n }
+            $($b)*
+        }
+    };
+    attr(reason = $why:literal $(,)?)
+        ($(# $at:tt)* $vis:vis fn $n:ident ($($ps:tt)*) $(-> $r:ty)? { $($b:tt)* }) => {
+        $(# $at)* $vis fn $n ($($ps)*) $(-> $r)? {
+            $crate::__aterm_spec_anchor! { @record unmodeled "" "" $why $n }
+            $($b)*
+        }
+    };
+    attr($($args:tt)*) ($($item:tt)*) => {
+        $crate::__aterm_spec_anchor! { @keys unmodeled [] [] [] [] ($($args)*) ($($item)*) }
+    };
+}
+
+/// The anchor attributes' general path: the keys in any order, any fn shape. Not an
+/// interface; the attributes above are.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __aterm_spec_anchor {
+    // ---- The keys, in any order, into four slots: machine action project reason.
+    // A key written twice keeps its last value.
+    (@keys $k:ident [$($m:tt)?] [$($a:tt)?] [$($p:tt)?] [$($r:tt)?]
+        (machine = $v:literal $(, $($rest:tt)*)?) $item:tt) => {
+        $crate::__aterm_spec_anchor! { @keys $k [$v] [$($a)?] [$($p)?] [$($r)?]
+            ($($($rest)*)?) $item }
+    };
+    (@keys $k:ident [$($m:tt)?] [$($a:tt)?] [$($p:tt)?] [$($r:tt)?]
+        (action = $v:literal $(, $($rest:tt)*)?) $item:tt) => {
+        $crate::__aterm_spec_anchor! { @keys $k [$($m)?] [$v] [$($p)?] [$($r)?]
+            ($($($rest)*)?) $item }
+    };
+    (@keys $k:ident [$($m:tt)?] [$($a:tt)?] [$($p:tt)?] [$($r:tt)?]
+        (project = $v:literal $(, $($rest:tt)*)?) $item:tt) => {
+        $crate::__aterm_spec_anchor! { @keys $k [$($m)?] [$($a)?] [$v] [$($r)?]
+            ($($($rest)*)?) $item }
+    };
+    (@keys $k:ident [$($m:tt)?] [$($a:tt)?] [$($p:tt)?] [$($r:tt)?]
+        (reason = $v:literal $(, $($rest:tt)*)?) $item:tt) => {
+        $crate::__aterm_spec_anchor! { @keys $k [$($m)?] [$($a)?] [$($p)?] [$v]
+            ($($($rest)*)?) $item }
+    };
+    (@keys $k:ident $m:tt $a:tt $p:tt $r:tt () $item:tt) => {
+        $crate::__aterm_spec_anchor! { @check $k $m $a $p $r $item }
+    };
+    (@keys $k:ident $m:tt $a:tt $p:tt $r:tt ($key:ident = $($rest:tt)*) ($($item:tt)*)) => {
+        ::core::compile_error! {
+            ::core::concat!(
+                "`", ::core::stringify!($key),
+                "`: not a key this attribute takes, or its value is not a string literal"
+            )
+        }
+        $($item)*
+    };
+    (@keys $k:ident $m:tt $a:tt $p:tt $r:tt ($($bad:tt)*) ($($item:tt)*)) => {
+        ::core::compile_error! { "expected `key = \"value\"` pairs separated by `,`" }
+        $($item)*
+    };
+
+    // ---- Each attribute's keys. An optional key's slot becomes `[value ""]` or `[""]`,
+    // so the first literal is its value.
+    (@check refines [$m:literal] [$a:literal] [""] [] ($($item:tt)*)) => {
+        ::core::compile_error! {
+            "missing `project` key: name the fn that projects the real state onto the model's \
+             variables"
+        }
+        $($item)*
+    };
+    (@check refines [$m:literal] [$a:literal] [$p:literal] [] $item:tt) => {
+        $crate::__aterm_spec_anchor! { @head [refines $m $a $p] $item $item }
+    };
+    (@check refines [] $a:tt $p:tt $r:tt ($($item:tt)*)) => {
+        ::core::compile_error! { "missing `machine` key" }
+        $($item)*
+    };
+    (@check refines $m:tt [] $p:tt $r:tt ($($item:tt)*)) => {
+        ::core::compile_error! { "missing `action` key" }
+        $($item)*
+    };
+    (@check refines $m:tt $a:tt [] $r:tt ($($item:tt)*)) => {
+        ::core::compile_error! {
+            "missing `project` key: name the fn that projects the real state onto the model's \
+             variables"
+        }
+        $($item)*
+    };
+    (@check refines $m:tt $a:tt $p:tt $r:tt ($($item:tt)*)) => {
+        ::core::compile_error! { "`refines` takes `machine`, `action` and `project`" }
+        $($item)*
+    };
+    (@check unmodeled [$($m:literal)?] [$($a:literal)?] [] [$r:literal] $item:tt) => {
+        $crate::__aterm_spec_anchor! { @head [unmodeled [$($m)? ""] [$($a)? ""] $r] $item $item }
+    };
+    (@check unmodeled $m:tt $a:tt [] [] ($($item:tt)*)) => {
+        ::core::compile_error! { "missing `reason` key" }
+        $($item)*
+    };
+    (@check unmodeled $m:tt $a:tt $p:tt $r:tt ($($item:tt)*)) => {
+        ::core::compile_error! { "`spec_unmodeled` takes `reason`, `machine` and `action`" }
+        $($item)*
+    };
+
+    // ---- The fn's name, and whether its body may hold the probe (not a `const fn`).
+    (@head $ctx:tt $item:tt ($(# $at:tt)* $vis:vis fn $n:ident $($rest:tt)*)) => {
+        $crate::__aterm_spec_anchor! { @split [$ctx $n probe] [] $item }
+    };
+    (@head $ctx:tt $item:tt ($(# $at:tt)* $vis:vis const fn $n:ident $($rest:tt)*)) => {
+        $crate::__aterm_spec_anchor! { @split [$ctx $n noprobe] [] $item }
+    };
+    (@head $ctx:tt $item:tt ($(# $at:tt)* $vis:vis const unsafe fn $n:ident $($rest:tt)*)) => {
+        $crate::__aterm_spec_anchor! { @split [$ctx $n noprobe] [] $item }
+    };
+    (@head $ctx:tt $item:tt ($(# $at:tt)* $vis:vis unsafe fn $n:ident $($rest:tt)*)) => {
+        $crate::__aterm_spec_anchor! { @split [$ctx $n probe] [] $item }
+    };
+    (@head $ctx:tt $item:tt ($(# $at:tt)* $vis:vis async $(unsafe)? fn $n:ident $($rest:tt)*)) => {
+        $crate::__aterm_spec_anchor! { @split [$ctx $n probe] [] $item }
+    };
+    (@head $ctx:tt $item:tt
+        ($(# $at:tt)* $vis:vis $(unsafe)? extern $($abi:literal)? fn $n:ident $($rest:tt)*)) => {
+        $crate::__aterm_spec_anchor! { @split [$ctx $n probe] [] $item }
+    };
+    (@head $ctx:tt ($($item:tt)*) $analysed:tt) => {
+        ::core::compile_error! {
+            "an anchor goes on a fn with a body: the record is an item inside it"
+        }
+        $($item)*
+    };
+
+    // ---- The body: the item's last token tree. Every step leaves at least one behind,
+    // so no step can take the body; the long steps keep the nesting shallow.
+    (@split $ctx:tt [$($h:tt)*] ({ $($b:tt)* })) => {
+        $crate::__aterm_spec_anchor! { @emit $ctx [$($h)*] { $($b)* } }
+    };
+    (@split $ctx:tt [$($h:tt)*]
+        ($t1:tt $t2:tt $t3:tt $t4:tt $t5:tt $t6:tt $t7:tt $t8:tt
+         $t9:tt $t10:tt $t11:tt $t12:tt $t13:tt $t14:tt $t15:tt $t16:tt $($rest:tt)+)) => {
+        $crate::__aterm_spec_anchor! { @split $ctx
+            [$($h)* $t1 $t2 $t3 $t4 $t5 $t6 $t7 $t8 $t9 $t10 $t11 $t12 $t13 $t14 $t15 $t16]
+            ($($rest)+) }
+    };
+    (@split $ctx:tt [$($h:tt)*] ($t1:tt $t2:tt $t3:tt $t4:tt $($rest:tt)+)) => {
+        $crate::__aterm_spec_anchor! { @split $ctx [$($h)* $t1 $t2 $t3 $t4] ($($rest)+) }
+    };
+    (@split $ctx:tt [$($h:tt)*] ($t:tt $($rest:tt)+)) => {
+        $crate::__aterm_spec_anchor! { @split $ctx [$($h)* $t] ($($rest)+) }
+    };
+    (@split $ctx:tt [$($h:tt)*] ($last:tt)) => {
+        ::core::compile_error! {
+            "an anchor goes on a fn with a body: the record is an item inside it"
+        }
+        $($h)* $last
+    };
+
+    // ---- The fn as written, its body prefixed by the record and, where it may hold
+    // one, the probe; after the body's inner attribute when it opens with one.
+    (@emit $ctx:tt $head:tt { # ! [$($ia:tt)*] $($b:tt)* }) => {
+        $crate::__aterm_spec_anchor! { @inner $ctx $head [#![$($ia)*]] { $($b)* } }
+    };
+    (@inner $ctx:tt $head:tt [$($inner:tt)*] { # ! [$($ia:tt)*] $($b:tt)* }) => {
+        $crate::__aterm_spec_anchor! { @inner $ctx $head
+            [$($inner)* #![$($ia)*]] { $($b)* } }
+    };
+    (@inner [$ctx:tt $n:ident $probe:ident] [$($h:tt)*] [$($inner:tt)*] { $($b:tt)* }) => {
+        $($h)* {
+            $($inner)*
+            $crate::__aterm_spec_anchor! { @body $ctx $n $probe }
+            $($b)*
+        }
+    };
+    (@emit [$ctx:tt $n:ident $probe:ident] [$($h:tt)*] { $($b:tt)* }) => {
+        $($h)* {
+            $crate::__aterm_spec_anchor! { @body $ctx $n $probe }
+            $($b)*
+        }
+    };
+    (@body [refines $m:literal $a:literal $p:literal] $n:ident probe) => {
+        $crate::__aterm_spec_anchor! { @record refines $m $a $p $n
+            (::core::concat!($m, "::", $a, " @ ", ::core::stringify!($n))) }
+        $crate::xref::note_entered(::core::concat!($m, "::", $a, " @ ", ::core::stringify!($n)));
+    };
+    (@body [refines $m:literal $a:literal $p:literal] $n:ident noprobe) => {
+        $crate::__aterm_spec_anchor! { @record refines $m $a $p $n ("") }
+    };
+    (@body [unmodeled [$m:literal $($dm:literal)?] [$a:literal $($da:literal)?] $r:literal]
+        $n:ident $probe:ident) => {
+        $crate::__aterm_spec_anchor! { @record unmodeled $m $a $r $n }
+    };
+
+    // ---- The records, collected at load time where the target has a constructor
+    // section (the list `registry::submit!` names). Elsewhere, wasm32 in practice,
+    // nothing could collect one, so a dev build for that target leaves it out.
+    (@record refines $m:literal $a:literal $p:literal $n:ident ($($id:tt)*)) => {
+        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
+        $crate::registry::submit! {
+            $crate::xref::RefinementAnchor => $crate::xref::RefinementAnchor {
+                machine: $m,
+                action: $a,
+                rust_method: ::core::stringify!($n),
+                location: ::core::concat!(::core::file!(), ":", ::core::line!()),
+                project: $p,
+                entry_id: $($id)*,
+            }
+        }
+    };
+    (@record unmodeled $m:literal $a:literal $r:literal $n:ident) => {
+        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
+        $crate::registry::submit! {
+            $crate::xref::Waiver => $crate::xref::Waiver {
+                machine: $m,
+                action: $a,
+                reason: $r,
+                rust_method: ::core::stringify!($n),
+                location: ::core::concat!(::core::file!(), ":", ::core::line!()),
+            }
+        }
+    };
+}

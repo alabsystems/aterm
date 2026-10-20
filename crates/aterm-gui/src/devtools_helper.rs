@@ -21,7 +21,7 @@
 //! `crate::consent_launch`), and `App::fda_page_opened_by_owner` for the owner's own
 //! *Open Settings* (the Security page's button, the digest entry's press), which opens
 //! the page itself and has the panel join it. No control verb reaches the Full Disk
-//! Access page. When both pages wait, Full Disk Access goes first: the Developer Tools
+//! Access page (clippy.toml: consent is the owner's). When both pages wait, Full Disk Access goes first: the Developer Tools
 //! list cannot be read without it, and there is one Settings window. This module holds
 //! the parts that decide, each testable without a window, a process or System Settings:
 //!
@@ -34,8 +34,9 @@
 //!   opens it; the window's own hand-over only on a probe that read `denied`, never while
 //!   the owner's Not now holds (this panel's `fda-declined`, or the access card's
 //!   permanent one), never on a build whose grant would not survive the next one, once
-//!   per version (`fda-pane-opened`), never within ten minutes of either page, and only
-//!   at a quiet moment.
+//!   per version (`fda-pane-opened`), never within ten minutes of this page and held back
+//!   (never refused) until ten minutes after the Developer Tools one, and only at a quiet
+//!   moment in a window whose reading is aterm's own.
 //! * [`Panel`] — the panel's states (why and how, with aterm's icon to drag; the variant
 //!   for a list aterm cannot read; a drop that did not take, or did not land; done) and
 //!   what each of the owner's presses asks of the window. On the Full Disk Access page
@@ -264,6 +265,9 @@ pub(crate) enum Refusal {
     /// aterm already brought the page up for this version, unasked
     /// ([`FdaFacts::shown_this_version`]).
     Shown,
+    /// Another app is responsible for this window ([`FdaFacts::own`]): the probe read
+    /// that app's grant, which aterm's page cannot change.
+    NotOwn,
 }
 
 impl Refusal {
@@ -277,6 +281,7 @@ impl Refusal {
             Self::Recent => "recent",
             Self::Listed => "listed",
             Self::Shown => "shown",
+            Self::NotOwn => "not own",
         }
     }
 }
@@ -360,12 +365,20 @@ pub(crate) struct FdaFacts {
     pub(crate) declined: bool,
     /// A grant keyed to this build's designated requirement survives the next build.
     pub(crate) grant_stable: bool,
-    /// aterm brought up this page, or the Developer Tools one, within
-    /// [`atpkg::devtools::REOPEN_AFTER_S`]: never two pages back to back.
+    /// aterm brought up this page within [`atpkg::devtools::REOPEN_AFTER_S`] (an update's
+    /// predecessor, a relaunch): the owner may still be at it.
     pub(crate) recent: bool,
+    /// aterm brought up the Developer Tools page within
+    /// [`atpkg::devtools::REOPEN_AFTER_S`]: never two pages back to back, so this one waits
+    /// until the ten minutes are up. A wait, never a refusal: the owner has not seen this
+    /// page.
+    pub(crate) devtools_recent: bool,
     /// aterm already brought this page up, unasked, for the running version
     /// (`fda-pane-opened`): once per version, as the Developer Tools page.
     pub(crate) shown_this_version: bool,
+    /// The probe reads this aterm's own grant: macOS names no other live process
+    /// responsible for the window (`ConsentState::window_reads_own_grant`).
+    pub(crate) own: bool,
 }
 
 /// WHO MAY BRING THE FULL DISK ACCESS PAGE UP, AND WHEN. An owner's press opens it
@@ -373,7 +386,13 @@ pub(crate) struct FdaFacts {
 /// hand-over acts only on a probe that read `denied` (`unknown` does nothing: the grant
 /// may be held), never while the owner's Not now holds, never on a build whose grant would
 /// not survive the next build, never twice for one version, never within ten minutes of
-/// either page, and only at a quiet moment. No control verb reaches it. Pure.
+/// this page, and only at a quiet moment in a window whose reading is aterm's own. The
+/// Developer Tools page up within ten minutes holds it back and never refuses it: a page
+/// an update's predecessor brought up minutes ago delays this one and does not cost the
+/// owner it. Ownership is judged at the quiet moment, where the page would come up, not as
+/// the hand-over is asked: an update's successor on the fork lane names its outgoing
+/// process responsible until that exits, seconds after the launch check (TCC design
+/// §2.2). No control verb reaches it. Pure.
 #[must_use]
 pub(crate) fn admit_fda(origin: Origin, moment: Moment, facts: &FdaFacts) -> Admit {
     if origin.owner_press() {
@@ -403,10 +422,11 @@ pub(crate) fn admit_fda(origin: Origin, moment: Moment, facts: &FdaFacts) -> Adm
         return Admit::Refuse(Refusal::Recent);
     }
     match moment {
-        Moment::Asked => Admit::Queue,
-        Moment::Quiet => Admit::Hand {
+        Moment::Quiet if !facts.own => Admit::Refuse(Refusal::NotOwn),
+        Moment::Quiet if !facts.devtools_recent => Admit::Hand {
             list_terminal: false,
         },
+        Moment::Asked | Moment::Quiet => Admit::Queue,
     }
 }
 
@@ -5645,14 +5665,16 @@ mod tests {
             declined: false,
             grant_stable: true,
             recent: false,
+            devtools_recent: false,
             shown_this_version: false,
+            own: true,
         }
     }
 
     /// The Full Disk Access page: an owner's press opens it whatever aterm read; the
     /// window's own acts only on a probe that read `denied`, never while the owner's Not
-    /// now holds, on an unstable build, twice for one version or within ten minutes of a
-    /// page, and waits for a quiet moment.
+    /// now holds, on an unstable build or twice for one version, waits for a quiet moment
+    /// (and ten minutes after a page), and comes up only where its reading is aterm's own.
     #[test]
     fn the_full_disk_access_hand_over_is_a_table_of_named_refusals() {
         let hand = Admit::Hand {
@@ -5665,7 +5687,9 @@ mod tests {
                 declined: true,
                 grant_stable: false,
                 recent: true,
+                devtools_recent: true,
                 shown_this_version: true,
+                own: false,
             };
             assert_eq!(admit_fda(origin, Moment::Asked, &refused_everything), hand);
             let granted = FdaFacts {
@@ -5730,6 +5754,31 @@ mod tests {
                 );
             }
         }
+        // The Developer Tools page up within ten minutes holds the hand-over at both
+        // moments; it never refuses it.
+        let devtools_recent = FdaFacts {
+            devtools_recent: true,
+            ..fda_facts()
+        };
+        for moment in [Moment::Asked, Moment::Quiet] {
+            assert_eq!(
+                admit_fda(auto, moment, &devtools_recent),
+                Admit::Queue,
+                "{moment:?}"
+            );
+        }
+        // Ownership is the quiet moment's to judge: asked while another process is
+        // responsible (an update's outgoing process on the fork lane), it waits; at the
+        // moment, another app's window brings nothing up.
+        let not_own = FdaFacts {
+            own: false,
+            ..fda_facts()
+        };
+        assert_eq!(admit_fda(auto, Moment::Asked, &not_own), Admit::Queue);
+        assert_eq!(
+            admit_fda(auto, Moment::Quiet, &not_own),
+            Admit::Refuse(Refusal::NotOwn)
+        );
     }
 
     fn fda_show(bundle: Option<PathBuf>) -> Show {
@@ -5811,6 +5860,7 @@ mod tests {
             test_arms::showing(),
         );
         lane.queue(Origin::Automatic, now);
+        #[expect(clippy::disallowed_methods, reason = "the lane's own test")]
         lane.queue_fda(Origin::Automatic, now + Duration::from_secs(1));
         assert_eq!(lane.fda_queued(), Some(Origin::Automatic));
         let later = now + Duration::from_secs(30);
@@ -5863,6 +5913,7 @@ mod tests {
             test_arms::fda_opening(),
             test_arms::showing(),
         );
+        #[expect(clippy::disallowed_methods, reason = "the lane's own test")]
         lane.queue_fda(Origin::Automatic, now);
         lane.note_fda(FdaState::Denied, now);
         lane.note_fda(FdaState::Unknown, now);

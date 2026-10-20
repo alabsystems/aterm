@@ -378,7 +378,13 @@ mod tests {
     /// `home_scoped: os_sandbox`.
     #[test]
     fn home_scoped_follows_the_home_not_the_sandbox() {
-        let secret = |profile: &str| profile.contains("/.ssh\"");
+        // The credential deny's `.ssh` subpath, after either separator: a Windows
+        // home reaches the profile spelled with `\`.
+        let secret = |profile: &str| {
+            ["/.ssh\"", "\\.ssh\""]
+                .iter()
+                .any(|tail| profile.contains(tail))
+        };
         match decide_on(ContainmentMode::Containment, true, None) {
             SpawnDecision::Permit {
                 os_sandbox: true,
@@ -401,6 +407,8 @@ mod tests {
             ),
             other => panic!("a sandbox with a home must Permit scoped, got {other:?}"),
         }
+        // The posture record tells the two apart.
+        assert_ne!(applied_posture(true), applied_posture(false));
     }
 
     // Enforcement proof (macOS). These tests spawn a probe via the same
@@ -997,14 +1005,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     const TASK_PORT_TARGET: &str = "ATERM_TASK_PORT_PROBE_TARGET";
 
-    /// Re-entered by PROOF 7 under a profile: asks for its own control port and
+    /// The child half of PROOF 7 under a profile: asks for its own control port and
     /// for the target's control, read, inspect and name ports, and prints the
-    /// `kern_return_t`s (`self=<c> target=<c>/<r>/<i>/<n>`). Run alone it does
-    /// nothing.
+    /// `kern_return_t`s (`self=<c> target=<c>/<r>/<i>/<n>`).
     #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "PROOF 7's probe child; runs only when that proof re-enters it"]
-    fn task_port_probe_child() {
+    fn task_port_probe_child(target: libc::pid_t) {
         type ForPid = unsafe extern "C" fn(
             libc::mach_port_t,
             libc::pid_t,
@@ -1033,12 +1038,6 @@ mod tests {
                 task: *mut libc::mach_port_t,
             ) -> libc::kern_return_t;
         }
-        let Some(target) = std::env::var(TASK_PORT_TARGET)
-            .ok()
-            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
-        else {
-            return;
-        };
         let ask = |flavor: ForPid, pid: libc::pid_t| {
             let mut port: libc::mach_port_t = 0;
             // SAFETY: `mach_task_self_` is libSystem's cached send right to this
@@ -1078,10 +1077,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_task_ports_stay_outside() {
-        // Re-signing a copy of an Apple binary waits on trustd.
-        if aterm_uds::deadline::trust_service_silent() {
+        if let Ok(target) = std::env::var(TASK_PORT_TARGET) {
+            task_port_probe_child(target.parse().expect("the parent's target pid"));
             return;
         }
+        // Re-signing a copy of an Apple binary waits on trustd.
+        aterm_uds::deadline::require_trust_service();
         struct Target(aterm_uds::spawnfd::Child);
         impl Drop for Target {
             fn drop(&mut self) {
@@ -1132,8 +1133,7 @@ mod tests {
                 exe,
                 &[
                     "--exact",
-                    "actuator::tests::task_port_probe_child",
-                    "--ignored",
+                    "actuator::tests::enforcement_proof_task_ports_stay_outside",
                     "--nocapture",
                     "--test-threads=1",
                 ],
@@ -1248,15 +1248,12 @@ mod tests {
         "com.apple.distributed_notifications@Uv3",
     ];
 
-    /// Re-entered by PROOFS 8 and 10 under a profile: asks bootstrap for a send
+    /// The child half of PROOFS 8 and 10 under a profile: asks bootstrap for a send
     /// right to each name in [`LOOKUP_PROBE`] and prints the `kern_return_t`s
     /// in that order (`LOOKUPS <kr>/<kr>/…`). It only looks the names up; it
-    /// never sends a message, so nothing is launched or changed. Run alone it
-    /// does nothing.
+    /// never sends a message, so nothing is launched or changed.
     #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "PROOFS 8 and 10's probe child; runs only when one re-enters it"]
-    fn mach_lookup_probe_child() {
+    fn mach_lookup_probe_child(names: &str) {
         unsafe extern "C" {
             static bootstrap_port: libc::mach_port_t;
             static mach_task_self_: libc::mach_port_t;
@@ -1270,9 +1267,6 @@ mod tests {
                 name: libc::mach_port_t,
             ) -> libc::kern_return_t;
         }
-        let Ok(names) = std::env::var(LOOKUP_PROBE) else {
-            return;
-        };
         let codes: Vec<String> = names
             .split(',')
             .map(|name| {
@@ -1304,8 +1298,7 @@ mod tests {
             exe.to_str().expect("utf8 test binary path"),
             &[
                 "--exact",
-                "actuator::tests::mach_lookup_probe_child",
-                "--ignored",
+                "actuator::tests::enforcement_proof_launch_brokers_denied",
                 "--nocapture",
                 "--test-threads=1",
             ],
@@ -1352,6 +1345,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_launch_brokers_denied() {
+        if let Ok(names) = std::env::var(LOOKUP_PROBE) {
+            mach_lookup_probe_child(&names);
+            return;
+        }
         let control = lookups("(version 1)(allow default)", LAUNCH_BROKERS);
         assert!(
             answered_otherwise(&control, "0").is_empty(),
@@ -1412,15 +1409,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     const PREFERENCE_PROBE: &str = "ATERM_PREFERENCE_WRITE_PROBE";
 
-    /// Re-entered by PROOF 9 under a profile: asks the sandbox, for this
+    /// The child half of PROOF 9 under a profile: asks the sandbox, for this
     /// process, whether it may write a user preference domain — the question
     /// the preferences daemon asks before it writes `~/Library/Preferences` on
     /// a caller's behalf — and prints the answer (`PREFERENCE_WRITE <rc>`, 0 =
-    /// allowed). It only asks; no preference is written. Run alone it does
-    /// nothing.
+    /// allowed). It only asks; no preference is written.
     #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "PROOF 9's probe child; runs only when that proof re-enters it"]
     fn preference_write_probe_child() {
         /// `SANDBOX_FILTER_PREFERENCE_DOMAIN` from `<sandbox/private.h>`.
         const SANDBOX_FILTER_PREFERENCE_DOMAIN: libc::c_int = 6;
@@ -1431,9 +1425,6 @@ mod tests {
                 filter: libc::c_int,
                 ...
             ) -> libc::c_int;
-        }
-        if std::env::var_os(PREFERENCE_PROBE).is_none() {
-            return;
         }
         // SAFETY: both strings are NUL-terminated literals; `sandbox_check`
         // reads them and the pid, and writes nothing.
@@ -1458,6 +1449,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_preference_writes_denied() {
+        if std::env::var_os(PREFERENCE_PROBE).is_some() {
+            preference_write_probe_child();
+            return;
+        }
         let exe = std::env::current_exe().expect("this test binary");
         let probe = |profile: &str| {
             let exe = exe.to_str().expect("utf8 test binary path");
@@ -1466,8 +1461,7 @@ mod tests {
                 exe,
                 &[
                     "--exact",
-                    "actuator::tests::preference_write_probe_child",
-                    "--ignored",
+                    "actuator::tests::enforcement_proof_preference_writes_denied",
                     "--nocapture",
                     "--test-threads=1",
                 ],

@@ -1,0 +1,31 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl line <n>` of a private headless aterm (144x50, aterm 0.107.0) running the real Claude Code (crates/aterm-lab, a local stub of the API) · the SCROLLBACK rows right above the screen of `claude-2.1.304-stop-hook-stop-reason-60-lines-limit-phrase-last.txt`, oldest first: `search` (no pattern) answered screen_first=57, and `line 27` .. `line 56` read these (the banner /clear redrew, the person's turns, the reply, the stop-hook summary and the stopReason's first 18 lines)
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ say nothing
+
+⏺ Hi! I am the local lab stub, not a model. (reply 2)
+
+⏺ Ran 1 stop hook (ctrl+o to expand)
+  ⎿  note line 1 from the nightly hook
+  note line 2 from the nightly hook
+  note line 3 from the nightly hook
+  note line 4 from the nightly hook
+  note line 5 from the nightly hook
+  note line 6 from the nightly hook
+  note line 7 from the nightly hook
+  note line 8 from the nightly hook
+  note line 9 from the nightly hook
+  note line 10 from the nightly hook
+  note line 11 from the nightly hook
+  note line 12 from the nightly hook
+  note line 13 from the nightly hook
+  note line 14 from the nightly hook
+  note line 15 from the nightly hook
+  note line 16 from the nightly hook
+  note line 17 from the nightly hook
+  note line 18 from the nightly hook

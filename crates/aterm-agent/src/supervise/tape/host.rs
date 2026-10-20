@@ -46,6 +46,7 @@
 //! same choice), and they keep serde off the policy's own types.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -56,10 +57,12 @@ use super::core::TapeValue;
 use super::frame::Hint;
 use crate::harness::accounts::Sample;
 use crate::harness::acts::{Act, TaskFace};
-use crate::harness::upgrade::StandingLimit;
+use crate::harness::repo_work::RepoWork;
+use crate::harness::upgrade::{LastTurn, StandingLimit};
 use crate::supervise::fx::Fx;
 use crate::supervise::memory::{AgentMemory, Pressure};
 use crate::supervise::policy::exception::Exception;
+use crate::supervise::policy::login::LoginShared;
 use crate::supervise::policy::reset::{
     ResetAsk, ResetEnd, ResetGo, ResetNo, ResetOutcome, ResetWord,
 };
@@ -67,7 +70,7 @@ use crate::supervise::policy::turn_end::{
     AccountAdvice, AccountBad, AccountPoint, HostTurn, Reach, Restart,
 };
 use crate::supervise::run::{
-    Guard, HostStep, IdlePoint, ProbeMiss, ProbeNo, StuckSurvey, UsageSeen, WaitPlan,
+    Guard, HostStep, IdlePoint, ProbeMiss, ProbeNo, StallSeen, StuckSurvey, UsageSeen, WaitPlan,
 };
 
 // -- the two hosts ------------------------------------------------------------
@@ -203,6 +206,7 @@ tape_arg_debug!(
     TaskFace,
     Guard,
     StuckSurvey,
+    StallSeen,
     Exception,
     UsageSeen,
     AccountPoint,
@@ -277,10 +281,19 @@ fn of_json<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, CodecError> 
 }
 
 /// `at` as signed nanoseconds from `origin` (saturated past ±292 years).
+///
+/// Both spans are taken, each at least zero, and the one that is not zero is
+/// the offset: Windows' `Instant` reads an instant within one tick of its
+/// counter BEFORE another as no span at all (not as one that is earlier), so
+/// asking only `at - origin` would record an instant just before the origin
+/// as the origin itself.
 pub(crate) fn offset_ns(origin: Instant, at: Instant) -> i64 {
-    match at.checked_duration_since(origin) {
-        Some(after) => i64::try_from(after.as_nanos()).unwrap_or(i64::MAX),
-        None => i64::try_from(origin.duration_since(at).as_nanos()).map_or(i64::MIN, |n| -n),
+    let after = at.saturating_duration_since(origin);
+    let before = origin.saturating_duration_since(at);
+    if before > after {
+        i64::try_from(before.as_nanos()).map_or(i64::MIN, |n| -n)
+    } else {
+        i64::try_from(after.as_nanos()).unwrap_or(i64::MAX)
     }
 }
 
@@ -422,6 +435,50 @@ macro_rules! tape_json {
 
 tape_json!(Option<String>, Option<bool>, Option<u32>, Option<u64>, u64);
 
+/// The session's login method ([`super::super::IdleHost::login_method`]) on a
+/// tape: its word.
+impl TapeValue for Option<aterm_phase::LoginMethod> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.map(aterm_phase::LoginMethod::word))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        of_json::<Option<String>>(bytes)?
+            .map(|w| {
+                aterm_phase::LoginMethod::of_word(&w)
+                    .ok_or(bad("a login method this build does not know"))
+            })
+            .transpose()
+    }
+}
+
+/// Another tab's sign-in of the session's login
+/// ([`super::super::IdleHost::login_shared`]) as a tape holds it.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SharedWire {
+    Carried(String),
+    Back(String),
+}
+
+impl TapeValue for Option<LoginShared> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.as_ref().map(|shared| match shared {
+            LoginShared::Carried { by } => SharedWire::Carried(by.clone()),
+            LoginShared::Back { by } => SharedWire::Back(by.clone()),
+        }))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(
+            of_json::<Option<SharedWire>>(bytes)?.map(|wire| match wire {
+                SharedWire::Carried(by) => LoginShared::Carried { by },
+                SharedWire::Back(by) => LoginShared::Back { by },
+            }),
+        )
+    }
+}
+
 /// [`HostTurn`]'s word on a tape.
 fn turn_word(turn: HostTurn) -> &'static str {
     match turn {
@@ -479,6 +536,33 @@ impl TapeValue for Option<HostStep> {
     }
 }
 
+/// `at_background`'s answer as a tape holds it: the line the host typed at
+/// a break and the turn it is ([`HostTurn`]).
+#[derive(Serialize, Deserialize)]
+struct BackgroundWire {
+    line: String,
+    turn: String,
+}
+
+impl TapeValue for Option<(String, HostTurn)> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.as_ref().map(|(line, turn)| BackgroundWire {
+            line: line.clone(),
+            turn: turn_word(*turn).to_string(),
+        }))
+    }
+
+    /// A tape an earlier build wrote holds the line alone, from before a line
+    /// typed at a break had a kind: it reads back as the notice, as that
+    /// build's loop took every such line.
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        match of_json::<Option<BackgroundWire>>(bytes) {
+            Ok(wire) => wire.map(|w| Ok((w.line, turn_of(&w.turn)?))).transpose(),
+            Err(_) => Ok(of_json::<Option<String>>(bytes)?.map(|line| (line, HostTurn::Notice))),
+        }
+    }
+}
+
 /// [`StandingLimit`] as a tape holds it.
 #[derive(Serialize, Deserialize)]
 struct LimitWire {
@@ -516,6 +600,99 @@ impl TapeValue for Option<StandingLimit> {
             window: w.window,
             at: w.at,
             row: w.row,
+        }))
+    }
+}
+
+/// [`LastTurn`] as a tape holds it, the time its prompt's turn worked in
+/// nanoseconds.
+#[derive(Serialize, Deserialize)]
+struct LastTurnWire {
+    last: Option<String>,
+    opened: Option<String>,
+    opened_said: Option<u64>,
+    ended_ns: Option<u64>,
+    /// Absent on a tape recorded before it: no time.
+    #[serde(default)]
+    opened_ms: Option<u64>,
+    asked: Vec<String>,
+}
+
+impl TapeValue for Option<LastTurn> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.as_ref().map(|t| {
+            let LastTurn {
+                last,
+                opened,
+                opened_said,
+                ended,
+                opened_ms,
+                asked,
+            } = t;
+            LastTurnWire {
+                last: last.clone(),
+                opened: opened.clone(),
+                opened_said: *opened_said,
+                ended_ns: ended.map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
+                opened_ms: *opened_ms,
+                asked: asked.clone(),
+            }
+        }))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(of_json::<Option<LastTurnWire>>(bytes)?.map(|w| LastTurn {
+            last: w.last,
+            opened: w.opened,
+            opened_said: w.opened_said,
+            ended: w.ended_ns.map(Duration::from_nanos),
+            opened_ms: w.opened_ms,
+            asked: w.asked,
+        }))
+    }
+}
+
+/// [`RepoWork`] as a tape holds it.
+#[derive(Serialize, Deserialize)]
+struct RepoWorkWire {
+    repo: String,
+    changed: usize,
+    untracked: usize,
+    stashes: usize,
+    unpushed: usize,
+    paths: Vec<String>,
+}
+
+impl TapeValue for Option<RepoWork> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.as_ref().map(|w| {
+            let RepoWork {
+                repo,
+                changed,
+                untracked,
+                stashes,
+                unpushed,
+                paths,
+            } = w;
+            RepoWorkWire {
+                repo: repo.clone(),
+                changed: *changed,
+                untracked: *untracked,
+                stashes: *stashes,
+                unpushed: *unpushed,
+                paths: paths.clone(),
+            }
+        }))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(of_json::<Option<RepoWorkWire>>(bytes)?.map(|w| RepoWork {
+            repo: w.repo,
+            changed: w.changed,
+            untracked: w.untracked,
+            stashes: w.stashes,
+            unpushed: w.unpushed,
+            paths: w.paths,
         }))
     }
 }
@@ -589,6 +766,28 @@ impl TapeValue for Option<AgentMemory> {
     }
 }
 
+/// `transcript`'s answer as a tape holds it: the file and its tail. A path
+/// that is not UTF-8 has no JSON form, so its answer is one a replay cannot
+/// take, and says so.
+#[derive(Serialize, Deserialize)]
+struct TranscriptWire {
+    path: PathBuf,
+    tail: String,
+}
+
+impl TapeValue for Option<(PathBuf, String)> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.as_ref().map(|(path, tail)| TranscriptWire {
+            path: path.clone(),
+            tail: tail.clone(),
+        }))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(of_json::<Option<TranscriptWire>>(bytes)?.map(|w| (w.path, w.tail)))
+    }
+}
+
 /// `account_probe`'s answer: `null` for a claim, else the refusal's word.
 impl TapeValue for Result<(), ProbeNo> {
     fn to_tape(&self) -> Vec<u8> {
@@ -615,6 +814,11 @@ enum ResetWordWire {
         limits: Vec<String>,
         left: u32,
         day: String,
+        /// The row's kind of reset by its word (`aterm_phase::ResetKind::word`);
+        /// absent from a tape written before Claude Code 2.1.304's kinds,
+        /// whose rows named none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
     },
     Again,
     No(String),
@@ -630,6 +834,7 @@ impl TapeValue for ResetWord {
                     limits,
                     left,
                     day,
+                    kind,
                 } = go;
                 ResetWordWire::Take {
                     until: *until,
@@ -637,6 +842,7 @@ impl TapeValue for ResetWord {
                     limits: limits.clone(),
                     left: *left,
                     day: day.clone(),
+                    kind: kind.map(|kind| kind.word().to_string()),
                 }
             }
             ResetWord::Again => ResetWordWire::Again,
@@ -652,12 +858,19 @@ impl TapeValue for ResetWord {
                 limits,
                 left,
                 day,
+                kind,
             } => ResetWord::Take(ResetGo {
                 until,
                 long,
                 limits,
                 left,
                 day,
+                kind: kind
+                    .map(|word| {
+                        aterm_phase::ResetKind::of_word(&word)
+                            .ok_or(bad("a kind of reset this build does not name"))
+                    })
+                    .transpose()?,
             }),
             ResetWordWire::Again => ResetWord::Again,
             ResetWordWire::No(word) => ResetWord::No(

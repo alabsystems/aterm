@@ -282,31 +282,34 @@ pub fn assert_moved_then_settled(
     );
 }
 
-// Byte-exact CPU==GPU parity for the source-over streams, and x86_64 macOS.
+// Byte-exact CPU==GPU parity for the source-over streams: where it is pinned, and where a
+// one-LSB miss is waived.
 //
 // Several tests require delta 0 between CPU and GPU frames of the source-over streams
 // (`fs_fire_over`, `fs_rain_glow_over`, the source-over bed, the ribbon train). That holds on
 // Apple-silicon GPUs; the Intel and AMD GPUs of x86_64 Macs store some source-over pixels one
-// LSB off (the additive streams stay exact). So on x86_64 macOS only, [`assert_byte_exact`]
-// reports a one-LSB miss on stderr and passes, and 2 or more still fails. Callers still gate on
+// LSB off (the additive streams stay exact), and so does Windows: an AMD Radeon 780M under
+// DX12 missed by one in the fire and veil Over, the ribbon train and the gradient bed
+// (2026-10-17, its additive streams exact). The fixed-function blend's precision is the
+// API's to choose, and Windows has no Apple GPU.
+//
+// Mesa's software rasterizer on Linux, llvmpipe for GL and lavapipe for Vulkan (both name
+// their device `llvmpipe`), misses by one in the fire and veil Over too: on the GL arm, and on
+// lavapipe through the rows' `_cpu_vs_wgpu_oracle` twins, on aarch64 and x86_64 (the Linux
+// lane, Mesa 25.2.8, 2026-10-19). Probed on llvmpipe's GLES, it blends a unorm8 target in
+// 8-bit fixed point, rounding each product on its own as `(t + (t >> 8) + 0x80) >> 8` with
+// `t = x·y`, then adding with saturation. Every one of the 16,777,216 (src, dst, alpha) cases
+// of a `SRC_ALPHA, ONE_MINUS_SRC_ALPHA` blend matched that law, and 4,121,116 of them sit one
+// below or above the single rounding the CPU's `over_rgb` takes, none further
+// (`docs/measured/linux-gpu-rows-2026-10-19.md`). So [`assert_byte_exact`] reports a
+// one-LSB miss on stderr and passes on x86_64 macOS, on Windows and on an `llvmpipe`
+// adapter, and 2 or more still fails; everywhere else (Apple GPUs, and any Linux GPU, none
+// of which has run here) it asserts delta 0. Callers still gate on
 // `GpuRenderer::additive_is_byte_exact` first.
 
-/// `assert_eq!(delta, 0, "{message}")`, on every target but x86_64 macOS.
-#[cfg(not(all(target_arch = "x86_64", target_os = "macos")))]
-#[track_caller]
-pub fn assert_byte_exact(
-    _test: &str,
-    _what: &str,
-    _gpu: &aterm_gpu::GpuRenderer,
-    delta: i32,
-    message: std::fmt::Arguments<'_>,
-) {
-    assert_eq!(delta, 0, "{message}");
-}
-
-/// x86_64 macOS: a one-LSB miss prints its report line and fails nothing; a
-/// larger miss fails with the caller's message, as it does everywhere.
-#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+/// `assert_eq!(delta, 0, "{message}")`, except where [`waived_on`] names the
+/// host or adapter: there a one-LSB miss prints its report line and fails
+/// nothing, and a larger miss fails with the caller's message.
 #[track_caller]
 pub fn assert_byte_exact(
     test: &str,
@@ -320,26 +323,52 @@ pub fn assert_byte_exact(
         return;
     }
     let (adapter, backend) = gpu.adapter();
+    // On Linux a renderer draws on the GL arm, armed at construction, even
+    // where the context is the oracle's wgpu one; a test that disarmed it
+    // ([`disarm_for_oracle`]) drew on wgpu, and the label names which arm drew.
+    #[cfg(target_os = "linux")]
+    let backend = if gpu.last_frame_on_gl() {
+        "the GL arm"
+    } else {
+        backend
+    };
+    let Some(waived) = waived_on(adapter) else {
+        assert_eq!(delta, 0, "{message}");
+        return;
+    };
     // The stderr handle rather than `eprintln!`, which libtest captures and
     // drops for a passing test: a waived pin must show in every run.
     let line = format!(
         "{test}: {what}: CPU vs GPU max per-channel delta {delta} on {adapter} ({backend}) — not \
-         asserted byte-exact on x86_64 macOS: pinned on Apple GPUs, and this GPU's source-over \
+         asserted byte-exact on {waived}: pinned on Apple GPUs, and this GPU's source-over \
          store need not round to the same last bit (tests/common/mod.rs records what was \
          measured where)\n"
     );
     let _ = std::io::stderr().write_all(line.as_bytes());
     assert!(
-        delta <= X86_64_MACOS_LSB,
-        "{message} — and {delta} is past the one-LSB rounding bound x86_64 macOS is allowed on \
+        delta <= WAIVED_LSB,
+        "{message} — and {delta} is past the one-LSB rounding bound {waived} is allowed on \
          {adapter} ({backend})"
     );
 }
 
-/// The one LSB a float store may round off from the integer law: the most an x86_64 macOS run
-/// waives.
-#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-const X86_64_MACOS_LSB: i32 = 1;
+/// The one LSB a blend unit may round off from the integer law: the most a
+/// waived run allows.
+const WAIVED_LSB: i32 = 1;
+
+/// Where a one-LSB source-over miss is waived, as the report line names it:
+/// x86_64 macOS and Windows by host, Mesa's software rasterizer by adapter.
+fn waived_on(adapter: &str) -> Option<&'static str> {
+    if cfg!(all(target_arch = "x86_64", target_os = "macos")) {
+        Some("x86_64 macOS")
+    } else if cfg!(windows) {
+        Some("Windows")
+    } else if cfg!(target_os = "linux") && adapter.starts_with("llvmpipe") {
+        Some("Mesa's llvmpipe and lavapipe")
+    } else {
+        None
+    }
+}
 
 /// The byte-exact comparisons of one CPU-vs-GPU parity test.
 ///

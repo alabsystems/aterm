@@ -18,7 +18,7 @@
 //! the fold, so a mutator that forgets to refresh fails on the next output. Shared as an `Arc`
 //! because the seam holds only `&Mutex<Terminal>`; `Release` on publish, `Acquire` on read.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use aterm_types::keyboard::KeyboardMode;
 use aterm_types::mouse::MouseMode;
@@ -26,8 +26,8 @@ use aterm_types::mouse::MouseMode;
 /// The lock-free input-mode word. See the module docs.
 #[derive(Debug, Default)]
 pub struct ModeMirror {
-    /// [`KeyboardMode`] bits (a `u16` bitflags word).
-    keyboard: AtomicU16,
+    /// [`KeyboardMode`] bits (a `u32` bitflags word).
+    keyboard: AtomicU32,
     /// [`MouseMode`] discriminant (`repr(u8)`, `None = 0`).
     mouse: AtomicU8,
     /// DEC 1004 (focus reporting) — `modes.focus_reporting`.
@@ -57,6 +57,22 @@ impl ModeMirror {
     #[must_use]
     pub fn mouse_tracking_enabled(&self) -> bool {
         self.mouse.load(Ordering::Acquire) != 0
+    }
+
+    /// Whether the published tracking mode reports a pointer motion with
+    /// `button` held (`3`: none): the rule `Terminal::encode_mouse_motion`
+    /// encodes by (`super::mouse::motion_reported`), without the lock.
+    #[must_use]
+    pub fn reports_motion(&self, button: u8) -> bool {
+        super::mouse::motion_reported(self.mouse_mode(), button)
+    }
+
+    /// Whether the published tracking mode reports a wheel notch: the rule
+    /// `Terminal::encode_mouse_wheel` encodes by (`super::mouse::wheel_reported`:
+    /// not X10, which is press-only), without the lock.
+    #[must_use]
+    pub fn reports_wheel(&self) -> bool {
+        super::mouse::wheel_reported(self.mouse_mode())
     }
 
     /// Lock-free twin of `Terminal::focus_reporting_enabled()` (DEC 1004), for the focus report

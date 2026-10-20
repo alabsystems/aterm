@@ -121,6 +121,7 @@ impl Snapshot {
         match self.posture {
             Some(ApplyPosture::Automatic) if self.retry_scheduled => "automatic",
             Some(ApplyPosture::Automatic) => "automatic-idle",
+            Some(ApplyPosture::WaitsForTerminal) => "waits-terminal",
             Some(ApplyPosture::ManualByConfig) => "manual-config",
             Some(ApplyPosture::VetoedByEnv { .. }) => "disabled-env",
             Some(ApplyPosture::ManualOnlyLatched { lapses: true }) => "retry-wait",
@@ -156,7 +157,7 @@ impl Snapshot {
 /// The worker observes source AND policy together; this also services the final
 /// pre-replacement recheck after a potentially long download/probe.
 pub(crate) fn check_settings_provider(
-    proxy: winit::event_loop::EventLoopProxy<Wake>,
+    proxy: aterm_window::event_loop::EventLoopProxy<Wake>,
 ) -> aterm_update::CheckSettingsProvider {
     let proxy = std::sync::Mutex::new(proxy);
     std::sync::Arc::new(move || {

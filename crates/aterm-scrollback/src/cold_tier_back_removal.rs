@@ -89,6 +89,7 @@ impl ColdTier {
                 Some(ColdPage {
                     compressed,
                     line_count: keep,
+                    lost: bp.lost,
                 })
             }
         } else {

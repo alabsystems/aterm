@@ -2558,6 +2558,13 @@ mod tests {
     /// A synthetic HOME-shaped tree: `prefix/` (the store) beside `rustup/`
     /// (a fake `RUSTUP_HOME`). Nothing here reads `$HOME` or `$RUSTUP_HOME`.
     struct Fixture {
+        #[cfg_attr(
+            not(unix),
+            expect(
+                dead_code,
+                reason = "the tree's drop guard; only the unix tests read it"
+            )
+        )]
         root: aterm_tempfile::TempDir,
         layout: Layout,
         rustup: PathBuf,
@@ -4473,6 +4480,17 @@ mod tests {
             "{lines:?}"
         );
         let view = view_dir(&fx.layout, "trust");
+        // Under a translator the kernel names it as the executable of every process it
+        // runs (Rosetta: `/mnt/lima-rosetta/rosetta`), so no process table shows a build
+        // running from the view, the rest of this case's question.
+        if let Some(translator) = aterm_uds::process::translator() {
+            eprintln!(
+                "NOT RUN under {translator}: seam::tests::reassert_leaves_a_view_a_live_build_\
+                 runs_from_and_says_so: the probe's executable reads as the translator, never \
+                 the view's targo; a CPU of this code's architecture decides it"
+            );
+            return;
+        }
 
         /// Kills the probe however the test ends, so no stray outlives a failed assertion.
         struct Probe(aterm_uds::spawnfd::Child);

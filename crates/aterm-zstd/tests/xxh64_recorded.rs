@@ -6,10 +6,8 @@
 //! stripes and the 4- and 8-byte tails, a 1 MiB input, and seeds that wrap
 //! the accumulators.
 
-mod support;
-
+use crate::support::sanity;
 use aterm_zstd::xxh64::xxh64;
-use support::sanity;
 
 const RECORDED: &str = include_str!("recorded/xxh64-libzstd-1.5.7.tsv");
 

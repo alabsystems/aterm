@@ -6,7 +6,8 @@
 
 // Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
 // Convert keyboard layout ids to and from windows-sys 0.61 pointer handles; take `SmolStr`
-// from `crate::keyboard`.
+// from `crate::keyboard`; read key state and the layout through `keyboard::key_state` and
+// `keyboard::replay`, so a recorded message sequence can drive the key path.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -18,18 +19,18 @@ use crate::keyboard::SmolStr;
 use crate::utils::Lazy;
 use windows_sys::Win32::System::SystemServices::{LANG_JAPANESE, LANG_KOREAN};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, GetKeyboardLayout, MapVirtualKeyExW, ToUnicodeEx, MAPVK_VK_TO_VSC_EX, VIRTUAL_KEY,
-    VK_ACCEPT, VK_ADD, VK_APPS, VK_ATTN, VK_BACK, VK_BROWSER_BACK, VK_BROWSER_FAVORITES,
-    VK_BROWSER_FORWARD, VK_BROWSER_HOME, VK_BROWSER_REFRESH, VK_BROWSER_SEARCH, VK_BROWSER_STOP,
-    VK_CANCEL, VK_CAPITAL, VK_CLEAR, VK_CONTROL, VK_CONVERT, VK_CRSEL, VK_DECIMAL, VK_DELETE,
-    VK_DIVIDE, VK_DOWN, VK_END, VK_EREOF, VK_ESCAPE, VK_EXECUTE, VK_EXSEL, VK_F1, VK_F10, VK_F11,
-    VK_F12, VK_F13, VK_F14, VK_F15, VK_F16, VK_F17, VK_F18, VK_F19, VK_F2, VK_F20, VK_F21, VK_F22,
-    VK_F23, VK_F24, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_FINAL, VK_GAMEPAD_A,
-    VK_GAMEPAD_B, VK_GAMEPAD_DPAD_DOWN, VK_GAMEPAD_DPAD_LEFT, VK_GAMEPAD_DPAD_RIGHT,
-    VK_GAMEPAD_DPAD_UP, VK_GAMEPAD_LEFT_SHOULDER, VK_GAMEPAD_LEFT_THUMBSTICK_BUTTON,
-    VK_GAMEPAD_LEFT_THUMBSTICK_DOWN, VK_GAMEPAD_LEFT_THUMBSTICK_LEFT,
-    VK_GAMEPAD_LEFT_THUMBSTICK_RIGHT, VK_GAMEPAD_LEFT_THUMBSTICK_UP, VK_GAMEPAD_LEFT_TRIGGER,
-    VK_GAMEPAD_MENU, VK_GAMEPAD_RIGHT_SHOULDER, VK_GAMEPAD_RIGHT_THUMBSTICK_BUTTON,
+    GetKeyboardLayout, MapVirtualKeyExW, ToUnicodeEx, MAPVK_VK_TO_VSC_EX, VIRTUAL_KEY, VK_ACCEPT,
+    VK_ADD, VK_APPS, VK_ATTN, VK_BACK, VK_BROWSER_BACK, VK_BROWSER_FAVORITES, VK_BROWSER_FORWARD,
+    VK_BROWSER_HOME, VK_BROWSER_REFRESH, VK_BROWSER_SEARCH, VK_BROWSER_STOP, VK_CANCEL, VK_CAPITAL,
+    VK_CLEAR, VK_CONTROL, VK_CONVERT, VK_CRSEL, VK_DECIMAL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END,
+    VK_EREOF, VK_ESCAPE, VK_EXECUTE, VK_EXSEL, VK_F1, VK_F10, VK_F11, VK_F12, VK_F13, VK_F14,
+    VK_F15, VK_F16, VK_F17, VK_F18, VK_F19, VK_F2, VK_F20, VK_F21, VK_F22, VK_F23, VK_F24, VK_F3,
+    VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_FINAL, VK_GAMEPAD_A, VK_GAMEPAD_B,
+    VK_GAMEPAD_DPAD_DOWN, VK_GAMEPAD_DPAD_LEFT, VK_GAMEPAD_DPAD_RIGHT, VK_GAMEPAD_DPAD_UP,
+    VK_GAMEPAD_LEFT_SHOULDER, VK_GAMEPAD_LEFT_THUMBSTICK_BUTTON, VK_GAMEPAD_LEFT_THUMBSTICK_DOWN,
+    VK_GAMEPAD_LEFT_THUMBSTICK_LEFT, VK_GAMEPAD_LEFT_THUMBSTICK_RIGHT,
+    VK_GAMEPAD_LEFT_THUMBSTICK_UP, VK_GAMEPAD_LEFT_TRIGGER, VK_GAMEPAD_MENU,
+    VK_GAMEPAD_RIGHT_SHOULDER, VK_GAMEPAD_RIGHT_THUMBSTICK_BUTTON,
     VK_GAMEPAD_RIGHT_THUMBSTICK_DOWN, VK_GAMEPAD_RIGHT_THUMBSTICK_LEFT,
     VK_GAMEPAD_RIGHT_THUMBSTICK_RIGHT, VK_GAMEPAD_RIGHT_THUMBSTICK_UP, VK_GAMEPAD_RIGHT_TRIGGER,
     VK_GAMEPAD_VIEW, VK_GAMEPAD_X, VK_GAMEPAD_Y, VK_HANGUL, VK_HANJA, VK_HELP, VK_HOME, VK_ICO_00,
@@ -58,7 +59,7 @@ pub(crate) static LAYOUT_CACHE: Lazy<Mutex<LayoutCache>> =
     Lazy::new(|| Mutex::new(LayoutCache::default()));
 
 fn key_pressed(vkey: VIRTUAL_KEY) -> bool {
-    unsafe { (GetKeyState(vkey as i32) & (1 << 15)) == (1 << 15) }
+    super::keyboard::key_state(vkey) < 0
 }
 
 const NUMPAD_VKEYS: [VIRTUAL_KEY; 16] = [
@@ -271,7 +272,12 @@ impl LayoutCache {
     /// prepares the layout if it isn't known.
     /// The current layout is then returned.
     pub fn get_current_layout(&mut self) -> (u64, &Layout) {
-        let locale_id = super::handle::to_usize(unsafe { GetKeyboardLayout(0) }) as u64;
+        #[cfg(any(test, debug_assertions))]
+        let replayed = super::keyboard::replay::layout();
+        #[cfg(not(any(test, debug_assertions)))]
+        let replayed = None;
+        let locale_id = replayed
+            .unwrap_or_else(|| super::handle::to_usize(unsafe { GetKeyboardLayout(0) }) as u64);
         match self.layouts.entry(locale_id) {
             Entry::Occupied(entry) => (locale_id, entry.into_mut()),
             Entry::Vacant(entry) => {

@@ -13,8 +13,10 @@ impl TerminalHandler<'_> {
     ///
     /// Handled: DECRQSS (`DCS $ q Pt ST`), Sixel (`DCS Ps q <data> ST`) and
     /// XTGETTCAP (`DCS + q Pt ST`). Everything else, including DECDLD (`{`),
-    /// tmux control mode (`DCS 1000 p`), tmux passthrough (`DCS tmux;`) and
-    /// SSH conductor (`DCS 2000 p`), is consumed and ignored as `Unknown`.
+    /// tmux control mode (`DCS 1000 p`) and SSH conductor (`DCS 2000 p`), is
+    /// consumed and ignored as `Unknown`. A tmux passthrough wrapper
+    /// (`DCS tmux; … ST`) never reaches here: the parser reads its payload
+    /// unwrapped, as tmux does (`aterm_parser::TmuxPassthrough`).
     pub(super) fn dcs_hook_inner(&mut self, _params: &[u16], intermediates: &[u8], final_byte: u8) {
         // Release an abandoned sequence's budget (dcs_hook with no dcs_unhook after a parser
         // reset), or its bytes would leak.
@@ -255,14 +257,40 @@ mod tests {
                     assert_eq!((cursor.row, cursor.col), (4, 6), "{shown:?} cut {cut}");
                 }
             }
-            // Wrapped in a tmux passthrough that reached aterm itself: the
-            // wrapper doubles the query's own ST into `ESC ESC \`.
-            let bytes = [&b"\x1bPtmux;\x1b"[..], query, &b"\x1b\x1b\\\x1b\\"[..]].concat();
+        }
+    }
+
+    /// `payload` in tmux's passthrough wrapper, every ESC doubled, as a program
+    /// that finds `TMUX` in its environment writes it.
+    fn tmux_wrapped(payload: &[u8]) -> Vec<u8> {
+        let mut out = b"\x1bPtmux;".to_vec();
+        for &byte in payload {
+            if byte == 0x1B {
+                out.push(0x1B);
+            }
+            out.push(byte);
+        }
+        out.extend_from_slice(b"\x1b\\");
+        out
+    }
+
+    /// A DECRQSS or XTGETTCAP wrapped in a tmux passthrough that reached aterm
+    /// itself (a tab that inherited `TMUX` with no tmux in it) is answered as
+    /// the bare query is, however the bytes are cut: tmux 3.5a hands its own
+    /// terminal the bare query for that wrapper (measured 2026-10-19), and the
+    /// parser unwraps it the same way. RED before: the wrapper doubled the
+    /// query's ST into `ESC ESC \`, which broke it off unanswered.
+    #[test]
+    fn a_query_wrapped_for_tmux_is_answered_as_the_bare_one() {
+        for query in [&b"\x1bP$qm\x1b\\"[..], b"\x1bP+q544E\x1b\\"] {
+            let bare = fed(query, 0).take_response();
+            assert!(bare.is_some(), "{query:?}: the bare query is answered");
+            let bytes = tmux_wrapped(query);
             for cut in 0..=bytes.len() {
                 let shown = String::from_utf8_lossy(&bytes);
                 assert_eq!(
                     fed(&bytes, cut).take_response(),
-                    None,
+                    bare,
                     "{shown:?} cut {cut}"
                 );
             }
@@ -291,12 +319,11 @@ mod tests {
         }
     }
 
-    /// The strings the engine consumes and ignores (tmux passthrough, tmux control
-    /// mode, the SSH conductor, DECDLD, a kitty remote-control command, the DCS
+    /// The strings the engine consumes and ignores (tmux control mode, the SSH
+    /// conductor, DECDLD, a kitty remote-control command, the DCS
     /// synchronized-update pair) end with nothing at ST or broken off alike, and
-    /// what breaks one off runs: a tmux passthrough wrapper's doubled ESC still
-    /// breaks into its inner OSC. An inner DCS's own ST is doubled too
-    /// (`ESC ESC \`), so a query wrapped that way is broken off, not answered.
+    /// what breaks one off runs. A tmux passthrough wrapper, unwrapped, runs
+    /// its payload (an OSC here) and ends at its own `ESC \`.
     #[test]
     fn a_consumed_string_broken_off_runs_what_breaks_it_off() {
         let heads: [&[u8]; 6] = [
@@ -323,6 +350,45 @@ mod tests {
         }
     }
 
+    /// A wrapper head with no wrapper after it (a program that wrote `ESC P tmux;`
+    /// and doubled nothing, a stray head in a file `cat` prints) leaves the shell's
+    /// and the next program's sequences working: an ST-ended title is set and the
+    /// text after it prints, a RIS ends the wrapper whole, and a query after BEL-ended
+    /// prompts is answered. RED before: the head's wrapper stayed open past RIS, and
+    /// its `ESC \` ended the wrapper instead of the title, which swallowed the text.
+    #[test]
+    fn a_stray_wrapper_head_breaks_no_sequence_after_it() {
+        let head = b"\x1bPtmux;";
+        let title = b"\x1b]2;t\x1b\\ok";
+        for cut in 0..=head.len() + title.len() {
+            let t = fed(&[&head[..], title].concat(), cut);
+            assert_eq!(t.title(), "t", "cut {cut}");
+            assert_eq!(t.row_text(0).as_deref().map(str::trim_end), Some("ok"));
+            assert!(t.parser_is_ground(), "cut {cut}");
+        }
+        let mut t = Terminal::new(24, 80);
+        t.process(head);
+        t.process(b"\x1bc");
+        assert!(t.parser_is_ground(), "RIS ends the wrapper");
+        t.process(b"\x1b]2;after-ris\x1b\\hi");
+        assert_eq!(t.title(), "after-ris");
+        assert_eq!(t.row_text(0).as_deref().map(str::trim_end), Some("hi"));
+        let mut t = Terminal::new(24, 80);
+        t.process(head);
+        for _ in 0..3 {
+            t.process(b"\x1b]133;A\x07% \x1b]133;B\x07\r\n");
+        }
+        t.process(b"\x1bP+q544e\x1b\\");
+        let response = t.take_response();
+        assert!(
+            response
+                .as_deref()
+                .is_some_and(|r| r.starts_with(b"\x1bP1+r544E=")),
+            "{response:?}"
+        );
+        assert!(t.parser_is_ground());
+    }
+
     /// A query torn at the ESC that may begin its ST is still open: the handback's
     /// `CAN` ends it, and it is not answered.
     #[test]
@@ -342,6 +408,20 @@ mod tests {
             .flat_map(|r| (0..grid.cols()).map(move |c| (r, c)))
             .filter(|&(r, c)| grid.cell_extra(r, c).is_some_and(|e| e.image().is_some()))
             .count()
+    }
+
+    /// A sixel wrapped in a tmux passthrough that reached aterm itself is placed
+    /// as the bare one is, however the bytes are cut. RED before: its doubled
+    /// ST broke it off.
+    #[test]
+    fn a_sixel_wrapped_for_tmux_is_placed() {
+        let sixel = b"\x1bPq#0;2;100;0;0#0~~~~~~-~~~~~~\x1b\\";
+        let placed = image_cells(&fed(sixel, 0));
+        assert!(placed > 0);
+        let bytes = tmux_wrapped(sixel);
+        for cut in 0..=bytes.len() {
+            assert_eq!(image_cells(&fed(&bytes, cut)), placed, "cut {cut}");
+        }
     }
 
     /// A sixel is placed only at ST: one broken off by an ESC is dropped, as one

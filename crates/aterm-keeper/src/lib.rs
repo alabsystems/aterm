@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
+// under them (crates/aterm-spec-anchor/anchor_rules.rs).
+#![cfg_attr(anchor_rules, feature(macro_attr))]
+
 //! **aterm-keeper**: the PTY keeper (`docs/DESIGN-pty-keeper-2026-09-26.md`).
 //!
 //! A window that dies without running its exit path (a fatal signal, jetsam, Force Quit) hangs
@@ -77,18 +81,6 @@ pub mod server;
 mod sys;
 
 pub use crate::core::{KeeperCore, RelaunchBrake};
-
-/// Ends a test that checks code COULD NOT RUN while macOS's `trustd` does not answer:
-/// every code check waits on it, so the silence is the machine's, not the code's.
-/// (`tests/identity_after_swap.rs` holds the one other copy: it is its own crate.)
-#[cfg(all(test, target_vendor = "apple"))]
-fn require_trust_service() {
-    if aterm_uds::deadline::trust_service_silent() {
-        aterm_spec::host::could_not_run(
-            "macOS's trustd does not answer, so no code check runs here — the machine's, not the code's",
-        );
-    }
-}
 
 /// Tier-1 of `PtyKeeperCustody`, `KeeperRelaunchBrake` and
 /// `KeeperDeathJudgement` over the real core.

@@ -691,15 +691,32 @@ impl PageMarkers {
     /// The last time aterm opened the page: `(version, unix seconds)`, or `None`.
     #[must_use]
     pub fn last_opened(self) -> Option<(String, u64)> {
-        let text = std::fs::read_to_string(self.opened_marker()?).ok()?;
+        self.last_opened_in(&aterm_types::dirs::state_dir()?)
+    }
+
+    /// [`Self::last_opened`] with `<state>` given: the marker as any aterm wrote it
+    /// into `state`.
+    #[must_use]
+    pub fn last_opened_in(self, state: &std::path::Path) -> Option<(String, u64)> {
+        let text = std::fs::read_to_string(state.join(self.opened)).ok()?;
         parse_opened(&text)
     }
 
     /// How many seconds ago aterm opened the page, when that was under `window_s` ago.
     #[must_use]
     pub fn opened_within(self, window_s: u64) -> Option<u64> {
-        let (_, at) = self.last_opened()?;
-        opened_ago(at, aterm_time::unix_secs()?, window_s)
+        self.opened_within_in(
+            &aterm_types::dirs::state_dir()?,
+            window_s,
+            aterm_time::unix_secs()?,
+        )
+    }
+
+    /// [`Self::opened_within`] with `<state>` and the clock (`now`, unix seconds) given.
+    #[must_use]
+    pub fn opened_within_in(self, state: &std::path::Path, window_s: u64, now: u64) -> Option<u64> {
+        let (_, at) = self.last_opened_in(state)?;
+        opened_ago(at, now, window_s)
     }
 
     /// Note that aterm opened the page now, for `version`. Best effort: a marker that cannot
@@ -731,8 +748,14 @@ impl PageMarkers {
     /// has run out, or the marker cannot be read.
     #[must_use]
     pub fn declined_until(self) -> Option<Declined> {
-        let text = std::fs::read_to_string(self.declined_marker()?).ok()?;
-        decline_holding(&text, aterm_time::unix_secs()?)
+        self.declined_until_in(&aterm_types::dirs::state_dir()?, aterm_time::unix_secs()?)
+    }
+
+    /// [`Self::declined_until`] with `<state>` and the clock (`now`, unix seconds) given.
+    #[must_use]
+    pub fn declined_until_in(self, state: &std::path::Path, now: u64) -> Option<Declined> {
+        let text = std::fs::read_to_string(state.join(self.declined)).ok()?;
+        decline_holding(&text, now)
     }
 
     /// Note that the owner declined the page now, under `version`. Best effort: a marker

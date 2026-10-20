@@ -1976,7 +1976,9 @@ pub(crate) mod system_shape {
         static FORCED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
     }
 
-    /// Answer "system-shaped" for `prefix` on this thread from now on.
+    /// Answer "system-shaped" for `prefix` on this thread from now on (the mode-bit tests
+    /// that ask are unix).
+    #[cfg(unix)]
     pub(crate) fn force(prefix: &Path) {
         FORCED.with(|f| f.borrow_mut().push(prefix.to_path_buf()));
     }
@@ -3280,9 +3282,15 @@ mod tests {
         std::fs::write(prog.join("8595.provenance"), b"src\n").unwrap();
         let recording = aterm_durable::seam::Recording::start();
         unmark_program_builds(&prog);
+        // Windows opens no directory to flush (`sync_dir_ordered` is best-effort there).
+        let flushed: &[aterm_durable::Flush] = if cfg!(windows) {
+            &[]
+        } else {
+            &[aterm_durable::Flush::Ordered]
+        };
         assert_eq!(
             recording.take(),
-            [aterm_durable::Flush::Ordered],
+            flushed,
             "every marker down before any tree goes: one ordered directory flush \
              (aterm-durable's counting seam)"
         );

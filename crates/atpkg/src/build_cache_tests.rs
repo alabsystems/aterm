@@ -4,6 +4,7 @@
 use super::*;
 use std::collections::HashMap;
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::time::{Duration, SystemTime};
 
 /// A canonical scratch tree (`/var` is a link to `/private/var` on macOS, and `$PWD` is
@@ -33,6 +34,7 @@ impl Fixture {
         p
     }
 
+    #[cfg(unix)]
     fn file(&self, rel: &str, text: &str) {
         let p = self.root.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -68,6 +70,7 @@ fn rust(
 
 /// The shells the block must parse alike: macOS's `/bin/sh` (bash in POSIX mode), and
 /// dash, ksh and zsh's sh emulation where installed (any of them can be `/bin/sh`).
+#[cfg(unix)]
 fn shells() -> Vec<Vec<&'static str>> {
     let mut out = vec![vec!["/bin/sh"]];
     for (path, extra) in [
@@ -96,6 +99,7 @@ fn block(tool: Tool) -> String {
 }
 
 /// The `sh` half, run for real: the block, then the arguments it leaves, one per line.
+#[cfg(unix)]
 fn sh(
     shell: &[&str],
     tool: Tool,
@@ -141,11 +145,13 @@ fn sh(
 
 /// One case through both halves for `targo`: `applied` says whether `--config <value>`
 /// must come first, and every shell and the Rust rule must agree.
+#[cfg(unix)]
 fn check(f: &Fixture, cwd: &Path, env: &[(&'static str, &str)], args: &[&str], applied: bool) {
     check_tool(f, Tool::Targo, cwd, env, args, applied);
 }
 
 /// [`check`] for `tool`'s shim.
+#[cfg(unix)]
 fn check_tool(
     f: &Fixture,
     tool: Tool,
@@ -183,6 +189,7 @@ fn check_tool(
 /// (or `clean`) under `$HOME` gets the cache; each choice of the user's (an environment
 /// variable, a flag, a config line, a folder outside the home or inside the cache, an
 /// unwritable cache), the verified lane and the verbs that do not build keep it as typed.
+#[cfg(unix)]
 #[test]
 fn the_shim_and_the_rust_rule_decide_every_case_alike() {
     let f = Fixture::new("build-cache-rules");
@@ -383,6 +390,7 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
 
 /// A home Cargo cannot take gets nothing, in both halves: one a TOML literal string cannot
 /// hold (a `'`), one Cargo would read as a template (a `{` or `}`), and one ending in `/`.
+#[cfg(unix)]
 #[test]
 fn a_home_cargo_cannot_take_is_left_alone() {
     let f = Fixture::new("build-cache-home");

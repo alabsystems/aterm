@@ -315,14 +315,14 @@ fn review_a_bridge_that_cannot_finish_its_attach_never_reads_connected() {
 /// `stalled reason=expired` — not the `attach` of a cap the broker does not
 /// take at all, whose remedy is another mint, not a renewal — redialling
 /// under its back-off. A renewed ring written over
-/// `node.cap` — what `join` installs from a fresh `mint-for`, by rename — is
+/// `node.cap` by rename — as `aterm fabric on` installs a re-minted one — is
 /// all it takes: the bridge reads the file again before its next dial and
 /// comes up `connected`, with the same pid. A bridge that read its cap only
 /// at start (the negative control: the code before this) redials the lapsed
 /// ring until it is killed, and the wait below fails at its hang detector.
 #[test]
 fn a_renewed_cap_is_attached_at_the_next_redial_without_a_restart() {
-    let w = World::boot_with_grants("r16-renew", &|node| {
+    let w = World::boot_with_grants("cap-renew", &|node| {
         node_grants(node)
             .into_iter()
             .map(|g| g.replacen(':', ",exp=1:", 1))

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Strict-gate log shims.
+//! Log shims for the Trust lane (`ship trust run`).
 //!
 //! `aterm_log::warn!` expands `format_args!` at the call site, and with runtime
 //! arguments that expansion embeds unsafe `fmt::Arguments` construction. Under

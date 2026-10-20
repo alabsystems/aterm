@@ -133,20 +133,26 @@ fn open_file(path: &Path) {
 }
 
 impl crate::App {
-    /// The ledger plan for `wid`'s focused session, `None` with no session
-    /// focused (a native tab, an empty window).
-    pub(crate) fn ledger_plan(&self, wid: crate::WindowId) -> Option<LedgerPlan> {
-        let session = self.focused_session_id(wid)?;
-        let sid = self.pool.get(session)?.ctx.self_id.as_str().to_string();
-        Some(plan_for(&sid))
-    }
-
     /// Compose the ledger plan for the focused session, remember it, and run it when
     /// this window is a real OS window (headless stops at the plan).
     pub(crate) fn open_session_ledger(&mut self, wid: crate::WindowId) {
-        let Some(plan) = self.ledger_plan(wid) else {
+        if let Some(session) = self.focused_session_id(wid) {
+            self.open_session_ledger_for(wid, session);
+        }
+    }
+
+    /// [`Self::open_session_ledger`] for one session by local id — the tab
+    /// menu's Harness Log for the CLICKED tab, which need not be the focused
+    /// one.
+    pub(crate) fn open_session_ledger_for(&mut self, wid: crate::WindowId, session: u64) {
+        let Some(sid) = self
+            .pool
+            .get(session)
+            .map(|s| s.ctx.self_id.as_str().to_string())
+        else {
             return;
         };
+        let plan = plan_for(&sid);
         let real_window = self
             .windows
             .get(&wid)

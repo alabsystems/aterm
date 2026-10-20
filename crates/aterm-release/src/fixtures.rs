@@ -8,7 +8,7 @@
 //! so N's cut writes them in two halves:
 //!
 //! * [`stage`], before the claim (beside the `ship release` build): the in-tree
-//!   generator ([`GENERATOR_SOURCE`], two `#[ignore]`d libtests) runs in the clone under
+//!   generator ([`GENERATOR_SOURCE`], two isolated libtests) runs in the clone under
 //!   the reserved identity's pins (release commit C and build n, and the prover's
 //!   `TRUST_STAGE2_BIN`) into the release cache, self-checking every desk against the
 //!   release's own consumer. A refusal, or a missing required desk, refuses the release
@@ -150,12 +150,12 @@ fn desks_in(dir: &Path) -> std::io::Result<Vec<String>> {
     Ok(desks)
 }
 
-/// The libtest arguments the generator runs with: its two tests by name, which are
-/// `#[ignore]`d, one at a time (both install the process's build stamp).
+/// The libtest arguments the generator runs with: its two tests by name, one at
+/// a time. Each isolates its installed build stamp in its own child process.
 #[must_use]
 pub fn generator_args() -> Vec<&'static str> {
     let mut args = GENERATOR_TESTS.to_vec();
-    args.extend(["--ignored", "--test-threads", "1"]);
+    args.extend(["--test-threads", "1"]);
     args
 }
 

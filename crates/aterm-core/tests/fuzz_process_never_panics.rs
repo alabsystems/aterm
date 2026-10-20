@@ -219,10 +219,11 @@ fn probe_lines(term: &Terminal) {
     }
 }
 
-/// History cap for the resize fuzzers. Below the default ring cap, so the
-/// ring reaches capacity (head wrap, oldest-line eviction) within the run; it
-/// also bounds the cost of each `resize()`, which reflows all retained history.
-const RESIZE_FUZZ_SCROLLBACK_LINES: usize = 1_000;
+/// History cap for the resize fuzzers. Far below the default ring cap, so the
+/// ring reaches capacity (head wrap, oldest-line eviction) early in the run and
+/// stays there; it also bounds the cost of each `resize()`, which reflows all
+/// retained history.
+const RESIZE_FUZZ_SCROLLBACK_LINES: usize = 250;
 
 /// Wide-grapheme + autowrap + style content that makes reflow do real work:
 /// CJK / emoji (width 2), ASCII runs, combining marks, colour SGR, newlines.
@@ -600,12 +601,14 @@ mod resize_reflow {
 
     /// The resize schedule under the ConPTY seam policy, plus its law: a rows-only grow appends
     /// blank rows and reveals nothing, so the history depth and every absolute key stay put.
-    /// Fewer iterations: with no reveal, history accumulates and each width change rewraps it.
+    /// History is capped as the other resize fuzzers cap it: with no reveal it accumulates, and
+    /// each width change rewraps all of it.
     #[test]
     fn resize_reflow_keeps_engine_invariants_under_the_conpty_policy() {
         use aterm_core::grid::ResizePolicy;
         let mut s: u64 = 0xD1CE_F00D_1234_5678;
         let mut term = Terminal::new(24, 80);
+        term.set_scrollback_line_limit(Some(super::RESIZE_FUZZ_SCROLLBACK_LINES));
         for it in 0..6_000u32 {
             emit_content(&mut s, &mut term);
             if next(&mut s) & 1 == 0 {

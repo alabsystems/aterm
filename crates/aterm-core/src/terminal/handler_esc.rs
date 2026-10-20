@@ -28,14 +28,16 @@ impl TerminalHandler<'_> {
             b'A' => {
                 let cursor = self.grid.cursor();
                 if cursor.row > 0 {
-                    self.grid.set_cursor(cursor.row - 1, cursor.col);
+                    self.grid
+                        .set_cursor_following_content(cursor.row - 1, cursor.col);
                 }
             }
             b'B' => {
                 let cursor = self.grid.cursor();
                 let rows = self.grid.rows();
                 if cursor.row + 1 < rows {
-                    self.grid.set_cursor(cursor.row + 1, cursor.col);
+                    self.grid
+                        .set_cursor_following_content(cursor.row + 1, cursor.col);
                 }
             }
             b'C' => {
@@ -366,6 +368,8 @@ impl TerminalHandler<'_> {
             self.secure_keyboard_entry,
             &mut groups,
         );
+        // RIS leaves the alternate screen.
+        self.holder_fence.note_alt_exit();
 
         // The BiDi cache may hold resolutions of the pre-reset content.
         self.invalidate_bidi_all();

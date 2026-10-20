@@ -234,6 +234,8 @@ fn zero_share_drag_step_during_the_offloaded_rewrap_keeps_the_rings_history() {
                 let job = tiered
                     .resize_offloading_scrollback(6, 16)
                     .expect("a tiered width change offloads its history");
+                // The newest lines the window holds back stay in the ring.
+                let held = tiered.ring_buffer_scrollback();
                 twin.resize(6, 16);
                 for _ in 0..in_window {
                     newest += 1;
@@ -249,7 +251,7 @@ fn zero_share_drag_step_during_the_offloaded_rewrap_keeps_the_rings_history() {
                 if rows == 6 {
                     assert_eq!(
                         !tiered.storage.lazy_buffer.is_empty(),
-                        in_window > limit,
+                        held + in_window > limit,
                         "{ctx}: reach, the window stages its oldest rows once its output passes the ring's cap"
                     );
                 }

@@ -602,6 +602,11 @@ fn portable_bold_draws_the_real_instance_not_a_dilation() {
     let px = 16.0;
     let theme = aterm_render::Theme::default();
     let mut r = aterm_render::Renderer::from_bytes(&bytes, px, theme).expect("renderer");
+    // The reference below is the instance's OUTLINE raster, so the renderer
+    // draws unfitted: grid fitting (the Linux and Windows default) moves the
+    // bold `M` a pixel (8x12 at x 1 against the outline's 9x12 at x 0), and
+    // `windows_grid_fit::bold_stays_bold_when_grid_fitted` binds the fitted half.
+    r.set_font_hinting("off");
     let bold_coords = r
         .debug_vf_bold_coords()
         .expect("a wght axis reaching 700 yields a bold instance")

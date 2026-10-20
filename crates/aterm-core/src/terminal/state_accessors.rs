@@ -47,16 +47,30 @@ impl Terminal {
     /// Declare whether this session sits behind a Windows console host (ConPTY), whose
     /// `CSI ? 9001 h` asks for win32-input-mode key records (default off). Elsewhere DEC 9001
     /// is ignored, so program output cannot turn Escape and Enter into records nothing reads.
+    /// Behind the host the xterm modifyOtherKeys family is refused (`CSI > 4 ; Pv m` and
+    /// `f` are ignored, `CSI ? 4 m` reads level 0, an earlier level stops reaching the
+    /// encoder): conhost reads the key bytes and has no reader for those chords.
     /// Host policy: preserved across `reset()`/RIS.
     pub fn set_win32_input_enabled(&mut self, enabled: bool) {
         self.modes.win32_input_enabled = enabled;
         self.refresh_mode_mirror();
     }
 
+    /// Declare whether the console host behind win32-input-mode is OpenConsole rather than
+    /// Windows' inbox conhost (default off): the two read KP_Begin and F13-F20 differently
+    /// (`KeyboardMode::OPENCONSOLE_HOST`). Meaningful only while
+    /// [`set_win32_input_enabled`](Self::set_win32_input_enabled) holds. Host policy:
+    /// preserved across `reset()`/RIS.
+    pub fn set_win32_input_openconsole(&mut self, openconsole: bool) {
+        self.modes.win32_input_openconsole = openconsole;
+        self.refresh_mode_mirror();
+    }
+
     /// Set the keyboard capabilities a console host decides from the same fact that picks
     /// the resize seam policy, so the two cannot disagree. Behind a Windows console host
-    /// ([`ResizePolicy::ConPty`]) DEC 9001 is honored and the kitty protocol is off
-    /// (conhost cannot turn CSI-u reports into console key records); any other session gets
+    /// ([`ResizePolicy::ConPty`]) DEC 9001 is honored and the kitty protocol and xterm's
+    /// modifyOtherKeys are off (conhost cannot turn CSI-u or `CSI 27 ; m ; c ~` reports into
+    /// console key records); any other session gets
     /// the reverse. Sets both bits either way, so a checkpoint carrying another host's bits
     /// does not outlive it. A live session and every replay (`cast drift`) call this.
     pub fn set_console_host_posture(&mut self, policy: ResizePolicy) {
@@ -64,6 +78,43 @@ impl Terminal {
         self.modes.win32_input_enabled = console_host;
         self.modes.kitty_keyboard_enabled = !console_host;
         self.refresh_mode_mirror();
+    }
+
+    /// Host knowledge, before the bytes it feeds next: whether a program other than the
+    /// shell holds the terminal's foreground while it wrote them (a unix host compares the
+    /// foreground process group it read for those bytes with the shell's pid; a host with
+    /// no foreground group says `false`). Kept across RIS.
+    ///
+    /// An OSC 7 no one signed while the shell sits at its prompt by its marks is then that
+    /// program's, not a background job's: a program a key binding started (a zsh widget, a
+    /// bash `bind -x`, a fish binding; each gets the foreground with no `C`), so it lands.
+    /// Once no program holds the foreground, and none the program probe sees runs
+    /// ([`Self::set_program_probe`]), the cwd the first such report replaced comes back, as
+    /// the shell reports its own again only at its next prompt.
+    pub fn set_foreground_job(&mut self, job: bool) {
+        self.shell.foreground_job = job;
+        if !job
+            && self.shell.cwd_before_job.is_some()
+            && !self.shell.program_runs_since_prompt()
+            && let Some(before) = self.shell.cwd_before_job.take()
+        {
+            let (_, mut handler) = self.split_for_process();
+            handler.apply_cwd_report(before);
+        }
+    }
+
+    /// Install the host's program probe: given a wall-clock instant (unix epoch ms), whether
+    /// a program the shell started at or after it runs now where the foreground word
+    /// ([`Self::set_foreground_job`]) cannot see it. PowerShell keeps the programs it runs
+    /// in its own process group (measured on pwsh 7.6.7, macOS), so one a PSReadLine key
+    /// handler starts holds no foreground of its own; ConPTY has no foreground group at
+    /// all. The engine asks it lazily, with the instant the shell's prompt began: for an
+    /// OSC 7 no one signed at the shell's prompt that no foreground word claims (it lands
+    /// when the probe says such a program runs), and at each foreground word while a
+    /// report it let land shows (the cwd it replaced comes back once the program is gone).
+    /// Host-side, never carried: a host installs it on every engine it reads for.
+    pub fn set_program_probe(&mut self, probe: Option<Box<dyn Fn(u64) -> bool + Send>>) {
+        self.shell.program_probe = probe;
     }
 
     /// Host policy: the console host between this terminal and its app forwards the app's
@@ -78,7 +129,24 @@ impl Terminal {
         self.transient.host_resyncs_alt_screen = on;
         if !on {
             self.transient.alt_screen_resync_requested = false;
+            self.transient.dead_alt_screen = None;
         }
+    }
+
+    /// The embedder is about to make its console host leave the alternate screen a dead app
+    /// left up (the `mainscreen` verb under the host policy,
+    /// [`set_host_resyncs_alt_screen`](Self::set_host_resyncs_alt_screen)): the `?1049l` the
+    /// host forwards then leaves it as a dead app's screen, releasing the modes the app left
+    /// on as a prompt's request does, and a prompt on that screen asks the host nothing more.
+    /// `false`, with nothing marked, when the primary screen is up.
+    pub fn expect_host_alt_screen_leave(&mut self) -> bool {
+        if !self.modes.alternate_screen {
+            return false;
+        }
+        let screen = Some(self.transient.screen_replaced);
+        self.transient.dead_alt_screen = screen;
+        self.transient.alt_screen_resync_screen = screen;
+        true
     }
 
     /// Take the pending alternate-screen resync request (see
@@ -134,6 +202,15 @@ impl Terminal {
     #[must_use]
     pub fn bell_total(&self) -> u64 {
         self.bell_total
+    }
+
+    /// The monotonic count of desktop notifications the program asked for
+    /// (OSC 9, a final OSC 99 chunk, OSC 777 `notify`), whether or not
+    /// notifications are allowed: the session log counts them
+    /// (`mark - notify n=`), never their text.
+    #[must_use]
+    pub fn notify_total(&self) -> u64 {
+        self.notify_total
     }
 
     /// The window title as a shared [`Arc<str>`] handle: a reference-count bump,
@@ -230,8 +307,9 @@ impl Terminal {
     /// rebase, set_color_scheme, a checkpoint restore, a host reset); the end
     /// of a process batch goes through
     /// [`Self::reconcile_color_scheme_after_output`], which first applies the
-    /// program-reply gates. Like any advisory report the push is dropped when
-    /// the response buffer is at its cap. Called at host entry
+    /// program-reply gates. The push is a report sent unasked, so it is queued
+    /// with the reports ([`Self::take_reports`]), and like any advisory report it
+    /// is dropped when what is owed to the peer is at its cap. Called at host entry
     /// points and the end of each process batch, never per sequence, so
     /// several background writes in one batch push at most once, and only for
     /// a net change. Returns whether the latch moved.
@@ -242,20 +320,11 @@ impl Terminal {
             return false;
         }
         self.modes.color_scheme = now;
-        if self.modes.report_color_scheme
-            && self
-                .transient
-                .response_buffer
-                .len()
-                .saturating_add(PUSH_MAX_LEN)
-                <= super::MAX_RESPONSE_BUFFER_SIZE
-        {
+        if self.modes.report_color_scheme {
             use std::fmt::Write as _;
             let mut response = super::stack_response::StackResponse::<PUSH_MAX_LEN>::new();
             let _ = write!(response, "\x1b[?997;{}n", now.dsr_code());
-            self.transient
-                .response_buffer
-                .extend_from_slice(response.as_bytes());
+            let _ = self.transient.push_report(response.as_bytes());
         }
         true
     }
@@ -720,18 +789,17 @@ impl Terminal {
     }
 }
 
-/// Append a DEC mode-2048 in-band size report, `CSI 48 ; rows ; cols ; pixH ; pixW t`
-/// (as xterm/ghostty), to a response buffer, unless it would pass
-/// `MAX_RESPONSE_BUFFER_SIZE`: every caller writes the buffer directly, past
-/// `send_response`'s rate limit, so a toggle flood or a resize storm against a host
-/// that does not drain must not grow it.
+/// Queue a DEC mode-2048 in-band size report, `CSI 48 ; rows ; cols ; pixH ; pixW t`
+/// (as xterm/ghostty), with the reports the terminal sends unasked
+/// ([`super::TransientState::push_report`], which holds the cap a toggle flood or a
+/// resize storm against a host that does not drain would test).
 ///
 /// `host_cell_px` is the cell box a host measured (`Terminal::host_cell_pixel_size`):
 /// pixels are `0` until one has, as the PTY's winsize says, never the 8x16
 /// placeholder passed off as a measurement. Pixels are computed in `u32`. Shared by
 /// the DECSET-2048 enable path, `Terminal::resize` and `Terminal::set_cell_pixel_size`.
 pub(super) fn push_in_band_size_report(
-    buf: &mut Vec<u8>,
+    transient: &mut super::TransientState,
     rows: u16,
     cols: u16,
     host_cell_px: Option<(u16, u16)>,
@@ -739,13 +807,10 @@ pub(super) fn push_in_band_size_report(
     use std::fmt::Write as _;
     // The report's capacity.
     const MAX_LEN: usize = 48;
-    if buf.len().saturating_add(MAX_LEN) > super::MAX_RESPONSE_BUFFER_SIZE {
-        return;
-    }
     let (cell_w, cell_h) = host_cell_px.unwrap_or((0, 0));
     let pix_h = u32::from(rows) * u32::from(cell_h);
     let pix_w = u32::from(cols) * u32::from(cell_w);
     let mut r = super::stack_response::StackResponse::<MAX_LEN>::new();
     let _ = write!(r, "\x1b[48;{rows};{cols};{pix_h};{pix_w}t");
-    buf.extend_from_slice(r.as_bytes());
+    let _ = transient.push_report(r.as_bytes());
 }

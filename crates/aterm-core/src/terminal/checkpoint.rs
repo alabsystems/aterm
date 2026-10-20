@@ -49,6 +49,7 @@ use aterm_types::charset::CharacterSetState;
 use aterm_types::{KittyKeyboardStateSnapshot, TaskbarProgress, XtermKeyboardState};
 
 use super::Terminal;
+use super::checkpoint_holder::HolderRepr;
 use super::checkpoint_output::OutputStateRepr;
 use super::checkpoint_state::{ColorRepr, ShellRepr, TitleRepr};
 use super::types::{CurrentStyle, TerminalModes};
@@ -83,6 +84,28 @@ pub struct GridCursorRepr {
     /// adds. `serde(default)`: an older checkpoint restores `false`, as it meant.
     #[cfg_attr(feature = "serde", serde(default))]
     pub tab_defaults_suppressed: bool,
+    /// What the grid's rows-only resizes owe back at one edge
+    /// (`Grid::handback_rows`): positive, the blank rows trims took that a grow
+    /// appends before it reveals history afresh; negative, the history lines grows
+    /// revealed that a shrink demotes before it trims afresh. Carried, and the
+    /// restored grid's grow reveals from the tier its history is restored into, so
+    /// a rows flap whose halves straddle an update handoff or a restore leaves the
+    /// rows where the same flap with none between does. `serde(default)`: an older
+    /// checkpoint owes nothing; written only when something is owed.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "is_zero_rows")
+    )]
+    pub handback_rows: i32,
+    /// The natural moves made after what `handback_rows` owes
+    /// (`Grid::handback_above`): rows demoted after the trims, or blank rows
+    /// appended after the reveals, which go back first. `serde(default)`, written
+    /// only when nonzero.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "is_zero_above")
+    )]
+    pub handback_above: u16,
 }
 
 impl GridCursorRepr {
@@ -99,6 +122,8 @@ impl GridCursorRepr {
             margin_right: margins.right,
             tab_stops: grid.tab_stops().to_vec(),
             tab_defaults_suppressed: grid.tab_defaults_suppressed(),
+            handback_rows: grid.handback_rows(),
+            handback_above: grid.handback_above(),
         }
     }
 
@@ -109,6 +134,8 @@ impl GridCursorRepr {
         grid.set_cursor(self.cursor_row, self.cursor_col);
         grid.set_pending_wrap(self.pending_wrap);
         grid.restore_tab_stops(&self.tab_stops, self.tab_defaults_suppressed);
+        // Last: owed from the restored grid's own counter on.
+        grid.seed_handback(self.handback_rows, self.handback_above);
     }
 }
 
@@ -392,6 +419,10 @@ pub struct TerminalCheckpoint {
     /// The engine state output still to come relies on ([`OutputStateRepr`]); a
     /// restore installs it whole.
     pub output_state: OutputStateRepr,
+    /// The holder fence and the main grid's span anchors ([`HolderRepr`]),
+    /// keyed like `shell`'s rows. Empty when no drawer ran; a restore
+    /// installs it whole or not at all.
+    pub holder: HolderRepr,
 }
 
 impl TerminalCheckpoint {
@@ -749,13 +780,17 @@ impl Terminal {
     }
 
     /// The parser state a partial escape sequence is sitting in (`CsiParam`,
-    /// `OscString`, `SosPmApcString`, …), or `None` at Ground. Whether that
+    /// `OscString`, `SosPmApcString`, …; `TmuxPassthrough` for a tmux
+    /// passthrough wrapper open at a payload's Ground), or `None` at Ground. Whether that
     /// sequence is carried or abandoned is
     /// [`Self::partial_sequence_uncarried`]'s answer. A pure read of the
     /// parser; nothing is projected.
     #[must_use]
     pub fn partial_sequence_state(&self) -> Option<&'static str> {
         let state = self.parser.state();
+        if state.is_ground() && self.parser.tmux_passthrough().is_open() {
+            return Some("TmuxPassthrough");
+        }
         (!state.is_ground()).then(|| state.name())
     }
 
@@ -783,9 +818,9 @@ impl Terminal {
             return None;
         }
         Some(match self.dcs.dcs_type {
-            // Consumed and ignored to the terminator (a tmux passthrough
-            // wrapper, tmux control mode, DECDLD, an unknown string): the
-            // handler keeps nothing and its unhook does nothing.
+            // Consumed and ignored to the terminator (tmux control mode,
+            // DECDLD, an unknown string): the handler keeps nothing and its
+            // unhook does nothing.
             super::DcsType::None | super::DcsType::Unknown => HookedDcs::Nothing,
             // A picture placed at the unhook, which a stream's next frame
             // replaces.
@@ -800,7 +835,7 @@ impl Terminal {
     /// reply). A hooked string whose handler keeps nothing, or holds a picture, rides
     /// as one to ignore to its terminator ([`aterm_parser::Parser::carry_unhooking`]),
     /// so the successor swallows its tail instead of printing it, and a tab streaming
-    /// sixel frames or tmux passthrough strings does not miss every park.
+    /// sixel frames or tmux control-mode lines does not miss every park.
     fn parser_carry(&self) -> Option<ParserCarry> {
         match self.hooked_dcs() {
             None => self.parser.carry(),
@@ -1066,6 +1101,7 @@ impl Terminal {
             shell_integration_rev: None,
             title: Some(self.capture_title_repr()),
             output_state: self.capture_output_state_repr(),
+            holder: self.capture_holder_repr(oldest_carried_row),
         }
     }
 
@@ -1117,6 +1153,7 @@ impl Terminal {
         }
         terminal.apply_color_repr(&c.color);
         terminal.apply_shell_repr(&c.shell);
+        terminal.install_holder_repr(&c.holder, main_counter(c));
         // The shell's integration body, when the carry named one — the same
         // install `restore_checkpoint` does, so the two restore doors agree
         // (the field's contract: a restore installs it, an absent or malformed
@@ -1218,6 +1255,7 @@ impl Terminal {
         // `apply_config` that follows reconciles against the carried latch.
         let _ = self.reconcile_color_scheme();
         self.apply_shell_repr(&c.shell);
+        self.install_holder_repr(&c.holder, main_counter(c));
         // The program's titles, as OSC input (`restore_title`). A checkpoint
         // that carried none (an older producer) leaves this engine's alone.
         if let Some(title) = &c.title {
@@ -1411,6 +1449,36 @@ pub struct CheckpointMeta {
         deserialize_with = "super::checkpoint_output::lenient_output_state"
     )]
     pub output_state: OutputStateRepr,
+    /// [`TerminalCheckpoint::holder`]. Absent when no drawer ran; an older child
+    /// starts with no fence. A value that does not read costs only the fence
+    /// (`lenient_holder`): every card stays bare until its drawer is seeded.
+    #[serde(
+        default,
+        skip_serializing_if = "HolderRepr::is_empty",
+        deserialize_with = "lenient_holder"
+    )]
+    pub holder: HolderRepr,
+}
+
+/// Read a carried [`HolderRepr`], or none when the value is not one: like
+/// [`lenient_title`], a malformed fence must not cost the screen.
+#[cfg(feature = "serde")]
+fn lenient_holder<'de, D>(deserializer: D) -> Result<HolderRepr, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Wire {
+        Holder(HolderRepr),
+        Unreadable(serde::de::IgnoredAny),
+    }
+    Ok(
+        match <Wire as serde::Deserialize>::deserialize(deserializer)? {
+            Wire::Holder(holder) => holder,
+            Wire::Unreadable(_) => HolderRepr::default(),
+        },
+    )
 }
 
 /// Read a carried [`TitleRepr`], or `None` when the value is not one: `CheckpointMeta`
@@ -1442,6 +1510,24 @@ where
     reason = "serde's skip_serializing_if hands the predicate a reference"
 )]
 fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+#[cfg(feature = "serde")]
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if hands the predicate a reference"
+)]
+fn is_zero_rows(n: &i32) -> bool {
+    *n == 0
+}
+
+#[cfg(feature = "serde")]
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if hands the predicate a reference"
+)]
+fn is_zero_above(n: &u16) -> bool {
     *n == 0
 }
 
@@ -1483,6 +1569,7 @@ impl CheckpointMeta {
             shell_integration_rev,
             title,
             output_state,
+            holder,
         } = c;
         Self {
             rows: *rows,
@@ -1514,6 +1601,7 @@ impl CheckpointMeta {
                 .as_ref()
                 .map(super::checkpoint_parser::ParserRepr::from_carry),
             output_state: output_state.clone(),
+            holder: holder.clone(),
         }
     }
 
@@ -1577,7 +1665,19 @@ impl CheckpointMeta {
             title: self.title,
             // Likewise judged where it lands (`apply_output_state_repr`).
             output_state: self.output_state,
+            // Likewise (`install_holder_repr`).
+            holder: self.holder,
         }
+    }
+}
+
+/// The absolute row counter of the checkpoint's main grid: the inactive one
+/// while the alternate screen is up.
+fn main_counter(c: &TerminalCheckpoint) -> u64 {
+    if c.modes.alternate_screen {
+        c.alt_absolute_row_counter
+    } else {
+        c.absolute_row_counter
     }
 }
 
@@ -2167,6 +2267,142 @@ mod tests {
         assert_eq!(t.cursor().row, 55, "the reveal moved it back");
     }
 
+    /// What a primary screen's rows-only resizes owe back at one edge rides the
+    /// checkpoint (`GridCursorRepr::handback_rows`), through the meta wire too: a
+    /// flap whose halves straddle a restore leaves every row where the program drew
+    /// it, as one in a single session does. Control: the same restore with the
+    /// hand-back forgotten keeps the revealed history line on top.
+    #[test]
+    fn a_flap_across_a_restore_hands_back_what_it_owes() {
+        fn screen(t: &Terminal) -> Vec<String> {
+            (0..usize::from(t.rows()))
+                .map(|r| t.row_text(r).unwrap_or_default().trim_end().to_string())
+                .collect()
+        }
+        let fresh = || {
+            let mut t = Terminal::new(8, 20);
+            for i in 0..20 {
+                t.process(format!("h{i}\r\n").as_bytes());
+            }
+            t.process(b"\x1b[H\x1b[2Jtop\r\n");
+            t
+        };
+        let drawn = screen(&fresh());
+        // (heights before the restore, what is owed, the natural moves since):
+        // a reveal; a trim; reveals until history ran out, then blank appends.
+        let paths: [(&[u16], i32, u16); 3] = [(&[9], -1, 0), (&[7], 1, 0), (&[30], -13, 9)];
+        for (path, owed, above) in paths {
+            let mut t = fresh();
+            for &rows in path {
+                t.resize(rows, 20);
+            }
+            let carry = t.checkpoint_carry(usize::MAX).expect("Ground");
+            assert_eq!(
+                (carry.cursor.handback_rows, carry.cursor.handback_above),
+                (owed, above),
+                "{path:?}"
+            );
+            #[cfg(feature = "serde")]
+            let carry =
+                CheckpointMeta::from_checkpoint(&carry).into_checkpoint(carry.grid.clone(), None);
+            let mut restored = Terminal::from_checkpoint(&carry);
+            assert_eq!(
+                (
+                    restored.grid().handback_rows(),
+                    restored.grid().handback_above()
+                ),
+                (owed, above),
+                "{path:?}: seeded"
+            );
+            restored.resize(8, 20);
+            assert_eq!(
+                screen(&restored),
+                drawn,
+                "{path:?}: every row where it was drawn"
+            );
+        }
+
+        // Trims then a demote: the demoted row rides as the natural move made
+        // since. Its reveal draws on the history a restored grid keeps in the
+        // tier; the screen it comes back to is checked by
+        // `a_flap_across_a_restore_brings_a_demoted_row_back`.
+        let mut t = fresh();
+        t.resize(2, 20);
+        t.resize(1, 20);
+        let restored = Terminal::from_checkpoint(&t.checkpoint_carry(usize::MAX).expect("Ground"));
+        assert_eq!(
+            (
+                restored.grid().handback_rows(),
+                restored.grid().handback_above()
+            ),
+            (6, 1),
+            "trims then a demote"
+        );
+
+        let mut t = fresh();
+        t.resize(9, 20);
+        let mut restored =
+            Terminal::from_checkpoint(&t.checkpoint_carry(usize::MAX).expect("Ground"));
+        restored.forget_handback();
+        restored.resize(8, 20);
+        assert_eq!(
+            screen(&restored)[..2],
+            ["h12", "top"],
+            "forgotten, every row stays down"
+        );
+    }
+
+    /// A flap whose second half must reveal a row its first half demoted comes back
+    /// across a restore too. A restored grid keeps its history in the scrollback tier
+    /// (`restore_grid`), and a rows-only grow revealed only from the ring, so it appended
+    /// a blank instead: a full screen with the prompt on its last row (8 -> 7, restore,
+    /// -> 8) came back one row higher than drawn, and a blank-tailed screen shrunk past
+    /// its tail (8 -> 2 -> 1, restore, -> 8) came back blank. Each now matches the live
+    /// terminal that ran the same flap with no restore between.
+    #[test]
+    fn a_flap_across_a_restore_brings_a_demoted_row_back() {
+        fn picture(t: &Terminal) -> (Vec<String>, u16, u16) {
+            let rows = (0..usize::from(t.rows()))
+                .map(|r| t.row_text(r).unwrap_or_default().trim_end().to_string())
+                .collect();
+            (rows, t.cursor().row, t.cursor().col)
+        }
+        let full = || {
+            let mut t = Terminal::new(8, 20);
+            for i in 0..30 {
+                t.process(format!("n{i}\r\n").as_bytes());
+            }
+            t.process(b"prompt$ ");
+            t
+        };
+        let blank_tailed = || {
+            let mut t = Terminal::new(8, 20);
+            for i in 0..20 {
+                t.process(format!("h{i}\r\n").as_bytes());
+            }
+            t.process(b"\x1b[H\x1b[2Jtop\r\n");
+            t
+        };
+        let cases: [(&str, &dyn Fn() -> Terminal, &[u16]); 3] = [
+            ("full screen, 7", &full, &[7]),
+            ("full screen, 5", &full, &[5]),
+            ("blank tail, 2 then 1", &blank_tailed, &[2, 1]),
+        ];
+        for (label, build, half) in cases {
+            let drawn = picture(&build());
+            let mut live = build();
+            for &rows in half {
+                live.resize(rows, 20);
+            }
+            let carry = live.checkpoint_carry(usize::MAX).expect("Ground");
+            let mut restored = Terminal::from_checkpoint(&carry);
+            live.resize(8, 20);
+            restored.resize(8, 20);
+            assert_eq!(picture(&live), drawn, "{label}: live");
+            assert_eq!(picture(&restored), drawn, "{label}: across the restore");
+        }
+    }
+
     /// A synchronized-update window open at the checkpoint still times out:
     /// `modes` crosses whole, and the timer is re-armed at the restore, so a
     /// program that never sends `?2026l` cannot leave mode 2026 set, on either
@@ -2372,11 +2608,11 @@ mod tests {
 
     /// A hooked DCS string rides the carry unless it is a query:
     ///
-    /// * a string the engine only consumes (a tmux passthrough wrapper, tmux control
-    ///   mode, a kitty remote-control command) is carried as one to ignore and loses
-    ///   nothing: the restored engine reads the queued tail (the wrapper's doubled
-    ///   ESC breaking into the inner sequence, UTF-8 in the payload, an 8-bit ST)
-    ///   exactly as the live one does, so it is not named as swallowed;
+    /// * a string the engine only consumes (tmux control mode, a kitty remote-control
+    ///   command) is carried as one to ignore and loses nothing: the restored engine
+    ///   reads the queued tail (UTF-8 in the payload, an 8-bit ST) exactly as the live
+    ///   one does, so it is not named as swallowed (a tmux passthrough wrapper hooks no
+    ///   string: `handoff_parser_carry` carries it);
     /// * a sixel string is carried the same way and named a swallowed picture: its
     ///   tail is swallowed, whichever ST ends it, and the next frame replaces it;
     /// * a query (DECRQSS) stays uncarried, as its reply would be lost (the
@@ -2384,8 +2620,7 @@ mod tests {
     ///   `every_partial_parser_state_is_carried_and_named`).
     #[test]
     fn a_hooked_dcs_rides_the_carry_unless_it_is_a_query() {
-        let consumed: [(&[u8], &[u8]); 4] = [
-            (b"\x1bPtmu", b"x;\x1b\x1b]2;inner\x07\x1b\\after"),
+        let consumed: [(&[u8], &[u8]); 3] = [
             (
                 b"\x1bP1000p%begin 1 1 0\n",
                 "%output %1 caf\u{e9} \u{276f} ls\n%end\x1b\\after".as_bytes(),
@@ -2471,7 +2706,7 @@ mod tests {
             assert!(query.partial_sequence_uncarried().is_some(), "{head:?}");
             assert!(query.checkpoint_carry(0).is_none(), "{head:?}");
         }
-        for head in [&b"\x1bPtmux;\x1b"[..], b"\x1bPq#0;2;0;0;0#0~\x1b"] {
+        for head in [&b"\x1bP1000p%end\x1b"[..], b"\x1bPq#0;2;0;0;0#0~\x1b"] {
             for tail in [&b"\\after"[..], b"]2;inner\x07after"] {
                 let mut live = Terminal::new(4, 30);
                 live.process(b"one\r\n");
@@ -2504,9 +2739,8 @@ mod tests {
     /// engine does.
     #[test]
     fn a_string_with_a_0x9c_inside_a_character_is_swallowed_live_and_carried() {
-        let strings: [(&[u8], &str); 4] = [
-            (b"\x1bPtmux;", "\u{672c}\u{d71c}\u{1f71c} x"),
-            (b"\x1bP1000p", "%output %1 \u{672c}\u{672c}\n%end"),
+        let strings: [(&[u8], &str); 3] = [
+            (b"\x1bP1000p", "%output %1 \u{672c}\u{d71c}\u{1f71c}\n%end"),
             (b"\x1bP@kitty-cmd", "{\"t\":\"\u{672c}\"}"),
             (b"\x1b_G", "a=q,\u{672c}"),
         ];
@@ -2569,7 +2803,8 @@ mod tests {
                 "DcsPassthrough",
                 Some("SosPmApcString"),
             ),
-            (b"\x1bPtmu", "DcsPassthrough", Some("SosPmApcString")),
+            // A tmux passthrough wrapper's head rides as itself.
+            (b"\x1bPtmu", "DcsIgnore", Some("DcsIgnore")),
             (b"\x1bP$qm", "DcsPassthrough", None),
             (b"\x1b]2;half a title", "OscString", Some("OscString")),
             (b"\x1b_Gf=100;", "SosPmApcString", Some("SosPmApcString")),

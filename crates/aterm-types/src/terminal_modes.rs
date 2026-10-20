@@ -188,6 +188,15 @@ pub struct TerminalModes {
     /// alternate screen leave the conhost way. Default `false`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub win32_input_enabled: bool,
+    /// Host capability: the console host behind [`Self::win32_input_enabled`] is
+    /// OpenConsole, not Windows' inbox conhost. Folded into the keyboard
+    /// encoding as `KeyboardMode::OPENCONSOLE_HOST` while win32-input-mode is
+    /// active, where the two hosts read a few keys differently (KP_Begin,
+    /// F13-F20). Set only by the embedder
+    /// (`Terminal::set_win32_input_openconsole`) and preserved across
+    /// `Terminal::reset()`/RIS like the bit above. Default `false`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub win32_input_openconsole: bool,
     /// DEC private mode 2048: in-band size reports. When set, the terminal emits
     /// `CSI 48 ; rows ; cols ; pixH ; pixW t` on enable and on every resize, so
     /// apps (neovim 0.10+) learn the geometry without an ioctl. Off by default.

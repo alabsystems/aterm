@@ -90,10 +90,6 @@ pub enum MotionEffect {
     /// thickening scale with it. At 0 the rim is still at fixed alpha and
     /// thickness: the information stays, the movement goes.
     UpgradeSurge,
-    /// The presence rim's edge ripple (the host's `presence`): a 300 ms flash
-    /// along the driven window's rim when a peer's turn submit landed. At 0 the
-    /// ripple never starts; the steady rim carries the information.
-    PresenceRipple,
     /// The message band's live indicator: a busy row's braille spinner and
     /// whole-row comet (`aterm_messages::Meter::busy`), the determinate bar's
     /// glide and glint, the completion echo's glow and fade. At 0 it is
@@ -112,7 +108,7 @@ impl MotionEffect {
     /// The complete governed-effect set, which the totality proof iterates.
     /// Test-only; production gates via [`MotionPolicy`].
     #[cfg(test)]
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 9] = [
         Self::CursorGlow,
         Self::WordSparkles,
         Self::SmoothScroll,
@@ -120,7 +116,6 @@ impl MotionEffect {
         Self::MatrixRain,
         Self::OutputStreak,
         Self::UpgradeSurge,
-        Self::PresenceRipple,
         Self::BandProgress,
         Self::HarnessCard,
     ];
@@ -141,7 +136,6 @@ impl MotionEffect {
             | Self::MatrixRain
             | Self::OutputStreak
             | Self::UpgradeSurge
-            | Self::PresenceRipple
             | Self::BandProgress
             | Self::HarnessCard => false,
         }
@@ -175,9 +169,6 @@ pub enum SeriousEffect {
     LevelUp,
     SettingsPreview,
     GpuPostFx,
-    /// The presence rim's turn-submit ripple: decoration on a rim that
-    /// otherwise moves only with a fact.
-    PresenceRipple,
     /// The message band's live indicator motion, the busy spinner and comet
     /// included. The band and its words stay; the indicator takes its still
     /// form.
@@ -198,7 +189,7 @@ pub enum SeriousEffect {
 
 impl SeriousEffect {
     #[cfg(test)]
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 14] = [
         Self::TerminalSound,
         Self::CursorTrail,
         Self::CursorGlow,
@@ -209,7 +200,6 @@ impl SeriousEffect {
         Self::LevelUp,
         Self::SettingsPreview,
         Self::GpuPostFx,
-        Self::PresenceRipple,
         Self::BandProgress,
         Self::HarnessCard,
         Self::HarnessTicker,
@@ -244,7 +234,6 @@ impl SeriousModePolicy {
             | SeriousEffect::LevelUp
             | SeriousEffect::SettingsPreview
             | SeriousEffect::GpuPostFx
-            | SeriousEffect::PresenceRipple
             | SeriousEffect::BandProgress
             | SeriousEffect::HarnessCard
             | SeriousEffect::HarnessTicker
@@ -288,7 +277,6 @@ impl MotionPolicy {
                 | MotionEffect::MatrixRain
                 | MotionEffect::OutputStreak
                 | MotionEffect::UpgradeSurge
-                | MotionEffect::PresenceRipple
                 | MotionEffect::BandProgress
                 | MotionEffect::HarnessCard => 0.0,
             },

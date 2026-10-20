@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aterm L3 — the fleet: a mutual, exporter-bound proof of one fleet secret over TLS 1.3, the listener that serves proved LAN peers, and the relay that bridges a proved stream to a local socket."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The portable local-socket type the relay bridges to (Unix: a pure std
+# UnixStream alias — zero behavioral change; Windows: AF_UNIX over winsock),
+# and this user's uid, which the key file must carry.
+aterm-uds = { workspace = true }
+# The fleet's proofs: HMAC-SHA256 over the channel exporter, HKDF over it, and
+# a constant-time compare. SHA-256 also fingerprints the pinned certificate
+# (tls.rs).
+aterm-digest = { workspace = true }
+# The workspace's one hex codec: a proof's tag and the certificate fingerprint.
+aterm-codec = { workspace = true }
+rustls = { workspace = true }
+# Each node's own key (fleet.rs, the module doc's Nodes): Ed25519 signing and
+# verification. ring is already rustls's provider here (the workspace row's
+# `ring` feature), so this adds an edge, not a crate; Ed25519 takes none of
+# its features.
+ring = { workspace = true }
+# The anchor attributes' registry (std-only): the `#[cfg_attr(any(test,
+# debug_assertions), aterm_spec_anchor::refines(…))]` anchors of
+# `NetSlotDisplacement` (the listener's slots and the watchdog's claim,
+# slots.rs) expand in every test and debug build, where the source-spec
+# closure collects them; a release build strips them.
+aterm-spec-anchor = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Readiness wait for the non-blocking fleet listener, and the key file's
+# no-follow open. `libc` is already
+# present in every native aterm binary; this adds no package to that graph.
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# `WSAPoll` is Winsock's readiness primitive. `windows-sys` 0.61 is already in
+# the Windows graph; this only enables the narrow WinSock binding surface.
+windows-sys = { version = "0.61", default-features = false, features = [
+  "Win32_Networking_WinSock",
+] }
+
+[dev-dependencies]
+# The interpreter, `verify`, `wait` and `host` the conformance tests drive.
+aterm-spec = { workspace = true }
+# The models those tests bind the code to: `NetSlotDisplacement` (slots.rs)
+# and `TlsBufferedRelay` (tls.rs). A model edit rebuilds only these tests.
+aterm-models-core = { workspace = true }
+aterm-models-session = { workspace = true }

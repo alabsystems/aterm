@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "amacs-files"
+# Integration tests are declared below, not discovered: every file is a module
+# of the one `amacs_files_suite` binary. With autotests off a `tests/*.rs` file
+# listed nowhere never compiles.
+autotests = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Placeholder for planned amacs file I/O and persistence; no implementation yet. See docs/DESIGN-amacs-2026-10-19.md."
+
+[[test]]
+name = "amacs_files_suite"
+path = "tests/amacs_files_suite.rs"
+
+[lints]
+workspace = true

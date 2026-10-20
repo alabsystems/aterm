@@ -75,20 +75,57 @@ impl PowerShellWorld {
         vars
     }
 
+    /// The start of every test child's `-Command`. It refuses, before sourcing
+    /// any integration or hook, a host that does not honor USERPROFILE as
+    /// documented, and never falls back to its home. It points `$PROFILE` into the
+    /// private home: `-NoProfile` keeps the real profiles from running, but
+    /// `$PROFILE` still names them (Windows PowerShell 5.1 finds them under the
+    /// Documents folder, which no environment variable moves), and the key layer
+    /// reads the files it names when the shell is in Emacs mode. A test writes the
+    /// ones it plays with [`PowerShellWorld::write_profile`].
     fn home_guard() -> &'static str {
-        // Refuse before sourcing any integration/hook if an installed host
-        // does not honor USERPROFILE as documented. Never fall back to its home.
-        "if ($HOME -cne $env:ATERM_TEST_HOME) { throw 'private PowerShell home not active' }; "
+        "if ($HOME -cne $env:ATERM_TEST_HOME) { throw 'private PowerShell home not active' }; \
+         $__test_profile = [psobject](Join-Path $HOME 'profile\\CurrentUserCurrentHost.ps1'); \
+         foreach ($__test_name in 'AllUsersAllHosts', 'AllUsersCurrentHost', 'CurrentUserAllHosts', 'CurrentUserCurrentHost') { \
+         Add-Member -InputObject $__test_profile -MemberType NoteProperty -Name $__test_name \
+         -Value (Join-Path $HOME ('profile\\' + $__test_name + '.ps1')) }; \
+         $global:PROFILE = $__test_profile; "
+    }
+
+    /// Write `text` as the file `$PROFILE.<name>` names in this world.
+    fn write_profile(&self, name: &str, text: &str) {
+        let dir = self.home().join("profile");
+        std::fs::create_dir_all(&dir).expect("private profile folder");
+        std::fs::write(dir.join(format!("{name}.ps1")), text).expect("private profile");
     }
 }
+
+/// Plays the profiles a PowerShell runs at startup, in its order, from the files
+/// [`PowerShellWorld::home_guard`] points `$PROFILE` at, where a test wrote them.
+#[cfg(windows)]
+const PLAY_PROFILES: &str = "foreach ($__test_name in 'AllUsersAllHosts', 'AllUsersCurrentHost', \
+     'CurrentUserAllHosts', 'CurrentUserCurrentHost') { \
+     $__test_file = $global:PROFILE.$__test_name; \
+     if (Test-Path -LiteralPath $__test_file) { . $__test_file } }; ";
+
+/// The block an earlier aterm setup wrote into a Windows PowerShell 5.1 profile:
+/// the whole `profile.ps1` it was found in on 2026-10-18 (308 bytes, LF line
+/// endings), which kept every 5.1 tab in Emacs mode and out of the key layer
+/// until the layer took it back (`$__aterm_legacy_emacs_block`).
+const LEGACY_EMACS_BLOCK: &str = "\
+# aterm: emacs line-editing so Ctrl+A/Ctrl+E/Ctrl+K/Ctrl+U... move the cursor\n\
+# (Windows PowerShell 5.1's PSReadLine defaults to \"Windows\" mode, where Ctrl+A =\n\
+# SelectAll and Ctrl+E is unbound). Remove this block to revert.\n\
+if (Get-Module -ListAvailable PSReadLine) { Set-PSReadLineOption -EditMode Emacs }\n";
 
 /// The rows the KEY BINDINGS block binds, in its order: chord, function, and the
 /// stock Windows-mode function it may replace (`""`: the chord is unbound in
 /// Windows mode). `Ctrl+u` is `BackwardKillInput` where PSReadLine has it and
 /// `BackwardKillLine` where it does not (2.0.0); `Ctrl+e` is the
 /// [`ACCEPT_THEN_END`] script block where PSReadLine has `AcceptSuggestion` and
-/// `EndOfLine` where it does not (2.0.0); the `OPTIONAL_FUNCTIONS` bind only
-/// where they exist.
+/// `EndOfLine` where it does not (2.0.0); `Alt+u/l/c` are PSReadLine's
+/// [`CASE_WORD_FUNCTIONS`], or where it lacks them (2.0.0) script blocks listed
+/// under the same names.
 const READLINE_ROWS: &[(&str, &str, &str)] = &[
     ("Ctrl+a", "BeginningOfLine", "SelectAll"),
     ("Ctrl+e", ACCEPT_THEN_END, ""),
@@ -103,6 +140,7 @@ const READLINE_ROWS: &[(&str, &str, &str)] = &[
     ("Ctrl+t", "SwapCharacters", ""),
     ("Ctrl+y", "Yank", "Redo"),
     ("Ctrl+_", "Undo", ""),
+    ("Ctrl+j", "AcceptLine", ""),
     ("Alt+b", "BackwardWord", ""),
     ("Alt+f", "ForwardWord", ""),
     ("Alt+Backspace", "BackwardKillWord", ""),
@@ -117,16 +155,13 @@ const READLINE_ROWS: &[(&str, &str, &str)] = &[
 /// `EndOfLine`), which `Get-PSReadLineKeyHandler -Bound` lists as its function.
 const ACCEPT_THEN_END: &str = "AcceptSuggestionAndEndOfLine";
 
-/// The row functions PSReadLine 2.0.0 (Windows PowerShell 5.1) lacks, measured
-/// 2026-10-16 with `[Microsoft.PowerShell.PSConsoleReadLine].GetMethod`; 2.4.5
-/// has all four.
-#[cfg(windows)]
-const OPTIONAL_FUNCTIONS: &[&str] = &[
-    "BackwardKillInput",
-    "UpcaseWord",
-    "DowncaseWord",
-    "CapitalizeWord",
-];
+/// The Alt+u/l/c functions, which PSReadLine 2.0.0 (Windows PowerShell 5.1)
+/// lacks, as it lacks `BackwardKillInput` (measured 2026-10-16 with
+/// `[Microsoft.PowerShell.PSConsoleReadLine].GetMethod`; 2.4.5 has all four).
+/// The layer binds a script block under each name there, so the rows bind on
+/// every PSReadLine; without them Windows mode typed a bare u, l or c (measured
+/// 2026-10-18).
+const CASE_WORD_FUNCTIONS: &[&str] = &["UpcaseWord", "DowncaseWord", "CapitalizeWord"];
 
 /// The chords Windows mode keeps: none of them may be a row.
 const WINDOWS_MODE_KEEPS: &[&str] = &[
@@ -192,7 +227,11 @@ fn test_powershell_layers_readline_chords_over_windows_mode() {
     for needle in [
         "$ErrorActionPreference = 'Stop'",
         "if (-not (Get-Module -Name PSReadLine)) { return }",
-        "if ((Get-PSReadLineOption).EditMode -ne 'Windows') { return }",
+        // Windows mode, or aterm's legacy Emacs block taken back to it.
+        "$__aterm_mode = [string](Get-PSReadLineOption).EditMode\n    \
+         if (($__aterm_mode -eq 'Emacs') -and (__aterm_legacy_emacs)) {\n        \
+         Set-PSReadLineOption -EditMode Windows\n",
+        "if ($__aterm_mode -ne 'Windows') { return }",
         // PSReadLine 2.0.0 has no -Chord on Get-PSReadLineKeyHandler.
         "foreach ($__aterm_h in @(Get-PSReadLineKeyHandler -Bound)) {",
         // -Bound lists a chord whole; its first key dispatches to it.
@@ -213,6 +252,29 @@ fn test_powershell_layers_readline_chords_over_windows_mode() {
     assert!(
         !code.contains("Get-PSReadLineKeyHandler -Chord"),
         "PSReadLine 2.0.0 (Windows PowerShell 5.1) has no -Chord on Get-PSReadLineKeyHandler"
+    );
+
+    // aterm's legacy Emacs block: the four lines it wrote, each a single-quoted
+    // PowerShell string, which __aterm_legacy_emacs looks for in the profiles. The
+    // decisions are `test_powershell_readline_layer_takes_back_atermss_legacy_emacs_block`
+    // and `test_powershell_readline_layer_keeps_an_emacs_the_user_chose`.
+    let quoted: Vec<String> = LEGACY_EMACS_BLOCK
+        .lines()
+        .map(|line| format!("'{}'", line.replace('\'', "''")))
+        .collect();
+    let legacy = format!(
+        "$Global:__aterm_legacy_emacs_block = @(\n    {})\n",
+        quoted.join(",\n    ")
+    );
+    let legacy_at = code
+        .find(&legacy)
+        .unwrap_or_else(|| panic!("the legacy block, line for line as aterm wrote it: {legacy}"));
+    let check = code
+        .find("function Global:__aterm_legacy_emacs {")
+        .expect("the legacy check");
+    assert!(
+        legacy_at < check && check < start,
+        "the block, then the check, then the layer that calls it"
     );
 
     // The Ctrl+e handler: named for -Bound, described, and a block that accepts the
@@ -250,6 +312,38 @@ fn test_powershell_layers_readline_chords_over_windows_mode() {
         "AcceptSuggestion only with the caret at the end of the buffer, then EndOfLine: {body}"
     );
 
+    // Alt+u/l/c: PSReadLine's function, or a script block listed under its name
+    // that cases the word from the caret. Like the Ctrl+e block it runs at key
+    // press time, so it calls the global helper and reads no setup variable.
+    // The presses are `test_powershell_alt_u_l_c_case_the_word_on_every_psreadline`.
+    assert!(
+        block.contains("function Global:__aterm_case_word([string]$how) {"),
+        "the case helper"
+    );
+    for (function, var, how) in CASE_WORD_FUNCTIONS
+        .iter()
+        .zip([
+            "$__aterm_upcase",
+            "$__aterm_downcase",
+            "$__aterm_capitalize",
+        ])
+        .zip(["Upcase", "Downcase", "Capitalize"])
+        .map(|((function, var), how)| (*function, var, how))
+    {
+        let fallback = format!(
+            "{var} = '{function}'\n    \
+             if (-not $__aterm_rl.GetMethod('{function}')) {{\n        \
+             {var} = @{{\n            \
+             BriefDescription = '{function}'"
+        );
+        assert!(
+            block.contains(&fallback),
+            "{function}'s fallback: {fallback:?}"
+        );
+        let call = format!("ScriptBlock      = {{ param($key, $arg) __aterm_case_word '{how}' }}");
+        assert!(block.contains(&call), "{function}'s block: {call:?}");
+    }
+
     // The rows, exactly: `@('chord', function, 'stock')`, one per line.
     let rows: Vec<(String, String, String)> = block
         .lines()
@@ -274,6 +368,9 @@ fn test_powershell_layers_readline_chords_over_windows_mode() {
             let function = match chord {
                 "Ctrl+u" => "$__aterm_kill_input",
                 "Ctrl+e" => "$__aterm_end_of_line",
+                "Alt+u" => "$__aterm_upcase",
+                "Alt+l" => "$__aterm_downcase",
+                "Alt+c" => "$__aterm_capitalize",
                 _ => function,
             };
             (chord.to_owned(), function.to_owned(), stock.to_owned())
@@ -293,8 +390,8 @@ fn test_powershell_layers_readline_chords_over_windows_mode() {
 struct Bound {
     /// `Get-PSReadLineKeyHandler -Bound`, in its order: `(Key, Function)`.
     keys: Vec<(String, String)>,
-    /// Which of the `OPTIONAL_FUNCTIONS` and `AcceptSuggestion` this PSReadLine
-    /// has.
+    /// Which of `BackwardKillInput`, the [`CASE_WORD_FUNCTIONS`] and
+    /// `AcceptSuggestion` this PSReadLine has.
     has: std::collections::BTreeSet<String>,
     /// `(Get-PSReadLineOption).EditMode`.
     mode: String,
@@ -341,8 +438,20 @@ const LIST_BOUND: &str = "$l = @('version=' + (Get-Module PSReadLine).Version); 
 /// must succeed and print nothing on stderr: the layer never errors at startup.
 #[cfg(windows)]
 fn bound_after(exe: &Path, prelude: &str, how: Pwsh, env: &[(&str, &str)]) -> Bound {
+    bound_after_in(&PowerShellWorld::new(), exe, prelude, how, env)
+}
+
+/// [`bound_after`] in `world`, whose private home holds the profiles a test wrote.
+#[cfg(windows)]
+fn bound_after_in(
+    world: &PowerShellWorld,
+    exe: &Path,
+    prelude: &str,
+    how: Pwsh,
+    env: &[(&str, &str)],
+) -> Bound {
     let prelude = format!("Import-Module PSReadLine; {prelude}");
-    let output = powershell_output(exe, &prelude, LIST_BOUND, None, how, env);
+    let output = powershell_output_in(world, exe, &prelude, LIST_BOUND, None, how, env);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -380,24 +489,22 @@ fn bound_after(exe: &Path, prelude: &str, how: Pwsh, env: &[(&str, &str)]) -> Bo
 }
 
 /// The rows a PSReadLine with `has` binds: `Ctrl+u` and `Ctrl+e` take their 2.0.0
-/// fallbacks, and a row whose function is missing binds nothing.
+/// fallbacks, and every other row binds, the [`CASE_WORD_FUNCTIONS`] as the
+/// layer's script blocks of the same name where PSReadLine lacks them.
 #[cfg(windows)]
 fn expected_layer(
     has: &std::collections::BTreeSet<String>,
 ) -> Vec<(&'static str, &'static str, &'static str)> {
     READLINE_ROWS
         .iter()
-        .filter_map(|&(chord, function, stock)| {
+        .map(|&(chord, function, stock)| {
             if chord == "Ctrl+u" && !has.contains("BackwardKillInput") {
-                return Some((chord, "BackwardKillLine", stock));
+                return (chord, "BackwardKillLine", stock);
             }
             if chord == "Ctrl+e" && !has.contains("AcceptSuggestion") {
-                return Some((chord, "EndOfLine", stock));
+                return (chord, "EndOfLine", stock);
             }
-            if OPTIONAL_FUNCTIONS.contains(&function) && !has.contains(function) {
-                return None;
-            }
-            Some((chord, function, stock))
+            (chord, function, stock)
         })
         .collect()
 }
@@ -562,6 +669,162 @@ fn test_powershell_readline_layer_leaves_emacs_and_vi_alone() {
             assert_eq!(tab.mode, mode);
             assert!(tab.loaded, "{exe:?}: the integration ran");
             assert_eq!(tab.keys, chosen.keys, "{exe:?}: EditMode {mode} untouched");
+        }
+    });
+}
+
+/// The Emacs mode of aterm's own legacy block is taken back: in an aterm tab whose
+/// profile holds [`LEGACY_EMACS_BLOCK`], as found or saved with CRLF and trailing
+/// blanks among other lines, the shell gets stock Windows mode plus exactly the
+/// rows, as a tab with no profile does. Without the change the block kept Emacs
+/// and no row (measured 2026-10-18 in a live 5.1 tab: 18 of 62 key checks failed,
+/// Alt+U/L/C typing u/l/c among them).
+#[cfg(windows)]
+#[test]
+fn test_powershell_readline_layer_takes_back_atermss_legacy_emacs_block() {
+    on_each_powershell("legacy Emacs block", |exe| {
+        let stock = bound_after(exe, "", Pwsh::Bare, &[]);
+        let mut expected = stock.map();
+        for (chord, function, _) in expected_layer(&stock.has) {
+            expected.insert(chord.to_owned(), function.to_owned());
+        }
+        let saved_by_an_editor = LEGACY_EMACS_BLOCK.replace('\n', " \r\n");
+        for (what, profiles) in [
+            (
+                "the block as found, in profile.ps1",
+                vec![("CurrentUserAllHosts", LEGACY_EMACS_BLOCK.to_owned())],
+            ),
+            (
+                "the block with CRLF and trailing blanks among other lines",
+                vec![
+                    ("CurrentUserAllHosts", "# my profile\r\n".to_owned()),
+                    (
+                        "CurrentUserCurrentHost",
+                        format!(
+                            "$global:__mine = 1\r\n{saved_by_an_editor}\
+                             Set-PSReadLineOption -HistorySaveStyle SaveNothing\r\n\
+                             function global:prompt {{ 'P> ' }}\r\n"
+                        ),
+                    ),
+                ],
+            ),
+        ] {
+            let world = PowerShellWorld::new();
+            for (name, text) in &profiles {
+                world.write_profile(name, text);
+            }
+            let played = bound_after_in(&world, exe, PLAY_PROFILES, Pwsh::Bare, &[]);
+            assert_eq!(
+                played.mode, "Emacs",
+                "{exe:?}, {what}: the block sets Emacs"
+            );
+            let tab = bound_after_in(&world, exe, PLAY_PROFILES, Pwsh::InTab, &[]);
+            assert!(tab.loaded);
+            assert_eq!(tab.mode, "Windows", "{exe:?}, {what}");
+            assert_eq!(
+                tab.map(),
+                expected,
+                "{exe:?}, {what}: stock Windows mode plus exactly the rows"
+            );
+        }
+    });
+}
+
+/// An Emacs mode the user chose stays exactly as the profile left it, block or no
+/// block: the user's own line, the block beside a comment naming EditMode (the
+/// documented way to keep Emacs with the block in place) or edited, the block with
+/// a key binding the switch to Windows mode would reset, in the profile text or
+/// bound as a script block by a module, the opt-out, and a shell outside aterm.
+#[cfg(windows)]
+#[test]
+fn test_powershell_readline_layer_keeps_an_emacs_the_user_chose() {
+    /// One shell whose Emacs mode must survive the integration.
+    struct Chosen {
+        what: &'static str,
+        /// `(the $PROFILE property naming the file, its text)`.
+        profiles: Vec<(&'static str, String)>,
+        /// What runs after the profiles and before the integration (a module).
+        module: &'static str,
+        env: &'static [(&'static str, &'static str)],
+        how: Pwsh,
+    }
+    let block = || ("CurrentUserAllHosts", LEGACY_EMACS_BLOCK.to_owned());
+    let in_tab = |what, profiles| Chosen {
+        what,
+        profiles,
+        module: "",
+        env: &[],
+        how: Pwsh::InTab,
+    };
+    let cases = [
+        in_tab(
+            "the user's own Emacs line",
+            vec![(
+                "CurrentUserAllHosts",
+                "Set-PSReadLineOption -EditMode Emacs\n".to_owned(),
+            )],
+        ),
+        in_tab(
+            "the block and a comment naming EditMode",
+            vec![(
+                "CurrentUserAllHosts",
+                format!("{LEGACY_EMACS_BLOCK}# EditMode Emacs: mine\n"),
+            )],
+        ),
+        in_tab(
+            "an edited block",
+            vec![(
+                "CurrentUserAllHosts",
+                LEGACY_EMACS_BLOCK.replacen(
+                    "emacs line-editing so",
+                    "emacs line-editing, mine, so",
+                    1,
+                ),
+            )],
+        ),
+        in_tab(
+            "the block and a key binding in the next profile",
+            vec![
+                block(),
+                (
+                    "CurrentUserCurrentHost",
+                    // The commonest binding, which the switch would reset to
+                    // Windows mode's TabCompleteNext.
+                    "Set-PSReadLineKeyHandler -Key Tab -Function MenuComplete\n".to_owned(),
+                ),
+            ],
+        ),
+        Chosen {
+            module: "Set-PSReadLineKeyHandler -Chord 'Ctrl+q' -ScriptBlock { } \
+                     -BriefDescription module; ",
+            ..in_tab("the block and a module's script block", vec![block()])
+        },
+        Chosen {
+            env: &[("ATERM_DISABLE_READLINE_KEYS", "1")],
+            ..in_tab("the block and the opt-out", vec![block()])
+        },
+        Chosen {
+            how: Pwsh::Outside,
+            ..in_tab("the block outside aterm", vec![block()])
+        },
+    ];
+    on_each_powershell("an Emacs of the user's", |exe| {
+        for case in &cases {
+            let what = case.what;
+            let world = PowerShellWorld::new();
+            for (name, text) in &case.profiles {
+                world.write_profile(name, text);
+            }
+            let prelude = format!("{PLAY_PROFILES}{}", case.module);
+            let chosen = bound_after_in(&world, exe, &prelude, Pwsh::Bare, &[]);
+            assert_eq!(
+                chosen.mode, "Emacs",
+                "{exe:?}, {what}: the profile sets Emacs"
+            );
+            let tab = bound_after_in(&world, exe, &prelude, case.how, case.env);
+            assert!(tab.loaded, "{exe:?}, {what}: the integration ran");
+            assert_eq!(tab.mode, "Emacs", "{exe:?}, {what}");
+            assert_eq!(tab.keys, chosen.keys, "{exe:?}, {what}: Emacs untouched");
         }
     });
 }
@@ -913,6 +1176,138 @@ fn test_powershell_ctrl_e_accepts_a_suggestion_only_at_the_end_of_the_line() {
             field("ctrl_e="),
             [if has { ACCEPT_THEN_END } else { "EndOfLine" }],
             "{exe:?} PSReadLine {version}: Ctrl+e's binding"
+        );
+    });
+}
+
+/// Each line typed at a real prompt for the Alt+U/L/C test, as the bytes aterm
+/// writes (Home `CSI H`, Right `CSI C`, Alt+u `ESC u`), Enter not included, and
+/// the line history holds after Enter. Every line is a comment, so nothing runs.
+#[cfg(windows)]
+const CASE_PRESSES: &[(&str, &str)] = &[
+    // From the start of a word to its end, the caret left after it.
+    (
+        "# alpha beta gamma\x1b[H\x1b[C\x1b[C\x1buX",
+        "# ALPHAX beta gamma",
+    ),
+    (
+        "# ALPHA beta gamma\x1b[H\x1b[C\x1b[C\x1blX",
+        "# alphaX beta gamma",
+    ),
+    (
+        "# alpha beta gamma\x1b[H\x1b[C\x1b[C\x1bcX",
+        "# AlphaX beta gamma",
+    ),
+    // From the space before a word: the next word, mixed case capitalized.
+    ("# hELLO world\x1b[H\x1b[C\x1bcX", "# HelloX world"),
+    // From inside a word, to its end.
+    (
+        "# alpha beta\x1b[H\x1b[C\x1b[C\x1b[C\x1b[C\x1buX",
+        "# alPHAX beta",
+    ),
+];
+
+/// Alt+U/L/C pressed at a real prompt in an aterm tab case the word from the caret,
+/// as readline's do, on every PSReadLine: 2.4.5's own UpcaseWord, DowncaseWord and
+/// CapitalizeWord, and the layer's script blocks on 5.1's 2.0.0, where Windows mode
+/// typed a bare u, l or c (`# uXalpha beta gamma`, measured 2026-10-18).
+#[cfg(windows)]
+#[test]
+fn test_powershell_alt_u_l_c_case_the_word_on_every_psreadline() {
+    on_each_powershell("Alt+U/L/C presses", |exe| {
+        let world = PowerShellWorld::new();
+        let dir = &world.root;
+        let quoted = |path: &Path| path.display().to_string().replace('\'', "''");
+        let result = dir.path().join("result.txt");
+        let profile = dir.path().join("profile.ps1");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("scripts")
+            .join("aterm_shell_integration.ps1");
+        // History kept in this folder and never saved, no predictor, the counting
+        // prompt, and the dump.
+        let body = [
+            format!(
+                "Set-PSReadLineOption -HistorySavePath '{}' -HistorySaveStyle SaveNothing",
+                quoted(&dir.path().join("history.txt"))
+            ),
+            "if ((Get-Command Set-PSReadLineOption).Parameters.ContainsKey('PredictionSource')) { \
+             Set-PSReadLineOption -PredictionSource None }"
+                .to_owned(),
+            "$global:__keys_prompts = 0".to_owned(),
+            "function global:prompt { $global:__keys_prompts += 1; 'K' + $global:__keys_prompts + '> ' }"
+                .to_owned(),
+            format!(
+                "function global:__keys_dump {{ \
+                 $l = @('version=' + (Get-Module PSReadLine).Version); \
+                 foreach ($h in [Microsoft.PowerShell.PSConsoleReadLine]::GetHistoryItems()) {{ \
+                 $l += 'line=' + $h.CommandLine }}; \
+                 [System.IO.File]::WriteAllLines('{}', [string[]]$l) }}",
+                quoted(&result)
+            ),
+            format!(". '{}'", quoted(&script)),
+        ]
+        .join("\r\n");
+        std::fs::write(&profile, body).expect("write the profile");
+        let command = format!("{}. '{}'", PowerShellWorld::home_guard(), quoted(&profile));
+        let argv: Vec<std::ffi::OsString> = [
+            exe.as_os_str(),
+            "-NoProfile".as_ref(),
+            "-NoLogo".as_ref(),
+            "-NoExit".as_ref(),
+            "-ExecutionPolicy".as_ref(),
+            "Bypass".as_ref(),
+            "-Command".as_ref(),
+            command.as_ref(),
+        ]
+        .into_iter()
+        .map(std::ffi::OsStr::to_os_string)
+        .collect();
+        let env_add: Vec<(String, String)> = [
+            ("ATERM_CHILD", "1"),
+            ("ATERM_SHELL_INTEGRATION_INSTALLED", ""),
+            ("ATERM_DISABLE_READLINE_KEYS", ""),
+            ("PSModulePath", ""),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+
+        let mut shell = ConptyShell::spawn(&world, &argv, &env_add);
+        for (n, &(keys, _)) in CASE_PRESSES.iter().enumerate() {
+            shell.wait_for(&format!("K{}>", n + 1), &format!("{exe:?} line {n}"));
+            shell.type_keys(&format!("{keys}\r"));
+        }
+        shell.wait_for(
+            &format!("K{}>", CASE_PRESSES.len() + 1),
+            &format!("{exe:?} after the presses"),
+        );
+        shell.type_keys("__keys_dump; exit\r");
+        shell.wait_for_exit(&format!("{exe:?} dump"));
+        let drawn = shell.drawn();
+        drop(shell);
+
+        let dump = std::fs::read_to_string(&result)
+            .unwrap_or_else(|error| panic!("{exe:?} wrote no dump ({error}); it drew: {drawn}"));
+        let field = |name: &str| -> Vec<&str> {
+            dump.lines()
+                .filter_map(|line| line.strip_prefix(name))
+                .collect()
+        };
+        let version = field("version=").concat();
+        let history = field("line=");
+        // 5.1 puts the -Command it started with into history first.
+        let history = history
+            .strip_prefix(&[command.as_str()][..])
+            .unwrap_or(&history);
+        let expected: Vec<&str> = CASE_PRESSES
+            .iter()
+            .map(|&(_, line)| line)
+            .chain(["__keys_dump; exit"])
+            .collect();
+        assert_eq!(
+            history, expected,
+            "{exe:?} PSReadLine {version}: the lines Enter submitted; the console drew: {drawn}"
         );
     });
 }

@@ -1884,6 +1884,31 @@ fn a_multi_select_text_drawn_against_its_checkbox_is_submitted_by_its_button() {
             .starts_with("a question aterm could not read whole"),
     );
 }
+
+/// ATERM-KI-1016-1 (Questions): `Submit` drawn over the last row of the loop's own text, the
+/// rest of that row glued to it as one word (2.1.300 MEASURED at 57 columns, `❯
+/// Submitked.)`). The dialog read whole with the text a row short, and the hand-over said the
+/// loop "did not write" the text it typed; it is a dialog aterm could not read whole, as the
+/// 39-column frame (`❯    Submit asked.)`) is, with no key pressed in either.
+#[test]
+fn a_text_overdrawn_by_its_button_is_one_aterm_could_not_read_whole() {
+    let (cols, capture) = REFLOW_2_1_300[2];
+    assert_eq!(cols, 57);
+    let rows = screen(capture);
+    assert!(
+        rows.iter().any(|r| r == "❯    Submitked.)"),
+        "PRECONDITION: the residue glued to the button"
+    );
+    for (p, own) in [(LONG, Some(LONG)), (LONG, None), (SHORT, Some(LONG))] {
+        let why = reason(&decided(&rows, p, own)).to_string();
+        assert!(
+            why.starts_with("a question aterm could not read whole")
+                && !why.contains("did not write"),
+            "{p:?}/{own:?}: {why}"
+        );
+    }
+}
+
 /// MUSE CODE'S QUESTION TAKES THE WORD'S TEXT AS A NOTE, AND ITS REVIEW IS
 /// SENT (1.4.10, measured in the lab: the whole 276-byte long-term text
 /// reached the model as `note`): under `long-term` / `short-term` the

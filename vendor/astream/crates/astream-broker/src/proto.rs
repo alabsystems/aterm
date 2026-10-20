@@ -316,7 +316,7 @@ contract_fn! {
     /// [`crate::store::BrokerLog`] when deciding whether a pending last will is fenced
     /// by a later normal publish from the same producer (`TlaWillFencing`).
     #[must_use]
-    pub fn will_is_fenced(high_water: u64, will_seq: u64) -> bool
+    pub const fn will_is_fenced(high_water: u64, will_seq: u64) -> bool
     clauses [ensures result == (will_seq < high_water)]
     {
         will_seq < high_water
@@ -328,7 +328,7 @@ contract_fn! {
     /// used by [`crate::store::BrokerLog`] and [`crate::broker`] to reject stale
     /// primary replication frames (`TlaEpochWatermarkReplication`).
     #[must_use]
-    pub fn epoch_is_fenced(cur_epoch: u64, req_epoch: u64) -> bool
+    pub const fn epoch_is_fenced(cur_epoch: u64, req_epoch: u64) -> bool
     clauses [ensures result == (req_epoch < cur_epoch)]
     {
         req_epoch < cur_epoch
@@ -340,7 +340,7 @@ contract_fn! {
     /// used by [`crate::store::BrokerLog::is_offset_replicated_committed`] and
     /// [`crate::store::BrokerLog::fetch_replicated_committed`] (`TlaEpochWatermarkReplication`).
     #[must_use]
-    pub fn offset_is_committed(committed_upto: u64, offset: u64) -> bool
+    pub const fn offset_is_committed(committed_upto: u64, offset: u64) -> bool
     clauses [ensures result == (offset < committed_upto)]
     {
         offset < committed_upto
@@ -352,7 +352,7 @@ contract_fn! {
     /// used by [`crate::client::CreditWindow`] when pipelining frames over high-RTT links
     /// (`TlaCreditFlowWindow`).
     #[must_use]
-    pub fn can_send_in_window(horizon: u64, next_seq: u64) -> bool
+    pub const fn can_send_in_window(horizon: u64, next_seq: u64) -> bool
     clauses [ensures result == (next_seq < horizon)]
     {
         next_seq < horizon
@@ -535,7 +535,7 @@ pub enum Request {
 }
 
 /// A broker → client response.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub enum Response {
     /// A publish landed (or deduped) at `offset`.
     PublishAck { offset: u64, deduped: bool },
@@ -616,6 +616,84 @@ pub enum Response {
     },
 }
 
+impl PartialEq for Response {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Response::PublishAck {
+                    offset: a_o,
+                    deduped: a_d,
+                },
+                Response::PublishAck {
+                    offset: b_o,
+                    deduped: b_d,
+                },
+            ) => *a_o == *b_o && *a_d == *b_d,
+            (
+                Response::Delivery {
+                    offset: a_o,
+                    subject: a_s,
+                    body: a_b,
+                },
+                Response::Delivery {
+                    offset: b_o,
+                    subject: b_s,
+                    body: b_b,
+                },
+            ) => *a_o == *b_o && a_s.as_str() == b_s.as_str() && a_b.as_slice() == b_b.as_slice(),
+            (
+                Response::Error {
+                    code: a_c,
+                    msg: a_m,
+                },
+                Response::Error {
+                    code: b_c,
+                    msg: b_m,
+                },
+            ) => *a_c == *b_c && a_m.as_str() == b_m.as_str(),
+            (
+                Response::Mark {
+                    next: a_n,
+                    head: a_h,
+                    resume: a_r,
+                    durable: a_d,
+                },
+                Response::Mark {
+                    next: b_n,
+                    head: b_h,
+                    resume: b_r,
+                    durable: b_d,
+                },
+            ) => *a_n == *b_n && *a_h == *b_h && a_r.as_str() == b_r.as_str() && *a_d == *b_d,
+            (
+                Response::Nonce {
+                    nonce: a_n,
+                    log: a_l,
+                    ext: a_e,
+                },
+                Response::Nonce {
+                    nonce: b_n,
+                    log: b_l,
+                    ext: b_e,
+                },
+            ) => a_n.as_slice() == b_n.as_slice() && *a_l == *b_l && *a_e == *b_e,
+            (
+                Response::Budget {
+                    subjects: a_s,
+                    reserved: a_r,
+                    max: a_m,
+                },
+                Response::Budget {
+                    subjects: b_s,
+                    reserved: b_r,
+                    max: b_m,
+                },
+            ) => *a_s == *b_s && *a_r == *b_r && *a_m == *b_m,
+            _ => false,
+        }
+    }
+}
+
 /// A durability tier as the `Hello` block (and `<log>.id`) codes it: 0 Strict,
 /// 1 Ordered, 2 Relaxed. A code this build does not know is kept as [`Tier::Other`].
 #[non_exhaustive]
@@ -633,7 +711,7 @@ pub enum Tier {
 }
 
 impl Tier {
-    fn code(self) -> u8 {
+    const fn code(self) -> u8 {
         match self {
             Tier::Strict => 0,
             Tier::Ordered => 1,
@@ -642,7 +720,7 @@ impl Tier {
         }
     }
 
-    fn from_code(c: u8) -> Tier {
+    const fn from_code(c: u8) -> Tier {
         match c {
             0 => Tier::Strict,
             1 => Tier::Ordered,
@@ -674,7 +752,7 @@ pub enum ServedReason {
 }
 
 impl ServedReason {
-    fn code(self) -> u8 {
+    const fn code(self) -> u8 {
         match self {
             ServedReason::None => 0,
             ServedReason::NotApple => 1,
@@ -686,7 +764,7 @@ impl ServedReason {
         }
     }
 
-    fn from_code(c: u8) -> ServedReason {
+    const fn from_code(c: u8) -> ServedReason {
         match c {
             0 => ServedReason::None,
             1 => ServedReason::NotApple,
@@ -734,11 +812,119 @@ impl ServedInfo {
     /// The horizon `h` as [`horizon_ms`](Self::horizon_ms) reports it: milliseconds
     /// rounded up, saturating below the wire's "none".
     #[must_use]
-    pub fn horizon_ms_of(h: std::time::Duration) -> u32 {
-        u32::try_from(h.as_nanos().div_ceil(1_000_000))
-            .unwrap_or(HORIZON_NONE)
-            .min(HORIZON_NONE - 1)
+    pub const fn horizon_ms_of(h: std::time::Duration) -> u32 {
+        let ms = h.as_nanos().div_ceil(1_000_000);
+        if ms >= (HORIZON_NONE - 1) as u128 {
+            HORIZON_NONE - 1
+        } else {
+            ms as u32
+        }
     }
+}
+
+const fn encode_u16_le_bytes(v: u16) -> [u8; 2] {
+    [v as u8, (v >> 8) as u8]
+}
+
+const fn encode_u32_le_bytes(v: u32) -> [u8; 4] {
+    [v as u8, (v >> 8) as u8, (v >> 16) as u8, (v >> 24) as u8]
+}
+
+const fn encode_u64_le_bytes(v: u64) -> [u8; 8] {
+    [
+        v as u8,
+        (v >> 8) as u8,
+        (v >> 16) as u8,
+        (v >> 24) as u8,
+        (v >> 32) as u8,
+        (v >> 40) as u8,
+        (v >> 48) as u8,
+        (v >> 56) as u8,
+    ]
+}
+
+const fn encode_served_info_bytes(d: &ServedInfo) -> [u8; 9] {
+    let horizon = match d.horizon_ms {
+        Some(ms) => ms,
+        None => HORIZON_NONE,
+    };
+    let h = encode_u32_le_bytes(horizon);
+    let r = encode_u16_le_bytes(d.rules);
+    [
+        d.requested.code(),
+        d.served.code(),
+        d.reason.code(),
+        h[0],
+        h[1],
+        h[2],
+        h[3],
+        r[0],
+        r[1],
+    ]
+}
+
+const fn decode_u16_le_bytes(b: &[u8; 2]) -> u16 {
+    (b[0] as u16) | ((b[1] as u16) << 8)
+}
+
+const fn decode_u32_le_bytes(b: &[u8; 4]) -> u32 {
+    (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24)
+}
+
+const fn decode_u64_le_bytes(b: &[u8; 8]) -> u64 {
+    (b[0] as u64)
+        | ((b[1] as u64) << 8)
+        | ((b[2] as u64) << 16)
+        | ((b[3] as u64) << 24)
+        | ((b[4] as u64) << 32)
+        | ((b[5] as u64) << 40)
+        | ((b[6] as u64) << 48)
+        | ((b[7] as u64) << 56)
+}
+
+const fn decode_served_info_bytes(raw: &[u8; 9]) -> ServedInfo {
+    let horizon = (raw[3] as u32)
+        | ((raw[4] as u32) << 8)
+        | ((raw[5] as u32) << 16)
+        | ((raw[6] as u32) << 24);
+    let rules = (raw[7] as u16) | ((raw[8] as u16) << 8);
+    let requested = Tier::from_code(raw[0]);
+    let served = Tier::from_code(raw[1]);
+    let reason = ServedReason::from_code(raw[2]);
+    let horizon_ms = if matches!(requested, Tier::Ordered) && horizon != HORIZON_NONE {
+        Some(horizon)
+    } else {
+        None
+    };
+    ServedInfo {
+        requested,
+        served,
+        reason,
+        // A horizon belongs to Ordered alone; the broker that predates
+        // Ordered sent 0 for Strict and Relaxed, which is no horizon.
+        horizon_ms,
+        rules,
+    }
+}
+
+const fn decode_served_info(body: &[u8]) -> Option<ServedInfo> {
+    let &[req, served, reason, h0, h1, h2, h3, r0, r1] = body else {
+        return None;
+    };
+    Some(decode_served_info_bytes(&[
+        req, served, reason, h0, h1, h2, h3, r0, r1,
+    ]))
+}
+
+const fn take_ext_entry_header(b: &[u8]) -> Option<(u8, usize, &[u8])> {
+    let &[tag, l0, l1, ref rest @ ..] = b else {
+        return None;
+    };
+    let len = decode_u16_le_bytes(&[l0, l1]) as usize;
+    if rest.len() < len {
+        return None;
+    }
+    Some((tag, len, rest))
 }
 
 /// The `Nonce` answer's EXTENSION BLOCK: after the identity trailer, `(tag u8, len u16
@@ -768,23 +954,22 @@ pub struct NonceExt {
 const EXT_DURABILITY: u8 = 0x01;
 const EXT_LINEAGE: u8 = 0x02;
 
+fn put_ext_entry(p: &mut Vec<u8>, tag: u8, body: &[u8]) {
+    p.push(tag);
+    p.extend_from_slice(&encode_u16_le_bytes(body.len() as u16));
+    p.extend_from_slice(body);
+}
+
 impl NonceExt {
     fn put(&self, p: &mut Vec<u8>) {
-        let mut entry = |tag: u8, body: &[u8]| {
-            p.push(tag);
-            p.extend_from_slice(&(body.len() as u16).to_le_bytes());
-            p.extend_from_slice(body);
-        };
         if let Some(d) = &self.durability {
-            let mut b = vec![d.requested.code(), d.served.code(), d.reason.code()];
-            b.extend_from_slice(&d.horizon_ms.unwrap_or(HORIZON_NONE).to_le_bytes());
-            b.extend_from_slice(&d.rules.to_le_bytes());
-            entry(EXT_DURABILITY, &b);
+            let b = encode_served_info_bytes(d);
+            put_ext_entry(p, EXT_DURABILITY, &b);
         }
         if let Some(l) = &self.lineage {
             let mut b = Vec::new();
             l.put(&mut b);
-            entry(EXT_LINEAGE, &b);
+            put_ext_entry(p, EXT_LINEAGE, &b);
         }
     }
 
@@ -792,29 +977,12 @@ impl NonceExt {
     /// entry cut short, or a known entry whose bytes are not its layout.
     fn read(mut b: &[u8]) -> Option<NonceExt> {
         let mut ext = NonceExt::default();
-        while let Some((&tag, rest)) = b.split_first() {
-            let len = u16::from_le_bytes(rest.get(..2)?.try_into().ok()?) as usize;
-            let end = 2usize.checked_add(len)?;
-            let body = rest.get(2..end)?;
-            b = rest.get(end..)?;
+        while !b.is_empty() {
+            let (tag, len, rest) = take_ext_entry_header(b)?;
+            let body = rest.get(..len)?;
+            b = rest.get(len..)?;
             match tag {
-                EXT_DURABILITY => {
-                    let [req, served, reason, h0, h1, h2, h3, r0, r1] = *body else {
-                        return None;
-                    };
-                    let requested = Tier::from_code(req);
-                    let horizon = u32::from_le_bytes([h0, h1, h2, h3]);
-                    ext.durability = Some(ServedInfo {
-                        requested,
-                        served: Tier::from_code(served),
-                        reason: ServedReason::from_code(reason),
-                        // A horizon belongs to Ordered alone; the broker that predates
-                        // Ordered sent 0 for Strict and Relaxed, which is no horizon.
-                        horizon_ms: (requested == Tier::Ordered && horizon != HORIZON_NONE)
-                            .then_some(horizon),
-                        rules: u16::from_le_bytes([r0, r1]),
-                    });
-                }
+                EXT_DURABILITY => ext.durability = Some(decode_served_info(body)?),
                 EXT_LINEAGE => ext.lineage = Some(Lineage::from_wire(body)?),
                 // Unknown (0x03 included): skipped by its length.
                 _ => {}
@@ -825,46 +993,102 @@ impl NonceExt {
 }
 
 fn put_str(p: &mut Vec<u8>, s: &str) {
-    p.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    p.extend_from_slice(&encode_u32_le_bytes(s.len() as u32));
     p.extend_from_slice(s.as_bytes());
 }
 fn put_bytes(p: &mut Vec<u8>, b: &[u8]) {
-    p.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    p.extend_from_slice(&encode_u32_le_bytes(b.len() as u32));
     p.extend_from_slice(b);
+}
+
+const fn take_u8(b: &[u8]) -> Option<(u8, &[u8])> {
+    let &[v, ref rest @ ..] = b else {
+        return None;
+    };
+    Some((v, rest))
+}
+
+const fn take_u32(b: &[u8]) -> Option<(usize, &[u8])> {
+    let &[b0, b1, b2, b3, ref rest @ ..] = b else {
+        return None;
+    };
+    Some((decode_u32_le_bytes(&[b0, b1, b2, b3]) as usize, rest))
+}
+
+const fn take_u64(b: &[u8]) -> Option<(u64, &[u8])> {
+    let &[b0, b1, b2, b3, b4, b5, b6, b7, ref rest @ ..] = b else {
+        return None;
+    };
+    Some((decode_u64_le_bytes(&[b0, b1, b2, b3, b4, b5, b6, b7]), rest))
+}
+
+const fn take_identity_trailer(b: &[u8]) -> Option<(Option<LogIdentity>, &[u8])> {
+    if b.is_empty() {
+        return Some((None, b));
+    }
+    let &[b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19, b20, b21, b22, b23, ref rest @ ..] =
+        b
+    else {
+        return None;
+    };
+    let Some(ident) = LogIdentity::from_wire(&[
+        b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19,
+        b20, b21, b22, b23,
+    ]) else {
+        return None;
+    };
+    Some((Some(ident), rest))
+}
+
+const fn decode_mark_durable(b: &[u8]) -> Option<Option<u64>> {
+    match b {
+        [] => Some(None),
+        &[b0, b1, b2, b3, b4, b5, b6, b7, ref _rest @ ..] => {
+            Some(Some(decode_u64_le_bytes(&[b0, b1, b2, b3, b4, b5, b6, b7])))
+        }
+        _ => None,
+    }
 }
 
 struct Reader<'a> {
     b: &'a [u8],
-    i: usize,
 }
 impl<'a> Reader<'a> {
-    fn u8(&mut self) -> Option<u8> {
-        let end = self.i.checked_add(1)?;
-        let v = *self.b.get(self.i)?;
-        self.i = end;
+    const fn u8(&mut self) -> Option<u8> {
+        let Some((v, rest)) = take_u8(self.b) else {
+            return None;
+        };
+        self.b = rest;
         Some(v)
     }
-    fn u64(&mut self) -> Option<u64> {
-        let end = self.i.checked_add(8)?;
-        let v = u64::from_le_bytes(self.b.get(self.i..end)?.try_into().ok()?);
-        self.i = end;
+    const fn u64(&mut self) -> Option<u64> {
+        let Some((v, rest)) = take_u64(self.b) else {
+            return None;
+        };
+        self.b = rest;
         Some(v)
     }
-    fn u32(&mut self) -> Option<usize> {
-        let end = self.i.checked_add(4)?;
-        let v = u32::from_le_bytes(self.b.get(self.i..end)?.try_into().ok()?) as usize;
-        self.i = end;
+    const fn u32(&mut self) -> Option<usize> {
+        let Some((v, rest)) = take_u32(self.b) else {
+            return None;
+        };
+        self.b = rest;
         Some(v)
     }
     fn take(&mut self, n: usize) -> Option<Vec<u8>> {
-        let end = self.i.checked_add(n)?;
-        let v = self.b.get(self.i..end)?.to_vec();
-        self.i = end;
+        let v = self.b.get(..n)?.to_vec();
+        self.b = self.b.get(n..)?;
         Some(v)
     }
     fn string(&mut self) -> Option<String> {
         let n = self.u32()?;
-        String::from_utf8(self.take(n)?).ok()
+        let raw = self.b.get(..n)?;
+        let rest = self.b.get(n..)?;
+        let Ok(s) = core::str::from_utf8(raw) else {
+            return None;
+        };
+        self.b = rest;
+        Some(s.to_owned())
     }
     fn bytes(&mut self) -> Option<Vec<u8>> {
         let n = self.u32()?;
@@ -874,14 +1098,12 @@ impl<'a> Reader<'a> {
     /// peer that predates it), `Some(Some(_))` when it follows — and `None`
     /// (malformed) for a body that ends INSIDE one, which is a frame cut short, never
     /// "no identity". Bytes after it are left unread, the room the next trailer takes.
-    fn identity_trailer(&mut self) -> Option<Option<LogIdentity>> {
-        if self.i == self.b.len() {
-            return Some(None);
-        }
-        let end = self.i.checked_add(LogIdentity::WIRE_LEN)?;
-        let ident = LogIdentity::from_wire(self.b.get(self.i..)?)?;
-        self.i = end;
-        Some(Some(ident))
+    const fn identity_trailer(&mut self) -> Option<Option<LogIdentity>> {
+        let Some((ident, rest)) = take_identity_trailer(self.b) else {
+            return None;
+        };
+        self.b = rest;
+        Some(ident)
     }
 }
 
@@ -904,8 +1126,8 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             body,
         } => {
             p[1] = TAG_PUBLISH;
-            p.extend_from_slice(&producer_id.to_le_bytes());
-            p.extend_from_slice(&producer_seq.to_le_bytes());
+            p.extend_from_slice(&encode_u64_le_bytes(*producer_id));
+            p.extend_from_slice(&encode_u64_le_bytes(*producer_seq));
             put_str(&mut p, subject);
             put_bytes(&mut p, body);
         }
@@ -914,7 +1136,7 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             filter,
         } => {
             p[1] = TAG_SUBSCRIBE;
-            p.extend_from_slice(&from_offset.to_le_bytes());
+            p.extend_from_slice(&encode_u64_le_bytes(*from_offset));
             put_str(&mut p, filter);
         }
         Request::ForkSubscribe {
@@ -924,7 +1146,7 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             filter,
         } => {
             p[1] = TAG_FORK_SUBSCRIBE;
-            p.extend_from_slice(&fork_at.to_le_bytes());
+            p.extend_from_slice(&encode_u64_le_bytes(*fork_at));
             put_str(&mut p, replacement_subject);
             put_bytes(&mut p, replacement_body);
             put_str(&mut p, filter);
@@ -932,7 +1154,7 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
         Request::Commit { group, upto } => {
             p[1] = TAG_COMMIT;
             put_str(&mut p, group);
-            p.extend_from_slice(&upto.to_le_bytes());
+            p.extend_from_slice(&encode_u64_le_bytes(*upto));
         }
         Request::ProcessAndProduce {
             producer_id,
@@ -943,12 +1165,12 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             upto,
         } => {
             p[1] = TAG_PROCESS;
-            p.extend_from_slice(&producer_id.to_le_bytes());
-            p.extend_from_slice(&producer_seq.to_le_bytes());
+            p.extend_from_slice(&encode_u64_le_bytes(*producer_id));
+            p.extend_from_slice(&encode_u64_le_bytes(*producer_seq));
             put_str(&mut p, out_subject);
             put_bytes(&mut p, out_body);
             put_str(&mut p, group);
-            p.extend_from_slice(&upto.to_le_bytes());
+            p.extend_from_slice(&encode_u64_le_bytes(*upto));
         }
         Request::SubscribeGroup { group, filter } => {
             p[1] = TAG_SUBSCRIBE_GROUP;
@@ -967,8 +1189,8 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             body,
         } => {
             p[1] = TAG_WILL;
-            p.extend_from_slice(&producer_id.to_le_bytes());
-            p.extend_from_slice(&producer_seq.to_le_bytes());
+            p.extend_from_slice(&encode_u64_le_bytes(*producer_id));
+            p.extend_from_slice(&encode_u64_le_bytes(*producer_seq));
             put_str(&mut p, subject);
             put_bytes(&mut p, body);
         }
@@ -977,7 +1199,7 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
         Request::IdleMarks => p[1] = TAG_IDLE_MARKS,
         Request::Budget { producer_id } => {
             p[1] = TAG_BUDGET;
-            p.extend_from_slice(&producer_id.to_le_bytes());
+            p.extend_from_slice(&encode_u64_le_bytes(*producer_id));
         }
         Request::Replicate {
             seq,
@@ -988,13 +1210,17 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             commit,
             leader,
         } => {
+            let commit_ref = match commit {
+                Some((g, u)) => Some((g.as_str(), *u)),
+                None => None,
+            };
             return encode_replicate(
                 *seq,
                 *producer_id,
                 *producer_seq,
                 subject,
                 body,
-                commit.as_ref().map(|(g, u)| (g.as_str(), *u)),
+                commit_ref,
                 leader.as_ref(),
             );
         }
@@ -1002,7 +1228,7 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             p[1] = TAG_LAST;
             put_str(&mut p, filter);
             put_str(&mut p, after);
-            p.extend_from_slice(&max.to_le_bytes());
+            p.extend_from_slice(&encode_u32_le_bytes(*max));
         }
         Request::Fetch {
             from_offset,
@@ -1010,9 +1236,9 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             max,
         } => {
             p[1] = TAG_FETCH;
-            p.extend_from_slice(&from_offset.to_le_bytes());
+            p.extend_from_slice(&encode_u64_le_bytes(*from_offset));
             put_str(&mut p, filter);
-            p.extend_from_slice(&max.to_le_bytes());
+            p.extend_from_slice(&encode_u32_le_bytes(*max));
         }
     }
     p
@@ -1034,9 +1260,9 @@ pub fn encode_replicate(
 ) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&[PROTO_VERSION, TAG_REPLICATE]);
-    p.extend_from_slice(&seq.to_le_bytes());
-    p.extend_from_slice(&producer_id.to_le_bytes());
-    p.extend_from_slice(&producer_seq.to_le_bytes());
+    p.extend_from_slice(&encode_u64_le_bytes(seq));
+    p.extend_from_slice(&encode_u64_le_bytes(producer_id));
+    p.extend_from_slice(&encode_u64_le_bytes(producer_seq));
     put_str(&mut p, subject);
     put_bytes(&mut p, body);
     match commit {
@@ -1044,7 +1270,7 @@ pub fn encode_replicate(
         Some((group, upto)) => {
             p.push(1);
             put_str(&mut p, group);
-            p.extend_from_slice(&upto.to_le_bytes());
+            p.extend_from_slice(&encode_u64_le_bytes(upto));
         }
     }
     put_identity(&mut p, leader);
@@ -1053,7 +1279,7 @@ pub fn encode_replicate(
 
 /// Decode a request from a frame payload (bounds-checked; `None` on malformed).
 pub fn decode_request(p: &[u8]) -> Option<Request> {
-    let mut r = Reader { b: p, i: 0 };
+    let mut r = Reader { b: p };
     if r.u8()? != PROTO_VERSION {
         return None;
     }
@@ -1147,7 +1373,7 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
     match resp {
         Response::PublishAck { offset, deduped } => {
             p[1] = TAG_ACK;
-            p.extend_from_slice(&offset.to_le_bytes());
+            p.extend_from_slice(&encode_u64_le_bytes(*offset));
             p.push(*deduped as u8);
         }
         Response::Delivery {
@@ -1156,7 +1382,7 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
             body,
         } => {
             p[1] = TAG_DELIVERY;
-            p.extend_from_slice(&offset.to_le_bytes());
+            p.extend_from_slice(&encode_u64_le_bytes(*offset));
             put_str(&mut p, subject);
             put_bytes(&mut p, body);
         }
@@ -1172,11 +1398,11 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
             durable,
         } => {
             p[1] = TAG_MARK;
-            p.extend_from_slice(&next.to_le_bytes());
-            p.extend_from_slice(&head.to_le_bytes());
+            p.extend_from_slice(&encode_u64_le_bytes(*next));
+            p.extend_from_slice(&encode_u64_le_bytes(*head));
             put_str(&mut p, resume);
             if let Some(d) = durable {
-                p.extend_from_slice(&d.to_le_bytes());
+                p.extend_from_slice(&encode_u64_le_bytes(*d));
             }
         }
         Response::Nonce { nonce, log, ext } => {
@@ -1195,9 +1421,9 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
             max,
         } => {
             p[1] = TAG_BUDGET_REPLY;
-            p.extend_from_slice(&subjects.to_le_bytes());
-            p.extend_from_slice(&reserved.to_le_bytes());
-            p.extend_from_slice(&max.to_le_bytes());
+            p.extend_from_slice(&encode_u64_le_bytes(*subjects));
+            p.extend_from_slice(&encode_u64_le_bytes(*reserved));
+            p.extend_from_slice(&encode_u64_le_bytes(*max));
         }
     }
     p
@@ -1216,36 +1442,68 @@ pub fn encode_delivery(offset: u64, subject: &str, body: &[u8]) -> Vec<u8> {
 
 fn put_delivery(p: &mut Vec<u8>, offset: u64, subject: &str, body: &[u8]) {
     p.extend_from_slice(&[PROTO_VERSION, TAG_DELIVERY]);
-    p.extend_from_slice(&offset.to_le_bytes());
+    p.extend_from_slice(&encode_u64_le_bytes(offset));
     put_str(p, subject);
     put_bytes(p, body);
 }
 
 fn put_publish(p: &mut Vec<u8>, producer_id: u64, producer_seq: u64, subject: &str, body: &[u8]) {
     p.extend_from_slice(&[PROTO_VERSION, TAG_PUBLISH]);
-    p.extend_from_slice(&producer_id.to_le_bytes());
-    p.extend_from_slice(&producer_seq.to_le_bytes());
+    p.extend_from_slice(&encode_u64_le_bytes(producer_id));
+    p.extend_from_slice(&encode_u64_le_bytes(producer_seq));
     put_str(p, subject);
     put_bytes(p, body);
 }
 
-fn encode_header_bytes(len32: u32, crc: u32) -> [u8; HEADER_SIZE] {
-    let l = len32.to_le_bytes();
-    let c = crc.to_le_bytes();
+const fn encode_header_bytes(len32: u32, crc: u32) -> [u8; HEADER_SIZE] {
     [
         FRAME_MAGIC[0],
         FRAME_MAGIC[1],
         FRAME_VERSION,
         0,
-        l[0],
-        l[1],
-        l[2],
-        l[3],
-        c[0],
-        c[1],
-        c[2],
-        c[3],
+        len32 as u8,
+        (len32 >> 8) as u8,
+        (len32 >> 16) as u8,
+        (len32 >> 24) as u8,
+        crc as u8,
+        (crc >> 8) as u8,
+        (crc >> 16) as u8,
+        (crc >> 24) as u8,
     ]
+}
+
+fn finish_framed(
+    out: &mut Vec<u8>,
+    start: usize,
+    payload_start: usize,
+    precomputed_crc: Option<u32>,
+) -> io::Result<u32> {
+    let len = out.len().saturating_sub(payload_start);
+    let Ok(len32) = u32::try_from(len) else {
+        out.truncate(start);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload exceeds cap",
+        ));
+    };
+    if len > MAX_PAYLOAD_LEN {
+        out.truncate(start);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload exceeds cap",
+        ));
+    }
+    let payload_slice = out.get(payload_start..).unwrap_or(&[]);
+    let crc = match precomputed_crc {
+        Some(c) => c,
+        None => crc32_ieee(payload_slice),
+    };
+    if let Some(tail) = out.get_mut(start..) {
+        if let Some((hdr, _)) = tail.split_first_chunk_mut::<HEADER_SIZE>() {
+            *hdr = encode_header_bytes(len32, crc);
+        }
+    }
+    Ok(crc)
 }
 
 /// Append one framed `Publish` request to `out`, assembled in place: `subject` and
@@ -1258,23 +1516,41 @@ pub(crate) fn append_publish_frame(
     subject: &str,
     body: &[u8],
 ) -> io::Result<()> {
-    append_framed(out, |p| {
-        put_publish(p, producer_id, producer_seq, subject, body)
-    })
+    let start = out.len();
+    out.extend_from_slice(&[0u8; HEADER_SIZE]);
+    let payload_start = out.len();
+    put_publish(out, producer_id, producer_seq, subject, body);
+    let _ = finish_framed(out, start, payload_start, None)?;
+    Ok(())
+}
+
+const fn encode_delivery_crc_header(offset: u64, subject_len: u32) -> [u8; 14] {
+    [
+        PROTO_VERSION,
+        TAG_DELIVERY,
+        offset as u8,
+        (offset >> 8) as u8,
+        (offset >> 16) as u8,
+        (offset >> 24) as u8,
+        (offset >> 32) as u8,
+        (offset >> 40) as u8,
+        (offset >> 48) as u8,
+        (offset >> 56) as u8,
+        subject_len as u8,
+        (subject_len >> 8) as u8,
+        (subject_len >> 16) as u8,
+        (subject_len >> 24) as u8,
+    ]
 }
 
 /// Compute the exact wire CRC-32/IEEE of a `Response::Delivery { offset, subject, body }`
 /// payload without allocating or copying a temporary payload buffer.
 #[must_use]
 pub fn compute_delivery_crc(offset: u64, subject: &str, body: &[u8]) -> u32 {
-    let mut hdr = [0u8; 14];
-    hdr[0] = PROTO_VERSION;
-    hdr[1] = TAG_DELIVERY;
-    hdr[2..10].copy_from_slice(&offset.to_le_bytes());
-    hdr[10..14].copy_from_slice(&(subject.len() as u32).to_le_bytes());
+    let hdr = encode_delivery_crc_header(offset, subject.len() as u32);
     let crc = astream_wire::crc32_ieee_update(0, &hdr);
     let crc = astream_wire::crc32_ieee_update(crc, subject.as_bytes());
-    let crc = astream_wire::crc32_ieee_update(crc, &(body.len() as u32).to_le_bytes());
+    let crc = astream_wire::crc32_ieee_update(crc, &encode_u32_le_bytes(body.len() as u32));
     astream_wire::crc32_ieee_update(crc, body)
 }
 
@@ -1287,7 +1563,8 @@ pub(crate) fn append_delivery_frame(
     subject: &str,
     body: &[u8],
 ) -> io::Result<()> {
-    append_delivery_frame_with_crc(out, offset, subject, body, None).map(|_| ())
+    let _ = append_delivery_frame_with_crc(out, offset, subject, body, None)?;
+    Ok(())
 }
 
 /// Append one framed `Delivery` to `out`, reusing `precomputed_crc` when `Some` so a
@@ -1304,54 +1581,16 @@ pub(crate) fn append_delivery_frame_with_crc(
     out.extend_from_slice(&[0u8; HEADER_SIZE]);
     let payload_start = out.len();
     put_delivery(out, offset, subject, body);
-    let len = out.len().saturating_sub(payload_start);
-    let Some(len32) = u32::try_from(len).ok().filter(|_| len <= MAX_PAYLOAD_LEN) else {
-        out.truncate(start);
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "payload exceeds cap",
-        ));
-    };
-    let payload_slice = out.get(payload_start..).unwrap_or(&[]);
-    let crc = precomputed_crc.unwrap_or_else(|| crc32_ieee(payload_slice));
-    if let Some((hdr, _)) = out
-        .get_mut(start..)
-        .and_then(|s| s.split_first_chunk_mut::<HEADER_SIZE>())
-    {
-        *hdr = encode_header_bytes(len32, crc);
-    }
-    Ok(crc)
+    finish_framed(out, start, payload_start, precomputed_crc)
 }
 
 /// Append `payload`, framed, to `out` (one copy). See [`append_delivery_frame`].
 pub(crate) fn append_frame(out: &mut Vec<u8>, payload: &[u8]) -> io::Result<()> {
-    append_framed(out, |p| p.extend_from_slice(payload))
-}
-
-/// Frame, in place, the payload `fill` appends to `out`: the header is reserved first
-/// and written once the payload's length and CRC are known. Byte-identical to
-/// `Frame::new(payload).encode()`. A payload over the cap leaves `out` as it was and
-/// is `InvalidData`.
-fn append_framed(out: &mut Vec<u8>, fill: impl FnOnce(&mut Vec<u8>)) -> io::Result<()> {
     let start = out.len();
     out.extend_from_slice(&[0u8; HEADER_SIZE]);
     let payload_start = out.len();
-    fill(out);
-    let len = out.len().saturating_sub(payload_start);
-    let Some(len32) = u32::try_from(len).ok().filter(|_| len <= MAX_PAYLOAD_LEN) else {
-        out.truncate(start);
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "payload exceeds cap",
-        ));
-    };
-    let crc = crc32_ieee(out.get(payload_start..).unwrap_or(&[]));
-    if let Some((hdr, _)) = out
-        .get_mut(start..)
-        .and_then(|s| s.split_first_chunk_mut::<HEADER_SIZE>())
-    {
-        *hdr = encode_header_bytes(len32, crc);
-    }
+    out.extend_from_slice(payload);
+    let _ = finish_framed(out, start, payload_start, None)?;
     Ok(())
 }
 
@@ -1386,23 +1625,29 @@ pub fn foreign_protocol(reply: &[u8]) -> Option<u8> {
 
 /// [`foreign_protocol`] as a client of protocol `ours` reads it.
 fn foreign_protocol_at(ours: u8, reply: &[u8]) -> Option<u8> {
-    let mut r = Reader { b: reply, i: 0 };
-    let version = r.u8()?;
+    let &[version, ref rest @ ..] = reply else {
+        return None;
+    };
     if version != ours {
         return Some(version);
     }
-    if r.u8()? != TAG_ERROR || r.u8()? != ERR_PROTOCOL {
+    let &[TAG_ERROR, ERR_PROTOCOL, l0, l1, l2, l3, ref after_len @ ..] = rest else {
         return None;
+    };
+    let len = decode_u32_le_bytes(&[l0, l1, l2, l3]) as usize;
+    let &[b] = after_len.get(len..)? else {
+        return None;
+    };
+    if b != ours {
+        Some(b)
+    } else {
+        None
     }
-    let len = r.u32()?;
-    r.i = r.i.checked_add(len).filter(|&end| end <= reply.len())?;
-    let broker = r.u8()?;
-    (r.i == reply.len() && broker != ours).then_some(broker)
 }
 
 /// Decode a response from a frame payload (bounds-checked; `None` on malformed).
 pub fn decode_response(p: &[u8]) -> Option<Response> {
-    let mut r = Reader { b: p, i: 0 };
+    let mut r = Reader { b: p };
     if r.u8()? != PROTO_VERSION {
         return None;
     }
@@ -1430,11 +1675,7 @@ pub fn decode_response(p: &[u8]) -> Option<Response> {
             let resume = r.string()?;
             // Optional: an older broker ends the body here. One to seven bytes more is a
             // frame cut short; anything past eight is a later trailer, skipped.
-            let durable = match r.b.len().checked_sub(r.i)? {
-                0 => None,
-                1..=7 => return None,
-                _ => Some(r.u64()?),
-            };
+            let durable = decode_mark_durable(r.b)?;
             Some(Response::Mark {
                 next,
                 head,
@@ -1445,7 +1686,7 @@ pub fn decode_response(p: &[u8]) -> Option<Response> {
         TAG_NONCE => {
             let nonce = r.bytes()?;
             let log = r.identity_trailer()?;
-            let ext = NonceExt::read(r.b.get(r.i..)?)?;
+            let ext = NonceExt::read(r.b)?;
             Some(Response::Nonce { nonce, log, ext })
         }
         TAG_BUDGET_REPLY => Some(Response::Budget {
@@ -1504,8 +1745,8 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
         }
         Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt frame")),
     }
-    let len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
-    let crc = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
+    let len = decode_u32_le_bytes(&[hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+    let crc = decode_u32_le_bytes(&[hdr[8], hdr[9], hdr[10], hdr[11]]);
     // Read straight into the payload buffer (no header copy, no second copy out).
     let mut payload = Vec::new();
     (&mut *r).take(len as u64).read_to_end(&mut payload)?;
@@ -2059,7 +2300,7 @@ mod tests {
     /// (next, head, resume — and no check of where the body ends): what an OLDER client
     /// runs on a `Mark` this build's broker sends.
     fn older_client_mark(p: &[u8]) -> Option<(u64, u64, String)> {
-        let mut r = Reader { b: p, i: 0 };
+        let mut r = Reader { b: p };
         if r.u8()? != PROTO_VERSION || r.u8()? != TAG_MARK {
             return None;
         }

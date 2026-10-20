@@ -558,8 +558,8 @@ impl crate::App {
             .filter(|(_, event)| {
                 matches!(
                     event,
-                    winit::event::WindowEvent::KeyboardInput { .. }
-                        | winit::event::WindowEvent::Ime(_)
+                    aterm_window::event::WindowEvent::KeyboardInput { .. }
+                        | aterm_window::event::WindowEvent::Ime(_)
                 )
             })
             .filter_map(|(winit_id, _)| self.winit_to_window.get(winit_id).copied())
@@ -675,7 +675,7 @@ impl crate::App {
                 if os_window.is_minimized() == Some(true) => {}
             ShowOp::Raise(_) => os_window.set_visible(true),
             ShowOp::EnterFullScreen(_) => {
-                os_window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                os_window.set_fullscreen(Some(aterm_window::window::Fullscreen::Borderless(None)));
             }
         }
     }
@@ -1022,11 +1022,13 @@ mod tests {
             app.frontmost_window = Some(ids[2]);
             app.incoming_handoff_pending = true;
             if typed {
-                let winit_id = winit::window::WindowId::from(2u64);
+                let winit_id = aterm_window::window::WindowId::from(2u64);
                 app.winit_to_window.insert(winit_id, ids[2]);
                 app.queue_pre_commit_input(
                     winit_id,
-                    winit::event::WindowEvent::Ime(winit::event::Ime::Commit("git pu".into())),
+                    aterm_window::event::WindowEvent::Ime(aterm_window::event::Ime::Commit(
+                        "git pu".into(),
+                    )),
                 );
             }
             let stack = app.settle_carried_window_show_at_proof();

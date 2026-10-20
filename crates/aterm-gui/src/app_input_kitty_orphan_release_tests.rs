@@ -3,7 +3,7 @@
 
 use super::{PhysicalReleaseTrace, take_physical_release_trace};
 use crate::{App, WindowId, term_lock};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use aterm_window::keyboard::{KeyCode, PhysicalKey};
 
 fn pairing_step(
     model: &aterm_spec::derive::Model,

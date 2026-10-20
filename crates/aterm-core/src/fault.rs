@@ -13,7 +13,8 @@
 //! where nothing arms a point but a test.
 //!
 //! Usage at a fail-closed seam:
-//! ```ignore
+//! ```
+//! # fn real_op() -> Result<(), std::io::Error> { Ok(()) }
 //! if aterm_core::fault::triggered("scrollback.cold_push") || real_op().is_err() {
 //!     // graceful degradation (drop / skip / fail closed) — never panic
 //! }

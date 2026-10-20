@@ -179,6 +179,16 @@ struct UndoRecord {
     token: UndoToken,
     before: Vec<(String, Option<String>)>,
     after: Vec<(String, Option<String>)>,
+    /// The admitted text just before the patch and just after it. Undo
+    /// restores the DOCUMENT, not the values: while the file still holds
+    /// `after_text` it goes back to `before_text` byte for byte (every
+    /// line where it stood, every comment with the key it described, the
+    /// value as it was spelled); once the file moved on it reverses only
+    /// the patch's own lines ([`merge_reverting`]). Replaying `before`
+    /// through the forward writer instead appended re-created keys and
+    /// tables at the end and left their comments behind.
+    before_text: Arc<str>,
+    after_text: Arc<str>,
 }
 
 /// Single-writer reducer. It is intended to live behind the process-global Config
@@ -563,14 +573,106 @@ impl VersionedConfigService {
 
     /// Apply one all-or-nothing patch. A stale patch is accepted only when every touched
     /// key is unchanged since its base revision and every expectation still matches.
+    ///
+    /// A value equal to its key's default is written as a removal
+    /// ([`crate::prefs::unset_equivalent_edits`]) — here, where every writer
+    /// meets (Settings, `aterm ctl settings set`, Serious Mode, presence, the
+    /// theme commit), so no lane can leave `window_theme = "auto"` behind for
+    /// Modified to count as a change.
     pub(crate) fn patch(&mut self, request: ConfigPatchRequest) -> ConfigPatchResult {
-        if request.base_revision == 0 || request.base_revision > self.revision {
-            return self.rejected("invalid base revision");
+        if let Err(result) = self.check_patch(&request) {
+            return result;
         }
-        if request.edits.is_empty() {
+        let borrowed = request
+            .edits
+            .iter()
+            .map(|edit| (edit.key.as_str(), edit.value.clone()))
+            .collect::<Vec<_>>();
+        let elide =
+            crate::prefs::unset_equivalent_edits(&self.text, &borrowed, &self.assets.themes);
+        // A value that reads as what its key already holds is no edit
+        // ([`written_value`]: `14` written over the file's `14.0`): rewriting
+        // it would only re-spell the person's line (`14.0` as `14`) and
+        // report a save of nothing. A removal is left to the writer, which
+        // also takes out a retired spelling of the key.
+        let borrowed = borrowed
+            .into_iter()
+            .zip(elide)
+            .map(|((key, value), elide)| (key, if elide { None } else { value }))
+            .filter(|(key, value)| {
+                // A value the writer refuses is kept, so the writer refuses it.
+                value.as_deref().is_none_or(|value| {
+                    written_value(key, value)
+                        .is_none_or(|written| self.values.get(*key) != Some(&written))
+                })
+            })
+            .collect::<Vec<_>>();
+        if borrowed.is_empty() {
             return ConfigPatchResult::Unchanged {
                 snapshot: self.snapshot(),
             };
+        }
+        let next = match crate::prefs::apply_prefs_edits(&self.text, &borrowed) {
+            Ok(next) => next,
+            Err(error) => return self.rejected(error.to_string()),
+        };
+        let mut keys = borrowed
+            .iter()
+            .map(|(key, _)| (*key).to_string())
+            .collect::<BTreeSet<_>>();
+        // A document transform can remove retired spellings or pin a sibling.
+        // Those leaf writes share the patch's OCC and conditional Undo. Parent
+        // projections are not extra writes, and an explicit whole parent
+        // already owns its descendants.
+        let before = match leaf_values(&self.text) {
+            Ok(values) => values,
+            Err(message) => return self.rejected(message),
+        };
+        let after = match leaf_values(&next) {
+            Ok(values) => values,
+            Err(message) => return self.rejected(message),
+        };
+        let implicit = before
+            .keys()
+            .chain(after.keys())
+            .filter(|key| before.get(*key) != after.get(*key))
+            .filter(|key| {
+                !key.match_indices('.')
+                    .any(|(at, _)| keys.contains(&key[..at]))
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let conflicts = implicit
+            .iter()
+            .filter(|key| {
+                self.key_revision
+                    .get(*key)
+                    .is_some_and(|revision| *revision > request.base_revision)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !conflicts.is_empty() {
+            return ConfigPatchResult::Conflict {
+                snapshot: self.snapshot(),
+                keys: conflicts,
+            };
+        }
+        keys.extend(implicit);
+        self.admit_text(next, &keys)
+    }
+
+    /// The patch's own validation and optimistic concurrency: a known base
+    /// revision, unique non-empty keys, no asset-source key, and every touched
+    /// key unchanged since its base revision with its expectation current.
+    /// `Err` carries the result to return.
+    fn check_patch(&self, request: &ConfigPatchRequest) -> Result<(), ConfigPatchResult> {
+        if request.base_revision == 0 || request.base_revision > self.revision {
+            return Err(self.rejected("invalid base revision"));
+        }
+        if request.edits.is_empty() {
+            return Err(ConfigPatchResult::Unchanged {
+                snapshot: self.snapshot(),
+            });
         }
         let mut keys = BTreeSet::new();
         if request
@@ -578,20 +680,18 @@ impl VersionedConfigService {
             .iter()
             .any(|edit| edit.key.trim().is_empty() || !keys.insert(edit.key.clone()))
         {
-            return self.rejected("empty or duplicate preference key");
+            return Err(self.rejected("empty or duplicate preference key"));
         }
         if let Some(edit) = request
             .edits
             .iter()
             .find(|edit| crate::prefs::config_asset_source_key(&edit.key))
         {
-            return self.rejected(format!(
+            return Err(self.rejected(format!(
                 "{} names filesystem-backed assets; edit it in Manual so a worker can validate and admit text plus assets atomically",
                 edit.key
-            ));
+            )));
         }
-
-        let current = self.values.clone();
         let mut conflicts = Vec::new();
         for edit in &request.edits {
             let changed_after_base = self
@@ -601,33 +701,27 @@ impl VersionedConfigService {
             let expectation_failed = match &edit.expected {
                 #[cfg(test)]
                 ExpectedValue::Any => false,
-                ExpectedValue::Exact(expected) => current.get(&edit.key).cloned() != *expected,
+                ExpectedValue::Exact(expected) => self.values.get(&edit.key).cloned() != *expected,
             };
             if changed_after_base || expectation_failed {
                 conflicts.push(edit.key.clone());
             }
         }
         if !conflicts.is_empty() {
-            return ConfigPatchResult::Conflict {
+            return Err(ConfigPatchResult::Conflict {
                 snapshot: self.snapshot(),
                 keys: conflicts,
-            };
+            });
         }
+        Ok(())
+    }
 
-        let before = request
-            .edits
-            .iter()
-            .map(|edit| (edit.key.clone(), current.get(&edit.key).cloned()))
-            .collect::<Vec<_>>();
-        let borrowed = request
-            .edits
-            .iter()
-            .map(|edit| (edit.key.as_str(), edit.value.clone()))
-            .collect::<Vec<_>>();
-        let next = match crate::prefs::apply_prefs_edits(&self.text, &borrowed) {
-            Ok(next) => next,
-            Err(error) => return self.rejected(error.to_string()),
-        };
+    /// Admit `next` as the new text, the one revision bump a patch or an undo
+    /// makes: validate the whole typed config before any state moves, rewrap
+    /// the sparkle and wallpaper assets it changed, stamp the revision on
+    /// every key in `touched` and every key whose value moved, and record the
+    /// undo of exactly this transition.
+    fn admit_text(&mut self, next: String, touched: &BTreeSet<String>) -> ConfigPatchResult {
         if next == self.text {
             return ConfigPatchResult::Unchanged {
                 snapshot: self.snapshot(),
@@ -641,6 +735,10 @@ impl VersionedConfigService {
         // change below rewraps them with a pending consumer projection.
         let next_config = match parse_config(&next) {
             Ok(config) => config,
+            Err(message) => return self.rejected(message),
+        };
+        let after_values = match parse_values(&next) {
+            Ok(values) => values,
             Err(message) => return self.rejected(message),
         };
 
@@ -675,29 +773,49 @@ impl VersionedConfigService {
             });
         }
 
+        let before = touched
+            .iter()
+            .map(|key| (key.clone(), self.values.get(key).cloned()))
+            .collect::<Vec<_>>();
+        let after = touched
+            .iter()
+            .map(|key| (key.clone(), after_values.get(key).cloned()))
+            .collect::<Vec<_>>();
         self.revision = self.revision.saturating_add(1);
-        self.text = next;
-        self.config = Arc::new(next_config);
-        for key in &keys {
+        // An undo's restored text can bring back keys the forward patch took
+        // out with it (a retired spelling the new key replaced), so every
+        // key whose value moved is stamped, not only the touched ones.
+        let moved = self
+            .values
+            .keys()
+            .chain(after_values.keys())
+            .filter(|key| self.values.get(*key) != after_values.get(*key))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for key in touched.iter().chain(&moved) {
             self.key_revision.insert(key.clone(), self.revision);
         }
-        let after_values = match parse_values(&self.text) {
-            Ok(values) => values,
-            Err(message) => return self.rejected(message),
+        // Each revision's text is held once: a patch right after another
+        // starts from the text the previous record ended on.
+        let before_text = match self.undo.back() {
+            Some(previous) if *previous.after_text == *self.text => {
+                Arc::clone(&previous.after_text)
+            }
+            _ => Arc::from(self.text.as_str()),
         };
-        self.values.clone_from(&after_values);
+        let after_text: Arc<str> = Arc::from(next.as_str());
+        self.text = next;
+        self.config = Arc::new(next_config);
+        self.values = after_values;
         self.disk_faults = parse_disk_faults(&self.text);
-        let after = request
-            .edits
-            .iter()
-            .map(|edit| (edit.key.clone(), after_values.get(&edit.key).cloned()))
-            .collect();
         let token = UndoToken(self.next_undo.max(1));
         self.next_undo = self.next_undo.saturating_add(1);
         self.undo.push_back(UndoRecord {
             token,
             before,
             after,
+            before_text,
+            after_text,
         });
         while self.undo.len() > UNDO_LIMIT {
             self.undo.pop_front();
@@ -731,6 +849,13 @@ impl VersionedConfigService {
 
     /// Conditional undo: it succeeds only if every value written by the target patch
     /// is still current. Later unrelated changes are preserved.
+    ///
+    /// It restores the document, not the values ([`UndoRecord::before_text`]):
+    /// while the file is still the patch's result it goes back to the text
+    /// before the patch exactly; after an unrelated change it reverses the
+    /// patch's own lines and keeps the change ([`merge_reverting`]), and only
+    /// where those lines were edited too, or the merge would not read as the
+    /// undone values, does it write the values back through the writer.
     pub(crate) fn undo(&mut self, token: UndoToken) -> ConfigPatchResult {
         let Some(record) = self
             .undo
@@ -740,23 +865,39 @@ impl VersionedConfigService {
         else {
             return self.rejected("undo token expired");
         };
-        let edits = record
+        let conflicts = record
+            .after
+            .iter()
+            .filter(|(key, after)| self.values.get(key) != after.as_ref())
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        if !conflicts.is_empty() {
+            return ConfigPatchResult::Conflict {
+                snapshot: self.snapshot(),
+                keys: conflicts,
+            };
+        }
+        let inverse = record
             .before
             .iter()
-            .zip(&record.after)
-            .map(|((key, before), (after_key, after))| {
-                debug_assert_eq!(key, after_key);
-                ConfigKeyEdit {
-                    key: key.clone(),
-                    expected: ExpectedValue::Exact(after.clone()),
-                    value: before.clone(),
-                }
-            })
-            .collect();
-        self.patch(ConfigPatchRequest {
-            base_revision: self.revision,
-            edits,
-        })
+            .map(|(key, before)| (key.as_str(), before.clone()))
+            .collect::<Vec<_>>();
+        let replay = match crate::prefs::apply_prefs_edits(&self.text, &inverse) {
+            Ok(replay) => replay,
+            Err(error) => return self.rejected(error.to_string()),
+        };
+        let next = if *self.text == *record.after_text {
+            record.before_text.to_string()
+        } else {
+            merge_reverting(&record.after_text, &record.before_text, &self.text)
+                .filter(|merged| {
+                    parse_config(merged).is_ok()
+                        && leaf_values(merged).ok() == leaf_values(&replay).ok()
+                })
+                .unwrap_or(replay)
+        };
+        let touched = record.before.iter().map(|(key, _)| key.clone()).collect();
+        self.admit_text(next, &touched)
     }
 
     /// Accept a whole watcher/file snapshot. Changed keys are revision-stamped so a
@@ -912,6 +1053,171 @@ fn parse_values(text: &str) -> Result<BTreeMap<String, String>, String> {
     Ok(values)
 }
 
+/// The values of `text`'s leaves — every key whose value is not a table —
+/// under their dotted paths, as [`parse_values`] names them. A table's own
+/// entry is its text, comments and order included, so two documents that
+/// hold the same settings laid out differently compare equal here only.
+fn leaf_values(text: &str) -> Result<BTreeMap<String, String>, String> {
+    fn walk(values: &mut BTreeMap<String, String>, path: &str, item: &aterm_toml::edit::Item) {
+        if let Some(table) = item.as_table_like() {
+            for (child, child_item) in table.iter() {
+                walk(values, &join_config_key_path(path, child), child_item);
+            }
+        } else {
+            values.insert(path.to_string(), semantic_item(item));
+        }
+    }
+    let document = text
+        .parse::<aterm_toml::edit::DocumentMut>()
+        .map_err(|error| format!("existing aterm.toml is not valid TOML: {error}"))?;
+    let mut values = BTreeMap::new();
+    for (key, item) in document.iter() {
+        walk(&mut values, &join_config_key_path("", key), item);
+    }
+    Ok(values)
+}
+
+/// `current` with the change from `before` to `after` taken back out, line
+/// for line: the three-way merge of `after` (the base both texts grew from),
+/// `before` (what the undo wants there) and `current` (the file now, with a
+/// later change of its own). `None` where a line the undo would restore was
+/// edited in `current` too, so the two cannot both stand. The later change
+/// keeps its own bytes, comments included.
+fn merge_reverting(after: &str, before: &str, current: &str) -> Option<String> {
+    let base: Vec<&str> = after.split_inclusive('\n').collect();
+    let wanted: Vec<&str> = before.split_inclusive('\n').collect();
+    let theirs: Vec<&str> = current.split_inclusive('\n').collect();
+    let revert = line_hunks(&base, &wanted)?;
+    let later = line_hunks(&base, &theirs)?;
+    // Both lists are in base order. A hunk replaces base[start..end] with
+    // other[other_start..other_end]; two hunks clash where their base ranges
+    // share a line, or where both insert at one place.
+    // An insertion at the start of the other's range goes ahead of it.
+    let clash = |a: &LineHunk, b: &LineHunk| {
+        (a.start < b.end && b.start < a.end)
+            || (a.start == a.end && b.start == b.end && a.start == b.start)
+    };
+    if revert.iter().any(|a| later.iter().any(|b| clash(a, b))) {
+        return None;
+    }
+    let mut merged = String::with_capacity(current.len().max(before.len()));
+    let mut at = 0usize;
+    let mut revert = revert.iter().peekable();
+    let mut later = later.iter().peekable();
+    loop {
+        let next = match (revert.peek(), later.peek()) {
+            (Some(a), Some(b)) if (a.start, a.end) <= (b.start, b.end) => (revert.next()?, &wanted),
+            (Some(_), Some(_)) | (None, Some(_)) => (later.next()?, &theirs),
+            (Some(_), None) => (revert.next()?, &wanted),
+            (None, None) => break,
+        };
+        let (hunk, lines) = next;
+        merged.extend(base[at..hunk.start].iter().copied());
+        merged.extend(lines[hunk.other_start..hunk.other_end].iter().copied());
+        at = hunk.end;
+    }
+    merged.extend(base[at..].iter().copied());
+    Some(merged)
+}
+
+/// One difference between two line lists: `base[start..end]` became
+/// `other[other_start..other_end]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LineHunk {
+    start: usize,
+    end: usize,
+    other_start: usize,
+    other_end: usize,
+}
+
+/// The shortest edit from `base` to `other` as hunks in base order (Myers'
+/// O((N+M)D) greedy diff over whole lines). `None` past a bounded number of
+/// differences: a merge over a rewritten file is no longer an undo of one
+/// change, and the caller writes the values back instead.
+fn line_hunks(base: &[&str], other: &[&str]) -> Option<Vec<LineHunk>> {
+    const MAX_DIFFERENCES: usize = 512;
+    let (n, m) = (base.len(), other.len());
+    let max = (n + m).min(MAX_DIFFERENCES);
+    let offset = max + 1;
+    let mut frontier = vec![0usize; 2 * max + 3];
+    let mut trace: Vec<Vec<usize>> = Vec::new();
+    let mut found = None;
+    'search: for d in 0..=max {
+        trace.push(frontier.clone());
+        let d = d as isize;
+        let mut k = -d;
+        while k <= d {
+            let index = (k + offset as isize) as usize;
+            let mut x = if k == -d || (k != d && frontier[index - 1] < frontier[index + 1]) {
+                frontier[index + 1]
+            } else {
+                frontier[index - 1] + 1
+            };
+            let mut y = (x as isize - k) as usize;
+            while x < n && y < m && base[x] == other[y] {
+                x += 1;
+                y += 1;
+            }
+            frontier[index] = x;
+            if x >= n && y >= m {
+                found = Some(d as usize);
+                break 'search;
+            }
+            k += 2;
+        }
+    }
+    let differences = found?;
+    // Walk the trace back from (n, m), collecting the snake each step took.
+    let mut matched: Vec<(usize, usize)> = Vec::new();
+    let (mut x, mut y) = (n, m);
+    for d in (1..=differences).rev() {
+        let row = &trace[d];
+        let d = d as isize;
+        let k = x as isize - y as isize;
+        let index = |k: isize| (k + offset as isize) as usize;
+        let previous_k = if k == -d || (k != d && row[index(k - 1)] < row[index(k + 1)]) {
+            k + 1
+        } else {
+            k - 1
+        };
+        let previous_x = row[index(previous_k)];
+        let previous_y = (previous_x as isize - previous_k) as usize;
+        let (start_x, start_y) = if previous_k == k + 1 {
+            (previous_x, previous_y + 1)
+        } else {
+            (previous_x + 1, previous_y)
+        };
+        while x > start_x && y > start_y {
+            x -= 1;
+            y -= 1;
+            matched.push((x, y));
+        }
+        x = previous_x;
+        y = previous_y;
+    }
+    while x > 0 && y > 0 {
+        x -= 1;
+        y -= 1;
+        matched.push((x, y));
+    }
+    matched.reverse();
+    let mut hunks = Vec::new();
+    let (mut at_base, mut at_other) = (0usize, 0usize);
+    for (base_line, other_line) in matched.into_iter().chain(std::iter::once((n, m))) {
+        if base_line > at_base || other_line > at_other {
+            hunks.push(LineHunk {
+                start: at_base,
+                end: base_line,
+                other_start: at_other,
+                other_end: other_line,
+            });
+        }
+        at_base = base_line + 1;
+        at_other = other_line + 1;
+    }
+    Some(hunks)
+}
+
 /// Append one semantic TOML key segment to the identity used by
 /// `ConfigSnapshot::values`.
 ///
@@ -938,6 +1244,15 @@ fn project_item(values: &mut BTreeMap<String, String>, path: &str, item: &aterm_
         }
     }
     values.insert(path.to_string(), semantic_item(item));
+}
+
+/// How `raw`, written for `key`, reads among [`ConfigSnapshot::values`] —
+/// the projection a patch's expectation is compared in (`12` for a typed
+/// `12.0`) — or `None` where the writer refuses it.
+pub(crate) fn written_value(key: &str, raw: &str) -> Option<String> {
+    crate::prefs::typed_toml_item(key, raw)
+        .ok()
+        .map(|item| semantic_item(&item))
 }
 
 fn semantic_item(item: &aterm_toml::edit::Item) -> String {
@@ -1395,6 +1710,326 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A VALUE EQUAL TO ITS DEFAULT IS WRITTEN AS A REMOVAL, by every writer
+    /// the service serves: for every Settings key with an unset value,
+    /// writing that value to an empty file changes nothing, and writing it
+    /// over another value removes the key. Negative controls: `theme =
+    /// "Default"` (a named theme is a choice, written as chosen so a later
+    /// change of default never moves it) and a value that differs stay
+    /// written, and a default that follows another
+    /// setting is that setting's (Laser's own bloom size is elided under
+    /// Laser; the kitty's default bloom size is not). `display_font = "off"`
+    /// over a display layer — a `display:` font family, the config's or its
+    /// theme's — is what keeps those faces off, so it stays written there and
+    /// only there.
+    #[test]
+    fn a_default_value_is_written_as_a_removal() {
+        let fields = crate::prefs::editable_fields(&crate::app_config::Config::default());
+        let mut checked = 0;
+        for field in &fields {
+            if crate::prefs::config_asset_source_key(field.key) {
+                continue;
+            }
+            let Some(literal) = crate::prefs::unset_literal(field) else {
+                continue;
+            };
+            let mut service = VersionedConfigService::new(String::new()).unwrap();
+            let base = service.snapshot().revision;
+            let result = service.patch(edit(base, field.key, ExpectedValue::Any, Some(&literal)));
+            assert!(
+                matches!(result, ConfigPatchResult::Unchanged { .. }),
+                "{} = {literal:?} on an empty file: {result:?}",
+                field.key
+            );
+            assert_eq!(&*service.snapshot().text, "", "{}", field.key);
+            checked += 1;
+        }
+        assert!(checked > 50, "only {checked} keys have an unset value");
+
+        let mut service =
+            VersionedConfigService::new("window_theme = \"dark\"\nbidi = \"disabled\"\n".into())
+                .unwrap();
+        let base = service.snapshot().revision;
+        assert!(matches!(
+            service.patch(edit(base, "window_theme", ExpectedValue::Any, Some("Auto"))),
+            ConfigPatchResult::Applied { .. }
+        ));
+        assert_eq!(&*service.snapshot().text, "bidi = \"disabled\"\n");
+
+        let mut service = VersionedConfigService::new(String::new()).unwrap();
+        let base = service.snapshot().revision;
+        service.patch(edit(base, "theme", ExpectedValue::Any, Some("Default")));
+        assert_eq!(service.value("theme").unwrap().as_deref(), Some("Default"));
+        let base = service.snapshot().revision;
+        service.patch(edit(base, "window_theme", ExpectedValue::Any, Some("dark")));
+        assert_eq!(
+            service.value("window_theme").unwrap().as_deref(),
+            Some("dark")
+        );
+
+        // A theme whose font family is a display face.
+        let arcade = {
+            let text = "foreground = #e0e0e0\nbackground = #101418\nfont_family = display:pixel\n";
+            let parsed = aterm_types::scheme::parse_theme_str(text).expect("a theme");
+            crate::app_config::ThemeCatalog::from_parsed([("Arcade".to_string(), parsed)])
+        };
+        for (source, kept) in [
+            ("theme = \"Arcade\"\n", true),
+            ("font_family = \"display:pixel\"\n", true),
+            ("theme = \"Arcade\"\nfont_family = \"Menlo\"\n", false),
+            ("", false),
+        ] {
+            let mut service =
+                VersionedConfigService::new_with_themes(source.into(), Arc::clone(&arcade))
+                    .unwrap();
+            let base = service.snapshot().revision;
+            service.patch(edit(
+                base,
+                crate::prefs::EDIT_DISPLAY_FONT,
+                ExpectedValue::Any,
+                Some("off"),
+            ));
+            assert_eq!(
+                service
+                    .value(crate::prefs::EDIT_DISPLAY_FONT)
+                    .unwrap()
+                    .is_some(),
+                kept,
+                "display_font = \"off\" over {source:?}"
+            );
+        }
+
+        let laser = crate::app_config::Config::bloom_radius_style_default(
+            crate::app_config::resolve_trail_style("laser"),
+        );
+        let kitty = crate::app_config::Config::bloom_radius_style_default(
+            crate::app_config::resolve_trail_style(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE),
+        );
+        assert_ne!(laser, kitty, "the styles' own bloom sizes differ");
+        let mut service =
+            VersionedConfigService::new("cursor_trail_style = \"laser\"\n".into()).unwrap();
+        let base = service.snapshot().revision;
+        service.patch(edit(
+            base,
+            crate::prefs::EDIT_CURSOR_TRAIL_BLOOM_RADIUS,
+            ExpectedValue::Any,
+            Some(&kitty.to_string()),
+        ));
+        assert!(
+            service
+                .value(crate::prefs::EDIT_CURSOR_TRAIL_BLOOM_RADIUS)
+                .unwrap()
+                .is_some(),
+            "the kitty's bloom size is not Laser's default"
+        );
+        let base = service.snapshot().revision;
+        service.patch(edit(
+            base,
+            crate::prefs::EDIT_CURSOR_TRAIL_BLOOM_RADIUS,
+            ExpectedValue::Any,
+            Some(&laser.to_string()),
+        ));
+        assert_eq!(
+            service
+                .value(crate::prefs::EDIT_CURSOR_TRAIL_BLOOM_RADIUS)
+                .unwrap(),
+            None,
+            "Laser's own bloom size is its default"
+        );
+    }
+
+    /// A VALUE THE KEY ALREADY HOLDS IS NO WRITE, whoever sends it (`aterm
+    /// ctl settings set font_px 14` over the file's `font_px = 14`): the
+    /// patch is Unchanged, no revision or Undo is minted, and the person's
+    /// line keeps its spelling and its comment. In a patch that also changes
+    /// another key only that key moves. Negative control: a different value
+    /// is written.
+    #[test]
+    fn a_value_the_key_already_holds_is_no_write() {
+        let source = "font_px = 14  # projector\nbidi = \"disabled\"\n";
+        let mut service = VersionedConfigService::new(source.into()).unwrap();
+        let base = service.snapshot().revision;
+        let result = service.patch(edit(base, "font_px", ExpectedValue::Any, Some("14")));
+        assert!(
+            matches!(result, ConfigPatchResult::Unchanged { .. }),
+            "{result:?}"
+        );
+        assert_eq!(&*service.snapshot().text, source);
+        assert_eq!(service.snapshot().revision, base);
+
+        let result = service.patch(ConfigPatchRequest {
+            base_revision: base,
+            edits: vec![
+                ConfigKeyEdit {
+                    key: "font_px".into(),
+                    expected: ExpectedValue::Any,
+                    value: Some("14.0".into()),
+                },
+                ConfigKeyEdit {
+                    key: "bidi".into(),
+                    expected: ExpectedValue::Any,
+                    value: Some("implicit".into()),
+                },
+            ],
+        });
+        let ConfigPatchResult::Applied { snapshot, .. } = result else {
+            panic!("the bidi change applies: {result:?}");
+        };
+        assert!(
+            snapshot.text.contains("font_px = 14  # projector\n"),
+            "{:?}",
+            snapshot.text
+        );
+        assert!(!snapshot.text.contains("bidi"), "{:?}", snapshot.text);
+
+        let base = service.snapshot().revision;
+        let result = service.patch(edit(base, "font_px", ExpectedValue::Any, Some("15")));
+        assert!(
+            matches!(result, ConfigPatchResult::Applied { .. }),
+            "{result:?}"
+        );
+        assert_eq!(service.value("font_px").unwrap().as_deref(), Some("15"));
+    }
+
+    /// The file a reset-and-undo test starts from: root keys with a comment
+    /// above one and an inline comment on another, tables in an authored
+    /// order, a comment above a table's key and one under a table's last key.
+    const AUTHORED: &str = "\
+# note
+font_px = 14  # projector
+cursor_blink = false
+scrollback_lines = 5000
+
+[update]
+enabled = false
+
+[packages]
+enabled = false
+
+[machine]
+universal_control = \"leave\"
+
+[sparkle_words.feline]
+# keep kitties quiet at work
+enabled = false
+
+[harness]
+# supervision off on this laptop
+enabled = false
+";
+
+    /// UNDO RESTORES THE FILE, NOT THE VALUES: a reset of several keys, then
+    /// Undo, gives back the exact bytes (every key where it stood, every
+    /// comment with the key it described, `14` still spelled `14`); Undo of
+    /// that Undo gives back the reset text, and once more the original.
+    #[test]
+    fn undo_of_a_reset_restores_the_file_byte_for_byte() {
+        let mut service = VersionedConfigService::new(AUTHORED.into()).unwrap();
+        let base = service.snapshot().revision;
+        let ConfigPatchResult::Applied { undo, .. } = service.reset_all(
+            base,
+            [
+                "font_px",
+                "cursor_blink",
+                "update.enabled",
+                "packages.enabled",
+                "sparkle_words.feline.enabled",
+                "harness.enabled",
+            ]
+            .map(str::to_string),
+        ) else {
+            panic!("the reset applies");
+        };
+        let reset = service.snapshot().text.to_string();
+        assert!(
+            !reset.contains("font_px") && !reset.contains("[update]"),
+            "{reset}"
+        );
+        let ConfigPatchResult::Applied { undo: redo, .. } = service.undo(undo) else {
+            panic!("the undo applies");
+        };
+        assert_eq!(&*service.snapshot().text, AUTHORED);
+        let ConfigPatchResult::Applied { undo: again, .. } = service.undo(redo) else {
+            panic!("the redo applies");
+        };
+        assert_eq!(&*service.snapshot().text, reset);
+        assert!(matches!(
+            service.undo(again),
+            ConfigPatchResult::Applied { .. }
+        ));
+        assert_eq!(&*service.snapshot().text, AUTHORED);
+    }
+
+    /// After an unrelated change, Undo takes back only its own lines: the
+    /// reset `font_px` returns where it stood with the comment above it and
+    /// its inline comment, and a hand edit made since (a changed value and a
+    /// new comment elsewhere) keeps its bytes. Negative control: an edit of
+    /// the undone key itself still refuses the Undo.
+    #[test]
+    fn undo_after_an_unrelated_edit_reverts_only_its_own_lines() {
+        let mut service = VersionedConfigService::new(AUTHORED.into()).unwrap();
+        let base = service.snapshot().revision;
+        let ConfigPatchResult::Applied { undo, .. } =
+            service.patch(edit(base, "font_px", ExpectedValue::Any, None))
+        else {
+            panic!("the reset applies");
+        };
+        let reset = service.snapshot().text.to_string();
+        let hand = reset.replace(
+            "cursor_blink = false\n",
+            "cursor_blink = true   # blinking for the demo\n",
+        ) + "# my own note\n";
+        service.replace_external(hand.clone()).unwrap();
+        assert!(matches!(
+            service.undo(undo),
+            ConfigPatchResult::Applied { .. }
+        ));
+        let expected = AUTHORED.replace(
+            "cursor_blink = false\n",
+            "cursor_blink = true   # blinking for the demo\n",
+        ) + "# my own note\n";
+        assert_eq!(&*service.snapshot().text, expected);
+
+        let base = service.snapshot().revision;
+        let ConfigPatchResult::Applied { undo, .. } =
+            service.patch(edit(base, "font_px", ExpectedValue::Any, None))
+        else {
+            panic!("the reset applies");
+        };
+        let edited = format!("font_px = 20\n{}", service.snapshot().text);
+        service.replace_external(edited).unwrap();
+        assert!(matches!(
+            service.undo(undo),
+            ConfigPatchResult::Conflict { keys, .. } if keys == ["font_px"]
+        ));
+    }
+
+    /// The line merge Undo uses: the later change and the reverted change
+    /// both stand where they touch different lines, and lines both touched
+    /// are refused (the caller writes the values back instead).
+    #[test]
+    fn the_reverting_merge_keeps_both_changes_or_refuses() {
+        let before = "a\nb\nc\nd\n";
+        let after = "a\nB\nc\nd\n";
+        assert_eq!(
+            merge_reverting(after, before, "a\nB\nc\nD\n").as_deref(),
+            Some("a\nb\nc\nD\n")
+        );
+        assert_eq!(
+            merge_reverting(after, before, "x\na\nB\nc\nd\ny\n").as_deref(),
+            Some("x\na\nb\nc\nd\ny\n")
+        );
+        assert_eq!(merge_reverting(after, before, "a\nBB\nc\nd\n"), None);
+        assert_eq!(
+            merge_reverting(after, before, after).as_deref(),
+            Some(before)
+        );
+        assert_eq!(
+            line_hunks(&["a\n", "b\n"], &["a\n", "b\n"]),
+            Some(Vec::new())
+        );
+    }
+
     #[test]
     fn invalid_multi_key_patch_changes_nothing() {
         let mut service = VersionedConfigService::new("font_px = 14.0\n".into()).unwrap();
@@ -1587,6 +2222,127 @@ mod tests {
             );
             let _: crate::app_config::Config = aterm_toml::from_str(&snapshot.text).unwrap();
         }
+        // A retired master and the sibling a style choice pins are part of
+        // its actual inverse, including after an unrelated later edit.
+        for master in [false, true] {
+            let original = format!("font_px = 13.0\ncursor_trail = {master}\n");
+            let mut service = VersionedConfigService::new(original.clone()).unwrap();
+            let ConfigPatchResult::Applied { snapshot, undo } = service.patch(edit(
+                service.snapshot().revision,
+                "cursor_trail_style",
+                ExpectedValue::Exact(None),
+                Some("comet"),
+            )) else {
+                panic!("style choice");
+            };
+            let chosen = snapshot.text.to_string();
+            assert!(!snapshot.semantic_values.contains_key("cursor_trail"));
+            let ConfigPatchResult::Applied { .. } = service.patch(edit(
+                service.snapshot().revision,
+                "font_px",
+                ExpectedValue::Exact(Some("13".into())),
+                Some("20"),
+            )) else {
+                panic!("unrelated later write");
+            };
+            let ConfigPatchResult::Applied {
+                snapshot,
+                undo: redo,
+            } = service.undo(undo)
+            else {
+                panic!("the full inverse must survive an unrelated edit");
+            };
+            let expected = original.replace("font_px = 13.0", "font_px = 20");
+            assert_eq!(
+                parse_values(&snapshot.text).unwrap(),
+                parse_values(&expected).unwrap()
+            );
+            let ConfigPatchResult::Applied { snapshot, .. } = service.undo(redo) else {
+                panic!("Redo");
+            };
+            let expected = chosen.replace("font_px = 13.0", "font_px = 20");
+            assert_eq!(
+                parse_values(&snapshot.text).unwrap(),
+                parse_values(&expected).unwrap()
+            );
+        }
+
+        // A newer value of the implicitly pinned sibling prevents Undo;
+        // its value must not be silently restored along with the old master.
+        let source = "cursor_trail = false\ncursor_momentum_glow = true\n";
+        let mut service = VersionedConfigService::new(source.into()).unwrap();
+        let ConfigPatchResult::Applied { snapshot, undo } = service.patch(edit(
+            service.snapshot().revision,
+            "cursor_trail_style",
+            ExpectedValue::Exact(None),
+            Some("comet"),
+        )) else {
+            panic!("style choice");
+        };
+        let newer = service
+            .replace_external(snapshot.text.replace(
+                "cursor_momentum_glow = false",
+                "cursor_momentum_glow = true",
+            ))
+            .unwrap();
+        assert!(
+            matches!(service.undo(undo), ConfigPatchResult::Conflict { keys, .. }
+            if keys.contains(&"cursor_momentum_glow".to_string()))
+        );
+        assert_eq!(service.snapshot(), newer);
+
+        // A stale style request cannot overwrite a newer sibling through the
+        // writer, despite its own explicit style expectation still matching.
+        let source = "cursor_trail = false\ncursor_trail_style = \"laser\"\n";
+        let mut service = VersionedConfigService::new(source.into()).unwrap();
+        let base = service.snapshot().revision;
+        let newer = service
+            .replace_external(format!("{source}cursor_momentum_glow = true\n"))
+            .unwrap();
+        assert!(matches!(service.patch(edit(base, "cursor_trail_style",
+            ExpectedValue::Exact(Some("laser".into())), Some("comet"))),
+            ConfigPatchResult::Conflict { keys, .. } if keys.contains(&"cursor_momentum_glow".to_string())));
+        assert_eq!(service.snapshot(), newer);
+
+        // An opaque parent's revision does not block independent leaf writes,
+        // and conditional Undo of one leaf preserves the other child's edit.
+        let mut service =
+            VersionedConfigService::new("[matrix_rain]\nenabled = false\nfps = 37\n".into())
+                .unwrap();
+        let base = service.snapshot().revision;
+        let ConfigPatchResult::Applied { undo, .. } = service.patch(edit(
+            base,
+            "matrix_rain.enabled",
+            ExpectedValue::Exact(Some("false".into())),
+            Some("true"),
+        )) else {
+            panic!("nested patch");
+        };
+        let ConfigPatchResult::Applied { .. } = service.patch(edit(
+            base,
+            "matrix_rain.fps",
+            ExpectedValue::Exact(Some("37".into())),
+            Some("41"),
+        )) else {
+            panic!("stale unrelated child rebases");
+        };
+        let ConfigPatchResult::Applied { snapshot, .. } = service.undo(undo) else {
+            panic!("conditional Undo");
+        };
+        assert_eq!(
+            snapshot
+                .semantic_values
+                .get("matrix_rain.enabled")
+                .map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            snapshot
+                .semantic_values
+                .get("matrix_rain.fps")
+                .map(String::as_str),
+            Some("41")
+        );
     }
 
     /// The value the service reports for a cleared palette (the slot table in

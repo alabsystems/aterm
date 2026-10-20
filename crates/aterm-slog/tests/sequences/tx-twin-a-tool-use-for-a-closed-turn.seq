@@ -1,0 +1,12 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_tool_use_for_a_closed_or_unmapped_turn_never_opens_a_step, its
+# first rig (S13).
+bind 0
+see busy
+tx prompt v1
+see idle
+wait 1000
+expect turn=none
+tx tool c1
+expect tx dropped=1
+expect close t1 turn out=done

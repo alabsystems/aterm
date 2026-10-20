@@ -153,7 +153,7 @@ terminal.
 | **Observe** | Plain text, lossless styled cells, cursor, modes, command blocks, session status, a lifecycle timeline, full-history search | Window and headless modes only |
 | **Drive** | Text, keys, paste, mouse, focus, resize, selection, clipboard, tabs, menu actions, Settings | Signals are a separate operation, never faked keystrokes |
 | **Coordinate** | Event-driven `await`, `ready`, `wait`, whole-turn settlement, drive leases | `turn` waits for the screen to settle; `wait` needs OSC 133 marks |
-| **Stream** | `screen`, `cursor`, `cells`, `bytes`, `events`, `mail`, `sessions` subscriptions, fleet-wide NDJSON | Gaps are marked, never hidden |
+| **Stream** | `screen`, `cursor`, `cells`, `bytes`, `events`, `mail`, `sessions` subscriptions, several sessions on one stream | Gaps are marked, never hidden |
 | **Capture** | PNG frames, full-window shots with native chrome (macOS), asciicast history, opt-in temporal replay, GPU video | What aterm rendered, not what the display showed |
 | **Measure** | Render, frame, input and present counters with percentiles and startup phases | Software-side counters |
 | **Extend** | Themes, typography, wallpaper, Toy Packs, keybindings, the engine source | Path dependencies only; no API stability yet |
@@ -171,7 +171,7 @@ terminal.
 The same binary answers the platform verbs (`ctl`, `pkg`, `fleet`, `drive`,
 `update`, `agents`, …), `help`, the diagnostic subcommands (`doctor`,
 `show-config`, …) and managed-tool dispatch; `aterm --help` lists them.
-`aterm-ctl`, `atpkg`, `aterm-fleet` and `aterm-drive` are symlinks onto it.
+`aterm-ctl`, `atpkg`, `abrew`, `aterm-fleet` and `aterm-drive` are symlinks onto it.
 Window and headless modes serve the control socket by default
 (`--no-control-sock` turns it off) and fail closed when a secure socket cannot
 be created.
@@ -196,12 +196,13 @@ uninstalls, and `agents_auto_prime = false` stops the window reinstalling it.
   `COPILOT_*`, `CODEX_*`, `ANTIGRAVITY_*`, `GEMINI_*`, `CURSOR_*`, `AI_*` and
   `_DEVTOOL_*` stripped, and a window's shell gets a fresh session identity.
 - **No MCP server.** The integration surfaces are the CLI (`aterm ctl`, `conn`,
-  `drive`, `fleet`) and the Rust library API.
+  `drive`) and the Rust library API; `aterm fleet` is a machine's fleet membership,
+  which `aterm ctl survey --fleet` reads through.
 - **A session fabric**: stable session IDs, `@sid` routing across every
   same-user instance, `@self`, per-session `status` and `timeline`, settable
   `meta` (`role`, `attention`), turn leases, multi-session subscriptions,
-  `aterm fleet events` / `aterm fleet exec`, and `aterm conn` to wire one
-  session to watch and type into another.
+  `aterm ctl survey` (what every session is doing, in one read), and `aterm
+  conn` to wire one session to watch and type into another.
 
 ### CLI tour
 
@@ -311,8 +312,8 @@ with rollback.
 ## Use aterm in your own project
 
 **Control a running terminal.** Every result in the [CLI tour](#cli-tour) has a
-protocol equivalent; from Rust, `aterm-agent` wraps it as `CtlClient`,
-`RelayClient` and `Turn`.
+protocol equivalent; from Rust, `aterm-agent` wraps it as `CtlClient` and
+`RelayClient`.
 
 **Embed the engine** when your application owns the grid and renderer:
 
@@ -349,6 +350,21 @@ it as privileged:
 - Scoped capabilities can grant a single kind of operation on a single session
   without handing over the instance's owner token; owner-only verbs stay
   owner-only.
+- Nothing on the network drives aterm unless its person names who may. The
+  one network door is the opt-in fleet listener (`[fleet] listen`): it accepts
+  loopback, private and link-local addresses only, admits a peer that proves
+  the shared fleet secret with an HMAC over the TLS 1.3 exporter, and answers
+  the read verbs marked `fleet` (`survey`, `version`), at `facts` or `content`
+  scope (`[fleet] allow`), never as the owner. At `allow = "drive"` it also
+  serves the worker's verbs to the machines `aterm fleet allow drive --from`
+  named, each proved by the node key it held when it was named (the fleet
+  secret alone drives nothing), and the person at the window wins: Take Over
+  refuses every write from another machine. On the fleet's issuer (the machine
+  that ran `aterm fleet init`) the same port also records a `join` from a peer
+  that proves the join key, which is derived from the same secret: that record
+  goes into this machine's book of peers and never reaches the control server.
+  Its embedded certificate and key are public and identify nobody; the secret
+  to guard is `<state>/fleet.key`.
 - Capture paths are confined to server-managed runtime directories.
 - Terminal-side powers other programs could abuse — window operations,
   notifications, palette reconfiguration, kitty-graphics reads of host files,

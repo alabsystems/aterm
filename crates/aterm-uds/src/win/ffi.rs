@@ -3,8 +3,9 @@
 
 //! Raw Win32 declarations for the AF_UNIX-over-winsock transport — the ONLY
 //! FFI in this crate, kept in one auditable file. `ws2_32` (sockets),
-//! `kernel32` (short-path fallback + pid liveness + console presence for
-//! `crate::spawn`), `bcrypt` (CSPRNG). All
+//! `kernel32` (short-path fallback + pid liveness and start + console presence for
+//! `crate::spawn`), `advapi32` (this process's token, for
+//! `crate::elevation`), `bcrypt` (CSPRNG). All
 //! import libraries ship with every Windows SDK, so `#[link]` is clean on
 //! stable with zero dependencies.
 
@@ -71,6 +72,21 @@ pub(crate) struct WsaNetworkEvents {
     pub _iErrorCode: [i32; 10],
 }
 
+/// `FILETIME`: 100 ns ticks since 1601-01-01 UTC, split in two halves.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FileTime {
+    pub dwLowDateTime: u32,
+    pub dwHighDateTime: u32,
+}
+
+impl FileTime {
+    /// The two halves as one tick count.
+    pub(crate) fn ticks(self) -> u64 {
+        (u64::from(self.dwHighDateTime) << 32) | u64::from(self.dwLowDateTime)
+    }
+}
+
 /// Opaque, oversized stand-in for `WSADATA` (408 bytes on x64); `WSAStartup`
 /// only writes into it and we never read it back.
 #[repr(C)]
@@ -134,10 +150,38 @@ unsafe extern "system" {
         dwProcessId: u32,
     ) -> RawHandle;
     pub(crate) fn GetExitCodeProcess(hProcess: RawHandle, lpExitCode: *mut u32) -> i32;
+    /// `WAIT_TIMEOUT` at `dwMilliseconds` 0: the process has not exited.
+    pub(crate) fn WaitForSingleObject(hHandle: RawHandle, dwMilliseconds: u32) -> u32;
+    /// A process's creation, exit, kernel and user times (`crate::process`).
+    pub(crate) fn GetProcessTimes(
+        hProcess: RawHandle,
+        lpCreationTime: *mut FileTime,
+        lpExitTime: *mut FileTime,
+        lpKernelTime: *mut FileTime,
+        lpUserTime: *mut FileTime,
+    ) -> i32;
     pub(crate) fn CloseHandle(hObject: RawHandle) -> i32;
     /// The pids attached to this process's console; 0 when it has none
     /// (`crate::spawn::have_console`).
     pub(crate) fn GetConsoleProcessList(lpdwProcessList: *mut u32, dwProcessCount: u32) -> u32;
+    /// This process's pseudo-handle (`crate::elevation`).
+    pub(crate) fn GetCurrentProcess() -> RawHandle;
+}
+
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    pub(crate) fn OpenProcessToken(
+        ProcessHandle: RawHandle,
+        DesiredAccess: u32,
+        TokenHandle: *mut RawHandle,
+    ) -> i32;
+    pub(crate) fn GetTokenInformation(
+        TokenHandle: RawHandle,
+        TokenInformationClass: u32,
+        TokenInformation: *mut core::ffi::c_void,
+        TokenInformationLength: u32,
+        ReturnLength: *mut u32,
+    ) -> i32;
 }
 
 #[link(name = "bcrypt")]

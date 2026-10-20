@@ -39,6 +39,71 @@ fn composing_a_strip_hands_the_renderer_its_band_and_seam_for_the_padding() {
     assert_eq!(app.backend.chrome_bleed(), None, "no strip ⇒ no bleed");
 }
 
+/// The band's seam on Windows is a rail on the strip's last pixel rows, window
+/// edge to window edge, so it meets the grid and runs through both gutters. It
+/// used to be a cell underline at the face's underline offset, which left a slab
+/// of band under the rule and the cards centred high in the band; no strip cell
+/// carries that underline there any more. Linux keeps the underline seam.
+#[test]
+fn composing_a_strip_rails_its_seam_on_the_bands_last_pixel_rows() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.tab_strip_rows = 1;
+    app.splice_tab_strip_with(wid, 1);
+    let Some((_, Some(seam))) = tab_bar::strip_bleed_tones(app.chrome_palette_theme()) else {
+        // macOS: the strip has no band, so there is no seam to rail.
+        return;
+    };
+    let ws = &app.windows[&wid];
+    if !tab_bar::STRIP_WINDOWS_PAINT {
+        // Linux keeps its seam: the strip's last row underlined in the seam tone,
+        // and no rail.
+        assert!(
+            ws.input_scratch
+                .chrome_rasters
+                .iter()
+                .all(|raster| raster.row != 0 || raster.rail.is_empty()),
+            "no rail on Linux's strip"
+        );
+        let seam = [(seam >> 16) as u8, (seam >> 8) as u8, seam as u8];
+        assert!(
+            ws.input_scratch.cells[0].iter().all(|cell| {
+                cell.underline == aterm_core::terminal::UnderlineStyle::Single
+                    && cell.underline_color == Some(seam)
+            }),
+            "every strip cell carries the underline seam"
+        );
+        return;
+    }
+    let rail = ws
+        .input_scratch
+        .chrome_rasters
+        .iter()
+        .find(|raster| raster.row == 0)
+        .expect("the strip's last row carries the seam rail");
+    let (cell_w, _) = app.win_cell_size(wid);
+    let frame_w = usize::from(ws.cols) * cell_w + 2 * app.win_pad(wid);
+    assert_eq!(rail.rail.len(), frame_w, "edge to edge, gutters included");
+    assert!(
+        rail.rail.iter().all(|&tone| tone == seam),
+        "in the seam tone"
+    );
+    assert_eq!(
+        usize::from(rail.rail_h),
+        tab_bar::strip_seam_px(ws.scale as f32)
+    );
+    assert!(
+        aterm_render::chrome_rail_covers_gutters(Some(rail)),
+        "the rail retires the bleed's gutter seam for this row"
+    );
+    assert!(
+        ws.input_scratch.cells[0]
+            .iter()
+            .all(|cell| cell.underline == aterm_core::terminal::UnderlineStyle::None),
+        "no strip cell draws the old underline seam"
+    );
+}
+
 /// Where the strip carries the version label (Windows), the opt-in build badge's
 /// top-right anchor sits below the strip's rows instead of on the label, and moves with
 /// their count.
@@ -95,8 +160,7 @@ fn composing_a_metered_band_row_hands_the_renderer_its_edge_tones() {
     assert_eq!(app.message_band_rows, 2);
     app.splice_tab_strip_with(wid, 0);
     let bleed = app.backend.chrome_bleed().expect("band rows are chrome");
-    let presence = usize::from(app.windows[&wid].presence.rows);
-    assert_eq!(bleed.rows, presence + 2);
+    assert_eq!(bleed.rows, 2);
     let ws = &app.windows[&wid];
     let cols = usize::from(ws.cols);
     let pack = |c: [u8; 3]| (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
@@ -108,19 +172,19 @@ fn composing_a_metered_band_row_hands_the_renderer_its_edge_tones() {
     let row = &ws.cached_band_rows[metered];
     let accent = pack(crate::chrome_band::band_colors(app.chrome_palette_theme()).accent);
     assert_eq!(
-        bleed.gutter_tones(presence + metered),
+        bleed.gutter_tones(metered),
         (pack(row[0].bg), pack(row[cols - 1].bg)),
         "the gutters continue the metered row's own edge cells"
     );
     assert_eq!(
-        bleed.gutter_tones(presence + metered),
+        bleed.gutter_tones(metered),
         (accent, accent),
         "a full meter runs through both gutters in the accent"
     );
     let plain = 1 - metered;
     assert_eq!(ws.cached_band_edges[plain], None);
     assert_eq!(
-        bleed.gutter_tones(presence + plain),
+        bleed.gutter_tones(plain),
         (bleed.color, bleed.color),
         "an unmetered row keeps the band tone"
     );
@@ -164,7 +228,6 @@ fn mixed_frame_retires_meter_rasters_when_the_message_band_disappears() {
             + std::time::Duration::from_millis(1),
     );
     assert_eq!(app.message_band_rows, 0);
-    assert_eq!(app.windows[&wid].presence.rows, 0);
     assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
     let input = &app.windows[&wid].input_scratch;
     assert!(
@@ -256,11 +319,7 @@ fn the_band_bleeds_below_a_strip_with_no_surface() {
         .backend
         .chrome_bleed()
         .expect("the band rows are chrome");
-    let presence = usize::from(app.windows[&wid].presence.rows);
-    assert_eq!(
-        bleed.rows,
-        1 + presence + usize::from(app.message_band_rows)
-    );
+    assert_eq!(bleed.rows, 1 + usize::from(app.message_band_rows));
     if tab_bar::strip_bleed_tones(app.chrome_palette_theme()).is_none() {
         assert_eq!(bleed.first, 1, "a strip with no surface keeps the padding");
     } else {

@@ -1,0 +1,10 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_turn_end_takes_the_settles_outcome_and_the_interrupt, its first
+# rig.
+bind 0
+see busy
+tx prompt v1
+see question
+tx end
+expect close t1 turn out=asked conf=heuristic src=transcript
+expect wake=none

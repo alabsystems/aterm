@@ -25,8 +25,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 
-use winit::event_loop::EventLoopProxy;
-use winit::window::Window;
+use aterm_window::event_loop::EventLoopProxy;
+use aterm_window::window::Window;
 
 use crate::app_config::WindowTheme;
 use crate::notify::NotifyMsg;
@@ -45,6 +45,9 @@ pub(crate) struct ToolbarTabsModel<'a> {
     pub(crate) tooltips: &'a [Option<String>],
     pub(crate) ext: &'a [crate::session_chrome::TabChromeExt],
     pub(crate) active: usize,
+    /// The window's needs pill (§5), drawn at the strip's trailing end
+    /// before "+": `None` while its border is unlit.
+    pub(crate) pill: Option<&'a crate::app_presence::NeedsPillModel>,
 }
 
 /// One editing command a menu key equivalent must hand to the inline rename
@@ -258,6 +261,17 @@ pub(crate) trait AppRt {
         None
     }
 
+    /// The EDR POTENTIAL of the screen `window` occupies: the most the panel
+    /// can show above SDR white, whatever its brightness now (macOS
+    /// `NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue`;
+    /// Windows with HDR on, its headroom). `1.0` on an SDR-only screen, and
+    /// by default — Linux presents SDR by design. Settings reads it as the
+    /// fact "this display shows HDR glow", which an 8-bit surface (HDR glow
+    /// off) cannot say.
+    fn screen_edr_potential(&self, _window: &Window) -> f32 {
+        1.0
+    }
+
     /// M3 (Windows scRGB): the display's reference-white scale (`SDR-white / 80`) for
     /// the EDR present, so the grid isn't dim (scRGB `1.0` == 80 nits). Default `1.0`
     /// (no scaling) — correct on macOS (the extended-linear layer auto-maps `1.0` → SDR
@@ -271,12 +285,15 @@ pub(crate) trait AppRt {
     /// Linux deliver; elsewhere this is the channel-draining stub (senders never
     /// block; nothing is delivered).
     /// `own_alerts` is the live `desktop_alerts` switch: while it reads `false` the
-    /// thread drops every notice aterm wrote itself ([`NotifyMsg::own`]).
+    /// thread drops every notice aterm wrote itself ([`NotifyMsg::own`]). `center`
+    /// is the instance's notice center: aterm's own voice on macOS (inert headless
+    /// and in tests), nothing elsewhere.
     fn send_notification_init(
         &self,
         suppress: Arc<Mutex<HashSet<u64>>>,
         silent: Arc<AtomicBool>,
         own_alerts: Arc<AtomicBool>,
+        center: crate::notice_center::NoticeCenter,
     ) -> SyncSender<NotifyMsg>;
 
     /// Build + install the native application menu bar, returning the retained
@@ -289,7 +306,7 @@ pub(crate) trait AppRt {
     fn install_status_item(
         &self,
         _proxy: &EventLoopProxy<Wake>,
-        _glance: &crate::status_item::FleetGlance,
+        _glance: &crate::status_item::Glance,
     ) -> Option<crate::status_item::StatusItemHandle> {
         None
     }
@@ -300,6 +317,31 @@ pub(crate) trait AppRt {
     #[cfg(target_os = "macos")]
     fn activate_instance(&self, _pid: u32) -> bool {
         false
+    }
+
+    /// Open `url` with the system's handler — the status item's Screen
+    /// Sharing (`vnc://<host>`) and the Local Network privacy pane
+    /// (`x-apple.systempreferences:`). Default `false`: nothing opened. A
+    /// test build opens nothing on any platform: it records the URL
+    /// ([`take_opened_urls`]), so no test reaches a handler or WindowServer.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(dead_code, reason = "the menu-bar status item is macOS's")
+    )]
+    fn open_url(&self, _url: &str) -> bool {
+        false
+    }
+
+    /// Put `text` on the system pasteboard (the status item's Copy "ssh
+    /// <host>"). Default: the clipboard backend's own write
+    /// (`control::pbcopy`), whose test build writes a thread-local board and
+    /// never the system's.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(dead_code, reason = "the menu-bar status item is macOS's")
+    )]
+    fn pasteboard_set(&self, text: &str) -> bool {
+        crate::control::pbcopy(text)
     }
 
     /// Un-minimize and raise OUR OWN `window` — the receiving half of a
@@ -337,6 +379,20 @@ pub(crate) trait AppRt {
     /// Linux model still RECORDS `ext` so the `chrome` mirror reads one truth on
     /// every platform).
     fn set_toolbar_tabs(&self, handle: &toolbar::ToolbarHandle, tabs: ToolbarTabsModel<'_>);
+
+    /// Push a window's needs pill alone (its age moved and nothing else),
+    /// laid out where the last strip push put it, no tab chip touched.
+    /// `true` when that held; `false` when the strip must be pushed whole
+    /// (the pill's width moved). Default: `true` — no titlebar pill here (the
+    /// in-grid strip draws it on its own repaint).
+    fn set_toolbar_pill(
+        &self,
+        handle: &toolbar::ToolbarHandle,
+        pill: Option<&crate::app_presence::NeedsPillModel>,
+    ) -> bool {
+        let _ = (handle, pill);
+        true
+    }
 
     /// Re-flow a window's native toolbar tab strip to the window's CURRENT width from
     /// the state its chips already hold — no titles, no terminal reads. Called on every
@@ -439,6 +495,17 @@ pub(crate) trait AppRt {
     /// asks through the in-window confirm banner instead. `proceed_label` titles
     /// the affirmative button; a "Cancel" button is always added.
     fn confirm(&self, title: &str, body: &str, proceed_label: &str) -> Option<bool>;
+
+    /// [`Self::confirm`] for an owner gesture that ends something, FAIL
+    /// CLOSED (Stop Worker's sheet): its default button is Cancel and the
+    /// destructive button takes only a click, so a Return the person was
+    /// typing elsewhere never says yes; `None` when no alert could be shown
+    /// (no native dialog, headless, off the main thread) — nobody was asked,
+    /// which the caller never reads as a yes. Off macOS there is no sheet
+    /// (Stop Worker then asks on the Overview's inline confirm).
+    fn confirm_owner(&self, _title: &str, _body: &str, _proceed_label: &str) -> Option<bool> {
+        None
+    }
 
     /// Register the whole-app quit confirmation for AppKit `terminate:` gestures that
     /// BYPASS the application menu's Quit item — the Dock-icon "Quit", AppleScript
@@ -809,6 +876,29 @@ impl AppRt for AppRtMacOS {
         }
     }
 
+    /// `NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue` for
+    /// this window's screen; `1.0` where any link is missing, as
+    /// [`Self::screen_edr_max`].
+    fn screen_edr_potential(&self, window: &Window) -> f32 {
+        let ns_window = ns_window_of(window);
+        if ns_window.is_null() {
+            return 1.0;
+        }
+        // SAFETY: as `screen_edr_max`: `-screen` is a nil-checked `-(id)`
+        // read and the potential getter (macOS 10.15+, the app requires 11)
+        // a side-effect-free `-(CGFloat)`.
+        unsafe {
+            let screen = crate::appkit::send_id(ns_window, aterm_objc::sel!(screen));
+            if screen.is_null() {
+                return 1.0;
+            }
+            crate::appkit::send_f64(
+                screen,
+                aterm_objc::sel!(maximumPotentialExtendedDynamicRangeColorComponentValue),
+            ) as f32
+        }
+    }
+
     /// Apply `NSWindowStyleMaskFullSizeContentView` (1<<15) so the content view —
     /// and with it the GPU surface — spans under the titlebar. Best-effort like
     /// the other chrome methods: no AppKit window → a silent no-op. Always ON in a
@@ -922,8 +1012,9 @@ impl AppRt for AppRtMacOS {
         suppress: Arc<Mutex<HashSet<u64>>>,
         silent: Arc<AtomicBool>,
         own_alerts: Arc<AtomicBool>,
+        center: crate::notice_center::NoticeCenter,
     ) -> SyncSender<NotifyMsg> {
-        crate::notify::spawn_delivery(suppress, silent, own_alerts)
+        crate::notify::spawn_delivery(suppress, silent, own_alerts, center)
     }
 
     fn install_menu(&self, proxy: &EventLoopProxy<Wake>) -> Option<menu::MenuHandle> {
@@ -933,9 +1024,29 @@ impl AppRt for AppRtMacOS {
     fn install_status_item(
         &self,
         proxy: &EventLoopProxy<Wake>,
-        glance: &crate::status_item::FleetGlance,
+        glance: &crate::status_item::Glance,
     ) -> Option<crate::status_item::StatusItemHandle> {
         crate::status_item::install(proxy, glance)
+    }
+
+    fn open_url(&self, url: &str) -> bool {
+        #[cfg(test)]
+        {
+            OPENED_URLS.with(|urls| urls.borrow_mut().push(url.to_string()));
+            true
+        }
+        #[cfg(not(test))]
+        {
+            // `/usr/bin/open <url>` (no shell): the scheme's registered
+            // handler, never waited for; its child is reaped on drop.
+            aterm_uds::spawnfd::command("/usr/bin/open")
+                .arg(url)
+                .stdin(aterm_uds::spawnfd::Stdio::null())
+                .stdout(aterm_uds::spawnfd::Stdio::null())
+                .stderr(aterm_uds::spawnfd::Stdio::null())
+                .spawn()
+                .is_ok()
+        }
     }
 
     fn activate_instance(&self, pid: u32) -> bool {
@@ -1012,8 +1123,17 @@ impl AppRt for AppRtMacOS {
             tooltips,
             ext,
             active,
+            pill,
         } = tabs;
-        toolbar::set_window_tabs(handle, titles, ids, metadata, tooltips, ext, active);
+        toolbar::set_window_tabs(handle, titles, ids, metadata, tooltips, ext, active, pill);
+    }
+
+    fn set_toolbar_pill(
+        &self,
+        handle: &toolbar::ToolbarHandle,
+        pill: Option<&crate::app_presence::NeedsPillModel>,
+    ) -> bool {
+        toolbar::set_window_pill(handle, pill)
     }
 
     fn reflow_toolbar_tabs(&self, handle: &toolbar::ToolbarHandle) {
@@ -1055,12 +1175,16 @@ impl AppRt for AppRtMacOS {
         Some(menu::confirm(title, body, proceed_label))
     }
 
+    fn confirm_owner(&self, title: &str, body: &str, proceed_label: &str) -> Option<bool> {
+        menu::confirm_owner(title, body, proceed_label)
+    }
+
     fn install_quit_confirm(&self) {
         // winit owns the `NSApplication` delegate, so the `applicationShouldTerminate:`
         // veto is registered through a small vendored-winit seam. The callback has no
         // access to `App`, so it defers onto the typed event loop; the main-thread App
         // then runs the same confirmation + document durability barrier as ⌘Q.
-        winit::platform::macos::set_application_should_terminate_handler(
+        aterm_window::platform::macos::set_application_should_terminate_handler(
             menu::defer_quit_for_terminate,
         );
     }
@@ -1094,7 +1218,7 @@ impl AppRt for AppRtMacOS {
 }
 
 /// Map aterm's config [`WindowTheme`] onto the winit window-theme override
-/// [`winit::window::Theme`] applied via [`Window::set_theme`]:
+/// [`aterm_window::window::Theme`] applied via [`Window::set_theme`]:
 /// * `Auto`  → `None` — clear the override. On X11 winit defaults the
 ///   `_GTK_THEME_VARIANT` hint to dark; on Wayland the fork only stores the value
 ///   (it draws no frame since LW.5: a window the compositor leaves undecorated
@@ -1112,28 +1236,30 @@ impl AppRt for AppRtMacOS {
 /// to `set_theme`.
 #[cfg(not(target_os = "macos"))]
 #[must_use]
-pub(crate) fn window_theme_to_winit(theme: WindowTheme) -> Option<winit::window::Theme> {
+pub(crate) fn window_theme_to_winit(theme: WindowTheme) -> Option<aterm_window::window::Theme> {
     match theme {
         WindowTheme::Auto => None,
-        WindowTheme::Light => Some(winit::window::Theme::Light),
-        WindowTheme::Dark => Some(winit::window::Theme::Dark),
+        WindowTheme::Light => Some(aterm_window::window::Theme::Light),
+        WindowTheme::Dark => Some(aterm_window::window::Theme::Dark),
     }
 }
 
 /// Proof that this process launched WINDOWED: its event loop is AppKit's, whose
-/// `+[NSApplication sharedApplication]` already exists, so sending it again
-/// creates nothing.
+/// `+[NSApplication sharedApplication]` exists once the loop is built, so
+/// sending it from the loop creates nothing.
 ///
 /// A headless process must never send it: the send CREATES the application
 /// object, and its `-init` checks the process in with LaunchServices and opens
 /// a WindowServer connection (`app_menu_bar`'s module doc). So every function
-/// that sends it takes this proof first — the menu bar reader as an argument,
-/// the rest from [`Windowed::get`] — and answers its headless value without
-/// one.
+/// that sends it takes this proof first — the menu bar reader and the pre-dial
+/// check-in seam as an argument, the rest from [`Windowed::get`] — and answers
+/// its headless value without one.
 ///
-/// Minted only by [`Windowed::launch`], at the two windowed launches:
-/// `main_entry`'s AppKit loop branch and the `objc_toolbar_drive` example's
-/// driver, a windowed process of its own. A unit-test build mints none.
+/// Minted only by [`Windowed::launch`], at the windowed launches: `main_entry`
+/// before its handoff intake (the one send before the loop is built, the
+/// development pre-dial check-in, creates the application object on purpose
+/// and dies), and the toolbar and devtools-helper drives, windowed processes of
+/// their own. A unit-test build mints none.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Windowed(());
@@ -1170,8 +1296,10 @@ impl Windowed {
 /// banned tree-wide (the aterm-census guard `input-probe`) — the first cut of
 /// this hook reached for it and the guard caught it.
 #[cfg(target_os = "macos")]
-pub(crate) fn cached_modifiers(window: &winit::window::Window) -> winit::keyboard::ModifiersState {
-    use winit::platform::macos::WindowExtMacOS as _;
+pub(crate) fn cached_modifiers(
+    window: &aterm_window::window::Window,
+) -> aterm_window::keyboard::ModifiersState {
+    use aterm_window::platform::macos::WindowExtMacOS as _;
     window.cached_modifiers()
 }
 
@@ -1182,8 +1310,8 @@ pub(crate) fn cached_modifiers(window: &winit::window::Window) -> winit::keyboar
 /// ESC; neither key otherwise, so Option types what the layout composes.
 #[cfg(target_os = "macos")]
 #[must_use]
-pub(crate) fn option_as_alt_for(alt: bool) -> winit::platform::macos::OptionAsAlt {
-    use winit::platform::macos::OptionAsAlt;
+pub(crate) fn option_as_alt_for(alt: bool) -> aterm_window::platform::macos::OptionAsAlt {
+    use aterm_window::platform::macos::OptionAsAlt;
     if alt {
         OptionAsAlt::Both
     } else {
@@ -1195,10 +1323,10 @@ pub(crate) fn option_as_alt_for(alt: bool) -> winit::platform::macos::OptionAsAl
 /// written by `App::sync_option_as_alt` and at the window's creation. No-op off macOS (no
 /// other backend composes on Alt: X11 and Wayland report AltGr as a level, not as Alt, and
 /// the Windows backend encodes the composed key itself).
-pub(crate) fn set_option_as_alt(window: &winit::window::Window, alt: bool) {
+pub(crate) fn set_option_as_alt(window: &aterm_window::window::Window, alt: bool) {
     #[cfg(target_os = "macos")]
     {
-        use winit::platform::macos::WindowExtMacOS as _;
+        use aterm_window::platform::macos::WindowExtMacOS as _;
         window.set_option_as_alt(option_as_alt_for(alt));
     }
     #[cfg(not(target_os = "macos"))]
@@ -1224,7 +1352,7 @@ mod option_as_alt_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn an_alt_window_is_both_option_keys_and_a_composing_one_neither() {
-        use winit::platform::macos::OptionAsAlt;
+        use aterm_window::platform::macos::OptionAsAlt;
         assert_eq!(super::option_as_alt_for(true), OptionAsAlt::Both);
         assert_eq!(super::option_as_alt_for(false), OptionAsAlt::None);
     }
@@ -1249,9 +1377,37 @@ mod option_as_alt_tests {
 /// which is exactly today's behaviour.
 #[cfg(target_os = "macos")]
 pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
-    use aterm_objc::{class, sel};
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicPtr, Ordering};
+
+    use aterm_objc::{Id, class, sel};
 
     use crate::appkit::{self, MainThread};
+
+    static NS_APPLICATION_CLASS: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static NS_PROCESS_INFO_CLASS: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+    #[inline]
+    fn ns_application_class() -> Id {
+        let cached = NS_APPLICATION_CLASS.load(Ordering::Relaxed);
+        if !cached.is_null() {
+            return Id::from_ptr(cached);
+        }
+        let cls = class(c"NSApplication").as_id();
+        NS_APPLICATION_CLASS.store(cls.cast(), Ordering::Relaxed);
+        cls
+    }
+
+    #[inline]
+    fn ns_process_info_class() -> Id {
+        let cached = NS_PROCESS_INFO_CLASS.load(Ordering::Relaxed);
+        if !cached.is_null() {
+            return Id::from_ptr(cached);
+        }
+        let cls = class(c"NSProcessInfo").as_id();
+        NS_PROCESS_INFO_CLASS.store(cls.cast(), Ordering::Relaxed);
+        cls
+    }
 
     // A headless process has no event queue to age, and no application object
     // to ask: the send below would create one.
@@ -1263,7 +1419,7 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
     // `-systemUptime` are `-(NSTimeInterval)`, i.e. `double`, side-effect-free
     // scalar reads; `+processInfo` is `-(id)`, another immortal singleton.
     let (ts, uptime) = unsafe {
-        let app = appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
+        let app = appkit::send_id(ns_application_class(), sel!(sharedApplication));
         if app.is_null() {
             return None;
         }
@@ -1271,7 +1427,7 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
         if ev.is_null() {
             return None;
         }
-        let info = appkit::send_id(class(c"NSProcessInfo").as_id(), sel!(processInfo));
+        let info = appkit::send_id(ns_process_info_class(), sel!(processInfo));
         if info.is_null() {
             return None;
         }
@@ -1323,6 +1479,43 @@ pub(crate) fn appkit_window_number(window: &Window) -> i64 {
 #[must_use]
 pub(crate) fn appkit_window_number(_window: &Window) -> i64 {
     0
+}
+
+/// Whether this window is the key window of the active application: where a key
+/// press goes, and the only window whose keys the input method composes (an
+/// Option dead key starts no composition in an inactive app, measured on macOS 27,
+/// `docs/measured/desk-appkit-2026-10-19.md`). `hwkey` reports it, so a caller
+/// knows whether its keys were pressed where a person's would land.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub(crate) fn appkit_window_is_key_in_active_app(window: &Window) -> bool {
+    // A headless process has no application object to ask, and must not create one.
+    let Some(_windowed) = Windowed::get() else {
+        return false;
+    };
+    let ns_window = ns_window_of(window);
+    if ns_window.is_null() {
+        return false;
+    }
+    // SAFETY: `+sharedApplication` is `@16#0:8` (the windowed launch created it
+    // before any window existed); `-isActive` and `-isKeyWindow` are `B16@0:8`
+    // plain getters on live receivers. Main thread, as the caller's wake runs.
+    unsafe {
+        let app = crate::appkit::send_id(
+            aterm_objc::class(c"NSApplication").as_id(),
+            aterm_objc::sel!(sharedApplication),
+        );
+        !app.is_null()
+            && crate::appkit::send_bool(app, aterm_objc::sel!(isActive))
+            && crate::appkit::send_bool(ns_window, aterm_objc::sel!(isKeyWindow))
+    }
+}
+
+/// Non-macOS peer: no AppKit, no key window to report.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub(crate) fn appkit_window_is_key_in_active_app(_window: &Window) -> bool {
+    false
 }
 
 /// Whether a hardware-input event occurred inside `within`.
@@ -1600,7 +1793,7 @@ mod user_input_probe_tests {
 #[cfg(target_os = "linux")]
 pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
     static MAX_AGE_MS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let server_ms = winit::platform::x11::key_event_server_time()?;
+    let server_ms = aterm_window::platform::x11::key_event_server_time()?;
     let mut now = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -1806,7 +1999,7 @@ mod x_server_event_age_tests {
 /// itself; that one line is `event_processor.rs`'s only use of the helper.
 #[cfg(all(test, target_os = "linux"))]
 mod x11_key_stamp_seam_tests {
-    use winit::platform::x11::{dispatch_with_key_event_server_time, key_event_server_time};
+    use aterm_window::platform::x11::{dispatch_with_key_event_server_time, key_event_server_time};
 
     use super::current_event_queue_age_ns;
 
@@ -1872,7 +2065,7 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
 
 /// Linux/BSD application-runtime using the **pure-winit** surface (NO new system
 /// libraries — see [`AppRt::window_set_background_color`] and `toolbar.rs` for the
-/// deferred GTK4 work): the appearance method drives `winit::Window::set_theme` so
+/// deferred GTK4 work): the appearance method drives `aterm_window::Window::set_theme` so
 /// the client-side-decoration light/dark variant honours config `window_theme`; the
 /// toolbar seam maintains a REAL in-memory tab-chrome model (`toolbar.rs`) and seeds
 /// the window title from it; the menu install delegates to the menu stub; and
@@ -1897,7 +2090,7 @@ impl AppRt for AppRtLinux {
     fn window_set_background_color(&self, _window: &Window, _bg: u32) {}
 
     /// Apply the window-chrome appearance by overriding winit's window theme: map
-    /// config [`WindowTheme`] → [`winit::window::Theme`] via [`window_theme_to_winit`]
+    /// config [`WindowTheme`] → [`aterm_window::window::Theme`] via [`window_theme_to_winit`]
     /// and hand it to [`Window::set_theme`]. On Wayland this themes the client-side
     /// decorations (titlebar/border); on X11 it sets the `_GTK_THEME_VARIANT` hint.
     /// `Auto` resets to the OS preference. This is the real, buildable Linux analogue
@@ -1971,8 +2164,9 @@ impl AppRt for AppRtLinux {
         suppress: Arc<Mutex<HashSet<u64>>>,
         silent: Arc<AtomicBool>,
         own_alerts: Arc<AtomicBool>,
+        center: crate::notice_center::NoticeCenter,
     ) -> SyncSender<NotifyMsg> {
-        crate::notify::spawn_delivery(suppress, silent, own_alerts)
+        crate::notify::spawn_delivery(suppress, silent, own_alerts, center)
     }
 
     // The branches below delegate to the `menu::`/`toolbar::` modules — the menu is
@@ -2001,8 +2195,9 @@ impl AppRt for AppRtLinux {
             tooltips,
             ext,
             active,
+            pill,
         } = tabs;
-        toolbar::set_window_tabs(handle, titles, ids, metadata, tooltips, ext, active);
+        toolbar::set_window_tabs(handle, titles, ids, metadata, tooltips, ext, active, pill);
     }
 
     fn read_toolbar_chrome(&self, handle: &toolbar::ToolbarHandle) -> Option<String> {
@@ -2069,6 +2264,24 @@ pub(crate) fn platform_apprt() -> PlatformAppRt {
             probe_preferences: !cfg!(test),
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The URLs [`AppRt::open_url`] was asked to open on this thread
+    /// (test-only): a test build opens none.
+    static OPENED_URLS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The URLs this thread's [`AppRt::open_url`] calls named, drained
+/// (test-only).
+#[cfg(test)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(dead_code, reason = "the menu-bar status item is macOS's")
+)]
+pub(crate) fn take_opened_urls() -> Vec<String> {
+    OPENED_URLS.with(|urls| std::mem::take(&mut *urls.borrow_mut()))
 }
 
 /// The runtime handed to a headless test or benchmark fixture. Its native
@@ -2419,7 +2632,7 @@ mod linux_reduce_motion_tests {
 #[cfg(target_os = "macos")]
 mod reduce_motion {
     use aterm_objc::{class, sel};
-    use winit::event_loop::EventLoopProxy;
+    use aterm_window::event_loop::EventLoopProxy;
 
     use crate::Wake;
     use crate::appkit::{self, MainThread};
@@ -2436,10 +2649,15 @@ mod reduce_motion {
     /// WORKSPACE centre.
     pub(crate) const DID_WAKE_NOTIFICATION: &str = "NSWorkspaceDidWakeNotification";
 
+    /// The system colours changed (the accent colour among them). Posted on
+    /// the DEFAULT notification centre: the selected tab's automatic pill
+    /// colour moves with it, and Settings names that colour.
+    pub(crate) const SYSTEM_COLORS_NOTIFICATION: &str = "NSSystemColorsDidChangeNotification";
+
     /// The observer target's ivars.
     ///
     /// A boxed relay rather than the `EventLoopProxy<Wake>` itself: a proxy can
-    /// only be minted from a live `winit::EventLoop`, which on macOS must be
+    /// only be minted from a live `aterm_window::EventLoop`, which on macOS must be
     /// built on the main thread and only once per process, so a class whose
     /// ivar IS the proxy cannot be driven from a test at all. Production still
     /// posts exactly `Wake::ReduceMotionChanged` and nothing else — see
@@ -2451,6 +2669,10 @@ mod reduce_motion {
         /// checker (`aterm_update::note_system_woke`), off the event loop — the post
         /// only notifies a condition variable.
         woke: Box<dyn Fn()>,
+        /// Called on each [`SYSTEM_COLORS_NOTIFICATION`]: production posts
+        /// `Wake::SystemColorsChanged`, so every window repaints the colours
+        /// it reads off the system.
+        colors: Box<dyn Fn()>,
     }
 
     aterm_objc::declare_class! {
@@ -2480,6 +2702,12 @@ mod reduce_motion {
             fn system_did_wake(&self, _note: aterm_objc::Id) {
                 (self.ivars().woke)();
             }
+
+            /// The system colours changed (the accent among them).
+            @sel(systemColorsDidChange:)
+            fn system_colors_did_change(&self, _note: aterm_objc::Id) {
+                (self.ivars().colors)();
+            }
         }
     }
 
@@ -2489,8 +2717,33 @@ mod reduce_motion {
         mtm: aterm_objc::MainThread,
         relay: Box<dyn Fn()>,
         woke: Box<dyn Fn()>,
+        colors: Box<dyn Fn()>,
     ) -> Option<aterm_objc::Retained<ReduceMotionTarget>> {
-        ReduceMotionTarget::alloc_init(mtm, ReduceMotionIvars { relay, woke })
+        ReduceMotionTarget::alloc_init(
+            mtm,
+            ReduceMotionIvars {
+                relay,
+                woke,
+                colors,
+            },
+        )
+    }
+
+    /// `[NSNotificationCenter defaultCenter]`, where AppKit posts
+    /// [`SYSTEM_COLORS_NOTIFICATION`].
+    fn default_center() -> aterm_objc::Id {
+        // SAFETY: `+defaultCenter` is `-(id)`, the standard immortal singleton
+        // accessor, only borrowed here.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(
+                aterm_objc::ClassPtr,
+                aterm_objc::Sel,
+            ) -> aterm_objc::Id = aterm_objc::checked_msg();
+            f(
+                aterm_objc::class(c"NSNotificationCenter"),
+                aterm_objc::sel!(defaultCenter),
+            )
+        }
     }
 
     /// `[[NSWorkspace sharedWorkspace] notificationCenter]`, or null.
@@ -2568,6 +2821,35 @@ mod reduce_motion {
                     );
                 }
             }
+            // The system colours (the accent among them) change on the
+            // default centre, not the workspace's.
+            let center = default_center();
+            if let (false, Some(name)) = (
+                center.is_null(),
+                aterm_objc::ns_string(SYSTEM_COLORS_NOTIFICATION),
+            ) {
+                // SAFETY: as above: `-addObserver:selector:name:object:` on the
+                // live default centre, the kept `target`, a selector this class
+                // declares, a live +1 NSString, and a nil sender.
+                unsafe {
+                    let add: unsafe extern "C-unwind" fn(
+                        aterm_objc::Id,
+                        aterm_objc::Sel,
+                        aterm_objc::Id,
+                        aterm_objc::Sel,
+                        aterm_objc::Id,
+                        aterm_objc::Id,
+                    ) = aterm_objc::checked_msg();
+                    add(
+                        center,
+                        aterm_objc::sel!(addObserver:selector:name:object:),
+                        target.as_id(),
+                        aterm_objc::sel!(systemColorsDidChange:),
+                        name.id(),
+                        aterm_objc::Id::NIL,
+                    );
+                }
+            }
             true
         })
     }
@@ -2616,6 +2898,7 @@ mod reduce_motion {
         proxy: &EventLoopProxy<Wake>,
     ) -> Option<aterm_objc::Retained<ReduceMotionTarget>> {
         let main_thread = MainThread::new()?;
+        let colors = proxy.clone();
         let proxy = proxy.clone();
         let target = new_target(
             main_thread,
@@ -2625,6 +2908,9 @@ mod reduce_motion {
                 let _ = proxy.send_event(Wake::ReduceMotionChanged);
             }),
             Box::new(aterm_update::note_system_woke),
+            Box::new(move || {
+                let _ = colors.send_event(Wake::SystemColorsChanged);
+            }),
         )?;
         if register(&target) {
             Some(target)
@@ -2647,20 +2933,47 @@ mod reduce_motion {
         /// this (the observer lives for the process), but a test must, or the
         /// centre keeps a weak reference to freed memory.
         fn unregister(target: &aterm_objc::Retained<ReduceMotionTarget>) {
-            let center = super::workspace_center();
-            if center.is_null() {
-                return;
+            for center in [super::workspace_center(), super::default_center()] {
+                if center.is_null() {
+                    continue;
+                }
+                // SAFETY: `-removeObserver:` is `-(void)(id)`; `center` is a
+                // live centre and `target` a live observer registered on it.
+                unsafe {
+                    let f: unsafe extern "C-unwind" fn(
+                        aterm_objc::Id,
+                        aterm_objc::Sel,
+                        aterm_objc::Id,
+                    ) = aterm_objc::checked_msg();
+                    f(center, aterm_objc::sel!(removeObserver:), target.as_id());
+                }
             }
-            // SAFETY: `-removeObserver:` is `-(void)(id)`; `center` is the live
-            // workspace centre and `target` a live observer registered on it.
-            unsafe {
-                let f: unsafe extern "C-unwind" fn(
-                    aterm_objc::Id,
-                    aterm_objc::Sel,
-                    aterm_objc::Id,
-                ) = aterm_objc::checked_msg();
-                f(center, aterm_objc::sel!(removeObserver:), target.as_id());
-            }
+        }
+
+        /// Post `notification` on the REAL default centre.
+        fn post_default(notification: &str) {
+            aterm_objc::autoreleasepool(|_| {
+                let center = super::default_center();
+                assert!(!center.is_null(), "no default notification centre");
+                let name = aterm_objc::ns_string(notification).expect("NSString");
+                // SAFETY: `-postNotificationName:object:` is `-(void)(id, id)`;
+                // `center` is live, `name` a live +1 NSString, nil sender is
+                // legal.
+                unsafe {
+                    let f: unsafe extern "C-unwind" fn(
+                        aterm_objc::Id,
+                        aterm_objc::Sel,
+                        aterm_objc::Id,
+                        aterm_objc::Id,
+                    ) = aterm_objc::checked_msg();
+                    f(
+                        center,
+                        aterm_objc::sel!(postNotificationName:object:),
+                        name.id(),
+                        aterm_objc::Id::NIL,
+                    );
+                }
+            });
         }
 
         /// Post the REAL display-options notification on the REAL workspace centre.
@@ -2706,6 +3019,8 @@ mod reduce_motion {
             let seen = Arc::clone(&hits);
             let wakes = Arc::new(AtomicUsize::new(0));
             let woke = Arc::clone(&wakes);
+            let recolors = Arc::new(AtomicUsize::new(0));
+            let recolored = Arc::clone(&recolors);
             let target = new_target(
                 crate::appkit::test_witness(),
                 Box::new(move || {
@@ -2713,6 +3028,9 @@ mod reduce_motion {
                 }),
                 Box::new(move || {
                     woke.fetch_add(1, Ordering::SeqCst);
+                }),
+                Box::new(move || {
+                    recolored.fetch_add(1, Ordering::SeqCst);
                 }),
             )
             .expect("+alloc/-init produced a ReduceMotionTarget");
@@ -2759,10 +3077,20 @@ mod reduce_motion {
             post();
             // The wake reaches the wake relay, and only it.
             post_named(DID_WAKE_NOTIFICATION);
+            // The system colours (the accent) reach the colours relay, from
+            // the default centre.
+            post_default(super::SYSTEM_COLORS_NOTIFICATION);
             unregister(&target);
             // Removed: a further post must NOT reach it.
             post();
             post_named(DID_WAKE_NOTIFICATION);
+            post_default(super::SYSTEM_COLORS_NOTIFICATION);
+            assert_eq!(
+                recolors.load(Ordering::SeqCst),
+                1,
+                "NSSystemColorsDidChangeNotification did not reach the colours relay \
+                 exactly once"
+            );
 
             assert_eq!(
                 hits.load(Ordering::SeqCst),
@@ -2797,6 +3125,7 @@ mod reduce_motion {
                     let _ = &spy;
                 }),
                 Box::new(|| {}),
+                Box::new(|| {}),
             )
             .expect("target");
             assert_eq!(drops.load(Ordering::SeqCst), 0);
@@ -2820,7 +3149,7 @@ mod layer_colorspace {
     use std::ffi::c_void;
 
     use aterm_objc::{Id, Sel, class, sel};
-    use winit::window::Window;
+    use aterm_window::window::Window;
 
     use super::ns_view_of;
     use crate::appkit;
@@ -3074,7 +3403,7 @@ mod layer_colorspace {
 #[cfg(target_os = "macos")]
 mod vibrancy {
     use aterm_objc::{Id, Sel, class, sel};
-    use winit::window::Window;
+    use aterm_window::window::Window;
 
     use super::{layer_colorspace, ns_window_of};
     use crate::app_config::BackgroundMaterial;

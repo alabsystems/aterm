@@ -248,7 +248,7 @@ impl Durability {
 
     /// The tier `requested` names in astream's terms (the `Hello` block's
     /// tag 0x01), as aterm says it: what a broker this host cannot read the
-    /// argv of (a joined host's, a hand-run one in a sandbox) asked for.
+    /// argv of (a hand-run one in a sandbox) asked for.
     #[must_use]
     pub fn of_tier(requested: astream_broker::Tier) -> Option<Self> {
         match requested {
@@ -996,7 +996,8 @@ mod tests {
 
     /// A BROKER THAT SERVES ORDERED IS NEVER TOLD AS STRICT. A later build's
     /// broker reports ordered in its `Hello`: asked ordered (a named job, or a
-    /// joined host's broker, whose requested tier is the one asked), or asked
+    /// broker whose argv this host cannot read, whose requested tier is the
+    /// one asked), or asked
     /// what this build reads a bare argv as (strict) while that build's own
     /// default is ordered. Either way the line says ordered's words with the
     /// broker's own horizon and escalation count — never strict's "loses nothing

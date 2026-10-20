@@ -70,6 +70,30 @@ pub enum Family {
     /// explicit `allow_palette_reconfigure = false`. One line for every tab, since the
     /// setting is one; raised by event at a session's first refusal.
     Terminal,
+    /// Settings a removed feature left behind, where another feature now does
+    /// its work (`removed.<feature>.<cause>`): raised by a config load that
+    /// finds them and cleared by one that does not, by event. Its own prefix,
+    /// apart from the config band's (`config.`), which a clean reload resolves.
+    Removed,
+    /// The tabs whose agent cannot reach its API (`harness.api-outage.<cause>`):
+    /// one fact for every tab the network keeps from it, never one per tab
+    /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §2.2). A level family: the
+    /// need publication states its whole answer whenever a tab's verdict
+    /// enters or leaves the wait, so the outage ending sweeps it.
+    ApiOutage,
+    /// The tabs the person took over and has held for half an hour
+    /// (`harness.long-hold.<tab>.taken-over`): one entry per tab, since the
+    /// one act — Hand Back — is per tab. A level family: the window states its
+    /// whole answer whenever a person hold moves and at every look, so a Hand
+    /// Back sweeps its entry (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4).
+    LongHold,
+    /// The fleet this Mac cannot read (`fleet.unreadable.<cause>`): every
+    /// peer refused at once with no route, which on a Mac is local-network
+    /// privacy until the person allows aterm
+    /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §3, S10). A level family:
+    /// the fleet glance states its whole answer at every read, so a read that
+    /// reaches a peer again sweeps it.
+    FleetUnreadable,
 }
 
 impl Family {
@@ -90,6 +114,10 @@ impl Family {
             Self::Disk => "disk",
             Self::Render => "render",
             Self::Terminal => "terminal",
+            Self::Removed => "removed",
+            Self::ApiOutage => "harness.api-outage",
+            Self::LongHold => "harness.long-hold",
+            Self::FleetUnreadable => "fleet.unreadable",
         }
     }
 
@@ -107,7 +135,12 @@ impl Family {
     #[must_use]
     pub const fn mode(self) -> Mode {
         match self {
-            Self::Upgrade | Self::Resume | Self::Ai => Mode::Level,
+            Self::Upgrade
+            | Self::Resume
+            | Self::Ai
+            | Self::ApiOutage
+            | Self::LongHold
+            | Self::FleetUnreadable => Mode::Level,
             Self::Privacy
             | Self::Update
             | Self::UpgradeHost
@@ -116,12 +149,13 @@ impl Family {
             | Self::Toolchain
             | Self::Disk
             | Self::Render
-            | Self::Terminal => Mode::Event,
+            | Self::Terminal
+            | Self::Removed => Mode::Event,
         }
     }
 
     /// Every family, in digest order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 16] = [
         Self::Privacy,
         Self::Update,
         Self::Upgrade,
@@ -134,6 +168,10 @@ impl Family {
         Self::Disk,
         Self::Render,
         Self::Terminal,
+        Self::Removed,
+        Self::ApiOutage,
+        Self::LongHold,
+        Self::FleetUnreadable,
     ];
 
     /// The message tag the family's entries carry.
@@ -147,11 +185,13 @@ impl Family {
             | Self::Resume
             | Self::Supervisor
             | Self::Accounts
-            | Self::Ai => tags::HARNESS,
+            | Self::Ai
+            | Self::ApiOutage
+            | Self::LongHold => tags::HARNESS,
             Self::Toolchain => tags::TOOLCHAIN,
-            Self::Disk => tags::SYSTEM,
+            Self::Disk | Self::FleetUnreadable => tags::SYSTEM,
             Self::Render => tags::RENDER,
-            Self::Terminal => tags::CONFIG,
+            Self::Terminal | Self::Removed => tags::CONFIG,
         }
     }
 }
@@ -192,6 +232,7 @@ pub struct Entry {
     resurface: Resurface,
     more: Vec<String>,
     log_line: Option<String>,
+    at_once: bool,
 }
 
 impl Entry {
@@ -222,6 +263,7 @@ impl Entry {
             resurface: Resurface::WAIT,
             more: Vec::new(),
             log_line: None,
+            at_once: false,
         }
     }
 
@@ -269,6 +311,15 @@ impl Entry {
         self
     }
 
+    /// Its words move only when its fact does (a count of the tabs it holds,
+    /// stated as they join and leave), so each restatement is shown at once
+    /// ([`LaterAsk::restated_at_once`]).
+    #[must_use]
+    pub fn restated_at_once(mut self) -> Self {
+        self.at_once = true;
+        self
+    }
+
     /// The `aterm.log` line, if the reporter gave one.
     #[must_use]
     pub fn log_line_text(&self) -> Option<&str> {
@@ -307,12 +358,15 @@ impl Entry {
         if self.nav.as_ref().is_some_and(Intent::is_snooze) {
             return Err(EntryFault::Decline);
         }
-        let ask = LaterAsk::person(
+        let mut ask = LaterAsk::person(
             self.why.clone(),
             self.then.clone(),
             Fingerprint::new(self.family.stem(), &self.subject, &self.cause),
             self.resurface,
         );
+        if self.at_once {
+            ask = ask.restated_at_once();
+        }
         if let Some(fault) = ask.fault() {
             return Err(EntryFault::Ask(fault));
         }

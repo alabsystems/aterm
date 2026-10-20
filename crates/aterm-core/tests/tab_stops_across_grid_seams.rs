@@ -68,6 +68,18 @@ fn tbc3_survives_the_alt_screen_switch_and_a_widen_under_it() {
         tab_from_home(&mut control),
         "HT must land where the control lands"
     );
+
+    // Shared the other way too: a clear the program issues on the alternate
+    // screen holds on the main screen after 1049l, through a widen there.
+    let mut t = Terminal::new(24, 80);
+    t.process(b"\x1b[?1049h\x1b[3g\x1b[?1049l");
+    assert_eq!(stops(&t), Vec::<usize>::new(), "1049l kept the alt's clear");
+    t.resize(24, 120);
+    assert_eq!(
+        stops(&t),
+        Vec::<usize>::new(),
+        "1049l dropped the alt's suppression"
+    );
 }
 
 #[test]

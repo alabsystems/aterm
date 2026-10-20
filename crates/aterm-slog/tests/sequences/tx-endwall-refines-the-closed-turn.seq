@@ -1,0 +1,15 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# §2.6 row 3: the vendor turn mapped to a turn the screen closed done ended
+# on the vendor's own notice: the outcome is refined to the wall at exact.
+# NEGATIVE CONTROL: an open turn's is not.
+bind 0
+see busy
+tx prompt v1
+tx endwall usage-weekly
+expect turn=open
+see idle
+wait 1000
+expect close t1 turn out=done src=screen
+tx endwall usage-weekly
+expect amend t1 turn vref=v1
+expect amend t1 turn out=wall:usage-weekly by=vendor conf=exact

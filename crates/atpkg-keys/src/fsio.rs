@@ -329,14 +329,17 @@ mod tests {
         crate::testdir::dir(&format!("atpkg-keys-fsio-{name}-"))
     }
 
-    /// The ordinary case: the file is replaced, and no temporary is left beside it.
+    /// The ordinary case: the file is replaced, and no temporary is left beside it. Both
+    /// the staged bytes and the renamed entry are made durable.
     #[test]
     fn an_atomic_write_replaces_the_file_and_leaves_nothing_behind() {
         let dir = scratch("replace");
         let path = dir.join("pins.rs").to_str().unwrap().to_string();
         std::fs::write(&path, b"old").unwrap();
 
+        let recording = aterm_durable::seam::Recording::start();
         write_bytes_atomic(&path, b"new content").expect("the write succeeds");
+        assert_eq!(recording.take(), [aterm_durable::Flush::Durable; 2]);
         assert_eq!(std::fs::read(&path).unwrap(), b"new content");
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
@@ -385,6 +388,34 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(leftovers, vec!["pins.rs".to_string()], "no litter");
+
+        // The other failure exit: staging lands, the RENAME fails (a directory squats on
+        // the target), and the staged temporary is removed with it.
+        let squatted = dir.join("roster.toml");
+        std::fs::create_dir(&squatted).unwrap();
+        assert!(write_bytes_atomic(squatted.to_str().unwrap(), b"body").is_err());
+        let mut leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        leftovers.sort();
+        assert_eq!(leftovers, ["pins.rs", "roster.toml"], "no litter");
+    }
+
+    /// A read is bounded at the cap, not one byte short of it, and refuses a file that is
+    /// not regular before reading a byte.
+    #[test]
+    fn a_read_is_bounded_at_its_cap_and_refuses_non_regular_files() {
+        let dir = scratch("read-cap");
+        let path = dir.join("doc").to_str().unwrap().to_string();
+        std::fs::write(&path, b"12345678").unwrap();
+        assert_eq!(read_bytes_up_to(&path, 8).unwrap(), b"12345678");
+        std::fs::write(&path, b"123456789").unwrap();
+        assert_eq!(
+            read_bytes_up_to(&path, 8).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(read_bytes(dir.to_str().unwrap()).is_err(), "a directory");
     }
 
     /// A TEMPORARY LEFT BY A DEAD PROCESS NEVER WEDGES THE NEXT WRITE.
@@ -415,7 +446,11 @@ mod tests {
         let dir = scratch("owner-create-new");
         let path = dir.join("machine.toml").to_str().unwrap().to_string();
 
+        // Durable throughout: the inode before its name, the name before the temp goes,
+        // and the directory after.
+        let recording = aterm_durable::seam::Recording::start();
         write_owner_file_create_new(&path, b"first").unwrap();
+        assert_eq!(recording.take(), [aterm_durable::Flush::Durable; 3]);
         assert_eq!(std::fs::read(&path).unwrap(), b"first");
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -446,10 +481,16 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(!dir.join("home/.aterm").exists());
+        // Each directory it CREATES is made durable, and nothing else is flushed.
+        let recording = aterm_durable::seam::Recording::start();
         ensure_parent_dir(&key).expect("creates the chain");
         assert!(dir.join("home/.aterm").is_dir());
+        assert_eq!(recording.take(), [aterm_durable::Flush::Durable; 2]);
         ensure_parent_dir(&key).expect("a second call is a no-op");
-        // A bare filename has no parent to create, and that is not an error.
+        assert_eq!(recording.take(), []);
+        // A bare filename has no parent to create, and that is not an error; its
+        // directory entry lives in the current directory, which is what gets flushed.
         ensure_parent_dir("machine.key").expect("no parent, no problem");
+        sync_parent("machine.key").expect("a bare name syncs the current directory");
     }
 }

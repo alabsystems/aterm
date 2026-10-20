@@ -2,10 +2,20 @@
 // Copyright 2026 Andrew Yates
 
 //! USAGE CREDITS, AND THE VENDOR'S OWN WORD THAT A WINDOW IS FILLING: what
-//! Claude Code says of the account's usage beside the composer, read FOR THE
-//! RECORD. Neither is a wall and neither decides a turn's end: with credits
-//! on, a turn that crosses a window's limit goes on, paid for, and the screen
-//! says only `Now using usage credits` (lab E4; the accounts design §3.3).
+//! Claude Code says of the account's usage beside the composer, read for the
+//! record. Neither is a wall: with credits on, a turn that crosses a window's
+//! limit goes on, paid for, and the screen says only `Now using usage
+//! credits` (lab E4; the accounts design §3.3). The first is what the
+//! supervisor's credits hold reads (aterm-agent's `turn_end::credits_hold`):
+//! under `[harness] usage_credits = false`, the default since the owner's
+//! ruling of 2026-10-19, the supervisor types nothing of its own while credits
+//! carry the session, but one probe turn past the reset their notice named
+//! (or at the hold's bound, where none is named). A MODEL Claude Code bills per request with no dialog —
+//! a credits-only model whose consent it stored, or on a tier an admin bills
+//! — draws no footer item: only `<M> is drawing from usage credits`, once a
+//! process, or `<M> is now using usage credits instead of your plan limits`
+//! (READ in the 2.1.301 to 2.1.304 bundles, never captured), read here with
+//! the model they name ([`Credits::model`]).
 //!
 //! Measured on 2.1.300 in the real-Claude lab (`targo --unverified lab`,
 //! crates/aterm-lab; the stub answering every request with the five-hour
@@ -75,9 +85,20 @@ pub struct Credits {
     /// names, if any, and its reset as printed; `None` for the lasting `Now
     /// using usage credits`, which names neither.
     pub started: Option<Started>,
+    /// The MODEL whose requests they carry, as the notice names it (`Fable
+    /// 5.1`, `Opus`): its per-model forms — `Now using usage credits for
+    /// Opus` with or without its `· Your Opus limit resets 4pm`, `Fable 5.1
+    /// is drawing from usage credits`, `Fable 5.1 is now using usage credits
+    /// instead of your plan limits`. `None`: the account's window, or no
+    /// model named.
+    pub model: Option<String>,
 }
 
-/// The window credits started past, as their first notice names it.
+/// The window credits started past, as their first notice names it: the
+/// session or the weekly window, or none of the two where the notice names a
+/// MODEL's (`Now using usage credits for Opus · Your Opus limit resets 4pm`,
+/// the same notification's per-model form, READ in the 2.1.304 bundle:
+/// `wbo`), its reset that model's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Started {
     pub window: Option<Window>,
@@ -95,27 +116,92 @@ pub struct Warning {
 }
 
 /// Whether usage credits carry the session, by Claude Code's own notice
-/// (module docs): the lasting `Now using usage credits` (`Now using usage
-/// credits for Opus · …` too), `Now using your usage allocation`, or the
-/// notice they started on — which wins where both show, for the window it
-/// names. `None` with no such notice, and with no composer frame (a box, a
-/// shell).
+/// (module docs): the lasting `Now using usage credits`, `Now using your
+/// usage allocation`, `Extra usage is now covering your requests` (the end
+/// of lower-priority mode), or the notice they started on — which wins where
+/// both show, for the window it names. The notice's per-model form (`Now
+/// using usage credits for Opus · Your Opus limit resets 4pm`) is the one
+/// they started on, its window the model's ([`Started`]), and names its
+/// model ([`Credits::model`]); so do its bare head and the notices of a
+/// model billed per request with no dialog (`Fable 5.1 is drawing from usage
+/// credits`, `… is now using usage credits instead of your plan limits`:
+/// the segment's END, the model's name before it). `None` with no such
+/// notice, and with no composer frame (a box, a shell).
 #[must_use]
 pub fn in_use(rows: &[String]) -> Option<Credits> {
-    let mut lasting = false;
+    let mut found: Option<Credits> = None;
     for segment in segments(rows) {
         for id in ["credits.started", "credits.allocation_started"] {
             if let Some(rest) = segment.strip_prefix(crate::anchors::anchor(id)) {
                 return Some(Credits {
                     started: Some(started(rest)),
+                    model: None,
                 });
             }
         }
-        lasting |= ["credits.in_use", "credits.allocation"]
+        if let Some(rest) = segment
+            .strip_prefix(crate::anchors::anchor("credits.in_use"))
+            .and_then(|rest| rest.strip_prefix(" for "))
+        {
+            let (name, tail) = rest
+                .split_once(" \u{b7} ")
+                .map_or((rest, ""), |(name, tail)| (name, tail));
+            let model = model_name(name);
+            let begun = started(&format!(" \u{b7} {tail}"));
+            if begun.reset.is_some() {
+                return Some(Credits {
+                    started: Some(begun),
+                    model,
+                });
+            }
+            if model.is_some() {
+                found = Some(Credits {
+                    started: None,
+                    model,
+                });
+                continue;
+            }
+        }
+        if let Some(model) = ["credits.model_drawing", "credits.model_instead"]
             .iter()
-            .any(|id| segment.starts_with(crate::anchors::anchor(id)));
+            .find_map(|id| segment.strip_suffix(crate::anchors::anchor(id)))
+            .and_then(model_name)
+        {
+            found = Some(Credits {
+                started: None,
+                model: Some(model),
+            });
+            continue;
+        }
+        let lasting = [
+            "credits.in_use",
+            "credits.allocation",
+            "credits.extra_covering",
+        ]
+        .iter()
+        .any(|id| segment.starts_with(crate::anchors::anchor(id)));
+        if lasting && found.is_none() {
+            found = Some(Credits {
+                started: None,
+                model: None,
+            });
+        }
     }
-    lasting.then_some(Credits { started: None })
+    found
+}
+
+/// A model's name as a notice prints it before its words (`Fable 5.1`,
+/// `Opus`): a few words, no run of blanks, none of the notice's own
+/// separators. `None` for anything else.
+fn model_name(name: &str) -> Option<String> {
+    let name = name.trim();
+    let words = name.split(' ').count();
+    (!name.is_empty()
+        && words <= 4
+        && !name.contains("  ")
+        && !name.contains('\u{b7}')
+        && name.chars().next().is_some_and(char::is_alphanumeric))
+    .then(|| name.to_string())
 }
 
 /// What follows a started notice's words: ` · Your <limit> resets <time>`.

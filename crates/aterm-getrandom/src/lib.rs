@@ -14,10 +14,9 @@
 //! ```text
 //! ring 0.17.14     every native cell   src/rand.rs:165 getrandom::getrandom(dest),
 //!                                      the error mapped to Unspecified
-//! astream-aead     `sealed` builds     getrandom::getrandom, and an error's Display
 //! ```
 //!
-//! Neither calls [`getrandom_uninit`], names a feature, or registers a custom
+//! It calls no [`getrandom_uninit`], names no feature, and registers no custom
 //! backend.
 //!
 //! # The source, per platform, against upstream 0.2.17

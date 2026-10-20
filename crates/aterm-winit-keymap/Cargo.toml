@@ -39,7 +39,7 @@ description = "winit Key/NamedKey/PhysicalKey -> aterm engine keyboard types (K-
 aterm-types = { workspace = true }
 # The platform keyboard enums this maps FROM. A hard dependency here, and ONLY
 # here: this crate exists precisely so the edge is not optional anywhere else.
-winit = { workspace = true }
+aterm-window = { workspace = true }
 
 [lints]
 workspace = true

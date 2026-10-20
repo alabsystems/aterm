@@ -379,7 +379,6 @@ impl WebBand {
     pub(crate) fn compose(&mut self, dst: &mut RenderInput, at: BandFrame) -> usize {
         band_frame::compose_band(
             dst,
-            None,
             &self.rows,
             &self.rasters,
             self.committed(),
@@ -1376,7 +1375,7 @@ mod tests {
     #[test]
     fn the_pet_is_pressed_where_the_band_draws_it() {
         let (mut t, t0) = clocked(12, 60);
-        t.set_chrome(6, 0);
+        t.set_chrome(6, 0).expect("admitted geometry");
         // The caret three rows down, so a text row lies above the cat.
         t.process(b"\r\n\r\n\r\n$ ");
         assert!(wake_the_pet(&mut t), "the pet must reach the glass");
@@ -1430,7 +1429,7 @@ mod tests {
         let (mut twin, _) = clocked(12, 60);
         twin.band.reset_at(t0);
         for x in [&mut t, &mut twin] {
-            x.set_chrome(6, 0);
+            x.set_chrome(6, 0).expect("admitted geometry");
             let _ = x.notice_at("progress p pct=40 Downloading assets", t0, stamp());
             x.set_details_view_at(true, t0);
             let _ = x.messages_tick_at(t0 + ms(2100));

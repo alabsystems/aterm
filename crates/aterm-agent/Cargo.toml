@@ -13,7 +13,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "aterm L2 — agent interface: turn-completion (idle ∧ prompt-ready) and the self-reflection feedback governor, composed over the L0/L0.5 observation predicates"
+description = "aterm L2 — agent interface: the window harness's supervisor, its readings and the live upgrade, composed over the L0/L0.5 observation predicates"
 
 [lints]
 workspace = true
@@ -40,10 +40,12 @@ aterm-phase = { workspace = true }
 # The portable control-socket stream (std-only): `RelayClient`'s local-connect
 # constructors talk raw control protocol over a `CtlStream`. No external deps.
 aterm-uds = { workspace = true }
-# The control client's fleet listing (`fleet_sessions`), instance discovery and
-# token reads, so the fleet and drive surfaces depend on no shipped sibling binary.
+# The client's own discovery and connect (`fleet_sessions`, `local_instances`,
+# `connect_then_read_token`) and its exit codes (`EXIT_REPLACED`), in process,
+# so the fleet and drive surfaces depend on no shipped sibling binary.
 aterm-ctl = { path = "../aterm-ctl" }
 # SHA-256 for the approval ledger's command digests (`supervise::approvals`).
+# `libc` is Unix-only at the call sites and supplies O_NOFOLLOW for private files.
 aterm-digest = { workspace = true }
 # The workspace's one hex codec (digests) and the
 # control wire's one percent escape (`pct`, every `status`/`history` field the
@@ -145,6 +147,11 @@ aterm-lz4 = { workspace = true }
 aterm-zstd = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+# `aterm fleet init|join|peers|leave` (`fleet_member`): the fleet's key file,
+# join code, book of peers and the join's handshake and registration. Not a new
+# edge in the shipped graph — aterm-gui already links it — and unix-only, as
+# the key file's reader is.
+aterm-net = { workspace = true }
 # The disk reclaim (`harness::disk::target`) reaches every profile, lock and
 # cache of a build directory through directory handles it opened without
 # following a symlink, and deletes an idle profile's `incremental/` with the
@@ -158,6 +165,11 @@ aterm-dirfd = { workspace = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }
+# The tests' stand-in programs (`stand_in`), in an optimized test build too.
+aterm-tempfile = { workspace = true, features = ["test-support"] }
+# The counting seam (`aterm_durable::seam`) its tests reach, in an optimized test
+# build too.
+aterm-durable = { workspace = true, features = ["test-support"] }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-harness = { workspace = true }
 # The upgrade tests' pseudo-terminals, both ends close-on-exec from birth
@@ -187,3 +199,10 @@ path = "tests/transcript_allocations.rs"
 [[test]]
 name = "profile_sentinels"
 path = "tests/profile_sentinels.rs"
+
+# What the session log's step tap costs the footer thread (Phase 3B plan §9
+# M1), run by hand (`targo --unverified bench -p aterm-agent --bench
+# step_tap_cost`), never a gate.
+[[bench]]
+name = "step_tap_cost"
+harness = false

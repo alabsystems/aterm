@@ -124,7 +124,8 @@ fn dropping_an_adopted_session_before_commit_leaves_its_shell_alive() {
 /// leaves them, and withdraws only this process's own held writes for the
 /// sid, so a later release cannot put its key over the parent's.
 /// NEGATIVE CONTROL: after Commit the files are this process's, and the
-/// drop removes them as before.
+/// drop removes them as before — with the `<sid>.trap` a bash writes beside
+/// its re-key path at load (2026-10-17), which was left behind before.
 ///
 /// RED before the fix: both files were gone after the uncommitted drop.
 #[test]
@@ -143,9 +144,14 @@ fn dropping_an_adopted_session_before_commit_leaves_the_predecessors_rekey_and_b
         let sid = session.ctx.self_id.clone();
         let rekey = crate::shell_rekey::path_for(&sid).expect("a server-minted sid");
         let body = crate::shell_body::path_for(&sid).expect("a server-minted sid");
-        // The predecessor's files, written at ITS Commit.
+        let mut trap = rekey.clone().into_os_string();
+        trap.push(aterm_core::shell_integration::DEBUG_TRAP_SUFFIX);
+        let trap = std::path::PathBuf::from(trap);
+        // The predecessor's files, written at ITS Commit, and the one its bash
+        // wrote at its load (its read of the rc's DEBUG trap).
         std::fs::write(&rekey, "parent-key\n").expect("the parent's re-key");
         std::fs::write(&body, "parent-body\n").expect("the parent's body pointer");
+        std::fs::write(&trap, "trap -- ': rc' DEBUG\n").expect("the shell's trap read");
         // This process's own write for the same shell, held for its Commit.
         commit.hold(crate::shell_rekey::Pending::body(
             &body,
@@ -163,19 +169,21 @@ fn dropping_an_adopted_session_before_commit_leaves_the_predecessors_rekey_and_b
         drop(session);
         if committed {
             assert!(
-                !rekey.exists() && !body.exists(),
-                "a committed session's untaken files go with it"
+                !rekey.exists() && !body.exists() && !trap.exists(),
+                "a committed session's untaken files, and its shell's trap read, go with it"
             );
             continue;
         }
         assert_eq!(
             (
                 std::fs::read_to_string(&rekey).ok(),
-                std::fs::read_to_string(&body).ok()
+                std::fs::read_to_string(&body).ok(),
+                trap.exists()
             ),
             (
                 Some("parent-key\n".to_string()),
-                Some("parent-body\n".to_string())
+                Some("parent-body\n".to_string()),
+                true
             ),
             "an uncommitted drop deleted the files the predecessor handed its shell"
         );
@@ -189,6 +197,7 @@ fn dropping_an_adopted_session_before_commit_leaves_the_predecessors_rekey_and_b
         );
         let _ = std::fs::remove_file(&rekey);
         let _ = std::fs::remove_file(&body);
+        let _ = std::fs::remove_file(&trap);
     }
 }
 
@@ -289,4 +298,89 @@ fn the_final_exit_ends_a_hup_ignoring_shell_as_closing_its_tab_does() {
         kept,
         "the final exit hung up a shell the predecessor still owns"
     );
+}
+
+/// THE COLD UPDATE LANE'S `exec` LEAVES NO HUP-IGNORING SHELL OF A CLOSED TAB
+/// (ATERM-KI-1014-6). The cold lane runs only at zero live tabs, but a tab
+/// closed just before keeps its shell's reap in grace for ~250 ms, and `exec`
+/// ends the reap's thread with every other: a shell that ignores SIGHUP, not
+/// yet SIGKILLed, would outlive the switch. The steps before the `exec`
+/// (`App::prepare_cold_exec`) settle those reaps, so by the time the `exec`
+/// runs no reap is in grace: each holdout has its SIGKILL.
+///
+/// Deterministic: the holdout says when its trap is set, so the hang-up cannot
+/// land first, and the reap is held at its SIGKILL tick
+/// (`aterm_pty::hold_reap_kills_for_test`) until the precondition is read, so a
+/// descheduled test thread cannot outlast the grace. RED with the wait removed
+/// from `prepare_cold_exec`: the exec runs while the released reap is still in
+/// its grace. Runs alone in its own process: the reap count and the hold are
+/// the process's.
+#[cfg(unix)]
+#[test]
+fn the_cold_exec_runs_only_once_a_closed_tabs_holdout_has_its_sigkill() {
+    use std::io::BufRead as _;
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let mut holdout = aterm_uds::spawnfd::command("/bin/sh")
+        .args(["-c", "trap '' HUP; echo up; exec /bin/sleep 600"])
+        .setsid(true)
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .spawn()
+        .expect("the HUP-ignoring shell must spawn");
+    let stdout = holdout.stdout.take().expect("the holdout's stdout");
+    let (up_tx, up_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+        let _ = up_tx.send(line);
+    });
+    assert_eq!(
+        up_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN).as_deref(),
+        Ok("up\n"),
+        "PRECONDITION: the holdout's SIGHUP trap is set"
+    );
+    let mut app = App::headless_for_test();
+    let mut tab = stub_session(1);
+    tab.pid = i32::try_from(holdout.id()).expect("pid fits i32");
+    tab.shell_identity = aterm_pty::record_spawned_shell(tab.pid);
+    let hold = aterm_pty::hold_reap_kills_for_test();
+    // Closing the tab: its hang-up, and the reap in grace.
+    drop(tab);
+    assert!(
+        !aterm_pty::wait_for_reaps(Duration::ZERO),
+        "PRECONDITION: the closed tab's reap is in its grace"
+    );
+    assert!(
+        running(&mut holdout),
+        "PRECONDITION: the holdout outlived its hang-up"
+    );
+    drop(hold);
+
+    app.prepare_cold_exec(7, true, false);
+    let mut settled_at_exec = None;
+    let returned = app.run_cold_exec(|| {
+        settled_at_exec = Some(aterm_pty::wait_for_reaps(Duration::ZERO));
+        std::io::Error::from(std::io::ErrorKind::NotFound)
+    });
+    app.resume_after_cold_exec();
+    // A hang detector: the reap's SIGKILL is the event.
+    let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    while running(&mut holdout) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let ended = !running(&mut holdout);
+    let _ = holdout.kill();
+    let _ = holdout.wait();
+    assert_eq!(
+        returned.kind(),
+        std::io::ErrorKind::NotFound,
+        "the exec ran"
+    );
+    assert_eq!(
+        settled_at_exec,
+        Some(true),
+        "the exec ran with a closed tab's HUP-ignoring shell still in its grace"
+    );
+    assert!(ended, "the holdout was SIGKILLed");
 }

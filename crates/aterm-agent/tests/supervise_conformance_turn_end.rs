@@ -127,6 +127,7 @@ fn ours() -> Vec<Typed> {
     vec![Typed {
         at_ms: 1_000,
         text: SupervisorConfig::default().continue_text,
+        rule: aterm_agent::supervise::policy::turn_end::RULE_CONTINUE.to_string(),
     }]
 }
 
@@ -190,6 +191,7 @@ fn reading(
         login_back: false,
         auto_continue: None,
         since_limit: None,
+        background: false,
         served_in_transcript: false,
         notice_elsewhere: false,
         reset_clock: None,
@@ -199,7 +201,16 @@ fn reading(
         login_label: None,
         login_superseded: false,
         login_notice: None,
+        login_screen: None,
+        login_interrupted: false,
+        login_method: None,
+        login_shared: None,
         wall_remembered: false,
+        answered: None,
+        worked_doubt: Duration::ZERO,
+        record_turn: None,
+        credits: None,
+        repo: None,
     }
 }
 

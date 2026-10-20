@@ -50,7 +50,7 @@ pub(crate) fn scheme_from_word(
     }
 }
 
-/// Map a winit window [`Theme`](winit::window::Theme) onto the engine's
+/// Map a winit window [`Theme`](aterm_window::window::Theme) onto the engine's
 /// [`Appearance`](aterm_types::Appearance).
 ///
 /// `Some(Light)`/`Some(Dark)` map across directly. `None` — winit could not
@@ -58,11 +58,13 @@ pub(crate) fn scheme_from_word(
 /// [`Appearance::Dark`], which is the engine's OWN default, so an "unknown" OS leaves
 /// the engine at the value it already held (no spurious change/push).
 #[must_use]
-pub(crate) fn theme_to_appearance(theme: Option<winit::window::Theme>) -> aterm_types::Appearance {
+pub(crate) fn theme_to_appearance(
+    theme: Option<aterm_window::window::Theme>,
+) -> aterm_types::Appearance {
     match theme {
-        Some(winit::window::Theme::Light) => aterm_types::Appearance::Light,
+        Some(aterm_window::window::Theme::Light) => aterm_types::Appearance::Light,
         // Dark, or an indeterminate OS appearance, both resolve to the engine default.
-        Some(winit::window::Theme::Dark) | None => aterm_types::Appearance::Dark,
+        Some(aterm_window::window::Theme::Dark) | None => aterm_types::Appearance::Dark,
     }
 }
 
@@ -154,9 +156,11 @@ impl App {
     pub(crate) fn install_resolved_colors(&mut self, reason: ThemeChange) -> ThemeInstall {
         self.settle_theme_preview(reason);
         let candidate = self.theme_preview.as_ref().map(|p| p.id.as_str());
-        let colors =
-            self.config
-                .resolved_colors(self.os_appearance, &self.config_assets.themes, candidate);
+        let colors = self.config.resolved_colors_previewing(
+            self.os_appearance,
+            &self.config_assets.themes,
+            candidate,
+        );
         self.install_colors(colors, reason)
     }
 
@@ -458,7 +462,7 @@ impl App {
 mod tests {
     use super::theme_to_appearance;
     use aterm_types::Appearance;
-    use winit::window::Theme;
+    use aterm_window::window::Theme;
 
     #[test]
     fn os_scheme_reaches_terminal_leaves_inside_native_splits() {
@@ -600,6 +604,7 @@ pub(crate) mod install_resolved_colors {
                 false,
                 crate::tab_bar::CaptionSlot::NONE,
                 None,
+                None,
             ));
         };
         let install = |app: &mut App, text: &str| {
@@ -664,6 +669,7 @@ pub(crate) mod install_resolved_colors {
         term.take_response().expect("DSR 996 answers")
     }
 
+    #[cfg(unix)]
     fn bg_of(name: &str) -> Rgb {
         aterm_types::scheme::builtin(name)
             .expect("built-in")

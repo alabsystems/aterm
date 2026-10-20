@@ -27,10 +27,10 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 
+use aterm_window::event_loop::EventLoopProxy;
+use aterm_window::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use aterm_window::window::Window;
 use core::ffi::c_void;
-use winit::event_loop::EventLoopProxy;
-use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::Window;
 
 use crate::app_config::{BackgroundMaterial, WindowTheme};
 use crate::notify::NotifyMsg;
@@ -336,6 +336,8 @@ const COLOR_BTNFACE: i32 = 15;
 const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as isize;
 /// `RRF_RT_REG_DWORD` — refuse to coerce; a value of another type reads as absent.
 const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
+/// `RRF_RT_REG_BINARY` — the same refusal for a byte blob.
+const RRF_RT_REG_BINARY: u32 = 0x0000_0008;
 
 /// The Personalize key, home of both the OS light/dark preference winit reads and
 /// the "Transparency effects" switch. Settings ▸ Personalization ▸ Colours ▸
@@ -383,7 +385,7 @@ fn validate_window_capture_transfer(
 
 /// The `HWND` behind a winit [`Window`], or `None` when there is no Win32 handle
 /// (headless / not-yet-realized). Mirrors `main.rs::window_hwnd`.
-fn hwnd_of(window: &Window) -> Option<isize> {
+pub(crate) fn hwnd_of(window: &Window) -> Option<isize> {
     let handle = window.window_handle().ok()?;
     match handle.as_raw() {
         RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
@@ -461,6 +463,21 @@ fn backdrop_label(v: u32) -> &'static str {
     }
 }
 
+/// The `caption_color` / `caption_text` field of the `chrome` line from the DWM
+/// readback (`read`) and the COLORREF last written (`set`): the readback where DWM
+/// answers it; else the written value marked `(set)`; else `n/a`.
+fn caption_color_label(read: Option<u32>, set: Option<u32>) -> String {
+    let color = |v: u32| match v {
+        DWMWA_COLOR_DEFAULT => "default".to_string(),
+        v => format!("#{:06x}", colorref_swap(v)),
+    };
+    match (read, set) {
+        (Some(v), _) => color(v),
+        (None, Some(v)) => format!("{}(set)", color(v)),
+        (None, None) => "n/a".to_string(),
+    }
+}
+
 /// The `chrome` introspection lines for the live Windows window: the backend name
 /// plus the ACTUAL DWM attributes read back off the HWND (`DwmGetWindowAttribute`)
 /// — dark-mode, corner preference, system backdrop — and the effective winit theme.
@@ -487,8 +504,8 @@ pub(crate) fn read_chrome_lines(
         )];
     };
     let theme = match window.theme() {
-        Some(winit::window::Theme::Dark) => "dark",
-        Some(winit::window::Theme::Light) => "light",
+        Some(aterm_window::window::Theme::Dark) => "dark",
+        Some(aterm_window::window::Theme::Light) => "light",
         None => "auto",
     };
     let Some(hwnd) = hwnd_of(window) else {
@@ -510,20 +527,25 @@ pub(crate) fn read_chrome_lines(
         Some(v) => format!("{}({v})", backdrop_label(v)),
         None => "n/a".to_string(),
     };
-    // The caption tint (H3), read back as ground truth like everything else here:
+    // The caption tint (H3), read back as ground truth where DWM answers:
     // `default` is the DWMWA_COLOR_DEFAULT sentinel (tint intentionally absent —
     // High Contrast, a backdrop material, an explicit theme policy, or no published
-    // background yet), a hex value is the live tint in theme byte order, and `n/a`
-    // is a pre-Win11 build where the attribute cannot be read. The acceptance
-    // check: this value tracks the terminal theme background, and `caption_text`
+    // background yet), a hex value is the live tint in theme byte order. Windows 11
+    // build 26200 refuses to read either attribute back (`E_INVALIDARG`) though it
+    // paints them, so there the field is the pair last WRITTEN, marked `(set)`;
+    // `n/a` only when nothing was written (a pre-Win11 build drops the write too).
+    // The acceptance check: this value tracks the surface under the caption
+    // (`caption_surface`, the tab band's tone with a strip), and `caption_text`
     // visibly dims while the window is unfocused.
-    let caption_color_field = |attr: u32| match dwm_get_u32(hwnd, attr) {
-        Some(DWMWA_COLOR_DEFAULT) => "default".to_string(),
-        Some(v) => format!("#{:06x}", colorref_swap(v)),
-        None => "n/a".to_string(),
+    let written = caption_tint_written(hwnd);
+    let caption_color_field =
+        |attr: u32, set: Option<u32>| caption_color_label(dwm_get_u32(hwnd, attr), set);
+    let caption = caption_color_field(DWMWA_CAPTION_COLOR, written.map(|w| w.0));
+    let caption_text = caption_color_field(DWMWA_TEXT_COLOR, written.map(|w| w.1));
+    let caption_surface = match caption_surface_of(Some(hwnd)) {
+        CHROME_BG_UNKNOWN => "n/a".to_string(),
+        surface => format!("#{surface:06x}"),
     };
-    let caption = caption_color_field(DWMWA_CAPTION_COLOR);
-    let caption_text = caption_color_field(DWMWA_TEXT_COLOR);
     // H1: which CLIENT-AREA presentation path this process runs — `visual` (the
     // DirectComposition swapchain: padding/chrome-bleed margins carry per-pixel
     // alpha and the DWM backdrop shows through them) or `opaque` (the default
@@ -587,7 +609,8 @@ pub(crate) fn read_chrome_lines(
     vec![format!(
         "windows: backend=AppRtWindows hwnd=0x{hwnd:x} cfg_theme={want_theme} cfg_backdrop={want_backdrop} \
          os_theme={theme} immersive_dark={dark} corner={corner} backdrop={backdrop} client={client} \
-         caption_color={caption} caption_text={caption_text} high_contrast={high_contrast} \
+         caption_color={caption} caption_text={caption_text} caption_surface={caption_surface} \
+         high_contrast={high_contrast} \
          hc_chrome={hc_chrome} transparency={transparency} reduce_motion={reduce_motion} \
          text_scale={text_scale:.2} os_settings={settings_seen}/{settings_woke} aumid={}",
         crate::win32::AUMID
@@ -822,6 +845,89 @@ fn hkcu_dword(subkey: &str, value: &str) -> Option<u32> {
     (rc == 0).then_some(data)
 }
 
+/// One `HKEY_CURRENT_USER` `REG_BINARY` into `buf`: the bytes written, or `None`
+/// when the value is absent, holds another type, does not fit, or is unreadable.
+fn hkcu_binary(subkey: &str, value: &str, buf: &mut [u8]) -> Option<usize> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide = |s: &str| {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let subkey = wide(subkey);
+    let value = wide(value);
+    let mut cb = u32::try_from(buf.len()).ok()?;
+    // SAFETY: one documented flat-C registry read. Both name buffers are
+    // NUL-terminated UTF-16 and outlive the call; `RRF_RT_REG_BINARY` refuses any
+    // other type, `cb` is `buf`'s length in and the bytes written out, and a value
+    // longer than `buf` fails (`ERROR_MORE_DATA`) without writing past it.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_BINARY,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr().cast::<c_void>(),
+            &mut cb,
+        )
+    };
+    (rc == 0).then_some(cb as usize)
+}
+
+/// Where Explorer keeps the accent's eight shades (`AccentPalette`) and DWM the
+/// accent itself (`AccentColor`, `0xAABBGGRR`).
+const ACCENT_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent";
+const ACCENT_PALETTE_VALUE: &str = "AccentPalette";
+const DWM_KEY: &str = r"Software\Microsoft\Windows\DWM";
+const DWM_ACCENT_VALUE: &str = "AccentColor";
+
+/// The user's Windows accent colour as the chrome takes it
+/// ([`crate::native_appearance::SystemAccent`]), from the registry for the same
+/// reason as the two settings above: `UISettings.GetColorValue` is WinRT.
+///
+/// `AccentPalette` is eight RGBA quads, lightest first: Light3, Light2, Light1,
+/// the accent, Dark1, Dark2, Dark3 (then a complement). WinUI fills accent
+/// controls with Light2 on dark surfaces and Dark1 on light ones, so those are
+/// the two shades (this machine: `#4cc2ff` / `#0067c0` for the default
+/// `#0078d4`). Without the palette, DWM's `AccentColor` serves both sides; the
+/// chrome then floors it per surface as it floors every accent. `None` (no
+/// accent) only when neither value reads.
+fn system_accent_read() -> Option<crate::native_appearance::SystemAccent> {
+    accent_from_palette(
+        {
+            let mut palette = [0u8; 32];
+            hkcu_binary(ACCENT_KEY, ACCENT_PALETTE_VALUE, &mut palette)
+                .filter(|&n| n >= 20)
+                .map(|_| palette)
+        },
+        hkcu_dword(DWM_KEY, DWM_ACCENT_VALUE),
+    )
+}
+
+/// [`system_accent_read`]'s decoding, pure: the palette's Light2 and Dark1 quads,
+/// else the DWM `0xAABBGGRR` accent on both sides.
+fn accent_from_palette(
+    palette: Option<[u8; 32]>,
+    dwm_abgr: Option<u32>,
+) -> Option<crate::native_appearance::SystemAccent> {
+    if let Some(p) = palette {
+        let quad = |i: usize| [p[i * 4], p[i * 4 + 1], p[i * 4 + 2]];
+        return Some(crate::native_appearance::SystemAccent {
+            on_dark: quad(1),
+            on_light: quad(4),
+        });
+    }
+    dwm_abgr.map(|abgr| {
+        let rgb = [abgr as u8, (abgr >> 8) as u8, (abgr >> 16) as u8];
+        crate::native_appearance::SystemAccent {
+            on_dark: rgb,
+            on_light: rgb,
+        }
+    })
+}
+
 /// The live Settings ▸ Personalization ▸ Colours ▸ **"Transparency effects"**
 /// switch: `true` (the Windows default) when translucent surfaces are permitted.
 ///
@@ -912,10 +1018,16 @@ fn force_hc_chrome_env() -> bool {
 /// `SPI_GETHIGHCONTRAST` read shared by the palette, the caption resolver and
 /// [`AppRtWindows::native_appearance_preferences`] — they can never disagree
 /// because there is one read.
+///
+/// The OS accent colour is re-read here too ([`system_accent_read`]): every seam
+/// that settles the OS chrome palette (startup, attach, the settings hook's
+/// `WM_DWMCOLORIZATIONCOLORCHANGED` / `ImmersiveColorSet` re-sample) settles the
+/// accent with it, and a move arms the same chrome-inputs latch.
 pub(crate) fn resync_forced_chrome_palette() -> bool {
     let high_contrast = high_contrast_active();
     CHROME_HIGH_CONTRAST.store(high_contrast, Ordering::Relaxed);
-    crate::chrome_band::install_forced_chrome(resolve_forced_chrome(high_contrast))
+    let accent_moved = crate::native_appearance::install_system_accent(system_accent_read());
+    crate::chrome_band::install_forced_chrome(resolve_forced_chrome(high_contrast)) || accent_moved
 }
 
 /// How far ONE wheel notch travels, per the user's Windows mouse settings.
@@ -1018,7 +1130,8 @@ fn chrome_policy_from_code(code: u8) -> WindowTheme {
 
 /// Resolve the config `window_theme` policy into the CONCRETE caption variant to apply.
 /// Explicit `Light`/`Dark` are hard overrides and pass straight through — only `Auto`
-/// consults the terminal background, and only once one has been published (before that
+/// consults `bg`, the surface under the caption ([`caption_surface_of`]: the tab band,
+/// else the terminal background), and only once one has been published (before that
 /// there is nothing to match, so `Auto` stays `Auto` and the OS preference wins, exactly
 /// as it did before this resolution existed).
 ///
@@ -1056,11 +1169,18 @@ fn resolve_chrome_theme(policy: WindowTheme, bg: u32, high_contrast: bool) -> Wi
 // ---- Caption tint (Windows 11) ------------------------------------------------------
 //
 // Immersive-dark alone still leaves the caption a SYSTEM gray (~#1F1F1F dark /
-// ~#F3F3F3 light) with a visible seam against the terminal grid — a dark island
-// on a light desktop, worse on hued schemes. `DWMWA_CAPTION_COLOR` +
-// `DWMWA_TEXT_COLOR` paint the caption the terminal background itself, so the
-// window reads as ONE surface (Windows Terminal's caption follows the profile
-// background the same way). Four deliberate gates keep this from doing damage:
+// ~#F3F3F3 light) with a visible seam against the window under it — a dark
+// island on a light desktop, worse on hued schemes. `DWMWA_CAPTION_COLOR` +
+// `DWMWA_TEXT_COLOR` paint the caption the colour of the SURFACE DIRECTLY UNDER
+// IT ([`App::caption_surface_tone`]): the tab band's tone where the window shows a
+// strip, so caption and tabs read as one chrome block over the grid (Windows
+// Terminal's title bar and tab row, Edge's), else the window's live background
+// (a session theme or OSC 11 included). Tinting with the terminal background
+// while a lighter band sat between caption and grid drew a dark / grey / dark
+// sandwich (the 2026-10-17 audit's `caption-band-sandwich`). The surface is per
+// window ([`CAPTION_SURFACE`]), published before reveal and on every composed
+// frame ([`note_caption_surface`]). Four deliberate gates keep this from doing
+// damage:
 //
 //  * only the `Auto` policy tints the caption with the terminal COLOUR — an
 //    explicit `window_theme = "light"/"dark"` gets the STOCK OS caption in
@@ -1096,7 +1216,8 @@ const CAPTION_TEXT_UNFOCUSED_DIM: f32 = 0.45;
 /// included) when any gate defers. Pure, so the whole gate ladder is testable
 /// without a window.
 ///
-/// The ink is white-on-dark / black-on-light by the SAME one dark/light rule
+/// `surface` is the colour under the caption ([`caption_surface_of`]). The ink is
+/// white-on-dark / black-on-light by the SAME one dark/light rule
 /// ([`crate::tab_bar::theme_is_dark`], the WCAG pole) that resolves the immersive-dark caption,
 /// so the tint and the dark-mode caption buttons can never disagree about which
 /// side of the split the window is on. Unfocused, the ink blends toward the
@@ -1104,7 +1225,7 @@ const CAPTION_TEXT_UNFOCUSED_DIM: f32 = 0.45;
 /// [`crate::chrome_band::mix3`] (one blend for every chrome surface, per its doc).
 fn caption_tint(
     policy: WindowTheme,
-    bg: u32,
+    surface: u32,
     backdrop: u32,
     high_contrast: bool,
     focused: bool,
@@ -1112,10 +1233,11 @@ fn caption_tint(
     if !matches!(policy, WindowTheme::Auto)
         || high_contrast
         || backdrop != DWMSBT_NONE
-        || bg == CHROME_BG_UNKNOWN
+        || surface == CHROME_BG_UNKNOWN
     {
         return (DWMWA_COLOR_DEFAULT, DWMWA_COLOR_DEFAULT);
     }
+    let bg = surface;
     let bg_bytes = [
         ((bg >> 16) & 0xFF) as u8,
         ((bg >> 8) & 0xFF) as u8,
@@ -1145,6 +1267,61 @@ fn caption_tint(
 /// [`apply_caption_tint`] with `force`, which writes unconditionally.
 static CAPTION_TINT_APPLIED: Mutex<Vec<(isize, u64)>> = Mutex::new(Vec::new());
 
+/// The `(caption, text)` pair last written to `hwnd` ([`CAPTION_TINT_APPLIED`]),
+/// as COLORREFs: what `aterm-ctl chrome` reports where DWM will not read the
+/// attributes back (Windows 11 build 26200 answers `E_INVALIDARG` for both).
+fn caption_tint_written(hwnd: isize) -> Option<(u32, u32)> {
+    let applied = CAPTION_TINT_APPLIED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    applied
+        .iter()
+        .find(|(h, _)| *h == hwnd)
+        .map(|&(_, state)| ((state >> 32) as u32, state as u32))
+}
+
+/// The surface each window's caption sits on, `(HWND, 0x00RRGGBB)`
+/// ([`App::caption_surface_tone`], published by [`note_caption_surface`]). A
+/// linear Vec like [`CAPTION_TINT_APPLIED`], for the same reasons; a window with
+/// no entry yet resolves from the theme background ([`CHROME_BG`]).
+static CAPTION_SURFACE: Mutex<Vec<(isize, u32)>> = Mutex::new(Vec::new());
+
+/// The surface under `hwnd`'s caption: its published [`CAPTION_SURFACE`], else
+/// the last theme background ([`CHROME_BG`], [`CHROME_BG_UNKNOWN`] before any).
+fn caption_surface_of(hwnd: Option<isize>) -> u32 {
+    let published = hwnd.and_then(|hwnd| {
+        CAPTION_SURFACE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(h, _)| *h == hwnd)
+            .map(|&(_, surface)| surface)
+    });
+    published.unwrap_or_else(|| CHROME_BG.load(Ordering::Relaxed))
+}
+
+/// Publish the colour of the surface directly under `window`'s caption
+/// ([`App::caption_surface_tone`]): before the window is revealed, and on every
+/// composed frame. A lock and a compare in the steady state; a change (a theme
+/// edit, the strip appearing or going, an OSC 11 on a strip-less window)
+/// re-resolves the caption at once ([`resync_chrome_appearance`]), so the tint
+/// lands in the same frame as the surface it matches.
+pub(crate) fn note_caption_surface(window: &Window, surface: u32) {
+    let Some(hwnd) = hwnd_of(window) else {
+        return;
+    };
+    let surface = surface & 0x00FF_FFFF;
+    {
+        let mut published = CAPTION_SURFACE.lock().unwrap_or_else(|e| e.into_inner());
+        match published.iter_mut().find(|(h, _)| *h == hwnd) {
+            Some((_, s)) if *s == surface => return,
+            Some((_, s)) => *s = surface,
+            None => published.push((hwnd, surface)),
+        }
+    }
+    resync_chrome_appearance(window);
+}
+
 /// Resolve and write the caption tint for `window`. `force` (the event seams:
 /// attach, theme publish, config reload, OS flip) writes even when the cache says
 /// the state is current — those seams are rare and must also heal a caption some
@@ -1154,7 +1331,7 @@ static CAPTION_TINT_APPLIED: Mutex<Vec<(isize, u64)>> = Mutex::new(Vec::new());
 fn apply_caption_tint(window: &Window, hwnd: isize, policy: WindowTheme, force: bool) {
     let (caption, text) = caption_tint(
         policy,
-        CHROME_BG.load(Ordering::Relaxed),
+        caption_surface_of(Some(hwnd)),
         CHROME_BACKDROP.load(Ordering::Relaxed),
         CHROME_HIGH_CONTRAST.load(Ordering::Relaxed),
         // winit-cached focus (a lock read, not a syscall). Focus flips reach this
@@ -1257,7 +1434,9 @@ fn apply_chrome_appearance(window: &Window, policy: WindowTheme) {
     // syscall.
     let high_contrast = high_contrast_active();
     CHROME_HIGH_CONTRAST.store(high_contrast, Ordering::Relaxed);
-    let resolved = resolve_chrome_theme(policy, CHROME_BG.load(Ordering::Relaxed), high_contrast);
+    // The caption's side follows the surface it sits on, the same one its tint
+    // takes ([`caption_surface_of`]), so fill and buttons cannot disagree.
+    let resolved = resolve_chrome_theme(policy, caption_surface_of(hwnd_of(window)), high_contrast);
     {
         // `set_theme` is `SetWindowTheme`, which SENDS `WM_THEMECHANGED` back to this
         // very window — synchronously, on this thread, straight into
@@ -1419,7 +1598,7 @@ pub(crate) fn verify_chrome_appearance(window: &Window) {
     // independent of the immersive-dark ladder's early returns below.
     apply_caption_tint(window, hwnd, policy, /* force= */ false);
     let want_dark =
-        match resolve_chrome_theme(policy, CHROME_BG.load(Ordering::Relaxed), high_contrast) {
+        match resolve_chrome_theme(policy, caption_surface_of(Some(hwnd)), high_contrast) {
             WindowTheme::Dark => true,
             WindowTheme::Light => false,
             // The EXPLICIT High-Contrast deferral (immersive-dark OFF; winit's own HC
@@ -1428,7 +1607,7 @@ pub(crate) fn verify_chrome_appearance(window: &Window) {
             WindowTheme::Auto if high_contrast => false,
             WindowTheme::Auto => return, // the OS owns it; winit's re-theme IS the answer
         };
-    if matches!(window.theme(), Some(winit::window::Theme::Dark)) == want_dark {
+    if matches!(window.theme(), Some(aterm_window::window::Theme::Dark)) == want_dark {
         return; // OS preference already agrees — a clobber cannot do damage
     }
     if chrome_reassert_needed(want_dark, dwm_get_u32(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE)) {
@@ -1524,12 +1703,16 @@ pub(crate) fn verify_chrome_appearance(window: &Window) {
 // touching `App` from the handler would require aliasing that unique borrow — UB by
 // construction, however briefly winit itself flirts with the same shape. Instead the
 // event loop PUBLISHES a serializable layout snapshot every couple of seconds
-// (`set_end_session_snapshot`, driven from `about_to_wait` behind the
-// `end_session_snapshot_due` debounce), and the handler only does file I/O on data it
-// owns: bounded staleness (≤ the TTL below) against a shutdown that would otherwise
-// lose EVERYTHING.
+// (`set_end_session_snapshot`, driven from `about_to_wait` by
+// `App::end_session_snapshot`, whose cadence is `crash_journal::EndSessionCadence`),
+// and the handler only does file I/O on data it owns: bounded staleness (≤
+// `crash_journal::END_SESSION_SNAPSHOT_TTL`) against a shutdown that would otherwise
+// lose EVERYTHING. A tab's standing words about typing (its Autopilot word and
+// timer, its holds) are never stale: a change is published on the loop turn that
+// made it (ATERM-KI-1016-1), so a Land, Off or hold set just before a logoff is
+// what the reopened tab carries.
 //
-// HONEST LIMITS. (1) The snapshot is up to ~2 s stale — a tab opened in the final
+// HONEST LIMITS. (1) The layout is up to ~2 s stale — a tab opened in the final
 // second before "Restart now" may be missing; every prior window/tab/cwd survives.
 // (2) A shutdown the user then CANCELS leaves session.toml on disk while aterm keeps
 // running: harmless for this instance (the graceful-exit write later overwrites it),
@@ -1537,12 +1720,6 @@ pub(crate) fn verify_chrome_appearance(window: &Window) {
 // layout — rare, self-correcting, and strictly better than the data loss this block
 // removes. (3) A hard crash gets no WM_ENDSESSION; that lane is the crash-marker
 // banner (`logging::take_crash_evidence`) + `RegisterApplicationRestart`, not this.
-
-/// How stale the published end-session snapshot may grow before `about_to_wait`
-/// refreshes it. Long enough that a busy terminal pays one cheap layout walk every
-/// couple of seconds, short enough that an end-session save is current for anything
-/// a human does between opening a tab and clicking Start ▸ Restart.
-const END_SESSION_SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The last layout snapshot the event loop published, plus its generation — the
 /// ONLY data the end-session handler touches. `None` until the first publish (or
@@ -1557,9 +1734,6 @@ static END_SESSION_SNAPSHOT: Mutex<Option<(crate::restore::RestoreManifest, u64)
 static END_SESSION_GEN: AtomicU64 = AtomicU64::new(0);
 static END_SESSION_FLUSHED: AtomicU64 = AtomicU64::new(0);
 
-/// When the snapshot was last refreshed (the TTL debounce for `about_to_wait`).
-static END_SESSION_REFRESHED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-
 /// hwnd → the wndproc we displaced (winit's), for `CallWindowProcW` chaining. A
 /// `Vec` because the window count is a handful and `Vec::new` is const (no lazy
 /// init inside a wndproc). Entries are dropped on WM_NCDESTROY.
@@ -1570,6 +1744,7 @@ const GWLP_WNDPROC: i32 = -4;
 const WM_QUERYENDSESSION: u32 = 0x0011;
 const WM_ENDSESSION: u32 = 0x0016;
 const WM_NCDESTROY: u32 = 0x0082;
+const WM_GETOBJECT: u32 = 0x003D;
 /// `WM_SYSCOLORCHANGE` — the system palette moved (H4's input).
 const WM_SYSCOLORCHANGE: u32 = 0x0015;
 /// `WM_SETTINGCHANGE` (a.k.a. `WM_WININICHANGE`) — an SPI-backed or shell setting
@@ -1748,21 +1923,6 @@ pub(crate) fn note_os_settings_resample() {
     *WHEEL_NOTCH_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
-/// Has the TTL lapsed since the last snapshot publish? `true` also ARMS the next
-/// interval, so the caller refreshes at most once per TTL. Main-thread only (the
-/// `about_to_wait` seam); the mutex is for interior mutability, not contention.
-pub(crate) fn end_session_snapshot_due() -> bool {
-    let now = std::time::Instant::now();
-    let mut slot = END_SESSION_REFRESHED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if slot.is_some_and(|at| now.duration_since(at) < END_SESSION_SNAPSHOT_TTL) {
-        return false;
-    }
-    *slot = Some(now);
-    true
-}
-
 /// Publish the layout snapshot the end-session handler may write ([`Some`]), or
 /// retract it ([`None`] — session restore configured off, so an end-session must
 /// NOT write a manifest the user asked not to keep).
@@ -1792,8 +1952,9 @@ fn flush_end_session_snapshot() {
 }
 
 /// The chained window procedure — the ONE aterm subclass (§3.2 forbids a second).
-/// Persist the session on end-session, coalesce OS-settings broadcasts into a single
-/// `Wake`, and forward EVERY message (those included) to winit's original proc.
+/// Serve UIA root-object requests, persist the session on end-session, coalesce
+/// OS-settings broadcasts into a single `Wake`, and forward other messages
+/// (including end-session and settings) to winit's original proc.
 ///
 /// WM_QUERYENDSESSION wants TRUE ("OK to end the session") — winit has no arm for
 /// it, so the chain lands in `DefWindowProc`, which returns exactly that; writing
@@ -1815,6 +1976,13 @@ unsafe extern "system" fn aterm_subclass_wndproc(
     wparam: usize,
     lparam: isize,
 ) -> isize {
+    // UIA requests are sent messages too. Serve the retained publication from
+    // this existing chain; the provider never re-enters the live App.
+    if msg == WM_GETOBJECT
+        && let Some(result) = aterm_a11y::uia::handle_wm_getobject(hwnd, wparam, lparam)
+    {
+        return result;
+    }
     let prev = {
         let map = PREV_WNDPROC.lock().unwrap_or_else(|e| e.into_inner());
         map.iter().find(|(h, _)| *h == hwnd).map(|&(_, p)| p)
@@ -1839,6 +2007,7 @@ unsafe extern "system" fn aterm_subclass_wndproc(
     // Window gone (forwarded first — winit's own WM_NCDESTROY cleanup must run
     // with the chain intact): drop the chain entry.
     if msg == WM_NCDESTROY {
+        aterm_a11y::uia::window_destroyed(hwnd);
         PREV_WNDPROC
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2006,16 +2175,22 @@ impl AppRt for AppRtWindows {
         })
     }
 
-    /// INTENTIONAL no-op: `contentsGravity` models CoreAnimation's rescale of a
-    /// not-yet-repainted layer, which is macOS-specific. The DXGI swapchain is
-    /// presented into the HWND's client area directly — there is no intermediate
-    /// layer holding a stale drawable to anchor. Documented rather than silently
-    /// empty.
+    /// A no-op, because nothing here can change it. Windows has the same stale
+    /// frame macOS anchors: DWM keeps the last flip-model buffer presented to the
+    /// HWND and, between a resize and the first present at the new size, scales
+    /// it to the new client area. The scaling is the swapchain's
+    /// `DXGI_SWAP_CHAIN_DESC1::Scaling`, fixed when wgpu-hal creates the
+    /// swapchain, and wgpu-hal 29 always passes `DXGI_SCALING_STRETCH` (so the
+    /// frame stretches); the top-left anchor is `DXGI_SCALING_NONE`, which
+    /// Windows Terminal's HWND swapchain uses, and needs a wgpu-hal change.
+    /// What aterm does instead is shorten the stretched interval: `Resized`
+    /// reconfigures the swapchain at once, ahead of the throttled reflow, and
+    /// `metrics`' `resize_present` fields time it.
     fn window_anchor_surface_top_left(&self, _window: &Window) {}
 
-    /// No CoreAnimation layer to read: the DXGI swapchain is presented into the
-    /// HWND's client area directly, so no intermediate layer holds a stale drawable
-    /// whose gravity could rescale it — nothing to report.
+    /// No layer to read: the swapchain's scaling mode is not exposed back
+    /// through wgpu, and reporting the constant wgpu-hal passes would not be a
+    /// reading (see [`Self::window_anchor_surface_top_left`]).
     fn window_surface_presentation(&self, _window: &Window) -> Option<(String, f64, bool)> {
         None
     }
@@ -2209,6 +2384,11 @@ impl AppRt for AppRtWindows {
         crate::hdr_win::edr_max(window)
     }
 
+    /// With Windows HDR on, the monitor's headroom; `1.0` off HDR.
+    fn screen_edr_potential(&self, window: &Window) -> f32 {
+        crate::hdr_win::edr_max(window)
+    }
+
     /// The display's reference-white scale (`SDR-white / 80`) for the scRGB EDR
     /// present, so the grid renders at the desktop's white level rather than 80 nits;
     /// `1.0` off HDR. See [`crate::hdr_win`].
@@ -2223,8 +2403,9 @@ impl AppRt for AppRtWindows {
         suppress: Arc<Mutex<HashSet<u64>>>,
         silent: Arc<AtomicBool>,
         own_alerts: Arc<AtomicBool>,
+        center: crate::notice_center::NoticeCenter,
     ) -> SyncSender<NotifyMsg> {
-        crate::notify::spawn_delivery(suppress, silent, own_alerts)
+        crate::notify::spawn_delivery(suppress, silent, own_alerts, center)
     }
 
     /// Delegate to the shared menu module — `None` on Windows BY DESIGN:
@@ -2261,8 +2442,9 @@ impl AppRt for AppRtWindows {
             tooltips,
             ext,
             active,
+            pill,
         } = tabs;
-        toolbar::set_window_tabs(handle, titles, ids, metadata, tooltips, ext, active);
+        toolbar::set_window_tabs(handle, titles, ids, metadata, tooltips, ext, active, pill);
     }
 
     fn read_toolbar_chrome(&self, handle: &toolbar::ToolbarHandle) -> Option<String> {
@@ -2504,6 +2686,41 @@ pub(crate) fn capture_window_rgba(window: &Window) -> Result<(Vec<u8>, u32, u32)
     }
 }
 
+impl crate::App {
+    /// The colour of the surface directly under window `wid`'s caption, which the
+    /// caption tint takes ([`note_caption_surface`]), `0x00RRGGBB`:
+    ///
+    ///  * with a tab strip, the band's tone ([`crate::tab_bar::strip_bleed_tones`]),
+    ///    so caption and tabs read as one chrome block over the grid;
+    ///  * without one but with the message band on top, that band's ground;
+    ///  * else the window's live background: the last composed frame's default
+    ///    background, which a session theme or OSC 11 moves and which paints the
+    ///    top padding the caption meets; the theme's before the first frame.
+    ///
+    /// The band tones come from the header palette ([`crate::app_render::ChromeSurface::Header`]),
+    /// the instance theme: window chrome does not follow a session theme
+    /// (`session_theme`'s module doc), so neither does a caption over a strip.
+    pub(crate) fn caption_surface_tone(&self, wid: WindowId) -> u32 {
+        let header = self.chrome_palette(crate::app_render::ChromeSurface::Header);
+        if self.tab_strip_rows > 0
+            && let Some((band, _)) = crate::tab_bar::strip_bleed_tones(header)
+        {
+            return band;
+        }
+        let ws = self.windows.get(&wid);
+        // The message band is the only chrome bar under the strip: presence
+        // owns no row (owner surfaces, 2026-10-16).
+        if self.message_band_rows > 0 {
+            let [r, g, b] = crate::chrome_band::band_colors(header).bar_bg;
+            return (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+        }
+        ws.map(|ws| ws.input_scratch.default_bg)
+            .filter(|&bg| bg >> 24 == 0)
+            .unwrap_or(self.theme.bg)
+            & 0x00FF_FFFF
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2515,11 +2732,11 @@ mod tests {
         DWMSBT_TRANSIENTWINDOW, DWMWA_COLOR_DEFAULT, WHEEL_PAGESCROLL,
         WM_DWMCOLORIZATIONCOLORCHANGED, WM_ENDSESSION, WM_NCDESTROY, WM_QUERYENDSESSION,
         WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WheelNotch, backdrop_for,
-        caption_tint, chrome_policy_code, chrome_policy_from_code, chrome_reassert_needed,
-        claim_os_settings_wake, colorref_swap, effective_backdrop, high_contrast_active,
-        is_os_settings_message, os_text_scale, resolve_chrome_theme, resolve_forced_chrome,
-        transparency_effects_enabled, validate_window_capture_transfer, watch_os_settings_message,
-        wheel_notch_from_raw, work_area_pts_from_rect,
+        caption_color_label, caption_tint, chrome_policy_code, chrome_policy_from_code,
+        chrome_reassert_needed, claim_os_settings_wake, colorref_swap, effective_backdrop,
+        high_contrast_active, is_os_settings_message, os_text_scale, resolve_chrome_theme,
+        resolve_forced_chrome, transparency_effects_enabled, validate_window_capture_transfer,
+        watch_os_settings_message, wheel_notch_from_raw, work_area_pts_from_rect,
     };
     use crate::app_config::{BackgroundMaterial, WindowTheme};
     use crate::native_appearance::AppearancePreferences;
@@ -3300,5 +3517,80 @@ mod tests {
                 "no published background yet — nothing to tint with"
             );
         }
+    }
+
+    /// The accent is WinUI's pair from Explorer's `AccentPalette` (Light2 for dark
+    /// surfaces, Dark1 for light ones; this machine's default blue below), DWM's
+    /// `AccentColor` on both sides without it, and nothing with neither.
+    #[test]
+    fn the_accent_palette_gives_the_winui_shades_and_dwm_backs_it_up() {
+        let shades: [[u8; 3]; 8] = [
+            [0x99, 0xeb, 0xff],
+            [0x4c, 0xc2, 0xff],
+            [0x00, 0x91, 0xf8],
+            [0x00, 0x78, 0xd4],
+            [0x00, 0x67, 0xc0],
+            [0x00, 0x3e, 0x92],
+            [0x00, 0x1a, 0x68],
+            [0xf7, 0x63, 0x0c],
+        ];
+        let mut palette = [0u8; 32];
+        for (i, rgb) in shades.iter().enumerate() {
+            palette[i * 4..i * 4 + 3].copy_from_slice(rgb);
+        }
+        let accent = super::accent_from_palette(Some(palette), Some(0xffd4_7800))
+            .expect("a palette is an accent");
+        assert_eq!(accent.on_dark, [0x4c, 0xc2, 0xff]);
+        assert_eq!(accent.on_light, [0x00, 0x67, 0xc0]);
+        let dwm = super::accent_from_palette(None, Some(0xffd4_7800)).expect("DWM's accent");
+        assert_eq!(
+            (dwm.on_dark, dwm.on_light),
+            ([0x00, 0x78, 0xd4], [0x00, 0x78, 0xd4])
+        );
+        assert_eq!(super::accent_from_palette(None, None), None);
+    }
+
+    /// `chrome`'s caption fields: the DWM readback where Windows answers it, the
+    /// value aterm wrote, marked, where it does not (build 26200 refuses both
+    /// colour attributes though it paints them), and `n/a` only with neither.
+    #[test]
+    fn the_caption_color_field_reports_what_was_written_when_dwm_will_not_read_back() {
+        let tint = colorref_swap(0x30_3135);
+        assert_eq!(caption_color_label(Some(tint), Some(0)), "#303135");
+        assert_eq!(caption_color_label(None, Some(tint)), "#303135(set)");
+        assert_eq!(
+            caption_color_label(None, Some(DWMWA_COLOR_DEFAULT)),
+            "default(set)"
+        );
+        assert_eq!(
+            caption_color_label(Some(DWMWA_COLOR_DEFAULT), None),
+            "default"
+        );
+        assert_eq!(caption_color_label(None, None), "n/a");
+    }
+
+    /// The caption takes the tone of what sits right under it. With the tab strip
+    /// (the Windows default) that is the band, not the terminal background, so
+    /// caption, band and grid stop reading dark / grey / dark; without a strip it
+    /// is the window's live background, which an OSC 11 moves.
+    #[test]
+    fn the_caption_matches_the_band_under_it_and_the_live_background_without_one() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.tab_strip_rows = 1;
+        let band = crate::tab_bar::strip_bleed_tones(
+            app.chrome_palette(crate::app_render::ChromeSurface::Header),
+        )
+        .expect("Windows paints a band")
+        .0;
+        assert_eq!(app.caption_surface_tone(wid), band);
+        assert_ne!(band, app.theme.bg & 0x00FF_FFFF, "the band is its own tone");
+        app.tab_strip_rows = 0;
+        app.message_band_rows = 0;
+        app.windows.get_mut(&wid).unwrap().input_scratch.default_bg = 0x002a_00ff;
+        assert_eq!(app.caption_surface_tone(wid), 0x002a_00ff);
+        app.windows.get_mut(&wid).unwrap().input_scratch.default_bg =
+            aterm_core::render::COLOR_UNSET;
+        assert_eq!(app.caption_surface_tone(wid), app.theme.bg & 0x00FF_FFFF);
     }
 }

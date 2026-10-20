@@ -7,26 +7,47 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm's accessibility publishing: the tree model, its text and AT-SPI semantics, and the publisher that serves them to Linux screen readers over aterm-dbus"
+description = "aterm's shared accessibility tree and native screen-reader publishers"
 
-# The publisher is unix-only: AT-SPI is D-Bus, and aterm-dbus's client is a unix
-# socket. It compiles on every unix so its tests run on the Mac that builds
-# aterm; only Linux ships it (aterm-gui's linux dependency row).
-[target.'cfg(unix)'.dependencies]
-# The model, tree, text and AT-SPI semantics are this crate's own
-# (docs/AUDIT-third-party-2026-10-15.md, unit a11y, A11Y.5: carved from
-# accesskit, accesskit_consumer, accesskit_atspi_common and atspi-common);
-# accesskit_unix, zbus and its async stack are what A11Y.4 replaced.
-# The bus: first-party, blocking, unix-socket D-Bus (A11Y.3).
+# The native publishers share the validated model/tree/text consumer. AT-SPI
+# runs only on Linux; its Unix unit tests retain the same D-Bus dependencies.
+[target.'cfg(target_os = "linux")'.dependencies]
 aterm-dbus = { workspace = true }
 aterm-log = { workspace = true }
-# `MutexExt::lock_or_recover`: a window's state stays reachable after a panic.
 aterm-types = { workspace = true }
-# poll(2), the publisher thread's one wait.
 libc = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+aterm-objc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+aterm-types = { workspace = true }
+# The interface implementation macro emits absolute windows_core references.
+windows-core = "0.62"
+# UI Automation is COM. The existing windows binding supplies its interfaces;
+# the shared model/tree/text consumer remains independent of this platform arm.
+windows = { version = "0.62", features = [
+    "Win32_UI_Accessibility",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_Foundation",
+] }
 
 [dev-dependencies]
 aterm-uds = { workspace = true }
 
+[target.'cfg(unix)'.dev-dependencies]
+aterm-dbus = { workspace = true }
+aterm-log = { workspace = true }
+aterm-types = { workspace = true }
+libc = { workspace = true }
+
 [lints]
 workspace = true
+
+# Explicit Linux session-bus acceptance, run only in the scratch runtime lane.
+[[bench]]
+name = "live_atspi"
+harness = false
+test = false

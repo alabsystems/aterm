@@ -1026,10 +1026,11 @@ impl NativeAppModel for RecoveryApp {
             button(
                 "recovery/retry",
                 "Retry",
+                // Named by the word it paints, then what it does.
                 if self.capability.is_some() {
-                    "Reopen this view".to_string()
+                    "Retry: reopen this view".to_string()
                 } else {
-                    "This view cannot be reopened".to_string()
+                    "Retry: this view cannot be reopened".to_string()
                 },
                 "recovery/retry".to_string(),
                 retry_enabled,
@@ -1043,10 +1044,12 @@ impl NativeAppModel for RecoveryApp {
                 } else {
                     "Open Original"
                 },
+                // Named by the words it paints ("Open" where narrow), then
+                // what it does.
                 if matches!(self.capability, Some(RecoveryCapability::Document { .. })) {
-                    "Open the file in the editor".to_string()
+                    "Open Original: the file, in the editor".to_string()
                 } else {
-                    "No file to open".to_string()
+                    "Open Original: no file to open".to_string()
                 },
                 "recovery/open-original".to_string(),
                 original_enabled,
@@ -1060,7 +1063,7 @@ impl NativeAppModel for RecoveryApp {
                 } else {
                     "Copy Diagnostics"
                 },
-                "Copy recovery diagnostics".to_string(),
+                "Copy Diagnostics: the recovery details".to_string(),
                 "recovery/copy".to_string(),
                 !pending,
             )
@@ -1073,7 +1076,12 @@ impl NativeAppModel for RecoveryApp {
                 } else {
                     "Previous"
                 },
-                "Previous diagnostics page".to_string(),
+                if compact_action_labels {
+                    "Prev: the previous diagnostics page"
+                } else {
+                    "Previous diagnostics page"
+                }
+                .to_string(),
                 format!("recovery/page/{}", projection.page.saturating_sub(1)),
                 projection.page > 0,
             )
@@ -1662,11 +1670,17 @@ mod recovery_tests {
 pub(crate) enum AppEvent {
     Action(ActionInvocation),
     FocusChanged(Option<UiKey>),
+    /// An assistive technology asks for `key`, which its list holds off
+    /// screen, to be scrolled into view; the keyboard stays where it is.
+    #[cfg(any(a11y_tree, test))]
+    RevealControl(UiKey),
     /// Text an assistive technology inserts (only the accessibility tree does).
     #[cfg(any(a11y_tree, test))]
     InsertText(String),
     TextInput(TextInputEvent),
-    EditorChord(crate::native_editor::KeyChord),
+    /// A key, text or paste for an Editor view, which amacs's shared input
+    /// reducer turns into commands (`EditorWorkspace::handle_input`).
+    EditorInput(amacs::input::EditorInput),
     EditorCommand(crate::native_editor::EditorCommand),
     EditorCompletion(crate::native_editor::EditorCompletionAction),
     EditorConfigCompletion(crate::native_config_language::ConfigCompletionEdit),
@@ -1695,6 +1709,15 @@ pub(crate) enum AppEvent {
         visible_lines: usize,
     },
     ScrollLines(i32),
+    /// A scroll aimed at `key`: the innermost node under the pointer for a
+    /// wheel, or the node an assistive technology scrolls. A view with a
+    /// second scrolling region (Settings' sidebar) scrolls the one `key` is
+    /// in; to every other view, and anywhere else, it is `ScrollLines`
+    /// ([`NativeRuntime::dispatch`] lowers it for them).
+    ScrollAt {
+        lines: i32,
+        key: UiKey,
+    },
     /// Up (`-1`) / Down (`1`) in Settings: the keyboard moves to the control
     /// before or after the focused one in the page's list and the list
     /// follows; with no control of the list focused, the list scrolls a row.
@@ -1867,6 +1890,14 @@ pub(crate) enum SemanticInput {
         byte: usize,
         extend: bool,
     },
+    /// A hue and saturation picked on the exact painted colour wheel
+    /// ([`crate::native_ui::CompiledUi::color_wheel_pick_at`]), each in
+    /// `0..=1`. The picker combines them with its own brightness, so a pick
+    /// on a wheel taken to black still picks a hue.
+    ColorPick {
+        hue: f32,
+        saturation: f32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2001,7 +2032,7 @@ pub(crate) enum ThemesRequest {
     /// built-in's name and an id that names no regular file in the folder;
     /// the view refuses the theme in use before asking.
     Trash { id: String },
-    /// Settings ▸ Themes ▸ Get More: install the pack theme `id`
+    /// Keep on a Settings ▸ Themes ▸ Community row: install the pack theme `id`
     /// (`aterm_theme_pack::install`, never replacing) into the themes
     /// folder. The view names the pack id; the host resolves the folder.
     AddPack { id: String },
@@ -2094,6 +2125,10 @@ pub(crate) enum HarnessRequest {
     /// Raise session `session`'s tab and focus its pane (a press on its row's
     /// Show, design §10.3.1; `App::raise_session_pane`).
     Show { session: u64 },
+    /// A press on SESSIONS' `Every session` row (design §11.5): one choice
+    /// for every session the harness can steer, read again at the press and
+    /// written in one batch (`App::press_autopilot_every`).
+    Every(crate::harness_screen::EveryPress),
 }
 
 /// Settings ▸ Harness's TIMER press (design §9.3.4,
@@ -2162,7 +2197,7 @@ pub(crate) enum PackagesRequest {
     UninstallAll,
     /// `atpkg machine apply` — the `[machine]` host settings (Universal Control off
     /// for this host), applied NOW from
-    /// the Security page's "This Mac" card — the verb that keeps them applied (a pass
+    /// Security's This Mac status — the verb that keeps them applied (a pass
     /// carries only an edit to the table); a local verb (no store lock, no network) that
     /// works with the package manager switched off. macOS only.
     MachineApply,
@@ -2356,6 +2391,17 @@ pub(crate) struct ViewMotionCx {
     /// favourite, else the tenured program cat, else the launch kitty), so
     /// the Cursor Styles preview draws the coat this terminal draws.
     pub(crate) companion_look: aterm_effects::kitty_registry::KittyLook,
+    /// The window's screen can show EDR (HDR glow's display): a host fact
+    /// read off the platform ([`crate::platform::PlatformAppRt::screen_edr_potential`]),
+    /// never in a headless run.
+    pub(crate) display_edr: bool,
+    /// The colour this window paints its selected tab with while the
+    /// `active_tab_color` key is unset ([`crate::App::automatic_tab_color`]:
+    /// the strip's selected tab over this frame's floor, a colour the theme
+    /// authors, the system's selected-content pill on macOS's toolbar, the
+    /// highlight under High Contrast), so Settings shows the automatic colour
+    /// it names. Injected like every host fact here.
+    pub(crate) automatic_tab_color: [u8; 3],
 }
 
 impl Default for ViewMotionCx {
@@ -2368,6 +2414,12 @@ impl Default for ViewMotionCx {
             serious: false,
             backend_gpu: false,
             companion_look: aterm_effects::kitty_registry::KittyLook::default(),
+            display_edr: false,
+            automatic_tab_color: crate::tab_bar::automatic_active_tab_color(
+                crate::chrome_band::ChromePalette::from(aterm_render::Theme::default()),
+                crate::tab_bar::StripFloor::Ground,
+                None,
+            ),
         }
     }
 }
@@ -2728,6 +2780,13 @@ impl NativeRuntime {
 
     pub(crate) fn document_id(&self, instance: AppInstanceId) -> Option<DocumentId> {
         self.instances.get(&instance)?.document_id()
+    }
+
+    /// Whether any app controller, of any kind, presents `document`.
+    pub(crate) fn holds_document(&self, document: DocumentId) -> bool {
+        self.instances
+            .values()
+            .any(|app| app.document_id() == Some(document))
     }
 
     /// Replace the process-global Settings updater projection. There is at most
@@ -3368,6 +3427,14 @@ impl NativeRuntime {
             next_operation: &mut self.next_operation,
             service_generations: &mut self.service_generations,
             effects: Vec::new(),
+        };
+        // Only Settings scrolls a second region (its sidebar); every other
+        // view's wheel moves its one list.
+        let event = match event {
+            AppEvent::ScrollAt { lines, .. } if app.kind() != AppKind::Settings => {
+                AppEvent::ScrollLines(lines)
+            }
+            event => event,
         };
         let result = app.update(state, event, &mut cx)?;
         Ok(DispatchOutcome {
@@ -4574,11 +4641,13 @@ impl NativeAppModel for MarkdownApp {
                 .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
                 button(
                     "markdown/previous-page-button".to_string(),
-                    ButtonSpec::new("Previous reading page").visual_label(if compact {
-                        "Prev"
+                    // Named by the words it paints, the short ones too.
+                    ButtonSpec::new(if compact {
+                        "Prev: the previous reading page"
                     } else {
-                        "Previous"
-                    }),
+                        "Previous reading page"
+                    })
+                    .visual_label(if compact { "Prev" } else { "Previous" }),
                     format!(
                         "markdown/page/{}/{}",
                         previous_page.source_anchor, previous_page.visual_row
@@ -5472,30 +5541,6 @@ fn bounded_middle_label_to_width_for_face(
     }
 }
 
-/// A toolbar row's buttons at their own (label) widths where the row holds
-/// them, else sharing the row equally, so no label is cut to keep a width.
-fn toolbar_row_widths(
-    mut buttons: Vec<crate::native_ui::UiNode>,
-    row_width: f32,
-    gap: f32,
-) -> Vec<crate::native_ui::UiNode> {
-    use crate::native_ui::Length;
-    let natural = buttons
-        .iter()
-        .map(|button| match button.layout.width {
-            Length::Fixed(width) => width,
-            _ => 0.0,
-        })
-        .sum::<f32>()
-        + gap * buttons.len().saturating_sub(1) as f32;
-    if natural > row_width {
-        for button in &mut buttons {
-            button.layout.width = Length::Fill;
-        }
-    }
-    buttons
-}
-
 /// Compact editor controller seam. The editor module owns commands/edit
 /// reduction; the app runtime owns lifecycle, semantic presentation, and close
 /// readiness around the shared `DocumentId`.
@@ -5542,6 +5587,21 @@ pub(crate) struct EditorApp {
 type LineIndexMemo = Option<(u64, u64, Option<std::sync::Arc<[usize]>>)>;
 
 impl EditorApp {
+    /// What this editor's toolbar holds beyond its fixed commands: the
+    /// Previous/Next problem pair while a config file has findings, Reload in
+    /// Commands' place while the file changed on disk under local edits. The
+    /// view draws it and the host sizes the file's rows by it.
+    pub(crate) fn toolbar(&self) -> crate::native_ui::EditorToolbar {
+        crate::native_ui::EditorToolbar {
+            problem_navigation: self.config_editor
+                && self
+                    .config_analysis
+                    .as_ref()
+                    .is_some_and(|analysis| analysis.diagnostic_count() > 0),
+            reload: self.disk_conflict && self.dirty,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn new(document: DocumentId, title: String) -> Self {
         Self::new_with_uri(
@@ -5800,11 +5860,9 @@ impl NativeAppModel for EditorApp {
             },
             |(_, candidates, _)| crate::native_ui::EditorPalette::Rows(candidates.len().max(1)),
         );
-        let shell = crate::native_ui::editor_shell_metrics(cx.viewport, completion_count);
+        let toolbar = self.toolbar();
+        let shell = crate::native_ui::editor_shell_metrics(cx.viewport, completion_count, toolbar);
         let outer_padding = shell.outer_padding;
-        let compact_commands = shell.compact_commands;
-        let narrow_problem_commands =
-            cx.viewport.width < 900.0 * crate::native_appearance::text_scale().min(1.4);
         let command_gap = shell.command_gap;
         let command_bar_height = shell.command_bar_height;
         let editor_gap = shell.content_gap;
@@ -5812,18 +5870,23 @@ impl NativeAppModel for EditorApp {
             || format!("document:{}", self.document.get()),
             |snapshot| format!("document:{}@{}", snapshot.id.get(), snapshot.seq.0),
         );
-        let editor_rect =
-            crate::native_ui::editor_text_viewport_rect_with_palette(cx.viewport, completion_count);
+        let editor_rect = crate::native_ui::editor_text_viewport_rect_with_palette(
+            cx.viewport,
+            completion_count,
+            toolbar,
+        );
         let editor_geometry = crate::native_ui::text_viewport_geometry(editor_rect);
         // Caret reveal keeps to the rows shown whole; the painter projects
         // the part row too.
         let line_capacity = crate::native_ui::editor_visible_line_capacity_with_palette(
             cx.viewport,
             completion_count,
+            toolbar,
         );
         let painted_capacity = crate::native_ui::editor_painted_line_capacity_with_palette(
             cx.viewport,
             completion_count,
+            toolbar,
         );
         let column_capacity = ((editor_rect.right() - editor_geometry.text_x).max(1.0)
             / editor_geometry.cell_w)
@@ -5936,20 +5999,16 @@ impl NativeAppModel for EditorApp {
         } else {
             0
         };
-        // A toolbar button is as wide as its label, as Settings' buttons are,
-        // so the bar reads as buttons rather than a row of equal fields. A row
-        // whose buttons do not fit at their own widths shares the bar equally
-        // ([`toolbar_row_widths`]).
-        let in_row =
-            if compact_commands { 3 } else { 6 } + if config_diagnostic_count > 0 { 2 } else { 0 };
-        let bar_width = (cx.viewport.width - outer_padding * 2.0).max(0.0);
-        let slot_width = ((bar_width - command_gap * (in_row - 1) as f32) / in_row as f32).max(0.0);
+        // THE TOOLBAR IS ONE MEASURED PLAN ([`crate::native_ui::plan_editor_toolbar`]),
+        // the same the host sizes the file's rows by: each button as wide as
+        // its words, as Settings' buttons are, flowed into as few rows as the
+        // bar holds, in plain words (the Emacs chords are in the spoken label).
         let command_button = |key: &'static str,
                               visual_label: &'static str,
+                              width: f32,
                               label: &'static str,
                               action: &'static str,
                               enabled: bool| {
-            let natural = crate::native_ui::native_button_label_width(visual_label) + 28.0;
             UiNode::new(
                 key,
                 UiContent::Button(
@@ -5967,188 +6026,96 @@ impl NativeAppModel for EditorApp {
             )
             .layout(
                 Layout::default()
-                    .width(Length::Fixed(natural.max(56.0)))
+                    .width(Length::Fixed(width))
                     .height(Length::Fill),
             )
         };
-        let save = || {
-            command_button(
-                "editor/save-button",
-                "Save",
-                "Save buffer (Cmd-S or C-x C-s)",
-                "editor/save",
-                self.dirty && !self.checkpoint_pending && !self.disk_conflict && config_valid,
-            )
-        };
-        let undo = || {
-            command_button(
-                "editor/undo-button",
-                "Undo",
-                "Undo (Cmd-Z or C-/)",
-                "editor/undo",
-                buffer_ready && self.can_undo,
-            )
-        };
-        let redo = || {
-            command_button(
-                "editor/redo-button",
-                "Redo",
-                "Redo (Cmd-Shift-Z)",
-                "editor/redo",
-                buffer_ready && self.can_redo,
-            )
-        };
-        let find = || {
-            command_button(
-                "editor/find-button",
-                "Find",
-                "Incremental search (C-s)",
-                "editor/find",
-                buffer_ready,
-            )
-        };
-        // Plain words on the toolbar, the Emacs chords in the spoken label:
-        // the long form where the row's equal slots hold it, else the short.
-        let slot_label_room = slot_width - 28.0;
-        let plain = |long: &'static str, short: &'static str| {
-            if crate::native_ui::native_button_label_width(long) <= slot_label_room {
-                long
-            } else {
-                short
-            }
-        };
-        let goto_line = || {
-            command_button(
-                "editor/goto-line-button",
-                plain("Go to Line", "Go to…"),
-                "Go to line (M-g g)",
-                "editor/goto-line",
-                buffer_ready,
-            )
-        };
-        let commands = || {
-            command_button(
-                "editor/commands-button",
-                plain("Commands", "Run…"),
-                "Run a command by name (M-x)",
-                "editor/commands",
-                buffer_ready,
-            )
-        };
-        let recovery_or_commands = || {
-            if self.disk_conflict && self.dirty {
-                command_button(
-                    "editor/revert-button",
-                    "Reload",
+        let button_for = |key: &'static str, words: &'static str, width: f32| {
+            let (label, action, enabled) = match key {
+                "editor/save-button" => (
+                    "Save buffer (Cmd-S or C-x C-s)",
+                    "editor/save",
+                    self.dirty && !self.checkpoint_pending && !self.disk_conflict && config_valid,
+                ),
+                "editor/undo-button" => (
+                    "Undo (Cmd-Z or C-/)",
+                    "editor/undo",
+                    buffer_ready && self.can_undo,
+                ),
+                "editor/redo-button" => (
+                    "Redo (Cmd-Shift-Z)",
+                    "editor/redo",
+                    buffer_ready && self.can_redo,
+                ),
+                "editor/find-button" => (
+                    "Find: incremental search (C-s)",
+                    "editor/find",
+                    buffer_ready,
+                ),
+                "editor/goto-line-button" => {
+                    ("Go to line (M-g g)", "editor/goto-line", buffer_ready)
+                }
+                "editor/revert-button" => (
                     "Discard Changes and Reload from Disk",
                     "editor/revert",
                     buffer_ready && !self.checkpoint_pending,
-                )
-            } else {
-                commands()
-            }
+                ),
+                "editor/config-problem-previous-button" => (
+                    "Prev Issue: the previous config problem (Shift-F8)",
+                    "editor/config-problem-previous",
+                    config_diagnostic_count > 0,
+                ),
+                "editor/config-problem-next-button" => (
+                    "Next Issue: the next config problem (F8)",
+                    "editor/config-problem-next",
+                    config_diagnostic_count > 0,
+                ),
+                _ => (
+                    "Commands: run a command by name (M-x)",
+                    "editor/commands",
+                    buffer_ready,
+                ),
+            };
+            command_button(key, words, width, label, action, enabled)
         };
-        let previous_problem = || {
-            command_button(
-                "editor/config-problem-previous-button",
-                if compact_commands {
-                    "‹!"
-                } else if narrow_problem_commands {
-                    "Prev"
-                } else {
-                    "Prev Issue"
-                },
-                "Previous config problem (Shift-F8)",
-                "editor/config-problem-previous",
-                config_diagnostic_count > 0,
-            )
-        };
-        let next_problem = || {
-            command_button(
-                "editor/config-problem-next-button",
-                if compact_commands {
-                    "!›"
-                } else if narrow_problem_commands {
-                    "Next"
-                } else {
-                    "Next Issue"
-                },
-                "Next config problem (F8)",
-                "editor/config-problem-next",
-                config_diagnostic_count > 0,
-            )
-        };
-        let command_bar = if compact_commands {
-            let mut navigation_commands = vec![find(), goto_line(), recovery_or_commands()];
-            if config_diagnostic_count > 0 {
-                navigation_commands.extend([previous_problem(), next_problem()]);
-            }
-            UiNode::new(
-                "editor/command-bar",
-                UiContent::Group(GroupSpec::new("Editor commands")),
-            )
-            .layout(
-                Layout::column()
-                    .gap(command_gap)
-                    .width(Length::Fill)
-                    .height(Length::Fixed(command_bar_height)),
-            )
-            .children(vec![
+        let plan = crate::native_ui::plan_editor_toolbar(
+            &crate::native_ui::editor_toolbar_items(toolbar),
+            shell.command_bar_width,
+            command_gap,
+        );
+        let command_rows: Vec<UiNode> = plan
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
                 UiNode::new(
-                    "editor/command-row-primary",
+                    format!("editor/command-row-{index}"),
                     UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
                 )
                 .layout(
                     Layout::row()
                         .gap(command_gap)
                         .width(Length::Fill)
-                        .height(Length::Fill),
+                        .height(Length::Fixed(shell.command_button_height)),
                 )
-                .children(toolbar_row_widths(
-                    vec![save(), undo(), redo()],
-                    bar_width,
-                    command_gap,
-                )),
-                UiNode::new(
-                    "editor/command-row-navigation",
-                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                .children(
+                    row.iter()
+                        .map(|&(key, words, width)| button_for(key, words, width))
+                        .collect(),
                 )
-                .layout(
-                    Layout::row()
-                        .gap(command_gap)
-                        .width(Length::Fill)
-                        .height(Length::Fill),
-                )
-                .children(toolbar_row_widths(
-                    navigation_commands,
-                    bar_width,
-                    command_gap,
-                )),
-            ])
-        } else {
-            let mut commands = vec![
-                save(),
-                undo(),
-                redo(),
-                find(),
-                goto_line(),
-                recovery_or_commands(),
-            ];
-            if config_diagnostic_count > 0 {
-                commands.extend([previous_problem(), next_problem()]);
-            }
-            UiNode::new(
-                "editor/command-bar",
-                UiContent::Group(GroupSpec::new("Editor commands")),
-            )
-            .layout(
-                Layout::row()
-                    .gap(command_gap)
-                    .width(Length::Fill)
-                    .height(Length::Fixed(command_bar_height)),
-            )
-            .children(toolbar_row_widths(commands, bar_width, command_gap))
-        };
+            })
+            .collect();
+        let command_bar = UiNode::new(
+            "editor/command-bar",
+            UiContent::Group(GroupSpec::new("Editor commands")),
+        )
+        .layout(
+            Layout::column()
+                .gap(command_gap)
+                .width(Length::Fill)
+                .height(Length::Fixed(command_bar_height)),
+        )
+        .children(command_rows);
         let command_palette = command_completion.as_ref().and_then(
             |(query, candidates, selected)| {
                 if shell.palette_visible_rows == 0 {
@@ -7971,6 +7938,37 @@ mod markdown_reader_tests {
         }
     }
 
+    /// The config editor's problem buttons compile at every width, each
+    /// named by the words it paints ("Prev Issue", "Prev", "!›"): the UI
+    /// compiler refuses a button whose painted words are not in its name
+    /// ([`crate::native_ui::visible_label_in_name`]), and the wide "Prev
+    /// Issue" / "Next Issue" were named "Previous config problem" and "Next
+    /// config problem", which no test compiled.
+    #[test]
+    fn config_problem_buttons_compile_at_every_width() {
+        let source = "future_first_setting = 1\nfuture_second_setting = 2\n";
+        let (mut app, view, snapshot) = editor_fixture(source, "aterm.toml");
+        app.config_editor = true;
+        app.config_analysis = Some(crate::native_config_language::analyze(source));
+        app.config_analysis_revision = 1;
+        for width in [1_424.0, 960.0, 804.0, 474.0, 320.0] {
+            let viewport = LogicalRect::new(0.0, 0.0, width, 600.0);
+            let compiled = app
+                .view(&view, &cx(viewport, Some(&snapshot)))
+                .compile(viewport)
+                .unwrap_or_else(|error| panic!("{width}pt: {error:?}"));
+            for key in [
+                "editor/config-problem-previous-button",
+                "editor/config-problem-next-button",
+            ] {
+                assert!(
+                    compiled.semantic(&UiKey::new(key)).is_some(),
+                    "{width}pt: {key}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn manual_config_completions_page_every_candidate_and_keep_full_live_help() {
         let source = "";
@@ -7986,8 +7984,12 @@ mod markdown_reader_tests {
                 0,
             ));
         let viewport = LogicalRect::new(0.0, 0.0, 320.0, 300.0);
-        let capacity = crate::native_ui::editor_shell_metrics(viewport, assist.completions.len())
-            .palette_visible_rows;
+        let capacity = crate::native_ui::editor_shell_metrics(
+            viewport,
+            assist.completions.len(),
+            app.toolbar(),
+        )
+        .palette_visible_rows;
         assert!(capacity > 0 && capacity < assist.completions.len());
         let mut reachable = std::collections::BTreeSet::new();
 
@@ -8106,8 +8108,11 @@ mod markdown_reader_tests {
         let assist = compiled
             .semantic(&UiKey::new("editor/config-assist"))
             .expect("the help line for the key under the caret");
-        let shell =
-            crate::native_ui::editor_shell_metrics(viewport, crate::native_ui::EditorPalette::Help);
+        let shell = crate::native_ui::editor_shell_metrics(
+            viewport,
+            crate::native_ui::EditorPalette::Help,
+            app.toolbar(),
+        );
         assert_eq!(
             assist.rect.height,
             shell.palette_padding * 2.0 + shell.palette_header_height,
@@ -8123,7 +8128,8 @@ mod markdown_reader_tests {
         assert_eq!(
             crate::native_ui::editor_text_viewport_rect_with_palette(
                 viewport,
-                crate::native_ui::EditorPalette::Help
+                crate::native_ui::EditorPalette::Help,
+                app.toolbar(),
             )
             .height,
             compiled
@@ -8334,6 +8340,172 @@ mod markdown_reader_tests {
         compiled.validate_parity().unwrap();
     }
 
+    /// THE EDITOR TOOLBAR IS ONE MEASURED PLAN IN WHOLE WORDS: at every
+    /// width from a wide window to a phone-width one, with and without config
+    /// problems and a disk conflict's Reload, every button paints whole words
+    /// from the toolbar's own vocabulary at its own width (no "‹!", no "…",
+    /// no shared-slot squeeze); the rows the view draws are the rows the
+    /// metrics count; and the file's rect is the one the host sizes the caret
+    /// for. At 738 and 374pt with problems the words are the long ones, in
+    /// two rows at 374. (The bar used to pick its rows and words from fixed
+    /// breakpoints: "Run…", "Go to…", "‹!" and "!›" at 374pt.)
+    #[test]
+    fn the_editor_toolbar_is_one_measured_plan_in_whole_words() {
+        const WORDS: [&str; 11] = [
+            "Save",
+            "Undo",
+            "Redo",
+            "Find",
+            "Go to Line",
+            "Commands",
+            "Prev Issue",
+            "Next Issue",
+            "Prev",
+            "Next",
+            "Reload",
+        ];
+        let whole_word = |label: &str| WORDS.contains(&label);
+        // Negative control: the old glyphs and cut words are not words.
+        for bad in ["‹!", "!›", "Go to…", "Run…", "F…", "…"] {
+            assert!(!whole_word(bad), "{bad}");
+        }
+        let source = "gpu = true\nunknown_key = 1\n";
+        let (mut app, view, snapshot) = editor_fixture(source, "aterm.toml");
+        app.config_editor = true;
+        app.config_analysis_revision = snapshot.seq.0;
+        app.dirty = true;
+        app.can_undo = true;
+        app.can_redo = true;
+        for (problems, conflict) in [(false, false), (true, false), (true, true)] {
+            let analysis = crate::native_config_language::analyze(source);
+            assert!(analysis.diagnostic_count() > 0, "the fixture has a problem");
+            app.config_analysis = problems.then_some(analysis);
+            app.disk_conflict = conflict;
+            for width in [1_074.0, 738.0, 486.0, 374.0, 286.5, 234.0] {
+                let viewport = LogicalRect::new(0.0, 0.0, width, 558.0);
+                let context = format!("{width} problems={problems} conflict={conflict}");
+                let compiled = app
+                    .view(&view, &cx(viewport, Some(&snapshot)))
+                    .compile(viewport)
+                    .unwrap();
+                assert!(
+                    compiled.fit_failures().is_empty(),
+                    "{context}: {:?}",
+                    compiled.fit_failures()
+                );
+                let buttons: Vec<(String, String, LogicalRect)> = compiled
+                    .paint
+                    .iter()
+                    .filter_map(|node| match &node.content {
+                        UiContent::Button(control)
+                            if node.key.as_str().starts_with("editor/")
+                                && node.key.as_str().ends_with("-button") =>
+                        {
+                            Some((
+                                node.key.as_str().to_string(),
+                                control.spec.visual_label.clone().unwrap_or_default(),
+                                node.rect,
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert!(buttons.len() >= 4, "{context}: {buttons:?}");
+                for (key, label, rect) in &buttons {
+                    assert!(whole_word(label), "{context}: {key} paints {label:?}");
+                    assert!(
+                        rect.width + 0.5 >= crate::native_ui::editor_toolbar_button_width(label),
+                        "{context}: {key} squeezed to {}",
+                        rect.width
+                    );
+                }
+                let has = |key: &str| buttons.iter().any(|(k, _, _)| k == key);
+                assert_eq!(
+                    has("editor/config-problem-next-button"),
+                    problems,
+                    "{context}"
+                );
+                assert_eq!(has("editor/revert-button"), conflict, "{context}");
+                assert!(
+                    has("editor/save-button") && has("editor/undo-button"),
+                    "{context}"
+                );
+                let rows = compiled
+                    .semantics
+                    .iter()
+                    .filter(|node| node.key.as_str().starts_with("editor/command-row-"))
+                    .count();
+                let shell = crate::native_ui::editor_shell_metrics(
+                    viewport,
+                    crate::native_ui::EditorPalette::Help,
+                    app.toolbar(),
+                );
+                assert_eq!(rows, shell.command_rows, "{context}");
+                let label = |key: &str| {
+                    buttons
+                        .iter()
+                        .find(|(k, _, _)| k == key)
+                        .map(|(_, label, _)| label.as_str())
+                };
+                if problems && !conflict && width == 738.0 {
+                    assert_eq!(
+                        [
+                            label("editor/goto-line-button"),
+                            label("editor/commands-button"),
+                            label("editor/config-problem-previous-button"),
+                            label("editor/config-problem-next-button"),
+                        ],
+                        [
+                            Some("Go to Line"),
+                            Some("Commands"),
+                            Some("Prev Issue"),
+                            Some("Next Issue")
+                        ],
+                        "{context}"
+                    );
+                    assert_eq!(rows, 1, "{context}");
+                }
+                if problems && !conflict && width == 374.0 {
+                    // Two rows hold them where the problem pair takes its
+                    // short words, the last buttons first; the others keep
+                    // theirs.
+                    assert_eq!(rows, 2, "{context}");
+                    assert_eq!(
+                        [
+                            label("editor/goto-line-button"),
+                            label("editor/commands-button"),
+                        ],
+                        [Some("Go to Line"), Some("Commands")],
+                        "{context}"
+                    );
+                }
+                // The host sizes the file for the toolbar the view draws.
+                let palette = if compiled
+                    .semantic(&UiKey::new("editor/config-assist"))
+                    .is_some()
+                {
+                    crate::native_ui::EditorPalette::Help
+                } else {
+                    crate::native_ui::EditorPalette::None
+                };
+                assert_eq!(
+                    crate::native_ui::editor_text_viewport_rect_with_palette(
+                        viewport,
+                        palette,
+                        app.toolbar(),
+                    )
+                    .height,
+                    compiled
+                        .semantic(&UiKey::new("editor/buffer"))
+                        .expect("the buffer")
+                        .rect
+                        .height,
+                    "{context}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn editor_command_bar_is_actionable_and_save_shares_the_conflict_gate() {
         let (mut app, view, snapshot) = editor_fixture("first\nsecond\n", "notes.md");
@@ -8364,8 +8536,8 @@ mod markdown_reader_tests {
                         .any(|hit| { hit.key.as_str() == key && hit.action.as_str() == action })
                 );
             }
-            // Plain words on glass, never Emacs chords: the long form where
-            // the row's slots hold it, the short where they do not.
+            // Plain words on glass, never Emacs chords, and whole: the bar
+            // flows into rows rather than cutting a label.
             let painted = |key: &str| {
                 compiled
                     .paint
@@ -8379,18 +8551,11 @@ mod markdown_reader_tests {
             };
             let goto = painted("editor/goto-line-button");
             let commands = painted("editor/commands-button");
-            if compact {
-                assert!(["Go to Line", "Go to…"].contains(&goto.as_str()), "{goto}");
-                assert!(
-                    ["Commands", "Run…"].contains(&commands.as_str()),
-                    "{commands}"
-                );
-            } else {
-                assert_eq!(
-                    (goto.as_str(), commands.as_str()),
-                    ("Go to Line", "Commands")
-                );
-            }
+            assert_eq!(
+                (goto.as_str(), commands.as_str()),
+                ("Go to Line", "Commands"),
+                "compact={compact}"
+            );
             compiled.validate_parity().unwrap();
         }
 

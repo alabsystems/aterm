@@ -280,6 +280,9 @@ pub struct Inventory {
     /// `[github]`.
     #[serde(default)]
     pub github: Option<Github>,
+    /// Custom host display names (`[names]` table mapping a host selector or tag to its name).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub names: std::collections::BTreeMap<String, String>,
     /// `[[host]]`.
     #[serde(default, rename = "host")]
     pub hosts: Vec<Host>,
@@ -325,6 +328,13 @@ pub fn parse(text: &str) -> Result<Inventory, String> {
         && github.account.trim().is_empty()
     {
         return Err("[github] account is empty".into());
+    }
+    for (k, v) in &inv.names {
+        if k.trim().is_empty() || !plain_word(v) {
+            return Err(format!(
+                "[names] {k:?} = {v:?}: name must be letters, digits, `.`, `_` or `-`"
+            ));
+        }
     }
     for (i, host) in inv.hosts.iter().enumerate() {
         check_host(host).map_err(|e| format!("[[host]] #{}: {e}", i + 1))?;
@@ -895,6 +905,27 @@ pub struct HostState {
     /// rekey it took).
     #[serde(default)]
     pub signers_sha256: Option<String>,
+    /// `plan|apply --only` envelopes sent to this host and not yet reported: each one's serial
+    /// and the tables it carried. The report with that serial (the run's own, or the one
+    /// `attach` follows) covers those tables alone, so it is merged into `report`, never put
+    /// in its place.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub only_sent: Vec<(u64, Vec<String>)>,
+    /// What `report` covers when its newest run was an `--only` one: `None` for a whole
+    /// baseline's report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only: Option<Only>,
+}
+
+/// The coverage of a report whose newest run was `plan|apply --only` (design §9).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Only {
+    /// The tables `--only` runs have reported since the last whole run.
+    pub tables: Vec<String>,
+    /// When the whole run whose rows the other tables keep finished; `None` when no whole
+    /// plan or apply was ever reported, so the other tables were never run at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rest: Option<u64>,
 }
 
 /// Read `state/<uuid>.json` (default when absent).
@@ -944,6 +975,253 @@ pub fn inside(root: &Path, path: &Path) -> bool {
         rest.components()
             .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
     })
+}
+
+/// Extract a canonical short tag from a host selector or Bonjour name (`m14` from
+/// `m14 Air M5 32GB 4TB prime`, `spark-49f7` from `spark-49f7-SSH`).
+#[must_use]
+pub fn host_tag_key(raw: &str) -> String {
+    let clean = raw
+        .trim()
+        .trim_end_matches('.')
+        .strip_suffix(".local")
+        .unwrap_or_else(|| raw.trim().trim_end_matches('.'));
+    let tokens: Vec<&str> = clean
+        .split(|c: char| c.is_whitespace() || c == '-')
+        .filter(|t| !t.is_empty())
+        .collect();
+    if let Some(&first) = tokens.first() {
+        let lower = first.to_ascii_lowercase();
+        if lower == "spark"
+            && let Some(&second) = tokens.get(1)
+        {
+            return format!("spark-{}", second.to_ascii_lowercase());
+        }
+        if lower.starts_with('m')
+            && lower[1..].chars().all(|c| c.is_ascii_digit())
+            && lower.len() > 1
+        {
+            return lower;
+        }
+    }
+    clean.to_ascii_lowercase()
+}
+
+/// Normalize any discovered or local host name into a consistent canonical hyphenated
+/// identifier (`m1-MacBook-Air-M2-24GB-1TB`, `m4-MacBook-Pro-3.1GHz-i7-16GB-1TB`,
+/// `m8-MacBook-Pro-M4-Max-36GB-1TB`, `m9-MacBook-Pro-M2-32GB-8TB`,
+/// `m10-MacBook-Pro-M4-Max-36GB-1TB`, `m14-MacBook-Air-M5-32GB-4TB-prime`,
+/// `m100-MacBook-Pro-M4-Pro-48GB-500GB`, `spark-49f7`, …), honoring any custom override in
+/// `custom_names` (`[names]` in `machines.toml`).
+#[must_use]
+pub fn canonical_host_name(
+    raw: &str,
+    custom_names: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let trimmed = raw
+        .trim()
+        .trim_end_matches('.')
+        .strip_suffix(".local")
+        .unwrap_or_else(|| raw.trim().trim_end_matches('.'))
+        .trim();
+    if trimmed.is_empty() {
+        return "unknown-host".to_owned();
+    }
+    let tag = host_tag_key(trimmed);
+    let slug: String = trimmed.split_whitespace().collect::<Vec<_>>().join("-");
+    for candidate in [trimmed, slug.as_str(), tag.as_str()] {
+        if let Some((_, v)) = custom_names
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(candidate))
+        {
+            return v.clone();
+        }
+    }
+    let mut raw_tokens: Vec<&str> = trimmed
+        .split(|c: char| c.is_whitespace() || c == '-')
+        .filter(|t| !t.is_empty())
+        .collect();
+    if raw_tokens
+        .last()
+        .is_some_and(|last| last.eq_ignore_ascii_case("ssh"))
+        && raw_tokens.len() > 1
+    {
+        raw_tokens.pop();
+    }
+    if raw_tokens.len() >= 2 && raw_tokens[0].eq_ignore_ascii_case("spark") {
+        return format!("spark-{}", raw_tokens[1].to_ascii_lowercase());
+    }
+    let mut norm: Vec<String> = Vec::with_capacity(raw_tokens.len() + 1);
+    for (idx, &tok) in raw_tokens.iter().enumerate() {
+        let low = tok.to_ascii_lowercase();
+        let mapped = if idx == 0
+            && low.starts_with('m')
+            && low.len() > 1
+            && low[1..].chars().all(|c| c.is_ascii_digit())
+        {
+            low
+        } else if idx > 0
+            && low.starts_with('m')
+            && low.len() == 2
+            && low.as_bytes()[1].is_ascii_digit()
+        {
+            tok.to_ascii_uppercase()
+        } else {
+            match low.as_str() {
+                "macbook" => "MacBook".to_owned(),
+                "air" => "Air".to_owned(),
+                "pro" => "Pro".to_owned(),
+                "max" => "Max".to_owned(),
+                "ultra" => "Ultra".to_owned(),
+                "mini" => "mini".to_owned(),
+                "imac" => "iMac".to_owned(),
+                "studio" => "Studio".to_owned(),
+                "intel" => "Intel".to_owned(),
+                "core" => "Core".to_owned(),
+                "i3" | "i5" | "i7" | "i9" | "prime" => low,
+                _ if low.ends_with("gb")
+                    && low[..low.len() - 2]
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == '.') =>
+                {
+                    format!("{}GB", &tok[..tok.len() - 2])
+                }
+                _ if low.ends_with("tb")
+                    && low[..low.len() - 2]
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == '.') =>
+                {
+                    format!("{}TB", &tok[..tok.len() - 2])
+                }
+                _ if low.ends_with("ghz")
+                    && low[..low.len() - 3]
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == '.') =>
+                {
+                    format!("{}GHz", &tok[..tok.len() - 3])
+                }
+                _ => tok.to_owned(),
+            }
+        };
+        norm.push(mapped);
+    }
+    // Ensure consistent `MacBook-Air` and `MacBook-Pro` family naming after `m<N>` tag:
+    if norm.len() >= 2
+        && norm[0].starts_with('m')
+        && norm[0][1..].chars().all(|c| c.is_ascii_digit())
+    {
+        if norm[1] == "Air" {
+            norm.insert(1, "MacBook".to_owned());
+        } else if norm[1] == "MacBook"
+            && norm.get(2).is_some_and(|t| {
+                t != "Pro"
+                    && t != "Air"
+                    && (t.starts_with('M') || t.chars().next().is_some_and(|c| c.is_ascii_digit()))
+            })
+        {
+            norm.insert(2, "Pro".to_owned());
+        }
+    }
+    norm.join("-")
+}
+
+/// Set or rename any host (`selector` may be a tag like `m14`, a canonical or raw Bonjour
+/// name, an address, or an enrolled UUID) to `new_name` in `machines.toml`.
+///
+/// Updates both `[names]` (so LAN discovery and `this Mac` use `new_name` immediately) and
+/// any matching enrolled `[[host]]` entry in `machines.toml`. Creates `machines.toml` if it
+/// does not exist yet.
+///
+/// # Errors
+/// One line if `new_name` is not a valid host name or the inventory cannot be written.
+pub fn set_host_name(
+    sys: &dyn System,
+    paths: &Paths,
+    selector: &str,
+    new_name: &str,
+) -> Result<String, String> {
+    let sel = selector.trim();
+    if sel.is_empty() {
+        return Err("host selector cannot be empty".into());
+    }
+    if !plain_word(new_name) {
+        return Err(format!(
+            "name {new_name:?} must be letters, digits, `.`, `_` or `-`"
+        ));
+    }
+    sys.create_dir_all(&paths.root, DIR_MODE)
+        .map_err(|e| format!("{}: {e}", paths.root.display()))?;
+    let path = paths.inventory();
+    let text = match sys.read_file(&path) {
+        Ok(bytes) => {
+            String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8 text", path.display()))?
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => "schema = 1\n".to_owned(),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let before = parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let tag_key = host_tag_key(sel);
+    if let Some(other) = before.hosts.iter().find(|h| {
+        h.name.eq_ignore_ascii_case(new_name)
+            && !h.name.eq_ignore_ascii_case(sel)
+            && !h.uuid.eq_ignore_ascii_case(sel)
+            && !h.address.eq_ignore_ascii_case(sel)
+            && host_tag_key(&h.name) != tag_key
+    }) {
+        return Err(format!(
+            "the name {new_name} is taken by the host with uuid {}",
+            other.uuid
+        ));
+    }
+    let mut doc: DocumentMut = text
+        .parse()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let root = doc.as_table_mut();
+
+    // Update any matching `[[host]]` entry in place.
+    if let Some(item) = root.get_mut("host")
+        && let Some(old) = item.as_array_of_tables().cloned()
+    {
+        let mut rebuilt = ArrayOfTables::new();
+        for table in old.iter() {
+            let mut table = table.clone();
+            let matches = table
+                .get("name")
+                .and_then(Item::as_str)
+                .is_some_and(|n| n.eq_ignore_ascii_case(sel) || host_tag_key(n) == tag_key)
+                || table
+                    .get("uuid")
+                    .and_then(Item::as_str)
+                    .is_some_and(|u| u.eq_ignore_ascii_case(sel))
+                || table
+                    .get("address")
+                    .and_then(Item::as_str)
+                    .is_some_and(|a| a.eq_ignore_ascii_case(sel) || host_tag_key(a) == tag_key);
+            if matches {
+                set_str(&mut table, "name", new_name);
+            }
+            rebuilt.push(table);
+        }
+        *item = Item::ArrayOfTables(rebuilt);
+    }
+
+    // Record in `[names]` under `tag_key` (and `sel` if distinct).
+    if !root.contains_key("names") {
+        root.insert("names", Item::Table(Table::new()));
+    }
+    let Some(names_table) = root.get_mut("names").and_then(Item::as_table_mut) else {
+        return Err(format!("{}: `names` is not a table", path.display()));
+    };
+    set_str(names_table, &tag_key, new_name);
+    if !sel.eq_ignore_ascii_case(&tag_key) {
+        set_str(names_table, sel, new_name);
+    }
+
+    let out = doc.to_string();
+    let _after = parse(&out).map_err(|e| format!("the edited inventory does not parse: {e}"))?;
+    sys.write_file(&path, out.as_bytes(), FILE_MODE)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(tag_key)
 }
 
 #[cfg(test)]
@@ -1371,6 +1649,11 @@ user = \"labadmin\"
             contact_error: Some((1_800_000_050, "its host key changed".into())),
             last_refusal: Some((1_800_000_060, "busy run=7".into())),
             signers_sha256: Some("ab".repeat(32)),
+            only_sent: vec![(9, vec!["names".into()])],
+            only: Some(Only {
+                tables: vec!["names".into()],
+                rest: Some(1_799_000_000),
+            }),
         };
         save_state(&fake, &p, UUID_7, &state).unwrap();
         assert!(fake.calls().contains(&format!("mkdir {ROOT}/state 700")));
@@ -1497,5 +1780,49 @@ user = \"labadmin\"
         assert!(!is_uuid("0A1B2C3D-0000-4000-8000-00000000000"));
         assert!(!is_uuid("0A1B2C3D-0000-4000-8000-00000000000G"));
         assert!(!is_uuid("../0000-4000-8000-000000000007"));
+    }
+
+    #[test]
+    fn canonical_host_name_normalizes_inconsistent_bonjour_names_and_honors_custom_names() {
+        let empty = std::collections::BTreeMap::new();
+        assert_eq!(
+            canonical_host_name("m1 Air M2 24GB 1TB", &empty),
+            "m1-MacBook-Air-M2-24GB-1TB"
+        );
+        assert_eq!(
+            canonical_host_name("m4 MacBook Pro 3.1GHz i7 16GB 1TB", &empty),
+            "m4-MacBook-Pro-3.1GHz-i7-16GB-1TB"
+        );
+        assert_eq!(
+            canonical_host_name("m8 Macbook Pro M4 Max 36GB 1TB", &empty),
+            "m8-MacBook-Pro-M4-Max-36GB-1TB"
+        );
+        assert_eq!(
+            canonical_host_name("m9 MacBook Pro  M2 32GB 8TB", &empty),
+            "m9-MacBook-Pro-M2-32GB-8TB"
+        );
+        assert_eq!(
+            canonical_host_name("m10 MacBook M4 Max 36GB 1TB", &empty),
+            "m10-MacBook-Pro-M4-Max-36GB-1TB"
+        );
+        assert_eq!(
+            canonical_host_name("m14-Air-M5-32GB-4TB-prime", &empty),
+            "m14-MacBook-Air-M5-32GB-4TB-prime"
+        );
+        assert_eq!(
+            canonical_host_name("m100 macbook pro m4 pro 48gb 500gb", &empty),
+            "m100-MacBook-Pro-M4-Pro-48GB-500GB"
+        );
+        assert_eq!(canonical_host_name("spark-49f7-SSH", &empty), "spark-49f7");
+
+        let fake = fake_with(HAND_EDITED);
+        set_host_name(&fake, &paths(), "m14", "m14-prime").unwrap();
+        set_host_name(&fake, &paths(), "lab-07", "bench-a-07").unwrap();
+        let inv = load(&fake, &paths()).unwrap();
+        assert_eq!(inv.hosts[0].name, "bench-a-07");
+        assert_eq!(
+            canonical_host_name("m14 Air M5 32GB 4TB prime", &inv.names),
+            "m14-prime"
+        );
     }
 }

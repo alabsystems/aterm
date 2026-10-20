@@ -1,0 +1,16 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# §2.4: the 1 s settle absorbs Codex's 220 ms mid-answer idle: one turn,
+# closed once, by the idle that held.
+see busy
+see idle
+wait 220
+see busy
+expect wake=none
+wait 2000
+expect turn=open
+see idle
+wait 999
+expect turn=open
+wait 1
+expect open t1 turn
+expect close t1 turn out=done dur_ms=2220 at=2220

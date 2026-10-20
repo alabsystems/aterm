@@ -52,6 +52,9 @@ libc = { workspace = true }
 aterm-durable = { workspace = true }
 
 [dev-dependencies]
+# The counting seam (`aterm_durable::seam`) its tests reach, in an optimized test
+# build too.
+aterm-durable = { workspace = true, features = ["test-support"] }
 # Prove the producer↔client contract: sign here, verify + INSTALL with the ACTUAL client.
 atpkg = { path = "../atpkg" }
 # Tier-1 binds the real roster pair redo/snapshot-CAS filesystem transaction to

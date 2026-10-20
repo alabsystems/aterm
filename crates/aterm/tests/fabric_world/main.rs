@@ -10,8 +10,6 @@
 //! (`/tmp/atl-<tag>-<pid>`, `/tmp/a5-<tag><pid>`): private sockets, state and
 //! HOME, so a world never meets another run's daemons or the machine's own.
 //! `harness::boot_permit` caps the tests holding live stacks at once.
-//!
-//! `two_nodes_sealed` is a target of its own: it needs `--features sealed`.
 #![cfg(unix)]
 
 mod harness;
@@ -27,6 +25,7 @@ mod exactly_once;
 mod fabric_cli;
 mod fabric_on;
 mod link_state;
+mod log_mail;
 mod log_mirror;
 mod ls_paging;
 mod notify;
@@ -35,7 +34,8 @@ mod presence;
 mod receipt_edge_cases;
 mod receipts;
 mod replaced_log;
-mod second_host;
+mod roster_bye;
 mod sender_attestation;
 mod topic_gap;
 mod topic_read_before_watch;
+mod two_nodes;

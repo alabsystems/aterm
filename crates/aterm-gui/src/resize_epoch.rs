@@ -12,15 +12,18 @@
 //!
 //! An epoch opens at the first alternate-screen resize after the screen was last
 //! repainted from scratch and remembers the geometry before it (`start`). The
-//! engine's [`Terminal::render_debt`] says what is owed: `(0, 0)` when every row sits
-//! where the program painted it. The epoch is at risk when the debt is not zero, the
-//! geometry is back at `start` and [`RISK_AFTER_MS`] has passed since the last
-//! resize: a program that compares the size it reads with the size it drew for can
-//! never read the intermediate size again, so it has no reason to repaint. While the
-//! geometry differs from `start` the program's handler still reads a change and
-//! repaints, so the epoch is only `displaced`. Whether the program has drawn since is
-//! information (`drew=`), not a condition: an undrawn residual (a mode set between
-//! the halves, an idle tab) is as displaced as a drawn one.
+//! engine's [`Terminal::render_debt`] says what is owed: nothing when every row sits
+//! where the program painted it and no drawn cell was cut. Rows and columns are one
+//! debt: a column flap that cut the cells past the narrower width brings blanks back
+//! where the program drew, as a row flap leaves the rows one higher. The epoch is at
+//! risk when anything is owed, the geometry is back at `start` and [`RISK_AFTER_MS`]
+//! has passed since the last resize: a program that compares the size it reads with
+//! the size it drew for can never read the intermediate size again, so it has no
+//! reason to repaint. While the geometry differs from `start` the program's handler
+//! still reads a change and repaints, so the epoch is only `displaced`. Whether the
+//! program has drawn since is information (`drew=`), not a condition: an undrawn
+//! residual (a mode set between the halves, an idle tab) is as displaced as a drawn
+//! one.
 //!
 //! Whether an epoch at risk is accused depends on the program's class:
 //! [`ProgramClass::Agent`] (Claude Code, the one program whose repaint contract, an
@@ -84,7 +87,7 @@ impl ProgramClass {
 /// An epoch's state (`verdict=`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EpochVerdict {
-    /// Open: rows are owed and the program may still read the change.
+    /// Open: debt is owed and the program may still read the change.
     Open,
     /// At risk, and the class is judged.
     DesyncRisk,
@@ -146,9 +149,11 @@ pub(crate) struct Epoch {
     pub(crate) start: (u16, u16),
     /// `(rows, cols)` as last read.
     pub(crate) now: (u16, u16),
-    /// The engine's debt as last read.
+    /// The engine's debt as last read: rows moved, rows pushed off, drawn columns
+    /// cut.
     pub(crate) shift: i32,
     pub(crate) pushed: i32,
+    pub(crate) cut: u16,
     /// The program drew (the content moved other than by a resize) since.
     pub(crate) drew: bool,
     /// The content sequence the screen shows while the program has drawn
@@ -158,7 +163,7 @@ pub(crate) struct Epoch {
     /// them is a repaint from scratch.
     full_clears: u64,
     screen_replaced: u64,
-    /// The engine owed rows at some reading.
+    /// The engine owed something at some reading.
     had_debt: bool,
     pub(crate) class: ProgramClass,
     pub(crate) verdict: EpochVerdict,
@@ -185,6 +190,7 @@ impl Epoch {
             now: report.to,
             shift: 0,
             pushed: 0,
+            cut: 0,
             drew: false,
             quiet_seq: report.content_seq,
             full_clears: report.full_clears,
@@ -204,7 +210,7 @@ impl Epoch {
         full_clears > self.full_clears || screen_replaced > self.screen_replaced
     }
 
-    /// Worth a line in `resizes`: rows were owed at some reading.
+    /// Worth a line in `resizes`: something was owed at some reading.
     pub(crate) fn listed(&self) -> bool {
         self.had_debt
     }
@@ -264,6 +270,8 @@ pub(crate) struct NudgeView {
     pub(crate) shift: i32,
     /// Rows pushed off the bottom, likewise.
     pub(crate) pushed: i32,
+    /// Drawn columns cut, likewise.
+    pub(crate) cut: u16,
     /// The program drew since.
     pub(crate) drew: bool,
 }
@@ -333,6 +341,7 @@ impl EpochBook {
                 epoch: epoch.id,
                 shift: epoch.shift,
                 pushed: epoch.pushed,
+                cut: epoch.cut,
                 drew: epoch.drew,
             })
     }
@@ -395,8 +404,8 @@ impl EpochBook {
         self.current.as_ref()
     }
 
-    /// The epochs `resizes` lists, oldest first: the closed ones that owed rows,
-    /// then the open one when it does.
+    /// The epochs `resizes` lists, oldest first: the closed ones that owed
+    /// something, then the open one when it does.
     pub(crate) fn listed(&self) -> impl Iterator<Item = &Epoch> {
         self.closed
             .iter()
@@ -458,9 +467,9 @@ impl EpochBook {
         out: &mut Vec<Transition>,
     ) {
         let class = self.class();
-        let debt = (probe.debt_shift, probe.debt_pushed);
-        if self.current.is_none() && debt != (0, 0) && probe.geom.0 > 0 {
-            // Rows are owed and no resize of this ledger explains it: a restored
+        let debt = probe.debt;
+        if self.current.is_none() && debt.owed() && probe.geom.0 > 0 {
+            // Debt is owed and no resize of this ledger explains it: a restored
             // engine seeded with its predecessor's debt (the handoff). The
             // geometry is taken to be the one the program painted.
             self.high = self.high.saturating_add(1);
@@ -483,7 +492,7 @@ impl EpochBook {
         };
         epoch.now = probe.geom;
         epoch.class = class;
-        if debt == (0, 0) {
+        if !debt.owed() {
             // The engine owes nothing: a quiet flap (nothing to record), or a
             // heal / an undo that ended a debt.
             let owed = epoch.had_debt;
@@ -517,8 +526,9 @@ impl EpochBook {
             return;
         }
         epoch.had_debt = true;
-        epoch.shift = debt.0;
-        epoch.pushed = debt.1;
+        epoch.shift = debt.shift;
+        epoch.pushed = debt.pushed;
+        epoch.cut = debt.cut;
         if probe.ordinal == last_ordinal && probe.content_seq > epoch.quiet_seq {
             epoch.drew = true;
         }
@@ -533,7 +543,7 @@ impl EpochBook {
             if !epoch.logged {
                 epoch.logged = true;
                 self.logs.push(format!(
-                    "render epoch {} {}: class={} geom={}x{} shift={:+} pushed={} drew={}",
+                    "render epoch {} {}: class={} geom={}x{} shift={:+} pushed={} cut={} drew={}",
                     epoch.id,
                     epoch.verdict.wire(),
                     class.wire(),
@@ -541,6 +551,7 @@ impl EpochBook {
                     epoch.start.0,
                     epoch.shift,
                     epoch.pushed,
+                    epoch.cut,
                     u8::from(epoch.drew),
                 ));
             }
@@ -560,6 +571,7 @@ impl EpochBook {
                     epoch: epoch.id,
                     shift: epoch.shift,
                     pushed: epoch.pushed,
+                    cut: epoch.cut,
                     drew: epoch.drew,
                     class,
                     at_ms: epoch.t_ms,
@@ -630,7 +642,7 @@ impl EpochBook {
 /// The end of a superseded repair, the epoch judge's half of the repaint nudge
 /// (`RepaintNudge`'s `Report`). A real resize that left the engine elsewhere ended
 /// the attempt `superseded` (the program was given a size of its own). If that
-/// resize does not last, the epoch comes back to `desync-risk` (rows still owed, the
+/// resize does not last, the epoch comes back to `desync-risk` (debt still owed, the
 /// geometry back at its start, the risk wait spent) with its one try spent: the same
 /// give-up as a resize that comes back inside its wait. `Some(id)` once; the window
 /// raises the digest line (`App::arm_nudges`). A repaint by the program closes the
@@ -648,7 +660,7 @@ fn returned_at_risk(epoch: &mut Epoch) -> Option<u64> {
         .then_some(epoch.id)
 }
 
-/// `epoch <e> t=<ms> geom=<start>><now> shift=<+-k> pushed=<k> drew=<0|1>
+/// `epoch <e> t=<ms> geom=<start>><now> shift=<+-k> pushed=<k> cut=<k> drew=<0|1>
 /// class=<agent|learned|unknown> verdict=<open|desync-risk|unjudged|healed|
 /// restored> by=<app|undo|nudge|-> tried=<0|1>`
 pub(crate) fn wire_epoch(out: &mut String, epoch: &Epoch) {
@@ -656,14 +668,15 @@ pub(crate) fn wire_epoch(out: &mut String, epoch: &Epoch) {
     let geom = |(rows, cols): (u16, u16)| format!("{cols}x{rows}");
     let _ = writeln!(
         out,
-        "epoch {} t={} geom={}>{} shift={:+} pushed={} drew={} class={} verdict={} by={} \
-         tried={}",
+        "epoch {} t={} geom={}>{} shift={:+} pushed={} cut={} drew={} class={} verdict={} \
+         by={} tried={}",
         epoch.id,
         epoch.t_ms,
         geom(epoch.start),
         geom(epoch.now),
         epoch.shift,
         epoch.pushed,
+        epoch.cut,
         u8::from(epoch.drew),
         epoch.class.wire(),
         epoch.verdict.wire(),

@@ -16,7 +16,7 @@
 //! Codex's files are a third party's, so every reader refuses a shape it was
 //! not written for.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use aterm_json::Value;
 
@@ -98,7 +98,13 @@ pub fn package_entrypoint(text: &str) -> Option<PathBuf> {
         return None;
     }
     let entry = Path::new(v.get("entrypoint")?.as_str()?);
-    if entry.is_absolute() || entry.components().any(|c| c.as_os_str() == "..") {
+    // Names only, so the join stays under the root: on Windows a root-relative
+    // `/abs/codex` is not `is_absolute` (it has no drive), yet joined to the
+    // root it replaces everything but the drive, and `C:codex` keeps its own.
+    if entry
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+    {
         return None;
     }
     Some(entry.to_path_buf())

@@ -312,11 +312,61 @@ pub fn write_atomically(
     drop(file);
     written.map_err(|e| failed(&tmp, e))?;
     if replace {
-        std::fs::rename(&tmp, dest).map_err(|e| failed(dest, e))
+        again_while_refused(|| std::fs::rename(&tmp, dest)).map_err(|e| failed(dest, e))
     } else {
         // Only an exclusive operation can publish without replacement: a
         // theme may appear after any check that the name is free.
         publish_new(&tmp, dest, |from, to| std::fs::hard_link(from, to))
+    }
+}
+
+/// How many times [`again_while_refused`] tries the replace again; the waits
+/// between the tries grow by a millisecond each, about half a second in all.
+#[cfg(windows)]
+const REFUSED_TRIES: u64 = 30;
+
+/// `ERROR_SHARING_VIOLATION` and `ERROR_LOCK_VIOLATION`, which std maps to
+/// no [`std::io::ErrorKind`] of their own.
+#[cfg(windows)]
+const HELD_OS_ERRORS: [i32; 2] = [32, 33];
+
+/// `op`, tried again while Windows refuses it because another process holds
+/// one of its files; elsewhere, `op` once.
+///
+/// POSIX `rename(2)` replaces a name whoever has it open. `MoveFileExW`
+/// refuses while another process holds either file without delete sharing,
+/// and a file written moments before is exactly what a virus scanner or the
+/// search indexer is reading: `install_round_trips_in_a_scratch_folder`
+/// (aterm-theme-pack) failed about one run in ten on Windows with "Access is
+/// denied" on the rewrite right after a write. The old theme held answers
+/// `ERROR_ACCESS_DENIED` (5); the stage file just written held answers
+/// `ERROR_SHARING_VIOLATION` (32, "being used by another process"). Such a
+/// hold ends in milliseconds, so the replace is tried again, briefly, the
+/// way `atpkg::vendor_direct::durable::again_while_refused` does; a refusal
+/// that outlasts the tries (a real denial, a directory in the way) is the
+/// caller's error as before.
+fn again_while_refused<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    #[cfg(windows)]
+    {
+        let mut tries = 0;
+        loop {
+            match op() {
+                Err(e)
+                    if (e.kind() == std::io::ErrorKind::PermissionDenied
+                        || e.raw_os_error()
+                            .is_some_and(|c| HELD_OS_ERRORS.contains(&c)))
+                        && tries < REFUSED_TRIES =>
+                {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(tries));
+                }
+                done => return done,
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        op()
     }
 }
 
@@ -357,6 +407,81 @@ mod tests {
         dir
     }
 
+    /// A refused replace is tried again on Windows until it goes through,
+    /// and a refusal that never lifts is still the caller's error after a
+    /// bounded number of tries; any other error is returned at once.
+    /// Elsewhere the operation runs once.
+    #[test]
+    fn a_refused_replace_is_tried_again_only_on_windows_and_only_so_often() {
+        use std::io::{Error, ErrorKind};
+        let mut calls = 0u64;
+        let out = again_while_refused(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(Error::from(ErrorKind::PermissionDenied))
+            } else {
+                Ok(calls)
+            }
+        });
+        if cfg!(windows) {
+            assert_eq!(out.unwrap(), 3, "two refusals, then the replace");
+        } else {
+            assert_eq!(out.unwrap_err().kind(), ErrorKind::PermissionDenied);
+            assert_eq!(calls, 1);
+        }
+
+        let mut calls = 0u64;
+        let out: std::io::Result<()> = again_while_refused(|| {
+            calls += 1;
+            Err(Error::from(ErrorKind::PermissionDenied))
+        });
+        assert_eq!(out.unwrap_err().kind(), ErrorKind::PermissionDenied);
+        #[cfg(windows)]
+        assert_eq!(calls, REFUSED_TRIES + 1, "bounded");
+        #[cfg(not(windows))]
+        assert_eq!(calls, 1);
+
+        // The stage file held by a scanner: `ERROR_SHARING_VIOLATION` and
+        // `ERROR_LOCK_VIOLATION`, which carry no kind of their own.
+        for code in [32, 33] {
+            let mut calls = 0u64;
+            let out = again_while_refused(|| {
+                calls += 1;
+                if calls < 3 {
+                    Err(Error::from_raw_os_error(code))
+                } else {
+                    Ok(calls)
+                }
+            });
+            if cfg!(windows) {
+                assert_eq!(
+                    out.unwrap(),
+                    3,
+                    "os error {code}: two holds, then the replace"
+                );
+            } else {
+                assert_eq!(out.unwrap_err().raw_os_error(), Some(code));
+                assert_eq!(calls, 1);
+            }
+        }
+
+        // Negative control: another error is never retried, by kind or by
+        // raw code (`ERROR_FILE_NOT_FOUND`).
+        let others: [fn() -> Error; 2] = [
+            || Error::from(ErrorKind::NotFound),
+            || Error::from_raw_os_error(2),
+        ];
+        for error in others {
+            let mut calls = 0u64;
+            let out: std::io::Result<()> = again_while_refused(|| {
+                calls += 1;
+                Err(error())
+            });
+            assert_eq!(out.unwrap_err().kind(), ErrorKind::NotFound);
+            assert_eq!(calls, 1);
+        }
+    }
+
     #[test]
     fn a_failed_exclusive_publication_never_falls_back_to_overwriting() {
         let root = scratch("exclusive");
@@ -389,34 +514,21 @@ mod tests {
 
     /// An arbitrary export filename can be our usual temporary basename.
     /// Publication and cleanup must leave the complete destination behind,
-    /// including when the destination is spelled without its `.` parent.
+    /// including when the destination is spelled without its `.` parent. That
+    /// spelling names the working directory, so it runs in a re-exec of this
+    /// test whose working directory is a scratch folder: never the folder the
+    /// test binary was started in (the crate's source under `cargo test`, a
+    /// read-only mount on the Linux lane).
     #[test]
     fn publication_keeps_a_destination_named_like_its_temporary_file() {
-        struct Cleanup(PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.0);
-            }
-        }
-
-        let dir = scratch("temp-destination");
+        const BARE_NAME: &str = "ATERM_TYPES_SCHEME_INSTALL_BARE_NAME";
+        const LAST: &str = "foreground = #000000\nbackground = #ffffff\n";
         let id = format!("export-alias-{:?}", std::thread::current().id());
         let name = format!(".{id}.conf.import-{}", std::process::id());
-        let relative = PathBuf::from(&name);
-        assert_eq!(
-            std::fs::symlink_metadata(&relative).unwrap_err().kind(),
-            std::io::ErrorKind::NotFound
-        );
-        let _relative_cleanup = Cleanup(relative.clone());
-        let explicit = dir.join(&name);
-        let _explicit_cleanup = Cleanup(explicit.clone());
-        for (parent, dest) in [
-            (Path::new("."), relative.as_path()),
-            (dir.as_path(), &explicit),
-        ] {
+        let publish = |parent: &Path, dest: &Path| {
             for (replace, text) in [
                 (false, "foreground = #ffffff\nbackground = #000000\n"),
-                (true, "foreground = #000000\nbackground = #ffffff\n"),
+                (true, LAST),
             ] {
                 write_atomically(parent, dest, &id, text.as_bytes(), replace).unwrap();
                 let actual = std::fs::read_to_string(dest).expect("published destination remains");
@@ -426,7 +538,56 @@ mod tests {
                     scheme::parse_theme_str(text).unwrap()
                 );
             }
+        };
+        if std::env::var_os(BARE_NAME).is_some() {
+            let bare = PathBuf::from(&name);
+            assert_eq!(
+                std::fs::symlink_metadata(&bare).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+            publish(Path::new("."), &bare);
+            return;
         }
+        let dir = scratch("temp-destination");
+        publish(&dir, &dir.join(&name));
+        let cwd = dir.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let test = format!(
+            "{}::publication_keeps_a_destination_named_like_its_temporary_file",
+            module_path!().split_once("::").map_or("", |(_, rest)| rest)
+        );
+        let out = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
+            .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+            .env(BARE_NAME, "1")
+            .current_dir(&cwd)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .output()
+            .expect("re-exec the test binary");
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "the re-exec failed:\n{said}");
+        assert!(
+            said.contains("1 passed"),
+            "the re-exec ran no test:\n{said}"
+        );
+        // The bare name landed in the re-exec's working directory, whole, and
+        // the staging folder went with publication.
+        let left: Vec<_> = std::fs::read_dir(&cwd)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(
+            left[0]
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".export-alias-")),
+            "{left:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&left[0]).unwrap(), LAST);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

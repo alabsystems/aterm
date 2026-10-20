@@ -22,7 +22,7 @@ use aterm_core::selection::SelectionType;
 use aterm_core::terminal::{RenderCell, Terminal, UnderlineStyle};
 use aterm_search::{LineFrame, MAX_SEARCH_MATCHES};
 use aterm_types::text_shaping::AmbiguousWidth;
-use winit::event_loop::EventLoopProxy;
+use aterm_window::event_loop::EventLoopProxy;
 
 use super::{
     DimsSnapshot, control_media, cursor_style_name, image_payload, json_ok, json_str_field,
@@ -1039,7 +1039,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
              n_reflow={} reflow_p50_ms={:.2} reflow_p95_ms={:.2} reflow_p99_ms={:.2} \
              n_present_tainted={} present_tainted_p50_ms={:.2} \
              present_tainted_p95_ms={:.2} present_tainted_p99_ms={:.2} \
-             turns_by_root={} main_busy_ms_per_s={:.2}{}{}{}{}\n",
+             turns_by_root={} main_busy_ms_per_s={:.2}{}{}{}{}{gpu}\n",
             input.count(),
             p(input, 0.50),
             p(input, 0.95),
@@ -1115,6 +1115,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
             // `present_*`), the IME preedit → commit clock, and the inputs a
             // full input queue refused.
             crate::metrics::input_legs_fields_text(),
+            gpu = crate::metrics::gpu_fields_text(),
         );
     }
     if !matches!(rest.trim(), "" | "reset") {
@@ -1179,7 +1180,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          frame_refills_scoped={} frame_refills_full={} frame_refills_skipped={} \
          pet_world_observations={} pet_world_cells={} \
          fx_glow_quads_last={} fx_under_quads_last={} fx_trail_cells_last={} \
-         fx_under_frames={} \
+         fx_under_frames={}{} \
          frame_refill_full_causes={} \
          offscreen_rasters={} last_offscreen_raster_ms={:.2} \
          max_offscreen_raster_ms={:.2} \
@@ -1231,7 +1232,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          startup_gpu_cell_pipeline_ms={} \
          effect_pipeline_builds={} effect_pipeline_build_ms={:.2} \
          effect_pipelines_built={} \
-         first_present_ms={:.2} first_visible_ms={:.2}{}{}{}{}{}{}{}{}\n",
+         first_present_ms={:.2} first_visible_ms={:.2}{}{}{}{}{}{}{}{}{}{gpu}\n",
         m.frames_presented,
         ms(m.last_present_latency_ns),
         ms(m.max_present_latency_ns),
@@ -1279,6 +1280,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         m.fx_under_quads_last,
         m.fx_trail_cells_last,
         m.fx_under_frames,
+        crate::metrics::frame_fields_text(),
         refill_cause_pairs(&refill_causes),
         // THE PIXELS THAT NEVER REACH GLASS. `record_offscreen_raster` exists
         // so an `image` / `window` / `snapshot` rasterization stops moving
@@ -1443,9 +1445,13 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         // open beside the live sessions that own one — a lead that stays is a
         // closed tab's master nothing will close.
         crate::metrics::pty_census_fields_text(),
+        // THE IDENTITY PRIMER (2026-10-17): the re-prime passes still writing
+        // into an identity's folder, off the spawn that handed them off.
+        crate::agent_identity::metrics_fields_text(),
         // THE WARM SPARE (`crate::spare`): its state and age, its PTY, the
         // learned gate, adoptions, misses, discards and budgets.
         crate::spare::metrics_fields_text(),
+        gpu = crate::metrics::gpu_fields_text(),
     )
 }
 
@@ -1779,7 +1785,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
              \"reflow_p99_ms\":{:.2},\"n_present_tainted\":{},\
              \"present_tainted_p50_ms\":{:.2},\"present_tainted_p95_ms\":{:.2},\
              \"present_tainted_p99_ms\":{:.2},\"turns_by_root\":{},\
-             \"main_busy_ms_per_s\":{:.2}{}{}{}{}}}",
+             \"main_busy_ms_per_s\":{:.2}{}{}{}{}{gpu}}}",
             input.count(),
             p(input, 0.50),
             p(input, 0.95),
@@ -1844,6 +1850,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
             crate::metrics::present_glass_fields_json(),
             // Field-for-field twin of the text form's input-leg fragment.
             crate::metrics::input_legs_fields_json(),
+            gpu = crate::metrics::gpu_fields_json(),
         ));
     }
     if !matches!(command.trim(), "" | "reset") {
@@ -1892,7 +1899,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"frame_refills_skipped\":{},\
          \"pet_world_observations\":{},\"pet_world_cells\":{},\
          \"fx_glow_quads_last\":{},\"fx_under_quads_last\":{},\"fx_trail_cells_last\":{},\
-         \"fx_under_frames\":{},\
+         \"fx_under_frames\":{}{},\
          \"frame_refill_full_causes\":{},\
          \"offscreen_rasters\":{},\"last_offscreen_raster_ms\":{:.2},\
          \"max_offscreen_raster_ms\":{:.2},\"pre_present_attempts\":{},\
@@ -1947,7 +1954,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"startup_gpu_cell_pipeline_ms\":{},\
          \"effect_pipeline_builds\":{},\"effect_pipeline_build_ms\":{:.2},\
          \"effect_pipelines_built\":\"{}\",\
-         \"first_present_ms\":{:.2},\"first_visible_ms\":{:.2}{}{}{}{}{}{}{}{}}}",
+         \"first_present_ms\":{:.2},\"first_visible_ms\":{:.2}{}{}{}{}{}{}{}{}{}{gpu}}}",
         m.frames_presented,
         ms(m.last_present_latency_ns),
         ms(m.max_present_latency_ns),
@@ -1995,6 +2002,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         m.fx_under_quads_last,
         m.fx_trail_cells_last,
         m.fx_under_frames,
+        crate::metrics::frame_fields_json(),
         refill_cause_object(&refill_causes),
         // Field-for-field twin of the text form's offscreen-raster ledger.
         m.offscreen_rasters,
@@ -2114,6 +2122,9 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         crate::control_listener::fields_json(),
         // Field-for-field twin of the text summary's PTY census.
         crate::metrics::pty_census_fields_json(),
+        // Field-for-field twin of the text summary's identity-primer fragment.
+        crate::agent_identity::metrics_fields_json(),
+        gpu = crate::metrics::gpu_fields_json(),
     ))
 }
 
@@ -2575,11 +2586,8 @@ pub(crate) fn read_abs_rows(
                     wrapped.push((start > 0 || k > 0) && line.is_wrapped());
                     let row = line.to_string();
                     if let Some(cells) = cells.as_deref_mut() {
-                        let idx = usize::try_from(start)
-                            .unwrap_or(usize::MAX)
-                            .saturating_add(k);
                         cells.push(aterm_core::terminal::history_line_text_cells(
-                            grid, idx, &line, &row,
+                            grid, &line, &row,
                         ));
                     }
                     text.push(row);
@@ -4557,10 +4565,11 @@ pub(crate) fn story_usage() -> String {
 }
 
 /// The grammar of `story <verb> [<text>]`, checked on the control thread so a
-/// junk form is a usage error and never a wake: the verb is one of the CLOSED
-/// SET (design §5: `approved dismissed reconnected timeout exit compacted
-/// warned`, plus `chose` — the in-window supervisor answering Claude Code's
-/// question box by policy, the question-policy contract v3 of 2026-09-24),
+/// junk form is a usage error and never a wake: the verb is the CLOSED SET,
+/// `chose` alone — the in-window supervisor answering Claude Code's question
+/// box by policy (the question-policy contract v3 of 2026-09-24); the seven
+/// words no process sent are usage errors since the owner surfaces
+/// (2026-10-16 §7),
 /// the text is optional, trimmed, at most
 /// [`TOLD_TEXT_MAX_BYTES`] bytes, and carries no control byte (a newline could
 /// forge a second reply line; the band would strip it, but the wire refuses
@@ -4585,24 +4594,32 @@ pub(crate) fn parse_story(rest: &str) -> Result<(crate::presence::StoryVerb, Str
     Ok((verb, text.to_string()))
 }
 
-/// `story <verb> [<text>]` -> `OK story=<n>`: the watcher's decision (or, for
-/// `chose`, the supervisor's question choice) for the target session, told to
-/// its window (design §5). The write face of the
-/// presence band, beside `appnotice` for the pull-down: watcher decisions live
-/// in another process (`aterm drive watch`'s journal loop) and reach the GUI no
-/// other way. `<n>` is the story point's seq — the number `status story=`
-/// reports once it has landed, so a poller can tell its own post from an older
-/// one. The grammar is [`parse_story`]'s; the point is noted on the main thread
+/// `story chose [<text>]` -> `OK story=<n>`: the supervisor's question choice
+/// for the target session, a RECORD (`status story=`): the hosted loop's
+/// `story chose <word>` is the one producer, and the seven other words no
+/// process sent went with the presence row that showed them (owner surfaces,
+/// 2026-10-16 §7). An Owner verb. `<n>` is the story point's seq — the number
+/// `status story=` reports once it has landed, so a poller can tell its own
+/// post from an older one. The grammar is [`parse_story`]'s (the text is
+/// validated and reaches no surface); the point is noted on the main thread
 /// (`Wake::Story`) because the slot is `App` state.
-pub(crate) fn cmd_story(proxy: &EventLoopProxy<Wake>, session: u64, rest: &str) -> String {
-    let (verb, text) = match parse_story(rest) {
-        Ok(parsed) => parsed,
+///
+/// `by` is the teller the session log's `story` mark names (the wire's
+/// `log_actor`).
+pub(crate) fn cmd_story(
+    proxy: &EventLoopProxy<Wake>,
+    session: u64,
+    rest: &str,
+    by: aterm_slog::Actor,
+) -> String {
+    let verb = match parse_story(rest) {
+        Ok((verb, _text)) => verb,
         Err(error) => return error,
     };
     match control_media::call_main(proxy, |reply| Wake::Story {
         session,
         verb,
-        text,
+        by,
         reply,
     }) {
         Ok(Ok(seq)) => format!("OK story={seq}\n"),
@@ -4663,7 +4680,7 @@ pub(crate) fn cmd_text_json(term: &Arc<Mutex<Terminal>>) -> String {
 /// (`"launch":null`).
 #[cfg(test)]
 pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> String {
-    cmd_text_json_read(term, args, None, 0, None)
+    cmd_text_json_read(term, args, None, None, 0, None)
 }
 
 /// [`cmd_text_json_opt`] as the dispatch answers it: `human_ms` (2026-09-25)
@@ -4680,34 +4697,37 @@ pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> 
 /// ([`crate::launch_witness`]), read inside the same terminal-lock hold as the
 /// rows and judged against that `human_seq`: `{"id","seq","word","why":"person"}`,
 /// `{"why":"<word>"}` for any other word, `null` for no mark.
-/// `text --json` as the session's own verb serves it: the read is noted as a
-/// LOOK at the session's screen generation first
-/// ([`crate::presence::GenerationLook`]: its `"gen"` is what an `if-gen=`
-/// fence names, and the presence row's pending fold waits its quiet past it,
-/// ruling 394), then [`cmd_text_json_read`] with the session's `human_ms`
-/// and `human_seq` — the count before the age, both before the screen, so a
-/// person's key after this is one the fence sees.
+/// `text --json` as the session's own verb serves it: [`cmd_text_json_read`]
+/// with the session's `human_ms` and `human_seq` — the count before the age,
+/// both before the screen, so a person's key after this is one the fence
+/// sees.
 pub(crate) fn cmd_text_json_looked(
     term: &Arc<Mutex<Terminal>>,
     ctx: &crate::SessionCtx,
     args: TextArgs,
 ) -> String {
     let now_us = crate::metrics::now_us();
-    ctx.generation_look.note(now_us);
     let human_seq = ctx.human_input.seq();
     cmd_text_json_read(
         term,
         args,
         ctx.human_input.ms_since(now_us),
+        ctx.human_input.unkeyed_ms(now_us),
         human_seq,
         Some(&ctx.launch),
     )
 }
 
+/// [`cmd_text_json_looked`]'s reply; `unkeyed_ms`
+/// ([`crate::human_input::HumanInputStamp::unkeyed_ms`], the review of LC-4)
+/// is how long the host has served a session no person keyed, written
+/// `"unkeyed_ms":N` LAST, and only beside a `"human_ms":null`: a never that
+/// says since when.
 pub(crate) fn cmd_text_json_read(
     term: &Arc<Mutex<Terminal>>,
     args: TextArgs,
     human_ms: Option<u64>,
+    unkeyed_ms: Option<u64>,
     human_seq: u64,
     launch: Option<&crate::launch_witness::LaunchWitness>,
 ) -> String {
@@ -4806,6 +4826,9 @@ pub(crate) fn cmd_text_json_read(
             }
             out.push(']');
         }
+        if let (None, Some(ms)) = (human_ms, unkeyed_ms) {
+            let _ = write!(out, ",\"unkeyed_ms\":{ms}");
+        }
         out.push('}');
     }
     out.push('\n');
@@ -4852,10 +4875,14 @@ fn push_bool(out: &mut String, v: bool) {
 /// grapheme (same source as `cell`/`text`); `wide_lead` is the only geometry field
 /// (the raw `WIDE` flag), kept distinct from the `wide` right-half continuation.
 ///
-/// NOTE on semantic boundary: `dim`/`blink`/`inverse`/`hidden` are baked into the
+/// NOTE on semantic boundary: `dim`/`inverse`/`hidden` are baked into the
 /// resolved `fg`/`bg` by `render_row` and are deliberately NOT reported as attrs
 /// (recovering them is the raw-flags path; byte-exact SGR replay is the `cast`
-/// raw-bytes channel's job, not this resolved-screen view).
+/// raw-bytes channel's job, not this resolved-screen view). `blink` is not a
+/// colour, and `render_row` folds it into nothing, so it IS an attr, read off the
+/// raw `BLINK` flag as `wide_lead` is off `WIDE`: without it the frame lost the
+/// blink `cell` reported on the same cell (measured 2026-10-17, the inbox console
+/// host's `ESC[5m`).
 ///
 /// Serializes from a [`StyledCellSnap`] gathered under the terminal lock, so the
 /// per-cell `format!` — the bulk of the frame cost — runs with the lock released.
@@ -4910,6 +4937,9 @@ fn write_styled_cell_json(
     }
     if cell.underline != UnderlineStyle::None {
         attr(out, "underline");
+    }
+    if snap.blink {
+        attr(out, "blink");
     }
     if cell.strikethrough {
         attr(out, "strike");
@@ -5079,11 +5109,12 @@ struct StyledLink {
 }
 
 /// One cell's raw material for [`serialize_styled_frame`]: the resolved
-/// [`RenderCell`] plus the three grid-side fields it does not carry — the
+/// [`RenderCell`] plus the four grid-side fields it does not carry — the
 /// combining-aware grapheme, the raw `WIDE` lead flag (the live cell's own flag
-/// bit, NOT the resolved `RenderCell::wide`), and the OSC 8 hyperlink target. All
-/// copied under the terminal lock; serialized without it. It owns no heap: the
-/// grapheme lives in its row's buffer and the link in the frame's table.
+/// bit, NOT the resolved `RenderCell::wide`), the raw `BLINK` flag, and the OSC 8
+/// hyperlink target. All copied under the terminal lock; serialized without it.
+/// It owns no heap: the grapheme lives in its row's buffer and the link in the
+/// frame's table.
 struct StyledCellSnap {
     cell: RenderCell,
     /// Byte range of this cell's grapheme inside its row's
@@ -5091,6 +5122,8 @@ struct StyledCellSnap {
     /// [`StyledRowSnap::glyph`], never on its own.
     glyph: std::ops::Range<usize>,
     wide_lead: bool,
+    /// SGR 5/6, which [`RenderCell`] does not carry.
+    blink: bool,
     /// Index into the frame's [`StyledFrameSnapshot::links`] table, or
     /// [`NO_LINK`].
     link: u32,
@@ -5397,13 +5430,16 @@ pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
             // and `cols` are the grid's own).
             let glyph_start = glyphs.len();
             t.cell_grapheme_into(r, c, &mut glyphs);
+            let raw = view.cell(col);
             row_cells.push(StyledCellSnap {
                 cell: rc.unwrap_or(blank),
                 glyph: glyph_start..glyphs.len(),
                 // Raw WIDE lead bit straight off the live cell: the retired
                 // `cell_attrs(..).contains(WIDE)` read the same inline bit, and a
                 // missing cell yields `false` on both paths.
-                wide_lead: view.cell(col).is_some_and(|cell| cell.is_wide()),
+                wide_lead: raw.is_some_and(|cell| cell.is_wide()),
+                // `cell`'s `blink`, off the same inline flags.
+                blink: raw.is_some_and(|cell| cell.flags().contains(CellFlags::BLINK)),
                 link,
             });
         }
@@ -5609,10 +5645,14 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         rain_quads: _, // OMITTED: host-owned PHOSPHOR rain sprite quads (render bling), not engine cell content
         rain_atlas: _, // OMITTED: host-owned PHOSPHOR rain glyph atlas (texture), not engine cell content
         rain_add: _, // OMITTED: host-owned PHOSPHOR rain additive halos (render bling), not engine cell content
+        fx_layers: _, // OMITTED: host-owned retained fx layers (the engine's sprite/bitmap primitive), not engine cell content
+        fx_occluders: _, // OMITTED: host chrome rects subtracted from the fx layers, not engine cell content
+        fx_prefetch: _,  // OMITTED: GPU residency hints for fx arts; draw nothing
         display_offset: _, // OMITTED: viewport scroll position, not visible-cell content
         base_y: _, // OMITTED: host-consumed re-anchor metadata (absolute row of the top line), not visible-cell content
         absolute_row_revision: _, // OMITTED: host-consumed absolute-row coordinate-space revision, not visible-cell content
         history_renumber_epoch: _, // OMITTED: host-consumed wholesale-renumber epoch (its twin), not visible-cell content
+        holder: _, // OMITTED: host-consumed holder fence (which rows a card may be decorated on), not visible-cell content
         scroll_frac_px: _, // OMITTED: M1b sub-row present translate, display-only (not cell content)
         grid_top_row: _,   // OMITTED: M1b grid/chrome partition, display-only
         grid_bot_row: _,   // OMITTED: M1b grid/chrome partition, display-only
@@ -5688,6 +5728,7 @@ fn _styled_cell_snap_is_fully_serialized(snap: &StyledCellSnap) {
         cell: _,
         glyph: _,     // "glyph" — a range into its row's buffer
         wide_lead: _, // "wide_lead"
+        blink: _,     // "blink" in "attrs"
         // "hyperlink" + "hyperlink_id" (ONE interned StyledLink, or NO_LINK)
         link: _,
     } = snap;
@@ -7605,6 +7646,9 @@ mod tests {
     /// rest` used to read as a successful reset while zeroing nothing.
     #[test]
     fn metrics_refuses_an_unknown_argument_and_resets_nothing() {
+        // The metrics tests that `reset()` hold this lock; without it one of them can zero the
+        // counter between the record and the read, which reads as a refused argument resetting.
+        let _serial = crate::metrics::scheduler_state_serial();
         crate::metrics::record_offscreen_raster(1_000_000);
         for arg in ["rest", "percentile", "reset now", "percentiles reset"] {
             assert_eq!(
@@ -8204,18 +8248,19 @@ mod trim_tests {
     #[test]
     fn text_json_carries_the_persons_stamp_after_gen() {
         let term = term_with(24, &numbered(22));
-        let never = super::cmd_text_json_read(&term, TextArgs::default(), None, 0, None);
+        let never = super::cmd_text_json_read(&term, TextArgs::default(), None, None, 0, None);
         assert!(
             never.contains(",\"human_ms\":null,\"human_seq\":0,\"launch\":null}"),
             "{never}"
         );
-        let keyed = super::cmd_text_json_read(&term, TextArgs::default(), Some(12_345), 3, None);
+        let keyed =
+            super::cmd_text_json_read(&term, TextArgs::default(), Some(12_345), None, 3, None);
         let gen_at = keyed.find("\"gen\":").expect("gen");
         let human_at = keyed
             .find(",\"human_ms\":12345,\"human_seq\":3,\"launch\":null}")
             .expect("human_ms, human_seq and launch, closing");
         assert!(gen_at < human_at, "{keyed}");
-        let shaped = super::cmd_text_json_read(&term, args("tail=5 trim"), Some(7), 9, None);
+        let shaped = super::cmd_text_json_read(&term, args("tail=5 trim"), Some(7), None, 9, None);
         assert!(
             shaped.ends_with(
                 ",\"human_ms\":7,\"human_seq\":9,\"launch\":null,\"trimmed\":2,\"first\":19}\n"
@@ -8224,6 +8269,20 @@ mod trim_tests {
         );
         // NEGATIVE CONTROL: the test spelling is the never-keyed session.
         assert_eq!(cmd_text_json_opt(&term, TextArgs::default()), never);
+        // A never that says since when (`"unkeyed_ms"`, last, the review of
+        // LC-4): beside `null` alone, never beside an age.
+        let served =
+            super::cmd_text_json_read(&term, args("tail=5 trim"), None, Some(5_000), 0, None);
+        assert!(
+            served.ends_with(
+                ",\"human_ms\":null,\"human_seq\":0,\"launch\":null,\"trimmed\":2,\"first\":19,\
+                 \"unkeyed_ms\":5000}\n"
+            ),
+            "{served}"
+        );
+        let keyed =
+            super::cmd_text_json_read(&term, TextArgs::default(), Some(7), Some(5_000), 0, None);
+        assert!(!keyed.contains("unkeyed_ms"), "{keyed}");
     }
 
     /// `"launch"` (the launch witness, `crate::launch_witness`) is judged
@@ -8241,7 +8300,7 @@ mod trim_tests {
             word: Some("claude"),
             why: Why::Person,
         });
-        let at = super::cmd_text_json_read(&term, args("tail=5 trim"), Some(7), 9, Some(&w));
+        let at = super::cmd_text_json_read(&term, args("tail=5 trim"), Some(7), None, 9, Some(&w));
         assert!(
             at.ends_with(
                 ",\"human_seq\":9,\"launch\":{\"id\":4,\"seq\":9,\"word\":\"claude\",\
@@ -8249,7 +8308,8 @@ mod trim_tests {
             ),
             "{at}"
         );
-        let moved = super::cmd_text_json_read(&term, TextArgs::default(), Some(7), 10, Some(&w));
+        let moved =
+            super::cmd_text_json_read(&term, TextArgs::default(), Some(7), None, 10, Some(&w));
         assert!(
             moved.ends_with(",\"human_seq\":10,\"launch\":{\"why\":\"since\"}}\n"),
             "{moved}"
@@ -8947,10 +9007,10 @@ mod offscreen_tests {
 
 #[cfg(test)]
 mod story_tests {
-    //! The `story` verb's grammar (round 19, item 5): every junk form is the
-    //! usage line, the closed set is exactly the design's seven words plus
-    //! `chose` (the question-policy contract v3, 2026-09-24), and the text cap
-    //! is the wire cap.
+    //! The `story` verb's grammar: every junk form is the usage line, the
+    //! closed set is `chose` alone (the question-policy contract v3,
+    //! 2026-09-24; the seven unsent words went with the presence row,
+    //! 2026-10-16), and the text cap is the wire cap.
 
     use super::{parse_story, story_usage};
     use crate::presence::{StoryVerb, TOLD_TEXT_MAX_BYTES};
@@ -8962,41 +9022,32 @@ mod story_tests {
             "",
             "   ",
             "approve",
-            "APPROVED",
-            "approved,",
-            "hold on",
-            "✓ approved",
+            "chosen",
+            "CHOSE",
+            "choose",
             "42",
-            "@s-1 approved",
-            "exited session gone",
-            "story approved",
+            "@s-1 chose",
+            "story chose",
+            // The seven words no process sent: refused now.
+            "approved",
+            "dismissed",
+            "reconnected",
+            "timeout",
+            "exit",
+            "compacted",
+            "warned",
         ] {
             assert_eq!(parse_story(junk), Err(usage.clone()), "{junk:?}");
         }
-        for (word, verb) in [
-            ("approved", StoryVerb::Approval),
-            ("dismissed", StoryVerb::Dismissed),
-            ("reconnected", StoryVerb::Reconnected),
-            ("timeout", StoryVerb::Timeout),
-            ("exit", StoryVerb::Exit),
-            ("compacted", StoryVerb::Compacted),
-            ("warned", StoryVerb::Warned),
-            ("chose", StoryVerb::Chose),
-        ] {
-            assert_eq!(parse_story(word), Ok((verb, String::new())), "{word}");
-            assert_eq!(
-                parse_story(&format!("  {word}   some text here  ")),
-                Ok((verb, "some text here".to_string())),
-                "{word}: the text is trimmed and kept whole"
-            );
-        }
+        assert_eq!(parse_story("chose"), Ok((StoryVerb::Chose, String::new())));
         assert_eq!(
-            parse_story("chose recommended"),
-            Ok((StoryVerb::Chose, "recommended".to_string())),
-            "the supervisor tells its policy word as the text"
+            parse_story("  chose   some text here  "),
+            Ok((StoryVerb::Chose, "some text here".to_string())),
+            "the text is trimmed and kept whole"
         );
-        for junk in ["chosen", "CHOSE", "choose"] {
-            assert_eq!(parse_story(junk), Err(usage.clone()), "{junk:?}");
+        assert_eq!(StoryVerb::TOLD_WORDS.len(), 1, "the closed set is `chose`");
+        for word in StoryVerb::TOLD_WORDS {
+            assert!(StoryVerb::parse_told(word).is_some(), "{word}");
         }
     }
 
@@ -9004,25 +9055,25 @@ mod story_tests {
     fn the_text_is_capped_at_the_wire_cap_and_refuses_control_bytes() {
         let ok = "x".repeat(TOLD_TEXT_MAX_BYTES);
         assert_eq!(
-            parse_story(&format!("exit {ok}")),
-            Ok((StoryVerb::Exit, ok.clone()))
+            parse_story(&format!("chose {ok}")),
+            Ok((StoryVerb::Chose, ok.clone()))
         );
         let long = "x".repeat(TOLD_TEXT_MAX_BYTES + 1);
         assert_eq!(
-            parse_story(&format!("exit {long}")),
+            parse_story(&format!("chose {long}")),
             Err(format!(
                 "ERR story: text is longer than {TOLD_TEXT_MAX_BYTES} bytes\n"
             ))
         );
         // Bytes, not chars: a multi-byte text is measured as the wire sees it.
         let wide = "é".repeat(TOLD_TEXT_MAX_BYTES / 2 + 1);
-        assert!(parse_story(&format!("warned {wide}")).is_err());
+        assert!(parse_story(&format!("chose {wide}")).is_err());
         assert_eq!(
-            parse_story("exit session gone\nOK forged"),
+            parse_story("chose session gone\nOK forged"),
             Err("ERR story: text carries a control character\n".to_string())
         );
         assert_eq!(
-            parse_story("exit tab\there"),
+            parse_story("chose tab\there"),
             Err("ERR story: text carries a control character\n".to_string())
         );
     }
@@ -9360,6 +9411,9 @@ mod styled_frame_fusion_parity {
                     cell: rendered.get(c).copied().unwrap_or(blank),
                     glyph: start..glyphs.len(),
                     wide_lead: view.cell(c as u16).is_some_and(|cell| cell.is_wide()),
+                    blink: view.cell(c as u16).is_some_and(|cell| {
+                        cell.flags().contains(aterm_core::grid::CellFlags::BLINK)
+                    }),
                     link,
                 });
             }

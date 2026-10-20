@@ -1,4 +1,0 @@
- ERROR ay_dpll::executor::proof::check::internal internal proof checker rejected UNSAT proof, error=proof validation cancelled by the caller (interrupt, deadline, or memory limit), checked_steps=7, skipped_hole_steps=0, total_steps=7
-note: trust: memory census: 71 bodies verified and compacted, 1 compacted slots recomputed, 0 bodies skipped at the memory ceiling; resident 0.3 GiB, peak 0.3 GiB, ceiling 3.0 GiB
-Summary: 50 proved, 18 failed, 0 runtime-checked, 0 assumed, 4 mandated, 0 contract-panic, 67 inconclusive (139 total)
-Coverage: 71/71 eligible function bodies verified (complete)

@@ -59,6 +59,17 @@
 //! the session unheld — the owner's stop silently gone. Now the fleet's lift
 //! leaves it standing, and an Owner act never touches the fleet's slot.
 //!
+//! THE THIRD ORIGIN IS THE PERSON'S (`origin=person`, Take Over at the window,
+//! `docs/DESIGN-owner-surfaces-2026-10-16.md` §4). It is the halt the owner's
+//! local stop could not be: no socket names it (`hold … origin=person` is
+//! [`HOLD_PERSON_USAGE`]), an Owner or bridge `hold off` lifts its own slot and
+//! answers `OK hold=1` beside it, and only the window's Take Over and Hand
+//! Back ([`person_hold`], [`HoldIssuer::Person`]) move it. While it — or any
+//! hold — stands, the app verbs (`invoke`, `tab`, `pane`, `hwkey`, `pointer`,
+//! `confirm`) are refused instance-wide ([`app_halt_refusal`]): that is what
+//! keeps an agent from `hwkey`ing the Hand Back shortcut or `pointer`-clicking
+//! its pill.
+//!
 //! ## A dead bridge: an advisory by default, fail closed on request
 //!
 //! By default since the owner's direction of 2026-09-29 ("stop adding blockers
@@ -78,8 +89,10 @@
 //!
 //! THE ONLY LIFT OF A FLEET HOLD IS A RECONNECTING BRIDGE, and that is a
 //! narrower promise than this header used to make. [`apply_hold`] has exactly
-//! two production callers — [`cmd_hold`] and [`bridge_lost`] — and there is no
-//! menu item, key binding, palette action or config path that clears a hold. The
+//! three production callers — [`cmd_hold`], [`bridge_lost`] and the window's
+//! [`person_hold`], which names the person's own slot and no other — and there
+//! is no menu item, key binding, palette action or config path that clears a
+//! fleet or local hold. The
 //! Owner token's `hold off` lifts a LOCAL hold and nothing else: against
 //! `origin=fleet`, or with only a fleet hold standing, it is `ERR denied`.
 //! DESIGN §11.2 and an earlier version of
@@ -140,9 +153,7 @@
 //! carries no agent.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
-#[cfg(any(unix, test, debug_assertions))]
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 
 use aterm_control::wire::pct_encode;
@@ -166,6 +177,15 @@ pub trait FabricSession: Send + Sync {
     /// lock held — the sanctioned fabric → timeline nesting — so the
     /// implementation takes the timeline lock and nothing else.
     fn record(&self, kind: &'static str, payload: String);
+    /// [`Self::record`], with what the record says TYPED ([`FabricFact`]) for
+    /// the session log's mark beside it, written in the same timeline hold.
+    /// `true` when the log's readers are owed a wake, which the caller gives
+    /// once the fabric lock is released. The default records and owes none.
+    fn record_fact(&self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
+        let _ = fact;
+        self.record(kind, payload);
+        false
+    }
     /// Tell the presence band this session's mail or hold moved. Called with
     /// no fabric lock held.
     fn fabric_changed(&self);
@@ -184,6 +204,9 @@ impl<T: FabricSession + ?Sized> FabricSession for Arc<T> {
     fn record(&self, kind: &'static str, payload: String) {
         (**self).record(kind, payload);
     }
+    fn record_fact(&self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
+        (**self).record_fact(kind, payload, fact)
+    }
     fn fabric_changed(&self) {
         (**self).fabric_changed();
     }
@@ -198,6 +221,46 @@ impl<T: FabricSession + ?Sized> FabricSession for Arc<T> {
 pub trait Timeline {
     /// Append one `kind` record carrying `payload`.
     fn record(&mut self, kind: &'static str, payload: String);
+    /// [`Self::record`] with its typed [`FabricFact`] (see
+    /// [`FabricSession::record_fact`]); the default records and owes none.
+    fn record_fact(&mut self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
+        let _ = fact;
+        self.record(kind, payload);
+        false
+    }
+}
+
+/// WHAT A FABRIC RECORD SAYS, TYPED, for the session log's mark beside it
+/// ([`FabricSession::record_fact`]), so nothing parses a timeline payload
+/// back: ids, words and offsets only — never a body, a reason or a topic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FabricFact<'a> {
+    /// A row delivered to this session's inbox: its `kind`, its sender's
+    /// principal, its bus offset and its inbox id.
+    MailIn {
+        kind: &'a str,
+        from: &'a str,
+        off: u64,
+        inbox: u64,
+    },
+    /// `inbox seen <id>` moved the watermark or decided a verdict: the row's
+    /// id and the verdict (`None`: seen, no verdict named).
+    MailSeen {
+        inbox: u64,
+        verdict: Option<&'a str>,
+    },
+    /// A post queued for the bridge: its kind, its recipient's principal (as
+    /// the `post` record spells it) and its post id.
+    MailOut {
+        kind: &'a str,
+        to: &'a str,
+        post: u64,
+    },
+    /// An outbound post landed on the bus at `off`.
+    MailLanded { post: u64, off: u64 },
+    /// The session's hold moved: whether it is held after, and whether the
+    /// bridge moved it.
+    Hold { held: bool, bridge: bool },
 }
 
 /// WHAT THE TWO BRIDGE VERBS NEED OF THE REGISTRY: aterm-gui's `SessionStore`,
@@ -358,6 +421,78 @@ pub const FABRIC_EVENT_KINDS: &[&str] = &[
 /// The `events` wire name for a timeline record kind the fabric wrote, or `None`.
 pub fn fabric_event_wire_kind(kind: &str) -> Option<&'static str> {
     FABRIC_EVENT_KINDS.iter().copied().find(|k| *k == kind)
+}
+
+/// Return `true` iff a decoded message body length is within [`BODY_MAX`] (`256 KiB`).
+#[must_use]
+pub const fn is_within_body_max(len: usize) -> bool {
+    len <= BODY_MAX
+}
+
+/// Return `true` iff an inline `post` text length is within [`POST_INLINE_MAX`] (`4 KiB`).
+#[must_use]
+pub const fn is_within_post_inline_max(len: usize) -> bool {
+    len <= POST_INLINE_MAX
+}
+
+/// Return `true` iff a peer with `unlisted_from_peer` unlisted inbox rows has room under [`SENDER_QUOTA`].
+#[must_use]
+pub const fn sender_within_quota(unlisted_from_peer: usize) -> bool {
+    unlisted_from_peer < SENDER_QUOTA
+}
+
+/// Return `true` iff adding `add_bytes` to an outbox with `(queued_posts, queued_bytes)` stays within
+/// [`OUTBOX_CAP`], [`BODY_MAX`], and [`OUTBOX_BYTES_MAX`].
+#[must_use]
+pub const fn outbox_has_room(queued_posts: usize, queued_bytes: usize, add_bytes: usize) -> bool {
+    queued_posts < OUTBOX_CAP
+        && add_bytes <= BODY_MAX
+        && queued_bytes.saturating_add(add_bytes) <= OUTBOX_BYTES_MAX
+}
+
+/// Encode `(seen_id, listed_id)` inbox watermarks into 16 little-endian bytes.
+#[must_use]
+pub const fn encode_fabric_watermarks_le(seen_id: u64, listed_id: u64) -> [u8; 16] {
+    [
+        seen_id as u8,
+        (seen_id >> 8) as u8,
+        (seen_id >> 16) as u8,
+        (seen_id >> 24) as u8,
+        (seen_id >> 32) as u8,
+        (seen_id >> 40) as u8,
+        (seen_id >> 48) as u8,
+        (seen_id >> 56) as u8,
+        listed_id as u8,
+        (listed_id >> 8) as u8,
+        (listed_id >> 16) as u8,
+        (listed_id >> 24) as u8,
+        (listed_id >> 32) as u8,
+        (listed_id >> 40) as u8,
+        (listed_id >> 48) as u8,
+        (listed_id >> 56) as u8,
+    ]
+}
+
+/// Decode 16 little-endian bytes into `(seen_id, listed_id)` inbox watermarks.
+#[must_use]
+pub const fn decode_fabric_watermarks_le(bytes: [u8; 16]) -> (u64, u64) {
+    let seen_id = (bytes[0] as u64)
+        | ((bytes[1] as u64) << 8)
+        | ((bytes[2] as u64) << 16)
+        | ((bytes[3] as u64) << 24)
+        | ((bytes[4] as u64) << 32)
+        | ((bytes[5] as u64) << 40)
+        | ((bytes[6] as u64) << 48)
+        | ((bytes[7] as u64) << 56);
+    let listed_id = (bytes[8] as u64)
+        | ((bytes[9] as u64) << 8)
+        | ((bytes[10] as u64) << 16)
+        | ((bytes[11] as u64) << 24)
+        | ((bytes[12] as u64) << 32)
+        | ((bytes[13] as u64) << 40)
+        | ((bytes[14] as u64) << 48)
+        | ((bytes[15] as u64) << 56);
+    (seen_id, listed_id)
 }
 
 /// The kinds a SENDER may claim on `post`: [`KINDS`] (the set `deliver`
@@ -685,11 +820,84 @@ pub struct PostRow {
 pub struct Hold {
     /// Pct-encoded reason, or `-`.
     pub reason: String,
-    /// `fleet` (a human's halt through the bridge, or a lost bridge) or `local`
-    /// (the instance Owner's own halt, over the local control socket). The origin
-    /// is what [`cmd_hold`] gates an Owner-issued act on: a `fleet` hold is not
-    /// the owner's to set or lift.
+    /// `person` (the person at the window took the tab over: Take Over,
+    /// [`HoldIssuer::Person`]), `fleet` (a human's halt through the bridge, or
+    /// a lost bridge) or `local` (the instance Owner's own halt, over the local
+    /// control socket). The origin is what [`cmd_hold`] gates an act on: a
+    /// `fleet` hold is not the owner's to set or lift, and a `person` hold is
+    /// no socket's at all.
     pub origin: String,
+}
+
+/// The origin word of the person's own slot ([`Holds`]): Take Over at the
+/// window (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4).
+pub const PERSON_ORIGIN: &str = "person";
+
+/// The reason the person's hold carries: the tab was taken over at the window.
+pub const TAKEN_OVER: &str = "taken-over";
+
+/// The origin word of a remote node's slot ([`Holds`]): another Mac took
+/// the tab over the fleet (the step-in,
+/// `docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5.1).
+pub const REMOTE_ORIGIN: &str = "remote";
+
+/// A REMOTE NODE'S HOLD: the node of another Mac that took the tab over the
+/// fleet's drive op ([`HoldIssuer::Remote`]), proved by its node key, and
+/// the host this Mac's book names it by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteHold {
+    /// Pct-encoded reason, or `-`.
+    pub reason: String,
+    /// The node that holds it.
+    pub node: String,
+    /// That node as a person reads it ([`Driver::host`]).
+    pub host: String,
+}
+
+/// The node of another Mac a drive connection serves for ([`DrivingAs`]):
+/// what its acts are credited to and what its own hold exempts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Driver {
+    /// Its node id, proved by its node key.
+    pub node: String,
+    /// It as a person reads it: the host this Mac's book names it by, with
+    /// its node's short id (`mac-03.local (node 1a2b3c4d)`) — a host is the
+    /// node's own word, so the id tells it from one that named itself the
+    /// same — else `node <8 hex>`.
+    pub host: String,
+}
+
+thread_local! {
+    /// The node of another Mac this thread serves a drive connection for
+    /// ([`DrivingAs`]), `None` everywhere else.
+    static DRIVING: std::cell::RefCell<Option<Driver>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Marks the connection this thread serves as a remote node's drive
+/// connection until dropped: its `hold` acts on the remote slot
+/// ([`HoldIssuer::Remote`]) as that node, and its own hold does not refuse
+/// its writes ([`halt_refusal`]). Nests: a drop restores what it found.
+pub struct DrivingAs(Option<Driver>);
+
+impl DrivingAs {
+    /// Serve as `driver` until the guard drops.
+    #[must_use]
+    pub fn enter(driver: Driver) -> Self {
+        Self(DRIVING.with(|driving| driving.replace(Some(driver))))
+    }
+}
+
+impl Drop for DrivingAs {
+    fn drop(&mut self) {
+        let was = self.0.take();
+        DRIVING.with(|driving| *driving.borrow_mut() = was);
+    }
+}
+
+/// The remote node this thread serves a drive connection for, if any.
+#[must_use]
+pub fn serving_driver() -> Option<Driver> {
+    DRIVING.with(|driving| driving.borrow().clone())
 }
 
 /// THE STANDING HALTS ON ONE SESSION: one slot per origin, each set and lifted
@@ -704,77 +912,186 @@ pub struct Hold {
 /// fleet's halt and the owner's stand side by side: the bridge sets and lifts
 /// the fleet's slot, the owner the local one, and neither act touches the
 /// other's.
+///
+/// AND A THIRD, THE PERSON'S (2026-10-16, Take Over). The `local` slot is the
+/// Owner token's, which every in-session client holds, so the held agent can
+/// lift it (`aterm ctl @self hold off`). The person at the window needs a halt
+/// nothing on the wire can touch: the `person` slot is set and lifted only by
+/// [`HoldIssuer::Person`], which only the window's own Take Over and Hand Back
+/// construct ([`person_hold`]); a socket naming `origin=person` is `ERR usage`
+/// and an Owner or bridge `hold off` lifts its own slot and answers `OK
+/// hold=1` while the person's stands.
+///
+/// AND A FOURTH, A REMOTE NODE'S (2026-10-19, the step-in). Another Mac this
+/// one lets drive it takes a tab with `hold <sid> on` over the fleet's drive
+/// op: the `remote` slot, set and lifted only by [`HoldIssuer::Remote`] as
+/// the node its connection proved. It refuses every write but that node's
+/// own, it is never set while the person's hold stands or another node's
+/// does, the person's Take Over takes it away and their Hand Back lifts it
+/// ([`Self::hand_back_origin`]), and no carry writes it ([`render_holds`]):
+/// the driving Mac takes it again.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Holds {
+    /// The person's own hold (`origin=person`): its reason.
+    person: Option<String>,
     /// The fleet's hold (`origin=fleet`): its reason.
     fleet: Option<String>,
     /// The owner's own hold (`origin=local`): its reason.
     local: Option<String>,
+    /// A remote node's hold (`origin=remote`).
+    remote: Option<RemoteHold>,
 }
 
 impl Holds {
-    /// The slot an origin names. Anything but `fleet` is the local slot, as
-    /// [`parse_hold`] reads an origin it does not know.
+    /// The slot an origin names. Anything but `person` or `fleet` is the
+    /// local slot, as [`parse_hold`] reads an origin it does not know.
     fn slot_mut(&mut self, origin: &str) -> &mut Option<String> {
-        if origin == "fleet" {
-            &mut self.fleet
-        } else {
-            &mut self.local
+        match origin {
+            PERSON_ORIGIN => &mut self.person,
+            "fleet" => &mut self.fleet,
+            _ => &mut self.local,
         }
     }
 
     /// Whether a hold of `origin` stands.
     pub fn has(&self, origin: &str) -> bool {
-        if origin == "fleet" {
-            self.fleet.is_some()
-        } else {
-            self.local.is_some()
+        match origin {
+            PERSON_ORIGIN => self.person.is_some(),
+            REMOTE_ORIGIN => self.remote.is_some(),
+            "fleet" => self.fleet.is_some(),
+            _ => self.local.is_some(),
         }
     }
 
     /// Whether any hold stands: the session is halted.
     pub fn is_held(&self) -> bool {
-        self.fleet.is_some() || self.local.is_some()
+        self.person.is_some()
+            || self.fleet.is_some()
+            || self.local.is_some()
+            || self.remote.is_some()
     }
 
-    /// The hold of `origin` alone, the other slot empty: what a cold restore
-    /// puts back of a layout's holds (the owner's, ruling 23).
-    pub fn of_origin(&self, origin: &str) -> Holds {
-        if origin == "fleet" {
-            Holds {
-                fleet: self.fleet.clone(),
-                local: None,
-            }
+    /// The person's hold's reason, when the tab is taken over.
+    pub fn person(&self) -> Option<&str> {
+        self.person.as_deref()
+    }
+
+    /// The remote node's hold, when another Mac holds the tab.
+    pub fn remote(&self) -> Option<&RemoteHold> {
+        self.remote.as_ref()
+    }
+
+    /// THE SLOT HAND BACK LIFTS ([`person_hold`]): the person's own, else an
+    /// Owner client's (`local`) where no person's stands; `None` where
+    /// neither does. The fleet's is never the window's to lift. Lifting a
+    /// client's hold confers nothing an Owner client lacks — every one of
+    /// them lifts that slot with `hold off` — and it is the only way out at
+    /// the window of a hold that halts the instance's app verbs (the owner's
+    /// own Fabric ▸ Hold a seamless update carried from an older build among
+    /// them).
+    ///
+    /// And where neither stands, a remote node's: the person takes the tab
+    /// from the Mac that drives it.
+    pub fn hand_back_origin(&self) -> Option<&'static str> {
+        if self.person.is_some() {
+            Some(PERSON_ORIGIN)
+        } else if self.local.is_some() {
+            Some("local")
+        } else if self.remote.is_some() {
+            Some(REMOTE_ORIGIN)
         } else {
-            Holds {
-                fleet: None,
-                local: self.local.clone(),
-            }
+            None
         }
     }
 
-    /// Every standing hold, the fleet's first.
+    /// Whose hold the session shows (`status hold_by=`, the survey's
+    /// `hold_by=`, the need classifier's [`aterm_types::needs::HoldWord`]):
+    /// the person's first, then a remote node's, then the owner's local
+    /// stop, then the bridge's.
+    pub fn word(&self) -> Option<aterm_types::needs::HoldWord> {
+        use aterm_types::needs::HoldWord;
+        if self.person.is_some() {
+            Some(HoldWord::Person)
+        } else if self.remote.is_some() {
+            Some(HoldWord::Remote)
+        } else if self.local.is_some() {
+            Some(HoldWord::Local)
+        } else if self.fleet.is_some() {
+            Some(HoldWord::Bridge)
+        } else {
+            None
+        }
+    }
+
+    /// The hold of `origin` alone, the other slots empty: what a cold restore
+    /// puts back of a layout's holds (the owner's, ruling 23).
+    pub fn of_origin(&self, origin: &str) -> Holds {
+        match origin {
+            PERSON_ORIGIN => Holds {
+                person: self.person.clone(),
+                ..Holds::default()
+            },
+            REMOTE_ORIGIN => Holds {
+                remote: self.remote.clone(),
+                ..Holds::default()
+            },
+            "fleet" => Holds {
+                fleet: self.fleet.clone(),
+                ..Holds::default()
+            },
+            _ => Holds {
+                local: self.local.clone(),
+                ..Holds::default()
+            },
+        }
+    }
+
+    /// Every standing hold, the person's first, then a remote node's, then
+    /// the fleet's.
     pub fn standing(&self) -> impl Iterator<Item = Hold> + '_ {
-        [("fleet", &self.fleet), ("local", &self.local)]
-            .into_iter()
-            .filter_map(|(origin, reason)| {
-                reason.as_ref().map(|reason| Hold {
-                    reason: reason.clone(),
-                    origin: origin.to_string(),
-                })
+        [
+            (PERSON_ORIGIN, self.person.as_ref()),
+            (
+                REMOTE_ORIGIN,
+                self.remote.as_ref().map(|remote| &remote.reason),
+            ),
+            ("fleet", self.fleet.as_ref()),
+            ("local", self.local.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(origin, reason)| {
+            reason.map(|reason| Hold {
+                reason: reason.clone(),
+                origin: origin.to_string(),
             })
+        })
+    }
+
+    /// The hold that refuses a write from the remote node `driver` (`None`:
+    /// any other writer) — [`Self::first`], past that node's own hold: a
+    /// node's hold keeps everyone out but the node.
+    pub fn first_against(&self, driver: Option<&str>) -> Option<Hold> {
+        let own = |hold: &Hold| {
+            hold.origin == REMOTE_ORIGIN
+                && driver.is_some_and(|node| self.remote.as_ref().is_some_and(|r| r.node == node))
+        };
+        self.standing().find(|hold| !own(hold))
     }
 
     /// The hold a one-hold surface names — `ERR halted reason= origin=`, the
-    /// menu's halt pair, the `hold` event's `reason=`/`origin=`: the FLEET's
-    /// when it stands, because that is the one the session's own agent cannot
-    /// lift (lifting the owner's leaves the session held), else the owner's.
+    /// `hold` event's `reason=`/`origin=`: the PERSON'S when it stands (the
+    /// one act that lifts it is the person's Hand Back), else a REMOTE
+    /// NODE'S (the Mac driving the tab, which the person takes it from), else
+    /// the FLEET'S,
+    /// because that is the one the session's own agent cannot lift (lifting
+    /// the owner's leaves the session held), else the owner's.
     pub fn first(&self) -> Option<Hold> {
         self.standing().next()
     }
 
-    /// The standing origins as `hold_origin=` prints them: comma-joined, the
-    /// fleet's first (`fleet`, `local`, `fleet,local`), `-` for none.
+    /// The standing origins as `hold_origin=` prints them: comma-joined, in
+    /// [`Self::standing`]'s order (`person`, `fleet`, `local`, `fleet,local`,
+    /// `person,fleet,local`), `-` for none.
     pub fn origins(&self) -> String {
         let words: Vec<String> = self.standing().map(|h| h.origin).collect();
         if words.is_empty() {
@@ -1442,14 +1759,18 @@ impl FabricCarry {
 #[cfg(unix)]
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct KeeperCarry {
-    /// The first standing hold, as [`render_hold`] writes it — the fleet's
-    /// when it stands ([`render_holds`]) — under the key every META reader
-    /// since the keeper carry reads, so a build from before the two slots
-    /// still recovers the stronger halt.
+    /// The first standing hold, as [`render_hold`] writes it — the person's
+    /// when it stands, else the fleet's ([`render_holds`]) — under the key
+    /// every META reader since the keeper carry reads, so a build from before
+    /// the slots still recovers a halt (it reads `origin=person` as a hold, as
+    /// [`parse_hold`] reads every row). A crash is not a Hand Back: the
+    /// recovered session comes back with the person's Take Over standing,
+    /// the fail-closed answer for a hold nobody lifted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hold: Option<String>,
-    /// Every other standing hold, one row each: the owner's, when the fleet's
-    /// stands too. An older reader reads past the key.
+    /// Every other standing hold, one row each (the fleet's and the owner's
+    /// beside the person's, the owner's beside the fleet's). An older reader
+    /// reads past the key.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub more_holds: Vec<String>,
     /// The id lease: inbox row, post, receipt.
@@ -1837,6 +2158,11 @@ pub struct SessionFabric {
     /// ([`Self::note_direct_reset`]): on a parked session it lands after the
     /// carry was taken, the same change-the-successor-would-not-see a hold is.
     hold_serial: std::sync::atomic::AtomicU64,
+    /// How many acts [`halt_refusal`] refused on this session while the
+    /// PERSON'S hold stood, since it was set (Take Over zeroes it): what the
+    /// menu bar's You hold row and the hover say the hold kept out ("refused
+    /// 3 writes"). Moved only by a refusal, never by a read.
+    person_refusals: AtomicU64,
     /// A test's own bound for every fenced wait ([`Self::fence_wait`]).
     #[cfg(any(test, debug_assertions))]
     fence_wait: Mutex<Option<std::time::Duration>>,
@@ -1845,6 +2171,11 @@ pub struct SessionFabric {
     /// waiter is parked, instead of sleeping and hoping it got there.
     #[cfg(any(test, debug_assertions))]
     fence_waits: AtomicU64,
+    /// The bound the latest waiter that blocked on this session's fence waits
+    /// ([`note_fence_block`]): a test reads which bound a fenced verb took
+    /// without sitting it out.
+    #[cfg(any(test, debug_assertions))]
+    fence_bound: Mutex<Option<Option<std::time::Duration>>>,
 }
 
 impl SessionFabric {
@@ -1875,8 +2206,9 @@ impl SessionFabric {
     /// (`HANDOFF_INPUT_DRAIN_DEADLINE`, 3 s), across turns of the main
     /// thread's run loop. This is the bound for a Commit that is stuck, so a
     /// control connection never waits on one for good. The main thread never
-    /// waits at all: it alone raises and lifts the fence, so the menu's Hold
-    /// answers [`HOLD_BUSY`] at once (`App::menu_hold`).
+    /// waits at all: it alone raises and lifts the fence, so the person's
+    /// Take Over and Hand Back answer [`HOLD_BUSY`] at once
+    /// (`App::take_over_session`).
     pub fn fence_wait(&self) -> std::time::Duration {
         #[cfg(any(test, debug_assertions))]
         if let Some(wait) = *self.fence_wait.lock().unwrap_or_else(|p| p.into_inner()) {
@@ -1896,6 +2228,14 @@ impl SessionFabric {
     #[cfg(any(test, debug_assertions))]
     pub fn fence_waits(&self) -> u64 {
         self.fence_waits.load(Ordering::SeqCst)
+    }
+
+    /// The bound the latest waiter that blocked on this session's fence waits
+    /// ([`note_fence_block`]): `Some(None)` for one that waits until the
+    /// fence lifts, `None` while no waiter has blocked.
+    #[cfg(any(test, debug_assertions))]
+    pub fn fence_bound(&self) -> Option<Option<std::time::Duration>> {
+        *self.fence_bound.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Wake every waiter parked on this session's condvar WITHOUT changing
@@ -2101,6 +2441,12 @@ impl SessionFabric {
         self.lock().holds.clone()
     }
 
+    /// How many acts the person's hold refused since it was set
+    /// ([`halt_refusal`]); `0` with no person hold ever set.
+    pub fn person_refusals(&self) -> u64 {
+        self.person_refusals.load(Ordering::Relaxed)
+    }
+
     /// THE HALT A LOST BRIDGE DID NOT MAKE on this session, while it still
     /// speaks for the link (`status hold_advisory=`): the hold [`bridge_lost`]
     /// would have applied under `[fabric] hold_on_bridge_lost = true`, as long
@@ -2277,7 +2623,7 @@ impl SessionFabric {
             if left.is_zero() {
                 return None;
             }
-            note_fence_block(self);
+            note_fence_block(self, Some(wait));
             inbox = self
                 .changed
                 .wait_timeout(inbox, left)
@@ -2285,6 +2631,23 @@ impl SessionFabric {
                 .0;
         }
         Some(inbox)
+    }
+
+    /// Run `change` — a change the handoff carries that lives off this
+    /// endpoint (a task mark, `task_record::mark_session_task`) — once no
+    /// committing update's fence stands ([`Self::fence_hold`]), and under the
+    /// guard the fence is raised with, so a Commit that raises it later reads
+    /// the change, and one that raised it first is waited out
+    /// ([`Self::wait_unfenced`]). `None` past `wait`, with `change` not run.
+    pub fn run_unfenced<T>(
+        &self,
+        wait: std::time::Duration,
+        change: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let unfenced = self.wait_unfenced(self.lock(), wait)?;
+        let out = change();
+        drop(unfenced);
+        Some(out)
     }
 
     /// A MANUAL RESET THAT RAN DIRECTLY ON THIS SESSION'S ENGINE
@@ -2681,20 +3044,31 @@ impl SessionFabric {
             // (a cold restore's layout over a keeper's META) moves nothing.
             return;
         }
-        timeline
+        // Seeded before the session is registered: nobody can be watching
+        // its log yet, so the owed wake is moot.
+        let fact = FabricFact::Hold {
+            held: true,
+            bridge: false,
+        };
+        let _ = timeline
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .record("hold", format!("{} carried=1", inbox.holds.event("local")));
+            .record_fact(
+                "hold",
+                format!("{} carried=1", inbox.holds.event("local")),
+                fact,
+            );
         self.hold_serial.fetch_add(1, Ordering::AcqRel);
         drop(inbox);
         self.changed.notify_all();
     }
 
-    /// **THE BAND'S READ** (aterm-gui's `presence`, round 19): the mail counts the
-    /// presence band prints and the `(kind, from, trust)` of the row its mail
-    /// slot names — an unread `task` or `ask` if one waits (the row the amber
-    /// rim is lit for, so a later note never hides it), else the newest unread
-    /// row — trust FIRST on the wire because it is the receiver's verdict.
+    /// **THE PRESENCE FACTS' MAIL READ** (aterm-gui's `App::sense`): the mail
+    /// counts the session's presence slot levels on (`status level=` and
+    /// `why=`, `aterm_messages::presence`) and the `(kind, from, trust)` of the
+    /// row it names — an unread `task` or `ask` if one waits (the row that
+    /// makes it a wait state, so a later note never hides it), else the newest
+    /// unread row — trust FIRST on the wire because it is the receiver's verdict.
     /// `unread` is every row above the HANDLED watermark, `pending` those of
     /// them a non-peek `inbox` has already LISTED (read, not yet decided — a
     /// fresh delivery is unread and not pending), `dropped` the monotone
@@ -3008,6 +3382,76 @@ static LINK: FabricLink = FabricLink {
         lane_faults: 0,
     }),
 };
+
+/// How a stored link transition came about ([`LinkMove`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkSaid {
+    /// A new bridge incarnation attached ([`bridge_attached`]): `stalled`.
+    Attached,
+    /// A bridge that never reports was read by what it did
+    /// ([`link_evidence`]): `connected`.
+    Evidence,
+    /// The bridge's own report of its broker link ([`link_report`]).
+    Report,
+    /// The owning incarnation's lane closed ([`bridge_lost`]): `disconnected`.
+    Lost,
+}
+
+/// One STORED transition of the link: the instance node log's `link state=`
+/// (session log 5J-2, ruling T27). The node log is aterm-gui's and this crate
+/// has no aterm-slog dependency, so a transition reaches it through
+/// [`on_link_moved`]'s hook. Only stored states move: the derived `stale`
+/// ([`fabric_state`]) has no event to report it at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkMove {
+    /// The stored state's [`fabric_state`] word: `stalled`, `connected` or
+    /// `disconnected`.
+    pub state: &'static str,
+    /// The bridge incarnation it speaks for.
+    pub generation: u64,
+    /// How it came about.
+    pub said: LinkSaid,
+}
+
+/// What hears each [`LinkMove`].
+pub type LinkMoved = fn(LinkMove);
+
+/// The hook [`on_link_moved`] installed.
+static LINK_MOVED: std::sync::OnceLock<LinkMoved> = std::sync::OnceLock::new();
+
+/// Have every stored link transition call `hook`: an attach (a new
+/// incarnation, so always), a change of the stored state by a report or a
+/// delivery's evidence, and the owner's loss. The hook runs UNDER THE
+/// GENERATION LOCK every writer of the state stores under, so it hears the
+/// transitions in the order they were stored. LOCK ORDER: `LINK.log_transition`
+/// → `LINK.generation` → `LINK.link` → the hook's own leaf lock; the hook must
+/// take nothing else and call nothing of this crate. The first caller's hook
+/// stands (one instance, one node log).
+pub fn on_link_moved(hook: LinkMoved) {
+    let _ = LINK_MOVED.set(hook);
+}
+
+/// Tell the installed hook that `state` was stored for `generation`. Called
+/// with `LINK.generation` held, and only for a transition.
+fn link_moved(state: u8, generation: u64, said: LinkSaid) {
+    if let Some(hook) = LINK_MOVED.get() {
+        hook(LinkMove {
+            state: state_word(state),
+            generation,
+            said,
+        });
+    }
+}
+
+/// A stored state's word, as [`fabric_state`] spells it.
+const fn state_word(state: u8) -> &'static str {
+    match state {
+        FABRIC_CONNECTED => "connected",
+        FABRIC_DISCONNECTED => "disconnected",
+        FABRIC_STALLED => "stalled",
+        _ => "absent",
+    }
+}
 
 /// Publish a newly created or adopted session into the registry. The callback
 /// takes the registry lock only after this session's fabric is ready for readers.
@@ -3402,7 +3846,7 @@ pub fn fabric_link_facts() -> (String, Option<u64>, Option<u64>) {
 }
 
 /// How long the link has been DOWN, in ms — the age of the stall itself,
-/// which is what the presence band's fabric slot prints (`~ 7s`). `None`
+/// which the presence facts' link carries (`Link::Stalled`). `None`
 /// while the link is up, before a bridge has attached, and for an attached
 /// bridge that has never reported (its dial has not been answered either
 /// way: there is no stall to date). Computed at read time like the ack's age,
@@ -3492,6 +3936,9 @@ pub fn bridge_attached(generation: BridgeGeneration) {
         link.lane_faults = 0;
     }
     LINK.state.store(FABRIC_STALLED, Ordering::Relaxed);
+    // A new incarnation is a transition whatever the state was: the node log
+    // says which bridge the link now speaks for (under `owner`, in order).
+    link_moved(FABRIC_STALLED, generation.0, LinkSaid::Attached);
 }
 
 /// A BRIDGE THAT NEVER REPORTS ITS LINK IS READ BY WHAT IT DOES. Called from
@@ -3536,6 +3983,8 @@ pub fn link_evidence(generation: Option<BridgeGeneration>) {
     link.acked_at = Some(std::time::Instant::now());
     link.stalled_at = None;
     LINK.state.store(FABRIC_CONNECTED, Ordering::Relaxed);
+    // `stalled` → `connected`, checked above: a transition.
+    link_moved(FABRIC_CONNECTED, *owner, LinkSaid::Evidence);
 }
 
 /// THE BRIDGE'S REPORT OF ITS BROKER LINK — the `link` verb's handler, and
@@ -3612,10 +4061,10 @@ pub fn link_report(
                 link.stalled_at = Some(std::time::Instant::now());
             }
         }
-        LINK.state.store(
-            if up { FABRIC_CONNECTED } else { FABRIC_STALLED },
-            Ordering::Relaxed,
-        );
+        let stored = if up { FABRIC_CONNECTED } else { FABRIC_STALLED };
+        if LINK.state.swap(stored, Ordering::Relaxed) != stored {
+            link_moved(stored, *owner, LinkSaid::Report);
+        }
         (
             (was_up || was_starting) && !up,
             (!was_up || was_starting) && up,
@@ -3675,8 +4124,8 @@ const BUILD_TOKEN_MAX: usize = 64;
 /// that does not say so leaves a seamless update counting them lost.
 ///
 /// RECORDED, AND COMPARED, NEVER REFUSED ON: the bridge binary is whatever
-/// `[fabric] command` names — a sealed build a second host needs, a dev
-/// build, the installed CLI an update replaced — so a build other than this
+/// `[fabric] command` names — a dev build, the installed CLI an update
+/// replaced — so a build other than this
 /// instance's is a fact `fabric status` reports and the log says once, not a
 /// reason to turn the bridge away. The lane is what decides what each side may
 /// write, and the bridge acts on the number it is answered.
@@ -3773,6 +4222,21 @@ pub fn lane_owns(generation: Option<BridgeGeneration>) -> bool {
     *owner != 0 && generation.is_some_and(|g| g.0 == *owner)
 }
 
+/// Run an owning bridge's operation while attach, log replacement and
+/// registration cannot cross it. The transition precedes generation and
+/// store/timeline/retired locks, as `register_on_log` does. `operation` must
+/// not re-enter a transition-taking entry point.
+pub fn with_current_bridge<T>(
+    generation: Option<BridgeGeneration>,
+    operation: impl FnOnce() -> T,
+) -> Option<T> {
+    let _transition = LINK
+        .log_transition
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    lane_owns(generation).then(operation)
+}
+
 /// Whether the bridge that owns the link asked for the bus mirror in its
 /// recorded `hello` (`log=turns`).
 #[must_use]
@@ -3830,12 +4294,12 @@ fn cmd_link_mirror<'a>(
             None => return LINK_USAGE.to_string(),
         }
     }
-    if !lane_owns(generation) {
-        return "OK stale=1\n".to_string();
-    }
-    LINK.link.lock().unwrap_or_else(|p| p.into_inner()).mirror =
-        Some(MirrorReport { state, reason });
-    "OK\n".to_string()
+    with_current_bridge(generation, || {
+        LINK.link.lock().unwrap_or_else(|p| p.into_inner()).mirror =
+            Some(MirrorReport { state, reason });
+        "OK\n".to_string()
+    })
+    .unwrap_or_else(|| "OK stale=1\n".to_string())
 }
 
 /// The endpoint answered one of `generation`'s bridge-only lines `ERR usage`:
@@ -3867,11 +4331,79 @@ pub fn fabric_bridge_facts() -> (Option<u32>, Option<String>, u64) {
 }
 
 const LINK_USAGE: &str = "ERR usage: link up rtt=<ms> | link down reason=<token> [rtt=<ms>] | \
-                          link log <identity> | link mirror on|stopped|capped [reason=<token>]\n";
+                          link log <identity> | link bye <quit|handoff> | \
+                          link mirror on|stopped|capped [reason=<token>]\n";
 
-/// `link up rtt=<ms>` / `link down reason=<token> [rtt=<ms>]`, from the bridge
-/// lane whose generation `generation` is. See [`link_report`].
+/// HOW MANY `bye`s THE LIVE BRIDGE HAS TAKEN — its `link bye <word>`, the
+/// answer to the `EVENT * bye <word>` this instance pushed before closing its
+/// lanes (aterm-gui's `fabric_launch::bye`). A COUNT, not a latch, so a second
+/// word — a handoff that rolled back, then a quit — waits for its own ack:
+/// the sayer reads [`byes_taken`] before it speaks and waits past it
+/// ([`await_bye_taken`]).
+static BYES_TAKEN: Mutex<u64> = Mutex::new(0);
+
+/// Signalled on every [`BYES_TAKEN`] increment.
+static BYE_TAKEN: Condvar = Condvar::new();
+
+/// The [`BYES_TAKEN`] count now.
+#[must_use]
+pub fn byes_taken() -> u64 {
+    *BYES_TAKEN.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Wait at most `wait` for the bridge to take a `bye` past `before`; whether
+/// it did.
+#[must_use]
+pub fn await_bye_taken(before: u64, wait: std::time::Duration) -> bool {
+    let taken = BYES_TAKEN.lock().unwrap_or_else(|p| p.into_inner());
+    let (taken, _) = BYE_TAKEN
+        .wait_timeout_while(taken, wait, |n| *n <= before)
+        .unwrap_or_else(|p| p.into_inner());
+    *taken > before
+}
+
+/// Whether a bridge incarnation owns the link right now — attached and not
+/// lost (`connected`, `stalled`, or `stale`, which is `connected` owing an
+/// answer): one that can hear a `bye`.
+#[must_use]
+pub fn bridge_attached_now() -> bool {
+    matches!(
+        LINK.state.load(Ordering::Relaxed),
+        FABRIC_CONNECTED | FABRIC_STALLED
+    )
+}
+
+/// `link bye <word>` from the lane whose generation `generation` is: counted
+/// only for the incarnation that owns the link, like every `link` report — a
+/// ghost lane's ack speaks for no bridge that can still withdraw anything.
+fn note_bye_taken(generation: Option<BridgeGeneration>) -> bool {
+    let owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
+    if !generation.is_some_and(|g| g.0 == *owner) || *owner == 0 {
+        return false;
+    }
+    drop(owner);
+    *BYES_TAKEN.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+    BYE_TAKEN.notify_all();
+    true
+}
+
+/// `link up rtt=<ms>` / `link down reason=<token> [rtt=<ms>]` / `link log
+/// <identity>` / `link bye <quit|handoff>` / `link mirror …`, from the bridge
+/// lane whose generation `generation` is. See [`link_report`],
+/// [`cmd_link_log`], [`note_bye_taken`] and [`cmd_link_mirror`].
 pub fn cmd_link(store: &impl AsStore, rest: &str, generation: Option<BridgeGeneration>) -> String {
+    cmd_link_after_log_switch(store, rest, generation, || {})
+}
+
+/// `cmd_link` with the endpoint's additional log-clock retirement, called
+/// exactly on a completed `forgot=1` switch before releasing the transition.
+/// The callback may take store/timeline locks, not re-enter this transition.
+pub fn cmd_link_after_log_switch(
+    store: &impl AsStore,
+    rest: &str,
+    generation: Option<BridgeGeneration>,
+    on_forgot: impl FnOnce(),
+) -> String {
     let store = &store.as_store();
     let mut toks = rest.split_whitespace();
     let up = match toks.next() {
@@ -3882,7 +4414,17 @@ pub fn cmd_link(store: &impl AsStore, rest: &str, generation: Option<BridgeGener
             if toks.next().is_some() {
                 return LINK_USAGE.to_string();
             }
-            return cmd_link_log(store, ident, generation);
+            return cmd_link_log(store, ident, generation, on_forgot);
+        }
+        Some("bye") => {
+            let word = toks
+                .next()
+                .and_then(aterm_types::fabric_grammar::Bye::parse);
+            return match (word, toks.next()) {
+                (Some(_), None) if note_bye_taken(generation) => "OK\n".to_string(),
+                (Some(_), None) => "OK stale=1\n".to_string(),
+                _ => LINK_USAGE.to_string(),
+            };
         }
         Some("mirror") => return cmd_link_mirror(toks, generation),
         _ => return LINK_USAGE.to_string(),
@@ -3931,6 +4473,7 @@ fn cmd_link_log(
     store: &Store,
     ident: Option<&str>,
     generation: Option<BridgeGeneration>,
+    on_forgot: impl FnOnce(),
 ) -> String {
     let Some(ident) = ident.filter(|i| is_log_identity(i)) else {
         return LINK_USAGE.to_string();
@@ -3995,7 +4538,13 @@ fn cmd_link_log(
     // Only a fully applied transition becomes the global witness. A busy
     // session keeps the old global witness and will be retried before delivery.
     *LINK.log.lock().unwrap_or_else(|p| p.into_inner()) = Some(ident.to_string());
-    if changed { "OK forgot=1\n" } else { "OK\n" }.to_string()
+    if changed {
+        on_forgot();
+        "OK forgot=1\n"
+    } else {
+        "OK\n"
+    }
+    .to_string()
 }
 
 /// astream's log identity as text: 32 lowercase hex digits, a dot, and a
@@ -4143,6 +4692,18 @@ fn note_bridge_touched(store: &Store, sid: &str) {
 /// report the live one disconnected. See [`BridgeGeneration`].
 #[cfg(any(unix, test, debug_assertions))]
 pub fn bridge_lost(store: &impl AsStore, generation: BridgeGeneration) -> usize {
+    bridge_lost_waking(store, generation, &|_| {})
+}
+
+/// [`bridge_lost`], calling `wake` with each session's id whose session log
+/// owes its readers a wake (the halt's `hold` mark), once its fabric lock is
+/// released.
+#[cfg(any(unix, test, debug_assertions))]
+pub fn bridge_lost_waking(
+    store: &impl AsStore,
+    generation: BridgeGeneration,
+    wake: &dyn Fn(&SessionId),
+) -> usize {
     let store = &store.as_store();
     {
         // Compare and store under the same lock `bridge_attached` writes under:
@@ -4150,7 +4711,9 @@ pub fn bridge_lost(store: &impl AsStore, generation: BridgeGeneration) -> usize 
         // lands between the two and is clobbered anyway.
         let owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
         if *owner == generation.0 {
-            LINK.state.store(FABRIC_DISCONNECTED, Ordering::Relaxed);
+            if LINK.state.swap(FABRIC_DISCONNECTED, Ordering::Relaxed) != FABRIC_DISCONNECTED {
+                link_moved(FABRIC_DISCONNECTED, generation.0, LinkSaid::Lost);
+            }
             // The link goes with the bridge. The last rtt and its age are kept
             // — they are history, and `fabric_link_age_ms=` growing past the
             // loss is the honest shape — but nothing about them is `up`.
@@ -4193,7 +4756,9 @@ pub fn bridge_lost(store: &impl AsStore, generation: BridgeGeneration) -> usize 
                 // one that must not be dropped, and the fence ends with the
                 // Commit — in `_exit`, which ends this sweep too, or in the
                 // attempt standing down, which lets it land.
-                apply_hold(&ctx, HoldAct::Set(lost), HoldIssuer::Bridge, None);
+                apply_hold(&ctx, HoldAct::Set(lost), HoldIssuer::Bridge, None, &|| {
+                    wake(ctx.self_id());
+                });
             } else if advise(&ctx, lost, generation) {
                 advised += 1;
             }
@@ -4404,14 +4969,32 @@ pub fn is_pty_reaching(verb: &str) -> bool {
 ///
 /// SCOPE-BLIND on purpose: the halt binds Owner, Edge and Bridge alike. A halt
 /// only the unprivileged obey is decoration.
+///
+/// A refusal under the PERSON'S hold is counted ([`SessionFabric::person_refusals`]):
+/// the window says how many acts aimed at the tab its Take Over kept out. Only
+/// this session-grain gate counts: an app verb [`app_halt_refusal`] refuses
+/// instance-wide was aimed at no tab, so no tab's words claim it.
 pub fn halt_refusal(ctx: &dyn FabricSession, verb: &str) -> Option<String> {
+    let (refusal, origin) = hold_refusal(ctx, verb)?;
+    if origin == PERSON_ORIGIN {
+        ctx.fabric().person_refusals.fetch_add(1, Ordering::Relaxed);
+    }
+    Some(refusal)
+}
+
+/// [`halt_refusal`]'s words and the standing hold's origin, counting nothing.
+/// A remote node's own hold does not refuse the drive connection that node
+/// serves on ([`serving_driver`], [`Holds::first_against`]); every other
+/// hold does, and its hold refuses everyone else.
+fn hold_refusal(ctx: &dyn FabricSession, verb: &str) -> Option<(String, String)> {
     if !is_pty_reaching(verb) {
         return None;
     }
-    let hold = ctx.fabric().hold()?;
-    Some(format!(
-        "ERR halted reason={} origin={}\n",
-        hold.reason, hold.origin
+    let driver = serving_driver().map(|driver| driver.node);
+    let hold = ctx.fabric().holds().first_against(driver.as_deref())?;
+    Some((
+        format!("ERR halted reason={} origin={}\n", hold.reason, hold.origin),
+        hold.origin,
     ))
 }
 
@@ -4454,7 +5037,40 @@ pub fn app_halt_refusal(store: &impl AsStore, verb: &str) -> Option<String> {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
         g.sessions()
     };
-    ctxs.iter().find_map(|ctx| halt_refusal(ctx, verb))
+    ctxs.iter()
+        .find_map(|ctx| hold_refusal(ctx, verb))
+        .map(|(refusal, _)| refusal)
+}
+
+/// `open` of a GATEWAY CARD under any hold: [`app_halt_refusal`]'s twin for
+/// the palette (`open menu`), a tab's menu (`open tab-menu`), the Overview
+/// (`open overview`, its old keyword `connections`) and the Autopilot menu
+/// (`open autopilot-menu`), the cards `escalated_op` classes Owner-only as
+/// gateways. Each card is a row of acts behind a key: a control client that
+/// opened one while a session is held could press with `key` what `invoke`
+/// refuses — Close Window over a held background tab, a palette row the
+/// person's Take Over keeps out, the Autopilot menu's mode, timers and
+/// Harness settings. So while any session is held, opening one answers
+/// `ERR halted` as `invoke` does. Closing one (`open <target> close`) and
+/// every other target stay answerable. A card already open when the hold
+/// began is still the gesture mark's (`App::person_gesture_refused`): the
+/// person's own acts on it refuse a control client's key.
+pub fn open_halt_refusal(store: &impl AsStore, verb: &str, rest: &str) -> Option<String> {
+    use aterm_types::control_verbs::AuxTarget;
+    if verb != "open" {
+        return None;
+    }
+    let mut words = rest.split_whitespace();
+    let target = AuxTarget::parse(words.next()?)?;
+    if words.next() == Some("close")
+        || !matches!(
+            target,
+            AuxTarget::Menu | AuxTarget::TabMenu | AuxTarget::Overview | AuxTarget::AutopilotMenu
+        )
+    {
+        return None;
+    }
+    app_halt_refusal(store, "invoke")
 }
 
 // ---------------------------------------------------------------------------
@@ -4527,6 +5143,15 @@ fn reason_token(raw: &str) -> String {
 
 const HOLD_USAGE: &str = "ERR usage: hold <sid> on|off [reason=<pct>] [origin=fleet|local]\n";
 
+/// The answer to a `hold` that names the PERSON'S slot from the wire
+/// (`origin=person`): that slot is the window's own (Take Over / Hand Back),
+/// set and lifted by nothing a socket can send. A usage error, because no
+/// scope may name it: the grammar is the whole of the refusal.
+pub const HOLD_PERSON_USAGE: &str = "ERR usage: origin=person is the window's own hold \
+                                            (Agents \u{25b8} Take Over This Tab / Hand Back This \
+                                            Tab); hold <sid> on|off [reason=<pct>] \
+                                            [origin=fleet|local]\n";
+
 /// The refusal an Owner-issued `hold` gets for a fleet-origin act — naming
 /// `origin=fleet`, or an `off` that finds only a fleet hold standing (nothing
 /// of the owner's to lift). It says whose hold it is, which tells a caller
@@ -4546,15 +5171,19 @@ pub const HOLD_BUSY: &str = "ERR busy update-committing\n";
 /// Count one block on a committing update's fence: on this thread (a test
 /// reads [`fence_blocks_on_this_thread`] to see that a path never waited) and
 /// on the session (a test awaits [`SessionFabric::fence_waits`] to know its
-/// waiter is parked), without a clock.
+/// waiter is parked), without a clock — and the `bound` that waiter waits
+/// (`None`: until the fence lifts), which a test reads
+/// ([`SessionFabric::fence_bound`]) to see the production bound taken
+/// without waiting it out.
 #[cfg(any(test, debug_assertions))]
-fn note_fence_block(fabric: &SessionFabric) {
+fn note_fence_block(fabric: &SessionFabric, bound: Option<std::time::Duration>) {
     FENCE_BLOCKS.with(|n| n.set(n.get() + 1));
+    *fabric.fence_bound.lock().unwrap_or_else(|p| p.into_inner()) = Some(bound);
     fabric.fence_waits.fetch_add(1, Ordering::SeqCst);
 }
 
 #[cfg(not(any(test, debug_assertions)))]
-fn note_fence_block(_: &SessionFabric) {}
+fn note_fence_block(_: &SessionFabric, _: Option<std::time::Duration>) {}
 
 #[cfg(any(test, debug_assertions))]
 thread_local! {
@@ -4617,6 +5246,17 @@ pub enum HoldIssuer {
     /// only, so its acts set and lift the owner's own slot and never the
     /// fleet's; an `off` that finds only a fleet hold standing is refused.
     Owner,
+    /// The person at the window: Take Over and Hand Back (`App::take_over`,
+    /// `App::hand_back`, through [`person_hold`]), on the main thread. Never
+    /// mapped from a scope: no socket constructs it. It acts on the `person`
+    /// slot and no other, and no other issuer acts on that slot
+    /// ([`apply_hold`]'s slot discipline) — save that its Take Over takes a
+    /// remote node's slot away and its Hand Back may lift it.
+    Person,
+    /// A remote node over the fleet's drive op: the lines a drive connection
+    /// serves, as the node [`DrivingAs`] names on its thread. It acts on the
+    /// `remote` slot alone, as that node, and names no origin.
+    Remote,
 }
 
 /// One act on a session's holds ([`apply_hold`]).
@@ -4626,6 +5266,11 @@ enum HoldAct<'a> {
     Set(Hold),
     /// Lift the slot of this origin, and only it.
     Lift(&'a str),
+    /// Set the remote slot as its node ([`HoldIssuer::Remote`]).
+    SetRemote(RemoteHold),
+    /// Lift the remote slot: as this node ([`HoldIssuer::Remote`]), or
+    /// whichever node holds it (`None`: the person's Hand Back).
+    LiftRemote(Option<&'a str>),
     /// Lift every slot: the test door's lift ([`apply_hold_for_test`]), never
     /// a `hold` verb's.
     #[cfg(any(test, debug_assertions))]
@@ -4638,6 +5283,7 @@ impl HoldAct<'_> {
         match self {
             Self::Set(hold) => Some(hold.origin.as_str()),
             Self::Lift(origin) => Some(origin),
+            Self::SetRemote(_) | Self::LiftRemote(_) => Some(REMOTE_ORIGIN),
             #[cfg(any(test, debug_assertions))]
             Self::LiftAll => None,
         }
@@ -4658,6 +5304,13 @@ enum Applied {
     /// only a fleet hold standing: refused without touching it. Never
     /// answered to [`HoldIssuer::Bridge`].
     FleetHeld,
+    /// The act named a slot its issuer may not touch: the person's slot from
+    /// a socket, or any other slot from the person. Nothing moved.
+    NotItsSlot,
+    /// A remote node's set while the person's hold stands or another node's
+    /// does, or its lift of another node's: nothing moved. The standing
+    /// hold is the refusal's ([`Holds::first`]).
+    Taken,
     /// A seamless update was committing the session for the whole of the wait
     /// the caller allowed ([`SessionFabric::fence_hold`]); nothing moved.
     Fenced,
@@ -4699,8 +5352,9 @@ fn apply_hold(
     act: HoldAct<'_>,
     issuer: HoldIssuer,
     fence_wait: Option<std::time::Duration>,
+    wake: &dyn Fn(),
 ) -> Applied {
-    apply_hold_as(ctx, act, issuer, fence_wait, false)
+    apply_hold_as(ctx, act, issuer, fence_wait, false, wake)
 }
 
 /// [`apply_hold`], its timeline row marked ` carried=1` where `carried`: a
@@ -4712,13 +5366,14 @@ fn apply_hold_as(
     issuer: HoldIssuer,
     fence_wait: Option<std::time::Duration>,
     carried: bool,
+    wake: &dyn Fn(),
 ) -> Applied {
     let mut inbox = ctx.fabric().lock();
     let deadline = fence_wait.map(|wait| std::time::Instant::now() + wait);
     while inbox.hold_fenced {
         inbox = match deadline {
             None => {
-                note_fence_block(ctx.fabric());
+                note_fence_block(ctx.fabric(), None);
                 ctx.fabric()
                     .changed
                     .wait(inbox)
@@ -4729,7 +5384,7 @@ fn apply_hold_as(
                 if left.is_zero() {
                     return Applied::Fenced;
                 }
-                note_fence_block(ctx.fabric());
+                note_fence_block(ctx.fabric(), fence_wait);
                 ctx.fabric()
                     .changed
                     .wait_timeout(inbox, left)
@@ -4737,6 +5392,41 @@ fn apply_hold_as(
                     .0
             }
         };
+    }
+    // THE PERSON'S SLOT IS THE PERSON'S: only the window's Take Over and
+    // Hand Back name it, and they name nothing else (`cmd_hold` refuses a
+    // socket's `origin=person` first; this keeps the rule where the slots
+    // are) — but the remote slot, which their Hand Back may lift. THE
+    // REMOTE SLOT IS ITS NODE'S: only a drive connection's own acts set or
+    // lift it, and they act on nothing else.
+    let remote_act = matches!(act, HoldAct::SetRemote(_) | HoldAct::LiftRemote(_));
+    let its_slot = match issuer {
+        HoldIssuer::Remote => {
+            matches!(act, HoldAct::SetRemote(_) | HoldAct::LiftRemote(Some(_)))
+        }
+        HoldIssuer::Person => {
+            matches!(act, HoldAct::LiftRemote(None))
+                || (!remote_act && act.origin() == Some(PERSON_ORIGIN))
+        }
+        HoldIssuer::Bridge | HoldIssuer::Owner => {
+            !remote_act && !matches!(act.origin(), Some(PERSON_ORIGIN | REMOTE_ORIGIN))
+        }
+    };
+    if !its_slot {
+        return Applied::NotItsSlot;
+    }
+    // THE PERSON WINS: no node takes a tab the person holds, nor one another
+    // node holds, nor lifts that node's.
+    if issuer == HoldIssuer::Remote {
+        let anothers = |node: &str| inbox.holds.remote.as_ref().is_some_and(|r| r.node != node);
+        let taken = match &act {
+            HoldAct::SetRemote(hold) => inbox.holds.person.is_some() || anothers(&hold.node),
+            HoldAct::LiftRemote(Some(node)) => anothers(node),
+            _ => false,
+        };
+        if taken {
+            return Applied::Taken;
+        }
     }
     if issuer == HoldIssuer::Owner {
         // Not the owner's slot to name at all (`cmd_hold` refuses it first;
@@ -4753,20 +5443,41 @@ fn apply_hold_as(
     }
     let before = inbox.holds.clone();
     match &act {
-        HoldAct::Set(hold) => *inbox.holds.slot_mut(&hold.origin) = Some(hold.reason.clone()),
+        HoldAct::Set(hold) => {
+            *inbox.holds.slot_mut(&hold.origin) = Some(hold.reason.clone());
+            // The person's Take Over takes the tab from the Mac driving it.
+            if issuer == HoldIssuer::Person {
+                inbox.holds.remote = None;
+            }
+        }
         HoldAct::Lift(origin) => *inbox.holds.slot_mut(origin) = None,
+        HoldAct::SetRemote(hold) => inbox.holds.remote = Some(hold.clone()),
+        HoldAct::LiftRemote(_) => inbox.holds.remote = None,
         #[cfg(any(test, debug_assertions))]
         HoldAct::LiftAll => inbox.holds = Holds::default(),
     }
     let held = inbox.holds.is_held();
     let changed = inbox.holds != before;
+    // A fresh Take Over counts its own refusals from zero.
+    if changed && issuer == HoldIssuer::Person && matches!(act, HoldAct::Set(_)) {
+        ctx.fabric().person_refusals.store(0, Ordering::Relaxed);
+    }
+    let mut owed = false;
     if changed {
         let lifted = act.origin().unwrap_or("local");
         ctx.fabric().hold_serial.fetch_add(1, Ordering::AcqRel);
         let mark = if carried { " carried=1" } else { "" };
-        ctx.record("hold", format!("{}{mark}", inbox.holds.event(lifted)));
+        let fact = FabricFact::Hold {
+            held,
+            bridge: issuer == HoldIssuer::Bridge,
+        };
+        let payload = format!("{}{mark}", inbox.holds.event(lifted));
+        owed = ctx.record_fact("hold", payload, fact);
     }
     drop(inbox);
+    if owed {
+        wake();
+    }
     if changed {
         ctx.fabric().changed.notify_all();
         ctx.fabric_changed();
@@ -4813,21 +5524,6 @@ fn link_section_is_foreign() -> bool {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .is_some_and(|owner| owner != std::thread::current().id())
-}
-
-/// Age the last `link up` ack by `by`, under the link lock: the fake-clock form
-/// of sleeping `by` between a `link up` and what follows it, for a test that
-/// needs an ack older than the stall reported after it. Test-only, and like
-/// every link write it belongs inside the caller's [`with_link_reset`] section.
-#[cfg(any(test, debug_assertions))]
-pub fn backdate_link_ack(by: std::time::Duration) {
-    let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
-    let acked_at = link.acked_at.expect("a `link up` was reported to backdate");
-    link.acked_at = Some(
-        acked_at
-            .checked_sub(by)
-            .expect("the monotonic clock has run longer than the backdate"),
-    );
 }
 
 /// What else a [`with_link_reset`] section resets beside the link: the
@@ -4961,12 +5657,19 @@ pub fn touched_contains(sid: &str) -> bool {
 /// recorded `carried=1` and wakes the band (`FabricChanged`); and while a
 /// seamless update is committing the session nothing moves. Never waits: the
 /// caller is the event loop, which alone raises and lifts that fence (as
-/// `App::menu_hold` does). `true` where the owner's hold stands on the
+/// `App::take_over_session` does). `true` where the owner's hold stands on the
 /// session after it; `false` where the commit's fence kept it off, nothing
 /// moved. A session not yet registered takes [`SessionFabric::seed_holds`]
 /// (the review of LC-8: seeded, a registered shell skipped the fence and the
 /// band's wake).
 pub fn carry_hold(ctx: &dyn FabricSession, hold: Hold) -> bool {
+    carry_hold_waking(ctx, hold, &|| {})
+}
+
+/// [`carry_hold`], calling `wake` when the session log's readers are owed a
+/// wake (its `hold` mark), once the fabric lock is released: the event
+/// loop's.
+pub fn carry_hold_waking(ctx: &dyn FabricSession, hold: Hold, wake: &dyn Fn()) -> bool {
     // Only the owner's slot is carried back (`Holds::of_origin("local")`);
     // naming the slot here keeps an Owner act off the fleet's.
     let act = HoldAct::Set(Hold {
@@ -4979,9 +5682,10 @@ pub fn carry_hold(ctx: &dyn FabricSession, hold: Hold) -> bool {
         HoldIssuer::Owner,
         Some(std::time::Duration::ZERO),
         true,
+        wake,
     ) {
         Applied::Changed { held } | Applied::Unchanged { held } => held,
-        Applied::FleetHeld | Applied::Fenced => false,
+        Applied::FleetHeld | Applied::NotItsSlot | Applied::Taken | Applied::Fenced => false,
     }
 }
 
@@ -4997,7 +5701,8 @@ pub fn apply_hold_for_test(ctx: &dyn FabricSession, hold: Option<Hold>) -> bool 
             ctx,
             act,
             HoldIssuer::Bridge,
-            Some(ctx.fabric().fence_wait())
+            Some(ctx.fabric().fence_wait()),
+            &|| {}
         ),
         Applied::Changed { .. }
     )
@@ -5047,6 +5752,19 @@ pub fn cmd_hold(store: &impl AsStore, rest: &str, issuer: HoldIssuer) -> String 
     cmd_hold_within(store, rest, issuer, None)
 }
 
+/// [`cmd_hold`], calling `wake` with the session's id when the session log's
+/// readers are owed a wake (its `hold` mark), once the fabric lock is
+/// released: the control worker's.
+pub fn cmd_hold_waking(
+    store: &impl AsStore,
+    rest: &str,
+    issuer: HoldIssuer,
+    wake: &dyn Fn(&SessionId),
+) -> String {
+    let store = &store.as_store();
+    cmd_hold_within_waking(store, rest, issuer, None, wake)
+}
+
 /// [`cmd_hold`] with the wait for a committing update as an argument — `None`
 /// is the session's own [`SessionFabric::fence_wait`] — so the menu can
 /// answer at once and a test can reach the [`HOLD_BUSY`] answer without
@@ -5056,6 +5774,17 @@ pub fn cmd_hold_within(
     rest: &str,
     issuer: HoldIssuer,
     fence_wait: Option<std::time::Duration>,
+) -> String {
+    cmd_hold_within_waking(store, rest, issuer, fence_wait, &|_| {})
+}
+
+/// [`cmd_hold_within`] with [`cmd_hold_waking`]'s wake.
+pub fn cmd_hold_within_waking(
+    store: &impl AsStore,
+    rest: &str,
+    issuer: HoldIssuer,
+    fence_wait: Option<std::time::Duration>,
+    wake: &dyn Fn(&SessionId),
 ) -> String {
     let store = &store.as_store();
     let mut toks = rest.split_whitespace();
@@ -5071,12 +5800,23 @@ pub fn cmd_hold_within(
     let mut origin = match issuer {
         HoldIssuer::Bridge => "fleet",
         HoldIssuer::Owner => "local",
+        HoldIssuer::Remote => REMOTE_ORIGIN,
+        // The window's own acts go through [`person_hold`], never this
+        // grammar: a line that claims to be the person's is refused whole.
+        HoldIssuer::Person => return HOLD_PERSON_USAGE.to_string(),
     }
     .to_string();
     for tok in toks {
         if let Some(v) = kv(tok, "reason") {
             reason = v.to_string();
         } else if let Some(v) = kv(tok, "origin") {
+            if v == PERSON_ORIGIN {
+                return HOLD_PERSON_USAGE.to_string();
+            }
+            // A remote node names no origin: its slot is its own.
+            if issuer == HoldIssuer::Remote {
+                return HOLD_USAGE.to_string();
+            }
             if !matches!(v, "fleet" | "local") {
                 return HOLD_USAGE.to_string();
             }
@@ -5102,22 +5842,103 @@ pub fn cmd_hold_within(
     if issuer == HoldIssuer::Bridge {
         note_bridge_touched(store, sid);
     }
-    let act = if on {
-        HoldAct::Set(Hold {
+    // A remote act is its connection's node's, which only a drive
+    // connection names: anywhere else it is refused.
+    let driver = match issuer {
+        HoldIssuer::Remote => match serving_driver() {
+            Some(driver) => Some(driver),
+            None => return HOLD_DENIED.to_string(),
+        },
+        _ => None,
+    };
+    let act = match (driver, on) {
+        (Some(Driver { node, host }), true) => HoldAct::SetRemote(RemoteHold {
+            reason: reason_token(&reason),
+            node,
+            host,
+        }),
+        (Some(Driver { node, .. }), false) => {
+            origin = node;
+            HoldAct::LiftRemote(Some(&origin))
+        }
+        (None, true) => HoldAct::Set(Hold {
             reason: reason_token(&reason),
             origin,
-        })
-    } else {
-        HoldAct::Lift(&origin)
+        }),
+        (None, false) => HoldAct::Lift(&origin),
     };
     let fence_wait = fence_wait.unwrap_or_else(|| ctx.fabric().fence_wait());
-    match apply_hold(&ctx, act, issuer, Some(fence_wait)) {
+    match apply_hold(&ctx, act, issuer, Some(fence_wait), &|| wake(ctx.self_id())) {
         Applied::FleetHeld => HOLD_DENIED.to_string(),
+        Applied::NotItsSlot => HOLD_PERSON_USAGE.to_string(),
+        Applied::Taken => match ctx.fabric().hold() {
+            Some(hold) => format!("ERR halted reason={} origin={}\n", hold.reason, hold.origin),
+            None => HOLD_DENIED.to_string(),
+        },
         Applied::Fenced => HOLD_BUSY.to_string(),
         // The session's state after the act: a lift that left the other
         // origin's hold standing is still a halt, which the answer says.
         Applied::Changed { held } | Applied::Unchanged { held } => {
             format!("OK hold={}\n", u8::from(held))
+        }
+    }
+}
+
+/// What the window's Take Over or Hand Back did ([`person_hold`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersonHoldOutcome {
+    /// The person's slot moved, as asked.
+    Moved,
+    /// The slot already stood as asked: nothing moved.
+    Unchanged,
+    /// A seamless update was committing the session: nothing moved, and the
+    /// press is answered at once (the Commit's fence is this thread's own).
+    Busy,
+}
+
+/// THE PERSON'S TAKE OVER (`on`) OR HAND BACK (`off`) of one session: the
+/// `person` slot, reason [`TAKEN_OVER`], under the same fabric guard, the
+/// same timeline record and the same wakes a wire `hold` takes. The only
+/// constructor of [`HoldIssuer::Person`] outside this module's tests: the
+/// window's `App::take_over` / `App::hand_back` call it on the main thread.
+///
+/// HAND BACK OF A CLIENT'S HOLD: where no person's hold stands, Hand Back
+/// lifts an Owner client's (`local`) as that client's own `hold off` would
+/// ([`Holds::hand_back_origin`]), issued as [`HoldIssuer::Owner`] so the
+/// slot discipline stays [`apply_hold`]'s. Only the main thread sets the
+/// person's slot, so the look and the lift cannot cross a Take Over.
+///
+/// NEVER A WAIT ON A COMMITTING UPDATE: the Commit's fence is raised and
+/// lifted by the main thread, which is this caller, so a wait could end only
+/// at its bound. The press is answered at once ([`PersonHoldOutcome::Busy`]).
+///
+/// `wake` is called when the session log's readers are owed a wake (its
+/// `hold` mark), once the fabric lock is released: the event loop's.
+pub fn person_hold(ctx: &dyn FabricSession, on: bool, wake: &dyn Fn()) -> PersonHoldOutcome {
+    let (act, issuer) = if on {
+        (
+            HoldAct::Set(Hold {
+                reason: TAKEN_OVER.to_string(),
+                origin: PERSON_ORIGIN.to_string(),
+            }),
+            HoldIssuer::Person,
+        )
+    } else {
+        match ctx.fabric().holds().hand_back_origin() {
+            Some("local") => (HoldAct::Lift("local"), HoldIssuer::Owner),
+            Some(REMOTE_ORIGIN) => (HoldAct::LiftRemote(None), HoldIssuer::Person),
+            _ => (HoldAct::Lift(PERSON_ORIGIN), HoldIssuer::Person),
+        }
+    };
+    match apply_hold(ctx, act, issuer, Some(std::time::Duration::ZERO), wake) {
+        Applied::Changed { .. } => PersonHoldOutcome::Moved,
+        Applied::Fenced => PersonHoldOutcome::Busy,
+        // `FleetHeld` answers only an Owner lift that found the fleet's
+        // hold alone (a client lifted its own meanwhile), and `NotItsSlot`
+        // and `Taken` cannot follow from either issuer naming its own slot:
+        // nothing moved either way.
+        Applied::Unchanged { .. } | Applied::FleetHeld | Applied::NotItsSlot | Applied::Taken => {
+            PersonHoldOutcome::Unchanged
         }
     }
 }
@@ -5154,6 +5975,13 @@ const DELIVER_USAGE: &str = "ERR usage: deliver <sid> off=<n> from=<p> kind=<k> 
 /// without ever running `inbox seen` accumulates offsets past the window and sees
 /// the oldest of them again as new mail. The `deliver` verb row says so too.
 pub fn cmd_deliver(store: &impl AsStore, rest: &str) -> String {
+    cmd_deliver_waking(store, rest, &|_| {})
+}
+
+/// [`cmd_deliver`], calling `wake` with the session's id when the session
+/// log's readers are owed a wake (a `mail` or `mail-landed` mark), once the
+/// fabric lock is released: the control worker's (see [`FabricFact`]).
+pub fn cmd_deliver_waking(store: &impl AsStore, rest: &str, wake: &dyn Fn(&SessionId)) -> String {
     let store = &store.as_store();
     let mut toks = rest.split_whitespace();
     let Some(sid) = toks.next() else {
@@ -5169,8 +5997,9 @@ pub fn cmd_deliver(store: &impl AsStore, rest: &str) -> String {
     let rest_toks: Vec<&str> = toks.collect();
     note_bridge_touched(store, sid);
     link_evidence(lane_generation());
+    let session_wake = || wake(ctx.self_id());
     if rest_toks.iter().any(|t| t.starts_with("landed=")) {
-        let landed = deliver_landed(&ctx, &rest_toks);
+        let landed = deliver_landed(&ctx, &rest_toks, &session_wake);
         // THE OTHER RETIREMENT PATH. `deliver landed=` retires a post exactly as
         // `outbox sent` does, so the owed clock is reconciled here for the same
         // reason and in the same order — after the retirement, so the post that
@@ -5184,7 +6013,7 @@ pub fn cmd_deliver(store: &impl AsStore, rest: &str) -> String {
     if rest_toks.iter().any(|t| t.starts_with("receipt=")) {
         return deliver_receipt(&ctx, &rest_toks);
     }
-    deliver_row(&ctx, &rest_toks)
+    deliver_row(&ctx, &rest_toks, &session_wake)
 }
 
 /// `deliver <sid> receipt=<rid> off=<n|->` — the bridge retiring a receipt this
@@ -5537,7 +6366,7 @@ fn parse_deliver_fields(toks: &[&str], len_max: usize) -> Result<DeliverFields, 
 /// retirement. ONE implementation with `outbox sent`, which is the same act with
 /// one more case (`off=-`, permanently undeliverable): two names for one
 /// transition would be two chances to disagree about the watermark.
-fn deliver_landed(ctx: &dyn FabricSession, toks: &[&str]) -> String {
+fn deliver_landed(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> String {
     let mut post_id: Option<u64> = None;
     let mut off: Option<u64> = None;
     for tok in toks {
@@ -5552,7 +6381,7 @@ fn deliver_landed(ctx: &dyn FabricSession, toks: &[&str]) -> String {
     let (Some(post_id), Some(off)) = (post_id, off) else {
         return DELIVER_USAGE.to_string();
     };
-    match retire_post(ctx, post_id, Some(off), DEAD_DEFAULT, false) {
+    match retire_post(ctx, post_id, Some(off), DEAD_DEFAULT, false, wake) {
         Ok(()) => "OK\n".to_string(),
         Err(e) => e,
     }
@@ -5573,6 +6402,7 @@ fn retire_post(
     off: Option<u64>,
     reason: &str,
     dup: bool,
+    wake: &dyn Fn(),
 ) -> Result<(), String> {
     // A RETIREMENT A COMMITTING UPDATE WOULD NOT CARRY WAITS: answered here
     // it would let the bridge forget the sequence it pinned while the
@@ -5625,16 +6455,25 @@ fn retire_post(
     row.body.shrink_to_fit();
     row.via = None;
     row.key = None;
+    let mut owed = false;
     if !already {
         inbox.outbox_moves += 1;
-        let payload = match off {
-            Some(n) => format!("{post_id} off={n}"),
-            None => format!("{post_id} off=-"),
-        };
-        ctx.record("post-landed", payload);
+        match off {
+            Some(n) => {
+                let fact = FabricFact::MailLanded {
+                    post: post_id,
+                    off: n,
+                };
+                owed = ctx.record_fact("post-landed", format!("{post_id} off={n}"), fact);
+            }
+            None => ctx.record("post-landed", format!("{post_id} off=-")),
+        }
     }
     inbox.trim_retired_posts();
     drop(inbox);
+    if owed {
+        wake();
+    }
     ctx.fabric().changed.notify_all();
     ctx.fabric_changed();
     Ok(())
@@ -5661,9 +6500,18 @@ fn valid_dead_reason(v: &str) -> bool {
 /// `outbox` — the whole keyword. Splits its one sub-form here, exactly as
 /// `inbox` does, so the router keeps one arm per keyword.
 pub fn cmd_outbox_verb(store: &impl AsStore, rest: &str) -> String {
+    cmd_outbox_verb_waking(store, rest, &|_| {})
+}
+
+/// [`cmd_outbox_verb`] with `outbox sent`'s wake ([`cmd_outbox_sent_waking`]).
+pub fn cmd_outbox_verb_waking(
+    store: &impl AsStore,
+    rest: &str,
+    wake: &dyn Fn(&SessionId),
+) -> String {
     let store = &store.as_store();
     match rest.split_once(' ') {
-        Some(("sent", tail)) => cmd_outbox_sent(store, tail),
+        Some(("sent", tail)) => cmd_outbox_sent_waking(store, tail, wake),
         _ if rest.trim() == "sent" => OUTBOX_USAGE.to_string(),
         _ => cmd_outbox(store, rest),
     }
@@ -5854,6 +6702,17 @@ pub fn cmd_outbox(store: &impl AsStore, rest: &str) -> String {
 /// `outbox sent <sid> <post-id> off=<n|->` — retire one queued post.
 /// BRIDGE-ONLY (the dispatch gates it).
 pub fn cmd_outbox_sent(store: &impl AsStore, rest: &str) -> String {
+    cmd_outbox_sent_waking(store, rest, &|_| {})
+}
+
+/// [`cmd_outbox_sent`], calling `wake` with the session's id when the
+/// session log's readers are owed a wake (a `mail-landed` mark), once the
+/// fabric lock is released: the control worker's (see [`FabricFact`]).
+pub fn cmd_outbox_sent_waking(
+    store: &impl AsStore,
+    rest: &str,
+    wake: &dyn Fn(&SessionId),
+) -> String {
     let store = &store.as_store();
     let mut toks = rest.split_whitespace();
     let (Some(sid), Some(id), Some(off_tok)) = (toks.next(), toks.next(), toks.next()) else {
@@ -5898,7 +6757,7 @@ pub fn cmd_outbox_sent(store: &impl AsStore, rest: &str) -> String {
     };
     note_bridge_touched(store, sid);
     link_evidence(lane_generation());
-    let retired = retire_post(&ctx, post_id, off, reason, dup);
+    let retired = retire_post(&ctx, post_id, off, reason, dup, &|| wake(ctx.self_id()));
     // A RETIREMENT SETTLES THE DEBT WHATEVER THE BRIDGE'S VINTAGE IS, and it
     // settles it against WHAT IS LEFT. `link_evidence` above is the legacy arm —
     // it returns at once for any bridge that reports its own link — but `outbox
@@ -5918,7 +6777,7 @@ pub fn cmd_outbox_sent(store: &impl AsStore, rest: &str) -> String {
 }
 
 /// The ordinary `deliver`: one message row.
-fn deliver_row(ctx: &dyn FabricSession, toks: &[&str]) -> String {
+fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> String {
     let DeliverFields {
         off,
         from,
@@ -6065,10 +6924,23 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str]) -> String {
     }
     inbox.oldest_on_bus = Some(inbox.oldest_on_bus.map_or(off, |o| o.min(off)));
     remember_offset(&mut inbox, off);
-    ctx.record("inbox", format!("{id} from={from} kind={kind} off={off}"));
+    let fact = FabricFact::MailIn {
+        kind: &kind,
+        from: &from,
+        off,
+        inbox: id,
+    };
+    let owed = ctx.record_fact(
+        "inbox",
+        format!("{id} from={from} kind={kind} off={off}"),
+        fact,
+    );
     drop(inbox);
     ctx.fabric().changed.notify_all();
     ctx.fabric_changed();
+    if owed {
+        wake();
+    }
     format!("OK {id}\n")
 }
 
@@ -6324,14 +7196,28 @@ pub const CARRIED_UNREADABLE: &str = "carried-unreadable";
 #[cfg(unix)]
 pub const REASON_NOT_CARRIED: &str = "not-carried";
 
-/// Every standing hold as the carries write them ([`render_hold`] rows), the
-/// fleet's first. A handoff record's `hold` and a keeper META's `hold` take
-/// the first row, `more_holds` the rest: a reader from before the two slots
-/// reads the stronger halt where it always read the one, and reads past the
-/// other. The durable layouts carry them all, on the leaf of a held tab
-/// (`restore::TerminalLeafRestore::holds`, LC-8), on every platform.
+/// Every standing hold as the carries write them ([`render_hold`] rows), in
+/// [`Holds::standing`]'s order: the person's first, then the fleet's. The
+/// seamless handoff carries the person's Take Over as it carries the other
+/// two, and so does a crash the PTY keeper recovers ([`KeeperCarry`]): a
+/// crash or a Force Quit is not a Hand Back. A cold restore puts back only
+/// the owner's local hold ([`carry_hold`]), so a deliberate quit and
+/// relaunch hands the tab back. A handoff record's `hold` and a keeper
+/// META's `hold` take the first row, `more_holds` the rest: a reader from
+/// before the slots reads the stronger halt where it always read the one,
+/// and reads past the others. The durable layouts carry them all, on the
+/// leaf of a held tab (`restore::TerminalLeafRestore::holds`, LC-8), on
+/// every platform.
+///
+/// A remote node's hold is never carried: it is the driving Mac's to take
+/// again, and a row a successor read as a local hold would halt the tab for
+/// no one.
 pub fn render_holds(holds: &Holds) -> Vec<String> {
-    holds.standing().map(|hold| render_hold(&hold)).collect()
+    holds
+        .standing()
+        .filter(|hold| hold.origin != REMOTE_ORIGIN)
+        .map(|hold| render_hold(&hold))
+        .collect()
 }
 
 /// The inverse of [`render_holds`], FAIL-CLOSED as [`parse_hold`] is: every
@@ -6348,9 +7234,9 @@ pub fn parse_holds<'a>(rows: impl IntoIterator<Item = &'a str>) -> Holds {
 
 /// The standing hold as the HANDOFF MANIFEST carries it
 /// (`SessionRecord::hold`): `"<origin> <reason>"`, both already wire tokens —
-/// the origin is `fleet` or `local` and the reason [`reason_token`]'s output,
-/// which holds no space. The durable layouts carry its rows too
-/// ([`render_holds`]), on the leaf of a held tab
+/// the origin is `person`, `fleet` or `local` and the reason
+/// [`reason_token`]'s output, which holds no space. The durable layouts carry
+/// its rows too ([`render_holds`]), on the leaf of a held tab
 /// (`restore::TerminalLeafRestore::holds`, LC-8).
 pub fn render_hold(hold: &Hold) -> String {
     format!("{} {}", hold.origin, hold.reason)
@@ -6363,18 +7249,26 @@ pub fn render_hold(hold: &Hold) -> String {
 /// unlike a topic row ([`parse_topics`]), a hold row that does not read cannot
 /// be DROPPED, because dropping it lifts a halt. So a row outside the grammar
 /// halts the session anyway, `reason=carried-unreadable`, under the STRONGER
-/// origin the row could have meant: `fleet` when it says so first, else
-/// `local`. The reason is rebuilt by [`reason_token`] on the way in, as a
+/// origin the row could have meant: `person` or `fleet` when it says so first,
+/// else `local`. The reason is rebuilt by [`reason_token`] on the way in, as a
 /// bridge's would be. The worst a hostile row can do is halt a session, which
-/// the owner's `hold off` undoes for a local hold and a reconnecting bridge
-/// for a fleet one.
+/// the owner's `hold off` undoes for a local hold, a reconnecting bridge for a
+/// fleet one and the person's Hand Back for the person's. A build from before
+/// the person's slot reads a carried `person` row as a local hold it cannot
+/// read: still a halt.
 pub fn parse_hold(row: &str) -> Hold {
     let mut words = row.split(' ');
     let origin = words.next().unwrap_or_default();
     let reason = words.next().filter(|reason| !reason.is_empty());
-    let origin_word = if origin == "fleet" { "fleet" } else { "local" };
+    let origin_word = match origin {
+        PERSON_ORIGIN => PERSON_ORIGIN,
+        "fleet" => "fleet",
+        _ => "local",
+    };
     let reason = match reason {
-        Some(reason) if matches!(origin, "fleet" | "local") && words.next().is_none() => {
+        Some(reason)
+            if matches!(origin, PERSON_ORIGIN | "fleet" | "local") && words.next().is_none() =>
+        {
             reason_token(reason)
         }
         _ => CARRIED_UNREADABLE.to_string(),
@@ -6882,6 +7776,7 @@ pub fn cmd_inbox_seen_waking(ctx: &dyn FabricSession, rest: &str, wake: &dyn Fn(
     }
     // MONOTONE: the watermark never goes backwards, so acknowledging an older row
     // out of order cannot re-open rows already handled.
+    let seen_before = inbox.seen;
     inbox.seen = inbox.seen.max(id);
     for row in &mut inbox.rows {
         if row.id <= id {
@@ -6898,7 +7793,17 @@ pub fn cmd_inbox_seen_waking(ctx: &dyn FabricSession, rest: &str, wake: &dyn Fn(
     // an older row out of order leaves the watermark where it was.
     let floor = addressed_floor(&inbox).map_or_else(|| "-".to_string(), |f| f.to_string());
     let payload = format!("{id} off={off} floor={floor} seen={seen}{verdict_tail}");
-    ctx.record("inbox-seen", payload);
+    // The session log's `mail-seen` mark when the act moved something (the
+    // watermark, or a verdict decided); `wake` below wakes its readers too.
+    if seen > seen_before || decided.is_some() {
+        let fact = FabricFact::MailSeen {
+            inbox: id,
+            verdict: decided,
+        };
+        let _ = ctx.record_fact("inbox-seen", payload, fact);
+    } else {
+        ctx.record("inbox-seen", payload);
+    }
     drop(inbox);
     ctx.fabric().changed.notify_all();
     ctx.fabric_changed();
@@ -7265,7 +8170,13 @@ pub fn cmd_post_waking(
     if let Some(k) = &key {
         payload.push_str(&format!(" key={k}"));
     }
-    ctx.record("post", payload);
+    let fact = FabricFact::MailOut {
+        kind: &kind,
+        to: &to,
+        post: id,
+    };
+    // `wake` below wakes the session log's readers too.
+    let _ = ctx.record_fact("post", payload, fact);
     drop(inbox);
     // THE BRIDGE NOW OWES AN ANSWER. This record is what becomes the push
     // lane's `EVENT <sid> post <id>`, so from here the endpoint has asked and
@@ -7546,8 +8457,8 @@ fn wait_is_futile() -> bool {
 // await inbox
 // ---------------------------------------------------------------------------
 
-/// `await inbox since=<id> [kinds=<k,...>] | await inbox re=<off> [since=<id>]
-/// [kinds=<k,...>]` — the fabric wake predicate.
+/// `await inbox since=<id> [kinds=<k,...>] [topic=<t>] | await inbox re=<off>
+/// [since=<id>] [kinds=<k,...>]` — the fabric wake predicate.
 ///
 /// MONOTONE: it latches only on a row whose id is strictly greater than `since`,
 /// so a row the agent read and chose to ignore cannot latch the same wait twice.
@@ -7560,12 +8471,23 @@ fn wait_is_futile() -> bool {
 /// the asker's own bridge's `expired` — and `since=` may then be omitted (0),
 /// because the offset is already a thing that happens once. `kinds=` still
 /// narrows it further when given.
+///
+/// `topic=<t>` NARROWS IT TO ONE CHANNEL: a BROADCAST row that arrived on that
+/// topic (the session ran `topic add <t>`, and the row carries `topic=<t>`).
+/// It is how a session chooses to be pushed to — nothing aterm types wakes
+/// an agent for mail, so the wait it runs in the background is the push. A
+/// broadcast is usually a `note`, and naming the topic accepts every kind on
+/// it, so the default skip does not apply; `kinds=` still narrows it when
+/// given. It sleeps through addressed mail: a row without the topic never
+/// latches it.
 pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) -> String {
-    const USAGE: &str = "ERR usage: await inbox since=<id> [kinds=<k,...>] [timeout=<ms>] \
-                         | await inbox re=<off> [since=<id>] [kinds=<k,...>] [timeout=<ms>]\n";
+    const USAGE: &str = "ERR usage: await inbox since=<id> [kinds=<k,...>] [topic=<t>] \
+                         [timeout=<ms>] | await inbox re=<off> [since=<id>] [kinds=<k,...>] \
+                         [timeout=<ms>]\n";
     let mut since: Option<u64> = None;
     let mut re: Option<u64> = None;
     let mut kinds: Option<Vec<String>> = None;
+    let mut topic: Option<String> = None;
     for tok in args {
         if let Some(v) = kv(tok, "since") {
             match v.parse() {
@@ -7586,6 +8508,13 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
                 return USAGE.to_string();
             }
             kinds = Some(list);
+        } else if let Some(v) = kv(tok, "topic") {
+            // THE GRAMMAR `post to=say:<t>` AND `topic add` TAKE: a word outside
+            // it is a topic no row can carry, so a wait on it could only time out.
+            if !is_topic(v) {
+                return USAGE.to_string();
+            }
+            topic = Some(v.to_string());
         } else {
             return USAGE.to_string();
         }
@@ -7600,9 +8529,18 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
         .is_some_and(|k| k.iter().any(|k| k == "hold"));
     let accepts = |kind: &str| match &kinds {
         Some(list) => list.iter().any(|k| k == kind),
-        // A reply to a named post is wanted whatever its kind; an unnamed
-        // wait skips the class that must never wake anybody by itself.
-        None => re.is_some() || kind != AWAIT_DEFAULT_SKIP,
+        // A reply to a named post is wanted whatever its kind, and so is a
+        // broadcast on a named topic (usually a `note`); an unnamed wait skips
+        // the class that must never wake anybody by itself.
+        None => re.is_some() || topic.is_some() || kind != AWAIT_DEFAULT_SKIP,
+    };
+    // A reply named by `re=` is one to a post of this log: an earlier log's
+    // rows (at or under `floor`, [`Inbox::log_floor`]) share its offsets.
+    let latches = |r: &InboxRow, floor: u64| {
+        r.id > since
+            && accepts(&r.kind)
+            && re.is_none_or(|n| r.id > floor && r.re == Some(n))
+            && (topic.is_none() || r.topic == topic)
     };
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
@@ -7626,14 +8564,11 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
         {
             return format!("ERR log-replaced re={off}\n");
         }
+        let floor = guard.log_floor;
         if let Some(id) = guard
             .rows
             .iter()
-            .filter(|r| {
-                r.id > since
-                    && accepts(&r.kind)
-                    && re.is_none_or(|n| r.id > guard.log_floor && r.re == Some(n))
-            })
+            .filter(|r| latches(r, floor))
             .map(|r| r.id)
             .max()
         {
@@ -7672,7 +8607,7 @@ mod test_support {
 
     use aterm_session::SessionId;
 
-    use super::{FabricSession, Registry, SessionFabric, Timeline};
+    use super::{FabricFact, FabricSession, Registry, SessionFabric, Timeline};
 
     /// One timeline record.
     pub(crate) struct Event {
@@ -7680,10 +8615,12 @@ mod test_support {
         pub(crate) payload: String,
     }
 
-    /// A session's timeline: every record, in order.
+    /// A session's timeline: every record, in order, and every typed fact
+    /// the session log's hook was handed ([`FabricSession::record_fact`]).
     #[derive(Default)]
     pub(crate) struct TestTimeline {
         events: Vec<Event>,
+        pub(crate) facts: Vec<String>,
     }
 
     impl TestTimeline {
@@ -7697,6 +8634,19 @@ mod test_support {
     impl Timeline for TestTimeline {
         fn record(&mut self, kind: &'static str, payload: String) {
             self.events.push(Event { kind, payload });
+        }
+
+        /// The fact as its `Debug`, and a wake owed for every one (the
+        /// host's log always moves on a mark).
+        fn record_fact(
+            &mut self,
+            kind: &'static str,
+            payload: String,
+            fact: FabricFact<'_>,
+        ) -> bool {
+            self.facts.push(format!("{kind}: {fact:?}"));
+            self.record(kind, payload);
+            true
         }
     }
 
@@ -7719,6 +8669,12 @@ mod test_support {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .record(kind, payload);
+        }
+        fn record_fact(&self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
+            self.timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .record_fact(kind, payload, fact)
         }
         fn fabric_changed(&self) {}
         fn holder_token(&self) -> Option<String> {
@@ -7795,6 +8751,13 @@ mod test_support {
         Arc::new(RwLock::new(TestStore::default()))
     }
 }
+#[cfg(test)]
+#[path = "fabric_person_tests.rs"]
+mod person_tests;
+#[cfg(test)]
+#[path = "fabric_remote_tests.rs"]
+mod remote_tests;
+
 #[cfg(test)]
 mod topic_tests {
     use super::{TopicEntry, parse_topics, render_topics};
@@ -8105,6 +9068,7 @@ mod inbox_hold {
                     }),
                     HoldIssuer::Bridge,
                     None,
+                    &|| {},
                 )
             })
         };
@@ -8684,8 +9648,9 @@ mod inbox_hold {
     /// TWO WATERMARKS, and the difference is the whole ergonomics of the drain: a
     /// bare `inbox` moves the LISTED mark (the agent has now had its chance to
     /// read the row, so it stops holding the ring hostage), `inbox seen` moves the
-    /// HANDLED mark (`seen=`, the durable one), and `--peek` moves neither — which
-    /// is what lets a hook print the header into a prompt without consuming mail.
+    /// HANDLED mark (`seen=`, the durable one, which `topic ls` reports too), and
+    /// `--peek` moves neither — which is what lets a hook print the header into a
+    /// prompt without consuming mail.
     #[test]
     fn the_watermarks_move_only_where_they_should() {
         let store = new_store();
@@ -8716,6 +9681,9 @@ mod inbox_hold {
         assert_eq!(cmd_inbox_seen(&ctx, "99"), "ERR no such message\n");
         assert_eq!(cmd_inbox_seen(&ctx, "2 shrugged"), INBOX_USAGE);
         assert!(cmd_inbox(&ctx, "--peek").contains(" seen=2 "));
+        // So does every read of the topic set: the bridge's backstop for an
+        // `inbox seen` it never heard.
+        assert!(cmd_topic(&ctx, "ls").0.starts_with("OK 0 seen=2\n"));
         // `since=` selects, `<n>` keeps the newest, and what a bounded reply did
         // not carry is `pending=`.
         assert_eq!(rows(&cmd_inbox(&ctx, "since=2 --peek")).len(), 1);
@@ -8746,6 +9714,61 @@ mod inbox_hold {
         assert_eq!(cmd_inbox_get(&ctx, "77"), "ERR no such message\n");
         // Reading a body moves nothing.
         assert!(cmd_inbox(&ctx, "--peek").contains(" seen=0 "));
+    }
+
+    /// THE SESSION LOG'S ONE TYPED HOOK (session log phase 3B, addendum A14):
+    /// each fabric site hands its record's facts — ids, words and offsets,
+    /// never a body — to `record_fact` in the record's own call, and the
+    /// verb's wake follows exactly when the hook owes one, once per record.
+    /// NEGATIVE CONTROLS: a redelivered offset, a repeated `inbox seen` and a
+    /// hold that moves nothing hand no fact and wake nobody.
+    #[test]
+    fn every_fabric_site_hands_its_facts_to_the_one_hook() {
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        let woke = std::cell::Cell::new(0u32);
+        let wake = |s: &SessionId| {
+            assert_eq!(s.as_str(), sid, "the session's own id");
+            woke.set(woke.get() + 1);
+        };
+        let line = format!("{sid} off=7 from=h-a kind=task trust=human text=SECRET%20BODY");
+        assert_eq!(cmd_deliver_waking(&store, &line, &wake), "OK 1\n");
+        assert_eq!(cmd_deliver_waking(&store, &line, &wake), "OK 1\n");
+        let session_wake = || wake(&ctx.self_id);
+        let _ = cmd_post_waking(
+            &ctx,
+            "to=@s-peer kind=ask --wait=0 SECRET-POST",
+            None,
+            &session_wake,
+        );
+        let landed = format!("{sid} landed=1 off=9");
+        assert_eq!(cmd_deliver_waking(&store, &landed, &wake), "OK\n");
+        assert_eq!(cmd_deliver_waking(&store, &landed, &wake), "OK\n");
+        let _ = cmd_inbox_seen_waking(&ctx, "1 handled", &session_wake);
+        let _ = cmd_inbox_seen_waking(&ctx, "1 handled", &session_wake);
+        let hold = |rest: &str| {
+            cmd_hold_waking(&store, &format!("{sid} {rest}"), HoldIssuer::Owner, &wake)
+        };
+        assert_eq!(hold("on reason=demo"), "OK hold=1\n");
+        assert_eq!(hold("on reason=demo"), "OK hold=1\n");
+        assert_eq!(hold("off"), "OK hold=0\n");
+        let facts = ctx.timeline.lock().unwrap().facts.clone();
+        assert_eq!(
+            facts,
+            [
+                "inbox: MailIn { kind: \"task\", from: \"h-a\", off: 7, inbox: 1 }",
+                "post: MailOut { kind: \"ask\", to: \"@s-peer\", post: 1 }",
+                "post-landed: MailLanded { post: 1, off: 9 }",
+                "inbox-seen: MailSeen { inbox: 1, verdict: Some(\"handled\") }",
+                "hold: Hold { held: true, bridge: false }",
+                "hold: Hold { held: false, bridge: false }",
+            ]
+        );
+        assert!(facts.iter().all(|f| !f.contains("SECRET")), "{facts:?}");
+        // One wake per fact: the post's and the seen's own wakes run for
+        // every answered verb (their `events` wake), the others only when owed.
+        let seen_and_post_wakes = 1 + 2;
+        assert_eq!(woke.get(), 4 + seen_and_post_wakes, "{facts:?}");
     }
 
     /// `trust=` is the RECEIVER's verdict and the endpoint refuses a label it does
@@ -8979,6 +10002,30 @@ mod inbox_hold {
             attach_up(&store, next);
             assert!(ctx.fabric.hold_advisory().is_none());
             assert!(halt_refusal(&ctx, "turn").is_none());
+        });
+    }
+
+    /// `link bye <word>` IS COUNTED FOR THE BRIDGE THAT OWNS THE LINK ALONE —
+    /// a ghost lane's or an unscoped one's ack speaks for no bridge that can
+    /// still withdraw anything, so it releases no waiting quit — and only a
+    /// word in the grammar is one.
+    #[test]
+    fn a_bye_is_taken_only_from_the_bridge_that_owns_the_link() {
+        with_link(|| {
+            let store = new_store();
+            let old = next_bridge_generation();
+            bridge_attached(old);
+            let live = next_bridge_generation();
+            bridge_attached(live);
+            let before = byes_taken();
+            assert_eq!(cmd_link(&store, "bye quit", Some(old)), "OK stale=1\n");
+            assert_eq!(cmd_link(&store, "bye quit", None), "OK stale=1\n");
+            assert!(!await_bye_taken(before, std::time::Duration::ZERO));
+            assert_eq!(cmd_link(&store, "bye handoff", Some(live)), "OK\n");
+            assert!(await_bye_taken(before, std::time::Duration::ZERO));
+            for bad in ["bye", "bye exit", "bye quit now"] {
+                assert_eq!(cmd_link(&store, bad, Some(live)), LINK_USAGE, "{bad}");
+            }
         });
     }
 
@@ -9446,6 +10493,56 @@ mod inbox_hold {
         });
     }
 
+    /// THE NODE LOG HEARS EVERY STORED LINK TRANSITION, ONCE, IN ORDER (session
+    /// log 5J-2, ruling T27): an attach (`stalled`, a new incarnation), the
+    /// bridge's report moving the state, its evidence moving it, and the
+    /// owner's loss. A report that stores the state it found, a ghost's report
+    /// and a second loss move nothing, and nothing is heard of them.
+    #[test]
+    fn every_stored_link_transition_reaches_the_hook_once_in_order() {
+        static HEARD: Mutex<Vec<LinkMove>> = Mutex::new(Vec::new());
+        fn hear(m: LinkMove) {
+            HEARD.lock().unwrap_or_else(|p| p.into_inner()).push(m);
+        }
+        on_link_moved(hear);
+        with_link(|| {
+            HEARD.lock().unwrap_or_else(|p| p.into_inner()).clear();
+            let store = new_store();
+            let g = next_bridge_generation();
+            bridge_attached(g);
+            assert_eq!(cmd_link(&store, "up rtt=3", Some(g)), "OK\n");
+            assert_eq!(cmd_link(&store, "up rtt=4", Some(g)), "OK\n");
+            assert_eq!(cmd_link(&store, "down reason=refused", Some(g)), "OK\n");
+            assert_eq!(cmd_link(&store, "down reason=gone", Some(g)), "OK\n");
+            let ghost = next_bridge_generation();
+            assert!(!link_report(&store, Some(ghost), true, "", Some(1)));
+            bridge_lost(&store, g);
+            bridge_lost(&store, g);
+            // A bridge that never reports, read by its first delivery.
+            let quiet = next_bridge_generation();
+            bridge_attached(quiet);
+            link_evidence(Some(quiet));
+            let heard: Vec<(&str, u64, LinkSaid)> = HEARD
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .filter(|m| [g.0, quiet.0].contains(&m.generation))
+                .map(|m| (m.state, m.generation, m.said))
+                .collect();
+            assert_eq!(
+                heard,
+                [
+                    ("stalled", g.0, LinkSaid::Attached),
+                    ("connected", g.0, LinkSaid::Report),
+                    ("stalled", g.0, LinkSaid::Report),
+                    ("disconnected", g.0, LinkSaid::Lost),
+                    ("stalled", quiet.0, LinkSaid::Attached),
+                    ("connected", quiet.0, LinkSaid::Evidence),
+                ]
+            );
+        });
+    }
+
     /// A BRIDGE THAT NEVER REPORTS ITS LINK IS READ BY WHAT IT DOES (the
     /// round-13 review's finding 1). Both lanes of a 0.85 bridge attach and
     /// no `link` record ever comes; its first delivery moves the endpoint to
@@ -9684,6 +10781,8 @@ mod inbox_hold {
             HoldAct::Set(hold) => Some(hold.clone()),
             HoldAct::Lift(origin) => standing.filter(|hold| hold.origin != *origin),
             HoldAct::LiftAll => None,
+            // The old rule knew no remote slot.
+            HoldAct::SetRemote(_) | HoldAct::LiftRemote(_) => standing,
         }
     }
 
@@ -9922,6 +11021,74 @@ mod inbox_hold {
         // Usage.
         assert!(cmd_await_inbox(&ctx, &[], 5).starts_with("ERR usage"));
         assert!(cmd_await_inbox(&ctx, &["since=1", "kinds=nope"], 5).starts_with("ERR usage"));
+    }
+
+    /// **`await inbox topic=<t>` LATCHES ON THAT CHANNEL'S BROADCASTS AND
+    /// NOTHING ELSE.** Naming the topic accepts every kind on it, so the wait
+    /// latches on a broadcast `note` without `kinds=note`; a broadcast on
+    /// another topic and an addressed row — of the default kinds, or a `note` —
+    /// do not; an explicit `kinds=` still narrows it; and a topic outside the
+    /// `post to=say:<t>` grammar is the usage line. NEGATIVE CONTROL: the
+    /// addressed row a topic wait sleeps through latches a bare wait.
+    #[test]
+    fn await_inbox_topic_latches_only_on_that_topics_broadcasts() {
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        // The session holds both topics: a broadcast reaches only a session
+        // that opted into it (`deliver` refuses one it does not hold).
+        for topic in ["news", "lab"] {
+            assert_eq!(ctx.fabric.topic_add(topic, "head", &ctx.timeline), Ok(true));
+        }
+        let shout = |off: u64, topic: &str| {
+            cmd_deliver(
+                &store,
+                &format!(
+                    "{sid} off={off} from=s-peer@n-lab kind=note trust=agent topic={topic} \
+                     text=shout"
+                ),
+            )
+        };
+        assert_eq!(deliver(&store, &sid, 1, "h-a", "task", "go"), "OK 1\n");
+        assert_eq!(shout(2, "news"), "OK 2\n");
+        assert_eq!(shout(3, "lab"), "OK 3\n");
+        assert_eq!(
+            cmd_await_inbox(&ctx, &["since=0", "topic=lab"], 5),
+            "OK inbox 3\n",
+            "a note on the topic latches with no kinds="
+        );
+        assert_eq!(
+            cmd_await_inbox(&ctx, &["since=0", "topic=news"], 5),
+            "OK inbox 2\n",
+            "the newest row on THAT topic, not the newest row"
+        );
+        assert_eq!(
+            cmd_await_inbox(&ctx, &["since=0", "topic=lab", "kinds=task,ask"], 5),
+            "OK timeout\n",
+            "kinds= still narrows"
+        );
+        assert_eq!(
+            cmd_await_inbox(&ctx, &["since=0", "topic=lab", "kinds=note"], 5),
+            "OK inbox 3\n"
+        );
+        assert_eq!(deliver(&store, &sid, 4, "h-a", "task", "more"), "OK 4\n");
+        assert_eq!(deliver(&store, &sid, 5, "h-a", "note", "fyi"), "OK 5\n");
+        assert_eq!(shout(6, "news"), "OK 6\n");
+        assert_eq!(
+            cmd_await_inbox(&ctx, &["since=3", "topic=lab"], 5),
+            "OK timeout\n",
+            "an addressed row and another topic's broadcast do not latch it"
+        );
+        assert_eq!(cmd_await_inbox(&ctx, &["since=3"], 5), "OK inbox 4\n");
+        for bad in ["topic=", "topic=Lab", "topic=a/b", "topic=-x"] {
+            assert!(
+                cmd_await_inbox(&ctx, &["since=0", bad], 5).starts_with("ERR usage"),
+                "{bad}"
+            );
+        }
+        assert!(
+            cmd_await_inbox(&ctx, &["topic=lab"], 5).starts_with("ERR usage"),
+            "a topic is not a one-off: since= is still required"
+        );
     }
 
     /// **AN ACCEPTED POST WAKES ITS WATCHERS ONCE, BEFORE ITS `--wait` PARKS;

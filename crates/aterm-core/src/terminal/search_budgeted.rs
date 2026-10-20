@@ -49,7 +49,7 @@ pub enum BudgetedSearchError {
 }
 
 // Piece-wise `write_str` + `Display::fmt`, never a runtime-argument `format_args!` (the
-// Trust strict gate fails closed on its unsafe constructor).
+// Trust lane fails closed on its unsafe constructor).
 impl std::fmt::Display for BudgetedSearchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -375,9 +375,8 @@ impl Terminal {
             .history_lines_from(hist_start)
             .chain(std::iter::repeat_with(|| None))
             .take(hist_end - hist_start);
-        for (k, line) in lines.enumerate() {
-            let (text, cells) =
-                history_row_for_search(&self.grid, hist_start.saturating_add(k), line);
+        for line in lines {
+            let (text, cells) = history_row_for_search(&self.grid, line);
             state.engine.feed_row_cells(text, &cells);
         }
     }

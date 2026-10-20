@@ -316,11 +316,11 @@ mod libtest {
 mod macos {
     use std::time::{Duration, Instant};
 
-    use winit::application::ApplicationHandler;
-    use winit::event::{StartCause, WindowEvent};
-    use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-    use winit::platform::headless::EventLoopBuilderExtHeadless as _;
-    use winit::window::{Window, WindowId};
+    use aterm_window::application::ApplicationHandler;
+    use aterm_window::event::{StartCause, WindowEvent};
+    use aterm_window::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+    use aterm_window::platform::headless::EventLoopBuilderExtHeadless as _;
+    use aterm_window::window::{Window, WindowId};
 
     #[link(name = "AppKit", kind = "framework")]
     unsafe extern "C" {

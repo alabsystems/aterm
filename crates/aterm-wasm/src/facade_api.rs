@@ -680,11 +680,10 @@ macro_rules! bind {
             /// hosts that run the engine in a Web Worker: mirror these bits into the
             /// main-thread engine-state snapshot and feed them to the free
             /// [`encode_key_with_mode`], which encodes keydowns synchronously without
-            /// an instance. `KeyboardMode` is a `bitflags` struct over `u16` (bits
-            /// 0..=14 defined); the value is zero-extended to `u32` for headroom.
+            /// an instance. `KeyboardMode` is a `bitflags` struct over `u32`.
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
             pub fn keyboard_mode_bits(&self) -> u32 {
-                u32::from(self.term.keyboard_mode().bits())
+                self.term.keyboard_mode().bits()
             }
 
             /// Begin a character selection at display `row`/`col` (clears any prior one).

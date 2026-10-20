@@ -124,7 +124,7 @@ const NOTED: char = '\u{2139}';
 pub(crate) type PassId = (String, u64);
 
 /// The machine-settings records' capsule: Settings ▸ Security, where the
-/// `[machine]` switches and the "This Mac" card are ([`machine_settings`]).
+/// `[machine]` settings and the This Mac status are ([`machine_settings`]).
 fn security() -> Intent {
     Intent::OpenSettings {
         route: crate::native_settings::SettingsRoute::Security
@@ -1110,11 +1110,12 @@ pub(crate) fn managed_current_words_for(
 
 /// `machine-settings:`: the machine-level settings a pass changed per doctor,
 /// as atpkg lists them: `universal-control disabled`. One Info record per item
-/// ([`machine_setting_words`]), in wire order, none on glass: the change and its
-/// undo are on Settings ▸ Security's "This Mac" card
-/// (`PackagesService::note_machine_change`), the log and `appstatus`. Each item
-/// wears a record's `ℹ`, is keyed on its own first word, and its capsule opens
-/// Settings ▸ Security, where the `[machine]` switches are.
+/// ([`machine_setting_words`]), in wire order, none on glass: Settings ▸ Security's
+/// This Mac status shows the change ("Last change: …", on a roomy page,
+/// `PackagesService::note_machine_change`); its undo, the `leave` choice plus the
+/// revert command, is in each record's detail ([`machine_setting_words`]), the log
+/// and `appstatus`. Each item wears a record's `ℹ`, is keyed on its own first word,
+/// and its capsule opens Settings ▸ Security, where the `[machine]` settings are.
 pub(crate) fn machine_settings(text: &str) -> Vec<Message> {
     text.split(';')
         .map(str::trim)

@@ -50,6 +50,99 @@ impl Scheme {
             Self::Https => "https",
         }
     }
+
+    /// Return `true` when this scheme uses TLS (`https`).
+    #[must_use]
+    pub const fn is_tls(self) -> bool {
+        matches!(self, Self::Https)
+    }
+
+    /// Return `true` when `port` equals this scheme's default port.
+    #[must_use]
+    pub const fn uses_default_port(self, port: u16) -> bool {
+        port == self.default_port()
+    }
+}
+
+/// Maximum accepted URL byte length (`8192`).
+pub const MAX_URI_LEN: usize = 8192;
+
+/// Return `true` when `len` is a valid non-empty URI length (`1..=8192`).
+#[must_use]
+pub const fn is_valid_uri_len(len: usize) -> bool {
+    len >= 1 && len <= MAX_URI_LEN
+}
+
+/// Return `true` when `status` is a `2xx` HTTP success code (`200..=299`).
+#[must_use]
+pub const fn is_http_status_success(status: u16) -> bool {
+    status >= 200 && status <= 299
+}
+
+/// Return `true` when `status` is a `3xx` HTTP redirect code (`300..=399`).
+#[must_use]
+pub const fn is_http_status_redirect(status: u16) -> bool {
+    status >= 300 && status <= 399
+}
+
+/// Return `true` when `status` is a `4xx` HTTP client error code (`400..=499`).
+#[must_use]
+pub const fn is_http_status_client_error(status: u16) -> bool {
+    status >= 400 && status <= 499
+}
+
+/// Return `true` when `status` is a `5xx` HTTP server error code (`500..=599`).
+#[must_use]
+pub const fn is_http_status_server_error(status: u16) -> bool {
+    status >= 500 && status <= 599
+}
+
+/// Encode an HTTP endpoint summary (`host_hash`, `port`, `status`, `body_len`) into 16 LE bytes.
+#[must_use]
+pub const fn encode_http_endpoint_le(
+    host_hash: u64,
+    port: u16,
+    status: u16,
+    body_len: u32,
+) -> [u8; 16] {
+    [
+        host_hash as u8,
+        (host_hash >> 8) as u8,
+        (host_hash >> 16) as u8,
+        (host_hash >> 24) as u8,
+        (host_hash >> 32) as u8,
+        (host_hash >> 40) as u8,
+        (host_hash >> 48) as u8,
+        (host_hash >> 56) as u8,
+        port as u8,
+        (port >> 8) as u8,
+        status as u8,
+        (status >> 8) as u8,
+        body_len as u8,
+        (body_len >> 8) as u8,
+        (body_len >> 16) as u8,
+        (body_len >> 24) as u8,
+    ]
+}
+
+/// Decode 16 LE bytes into an HTTP endpoint summary (`host_hash`, `port`, `status`, `body_len`).
+#[must_use]
+pub const fn decode_http_endpoint_le(bytes: [u8; 16]) -> (u64, u16, u16, u32) {
+    let host_hash = (bytes[0] as u64)
+        | ((bytes[1] as u64) << 8)
+        | ((bytes[2] as u64) << 16)
+        | ((bytes[3] as u64) << 24)
+        | ((bytes[4] as u64) << 32)
+        | ((bytes[5] as u64) << 40)
+        | ((bytes[6] as u64) << 48)
+        | ((bytes[7] as u64) << 56);
+    let port = (bytes[8] as u16) | ((bytes[9] as u16) << 8);
+    let status = (bytes[10] as u16) | ((bytes[11] as u16) << 8);
+    let body_len = (bytes[12] as u32)
+        | ((bytes[13] as u32) << 8)
+        | ((bytes[14] as u32) << 16)
+        | ((bytes[15] as u32) << 24);
+    (host_hash, port, status, body_len)
 }
 
 /// A parsed absolute `http`/`https` URL.
@@ -78,8 +171,7 @@ impl Uri {
     pub fn parse(text: &str) -> Option<Self> {
         // No control characters and no spaces: the string is about to become
         // part of a request line, and CR/LF there is header injection.
-        if text.is_empty()
-            || text.len() > 8192
+        if !is_valid_uri_len(text.len())
             || text
                 .chars()
                 .any(|c| c.is_control() || c == ' ' || c == '\t')
@@ -125,6 +217,18 @@ impl Uri {
     #[must_use]
     pub const fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Return `true` when the authority explicitly included `:port`.
+    #[must_use]
+    pub const fn has_explicit_port(&self) -> bool {
+        self.explicit_port
+    }
+
+    /// Return `true` when `self.port()` matches `self.scheme().default_port()`.
+    #[must_use]
+    pub const fn uses_default_port(&self) -> bool {
+        self.scheme.uses_default_port(self.port)
     }
 
     /// The origin-form request target (`/v1/chat/completions?x=1`).

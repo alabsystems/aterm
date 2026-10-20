@@ -18,9 +18,9 @@
 //! given stays byte-exact. Printable text — every other character, non-ASCII
 //! included — is unchanged, and so are `\n` and `\t`, so lines stay lines.
 //!
-//! Users: `aterm-ctl` (every byte it prints to a terminal), the supervisor's
-//! `drive task --wait` answer, `aterm_link::render::safe` (the bus's one-line
-//! form, which names `\n`, `\t` and `\\` itself) and the control wire's JSON
+//! Users: `aterm-ctl` (every byte it prints to a terminal), [`one_line`] (the
+//! one-line form, which names `\n`, `\t` and `\\` itself: `aterm_link::render::safe`
+//! for the bus, `aterm ctl survey` for its excerpts) and the control wire's JSON
 //! escape ([`crate::json`]).
 //!
 //! Ruling 2026-10-10 (round fifteen, OUT-1): the function lives here, in the
@@ -100,6 +100,43 @@ pub fn safe(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
     stream.push(bytes, &mut out);
     stream.finish(&mut out);
     std::borrow::Cow::Owned(out)
+}
+
+/// Text that can only ever be ONE line of ordinary characters: the form a
+/// record another party wrote takes beside a label it must not forge
+/// (`aterm_link::render::safe`, the bus's; `aterm ctl survey`'s excerpts).
+///
+/// Escaped, never dropped: a backslash doubled, and every [`is_active`]
+/// character in [`push_escape`]'s spelling — `\n`, `\r` and `\t` by name too,
+/// so a line stays one line, and an unescaped U+202E cannot reorder the line
+/// and move a label with no control byte at all. Truncated to `cap`
+/// CHARACTERS with a trailing `…`.
+///
+/// `trust=` is reserved, rendered `trust\=` wherever the text spells it: one
+/// logical line can still wrap, and `trust=human` just past a wrap point would
+/// start a row with a forged label. A real backslash is already doubled, so
+/// the single backslash in `trust\=` can only be this escape.
+#[must_use]
+pub fn one_line(text: &str, cap: usize) -> String {
+    let mut out = String::with_capacity(text.len().min(cap.saturating_mul(4)));
+    for (n, c) in text.chars().enumerate() {
+        if n >= cap {
+            out.push('…');
+            break;
+        }
+        match c {
+            '\\' => out.push_str("\\\\"),
+            c if is_active(c) => push_escape(&mut out, c),
+            c => out.push(c),
+        }
+    }
+    // The reserved token, after the character escaping so the two rules cannot
+    // interfere: nothing above can produce the letters `trust=`, and nothing
+    // here can produce a control byte.
+    if out.contains("trust=") {
+        out = out.replace("trust=", "trust\\=");
+    }
+    out
 }
 
 /// The characters a terminal body escapes: [`is_active`] but for the line

@@ -4,6 +4,7 @@
 # `fits`, `memory_refusal`). One row per library and RAM it was measured on:
 #
 #   floor ceiling  GiB of the run that set its floors.tsv floor (one per library), or -
+#                  (also when that run's log named none, as a seal from trust main's)
 #   host RAM       GiB of the machine the need was measured on, or - with no need
 #   run ceiling    GiB of the verifier ceiling that run had, or - with no need
 #   need           GiB of the verifier's peak (trustc's memory census), or -
@@ -15,80 +16,68 @@
 # floors.tsv.
 #
 # <name>	<floor ceiling GiB>	<host RAM GiB>	<run ceiling GiB>	<need GiB>	<bound>	<measured>
+amacs	16.0	-	-	-	-	-
 arrayvec	16.0	-	-	-	-	-
-astream-aead	16.0	128	16.0	1.5	=	2026-10-17
-astream-broker	16.0	24	6.0	4.9	=	2026-09-29: m101 (24 GiB) with RAM faked, the ceiling sweep (4.9 GiB with room at 6 GiB, 16 GiB and none; docs/measured/trust-broker-floor-memory-ceiling-2026-09-29.md)
-astream-broker	16.0	128	16.0	5.7	=	2026-10-17
-astream-cap	16.0	24	3.0	0.3	=	2026-09-29: m101 (24 GiB), its real ceiling
-astream-cap	16.0	48	6.0	0.4	=	2026-10-15
-astream-cap	16.0	128	16.0	1.3	=	2026-10-17
-astream-digest	16.0	128	16.0	5.5	=	2026-10-17
-astream-wire	16.0	24	3.0	1.8	=	2026-09-29: m101 (24 GiB), its real ceiling
-astream-wire	16.0	48	6.0	0.7	=	2026-10-17
-astream-wire	16.0	128	16.0	0.7	=	2026-10-17
+astream-aead	16.0	-	-	-	-	-
+astream-broker	16.0	128	16.0	6.6	=	2026-10-18
+astream-cap	16.0	128	16.0	1.3	=	2026-10-19
+astream-digest	16.0	128	16.0	4.2	=	2026-10-18
+astream-effects	16.0	-	-	-	-	-
+astream-sys	16.0	-	-	-	-	-
+astream-term	16.0	128	16.0	1.7	=	2026-10-18
+astream-wire	16.0	128	16.0	1.6	=	2026-10-18
 aterm-a11y	6.0	48	6.0	3.1	=	2026-10-17
-aterm-agent	16.0	128	16.0	9.5	=	2026-10-16
-aterm-alloc	16.0	128	16.0	0.3	=	2026-10-16
-aterm-bench	16.0	-	-	-	-	-
-aterm-bidi	16.0	-	-	-	-	-
-aterm-bits	16.0	-	-	-	-	-
-aterm-buffer	16.0	128	16.0	0.3	=	2026-10-16
-aterm-cap	16.0	128	16.0	0.2	=	2026-10-16
-aterm-census	16.0	8	4.0	1.3	=	2026-09-29: the 8 GiB A18 Pro Mac with RAM faked to 32 GiB (DYLD interposer), seal 321aaeda7, tree 32fbdd443, nothing ran out
-aterm-census	16.0	32	4.0	7.3	>	2026-10-17
+aterm-agent	16.0	128	16.0	11.2	=	2026-10-20
+aterm-alloc	16.0	128	16.0	1.3	=	2026-10-19
+aterm-bench	-	-	-	-	-	-
+aterm-bidi	-	-	-	-	-	-
+aterm-bits	-	-	-	-	-	-
+aterm-buffer	16.0	128	16.0	1.2	=	2026-10-18
+aterm-caffeine	6.0	48	6.0	0.8	=	2026-10-20
+aterm-cap	16.0	128	16.0	0.7	=	2026-10-18
 aterm-census	16.0	128	16.0	7.3	=	2026-10-16
-aterm-cg	16.0	-	-	-	-	-
-aterm-cli	4.0	8	4.0	2.1	=	2026-09-29: the 8 GiB A18 Pro Mac with RAM faked to 32 GiB (DYLD interposer), seal 321aaeda7, tree 32fbdd443, nothing ran out
-aterm-cli	4.0	24	4.0	3.0	=	2026-10-01: m101 (24 GiB) with RAM faked to 32 GiB (DYLD interposer), seal 321aaeda7, tree d060d2a40, nothing ran out: 92 of 558 proved against a floor of 75; the peak is the whole-crate R1 pre-pass's, before any body. At m101's real 3.0 GiB ceiling the same tree printed peak 3.0, ceiling 3.0, and proved 0 of 443 (2.4 GiB with room on 2026-09-28's trees)
-aterm-cli	4.0	32	4.0	3.1	=	2026-10-17
-aterm-cli	4.0	128	16.0	3.1	=	2026-10-16
+aterm-cg	-	-	-	-	-	-
+aterm-cli	16.0	128	16.0	3.5	=	2026-10-18
 aterm-codec	16.0	-	-	-	-	-
 aterm-conformance	16.0	128	16.0	1.2	=	2026-10-16
-aterm-containment	16.0	24	3.0	0.7	=	2026-10-01T14:23:54Z: m101 (24 GiB), its real ceiling, the lane's cost history
 aterm-containment	16.0	128	16.0	1.7	=	2026-10-16
-aterm-contract-probe	16.0	-	-	-	-	-
+aterm-contract-probe	-	-	-	-	-	-
 aterm-control	16.0	128	16.0	0.9	=	2026-10-16
-aterm-core	16.0	36	4.5	4.1	=	2026-10-16: this 36 GiB M4 Max at its real 4.5 GiB ceiling (--try-refused), tree ec09cbc78, nothing ran out (0 bodies skipped at the ceiling): 1045 of 4100 proved against a floor of 1030
 aterm-core	16.0	128	16.0	4.6	=	2026-10-16
-aterm-ctl	16.0	8	4.0	1.8	=	2026-09-29: the 8 GiB A18 Pro Mac with RAM faked to 32 GiB (DYLD interposer), seal 321aaeda7, tree 32fbdd443, nothing ran out
-aterm-ctl	16.0	24	3.0	2.1	=	2026-10-01T14:23:54Z: m101 (24 GiB), its real ceiling, the lane's cost history
-aterm-ctl	16.0	128	16.0	2.2	=	2026-10-16
+aterm-ctl	16.0	128	16.0	2.9	=	2026-10-18
 aterm-dbus	6.0	48	6.0	0.8	=	2026-10-16
-aterm-digest	16.0	-	-	-	-	-
-aterm-dirfd	16.0	-	-	-	-	-
-aterm-dl	6.0	-	-	-	-	-
+aterm-digest	-	-	-	-	-	-
+aterm-dirfd	-	-	-	-	-	-
+aterm-dl	-	-	-	-	-	-
+aterm-durable	16.0	-	-	-	-	-
 aterm-effects	16.0	128	16.0	28.9	>	2026-10-16
 aterm-font	6.0	48	6.0	5.4	=	2026-10-16
 aterm-forge	16.0	128	16.0	40.3	>	2026-10-16
 aterm-gpu	16.0	128	16.0	19.1	>	2026-10-16
-aterm-gpu-web	6.0	48	6.0	1.2	=	2026-10-16
 aterm-gpu-web	6.0	128	16.0	2.4	=	2026-10-16
-aterm-grapheme	16.0	128	16.0	0.4	=	2026-10-16
-aterm-grid	16.0	128	16.0	2.2	=	2026-10-16
+aterm-grapheme	16.0	128	16.0	1.4	=	2026-10-19
+aterm-grid	16.0	128	16.0	2.3	=	2026-10-19
 aterm-gui	16.0	128	16.0	17.3	>	2026-10-16
-aterm-gui-consent	16.0	128	16.0	0.4	=	2026-10-17
+aterm-gui-consent	16.0	128	16.0	1.4	=	2026-10-19
 aterm-gui-documents	16.0	128	16.0	3.2	=	2026-10-17
-aterm-gui-fabric	16.0	128	16.0	1.6	=	2026-10-17
-aterm-gui-tabs	16.0	128	16.0	0.7	=	2026-10-17
-aterm-gui-timing	16.0	-	-	-	-	-
-aterm-hash	16.0	-	-	-	-	-
-aterm-http	16.0	128	16.0	2.2	=	2026-10-16
-aterm-json	16.0	-	-	-	-	-
-aterm-keeper	16.0	8	1.0	1.0	>	2026-10-05: the 8 GiB A18 Pro Mac at its real 1.0 GiB ceiling, seal 321aaeda7, tree bdf61b81d plus test-only edits: 393 functions ran out of the ceiling, 24 proved of 637 (the 2026-09-29 0.3 row predates the library's growth from 489 obligations)
-aterm-keeper	16.0	24	3.0	1.2	=	2026-10-01T12:48:56Z: m101 (24 GiB), its real ceiling, the lane's cost history
+aterm-gui-fabric	16.0	128	16.0	1.7	=	2026-10-19
+aterm-gui-tabs	16.0	128	16.0	1.5	=	2026-10-19
+aterm-gui-timing	-	-	-	-	-	-
+aterm-hash	-	-	-	-	-	-
+aterm-http	16.0	128	16.0	2.3	=	2026-10-19
+aterm-json	-	-	-	-	-	-
 aterm-keeper	16.0	128	16.0	1.5	=	2026-10-17
-aterm-lexicon	16.0	128	16.0	1.3	=	2026-10-16
-aterm-link	16.0	128	16.0	3.9	=	2026-10-16
-aterm-link+sealed	16.0	128	16.0	4.4	=	2026-10-16
-aterm-log	16.0	128	16.0	0.3	=	2026-10-16
-aterm-lz4	16.0	128	16.0	0.6	=	2026-10-16
+aterm-lab-clock	16.0	128	16.0	2.6	=	2026-10-19
+aterm-lexicon	16.0	128	16.0	1.4	=	2026-10-19
+aterm-link	16.0	128	16.0	5.0	=	2026-10-18
+aterm-log	16.0	128	16.0	1.4	=	2026-10-19
+aterm-lz4	16.0	128	16.0	0.4	=	2026-10-18
 aterm-machines	4.0	32	4.0	2.7	=	2026-10-17
 aterm-macro-support	6.0	-	-	-	-	-
-aterm-messages	16.0	32	4.0	2.0	=	2026-10-17
 aterm-messages	16.0	128	16.0	2.2	=	2026-10-17
 aterm-models	16.0	-	-	-	-	-
 aterm-models-atpkg	16.0	-	-	-	-	-
-aterm-models-core	16.0	128	16.0	4.6	=	2026-10-16
+aterm-models-core	16.0	128	16.0	6.8	=	2026-10-19
 aterm-models-effects	16.0	-	-	-	-	-
 aterm-models-gui	16.0	-	-	-	-	-
 aterm-models-harness	16.0	-	-	-	-	-
@@ -98,89 +87,75 @@ aterm-models-release	16.0	-	-	-	-	-
 aterm-models-render	16.0	-	-	-	-	-
 aterm-models-session	16.0	-	-	-	-	-
 aterm-models-update	16.0	-	-	-	-	-
-aterm-objc	16.0	128	16.0	0.5	=	2026-10-16
-aterm-observe	16.0	-	-	-	-	-
+aterm-net	16.0	128	16.0	1.3	=	2026-10-18
+aterm-objc	16.0	128	16.0	1.6	=	2026-10-19
+aterm-observe	-	-	-	-	-	-
 aterm-parser	16.0	128	16.0	1.3	=	2026-10-16
-aterm-phase	16.0	36	4.5	2.4	=	2026-10-17
 aterm-phase	16.0	128	16.0	2.6	=	2026-10-17
 aterm-png	16.0	128	16.0	2.7	=	2026-10-16
-aterm-policy	16.0	24	3.0	0.9	=	2026-09-29: m101 (24 GiB), its real ceiling
-aterm-policy	16.0	128	16.0	0.9	=	2026-10-16
-aterm-predict	16.0	-	-	-	-	-
+aterm-policy	16.0	128	16.0	1.4	=	2026-10-19
+aterm-predict	-	-	-	-	-	-
 aterm-primer	16.0	8	2.0	1.5	=	2026-10-01: the 8 GiB A18 Pro Mac, its real RAM, a hand trustc sweep at a 2.0 GiB ceiling and with none, seal 321aaeda7, tree af94a8122, nothing ran out (ru_maxrss 1.59 GB; no census line printed). At this host's real 1.0 GiB ceiling the R1 pre-pass peak turns every function UNKNOWN: 0 of 305
-aterm-provenance	16.0	-	-	-	-	-
-aterm-pty	6.0	48	6.0	0.7	=	2026-10-17
-aterm-pty	6.0	128	16.0	0.7	=	2026-10-16
-aterm-regex	16.0	24	3.0	1.0	=	2026-09-29: m101 (24 GiB), its real ceiling
-aterm-regex	16.0	128	16.0	0.8	=	2026-10-16
+aterm-provenance	-	-	-	-	-	-
+aterm-pty	16.0	128	16.0	0.8	=	2026-10-18
+aterm-regex	16.0	128	16.0	1.6	=	2026-10-18
 aterm-render	16.0	128	16.0	11.0	=	2026-10-16
 aterm-restore	16.0	128	16.0	1.5	=	2026-10-17
-aterm-rle	16.0	-	-	-	-	-
-aterm-sandbox	16.0	-	-	-	-	-
-aterm-scene	16.0	-	-	-	-	-
+aterm-rle	-	-	-	-	-	-
+aterm-sandbox	-	-	-	-	-	-
+aterm-scene	-	-	-	-	-	-
 aterm-scrollback	16.0	128	16.0	0.9	=	2026-10-16
-aterm-search	16.0	8	1.0	0.7	=	2026-10-04
 aterm-search	16.0	128	16.0	0.7	=	2026-10-16
-aterm-selection	16.0	128	16.0	0.3	=	2026-10-16
+aterm-selection	16.0	128	16.0	1.4	=	2026-10-19
 aterm-serde	6.0	-	-	-	-	-
 aterm-serde-derive	6.0	-	-	-	-	-
-aterm-session	16.0	128	16.0	0.6	=	2026-10-16
-aterm-shell-integration	16.0	-	-	-	-	-
-aterm-sixel	16.0	-	-	-	-	-
+aterm-session	16.0	128	16.0	1.5	=	2026-10-18
+aterm-shell-integration	-	-	-	-	-	-
+aterm-sixel	-	-	-	-	-	-
 aterm-slog	8.0	64	8.0	3.2	=	2026-10-16
-aterm-spec	16.0	36	4.5	2.1	=	2026-10-16: this 36 GiB M4 Max at its real 4.5 GiB ceiling (--try-refused), tree ec09cbc78, nothing ran out (0 bodies skipped at the ceiling); 120 proved against a floor of 181 with 148 obligations out of time, the same at load 1-3 as at 20 (NOT-VERIFIED(clock), undecided)
 aterm-spec	16.0	128	16.0	7.7	=	2026-10-16
 aterm-spec-anchor	16.0	-	-	-	-	-
 aterm-spec-macros	6.0	128	16.0	4.3	=	2026-10-16
 aterm-spec-models	16.0	-	-	-	-	-
-aterm-sysprobe	16.0	-	-	-	-	-
-aterm-tempfile	16.0	-	-	-	-	-
-aterm-theme-pack	6.0	-	-	-	-	-
-aterm-time	16.0	-	-	-	-	-
+aterm-sysprobe	-	-	-	-	-	-
+aterm-tempfile	-	-	-	-	-	-
+aterm-theme-pack	-	-	-	-	-	-
+aterm-time	-	-	-	-	-	-
 aterm-toml	16.0	128	16.0	1.3	=	2026-10-16
-aterm-toolchain	16.0	128	16.0	0.5	=	2026-10-16
-aterm-types	16.0	8	4.0	1.5	=	2026-09-29: the 8 GiB A18 Pro Mac with RAM faked to 32 GiB (DYLD interposer), seal 321aaeda7, tree 32fbdd443, nothing ran out
-aterm-types	16.0	128	16.0	1.5	=	2026-10-16
-aterm-uds	6.0	8	2.0	1.0	=	2026-10-01: the 8 GiB A18 Pro Mac, its real RAM, a hand trustc sweep at a 2.0 GiB ceiling and with none, seal 321aaeda7, tree 265cc3cd4, nothing ran out (census peak 1.0 GiB, ru_maxrss 1.03 GiB). At this host's real 1.0 GiB ceiling: 16 of 630 against a floor of 27, the same without the new deadline module
-aterm-uds	6.0	24	3.0	1.0	=	2026-10-01T14:23:54Z: m101 (24 GiB), its real ceiling, the lane's cost history
-aterm-uds	6.0	48	6.0	1.5	=	2026-10-17
-aterm-uds	6.0	128	16.0	1.5	=	2026-10-17
+aterm-toolchain	16.0	128	16.0	1.5	=	2026-10-19
+aterm-types	16.0	128	16.0	5.7	=	2026-10-18
+aterm-uds	16.0	128	16.0	1.6	=	2026-10-20
 aterm-update	16.0	128	16.0	4.1	=	2026-10-16
-aterm-update-core	16.0	24	3.0	0.7	=	2026-10-01T14:23:54Z: m101 (24 GiB), its real ceiling, the lane's cost history
 aterm-update-core	16.0	128	16.0	1.0	=	2026-10-16
-aterm-verify	6.0	8	4.0	1.6	=	2026-09-29: the 8 GiB A18 Pro Mac with RAM faked to 32 GiB (DYLD interposer), seal 321aaeda7, tree 32fbdd443, nothing ran out
-aterm-verify	6.0	36	4.5	3.5	=	2026-10-05
-aterm-verify	6.0	48	6.0	2.1	=	2026-10-16
-aterm-verify	6.0	128	16.0	1.4	=	2026-10-16
-aterm-wasm	6.0	48	6.0	2.5	=	2026-10-16
+aterm-verify	16.0	128	16.0	2.2	=	2026-10-19
 aterm-wasm	6.0	128	16.0	2.4	=	2026-10-16
 aterm-wasm-abi	6.0	-	-	-	-	-
-aterm-wasm-abi-macros	6.0	48	6.0	0.8	=	2026-10-16
+aterm-wasm-abi-macros	16.0	128	16.0	1.4	=	2026-10-19
 aterm-wayland	6.0	48	6.0	0.7	=	2026-10-17
 aterm-win32	6.0	-	-	-	-	-
-aterm-winit-keymap	16.0	-	-	-	-	-
-aterm-winres	16.0	-	-	-	-	-
-aterm-winsign	16.0	-	-	-	-	-
+aterm-window	4.5	128	16.0	2.4	=	2026-10-16
+aterm-winit-keymap	-	-	-	-	-	-
+aterm-winres	-	-	-	-	-	-
+aterm-winsign	-	-	-	-	-	-
 aterm-x11	6.0	48	6.0	0.9	=	2026-10-17
-aterm-xkb	6.0	-	-	-	-	-
+aterm-xkb	-	-	-	-	-	-
 aterm-zstd	6.0	48	6.0	2.3	=	2026-10-16
-atpkg	16.0	128	16.0	19.8	>	2026-10-16
+atpkg	6.0	48	6.0	6.5	>	2026-10-20
+atpkg	6.0	128	16.0	19.8	>	2026-10-16
 atpkg-keys	16.0	128	16.0	0.6	=	2026-10-16
-atpkg-publish	16.0	128	16.0	11.6	=	2026-10-15
+atpkg-publish	16.0	128	16.0	8.8	=	2026-10-19
 cfg-if	16.0	-	-	-	-	-
 document-features	6.0	-	-	-	-	-
 getrandom	6.0	-	-	-	-	-
-libc	16.0	24	3.0	0.3	=	2026-10-01T12:48:56Z: m101 (24 GiB), its real ceiling, the lane's cost history
 libc	16.0	128	16.0	0.3	=	2026-10-16
 libm	6.0	-	-	-	-	-
 log	16.0	-	-	-	-	-
 once_cell	16.0	-	-	-	-	-
 profiling	16.0	-	-	-	-	-
+rustix	6.0	-	-	-	-	-
 smallvec	6.0	-	-	-	-	-
 tracing	16.0	-	-	-	-	-
 unicode-width	6.0	-	-	-	-	-
 windows-sys@0.52.0	6.0	-	-	-	-	-
 windows-sys@0.61.2	6.0	-	-	-	-	-
-winit	4.5	36	4.5	2.1	=	2026-10-16
-winit	4.5	48	6.0	1.9	=	2026-10-16
 winit	4.5	128	16.0	2.4	=	2026-10-16

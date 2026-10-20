@@ -1,0 +1,25 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# S23: an overflow is counted on the source mark, and the join drops every
+# row until the next prompt (no tool call is kept without its prompt).
+bind 0
+see busy
+tx prompt v1
+tx tool c1
+tx overflow 3
+expect mark r1 source field=transcript skipped=0
+expect mark r1 source field=transcript state=on dropped=3
+expect tx desync=1
+tx tool c2
+tx result c1
+tx end
+tx compact
+expect tx dropped=7
+tx prompt v2
+expect tx desync=0
+expect open p1 tool vref=c1
+expect close p1 tool out=gone
+expect open t1 turn src=screen
+expect close t1 turn out=superseded by=vendor
+expect open t2 turn vref=v2 src=transcript
+tx tool c3
+expect open p2 tool par=t2 vref=c3

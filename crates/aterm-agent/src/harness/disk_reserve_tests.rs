@@ -77,3 +77,32 @@ fn a_link_in_the_reserves_place_is_never_followed_or_removed() {
         b"not the reserve"
     );
 }
+
+/// ONE PASS AT A TIME: the pass lock beside the reserve is taken without
+/// waiting, and a second taker (another instance's watch: a second open, as
+/// another process makes) finds it held; once the first lets go, by `LOCK_UN`,
+/// the next takes it. NEGATIVE CONTROL: a link planted at the lock's name is
+/// never followed.
+#[test]
+fn the_pass_lock_lets_one_pass_run_at_a_time() {
+    let tmp = Tmp::new("pass-lock");
+    let home = tmp.path().join("home");
+    let path = pass_lock_for(&home);
+    assert_eq!(
+        path.parent(),
+        path_for(&home).parent(),
+        "beside the reserve"
+    );
+    let first = take_pass(&path).expect("made").expect("taken");
+    assert!(take_pass(&path).expect("opened").is_none(), "held");
+    drop(first);
+    let again = take_pass(&path).expect("opened");
+    assert!(again.is_some(), "released by LOCK_UN");
+    drop(again);
+    let victim = tmp.path().join("victim");
+    std::fs::write(&victim, b"keep").expect("victim");
+    std::fs::remove_file(&path).expect("unlinked");
+    std::os::unix::fs::symlink(&victim, &path).expect("link");
+    assert!(take_pass(&path).is_err(), "a link is not followed");
+    assert_eq!(std::fs::read(&victim).expect("victim"), b"keep");
+}

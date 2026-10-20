@@ -468,6 +468,24 @@ pub(crate) fn task_field(
     }
 }
 
+/// The `pause=` field `status` and `ls` print after `task=`
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §10.5.1): the unix second
+/// the loop's pause after short turns ends, as the session's loop last told
+/// this window's host, for a supervisable agent session (`agent`) whose live
+/// claim that host holds (`claimed_here`) — and `-` otherwise, as `task=`.
+/// A clock time, never a countdown.
+#[must_use]
+pub(crate) fn pause_field(
+    pause: Option<crate::PausePlan>,
+    claimed_here: bool,
+    agent: Option<aterm_phase::Program>,
+) -> String {
+    match pause {
+        Some(p) if claimed_here && agent.is_some() => p.at_unix.to_string(),
+        _ => "-".to_string(),
+    }
+}
+
 impl App {
     /// The window's harness posture now: whether it has a host, and the
     /// policy in force (the config watcher's, `harness_policy`).
@@ -610,10 +628,12 @@ impl App {
         let Some(ctx) = self.pool.get(local_id).map(|s| s.ctx.clone()) else {
             return false;
         };
+        // The window's own chip and menu: the person's.
         let write = crate::session_timeline::apply_autopilot(
             &ctx,
             word.map(|w| w.word().to_string()),
             land_at,
+            aterm_slog::Actor::Human,
         );
         self.autopilot_pair_written(local_id, write.moved, word.is_some())
     }
@@ -633,6 +653,54 @@ impl App {
         moved: bool,
         has_word: bool,
     ) -> bool {
+        self.autopilot_pair_fanned_out(local_id, moved, has_word, true)
+    }
+
+    /// WRITE MANY SESSIONS' AUTOPILOT PAIRS AT ONCE (design §11.5.3, item
+    /// 6; the `Every session` row): each `(local_id, word, land_at)` written
+    /// as the window's one writer writes one
+    /// ([`Self::set_session_autopilot_timed`]), with that write's own
+    /// fan-out — the timer index, an open menu, the crash journal's owed
+    /// words, the footer, the A/B arm and the keyed record — by `by`, but
+    /// the page published ONCE, after the loop: each publish reads every
+    /// session (`App::harness_state`), so N writes each publishing would
+    /// read N² sessions on one click. Published whether or not a write
+    /// moved, so the page converges on what is stored, as the timer's press
+    /// does (`App::execute_harness_timer`). A session gone since the press
+    /// was read is skipped. How many pairs moved.
+    pub(crate) fn write_autopilot_batch(
+        &mut self,
+        writes: &[(u64, Option<Autopilot>, Option<i64>)],
+        by: aterm_slog::Actor,
+    ) -> usize {
+        let mut moved = 0;
+        for &(local_id, word, land_at) in writes {
+            let Some(ctx) = self.pool.get(local_id).map(|s| s.ctx.clone()) else {
+                continue;
+            };
+            let write = crate::session_timeline::apply_autopilot(
+                &ctx,
+                word.map(|w| w.word().to_string()),
+                land_at,
+                by,
+            );
+            if self.autopilot_pair_fanned_out(local_id, write.moved, word.is_some(), false) {
+                moved += 1;
+            }
+        }
+        self.harness_screen_moved();
+        moved
+    }
+
+    /// [`Self::autopilot_pair_written`]'s fan-out, the page's publish in it
+    /// where `publish` (the batch publishes once, after its loop).
+    fn autopilot_pair_fanned_out(
+        &mut self,
+        local_id: u64,
+        moved: bool,
+        has_word: bool,
+        publish: bool,
+    ) -> bool {
         // The timer the write may drop, read BEFORE the index is built again
         // from what is stored (§10.2.3, item 8): the record names it.
         let dropped = self.autopilot_timers.glass(local_id);
@@ -646,11 +714,11 @@ impl App {
             return false;
         }
         // What a `meta set` from the window refreshes
-        // (`App::write_session_meta_field`): the tab chrome, the presence
-        // band and the operator item, and the session's `events` watchers.
+        // (`App::write_session_meta_field`): the tab chrome, the needs border
+        // and the menu-bar item, and the session's `events` watchers.
         self.refresh_meta_dependent_chrome(local_id);
-        self.refresh_presence_session(local_id, false);
-        self.refresh_operator_status_item();
+        self.refresh_presence_session(local_id);
+        self.mark_status_dirty();
         if self.subscribers.any() {
             self.subscribers
                 .lock()
@@ -661,7 +729,9 @@ impl App {
         // The session's A/B arm moves with its mode (Settings ▸ Harness), and
         // the page, where a view shows it, lists the word.
         self.note_harness_arm(local_id);
-        self.harness_screen_moved();
+        if publish {
+            self.harness_screen_moved();
+        }
         let sid = self
             .pool
             .get(local_id)
@@ -700,15 +770,38 @@ impl App {
         self.session_autopilot(local_id).1
     }
 
+    /// Single toggle on-off switch for a running session's harness: flips
+    /// session `local_id` directly between `Autopilot::Off` (disabling the
+    /// entire harness — supervision, launch card rainbow kitty, composer
+    /// border branding, and glass transcript rewrites) and `Autopilot::Cruise`
+    /// (seamlessly re-enabling the entire harness during the running session).
+    pub(crate) fn toggle_session_harness(&mut self, local_id: u64) -> AutopilotView {
+        let (word, view, _) = self.session_autopilot(local_id);
+        let currently_off = matches!(
+            view,
+            AutopilotView::Off | AutopilotView::MasterOff | AutopilotView::AgentOff(_)
+        ) || word == Some(Autopilot::Off);
+        let next = if currently_off {
+            Autopilot::Cruise
+        } else {
+            Autopilot::Off
+        };
+        self.set_session_autopilot(local_id, Some(next));
+        self.session_autopilot(local_id).1
+    }
+
     /// Open Settings ▸ Harness in window `wid` (the `⚙` chip, the chip under
     /// the master switch off, the Autopilot menu's `Harness settings…`, View ▸
     /// Coding Agent Harness…): the one Settings tab, raised there at the
     /// Harness route, and landed at `focus` (§10.3.3, item 8) — a session's
-    /// row, drawn selected until the next press or scroll, or SUPERVISION;
-    /// [`HarnessFocus::Top`] leaves the page where the route's arrival puts
-    /// it. The landing is the page's own action
+    /// row, drawn selected until the next press or scroll, SUPERVISION, or
+    /// [`HarnessFocus::Top`], the page's top (§10.3.1: View ▸ Coding Agent
+    /// Harness… opens at the top). The landing is the page's own action
     /// ([`crate::harness_screen::HARNESS_LAND`]), so it holds before the
-    /// page has been measured and after. Whether a tab shows it.
+    /// page has been measured and after, and each open replaces the one
+    /// before it: a landing still waiting for its row (a session the page
+    /// does not list yet) never pulls a page opened since. Whether a tab
+    /// shows it.
     ///
     /// [`HarnessFocus::Top`]: crate::harness_screen::HarnessFocus::Top
     pub(crate) fn open_harness_settings(
@@ -718,9 +811,6 @@ impl App {
     ) -> bool {
         if !self.open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Harness) {
             return false;
-        }
-        if focus == crate::harness_screen::HarnessFocus::Top {
-            return true;
         }
         self.dispatch_settings_action_in_window(
             wid,
@@ -1088,7 +1178,7 @@ mod tests {
         let now = crate::metrics::now_us();
         crate::session_timeline::claim_supervisor(&ctx, "someone-else", None, None, now).unwrap();
         assert!(!app.session_autopilot(0).2, "another holder's claim");
-        crate::session_timeline::release_supervisor(&ctx, None, now);
+        crate::session_timeline::release_supervisor(&ctx, None, now, aterm_slog::Actor::Ctl);
         crate::session_timeline::claim_supervisor(
             &ctx,
             &crate::harness_host::holder(),

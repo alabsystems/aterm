@@ -12,8 +12,9 @@
 //! release's own policy reader, capture ladder, history carry, writer and
 //! consumer, and the guard's own rendezvous capture. An API change that breaks
 //! it fails to compile, and each release's tree carries the generator that
-//! matches its producer. Its two entry tests are `#[ignore]`d: they write a
-//! release's bytes and run only by name.
+//! matches its producer. Both tests run in isolated children: ordinary test
+//! runs generate and validate private scratch fixtures; the release cutter
+//! supplies an explicit destination and release stamp for publication.
 //!
 //! `targo --unverified ship release` runs them in the cut tree once the
 //! release's identity is reserved, before anything is claimed, into the
@@ -26,7 +27,7 @@
 //! ATERM_BUILD_GIT_COMMIT_FULL=<the tag's 40-digit commit> \
 //! SOURCE_DATE_EPOCH=<the release's build number in RELEASES.ledger> \
 //! ATERM_HANDOFF_FIXTURE_OUT=<dir>/vX.Y.0 ATERM_RENDEZVOUS_FIXTURE_OUT=<dir>/vX.Y.0 \
-//!   targo --unverified test -p aterm-gui --lib -- generate_ --ignored --test-threads 1
+//!   targo --unverified test -p aterm-gui --lib -- generate_ --test-threads 1
 //! ```
 //!
 //! EVERY RELEASE INPUT IS DERIVED, never spelled. The three pins are the ones
@@ -49,6 +50,48 @@
 //! this is that generator, with its per-release inputs derived.
 
 use super::*;
+
+/// Keep the installed build stamp and generator environment out of sibling
+/// tests. An explicit destination retains the release caller's required pins;
+/// ordinary tests use the deterministic library stamp and a private directory.
+fn fx_generator_in_child(output: &str) -> bool {
+    if crate::test_alone::in_child() {
+        return true;
+    }
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let scratch = aterm_tempfile::tempdir().expect("private fixture destination");
+    let mut vars = vec![];
+    let destination = if let Some(out) = std::env::var_os(output) {
+        std::path::PathBuf::from(out)
+    } else {
+        vars.extend([
+            (
+                "ATERM_BUILD_GIT_COMMIT",
+                std::ffi::OsString::from(crate::build_info::git_commit()),
+            ),
+            (
+                "ATERM_BUILD_GIT_COMMIT_FULL",
+                std::ffi::OsString::from(crate::build_info::git_commit_full()),
+            ),
+            (
+                "SOURCE_DATE_EPOCH",
+                std::ffi::OsString::from(crate::running_build_number().to_string()),
+            ),
+        ]);
+        scratch.path().to_path_buf()
+    };
+    vars.push((output, destination.as_os_str().to_owned()));
+    let env: Vec<_> = vars.iter().map(|(k, v)| (*k, v.as_os_str())).collect();
+    crate::test_alone::run_alone_with(&env);
+    assert!(
+        std::fs::read_dir(&destination)
+            .expect("generator destination exists")
+            .next()
+            .is_some(),
+        "the generator wrote fixtures"
+    );
+    false
+}
 
 const FIXTURE_DIR_PLACEHOLDER: &str = "@HANDOFF_DIR@";
 /// The successor these desks hand to: a build a day NEWER than this release's
@@ -331,7 +374,10 @@ fn fx_record(local_id: u64, title: &str) -> SessionRecord {
         // shell whose journal image was not this process's own. Every desk's
         // process wrote its own image, so none carries a key.
         render_debt: None,
+        render_debt_cut: 0,
         journal_key: None,
+        task: None,
+        status_seen: None,
     }
 }
 
@@ -368,6 +414,7 @@ fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::Res
         // quit's layout, never by the handoff's (`capture_restore_manifest`).
         agent: None,
         supervised: None,
+        lost: None,
         // Since v0.100.0: a pane kept open after its command exited.
         held: false,
         holds: Vec::new(),
@@ -574,6 +621,8 @@ fn fx_window_carry(rows: u16, cols: u16, installing: bool) -> WindowCarry {
         // parent's health warnings said (`carried_messages`).
         font_px_milli: None,
         font_reset_px_milli: None,
+        font_size_milli: None,
+        font_reset_size_milli: None,
         update_health_said: carried.update_health_said,
         messages_captured_unix_ms: carried.captured_unix_ms,
     }
@@ -654,6 +703,7 @@ fn fx_claude(local_id: u64, rows: u16, cols: u16, before: usize) -> FxSession {
         screen_hash: 2,
         seq: t.content_seq(),
         arch,
+        by: crate::turn_ledger::TurnBy::Ctl,
         carried: false,
     });
     FxSession {
@@ -775,7 +825,7 @@ struct FxCapture {
     rungs: Vec<(u64, CarryRung, usize)>,
     /// The rows the engine owed each carried alternate screen (v0.101.0's
     /// `ParkedScreens::render_debts`), only where not zero.
-    render_debts: Vec<(u64, (i32, i32))>,
+    render_debts: Vec<(u64, aterm_core::terminal::RenderDebt)>,
     /// The held panes' screens (`App::capture_held_screens`), captured last,
     /// priced from what the handed screens left of the aggregate cells; their
     /// control carries are in `sources`.
@@ -941,7 +991,7 @@ fn fx_capture(
         // screen of a session whose screen is carried (not blank on purpose).
         if rung != CarryRung::Repaint && guard.modes().alternate_screen {
             let debt = guard.render_debt();
-            if debt != (0, 0) {
+            if debt.owed() {
                 render_debts.push((id, debt));
             }
         }
@@ -1289,15 +1339,18 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             41_000 + index
         };
         record.fg_holder = Some(holder).filter(|holder| *holder > 0);
-        // THE RENDER DEBT (v0.101.0, `stamp_render_debts`): `"<shift>,<pushed>"`
-        // for a session whose carried alternate screen the engine owed rows,
-        // and nothing for any other. No journal key (`stamp_journal_keys`):
-        // this process's journal holds its own image.
-        record.render_debt = capture
-            .render_debts
-            .iter()
-            .find(|(local_id, _)| *local_id == record.local_id)
-            .map(|(_, (shift, pushed))| crate::session_store::render_debt_row(*shift, *pushed));
+        // THE RENDER DEBT (v0.101.0, `stamp_render_debts`): `"<shift>,<pushed>"`,
+        // and the columns in their own key, for a session whose carried
+        // alternate screen the engine owed something, and nothing for any
+        // other. No journal key (`stamp_journal_keys`): this process's journal
+        // holds its own image.
+        record.carry_render_debt(
+            capture
+                .render_debts
+                .iter()
+                .find(|(local_id, _)| *local_id == record.local_id)
+                .map(|(_, debt)| *debt),
+        );
         record.journal_key = None;
     }
     // Each `(src, dst, op)` once, sorted, as `SessionHandoff::from_store` has
@@ -1325,8 +1378,10 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         held: Vec::new(),
         roster_seq: Some(FX_ROSTER_SEQ),
         fabric_attached: Vec::new(),
+        fleet_told: Vec::new(),
         mirror_dropped: Vec::new(),
         mirror_served: false,
+        machine_names: Vec::new(),
     };
     // THE LAYOUT, captured after the screens and committed at the park
     // (`App::capture_handoff_layout`, then `commit_handoff_layout`). Since
@@ -1431,7 +1486,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         handoff_carry::StatusWords::for_target(fx_target_build()),
     );
     manifest.next_turn_id = handoff_carry::manifest_turn_id(turn_id_ceiling);
-    let mut results = plan.results(&dir);
+    let mut results = plan.results_for_test(&dir);
     let held_history = results.take_held(
         &capture
             .held
@@ -2081,9 +2136,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         );
         assert_eq!(
             adopted.render_debt,
-            rec.render_debt
-                .as_deref()
-                .and_then(crate::session_store::parse_render_debt),
+            rec.carried_render_debt(),
             "{}: session {}'s render debt crosses",
             desk.name,
             adopted.local_id
@@ -3505,8 +3558,10 @@ fn fx_held_pane_desk() -> FxDesk {
 }
 
 #[test]
-#[ignore = "writes release fixtures; run by name with --ignored"]
 fn generate_handoff_fixtures() {
+    if !fx_generator_in_child("ATERM_HANDOFF_FIXTURE_OUT") {
+        return;
+    }
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let _restore = restore_env();
     fx_install_release_stamp();
@@ -3588,8 +3643,10 @@ mod rendezvous_generator {
     /// release's claim, grant, descriptor order, launch environment and
     /// device-term proof over the fixed inputs.
     #[test]
-    #[ignore = "writes a release fixture; run by name with --ignored"]
     fn generate_rendezvous_fixture() {
+        if !super::fx_generator_in_child("ATERM_RENDEZVOUS_FIXTURE_OUT") {
+            return;
+        }
         let _env = super::ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

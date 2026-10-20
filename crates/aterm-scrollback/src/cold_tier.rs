@@ -57,6 +57,10 @@ struct ColdPage {
     compressed: Vec<u8>,
     /// Number of lines in page.
     line_count: usize,
+    /// Its rows are blank stand-ins for text already counted as lost: the page
+    /// a quarantined warm block leaves in its place ([`ColdTier::push_lost_block`]).
+    /// Evicting it loses nothing more ([`Evicted::already_lost`]).
+    lost: bool,
 }
 
 impl ColdPage {
@@ -67,6 +71,7 @@ impl ColdPage {
         Ok(Self {
             compressed,
             line_count,
+            lost: false,
         })
     }
 
@@ -75,6 +80,16 @@ impl ColdPage {
         let decompressed = super::decode_cold_bounded(&self.compressed)?;
         Ok(deserialize_page_lines(&decompressed))
     }
+}
+
+/// What a byte-budget eviction ([`ColdTier::evict_bytes`]) took.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Evicted {
+    /// Logical lines removed.
+    pub(crate) lines: usize,
+    /// Of those, the rows of lost pages: blank stand-ins for text the loss
+    /// counter already holds, which their eviction must not count again.
+    pub(crate) already_lost: usize,
 }
 
 /// Cold tier: LZ4 compressed pages (in-memory).
@@ -161,8 +176,21 @@ impl ColdTier {
     /// the fire-and-forget semantics of the in-memory eviction path while
     /// allowing callers to adjust their line counts.
     pub(crate) fn push_block(&mut self, block: &WarmBlock) -> usize {
+        self.push(block, false)
+    }
+
+    /// Push `block` as the blank stand-in for a quarantined warm block's
+    /// lines, whose loss is already counted: its eviction reports them as
+    /// [`Evicted::already_lost`]. Returns the lines accepted, as
+    /// [`Self::push_block`].
+    pub(crate) fn push_lost_block(&mut self, block: &WarmBlock) -> usize {
+        self.push(block, true)
+    }
+
+    fn push(&mut self, block: &WarmBlock, lost: bool) -> usize {
         match ColdPage::from_warm_block(block) {
-            Ok(page) => {
+            Ok(mut page) => {
+                page.lost = lost;
                 let accepted = page.line_count;
                 // saturating_add: a byte total cannot overflow usize for real
                 // data — exact on every real path.
@@ -529,7 +557,8 @@ impl ColdTier {
 
     /// Evict oldest pages until at least `target_bytes` of compressed memory is freed.
     ///
-    /// Returns total lines evicted. Counts pages to evict first, then batch-removes
+    /// Returns the lines evicted, and how many of them were a lost page's
+    /// already-counted rows. Counts pages to evict first, then batch-removes
     /// them in O(P) total instead of the O(k*P) cost of repeated `pop_front()`.
     // Skip: the eviction walk drives a std iterator whose `next` is an absent
     // body (generic trait path). Pure bookkeeping over owned blocks; the
@@ -537,17 +566,29 @@ impl ColdTier {
     // INCONCLUSIVE (1 of 2 obligations unknown). Needed from $HOME/trust, in a
     // promoted seal: totality for std iterator `next`; then drop this.
     #[cfg_attr(trust_verify, trust::skip)]
-    pub(crate) fn evict_bytes(&mut self, target_bytes: usize) -> usize {
+    pub(crate) fn evict_bytes(&mut self, target_bytes: usize) -> Evicted {
         if target_bytes == 0 || self.pages.is_empty() {
-            return 0;
+            return Evicted::default();
         }
 
-        // Count pages needed to free target_bytes.
+        // Count pages needed to free target_bytes, and the lost rows among
+        // them (the first page's count adjusted for `front_offset`, as
+        // `pop_front_batch` adjusts it).
         let mut bytes_freed = 0usize;
         let mut pages_to_evict = 0usize;
+        let mut already_lost = 0usize;
         for page in &self.pages {
             if bytes_freed >= target_bytes {
                 break;
+            }
+            if page.lost {
+                let logical = if pages_to_evict == 0 {
+                    page.line_count.saturating_sub(self.front_offset)
+                } else {
+                    page.line_count
+                };
+                // Bounded by the lines in memory, like `pop_front_batch`'s sum.
+                already_lost = already_lost.saturating_add(logical);
             }
             // `bytes_freed` sums the lengths of live `compressed`
             // allocations (bounded by self.bytes_used) and `pages_to_evict`
@@ -557,7 +598,10 @@ impl ColdTier {
             pages_to_evict = pages_to_evict.saturating_add(1);
         }
 
-        self.pop_front_batch(pages_to_evict)
+        Evicted {
+            lines: self.pop_front_batch(pages_to_evict),
+            already_lost,
+        }
     }
 
     /// Remove the oldest `n` logical lines from the front of the cold tier.
@@ -596,7 +640,7 @@ impl ColdTier {
         if n > self.line_count {
             // Pre-composed message via the log shim: identical rendered
             // record, but no macro-expanded `format_args!` unsafe in THIS
-            // function (which the strict gate would escalate — see log_shim.rs).
+            // function (which the Trust lane would escalate — see log_shim.rs).
             let mut msg = String::from("truncate_front_lines(");
             msg.push_str(&crate::error::dec_string(n));
             msg.push_str(") exceeds line_count(");
@@ -607,7 +651,7 @@ impl ColdTier {
 
         // Saturating: `front_offset` and `n` are bounded by lines this process
         // actually stored, so the sum always fits in `usize` — the saturation
-        // just discharges the strict gate's unconstrained-input counterexample.
+        // just discharges the Trust lane's unconstrained-input counterexample.
         self.front_offset = self.front_offset.saturating_add(n);
         self.line_count = self.line_count.saturating_sub(n);
 
@@ -619,7 +663,7 @@ impl ColdTier {
             if self.front_offset >= front.line_count {
                 // `let-else` + break instead of `.expect(..)`: the loop
                 // condition just witnessed a front page, so the `None` arm is
-                // unreachable and behavior identical — but the strict gate
+                // unreachable and behavior identical — but the Trust lane
                 // must refute every reachable panic and cannot carry the
                 // witness across the `pop_front` call.
                 let Some(page) = self.pages.pop_front() else {

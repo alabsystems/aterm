@@ -14,14 +14,15 @@
 
 use std::time::{Duration, Instant};
 
-use aterm_agent::supervise::StuckSurvey;
 use aterm_agent::supervise::policy::exception::{Exception, Urgency};
+use aterm_agent::supervise::policy::notice;
 use aterm_agent::supervise::policy::outlook::ExceptionKind;
+use aterm_agent::supervise::{StallSeen, StuckSurvey};
 use aterm_core::terminal::repaint_nudge::{Gate, GiveUp};
 use aterm_messages::exceptions::{Entry, Family};
+use aterm_phase::Program;
 
 use crate::App;
-use crate::app_presence::presence_regrids;
 use crate::harness_host::{AccountsSaid, HostNote, RelaunchSay};
 use crate::message_reporters as mr;
 use crate::messages_host::message_regrids;
@@ -77,6 +78,24 @@ fn roster() -> Vec<Entry> {
         }
     }
     all.push(mr::disk_low_entry(7, 20, &[]));
+    // The settings a removed feature left, at a line and with none.
+    for feature in mr::REMOVED_FEATURES {
+        all.push(mr::removed_setting_entry(feature, Some(12), &[]));
+        all.push(mr::removed_setting_entry(feature, None, &[]));
+        let left = feature.left.map(|left| {
+            left(
+                aterm_toml::from_str::<aterm_toml::Value>(NET_WITH_CREDENTIALS)
+                    .expect("the fixture parses")
+                    .get("net")
+                    .expect("the fixture has [net]"),
+            )
+        });
+        all.push(mr::removed_setting_entry(
+            feature,
+            Some(12),
+            &left.unwrap_or_default(),
+        ));
+    }
     for cause in [
         crate::session_log_journal::Cause::Full,
         crate::session_log_journal::Cause::Io,
@@ -123,6 +142,12 @@ fn roster() -> Vec<Entry> {
         &std::iter::repeat_n(note, 5).collect::<Vec<_>>(),
     ));
     all.push(mr::upgrade_cannot_run_entry("busy:state-unwritable", None));
+    all.push(mr::upgrade_records_unlisted_entry(std::path::Path::new(
+        "/Users//someone/.local/state/aterm/harness/upgrade",
+    )));
+    all.push(mr::upgrade_records_unreadable_entry(&[
+        std::path::PathBuf::from("/Users//someone/.local/state/aterm/harness/upgrade/0badf00d.json"),
+    ]));
     for step in [
         atpkg::devtools::Step::Add,
         atpkg::devtools::Step::SwitchOn,
@@ -152,31 +177,71 @@ fn roster() -> Vec<Entry> {
         for cause in ["held", "shell-prompt", "other-tab"] {
             all.push(mr::relaunch_blocked_entry("s-3e79", &spot, cause, false));
         }
+        // A step of its own where resuming is no remedy (the Gemini CLI
+        // lane's pre-check, a session with no turn), and none.
+        let thens = [
+            None,
+            crate::harness_host::cannot_then("refused:history-unsafe"),
+            crate::harness_host::cannot_then("refused:no-turn"),
+        ];
         for reason in ["its shell is gone", "it ran one prompt and ended"] {
-            all.push(mr::relaunch_gone_entry("s-3e79", &spot, reason, false));
-            all.push(mr::relaunch_gone_entry("s-3e79", &spot, reason, true));
+            for new_tab in [false, true] {
+                for then in thens {
+                    all.push(mr::relaunch_gone_entry(
+                        "s-3e79", &spot, reason, false, new_tab, then,
+                    ));
+                    all.push(mr::relaunch_gone_entry(
+                        "s-3e79", &spot, reason, true, new_tab, then,
+                    ));
+                }
+            }
         }
         for restarted in [false, true] {
             for command in [None, Some("HOME=/Users//o claude --resume 0badf00d")] {
-                all.push(mr::relaunch_lost_entry(
-                    "s-3e79",
-                    &spot,
-                    "its shell is gone",
-                    restarted,
-                    command,
-                ));
+                for then in thens {
+                    all.push(mr::relaunch_lost_entry(
+                        "s-3e79",
+                        &spot,
+                        "its shell is gone",
+                        restarted,
+                        command,
+                        then,
+                    ));
+                }
             }
         }
         all.push(mr::relaunch_not_restored_entry("s-3e79", &spot));
     }
     // The resume loop's: every kind, alone and in three tabs, in every place.
     for spot in places() {
-        let one = vec![("s-1".to_string(), stall_exception(), spot.clone())];
+        let one = vec![(
+            "s-1".to_string(),
+            stall_exception(),
+            Program::Claude,
+            spot.clone(),
+        )];
         all.extend(mr::resume_exceptions(&one));
+        // agy's and Muse Code's own background work, named by their agent.
+        for agent in [Program::Agy, Program::Muse] {
+            let own = vec![(
+                "s-1".to_string(),
+                Exception::stalled_on_work(),
+                agent,
+                spot.clone(),
+            )];
+            all.extend(mr::resume_exceptions(&own));
+        }
         for kind in later_kinds() {
             let many: Vec<_> = ["s-1", "s-2", "s-3"]
                 .iter()
-                .map(|sid| (sid.to_string(), resume_exception(kind), spot.clone()))
+                .map(|sid| {
+                    (
+                        sid.to_string(),
+                        resume_exception(kind),
+                        Program::Claude,
+                        spot.clone(),
+                    )
+                })
                 .collect();
             all.extend(mr::resume_exceptions(&many));
             all.extend(mr::resume_exceptions(&many[..1]));
@@ -238,8 +303,9 @@ fn resume_exception(kind: ExceptionKind) -> Exception {
         why: why.to_string(),
         action: action.to_string(),
         clears: "the agent working",
-        // The old lost login is the loop's own escalation.
+        // Another program's lost login is the loop's own escalation.
         escalated: kind == ExceptionKind::Login,
+        notice: None,
     }
 }
 
@@ -279,6 +345,258 @@ fn every_host_entry_passes_the_door_and_the_caps() {
         assert!(
             !record_keys.contains(&key),
             "{key}: an entry and a record never share a key"
+        );
+    }
+}
+
+/// A REMOVED FEATURE'S SETTINGS ARE ONE ENTRY UNTIL THEY GO (design §7): an
+/// `aterm.toml` that still configures the network drive, in any spelling —
+/// a `[net]` header, a `[[net.connections]]` array with no header, an inline
+/// table, a dotted key — is told once, naming what replaced it, and every load
+/// that still finds it says the same entry again rather than a second one; the
+/// load that no longer finds it ends it. NEGATIVE CONTROL: a config with no
+/// `[net]` (a `[fleet]` one included, and one that does not parse) raises
+/// nothing.
+#[test]
+fn a_removed_features_settings_are_one_entry_until_they_go() {
+    let net = &mr::REMOVED_FEATURES[0];
+    assert_eq!(net.table, "net");
+    for text in [
+        "[net]\nlisten = \"0.0.0.0:7100\"\ncert = \"c.der\"\nkey = \"k.der\"\n",
+        "[[net.connections]]\nname = \"box\"\nhost = \"box:7100\"\n",
+        "net = { listen = \"0.0.0.0:7100\" }\n",
+        "net.listen = \"0.0.0.0:7100\"\n",
+    ] {
+        let mut app = App::headless_for_test();
+        app.note_removed_settings(text);
+        app.note_removed_settings(text);
+        let digest = app.messages.digest();
+        assert_eq!(digest.len(), 1, "{text:?}: {digest:?}");
+        let entry = &digest.entries[0];
+        assert_eq!(entry.key, mr::removed_setting_key(net), "{text:?}");
+        assert_eq!(
+            entry.then, "Delete the [net] table from aterm.toml",
+            "the step is the one that ends it: {text:?}"
+        );
+        assert!(
+            entry.why.contains("the fleet replaced")
+                && entry
+                    .detail
+                    .iter()
+                    .any(|line| line.contains("aterm fleet join")),
+            "it names what replaced it: {text:?}: {entry:?}"
+        );
+        app.note_removed_settings("font_px = 14\n");
+        assert!(
+            app.messages.digest().is_empty(),
+            "{text:?}: a load without [net] ends it"
+        );
+    }
+    for text in [
+        "",
+        "font_px = 14\n",
+        "[fleet]\nlisten = \"0.0.0.0:7100\"\n",
+        "[net\n",
+    ] {
+        let mut app = App::headless_for_test();
+        app.note_removed_settings(text);
+        assert!(app.messages.digest().is_empty(), "{text:?}");
+    }
+}
+
+/// A `[net]` table that names every credential the network drive kept: the
+/// TLS key (whose folder held its persistent drive token), the certificate,
+/// and two saved connections, one with a `token_file` and one without.
+const NET_WITH_CREDENTIALS: &str = "[net]\nlisten = \"0.0.0.0:7100\"\ncert = \
+     \"/keys/net-cert.der\"\nkey = \"/keys/net-key.der\"\n\n[[net.connections]]\nname = \
+     \"box\"\nhost = \"box:7100\"\ntoken_file = \"/keys/box.token\"\n\n[[net.connections]]\n\
+     name = \"lab\"\nhost = \"lab:7100\"\n";
+
+/// The same at a real home's length: the key and certificate in the config
+/// folder, and four connections, two with a `token_file` (one beside the key,
+/// one in another folder) and two without.
+const NET_AT_HOME: &str = "[net]\nlisten = \"0.0.0.0:7100\"\n\
+     cert = \"/home/alexandra/.config/aterm/net/drive-cert.der\"\n\
+     key = \"/home/alexandra/.config/aterm/net/drive-key.der\"\n\
+     [[net.connections]]\nname = \"build-box\"\nhost = \"build-box:7100\"\n\
+     token_file = \"/home/alexandra/.config/aterm/net/build-box.token\"\n\
+     [[net.connections]]\nname = \"lab-mac\"\nhost = \"lab-mac:7100\"\n\
+     token_file = \"/home/alexandra/secrets/aterm/lab-mac.token\"\n\
+     [[net.connections]]\nname = \"render-farm\"\nhost = \"render-farm:7100\"\n\
+     [[net.connections]]\nname = \"office-mini\"\nhost = \"office-mini:7100\"\n";
+
+/// Whether a line of `detail` names the file `name` in `folder`: its whole
+/// path, ended by the line or a list's `,` or `;`, or `name` in the list after
+/// `in <folder>: `.
+fn names_file(detail: &[String], folder: &str, name: &str) -> bool {
+    let whole = std::path::Path::new(folder)
+        .join(name)
+        .display()
+        .to_string();
+    let group = format!("in {folder}: ");
+    detail.iter().any(|line| {
+        let ended = |at: usize| {
+            line[at..]
+                .chars()
+                .next()
+                .is_none_or(|c| c == ',' || c == ';')
+        };
+        line.match_indices(&whole)
+            .any(|(i, _)| ended(i + whole.len()))
+            || line.match_indices(&group).any(|(i, _)| {
+                line[i + group.len()..]
+                    .split("; ")
+                    .next()
+                    .is_some_and(|list| list.split(", ").any(|n| n == name))
+            })
+    })
+}
+
+/// THE NETWORK DRIVE'S CREDENTIALS ARE NAMED WHILE ITS TABLE STILL SAYS WHERE
+/// THEY ARE (design §7): an `aterm.toml` whose `[net]` names a TLS key, a
+/// certificate and saved connections gets Details naming each file — the
+/// drive token in the key's folder, a connection's `token_file`, the key, the
+/// certificate — and, on macOS, the Keychain service and every connection's
+/// name; elsewhere every connection's conventional file, which `dial-token`
+/// wrote whatever its `token_file` said. A table at a real home's length,
+/// four connections deep, is named whole: no file is cut at a line's cap.
+/// aterm deletes none of them. NEGATIVE CONTROL: a `[net]` that names no
+/// credential gets no such line.
+#[test]
+fn the_network_drives_left_credentials_are_named_from_its_table() {
+    let home = "/home/alexandra/.config/aterm/net";
+    for (table, files, connections) in [
+        (
+            NET_WITH_CREDENTIALS,
+            vec![
+                ("/keys", "aterm-network-drive.token"),
+                ("/keys", "net-key.der"),
+                ("/keys", "net-cert.der"),
+                ("/keys", "box.token"),
+            ],
+            &["box", "lab"][..],
+        ),
+        (
+            NET_AT_HOME,
+            vec![
+                (home, "aterm-network-drive.token"),
+                (home, "drive-key.der"),
+                (home, "drive-cert.der"),
+                (home, "build-box.token"),
+                ("/home/alexandra/secrets/aterm", "lab-mac.token"),
+            ],
+            &["build-box", "lab-mac", "render-farm", "office-mini"][..],
+        ),
+    ] {
+        let mut app = App::headless_for_test();
+        app.note_removed_settings(table);
+        let digest = app.messages.digest();
+        assert_eq!(digest.len(), 1, "{digest:?}");
+        let detail = &digest.entries[0].detail;
+        for (folder, name) in files {
+            assert!(
+                names_file(detail, folder, name),
+                "names {folder}/{name}: {detail:#?}"
+            );
+        }
+        if cfg!(target_os = "macos") {
+            let keychain = detail
+                .iter()
+                .find(|l| l.contains("-s aterm-net-drive"))
+                .unwrap_or_else(|| panic!("the Keychain items: {detail:#?}"));
+            assert!(
+                keychain.ends_with(&connections.join(", ")),
+                "every connection: {keychain}"
+            );
+        } else {
+            for name in connections {
+                assert!(
+                    names_file(detail, "net beside aterm.toml", &format!("{name}.token")),
+                    "{name}'s conventional file: {detail:#?}"
+                );
+            }
+            assert!(
+                !detail.iter().any(|l| l.contains("aterm-net-drive")),
+                "{detail:#?}"
+            );
+        }
+    }
+    let mut app = App::headless_for_test();
+    app.note_removed_settings(NET_WITH_CREDENTIALS);
+    let lines = app.messages.digest().entries[0].detail.len();
+    let mut bare = App::headless_for_test();
+    bare.note_removed_settings("[net]\nlisten = \"0.0.0.0:7100\"\n");
+    let digest = bare.messages.digest();
+    assert_eq!(digest.len(), 1, "{digest:?}");
+    let detail = &digest.entries[0].detail;
+    assert_eq!(
+        detail.len() + 2,
+        lines,
+        "no credential, no line: {detail:?}"
+    );
+    assert!(
+        !detail
+            .iter()
+            .any(|l| l.contains(".token") || l.contains("aterm-net-drive")),
+        "{detail:?}"
+    );
+}
+
+/// A TABLE A REMOVED FEATURE LEFT BEHIND (`[operator]`, 2026-10-15) is one
+/// line of the digest while `aterm.toml` still writes it — said again at a
+/// reload, still one line — its one step the deletion that ends it, its
+/// navigation opening the file at the table's line, and its reason and
+/// Details naming the manager session that replaced it on every platform;
+/// the reload that drops the table ends it. NEGATIVE CONTROL: a file without
+/// the table raises nothing, and a file that does not parse changes nothing.
+#[test]
+fn a_removed_table_is_one_line_while_the_file_writes_it() {
+    let operator = mr::REMOVED_FEATURES
+        .iter()
+        .find(|feature| feature.table == "operator")
+        .expect("the operator is a removed feature");
+    let mut app = App::headless_for_test();
+    app.note_removed_settings("font_px = 14\n");
+    assert!(app.messages.digest().is_empty(), "no table, no line");
+    for text in [
+        "font_px = 14\n\n# the old switch\n[operator]\nenabled = true\n",
+        "font_px = 14\n\n# the old switch\noperator.enabled = true\n",
+        "font_px = 14\n\n# the old switch\n[[operator.queue]]\nsid = \"s-1\"\n",
+    ] {
+        app.note_removed_settings(text);
+        app.note_removed_settings(text);
+        let digest = app.messages.digest();
+        assert_eq!(
+            digest.len(),
+            1,
+            "one line, however often it is said: {text:?}"
+        );
+        let line = &digest.entries[0];
+        assert_eq!(line.key, mr::removed_setting_key(operator));
+        assert_eq!(line.then, "Delete the [operator] table from aterm.toml");
+        assert_eq!(
+            line.actions.first(),
+            Some(&aterm_messages::Intent::OpenConfigEditor { line: Some(4) }),
+            "{text:?}"
+        );
+        assert!(
+            line.why.contains("a manager session")
+                && line
+                    .detail
+                    .iter()
+                    .any(|said| said.contains("spawn agent=claude")),
+            "{text:?}: {line:?}"
+        );
+        app.note_removed_settings("font_px = [\n");
+        assert_eq!(
+            app.messages.digest().len(),
+            1,
+            "an unparsed file moves nothing"
+        );
+        app.note_removed_settings("font_px = 14\n");
+        assert!(
+            app.messages.digest().is_empty(),
+            "the edit that drops the table ends its line"
         );
     }
 }
@@ -466,7 +784,7 @@ fn a_carried_excerpt_dates_the_day_from_the_end_of_its_day() {
 #[test]
 fn a_supervisor_that_keeps_failing_is_a_record_then_a_line_after_an_hour() {
     let mut app = App::headless_for_test();
-    let (message, presence) = (message_regrids(), presence_regrids());
+    let message = message_regrids();
     let pause = Duration::from_secs(300);
     let failing = |why: &str| HostNote::SupervisorFailing {
         sid: "s-7".to_string(),
@@ -527,7 +845,7 @@ fn a_supervisor_that_keeps_failing_is_a_record_then_a_line_after_an_hour() {
     });
     assert!(app.ripening_deadline().is_none());
     assert!(app.messages.digest().is_empty());
-    assert_eq!((message_regrids(), presence_regrids()), (message, presence));
+    assert_eq!(message_regrids(), message);
     assert!(app.messages.live_rows().count() == 0, "no band row");
 }
 
@@ -746,7 +1064,7 @@ fn the_developer_tools_list_is_one_line_and_a_reading_decides_it() {
         "two capsules that never read alike"
     );
     assert_eq!(line.then, atpkg::devtools::HELPER_STEP, "the one action");
-    let skips = aterm_containment::SpikeEvidence::UNMEASURED.devtool_skips_first_run_check;
+    let skips = aterm_containment::SpikeEvidence::MEASURED.devtool_skips_first_run_check;
     assert!(
         line.detail.iter().any(|l| l == atpkg::devtools::why(skips)),
         "why, in atpkg's words: {:?}",
@@ -1019,9 +1337,114 @@ fn an_upgrade_that_cannot_run_is_one_line_until_the_last_tab_runs_again() {
     assert!(app.messages.digest().is_empty());
 }
 
+/// THE RECORDS' FOLDER THE UPGRADES' VIEW CANNOT LIST (ATERM-KI-1016-1) is
+/// the host's fact, `harness.upgrade-host.records-unlisted`, in the
+/// classifier's words with the folder under Details: until it, the upgrades
+/// shown stood at the last whole look with nothing said. Said again, it is
+/// one line; a pass over the upgrade's rows never ends it; the note that the
+/// folder is listed ends it whether or not this process raised it.
+#[test]
+fn a_records_folder_the_view_cannot_list_is_one_line_until_it_is_listed() {
+    let mut app = App::headless_for_test();
+    let dir = std::path::PathBuf::from("/state/harness/upgrade");
+    for _ in 0..2 {
+        app.note_harness_host(HostNote::UpgradeRecords {
+            unlisted: Some(dir.clone()),
+        });
+    }
+    assert_eq!(app.messages.digest().len(), 1, "one line");
+    let entry = &app.messages.digest().entries[0];
+    assert_eq!(entry.key, mr::UPGRADE_RECORDS_UNLISTED_KEY);
+    let said = format!("{} {} {:?}", entry.title, entry.then, entry.detail);
+    assert!(said.contains("/state/harness/upgrade"), "{said}");
+    app.except_replace(Family::Upgrade, &[]);
+    assert_eq!(
+        app.messages.digest().len(),
+        1,
+        "the rows' pass does not end it"
+    );
+    app.note_harness_host(HostNote::UpgradeRecords { unlisted: None });
+    assert!(app.messages.digest().is_empty(), "listed: it ends");
+    // NEGATIVE CONTROL: the cannot-run line is another fact, untouched.
+    app.note_harness_host(HostNote::UpgradeCannotRun {
+        sid: "s-1".to_string(),
+        step: "busy:state-unwritable".to_string(),
+        dir: None,
+    });
+    app.note_harness_host(HostNote::UpgradeRecords { unlisted: None });
+    assert_eq!(app.messages.digest().len(), 1);
+    assert_eq!(
+        app.messages.digest().entries[0].key,
+        mr::UPGRADE_CANNOT_RUN_KEY
+    );
+}
+
+/// THE RECORDS THE UPGRADES' VIEW CANNOT READ (ATERM-KI-1016-1 host-8) are
+/// the host's fact, `harness.upgrade-host.records-unreadable`, in the
+/// classifier's words with each file under Details: until it, a record that
+/// could not be read froze its tab's upgrade row and mark with nothing
+/// said. Said again, it is one line; the note that none is left ends it
+/// whether or not this process raised it. NEGATIVE CONTROL: the folder's
+/// own line is another fact, untouched by it.
+#[test]
+fn records_the_view_cannot_read_are_one_line_until_they_read() {
+    let mut app = App::headless_for_test();
+    let files = vec![
+        std::path::PathBuf::from("/state/harness/upgrade/aaa.json"),
+        std::path::PathBuf::from("/state/harness/upgrade/bbb.json"),
+    ];
+    app.note_harness_host(HostNote::UpgradeRecords {
+        unlisted: Some(std::path::PathBuf::from("/state/harness/upgrade")),
+    });
+    for _ in 0..2 {
+        app.note_harness_host(HostNote::UpgradeRecordsUnreadable {
+            files: files.clone(),
+        });
+    }
+    let keys: Vec<String> = app
+        .messages
+        .digest()
+        .entries
+        .iter()
+        .map(|e| e.key.clone())
+        .collect();
+    assert_eq!(
+        keys.iter()
+            .filter(|k| *k == mr::UPGRADE_RECORDS_UNREADABLE_KEY)
+            .count(),
+        1,
+        "one line: {keys:?}"
+    );
+    let digest = app.messages.digest();
+    let entry = digest
+        .entries
+        .iter()
+        .find(|e| e.key == mr::UPGRADE_RECORDS_UNREADABLE_KEY)
+        .expect("said");
+    let said = format!("{} {} {:?}", entry.title, entry.then, entry.detail);
+    assert!(
+        said.contains("aaa.json") && said.contains("bbb.json"),
+        "{said}"
+    );
+    app.note_harness_host(HostNote::UpgradeRecordsUnreadable { files: Vec::new() });
+    let keys: Vec<String> = app
+        .messages
+        .digest()
+        .entries
+        .iter()
+        .map(|e| e.key.clone())
+        .collect();
+    assert_eq!(
+        keys,
+        [mr::UPGRADE_RECORDS_UNLISTED_KEY.to_string()],
+        "read: it ends, the folder's line stands"
+    );
+}
+
 /// What a note of the accounts may never move: the band's rows, a tab's
-/// attention (its strip's bit, its session's badge), and the two re-grid counts.
-fn glass(app: &App) -> (usize, usize, usize, u64, u64) {
+/// attention (its strip's bit, its session's badge), and the band's re-grid
+/// count (presence owns no row to re-grid).
+fn glass(app: &App) -> (usize, usize, usize, u64) {
     let marked = app
         .windows
         .values()
@@ -1041,7 +1464,6 @@ fn glass(app: &App) -> (usize, usize, usize, u64, u64) {
         marked,
         badged,
         message_regrids(),
-        presence_regrids(),
     )
 }
 
@@ -1056,8 +1478,9 @@ fn glass(app: &App) -> (usize, usize, usize, u64, u64) {
 /// account its action is for changes, the open line ends and is raised anew, so
 /// its title, its detail and the log's open record (what `aterm exceptions`
 /// prints) say the accounts as they are. A count that moves while the first
-/// label holds restates in place by the digest's own rule: inside its restate
-/// quiet the words wait, and the host saying the line again past it lands them.
+/// label holds restates in place AT ONCE: the line's words move only with the
+/// roster (`restated_at_once`), so the window never shows a count the roster
+/// has left, while the log keeps the open line's first words.
 ///
 /// NEGATIVE CONTROLS: the same note again moves nothing, `Nothing` on an empty
 /// digest (the machine with no roster) moves nothing, and after every step no
@@ -1067,7 +1490,6 @@ fn glass(app: &App) -> (usize, usize, usize, u64, u64) {
 fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
     use crate::messages_host::wall_stamp_now;
     use aterm_messages::PostOutcome;
-    use aterm_messages::need::RESTATE_QUIET;
     use std::time::Instant;
     let mut app = App::headless_for_test();
     let before = glass(&app);
@@ -1128,7 +1550,7 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
     let login = |label: &str| {
         line(
             mr::ACCOUNTS_SIGNED_OUT_KEY,
-            &format!("Run aterm harness accounts login {label}"),
+            &notice::ACCOUNT_SIGNED_OUT.fill(Some(label), None).todo,
         )
     };
     let refused = line(
@@ -1149,31 +1571,37 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
     assert_eq!(step(&mut app, listed(&["work-2"])), [login("work-2")]);
     assert_eq!(app.messages.digest_revision(), rev, "the same words again");
     let id = app.messages.digest().entries[0].id;
-    // A second signs out: the same line, the same action. Its count and its
-    // detail wait out the digest's restate quiet...
+    // A second signs out: the same line, the same action, its count and its
+    // detail in place at once — never ten minutes behind the roster.
     let both = ["work-2", "pool-a"];
     assert_eq!(step(&mut app, listed(&both)), [login("work-2")]);
     assert_eq!(app.messages.digest().entries[0].id, id, "one entry, kept");
-    assert!(!shown(&app).0, "the count waits out the quiet");
-    // ...and the host saying the line again past it (its slow look) lands
-    // them in place.
+    assert_eq!(shown(&app), (true, vec!["work-2", "pool-a"]), "at once");
+    // Said again: the same words, nothing moves.
+    let rev = app.messages.digest_revision();
     let again = mr::accounts_signed_out_entry(&both.map(str::to_string)).expect("an entry");
     let posted = app.messages.post(
         again.message().expect("an entry that passes"),
         wall_stamp_now(),
-        Instant::now() + RESTATE_QUIET,
+        Instant::now(),
     );
-    assert_eq!(posted.outcome, PostOutcome::Restated);
-    assert_eq!(shown(&app), (true, vec!["work-2", "pool-a"]));
+    assert_eq!(posted.outcome, PostOutcome::Duplicate);
+    assert_eq!(app.messages.digest_revision(), rev);
     assert_eq!(app.messages.digest().entries[0].id, id);
-    assert_eq!(logged(&app), ["Run aterm harness accounts login work-2"]);
+    assert_eq!(
+        logged(&app),
+        [notice::ACCOUNT_SIGNED_OUT.fill(Some("work-2"), None).todo]
+    );
 
     // The first signs in: the line is the next account's at once, in the
     // window and in the log — a line of its own, the other one ended.
     assert_eq!(step(&mut app, listed(&["pool-a"])), [login("pool-a")]);
     assert_ne!(app.messages.digest().entries[0].id, id, "raised anew");
     assert_eq!(shown(&app), (false, vec!["pool-a"]));
-    assert_eq!(logged(&app), ["Run aterm harness accounts login pool-a"]);
+    assert_eq!(
+        logged(&app),
+        [notice::ACCOUNT_SIGNED_OUT.fill(Some("pool-a"), None).todo]
+    );
     // None signed out: gone.
     assert!(step(&mut app, listed(&[])).is_empty());
     assert!(logged(&app).is_empty());
@@ -1242,7 +1670,10 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
         "the adopted words gave way"
     );
     assert_eq!(app.messages.digest().len(), 1, "and the refused line ended");
-    assert_eq!(logged(&app), ["Run aterm harness accounts login pool-a"]);
+    assert_eq!(
+        logged(&app),
+        [notice::ACCOUNT_SIGNED_OUT.fill(Some("pool-a"), None).todo]
+    );
     assert_eq!(glass(&app), before);
     // `Nothing` (the roster deleted, or the owner's switch off) ends both.
     let mut app = adopting();
@@ -1257,10 +1688,13 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
 /// nothing — and ended when nothing names it (credits over); the week nearly
 /// used with credits off is ONE line, `harness.accounts.window-full`, whose
 /// action is to turn credits on, or to raise their cap where the vendor said
-/// they ran out. Neither marks a tab, puts a row on the band or writes a
-/// record. NEGATIVE CONTROLS: a note that names neither raises neither (the
-/// window-full line needs credits known off: the host names none
-/// otherwise), and both Entries pass the door's caps and vocabulary.
+/// they ran out — under `[harness] usage_credits = false`, the default, with
+/// that key set too, since the harness keeps the session on the plan until
+/// the reset whatever the account allows. Neither marks a tab, puts a row on
+/// the band or writes a record. NEGATIVE CONTROLS: a note that names neither
+/// raises neither (the window-full line needs credits known off: the host
+/// names none otherwise); the key on asks for the account's step alone; and
+/// every Entry passes the door's caps and vocabulary.
 #[test]
 fn the_accounts_usage_lines_follow_what_the_host_says_and_mark_nothing() {
     let mut app = App::headless_for_test();
@@ -1296,14 +1730,11 @@ fn the_accounts_usage_lines_follow_what_the_host_says_and_mark_nothing() {
         mr::ACCOUNTS_CREDITS_KEY.to_string(),
         "Review the usage credit cap in claude.ai settings".to_string(),
     );
-    let turn_on = (
-        mr::ACCOUNTS_WINDOW_FULL_KEY.to_string(),
-        "Turn on usage credits in claude.ai settings".to_string(),
-    );
-    let raise = (
-        mr::ACCOUNTS_WINDOW_FULL_KEY.to_string(),
-        "Raise the usage credit cap in claude.ai settings".to_string(),
-    );
+    let full_line = |then: &str| (mr::ACCOUNTS_WINDOW_FULL_KEY.to_string(), then.to_string());
+    let turn_on =
+        full_line("Set [harness] usage_credits = true and turn on usage credits in claude.ai");
+    let raise =
+        full_line("Set [harness] usage_credits = true and raise the usage credit cap in claude.ai");
     // NEGATIVE CONTROL: nothing named, nothing raised.
     assert!(step(&mut app, said(&[], &[])).is_empty());
     // Credits in use: the line, once.
@@ -1336,6 +1767,22 @@ fn the_accounts_usage_lines_follow_what_the_host_says_and_mark_nothing() {
         step(&mut app, said(&[], &[("main", "out_of_credits")])),
         [raise]
     );
+    assert!(step(&mut app, said(&[], &[])).is_empty());
+    // `[harness] usage_credits = true`: the account's step alone.
+    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+        crate::app_config::HarnessPolicy::read("[harness]\nusage_credits = true\n"),
+    );
+    assert_eq!(
+        step(&mut app, said(&[], &[("main", "org_level_disabled")])),
+        [full_line("Turn on usage credits in claude.ai settings")]
+    );
+    assert!(step(&mut app, said(&[], &[])).is_empty());
+    assert_eq!(
+        step(&mut app, said(&[], &[("main", "out_of_credits")])),
+        [full_line(
+            "Raise the usage credit cap in claude.ai settings"
+        )]
+    );
     // The owner's switch off, or no roster: both end.
     assert_eq!(
         step(&mut app, said(&["main"], &[("main", "org_level_disabled")])).len(),
@@ -1343,17 +1790,21 @@ fn the_accounts_usage_lines_follow_what_the_host_says_and_mark_nothing() {
     );
     assert!(step(&mut app, HostNote::Accounts(AccountsSaid::Nothing)).is_empty());
     // The door's own checks, every wording.
+    let spent = [("main".to_string(), "out_of_credits".to_string())];
+    let off = [("main".to_string(), String::new())];
     for entry in [
         mr::accounts_credits_entry(&["main".to_string(), "work-2".to_string()]),
-        mr::accounts_window_full_entry(&[("main".to_string(), "out_of_credits".to_string())]),
-        mr::accounts_window_full_entry(&[("main".to_string(), String::new())]),
+        mr::accounts_window_full_entry(&spent, true),
+        mr::accounts_window_full_entry(&off, true),
+        mr::accounts_window_full_entry(&spent, false),
+        mr::accounts_window_full_entry(&off, false),
     ] {
         let entry = entry.expect("an entry");
         assert_eq!(entry.family(), Family::Accounts);
         assert!(entry.message().is_ok(), "{:?}", entry.message().err());
     }
     assert!(mr::accounts_credits_entry(&[]).is_none());
-    assert!(mr::accounts_window_full_entry(&[]).is_none());
+    assert!(mr::accounts_window_full_entry(&[], false).is_none());
 }
 
 /// THE RESUME LOOP'S EXCEPTIONS REACH THE DIGEST (design-exceptions 9.3, X3d).
@@ -1370,6 +1821,7 @@ fn a_resume_exception_is_one_line_per_kind_and_a_stall_one_per_tab_and_each_ends
     let told = |app: &mut App, sid: &str, standing: Option<Exception>| {
         app.note_harness_host(HostNote::ResumeException {
             sid: sid.to_string(),
+            agent: Program::Claude,
             standing,
         });
     };
@@ -1523,23 +1975,46 @@ fn a_relaunch_is_a_record_and_only_what_a_person_alone_can_mend_is_a_line() {
     );
     assert!(app.messages.digest().is_empty());
     // Cannot, with the command for the tab's mark: a record, no line.
-    let cannot = |command: Option<&str>, marked: bool, lost: bool| RelaunchSay::Cannot {
-        reason: "its shell is gone".to_string(),
-        restarted: false,
-        command: command.map(str::to_string),
-        marked,
-        lost,
-    };
+    let cannot_at =
+        |command: Option<&str>, marked: bool, lost: bool, new_tab: bool| RelaunchSay::Cannot {
+            reason: "its shell is gone".to_string(),
+            restarted: false,
+            command: command.map(str::to_string),
+            marked,
+            lost,
+            new_tab,
+            then: None,
+        };
+    let cannot =
+        |command: Option<&str>, marked: bool, lost: bool| cannot_at(command, marked, lost, false);
     say(
         &mut app,
         cannot(Some("claude --resume 0badf00d"), true, true),
     );
     assert!(app.messages.digest().is_empty(), "the tab carries the ask");
     // Cannot, with no command to name and no conversation: one line of the
-    // digest.
+    // digest, the agent started again in its tab.
     say(&mut app, cannot(None, false, false));
     let gone = app.messages.digest().entries[0].clone();
     assert_eq!(gone.key, mr::relaunch_keys(&tab)[1]);
+    assert!(
+        gone.then.starts_with("Start the agent in that tab"),
+        "{}",
+        gone.then
+    );
+    say(&mut app, RelaunchSay::Ended);
+    assert!(app.messages.digest().is_empty());
+    // A TAB'S OWN PROGRAM (an agent run as `aterm -e claude`, no conversation
+    // known, and no shell left in its tab): the line says a new tab, never
+    // the one the agent took with it (px1's review: a remedy that cannot be
+    // followed).
+    say(&mut app, cannot_at(None, false, false, true));
+    let gone = app.messages.digest().entries[0].clone();
+    assert!(
+        gone.then.starts_with("Start the agent in a new tab"),
+        "{}",
+        gone.then
+    );
     say(&mut app, RelaunchSay::Ended);
     assert!(app.messages.digest().is_empty());
     // THE CONVERSATION KNOWN, NO MARK (a command too long for it): its own
@@ -1679,6 +2154,8 @@ fn a_relaunch_claim_and_line_end_when_their_tab_is_gone() {
             command: None,
             marked: false,
             lost: false,
+            new_tab: false,
+            then: None,
         },
     });
     let _ = app.settle_messages(due + Duration::from_secs(2));
@@ -1713,6 +2190,52 @@ fn a_relaunch_claim_and_line_end_when_their_tab_is_gone() {
     assert_eq!(keys, [mr::relaunch_not_restored_key(&tab)], "{keys:?}");
 }
 
+/// A RESUME THAT WOULD LOSE TURNS IS NEVER TOLD TO BE RESUMED (the Gemini
+/// CLI lane's pre-check, `refused:history-unsafe`): its Messages line's step
+/// is its own, with its conversation known and without; so is a session that
+/// took no turn. NEGATIVE CONTROL: another refusal's line says to start the
+/// agent and resume it.
+#[test]
+fn a_resume_that_would_lose_turns_is_never_told_to_be_resumed() {
+    use crate::harness_host::cannot_then;
+    let unsafe_then = cannot_then("refused:history-unsafe");
+    assert!(unsafe_then.is_some());
+    assert!(cannot_then("refused:no-turn").is_some());
+    assert_eq!(cannot_then("refused:shell-gone"), None);
+    for (step, lost) in [
+        ("refused:history-unsafe", true),
+        ("refused:history-unsafe", false),
+        ("refused:no-turn", true),
+        ("refused:shell-gone", true),
+    ] {
+        let mut app = App::headless_for_test();
+        let tab = front_tab_sid(&mut app);
+        app.note_harness_host(HostNote::Relaunch {
+            sid: tab.clone(),
+            said: RelaunchSay::Cannot {
+                reason: "why".to_string(),
+                restarted: false,
+                command: None,
+                marked: false,
+                lost,
+                new_tab: false,
+                then: cannot_then(step),
+            },
+        });
+        let thens: Vec<String> = app
+            .messages
+            .digest()
+            .entries
+            .iter()
+            .map(|e| e.then.clone())
+            .collect();
+        let want = cannot_then(step)
+            .unwrap_or("Start the agent in that tab and resume its conversation")
+            .to_string();
+        assert_eq!(thens, [want], "{step} lost={lost}");
+    }
+}
+
 /// A `lost` LINE ENDS WITH ITS TAB TOO (the review of ATERM-KI-1015-1 LC-4):
 /// it says "run the command below in that tab" and shows that tab, and its
 /// host forgets the tab's word with it, so nothing would end it once the
@@ -1732,6 +2255,8 @@ fn a_lost_line_ends_when_its_tab_is_gone() {
             command: Some("HOME=/Users//o claude --resume 0badf00d".to_string()),
             marked: false,
             lost: true,
+            new_tab: false,
+            then: None,
         },
     };
     app.note_harness_host(lost(CLOSED_SID));
@@ -1773,6 +2298,8 @@ fn a_lost_word_and_what_a_restart_did_not_bring_back_end_each_on_its_own() {
         command: Some("HOME=/Users//o claude --resume 0badf00d".to_string()),
         marked,
         lost: true,
+        new_tab: false,
+        then: None,
     };
     let lines = |app: &App| -> Vec<(String, String)> {
         let mut lines: Vec<(String, String)> = app
@@ -1839,6 +2366,7 @@ fn a_lost_word_and_what_a_restart_did_not_bring_back_end_each_on_its_own() {
         "its shell is gone",
         false,
         Some("claude --resume 0badf00d"),
+        None,
     ));
     successor.except(&mr::relaunch_not_restored_entry(&tab, spot));
     successor.sweep_adopted_supervisor_lines();
@@ -1894,6 +2422,8 @@ fn the_adoption_sweep_ends_relaunch_lines_this_process_did_not_tell() {
                 spot,
                 "its shell is gone",
                 false,
+                false,
+                None,
             ));
             app.except(&mr::relaunch_blocked_entry(sid, spot, "held", false));
             app.except(&mr::relaunch_lost_entry(
@@ -1902,6 +2432,7 @@ fn the_adoption_sweep_ends_relaunch_lines_this_process_did_not_tell() {
                 "its shell is gone",
                 false,
                 Some("claude --resume 0badf00d-1111-2222-3333-444455556666"),
+                None,
             ));
         }
         app.host_noted.insert(format!("relaunch:{told}"));
@@ -1920,32 +2451,28 @@ fn the_adoption_sweep_ends_relaunch_lines_this_process_did_not_tell() {
     }
 }
 
-/// The loop's words for a lost login waited at with no account left to move
-/// to (`policy/exception.rs`): `Now`, and no escalation of the loop's carries
-/// it.
+/// The loop's notice for Claude Code's lost login carried to the browser
+/// sign-in (`policy/exception.rs`): `Now`, and no escalation of the loop's
+/// carries it.
 fn stuck_login_exception() -> Exception {
-    Exception {
-        kind: ExceptionKind::Login,
-        when: Urgency::Now,
-        why: "Its login is gone, and the roster has no other account to move it to.".to_string(),
-        action: "Run aterm harness accounts login pool-a.".to_string(),
-        clears: "the login signed in again, an account to move to, or the agent working",
-        escalated: false,
-    }
+    Exception::of_notice(&notice::LOGIN_SIGN_IN, None, None, "the agent working")
 }
 
 /// A NOW NO ESCALATION OF THE LOOP'S CARRIES IS THE OWNER'S ASK ON THE GLASS
 /// (the alert rule: the owner is needed now, aterm cannot settle it, and one
-/// step changes it): a tab's lost login waited at with no account left is ONE
-/// standing row, `harness.resume-ask.<tab>`, `Now`-class, in the loop's words
-/// — its why and its one step, `Run aterm harness accounts login <label>.` —
-/// and no line of the digest. Told again in the same words it is the same
-/// row; its end (`None`: the move onto the login signed in again was asked)
-/// takes the row down, as the loop's own escalation taking its place does. A
-/// row an earlier process carried here that no loop of this one tells of ends
-/// at the resume family's settle, and a told one stands. NEGATIVE CONTROLS:
-/// the same login carried by the loop's own escalation (`/login` typed, its
-/// badge) raises no row and no line, and a `Later` one is a line and no row.
+/// step changes it): a tab's lost login carried to the owner's sign-in is ONE
+/// standing row, `harness.resume-ask.<tab>.<code>`, `Now`-class, in the
+/// owner's four parts — what happened, the one step, what aterm did, what
+/// follows — and NO line of the digest beside it: Settings > Messages lists
+/// the ask once (the review's messages-double). Told
+/// again in the same words it is the same row; ANOTHER notice of the tab's
+/// takes its place (one row, the old replaced); its end (`None`: the login
+/// back) takes the row down, as the loop's own escalation taking
+/// its place does. A row an earlier process carried here that no loop of
+/// this one tells of ends at the resume family's settle, and a told one
+/// stands. NEGATIVE CONTROLS: another program's login carried by the loop's
+/// own escalation raises no row and no line, and a `Later` one is a line and
+/// no row.
 #[test]
 fn a_now_no_escalation_carries_is_a_standing_ask_until_its_point_moves_on() {
     use aterm_messages::need::Need;
@@ -1953,6 +2480,7 @@ fn a_now_no_escalation_carries_is_a_standing_ask_until_its_point_moves_on() {
     let told = |app: &mut App, sid: &str, standing: Option<Exception>| {
         app.note_harness_host(HostNote::ResumeException {
             sid: sid.to_string(),
+            agent: Program::Claude,
             standing,
         });
     };
@@ -1963,6 +2491,7 @@ fn a_now_no_escalation_carries_is_a_standing_ask_until_its_point_moves_on() {
             .map(|row| row.msg.key.clone().unwrap_or_default())
             .collect()
     };
+    let sign_in = |sid: &str| mr::notice_ask_key(sid, Some(notice::LOGIN_SIGN_IN.code));
     // NEGATIVE CONTROLS: the loop's own escalation; a `Later` one.
     told(
         &mut app,
@@ -1979,21 +2508,30 @@ fn a_now_no_escalation_carries_is_a_standing_ask_until_its_point_moves_on() {
     assert!(asks(&app).is_empty());
     assert_eq!(app.messages.digest().len(), 1, "a line, no row");
     told(&mut app, "s-1", None);
-    // The ask.
-    let lines = app.messages.digest().len();
-    told(&mut app, "s-1", Some(stuck_login_exception()));
-    let key = mr::resume_ask_key("s-1");
+    let _ = app.settle_messages(Instant::now() + DAY);
+    assert!(app.messages.digest().is_empty());
+    // The ask, in four parts, and nothing beside it in the digest.
+    let e = stuck_login_exception();
+    let n = e.notice.clone().expect("a notice");
+    told(&mut app, "s-1", Some(e.clone()));
+    let key = sign_in("s-1");
     assert_eq!(asks(&app), std::slice::from_ref(&key));
-    assert_eq!(app.messages.digest().len(), lines, "no line of the digest");
     let row = app.messages.live_by_key(&key).expect("the ask");
     assert!(matches!(row.msg.hold, aterm_messages::Hold::Standing(_)));
+    assert_eq!(
+        row.msg.detail,
+        [
+            e.why.clone(),
+            e.action.clone(),
+            n.did.clone(),
+            n.expect.clone()
+        ],
+        "what happened, the step, what aterm did, what follows"
+    );
     assert!(
-        row.msg
-            .detail
-            .iter()
-            .any(|l| l == "Run aterm harness accounts login pool-a."),
-        "{:?}",
-        row.msg.detail
+        app.messages.digest().is_empty(),
+        "the ask is listed once: {:?}",
+        app.messages.digest().entries
     );
     let id = row.id;
     told(&mut app, "s-1", Some(stuck_login_exception()));
@@ -2002,12 +2540,30 @@ fn a_now_no_escalation_carries_is_a_standing_ask_until_its_point_moves_on() {
         Some(id),
         "the same row"
     );
+    // Another notice takes its place: one row.
+    told(
+        &mut app,
+        "s-1",
+        Some(Exception::of_notice(
+            &notice::LOGIN_CANCELLED,
+            None,
+            None,
+            "the agent working",
+        )),
+    );
+    assert_eq!(
+        asks(&app),
+        [mr::notice_ask_key(
+            "s-1",
+            Some(notice::LOGIN_CANCELLED.code)
+        )]
+    );
     // Its end takes it down.
     told(&mut app, "s-1", None);
-    assert!(asks(&app).is_empty(), "the move asked");
+    assert!(asks(&app).is_empty(), "the login back");
     // …and so does the loop's own escalation taking its place.
     told(&mut app, "s-2", Some(stuck_login_exception()));
-    assert_eq!(asks(&app), [mr::resume_ask_key("s-2")]);
+    assert_eq!(asks(&app), [sign_in("s-2")]);
     told(
         &mut app,
         "s-2",
@@ -2026,7 +2582,303 @@ fn a_now_no_escalation_carries_is_a_standing_ask_until_its_point_moves_on() {
     app.ripen_exceptions(Instant::now());
     assert_eq!(asks(&app).len(), 2, "not yet settled");
     app.ripen_exceptions(Instant::now() + DAY);
-    assert_eq!(asks(&app), [mr::resume_ask_key("s-3")]);
+    assert_eq!(asks(&app), [sign_in("s-3")]);
+}
+
+/// ONE LOSS, ONE ROW IN SETTINGS ▸ MESSAGES (the owner's capture, 2026-10-19:
+/// "Claude's login expired in tab 1" listed three times, beside "Claude
+/// sign-in cancelled"): a tab's login notices are one story. Every state the
+/// loss moves through — another notice, the same one again after the owner
+/// read it, one after the point moved on and the row was withdrawn — is ONE
+/// row of the page, in the latest state's four parts, while the band keeps
+/// the one live ask; the login back closes it FIXED (`✓`, its fix words, the
+/// last state's title its first detail line), whether its row still stood or
+/// had already left. The next loss is a row of its own, and another tab's
+/// loss is its own row. NEGATIVE CONTROLS: a loss whose login is not said to
+/// be back stays withdrawn, never `✓`; the login back of a tab with no story
+/// moves nothing; a row the band withdrew is not resolved by its end alone.
+#[test]
+fn a_lost_logins_notices_are_one_row_in_their_latest_words_closed_fixed_once_it_is_back() {
+    use aterm_messages::need::Need;
+    let mut app = App::headless_for_test();
+    let told = |app: &mut App, sid: &str, standing: Option<Exception>| {
+        app.note_harness_host(HostNote::ResumeException {
+            sid: sid.to_string(),
+            agent: Program::Claude,
+            standing,
+        });
+    };
+    let notice = |text: &notice::NoticeText| {
+        Exception::of_notice(
+            text,
+            Some("main"),
+            Some(notice::WHY_DRAFT),
+            "the agent working",
+        )
+    };
+    let back = |app: &mut App, sid: &str| {
+        app.note_harness_host(HostNote::LoginBack {
+            sid: sid.to_string(),
+        });
+    };
+    // The page's rows of tab `sid`'s notices, newest first.
+    let rows = |app: &App, sid: &str| -> Vec<aterm_messages::page::MessageView> {
+        let base = mr::resume_ask_key(sid);
+        app.messages_state()
+            .entries
+            .into_iter()
+            .filter(|row| {
+                aterm_messages::MessageId::from_raw(row.id)
+                    .and_then(|id| app.messages.log().get(id))
+                    .and_then(|rec| rec.key.as_deref())
+                    .is_some_and(|key| key.starts_with(&base))
+            })
+            .collect()
+    };
+    let asks = |app: &App| -> Vec<String> {
+        app.messages
+            .live_rows()
+            .filter(|row| matches!(row.msg.need(), Need::Now(_)))
+            .map(|row| row.msg.key.clone().unwrap_or_default())
+            .collect()
+    };
+    let step_of = |text: &notice::NoticeText| text.fill(Some("main"), Some(notice::WHY_DRAFT)).todo;
+
+    told(&mut app, "s-1", Some(notice(&notice::LOGIN_SIGN_IN)));
+    told(&mut app, "s-1", Some(notice(&notice::LOGIN_CHOOSE)));
+    let row = rows(&app, "s-1");
+    assert_eq!(row.len(), 1, "{row:?}");
+    assert_eq!(
+        row[0].detail[1],
+        step_of(&notice::LOGIN_CHOOSE),
+        "its latest words"
+    );
+    assert_eq!(
+        asks(&app),
+        [mr::notice_ask_key("s-1", Some("ch"))],
+        "one live ask"
+    );
+    // The owner reads it, and the loss moves on: news on the band, one row.
+    let read = app
+        .messages
+        .live_by_key(&asks(&app)[0])
+        .expect("the ask")
+        .id;
+    assert!(app.messages.mark_seen(read, Instant::now()));
+    assert!(asks(&app).is_empty(), "read: off the band");
+    told(&mut app, "s-1", Some(notice(&notice::LOGIN_SIGN_IN)));
+    assert_eq!(
+        asks(&app),
+        [mr::notice_ask_key("s-1", Some("si"))],
+        "news again"
+    );
+    // The point moves on (the agent working); the loss goes on, cancelled.
+    told(&mut app, "s-1", None);
+    assert!(asks(&app).is_empty());
+    let row = rows(&app, "s-1");
+    assert_eq!((row.len(), row[0].state), (1, "withdrawn"), "{row:?}");
+    told(&mut app, "s-1", Some(notice(&notice::LOGIN_CANCELLED)));
+    let row = rows(&app, "s-1");
+    assert_eq!(row.len(), 1, "{row:?}");
+    assert_eq!(row[0].state, "live");
+    assert_eq!(
+        row[0].detail,
+        [
+            notice::LOGIN_CANCELLED.happened,
+            notice::LOGIN_CANCELLED.todo,
+            notice::LOGIN_CANCELLED.did,
+            notice::LOGIN_CANCELLED.expect
+        ],
+        "what happened, the step, what aterm did, what follows"
+    );
+    let cancelled = row[0].title.clone();
+    // The agent works again, then the loop says the login is back: fixed.
+    told(&mut app, "s-1", None);
+    back(&mut app, "s-1");
+    let row = rows(&app, "s-1");
+    assert_eq!(row.len(), 1, "{row:?}");
+    assert_eq!(row[0].state, "resolved-ok");
+    assert_eq!(row[0].severity, "success");
+    assert!(row[0].title.starts_with(notice::BACK), "{:?}", row[0].title);
+    assert_eq!(row[0].detail[0], cancelled, "the state it ended in");
+    // The next loss is its own row — news, though the owner read the last.
+    told(&mut app, "s-1", Some(notice(&notice::LOGIN_SIGN_IN)));
+    assert_eq!(asks(&app), [mr::notice_ask_key("s-1", Some("si"))]);
+    assert_eq!(rows(&app, "s-1").len(), 2, "a new loss, a new row");
+    // ...closed fixed with its row still standing (the back told first).
+    back(&mut app, "s-1");
+    assert!(asks(&app).is_empty(), "resolved off the band");
+    let row = rows(&app, "s-1");
+    assert_eq!(
+        (row.len(), row[0].state, row[0].severity),
+        (2, "resolved-ok", "success")
+    );
+
+    // NEGATIVE CONTROLS: another tab's loss is its own row, and one whose
+    // login is never said to be back stays withdrawn, never fixed.
+    told(&mut app, "s-2", Some(notice(&notice::LOGIN_SIGN_IN)));
+    told(&mut app, "s-2", None);
+    let row = rows(&app, "s-2");
+    assert_eq!(
+        (row.len(), row[0].state, row[0].severity),
+        (1, "withdrawn", "warn"),
+        "its end alone claims no fix"
+    );
+    let before = app.messages_state().entries;
+    back(&mut app, "s-3");
+    assert_eq!(
+        app.messages_state().entries,
+        before,
+        "no story: nothing moves"
+    );
+}
+
+/// Tab `sid`'s loop tells `text`'s notice (`None`: its point moved on).
+fn tell_notice(app: &mut App, sid: &str, text: Option<&notice::NoticeText>) {
+    app.note_harness_host(HostNote::ResumeException {
+        sid: sid.to_string(),
+        agent: Program::Claude,
+        standing: text.map(|text| {
+            Exception::of_notice(
+                text,
+                Some("main"),
+                Some(notice::WHY_DRAFT),
+                "the agent working",
+            )
+        }),
+    });
+}
+
+/// The keys of the live asks on the band.
+fn notice_asks(app: &App) -> Vec<String> {
+    app.messages
+        .live_rows()
+        .filter(|row| matches!(row.msg.need(), aterm_messages::need::Need::Now(_)))
+        .map(|row| row.msg.key.clone().unwrap_or_default())
+        .collect()
+}
+
+/// The ids of the page's rows of tab `sid`'s notices, newest first.
+fn notice_rows(app: &App, sid: &str) -> Vec<aterm_messages::MessageId> {
+    let base = mr::resume_ask_key(sid);
+    app.messages_state()
+        .entries
+        .into_iter()
+        .filter_map(|row| aterm_messages::MessageId::from_raw(row.id))
+        .filter(|id| {
+            app.messages
+                .log()
+                .get(*id)
+                .and_then(|rec| rec.key.as_deref())
+                .is_some_and(|key| key.starts_with(&base))
+        })
+        .collect()
+}
+
+/// A NOTICE THE OWNER READ STAYS QUIET WHILE ITS LOSS STANDS — the commit's
+/// own rule for the per-notice keys — even after the loss's next notice told
+/// its story on (the read row replaced, so the page lists the loss once): the
+/// sign-in read, then cancelled, then the sign-in again is no news, and the
+/// cancelled ask leaves the band as the sign-in's quiet return withdraws it,
+/// as on a tab whose read row was never replaced. The login back ends the
+/// story, and with it the quiet: the next loss's sign-in is news.
+/// NEGATIVE CONTROL: a notice the owner did NOT read comes back as news.
+#[test]
+fn a_read_notice_stays_quiet_after_the_next_notice_tells_its_story_on() {
+    let mut app = App::headless_for_test();
+    let si = mr::notice_ask_key("s-1", Some("si"));
+    let ca = mr::notice_ask_key("s-1", Some("ca"));
+    tell_notice(&mut app, "s-1", Some(&notice::LOGIN_SIGN_IN));
+    let read = app.messages.live_by_key(&si).expect("the ask").id;
+    assert!(
+        app.messages.mark_seen(read, Instant::now()),
+        "the owner reads it"
+    );
+    tell_notice(&mut app, "s-1", Some(&notice::LOGIN_CANCELLED));
+    assert_eq!(
+        notice_asks(&app),
+        std::slice::from_ref(&ca),
+        "a new notice is news"
+    );
+    assert_eq!(notice_rows(&app, "s-1").len(), 1, "one loss, one row");
+    tell_notice(&mut app, "s-1", Some(&notice::LOGIN_SIGN_IN));
+    assert!(
+        notice_asks(&app).is_empty(),
+        "the sign-in the owner read is not raised again: {:?}",
+        notice_asks(&app)
+    );
+    assert_eq!(notice_rows(&app, "s-1").len(), 1, "still one row");
+    // NEGATIVE CONTROL: the cancelled notice was never read: news again.
+    tell_notice(&mut app, "s-1", Some(&notice::LOGIN_CANCELLED));
+    assert_eq!(notice_asks(&app), [ca]);
+    // The login back ends the story and its quiet.
+    tell_notice(&mut app, "s-1", None);
+    app.note_harness_host(HostNote::LoginBack {
+        sid: "s-1".to_string(),
+    });
+    tell_notice(&mut app, "s-1", Some(&notice::LOGIN_SIGN_IN));
+    assert_eq!(notice_asks(&app), [si], "the next loss is news");
+    assert_eq!(notice_rows(&app, "s-1").len(), 2, "a row of its own");
+}
+
+/// A LOSS WHOSE END NO LOOP TOLD IS NEVER SWALLOWED BY THE NEXT: a renewed
+/// login's held move (`renewed-draft`) that then landed under a loop that
+/// ended, say, tells no login back, and the tab's next loss a day later is a
+/// loss of its own — its own row beside the earlier one, which keeps its
+/// words, and the login back closes the new one alone. NEGATIVE CONTROL: the
+/// same notices inside the story's span are one row (the loss told on).
+#[test]
+fn a_loss_with_no_word_for_its_span_is_not_swallowed_by_the_next() {
+    use crate::exceptions_host::NOTICE_STORY_SPAN;
+    let span = u64::try_from(NOTICE_STORY_SPAN.as_millis()).unwrap();
+    let mut app = App::headless_for_test();
+    // Each tab: the held move, its end, and the story's last word moved
+    // back by `age` (the wall clock a test cannot wait out).
+    let renewed = |app: &mut App, sid: &str, age: u64| {
+        tell_notice(app, sid, Some(&notice::RENEWED_DRAFT));
+        tell_notice(app, sid, None);
+        let story = app.resume_stories.get_mut(sid).expect("its story");
+        story.last = story.last.saturating_sub(age);
+        notice_rows(app, sid)
+    };
+    let first = renewed(&mut app, "s-1", span);
+    assert_eq!(first.len(), 1);
+    tell_notice(&mut app, "s-1", Some(&notice::LOGIN_SIGN_IN));
+    let rows = notice_rows(&app, "s-1");
+    assert_eq!(rows.len(), 2, "a loss of its own: {rows:?}");
+    assert_eq!(rows[1], first[0], "the earlier loss keeps its row");
+    assert_eq!(
+        app.messages.log().get(first[0]).and_then(|r| r.retired()),
+        Some(&aterm_messages::Retired::Withdrawn),
+        "in its own words, never replaced"
+    );
+    tell_notice(&mut app, "s-1", None);
+    app.note_harness_host(HostNote::LoginBack {
+        sid: "s-1".to_string(),
+    });
+    let state = |id| {
+        app.messages
+            .log()
+            .get(id)
+            .and_then(|r| r.retired())
+            .cloned()
+    };
+    assert_eq!(
+        (state(rows[0]), state(rows[1])),
+        (
+            Some(aterm_messages::Retired::Resolved(
+                aterm_messages::Outcome::Ok
+            )),
+            Some(aterm_messages::Retired::Withdrawn)
+        ),
+        "the login back closes the loss it ends"
+    );
+    // NEGATIVE CONTROL: a minute inside the span, the loss is told on.
+    let first = renewed(&mut app, "s-2", span - 60_000);
+    tell_notice(&mut app, "s-2", Some(&notice::LOGIN_SIGN_IN));
+    let rows = notice_rows(&app, "s-2");
+    assert_eq!(rows.len(), 1, "one story: {rows:?}");
+    assert_ne!(rows[0], first[0], "in its latest words");
 }
 
 /// A LINE AN EARLIER PROCESS LEFT OPEN for a resume exception no loop of this
@@ -2040,6 +2892,7 @@ fn a_resume_line_an_earlier_process_left_open_ends_after_the_settle() {
     let stale = mr::resume_exceptions(&[(
         "s-9".to_string(),
         resume_exception(ExceptionKind::Spend),
+        Program::Claude,
         places()[0].clone(),
     )]);
     app.except_replace(Family::Resume, &stale);
@@ -2058,6 +2911,7 @@ fn a_resume_line_an_earlier_process_left_open_ends_after_the_settle() {
     let mut app = App::headless_for_test();
     app.note_harness_host(HostNote::ResumeException {
         sid: "s-9".to_string(),
+        agent: Program::Claude,
         standing: Some(resume_exception(ExceptionKind::Spend)),
     });
     app.ripen_exceptions(Instant::now() + DAY);
@@ -2074,7 +2928,14 @@ fn a_kind_in_two_tabs_is_one_entry_that_names_them() {
         place: format!("in tab {n}"),
         nav: Some(aterm_messages::Intent::ShowTab { tab: n, window: 1 }),
     };
-    let fact = |sid: &str, n: u16, kind| (sid.to_string(), resume_exception(kind), spot(n));
+    let fact = |sid: &str, n: u16, kind| {
+        (
+            sid.to_string(),
+            resume_exception(kind),
+            Program::Claude,
+            spot(n),
+        )
+    };
     let two = mr::resume_exceptions(&[
         fact("s-1", 1, ExceptionKind::Spend),
         fact("s-3", 3, ExceptionKind::Spend),
@@ -2145,10 +3006,11 @@ fn a_kind_in_two_tabs_is_one_entry_that_names_them() {
 #[test]
 fn a_stall_at_ninety_minutes_is_a_record_once_and_no_line() {
     let mut app = App::headless_for_test();
-    let told = |app: &mut App, minutes| {
+    let told = |app: &mut App, minutes: Option<u64>| {
         app.note_harness_host(HostNote::ResumeUnread {
             sid: "s-1".to_string(),
-            minutes,
+            agent: Program::Claude,
+            stall: minutes.map(|minutes| StallSeen::Unread { minutes }),
         });
     };
     told(&mut app, Some(90));
@@ -2167,6 +3029,97 @@ fn a_stall_at_ninety_minutes_is_a_record_once_and_no_line() {
     assert!(!app.host_noted.contains("stalled:s-1"));
     told(&mut app, Some(95));
     assert_eq!(recorded(&app), 2, "a new episode is told again");
+}
+
+/// A STALL ON THE AGENT'S OWN BACKGROUND WORK SPEAKS OF THAT AGENT AND ITS
+/// WORK (the review of 6b820169e8: agy's and Muse Code's ladder told the
+/// window "Claude has stalled" over "Claude's own title has said idle … over
+/// a screen this build does not recognise", where no title was read, the
+/// screen was read, and the agent was not Claude). The 90-minute record of
+/// `StallSeen::OwnWork` names the tab's agent and its background work run
+/// under words that stood still; the three-hour line of
+/// `Exception::stalled_on_work` is titled by the agent its tab's worker
+/// supervises, carried from the host's note to the digest. NEGATIVE
+/// CONTROL: Claude Code's unread screen keeps its own words, and its line
+/// says Claude.
+#[test]
+fn a_stall_on_an_agents_own_work_names_that_agent_and_reads_no_title() {
+    let record = |agent: Program, stall: StallSeen| {
+        let mut app = App::headless_for_test();
+        app.note_harness_host(HostNote::ResumeUnread {
+            sid: "s-1".to_string(),
+            agent,
+            stall: Some(stall),
+        });
+        let r = app
+            .messages
+            .log()
+            .records()
+            .find(|r| r.key.as_deref() == Some("harness.host.stalled.s-1"))
+            .expect("the record");
+        (r.title.clone(), r.detail.join(" "))
+    };
+    for (agent, name) in [
+        (Program::Muse, "Muse Code"),
+        (Program::Agy, "Antigravity CLI"),
+    ] {
+        let (title, detail) = record(agent, StallSeen::OwnWork { minutes: 90 });
+        assert!(title.starts_with(&format!("{name} has stalled")), "{title}");
+        assert!(
+            detail.contains(&format!("{name}'s turn ended"))
+                && detail.contains("background work has run 90 min under words that stood still"),
+            "{detail}"
+        );
+        for claim in ["Claude", "title", "does not recognise"] {
+            assert!(
+                !title.contains(claim) && !detail.contains(claim),
+                "{claim}: {title} / {detail}"
+            );
+        }
+    }
+    let (title, detail) = record(Program::Claude, StallSeen::Unread { minutes: 90 });
+    assert!(title.starts_with("Claude has stalled"), "{title}");
+    assert!(
+        detail.contains("Claude's own title has said idle for 90 min"),
+        "{detail}"
+    );
+    // The third rung's line, titled by the tab's agent.
+    let spot = mr::UpgradeSpot {
+        place: "in tab 2".to_string(),
+        nav: None,
+    };
+    let title = |exception: Exception, agent: Program| {
+        let entries = mr::resume_exceptions(&[("s-2".to_string(), exception, agent, spot.clone())]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key(), "harness.resume.s-2.stalled");
+        entries[0].message().expect("passes the door").title
+    };
+    assert_eq!(
+        title(Exception::stalled_on_work(), Program::Muse),
+        "Muse Code in tab 2 has stalled"
+    );
+    assert_eq!(
+        title(Exception::stalled_on_work(), Program::Agy),
+        "Antigravity CLI in tab 2 has stalled"
+    );
+    assert_eq!(
+        title(Exception::stalled(), Program::Claude),
+        "Claude in tab 2 has stalled"
+    );
+    // Through the window: the note's agent is the one its line names.
+    let mut app = App::headless_for_test();
+    app.note_harness_host(HostNote::ResumeException {
+        sid: "s-3".to_string(),
+        agent: Program::Muse,
+        standing: Some(Exception::stalled_on_work()),
+    });
+    let digest = app.messages.digest();
+    let line = digest
+        .entries
+        .iter()
+        .find(|e| e.key == "harness.resume.s-3.stalled")
+        .expect("the tab's line");
+    assert!(line.title.starts_with("Muse Code"), "{}", line.title);
 }
 
 /// A PALETTE SET THE OWNER'S CONFIG REFUSED is one digest line for every tab,
@@ -2266,7 +3219,7 @@ fn turning_palette_sets_on_clears_the_refusal_line() {
 #[test]
 fn a_repaint_that_gave_up_is_one_line_and_none_for_a_healed_epoch() {
     let mut app = App::headless_for_test();
-    let (message, presence) = (message_regrids(), presence_regrids());
+    let message = message_regrids();
     // No such session: nothing.
     app.note_render_unrepaired(404, 7, GiveUp::NoAnswer);
     assert!(app.messages.digest().is_empty());
@@ -2279,7 +3232,7 @@ fn a_repaint_that_gave_up_is_one_line_and_none_for_a_healed_epoch() {
         "epoch 7 is not at risk: no line"
     );
     assert_eq!(app.messages.digest_revision(), rev, "nothing moved");
-    assert_eq!((message_regrids(), presence_regrids()), (message, presence));
+    assert_eq!(message_regrids(), message);
 }
 
 /// A pool session the store knows (so `render.<sid>.unrepaired` can name it),
@@ -2290,7 +3243,7 @@ fn session_with_open_epoch(app: &mut App, local: u64) -> (u64, String) {
     let session = crate::stub_session(local);
     let probe = EngineProbe {
         lifetime: 1,
-        debt_shift: 1,
+        debt: aterm_core::terminal::RenderDebt::of_rows(1, 0),
         geom: (24, 80),
         ..EngineProbe::default()
     };
@@ -2674,38 +3627,22 @@ fn a_failing_relaunch_with_no_command_is_the_digests_line_at_once() {
     assert!(app.messages.digest().is_empty(), "a record, its row speaks");
 }
 
-/// A renewable login's stuck tab, as the loop tells it (accounts v2 S7): the
-/// policy's words, its step `Run aterm harness accounts renew <label>.`.
-fn ended_login_exception(label: &str) -> Exception {
-    Exception {
-        kind: ExceptionKind::Login,
-        when: Urgency::Now,
-        why: "Its login has ended, and only a renewal in your browser restores it.".to_string(),
-        action: format!(
-            "{}{label}.",
-            aterm_agent::supervise::policy::exception::RENEW_STEP
-        ),
-        clears: "the login signed in again, an account to move to, or the agent working",
-        escalated: false,
-    }
-}
-
-/// EVERY TAB STOPPED ON AN ENDED, RENEWABLE LOGIN IS IN ONE ASK PER MACHINE
-/// (`harness.accounts.renew-ask`): restated in place as tabs join it — its
-/// step renewing every label — and withdrawn once the last one leaves. No
-/// per-tab ask and no line of the digest for them. The machine's due logins
-/// are an Info line of the digest, NEVER an ask; no working login within a
-/// day a Warn line; a renewal that signed in another account a line.
-/// NEGATIVE CONTROLS: S0's stuck login after a move (`accounts login`)
-/// keeps its own tab's ask; the loop's escalated login raises nothing; an
-/// earlier process's renew ask no tab of this one holds ends at the settle.
+/// A LOST LOGIN IS ITS TAB'S NOTICE, NEVER A MACHINE'S RENEW ASK: an earlier
+/// build's machine ask (`harness.accounts.renew-ask`) an earlier process left
+/// is withdrawn at the resume family's settle, whatever its tabs tell, and a
+/// tab's lost login carried to the owner's sign-in is its own ask. The
+/// machine's due logins are an Info line of the digest, NEVER an ask; no
+/// working login within a day a Warn line; a renewal that signed in another
+/// account a line. NEGATIVE CONTROL: the loop's escalated login raises
+/// nothing.
 #[test]
-fn every_tab_stopped_on_an_ended_login_is_in_one_machine_ask() {
+fn a_lost_login_is_its_tabs_ask_and_the_accounts_say_lines() {
     use aterm_messages::need::Need;
     let mut app = App::headless_for_test();
     let told = |app: &mut App, sid: &str, standing: Option<Exception>| {
         app.note_harness_host(HostNote::ResumeException {
             sid: sid.to_string(),
+            agent: Program::Claude,
             standing,
         });
     };
@@ -2716,59 +3653,33 @@ fn every_tab_stopped_on_an_ended_login_is_in_one_machine_ask() {
             .map(|row| row.msg.key.clone().unwrap_or_default())
             .collect()
     };
-    let detail = |app: &App| -> Vec<String> {
-        app.messages
-            .live_by_key(mr::RENEW_ASK_KEY)
-            .map(|row| row.msg.detail.clone())
-            .unwrap_or_default()
-    };
-    let lines = app.messages.digest().len();
-    told(&mut app, "s-1", Some(ended_login_exception("m7-a")));
+    // An earlier build's machine ask, which no build raises now.
+    {
+        use aterm_messages::need::{Ask, Reason, StandingWhy, Then};
+        app.post_message(
+            aterm_messages::Message::new(
+                aterm_messages::tags::HARNESS,
+                aterm_messages::Severity::Warn,
+                "Claude login ended",
+            )
+            .line("Claude Code's login ended.")
+            .now(Ask::standing(
+                StandingWhy::OnlyYou(Reason::new("Claude Code's login ended")),
+                Then::step("Run aterm harness accounts renew main"),
+            ))
+            .key(mr::RENEW_ASK_KEY),
+        );
+    }
     assert_eq!(asks(&app), [mr::RENEW_ASK_KEY]);
-    assert!(
-        detail(&app)
-            .iter()
-            .any(|l| l == "Run aterm harness accounts renew m7-a"),
-        "{:?}",
-        detail(&app)
-    );
-    let id = app.messages.live_by_key(mr::RENEW_ASK_KEY).map(|r| r.id);
-    told(&mut app, "s-2", Some(ended_login_exception("m7-a")));
-    told(&mut app, "s-3", Some(ended_login_exception("pool-1")));
-    assert_eq!(asks(&app), [mr::RENEW_ASK_KEY], "one ask, whatever stopped");
-    assert!(
-        detail(&app)
-            .iter()
-            .any(|l| l == "Run aterm harness accounts renew m7-a pool-1"),
-        "{:?}",
-        detail(&app)
-    );
-    assert!(
-        app.messages
-            .live_by_key(mr::RENEW_ASK_KEY)
-            .is_some_and(|row| row.msg.title.contains("in 3 tabs")),
-        "the tabs counted"
-    );
-    assert_eq!(app.messages.digest().len(), lines, "no line of the digest");
-    let _ = id;
-    told(&mut app, "s-1", None);
-    told(&mut app, "s-2", None);
-    assert_eq!(asks(&app), [mr::RENEW_ASK_KEY], "s-3 still stopped");
-    assert!(
-        detail(&app)
-            .iter()
-            .any(|l| l == "Run aterm harness accounts renew pool-1"),
-        "{:?}",
-        detail(&app)
-    );
-    told(&mut app, "s-3", None);
-    assert!(asks(&app).is_empty(), "the last tab moved");
-
-    // NEGATIVE CONTROLS: the stuck login after a move keeps its tab's ask;
-    // the loop's escalation raises nothing.
     told(&mut app, "s-4", Some(stuck_login_exception()));
-    assert_eq!(asks(&app), [mr::resume_ask_key("s-4")]);
+    app.ripen_exceptions(Instant::now() + DAY);
+    assert_eq!(
+        asks(&app),
+        [mr::notice_ask_key("s-4", Some(notice::LOGIN_SIGN_IN.code))],
+        "the old machine ask swept; the tab's own ask stands"
+    );
     told(&mut app, "s-4", None);
+    // NEGATIVE CONTROL: the loop's escalation raises nothing.
     told(
         &mut app,
         "s-5",
@@ -2795,6 +3706,7 @@ fn every_tab_stopped_on_an_ended_login_is_in_one_machine_ask() {
             .map(|e| e.key.clone())
             .collect()
     };
+    let _ = app.settle_messages(Instant::now() + DAY);
     app.note_harness_host(listed(&["m7-a"], false, &[]));
     assert_eq!(keys(&app), [mr::ACCOUNTS_DUE_KEY]);
     assert!(asks(&app).is_empty(), "a due login is a line, never an ask");
@@ -2811,24 +3723,6 @@ fn every_tab_stopped_on_an_ended_login_is_in_one_machine_ask() {
     app.note_harness_host(listed(&[], false, &[]));
     let _ = app.settle_messages(Instant::now() + DAY);
     assert!(keys(&app).is_empty(), "renewed: every line ends");
-
-    // An earlier process's renew ask no tab of this one holds ends at the
-    // settle; one a loop tells of stands.
-    let mut app = App::headless_for_test();
-    app.post_message(mr::renew_ask(
-        &["m7-a".to_string()],
-        &["in tab 9".to_string()],
-    ));
-    app.ripen_exceptions(Instant::now() + DAY);
-    assert!(asks(&app).is_empty());
-    let mut app = App::headless_for_test();
-    app.post_message(mr::renew_ask(
-        &["m7-a".to_string()],
-        &["in tab 9".to_string()],
-    ));
-    told(&mut app, "s-6", Some(ended_login_exception("m7-a")));
-    app.ripen_exceptions(Instant::now() + DAY);
-    assert_eq!(asks(&app), [mr::RENEW_ASK_KEY]);
 }
 
 /// A SILENT USAGE TAP IS ONE LINE FOR THE MACHINE (`HostNote::UsageTap`,

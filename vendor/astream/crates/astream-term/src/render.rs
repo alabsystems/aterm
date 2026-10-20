@@ -32,7 +32,7 @@ contract_fn! {
     /// Discharged in the Clean CIC kernel by definitional equality against
     /// `render_frame_changed_isl` (`clean-kernel-defeq`).
     #[must_use]
-    pub fn render_frame_changed(prev_hash: u64, cur_hash: u64) -> bool
+    pub const fn render_frame_changed(prev_hash: u64, cur_hash: u64) -> bool
     clauses [ensures result == (prev_hash != cur_hash)]
     {
         prev_hash != cur_hash
@@ -92,9 +92,11 @@ struct Fnv1a(u64);
 
 impl crate::screen::ByteSink for Fnv1a {
     fn extend_from_slice(&mut self, bytes: &[u8]) {
-        for &b in bytes {
+        let mut rest = bytes;
+        while let &[b, ref tail @ ..] = rest {
             self.0 ^= b as u64;
             self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+            rest = tail;
         }
     }
 }
@@ -154,37 +156,118 @@ pub fn animation(
     out
 }
 
+/// Encode an [`AnimFrame`] `(offset, hash, changed)` into a 17-byte little-endian
+/// wire/snapshot record.
+#[must_use]
+pub const fn encode_anim_frame_bytes(offset: u64, hash: u64, changed: bool) -> [u8; 17] {
+    [
+        offset as u8,
+        (offset >> 8) as u8,
+        (offset >> 16) as u8,
+        (offset >> 24) as u8,
+        (offset >> 32) as u8,
+        (offset >> 40) as u8,
+        (offset >> 48) as u8,
+        (offset >> 56) as u8,
+        hash as u8,
+        (hash >> 8) as u8,
+        (hash >> 16) as u8,
+        (hash >> 24) as u8,
+        (hash >> 32) as u8,
+        (hash >> 40) as u8,
+        (hash >> 48) as u8,
+        (hash >> 56) as u8,
+        changed as u8,
+    ]
+}
+
+/// Decode a 17-byte [`AnimFrame`] wire/snapshot record into `(offset, hash, changed)`.
+#[must_use]
+pub const fn decode_anim_frame_bytes(raw: &[u8; 17]) -> (u64, u64, bool) {
+    let offset = (raw[0] as u64)
+        | ((raw[1] as u64) << 8)
+        | ((raw[2] as u64) << 16)
+        | ((raw[3] as u64) << 24)
+        | ((raw[4] as u64) << 32)
+        | ((raw[5] as u64) << 40)
+        | ((raw[6] as u64) << 48)
+        | ((raw[7] as u64) << 56);
+    let hash = (raw[8] as u64)
+        | ((raw[9] as u64) << 8)
+        | ((raw[10] as u64) << 16)
+        | ((raw[11] as u64) << 24)
+        | ((raw[12] as u64) << 32)
+        | ((raw[13] as u64) << 40)
+        | ((raw[14] as u64) << 48)
+        | ((raw[15] as u64) << 56);
+    let changed = raw[16] != 0;
+    (offset, hash, changed)
+}
+
+/// Map a 6×6×6 xterm colour-cube axis index (`0..=5`) to its 8-bit channel value.
+#[must_use]
+pub const fn cube_level(idx: u8) -> u8 {
+    match idx {
+        0 => 0,
+        1 => 95,
+        2 => 135,
+        3 => 175,
+        4 => 215,
+        _ => 255,
+    }
+}
+
 /// The xterm-256 palette: 0–15 named, 16–231 the 6×6×6 colour cube, 232–255 the
 /// grayscale ramp. A fixed, deterministic mapping.
-fn palette(n: u8) -> [u8; 3] {
-    const NAMED: [[u8; 3]; 16] = [
-        [0, 0, 0],
-        [128, 0, 0],
-        [0, 128, 0],
-        [128, 128, 0],
-        [0, 0, 128],
-        [128, 0, 128],
-        [0, 128, 128],
-        [192, 192, 192],
-        [128, 128, 128],
-        [255, 0, 0],
-        [0, 255, 0],
-        [255, 255, 0],
-        [0, 0, 255],
-        [255, 0, 255],
-        [0, 255, 255],
-        [255, 255, 255],
-    ];
+#[must_use]
+pub const fn palette(n: u8) -> [u8; 3] {
     match n {
-        0..=15 => NAMED.get(n as usize).copied().unwrap_or([0, 0, 0]),
+        0 => [0, 0, 0],
+        1 => [128, 0, 0],
+        2 => [0, 128, 0],
+        3 => [128, 128, 0],
+        4 => [0, 0, 128],
+        5 => [128, 0, 128],
+        6 => [0, 128, 128],
+        7 => [192, 192, 192],
+        8 => [128, 128, 128],
+        9 => [255, 0, 0],
+        10 => [0, 255, 0],
+        11 => [255, 255, 0],
+        12 => [0, 0, 255],
+        13 => [255, 0, 255],
+        14 => [0, 255, 255],
+        15 => [255, 255, 255],
         16..=231 => {
             let i = n.saturating_sub(16);
-            let levels = [0u8, 95, 135, 175, 215, 255];
-            [
-                levels.get((i / 36) as usize).copied().unwrap_or(0),
-                levels.get(((i / 6) % 6) as usize).copied().unwrap_or(0),
-                levels.get((i % 6) as usize).copied().unwrap_or(0),
-            ]
+            let r_idx = i / 36;
+            let g_idx = (i / 6) % 6;
+            let b_idx = i % 6;
+            let r = match r_idx {
+                0 => 0,
+                1 => 95,
+                2 => 135,
+                3 => 175,
+                4 => 215,
+                _ => 255,
+            };
+            let g = match g_idx {
+                0 => 0,
+                1 => 95,
+                2 => 135,
+                3 => 175,
+                4 => 215,
+                _ => 255,
+            };
+            let b = match b_idx {
+                0 => 0,
+                1 => 95,
+                2 => 135,
+                3 => 175,
+                4 => 215,
+                _ => 255,
+            };
+            [r, g, b]
         }
         _ => {
             let v = 8u8.saturating_add(n.saturating_sub(232).saturating_mul(10));
@@ -193,7 +276,7 @@ fn palette(n: u8) -> [u8; 3] {
     }
 }
 
-fn color_rgb(color: Color, default: [u8; 3]) -> [u8; 3] {
+const fn color_rgb(color: Color, default: [u8; 3]) -> [u8; 3] {
     match color {
         Color::Default => default,
         Color::Indexed(n) => palette(n),

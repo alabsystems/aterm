@@ -630,3 +630,203 @@ fn a_stamp_names_its_day_so_it_cannot_be_read_as_another() {
     assert_eq!(Weekday::of_days(FRI), Weekday::of_days(FRI + 7));
     assert_eq!(Weekday::of_days(FRI).short(), "Fri");
 }
+
+/// 2024-10-11, a Friday: the day the pause tests' clocks fall on.
+const FRI: i64 = 20_007;
+
+/// A pause until `h:m` on local day `day`, after `short` short turns.
+fn paused(h: u16, m: u16, day: i64, short: u8) -> PauseGlass {
+    PauseGlass {
+        until: Stamp {
+            clock: Clock::of_minute(h * 60 + m),
+            day,
+        },
+        short,
+    }
+}
+
+/// THE PAUSE IN ITS WORDS (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §10.5.1): a clock time, never a countdown — `pausing until 18:41 after 3
+/// short turns` in the title, `pausing until 18:41 (3 short turns in a
+/// row)` on the page, `Pausing until 18:41.` spoken; one short turn (the
+/// first point seen) said as `a short turn`; a pause that ends past
+/// midnight names that day's weekday (`Sat 00:12`, spoken `Saturday at
+/// 00:12`), and with no day read for the build the clock stands alone.
+/// NEGATIVE CONTROL: read on its own day, no weekday.
+#[test]
+fn the_pause_is_said_as_a_clock_time_with_its_streak() {
+    let p = paused(18, 41, FRI, 3);
+    assert_eq!(
+        p.title_words(Some(FRI)),
+        "pausing until 18:41 after 3 short turns"
+    );
+    assert_eq!(
+        p.state_words(Some(FRI)),
+        "pausing until 18:41 (3 short turns in a row)"
+    );
+    assert_eq!(p.spoken(Some(FRI)), "Pausing until 18:41.");
+    let one = paused(18, 41, FRI, 1);
+    assert_eq!(
+        one.title_words(Some(FRI)),
+        "pausing until 18:41 after a short turn"
+    );
+    assert_eq!(
+        one.state_words(Some(FRI)),
+        "pausing until 18:41 (a short turn)"
+    );
+    let past_midnight = paused(0, 12, FRI + 1, 6);
+    assert_eq!(
+        past_midnight.title_words(Some(FRI)),
+        "pausing until Sat 00:12 after 6 short turns"
+    );
+    assert_eq!(
+        past_midnight.spoken(Some(FRI)),
+        "Pausing until Saturday at 00:12."
+    );
+    assert_eq!(
+        past_midnight.title_words(None),
+        "pausing until 00:12 after 6 short turns",
+        "no day read: the clock alone"
+    );
+    // NEGATIVE CONTROL: its own day names none.
+    assert!(!past_midnight.title_words(Some(FRI + 1)).contains("Sat"));
+    for words in [
+        p.title_words(Some(FRI)),
+        p.state_words(Some(FRI)),
+        p.spoken(Some(FRI)),
+    ] {
+        assert!(
+            !words.contains(" left") && !words.contains("remaining"),
+            "a clock time, never a countdown: {words}"
+        );
+    }
+}
+
+/// THE PAUSE ON THE GLASS (§10.5.3, item 4): told, it is kept for the
+/// chip's title with its end's clock, and it moves the trail's generation
+/// — the footer's term moves while someone reads the title, and at rest it
+/// moves NOTHING (no face moved: a frame at rest keys nothing new). Told
+/// again it is no move; told gone it clears. Through the window's one door
+/// for harness facts it is on the timeline too (`status pause=`).
+/// NEGATIVE CONTROL: the read title's term, which keys the trail, moves.
+#[test]
+fn a_pause_moves_the_read_title_and_nothing_at_rest() {
+    use crate::claude_lights::glass_bits;
+    let mut app = App::headless_for_test();
+    let plan = crate::PausePlan {
+        at_unix: T0_UNIX + 360,
+        short: 3,
+    };
+    let before = app.chip_glass(0);
+    assert!(on_pause(&mut app, 0, Some(plan)));
+    let after = app.chip_glass(0);
+    assert_eq!(after.pause, Some(PauseGlass::of(plan)));
+    assert_eq!(after.pause.map(|p| p.short), Some(3));
+    assert_eq!(
+        glass_bits(before, false),
+        glass_bits(after, false),
+        "at rest the term keys nothing new"
+    );
+    assert_ne!(
+        glass_bits(before, true),
+        glass_bits(after, true),
+        "NEGATIVE CONTROL: a title being read is built again"
+    );
+    assert!(!on_pause(&mut app, 0, Some(plan)), "told again: no move");
+    assert!(on_pause(&mut app, 0, None));
+    assert_eq!(app.chip_glass(0).pause, None);
+    // Through the door: the timeline and the glass together.
+    let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+    let sid = ctx.self_id.as_str().to_string();
+    app.apply_harness_fact(&sid, crate::HarnessFact::Pause(Some(plan)));
+    assert_eq!(ctx.timeline.lock().unwrap().pause(), Some(plan));
+    assert_eq!(app.chip_glass(0).pause, Some(PauseGlass::of(plan)));
+    app.apply_harness_fact(&sid, crate::HarnessFact::Pause(None));
+    assert_eq!(ctx.timeline.lock().unwrap().pause(), None);
+    assert_eq!(app.chip_glass(0).pause, None);
+}
+
+/// THE TITLE WITH A PAUSE, IN EACH OF ITS FORMS (§10.5.1): the whole title
+/// carries ` · pausing until 18:41 after 3 short turns` after the
+/// explanation and before the trail, sized in (its ` · ` is four bytes); the
+/// first leaner form (no trail) keeps it, v1's words give it up, the forms
+/// that keep the clicks give it up with the explanation (§10.2.7), and the
+/// short title is the mode phrase alone. With no trail the first leaner form
+/// is the whole title itself (`("", "")`), and v1's words still give the
+/// pause up. NEGATIVE CONTROL: with no pause every form is as before.
+#[test]
+fn the_title_carries_the_pause_in_its_whole_and_first_leaner_forms() {
+    use crate::claude_lights::lean_titles;
+    let pause = paused(18, 41, FRI, 3);
+    let glass = ChipGlass {
+        pause: Some(pause),
+        ..ChipGlass::default()
+    };
+    let trail = "\u{2713} approved 18:35";
+    let (whole, short) = autopilot_title(AutopilotView::Cruise, &glass, trail, Some(FRI));
+    assert_eq!(
+        whole,
+        "autopilot: cruise \u{2014} keeps the work moving \u{b7} pausing until 18:41 after 3 \
+         short turns \u{b7} last: \u{2713} approved 18:35 \u{b7} click: land \u{b7} right-click: \
+         more"
+    );
+    assert_eq!(short, "autopilot: cruise");
+    assert_eq!(whole.capacity(), whole.len(), "sized exactly: {whole}");
+    let [lean, v1, clicks, click] = lean_titles(&whole);
+    assert_eq!(
+        format!("{}{}", lean.0, lean.1),
+        "autopilot: cruise \u{2014} keeps the work moving \u{b7} pausing until 18:41 after 3 \
+         short turns \u{b7} click: land \u{b7} right-click: more",
+        "the first leaner form keeps the pause"
+    );
+    assert_eq!(
+        format!("{}{}", v1.0, v1.1),
+        "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land",
+        "v1's words give it up"
+    );
+    assert_eq!(
+        format!("{}{}", clicks.0, clicks.1),
+        "autopilot: cruise \u{b7} click: land \u{b7} right-click: more",
+        "the clicks give it up with the explanation"
+    );
+    assert_eq!(
+        format!("{}{}", click.0, click.1),
+        "autopilot: cruise \u{b7} click: land"
+    );
+    // No trail: the first leaner form is the whole itself; v1 still drops it.
+    let (bare, _) = autopilot_title(AutopilotView::Land, &glass, "", Some(FRI));
+    assert_eq!(
+        bare,
+        "autopilot: land \u{2014} wrapping up \u{b7} pausing until 18:41 after 3 short turns \
+         \u{b7} click: off \u{b7} right-click: more"
+    );
+    let [lean, v1, clicks, click] = lean_titles(&bare);
+    assert_eq!(lean, ("", ""));
+    assert_eq!(
+        format!("{}{}", v1.0, v1.1),
+        "autopilot: land \u{2014} wrapping up \u{b7} click: off"
+    );
+    assert_eq!(clicks, ("", ""), "no narrower than v1's words");
+    assert_eq!(
+        format!("{}{}", click.0, click.1),
+        "autopilot: land \u{b7} click: off"
+    );
+    // NEGATIVE CONTROL: no pause, the forms as before.
+    let (plain, _) = autopilot_title(
+        AutopilotView::Cruise,
+        &ChipGlass::default(),
+        trail,
+        Some(FRI),
+    );
+    assert!(!plain.contains("pausing"), "{plain}");
+    let [lean, v1, ..] = lean_titles(&plain);
+    assert_eq!(
+        format!("{}{}", lean.0, lean.1),
+        "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land \u{b7} right-click: \
+         more"
+    );
+    assert_eq!(
+        format!("{}{}", v1.0, v1.1),
+        "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land"
+    );
+}

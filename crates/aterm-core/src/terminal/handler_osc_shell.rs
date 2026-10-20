@@ -15,6 +15,11 @@ use super::shell::{
 };
 use super::{MAX_COMMANDLINE_BYTES, MAX_CWD_PATH_BYTES};
 
+/// The most startup roots one START record names: a fish's sysconf folder and
+/// its vendor conf.d folders (one per `$XDG_DATA_DIRS` entry, its user data
+/// folder's and its build's). A record naming more names none.
+const MAX_START_ROOTS: usize = 32;
+
 impl TerminalHandler<'_> {
     /// Parse shell integration OSC params into (command_char, absolute_row, col).
     fn parse_shell_osc(&self, params: &[&[u8]]) -> Option<(char, u64, u16)> {
@@ -167,6 +172,7 @@ impl TerminalHandler<'_> {
                 // A is a hard reset to prompt start from any phase (Enter on an
                 // empty line or Ctrl-C while typing emits A→B→A).
                 self.shell.phase = ShellIntegrationPhase::PromptStart;
+                self.shell.phase_stale = false;
                 // The shell reported its own cwd immediately before this mark:
                 // a report held at its prompt lands now, so the prompt's mark
                 // and block record it.
@@ -191,14 +197,28 @@ impl TerminalHandler<'_> {
                     return true;
                 }
                 // A report held at the prompt was not the shell's: the shell
-                // starts a command instead of redrawing its prompt.
+                // starts a command instead of redrawing its prompt. And it
+                // marks what it runs.
                 self.shell.held_cwd = None;
+                self.shell.unmarked_run = false;
                 self.shell.phase = ShellIntegrationPhase::CommandExec;
                 self.shell_execution_start(row);
                 self.transient.kitty_pending = None;
             }
             'D' => {
                 if self.shell.phase != ShellIntegrationPhase::CommandExec {
+                    // The shell says a command finished while its marks say it
+                    // sat at its prompt: it ran one it did not mark with `C`
+                    // (unless its marks were dropped since that prompt).
+                    if !self.shell.phase_stale
+                        && matches!(
+                            self.shell.phase,
+                            ShellIntegrationPhase::PromptStart
+                                | ShellIntegrationPhase::CommandStart
+                        )
+                    {
+                        self.shell.unmarked_run = true;
+                    }
                     return true;
                 }
                 self.shell.phase = ShellIntegrationPhase::CommandFinished;
@@ -209,37 +229,43 @@ impl TerminalHandler<'_> {
         true
     }
 
-    /// Whether an OSC 7 waits for the shell's next prompt start instead of
-    /// landing now: only while an authenticated shell sits at its prompt, after
-    /// its `A` and before its `C`, and only where that phase is the shell's own
-    /// word that it runs nothing:
+    /// Whether the authenticated shell sits at its prompt by its own marks, so
+    /// an OSC 7 it did not sign is not a program it started with a `C`
+    /// ([`Self::handle_osc_7`] says what becomes of one). Only where the phase
+    /// is the shell's own word that it runs nothing:
     ///
     /// - the nonce gate is on and its nonce is in use (`status
     ///   integration=on`), so the phase follows the shell's marks alone (a
     ///   remote shell's or a program's are dropped) and the shell's marks
     ///   arrive. A successor whose handoff lost the nonce, or a re-key the
-    ///   shell has not taken, drops them all, and the phase it shows is stale.
-    /// - the shell has marked a command it ran with `C` (`started_seq`), so
-    ///   it is one that marks what it runs. PowerShell without PSReadLine never
-    ///   sends `C`, and a program it starts speaks while the phase still reads
-    ///   its prompt.
+    ///   shell has not taken, drops them all, and the phase it shows is stale
+    ///   until the shell's first `A` with the key it takes (`phase_stale`).
+    /// - the shell has marked a command it ran with `C` (`started_seq`) and has
+    ///   not since finished one it did not mark (`unmarked_run`), so it is one
+    ///   that marks what it runs. PowerShell without PSReadLine never sends
+    ///   `C`, and a program it starts speaks while the phase still reads its
+    ///   prompt; one whose readline shim was replaced says so with its next
+    ///   `D`.
+    /// - the phase is its prompt: after its `A` and before its `C`, and for a
+    ///   shell that signs its own report also from its `D` on (the report it
+    ///   signs before its `A` names its cwd; anything else there is not its).
     ///
-    /// Then a report is a background job's output or the prompt's own text,
-    /// never a program the shell started (a remote shell over ssh, a nested
-    /// shell, a script's `cd`), which all speak after the `C` and land at once,
-    /// as does the shell's own report after a `D`. Every integration reports
-    /// its own cwd immediately before its next `A`, which applies the latest
-    /// held report; a `B` or a `C` first drops it. A program a key binding
-    /// starts runs with no `C`, so what it reports is held too.
-    pub(super) fn reported_cwd_waits_for_prompt(&self) -> bool {
+    /// A program the shell started with `C` speaks after it and lands at once,
+    /// a remote shell over ssh, a nested shell or a script's `cd` alike. A
+    /// program a key binding starts runs with no `C`; the host says it holds
+    /// the foreground (`ShellIntegrationState::foreground_job`).
+    pub(super) fn shell_sits_at_prompt(&self) -> bool {
         use super::grouped_state::ShellIntegrationPhase;
         self.modes.require_shell_integration_nonce
             && self.shell_integration_auth.nonce_in_use().is_some()
+            && !self.shell.phase_stale
             && self.shell.started_seq > 0
-            && matches!(
-                self.shell.phase,
-                ShellIntegrationPhase::PromptStart | ShellIntegrationPhase::CommandStart
-            )
+            && !self.shell.unmarked_run
+            && match self.shell.phase {
+                ShellIntegrationPhase::PromptStart | ShellIntegrationPhase::CommandStart => true,
+                ShellIntegrationPhase::CommandFinished => self.shell.signs_cwd,
+                ShellIntegrationPhase::None | ShellIntegrationPhase::CommandExec => false,
+            }
     }
 
     /// Gate OSC 133/633 on the capability nonce. With
@@ -253,8 +279,17 @@ impl TerminalHandler<'_> {
             return true;
         }
         let gate = self.policy.shell_integration_gate(command, params);
-        self.shell_integration_auth
-            .verify_nonce_with_engine(gate, params)
+        // A key not in use yet (a re-key, a successor's after a handoff that
+        // lost the nonce): the marks signed with the key before it were
+        // dropped, so the phase this mark meets is not the shell's last word.
+        let taking_key = self.shell_integration_auth.nonce_in_use().is_none();
+        let ok = self
+            .shell_integration_auth
+            .verify_nonce_with_engine(gate, params);
+        if ok && taking_key {
+            self.shell.phase_stale = true;
+        }
+        ok
     }
 
     /// A shell prompt (OSC 133/633 `A`) on the alternate screen means the
@@ -281,13 +316,36 @@ impl TerminalHandler<'_> {
     /// (`TransientState::host_resyncs_alt_screen`, OpenConsole; off unless the
     /// embedder sets it) the alt screen is NOT left here: the host is asked, once
     /// per stuck screen, to leave its own dead buffer, and the `?1049l` it
-    /// forwards leaves ours from the same place in the stream.
+    /// forwards leaves ours from the same place in the stream. The prompt marks
+    /// the screen dead, so that switch also releases the modes the dead app left
+    /// on, as the local leave does (`TerminalHandler::take_dead_alt_screen`). Where
+    /// this `A` put the prompt on the dead screen is kept, so the host's leave can
+    /// carry the prompt along (`Terminal::dead_alt_screen_carry`).
+    ///
+    /// What turns the person's own input into typed junk goes at the prompt
+    /// itself on either path: the app's input modes, the reports no shell asks
+    /// for and the ones still queued for it (`release_dead_app_input`), and its
+    /// bracketed paste (`release_dead_app_paste`). The host's switch comes a
+    /// client's start later (about 12 ms), and can arrive after a line editor's
+    /// own `?2004h`, too late to tell the two apart. On either screen a
+    /// DEC 2048 size report still held for the program that asked
+    /// (`TerminalHandler::hold_size_report`) is dropped: the shell reads now.
     fn prompt_leaves_orphaned_alt_screen(&mut self, params: &[&[u8]]) {
         if params.get(1).and_then(|p| p.first()) != Some(&b'A') {
             return;
         }
+        self.drop_held_size_report();
+        if self.modes.alternate_screen {
+            self.release_dead_app_paste();
+            self.release_dead_app_input();
+        }
         if self.modes.alternate_screen && self.transient.host_resyncs_alt_screen {
             let screen = Some(self.transient.screen_replaced);
+            self.transient.dead_alt_screen = screen;
+            let at = self.grid.cursor();
+            self.transient.dead_alt_prompt_at =
+                Some((self.transient.screen_replaced, at.row, at.col));
+            self.take_main_pen_for_dead_screen_prompt();
             if self.transient.alt_screen_resync_screen != screen {
                 self.transient.alt_screen_resync_screen = screen;
                 self.transient.alt_screen_resync_requested = true;
@@ -323,7 +381,7 @@ impl TerminalHandler<'_> {
     /// Handle OSC 633, VS Code shell integration
     /// (<https://code.visualstudio.com/docs/terminal/shell-integration>): the
     /// OSC 133 marks plus E (explicit command line) and P (`Cwd=`,
-    /// `AtermIntegration=`). Nonce-gated like OSC 133.
+    /// `AtermIntegration=`, `AtermCwd=`). Nonce-gated like OSC 133.
     pub(super) fn handle_osc_633(&mut self, params: &[&[u8]]) {
         if !self.shell_nonce_gate_ok(633, params) {
             return;
@@ -374,6 +432,10 @@ impl TerminalHandler<'_> {
                     self.record_integration_rev(value);
                     return;
                 }
+                if key == crate::shell_integration::CWD_REPORT_KEY {
+                    self.report_cwd(&[value.as_bytes()], true);
+                    return;
+                }
                 if self.record_spare_mark(key, value) {
                     return;
                 }
@@ -386,8 +448,10 @@ impl TerminalHandler<'_> {
                     return;
                 }
                 // The shell's own word: an OSC 7 held at its prompt does not
-                // override it at the next `A`.
+                // override it at the next `A`, nor does a job's end restore
+                // the cwd before it.
                 self.shell.held_cwd = None;
+                self.shell.cwd_before_job = None;
                 if let Some(ref mut mark) = self.shell.current_mark {
                     mark.working_directory = Some(value.into());
                 }
@@ -420,14 +484,25 @@ impl TerminalHandler<'_> {
 
     /// OSC 633 `P` keys of the warm spare (`docs/DESIGN-warm-spare-2026-10-16.md`
     /// §4): `AtermSpare=parked`, and the START record's `AtermStartRc=`,
-    /// `AtermStartFlags=` and `AtermStart=cold|spare`, which completes it.
+    /// `AtermStartRoots=` (fish's), `AtermStartFlags=` and
+    /// `AtermStart=cold|spare`, which completes it.
     /// Recorded only under the nonce gate, like [`Self::record_integration_rev`],
     /// so a program's output cannot forge a spare's readiness. Parsed strictly;
     /// a malformed value is ignored and counted. Only the first record is kept.
     /// Returns whether `key` is one of these.
     fn record_spare_mark(&mut self, key: &str, value: &str) -> bool {
-        use crate::shell_integration::{SPARE_KEY, START_FLAGS_KEY, START_KEY, START_RC_KEY};
-        if ![SPARE_KEY, START_KEY, START_RC_KEY, START_FLAGS_KEY].contains(&key) {
+        use crate::shell_integration::{
+            SPARE_KEY, START_FLAGS_KEY, START_KEY, START_RC_KEY, START_ROOTS_KEY,
+        };
+        if ![
+            SPARE_KEY,
+            START_KEY,
+            START_RC_KEY,
+            START_ROOTS_KEY,
+            START_FLAGS_KEY,
+        ]
+        .contains(&key)
+        {
             return false;
         }
         if !self.modes.require_shell_integration_nonce {
@@ -448,6 +523,12 @@ impl TerminalHandler<'_> {
                 }
                 ok
             }
+            START_ROOTS_KEY => {
+                let roots = Self::parse_start_roots(value);
+                let ok = roots.is_some();
+                spare.pending_roots = roots;
+                ok
+            }
             START_FLAGS_KEY => {
                 let flags = super::shell::StartFlags::parse(value);
                 spare.pending_flags = flags;
@@ -464,6 +545,7 @@ impl TerminalHandler<'_> {
                     spare.mark = Some(super::shell::StartMark {
                         kind,
                         rc_dir: spare.pending_rc.take(),
+                        roots: spare.pending_roots.take(),
                         flags: spare.pending_flags.take(),
                     });
                 }
@@ -474,6 +556,28 @@ impl TerminalHandler<'_> {
             spare.refused = spare.refused.saturating_add(1);
         }
         true
+    }
+
+    /// A START record's other startup roots (`AtermStartRoots=`): absolute
+    /// paths, escaped as the rc folder is (a raw space too) and joined by the
+    /// escape `\x00` (no path holds a NUL), at most [`MAX_START_ROOTS`] of
+    /// them, each within [`MAX_CWD_PATH_BYTES`]; anything else names none. An
+    /// empty or relative one is refused rather than dropped: the host stamps
+    /// every folder the shell read, and a folder relative to the shell's own is
+    /// no fixed one.
+    fn parse_start_roots(value: &str) -> Option<Vec<String>> {
+        if value.is_empty() || value.len() > MAX_START_ROOTS * MAX_CWD_PATH_BYTES {
+            return None;
+        }
+        let roots: Vec<String> = Self::unescape_vscode_string(value)
+            .split('\0')
+            .map(str::to_owned)
+            .collect();
+        (roots.len() <= MAX_START_ROOTS
+            && roots
+                .iter()
+                .all(|root| root.starts_with('/') && root.len() <= MAX_CWD_PATH_BYTES))
+        .then_some(roots)
     }
 
     /// Unescape VS Code's command-line format: `\\` is a backslash and `\xAB`
@@ -518,6 +622,104 @@ impl TerminalHandler<'_> {
         }
 
         result
+    }
+}
+
+impl super::Terminal {
+    /// THE CARRY: what the console host should write right after its `?1049l` when it
+    /// leaves the alternate screen a dead app left up (`set_host_resyncs_alt_screen`), so
+    /// the prompt the shell already drew on that screen comes along, at the same rows and
+    /// columns, with the cursor where it was. `None` when there is nothing to carry: no
+    /// host leave is pending, no prompt was marked on this screen, or the shell has drawn
+    /// nothing since its `A` (its prompt is still to come and lands on the primary screen
+    /// by itself, as Git Bash's does).
+    ///
+    /// WHY. The `A` that proves the app dead arrives with the prompt it starts, so the host
+    /// is asked only after the shell drew that prompt on the dead screen, and a line editor
+    /// that anchors at the cursor it read when its read began keeps that anchor across the
+    /// switch. PSReadLine does: after a vim killed in a pwsh tab its first redraw went to
+    /// `CSI 1 ; 55 H`, the dead screen's prompt end, while the host's switch had put both
+    /// cursors at row 4 of the primary screen, so every line pwsh drew after it overwrote
+    /// the rows above and left stale tails of the old command line (measured 2026-10-18,
+    /// the bundled OpenConsole 1.25.2609.30003). The carry makes the primary screen agree
+    /// with that anchor: the rows the primary screen used scroll up (into the scrollback)
+    /// until the prompt's first row is free, the rows from there down are cleared, the
+    /// prompt's rows are drawn as the dead screen showed them (the dead app's cells left
+    /// of the prompt's start, and right of the cursor, cleared), and the cursor goes back
+    /// where the shell left it. The host draws the same bytes and forwards them, so both
+    /// screens stay in step.
+    ///
+    /// The host's client writes it only where the shell keeps reading across the switch
+    /// (a console in line mode is conhost's own line editor, whose read the switch ends:
+    /// cmd prompts again on the primary screen at once), and only while the host's cursor
+    /// is still the one it was composed for (`aterm_pty::resync_alt_screen_carrying`).
+    #[must_use]
+    pub fn dead_alt_screen_carry(&self) -> Option<String> {
+        use std::fmt::Write as _;
+        let screen = self.transient.screen_replaced;
+        if !self.modes.alternate_screen || self.transient.dead_alt_screen != Some(screen) {
+            return None;
+        }
+        let (at_screen, a_row, a_col) = self.transient.dead_alt_prompt_at?;
+        if at_screen != screen {
+            return None;
+        }
+        let alt = &self.grid;
+        let cursor = alt.cursor();
+        let wrap = alt.pending_wrap();
+        // The prompt's first row: no lower than the cursor's (a screen that scrolled under
+        // a prompt started on its last row moved that row up), and its start column only on
+        // the row it started on.
+        let top = a_row.min(cursor.row);
+        let left = if top == a_row { a_col } else { 0 };
+        let left = if top == cursor.row {
+            left.min(cursor.col)
+        } else {
+            left
+        };
+        if (cursor.row, cursor.col) == (top, left) && !wrap {
+            return None;
+        }
+        // Where the host's `?1049l` puts the primary cursor (the main slot `?1049h` saved;
+        // home when none was), and the first row below everything the primary screen holds.
+        let main = self.main_grid();
+        let (saved_row, saved_col, saved_wrap) = self.cursor_save.main.map_or((0, 0, false), |s| {
+            (s.cursor.row, s.cursor.col, s.pending_wrap)
+        });
+        let used = (0..main.rows())
+            .rev()
+            .find(|&r| main.row(r).is_some_and(|row| !row.is_empty()))
+            .map_or(0, |r| r + 1);
+        let free = saved_row
+            .saturating_add(u16::from(saved_col > 0 || saved_wrap))
+            .max(used);
+        let rows = alt.rows();
+        let scroll = free.saturating_sub(top).min(rows);
+        // A plain pen, and the margins the dead app may have left on the host's screen.
+        let mut out = String::from("\x1b[0m\x1b[r");
+        if scroll > 0 {
+            let _ = write!(out, "\x1b[{rows};1H");
+            for _ in 0..scroll {
+                out.push('\n');
+            }
+        }
+        let _ = write!(out, "\x1b[{};1H\x1b[J", top + 1);
+        for r in top..=cursor.row {
+            let _ = write!(out, "\x1b[{};1H", r + 1);
+            if let Some(text) = alt.row_ansi_text_screen(r) {
+                out.push_str(&text);
+            }
+            out.push_str("\x1b[0m");
+        }
+        if left > 0 {
+            let _ = write!(out, "\x1b[{};1H\x1b[{left}X", top + 1);
+        }
+        let _ = write!(out, "\x1b[{};{}H", cursor.row + 1, cursor.col + 1);
+        // The cursor on a full row's last cell (its wrap deferred) is the prompt's own end.
+        if !wrap {
+            out.push_str("\x1b[K");
+        }
+        Some(out)
     }
 }
 
@@ -745,6 +947,200 @@ mod prompt_on_alt_screen_tests {
         assert_eq!((cursor.row, cursor.col), (4, 0));
     }
 
+    // The host's forwarded switch out of a screen a prompt proved dead releases
+    // what the dead app left on, as the local leave does: a killed editor's mouse
+    // tracking, cursor-key and keypad modes and scroll region would otherwise
+    // route the wheel and clicks to the shell and keep its output out of the
+    // scrollback. The local leave is the positive control; an app's own
+    // `?1049l` (no prompt before it) keeps its modes, which are its own to reset.
+    #[test]
+    fn the_hosts_switch_out_of_a_dead_screen_releases_the_dead_apps_modes() {
+        use crate::terminal::{MouseEncoding, MouseMode};
+        const DEAD_APP_MODES: &[u8] = b"\x1b[2;4r\x1b[?1002h\x1b[?1006h\x1b[?1h\x1b=";
+        let released = |term: &Terminal, why: &str| {
+            assert!(!term.modes().alternate_screen, "{why}");
+            let modes = term.modes();
+            assert_eq!(modes.mouse_mode, MouseMode::None, "{why}");
+            assert_eq!(modes.mouse_encoding, MouseEncoding::X10, "{why}");
+            assert!(!modes.application_cursor_keys, "{why}");
+            assert!(!modes.application_keypad, "{why}");
+            let region = term.grid().scroll_region();
+            assert_eq!((region.top, region.bottom), (0, 4), "{why}");
+        };
+
+        let mut local = stuck_pager();
+        local.process(DEAD_APP_MODES);
+        local.process(PROMPT_AFTER_KILL);
+        released(&local, "control: the local leave");
+
+        let mut term = stuck_pager();
+        term.set_host_resyncs_alt_screen(true);
+        term.process(DEAD_APP_MODES);
+        term.process(PROMPT_AFTER_KILL);
+        assert!(term.take_alt_screen_resync_request());
+        assert!(term.modes().alternate_screen, "the host is asked instead");
+        term.process(b"\x1b[?1049l");
+        released(&term, "the host's forwarded switch");
+
+        // A live app's own exit: no prompt proved it dead, so nothing is taken
+        // from it, under the host policy or not.
+        for host_resyncs in [true, false] {
+            let mut term = stuck_pager();
+            term.set_host_resyncs_alt_screen(host_resyncs);
+            term.process(b"\x1b[?1000h\x1b[?1h\x1b[?1049l");
+            assert!(!term.modes().alternate_screen);
+            assert_eq!(term.modes().mouse_mode, MouseMode::Normal, "{host_resyncs}");
+            assert!(term.modes().application_cursor_keys, "{host_resyncs}");
+        }
+
+        // The mark is the dead screen's alone: an app started on a NEW screen
+        // after the prompt (its own `?1049h`) keeps its modes through its exit.
+        let mut term = stuck_pager();
+        term.set_host_resyncs_alt_screen(true);
+        term.process(PROMPT_AFTER_KILL);
+        term.process(b"\x1b[?1049h\x1b[?1000hnext app");
+        term.process(b"\x1b[?1049l");
+        assert_eq!(term.modes().mouse_mode, MouseMode::Normal);
+    }
+
+    // A killed vim leaves bracketed paste (2004), in-band size reports (2048) and
+    // colour-scheme reports (2031) on, and OpenConsole forwards all three; pwsh
+    // and cmd never turn them off, so the next line got `CSI 48 ; … t` and every
+    // paste its brackets (measured 2026-10-18). The prompt that proves the app
+    // dead turns them off on both paths: the local leave, and before the host's
+    // forwarded `?1049l`, which can follow a line editor's own `?2004h`.
+    #[test]
+    fn the_prompt_that_proves_an_app_dead_turns_off_its_paste_and_reports() {
+        const VIM_MODES: &[u8] = b"\x1b[?2004h\x1b[?2048h\x1b[?2031h";
+        for host_resyncs in [false, true] {
+            let mut term = stuck_pager();
+            term.set_host_resyncs_alt_screen(host_resyncs);
+            term.process(VIM_MODES);
+            let _ = term.take_response(); // 2048's report on enabling
+            term.process(PROMPT_AFTER_KILL);
+            let m = term.modes();
+            assert!(!m.bracketed_paste, "host_resyncs={host_resyncs}");
+            assert!(!m.in_band_size_reports, "host_resyncs={host_resyncs}");
+            assert!(!m.report_color_scheme, "host_resyncs={host_resyncs}");
+            term.resize(5, 30);
+            assert_eq!(
+                term.take_response(),
+                None,
+                "no size report typed at the prompt (host_resyncs={host_resyncs})"
+            );
+        }
+
+        // Control: the same modes from a live program on the primary screen stay;
+        // no prompt proved anything dead.
+        let mut term = stuck_pager();
+        term.process(b"\x1b[?1049l");
+        term.process(VIM_MODES);
+        term.process(b"\x1b]133;D;0\x07\x1b]133;A\x07PS> \x1b]133;B\x07");
+        assert!(term.modes().bracketed_paste);
+        assert!(term.modes().in_band_size_reports);
+    }
+
+    // The prompt that proves an app dead releases at once, on both paths, what
+    // decides what the person's input becomes: mouse tracking and its encoding,
+    // cursor-key and keypad modes, and a report still queued for the app (the
+    // DEC 2048 report a new cell box queued, which waited for the session
+    // reader's next take). Under a host that is asked to leave, the dead screen
+    // keeps its scroll region until the host's switch, which releases it.
+    #[test]
+    fn the_prompt_that_proves_an_app_dead_releases_its_input_at_once() {
+        use crate::terminal::{MouseEncoding, MouseMode};
+        const DEAD_APP_MODES: &[u8] = b"\x1b[2;4r\x1b[?1002h\x1b[?1006h\x1b[?1h\x1b=\x1b[?2048h";
+        for host_resyncs in [true, false] {
+            let mut term = stuck_pager();
+            term.set_host_resyncs_alt_screen(host_resyncs);
+            term.process(DEAD_APP_MODES);
+            let _ = term.take_response(); // the enable's own report, the reader's
+            // The window's first cell box, while the app sits idle.
+            term.set_cell_pixel_size(9, 23);
+            term.process(PROMPT_AFTER_KILL);
+            let m = term.modes();
+            assert_eq!(m.mouse_mode, MouseMode::None, "{host_resyncs}");
+            assert_eq!(m.mouse_encoding, MouseEncoding::X10, "{host_resyncs}");
+            assert!(!m.application_cursor_keys, "{host_resyncs}");
+            assert!(!m.application_keypad, "{host_resyncs}");
+            assert_eq!(
+                term.take_reports(),
+                None,
+                "no report for the dead app reaches the shell (host_resyncs={host_resyncs})"
+            );
+        }
+
+        let mut term = stuck_pager();
+        term.set_host_resyncs_alt_screen(true);
+        term.process(DEAD_APP_MODES);
+        term.process(PROMPT_AFTER_KILL);
+        assert!(term.modes().alternate_screen, "the host is asked instead");
+        let region = term.grid().scroll_region();
+        assert_eq!((region.top, region.bottom), (1, 3), "the dead screen's own");
+        term.process(b"\x1b[?1049l");
+        let region = term.grid().scroll_region();
+        assert_eq!(
+            (region.top, region.bottom),
+            (0, 4),
+            "released with the screen"
+        );
+    }
+
+    // The shell's own bracketed paste is the shell's. fish 3 sets it from its
+    // `fish_prompt` event, after its `D` and before its `A`, and a readline
+    // whose `A` sits in `PS1` sets it before drawing that prompt: kept. bash and
+    // zsh under aterm's integration set it after the `A`, which comes first.
+    #[test]
+    fn a_shells_own_bracketed_paste_for_the_prompt_survives_the_dead_apps_release() {
+        let mut term = stuck_pager();
+        term.process(b"\x1b[?2004h\x1b[?2048h");
+        term.process(b"\r\n\x1b]133;D;-1\x07\x1b[?2004h\x1b]133;A\x07> \x1b]133;B\x07");
+        assert!(term.modes().bracketed_paste, "fish's own, set after its D");
+        assert!(!term.modes().in_band_size_reports, "no shell asks for 2048");
+
+        let mut term = stuck_pager();
+        term.process(b"\x1b[?2004h");
+        term.process(b"\r\n\x1b]133;D;-1\x07\x1b]133;A\x07");
+        assert!(!term.modes().bracketed_paste, "vim's, released at the A");
+        term.process(b"\x1b[?2004h$ \x1b]133;B\x07");
+        assert!(term.modes().bracketed_paste, "readline's own, after the A");
+    }
+
+    // `mainscreen` under the host policy marks the screen as a dead app's before
+    // the host is asked, so the forwarded switch releases its modes too, and a
+    // prompt on the same screen does not ask the host a second time. On the
+    // primary screen nothing is marked.
+    #[test]
+    fn expecting_the_hosts_leave_marks_the_screen_dead() {
+        use crate::terminal::MouseMode;
+        let mut term = stuck_pager();
+        term.set_host_resyncs_alt_screen(true);
+        term.process(b"\x1b[?1000h\x1b[?1h");
+        assert!(term.expect_host_alt_screen_leave());
+        term.process(PROMPT_AFTER_KILL);
+        assert!(
+            !term.take_alt_screen_resync_request(),
+            "the verb's client is the one request for this screen"
+        );
+        term.process(b"\x1b[?1049l");
+        assert!(!term.modes().alternate_screen);
+        assert_eq!(term.modes().mouse_mode, MouseMode::None);
+        assert!(!term.modes().application_cursor_keys);
+
+        assert!(!term.expect_host_alt_screen_leave(), "the primary screen");
+        term.process(b"\x1b[?1049h\x1b[?1000h\x1b[?1049l");
+        assert_eq!(term.modes().mouse_mode, MouseMode::Normal);
+
+        // Opting off forgets the mark with the request.
+        let mut term = stuck_pager();
+        term.set_host_resyncs_alt_screen(true);
+        term.process(b"\x1b[?1000h");
+        assert!(term.expect_host_alt_screen_leave());
+        term.set_host_resyncs_alt_screen(false);
+        term.process(b"\x1b[?1049l");
+        assert_eq!(term.modes().mouse_mode, MouseMode::Normal);
+    }
+
     // Each stuck screen asks once: a later app that dies on a NEW alternate
     // screen raises a new request.
     #[test]
@@ -786,6 +1182,7 @@ mod spare_mark_tests {
     //! The warm spare's marks (`docs/DESIGN-warm-spare-2026-10-16.md` §4, test
     //! E1): only a signed mark counts, a malformed one is refused and counted,
     //! only the first START record is kept, and each take happens once.
+    use super::MAX_START_ROOTS;
     use crate::terminal::{ShellIntegrationNonce, StartFlags, StartKind, StartMark, Terminal};
 
     const KEY: [u8; 32] = [0x3Cu8; 32];
@@ -859,6 +1256,7 @@ mod spare_mark_tests {
         let want = StartMark {
             kind: StartKind::Spare,
             rc_dir: Some("/Users//a b;c".into()),
+            roots: None,
             flags: Some(StartFlags {
                 pre: 2,
                 sched: 1,
@@ -875,6 +1273,48 @@ mod spare_mark_tests {
         assert_eq!(t.spare_marks_refused(), 7, "a later record is not refused");
     }
 
+    /// fish's startup roots (`AtermStartRoots=`): escaped absolute folders
+    /// joined by `\x00`, kept with the record that follows. An empty list, an
+    /// empty or relative folder, or more than `MAX_START_ROOTS` names none and
+    /// is counted, and the record then carries none, as zsh's and bash's do.
+    #[test]
+    fn a_start_record_carries_the_startup_roots_it_names() {
+        let id = id();
+        let mut t = gated();
+        let too_many = format!(
+            "AtermStartRoots={}",
+            ["/v"; MAX_START_ROOTS + 1].join("\\x00")
+        );
+        for bad in [
+            "AtermStartRoots=",
+            "AtermStartRoots=etc/fish",
+            "AtermStartRoots=/etc/fish\\x00",
+            "AtermStartRoots=/etc/fish\\x00\\x00/v",
+            too_many.as_str(),
+        ] {
+            t.process(&p(bad, &id));
+        }
+        assert_eq!(t.spare_marks_refused(), 5);
+        record(&mut t, "/c", "pre:0,s:0,j:0,r:0", "cold");
+        assert_eq!(t.take_start_mark().map(|m| m.roots), Some(None));
+
+        let mut t = gated();
+        t.process(&p(
+            "AtermStartRoots=/opt/homebrew/etc/fish\\x00/Users//a\\x20b/.local/share/fish/vendor_conf.d\\x00/x\\x3by\\\\z/fish/vendor_conf.d",
+            &id,
+        ));
+        record(&mut t, "/c", "pre:0,s:0,j:0,r:0", "cold");
+        assert_eq!(
+            t.take_start_mark().and_then(|m| m.roots),
+            Some(vec![
+                "/opt/homebrew/etc/fish".to_owned(),
+                "/Users//a b/.local/share/fish/vendor_conf.d".to_owned(),
+                "/x;y\\z/fish/vendor_conf.d".to_owned(),
+            ])
+        );
+        assert_eq!(t.spare_marks_refused(), 0);
+    }
+
     #[test]
     fn a_prompt_start_is_seen_only_once_signed() {
         let mut t = gated();
@@ -889,12 +1329,13 @@ mod spare_mark_tests {
 #[cfg(test)]
 mod reported_cwd_tests {
     //! Which OSC 7 sets the folder (New Tab, Split, New Window, `aterm ctl cwd`)
-    //! while an authenticated shell holds its prompt. OSC 7 carries no nonce (a
-    //! remote shell over ssh must be able to report its cwd), so the shell's own
-    //! signed marks say who can be speaking: between its `A` and its `C` the
-    //! shell sits at its prompt and runs nothing, and every integration reports
-    //! its own cwd immediately before its next `A`. That holds only while its
-    //! marks arrive and once it has marked a command it ran with `C`.
+    //! while an authenticated shell holds its prompt
+    //! (docs/DESIGN-cwd-reports-2026-10-19.md). OSC 7 cannot require the nonce
+    //! (a remote shell over ssh must be able to report its cwd), so the shell
+    //! signs its own report, its signed marks say when it sits at its prompt and
+    //! runs nothing (between its `A` and its `C`, once it has marked a command
+    //! with `C`), and the host says when a program holds the foreground anyway.
+    //! The unsigned `osc7` reports below are a shell's from before the signature.
     use crate::terminal::{ShellIntegrationNonce, Terminal};
 
     const KEY: [u8; 32] = [0x5Du8; 32];
@@ -936,6 +1377,37 @@ mod reported_cwd_tests {
         t.process(&signed("A"));
         t.process(b"$ ");
         t.process(&signed("B"));
+        while t.take_osc_event().is_some() {}
+        t
+    }
+
+    /// The shell's own report as every integration sends it: the `AtermCwd`
+    /// property it signs with `KEY`, then the same URI as its OSC 7, which
+    /// carries no nonce.
+    fn own_report(path: &str) -> Vec<u8> {
+        format!(
+            "\x1b]633;P;AtermCwd=file://host{path};id={}\x07\x1b]7;file://host{path}\x07",
+            ShellIntegrationNonce(KEY).to_hex()
+        )
+        .into_bytes()
+    }
+
+    /// [`at_prompt`] for a shell that signs its own reports.
+    fn signing_at_prompt() -> Terminal {
+        let mut t = Terminal::new(6, 60);
+        t.authorize_shell_integration(KEY);
+        t.set_require_shell_integration_nonce(true);
+        for line in ["", "true\r\n"] {
+            if !line.is_empty() {
+                t.process(line.as_bytes());
+                t.process(&signed("C"));
+                t.process(&signed("D;0"));
+            }
+            t.process(&own_report("/home/me"));
+            t.process(&signed("A"));
+            t.process(b"$ ");
+            t.process(&signed("B"));
+        }
         while t.take_osc_event().is_some() {}
         t
     }
@@ -1189,5 +1661,549 @@ mod reported_cwd_tests {
                 .as_deref(),
             Some("/adopted")
         );
+    }
+
+    /// The shell's own report (the `AtermCwd` it signs, then its OSC 7) is its
+    /// word at any phase, and one report queues one event, none when the folder
+    /// is unchanged. A property signed
+    /// with another key is dropped as the marks it would forge are. The OSC 7
+    /// carries no nonce, and one whose last parameter is `id=` is URI through
+    /// and through, as an engine from before the property reads it: the nonce
+    /// never reaches a stored path there.
+    #[test]
+    fn the_shells_own_report_lands_at_once_with_no_nonce_in_its_uri() {
+        let mut t = signing_at_prompt();
+        assert!(t.shell.signs_cwd);
+        t.process(&own_report("/home/me/src"));
+        assert_eq!(t.current_working_directory(), Some("/home/me/src"));
+        assert_eq!(cwd_events(&mut t), vec!["//host/home/me/src".to_owned()]);
+        t.process(
+            format!(
+                "\x1b]633;P;AtermCwd=file://host/forged;id={}\x07",
+                ShellIntegrationNonce([0x11; 32]).to_hex()
+            )
+            .as_bytes(),
+        );
+        assert_eq!(t.current_working_directory(), Some("/home/me/src"));
+        // The same folder again: no event.
+        t.process(&own_report("/home/me/src"));
+        assert!(cwd_events(&mut t).is_empty(), "unchanged");
+        // Where the shell does not sit at its prompt (no `C` yet) its OSC 7
+        // lands too, naming the folder its signed word just stored: one event.
+        let mut t = gated_at_first_prompt();
+        while t.take_osc_event().is_some() {}
+        t.process(&own_report("/srv"));
+        assert_eq!(t.current_working_directory(), Some("/srv"));
+        assert_eq!(cwd_events(&mut t), vec!["//host/srv".to_owned()]);
+        // A last parameter that looks like a signature is part of the URI.
+        let mut t = Terminal::new(6, 60);
+        t.process(b"\x1b]7;file://host/a;id=b\x07");
+        assert_eq!(t.current_working_directory(), Some("/a;id=b"));
+    }
+
+    /// A stray between the shell's report and its `A`: the
+    /// shell reports its cwd and then prints its prompt start, and a background
+    /// job's report lands between the two. From a shell that signs its own it
+    /// is dropped, after a command (`D` on) and after an empty Enter alike, so
+    /// the folder and the prompt's mark keep the shell's. Control: from a shell
+    /// that does not sign (an integration from before the signature) the
+    /// latest held report still wins, as it always did.
+    #[test]
+    fn a_stray_between_the_shells_signed_report_and_its_prompt_sets_nothing() {
+        // After a command.
+        let mut t = signing_at_prompt();
+        t.process(b"cd src\r\n");
+        t.process(&signed("C"));
+        t.process(&signed("D;0"));
+        t.process(&own_report("/home/me/src"));
+        t.process(&osc7("/elsewhere"));
+        t.process(&signed("A"));
+        assert_eq!(t.current_working_directory(), Some("/home/me/src"));
+        let mark = t.shell.current_mark.as_ref().expect("the prompt's mark");
+        assert_eq!(mark.working_directory.as_deref(), Some("/home/me/src"));
+        assert_eq!(cwd_events(&mut t), vec!["//host/home/me/src".to_owned()]);
+
+        // After an empty Enter (no C, no D: the phase still reads its prompt).
+        let mut t = signing_at_prompt();
+        t.process(b"\r\n");
+        t.process(&own_report("/home/me"));
+        t.process(&osc7("/elsewhere"));
+        t.process(&signed("A"));
+        assert_eq!(t.current_working_directory(), Some("/home/me"));
+        assert!(cwd_events(&mut t).is_empty(), "nothing changed");
+
+        // Control: unsigned reports, the latest held one wins at the A.
+        let mut t = at_prompt();
+        t.process(b"\r\n");
+        t.process(&osc7("/home/me"));
+        t.process(&osc7("/elsewhere"));
+        t.process(&signed("A"));
+        assert_eq!(t.current_working_directory(), Some("/elsewhere"));
+    }
+
+    /// A program a key binding starts: it runs with no `C`
+    /// (a zsh widget, a bash `bind -x`, a fish binding), but it holds the
+    /// terminal's foreground, which the host says. Its reports land while it
+    /// does, and once it leaves the foreground the folder is the prompt's
+    /// again: the shell reports its own only at its next prompt. A stray while
+    /// the shell holds the foreground is still dropped.
+    #[test]
+    fn a_key_bound_programs_report_lands_while_it_holds_the_foreground() {
+        let mut t = signing_at_prompt();
+        t.set_foreground_job(true);
+        t.process(b"\x1b]133;A\x07remote$ ");
+        t.process(&osc7("/srv/app"));
+        assert_eq!(t.current_working_directory(), Some("/srv/app"));
+        assert_eq!(t.reported_cwd_host(), Some("host"));
+        t.process(&osc7("/srv/app/logs"));
+        assert_eq!(t.current_working_directory(), Some("/srv/app/logs"));
+        // The program exits; the shell holds the foreground and redraws its line.
+        t.set_foreground_job(false);
+        assert_eq!(t.current_working_directory(), Some("/home/me"));
+        assert_eq!(
+            cwd_events(&mut t),
+            vec![
+                "//host/srv/app".to_owned(),
+                "//host/srv/app/logs".to_owned(),
+                "//host/home/me".to_owned()
+            ]
+        );
+        // Nothing more to restore: a second word changes nothing.
+        t.set_foreground_job(false);
+        assert!(cwd_events(&mut t).is_empty());
+        // A stray at the prompt again.
+        t.process(&osc7("/elsewhere"));
+        assert_eq!(t.current_working_directory(), Some("/home/me"));
+
+        // A program the shell started with `C` reports as it always did, and
+        // its end restores nothing: the shell reports its own at its prompt.
+        let mut t = signing_at_prompt();
+        t.process(b"ssh build\r\n");
+        t.process(&signed("C"));
+        t.set_foreground_job(true);
+        t.process(&osc7("/srv/app"));
+        t.set_foreground_job(false);
+        assert_eq!(t.current_working_directory(), Some("/srv/app"));
+    }
+
+    /// A program the shell keeps in its own process group (PowerShell runs
+    /// every program there, so one a PSReadLine key handler starts holds no
+    /// foreground of its own; ConPTY has no foreground group at all): the
+    /// host's program probe says whether one the shell started since its prompt
+    /// began runs. Its report lands while one does, and the cwd it replaced
+    /// comes back at the first foreground word once none does. A program the
+    /// shell started before its prompt (a job an earlier command left running)
+    /// is no such program: its report at the prompt is a stray, dropped. The
+    /// probe is asked only for a report at the prompt and while one it let land
+    /// shows.
+    #[test]
+    fn a_program_the_probe_sees_since_the_prompt_reports_its_cwd() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        // When the shell's one child started (0: none runs).
+        let started = Arc::new(AtomicU64::new(0));
+        let asked = Arc::new(AtomicU64::new(0));
+        let mut t = signing_at_prompt();
+        let (child, count) = (started.clone(), asked.clone());
+        t.set_program_probe(Some(Box::new(move |since| {
+            count.fetch_add(1, SeqCst);
+            let at = child.load(SeqCst);
+            at != 0 && at >= since
+        })));
+        // A job an earlier command started.
+        started.store(1, SeqCst);
+        t.process(&osc7("/elsewhere"));
+        assert_eq!(t.current_working_directory(), Some("/home/me"));
+        // A key handler's program, started since the prompt.
+        started.store(u64::MAX, SeqCst);
+        t.process(&osc7("/srv/app"));
+        assert_eq!(t.current_working_directory(), Some("/srv/app"));
+        // It runs on in the shell's group: the foreground word keeps it.
+        t.set_foreground_job(false);
+        assert_eq!(t.current_working_directory(), Some("/srv/app"));
+        // It exits.
+        started.store(0, SeqCst);
+        t.set_foreground_job(false);
+        assert_eq!(t.current_working_directory(), Some("/home/me"));
+        // Nothing shows now, and the shell's own report needs no word: the
+        // probe is not asked.
+        let before = asked.load(SeqCst);
+        t.set_foreground_job(false);
+        t.process(&own_report("/home/me/src"));
+        assert_eq!(asked.load(SeqCst), before);
+        // After the shell's `D` the prompt began there: a program started
+        // after it is seen too.
+        t.process(b"true\r\n");
+        t.process(&signed("C"));
+        t.process(&signed("D;0"));
+        started.store(u64::MAX, SeqCst);
+        t.process(&osc7("/srv/logs"));
+        assert_eq!(t.current_working_directory(), Some("/srv/logs"));
+    }
+
+    /// A shell that stops sending `C` (PowerShell after `Import-Module
+    /// PSReadLine -Force` replaced aterm's readline shim): its next `D` comes
+    /// while its marks
+    /// say it sat at its prompt, which says it ran a command it did not mark,
+    /// and from there on its reports land at once, until a `C` says it marks
+    /// what it runs again. The first command it runs so is read as its prompt
+    /// where the host says nothing of the foreground (a stray, dropped); a host
+    /// that does says the program holds it, and it lands.
+    #[test]
+    fn a_shell_that_stops_marking_commands_holds_no_report_once_it_says_so() {
+        let mut t = signing_at_prompt();
+        t.process(b"ssh build\r\n");
+        t.process(&osc7("/srv/app"));
+        assert_eq!(t.current_working_directory(), Some("/home/me"), "the first");
+        t.process(&signed("D;0"));
+        assert!(t.shell.unmarked_run);
+        t.process(&own_report("/home/me"));
+        t.process(&signed("A"));
+        t.process(b"$ ");
+        t.process(&signed("B"));
+        t.process(b"ssh build\r\n");
+        t.process(&osc7("/srv/app"));
+        assert_eq!(t.current_working_directory(), Some("/srv/app"));
+        t.process(&signed("D;0"));
+        t.process(&own_report("/home/me"));
+        t.process(&signed("A"));
+        t.process(b"$ ");
+        t.process(&signed("B"));
+        // PSReadLine is back: its C, then the prompt rule holds again.
+        t.process(b"true\r\n");
+        t.process(&signed("C"));
+        assert!(!t.shell.unmarked_run);
+        t.process(&signed("D;0"));
+        t.process(&own_report("/home/me"));
+        t.process(&signed("A"));
+        t.process(&osc7("/elsewhere"));
+        assert_eq!(t.current_working_directory(), Some("/home/me"));
+
+        // The first unmarked command, where the host says the program holds
+        // the foreground.
+        let mut t = signing_at_prompt();
+        t.process(b"ssh build\r\n");
+        t.set_foreground_job(true);
+        t.process(&osc7("/srv/app"));
+        assert_eq!(t.current_working_directory(), Some("/srv/app"));
+    }
+
+    /// What the prompt left pending rides a checkpoint: a
+    /// report held at the prompt of a shell that does not sign its own lands at
+    /// the successor's next `A`; a shell's signing goes on being read (a stray
+    /// before its `A` is dropped there too); a shell that stopped marking
+    /// commands is still read so; and the cwd a key-bound program's report
+    /// replaced comes back when the successor's host says it left the
+    /// foreground. Through the meta wire as well.
+    #[test]
+    fn what_the_prompt_left_pending_survives_a_checkpoint() {
+        fn carried(t: &Terminal) -> Vec<Terminal> {
+            let cp = t.checkpoint_carry(0).expect("a prompt carries");
+            let key = cp
+                .shell_integration_nonce
+                .expect("an authenticated prompt carries its key")
+                .0;
+            #[allow(unused_mut)]
+            let mut out = vec![Terminal::from_checkpoint(&cp)];
+            #[cfg(feature = "serde")]
+            {
+                let meta = crate::terminal::CheckpointMeta::from_checkpoint(&cp);
+                out.push(Terminal::from_checkpoint(
+                    &meta.into_checkpoint(cp.grid.clone(), cp.alt_grid.clone()),
+                ));
+            }
+            for s in &mut out {
+                s.authorize_shell_integration(key);
+            }
+            out
+        }
+
+        let mut held = at_prompt();
+        held.process(b"\r\n");
+        held.process(&osc7("/home/me/src"));
+        for mut s in carried(&held) {
+            s.process(&signed("A"));
+            assert_eq!(s.current_working_directory(), Some("/home/me/src"));
+        }
+
+        // Carried between the shell's D and its report: a stray there is
+        // dropped, not landed as from a shell that does not sign.
+        let mut signing = signing_at_prompt();
+        signing.process(b"cd src\r\n");
+        signing.process(&signed("C"));
+        signing.process(&signed("D;0"));
+        for mut s in carried(&signing) {
+            s.process(&osc7("/elsewhere"));
+            assert_eq!(s.current_working_directory(), Some("/home/me"));
+            assert!(cwd_events(&mut s).is_empty());
+            s.process(&own_report("/home/me/src"));
+            s.process(&signed("A"));
+            assert_eq!(s.current_working_directory(), Some("/home/me/src"));
+        }
+
+        // A re-key's first property takes the key before its next A makes the
+        // old prompt phase current. Carrying at that boundary must not turn
+        // the stale phase into a reason to drop a report the live engine accepts.
+        const REKEY: [u8; 32] = [0xA7; 32];
+        let hex = ShellIntegrationNonce(REKEY).to_hex();
+        let mut rekeying = signing_at_prompt();
+        rekeying.authorize_shell_integration_on_first_mark(REKEY);
+        rekeying
+            .process(format!("\x1b]633;P;AtermCwd=file://host/home/me;id={hex}\x07").as_bytes());
+        let mut continuations = carried(&rekeying);
+        continuations.push(rekeying);
+        for mut s in continuations {
+            s.process(&osc7("/srv/app"));
+            assert_eq!(s.current_working_directory(), Some("/srv/app"));
+            // Once A arrives, both the live and restored engine refuse strays.
+            s.process(format!("\x1b]133;A;id={hex}\x07").as_bytes());
+            s.process(&osc7("/elsewhere"));
+            assert_eq!(s.current_working_directory(), Some("/srv/app"));
+        }
+
+        let mut unmarked = signing_at_prompt();
+        unmarked.process(&signed("D;0"));
+        unmarked.process(&own_report("/home/me"));
+        unmarked.process(&signed("A"));
+        unmarked.process(&signed("B"));
+        for mut s in carried(&unmarked) {
+            s.process(&osc7("/srv/app"));
+            assert_eq!(s.current_working_directory(), Some("/srv/app"));
+        }
+
+        let mut job = signing_at_prompt();
+        job.set_foreground_job(true);
+        job.process(&osc7("/srv/app"));
+        for mut s in carried(&job) {
+            assert_eq!(s.current_working_directory(), Some("/srv/app"));
+            s.set_foreground_job(true);
+            s.set_foreground_job(false);
+            assert_eq!(s.current_working_directory(), Some("/home/me"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod dead_screen_carry_tests {
+    //! The carry a console host's leave writes after its switch
+    //! (`Terminal::dead_alt_screen_carry`), played on two engines: OURS, under the
+    //! host policy, and a HOST model that draws what the shell, the app and the
+    //! host's client write (never the marks), as OpenConsole does. The leave's
+    //! bytes reach both, the host drawing them and ours from what it forwards.
+    use crate::terminal::Terminal;
+
+    const ROWS: u16 = 6;
+
+    struct Tab {
+        ours: Terminal,
+        host: Terminal,
+    }
+
+    impl Tab {
+        /// A tab whose primary screen used `used` rows (`out 0` ...), then an app
+        /// on the alternate screen that drew `app` and died there, and the shell's
+        /// next prompt `prompt` drawn on the dead screen.
+        fn killed(used: u16, app: &[u8], prompt: &[u8]) -> Self {
+            let mut ours = Terminal::new(ROWS, 40);
+            ours.set_host_resyncs_alt_screen(true);
+            let mut tab = Self {
+                ours,
+                host: Terminal::new(ROWS, 40),
+            };
+            for i in 0..used {
+                tab.both(format!("out {i}\r\n").as_bytes());
+            }
+            tab.both(b"\x1b[?1049h\x1b[H\x1b[2J");
+            tab.both(app);
+            tab.both(b"\x1b]133;D;-1\x07\x1b]133;A\x07");
+            tab.both(prompt);
+            tab.both(b"\x1b]133;B\x07");
+            tab
+        }
+
+        /// Bytes both sides draw: ours with the marks, the host without.
+        fn both(&mut self, bytes: &[u8]) {
+            self.ours.process(bytes);
+            self.host.process(&without_marks(bytes));
+        }
+
+        /// The host's leave: its client writes `?1049l` and, with `carry`, what
+        /// ours composed; the host draws it and forwards it to ours. Whether
+        /// there was a carry.
+        fn leave(&mut self, carry: bool) -> bool {
+            let text = self.ours.dead_alt_screen_carry();
+            let mut bytes = b"\x1b[?1049l".to_vec();
+            if carry && let Some(text) = &text {
+                bytes.extend_from_slice(text.as_bytes());
+            }
+            self.both(&bytes);
+            text.is_some()
+        }
+
+        fn rows(t: &Terminal) -> Vec<String> {
+            (0..usize::from(ROWS))
+                .map(|r| t.row_text(r).unwrap_or_default().trim_end().to_string())
+                .collect()
+        }
+
+        fn history(t: &Terminal) -> Vec<String> {
+            let grid = t.grid();
+            (0..grid.scrollback_lines())
+                .map(|i| {
+                    grid.get_history_line(i)
+                        .as_ref()
+                        .and_then(|l| l.as_str())
+                        .map(|s| s.trim_end().to_string())
+                        .unwrap_or_default()
+                })
+                .collect()
+        }
+
+        /// Both screens show the same rows, history and cursor, off the
+        /// alternate screen. Returns our rows.
+        fn in_step(&self) -> Vec<String> {
+            let (a, b) = (self.ours.cursor(), self.host.cursor());
+            assert_eq!(Self::rows(&self.ours), Self::rows(&self.host));
+            assert_eq!(Self::history(&self.ours), Self::history(&self.host));
+            assert_eq!((a.row, a.col), (b.row, b.col), "cursors");
+            assert!(!self.ours.is_alternate_screen() && !self.host.is_alternate_screen());
+            Self::rows(&self.ours)
+        }
+
+        fn cursor(&self) -> (u16, u16) {
+            let c = self.ours.cursor();
+            (c.row, c.col)
+        }
+    }
+
+    /// The bytes without their OSC 133 marks (`ESC ] 133 ; ... BEL`).
+    fn without_marks(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i..].starts_with(b"\x1b]133;") {
+                i += bytes[i..]
+                    .iter()
+                    .position(|&b| b == 0x07)
+                    .map_or(bytes.len(), |p| p + 1);
+                continue;
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        out
+    }
+
+    // The killed vim of the live run, small: the app's cursor on its top row, so
+    // pwsh's prompt is drawn at row 0 of the dead screen and PSReadLine anchors
+    // there. The carry scrolls the three used rows into the scrollback, draws the
+    // prompt at row 0 with nothing of the app's row after it, and leaves the
+    // cursor where the prompt ended, on both sides.
+    #[test]
+    fn the_prompt_comes_back_at_the_row_and_column_it_was_drawn_at() {
+        let mut tab = Tab::killed(3, b"line 1 of the file\r\nline 2\x1b[H", b"PS> ");
+        assert!(tab.leave(true), "a prompt to carry");
+        let rows = tab.in_step();
+        assert_eq!(rows, ["PS>", "", "", "", "", ""]);
+        assert_eq!(tab.cursor(), (0, 4), "where the line editor anchored");
+        assert_eq!(Tab::history(&tab.ours), ["out 0", "out 1", "out 2"]);
+        // The line editor's redraw from its anchor lands after the prompt.
+        tab.both(b"\x1b[1;5Hecho after");
+        assert_eq!(Tab::rows(&tab.ours)[0], "PS> echo after");
+    }
+
+    // The control, the plain leave: the cursor goes back under the used rows
+    // while the line editor's anchor stays on row 0, so its redraw overwrites
+    // `out 0` and no prompt is left on screen.
+    #[test]
+    fn without_the_carry_the_anchored_redraw_overwrites_an_earlier_row() {
+        let mut tab = Tab::killed(3, b"line 1 of the file\r\nline 2\x1b[H", b"PS> ");
+        tab.leave(false);
+        tab.in_step();
+        assert_eq!(tab.cursor(), (3, 0));
+        tab.both(b"\x1b[1;5Hecho after");
+        assert_eq!(
+            Tab::rows(&tab.ours)[..3],
+            ["out echo after", "out 1", "out 2"]
+        );
+    }
+
+    // A prompt below the used rows keeps them on screen: nothing scrolls, the rows
+    // between are cleared, and the prompt stays on its own row.
+    #[test]
+    fn a_prompt_below_the_used_rows_scrolls_nothing() {
+        let mut tab = Tab::killed(2, b"a\r\nb\r\nc\r\nd\x1b[5;1H", b"PS> ");
+        assert!(tab.leave(true));
+        let rows = tab.in_step();
+        assert_eq!(rows, ["out 0", "out 1", "", "", "PS>", ""]);
+        assert_eq!(tab.cursor(), (4, 4));
+        assert!(Tab::history(&tab.ours).is_empty());
+    }
+
+    // A prompt that started mid-row (the app's cursor was not in column 0) comes
+    // back without the app's cells left of it or right of the cursor; a prompt of
+    // two rows comes back whole; the used rows scroll only as far as needed.
+    #[test]
+    fn the_carry_is_the_prompt_alone_and_all_of_it() {
+        let mut tab = Tab::killed(1, b"\x1b[2;1Hdead app text that runs on\x1b[2;10H", b"PS> ");
+        assert!(tab.leave(true));
+        assert_eq!(tab.in_step(), ["out 0", "         PS>", "", "", "", ""]);
+        assert_eq!(tab.cursor(), (1, 13));
+
+        let mut tab = Tab::killed(4, b"x\r\ny\r\nz\x1b[2;1H", b"~\\dir\r\nPS> ");
+        assert!(tab.leave(true));
+        assert_eq!(tab.in_step(), ["out 3", "~\\dir", "PS>", "", "", ""]);
+        assert_eq!(tab.cursor(), (2, 4));
+        assert_eq!(Tab::history(&tab.ours), ["out 0", "out 1", "out 2"]);
+    }
+
+    // The prompt's colours come along: what the host's client writes is our own
+    // row with its SGR.
+    #[test]
+    fn the_prompt_keeps_its_colours() {
+        let mut tab = Tab::killed(1, b"\x1b[H", b"\x1b[32mPS\x1b[0m> ");
+        assert!(tab.leave(true));
+        tab.in_step();
+        let text = tab.ours.grid().row_ansi_text_screen(0).unwrap_or_default();
+        assert!(text.contains("\x1b[0;32mPS"), "{text:?}");
+    }
+
+    // The dead app's pen stays with it: a killed vim left bold reverse video on
+    // from its ruler, and pwsh, which sets no colour for its prompt, drew the
+    // prompt in it. The carried prompt comes back in the pen the leave restores,
+    // on both sides, as the local leave draws it.
+    #[test]
+    fn the_prompt_comes_back_in_the_pen_the_leave_restores() {
+        let mut tab = Tab::killed(1, b"\x1b[0;1;7mruler\x1b[H", b"PS> ");
+        assert!(tab.leave(true));
+        assert_eq!(tab.in_step()[0], "PS>");
+        for t in [&tab.ours, &tab.host] {
+            let text = t.grid().row_ansi_text_screen(0).unwrap_or_default();
+            assert!(!text.contains('\x1b'), "{text:?}");
+        }
+    }
+
+    // Nothing to carry: the shell has drawn nothing since its `A` (Git Bash's
+    // prompt comes in a later write and lands on the primary screen itself), no
+    // prompt marked the screen, the host's leave already came, or the policy is
+    // off.
+    #[test]
+    fn nothing_drawn_after_the_mark_carries_nothing() {
+        let tab = Tab::killed(2, b"pager\x1b[H", b"");
+        assert_eq!(tab.ours.dead_alt_screen_carry(), None);
+
+        let mut term = Terminal::new(ROWS, 40);
+        term.set_host_resyncs_alt_screen(true);
+        term.process(b"\x1b[?1049hpager\x1b[H");
+        assert_eq!(term.dead_alt_screen_carry(), None, "no prompt on it");
+        term.process(b"\x1b]133;A\x07PS> ");
+        assert!(term.dead_alt_screen_carry().is_some());
+        term.process(b"\x1b[?1049l");
+        assert_eq!(term.dead_alt_screen_carry(), None, "left");
+
+        let mut local = Terminal::new(ROWS, 40);
+        local.process(b"\x1b[?1049hpager\x1b[H\x1b]133;A\x07PS> ");
+        assert!(!local.is_alternate_screen(), "the local leave");
+        assert_eq!(local.dead_alt_screen_carry(), None);
     }
 }

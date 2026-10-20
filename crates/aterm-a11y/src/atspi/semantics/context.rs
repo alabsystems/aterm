@@ -152,8 +152,15 @@ mod tests {
     }
     struct NoBus;
     impl AdapterCallback for NoBus {
-        fn register_interfaces(&self, _: &Adapter, _: crate::tree::NodeId, _: InterfaceSet) {}
-        fn unregister_interfaces(&self, _: &Adapter, _: crate::tree::NodeId, _: InterfaceSet) {}
+        fn register_interfaces(&self, _: &Adapter, _: super::super::NodeIdentity, _: InterfaceSet) {
+        }
+        fn unregister_interfaces(
+            &self,
+            _: &Adapter,
+            _: super::super::NodeIdentity,
+            _: InterfaceSet,
+        ) {
+        }
         fn emit_event(&self, _: &Adapter, _: Event) {}
     }
     fn window(app: &Arc<SharedLock<AppContext>>, id: usize) -> Adapter {

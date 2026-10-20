@@ -143,6 +143,15 @@ pub(super) struct HandRow {
     pub(super) caret_row: Option<u16>,
 }
 
+/// A generic input boundary may move input away from the drawn caret. Only
+/// an observed park on that boundary's source row displaces its ownership;
+/// initial program output alone establishes no such claim.
+#[derive(Clone, Copy)]
+pub(super) struct UnownedCaret {
+    pub(super) row: u16,
+    pub(super) parked: bool,
+}
+
 impl HandRow {
     /// The hand's row after a licensed typed echo landed on `row`.
     pub(super) fn at(row: u16) -> Self {
@@ -934,20 +943,14 @@ pub(super) struct PendingHop {
     pub(super) at: Instant,
 }
 
-/// A typed lay the caret has not yet rested behind (Rainbow Kitty, the visible
-/// lane). A remote zle drawing its Ctrl-R match torn across two reads prints
-/// the match's glyph at the caret first (the frame a typed echo draws, so the
-/// visible lane lays it), then prints its status row below and walks the caret
-/// back onto the match with no key. A glyph's echo leaves the caret right of
-/// it, so a print ending off the lay's row followed by the caret at rest on or
-/// left of the laid cells shows the lay was judged mid-redisplay: it is
-/// recalled, its cells retracting as an insert rewrite's do
-/// ([`rk::Event::Rewrite`]). Judged at the caret's rest
-/// ([`CursorGlow::TORN_REST_S`] without a move) or at the next typed lay's
-/// origin. A caret resting right of the lay, elsewhere, or behind a keyed move
-/// keeps it, as does a walk back with every print on the lay's row (a
-/// highlighter's redraw split across reads, vi-mode Escape). The lay is a
-/// shortened band, not a refused one (RAINBOW-PATH-V3 §8 D-13).
+/// A visible-lane typed lay whose caret has not rested. Earlier observed
+/// parked rows are refused before laying ([`CursorGlow::unowned_caret`]);
+/// this is the fallback when that earlier evidence was unavailable. A later
+/// print off the row followed by a keyless rest on or left of the new cells
+/// recalls them through [`rk::Event::Rewrite`]. Judged at the caret's rest
+/// ([`CursorGlow::TORN_REST_S`] without a move) or the next typed lay's origin.
+/// A keyed move, an established typing row, a rest right of the lay, or a
+/// redraw confined to the lay's row keeps it.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct TornLay {
     /// The row the typed echo laid on (a scroll drops the lay).
@@ -1448,7 +1451,6 @@ impl CursorGlow {
     /// newest slot. The two must stay distinct, or a zero-width erase would
     /// retire the press before the run.
     pub fn note_backspace_erasing(&mut self, now: Instant, cells: Option<u16>) {
-        self.recent_typed_run = None;
         // Backspace starts a new deletion class: close every older movement
         // class and the swallowed typed cohort's unspent credits before arming
         // quench/poof state. `clear_typed_keeping_hand` flushes a held park
@@ -1530,6 +1532,7 @@ impl CursorGlow {
     /// never touches heat or coal.
     pub fn note_navigation(&mut self, now: Instant) {
         self.recent_typed_run = None;
+        self.unowned_caret = None;
         self.flush_held_park();
         if self.newline_hint.take().is_some() && self.v2.engaged() {
             self.v2.on_event(rk::Event::CancelComposerNewline, now);
@@ -1634,6 +1637,7 @@ impl CursorGlow {
     pub fn note_return(&mut self, now: Instant) {
         self.note_return_keeping_hand(now);
         self.hand_row = None;
+        self.unowned_caret = None;
     }
 
     /// [`Self::note_return`] for an Enter into a foreground program's composer
@@ -2180,6 +2184,7 @@ impl CursorGlow {
     /// landing's shape to decide whether the jump choreography fires.
     pub fn note_motion(&mut self, now: Instant) {
         self.recent_typed_run = None;
+        self.unowned_caret = None;
         // A motion moves the caret along the line editor: the hand keeps its
         // row ([`Self::clear_typed_keeping_hand`]).
         self.clear_typed_keeping_hand(now);
@@ -2707,6 +2712,9 @@ impl CursorGlow {
         self.clear_typed_keeping_hand(now);
         // The hand did something other than type or edit its line.
         self.hand_row = None;
+        self.unowned_caret = self
+            .last
+            .map(|(row, _)| UnownedCaret { row, parked: false });
     }
 
     /// [`Self::clear_typed`] for a press that cannot take the hand off its

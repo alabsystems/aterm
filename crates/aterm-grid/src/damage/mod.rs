@@ -8,20 +8,19 @@
 //! `trailing_zeros()`) with per-row column bounds. Resize uses full damage; a
 //! scroll smaller than the screen marks only the rows it exposes.
 //!
-//! ```rust,ignore
-//! use aterm_grid::Damage;
+//! ```
+//! use aterm_grid::damage::{Damage, DamageTracker};
 //!
-//! let mut damage = Damage::new(24);
+//! let mut damage = Damage::Partial(DamageTracker::new(24));
+//! assert!(!damage.has_damage());
 //!
-//! if damage.is_full() {
-//!     // Redraw everything
-//! }
+//! damage.mark_cell(2, 3);
+//! let bounds: Vec<_> = damage.iter_bounds(24, 80).collect();
+//! assert_eq!(bounds.len(), 1);
+//! assert_eq!((bounds[0].line, bounds[0].left, bounds[0].right), (2, 3, 4));
 //!
-//! if damage.has_damage() {
-//!     for bounds in damage.iter_bounds(24, 80) {
-//!         // bounds.line, bounds.left, bounds.right
-//!     }
-//! }
+//! damage.mark_full();
+//! assert!(damage.is_full());
 //! ```
 
 mod display_offset;

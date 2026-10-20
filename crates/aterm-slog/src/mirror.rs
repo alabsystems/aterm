@@ -37,7 +37,9 @@
 //!   a space's first take and each [`SNAP_EVERY`] bus-class records, a take
 //!   that reaches the head adds one `op=snap` body holding the open path and
 //!   the open needs, of the bus class only (ruling S17), the mail counts,
-//!   and `upto=`, the `ms` head it folds. It counts as given only once a
+//!   and `upto=`, the `ms` head it folds. `n=` is the original bus-needs
+//!   count: a seeded reader can detect words omitted at the field cap.
+//!   It counts as given only once a
 //!   landing reaches its slot ([`Log::land`]): a take the bridge dropped
 //!   unlanded (a subject budget's refusal) leaves the next take owing it,
 //!   so a reader of a view that lost records meanwhile still gets the seed
@@ -412,6 +414,9 @@ fn snap_body(
     let _ = f.set(Key::MailIn, Val::U(u64::from(s.mail_in)));
     let _ = f.set(Key::MailOut, Val::U(u64::from(s.mail_out)));
     let _ = f.set(Key::Epoch, Val::U(u64::from(s.ep_now)));
+    // The original bus-needs count proves whether the bounded words held
+    // every need. Older snapshots lack it and remain usable but partial.
+    let _ = f.set(Key::N, Val::U(s.needs.len() as u64));
     let _ = f.set(Key::Upto, Val::U(s.upto));
     let rec = Rec {
         seq: s.seq,

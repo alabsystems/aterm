@@ -25,8 +25,8 @@ use crate::app_launch_successor::{
 };
 use crate::app_native::PhysicalFailureShape;
 use crate::handoff_rendezvous::{
-    DialerCode, Rendezvous, RendezvousError, TRUSTD_SILENT, admitted, dial_for_test,
-    held_for_trustd,
+    DialerCode, Rendezvous, RendezvousError, admitted, dial_for_test, held_for_trustd,
+    trustd_silent,
 };
 use aterm_models_update::native_update_launched_dial_wait_model;
 use aterm_spec::derive::Model;
@@ -425,10 +425,10 @@ fn the_real_dial_wait_refines_the_model() {
         let peer = match accepted {
             Ok(peer) => peer,
             Err(LaunchedDialEnd::Rendezvous(error)) if held_for_trustd(&error) => {
-                panic!("{TRUSTD_SILENT}: {error}")
+                trustd_silent(error)
             }
             Err(end @ LaunchedDialEnd::ExitedWhileHeld { .. }) => {
-                panic!("{TRUSTD_SILENT}: {end:?}")
+                trustd_silent(format_args!("{end:?}"))
             }
             Err(end) => {
                 panic!("a live successor's dial is accepted, whatever was answered: {end:?}")
@@ -772,65 +772,4 @@ fn the_models_mutants_are_the_defects_they_name() {
         );
         assert!(!model.check_invariant("AnswerKeptForTheCorroboration", &projected));
     }
-}
-
-/// The machine's actions with no shipping code of their own on the outgoing side, each waived
-/// by name; the anchored ones are listed in `the_real_dial_wait_refines_the_model`.
-mod waivers {
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_launched_dial_wait",
-        action = "Dial",
-        reason = "The successor's dial (handoff_rendezvous::claim_incoming), bound by \
-                  NativeUpdateSuccessorWarmBeforeClaim's Tier-1; this conformance dials the real \
-                  listener with the real claim frame."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_launched_dial_wait",
-        action = "Die",
-        reason = "The environment: a successor that dies before its dial (a warm-prologue fatal, \
-                  a boot crash). Driven live through the ATERM_DEBUG_DIE_BEFORE_DIAL seam in \
-                  main_entry; a unit test may not launch an application (AGENTS.md), so \
-                  the named-pid half ends a real stand-in process instead."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_launched_dial_wait",
-        action = "Expire",
-        reason = "The environment: the dial budget running out (handoff_ready_deadline)."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_launched_dial_wait",
-        action = "EndOnAnyAnswer",
-        reason = "The Buggy=1 mutant: an answer that proves nothing read as death; no shipping \
-                  code, and the conformance's negative control replays it and sees it refused."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_launched_dial_wait",
-        action = "ConsumingPoll",
-        reason = "The Buggy=1 mutant: the pre-dial poll taking the answer; no shipping code (the \
-                  wait peeks), replayed for real and caught by the conformance."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_launched_dial_wait",
-        action = "PollCancelOnly",
-        reason = "The Buggy=1 liveness mutant: the retired cancel-only abort; replayed for real \
-                  by the conformance, which waits out its budget beside a reported death."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_launched_dial_wait",
-        action = "EndOnNamedPid",
-        reason = "The Buggy=1 mutant: a named pid taken for gone without the kernel's word; no \
-                  shipping code, replayed for real on pid 1 and refused by the conformance."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_launched_dial_wait",
-        action = "IgnoreNamedPid",
-        reason = "The Buggy=1 liveness mutant: the abort before the named-pid watch; replayed \
-                  for real by the conformance, which waits out its budget beside a named \
-                  process that is gone."
-    )]
-    #[expect(
-        dead_code,
-        reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it"
-    )]
-    fn launched_dial_wait_waivers() {}
 }

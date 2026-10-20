@@ -70,6 +70,7 @@ impl SemanticVariation {
 /// committed renderer's face.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SemanticFontCandidate {
+    /// The font family: the person's own font, never a display face.
     pub(crate) regular: Option<String>,
     pub(crate) bold: Option<String>,
     pub(crate) italic: Option<String>,
@@ -83,6 +84,9 @@ pub(crate) struct SemanticFontCandidate {
     /// hashable across the worker generation handshake.
     pub(crate) variations: Vec<SemanticVariation>,
     pub(crate) synthetic_styles: bool,
+    /// The display layer drawn over the font (`display_font`): registry ids
+    /// in registry order, empty for none.
+    pub(crate) display: Vec<&'static str>,
 }
 
 impl Default for SemanticFontCandidate {
@@ -97,6 +101,7 @@ impl Default for SemanticFontCandidate {
             emoji: None,
             variations: Vec::new(),
             synthetic_styles: true,
+            display: Vec::new(),
         }
     }
 }
@@ -112,6 +117,21 @@ impl SemanticFontCandidate {
             && self.emoji.is_none()
             && self.variations.is_empty()
             && self.synthetic_styles
+            && self.display.is_empty()
+    }
+
+    /// What the sample draws its letters in, as one family string: the
+    /// display layer (`display:<ids>`) when one is on, else the font family.
+    pub(crate) fn drawn_family(&self) -> Option<String> {
+        if self.display.is_empty() {
+            self.regular.clone()
+        } else {
+            Some(format!(
+                "{}{}",
+                aterm_render::DISPLAY_FACE_SCHEME,
+                self.display.join("+")
+            ))
+        }
     }
 
     pub(crate) fn authored_slots(&self) -> impl Iterator<Item = (&'static str, &str)> {
@@ -138,6 +158,48 @@ pub(crate) enum SpecimenTextBlending {
     Linear,
     #[default]
     LinearCorrected,
+}
+
+/// The wallpaper a terminal specimen draws under its default backgrounds, as
+/// a tab draws it: the decoded image (`w × h` straight sRGB RGBA8, `fp` its
+/// asset fingerprint), prepared at raster time for the specimen's exact frame
+/// ([`crate::wallpaper_present::prepare`]), toned by `dim`, and, with `tint`,
+/// its default-foreground text tinted toward the picture under each cell.
+#[derive(Clone)]
+pub(crate) struct SpecimenWallpaper {
+    pub(crate) rgba: Arc<[u8]>,
+    pub(crate) w: usize,
+    pub(crate) h: usize,
+    pub(crate) fp: u64,
+    pub(crate) dim: f32,
+    pub(crate) tint: bool,
+}
+
+impl SpecimenWallpaper {
+    /// Everything the prepared pixels depend on but the frame: the asset, its
+    /// size, the dim and the tint.
+    pub(crate) fn identity(&self) -> (u64, usize, usize, u32, bool) {
+        (self.fp, self.w, self.h, self.dim.to_bits(), self.tint)
+    }
+}
+
+/// Equal where the pixels are: the asset's fingerprint stands for its bytes.
+impl PartialEq for SpecimenWallpaper {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
+}
+
+impl std::fmt::Debug for SpecimenWallpaper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpecimenWallpaper")
+            .field("fp", &self.fp)
+            .field("w", &self.w)
+            .field("h", &self.h)
+            .field("dim", &self.dim)
+            .field("tint", &self.tint)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Complete renderer state for one bounded, real terminal-frame specimen. `input` is an
@@ -172,6 +234,9 @@ pub(crate) struct TerminalSpecimenSpec {
     pub(crate) minimum_contrast: f32,
     pub(crate) selection_foreground: Option<u32>,
     pub(crate) selection_inactive: bool,
+    /// The wallpaper under the specimen's default backgrounds, as a tab draws
+    /// it; `None` draws the theme background.
+    pub(crate) wallpaper: Option<SpecimenWallpaper>,
 }
 
 /// The only constructor of [`DrawPrim::Text`]. Its size is a [`StepPx`],
@@ -299,6 +364,14 @@ pub(crate) enum DrawPrim {
     ClipPush { x: f32, y: f32, w: f32, h: f32 },
     /// Pop the most recent [`DrawPrim::ClipPush`]. Unbalanced pops are ignored.
     ClipPop,
+    /// Fade every later prim until the matching [`DrawPrim::FadePop`] over the
+    /// band `y..y + h` (frame px): what it draws above `y` is untouched, and
+    /// from `y` down its opacity falls, eased out, from `from` to `to`, `to`
+    /// past the band — a scrolling list's peek in the strip under its room
+    /// ([`crate::native_ui::UiNode::room`]).
+    FadePush { y: f32, h: f32, from: f32, to: f32 },
+    /// Pop the most recent [`DrawPrim::FadePush`]. Unbalanced pops are ignored.
+    FadePop,
     /// One of the message band's drawn icons in a `size`-point square at `(x, y)`,
     /// rasterized at device scale (Settings ▸ Messages' severity column).
     BandIcon {
@@ -343,7 +416,8 @@ pub(crate) fn translate_prims(prims: &mut [DrawPrim], dx: f32, dy: f32) {
                 *cx += dx;
                 *cy += dy;
             }
-            DrawPrim::ClipPop => {}
+            DrawPrim::FadePush { y, .. } => *y += dy,
+            DrawPrim::ClipPop | DrawPrim::FadePop => {}
         }
     }
 }

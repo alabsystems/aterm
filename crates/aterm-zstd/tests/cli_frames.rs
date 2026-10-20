@@ -13,11 +13,9 @@
 //! same run checked 17 lengths up to 4 MiB with `zstd -t` and `zstd -d | cmp`
 //! on `write_raw`'s own frames, and found every CLI frame identical to them.
 
-mod support;
-
+use crate::support::sanity;
 use aterm_digest::Sha256;
 use aterm_zstd::frame::{self, Checksum};
-use support::sanity;
 
 /// `(len, sha256 of zstd -19, sha256 of zstd -19 --no-check)`.
 const CLI: &[(usize, &str, &str)] = &[

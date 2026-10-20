@@ -1,0 +1,26 @@
+# claude-code 2.1.302 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the Sonnet bucket's generic countdown row (seven_day_sonnet, 3600 s) cancelled by Esc
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.FiIC/proj
+
+
+❯ start the task
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Brewed for 0s · done 9:06 AM
+
+❯ carry on with the task
+  ⎿  You've hit your Sonnet limit · resets 10:06am (America/Los_Angeles)
+     /upgrade to increase your usage limit.
+
+⏺ Usage limit reached · continuing automatically at 10:06am · esc to cancel
+
+✻ Sautéed for 0s · done 9:06 AM
+
+⏺ Automatic continue cancelled · /rate-limit-options to re-arm
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

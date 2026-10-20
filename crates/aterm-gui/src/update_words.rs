@@ -87,6 +87,9 @@ pub(crate) const KEY_HEALTH: &str = "update.health";
 /// aterm a person starts ([`install_awaits_start`]): no health warning, so never
 /// under [`KEY_HEALTH`].
 pub(crate) const KEY_AWAITS_START: &str = "update.awaits-start";
+/// The key of the Linux row that says a downloaded build is held for a person
+/// ([`linux_held`]).
+pub(crate) const KEY_HELD: &str = "update.held";
 
 /// WHICH HALF OF UPDATING A HEALTH WARNING IS ABOUT — the warning's stable
 /// identity (design ruling 311). The latch, the heal proof and the record of the
@@ -244,6 +247,11 @@ pub(crate) enum ApplyPosture {
     /// (`native_update_auto_intent::LANDS_WITHIN`, within a minute) whatever the
     /// terminal does.
     Automatic,
+    /// The automatic lane is armed, but this process kept the image it was launched
+    /// with and has no terminal open (`App::kept_image_waits_for_terminal`): every
+    /// attempt is refused (`KeptImageNeedsTerminal`) until a terminal tab opens, so the
+    /// bar never says "within a minute" over a lane the gate refuses.
+    WaitsForTerminal,
     /// `[update] auto_apply = false`.
     ManualByConfig,
     /// An environment veto for this run: only the `ATERM_DEBUG_RELAUNCH_NUDGE`
@@ -270,11 +278,16 @@ pub(crate) enum ApplyPosture {
     /// None`) the update lands once every terminal is closed; with it vetoed
     /// (`veto` names what stands in the way) that closed-terminals landing is a
     /// promise the lane never arms, so the sentence names the veto and the
-    /// menu instead. It outranks every other arm, because the others change
-    /// WHEN the build installs and this one changes WHETHER.
+    /// menu instead. A process that keeps its image (`image_kept`: a launched
+    /// successor, `App::launch_image_kept`) never takes the cold lane either
+    /// (`KeptImageNeedsTerminal`), so nothing installs in it at all and the
+    /// sentence names the next launch instead. It outranks every other arm,
+    /// because the others change WHEN the build installs and this one changes
+    /// WHETHER.
     HandoffDisabled {
         why: HandoffUnavailable,
         veto: Option<AutoApplyVeto>,
+        image_kept: bool,
     },
 }
 
@@ -296,7 +309,7 @@ impl AutoApplyVeto {
     /// act on, worded like the standalone arms for the same states.
     fn clause(self) -> String {
         match self {
-            Self::Config => "automatic install is off".to_string(),
+            Self::Config => aterm_update_core::settings::install_switch_off(),
             Self::Env { var } => format!("${var} is set"),
         }
     }
@@ -469,6 +482,7 @@ pub(crate) fn apply_capsule_for(posture: Option<ApplyPosture>, build: u64) -> Op
         Some(
             ApplyPosture::HandoffDisabled { .. }
             | ApplyPosture::Automatic
+            | ApplyPosture::WaitsForTerminal
             | ApplyPosture::ManualOnlyLatched { lapses: true }
             | ApplyPosture::TrialSpent,
         ) => None,
@@ -491,7 +505,10 @@ pub(crate) fn staged_is_decision(posture: Option<ApplyPosture>) -> bool {
 pub(crate) fn staged_detail(posture: ApplyPosture) -> String {
     match posture {
         ApplyPosture::Automatic => INSTALLS_BY_ITSELF.to_string(),
-        ApplyPosture::ManualByConfig => "automatic install is off".to_string(),
+        ApplyPosture::WaitsForTerminal => {
+            "installs by itself once a terminal tab is open".to_string()
+        }
+        ApplyPosture::ManualByConfig => aterm_update_core::settings::install_switch_off(),
         ApplyPosture::VetoedByEnv { var } => format!("${var} is set \u{2014} {INSTALL_FROM_MENU}"),
         ApplyPosture::ManualOnlyLatched { lapses: true } => {
             format!("didn't install \u{2014} {TRIES_AGAIN} later")
@@ -506,7 +523,11 @@ pub(crate) fn staged_detail(posture: ApplyPosture) -> String {
         // from the right when the window is narrow. Nothing installs while a
         // terminal is open (the admission classifier refuses it), so that is
         // the promise, and the only one.
-        ApplyPosture::HandoffDisabled { why, veto: None } => format!(
+        ApplyPosture::HandoffDisabled {
+            why,
+            veto: None,
+            image_kept: false,
+        } => format!(
             "{} \u{2014} installs once every terminal is closed",
             why.cause()
         ),
@@ -516,8 +537,29 @@ pub(crate) fn staged_detail(posture: ApplyPosture) -> String {
         ApplyPosture::HandoffDisabled {
             why,
             veto: Some(veto),
+            image_kept: false,
         } => format!(
             "{}; {} \u{2014} {INSTALL_FROM_MENU} once every terminal is closed",
+            why.cause(),
+            veto.clause()
+        ),
+        // A process that keeps its image installs nothing in-session with the handoff
+        // off: closing the terminals only trades one refusal for another. The next
+        // launch's own lane installs it.
+        ApplyPosture::HandoffDisabled {
+            why,
+            veto: None,
+            image_kept: true,
+        } => format!(
+            "{} \u{2014} installs once aterm is quit and opened again",
+            why.cause()
+        ),
+        ApplyPosture::HandoffDisabled {
+            why,
+            veto: Some(veto),
+            image_kept: true,
+        } => format!(
+            "{}; {} \u{2014} {INSTALL_FROM_MENU} once aterm is quit and opened again",
             why.cause(),
             veto.clause()
         ),
@@ -526,7 +568,7 @@ pub(crate) fn staged_detail(posture: ApplyPosture) -> String {
 
 /// The Staged line for a caller that computed no posture: only the manual
 /// affordance, which is true whatever the policy — never a promise about the
-/// automatic lane, and never "automatic install is off" painted over a lane
+/// automatic lane, and never that the install switch is off painted over a lane
 /// that may be armed.
 pub(crate) fn staged_detail_unknown() -> String {
     INSTALL_FROM_MENU.to_string()
@@ -1551,6 +1593,22 @@ pub(crate) fn install_awaits_start(body: &str) -> Message {
     .key(KEY_AWAITS_START)
 }
 
+/// A LINUX BUILD DOWNLOADED AND HELD FOR A PERSON (ATERM-KI-1015-2, U21): with
+/// automatic install off, a Linux check downloads a newer build and holds it for
+/// `aterm update apply`. The macOS ready row's title (`aterm vX is ready`) and
+/// glyph, the command as the sentence — no in-session lane starts a Linux
+/// executable, so no capsule could install it — and `Software Update` as the
+/// capsule, held the ready row's [`HOLD_STAGED_MANUAL`] under its own key
+/// ([`KEY_HELD`]).
+pub(crate) fn linux_held(version: &str) -> Message {
+    row(Severity::Info, staged_title(version))
+        .glyph(glyph(MOVING_IN))
+        .sentence("Run `aterm update apply` to install it; the next aterm you start runs it.")
+        .action(software_update())
+        .hold(Hold::For(HOLD_STAGED_MANUAL))
+        .key(KEY_HELD)
+}
+
 /// R38 — THE CHECK-HEALTH WARNING. The updater's ledger says one half of the
 /// lane is PERSISTENTLY failing, and the title says which in plain words
 /// ("Couldn't install updates" / "download" / "check for",
@@ -1627,7 +1685,7 @@ pub(crate) fn update_health_entry(kind: HealthKind, body: &str) -> Entry {
     let (what, why, then) = match kind {
         HealthKind::Install => (
             "Updates are not installing",
-            "a downloaded, verified update hasn\u{2019}t installed on this Mac",
+            "a downloaded, verified update hasn\u{2019}t installed here",
             "Open Software Update and read the cause",
         ),
         HealthKind::Download => (
@@ -1637,7 +1695,7 @@ pub(crate) fn update_health_entry(kind: HealthKind, body: &str) -> Entry {
         ),
         HealthKind::Check => (
             "Update checks keep failing",
-            "the newest release cannot be read or trusted from this Mac",
+            "the newest release cannot be read or trusted from here",
             "Open Software Update and read the cause",
         ),
         HealthKind::Stalled => (
@@ -1814,8 +1872,9 @@ pub(crate) fn health_notification_body(
 /// The OS notification's title for the same warning: the warning's own title
 /// under aterm's name, as the herald's and the consent path's notices read
 /// ("aterm · couldn't install updates"). A bare "Couldn't install updates" names
-/// no app — without terminal-notifier macOS shows the banner as Script Editor's
-/// — and reads as macOS's own updater.
+/// no app — where aterm is not run from an app at all (a bare binary) and
+/// terminal-notifier is missing, macOS shows the banner as Script Editor's —
+/// and reads as macOS's own updater.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn health_notification_title(title: &str) -> String {
     let mut chars = title.chars();
@@ -1917,6 +1976,63 @@ pub(crate) fn dev_build_entry(writes: DevSharedWrites) -> Entry {
         "rebuild it with `targo --unverified ship dev-app`, which installs it as aterm \
          (dev).app, and remove this copy",
     )
+}
+
+/// A SUCCESSOR LAUNCHSERVICES HAS NO PID FOR (2026-10-19): the outgoing window asked
+/// LaunchServices for its successor, the successor dialled, and LaunchServices then
+/// answered the launch with pid -1 (`app_update_handoff::LaunchCorroboration`). Its
+/// record of the app is stale for the process's whole life: System Settings' Quit &
+/// Reopen quits by that record and misses it, the menu-bar item is never placed, and
+/// TCC attributes it to the bundle it first saw. The mark an `execve` after the
+/// launch leaves, which no successor this build launches through LaunchServices makes
+/// any more (its parent swaps first); an older build's successor, or a cause not yet
+/// measured, can still leave it. Only a quit and a fresh open give macOS a new record,
+/// and nothing breaks meanwhile, so it is an ENTRY of the digest (a fact for later),
+/// never a row on the glass. Booked by the outgoing window, it crosses to the successor
+/// at Commit and ends if the attempt returns (`App::book_launch_unregistered`) or when a
+/// window starts that no parent handed off to (`main_entry`). Every windowed process
+/// then measures its own record and books or ends the same entry on that
+/// ([`own_launch_record_stale_entry`]). Its key holds no pid.
+#[cfg(target_os = "macos")]
+pub(crate) fn launch_unregistered_entry(pid: i32) -> Entry {
+    stale_launch_record_entry(
+        format!("LaunchServices answered the update's launch of pid {pid} with no pid"),
+        format!("update: LaunchServices keeps a stale record of the successor (pid {pid})"),
+    )
+}
+
+/// The same entry from this process's own measure (`App::note_own_launch_record`):
+/// LaunchServices lists this app with no pid, and no entry is this process (`pid`).
+/// It also sees what no parent reported: a successor an older build launched, which
+/// swapped and re-exec'd itself, and a cold launch whose boot apply did.
+#[cfg(target_os = "macos")]
+pub(crate) fn own_launch_record_stale_entry(pid: u32) -> Entry {
+    stale_launch_record_entry(
+        format!("LaunchServices lists aterm with no pid, and none of its entries is pid {pid}"),
+        format!("launch record: LaunchServices keeps a stale record of this process (pid {pid})"),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn stale_launch_record_entry(evidence: String, log_line: String) -> Entry {
+    Entry::new(
+        Family::Update,
+        "launch-registration",
+        "stale",
+        "macOS lost track of updated aterm",
+        Why::OnlyYou(Reason::new(
+            "only quitting aterm and opening it again gives macOS a new record of it",
+        )),
+        Then::step("quit aterm with \u{2318}Q, then open it again"),
+    )
+    .severity(Severity::Warn)
+    .resurface(Resurface::WAIT)
+    .more(evidence)
+    .more(
+        "until then System Settings\u{2019} Quit & Reopen can miss it and its menu-bar \
+         item may not appear",
+    )
+    .log_line(log_line)
 }
 
 /// A DEV BUILD'S STANDING AGAINST THE CHANNEL (gap #30, 2026-09-26). The updater
@@ -2186,6 +2302,7 @@ mod tests {
         use ApplyPosture as P;
         let mut postures = vec![
             P::Automatic,
+            P::WaitsForTerminal,
             P::ManualByConfig,
             P::VetoedByEnv {
                 var: "ATERM_DEBUG_RELAUNCH_NUDGE",
@@ -2194,20 +2311,56 @@ mod tests {
             P::ManualOnlyLatched { lapses: false },
             P::TrialSpent,
         ];
-        postures.extend(HandoffUnavailable::ALL.map(|why| P::HandoffDisabled { why, veto: None }));
-        for why in HandoffUnavailable::ALL {
-            postures.push(P::HandoffDisabled {
-                why,
-                veto: Some(AutoApplyVeto::Config),
-            });
-            postures.push(P::HandoffDisabled {
-                why,
-                veto: Some(AutoApplyVeto::Env {
-                    var: "ATERM_DEBUG_RELAUNCH_NUDGE",
-                }),
-            });
+        for image_kept in [false, true] {
+            for why in HandoffUnavailable::ALL {
+                for veto in [
+                    None,
+                    Some(AutoApplyVeto::Config),
+                    Some(AutoApplyVeto::Env {
+                        var: "ATERM_DEBUG_RELAUNCH_NUDGE",
+                    }),
+                ] {
+                    postures.push(P::HandoffDisabled {
+                        why,
+                        veto,
+                        image_kept,
+                    });
+                }
+            }
         }
         postures
+    }
+
+    /// THE INSTALL SWITCH HAS ONE NAME ON THE STAGED LINE TOO: a build that
+    /// `[update] auto_apply` holds for a press says the switch's name as
+    /// Settings paints it right under that line on Software Update ("Install
+    /// updates automatically"), alone or after a handoff cause, as the Linux
+    /// held download does — it said "automatic install is off", a second name
+    /// for one switch.
+    #[test]
+    fn a_build_held_by_the_install_switch_names_the_switch() {
+        use ApplyPosture as P;
+        let named = format!(
+            "\u{201c}{}\u{201d} is off",
+            crate::prefs::UPDATE_INSTALL_LABEL
+        );
+        for posture in every_posture() {
+            let held = matches!(
+                posture,
+                P::ManualByConfig
+                    | P::HandoffDisabled {
+                        veto: Some(AutoApplyVeto::Config),
+                        ..
+                    }
+            );
+            let sentence = staged_detail(posture);
+            assert_eq!(sentence.contains(&named), held, "{posture:?}: {sentence}");
+            assert!(
+                !sentence.contains("automatic install is off"),
+                "{posture:?}: {sentence}"
+            );
+        }
+        assert_eq!(staged_detail(P::ManualByConfig), named);
     }
 
     /// A LANE THAT TRIES AGAIN BY ITSELF ASKS NOTHING (design ruling 246):
@@ -2754,13 +2907,19 @@ mod tests {
             // classifier does — nothing installs while a terminal is open — and
             // neither an in-place landing nor a kill it forbids; a vetoed lane
             // names the menu instead of a landing it never arms.
-            if let P::HandoffDisabled { why, veto } = posture {
+            if let P::HandoffDisabled {
+                why,
+                veto,
+                image_kept,
+            } = posture
+            {
                 assert!(
                     sentence.starts_with(why.cause()),
                     "{posture:?}: the cause leads: {sentence}"
                 );
-                assert!(
+                assert_eq!(
                     sentence.contains("once every terminal is closed"),
+                    !image_kept,
                     "{posture:?}: {sentence}"
                 );
                 assert_eq!(
@@ -2825,6 +2984,7 @@ mod tests {
             P::HandoffDisabled {
                 why: HandoffUnavailable::Headless,
                 veto: None,
+                image_kept: false,
             },
         );
         assert_eq!(r.actions, Some(Vec::new()), "the handoff off strips it");
@@ -2842,7 +3002,14 @@ mod tests {
         );
         for why in HandoffUnavailable::ALL {
             assert_eq!(
-                apply_capsule_for(Some(P::HandoffDisabled { why, veto: None }), 3),
+                apply_capsule_for(
+                    Some(P::HandoffDisabled {
+                        why,
+                        veto: None,
+                        image_kept: false
+                    }),
+                    3
+                ),
                 None
             );
         }
@@ -3606,6 +3773,7 @@ mod tests {
             live_ptys,
             foreground_jobs: 0,
             unknown_foregrounds: 0,
+            image_kept: false,
         };
         assert_eq!(
             classify(opted_out(1)),
@@ -3618,7 +3786,11 @@ mod tests {
             "no terminal at all: the cold re-exec"
         );
         for why in HandoffUnavailable::ALL {
-            let line = staged_detail(ApplyPosture::HandoffDisabled { why, veto: None });
+            let line = staged_detail(ApplyPosture::HandoffDisabled {
+                why,
+                veto: None,
+                image_kept: false,
+            });
             assert!(
                 line.starts_with(why.cause())
                     && line.ends_with("installs once every terminal is closed"),

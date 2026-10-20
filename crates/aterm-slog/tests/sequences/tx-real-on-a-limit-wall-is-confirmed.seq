@@ -1,0 +1,32 @@
+seq v=1 rig=transcript program=claude build=2.1.303
+# REAL ROWS, THE EXACT PATH (5H-2b): the rows the managed Claude Code 2.1.303
+# wrote, in the lab against its stub on the subscriber path, for a turn the
+# session limit ended (aterm-agent's committed reduction of that transcript,
+# lines 36-40, folded whole there; the notice reduced to its wall's anchor
+# phrase): each row at the offset and time the real reader hands it on
+# (dated= relative, the prompt at 0), read as the lab's candidate build
+# read them, after the screen's settle closed the turn on the wall.
+# 2.1.303 is a measured build, so every row is On: the late prompt names
+# the closed turn, the vendor's notice refines its outcome to the screen's
+# own, and the judge confirms the wall the run carries (`confirmed=1`). The
+# screen lines are this test's own.
+state on
+bind 0
+see busy
+expect open t1 turn par=r1 src=screen conf=strong
+at 2050 see wall:usage-session
+expect open p1 wall par=t1 wall=usage-session src=screen conf=strong
+expect need=wall:usage-session
+wait 1000
+expect close p1 wall out=gone src=screen at=2050
+expect close t1 turn out=wall:usage-session steps=1 walls=1 src=screen at=2050
+expect open p2 wall par=r1 wall=usage-session cont=p1 orphan=1 src=screen
+at 3600 tx prompt v1 dated=0 off=37526 slice=2.1.303:36-40
+expect amend t1 turn vref=v1 by=vendor src=transcript conf=exact
+at 3600 tx end vdur=2051 in=0 out=0 dated=2048 off=40212 slice=2.1.303:36-40
+expect amend t1 turn vdur_ms=2051 tok_in=0 tok_out=0 by=vendor src=transcript conf=exact
+at 3600 tx endwall usage-session dated=2048 off=40213 slice=2.1.303:36-40
+expect amend t1 turn out=wall:usage-session by=vendor src=transcript conf=exact
+at 3600 tx wall usage-session confirm
+expect amend p2 wall confirmed=1 by=vendor src=transcript conf=exact
+expect need=wall:usage-session

@@ -23,6 +23,11 @@ pub(crate) struct AdmissionFacts {
     pub(crate) foreground_jobs: usize,
     /// PTYs for which the foreground process group could not be observed.
     pub(crate) unknown_foregrounds: usize,
+    /// This process keeps the image it was launched with
+    /// (`aterm_update::ImageReplacement`: a macOS window no parent handed off to, or a
+    /// seamless successor LaunchServices launched): it never execs in place, so the cold
+    /// lane is closed to it.
+    pub(crate) image_kept: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +42,7 @@ pub(crate) enum AdmissionBlock {
     NativeStateUncertified,
     LivePtysNeedSeamless,
     ForegroundProbeUnknown,
+    KeptImageNeedsTerminal,
 }
 
 impl AdmissionBlock {
@@ -55,6 +61,9 @@ impl AdmissionBlock {
                 "Update kept {} terminal session(s) running because their foreground process state could not be proven safe",
                 facts.unknown_foregrounds
             ),
+            Self::KeptImageNeedsTerminal => "The update installs when a terminal tab is open: \
+                 this aterm hands its terminals to the new build and never restarts in place"
+                .to_string(),
         }
     }
 }
@@ -125,6 +134,15 @@ pub(crate) fn classify(facts: AdmissionFacts) -> AdmissionDecision {
     if facts.unknown_foregrounds > 0 {
         return AdmissionDecision::Block(AdmissionBlock::ForegroundProbeUnknown);
     }
+    // THE COLD LANE EXECS IN PLACE, which a process that keeps its image never does: an
+    // `execve` after a LaunchServices launch leaves LaunchServices answering pid -1 for the
+    // app for the rest of the process's life (no Quit & Reopen, no menu-bar item, TCC
+    // attributing it to the rollback path). Refused, never failed: the block is retried, and
+    // the seamless lane carries the update once a terminal tab is open, when the overlap
+    // handoff is available (`update_admission_refusal` names the cause when it is not).
+    if facts.image_kept {
+        return AdmissionDecision::Block(AdmissionBlock::KeptImageNeedsTerminal);
+    }
     AdmissionDecision::Apply(ApplyLane::Cold)
 }
 
@@ -140,6 +158,7 @@ mod tests {
             live_ptys: 0,
             foreground_jobs: 0,
             unknown_foregrounds: 0,
+            image_kept: false,
         }
     }
 

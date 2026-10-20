@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! **ZSH'S Ctrl-R SEARCH LAYS NO BAND** (the owner's screenshot, the shipped
-//! default Rainbow Kitty: `user@… aterm % ` with the history entry `claude
+//! default Rainbow Kitty: `owner0@… aterm % ` with the history entry `claude
 //! --dangerously-skip-permissions`, Ctrl-R, `clad` typed, the search failing at
 //! `d`. Row R shows the prompt line with the match, the block caret on the `c`
 //! of `claude`; row R+1 shows `failing bck-i-search: clad_`. A dithered band
@@ -82,7 +82,8 @@
 //! switch shaped like a soft-wrapped caret, keys `ad` 150 and 600 ms apart);
 //! `bash-isearch-2026-09-24` is bash 3.2's reverse-i-search under it. The
 //! recording host's name appears only as the same-length placeholder
-//! `hostmachine0000` (replaced byte for byte where a take recorded it).
+//! `hostmachine0000`, and the account only as `owner0` (`/Users//owner` in a
+//! home path), each replaced byte for byte where a take recorded it.
 //! Claude Code's and Codex's composer takes,
 //! recorded for `review_real_bytes.rs` and `codex_particle_replay.rs`, are
 //! replayed here as the gates' blast radius.
@@ -111,11 +112,14 @@
 //! key's own cell, a parked caret's own echo and a wide glyph's (glyph-less, so
 //! unknown) still light, a hidden caret's echo is judged alike on every path,
 //! Claude Code's and Codex's composers are refused nothing, and nothing
-//! outlives the idle ceiling. A read torn inside ONE zle redisplay (a remote
-//! zsh, a redisplay past the tty's chunk) can present the match's own glyph at
-//! the caret as a key's echo: that lay is RECALLED once zle prints its status
-//! row and the caret rests behind it — shortened, not refused (RAINBOW-PATH-V3
-//! §8 D-13).
+//! outlives the idle ceiling. The initial search display establishes that the
+//! drawn caret is parked away from its echo row with no hand typing there.
+//! A later partial redisplay cannot claim that parked row merely by printing
+//! a key's own glyph: it stays dark, however late the continuation arrives.
+//! Established typing stays immediate. Classified navigation, shell Return or
+//! generic input boundary lets the next echo establish a new typing row.
+//! A program that silently resumes input on an unowned parked row stays dark
+//! until such a boundary (RAINBOW-PATH-V3 §8 D-13).
 
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};
@@ -365,7 +369,7 @@ const COMPOSERS: [Composer; 16] = [
     },
 ];
 
-/// The prompt `user@hostmachine0000 aterm % `: its width is the column where
+/// The prompt `owner0@hostmachine0000 aterm % `: its width is the column where
 /// the line and the match start in the python-pty takes.
 const PROMPT_COLS: u16 = 31;
 
@@ -1110,7 +1114,7 @@ fn replay(take: Take, present: Present) -> Host {
     // Scrollback above the prompt, so the prompt row is not the grid's top.
     for i in 0..take.preroll {
         h.term
-            .process(format!("user@hostmachine0000 aterm % echo {i}\r\n{i}\r\n").as_bytes());
+            .process(format!("owner0@hostmachine0000 aterm % echo {i}\r\n{i}\r\n").as_bytes());
     }
     let mut nth_out = 0usize;
     // The Ctrl-R's own redisplay places the match row: a prompt on the
@@ -1836,7 +1840,11 @@ fn every_tear(law: fn(&Host) -> Vec<String>) -> String {
             );
             let found = law(&h);
             if !found.is_empty() {
-                bad.push_str(&format!("\n{}/{host_wake}: {found:?}", take.name));
+                bad.push_str(&format!(
+                    "\n{}/{host_wake}: {found:?}\n{}",
+                    take.name,
+                    h.report(take.name)
+                ));
             }
         }
     }
@@ -1845,9 +1853,9 @@ fn every_tear(law: fn(&Host) -> Vec<String>) -> String {
 
 /// Each owner take's search reads torn at each of their piece boundaries,
 /// one at a time, everything else whole: what `law` finds, per tear, with
-/// how many tears were tried and how many recalls the ring logged.
+/// how many tears were tried and how many program-row refusals the ring logged.
 fn one_tear(law: fn(&Host) -> Vec<String>) -> (String, usize, usize) {
-    let (mut bad, mut tried, mut recalled) = (String::new(), 0, 0);
+    let (mut bad, mut tried, mut refused) = (String::new(), 0, 0);
     for take in OWNER_TAKES {
         let evs = events(take.src);
         let from = evs
@@ -1873,7 +1881,11 @@ fn one_tear(law: fn(&Host) -> Vec<String>) -> (String, usize, usize) {
                         ..APP
                     },
                 );
-                recalled += h.ring.iter().filter(|v| v.licence == "recall").count();
+                refused += h
+                    .ring
+                    .iter()
+                    .filter(|v| v.reason == CursorGlow::DECLINE_PROGRAM_ROW)
+                    .count();
                 let found = law(&h);
                 if !found.is_empty() {
                     bad.push_str(&format!(
@@ -1884,41 +1896,121 @@ fn one_tear(law: fn(&Host) -> Vec<String>) -> (String, usize, usize) {
             }
         }
     }
-    (bad, tried, recalled)
+    (bad, tried, refused)
 }
 
-/// **A PRESENT INSIDE ONE zle WRITE IS RECALLED.** A present after every
-/// piece of every redisplay: the caret visits every intermediate cell, and
-/// the frame that caught zle printing the match's own glyph at the caret is
-/// the very frame a typed echo draws, so the visible lane lays it. zle then
-/// prints its status row below and walks the caret back ON the match, left
-/// of what was laid, with no key behind the move — a glyph's echo never
-/// leaves the caret behind it — and the lay is recalled (`licence=recall`):
-/// nothing on row R outlives the last key's recall. Every local take
-/// delivered each redisplay as one read; a redisplay larger than the tty's
-/// output chunk (a long wrapped match) or a remote zsh over ssh can arrive
-/// split. RED before the recall (2026-09-30): the lays lived about 2 s on
-/// row R (`c` at (R, 31) from 161 ms to 2,208 ms in the bare take). The
-/// recall shortens the lay, it does not refuse it (RAINBOW-PATH-V3 §8 D-13).
+/// The existing retention ceiling also holds with a present after every
+/// redisplay fragment. Strict transient-ink checks below cover admission.
 #[test]
 fn torn_reads_leave_no_band_on_the_match_row() {
     let bad = every_tear(match_row_kept);
     assert!(bad.is_empty(), "band kept on the match row R:{bad}");
 }
 
-/// **ONE TORN READ, EVERY BOUNDARY, IS RECALLED.** Whatever the torn frame
-/// laid on the match row is recalled when the caret rests, and nothing on
-/// it outlives the recall. Non-vacuous: the sweep must catch a lay and
-/// recall it.
+/// Each possible single tear preserves the retention ceiling and exercises
+/// program-row refusal, rather than passing with an empty fixture.
 #[test]
 fn one_torn_read_at_any_boundary_leaves_no_band_on_the_match_row() {
-    let (bad, tried, recalled) = one_tear(match_row_kept);
+    let (bad, tried, refused) = one_tear(match_row_kept);
     assert!(tried > 100, "the sweep tried {tried} tears");
-    assert!(recalled > 0, "non-vacuity: some tear laid and was recalled");
+    assert!(refused > 0, "non-vacuity: some program rows were refused");
     assert!(
         bad.is_empty(),
         "a single torn read left band on the match row:{bad}"
     );
+}
+
+/// Any band ink on the match row, with how long each cell carried it.
+fn match_row_inked(h: &Host) -> Vec<String> {
+    let r = h.match_row();
+    h.lives
+        .iter()
+        .filter(|((row, _), _)| *row == r)
+        .map(|((_, c), l)| format!("({r},{c}) {} ms", (l.last_us - l.first_us) / 1000))
+        .collect()
+}
+
+#[test]
+fn torn_reads_lay_no_band_on_the_match_row() {
+    let bad = every_tear(match_row_inked);
+    assert!(bad.is_empty(), "band laid on the match row R:{bad}");
+    // A PTY continuation may arrive after any rest timer or press expiry.
+    // The parked row's ownership, rather than silence, must keep it dark.
+    for delay_ms in [64, 1_500, 12_000] {
+        let mut h = Host::new(24, 100, APP);
+        let row = plain_prompt(&mut h);
+        h.hint(&[0x12]);
+        h.feed(b"\r\r\nbck-i-search: _\x1b[K\x1b[A\x1b[16C");
+        h.hint(b"c");
+        h.feed(b"\x1b[4mc");
+        h.idle_ms(delay_ms);
+        h.feed(b"\x1b[24mlaude --dangerously-skip-permissions\x1b[1B\x1b[54Dc_\x1b[A\x1b[15C");
+        h.idle_ms(100);
+        assert_eq!(h.match_row(), row);
+        assert!(
+            match_row_inked(&h).is_empty(),
+            "delayed {delay_ms} ms continuation painted the match: {}",
+            h.report("delayed redisplay")
+        );
+    }
+}
+
+#[test]
+fn one_torn_read_at_any_boundary_lays_no_band_on_the_match_row() {
+    let (bad, tried, _) = one_tear(match_row_inked);
+    assert!(tried > 100, "the sweep tried {tried} tears");
+    assert!(
+        bad.is_empty(),
+        "a single torn read painted the match row:{bad}"
+    );
+}
+
+/// A footer does not displace an established typing row. After an unowned
+/// parked row is refused, a classified navigation boundary restores ordinary
+/// typing on that row; neither path waits for a rest timer.
+#[test]
+fn ordinary_typing_keeps_its_row_and_a_classified_boundary_restores_it() {
+    let mut h = Host::new(24, 100, APP);
+    let row = plain_prompt(&mut h);
+    h.feed(b"\x1b[1B\rstatus\x1b[A\x1b[4G");
+    h.hint(b"a");
+    h.feed(b"a");
+    assert_eq!(
+        live_cols(&h, row),
+        [3],
+        "first ordinary echo lights immediately"
+    );
+    h.feed(b"\x1b[1B\rstatus\x1b[A\x1b[5G");
+    h.hint(b"b");
+    h.feed(b"b");
+    assert_eq!(
+        live_cols(&h, row),
+        [3, 4],
+        "the footer keeps the hand's row"
+    );
+
+    let navigation: [fn(&mut CursorGlow, Instant); 2] =
+        [CursorGlow::note_motion, CursorGlow::note_navigation];
+    for navigate in navigation {
+        let mut h = Host::new(24, 100, APP);
+        let row = plain_prompt(&mut h);
+        h.glow.clear_typed(h.now);
+        h.feed(b"\x1b[1B\rstatus\x1b[A\x1b[4G");
+        h.hint(b"a");
+        h.feed(b"a");
+        assert!(
+            live_cols(&h, row).is_empty(),
+            "unowned parked row is ambiguous"
+        );
+        navigate(&mut h.glow, h.now);
+        h.feed(b"\x1b[C");
+        h.hint(b"b");
+        h.feed(b"b");
+        assert!(
+            live_cols(&h, row).contains(&5),
+            "navigation restores own-row typing"
+        );
+    }
 }
 
 /// **A CARET THAT RESTS RIGHT OF THE ECHO KEEPS IT** — the recall's

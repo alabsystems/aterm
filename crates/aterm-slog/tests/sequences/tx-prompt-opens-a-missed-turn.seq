@@ -1,0 +1,8 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# §2.4 source 2: a turn the screen missed is opened and closed with
+# src=transcript.
+bind 0
+tx prompt v1
+expect open t1 turn par=r1 vref=v1 src=transcript conf=exact
+tx end
+expect close t1 turn out=done by=vendor src=transcript

@@ -1,0 +1,26 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a subscriber login (`claude --subscriber`, a fake claude.ai OAuth token) at its five-hour limit (stub: limit five_hour) with a statusLine printing 'Not logged in · Run /login': Claude Code's own banner `⚠ Usage limit reached · …` and its countdown drawn ABOVE the status line, the status line right above the mode row
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ hello
+
+⏺ Hi! I am the local lab stub, not a model. (reply 29)
+
+✻ Sautéed for 0s · done 5:48 PM
+
+❯ carry on
+  ⎿  You've hit your session limit · resets 6:19pm (America/Los_Angeles)
+
+⏺ Usage limit reached · continuing automatically at 6:19pm · esc to cancel
+
+✻ Cooked for 0s · done 5:49 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⚠ Usage limit reached · limit resets 6:19pm
+    Continuing automatically at 6:19pm · esc to cancel
+  Not logged in · Run /login
+  ⏵⏵ auto mode on (shift+tab to cycle)

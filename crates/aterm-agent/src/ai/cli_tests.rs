@@ -140,6 +140,51 @@ fn the_doctor_signs_in_for_a_person_and_only_looks_for_an_agent() {
 }
 
 #[test]
+fn the_doctor_repairs_definite_unmeasured_vendor_failures_but_not_unknown_logins() {
+    let only_agy = "[ai]\npreferred = \"agy\"\n[ai.claude]\nuse = false\n[ai.codex]\nuse = false\n[ai.muse]\nuse = false\n";
+    let missing = machine(&[]);
+    let env = env_of(&missing, only_agy, &[], true);
+    let runner = FakeRunner::quiet();
+    let (code, out, _) = run_cli(&env, &runner, &["doctor"]);
+    assert_eq!(code, 1, "the stand-in did not install anything: {out}");
+    assert_eq!(runner.calls().len(), 1);
+    assert_eq!(runner.calls()[0].args, ["pkg", "install", "agy"]);
+    assert!(runner.calls()[0].terminal);
+
+    let installed = machine(&["agy"]);
+    let env = env_of(&installed, only_agy, &[], true);
+    let runner = FakeRunner::quiet();
+    let (code, out, _) = run_cli(&env, &runner, &["doctor"]);
+    assert_eq!(
+        code, 0,
+        "an unread keyring is unknown, not signed out: {out}"
+    );
+    assert!(runner.calls().is_empty());
+    env.store()
+        .expect("store")
+        .note(
+            "agy",
+            super::super::store::How::Review,
+            super::super::store::Outcome::Ended(super::super::store::Ended::ReviewAuth),
+            env.now,
+        )
+        .expect("recorded authentication failure");
+    let (_, out, _) = run_cli(&env, &runner, &["doctor"]);
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 1, "{out}");
+    assert_eq!(calls[0].program, "agy");
+    assert!(
+        calls[0].args.is_empty(),
+        "agy signs in on interactive startup"
+    );
+    assert!(calls[0].terminal);
+    assert!(
+        out.contains("nothing reads whether it worked"),
+        "no unsupported status probe: {out}"
+    );
+}
+
+#[test]
 fn the_json_names_every_cli_by_its_closed_words() {
     let b = machine(&["codex"]);
     let env = env_of(&b, ONLY_CODEX, &[], false);

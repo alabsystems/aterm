@@ -26,7 +26,9 @@ impl Scrollback {
     /// Monotonic count of lines dropped by memory-pressure eviction (the byte
     /// budget's cold-tier FIFO) or lost with a quarantined warm block: real
     /// retention loss, reported out of band (no sentinel content is injected).
-    /// `set_line_limit` truncation is intentional and not counted.
+    /// Each line counts once: the blank rows a quarantined block leaves in cold
+    /// are not counted again when the budget evicts them. `set_line_limit`
+    /// truncation is intentional and not counted.
     #[must_use]
     pub fn pressure_evicted_lines(&self) -> u64 {
         self.pressure_evicted_lines
@@ -78,7 +80,7 @@ impl Scrollback {
         );
     }
 
-    /// Saturating for the strict gate, as in [`sync_accounting`](Self::sync_accounting).
+    /// Saturating for the Trust lane, as in [`sync_accounting`](Self::sync_accounting).
     /// Test-only: only the invariant assert and the memory-tracking tests call it.
     #[cfg(test)]
     pub(crate) fn recompute_total_memory_used(&self) -> usize {
@@ -88,7 +90,7 @@ impl Scrollback {
             .saturating_add(self.cold.recompute_compressed_size())
     }
 
-    /// Saturating for the strict gate, as in [`sync_accounting`](Self::sync_accounting).
+    /// Saturating for the Trust lane, as in [`sync_accounting`](Self::sync_accounting).
     #[cfg(test)]
     pub(crate) fn recompute_budgeted_bytes(&self) -> usize {
         self.hot

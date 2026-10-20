@@ -51,12 +51,23 @@
 // false here (trust known gap `cb_n1_f1_unread_body_carries_cut_note`).
 // Measured 2026-10-17 with a stage-1 trustc of `537da4cd8c`: that check
 // build refuses the three seals, and the full build holds all three (58,933
-// bodies, 263,075 instances read). On aterm `21a2393efb` the full build
+// bodies, 263,075 instances read; again on aterm `7b43aa8d60`, 59,402 bodies
+// and 267,309 instances, with Trust main's seal check unchanged since
+// `537da4cd8c`). On aterm `21a2393efb` the full build
 // refused `cell` at one newer statement: the session journal's `list`, then a
 // provided method of `JournalFs`, called `scan` at its own `Self` with a
 // `&mut dyn FnMut`, which the check took to hold a cell; `list` is now a fn
 // of `&dyn JournalFs` (session_log_journal_fs.rs), whose `scan` is read
-// where each `dyn` is made.
+// where each `dyn` is made. Measured 2026-10-19 on aterm `ee3e477883`, with a
+// stage-1 trustc built from trust `269edd02c3`'s tree (it contains
+// `537da4cd8c`): `stamp` and `source` hold, and the full build refused `cell`
+// at one newer statement, `App::on_pill_act` (app_presence.rs, 49f7582226,
+// the pill's `+N`) running `aterm_messages`' provided
+// `Desk::next_need_after` at `&App`. It reads the table through `Desk`'s
+// getters and is handed no `&mut`, so `cell`'s `trusts` names it; the build
+// with that entry was not measured here (this Mac's two build slots stayed
+// held by other lanes), so re-run the full-build dry run before citing
+// "the seals hold" on this tree.
 //
 // WHAT IT DOES NOT SAY: that `config.harness`, the mirror Settings reads, is
 // written nowhere else (`adopt_harness_policy` and the config lane copy the
@@ -67,9 +78,10 @@
 // `config_watcher::spawn` would mint from 1 again, and the join would drop its
 // posts until they passed the first watcher's: one call site today, in
 // `main_entry`). And a seal is a claim about safe code of THIS crate, on the
-// word of its `trusts` list for the fns of other crates named there. At
-// `ebfd92f24d` Trust's `docs/USING_TRUST.md` lists 22 KNOWN GAPS of the
-// check, recorded and not fixed, 8 of them false passes (the seal holds and
+// word of its `trusts` list for the fns of other crates named there. On
+// Trust main, `docs/USING_TRUST.md` lists 24 KNOWN GAPS of the check (review
+// 6's 22 at `ebfd92f24d`, and two false notes the check-build fix's review
+// found), recorded and not fixed, 8 of them false passes (the seal holds and
 // code of the crate puts one holder's value over another's). Its reading of
 // generic code is where Trust says a seal is weakest: a seal that holds is
 // evidence, not a proof.
@@ -98,6 +110,10 @@ clean {
          "presence::drive::deadline", "presence::drive::tick",
          "presence::drive::chrome_line", "presence::drive::status_tail",
          "presence::drive::tell",
+         -- `Desk`'s provided `next_need_after`, which the pill's `+N` runs
+         -- at `&App` (`App::on_pill_act`): it reads the table through
+         -- `Desk`'s getters and is handed no `&mut`.
+         "presence::drive::Desk::next_need_after",
          -- An `unsafe impl` of another crate's trait, other than an auto
          -- trait (`Send`, `Sync`), is the crate's word to that crate's
          -- `unsafe` code, whatever it is for, so each seal answers for it. This one is `aterm_objc`'s: the window's Objective-C

@@ -30,7 +30,8 @@
 //!
 //! A soft additive halo around the cursor cell (three stacked discs, premul coverage capped at
 //! [`COV_CAP`]) and a warm tint on the block body, both ramping amber → gold → white-hot (deep
-//! orange on a light theme, since white sinks into paper). Everything is quantised to `u8`, so
+//! orange on a light theme, since white sinks into paper). On a light theme the halo is a round
+//! warm ink under the letters instead, inside the caret's row, solved against the theme's text. Everything is quantised to `u8`, so
 //! the fingerprint settles and the lane releases once the light stops changing, even while the
 //! value is still > 0. The halo is in window px (`Geom::cell_center` + `push_fx_rect`), the
 //! `cursor_glow_add` stream's contract: the renderer adds no offset, so a grid-relative centre
@@ -134,6 +135,10 @@ pub struct MomentumGlowConfig {
     /// The resolved cursor colour `0x00RRGGBB` — what the tint is built from.
     pub base: u32,
     pub dark_theme: bool,
+    /// The theme's text and paper, which a light ground's glow solves its
+    /// ink against.
+    pub theme_fg: u32,
+    pub theme_bg: u32,
     /// Whether the cursor is a block (the body tint applies); bar/underline get the halo only.
     pub block: bool,
 }
@@ -205,7 +210,9 @@ impl MomentumGlow {
     }
 
     /// One frame. Pushes additive quads into `out` (the host's aurora
-    /// scratch) and returns the fill / blink verdict / fingerprint.
+    /// scratch) on a dark ground, the glow's ink into `under` (the under-ink
+    /// stream) on a light one, and returns the fill / blink verdict /
+    /// fingerprint.
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -213,6 +220,7 @@ impl MomentumGlow {
         geom: Geom,
         cfg: &MomentumGlowConfig,
         out: &mut Vec<GlowQuad>,
+        under: &mut Vec<GlowQuad>,
     ) -> MomentumGlowFrame {
         let raw = self.rate.value(now, cfg.tau_s);
         let a = if cfg.intensity.is_finite() {
@@ -251,9 +259,27 @@ impl MomentumGlow {
             [(1.00, 0.40, 0.0), (0.70, 0.70, 0.35), (0.42, 1.00, 0.7)];
         let cov_core = (COV_CAP * a).min(COV_CAP);
         let slab = ((ch * 0.125) as i32).max(2);
-        // The halo is additive light: on a light ground it cannot show on the
-        // paper and would only bleach the letters and the trail's ink around
-        // the caret, so there the warm caret is the whole glow.
+        // A LIGHT GROUND: additive light cannot show on the paper, so the
+        // glow is a round warm ink under the letters around the caret, inside
+        // its row, its ink solved against the theme's text, swelling and
+        // deepening with the typing rate as the dark halo brightens.
+        if !cfg.dark_theme {
+            use crate::cursor_glow::{LIGHT_BODY_ALPHA_CAP, light_body_ink, push_ink_ellipse};
+            let ink = light_body_ink(tint, cfg.theme_fg, cfg.theme_bg, LIGHT_BODY_ALPHA_CAP as u8);
+            let budget = under
+                .len()
+                .saturating_add(crate::cursor_glow::LIGHT_MARK_QUADS);
+            push_ink_ellipse(
+                under,
+                geom,
+                (cx, cy),
+                rx_full,
+                ry_full,
+                ink,
+                LIGHT_BODY_ALPHA_CAP * 0.85 * a,
+                budget,
+            );
+        }
         let discs: &[(f32, f32, f32)] = if cfg.dark_theme { &discs } else { &[] };
         for &(scale, cov_x, warm) in discs {
             let (rx, ry) = (rx_full * scale, ry_full * scale);
@@ -368,6 +394,8 @@ mod tests {
             radius_cells: MOMENTUM_GLOW_RADIUS_CELLS,
             base,
             dark_theme: dark,
+            theme_fg: if dark { 0x00C8_C8D2 } else { 0x0024_292F },
+            theme_bg: if dark { 0x0010_1016 } else { 0x00FF_FFFF },
             block: true,
         }
     }
@@ -391,7 +419,7 @@ mod tests {
 
         // Positive control at full intensity: drawn, and a deadline asked for.
         out.clear();
-        let full = glow.tick(Some((1, 1)), last, geom(), &cfg, &mut out);
+        let full = glow.tick(Some((1, 1)), last, geom(), &cfg, &mut out, &mut Vec::new());
         assert!(full.hot, "fixture: at intensity 1 it is on glass");
         assert!(
             glow.next_change_deadline(last, &cfg).is_some(),
@@ -402,7 +430,7 @@ mod tests {
         // load-shed envelope produces.
         cfg.intensity = MOMENTUM_GLOW_HOT / glow.rate.value(last, cfg.tau_s) * 0.5;
         out.clear();
-        let dim = glow.tick(Some((1, 1)), last, geom(), &cfg, &mut out);
+        let dim = glow.tick(Some((1, 1)), last, geom(), &cfg, &mut out, &mut Vec::new());
         assert!(
             !dim.hot && out.is_empty(),
             "fixture: scaled below the floor the effect is inert"
@@ -493,11 +521,25 @@ mod tests {
         let mut g = MomentumGlow::default();
         let mut out = Vec::new();
         assert!(
-            !g.tick(Some((3, 3)), t0, geom(), &on(0x00A0_A0A0, true), &mut out)
-                .hot
+            !g.tick(
+                Some((3, 3)),
+                t0,
+                geom(),
+                &on(0x00A0_A0A0, true),
+                &mut out,
+                &mut Vec::new()
+            )
+            .hot
         );
         g.on_key(t0, TAU);
-        let f = g.tick(Some((3, 3)), t0, geom(), &on(0x00A0_A0A0, true), &mut out);
+        let f = g.tick(
+            Some((3, 3)),
+            t0,
+            geom(),
+            &on(0x00A0_A0A0, true),
+            &mut out,
+            &mut Vec::new(),
+        );
         assert!(f.hot, "one key makes the cursor hot");
         assert!(f.fill.is_some(), "a hot block carries the tint");
         assert!(!out.is_empty(), "and a halo is on glass");
@@ -509,6 +551,7 @@ mod tests {
             geom(),
             &on(0x00A0_A0A0, true),
             &mut out,
+            &mut Vec::new(),
         );
         assert!(
             !f.hot && f.fill.is_none() && f.fp == 0,
@@ -543,7 +586,7 @@ mod tests {
         let mut cfg = on(0x00FF_FFFF, true);
         cfg.intensity = f32::NAN;
         let mut out = Vec::new();
-        let f = g.tick(Some((1, 1)), t, geom(), &cfg, &mut out);
+        let f = g.tick(Some((1, 1)), t, geom(), &cfg, &mut out, &mut Vec::new());
         assert_eq!(f, MomentumGlowFrame::default());
         assert!(out.is_empty());
     }
@@ -571,10 +614,24 @@ mod tests {
         for k in 0..240u64 {
             let t = end + Duration::from_millis(16 * k);
             out_a.clear();
-            fa = a.tick(Some((2, 2)), t, geom(), &on(0x0080_80FF, true), &mut out_a);
+            fa = a.tick(
+                Some((2, 2)),
+                t,
+                geom(),
+                &on(0x0080_80FF, true),
+                &mut out_a,
+                &mut Vec::new(),
+            );
             if k % 8 == 0 {
                 out_b.clear();
-                fb = b.tick(Some((2, 2)), t, geom(), &on(0x0080_80FF, true), &mut out_b);
+                fb = b.tick(
+                    Some((2, 2)),
+                    t,
+                    geom(),
+                    &on(0x0080_80FF, true),
+                    &mut out_b,
+                    &mut Vec::new(),
+                );
                 assert_eq!(
                     fa, fb,
                     "sampling cadence must not change the value at a shared instant"
@@ -608,21 +665,35 @@ mod tests {
         let mut off = on(0x00FF_FFFF, true);
         off.enabled = false;
         assert_eq!(
-            g.tick(Some((1, 1)), t0, geom(), &off, &mut out),
+            g.tick(Some((1, 1)), t0, geom(), &off, &mut out, &mut Vec::new()),
             MomentumGlowFrame::default()
         );
         let mut zero = on(0x00FF_FFFF, true);
         zero.intensity = 0.0;
         assert_eq!(
-            g.tick(Some((1, 1)), t0, geom(), &zero, &mut out),
+            g.tick(Some((1, 1)), t0, geom(), &zero, &mut out, &mut Vec::new()),
             MomentumGlowFrame::default()
         );
         assert_eq!(
-            g.tick(None, t0, geom(), &on(0x00FF_FFFF, true), &mut out),
+            g.tick(
+                None,
+                t0,
+                geom(),
+                &on(0x00FF_FFFF, true),
+                &mut out,
+                &mut Vec::new()
+            ),
             MomentumGlowFrame::default()
         );
         assert_eq!(
-            g.tick(Some((99, 1)), t0, geom(), &on(0x00FF_FFFF, true), &mut out),
+            g.tick(
+                Some((99, 1)),
+                t0,
+                geom(),
+                &on(0x00FF_FFFF, true),
+                &mut out,
+                &mut Vec::new()
+            ),
             MomentumGlowFrame::default()
         );
         assert_eq!(out, sentinel, "an inert tick touches nothing");
@@ -640,7 +711,14 @@ mod tests {
             g.on_key(t0, TAU);
         }
         let mut out = Vec::new();
-        let f = g.tick(Some((10, 40)), t0, g0, &on(0x00FF_FFFF, true), &mut out);
+        let f = g.tick(
+            Some((10, 40)),
+            t0,
+            g0,
+            &on(0x00FF_FFFF, true),
+            &mut out,
+            &mut Vec::new(),
+        );
         assert!(f.hot && !out.is_empty());
         let cx = (40.0 + 0.5) * g0.cw as f32;
         let reach = g0.cw as f32 * (0.55 + MOMENTUM_GLOW_RADIUS_CELLS) + 1.0;
@@ -695,7 +773,14 @@ mod tests {
             g.on_key(t0, TAU);
         }
         let mut out = Vec::new();
-        let f = g.tick(Some((cr, cc)), t0, real, &on(0x00FF_FFFF, true), &mut out);
+        let f = g.tick(
+            Some((cr, cc)),
+            t0,
+            real,
+            &on(0x00FF_FFFF, true),
+            &mut out,
+            &mut Vec::new(),
+        );
         assert!(f.hot && !out.is_empty());
         // The caret cell in window px, from the one anchor every emitter shares.
         let (cell_x0, cell_y0) = (
@@ -742,10 +827,10 @@ mod tests {
         g.on_key(t0, TAU);
         let mut out = Vec::new();
         let cfg = on(0x0010_2030, true);
-        let f1 = g.tick(Some((1, 1)), t0, geom(), &cfg, &mut out);
+        let f1 = g.tick(Some((1, 1)), t0, geom(), &cfg, &mut out, &mut Vec::new());
         assert!(f1.hot);
         // Same instant twice: the fingerprint repeats, so the lane releases…
-        let f2 = g.tick(Some((1, 1)), t0, geom(), &cfg, &mut out);
+        let f2 = g.tick(Some((1, 1)), t0, geom(), &cfg, &mut out, &mut Vec::new());
         assert_eq!(f1.fp, f2.fp);
         assert!(!g.is_active(), "an unchanged frame must not hold the lane");
         assert!(
@@ -759,6 +844,7 @@ mod tests {
             geom(),
             &cfg,
             &mut out,
+            &mut Vec::new(),
         );
         assert_ne!(f3.fp, f2.fp);
         assert!(g.is_active());

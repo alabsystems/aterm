@@ -2,94 +2,439 @@
 // Copyright 2026 Andrew Yates
 
 //! FONT-DISPLAY conformance: every bundled display face is a real, parseable
-//! font, and the `display:` virtual-family scheme resolves identically through
-//! BOTH resolution paths (startup construction and the off-thread catalog).
+//! font; a display face is a LAYER over the person's font, never the font
+//! itself, so it never changes the grid; and every glyph it draws is whole
+//! inside the primary's cell.
 
 use aterm_render::{
-    DISPLAY_FACE_MIX_MAX, DISPLAY_FACE_SCHEME, DISPLAY_FACES, Renderer, Theme, display_face_bytes,
-    display_face_canonical_id, display_face_fit, display_face_for_family,
-    display_face_mix_for_family,
+    DISPLAY_FACE_MIX_MAX, DISPLAY_FACE_SCHEME, DISPLAY_FACES, FaceId, Renderer, Theme,
+    display_face_bytes, display_face_canonical_id, display_face_fit, display_face_ids_for_family,
+    display_face_mix_for_family, display_face_scale, display_layer_ids, display_mix_face_index,
 };
 
-/// FONT-DISPLAY-FIT, the invariant the whole fit exists to guarantee: NO glyph a
-/// FITTED display face can draw is wider than the cell it renders into.
-///
-/// Violating it is not a cosmetic problem — an overrunning glyph paints over its
-/// NEIGHBOUR, which is how `pixel` came out as "m ncraft" in Luckiest Guy
-/// (cell from `M` at 0.79 em, `m` drawn at 0.91 em, the `i` buried in the ink).
-/// The cell is still that `M` cell; the `m` is squeezed into it.
-///
-/// Scoped to fitted faces on purpose. An UNFITTED face is one this policy
-/// promises to leave exactly as it found it, and Monocraft — which has been
-/// rendering happily all along — draws `#` a pixel past its advance by design.
-/// Holding it to this invariant would mean changing the one face that was
-/// already right, which is precisely what the fit must not do.
-#[test]
-fn no_fitted_display_glyph_can_overrun_its_cell() {
-    for font in DISPLAY_FACES {
-        let bytes = display_face_bytes(font.id).expect("registry id resolves");
-        if !display_face_fit(bytes).is_some_and(|fit| fit.proportional) {
-            continue;
+/// Every single face and every 2- and 3-face mix of the registry, in every
+/// order: the layers a person can switch on.
+fn every_layer() -> Vec<Vec<&'static str>> {
+    let ids: Vec<&'static str> = DISPLAY_FACES.iter().map(|face| face.id).collect();
+    let mut layers = Vec::new();
+    for &a in &ids {
+        layers.push(vec![a]);
+        for &b in ids.iter().filter(|&&b| b != a) {
+            layers.push(vec![a, b]);
+            for &c in ids.iter().filter(|&&c| c != a && c != b) {
+                layers.push(vec![a, b, c]);
+            }
         }
-        // Several sizes: the fit is an em fraction, the cell an integer, so the
-        // rounding is only provably safe if it is checked across sizes.
-        for px in [12.0_f32, 14.0, 16.0, 20.0, 28.0] {
-            let mut renderer = Renderer::from_bytes(bytes, px, Theme::default())
-                .unwrap_or_else(|e| panic!("{}: {e}", font.id));
-            let (cell_w, _) = renderer.cell_size();
-            for ch in '!'..='~' {
-                let key = renderer.glyph_key(ch);
-                // Only glyphs the DISPLAY FACE serves. A code point it does not
-                // cover falls through the ordinary fallback cascade by design —
-                // that is the "never tofu" promise — and such a glyph is placed
-                // by the fallback pipeline's own centring, not by the fit.
-                if !matches!(
-                    key.source,
-                    aterm_render::FaceId::Primary | aterm_render::FaceId::DisplayMix
-                ) {
-                    continue;
-                }
-                let img = renderer.glyph_image(key);
-                let right = img.xmin() + img.width() as i32;
-                assert!(
-                    right <= cell_w as i32,
-                    "{} at {px}px: {ch:?} ends at {right} past the {cell_w}px cell \
-                     — it would paint over the next character",
-                    font.id
-                );
-                assert!(
-                    img.xmin() >= 0,
-                    "{} at {px}px: {ch:?} starts left of its cell (xmin {})",
-                    font.id,
-                    img.xmin()
+    }
+    layers
+}
+
+/// The primaries the layer is drawn over: the embedded DejaVu Sans Mono and
+/// the bundled Iosevka Term, whose cells differ (Iosevka's is narrower and
+/// shorter), so a fit that only works in one cell fails here.
+fn primaries() -> Vec<(&'static str, &'static [u8])> {
+    let mut faces = Vec::new();
+    #[cfg(feature = "embedded-font")]
+    faces.push(("DejaVu Sans Mono", aterm_render::embedded_font()));
+    if let Some(iosevka) = aterm_render::bundled::face_for_id(aterm_render::bundled::IOSEVKA_ID) {
+        faces.push(("Iosevka Term", iosevka));
+    }
+    assert!(
+        !faces.is_empty(),
+        "no primary face compiled into this build"
+    );
+    faces
+}
+
+fn layered(primary: &[u8], ids: &[&str], px: f32) -> Renderer {
+    let mut renderer = Renderer::from_bytes(primary, px, Theme::default()).expect("primary face");
+    renderer
+        .set_display_faces(ids)
+        .expect("a bundled display face installs");
+    renderer
+}
+
+/// THE GRID IS THE PERSON'S FONT'S. A display face is a layer over the
+/// primary, so turning one on — or mixing two or three, in either order —
+/// leaves the cell and baseline exactly the bare primary's: no column and no
+/// row is ever lost to a face. The layer replaced a design that made the
+/// first face of a mix the primary, which gave each face its own `M` cell
+/// (Engraved 11 px wide against SF Mono's 7, a third of the columns gone) and
+/// made "engraved+pixel" and "pixel+engraved" two different grids.
+#[test]
+fn a_display_face_never_changes_the_grid() {
+    for (name, primary) in primaries() {
+        for px in [12.0_f32, 16.0, 24.0] {
+            let bare = Renderer::from_bytes(primary, px, Theme::default()).unwrap();
+            let want = (bare.cell_size(), bare.baseline());
+            for ids in every_layer() {
+                let renderer = layered(primary, &ids, px);
+                assert_eq!(
+                    (renderer.cell_size(), renderer.baseline()),
+                    want,
+                    "{ids:?} over {name} at {px}px changed the grid"
                 );
             }
         }
     }
 }
 
-/// The monospaced bundled face takes the IDENTITY fit. Monocraft (`pixel`) was
-/// already correct in a fixed grid — the policy must not touch its glyphs, its
-/// cell, or its weight, so the face the user likes cannot regress.
+/// One set of faces draws ONE way: the layer is kept in registry order, so
+/// the order the switches were turned on in changes neither which face a
+/// letter takes nor the glyph it draws.
 #[test]
-fn the_monospaced_display_face_is_left_exactly_alone() {
+fn the_order_faces_were_switched_on_in_changes_nothing() {
+    let (_, primary) = primaries()[0];
+    for ids in every_layer() {
+        let mut sorted = ids.clone();
+        sorted.sort_by_key(|id| DISPLAY_FACES.iter().position(|face| face.id == *id));
+        let mut written = layered(primary, &ids, 16.0);
+        let mut canonical = layered(primary, &sorted, 16.0);
+        assert_eq!(written.display_faces(), sorted, "{ids:?}");
+        assert_eq!(display_layer_ids(ids.iter().copied()), sorted);
+        for ch in '!'..='~' {
+            let (a, b) = (written.glyph_key(ch), canonical.glyph_key(ch));
+            assert_eq!(a, b, "{ids:?}: {ch:?} routes alike");
+            let (a, b) = (
+                raster(written.glyph_image(a)),
+                raster(canonical.glyph_image(b)),
+            );
+            assert_eq!(a, b, "{ids:?}: {ch:?} draws alike");
+        }
+    }
+}
+
+/// THE INVARIANT THE FIT EXISTS FOR: every glyph the layer draws is WHOLE and
+/// inside its cell — never wider than the cell (it would paint over its
+/// neighbour: "minecraft" drew as "m ncraft"), never above the cell's top
+/// (the first row's ink was cut at the window edge and under a pane header)
+/// and never below its floor — and never cut to get there: its ink is as tall
+/// as the face draws it at the fitted size. The mix used to run its extra
+/// faces through the fallback pipeline, which scaled them by x-height and then
+/// deleted the rows past the cell, so chunky+pixel+engraved read "CARGO.IOmL"
+/// (the T's crossbar gone) and "BULD".
+///
+/// Every layer, over two primaries, across sizes and two line heights, for
+/// printable ASCII and accented capitals the ASCII measure does not cover.
+#[test]
+fn every_display_glyph_is_drawn_whole_inside_its_cell() {
+    let mut owners = std::collections::HashMap::new();
+    let mut own_rows = std::collections::HashMap::new();
+    for (name, primary) in primaries() {
+        for line_height in [1.0_f32, 0.8] {
+            for px in [12.0_f32, 14.0, 20.0, 48.0] {
+                for ids in every_layer() {
+                    let mut renderer = layered(primary, &ids, px);
+                    renderer.set_line_height(line_height);
+                    let (cell_w, cell_h) = renderer.cell_size();
+                    let baseline = renderer.baseline();
+                    let at = || format!("{ids:?} over {name} at {px}px, line height {line_height}");
+                    for ch in ('!'..='~').chain("ÁÉÖÅÇÿ".chars()) {
+                        let key = renderer.glyph_key(ch);
+                        if key.source != FaceId::DisplayMix {
+                            continue;
+                        }
+                        let img = renderer.glyph_image(key).clone();
+                        if img.width() == 0 || img.height() == 0 {
+                            continue;
+                        }
+                        let top = baseline - (img.height() as i32 + img.ymin());
+                        assert!(
+                            img.xmin() >= 0 && img.xmin() + img.width() as i32 <= cell_w as i32,
+                            "{}: {ch:?} spans {}..{} outside the {cell_w}px cell",
+                            at(),
+                            img.xmin(),
+                            img.xmin() + img.width() as i32
+                        );
+                        assert!(
+                            top >= 0 && top + img.height() as i32 <= cell_h as i32,
+                            "{}: {ch:?} spans rows {top}..{} outside the {cell_h}px cell",
+                            at(),
+                            top + img.height() as i32
+                        );
+                        if !ch.is_ascii() {
+                            continue;
+                        }
+                        // Whole: as tall as the face draws it at its fitted
+                        // size (one pixel of rasterizer rounding either way).
+                        let id = ids
+                            .iter()
+                            .copied()
+                            .find(|id| renderer_face_of(&renderer, ch) == *id)
+                            .expect("the drawing face is in the layer");
+                        let bytes = display_face_bytes(id).unwrap();
+                        let fit = display_face_fit(bytes).unwrap();
+                        let scale = display_face_scale(&fit, px, cell_w, cell_h);
+                        // The face's own raster at that size, by the same
+                        // rasterizer: the face drawn as a primary.
+                        let authored = *own_rows
+                            .entry((id, (px * scale).to_bits(), ch))
+                            .or_insert_with(|| {
+                                let own = owners
+                                    .entry((id, (px * scale).to_bits()))
+                                    .or_insert_with(|| {
+                                        Renderer::from_bytes(bytes, px * scale, Theme::default())
+                                            .expect("the face draws on its own")
+                                    });
+                                let own_key = own.glyph_key(ch);
+                                let own_img = own.glyph_image(own_key);
+                                ink_rows(own_img.width(), own_img.bytes()) as i32
+                            });
+                        assert!(
+                            ink_rows(img.width(), img.bytes()) as i32 >= authored - 1,
+                            "{}: {ch:?} from {id} is {} rows, the face draws {authored} — cut",
+                            at(),
+                            img.height()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A glyph raster as comparable facts: its box, placement and coverage.
+fn raster(img: &aterm_render::GlyphImage) -> (usize, usize, i32, i32, Vec<u8>) {
+    (
+        img.width(),
+        img.height(),
+        img.xmin(),
+        img.ymin(),
+        img.bytes().to_vec(),
+    )
+}
+
+/// The rows of a coverage mask `width` wide that carry ink.
+fn ink_rows(width: usize, coverage: &[u8]) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    let rows: Vec<bool> = coverage
+        .chunks_exact(width)
+        .map(|row| row.iter().any(|&a| a > 0))
+        .collect();
+    match (
+        rows.iter().position(|&ink| ink),
+        rows.iter().rposition(|&ink| ink),
+    ) {
+        (Some(first), Some(last)) => last + 1 - first,
+        _ => 0,
+    }
+}
+
+/// Which layer face draws `ch` (the pick the renderer makes).
+fn renderer_face_of(renderer: &Renderer, ch: char) -> &'static str {
+    let faces = renderer.display_faces();
+    faces[display_mix_face_index(ch, faces.len())]
+}
+
+/// The fit does not buy containment by drawing letters small: the scale is
+/// set by a typical letter (the median advance) and the ink band, never by
+/// the widest glyph (Cinzel's `Q` tail at 1.27 em would have drawn every
+/// letter at half size), so over either primary — Iosevka Term's cell is a
+/// narrow 0.5 em — a face keeps at least 0.7 of the size asked for. Taller
+/// marks move rather than shrink the face, and deep descenders raise the
+/// layer's line instead (`a_deep_descender_raises_the_line_instead_of_shrinking_the_face`).
+#[test]
+fn a_display_face_keeps_most_of_its_size() {
+    for (name, primary) in primaries() {
+        for px in [12.0_f32, 16.0, 24.0] {
+            let bare = Renderer::from_bytes(primary, px, Theme::default()).unwrap();
+            let (cell_w, cell_h) = bare.cell_size();
+            for font in DISPLAY_FACES {
+                let fit = display_face_fit(display_face_bytes(font.id).unwrap()).unwrap();
+                let scale = display_face_scale(&fit, px, cell_w, cell_h);
+                assert!(
+                    (0.7..=1.0).contains(&scale),
+                    "{} over {name} at {px}px is drawn at {scale:.2} of its size",
+                    font.id
+                );
+            }
+        }
+    }
+}
+
+/// The scale is the largest that fits: a roomier cell never shrinks a face,
+/// the result never exceeds 1, and a degenerate cell still draws something.
+#[test]
+fn the_display_scale_is_monotone_and_bounded() {
+    let fit = display_face_fit(display_face_bytes("chunky").unwrap()).unwrap();
+    let tight = display_face_scale(&fit, 16.0, 8, 12);
+    let roomy = display_face_scale(&fit, 16.0, 12, 24);
+    assert!(tight <= roomy && roomy <= 1.0, "{tight} {roomy}");
+    assert_eq!(display_face_scale(&fit, 16.0, 1, 1), 0.25);
+    assert_eq!(display_face_scale(&fit, f32::NAN, 8, 16), 1.0);
+}
+
+/// A DEEP DESCENDER RAISES THE LINE INSTEAD OF SHRINKING THE FACE: Chewy's
+/// `g` sinks 0.30 em, past DejaVu Sans Mono's 0.24 em descent, while the cell
+/// has room to spare above. The layer stands on a line raised just enough —
+/// the primary's own baseline when the face fits there — so Bubble keeps its
+/// full size, and every face of a mix stands on that one line.
+#[cfg(feature = "embedded-font")]
+#[test]
+fn a_deep_descender_raises_the_line_instead_of_shrinking_the_face() {
+    let primary = aterm_render::embedded_font();
+    let bare = Renderer::from_bytes(primary, 48.0, Theme::default()).unwrap();
+    let (cell_w, cell_h) = bare.cell_size();
+    let fit = |id: &str| display_face_fit(display_face_bytes(id).unwrap()).unwrap();
+    let (bubble, chunky) = (fit("bubble"), fit("chunky"));
+    assert_eq!(display_face_scale(&bubble, 48.0, cell_w, cell_h), 1.0);
+    let line = aterm_render::display_layer_baseline(
+        &[bubble],
+        None,
+        48.0,
+        cell_w,
+        cell_h,
+        bare.baseline(),
+    );
+    assert!(line < bare.baseline(), "the line rises for Chewy's `g`");
+    let alone = aterm_render::display_layer_baseline(
+        &[chunky],
+        None,
+        48.0,
+        cell_w,
+        cell_h,
+        bare.baseline(),
+    );
+    assert_eq!(
+        alone,
+        bare.baseline(),
+        "a face that fits keeps the primary's line"
+    );
+    let mixed = aterm_render::display_layer_baseline(
+        &[chunky, bubble],
+        None,
+        48.0,
+        cell_w,
+        cell_h,
+        bare.baseline(),
+    );
+    assert_eq!(mixed, line, "a mix stands on one line");
+    // And the drawn letters agree: every face's `n` stands on that line.
+    let mut renderer = layered(primary, &["bubble", "chunky"], 48.0);
+    let mut floors = std::collections::BTreeSet::new();
+    for ch in ('a'..='z').filter(|ch| "acemnorsuvwxz".contains(*ch)) {
+        let key = renderer.glyph_key(ch);
+        let img = renderer.glyph_image(key);
+        // A letter without a descender sits on the line (`ymin` is its
+        // bottom; a round letter's overshoot and rounding within two pixels,
+        // where a face on its own line would be four off).
+        floors.insert(img.ymin() - (bare.baseline() - line));
+    }
+    assert!(
+        floors.iter().all(|&floor| (-2..=1).contains(&floor)),
+        "letters stand on the raised line: {floors:?}"
+    );
+}
+
+/// A FIRST ROW DRAWN UNDER ANYTHING KEEPS ITS INK: Luckiest Guy's backtick
+/// rises 0.93 em over its 0.70 em ascent, so drawn as the primary it inked
+/// above its own cell — into the 2 px window padding, cut at the frame edge,
+/// and under a split pane's header. In the layer the same face's ink stays in
+/// the row: every row of a frame draws identically, the first one included.
+#[cfg(feature = "embedded-font")]
+#[test]
+fn a_first_row_draws_exactly_like_the_rows_below_it() {
+    let text = "`$ LS \"Q\" {J}";
+    let mut renderer = layered(aterm_render::embedded_font(), &["chunky"], 48.0);
+    let cols = text.chars().count();
+    let mut terminal = aterm_core::terminal::Terminal::new(4, cols as u16);
+    terminal.process(format!("\x1b[?25l{text}\r\n\r\n\r\n{text}").as_bytes());
+    let mut input = terminal.cell_frame(4, cols);
+    input.cursor_visible = false;
+    let frame = renderer.render_input(&input);
+    let (_, cell_h) = renderer.cell_size();
+    let width = frame.width;
+    let row = |r: usize| -> Vec<u32> {
+        let y0 = renderer.pad_top() + r * cell_h;
+        (y0..y0 + cell_h)
+            .flat_map(|y| frame.pixels[y * width..(y + 1) * width].to_vec())
+            .collect()
+    };
+    assert_eq!(row(0), row(3), "row 0 lost ink row 3 keeps");
+}
+
+/// THE CHROME IS THE PERSON'S FONT: Settings' code text, the palette and the
+/// Manual editor take their face from the terminal's primary
+/// (`chrome_primary_face`). With the display face as the primary that face was
+/// Cinzel, which the chrome refused, so it fell back to the embedded DejaVu —
+/// a face nobody chose. As a layer the face never reaches the primary.
+#[test]
+fn the_chrome_face_is_the_primary_under_a_display_layer() {
+    let plain = Renderer::from_system(16.0, Theme::default()).expect("a system font");
+    let mut layered = Renderer::from_system(16.0, Theme::default()).expect("a system font");
+    layered.set_display_faces(&["engraved"]).unwrap();
+    let face = |r: &Renderer| {
+        r.chrome_primary_face()
+            .map(|(bytes, index)| (bytes.to_vec(), index))
+    };
+    assert_eq!(face(&layered), face(&plain));
+    let engraved = display_face_bytes("engraved").unwrap();
+    assert!(face(&layered).is_some_and(|(bytes, _)| bytes != engraved));
+}
+
+/// A layer cell is not the primary's to shape: a primary with programming
+/// ligatures (Iosevka Term) ligates `=>` bare, and under the layer the
+/// letters the layer draws stay per-cell, so a primary ligature never
+/// replaces display-face letters.
+#[test]
+fn a_display_cell_is_never_ligated_by_the_primary() {
+    let Some(iosevka) = aterm_render::bundled::face_for_id(aterm_render::bundled::IOSEVKA_ID)
+    else {
+        return;
+    };
+    let text = "a => b";
+    let mut terminal = aterm_core::terminal::Terminal::new(1, text.len() as u16);
+    terminal.process(format!("\x1b[?25l{text}").as_bytes());
+    let input = terminal.cell_frame(1, text.len());
+    let plan = |renderer: &mut Renderer| {
+        let mut plan = Vec::new();
+        renderer.row_glyph_plan(&input, 0, &[], &mut plan);
+        plan
+    };
+    let mut bare = Renderer::from_bytes(iosevka, 16.0, Theme::default()).unwrap();
+    assert!(
+        plan(&mut bare)
+            .iter()
+            .any(|glyph| !matches!(glyph, aterm_render::ColumnGlyph::PerCell)),
+        "Iosevka Term ligates `=>`, or this test cannot fail"
+    );
+    let mut layer = layered(iosevka, &["pixel"], 16.0);
+    for (col, glyph) in plan(&mut layer).iter().enumerate() {
+        let ch = text.as_bytes()[col] as char;
+        if layer.glyph_key(ch).source == FaceId::DisplayMix {
+            assert!(
+                matches!(glyph, aterm_render::ColumnGlyph::PerCell),
+                "{ch:?} is the layer's, yet the primary shaped it"
+            );
+        }
+    }
+}
+
+/// The monospaced bundled face (Monocraft, `pixel`) is not centred by its ink
+/// and takes no weight boost: its own bearings and weight are kept.
+#[test]
+fn the_monospaced_display_face_keeps_its_bearings_and_weight() {
     let fit =
         display_face_fit(display_face_bytes("pixel").unwrap()).expect("bundled face has a fit");
-    assert!(!fit.proportional, "no squeeze or centring");
+    assert!(!fit.proportional, "the advance is centred, not the ink");
     assert!(!fit.embolden, "no weight change");
 }
 
-/// A face that is NOT bundled never gets re-fitted: the policy keys off the
-/// registry bytes, so a user's own proportional font keeps the historical
-/// `M`-advance cell and their existing config keeps rendering as it did.
-#[cfg(feature = "embedded-font")]
+/// A face that is NOT bundled is never a display face: the fit keys off the
+/// registry bytes, and the layer takes registry ids only, so a person's own
+/// font is the primary and draws as itself.
 #[test]
-fn a_non_bundled_face_is_never_fitted() {
-    let dejavu = aterm_render::embedded_font();
+fn only_a_bundled_face_is_ever_a_display_face() {
+    #[cfg(feature = "embedded-font")]
     assert!(
-        display_face_fit(dejavu).is_none(),
+        display_face_fit(aterm_render::embedded_font()).is_none(),
         "the embedded fallback face is not a display face and must not be fitted"
     );
+    let (_, primary) = primaries()[0];
+    let renderer = layered(primary, &["Menlo", "doom", "mariokart"], 16.0);
+    assert!(renderer.display_faces().is_empty());
 }
 
 /// The proportional faces really do take the fit — a guard against the whole
@@ -100,93 +445,11 @@ fn proportional_display_faces_are_fitted() {
     for id in ["chunky", "engraved", "bubble"] {
         let fit = display_face_fit(display_face_bytes(id).unwrap()).expect("bundled");
         assert!(fit.proportional, "{id} is proportional and takes the fit");
-    }
-}
-
-/// A display face is drawn at the size asked for, in its own `M` cell: turning
-/// one on costs no more columns than that face's `M`, and its rows are never
-/// shorter than the font size. The earlier fit cut the cell to the widest ink
-/// of any glyph (Cinzel's `Q` tail set every cell, 17px at 12px against an
-/// 11px `M`) and shrank the glyphs 0.87 to win it back, so the letters sat
-/// small in cells 33-55% too wide, and Luckiest Guy's rows (10px) fell under
-/// a 12px font.
-#[test]
-fn a_display_face_keeps_its_size_and_its_own_m_cell() {
-    for font in DISPLAY_FACES {
-        let bytes = display_face_bytes(font.id).expect("registry id resolves");
-        let face = aterm_render::font::Font::from_bytes(bytes, Default::default()).unwrap();
-        for px in [12.0_f32, 16.0, 24.0] {
-            let mut renderer = Renderer::from_bytes(bytes, px, Theme::default()).unwrap();
-            let (cell_w, cell_h) = renderer.cell_size();
-            let m = face.metrics('M', px).advance_width.round().max(1.0) as usize;
-            assert_eq!(cell_w, m, "{} at {px}px: the cell is its own M", font.id);
-            assert!(
-                cell_h as f32 >= px,
-                "{} at {px}px: a {cell_h}px row is under the font size",
-                font.id
-            );
-            // And the glyphs are drawn at that size: an `H` stands at least as
-            // tall as the face draws it at `px` (a platform rasterizer may pad
-            // its box), not 13% shorter. The outline's own height, measured at
-            // 64x so the whole-pixel box (`ceil(yMax) - floor(yMin)`, up to 2px
-            // over the outline at `px`) adds at most 2/64: a hinting
-            // rasterizer (Linux's, Windows') draws the true height, not the box.
-            let key = renderer.glyph_key('H');
-            let drawn = renderer.glyph_image(key).height() as f32;
-            let authored = face.metrics('H', px * 64.0).height as f32 / 64.0;
-            assert!(
-                drawn >= authored - 1.0,
-                "{} at {px}px: H is {drawn}px tall, the face draws {authored}px",
-                font.id
-            );
-        }
-    }
-}
-
-/// A display face's capitals rise past its own cell (Luckiest Guy's above a
-/// 0.70 em ascent), which the terminal's window padding absorbs but a frame
-/// with nothing above its first row cuts off. `display_ink_headroom` names the
-/// band that keeps every printable glyph of the first row whole; an ordinary
-/// font needs none.
-#[test]
-fn display_ink_headroom_holds_the_first_row_whole() {
-    let mut any = false;
-    for font in DISPLAY_FACES {
-        let bytes = display_face_bytes(font.id).expect("registry id resolves");
-        for px in [12.0_f32, 16.0, 24.0] {
-            let mut renderer = Renderer::from_bytes(bytes, px, Theme::default()).unwrap();
-            let head = renderer.display_ink_headroom(px, 1.0, 0) as i32;
-            let baseline = renderer.baseline();
-            any |= head > 0;
-            for invalid in [f32::NAN, f32::NEG_INFINITY, f32::INFINITY, f32::MAX] {
-                assert_eq!(renderer.display_ink_headroom(invalid, 1.0, 0), 0);
-                assert_eq!(renderer.display_ink_headroom(px, invalid, 0), 0);
-            }
-            for ch in '!'..='~' {
-                let key = renderer.glyph_key(ch);
-                if !matches!(key.source, aterm_render::FaceId::Primary) {
-                    continue;
-                }
-                let img = renderer.glyph_image(key);
-                if img.height() == 0 {
-                    continue;
-                }
-                let top = baseline - (img.height() as i32 + img.ymin());
-                assert!(
-                    top + head >= 0,
-                    "{} at {px}px: {ch:?} rises {} px above its cell, headroom {head}",
-                    font.id,
-                    -top
-                );
-            }
-        }
-    }
-    assert!(any, "a title face's capitals do rise past its cell");
-    #[cfg(feature = "embedded-font")]
-    {
-        let plain =
-            Renderer::from_bytes(aterm_render::embedded_font(), 16.0, Theme::default()).unwrap();
-        assert_eq!(plain.display_ink_headroom(16.0, 1.0, 0), 0);
+        assert!(
+            fit.ink_top_em > 0.5 && fit.ink_bottom_em < 0.0,
+            "{id}: {fit:?}"
+        );
+        assert!(fit.letter_advance_em > 0.3, "{id}: {fit:?}");
     }
 }
 
@@ -197,33 +460,54 @@ fn display_ink_headroom_holds_the_first_row_whole() {
 fn display_scheme_resolution_is_exact() {
     for font in DISPLAY_FACES {
         let family = format!("{DISPLAY_FACE_SCHEME}{}", font.id);
-        assert!(
-            display_face_for_family(&family).is_some(),
+        assert_eq!(
+            display_face_ids_for_family(&family),
+            Some(vec![font.id]),
             "{family} resolves"
         );
         assert!(
-            display_face_for_family(font.id).is_none(),
+            display_face_ids_for_family(font.id).is_none(),
             "bare id {:?} must NOT resolve without the scheme",
             font.id
         );
     }
-    assert!(display_face_for_family("display:doom").is_none());
-    assert!(display_face_for_family("Menlo").is_none());
+    assert!(display_face_ids_for_family("display:doom").is_none());
+    assert!(display_face_ids_for_family("Menlo").is_none());
 }
 
-/// The catalog batch path resolves a `display:` request to the embedded bytes
-/// (identity path = the virtual name), so live reload and startup agree.
+/// A `display:` family is a request for the layer, never a face: no resolver
+/// answers it — the catalogue batch and the config resolver both refuse it,
+/// saying where display faces are set — so the primary is always a real font.
 #[test]
-fn catalog_batch_resolves_display_scheme_to_embedded_bytes() {
-    let requests = vec!["display:pixel".to_string()];
+fn no_resolver_answers_a_display_family_with_a_face() {
+    let requests = vec![(
+        "display:pixel".to_string(),
+        aterm_render::FaceTarget::REGULAR,
+    )];
     let batch = aterm_render::font_catalog::resolve_and_admit(&requests);
-    let asset = batch
+    let refusal = batch
         .get(0)
         .expect("entry present")
         .as_ref()
-        .expect("display face admitted");
-    assert_eq!(asset.path, "display:pixel");
-    assert_eq!(asset.bytes.as_slice(), display_face_bytes("pixel").unwrap());
+        .expect_err("a display family admits no face");
+    assert!(refusal.contains("display_font"), "{refusal}");
+    let refusal =
+        aterm_render::resolve_config_font("display:pixel", aterm_render::FaceTarget::REGULAR)
+            .expect_err("a display family resolves to no face");
+    assert!(refusal.contains("display_font"), "{refusal}");
+}
+
+/// Startup construction honors the scheme as a layer: the default font is the
+/// primary — its path, its grid — and the face is drawn over it.
+#[test]
+fn from_system_with_family_draws_a_display_family_over_the_default_font() {
+    let plain = Renderer::from_system(16.0, Theme::default()).expect("a system font");
+    let renderer =
+        Renderer::from_system_with_family(Some("display:engraved"), 16.0, Theme::default())
+            .expect("display face constructs");
+    assert_eq!(renderer.primary_source_path(), plain.primary_source_path());
+    assert_eq!(renderer.cell_size(), plain.cell_size());
+    assert_eq!(renderer.display_faces(), vec!["engraved"]);
 }
 
 /// MIX parsing is exact: 1..=3 distinct known ids joined by `+`; anything
@@ -239,14 +523,11 @@ fn display_mix_family_parsing_is_exact() {
     assert_eq!(duo[1], display_face_bytes("engraved").unwrap());
     let trio = display_face_mix_for_family("display:chunky+bubble+engraved").unwrap();
     assert_eq!(trio.len(), DISPLAY_FACE_MIX_MAX);
-    // The single-face view of a mix is its FIRST face (the primary).
-    assert_eq!(
-        display_face_for_family("display:pixel+engraved"),
-        Some(display_face_bytes("pixel").unwrap())
-    );
     for bad in [
         "display:pixel+doom",
         "display:pixel+pixel",
+        // One face under two spellings is still one face twice.
+        "display:pixel+Pixel",
         "display:chunky+pixel+engraved+bubble",
         "display:",
         "display:+",
@@ -258,11 +539,11 @@ fn display_mix_family_parsing_is_exact() {
     }
 }
 
-/// End-to-end: a mixed renderer routes each character to the face its pick
-/// names — pick 0 stays on the primary, a covered non-zero pick routes to the
-/// DisplayMix source — and the routing is stable across repeated lookups.
+/// End-to-end: a layered renderer routes every letter to the layer (each face
+/// covers ASCII), none to the primary, and the routing is stable across
+/// repeated lookups; each routed glyph owns exactly its cell.
 #[test]
-fn mixed_renderer_routes_characters_across_faces() {
+fn a_layer_routes_every_letter_across_its_faces() {
     let mut renderer = Renderer::from_system_with_family(
         Some("display:pixel+engraved+chunky"),
         16.0,
@@ -270,36 +551,25 @@ fn mixed_renderer_routes_characters_across_faces() {
     )
     .expect("mix constructs");
     assert_eq!(
-        renderer.primary_source_path(),
-        Some("display:pixel+engraved+chunky")
+        renderer.display_faces(),
+        vec!["chunky", "pixel", "engraved"]
     );
-    let mut mixed = 0usize;
-    let mut primary = 0usize;
     let (cell_w, _) = renderer.cell_size();
-    for ch in 'A'..='z' {
+    let mut served = std::collections::BTreeSet::new();
+    for ch in ('A'..='Z').chain('a'..='z') {
         let key = renderer.glyph_key(ch);
-        let again = renderer.glyph_key(ch);
-        assert_eq!(key, again, "routing is stable for {ch:?}");
-        match key.source {
-            aterm_render::FaceId::DisplayMix => {
-                mixed += 1;
-                assert_eq!(key.cell_span, 1);
-                let image = renderer.glyph_image(key);
-                assert_eq!(
-                    image.advance(),
-                    cell_w as f32,
-                    "DisplayMix has one placement owner: fallback harmony"
-                );
-                assert!(
-                    image.xmin() >= 0 && image.xmin() + image.width() as i32 <= cell_w as i32,
-                    "DisplayMix {ch:?} escaped after its single harmony placement"
-                );
-            }
-            _ => primary += 1,
-        }
+        assert_eq!(key, renderer.glyph_key(ch), "routing is stable for {ch:?}");
+        assert_eq!(
+            key.source,
+            FaceId::DisplayMix,
+            "{ch:?} stays on the primary"
+        );
+        assert_eq!(key.cell_span, 1);
+        served.insert(renderer_face_of(&renderer, ch));
+        let image = renderer.glyph_image(key);
+        assert_eq!(image.advance(), cell_w as f32, "{ch:?} owns its cell");
     }
-    assert!(mixed > 0, "some letters render from the extra mix faces");
-    assert!(primary > 0, "some letters stay on the primary face");
+    assert_eq!(served.len(), 3, "every face of the mix draws some letter");
 }
 
 /// Ligatures on (the default) under a display face, alone or mixed, never put
@@ -345,162 +615,79 @@ fn display_face_operators_never_shape_to_notdef() {
     }
 }
 
-/// THE FIT IS A PROPERTY OF THE FONT, NOT OF THE ALLOCATION. `display_face_fit`
-/// identified a bundled face with `std::ptr::eq` against the `DISPLAY_FACES`
-/// statics, so it recognised only the ONE copy of the bytes the registry itself
-/// holds. Every rebuild path rebuilds from a copy — `rebuild_from_admitted` goes
-/// through `shared_parsed_face`'s `Arc::from(bytes)`, `fork_semantic_surface`
-/// calls it, and the config worker copies twice more — so each silently dropped
-/// the WHOLE policy (then a px scale and a widest-ink cell; now the squeeze and
-/// the centring), and the weight boost with it.
-///
-/// It was reachable in the shipped GUI through `rebuild_backend_with_prepared`,
-/// which the config/theme hot-reload calls: a user with `display_font` set got
-/// the correct fitted grid at launch and permanently lost it the first time the
-/// config file was saved or the theme flipped. Measured for `engraved` at 16 px,
-/// the rebuilt cell went (21, 19) -> (15, 22) with a widest printable-ASCII
-/// raster of 24 px — 9 px of ink over the cell edge, per cell.
-///
+/// THE LAYER SURVIVES EVERY REBUILD: `rebuild_from_admitted` (a zoom, a theme
+/// flip, the config hot-reload) and the semantic fork rebuild the renderer from
+/// copies, and each must carry the layer — the same faces, drawing the same
+/// glyphs in the same cell.
 #[test]
-fn the_fit_survives_a_rebuild_and_a_copy_of_the_bytes() {
-    let bytes = display_face_bytes("engraved").expect("registry id resolves");
-
-    // The root: identity must be the CONTENT. A byte-for-byte copy is the same
-    // font and must take the same policy.
-    let copy = bytes.to_vec();
-    assert!(
-        display_face_fit(copy.as_slice()).is_some(),
-        "a byte-for-byte copy of a bundled face is the same font and must keep \
-         its fit — matching by pointer made the policy an accident of which \
-         allocation the caller happened to hold"
-    );
-
-    // And the seam that actually carried the loss into the GUI.
-    let mut base = Renderer::from_bytes(bytes, 16.0, Theme::default()).expect("engraved at 16px");
+fn the_layer_survives_a_rebuild_and_a_fork() {
+    let mut base =
+        Renderer::from_system_with_family(Some("display:engraved+bubble"), 16.0, Theme::default())
+            .expect("a system font");
     let before = base.cell_size();
     let _ = base.seal_admitted_font_sources();
-    let rebuilt = base
-        .rebuild_from_admitted(16.0, Theme::default())
-        .expect("a sealed generation rebuilds");
-    assert_eq!(
-        rebuilt.cell_size(),
-        before,
-        "`rebuild_from_admitted` promises to preserve the font appearance knobs, \
-         and the display fit is one of them"
-    );
-
-    let forked = base
-        .fork_semantic_surface(16.0, Theme::default())
-        .expect("a sealed generation forks");
-    assert_eq!(
-        forked.cell_size(),
-        before,
-        "a semantic fork rebuilds through the same seam and must not lose the fit"
-    );
-}
-
-/// A VARIATION CHANGE IS NOT AN EXCUSE TO FORGET THE FIT. `refresh_variations`
-/// once re-derived the cell differently from every sibling site (the
-/// constructor, `set_px`, `activate_px`, both `cell_geometry` arms), which on
-/// the widest-ink fit of the time threw the cell away: measured for `engraved`
-/// at 16 px, cell 21 -> 13 against a 22 px widest raster. Every site now takes
-/// the same `M` cell, and the squeeze keeps a heavier instance's ink inside it.
-///
-/// It is reachable on the one generation that carries a live fit — STARTUP:
-/// `apply_font_config_to_backend` calls `set_font_variations` immediately after
-/// construction, so any non-empty `font_variation`/`font_weight`, or a non-zero
-/// `font_weight_dark_nudge`, runs it past its early-out.
-///
-/// Two assertions, because the defect had two distinct faces: the cell must
-/// still clear the ink (the overrun this whole policy exists to prevent), and
-/// the PURE read must still agree with paint — `cell_geometry` documents that it
-/// "equal[s] exactly what the renderer produces once activated to `px`", and
-/// while this was broken it reported the fitted 21 against a painted 13, putting
-/// grid sizing, hit-testing and IME positioning 8 px per column out of step.
-#[test]
-fn a_variation_change_keeps_the_fit_and_the_pure_read_agrees() {
-    let mut renderer =
-        Renderer::from_system_with_family(Some("display:engraved"), 16.0, Theme::default())
-            .expect("the display scheme resolves");
-    // A heavier instance than the constructor resolved, so the coords really
-    // differ and `refresh_variations` runs past its early-out.
-    renderer.set_font_variations(&[(aterm_render::variation::WGHT_TAG, 600.0)], 0.0);
-
-    let (cell_w, cell_h) = renderer.cell_size();
-    assert_eq!(
-        renderer.cell_geometry(16.0),
-        (cell_w, cell_h, renderer.baseline()),
-        "the pure read must equal what the renderer actually paints"
-    );
-
-    for ch in '!'..='~' {
-        let key = renderer.glyph_key(ch);
-        if !matches!(
-            key.source,
-            aterm_render::FaceId::Primary | aterm_render::FaceId::DisplayMix
-        ) {
-            continue;
-        }
-        let img = renderer.glyph_image(key);
-        let right = img.xmin() + img.width() as i32;
-        assert!(
-            right <= cell_w as i32,
-            "after a variation change {ch:?} ends at {right} past the {cell_w}px \
-             cell — it would paint over the next character"
+    let key = base.glyph_key('Q');
+    let glyph = raster(base.glyph_image(key));
+    for (how, mut renderer) in [
+        (
+            "rebuild",
+            base.rebuild_from_admitted(16.0, Theme::default())
+                .expect("a sealed generation rebuilds"),
+        ),
+        (
+            "fork",
+            base.fork_semantic_surface(16.0, Theme::default())
+                .expect("a sealed generation forks"),
+        ),
+    ] {
+        assert_eq!(
+            renderer.display_faces(),
+            vec!["engraved", "bubble"],
+            "{how}"
         );
+        assert_eq!(renderer.cell_size(), before, "{how}");
+        let key = renderer.glyph_key('Q');
+        assert_eq!(raster(renderer.glyph_image(key)), glyph, "{how}");
     }
 }
 
-/// A FACE SWAP RE-PROBES THE FIT. `set_primary_font` re-probes the new bytes'
-/// ligature features, OS/2 typo metrics and decoration tables, but left
-/// `display_fit` holding the face that had just been replaced — so a swap
-/// carried the previous face's fit onto bytes it was never measured from.
-///
-/// Both directions, because the defect is symmetric and each has a distinct
-/// failure: leaving a fit behind squeezes and recentres an ordinary font, and
-/// failing to pick one up reopens the overrun the policy exists to prevent.
-/// The comparison is against a renderer CONSTRUCTED from the same bytes, which
-/// is the definition of right here — a swap must land exactly where a fresh
-/// construction would.
-#[cfg(feature = "embedded-font")]
+/// A VARIATION CHANGE OR A NEW PRIMARY REFITS THE LAYER TO THE NEW CELL: the
+/// fit is computed from the cell the glyph is drawn into, so whatever the
+/// primary's geometry becomes, the pure read agrees with paint and every layer
+/// glyph stays inside the new cell.
 #[test]
-fn a_primary_swap_reprobes_the_fit_for_the_new_face() {
-    let engraved = display_face_bytes("engraved").expect("registry id resolves");
-    let plain = aterm_render::embedded_font();
-
-    let fresh_fitted = Renderer::from_bytes(engraved, 16.0, Theme::default())
-        .expect("engraved")
-        .cell_size();
-    let fresh_plain = Renderer::from_bytes(plain, 16.0, Theme::default())
-        .expect("dejavu")
-        .cell_size();
-    assert_ne!(
-        fresh_fitted, fresh_plain,
-        "the two faces must differ for this test to be able to fail"
-    );
-
-    let mut fitted_to_plain =
-        Renderer::from_bytes(engraved, 16.0, Theme::default()).expect("engraved");
-    fitted_to_plain
-        .set_primary_font(plain)
-        .expect("the embedded face installs");
-    assert_eq!(
-        fitted_to_plain.cell_size(),
-        fresh_plain,
-        "swapping AWAY from a fitted face must drop its fit — an ordinary user \
-         font is one this policy promises to leave exactly as it found it"
-    );
-
-    let mut plain_to_fitted = Renderer::from_bytes(plain, 16.0, Theme::default()).expect("dejavu");
-    plain_to_fitted
-        .set_primary_font(engraved)
-        .expect("the display face installs");
-    assert_eq!(
-        plain_to_fitted.cell_size(),
-        fresh_fitted,
-        "swapping TO a fitted face must pick its fit up — a swap has to land \
-         where a fresh construction from the same bytes would"
-    );
+fn the_layer_follows_the_primary_into_a_new_cell() {
+    let mut renderer =
+        Renderer::from_system_with_family(Some("display:engraved"), 16.0, Theme::default())
+            .expect("the display scheme resolves");
+    renderer.set_font_variations(&[(aterm_render::variation::WGHT_TAG, 600.0)], 0.0);
+    let primaries = primaries();
+    let mut swaps = vec![None];
+    swaps.extend(primaries.iter().map(|(_, bytes)| Some(*bytes)));
+    for swap in swaps {
+        if let Some(bytes) = swap {
+            renderer.set_primary_font(bytes).expect("the face installs");
+            let fresh = Renderer::from_bytes(bytes, 16.0, Theme::default()).unwrap();
+            assert_eq!(renderer.cell_size(), fresh.cell_size());
+        }
+        let (cell_w, cell_h) = renderer.cell_size();
+        assert_eq!(
+            renderer.cell_geometry(16.0),
+            (cell_w, cell_h, renderer.baseline()),
+            "the pure read must equal what the renderer actually paints"
+        );
+        for ch in '!'..='~' {
+            let key = renderer.glyph_key(ch);
+            if key.source != FaceId::DisplayMix {
+                continue;
+            }
+            let img = renderer.glyph_image(key);
+            assert!(
+                img.xmin() >= 0 && img.xmin() + img.width() as i32 <= cell_w as i32,
+                "{ch:?} leaves the {cell_w}px cell"
+            );
+        }
+    }
 }
 
 /// A `display_font` VALUE IS A HUMAN-TYPED CONFIG STRING, so it folds case like

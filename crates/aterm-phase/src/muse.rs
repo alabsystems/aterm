@@ -199,6 +199,26 @@
 //! ([`fixtures::END_OF_TURN_WORK_HINT`]): no part of the reply, so the turn
 //! still ends on the reply's last words (a done token, a question).
 //!
+//! A branch's STATE says whether its work still runs: `running` (a
+//! backgrounded shell) and `watching` (a monitor) while it does, `ran 1s,
+//! exit 0` and `failed` once it is over (measured on 1.4.10 again on
+//! 2026-10-17, [`fixtures::END_OF_TURN_BG_RUNNING`]: the glyph and the
+//! count redraw every second while it runs, so the screen never holds
+//! still; the finished branch stood 8-11 s, then the panel went,
+//! [`fixtures::END_OF_TURN_BG_FINISHED`]). A turn's end over a branch that
+//! runs is the agent's own background work ([`background_wait`]): busy as
+//! evidence, so nothing is typed into a session Muse Code itself will wake —
+//! the backgrounded shell's end drew `◆ Finished · <description> · ✓` and
+//! Muse Code took a turn of its own on its output. As Claude Code's reader
+//! reads its own (`phase::worker_phase`): a backgrounded shell is the HARD
+//! rule, busy over a question the turn ended on too, as a shell Claude Code
+//! left running is; a monitor is the SOFT one ([`crate::phase::Busy::soft`]),
+//! which a question outranks. A limit and a wall the turn ended on stand
+//! over either (limited, idle on its wall). The composer and the reply's
+//! last words read over it as before. A panel whose work is over reads
+//! none. Before, such a turn's end read plainly idle: a point the turn-end
+//! policy continued, its `keep going` typed while the work ran.
+//!
 //! **THE QUESTION** (`request_user_input`, 1.4.10) is drawn ABOVE an open
 //! composer:
 //!
@@ -287,7 +307,7 @@
 //! typed 4 min 50 s after a turn's end, five minutes after a recap, drew
 //! none, and so did a continuation the harness typed two minutes after one.
 //! The harness's continuation typed 2 min 43 s after a usage wall drew one
-//! above its message, and `aterm drive task`'s nudge 2 min 14 s after a
+//! above its message, and the since-removed `aterm drive task`'s nudge 2 min 14 s after a
 //! turn's end drew one too; both were submitted. The recap's side call
 //! (`x-tbh-agent-role: away-recap`) goes out with the first key.
 //!
@@ -360,6 +380,7 @@ use crate::anchors::anchor_text;
 use crate::phase::{Phase, is_rule, leading_spaces, plain_rule_width};
 use crate::prompt::{Cancel, CancelEffect, Opt, PromptKind, PromptV2, Role, Select};
 use crate::text::blank;
+use crate::turn::{CardPlace, LaunchCard};
 use crate::wall::{ApiCause, Placement, Wall, WallKind};
 
 /// The composer, read whole.
@@ -784,6 +805,77 @@ fn interrupting(rows: &[String], f: Frame) -> bool {
     })
 }
 
+/// What [`background_wait`] names: a branch of the background-work panel
+/// whose state is `running` (a backgrounded shell) or `watching` (a
+/// monitor).
+const WORK_RUNNING: &str = "background work running";
+const MONITOR_WATCHING: &str = "a monitor watching";
+
+/// The work one branch of the background-work panel says runs (module
+/// header): `└ ◈ Wait in the background  running  13s` (a backgrounded
+/// shell), `└ ◇ Watch the lab socket  watching  14s` (a monitor) — the
+/// branch, a status diamond, the description, its state and its time, each
+/// two blanks or more apart. A branch that finished (`ran 1s, exit 0`,
+/// `failed`), and a row of any other shape, says none.
+fn panel_work(row: &str) -> Option<&'static str> {
+    let item = row
+        .strip_prefix("└ ")
+        .or_else(|| row.strip_prefix("├ "))?
+        .strip_prefix(STATUS_GLYPHS)?
+        .strip_prefix(' ')?;
+    let cells: Vec<&str> = item
+        .split("  ")
+        .map(crate::text::trim)
+        .filter(|c| !c.is_empty())
+        .collect();
+    let [_, .., state, took] = cells.as_slice() else {
+        return None;
+    };
+    if !is_elapsed(took) {
+        return None;
+    }
+    if *state == const { anchor_text("muse.panel.running") } {
+        Some(WORK_RUNNING)
+    } else if *state == const { anchor_text("muse.panel.watching") } {
+        Some(MONITOR_WATCHING)
+    } else {
+        None
+    }
+}
+
+/// The work the panel under the open composer's bottom rule says runs
+/// ([`panel_work`] over its branches): a backgrounded shell's
+/// ([`WORK_RUNNING`], the hard rule) over a monitor's, as Claude Code's
+/// reader names its hard rules first (`phase::busy_signal`).
+fn work(rows: &[String]) -> Option<&'static str> {
+    let f = open_frame(rows)?;
+    let branches = &rows[f.bottom + 1..f.footer];
+    let named = |what: &'static str| {
+        branches
+            .iter()
+            .any(|r| panel_work(r) == Some(what))
+            .then_some(what)
+    };
+    named(WORK_RUNNING).or_else(|| named(MONITOR_WATCHING))
+}
+
+/// THE AGENT'S OWN BACKGROUND WORK RUNS AND ITS TURN IS OVER (module header):
+/// the open composer, the turn over it ended — idle (on a wall too), a
+/// question or a limit, as evidence ([`turn_phase`]) — and a branch of the
+/// panel under it running or watching. `Some(what runs)`; `None` for a
+/// running turn (its status row over the panel), a box, a turn whose end is
+/// no evidence, a panel whose work finished (`ran 1s, exit 0`, `failed`),
+/// and no panel.
+#[must_use]
+pub fn background_wait(rows: &[String]) -> Option<&'static str> {
+    let what = work(rows)?;
+    matches!(
+        turn_phase(rows),
+        (Phase::Idle | Phase::Question | Phase::Limited { .. }, true)
+    )
+    .then_some(what)
+}
+
 /// The phase, and whether it is evidence (module header): the trust box, an
 /// approval box, the question, the review of its answers and a drawer are a
 /// prompt; the status row is busy; a reply as the last thing drawn above the
@@ -794,9 +886,32 @@ fn interrupting(rows: &[String], f: Frame) -> bool {
 /// and a turn's end whose footer still says `interrupting run`, are busy NOT
 /// authoritatively; a turn stopped on a fault only a person can fix
 /// ([`faulted`]), and any other screen, are `idle` NOT authoritatively. No
-/// screen with a box on it reads idle.
+/// screen with a box on it reads idle. An ended turn that would read idle,
+/// with no wall, while the panel says the agent's own background work runs
+/// ([`background_wait`]) is BUSY as evidence, as Claude Code's reader reads
+/// its background work (`phase::worker_phase`): a backgrounded shell over a
+/// question the turn ended on too (the hard rule, a shell's), a monitor not
+/// (the soft rule: the question stands); a limit and a wall stand over
+/// either.
 #[must_use]
 pub fn phase(rows: &[String]) -> (Phase, bool) {
+    let read = turn_phase(rows);
+    let Some(what) = work(rows) else {
+        return read;
+    };
+    let held = match read {
+        (Phase::Idle, true) => true,
+        (Phase::Question, true) => what == WORK_RUNNING,
+        _ => false,
+    };
+    if held && wall(rows).is_none() {
+        return (Phase::Busy, true);
+    }
+    read
+}
+
+/// [`phase`], the agent's background work aside.
+fn turn_phase(rows: &[String]) -> (Phase, bool) {
     if trust_box(rows).is_some() || approval_box(rows).is_some() {
         return (Phase::Prompt, true);
     }
@@ -1135,6 +1250,7 @@ fn trust_prompt(
                 role: Role::Other,
                 focused,
                 row: i,
+                kept: false,
             })
         })
         .collect();
@@ -1546,6 +1662,7 @@ fn approval_prompt(rows: &[String], b: Approval) -> PromptV2 {
             role: Role::Other,
             focused: *focused,
             row: *i,
+            kept: false,
         });
         keys.push(key.map(str::to_string));
     }
@@ -1775,6 +1892,7 @@ fn question_prompt(rows: &[String], q: Question) -> PromptV2 {
                 role: Role::Other,
                 focused,
                 row: i,
+                kept: false,
             });
             described = stacked || beside(text);
         } else if is_note_row(row) {
@@ -1987,6 +2105,7 @@ fn review_prompt(rows: &[String], r: Review) -> PromptV2 {
                 role: Role::Other,
                 focused,
                 row: i,
+                kept: false,
             })
         })
         .collect();
@@ -2074,6 +2193,148 @@ pub(crate) fn is_muse_screen(rows: &[String]) -> bool {
         || approval_box(rows).is_some()
         || trust_box(rows).is_some()
         || signed_out(rows).is_some()
+}
+
+/// Both composer rules, `(top, bottom)`, when Muse Code's open composer frame
+/// is on the screen.
+#[must_use]
+pub fn composer_rules(rows: &[String]) -> Option<(usize, usize)> {
+    open_frame(rows).map(|f| (f.top, f.bottom))
+}
+
+fn muse_banner_version(row: &str) -> Option<&str> {
+    if leading_spaces(row) != 2 {
+        return None;
+    }
+    let after = crate::text::trim(row)
+        .strip_prefix(const { anchor_text("muse.banner") })?
+        .strip_prefix(' ')?;
+    let len = after
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(*b, b'.' | b'-' | b'_' | b'+'))
+        .count();
+    let version = &after[..len];
+    (!version.is_empty()
+        && version.starts_with(|c: char| c.is_ascii_digit())
+        && crate::text::trim(&after[len..]).is_empty())
+    .then_some(version)
+}
+
+fn muse_card_at(rows: &[String], top: usize) -> Option<CardPlace> {
+    let row0 = rows.get(top)?;
+    muse_banner_version(row0)?;
+    let end0 = crate::text::trim_end(row0).chars().count();
+    Some(CardPlace {
+        top,
+        rows: 1,
+        text_col: 2,
+        mascot_end: 0,
+        ends: [end0, end0, end0],
+    })
+}
+
+/// Scan `rows` for Muse Code's launch banner: `(banner_row, place)`.
+#[must_use]
+pub fn launch_card_scan(rows: &[String]) -> (Option<usize>, Option<CardPlace>) {
+    for i in (0..rows.len()).rev() {
+        if is_session_banner(rows, i) {
+            return (Some(i), muse_card_at(rows, i));
+        }
+    }
+    (None, None)
+}
+
+/// Whether [`launch_card_scan`] reads `rows` as it read the rows they were
+/// before the rows `changed` names changed (the count of rows the same) —
+/// known without a scan. `banner` is that reading's banner row. Whether a
+/// row is a session's banner ([`is_session_banner`]) reads it and the rows
+/// over it up to the nearest nonblank one, so a changed row can make or
+/// unmake a banner only on itself or on the first nonblank row under it
+/// (a blank row between that changed answers for itself). So the reading
+/// holds while the banner's row did not change and none of those rows at
+/// or under it draws a banner (the banner's own row among them is one whose
+/// row over it changed); with no banner, while none of them draws one. A
+/// keystroke in the composer under the card costs a banner test of its row
+/// and the row under it. Never panics, on any rows and indices.
+#[must_use]
+pub fn launch_card_unmoved(rows: &[String], banner: Option<usize>, changed: &[usize]) -> bool {
+    if banner.is_some_and(|b| b >= rows.len() || changed.contains(&b))
+        || changed.iter().any(|&row| row >= rows.len())
+    {
+        return false;
+    }
+    let draws =
+        |i: usize| banner.is_none_or(|b| i >= b) && rows.get(i).is_some_and(|r| is_banner_row(r));
+    changed.iter().all(|&j| {
+        let under = (j + 1..rows.len()).find(|&k| !blank(&rows[k]));
+        !draws(j) && under.is_none_or(|k| !draws(k))
+    })
+}
+
+/// The version Muse Code's launch banner at `place` names (`1.4.10`).
+#[must_use]
+pub fn launch_card_version<'a>(rows: &'a [String], place: &CardPlace) -> Option<&'a str> {
+    muse_banner_version(rows.get(place.top)?)
+}
+
+/// The text of Muse Code's launch banner at `place`.
+#[must_use]
+pub fn launch_card_words<'a>(rows: &'a [String], place: &CardPlace) -> Option<[&'a str; 3]> {
+    let w = crate::text::trim(rows.get(place.top)?);
+    (!w.is_empty()).then_some([w, w, w])
+}
+
+fn parse_muse_footer_model(row: &str) -> Option<(String, Option<String>)> {
+    if leading_spaces(row) != 2 {
+        return None;
+    }
+    let parts: Vec<&str> = crate::text::trim(row).split(" \u{00B7} ").collect();
+    if parts.len() >= 4 {
+        let model = crate::text::trim(parts[0]);
+        let effort = crate::text::trim(parts[1]).to_ascii_lowercase();
+        let effort = matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh" | "max")
+            .then_some(effort);
+        if !model.is_empty() {
+            return Some((model.to_owned(), effort));
+        }
+    } else if parts.len() == 3 {
+        let model = crate::text::trim(parts[0]);
+        if !model.is_empty() {
+            return Some((model.to_owned(), None));
+        }
+    }
+    None
+}
+
+/// Muse Code's launch banner and live footer model/effort for the harness footer.
+#[must_use]
+pub fn launch_card(rows: &[String]) -> Option<LaunchCard> {
+    let f = frame(rows)?;
+    let footer_model = rows.get(f.footer).and_then(|r| parse_muse_footer_model(r));
+    let (_, place) = launch_card_scan(&rows[..f.top]);
+    let version = place
+        .as_ref()
+        .and_then(|p| launch_card_version(rows, p))
+        .map(str::to_owned)
+        .unwrap_or_default();
+    match (version.is_empty(), footer_model) {
+        (false, Some((model, effort))) => Some(LaunchCard {
+            version,
+            model,
+            effort,
+        }),
+        (false, None) => Some(LaunchCard {
+            version,
+            model: String::new(),
+            effort: None,
+        }),
+        (true, Some((model, effort))) => Some(LaunchCard {
+            version: String::new(),
+            model,
+            effort,
+        }),
+        (true, None) => None,
+    }
 }
 
 /// Muse Code's screens, measured, for this crate's tests and a dependent
@@ -2363,6 +2624,14 @@ pub mod fixtures {
     /// A running turn over the panel.
     pub const BUSY_WORK_RUNNING: &str =
         include_str!("fixtures/muse-1.4.10-R6427.1-busy-work-running.txt");
+    /// A backgrounded shell 3 s in (2026-10-17): the turn's end, the
+    /// pointer under its reply, the panel's branch `running`.
+    pub const END_OF_TURN_BG_RUNNING: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-end-of-turn-bg-running.txt");
+    /// The same session once that shell ended: `◆ Finished · … · ✓`, Muse
+    /// Code's own turn on its output, and no panel.
+    pub const END_OF_TURN_BG_FINISHED: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-end-of-turn-bg-finished.txt");
     /// A call of two questions, the first drawn: `1 of 2` over the key row.
     pub const QUESTION_MULTI: &str =
         include_str!("fixtures/muse-1.4.10-R6427.1-question-multi.txt");

@@ -151,6 +151,7 @@ fn opts() -> Opts {
         aterm_state: None,
         ask: false,
         several_logins: false,
+        usage_credits: false,
         usage_tap: None,
         instances: Instances::Listed(Vec::new()),
         timings: crate::harness::Timings::FAST,

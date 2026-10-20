@@ -4,7 +4,7 @@
 //! SETTINGS ▸ HARNESS (`docs/DESIGN-harness-autopilot-2026-10-15.md` §4): the
 //! coding agents' harness page, headed "Coding agent harness" where that
 //! fits (else "Harness", its rail entry), a SPECIAL route built like
-//! Packages over the host's [`HarnessState`] (`crate::harness_screen`). Six
+//! Packages over the host's [`HarnessState`] (`crate::harness_screen`). Seven
 //! cards, in order:
 //!
 //! 1. **STATUS** — the policy in force in its own words
@@ -29,13 +29,38 @@
 //!    detail, the row's STATE LINE (`lands at 18:00`, `landed 17:42`, …:
 //!    `HarnessSessionRow::state_line`, clock times only), and a TIMER
 //!    disclosure (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.4)
-//!    holding `1 h`, `2 h`, `4 h`, `at 18:00` (only with `[harness] land_at`
+//!    holding `1 hour`, `2 hours`, `4 hours`, `at 18:00` (only with `[harness] land_at`
 //!    set; `at Sat 18:00` once today's 18:00 has passed, the day it would
 //!    arm) and `Cancel` (only while a timer is armed), keyed
 //!    `harness/session/<id>/land-in/60|120|240`, `…/land-at` and
 //!    `…/land-cancel`: a timed Cruise, through the App's one writer
 //!    (`HarnessTimerRequest`), Owner-only like the mode buttons.
-//! 3. **SUPERVISION** — the registry rows the harness owns: Supervise coding
+//! 2½. **DECIDED FOR YOU** — only on a day the harness chose in the person's
+//!    name (`docs/DESIGN-harness-autopilot-2026-10-15.md` §10.4): the
+//!    dialogs it answered, the prose questions, the presses full power made
+//!    that no safe rule proved, its refusals and the limit resets it kept,
+//!    newest first, each at its clock time in one sentence
+//!    (`harness/decided/<id>`, the decision's id: the same at every reading)
+//!    with `Show tab` (`harness/decided/<id>/show`, the session's own
+//!    `harness/session/<id>/show` action: Owner-only) while the session is
+//!    open; the newest three, and a `Show all N` disclosure
+//!    (`harness/decided/all`). Read-only: no alert, no Entry.
+//! 3. **EFFECT OF EACH AUTOPILOT** — after the page's actions, the verdict up
+//!    front (§11.6): the A/B book over the last 7 local days, kept on disk
+//!    one file per aterm process (`harness_ab_store`). It opens with its LEAD
+//!    where Cruise and Off each have 10 minutes of working time — `Working
+//!    time held at a box or a question` and each side's share in Hero type,
+//!    with its working time ([`ab_lead_block`]) — or, Cruise with no Off
+//!    time, a plain note. Then how long boxes and questions stood (medians,
+//!    Cruise beside Off, with how many each is of), the time held as a share
+//!    of working time where the lead does not say it, the time at the prompt
+//!    with Cruise's finished and pausing shares, Land on its own row, the
+//!    ends (landings, quiet ends, the time from Land to landed; `none yet`),
+//!    unsupervised time (`none`), and how long it has measured, to when
+//!    (`harness_ab::ab_rows`). Its rows stand where nothing is counted yet,
+//!    so a background landing changes words above SUPERVISION's switches,
+//!    never their places. Never a "time saved".
+//! 4. **SUPERVISION** — the registry rows the harness owns: Supervise coding
 //!    agents (the master switch), one switch per supervisable agent (Supervise
 //!    Claude Code sessions, Watch codex-alab sessions, Supervise Antigravity CLI
 //!    sessions, Supervise Muse Code sessions, Supervise Gemini CLI sessions:
@@ -46,10 +71,7 @@
 //!    `settings/set/<key>` controls, so OCC saves, Undo, Search and Modified
 //!    behave as on every page; an enum row opens the ordinary choice picker,
 //!    which takes the page while open.
-//! 4. **WHAT THE HARNESS DID** — today and over 7 days, from its ledgers.
-//! 5. **EFFECT OF EACH AUTOPILOT** — the A/B: the share of agents' time spent
-//!    waiting for input under Cruise, Land and Off (and unsupervised), and
-//!    Cruise's beside Off's, for this aterm run. Never a "time saved".
+//! 5. **WHAT THE HARNESS DID** — today and over 7 days, from its ledgers.
 //! 6. **SETTINGS IN ATERM.TOML** — every `[harness]` key, its value, and
 //!    whether it is the default or yours: the person's own keys and how many
 //!    more are at their defaults, and under the card a disclosure that lists
@@ -64,8 +86,10 @@
 
 use super::*;
 use crate::autopilot_timers::TimerChoice;
+use crate::harness_ab::AbLead;
 use crate::harness_screen::{
-    HarnessSessionRow, autopilot_action, hands_back, parse_autopilot_action,
+    EveryPress, EveryRow, HarnessSessionRow, autopilot_action, every_action, hands_back,
+    parse_autopilot_action, parse_every_action,
 };
 use crate::native_app::{HarnessRequest, HarnessTimerRequest};
 use aterm_agent::supervise::Autopilot;
@@ -82,6 +106,17 @@ pub(super) const HARNESS_OPEN_CONFIG: &str = "harness/open-config";
 
 /// The SETTINGS IN ATERM.TOML card's disclosure: every key, or only yours.
 pub(super) const HARNESS_CONFIG_TOGGLE: &str = "harness/config/toggle";
+
+/// DECIDED FOR YOU's disclosure (§10.4.1): every choice made today, or the
+/// newest three.
+pub(super) const HARNESS_DECIDED_ALL: &str = "harness/decided/all";
+
+/// How many of today's choices DECIDED FOR YOU shows, its disclosure closed.
+const DECIDED_SHOWN: usize = 3;
+
+/// The most lines one choice's sentence is drawn on (its label keeps it
+/// whole).
+const DECIDED_LINES: usize = 4;
 
 /// A SESSIONS row's timer press: `harness/session/<id>/land-in/<minutes>`,
 /// `…/land-at`, `…/land-cancel` (design §9.3.4) — under the session prefix,
@@ -141,6 +176,16 @@ pub(super) fn show_action(local_id: u64) -> String {
     )
 }
 
+/// The `Every session` row's Timer disclosure: `harness/session/all/timer`
+/// (design §11.5.1), under the session prefix like a row's.
+pub(super) fn every_timer_toggle() -> String {
+    format!(
+        "{}{}/timer",
+        crate::harness_screen::SESSION_ACTION_PREFIX,
+        crate::harness_screen::EVERY_ID
+    )
+}
+
 /// [`show_action`] read back.
 fn parse_show_action(action: &str) -> Option<u64> {
     action
@@ -167,6 +212,9 @@ fn landing_key(focus: crate::harness_screen::HarnessFocus) -> Option<UiKey> {
 
 /// The AI CLIs button's key: its action is the sub-page's route.
 pub(super) const HARNESS_AI_CLIS: &str = "harness/ai-clis";
+
+/// The Tab Control button's key: its action is the sub-page's route.
+pub(super) const HARNESS_TAB_CONTROL: &str = "harness/tab-control";
 
 /// The page's heading (its rail label is the route's, "Harness").
 const HARNESS_PAGE_TITLE: &str = "Coding agent harness";
@@ -290,12 +338,32 @@ impl SettingsApp {
             };
             view.harness_focus = focus;
             match landing_key(focus) {
+                // A row's landing selects its whole block (its state, its
+                // day, its open timer under its buttons): all of it is drawn.
+                Some(key) if matches!(focus, crate::harness_screen::HarnessFocus::Session(_)) => {
+                    view.land_on_stop(key);
+                }
                 Some(key) => view.land_on_control(key),
-                None => view.page_scroll = 0,
+                None => view.land_at_top(),
             }
         } else if let Some(session) = parse_show_action(action) {
-            // Navigation writes nothing: no posture is weighed.
-            if self.harness.sessions.iter().any(|s| s.local_id == session) {
+            // Navigation writes nothing: no posture is weighed. A SESSIONS
+            // row's Show, or a DECIDED FOR YOU / TAB CONTROL row's Show tab
+            // (whose session may be one SESSIONS does not list: its agent has
+            // exited or it is a plain shell tab).
+            if self.harness.sessions.iter().any(|s| s.local_id == session)
+                || self
+                    .harness
+                    .decided_open
+                    .iter()
+                    .any(|s| s.local_id == session)
+                || self
+                    .harness
+                    .tabs
+                    .tabs
+                    .iter()
+                    .any(|r| r.show_local_id == Some(session))
+            {
                 cx.harness(HarnessRequest::Show { session });
             } else {
                 view.feedback = Some("That session is no longer open.".to_string());
@@ -303,6 +371,9 @@ impl SettingsApp {
         } else if action == HARNESS_CONFIG_TOGGLE {
             // The page's cards change height: its bound is the next render's.
             view.harness_config_open = !view.harness_config_open;
+            view.invalidate_result_page_limit();
+        } else if action == HARNESS_DECIDED_ALL {
+            view.harness_decided_open = !view.harness_decided_open;
             view.invalidate_result_page_limit();
         } else if action == HARNESS_OPEN_CONFIG {
             if view
@@ -321,7 +392,40 @@ impl SettingsApp {
         } else if let Some(session) = parse_timer_toggle(action) {
             // One row's disclosure at a time; the page's cards change height.
             view.harness_timer_open = (view.harness_timer_open != Some(session)).then_some(session);
+            if view.harness_timer_open.is_some() {
+                view.harness_every_timer_open = false;
+            }
             view.invalidate_result_page_limit();
+        } else if action == every_timer_toggle() {
+            view.harness_every_timer_open = !view.harness_every_timer_open;
+            if view.harness_every_timer_open {
+                view.harness_timer_open = None;
+            }
+            view.invalidate_result_page_limit();
+        } else if let Some(press) = parse_every_action(action) {
+            // The row stands only where SESSIONS lists two sessions or more,
+            // and acts only where the harness steers one of them; the host
+            // reads the live set again at the press.
+            match self.harness.every_row() {
+                None => {
+                    view.feedback = Some("There is no other session to set with it.".to_string())
+                }
+                Some(every) if every.steered == 0 => {
+                    view.feedback = Some(match every.product {
+                        Some(product) => nothing_to_steer(self.harness.posture, product),
+                        None => match self.harness.posture {
+                            posture @ (crate::autopilot::HarnessPosture::Unhosted
+                            | crate::autopilot::HarnessPosture::MasterOff) => {
+                                nothing_to_steer(posture, "")
+                            }
+                            _ => "Each agent's own switch is Off, so Autopilot has nothing to \
+                                  steer there."
+                                .to_string(),
+                        },
+                    });
+                }
+                Some(_) => cx.harness(HarnessRequest::Every(press)),
+            }
         } else if let Some((session, choice)) = parse_timer_action(action) {
             // By the session's own posture, as its mode buttons are.
             match self.harness.sessions.iter().find(|s| s.local_id == session) {
@@ -366,7 +470,7 @@ pub(super) fn harness_page(
         return harness_choice_page(state, width, cx);
     }
     let gap = settings_page_gap(state, width, viewport);
-    let maximum = page_maximum(SettingsRoute::Harness, width);
+    let maximum = PageLayout::Form.maximum(width);
     let page_width = settings_page_content_width(viewport.width, width, maximum);
     let (heading, heading_height) = pinned_heading(
         width,
@@ -412,7 +516,7 @@ fn harness_choice_page(
         }
     }
     let gap = settings_page_gap(state, width, cx.viewport);
-    let maximum = page_maximum(SettingsRoute::Harness, width);
+    let maximum = PageLayout::Form.maximum(width);
     let (mut out, _) = pinned_heading(
         width,
         cx.viewport,
@@ -470,20 +574,46 @@ fn harness_cards(
         crate::harness_screen::HarnessFocus::Session(id) => Some(id),
         _ => None,
     };
-    cards.extend(row_cards(
+    cards.extend(row_cards_inset(
         "harness/sessions",
         ("Sessions", ("SESSIONS", "SESSIONS")),
         session_rows(
             harness,
             rows_width,
             (inner, room),
-            state.harness_timer_open,
+            (state.harness_timer_open, state.harness_every_timer_open),
             selected,
         ),
-        room,
-        card_width,
+        (room, card_width),
+        true,
     ));
+    // DECIDED FOR YOU (§10.4.1), only on a day with a decision: right after
+    // SESSIONS, whose sessions its `Show tab`s raise.
+    if !harness.decided.is_empty() {
+        cards.extend(row_cards(
+            "harness/decided",
+            ("Decided for you", ("DECIDED FOR YOU", "DECIDED")),
+            decided_rows(harness, inner, state.harness_decided_open),
+            room,
+            card_width,
+        ));
+    }
     cards.push(harness_actions(harness, card_width));
+    // THE VERDICT UP FRONT (§11.6.1): EFFECT OF EACH AUTOPILOT right after
+    // the page's actions, ahead of SUPERVISION and WHAT THE HARNESS DID —
+    // nothing above SESSIONS moves — opening with its lead where it has one.
+    let mut effect = facts(
+        "harness/ab",
+        ("EFFECT OF EACH AUTOPILOT", "EFFECT"),
+        &harness.ab_rows,
+    );
+    if let (Some(lead), Some((card, height))) = (&harness.ab_lead, effect.first_mut()) {
+        let (block, block_height) = ab_lead_block(lead, inner);
+        card.children.insert(1, block);
+        *height += 4.0 + block_height;
+        card.layout = card.layout.height(Length::Fixed(*height));
+    }
+    cards.extend(effect);
     cards.extend(row_cards(
         "harness/switches",
         ("Supervision", ("SUPERVISION", "SUPERVISION")),
@@ -495,11 +625,6 @@ fn harness_cards(
         "harness/did",
         ("WHAT THE HARNESS DID", "WHAT IT DID"),
         &harness.did_rows,
-    ));
-    cards.extend(facts(
-        "harness/ab",
-        ("EFFECT OF EACH AUTOPILOT", "EFFECT"),
-        &harness.ab_rows,
     ));
     // The effective table: the person's own keys and how many are at their
     // defaults, or — its disclosure open — every key.
@@ -559,9 +684,16 @@ fn fits_in(text: &str, width: f32, role: SemanticRole, style: StyleRef) -> bool 
 /// STATUS'S TODAY (§10.3.1, [`crate::harness_screen::HarnessState::today_lines`])
 /// as one block of the card, keyed `harness/status/today`, its label both
 /// lines whole, no taller than `budget`: the first line in Hero type (the
-/// page heading's) where it is whole at the card's `inner` width, else in
-/// the page's plain type; the second, where there is one, plain. A plain
-/// line that does not fit is cut at a ` · ` joint ([`cut_at_joint`]).
+/// page heading's) where it counts and is whole at the card's `inner`
+/// width, else in the page's plain type — a note (`nothing yet today`,
+/// `reading…`, [`crate::harness_screen::today_counts`]) always plain; the
+/// second, where there is one, plain. A plain line that does not fit is cut
+/// at a ` · ` joint ([`cut_at_joint`]).
+///
+/// A NOTE KEEPS THE COUNTS' ROOM: where Hero type would hold it, a note is
+/// drawn plain in the Hero line's slot, so the counts that replace it (the
+/// first reading, the day's first act) move nothing under STATUS — not
+/// SESSIONS, not a row `⚙` has just landed on.
 ///
 /// THE BUDGET is what the page's first screen has left once SESSIONS' top
 /// is on it (§4 item 2: SESSIONS shares the first screen with the status).
@@ -577,11 +709,11 @@ pub(super) fn today_block(
     let scale = settings_text_scale();
     let plain_height = 28.0_f32.max(18.0 * scale);
     let hero_height = page_heading_height();
-    let line = |suffix: &str, text: &str, hero: bool| {
-        let (role, style, height) = if hero {
-            (SemanticRole::Heading, StyleRef::Hero, hero_height)
+    let line = |suffix: &str, text: &str, hero: bool, height: f32| {
+        let (role, style) = if hero {
+            (SemanticRole::Heading, StyleRef::Hero)
         } else {
-            (SemanticRole::Text, StyleRef::Primary, plain_height)
+            (SemanticRole::Text, StyleRef::Primary)
         };
         let shown = if hero {
             text.to_string()
@@ -607,19 +739,23 @@ pub(super) fn today_block(
         )
         .paint_only()
     };
-    let hero = fits_in(first, inner, SemanticRole::Heading, StyleRef::Hero);
+    // The Hero line's slot where Hero type holds the first line whole; its
+    // type Hero only where the line counts — a note is plain in it.
+    let tall = fits_in(first, inner, SemanticRole::Heading, StyleRef::Hero);
+    let counts = crate::harness_screen::today_counts(first);
     let more = !second.is_empty();
-    // Each shape, fullest first: (Hero for the first line, the second drawn).
-    let shapes = [(hero, more), (false, more), (false, false)];
-    let (hero, more) = shapes.into_iter().find(|&(hero, more)| {
-        let height = if hero { hero_height } else { plain_height }
+    // Each shape, fullest first: (the Hero line's slot, the second drawn).
+    let shapes = [(tall, more), (false, more), (false, false)];
+    let (tall, more) = shapes.into_iter().find(|&(tall, more)| {
+        let height = if tall { hero_height } else { plain_height }
             + if more { 4.0 + plain_height } else { 0.0 };
         height <= budget
     })?;
-    let mut children = vec![line("hero", first, hero)];
-    let mut height = if hero { hero_height } else { plain_height };
+    let first_height = if tall { hero_height } else { plain_height };
+    let mut children = vec![line("hero", first, tall && counts, first_height)];
+    let mut height = first_height;
     if more {
-        children.push(line("more", second, false));
+        children.push(line("more", second, false, plain_height));
         height += 4.0 + plain_height;
     }
     let label = if second.is_empty() {
@@ -636,6 +772,216 @@ pub(super) fn today_block(
         .children(children),
         height,
     ))
+}
+
+/// The room between a lead share's Hero figure and its plain words.
+const LEAD_WORD_GAP: f32 = 6.0;
+
+/// The room between the lead's two sides.
+const LEAD_SIDE_GAP: f32 = 24.0;
+
+/// `text` as `width` lines in plain type, each whole: broken greedily at the
+/// joins `tokens` carry (`(join, token)`; the first join is never drawn) and,
+/// inside a token too wide for a line, between its words; a word too wide
+/// alone is elided. The card's own rows break their values at ` · ` too
+/// (`metadata_value_lines`), so no part of the lead is ever cut away.
+fn lead_lines(tokens: &[(&str, String)], width: f32) -> Vec<String> {
+    let fits = |text: &str| fits_in(text, width, SemanticRole::Text, StyleRef::Primary);
+    let mut pieces: Vec<(&str, &str)> = Vec::new();
+    for (join, token) in tokens {
+        if fits(token) {
+            pieces.push((join, token));
+            continue;
+        }
+        for (index, word) in token.split(' ').enumerate() {
+            pieces.push((if index == 0 { join } else { " " }, word));
+        }
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for (join, piece) in pieces {
+        let candidate = if current.is_empty() {
+            piece.to_string()
+        } else {
+            format!("{current}{join}{piece}")
+        };
+        if current.is_empty() || fits(&candidate) {
+            current = candidate;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current = piece.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+        .into_iter()
+        .map(|line| {
+            if fits(&line) {
+                line
+            } else {
+                crate::native_ui::fit_native_text_label(&line, width)
+            }
+        })
+        .collect()
+}
+
+/// EFFECT OF EACH AUTOPILOT'S LEAD (§11.6.3, item 2;
+/// [`crate::harness_ab::ab_lead`]) as the card's first block, keyed
+/// `harness/ab/lead` and spoken whole ([`AbLead::words`]), its parts
+/// drawn only:
+///
+/// * **Both sides**: the caption, `Working time held at a box or a
+///   question`, in the page's plain type; under it the two sides in a row —
+///   each share in Hero type (the page heading's), its working time beside
+///   it plain, on the figure's baseline — where the row is whole at the
+///   card's `inner` width. Otherwise the whole lead in plain type, `Working
+///   time held at a box or a question: <1% of 6h 10m on Cruise · 14% of 25m
+///   off`, on as many lines as it needs, broken at its joins
+///   ([`lead_lines`]): never cut, since each side is half the comparison.
+/// * **No Off time**: the note, always plain, broken between words.
+///
+/// Its height comes back with it.
+pub(super) fn ab_lead_block(lead: &AbLead, inner: f32) -> (UiNode, f32) {
+    let plain_height = 28.0_f32.max(18.0 * settings_text_scale());
+    let hero_height = page_heading_height();
+    let width_of = |text: &str, role: SemanticRole, style: StyleRef| {
+        let (px, face) = crate::native_ui::text_paint_metrics(role, style);
+        crate::tray_raster::ui_text_width_for(face, text, px) + ABOUT_METADATA_TEXT_SAFETY
+    };
+    let text = |key: &str,
+                text: &str,
+                (role, style): (SemanticRole, StyleRef),
+                width: Length,
+                height: f32| {
+        UiNode::new(
+            format!("harness/ab/lead/{key}"),
+            UiContent::Text(TextSpec {
+                text: text.to_string(),
+                role,
+                style,
+            }),
+        )
+        .layout(Layout::default().width(width).height(Length::Fixed(height)))
+        .paint_only()
+    };
+    let hero = (SemanticRole::Heading, StyleRef::Hero);
+    let plain = (SemanticRole::Text, StyleRef::Primary);
+    let block = |children: Vec<UiNode>, height: f32| {
+        (
+            UiNode::new(
+                "harness/ab/lead",
+                UiContent::Group(GroupSpec::new(lead.words())),
+            )
+            .layout(Layout::column().height(Length::Fixed(height)).gap(4.0))
+            .children(children),
+            height,
+        )
+    };
+    let lines = |tokens: &[(&str, String)]| {
+        let lines = lead_lines(tokens, inner);
+        let height = lines.len() as f32 * plain_height + lines.len().saturating_sub(1) as f32 * 4.0;
+        let children = lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                text(
+                    &format!("line-{index}"),
+                    line,
+                    plain,
+                    Length::Fill,
+                    plain_height,
+                )
+            })
+            .collect();
+        block(children, height)
+    };
+    let AbLead::Both { cruise, off } = lead else {
+        let note = crate::harness_ab::LEAD_NOTE;
+        return lines(&[("", note.to_string())]);
+    };
+    let sides = [("cruise", cruise), ("off", off)];
+    let widths = sides.map(|(_, side)| {
+        (
+            width_of(&side.share, hero.0, hero.1),
+            width_of(&side.of, plain.0, plain.1),
+        )
+    });
+    // The plain words stand on the Hero figure's baseline. The text paint
+    // centres a line's cap height in its node (`tray_raster::row_baseline`),
+    // so each side's words take the row's whole height and its figure the
+    // row's height less the two cap heights' difference.
+    let cap_of = |(role, style): (SemanticRole, StyleRef)| {
+        let (px, _) = crate::native_ui::text_paint_metrics(role, style);
+        2.0 * crate::tray_raster::row_baseline(0.0, 0.0, px)
+    };
+    let share_height = hero_height - (cap_of(hero) - cap_of(plain)).max(0.0);
+    let whole = widths
+        .iter()
+        .map(|(share, of)| share + LEAD_WORD_GAP + of)
+        .sum::<f32>()
+        + LEAD_SIDE_GAP;
+    if whole > inner {
+        let caption = format!("{}:", crate::harness_ab::LEAD_CAPTION);
+        return lines(&[
+            ("", caption),
+            (" ", cruise.words()),
+            (crate::harness_screen::JOINT, off.words()),
+        ]);
+    }
+    let row = sides
+        .iter()
+        .zip(widths)
+        .map(|((key, side), (share_width, of_width))| {
+            UiNode::new(
+                format!("harness/ab/lead/{key}"),
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(
+                Layout::row()
+                    .width(Length::Fixed(share_width + LEAD_WORD_GAP + of_width))
+                    .height(Length::Fixed(hero_height))
+                    .gap(LEAD_WORD_GAP),
+            )
+            .paint_only()
+            .children(vec![
+                text(
+                    &format!("{key}/share"),
+                    &side.share,
+                    hero,
+                    Length::Fixed(share_width),
+                    share_height,
+                ),
+                text(
+                    &format!("{key}/of"),
+                    &side.of,
+                    plain,
+                    Length::Fixed(of_width),
+                    hero_height,
+                ),
+            ])
+        })
+        .collect();
+    let shares = UiNode::new(
+        "harness/ab/lead/shares",
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+    )
+    .layout(
+        Layout::row()
+            .height(Length::Fixed(hero_height))
+            .gap(LEAD_SIDE_GAP),
+    )
+    .paint_only()
+    .children(row);
+    let caption = text(
+        "caption",
+        crate::harness_ab::LEAD_CAPTION,
+        plain,
+        Length::Fill,
+        plain_height,
+    );
+    block(vec![caption, shares], plain_height + 4.0 + hero_height)
 }
 
 /// The SETTINGS IN ATERM.TOML card's facts: every `[harness]` setting while
@@ -670,7 +1016,7 @@ fn config_disclosure(open: bool, keys: usize, card_width: f32) -> (UiNode, f32) 
     let height = scaled_control_height();
     let (label, visual) = if open {
         (
-            "Show only the settings you changed".to_string(),
+            "Show only yours: the settings you changed".to_string(),
             "Show only yours".to_string(),
         )
     } else {
@@ -744,6 +1090,28 @@ pub(super) fn row_cards(
     room: f32,
     card_width: f32,
 ) -> Vec<(UiNode, f32)> {
+    row_cards_inset(key, names, rows, (room, card_width), false)
+}
+
+/// How far a SESSIONS row's words stand inside the block its landing draws
+/// the accent card on (§10.3.1): the outline clear of every glyph and button.
+const ROW_INSET: f32 = 8.0;
+
+/// [`row_cards`], where `blocks`, of rows a landing can draw selected
+/// (SESSIONS, [`session_timer`]'s block): each row's block keeps
+/// [`ROW_INSET`] (half the card's padding, where that is tight) beside its
+/// words and half the gap between rows over and under them, taken from the
+/// card's padding and that gap — so every word stands where it would stand
+/// without it, the heading's too (inset as the rows are, in a frame the list
+/// still reads as the card's head), and nothing moves when a row lands. The
+/// card's height is the same.
+fn row_cards_inset(
+    key: &str,
+    names: (&str, (&str, &str)),
+    rows: Vec<(UiNode, f32)>,
+    (room, card_width): (f32, f32),
+    blocks: bool,
+) -> Vec<(UiNode, f32)> {
     let (label, heading) = names;
     let heading_height = 22.0_f32.max(16.0 * settings_text_scale());
     let tallest = rows
@@ -757,6 +1125,11 @@ pub(super) fn row_cards(
     };
     let fixed = 2.0 * pad + heading_height;
     let inner = (card_width - 2.0 * pad).max(0.0);
+    let (inset_x, inset_y) = if blocks {
+        (ROW_INSET.min(pad / 2.0), CARD_GAP / 2.0)
+    } else {
+        (0.0, 0.0)
+    };
     chunk_rows(rows, room - fixed)
         .into_iter()
         .enumerate()
@@ -775,18 +1148,43 @@ pub(super) fn row_cards(
                     .iter()
                     .map(|(_, height)| height + CARD_GAP)
                     .sum::<f32>();
-            let mut children = vec![
-                UiNode::new(
-                    format!("{key}/heading"),
-                    UiContent::Text(TextSpec {
-                        text: heading,
-                        role: SemanticRole::Heading,
-                        style: StyleRef::Quiet,
-                    }),
+            let mut heading = UiNode::new(
+                format!("{key}/heading"),
+                UiContent::Text(TextSpec {
+                    text: heading,
+                    role: SemanticRole::Heading,
+                    style: StyleRef::Quiet,
+                }),
+            )
+            .layout(Layout::default().height(Length::Fixed(heading_height)));
+            if blocks {
+                heading = UiNode::new(
+                    format!("{key}/heading-frame"),
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
                 )
-                .layout(Layout::default().height(Length::Fixed(heading_height))),
-            ];
-            children.extend(rows.into_iter().map(|(row, _)| row));
+                .layout(
+                    Layout::column()
+                        .height(Length::Fixed(heading_height + inset_y))
+                        .padding(Insets {
+                            top: 0.0,
+                            right: inset_x,
+                            bottom: inset_y,
+                            left: inset_x,
+                        }),
+                )
+                .paint_only()
+                .children(vec![heading]);
+            }
+            let mut children = vec![heading];
+            children.extend(rows.into_iter().map(|(mut row, height)| {
+                if blocks {
+                    row.layout = row
+                        .layout
+                        .height(Length::Fixed(height + 2.0 * inset_y))
+                        .padding(Insets::symmetric(inset_x, inset_y));
+                }
+                row
+            }));
             let card = UiNode::new(
                 key,
                 UiContent::Group(GroupSpec::new(label).style(StyleRef::Secondary)),
@@ -795,8 +1193,13 @@ pub(super) fn row_cards(
                 Layout::column()
                     .width(Length::Fill)
                     .height(Length::Fixed(height))
-                    .padding(Insets::all(pad))
-                    .gap(CARD_GAP)
+                    .padding(Insets {
+                        top: pad,
+                        right: pad - inset_x,
+                        bottom: pad - inset_y,
+                        left: pad - inset_x,
+                    })
+                    .gap(CARD_GAP - 2.0 * inset_y)
                     .clipped(),
             )
             .children(children);
@@ -826,19 +1229,31 @@ fn chunk_rows(rows: Vec<(UiNode, f32)>, room: f32) -> Vec<Vec<(UiNode, f32)>> {
     chunks
 }
 
-/// The page's three actions under the STATUS card: Refresh (busy while the
-/// ledgers are read), Open aterm.toml, and AI CLIs (its sub-page, Settings ▸
-/// Harness ▸ AI CLIs). Side by side where every label fits whole, else
-/// stacked.
+/// The page's four actions under the STATUS card: Refresh (busy while the
+/// ledgers are read), Open aterm.toml, AI CLIs (Settings ▸ Harness ▸ AI CLIs),
+/// and Tab Control (Settings ▸ Harness ▸ Tab Control). Side by side where
+/// every label fits whole, else stacked.
 fn harness_actions(harness: &HarnessProjection, card_width: f32) -> (UiNode, f32) {
     let control_height = scaled_control_height();
     let need = |label: &str| crate::native_ui::native_button_label_width(label) + 40.0;
-    let row = 3.0 * need("Open aterm.toml") + 2.0 * CARD_GAP <= card_width;
-    let button = |key: &str, label: &str, busy: bool, style: StyleRef| {
-        // Stacked, a button is the card's width: its label is fitted to it.
-        let visual = crate::native_ui::fit_native_button_label(label, (card_width - 40.0).max(0.0));
+    let row = need("Refresh")
+        + need("Open aterm.toml")
+        + need("AI CLIs")
+        + need("Tab Control")
+        + 3.0 * CARD_GAP
+        <= card_width;
+    let subpages_side_by_side =
+        !row && need("AI CLIs") + need("Tab Control") + CARD_GAP <= card_width;
+    let button = |key: &str, label: &str, busy: bool, style: StyleRef, width: Length| {
+        let max_w = match width {
+            Length::Fixed(w) => (w - 40.0).max(0.0),
+            _ => (card_width - 40.0).max(0.0),
+        };
+        let visual = crate::native_ui::fit_native_button_label(label, max_w);
         let action = if key == HARNESS_AI_CLIS {
             route_action(SettingsRoute::Ai)
+        } else if key == HARNESS_TAB_CONTROL {
+            route_action(SettingsRoute::Tabs)
         } else {
             ActionId::new(key)
         };
@@ -855,33 +1270,98 @@ fn harness_actions(harness: &HarnessProjection, card_width: f32) -> (UiNode, f32
         )
         .layout(
             Layout::default()
-                .width(if row {
-                    Length::Fixed(need("Open aterm.toml"))
-                } else {
-                    Length::Fill
-                })
+                .width(width)
                 .height(Length::Fixed(control_height)),
         )
     };
-    let buttons = vec![
-        button(
-            HARNESS_REFRESH,
-            "Refresh",
-            harness.collecting,
-            StyleRef::Primary,
-        ),
-        button(
-            HARNESS_OPEN_CONFIG,
-            "Open aterm.toml",
-            false,
-            StyleRef::Secondary,
-        ),
-        button(HARNESS_AI_CLIS, "AI CLIs", false, StyleRef::Secondary),
-    ];
+    let w = |label: &str| {
+        if row {
+            Length::Fixed(need(label))
+        } else {
+            Length::Fill
+        }
+    };
+    let buttons = if subpages_side_by_side {
+        vec![
+            button(
+                HARNESS_REFRESH,
+                "Refresh",
+                harness.collecting,
+                StyleRef::Primary,
+                Length::Fill,
+            ),
+            button(
+                HARNESS_OPEN_CONFIG,
+                "Open aterm.toml",
+                false,
+                StyleRef::Secondary,
+                Length::Fill,
+            ),
+            UiNode::new(
+                "harness/actions/subpages",
+                UiContent::Group(GroupSpec::new("Harness sub-pages")),
+            )
+            .layout(
+                Layout::row()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(control_height))
+                    .gap(CARD_GAP),
+            )
+            .children(vec![
+                button(
+                    HARNESS_AI_CLIS,
+                    "AI CLIs",
+                    false,
+                    StyleRef::Secondary,
+                    Length::Fixed(need("AI CLIs")),
+                ),
+                button(
+                    HARNESS_TAB_CONTROL,
+                    "Tab Control",
+                    false,
+                    StyleRef::Secondary,
+                    Length::Fill,
+                ),
+            ]),
+        ]
+    } else {
+        vec![
+            button(
+                HARNESS_REFRESH,
+                "Refresh",
+                harness.collecting,
+                StyleRef::Primary,
+                w("Refresh"),
+            ),
+            button(
+                HARNESS_OPEN_CONFIG,
+                "Open aterm.toml",
+                false,
+                StyleRef::Secondary,
+                w("Open aterm.toml"),
+            ),
+            button(
+                HARNESS_AI_CLIS,
+                "AI CLIs",
+                false,
+                StyleRef::Secondary,
+                w("AI CLIs"),
+            ),
+            button(
+                HARNESS_TAB_CONTROL,
+                "Tab Control",
+                false,
+                StyleRef::Secondary,
+                w("Tab Control"),
+            ),
+        ]
+    };
     let height = if row {
         control_height
-    } else {
+    } else if subpages_side_by_side {
         3.0 * control_height + 2.0 * CARD_GAP
+    } else {
+        4.0 * control_height + 3.0 * CARD_GAP
     };
     let layout = if row { Layout::row() } else { Layout::column() };
     (
@@ -896,9 +1376,9 @@ fn harness_actions(harness: &HarnessProjection, card_width: f32) -> (UiNode, f32
 }
 
 /// The SUPERVISION card's rows, each the way every page draws a setting
-/// ([`page_setting_rows_noted`]): its note and its Changed tag and Reset with
+/// ([`page_box_setting_rows`]): its note and its Changed tag and Reset with
 /// it. A note two rows share (Answer questions and Question priority) is
-/// drawn once, under the last of them ([`prefs::row_notes`]). A row and its
+/// drawn once, after the last of them ([`prefs::row_notes`]). A row and its
 /// note taller than a card's `room` together (large type on a short host)
 /// list the note as the card's next rows.
 fn switch_rows(
@@ -915,10 +1395,8 @@ fn switch_rows(
     // at the tight padding.
     let heading_height = 22.0_f32.max(16.0 * settings_text_scale());
     let row_room = (room - 2.0 * TIGHT_CARD_PAD - heading_height - CARD_GAP).max(0.0);
-    keys.iter()
-        .zip(notes)
-        .flat_map(|(key, note)| page_setting_rows_noted(state, key, width, inner, note, row_room))
-        .collect()
+    let rows: Vec<(&str, Option<prefs::RowNote<'_>>)> = keys.iter().copied().zip(notes).collect();
+    page_box_setting_rows(state, &rows, width, inner, None, Some(row_room))
 }
 
 /// "No Claude Code or Codex session is open": every agent the harness
@@ -940,13 +1418,15 @@ fn no_session_open() -> String {
 }
 
 /// The SESSIONS card's rows: one per live session of an agent the harness
-/// supervises, or the one line that says none is open (or that the page is
-/// still reading).
+/// supervises, then — where it lists two or more — the `Every session` row
+/// ([`every_row`]), or the one line that says none is open (or that the
+/// page is still reading). `timer_open`: the row whose Timer disclosure is
+/// open, and whether the `Every session` row's is.
 fn session_rows(
     harness: &HarnessProjection,
     width: SettingsWidth,
     (inner, room): (f32, f32),
-    timer_open: Option<u64>,
+    (timer_open, every_open): (Option<u64>, bool),
     selected: Option<u64>,
 ) -> Vec<(UiNode, f32)> {
     if harness.sessions.is_empty() {
@@ -974,7 +1454,7 @@ fn session_rows(
     let heading_height = 22.0_f32.max(16.0 * settings_text_scale());
     let row_room = (room - 2.0 * TIGHT_CARD_PAD - heading_height - CARD_GAP).max(0.0);
     let measure = RowMeasure::of(&harness.sessions, width, (inner, row_room));
-    harness
+    let mut rows: Vec<(UiNode, f32)> = harness
         .sessions
         .iter()
         .map(|row| {
@@ -986,28 +1466,409 @@ fn session_rows(
                 (node, height),
                 row.default.is_some(),
                 offer,
-                open,
+                (open, landed),
                 inner,
             )
         })
-        .collect()
+        .collect();
+    // AFTER every per-session row (design §11.5.1): a session opening or
+    // closing adds or takes the row away below every per-session button, so
+    // it moves none of them under the pointer, and SESSIONS' top is where it
+    // was.
+    if let Some(every) = &harness.every {
+        rows.push(every_row(
+            every,
+            measure,
+            offer,
+            every_open,
+            (inner, row_room),
+        ));
+    }
+    rows
+}
+
+/// The `Every session` row's faces, in its order: Cruise, Land, its Timer
+/// disclosure, Follow the default.
+const EVERY_FACES: [&str; 4] = ["Cruise", "Land", "Timer", "Follow the default"];
+
+/// SESSIONS' `EVERY SESSION` ROW (design §11.5.1), after the per-session
+/// rows: its name and what is there now (`5 sessions: 3 cruising, 1
+/// landing, 1 off`, [`EveryRow::line`]), then `Cruise`, `Land`, `Timer` and
+/// `Follow the default`, each spoken with what it moves (`Land every
+/// session, 3 sessions`) and described with what stays (`Land 3 sessions;
+/// the 1 off stays off`, [`EveryRow::description`]); its Timer, open, holds
+/// `1 hour`, `2 hours`, `4 hours` and `at 18:00` (with `[harness] land_at` set,
+/// `offer`) as a row's does, and no cancel: Cruise drops every timer. No
+/// Off: the master switch, SUPERVISION's first row, is the bulk Off. Laid
+/// out at the rows' `measure`: beside the words, Cruise and Land under the
+/// rows' Cruise and Land, in their band of five (Timer under Off, Follow the
+/// default across Timer and Show); else stacked, as many to a line as hold
+/// their faces whole. Its buttons act only where the harness steers one of
+/// the sessions (inert under the master switch, with the row saying so),
+/// and each press is one host request ([`HarnessRequest::Every`]). One
+/// block (`harness/session/all/block`), as a row's is.
+fn every_row(
+    every: &EveryRow,
+    measure: RowMeasure,
+    offer: Option<crate::claude_lights::LandAtGlass>,
+    open: bool,
+    (inner, row_room): (f32, f32),
+) -> (UiNode, f32) {
+    use crate::harness_screen::sessions_words;
+    let enabled = every.steered > 0;
+    let scale = settings_text_scale();
+    let title_height = 22.0_f32.max(18.0 * scale);
+    let detail_height = 18.0_f32.max(16.0 * scale);
+    let control_height = scaled_control_height();
+    let key = format!(
+        "{}{}",
+        crate::harness_screen::SESSION_ACTION_PREFIX,
+        crate::harness_screen::EVERY_ID
+    );
+    let face_width = |face: &str| crate::native_ui::native_button_label_width(face);
+    let widest = EVERY_FACES
+        .iter()
+        .map(|face| face_width(face))
+        .fold(0.0_f32, f32::max);
+    // Beside the words, the rows' band of five: Follow the default takes
+    // the last two slots, where its face is whole there.
+    let wide_follow = 2.0 * measure.button_width + MODE_GAP;
+    let stacked = measure.stacked || face_width(EVERY_FACES[3]) + 20.0 > wide_follow;
+    // Stacked, the flow: all four on a line where each holds the widest face
+    // whole, else two and two, else one a line — but never more lines than
+    // let the row fit one card of the page.
+    const FLOWS: [&[u8]; 3] = [&[4], &[2, 2], &[1, 1, 1, 1]];
+    let lines: &'static [u8] = if stacked {
+        let want = FLOWS
+            .iter()
+            .position(|flow| {
+                flow.iter()
+                    .all(|&count| line_button(inner, count) - 20.0 >= widest)
+            })
+            .unwrap_or(FLOWS.len() - 1);
+        FLOWS[..=want]
+            .iter()
+            .rev()
+            .find(|flow| {
+                stacked_row_height(f32::from(u8::try_from(flow.len()).unwrap_or(u8::MAX)))
+                    <= row_room
+            })
+            .copied()
+            .unwrap_or(FLOWS[0])
+    } else {
+        FLOWS[0]
+    };
+    // Each button's width: beside the words, Cruise, Land and Timer one slot
+    // each and Follow the default two; stacked, a line's buttons share it.
+    let width_of = |index: usize| -> f32 {
+        if !stacked {
+            return if index == 3 {
+                wide_follow
+            } else {
+                measure.button_width
+            };
+        }
+        let mut start = 0;
+        for &count in lines {
+            start += usize::from(count);
+            if index < start {
+                return line_button(inner, count);
+            }
+        }
+        inner
+    };
+    let presses = [
+        Some(EveryPress::Mode(Autopilot::Cruise)),
+        Some(EveryPress::Mode(Autopilot::Land)),
+        None,
+        Some(EveryPress::Follow),
+    ];
+    let timer = EveryPress::Timer(TimerChoice::In(60));
+    let buttons: Vec<UiNode> = EVERY_FACES
+        .iter()
+        .zip(presses)
+        .enumerate()
+        .map(|(index, (face, press))| {
+            let room = (width_of(index) - 20.0).max(0.0);
+            let (action, label, description, expanded) = match press {
+                Some(press) => {
+                    let moved = sessions_words(every.moved(press));
+                    let label = match press {
+                        EveryPress::Mode(mode) => {
+                            format!("{} every session, {moved}", mode_label(mode))
+                        }
+                        // The Timer's choices are its disclosure's (below).
+                        EveryPress::Follow | EveryPress::Timer(_) => {
+                            format!("Follow the default for every session, {moved}")
+                        }
+                    };
+                    let label = format!("{label}{}", every.spoken_tail(press));
+                    (every_action(press), label, every.description(press), None)
+                }
+                None => (
+                    every_timer_toggle(),
+                    format!(
+                        "Timer for every session, {}",
+                        sessions_words(every.moved(timer))
+                    ),
+                    every.description(timer),
+                    Some(open),
+                ),
+            };
+            let mut spec = ButtonSpec::new(label)
+                .visual_label(crate::native_ui::fit_native_button_label(face, room));
+            spec.description = Some(description);
+            // One press writes every session: it goes only where the pointer
+            // looked, never where a session opening or closing above, or the
+            // row's own press, moved it under a still pointer — nor does a
+            // session's button the layout moves under a pointer resting here.
+            UiNode::new(
+                action.clone(),
+                UiContent::Button(
+                    Control::new(spec, ActionId::new(action))
+                        .look_first()
+                        .state(ControlState {
+                            enabled,
+                            expanded,
+                            ..ControlState::default()
+                        })
+                        .style(if press.is_some() {
+                            StyleRef::Secondary
+                        } else {
+                            StyleRef::Quiet
+                        }),
+                ),
+            )
+            .layout(
+                Layout::default()
+                    .width(if stacked {
+                        Length::Fill
+                    } else {
+                        Length::Fixed(width_of(index))
+                    })
+                    .height(Length::Fill),
+            )
+        })
+        .collect();
+    let text_width = if stacked {
+        inner
+    } else {
+        (inner - 5.0 * (measure.button_width + MODE_GAP)).max(0.0)
+    };
+    let text = |suffix: &str, text: String, role: SemanticRole, style: StyleRef, height: f32| {
+        UiNode::new(
+            format!("{key}/{suffix}"),
+            UiContent::Text(TextSpec { text, role, style }),
+        )
+        .layout(
+            Layout::default()
+                .width(Length::Fill)
+                .height(Length::Fixed(height)),
+        )
+        .paint_only()
+    };
+    let line = every.line();
+    let title = text(
+        "title",
+        crate::native_ui::fit_native_text_label("Every session", text_width),
+        SemanticRole::Text,
+        StyleRef::Primary,
+        title_height,
+    );
+    let detail = text(
+        "detail",
+        crate::native_ui::fit_native_status_label(&line, text_width),
+        SemanticRole::Status,
+        StyleRef::Quiet,
+        detail_height,
+    );
+    let label = format!("Every session, {line}");
+    let (row, height) = if stacked {
+        let mut children = vec![title, detail];
+        let mut rest = buttons.into_iter();
+        let mut start = 0;
+        for (n, &count) in lines.iter().enumerate() {
+            let count = usize::from(count);
+            let on_line: Vec<UiNode> = rest.by_ref().take(count).collect();
+            let (suffix, name) = if n == 0 {
+                (
+                    "modes".to_string(),
+                    "Autopilot for every session".to_string(),
+                )
+            } else {
+                let faces = EVERY_FACES.get(start..start + count).unwrap_or_default();
+                (format!("line/{n}"), faces.join(", "))
+            };
+            children.push(
+                UiNode::new(
+                    format!("{key}/{suffix}"),
+                    UiContent::Group(GroupSpec::new(name)),
+                )
+                .layout(
+                    Layout::row()
+                        .height(Length::Fixed(control_height))
+                        .gap(MODE_GAP),
+                )
+                .children(on_line),
+            );
+            start += count;
+        }
+        let height = stacked_row_height(f32::from(u8::try_from(lines.len()).unwrap_or(u8::MAX)));
+        (
+            UiNode::new(key.clone(), UiContent::Group(GroupSpec::new(label)))
+                .layout(Layout::column().height(Length::Fixed(height)).gap(4.0))
+                .children(children),
+            height,
+        )
+    } else {
+        let height = control_height.max(title_height + detail_height);
+        let words = UiNode::new(
+            format!("{key}/words"),
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(Layout::column().width(Length::Fill).height(Length::Fill))
+        .children(vec![title, detail]);
+        let mut children = vec![words];
+        children.extend(buttons);
+        (
+            UiNode::new(key.clone(), UiContent::Group(GroupSpec::new(label)))
+                .layout(Layout::row().height(Length::Fixed(height)).gap(MODE_GAP))
+                .children(children),
+            height,
+        )
+    };
+    // The Timer, open: `1 hour`, `2 hours`, `4 hours`, `at 18:00`, each as wide as its
+    // words, in as many lines as the column needs.
+    let mut children = vec![row];
+    let mut total = height;
+    if open {
+        let moved = sessions_words(every.moved(timer));
+        let mut choices: Vec<(EveryPress, String, String)> = crate::autopilot_menu::LAND_IN_MINUTES
+            .iter()
+            .map(|&minutes| {
+                let hours = minutes / 60;
+                let words = if hours == 1 {
+                    "1 hour".to_string()
+                } else {
+                    format!("{hours} hours")
+                };
+                // It paints the words its name says ("1 hour"), as a
+                // session row's Timer does, so a speech user can say what
+                // they see.
+                (
+                    EveryPress::Timer(TimerChoice::In(minutes)),
+                    format!("Cruise every session for {words}, then land, {moved}"),
+                    words,
+                )
+            })
+            .collect();
+        if let Some(at) = offer {
+            // Named by the words it paints ("at Sat 18:00"), as a session
+            // row's is.
+            let when = crate::autopilot_menu::when(at);
+            choices.push((
+                EveryPress::Timer(TimerChoice::At),
+                format!("Cruise every session, then land at {when}, {moved}"),
+                format!("at {when}"),
+            ));
+        }
+        // Beside the words, under the Timer and Follow the default only: a
+        // row above shrinking (Cruise drops the timers' `lands at` lines)
+        // lifts this line into the row's place, and nothing of it then sits
+        // where Cruise or Land was. Stacked, the whole column.
+        let (indent, room) = if stacked {
+            (0.0, inner)
+        } else {
+            let room = (3.0 * measure.button_width + 2.0 * MODE_GAP).min(inner);
+            (inner - room, room)
+        };
+        let mut lines: Vec<Vec<UiNode>> = Vec::new();
+        let mut used = 0.0_f32;
+        for (press, label, face) in choices {
+            let width = (face_width(&face) + 40.0).min(room);
+            let action = every_action(press);
+            let mut spec = ButtonSpec::new(label).visual_label(
+                crate::native_ui::fit_native_button_label(&face, (width - 24.0).max(0.0)),
+            );
+            spec.description = Some(every.description(press));
+            let node = UiNode::new(
+                action.clone(),
+                UiContent::Button(
+                    Control::new(spec, ActionId::new(action))
+                        .look_first()
+                        .state(ControlState {
+                            enabled,
+                            ..ControlState::default()
+                        })
+                        .style(StyleRef::Quiet),
+                ),
+            )
+            .layout(
+                Layout::default()
+                    .width(Length::Fixed(width))
+                    .height(Length::Fill),
+            );
+            match lines.last_mut() {
+                Some(line) if used + MODE_GAP + width <= room => {
+                    used += MODE_GAP + width;
+                    line.push(node);
+                }
+                _ => {
+                    used = width;
+                    lines.push(vec![node]);
+                }
+            }
+        }
+        for (i, line) in lines.into_iter().enumerate() {
+            children.push(
+                UiNode::new(
+                    format!("{key}/timer-row/{i}"),
+                    UiContent::Group(GroupSpec::new("Timer for every session")),
+                )
+                .layout(
+                    Layout::row()
+                        .height(Length::Fixed(control_height))
+                        .gap(MODE_GAP)
+                        .padding(Insets {
+                            left: indent,
+                            ..Insets::default()
+                        }),
+                )
+                .children(line),
+            );
+            total += control_height + 4.0;
+        }
+    }
+    (
+        UiNode::new(
+            format!("{key}/block"),
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(Layout::column().height(Length::Fixed(total)).gap(4.0))
+        .children(children),
+        total,
+    )
 }
 
 /// A SESSIONS row under its STATE LINE and its open TIMER (§9.3.4): the
 /// `row` node as built (its `Timer` disclosure beside the mode buttons,
 /// [`session_row`]), then — where its glass says something — the state line
 /// (`lands at 18:00`, `landed 17:42`, `last: ✓ approved 14:05`: clock times
-/// only), then, the disclosure open, `1 h`, `2 h`, `4 h`, `at 18:00` (with
+/// only), then, the disclosure open, `1 hour`, `2 hours`, `4 hours`, `at 18:00` (with
 /// `[harness] land_at` set, `offer`) and `Cancel` (while a timer is armed),
 /// in as many lines as the column needs. Closed and with nothing to say, the
 /// row is as tall as v1's. The timer's buttons act only where the modes do
-/// (`enabled`). One column.
+/// (`enabled`). One column: the row's BLOCK (`harness/session/<id>/block`),
+/// which the page's landing (`landed`, §10.3.1) draws whole on the accent
+/// card the page's selected things wear — the row, its state, its day and
+/// its timer's lines — inset from its words by the room [`row_cards_inset`]
+/// gives it.
 fn session_timer(
     row: &HarnessSessionRow,
     (node, height): (UiNode, f32),
     enabled: bool,
     offer: Option<crate::claude_lights::LandAtGlass>,
-    open: bool,
+    (open, landed): (bool, bool),
     inner: f32,
 ) -> (UiNode, f32) {
     let scale = settings_text_scale();
@@ -1114,23 +1975,31 @@ fn session_timer(
             };
             buttons.push(button(
                 timer_action(row.local_id, TimerChoice::In(minutes)),
+                // It paints the words its name says ("1 hour"), so a
+                // speech user can say what they see.
                 format!("Cruise for {words}, then land"),
-                &format!("{hours} h"),
+                &words,
                 enabled,
                 None,
             ));
         }
         if let Some(at) = offer {
-            buttons.push(button(
+            // Named by the words it paints ("Cruise, then land at Sat
+            // 18:00"); the day in full is its description.
+            let (mut node, width) = button(
                 timer_action(row.local_id, TimerChoice::At),
-                format!(
-                    "Cruise until {}, then land",
-                    crate::autopilot_menu::spoken_when(at)
-                ),
+                format!("Cruise, then land at {}", crate::autopilot_menu::when(at)),
                 &format!("at {}", crate::autopilot_menu::when(at)),
                 enabled,
                 None,
-            ));
+            );
+            if let UiContent::Button(control) = &mut node.content {
+                control.spec.description = Some(format!(
+                    "Cruise until {}, then land",
+                    crate::autopilot_menu::spoken_when(at)
+                ));
+            }
+            buttons.push((node, width));
         }
         if row.armed_at_ms.is_some() {
             buttons.push(button(
@@ -1171,17 +2040,257 @@ fn session_timer(
         );
         total += control_height + 4.0;
     }
-    if children.len() == 1 {
-        return (children.remove(0), height);
-    }
+    // The landed row is drawn on the accent-tinted card the page's selected
+    // things wear, until the next press or scroll.
+    let block = GroupSpec::unlabeled(SemanticRole::Group);
     (
         UiNode::new(
-            format!("{key}/with-timer"),
-            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            format!("{key}/block"),
+            UiContent::Group(if landed {
+                block.style(StyleRef::Primary)
+            } else {
+                block
+            }),
         )
         .layout(Layout::column().height(Length::Fixed(total)).gap(4.0))
         .children(children),
         total,
+    )
+}
+
+/// DECIDED FOR YOU'S ROWS (§10.4.1): the newest three of today's choices, or
+/// every one kept with its disclosure `open`, newest first — each its clock
+/// time, its sentence on as many lines as the column needs (at most
+/// [`DECIDED_LINES`], its label whole), and `Show tab` while its session is
+/// open, beside the words where the column leaves them room, else under
+/// them; then, where there are more than three, the disclosure.
+fn decided_rows(harness: &HarnessProjection, inner: f32, open: bool) -> Vec<(UiNode, f32)> {
+    let shown = if open {
+        harness.decided.len()
+    } else {
+        harness.decided.len().min(DECIDED_SHOWN)
+    };
+    let rows = &harness.decided[..shown];
+    let (clock_px, clock_face) =
+        crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
+    let clock_width = rows
+        .iter()
+        .map(|row| crate::tray_raster::ui_text_width_for(clock_face, &row.clock, clock_px))
+        .fold(0.0_f32, f32::max)
+        + ABOUT_METADATA_TEXT_SAFETY;
+    let button_width = (crate::native_ui::native_button_label_width("Show tab") + 40.0).min(inner);
+    let any_show = rows.iter().any(|row| row.show.is_some());
+    let words = inner - clock_width - MODE_GAP;
+    let beside = words
+        - if any_show {
+            button_width + MODE_GAP
+        } else {
+            0.0
+        };
+    // The button goes under the words where beside them it would leave the
+    // sentence a column too narrow to read.
+    let stacked = beside < 240.0;
+    let measure = DecidedMeasure {
+        clock_width,
+        words_width: if stacked { words } else { beside }.max(0.0),
+        button_width,
+        stacked,
+    };
+    let mut out: Vec<(UiNode, f32)> = rows.iter().map(|row| decided_row(row, measure)).collect();
+    if harness.decided.len() > DECIDED_SHOWN {
+        out.push(decided_disclosure(
+            open,
+            (harness.decided.len(), harness.decided_total),
+            inner,
+        ));
+    }
+    out
+}
+
+/// How DECIDED FOR YOU's rows are laid out at the page's measure: one
+/// decision for every row ([`decided_rows`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DecidedMeasure {
+    /// The clock column's width.
+    clock_width: f32,
+    /// The sentence's column.
+    words_width: f32,
+    /// `Show tab`'s width.
+    button_width: f32,
+    /// `Show tab` goes under the words.
+    stacked: bool,
+}
+
+/// One choice's row, keyed `harness/decided/<id>` (its decision's id), its
+/// label its clock and its sentence whole.
+fn decided_row(row: &crate::harness_screen::DecidedRow, measure: DecidedMeasure) -> (UiNode, f32) {
+    let scale = settings_text_scale();
+    let line_height = 20.0_f32.max(18.0 * scale);
+    let control_height = scaled_control_height();
+    let key = format!("harness/decided/{}", row.id);
+    let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+    let room = (measure.words_width - ABOUT_METADATA_TEXT_SAFETY).max(1.0);
+    let mut lines = wrap_native_lines(std::slice::from_ref(&row.sentence), room, px);
+    if lines.len() > DECIDED_LINES {
+        lines.truncate(DECIDED_LINES);
+        if let Some(last) = lines.last_mut() {
+            *last = crate::native_ui::fit_native_text_label(&format!("{last}\u{2026}"), room);
+        }
+    }
+    let count = lines.len().max(1);
+    let words_height = count as f32 * line_height + (count - 1) as f32 * 2.0;
+    let text = |key: String, text: String, role: SemanticRole, style: StyleRef, width: Length| {
+        UiNode::new(key, UiContent::Text(TextSpec { text, role, style }))
+            .layout(
+                Layout::default()
+                    .width(width)
+                    .height(Length::Fixed(line_height)),
+            )
+            .paint_only()
+    };
+    let clock = text(
+        format!("{key}/clock"),
+        row.clock.clone(),
+        SemanticRole::Status,
+        StyleRef::Quiet,
+        Length::Fixed(measure.clock_width),
+    );
+    let words = UiNode::new(
+        format!("{key}/words"),
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+    )
+    .layout(
+        Layout::column()
+            .width(Length::Fixed(measure.words_width))
+            .height(Length::Fixed(words_height))
+            .gap(2.0),
+    )
+    .children(
+        lines
+            .into_iter()
+            .enumerate()
+            .map(|(i, line)| {
+                text(
+                    format!("{key}/line/{i}"),
+                    line,
+                    SemanticRole::Text,
+                    StyleRef::Primary,
+                    Length::Fill,
+                )
+            })
+            .collect(),
+    );
+    // SHOW TAB raises the session's tab and pane: the SESSIONS row's own
+    // action (`harness/session/<id>/show`), so the control surface keeps it
+    // behind the one Owner fence its prefix has (§10.3.7).
+    let show = row.show.map(|local_id| {
+        let action = show_action(local_id);
+        let mut spec = ButtonSpec::new(format!("Show tab of {}", row.name)).visual_label(
+            crate::native_ui::fit_native_button_label(
+                "Show tab",
+                (measure.button_width - 24.0).max(0.0),
+            ),
+        );
+        spec.description = Some("raise its tab and pane".to_string());
+        UiNode::new(
+            format!("{key}/show"),
+            UiContent::Button(Control::new(spec, ActionId::new(action)).style(StyleRef::Quiet)),
+        )
+        .layout(
+            Layout::default()
+                .width(Length::Fixed(measure.button_width))
+                .height(Length::Fixed(control_height)),
+        )
+    });
+    let label = format!("{} {}", row.clock, row.sentence);
+    let when = format!("{key}/when");
+    let line = |children: Vec<UiNode>, height: f32| {
+        UiNode::new(
+            when,
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(Layout::row().height(Length::Fixed(height)).gap(MODE_GAP))
+        .children(children)
+    };
+    let (node, height) = match show {
+        Some(show) if measure.stacked => {
+            let height = words_height + 4.0 + control_height;
+            (
+                UiNode::new(key, UiContent::Group(GroupSpec::new(label)))
+                    .layout(Layout::column().height(Length::Fixed(height)).gap(4.0))
+                    .children(vec![line(vec![clock, words], words_height), show]),
+                height,
+            )
+        }
+        Some(show) => {
+            let height = words_height.max(control_height);
+            (
+                UiNode::new(key, UiContent::Group(GroupSpec::new(label)))
+                    .layout(Layout::row().height(Length::Fixed(height)).gap(MODE_GAP))
+                    .children(vec![clock, words, show]),
+                height,
+            )
+        }
+        None => (
+            UiNode::new(key, UiContent::Group(GroupSpec::new(label)))
+                .layout(
+                    Layout::row()
+                        .height(Length::Fixed(words_height))
+                        .gap(MODE_GAP),
+                )
+                .children(vec![clock, words]),
+            words_height,
+        ),
+    };
+    (node, height)
+}
+
+/// DECIDED FOR YOU's disclosure (`harness/decided/all`): every one of the
+/// `kept` choices (of `total` today: the newest [`aterm_agent::harness::stats::DECIDED_KEEP`]
+/// are kept), or, `open`, only the newest three.
+fn decided_disclosure(open: bool, (kept, total): (usize, u64), inner: f32) -> (UiNode, f32) {
+    let height = scaled_control_height();
+    let (label, visual) = if open {
+        (
+            format!("Show the newest {DECIDED_SHOWN} choices made for you, only"),
+            format!("Show the newest {DECIDED_SHOWN}"),
+        )
+    } else if total > kept as u64 {
+        (
+            format!("Show the newest {kept} of {total} choices made for you today"),
+            format!("Show the newest {kept} of {total}"),
+        )
+    } else {
+        (
+            format!("Show all {kept} choices made for you today"),
+            format!("Show all {kept}"),
+        )
+    };
+    let width = (crate::native_ui::native_button_label_width(&visual) + 56.0).min(inner);
+    (
+        UiNode::new(
+            HARNESS_DECIDED_ALL,
+            UiContent::Button(
+                Control::new(
+                    ButtonSpec::new(label).visual_label(crate::native_ui::fit_native_button_label(
+                        &visual,
+                        (width - 48.0).max(0.0),
+                    )),
+                    ActionId::new(HARNESS_DECIDED_ALL),
+                )
+                .state(ControlState {
+                    expanded: Some(open),
+                    ..ControlState::default()
+                })
+                .style(StyleRef::Quiet),
+            ),
+        )
+        .layout(
+            Layout::default()
+                .width(Length::Fixed(width))
+                .height(Length::Fixed(height)),
+        ),
+        height,
     )
 }
 
@@ -1477,16 +2586,6 @@ fn session_row(
                 .height(Length::Fill),
         ),
     );
-    // The landed row is drawn on the accent-tinted card the page's selected
-    // things wear, until the next press or scroll.
-    let group = |label: String| {
-        let spec = GroupSpec::new(label);
-        if landed {
-            spec.style(StyleRef::Primary)
-        } else {
-            spec
-        }
-    };
     let text = |suffix: &str, text: String, role: SemanticRole, style: StyleRef, height: f32| {
         UiNode::new(
             format!("{key}/{suffix}"),
@@ -1547,7 +2646,7 @@ fn session_row(
             u8::try_from(measure.lines.len()).unwrap_or(u8::MAX),
         ));
         return (
-            UiNode::new(key, UiContent::Group(group(label)))
+            UiNode::new(key, UiContent::Group(GroupSpec::new(label)))
                 .layout(Layout::column().height(Length::Fixed(height)).gap(4.0))
                 .children(children),
             height,
@@ -1563,7 +2662,7 @@ fn session_row(
     let mut children = vec![words];
     children.extend(buttons);
     (
-        UiNode::new(key, UiContent::Group(group(label)))
+        UiNode::new(key, UiContent::Group(GroupSpec::new(label)))
             .layout(Layout::row().height(Length::Fixed(height)).gap(MODE_GAP))
             .children(children),
         height,

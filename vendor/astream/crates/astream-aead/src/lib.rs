@@ -24,13 +24,33 @@
 //!   confidential.
 //!
 //! # Not hand-rolled
-//! The primitive is the vetted RustCrypto `chacha20poly1305` (an upstream
-//! known-answer-tested, widely-audited implementation of a standard AEAD), and
-//! this crate's own known-answer test pins the full ciphertext and tag of the
-//! draft-irtf-cfrg-xchacha §A.3.1 vector. This crate is the ONE place astream
-//! pulls a cipher dependency — deliberately isolated; the handshake's HMAC/HKDF
-//! run over the workspace's own SHA-256 (`astream-digest`).
+//! The cipher and the MAC are ring's ChaCha20-Poly1305 (RFC 8439; ring 0.17, the one
+//! aterm already ships under rustls), and XChaCha20-Poly1305 is built on it exactly as
+//! draft-irtf-cfrg-xchacha-03 §2.3 defines it: the per-message subkey is HChaCha20 of
+//! the key and nonce bytes 0..16, and ChaCha20-Poly1305's 96-bit nonce is four zero
+//! bytes followed by nonce bytes 16..24. HChaCha20 (`hchacha.rs`) is the one part
+//! computed here: the ChaCha20 block function's rounds without their final addition,
+//! constant-time by construction (add, rotate, xor on 32-bit words), held to the
+//! draft's §2.2.1 vector and to subkeys recorded from RustCrypto's `chacha20`. The wire
+//! is the one this crate sealed over RustCrypto's `chacha20poly1305` until the move to
+//! ring: `tests/recorded.rs` reproduces every seal recorded from it byte for byte and
+//! opens a session recorded from it, and this crate's own known-answer test pins the
+//! full ciphertext and tag of the draft's §A.3.1 vector. This crate is the ONE place
+//! astream pulls a cipher dependency — deliberately isolated; the handshake's
+//! HMAC/HKDF run over the workspace's own SHA-256 (`astream-digest`).
 //! `forbid(unsafe_code)` applies to this crate's own code.
+//!
+//! The `handshake` and `identity` features still delegate raw X25519 and Ed25519 to
+//! `x25519-dalek` and `ed25519-dalek`: ring cannot build an X25519 secret from bytes
+//! (its agreement keys come only from its own RNG). Both features are off by default.
+//!
+//! # Keys in memory
+//! The pre-shared key a [`SealedStream`] holds, each per-message subkey, and
+//! HChaCha20's working state are wiped (`zeroize`) when dropped. ring keeps no wiping
+//! hook on its key schedule and this crate forbids `unsafe`, so the subkey's copy
+//! inside ring is overwritten in place with an all-zero key once the message is
+//! sealed or opened. As with any wiping in Rust, a copy that a move left behind on the
+//! stack is out of reach.
 #![forbid(unsafe_code)]
 
 // A contracted fn is written once, through `contract_fn!`: under a Trust compiler
@@ -66,8 +86,9 @@ pub use identity::{
     server_identity_handshake, IdentityKeypair, ID_PUB_LEN,
 };
 
-use chacha20poly1305::aead::AeadInPlace;
-use chacha20poly1305::{KeyInit, Tag, XChaCha20Poly1305, XNonce};
+mod hchacha;
+
+use ring::aead::{Aad, LessSafeKey, Nonce, Tag, UnboundKey, CHACHA20_POLY1305};
 
 /// Pre-shared key length (XChaCha20-Poly1305 key), in bytes.
 pub const KEY_LEN: usize = 32;
@@ -106,7 +127,7 @@ contract_fn! {
     /// Verified check that a sealed AEAD box has at least `overhead` bytes (`overhead <= sealed_len`),
     /// linked via `clean-kernel-defeq` to `aead_sealed_has_overhead_isl`.
     #[must_use]
-    pub fn aead_sealed_has_overhead(sealed_len: usize, overhead: usize) -> bool
+    pub const fn aead_sealed_has_overhead(sealed_len: usize, overhead: usize) -> bool
     clauses [ensures result == (overhead <= sealed_len)]
     {
         overhead <= sealed_len
@@ -122,7 +143,10 @@ pub fn seal(key: &[u8; KEY_LEN], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
     let mut nonce = [0u8; NONCE_LEN];
     // getrandom draws from the OS CSPRNG; it only errors if the OS entropy
     // source is missing, which is not a recoverable condition for a wire.
-    getrandom::getrandom(&mut nonce).expect("OS CSPRNG unavailable");
+    assert!(
+        getrandom::getrandom(&mut nonce).is_ok(),
+        "OS CSPRNG unavailable"
+    );
     seal_with_nonce(key, &nonce, aad, plaintext)
 }
 
@@ -144,25 +168,93 @@ pub fn seal_with_nonce(
     out
 }
 
+/// ring's ChaCha20-Poly1305 under one message's XChaCha20 subkey.
+///
+/// ring keeps no wiping hook on its key schedule, and this crate forbids `unsafe`, so
+/// on drop the one place the subkey lives in ring's key is overwritten in place with
+/// an all-zero key (and `black_box` keeps that store from being elided).
+struct MessageKey(LessSafeKey);
+
+impl MessageKey {
+    /// The ChaCha20-Poly1305 key and nonce XChaCha20-Poly1305 seals one message under
+    /// (draft-irtf-cfrg-xchacha-03 §2.3): HChaCha20 of `key` and `nonce[..16]` is the
+    /// subkey, and `0x00000000 ‖ nonce[16..]` the 96-bit nonce. `None` only if `nonce`
+    /// is not [`NONCE_LEN`] bytes.
+    fn derive(key: &[u8; KEY_LEN], nonce: &[u8]) -> Option<(MessageKey, Nonce)> {
+        let (head, tail) = nonce.split_first_chunk::<{ hchacha::HCHACHA_INPUT_LEN }>()?;
+        let &[t0, t1, t2, t3, t4, t5, t6, t7] = tail else {
+            return None;
+        };
+        let subkey = hchacha::hchacha20(key, head);
+        let Ok(unbound) = UnboundKey::new(&CHACHA20_POLY1305, subkey.as_slice()) else {
+            return None;
+        };
+        let nonce = [0, 0, 0, 0, t0, t1, t2, t3, t4, t5, t6, t7];
+        Some((
+            MessageKey(LessSafeKey::new(unbound)),
+            Nonce::assume_unique_for_key(nonce),
+        ))
+    }
+}
+
+impl Drop for MessageKey {
+    fn drop(&mut self) {
+        if let Ok(zero) = UnboundKey::new(&CHACHA20_POLY1305, &[0u8; KEY_LEN]) {
+            self.0 = LessSafeKey::new(zero);
+        }
+        core::hint::black_box(&self.0);
+    }
+}
+
 /// Seal in place — the one primitive both [`seal`] and the record layer use.
 /// On entry `buf[at..at + NONCE_LEN]` holds the nonce and `buf[at + NONCE_LEN..]`
 /// the plaintext; on return those plaintext bytes are the ciphertext and the
 /// 16-byte tag has been appended, so `buf[at..]` is exactly
 /// `nonce ‖ ciphertext ‖ tag`. No copy of the plaintext is made.
 pub(crate) fn seal_in_place(key: &[u8; KEY_LEN], aad: &[u8], buf: &mut Vec<u8>, at: usize) {
-    let cipher = XChaCha20Poly1305::new(key.into());
     let Some(tail) = buf.get_mut(at..) else {
         return;
     };
     let Some((nonce, msg)) = tail.split_at_mut_checked(NONCE_LEN) else {
         return;
     };
-    let tag = cipher
-        .encrypt_in_place_detached(XNonce::from_slice(nonce), aad, msg)
-        // encrypt only fails if the message exceeds the cipher's length ceiling
-        // (~256 GiB) — never for a wire record.
-        .expect("plaintext exceeds XChaCha20-Poly1305 length ceiling");
-    buf.extend_from_slice(&tag);
+    let Some((cipher, nonce)) = MessageKey::derive(key, nonce) else {
+        // A 24-byte nonce and a 32-byte subkey always make a key, so this does not
+        // happen; were it to, no plaintext is left to reach the wire and no tag is
+        // appended, so the record can never open.
+        msg.fill(0);
+        return;
+    };
+    let Ok(tag) = cipher
+        .0
+        .seal_in_place_separate_tag(nonce, Aad::from(aad), msg)
+    else {
+        // ring refuses only a message past ChaCha20-Poly1305's length ceiling
+        // (~256 GiB) — never a wire record; were it to, zero msg and append no tag.
+        msg.fill(0);
+        return;
+    };
+    buf.extend_from_slice(tag.as_ref());
+}
+
+/// Open `ct` in place under `key`, the 24-byte `nonce`, `aad` and the 16-byte `tag`.
+/// ring decrypts as it authenticates and compares the tag in constant time; on a
+/// mismatch it zeroes `ct` before returning, so no plaintext of an unauthentic message
+/// survives the call.
+fn open_detached(
+    key: &[u8; KEY_LEN],
+    nonce: &[u8],
+    aad: &[u8],
+    ct: &mut [u8],
+    tag: &[u8],
+) -> Result<(), AeadError> {
+    let (cipher, nonce) = MessageKey::derive(key, nonce).ok_or(AeadError)?;
+    let tag = Tag::try_from(tag).map_err(|_| AeadError)?;
+    cipher
+        .0
+        .open_in_place_separate_tag(nonce, Aad::from(aad), tag, ct, 0..)
+        .map_err(|_| AeadError)?;
+    Ok(())
 }
 
 /// Open a message produced by [`seal`] / [`seal_with_nonce`]: verify the tag
@@ -185,26 +277,19 @@ pub fn open(key: &[u8; KEY_LEN], aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>, A
     let Some((ct, tag)) = rest.split_at_checked(ct_len) else {
         return Err(AeadError);
     };
-    // Only the ciphertext is copied, and decrypted in place once its tag has
-    // verified.
+    // Only the ciphertext is copied, and decrypted in place; a failed open leaves
+    // the copy zeroed and drops it.
     let mut plain = ct.to_vec();
-    XChaCha20Poly1305::new(key.into())
-        .decrypt_in_place_detached(
-            XNonce::from_slice(nonce),
-            aad,
-            &mut plain,
-            Tag::from_slice(tag),
-        )
-        .map_err(|_| AeadError)?;
+    open_detached(key, nonce, aad, &mut plain, tag)?;
     Ok(plain)
 }
 
 /// Open in place — the record layer's primitive.
-/// `buf` is `nonce ‖ ciphertext ‖ tag`; the tag is verified FIRST (constant
-/// time), and only then is the ciphertext decrypted in place, so on failure the
-/// buffer is untouched and nothing derived from an unauthentic message ever
-/// exists. On success the returned slice is the plaintext,
-/// `buf[NONCE_LEN..len - TAG_LEN]`.
+/// `buf` is `nonce ‖ ciphertext ‖ tag`. On success the returned slice is the
+/// plaintext, `buf[NONCE_LEN..len - TAG_LEN]`. On failure the ciphertext span is
+/// zeroed (ring decrypts as it authenticates, then wipes what it decrypted) and the
+/// nonce and tag are left as they were, so nothing derived from an unauthentic
+/// message survives in the buffer.
 pub(crate) fn open_in_place<'a>(
     key: &[u8; KEY_LEN],
     aad: &[u8],
@@ -222,10 +307,7 @@ pub(crate) fn open_in_place<'a>(
     let Some((ct, tag)) = rest.split_at_mut_checked(ct_len) else {
         return Err(AeadError);
     };
-    let cipher = XChaCha20Poly1305::new(key.into());
-    cipher
-        .decrypt_in_place_detached(XNonce::from_slice(nonce), aad, ct, Tag::from_slice(tag))
-        .map_err(|_| AeadError)?;
+    open_detached(key, nonce, aad, ct, tag)?;
     Ok(ct)
 }
 
@@ -285,16 +367,84 @@ mod tests {
         assert_eq!(open(&KEY, b"different-aad", &sealed), Err(AeadError));
         assert_eq!(open(&KEY, aad, &sealed[..sealed.len() - 1]), Err(AeadError));
         assert_eq!(open(&KEY, aad, &sealed[..OVERHEAD - 1]), Err(AeadError));
+
+        // The exported length gate is the one `open` applies: an empty message
+        // passes it and opens, and one byte less fails both.
+        let empty = seal(&KEY, aad, b"");
+        assert_eq!(open(&KEY, aad, &empty), Ok(Vec::new()));
+        for sealed in [&empty[..], &empty[..empty.len() - 1]] {
+            assert_eq!(
+                aead_sealed_has_overhead(sealed.len(), OVERHEAD),
+                open(&KEY, aad, sealed).is_ok(),
+                "{} bytes",
+                sealed.len()
+            );
+        }
+    }
+
+    /// A transport whose peer is a fixed script: reads drain `peer`, then EOF,
+    /// and writes are kept in `sent`. A read while a write is unflushed is
+    /// refused with `WouldBlock`: over a buffering transport, a handshake that
+    /// waits for its peer before flushing what it sent would deadlock. A handshake
+    /// meets a malformed, silent or unkeyed peer through it with no socket.
+    pub(crate) struct Scripted {
+        peer: std::io::Cursor<Vec<u8>>,
+        // Read by the handshake's wire pin only.
+        #[cfg_attr(not(feature = "handshake"), allow(dead_code))]
+        pub(crate) sent: Vec<u8>,
+        unflushed: bool,
+    }
+
+    impl Scripted {
+        pub(crate) fn new(peer: Vec<u8>) -> Self {
+            Scripted {
+                peer: std::io::Cursor::new(peer),
+                sent: Vec::new(),
+                unflushed: false,
+            }
+        }
+    }
+
+    impl std::io::Read for Scripted {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.unflushed {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            self.peer.read(out)
+        }
+    }
+
+    impl std::io::Write for Scripted {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.sent.extend_from_slice(bytes);
+            self.unflushed = true;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.unflushed = false;
+            Ok(())
+        }
     }
 
     #[test]
-    fn a_failed_open_leaves_the_buffer_untouched() {
-        // The tag is verified BEFORE decryption: on failure nothing derived from an
-        // unauthentic message is ever written back into the buffer.
-        let sealed = seal(&KEY, b"aad", b"do not decrypt me on failure");
+    fn a_failed_open_leaves_no_plaintext_in_the_buffer() {
+        // ring decrypts as it authenticates, so a failed open has decrypted the
+        // ciphertext span; it zeroes that span before returning. Nonce and tag are
+        // untouched, and no byte of the plaintext is left behind.
+        let msg = b"do not decrypt me on failure";
+        let sealed = seal(&KEY, b"aad", msg);
         let mut buf = sealed.clone();
         assert_eq!(open_in_place(&KEY, b"other-aad", &mut buf), Err(AeadError));
-        assert_eq!(buf, sealed);
+        let ct = NONCE_LEN..NONCE_LEN + msg.len();
+        assert_eq!(buf[..ct.start], sealed[..ct.start]);
+        assert!(buf[ct.clone()].iter().all(|&b| b == 0));
+        assert_eq!(buf[ct.end..], sealed[ct.end..]);
+        // The control: the same buffer, opened with the right AAD, would have held
+        // the plaintext there.
+        let mut good = sealed.clone();
+        assert_eq!(open_in_place(&KEY, b"aad", &mut good).unwrap(), msg);
+        assert_eq!(&good[ct], msg);
     }
 
     #[test]

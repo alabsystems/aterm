@@ -111,6 +111,8 @@ impl Grid {
         // A wholesale coordinate change is not a row-band translation: poison the
         // band record so no host replays the batch's bands as if they explained it.
         self.storage.presentation.poison_row_band_moves();
+        // Rows were rotated or renumbered: no anchor rule describes it.
+        self.lose_anchors_renumbered();
         // `All`: the whole coordinate space is gone, so no band describes it.
         self.storage.selection_damage = self
             .storage
@@ -126,9 +128,11 @@ impl Grid {
     #[inline]
     pub fn invalidate_host_coordinates(&mut self) {
         self.storage.coordinates_invalidated = true;
-        // The bands recorded so far (for a buffer swap, on the outgoing grid)
-        // explain none of the move.
+        // The bands recorded so far explain none of the move.
         self.storage.presentation.poison_row_band_moves();
+        // Nor does any anchor rule: a buffer swap, which moves no row of this
+        // grid, calls `invalidate_host_coordinates_for_swap` instead.
+        self.lose_anchors_renumbered();
     }
 
     /// Record that retained history was discarded wholesale (ED 3,
@@ -186,6 +190,7 @@ impl Grid {
         self.storage
             .presentation
             .record_row_band_move(top, bottom, delta);
+        self.anchors_band_move(top, bottom, i64::from(delta));
         self.damage_selection_visible_rows(top, bottom);
     }
 

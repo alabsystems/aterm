@@ -29,15 +29,15 @@
 
 /// A 64-bit linear congruential generator (Knuth's MMIX constants). Chosen over
 /// `rand` for exactly one reason: a fixed seed here means a fixed corpus, on
-/// every machine, forever.
-struct Lcg(u64);
+/// every machine, forever. `typed`'s round-trip properties draw from it too.
+pub(crate) struct Lcg(u64);
 
 impl Lcg {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self(seed ^ 0x9E37_79B9_7F4A_7C15)
     }
 
-    fn next(&mut self) -> u32 {
+    pub(crate) fn next(&mut self) -> u32 {
         self.0 = self
             .0
             .wrapping_mul(6_364_136_223_846_793_005)
@@ -45,7 +45,7 @@ impl Lcg {
         (self.0 >> 33) as u32
     }
 
-    fn below(&mut self, bound: u32) -> u32 {
+    pub(crate) fn below(&mut self, bound: u32) -> u32 {
         self.next() % bound.max(1)
     }
 

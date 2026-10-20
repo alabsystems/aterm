@@ -22,7 +22,7 @@ use aterm_types::MutexExt as _;
 use super::publisher::{Change, Link, Msg};
 use super::semantics::{
     ActionHandlerNoMut, ActionHandlerWrapper, Adapter as Semantics, AdapterCallback, CacheEvent,
-    Event, InterfaceSet, NodeId, WindowBounds, next_adapter_id,
+    Event, InterfaceSet, NodeIdentity, WindowBounds, next_adapter_id,
 };
 
 /// Where a window's accessibility stands.
@@ -89,14 +89,19 @@ impl Callback {
 }
 
 impl AdapterCallback for Callback {
-    fn register_interfaces(&self, adapter: &Semantics, id: NodeId, interfaces: InterfaceSet) {
+    fn register_interfaces(&self, adapter: &Semantics, id: NodeIdentity, interfaces: InterfaceSet) {
         self.send(Change::RegisterInterfaces {
             node: adapter.platform_node(id),
             interfaces,
         });
     }
 
-    fn unregister_interfaces(&self, adapter: &Semantics, id: NodeId, interfaces: InterfaceSet) {
+    fn unregister_interfaces(
+        &self,
+        adapter: &Semantics,
+        id: NodeIdentity,
+        interfaces: InterfaceSet,
+    ) {
         self.send(Change::UnregisterInterfaces {
             adapter: adapter.id(),
             node: id,

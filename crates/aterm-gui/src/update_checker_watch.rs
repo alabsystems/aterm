@@ -76,7 +76,7 @@ impl CheckerWatchState {
     }
 
     /// Whether this watchdog owes a stall warning's heal (test-only).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn owes_stall_heal(&self) -> bool {
         self.announced_at_checks.is_some()
     }

@@ -59,7 +59,7 @@ contract_fn! {
     /// Discharged in the Clean CIC kernel by definitional equality against
     /// `watermark_advances_isl` (`clean-kernel-defeq`).
     #[must_use]
-    pub fn watermark_advances(cur_wm: u64, new_wm: u64) -> bool
+    pub const fn watermark_advances(cur_wm: u64, new_wm: u64) -> bool
     clauses [ensures result == (cur_wm < new_wm)]
     {
         cur_wm < new_wm
@@ -79,12 +79,35 @@ pub const fn echo_admit_causal_watermark(
     cur_wm: u64,
     cand_wm: u64,
 ) -> u64 {
-    echo_causal_watermark_select(
-        in_off,
-        pred_in_off,
-        echo_watermark_monotone(cur_wm, cand_wm),
-        cur_wm,
-    )
+    let next_wm = if cur_wm < cand_wm { cand_wm } else { cur_wm };
+    if in_off == pred_in_off {
+        next_wm
+    } else {
+        cur_wm
+    }
+}
+
+const fn all_ascii_printable(mut bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    while let &[b, ref tail @ ..] = bytes {
+        if b < 0x20 || b > 0x7e {
+            return false;
+        }
+        bytes = tail;
+    }
+    true
+}
+
+const fn slice_contains_byte(mut bytes: &[u8], needle: u8) -> bool {
+    while let &[b, ref tail @ ..] = bytes {
+        if b == needle {
+            return true;
+        }
+        bytes = tail;
+    }
+    false
 }
 
 /// Whether the authoritative output has demonstrably *traversed* `(row, col)`:
@@ -173,7 +196,7 @@ impl Predictor {
     }
 
     fn enqueue(&mut self, client_seq: u64, in_offset: Option<u64>, bytes: &[u8]) -> bool {
-        if bytes.is_empty() || !bytes.iter().all(|b| (0x20..=0x7e).contains(b)) {
+        if !all_ascii_printable(bytes) {
             return false;
         }
         let (cols, _) = self.base.screen().dims();
@@ -184,7 +207,8 @@ impl Predictor {
             Some(p) => (p.row, p.col.saturating_add(1)),
             None => self.base.screen().cursor(),
         };
-        for &b in bytes {
+        let mut rest = bytes;
+        while let &[b, ref tail @ ..] = rest {
             if col >= cols {
                 col = 0;
                 row = row.saturating_add(1);
@@ -197,6 +221,7 @@ impl Predictor {
                 in_offset,
             });
             col = col.saturating_add(1);
+            rest = tail;
         }
         true
     }
@@ -207,7 +232,8 @@ impl Predictor {
     }
 
     /// The highest authoritative out-offset retired so far.
-    pub fn in_watermark(&self) -> Option<u64> {
+    #[must_use]
+    pub const fn in_watermark(&self) -> Option<u64> {
         self.in_watermark
     }
 
@@ -236,7 +262,11 @@ impl Predictor {
                 if !watermark_advances(w, watermark) {
                     return Vec::new(); // out-of-order watermark: reject, do not advance
                 }
-                echo_watermark_monotone(w, watermark)
+                if w < watermark {
+                    watermark
+                } else {
+                    w
+                }
             }
             None => watermark,
         };
@@ -266,8 +296,14 @@ impl Predictor {
                 verdicts.push((p.client_seq, Verdict::Lost));
             }
             self.preds.clear();
-        } else {
-            self.preds.drain(0..confirmed.min(self.preds.len()));
+        } else if confirmed >= self.preds.len() {
+            self.preds.clear();
+        } else if confirmed > 0 {
+            let mut kept = Vec::new();
+            if let Some(tail) = self.preds.get(confirmed..) {
+                kept.extend_from_slice(tail);
+            }
+            self.preds = kept;
         }
         verdicts
     }
@@ -297,10 +333,27 @@ impl Predictor {
         let (Some(in_off), Record::Out(bytes)) = (in_offset_for_out, record) else {
             return Vec::new();
         };
-        let Some(pos) = self.preds.iter().position(|p| p.in_offset == Some(in_off)) else {
+        let mut found_pos = None;
+        for (idx, p) in self.preds.iter().enumerate() {
+            if p.in_offset == Some(in_off) {
+                found_pos = Some(idx);
+                break;
+            }
+        }
+        let Some(pos) = found_pos else {
             return Vec::new();
         };
-        let p = self.preds.remove(pos);
+        let Some(p) = self.preds.get(pos).cloned() else {
+            return Vec::new();
+        };
+        let mut kept = Vec::new();
+        if let Some(head) = self.preds.get(..pos) {
+            kept.extend_from_slice(head);
+        }
+        if let Some(tail) = self.preds.get(pos.saturating_add(1)..) {
+            kept.extend_from_slice(tail);
+        }
+        self.preds = kept;
         if let Some(pred_in_off) = p.in_offset {
             let cur_wm = self.in_watermark.unwrap_or(out_offset);
             self.in_watermark = Some(echo_admit_causal_watermark(
@@ -312,7 +365,7 @@ impl Predictor {
         }
         // A predicted glyph is always ASCII-printable (see `enqueue`), so it is
         // among the Out's printable bytes iff that byte occurs in the Out at all.
-        let verdict = if bytes.contains(&(p.ch as u8)) {
+        let verdict = if slice_contains_byte(bytes, p.ch as u8) {
             Verdict::Confirmed
         } else {
             Verdict::Contradicted
@@ -321,7 +374,8 @@ impl Predictor {
     }
 
     /// The authoritative screen, with no predictions overlaid.
-    pub fn authoritative(&self) -> &Screen {
+    #[must_use]
+    pub const fn authoritative(&self) -> &Screen {
         self.base.screen()
     }
 
@@ -350,14 +404,12 @@ impl Predictor {
     /// nothing traversed included) is `Lost`. After this call
     /// [`view`](Self::view) equals the authoritative screen.
     pub fn reconcile(&mut self) -> Vec<(u64, Verdict)> {
-        let verdicts = self
-            .preds
-            .iter()
-            .map(|p| {
-                let verdict = verdict_now(self.base.screen(), p).unwrap_or(Verdict::Lost);
-                (p.client_seq, verdict)
-            })
-            .collect();
+        let mut verdicts = Vec::new();
+        let screen = self.base.screen();
+        for p in &self.preds {
+            let verdict = verdict_now(screen, p).unwrap_or(Verdict::Lost);
+            verdicts.push((p.client_seq, verdict));
+        }
         self.preds.clear();
         verdicts
     }

@@ -75,7 +75,18 @@ pub fn control_connection_admission_model() -> Model {
 /// a vacuous negative control, `ty --strict-vacuity`). A fresh client is
 /// admitted when a request lane is free and fewer than `Cap` connections are
 /// open (`Cap` is the parker's capacity, so an idle connection always has a
-/// place to park), and refused otherwise. A wait stays on its request lane only when every wait lane is
+/// place to park). At `Cap` it is handed to the parker (`Hand`) — as many at
+/// once as are parked (`placing`), each owed one — which parks it in the slots
+/// of one that ended since (`PlaceFreed`), or else of the stalest parked
+/// connection that gives way, closing that one (`Place`), so `open` never
+/// passes `Cap`; `open` counts placed connections, excluding pending accepted
+/// streams. A parked connection with a live connection-bound claim or one
+/// still making its handshake does not give way (`spared`: `Spare`, `Unspare`),
+/// and with none to give way the parker turns the fresh one away (`TurnAway`).
+/// So a fresh client is refused only when every request lane is taken by work
+/// or no parked connection gives way to it that an earlier one is not owed
+/// (`refused_parked` records a refusal beside one: one process holding the cap
+/// idle, half-sent or unread starved every fresh client until 2026-10-19). A wait stays on its request lane only when every wait lane is
 /// taken (`bypassed` records one kept there beside a free wait lane); then at
 /// most `Inline` request lanes serve a wait (`Inline < Lanes`), and a wait past
 /// that is answered busy (`BusyWait`, recorded in `busied`) and its connection
@@ -85,7 +96,7 @@ pub fn control_connection_admission_model() -> Model {
 /// (`control_lanes.rs`'s `stop_parker`) leaves it for the no-parker fallback,
 /// which `NoIdleHold` rejects on purpose — a degraded mode, logged as an error.
 ///
-/// `Buggy=1` is seven defects at once, each caught by its own invariant:
+/// `Buggy=1` is eight defects at once, each caught by its own invariant:
 /// finishing a request keeps the idle connection on its lane, so persistent
 /// drivers use up every lane and a fresh client is refused (`NoIdleHold`,
 /// `NoRefusalByIdleDriver`); admission ignores both bounds
@@ -97,7 +108,9 @@ pub fn control_connection_admission_model() -> Model {
 /// served there, or answered busy — while a wait lane is free, turning a relay
 /// away with most of the wait lanes free (`WaitLaneTakenFirst`); the parker
 /// closes a hung-up connection without ending its tenure
-/// (`EveryConnectionPlaced`).
+/// (`EveryConnectionPlaced`); admission at `Cap` refuses a fresh client beside
+/// a parked connection it could take the place of, the design before
+/// 2026-10-19 (`NoRefusalBesideParked`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn control_lane_tenure_model() -> Model {
@@ -109,14 +122,23 @@ pub fn control_lane_tenure_model() -> Model {
             const Inline = 1;
             const Cap = 3;
             // Bounds the arrivals the checker walks (a `Buggy` admission ignores
-            // `Cap`, and would otherwise admit for ever).
-            const Arrivals = 4;
+            // `Cap`, and a hand-over admits at it: either would otherwise
+            // admit for ever).
+            const Arrivals = 6;
             var working = 0;
             var held = 0;
             var waiting = 0;
             var inline = 0;
             var parked = 0;
+            // Of the parked, those no fresh client may take the place of: one
+            // holding a live connection-bound claim, or still making its
+            // handshake. A released or expired claim no longer spares it.
+            var spared = 0;
+            // Fresh connections handed to the parker at `Cap`, not placed yet.
+            var placing = 0;
             var queued = 0;
+            // Placed connections; raw arrivals still pending placement do not
+            // consume these slots. This is not the physical socket count.
             var open = 0;
             var arrivals = 0;
             // A fresh client was refused while an idle connection held a lane.
@@ -126,6 +148,9 @@ pub fn control_lane_tenure_model() -> Model {
             // A wait was kept on a request lane (served there, or answered
             // busy) while a wait lane was free.
             var bypassed = 0;
+            // A fresh client was refused with a request lane free and a parked
+            // connection that gives way, owed to no earlier fresh client.
+            var refused_parked = 0;
             action Admit when (
                 arrivals <= Arrivals - 1 &&
                 (Buggy == 1 || open <= Cap - 1) &&
@@ -135,8 +160,57 @@ pub fn control_lane_tenure_model() -> Model {
                 open = open + 1;
                 arrivals = arrivals + 1;
             }
-            action Refuse when (Lanes <= working + held + inline + queued || Cap <= open) {
+            // At the cap: handed to the parker, owed a parked connection's
+            // place — no more are handed at once than are parked.
+            action Hand when (
+                arrivals <= Arrivals - 1 &&
+                Cap <= open && placing <= parked - 1 &&
+                working + held + inline + queued <= Lanes - 1
+            ) {
+                placing = placing + 1;
+                arrivals = arrivals + 1;
+            }
+            // A connection ended since: the parker parks the fresh one in the
+            // slots it left, closing no one, to wait there for its handshake
+            // (so spared).
+            action PlaceFreed when (placing > 0 && open <= Cap - 1) {
+                placing = placing - 1;
+                open = open + 1;
+                parked = parked + 1;
+                spared = spared + 1;
+            }
+            // Still at `Cap`: the parker closes the stalest parked connection
+            // that gives way and parks the fresh one in the slots it gave up:
+            // `open` and `parked` stand.
+            action Place when (placing > 0 && Cap <= open && spared <= parked - 1) {
+                placing = placing - 1;
+                spared = spared + 1;
+            }
+            // None gives way: the parker answers the fresh one busy.
+            action TurnAway when (placing > 0 && Cap <= open && parked <= spared) {
+                placing = placing - 1;
+            }
+            action Refuse when (
+                Lanes <= working + held + inline + queued ||
+                (Cap <= open && (Buggy == 1 || parked <= placing))
+            ) {
                 refused_idle = if held > 0 { 1 } else { refused_idle };
+                refused_parked = if placing + spared <= parked - 1 &&
+                    working + held + inline + queued <= Lanes - 1 {
+                    1
+                } else {
+                    refused_parked
+                };
+            }
+            // A parked connection takes a claim (on a lane, before it parked)
+            // or is placed still making its handshake: it gives way no more.
+            action Spare when (spared <= parked - 1) {
+                spared = spared + 1;
+            }
+            // Its claim ends or its handshake comes whole (it wakes for that):
+            // it gives way again.
+            action Unspare when (spared > 0) {
+                spared = spared - 1;
             }
             action Finish when (working > 0) {
                 working = working - 1;
@@ -172,7 +246,7 @@ pub fn control_lane_tenure_model() -> Model {
                 inline = inline - 1;
                 parked = parked + 1;
             }
-            action Wake when (parked > 0) {
+            action Wake when (spared <= parked - 1) {
                 parked = parked - 1;
                 queued = queued + 1;
             }
@@ -192,12 +266,13 @@ pub fn control_lane_tenure_model() -> Model {
                 inline = inline - 1;
                 open = open - 1;
             }
-            action ParkedClose when (parked > 0) {
+            action ParkedClose when (spared <= parked - 1) {
                 parked = parked - 1;
                 open = if Buggy == 1 { open } else { open - 1 };
             }
             invariant NoIdleHold: held == 0;
             invariant NoRefusalByIdleDriver: refused_idle == 0;
+            invariant NoRefusalBesideParked: refused_parked == 0;
             invariant RequestLanesBounded: working + held + inline <= Lanes;
             invariant WaitLanesBounded: waiting <= Waits;
             invariant RequestLaneLeftForRequests: held + inline <= Lanes - 1;
@@ -2588,165 +2663,6 @@ pub fn config_file_commit_cas_model() -> Model {
                 manual_committed <= 1 && settings_committed <= 1 &&
                 symlink_publication <= 1 && manual_indeterminate <= 1 &&
                 settings_indeterminate <= 1 && blind_retry <= 1;
-        }
-    }
-}
-
-/// Every admitted config revision publishes text, its resolved trail-style
-/// cache (`TrailStyleCache`), resolved kitty sprite, parsed custom-theme
-/// catalog, and exact inline + Toy Pack consumer projection as one immutable
-/// snapshot. Settings, the live host, and capture may observe a generation only
-/// after every payload reaches it. Explicit mutant actions
-/// independently retain each stale asset generation, proving no member is
-/// accidentally protected only by another. One more, `PublishLiveUnadmitted`,
-/// installs a worker-prepared generation on the live host before the service
-/// admits it — `finish_native_config_write` scheduling its runtime observation
-/// ahead of `synchronize_prepared_observation` instead of on its `Ok` arm — so
-/// when admission fails the host runs a config the service never published
-/// (`ViewsNeverAhead`).
-#[must_use]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn config_catalog_snapshot_model() -> Model {
-    aterm_spec::ty_model! {
-        ConfigCatalogSnapshot {
-            const Buggy = 0;
-            const MaxRevision = 2;
-            var revision = 0;
-            var text_generation = 0;
-            var trail_generation = 0;
-            var kitty_generation = 0;
-            var theme_generation = 0;
-            var sparkle_generation = 0;
-            // Distinguishes a byte-identical path-asset refresh from an
-            // ordinary text patch in Tier-1 traces without weakening the
-            // shared atomic-generation invariant.
-            var asset_refresh = 0;
-            var view_one_generation = 0;
-            var view_two_generation = 0;
-            var live_generation = 0;
-            var capture_generation = 0;
-            action AdmitPatch when (revision == 0) {
-                revision = revision + 1;
-                text_generation = revision + 1;
-                trail_generation = revision + 1;
-                kitty_generation = revision + 1;
-                theme_generation = revision + 1;
-                sparkle_generation = revision + 1;
-                asset_refresh = 0;
-            }
-            action AdmitExternal when (revision == 1) {
-                revision = revision + 1;
-                text_generation = revision + 1;
-                trail_generation = revision + 1;
-                kitty_generation = revision + 1;
-                theme_generation = revision + 1;
-                sparkle_generation = revision + 1;
-                asset_refresh = 0;
-            }
-            // A byte-identical external observation may still resolve a new
-            // path-backed asset generation. The text is re-admitted as part of
-            // the same immutable snapshot identity; consumers never combine
-            // the retained text Arc with an independently refreshed catalog.
-            action RefreshAssets when (revision == 0) {
-                revision = revision + 1;
-                text_generation = revision + 1;
-                trail_generation = revision + 1;
-                kitty_generation = revision + 1;
-                theme_generation = revision + 1;
-                sparkle_generation = revision + 1;
-                asset_refresh = 1;
-            }
-            // The theme-directory watcher parses off-thread and republishes a
-            // complete outer snapshot even when config text is byte-identical.
-            action RefreshThemes when (revision == 0) {
-                revision = revision + 1;
-                text_generation = revision + 1;
-                trail_generation = revision + 1;
-                kitty_generation = revision + 1;
-                theme_generation = revision + 1;
-                sparkle_generation = revision + 1;
-                asset_refresh = 2;
-            }
-            action AdmitStaleTrail when (Buggy == 1 && revision == 0) {
-                revision = revision + 1;
-                text_generation = revision + 1;
-                trail_generation = trail_generation;
-                kitty_generation = revision + 1;
-                theme_generation = revision + 1;
-                sparkle_generation = revision + 1;
-                asset_refresh = 0;
-            }
-            action AdmitStaleKitty when (Buggy == 1 && revision == 0) {
-                revision = revision + 1;
-                text_generation = revision + 1;
-                trail_generation = revision + 1;
-                kitty_generation = kitty_generation;
-                theme_generation = revision + 1;
-                sparkle_generation = revision + 1;
-                asset_refresh = 0;
-            }
-            action AdmitStaleTheme when (Buggy == 1 && revision == 0) {
-                revision = revision + 1;
-                text_generation = revision + 1;
-                trail_generation = revision + 1;
-                kitty_generation = revision + 1;
-                theme_generation = theme_generation;
-                sparkle_generation = revision + 1;
-                asset_refresh = 0;
-            }
-            action AdmitStaleSparkle when (Buggy == 1 && revision == 0) {
-                revision = revision + 1;
-                text_generation = revision + 1;
-                trail_generation = revision + 1;
-                kitty_generation = revision + 1;
-                theme_generation = revision + 1;
-                sparkle_generation = sparkle_generation;
-                asset_refresh = 0;
-            }
-            action PublishLiveUnadmitted when (
-                Buggy == 1 && revision <= MaxRevision - 1
-            ) {
-                live_generation = revision + 1;
-            }
-            action PublishOne when (
-                text_generation == revision && trail_generation == revision &&
-                kitty_generation == revision && theme_generation == revision &&
-                sparkle_generation == revision
-            ) {
-                view_one_generation = revision;
-            }
-            action PublishTwo when (
-                text_generation == revision && trail_generation == revision &&
-                kitty_generation == revision && theme_generation == revision &&
-                sparkle_generation == revision
-            ) {
-                view_two_generation = revision;
-            }
-            action PublishLive when (
-                text_generation == revision && trail_generation == revision &&
-                kitty_generation == revision && theme_generation == revision &&
-                sparkle_generation == revision
-            ) {
-                live_generation = revision;
-            }
-            action PublishCapture when (
-                text_generation == revision && trail_generation == revision &&
-                kitty_generation == revision && theme_generation == revision &&
-                sparkle_generation == revision
-            ) {
-                capture_generation = revision;
-            }
-            invariant SnapshotAtomic:
-                text_generation == revision && trail_generation == revision &&
-                kitty_generation == revision && theme_generation == revision &&
-                sparkle_generation == revision;
-            invariant ViewsNeverAhead:
-                view_one_generation <= revision && view_two_generation <= revision &&
-                live_generation <= revision && capture_generation <= revision;
-            // Consumers receive the one immutable snapshot `Arc` — text and every
-            // asset together — so a consumer's generation is complete whenever the
-            // snapshot is (`SnapshotAtomic`) and not ahead of it (`ViewsNeverAhead`).
-            bound RevisionBounded: revision <= MaxRevision && asset_refresh <= 2;
         }
     }
 }

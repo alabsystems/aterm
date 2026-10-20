@@ -248,8 +248,8 @@ pub struct Reading {
     /// box, a shell).
     pub composer: Option<(usize, Vec<String>)>,
     /// Usage credits carry the session, by the program's own notice
-    /// ([`ScreenReader::credits`]). FOR THE RECORD: it is no wall, and no
-    /// policy decides a turn's end by it.
+    /// ([`ScreenReader::credits`]). It is no wall; the supervisor's credits
+    /// hold reads it ([`crate::credits`]).
     pub credits: Option<crate::credits::Credits>,
     /// The program's own warning that a usage window is filling
     /// ([`ScreenReader::usage_warning`]), for the record.
@@ -301,8 +301,16 @@ pub trait ScreenReader: Sync {
     }
     /// THE AGENT'S OWN BACKGROUND WORK, AND NOTHING ELSE, KEEPS THIS SCREEN
     /// BUSY: its turn is over, the composer drawn, and what runs on is work
-    /// it started (a dynamic workflow, a background agent, a shell) — `Some(what runs)`. `None` for a live turn, an
-    /// idle screen, a box, or a program with no such read (the default).
+    /// it started (Claude Code's dynamic workflow, background agent or
+    /// shell; agy's task, timer or subagent in its panel; Muse Code's
+    /// backgrounded shell or monitor in its panel) — `Some(what runs)`.
+    /// `None` for a live turn, an idle screen, a box, or a program with no
+    /// such read (the default). The reader reads such a screen
+    /// [`Phase::Busy`] — but where a limit or a wall the turn ended on
+    /// stands over the work, or a question stands over work of the soft
+    /// kind (a monitor: [`crate::phase::Busy::soft`]), as each reader says —
+    /// so the supervisor's wait holds through it, the wall it remembers
+    /// stands through it, and the host is offered its break.
     fn background_wait(&self, _rows: &[String]) -> Option<&'static str> {
         None
     }
@@ -336,8 +344,8 @@ pub trait ScreenReader: Sync {
     }
     /// Where the TRANSCRIPT ends on `rows`, by position: the first row of the
     /// program's live zone — its box, its running turn's status row, its
-    /// composer and footer — which a read of what the worker said (`aterm
-    /// drive report`) cuts. One past the last non-blank row by default: a
+    /// composer and footer — which a read of what the worker said (the
+    /// since-removed `aterm drive report`) cuts. One past the last non-blank row by default: a
     /// program whose live zone no reader knows has nothing cut.
     fn transcript_end(&self, rows: &[String]) -> usize {
         rows.iter()
@@ -647,7 +655,7 @@ impl ScreenReader for ClaudeReader {
 /// was retired on 2026-10-16, the owner: "retire the codex harness"): no
 /// box, wall, composer, busy row or paste guard, every trait method but these
 /// two at its default. Its own state is its OSC 7501 report, which the window
-/// shows (`status program_state=`, the presence row) and nothing decides on.
+/// shows (`status program_state=`, the needs border's hover) and nothing decides on.
 #[derive(Debug, Clone, Copy)]
 pub struct CodexReader;
 
@@ -657,8 +665,8 @@ impl ScreenReader for CodexReader {
     }
     /// No evidence: every reading is `idle` NOT authoritatively (the trait's
     /// default [`ScreenReader::phase_authoritative`]), so the server
-    /// publishes `agent=unknown`, and `aterm drive phase`, `await-turn` and
-    /// `answer` read nothing on a Codex.
+    /// publishes `agent=unknown`, and `aterm drive phase` and `answer` read
+    /// nothing on a Codex.
     fn phase(&self, _rows: &[String]) -> Phase {
         Phase::Idle
     }
@@ -695,6 +703,11 @@ impl ScreenReader for AgyReader {
     fn interrupted(&self, rows: &[String]) -> bool {
         agy::interrupted(rows)
     }
+    /// A task, a timer or a subagent running in the panel under the
+    /// composer, the turn over it ended ([`agy::background_wait`]).
+    fn background_wait(&self, rows: &[String]) -> Option<&'static str> {
+        agy::background_wait(rows)
+    }
     fn fresh(&self, rows: &[String]) -> bool {
         agy::fresh(rows)
     }
@@ -720,6 +733,9 @@ impl ScreenReader for AgyReader {
     /// drawn under a menu and a box too, and must not read as a turn running.
     fn busy_guard(&self) -> Option<String> {
         Some(agy::busy_guard())
+    }
+    fn busy_zone_start(&self, rows: &[String]) -> usize {
+        agy::busy_zone_start(rows)
     }
     fn phase_authoritative(&self, rows: &[String], _: &Phase) -> bool {
         agy::phase(rows).1
@@ -748,6 +764,11 @@ impl ScreenReader for MuseReader {
     }
     fn interrupted(&self, rows: &[String]) -> bool {
         muse::interrupted(rows)
+    }
+    /// A backgrounded shell or a monitor running in the panel under the
+    /// composer, the turn over it ended ([`muse::background_wait`]).
+    fn background_wait(&self, rows: &[String]) -> Option<&'static str> {
+        muse::background_wait(rows)
     }
     fn fresh(&self, rows: &[String]) -> bool {
         muse::fresh(rows)

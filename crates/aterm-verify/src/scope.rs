@@ -115,20 +115,41 @@ impl Scope {
             .collect()
     }
 
-    /// Would this selection compile the bare package `name`? A supported
-    /// `name@version` spec identifies the same package; its original text is
-    /// retained by the driver arguments.
+    /// Would this selection compile the bare package `name`? A spec the cone
+    /// names it by (`name@version`, a path spec) identifies the same package
+    /// ([`Scope::spec_of`]); its original text is retained by the driver
+    /// arguments.
     #[must_use]
     pub fn includes_crate(&self, name: &str) -> bool {
+        self.spec_of(name).is_some()
+    }
+
+    /// The `-p` spelling this selection names the package `name` by: the
+    /// cone's own spec for it — `name`, `name@<version>`, or the path spec
+    /// `path+file://<dir>#name@<version>` for a member whose name the lock
+    /// shares ([`crate::changed::Members::spec`]) — or `name` itself for the
+    /// workspace. `None` when the selection would not compile it.
+    #[must_use]
+    pub fn spec_of(&self, name: &str) -> Option<String> {
         match self {
-            Self::Workspace => true,
-            _ => self.crates().iter().any(|spec| {
-                spec == name
-                    || spec
-                        .split_once('@')
-                        .is_some_and(|(package, version)| package == name && !version.is_empty())
-            }),
+            Self::Workspace => Some(name.to_string()),
+            _ => self
+                .crates()
+                .iter()
+                .find(|spec| spec_name(spec) == Some(name))
+                .cloned(),
         }
+    }
+}
+
+/// The package name a `-p` spec names: what follows a path spec's `#`, up to
+/// its `@<version>`. `None` for a spec whose `@` has no version after it
+/// (`name@`), which names no package.
+fn spec_name(spec: &str) -> Option<&str> {
+    let tail = spec.rsplit_once('#').map_or(spec, |(_, t)| t);
+    match tail.split_once('@') {
+        None => Some(tail),
+        Some((name, version)) => (!version.is_empty()).then_some(name),
     }
 }
 
@@ -161,6 +182,23 @@ mod tests {
         assert!(!empty.includes_crate("aterm-link"));
         assert!(Scope::workspace().includes_crate("aterm-link"));
         assert!(!Scope::crate_only("aterm-grid").includes_crate("aterm-link"));
+        // A member the cone names by its spec, because the lock holds another
+        // package of its name, is that package — and no other one.
+        let shared = changed(&["getrandom@0.2.17", "path+file:///r/crates/aterm-x#x@1.0.0"]);
+        assert_eq!(
+            shared.spec_of("getrandom").as_deref(),
+            Some("getrandom@0.2.17")
+        );
+        assert_eq!(
+            shared.spec_of("x").as_deref(),
+            Some("path+file:///r/crates/aterm-x#x@1.0.0")
+        );
+        assert!(!shared.includes_crate("getrandom@0.2.17"));
+        assert!(!shared.includes_crate("aterm-x"));
+        assert_eq!(
+            Scope::workspace().spec_of("getrandom").as_deref(),
+            Some("getrandom")
+        );
         assert!(Scope::crate_only("aterm-lab").has_lib_target());
         assert!(!Scope::changed("main", vec!["aterm-lab".into()], false).has_lib_target());
     }

@@ -77,9 +77,9 @@ mod wayland_backend {
     #[macro_export]
     macro_rules! message {
         ($opcode:expr, [$($args:expr),* $(,)?] $(,)?) => {
-            $crate::wayland_backend::Message {
+            $crate::consumer_forms::wayland_backend::Message {
                 opcode: $opcode,
-                args: $crate::wayland_backend::smallvec::smallvec![$($args),*],
+                args: $crate::consumer_forms::wayland_backend::smallvec::smallvec![$($args),*],
             }
         }
     }

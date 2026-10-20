@@ -62,10 +62,44 @@ fn corpus() -> Vec<String> {
         "X".repeat(COLS as usize),
         // A row whose last cell is wide (the row-edge case).
         format!("{}日", "y".repeat(COLS as usize - 2)),
+        // Cells the grid drew apart that a walk of their text joins: the grid
+        // folds a character into the cell before only when that cell is the one
+        // before the cursor (`OUT_OF_ORDER`).
+        OUT_OF_ORDER[0].1.to_owned(),
+        OUT_OF_ORDER[1].1.to_owned(),
+        OUT_OF_ORDER[2].1.to_owned(),
+        OUT_OF_ORDER[3].1.to_owned(),
+        OUT_OF_ORDER[4].1.to_owned(),
         // Empty row (zero length).
         String::new(),
     ]
 }
+
+/// Rows whose cells the grid drew apart where a walk of the row's text joins
+/// them, each ending in `XYZ`: written out of order, or brought together by a
+/// DCH. Each starts with `CR` and draws on the cursor's row only.
+const OUT_OF_ORDER: [(&str, &str); 5] = [
+    (
+        "flag halves, right one first",
+        "\r\x1b[3G\u{1f1e7}\x1b[1G\u{1f1e6}\x1b[5GXYZ",
+    ),
+    (
+        "skin tone before its base",
+        "\r\x1b[3G\u{1f3fd}\x1b[1G\u{1f44d}\x1b[5GXYZ",
+    ),
+    (
+        "a cell ending in ZWJ, the next drawn first",
+        "\r\x1b[2G\u{e9}\x1b[1Ga\u{200d}\x1b[3GXYZ",
+    ),
+    (
+        "flag halves brought together by DCH",
+        "\r\u{1f1e6}q\u{1f1e7}XYZ\x1b[3G\x1b[P",
+    ),
+    (
+        "skin tone brought to its base by DCH",
+        "\r\u{1f44d}q\u{1f3fd}XYZ\x1b[3G\x1b[P",
+    ),
+];
 
 /// Feed the corpus, then enough blank lines to push every corpus row off the
 /// screen and into history.
@@ -138,5 +172,65 @@ fn ring_rows_materialize_identically_to_the_line_round_trip() {
             "rev_idx {rev_idx}: the ring fast path declined a ring row, so the parity \
              assertion for it compared the round trip with itself. Row text: {text:?}"
         );
+    }
+}
+
+/// Every display column of the top row as drawn: `(grapheme, wide)`.
+fn top_row(term: &Terminal) -> Vec<(String, bool)> {
+    term.display_row_grapheme_cells(0).expect("the top row")
+}
+
+/// Cells the grid drew apart stay apart in history: the ring tier draws the
+/// row from its own cells, and the stored line it becomes past the ring, and
+/// the line a history rewrap builds from it, keep the cells apart too, so the
+/// row is drawn the same in every tier and its `XYZ` stays where it was drawn
+/// for every reader of a history row's cells (search, a double-click, a copy).
+/// The stored line used to join them (`advance_grapheme_unit_wide`), and the
+/// row's layout changed when it left the ring.
+#[test]
+fn cells_drawn_apart_stay_apart_in_every_history_tier() {
+    use aterm_core::scrollback::Scrollback;
+    for (label, input) in OUT_OF_ORDER {
+        let mut term = Terminal::with_scrollback(3, COLS, 2, Scrollback::with_defaults());
+        term.process(input.as_bytes());
+        let drawn = top_row(&term);
+        let x = drawn
+            .iter()
+            .position(|(g, _)| g == "X")
+            .expect("X is drawn");
+        let col_of_x = |term: &Terminal, row: i32| {
+            let (text, cells) = term.written_line_cells(row).expect("the row");
+            let x = text.find('X').expect("X in the text");
+            cells.columns_of(&text, x, x + 1).0
+        };
+        assert_eq!(col_of_x(&term, 0), x, "{label}: on screen");
+
+        // Into the ring, then past it into the store.
+        for (tier, newer) in [("ring", 1usize), ("store", 4)] {
+            term.scroll_to_bottom();
+            while term.grid().scrollback_lines() < newer + 1 {
+                term.process(b"\r\n");
+            }
+            let in_ring = term.grid().ring_buffer_scrollback() > newer;
+            assert_eq!(in_ring, tier == "ring", "{label}: precondition, {tier}");
+            term.scroll_to_top();
+            assert_eq!(top_row(&term), drawn, "{label}: drawn in the {tier}");
+            let row = -i32::try_from(newer).expect("small") - 1;
+            assert_eq!(col_of_x(&term, row), x, "{label}: read in the {tier}");
+            let step = term
+                .search_budgeted("XYZ", false, false, None, 100)
+                .expect("budgeted search");
+            assert!(
+                step.results.matches.iter().any(|m| m.start_col == x),
+                "{label}: found in the {tier}: {:?}",
+                step.results.matches
+            );
+        }
+
+        // A history rewrap there and back builds the line from those cells.
+        term.resize(3, COLS + 7);
+        term.resize(3, COLS);
+        term.scroll_to_top();
+        assert_eq!(top_row(&term), drawn, "{label}: after a history rewrap");
     }
 }

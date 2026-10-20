@@ -1,0 +1,49 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl line <n>` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code (crates/aterm-lab, a local stub of the API) · the SCROLLBACK rows right above the screen of `claude-2.1.304-verbose-long-output-context-wall.txt`, oldest first: `search` (no pattern) answered screen_first=256 and `lines` 48, and `line 208` .. `line 255` read these (the launch banner, the person's turn, the call row, the output's rows 1-40)
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ toolstart
+
+⏺ Bash(sleep 4; seq 1 80)
+  ⎿  1
+     2
+     3
+     4
+     5
+     6
+     7
+     8
+     9
+     10
+     11
+     12
+     13
+     14
+     15
+     16
+     17
+     18
+     19
+     20
+     21
+     22
+     23
+     24
+     25
+     26
+     27
+     28
+     29
+     30
+     31
+     32
+     33
+     34
+     35
+     36
+     37
+     38
+     39
+     40

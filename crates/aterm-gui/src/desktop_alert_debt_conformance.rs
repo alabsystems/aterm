@@ -20,11 +20,11 @@ fn escalation(session: u64, key: u64) -> Escalation {
     Escalation {
         session,
         kind: EscalationKind::Attention,
+        word: aterm_types::needs::NeedWord::Ask,
         key,
         label: key.to_string(),
         body: "attention".to_string(),
-        headline: EscalationKind::Attention.headline(),
-        shared: false,
+        headline: super::headline(aterm_types::needs::NeedWord::Ask),
     }
 }
 
@@ -40,7 +40,9 @@ impl Rig {
 
     fn reset(&mut self) {
         self.app.presence.herald = Herald::default();
-        self.app.config.desktop_alerts = None;
+        // The model starts disabled, as the shipped default is; the rig
+        // names the switch rather than leaning on the default.
+        self.app.config.desktop_alerts = Some(false);
         self.app.apply_desktop_alerts(false);
         self.now = Instant::now();
         self.next_prime = 1;

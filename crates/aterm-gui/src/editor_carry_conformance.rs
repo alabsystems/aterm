@@ -721,7 +721,7 @@ fn prelaunch_record() -> crate::HandoffPrelaunch {
         stand_down: std::sync::mpsc::sync_channel(1).0,
         transfer: std::sync::mpsc::sync_channel(1).0,
         arbiter: crate::HandoffAttemptArbiter::new(),
-        launched_at: std::time::Instant::now(),
+        begun_at: std::time::Instant::now(),
         dialled: None,
         park_retry_at: None,
         park_misses: 0,
@@ -732,6 +732,8 @@ fn prelaunch_record() -> crate::HandoffPrelaunch {
         stood_down: false,
         teardown: crate::DeferredHandoffTeardown::None,
         revoked_by_activity: false,
+        #[cfg(target_os = "macos")]
+        booked_launch_unregistered: false,
         history_export: None,
     }
 }
@@ -759,21 +761,6 @@ fn rejected(attempt_id: u64) -> crate::UpdateHandoffCompletion {
 /// the completion that retires the record runs it. Stood down before the
 /// park, nothing is owed.
 #[test]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "NativeUpdateEditorCarry",
-    action = "Park",
-    reason = "The handoff's own step: the park installs the attempt record, which this machine \
-              reads only through the fences and the late fact. Tier-1 installs the real record \
-              (`PendingUpdateHandoff`) the park installs; the park itself is \
-              `NativeUpdateSeamlessHandoffOwnership`'s `ParkOutgoingReaders`."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "NativeUpdateEditorCarry",
-    action = "StandDown",
-    reason = "The handoff's own step: a launched successor stood down before the park leaves \
-              nothing restored and nothing owed. Tier-1 retires a real prelaunch record through \
-              the real completion reducer (`reduce_returned_handoff_completion`)."
-)]
 fn the_launched_lane_journals_through_the_hold_and_reseats_after_its_stand_down() {
     let mut rig = Rig::new("launched-lane");
     rig.type_key("draft", "a", &["Type", "Plan", "Land"]);

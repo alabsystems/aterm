@@ -542,7 +542,8 @@ fn warm(
                 command.env(name, value);
             }
         }
-        match command.spawn() {
+        // The twin may have been laid a moment ago: an `ETXTBSY` refusal is tried again.
+        match aterm_uds::spawnfd::spawn_past_text_busy(|| command.spawn()) {
             Ok(child) => drive(child, hold, deadline),
             Err(_) => Ended::SpawnFailed,
         }
@@ -567,17 +568,13 @@ fn stripped(warm: &Warm, name: &str) -> bool {
 /// process ([`aterm_uds::spawnfd::InheritNothing`]): the shim command is raw because the
 /// pass-throughs that exec it hand their caller's descriptors on, and the warm is no
 /// pass-through.
-#[expect(
-    clippy::disallowed_types,
-    reason = "the shim's raw Command, stripped here with InheritNothing"
-)]
 fn warm_command(
     layout: &Layout,
     tool: &ToolName,
     warm: &Warm,
     inherited: impl IntoIterator<Item = OsString>,
     home: Option<&Path>,
-) -> std::process::Command {
+) -> aterm_uds::spawnfd::StdCommand {
     use aterm_uds::spawnfd::InheritNothing as _;
     let args: Vec<String> = warm.argv.iter().map(|a| (*a).to_string()).collect();
     let mut command = crate::landing::shim_command(layout, tool, &args);
@@ -738,6 +735,7 @@ mod tests {
 
     /// Poll for `path` for up to a minute — a freshly written script's first exec can wait
     /// on the system's code-policy check for seconds on a busy machine.
+    #[cfg(unix)]
     fn appears(path: &Path) -> bool {
         (0..1200).any(|_| {
             let there = path.exists();
@@ -1079,10 +1077,12 @@ mod tests {
         std::fs::create_dir_all(&marks).unwrap();
         let tool = ToolName::new("claude").unwrap();
         let spec = crate::vendor_direct::spec("claude").unwrap();
+        // Each spawn follows a lay: past the `ETXTBSY` a sibling test's fork can hold it in.
         let spawn = || {
-            warm_command(layout, &tool, &spec.warm.unwrap(), [], None)
-                .spawn()
-                .unwrap()
+            aterm_spec::wait::past_text_busy(|| {
+                warm_command(layout, &tool, &spec.warm.unwrap(), [], None).spawn()
+            })
+            .unwrap()
         };
         // Reads stdin to EOF, then exits 3.
         install(
@@ -1189,9 +1189,10 @@ mv '{m}/fd.tmp' '{m}/fd'
             "the negative control: the pass-throughs' spawn hands it on"
         );
         assert!(control.wait().unwrap().success());
-        let mut child = warm_command(layout, &tool, &spec.warm.unwrap(), [], None)
-            .spawn()
-            .unwrap();
+        let mut child = aterm_spec::wait::past_text_busy(|| {
+            warm_command(layout, &tool, &spec.warm.unwrap(), [], None).spawn()
+        })
+        .unwrap();
         assert_eq!(seen(), "absent");
         drop(child.stdin.take());
         let _ = child.wait();

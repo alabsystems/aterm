@@ -885,3 +885,114 @@ fn shell_setup_under_an_open_umask_shares_no_directory() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// The Caffeine mug's leftovers are swept through the going bundle's own aterm — asked
+/// `help caffeine` first, then `caffeine startup off` and `caffeine quit` — and its files in
+/// the support dir go after a free lock is held (the rendezvous stays); a dry run runs no
+/// helper. Refused or unsupported helpers and busy/missing locks preserve the files.
+#[test]
+fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
+    let a = Account::new("caffeine");
+    let home = a.home().to_path_buf();
+    let log = a.dir.join("asked.log");
+    let app = home.join("Applications/aterm.app");
+    bundle(&app, None);
+    let aterm = app.join("Contents/MacOS/aterm");
+    // Absolute paths: the child inherits this test process's HOME, which is the real one.
+    exe(
+        &aterm,
+        &format!("#!/bin/sh\necho \"$*\" >>'{}'\n", log.display()),
+    );
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(ok, "{out}{err}");
+    assert!(
+        !log.exists(),
+        "no mug ran here, so no aterm was asked: {out}"
+    );
+
+    let a = Account::new("caffeine-left");
+    let home = a.home().to_path_buf();
+    let app = home.join("Applications/aterm.app");
+    bundle(&app, None);
+    let aterm = app.join("Contents/MacOS/aterm");
+    exe(
+        &aterm,
+        &format!("#!/bin/sh\necho \"$*\" >>'{}'\n", log.display()),
+    );
+    let support = home.join("Library/Application Support/aterm");
+    write(&support.join("caffeine.state"), "mode=off\n");
+    write(&support.join("caffeine.lock"), "");
+    write(&support.join("caffeine/l.plist"), "<plist/>");
+    write(
+        &support.join("caffeine-code.noindex/l/aterm.app/Contents/Info.plist"),
+        "<plist/>",
+    );
+    let (ok, out, err) = a.sweep(None, true);
+    assert!(ok, "{out}{err}");
+    for step in ["caffeine startup off", "caffeine quit"] {
+        assert!(
+            out.contains(&format!("would run {} {step}", aterm.display())),
+            "{out}"
+        );
+    }
+    assert!(
+        support.join("caffeine.state").exists(),
+        "a dry run keeps it"
+    );
+    assert!(!log.exists(), "a dry run starts no helper");
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(ok, "{out}{err}");
+    assert_eq!(
+        std::fs::read_to_string(&log).expect("asked"),
+        "help caffeine\ncaffeine startup off\ncaffeine quit\n"
+    );
+    for name in ["caffeine-code.noindex", "caffeine", "caffeine.state"] {
+        assert!(!present(&support.join(name)), "{name}: {out}");
+    }
+    assert!(
+        support.join("caffeine.lock").is_file(),
+        "the rendezvous stays"
+    );
+    assert!(!app.exists(), "the bundle went after its aterm was asked");
+
+    for kind in ["quit-fails", "unsupported", "busy", "missing"] {
+        let a = Account::new(kind);
+        let support = a.home().join("Library/Application Support/aterm");
+        let app = a.home().join("Applications/aterm.app");
+        bundle(&app, None);
+        let refuse = match kind {
+            "quit-fails" => "caffeine quit",
+            "unsupported" => "help caffeine",
+            _ => "never",
+        };
+        exe(
+            &app.join("Contents/MacOS/aterm"),
+            &format!("#!/bin/sh\n[ \"$*\" = '{refuse}' ] && exit 1\nexit 0\n"),
+        );
+        write(&support.join("caffeine.state"), "mode=off\n");
+        write(&support.join("caffeine-code.noindex/keep"), "copy bytes");
+        let lock = support.join("caffeine.lock");
+        if kind != "missing" {
+            write(&lock, "");
+        }
+        let held = (kind == "busy").then(|| {
+            crate::lock::Flock::try_lock(std::fs::File::open(&lock).expect("open")).expect("hold")
+        });
+        let before = tree(&support);
+        let (ok, out, err) = a.sweep(None, false);
+        assert!(
+            !ok,
+            "unconfirmed cleanup must report a partial result: {kind}: {out}{err}"
+        );
+        assert_eq!(tree(&support), before, "{kind}");
+        assert_eq!(
+            std::fs::read_to_string(support.join("caffeine.state")).expect("state"),
+            "mode=off\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(support.join("caffeine-code.noindex/keep")).expect("copy"),
+            "copy bytes"
+        );
+        drop(held);
+    }
+}

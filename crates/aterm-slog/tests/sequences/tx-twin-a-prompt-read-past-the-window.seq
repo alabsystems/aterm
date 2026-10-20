@@ -1,0 +1,12 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_prompt_read_before_the_screens_turn_names_it, 6 s apart (the
+# negative control): the turn is its own, the call counted.
+state partial
+bind 0
+pass 10000
+tx prompt vlead
+pass 6000
+see busy
+expect open t1 turn src=screen
+tx tool c1
+expect tx dropped=1

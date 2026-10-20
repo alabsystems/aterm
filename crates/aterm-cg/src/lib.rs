@@ -119,4 +119,66 @@ impl CGDisplay {
         // SAFETY: a by-value ID; see the type's doc.
         unsafe { CGDisplayModelNumber(self.id) }
     }
+
+    /// Return the raw `CGDirectDisplayID`.
+    #[must_use]
+    pub const fn raw_id(self) -> CGDirectDisplayID {
+        self.id
+    }
+
+    /// Encode display geometry (`id`, `width_px`, `height_px`, `model_number`) into 16 LE bytes.
+    #[must_use]
+    pub const fn encode_geometry_le(
+        id: CGDirectDisplayID,
+        width_px: u32,
+        height_px: u32,
+        model_number: u32,
+    ) -> [u8; 16] {
+        [
+            id as u8,
+            (id >> 8) as u8,
+            (id >> 16) as u8,
+            (id >> 24) as u8,
+            width_px as u8,
+            (width_px >> 8) as u8,
+            (width_px >> 16) as u8,
+            (width_px >> 24) as u8,
+            height_px as u8,
+            (height_px >> 8) as u8,
+            (height_px >> 16) as u8,
+            (height_px >> 24) as u8,
+            model_number as u8,
+            (model_number >> 8) as u8,
+            (model_number >> 16) as u8,
+            (model_number >> 24) as u8,
+        ]
+    }
+
+    /// Decode 16 LE bytes into display geometry (`id`, `width_px`, `height_px`, `model_number`).
+    #[must_use]
+    pub const fn decode_geometry_le(bytes: [u8; 16]) -> (CGDirectDisplayID, u32, u32, u32) {
+        let id = (bytes[0] as u32)
+            | ((bytes[1] as u32) << 8)
+            | ((bytes[2] as u32) << 16)
+            | ((bytes[3] as u32) << 24);
+        let w = (bytes[4] as u32)
+            | ((bytes[5] as u32) << 8)
+            | ((bytes[6] as u32) << 16)
+            | ((bytes[7] as u32) << 24);
+        let h = (bytes[8] as u32)
+            | ((bytes[9] as u32) << 8)
+            | ((bytes[10] as u32) << 16)
+            | ((bytes[11] as u32) << 24);
+        let m = (bytes[12] as u32)
+            | ((bytes[13] as u32) << 8)
+            | ((bytes[14] as u32) << 16)
+            | ((bytes[15] as u32) << 24);
+        (id, w, h, m)
+    }
+}
+
+/// Return `true` when `error == kCGErrorSuccess`.
+#[must_use]
+pub const fn is_cg_success(error: CGError) -> bool {
+    error == kCGErrorSuccess
 }

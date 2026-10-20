@@ -4,13 +4,13 @@
 //! Which build a run measures: the lane's `--profile dev|opt`, and how the
 //! bench names the build it is running from.
 //!
-//! TWO ARMS, ONE CODE PATH. Both are test builds with debug assertions on, so
+//! TWO ARMS, ONE CODE PATH. Both enable debug assertions, so
 //! every `#[cfg(any(test, debug_assertions))]` seam the harness calls compiles
 //! (AGENTS.md) and the headless `aterm` reads the `ATERM_FABRIC_COMMAND`
 //! development seam that points it at the bridge. They differ only in code
 //! generation:
 //!
-//! - **dev** is `targo test`'s own `test` profile, which inherits `dev`: opt-level
+//! - **dev** explicitly selects the `test` profile, which inherits `dev`: opt-level
 //!   0 except the root `Cargo.toml`'s per-crate speed rows, from two tables —
 //!   `[profile.dev.package.<name>]`, which `test` inherits (aterm-core,
 //!   aterm-grid, aterm-render … at 2, aterm-spec at 1), and
@@ -31,7 +31,7 @@
 //! WHERE EACH ARM'S BINARY IS. cargo writes a profile's binaries to
 //! `<target dir>/<profile dir>/` — `debug` for `dev` and `test`, the profile's
 //! own name for a custom one, wherever its intermediates go (atpkg's shim puts
-//! those in its own build directory) — and hands a test target that path in
+//! those in its own build directory) — and hands a test or bench target that path in
 //! `CARGO_BIN_EXE_<name>`. The harness launches its `aterm` (the window and,
 //! through the seam, the bridge) by that path, which other builds write too,
 //! so the bench reports the path, the arm it names ([`Profile::of_binary`]) and
@@ -46,7 +46,7 @@ use std::path::Path;
 /// One arm of the measurement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Profile {
-    /// `targo test`'s own profile: the dev code generation.
+    /// The `test` profile: the dev measurement's original code generation.
     #[default]
     Dev,
     /// `--profile opt-test`: release code generation, debug assertions on.
@@ -78,14 +78,13 @@ impl Profile {
             .ok_or_else(|| format!("`--profile` is `dev` or `opt`, not `{raw}`"))
     }
 
-    /// The cargo profile the lane builds the arm with, as `--profile <it>`;
-    /// `None` is `targo test`'s own (`test`), and the dev arm's command line
-    /// stays the one every earlier entry ran.
+    /// The explicit cargo profile: `test` keeps the dev measurement unchanged
+    /// when the entry is built as a bench, whose default profile is release.
     #[must_use]
-    pub fn cargo_profile(self) -> Option<&'static str> {
+    pub fn cargo_profile(self) -> &'static str {
         match self {
-            Profile::Dev => None,
-            Profile::Opt => Some("opt-test"),
+            Profile::Dev => "test",
+            Profile::Opt => "opt-test",
         }
     }
 
@@ -138,24 +137,11 @@ impl Profile {
     }
 }
 
-/// What tells one build's file at `path` from any other written there: its
-/// length and its modification time to the nanosecond.
-///
-/// WHY A PATH IS NOT ENOUGH. The harness launches `aterm` by path — the window,
-/// and the bridge it re-launches on every attach round — and other builds write
-/// that path too: `targo build -p aterm` (the dev profile, not `test`) rewrites
-/// `target/debug/aterm`, and any build of `opt-test` rewrites
-/// `target/opt-test/aterm`. The lane reads this right after its own build, the
-/// bench at its start and at its end; one value across the three is one binary
-/// measured throughout. A linker writes a new file, so a rebuild changes the
-/// time even at the same length.
-///
-/// NOT THE INODE. Under atpkg's shim the build directory is not the target
-/// directory, and cargo copies the binary up into `target/<profile dir>/` again
-/// on every invocation, fresh or not — on macOS by a clone that keeps the
-/// modification time and gets a new inode. Measured 2026-10-17: the lane's build
-/// and the `targo test` that runs the bench right after it left the same length
-/// and nanosecond, and two inodes.
+/// The built file's length and nanosecond modification time. Profile binary
+/// paths are shared with other builds, so the lane compares this immediately
+/// after building with the bench's readings at its start and end. A changed
+/// reading refuses the report. Inodes are excluded: atpkg's cache copies a
+/// fresh target by clone on macOS, preserving modification time with a new inode.
 ///
 /// # Errors
 ///
@@ -177,10 +163,10 @@ pub fn identity(path: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn each_arm_parses_from_its_name_and_nothing_else_does() {
+        use super::*;
+
         for p in Profile::ALL {
             assert_eq!(Profile::parse(p.name()), Ok(p));
         }
@@ -196,6 +182,8 @@ mod tests {
 
     #[test]
     fn a_binary_names_the_arm_whose_directory_holds_it() {
+        use super::*;
+
         for p in Profile::ALL {
             let exe = Path::new("/w/target").join(p.dir()).join("aterm");
             assert_eq!(Profile::of_binary(&exe), Some(p));
@@ -237,13 +225,15 @@ mod tests {
 
     #[test]
     fn an_arm_is_looked_up_where_cargo_writes_its_profile() {
+        use super::*;
+
         for p in Profile::ALL {
             match p.cargo_profile() {
                 // A custom profile's binaries land in a directory of its own
                 // name.
-                Some(custom) => assert_eq!(p.dir(), custom, "{p:?}"),
+                custom if custom != "test" => assert_eq!(p.dir(), custom, "{p:?}"),
                 // `targo test`'s own profile, `test`, writes to `debug`.
-                None => assert_eq!(p.dir(), "debug", "{p:?}"),
+                _ => assert_eq!(p.dir(), "debug", "{p:?}"),
             }
             // What the ledger says of an arm is the level the lane holds its
             // build to.
@@ -256,6 +246,8 @@ mod tests {
 
     #[test]
     fn a_rewritten_binary_is_another_identity() {
+        use super::*;
+
         let dir = std::env::temp_dir().join(format!("fabric-identity-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch");
         let exe = dir.join("aterm");

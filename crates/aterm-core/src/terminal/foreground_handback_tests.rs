@@ -252,6 +252,44 @@ fn foreground_handback_torn_sequence_alone_gets_only_can() {
     }
 }
 
+/// A holder that dies inside a tmux passthrough wrapper (a tab that inherited
+/// `TMUX` with no tmux in it, `aterm_parser::TmuxPassthrough`) is handed back
+/// with the `CAN`, then the `ESC \` that ends the wrapper: a `CAN` alone ends
+/// only the payload's sequence, and the next holder's doubled ESC would still
+/// read as one and its `ESC \` would end the wrapper instead of its own string;
+/// the wrapper's end first would end the torn string as at its ST (a torn
+/// title set, a torn sixel placed).
+#[test]
+fn foreground_handback_ends_a_tmux_wrapper_it_left_open() {
+    for (torn, bytes) in [
+        (&b"\x1bPtmux;"[..], &b"\x18\x1b\\"[..]),
+        (b"\x1bPtmux;\x1b", b"\x18\x1b\\"),
+        (b"\x1bPtmux;\x1b\x1bPq#0;2;0;0;0#0~~~~~~", b"\x18\x1b\\"),
+        (b"\x1bPtmux;\x1b\x1b]2;torn", b"\x18\x1b\\"),
+        (b"\x1bPtmu", b"\x18"),
+    ] {
+        let mut t = Terminal::new(24, 80);
+        t.process(torn);
+        let label = String::from_utf8_lossy(torn);
+        assert!(!t.parser_is_ground(), "precondition {label:?}");
+        let h = t.foreground_handback().expect("torn");
+        assert_eq!(h.bytes, bytes, "{label:?}");
+        assert_eq!(h.reverted, vec!["parser"]);
+        assert!(t.parser_is_ground(), "{label:?}");
+        assert_ne!(t.title(), "torn", "{label:?}: the torn title is canceled");
+        let grid = t.grid();
+        let images = (0..grid.rows())
+            .flat_map(|r| (0..grid.cols()).map(move |c| (r, c)))
+            .filter(|&(r, c)| grid.cell_extra(r, c).is_some_and(|e| e.image().is_some()))
+            .count();
+        assert_eq!(images, 0, "{label:?}: the torn sixel is not placed");
+        // The next holder's own title, ST-ended, then its prompt.
+        t.process(b"\x1b]2;shell\x1b\\% ");
+        assert_eq!(t.title(), "shell", "{label:?}");
+        assert_eq!(t.row_text(0).unwrap().trim_end(), "%", "{label:?}");
+    }
+}
+
 #[test]
 fn foreground_handback_leaves_vt52_before_any_csi() {
     let mut t = Terminal::new(24, 80);

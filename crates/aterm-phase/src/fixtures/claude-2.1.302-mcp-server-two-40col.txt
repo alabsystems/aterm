@@ -1,0 +1,16 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (40x30, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the several-server .mcp.json approval dialog (two new servers lab-probe-a and lab-probe-b) in a 40x30 pane, cursor on its first server
+
+────────────────────────────────────────
+  2 new MCP servers found in this
+  project
+  Select any you wish to enable.
+
+  MCP servers may execute code or
+  access system resources. All tool
+  calls require approval. Learn more
+  in the MCP documentation.
+
+  ❯ [✔] lab-probe-a
+    [✔] lab-probe-b
+       Enable selected
+ Space to select · Esc to reject all

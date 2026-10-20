@@ -1,0 +1,22 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# P8a: a harness answering a prose question within the settle: the asked
+# turn closes at once, dated when the agent asked; the exchange is a turn of
+# its own carrying by= and ledger=; an hour later the human's turn is the
+# human's (P8b).
+see busy
+see question
+pass 400
+ctl
+expect close t1 turn out=asked conf=heuristic at=0
+pass 200
+see busy
+expect open t1 turn
+expect open t2 turn ledger=1 by=harness at=600
+see idle
+half
+half
+expect close t2 turn out=done
+pass 3600000
+input human
+see busy
+expect open t3 turn by=human at=3601600

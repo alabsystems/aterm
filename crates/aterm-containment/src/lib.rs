@@ -51,9 +51,9 @@ pub(crate) mod mode;
 pub(crate) mod policy;
 pub mod sbpl;
 
-// `audit` is declared last: the Trust strict gate verifies roughly in declaration order and
-// stops at the first fail-closed error, and `audit::forward` must carry the unsafe
-// `fmt::Arguments::new` (`aterm_log::__log` takes a `fmt::Arguments`).
+// `audit` is declared last: the Trust lane (`ship trust run`) verifies roughly in
+// declaration order and stops at the first fail-closed error, and `audit::forward` must
+// carry the unsafe `fmt::Arguments::new` (`aterm_log::__log` takes a `fmt::Arguments`).
 pub(crate) mod audit;
 
 pub use actuator::{
@@ -96,7 +96,7 @@ pub enum InitError {
 }
 
 // Hand-written `Display`/`Error`: a derived or `write!` `fmt` expands a runtime-argument
-// `format_args!`, whose unsafe `fmt::Arguments::new` the Trust strict gate fails closed on.
+// `format_args!`, whose unsafe `fmt::Arguments::new` the Trust lane fails closed on.
 impl std::fmt::Display for InitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

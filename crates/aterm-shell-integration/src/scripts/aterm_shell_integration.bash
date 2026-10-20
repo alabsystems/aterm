@@ -53,13 +53,14 @@
 # off on the line above, put back wherever this file returns, so an rc's
 # `set -x`, or a typed upgrade under one, traces nothing of it but its first
 # line, `[[ $- != *i* ]]`. What remains is bash's own trace of the hooks'
-# calls — the DEBUG trap's `__aterm_preexec <$_>` before each command and
+# calls — the DEBUG trap's `__aterm_preexec <$_>` before each command,
 # PROMPT_COMMAND's `__aterm_prompt_command` (and an array one's last element,
-# `__aterm_prompt_end`) — and an `eval` line before a scalar
-# PROMPT_COMMAND of the user's; none carries the nonce. Under BASH_XTRACEFD
-# (bash 4.1+) the trace is not on stderr, so each function's opening `local` and
-# `set +xv` and its closing `return` reach it too: about 15 lines a command, no
-# nonce (measured on bash 5.2.37; 290 and the nonce 21 times before). A loader
+# `__aterm_prompt_end`) and, on bash 5.3+, PS0's `__aterm_ps0` — and an `eval`
+# line before a scalar PROMPT_COMMAND of the user's; none carries the nonce.
+# Under BASH_XTRACEFD (bash 4.1+) the trace is not on stderr, so each function's
+# opening `local` and `set +xv` and its closing `return` reach it too: about 15
+# lines a command, no nonce (measured on bash 5.2.37; 290 and the nonce 21 times
+# before). A loader
 # from before this, frozen in a running shell, still traces its trampoline's own
 # lines (no nonce); the body it takes does not.
 
@@ -147,11 +148,28 @@ case "${ATERM_MUX:-}" in 0|off|no|none|false) __aterm_mux="" ;; esac
 # upgrade in place: everything below is idempotent, and what must run once per
 # shell (the package blocks, the PROMPT_COMMAND and DEBUG-trap wiring) is skipped
 # where it already ran.
-__aterm_fresh_load=1
+#
+# An upgrade in place first notes, for the body's AN OLDER SCRIPT'S
+# `~/.aterm/bin`, the script that loaded this shell FRESH — before this load
+# writes over what says so: the loader in `__aterm_si_dir` when its own load was
+# the fresh one (`__aterm_fresh_load` 1), `-` for a shell from before loaders
+# (neither is set), nothing it can name otherwise (a loader that itself came in
+# place). Once per shell, while the body has not settled it.
 if [[ -n "${ATERM_SHELL_INTEGRATION_INSTALLED:-}" && -n "${__aterm_shell_nonce+x}" ]] &&
    declare -F __aterm_prompt_command >/dev/null; then
+    if [[ -z "${__aterm_old_bin_off+x}${__aterm_bin_from+x}" ]]; then
+        if [[ -z "${__aterm_fresh_load+x}${__aterm_si_dir+x}" ]]; then
+            __aterm_bin_from=-
+        elif [[ "${__aterm_fresh_load-}" == 1 && -n "${__aterm_si_dir-}" ]]; then
+            __aterm_bin_from="$__aterm_si_dir/aterm_shell_integration.bash"
+        else
+            __aterm_bin_from=
+        fi
+    fi
     __aterm_fresh_load=0
     ATERM_SHELL_INTEGRATION_INSTALLED=
+else
+    __aterm_fresh_load=1
 fi
 
 # Skip if already loaded — marking the boundary on the way out when the
@@ -290,6 +308,13 @@ if [[ ${#__aterm_body_rev} -ne 16 || "$__aterm_body_rev" == *[!0-9a-f]* ]]; then
     __aterm_body_rev=""
 fi
 
+# A fresh load settles the body's AN OLDER SCRIPT'S `~/.aterm/bin` at once: this
+# loader puts no `~/.aterm/bin` on PATH, so no entry there is an integration's
+# and the body has nothing to look for.
+if (( __aterm_fresh_load )); then
+    __aterm_old_bin_off=1
+fi
+
 # Source package shell hooks — once per shell: an upgrade in place already ran
 # them (the LIVE block re-sources the atpkg hook whenever it changes).
 # No `~/.aterm/bin` goes on PATH: nothing creates or manages that folder, and an
@@ -361,6 +386,21 @@ __aterm_prompt_command() {
     case $__aterm_flags in *x*) set -x ;; esac
 }
 
+# THE PS0 TRAMPOLINE (bash 5.3+, the body's "PS0" says why): what PS0 names, and
+# like the prompt's trampoline the piece that never changes. It calls the body's
+# hook only where the body defines one, so a body without it (an older build's,
+# taken at a prompt) leaves PS0 printing nothing, never `command not found` at
+# every line. The hook runs where `set -e` is ignored and the flags are off
+# untraced (see THE TRACE); it returns 0.
+__aterm_ps0() {
+    { local __aterm_flags=$-; set +xv; } 2>/dev/null
+    if declare -F __aterm_body_ps0 >/dev/null; then
+        __aterm_body_ps0 || :
+    fi
+    case $__aterm_flags in *v*) set -v ;; esac
+    case $__aterm_flags in *x*) set -x ;; esac
+}
+
 # @@ATERM-INTEGRATION-BODY-BEGIN@@ — everything from here to the END marker is re-sourced live
 
 # Not traced (see THE TRACE): a loader from before it sources this body at a
@@ -378,6 +418,93 @@ __aterm_flags_put() {
     case $1 in *x*) set -x ;; esac
     { return "${2:-0}"; } 2>/dev/null
 }
+
+# ─── AN OLDER SCRIPT'S `~/.aterm/bin`, taken off (2026-10-19) ───
+#
+# Every script before 613305828c (2026-10-16) put `$HOME/.aterm/bin` FIRST on
+# PATH when it loaded a shell fresh and that folder existed; none since does
+# (the loader's package block says why). Such a shell kept the entry through an
+# upgrade in place — this body sourced at a prompt by its older loader, or this
+# loader sourced over it — until it exited. So the body takes it off, once per
+# shell, where the shell PROVES that such a script put it there, and nowhere
+# else: v0.106.0 and every build from 613305828c up to this one put none there
+# and set no mark, so in their shells a `~/.aterm/bin` on PATH is the user's
+# own. The proof has two halves:
+#
+#  1. The script that loaded this shell fresh carried the prepend. That is the
+#     loader in `__aterm_si_dir` when its own load was the fresh one
+#     (`__aterm_fresh_load` 1), or, when this build's loader came in place, the
+#     one it noted there (`__aterm_bin_from`, the loader's block says how; `-`
+#     for a shell from before loaders, whose every script prepended). The
+#     folder is content-addressed, so its loader still holds the bytes that
+#     loaded the shell, and the prepend line is looked for in it, spelled here
+#     so that this file never holds it. A folder already collected, or a loader
+#     an intermediate build sourced in place, leaves nothing to prove it with:
+#     the entry stays.
+#  2. The folder was there at that load: it is older than the shell process —
+#     its positive birth, or its last change only when birth is unavailable,
+#     by more than the whole seconds `stat`, `date` and `ps -o etime=` count in.
+#     A usable birth takes precedence even if mtime was preserved or backdated.
+#     The clock is read before the shell's age; mtime without a usable birth
+#     remains a fallback reading, not an independent creation-time witness.
+#
+# One `sh` asks both (grep, stat, ps and date: once per shell, and only where
+# PATH holds the entry and the folder exists). Then one copy goes — the first
+# equal to `$HOME/.aterm/bin`, where the old script put it — and nothing else
+# moves: an EMPTY entry ("here") keeps its place, and a copy the user's own
+# startup added keeps the folder on PATH. Walked entry by entry and compared
+# with `[ = ]`, never a pattern: a user's `nocasematch` (a `.bashrc` runs before
+# this file) turns a pattern case-insensitive, and an entry spelled in another
+# case is not the one an older script added.
+if [[ -z "${__aterm_old_bin_off-}" ]]; then
+    __aterm_old_bin_off=1
+    __aterm_path_drop_first() {
+        local __aterm_left="" __aterm_right="$PATH" __aterm_entry
+        while :; do
+            __aterm_entry="${__aterm_right%%:*}"
+            if [ "$__aterm_entry" = "$1" ]; then
+                case "$__aterm_right" in
+                    *:*) export PATH="$__aterm_left${__aterm_right#*:}" ;;
+                    *) export PATH="${__aterm_left%:}" ;;
+                esac
+                return 0
+            fi
+            case "$__aterm_right" in *:*) ;; *) return 0 ;; esac
+            __aterm_left="$__aterm_left$__aterm_entry:"
+            __aterm_right="${__aterm_right#*:}"
+        done
+    }
+    __aterm_old_bin_take_off() {
+        local __aterm_from="" __aterm_bin="${HOME-}/.aterm/bin"
+        if [[ -n "${__aterm_bin_from+x}" ]]; then
+            __aterm_from="$__aterm_bin_from"
+        elif [[ "${__aterm_fresh_load-}" == 1 && -n "${__aterm_si_dir-}" ]]; then
+            __aterm_from="$__aterm_si_dir/aterm_shell_integration.bash"
+        fi
+        [[ -n "$__aterm_from" && -d "$__aterm_bin" && ":${PATH-}:" == *":$__aterm_bin:"* ]] &&
+            command sh -c '
+                [ "$1" = - ] || grep -qF -e "$2" -- "$1" || exit 1
+                t=$(stat -f "%B %m" -- "$3") || t=$(stat -c "%W %Y" -- "$3") || exit 1
+                b=${t%% *}; m=${t##* }
+                case $m in ""|*[!0-9]*) exit 1 ;; esac
+                case $b in ""|*[!0-9]*|0) b=$m ;; esac
+                n=$(date +%s) || exit 1
+                e=$(ps -o etime= -p "$4") || exit 1
+                e=${e##* }; d=0
+                case $e in *-*) d=${e%%-*}; d=${d#0}; e=${e#*-} ;; esac
+                case $d$e in ""|*[!0-9:]*) exit 1 ;; esac
+                s=0; IFS=:
+                for x in $e; do x=${x#0}; s=$((s * 60 + ${x:-0})); done
+                [ $((b + ${d:-0} * 86400 + s + 1)) -lt "$n" ]
+            ' sh "$__aterm_from" "export PATH=\"\$HOME/.aterm/bin:\$PATH\"" "$__aterm_bin" "$$" \
+                2>/dev/null &&
+            __aterm_path_drop_first "$__aterm_bin"
+        return 0
+    }
+    __aterm_old_bin_take_off
+    unset -f __aterm_old_bin_take_off __aterm_path_drop_first
+    unset __aterm_bin_from
+fi
 
 # ─── The reroute directory, FIRST — and the agents directory beside it ───
 #
@@ -661,6 +788,8 @@ __aterm_managed_path_live() {
 # below): the body is re-sourced from the PROMPT_COMMAND trampoline, where a
 # command that was running still owes its 133;D and the flag is raised.
 __aterm_last_command="${__aterm_last_command:-}"
+# When that command started (`__aterm_line_ran_a_second`), kept the same way.
+__aterm_line_t0="${__aterm_line_t0:-}"
 # Guard: suppress DEBUG trap capture during PROMPT_COMMAND execution.
 # Without this, commands from the user's original PROMPT_COMMAND (starship,
 # pyenv, nvm, etc.) would be captured as if they were user commands.
@@ -806,13 +935,16 @@ __aterm_win_cwd_to=
 # Reading the entry takes a command substitution: a fork (0.8 ms in a bash tab
 # on Linux) on the way from Enter to the command, except on bash 5.3+, whose
 # `${ ...; }` runs in the shell. Under Git Bash, MSYS2 and Cygwin a fork costs
-# tens of milliseconds, so there it stays `$BASH_COMMAND`.
+# tens of milliseconds (16 ms a `$( )` in Git Bash 5.3.9, where `${ ...; }` takes
+# 0.5 ms; measured 2026-10-17), so there it stays `$BASH_COMMAND` before 5.3.
+# Git for Windows ships 5.3, whose typed `ls /nope` had been recorded as its
+# alias, `ls -F --color=auto --show-control-chars /nope`.
 __aterm_hist_mark="${__aterm_hist_mark:-}"
-if [[ -n "$__aterm_win_posix" ]]; then
-    __aterm_history_line() { return 1; }
-elif (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3) )); then
+if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3) )); then
     # Inside eval: an older bash cannot parse `${ ...; }` at all.
     eval '__aterm_history_line() { REPLY=${ HISTTIMEFORMAT= builtin history 1; }; }'
+elif [[ -n "$__aterm_win_posix" ]]; then
+    __aterm_history_line() { return 1; }
 else
     __aterm_history_line() { REPLY=$(HISTTIMEFORMAT= builtin history 1); }
 fi
@@ -958,7 +1090,12 @@ __aterm_report_cwd() {
     fi
     local REPLY
     __aterm_urlencode "$cwd"
-    __aterm_osc "7;file://${HOSTNAME:-$(hostname)}${REPLY}"
+    # SIGNED first, then plain (see the zsh script's __aterm_report_cwd).
+    local uri="file://${HOSTNAME:-$(hostname)}${REPLY}"
+    if [[ -n "$__aterm_id_suffix_str" ]]; then
+        __aterm_osc "633;P;AtermCwd=${uri}${__aterm_id_suffix_str}"
+    fi
+    __aterm_osc "7;${uri}"
 }
 
 # Mark prompt start (OSC 133;A)
@@ -1104,26 +1241,90 @@ __aterm_preexec_run() {
 
     # Only capture the first command (not subshells)
     if [[ -z "$__aterm_last_command" ]]; then
-        # The managed dirs, live — BEFORE this command resolves: a `claude` typed
-        # at a prompt that was drawn before atpkg laid agents/ must already run
-        # the twin (see "LIVE" above).
-        __aterm_managed_path_live
         # The line as typed (see above), not this one simple command of it.
         local REPLY
         __aterm_typed_line
-        __aterm_last_command="$REPLY"
-        # Report command text for session memory (OSC 633;E)
-        __aterm_encode_cmd "$__aterm_last_command"
-        __aterm_osc "633;E;${REPLY}${__aterm_id_suffix_str}"
-        # Set tab title to running command (OSC 0).
-        # Truncate to first 64 chars and strip control characters.
-        local cmd="${__aterm_last_command:0:64}"
-        cmd="${cmd//[[:cntrl:]]/}"
-        if [[ -z "${ATERM_DISABLE_PROMPT_TITLES:-}" ]]; then
-            __aterm_osc "0;$cmd"
-        fi
-        __aterm_mark_exec_start
+        __aterm_line_start "$REPLY"
     fi
+}
+
+# A line's start, for the line `$1`: the managed dirs, the line's 633;E, its
+# running title and its 133;C. The first trap's work (`__aterm_preexec_run`), or
+# PS0's where bash saved the line (see "PS0" below).
+__aterm_line_start() {
+    # The managed dirs, live — BEFORE this command resolves: a `claude` typed
+    # at a prompt that was drawn before atpkg laid agents/ must already run
+    # the twin (see "LIVE" above).
+    __aterm_managed_path_live
+    __aterm_last_command="$1"
+    local REPLY
+    # Report command text for session memory (OSC 633;E)
+    __aterm_encode_cmd "$__aterm_last_command"
+    __aterm_osc "633;E;${REPLY}${__aterm_id_suffix_str}"
+    # Set tab title to running command (OSC 0): see "The command title" below.
+    if [[ -z "${ATERM_DISABLE_PROMPT_TITLES:-}" ]]; then
+        local cmd="$__aterm_last_command"
+        (( ${#cmd} <= 256 )) || cmd="${cmd:0:255}…"
+        __aterm_osc "0;${cmd//[[:cntrl:]]/}"
+    fi
+    # When the line started, for the tty probe at its end (see "The tty settings
+    # after a failed command"): microseconds where bash keeps a real-time clock
+    # (5.0+), whole seconds before.
+    if [[ -n "${EPOCHREALTIME-}" ]]; then
+        __aterm_line_t0=${EPOCHREALTIME//[!0-9]/}
+    else
+        __aterm_line_t0=s$SECONDS
+    fi
+    __aterm_mark_exec_start
+}
+
+# ─── The command title (2026-10-18) ───
+#
+# The tab's title while a line runs is the line as typed, its control characters
+# stripped, at most 256 characters: a longer line is cut to its first 255 and ends
+# with `…`. The cut used to be a bare 64 characters, and the tab, which keeps a
+# command line's last argument when it middle-cuts one (a file or a path), then
+# showed the cut-off end as if it were the file: `vim … crates/aterm-gui/src/plat`
+# for a 70-character `vim` line (the 2026-10-18 judges' J4F-1). The mark tells
+# the tab the end is gone, and it cuts such a title at its end. 256 characters
+# stay under the terminal's 1024-byte title cap in any script. The pwsh, zsh and
+# fish scripts cut the same way.
+
+# ─── PS0: the line's start where the DEBUG trap never fires (2026-10-17) ───
+#
+# The trap fires before a SIMPLE command at the top level, and a line that opens
+# with a subshell runs none there: `(exit 3)` and `( cd sub && make )` emitted
+# no 633;E and no 133;C, so their block never started and the exit code was
+# lost (`ctl blocks`: `entering exit=-`, measured on Git Bash 5.3.9; the trap
+# rule is bash's, not Windows'). bash 4.4+ expands PS0 once for each line it
+# reads, after reading it and before running it, and never for an empty line or
+# a lone comment; bash 5.3's `${ ...; }` runs that expansion in the shell itself,
+# with no fork (0.5 ms a line in Git Bash), and changes neither `$?` nor `$_`
+# (measured). So on bash 5.3+ PS0 opens with `${ __aterm_ps0; }` (the loader's
+# trampoline, wired once per shell), and this does the first trap's work for a
+# line bash saved in its history, whatever its first command: the line is the
+# history entry at the prompt's mark, as the trap takes it ("The line as
+# typed"), and the trap then finds the work done. A line bash did not save
+# (ignorespace, ignoredups, `set +o history`) is still the trap's: PS0 cannot
+# read it. Before 5.3 PS0 would cost a fork a line, run in a subshell that
+# could keep no state, and is not used. A PS0 the user sets later replaces the
+# hook; the trap then covers what it did before.
+__aterm_body_ps0() {
+    (( __aterm_in_prompt_cmd )) && return 0
+    # Before the line runs, `$HISTCMD` is the number the NEXT line would take:
+    # one past the mark for a line bash saved, the mark itself for one it did
+    # not (the trap, while the line runs, reads the mark; measured on 5.3.9).
+    [[ -z "$__aterm_last_command" && "$__aterm_hist_mark" == [1-9]* &&
+        "$__aterm_hist_mark" != *[!0-9]* &&
+        "${HISTCMD-}" == "$((__aterm_hist_mark + 1))" ]] || return 0
+    local REPLY
+    __aterm_history_line || return 0
+    REPLY="${REPLY#*[0-9][* ] }"
+    [[ -n "$REPLY" ]] || return 0
+    __aterm_hist_mark=
+    __aterm_hist_seen=
+    __aterm_line_start "$REPLY"
+    return 0
 }
 
 # ─── The tty settings after a failed command (2026-09-26) ───
@@ -1147,9 +1348,31 @@ __aterm_preexec_run() {
 # on purpose, since it disables Ctrl-C and Ctrl-Z) — a second one turning back on
 # what raw modes turn off: `isig icanon iexten echo icrnl opost`. IXON is
 # deliberately NOT touched: a user's own `stty -ixon` clears it too and cannot be
-# told apart, so it survives. A successful command costs nothing — which is the
-# residual: a raw program that exits 0 without restoring is not caught here
-# (measured with this code: exit 1 repaired, Ctrl-C at 0.48 s; exit 0 not).
+# told apart, so it survives. A successful command costs nothing when it ended
+# within a second (measured with this code: exit 1 repaired, Ctrl-C at 0.48 s).
+#
+# A command that ran a second or more is probed whatever its status (2026-10-18):
+# a full-screen program killed from outside — vim ended by Task Manager or
+# `taskkill /F` in Git Bash — reports 0 under MSYS2, and the tty it left raw
+# echoed nothing typed until `stty sane` (the 2026-10-18 verifier's
+# v4-gitbash-killed-app-echo-repair-gated-on-status: only a failing command
+# after it happened to repair it). A program the user ran that long can afford
+# the probe, one fork: about 50 ms on MSYS2, a few on Linux and macOS. A quick
+# command still takes no fork, so a raw program that exits 0 within a second of
+# its start is the residual.
+__aterm_line_ran_a_second() {
+    local __aterm_t0=${__aterm_line_t0-} __aterm_now
+    case $__aterm_t0 in
+        s[0-9]*) (( SECONDS - ${__aterm_t0#s} >= 1 )) ;;
+        [0-9]*)
+            __aterm_now=${EPOCHREALTIME-}
+            __aterm_now=${__aterm_now//[!0-9]/}
+            [[ -n "$__aterm_now" ]] && (( __aterm_now - __aterm_t0 >= 1000000 ))
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 __aterm_tty_repair() {
     local __aterm_tty_state=""
     __aterm_tty_state="$(command stty -a 2>/dev/null)" || return 0
@@ -1193,13 +1416,17 @@ __aterm_start_mark() {
 # the list read again as a cold start reads it (the sizes applied, then
 # `history -c; history -r`: bash 3.2 has no fork-free stat to tell whether the
 # file moved, and a reload of an unmoved file reads the same list), and
-# `$SECONDS` carries on from the rc's run.
+# `$SECONDS` carries on from the rc's run. Not read again where the startup
+# files left a list of their own (`history -s`, noted at the fresh load below):
+# bash then read no file at its start. A readonly history variable (a
+# hardened /etc/profile) stays as it is: its unset fails quietly, and its
+# assignment fails alone in an `eval` instead of ending the prompt.
 # Nothing here touches the tty, so what is typed before the release waits there
 # for readline.
 __aterm_spare_hold() {
-    local __aterm_rc=$SECONDS __aterm_go="" __aterm_n=0
+    local __aterm_rc=$SECONDS __aterm_go="" __aterm_n=0 __aterm_own=${__aterm_spare_rc_list-}
     local __aterm_hf_set=${HISTFILE+x} __aterm_hf=${HISTFILE-}
-    unset HISTFILE
+    unset HISTFILE 2>/dev/null || :
     __aterm_start_mark spare
     while :; do
         if IFS= read -r __aterm_go < "$__aterm_spare_fifo"; then
@@ -1209,14 +1436,14 @@ __aterm_spare_hold() {
             { [[ $__aterm_n -lt 50 ]] && [[ -p $__aterm_spare_fifo ]]; } || exit 0
         fi
     done 2>/dev/null
-    unset __aterm_spare_mode __aterm_spare_fifo
+    unset __aterm_spare_mode __aterm_spare_fifo __aterm_spare_rc_list
     if [[ -n $__aterm_hf_set ]]; then
-        HISTFILE=$__aterm_hf
-        if [[ -f $HISTFILE ]]; then
+        [[ -n ${HISTFILE+x} ]] || HISTFILE=$__aterm_hf
+        if [[ -z $__aterm_own && -f $HISTFILE ]]; then
             # As bash's own load: the list's size, then the file cut to
             # HISTFILESIZE (each assignment applies it), then the read.
-            [[ -z ${HISTSIZE+x} ]] || HISTSIZE=$HISTSIZE
-            [[ -z ${HISTFILESIZE+x} ]] || HISTFILESIZE=$HISTFILESIZE
+            [[ -z ${HISTSIZE+x} ]] || eval 'HISTSIZE=$HISTSIZE' 2>/dev/null || :
+            [[ -z ${HISTFILESIZE+x} ]] || eval 'HISTFILESIZE=$HISTFILESIZE' 2>/dev/null || :
             history -c
             history -r
         fi
@@ -1257,8 +1484,10 @@ __aterm_body_prompt_command() {
     __aterm_rekey_check
 
     # The tty settings (see "The tty settings after a failed command" above): one
-    # probe after a failed command, nothing after a successful one.
-    [[ "$last_status" == 0 ]] || __aterm_tty_repair
+    # probe after a failed command or one that ran a second, nothing after a
+    # quick success.
+    [[ "$last_status" == 0 ]] && ! __aterm_line_ran_a_second || __aterm_tty_repair
+    __aterm_line_t0=
 
     # The managed dirs, live (see "LIVE" above): one probe, an assign only on change.
     __aterm_managed_path_live
@@ -1523,24 +1752,51 @@ if (( __aterm_fresh_load )); then
     __aterm_setup_keybindings 2>/dev/null
 fi
 
-# Save any existing DEBUG trap handler for chaining.
-# trap -p DEBUG outputs: trap -- 'handler' DEBUG
-# Once per shell: in an upgrade in place the trap is already ours, and the
-# handler it chains was saved at the first load.
+# Save the DEBUG trap the startup files set, for chaining. Once per shell: in
+# an upgrade in place the trap is already ours, and the handler it chains was
+# saved at the first load.
+#
+# THE RC'S DEBUG TRAP (2026-10-17). This file is sourced, and bash hides the
+# DEBUG trap from a sourced file, so the `$(trap -p DEBUG)` that stood here saw
+# no trap the user's rc set (bash-preexec, atuin) — and forked for nothing on
+# the path of every new tab (0.7-1.4 ms). Both wrappers now hand it over
+# (`bash_debug_trap_handover!`): in `<re-key path>.trap` (DEBUG_TRAP_SUFFIX),
+# read here without a fork — `read -d ''` takes every line of a multi-line
+# handler — or, for a shell with no re-key path, in `__aterm_rc_debug_trap`.
+# A copy sourced by hand gets what the `.` shows it (a trap set under
+# functrace), through the fork as before. `trap -p` quotes for re-input, so
+# its line is read back as words, and the handler is the third, exactly as
+# set (stripping the outer quotes left `'\''` escapes in it). The read answers
+# 1 at the file's end, so it is the first command of an `||` list: no user's
+# ERR trap hears it, and a `.bashrc`'s `set -e` closed the shell on it (review,
+# 2026-10-17).
 if (( __aterm_fresh_load )); then
     __aterm_prev_debug_handler=""
-    __aterm_tmp=$(trap -p DEBUG 2>/dev/null)
-    if [[ "$__aterm_tmp" == trap\ --\ * ]]; then
-        __aterm_prev_debug_handler="${__aterm_tmp#trap -- \'}"
-        __aterm_prev_debug_handler="${__aterm_prev_debug_handler%\' DEBUG}"
+    __aterm_tmp=""
+    if [[ -z "${__aterm_rc_debug_handed-}" ]]; then
+        __aterm_tmp=$(trap -p DEBUG 2>/dev/null)
+    elif [[ -n "${__aterm_rc_debug_trap+x}" ]]; then
+        __aterm_tmp=$__aterm_rc_debug_trap
+    elif [[ -n "$__aterm_rekey_path" ]]; then
+        { IFS= read -r -d '' __aterm_tmp <"$__aterm_rekey_path.trap"; } 2>/dev/null || :
     fi
-    unset __aterm_tmp
+    if [[ "$__aterm_tmp" == trap\ --\ * ]] && eval "__aterm_tmp=($__aterm_tmp)" 2>/dev/null; then
+        __aterm_prev_debug_handler=${__aterm_tmp[2]-}
+    fi
+    unset __aterm_tmp __aterm_rc_debug_handed __aterm_rc_debug_trap
 fi
 
 # The start record is owed once per shell, at its first prompt (see THE START
 # MARK): a fresh load only. A body re-sourced live, or a typed upgrade, owes none.
 if (( __aterm_fresh_load )); then
     __aterm_start_pending=1
+    # bash reads its history file after the startup files only when they saved
+    # no line of their own (`history -s`): a warm spare whose list is not empty
+    # here keeps it at its release (THE WARM HOLD). A fork, in a spare only,
+    # before anyone asked for it.
+    if [[ ${__aterm_spare_mode-} == warm && -n $(builtin history 1 2>/dev/null) ]]; then
+        __aterm_spare_rc_list=1
+    fi
 fi
 
 # Install the integration. The trap goes LAST: the DEBUG trap is live from the
@@ -1558,6 +1814,15 @@ if (( __aterm_fresh_load )); then
         fi
     else
         PROMPT_COMMAND="__aterm_prompt_command"
+    fi
+    # The line's start from PS0 on bash 5.3+ (the body's "PS0"), ahead of the
+    # user's own PS0, which is kept whole after it. Never exported: a bash
+    # started from this one has no `__aterm_ps0` to call, and one before 5.3
+    # cannot expand `${ ...; }`.
+    if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3) )) &&
+        [[ "${PS0-}" != *'__aterm_ps0'* ]]; then
+        PS0='${ __aterm_ps0; }'"${PS0-}"
+        export -n PS0
     fi
     # The user's `$_` handed through (see `__aterm_preexec`).
     trap '__aterm_preexec "$_"' DEBUG

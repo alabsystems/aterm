@@ -413,29 +413,44 @@ fn live_image_bytes(term: &Terminal) -> usize {
     bytes
 }
 
-/// A screen's images are bounded as a whole: each sixel declaring a 4096x20
-/// raster (no pixel data) takes the rest of its row, so placing one a column
-/// further right each time leaves every one a cell, and its 320 KiB raster, on
-/// screen.
+/// The sixel the live-budget tests place, and its raster's bytes: a declared
+/// 4096x100 raster (no pixel data) one 100 px cell tall, which takes the rest
+/// of its row. [`SIXEL_CELLS`] of them, twenty a row on eight rows, one a
+/// column further right each time, leave every one a cell, and its 1.6 MiB
+/// raster, on screen: nearly twice what the budget holds.
+const ROW_SIXEL: &[u8] = b"\x1bPq\"1;1;4096;100\x1b\\";
+const ROW_SIXEL_BYTES: usize = 4096 * 100 * 4;
+const SIXEL_CELL_PX: u16 = 100;
+/// Where the live-budget tests place [`ROW_SIXEL`]s, in order (1-based).
+const SIXEL_CELLS: [(u16, u16); 160] = {
+    let mut cells = [(0, 0); 160];
+    let mut i = 0;
+    while i < cells.len() {
+        cells[i] = (1 + i as u16 / 20, 1 + i as u16 % 20);
+        i += 1;
+    }
+    cells
+};
+const _: () = assert!(SIXEL_CELLS.len() * ROW_SIXEL_BYTES > super::MAX_LIVE_IMAGE_BYTES * 3 / 2);
+
+/// A screen's images are bounded as a whole ([`ROW_SIXEL`]).
 #[test]
 fn a_screen_of_sixels_keeps_its_images_within_the_live_budget() {
     let mut term = Terminal::new(24, 80);
-    term.set_cell_pixel_size(10, 20);
-    let raster = 4096 * 20 * 4;
-    // DECSDM: each sixel is drawn at the cursor, which stays put. The last row
-    // is left alone: a placement there scrolls the screen.
+    term.set_cell_pixel_size(10, SIXEL_CELL_PX);
+    let raster = ROW_SIXEL_BYTES;
+    // DECSDM: each sixel is drawn at the cursor, which stays put.
     term.process(b"\x1b[?80h");
-    for row in 1..=23u16 {
-        for col in 1..=80u16 {
-            term.process(format!("\x1b[{row};{col}H\x1bPq\"1;1;4096;20\x1b\\").as_bytes());
-            let live = live_image_bytes(&term);
-            assert!(
-                live <= super::MAX_LIVE_IMAGE_BYTES + raster,
-                "at row {row}, column {col} the screen holds {live} bytes of images"
-            );
-        }
+    for (row, col) in SIXEL_CELLS {
+        term.process(format!("\x1b[{row};{col}H").as_bytes());
+        term.process(ROW_SIXEL);
+        let live = live_image_bytes(&term);
+        assert!(
+            live <= super::MAX_LIVE_IMAGE_BYTES + raster,
+            "at row {row}, column {col} the screen holds {live} bytes of images"
+        );
     }
-    let newest = term.grid().cell_extra(22, 79).and_then(|e| e.image());
+    let newest = term.grid().cell_extra(7, 19).and_then(|e| e.image());
     assert!(
         newest.is_some_and(|image| image.image.bytes.len() == raster),
         "the image just placed is never the one taken off"
@@ -445,31 +460,34 @@ fn a_screen_of_sixels_keeps_its_images_within_the_live_budget() {
 /// Each screen's images are bounded however a program moves between them: a
 /// count sees only the active grid, so a charge shared by both screens would be
 /// reset by a sixel on the near-empty alternate screen (mode 47 keeps both
-/// buffers) and the parked main screen never counted again.
+/// buffers) and the parked main screen never counted again. One sixel on each
+/// screen in turn: a shared charge, reset to two sixels by each count, would
+/// cross the budget on an alternate-screen placement every time (an odd number
+/// of sixels fits the budget), so the main screen would grow past it.
 #[test]
 fn each_screen_keeps_its_images_within_the_live_budget() {
+    const _: () = assert!((super::MAX_LIVE_IMAGE_BYTES / ROW_SIXEL_BYTES) % 2 == 1);
     let mut term = Terminal::new(24, 80);
-    term.set_cell_pixel_size(10, 20);
-    let raster = 4096 * 20 * 4;
-    let bound = super::MAX_LIVE_IMAGE_BYTES + raster;
+    term.set_cell_pixel_size(10, SIXEL_CELL_PX);
+    let bound = super::MAX_LIVE_IMAGE_BYTES + ROW_SIXEL_BYTES;
     term.process(b"\x1b[?80h");
-    for row in 1..=23u16 {
-        for col in 1..=80u16 {
-            term.process(format!("\x1b[{row};{col}H\x1bPq\"1;1;4096;20\x1b\\").as_bytes());
-            let main = live_image_bytes(&term);
-            assert!(
-                main <= bound,
-                "at row {row}, column {col} the main screen holds {main} bytes of images"
-            );
-            // Over to the alternate screen for one sixel, always on its first
-            // row, and back.
-            term.process(b"\x1b[?47h\x1b[1;1H\x1bPq\"1;1;4096;20\x1b\\");
-            let alternate = live_image_bytes(&term);
-            assert!(
-                alternate <= bound,
-                "the alternate screen holds {alternate} bytes of images"
-            );
-            term.process(b"\x1b[?47l");
-        }
+    for (row, col) in SIXEL_CELLS {
+        term.process(format!("\x1b[{row};{col}H").as_bytes());
+        term.process(ROW_SIXEL);
+        let main = live_image_bytes(&term);
+        assert!(
+            main <= bound,
+            "at row {row}, column {col} the main screen holds {main} bytes of images"
+        );
+        // Over to the alternate screen for one sixel, always at its home, and
+        // back.
+        term.process(b"\x1b[?47h\x1b[1;1H");
+        term.process(ROW_SIXEL);
+        let alternate = live_image_bytes(&term);
+        assert!(
+            alternate <= bound,
+            "the alternate screen holds {alternate} bytes of images"
+        );
+        term.process(b"\x1b[?47l");
     }
 }

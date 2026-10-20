@@ -46,7 +46,7 @@ use aterm_uds::process::BootClock;
 /// answering (a failed update, a crash, a quit), or that is not asked again:
 /// EX_TEMPFAIL's number, distinct from 0 ("session over") and from 1/124 (a
 /// refusal, a timeout). Every client in this binary ends such an exchange with
-/// it, `aterm drive`'s persistent prompt included.
+/// it.
 pub const EXIT_REPLACED: u8 = 75;
 
 /// How long a successor may take to answer.
@@ -196,7 +196,7 @@ impl Redial {
     }
 
     /// The same policy with a different successor bound (tests).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_bound(mut self, bound: Duration) -> Self {
         self.bound = bound;
         self
@@ -204,7 +204,7 @@ impl Redial {
 
     /// The same policy reading a successor's start from `started` (tests: an
     /// in-process fake successor started long before any hang-up it serves).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_started(mut self, started: fn(u32) -> Option<Stamp>) -> Self {
         self.started = started;
         self
@@ -212,7 +212,7 @@ impl Redial {
 
     /// The same policy reading every moment it stamps from `clock` (tests: a
     /// stepped or foreign clock, or one that records its readers).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_clock(mut self, clock: fn() -> Stamp) -> Self {
         self.clock = clock;
         self
@@ -220,7 +220,7 @@ impl Redial {
 
     /// The same policy telling `note` the pid of each server whose exit it
     /// watches, once the watch is registered.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_watch_note(mut self, note: fn(u32)) -> Self {
         self.on_watch = Some(note);
         self
@@ -417,7 +417,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const PROBE_FLOOR: Duration = Duration::from_millis(100);
 
 /// [`serving_pid_within`] with the full probe wait (tests).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn serving_pid(path: &str) -> Option<u32> {
     serving_pid_within(path, PROBE_TIMEOUT)
 }
@@ -601,9 +601,10 @@ pub(crate) fn is_hangup(e: &io::Error) -> bool {
 /// Whether a request is retried once on a successor after a hang-up before its
 /// reply: a blocking read with no instance-local anchor. Not retried (they end
 /// with [`EXIT_REPLACED`] and a [`not_asked_again_note`]):
-/// * `await seq <n>`, `await inbox since=<id>`, `inbox get <id>` and `inbox
-///   since=<id>`: a successor restarts grid counters and numbers the rows it
-///   re-delivers afresh;
+/// * `await seq <n>`, `await inbox since=<id>`, `await agent … since=<rev>`,
+///   `inbox get <id>` and `inbox since=<id>`: a successor restarts grid
+///   counters and agent verdict revs, and numbers the rows it re-delivers
+///   afresh;
 /// * waits anchored at the moment they were armed (`await block`, a bare
 ///   `await seq`, `await consent`, an `await log` with no `since=` other than
 ///   the latching `need`): what they wait for may be what a parked producer
@@ -613,7 +614,9 @@ pub(crate) fn is_hangup(e: &io::Error) -> bool {
 ///   retried: the session log's seq space continues across an update, and
 ///   the successor's read says the handoff's hole as `OK gap why=handoff`;
 ///   so is a since-less `await log need`, which latches on the needs the
-///   carried fold holds open;
+///   carried fold holds open. A since-less predicate list is retried only
+///   when every member is `need`: any other member (`need,close=turn`)
+///   arms at the successor's head as it would alone;
 /// * a request naming its session by local number (`@<n>`,
 ///   [`is_local_selector`]), which a successor assigns afresh.
 pub(crate) fn retries_across_replacement(request_parts: &[String]) -> bool {
@@ -628,7 +631,7 @@ pub(crate) fn retries_across_replacement(request_parts: &[String]) -> bool {
         Some("inbox") => inbox_plain_read(&args),
         Some("await") => match args.first() {
             Some(&("seq" | "block" | "consent")) => false,
-            Some(&"inbox") => !args.iter().any(|a| a.starts_with("since=")),
+            Some(&("inbox" | "agent")) => !args.iter().any(|a| a.starts_with("since=")),
             Some(&"log") => log_wait_resumes(&args),
             Some(_) => true,
             None => false,
@@ -640,12 +643,18 @@ pub(crate) fn retries_across_replacement(request_parts: &[String]) -> bool {
 /// Whether an `await log` (its arguments, `log` first) names where it reads
 /// from on its own: a `since=` cursor, which means the same on a successor
 /// (the log's seq space continues across an update), or the `need` form,
-/// which latches on the needs the carried fold holds open. Every other
-/// since-less `await log` is anchored at the moment it was armed.
+/// which latches on the needs the carried fold holds open. A predicate list
+/// (session log 5F-1) latches only as far as its members do: every member
+/// `need` (`need,need`) resumes as `need` does, but one other member
+/// (`need,close=turn`) is anchored at the moment it was armed — a resting
+/// turn's settle close the successor wrote before a retry armed at its head
+/// would never answer it — so the list is not asked again, as that member
+/// alone is not. Every other since-less `await log` is anchored at the
+/// moment it was armed.
 fn log_wait_resumes(args: &[&str]) -> bool {
     args.iter()
         .skip(1)
-        .any(|a| a.starts_with("since=") || *a == "need")
+        .any(|a| a.starts_with("since=") || a.split(',').all(|w| w == "need"))
 }
 
 /// Whether an `inbox` request is a plain read of what is queued now: a
@@ -658,7 +667,8 @@ fn inbox_plain_read(args: &[&str]) -> bool {
 
 /// The part of a blocking read that names something in the old process (a
 /// local session number `@3`, a grid counter `seq 40`, an inbox anchor
-/// `since=12` / `inbox get 4`); `None` when the request carries none.
+/// `since=12` / `inbox get 4`, an agent verdict rev `since=7`); `None` when
+/// the request carries none.
 pub(crate) fn old_process_anchor(request_parts: &[String]) -> Option<String> {
     let rest = match request_parts.first() {
         Some(sel) if is_local_selector(sel) => return Some(sel.clone()),
@@ -672,7 +682,7 @@ pub(crate) fn old_process_anchor(request_parts: &[String]) -> Option<String> {
             Some(&"seq") if args.len() >= 2 && !args[1].contains('=') => {
                 Some(format!("seq {}", args[1]))
             }
-            Some(&"inbox") => args
+            Some(&("inbox" | "agent")) => args
                 .iter()
                 .find(|a| a.starts_with("since="))
                 .map(|a| (*a).to_string()),
@@ -979,10 +989,11 @@ fn pin_self(out: &mut Vec<String>, sids: &[(String, String)]) -> bool {
     }
 }
 
-/// Whether a selector token names the connection's own session (`@.`, or a
-/// bare `@`), which the server resolves afresh on every request.
+/// Whether a selector token names the connection's own session (`@.`), which
+/// the server resolves afresh on every request. A bare `@` names nothing and
+/// never leaves the client (`refuse_empty_selectors`).
 fn is_self_selector(token: &str) -> bool {
-    token == "@." || token == "@"
+    token == "@."
 }
 
 /// The one session a single-target stream's `sub` lines tied it to, or `None`
@@ -1051,6 +1062,9 @@ pub(crate) struct FrameTracker {
     /// The host a forward said went away under this leg: its pid and the
     /// socket it was reached at.
     gone: Option<(u32, String)>,
+    /// The instance said `EVENT * bye quit` on this leg: it is quitting, and
+    /// nothing replaces a quit.
+    quit: bool,
 }
 
 /// The longest header line the tracker keeps; a longer one is not a frame
@@ -1086,6 +1100,13 @@ impl FrameTracker {
     /// The newest `block-complete` and `turn` ids relayed so far, every leg.
     pub(crate) fn anchors(&self) -> EventAnchors {
         self.anchors
+    }
+
+    /// Whether the instance said on this leg that it is quitting (`EVENT * bye
+    /// quit`, the `sessions` stream's last word): a hang-up after it has no
+    /// successor to wait for.
+    pub(crate) fn said_quit(&self) -> bool {
+        self.quit && !self.lost
     }
 
     /// Whether the stream said every one of its sessions exited.
@@ -1207,6 +1228,7 @@ impl FrameTracker {
                     self.anchors.log_ep = Some(ep);
                 }
             }
+            ["EVENT", "*", "bye", "quit"] => self.quit = true,
             ["EVENT", local, "exited", ..] => {
                 for (known, _, exited) in &mut self.targets {
                     if known == local {
@@ -1399,11 +1421,10 @@ pub(crate) fn after_refusal(
 }
 
 /// The self target of `request` as the caller wrote it, resolved on a fresh
-/// successor — never `@.` for a bare `@` or a request that named none.
+/// successor — never `@.` for a request that named none.
 fn self_resolved(request: &str) -> &'static str {
     match request.split_whitespace().find(|t| t.starts_with('@')) {
         Some("@.") => "`@.` resolved there",
-        Some("@") => "`@` resolved there",
         _ => "the request names no session, and it resolved there",
     }
 }
@@ -1562,10 +1583,16 @@ fn pump(
     clock: fn() -> Stamp,
 ) -> io::Result<Leg> {
     let poll = Duration::from_millis(250);
+    // A read is never parked without a bound, watch or no watch: Darwin can lose
+    // the wakeup of a thread parked in a blocking `recv` for its peer's
+    // end-of-file when the peer writes and half-closes while another thread polls
+    // the peer's end — what a forward's relay does on every stream it ends. The
+    // end-of-file is there, but an unbounded read would park `aterm ctl subscribe`
+    // for good; on the tick the next read returns it.
     // Ignored on failure: macOS answers `setsockopt` on a socket whose peer is
     // gone with EINVAL, and such a socket's next read returns the buffered
     // frames and then EOF without waiting.
-    let _ = stream.set_read_timeout(watch.map(|_| poll));
+    let _ = stream.set_read_timeout(Some(poll));
     let mut buf = [0u8; 8192];
     loop {
         if let Some((start, limit)) = watch
@@ -1587,7 +1614,7 @@ fn pump(
                 tracker.relay(&buf[..n], out)?;
                 out.flush()?;
             }
-            Err(ref e) if super::is_timeout_error(e) && watch.is_some() => {}
+            Err(ref e) if super::is_timeout_error(e) => {}
             Err(ref e) if is_hangup(e) => {
                 let at = clock();
                 tracker.finish(out)?;
@@ -1665,6 +1692,12 @@ pub(crate) fn relay_subscription(
     'leg: loop {
         if tracker.session_over() {
             return Ok(ExitCode::SUCCESS);
+        }
+        // The instance said it was quitting before the hang-up: no successor
+        // comes, so the stream ends now instead of waiting one out.
+        if tracker.said_quit() {
+            super::stderr_line(&quit_note(server))?;
+            return Ok(ExitCode::from(EXIT_REPLACED));
         }
         // A forward's host that went away said so as the leg's last line: its
         // relay still answering is no end on purpose, and from here the stream
@@ -1868,6 +1901,16 @@ pub(crate) fn gone_note(
     };
     format!(
         "aterm (pid {pid}) went away{why}; the exchange cannot be resumed (exit {EXIT_REPLACED})"
+    )
+}
+
+/// The note for a stream whose instance said `bye quit` and hung up
+/// ([`FrameTracker::said_quit`]).
+fn quit_note(server: Option<u32>) -> String {
+    let pid = server.map_or_else(|| "?".to_owned(), |pid| pid.to_string());
+    format!(
+        "aterm (pid {pid}) quit (`EVENT * bye quit`); nothing replaces a quit, so the stream \
+         ends (exit {EXIT_REPLACED})"
     )
 }
 

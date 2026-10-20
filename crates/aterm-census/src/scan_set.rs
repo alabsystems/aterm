@@ -41,6 +41,8 @@
 //!     row either, but until they are carved under first-party lock discipline
 //!     they are scanned exactly as while vendored: [`ABSORBED_CRATES`] gives
 //!     each its identity namespace and platform slices, fail-closed both ways.
+//!     An absorbed crate renamed off its upstream name (`crates/aterm-window`,
+//!     once `winit`) leaves the patch table and is found by its row's path.
 //!     See [`classify_patch_target`]: a patch path under neither `vendor/` nor
 //!     `crates/`, a `crates/` path with only one of the two absorption records,
 //!     or a first-party or absorbed path carrying a review row, is a hard error.
@@ -195,8 +197,11 @@ fn intern(s: &str) -> &'static str {
     leaked
 }
 
-/// An ABSORBED `[patch.*]` crate ([`PatchTargetKind::Absorbed`]) as the
-/// lock-order census scans it. It is a workspace member, so the path-dependency
+/// An ABSORBED crate as the lock-order census scans it: upstream source aterm
+/// owns as a workspace member, either still patched in under its upstream name
+/// ([`PatchTargetKind::Absorbed`]) or renamed and reached by path alone. Both
+/// keep the absorption records (a retained upstream license in the crate root
+/// and a NOTICE line naming it). It is a workspace member, so the path-dependency
 /// closure reaches it, but its code was written to upstream's lock discipline,
 /// not aterm's: its receiver names would merge with aterm's identities, and its
 /// per-OS backends (which no single binary links together) would meet each
@@ -207,9 +212,11 @@ fn intern(s: &str) -> &'static str {
 /// slices counted and labeled, never graphed. A row leaves when the carve
 /// brings the crate under the first-party discipline.
 pub struct AbsorbedCrate {
-    /// The patch table key (the crates-io package being replaced).
-    pub package: &'static str,
-    /// The replacement path, repo-relative, under `crates/`.
+    /// The upstream package it was absorbed from, as NOTICE names it. While the
+    /// member still answers to that name it is also the patch table key; a
+    /// renamed member is in no patch row.
+    pub upstream: &'static str,
+    /// The member's path, repo-relative, under `crates/`.
     pub path: &'static str,
     /// The identity namespace prefix (unique across every namespaced crate).
     pub namespace: &'static str,
@@ -220,12 +227,13 @@ pub struct AbsorbedCrate {
 }
 
 /// The absorbed crates the census scans namespaced (see [`AbsorbedCrate`]).
-/// An absorbed `[patch]` target without a row, or a row whose target is not an
-/// absorbed `[patch]` entry at that path, is a hard error.
+/// An absorbed `[patch]` target without a row, or a row that is neither an
+/// absorbed `[patch]` entry at that path nor an absorbed member there, is a hard
+/// error.
 pub const ABSORBED_CRATES: &[AbsorbedCrate] = &[AbsorbedCrate {
-    package: "winit",
+    upstream: "winit",
     path: "crates/aterm-window",
-    namespace: "winit",
+    namespace: "aterm_window",
     // The macOS GUI process compiles only the shared code, platform_impl/macos
     // and the macOS-gated platform/ extension modules (2 blocking `.lock()`
     // sites: event.rs InnerSizeWriter, macos/window_delegate.rs
@@ -247,10 +255,10 @@ pub const ABSORBED_CRATES: &[AbsorbedCrate] = &[AbsorbedCrate {
         },
     ],
     audit: "winit 0.30.13, absorbed as crates/aterm-window (2026-10-15; vendored as \
-            vendor/winit before): runs ON the main thread of the GUI process; the \
-            macOS-compiled surface is graphed under the `winit::` namespace, the \
-            non-macOS backends are labeled platform slices until the carve; the wasm \
-            cells do not compile it",
+            vendor/winit before; the package renamed aterm-window 2026-10-19): runs ON \
+            the main thread of the GUI process; the macOS-compiled surface is graphed \
+            under the `aterm_window::` namespace, the non-macOS backends are labeled \
+            platform slices until the carve; the wasm cells do not compile it",
 }];
 
 /// What a `[patch.crates-io]` replacement is, which decides whether it owes a
@@ -370,9 +378,11 @@ pub fn classify_patch_target(
 /// walker's vendored-identity-mode input.
 #[derive(Debug)]
 pub struct ScannedVendored {
-    /// The package name (== the patch table key).
+    /// The package name (the patch table key, or a renamed absorbed member's
+    /// own name).
     pub package: String,
-    /// The identity namespace prefix (`winit` ⇒ identities `winit::…`).
+    /// The identity namespace prefix (`aterm_window` ⇒ identities
+    /// `aterm_window::…`).
     pub namespace: &'static str,
     /// Repo-relative crate dir (`vendor/indexmap`, `crates/aterm-window`).
     pub crate_dir: String,
@@ -396,11 +406,13 @@ pub struct ScanSet {
     /// (package, path). Printed, never review-registered; a member that links
     /// into the GUI process is already in `scan_dirs`, unnamespaced.
     pub first_party_patches: Vec<(String, String)>,
-    /// `[patch.*]` entries pointing at an ABSORBED workspace member
-    /// ([`PatchTargetKind::Absorbed`]), sorted: (package, path). Scanned like
-    /// [`Self::first_party_patches`]; listed apart because they still
-    /// redistribute upstream source.
-    pub absorbed_patches: Vec<(String, String)>,
+    /// The ABSORBED crates ([`ABSORBED_CRATES`]), sorted: (package, path), the
+    /// package being the patch table key of one still patched in under its
+    /// upstream name ([`PatchTargetKind::Absorbed`]) or a renamed member's own
+    /// name. Listed apart from [`Self::first_party_patches`] because they still
+    /// redistribute upstream source; scanned namespaced, in
+    /// [`Self::vendored_scanned`].
+    pub absorbed: Vec<(String, String)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1454,7 +1466,7 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
     // ways.
     let mut vendored_scanned: Vec<ScannedVendored> = Vec::new();
     let mut first_party_patches: Vec<(String, String)> = Vec::new();
-    let mut absorbed_patches: Vec<(String, String)> = Vec::new();
+    let mut absorbed: Vec<(String, String)> = Vec::new();
     for (pkg, path) in tables.patches.values() {
         // Only vendored source owes a review row; a patch pointing at a
         // workspace member, first-party or absorbed, is covered by the closure
@@ -1483,7 +1495,7 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
                 ));
             }
             if kind == PatchTargetKind::Absorbed {
-                let Some(absorbed) = ABSORBED_CRATES.iter().find(|a| a.package == pkg) else {
+                let Some(row) = ABSORBED_CRATES.iter().find(|a| a.upstream == pkg) else {
                     return Err(format!(
                         "[patch] entry `{pkg}` points at absorbed `{path}`, which has no \
                          ABSORBED_CRATES row — the census must be told how to scan upstream \
@@ -1492,37 +1504,15 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
                          crates/aterm-census/src/scan_set.rs (fail-closed, never silent)"
                     ));
                 };
-                if absorbed.path != path {
+                if row.path != path {
                     return Err(format!(
                         "ABSORBED_CRATES entry `{pkg}` is registered at `{}` but the [patch] \
                          table says `{path}` — the row is STALE; update it",
-                        absorbed.path
+                        row.path
                     ));
                 }
-                for slice in absorbed.platform_slices {
-                    for p in slice.paths {
-                        if !root.join(path).join(p).exists() {
-                            return Err(format!(
-                                "ABSORBED_CRATES entry `{pkg}` registers platform slice `{}` \
-                                 path `{p}`, which no longer exists under `{path}` — the row \
-                                 is STALE (fail-closed)",
-                                slice.label
-                            ));
-                        }
-                    }
-                }
-                // A member, so the closure walk may have reached it; scanned
-                // namespaced instead, never twice.
-                let scan_dir = format!("{path}/src");
-                scan_dirs.retain(|d| *d != scan_dir);
-                vendored_scanned.push(ScannedVendored {
-                    package: pkg.clone(),
-                    namespace: absorbed.namespace,
-                    crate_dir: path.clone(),
-                    scan_dir,
-                    platform_slices: absorbed.platform_slices,
-                });
-                absorbed_patches.push((pkg.clone(), path.clone()));
+                vendored_scanned.push(scan_absorbed(root, row, pkg, &mut scan_dirs)?);
+                absorbed.push((pkg.clone(), path.clone()));
             } else {
                 first_party_patches.push((pkg.clone(), path.clone()));
             }
@@ -1559,20 +1549,6 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
             platform_slices: &[],
         });
     }
-    // Namespace uniqueness: two crates sharing a namespace would merge their
-    // identities.
-    {
-        let mut seen: BTreeSet<&str> = BTreeSet::new();
-        for v in &vendored_scanned {
-            if !seen.insert(v.namespace) {
-                return Err(format!(
-                    "two scanned vendored crates share the identity namespace \
-                     `{}` — namespaces must be unique (fail-closed)",
-                    v.namespace
-                ));
-            }
-        }
-    }
     for r in &reviewed {
         if !tables.patches.values().any(|(pkg, _)| *pkg == r.package) {
             return Err(format!(
@@ -1591,26 +1567,86 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
         }
     }
 
-    for a in ABSORBED_CRATES {
-        if !absorbed_patches.iter().any(|(p, _)| p == a.package) {
+    // ---- Absorbed crates renamed off their upstream name: no [patch] row
+    // serves them and cargo reaches them by path, so each is found by its
+    // row's path, and must still carry both absorption records there.
+    for row in ABSORBED_CRATES {
+        if absorbed.iter().any(|(_, p)| p == row.path) {
+            continue;
+        }
+        let member = root.join(row.path).join("Cargo.toml").is_file();
+        if !(member && retained_license(root, row.path).is_some() && notice_names(root, row.path)) {
             return Err(format!(
-                "ABSORBED_CRATES entry `{}` (`{}`) is not an absorbed [patch] target of this \
-                 tree — a STALE row cannot keep describing it; remove or update the entry \
-                 (fail-closed)",
-                a.package, a.path
+                "ABSORBED_CRATES entry `{}` (`{}`) is neither an absorbed [patch] target nor an \
+                 absorbed member of this tree (a crate there that retains its upstream license \
+                 file AND that the top-level NOTICE names) — a STALE row cannot keep \
+                 describing it; remove or update the entry (fail-closed)",
+                row.upstream, row.path
             ));
+        }
+        let package = match manifests.get(row.path) {
+            Some(m) => m.name.clone(),
+            None => load_manifest(root, row.path)?.name,
+        };
+        vendored_scanned.push(scan_absorbed(root, row, &package, &mut scan_dirs)?);
+        absorbed.push((package, row.path.to_string()));
+    }
+    // Namespace uniqueness: two crates sharing a namespace would merge their
+    // identities.
+    {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for v in &vendored_scanned {
+            if !seen.insert(v.namespace) {
+                return Err(format!(
+                    "two scanned vendored crates share the identity namespace \
+                     `{}` — namespaces must be unique (fail-closed)",
+                    v.namespace
+                ));
+            }
         }
     }
     vendored_scanned.sort_by(|a, b| a.package.cmp(&b.package));
     first_party_patches.sort();
-    absorbed_patches.sort();
+    absorbed.sort();
 
     Ok(ScanSet {
         scan_dirs,
         proc_macros,
         vendored_scanned,
         first_party_patches,
-        absorbed_patches,
+        absorbed,
+    })
+}
+
+/// One [`ABSORBED_CRATES`] row resolved for the walker: every platform-slice
+/// path must exist, and the crate's source leaves `scan_dirs` (it is a member,
+/// so the closure walk may have reached it), scanned namespaced instead, never
+/// twice.
+fn scan_absorbed(
+    root: &Path,
+    row: &AbsorbedCrate,
+    package: &str,
+    scan_dirs: &mut Vec<String>,
+) -> Result<ScannedVendored, String> {
+    for slice in row.platform_slices {
+        for p in slice.paths {
+            if !root.join(row.path).join(p).exists() {
+                return Err(format!(
+                    "ABSORBED_CRATES entry `{}` registers platform slice `{}` path `{p}`, \
+                     which no longer exists under `{}` — the row is STALE (fail-closed)",
+                    row.upstream, slice.label, row.path
+                ));
+            }
+        }
+    }
+    let scan_dir = format!("{}/src", row.path);
+    scan_dirs.retain(|d| *d != scan_dir);
+    Ok(ScannedVendored {
+        package: package.to_string(),
+        namespace: row.namespace,
+        crate_dir: row.path.to_string(),
+        scan_dir,
+        platform_slices: row.platform_slices,
     })
 }
 
@@ -1659,7 +1695,7 @@ pub fn render_scan_set(set: &ScanSet) -> String {
             .collect();
         let _ = writeln!(
             out,
-            "      vendored and absorbed [patch] crate(s) SCANNED in vendored-identity \
+            "      vendored [patch] and absorbed crate(s) SCANNED in vendored-identity \
              mode (vendor/forge.toml's [[fork]] blocks and ABSORBED_CRATES, fail-closed both \
              ways) — upstream process code, each crate's lock identities in its own \
              `<crate>::…` namespace so foreign receiver names can never merge with \
@@ -1683,18 +1719,19 @@ pub fn render_scan_set(set: &ScanSet) -> String {
             listed.join(", ")
         );
     }
-    if !set.absorbed_patches.is_empty() {
+    if !set.absorbed.is_empty() {
         let listed: Vec<String> = set
-            .absorbed_patches
+            .absorbed
             .iter()
             .map(|(n, p)| format!("{n} ({p})"))
             .collect();
         let _ = writeln!(
             out,
-            "      ABSORBED [patch] target(s) — upstream source aterm owns as a workspace \
-             member (retained upstream license + NOTICE line; `forge attest` holds its \
-             notices), no review row; scanned NAMESPACED with its platform slices \
-             (ABSORBED_CRATES) until the carve, listed with the vendored crates above: {}",
+            "      ABSORBED crate(s) — upstream source aterm owns as a workspace member \
+             (retained upstream license + NOTICE line; `forge attest` holds its notices), \
+             patched in under the upstream name or renamed and reached by path, no review \
+             row; scanned NAMESPACED with its platform slices (ABSORBED_CRATES) until the \
+             carve, listed with the vendored crates above: {}",
             listed.join(", ")
         );
     }
@@ -1713,7 +1750,7 @@ pub(crate) mod test_fixtures {
 
     use std::path::{Path, PathBuf};
 
-    use super::{ABSORBED_CRATES, FORK_LEDGER};
+    use super::{ABSORBED_CRATES, AbsorbedCrate, FORK_LEDGER};
 
     /// The vendored fork every fixture reviews: (package, path, namespace).
     pub(crate) const FIXTURE_FORK: (&str, &str, &str) = ("indexmap", "vendor/indexmap", "indexmap");
@@ -1757,11 +1794,19 @@ pub(crate) mod test_fixtures {
         root
     }
 
+    /// The package name a fixture gives an absorbed crate's member: its
+    /// directory's, as aterm names its crates (`crates/aterm-window` ⇒
+    /// `aterm-window`).
+    pub(crate) fn member_name(row: &AbsorbedCrate) -> &'static str {
+        row.path.rsplit('/').next().unwrap_or(row.path)
+    }
+
     /// The `[patch.crates-io]` table and vendor stub trees that satisfy the
     /// reviewed-classification checks: [`FIXTURE_FORK`] patched in, reviewed by
-    /// a ledger and with a stub `src/`. Each absorbed crate is a `crates/` stub
-    /// with both absorption records (a LICENSE in its root and a NOTICE line
-    /// naming it) and every platform-slice path existing.
+    /// a ledger and with a stub `src/`. Each absorbed crate is a renamed
+    /// `crates/` member (in no patch row, named by [`member_name`]) with both
+    /// absorption records (a LICENSE in its root and a NOTICE line naming it)
+    /// and every platform-slice path existing.
     pub(crate) fn patch_fixture() -> (String, Vec<(String, String)>) {
         let mut table = String::from("[patch.crates-io]\n");
         let (package, path, _) = FIXTURE_FORK;
@@ -1776,11 +1821,10 @@ pub(crate) mod test_fixtures {
         ];
         let mut notice = String::from("NOTICE\n");
         for a in ABSORBED_CRATES {
-            table.push_str(&format!("{} = {{ path = \"{}\" }}\n", a.package, a.path));
-            notice.push_str(&format!("- {} (`{}/`)\n", a.package, a.path));
+            notice.push_str(&format!("- {} (`{}/`)\n", a.upstream, a.path));
             stubs.push((
                 format!("{}/Cargo.toml", a.path),
-                format!("[package]\nname = \"{}\"\n", a.package),
+                format!("[package]\nname = \"{}\"\n", member_name(a)),
             ));
             stubs.push((format!("{}/LICENSE", a.path), "upstream\n".to_string()));
             stubs.push((format!("{}/src/lib.rs", a.path), "// stub\n".to_string()));
@@ -1885,48 +1929,85 @@ mod tests {
         );
     }
 
-    /// An absorbed `[patch]` target is scanned namespaced, with its slices, and
-    /// never also as a plain member, even when the closure reaches it.
-    #[test]
-    fn an_absorbed_patch_target_is_scanned_namespaced_not_as_a_member() {
-        let absorbed = &ABSORBED_CRATES[0];
+    /// The fixture tree with `dep` (a workspace dependency on the absorbed
+    /// crate, by path) in the root table and aterm-gui's dependencies, so the
+    /// closure walk reaches the crate as a member.
+    fn reaching_absorbed(dep: &str, path: &str) -> Vec<(String, String)> {
         let mut files = test_fixtures::workspace_manifests(&[]);
-        for (path, contents) in files.iter_mut() {
-            if path == "Cargo.toml" {
+        for (rel, contents) in files.iter_mut() {
+            if rel == "Cargo.toml" {
                 *contents = contents.replace(
                     "aterm-types = { path = \"crates/aterm-types\" }\n",
                     &format!(
                         "aterm-types = {{ path = \"crates/aterm-types\" }}\n\
-                         {} = {{ path = \"{}\" }}\n",
-                        absorbed.package, absorbed.path
+                         {dep} = {{ path = \"{path}\" }}\n"
                     ),
                 );
             }
-            if path == "crates/aterm-gui/Cargo.toml" {
-                contents.push_str(&format!("{} = {{ workspace = true }}\n", absorbed.package));
+            if rel == "crates/aterm-gui/Cargo.toml" {
+                contents.push_str(&format!("{dep} = {{ workspace = true }}\n"));
             }
         }
-        let set = derive("absorbed", with_src(files)).expect("derivation must succeed");
+        files
+    }
+
+    /// Assert `set` scans the absorbed crate namespaced under `package`, with
+    /// its slices, and never also as a plain member.
+    fn assert_scanned_namespaced(set: &ScanSet, row: &AbsorbedCrate, package: &str) {
         assert_eq!(
-            set.absorbed_patches,
-            vec![(absorbed.package.to_string(), absorbed.path.to_string())]
+            set.absorbed,
+            vec![(package.to_string(), row.path.to_string())]
         );
         assert!(
-            !set.scan_dirs.contains(&format!("{}/src", absorbed.path)),
+            !set.scan_dirs.contains(&format!("{}/src", row.path)),
             "an absorbed crate is not scanned unnamespaced: {:?}",
             set.scan_dirs
         );
         let scanned = set
             .vendored_scanned
             .iter()
-            .find(|v| v.package == absorbed.package)
+            .find(|v| v.package == package)
             .expect("the absorbed crate is scanned namespaced");
-        assert_eq!(scanned.namespace, absorbed.namespace);
-        assert_eq!(scanned.crate_dir, absorbed.path);
+        assert_eq!(scanned.namespace, row.namespace);
+        assert_eq!(scanned.crate_dir, row.path);
+        assert_eq!(scanned.platform_slices.len(), row.platform_slices.len());
     }
 
-    /// An absorbed target with no ABSORBED_CRATES row, and a row whose target
-    /// left the patch table, both stop the census.
+    /// An absorbed crate renamed off its upstream name is in no patch row; it
+    /// is found by its row's path and scanned namespaced, with its slices, and
+    /// never also as a plain member, even when the closure reaches it.
+    #[test]
+    fn a_renamed_absorbed_member_is_scanned_namespaced_not_as_a_member() {
+        let row = &ABSORBED_CRATES[0];
+        let member = test_fixtures::member_name(row);
+        let files = reaching_absorbed(member, row.path);
+        let set = derive("absorbedmember", with_src(files)).expect("derivation must succeed");
+        assert_scanned_namespaced(&set, row, member);
+    }
+
+    /// An absorbed crate still patched in under its upstream name is scanned
+    /// the same way, found by its patch row.
+    #[test]
+    fn an_absorbed_patch_target_is_scanned_namespaced_not_as_a_member() {
+        let row = &ABSORBED_CRATES[0];
+        let mut files = reaching_absorbed(row.upstream, row.path);
+        for (rel, contents) in files.iter_mut() {
+            if rel == "Cargo.toml" {
+                contents.push_str(&format!(
+                    "{} = {{ path = \"{}\" }}\n",
+                    row.upstream, row.path
+                ));
+            }
+            if *rel == format!("{}/Cargo.toml", row.path) {
+                *contents = format!("[package]\nname = \"{}\"\n", row.upstream);
+            }
+        }
+        let set = derive("absorbedpatch", with_src(files)).expect("derivation must succeed");
+        assert_scanned_namespaced(&set, row, row.upstream);
+    }
+
+    /// An absorbed target with no ABSORBED_CRATES row, and a row whose crate
+    /// lost an absorption record (here its NOTICE line), both stop the census.
     #[test]
     fn the_absorbed_registry_is_fail_closed_both_ways() {
         let absorbed = &ABSORBED_CRATES[0];
@@ -1954,19 +2035,16 @@ mod tests {
         );
         let mut files = test_fixtures::workspace_manifests(&[]);
         for (path, contents) in files.iter_mut() {
-            if path == "Cargo.toml" {
+            if path == "NOTICE" {
                 *contents = contents.replace(
-                    &format!(
-                        "{} = {{ path = \"{}\" }}\n",
-                        absorbed.package, absorbed.path
-                    ),
+                    &format!("- {} (`{}/`)\n", absorbed.upstream, absorbed.path),
                     "",
                 );
             }
         }
         let err = derive("staleabsorbed", with_src(files)).expect_err("must fail");
         assert!(
-            err.contains(&format!("ABSORBED_CRATES entry `{}`", absorbed.package))
+            err.contains(&format!("ABSORBED_CRATES entry `{}`", absorbed.upstream))
                 && err.contains("STALE"),
             "err: {err}"
         );

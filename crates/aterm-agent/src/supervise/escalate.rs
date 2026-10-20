@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! What the loop hands a person, and taking it back: the worker's `attention`
-//! (the menu bar badges it) and, while the fabric is connected, one post to
-//! the manager's inbox.
+//! (the menu bar badges it). Nothing is mailed: a manager waits on the
+//! worker's task record, whose `attention=` this entry raises (`await task`).
 //!
 //! The attention text says what the person is asked: `<program> <kind>:
 //! <command, path or question, cut at 64 cells> (<why no rule answered it>)`,
@@ -12,12 +12,6 @@
 //! own first row ([`prompt_box_first_row`]). Every part is on one line and cut
 //! by terminal cells ([`cut_cells`]). A limit keeps `limited: <message>`.
 //!
-//! Mail (`kind=ask` for a box or question, `kind=control` for a limit) is
-//! posted only while `status` says `fabric=connected`; otherwise it is
-//! journaled `mail=skipped: no fabric (fabric=<state>)`. An `ask` is posted
-//! `--wait=0` (the loop is single-threaded), and a queued reply is journaled
-//! `mail=queued id=<n> (…)` ([`post_word`]).
-//!
 //! The attention is keyed: this loop writes and clears only its own entry
 //! (`meta set|unset attention owner=supervisor`), never the bare form, which
 //! is the human's. The key proves ownership; the text
@@ -25,7 +19,7 @@
 //! loop watching behind another supervisor's claim writes none.
 
 use super::super::journal::{
-    ATTENTION_KEPT, ATTENTION_SKIPPED, CLEARED_BOX, ESCALATED_BEHIND, MAIL_ADOPTED, MAIL_RETRY,
+    AGAIN_ADOPTED, AGAIN_RETRY, ATTENTION_KEPT, ATTENTION_SKIPPED, CLEARED_BOX, ESCALATED_BEHIND,
 };
 use super::*;
 
@@ -255,45 +249,64 @@ fn refused_cap(r: &CtlReply, sent: &str) -> Option<usize> {
 
 pub(crate) use super::super::screen::status_field;
 
-impl<C: Ctl> Session<'_, C> {
-    /// The fabric's state as the worker's `status` says it (`connected`,
-    /// `absent`, …), `unknown` when the host does not say.
-    fn fabric_state(&mut self) -> Result<String, Fail> {
-        let r = self.call(&["status"])?;
-        if self.unserved(&r) {
-            return Err(Fail::Lost(format!("status failed: {}", r.stderr.trim())));
-        }
-        Ok(if r.ok() {
-            status_field(&r.stdout, "fabric").unwrap_or("unknown")
-        } else {
-            "unknown"
-        }
-        .to_string())
-    }
+/// What one escalation hands the person ([`Session::escalate`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Escalation {
+    /// A box, a question, a point the turn-end policy hands over: the person
+    /// is asked. Its entry names no `kind=`: an entry with none whose text
+    /// does not open with [`ATTENTION_PREFIX`] is an ask to every reader
+    /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §2.4).
+    Ask,
+    /// A limit (`limited: <message>`). `waits`: this loop waits it out by
+    /// itself ([`Session::waits_out`]), so the entry is `kind=wait`, a
+    /// record; otherwise `kind=ask`, as a limit nothing here ends.
+    Limit { waits: bool },
+}
 
+impl Escalation {
+    /// The `kind=` token the entry is written with, if any.
+    fn kind_token(self) -> Option<String> {
+        match self {
+            Self::Ask => None,
+            Self::Limit { waits } => {
+                let kind = if waits {
+                    aterm_types::needs::AttentionKind::Wait
+                } else {
+                    aterm_types::needs::AttentionKind::Ask
+                };
+                Some(format!("kind={}", kind.word()))
+            }
+        }
+    }
+}
+
+impl<C: Ctl> Session<'_, C> {
     /// The escalation: `meta set attention <text>` on the worker (cut to the
     /// server's keyed cap, and once more to the cap a `too long (max <n>
-    /// bytes)` refusal names), the same text posted as `kind=<kind>` to the
-    /// manager ([`Self::set_manager`]) while the fabric is connected, and one
-    /// journal line, `ESCALATED seq=<n> attention=<reply> mail=<reply>`. A
-    /// refusal is recorded, never the loop's end.
+    /// bytes)` refusal names), and one journal line, `ESCALATED seq=<n>
+    /// attention=<reply>`. A refusal is recorded, never the loop's end. `kind`
+    /// is what is escalated ([`Escalation`]): an ask (a box, a question, a
+    /// point the turn-end policy hands over) or a limit, written `kind=wait`
+    /// where this loop waits it out and `kind=ask` where it does not.
     ///
-    /// The same episode opened again (`again`, [`Retry`]) or adopted from a
-    /// previous watcher sets the attention and posts nothing (`mail=skipped:
-    /// …`), as does a missing manager or fabric. While a stall is in hand an
-    /// ask raises no badge ([`Self::withhold_badge`], [`stall::WITHHELD`]).
+    /// The same episode opened again (`again`, [`Retry`]) or a limit's badge
+    /// adopted from a previous watcher is the same ask set again: its line
+    /// ends `again=<why>` ([`AGAIN_RETRY`], [`AGAIN_ADOPTED`]), which the
+    /// harness's stats count as no second escalation. While a stall is in
+    /// hand an ask raises no badge ([`Self::withhold_badge`],
+    /// [`stall::WITHHELD`]).
     pub(super) fn escalate(
         &mut self,
         seq: u64,
         text: &str,
         again: Option<u64>,
-        kind: &str,
+        kind: Escalation,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
         if let Some(holder) = self.claim.watching_behind() {
             review.note(&format!(
                 "ESCALATED seq={seq} {ATTENTION_SKIPPED}{ESCALATED_BEHIND} ({holder}) answers \
-                 this session mail=skipped: the same"
+                 this session"
             ));
             return Ok(());
         }
@@ -302,46 +315,35 @@ impl<C: Ctl> Session<'_, C> {
         }
         let mut attention = fit_bytes(text, ATTENTION_BYTES);
         let owner = format!("owner={ATTENTION_OWNER}");
-        let mut r = self.call(&["meta", "set", "attention", &owner, &attention])?;
+        let kind_token = kind.kind_token();
+        let set = |attention: &str| -> Vec<String> {
+            ["meta", "set", "attention", owner.as_str()]
+                .into_iter()
+                .map(str::to_string)
+                .chain(kind_token.clone())
+                .chain(std::iter::once(attention.to_string()))
+                .collect()
+        };
+        let args = set(&attention);
+        let mut r = self.call(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
         if let Some(cap) = refused_cap(&r, &attention) {
             attention = fit_bytes(&attention, cap);
-            r = self.call(&["meta", "set", "attention", &owner, &attention])?;
+            let args = set(&attention);
+            r = self.call(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
         }
         if r.ok() {
             self.attention_ours = Some(attention.clone());
         }
-        let attention_said = reply_word(&r);
-        let adopted = kind == "control" && std::mem::take(&mut self.adopted_limit);
-        let mail_said = match (again, self.setup.manager.clone()) {
-            (Some(of), _) => format!("{MAIL_RETRY}, the episode of seq={of}"),
-            _ if adopted => MAIL_ADOPTED.to_string(),
-            (None, None) => "skipped: no --inbox and no $ATERM_PARENT_SESSION_ID".to_string(),
-            (None, Some(to)) => match self.fabric_state()?.as_str() {
-                "connected" if kind == "ask" && self.stall_in_hand(review) => {
-                    format!("skipped: {}", stall::WITHHELD)
-                }
-                "connected" => {
-                    let to = format!("to={to}");
-                    let kind_arg = format!("kind={kind}");
-                    // An `ask` waits by default (up to 30 s for its record to
-                    // land on the bus) and this loop is single-threaded, so a
-                    // stalled bridge would hold every look behind the
-                    // escalation. `--wait=0` returns at once;
-                    // the row is recorded before any wait, so the post is
-                    // queued whatever the reply ([`post_word`]).
-                    let mut args = vec!["post", to.as_str(), kind_arg.as_str()];
-                    if kind == "ask" {
-                        args.push("--wait=0");
-                    }
-                    args.push(text);
-                    let r = self.call(&args)?;
-                    post_word(&r)
-                }
-                state => format!("skipped: no fabric (fabric={state})"),
-            },
+        let adopted =
+            matches!(kind, Escalation::Limit { .. }) && std::mem::take(&mut self.adopted_limit);
+        let again = match again {
+            Some(of) => format!(" again={AGAIN_RETRY}, the episode of seq={of}"),
+            None if adopted => format!(" again={AGAIN_ADOPTED}"),
+            None => String::new(),
         };
         review.note(&format!(
-            "ESCALATED seq={seq} attention={attention_said} mail={mail_said}"
+            "ESCALATED seq={seq} attention={}{again}",
+            reply_word(&r)
         ));
         Ok(())
     }
@@ -351,19 +353,18 @@ impl<C: Ctl> Session<'_, C> {
     /// answer among them), escalated ONCE
     /// PER REVIEW POINT: the worker's `attention` set to [`attention_text`] —
     /// `reason`, else the reason the approval policy gave for a box
-    /// ([`Session::box_reason`]) — and one `kind=ask` posted to the manager
-    /// ([`Self::escalate`]). It is called only where the loop hands a NEW
-    /// point over — a later look at the same point posts nothing: the box
-    /// redrawn, re-wrapped, its focus moved, its countdown ticking, the
-    /// transcript reflowed above it ([`Session::review_key`]) — so the same box back
-    /// after the worker worked (or after an outage) is a new point, a new
-    /// `EVENT prompt` AND a new ask (deduping
-    /// on the box's key alone leaves a cleared badge gone), and so is another
-    /// box drawn over it with no read between (another command, another diff
-    /// on the same path).
+    /// ([`Session::box_reason`]); see [`Self::escalate`]. It is called only
+    /// where the loop hands a NEW point over — a later look at the same point
+    /// raises nothing again: the box redrawn, re-wrapped, its focus moved, its
+    /// countdown ticking, the transcript reflowed above it
+    /// ([`Session::review_key`]) — so the same box back after the worker worked
+    /// (or after an outage) is a new point, a new `EVENT prompt` AND a new
+    /// badge (deduping on the box's key alone leaves a cleared badge gone),
+    /// and so is another box drawn over it with no read between (another
+    /// command, another diff on the same path).
     /// The one exception is the point a previous watcher's badge was
     /// ADOPTED for at the start ([`Self::reconcile`]): its first review
-    /// posts nothing, the ask having gone already. The manager's own
+    /// raises nothing, the badge standing already. The manager's own
     /// `key`/`turn` that answers it is the screen change the loop already
     /// waits on ([`Self::wait_for_next`]), and the badge goes when the point
     /// has ([`Self::close_box`]).
@@ -391,8 +392,21 @@ impl<C: Ctl> Session<'_, C> {
             (None, _, Some((k, why))) if *k == key => why.clone(),
             _ => "no approval rule answers this box".to_string(),
         };
+        // THE OWNER'S NOTICE STANDS FOR THIS POINT ([`super::policy::notice`],
+        // Claude Code's lost login: `/login` held back, its method picker
+        // left to them): it is the one thing they see, with its step — a
+        // badge beside it would tell them twice, in other words. Journaled.
+        if let Some(notice) = self.exception_now.as_ref().and_then(|e| e.notice.as_ref()) {
+            review.note(&format!(
+                "NOT ESCALATED seq={} the notice {} stands: {}",
+                point.screen.seq,
+                notice.id,
+                clip(&reason)
+            ));
+            return Ok(());
+        }
         let text = attention_text(self.reader(&point.screen.rows), point, &reason);
-        self.escalate(point.screen.seq, &text, None, "ask", review)?;
+        self.escalate(point.screen.seq, &text, None, Escalation::Ask, review)?;
         self.box_ask = Some(BoxAsk { key, memory: false });
         Ok(())
     }
@@ -477,8 +491,8 @@ impl<C: Ctl> Session<'_, C> {
     /// The worker answered on a point that is not the limit's notice (a look's
     /// point, or a read of an Off park), with no episode open: the limit a
     /// previous loop's badge was adopted for ([`Session::adopted_limit`]) is
-    /// over. Its marker goes, so a later limit is a new episode, mailed — never
-    /// `mail=skipped: adopted …` for a wall nobody was told of — and its badge,
+    /// over. Its marker goes, so a later limit is a new episode, a new ask —
+    /// never `again=adopted …` for a wall nobody was told of — and its badge,
     /// if still up, goes with it ([`Self::lower_adopted_limit`]). Nothing
     /// while an episode is open: its close is the episode's.
     pub(super) fn adopted_limit_over(

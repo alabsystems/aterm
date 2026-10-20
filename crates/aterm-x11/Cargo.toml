@@ -14,6 +14,10 @@ description = "First-party X11 for aterm: the wire codec held to x11rb-protocol'
 # under tests/recorded/ are the oracle (tests/recorder, its own workspace,
 # wrote them), so this crate's tests outlive the registry crates leaving the
 # lock at LW.7.
+#
+# The integration files are modules of `tests/x11_suite.rs`, one test binary.
+# With autotests off a `tests/*.rs` file listed nowhere never compiles.
+autotests = false
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # libxcb and libX11-xcb, opened at run time.
@@ -28,3 +32,7 @@ aterm-uds = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "x11_suite"
+path = "tests/x11_suite.rs"

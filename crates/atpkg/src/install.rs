@@ -87,6 +87,8 @@ pub enum StageError {
     /// refusing the image. Names the field or tool, so a mis-authored row fails fast on
     /// the authoring machine.
     Payload(String),
+    /// A mounted DMG root contains this many real app directories, rather than one.
+    DmgAppCount(usize),
     /// The staged tree's platform signer check refused it: a Mach-O not signed by the
     /// pinned Developer ID team, no Mach-O at all, an exposed tool's entry that is not a
     /// verified Mach-O, or a shape that would let code escape the check (an interpreter
@@ -114,6 +116,12 @@ impl std::fmt::Display for StageError {
                 write!(f, "tree_root mismatch: expected {expected}, got {got}")
             }
             StageError::Payload(m) => write!(f, "payload: {m}"),
+            StageError::DmgAppCount(count) => {
+                write!(
+                    f,
+                    "payload: dmg image root must hold exactly one .app, found {count}"
+                )
+            }
             StageError::SignerRefused(m) => write!(f, "signer refused: {m}"),
             StageError::VerifyDeferred(m) => write!(f, "signature check deferred: {m}"),
         }
@@ -201,7 +209,7 @@ pub(crate) fn check_signed_digest(artifact: &Artifact, file: &Path) -> Result<()
 fn size_cap(artifact: &Artifact) -> u64 {
     let signed = artifact.cost.disk_installed;
     if signed == 0 {
-        2u64 << 30
+        UNSIGNED_SIZE_CAP
     } else {
         signed.saturating_mul(2).max(1 << 20)
     }
@@ -209,7 +217,10 @@ fn size_cap(artifact: &Artifact) -> u64 {
 
 /// The maximum entry count — a tar-bomb (millions of tiny entries) guard well above any
 /// real toolchain bundle.
-const MAX_ENTRIES: u64 = 4_000_000;
+pub(crate) const MAX_ENTRIES: u64 = 4_000_000;
+
+/// Extraction ceiling when no signed installed-size estimate is available.
+pub(crate) const UNSIGNED_SIZE_CAP: u64 = 2u64 << 30;
 
 /// The mode of the `<build>.incoming-<pid>` scratch while a stage fills and verifies it:
 /// its owner's alone, so nobody else can reach a member before it has its final mode or
@@ -739,7 +750,8 @@ fn check_signed_tree(
 ///
 /// # Errors
 /// [`StageError::Extract`] for anything the extractor refused (a slip, a cap, a
-/// malformed container), [`StageError::Payload`] for a row the lane cannot honour, and
+/// malformed container), [`StageError::DmgAppCount`] for a DMG with the wrong app count,
+/// [`StageError::Payload`] for another row the lane cannot honour, and
 /// [`StageError::Io`] for the filesystem.
 pub fn stage_payload(
     artifact: &Artifact,
@@ -767,7 +779,8 @@ pub(crate) fn stage_payload_modes(
     let cap = size_cap(artifact);
     let vendor = ExtractOptions {
         strip_components: artifact.strip_components,
-        in_root_symlinks: true,
+        symlinks: crate::extract::SymlinkPolicy::InRoot,
+        allow_global_pax: false,
     };
     // A row that signs no `tree_root` has nothing to compare the decoded tree against
     // ([`verify_and_stage`] step 3), so its zstd frames must carry the producer's content
@@ -1013,6 +1026,7 @@ fn apply_links(
 /// `remove_dir_all` a directory that may be a live mount; the [`Mount`] guard is what
 /// reclaims it, on every path.
 #[cfg(target_os = "macos")]
+#[cfg(not(test))]
 fn dmg_mount_point(dest: &Path) -> Result<PathBuf, StageError> {
     let name = dest
         .file_name()
@@ -1160,8 +1174,77 @@ fn same_file(a: &Path, b: &Path) -> bool {
         }
 }
 
+/// A disk image the `dmg` lane reads from, released on EVERY path: the folder that holds
+/// its root, an explicit [`Attached::detach`] on the happy path so a failed release is
+/// reported rather than swallowed, and `Drop` for the error paths. [`Mount`] is
+/// `hdiutil`'s; a test stands a scratch folder in for the mounted image ([`attach_image`]).
+#[cfg(target_os = "macos")]
+trait Attached {
+    /// The folder that holds the image's root.
+    fn root(&self) -> &Path;
+    /// Release the image and report; `Drop` then has nothing left to do.
+    fn detach(&mut self) -> Result<(), StageError>;
+}
+
+/// Attach `image` for the stage at `dest`: `hdiutil` ([`Mount::attach`]).
+#[cfg(all(target_os = "macos", not(test)))]
+fn attach_image(image: &Path, dest: &Path) -> Result<Box<dyn Attached>, StageError> {
+    Ok(Box::new(Mount::attach(image, dest)?))
+}
+
+/// A test build's [`attach_image`]: the arm this thread set ([`image_arm::with`]) and,
+/// with none set, a refusal, never `hdiutil`. Attaching a disk image and reading inside it
+/// drew macOS's removable-volume dialog on a Mac without Full Disk Access ([`stage_dmg`]),
+/// so a default test run attaches none: the stage is tested over a scratch folder standing
+/// in for the mounted image. The explicit `dmg_acceptance` bench links the normal debug
+/// library, whose stage uses [`Mount::attach`].
+#[cfg(all(target_os = "macos", test))]
+fn attach_image(image: &Path, dest: &Path) -> Result<Box<dyn Attached>, StageError> {
+    image_arm::attach(image, dest)
+}
+
+/// The test seam behind [`attach_image`]: which arm attaches this thread's images.
+#[cfg(all(target_os = "macos", test))]
+mod image_arm {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    use super::{Attached, StageError};
+
+    /// What attaches an image for a stage: `(image, dest)` to the attached image.
+    pub(super) type Arm = Box<dyn Fn(&Path, &Path) -> Result<Box<dyn Attached>, StageError>>;
+
+    thread_local! {
+        static ARM: RefCell<Option<Arm>> = const { RefCell::new(None) };
+    }
+
+    /// Run `f` with `arm` attaching this thread's images; none again after, unwinding
+    /// included.
+    pub(super) fn with<R>(arm: Arm, f: impl FnOnce() -> R) -> R {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ARM.with(|a| *a.borrow_mut() = None);
+            }
+        }
+        ARM.with(|a| *a.borrow_mut() = Some(arm));
+        let _reset = Reset;
+        f()
+    }
+
+    /// Attach `image` for the stage at `dest` with this thread's arm.
+    pub(super) fn attach(image: &Path, dest: &Path) -> Result<Box<dyn Attached>, StageError> {
+        ARM.with(|a| match a.borrow().as_ref() {
+            Some(arm) => arm(image, dest),
+            None => Err(StageError::Payload(String::from(
+                "this test thread attaches no disk image: a default test run never runs hdiutil",
+            ))),
+        })
+    }
+}
+
 /// An attached disk image, detached on EVERY path (`Drop` for the error paths, an
-/// explicit [`Mount::detach`] on the happy path so a detach failure is reported
+/// explicit [`Attached::detach`] on the happy path so a detach failure is reported
 /// rather than swallowed). The mount point directory is removed with it.
 ///
 /// The guard is armed BEFORE `hdiutil attach` runs, not after it succeeds, because a
@@ -1185,6 +1268,7 @@ struct Mount {
 /// attempt once the failed attempt's devices had been reclaimed. A genuinely bad image
 /// costs this many attach attempts and no more.
 #[cfg(target_os = "macos")]
+#[cfg(not(test))]
 const ATTACH_ATTEMPTS: u32 = 4;
 
 #[cfg(target_os = "macos")]
@@ -1200,6 +1284,7 @@ impl Mount {
     ///
     /// A failed attempt is reclaimed ([`Mount::detach_now`]) and retried, up to
     /// [`ATTACH_ATTEMPTS`].
+    #[cfg(not(test))]
     fn attach(image: &Path, dest: &Path) -> Result<Self, StageError> {
         let point = dmg_mount_point(dest)?;
         // An EMPTY leftover from a crashed run is ours; a live mount there refuses the
@@ -1240,13 +1325,6 @@ impl Mount {
         Err(last.unwrap_or_else(|| {
             StageError::Payload(String::from("hdiutil attach was never attempted"))
         }))
-    }
-
-    /// The ONE `.app` directory at the image root. Anything else there (`Applications`
-    /// link, `.background`, `.DS_Store`, a README) is ignored; zero or several apps is
-    /// a refusal — the row said which bundle to stage by saying there is one.
-    fn single_app(&self) -> Result<PathBuf, StageError> {
-        single_app_in(&self.point)
     }
 
     fn detach_now(&mut self) -> Result<(), StageError> {
@@ -1336,9 +1414,15 @@ impl Mount {
             .map(|a| a.node)
             .collect()
     }
+}
 
-    /// Detach and report. Consumes the guard so `Drop` has nothing left to do.
-    fn detach(mut self) -> Result<(), StageError> {
+#[cfg(target_os = "macos")]
+impl Attached for Mount {
+    fn root(&self) -> &Path {
+        &self.point
+    }
+
+    fn detach(&mut self) -> Result<(), StageError> {
         self.detach_now()
     }
 }
@@ -1364,10 +1448,7 @@ fn single_app_in(dir: &Path) -> Result<PathBuf, StageError> {
     if apps.len() == 1 {
         return Ok(apps.swap_remove(0));
     }
-    Err(payload2(
-        "dmg image root must hold exactly one .app, found ",
-        &apps.len().to_string(),
-    ))
+    Err(StageError::DmgAppCount(apps.len()))
 }
 
 #[cfg(target_os = "macos")]
@@ -1378,7 +1459,7 @@ impl Drop for Mount {
 }
 
 /// The `dmg` lane: attach the image read-only, require exactly one `.app` at its
-/// root, `ditto` that bundle into `dest` (symlinks, contents and extended attributes as
+/// root (otherwise [`StageError::DmgAppCount`]), `ditto` that bundle into `dest` (symlinks, contents and extended attributes as
 /// the image carries them; no ACL), give it the archive lanes' modes and the stage's
 /// owner and group, clear any flag that would make a member immutable, and refuse any
 /// link in it that leaves the stage root ([`vet_copied_tree`]), detach. Nothing else on
@@ -1397,7 +1478,10 @@ impl Drop for Mount {
 /// land a setuid or world-writable member in a store that, under a system prefix, every
 /// user runs from. Fail closed: the lane gives every copied directory and regular file
 /// the same mode as every other lane does, through the same function, passes
-/// `--noacl`, clears the immutable and append-only flags `ditto` also copies, and gives
+/// `--noacl` (with `--noclone`: on one volume `ditto` clones a file, ACL included,
+/// whatever `--noacl` says, measured 2026-10-19 on macOS 27, so a folder on the store's
+/// volume, a mount-free reader's or the tests' stand-in, would land its ACLs), clears
+/// the immutable and append-only flags `ditto` also copies, and gives
 /// every entry the stage root's owner and group, which `ditto` would otherwise keep from
 /// the image ([`give_owner`], added on the lane's review the same day), because no lane
 /// is the place a store tree gets a permission the others strip. A code
@@ -1411,18 +1495,48 @@ impl Drop for Mount {
 /// So a `dmg` tree's `tree_root` now folds `755` or `644` in every file's mode slot,
 /// never the image's own bits, and a future `dmg` row is signed against that sanitized
 /// tree (the root [`stage_payload`] returns over the image).
+///
+/// # The attach draws a consent dialog, so no row may name this lane (2026-10-19)
+///
+/// On 2026-10-17 at 11:33:14 the owner's aterm logged "macOS showed a consent dialog for
+/// SystemPolicyRemovableVolumes to a program of this aterm", 27 s into a
+/// `targo --unverified test -p atpkg` an agent had started in one of its tabs; that suite's
+/// only disk-image work was this lane's two real-image tests (`hdiutil create
+/// -srcfolder`, then this attach and the `ditto` read inside it). It is the only such
+/// dialog that log holds, and aterm had no Full Disk Access then. A user's stage of a
+/// `payload = "dmg"` row does the same attach and read, so it would draw the same dialog,
+/// naming aterm, for every user without Full Disk Access; and a TCC dialog has no timeout
+/// (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §1.4): the stage, an unattended
+/// first-launch install among them, would park until someone answered it. Full Disk
+/// Access, which aterm asks for at launch, covers the service: on 2026-10-17 with the
+/// grant held, a tab listed, read and wrote a USB drive with no dialog and `tccd` was
+/// asked nothing about removable volumes (that doc's §7 S4). The same spike found a
+/// mounted disk image unprotected on its VMs, which this Mac contradicts.
+///
+/// So [`crate::vendor::check_row`] refuses a `dmg` row before any download (its last
+/// check, so every other field of the row is still judged) until an image can be read
+/// without attaching it. The refusal costs nothing today, as no published row names the
+/// lane (above). Waiting on a grant the user may never give is a stall; the attach also
+/// needs a live bootstrap context (`hdiutil` answers `ENXIO` to an orphan, which is why
+/// the app's own updater stages from a zip), fails transiently (5 attaches in 20,
+/// the bounded attach retry loop), and costs seconds an install does not have. A mount-free reader
+/// would stand where [`attach_image`] does and hand this lane a folder, as the tests'
+/// stand-in does. Everything after it (the picker, the copy, the vet) stays.
 #[cfg(target_os = "macos")]
 fn stage_dmg(image: &Path, dest: &Path) -> Result<(), StageError> {
     std::fs::create_dir_all(dest).map_err(StageError::Io)?;
     crate::extract::require_empty_destination(dest).map_err(StageError::Extract)?;
-    let mount = Mount::attach(image, dest)?;
-    let app = mount.single_app()?;
+    let mut mount = attach_image(image, dest)?;
+    let app = single_app_in(mount.root())?;
     let name = app
         .file_name()
         .ok_or_else(|| payload2("dmg bundle has no name: ", &app.to_string_lossy()))?;
     let out = dest.join(name);
-    let no_acl = std::ffi::OsStr::new("--noacl");
-    run_tool("ditto", &[no_acl, app.as_os_str(), out.as_os_str()])?;
+    let (no_acl, no_clone) = ("--noacl".as_ref(), "--noclone".as_ref());
+    run_tool(
+        "ditto",
+        &[no_acl, no_clone, app.as_os_str(), out.as_os_str()],
+    )?;
     // `ditto` laid the bundle VERBATIM, links and modes included, with nothing of ours
     // vetting them on the way — so vet and sanitize them now, before the mount is
     // released and long before the swap: the archive lanes' rules, applied to the
@@ -1679,10 +1793,20 @@ fn restore_outgoing(old: &Path, build_dir: &Path, was_complete: bool) -> bool {
     true
 }
 
+#[cfg(any(test, all(debug_assertions, target_os = "macos")))]
+#[path = "install_acceptance.rs"]
+mod acceptance_fixtures;
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+pub use acceptance_fixtures::{
+    a_real_image_stages_its_single_app, a_real_image_with_no_app_is_refused_and_detached,
+};
+
 #[cfg(test)]
 mod tests {
+    use super::acceptance_fixtures::*;
     use super::*;
-    use crate::manifest::{Artifact, Cost};
+    use crate::manifest::Artifact;
     use crate::tree::file_sha256;
     use std::path::PathBuf;
 
@@ -1739,32 +1863,6 @@ mod tests {
         let mut tar = tar_entry("bin/ay", b"a plausible first entry");
         tar.extend(tar_entry("../escape", b"pwned"));
         seal(dir.join("slip-18.tar.zst"), tar)
-    }
-
-    fn artifact(sha256: &str, tree_root: &str) -> Artifact {
-        Artifact {
-            target: "aarch64-apple-darwin".into(),
-            kind: "binary".into(),
-            asset: "ay-18.tar.zst".into(),
-            sha256: sha256.into(),
-            sha512: String::new(),
-            tree_root: tree_root.into(),
-            size: 0,
-            reloc: "self-contained".into(),
-            cost: Cost {
-                download_bytes: 0,
-                disk_installed: 1 << 20,
-                build_seconds: 0,
-            },
-            url: String::new(),
-            payload: String::new(),
-            entry: String::new(),
-            strip_components: 0,
-            links: std::collections::BTreeMap::new(),
-            vendor: String::new(),
-            protocol: "github-release".into(),
-            provenance: None,
-        }
     }
 
     /// The three facts every staging test needs: a scratch root, a good archive, and the
@@ -1835,23 +1933,6 @@ mod tests {
             std::fs::write(&witness, b"old").unwrap();
             (build, witness)
         }
-    }
-
-    /// Every stage-scratch sibling currently sitting beside `build_dir`.
-    fn scratch_beside(build_dir: &Path) -> Vec<String> {
-        let Some(parent) = build_dir.parent() else {
-            return Vec::new();
-        };
-        let Ok(entries) = std::fs::read_dir(parent) else {
-            return Vec::new();
-        };
-        let mut out: Vec<String> = entries
-            .flatten()
-            .filter_map(|e| e.file_name().to_str().map(str::to_string))
-            .filter(|n| n.contains(".incoming-") || n.contains(".superseded-"))
-            .collect();
-        out.sort();
-        out
     }
 
     /// What a refused stage must be: the error it names.
@@ -1959,6 +2040,21 @@ mod tests {
         );
     }
 
+    /// The extraction cap is twice the signed size, never under 1 MiB, and 2 GiB for a row
+    /// that signs no size.
+    #[test]
+    fn the_extraction_cap_follows_the_signed_size() {
+        let cap = |disk_installed| {
+            let mut a = artifact("", "");
+            a.cost.disk_installed = disk_installed;
+            size_cap(&a)
+        };
+        assert_eq!(cap(0), 2 << 30);
+        assert_eq!(cap(1), 1 << 20);
+        assert_eq!(cap(1 << 20), 2 << 20);
+        assert_eq!(cap(u64::MAX), u64::MAX);
+    }
+
     /// A row that signs a sha512 is gated by it: the matching archive stages, and one whose
     /// sha512 differs is refused naming that algorithm — even when the value it carries is
     /// the archive's sha256. A row that signs both digests or neither has no gate, and is
@@ -1973,7 +2069,12 @@ mod tests {
             ..b.art.clone()
         };
         let build = b.build();
-        verify_and_stage(&by_512("", &sha512), &b.archive, &build, &StageHooks::NONE).unwrap();
+        // Signed hex is compared case-insensitively, the digest and the root alike.
+        let upper = Artifact {
+            tree_root: b.art.tree_root.to_ascii_uppercase(),
+            ..by_512("", &sha512.to_ascii_uppercase())
+        };
+        verify_and_stage(&upper, &b.archive, &build, &StageHooks::NONE).unwrap();
         assert!(crate::store::build_is_complete(&build));
         let other = b.dir.join("store/ay/19");
         let err = verify_and_stage(
@@ -2114,15 +2215,26 @@ mod tests {
         std::fs::write(&blocker, b"not a directory").unwrap();
         let incoming = crate::store::incoming_dir(&build).unwrap();
         std::fs::create_dir_all(incoming.join("bin")).unwrap();
+        // Windows renames a directory over a file, and refuses to rename one while a file
+        // in it is open: there the witness, held open across the swap, is the blocker.
+        #[cfg(windows)]
+        let held = std::fs::File::open(&witness).unwrap();
 
         let err = swap_into_place(&build, &incoming).unwrap_err();
+        #[cfg(windows)]
+        drop(held);
         assert!(
             blocker.is_file(),
             "the fixture only exercises the failed-retire path while the blocker is there"
         );
+        let refused = if cfg!(windows) {
+            std::io::ErrorKind::PermissionDenied
+        } else {
+            std::io::ErrorKind::NotADirectory
+        };
         assert_eq!(
             err.kind(),
-            std::io::ErrorKind::NotADirectory,
+            refused,
             "the fixture must fail at the FIRST rename, not somewhere else"
         );
         assert!(
@@ -2467,305 +2579,6 @@ mod tests {
 
     #[cfg(unix)]
     use crate::extract::fixtures::{ZipMember, gzip_bytes, tar_bytes, zip_bytes};
-
-    /// An https artifact over `archive`, signed for ITS bytes and for `root`.
-    fn vendor_artifact(archive: &Path, payload: &str, root: &str) -> Artifact {
-        let mut a = artifact(&file_sha256(archive).unwrap(), root);
-        a.kind = if payload == "dmg" {
-            "app-bundle".into()
-        } else {
-            "binary".into()
-        };
-        a.protocol = "https".into();
-        a.payload = payload.into();
-        a.size = std::fs::metadata(archive).unwrap().len();
-        a
-    }
-
-    /// Write `content` at `dir/rel` with `mode`, creating parents — the REPLICA the
-    /// expected roots below are learned from, so no expectation ever comes out of the
-    /// function under test.
-    #[cfg(unix)]
-    fn lay(dir: &Path, rel: &str, content: &[u8], mode: u32) {
-        use std::os::unix::fs::PermissionsExt as _;
-        let p = dir.join(rel);
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(&p, content).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
-    }
-
-    #[cfg(unix)]
-    fn lay_link(dir: &Path, rel: &str, target: &str) {
-        let p = dir.join(rel);
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(target, p).unwrap();
-    }
-
-    /// `chmod +a <ace> <path>`: add an ACL entry, which std has no call for.
-    #[cfg(target_os = "macos")]
-    fn add_acl(path: &Path, ace: &str) {
-        let out = aterm_uds::spawnfd::command("/bin/chmod")
-            .arg("+a")
-            .arg(ace)
-            .arg(path)
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "chmod +a {ace:?} {}: {}",
-            path.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-
-    /// Whether `path` carries an ACL entry: `ls -led` lists each one on a line of its
-    /// own (`  0: group:everyone allow write`) after the entry's. (The `+` after the mode
-    /// is no witness: an entry with extended attributes shows `@` there instead.)
-    #[cfg(target_os = "macos")]
-    fn has_acl(path: &Path) -> bool {
-        let out = aterm_uds::spawnfd::command("/bin/ls")
-            .arg("-led")
-            .arg(path)
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "ls -led {}: {}",
-            path.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .skip(1)
-            .any(|line| line.trim_start().starts_with("0:"))
-    }
-
-    /// The fixture's `hdiutil create` argv: a UDZO image of `src` at `dmg`. ONE
-    /// spelling, which [`hdiutil_create`] runs and [`dmg_fixture_key`] files the result
-    /// under, so a changed flag is never served an image the old flags made.
-    #[cfg(target_os = "macos")]
-    fn hdiutil_create_argv<'a>(
-        src: &'a std::ffi::OsStr,
-        volname: &'a std::ffi::OsStr,
-        dmg: &'a std::ffi::OsStr,
-    ) -> [&'a std::ffi::OsStr; 9] {
-        [
-            "create".as_ref(),
-            "-quiet".as_ref(),
-            "-srcfolder".as_ref(),
-            src,
-            "-volname".as_ref(),
-            volname,
-            "-format".as_ref(),
-            "UDZO".as_ref(),
-            dmg,
-        ]
-    }
-
-    /// `hdiutil create` a UDZO image of `src` at `dmg` ([`dmg_fixture`]'s miss). It is
-    /// setup, not the subject, and `hdiutil` fails transiently under load the way
-    /// `attach` does ([`ATTACH_ATTEMPTS`]; measured at load ~40). So it tries as often as
-    /// the stage's own attach does, removes a partial image between tries, and a real
-    /// failure panics with `hdiutil`'s own last words.
-    #[cfg(target_os = "macos")]
-    fn hdiutil_create(src: &Path, volname: &str, dmg: &Path) {
-        let mut last = String::new();
-        for _ in 0..ATTACH_ATTEMPTS {
-            let _ = std::fs::remove_file(dmg);
-            let out = std::process::Command::new("/usr/bin/hdiutil")
-                .args(hdiutil_create_argv(
-                    src.as_os_str(),
-                    volname.as_ref(),
-                    dmg.as_os_str(),
-                ))
-                .output()
-                .unwrap();
-            if out.status.success() {
-                return;
-            }
-            last = format!(
-                "{}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        panic!(
-            "hdiutil create {} failed {ATTACH_ATTEMPTS} times; the last: {last}",
-            dmg.display()
-        );
-    }
-
-    /// The image a dmg test stages from, at `dmg`: [`hdiutil_create`]'s UDZO image of
-    /// `src` — or, when this build's target dir already holds the image that same argv
-    /// made from the same tree on the same macOS build ([`dmg_fixture_key`]), a copy of
-    /// exactly those bytes.
-    ///
-    /// WHY (measured on 14 cores, macOS 25G83): `hdiutil create` is nearly all of these
-    /// tests' time, and none of it is the lane under test. One create of these ~17 KB
-    /// images takes 4.0-5.1 s idle, made of `diskimages-helper`'s one-second progress
-    /// polls, a 1.8 s finalize and a 0.5 s exit. No create flag helped beyond which
-    /// one-second tick it finished on (`-noatomic` averaged 4.20 s against 4.54 s over six
-    /// runs each). Each test took 5.3 s alone. Three side by side under 28 spinning loops
-    /// spent 19-20 s of 21-33 s in it, and a loaded whole-workspace run timed the tests at
-    /// 36.8-49.9 s. Each test images a DIFFERENT tree, so within one process there is
-    /// nothing to share; the work that repeats is the same image, run after run. With the
-    /// image filed here, the three take 0.63-0.81 s idle against 5.6-5.7 s, and 4.0-6.3 s
-    /// against 16.7-19.8 s inside the whole lib run under 14 spinning loops.
-    ///
-    /// A hit is byte for byte an image `hdiutil create` wrote with identical flags on
-    /// this OS build from a tree identical in every entry's path, kind, mode, contents
-    /// and link target (directories included). A fresh create here could still differ
-    /// only in metadata nothing downstream reads: hdiutil's own stamps (UUIDs, dates)
-    /// and the tree's times, owners and extended attributes (measured 2026-10-05: the
-    /// image carries each source entry's `com.apple.provenance` tag, which names the app
-    /// the laying process ran under). The lane (attach, pick, `ditto`, vet,
-    /// `tree_root`) and every assertion read names, kinds, modes, contents and link
-    /// targets only; nothing in install/store/tree/extract reads a time, an owner or an
-    /// xattr. A test that starts reading one of those off a staged dmg tree must fold it
-    /// into [`dmg_fixture_key`] first. The attach, copy, vet
-    /// and detach under test still run per test, on the test's own copy (two
-    /// byte-identical images attach and detach side by side, measured). The cached
-    /// entry itself is never attached, and an entry whose bytes no longer match its name
-    /// is dropped and made again. With no cache dir (a binary run from outside
-    /// `<target>/<profile>/deps/`), every call creates.
-    #[cfg(target_os = "macos")]
-    fn dmg_fixture(src: &Path, volname: &str, dmg: &Path) {
-        let cache =
-            dmg_fixture_cache().and_then(|dir| dmg_fixture_key(src, volname).map(|key| (dir, key)));
-        if let Some((dir, key)) = &cache
-            && let Some(hit) = dmg_fixture_hit(dir, key)
-            && std::fs::copy(&hit, dmg).is_ok()
-        {
-            return;
-        }
-        hdiutil_create(src, volname, dmg);
-        if let Some((dir, key)) = cache {
-            dmg_fixture_publish(&dir, &key, dmg);
-        }
-    }
-
-    /// `<target>/tmp/atpkg-dmg-fixtures`: cargo's test scratch dir (the
-    /// `CARGO_TARGET_TMPDIR` only integration tests are handed), found from this
-    /// binary's own `<target>/<profile>/deps/`. The cache lives and dies with the build
-    /// it serves (`targo clean`), never in the shared `$TMPDIR` the suite leaves as it
-    /// found it ([`crate::testdir`]).
-    #[cfg(target_os = "macos")]
-    fn dmg_fixture_cache() -> Option<PathBuf> {
-        let exe = std::env::current_exe().ok()?;
-        let deps = exe.parent()?;
-        if deps.file_name()? != "deps" {
-            return None;
-        }
-        Some(deps.parent()?.parent()?.join("tmp/atpkg-dmg-fixtures"))
-    }
-
-    /// What a fixture image is filed under: SHA-256 over the create argv (its two
-    /// paths left out), the mode of `src` and every entry under it ([`fold_fixture_tree`]),
-    /// and this OS build's `SystemVersion.plist`, so an OS update makes every image
-    /// again. `None` when the OS build cannot be read.
-    #[cfg(target_os = "macos")]
-    fn dmg_fixture_key(src: &Path, volname: &str) -> Option<String> {
-        use std::os::unix::ffi::OsStrExt as _;
-        use std::os::unix::fs::MetadataExt as _;
-        let os = std::fs::read("/System/Library/CoreServices/SystemVersion.plist").ok()?;
-        let mut h = aterm_digest::Sha256::new();
-        for arg in hdiutil_create_argv("<src>".as_ref(), volname.as_ref(), "<dmg>".as_ref()) {
-            fold_framed(&mut h, arg.as_bytes());
-        }
-        fold_framed(
-            &mut h,
-            &std::fs::symlink_metadata(src).unwrap().mode().to_le_bytes(),
-        );
-        fold_fixture_tree(src, src, &mut h);
-        fold_framed(&mut h, &os);
-        Some(aterm_codec::hex::encode_lower(&h.finalize()))
-    }
-
-    /// Every entry under `dir`, in path order: its path relative to `root`, its whole
-    /// `st_mode` (kind and permission bits) and its contents or link target, directories
-    /// included where `tree_root` leaves them out. That is all of the tree the dmg lane
-    /// and its assertions read; what else `-srcfolder` images is listed at [`dmg_fixture`].
-    #[cfg(target_os = "macos")]
-    fn fold_fixture_tree(root: &Path, dir: &Path, h: &mut aterm_digest::Sha256) {
-        use std::os::unix::ffi::OsStrExt as _;
-        use std::os::unix::fs::MetadataExt as _;
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .collect();
-        paths.sort();
-        for path in paths {
-            let meta = std::fs::symlink_metadata(&path).unwrap();
-            let body = if meta.is_symlink() {
-                std::fs::read_link(&path)
-                    .unwrap()
-                    .as_os_str()
-                    .as_bytes()
-                    .to_vec()
-            } else if meta.is_file() {
-                std::fs::read(&path).unwrap()
-            } else {
-                Vec::new()
-            };
-            fold_framed(h, path.strip_prefix(root).unwrap().as_os_str().as_bytes());
-            fold_framed(h, &meta.mode().to_le_bytes());
-            fold_framed(h, &body);
-            if meta.is_dir() {
-                fold_fixture_tree(root, &path, h);
-            }
-        }
-    }
-
-    /// One length-framed field, so no two different trees fold the same byte stream.
-    #[cfg(target_os = "macos")]
-    fn fold_framed(h: &mut aterm_digest::Sha256, field: &[u8]) {
-        h.update(u64::try_from(field.len()).unwrap().to_le_bytes());
-        h.update(field);
-    }
-
-    /// The entry filed under `key` (`<key>-<sha256>.dmg`) whose bytes still hash to the
-    /// sha256 its name carries. One that does not is removed, and the caller makes it
-    /// again.
-    #[cfg(target_os = "macos")]
-    fn dmg_fixture_hit(dir: &Path, key: &str) -> Option<PathBuf> {
-        let prefix = format!("{key}-");
-        for entry in std::fs::read_dir(dir).ok()?.flatten() {
-            let path = entry.path();
-            let Some(sha) = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_prefix(&prefix))
-                .and_then(|n| n.strip_suffix(".dmg"))
-            else {
-                continue;
-            };
-            if file_sha256(&path).is_ok_and(|got| got == sha) {
-                return Some(path);
-            }
-            let _ = std::fs::remove_file(&path);
-        }
-        None
-    }
-
-    /// File the image just made at `dmg` under `key`: copied to a part file of this
-    /// process's own, then renamed into place, so a reader only ever finds a whole
-    /// entry. Best effort: a cache that cannot be written costs the next run a create,
-    /// nothing else.
-    #[cfg(target_os = "macos")]
-    fn dmg_fixture_publish(dir: &Path, key: &str, dmg: &Path) {
-        let Ok(sha) = file_sha256(dmg) else {
-            return;
-        };
-        let part = dir.join(format!("{key}-{sha}.dmg.{}.part", std::process::id()));
-        let published = std::fs::create_dir_all(dir).is_ok()
-            && std::fs::copy(dmg, &part).is_ok()
-            && std::fs::rename(&part, dir.join(format!("{key}-{sha}.dmg"))).is_ok();
-        if !published {
-            let _ = std::fs::remove_file(&part);
-        }
-    }
 
     /// The `gh` archive shape as tar bytes: a versioned top-level directory to strip, an
     /// executable, a plain file, a nested one, a hardlink alias and an in-root symlink.
@@ -3299,68 +3112,6 @@ mod tests {
         }
     }
 
-    /// Detaches every disk image attached from under `dir` when it goes out of scope —
-    /// on EVERY path out of a test: an early `return`, an assertion panic, or success.
-    ///
-    /// It exists because the leak it cleans up OUTLIVES the process. A failed
-    /// `hdiutil attach` leaves the image's devices attached with nothing mounted on
-    /// them; until [`Mount`] learned to reclaim those, they survived until the machine
-    /// was rebooted or a human ran `hdiutil detach` by hand, and each one made the next
-    /// attach of the same image fail `Resource busy`.
-    #[cfg(target_os = "macos")]
-    struct DetachAll {
-        prefixes: Vec<PathBuf>,
-    }
-
-    #[cfg(target_os = "macos")]
-    impl DetachAll {
-        /// Guard everything attached from under `dir` — by the path as spelled and as
-        /// resolved, since `/var/folders/…` and `/private/var/folders/…` are the same
-        /// directory and `hdiutil` echoes whichever spelling it was handed.
-        fn over(dir: &Path) -> Self {
-            let mut prefixes = vec![dir.to_path_buf()];
-            match dir.canonicalize() {
-                Ok(c) if c != *dir => prefixes.push(c),
-                _ => {}
-            }
-            Self { prefixes }
-        }
-
-        /// The device nodes of every image `hdiutil info` still lists from under the
-        /// guarded directory. Never panics: it runs from `Drop`, which may itself be
-        /// running because an assertion already failed.
-        fn leaked(&self) -> Vec<PathBuf> {
-            let Ok(out) = std::process::Command::new("/usr/bin/hdiutil")
-                .arg("info")
-                .output()
-            else {
-                return Vec::new();
-            };
-            parse_hdiutil_info(&String::from_utf8_lossy(&out.stdout))
-                .into_iter()
-                .filter(|a| self.prefixes.iter().any(|p| a.image.starts_with(p)))
-                .map(|a| a.node)
-                .collect()
-        }
-
-        fn assert_clean(&self, what: &str) {
-            let leaked = self.leaked();
-            assert!(leaked.is_empty(), "{what}: still attached: {leaked:?}");
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    impl Drop for DetachAll {
-        fn drop(&mut self) {
-            for node in self.leaked() {
-                let _ = std::process::Command::new("/usr/bin/hdiutil")
-                    .args(["detach", "-force", "-quiet"])
-                    .arg(&node)
-                    .status();
-            }
-        }
-    }
-
     /// `hdiutil info`'s report, parsed: the block a FAILED attach leaves behind — the
     /// image attached, every entity mounted NOWHERE — is recognised as a carcass with a
     /// device node to eject, while an image mounted somewhere that is not our mount
@@ -3450,156 +3201,159 @@ image-alias     : /tmp/stage/bar.dmg
         );
     }
 
-    /// The `dmg` lane, for real: a tiny image built with `hdiutil create` ([`dmg_fixture`])
-    /// around a `Foo.app` (an executable, two internal symlinks, one of them a `..` climb
-    /// to the stage root and back, and the modes and ACL AT3 is about) beside the usual
-    /// `Applications` link and a README; the stage copies ONLY the bundle, keeps its
-    /// links, lays the row's `links`, detaches the image, and the root equals the walk of
-    /// a replica laid at the archive lanes' modes. Runs only where `hdiutil` exists (this
-    /// Mac); skips elsewhere.
-    ///
-    /// AT3 (2026-10-10): the image carries what survives an unprivileged `hdiutil create`
-    /// and `ditto` (measured that day): an owner-only `0600` file, a read-only `0400` one,
-    /// a world-writable `0666` one, a group-writable executable, a world-writable `0777`
-    /// directory, a group-writable `0775` `Contents`, and a file whose ACL lets everyone
-    /// write it. Each lands at `0644`/`0755` with no ACL, and the root a row signs is the
-    /// root of that sanitised tree. (`hdiutil` and an unprivileged `ditto` drop
-    /// setuid, setgid and sticky themselves; ditto run as root keeps the first two, and
-    /// [`dmg_copy_walk_gives_the_bundle_the_archive_lanes_modes`] feeds the walk those.)
-    ///
-    /// TWO real images, one per way the lane releases its mount, each its own test (an
-    /// `hdiutil create` + attach is seconds, so they run in parallel): this one is the
-    /// success path (the explicit detach after the copy);
-    /// [`a_dmg_with_no_app_is_refused_and_detached`] is an image with no `.app` (the
-    /// picker refuses before the copy, so the guard's `Drop` detaches). The picker's other
-    /// refusals and the link rule's other shapes are pure functions of a directory, proved
-    /// without an image by [`dmg_picker_refuses_anything_but_exactly_one_real_app`] and
+    /// The bytes of an image a [`StandIn`] stands in for: the row's digest is over them, and
+    /// no arm reads them.
+    #[cfg(target_os = "macos")]
+    fn stand_in_bytes(_src: &Path, image: &Path) -> std::io::Result<()> {
+        std::fs::write(image, b"a scratch folder stands in for this image")
+    }
+
+    /// A scratch folder standing in for a mounted disk image ([`attach_image`]): `root` is
+    /// what the stage reads as the image's root, and its release is written to `log`:
+    /// `detach` for the stage's explicit one, `dropped` for its guard's on an error path.
+    #[cfg(target_os = "macos")]
+    struct StandIn {
+        root: PathBuf,
+        log: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        released: bool,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Attached for StandIn {
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        fn detach(&mut self) -> Result<(), StageError> {
+            self.released = true;
+            self.log.borrow_mut().push("detach");
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for StandIn {
+        fn drop(&mut self) {
+            if !self.released {
+                self.log.borrow_mut().push("dropped");
+            }
+        }
+    }
+
+    /// Run `f` with every image this thread attaches stood in for by the folder `root`
+    /// ([`StandIn`]): what `f` answered, and each attach and release in order.
+    #[cfg(target_os = "macos")]
+    fn standing_in<R>(root: &Path, f: impl FnOnce() -> R) -> (R, Vec<&'static str>) {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (root, arm_log) = (root.to_path_buf(), std::rc::Rc::clone(&log));
+        let out = image_arm::with(
+            Box::new(move |_, _| {
+                arm_log.borrow_mut().push("attach");
+                Ok(Box::new(StandIn {
+                    root: root.clone(),
+                    log: std::rc::Rc::clone(&arm_log),
+                    released: false,
+                }))
+            }),
+            f,
+        );
+        let events = log.borrow().clone();
+        (out, events)
+    }
+
+    /// The `dmg` lane over a scratch folder standing in for the mounted image
+    /// ([`standing_in`]; a default test run attaches no disk image, [`attach_image`]):
+    /// around [`foo_app_image`]'s `Foo.app`, the stage copies ONLY the bundle, keeps its
+    /// links, lays the row's `links`, gives every file the archive lanes' mode and no ACL,
+    /// releases the image explicitly once the copy is vetted, and the root equals the walk
+    /// of the replica. The same stage of a real image, attach and detach included, is
+    /// the explicit `dmg_acceptance` bench. The picker's other refusals
+    /// and the link rule's other shapes are pure functions of a directory, proved by
+    /// [`dmg_picker_refuses_anything_but_exactly_one_real_app`] and
     /// [`dmg_link_vet_admits_an_in_root_climb_and_refuses_an_escape`].
     #[cfg(target_os = "macos")]
     #[test]
     fn dmg_app_payload_stages_the_single_app_and_its_links() {
-        use std::os::unix::fs::PermissionsExt as _;
-        if !Path::new("/usr/bin/hdiutil").exists() || !Path::new("/usr/bin/ditto").exists() {
-            eprintln!("skipping: hdiutil/ditto not available");
-            return;
-        }
-        /// Resources -> Contents -> Foo.app -> the stage root, then back down to the binary.
-        const UP: &str = "../../../Foo.app/Contents/MacOS/foo";
-        /// The ACL entry the image's `acl` file carries, and that file's contents, so the
-        /// fixture key ([`dmg_fixture_key`], which reads no ACL) still names it.
-        const ACE: &str = "everyone allow write";
-        /// `(path, contents, mode on the image, mode staged)`.
-        const FILES: &[(&str, &[u8], u32, u32)] = &[
-            (
-                "Foo.app/Contents/MacOS/foo",
-                b"#!/bin/sh\necho foo\n",
-                0o755,
-                0o755,
-            ),
-            ("Foo.app/Contents/Info.plist", b"<plist/>", 0o644, 0o644),
-            ("Foo.app/Contents/Resources/secret", b"s", 0o600, 0o644),
-            ("Foo.app/Contents/Resources/sealed", b"r", 0o400, 0o644),
-            ("Foo.app/Contents/Resources/shared", b"w", 0o666, 0o644),
-            (
-                "Foo.app/Contents/Resources/acl",
-                ACE.as_bytes(),
-                0o644,
-                0o644,
-            ),
-            (
-                "Foo.app/Contents/Plugins/helper",
-                b"#!/bin/sh\n",
-                0o775,
-                0o755,
-            ),
-        ];
-        /// `(directory, mode on the image)`; every one is staged `0755`.
-        const DIRS: &[(&str, u32)] = &[
-            ("Foo.app/Contents/Plugins", 0o777),
-            ("Foo.app/Contents", 0o775),
-            ("Foo.app", 0o700),
-        ];
         let d = tmp("vendor-dmg");
-        // Armed BEFORE the first image exists, dropped after the last assertion: an
-        // assertion that fires half way through must not leave an image attached.
-        let leaks = DetachAll::over(&d);
-        let src = d.join("src");
-        for (rel, body, mode, _) in FILES {
-            lay(&src, rel, body, *mode);
-        }
-        for (rel, mode) in DIRS {
-            std::fs::set_permissions(src.join(rel), std::fs::Permissions::from_mode(*mode))
-                .unwrap();
-        }
-        add_acl(&src.join("Foo.app/Contents/Resources/acl"), ACE);
-        assert!(
-            has_acl(&src.join("Foo.app/Contents/Resources/acl")),
-            "the image's file carries the ACL under test"
-        );
-        lay_link(&src, "Foo.app/Contents/current", "MacOS/foo");
-        // A `..` climb to the stage root and back into the bundle (frameworks do that):
-        // it must survive `hdiutil` + `ditto` byte for byte, pass the vet, and be swapped in.
-        lay_link(&src, "Foo.app/Contents/Resources/up", UP);
-        lay(&src, "README.txt", b"not copied", 0o644);
-        lay_link(&src, "Applications", "/Applications");
-        let dmg = d.join("foo.dmg");
-        dmg_fixture(&src, "FooTest", &dmg);
-
-        let replica = d.join("replica");
-        for (rel, body, _, staged) in FILES {
-            lay(&replica, rel, body, *staged);
-        }
-        lay_link(&replica, "Foo.app/Contents/current", "MacOS/foo");
-        lay_link(&replica, "Foo.app/Contents/Resources/up", UP);
-        lay_link(&replica, "bin/foo", "../Foo.app/Contents/MacOS/foo");
-        let expected = tree_root(&replica).unwrap();
-
-        let mut art = vendor_artifact(&dmg, "dmg", &expected);
-        art.links
-            .insert("foo".into(), "Foo.app/Contents/MacOS/foo".into());
+        let (src, dmg) = (d.join("src"), d.join("foo.dmg"));
+        let art = foo_app_image(&d, &src, &dmg, stand_in_bytes).unwrap();
         let build = d.join("store/foo/2026082601");
+        let (staged, events) = standing_in(&src, || {
+            verify_and_stage(&art, &dmg, &build, &StageHooks::NONE)
+        });
         // The signed root is the sanitized replica's: only the bundle copied, its links
         // (the `..` climb included) laid verbatim, every file at the archive lanes' mode.
-        verify_and_stage(&art, &dmg, &build, &StageHooks::NONE).unwrap();
+        staged.unwrap();
         assert!(
             !has_acl(&build.join("Foo.app/Contents/Resources/acl")),
             "no ACL on the image reaches the store"
         );
-        // The mount point (`<build>.incoming-<pid>.mnt`) is gone and the image is detached.
-        let mounts: Vec<_> = std::fs::read_dir(build.parent().unwrap())
-            .unwrap()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".mnt"))
-            .collect();
-        assert!(mounts.is_empty(), "no mount point left behind: {mounts:?}");
-        leaks.assert_clean("the image must be detached");
+        assert_eq!(events, ["attach", "detach"], "released once, explicitly");
     }
 
-    /// An image with no `.app` at the root: refused by the picker, detached by the
-    /// guard's `Drop`, nothing staged. (Two apps is the same refusal from the same
-    /// picker; see [`dmg_picker_refuses_anything_but_exactly_one_real_app`].)
+    /// An image with no `.app` at the root, over a stand-in folder: refused by the picker,
+    /// released by the guard's `Drop`, nothing staged. (Two apps is the same refusal from
+    /// the same picker; see [`dmg_picker_refuses_anything_but_exactly_one_real_app`].) The
+    /// real image's refusal and detach runs in the explicit `dmg_acceptance` bench.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_dmg_with_no_app_is_refused_and_detached() {
-        if !Path::new("/usr/bin/hdiutil").exists() || !Path::new("/usr/bin/ditto").exists() {
-            eprintln!("skipping: hdiutil/ditto not available");
-            return;
-        }
         let d = tmp("vendor-dmg-none");
-        // Armed BEFORE the image exists, dropped after the last assertion.
-        let leaks = DetachAll::over(&d);
-        let label = "none";
-        let src2 = d.join(format!("src-{label}"));
-        lay(&src2, "README.txt", b"r", 0o644);
-        let dmg2 = d.join(format!("{label}.dmg"));
-        dmg_fixture(&src2, "Bad", &dmg2);
-        let art = vendor_artifact(&dmg2, "dmg", &tree_root(&src2).unwrap());
-        let build2 = d.join(format!("store/{label}/1"));
-        let err = verify_and_stage(&art, &dmg2, &build2, &StageHooks::NONE).unwrap_err();
-        assert!(matches!(err, StageError::Payload(_)), "{label}: {err:?}");
-        assert!(!build2.exists(), "{label}");
-        assert!(scratch_beside(&build2).is_empty(), "{label}");
-        leaks.assert_clean(&format!("{label}: detached on the error path"));
+        let src = d.join("src-none");
+        lay(&src, "README.txt", b"r", 0o644);
+        let dmg = d.join("none.dmg");
+        stand_in_bytes(&src, &dmg).unwrap();
+        let art = vendor_artifact(&dmg, "dmg", &tree_root(&src).unwrap());
+        let build = d.join("store/none/1");
+        let (staged, events) = standing_in(&src, || {
+            verify_and_stage(&art, &dmg, &build, &StageHooks::NONE)
+        });
+        let err = staged.unwrap_err();
+        assert!(matches!(err, StageError::DmgAppCount(0)), "{err:?}");
+        assert!(!build.exists());
+        assert!(scratch_beside(&build).is_empty());
+        assert_eq!(events, ["attach", "dropped"], "released on the error path");
+    }
+
+    /// A bundle with a link out of the stage, over a stand-in folder: the copy is made, the
+    /// stage's post-copy vet refuses it naming the link, the image is released once and
+    /// nothing is staged. (The link rule's other shapes are
+    /// [`dmg_link_vet_admits_an_in_root_climb_and_refuses_an_escape`].)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_dmg_whose_bundle_links_out_is_refused_naming_the_link_and_released() {
+        let d = tmp("vendor-dmg-escape");
+        let src = d.join("src-escape");
+        lay(
+            &src,
+            "Bad.app/Contents/MacOS/x",
+            b"#!/bin/sh\nexit 0\n",
+            0o755,
+        );
+        lay_link(
+            &src,
+            "Bad.app/Contents/Resources/out",
+            "../../../../outside",
+        );
+        let dmg = d.join("escape.dmg");
+        stand_in_bytes(&src, &dmg).unwrap();
+        let art = vendor_artifact(&dmg, "dmg", &tree_root(&src).unwrap());
+        let build = d.join("store/escape/1");
+        let (staged, events) = standing_in(&src, || {
+            verify_and_stage(&art, &dmg, &build, &StageHooks::NONE)
+        });
+        match staged {
+            Err(StageError::Extract(ExtractError::Rejected(_, link))) => {
+                assert_eq!(link, Path::new("Bad.app/Contents/Resources/out"));
+            }
+            other => panic!("the vet refuses the link: {other:?}"),
+        }
+        assert!(!build.exists());
+        assert!(scratch_beside(&build).is_empty());
+        assert!(
+            matches!(events.as_slice(), ["attach", "detach" | "dropped"]),
+            "released exactly once: {events:?}"
+        );
     }
 
     /// The dmg lane's `.app` picker over a plain directory — the rule a mounted image's
@@ -3626,7 +3380,10 @@ image-alias     : /tmp/stage/bar.dmg
             }
             lay(&root, "README.txt", b"r", 0o644);
             let err = single_app_in(&root).unwrap_err();
-            assert!(matches!(err, StageError::Payload(_)), "{label}: {err:?}");
+            assert!(
+                matches!(err, StageError::DmgAppCount(count) if count == apps.len()),
+                "{label}: {err:?}"
+            );
         }
     }
 
@@ -3905,14 +3662,24 @@ image-alias     : /tmp/stage/bar.dmg
         // ordered (the tree's and each file's own flush is a plain `fsync(2)`, which the
         // seam does not see): the marker down before the old tree moves aside, the
         // sidecars before `.ready`, and `.ready`'s name before what follows. A lost step
-        // reads as incomplete and the next pass stages again.
+        // reads as incomplete and the next pass stages again. Windows opens no directory to
+        // flush, and each file's own flush is `aterm_durable::durable_data`, which the seam
+        // sees: the tree's one file, the declared-mode record (Windows keeps one), the
+        // sidecar and the marker, each durable.
         let recording = aterm_durable::seam::Recording::start();
         let root = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap();
-        assert_eq!(
-            recording.take(),
-            [aterm_durable::Flush::Ordered; 3],
-            "the swap's unmark, the sidecars, the marker"
-        );
+        let (flushes, what): (&[aterm_durable::Flush], &str) = if cfg!(windows) {
+            (
+                &[aterm_durable::Flush::Durable; 4],
+                "the tree's file, the declared modes, the sidecar, the marker",
+            )
+        } else {
+            (
+                &[aterm_durable::Flush::Ordered; 3],
+                "the swap's unmark, the sidecars, the marker",
+            )
+        };
+        assert_eq!(recording.take(), flushes, "{what}");
         drop(recording);
         assert_eq!(root, b.art.tree_root, "the verified root comes back");
         assert_eq!(*seen.borrow(), ["pre_swap", "sidecars"]);

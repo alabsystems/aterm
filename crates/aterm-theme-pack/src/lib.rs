@@ -20,7 +20,8 @@
 //! once [`install`] has copied its file into the themes folder, through the
 //! one atomic writer every theme file goes through
 //! (`aterm_types::scheme_install::write_atomically`). `aterm theme pack`,
-//! `aterm theme install` and Settings ▸ Themes ▸ Get More are the front doors.
+//! `aterm theme install` and Keep on a Settings ▸ Themes ▸ Community row
+//! are the front doors.
 
 mod policy;
 
@@ -85,19 +86,25 @@ pub fn themes() -> &'static [PackTheme] {
 
 /// The pack theme `id` names, ignoring ASCII case (as the catalog does).
 #[must_use]
+#[allow(clippy::manual_find)]
 pub fn find(id: &str) -> Option<&'static PackTheme> {
-    THEMES
-        .iter()
-        .find(|theme| theme.id.eq_ignore_ascii_case(id))
+    for theme in THEMES {
+        if theme.id.eq_ignore_ascii_case(id) {
+            return Some(theme);
+        }
+    }
+    None
 }
 
 /// The text of the licence file `file` (`LICENSES/…`), if the pack has it.
 #[must_use]
 pub fn licence_text(file: &str) -> Option<&'static str> {
-    LICENCES
-        .iter()
-        .find(|(name, _)| *name == file)
-        .map(|(_, text)| *text)
+    for &(name, text) in LICENCES {
+        if name == file {
+            return Some(text);
+        }
+    }
+    None
 }
 
 /// Every licence file the pack embeds, `(path, text)`, sorted by path.
@@ -112,15 +119,80 @@ pub fn collection() -> &'static Collection {
     &COLLECTION
 }
 
+impl PackTheme {
+    /// Return `true` when this theme declares a companion theme for the opposite appearance.
+    #[must_use]
+    pub const fn has_pair(&self) -> bool {
+        self.pair.is_some()
+    }
+
+    /// Return the number of licence files carried by this theme.
+    #[must_use]
+    pub const fn licence_file_count(&self) -> usize {
+        self.licence_files.len()
+    }
+}
+
+/// Encode a theme pack entry summary (`id_hash`, `text_len`, `licence_count`) into 16 LE bytes.
+#[must_use]
+pub const fn encode_theme_descriptor_le(
+    id_hash: u64,
+    text_len: u32,
+    licence_count: u32,
+) -> [u8; 16] {
+    [
+        id_hash as u8,
+        (id_hash >> 8) as u8,
+        (id_hash >> 16) as u8,
+        (id_hash >> 24) as u8,
+        (id_hash >> 32) as u8,
+        (id_hash >> 40) as u8,
+        (id_hash >> 48) as u8,
+        (id_hash >> 56) as u8,
+        text_len as u8,
+        (text_len >> 8) as u8,
+        (text_len >> 16) as u8,
+        (text_len >> 24) as u8,
+        licence_count as u8,
+        (licence_count >> 8) as u8,
+        (licence_count >> 16) as u8,
+        (licence_count >> 24) as u8,
+    ]
+}
+
+/// Decode 16 LE bytes into a theme pack entry summary (`id_hash`, `text_len`, `licence_count`).
+#[must_use]
+pub const fn decode_theme_descriptor_le(bytes: [u8; 16]) -> (u64, u32, u32) {
+    let id_hash = (bytes[0] as u64)
+        | ((bytes[1] as u64) << 8)
+        | ((bytes[2] as u64) << 16)
+        | ((bytes[3] as u64) << 24)
+        | ((bytes[4] as u64) << 32)
+        | ((bytes[5] as u64) << 40)
+        | ((bytes[6] as u64) << 48)
+        | ((bytes[7] as u64) << 56);
+    let text_len = (bytes[8] as u32)
+        | ((bytes[9] as u32) << 8)
+        | ((bytes[10] as u32) << 16)
+        | ((bytes[11] as u32) << 24);
+    let licence_count = (bytes[12] as u32)
+        | ((bytes[13] as u32) << 8)
+        | ((bytes[14] as u32) << 16)
+        | ((bytes[15] as u32) << 24);
+    (id_hash, text_len, licence_count)
+}
+
 /// The licence file for a built-in port's source `project`: by the build's
 /// rule, `LICENSES/<spdx>-<repo>.txt`, checked to exist and embedded at build
 /// time for every built-in's source.
 #[must_use]
 pub fn port_licence_file(project: &str) -> Option<&'static str> {
-    PORTS
-        .iter()
-        .find(|(name, _)| *name == project)
-        .map(|(_, file)| *file)
+    for &(name, file) in PORTS {
+        if name == project {
+            return Some(file);
+        }
+    }
+    None
 }
 
 /// The Apache-2.0 short notice a copy carries in place of the whole licence.
@@ -135,23 +207,35 @@ const APACHE_NOTICE: [&str; 6] = [
 
 /// The copyright lines of a licence text, without the appendix's
 /// `Copyright [yyyy] [name of copyright owner]` template.
-fn copyright_lines(licence: &str) -> impl Iterator<Item = &str> {
-    licence.lines().map(str::trim).filter(|line| {
-        line.starts_with("Copyright") && !line.contains("[yyyy]") && !line.contains("[name of")
-    })
+fn copyright_lines(licence: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    for raw in licence.lines() {
+        let line = raw.trim();
+        if line.starts_with("Copyright") && !line.contains("[yyyy]") && !line.contains("[name of") {
+            out.push(line);
+        }
+    }
+    out
 }
 
 /// The notice a file under `spdx` carries for `licence` (the licence file's
 /// text): the whole text for a notice-carrying licence, else (Apache-2.0)
 /// the copyright lines and the short notice.
 fn notice_lines(spdx: &str, licence: &str) -> Vec<String> {
+    let mut out = Vec::new();
     if policy::notice_is_whole_text(spdx) {
-        return licence.lines().map(str::to_string).collect();
+        for line in licence.lines() {
+            out.push(line.to_string());
+        }
+        return out;
     }
-    copyright_lines(licence)
-        .map(str::to_string)
-        .chain(APACHE_NOTICE.iter().map(|line| (*line).to_string()))
-        .collect()
+    for line in copyright_lines(licence) {
+        out.push(line.to_string());
+    }
+    for line in APACHE_NOTICE {
+        out.push(line.to_string());
+    }
+    out
 }
 
 /// The pack's file for `theme`, generated from `upstream_text` (the
@@ -170,8 +254,10 @@ pub fn derive(
     licences: &[&str],
     collection_licence: &str,
 ) -> Result<String, String> {
-    let mut report = scheme_import::convert(ImportFormat::Ghostty, upstream_text, None)
-        .map_err(|error| format!("{}: {error}", theme.upstream))?;
+    let mut report = match scheme_import::convert(ImportFormat::Ghostty, upstream_text, None) {
+        Ok(r) => r,
+        Err(error) => return Err(format!("{}: {error}", theme.upstream)),
+    };
     report.scheme.name = theme.id.to_string();
     report.author = Some(theme.author.to_string());
     report.description = Some(format!(
@@ -215,17 +301,21 @@ pub fn derive(
     for licence in licences {
         header.push(String::new());
         let lines = notice_lines(theme.licence, licence);
-        if !policy::notice_is_whole_text(theme.licence) && copyright_lines(licence).next().is_none()
-        {
+        if !policy::notice_is_whole_text(theme.licence) && copyright_lines(licence).is_empty() {
             header.push(format!("Copyright {}", theme.author));
         }
         header.extend(lines);
     }
     header.push(String::new());
     header.push("The iTerm2-Color-Schemes collection:".to_string());
-    header.extend(collection_licence.lines().map(str::to_string));
-    let header: Vec<&str> = header.iter().map(String::as_str).collect();
-    let text = report.to_native_conf(&header);
+    for line in collection_licence.lines() {
+        header.push(line.to_string());
+    }
+    let mut header_refs = Vec::with_capacity(header.len());
+    for line in &header {
+        header_refs.push(line.as_str());
+    }
+    let text = report.to_native_conf(&header_refs);
 
     let expected = ParsedTheme::colours_only(
         report.scheme.clone(),
@@ -251,12 +341,26 @@ pub fn derive(
 /// `# <line>` comment line.
 #[must_use]
 pub fn carries_notice(text: &str, spdx: &str, licence: &str) -> bool {
-    let mut comments = text.lines().filter_map(|line| line.strip_prefix("# "));
-    notice_lines(spdx, licence)
-        .iter()
-        .map(|line| line.trim_end())
-        .filter(|line| !line.trim().is_empty())
-        .all(|wanted| comments.any(|line| line == wanted))
+    let mut comments = text.lines();
+    for raw in notice_lines(spdx, licence) {
+        let wanted = raw.trim_end();
+        if wanted.trim().is_empty() {
+            continue;
+        }
+        let mut found = false;
+        for line in &mut comments {
+            if let Some(comment) = line.strip_prefix("# ")
+                && comment == wanted
+            {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return false;
+        }
+    }
+    true
 }
 
 /// Where a pack theme stands in a themes folder.
@@ -292,12 +396,21 @@ pub fn state_in(dir: &Path, theme: &PackTheme) -> PackState {
 }
 
 /// What [`install`] did.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub enum PackInstall {
     /// Wrote the pack's file here.
     Wrote(PathBuf),
     /// The pack's file was already here, unchanged.
     Unchanged(PathBuf),
+}
+
+impl PartialEq for PackInstall {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Wrote(a), Self::Wrote(b)) | (Self::Unchanged(a), Self::Unchanged(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// Copy `theme`'s file into the themes folder `dir` (`None`: none could be
@@ -326,14 +439,13 @@ pub fn install(
             "no themes folder: neither XDG_CONFIG_HOME, APPDATA nor HOME is set".to_string(),
         ));
     };
-    if let Some(builtin) = scheme::builtin_names()
-        .into_iter()
-        .find(|builtin| builtin.eq_ignore_ascii_case(theme.id))
-    {
-        return Err(InstallError::Refused(format!(
-            "{:?} is the built-in theme {builtin:?}",
-            theme.id
-        )));
+    for builtin in scheme::builtin_names() {
+        if builtin.eq_ignore_ascii_case(theme.id) {
+            return Err(InstallError::Refused(format!(
+                "{:?} is the built-in theme {builtin:?}",
+                theme.id
+            )));
+        }
     }
     let dest = dir.join(format!("{}.conf", theme.id));
     match state_in(dir, theme) {
@@ -351,7 +463,12 @@ pub fn install(
             theme.id
         )));
     }
-    scheme_install::write_atomically(dir, &dest, theme.id, theme.text.as_bytes(), replace)?;
+    #[allow(clippy::question_mark)]
+    if let Err(err) =
+        scheme_install::write_atomically(dir, &dest, theme.id, theme.text.as_bytes(), replace)
+    {
+        return Err(err);
+    }
     Ok(PackInstall::Wrote(dest))
 }
 
@@ -377,15 +494,31 @@ pub fn notices() -> String {
          Each palette belongs to its author:\n",
         COLLECTION.repo, COLLECTION.commit, COLLECTION.licence_file
     );
-    let mut projects: Vec<&str> = THEMES.iter().map(|theme| theme.project).collect();
-    projects.sort_by_key(|project| project.to_ascii_lowercase());
-    projects.dedup();
+    let mut keyed_projects: Vec<(String, &str)> = Vec::with_capacity(THEMES.len());
+    for theme in THEMES {
+        keyed_projects.push((theme.project.to_ascii_lowercase(), theme.project));
+    }
+    keyed_projects.sort_unstable();
+    let mut projects: Vec<&str> = Vec::with_capacity(keyed_projects.len());
+    for (_, project) in keyed_projects {
+        if projects.last() != Some(&project) {
+            projects.push(project);
+        }
+    }
     for project in projects {
-        let members: Vec<&PackTheme> = THEMES.iter().filter(|t| t.project == project).collect();
-        let Some(first) = members.first() else {
+        let mut first: Option<&PackTheme> = None;
+        let mut ids: Vec<&str> = Vec::new();
+        for t in THEMES {
+            if t.project == project {
+                if first.is_none() {
+                    first = Some(t);
+                }
+                ids.push(t.id);
+            }
+        }
+        let Some(first) = first else {
             continue;
         };
-        let ids: Vec<&str> = members.iter().map(|t| t.id).collect();
         let _ = writeln!(
             out,
             "- {project} by {} ({}; {}): {}\n  {}",
@@ -402,12 +535,16 @@ pub fn notices() -> String {
         let Some(source) = builtin.source else {
             continue;
         };
-        match sources
-            .iter_mut()
-            .find(|(s, _)| s.project == source.project)
-        {
-            Some((_, names)) => names.push(builtin.name),
-            None => sources.push((source, vec![builtin.name])),
+        let mut pushed = false;
+        for (s, names) in &mut sources {
+            if s.project == source.project {
+                names.push(builtin.name);
+                pushed = true;
+                break;
+            }
+        }
+        if !pushed {
+            sources.push((source, vec![builtin.name]));
         }
     }
     for (source, names) in &sources {

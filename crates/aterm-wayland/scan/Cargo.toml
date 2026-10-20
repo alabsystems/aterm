@@ -7,8 +7,9 @@
 # modules it writes do not: it reads ../protocols/*.xml and writes
 # ../src/protocols/. It depends on nothing. From this directory:
 #   targo --unverified run --release
-# aterm-wayland's tests/generated.rs compiles the same generate.rs and xml.rs
-# and holds the committed modules to a fresh run.
+# aterm-wayland's test binary (tests/wayland_suite.rs) compiles the same
+# generate.rs and xml.rs, and its tests/generated.rs holds the committed
+# modules to a fresh run.
 [package]
 name = "aterm-wayland-scan"
 version = "0.0.0"

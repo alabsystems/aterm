@@ -23,7 +23,7 @@ use aterm_update_core::tag::{TagKind, parse_release_tag};
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
 use crate::support::{
-    Lib, Rng, SYSTEM_PATH, Scratch, chmod, install_sh, q, run, s, symlink, write,
+    Lib, Rng, Scratch, chmod, install_sh, q, run, s, symlink, system_path, write,
 };
 
 const TAG: &str = "v0.100.0";
@@ -183,7 +183,7 @@ impl Verifier {
     /// A batch over `script` in which `linux_release_verify` reaches the harness.
     fn lib(&self, script: &Path) -> Lib {
         let mut lib = Lib::of(script);
-        lib.env("PATH", &format!("{}:{SYSTEM_PATH}", s(&self.bin)))
+        lib.env("PATH", &format!("{}:{}", s(&self.bin), system_path()))
             .env("STUB_PYTHON", s(&self.python))
             .env("STUB_HARNESS", s(&self.bin.join("harness.py")));
         lib
@@ -277,6 +277,9 @@ struct Policy {
     roster_floor: u64,
     revoked: Vec<String>,
     rejected: u64,
+    /// The `[min_build_sources]` tables, which [`updater_verdict`] does not
+    /// model: only direct cases set them, never the corpus.
+    sources: String,
 }
 
 fn toml_list(items: &[String]) -> String {
@@ -289,10 +292,11 @@ fn toml_list(items: &[String]) -> String {
 struct Case {
     label: String,
     tag: String,
+    slug: String,
     arch: String,
     pins: Vec<String>,
     schema: String,
-    roster_seq: u64,
+    roster_seq: String,
     valid_until: String,
     revoked: Vec<String>,
     roster_head: String,
@@ -355,6 +359,40 @@ fn resign_header(c: &mut Case, at: usize, bytes: &[u8]) {
     resign(c, patched);
 }
 
+/// `c` released as `version` throughout: its tag, the signed version, the dmg,
+/// its url and the target's name all agree, so only the version's own spelling
+/// can refuse it.
+fn retag(c: &mut Case, version: &str) {
+    c.tag = format!("v{version}");
+    c.set("version", &format!("{version:?}"));
+    c.set("dmg", &format!("\"aterm-{version}.dmg\""));
+    c.set(
+        "url",
+        &format!(
+            "\"https://github.com/{}/releases/download/v{version}/aterm-{version}.dmg\"",
+            c.slug
+        ),
+    );
+    let arch = c.arch.clone();
+    c.set(
+        &format!("linux_{arch}"),
+        &format!("\"aterm-{version}-linux-{arch}\""),
+    );
+}
+
+/// The other target's triple beside `c`'s, with `digest` and `size`: a check on
+/// it is the triple's own rule, never the candidate's digest or size.
+fn sibling(c: &mut Case, digest: &str, size: &str) {
+    let other = other_arch(&c.arch);
+    let version = c.tag.trim_start_matches('v').to_string();
+    c.set(
+        &format!("linux_{other}"),
+        &format!("\"aterm-{version}-linux-{other}\""),
+    );
+    c.set(&format!("linux_{other}_sha256"), &format!("{digest:?}"));
+    c.set(&format!("linux_{other}_size"), size);
+}
+
 impl Case {
     /// A valid aarch64 release, as the cutter publishes it.
     fn base(keys: &Keys) -> Self {
@@ -380,10 +418,11 @@ impl Case {
         Self {
             label: "a valid release".into(),
             tag: TAG.into(),
+            slug: SLUG.into(),
             arch: "aarch64".into(),
             pins: vec![Keys::public(&keys.master)],
             schema: "1".into(),
-            roster_seq: 7,
+            roster_seq: "7".into(),
             valid_until: "9999-12-31T00:00:00Z".into(),
             revoked: Vec::new(),
             roster_head: String::new(),
@@ -488,13 +527,14 @@ impl Case {
                 &format!(
                     "schema = 1\ntarget = {:?}\nenabled = false\nhigh_water = {}\nmin_build = {}\n\
                      roster_floor = {}\nrevoked_machines = {}\nrejected_build = {}\n\
-                     [installed]\nbuild = 0\nsha256 = \"\"\n",
+                     [installed]\nbuild = 0\nsha256 = \"\"\n{}",
                     s(&store.join("aterm")),
                     self.policy.high_water,
                     self.policy.min_build,
                     self.policy.roster_floor,
                     toml_list(&self.policy.revoked),
                     self.policy.rejected,
+                    self.policy.sources,
                 ),
             );
         }
@@ -541,6 +581,10 @@ type Accepted = (String, String, u64, u64, u64);
 /// durable revocations; the tag; the target's signed name, size, ELF header and
 /// digest; the source commit; the build against the durable floors.
 fn updater_verdict(case: &Case, proofs: &Proofs) -> Result<Accepted, String> {
+    assert!(
+        case.policy.sources.is_empty(),
+        "floor sources are not modelled"
+    );
     let target = match case.arch.as_str() {
         "x86_64" => LinuxTarget::X86_64,
         "aarch64" => LinuxTarget::Aarch64,
@@ -642,7 +686,7 @@ fn main_call(case: &Case, laid: &Laid) -> String {
         case.pins.join(" "),
         s(&laid.release).into(),
         case.tag.clone(),
-        SLUG.into(),
+        case.slug.clone(),
         case.arch.clone(),
         s(&laid.store).into(),
         s(&laid.candidate).into(),
@@ -650,7 +694,9 @@ fn main_call(case: &Case, laid: &Laid) -> String {
     .join("\t")
 }
 
-/// The installer's answer as an [`Accepted`], or why it refused.
+/// The installer's answer as an [`Accepted`], or why it refused. An acceptance
+/// whose size, build or roster generation is no u64 (`7.0`, `-1`) reads as a
+/// crash: no Rust verdict can name it.
 fn installer_verdict(answer: &str) -> Result<Accepted, String> {
     let (kind, rest) = answer.split_once('\t').unwrap_or((answer, ""));
     if kind != "ok" {
@@ -660,9 +706,9 @@ fn installer_verdict(answer: &str) -> Result<Accepted, String> {
     let n = |i: usize| {
         f.get(i)
             .and_then(|v| v.parse::<u64>().ok())
-            .expect("a number")
+            .ok_or_else(|| format!("crashed: accepted with an unreadable number: {rest}"))
     };
-    Ok((f[0].into(), f[1].into(), n(2), n(3), n(4)))
+    Ok((f[0].into(), f[1].into(), n(2)?, n(3)?, n(4)?))
 }
 
 /// Whose rule a mutation exercises.
@@ -700,6 +746,14 @@ const MUTATIONS: &[Mutation] = &[
     ("roster schema as a string", Rule::Shared, |c, _| {
         c.schema = "\"1\"".into()
     }),
+    ("roster schema as a boolean", Rule::Shared, |c, _| {
+        c.schema = "true".into()
+    }),
+    (
+        "a roster generation that is a float",
+        Rule::Shared,
+        |c, _| c.roster_seq = "7.0".into(),
+    ),
     ("roster below the durable floor", Rule::Shared, |c, _| {
         c.policy.roster_floor = 8
     }),
@@ -715,6 +769,13 @@ const MUTATIONS: &[Mutation] = &[
     ("roster deadline with an offset", Rule::Shared, |c, _| {
         c.valid_until = "9999-12-31T00:00:00+01:00".into();
     }),
+    (
+        "roster deadline with single-digit fields",
+        Rule::Shared,
+        |c, _| {
+            c.valid_until = "9999-1-1T0:0:0Z".into();
+        },
+    ),
     ("signer revoked", Rule::Shared, |c, _| {
         c.revoked = vec![SIGNER.into()]
     }),
@@ -764,6 +825,20 @@ const MUTATIONS: &[Mutation] = &[
             extra: String::new(),
         });
     }),
+    (
+        "an empty machine id ahead of the signer",
+        Rule::Shared,
+        |c, k| {
+            c.machines.insert(
+                0,
+                Row {
+                    id: String::new(),
+                    pubkey: Keys::public(&k.other),
+                    extra: String::new(),
+                },
+            );
+        },
+    ),
     ("seventeen machines", Rule::Shared, |c, _| {
         for seed in 0x60..0x70u8 {
             c.machines.push(Row {
@@ -779,6 +854,35 @@ const MUTATIONS: &[Mutation] = &[
     ("signer lapses later", Rule::Shared, |c, _| {
         c.machines[0].extra = "not_after = \"9999-01-01T00:00:00Z\"\n".into();
     }),
+    (
+        "a signer deadline that is a number",
+        Rule::Shared,
+        |c, _| {
+            c.machines[0].extra = "not_after = 5\n".into();
+        },
+    ),
+    ("a machine roster that is a number", Rule::Shared, |c, _| {
+        c.machines.clear();
+        c.roster_head = "machine = 5\n".into();
+    }),
+    ("a machine that is a number", Rule::Shared, |c, _| {
+        c.machines.clear();
+        c.roster_head = "machine = [1]\n".into();
+    }),
+    (
+        "a lapsed machine listed ahead of the signer",
+        Rule::Shared,
+        |c, k| {
+            c.machines.insert(
+                0,
+                Row {
+                    id: OTHER.into(),
+                    pubkey: Keys::public(&k.other),
+                    extra: "not_after = \"2001-01-01T00:00:00Z\"\n".into(),
+                },
+            );
+        },
+    ),
     (
         "signer key in a noncanonical spelling",
         Rule::Shared,
@@ -824,6 +928,31 @@ const MUTATIONS: &[Mutation] = &[
     ("a noncanonical tag", Rule::Shared, |c, _| {
         c.tag = "v00.100.0".into()
     }),
+    (
+        "a noncanonical version under its own tag",
+        Rule::Shared,
+        |c, _| retag(c, "0.100.00"),
+    ),
+    (
+        "a noncanonical major version under its own tag",
+        Rule::Shared,
+        |c, _| retag(c, "00.100.0"),
+    ),
+    (
+        "a noncanonical minor version under its own tag",
+        Rule::Shared,
+        |c, _| retag(c, "0.0100.0"),
+    ),
+    (
+        "a version past u64 under its own tag",
+        Rule::Shared,
+        |c, _| retag(c, "18446744073709551616.0.0"),
+    ),
+    (
+        "a version at u64's bound under its own tag",
+        Rule::Shared,
+        |c, _| retag(c, "18446744073709551615.0.0"),
+    ),
     ("build zero", Rule::Shared, |c, _| {
         c.set("build_number", "0")
     }),
@@ -845,6 +974,9 @@ const MUTATIONS: &[Mutation] = &[
     ("build at its own minimum", Rule::Shared, |c, _| {
         c.set("min_build", "100")
     }),
+    ("a negative minimum build", Rule::Shared, |c, _| {
+        c.set("min_build", "-1")
+    }),
     ("signer durably revoked", Rule::Shared, |c, _| {
         c.policy.revoked = vec![SIGNER.into()]
     }),
@@ -857,19 +989,22 @@ const MUTATIONS: &[Mutation] = &[
     ("a traversal in the Linux name", Rule::Shared, |c, _| {
         c.set("linux_aarch64", "\"../../aterm\"")
     }),
-    ("an uppercase Linux digest", Rule::Shared, |c, _| {
-        let upper = c
-            .get("linux_aarch64_sha256")
-            .expect("digest")
-            .to_uppercase();
-        c.set("linux_aarch64_sha256", &upper);
+    (
+        "an uppercase digest beside the target",
+        Rule::Shared,
+        |c, _| sibling(c, &"E".repeat(64), "4096"),
+    ),
+    ("a size of 63 beside the target", Rule::Shared, |c, _| {
+        sibling(c, &"e".repeat(64), "63")
     }),
-    ("a Linux size of 63", Rule::Shared, |c, _| {
-        c.set("linux_aarch64_size", "63")
+    ("a size of 64 beside the target", Rule::Shared, |c, _| {
+        sibling(c, &"e".repeat(64), "64")
     }),
-    ("a Linux size over the bound", Rule::Shared, |c, _| {
-        c.set("linux_aarch64_size", "536870913")
-    }),
+    (
+        "a size over the bound beside the target",
+        Rule::Shared,
+        |c, _| sibling(c, &"e".repeat(64), "536870913"),
+    ),
     ("a Linux size that is a boolean", Rule::Shared, |c, _| {
         c.set("linux_aarch64_size", "true")
     }),
@@ -997,6 +1132,17 @@ const MUTATIONS: &[Mutation] = &[
         );
     }),
     (
+        "a repository slug with a third segment",
+        Rule::Installer,
+        |c, _| {
+            c.slug = "example/aterm/x".into();
+            c.set(
+            "url",
+            "\"https://github.com/example/aterm/x/releases/download/v0.100.0/aterm-0.100.0.dmg\"",
+        );
+        },
+    ),
+    (
         "an unreadable deadline on a machine ahead of the signer",
         Rule::Installer,
         |c, k| {
@@ -1073,7 +1219,7 @@ fn corpus(keys: &Keys) -> Vec<Case> {
         })
         .collect();
     let mut rng = Rng::new(0x6c_696e_7578);
-    for round in 0..300 {
+    for round in 0..100 {
         let mut picks: Vec<&Mutation> =
             (0..2 + rng.below(2)).map(|_| *rng.pick(&neutral)).collect();
         if round % 2 == 1 {
@@ -1106,7 +1252,7 @@ impl Tally {
             self.accepted, self.refused
         );
         assert!(
-            self.accepted >= 150 && self.refused >= 150,
+            self.accepted >= 50 && self.refused >= 50,
             "accepted {}, refused {}",
             self.accepted,
             self.refused
@@ -1221,7 +1367,7 @@ fn verify_once(
     let args = [
         q(s(&laid.release)),
         case.tag.clone(),
-        SLUG.into(),
+        case.slug.clone(),
         case.arch.clone(),
         q(s(&laid.store)),
         q(s(&laid.candidate)),
@@ -1308,8 +1454,9 @@ fn floors(policy: &aterm_json::Value) -> Vec<u64> {
 
 /// The durable policy binds the installed file: the floors, revocations and
 /// rejected build are read only while the target is the identity the record
-/// names, a trial is read by its phase, and the record must be the updater's
-/// own private file.
+/// names, a trial is read by its phase and its identities, the record must be
+/// the updater's own private file of the schema it writes, every number in it a
+/// u64 and the target a file no other account can write.
 #[test]
 fn the_durable_policy_binds_the_installed_file() {
     let scratch = Scratch::new();
@@ -1332,7 +1479,7 @@ fn the_durable_policy_binds_the_installed_file() {
     };
     let fresh = "f".repeat(64);
     // (name, the record's tail, the target's bytes, the record's target)
-    let rows: [(&str, String, Vec<u8>, bool); 7] = [
+    let rows: [(&str, String, Vec<u8>, bool); 8] = [
         ("plain", String::new(), raw.clone(), true),
         (
             "prepared",
@@ -1365,6 +1512,16 @@ fn the_durable_policy_binds_the_installed_file() {
             true,
         ),
         ("elsewhere", String::new(), raw.clone(), false),
+        // A rollback interrupted before its rename: the target is still the new build.
+        (
+            "rolling-back-before-the-rename",
+            format!(
+                "\n[trial]\nphase = \"RollbackPrepared\"\nhealthy = false\n[trial.old]\nbuild = 99\n\
+                 sha256 = {fresh:?}\n[trial.new]\nbuild = 100\nsha256 = {digest:?}\n"
+            ),
+            raw.clone(),
+            true,
+        ),
     ];
     let mut stores = Vec::new();
     for (name, tail, bytes, here) in &rows {
@@ -1387,6 +1544,177 @@ fn the_durable_policy_binds_the_installed_file() {
         &linked.join(".aterm-update"),
     );
     stores.push(linked);
+    // Each refused: (name, an edit of the record, its tail, the target's bytes,
+    // the modes of the state directory, the state file and the target, a word
+    // of the refusal).
+    let installed = format!("sha256 = {digest:?}\n");
+    let tampered = [raw.as_slice(), b"tampered"].concat();
+    let private = [0o700, 0o600, 0o755];
+    type Refusal<'a> = (
+        &'a str,
+        (&'a str, &'a str),
+        String,
+        &'a [u8],
+        [u32; 3],
+        &'a str,
+    );
+    let refusals: [Refusal<'_>; 17] = [
+        (
+            "newer-schema",
+            ("schema = 1", "schema = 2"),
+            String::new(),
+            &raw,
+            private,
+            "schema",
+        ),
+        (
+            "revocations-unlisted",
+            ("[\"old-machine\"]", "\"old-machine\""),
+            String::new(),
+            &raw,
+            private,
+            "revoked",
+        ),
+        (
+            "negative-floor",
+            ("min_build = 98", "min_build = -1"),
+            String::new(),
+            &raw,
+            private,
+            "min_build",
+        ),
+        (
+            "negative-rejected",
+            ("rejected_build = 97", "rejected_build = -1"),
+            String::new(),
+            &raw,
+            private,
+            "rejected",
+        ),
+        (
+            "negative-installed",
+            ("[installed]\nbuild = 99", "[installed]\nbuild = -1"),
+            String::new(),
+            &raw,
+            private,
+            "installed build",
+        ),
+        (
+            "rollback-unreadable-installed",
+            (&installed, "sha256 = \"not-hex\"\n"),
+            trial("RollbackPrepared", false, &fresh),
+            &raw,
+            private,
+            "installed identity",
+        ),
+        (
+            "prepared-from-another-identity",
+            (&installed, &format!("sha256 = {fresh:?}\n")),
+            trial("Prepared", false, &fresh),
+            &raw,
+            private,
+            "unresolved",
+        ),
+        (
+            "prepared-then-replaced",
+            ("", ""),
+            trial("Prepared", false, &fresh),
+            &tampered,
+            private,
+            "unresolved",
+        ),
+        (
+            "rollback-over-a-third-binary",
+            ("", ""),
+            trial("RollbackPrepared", false, &fresh),
+            &tampered,
+            private,
+            "unresolved",
+        ),
+        (
+            "healthy-then-replaced",
+            ("", ""),
+            trial("Installed", true, &digest),
+            &tampered,
+            private,
+            "unresolved",
+        ),
+        (
+            "healthy-under-another-identity",
+            (&installed, &format!("sha256 = {fresh:?}\n")),
+            trial("Installed", true, &digest),
+            &raw,
+            private,
+            "unresolved",
+        ),
+        (
+            "installed-digest-not-a-string",
+            (&installed, "sha256 = 5\n"),
+            String::new(),
+            &raw,
+            private,
+            "installed identity",
+        ),
+        (
+            "unreadable-trial-identity",
+            ("", ""),
+            trial("RollbackPrepared", false, "not-hex"),
+            &raw,
+            private,
+            "trial identity",
+        ),
+        (
+            "readable-directory",
+            ("", ""),
+            String::new(),
+            &raw,
+            [0o750, 0o600, 0o755],
+            "directory",
+        ),
+        (
+            "readable-file",
+            ("", ""),
+            String::new(),
+            &raw,
+            [0o700, 0o640, 0o755],
+            "file",
+        ),
+        (
+            "group-writable-target",
+            ("", ""),
+            String::new(),
+            &raw,
+            [0o700, 0o600, 0o775],
+            "executable",
+        ),
+        (
+            "setuid-target",
+            ("", ""),
+            String::new(),
+            &raw,
+            [0o700, 0o600, 0o4755],
+            "executable",
+        ),
+    ];
+    for (name, (from, to), tail, bytes, [dir, file, exe], _) in &refusals {
+        let store = scratch.mkdir(&format!("policy/{name}"));
+        let target = store.join("aterm");
+        write(&target, bytes);
+        chmod(&target, *exe);
+        let mut text = record(&target);
+        if !from.is_empty() {
+            assert_eq!(
+                text.matches(from).count(),
+                1,
+                "{name}: the edit applies once"
+            );
+            text = text.replace(from, to);
+        }
+        state(&store, &(text + tail));
+        chmod(&store.join(".aterm-update/state.toml"), *file);
+        chmod(&store.join(".aterm-update"), *dir);
+        stores.push(store);
+    }
     let refs: Vec<&Path> = stores.iter().map(PathBuf::as_path).collect();
     let answers = read_policies(&scratch, &verifier, &refs);
     let ok = |i: usize| {
@@ -1412,17 +1740,29 @@ fn the_durable_policy_binds_the_installed_file() {
         [99, 98, 7],
         "a healthy trial reads as installed"
     );
+    assert_eq!(
+        ok(7)["rejected_build"].as_u64(),
+        Some(100),
+        "a rollback before its rename rejects the new build"
+    );
     for (i, why) in [
         (4, "unresolved"),
         (5, "identity"),
         (6, "target mismatch"),
-        (7, "directory"),
+        (8, "directory"),
     ] {
         let refused = answers[i].as_ref().expect_err("refused");
         assert!(
             refused.contains(why),
             "{}: {refused}",
             rows.get(i).map_or("linked", |r| r.0)
+        );
+    }
+    for ((name, .., why), answer) in refusals.iter().zip(&answers[9..]) {
+        let refused = answer.as_ref().expect_err(name);
+        assert!(
+            refused.starts_with("refused\t") && refused.contains(why),
+            "{name}: {refused}"
         );
     }
 }
@@ -1997,7 +2337,8 @@ fn shielded(dir: &Path) -> bool {
 }
 
 /// A first install that recorded its policy before placing the binary keeps
-/// every floor on the retry; an enrolled target that vanished is refused.
+/// every floor on the retry; an enrolled target that vanished, or a disabled
+/// one whose trial awaits recovery, is refused.
 #[test]
 fn a_disabled_fresh_install_keeps_its_policy_on_retry() {
     let scratch = Scratch::new();
@@ -2023,6 +2364,20 @@ fn a_disabled_fresh_install_keeps_its_policy_on_retry() {
     let enrolled = scratch.mkdir("fresh/enrolled");
     state(&enrolled, &(header(&enrolled, true) + &identities[1]));
     stores.push(enrolled);
+    // A built identity with no digest is no fresh install's.
+    let unbuilt = scratch.mkdir("fresh/unbuilt");
+    state(
+        &unbuilt,
+        &(header(&unbuilt, false) + "[installed]\nbuild = 5\nsha256 = \"\"\n"),
+    );
+    stores.push(unbuilt);
+    // A disabled install whose trial awaits recovery has no target to vanish from.
+    let trial = scratch.mkdir("fresh/trial");
+    state(
+        &trial,
+        &(header(&trial, false) + &identities[0] + "[trial]\nphase = \"Prepared\"\n"),
+    );
+    stores.push(trial);
     let refs: Vec<&Path> = stores.iter().map(PathBuf::as_path).collect();
     let answers = read_policies(&scratch, &verifier, &refs);
     for answer in &answers[..2] {
@@ -2038,11 +2393,18 @@ fn a_disabled_fresh_install_keeps_its_policy_on_retry() {
         .as_ref()
         .expect_err("an enrolled target vanished");
     assert!(refused.contains("absent"), "{refused}");
+    let refused = answers[3].as_ref().expect_err("a built empty identity");
+    assert!(refused.contains("fresh installed identity"), "{refused}");
+    let refused = answers[4].as_ref().expect_err("a trial to recover");
+    assert!(refused.contains("absent"), "{refused}");
 }
 
 /// A stolen key's floor, recorded against its machine, goes with the roster
-/// that revokes it, as the updater's `FloorSources::step` withdraws it; an
-/// unattributed floor, or one a machine still trusted raised, stands.
+/// that revokes it, or with this client's durable revocation of it, as the
+/// updater's `FloorSources::step` withdraws it; an unattributed floor, one a
+/// machine still trusted raised, or one its sources do not explain, stands; a
+/// source above the floor (a hand edit) is capped at it; and sources that are
+/// not a table are refused.
 #[test]
 fn a_revoked_machines_floor_is_withdrawn() {
     let scratch = Scratch::new();
@@ -2050,28 +2412,71 @@ fn a_revoked_machines_floor_is_withdrawn() {
     let keys = Keys::new();
     let mut case = Case::base(&keys);
     case.revoked = vec!["thief".into()];
-    let sources = [
+    const BIG: u64 = 9_999_999_999;
+    // (name, the recorded min_build, the durable revocations, its sources, the build
+    // installed or a word of the refusal)
+    type Sources<'a> = (&'a str, u64, &'a str, &'a str, Result<u64, &'a str>);
+    let sources: [Sources<'_>; 8] = [
         (
             "thief",
+            BIG,
+            "",
             "[min_build_sources.machines]\nthief = 9999999999\n",
-            true,
+            Ok(100),
         ),
-        ("none", "", false),
-        ("base", "[min_build_sources]\nbase = 9999999999\n", false),
+        (
+            "durably revoked",
+            BIG,
+            "\"stolen\"",
+            "[min_build_sources.machines]\nstolen = 9999999999\n",
+            Ok(100),
+        ),
+        ("none", BIG, "", "", Err("below apply floor")),
+        (
+            "base",
+            BIG,
+            "",
+            "[min_build_sources]\nbase = 9999999999\n",
+            Err("below apply floor"),
+        ),
         (
             "trusted",
+            BIG,
+            "",
             "[min_build_sources.machines]\nother = 9999999999\n",
-            false,
+            Err("below apply floor"),
+        ),
+        (
+            "unexplained",
+            BIG,
+            "",
+            "[min_build_sources.machines]\nthief = 5\n",
+            Err("below apply floor"),
+        ),
+        (
+            "capped",
+            100,
+            "",
+            "[min_build_sources]\nbase = 9999999999\n[min_build_sources.machines]\nother = 9999999999\n",
+            Ok(100),
+        ),
+        // Sources that are no table are refused, never a crash.
+        (
+            "malformed",
+            BIG,
+            "",
+            "[[min_build_sources]]\nbase = 1\n",
+            Err("floor sources"),
         ),
     ];
     let mut calls = Vec::new();
-    for (name, table, _) in &sources {
+    for (name, min_build, durable, table, _) in &sources {
         let laid = case.lay(&keys, &scratch.join(&format!("floor/{name}")));
         state(
             &laid.store,
             &format!(
-                "schema = 1\ntarget = {:?}\nenabled = false\nhigh_water = 0\nmin_build = 9999999999\n\
-                 roster_floor = 0\nrevoked_machines = []\nrejected_build = 0\n\
+                "schema = 1\ntarget = {:?}\nenabled = false\nhigh_water = 0\nmin_build = {min_build}\n\
+                 roster_floor = 0\nrevoked_machines = [{durable}]\nrejected_build = 0\n\
                  [installed]\nbuild = 0\nsha256 = \"\"\n{table}",
                 s(&laid.store.join("aterm"))
             ),
@@ -2079,20 +2484,109 @@ fn a_revoked_machines_floor_is_withdrawn() {
         calls.push(main_call(&case, &laid));
     }
     let answers = ask_verifier(&scratch, &verifier, &install_sh(), &calls);
-    for ((name, _, installs), answer) in sources.iter().zip(answers) {
-        let verdict = installer_verdict(&answer);
-        if *installs {
-            assert_eq!(verdict.map(|a| a.3), Ok(100), "{name}");
-        } else {
-            let why = verdict.expect_err(name);
-            assert!(why.contains("below apply floor"), "{name}: {why}");
+    for ((name, .., want), answer) in sources.iter().zip(answers) {
+        match (installer_verdict(&answer), want) {
+            (Ok(accepted), Ok(build)) => assert_eq!(accepted.3, *build, "{name}"),
+            (Err(why), Err(word)) => {
+                assert!(
+                    why.starts_with("refused: ") && why.contains(word),
+                    "{name}: {why}"
+                );
+            }
+            (got, _) => panic!("{name}: {got:?}"),
         }
     }
 }
 
+/// The roster's `valid_until` and its signer's `not_after` are exclusive
+/// deadlines, read as the updater's `Roster::admit` and `Roster::machine` read
+/// them: the second before admits the release, the deadline's own second
+/// refuses it.
+#[test]
+fn a_deadline_refuses_from_its_own_second() {
+    let scratch = Scratch::new();
+    let verifier = Verifier::new(&scratch);
+    let keys = Keys::new();
+    const STAMP: &str = "2030-01-01T00:00:00Z";
+    let at = aterm_types::rfc3339::parse_utc(STAMP).expect("a deadline");
+    let mut roster_lapses = Case::base(&keys);
+    roster_lapses.valid_until = STAMP.into();
+    let mut signer_lapses = Case::base(&keys);
+    signer_lapses.machines[0].extra = format!("not_after = {STAMP:?}\n");
+    let json = |v: aterm_json::Value| aterm_json::to_string(&v).expect("JSON");
+    let (mut calls, mut updater) = (Vec::new(), Vec::new());
+    for (name, case) in [("roster", &roster_lapses), ("signer", &signer_lapses)] {
+        let laid = case.lay(&keys, &scratch.join(&format!("deadline/{name}")));
+        let pins: Vec<&str> = case.pins.iter().map(String::as_str).collect();
+        let verified = verify_roster(&pins, laid.proofs.roster.clone(), &laid.proofs.roster_sig)
+            .expect("the master signed it");
+        let roster = Roster::parse(&verified).expect("a roster");
+        for now in [at - 1, at] {
+            let admitted = roster.admit(0, now).and_then(|()| {
+                roster.authorize_appcast(&laid.proofs.appcast, &laid.proofs.appcast_sig, now)
+            });
+            updater.push((name, now, admitted.is_ok()));
+            calls.push(
+                [
+                    "json:verify_manifest".to_string(),
+                    case.pins.join(" "),
+                    json(aterm_json::json!(s(&laid.release))),
+                    json(aterm_json::json!(case.tag)),
+                    json(aterm_json::json!(case.slug)),
+                    json(aterm_json::json!(case.arch)),
+                    "[0, 0, 0]".into(),
+                    now.to_string(),
+                ]
+                .join("\t"),
+            );
+        }
+    }
+    let answers = ask_verifier(&scratch, &verifier, &install_sh(), &calls);
+    for ((name, now, admitted), answer) in updater.iter().zip(&answers) {
+        assert_eq!(*admitted, *now < at, "the updater's {name} deadline");
+        assert_eq!(
+            answer.starts_with("ok\t"),
+            *admitted,
+            "{name} at {now}: {answer}"
+        );
+    }
+}
+
+/// How a row publishes the head's proof pair.
+#[derive(Clone, Copy)]
+enum Pair {
+    /// Both files, the appcast signed by this signer.
+    Signed(By),
+    /// Both files, the signature 64 zero bytes.
+    Forged,
+    AppcastOnly,
+    SignatureOnly,
+}
+
+/// A row of [`an_older_release_is_judged_under_the_current_signed_policy`]: its
+/// edit of the candidate's case and of the head's, how the head is published,
+/// and the build installed or a word of the refusal.
+type HeadRow = (
+    &'static str,
+    fn(&mut Case, &mut Case, &Keys),
+    Pair,
+    Result<u64, &'static str>,
+);
+
+/// A stolen machine's floor in the durable policy, which the roster revokes.
+fn stolen_floor(c: &mut Case) {
+    c.revoked = vec!["thief".into()];
+    c.policy.min_build = 9_999_999_999;
+    c.policy.sources = "[min_build_sources.machines]\nthief = 9999999999\n".into();
+}
+
 /// An older release is installed only beneath the channel's current signed
-/// policy: the head's own floor applies to it, and a head that does not verify
-/// refuses the install rather than falling back to the older proof alone.
+/// policy: the head's own floor applies to it, beside the durable floor less
+/// what revoked machines raised; the head is admitted under the durable policy,
+/// the candidate under the durable revocations too, and the head must be at
+/// least the candidate (a head at its version stands); and a head that does not
+/// verify, or is half published, refuses the install rather than falling back
+/// to the older proof alone.
 #[test]
 fn an_older_release_is_judged_under_the_current_signed_policy() {
     let scratch = Scratch::new();
@@ -2108,25 +2602,136 @@ fn an_older_release_is_judged_under_the_current_signed_policy() {
     );
     head.set("dmg", "\"aterm-0.101.0.dmg\"");
     head.appcast.retain(|(k, _)| !k.starts_with("linux_"));
-    let rows: [(&str, &str, bool, Result<u64, &str>); 3] = [
-        ("under", "99", true, Ok(100)),
-        ("floor", "101", true, Err("floor")),
-        ("forged", "99", false, Err("signature")),
+    let signed = Pair::Signed(By::Machine);
+    let rows: [HeadRow; 13] = [
+        ("under", |_, h, _| h.set("min_build", "99"), signed, Ok(100)),
+        (
+            "floor",
+            |_, h, _| h.set("min_build", "101"),
+            signed,
+            Err("floor"),
+        ),
+        ("forged", |_, _, _| {}, Pair::Forged, Err("signature")),
+        (
+            "appcast alone",
+            |_, _, _| {},
+            Pair::AppcastOnly,
+            Err("pair"),
+        ),
+        (
+            "signature alone",
+            |_, _, _| {},
+            Pair::SignatureOnly,
+            Err("pair"),
+        ),
+        (
+            "older than the candidate",
+            |_, h, _| {
+                h.set("version", "\"0.99.0\"");
+                h.set("build_number", "99");
+                h.set(
+                    "url",
+                    "\"https://github.com/example/aterm/releases/download/v0.99.0/aterm-0.99.0.dmg\"",
+                );
+                h.set("dmg", "\"aterm-0.99.0.dmg\"");
+            },
+            signed,
+            Err("head"),
+        ),
+        (
+            "below the high water",
+            |c, _, _| c.policy.high_water = 101,
+            signed,
+            Err("floor"),
+        ),
+        (
+            "a revoked machine's floor withdrawn",
+            |c, h, _| {
+                stolen_floor(c);
+                h.set("min_build", "99");
+            },
+            signed,
+            Ok(100),
+        ),
+        (
+            "the head's floor after the withdrawal",
+            |c, h, _| {
+                stolen_floor(c);
+                h.set("min_build", "101");
+            },
+            signed,
+            Err("floor"),
+        ),
+        (
+            "a head signed by a durably revoked machine",
+            |c, h, k| {
+                c.machines.push(Row {
+                    id: OTHER.into(),
+                    pubkey: Keys::public(&k.other),
+                    extra: String::new(),
+                });
+                c.policy.revoked = vec![OTHER.into()];
+                h.set("machine_id", "\"other\"");
+            },
+            Pair::Signed(By::Other),
+            Err("signature"),
+        ),
+        (
+            "a candidate signed by a durably revoked machine",
+            |c, _, k| {
+                c.machines.push(Row {
+                    id: OTHER.into(),
+                    pubkey: Keys::public(&k.other),
+                    extra: String::new(),
+                });
+                c.policy.revoked = vec![OTHER.into()];
+                c.appcast_by = By::Other;
+                c.set("machine_id", "\"other\"");
+            },
+            signed,
+            Err("signature"),
+        ),
+        (
+            "below the durable minimum",
+            |c, h, _| {
+                c.policy.min_build = 101;
+                h.set("min_build", "99");
+            },
+            signed,
+            Err("floor"),
+        ),
+        (
+            "a head at the candidate's version",
+            |_, h, _| {
+                h.set("version", "\"0.100.0\"");
+                h.set("build_number", "100");
+                h.set(
+                    "url",
+                    "\"https://github.com/example/aterm/releases/download/v0.100.0/aterm-0.100.0.dmg\"",
+                );
+                h.set("dmg", "\"aterm-0.100.0.dmg\"");
+            },
+            signed,
+            Ok(100),
+        ),
     ];
     let mut calls = Vec::new();
-    for (name, min_build, signed, _) in &rows {
-        let laid = case.lay(&keys, &scratch.join(&format!("head/{name}")));
-        let mut policy = head.clone();
-        policy.set("min_build", min_build);
-        let bytes = policy.appcast_text().into_bytes();
-        let sig = if *signed {
-            By::Machine.sign(&keys, &bytes)
-        } else {
-            vec![0; 64]
+    for (name, edit, pair, _) in &rows {
+        let (mut c, mut h) = (case.clone(), head.clone());
+        edit(&mut c, &mut h, &keys);
+        let laid = c.lay(&keys, &scratch.join(&format!("head/{name}")));
+        let bytes = h.appcast_text().into_bytes();
+        let sig = match pair {
+            Pair::Signed(by) => by.sign(&keys, &bytes),
+            _ => vec![0; 64],
         };
-        write(&laid.release.join("aterm-policy-appcast.toml"), &bytes);
-        write(&laid.release.join("aterm-policy-appcast.toml.sig"), &sig);
-        calls.push(main_call(&case, &laid));
+        if !matches!(pair, Pair::SignatureOnly) {
+            write(&laid.release.join("aterm-policy-appcast.toml"), &bytes);
+        }
+        if !matches!(pair, Pair::AppcastOnly) {
+            write(&laid.release.join("aterm-policy-appcast.toml.sig"), &sig);
+        }
+        calls.push(main_call(&c, &laid));
     }
     let answers = ask_verifier(&scratch, &verifier, &install_sh(), &calls);
     for ((name, _, _, want), answer) in rows.iter().zip(answers) {

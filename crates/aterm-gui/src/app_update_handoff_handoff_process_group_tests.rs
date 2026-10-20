@@ -267,6 +267,9 @@ fn queued_output_is_buffered_mid_flight_but_peer_death_still_revokes() {
         "mid-flight, queued output buffers through instead of revoking"
     );
 
+    // Nonblocking, so the close flushes the unread output at once instead of
+    // waiting out the tty's drain (0.6 s on macOS) to flush it.
+    aterm_pty::set_nonblocking(slave, true).expect("nonblocking slave");
     aterm_pty::close_fd(slave);
     // Eventual, not same-instant: production peeks repeatedly across the overlap, and macOS can
     // surface the HUP edge a scheduler quantum after close(2), or only once a sibling test's
@@ -298,6 +301,9 @@ fn a_hung_up_master_is_never_output_waiting() {
         unsafe { libc::write(exited_slave, [0x62u8].as_ptr().cast(), 1) },
         1
     );
+    // Nonblocking, so the close flushes the unread output at once instead of
+    // waiting out the tty's drain (0.6 s on macOS) to flush it.
+    aterm_pty::set_nonblocking(exited_slave, true).expect("nonblocking slave");
     aterm_pty::close_fd(exited_slave);
     let dead = [(1u64, exited, 4242i32)];
     // Eventual, as in the sibling test above.
@@ -325,8 +331,10 @@ fn a_hung_up_master_is_never_output_waiting() {
         handoff_masters_have_activity(&desk),
         "a live session's unread output is still output"
     );
-    aterm_pty::close_fd(alive_slave);
+    // The master first: a slave closed over output its master never read
+    // waits out the tty's drain (0.6 s on macOS).
     aterm_pty::close_fd(alive);
+    aterm_pty::close_fd(alive_slave);
     aterm_pty::close_fd(exited);
 }
 
@@ -890,10 +898,22 @@ fn sleeping_candidate() -> (
     HandoffCandidateHandle,
     ProcessGroupCleanup,
 ) {
+    candidate_in_own_group("exec sleep 30")
+}
+
+/// `/bin/sh -c script` as a candidate leading its own group, under the same guard
+/// as [`sleeping_candidate`].
+fn candidate_in_own_group(
+    script: &str,
+) -> (
+    HandoffCandidate,
+    HandoffCandidateHandle,
+    ProcessGroupCleanup,
+) {
     let child = std::process::Command::new("/bin/sh")
         .inherit_nothing()
         .arg("-c")
-        .arg("exec sleep 30")
+        .arg(script)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -910,10 +930,21 @@ fn sleeping_candidate() -> (
 /// be rejected as gone.
 #[test]
 fn a_stopped_candidate_is_not_gone() {
-    let (candidate, mut handle, mut cleanup) = sleeping_candidate();
+    // The candidate stops itself. A SIGSTOP sent from here can land while it is
+    // still exec'ing (`spawn` returns once the first exec commits; `/bin/sh` is a
+    // shim that execs a shell, which execs `sleep`), and Darwin mishandles a
+    // SIGSTOP that arrives mid-exec. Usually it is dropped: `kill` answers 0, the
+    // child runs on, and the wait below ends only at its hang detector. Rarely
+    // the stop is reported but the child is left frozen at its first dyld
+    // syscall, the reaper's SIGKILL right after does not end it, and the reap's
+    // `wait` blocks for good. Measured on Darwin 27.0.0 under load: 11 of 6,000
+    // sends through this fixture stopped nothing, and 2,400 runs of this test
+    // gave one of each failure. A SIGKILL on its own was never lost (0 of 9,600
+    // sent into the same exec windows). The shell's own `kill` stops it once its
+    // exec is done, so no signal is in flight across an exec.
+    let (candidate, mut handle, mut cleanup) =
+        candidate_in_own_group("kill -STOP $$; exec sleep 30");
     let pid = libc::pid_t::try_from(candidate.pid).expect("bounded pid");
-    // SAFETY: a signal to our own unreaped child.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
     // Not vacuous: the kernel has reported the stop before the probe is asked.
     let stopped_by = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     loop {

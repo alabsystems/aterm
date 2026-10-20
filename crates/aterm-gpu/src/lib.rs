@@ -15,6 +15,10 @@
 // so the single-armed builds (macOS production: Metal; Linux and wasm: GL;
 // Windows: wgpu) spell no unreachable pattern. See `device_layer`.
 
+// The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
+// under them (crates/aterm-spec-anchor/anchor_rules.rs).
+#![cfg_attr(anchor_rules, feature(macro_attr))]
+
 /// `eprintln!` that cannot panic, for every stderr line this crate writes at
 /// runtime. `eprintln!` panics when stderr fails (a closed pipe or pty), and
 /// these notes fire on the present path, where a panic aborts under
@@ -75,7 +79,7 @@ mod metal;
 mod gl;
 /// The launch's first-frame Metal warm (see `metal/warm.rs`).
 #[cfg(target_os = "macos")]
-pub use metal::warm::FirstFrameWarm;
+pub use metal::warm::{FirstFrameKnobs, FirstFrameWarm};
 /// The first-frame compile measurement (`benches/first_frame_compile.rs`).
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
@@ -86,7 +90,8 @@ mod renderer;
 #[cfg(not(target_arch = "wasm32"))]
 pub use renderer::WindowTarget;
 pub use renderer::{
-    DropOverlay, GpuRenderer, GpuSurface, PresentCrop, SurfacePresentFailure, TrayQuad, WindowGpu,
+    DropOverlay, FrameShape, GpuRenderer, GpuSurface, PresentCrop, SurfacePresentFailure, TrayQuad,
+    TrayScrim, UnormAblation, WindowGpu,
 };
 /// The demand-built effect pipelines (see `renderer::EffectPipelines`). The
 /// enum and name table let a test name a slot and read
@@ -94,6 +99,9 @@ pub use renderer::{
 pub use renderer::{
     EFFECT_PIPELINE_COUNT, EFFECT_PIPELINE_NAMES, EFFECT_PIPELINES, EffectPipeline,
 };
+/// GPU time per presented frame: Metal command-buffer spans or wgpu
+/// render-pass timestamp queries, summed per present.
+pub mod gpu_time;
 /// Present-to-glass timing: `presentDrawable:` registration to the drawable's
 /// `presentedTime`.
 pub mod present_glass;
@@ -104,6 +112,9 @@ pub mod video_tap;
 /// The browser entry: a canvas becomes a context and a pending surface.
 #[cfg(target_arch = "wasm32")]
 pub mod web;
+/// The wgpu arm's clock for `gpu_time`: per-pass timestamp queries.
+#[cfg(wgpu_arm)]
+mod wgpu_timer;
 // The GPU-free slice-precondition decision `VertexBuffer::upload_via` (and the
 // Metal arm's `upload_stream`) uses,
 // re-exported for the Tier-1 conformance test.
@@ -491,6 +502,15 @@ pub(crate) fn terminal_memory_hints() -> wgpu::MemoryHints {
 #[cfg(wgpu_arm)]
 const TERMINAL_VIEW_DESCRIPTORS: u32 = 16_384;
 
+/// The optional features aterm asks of an adapter offering `available`:
+/// timestamp queries when offered (the `gpu_time` clock, idle unless a sink
+/// listens), nothing else. Asking for a feature the adapter lacks would fail
+/// the device request, so the grant is never assumed.
+#[cfg(wgpu_arm)]
+fn terminal_device_features(available: wgpu::Features) -> wgpu::Features {
+    available & wgpu::Features::TIMESTAMP_QUERY
+}
+
 /// The device limits aterm asks of an adapter on `backend`: wgpu's defaults,
 /// with a DX12 view-descriptor heap sized for a terminal
 /// ([`TERMINAL_VIEW_DESCRIPTORS`]). DX12 compiles only into the Windows build,
@@ -692,7 +712,7 @@ impl GpuContext {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("aterm-gpu device"),
-                required_features: wgpu::Features::empty(),
+                required_features: terminal_device_features(adapter.features()),
                 required_limits,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 // Not `MemoryHints::Performance`; see `terminal_memory_hints`.
@@ -984,6 +1004,23 @@ impl GpuContext {
 #[cfg(all(test, wgpu_arm))]
 mod device_request_tests {
     use super::*;
+
+    /// The one optional feature aterm asks for is timestamp queries (the
+    /// `gpu_time` clock), and only from an adapter that offers them: a request
+    /// for a feature the adapter lacks fails the whole device.
+    #[test]
+    fn only_timestamp_queries_are_requested_and_only_when_offered() {
+        assert_eq!(
+            terminal_device_features(wgpu::Features::all()),
+            wgpu::Features::TIMESTAMP_QUERY
+        );
+        assert_eq!(
+            terminal_device_features(wgpu::Features::empty()),
+            wgpu::Features::empty()
+        );
+        let without = wgpu::Features::all() - wgpu::Features::TIMESTAMP_QUERY;
+        assert_eq!(terminal_device_features(without), wgpu::Features::empty());
+    }
 
     /// The DX12 view-descriptor heap is the one device limit aterm moves off
     /// wgpu's defaults, and only for a DX12 adapter: every other limit, and

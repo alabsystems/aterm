@@ -30,7 +30,7 @@ use aterm_types::native_window::{HasNativeWindow, NativeWindow};
 use aterm_wayland::globals::Registry;
 use aterm_wayland::protocols::wayland::{wl_buffer, wl_shm, wl_shm_pool, wl_surface};
 use aterm_wayland::proxy::{Display, Listener, Proxy, Queue};
-use winit::window::Window;
+use aterm_window::window::Window;
 
 use super::shm_mem::ShmMem;
 use super::{CpuFrameBuffer, DamageRect};

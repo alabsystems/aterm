@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// Explicit `match` / `let ... else` / `contains_key` forms are used in verified code
+// paths so `trustc` discharges Level-0 obligations without closure calls, residual trait
+// projections, or `hardened_error_discard` unknowns.
+#![allow(
+    clippy::manual_div_ceil,
+    clippy::manual_map,
+    clippy::manual_ok_err,
+    clippy::manual_unwrap_or_default,
+    clippy::map_entry,
+    clippy::question_mark
+)]
 //! `astream-broker` — astream's **servable broker**: the message bus you actually
 //! connect to.
 //!
@@ -6,7 +17,8 @@
 //! system, over a local Unix-domain socket ([`Broker::serve`], same-machine), plain
 //! TCP ([`Broker::serve_tcp`] — plaintext, trusted network only), or — with the
 //! `aead` feature — an XChaCha20-Poly1305-sealed TCP transport
-//! (`Broker::serve_tcp_sealed`, confidential + authenticated). With the `cap`
+//! (`Broker::serve_tcp_sealed`, confidential + authenticated; ring's ChaCha20-Poly1305
+//! under the HChaCha20 subkey `astream-aead` derives). With the `cap`
 //! feature a broker opened by `Broker::open_guarded` enforces signed capabilities on
 //! its accept path — presented as a proof of possession over a per-connection nonce
 //! (`Hello` → `Nonce` → `Attach` → `Mark`), so the capability's tag never crosses the

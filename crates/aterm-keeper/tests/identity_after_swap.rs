@@ -36,7 +36,7 @@ use aterm_keeper::client::{KeeperClient, refused_identity};
 use aterm_keeper::identity::{Identity, IdentityPolicy};
 use aterm_keeper::job::{self, JobState};
 use aterm_spec::wait::{MUST_HAPPEN, within};
-use aterm_uds::deadline::{output_until, trust_service_silent};
+use aterm_uds::deadline::output_until;
 
 /// What a child run of this binary does instead of its test.
 const ROLE: &str = "ATERM_KEEPER_SWAP_ROLE";
@@ -220,16 +220,6 @@ fn private_dir(path: &Path) {
 /// through a process's gate: the machine's moment, never the code's verdict.
 const TRUSTD_SILENT: &str = "the process trustd gate was silent — the machine's, not the code's";
 
-/// Ends a test that checks code COULD NOT RUN while `trustd` does not answer the
-/// probe (the crate's `require_trust_service`, which this crate cannot reach).
-fn require_trust_service() {
-    if trust_service_silent() {
-        aterm_spec::host::could_not_run(
-            "macOS's trustd does not answer, so no code check runs here — the machine's, not the code's",
-        );
-    }
-}
-
 /// Whether `why` is an identity check's words for a gate that refused it
 /// unanswered.
 fn trustd_silent(why: &str) -> bool {
@@ -316,7 +306,7 @@ fn ditto(from: &Path, to: &Path) {
 #[test]
 fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
     play_role_if_asked();
-    require_trust_service();
+    aterm_uds::deadline::require_trust_service();
     let mut s = Scratch::new("akswap");
     // The build the keeper starts from: this binary, so this test dials as it.
     let build = s.dir.join("build").join("aterm");
@@ -408,7 +398,7 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
 #[test]
 fn a_keeper_whose_app_is_deleted_is_still_that_apps() {
     play_role_if_asked();
-    require_trust_service();
+    aterm_uds::deadline::require_trust_service();
     let mut s = Scratch::new("akswapb");
     let sock = s.sock();
     let sock_arg = sock.to_string_lossy().into_owned();
@@ -479,7 +469,7 @@ fn a_keeper_whose_app_is_deleted_is_still_that_apps() {
 #[test]
 fn a_stopped_keeper_leaves_no_copy_of_its_code() {
     play_role_if_asked();
-    require_trust_service();
+    aterm_uds::deadline::require_trust_service();
     let mut s = Scratch::new("akstop");
     let label = format!("{}.{}.stop", job::TEST_LABEL_PREFIX, std::process::id());
     assert_eq!(job::state(&label).expect("launchctl"), JobState::Absent);

@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 
-use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey, PhysicalKey};
+use aterm_window::keyboard::{Key as WinitKey, ModifiersState, NamedKey, PhysicalKey};
 
 /// Modifier mask bits for a [`Chord`]. A small hand-rolled bitset (rather than
 /// pulling in `bitflags`) keeps this module dependency-free; the four bits are
@@ -280,7 +280,7 @@ pub(crate) const BUILTIN_CMD_CHORDS: &[(&str, &str)] = &[
     ("cmd+shift+o", "Open Session in New Window"),
     ("cmd+d", "Split Right"),
     ("cmd+shift+d", "Split Down"),
-    ("cmd+shift+l", "Ledger for This Session"),
+    ("cmd+shift+l", "Harness Log for This Tab"),
     ("cmd+shift+]", "Show Next Tab"),
     ("cmd+shift+[", "Show Previous Tab"),
     ("cmd+shift+enter", "Toggle Pane Zoom"),
@@ -321,6 +321,8 @@ pub(crate) const MENU_CMD_CHORDS: &[(&str, &str)] = &[
     ("cmd+g", "Find Next"),
     ("cmd+shift+g", "Find Previous"),
     ("cmd+ctrl+f", "Enter Full Screen"),
+    ("cmd+ctrl+o", "Overview…"),
+    ("cmd+shift+j", "Next That Needs You"),
     ("cmd+shift+p", "Command Palette…"),
     ("cmd+m", "Minimize"),
 ];
@@ -949,7 +951,14 @@ impl Keybindings {
         ("ctrl+shift+f", "find"),
         ("ctrl+shift+d", "split_vertical"),
         ("ctrl+shift+e", "split_horizontal"),
+        // WINDOWS: Ctrl+Shift+Enter is stock PSReadLine's InsertLineBelow, so the
+        // pane zoom takes WezTerm's Ctrl+Shift+Z there. Its legacy byte is ^Z,
+        // which plain Ctrl+Z (PSReadLine's Undo) still types. Windows Terminal
+        // seeds no zoom chord at all.
+        #[cfg(not(windows))]
         ("ctrl+shift+return", "toggle_pane_zoom"),
+        #[cfg(windows)]
+        ("ctrl+shift+z", "toggle_pane_zoom"),
         // PANE FOCUS. Without these a split was a one-way door off macOS: the
         // splits above were seeded but nothing moved the keyboard between the
         // panes they create, and `menu.rs` has no pane-focus MenuAction (so the
@@ -980,18 +989,33 @@ impl Keybindings {
         ("alt+right", "focus_pane_right"),
         ("alt+up", "focus_pane_up"),
         ("alt+down", "focus_pane_down"),
+        // TAB NAVIGATION. Ctrl+Shift+←/→ are stock PSReadLine's SelectBackwardWord
+        // / SelectNextWord on Windows, and Windows Terminal leaves them to the
+        // program, so they are seeded off Windows only; Windows keeps Windows
+        // Terminal's Ctrl+Tab / Ctrl+Shift+Tab, listed first so the palette shows
+        // them, and Ctrl+PageDown / PageUp (PSReadLine's ScrollDisplayDownLine /
+        // UpLine, which move nothing in a ConPTY tab).
+        #[cfg(not(windows))]
         ("ctrl+shift+right", "next_tab"),
+        #[cfg(not(windows))]
         ("ctrl+shift+left", "prev_tab"),
-        ("ctrl+pagedown", "next_tab"),
-        ("ctrl+pageup", "prev_tab"),
         // The document-window reflex every Windows app answers. Ctrl+Tab is
         // indistinguishable from a bare Tab in the LEGACY encoding, so nothing
         // that works today loses a keystroke; a kitty-protocol app does lose
         // its `ESC[9;5u`, which is the same trade Windows Terminal makes.
+        #[cfg(windows)]
         ("ctrl+tab", "next_tab"),
+        #[cfg(windows)]
+        ("ctrl+shift+tab", "prev_tab"),
+        ("ctrl+pagedown", "next_tab"),
+        ("ctrl+pageup", "prev_tab"),
+        #[cfg(not(windows))]
+        ("ctrl+tab", "next_tab"),
+        #[cfg(not(windows))]
         ("ctrl+shift+tab", "prev_tab"),
         // Jump-to-prompt (OSC-133 marks): the WezTerm/iTerm2 chord. Up/Down
-        // are free here (left/right are tab nav), so no shadow.
+        // are free here (left/right are tab nav off Windows, and PSReadLine binds
+        // neither), so no shadow.
         ("ctrl+shift+up", "jump_prev_prompt"),
         ("ctrl+shift+down", "jump_next_prompt"),
         // Zoom: Ctrl+= and Ctrl+Shift+= (the latter is "Ctrl++" on a US layout,
@@ -1062,7 +1086,8 @@ impl Keybindings {
         // Windows Terminal ships Ctrl+Alt+digit, but brace input outranks a tab
         // shortcut the user can bind in one line, and the pinning test below
         // (`Ctrl+Alt+{n} must stay free`) holds that. Tab nav stays covered by
-        // next/prev (Ctrl+Tab, Ctrl+Shift+Left/Right, Ctrl+PageUp/Down), and a
+        // next/prev (Ctrl+Tab, Ctrl+PageUp/Down, and Ctrl+Shift+Left/Right off
+        // Windows), and a
         // user who wants N-jump has both spellings available: `switch_tab_N`
         // parses and dispatches, so `ctrl+alt+1 = "switch_tab_1"` in
         // `[keybindings]` works today.
@@ -1170,8 +1195,9 @@ impl Keybindings {
     /// key-equivalents are honestly blanked and the rows used to show nothing).
     ///
     /// Preference order: the first [`Self::PLATFORM_DEFAULT_PAIRS`] entry
-    /// (presentation order — so Next Tab shows `Ctrl+Shift+Right`, not one of
-    /// its aliases) that STILL resolves to `action` in this map — a user rebind
+    /// (presentation order — so Next Tab shows `Ctrl+Shift+Right`, or `Ctrl+Tab`
+    /// on Windows, not one of its aliases) that STILL resolves to `action` in this
+    /// map — a user rebind
     /// or `"none"` unbind of a seed is therefore honored, never advertised
     /// stale. When no seed survives, the lexicographically smallest display of
     /// any user-bound chord (stable across the `HashMap`'s arbitrary iteration
@@ -1301,7 +1327,7 @@ impl KeySequences {
 /// No physical key: a chord the tests spell, which has no layout twin.
 #[cfg(test)]
 const NO_PHYSICAL_KEY: PhysicalKey =
-    PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified);
+    PhysicalKey::Unidentified(aterm_window::keyboard::NativeKeyCode::Unidentified);
 
 /// The outcome of consulting the two user chord maps for a key event. Captures MAP
 /// PRECEDENCE: `[keybindings]` (app actions) win over `[key_sequences]` (raw-byte
@@ -1460,7 +1486,7 @@ pub(crate) fn parse_byte_sequence(s: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use winit::keyboard::SmolStr;
+    use aterm_window::keyboard::SmolStr;
 
     fn ch(c: &str) -> WinitKey {
         WinitKey::Character(SmolStr::new(c))
@@ -1746,6 +1772,56 @@ mod tests {
         }
     }
 
+    /// WINDOWS LEAVES PSREADLINE ITS KEYS (the 2026-10-17 audit's
+    /// `gui-chords-shadow-psreadline`). Stock PSReadLine's Windows mode selects
+    /// by word on Ctrl+Shift+←/→ and opens a line below on Ctrl+Shift+Enter, and
+    /// the tab and zoom seeds took those chords from the shell; sent past the
+    /// window they work in pwsh 7.6.7. Windows seeds Windows Terminal's tab
+    /// chords and WezTerm's zoom chord instead. Off Windows nothing changed.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn windows_defaults_leave_psreadline_its_selection_and_edit_chords() {
+        let kb = Keybindings::resolved(None);
+        let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        let named = WinitKey::Named;
+        for key in [NamedKey::ArrowLeft, NamedKey::ArrowRight, NamedKey::Enter] {
+            let bound = kb.lookup(&named(key), cs);
+            if cfg!(windows) {
+                assert_eq!(bound, None, "Ctrl+Shift+{key:?} belongs to PSReadLine");
+            } else {
+                assert!(
+                    bound.is_some(),
+                    "Ctrl+Shift+{key:?} keeps its seed off Windows"
+                );
+            }
+        }
+        for key in [
+            NamedKey::ArrowLeft,
+            NamedKey::ArrowRight,
+            NamedKey::Home,
+            NamedKey::End,
+        ] {
+            assert_eq!(
+                kb.lookup(&named(key), ModifiersState::SHIFT),
+                None,
+                "Shift+{key:?} selects in PSReadLine"
+            );
+        }
+        assert_eq!(
+            kb.lookup(&ch("z"), cs),
+            cfg!(windows).then_some(Action::TogglePaneZoom),
+            "WezTerm's zoom chord, on Windows"
+        );
+        assert_eq!(
+            kb.lookup(&named(NamedKey::PageDown), ModifiersState::CONTROL),
+            Some(Action::NextTab)
+        );
+        assert_eq!(
+            kb.lookup(&named(NamedKey::PageUp), ModifiersState::CONTROL),
+            Some(Action::PrevTab)
+        );
+    }
+
     /// PANE FOCUS AND TAB NAV EXIST OFF macOS. The splits were seeded and their
     /// panes were then unreachable from the keyboard: no `focus_pane_*` default, no
     /// pane-focus MenuAction (so no palette row either) and no control verb. Same
@@ -1936,7 +2012,11 @@ mod tests {
         );
         assert_eq!(
             kb.display_chord_for(Action::NextTab).as_deref(),
-            Some("Ctrl+Shift+Right"),
+            Some(if cfg!(windows) {
+                "Ctrl+Tab"
+            } else {
+                "Ctrl+Shift+Right"
+            }),
             "presentation order picks the FIRST seeded spelling, not an alias"
         );
         assert_eq!(
@@ -2140,8 +2220,8 @@ mod tests {
     /// letter on a US digit key (AZERTY 'é' on 2) is never re-read as a digit.
     #[test]
     fn a_layout_letter_matches_its_us_keys_binding_only_in_a_chord() {
+        use aterm_window::keyboard::KeyCode;
         use std::collections::BTreeMap;
-        use winit::keyboard::KeyCode;
         let key = PhysicalKey::Code;
         let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
         let table: BTreeMap<String, String> = [

@@ -271,39 +271,27 @@ mod tests {
 
     // Response suppression at the single `send_response` sink.
 
-    /// `response any = Drop` suppresses every PTY-origin reply (DA1, DSR, DECRQSS, …) at the
-    /// sink.
+    /// `response any = Drop` suppresses every PTY-origin reply at the one `send_response` sink:
+    /// a DA1 query's, and the Kitty `a=q` probe's (`i=1`, quiet 0), which goes through the
+    /// same sink.
     #[test]
-    fn drop_policy_suppresses_response_at_the_sink() {
+    fn drop_policy_suppresses_every_reply_at_the_sink() {
         use crate::terminal::Terminal;
-        let mut term = Terminal::new(24, 80);
-        term.apply_policy_engine(PolicyEngine::new(policy_with_rule(
-            "response any",
-            Response::Drop,
-            OriginTag::NetworkUntrusted,
-        )));
-        term.process(b"\x1b[c"); // DA1 primary device-attributes query
-        assert!(
-            term.take_response().is_none(),
-            "`response any = Drop` must suppress the DA1 reply at the send_response sink (P4)"
-        );
-    }
-
-    /// The Kitty `a=q` probe reply goes through the same `send_response` sink as every PTY reply.
-    #[test]
-    fn drop_policy_suppresses_kitty_query_reply() {
-        use crate::terminal::Terminal;
-        let mut term = Terminal::new(24, 80);
-        term.apply_policy_engine(PolicyEngine::new(policy_with_rule(
-            "response any",
-            Response::Drop,
-            OriginTag::NetworkUntrusted,
-        )));
-        // APC Kitty graphics support probe: a=q (query), i=1, quiet=0 (default).
-        term.process(b"\x1b_Ga=q,i=1\x1b\\");
-        assert!(
-            term.take_response().is_none(),
-            "`response any = Drop` must suppress the Kitty a=q OK reply at the send_response sink"
-        );
+        for (query, what) in [
+            (&b"\x1b[c"[..], "DA1"),
+            (&b"\x1b_Ga=q,i=1\x1b\\"[..], "Kitty a=q"),
+        ] {
+            let mut term = Terminal::new(24, 80);
+            term.apply_policy_engine(PolicyEngine::new(policy_with_rule(
+                "response any",
+                Response::Drop,
+                OriginTag::NetworkUntrusted,
+            )));
+            term.process(query);
+            assert!(
+                term.take_response().is_none(),
+                "`response any = Drop` must suppress the {what} reply at the send_response sink"
+            );
+        }
     }
 }

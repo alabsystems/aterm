@@ -1,0 +1,8 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (40x8, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the several-server .mcp.json approval dialog (two new servers lab-probe-a and lab-probe-b), the pane resized to 40x8 (`ctl resize 8 40`): its title off the screen, the Select scrolled to its focused first server (the second scrolled out, no arrow drawn), `Enable selected` and the footer
+  access system resources. All tool
+  calls require approval. Learn more
+  in the MCP documentation.
+
+  ❯ [✔] lab-probe-a
+       Enable selected
+ Space to select · Esc to reject all

@@ -119,7 +119,7 @@ contract_fn! {
 }
 
 /// What recovery decided about the bytes after the intact prefix.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Eq)]
 pub(crate) enum Classified {
     /// Keep the first `keep` bytes, which hold the first `records` records, and cut
     /// the rest. `written`: the cut removes bytes a client may have been told about
@@ -143,6 +143,52 @@ pub(crate) enum Classified {
         at_byte: usize,
         version: u8,
     },
+}
+
+impl PartialEq for Classified {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Classified::Keep {
+                    keep: a_k,
+                    records: a_r,
+                    written: a_w,
+                },
+                Classified::Keep {
+                    keep: b_k,
+                    records: b_r,
+                    written: b_w,
+                },
+            ) => *a_k == *b_k && *a_r == *b_r && *a_w == *b_w,
+            (
+                Classified::Corrupt {
+                    offset: a_o,
+                    at_byte: a_b,
+                    reason: a_r,
+                    repair_at: a_ra,
+                },
+                Classified::Corrupt {
+                    offset: b_o,
+                    at_byte: b_b,
+                    reason: b_r,
+                    repair_at: b_ra,
+                },
+            ) => *a_o == *b_o && *a_b == *b_b && a_r.as_str() == b_r.as_str() && *a_ra == *b_ra,
+            (
+                Classified::Newer {
+                    offset: a_o,
+                    at_byte: a_b,
+                    version: a_v,
+                },
+                Classified::Newer {
+                    offset: b_o,
+                    at_byte: b_b,
+                    version: b_v,
+                },
+            ) => *a_o == *b_o && *a_b == *b_b && *a_v == *b_v,
+            _ => false,
+        }
+    }
 }
 
 /// What the classifier knows besides the scan.
@@ -179,22 +225,35 @@ const MAX_FRAME: u64 = (HEADER_SIZE + MAX_PAYLOAD_LEN) as u64;
 /// carry, so a keyed resync tries few candidate offsets per frame.
 const MIN_SEALED_FRAME: u64 = MIN_FRAME + 40;
 
+const fn first_newer_after(after: &[Found]) -> Option<(u64, usize, u8)> {
+    let mut rest = after;
+    while let [f, tail @ ..] = rest {
+        if let Found::Newer {
+            offset,
+            at_byte,
+            version,
+        } = f
+        {
+            return Some((*offset, *at_byte, *version));
+        }
+        rest = tail;
+    }
+    None
+}
+
+const fn keep_all(keep: usize, records: usize) -> Classified {
+    Classified::Keep {
+        keep,
+        records,
+        written: false,
+    }
+}
+
 /// Classify the bytes after `scan`'s intact prefix — see the module docs.
 pub(crate) fn classify(scan: &Scan, j: &Judge<'_>) -> Classified {
     let records = scan.records.len();
     let e = j.base.saturating_add(records as u64);
     let p = scan.valid_len;
-    let keep_all = Classified::Keep {
-        keep: p,
-        records,
-        written: false,
-    };
-    let refuse = |offset, at_byte, reason: &str, repair_at| Classified::Corrupt {
-        offset,
-        at_byte,
-        reason: reason.to_string(),
-        repair_at,
-    };
     // A later intact record in a newer format must refuse before ANY path that
     // could cut the damaged tail, including explicit repair and unclean Relaxed
     // recovery. Preserve its own location, not the earlier damage's cut point.
@@ -203,84 +262,72 @@ pub(crate) fn classify(scan: &Scan, j: &Judge<'_>) -> Classified {
     } else {
         frames_after(j.bytes, p, e, j.key)
     };
-    for f in &after {
-        if let Found::Newer {
+    if let Some((offset, at_byte, version)) = first_newer_after(&after) {
+        return Classified::Newer {
             offset,
             at_byte,
             version,
-        } = f
-        {
-            return Classified::Newer {
-                offset: *offset,
-                at_byte: *at_byte,
-                version: *version,
-            };
-        }
+        };
     }
-    match (&scan.tail, j.floor) {
-        (
-            Tail::Newer {
-                offset,
-                at_byte,
-                version,
-            },
-            _,
-        ) => Classified::Newer {
+    match &scan.tail {
+        Tail::Newer {
+            offset,
+            at_byte,
+            version,
+        } => Classified::Newer {
             offset: *offset,
             at_byte: *at_byte,
             version: *version,
         },
-        // The floor unknown: the rules that predate it, verbatim — a clean log or a
-        // torn tail is kept up to its prefix, anything else refused.
-        (Tail::Clean | Tail::Torn, None) => keep_all,
-        (
-            Tail::Corrupt {
-                offset,
-                at_byte,
-                reason,
-                repair_at,
-                ..
-            },
-            None,
-        )
-        // A shape only a writer makes is refused whatever the floor says.
-        | (
-            Tail::Corrupt {
-                offset,
-                at_byte,
-                reason,
-                repair_at,
-                tear: false,
-            },
-            Some(_),
-        ) => refuse(*offset, *at_byte, reason, *repair_at),
-        (Tail::Clean, Some(floor)) => {
-            // A log that ends cleanly below its floor is SHORTER than its last open saw
-            // — a restored copy, or another file — not damaged: nothing here is cut, and
-            // the identity rules move the generation for the shortening.
-            let Some((b0, b0_at)) = batch_start(scan, floor) else {
-                return keep_all;
-            };
-            if b0 < e && !j.unclean_relaxed {
-                // The file ends inside a sealing build's batch above the floor: its
-                // records say the batch continues, and its sealed last record never
-                // landed. Cut it whole. No rot ends a file early, so this is a write
-                // that never finished; in the boot that wrote it, a dead process's own
-                // (never acked), so the cut moves nothing — in another, the power loss
-                // that cut it short is announced as a precaution.
-                Classified::Keep {
-                    keep: b0_at,
-                    records: b0.saturating_sub(j.base) as usize,
-                    written: !j.same_boot,
+        Tail::Clean => match j.floor {
+            // The floor unknown: the rules that predate it, verbatim — a clean log or a
+            // torn tail is kept up to its prefix, anything else refused.
+            None => keep_all(p, records),
+            Some(floor) => {
+                // A log that ends cleanly below its floor is SHORTER than its last open saw
+                // — a restored copy, or another file — not damaged: nothing here is cut, and
+                // the identity rules move the generation for the shortening.
+                let Some((b0, b0_at)) = batch_start(scan, floor) else {
+                    return keep_all(p, records);
+                };
+                if b0 < e && !j.unclean_relaxed {
+                    // The file ends inside a sealing build's batch above the floor: its
+                    // records say the batch continues, and its sealed last record never
+                    // landed. Cut it whole. No rot ends a file early, so this is a write
+                    // that never finished; in the boot that wrote it, a dead process's own
+                    // (never acked), so the cut moves nothing — in another, the power loss
+                    // that cut it short is announced as a precaution.
+                    Classified::Keep {
+                        keep: b0_at,
+                        records: b0.saturating_sub(j.base) as usize,
+                        written: !j.same_boot,
+                    }
+                } else {
+                    keep_all(p, records)
                 }
-            } else {
-                keep_all
             }
-        }
-        (Tail::Torn, Some(floor)) => damaged(scan, j, &after, floor, e, p, "a torn tail"),
-        (Tail::Corrupt { reason, tear: true, .. }, Some(floor)) => {
-            damaged(scan, j, &after, floor, e, p, reason)
-        }
+        },
+        Tail::Torn => match j.floor {
+            None => keep_all(p, records),
+            Some(floor) => damaged(scan, j, &after, floor, e, p, "a torn tail"),
+        },
+        Tail::Corrupt {
+            offset,
+            at_byte,
+            reason,
+            repair_at,
+            tear,
+        } => match j.floor {
+            Some(floor) if *tear => damaged(scan, j, &after, floor, e, p, reason),
+            // A shape only a writer makes (`!tear`), or any corruption when the floor is
+            // unknown, is refused.
+            _ => Classified::Corrupt {
+                offset: *offset,
+                at_byte: *at_byte,
+                reason: reason.clone(),
+                repair_at: *repair_at,
+            },
+        },
     }
 }
 
@@ -373,13 +420,25 @@ fn damaged(
 /// Where the unit the first damage (or the end) falls in starts, by offset and byte:
 /// the later of the end of the last record that ends a unit and the floor. `None` when
 /// the floor is above the intact prefix.
-fn batch_start(scan: &Scan, floor: u64) -> Option<(u64, usize)> {
-    let floor_at = scan.floor_at?;
+const fn batch_start(scan: &Scan, floor: u64) -> Option<(u64, usize)> {
+    let Some(floor_at) = scan.floor_at else {
+        return None;
+    };
     Some(if scan.seal_end.0 >= floor {
         scan.seal_end
     } else {
         (floor, floor_at)
     })
+}
+
+const fn has_nonzero(mut bytes: &[u8]) -> bool {
+    while let &[b, ref tail @ ..] = bytes {
+        if b != 0 {
+            return true;
+        }
+        bytes = tail;
+    }
+    false
 }
 
 /// Whether the file ends inside the frame at byte `p`: something other than zeros is
@@ -391,7 +450,7 @@ fn ends_inside_a_frame(bytes: &[u8], p: usize) -> bool {
     let Some(rest) = bytes.get(p..) else {
         return false;
     };
-    rest.iter().any(|&b| b != 0) && matches!(Frame::decode(rest), Ok(None))
+    has_nonzero(rest) && matches!(Frame::decode(rest), Ok(None))
 }
 
 /// Whether the damaged frame at byte `p` is the shape a WRITTEN record leaves damaged
@@ -409,24 +468,56 @@ fn written_frame(bytes: &[u8], p: usize) -> bool {
 /// EMPTY frame claims no payload, so what decides is whether anything follows it: a
 /// header torn after its first four bytes ends the file, or is followed by zeros, while
 /// a real record whose header's last eight bytes were zeroed has its payload behind it.
+const fn header_len_field(hdr: &[u8; HEADER_SIZE]) -> usize {
+    ((hdr[4] as u32) | ((hdr[5] as u32) << 8) | ((hdr[6] as u32) << 16) | ((hdr[7] as u32) << 24))
+        as usize
+}
+
+const fn split_header_len_field(rest: &[u8]) -> Option<(usize, &[u8])> {
+    let &[h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, ref after_hdr @ ..] = rest else {
+        return None;
+    };
+    let len = header_len_field(&[h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11]);
+    Some((len, after_hdr))
+}
+
+const fn header_crc_and_magic_v1(hdr: &[u8; HEADER_SIZE]) -> Option<u32> {
+    let crc = (hdr[8] as u32)
+        | ((hdr[9] as u32) << 8)
+        | ((hdr[10] as u32) << 16)
+        | ((hdr[11] as u32) << 24);
+    if hdr[0] != MAGIC[0] || hdr[1] != MAGIC[1] || hdr[2] != VERSION {
+        return None;
+    }
+    Some(crc)
+}
+
+const fn split_header_crc_and_magic_v1(rest: &[u8]) -> Option<(u32, &[u8])> {
+    let &[h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, ref payload @ ..] = rest else {
+        return None;
+    };
+    let Some(crc) = header_crc_and_magic_v1(&[h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11])
+    else {
+        return None;
+    };
+    Some((crc, payload))
+}
+
 fn whole_sized(bytes: &[u8], p: usize) -> bool {
     let Some(rest) = bytes.get(p..) else {
         return false;
     };
-    let Some(len_bytes) = rest.get(4..8).and_then(|b| b.try_into().ok()) else {
+    let Some((len, after_hdr)) = split_header_len_field(rest) else {
         return false;
     };
-    let len = u32::from_le_bytes(len_bytes) as usize;
     let Some(claimed) = (if len == 0 {
-        rest.get(HEADER_SIZE..)
+        Some(after_hdr)
     } else {
-        HEADER_SIZE
-            .checked_add(len)
-            .and_then(|whole| rest.get(HEADER_SIZE..whole))
+        after_hdr.get(..len)
     }) else {
         return false;
     };
-    claimed.iter().any(|&b| b != 0)
+    has_nonzero(claimed)
 }
 
 /// Whether the frame at byte `p` is a WHOLE record running exactly to the end of the
@@ -439,16 +530,13 @@ fn whole_to_eof(bytes: &[u8], p: usize) -> bool {
     let Some(rest) = bytes.get(p..) else {
         return false;
     };
-    let Some(payload) = rest.get(HEADER_SIZE..).filter(|b| b.len() >= MIN_PAYLOAD) else {
+    let Some((crc, payload)) = split_header_crc_and_magic_v1(rest) else {
         return false;
     };
-    let Some(crc_bytes) = rest.get(8..12).and_then(|b| b.try_into().ok()) else {
+    if payload.len() < MIN_PAYLOAD {
         return false;
-    };
-    let crc = u32::from_le_bytes(crc_bytes);
-    rest.get(..2) == Some(MAGIC.as_slice())
-        && rest.get(2) == Some(&VERSION)
-        && crc32_ieee(payload) == crc
+    }
+    crc32_ieee(payload) == crc
 }
 
 /// Whether a record with offset `s` can START `q` bytes after the damaged record `e`:
@@ -456,13 +544,23 @@ fn whole_to_eof(bytes: &[u8], p: usize) -> bool {
 /// the `s - e` records before it fill exactly `q` bytes, and record `e` itself starts
 /// at the damage, never after it. A frame anywhere else is not a record at its place:
 /// one carried inside another record's body (see the module docs).
-fn placed(s: u64, e: u64, q: usize) -> bool {
-    let Some(n) = s.checked_sub(e).filter(|&n| n > 0) else {
+const fn placed(s: u64, e: u64, q: usize) -> bool {
+    let Some(n) = s.checked_sub(e) else {
         return false;
     };
+    if n == 0 {
+        return false;
+    }
     let q = q as u64;
-    n.checked_mul(MIN_FRAME).is_some_and(|lo| lo <= q)
-        && n.checked_mul(MAX_FRAME).is_none_or(|hi| q <= hi)
+    let lo_ok = match n.checked_mul(MIN_FRAME) {
+        Some(lo) => lo <= q,
+        None => false,
+    };
+    let hi_ok = match n.checked_mul(MAX_FRAME) {
+        Some(hi) => q <= hi,
+        None => true,
+    };
+    lo_ok && hi_ok
 }
 
 /// One intact frame found after the damage, parsed as a record: the record and its mark.
@@ -529,21 +627,31 @@ fn frames_after(bytes: &[u8], p: usize, e: u64, key: Option<&[u8; 32]>) -> Vec<F
             Some(_) => {
                 // Records from `p` on are dense and each takes at least a minimal sealed
                 // frame, so the one at byte `q` carries an offset below this bound.
-                let last = e.saturating_add(q as u64 / MIN_SEALED_FRAME + 1);
-                (next..=last)
-                    .find_map(|o| {
-                        let pt = open_disk_payload(key, o, d.frame.payload.clone())?;
-                        if let Some((r, mark)) = BrokerRecord::from_payload_marked(&pt) {
-                            return (r.seq.0 == o).then_some(Found::Record(r, mark));
+                let last = e.saturating_add((q as u64 / MIN_SEALED_FRAME).saturating_add(1));
+                let mut keyed_found = Found::Foreign;
+                for o in next..=last {
+                    let Some(pt) = open_disk_payload(key, o, d.frame.payload.clone()) else {
+                        continue;
+                    };
+                    if let Some((r, mark)) = BrokerRecord::from_payload_marked(&pt) {
+                        if r.seq.0 == o {
+                            keyed_found = Found::Record(r, mark);
+                            break;
                         }
-                        let version = crate::brecord::newer_format(&pt, Some(o))?;
-                        placed(o, e, q).then_some(Found::Newer {
-                            offset: o,
-                            at_byte: p.saturating_add(q),
-                            version,
-                        })
-                    })
-                    .unwrap_or(Found::Foreign)
+                        continue;
+                    }
+                    if let Some(version) = crate::brecord::newer_format(&pt, Some(o)) {
+                        if placed(o, e, q) {
+                            keyed_found = Found::Newer {
+                                offset: o,
+                                at_byte: p.saturating_add(q),
+                                version,
+                            };
+                            break;
+                        }
+                    }
+                }
+                keyed_found
             }
         };
         match &found {
@@ -562,18 +670,54 @@ fn frames_after(bytes: &[u8], p: usize, e: u64, key: Option<&[u8; 32]>) -> Vec<F
     out
 }
 
+const fn seq_prefix_of(prefix: &[u8; 9]) -> u64 {
+    (prefix[1] as u64)
+        | ((prefix[2] as u64) << 8)
+        | ((prefix[3] as u64) << 16)
+        | ((prefix[4] as u64) << 24)
+        | ((prefix[5] as u64) << 32)
+        | ((prefix[6] as u64) << 40)
+        | ((prefix[7] as u64) << 48)
+        | ((prefix[8] as u64) << 56)
+}
+
 /// The offset a payload's version-independent prefix names (its bytes 1..9).
-fn seq_of(payload: &[u8]) -> u64 {
-    payload
-        .get(1..9)
-        .and_then(|b| b.try_into().ok())
-        .map_or(0, u64::from_le_bytes)
+const fn seq_of(payload: &[u8]) -> u64 {
+    let &[b0, b1, b2, b3, b4, b5, b6, b7, b8, ref _rest @ ..] = payload else {
+        return 0;
+    };
+    seq_prefix_of(&[b0, b1, b2, b3, b4, b5, b6, b7, b8])
 }
 
 /// Whether any intact record at its place (or any frame a keyed log cannot place)
 /// follows byte `p`.
-fn intact_records_after(after: &[Found]) -> bool {
-    after.iter().any(|f| !matches!(f, Found::Nothing))
+const fn intact_records_after(mut after: &[Found]) -> bool {
+    while let &[ref f, ref tail @ ..] = after {
+        if !matches!(f, Found::Nothing) {
+            return true;
+        }
+        after = tail;
+    }
+    false
+}
+
+/// Whether a sealed batch ending at `s` with `count` records is the torn batch's own
+/// seal (`(start, own)`).
+const fn seal_is_own(
+    s: u64,
+    count: u32,
+    own_seal: Option<u64>,
+    b0: u64,
+    floor: u64,
+    seal_end: u64,
+) -> (u64, bool) {
+    let start = s.saturating_add(1).saturating_sub(count as u64);
+    // The batch the damage falls in starts at `b0` — or, where retention
+    // raised the base above where it started, somewhere below a floor no
+    // unit's end reached.
+    let own =
+        own_seal.is_none() && (start == b0 || (start < b0 && b0 == floor && seal_end < floor));
+    (start, own)
 }
 
 /// Judge every intact frame after the damage at byte `p` (offset `e`) against the torn
@@ -620,12 +764,7 @@ fn resync(after: &[Found], e: u64, b0: u64, floor: u64, seal_end: u64) -> Result
             }
             Mark::Continues => {}
             Mark::Seal(count) => {
-                let start = s.saturating_add(1).saturating_sub(u64::from(count));
-                // The batch the damage falls in starts at `b0` — or, where retention
-                // raised the base above where it started, somewhere below a floor no
-                // unit's end reached.
-                let own = own_seal.is_none()
-                    && (start == b0 || (start < b0 && b0 == floor && seal_end < floor));
+                let (start, own) = seal_is_own(s, count, own_seal, b0, floor, seal_end);
                 if !own {
                     return Err(format!(
                         "a sealed batch (offsets {start}..={s}) is intact behind the damage at \

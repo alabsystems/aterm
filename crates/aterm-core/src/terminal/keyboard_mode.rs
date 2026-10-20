@@ -54,8 +54,34 @@ pub(crate) fn keyboard_mode_from_state(
     // `KeyboardMode::WIN32_INPUT`).
     if modes.win32_input_active() {
         km.insert(KeyboardMode::WIN32_INPUT);
+        // Which host asked: OpenConsole reads KP_Begin and F13-F20 from records
+        // where conhost keeps their legacy bytes (`KeyboardMode::OPENCONSOLE_HOST`).
+        if modes.win32_input_openconsole {
+            km.insert(KeyboardMode::OPENCONSOLE_HOST);
+        }
     }
     km
+}
+
+/// The xterm modifyOtherKeys / formatOtherKeys state (XTMODKEYS / XTFMTKEYS) a
+/// session offers: `xterm` itself, or the defaults behind a Windows console
+/// host ([`TerminalModes::win32_input_enabled`]). conhost reads the key bytes
+/// and has no `CSI 27 ; m ; c ~` or `CSI c ; m u` dialect, so under a native
+/// console program's `CSI > 4 ; 2 m` every Ctrl, Alt and Shift character chord
+/// reached it as nothing (measured 2026-10-18 under OpenConsole and the inbox
+/// conhost: PSReadLine lost Shift+A, Ctrl+A/E/K and Alt+B, and the level
+/// outlived the program). There the family is refused as the kitty protocol is:
+/// setters are ignored, a query reads level 0, and a level negotiated before
+/// the host said so stops reaching the encoder.
+pub(crate) fn offered_xterm_keyboard(
+    modes: &TerminalModes,
+    xterm: XtermKeyboardState,
+) -> XtermKeyboardState {
+    if modes.win32_input_enabled {
+        XtermKeyboardState::new()
+    } else {
+        xterm
+    }
 }
 
 impl Terminal {
@@ -66,13 +92,15 @@ impl Terminal {
     #[must_use]
     pub fn keyboard_mode(&self) -> KeyboardMode {
         // Capability off ⇒ derive as if the protocol is unsupported: no kitty
-        // bits even if flags were negotiated before the host disabled it.
+        // bits even if flags were negotiated before the host disabled it. The
+        // xterm modifier family goes the same way behind a console host.
         let kitty = if self.modes().kitty_keyboard_enabled {
             self.kitty_keyboard_flags()
         } else {
             KittyKeyboardFlags::none()
         };
-        keyboard_mode_from_state(self.modes(), kitty, *self.xterm_keyboard())
+        let xterm = offered_xterm_keyboard(self.modes(), *self.xterm_keyboard());
+        keyboard_mode_from_state(self.modes(), kitty, xterm)
     }
 
     /// Whether the kitty keyboard protocol's `REPORT_ALL_KEYS_AS_ESC` (0b1000)
@@ -556,6 +584,39 @@ mod shift_enter_e2e_tests {
         assert!(!native.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
         assert_eq!(native.take_response().unwrap_or_default(), b"\x1b[?0u");
     }
+
+    /// Which console host asked for 9001 rides with it: `OPENCONSOLE_HOST` is
+    /// set exactly while win32-input-mode is active and the embedder said the
+    /// host is OpenConsole, survives a program's RIS (host policy), reaches the
+    /// lock-free word, and goes when the embedder says conhost.
+    #[test]
+    fn the_openconsole_host_bit_rides_with_win32_input_mode() {
+        let oc = |t: &Terminal| {
+            (
+                t.keyboard_mode().contains(KeyboardMode::OPENCONSOLE_HOST),
+                t.mode_mirror()
+                    .keyboard_mode()
+                    .contains(KeyboardMode::OPENCONSOLE_HOST),
+            )
+        };
+        let mut term = conpty_term();
+        term.set_win32_input_openconsole(true);
+        assert_eq!(oc(&term), (false, false), "nothing before the host's 9001");
+        term.process(b"\x1b[?9001h");
+        assert_eq!(oc(&term), (true, true));
+        term.process(b"\x1bc");
+        assert_eq!(oc(&term), (false, false), "RIS clears 9001 itself");
+        term.process(b"\x1b[?9001h");
+        assert_eq!(oc(&term), (true, true), "but keeps the host policy");
+        term.set_win32_input_openconsole(false);
+        assert_eq!(oc(&term), (false, false));
+        assert!(term.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
+        // Without a console host the bit is inert.
+        let mut native = Terminal::new(24, 80);
+        native.set_win32_input_openconsole(true);
+        native.process(b"\x1b[?9001h");
+        assert_eq!(oc(&native), (false, false));
+    }
 }
 
 #[cfg(test)]
@@ -648,5 +709,116 @@ mod kitty_capability_toggle_tests {
         assert!(!term.is_kitty_keyboard_enabled());
         term.process(b"\x1b[?u");
         assert_eq!(term.take_response(), None);
+    }
+}
+
+#[cfg(test)]
+mod console_host_modify_other_keys_tests {
+    //! Behind a Windows console host a native console program's `CSI > 4 ; 2 m`
+    //! reaches the terminal (OpenConsole and the inbox conhost both forward it),
+    //! and conhost, which reads the key bytes, has no reader for the
+    //! `CSI 27 ; m ; c ~` chords it would ask for: PSReadLine got nothing for
+    //! Shift+A, Ctrl+A/E/K or Alt+B until the level was reset (measured
+    //! 2026-10-18). The session refuses the family as it refuses kitty's.
+    use crate::grid::ResizePolicy;
+    use crate::terminal::Terminal;
+    use crate::terminal::program_evidence;
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey, encode_key_with_layout};
+
+    /// The chords the measurement lost, as the GUI's input seam encodes them
+    /// (the lock-free word).
+    fn chords(term: &Terminal) -> Vec<Vec<u8>> {
+        let c = |k: char| Key::Character(k);
+        let n = Key::Named;
+        let cases = [
+            (c('a'), Modifiers::CTRL),
+            (c('e'), Modifiers::CTRL),
+            (c('k'), Modifiers::CTRL),
+            (c('A'), Modifiers::SHIFT),
+            (c('@'), Modifiers::SHIFT),
+            (c('a'), Modifiers::ALT),
+            (c('b'), Modifiers::ALT),
+            (c('a'), Modifiers::CTRL | Modifiers::ALT),
+            (c('K'), Modifiers::CTRL | Modifiers::SHIFT),
+            (c('i'), Modifiers::CTRL),
+            (n(NamedKey::Tab), Modifiers::SHIFT),
+            (n(NamedKey::Tab), Modifiers::CTRL),
+            (n(NamedKey::Enter), Modifiers::ALT),
+        ];
+        cases
+            .iter()
+            .map(|(key, mods)| {
+                encode_key_with_layout(
+                    key,
+                    *mods,
+                    term.mode_mirror().keyboard_mode(),
+                    KeyEventType::Press,
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    fn session(policy: ResizePolicy) -> Terminal {
+        let mut term = Terminal::new(24, 80);
+        term.set_console_host_posture(policy);
+        // conhost's own request at every ConPTY start; ignored elsewhere.
+        term.process(b"\x1b[?9001h");
+        term
+    }
+
+    fn mok_query(term: &mut Terminal) -> Vec<u8> {
+        term.process(b"\x1b[?4m");
+        term.take_response().unwrap_or_default()
+    }
+
+    #[test]
+    fn a_console_host_session_ignores_modify_other_keys_and_reads_level_0() {
+        let untouched = chords(&session(ResizePolicy::ConPty));
+        assert_eq!(untouched[0], [0x01], "control: legacy Ctrl+A is ^A");
+        assert_eq!(untouched[3], b"A", "control: legacy Shift+A is A");
+
+        // Control: off a console host the request takes, and the chords change.
+        let mut native = session(ResizePolicy::Native);
+        native.process(b"\x1b[>4;2m");
+        assert_eq!(mok_query(&mut native), b"\x1b[>4;2m");
+        assert_eq!(chords(&native)[0], b"\x1b[27;5;97~");
+
+        let mut term = session(ResizePolicy::ConPty);
+        let requests: [&[u8]; 4] = [b"\x1b[>4;2m", b"\x1b[>4;1m", b"\x1b[>4;1f", b"\x1b[>4n"];
+        for level in requests {
+            term.process(level);
+            assert_eq!(chords(&term), untouched, "{level:?}");
+            assert_eq!(mok_query(&mut term), b"\x1b[>4;0m", "{level:?}");
+        }
+        term.process(b"\x1b[?4g");
+        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[>4;0f");
+        assert_eq!(
+            term.keyboard_mode().xterm_modify_other_keys_level(),
+            0,
+            "`ctl modes` reads the level the encoder uses"
+        );
+        // Refused, so neither evidence of a program holding the terminal nor
+        // anything for a handback to undo.
+        assert_eq!(
+            term.take_evidence_asserted()
+                & (program_evidence::MODIFY_OTHER_KEYS | program_evidence::FORMAT_OTHER_KEYS),
+            0
+        );
+        assert!(!term.program_owns_terminal());
+    }
+
+    #[test]
+    fn a_level_negotiated_before_the_console_host_posture_stops_reaching_the_encoder() {
+        let mut term = session(ResizePolicy::Native);
+        term.process(b"\x1b[>4;2m");
+        let negotiated = chords(&term);
+        term.set_console_host_posture(ResizePolicy::ConPty);
+        term.process(b"\x1b[?9001h");
+        assert_eq!(chords(&term), chords(&session(ResizePolicy::ConPty)));
+        assert_eq!(mok_query(&mut term), b"\x1b[>4;0m");
+        // The posture gates the capability; it does not destroy the negotiation.
+        term.set_console_host_posture(ResizePolicy::Native);
+        assert_eq!(chords(&term), negotiated);
     }
 }

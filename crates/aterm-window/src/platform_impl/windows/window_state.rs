@@ -5,7 +5,9 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 // Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
-// Use pointer-typed null arguments and checks in Windows window-state operations.
+// Use pointer-typed null arguments and checks in Windows window-state operations. Keep a
+// hidden window's maximize for its reveal, which shows it maximized in one step. `ImeState` is
+// `Copy`, for `ime::ime_events`.
 
 use crate::dpi::{PhysicalPosition, PhysicalSize, Size};
 use crate::icon::Icon;
@@ -19,13 +21,14 @@ use windows_sys::Win32::Graphics::Gdi::InvalidateRgn;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, EnableMenuItem, GetMenu, GetSystemMenu, GetWindowLongW, SendMessageW,
     SetWindowLongW, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, HWND_BOTTOM, HWND_NOTOPMOST,
-    HWND_TOPMOST, MF_BYCOMMAND, MF_DISABLED, MF_ENABLED, SC_CLOSE, SWP_ASYNCWINDOWPOS,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREPOSITION, SWP_NOSIZE, SWP_NOZORDER,
-    SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, WINDOWPLACEMENT,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
-    WS_CLIPSIBLINGS, WS_EX_ACCEPTFILES, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_EX_WINDOWEDGE, WS_MAXIMIZE, WS_MAXIMIZEBOX, WS_MINIMIZE,
-    WS_MINIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SIZEBOX, WS_SYSMENU, WS_VISIBLE,
+    HWND_TOPMOST, MF_BYCOMMAND, MF_DISABLED, MF_ENABLED, SC_CLOSE, SHOW_WINDOW_CMD,
+    SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREPOSITION, SWP_NOSIZE,
+    SWP_NOZORDER, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE,
+    WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_STYLE, WS_BORDER, WS_CAPTION, WS_CHILD,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_ACCEPTFILES, WS_EX_APPWINDOW, WS_EX_LAYERED,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_EX_WINDOWEDGE, WS_MAXIMIZE,
+    WS_MAXIMIZEBOX, WS_MINIMIZE, WS_MINIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SIZEBOX,
+    WS_SYSMENU, WS_VISIBLE,
 };
 
 /// Contains information about states and the window that the callback is going to use.
@@ -136,7 +139,7 @@ aterm_types::bitflags! {
     }
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImeState {
     Disabled,
     Enabled,
@@ -321,6 +324,29 @@ impl WindowFlags {
         (style, style_ex)
     }
 
+    /// aterm: the `ShowWindow` command [`Self::apply_diff`] shows a window with, going
+    /// from `old` to `new` (visible). No activation for a window that asked for none; for a
+    /// hidden window revealed maximized, `SW_SHOWMAXIMIZED` (`SW_MAXIMIZE`, the same value),
+    /// which shows it maximized in one step instead of at its normal frame first and then
+    /// maximized on glass.
+    fn show_command(old: WindowFlags, new: WindowFlags) -> SHOW_WINDOW_CMD {
+        if !old.contains(WindowFlags::MARKER_ACTIVATE) {
+            SW_SHOWNOACTIVATE
+        } else if !old.contains(WindowFlags::VISIBLE) && new.contains(WindowFlags::MAXIMIZED) {
+            SW_MAXIMIZE
+        } else {
+            SW_SHOW
+        }
+    }
+
+    /// aterm: whether a maximize waits for the window's reveal ([`Self::show_command`]):
+    /// a hidden window's. `SW_MAXIMIZE` would show it, and `apply_diff`'s `SW_HIDE` hide it
+    /// again, on glass; nor does it take the `WS_MAXIMIZE` style early, which `ShowWindow`
+    /// reads as "already maximized" and would then show it at its normal frame.
+    fn maximize_waits_for_reveal(new: WindowFlags) -> bool {
+        new.contains(WindowFlags::MAXIMIZED) && !new.contains(WindowFlags::VISIBLE)
+    }
+
     /// Adjust the window client rectangle to the return value, if present.
     fn apply_diff(mut self, window: HWND, mut new: WindowFlags) {
         self = self.mask();
@@ -333,14 +359,8 @@ impl WindowFlags {
         }
 
         if new.contains(WindowFlags::VISIBLE) {
-            let flag = if !self.contains(WindowFlags::MARKER_ACTIVATE) {
-                self.set(WindowFlags::MARKER_ACTIVATE, true);
-                SW_SHOWNOACTIVATE
-            } else {
-                SW_SHOW
-            };
             unsafe {
-                ShowWindow(window, flag);
+                ShowWindow(window, Self::show_command(self, new));
             }
         }
 
@@ -367,7 +387,10 @@ impl WindowFlags {
             }
         }
 
-        if diff.contains(WindowFlags::MAXIMIZED) || new.contains(WindowFlags::MAXIMIZED) {
+        let maximize_hidden = Self::maximize_waits_for_reveal(new);
+        if (diff.contains(WindowFlags::MAXIMIZED) || new.contains(WindowFlags::MAXIMIZED))
+            && !maximize_hidden
+        {
             unsafe {
                 ShowWindow(window, match new.contains(WindowFlags::MAXIMIZED) {
                     true => SW_MAXIMIZE,
@@ -404,7 +427,9 @@ impl WindowFlags {
         }
 
         if diff != WindowFlags::empty() {
-            let (style, style_ex) = new.to_window_styles();
+            // aterm: no `WS_MAXIMIZE` ahead of the reveal (`maximize_waits_for_reveal`).
+            let styled = if maximize_hidden { new - WindowFlags::MAXIMIZED } else { new };
+            let (style, style_ex) = styled.to_window_styles();
 
             unsafe {
                 SendMessageW(window, event_loop::SET_RETAIN_STATE_ON_SIZE_MSG_ID.get(), 1, 0);
@@ -549,5 +574,37 @@ impl CursorFlags {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod reveal_tests {
+    use super::WindowFlags;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_MAXIMIZE, SW_SHOW, SW_SHOWNOACTIVATE};
+
+    /// aterm: a hidden window maximized before its reveal keeps the maximize for the
+    /// reveal, which shows it maximized in one step; a shown window maximizes at once.
+    #[test]
+    fn a_hidden_window_is_revealed_maximized_in_one_step() {
+        let hidden = WindowFlags::MARKER_ACTIVATE | WindowFlags::RESIZABLE;
+        let hidden_max = hidden | WindowFlags::MAXIMIZED;
+        let shown = hidden | WindowFlags::VISIBLE;
+        // The maximize of the hidden window waits; a shown window's does not.
+        assert!(WindowFlags::maximize_waits_for_reveal(hidden_max));
+        assert!(!WindowFlags::maximize_waits_for_reveal(shown | WindowFlags::MAXIMIZED));
+        assert!(!WindowFlags::maximize_waits_for_reveal(hidden));
+        // Its reveal shows it maximized; a plain reveal or a shown window shows as before.
+        assert_eq!(
+            WindowFlags::show_command(hidden_max, hidden_max | WindowFlags::VISIBLE),
+            SW_MAXIMIZE
+        );
+        assert_eq!(WindowFlags::show_command(hidden, shown), SW_SHOW);
+        assert_eq!(WindowFlags::show_command(shown, shown | WindowFlags::MAXIMIZED), SW_SHOW);
+        // A window that asked not to be activated is never activated by its reveal.
+        let passive = WindowFlags::MAXIMIZED;
+        assert_eq!(
+            WindowFlags::show_command(passive, passive | WindowFlags::VISIBLE),
+            SW_SHOWNOACTIVATE
+        );
     }
 }

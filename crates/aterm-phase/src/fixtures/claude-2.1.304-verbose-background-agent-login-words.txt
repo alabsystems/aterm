@@ -1,0 +1,25 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a background Agent (run_in_background) under `claude --verbose` whose reply was 'Not logged in · Please run /login', its completion delivered: the notice row alone (`⏺ Agent "Login check" finished · 0s`), no output drawn under it
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ toolstart
+
+⏺ Agent(Login check)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Started the agent.
+
+✻ Waiting for 1 background agent to finish
+
+⏺ Agent "Login check" finished · 0s
+
+⏺ Tool call done.
+
+✻ Sautéed for 0s · done 5:42 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · /tasks to see subagents                                                                                      13200 tokens

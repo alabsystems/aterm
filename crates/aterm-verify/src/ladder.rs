@@ -133,7 +133,9 @@ impl Report {
 
     /// [`Report::fail_child`] for a `targo test` child that ran under `env`:
     /// one finding per failed test when the log accounts for every one
-    /// ([`findings::test_findings`]).
+    /// ([`findings::test_findings`]), and a COULD NOT RUN row for the tests
+    /// beside them that refused the machine ([`findings::split_test_findings`]):
+    /// a host with no fish never reads as a failure of the tree.
     pub fn fail_test_child(
         &mut self,
         run: &Run,
@@ -142,7 +144,14 @@ impl Report {
     ) {
         let label = label.into();
         if !self.child_could_not_run(run, &label) {
-            let found = findings::test_findings(&label, &run.output, env);
+            let (found, refused) = findings::split_test_findings(&label, &run.output, env);
+            if !refused.is_empty() {
+                let who = format!("{} of its failing tests", refused.len());
+                self.cannot_run(format!(
+                    "{label} — {}",
+                    crate::libtest::refusal_reason(&who, &refused, &run.output)
+                ));
+            }
             self.fail_with(label, found);
         }
     }
@@ -386,7 +395,8 @@ mod tests {
         assert_eq!(found[0].message, ["error[E0308]: mismatched types"]);
     }
 
-    /// One plain failure beside the refusals makes the test child a finding.
+    /// One plain failure beside the refusals makes the test child a finding:
+    /// that failure alone, and the refusals beside it a COULD NOT RUN row.
     #[test]
     fn a_test_child_whose_every_failure_is_a_refusal_is_could_not_run() {
         let sentinel = crate::libtest::COULD_NOT_RUN_SENTINEL;
@@ -412,11 +422,17 @@ mod tests {
         r.decide_test_child(&run(log("assertion failed: a finding")), "found", &[]);
         let t = tally(std::slice::from_ref(&r));
         assert_eq!(t.gate_failures, ["found"]);
-        assert_eq!(t.could_not_run.len(), 1, "{t:?}");
+        assert_eq!(t.could_not_run.len(), 2, "{t:?}");
+        assert_eq!(
+            t.could_not_run[1],
+            "found — 1 of its failing tests refused the machine, not the tree (a) — strays alive",
+            "the refusal named with what it said: {t:?}"
+        );
         let ids: Vec<String> = r.findings().into_iter().map(|f| f.id).collect();
         assert_eq!(
             ids,
-            ["-p x --test bridge_e2e -- a", "-p x --test bridge_e2e -- b"]
+            ["-p x --test bridge_e2e -- b"],
+            "the refusal is no finding"
         );
     }
 }

@@ -21,13 +21,19 @@
 //!   pattern to spell. The arms counted: Metal (macOS), wgpu (`wgpu_arm`) and
 //!   GL (`gl_arm`). D3D11 (GW.5) adds itself to the count here.
 //!
-//! It also asks the compiler for `cfg(clean_islands)`.
+//! It also asks the compiler for `cfg(clean_islands)`, and Cargo's cfg query for
+//! `cfg(anchor_rules)` (crates/aterm-spec-anchor/anchor_rules.rs).
 
 #[path = "../aterm-log/clean_islands.rs"]
 mod clean_islands;
 
+// `cfg(anchor_rules)`: which anchor attributes this crate writes.
+#[path = "../aterm-spec-anchor/anchor_rules.rs"]
+mod anchor_rules;
+
 fn main() {
     clean_islands::emit();
+    anchor_rules::emit();
     println!("cargo:rustc-check-cfg=cfg(wgpu_arm)");
     println!("cargo:rustc-check-cfg=cfg(multi_arm)");
     println!("cargo:rustc-check-cfg=cfg(gl_arm)");

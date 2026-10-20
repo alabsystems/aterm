@@ -95,7 +95,6 @@ fn compose(
     };
     let composed = compose_band(
         &mut dst,
-        None,
         &painted,
         &rasters,
         rows,

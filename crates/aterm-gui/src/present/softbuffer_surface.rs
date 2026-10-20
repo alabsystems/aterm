@@ -13,7 +13,7 @@ use std::num::NonZeroU32;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use winit::window::Window;
+use aterm_window::window::Window;
 
 use super::{CpuFrameBuffer, CpuPresenter, DamageRect};
 

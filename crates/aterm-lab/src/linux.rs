@@ -1,0 +1,1528 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The Linux runtime lane on this Mac: one lima VM (Apple's Virtualization
+//! framework, Ubuntu 24.04 LTS on aarch64, Rosetta for x86_64) in which the
+//! lane builds and runs this checkout's Linux tests on both architectures and
+//! drives a real aterm under Xvfb, headless weston, headless Mutter and
+//! Xwayland, with a session D-Bus and at-spi2-core up and Mesa's software
+//! GL and Vulkan (llvmpipe, lavapipe) as the GPU.
+//!
+//! `linux up|down|status|exec|proof|gone|baseline|clean|destroy`
+//! (`targo --unverified lab linux help`):
+//!
+//! * the VM is made on the first `up` (`limactl create`: 8 CPUs, 16 GiB,
+//!   a sparse disk of at most 60 GiB, no containerd) and kept: a later run
+//!   boots it in about ten seconds;
+//! * this checkout reaches it by a read-only mount at its own path, set
+//!   before each boot, so a lane built from another worktree tests that one;
+//!   a linked worktree's repository git directory is mounted beside it, also
+//!   read-only, so git in the guest reads its history ([`lane_mounts`]);
+//!   everything a build writes stays on the VM's own disk ([`GUEST_DIR`]),
+//!   and is removed when the run ends (a proof, a one-shot `exec`, or the
+//!   `down` that ends an `up`), or when the next run finds that another
+//!   checkout built it ([`BUILT_FROM`]);
+//! * provisioning is [`crate::linux_guest`]'s plan, issued step by step
+//!   through `limactl shell` and stamped with its fingerprint, so a changed
+//!   plan provisions again and an unchanged one costs nothing;
+//! * whatever boots the VM stops it when it ends, except `up`, which holds
+//!   it for `exec` until `down`;
+//! * one run at a time across every checkout: one lock per VM, beside
+//!   lima's instances (`$LIMA_HOME`, else `~/.lima`, as
+//!   `.aterm-linux.lane.lock`; [`lane_lock_path`], [`LaneLock`]), never in a
+//!   checkout.
+//!
+//! The proof (`proof`, and `targo --unverified verify linux`, which runs it)
+//! is [`crate::linux_proof`]. Without lima, the VM or a display it exits 3
+//! with an `aterm-lab: NOT RUN: <why>` line, never 0. The lane is documented
+//! in `docs/LINUX-RUNTIME-LANE.md`.
+
+use std::io::{BufRead as _, BufReader, Read, Write as _};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use aterm_uds::spawnfd::Stdio;
+
+use crate::linux_guest::{self as guest, Arch, Display};
+use crate::paths::paths;
+use crate::{Fail, LAB, Res};
+
+/// The VM's lima name.
+pub const VM: &str = "aterm-linux";
+
+/// What the VM is made with (`limactl create`), the same size on every host.
+/// The disk is a sparse file that grows to what the guest has written, never
+/// past this.
+pub const CPUS: u32 = 8;
+pub const MEMORY_GIB: u32 = 16;
+pub const DISK_GIB: u32 = 60;
+
+/// lima's template for the guest image (the image digest is pinned by the
+/// lima release that ships the template).
+pub const TEMPLATE: &str = "template:ubuntu-24.04";
+
+/// The guest-local directory every build of the lane writes, under the guest
+/// user's home (never a host mount); the end of a run (a proof, a one-shot
+/// `exec`, `down`) and `clean` empty it, and a run that finds another
+/// checkout's output in it empties it first ([`BUILT_FROM`]).
+pub const GUEST_DIR: &str = "aterm-lane";
+
+/// The file in [`GUEST_DIR`] that names the checkout whose build output it
+/// holds. Cargo hashes a path package by its path inside the workspace and
+/// keeps its dep-info relative to it, so the output another checkout left
+/// (`--keep-build`, or an `up` never taken `down`) reads as fresh to this
+/// one's build, which then links that checkout's units: measured 2026-10-19,
+/// when a run took another worktree's aterm-serde-derive and atpkg failed
+/// with E0782 on a method only that worktree's aterm-serde had.
+pub const BUILT_FROM: &str = "built-from";
+
+/// Exit status of a lane that could not run (no lima, no VM, no display):
+/// never a pass.
+pub const NOT_RUN: i32 = 3;
+
+/// Where Homebrew puts `limactl`, after `$LAB_LIMACTL`.
+const LIMACTL_PATHS: [&str; 2] = ["/opt/homebrew/bin/limactl", "/usr/local/bin/limactl"];
+
+/// The verbs, as `linux help` prints them.
+pub const USAGE: &str = "\
+targo --unverified lab linux <verb> — the Linux runtime lane: a lima VM (vz, Ubuntu 24.04 aarch64, Rosetta for x86_64)
+  up                       make the VM on first use, mount this checkout read-only, boot, provision; leaves it running
+  down                     remove the guest's build output and stop the VM (it is kept; the next run boots it in ~10 s)
+  status                   lima, the VM, its mount, provisioning and disk use (guest and host)
+  exec [--arch aarch64|x86_64] [--display xvfb|weston|mutter|xwayland] [--] CMD...
+                           run CMD in the guest at this checkout's path with the arch's cargo environment (stock
+                           Rust {rust}; x86_64: CARGO_BUILD_TARGET and the cross linker, run under Rosetta), under
+                           the display when one is named, with the session bus and at-spi2-core up; the build
+                           output is kept for the next `exec` under `up`, else removed when CMD ends
+  proof [--arch A]... [--display D]... [--keep-build] [--keep-up]
+                           the lane's proof: aterm-uds, aterm-pty and aterm-libc's tests, the libc
+                           oracle's conformance cells, and the windowing crates' and the winit fork's tests
+                           with the displays up, on each arch; then aterm-gui under each
+                           display (and --headless):
+                           a session over its control socket, typed, resized, `status` read, a frame kept;
+                           then, under xvfb and weston, the display killed under a running aterm-gui, and a
+                           person's quit as their control (`gone`);
+                           then LW.4's baseline replayed (below) under every screen of those displays.
+                           Exit 0 pass, 1 a row failed, 3 NOT RUN. Report and frames: $LAB_STATE/linux/
+  gone [--arch A]... [--display D]... [--wgpu-oracle] [--keep-build] [--keep-up]
+                           the proof's display-gone rows alone (xvfb and weston unless named): the display's
+                           servers killed with SIGKILL under a running aterm-gui, at rest and mid-resize (the
+                           server frozen until aterm's requests wait in it), after which aterm-gui must exit by
+                           itself, nonzero and without a panic, say that its display connection ended, and
+                           leave session.toml holding its tab's folder and no crash journal; and a person's
+                           quit (`invoke Quit`, the display up), which must exit 0, say nothing about the
+                           display and save the same layout; --wgpu-oracle builds aterm-gui with aterm-gpu's
+                           wgpu-oracle, so its windows draw on wgpu, and a Wayland mid-resize row must then
+                           show the resize's surface configure rejected inside its error scope
+  cpu [--arch A]... [--display D]... [--keep-build] [--keep-up]
+                           the proof's CPU presenter rows alone (every display unless named): aterm-gui --cpu
+                           typed, resized and photographed twice (after the resize, and after one more line typed),
+                           each frame held to the server's own pixels under xvfb, xvfb without MIT-SHM, xwayland
+                           (lane-bus xgrab) and weston (weston-screenshooter, weston started with --debug); under
+                           mutter, whose pixels the lane cannot read back, only typed, echoed and resized
+  baseline [--arch A]... [--screen S]... [--record | --wgpu-oracle] [--keep-build] [--keep-up]
+                           record a scripted aterm-gui session under each screen (xvfb, xvfb-dpi144, weston,
+                           weston-scale2, mutter, mutter-scale1.5, xwayland): dims and scale, resizes and cast
+                           drift, clipboard and primary, key repeat, compose, XIM and an XDND drop (X11), the
+                           AT-SPI tree and event stream, present percentiles and the item the slowest present
+                           ended in, and the stack under it; replay it against the recordings committed in
+                           crates/aterm-lab/linux-baseline/ (exit 0 same behaviour, 1 it moved, 3 NOT RUN), or
+                           with --record write them there; --wgpu-oracle replays with aterm-gui built with
+                           aterm-gpu's wgpu-oracle, drawing on wgpu (GW.2's Vulkan arm) instead of the GL arm
+  clean                    remove the guest's build output and trim the VM disk (its blocks go back to this Mac)
+  destroy                  delete the VM and its disk (`limactl delete`); the next `up` makes it again
+";
+
+/// `linux <verb> …`.
+///
+/// # Errors
+/// A usage error, or a step that failed.
+pub fn cmd_linux(args: &[String]) -> Res {
+    let verb = args.first().map_or("help", String::as_str);
+    let rest = args.get(1..).unwrap_or_default();
+    match verb {
+        "up" => cmd_up(),
+        "down" => cmd_down(),
+        "status" => cmd_status(),
+        "exec" => cmd_exec(rest),
+        "proof" => crate::linux_proof::cmd_proof(rest),
+        "baseline" => crate::linux_baseline::cmd_baseline(rest),
+        "gone" => crate::linux_proof::cmd_gone(rest),
+        "cpu" => crate::linux_proof::cmd_cpu(rest),
+        "clean" => cmd_clean(),
+        "destroy" => cmd_destroy(),
+        "help" | "-h" | "--help" => {
+            print!("{}", USAGE.replace("{rust}", guest::RUST));
+            Ok(0)
+        }
+        other => Err(Fail::usage(format!(
+            "linux: unknown verb '{other}' ({LAB} linux help)"
+        ))),
+    }
+}
+
+/// A lane that cannot run on this machine: `aterm-lab: NOT RUN: <why>`, exit 3.
+#[must_use]
+pub fn not_run(why: impl std::fmt::Display) -> Fail {
+    Fail::exit(NOT_RUN, format!("NOT RUN: {why}"))
+}
+
+/// What one guest command did.
+#[derive(Debug)]
+pub struct Out {
+    /// `None`: killed by a signal, or never started.
+    pub code: Option<i32>,
+    /// stdout, then stderr (merged in order by [`Lima::shell_streamed`]).
+    pub text: String,
+    pub secs: f64,
+}
+
+impl Out {
+    #[must_use]
+    pub fn ok(&self) -> bool {
+        self.code == Some(0)
+    }
+
+    /// The output's last `n` lines, for a failure's detail.
+    #[must_use]
+    pub fn tail(&self, n: usize) -> String {
+        let lines: Vec<&str> = self.text.lines().collect();
+        lines[lines.len().saturating_sub(n)..].join("\n")
+    }
+}
+
+/// The VM as `limactl list --json` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmState {
+    /// `Running`, `Stopped`, `Broken`, …
+    pub status: String,
+    /// The instance's directory on this Mac (its disk lives there).
+    pub dir: PathBuf,
+    /// Each mount: host location and whether it is writable.
+    pub mounts: Vec<(String, bool)>,
+    pub cpus: u64,
+    pub memory: u64,
+    pub disk: u64,
+}
+
+/// Read the instance named `name` out of `limactl list --json` (one JSON
+/// object per line).
+#[must_use]
+pub fn parse_list(json_lines: &str, name: &str) -> Option<VmState> {
+    json_lines.lines().find_map(|line| {
+        let v = aterm_json::from_str::<aterm_json::Value>(line).ok()?;
+        if v.get("name")?.as_str()? != name {
+            return None;
+        }
+        let mounts = v
+            .get("config")
+            .and_then(|c| c.get("mounts"))
+            .and_then(aterm_json::Value::as_array)
+            .map(|ms| {
+                ms.iter()
+                    .filter_map(|m| {
+                        Some((
+                            m.get("location")?.as_str()?.to_string(),
+                            m.get("writable")
+                                .and_then(aterm_json::Value::as_bool)
+                                .unwrap_or(false),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let num = |k: &str| v.get(k).and_then(aterm_json::Value::as_u64).unwrap_or(0);
+        Some(VmState {
+            status: v.get("status")?.as_str()?.to_string(),
+            dir: PathBuf::from(v.get("dir")?.as_str()?),
+            mounts,
+            cpus: num("cpus"),
+            memory: num("memory"),
+            disk: num("disk"),
+        })
+    })
+}
+
+/// What the guest mounts, each read-only at its own path: the checkout `repo`,
+/// and the git directory its `.git` file names outside it ([`outside_git_dir`]),
+/// so git in the guest reads a linked worktree's history as it does here.
+#[must_use]
+pub fn lane_mounts(repo: &str) -> Vec<String> {
+    let mut mounts = vec![repo.to_string()];
+    mounts.extend(outside_git_dir(Path::new(repo)).map(|dir| dir.to_string_lossy().into_owned()));
+    mounts
+}
+
+/// The repository directory a checkout's `.git` FILE points to outside it: for
+/// a linked worktree (`git worktree add`) the common directory (its gitdir's
+/// `commondir`), which holds the worktree's own `worktrees/<name>`, the objects
+/// and the refs. `None` where `.git` is a directory (inside the checkout's mount
+/// already), names a directory inside the checkout, or does not read.
+#[must_use]
+pub fn outside_git_dir(repo: &Path) -> Option<PathBuf> {
+    let file = std::fs::read_to_string(repo.join(".git")).ok()?;
+    let gitdir = repo.join(file.lines().next()?.strip_prefix("gitdir:")?.trim());
+    let common = match std::fs::read_to_string(gitdir.join("commondir")) {
+        Ok(relative) => gitdir.join(relative.trim()),
+        Err(_) => gitdir,
+    };
+    let common = crate::paths::physical(&common);
+    (!common.starts_with(repo)).then_some(common)
+}
+
+/// The `limactl edit --set` expression that makes `mounts` the VM's mounts,
+/// each read-only at its own path.
+#[must_use]
+pub fn mount_expr(mounts: &[String]) -> String {
+    let entries: Vec<String> = mounts
+        .iter()
+        .map(|path| {
+            let quoted = path.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("{{\"location\": \"{quoted}\", \"writable\": false}}")
+        })
+        .collect();
+    format!(".mounts = [{}]", entries.join(", "))
+}
+
+/// Whether `state`'s mounts are exactly `mounts`, each read-only.
+#[must_use]
+pub fn mounted_exactly(state: &VmState, mounts: &[String]) -> bool {
+    state.mounts.len() == mounts.len()
+        && state
+            .mounts
+            .iter()
+            .zip(mounts)
+            .all(|((have, writable), want)| have == want && !writable)
+}
+
+/// `limactl create`'s arguments for the lane's VM.
+#[must_use]
+pub fn create_args() -> Vec<String> {
+    [
+        "create".to_string(),
+        format!("--name={VM}"),
+        "--tty=false".into(),
+        "--vm-type=vz".into(),
+        "--rosetta".into(),
+        "--arch=aarch64".into(),
+        format!("--cpus={CPUS}"),
+        format!("--memory={MEMORY_GIB}"),
+        format!("--disk={DISK_GIB}"),
+        "--containerd=none".into(),
+        "--mount-none".into(),
+        TEMPLATE.into(),
+    ]
+    .into()
+}
+
+/// The `limactl` to run: `named` (`$LAB_LIMACTL`) alone when it is given,
+/// else the first of Homebrew's paths that `executable` accepts.
+///
+/// # Errors
+/// A relative `named` (usage), or none that runs (NOT RUN).
+pub fn pick_limactl(
+    named: Option<&str>,
+    executable: impl Fn(&str) -> bool,
+) -> Result<String, Fail> {
+    match named {
+        Some(p) if !p.starts_with('/') => Err(Fail::usage(format!(
+            "LAB_LIMACTL={p} must be an absolute path"
+        ))),
+        Some(p) if executable(p) => Ok(p.to_string()),
+        Some(p) => Err(not_run(format!(
+            "LAB_LIMACTL={p} is not an executable limactl"
+        ))),
+        None => LIMACTL_PATHS
+            .into_iter()
+            .find(|p| executable(p))
+            .map(str::to_string)
+            .ok_or_else(|| {
+                not_run("no limactl (brew install lima, or LAB_LIMACTL=/path/to/limactl)")
+            }),
+    }
+}
+
+/// The `limactl` this Mac has.
+pub struct Lima {
+    pub bin: PathBuf,
+}
+
+impl Lima {
+    /// `$LAB_LIMACTL` (an absolute path), else Homebrew's.
+    ///
+    /// # Errors
+    /// No `limactl`: the lane cannot run here.
+    pub fn find() -> Result<Lima, Fail> {
+        if !cfg!(target_arch = "aarch64") {
+            return Err(not_run(
+                "the lane needs Apple silicon (lima's vz VM with Rosetta for x86_64)",
+            ));
+        }
+        if !Path::new("/Library/Apple/usr/libexec/oah/RosettaLinux").exists() {
+            return Err(not_run(
+                "Rosetta for Linux is not installed (softwareupdate --install-rosetta)",
+            ));
+        }
+        let named = std::env::var("LAB_LIMACTL").ok().filter(|p| !p.is_empty());
+        pick_limactl(named.as_deref(), crate::sys::executable).map(|bin| Lima {
+            bin: PathBuf::from(bin),
+        })
+    }
+
+    fn command(&self) -> aterm_uds::spawnfd::Command {
+        let mut c = aterm_uds::spawnfd::command(&self.bin);
+        c.stdin(Stdio::null());
+        c
+    }
+
+    /// Run `limactl ARGS`, capturing what it says.
+    #[must_use]
+    pub fn run(&self, args: &[String]) -> Out {
+        let t0 = Instant::now();
+        let out = self.command().args(args).output();
+        let secs = t0.elapsed().as_secs_f64();
+        match out {
+            Ok(o) => Out {
+                code: o.status.code(),
+                text: format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+                secs,
+            },
+            Err(e) => Out {
+                code: None,
+                text: format!("{} could not start: {e}", self.bin.display()),
+                secs,
+            },
+        }
+    }
+
+    /// `limactl --version`'s answer.
+    #[must_use]
+    pub fn version(&self) -> String {
+        self.run(&["--version".into()]).text.trim().to_string()
+    }
+
+    /// The lane's VM, or `None` when there is none.
+    ///
+    /// # Errors
+    /// `limactl list` failed.
+    pub fn state(&self) -> Result<Option<VmState>, String> {
+        let out = self.run(&["list".into(), "--json".into()]);
+        if !out.ok() {
+            return Err(format!("limactl list failed: {}", out.tail(5)));
+        }
+        Ok(parse_list(&out.text, VM))
+    }
+
+    fn shell_argv(workdir: &str, argv: &[String]) -> Vec<String> {
+        let mut a = vec![
+            "shell".to_string(),
+            format!("--workdir={workdir}"),
+            VM.to_string(),
+            "--".to_string(),
+        ];
+        a.extend(argv.iter().cloned());
+        a
+    }
+
+    /// Run `argv` in the guest from `workdir`, capturing its output; `stdin`
+    /// is written to it when given.
+    #[must_use]
+    pub fn shell(&self, workdir: &str, argv: &[String], stdin: Option<&str>) -> Out {
+        let t0 = Instant::now();
+        let mut cmd = self.command();
+        cmd.args(Self::shell_argv(workdir, argv))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if stdin.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return Out {
+                    code: None,
+                    text: format!("{} could not start: {e}", self.bin.display()),
+                    secs: 0.0,
+                };
+            }
+        };
+        if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+            let _ = pipe.write_all(text.as_bytes());
+        }
+        let out = child.wait_with_output();
+        let secs = t0.elapsed().as_secs_f64();
+        match out {
+            Ok(o) => Out {
+                code: o.status.code(),
+                text: format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+                secs,
+            },
+            Err(e) => Out {
+                code: None,
+                text: format!("waiting for limactl shell: {e}"),
+                secs,
+            },
+        }
+    }
+
+    /// Run `argv` in the guest with its stderr merged into its stdout there
+    /// (so cargo's `Running` lines and libtest's lines keep their order),
+    /// each line shown here as it comes, prefixed, and kept.
+    #[must_use]
+    pub fn shell_streamed(&self, workdir: &str, argv: &[String], prefix: &str) -> Out {
+        let t0 = Instant::now();
+        let mut merged = vec![
+            "sh".to_string(),
+            "-c".into(),
+            "exec \"$@\" 2>&1".into(),
+            "merged".into(),
+        ];
+        merged.extend(argv.iter().cloned());
+        let mut child = match self
+            .command()
+            .args(Self::shell_argv(workdir, &merged))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return Out {
+                    code: None,
+                    text: format!("{} could not start: {e}", self.bin.display()),
+                    secs: 0.0,
+                };
+            }
+        };
+        // limactl's own complaints (its stderr) are kept after the guest's lines.
+        let mut err_text = String::new();
+        let err_reader = child.stderr.take().map(|mut e| {
+            std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = e.read_to_string(&mut s);
+                s
+            })
+        });
+        let mut text = String::new();
+        if let Some(out) = child.stdout.take() {
+            let stdout = std::io::stdout();
+            for line in BufReader::new(out).lines() {
+                let Ok(line) = line else { break };
+                {
+                    let mut lock = stdout.lock();
+                    let _ = writeln!(lock, "{prefix}{line}");
+                }
+                text.push_str(&line);
+                text.push('\n');
+            }
+        }
+        if let Some(h) = err_reader {
+            err_text = h.join().unwrap_or_default();
+        }
+        let status = child.wait();
+        text.push_str(&err_text);
+        Out {
+            code: status.ok().and_then(|s| s.code()),
+            text,
+            secs: t0.elapsed().as_secs_f64(),
+        }
+    }
+
+    /// Copy a guest file to this Mac.
+    #[must_use]
+    pub fn copy_out(&self, guest_path: &str, host_path: &Path) -> Out {
+        self.run(&[
+            "copy".into(),
+            format!("{VM}:{guest_path}"),
+            host_path.to_string_lossy().into_owned(),
+        ])
+    }
+}
+
+/// The checkout this lane tests: the one this program was built from, by
+/// its physical path (the guest sees it at the same path).
+#[must_use]
+pub fn repo() -> String {
+    crate::paths::physical(&paths().repo)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The VM's disk file on this Mac, and the bytes it really holds (a sparse
+/// file: what the guest has written and not yet trimmed).
+#[must_use]
+pub fn host_disk_bytes(state: &VmState) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    ["disk", "diffdisk"]
+        .iter()
+        .find_map(|f| std::fs::metadata(state.dir.join(f)).ok())
+        .map(|m| m.blocks() * 512)
+}
+
+/// `n` bytes in GiB, one decimal.
+#[must_use]
+pub fn gib(n: u64) -> String {
+    #[expect(clippy::cast_precision_loss, reason = "a size shown to one decimal")]
+    let g = n as f64 / f64::from(1u32 << 30);
+    format!("{g:.1} GiB")
+}
+
+/// The one lane run of this Mac: `flock` on [`lane_lock_path`], released by
+/// `LOCK_UN` before the file closes (clippy.toml's flock rule).
+pub struct LaneLock {
+    file: std::fs::File,
+}
+
+impl LaneLock {
+    /// Take the lane, or say who holds it.
+    ///
+    /// # Errors
+    /// Another run holds it (NOT RUN), or the lock file cannot be made.
+    pub fn take() -> Result<LaneLock, Fail> {
+        let path = lane_lock_path(
+            std::env::var("LIMA_HOME").ok().as_deref(),
+            paths().need_home().map_err(Fail::die)?,
+        );
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| Fail::die(format!("{}: {e}", dir.display())))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| Fail::die(format!("{}: {e}", path.display())))?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the guard's Drop releases by File::unlock before the close"
+        )]
+        let taken = file.try_lock();
+        match taken {
+            Ok(()) => Ok(LaneLock { file }),
+            // Busy, not broken: this run decided nothing.
+            Err(std::fs::TryLockError::WouldBlock) => Err(not_run(format!(
+                "another lane run holds the VM ({}); wait for it, or `{LAB} linux status`",
+                path.display()
+            ))),
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(Fail::die(format!("{}: {e}", path.display())))
+            }
+        }
+    }
+}
+
+impl Drop for LaneLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+/// The lane lock: one per VM, so beside lima's instances (`$LIMA_HOME`, else
+/// `~/.lima`), never in a checkout. Every worktree drives the same VM, and a
+/// run from one stops and remounts it for its own checkout, so a lock kept in
+/// each checkout's `$LAB_STATE` let a second worktree power the VM off under a
+/// first one's proof (seen 2026-10-16). The leading dot keeps `limactl list`
+/// from reading it as an instance.
+#[must_use]
+pub fn lane_lock_path(lima_home: Option<&str>, home: &str) -> PathBuf {
+    let base = match lima_home.filter(|h| !h.is_empty()) {
+        Some(h) => PathBuf::from(h),
+        None => Path::new(home).join(".lima"),
+    };
+    base.join(format!(".{VM}.lane.lock"))
+}
+
+/// `$LAB_STATE/linux`, made when missing.
+///
+/// # Errors
+/// It cannot be made.
+pub fn state_dir() -> Result<PathBuf, Fail> {
+    let dir = paths().need_state()?.join("linux");
+    std::fs::create_dir_all(&dir).map_err(|e| Fail::die(format!("{}: {e}", dir.display())))?;
+    Ok(dir)
+}
+
+/// The VM, booted and provisioned, and whether this call booted it (then
+/// the caller stops it when it ends).
+pub struct Up {
+    pub lima: Lima,
+    /// The guest user's home and `XDG_RUNTIME_DIR`.
+    pub home: String,
+    pub runtime: String,
+    pub booted_here: bool,
+    /// What it took, in order.
+    pub timings: Vec<Step>,
+}
+
+/// One step of bringing the lane up.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Step {
+    pub name: String,
+    pub secs: f64,
+    /// Why it failed, for the one step whose failure leaves the lane running
+    /// (the Rosetta cache reset): the proof shows it NOT RUN, never PASS.
+    pub failed: Option<String>,
+}
+
+impl Step {
+    fn done(name: &str, secs: f64) -> Step {
+        Step {
+            name: name.to_string(),
+            secs,
+            failed: None,
+        }
+    }
+}
+
+impl Up {
+    /// The guest-local build directory ([`GUEST_DIR`]).
+    #[must_use]
+    pub fn lane_dir(&self) -> String {
+        format!("{}/{GUEST_DIR}", self.home)
+    }
+
+    /// Run `argv` in the guest, captured, from its home.
+    #[must_use]
+    pub fn sh(&self, argv: &[String]) -> Out {
+        self.lima.shell(&self.home, argv, None)
+    }
+
+    /// Remove the guest's build output, and hand the freed blocks back to
+    /// this Mac (`fstrim`: the VM disk is a sparse file that otherwise keeps
+    /// its high-water mark).
+    ///
+    /// # Errors
+    /// The removal failed.
+    pub fn clean_build(&self) -> Result<(), String> {
+        clean_guest_build(&self.lima, &self.home)
+    }
+
+    /// Stop the lane's units in the guest (a display, an aterm).
+    pub fn stop_units(&self) {
+        for argv in guest::stop_units() {
+            let _ = self.sh(&argv);
+        }
+    }
+
+    /// Stop the VM when this run booted it.
+    pub fn release(self) {
+        self.stop_units();
+        if self.booted_here {
+            let out = self.lima.run(&["stop".into(), VM.into()]);
+            if out.ok() {
+                println!("linux: VM stopped (this run booted it)");
+            } else {
+                eprintln!("aterm-lab: linux: limactl stop failed: {}", out.tail(5));
+            }
+        }
+    }
+}
+
+/// Remove `home`'s [`GUEST_DIR`] in the guest and trim its disk
+/// ([`Up::clean_build`]).
+fn clean_guest_build(lima: &Lima, home: &str) -> Result<(), String> {
+    let dir = format!("{home}/{GUEST_DIR}");
+    let out = lima.shell(home, &["rm".into(), "-rf".into(), dir], None);
+    if !out.ok() {
+        return Err(out.tail(5));
+    }
+    let _ = lima.shell(home, &["sudo".into(), "fstrim".into(), "/".into()], None);
+    Ok(())
+}
+
+/// The guest user's `var`, when it is an absolute path.
+fn guest_path_var(lima: &Lima, var: &str) -> Option<String> {
+    let out = lima.shell("/", &["printenv".into(), var.into()], None);
+    out.ok()
+        .then(|| out.text.trim().to_string())
+        .filter(|s| s.starts_with('/'))
+}
+
+/// Make the VM if there is none, mount this checkout, boot it, and provision
+/// it when its stamp is not the plan's.
+///
+/// # Errors
+/// NOT RUN: no lima, or the VM could not be made, booted or provisioned.
+pub fn bring_up() -> Result<Up, Fail> {
+    let lima = Lima::find()?;
+    let repo = repo();
+    let mut timings = Vec::new();
+    let mut state = lima.state().map_err(not_run)?;
+    if state.is_none() {
+        println!(
+            "linux: making the VM ({CPUS} CPUs, {MEMORY_GIB} GiB, disk <= {DISK_GIB} GiB, {TEMPLATE}) …"
+        );
+        let out = lima.run(&create_args());
+        timings.push(Step::done("create", out.secs));
+        if !out.ok() {
+            return Err(not_run(format!("limactl create failed: {}", out.tail(8))));
+        }
+        state = lima.state().map_err(not_run)?;
+    }
+    let Some(mut vm) = state else {
+        return Err(not_run("limactl create left no VM"));
+    };
+    let mounts = lane_mounts(&repo);
+    if !mounted_exactly(&vm, &mounts) {
+        if vm.status == "Running" {
+            let out = lima.run(&["stop".into(), VM.into()]);
+            if !out.ok() {
+                return Err(not_run(format!("limactl stop failed: {}", out.tail(5))));
+            }
+        }
+        let out = lima.run(&[
+            "edit".into(),
+            "--tty=false".into(),
+            VM.into(),
+            "--set".into(),
+            mount_expr(&mounts),
+        ]);
+        if !out.ok() {
+            return Err(not_run(format!(
+                "limactl edit (the mount) failed: {}",
+                out.tail(5)
+            )));
+        }
+        vm = lima
+            .state()
+            .map_err(not_run)?
+            .ok_or_else(|| not_run("the VM went away"))?;
+    }
+    let booted_here = vm.status != "Running";
+    if booted_here {
+        println!("linux: booting {VM} (mount: {repo}, read-only) …");
+        let out = lima.run(&["start".into(), "--tty=false".into(), VM.into()]);
+        timings.push(Step::done("boot", out.secs));
+        if !out.ok() {
+            return Err(not_run(format!("limactl start failed: {}", out.tail(8))));
+        }
+    }
+    let (home, runtime) = (
+        guest_path_var(&lima, "HOME"),
+        guest_path_var(&lima, "XDG_RUNTIME_DIR"),
+    );
+    let mut up = Up {
+        lima,
+        home: home.clone().unwrap_or_default(),
+        runtime: runtime.clone().unwrap_or_default(),
+        booted_here,
+        timings,
+    };
+    if home.is_none() || runtime.is_none() {
+        up.release();
+        return Err(not_run("the guest named no HOME or XDG_RUNTIME_DIR"));
+    }
+    match provision(&up) {
+        Ok(Some(secs)) => up.timings.push(Step::done("provision", secs)),
+        Ok(None) => {}
+        Err(f) => {
+            up.release();
+            return Err(f);
+        }
+    }
+    if let Some(step) = reset_rosetta_cache(&up) {
+        up.timings.push(step);
+    }
+    match claim_build_output(&up, &repo) {
+        Ok(Some(step)) => up.timings.push(step),
+        Ok(None) => {}
+        Err(f) => {
+            up.release();
+            return Err(f);
+        }
+    }
+    // A run cut short leaves its units; this run starts from none.
+    up.stop_units();
+    Ok(up)
+}
+
+/// What the guest's build directory holds for the checkout `repo`, from
+/// whether [`GUEST_DIR`] exists and what its [`BUILT_FROM`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildOutput {
+    /// No build directory: this run makes it and names itself in it.
+    Absent,
+    /// This checkout's own output, which the run builds on.
+    Own,
+    /// Another checkout's output, or output no stamp names: removed first.
+    Foreign,
+}
+
+fn build_output(dir_exists: bool, built_from: Option<&str>, repo: &str) -> BuildOutput {
+    match (dir_exists, built_from) {
+        (false, _) => BuildOutput::Absent,
+        (true, Some(stamp)) if stamp == repo => BuildOutput::Own,
+        (true, _) => BuildOutput::Foreign,
+    }
+}
+
+/// Make [`GUEST_DIR`] this checkout's before anything builds in it: remove
+/// another checkout's output ([`BUILT_FROM`] says why), then name `repo` in
+/// it. The removal as a step, or `None` when there was nothing to remove.
+///
+/// # Errors
+/// NOT RUN: the foreign output could not be removed, or the stamp written.
+fn claim_build_output(up: &Up, repo: &str) -> Result<Option<Step>, Fail> {
+    let dir = up.lane_dir();
+    let stamp = format!("{dir}/{BUILT_FROM}");
+    let exists = up.sh(&["test".into(), "-d".into(), dir.clone()]).ok();
+    let read = up.sh(&["cat".into(), stamp.clone()]);
+    let built_from = read.ok().then(|| read.text.trim().to_string());
+    let mut step = None;
+    match build_output(exists, built_from.as_deref(), repo) {
+        BuildOutput::Own => return Ok(None),
+        BuildOutput::Absent => {}
+        BuildOutput::Foreign => {
+            println!(
+                "linux: removing the guest's build output, which {} built …",
+                built_from.as_deref().map_or_else(
+                    || "a checkout no stamp names".to_string(),
+                    |c| format!("{c}, not this checkout,")
+                )
+            );
+            let t0 = Instant::now();
+            up.clean_build().map_err(|e| {
+                not_run(format!(
+                    "another checkout's build output could not be removed: {e}"
+                ))
+            })?;
+            step = Some(Step::done(
+                "foreign build output removed",
+                t0.elapsed().as_secs_f64(),
+            ));
+        }
+    }
+    let made = up.sh(&["mkdir".into(), "-p".into(), dir]);
+    let wrote = up
+        .lima
+        .shell(&up.home, &["tee".into(), stamp], Some(&format!("{repo}\n")));
+    if !made.ok() || !wrote.ok() {
+        return Err(not_run(format!(
+            "could not name this checkout in {BUILT_FROM}: {}",
+            wrote.tail(5)
+        )));
+    }
+    Ok(step)
+}
+
+/// Empty Rosetta's AOT cache when it was not emptied in this boot
+/// ([`guest::ROSETTA_CACHE`] says why): the step, or `None` when this boot's
+/// cache stands. A step that fails is said and the step carries it, but it is
+/// not fatal: the aarch64 rows still decide, and the x86_64 rows show what
+/// Rosetta does with the old cache.
+fn reset_rosetta_cache(up: &Up) -> Option<Step> {
+    let boot = up.sh(&["cat".into(), guest::BOOT_ID.into()]);
+    let stamp = up.sh(&["cat".into(), guest::ROSETTA_CACHE_BOOT.into()]);
+    let boot_id = boot.text.trim();
+    if !boot.ok() || boot_id.is_empty() || (stamp.ok() && stamp.text.trim() == boot_id) {
+        return None;
+    }
+    let t0 = Instant::now();
+    let mut failed = None;
+    for s in guest::rosetta_cache_reset(boot_id) {
+        let out = up.lima.shell(&up.home, &s.argv, s.stdin.as_deref());
+        if !out.ok() {
+            let why = format!(
+                "step '{}' failed (the x86_64 rows ran on the old cache): {}",
+                s.label,
+                out.tail(3)
+            );
+            eprintln!("aterm-lab: linux: Rosetta cache reset, {why}");
+            failed = Some(why);
+            break;
+        }
+    }
+    Some(Step {
+        failed,
+        ..Step::done("rosetta cache reset", t0.elapsed().as_secs_f64())
+    })
+}
+
+/// Provision the guest when its stamp is not the plan's fingerprint: the
+/// seconds it took, or `None` when it was current.
+fn provision(up: &Up) -> Result<Option<f64>, Fail> {
+    let steps = guest::provision_steps();
+    let want = guest::fingerprint(&steps);
+    let have = up.sh(&["cat".into(), guest::STAMP.into()]);
+    if have.ok() && have.text.trim() == want {
+        return Ok(None);
+    }
+    println!("linux: provisioning the guest (plan {want}) …");
+    let t0 = Instant::now();
+    for s in &steps {
+        println!("linux:   {} …", s.label);
+        let out = up.lima.shell(&up.home, &s.argv, s.stdin.as_deref());
+        if !out.ok() {
+            // The guest could not be made ready (apt or rustup unreachable,
+            // most often): nothing was decided, so NOT RUN, never a finding.
+            return Err(not_run(format!(
+                "provisioning step '{}' failed:\n{}",
+                s.label,
+                out.tail(15)
+            )));
+        }
+    }
+    let stamp_dir = Path::new(guest::STAMP)
+        .parent()
+        .map_or_else(String::new, |p| p.to_string_lossy().into_owned());
+    let made = up.sh(&["sudo".into(), "mkdir".into(), "-p".into(), stamp_dir]);
+    let wrote = up.lima.shell(
+        &up.home,
+        &["sudo".into(), "tee".into(), guest::STAMP.into()],
+        Some(&format!("{want}\n")),
+    );
+    if !made.ok() || !wrote.ok() {
+        return Err(not_run(format!(
+            "could not write {}: {}",
+            guest::STAMP,
+            wrote.tail(5)
+        )));
+    }
+    Ok(Some(t0.elapsed().as_secs_f64()))
+}
+
+fn cmd_up() -> Res {
+    let _lock = LaneLock::take()?;
+    let up = bring_up()?;
+    for step in &up.timings {
+        match &step.failed {
+            None => println!("linux: {} {:.1} s", step.name, step.secs),
+            Some(why) => println!("linux: {} FAILED: {why}", step.name),
+        }
+    }
+    println!(
+        "linux: {VM} is up; `{LAB} linux exec -- CMD` runs in it, `{LAB} linux down` cleans and stops it"
+    );
+    Ok(0)
+}
+
+/// Stop the VM `up` held, removing the build output its `exec`s left (a
+/// session's output is kept between its `exec`s, never past its `down`).
+fn cmd_down() -> Res {
+    let lima = Lima::find()?;
+    let _lock = LaneLock::take()?;
+    match lima.state().map_err(Fail::die)? {
+        None => println!("linux: there is no {VM} VM"),
+        Some(vm) if vm.status != "Running" => println!("linux: {VM} is {}", vm.status),
+        Some(_) => {
+            match guest_path_var(&lima, "HOME").map(|home| clean_guest_build(&lima, &home)) {
+                Some(Ok(())) => println!("linux: the guest's build output removed, disk trimmed"),
+                Some(Err(e)) => eprintln!("aterm-lab: linux: build output NOT removed: {e}"),
+                None => eprintln!("aterm-lab: linux: the guest named no HOME; build output kept"),
+            }
+            let out = lima.run(&["stop".into(), VM.into()]);
+            if !out.ok() {
+                return Err(Fail::die(format!("limactl stop failed: {}", out.tail(5))));
+            }
+            println!("linux: {VM} stopped");
+        }
+    }
+    Ok(0)
+}
+
+fn cmd_status() -> Res {
+    let lima = Lima::find()?;
+    println!("limactl   {} ({})", lima.bin.display(), lima.version());
+    let Some(vm) = lima.state().map_err(Fail::die)? else {
+        println!("vm        none (`{LAB} linux up` makes it)");
+        return Ok(0);
+    };
+    println!(
+        "vm        {VM} {} — {} CPUs, {}, disk <= {}",
+        vm.status,
+        vm.cpus,
+        gib(vm.memory),
+        gib(vm.disk)
+    );
+    for (loc, writable) in &vm.mounts {
+        println!(
+            "mount     {loc} ({})",
+            if *writable { "writable" } else { "read-only" }
+        );
+    }
+    if let Some(bytes) = host_disk_bytes(&vm) {
+        println!("host disk {} allocated in {}", gib(bytes), vm.dir.display());
+    }
+    if vm.status == "Running" {
+        let stamp = lima.shell("/", &["cat".into(), guest::STAMP.into()], None);
+        let want = guest::fingerprint(&guest::provision_steps());
+        let have = stamp.text.trim();
+        println!(
+            "provision {}",
+            if stamp.ok() && have == want {
+                format!("current ({want})")
+            } else if stamp.ok() {
+                format!("stale ({have}; the plan is {want}: the next run provisions)")
+            } else {
+                "never (the next run provisions)".to_string()
+            }
+        );
+        let df = lima.shell(
+            "/",
+            &[
+                "df".into(),
+                "-B1".into(),
+                "--output=used,size".into(),
+                "/".into(),
+            ],
+            None,
+        );
+        if let Some((used, size)) = parse_df(&df.text) {
+            println!("guest /   {} used of {}", gib(used), gib(size));
+        }
+    }
+    Ok(0)
+}
+
+/// `df -B1 --output=used,size /`'s numbers.
+#[must_use]
+pub fn parse_df(text: &str) -> Option<(u64, u64)> {
+    let line = text.lines().nth(1)?;
+    let mut nums = line.split_whitespace().map(str::parse::<u64>);
+    Some((nums.next()?.ok()?, nums.next()?.ok()?))
+}
+
+/// What `exec` was asked.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ExecArgs {
+    pub arch: Arch,
+    pub display: Option<Display>,
+    pub argv: Vec<String>,
+}
+
+/// `exec [--arch A] [--display D] [--] CMD...`.
+///
+/// # Errors
+/// A usage error.
+pub fn parse_exec(args: &[String]) -> Result<ExecArgs, Fail> {
+    let mut arch = Arch::Aarch64;
+    let mut display = None;
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        match a.as_str() {
+            "--arch" => {
+                let w = args.get(i + 1).map_or("", String::as_str);
+                arch = Arch::parse(w).ok_or_else(|| {
+                    Fail::usage(format!("linux exec: --arch {w}: aarch64 or x86_64"))
+                })?;
+                i += 2;
+            }
+            "--display" => {
+                let w = args.get(i + 1).map_or("", String::as_str);
+                display = Some(Display::parse(w).ok_or_else(|| {
+                    Fail::usage(format!(
+                        "linux exec: --display {w}: xvfb, weston, mutter or xwayland"
+                    ))
+                })?);
+                i += 2;
+            }
+            "--" => {
+                i += 1;
+                break;
+            }
+            _ => break,
+        }
+    }
+    let argv: Vec<String> = args.get(i..).unwrap_or_default().to_vec();
+    if argv.is_empty() {
+        return Err(Fail::usage(
+            "linux exec: no command (… exec [--arch A] [--display D] -- CMD)",
+        ));
+    }
+    Ok(ExecArgs {
+        arch,
+        display,
+        argv,
+    })
+}
+
+fn cmd_exec(args: &[String]) -> Res {
+    let ask = parse_exec(args)?;
+    let _lock = LaneLock::take()?;
+    let up = bring_up()?;
+    let mut env = guest::cargo_env(ask.arch, &format!("{}/target", up.lane_dir()), true);
+    env.push((
+        "DBUS_SESSION_BUS_ADDRESS".into(),
+        format!("unix:path={}/bus", up.runtime),
+    ));
+    if let Some(d) = ask.display {
+        if let Err(why) = start_display(&up, d) {
+            up.release();
+            return Err(not_run(why));
+        }
+        env.push(d.client_env(&up.runtime));
+    }
+    let out = up
+        .lima
+        .shell_streamed(&repo(), &guest::with_env(&env, &ask.argv), "");
+    // A one-shot `exec` (it booted the VM) is a run: its output goes with it.
+    // Under `up`, the next `exec` builds on it until `down`.
+    if up.booted_here
+        && let Err(e) = up.clean_build()
+    {
+        eprintln!("aterm-lab: linux: build output NOT removed: {e}");
+    }
+    up.release();
+    Ok(out.code.unwrap_or(1))
+}
+
+/// Start `display`'s servers in the guest, the accessibility bus answering:
+/// the bus address, or why it is not up (the journal's tail of the unit that
+/// failed).
+///
+/// # Errors
+/// A server that did not come up within a minute, or no accessibility bus.
+pub fn start_display(up: &Up, display: Display) -> Result<String, String> {
+    start_screen(up, guest::Screen::plain(display))
+}
+
+/// [`start_display`] for a [`guest::Screen`]: its files written first, its
+/// servers started, then what runs once they are up.
+///
+/// # Errors
+/// As [`start_display`], or a file or an after-step that failed.
+pub fn start_screen(up: &Up, screen: guest::Screen) -> Result<String, String> {
+    for (path, text) in screen.files() {
+        let dir = Path::new(&path)
+            .parent()
+            .map_or_else(String::new, |p| p.to_string_lossy().into_owned());
+        let made = up.sh(&[
+            "install".into(),
+            "-d".into(),
+            "-m".into(),
+            "700".into(),
+            dir,
+        ]);
+        let wrote = up
+            .lima
+            .shell(&up.home, &["tee".into(), path.clone()], Some(&text));
+        if !made.ok() || !wrote.ok() {
+            return Err(format!(
+                "{}: could not write {path}: {}",
+                screen.name(),
+                wrote.tail(3)
+            ));
+        }
+    }
+    start_units(up, &screen.name(), screen.units(&up.runtime))?;
+    for step in screen.after() {
+        let out = up.lima.shell(&up.home, &step.argv, step.stdin.as_deref());
+        if !out.ok() {
+            up.stop_units();
+            return Err(format!(
+                "{}: {} failed: {}",
+                screen.name(),
+                step.label,
+                out.tail(3)
+            ));
+        }
+    }
+    a11y_bus(up)
+}
+
+/// Start `units` in order, each listening within a minute (a hang
+/// detector); `name` says which screen in an error.
+fn start_units(up: &Up, name: &str, units: Vec<guest::Unit>) -> Result<(), String> {
+    for unit in units {
+        let started = up.sh(&guest::run_unit(&unit, None));
+        let listening = started.ok() && up.sh(&guest::wait_socket(&unit.socket, 60)).ok();
+        if !listening {
+            let journal = up.sh(&[
+                "journalctl".into(),
+                "--user".into(),
+                "--no-pager".into(),
+                "-n".into(),
+                "15".into(),
+                "-u".into(),
+                unit.name.clone(),
+            ]);
+            up.stop_units();
+            return Err(format!(
+                "{name} ({}) did not come up: {}\n{}",
+                unit.argv.join(" "),
+                started.tail(3),
+                journal.tail(15)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The accessibility bus's address, the last sign a display is up.
+fn a11y_bus(up: &Up) -> Result<String, String> {
+    let a11y = up.sh(&guest::a11y_address());
+    guest::parse_a11y_address(&a11y.text)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            up.stop_units();
+            format!("at-spi2-core: no accessibility bus ({})", a11y.tail(3))
+        })
+}
+
+/// Xvfb with MIT-SHM turned off (`-extension MIT-SHM`), on Xvfb's display:
+/// the X11 CPU presenter's PutImage path (LW.6), which a server that cannot
+/// map a client's memory (a remote one) takes. Started as [`start_display`]
+/// starts Xvfb, the bus address returned.
+///
+/// # Errors
+/// As [`start_display`].
+pub fn start_xvfb_without_shm(up: &Up) -> Result<String, String> {
+    let mut units = Display::Xvfb.units(&up.runtime);
+    for u in &mut units {
+        u.argv
+            .extend(["-extension".to_string(), "MIT-SHM".to_string()]);
+    }
+    start_units(up, "xvfb without MIT-SHM", units)?;
+    a11y_bus(up)
+}
+
+/// Headless weston with its debug protocols on (`--debug`), on weston's
+/// socket: `weston_capture_v1`, which `weston-screenshooter` reads the
+/// output's pixels through, so the Wayland CPU rows hold the `wl_shm`
+/// presenter (LW.6) to what the compositor shows. Started as
+/// [`start_display`] starts weston, the bus address returned.
+///
+/// # Errors
+/// As [`start_display`].
+pub fn start_weston_capturing(up: &Up) -> Result<String, String> {
+    let mut units = Display::Weston.units(&up.runtime);
+    for u in &mut units {
+        u.argv.push("--debug".to_string());
+    }
+    start_units(up, "weston with its capture protocol", units)?;
+    a11y_bus(up)
+}
+
+fn cmd_clean() -> Res {
+    let _lock = LaneLock::take()?;
+    let up = bring_up()?;
+    let cleaned = up.clean_build();
+    let df = up.sh(&[
+        "df".into(),
+        "-B1".into(),
+        "--output=used,size".into(),
+        "/".into(),
+    ]);
+    up.release();
+    if let Err(e) = cleaned {
+        return Err(Fail::die(format!("linux clean: {e}")));
+    }
+    if let Some((used, _)) = parse_df(&df.text) {
+        println!(
+            "linux: guest build output removed; guest / now {} used",
+            gib(used)
+        );
+    }
+    Ok(0)
+}
+
+fn cmd_destroy() -> Res {
+    let _lock = LaneLock::take()?;
+    let lima = Lima::find()?;
+    if lima.state().map_err(Fail::die)?.is_none() {
+        println!("linux: there is no {VM} VM");
+        return Ok(0);
+    }
+    let out = lima.run(&[
+        "delete".into(),
+        "--force".into(),
+        "--tty=false".into(),
+        VM.into(),
+    ]);
+    if !out.ok() {
+        return Err(Fail::die(format!("limactl delete failed: {}", out.tail(5))));
+    }
+    println!("linux: {VM} deleted with its disk");
+    Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LIST: &str = r#"{"name":"other","status":"Running","dir":"/x","cpus":2,"memory":1,"disk":2}
+{"name":"aterm-linux","status":"Stopped","dir":"/Users//u/.lima/aterm-linux","vmType":"vz","cpus":8,"memory":17179869184,"disk":64424509440,"config":{"mounts":[{"location":"/Users//u/aterm","mountPoint":"/Users//u/aterm","writable":false}]}}
+"#;
+
+    #[test]
+    fn the_lane_vm_is_read_out_of_limas_list() {
+        let vm = parse_list(LIST, VM).expect("the lane's VM");
+        assert_eq!(vm.status, "Stopped");
+        assert_eq!(vm.dir, PathBuf::from("/Users//u/.lima/aterm-linux"));
+        assert_eq!(vm.cpus, 8);
+        assert_eq!(vm.memory, 16 << 30);
+        assert_eq!(vm.disk, 60 << 30);
+        let alone = ["/Users//u/aterm".to_string()];
+        assert!(mounted_exactly(&vm, &alone));
+        assert!(!mounted_exactly(&vm, &["/Users//u/other-worktree".into()]));
+        assert!(!mounted_exactly(
+            &vm,
+            &["/Users//u/aterm".into(), "/Users//u/main/.git".into()]
+        ));
+        assert_eq!(parse_list(LIST, "absent"), None);
+        assert_eq!(parse_list("", VM), None);
+        let writable = LIST.replace("\"writable\":false", "\"writable\":true");
+        assert!(!mounted_exactly(
+            &parse_list(&writable, VM).expect("vm"),
+            &alone
+        ));
+    }
+
+    /// A run builds on the guest's output only when its stamp names this
+    /// checkout. Another checkout's output, or output no stamp names (a lane
+    /// from before the stamp left it), is removed before anything builds.
+    #[test]
+    fn a_run_builds_only_on_its_own_checkouts_output() {
+        let me = "/Users//u/aterm-dv-a";
+        assert_eq!(build_output(false, None, me), BuildOutput::Absent);
+        assert_eq!(
+            build_output(false, Some("/Users//u/aterm-dv-b"), me),
+            BuildOutput::Absent
+        );
+        assert_eq!(build_output(true, Some(me), me), BuildOutput::Own);
+        assert_eq!(
+            build_output(true, Some("/Users//u/aterm-dv-b"), me),
+            BuildOutput::Foreign
+        );
+        assert_eq!(build_output(true, None, me), BuildOutput::Foreign);
+        assert_eq!(
+            build_output(true, Some("/Users//u/aterm-dv-a-base"), me),
+            BuildOutput::Foreign
+        );
+    }
+
+    /// A linked worktree's `.git` file names its gitdir under the main checkout's
+    /// `.git`, whose `commondir` leads back to that `.git`: the guest mounts it
+    /// beside the worktree. A checkout whose `.git` is a directory mounts alone.
+    #[test]
+    fn a_linked_worktree_mounts_its_repositorys_git_directory() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let root = crate::paths::physical(root.path());
+        let main_git = root.join("main/.git");
+        let gitdir = main_git.join("worktrees/wt");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        let wt = root.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        assert_eq!(outside_git_dir(&wt), Some(main_git.clone()));
+        let wt_path = wt.to_string_lossy().into_owned();
+        assert_eq!(
+            lane_mounts(&wt_path),
+            [wt_path.clone(), main_git.to_string_lossy().into_owned()]
+        );
+        // The main checkout: its `.git` is a directory inside its own mount.
+        let main = root.join("main").to_string_lossy().into_owned();
+        assert_eq!(outside_git_dir(Path::new(&main)), None);
+        assert_eq!(lane_mounts(&main), std::slice::from_ref(&main));
+        // A `.git` file naming a directory inside the checkout needs no mount.
+        let inner = root.join("inner");
+        std::fs::create_dir_all(inner.join("gitdir")).unwrap();
+        std::fs::write(inner.join(".git"), "gitdir: gitdir\n").unwrap();
+        assert_eq!(outside_git_dir(&inner), None);
+    }
+
+    #[test]
+    fn every_checkout_takes_the_one_lock_beside_the_vm() {
+        let mine = lane_lock_path(None, "/Users//u");
+        assert_eq!(mine, PathBuf::from("/Users//u/.lima/.aterm-linux.lane.lock"));
+        assert_eq!(
+            lane_lock_path(Some(""), "/Users//u"),
+            mine,
+            "an empty LIMA_HOME is unset"
+        );
+        assert_eq!(
+            lane_lock_path(Some("/v/lima"), "/Users//u"),
+            PathBuf::from("/v/lima/.aterm-linux.lane.lock")
+        );
+    }
+
+    #[test]
+    fn the_mount_expression_quotes_its_paths() {
+        assert_eq!(
+            mount_expr(&["/Users//u/aterm".into()]),
+            r#".mounts = [{"location": "/Users//u/aterm", "writable": false}]"#
+        );
+        assert_eq!(
+            mount_expr(&["/Users//u/wt".into(), "/Users//u/aterm/.git".into()]),
+            r#".mounts = [{"location": "/Users//u/wt", "writable": false}, {"location": "/Users//u/aterm/.git", "writable": false}]"#
+        );
+        assert!(mount_expr(&["/a\"b".into()]).contains(r#""/a\"b""#));
+    }
+
+    #[test]
+    fn exec_reads_its_switches_then_the_command() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        let e = parse_exec(&s(&[
+            "--arch",
+            "x86_64",
+            "--display",
+            "weston",
+            "--",
+            "cargo",
+            "test",
+        ]))
+        .expect("parses");
+        assert_eq!(e.arch, Arch::X86_64);
+        assert_eq!(e.display, Some(Display::Weston));
+        assert_eq!(e.argv, ["cargo", "test"]);
+        let bare = parse_exec(&s(&["uname", "-m"])).expect("parses");
+        assert_eq!((bare.arch, bare.display), (Arch::Aarch64, None));
+        assert_eq!(bare.argv, ["uname", "-m"]);
+        assert_eq!(
+            parse_exec(&s(&["--arch", "mips", "x"]))
+                .map_err(|f| f.code)
+                .err(),
+            Some(2)
+        );
+        assert_eq!(parse_exec(&s(&["--"])).map_err(|f| f.code).err(), Some(2));
+    }
+
+    #[test]
+    fn df_and_sizes_read_as_shown() {
+        assert_eq!(
+            parse_df("    Used     1B-blocks\n 6940000000 61285326848\n"),
+            Some((6_940_000_000, 61_285_326_848))
+        );
+        assert_eq!(parse_df("Used 1B-blocks\n"), None);
+        assert_eq!(gib(3 << 29), "1.5 GiB");
+    }
+
+    #[test]
+    fn a_named_limactl_is_the_only_one_tried() {
+        let code = |r: Result<String, Fail>| r.map_err(|f| f.code);
+        let none = |_: &str| false;
+        let brew = |p: &str| p == "/opt/homebrew/bin/limactl";
+        assert_eq!(
+            code(pick_limactl(None, brew)),
+            Ok("/opt/homebrew/bin/limactl".into())
+        );
+        assert_eq!(code(pick_limactl(None, none)), Err(NOT_RUN));
+        assert_eq!(
+            code(pick_limactl(Some("/x/limactl"), brew)),
+            Err(NOT_RUN),
+            "no fallback"
+        );
+        assert_eq!(
+            code(pick_limactl(Some("/x/limactl"), |_| true)),
+            Ok("/x/limactl".into())
+        );
+        assert_eq!(code(pick_limactl(Some("limactl"), |_| true)), Err(2));
+    }
+
+    #[test]
+    fn a_lane_that_cannot_run_exits_three_and_says_so() {
+        let f = not_run("no limactl");
+        assert_eq!(f.code, NOT_RUN);
+        assert_eq!(f.msg.as_deref(), Some("NOT RUN: no limactl"));
+    }
+}

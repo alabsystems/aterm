@@ -4,9 +4,8 @@
 //! The self-feed floor: a process-wide token bucket on control-injected input,
 //! keyed by the target session's process-local id.
 //!
-//! The [`SelfGovernor`](../../aterm_agent/struct.SelfGovernor.html) binds only
-//! drivers that link `aterm-agent`; a raw control-socket client can `feed @.` in
-//! a loop without it. So every self-targeted injection verb passes [`allow`]
+//! A raw control-socket client can `feed @.` in a loop, and nothing on the
+//! client's side stops it. So every self-targeted injection verb passes [`allow`]
 //! first — `send`/`key`/`ctrl`/`feed`/`mouse`/`paste` at the dispatch path
 //! (control.rs) and `feed-bin` in `run_feed_bin` — and a feedback storm gets
 //! `ERR rate` instead of saturating the engine. The cap is far above legitimate

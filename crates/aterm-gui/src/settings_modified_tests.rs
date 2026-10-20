@@ -50,6 +50,16 @@ impl Lab {
             .unwrap();
     }
 
+    /// Dispatch `event` to the view; what it did.
+    pub(super) fn dispatch_outcome(
+        &mut self,
+        event: AppEvent,
+    ) -> crate::native_app::DispatchOutcome {
+        self.runtime
+            .dispatch(self.instance, self.view, event)
+            .unwrap()
+    }
+
     pub(super) fn text(&self) -> String {
         self.service.snapshot().text.to_string()
     }
@@ -83,6 +93,19 @@ impl Lab {
         let (patch, operation) = self
             .invoke(action, value)
             .unwrap_or_else(|| panic!("{action} writes aterm.toml"));
+        self.carry(patch, operation)
+    }
+
+    /// Invoke `action` as a press does, and carry the patch it emits, if it
+    /// writes, through the real service as [`Self::commit`] does.
+    pub(super) fn press(&mut self, action: &str) -> Option<ConfigPatch> {
+        let (patch, operation) = self.invoke(action, None)?;
+        Some(self.carry(patch, operation))
+    }
+
+    /// Carry `patch` through the real service, as the host does: the
+    /// result, then the new snapshot.
+    fn carry(&mut self, patch: ConfigPatch, operation: OperationId) -> ConfigPatch {
         let (snapshot, undo) = apply_real_config_patch(&mut self.service, &patch);
         self.runtime
             .dispatch(
@@ -232,7 +255,7 @@ pub(super) fn rect_of(compiled: &crate::native_ui::CompiledUi, key: &str) -> Log
 /// longer tried once its change is gone.
 #[test]
 fn undo_takes_the_cursor_style_highlight_to_the_restored_style() {
-    let mut lab = Lab::new("cursor_trail_style = \"comet\"\n");
+    let mut lab = Lab::new(&trail_drawn("cursor_trail_style = \"comet\"\n"));
     lab.state_mut().navigate(SettingsRoute::CursorStyles);
     let _ = lab.compile(1_074.0, 684.0);
     let water = UiKey::new(cursor_style_row_key("water"));
@@ -485,10 +508,12 @@ fn special_page_switches_offer_reset_while_written() {
     assert_eq!(lab.text(), "[packages]\nauto_install = false\n");
 }
 
-/// The old shared word-effects switch is its own row on Modified, so a
-/// toy's row is listed only when the toy's own key is written.
+/// The old shared word-effects switch has no Settings row anywhere (the Top
+/// card's two toys are the switches), so Modified lists it among the keys
+/// only aterm.toml holds, as Search does, with its Reset; a toy's row is
+/// listed only when the toy's own key is written.
 #[test]
-fn modified_lists_the_old_word_effects_switch_as_its_own_row() {
+fn modified_lists_the_old_word_effects_switch_with_the_aterm_toml_keys() {
     let mut lab = Lab::new("[sparkle_words]\nenabled = false\n");
     lab.state_mut().navigate(SettingsRoute::Modified);
     let compiled = lab.compile(1_200.0, 820.0);
@@ -497,7 +522,13 @@ fn modified_lists_the_old_word_effects_switch_as_its_own_row() {
             .semantic(&UiKey::new(format!(
                 "settings/control/{SPARKLE_MASTER_KEY}"
             )))
-            .is_some()
+            .is_none(),
+        "no row: it is not a setting"
+    );
+    assert!(
+        authored_manual_overrides(lab.state())
+            .iter()
+            .any(|entry| entry.key == SPARKLE_MASTER_KEY)
     );
     for toy in [SPARKLE_WORDS_KEY, KEYWORD_KITTIES_KEY] {
         assert!(
@@ -507,7 +538,8 @@ fn modified_lists_the_old_word_effects_switch_as_its_own_row() {
             "{toy} is not written"
         );
     }
-    lab.commit(&format!("settings/reset/{SPARKLE_MASTER_KEY}"), None);
+    let reset = manual_override_reset_action(SPARKLE_MASTER_KEY).expect("its Reset");
+    lab.commit(reset.as_str(), None);
     assert_eq!(lab.text(), "");
 }
 
@@ -648,28 +680,84 @@ fn modified_offers_reset_all_and_names_what_it_resets() {
     assert_eq!(empty.state().feedback.as_deref(), Some("Nothing to reset."));
 }
 
-/// Display face on Modified is a toggle per face, as on its own page: no
-/// pop-up of raw mixes, and a toggle changes only that face.
+/// DISPLAY FACE ON MODIFIED IS THE SWITCHES TEXT & FONTS DRAWS, from the one
+/// builder ([`display_face_rows`]): a Switch per face, its value on or off and
+/// never "selected" as a single choice is, saying what its own page's switch
+/// says (name, value, credit or why a fourth is refused); no pop-up of raw
+/// mixes; inside its row at a phone width; and a switch changes only its
+/// face. On the old builder they were single-choice segment buttons with no
+/// description.
 #[test]
 fn modified_display_face_is_a_toggle_per_face() {
+    for source in [
+        "display_font = \"pixel+bubble\"\n",
+        "display_font = \"chunky+pixel+bubble\"\n",
+    ] {
+        let mut lab = Lab::new(source);
+        for (width, height) in [(1_200.0, 820.0), (420.0, 820.0)] {
+            lab.state_mut().navigate(SettingsRoute::TextFonts);
+            let mut own = std::collections::BTreeMap::new();
+            for top in 0..40 {
+                lab.state_mut().page_scroll = top;
+                let compiled = lab.compile(width, 2_400.0);
+                for font in aterm_render::DISPLAY_FACES {
+                    if let Some(node) =
+                        compiled.semantic(&UiKey::new(format!("settings/display-face/{}", font.id)))
+                    {
+                        own.entry(font.id).or_insert_with(|| node.clone());
+                    }
+                }
+            }
+            lab.state_mut().navigate(SettingsRoute::Modified);
+            lab.state_mut().page_scroll = 0;
+            let compiled = lab.compile(width, height);
+            let row = compiled
+                .semantics
+                .iter()
+                .find(|node| {
+                    node.key.as_str().starts_with("settings/row/")
+                        && node.key.as_str().ends_with("/display_font")
+                })
+                .map(|node| node.rect)
+                .expect("the Display face row");
+            for font in aterm_render::DISPLAY_FACES {
+                let key = UiKey::new(format!("settings/display-face/{}", font.id));
+                let toggle = compiled
+                    .semantic(&key)
+                    .unwrap_or_else(|| panic!("{source} {width}: {} on Modified", font.id));
+                let mine = own
+                    .get(font.id)
+                    .unwrap_or_else(|| panic!("{} on Text & Fonts", font.id));
+                assert_eq!(toggle.role, SemanticRole::Switch, "{}", font.id);
+                assert!(
+                    toggle.state.is_some_and(|state| !state.selected),
+                    "{}: a switch, not a chosen segment",
+                    font.id
+                );
+                assert_eq!(
+                    (&toggle.label, &toggle.value, &toggle.description),
+                    (&mine.label, &mine.value, &mine.description),
+                    "{source} {width}: {} says what its own page says",
+                    font.id
+                );
+                assert!(
+                    toggle.rect.y >= row.y - 0.5 && toggle.rect.bottom() <= row.bottom() + 0.5,
+                    "{width}: {} {:?} inside its row {row:?}",
+                    font.id,
+                    toggle.rect
+                );
+            }
+            assert!(
+                compiled.semantics.iter().all(|node| node
+                    .action
+                    .as_ref()
+                    .is_none_or(|action| action.as_str() != "settings/set/display_font")),
+                "no pop-up of raw mixes"
+            );
+        }
+    }
     let mut lab = Lab::new("display_font = \"pixel+bubble\"\n");
     lab.state_mut().navigate(SettingsRoute::Modified);
-    for (width, height) in [(1_200.0, 820.0), (420.0, 820.0)] {
-        let compiled = lab.compile(width, height);
-        for (id, on) in [("chunky", false), ("pixel", true), ("bubble", true)] {
-            let toggle = compiled
-                .semantic(&UiKey::new(format!("settings/display-face/{id}")))
-                .unwrap_or_else(|| panic!("{id} toggle at {width}"));
-            assert_eq!(toggle.value, SemanticValue::Bool(on), "{id}");
-        }
-        assert!(
-            compiled.semantics.iter().all(|node| node
-                .action
-                .as_ref()
-                .is_none_or(|action| action.as_str() != "settings/set/display_font")),
-            "no pop-up of raw mixes"
-        );
-    }
     lab.commit("settings/display-face/chunky", None);
     assert_eq!(lab.text(), "display_font = \"pixel+bubble+chunky\"\n");
 }
@@ -679,7 +767,7 @@ fn modified_display_face_is_a_toggle_per_face() {
 /// line under it, whole.
 #[test]
 fn a_long_modified_row_puts_its_facts_on_a_second_line() {
-    let mut lab = Lab::new("[machine]\nuniversal_control = \"leave\"\n");
+    let mut lab = Lab::new("[machine]\nuniversal_control = \"off\"\n");
     lab.state_mut().navigate(SettingsRoute::Modified);
     let compiled = lab.compile(900.0, 820.0);
     let key = prefs::EDIT_MACHINE_UNIVERSAL_CONTROL;
@@ -709,15 +797,7 @@ fn a_long_modified_row_puts_its_facts_on_a_second_line() {
         lines.contains("Applies at the next ALab tools check"),
         "{lines}"
     );
-    let visual = compiled
-        .paint
-        .iter()
-        .find(|node| node.key.as_str() == format!("settings/label/{key}/visual"))
-        .and_then(|node| match &node.content {
-            UiContent::Text(spec) => Some(spec.text.clone()),
-            _ => None,
-        })
-        .unwrap_or_default();
+    let visual = painted_row_label(&compiled, key).unwrap_or_default();
     assert!(
         lines.contains("Default: Off") || visual.contains("Default: Off"),
         "{visual} / {lines}"
@@ -932,10 +1012,10 @@ fn an_invalid_value_keeps_the_draft_and_says_why_under_its_row() {
     for (raw, why) in [
         ("lots", "must be a whole number, 0 or more"),
         ("-5", "must be 0 or more"),
-        ("5000000000", "must be at most 4,294,967,295"),
+        ("5000000000", "must be at most 4294967295"),
         // Too long for i64 is still a whole number: it says which end it
         // passed, never that it is not a number.
-        ("99999999999999999999", "must be at most 4,294,967,295"),
+        ("99999999999999999999", "must be at most 4294967295"),
         ("-99999999999999999999", "must be 0 or more"),
         ("99999999999999999999x", "must be a whole number, 0 or more"),
     ] {
@@ -1047,13 +1127,6 @@ fn the_manual_page_names_the_file_and_lists_the_keys_only_it_holds() {
         Some("aterm.toml is at ~/.config/aterm/aterm.toml"),
         "the inert arm names the folder"
     );
-    lab.state_mut()
-        .arm_config_file(Some(path.clone()), Some(home), ConfigFileArm::showing());
-    lab.invoke("settings/manual/show-file", None);
-    assert_eq!(
-        lab.state().feedback.as_deref(),
-        Some(format!("Showed aterm.toml in {}", file_viewer_name()).as_str())
-    );
 
     let outcome = lab
         .runtime
@@ -1098,6 +1171,80 @@ fn the_manual_page_names_the_file_and_lists_the_keys_only_it_holds() {
         .semantic(&UiKey::new("settings/manual/show-file"))
         .unwrap();
     assert!(show.state.is_some_and(|state| !state.enabled));
+}
+
+/// SHOW IN FINDER SHOWS THE FILE AND SAYS ONLY WHAT IT SHOWED: with the
+/// file there, the file itself — never its folder — goes to the file
+/// viewer to be selected, and only its yes is "Showed aterm.toml"; before
+/// the file exists, its folder is shown and the status says so; a viewer
+/// that selects nothing leaves the path named. The live arm's seams are the
+/// real reveal and folder open.
+#[test]
+fn show_in_finder_selects_the_file_and_says_only_what_it_showed() {
+    use std::sync::Mutex;
+    static REVEALED: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+    static OPENED: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+    fn reveal(path: &std::path::Path) -> bool {
+        REVEALED.lock().unwrap().push(path.to_path_buf());
+        true
+    }
+    fn refuse(path: &std::path::Path) -> bool {
+        REVEALED.lock().unwrap().push(path.to_path_buf());
+        false
+    }
+    fn open_folder(path: &std::path::Path) -> bool {
+        OPENED.lock().unwrap().push(path.to_path_buf());
+        true
+    }
+    let root = aterm_tempfile::TempDir::new().unwrap();
+    let path = root.path().join("aterm.toml");
+    std::fs::write(&path, "").unwrap();
+    let mut lab = Lab::new("");
+    lab.state_mut().navigate(SettingsRoute::Manual);
+    lab.state_mut().arm_config_file(
+        Some(path.clone()),
+        None,
+        ConfigFileArm::with_seams(reveal, open_folder),
+    );
+    lab.invoke("settings/manual/show-file", None);
+    assert_eq!(
+        lab.state().feedback.as_deref(),
+        Some(format!("Showed aterm.toml in {}", file_viewer_name()).as_str())
+    );
+    assert_eq!(
+        REVEALED.lock().unwrap().as_slice(),
+        std::slice::from_ref(&path),
+        "the file, not its folder"
+    );
+    assert!(OPENED.lock().unwrap().is_empty());
+
+    std::fs::remove_file(&path).unwrap();
+    lab.invoke("settings/manual/show-file", None);
+    assert_eq!(
+        lab.state().feedback.as_deref(),
+        Some(
+            format!(
+                "aterm.toml does not exist yet; showed its folder in {}",
+                file_viewer_name()
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(REVEALED.lock().unwrap().len(), 1, "nothing to select");
+    assert_eq!(*OPENED.lock().unwrap(), [root.path().to_path_buf()]);
+
+    std::fs::write(&path, "").unwrap();
+    lab.state_mut().arm_config_file(
+        Some(path.clone()),
+        None,
+        ConfigFileArm::with_seams(refuse, open_folder),
+    );
+    lab.invoke("settings/manual/show-file", None);
+    let status = lab.state().feedback.clone().unwrap();
+    assert!(status.starts_with("aterm.toml is at "), "{status}");
+
+    assert!(ConfigFileArm::live().seams_are_live());
+    assert!(!ConfigFileArm::inert().seams_are_live());
 }
 
 /// A suffix used to distinguish two normalized keys may already be another
@@ -1214,9 +1361,7 @@ fn the_offer_after_an_undo_is_a_redo_that_says_so() {
 
     lab.undo().expect("Undo is offered");
     let restored = lab.text();
-    for line in source.lines() {
-        assert!(restored.contains(line), "{line} is back: {restored}");
-    }
+    assert_eq!(restored, source, "Undo gives back the file, byte for byte");
     assert_eq!(lab.state().feedback.as_deref(), Some("Restored 3 settings"));
     assert_eq!(lab.undo_button_label().as_deref(), Some("Redo"));
     // Cmd-Z asks for an undo; what is offered is a redo, so nothing happens.
@@ -1266,11 +1411,11 @@ fn an_outside_change_to_its_keys_takes_the_undo_away() {
     );
 }
 
-/// A STYLE ROUND TRIP FROM EFFECTS OFF LEAVES NO REDUNDANT MASTER: turning
-/// cursor effects on by choosing a style writes the switch in its canonical
-/// ON form (no key where the platform default draws), so choosing the
-/// default style afterwards leaves nothing behind, and Modified lists no
-/// "Cursor style" whose value is its default.
+/// A STYLE ROUND TRIP FROM THE RETIRED SWITCH LEAVES NO STRAY KEY: from an old
+/// `cursor_trail = false`, choosing a style takes the retired switch out of
+/// the file (the typing glow kept as it drew), and choosing the default style
+/// afterwards writes no style key, so Modified lists no "Cursor style" whose
+/// value is its default.
 #[test]
 fn a_style_round_trip_from_effects_off_leaves_no_redundant_master() {
     let mut lab = Lab::new("cursor_trail = false\n");
@@ -1286,15 +1431,30 @@ fn a_style_round_trip_from_effects_off_leaves_no_redundant_master() {
         None,
     );
     let config: Config = aterm_toml::from_str(&lab.text()).unwrap();
-    assert!(config.cursor_trail_or_default(), "the trail is on");
+    assert!(config.cursor_trail_drawn(), "the trail is on");
+    assert!(config.cursor_trail.is_none(), "the retired switch is gone");
+    assert!(
+        !config.cursor_momentum_glow_or_default(),
+        "the typing glow stays off, as the old switch drew it"
+    );
     if crate::app_config::DEFAULT_DECORATIVE_EFFECTS {
-        assert_eq!(lab.text(), "", "no cursor key is left behind");
+        assert_eq!(
+            lab.text(),
+            "cursor_momentum_glow = false\n",
+            "no cursor style key is left behind"
+        );
         assert!(
             !lab.state().is_explicit(prefs::EDIT_CURSOR_TRAIL_STYLE),
             "Modified lists no Cursor style row"
         );
     } else {
-        assert_eq!(lab.text(), "cursor_trail = true\n");
+        assert_eq!(
+            lab.text(),
+            format!(
+                "cursor_trail_style = \"{}\"\n",
+                prefs::DEFAULT_CURSOR_TRAIL_STYLE
+            )
+        );
     }
 }
 
@@ -1317,4 +1477,512 @@ fn resets_name_the_default_in_plain_words() {
     assert_eq!(lab.state().feedback.as_deref(), Some("Wallpaper removed"));
     // Modified names the default the same way.
     assert_eq!(default_value_label(prefs::EDIT_WALLPAPER), Some("No image"));
+}
+
+/// WHEN UNIVERSAL CONTROL'S CHANGE LANDS IS READ FROM WHAT IS SAVED: Off at
+/// the next ALab tools check while Keep ALab tools up to date is on, and with
+/// it off (a retired `auto_update = false` too) once a day, at a new window
+/// or session, since no package pass runs; Leave as is when saved, so it says
+/// no timing, and its segment none either. The row, its control, the status
+/// after a save and Manual's help say it in the same words. Negative
+/// control: Keep on keeps the tools-check words.
+#[test]
+fn universal_control_says_when_off_lands_by_the_keep_switch() {
+    use prefs::ApplicationTiming::{DailyLaunchApply, NextToolsCheck};
+    let key = prefs::EDIT_MACHINE_UNIVERSAL_CONTROL;
+    let row_words = |lab: &Lab| {
+        let compiled = lab.compile(1_074.0, 820.0);
+        let painted = compiled
+            .paint
+            .iter()
+            .filter(|node| {
+                node.key
+                    .as_str()
+                    .starts_with(&format!("settings/detail/{key}/line-"))
+            })
+            .filter_map(|node| match &node.content {
+                UiContent::Text(spec) => Some(spec.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let visual = painted_row_label(&compiled, key).unwrap_or_default();
+        let control = compiled
+            .semantic(&UiKey::new(format!("settings/control/{key}")))
+            .map(|node| node.label.clone())
+            .unwrap_or_default();
+        let segments: Vec<String> = compiled
+            .semantics
+            .iter()
+            .filter(|node| {
+                node.key
+                    .as_str()
+                    .starts_with(&format!("settings/segment/{key}/"))
+            })
+            .map(|node| node.label.clone())
+            .collect();
+        (format!("{visual} {painted}"), control, segments)
+    };
+    for (source, timing) in [
+        (
+            "[machine]\nuniversal_control = \"off\"\n",
+            Some(NextToolsCheck),
+        ),
+        (
+            "[packages]\nenabled = true\n[machine]\nuniversal_control = \"off\"\n",
+            Some(NextToolsCheck),
+        ),
+        (
+            "[packages]\nenabled = false\n[machine]\nuniversal_control = \"off\"\n",
+            Some(DailyLaunchApply),
+        ),
+        (
+            "[packages]\nauto_update = false\n[machine]\nuniversal_control = \"off\"\n",
+            Some(DailyLaunchApply),
+        ),
+        ("[machine]\nuniversal_control = \"leave\"\n", None),
+    ] {
+        let mut lab = Lab::new(source);
+        lab.state_mut().navigate(SettingsRoute::Modified);
+        let (painted, control, segments) = row_words(&lab);
+        for phrase in [NextToolsCheck, DailyLaunchApply].map(prefs::ApplicationTiming::words) {
+            let says = timing.map(prefs::ApplicationTiming::words) == Some(phrase);
+            assert_eq!(
+                painted.contains(phrase),
+                says,
+                "{source}: painted {painted:?}"
+            );
+            assert_eq!(
+                control.contains(phrase),
+                says,
+                "{source}: control {control:?}"
+            );
+        }
+        // The segment not saved says when choosing it would land: Off its
+        // timing (by the Keep switch), Leave as is none.
+        for label in &segments {
+            if label.contains("Leave") {
+                assert!(
+                    !label.contains("Applies"),
+                    "{source}: Leave as is lands when saved: {label}"
+                );
+            }
+        }
+        // The status after saving Off says the same words.
+        let state = lab.state();
+        let patch = ConfigPatch {
+            edits: vec![ConfigEdit {
+                key: key.to_string(),
+                expected: ExpectedConfigValue::Exact(None),
+                value: Some("off".to_string()),
+            }],
+            base_revision: 1,
+        };
+        let projection =
+            config_application_projection(state, &patch, SettingsAvailability::for_state(state));
+        let off_timing = if source.contains("enabled = false") || source.contains("auto_update") {
+            DailyLaunchApply
+        } else {
+            NextToolsCheck
+        };
+        assert!(
+            projection.application_timings.contains(&off_timing) || !native_advanced_key(key),
+            "{source}: saving Off says {off_timing:?}: {projection:?}"
+        );
+    }
+    // An unsaved patch that turns Keep on with it flips the words.
+    let lab = Lab::new("[packages]\nenabled = false\n[machine]\nuniversal_control = \"leave\"\n");
+    let state = lab.state();
+    let patch = ConfigPatch {
+        edits: vec![
+            ConfigEdit {
+                key: key.to_string(),
+                expected: ExpectedConfigValue::Exact(None),
+                value: Some("off".to_string()),
+            },
+            ConfigEdit {
+                key: prefs::EDIT_PACKAGES_ENABLED.to_string(),
+                expected: ExpectedConfigValue::Exact(None),
+                value: Some("true".to_string()),
+            },
+        ],
+        base_revision: 1,
+    };
+    assert_eq!(
+        application_timing_in(state, Some(&patch), key),
+        Some(NextToolsCheck)
+    );
+}
+
+/// A NUMBER SETTINGS NAMES FOR A ROW IS ONE THE ROW TAKES BACK: the bound a
+/// refusal names is spelled as the field takes it (plain digits), so typing
+/// that bound saves, and the status, Reset and placeholder spell their
+/// numbers the same way. Negative control: the grouped spelling the refusal
+/// used to show is still refused, so grouping cannot come back without the
+/// writer taking it.
+#[test]
+fn a_number_a_row_names_is_one_it_takes_back() {
+    let key = prefs::EDIT_SEARCH_HISTORY_LINES;
+    let set = format!("settings/set/{key}");
+    let mut lab = Lab::new("");
+    lab.state_mut().navigate(SettingsRoute::Terminal);
+    let too_many = (i64::from(u32::MAX) + 1).to_string();
+    assert!(
+        lab.invoke(&set, Some(SemanticInput::Text(too_many)))
+            .is_none()
+    );
+    let error = lab.state().field_errors[key].clone();
+    let bound = error
+        .split("at most ")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .unwrap_or_else(|| panic!("the refusal names its bound: {error}"))
+        .to_string();
+    assert!(
+        prefs::check_edit_value(key, &bound).is_ok(),
+        "the named bound {bound:?} is one the row takes"
+    );
+    assert!(
+        prefs::check_edit_value(key, "4,294,967,295").is_err(),
+        "the grouped spelling is still refused"
+    );
+    let label = lab.state().field_by_key(key).unwrap().label;
+    lab.commit(&set, Some(SemanticInput::Text(bound.clone())));
+    assert_eq!(
+        lab.state().feedback.as_deref(),
+        Some(format!("{label} set to {bound}").as_str()),
+        "the status spells the number as the refusal did"
+    );
+    lab.commit(&format!("settings/reset/{key}"), None);
+    let feedback = lab.state().feedback.clone().unwrap_or_default();
+    let reset_to = feedback
+        .split(" reset to ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("a reset says what to: {feedback}"))
+        .to_string();
+    let placeholder = lab.state().field_by_key(key).unwrap().placeholder.clone();
+    assert_eq!(
+        placeholder.strip_suffix(" (default)"),
+        Some(reset_to.as_str()),
+        "Reset and the placeholder spell the default alike"
+    );
+}
+
+/// A COUNTED VALUE CARRIES ITS UNIT ON ITS NUMBER, never in its row's name
+/// ([`prefs::numeric_unit`]): the padding, tab-status and typography rows
+/// read "20 px" and "3000 ms" on their sliders and in their spoken value,
+/// Modified's default reads "Default: 12 px", and no label says "(px)".
+#[test]
+fn counted_values_read_with_their_units() {
+    let mut lab = Lab::new(
+        "window_padding = 20\nwindow_padding_top = 18\ntab_status_quiet_after_ms = 3000\n\
+         adjust_baseline = 2\n",
+    );
+    lab.state_mut().navigate(SettingsRoute::Modified);
+    let compiled = lab.compile(1_200.0, 2_400.0);
+    for (key, reading, default) in [
+        (prefs::EDIT_WINDOW_PADDING, "20 px", "12 px"),
+        (prefs::EDIT_WINDOW_PADDING_TOP, "18 px", "2 px"),
+    ] {
+        let control = compiled
+            .semantic(&UiKey::new(format!("settings/control/{key}")))
+            .unwrap_or_else(|| panic!("{key}'s slider"));
+        assert_eq!(control.value_text.as_deref(), Some(reading), "{key}");
+        assert_eq!(default_value_label(key), Some(default), "{key}");
+        let painted = compiled
+            .paint
+            .iter()
+            .find_map(|node| match &node.content {
+                UiContent::Slider(slider) if node.key == control.key => {
+                    Some(slider.spec.display_value.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert_eq!(painted, reading, "{key}: the readout");
+    }
+    for field in prefs::editable_fields(&crate::app_config::Config::default()) {
+        assert!(
+            !field.label.contains("(px)")
+                && !field.label.contains("(ms)")
+                && !field.label.contains("(s)")
+                && !field.label.contains("(%)"),
+            "{}: {}",
+            field.key,
+            field.label
+        );
+    }
+    for (key, value, reading) in [
+        (prefs::EDIT_TAB_STATUS_QUIET_AFTER_MS, 3000.0, "3000 ms"),
+        (prefs::EDIT_ADJUST_BASELINE, 2.0, "2 px"),
+        ("matrix_rain.idle_secs", 4.0, "4 s"),
+        ("sparkle_words.profanity.supernova_chance", 35.0, "35%"),
+    ] {
+        assert_eq!(
+            prefs::numeric_reading(key, value, &compact_f64(value)).as_deref(),
+            Some(reading),
+            "{key}"
+        );
+    }
+}
+
+/// Open a font row's picker on Text & Fonts and choose the option labelled
+/// `label`: the patch that writes, if any.
+fn choose_font(lab: &mut Lab, label: &str) -> Option<(ConfigPatch, OperationId)> {
+    lab.invoke("settings/font-picker/font_family", None);
+    let index = {
+        let picker = lab
+            .state()
+            .choice_picker
+            .as_ref()
+            .expect("the font picker opens");
+        picker
+            .options
+            .iter()
+            .position(|option| option.label.starts_with(label))
+            .unwrap_or_else(|| panic!("{label} is offered"))
+    };
+    lab.invoke(&format!("settings/choice/font_family/{index}"), None)
+}
+
+/// A COMMIT THAT CHANGES NOTHING WRITES NOTHING AND SAYS NOTHING: Return in
+/// "Other…" with the field empty while the font is unset, choosing
+/// Automatic while unset, choosing the saved font again, and Return in an
+/// empty unset number field send no patch, leave the file alone, claim no
+/// "reset to", and close what they opened. Negative controls: a name typed
+/// into Other… is written and named, and clearing a saved font removes it
+/// and says so.
+#[test]
+fn a_commit_of_what_the_file_holds_writes_nothing_and_claims_nothing() {
+    let mut lab = Lab::new("");
+    lab.state_mut().navigate(SettingsRoute::TextFonts);
+    lab.state_mut()
+        .replace_font_families(injected_font_families());
+    assert!(
+        choose_font(&mut lab, "Other").is_none(),
+        "Other… opens a field"
+    );
+    assert_eq!(
+        lab.state().font_text_entry.as_deref(),
+        Some(prefs::EDIT_FONT_FAMILY)
+    );
+    let submitted = lab
+        .runtime
+        .dispatch(
+            lab.instance,
+            lab.view,
+            AppEvent::TextInput(TextInputEvent::Submit),
+        )
+        .unwrap();
+    assert!(
+        submitted
+            .effects
+            .iter()
+            .all(|effect| !matches!(effect, AppEffect::ConfigPatch { .. })),
+        "an empty Other… on an unset font writes nothing"
+    );
+    assert_eq!(lab.text(), "");
+    assert!(
+        lab.state()
+            .feedback
+            .as_deref()
+            .is_none_or(|status| !status.contains("reset") && !status.contains("set to")),
+        "{:?}",
+        lab.state().feedback
+    );
+    assert_eq!(lab.state().font_text_entry, None, "the list button is back");
+    assert_eq!(lab.state().editing_field, None);
+
+    assert!(
+        choose_font(&mut lab, "Automatic").is_none(),
+        "Automatic while unset"
+    );
+    assert!(lab.state().choice_picker.is_none(), "the picker closes");
+    assert_eq!(lab.state().feedback, None);
+
+    // An empty, unset number field: Return writes nothing.
+    lab.invoke(&format!("settings/set/{}", prefs::EDIT_SCROLLBACK), None);
+    let submitted = lab
+        .runtime
+        .dispatch(
+            lab.instance,
+            lab.view,
+            AppEvent::TextInput(TextInputEvent::Submit),
+        )
+        .unwrap();
+    assert!(
+        submitted
+            .effects
+            .iter()
+            .all(|effect| !matches!(effect, AppEffect::ConfigPatch { .. })),
+        "an empty unset field writes nothing"
+    );
+    assert_eq!(lab.state().feedback, None);
+
+    // Negative control: a typed name is written, and its status names it.
+    choose_font(&mut lab, "Other");
+    lab.dispatch(AppEvent::TextInput(TextInputEvent::Commit(
+        "Menlo".to_string(),
+    )));
+    lab.commit_event(AppEvent::TextInput(TextInputEvent::Submit));
+    assert_eq!(lab.text(), "font_family = \"Menlo\"\n");
+    assert_eq!(
+        lab.state().feedback.as_deref(),
+        Some("Font family set to Menlo")
+    );
+
+    let mut lab = Lab::new("font_family = \"Menlo\"\n");
+    lab.state_mut().navigate(SettingsRoute::TextFonts);
+    lab.state_mut()
+        .replace_font_families(injected_font_families());
+    assert!(
+        choose_font(&mut lab, "Menlo").is_none(),
+        "the saved font again"
+    );
+    assert!(lab.state().choice_picker.is_none());
+    // Negative control: Automatic over a saved font removes it, and says so.
+    let (patch, _) = choose_font(&mut lab, "Automatic").expect("a real change writes");
+    assert_eq!(patch.edits[0].value, None);
+}
+
+/// The words of a patch that changes no row never say "reset to" or "set
+/// to": they say what the setting already is.
+#[test]
+fn a_patch_that_changes_nothing_is_never_worded_as_a_change() {
+    let lab = Lab::new("font_family = \"Menlo\"\n");
+    let words = change_words(
+        lab.state(),
+        &ConfigPatch {
+            base_revision: 1,
+            edits: vec![ConfigEdit {
+                key: prefs::EDIT_FONT_FAMILY.to_string(),
+                expected: ExpectedConfigValue::Exact(Some("Menlo".to_string())),
+                value: Some("Menlo".to_string()),
+            }],
+        },
+    );
+    assert!(
+        !words.status.contains("reset to") && !words.status.contains("set to"),
+        "{}",
+        words.status
+    );
+    assert_eq!(words.status, "Font family is already Menlo");
+}
+
+/// A VALUE EQUAL TO ITS DEFAULT IS A REMOVAL ON THE PAGE TOO: setting
+/// Window appearance to auto (by value, as automation and assistive
+/// technology do) writes no key, and Modified's count does not move.
+#[test]
+fn the_page_writes_a_default_value_as_a_removal() {
+    let mut lab = Lab::new("window_theme = \"dark\"\n");
+    lab.state_mut().navigate(SettingsRoute::Appearance);
+    let patch = lab.commit(
+        &format!("settings/set/{}", prefs::EDIT_WINDOW_THEME),
+        Some(SemanticInput::Text("auto".to_string())),
+    );
+    assert_eq!(patch.edits[0].value, None, "the page sends the removal");
+    assert_eq!(lab.text(), "");
+    assert_eq!(lab.state().raw_value(prefs::EDIT_WINDOW_THEME), None);
+    // Already absent: the default again writes nothing.
+    assert!(
+        lab.invoke(
+            &format!("settings/set/{}", prefs::EDIT_WINDOW_THEME),
+            Some(SemanticInput::Text("auto".to_string())),
+        )
+        .is_none()
+    );
+}
+
+/// A COMMENT UNDER A TABLE'S LAST KEY STAYS WITH ITS TABLE: turning Keyword
+/// kitties back on (the default, so its key goes) keeps the
+/// `[sparkle_words.feline]` header with the comment written under its key,
+/// never leaving that comment under the table before it; Undo gives the file
+/// back byte for byte.
+#[test]
+fn a_reset_keeps_the_comment_under_a_tables_last_key_with_its_table() {
+    let source = "[machine]\nuniversal_control = \"leave\"\n\n[sparkle_words.feline]\nenabled = false\n# kitties: off until the demo is over\n\n[harness]\nenabled = true\n";
+    let mut lab = Lab::new(source);
+    lab.state_mut().navigate(SettingsRoute::Home);
+    lab.commit(
+        &format!("settings/set/{KEYWORD_KITTIES_KEY}"),
+        Some(SemanticInput::Bool(true)),
+    );
+    let text = lab.text();
+    assert!(
+        text.contains("[sparkle_words.feline]\n# kitties: off until the demo is over\n"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("universal_control = \"leave\"\n# kitties"),
+        "{text}"
+    );
+    lab.undo().expect("Undo is offered");
+    assert_eq!(lab.text(), source);
+}
+
+/// ONE KEY, ONE CLASSIFICATION ON EVERY SURFACE: a written key Modified
+/// draws as a row is a row Search draws too, and a written key Modified
+/// lists among the keys only aterm.toml holds is in Search's aterm.toml card
+/// too — never a row on one and an aterm.toml key on the other. The keys
+/// with an audited consumer and a home are rows (the renderer, replay, the
+/// shell's priority, the window's size and badge); the ones without
+/// (typography tuning, the old word-effects master, rain tuning) are
+/// aterm.toml keys on both. (Modified used to admit every registry key while
+/// Search admitted only the audited ones.)
+#[test]
+fn a_written_setting_is_the_same_row_in_search_and_modified() {
+    let source = "gpu = false\nfocus_boost = false\ntemporal_recording = true\ncolumns = 96\nshow_build_badge = false\nstem_gamma = 1.2\nsparkle_words.enabled = false\n[matrix_rain]\nfps = 20\n";
+    let controls = |compiled: &crate::native_ui::CompiledUi| {
+        compiled
+            .semantics
+            .iter()
+            .filter_map(|node| node.key.as_str().strip_prefix("settings/control/"))
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
+    };
+    let mut lab = Lab::new(source);
+    lab.state_mut().navigate(SettingsRoute::Modified);
+    let modified_rows = controls(&lab.compile(1_200.0, 8_000.0));
+    let overrides: BTreeSet<String> = authored_manual_overrides(lab.state())
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect();
+    let keys = [
+        prefs::EDIT_GPU,
+        prefs::EDIT_FOCUS_BOOST,
+        prefs::EDIT_TEMPORAL_RECORDING,
+        prefs::EDIT_COLUMNS,
+        prefs::EDIT_SHOW_BUILD_BADGE,
+        prefs::EDIT_STEM_GAMMA,
+        SPARKLE_MASTER_KEY,
+        "matrix_rain.fps",
+    ];
+    for key in keys {
+        let row = modified_rows.contains(key);
+        let toml = overrides.contains(key);
+        assert!(row != toml, "{key}: a row or an aterm.toml key on Modified");
+        lab.dispatch(AppEvent::Action(ActionInvocation {
+            id: ActionId::new("settings/search"),
+            value: Some(SemanticInput::Text(key.to_string())),
+        }));
+        let searched = controls(&lab.compile(1_200.0, 8_000.0));
+        assert_eq!(
+            searched.contains(key),
+            row,
+            "{key}: Search draws a row iff Modified does"
+        );
+        assert_eq!(
+            manual_search_matching_keys(lab.state(), key)
+                .iter()
+                .any(|listed| listed == key),
+            toml,
+            "{key}: Search's aterm.toml card lists it iff Modified does"
+        );
+    }
+    for key in &keys[..5] {
+        assert!(modified_rows.contains(*key), "{key} is a setting");
+    }
+    for key in &keys[5..] {
+        assert!(overrides.contains(*key), "{key} has no Settings control");
+    }
 }

@@ -65,6 +65,16 @@ impl Fixture {
     /// The dev `atpkg` over this fixture, however it ends. Its working directory is the
     /// fixture's, so a relative seam names nothing outside it.
     fn run(&self, args: &[&str], state_home: Option<&std::path::Path>) -> std::process::Output {
+        let mut cmd = self.command(args);
+        if let Some(state_home) = state_home {
+            cmd.env("ATERM_STATE_HOME", state_home);
+        }
+        cmd.output().expect("run the dev atpkg")
+    }
+
+    /// The dev `atpkg` with `args` over this fixture, as the owner's process (no private
+    /// state root), stdin closed.
+    fn command(&self, args: &[&str]) -> aterm_uds::spawnfd::Command {
         let mut cmd = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_atpkg"));
         cmd.args(args)
             .current_dir(self.root.path())
@@ -76,10 +86,7 @@ impl Fixture {
             )
             .env_remove("ATERM_STATE_HOME")
             .stdin(Stdio::null());
-        if let Some(state_home) = state_home {
-            cmd.env("ATERM_STATE_HOME", state_home);
-        }
-        cmd.output().expect("run the dev atpkg")
+        cmd
     }
 
     fn lines(stdout: &[u8]) -> Vec<String> {
@@ -225,29 +232,97 @@ fn an_unknown_word_ahead_of_the_verb_is_refused_before_the_machine_edge() {
     );
 }
 
-/// A PASS THE STORE LOCK TURNS AWAY STILL CARRIES THE EDIT, AND HAS SAID SO WHEN IT EXITS.
-/// The edge's apply needs no store lock, so it runs BESIDE the pass, on a thread started
-/// before the lock is asked for, and the pass joins it before it returns — a refused pass
-/// too. Here the test holds the store lock, so the `update` is refused at once (exit 75),
-/// and the never-applied table's apply was still attempted: its synthetic-home refusal is
-/// on stdout.
+/// A PASS THE STORE LOCK TURNS AWAY STILL CARRIES THE EDIT, AND HAS SAID SO WHEN IT EXITS —
+/// AND ITS LOCK ATTEMPT NEVER WAITED FOR THAT EDIT. The edge's apply needs no store lock, so
+/// it runs BESIDE the pass, on a thread started before the lock is asked for, and the pass
+/// joins it before it returns — a refused pass too. Here the test holds the store lock, so
+/// the `update` is refused at once (exit 75), and holds the edge's apply up where it opens
+/// the `[machine]` queue: a FIFO stands at `machine.lock`, and its open waits for a reader,
+/// as an apply waits on a wedged `defaults`. The refusal reaches stderr while the edge is
+/// held; once a reader lets it go, the pass exits with the never-applied table's apply
+/// attempted on stdout (its synthetic-home refusal). Negative control: an edge applied in
+/// line, in front of the lock attempt, holds the refusal back with it.
 #[test]
 fn a_pass_the_store_lock_refuses_still_carries_the_machine_edit() {
+    use std::io::{BufRead as _, Read as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     let fx = Fixture::new("contended");
     let layout = atpkg::store::Layout {
         prefix: fx.prefix.clone(),
     };
     let held = atpkg::lock::try_lock_store(&layout).expect("the test holds the store lock");
-    let out = fx.run(&["update"], None);
+    let queue = fx.prefix.join("machine.lock");
+    let fifo = std::ffi::CString::new(queue.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `fifo` is a NUL-terminated path that outlives the call.
+    let made = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+    assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+    let mut child = fx
+        .command(&["update"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run the dev atpkg");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let stdout = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        text
+    });
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (line_tx, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = line_tx.send(line);
+        }
+    });
+    // A hang detector, not a latency budget: the refusal must come while the edge is held.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut said = Vec::new();
+    let refused_while_held = loop {
+        match lines.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) {
+            Ok(line) if line.contains("holds the store lock") => break true,
+            Ok(line) => said.push(line),
+            Err(_) => break false,
+        }
+    };
+    // A reader at the FIFO ends the edge's open.
+    let release = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&queue)
+        .expect("open the queue's FIFO for reading");
+    if !refused_while_held {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("hang detector: the store lock's refusal waited for the [machine] edge: {said:?}");
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= until {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("hang detector: the refused pass did not exit once its edge was let go");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    drop(release);
     drop(held);
+    let stdout = stdout.join().expect("the stdout drain");
     assert_eq!(
-        out.status.code(),
+        status.code(),
         Some(i32::from(atpkg::lock::CONTENDED_EXIT)),
-        "{out:?}"
+        "{status:?}"
     );
     assert!(
-        Fixture::attempted(&Fixture::lines(&out.stdout)),
-        "the refused pass still carried the never-applied table: {out:?}"
+        Fixture::attempted(&Fixture::lines(stdout.as_bytes())),
+        "the refused pass still carried the never-applied table: {stdout:?}"
     );
 }
 

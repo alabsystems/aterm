@@ -54,7 +54,7 @@ fn gone() -> Instant {
 #[derive(Debug, Clone, PartialEq)]
 struct Laid {
     title: Vec<RenderCell>,
-    lean: [Vec<RenderCell>; 2],
+    lean: [Vec<RenderCell>; LEAN_FORMS],
     short_title: Vec<RenderCell>,
     reason: bool,
     lights: Vec<RenderCell>,

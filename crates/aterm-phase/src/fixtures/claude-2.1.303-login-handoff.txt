@@ -1,0 +1,27 @@
+# claude-code 2.1.303 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the /login browser hand-off with its paste field, 2.1.303
+ ▐▛███▛█   Claude Code v2.1.303
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.26bb/proj
+
+
+❯ hi
+  ⎿  Not logged in · Please run /login
+
+✻ Worked for 1s · done 10:24 AM
+
+❯ /login
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Login
+
+  Browser didn't open? Use the url below to sign in (c to copy)
+
+https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fpl
+atform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_
+servers+user%3Afile_upload+user%3Aplugins&code_challenge=xoyoWhvKFTK3t7RBJ-2axcpYQ-Ft55xmgwHkdj9Ujz8&code_challenge_method=S256&state=m1PX-QbqBd
+ajpWFDgTpFxHwB4jMJgVJJZQ1K7-M46Aw
+
+
+  Paste code here if prompted >
+
+  Esc to cancel

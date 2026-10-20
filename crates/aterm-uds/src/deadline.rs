@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! A deadline on a call that can block forever: in this process ([`Gate`]) or in a child
-//! ([`output_until`], [`outputs_until`]).
+//! ([`output_until`], [`output_while_progressing`], [`outputs_until`]).
 //!
 //! The case is macOS's `trustd`. Security.framework's certificate and code-signing checks
 //! (`SecTrustEvaluateWithError`, `SecCodeCheckValidity`, `SecStaticCodeCheckValidity` on
@@ -30,12 +30,21 @@
 //!   goes through the one [`TRUST`] gate.
 //! * A panic settles as [`Refused::Failed`], never as a service that did not answer.
 //!
+//! [`Gate::start`] is the same call with the wait left to the caller: a [`Pending`] it waits
+//! for in slices, watching other things between them, for as long as it chooses. Its suspect
+//! age still says when it starts refusing the other calls; dropped unanswered, it is abandoned
+//! as [`Gate::run`] abandons a call at its deadline.
+//!
 //! # In a child: [`output_until`]
 //!
 //! `codesign`, `spctl`, `security`: run to completion by a deadline, with the child's process
 //! group killed and reaped at the deadline. Children need no gate. The exit is waited for as
 //! the kernel reports it ([`ExitWait`]: a kqueue on Darwin, a pidfd on Linux), not on a sleep
 //! tick, so a 40 ms tool returns at 40 ms.
+//!
+//! A child that does a long run of small steps is held to its progress instead
+//! ([`output_while_progressing`]): killed once a caller's probe of it has not moved for one
+//! window, however long the whole run takes.
 //!
 //! # Several children at once: [`outputs_until`]
 //!
@@ -44,11 +53,17 @@
 //! watches their exits, so it starts no thread (the boot apply runs it before the window
 //! exists).
 //!
+//! # A child started now, run later: [`Held`]
+//!
+//! On Darwin a child can be started stopped at its exec and run to its output once the caller
+//! decides it may: the exec, and the work the system does at one, overlap the caller's own
+//! work, and nothing of the program runs before the decision.
+//!
 //! # Tests
 //!
-//! Test and debug builds (never a release one) add [`notice_once`], [`trust_service_silent`]
-//! and [`disk_image_service_silent`]: a test that needs the service skips with one line on
-//! stderr when it does not answer.
+//! Test and debug builds (never a release one) add [`require_trust_service`] and
+//! [`require_disk_image_service`]: a test that needs the service ends COULD NOT RUN when it
+//! does not answer ([`crate::host::could_not_run`]).
 
 use std::io::{self, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -70,8 +85,8 @@ pub use complete::{
 mod silent;
 #[cfg(any(test, debug_assertions))]
 pub use silent::{
-    CODESIGN_HANG, DISK_IMAGE_SKIPPED, SKIPPED, disk_image_service_silent, notice_once,
-    sign_ad_hoc, trust_service_silent,
+    CODESIGN_HANG, ad_hoc_copy, require_disk_image_service, require_trust_service, sign_ad_hoc,
+    trust_service_silent,
 };
 
 /// The gate for every in-process call that can wait on macOS's `trustd` (TLS certificate
@@ -167,6 +182,28 @@ impl Gate {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
+        // Still pending at the deadline: dropping it marks the slot abandoned.
+        self.start(suspect.min(deadline), work)?
+            .wait(deadline)
+            .unwrap_or(Err(Refused::Unanswered))
+    }
+
+    /// `work()`, started on a helper thread, its answer left to the caller to wait for
+    /// ([`Pending::wait`]) for as long as it chooses.
+    ///
+    /// Refused at once, without starting a helper, while an earlier call's work has run longer
+    /// than its suspect age. This call's suspect age is `suspect`: past it, while the caller
+    /// still waits, every other call through the gate is refused at once.
+    ///
+    /// # Errors
+    /// [`Refused::Unanswered`] while another call is overdue; [`Refused::Failed`] when no
+    /// thread could start.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn start<T, F>(&'static self, suspect: Duration, work: F) -> Result<Pending<T>, Refused>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
         let ours = Arc::new((
             Mutex::new(Slot::<std::thread::Result<T>>::Pending),
             Condvar::new(),
@@ -187,7 +224,7 @@ impl Gate {
             helpers.running.push(Running {
                 id,
                 began: now,
-                suspect: suspect.min(deadline),
+                suspect,
             });
             id
         };
@@ -212,24 +249,62 @@ impl Gate {
                 "no thread could be started: {error}"
             )));
         }
-
-        let (lock, answered) = &*ours;
-        let slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
-        let (mut slot, _) = answered
-            .wait_timeout_while(slot, deadline, |slot| matches!(slot, Slot::Pending))
-            .unwrap_or_else(PoisonError::into_inner);
-        match std::mem::replace(&mut *slot, Slot::Abandoned) {
-            Slot::Done(Ok(value)) => Ok(value),
-            Slot::Done(Err(_panic)) => Err(Refused::Failed("the check panicked".to_owned())),
-            // Still pending at the deadline: the slot now says abandoned.
-            Slot::Pending | Slot::Abandoned => Err(Refused::Unanswered),
-        }
+        Ok(Pending { slot: ours })
     }
 
     /// The helper `id` has returned.
     fn forget(&self, id: u64) {
         let mut helpers = self.helpers.lock().unwrap_or_else(PoisonError::into_inner);
         helpers.running.retain(|helper| helper.id != id);
+    }
+}
+
+/// A call [`Gate::start`] began whose answer nobody has taken yet. Dropped before then, it is
+/// abandoned: the helper drops its result when it returns.
+pub struct Pending<T> {
+    slot: Arc<(Mutex<Slot<std::thread::Result<T>>>, Condvar)>,
+}
+
+impl<T> Pending<T> {
+    /// The call's answer, if it comes within `within`; the call back, still pending, if not.
+    ///
+    /// # Errors
+    /// The pending call itself while its work has not returned. Its answer is
+    /// [`Refused::Failed`] when the work panicked.
+    pub fn wait(self, within: Duration) -> Result<Result<T, Refused>, Self> {
+        let answer = {
+            let (lock, answered) = &*self.slot;
+            let slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            let (mut slot, _) = answered
+                .wait_timeout_while(slot, within, |slot| matches!(slot, Slot::Pending))
+                .unwrap_or_else(PoisonError::into_inner);
+            match std::mem::replace(&mut *slot, Slot::Abandoned) {
+                Slot::Done(Ok(value)) => Some(Ok(value)),
+                Slot::Done(Err(_panic)) => {
+                    Some(Err(Refused::Failed("the check panicked".to_owned())))
+                }
+                Slot::Pending => {
+                    *slot = Slot::Pending;
+                    None
+                }
+                // Only this call's own drop abandons it, and that has not run.
+                Slot::Abandoned => Some(Err(Refused::Unanswered)),
+            }
+        };
+        answer.ok_or(self)
+    }
+}
+
+impl<T> Drop for Pending<T> {
+    fn drop(&mut self) {
+        let (lock, _) = &*self.slot;
+        *lock.lock().unwrap_or_else(PoisonError::into_inner) = Slot::Abandoned;
+    }
+}
+
+impl<T> std::fmt::Debug for Pending<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Pending")
     }
 }
 
@@ -296,6 +371,66 @@ pub fn output_until_from(
     stdin: Stdio,
     deadline: Instant,
 ) -> Result<Output, RunError> {
+    output_by(cmd, stdin, &mut || {
+        deadline.saturating_duration_since(Instant::now())
+    })
+}
+
+/// The most time [`output_while_progressing`] lets pass between two reads of its progress
+/// probe (a quarter of its window, when that is shorter): a stall is named within one tick of
+/// its window, and a probe that reads a file's length costs nothing at this rate.
+const PROGRESS_TICK: Duration = Duration::from_millis(100);
+
+/// [`output_until`] held to the child's PROGRESS, not to one deadline: for a child that does a
+/// long run of small steps (one shell running a batch of calls), where a deadline on the whole
+/// run times the batch rather than a hang, and a loaded machine fails an honest run.
+///
+/// `progress` is the caller's measure of how far the child has got (the length of a file it
+/// appends to is the usual one), read when the child is first found running and then at least
+/// every [`PROGRESS_TICK`] (a quarter of `window` when that is shorter); any change in what it
+/// returns is progress. The child runs as long as it keeps making some, and once `progress`
+/// has answered the same for `window` the child's process group is killed (`SIGKILL`) and the
+/// child reaped, as [`output_until`] does at its deadline. A reading taken late (a descheduled
+/// caller) still counts what the child did meanwhile. Stdin, the kept tails, the process group
+/// and [`DRAIN_GRACE`] are as in [`output_until`].
+///
+/// # Errors
+/// As [`output_until`]. [`RunError::TimedOut`] here means no progress for `window`: the
+/// probe's last reading is where the child stopped, which the caller can name.
+pub fn output_while_progressing(
+    cmd: &mut Command,
+    window: Duration,
+    progress: &mut dyn FnMut() -> u64,
+) -> Result<Output, RunError> {
+    let tick = PROGRESS_TICK.min(window / 4).max(Duration::from_millis(1));
+    // The reading, and when it last changed: taken at the first look, after the spawn.
+    let mut last: Option<(u64, Instant)> = None;
+    output_by(cmd, Stdio::null(), &mut || {
+        // The reading first, then the clock: a quiet stretch is never counted from before
+        // the reading that ended the last one.
+        let reading = progress();
+        let now = Instant::now();
+        let since = match last {
+            Some((seen, since)) if seen == reading => since,
+            _ => {
+                last = Some((reading, now));
+                now
+            }
+        };
+        let quiet = now.saturating_duration_since(since);
+        window.saturating_sub(quiet).min(tick)
+    })
+}
+
+/// The one child run behind [`output_until_from`] and [`output_while_progressing`]: each time
+/// the child is found still running, `left` says how long to wait for its exit before looking
+/// again, and zero ends the run (the group is killed and the child reaped,
+/// [`RunError::TimedOut`]).
+fn output_by(
+    cmd: &mut Command,
+    stdin: Stdio,
+    left: &mut dyn FnMut() -> Duration,
+) -> Result<Output, RunError> {
     #[cfg(unix)]
     cmd.process_group(0);
     let mut child = cmd
@@ -318,7 +453,7 @@ pub fn output_until_from(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
+                let remaining = left();
                 if remaining.is_zero() {
                     end(&mut child);
                     return Err(RunError::TimedOut);
@@ -353,10 +488,23 @@ pub fn output_until_from(
 /// Make it while the child is unreaped (right after the spawn), then alternate `try_wait`
 /// with [`ExitWait::wait`]:
 ///
-/// ```ignore
-/// let mut exit = ExitWait::new(&child);
-/// while child.try_wait()?.is_none() {
-///     exit.wait(deadline.saturating_duration_since(Instant::now()));
+/// ```no_run
+/// use std::{io, process::ExitStatus, time::Instant};
+/// use aterm_uds::{deadline::ExitWait, spawnfd::Child};
+///
+/// // On timeout the caller still owns the live child and decides how to end it.
+/// fn wait_until(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+///     let mut exit = ExitWait::new(child);
+///     loop {
+///         if let Some(status) = child.try_wait()? {
+///             return Ok(Some(status));
+///         }
+///         let remaining = deadline.saturating_duration_since(Instant::now());
+///         if remaining.is_zero() {
+///             return Ok(None);
+///         }
+///         exit.wait(remaining);
+///     }
 /// }
 /// ```
 #[derive(Debug)]
@@ -482,6 +630,74 @@ pub fn outputs_until(
     }
 }
 
+/// How long a [`Held`] child dropped unrun is given to be reaped after its `SIGKILL`.
+#[cfg(unix)]
+const HELD_REAP: Duration = Duration::from_millis(250);
+
+/// A child STARTED STOPPED AT ITS EXEC ([`crate::spawnfd::Command::start_suspended`]), for
+/// [`Self::output_until`] to run later. Its exec — and whatever the system does at one, a
+/// first-exec assessment included — proceeds while the caller does other work, and not one
+/// instruction of the program runs before the caller resumes it.
+///
+/// Dropped unrun, it is killed (`SIGKILL`, its process group) without ever running and reaped
+/// within [`HELD_REAP`]; one the kernel has not let go by then is left to [`crate::reaper`].
+/// If this process dies holding it, it dies unrun too: it leads its own process group, which
+/// the kernel hangs up when orphaned, with `SIGHUP` at its default
+/// ([`crate::spawnfd::Command::start_suspended`]).
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct Held {
+    /// `None` once [`Self::output_until`] has taken it.
+    child: Option<Child>,
+}
+
+#[cfg(unix)]
+impl Held {
+    /// Start `cmd` stopped at its exec, set up as [`outputs_until`] runs a child: leading a new
+    /// process group, stdin `/dev/null`, stdout and stderr piped.
+    ///
+    /// # Errors
+    /// The spawn's, the exec's own included: `Unsupported` off Darwin, with nothing started.
+    pub fn start(cmd: &mut Command) -> io::Result<Self> {
+        let child = children::prepare(cmd).start_suspended(true).spawn()?;
+        Ok(Self { child: Some(child) })
+    }
+
+    /// The held child's pid.
+    #[must_use]
+    pub fn id(&self) -> u32 {
+        self.child.as_ref().map_or(0, Child::id)
+    }
+
+    /// Resume the child and run it to its output by `deadline`, exactly as [`outputs_until`]
+    /// runs one child from its spawn (the reaping reserve `reap` included).
+    ///
+    /// # Errors
+    /// As [`outputs_until`]'s, and [`RunError::Spawn`] for a child that could not be resumed
+    /// (killed and reaped within `reap`; it never ran).
+    pub fn output_until(mut self, deadline: Instant, reap: Duration) -> Result<Output, RunError> {
+        let Some(mut child) = self.child.take() else {
+            return Err(RunError::TimedOut);
+        };
+        if let Err(error) = child.resume() {
+            children::kill_group(&mut child);
+            reap_within(&mut child, None, Instant::now() + reap);
+            return Err(RunError::Spawn(error));
+        }
+        children::output_of_until(child, deadline, reap)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            children::kill_group(&mut child);
+            reap_within(&mut child, None, Instant::now() + HELD_REAP);
+        }
+    }
+}
+
 /// One stream being read on a thread of its own: the tail so far, and a
 /// signal when the stream has ended.
 struct Drain {
@@ -530,8 +746,12 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    #[cfg(target_vendor = "apple")]
+    use super::Held;
     #[cfg(unix)]
-    use super::{ExitWait, OUTPUT_KEEP, RunError, output_until, outputs_until};
+    use super::{
+        ExitWait, OUTPUT_KEEP, RunError, output_until, output_while_progressing, outputs_until,
+    };
     use super::{Gate, Refused};
 
     /// Short: the work never answers on its own; the assertion is that the call comes back.
@@ -663,6 +883,38 @@ mod tests {
         release.send(()).expect("the slow helper is still waiting");
         assert_eq!(slow.join().expect("the slow caller"), Ok("hashed"));
         drained(&GATE);
+    }
+
+    #[test]
+    fn a_started_call_past_its_suspect_age_is_still_its_callers_answer_and_refuses_the_others() {
+        const SUSPECT: Duration = Duration::from_millis(50);
+        static GATE: Gate = Gate::new("test-gate");
+
+        let (release, held) = mpsc::channel::<()>();
+        let mut pending = GATE
+            .start(SUSPECT, move || {
+                let _ = held.recv();
+                "answered"
+            })
+            .expect("the gate is idle");
+        std::thread::sleep(SUSPECT * 2);
+        // Waited for in slices, it stays pending, and its caller keeps it.
+        for _ in 0..3 {
+            pending = match pending.wait(Duration::from_millis(5)) {
+                Err(still) => still,
+                Ok(answer) => panic!("answered before its work returned: {answer:?}"),
+            };
+        }
+        // Past its suspect age it refuses every other call at once.
+        let (work, seen) = witness();
+        assert_eq!(GATE.run(HANG, HANG, work), Err(Refused::Unanswered));
+        assert!(never_ran(&seen), "a call started behind an overdue one");
+
+        release.send(()).expect("the helper is still waiting");
+        let answer = pending.wait(HANG);
+        assert!(matches!(answer, Ok(Ok("answered"))), "{answer:?}");
+        drained(&GATE);
+        assert_eq!(GATE.run(HANG, HANG, || 7), Ok(7));
     }
 
     #[test]
@@ -825,6 +1077,93 @@ mod tests {
         assert_eq!(status.code(), Some(4));
     }
 
+    /// The window the two progress tests hold a child to: short, so a stall is named in well
+    /// under a second. Each test's progress is the probe's own (a reading the test moves), so
+    /// neither verdict rests on how fast a loaded machine runs the child.
+    #[cfg(unix)]
+    const WINDOW: Duration = Duration::from_millis(300);
+
+    /// A child that keeps making progress outlives its window and answers: the probe's
+    /// reading moves every quarter window, and after three windows the probe drops the flag
+    /// the child waits for. A deadline of one window would have killed it. The reading stops
+    /// moving at the hang detector, so a child that never sees the flag still fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_keeps_making_progress_outlives_its_window() {
+        let dir = scratch("progressing");
+        let flag = dir.join("flag");
+        let mut cmd = sh(
+            "while [ ! -e \"$0\" ]; do sleep 0.02; done; printf done",
+            &[&flag],
+        );
+        let begun = Instant::now();
+        let mut dropped = false;
+        let mut probe = || {
+            let age = begun.elapsed().min(HANG);
+            if age >= WINDOW * 3 && !dropped {
+                std::fs::write(&flag, b"").expect("the flag");
+                dropped = true;
+            }
+            u64::try_from(age.as_millis() / (WINDOW / 4).as_millis()).unwrap_or(u64::MAX)
+        };
+        let out = output_while_progressing(&mut cmd, WINDOW, &mut probe);
+        let waited = begun.elapsed();
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = out.expect("a child making progress is no hang");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(out.stdout, b"done");
+        assert!(
+            waited >= WINDOW * 3,
+            "the child ran past three windows: {waited:?}"
+        );
+    }
+
+    /// A child that stops making progress is killed, with its group, one whole window after
+    /// its LAST step, not one window after it started, and the probe's last reading names the
+    /// step it stopped after: the reading moves on each of the probe's first five looks and
+    /// never again, while the child sleeps for ten minutes.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_stops_making_progress_is_killed_one_window_after_its_last_step() {
+        const STEPS: u64 = 5;
+        let dir = scratch("stalled");
+        let pid_file = dir.join("pid");
+        let mut cmd = sh("echo $$ > \"$0\"; exec sleep 600", &[&pid_file]);
+        let begun = Instant::now();
+        let mut reading = 0;
+        let mut last_step = begun;
+        let mut probe = || {
+            if reading < STEPS {
+                reading += 1;
+                last_step = Instant::now();
+            }
+            reading
+        };
+        let result = output_while_progressing(&mut cmd, WINDOW, &mut probe);
+        let killed = Instant::now();
+        let child = pid_in(&pid_file);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(result, Err(RunError::TimedOut)), "{result:?}");
+        assert_eq!(reading, STEPS, "the stall is named by the last step");
+        let quiet = killed.duration_since(last_step);
+        assert!(
+            quiet >= WINDOW,
+            "killed {quiet:?} after the last step, inside the window"
+        );
+        assert!(
+            killed.duration_since(begun) < HANG,
+            "the call did not come back"
+        );
+        // A zombie still answers `kill(pid, 0)`, so gone means killed and reaped. A machine
+        // too loaded to start the shell in time leaves no pid to check.
+        if let Some(pid) = child {
+            assert!(
+                !crate::process::pid_alive(pid),
+                "pid {pid} outlived the call"
+            );
+        }
+    }
+
     /// The first child cannot finish until the third has run, which a one-after-another run
     /// would reach only at the deadline. Each answers with its own status and streams, in
     /// order; a tool that cannot start stops nothing else; one that leaves a descendant on its
@@ -929,6 +1268,48 @@ mod tests {
             kill_stray((!dead).then_some(pid));
             assert!(dead, "the child's descendant {pid} outlived the call");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A HELD CHILD RUNS ONLY ONCE RESUMED, TO ITS OUTPUT.** Held, the shell is exec'd and
+    /// stopped before its first instruction (`ps`: `T`) and has left no marker;
+    /// [`Held::output_until`] runs it to its status and both streams, as
+    /// [`output_until`] does from a spawn. Dropped unresumed, a held child is killed and
+    /// gone without having run.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_held_child_runs_only_once_resumed_and_one_dropped_never_runs() {
+        let state = |pid: u32| {
+            let out = crate::spawnfd::command("/bin/ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .expect("run ps");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let dir = scratch("held");
+        let marker = dir.join("ran");
+        let held = Held::start(&mut sh(
+            "printf ran > \"$0\"; printf out; printf err >&2; exit 3",
+            &[&marker],
+        ))
+        .expect("held");
+        assert!(state(held.id()).starts_with('T'), "{:?}", state(held.id()));
+        assert!(!marker.exists(), "a held child ran");
+        let out = held
+            .output_until(Instant::now() + HANG, Duration::from_secs(1))
+            .expect("ran");
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.stdout, b"out");
+        assert_eq!(out.stderr, b"err");
+        assert!(marker.exists(), "the resumed child ran");
+
+        let unrun = dir.join("unrun");
+        let dropped = Held::start(&mut sh("printf ran > \"$0\"", &[&unrun])).expect("held");
+        let pid = dropped.id();
+        drop(dropped);
+        assert!(gone(pid), "the dropped held child {pid} outlived its drop");
+        assert!(!unrun.exists(), "a held child dropped unresumed ran");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

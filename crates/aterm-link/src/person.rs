@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm fabric halt|inbox|post` — the PERSON side of the fabric.
+//! `aterm fabric mint-for|halt|inbox|post` — the PERSON side of the fabric.
 //!
 //! ```text
+//! aterm fabric mint-for h-<name>|a-<name> [--out <cap>] [--fleet <F>] [--expires <N>d|<N>h]
 //! aterm fabric halt  --cap-file <cap> <reason>|off
 //! aterm fabric inbox --cap-file <cap> [--peek]
 //! aterm fabric post  --cap-file <cap> to=@<sid>@<node> kind=<k> [re=<off>] [--] <text>
@@ -13,9 +14,21 @@
 //! `<src>` says so: what a person types in an aterm session arrives
 //! `trust=agent`, attested by that node. A PERSON speaks for themself, under a
 //! cap of their own — §8.2's human ring, [`crate::enable::person_grants`],
-//! minted by `aterm fabric mint-for h-<name>` on the host that holds the
-//! fleet's mint secret — and the broker binds every publish to the principal
-//! the cap names. That is what these three verbs are:
+//! minted by `aterm fabric mint-for h-<name>` on this machine, whose fabric
+//! root holds the mint secret — and the broker binds every publish to the
+//! principal the cap names. That is what these four verbs are:
+//!
+//! * `mint-for` mints that ring under `<root>/mint.secret`
+//!   ([`mint_for`]): the cap these verbs take, and the one `aterm link notify
+//!   --on ask:<person>` reads its mail with. It refuses anything but an `h-`
+//!   or `a-` id, and a secret that is missing, short or readable by another
+//!   user (the one reader, [`crate::transport::read_mint_secret`]). It never
+//!   prints the secret; `--out` writes the cap 0600, atomically, never over a
+//!   DIFFERENT file and never through a symlink, and makes an IDENTICAL file
+//!   already there 0600 before it says so; without `--out` the lines go to
+//!   stdout (like `aterm link mint`) and the guidance to stderr. `--expires
+//!   30d` stamps `exp=` into every grant, and the broker refuses the ring from
+//!   that instant on; without it the ring lasts until the secret is rotated.
 //!
 //! * A HUMAN's `halt` publishes the retained row `/f/<F>/fleet/<person>/halt`
 //!   (`v=1 t= state=on reason=<pct>`, or `state=off`). Every bridge applies it to every
@@ -63,14 +76,15 @@
 
 use std::collections::BTreeSet;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use astream_broker::Event;
 
 use crate::body::Body;
 use crate::bridge::{read_cap_file, Config};
+use crate::enable::{is_node_id, write_atomic, Paths};
 use crate::fabric::IO_TIMEOUT;
-use crate::join::{is_node_id, is_person_id};
 use crate::render::{safe, TEXT_CAP};
 use crate::transport::{self, Closer, Conn};
 
@@ -154,7 +168,7 @@ pub fn parse(verb: &str, rest: &[String]) -> Result<Option<PersonCmd>, String> {
     if cap_files.is_empty() {
         return Err(format!(
             "`{verb}` needs --cap-file <cap>: a person's cap, from `aterm fabric mint-for \
-             h-<name> --out <cap>` on the host that holds the fleet's mint secret"
+             h-<name> --out <cap>` on this machine (its fabric root holds the mint secret)"
         ));
     }
     let act = match verb {
@@ -295,7 +309,7 @@ pub fn main(verb: &str, cmd: &PersonCmd, cfg: &Config) -> ExitCode {
                 eprintln!(
                     "aterm fabric {verb}: the broker at {} refused it: {e} — {caps} must be \
                      {person}'s ring, minted under this fleet's secret (`aterm fabric mint-for \
-                     {person}` on the host that holds it)",
+                     {person}` on this machine)",
                     safe(&cfg.broker, 256)
                 );
             } else {
@@ -372,8 +386,7 @@ pub fn person_of(cap_files: &[String], fleet: &str) -> Result<String, String> {
         (Some(p), None) => Ok(p),
         (None, _) => Err(format!(
             "{} holds no person's grant (a node's cap speaks as its node, not as a person): \
-             `aterm fabric mint-for h-<name> --out <cap>` on the host that holds the fleet's \
-             mint secret mints one",
+             `aterm fabric mint-for h-<name> --out <cap>` on this machine mints one",
             cap_files.join(" ")
         )),
         (Some(a), Some(b)) => Err(format!(
@@ -386,7 +399,7 @@ pub fn person_of(cap_files: &[String], fleet: &str) -> Result<String, String> {
 /// A broker connection with the person's caps attached, every exchange
 /// bounded by [`IO_TIMEOUT`].
 fn connect(cfg: &Config, cmd: &PersonCmd) -> io::Result<(Conn, Closer)> {
-    let (mut conn, closer) = transport::connect(&cfg.transport, &cfg.broker, IO_TIMEOUT)?;
+    let (mut conn, closer) = transport::connect(&cfg.broker, IO_TIMEOUT)?;
     transport::attach_cap_files(&mut conn, &cmd.cap_files)?;
     Ok((conn, closer))
 }
@@ -524,7 +537,9 @@ fn inbox(
         }
     );
     let mut sub = conn.subscribe_group(&group, &filter)?;
-    closer.set_read_timeout(Some(astream_broker::IDLE_MARK_DEADLINE))?;
+    // A broker that already answered and hung up leaves nothing to bound; its mail
+    // is still read below, and its close ends the inbox in words.
+    transport::bound_reads(&closer, Some(astream_broker::IDLE_MARK_DEADLINE))?;
     let cap = cmd.cap_files.join(" --cap-file ");
     let mut count = 0usize;
     loop {
@@ -650,9 +665,398 @@ fn went_silent(e: io::Error) -> io::Error {
     }
 }
 
+// ---------------------------------------------------------------------------
+// mint-for
+// ---------------------------------------------------------------------------
+
+/// `aterm fabric mint-for`'s flags.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MintForOpts {
+    /// The person to mint for: `h-<name>` or `a-<name>`.
+    pub person: String,
+    /// `--out <cap>`: write the cap there (0600) instead of stdout.
+    pub out: Option<String>,
+    /// `--fleet <F>`: default this host's configured fleet.
+    pub fleet: Option<String>,
+    /// `--expires <N>d|<N>h` ([`parse_lifetime`]), as milliseconds: every
+    /// grant is stamped `exp=<now + this>`, and the broker refuses the ring
+    /// from that instant on. `None` mints a ring that never expires.
+    pub expires: Option<u64>,
+}
+
+/// Whether `id` is a PERSON: an `h-` human or an `a-` agent holding its own cap
+/// (§3.2), the principals `mint-for` mints [`crate::enable::person_grants`] for.
+#[must_use]
+pub fn is_person_id(id: &str) -> bool {
+    (id.starts_with("h-") || id.starts_with("a-")) && crate::subject::is_principal(id)
+}
+
+/// `--expires <N>d|<N>h`: a capability lifetime, as milliseconds.
+///
+/// # Errors
+///
+/// Anything but a positive whole number of days or hours, at most ten years.
+pub fn parse_lifetime(word: &str) -> Result<u64, String> {
+    const HOUR_MS: u64 = 3_600_000;
+    const MAX_HOURS: u64 = 10 * 366 * 24;
+    let refuse = || {
+        format!(
+            "--expires {}: a whole number of days or hours, e.g. 30d or 12h",
+            safe(word, 32)
+        )
+    };
+    let (n, unit_hours) = if let Some(d) = word.strip_suffix('d') {
+        (d, 24)
+    } else if let Some(h) = word.strip_suffix('h') {
+        (h, 1)
+    } else {
+        return Err(refuse());
+    };
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(refuse());
+    }
+    let hours = n
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(unit_hours))
+        .filter(|&h| (1..=MAX_HOURS).contains(&h))
+        .ok_or_else(refuse)?;
+    Ok(hours * HOUR_MS)
+}
+
+/// `grant` with `exp=<exp_ms>` added to its prefix: `rw,p=<P>:` becomes
+/// `rw,p=<P>,exp=<ms>:` and `ro:` becomes `ro,exp=<ms>:` — the grammar
+/// astream-cap reads (`field := "p=" … | "exp=" …`). Every person grant has a
+/// prefix, and the mint re-parses, so a stamp that went wrong fails closed.
+fn with_expiry(grant: &str, exp_ms: u64) -> String {
+    grant.replacen(':', &format!(",exp={exp_ms}:"), 1)
+}
+
+/// The fleet and the broker of THIS host's fabric, when it has one: the
+/// config's `[fabric] command`, else the rendezvous file's.
+fn this_fabric() -> Option<(String, String)> {
+    crate::fabric::resolve_command(None, crate::fabric::config_path().as_deref())
+        .ok()
+        .flatten()
+        .and_then(|(_, cmd)| crate::fabric::bridge_config(&cmd).ok())
+        .map(|cfg| (cfg.fleet, cfg.broker))
+        .or_else(|| {
+            crate::enable::Rendezvous::read()
+                .ok()
+                .flatten()
+                .map(|r| (r.fleet, r.broker))
+        })
+}
+
+/// `path` as an absolute path: itself, or joined to the working directory, so
+/// the line that names the cap names the file a later command reads.
+fn absolute(path: &str) -> PathBuf {
+    let p = PathBuf::from(path);
+    if p.is_absolute() {
+        p
+    } else {
+        std::env::current_dir().map_or(p.clone(), |cwd| cwd.join(&p))
+    }
+}
+
+/// `aterm fabric mint-for h-<name>|a-<name> [--out <cap>] [--fleet <F>] [--expires <N>d|<N>h]`.
+#[must_use]
+pub fn mint_for(opts: &MintForOpts) -> ExitCode {
+    let person = &opts.person;
+    if !is_person_id(person) {
+        eprintln!(
+            "aterm fabric mint-for: `{}` is not a person: `h-<name>` for a human, `a-<name>` \
+             for an agent with its own cap ([a-z0-9-])",
+            safe(person, 64)
+        );
+        return ExitCode::from(2);
+    }
+    let (p, root_from) = match Paths::resolve_for_off() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("aterm fabric mint-for: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let here = this_fabric();
+    let fleet = opts
+        .fleet
+        .clone()
+        .or_else(|| here.as_ref().map(|(f, _)| f.clone()))
+        .unwrap_or_else(|| p.fleet.clone());
+    if !crate::subject::is_fleet(&fleet) {
+        eprintln!(
+            "aterm fabric mint-for: fleet {} is not a subject segment ([a-z0-9-]{{1,32}})",
+            safe(&fleet, 64)
+        );
+        return ExitCode::from(2);
+    }
+    // The secret, through the one reader (0600, 32+ bytes, its exact bytes).
+    let secret_path = p.secret();
+    let shown = secret_path.to_string_lossy().into_owned();
+    let secret = match crate::transport::read_mint_secret(&shown) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            eprintln!(
+                "aterm fabric mint-for: no mint secret at {shown}: `aterm fabric on` mints it"
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!(
+                "aterm fabric mint-for: {}",
+                crate::transport::describe(&shown, &e)
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let exp = opts
+        .expires
+        .map(|lifetime| crate::now_ms().saturating_add(lifetime));
+    let ring = crate::enable::person_grants(&fleet, person);
+    let mut lines = String::new();
+    for grant in &ring {
+        let grant = exp.map_or_else(|| grant.clone(), |exp| with_expiry(grant, exp));
+        match astream_cap::mint(&secret, &grant) {
+            Ok(c) => {
+                lines.push_str(&astream_cap::capfile::format_line(&c.filter, &c.tag));
+                lines.push('\n');
+            }
+            Err(e) => {
+                eprintln!("aterm fabric mint-for: the mint refused `{grant}`: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let written = match &opts.out {
+        None => {
+            // THE CAP IS THE ANSWER: one that did not reach stdout whole is no mint the
+            // caller holds, so it is refused before the guidance below says "to stdout".
+            if let Err(line) = cap_on_stdout(write_capability_to(&mut io::stdout(), &lines)) {
+                eprintln!("{line}");
+                return ExitCode::FAILURE;
+            }
+            None
+        }
+        Some(out) => match write_cap(&absolute(out), &lines, &secret_path) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                eprintln!("aterm fabric mint-for: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    // THE GUIDANCE, on stderr when the cap itself went to stdout, so a
+    // redirect captures exactly the cap's lines.
+    let say = |line: String| {
+        if written.is_some() {
+            println!("{line}");
+        } else {
+            eprintln!("{line}");
+        }
+    };
+    say(format!(
+        "minted {person}'s {} grants on fleet {fleet} under {} (root from {root_from}){}",
+        ring.len(),
+        secret_path.display(),
+        written.as_ref().map_or_else(
+            || " — to stdout".to_string(),
+            |w| format!(" into {} (0600)", w.display())
+        )
+    ));
+    if let Some(exp) = exp {
+        say(format!(
+            "they expire at {} (exp={exp}): the broker refuses them from then on; mint again \
+             here before then",
+            aterm_types::rfc3339::format_rfc3339(exp / 1000)
+        ));
+    }
+    let cap_shown = written
+        .as_ref()
+        .map_or_else(|| "<cap>".to_string(), |w| w.display().to_string());
+    let broker = here.as_ref().map_or("<broker>", |(_, b)| b.as_str());
+    say(person_guidance(person, &fleet, broker, &cap_shown));
+    ExitCode::SUCCESS
+}
+
+/// Write a capability result completely and flush it. Unlike incidental diagnostic
+/// printing, every error (including a departed reader) prevents claiming delivery.
+///
+/// # Errors
+/// Any write or flush failure; no partial result is certified as delivered.
+pub(crate) fn write_capability_to(out: &mut dyn io::Write, text: &str) -> io::Result<()> {
+    out.write_all(text.as_bytes()).and_then(|()| out.flush())
+}
+
+/// Whether the cap `mint-for` wrote to stdout reached its reader whole, as `written` says: any
+/// write error refuses, a reader that went away included. A verb's answer into `| head -1` is no
+/// failure ([`aterm_uds::stdout::answer_status`]), but a cap cut short (`| ssh host 'cat > cap'`
+/// whose ssh died, `> cap` on a full disk) is no cap a person can present, and "minted … to
+/// stdout" would say it was.
+fn cap_on_stdout(written: io::Result<()>) -> Result<(), String> {
+    written.map_err(|e| {
+        format!(
+            "aterm fabric mint-for: the cap was not written whole to stdout ({e}), so none was \
+             handed over; mint again"
+        )
+    })
+}
+
+/// Write the cap `lines` to `path`, 0600 — never through a symlink, never over
+/// a DIFFERENT file; an IDENTICAL file already there is made 0600, and a wider
+/// mode it had is reported with what voids a copy (`secret`, the mint secret
+/// the cap was minted under). The path written.
+fn write_cap(path: &Path, lines: &str, secret: &Path) -> Result<PathBuf, String> {
+    // NEVER THROUGH A SYMLINK: `read` and the write below would both follow
+    // one at `--out`, into a file somebody else chose.
+    if std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_file()) {
+        return Err(format!(
+            "{} exists and is not a regular file; remove it or choose another --out",
+            path.display()
+        ));
+    }
+    match std::fs::read(path) {
+        // THE SAME CAP IS ALREADY THERE: made 0600 first, since the line
+        // after says so, and a wider mode is reported.
+        Ok(old) if old == lines.as_bytes() => match private_mode(path) {
+            Ok(None) => {}
+            Ok(Some(was)) => eprintln!(
+                "aterm fabric mint-for: {} held this cap at mode {was:03o}, readable by other \
+                 users; now 0600. A copy of it works until its grants expire (a cap minted \
+                 with --expires lapses on its own) or the mint secret is replaced: move {} \
+                 aside and run `aterm fabric on` again, which re-mints the node's cap; every \
+                 person's cap minted under the old secret stops verifying, so mint each again",
+                path.display(),
+                secret.display()
+            ),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        },
+        Ok(_) => {
+            return Err(format!(
+                "{} exists and holds a different cap; remove it or choose another --out",
+                path.display()
+            ));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            write_atomic(path, lines.as_bytes(), 0o600)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    }
+    Ok(path.to_path_buf())
+}
+
+/// What a person does with the cap `mint-for <person>` just made: the
+/// commands, spelled with that cap. Only a human (`h-`) halts, and every node
+/// takes a human's task as a task; an `a-` service's ring has no halt grant,
+/// and its task is one only where `--accept-from` lists it (the bridge's
+/// `accepted`).
+fn person_guidance(person: &str, fleet: &str, broker: &str, cap: &str) -> String {
+    let human = person.starts_with("h-");
+    let halt = if human {
+        format!(
+            "  aterm fabric halt --cap-file {cap} <reason>    hold every session on the fleet\n  \
+             aterm fabric halt --cap-file {cap} off         withdraw that halt\n"
+        )
+    } else {
+        String::new()
+    };
+    let task = if human {
+        format!("a `task` from {person} arrives as a task on every node")
+    } else {
+        format!(
+            "{person} is not a human: it halts nothing, and its `task` arrives as a task only on \
+             a node whose --accept-from lists {person}"
+        )
+    };
+    format!(
+        "with it, {person} uses the fleet (keep the cap 0600; it IS {person}):\n\
+         {halt}  \
+         aterm fabric inbox --cap-file {cap}            read what agents posted to={person}\n  \
+         aterm fabric post --cap-file {cap} to=@<sid>@<node> kind=answer re=<off> <text>\n  \
+         aterm link notify --fleet {fleet} --broker {broker} --cap-file {cap} --on \
+         ask:{person} --exec <cmd>    be paged when an agent asks {person}\n\
+         {task}"
+    )
+}
+
+/// Make `path` 0600 if it is not: `Ok(None)` when it already was, `Ok(Some(
+/// <old mode>))` when it was changed.
+///
+/// # Errors
+///
+/// The stat or the chmod.
+fn private_mode(path: &Path) -> io::Result<Option<u32>> {
+    use std::os::unix::fs::PermissionsExt;
+    let was = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    if was == 0o600 {
+        return Ok(None);
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(Some(was))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CAP STDOUT DID NOT TAKE WHOLE IS REFUSED, a reader that went away included: the cap
+    /// is the whole answer, and a person cannot present part of one.
+    #[test]
+    fn a_cap_stdout_did_not_take_whole_is_refused() {
+        assert_eq!(cap_on_stdout(Ok(())), Ok(()));
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::StorageFull] {
+            let refused = cap_on_stdout(Err(kind.into())).expect_err("no cap was handed over");
+            assert!(
+                refused.starts_with("aterm fabric mint-for: the cap was not written whole"),
+                "{kind:?}: {refused}"
+            );
+        }
+    }
+
+    /// `--expires` is a whole number of days or hours, never zero, never
+    /// past ten years.
+    #[test]
+    fn a_lifetime_is_days_or_hours() {
+        assert_eq!(parse_lifetime("30d"), Ok(30 * 24 * 3_600_000));
+        assert_eq!(parse_lifetime("12h"), Ok(12 * 3_600_000));
+        for bad in [
+            "0d", "0h", "d", "30", "30m", "-1d", "+3h", "1.5d", "99999d", "",
+        ] {
+            assert!(parse_lifetime(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// A PERSON'S RING STAMPED WITH AN EXPIRY keeps its authority: every grant
+    /// carries `exp=` in astream's grammar, a principal grant beside its `p=`.
+    #[test]
+    fn a_person_ring_stamped_with_an_expiry_reads_its_expiry() {
+        let exp = 1_800_000_000_000u64;
+        let stamped: Vec<String> = crate::enable::person_grants("lab", "h-andrew")
+            .iter()
+            .map(|g| with_expiry(g, exp))
+            .collect();
+        assert!(
+            stamped
+                .iter()
+                .any(|g| g.starts_with(&format!("rw,p=h-andrew,exp={exp}:"))),
+            "{stamped:?}"
+        );
+        for g in &stamped {
+            assert_eq!(astream_cap::expires_at(g), Some(exp), "{g}");
+        }
+    }
+
+    /// A PERSON is an `h-` or `a-` principal; a node, a session and a
+    /// malformed id are not.
+    #[test]
+    fn a_person_is_h_or_a_dash_and_a_principal() {
+        assert!(is_person_id("h-andrew"));
+        assert!(is_person_id("a-review"));
+        for bad in ["n-0123", "s-0123", "h-", "h-UPPER", "h-a b", "andrew", ""] {
+            assert!(!is_person_id(bad), "{bad}");
+        }
+    }
 
     fn words(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_string).collect()
@@ -788,7 +1192,6 @@ mod tests {
         Config {
             fleet: "f".to_string(),
             broker: socket.to_string_lossy().into_owned(),
-            transport: transport::Transport::Unix,
             cap_files: Vec::new(),
             state_dir: dir.join("state").to_string_lossy().into_owned(),
             accept_from: Vec::new(),

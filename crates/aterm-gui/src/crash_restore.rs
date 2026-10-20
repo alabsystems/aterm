@@ -441,6 +441,11 @@ pub(crate) struct JournalSlot {
     restored: OnceLock<RestoreReport>,
 }
 
+/// A live journal as [`JournalSlot::status_words`] reads it: why it broke
+/// (`None` while it writes), then its tail, its ring's lag, whether its ring
+/// is shed, and the bytes its region holds resident.
+type JournalSample = (Option<String>, (u64, u64, bool, usize));
+
 impl JournalSlot {
     /// Install the session's journal (once, at its spawn).
     #[cfg(unix)]
@@ -491,7 +496,7 @@ impl JournalSlot {
     }
 
     /// What a keeper recovery restored for this session, if it was recovered.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn restored(&self) -> Option<&RestoreReport> {
         self.restored.get()
     }
@@ -509,7 +514,7 @@ impl JournalSlot {
     /// [`RestoreReport::status_words`].
     pub(crate) fn status_words(&self) -> String {
         #[cfg(unix)]
-        let live = self.journal.get().map(|j| {
+        let live: Option<JournalSample> = self.journal.get().map(|j| {
             (
                 j.broken(),
                 (
@@ -521,7 +526,7 @@ impl JournalSlot {
             )
         });
         #[cfg(not(unix))]
-        let live: Option<(Option<String>, (u64, u64, bool, usize))> = None;
+        let live: Option<JournalSample> = None;
         let mut words = match (live, self.off.get()) {
             (Some((None, (tail, lag, shed, bytes))), _) => format!(
                 "journal=live journal_tail={tail} journal_ring_lag={lag} journal_ring={} \
@@ -2824,7 +2829,7 @@ fn pressure_request(rest: &str, injection: bool) -> Result<Option<PressureLevel>
 /// shed's effect (`status journal_bytes=`, `metrics journal_resident_bytes=`, the window's
 /// footprint) right after. Only macOS has a source to stand in for.
 pub(crate) fn cmd_pressure(
-    proxy: &winit::event_loop::EventLoopProxy<crate::Wake>,
+    proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>,
     rest: &str,
 ) -> String {
     let level = match pressure_request(rest, PRESSURE_INJECTION) {

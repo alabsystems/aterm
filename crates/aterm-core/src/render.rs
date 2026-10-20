@@ -17,6 +17,12 @@ use crate::selection::TextSelection;
 use crate::terminal::{CursorStyle, RenderCell};
 use aterm_hash::FxHashMap;
 
+// The engine's sprite and bitmap primitive (design: docs/DESIGN-card-engine-2026-10-19.md §4).
+pub use crate::render_fx::{
+    FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRamps, FxRect, FxRowRuns, FxRun, FxSlot,
+    FxSpace, FxSprite, FxTexels, PxRect,
+};
+
 /// One faded cell of the cursor motion trail: a cell the cursor recently swept
 /// through, painted in the trail colour at `alpha` coverage over its own
 /// background. The trail fades within a few hundred milliseconds, reading as a
@@ -1552,6 +1558,22 @@ pub struct RenderInput {
     /// offsets by `(pad, grid_top)`), one row band per quad. Host-owned;
     /// usually empty.
     pub rain_add: Vec<RainHalo>,
+    /// Retained fx layers ([`FxLayer`]): the engine's sprite and bitmap
+    /// primitive, drawn at their [`FxSlot`]s and sliced by the renderer at the
+    /// cell-row bands, so a layer spans rows freely. Compared by identity (the
+    /// content `Arc`, never its bytes), so a settled layer is a pointer
+    /// compare. Host-owned; usually empty.
+    pub fx_layers: Vec<FxLayer>,
+    /// Host chrome painted over every fx layer, in window pixels (a find bar's
+    /// band, a menu card): the renderer subtracts each from every layer's draw
+    /// rect, so several compose. Rendered content: compared in `PartialEq`.
+    /// Host-owned; usually empty.
+    pub fx_occluders: Vec<PxRect>,
+    /// Arts a GPU renderer should make resident ahead of the frame that draws
+    /// them (the card's arts when a drawer image is published). Draws
+    /// nothing; excluded from `PartialEq` and from damage, and not kept in the
+    /// damage cache. Host-owned; usually empty.
+    pub fx_prefetch: Vec<std::sync::Arc<FxArt>>,
     /// Scrollback offset: viewport row `r` shows live row `r - display_offset`.
     pub display_offset: i32,
     /// Absolute row of the top visible line at extraction (`Grid::base_y()` =
@@ -1577,6 +1599,15 @@ pub struct RenderInput {
     /// geometry must fail closed on both stamps. Metadata, excluded from
     /// `PartialEq`.
     pub history_renumber_epoch: u64,
+    /// The holder fence at extraction ([`Terminal::holder_view`]), resolved to
+    /// absolute rows under the same lock as [`base_y`](Self::base_y): which
+    /// main-screen rows the current drawer wrote, and whether the alternate
+    /// screen is wholly its. A card is decorated only inside it. Metadata,
+    /// excluded from `PartialEq` like `base_y`; `HolderView::NONE` (token 0)
+    /// where nothing cuts (wasm, gpu-web, a replay).
+    ///
+    /// [`Terminal::holder_view`]: crate::terminal::Terminal::holder_view
+    pub holder: crate::terminal::HolderView,
     /// Sub-row scroll translate (display only): the signed fractional-pixel
     /// residual smooth scrolling banks below one row
     /// (`scroll_frac_px ∈ (-cell_h, cell_h)`). Positive is the `frac` half of
@@ -2170,6 +2201,10 @@ impl PartialEq for RenderInput {
             && self.rain_atlas.as_ref().map(std::sync::Arc::as_ptr)
                 == other.rain_atlas.as_ref().map(std::sync::Arc::as_ptr)
             && self.rain_add == other.rain_add
+            // Fx layers by identity (`FxLayer`'s `PartialEq`: the content
+            // `Arc` is pointer-compared, like every atlas above).
+            && self.fx_layers == other.fx_layers
+            && self.fx_occluders == other.fx_occluders
             && self.display_offset == other.display_offset
             && self.selection == other.selection
             && self.selection_clip == other.selection_clip
@@ -2194,13 +2229,14 @@ impl PartialEq for RenderInput {
         // Not compared (metadata or present-time only, so a change must not
         // force a raster repaint):
         // - `snapshot_seq`, `base_y`, `absolute_row_revision`,
-        //   `history_renumber_epoch`: host re-anchor metadata.
+        //   `history_renumber_epoch`, `holder`: host re-anchor metadata.
         // - `scroll_frac_px`, `grid_top_row`, `grid_bot_row`, `apron_row`,
         //   `input_hot`: consumed at present time, outside the damage cache.
         // - `terminal_id`, `extract_gen`, `engine_fill_seq`, `engine_alt`,
         //   `engine_row_order`, `row_rev`, `row_rev_lane`, `shifted_fill_seq`,
         //   `composed_fill_seq`: continuity tokens that advance on every
         //   damaged frame and would defeat the dirty gate they feed.
+        // - `fx_prefetch`: residency hints that draw nothing.
     }
 }
 
@@ -2380,10 +2416,21 @@ impl RenderInput {
         self.rain_quads.clone_from(&source.rain_quads);
         self.rain_atlas.clone_from(&source.rain_atlas);
         self.rain_add.clone_from(&source.rain_add);
+        // The layers clone their `Arc`s: the cache holds strong references,
+        // so the identity it compares against can never be reused (no ABA).
+        self.fx_layers.clone_from(&source.fx_layers);
+        self.fx_occluders.clone_from(&source.fx_occluders);
+        // Prefetch draws nothing, so the damage cache does not keep it.
+        if retain_effect_payloads {
+            self.fx_prefetch.clone_from(&source.fx_prefetch);
+        } else {
+            self.fx_prefetch.clear();
+        }
         self.display_offset = source.display_offset;
         self.base_y = source.base_y;
         self.absolute_row_revision = source.absolute_row_revision;
         self.history_renumber_epoch = source.history_renumber_epoch;
+        self.holder = source.holder;
         self.scroll_frac_px = source.scroll_frac_px;
         self.grid_top_row = source.grid_top_row;
         self.grid_bot_row = source.grid_bot_row;
@@ -2484,10 +2531,14 @@ impl RenderInput {
             rain_quads: Vec::new(),
             rain_atlas: None,
             rain_add: Vec::new(),
+            fx_layers: Vec::new(),
+            fx_occluders: Vec::new(),
+            fx_prefetch: Vec::new(),
             display_offset: 0,
             base_y: 0,
             absolute_row_revision: 0,
             history_renumber_epoch: 0,
+            holder: crate::terminal::HolderView::NONE,
             scroll_frac_px: 0,
             grid_top_row: 0,
             grid_bot_row: 0,
@@ -2862,6 +2913,23 @@ impl RenderInput {
             q.y = q.y.saturating_add(dy);
             q.cy = q.cy.saturating_add(dy);
         }
+        // Fx layers carry no row tag: O(layers). A layer's offset and its
+        // clip share its space, so both move: a Window layer by `pixel_dy`
+        // (the window streams' rule), a Grid layer by `dy` (the grid
+        // streams'). The occluders are window pixels and follow `pixel_dy`
+        // like the effect clip.
+        let (fx_window_dy, fx_grid_dy) = (i32::from(pixel_dy), i32::from(dy));
+        for layer in &mut self.fx_layers {
+            let d = match layer.space {
+                FxSpace::Window => fx_window_dy,
+                FxSpace::Grid => fx_grid_dy,
+            };
+            layer.offset.1 = layer.offset.1.saturating_add(d);
+            layer.clip = layer.clip.translate(0, d);
+        }
+        for o in &mut self.fx_occluders {
+            *o = o.translate(0, fx_window_dy);
+        }
         self.rows += strip;
         // The strip changes the presented pixels; bump the snapshot seq so the renderer's
         // content cache sees the new frame.
@@ -3076,8 +3144,9 @@ impl RenderInput {
     /// content (grid, cursor position/colour, selection, images): the cursor
     /// trail and shape override, cursor glow and halos, under-glyph flame light,
     /// fire patches, charred-ink and contrast-halo overrides, sparkle-word
-    /// decorations, animated ink, cat sprites, supernova light and rain (atlas
-    /// `Arc`s nulled). Used by the `image plain` introspection capture.
+    /// decorations, animated ink, cat sprites, supernova light, rain (atlas
+    /// `Arc`s nulled) and the fx layers with their occluders and prefetch. Used
+    /// by the `image plain` introspection capture.
     pub fn clear_overlays(&mut self) {
         self.cursor_effect_style_override = None;
         self.cursor_trail.clear();
@@ -3105,6 +3174,9 @@ impl RenderInput {
         self.rain_quads.clear();
         self.rain_atlas = None;
         self.rain_add.clear();
+        self.fx_layers.clear();
+        self.fx_occluders.clear();
+        self.fx_prefetch.clear();
         self.wallpaper = None;
     }
 
@@ -5379,5 +5451,164 @@ mod host_row_prepend_tests {
         let mut reordered = frame();
         reordered.visual_to_logical = vec![Vec::new(), vec![1, 0]];
         assert!(plain != reordered);
+    }
+}
+
+#[cfg(test)]
+mod fx_input_tests {
+    use std::sync::Arc;
+
+    use super::{
+        FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRect, FxSlot, FxSpace, FxTexels,
+        HostRowPixels, PxRect, RenderInput,
+    };
+    use crate::terminal::RenderCell;
+
+    fn content() -> Arc<FxContent> {
+        Arc::new(FxContent::new(
+            vec![FxItem::Rect(FxRect {
+                x: 1,
+                y: 2,
+                w: 3,
+                h: 4,
+                ink: 0,
+            })],
+            vec![FxInk::add(0x0010_2030); 2],
+        ))
+    }
+
+    fn art() -> Arc<FxArt> {
+        Arc::new(FxArt::new(1, 1, FxTexels::Index8, vec![1]).expect("sized"))
+    }
+
+    /// A frame carrying a clipped Window layer, a clipped Grid layer, an
+    /// unclipped Window layer, an occluder and a prefetched art.
+    fn frame(c: &Arc<FxContent>) -> RenderInput {
+        let mut window = FxLayer::new(1, c.clone(), FxSlot::Over, FxSpace::Window, FxBlend::Exact);
+        window.clip = PxRect::new(-3, 2, 60, 25);
+        let mut grid = FxLayer::new(2, c.clone(), FxSlot::Under, FxSpace::Grid, FxBlend::Exact);
+        grid.offset = (5, 7);
+        grid.clip = PxRect::new(0, 0, 40, 30);
+        let unclipped = FxLayer::new(3, c.clone(), FxSlot::Glow, FxSpace::Window, FxBlend::Exact);
+        RenderInput {
+            rows: 4,
+            cols: 3,
+            cells: vec![vec![RenderCell::default(); 3]; 4],
+            fx_layers: vec![window, grid, unclipped],
+            fx_occluders: vec![PxRect::new(0, 10, 50, 20)],
+            fx_prefetch: vec![art()],
+            ..Default::default()
+        }
+    }
+
+    /// Frames compare their layers by identity and their occluders by value,
+    /// and never read the prefetch. Each `!=` is a negative control: equal
+    /// bytes behind another `Arc`, a moved offset, another slot and a moved
+    /// occluder are each a different frame.
+    #[test]
+    fn fx_channels_compare_by_identity_and_prefetch_draws_nothing() {
+        let c = content();
+        let a = frame(&c);
+        let mut b = frame(&c);
+        b.fx_prefetch.clear();
+        assert!(a == b, "same Arcs, prefetch ignored");
+        let mut twin = frame(&content());
+        twin.fx_prefetch.clone_from(&a.fx_prefetch);
+        assert!(
+            a != twin,
+            "equal bytes behind another Arc are another layer"
+        );
+        let mut moved = frame(&c);
+        moved.fx_layers[0].offset.0 += 1;
+        assert!(a != moved);
+        let mut slot = frame(&c);
+        slot.fx_layers[0].slot = FxSlot::Glow;
+        assert!(a != slot);
+        let mut occ = frame(&c);
+        occ.fx_occluders[0] = PxRect::new(0, 11, 50, 20);
+        assert!(a != occ);
+    }
+
+    /// The damage cache keeps the layers' `Arc`s (so the identity it compares
+    /// against can never be reused) and the occluders, and drops the
+    /// prefetch; a full clone keeps all three; `clear_overlays` clears all
+    /// three.
+    #[test]
+    fn the_damage_cache_keeps_the_layer_arcs_and_drops_the_prefetch() {
+        let c = content();
+        let src = frame(&c);
+        let mut cache = RenderInput::default();
+        cache.clone_damage_cache_from(&src);
+        assert!(cache == src);
+        assert!(Arc::ptr_eq(&cache.fx_layers[1].content, &c));
+        assert_eq!(cache.fx_occluders, src.fx_occluders);
+        assert!(cache.fx_prefetch.is_empty(), "prefetch is not cached");
+        assert_eq!(
+            Arc::strong_count(&c),
+            7,
+            "frame (3 layers), cache (3) and the local hold it"
+        );
+        let full = src.clone();
+        assert!(Arc::ptr_eq(&full.fx_prefetch[0], &src.fx_prefetch[0]));
+        let mut plain = src.clone();
+        plain.clear_overlays();
+        assert!(plain.fx_layers.is_empty() && plain.fx_occluders.is_empty());
+        assert!(plain.fx_prefetch.is_empty());
+    }
+
+    /// A prepend moves a Window layer and the occluders by the window streams'
+    /// `pixel_dy` (zero under `Placed`) and a Grid layer by the grid streams'
+    /// `dy`, offset and clip together, each clip in its layer's own space; an
+    /// unbounded clip stays unbounded. Negative control: under `Placed` the
+    /// Window layers and the occluders stay.
+    #[test]
+    fn a_prepend_moves_each_layer_in_its_own_space() {
+        let (strip, ch, top) = (2, 10, 6);
+        let dy = i32::try_from(strip * ch).expect("small");
+        let rows = vec![vec![RenderCell::default(); 3]; strip];
+        let c = content();
+        let prepend = |pixels| {
+            let mut f = frame(&c);
+            f.prepend_host_rows(
+                strip,
+                rows.iter().map(Vec::as_slice),
+                ch,
+                top,
+                &mut Vec::new(),
+                pixels,
+            );
+            f
+        };
+        let before = frame(&c);
+        for (pixels, wdy) in [(HostRowPixels::Translate, dy), (HostRowPixels::Placed, 0)] {
+            let f = prepend(pixels);
+            assert_eq!(f.fx_layers[0].offset, (0, wdy), "{pixels:?}: Window offset");
+            assert_eq!(
+                f.fx_layers[0].clip,
+                PxRect::new(-3, 2 + wdy, 60, 25 + wdy),
+                "{pixels:?}: Window clip"
+            );
+            assert_eq!(f.fx_layers[2].offset, (0, wdy), "{pixels:?}: unclipped");
+            assert_eq!(f.fx_layers[2].clip, PxRect::EVERYWHERE, "{pixels:?}");
+            assert_eq!(
+                f.fx_layers[1].offset,
+                (5, 7 + dy),
+                "{pixels:?}: Grid offset"
+            );
+            assert_eq!(
+                f.fx_layers[1].clip,
+                before.fx_layers[1].clip.translate(0, dy),
+                "{pixels:?}: Grid clip"
+            );
+            assert_eq!(
+                f.fx_occluders,
+                vec![PxRect::new(0, 10 + wdy, 50, 20 + wdy)],
+                "{pixels:?}: occluders"
+            );
+            assert!(
+                Arc::ptr_eq(&f.fx_layers[0].content, &c),
+                "content untouched"
+            );
+        }
     }
 }

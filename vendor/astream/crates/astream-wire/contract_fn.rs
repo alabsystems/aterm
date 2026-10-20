@@ -20,6 +20,17 @@ macro_rules! contract_fn {
             $($clauses)+
         { $($body)* }
     };
+    (
+        $(#[$meta:meta])*
+        $vis:vis const fn $name:ident($($arg:ident : $arg_ty:ty),* $(,)?) -> $ret:ident
+        clauses [$($clauses:tt)+]
+        { $($body:tt)* }
+    ) => {
+        $(#[$meta])*
+        $vis const fn $name($($arg: $arg_ty),*) -> $ret
+            $($clauses)+
+        { $($body)* }
+    };
 }
 
 #[cfg(not(clean_islands))]
@@ -32,5 +43,14 @@ macro_rules! contract_fn {
     ) => {
         $(#[$meta])*
         $vis fn $name($($arg: $arg_ty),*) -> $ret { $($body)* }
+    };
+    (
+        $(#[$meta:meta])*
+        $vis:vis const fn $name:ident($($arg:ident : $arg_ty:ty),* $(,)?) -> $ret:ident
+        clauses [$($clauses:tt)+]
+        { $($body:tt)* }
+    ) => {
+        $(#[$meta])*
+        $vis const fn $name($($arg: $arg_ty),*) -> $ret { $($body)* }
     };
 }

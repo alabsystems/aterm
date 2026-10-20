@@ -35,7 +35,12 @@
 //! - **Silence never raises a need**: [`Hints::quiet_for_ms`] is a hint.
 //! - **The confidence law** (§3.7): for each (node, key) the value of the
 //!   highest confidence wins, ties to the later seq; a claim never overrides
-//!   an observation.
+//!   an observation. A closed node's OUTCOME is refined only by an exact
+//!   amend ([`amend_refines_out`], phase 3B ruling S9: an unmeasured build's
+//!   transcript adds facts and never overrules the screen), which moves a
+//!   held turn between the totals' buckets ([`turn_out_rebucket`]); an exact
+//!   `confirmed=1` raises its step's need to the amend's source and
+//!   confidence ([`need_takes_amend`]).
 //! - **Claims** (`verdict`, `label`) are kept as made, the newest of any
 //!   author; beside it the newest of a trusted author (the harness or the
 //!   owner class, [`Actor::is_trusted`]), which no other author displaces;
@@ -48,10 +53,16 @@
 use crate::field::{Key, Val};
 use crate::rec::Rec;
 
+#[path = "fold_mail.rs"]
+pub mod mail;
 #[path = "fold_snap.rs"]
 mod snap;
 use crate::vocab::{Actor, CLS_WORDS, Conf, Kind, Lvl, Node, Op, Src};
 use crate::words::{BoxWord, WallKind, need_rank};
+pub use mail::{
+    MAIL_LINK_WINDOW_MS, MAX_MAIL_WAITING, MailLink, MailLinkOf, MailWaiting, mail_in_window,
+    mail_link_of,
+};
 pub use snap::SnapError;
 
 /// The most needs the state holds; a less urgent one gives way.
@@ -106,6 +117,21 @@ impl NodeFields {
                 conf,
                 seq,
             });
+        }
+    }
+
+    /// Hold `val` for `key` at `conf` from record `seq` whatever is held:
+    /// in the held one's place, so the fields keep their order.
+    fn put(&mut self, key: Key, val: Val, conf: Conf, seq: u64) {
+        let held = Held {
+            key,
+            val,
+            conf,
+            seq,
+        };
+        match self.0.iter_mut().find(|h| h.key == key) {
+            Some(h) => *h = held,
+            None => self.0.push(held),
         }
     }
 
@@ -369,6 +395,9 @@ pub struct Totals {
     pub human: u32,
     /// Records reported lost by gaps.
     pub lost: u64,
+    /// Turns that found two or more mails waiting and linked none
+    /// ([`mail::MailLinkOf::Ambiguous`], phase 5 ruling T10c).
+    pub mail_amb: u32,
 }
 
 /// A session's current state (§7.1). About 1 KiB; kept outside the ring.
@@ -541,6 +570,24 @@ fn cut_subject(s: &str, room: usize) -> &str {
     &s[..end]
 }
 
+/// Which row of the clause policy (§7.3) a clause came from: what the
+/// tooltip attributes (a label is said to be one; an observation never is).
+/// Never serialised.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ClauseRow {
+    /// The most urgent need.
+    Need,
+    /// A live label of a trusted (or, for [`clause_of_proven`], a proven)
+    /// author.
+    Label,
+    /// The open tool or subagent step.
+    Step,
+    /// The open turn.
+    Turn,
+    /// The open command, or the agent at rest.
+    Run,
+}
+
 /// The tab's "what is it doing" clause (§7.3): drawn as is, never parsed
 /// back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -553,6 +600,13 @@ pub struct Clause {
     pub tone: Tone,
     /// Whose state it is (a label's author, a need's raiser).
     pub by: Actor,
+    /// The row it came from (phase 3B).
+    pub row: ClauseRow,
+    /// The words without the coarse age [`Clause::words`] ends with on a
+    /// label, step, turn or command row (the same words on a need's): what
+    /// a clock-free cache may key on, since they move only when the state
+    /// does (phase 3B).
+    pub head: Words,
 }
 
 /// What the fold can say without claiming a need.
@@ -628,6 +682,12 @@ pub struct Fold {
     tracked: Vec<OpenNode>,
     /// The shell phase, kept apart from the agent word.
     shell_phase: Option<Phase>,
+    /// The delivered `kind=task` mails no turn has taken, oldest first
+    /// (phase 5, [`mail`]): not carried.
+    mail: Vec<MailWaiting>,
+    /// The heuristic mail links of the open turns and the newest closed
+    /// one ([`Fold::mail_link`]).
+    links: Vec<(Node, MailLink)>,
 }
 
 impl Fold {
@@ -719,6 +779,50 @@ impl Fold {
             Op::Gap => self.on_gap(r, reset),
             Op::Snap => {}
         }
+    }
+
+    /// THE HEURISTIC MAIL LINK of turn `node` (phase 5, [`mail`]): the
+    /// delivered mail it most likely acted on, always
+    /// [`Conf::Heuristic`]; held for the open turns and the newest closed
+    /// one. No wire prints it (rulings T10b, T36).
+    #[must_use]
+    pub fn mail_link(&self, node: Node) -> Option<MailLink> {
+        self.links.iter().find(|(n, _)| *n == node).map(|(_, l)| *l)
+    }
+
+    /// The delivered `kind=task` mails no turn has taken, oldest first.
+    #[must_use]
+    pub fn mail_waiting(&self) -> &[MailWaiting] {
+        &self.mail
+    }
+
+    /// A turn opened: link it to the one mail waiting in its window, or
+    /// count it ambiguous, and take what it weighed off the waiting list
+    /// ([`mail::mail_link_of`], [`mail::after_turn`]).
+    fn link_turn(&mut self, r: &Rec) {
+        let decided = mail_link_of(&self.mail, r);
+        match decided {
+            MailLinkOf::Link(off) => self.links.push((
+                r.node,
+                MailLink {
+                    off,
+                    conf: Conf::Heuristic,
+                },
+            )),
+            MailLinkOf::Ambiguous => {
+                self.st.totals.mail_amb = self.st.totals.mail_amb.saturating_add(1);
+            }
+            MailLinkOf::None => {}
+        }
+        mail::after_turn(&mut self.mail, r, decided);
+    }
+
+    /// Keep the links of the open turns and the newest closed one.
+    fn prune_links(&mut self) {
+        let last = self.st.last[1].as_ref().map(|c| c.node);
+        let tracked = &self.tracked;
+        self.links
+            .retain(|(n, _)| Some(*n) == last || tracked.iter().any(|o| o.node == *n));
     }
 
     /// The tab clause at `now_wall` (§7.3): the first matching row wins.
@@ -943,7 +1047,10 @@ impl Fold {
             .then(|| r.f.get_str(Key::Cont).and_then(Node::parse))
             .flatten();
         match r.k {
-            Kind::Turn => self.st.totals.turns = self.st.totals.turns.saturating_add(1),
+            Kind::Turn => {
+                self.st.totals.turns = self.st.totals.turns.saturating_add(1);
+                self.link_turn(r);
+            }
             _ if continued.is_some() => {}
             Kind::Approval | Kind::Question | Kind::Wall | Kind::Stall | Kind::Tool => {
                 self.count_step(r);
@@ -976,6 +1083,8 @@ impl Fold {
             });
         }
         self.tracked.push(open);
+        // Bounded: a link outlives its turn only as the newest closed one.
+        self.prune_links();
         self.reproject();
     }
 
@@ -1022,9 +1131,25 @@ impl Fold {
             walk.extend(children);
         }
         let mut f = opened.as_ref().map(|o| o.f.clone()).unwrap_or_default();
+        let amended = f.held(Key::Out).cloned();
         for (k, v) in r.f.iter() {
             f.offer(*k, v.clone(), r.conf, r.seq);
         }
+        // THE OUTCOME (rulings S9, A5): the close's, unless an exact amend
+        // made while the node was open refines it ([`amend_refines_out`]:
+        // the transcript's word outranks a screen close that came after it).
+        // Either way the held `out=` field says the same as `out`.
+        let out = match amended.filter(|h| amend_refines_out(r.conf, r.seq, h.conf, h.seq)) {
+            Some(Held {
+                val: Val::Word(w), ..
+            }) => w,
+            _ => {
+                if f.word(Key::Out) != Some(out) {
+                    f.put(Key::Out, Val::Word(out), r.conf, r.seq);
+                }
+                out
+            }
+        };
         let closed = ClosedNode {
             node,
             kind: r.k,
@@ -1063,15 +1188,8 @@ impl Fold {
                 self.st.last[0] = Some(closed);
             }
             Lvl::Turn => {
-                let t = &mut self.st.totals;
-                match out {
-                    "done" => t.done = t.done.saturating_add(1),
-                    "asked" => t.asked = t.asked.saturating_add(1),
-                    "interrupted" => t.interrupted = t.interrupted.saturating_add(1),
-                    "error" => t.errors = t.errors.saturating_add(1),
-                    w if w.starts_with("wall:") => t.walled = t.walled.saturating_add(1),
-                    _ => t.other = t.other.saturating_add(1),
-                }
+                let b = turn_bucket(&mut self.st.totals, out);
+                *b = b.saturating_add(1);
                 self.st.last[1] = Some(closed);
             }
             Lvl::Step => {
@@ -1107,6 +1225,7 @@ impl Fold {
             }
             Lvl::Instance => {}
         }
+        self.prune_links();
         self.reproject();
     }
 
@@ -1174,6 +1293,15 @@ impl Fold {
                 Some("in") => {
                     self.st.totals.mail_in = self.st.totals.mail_in.saturating_add(1);
                     self.st.mail_open = self.st.mail_open.saturating_add(1);
+                    // A task waits for the turn it may have started (phase 5).
+                    if let (Some("task"), Some(off)) =
+                        (r.f.get_word(Key::MailKind), r.f.get_u(Key::Off))
+                    {
+                        if self.mail.len() >= MAX_MAIL_WAITING {
+                            self.mail.remove(0);
+                        }
+                        self.mail.push(MailWaiting { off, t: r.t });
+                    }
                 }
                 Some("out") => {
                     self.st.totals.mail_out = self.st.totals.mail_out.saturating_add(1);
@@ -1193,7 +1321,15 @@ impl Fold {
                     self.st.ep = u32::try_from(e).unwrap_or(u32::MAX);
                 }
             }
-            Kind::Human => self.st.totals.human = self.st.totals.human.saturating_add(1),
+            Kind::Human => {
+                self.st.totals.human = self.st.totals.human.saturating_add(1);
+                // A person acted on the program: no waiting mail is a later
+                // turn's (T39). A gesture that reached none (`reached=0`: a
+                // view scroll, a selection) answered nothing.
+                if r.f.get_u(Key::Reached) != Some(0) {
+                    self.mail.clear();
+                }
+            }
             Kind::Agent => {
                 if let Some(w) = word {
                     self.st.phase = Phase {
@@ -1224,22 +1360,33 @@ impl Fold {
 
     fn on_amend(&mut self, r: &Rec) {
         let node = r.node;
-        let target = self
-            .tracked
-            .iter_mut()
-            .find(|o| o.node == node)
-            .map(|o| &mut o.f)
-            .or_else(|| {
-                self.st
-                    .last
-                    .iter_mut()
-                    .flatten()
-                    .find(|c| c.node == node)
-                    .map(|c| &mut c.f)
-            });
-        if let Some(f) = target {
+        if let Some(o) = self.tracked.iter_mut().find(|o| o.node == node) {
             for (k, v) in r.f.iter() {
-                f.offer(*k, v.clone(), r.conf, r.seq);
+                o.f.offer(*k, v.clone(), r.conf, r.seq);
+            }
+        } else if let Some(c) = self.st.last.iter_mut().flatten().find(|c| c.node == node) {
+            // A held closed node: every field under the confidence law, but
+            // its outcome only by an exact amend ([`amend_refines_out`]), so
+            // `out` and its held field never disagree.
+            for (k, v) in r.f.iter().filter(|(k, _)| *k != Key::Out) {
+                c.f.offer(*k, v.clone(), r.conf, r.seq);
+            }
+            if let Some(new) = r.out() {
+                let (held_conf, held_seq) =
+                    c.f.held(Key::Out).map_or((c.conf, 0), |h| (h.conf, h.seq));
+                if amend_refines_out(held_conf, held_seq, r.conf, r.seq) {
+                    c.f.offer(Key::Out, Val::Word(new), r.conf, r.seq);
+                    let old = std::mem::replace(&mut c.out, new);
+                    if node.lvl == Lvl::Turn && old != new {
+                        turn_out_rebucket(&mut self.st.totals, old, new);
+                    }
+                }
+            }
+        }
+        for n in self.st.needs.iter_mut().flatten() {
+            if need_takes_amend(n, r) {
+                n.src = r.src;
+                n.conf = r.conf;
             }
         }
         self.reproject();
@@ -1259,6 +1406,8 @@ impl Fold {
             // is unknown now, and a step's need cannot be closed any more.
             self.tracked.clear();
             self.drop_needs(|n| n.node.lvl == Lvl::Step);
+            self.mail.clear();
+            self.prune_links();
             self.reproject();
         }
     }
@@ -1308,6 +1457,55 @@ pub fn lifts_failure(kind: Kind, out: &str, closed: Node, need: &Need) -> bool {
         && need.node.lvl == Lvl::Run
         && need.kind == kind
         && need.node != closed
+}
+
+/// THE OUTCOME REFINEMENT (§2.3, §3.7; phase 3B rulings S9 and A5):
+/// whether an amend's `out=` at (`conf`, `seq`) replaces the outcome a
+/// closed node holds at (`held_conf`, `held_seq`). Only an EXACT amend
+/// refines an outcome (a transcript read on a measured build), and then
+/// under the confidence law: a strong amend, an unmeasured build's
+/// transcript among them, adds facts and never overrules the screen's close.
+#[must_use]
+pub const fn amend_refines_out(held_conf: Conf, held_seq: u64, conf: Conf, seq: u64) -> bool {
+    matches!(conf, Conf::Exact) && confidence_law(held_conf, held_seq, conf, seq)
+}
+
+/// The totals' bucket a turn closed `out` is counted in.
+fn turn_bucket<'a>(t: &'a mut Totals, out: &str) -> &'a mut u32 {
+    match out {
+        "done" => &mut t.done,
+        "asked" => &mut t.asked,
+        "interrupted" => &mut t.interrupted,
+        "error" => &mut t.errors,
+        w if w.starts_with("wall:") => &mut t.walled,
+        _ => &mut t.other,
+    }
+}
+
+/// A held turn's outcome refined from `old` to `new`
+/// ([`amend_refines_out`]): it leaves its old bucket and joins the new one,
+/// so the totals still count each closed turn once. A turn no longer held
+/// (a newer one closed since) keeps its totals: the stated approximation
+/// (plan §11 Q9, accepted).
+pub fn turn_out_rebucket(t: &mut Totals, old: &str, new: &str) {
+    let from = turn_bucket(t, old);
+    *from = from.saturating_sub(1);
+    let to = turn_bucket(t, new);
+    *to = to.saturating_add(1);
+}
+
+/// Whether amend `r` raises `need` to its own source and confidence (phase
+/// 3B, A5): an exact `confirmed=1` of the step that raised it — the
+/// transcript confirmed the wall the screen saw — and never anything below
+/// exact (ruling S9).
+#[must_use]
+pub fn need_takes_amend(need: &Need, r: &Rec) -> bool {
+    r.op == Op::Amend
+        && need.node == r.node
+        && need.node.lvl == Lvl::Step
+        && r.conf == Conf::Exact
+        && r.f.get_u(Key::Confirmed) == Some(1)
+        && r.conf.rank() > need.conf.rank()
 }
 
 /// Whether `r` starts an epoch newer than `ep`: a `gap why=handoff` (or
@@ -1465,15 +1663,55 @@ pub fn shown_verdicts(st: &SessionState) -> Vec<&Claim> {
     out
 }
 
+/// The label a PROVEN author's slot shows at `now_wall` (the harness's or the
+/// person's), never a `ctl` client's or another author's: what a person's
+/// tooltip may show (phase 3B ruling S11).
+#[must_use]
+pub fn shown_proven_label(st: &SessionState, now_wall: u64) -> Option<&Claim> {
+    st.label_proven
+        .as_ref()
+        .filter(|c| c.by.is_proven())
+        .filter(|c| c.text.is_some() && c.until.is_some_and(|u| u > now_wall))
+}
+
 /// THE clause policy (§7.3), a pure function of the state and `now_wall`.
 #[must_use]
 pub fn clause_of(st: &SessionState, now_wall: u64) -> Option<Clause> {
+    clause_with(st, now_wall, shown_label)
+}
+
+/// [`clause_of`] with only a PROVEN author's label admitted
+/// ([`shown_proven_label`]; phase 3B rulings S11 and A5): a `ctl` label
+/// neither shows nor hides the step or turn row beneath it. The tooltip's
+/// clause; `brief` and [`Fold::clause`] keep [`clause_of`].
+#[must_use]
+pub fn clause_of_proven(st: &SessionState, now_wall: u64) -> Option<Clause> {
+    clause_with(st, now_wall, shown_proven_label)
+}
+
+/// The clause policy over the label rule `label`.
+fn clause_with(
+    st: &SessionState,
+    now_wall: u64,
+    label: fn(&SessionState, u64) -> Option<&Claim>,
+) -> Option<Clause> {
     let age = |t: u64| now_wall.saturating_sub(t);
     let mk = |words: Words, age_ms: u64, tone: Tone, by: Actor| Clause {
         words,
         age_ms,
         tone,
         by,
+        row: ClauseRow::Need,
+        head: words,
+    };
+    // A row whose words end with a coarse age keeps its head apart.
+    let aged = |subject: &str, a: u64, tone: Tone, by: Actor, row: ClauseRow| Clause {
+        words: Words::fit(subject, &age_short(a)),
+        age_ms: a,
+        tone,
+        by,
+        row,
+        head: Words::fit(subject, ""),
     };
     if let Some(n) = st.top_need() {
         let found = match n.word {
@@ -1511,57 +1749,65 @@ pub fn clause_of(st: &SessionState, now_wall: u64) -> Option<Clause> {
             return Some(mk(words, age(n.t), tone, n.by));
         }
     }
-    if let Some(label) = shown_label(st, now_wall)
-        && let Some(text) = &label.text
+    if let Some(l) = label(st, now_wall)
+        && let Some(text) = &l.text
     {
         let tone = if st.turn().is_some() {
             Tone::Working
         } else {
             Tone::Idle
         };
-        let a = age(label.t);
-        return Some(mk(Words::fit(text, &age_short(a)), a, tone, label.by));
+        return Some(aged(text, age(l.t), tone, l.by, ClauseRow::Label));
     }
     if let Some(step) = st.step() {
         match step.kind {
             Kind::Tool => {
-                let a = age(step.t);
-                let words = Words::fit(tool_words(step.f.word(Key::Cls)), &age_short(a));
-                return Some(mk(words, a, Tone::Working, step.by));
+                let words = tool_words(step.f.word(Key::Cls));
+                return Some(aged(
+                    words,
+                    age(step.t),
+                    Tone::Working,
+                    step.by,
+                    ClauseRow::Step,
+                ));
             }
             Kind::Subagent => {
-                return Some(mk(
+                let c = mk(
                     Words::fit("subagent", ""),
                     age(step.t),
                     Tone::Working,
                     step.by,
-                ));
+                );
+                return Some(Clause {
+                    row: ClauseRow::Step,
+                    ..c
+                });
             }
             _ => {}
         }
     }
     if let Some(turn) = st.turn() {
-        let a = age(turn.t);
-        return Some(mk(
-            Words::fit("working", &age_short(a)),
-            a,
+        return Some(aged(
+            "working",
+            age(turn.t),
             Tone::Working,
             turn.by,
+            ClauseRow::Turn,
         ));
     }
     if let Some(run) = st.run() {
         if run.kind == Kind::Cmd {
-            let a = age(run.t);
             let detail = run
                 .f
                 .str(Key::Detail)
                 .or(run.f.str(Key::Prog))
                 .unwrap_or("running");
-            return Some(mk(
-                Words::fit(detail, &age_short(a)),
-                a,
+            return Some(aged(
+                detail,
+                age(run.t),
                 Tone::Working,
                 run.by,
+                ClauseRow::Run,
             ));
         }
         if run.kind == Kind::Agent {
@@ -1570,7 +1816,11 @@ pub fn clause_of(st: &SessionState, now_wall: u64) -> Option<Clause> {
                 Some(t) => (if interrupted { "interrupted" } else { "idle" }, t.t),
                 None => ("idle", run.t),
             };
-            return Some(mk(Words::fit(word, ""), age(since), Tone::Idle, run.by));
+            let c = mk(Words::fit(word, ""), age(since), Tone::Idle, run.by);
+            return Some(Clause {
+                row: ClauseRow::Run,
+                ..c
+            });
         }
     }
     None

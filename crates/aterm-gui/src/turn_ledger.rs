@@ -2,13 +2,17 @@
 // Copyright 2026 Andrew Yates
 
 //! The per-session TURN LEDGER: a bounded, drop-oldest ring of one record per
-//! completed [`crate::control_session::cmd_turn`] exchange. It is the durable
-//! memory behind two capabilities:
+//! completed [`crate::control_session::cmd_turn`] exchange (a `turn
+//! settle=submitted`, answered at its verified submit, is `status=pressed`),
+//! and per text the window harness typed with `send` and submitted with `key
+//! enter` ([`crate::control_session::ledger_typed_input`], `status=pressed`). It is
+//! the durable memory behind two capabilities:
 //!
-//! * the `turns` control verb — an orchestrator reads back WHAT it drove into a
-//!   session (submitted text, whether the submit landed, whether the reply
-//!   settled or timed out, how long it took, and a stable hash of the settled
-//!   screen), keyed by the same monotonic turn id the `turn` reply prints; and
+//! * the `history` control verb — an orchestrator reads back WHAT was driven
+//!   into a session and BY WHOM (submitted text, who typed it, whether the
+//!   submit landed, whether the reply settled or timed out, how long it took,
+//!   and a stable hash of the settled screen), keyed by the same monotonic
+//!   turn id the `turn` reply prints; and
 //! * the `subscribe … events` digest — the push loop scans this ledger by id
 //!   watermark and emits one `EVENT <sid> turn <id> …` line per new record, so a
 //!   fleet controller watches N sessions on one fd and pulls a full `image`/
@@ -16,7 +20,10 @@
 //!
 //! Shaped like the other bounded recorders on [`crate::SessionCtx`] (drop-oldest,
 //! `Mutex`-wrapped, cheap when unused): a session that is never driven by `turn`
-//! holds an empty ring.
+//! holds an empty ring. One refinement: past [`HARNESS_SHARE`] the window
+//! harness's own records make room among themselves ([`TurnLedger::push`]),
+//! so a long autonomous run of continuations never evicts the manager's
+//! turn the readers anchor on.
 
 use std::collections::VecDeque;
 
@@ -24,6 +31,19 @@ use std::collections::VecDeque;
 /// stays fully readable while the ring never grows unbounded; the screen-hash +
 /// bounded text keep each record small (~a few hundred bytes).
 pub(crate) const LEDGER_CAP: usize = 512;
+
+/// While more than this many of a full ledger's records are the window
+/// harness's own ([`TurnBy::Harness`]), an eviction takes the OLDEST OF
+/// THOSE instead of the oldest record. The harness's continuations, done
+/// checks and `/usage` probes come one per act, with no cap by default, so a
+/// long autonomous run would otherwise push the manager's turns out of the
+/// ring: the report reader would find no turn of the manager's and open at the
+/// harness's own `❯ keep going`, and `drive ledger` and the companion would
+/// lose them. The harness keeps its newest texts (all a reader of them
+/// needs: the survey matches their words in a transcript). At or below it
+/// the ring is plain drop-oldest, so a manager's long run sheds the
+/// harness's records like any other.
+pub(crate) const HARNESS_SHARE: usize = LEDGER_CAP / 2;
 
 /// The submitted-text is bounded in the record so a pathological multi-megabyte
 /// `turn` payload cannot bloat the ring; the full text still reached the PTY.
@@ -42,10 +62,16 @@ pub(crate) struct TurnRecord {
     /// How long the whole type→submit→settle exchange took, in milliseconds.
     pub dur_ms: u64,
     /// Whether a submit keypress VERIFIABLY landed (content advanced). `false`
-    /// for `submit=none` and for a swallowed submit that never took.
+    /// for `submit=none` and for a swallowed submit that never took. A
+    /// [`STATUS_PRESSED`] record's Enter was written behind the text and
+    /// nothing after it was awaited: the harness's, fenced on a read that
+    /// showed the text in the composer; a `turn settle=submitted`'s, verified
+    /// as any turn's submit is.
     pub submitted: bool,
     /// The settle verdict: `settled` (went quiet), `timeout` (deadline hit) or
-    /// `hangup` (the caller hung up during the settle, so it was not awaited).
+    /// `hangup` (the caller hung up during the settle, so it was not awaited);
+    /// [`STATUS_PRESSED`] for the harness's `send` and `key enter`, and for a
+    /// `turn settle=submitted`, which await no settle.
     pub status: &'static str,
     /// The submitted message, truncated to [`MAX_TEXT`] bytes on a char boundary.
     pub text: String,
@@ -59,11 +85,90 @@ pub(crate) struct TurnRecord {
     /// rows a fullscreen app scrolled off the top during and after this turn.
     /// `history` prints it as `arch=<origin>:<last>`.
     pub arch: ArchMark,
+    /// Who typed the turn ([`TurnBy`]): `history` prints it as `by=<word>`.
+    pub by: TurnBy,
     /// The record came from an EARLIER aterm process, carried to this one by
     /// a self-update handoff: `history` prints `carried=1`, and its
     /// `started_ms` and `seq` are that process's clock and content counter
     /// (neither is comparable with this process's).
     pub carried: bool,
+}
+
+/// WHO TYPED A TURN, as `history` prints it (`by=<word>`): the connection's
+/// own identity, the one the exits ledger's `by=` names
+/// ([`crate::control_session::caller_actor`]), with one refinement only the
+/// turn can make — an owner-token turn typed under this process's window
+/// harness's hand is the harness's
+/// ([`crate::control_session::typed_by`]). So a reader of the ledger (the
+/// survey's newest prompt, a manager's report) tells the harness's own turns
+/// — the live upgrade's notice and release, a relaunched agent's
+/// continuation — from a manager's or another session's, without a list of
+/// the harness's words. (A person at the keyboard types no `turn`, so has no
+/// record here.) `fleet` is reserved for a turn a fleet peer types; no path
+/// types one yet.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TurnBy {
+    /// This process's window harness (`by=harness`): an owner-token turn
+    /// typed under the drive lease its supervisor loops take a tab by
+    /// ([`crate::harness_host::holder`]), held over the turn's own
+    /// connection — the hand the presence band reads as aterm's own (ruling
+    /// 313), and the one every line the upgrade and relaunch lanes type goes
+    /// under. The turn-end loop types its texts (the continuation, the done
+    /// check, an answer, the worker's own suggestion, the accounts probe's
+    /// `/usage`) under the same hand: as a fenced `send` and `key enter`
+    /// where the host fences them (`aterm-agent`'s `Session::type_fenced`,
+    /// recorded `status=pressed` by
+    /// [`crate::control_session::ledger_typed_input`]), else as a `turn`.
+    /// A text of its own that it left standing (its Enter refused or
+    /// skipped) and sends later with Enter alone is NOT recorded: by then
+    /// the hand was given back, and nothing here can tell that the composer
+    /// still holds the text as it was typed. Another instance's harness, or
+    /// a CLI supervisor, holds a hand under its own pid and stays `ctl`. A
+    /// carried record's `harness` is the previous instance's.
+    Harness,
+    /// An owner-token client (`by=ctl`): `aterm ctl … turn`, an in-session
+    /// agent's `@<sid>` connection. The per-instance token names the
+    /// instance's owner, not a session, so this is the most the socket knows.
+    Ctl,
+    /// The fabric bridge (`by=bridge`): a connection the server
+    /// pre-resolves, with no sid to write.
+    Bridge,
+    /// An edge-scoped connection (`by=<sid>`): the session its token was
+    /// granted to, read from the target's edge table.
+    Sid(String),
+    /// Not attributable (`by=-`): no caller can be named — a record carried
+    /// from a build before the field, an edge whose grant is gone.
+    #[default]
+    Unknown,
+}
+
+impl TurnBy {
+    /// The stable wire word (`harness|ctl|bridge|<sid>|-`).
+    #[must_use]
+    pub(crate) fn as_wire(&self) -> &str {
+        match self {
+            TurnBy::Harness => "harness",
+            TurnBy::Ctl => "ctl",
+            TurnBy::Bridge => "bridge",
+            TurnBy::Sid(sid) => sid.as_str(),
+            TurnBy::Unknown => "-",
+        }
+    }
+
+    /// A carried record's word as this build names it: one of its own words,
+    /// a sid of the shape this build mints, else [`TurnBy::Unknown`] — an
+    /// older sender's missing field, a later build's word (`fleet`), or
+    /// anything a sidecar should not have held.
+    #[must_use]
+    pub(crate) fn from_wire(word: &str) -> Self {
+        match word {
+            "harness" => TurnBy::Harness,
+            "ctl" => TurnBy::Ctl,
+            "bridge" => TurnBy::Bridge,
+            sid if crate::keeper_link::valid_sid(sid) => TurnBy::Sid(sid.to_string()),
+            _ => TurnBy::Unknown,
+        }
+    }
 }
 
 /// A position in a session's alt-screen archive (`aterm_core`'s `AltArchive`):
@@ -99,10 +204,40 @@ impl std::fmt::Display for ArchMark {
     }
 }
 
-/// A session's bounded turn history, newest-last, drop-oldest at [`LEDGER_CAP`].
+/// The [`TurnRecord::status`] of a text the window harness typed with `send`
+/// and submitted with `key enter` ([`TurnLedger::typed`]), and of a `turn
+/// settle=submitted` whose submit was verified: the Enter was written, and no
+/// settle was awaited after it.
+pub(crate) const STATUS_PRESSED: &str = "pressed";
+
+/// A TEXT THE WINDOW HARNESS TYPED AND HAS NOT SUBMITTED: its `send` under
+/// its hand, kept for the Enter its connection presses next
+/// ([`crate::control_session::ledger_typed_input`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Typed {
+    /// The control connection that typed it: only its Enter submits it.
+    pub conn: u64,
+    /// The text, clamped like a record's ([`clamp_text`]).
+    pub text: String,
+    /// When it was written ([`now_ms`]).
+    pub started_ms: u64,
+    /// The archive's mark as the text was written.
+    pub arch: ArchMark,
+}
+
+/// A session's bounded turn history, newest-last, drop-oldest at [`LEDGER_CAP`]
+/// (the harness's records past [`HARNESS_SHARE`] going first).
 #[derive(Default)]
 pub(crate) struct TurnLedger {
     records: VecDeque<TurnRecord>,
+    /// How many of `records` are the window harness's ([`TurnBy::Harness`]).
+    harness: usize,
+    /// Turn ids below this may have named a harness record evicted from
+    /// INSIDE the ring ([`HARNESS_SHARE`]): every record from here on is
+    /// held, so [`TurnLedger::low_id`] reports it and a resumed
+    /// `since-turn=` below it is told, as for a record evicted from the
+    /// front. A handoff carries it (`handoff_carry`'s sidecar). 0: none.
+    shed_below: u64,
     /// Turn ids below this may have named records of this session that the
     /// ledger never got: a self-update handoff could not carry the ledger
     /// whole (no sidecar, a bad one, a lock another thread kept, records shed
@@ -120,14 +255,39 @@ pub(crate) struct TurnLedger {
     /// so this holds one id, or a few when `lease release force` preempted a
     /// wedged turn.
     open: Vec<u64>,
+    /// The text the window harness typed and has not submitted yet
+    /// ([`Typed`]): this process's alone, never carried.
+    typed: Option<Typed>,
 }
 
 impl TurnLedger {
-    /// Append one record, evicting the oldest past the cap. The caller keeps
-    /// the ids rising ([`TurnLedger::record`] does, for a live turn).
+    /// Append one record, evicting one past the cap: the oldest, or — while
+    /// the window harness's records are more than [`HARNESS_SHARE`] of them
+    /// — the oldest of those, wherever it is. One taken from inside the ring
+    /// raises [`Self::low_id`] past its id (`shed_below`). The caller keeps
+    /// the ids rising ([`TurnLedger::record`] does, for a live turn), and
+    /// the ring stays in id order.
     pub(crate) fn push(&mut self, rec: TurnRecord) {
-        if self.records.len() == LEDGER_CAP {
-            self.records.pop_front();
+        if self.records.len() >= LEDGER_CAP {
+            let at = if self.harness > HARNESS_SHARE {
+                self.records
+                    .iter()
+                    .position(|r| r.by == TurnBy::Harness)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            if let Some(gone) = self.records.remove(at) {
+                if gone.by == TurnBy::Harness {
+                    self.harness -= 1;
+                }
+                if at > 0 {
+                    self.shed_below = self.shed_below.max(gone.id.saturating_add(1));
+                }
+            }
+        }
+        if rec.by == TurnBy::Harness {
+            self.harness += 1;
         }
         self.records.push_back(rec);
     }
@@ -164,6 +324,20 @@ impl TurnLedger {
         id
     }
 
+    /// The window harness typed `typed` and has not submitted it: kept, in
+    /// place of any text before it, for its connection's Enter
+    /// ([`Self::take_typed`]).
+    pub(crate) fn typed(&mut self, typed: Typed) {
+        self.typed = Some(typed);
+    }
+
+    /// The text the window harness typed and has not submitted, taken: by
+    /// the next write that reaches the session, which submits it or leaves
+    /// it to no record, and by the end of the hand it was typed under.
+    pub(crate) fn take_typed(&mut self) -> Option<Typed> {
+        self.typed.take()
+    }
+
     /// How many turns this session has retained (for the `who` verb's `turns=`).
     pub(crate) fn len(&self) -> usize {
         self.records.len()
@@ -171,19 +345,22 @@ impl TurnLedger {
 
     /// The ledger a self-update handoff carried from the previous process:
     /// its records, each marked [`TurnRecord::carried`], in id order (as
-    /// [`TurnLedger::since`] seeks), and only the newest [`LEDGER_CAP`] of
-    /// them. A sender whose ledger was out of order (an older build recorded a
-    /// preempted turn after the one that replaced it) is put back in order
-    /// rather than losing the record; of two records under one id, the first
-    /// is kept. `unheld_below`: turn ids below it may have named records the
-    /// carry could not bring (0: none).
+    /// [`TurnLedger::since`] seeks), and no more than [`LEDGER_CAP`] of
+    /// them, evicted as [`Self::push`] evicts. A sender whose ledger was out
+    /// of order (an older build recorded a preempted turn after the one that
+    /// replaced it) is put back in order rather than losing the record; of
+    /// two records under one id, the first is kept. `unheld_below`: turn ids
+    /// below it may have named records the carry could not bring (0: none).
     pub(crate) fn carried(mut records: Vec<TurnRecord>, unheld_below: u64) -> Self {
         records.sort_by_key(|rec| rec.id);
         records.dedup_by_key(|rec| rec.id);
         let mut ledger = Self {
             records: VecDeque::new(),
+            harness: 0,
+            shed_below: 0,
             unheld_below,
             open: Vec::new(),
+            typed: None,
         };
         for mut rec in records {
             rec.carried = true;
@@ -192,15 +369,31 @@ impl TurnLedger {
         ledger
     }
 
+    /// [`Self::carried`] with the sender's `shed_below` (0: none): the ids
+    /// below it may have named a harness record its ring evicted from
+    /// inside, and still may here.
+    pub(crate) fn with_shed_below(mut self, below: u64) -> Self {
+        self.shed_below = self.shed_below.max(below);
+        self
+    }
+
     /// Every retained record, oldest first (the handoff's export).
     #[cfg(any(unix, test))]
     pub(crate) fn records(&self) -> impl Iterator<Item = &TurnRecord> {
         self.records.iter()
     }
 
+    /// Turn ids below this may have named a harness record evicted from
+    /// inside the ring (see the field); 0: none. The handoff's export
+    /// carries it.
+    #[cfg(any(unix, test))]
+    pub(crate) const fn shed_below(&self) -> u64 {
+        self.shed_below
+    }
+
     /// Turn ids below this may have named records the ledger never got (see
     /// the field); 0: none. Replies read [`TurnLedger::live_floor`].
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) const fn unheld_below(&self) -> u64 {
         self.unheld_below
     }
@@ -261,6 +454,14 @@ impl TurnLedger {
         self.records.back().map(|r| r.id)
     }
 
+    /// The newest record the window harness did not type ([`TurnBy::Harness`]
+    /// aside, carried or not): the turn the window's companion reacts to.
+    /// aterm's own turns — a `keep going`, a done check — are no news in the
+    /// room, as presence reads them (`TurnFact::aterm`).
+    pub(crate) fn newest_not_harness(&self) -> Option<&TurnRecord> {
+        self.records.iter().rev().find(|r| r.by != TurnBy::Harness)
+    }
+
     /// The LOWEST retained turn id (the drop-oldest low-water), or `None` when empty.
     /// A `since-turn=<n>` resume with `n < low_id - 1` means records were EVICTED
     /// between the anchor and the retained window — the events stream emits a
@@ -272,9 +473,12 @@ impl TurnLedger {
     /// are just as gone — and so does one whose floor sits ABOVE a held record
     /// (a turn still open when the handoff exported it: the records past the
     /// floor are whole, the ones below it are not), so the low-water is the
-    /// higher of the two.
+    /// higher of the two. A harness record evicted from inside the ring
+    /// (`shed_below`, [`HARNESS_SHARE`]) raises it the same way: the
+    /// records past it are whole.
     pub(crate) fn low_id(&self) -> Option<u64> {
-        let floor = (self.unheld_below > 0).then_some(self.unheld_below);
+        let floor = self.unheld_below.max(self.shed_below);
+        let floor = (floor > 0).then_some(floor);
         match (self.records.front().map(|r| r.id), floor) {
             (Some(front), Some(floor)) => Some(front.max(floor)),
             (front, floor) => front.or(floor),
@@ -313,12 +517,15 @@ impl TurnLedger {
 }
 
 /// A carried record's `status` word as the one this build prints: `settled`,
-/// `timeout` or `hangup` (what `cmd_turn` records); `None` for any other word.
+/// `timeout` or `hangup` (what `cmd_turn` records) or [`STATUS_PRESSED`] (the
+/// harness's `send` and `key enter`, and a `turn settle=submitted`); `None` for
+/// any other word.
 pub(crate) fn status_word(word: &str) -> Option<&'static str> {
     match word {
         "settled" => Some("settled"),
         "timeout" => Some("timeout"),
         "hangup" => Some("hangup"),
+        STATUS_PRESSED => Some(STATUS_PRESSED),
         _ => None,
     }
 }
@@ -358,7 +565,113 @@ mod tests {
             screen_hash: id,
             seq: id,
             arch: ArchMark::default(),
+            by: TurnBy::Ctl,
             carried: false,
+        }
+    }
+
+    /// Every word `by=` prints reads back as the same caller, the shape a
+    /// carried record is held to: the reserved `fleet`, an older sender's
+    /// missing field and anything not a word or a sid this build mints read
+    /// as `-`, never as a sid.
+    #[test]
+    fn by_words_round_trip_and_anything_else_is_unknown() {
+        let sid = aterm_session::SessionId::generate();
+        for by in [
+            TurnBy::Harness,
+            TurnBy::Ctl,
+            TurnBy::Bridge,
+            TurnBy::Sid(sid.as_str().to_string()),
+            TurnBy::Unknown,
+        ] {
+            assert_eq!(TurnBy::from_wire(by.as_wire()), by, "{by:?}");
+        }
+        for word in ["", "fleet", "human", "Harness", "s-", "s-xyz", "s-1 text=x"] {
+            assert_eq!(TurnBy::from_wire(word), TurnBy::Unknown, "{word:?}");
+        }
+        assert_eq!(TurnBy::default(), TurnBy::Unknown);
+    }
+
+    /// The window's companion reacts to the newest turn the window harness
+    /// did not type ([`TurnLedger::newest_not_harness`]): a `keep going`
+    /// (`status=pressed`, carried or not) after a manager's turn leaves the
+    /// manager's as the room's. Negative control: a manager's turn after the
+    /// harness's is the newest again.
+    #[test]
+    fn the_room_turn_is_the_newest_the_harness_did_not_type() {
+        let harness = |id: u64, carried: bool| TurnRecord {
+            status: STATUS_PRESSED,
+            by: TurnBy::Harness,
+            carried,
+            ..rec(id)
+        };
+        let mut l = TurnLedger::default();
+        assert!(l.newest_not_harness().is_none());
+        l.push(harness(1, true));
+        assert!(l.newest_not_harness().is_none(), "the harness's alone");
+        l.push(rec(2));
+        l.push(harness(3, false));
+        l.push(harness(4, true));
+        assert_eq!(l.high_id(), Some(4));
+        assert_eq!(l.newest_not_harness().map(|r| r.id), Some(2));
+        l.push(rec(5));
+        assert_eq!(l.newest_not_harness().map(|r| r.id), Some(5));
+    }
+
+    /// A LONG RUN OF THE HARNESS'S OWN TURNS NEVER EVICTS THE MANAGER'S:
+    /// past [`HARNESS_SHARE`] the harness's records make room among
+    /// themselves, so a manager's turn followed by twice [`LEDGER_CAP`]
+    /// continuations is still held, beside the harness's newest. The ring
+    /// stays in id order, and [`TurnLedger::low_id`] rises past the records
+    /// shed from inside it, so a resume anchored at the manager's turn is
+    /// told it missed some. Once the manager's turns come again, they push
+    /// the harness's out down to the share, and then the ring is plain
+    /// drop-oldest. NEGATIVE CONTROLS: a run of everyone else's turns, or of
+    /// the harness's alone, sheds nothing from inside (`low_id` is the
+    /// front).
+    #[test]
+    fn the_harness_makes_room_among_its_own_and_the_managers_turn_stays() {
+        let harness = |id: u64| TurnRecord {
+            status: STATUS_PRESSED,
+            by: TurnBy::Harness,
+            ..rec(id)
+        };
+        let cap = LEDGER_CAP as u64;
+        let ids = |l: &TurnLedger| l.since(None).map(|r| r.id).collect::<Vec<u64>>();
+        let mut l = TurnLedger::default();
+        l.push(rec(1));
+        let last = 1 + 2 * cap;
+        for id in 2..=last {
+            l.push(harness(id));
+        }
+        let held = ids(&l);
+        assert_eq!(held.len(), LEDGER_CAP);
+        assert_eq!(l.newest_not_harness().map(|r| r.id), Some(1), "kept");
+        assert_eq!(held[1..], (last - cap + 2..=last).collect::<Vec<u64>>()[..]);
+        assert_eq!(l.low_id(), Some(held[1]), "a resume from 1 is told");
+        assert_eq!(l.shed_below(), held[1]);
+        // The manager's turns come again: the harness's give way to the share,
+        // then the manager's oldest goes like any record.
+        let resumed = last + 1;
+        for id in resumed..resumed + cap - 1 - HARNESS_SHARE as u64 {
+            l.push(rec(id));
+        }
+        assert_eq!(l.since(None).next().map(|r| r.id), Some(1), "still held");
+        l.push(rec(resumed + cap));
+        assert_ne!(l.since(None).next().map(|r| r.id), Some(1), "drop-oldest");
+        let held = ids(&l);
+        assert!(held.windows(2).all(|w| w[0] < w[1]), "in id order");
+        // NEGATIVE CONTROLS: plain drop-oldest, nothing shed from inside.
+        for run in [rec as fn(u64) -> TurnRecord, |id| TurnRecord {
+            by: TurnBy::Harness,
+            ..rec(id)
+        }] {
+            let mut l = TurnLedger::default();
+            for id in 1..=cap + 5 {
+                l.push(run(id));
+            }
+            assert_eq!(ids(&l), (6..=cap + 5).collect::<Vec<u64>>());
+            assert_eq!((l.shed_below(), l.low_id()), (0, Some(6)));
         }
     }
 
@@ -541,8 +854,13 @@ mod tests {
 
     #[test]
     fn text_clamps_on_boundary() {
-        let long = "é".repeat(400); // 800 bytes, 2 per char
-        let c = clamp_text(&long);
-        assert!(c.len() <= MAX_TEXT && c.chars().all(|ch| ch == 'é'));
+        // 801 bytes whose MAX_TEXT-th byte is inside an 'é': the clamp backs
+        // off to the boundary before it, one byte short of the cap.
+        let long = format!("a{}", "é".repeat(400));
+        assert_eq!(clamp_text(&long), format!("a{}", "é".repeat(255)));
+        let on_boundary = "é".repeat(400);
+        assert_eq!(clamp_text(&on_boundary), "é".repeat(256), "cut at the cap");
+        let short = "é".repeat(256);
+        assert_eq!(clamp_text(&short), short, "at the cap it is kept whole");
     }
 }

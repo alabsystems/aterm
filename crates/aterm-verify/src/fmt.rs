@@ -73,14 +73,12 @@ pub struct Sweep {
 
 /// The `fmt` check's stage.
 pub fn run(ctx: &Ctx, r: &mut Report) {
-    let bin = ctx.tools.stage2_dir.join(TRUSTFMT);
-    if !crate::is_executable_file(&bin) {
-        r.skip(format!(
-            "trustfmt (no {TRUSTFMT} in {} — fix: `aterm pkg install trust`)",
-            ctx.tools.stage2_dir.display()
-        ));
+    // The toolchain directory's own, else the managed Trust build's
+    // (`Toolchain::borrowed`); a skip only when there is none anywhere.
+    let Some(bin) = ctx.tools.trustfmt.clone() else {
+        r.skip(ctx.tools.missing_trustfmt_label());
         return;
-    }
+    };
     let files = match rs_files(ctx) {
         Ok(f) if !f.is_empty() => f,
         Ok(_) => {
@@ -110,7 +108,11 @@ fn record_sweep(ctx: &Ctx, r: &mut Report, bin: &Path, found: &Sweep) {
     }
     if found.drifted.is_empty() {
         if found.unread.is_empty() {
-            r.pass(format!("trustfmt: {} files formatted", found.files));
+            r.pass(format!(
+                "trustfmt: {} files formatted{}",
+                found.files,
+                borrowed_suffix(ctx, TRUSTFMT)
+            ));
         }
         return;
     }
@@ -162,6 +164,16 @@ fn record_sweep(ctx: &Ctx, r: &mut Report, bin: &Path, found: &Sweep) {
         ),
         findings,
     );
+}
+
+/// ` (the managed Trust build's <file>)` when the run took `name` from the managed
+/// Trust build because its toolchain directory has none (`Toolchain::borrowed`), so
+/// the row says which formatter or lint decided it; empty otherwise.
+pub(crate) fn borrowed_suffix(ctx: &Ctx, name: &str) -> String {
+    ctx.tools
+        .borrowed(name)
+        .map(|file| format!(" (the managed Trust build's {})", file.display()))
+        .unwrap_or_default()
 }
 
 /// The edition rows: one finding per directory whose `rustfmt.toml` must name
@@ -877,12 +889,26 @@ mod tests {
     fn the_real_formatter_reds_on_drift_and_the_fix_greens_it() {
         use crate::ladder::{Outcome, Severity};
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let tools = crate::run_toolchain(&crate::EnvSnapshot::capture(), &repo);
-        if !crate::is_executable_file(&tools.stage2_dir.join(TRUSTFMT)) {
+        // Under `verify` every child inherits the run's directory as TRUST_STAGE2_BIN
+        // (`Ctx::new_with_tools`), and an explicit override borrows nothing
+        // (`toolchain-borrowed-tools`): a run whose directory lacks a formatter it
+        // borrowed from the managed build would hand this test a toolchain with none,
+        // and the test would skip on every run. It wants a real formatter, whichever
+        // one this machine has, so it looks again without the inherited override.
+        let env = crate::EnvSnapshot::capture();
+        let mut tools = crate::run_toolchain(&env, &repo);
+        if tools.trustfmt.is_none() && env.trust_stage2_bin.is_some() {
+            let discovered = crate::EnvSnapshot {
+                trust_stage2_bin: None,
+                ..env
+            };
+            tools = crate::run_toolchain(&discovered, &repo);
+        }
+        if tools.trustfmt.is_none() {
             eprintln!(
-                "SKIP the_real_formatter_reds_on_drift_and_the_fix_greens_it: no {TRUSTFMT} in \
-                 {}, so this machine cannot show the check either way",
-                tools.stage2_dir.display()
+                "SKIP the_real_formatter_reds_on_drift_and_the_fix_greens_it: {}, so this \
+                 machine cannot show the check either way",
+                tools.missing_trustfmt_label()
             );
             return;
         }

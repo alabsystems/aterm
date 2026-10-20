@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use aterm_dbus::{Type, Value};
 
 use super::semantics::{
-    Action, CacheNode, Interface, InterfaceSet, NodeId, NodeIdOrRoot, PlatformNode, Rect,
+    Action, CacheNode, Interface, InterfaceSet, NodeIdOrRoot, NodeIdentity, PlatformNode, Rect,
     RelationType, StateSet,
 };
 
@@ -39,7 +39,7 @@ const NULL_PATH: &str = "/org/a11y/atspi/null";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ObjectId {
     Root,
-    Node { adapter: usize, node: NodeId },
+    Node { adapter: usize, node: NodeIdentity },
 }
 
 impl ObjectId {

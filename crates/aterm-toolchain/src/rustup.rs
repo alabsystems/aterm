@@ -10,7 +10,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use crate::discovery::is_executable_file;
+use crate::discovery::{is_executable_file, tool_file};
 
 /// Rustup's home: a non-empty `$RUSTUP_HOME` (passed in as `env_rustup_home`), else
 /// `<home>/.rustup` — rustup's own rule, which `atpkg::seam::rustup_home_with` (and
@@ -74,20 +74,22 @@ pub fn find_rustup_among(
     home: Option<&OsStr>,
     keg: Option<&Path>,
 ) -> Option<PathBuf> {
+    // `rustup.exe` on Windows: the lookups read metadata, which appends no suffix.
+    let rustup = tool_file("rustup");
     let mut candidates: Vec<PathBuf> = path
         .map(|p| {
             std::env::split_paths(p)
                 .filter(|dir| dir.is_absolute())
-                .map(|dir| dir.join("rustup"))
+                .map(|dir| dir.join(&rustup))
                 .collect()
         })
         .unwrap_or_default();
     let absolute = |v: Option<&OsStr>| v.map(PathBuf::from).filter(|p| p.is_absolute());
     if let Some(cargo_home) = absolute(cargo_home) {
-        candidates.push(cargo_home.join("bin/rustup"));
+        candidates.push(cargo_home.join("bin").join(&rustup));
     }
     if let Some(home) = absolute(home) {
-        candidates.push(home.join(".cargo/bin/rustup"));
+        candidates.push(home.join(".cargo/bin").join(&rustup));
     }
     candidates.extend(keg.map(Path::to_path_buf));
     candidates.into_iter().find(|p| is_executable_file(p))

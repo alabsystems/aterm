@@ -205,18 +205,43 @@ pub struct Roots {
     /// even `stat`ed — a stalled network mount answers a `stat` of its root
     /// by blocking, and a blocked look holds the disk watch until restart.
     pub mounts: Vec<PathBuf>,
+    /// Leave `$HOME`'s children and their worktrees unwalked: a pass handed
+    /// no session but an agent's demand reaches that agent's own checkout
+    /// ([`Self::cwds`]) and aterm's build cache, not every checkout of `$HOME`.
+    pub skip_home_children: bool,
 }
 
 /// Claude Code's per-user temp root for `uid`: `/private/tmp/claude-<uid>`
-/// where `/private/tmp` exists (macOS), else `/tmp/claude-<uid>`.
+/// where `/private/tmp` exists (macOS), else `/tmp/claude-<uid>`. On Windows
+/// `claude` under the user's own temp directory, which holds no uid
+/// ([`windows_claude_tmp`]).
 #[must_use]
 pub fn claude_tmp_root(uid: u32) -> PathBuf {
+    if cfg!(windows) {
+        return windows_claude_tmp(|name| std::env::var_os(name))
+            .unwrap_or_else(|| std::env::temp_dir().join("claude"));
+    }
     let base = if Path::new("/private/tmp").is_dir() {
         "/private/tmp"
     } else {
         "/tmp"
     };
     PathBuf::from(format!("{base}/claude-{uid}"))
+}
+
+/// Claude Code's temp root on Windows, from the environment `var` reads:
+/// `claude` under Node's `os.tmpdir()`, `%TEMP%`, else `%TMP%` (measured:
+/// `%TEMP%\claude\<project>\<session>\scratchpad`). `None` where neither
+/// names an absolute directory.
+#[must_use]
+pub fn windows_claude_tmp(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    ["TEMP", "TMP"]
+        .into_iter()
+        .filter_map(|name| var(name).filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+        .next()
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("claude"))
 }
 
 /// The Claude Code directories a survey reads sessions' ends from
@@ -679,6 +704,30 @@ pub fn own_uid() -> u32 {
     }
 }
 
+/// What places a workspace nested in a removed checkout under `home`
+/// ([`checkout::Placing`]): `home`'s device and every mount point of the
+/// mount table read now — `None` when the table was cut or `home` cannot be
+/// read, and then no such workspace is called gone.
+#[must_use]
+pub fn placing_now(home: &Path) -> Option<checkout::Placing> {
+    placing_of(home, &aterm_sysprobe::volumes::table())
+}
+
+/// [`placing_now`] from the mount table `table` already read.
+#[must_use]
+pub fn placing_of(
+    home: &Path,
+    table: &aterm_sysprobe::volumes::Table,
+) -> Option<checkout::Placing> {
+    if !table.complete {
+        return None;
+    }
+    Some(checkout::Placing {
+        home_dev: dev_nofollow(home)?,
+        mounts: table.points(),
+    })
+}
+
 /// The device of the directory at `path`, a link followed (as `statvfs`
 /// follows it): what [`Roots::device`] is set from.
 #[must_use]
@@ -687,97 +736,15 @@ pub fn device_of(path: &Path) -> Option<u64> {
 }
 
 /// The system's mount points, read from the mount table without asking any
-/// file system (`getmntinfo(MNT_NOWAIT)` on macOS, `/proc/self/mountinfo` on
-/// Linux): what [`Roots::mounts`] is set from. A mount point written under
-/// `/System/Volumes/Data` (macOS's data volume) is listed in its firmlinked
-/// form too. Empty where there is no reader.
+/// file system ([`aterm_sysprobe::volumes::table`]: `getfsstat(MNT_NOWAIT)` on
+/// macOS, `/proc/self/mountinfo` on Linux): what [`Roots::mounts`] is set
+/// from. A mount point written under `/System/Volumes/Data` (macOS's data
+/// volume) is listed in its firmlinked form too
+/// ([`aterm_sysprobe::volumes::Table::points`]). Empty where there is no
+/// reader.
 #[must_use]
 pub fn mount_points() -> Vec<PathBuf> {
-    let mut out = raw_mount_points();
-    let firmlinked: Vec<PathBuf> = out
-        .iter()
-        .filter_map(|p| p.strip_prefix("/System/Volumes/Data").ok())
-        .filter(|rel| !rel.as_os_str().is_empty())
-        .map(|rel| Path::new("/").join(rel))
-        .collect();
-    out.extend(firmlinked);
-    out.sort();
-    out.dedup();
-    out
-}
-
-#[cfg(target_os = "macos")]
-fn raw_mount_points() -> Vec<PathBuf> {
-    use std::os::unix::ffi::OsStrExt as _;
-    unsafe extern "C" {
-        #[cfg_attr(target_arch = "x86_64", link_name = "getmntinfo$INODE64")]
-        fn getmntinfo(mntbufp: *mut *mut libc::statfs, flags: libc::c_int) -> libc::c_int;
-    }
-    const MNT_NOWAIT: libc::c_int = 2;
-    let mut buf: *mut libc::statfs = std::ptr::null_mut();
-    // SAFETY: getmntinfo(3) points `buf` at an array of `n` entries it owns
-    // (valid until the next call on this thread); MNT_NOWAIT asks no file
-    // system, so a stalled mount cannot block it.
-    let n = unsafe { getmntinfo(&raw mut buf, MNT_NOWAIT) };
-    let Ok(n) = usize::try_from(n) else {
-        return Vec::new();
-    };
-    if buf.is_null() {
-        return Vec::new();
-    }
-    // SAFETY: as above — `n` initialized entries at `buf`.
-    let all = unsafe { std::slice::from_raw_parts(buf, n) };
-    all.iter()
-        .map(|fs| {
-            let name = &fs.f_mntonname;
-            let len = name.iter().position(|c| *c == 0).unwrap_or(name.len());
-            let bytes: Vec<u8> = name[..len].iter().map(|c| c.to_ne_bytes()[0]).collect();
-            PathBuf::from(std::ffi::OsStr::from_bytes(&bytes))
-        })
-        .filter(|p| p.is_absolute())
-        .collect()
-}
-
-#[cfg(target_os = "linux")]
-fn raw_mount_points() -> Vec<PathBuf> {
-    let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter_map(|l| l.split(' ').nth(4))
-        .map(unescape_mount)
-        .filter(|p| p.is_absolute())
-        .collect()
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn raw_mount_points() -> Vec<PathBuf> {
-    Vec::new()
-}
-
-/// A mountinfo field with its octal escapes (`\040` for a space) decoded.
-#[cfg(any(target_os = "linux", test))]
-fn unescape_mount(field: &str) -> PathBuf {
-    let b = field.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        let octal = b
-            .get(i + 1..i + 4)
-            .filter(|d| b[i] == b'\\' && d.iter().all(|c| (b'0'..=b'7').contains(c)))
-            .map(|d| d.iter().fold(0u32, |a, c| a * 8 + u32::from(c - b'0')));
-        match octal.and_then(|v| u8::try_from(v).ok()) {
-            Some(v) => {
-                out.push(v);
-                i += 4;
-            }
-            None => {
-                out.push(b[i]);
-                i += 1;
-            }
-        }
-    }
-    PathBuf::from(String::from_utf8_lossy(&out).into_owned())
+    aterm_sysprobe::volumes::table().points()
 }
 
 /// How a build directory was found — which also says what frees it.
@@ -890,6 +857,10 @@ pub struct Discovered {
     pub found: Vec<Found>,
     /// Why the walk stopped short, when it did.
     pub notes: Vec<String>,
+    /// The walk stopped short of every build directory it would reach (its
+    /// budget, a folder it could not read): why. A pass that ran on it did
+    /// not run out of what it may take.
+    pub cut: Option<String>,
 }
 
 /// Find every build directory reachable from `roots` within `budget`.
@@ -947,6 +918,7 @@ pub fn discover(roots: &Roots, budget: Budget) -> Discovered {
     if let Some(home) = roots
         .home
         .as_deref()
+        .filter(|_| !roots.skip_home_children)
         .and_then(|h| std::fs::canonicalize(h).ok())
         && w.on_device(&home)
     {
@@ -971,6 +943,7 @@ pub fn discover(roots: &Roots, budget: Budget) -> Discovered {
         w.claude_scratch(tmp);
     }
     let mut notes = w.notes;
+    let cut = w.cut.clone();
     if let Some(why) = w.cut {
         notes.push(format!(
             "cargo-targets: the search for build directories stopped short ({why}); the {} found are surveyed",
@@ -980,6 +953,7 @@ pub fn discover(roots: &Roots, budget: Budget) -> Discovered {
     Discovered {
         found: w.found,
         notes,
+        cut,
     }
 }
 
@@ -1029,6 +1003,12 @@ fn inside_xpy_build(dir: &Path) -> bool {
     dir.ancestors()
         .take(MAX_ANCESTORS)
         .any(|a| a.file_name().is_some_and(|n| n == "build") && a.parent().is_some_and(is_xpy))
+}
+
+/// [`worktree_root`], for tier 3's checkout ([`super::idle::checkout_of`]).
+#[must_use]
+pub fn worktree_root_of(dir: &Path) -> Option<PathBuf> {
+    worktree_root(dir)
 }
 
 /// The git worktree root at or above `dir`: the nearest directory holding a
@@ -1202,6 +1182,7 @@ impl Walk {
             .filter_map(|e| Some((e.file_name(), e.path(), e.file_type().ok()?)))
             .collect();
         self.entries = self.entries.saturating_add(out.len());
+        super::beat::tick(out.len());
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
@@ -1462,18 +1443,22 @@ impl Owner {
 
     /// How long nothing of a gone owner's build directory may have been
     /// written before it goes whole, given the configured quiet window
-    /// `quiet_s` ([`super::Config::quiet_s`], at least a day): a session's
-    /// that window; a REMOVED WORKSPACE's build cache only
+    /// `quiet_s` ([`super::Config::quiet_s`], at least a day) and whether the
+    /// volume is `short` (below the floor): a session's that window; a
+    /// REMOVED WORKSPACE's build cache, below the floor, only
     /// [`super::PRESSURE_MIN_IDLE_S`] — its workspace is SEEN gone, nobody
-    /// builds there again, and a day of waiting is a day of a full disk
-    /// (`atpkg::build_cache::RECLAIM_GONE` is that day for the sweep above the
-    /// floor). A build that recreated the worktree since writes a manifest,
-    /// which the recheck under the locks reads ([`still_gone`]), and a process
-    /// inside it keeps it ([`unused`]).
+    /// builds there again, and a day of waiting is a day of a full disk — and
+    /// while the volume is only low, atpkg's own above-pressure window
+    /// (`atpkg::build_cache::RECLAIM_GONE`, a day). A build that recreated the
+    /// worktree since writes a manifest, which the recheck under the locks
+    /// reads ([`still_gone`]), and a process inside it keeps it ([`unused`]).
     #[must_use]
-    pub fn quiet_s(&self, quiet_s: i64) -> i64 {
+    pub fn quiet_s(&self, quiet_s: i64, short: bool) -> i64 {
         match self {
-            Owner::BuildCache { .. } => super::PRESSURE_MIN_IDLE_S,
+            Owner::BuildCache { .. } if short => super::PRESSURE_MIN_IDLE_S,
+            Owner::BuildCache { .. } => {
+                i64::try_from(atpkg::build_cache::RECLAIM_GONE.as_secs()).unwrap_or(i64::MAX)
+            }
             Owner::ClaudeSession { .. } => quiet_s,
         }
     }
@@ -1531,6 +1516,10 @@ pub struct Owners {
     /// Each Claude Code directory's registry, as read ([`live_records`]).
     registries: BTreeMap<PathBuf, Registry>,
     sessions: BTreeMap<PathBuf, Owned>,
+    /// What places a workspace nested in a removed checkout
+    /// ([`checkout::gone_placed`], [`Self::placed`]); `None`: such a workspace
+    /// is away, not removed, and keeps its cache.
+    placing: Option<checkout::Placing>,
 }
 
 impl Owners {
@@ -1558,7 +1547,17 @@ impl Owners {
             quiet_s,
             registries: BTreeMap::new(),
             sessions: BTreeMap::new(),
+            placing: None,
         }
+    }
+
+    /// These owners, a removed workspace judged with `placing` (the home
+    /// volume's device and a complete mount table, [`placing_now`]): one nested
+    /// in a removed checkout can be seen gone ([`checkout::gone_placed`]).
+    #[must_use]
+    pub fn placed(mut self, placing: Option<checkout::Placing>) -> Owners {
+        self.placing = placing;
+        self
     }
 
     /// Who owns a build directory found as `origin`.
@@ -1569,9 +1568,12 @@ impl Owners {
             | Origin::AgentTargetDir
             | Origin::Bootstrap { .. }
             | Origin::Linked { .. } => Owned::NotOwned,
-            Origin::BuildCache { workspace, mirror } => {
-                build_cache_owner(workspace, mirror, self.home.as_deref())
-            }
+            Origin::BuildCache { workspace, mirror } => build_cache_owner(
+                workspace,
+                mirror,
+                self.home.as_deref(),
+                self.placing.as_ref(),
+            ),
             Origin::ClaudeScratch {
                 session,
                 session_dir,
@@ -1651,10 +1653,16 @@ fn live_records(claude_dir: &Path) -> Registry {
 }
 
 /// A Rust build cache's owner: gone only when its workspace is SEEN to be
-/// no longer one ([`checkout::gone`], the rule `atpkg::build_cache::reclaim`
-/// reads too).
-fn build_cache_owner(workspace: &Path, mirror: &Path, home: Option<&Path>) -> Owned {
-    match self::checkout::gone(workspace, home) {
+/// no longer one ([`checkout::gone_placed`], the rule
+/// `atpkg::build_cache::reclaim_watched` reads too), with `placing` a
+/// workspace nested in a removed checkout among them.
+fn build_cache_owner(
+    workspace: &Path,
+    mirror: &Path,
+    home: Option<&Path>,
+    placing: Option<&checkout::Placing>,
+) -> Owned {
+    match self::checkout::gone_placed(workspace, home, placing) {
         Ok(seen) => Owned::Gone {
             evidence: format!(
                 "the Rust build cache of {}, a workspace that is gone: {seen}",
@@ -1810,11 +1818,18 @@ pub type Census<'a> = &'a dyn Fn(Option<&Path>) -> ClaudeCensus;
 /// Why it no longer is.
 pub fn still_gone(owner: &Owner, now: i64, quiet_s: i64, census: Census<'_>) -> Result<(), String> {
     let verdict = match owner {
+        // Placed again from a mount table read now: a volume mounted since
+        // the survey keeps the workspace "away".
         Owner::BuildCache {
             workspace,
             mirror,
             home,
-        } => build_cache_owner(workspace, mirror, home.as_deref()),
+        } => build_cache_owner(
+            workspace,
+            mirror,
+            home.as_deref(),
+            home.as_deref().and_then(placing_now).as_ref(),
+        ),
         Owner::ClaudeSession {
             session,
             session_dir,
@@ -1882,7 +1897,7 @@ pub fn owns(owner: &Owner, path: &Path) -> Result<(), String> {
 /// directory or descriptors of `lsd`, `UserEventAgent`, `routined` and
 /// other agents under `/usr/libexec` and `/System`, always; counting them
 /// would keep every directory forever.
-fn platform_service(exe: Option<&Path>) -> bool {
+pub(crate) fn platform_service(exe: Option<&Path>) -> bool {
     exe.is_some_and(|p| {
         ["/System/", "/usr/libexec/", "/usr/sbin/", "/sbin/"]
             .iter()
@@ -1917,7 +1932,19 @@ pub fn unused(owner: &Owner, path: &Path, processes: Processes<'_>) -> Result<()
     if let Ok(dir) = std::fs::canonicalize(owner.dir()) {
         dirs.push(dir);
     }
-    let scan = processes(&dirs, &[std::process::id()])
+    unused_under(&dirs, processes)
+}
+
+/// Is any running process USING a path under one of `dirs` (each canonical)
+/// — its working directory, its executable or an open file there, as
+/// `processes` reads them ([`unused`]'s rule, for any set of directories: a
+/// checkout and its build directory for tier 3)?
+///
+/// # Errors
+///
+/// Who uses one, or why that could not be ruled out.
+pub fn unused_under(dirs: &[PathBuf], processes: Processes<'_>) -> Result<(), String> {
+    let scan = processes(dirs, &[std::process::id()])
         .map_err(|e| format!("the running processes could not be listed: {e}"))?;
     if let Some(u) = scan.users.first() {
         return Err(format!(
@@ -1944,6 +1971,66 @@ pub fn unused(owner: &Owner, path: &Path, processes: Processes<'_>) -> Result<()
         ));
     }
     Ok(())
+}
+
+/// THE PRODUCT'S [`Processes`]: every process of this uid
+/// ([`aterm_uds::holders::scan_path_users`]) — and, where the scan passes
+/// over this process (`skip` names it: its descriptors are the reclaim's own
+/// handles and lock files), this process's own EXECUTABLE and WORKING
+/// DIRECTORY, which no skip covers: an aterm run from a checkout's
+/// `target/release` is that build directory's user, and every tab's `aterm`
+/// and the re-exec after an update resolve to it.
+///
+/// # Errors
+///
+/// As [`aterm_uds::holders::scan_path_users`].
+pub fn scan_processes(
+    dirs: &[PathBuf],
+    skip: &[u32],
+) -> std::io::Result<aterm_uds::holders::PathScan> {
+    let mut scan = aterm_uds::holders::scan_path_users(dirs, skip)?;
+    let me = std::process::id();
+    if skip.contains(&me) {
+        let own = [
+            ("exe", std::env::current_exe()),
+            ("cwd", std::env::current_dir()),
+        ];
+        if let Some((how, path)) = own_use(&own, dirs)? {
+            scan.users
+                .push(aterm_uds::holders::PathUse { pid: me, how, path });
+        }
+    }
+    Ok(scan)
+}
+
+/// The first of `own` (this process's executable and working directory,
+/// each resolved) at or under one of `dirs`. A failed reading or resolution
+/// leaves this process unknown and refuses the scan, never positive absence.
+fn own_use(
+    own: &[(&'static str, std::io::Result<PathBuf>)],
+    dirs: &[PathBuf],
+) -> std::io::Result<Option<(&'static str, PathBuf)>> {
+    for (how, path) in own {
+        let path = path.as_ref().map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("own {how} could not be read: {error}"),
+            )
+        })?;
+        let path = std::fs::canonicalize(path).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "own {how} {} could not be resolved: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        if dirs.iter().any(|d| path.starts_with(d)) {
+            return Ok(Some((*how, path)));
+        }
+    }
+    Ok(None)
 }
 
 /// What a removal of a gone owner's build directory checks under cargo's
@@ -1999,6 +2086,7 @@ pub fn newest_write(dir: &Path, max: usize) -> Result<Option<i64>, String> {
             .any(|e| CARGO_LOCKS.iter().any(|l| e.file_name() == *l));
         for e in entries {
             seen += 1;
+            super::beat::tick(1);
             if seen > max {
                 return Err(format!(
                     "{} holds more than {max} entries, too many to date",

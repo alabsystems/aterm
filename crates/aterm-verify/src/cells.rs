@@ -5,10 +5,10 @@
 //! wasm32), or each `--cell` named, linted for its own triple with the
 //! `clippy.toml` bans that resolve or matter only there, and every workspace
 //! member in its graph type-checked with all its targets (wasm32 excepted).
-//! On an OS a fleet machine runs ([`judges_warnings`]) both passes are also red
-//! on any warning rustc itself raises ([`is_cell_warning`]): `dead_code`,
-//! `unused_imports` and the like turn on `cfg`, so the triple's own compile is
-//! the only one that sees them.
+//! On an OS a fleet machine runs, and on Windows ([`judges_warnings`]), both
+//! passes are also red on any warning rustc itself raises
+//! ([`is_cell_warning`]): `dead_code`, `unused_imports` and the like turn on
+//! `cfg`, so the triple's own compile is the only one that sees them.
 //! The cells a fleet machine hosts are that machine's own `verify lint test`,
 //! and the cell whose triple is this machine's is never cross-checked here.
 //!
@@ -1173,9 +1173,10 @@ pub struct CargoRead {
 /// `verify lint` holds the OS to `-D warnings`, but only on its own triple's
 /// `cfg`s; the cell holds the OS's other architectures to the same standard,
 /// and so every host that never compiles that OS (a Mac never compiles
-/// `target_os = "linux"`, a Linux box never `target_os = "macos"`). An OS no
-/// fleet machine runs (Windows, the browser) has no such standard to carry yet:
-/// its cells judge errors, bans and stale expectations only.
+/// `target_os = "linux"`, a Linux box never `target_os = "macos"`). Of the
+/// OSes no fleet machine runs, Windows is held to it too
+/// ([`WARNINGS_JUDGED_OFF_FLEET`]); the browser has no such standard to carry
+/// yet: its cells judge errors, bans and stale expectations only.
 ///
 /// The judge is the cell's rustup toolchain (stable first, unpinned), not the
 /// fleet's Trust rustc: a newer stable that adds a warn-by-default lint turns
@@ -1188,10 +1189,18 @@ pub fn judges_warnings(triple: &str) -> bool {
     let Some(own) = os(triple) else {
         return false;
     };
-    FLEET_HOST_TRIPLES
-        .iter()
-        .any(|host| os(host).as_deref() == Some(own.as_str()))
+    WARNINGS_JUDGED_OFF_FLEET.contains(&own.as_str())
+        || FLEET_HOST_TRIPLES
+            .iter()
+            .any(|host| os(host).as_deref() == Some(own.as_str()))
 }
+
+/// The OSes (a triple past its architecture) no fleet machine runs whose cells
+/// still judge warnings ([`judges_warnings`]): Windows, whose warning pass is
+/// done (a76bd27015 and 3cf93be412 took its lib and test targets to none), so a
+/// warning there is red the day it is written, not the day a Windows box next
+/// builds it.
+pub const WARNINGS_JUDGED_OFF_FLEET: [&str; 1] = ["pc-windows-msvc"];
 
 /// Whether a warning's lint code makes a cell red: any lint rustc itself
 /// raises. Those are the ones that turn on `cfg` (`dead_code` and
@@ -1771,14 +1780,15 @@ mod tests {
         );
         assert!(is_cell_warning(Some("unused_variables")));
         // Linux and macOS are fleet OSes, every architecture of them; Windows
-        // and the browser are not.
+        // is not, and is judged anyway; the browser is not judged.
         for (triple, judged) in [
             ("aarch64-unknown-linux-gnu", true),
             ("x86_64-unknown-linux-gnu", true),
             ("aarch64-apple-darwin", true),
             ("x86_64-apple-darwin", true),
-            ("x86_64-pc-windows-msvc", false),
-            ("aarch64-pc-windows-msvc", false),
+            ("x86_64-pc-windows-msvc", true),
+            ("aarch64-pc-windows-msvc", true),
+            ("x86_64-pc-windows-gnu", false),
             ("wasm32-unknown-unknown", false),
         ] {
             assert_eq!(judges_warnings(triple), judged, "{triple}");
@@ -1802,7 +1812,8 @@ mod tests {
             assert_eq!(red.detail.len(), 2);
             assert!(red.detail[0].contains("launchctl_list"), "{:?}", red.detail);
         }
-        // An OS no fleet machine runs is held to errors only.
+        // Windows, which no fleet machine runs, is held to the same standard
+        // (WARNINGS_JUDGED_OFF_FLEET); the browser is held to errors only.
         let run = exec::Run {
             ok: true,
             output: out.clone(),
@@ -1811,6 +1822,15 @@ mod tests {
         };
         let mut red = Red::default();
         read_cargo_run(&run, "x86_64-pc-windows-msvc", &graph, false, &mut red)
+            .expect("the compiler ran");
+        assert_eq!(
+            red.status.as_deref(),
+            Some("WARNING(2)"),
+            "{:?}",
+            red.detail
+        );
+        let mut red = Red::default();
+        read_cargo_run(&run, "wasm32-unknown-unknown", &graph, false, &mut red)
             .expect("the compiler ran");
         assert!(red.status.is_none(), "{:?}", red.detail);
         // Negative control: the clippy-only stream leaves a cell green.

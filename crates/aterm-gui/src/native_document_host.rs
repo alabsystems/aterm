@@ -325,6 +325,42 @@ pub(crate) enum DocumentHostError {
     },
 }
 
+/// How a refused read of a file that is not there ends its message; the one
+/// spelling [`DocumentHostError::refusal_word`] reads `missing` from.
+const MISSING_SUFFIX: &str = " does not exist";
+
+impl DocumentHostError {
+    /// One word for why an open refused, for a client to act on (the `edit`
+    /// verb's `ERR refused <word>`, design §6.2): `not-regular`, `too-large`,
+    /// `invalid-utf8`, `symlink`, `file-provider` (an evicted iCloud Drive
+    /// item), `missing`, `bad-uri` (the URI names no local absolute path), or
+    /// `unreadable` for the rest.
+    pub(crate) fn refusal_word(&self) -> &'static str {
+        match self {
+            Self::NotAFile => "not-regular",
+            Self::TooLarge { .. } => "too-large",
+            Self::InvalidUtf8 => "invalid-utf8",
+            Self::SymlinkComponent { .. } => "symlink",
+            #[cfg(unix)]
+            Self::NotDownloaded { .. } => "file-provider",
+            Self::Io { stage, message }
+                if *stage == AtomicSaveStage::Preflight && message.ends_with(MISSING_SUFFIX) =>
+            {
+                "missing"
+            }
+            Self::UnsupportedScheme
+            | Self::RemoteAuthority
+            | Self::MalformedUri
+            | Self::InvalidEncoding
+            | Self::NotAbsolute => "bad-uri",
+            Self::Io { .. }
+            | Self::UnknownGrant
+            | Self::ChangedWhileReading
+            | Self::TargetRetargeted => "unreadable",
+        }
+    }
+}
+
 impl std::fmt::Display for DocumentHostError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -509,6 +545,15 @@ impl DocumentPersistenceStore {
             .is_some_and(|persistence| persistence.save.pending().is_some())
     }
 
+    /// Drop `document`'s saver, which nothing is saving through
+    /// ([`Self::save_in_flight`] is false), and name the grant it held.
+    pub(crate) fn forget(&mut self, document: DocumentId) -> Option<DocumentGrantId> {
+        debug_assert!(!self.save_in_flight(document));
+        self.documents
+            .remove(&document)
+            .map(|persistence| persistence.grant)
+    }
+
     pub(crate) fn grant(&self, document: DocumentId) -> Option<DocumentGrantId> {
         self.documents
             .get(&document)
@@ -642,6 +687,14 @@ impl DocumentGrantStore {
         self.grants.get(&id)
     }
 
+    /// Drop the grant of a released document. Opening its URI again admits
+    /// the file afresh and mints a new grant.
+    pub(crate) fn forget(&mut self, id: DocumentGrantId) {
+        if let Some(grant) = self.grants.remove(&id) {
+            self.by_uri.remove(&grant.canonical_uri);
+        }
+    }
+
     pub(crate) fn cloned_grant(&self, id: DocumentGrantId) -> Option<DocumentGrant> {
         self.grants.get(&id).cloned()
     }
@@ -701,106 +754,36 @@ fn decode_utf8(mut bytes: Vec<u8>) -> Result<String, DocumentHostError> {
     String::from_utf8(bytes).map_err(|_| DocumentHostError::InvalidUtf8)
 }
 
+/// The absolute path a `file://` URI names: amacs's codec
+/// ([`amacs::protocol::uri`]), which the `edit` client spells its URIs with.
 pub(crate) fn file_uri_path(uri: &str) -> Result<PathBuf, DocumentHostError> {
-    let rest = uri
-        .strip_prefix("file://")
-        .ok_or(DocumentHostError::UnsupportedScheme)?;
-    if rest.contains(['?', '#']) {
-        return Err(DocumentHostError::MalformedUri);
-    }
-    let (authority, encoded_path) = if rest.starts_with('/') {
-        ("", rest)
-    } else {
-        rest.split_once('/')
-            .map(|(authority, _path)| (authority, &rest[authority.len()..]))
-            .ok_or(DocumentHostError::MalformedUri)?
-    };
-    if !authority.is_empty() && !authority.eq_ignore_ascii_case("localhost") {
-        return Err(DocumentHostError::RemoteAuthority);
-    }
-    let decoded = percent_decode(encoded_path)?;
-    if decoded.contains('\0') {
-        return Err(DocumentHostError::MalformedUri);
-    }
-    #[cfg(windows)]
-    let decoded = windows_file_uri_path_text(&decoded)?;
-    let path = PathBuf::from(decoded);
-    if !path.is_absolute() {
-        return Err(DocumentHostError::NotAbsolute);
-    }
-    Ok(path)
+    amacs::protocol::uri::file_uri_to_path(uri).map_err(DocumentHostError::from)
 }
 
 /// RFC 8089 drive paths carry one URI root slash (`/C:/...`) which is not a
-/// Windows path root. Remove exactly that slash; all other leading-slash forms
-/// retain their meaning and are subsequently accepted/rejected by `Path`.
-#[cfg(any(windows, test))]
+/// Windows path root; [`amacs::protocol::uri::windows_drive_path_text`] holds
+/// the rule, which `file_uri_path` applies on Windows.
+#[cfg(test)]
 fn windows_file_uri_path_text(decoded: &str) -> Result<String, DocumentHostError> {
-    let bytes = decoded.as_bytes();
-    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
-        return Ok(decoded[1..].to_string());
-    }
-    if decoded.starts_with("//") {
-        // UNC paths name a remote authority even when encoded with an empty URI
-        // authority (`file:////server/share`). The document host is local-only.
-        return Err(DocumentHostError::RemoteAuthority);
-    }
-    Ok(decoded.to_string())
+    amacs::protocol::uri::windows_drive_path_text(decoded).map_err(DocumentHostError::from)
 }
 
-fn percent_decode(value: &str) -> Result<String, DocumentHostError> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'%' {
-            decoded.push(bytes[index]);
-            index += 1;
-            continue;
-        }
-        if index + 2 >= bytes.len() {
-            return Err(DocumentHostError::InvalidEncoding);
-        }
-        let high =
-            aterm_codec::hex::nibble(bytes[index + 1]).ok_or(DocumentHostError::InvalidEncoding)?;
-        let low =
-            aterm_codec::hex::nibble(bytes[index + 2]).ok_or(DocumentHostError::InvalidEncoding)?;
-        decoded.push(high << 4 | low);
-        index += 3;
-    }
-    String::from_utf8(decoded).map_err(|_| DocumentHostError::InvalidEncoding)
-}
-
+/// The canonical `file://` spelling of an absolute path (amacs's codec).
 pub(crate) fn path_to_file_uri(path: &Path) -> Result<String, DocumentHostError> {
-    let path = path.to_str().ok_or(DocumentHostError::InvalidEncoding)?;
-    let mut normalized = if cfg!(windows) {
-        path.strip_prefix(r"\\?\")
-            .unwrap_or(path)
-            .replace('\\', "/")
-    } else {
-        path.to_string()
-    };
-    if cfg!(windows)
-        && (normalized.starts_with("//")
-            || normalized
-                .get(..4)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UNC/")))
-    {
-        return Err(DocumentHostError::RemoteAuthority);
-    }
-    if cfg!(windows) && !normalized.starts_with('/') {
-        normalized.insert(0, '/');
-    }
-    let mut uri = String::from("file://");
-    for byte in normalized.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~' | b':') {
-            uri.push(char::from(byte));
-        } else {
-            use std::fmt::Write as _;
-            write!(uri, "%{byte:02X}").map_err(|_| DocumentHostError::MalformedUri)?;
+    amacs::protocol::uri::path_to_file_uri(path).map_err(DocumentHostError::from)
+}
+
+impl From<amacs::protocol::uri::UriError> for DocumentHostError {
+    fn from(error: amacs::protocol::uri::UriError) -> Self {
+        use amacs::protocol::uri::UriError;
+        match error {
+            UriError::UnsupportedScheme => Self::UnsupportedScheme,
+            UriError::RemoteAuthority => Self::RemoteAuthority,
+            UriError::Malformed => Self::MalformedUri,
+            UriError::InvalidEncoding => Self::InvalidEncoding,
+            UriError::NotAbsolute => Self::NotAbsolute,
         }
     }
-    Ok(uri)
 }
 
 enum RegularReadHandle {
@@ -972,7 +955,7 @@ fn read_stable_file(
         }
         return Err(DocumentHostError::Io {
             stage: AtomicSaveStage::Preflight,
-            message: format!("{} does not exist", path.display()),
+            message: format!("{}{MISSING_SUFFIX}", path.display()),
         });
     };
     let (bytes, after) = bounded_read(path, &mut file, &metadata, limit)?;
@@ -1724,9 +1707,9 @@ impl HeldAdvisoryLock {
     }
 
     /// The locked file: what the holder reads or writes under the lock (the
-    /// edge-token secret), and what a test copies to stand in for a forked
-    /// child's copy of the description.
-    #[cfg(any(unix, test))]
+    /// edge-token secret), what a journal lock's taker proves its name still
+    /// names, and what a test copies to stand in for a forked child's copy of
+    /// the description.
     pub(crate) fn file(&self) -> &File {
         &self.0
     }

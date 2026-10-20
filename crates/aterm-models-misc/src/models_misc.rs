@@ -298,7 +298,7 @@ pub fn trail_audio_start_latency_model() -> Model {
 ///   `motion = "reduced"`, or the load-shed envelope).
 /// * `TickDarkUnfocused`: dark because the key belongs to another window.
 /// * `TickDarkUserOff`: dark because the person set the aurora's own brightness knob to zero.
-/// * `TickMasterOff`: `cursor_trail = false` or serious mode.
+/// * `TickMasterOff`: the trail is off (`cursor_trail_style = "off"`) or serious mode.
 ///
 /// A tick class is the host's config class whatever the engine then does: every style (the
 /// classic wake included) and every grid (a degenerate one too) must answer each class the
@@ -3385,10 +3385,14 @@ pub fn exact_profanity_completion_model() -> Model {
 /// disarm. Startup consumes inherited re-exec/expected-artifact authority before any verifier
 /// can inherit it, then observes an armed trial before interpreting that authority.
 ///
-/// A WINDOW'S CONFIRMATION KEEPS THE PREDECESSOR'S BYTES (2026-10-17). The window
-/// LaunchServices starts for an update makes the swap itself, and macOS judges it for its
-/// whole life by the bundle at the path its first consent check saw: the fixed path. Deleted
-/// there, the window's consent checks are refused even with the grant on. So
+/// A WINDOW'S CONFIRMATION KEEPS THE PREDECESSOR'S BYTES (2026-10-17). A window that makes
+/// the swap itself and then execs (a cold launch with a stage ready, a fork-lane successor,
+/// and before 2026-10-19 the window LaunchServices started for an update) is judged by macOS
+/// for its whole life by the bundle at the path its first consent check saw: the fixed path.
+/// Deleted there, the window's consent checks are refused even with the grant on. Since
+/// 2026-10-19 a LaunchServices-launched successor swaps nothing (its parent runs this same
+/// transaction before the launch; the model has no process identity, so that is no new
+/// step), and identity `4` remains for the lanes that exec. So
 /// `GarbageCollectRollback` ends the predecessor's authority but keeps the bytes for that
 /// window (identity `4`, `install::keep_settled_predecessor`), and `ReleaseKeptPredecessor`
 /// deletes them once the window is gone and no trial is armed

@@ -530,7 +530,6 @@ fn batch_search_caps_matches_and_flags_incomplete() {
     let terminal = TerminalSearch {
         index,
         indexed_scrollback_lines: 0,
-        generation: 0,
     };
     for case_sensitive in [true, false] {
         let newest = terminal
@@ -835,17 +834,16 @@ fn case_insensitive_repeated_prefix_uses_linear_matcher_path() {
     assert_eq!(SearchIndex::take_case_insensitive_lowered_lines(), 2);
 }
 
-/// Point navigation borrows and range-bounds posting lists. Even a ubiquitous
-/// one-trigram token never clones/intersects the full tree before yielding the
+/// Point navigation range-bounds posting lists. Even a ubiquitous one-trigram
+/// token visits only the candidates next to its anchor before yielding the
 /// neighboring match, and repeated trigrams collapse to one membership source.
 #[test]
-fn case_sensitive_point_navigation_builds_no_owned_intersection() {
+fn case_sensitive_point_navigation_stops_at_the_neighbouring_match() {
     let mut search = TerminalSearch::with_capacity(10_000);
     for _ in 0..10_000 {
         search.index_scrollback_line("hit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     }
 
-    let _ = SearchIndex::take_owned_intersection_builds();
     let _ = SearchIndex::take_search_from_line_candidates();
     let next = search
         .find_direction_opts(
@@ -862,7 +860,6 @@ fn case_sensitive_point_navigation_builds_no_owned_intersection() {
         .unwrap()
         .expect("last line match");
     assert_eq!((next.line, next.start_col), (9_999, 0));
-    assert_eq!(SearchIndex::take_owned_intersection_builds(), 0);
     assert_eq!(SearchIndex::take_search_from_line_candidates(), 2);
 
     let repeated = "a".repeat(32);
@@ -885,7 +882,6 @@ fn case_sensitive_point_navigation_builds_no_owned_intersection() {
         1,
         "thirty identical overlapping trigrams share one posting filter"
     );
-    assert_eq!(SearchIndex::take_owned_intersection_builds(), 0);
 }
 
 /// Deterministic 100K-line regression for the default short-query path.
@@ -1065,32 +1061,7 @@ fn regex_pattern_too_long_rejected() {
     );
 }
 
-// =============================================================================
-// Generation counter tests (#7271)
-// =============================================================================
-
-/// Every index mutation bumps the generation exactly once: per scrollback
-/// line (the batch method too), per `index_visible_content` call, per
-/// `clear`, and per `invalidate` — which leaves the content searchable.
-#[test]
-fn generation_bumps_once_per_mutation() {
-    let mut search = TerminalSearch::new();
-    assert_eq!(search.generation(), 0);
-    search.index_scrollback_line("line 0");
-    assert_eq!(search.generation(), 1);
-    search.index_scrollback_lines(vec!["a", "b", "c"]);
-    assert_eq!(search.generation(), 4, "one per batched line");
-    search.index_visible_content(4, vec!["line A", "line B"]);
-    assert_eq!(search.generation(), 5, "one per visible-content call");
-    search.invalidate();
-    assert_eq!(search.generation(), 6);
-    assert_eq!(search.search("line A").len(), 1, "invalidate keeps content");
-    search.clear();
-    assert_eq!(search.generation(), 7);
-}
-
-/// The owned batch seam is result-identical to borrowed indexing and advances
-/// the generation once for the whole batch.
+/// The owned batch seam is result-identical to borrowed indexing.
 #[test]
 fn owned_numbered_content_matches_borrowed_indexing() {
     let mut borrowed = TerminalSearch::new();
@@ -1119,44 +1090,6 @@ fn owned_numbered_content_matches_borrowed_indexing() {
         .search_results_opts("needle", true, false)
         .expect("owned search is valid");
     assert_eq!(owned_results, borrowed_results);
-    assert_eq!(owned.generation(), 1, "owned batch bumps exactly once");
-}
-
-/// Read-only operations (search, find_next, find_prev, might_contain)
-/// do NOT bump the generation.
-#[test]
-fn generation_stable_across_read_operations() {
-    let mut search = TerminalSearch::new();
-    search.index_scrollback_line("needle in haystack");
-    let gen_snapshot = search.generation();
-
-    let _ = search.search("needle");
-    assert_eq!(
-        search.generation(),
-        gen_snapshot,
-        "search should not bump generation"
-    );
-
-    let _ = search.find_next("needle", 0, 0);
-    assert_eq!(
-        search.generation(),
-        gen_snapshot,
-        "find_next should not bump generation"
-    );
-
-    let _ = search.find_prev("needle", 1, 0);
-    assert_eq!(
-        search.generation(),
-        gen_snapshot,
-        "find_prev should not bump generation"
-    );
-
-    let _ = search.might_contain("needle");
-    assert_eq!(
-        search.generation(),
-        gen_snapshot,
-        "might_contain should not bump generation"
-    );
 }
 
 /// Eviction with sparse (widely-spaced) line numbers is O(n log n) in cached

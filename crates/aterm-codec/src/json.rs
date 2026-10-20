@@ -4,7 +4,7 @@
 //! The JSON string escape every control-path JSON writer shares: the control
 //! wire's `--json` replies, `subscribe … cells` and the asciicast emitter
 //! (`aterm_control::wire::json_escape*` re-export it), and the supervisor's
-//! `aterm fleet` records and journal.
+//! journal.
 //!
 //! RFC 8259 requires only `"`, `\` and U+0000-U+001F escaped, and a writer
 //! that stops there is valid JSON — but a reply is often read raw on a

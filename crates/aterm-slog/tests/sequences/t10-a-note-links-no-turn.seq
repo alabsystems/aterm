@@ -1,0 +1,10 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# T10: only a task mail starts a turn; a note delivered just before a
+# `ctl turn` links nothing.
+mail note off=3
+expect mark - mail dir=in kind=note off=3 by=bridge
+at 1000 ctl
+wait 300
+see busy
+expect open t1 turn ledger=1 by=harness at=1300
+expect link=none

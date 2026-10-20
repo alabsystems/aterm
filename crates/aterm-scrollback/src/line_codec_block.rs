@@ -161,7 +161,7 @@ fn line_size_v1v2(data: &[u8], version: u8) -> Option<usize> {
     let has_attrs = data[attrs_start] != 0;
     let attrs_size = if has_attrs {
         // By-byte `get`s with saturating offsets: each read discharges its own
-        // bound for the strict gate.
+        // bound for the Trust lane.
         let (Some(&b1), Some(&b2), Some(&b3), Some(&b4)) = (
             data.get(attrs_start.saturating_add(1)),
             data.get(attrs_start.saturating_add(2)),
@@ -434,7 +434,7 @@ pub fn deserialize_lines_capped(data: &[u8], max_lines: usize) -> Vec<Line> {
 
     if lines.len() >= max_lines && offset < data.len() {
         // Pre-composed via the log shim: no macro-expanded `format_args!` unsafe
-        // in this function for the strict gate (see log_shim.rs).
+        // in this function for the Trust lane (see log_shim.rs).
         let mut msg = String::from("deserialize_lines_capped truncated at ");
         msg.push_str(&crate::error::dec_string(max_lines));
         msg.push_str(" lines (block has more records)");

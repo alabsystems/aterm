@@ -202,6 +202,72 @@ pub fn release(path: &Path) -> Result<Option<u64>, ReserveError> {
     }
 }
 
+/// The pass lock's name, beside the reserve ([`pass_lock_for`]).
+const PASS_LOCK: &str = "pass.lock";
+
+/// Where the machine-wide pass lock lives for `home`: beside the reserve, on
+/// the home volume ([`path_for`]'s folder).
+#[must_use]
+pub fn pass_lock_for(home: &Path) -> PathBuf {
+    path_for(home).with_file_name(PASS_LOCK)
+}
+
+/// ONE PASS AT A TIME ACROSS INSTANCES (design §4.8): every aterm instance has
+/// its own watch, and cargo's locks already make two passes safe, but not
+/// sensible — each would survey, size and race the other for the same
+/// caches. Held while this process's pass runs, released by `LOCK_UN` on
+/// drop (a child mid-spawn keeps a copy of the descriptor until its exec,
+/// so close alone would leave it held there).
+pub struct PassLock(std::fs::File);
+
+impl Drop for PassLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// Take the pass lock at `path` without waiting: `Ok(Some)` taken,
+/// `Ok(None)` another instance's pass holds it (this look runs none). The
+/// file is created `0600` in a folder made `0700`, never through a link.
+///
+/// # Errors
+///
+/// The folder or the file could not be made or opened (a full disk): the
+/// caller decides whether its pass runs unlocked.
+pub fn take_pass(path: &Path) -> std::io::Result<Option<PassLock>> {
+    if let Some(folder) = path.parent() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        builder.create(folder)?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    // The ascription is the lock-order census's File evidence (aterm-census
+    // `is_file_binding_rhs`), keeping this site a cross-process advisory lock.
+    let file: std::fs::File = opts.open(path)?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the pass lock's own take: its Drop releases by LOCK_UN"
+    )]
+    let taken = file.try_lock();
+    match taken {
+        Ok(()) => Ok(Some(PassLock(file))),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
 #[path = "disk_reserve_tests.rs"]
 #[cfg(all(test, unix))]
 mod tests;

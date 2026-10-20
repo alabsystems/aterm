@@ -13,23 +13,25 @@
 //!
 //! Each other agent's strings are a table of its own — [`AGY_ANCHORS`]
 //! (ids `agy.…`), [`MUSE_ANCHORS`] (`muse.…`), [`GEMINI_ANCHORS`]
-//! (`gemini.…`); [`anchor`] and [`anchor_text`] read them all. Codex has none:
-//! aterm reads no Codex screen (its screen lane was retired on 2026-10-16).
+//! (`gemini.…`) — and so are the keys of Claude Code's transcript rows the
+//! session log's step fold reads, [`TRANSCRIPT_KEYS`] (`transcript.…`), and
+//! the keys of Codex's rollout rows its Codex step fold reads,
+//! [`ROLLOUT_KEYS`] (`rollout.…`); [`anchor`] and [`anchor_text`] read them
+//! all. Codex has no screen table: aterm reads no Codex screen (its screen
+//! lane was retired on 2026-10-16).
 //!
-//! The tests `every_literal_anchor_is_in_the_store_claude`,
-//! `every_literal_agy_anchor_is_in_the_store_agy` and
-//! `every_literal_muse_anchor_is_in_the_store_muse` grep the store's
-//! binaries for every [`AnchorKind::Literal`] row and name the misses — the drift canaries. They RUN in the suite (`verify
-//! test` included) wherever a store binary is found (`$ATERM_CLAUDE_BIN`,
-//! `$ATERM_AGY_BIN`, `$ATERM_MUSE_BIN`, else `aterm pkg
-//! which <program>`), so a new build the vendor's auto-updater or `aterm pkg
-//! update` brought is judged by the next test run, and say so loudly and
-//! return where there is none — a canary that could not look has not passed,
-//! and is not counted as having. None is `#[ignore]`d: an ignored test is run
-//! by nobody. Gemini CLI is no store binary but an npm package of JavaScript
-//! files: `every_literal_gemini_anchor_is_in_its_bundle` reads the bundle
-//! that `$ATERM_GEMINI_BIN` (else the first `gemini` on PATH, else
-//! Homebrew's link) resolves into, every `.js` file beside its `gemini.js`.
+//! The explicit `vendor_drift` bench reads managed builds for their literal
+//! anchors and transcript/rollout keys, plus Claude's reset templates and wall
+//! phrases. Run `targo --unverified bench -p aterm-phase --bench vendor_drift`.
+//! Each missing vendor is COULD NOT RUN, including Gemini's npm bundle; the
+//! ordinary unit suite keeps deterministic resolver and table fixtures only.
+//!
+//! A row is owed only by the builds that draw it ([`Anchor::drawn_by`]), from
+//! `since` through `last` where present. Build versions come from atpkg records
+//! or Gemini's package.json; no vendor executable is started. The bench accepts
+//! `$ATERM_CLAUDE_BIN`, `$ATERM_CODEX_BIN`, `$ATERM_AGY_BIN`, `$ATERM_MUSE_BIN`
+//! and `$ATERM_GEMINI_BIN`; otherwise it resolves managed builds through
+//! `aterm pkg which`, or Gemini's script on PATH/Homebrew and adjacent .js files.
 
 /// How an anchor's text reaches the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +60,38 @@ pub struct Anchor {
     pub kind: AnchorKind,
     /// The vendor release it was read on (a capture or the binary).
     pub since: &'static str,
+    /// The LAST release that draws it, where a later one no longer does
+    /// ([`Anchor::through`]): the row stays for the readers of the builds
+    /// that draw it, and the drift canaries owe it only from `since`
+    /// through this one. `None`: the newest build still draws it.
+    pub last: Option<&'static str>,
+}
+
+impl Anchor {
+    /// This anchor as drawn by the builds from its `since` through `last`
+    /// alone: a later build no longer has it, and its readers read that
+    /// build's own words beside it.
+    #[must_use]
+    pub const fn through(self, last: &'static str) -> Anchor {
+        Anchor {
+            last: Some(last),
+            ..self
+        }
+    }
+
+    /// Whether a build of `version` draws this anchor: it is not older than
+    /// `since` nor newer than `last`. A version that could not be read
+    /// (`None`) draws every anchor still drawn and none retired: a canary
+    /// that cannot tell the build owes it what the newest draws.
+    #[must_use]
+    pub fn drawn_by(&self, version: Option<&str>) -> bool {
+        match version {
+            Some(v) => {
+                !newer_than(self.since, v) && self.last.is_none_or(|last| !newer_than(v, last))
+            }
+            None => self.last.is_none(),
+        }
+    }
 }
 
 const fn lit(id: &'static str, text: &'static str, since: &'static str) -> Anchor {
@@ -66,6 +100,7 @@ const fn lit(id: &'static str, text: &'static str, since: &'static str) -> Ancho
         text,
         kind: AnchorKind::Literal,
         since,
+        last: None,
     }
 }
 
@@ -75,6 +110,7 @@ const fn composed(id: &'static str, text: &'static str, since: &'static str) -> 
         text,
         kind: AnchorKind::Composed,
         since,
+        last: None,
     }
 }
 
@@ -84,6 +120,7 @@ const fn hint(id: &'static str, text: &'static str, since: &'static str) -> Anch
         text,
         kind: AnchorKind::KeyHint,
         since,
+        last: None,
     }
 }
 
@@ -251,6 +288,17 @@ pub const ANCHORS: &[Anchor] = &[
         "computer_use.title",
         "Computer Use wants to control these apps",
         "2.1.280",
+    ),
+    // Two Select labels with a NAME mid-sentence, which Ink may wrap onto a
+    // row of its own in a narrow pane: the held message's delivery and
+    // Computer Use's refusal (drawn with ` (esc)` after it). `prompt`'s
+    // options read a row that opens with a capital as the rest of the label
+    // above only where the two make the start of one of these.
+    lit("held.deliver", "Deliver this message to Claude", "2.1.282"),
+    lit(
+        "computer_use.deny",
+        "Deny, and tell Claude what to do differently",
+        "2.1.282",
     ),
     lit(
         "read_outside.title",
@@ -686,32 +734,32 @@ pub const ANCHORS: &[Anchor] = &[
     lit("usage.dismissed", "Settings dialog dismissed", "2.1.287"),
     // The limit reset (`crate::reset`,
     // `docs/SPEC-claude-accounts-resets-2026-10-02.md`). EVERY ROW IS READ
-    // in the 2.1.287 bundle and NONE WAS SEEN on a screen or in a
-    // transcript: the offer's texts are one table there (`lg`), the pending
-    // lines and the answers their own literals, and the server's flag
-    // payload may replace any text of the table. The rows are the words the
-    // readers match by, never a whole template: the grant row's head and the
-    // words between its count and its day (`Use your reset now ({left} left,
-    // until {date})`); the weekly session reset's row, which the vendor
-    // draws in the grant row's slot; the confirmation's title, the head of
-    // its body, the two joins of body and detail (`Refills your {limits} now
-    // · your weekly reset day stays {week}`, `{resets} left · use by
-    // {deadline}`), its yes and its no, and the tail both early lines share
-    // (`… — use your reset anyway?`); the two pending lines, each `…`-ended
-    // on the screen (an escape in the bundle, so the rows carry the words
-    // without it); and of the answers the four a reader tells apart — the
-    // spent line's head, the two lifted lines, the kept line's head, the
+    // in a bundle and NONE WAS SEEN on a screen or in a transcript: the
+    // offer's texts are one table there (2.1.287's `lg`, 2.1.304's `Ug`),
+    // the pending lines and the answers their own literals, and the server's
+    // flag payload may replace any text of the table. The rows are the words
+    // the readers match by, never a whole template: the grant row's head and
+    // the words between its count and its day (`Use your reset now ({left}
+    // left, until {date})`); the weekly session reset's row, which the
+    // vendor draws in the grant row's slot; the confirmation's title, the
+    // head of its body, the two joins of body and detail (`Refills your
+    // {limits} now · your weekly reset day stays {week}`, `{resets} left ·
+    // use by {deadline}`), its yes and its no, and the tail both early lines
+    // share (`… — use your reset anyway?`); the two pending lines, each
+    // `…`-ended on the screen (an escape in the bundle, so the rows carry the
+    // words without it); and of the answers the four a reader tells apart —
+    // the spent line's head, the two lifted lines, the kept line's head, the
     // login line's — with the ending the vendor adds where it queued no
     // continuation of its own. The other answers are no rows on purpose: a
     // line no row names is a failure.
-    lit("reset.row", "Use your reset now", "2.1.287"),
+    lit("reset.row", "Use your reset now", "2.1.287").through("2.1.303"),
     lit("reset.row.until", "left, until", "2.1.287"),
     lit(
         "reset.weekly_row",
         "Reset your session limit now",
         "2.1.287",
     ),
-    lit("reset.confirm.title", "Use your reset?", "2.1.287"),
+    lit("reset.confirm.title", "Use your reset?", "2.1.287").through("2.1.303"),
     lit("reset.confirm.refills", "Refills your", "2.1.287"),
     lit(
         "reset.confirm.stays",
@@ -719,9 +767,9 @@ pub const ANCHORS: &[Anchor] = &[
         "2.1.287",
     ),
     lit("reset.confirm.use_by", "left · use by", "2.1.287"),
-    lit("reset.yes", "Yes, use my reset", "2.1.287"),
+    lit("reset.yes", "Yes, use my reset", "2.1.287").through("2.1.303"),
     lit("reset.no", "No, keep it", "2.1.287"),
-    lit("reset.early", "use your reset anyway?", "2.1.287"),
+    lit("reset.early", "use your reset anyway?", "2.1.287").through("2.1.303"),
     lit("reset.checking", "Checking for a reset", "2.1.287"),
     lit("reset.resetting", "Resetting your limits", "2.1.287"),
     lit("reset.done", "Limits reset", "2.1.287"),
@@ -731,13 +779,45 @@ pub const ANCHORS: &[Anchor] = &[
         "2.1.287",
     ),
     lit("reset.clear", "Your limits are clear", "2.1.287"),
-    lit("reset.kept", "Reset kept", "2.1.287"),
+    lit("reset.kept", "Reset kept", "2.1.287").through("2.1.303"),
     lit(
         "reset.login",
         "Couldn't reset your limits with this login",
         "2.1.287",
     ),
     lit("reset.continue", "send a message to continue", "2.1.287"),
+    // 2.1.304 offers SEVERAL KINDS of reset, one row each, and names the
+    // kind where 2.1.287-2.1.303 said `your reset` (READ in the 2.1.304
+    // bundle: the table `Ug`, the kind names `X()`, the counted names `ce()`,
+    // the spent lines' heads `Mt()`): the row `Use a {kind} ({left} left,
+    // until {date})`, the confirmation's title `Use a {kind}?` and yes `Yes,
+    // use my {kind}`, its detail `{kindResets} left · use by {deadline}`, the
+    // early lines' tail `… — use your {kind} anyway?`, the spent line
+    // `{done} · your weekly reset day stays {week} · {kindResets} left` and
+    // the kept line `{Kind} kept · …` — `{Kind}` the kind with its first
+    // letter capitalised. The rows: the words before and after the kind, each
+    // kind's name as drawn and as counted (the 5-hour kind counts as
+    // `five-hour reset`), each kind's spent head, the kept line's word, and
+    // the line a declined chooser (`Which reset do you want to use?`, reached
+    // by a typed `/limit-reset` alone) answers with.
+    lit("reset.kind.row", "Use a", "2.1.304"),
+    lit("reset.kind.yes", "Yes, use my", "2.1.304"),
+    lit("reset.kind.early", "use your", "2.1.304"),
+    lit("reset.kind.anyway", "anyway?", "2.1.304"),
+    lit("reset.kind.kept", "kept", "2.1.304"),
+    lit("reset.kind.session", "5-hour reset", "2.1.304"),
+    lit("reset.kind.session.counted", "five-hour reset", "2.1.304"),
+    lit("reset.kind.weekly", "weekly reset", "2.1.304"),
+    lit("reset.kind.full", "full reset", "2.1.304"),
+    lit("reset.kind.fable", "Fable reset", "2.1.304"),
+    lit("reset.done.session", "Session limit reset", "2.1.304"),
+    lit("reset.done.weekly", "Weekly limits reset", "2.1.304"),
+    lit(
+        "reset.done.fable",
+        "Fable reset used · what Fable used is back in your weekly limit",
+        "2.1.304",
+    ),
+    lit("reset.kept.choice", "Resets kept", "2.1.304"),
     // The walls (see `wall::PHRASES` for the whole classification table).
     lit("wall.fable", "You've reached your Fable limit", "2.1.267"),
     lit("wall.auto_continue", "continuing automatically", "2.1.268"),
@@ -784,6 +864,32 @@ pub const ANCHORS: &[Anchor] = &[
         "2.1.280",
     ),
     lit("wall.login", "Please run /login", "2.1.280"),
+    // Claude Code's `/login` dialog (crate::login; MEASURED on 2.1.303 in
+    // the real-Claude lab, the success state READ in its bundle): the
+    // method picker and its three methods, Console's own menu, the browser
+    // hand-off, the success state, and the row Esc leaves.
+    lit("login.method", "Select login method:", "2.1.303"),
+    lit(
+        "login.subscription",
+        "Claude account with subscription",
+        "2.1.303",
+    ),
+    lit("login.console", "Anthropic Console account", "2.1.303"),
+    lit("login.platform", "3rd-party platform", "2.1.303"),
+    lit(
+        "login.console_how",
+        "How do you want to sign in?",
+        "2.1.303",
+    ),
+    lit("login.opening", "Opening browser to sign in", "2.1.303"),
+    lit("login.no_browser", "Browser didn't open?", "2.1.303"),
+    lit("login.paste", "Paste code here if prompted", "2.1.303"),
+    composed(
+        "login.success",
+        "Login successful. Press Enter to continue",
+        "2.1.303",
+    ),
+    lit("login.interrupted", "Login interrupted", "2.1.303"),
     // The vendor's API-error message row opens with it (`phase::error_row_notice`).
     lit("wall.api_error", "API Error", "2.1.283"),
     lit("wall.goal_paused", "Goal paused", "2.1.280"),
@@ -943,6 +1049,33 @@ pub const ANCHORS: &[Anchor] = &[
         " hook returned blocking error",
         "2.1.302",
     ),
+    // The stop-hook summary's OWN labelled rows, the first of which ends the
+    // hooks' words under it (2.1.304's bundle: `N??"Stop"," hook error: "`
+    // per blocking error, `"Stop hook feedback: "` per context a hook added;
+    // `phase::is_summary_label`).
+    lit("hook.error.label", " hook error:", "2.1.302"),
+    lit("hook.feedback", "Stop hook feedback: ", "2.1.302"),
+    // Claude Code's own LABEL OVER A HOOK'S VERDICT ON A PROMPT, the head of
+    // the `⏺` message it draws for it (`turn::said_message`: no words of the
+    // worker's, and no answer to the `❯` row over it). A hook's
+    // `{"continue": false}`: `Operation stopped by hook`, then `: ` and its
+    // `stopReason` where it gave one (measured on 2.1.302; the bundle's own
+    // constant on 2.1.303) — drawn under the prompt's own `❯` row. A hook's
+    // exit 2: the event's name, then ` operation blocked by hook:` and its
+    // stderr on the next row (UserPromptSubmit measured on 2.1.302; a slash
+    // command's UserPromptExpansion read from the 2.1.303 bundle) — the
+    // prompt drawn under it as `Original prompt: …`, never as a `❯` row.
+    lit("hook.stopped", "Operation stopped by hook", "2.1.302"),
+    lit(
+        "hook.prompt_blocked",
+        "UserPromptSubmit operation blocked by hook:",
+        "2.1.302",
+    ),
+    lit(
+        "hook.expansion_blocked",
+        "UserPromptExpansion operation blocked by hook:",
+        "2.1.303",
+    ),
     // Usage credits carry the session (the 2.1.300 bundle's own list of these
     // notices, measured in the lab): the footer's lasting item, the
     // notification as they start, and the same two under an admin's
@@ -962,6 +1095,30 @@ pub const ANCHORS: &[Anchor] = &[
         "credits.allocation_started",
         "You're now using your usage allocation",
         "2.1.300",
+    ),
+    // Usage credits carrying a MODEL's requests (READ in the 2.1.301 to
+    // 2.1.304 bundles, the `fable-usage-credits` notification; never
+    // captured): a credits-only model billed per request with no dialog, its
+    // consent stored or its tier billed by an admin, says so only as `<M> is
+    // drawing from usage credits` (once a process, then gone) or `<M> is now
+    // using usage credits instead of your plan limits` — the model's name
+    // first, so each is read as the SEGMENT'S END. And lower-priority mode's
+    // end as credits take over: `Extra usage is now covering your requests ·
+    // lower-priority mode ended`. Read by place, `credits::in_use`.
+    lit(
+        "credits.model_drawing",
+        " is drawing from usage credits",
+        "2.1.301",
+    ),
+    lit(
+        "credits.model_instead",
+        " is now using usage credits instead of your plan limits",
+        "2.1.301",
+    ),
+    lit(
+        "credits.extra_covering",
+        "Extra usage is now covering your requests",
+        "2.1.301",
     ),
     // The vendor's own warning that a window is filling (`You've used 80% of
     // your weekly limit · resets Oct 18 at 8:50pm (…)`, measured):
@@ -1005,6 +1162,16 @@ pub const AGY_ANCHORS: &[Anchor] = &[
     // to edit queued messages`: the binary's `Press %s to edit queued
     // messages`, its key filled in at run time).
     lit("agy.footer.queued", "to edit queued messages", "1.4.0"),
+    // The background-work panel under the composer's bottom rule, one row an
+    // item (`  ● [17:50:42] <what> running`, `  ● Agent(research: <name>)
+    // Working · 1s`), and the footer's counts of that work (`· 1 task(s) ·
+    // /tasks`, `· 1 subagent(s)`: the binary's `%d task(s)` and `%d
+    // subagent(s)`). Measured in the lab on 2026-10-17 (`agy-1.4.0-lab-bg-*`).
+    lit("agy.panel.running", " running", "1.4.0"),
+    lit("agy.panel.agent", "Agent(", "1.4.0"),
+    lit("agy.panel.working", "Working", "1.4.0"),
+    lit("agy.footer.tasks", " task(s)", "1.4.0"),
+    lit("agy.footer.subagents", " subagent(s)", "1.4.0"),
     // The permission modes' hints, drawn in the EMPTY composer while one is
     // on (shift+tab cycles them).
     lit(
@@ -1263,6 +1430,13 @@ pub const MUSE_ANCHORS: &[Anchor] = &[
     // The background-work panel under the composer's bottom rule (the lab's
     // captures `end-of-turn-work-panel`, `end-of-turn-work-running`).
     lit("muse.panel.select", "↓ to select", "1.4.10-R6427.1"),
+    // A panel branch's state while its work runs: a backgrounded shell's
+    // `running` (`└ ◈ Wait in the background  running  13s`), a monitor's
+    // `watching` (`└ ◇ Watch the lab socket  watching  14s`). A finished
+    // one says `ran 1s, exit 0` or `failed` (the lab's captures,
+    // 2026-10-16 and 2026-10-17).
+    lit("muse.panel.running", "running", "1.4.10-R6427.1"),
+    lit("muse.panel.watching", "watching", "1.4.10-R6427.1"),
     // The transcript's pointer to that panel, `(↓ to view terminals)` (the
     // binary holds ` to view ` and puts the rest together; the lab's capture
     // `end-of-turn-work-hint`).
@@ -1605,6 +1779,124 @@ pub const GEMINI_ANCHORS: &[Anchor] = &[
     ),
 ];
 
+/// The KEYS of Claude Code's transcript rows the session log's step fold
+/// (`aterm-agent`'s `harness::steps`) depends on (ids `transcript.…`): a
+/// key a build renames is a tool call, turn end or wall the fold no longer
+/// sees, so each is a literal the drift canary greps the store's build for
+/// (`every_transcript_key_is_in_the_store_claude`), as it does the screen's
+/// strings. Each was read on 2.1.294's transcripts (`aterm-agent`'s
+/// `supervise/fixtures/claude-2.1.294-transcript-*.jsonl`), and the fold
+/// spells its raw-byte tests from this table ([`anchor_text`]), so the
+/// two cannot drift apart.
+pub const TRANSCRIPT_KEYS: &[Anchor] = &[
+    lit("transcript.tool_use", "tool_use", "2.1.294"),
+    lit("transcript.tool_result", "tool_result", "2.1.294"),
+    lit("transcript.tool_use_id", "tool_use_id", "2.1.294"),
+    lit("transcript.is_error", "is_error", "2.1.294"),
+    lit("transcript.turn_duration", "turn_duration", "2.1.294"),
+    lit("transcript.durationMs", "durationMs", "2.1.294"),
+    lit("transcript.compact_boundary", "compact_boundary", "2.1.294"),
+    lit("transcript.isCompactSummary", "isCompactSummary", "2.1.294"),
+    lit(
+        "transcript.isApiErrorMessage",
+        "isApiErrorMessage",
+        "2.1.294",
+    ),
+    lit("transcript.isSidechain", "isSidechain", "2.1.294"),
+    lit("transcript.isMeta", "isMeta", "2.1.294"),
+    lit("transcript.promptId", "promptId", "2.1.294"),
+    lit("transcript.parentUuid", "parentUuid", "2.1.294"),
+    lit("transcript.local_command", "local_command", "2.1.294"),
+];
+
+/// The KEYS of Codex's rollout rows the session log's Codex step fold
+/// (`aterm-agent`'s `harness::codex_steps`) reads (ids `rollout.…`): the
+/// row and payload types it opens, ends, interrupts, calls and compacts by,
+/// the keys it names a thread, a turn, a call and a model by, the one wall
+/// word it reads, and the one call it classes by name. Ruling T9: ONLY literal strings a committed rollout shows, each
+/// `since` the build it was read on — the lab's Codex 0.163.0 rollouts
+/// (session log 5G, 2026-10-19), reduced and committed as `aterm-agent`'s
+/// `harness/testdata/steps/codex-0.163.0.jsonl` and its `-subagent` leg
+/// (`every_rollout_key_is_in_its_committed_rollout`), never a guessed key.
+/// A key a build renames is a turn, a call or a wall the fold no longer
+/// sees, so the drift canary greps the store's Codex build for each
+/// (`every_rollout_key_is_in_the_store_codex`), as it does Claude Code's
+/// transcript keys, and the fold spells its keys from this table
+/// ([`anchor_text`]), so the two cannot drift apart.
+pub const ROLLOUT_KEYS: &[Anchor] = &[
+    // The rows: a thread's own first row, a turn's context (the one key a
+    // turn opens by), an event, a model's item, a compaction.
+    lit("rollout.session_meta", "session_meta", "0.163.0"),
+    lit("rollout.turn_context", "turn_context", "0.163.0"),
+    lit("rollout.event_msg", "event_msg", "0.163.0"),
+    lit("rollout.response_item", "response_item", "0.163.0"),
+    lit("rollout.compacted", "compacted", "0.163.0"),
+    // The events and items it reads.
+    lit("rollout.task_complete", "task_complete", "0.163.0"),
+    lit("rollout.turn_aborted", "turn_aborted", "0.163.0"),
+    lit(
+        "rollout.thread_settings_applied",
+        "thread_settings_applied",
+        "0.163.0",
+    ),
+    lit("rollout.token_count", "token_count", "0.163.0"),
+    lit("rollout.function_call", "function_call", "0.163.0"),
+    lit(
+        "rollout.function_call_output",
+        "function_call_output",
+        "0.163.0",
+    ),
+    lit("rollout.custom_tool_call", "custom_tool_call", "0.163.0"),
+    lit(
+        "rollout.custom_tool_call_output",
+        "custom_tool_call_output",
+        "0.163.0",
+    ),
+    // The keys it reads them by.
+    lit("rollout.id", "id", "0.163.0"),
+    lit("rollout.forked_from_id", "forked_from_id", "0.163.0"),
+    lit("rollout.cli_version", "cli_version", "0.163.0"),
+    lit("rollout.thread_id", "thread_id", "0.163.0"),
+    lit("rollout.turn_id", "turn_id", "0.163.0"),
+    lit("rollout.call_id", "call_id", "0.163.0"),
+    lit("rollout.name", "name", "0.163.0"),
+    lit("rollout.namespace", "namespace", "0.163.0"),
+    lit("rollout.duration_ms", "duration_ms", "0.163.0"),
+    lit("rollout.last_token_usage", "last_token_usage", "0.163.0"),
+    lit("rollout.total_token_usage", "total_token_usage", "0.163.0"),
+    lit("rollout.model", "model", "0.163.0"),
+    lit("rollout.effort", "effort", "0.163.0"),
+    lit("rollout.error", "error", "0.163.0"),
+    lit("rollout.codex_error_info", "codex_error_info", "0.163.0"),
+    // The one call the fold classes by name, in its namespace: a subagent
+    // (`spawn_agent` in `collaboration`; the lab's subagent leg).
+    lit("rollout.collaboration", "collaboration", "0.163.0"),
+    lit("rollout.spawn_agent", "spawn_agent", "0.163.0"),
+    // The usage wall's word, on the turn's `task_complete` (the lab's
+    // usage leg: the stub's 429 `usage_limit_reached`).
+    lit(
+        "rollout.usage_limit_exceeded",
+        "usage_limit_exceeded",
+        "0.163.0",
+    ),
+];
+
+/// Whether version `a` is newer than `b`, numerically part by part, a
+/// revision's parts after the version's (`1.4.9-R6297.1` is `1.4.9.6297.1`;
+/// a part that is no number reads 0). The drift canaries owe an anchor only
+/// to the builds it was read on, and the step fold reads a Claude Code
+/// build newer than the newest it measured as unmeasured.
+#[must_use]
+pub fn newer_than(a: &str, b: &str) -> bool {
+    let parts = |v: &str| {
+        v.replace("-R", ".")
+            .split('.')
+            .map(|p| p.parse::<u64>().unwrap_or(0))
+            .collect::<Vec<_>>()
+    };
+    parts(a) > parts(b)
+}
+
 /// The text of the anchor `id`. Panics on an id the table does not have —
 /// a typo in a caller is a bug to find in its first test, not a guard that
 /// silently matches nothing.
@@ -1615,6 +1907,8 @@ pub fn anchor(id: &str) -> &'static str {
         .chain(AGY_ANCHORS)
         .chain(MUSE_ANCHORS)
         .chain(GEMINI_ANCHORS)
+        .chain(TRANSCRIPT_KEYS)
+        .chain(ROLLOUT_KEYS)
         .find(|a| a.id == id)
     {
         Some(a) => a.text,
@@ -1669,6 +1963,20 @@ pub const fn anchor_text(id: &str) -> &'static str {
         }
         i += 1;
     }
+    let mut i = 0;
+    while i < TRANSCRIPT_KEYS.len() {
+        if same(TRANSCRIPT_KEYS[i].id, id) {
+            return TRANSCRIPT_KEYS[i].text;
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < ROLLOUT_KEYS.len() {
+        if same(ROLLOUT_KEYS[i].id, id) {
+            return ROLLOUT_KEYS[i].text;
+        }
+        i += 1;
+    }
     panic!("aterm-phase has no anchor with that id")
 }
 
@@ -1701,141 +2009,12 @@ pub fn guard_regex(text: &str) -> String {
     out
 }
 
-/// Whether `bytes` are a build of a program rather than a stub: a Mach-O or
-/// ELF header, or at least [`MIN_BUILD_BYTES`]. A reroute stub
-/// (`<prefix>/reroute/<program>`, a few lines of shell) answers `aterm pkg
-/// which` on a box whose resolved token is the stub itself; it holds none of
-/// the anchors, so "missing" would be the stub's, not the build's.
-#[cfg(test)]
-pub(crate) fn looks_like_a_build(bytes: &[u8]) -> bool {
-    const MAGICS: [[u8; 4]; 6] = [
-        [0xfe, 0xed, 0xfa, 0xce],
-        [0xfe, 0xed, 0xfa, 0xcf],
-        [0xce, 0xfa, 0xed, 0xfe],
-        [0xcf, 0xfa, 0xed, 0xfe],
-        [0xca, 0xfe, 0xba, 0xbe],
-        [0x7f, b'E', b'L', b'F'],
-    ];
-    bytes.len() >= MIN_BUILD_BYTES
-        || bytes
-            .get(..4)
-            .is_some_and(|head| MAGICS.iter().any(|magic| magic == head))
-}
-
-/// Below this, a file that is no native executable is a stub script.
-#[cfg(test)]
-const MIN_BUILD_BYTES: usize = 4 * 1024 * 1024;
-
-/// Whether `needle` occurs in `hay` (Boyer-Moore-Horspool: a 225 MB binary
-/// is scanned in a fraction of a second per needle, where a window-by-
-/// window compare took most of a minute for the table).
-#[cfg(test)]
-pub(crate) fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
-    let n = needle.len();
-    if n == 0 {
-        return true;
-    }
-    if hay.len() < n {
-        return false;
-    }
-    let mut skip = [n; 256];
-    for (i, &b) in needle[..n - 1].iter().enumerate() {
-        skip[usize::from(b)] = n - 1 - i;
-    }
-    let mut at = 0;
-    while at + n <= hay.len() {
-        if &hay[at..at + n] == needle {
-            return true;
-        }
-        at += skip[usize::from(hay[at + n - 1])];
-    }
-    false
-}
-
-/// Where the store keeps managed programs under `home`: MIRRORS
-/// `atpkg::platform::default_prefix` (this crate has no dependencies, and a
-/// moved prefix makes a canary say `CANARY NOT RUN`, never pass).
-#[cfg(test)]
-fn canary_prefix(home: &std::path::Path) -> std::path::PathBuf {
-    if cfg!(target_os = "macos") {
-        home.join("Library")
-            .join("Application Support")
-            .join("aterm")
-            .join("pkg")
-    } else {
-        home.join(".local").join("share").join("aterm").join("pkg")
-    }
-}
-
-/// The path the drift canaries read a program's build at, from the first line
-/// `aterm pkg which <program>` prints. Its head ends in the copy that runs in
-/// the shell that asked, and that is the MANAGED build only when it lies in
-/// the store (`claude → <shim> → … → <prefix>/store/claude/<build>/bin/claude
-/// — managed 2.1.286 — …`). Any other — a system copy, one SHADOWED by a copy
-/// ahead on PATH, or a managed program whose row says `not what runs outside
-/// aterm: … this shell's own copy` (atpkg's outside-aterm rows, `state.rs`) —
-/// names a copy aterm does not manage (an old brew build judged against the
-/// managed build's anchors fails the test). The managed copy is then read
-/// where the store keeps it
-/// (`<prefix>/store/<program>/current/bin/<program>`), and `None` where that
-/// is not there either.
-#[cfg(test)]
-pub(crate) fn canary_path(
-    which_line: &str,
-    home: Option<&std::path::Path>,
-) -> Option<std::path::PathBuf> {
-    let (head, said) = which_line
-        .split_once(" \u{2014} ")
-        .unwrap_or((which_line, ""));
-    let program = head.split(" \u{2192} ").next()?.trim();
-    if said.starts_with("managed")
-        && let Some(end) = head
-            .rsplit(" \u{2192} ")
-            .next()
-            .map(str::trim)
-            .filter(|end| in_store(end, program))
-    {
-        return Some(end.into());
-    }
-    let current = canary_prefix(home?)
-        .join("store")
-        .join(program)
-        .join("current")
-        .join("bin")
-        .join(program);
-    current.exists().then_some(current)
-}
-
-/// Whether `path` lies in a store's tree for `program` (`…/store/<program>/…`),
-/// the layout [`canary_path`]'s fallback reads.
-#[cfg(test)]
-fn in_store(path: &str, program: &str) -> bool {
-    let parts: Vec<&std::ffi::OsStr> = std::path::Path::new(path)
-        .components()
-        .map(|c| c.as_os_str())
-        .collect();
-    parts.windows(2).any(|w| w[0] == "store" && w[1] == program)
-}
-
-/// [`canary_path`] for `program`: `$<env>` first, else what `aterm pkg which`
-/// says (`None` where it says nothing).
-#[cfg(test)]
-pub(crate) fn canary_binary(program: &str, env: &str) -> Option<std::path::PathBuf> {
-    if let Some(path) = std::env::var_os(env) {
-        return Some(path.into());
-    }
-    let out = std::process::Command::new("aterm")
-        .args(["pkg", "which", program])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    canary_path(text.lines().next()?, home.as_deref())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vendor_drift::*;
+    #[cfg(unix)]
+    use crate::vendor_files::*;
 
     #[test]
     #[should_panic(expected = "no anchor")]
@@ -1853,57 +2032,6 @@ mod tests {
             guard_regex("Run a (dynamic) x.y"),
             "Run.a.\\(dynamic\\).x\\.y"
         );
-    }
-
-    /// The drift canaries (they run in the suite; `--nocapture` shows which
-    /// binary answered). Each reads `$<env>`, else asks `aterm pkg which
-    /// <program>` for the store path, and FAILS naming every literal anchor
-    /// the binary no longer has; where it finds no build it says `CANARY
-    /// NOT RUN` and returns, for a canary that could not look has not
-    /// passed. A `·` in an anchor is drawn from a `\xB7` escape, so each
-    /// side of it is looked for on its own.
-    fn store_binary(program: &str, env: &str) -> Option<(String, Vec<u8>)> {
-        let path = super::canary_binary(program, env)?
-            .to_string_lossy()
-            .into_owned();
-        let bytes = std::fs::read(&path).ok()?;
-        if !super::looks_like_a_build(&bytes) {
-            eprintln!("{path} is a script of a few lines, not a build: skipped");
-            return None;
-        }
-        Some((path, bytes))
-    }
-
-    /// The version atpkg's record beside the build names (`<build>.vendor`'s
-    /// `version = "…"`: the build of the binary's directory, reached through
-    /// a `current` link, else of the file a link from outside the store
-    /// names), or `None` where there is no record ([`version_in`]). The binary is never
-    /// run, as the Gemini canary reads its `package.json`: a vendor build the
-    /// suite starts runs with the owner's HOME, and its `--version` is no
-    /// pure read there (measured 2026-10-17 in a scratch HOME: Muse Code
-    /// 1.4.10's takes `~/.config/muse/.auth.json.lock`, Codex 0.163.0's makes
-    /// its PATH-alias helpers under `~/.codex`).
-    fn build_version(path: &str) -> Option<String> {
-        use std::path::{Path, PathBuf};
-        let path = Path::new(path);
-        let build_of = |bin_dir: Option<PathBuf>| bin_dir?.parent().map(Path::to_path_buf);
-        let record = [
-            build_of(path.parent().and_then(|d| d.canonicalize().ok())),
-            build_of(
-                path.canonicalize()
-                    .ok()
-                    .and_then(|f| f.parent().map(Path::to_path_buf)),
-            ),
-        ]
-        .into_iter()
-        .flatten()
-        .find_map(|build| std::fs::read_to_string(format!("{}.vendor", build.display())).ok())?;
-        let version = record
-            .lines()
-            .filter_map(|l| l.split_once('='))
-            .find(|(k, _)| k.trim() == "version")?
-            .1;
-        version_in(version.trim().trim_matches('"'))
     }
 
     /// The canary's version is the store record's, read through a `current`
@@ -1934,6 +2062,13 @@ mod tests {
         .expect("a record");
         std::os::unix::fs::symlink(&build, root.join("store/agy/current")).expect("a link");
         let via_link = root.join("store/agy/current/bin/agy");
+        let managed = format!("agy → {} — managed 1.4.0", via_link.display());
+        assert_eq!(canary_path(&managed, Some(root)), Some(via_link.clone()));
+        assert_eq!(
+            canary_path("agy — absent from PATH", None),
+            None,
+            "no unmanaged path is guessed without a default store"
+        );
         assert_eq!(
             build_version(&via_link.to_string_lossy()).as_deref(),
             Some("1.4.0")
@@ -1952,41 +2087,53 @@ mod tests {
         assert!(!mark.exists(), "the build was never started");
     }
 
-    /// The version a `--version` line names: a dotted one (`2.1.286 (Claude
-    /// Code)`, `codex-cli 0.130.0`, agy's bare `1.4.0`), or Muse Code's with
-    /// its revision, `x.y.z-R<n>.<s>` — `Muse Code 1.4.9 (1.4.9-R6297.1)`
-    /// names both, and the revision is the build its anchors were read on.
-    fn version_in(text: &str) -> Option<String> {
-        let dotted = |v: &str| {
-            v.split('.').count() >= 2
-                && v.split('.')
-                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-        };
-        let words: Vec<&str> = text
-            .split_whitespace()
-            .map(|w| w.trim_matches(|c: char| matches!(c, '(' | ')' | ',')))
-            .collect();
-        words
-            .iter()
-            .find(|w| {
-                w.split_once("-R").is_some_and(|(v, rev)| {
-                    dotted(v) && (dotted(rev) || rev.parse::<u64>().is_ok())
-                })
-            })
-            .or_else(|| words.iter().find(|w| dotted(w)))
-            .map(|w| (*w).to_string())
+    /// [`newer_than`] orders versions by number, part by part, never by
+    /// text: `2.1.300` is newer than `2.1.30` and `2.1.299`, a longer
+    /// version newer than its own prefix, a revision after its version.
+    /// NEGATIVE CONTROLS: a version is not newer than itself, and the text
+    /// order (`"2.1.9" > "2.1.10"`) is not the rule.
+    #[test]
+    fn newer_than_orders_versions_by_number() {
+        for (a, b) in [
+            ("2.1.300", "2.1.30"),
+            ("2.1.300", "2.1.299"),
+            ("2.1.10", "2.1.9"),
+            ("2.1.294.1", "2.1.294"),
+            ("1.4.9-R6297.1", "1.4.9"),
+            ("1.4.10-R6427.1", "1.4.9-R6297.1"),
+            ("3", "2.9.9"),
+        ] {
+            assert!(newer_than(a, b), "{a} > {b}");
+            assert!(!newer_than(b, a), "{b} > {a}");
+        }
+        assert!(!newer_than("2.1.300", "2.1.300"));
+        assert!("2.1.9" > "2.1.10" && !newer_than("2.1.9", "2.1.10"));
     }
 
-    /// Whether version `a` is newer than `b`, numerically part by part, a
-    /// revision's parts after the version's (`1.4.9-R6297.1` is `1.4.9.6297.1`).
-    fn newer_than(a: &str, b: &str) -> bool {
-        let parts = |v: &str| {
-            v.replace("-R", ".")
-                .split('.')
-                .map(|p| p.parse::<u64>().unwrap_or(0))
-                .collect::<Vec<_>>()
-        };
-        parts(a) > parts(b)
+    /// The transcript's keys are their own table, read by [`anchor`] and
+    /// [`anchor_text`] like any other, and every one is a literal the
+    /// canary looks for. NEGATIVE CONTROL: no id is two tables'.
+    #[test]
+    fn the_transcript_keys_are_literals_the_lookups_read() {
+        for a in TRANSCRIPT_KEYS {
+            assert_eq!(a.kind, AnchorKind::Literal, "{}", a.id);
+            assert_eq!(anchor(a.id), a.text);
+            assert_eq!(anchor_text(a.id), a.text);
+            assert_eq!(a.id.strip_prefix("transcript."), Some(a.text));
+        }
+        let mut ids: Vec<&str> = ANCHORS
+            .iter()
+            .chain(AGY_ANCHORS)
+            .chain(MUSE_ANCHORS)
+            .chain(GEMINI_ANCHORS)
+            .chain(TRANSCRIPT_KEYS)
+            .chain(ROLLOUT_KEYS)
+            .map(|a| a.id)
+            .collect();
+        let all = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), all, "an id is two anchors'");
     }
 
     /// MUSE CODE'S VERSION IS READ WITH ITS REVISION: `muse --version` prints
@@ -2031,194 +2178,150 @@ mod tests {
         assert_eq!(version_in("Muse Code"), None);
     }
 
-    fn contains(bytes: &[u8], needle: &str) -> bool {
-        super::contains_bytes(bytes, needle.as_bytes())
-    }
+    /// Where the lab's Codex rollouts are committed, reduced (`aterm-agent`'s
+    /// step testdata, session log 5G): `codex-<build>.jsonl` and its legs,
+    /// `codex-<build>-<leg>.jsonl`.
+    const ROLLOUTS: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../aterm-agent/src/harness/testdata/steps"
+    );
 
-    /// The literal anchors of `table` missing from `bytes`: a row whose
-    /// parts (split at ` · `) are not all in them.
-    fn missing(bytes: &[u8], table: &[Anchor]) -> Vec<&'static str> {
-        table
-            .iter()
-            .filter(|a| a.kind == AnchorKind::Literal)
-            .filter(|a| !a.text.split(" · ").all(|part| contains(bytes, part)))
-            .map(|a| a.id)
-            .collect()
-    }
-
-    fn literal_anchors_are_in_the_store(program: &str, env: &str, table: &[Anchor]) {
-        let Some((path, bytes)) = store_binary(program, env) else {
-            eprintln!(
-                "CANARY NOT RUN: no {program} binary (set {env} or `aterm pkg install \
-                 {program}`); anchors not checked"
-            );
-            return;
-        };
-        // AN ANCHOR IS OWED ONLY BY THE BUILDS IT WAS WRITTEN FOR: each carries
-        // the version it was measured on (`since`), and a store holding an older
-        // build is not a build that lost it. A version that cannot be read owes
-        // every anchor.
-        let version = build_version(&path);
-        let (owed, newer): (Vec<Anchor>, Vec<Anchor>) = table
-            .iter()
-            .copied()
-            .partition(|a| version.as_deref().is_none_or(|v| !newer_than(a.since, v)));
-        if !newer.is_empty() {
-            eprintln!(
-                "{path}: {} anchor(s) are for builds newer than {}, not checked: {:?}",
-                newer.len(),
-                version.as_deref().unwrap_or("?"),
-                newer.iter().map(|a| a.id).collect::<Vec<_>>()
-            );
-        }
-        let missing = missing(&bytes, &owed);
-        assert!(
-            missing.is_empty(),
-            "{path}: {} literal anchors missing: {missing:?}",
-            missing.len()
-        );
-        eprintln!(
-            "{path} ({}): every literal anchor is present",
-            version
-                .as_deref()
-                .unwrap_or("no store record: every anchor owed")
-        );
-    }
-
-    #[test]
-    fn every_literal_anchor_is_in_the_store_claude() {
-        literal_anchors_are_in_the_store("claude", "ATERM_CLAUDE_BIN", ANCHORS);
-    }
-
-    /// THE LIMIT RESET'S TEMPLATES, WHOLE, as the bundle spells them — a `·`
-    /// as its `\xB7` escape, a value as its `{placeholder}` — each built
-    /// from the rows the readers match by (`crate::reset`) and named by the
-    /// row it stands for: the grant row, the confirmation's body and its
-    /// detail, and the opening of each answer a reader tells apart.
-    ///
-    /// [`missing`] looks for each side of a `·` on its own, and the sides of
-    /// the confirmation's two joins are `now`, `left` and `use by`: words a
-    /// build that rewords the confirmation still carries elsewhere. A
-    /// template is ONE literal of the vendor's table, so a reworded one is
-    /// missing — and what a rewording costs is every confirmation read
-    /// inexact and Escaped, the wall's one attempt with it.
-    fn reset_templates() -> Vec<(&'static str, String)> {
-        let escaped = |id: &str| anchor(id).replace('·', "\\xB7");
-        let led = |id: &str| format!("{} \\xB7 ", anchor(id));
-        vec![
-            (
-                "reset.row.until",
-                format!(
-                    "{} ({{left}} {} {{date}})",
-                    anchor("reset.row"),
-                    anchor("reset.row.until")
-                ),
-            ),
-            (
-                "reset.confirm.stays",
-                format!(
-                    "{} {{limits}} {} {{week}}",
-                    anchor("reset.confirm.refills"),
-                    escaped("reset.confirm.stays")
-                ),
-            ),
-            (
-                "reset.confirm.use_by",
-                format!(
-                    "{{resets}} {} {{deadline}}",
-                    escaped("reset.confirm.use_by")
-                ),
-            ),
-            ("reset.done", led("reset.done")),
-            ("reset.kept", led("reset.kept")),
-            ("reset.lifted", escaped("reset.lifted")),
-            ("reset.login", led("reset.login")),
-        ]
-    }
-
-    /// The rows whose template `bytes` do not hold whole.
-    fn missing_templates(bytes: &[u8]) -> Vec<&'static str> {
-        reset_templates()
-            .iter()
-            .filter(|(_, template)| !contains(bytes, template))
-            .map(|(id, _)| *id)
-            .collect()
-    }
-
-    /// The drift canary for [`reset_templates`], run and skipped as the
-    /// table's own is ([`store_binary`]).
-    #[test]
-    fn every_reset_template_is_whole_in_the_store_claude() {
-        let Some((path, bytes)) = store_binary("claude", "ATERM_CLAUDE_BIN") else {
-            eprintln!(
-                "CANARY NOT RUN: no claude binary found (set ATERM_CLAUDE_BIN, or install one: \
-                 `aterm pkg install claude`) — the reset's templates are NOT checked against a \
-                 build"
-            );
-            return;
-        };
-        let missing = missing_templates(&bytes);
-        assert!(
-            missing.is_empty(),
-            "{path}: {} reset templates not whole: {missing:?}",
-            missing.len()
-        );
-        eprintln!("{path}: every reset template is whole");
-    }
-
-    #[test]
-    fn every_literal_agy_anchor_is_in_the_store_agy() {
-        literal_anchors_are_in_the_store("agy", "ATERM_AGY_BIN", AGY_ANCHORS);
-    }
-
-    #[test]
-    fn every_literal_muse_anchor_is_in_the_store_muse() {
-        literal_anchors_are_in_the_store("muse", "ATERM_MUSE_BIN", MUSE_ANCHORS);
-    }
-
-    /// Gemini CLI's npm bundle, found from `bin` (a `gemini` on PATH, a
-    /// Homebrew link or the script itself): the directory the script
-    /// resolves into, every `.js` file in it (joined, NUL between), and the
-    /// version its package's `package.json` (one up) names. `None` where
-    /// `bin` leads to no `@google/gemini-cli` package: a stub, another
-    /// program of that name.
-    fn gemini_bundle(bin: &std::path::Path) -> Option<(String, Vec<u8>, Option<String>)> {
-        let script = std::fs::canonicalize(bin).ok()?;
-        let dir = script.parent()?;
-        let package = std::fs::read_to_string(dir.parent()?.join("package.json")).ok()?;
-        if !package.contains("\"@google/gemini-cli\"") {
-            return None;
-        }
-        let version = package
-            .split_once("\"version\"")
-            .and_then(|(_, rest)| rest.split('"').nth(1))
-            .map(str::to_string);
-        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-            .ok()?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "js"))
+    /// The committed rollout reductions of `build`, joined, each checked to
+    /// open with the reducer's own line naming that build.
+    fn committed_rollouts(build: &str) -> Vec<u8> {
+        let leg = format!("{build}-");
+        let mut names: Vec<String> = std::fs::read_dir(ROLLOUTS)
+            .expect("the step testdata")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| {
+                n.strip_prefix("codex-")
+                    .and_then(|n| n.strip_suffix(".jsonl"))
+                    .is_some_and(|b| b == build || b.starts_with(&leg))
+            })
             .collect();
-        files.sort();
-        let mut bytes = Vec::new();
-        for file in files {
-            bytes.extend(std::fs::read(file).ok()?);
-            bytes.push(0);
+        names.sort();
+        let head = format!("# codex {build} ");
+        let mut out = Vec::new();
+        for n in names {
+            let text = std::fs::read_to_string(format!("{ROLLOUTS}/{n}")).expect("a reduction");
+            assert!(text.starts_with(&head), "{n} is a reduction of {build}");
+            out.extend_from_slice(text.as_bytes());
         }
-        Some((dir.display().to_string(), bytes, version))
+        out
     }
 
-    /// Where the Gemini CLI canary looks: `$ATERM_GEMINI_BIN`, else the first
-    /// `gemini` on PATH, else Homebrew's link.
-    fn gemini_bin() -> Option<std::path::PathBuf> {
-        if let Some(path) = std::env::var_os("ATERM_GEMINI_BIN") {
-            return Some(path.into());
+    /// RULING T9: every rollout key is a literal the committed rollout of
+    /// the build it names (`since`) shows, quoted — a JSON key or a closed
+    /// word — never a guess; and the lookups read it like any anchor.
+    /// NEGATIVE CONTROLS: the planted key is named missing, and a build with
+    /// no committed rollout shows none.
+    #[test]
+    fn every_rollout_key_is_in_its_committed_rollout() {
+        let quoted = |a: &Anchor| -> Vec<u8> { format!("\"{}\"", a.text).into_bytes() };
+        for a in ROLLOUT_KEYS {
+            assert_eq!(a.kind, AnchorKind::Literal, "{}", a.id);
+            assert_eq!(anchor(a.id), a.text);
+            assert_eq!(anchor_text(a.id), a.text);
+            assert_eq!(a.id.strip_prefix("rollout."), Some(a.text));
+            let rollouts = committed_rollouts(a.since);
+            assert!(!rollouts.is_empty(), "{}: no rollout of {}", a.id, a.since);
+            assert!(
+                contains_bytes(&rollouts, &quoted(a)),
+                "{}: {:?} is not in the committed rollout of {}",
+                a.id,
+                a.text,
+                a.since
+            );
         }
-        std::env::var_os("PATH")
+        // NEGATIVE CONTROLS.
+        let rollouts = committed_rollouts("0.163.0");
+        assert!(!contains_bytes(&rollouts, &quoted(&PLANTED_ROLLOUT_KEY[0])));
+        assert!(committed_rollouts("9.9.999").is_empty());
+    }
+
+    /// WHICH BUILDS OWE A ROW: an anchor from its `since` through its
+    /// `last`, and a build whose version could not be read every anchor the
+    /// newest draws; the reset's templates by the same rule. The reset's
+    /// 2.1.287 words are 2.1.287-2.1.303's, and 2.1.304's words are no older
+    /// build's. NEGATIVE CONTROLS: a retired row is owed by no build after
+    /// its last, nor by an unread one; a row is owed by no build before its
+    /// first; a planted template of one build is missing from bytes that
+    /// spell the other build's.
+    #[test]
+    fn a_row_is_owed_only_by_the_builds_that_draw_it() {
+        let row = ANCHORS
             .iter()
-            .flat_map(std::env::split_paths)
-            .map(|d| d.join("gemini"))
-            .chain(["/opt/homebrew/bin/gemini", "/usr/local/bin/gemini"].map(Into::into))
-            .find(|p| p.is_file())
+            .find(|a| a.id == "reset.row")
+            .expect("the old row");
+        let kinds = ANCHORS
+            .iter()
+            .find(|a| a.id == "reset.kind.row")
+            .expect("2.1.304's row");
+        let until = ANCHORS
+            .iter()
+            .find(|a| a.id == "reset.row.until")
+            .expect("both builds' join");
+        for (version, old, new) in [
+            (Some("2.1.286"), false, false),
+            (Some("2.1.287"), true, false),
+            (Some("2.1.303"), true, false),
+            (Some("2.1.304"), false, true),
+            (Some("2.1.310"), false, true),
+            (Some("2.1.303.1"), false, false),
+            (None, false, true),
+        ] {
+            assert_eq!(row.drawn_by(version), old, "{version:?}");
+            assert_eq!(kinds.drawn_by(version), new, "{version:?}");
+            assert_eq!(
+                until.drawn_by(version),
+                version != Some("2.1.286"),
+                "{version:?}"
+            );
+        }
+        // No row is retired before it was first drawn: each is owed by the
+        // build that first drew it and the build that last did.
+        for a in ANCHORS.iter().filter(|a| a.last.is_some()) {
+            assert!(a.drawn_by(Some(a.since)), "{}", a.id);
+            assert!(a.drawn_by(a.last), "{}", a.id);
+        }
+        // The templates: a 2.1.303 build spells only the old ones, a 2.1.304
+        // build only the new ones, both spell the lifted and login lines.
+        let ids = |version: &str| {
+            reset_templates()
+                .into_iter()
+                .filter(|t| t.spelled_by(Some(version)))
+                .map(|t| (t.id, t.text))
+                .collect::<Vec<_>>()
+        };
+        let (old, new) = (ids("2.1.303"), ids("2.1.304"));
+        assert!(
+            old.iter()
+                .any(|(_, t)| t == "Use your reset now ({left} left, until {date})")
+        );
+        assert!(
+            new.iter()
+                .any(|(_, t)| t == "Use a {kind} ({left} left, until {date})")
+        );
+        for both in ["reset.lifted", "reset.login"] {
+            assert!(old.iter().any(|(id, _)| *id == both), "{both}");
+            assert!(new.iter().any(|(id, _)| *id == both), "{both}");
+        }
+        // NEGATIVE CONTROL: the bytes of one build's spelling miss the
+        // other's templates, and nothing of their own.
+        let spell = |templates: &[(&str, String)]| {
+            templates
+                .iter()
+                .map(|(_, t)| t.as_str())
+                .collect::<Vec<_>>()
+                .join("|")
+                .into_bytes()
+        };
+        let (old_bytes, new_bytes) = (spell(&old), spell(&new));
+        assert!(missing_templates(&old_bytes, Some("2.1.303")).is_empty());
+        assert!(missing_templates(&new_bytes, Some("2.1.304")).is_empty());
+        assert!(missing_templates(&old_bytes, Some("2.1.304")).contains(&"reset.kind.row"));
+        assert!(missing_templates(&new_bytes, Some("2.1.303")).contains(&"reset.row.until"));
     }
 
     /// The bundle finder on a stand-in package: the version its
@@ -2253,43 +2356,5 @@ mod tests {
         assert!(gemini_bundle(&link).is_none(), "another package");
         std::fs::remove_file(&package).expect("removed");
         assert!(gemini_bundle(&link).is_none(), "no package");
-    }
-
-    /// The drift canary for [`GEMINI_ANCHORS`], run and skipped as the
-    /// store's are ([`literal_anchors_are_in_the_store`]), over the npm
-    /// bundle ([`gemini_bundle`]).
-    #[test]
-    fn every_literal_gemini_anchor_is_in_its_bundle() {
-        let Some((dir, bytes, version)) = gemini_bin().as_deref().and_then(gemini_bundle) else {
-            eprintln!(
-                "CANARY NOT RUN: no Gemini CLI bundle (set ATERM_GEMINI_BIN to its `gemini`, or \
-                 `brew install gemini-cli`); anchors not checked"
-            );
-            return;
-        };
-        let (owed, newer): (Vec<Anchor>, Vec<Anchor>) = GEMINI_ANCHORS
-            .iter()
-            .copied()
-            .partition(|a| version.as_deref().is_none_or(|v| !newer_than(a.since, v)));
-        if !newer.is_empty() {
-            eprintln!(
-                "{dir}: {} anchor(s) are for builds newer than {}, not checked: {:?}",
-                newer.len(),
-                version.as_deref().unwrap_or("?"),
-                newer.iter().map(|a| a.id).collect::<Vec<_>>()
-            );
-        }
-        let missing = missing(&bytes, &owed);
-        assert!(
-            missing.is_empty(),
-            "{dir}: {} literal anchors missing: {missing:?}",
-            missing.len()
-        );
-        eprintln!(
-            "{dir} ({}): every literal Gemini CLI anchor is present",
-            version
-                .as_deref()
-                .unwrap_or("no package version: every anchor owed")
-        );
     }
 }

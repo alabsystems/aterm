@@ -62,7 +62,7 @@ contract_fn! {
     /// Discharged in the Clean CIC kernel by definitional equality against
     /// `event_carry_within_bound_isl` (`clean-kernel-defeq`).
     #[must_use]
-    pub fn event_carry_within_bound(len: u64, max_carry: u64) -> bool
+    pub const fn event_carry_within_bound(len: u64, max_carry: u64) -> bool
     clauses [ensures result == (len <= max_carry)]
     {
         len <= max_carry
@@ -71,7 +71,7 @@ contract_fn! {
 
 /// A classified boundary in a recorded session. `offset` is the record index
 /// that produced it (records are position-addressed at this rung).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub enum SessionEvent {
     /// The prompt is ready for input (OSC-133 `A`, or a [`Profile`] glyph at
     /// quiescence).
@@ -98,10 +98,31 @@ pub enum SessionEvent {
     },
 }
 
+impl PartialEq for SessionEvent {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::PromptReady { offset: a }, Self::PromptReady { offset: b }) => a == b,
+            (Self::CommandStart { offset: a }, Self::CommandStart { offset: b }) => a == b,
+            (
+                Self::CommandEnd {
+                    offset: oa,
+                    exit: ea,
+                },
+                Self::CommandEnd {
+                    offset: ob,
+                    exit: eb,
+                },
+            ) => oa == ob && ea == eb,
+            (Self::Quiesced { offset: a }, Self::Quiesced { offset: b }) => a == b,
+            _ => false,
+        }
+    }
+}
+
 impl SessionEvent {
     /// The record index this event is anchored to.
     #[must_use]
-    pub fn offset(&self) -> usize {
+    pub const fn offset(&self) -> usize {
         match *self {
             SessionEvent::PromptReady { offset }
             | SessionEvent::CommandStart { offset }
@@ -147,23 +168,54 @@ impl Profile {
     }
 }
 
-// The index just past the run of ASCII digits starting at `b[i]` — used to read
-// the OSC command number before the first `;`.
-fn digits_end(b: &[u8], mut i: usize) -> usize {
-    while b.get(i).is_some_and(|c| c.is_ascii_digit()) {
-        i = i.saturating_add(1);
-    }
-    i
-}
-
 // A shell-mark introducer (`\x1b]133/633;<letter>;<params><term>`) is short; bound
 // the bytes we carry for a split/never-terminated one.
 const CARRY_MAX: usize = 32;
 
 // True if `code` (the digits right after `\x1b]`) is a prefix of "133" or "633" — a
 // mark code that may still complete once more bytes arrive.
-fn is_shell_prefix(code: &[u8]) -> bool {
-    b"133".starts_with(code) || b"633".starts_with(code)
+const fn is_shell_prefix(code: &[u8]) -> bool {
+    matches!(code, b"" | b"1" | b"13" | b"133" | b"6" | b"63" | b"633")
+}
+
+#[derive(Clone, Copy)]
+enum MarkScan<'a> {
+    Terminated {
+        after_term: &'a [u8],
+        param_len: usize,
+    },
+    Abandoned {
+        at_esc: &'a [u8],
+    },
+    Unterminated,
+}
+
+const fn find_mark_terminator(mut k_rest: &[u8]) -> MarkScan<'_> {
+    let mut param_len = 0usize;
+    loop {
+        match k_rest {
+            [] | [0x1b] => return MarkScan::Unterminated,
+            &[0x07, ref after_term @ ..] => {
+                return MarkScan::Terminated {
+                    after_term,
+                    param_len,
+                };
+            }
+            &[0x1b, b'\\', ref after_term @ ..] => {
+                return MarkScan::Terminated {
+                    after_term,
+                    param_len,
+                };
+            }
+            &[0x1b, ..] => {
+                return MarkScan::Abandoned { at_esc: k_rest };
+            }
+            &[_, ref tail @ ..] => {
+                param_len = param_len.saturating_add(1);
+                k_rest = tail;
+            }
+        }
+    }
 }
 
 // Scan `b` for COMPLETE OSC-133/633 marks, appending events at `offset`, and RETURN
@@ -180,84 +232,61 @@ fn scan_marks(
     out: &mut Vec<SessionEvent>,
     integrated: &mut bool,
 ) -> Vec<u8> {
-    let mut i = 0;
-    while let Some(&cur) = b.get(i) {
+    let mut rest = b;
+    while let &[cur, ref after_cur @ ..] = rest {
         if cur != 0x1b {
-            i = i.saturating_add(1);
+            rest = after_cur;
             continue;
         }
         // A lone trailing ESC could begin `\x1b]` on the next record.
-        let Some(&after_esc) = b.get(i.saturating_add(1)) else {
+        let &[after_esc, ref after_intro @ ..] = after_cur else {
             return vec![0x1b];
         };
         if after_esc != b']' {
-            i = i.saturating_add(1);
+            rest = after_cur;
             continue;
         }
-        let code_start = i.saturating_add(2);
-        let code_end = digits_end(b, code_start);
-        let code = b.get(code_start..code_end).unwrap_or(&[]);
-        // The numeric code is still being read at end-of-buffer: carry if it could
-        // yet become 133/633.
-        let Some(&at_code_end) = b.get(code_end) else {
-            return if is_shell_prefix(code)
-                && event_carry_within_bound(b.len().saturating_sub(i) as u64, CARRY_MAX as u64)
-            {
-                b.get(i..).unwrap_or(&[]).to_vec()
-            } else {
-                Vec::new()
-            };
-        };
-        if !matches!(code, b"133" | b"633") || at_code_end != b';' {
-            i = i.saturating_add(1); // some other OSC (e.g. a title) — skip its introducer
-            continue;
-        }
-        let letter_idx = code_end.saturating_add(1);
-        let Some(&letter) = b.get(letter_idx) else {
-            // `\x1b]133;` with no letter yet → carry.
-            return if event_carry_within_bound(b.len().saturating_sub(i) as u64, CARRY_MAX as u64) {
-                b.get(i..).unwrap_or(&[]).to_vec()
-            } else {
-                Vec::new()
-            };
-        };
-        // Collect params up to the terminator (BEL 0x07 or ST ESC \). Any other
-        // ESC begins a new escape, as in the fold's parser: the mark is abandoned
-        // there and the scan resumes AT that ESC, so a later mark is still seen.
-        // An ESC as the last byte may be the first half of a split ST: carry it.
-        let mut k = letter_idx.saturating_add(1);
-        let mut terminated = false;
-        let mut abandoned = false;
-        while let Some(&kb) = b.get(k) {
-            if kb == 0x07 {
-                terminated = true;
-                break;
+        let after_semi = match after_intro {
+            &[b'1', b'3', b'3', b';', ref tail @ ..] | &[b'6', b'3', b'3', b';', ref tail @ ..] => {
+                tail
             }
-            if kb == 0x1b {
-                if let Some(&next_kb) = b.get(k.saturating_add(1)) {
-                    if next_kb == b'\\' {
-                        terminated = true;
+            _ => {
+                if is_shell_prefix(after_intro) {
+                    return if event_carry_within_bound(rest.len() as u64, CARRY_MAX as u64) {
+                        rest.to_vec()
                     } else {
-                        abandoned = true;
-                    }
-                    break;
+                        Vec::new()
+                    };
                 }
+                rest = after_cur;
+                continue;
             }
-            k = k.saturating_add(1);
-        }
-        if abandoned {
-            i = k;
-            continue;
-        }
-        if !terminated {
-            // Unterminated shell mark running off the end → carry it.
-            return if event_carry_within_bound(b.len().saturating_sub(i) as u64, CARRY_MAX as u64) {
-                b.get(i..).unwrap_or(&[]).to_vec()
+        };
+        let &[letter, ref after_letter @ ..] = after_semi else {
+            // `\x1b]133;` with no letter yet → carry.
+            return if event_carry_within_bound(rest.len() as u64, CARRY_MAX as u64) {
+                rest.to_vec()
             } else {
                 Vec::new()
             };
-        }
-        let params = b.get(letter_idx.saturating_add(1)..k).unwrap_or(&[]);
+        };
+        let (after_term, param_len) = match find_mark_terminator(after_letter) {
+            MarkScan::Abandoned { at_esc } => {
+                rest = at_esc;
+                continue;
+            }
+            MarkScan::Unterminated => {
+                return if event_carry_within_bound(rest.len() as u64, CARRY_MAX as u64) {
+                    rest.to_vec()
+                } else {
+                    Vec::new()
+                };
+            }
+            MarkScan::Terminated {
+                after_term,
+                param_len,
+            } => (after_term, param_len),
+        };
         match letter {
             b'A' => {
                 *integrated = true;
@@ -271,7 +300,7 @@ fn scan_marks(
                 *integrated = true;
                 out.push(SessionEvent::CommandEnd {
                     offset,
-                    exit: parse_exit(params),
+                    exit: parse_exit_prefix(after_letter, param_len),
                 });
             }
             // B (input boundary), E (command line), P (property) and any unknown
@@ -282,28 +311,203 @@ fn scan_marks(
             // spec adds -- would permanently blind glyph detection for the session.
             _ => {}
         }
-        let step = if b.get(k) == Some(&0x07) { 1 } else { 2 };
-        i = k.saturating_add(step); // past BEL (1) or ST (2)
+        rest = after_term;
     }
     Vec::new()
 }
 
-// Params look like `;0` / `;127` / `` — parse the exit code after a leading `;`.
-#[expect(
-    clippy::manual_ok_err,
-    reason = "eee18ea spelled `.ok()` as a match for the verified lane; keep its form"
-)]
-fn parse_exit(params: &[u8]) -> Option<i32> {
-    let s = match std::str::from_utf8(params) {
-        Ok(s) => s,
-        Err(_) => return None,
-    };
-    let s = s.strip_prefix(';').unwrap_or(s);
-    // A D-mark may carry `<exit>;<extra>`; take the first field.
-    let field = s.split(';').next().unwrap_or("");
-    match field.trim().parse::<i32>() {
-        Ok(code) => Some(code),
-        Err(_) => None,
+const fn is_valid_utf8_prefix(bytes: &[u8], len: usize) -> bool {
+    if len > bytes.len() {
+        return false;
+    }
+    let mut rem = len;
+    let mut scan = bytes;
+    while rem > 0 {
+        let &[b0, ref tail @ ..] = scan else {
+            return false;
+        };
+        if b0 < 0x80 {
+            rem = rem.saturating_sub(1);
+            scan = tail;
+        } else if b0 >= 0xC2 && b0 <= 0xDF {
+            if rem < 2 {
+                return false;
+            }
+            let &[b1, ref tail2 @ ..] = tail else {
+                return false;
+            };
+            if (b1 & 0xC0) != 0x80 {
+                return false;
+            }
+            rem = rem.saturating_sub(2);
+            scan = tail2;
+        } else if b0 >= 0xE0 && b0 <= 0xEF {
+            if rem < 3 {
+                return false;
+            }
+            let &[b1, b2, ref tail3 @ ..] = tail else {
+                return false;
+            };
+            if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 {
+                return false;
+            }
+            if (b0 == 0xE0 && b1 < 0xA0) || (b0 == 0xED && b1 >= 0xA0) {
+                return false;
+            }
+            rem = rem.saturating_sub(3);
+            scan = tail3;
+        } else if b0 >= 0xF0 && b0 <= 0xF4 {
+            if rem < 4 {
+                return false;
+            }
+            let &[b1, b2, b3, ref tail4 @ ..] = tail else {
+                return false;
+            };
+            if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80 {
+                return false;
+            }
+            if (b0 == 0xF0 && b1 < 0x90) || (b0 == 0xF4 && b1 >= 0x90) {
+                return false;
+            }
+            rem = rem.saturating_sub(4);
+            scan = tail4;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+// Read only the parameter bytes before the OSC terminator. Keep Rust's UTF-8,
+// Unicode whitespace and signed-i32 grammar, including validation of extra fields.
+const fn parse_exit_prefix(params: &[u8], param_len: usize) -> Option<i32> {
+    if param_len == 0 || !is_valid_utf8_prefix(params, param_len) {
+        return None;
+    }
+    let mut rem = param_len;
+    let mut scan = params;
+    let mut first = true;
+    let mut skip = 0u8;
+    let mut phase = 0u8;
+    let mut neg = false;
+    let mut digits = false;
+    let mut acc = 0i64;
+    while let &[b0, ref tail @ ..] = scan {
+        if rem == 0 {
+            break;
+        }
+        rem = rem.saturating_sub(1);
+        if skip > 0 {
+            skip = (skip & 3).wrapping_sub(1);
+            scan = tail;
+            continue;
+        }
+        if first {
+            first = false;
+            if b0 == b';' {
+                scan = tail;
+                continue;
+            }
+        }
+        if b0 == b';' {
+            break;
+        }
+        if matches!(b0, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C) {
+            if phase == 1 {
+                return None;
+            }
+            if phase == 2 {
+                phase = 3;
+            }
+            scan = tail;
+            continue;
+        }
+        if b0 == 0xC2 {
+            if rem >= 1 && matches!(tail, &[0x85 | 0xA0, ..]) {
+                if phase == 1 {
+                    return None;
+                }
+                if phase == 2 {
+                    phase = 3;
+                }
+                skip = 1;
+                scan = tail;
+                continue;
+            }
+            return None;
+        }
+        if matches!(b0, 0xE1..=0xE3) {
+            if rem >= 2 {
+                if let &[b1, b2, ..] = tail {
+                    let is_ws = (b0 == 0xE1 && b1 == 0x9A && b2 == 0x80)
+                        || (b0 == 0xE2
+                            && b1 == 0x80
+                            && ((b2 >= 0x80 && b2 <= 0x8A)
+                                || b2 == 0xA8
+                                || b2 == 0xA9
+                                || b2 == 0xAF))
+                        || (b0 == 0xE2 && b1 == 0x81 && b2 == 0x9F)
+                        || (b0 == 0xE3 && b1 == 0x80 && b2 == 0x80);
+                    if is_ws {
+                        if phase == 1 {
+                            return None;
+                        }
+                        if phase == 2 {
+                            phase = 3;
+                        }
+                        skip = 2;
+                        scan = tail;
+                        continue;
+                    }
+                }
+            }
+            return None;
+        }
+        if phase == 3 {
+            return None;
+        }
+        if phase == 0 && (b0 == b'+' || b0 == b'-') {
+            neg = b0 == b'-';
+            phase = 1;
+            scan = tail;
+            continue;
+        }
+        let d: i64 = match b0 {
+            b'0' => 0,
+            b'1' => 1,
+            b'2' => 2,
+            b'3' => 3,
+            b'4' => 4,
+            b'5' => 5,
+            b'6' => 6,
+            b'7' => 7,
+            b'8' => 8,
+            b'9' => 9,
+            _ => return None,
+        };
+        acc = acc.saturating_mul(10).saturating_add(d);
+        if acc > 2_147_483_648 {
+            return None;
+        }
+        digits = true;
+        phase = 2;
+        scan = tail;
+    }
+    if !digits {
+        return None;
+    }
+    if neg {
+        if acc == 2_147_483_648 {
+            Some(i32::MIN)
+        } else if acc <= 2_147_483_647 {
+            Some(0i32.saturating_sub(acc as i32))
+        } else {
+            None
+        }
+    } else if acc <= 2_147_483_647 {
+        Some(acc as i32)
+    } else {
+        None
     }
 }
 
@@ -323,18 +527,23 @@ fn settle_events(
         return ev;
     }
     let (_, nrows) = screen.dims();
-    let last_nonempty = (0..nrows)
-        .rev()
-        .map(|r| screen.line_text(r))
-        .find(|l| !l.is_empty());
+    let mut last_nonempty = None;
+    let mut r = nrows;
+    while r > 0 {
+        r = r.saturating_sub(1);
+        let l = screen.line_text(r);
+        if !l.is_empty() {
+            last_nonempty = Some(l);
+            break;
+        }
+    }
     if let Some(line) = last_nonempty {
         let tail = line.trim_end();
-        if profile
-            .prompt_markers
-            .iter()
-            .any(|m| tail.ends_with(m.trim_end()))
-        {
-            ev.push(SessionEvent::PromptReady { offset: q });
+        for m in &profile.prompt_markers {
+            if tail.ends_with(m.trim_end()) {
+                ev.push(SessionEvent::PromptReady { offset: q });
+                break;
+            }
         }
     }
     ev
@@ -489,7 +698,7 @@ impl EventClassifier {
     /// mark, never from a glyph. A `B`/`E`/`P` or unknown letter leaves this
     /// `false`: it carries no prompt/command lifecycle.
     #[must_use]
-    pub fn integrated(&self) -> bool {
+    pub const fn integrated(&self) -> bool {
         self.integrated
     }
 }

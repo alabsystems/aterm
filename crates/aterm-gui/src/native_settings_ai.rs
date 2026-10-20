@@ -214,7 +214,7 @@ pub(super) fn ai_page(
         return ai_choice_page(state, width, cx);
     }
     let gap = settings_page_gap(state, width, viewport);
-    let maximum = page_maximum(SettingsRoute::Ai, width);
+    let maximum = PageLayout::Form.maximum(width);
     let page_width = settings_page_content_width(viewport.width, width, maximum);
     let (heading, heading_height) = pinned_heading(
         width,
@@ -333,7 +333,7 @@ fn ai_cards(
 }
 
 /// The THIS MACHINE card's rows, each the way every page draws a setting
-/// ([`page_setting_rows_noted`]): its note, and the fleet's word where the
+/// ([`page_box_setting_rows`]): its note, and the fleet's word where the
 /// preferred CLI came from the fleet document.
 fn machine_rows(
     state: &SettingsViewState,
@@ -342,25 +342,34 @@ fn machine_rows(
     inner: f32,
     row_room: f32,
 ) -> Vec<(UiNode, f32)> {
-    MACHINE_ROWS
+    let notes: Vec<Option<String>> = MACHINE_ROWS
         .iter()
-        .flat_map(|key| {
+        .map(|key| {
             let note = prefs::footnote_of(key).map(str::to_string);
-            let note = if *key == prefs::EDIT_AI_PREFERRED && ai.preferred_from_fleet {
+            if *key == prefs::EDIT_AI_PREFERRED && ai.preferred_from_fleet {
                 Some(match note {
                     Some(note) => format!("{FROM_FLEET} {note}"),
                     None => FROM_FLEET.to_string(),
                 })
             } else {
                 note
-            };
-            page_setting_rows_noted(state, key, width, inner, note.as_deref(), row_room)
+            }
         })
-        .collect()
+        .collect();
+    let rows: Vec<(&str, Option<prefs::RowNote<'_>>)> = MACHINE_ROWS
+        .iter()
+        .copied()
+        .zip(
+            notes
+                .iter()
+                .map(|note| note.as_deref().map(prefs::RowNote::Own)),
+        )
+        .collect();
+    page_box_setting_rows(state, &rows, width, inner, None, Some(row_room))
 }
 
 /// A card's setting rows, each the way every page draws a setting, with its
-/// own note.
+/// note ([`prefs::row_notes`]), as one box ([`page_box_setting_rows`]).
 fn setting_rows(
     state: &SettingsViewState,
     keys: &[&str],
@@ -368,18 +377,15 @@ fn setting_rows(
     inner: f32,
     row_room: f32,
 ) -> Vec<(UiNode, f32)> {
-    keys.iter()
-        .flat_map(|key| {
-            let note = prefs::footnote_of(key);
-            page_setting_rows_noted(state, key, width, inner, note, row_room)
-        })
-        .collect()
+    let rows: Vec<(&str, Option<prefs::RowNote<'_>>)> =
+        keys.iter().copied().zip(prefs::row_notes(keys)).collect();
+    page_box_setting_rows(state, &rows, width, inner, None, Some(row_room))
 }
 
 /// The AI CLIS card's rows: who needs you, then for each CLI its status row
 /// and its "Use on this machine" switch. The switches' shared note is drawn
-/// once, under the last of them; a switch whose value came from the fleet
-/// document says so.
+/// once, after the last of them ([`prefs::RowNote::Shared`]); a switch whose
+/// value came from the fleet document says so in its own row.
 fn cli_rows(
     state: &SettingsViewState,
     ai: &AiProjection,
@@ -389,23 +395,55 @@ fn cli_rows(
 ) -> Vec<(UiNode, f32)> {
     let mut rows = vec![quiet_line("ai/clis/health", &ai.health, inner)];
     let last = ai.clis.len().saturating_sub(1);
-    for (index, row) in ai.clis.iter().enumerate() {
+    let keys: Vec<String> = ai
+        .clis
+        .iter()
+        .map(|row| format!("ai.{}.use", row.id))
+        .collect();
+    // A switch's own note: that its value came from the fleet document, and
+    // the switches' note where it is the only one.
+    let own: Vec<Option<String>> = ai
+        .clis
+        .iter()
+        .map(|row| {
+            let words: Vec<&str> = [
+                row.use_from_fleet.then_some(FROM_FLEET),
+                (last == 0).then_some(prefs::AI_USE_NOTE),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            (!words.is_empty()).then(|| words.join(" "))
+        })
+        .collect();
+    // The switches are one box under their status rows: their facts are
+    // placed alike ([`place_box_facts`]).
+    let switches: Vec<(&str, Option<prefs::RowNote<'_>>)> = keys
+        .iter()
+        .map(String::as_str)
+        .zip(
+            own.iter()
+                .map(|note| note.as_deref().map(prefs::RowNote::Own)),
+        )
+        .collect();
+    let mut placed = page_finished_rows(state, &switches, width, inner, None);
+    place_box_facts(&mut placed);
+    // Two switches or more share their note, after the last of them.
+    if last > 0
+        && let Some(closing) = placed.last_mut()
+    {
+        closing.shared_note = Some(prefs::AI_USE_NOTE.to_string());
+    }
+    let mut placed = placed.into_iter().peekable();
+    for (row, key) in ai.clis.iter().zip(&keys) {
         rows.push(cli_status_row(row, width, inner));
-        let key = format!("ai.{}.use", row.id);
-        let shared = (index == last).then_some(prefs::AI_USE_NOTE);
-        let note = match (row.use_from_fleet, shared) {
-            (true, Some(shared)) => Some(format!("{FROM_FLEET} {shared}")),
-            (true, None) => Some(FROM_FLEET.to_string()),
-            (false, shared) => shared.map(str::to_string),
-        };
-        rows.extend(page_setting_rows_noted(
-            state,
-            &key,
-            width,
-            inner,
-            note.as_deref(),
-            row_room,
-        ));
+        if placed
+            .peek()
+            .is_some_and(|switch| switch.key == key.as_str())
+        {
+            let switch = placed.next().expect("peeked");
+            rows.extend(finished_row_stops(&switch, Some(row_room)));
+        }
     }
     rows
 }
@@ -624,7 +662,9 @@ fn fleet_actions(ai: &AiProjection, card_width: f32) -> (UiNode, f32) {
         AI_FLEET_FETCH,
         UiContent::Button(
             Control::new(
-                ButtonSpec::new("Fetch the fleet document now").visual_label(label),
+                ButtonSpec::new("Fetch now")
+                    .visual_label(label)
+                    .description("Fetches the fleet document now"),
                 ActionId::new(AI_FLEET_FETCH),
             )
             .state(ControlState {

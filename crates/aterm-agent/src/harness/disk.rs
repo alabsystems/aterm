@@ -143,11 +143,12 @@
 //!
 //! # The one timer in the design, and why it is here
 //!
-//! §5.5 keeps a 6 h tick, and §4.2 row 18 says why: a free-space figure has
-//! no event to hang on — nothing in aterm or the vendor announces "a gigabyte
+//! §5.5 keeps a tick, and §4.2 row 18 says why: a free-space figure has no
+//! event to hang on — nothing in aterm or the vendor announces "a gigabyte
 //! left". That tick belongs to the HOST that calls [`report`]; there is no
 //! sleep, no loop and no cadence in this file. The window's harness host
-//! (`aterm-gui` `harness_host.rs`) keeps it, and hands each tick to
+//! (`aterm-gui` `harness_host.rs`) keeps it — a look every minute since the
+//! disk filled twice on 2026-10-16 (it was six hours) — and hands each pass to
 //! [`super::cli::disk_tick`] ([`Trigger::Tick`]).
 //!
 //! # Every removal is journalled before and after
@@ -168,7 +169,8 @@
 //! profile recent: the oldest unlocked one goes first, the pass stops once
 //! free space is back, a locked or just-built one is never taken, and a
 //! re-measure that never rises stops it once the counted bytes cover what
-//! was short). The re-measure is the host's `statvfs` (the verb's `df`). A
+//! was short). The re-measure is one `statfs`/`statvfs` on the mount point
+//! ([`volume_of`]), the watch's and the verb's alike. A
 //! drill on a scratch APFS volume saw each unlink there at once and the
 //! pass stop `by=measured`;
 //! with the caches made clones of a kept file it stopped `by=counted`. A
@@ -246,6 +248,14 @@ pub const WARN_FREE_SHARE_MAX_GIB: u64 = 64;
 /// emergency line to.
 pub const EMERGENCY_FREE_SHARE_MAX_GIB: u64 = 8;
 
+/// An UNWRITTEN `warn_free_gib` is held to at most this percent of the
+/// volume ([`Config::on_volume`]): a fixed 40 GiB is a third of a 128 GB disk.
+pub const SMALL_WARN_MAX_PCT: u64 = 20;
+
+/// An UNWRITTEN `auto_free_gib` is held to at most this percent of the
+/// volume ([`Config::on_volume`]).
+pub const SMALL_FLOOR_MAX_PCT: u64 = 10;
+
 /// THE EMERGENCY: below the larger of this many GiB and
 /// [`EMERGENCY_FREE_PCT`] of the volume ([`Thresholds::emergency`]), or with
 /// fewer than [`EMERGENCY_FILES_FREE`] inodes, writes are about to fail with
@@ -281,7 +291,22 @@ pub mod reserve;
 #[path = "disk_poke.rs"]
 pub mod poke;
 
+#[path = "disk_room.rs"]
+pub mod room;
+
+#[path = "disk_idle.rs"]
+pub mod idle;
+
+#[path = "disk_beat.rs"]
+pub mod beat;
+
 pub use target::{CARGO_LOCKS, INCREMENTAL, Judge, PRESSURE_MIN_IDLE_S, Profile, TargetDir};
+
+/// `disk.idle_build_dirs`: tier 3 is ON (design §8, stage 7), turned on once
+/// the live lane (`targo --unverified lab disk-lane`) passed with it on and
+/// what it would free here was measured report-only. `false` lists its rows
+/// report-only (`removable=false`).
+pub const DEFAULT_IDLE_BUILD_DIRS: bool = true;
 
 /// The most bytes of any quoted path or reason one ledger row may carry.
 pub const ROW_TEXT_CAP: usize = 512;
@@ -433,9 +458,20 @@ pub struct Config {
     /// Below this many free GiB the host's tick applies [`auto_plan`]; `0`
     /// is off ([`DEFAULT_AUTO_FREE_GIB`]).
     pub auto_free_gib: u64,
-    /// Below the floor, may a build directory whose owner is gone go whole
-    /// ([`DEFAULT_DEAD_BUILD_DIRS`])?
+    /// Once the volume is low, may a build directory whose owner is gone go
+    /// whole ([`DEFAULT_DEAD_BUILD_DIRS`], tier 1)?
     pub dead_build_dirs: bool,
+    /// `disk.room_gib`: the room PINNED, read as written (`None`: the watch's
+    /// measured room, [`room`]). A line knob, not a removal knob: a value of
+    /// it aterm cannot read falls back to the measured room.
+    pub room_gib: Option<u64>,
+    /// `disk.idle_build_dirs`: may tier 3 empty a live checkout's WHOLE idle
+    /// build directory ([`Witness::IdleWhole`], [`DEFAULT_IDLE_BUILD_DIRS`])?
+    /// Off, its rows are listed, report-only.
+    pub idle_build_dirs: bool,
+    /// `disk.idle_build_days`: tier 3's window ([`idle::DEFAULT_IDLE_BUILD_DAYS`]);
+    /// below one turns tier 3 off (`0` must not make every checkout idle).
+    pub idle_build_days: i64,
 }
 
 impl Default for Config {
@@ -446,6 +482,9 @@ impl Default for Config {
             apply: DEFAULT_APPLY,
             auto_free_gib: DEFAULT_AUTO_FREE_GIB,
             dead_build_dirs: DEFAULT_DEAD_BUILD_DIRS,
+            room_gib: None,
+            idle_build_dirs: DEFAULT_IDLE_BUILD_DIRS,
+            idle_build_days: idle::DEFAULT_IDLE_BUILD_DAYS,
         }
     }
 }
@@ -459,6 +498,9 @@ pub const KEYS: &[&str] = &[
     "target_stale_days",
     "auto_free_gib",
     "dead_build_dirs",
+    "room_gib",
+    "idle_build_dirs",
+    "idle_build_days",
 ];
 
 impl Config {
@@ -473,6 +515,11 @@ impl Config {
             "target_stale_days" => d.target_stale_days.to_string(),
             "auto_free_gib" => format!("{} (0: off)", d.auto_free_gib),
             "dead_build_dirs" => d.dead_build_dirs.to_string(),
+            "room_gib" => {
+                "unset (measured: the second-largest daily two-hour fall of the week)".to_owned()
+            }
+            "idle_build_dirs" => d.idle_build_dirs.to_string(),
+            "idle_build_days" => format!("{} (below 1: tier 3 off)", d.idle_build_days),
             _ => return None,
         })
     }
@@ -489,8 +536,16 @@ impl Config {
             "auto_free_gib" => "0: the automatic removal is off".to_owned(),
             "warn_free_gib" => format!("the default, {}", d.warn_free_gib),
             "target_stale_days" => format!("the default, {}", d.target_stale_days),
+            "idle_build_days" => "below 1: tier 3 is off".to_owned(),
             _ => return None,
         })
+    }
+
+    /// Whether tier 3 ([`Witness::IdleWhole`]) may remove: `disk.idle_build_dirs`
+    /// on and `disk.idle_build_days` at least one, the automatic removal on.
+    #[must_use]
+    pub fn idle_whole_on(&self) -> bool {
+        self.idle_build_dirs && self.idle_build_days >= 1 && self.auto_free_gib > 0
     }
 
     /// Whether `free` bytes is below the automatic floor. An unknown figure
@@ -498,6 +553,28 @@ impl Config {
     #[must_use]
     pub fn below_auto_floor(&self, free: Option<u64>) -> bool {
         self.auto_free_gib > 0 && free.is_some_and(|f| f < self.auto_free_gib.saturating_mul(GIB))
+    }
+
+    /// Whether `free` bytes is below the warning: the volume is `low` (or
+    /// worse) and tiers 1 and 2 run ([`pass_plan`]). An unknown figure never
+    /// is.
+    #[must_use]
+    pub fn below_warn(&self, free: Option<u64>) -> bool {
+        free.is_some_and(|f| f < self.warn_free_gib.saturating_mul(GIB))
+    }
+
+    /// The free bytes the idle tiers (2 and 3) reclaim up to ([`pass_plan`]):
+    /// the warning, and below the floor never less than where the recent tier
+    /// stops ([`Self::pressure_target_bytes`]), so no recent cache goes while
+    /// an idle one is left.
+    #[must_use]
+    pub fn idle_target_bytes(&self, short: bool) -> u64 {
+        let warn = self.warn_free_gib.saturating_mul(GIB);
+        if short {
+            warn.max(self.pressure_target_bytes())
+        } else {
+            warn
+        }
     }
 
     /// The free bytes the pressure pass reclaims up to before it stops: the
@@ -523,23 +600,70 @@ impl Config {
     /// larger of the knob and the share. A value the owner WROTE is read as
     /// written ([`Written`]); a floor of `0`, off, stays off. An unknown size
     /// changes nothing.
+    ///
+    /// ON A SMALL VOLUME an UNWRITTEN fixed default is first held to a share
+    /// of it ([`SMALL_WARN_MAX_PCT`], [`SMALL_FLOOR_MAX_PCT`], never below one
+    /// GiB): the 40 GiB warning is 34 % of a 128 GB disk, which read `low` for
+    /// good (design `docs/DESIGN-disk-awareness-2026-10-17.md` §2.4). The hold
+    /// only lowers a line, so it only ever removes less.
     #[must_use]
     pub fn on_volume(self, total: Option<u64>, written: Written) -> Config {
+        self.on_volume_with(total, written, None)
+    }
+
+    /// [`Self::on_volume`], the lines raised to this machine's ROOM (`room`
+    /// bytes, [`room`]; `disk.room_gib` pins it, read as written): an
+    /// UNWRITTEN warning at least twice the room, an unwritten floor at least
+    /// the room, each never below the line [`Self::on_volume`] gives (design
+    /// §2.4). With no room (none measured, no size) the lines are
+    /// [`Self::on_volume`]'s, so a lost history never removes more. A written
+    /// knob is read as written, and a floor of `0`, off, stays off.
+    #[must_use]
+    pub fn on_volume_with(self, total: Option<u64>, written: Written, room: Option<u64>) -> Config {
+        let base = self.on_volume_base(total, written);
+        let Some(room) = self.room_gib.map(|g| g.saturating_mul(GIB)).or(room) else {
+            return base;
+        };
+        if total.is_none() {
+            return base;
+        }
+        let room_gib = room.div_ceil(GIB);
+        Config {
+            warn_free_gib: if written.warn_free_gib {
+                base.warn_free_gib
+            } else {
+                base.warn_free_gib.max(room_gib.saturating_mul(2))
+            },
+            auto_free_gib: if base.auto_free_gib == 0 || written.auto_free_gib {
+                base.auto_free_gib
+            } else {
+                base.auto_free_gib.max(room_gib)
+            },
+            ..base
+        }
+    }
+
+    /// [`Self::on_volume`]'s lines: the knob or the volume's share, the
+    /// small-volume hold first.
+    fn on_volume_base(self, total: Option<u64>, written: Written) -> Config {
         let Some(total) = total else {
             return self;
         };
         let share = |pct: u64, max: u64| (total / 100).saturating_mul(pct).div_ceil(GIB).min(max);
+        // At most `pct` of the volume, in whole GiB rounded down, and never
+        // below one: a hold must not turn a floor that is on into `0`, off.
+        let held = |knob: u64, pct: u64| knob.min((total.saturating_mul(pct) / 100 / GIB).max(1));
         Config {
             warn_free_gib: if written.warn_free_gib {
                 self.warn_free_gib
             } else {
-                self.warn_free_gib
+                held(self.warn_free_gib, SMALL_WARN_MAX_PCT)
                     .max(share(WARN_FREE_PCT, WARN_FREE_SHARE_MAX_GIB))
             },
             auto_free_gib: if self.auto_free_gib == 0 || written.auto_free_gib {
                 self.auto_free_gib
             } else {
-                self.auto_free_gib
+                held(self.auto_free_gib, SMALL_FLOOR_MAX_PCT)
                     .max(share(AUTO_FREE_PCT, AUTO_FREE_SHARE_MAX_GIB))
             },
             ..self
@@ -560,7 +684,19 @@ impl Config {
     /// floor that is on: below the emergency the pass must be able to run.
     #[must_use]
     pub fn thresholds_on(self, total: Option<u64>, written: Written) -> Thresholds {
-        let c = self.on_volume(total, written);
+        self.thresholds_with(total, written, None)
+    }
+
+    /// [`Self::thresholds_on`], the lines raised to the volume's room
+    /// ([`Self::on_volume_with`]).
+    #[must_use]
+    pub fn thresholds_with(
+        self,
+        total: Option<u64>,
+        written: Written,
+        room: Option<u64>,
+    ) -> Thresholds {
+        let c = self.on_volume_with(total, written, room);
         let pct = |p: u64| total.map_or(0, |t| (t / 100).saturating_mul(p));
         let floor = c.auto_free_gib.saturating_mul(GIB);
         let emergency = EMERGENCY_FREE_GIB
@@ -755,6 +891,18 @@ pub struct Survey {
     /// What the search for build directories could not finish
     /// ([`discover::Discovered::notes`]).
     pub notes: Vec<String>,
+    /// The volume's ROOM, when one was read ([`room`]): what one round of
+    /// this machine's builds takes. The lines in force already read it
+    /// ([`Config::on_volume_with`]); this is the figure reported.
+    pub room: Option<u64>,
+    /// The mount table read for this survey ([`aterm_sysprobe::volumes::table`]):
+    /// a whole removal needs it read whole and no mount point inside the
+    /// directory ([`whole_fences`]). `None`: not read, and nothing goes whole.
+    pub mounts: Option<aterm_sysprobe::volumes::Table>,
+    /// The free bytes an agent's wait needs and the pass adopted (a DEMAND,
+    /// `await sys free>=`): tiers 1-3 then run until free space is the need
+    /// plus the floor, at any measured level ([`pass_plan`]); never tier 4.
+    pub demand: Option<u64>,
 }
 
 impl Survey {
@@ -776,6 +924,9 @@ impl Survey {
             purge_available: false,
             home: None,
             notes: Vec::new(),
+            room: None,
+            mounts: None,
+            demand: None,
         }
     }
 }
@@ -826,10 +977,12 @@ pub enum Witness {
         /// any other.
         device: u64,
     },
-    /// Below the floor, a WHOLE build directory whose owner is gone (a Claude
-    /// Code session no running process names), every profile unwritten for
-    /// the quiet window, none locked
-    /// (the module docs; [`target::reclaim_whole`]). The row's path is the
+    /// Once the volume is low, a WHOLE build directory whose owner is gone (a
+    /// Claude Code session no running process names, a removed workspace's
+    /// build cache), every profile unwritten for the quiet window, none
+    /// locked, no mount point inside it and nothing of another user's in it
+    /// (the module docs; [`target::reclaim_whole`]). Tier 1: nobody builds
+    /// there again, so it goes first and takes all. The row's path is the
     /// build directory's.
     OwnerGone {
         /// Its marker: a signed `CACHEDIR.TAG`, the mark of a cache.
@@ -848,6 +1001,26 @@ pub enum Witness {
         floor_gib: u64,
         /// The free GiB the pass stops at.
         until_gib: u64,
+        /// The device measured.
+        device: u64,
+    },
+    /// Below the floor (or for a demand), a live checkout's WHOLE idle build
+    /// directory, its profiles EMPTIED under their locks and kept as empty
+    /// directories with their lock files (tier 3, [`idle`],
+    /// [`target::reclaim_profiles`]). The row's path is the build directory's.
+    IdleWhole {
+        /// Its marker: a signed `CACHEDIR.TAG`.
+        marker: String,
+        /// The checkout judged quiet (its working tree, git files, processes).
+        checkout: PathBuf,
+        /// How many profiles it holds.
+        profiles: usize,
+        /// The newest last use of its profiles (unix seconds).
+        last_used: i64,
+        /// Seconds since then, at the survey.
+        age_s: i64,
+        /// The idle window it cleared, in days (`disk.idle_build_days`).
+        window_days: i64,
         /// The device measured.
         device: u64,
     },
@@ -905,8 +1078,21 @@ impl Witness {
                 until_gib,
                 ..
             } => format!(
-                "{marker} present (a cache by its own mark); {evidence}; no build holding its locks, every profile unwritten for {} — free space is under the {floor_gib} GiB floor, so the whole build directory goes, before any live checkout's cache, until {until_gib} GiB are free",
+                "{marker} present (a cache by its own mark); {evidence}; no build holding its locks, every profile unwritten for {}, no mount point and nothing of another user's inside — free space is under the {floor_gib} GiB line and nobody builds there again, so the whole build directory goes first (until {until_gib} GiB are free is no stop for it: it costs nobody anything)",
                 target::human_age(*age_s)
+            ),
+            Witness::IdleWhole {
+                marker,
+                checkout,
+                profiles,
+                age_s,
+                window_days,
+                ..
+            } => format!(
+                "{marker} present; every one of its {profiles} profile{} unwritten for {} (the {window_days}d window), its checkout {} quiet as long (no session or process in it, its git files and working tree unwritten), nothing installed pointing into it — tier 3 empties each profile under its locks and keeps the directory, its lock files and everything at its root that is not a profile (costs a full rebuild)",
+                if *profiles == 1 { "" } else { "s" },
+                target::human_age(*age_s),
+                checkout.display()
             ),
             Witness::NotLinkTarget { live } => {
                 format!("not the live symlink target {}", live.display())
@@ -925,10 +1111,40 @@ impl Witness {
             Witness::StaleBuildDir { .. } => "stale-build-dir",
             Witness::LeastRecentlyUsed { .. } => "least-recently-used",
             Witness::OwnerGone { .. } => "owner-gone",
+            Witness::IdleWhole { .. } => "idle-whole",
             Witness::NotLinkTarget { .. } => "not-link-target",
             Witness::Superseded { .. } => "superseded",
             Witness::VendorReports { .. } => "vendor-reports",
         }
+    }
+}
+
+/// THE TIERS of the automatic pass, cheapest to the owner first (design
+/// `docs/DESIGN-disk-awareness-2026-10-17.md` §4.1): each a kind of
+/// [`Class::CargoTargets`] row, admitted at a measured level and stopped at
+/// its own target ([`pass_plan`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Tier {
+    /// Ended owners' build directories, whole ([`Witness::OwnerGone`]):
+    /// nobody builds there again. From `low`; takes all.
+    EndedOwners = 1,
+    /// Idle profiles' `incremental/` ([`Witness::StaleBuildDir`]). From
+    /// `low`, to the idle target.
+    IdleIncremental = 2,
+    /// Whole idle build directories of live checkouts, their profiles
+    /// emptied. From `short`, or a demand.
+    IdleWhole = 3,
+    /// Recent profiles' `incremental/`, least recently used first
+    /// ([`Witness::LeastRecentlyUsed`]). Only at a measured `short`, never
+    /// for a demand.
+    RecentIncremental = 4,
+}
+
+impl Tier {
+    /// Its number, as a row's `tier=` and the journal spell it.
+    #[must_use]
+    pub fn number(self) -> u8 {
+        self as u8
     }
 }
 
@@ -958,6 +1174,22 @@ pub struct Row {
 }
 
 impl Row {
+    /// The tier of the automatic pass that would take it ([`Tier`]); `None`
+    /// for a row of another class.
+    #[must_use]
+    pub fn tier(&self) -> Option<Tier> {
+        if self.class != Class::CargoTargets {
+            return None;
+        }
+        match self.witness {
+            Witness::OwnerGone { .. } => Some(Tier::EndedOwners),
+            Witness::StaleBuildDir { .. } => Some(Tier::IdleIncremental),
+            Witness::IdleWhole { .. } => Some(Tier::IdleWhole),
+            Witness::LeastRecentlyUsed { .. } => Some(Tier::RecentIncremental),
+            _ => None,
+        }
+    }
+
     /// The text-report line.
     #[must_use]
     pub fn line(&self) -> String {
@@ -967,8 +1199,11 @@ impl Row {
             Some(why) => format!("blocked: {why}"),
             None => "removable".to_owned(),
         };
+        let tier = self
+            .tier()
+            .map_or_else(String::new, |t| format!(" tier={}", t.number()));
         format!(
-            "{:<22} {size}{partial:<1} {} — {} [{state}]",
+            "{:<22} {size}{partial:<1} {}{tier} — {} [{state}]",
             self.class.as_str(),
             self.path.display(),
             self.witness.describe()
@@ -1004,6 +1239,10 @@ pub struct Report {
     pub home: Option<PathBuf>,
     /// The config that produced it.
     pub config: Config,
+    /// The volume's room ([`Survey::room`]).
+    pub room: Option<u64>,
+    /// The demand the pass adopted ([`Survey::demand`]).
+    pub demand: Option<u64>,
 }
 
 /// One build directory — or an x.py checkout's whole `build/` — holding
@@ -1107,7 +1346,19 @@ impl Report {
     pub fn reclaimable_total(&self) -> u64 {
         self.rows
             .iter()
-            .filter(|r| r.removable && !is_pressure(r))
+            .filter(|r| r.removable && !is_pressure(r) && r.tier() != Some(Tier::IdleWhole))
+            .fold(0u64, |a, r| a.saturating_add(r.bytes))
+    }
+
+    /// Bytes tier 3 would free if it emptied every whole idle build directory
+    /// it lists, removable or not (report-only while `disk.idle_build_dirs` is
+    /// off): an upper bound, counted apart since those directories' idle
+    /// caches are tier 2's rows too.
+    #[must_use]
+    pub fn idle_whole_up_to(&self) -> u64 {
+        self.rows
+            .iter()
+            .filter(|r| r.tier() == Some(Tier::IdleWhole))
             .fold(0u64, |a, r| a.saturating_add(r.bytes))
     }
 
@@ -1131,14 +1382,16 @@ impl Report {
             None => "unknown".to_owned(),
         };
         format!(
-            "OK schema=1 kind=disk root={} free={free} warn_below={} state={} trigger={} rows={} reclaimable={} under_pressure_up_to={} apply={}",
+            "OK schema=1 kind=disk root={} free={free} warn_below={} room={} state={} trigger={} rows={} reclaimable={} under_pressure_up_to={} idle_whole_up_to={} apply={}",
             self.root.display(),
             human_bytes(self.warn_free_bytes),
+            self.room.map_or_else(|| "unknown".to_owned(), human_bytes),
             if self.warn { "low" } else { "ok" },
             self.trigger.as_str(),
             self.rows.len(),
             human_bytes(self.reclaimable_total()),
             human_bytes(self.reclaimable_under_pressure()),
+            human_bytes(self.idle_whole_up_to()),
             if self.config.apply { "allowed" } else { "off" },
         )
     }
@@ -1167,6 +1420,10 @@ impl Report {
             Value::from(self.warn_free_bytes),
         );
         o.insert("warn".to_owned(), Value::from(self.warn));
+        o.insert(
+            "room_bytes".to_owned(),
+            self.room.map_or(Value::Null, Value::from),
+        );
         o.insert("apply_allowed".to_owned(), Value::from(self.config.apply));
         o.insert(
             "reclaimable_bytes".to_owned(),
@@ -1175,6 +1432,10 @@ impl Report {
         o.insert(
             "reclaimable_under_pressure_up_to_bytes".to_owned(),
             Value::from(self.reclaimable_under_pressure()),
+        );
+        o.insert(
+            "idle_whole_up_to_bytes".to_owned(),
+            Value::from(self.idle_whole_up_to()),
         );
         o.insert(
             "rows".to_owned(),
@@ -1230,8 +1491,12 @@ fn row_value(r: &Row) -> Value {
         Value::from(truncate_bytes(&r.witness.describe(), ROW_TEXT_CAP).to_owned()),
     );
     o.insert("removable".to_owned(), Value::from(r.removable));
-    if let Witness::LeastRecentlyUsed { last_used, .. } | Witness::OwnerGone { last_used, .. } =
-        &r.witness
+    if let Some(tier) = r.tier() {
+        o.insert("tier".to_owned(), Value::from(u64::from(tier.number())));
+    }
+    if let Witness::LeastRecentlyUsed { last_used, .. }
+    | Witness::OwnerGone { last_used, .. }
+    | Witness::IdleWhole { last_used, .. } = &r.witness
     {
         o.insert("last_used".to_owned(), Value::from(rfc3339_utc(*last_used)));
     }
@@ -1270,6 +1535,10 @@ pub fn report(survey: &Survey, config: Config) -> Report {
     let mut notes: Vec<String> = Vec::new();
 
     // -- atpkg-gc: superseded package builds, delegated -------------------
+    // Only what atpkg's retention would take ([`gc_retains`]): `aterm pkg gc`
+    // keeps the live build AND its rollback target, so a row naming the
+    // rollback would point at bytes the delegate never frees (measured
+    // 2026-10-17: eight rows of 3.6 GiB, and `aterm pkg gc` reclaimed nothing).
     let d = Delegate::AtermPkgGc;
     for b in survey.store.iter().take(MAX_ROWS_PER_CLASS) {
         let Some(live) = survey.live_builds.get(&b.program) else {
@@ -1279,7 +1548,7 @@ pub fn report(survey: &Survey, config: Config) -> Report {
             ));
             continue;
         };
-        if live == &b.build {
+        if gc_retains(&survey.store, &b.program, live, &b.build) {
             continue;
         }
         rows.push(Row {
@@ -1417,6 +1686,7 @@ pub fn report(survey: &Survey, config: Config) -> Report {
         }
     }
     pressure_rows(survey, config, &whole, &mut rows, &mut notes);
+    idle_whole_rows(survey, config, &mut rows, &mut notes);
     notes.extend(survey.notes.iter().cloned());
 
     // -- claude-purge: surfaced, delegated --------------------------------
@@ -1462,7 +1732,81 @@ pub fn report(survey: &Survey, config: Config) -> Report {
         hogs,
         home: survey.home.clone(),
         config,
+        room: survey.room,
+        demand: survey.demand,
     }
+}
+
+/// Tier 3's rows ([`Witness::IdleWhole`]): each build directory the survey
+/// assessed whole and found idle ([`idle::assess`]), removable only while
+/// `disk.idle_build_dirs` is on (report-only before: what it would free here
+/// is measured first), and a note for each it keeps and why.
+fn idle_whole_rows(survey: &Survey, config: Config, rows: &mut Vec<Row>, notes: &mut Vec<String>) {
+    for t in survey.targets.iter().take(MAX_TARGETS) {
+        match &t.idle {
+            None => {}
+            Some(Err(why)) => notes.push(format!(
+                "cargo-targets: {} — tier 3 keeps it whole: {why}",
+                t.path.display()
+            )),
+            Some(Ok(facts)) => {
+                let Some(device) = survey.volume_device else {
+                    continue;
+                };
+                let blocked = (!config.idle_whole_on()).then(|| {
+                    if config.idle_build_days < 1 {
+                        "`[disk] idle_build_days` is below 1, which turns tier 3 off".to_owned()
+                    } else if !config.idle_build_dirs {
+                        "`[disk] idle_build_dirs` is off: tier 3 is report-only until it is on"
+                            .to_owned()
+                    } else {
+                        "the automatic removal is off".to_owned()
+                    }
+                });
+                rows.push(Row {
+                    class: Class::CargoTargets,
+                    path: t.path.clone(),
+                    bytes: facts.bytes.0,
+                    bytes_partial: facts.bytes.1,
+                    witness: Witness::IdleWhole {
+                        marker: "CACHEDIR.TAG".to_owned(),
+                        checkout: facts.checkout.clone(),
+                        profiles: facts.profiles,
+                        last_used: facts.last_used,
+                        age_s: survey.now.saturating_sub(facts.last_used),
+                        window_days: config.idle_build_days,
+                        device,
+                    },
+                    removable: blocked.is_none(),
+                    blocked,
+                });
+            }
+        }
+    }
+}
+
+/// Does atpkg's retention keep `build` of `program`, whose live build is
+/// `live` ([`atpkg::gc::reclaimable`]'s rule: the live build, and the newest
+/// installed build below it, the one `aterm pkg rollback` lands on)? A build
+/// whose name is not a build number is kept: the store names every installed
+/// build by one, so such a tree is not one atpkg would collect either. The
+/// rule here may keep MORE than atpkg (it cannot read whether a rollback may
+/// land on that build, which atpkg reads from the channel), never less, so no
+/// row names bytes `aterm pkg gc` will not free.
+fn gc_retains(store: &[StoreBuild], program: &str, live: &str, build: &str) -> bool {
+    if build == live {
+        return true;
+    }
+    let (Ok(live), Ok(build)) = (live.parse::<u64>(), build.parse::<u64>()) else {
+        return true;
+    };
+    let rollback = store
+        .iter()
+        .filter(|b| b.program == program)
+        .filter_map(|b| b.build.parse::<u64>().ok())
+        .filter(|b| *b < live)
+        .max();
+    rollback == Some(build)
 }
 
 /// Below the floor, with `disk.dead_build_dirs` on, the verdict on taking
@@ -1481,9 +1825,13 @@ fn whole_verdict(
     let discover::Owned::Gone { evidence, owner } = &t.owned else {
         return None;
     };
-    if !config.dead_build_dirs || !config.below_auto_floor(survey.free_bytes) {
+    // Tier 1 runs from `low` (or for a demand), and only while the automatic
+    // removal is on.
+    let low = config.below_warn(survey.free_bytes) || survey.demand.is_some();
+    if !config.dead_build_dirs || config.auto_free_gib == 0 || !low {
         return None;
     }
+    let short = config.below_auto_floor(survey.free_bytes);
     let device = survey.volume_device?;
     Some((|| {
         let marker = t.fences()?;
@@ -1492,6 +1840,7 @@ fn whole_verdict(
                 "only a signed CACHEDIR.TAG lets a whole build directory go, and it carries {marker}"
             ));
         }
+        whole_fences(t, survey.mounts.as_ref())?;
         if t.device != Some(device) {
             return Err(
                 "it is on another volume than the one measured — removing it frees nothing there"
@@ -1521,7 +1870,7 @@ fn whole_verdict(
             newest = newest.max(m);
         }
         let age_s = survey.now.saturating_sub(newest);
-        let quiet_s = owner.quiet_s(config.quiet_s());
+        let quiet_s = owner.quiet_s(config.quiet_s(), short);
         if age_s < quiet_s {
             return Err(format!(
                 "a profile was written into {} ago, inside the {} quiet window",
@@ -1539,17 +1888,70 @@ fn whole_verdict(
             last_used: newest,
             age_s,
             quiet_s,
-            floor_gib: config.auto_free_gib,
-            until_gib: config.auto_free_gib.saturating_add(PRESSURE_MARGIN_GIB),
+            floor_gib: if short {
+                config.auto_free_gib
+            } else {
+                config.warn_free_gib
+            },
+            until_gib: config.warn_free_gib,
             device,
         })
     })())
 }
 
+/// THE FENCES EVERY WHOLE REMOVAL GAINS (design §4.5), read at the survey (the
+/// reclaim reads the mount table again under the locks): no mount point at or
+/// under the build directory, from a mount table read WHOLE (`mounts`; a Linux
+/// bind mount shares its source's `st_dev`, so the walk's device fence cannot
+/// see it, and a cut table proves nothing), and no entry of another user, from
+/// the `lstat`s the sizing walk made (one would fail to delete and leave a
+/// half-removed directory).
+///
+/// # Errors
+///
+/// Why the directory does not go whole.
+fn whole_fences(
+    t: &TargetDir,
+    mounts: Option<&aterm_sysprobe::volumes::Table>,
+) -> Result<(), String> {
+    mounts_clear(&t.path, mounts)?;
+    if let Some(foreign) = &t.foreign {
+        return Err(foreign.clone());
+    }
+    Ok(())
+}
+
+/// No mount point of `table` at or under `dir`, and `table` read whole
+/// ([`aterm_sysprobe::volumes::mounts_under`]).
+///
+/// # Errors
+///
+/// The table was not read whole, or a volume is mounted there.
+pub(crate) fn mounts_clear(
+    dir: &Path,
+    table: Option<&aterm_sysprobe::volumes::Table>,
+) -> Result<(), String> {
+    let Some(table) = table.filter(|t| t.complete) else {
+        return Err(
+            "the mount table was not read whole, so no mount point inside it is ruled out"
+                .to_owned(),
+        );
+    };
+    match aterm_sysprobe::volumes::mounts_under(dir, table).next() {
+        Some(m) => Err(format!(
+            "a volume is mounted inside it at {} — nothing under a mount point is removed",
+            m.on.display()
+        )),
+        None => Ok(()),
+    }
+}
+
 /// The build directory a [`Class::CargoTargets`] row frees bytes of.
 fn row_dir(r: &Row) -> Option<&Path> {
     match &r.witness {
-        Witness::StaleBuildDir { .. } | Witness::OwnerGone { .. } => Some(&r.path),
+        Witness::StaleBuildDir { .. } | Witness::OwnerGone { .. } | Witness::IdleWhole { .. } => {
+            Some(&r.path)
+        }
         Witness::LeastRecentlyUsed { build_dir, .. } => Some(build_dir),
         _ => None,
     }
@@ -1651,9 +2053,9 @@ pub fn hogs_left(
                 // A profile row is sized as its removal counts
                 // (`target::cache_bytes`, the blocks its unlinks release):
                 // released other than that, what it left differs too.
-                Witness::StaleBuildDir { .. } | Witness::LeastRecentlyUsed { .. } => {
-                    removed.bytes != row.bytes
-                }
+                Witness::StaleBuildDir { .. }
+                | Witness::LeastRecentlyUsed { .. }
+                | Witness::IdleWhole { .. } => removed.bytes != row.bytes,
                 Witness::NotLinkTarget { .. }
                 | Witness::Superseded { .. }
                 | Witness::VendorReports { .. } => false,
@@ -1696,12 +2098,14 @@ pub fn hogs_left(
 fn hog_of(t: &TargetDir, config: Config, survey: &Survey, notes: &[String]) -> (PathBuf, String) {
     use discover::{Origin, Owned};
     let gone_why = |what: &str| -> String {
-        let floor = config.auto_free_gib;
         if !config.dead_build_dirs {
             return format!("{what}; `[disk] dead_build_dirs` is off");
         }
-        if !config.below_auto_floor(survey.free_bytes) {
-            return format!("{what}; it goes whole below the {floor} GiB floor");
+        if !config.below_warn(survey.free_bytes) && survey.demand.is_none() {
+            return format!(
+                "{what}; it goes whole once free space is below the {} GiB warning",
+                config.warn_free_gib
+            );
         }
         let prefix = format!("cargo-targets: {} — its owner is gone", t.path.display());
         match notes.iter().find_map(|n| n.strip_prefix(&prefix)) {
@@ -1762,26 +2166,26 @@ fn hog_of(t: &TargetDir, config: Config, survey: &Survey, notes: &[String]) -> (
     }
 }
 
-/// Is `r` a pressure row — one the pass measures free space again before
-/// and may stop short of ([`Witness::OwnerGone`],
-/// [`Witness::LeastRecentlyUsed`])?
+/// Is `r` a pressure row — a recent profile's, which only a volume below
+/// the floor gives up, least recently used first, and of which a pass takes
+/// only as many as free space needs ([`Witness::LeastRecentlyUsed`], tier 4)?
 fn is_pressure(r: &Row) -> bool {
-    matches!(
-        r.witness,
-        Witness::LeastRecentlyUsed { .. } | Witness::OwnerGone { .. }
-    )
+    matches!(r.witness, Witness::LeastRecentlyUsed { .. })
 }
 
-/// Where a row sorts inside its class — the order the pass takes them in:
-/// every row but a pressure row first (an idle cache, taken whole); then a
-/// gone owner's whole build directory, the longest unwritten first (nothing
-/// builds there again); then the least recently used profiles, oldest
-/// first.
+/// Where a row sorts inside its class — the order the pass takes them in,
+/// cheapest to the owner first ([`Tier`]): a gone owner's whole build
+/// directory, the longest unwritten first (nothing builds there again); then
+/// the idle caches, the longest idle first; then the least recently used
+/// recent profiles, oldest first.
 fn lru_rank(r: &Row) -> (u8, i64) {
+    let tier = r.tier().map_or(0, Tier::number);
     match r.witness {
-        Witness::OwnerGone { last_used, .. } => (1, last_used),
-        Witness::LeastRecentlyUsed { last_used, .. } => (2, last_used),
-        _ => (0, 0),
+        Witness::OwnerGone { last_used, .. }
+        | Witness::LeastRecentlyUsed { last_used, .. }
+        | Witness::IdleWhole { last_used, .. } => (tier, last_used),
+        Witness::StaleBuildDir { idle_days, .. } => (tier, -idle_days),
+        _ => (tier, 0),
     }
 }
 
@@ -2198,6 +2602,10 @@ pub fn report_row(now: i64, sid: &str, rep: &Report) -> String {
     );
     o.insert("warn".to_owned(), Value::from(rep.warn));
     o.insert(
+        "room_bytes".to_owned(),
+        rep.room.map_or(Value::Null, Value::from),
+    );
+    o.insert(
         "rows".to_owned(),
         Value::from(u64::try_from(rep.rows.len()).unwrap_or(u64::MAX)),
     );
@@ -2227,7 +2635,10 @@ pub enum Plan {
 /// Decide what `class` would do against `rep`. Pure: no filesystem.
 ///
 /// `None` is [`Plan::ReportOnly`]: the design's "report-only by default" as
-/// the shape of the function.
+/// the shape of the function. A tier-3 row ([`Witness::IdleWhole`]) is never
+/// the owner's verb's to take, whatever `disk.apply` says: emptying a live
+/// checkout's whole build directory is the window's pass's alone, below the
+/// floor or for an agent's demand (design §4.7). The verb reports those rows.
 #[must_use]
 pub fn plan(rep: &Report, class: Option<Class>) -> Plan {
     let Some(class) = class else {
@@ -2242,7 +2653,7 @@ pub fn plan(rep: &Report, class: Option<Class>) -> Plan {
     let rows: Vec<Row> = rep
         .rows
         .iter()
-        .filter(|r| r.class == class && r.removable)
+        .filter(|r| r.class == class && r.removable && r.tier() != Some(Tier::IdleWhole))
         .cloned()
         .collect();
     Plan::Remove(class, rows)
@@ -2289,6 +2700,53 @@ pub fn guard(
     Ok(())
 }
 
+/// [`guard`] for the very row `row`, not only its path: one build directory
+/// can be the path of two rows (tier 2's idle caches and tier 3's whole
+/// directory), and the row removed must be one the report holds as it is.
+///
+/// # Errors
+///
+/// As [`guard`]; and no row of the report is `row`.
+pub fn guard_row(
+    rep: &Report,
+    survey_transcripts: Option<&Path>,
+    class: Class,
+    row: &Row,
+) -> Result<(), Refusal> {
+    guard_path(survey_transcripts, &row.path)?;
+    let Some(held) = rep
+        .rows
+        .iter()
+        .find(|r| r.class == class && r.path == row.path && r.witness == row.witness)
+    else {
+        return Err(Refusal::NotReported(row.path.clone()));
+    };
+    if !held.removable {
+        return Err(Refusal::Blocked(
+            row.path.clone(),
+            held.blocked.clone().unwrap_or_else(|| "blocked".to_owned()),
+        ));
+    }
+    Ok(())
+}
+
+/// The anchor and transcript fences of [`guard`].
+fn guard_path(survey_transcripts: Option<&Path>, path: &Path) -> Result<(), Refusal> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(Refusal::NotAnchored(path.to_path_buf()));
+    }
+    if let Some(t) = survey_transcripts
+        && (path == t || path.starts_with(t))
+    {
+        return Err(Refusal::Transcript(path.to_path_buf()));
+    }
+    Ok(())
+}
+
 /// What one row's removal did — the remover's answer, never the report's
 /// estimate.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -2318,7 +2776,7 @@ pub enum StopBy {
     /// them) cover what free space was short of that target at its first
     /// pressure row, though the figure has not risen to match: a local
     /// snapshot, a clone sharing the blocks or a deferred free can keep an
-    /// unlink out of `statvfs`/`df` for a while, and without this stop the
+    /// unlink out of `statfs` for a while, and without this stop the
     /// pass would take every row it has.
     Counted,
     /// Free space could not be measured again.
@@ -2355,20 +2813,30 @@ pub struct Stop {
     /// The bytes the pressure rows it took released, as their unlinks
     /// counted them.
     pub released: u64,
-    /// The rows it did not take (each a build cache more recently used than
-    /// every one it took).
+    /// The rows of its tier it did not take (each, in tier 4, a build cache
+    /// more recently used than every one it took).
     pub left: usize,
+    /// The tier it stopped ([`Tier::number`]); `None` for a row of no tier.
+    pub tier: Option<u8>,
 }
 
 impl Stop {
     /// The sentence a person reads.
     #[must_use]
     pub fn describe(&self) -> String {
-        let kept = format!(
-            "{} more recently used cache{} kept",
-            self.left,
-            if self.left == 1 { "" } else { "s" }
-        );
+        let what = match self.tier {
+            Some(1) => "build director",
+            Some(2) => "idle cache",
+            Some(3) => "idle build director",
+            _ => "more recently used cache",
+        };
+        let plural = match (self.left == 1, what.ends_with('r')) {
+            (true, true) => "y",
+            (false, true) => "ies",
+            (true, false) => "",
+            (false, false) => "s",
+        };
+        let kept = format!("{} {what}{plural} kept", self.left);
         match (self.by, self.free) {
             (StopBy::Unmeasured, _) | (_, None) => format!(
                 "free space could not be measured again, and nothing is removed on a number nobody read — {kept}"
@@ -2479,7 +2947,7 @@ pub fn poke_row(now: i64, cause: &poke::Cause, free: Option<u64>, level: Level) 
     o.insert(
         "sid".to_owned(),
         Value::from(match cause {
-            poke::Cause::Screen { sid, .. } => sid.clone(),
+            poke::Cause::Screen { sid, .. } | poke::Cause::Demand { sid, .. } => sid.clone(),
             poke::Cause::Write(_) => String::new(),
         }),
     );
@@ -2521,6 +2989,9 @@ pub fn stop_row(now: i64, sid: &str, stop: &Stop) -> String {
         "left".to_owned(),
         Value::from(u64::try_from(stop.left).unwrap_or(u64::MAX)),
     );
+    if let Some(tier) = stop.tier {
+        o.insert("tier".to_owned(), Value::from(u64::from(tier)));
+    }
     o.insert(
         "text".to_owned(),
         Value::from(truncate_bytes(&stop.describe(), ROW_TEXT_CAP).to_owned()),
@@ -2539,11 +3010,30 @@ pub struct Applied {
     pub denials: Vec<Refusal>,
     /// Bytes the removals released, as each remover counted them.
     pub freed_bytes: u64,
-    /// Where the pressure pass stopped, when it stopped before its last row.
+    /// Where the pass ended, when a stop ended it before its last row: the
+    /// last of [`Self::stops`].
     pub stopped: Option<Stop>,
+    /// Every tier's stop, in the order they fired.
+    pub stops: Vec<Stop>,
+    /// The pass did not reach every row it may have: why (the search for
+    /// build directories stopped short). [`Self::ran_out`] reads it.
+    pub unfinished: Option<String>,
 }
 
 impl Applied {
+    /// Did the pass RUN OUT of what it may take: every row of every tier it
+    /// admitted tried, no tier stopped by a figure it could not read or by
+    /// the bytes it counted ([`StopBy::Unmeasured`], [`StopBy::Counted`] —
+    /// rows of that tier were left), and the search for build directories
+    /// finished ([`Self::unfinished`])? A tier stopped because free space
+    /// MEASURED at its target ran out of nothing, but it reached its target.
+    /// What an agent's demand reads as `why=spent` (`ERR unmet`) only when
+    /// this holds and free space is still below its need.
+    #[must_use]
+    pub fn ran_out(&self) -> bool {
+        self.unfinished.is_none() && self.stops.iter().all(|s| s.by == StopBy::Measured)
+    }
+
     /// The one summary line.
     #[must_use]
     pub fn headline(&self) -> String {
@@ -2560,7 +3050,9 @@ impl Applied {
     pub fn went(&self) -> Went {
         let mut went = Went::default();
         for (row, removed) in &self.removed {
-            if !matches!(row.witness, Witness::OwnerGone { .. }) {
+            if matches!(row.witness, Witness::IdleWhole { .. }) {
+                went.idle_whole += 1;
+            } else if !matches!(row.witness, Witness::OwnerGone { .. }) {
                 went.profiles += removed.units.len();
             } else if removed.units.contains(&row.path) {
                 went.whole += 1;
@@ -2582,40 +3074,106 @@ pub struct Went {
     pub whole: usize,
     /// Gone owners' build directories that went only in part.
     pub in_part: usize,
+    /// Live checkouts' whole idle build directories whose profiles were
+    /// emptied (tier 3), in whole or in part.
+    pub idle_whole: usize,
     /// Every other unit that went.
     pub profiles: usize,
 }
 
-/// The automatic grant. Pure. Below the report's automatic floor
-/// ([`Config::below_auto_floor`]) the removable [`Class::CargoTargets`] rows,
-/// in the order they are taken (the idle build directories, then the
-/// pressure rows least recently used first, of which [`apply_auto`] takes
-/// only as many as free space needs), and never a row of another class,
-/// whatever `disk.apply` says; at or above it, or on an unknown free figure,
-/// `None`.
+/// One row of a pass, with where its tier stops: `None` takes it whatever
+/// free space reads (a gone owner's build directory: nobody builds there
+/// again; the owner's verb's idle rows), `Some(bytes)` measures free space
+/// again before it and leaves it once free space is at that target
+/// ([`remove_rows`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Planned {
+    /// The row.
+    pub row: Row,
+    /// Its tier's target, or `None`: taken whole.
+    pub target: Option<u64>,
+}
+
+/// THE TIER PLANNER of the automatic pass (design §4.1). Pure. The
+/// removable [`Class::CargoTargets`] rows in the order they are taken —
+/// cheapest to the owner first ([`Tier`], [`lru_rank`]) — each with its
+/// tier's target, of the tiers the MEASURED level admits:
+///
+/// | tier | admitted | stops at |
+/// |---|---|---|
+/// | 1 ended owners | `low` or worse, or a demand | takes all |
+/// | 2 idle `incremental/` | `low` or worse, or a demand | the idle target ([`Config::idle_target_bytes`]), or the demand's |
+/// | 3 whole idle build directories | `short` or worse, or a demand | as tier 2 |
+/// | 4 recent `incremental/` | a measured `short` only — never a demand | the floor plus [`PRESSURE_MARGIN_GIB`] |
+///
+/// A demand ([`Report::demand`], need bytes) targets the need plus the floor,
+/// so the build leaves the volume above its floor and tier 4 never runs for
+/// it. Never a row of another class, whatever `disk.apply` says. `None` at
+/// `ok` with no demand, on an unknown free figure, or with the automatic
+/// removal off (`auto_free_gib = 0`).
 #[must_use]
-pub fn auto_plan(rep: &Report) -> Option<Vec<Row>> {
-    rep.config.below_auto_floor(rep.free_bytes).then(|| {
+pub fn pass_plan(rep: &Report) -> Option<Vec<Planned>> {
+    let c = rep.config;
+    let free = rep.free_bytes?;
+    if c.auto_free_gib == 0 {
+        return None;
+    }
+    let low = c.below_warn(Some(free));
+    let short = c.below_auto_floor(Some(free));
+    let demand = rep
+        .demand
+        .map(|need| need.saturating_add(c.auto_free_gib.saturating_mul(GIB)));
+    if !low && !short && demand.is_none() {
+        return None;
+    }
+    let idle = |measured: bool| {
+        let line = if measured {
+            c.idle_target_bytes(short)
+        } else {
+            0
+        };
+        line.max(demand.unwrap_or(0))
+    };
+    Some(
         rep.rows
             .iter()
             .filter(|r| r.class == Class::CargoTargets && r.removable)
-            .cloned()
-            .collect()
-    })
+            .filter_map(|r| {
+                let target = match r.tier()? {
+                    Tier::EndedOwners => (low || short || demand.is_some()).then_some(None),
+                    Tier::IdleIncremental => {
+                        (low || short || demand.is_some()).then(|| Some(idle(low || short)))
+                    }
+                    Tier::IdleWhole => (short || demand.is_some()).then(|| Some(idle(short))),
+                    Tier::RecentIncremental => short.then(|| Some(c.pressure_target_bytes())),
+                }?;
+                Some(Planned {
+                    row: r.clone(),
+                    target,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The rows [`pass_plan`] would take, without their targets: what the
+/// automatic grant reaches. `None` where it reaches nothing.
+#[must_use]
+pub fn auto_plan(rep: &Report) -> Option<Vec<Row>> {
+    pass_plan(rep).map(|rows| rows.into_iter().map(|p| p.row).collect())
 }
 
 /// A row's remover: what [`apply`] calls for each row that passed [`guard`].
 pub type Remove<'a> = dyn FnMut(&Row) -> std::io::Result<Removed> + 'a;
 
-/// Free space on the measured volume, measured again: what the pressure pass
-/// reads before each of its rows. `None` (a failed measurement) stops it.
+/// Free space on the measured volume, measured again: what the pass reads
+/// before each row that has a target. `None` (a failed measurement) stops it.
 pub type Measure<'a> = dyn FnMut() -> Option<u64> + 'a;
 
-/// Carry out [`auto_plan`] against `rep` through `remove`, each path behind
+/// Carry out [`pass_plan`] against `rep` through `remove`, each path behind
 /// [`guard`] as [`apply`]'s are, each [`Step`] told to `record` as it
-/// happens, and free space re-read through `measure` before each pressure
-/// row: the pass stops once it is at [`Config::pressure_target_bytes`].
-/// `None` when the floor was not crossed.
+/// happens, and free space re-read through `measure` before each row with a
+/// target: each tier stops at its own. `None` when the plan reaches nothing.
 pub fn apply_auto(
     rep: &Report,
     transcripts: Option<&Path>,
@@ -2623,7 +3181,7 @@ pub fn apply_auto(
     measure: &mut Measure<'_>,
     record: &mut Record<'_>,
 ) -> Option<Applied> {
-    let rows = auto_plan(rep)?;
+    let rows = pass_plan(rep)?;
     let mut done = Applied::default();
     remove_rows(
         rep,
@@ -2638,9 +3196,13 @@ pub fn apply_auto(
 }
 
 /// Carry out `class` against `rep`, removing through `remove` and telling
-/// `record` each [`Step`] as it happens. A pressure row (on a report taken
-/// below the floor) is preceded by a fresh `measure`, and the pass stops at
-/// [`Config::pressure_target_bytes`], as the tick's does.
+/// `record` each [`Step`] as it happens. The owner's verb takes every
+/// removable row of the class named but tier 3's ([`plan`]): a gone owner's
+/// build directory and an idle cache whole, whatever free space reads (the
+/// grant is the class); a
+/// recent profile's row ([`Witness::LeastRecentlyUsed`], on a report taken
+/// below the floor) is preceded by a fresh `measure`, and those stop at
+/// [`Config::pressure_target_bytes`], as the tick's do.
 ///
 /// `remove` is injected so this is testable without a disk ([`remover`] is
 /// the real one); [`guard`] runs before every call to it, and a guard refusal
@@ -2668,6 +3230,14 @@ pub fn apply(
         done.denials.push(Refusal::NoClass);
         return done;
     };
+    let target = rep.config.pressure_target_bytes();
+    let rows = rows
+        .into_iter()
+        .map(|row| Planned {
+            target: is_pressure(&row).then_some(target),
+            row,
+        })
+        .collect();
     remove_rows(
         rep,
         transcripts,
@@ -2680,55 +3250,78 @@ pub fn apply(
     done
 }
 
+/// Where one tier of a pass stands ([`remove_rows`]).
+#[derive(Default)]
+struct TierRun {
+    /// What free space was short of the tier's target at its first measure.
+    short: Option<u64>,
+    /// What its rows released, as counted.
+    released: u64,
+    /// It stopped.
+    stopped: bool,
+}
+
 /// Remove `rows` of `class`, each behind [`guard`], into `done`: the intent
 /// told before each removal (a removal whose intent is not on record does
-/// not start), its outcome after. Before each pressure row free space is
-/// measured again, and the pass stops (a [`Stop`], told and kept) once it is
-/// at [`Config::pressure_target_bytes`], once the bytes the pressure rows
-/// released cover what it was short at the first of them
-/// ([`StopBy::Counted`]), or when it cannot be read.
+/// not start), its outcome after. Before each row with a target free space is
+/// measured again, and its TIER stops (a [`Stop`], told and kept) once free
+/// space is at that target, once the bytes the tier's rows released cover
+/// what it was short at the first of them ([`StopBy::Counted`]); a figure
+/// that cannot be read stops the whole pass ([`StopBy::Unmeasured`]). A row
+/// with no target is taken whatever free space reads.
 fn remove_rows(
     rep: &Report,
     transcripts: Option<&Path>,
     class: Class,
-    rows: Vec<Row>,
+    rows: Vec<Planned>,
     (remove, measure): (&mut Remove<'_>, &mut Measure<'_>),
     record: &mut Record<'_>,
     done: &mut Applied,
 ) {
-    let target = rep.config.pressure_target_bytes();
-    let total = rows.len();
-    // What free space was short of `target` before the first pressure row,
-    // and what the pressure rows have released since, as counted.
-    let mut short: Option<u64> = None;
-    let mut released: u64 = 0;
-    for (i, row) in rows.into_iter().enumerate() {
-        let pressure = is_pressure(&row);
-        if pressure {
+    let tier_of = |p: &Planned| p.row.tier().map(Tier::number);
+    let mut runs: BTreeMap<Option<u8>, TierRun> = BTreeMap::new();
+    for (i, planned) in rows.iter().enumerate() {
+        let tier = tier_of(planned);
+        let run = runs.entry(tier).or_default();
+        if run.stopped {
+            continue;
+        }
+        if let Some(target) = planned.target {
             let free = measure();
             let by = match free {
                 None => Some(StopBy::Unmeasured),
                 Some(f) if f >= target => Some(StopBy::Measured),
                 Some(f) => {
-                    let short = *short.get_or_insert(target - f);
-                    (released >= short).then_some(StopBy::Counted)
+                    let short = *run.short.get_or_insert(target - f);
+                    (run.released >= short).then_some(StopBy::Counted)
                 }
             };
             if let Some(by) = by {
+                let left = rows[i..]
+                    .iter()
+                    .filter(|p| tier_of(p) == tier && p.target.is_some())
+                    .count();
                 let stop = Stop {
                     by,
                     free,
                     target,
-                    short: short.unwrap_or(0),
-                    released,
-                    left: total - i,
+                    short: run.short.unwrap_or(0),
+                    released: run.released,
+                    left,
+                    tier,
                 };
                 record(&Step::Stopped(&stop));
-                done.stopped = Some(stop);
-                return;
+                run.stopped = true;
+                done.stopped = Some(stop.clone());
+                done.stops.push(stop);
+                if by == StopBy::Unmeasured {
+                    return;
+                }
+                continue;
             }
         }
-        if let Err(r) = guard(rep, transcripts, class, &row.path) {
+        let row = planned.row.clone();
+        if let Err(r) = guard_row(rep, transcripts, class, &row) {
             record(&Step::Denied(&r));
             done.denials.push(r);
             continue;
@@ -2742,8 +3335,9 @@ fn remove_rows(
         match remove(&row) {
             Ok(removed) => {
                 done.freed_bytes = done.freed_bytes.saturating_add(removed.bytes);
-                if pressure {
-                    released = released.saturating_add(removed.bytes);
+                if planned.target.is_some() {
+                    let run = runs.entry(tier).or_default();
+                    run.released = run.released.saturating_add(removed.bytes);
                 }
                 record(&Step::Removed(&row, &removed));
                 done.removed.push((row, removed));
@@ -2772,7 +3366,7 @@ fn remove_rows(
 pub fn remover(judge: Judge) -> impl FnMut(&Row) -> std::io::Result<Removed> {
     remover_among(
         judge,
-        aterm_uds::holders::scan_path_users,
+        discover::scan_processes,
         discover::running_claude_census,
     )
 }
@@ -2831,6 +3425,50 @@ pub(crate) fn remover_among(
                     *last_used,
                     *quiet_s,
                     &mut || discover::recheck(owner, &row.path, judge.now, *quiet_s, &census),
+                )
+            }
+            // TIER 3: clause 4 read again at the removal — no process in the
+            // checkout or the build directory, its git files and its working
+            // tree quiet — BEFORE anything there is opened; then each profile
+            // emptied under its locks, its directory and lock files kept,
+            // clause 3 and the mount table read again under them, and the
+            // processes and the git files once more, under each profile's
+            // locks, right before its delete ([`target::reclaim_profiles`]).
+            Witness::IdleWhole {
+                checkout,
+                last_used,
+                window_days,
+                device,
+                ..
+            } => {
+                let dirs = [checkout.clone(), row.path.clone()];
+                let window_s = window_days.max(&1).saturating_mul(DAY_S);
+                let no_longer =
+                    |why: String| std::io::Error::other(format!("no longer a candidate: {why}"));
+                let table = aterm_sysprobe::volumes::table();
+                idle::git_quiet(checkout, judge.now, window_s, Some(&table)).map_err(no_longer)?;
+                idle::tree_quiet(
+                    checkout,
+                    std::slice::from_ref(&row.path),
+                    judge.now,
+                    window_s,
+                    idle::TREE_WALL,
+                )
+                .map_err(no_longer)?;
+                discover::unused_under(&dirs, &processes).map_err(no_longer)?;
+                target::reclaim_profiles(
+                    &row.path,
+                    &Judge {
+                        device: Some(*device),
+                        ..judge
+                    },
+                    *last_used,
+                    window_s,
+                    &mut || mounts_clear(&row.path, Some(&aterm_sysprobe::volumes::table())),
+                    &mut || {
+                        discover::unused_under(&dirs, &processes)?;
+                        idle::git_quiet(checkout, judge.now, window_s, Some(&table))
+                    },
                 )
             }
             _ => target::reclaim(&row.path, &judge),
@@ -2942,13 +3580,30 @@ pub struct Roots {
     pub claude_unread: Option<String>,
     /// Where transcripts live.
     pub transcripts: Option<PathBuf>,
+    /// The mount table, read for the whole-removal fences ([`Survey::mounts`]).
+    pub mounts: Option<aterm_sysprobe::volumes::Table>,
+    /// What places a workspace nested in a removed checkout
+    /// ([`discover::placing_now`], [`discover::Owners::placed`]).
+    pub placing: Option<discover::checkout::Placing>,
+    /// The demand the pass adopted ([`Survey::demand`]).
+    pub demand: Option<u64>,
+    /// Assess the found build directories for TIER 3 ([`idle::assess`]): the
+    /// owner's verb always (what tier 3 would free is shown), the window's
+    /// pass only when tier 3 may run.
+    pub idle_whole: bool,
+    /// The working directory of every session of this instance (tier 3's
+    /// clause 4a).
+    pub session_cwds: Vec<PathBuf>,
+    /// The folders whose links clause 5 reads (`~/.local/bin`,
+    /// `~/.cargo/bin`, `$ATPKG_BIN`, `~/.rustup/toolchains`).
+    pub link_dirs: Vec<PathBuf>,
 }
 
 /// Measure one machine into a [`Survey`]: the one function here that
 /// touches a filesystem; everything else is a pure function of its result.
 ///
-/// Free space is left to the caller (`free`): the statvfs edge lives in
-/// `atpkg`, which this crate does not depend on. `None` fails open.
+/// Free space is left to the caller (`free`), who measured it on the volume
+/// the lines are about; `None` fails open.
 #[must_use]
 pub fn scan(
     roots: &Roots,
@@ -2957,17 +3612,42 @@ pub fn scan(
     config: Config,
     free_bytes: Option<u64>,
 ) -> Survey {
+    scan_with(
+        roots,
+        now,
+        trigger,
+        config,
+        free_bytes,
+        &discover::scan_processes,
+    )
+}
+
+/// [`scan`], tier 3's clause 4b read through `processes` ([`discover::Processes`]:
+/// the product's is every process of this uid, a test's the ones it names).
+#[must_use]
+pub fn scan_with(
+    roots: &Roots,
+    now: i64,
+    trigger: Trigger,
+    config: Config,
+    free_bytes: Option<u64>,
+    processes: discover::Processes<'_>,
+) -> Survey {
     let mut s = Survey::new(now);
     s.trigger = trigger;
     s.free_bytes = free_bytes;
     s.transcripts_root = roots.transcripts.clone();
+    s.mounts = roots.mounts.clone();
+    s.demand = roots.demand;
     if let Some(v) = &roots.volume {
         s.root = v.clone();
         s.volume_device = target::dev_of(v);
     }
-    // Below the floor every profile is sized and probed, recent ones too:
-    // the pressure pass may take any of them.
-    let pressure = config.below_auto_floor(free_bytes);
+    // Once the volume is low (or a demand was adopted) every profile is sized
+    // and probed, recent ones too: a gone owner's build directory goes whole
+    // only with every lock free, and below the floor the recent tier may take
+    // any of them.
+    let pressure = config.below_warn(free_bytes) || roots.demand.is_some();
     // Both sides are canonical or neither is compared: `report` decides the
     // whole class by path equality, and on macOS `/var` resolves to
     // `/private/var`, so comparing a resolved link against an unresolved
@@ -3024,7 +3704,8 @@ pub fn scan(
         roots.claude_unread.clone(),
         now,
         config.quiet_s(),
-    );
+    )
+    .placed(roots.placing.clone());
     for (t, origin) in named.chain(found).take(MAX_TARGETS) {
         let Ok(canonical) = std::fs::canonicalize(t) else {
             continue;
@@ -3035,9 +3716,26 @@ pub fn scan(
         if let Some(mut td) = scan_target(&canonical, now, config.target_stale_days, pressure) {
             td.owned = owners.of(&origin);
             td.origin = origin;
-            td.total = Some(target::total_bytes(&td.path));
+            let (total, foreign) = target::total_bytes_owned(&td.path);
+            td.total = Some(total);
+            // A sizing walk that stopped short read only part of it: before
+            // it can go whole (tier 1, or tier 3's assessment), the rest is
+            // read for another user's entry by a walk of its own
+            // ([`target::foreign_beyond`]); one that cannot finish keeps it.
+            let whole = matches!(td.owned, discover::Owned::Gone { .. })
+                || (roots.idle_whole && idle::checkout_of(&td.origin, &td.path).is_some());
+            td.foreign = foreign.or_else(|| {
+                (whole && total.1)
+                    .then(|| target::foreign_beyond(&td.path))
+                    .flatten()
+            });
             s.targets.push(td);
+            // A directory sized: the pass is moving ([`beat`]).
+            beat::beat();
         }
+    }
+    if roots.idle_whole {
+        assess_idle_whole(&mut s, roots, config, now, processes);
     }
     // The census refusal, said once where the report is read (`aterm
     // harness disk`'s notes): while it stands no session's scratch build is
@@ -3052,6 +3750,61 @@ pub fn scan(
         ));
     }
     s
+}
+
+/// Tier 3's assessment of every build directory `s` holds that it could take
+/// ([`idle::assess`], then one scan of the running processes for every
+/// candidate, [`idle::processes_clear`]): each one's verdict in
+/// [`TargetDir::idle`].
+fn assess_idle_whole(
+    s: &mut Survey,
+    roots: &Roots,
+    config: Config,
+    now: i64,
+    processes: discover::Processes<'_>,
+) {
+    let mounts = s.mounts.clone();
+    let links = idle::inbound_links(&roots.link_dirs, mounts.as_ref());
+    let found: Vec<PathBuf> = s.targets.iter().map(|t| t.path.clone()).collect();
+    let cwds: Vec<PathBuf> = roots
+        .session_cwds
+        .iter()
+        .map(|c| std::fs::canonicalize(c).unwrap_or_else(|_| c.clone()))
+        .collect();
+    let cx = idle::Context {
+        now,
+        window_s: config.idle_build_days.max(1).saturating_mul(DAY_S),
+        device: s.volume_device,
+        session_cwds: &cwds,
+        links: &links,
+        found: &found,
+        home: roots.home.as_deref(),
+        mounts: mounts.as_ref(),
+    };
+    let fences = |t: &TargetDir| whole_fences(t, mounts.as_ref());
+    let mut candidates: Vec<(usize, PathBuf, PathBuf)> = Vec::new();
+    for (i, t) in s.targets.iter_mut().enumerate() {
+        if idle::checkout_of(&t.origin, &t.path).is_none() {
+            continue;
+        }
+        let verdict = idle::assess(t, &cx, &fences);
+        if let Ok(facts) = &verdict {
+            candidates.push((i, facts.checkout.clone(), t.path.clone()));
+        }
+        t.idle = Some(verdict);
+    }
+    let pairs: Vec<(PathBuf, PathBuf)> = candidates
+        .iter()
+        .map(|(_, c, d)| (c.clone(), d.clone()))
+        .collect();
+    for ((i, ..), clear) in candidates
+        .iter()
+        .zip(idle::processes_clear(&pairs, processes))
+    {
+        if let (Err(why), Some(t)) = (clear, s.targets.get_mut(*i)) {
+            t.idle = Some(Err(why));
+        }
+    }
 }
 
 /// Read `<prefix>/store` into [`Survey::store`] and [`Survey::live_builds`].
@@ -3187,12 +3940,20 @@ fn walk_bytes(
     let mut total: u64 = 0;
     let mut seen = 0usize;
     let mut stack = vec![dir.to_path_buf()];
+    // A folder that could not be read (another user's, say) leaves the
+    // figure a floor: said, never passed over as if it were empty.
+    let mut unread = false;
     while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else {
-            continue;
+        let rd = match std::fs::read_dir(&d) {
+            Ok(rd) => rd,
+            Err(e) => {
+                unread |= e.kind() != std::io::ErrorKind::NotFound;
+                continue;
+            }
         };
         for entry in rd.flatten() {
             seen += 1;
+            beat::tick(1);
             if seen > MAX_WALK_ENTRIES {
                 return (total, true);
             }
@@ -3211,76 +3972,48 @@ fn walk_bytes(
             }
         }
     }
-    (total, false)
+    (total, unread)
 }
 
-/// Free bytes on the volume holding `path`, or `None` on any failure.
+/// The volume holding `path`, read now through the mount table `table`
+/// ([`aterm_sysprobe::volumes`]): one `statfs` (macOS) or `statvfs` (Linux)
+/// on the mount point, never a fork. The path's own spelling is placed first
+/// ([`aterm_sysprobe::volumes::mount_of`], which touches nothing): one on a
+/// remote or automounted mount is answered unread without a `stat`, since a
+/// stalled one answers by blocking. Otherwise its nearest existing ancestor
+/// is resolved (a link followed, `/tmp` to `/private/tmp`) and that one's
+/// mount read.
 ///
-/// `None` fails open, as `atpkg`'s `freespace::available_bytes` does: a
-/// report that cannot read the disk says `free=unknown` and warns about
-/// nothing.
+/// # Errors
 ///
-/// Uses `df -Pk`: std has no free-space call, `statvfs` needs `unsafe`
-/// (not written in this crate), and `atpkg`'s `platform::volume_free_bytes`
-/// sits behind a crate this one does not depend on.
-/// `crates/aterm-verify/src/disk.rs`'s `parse_df` is the reference for
-/// [`parse_df_kb`].
-///
-/// It is also BOUNDED. `df` walks the mount table, and a stale NFS or SMB
-/// mount under `path` makes it block for as long as that server stays gone —
-/// a deadline-free `output()` would wedge the whole report there. A
-/// measurement that cannot return is worse than `free=unknown`, which this
-/// function already answers safely, so [`DF_BUDGET`] is the deadline and the
-/// shipped bounded runner ([`super::align::capture_bounded`]) is what enforces
-/// it.
-///
-/// Built through `aterm_uds::spawnfd::command`: on Windows a `df` on `PATH` (Git for
-/// Windows, MSYS) is a console image, and the window's harness host, which has
-/// no console, would flash a console window for it.
+/// [`aterm_sysprobe::volumes::Unread`]: the mount is remote or automounted,
+/// no mount holds the path or nothing of it exists, the read was refused, or
+/// this platform has no reader.
+pub fn volume_of(
+    path: &Path,
+    table: &aterm_sysprobe::volumes::Table,
+) -> Result<aterm_sysprobe::volumes::Reading, aterm_sysprobe::volumes::Unread> {
+    use aterm_sysprobe::volumes::{self, Unread};
+    let spelled = volumes::mount_of(path, table).ok_or(Unread::NoMount)?;
+    if spelled.automounted || !spelled.local {
+        return volumes::read(spelled);
+    }
+    let placed = path
+        .ancestors()
+        .find_map(|a| std::fs::canonicalize(a).ok())
+        .ok_or(Unread::NoMount)?;
+    volumes::read_path(&placed, table)
+}
+
+/// Free bytes on the volume holding `path` ([`volume_of`] through a fresh
+/// mount table), or `None` on any failure: a report that cannot read the disk
+/// says `free=unknown` and warns about nothing, and the pressure pass stops on
+/// a figure nobody read ([`StopBy::Unmeasured`]).
 #[must_use]
 pub fn free_bytes(path: &Path) -> Option<u64> {
-    let mut cmd = aterm_uds::spawnfd::command("df");
-    cmd.arg("-Pk").arg(path);
-    let got = super::align::capture_bounded(cmd, DF_BUDGET, MAX_DF_STDOUT).ok()?;
-    if !got.success() {
-        return None;
-    }
-    parse_df_kb(&String::from_utf8_lossy(&got.stdout))
-}
-
-/// The deadline on the one `df` a report runs. A target: a local volume
-/// answers in milliseconds, and a mount slower than this is not going to
-/// answer.
-pub const DF_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// The byte cap on `df` output. `df -Pk <path>` prints a header and one row;
-/// the cap is what keeps a pathological filesystem list out of memory.
-pub const MAX_DF_STDOUT: usize = 64 * 1024;
-
-/// The `Available` column of `df -Pk` output, in bytes.
-///
-/// Anchored on `Capacity`, never on a field count: `-P` fixes the column
-/// order (`Filesystem 1024-blocks Used Available Capacity Mounted on`) and
-/// nothing else, and on macOS `df -Pk /System/Volumes/Data/home` prints seven
-/// fields because autofs names the source `map auto_home`. `Capacity` is the
-/// one percentage cell and `Available` is the field before it.
-///
-/// An unreadable row answers `None`, never a guess.
-#[must_use]
-pub fn parse_df_kb(text: &str) -> Option<u64> {
-    let row = text.lines().nth(1)?;
-    let fields: Vec<&str> = row.split_whitespace().collect();
-    let capacity = fields.iter().position(|f| is_percentage(f))?;
-    let kib: u64 = fields.get(capacity.checked_sub(1)?)?.parse().ok()?;
-    kib.checked_mul(1024)
-}
-
-/// A `df` `Capacity` cell: digits then `%`, and nothing else — so a mount
-/// name that merely contains a `%` cannot be mistaken for the anchor.
-fn is_percentage(field: &str) -> bool {
-    field
-        .strip_suffix('%')
-        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    volume_of(path, &aterm_sysprobe::volumes::table())
+        .ok()
+        .map(|r| r.free)
 }
 
 /// Remove one directory tree: [`remover`]'s primitive for

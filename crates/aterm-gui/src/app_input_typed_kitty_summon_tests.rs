@@ -315,6 +315,7 @@ pub(super) fn drain(pipe: [i32; 2]) -> Vec<u8> {
 /// `Instant::now()` after polling the FIFO writer would judge it at the
 /// scheduler's whim; the observing frame is presented at most one refresh
 /// after the edge.
+#[cfg(unix)]
 pub(super) const OBSERVING_FRAME: Duration = Duration::from_millis(16);
 
 /// The clock of the `nth` (1-based) frame after the key edge `edge`
@@ -322,6 +323,7 @@ pub(super) const OBSERVING_FRAME: Duration = Duration::from_millis(16);
 /// already observed), monotone in `nth` and in real time. An inline
 /// key's edge is bounded below by an instant read just before its
 /// dispatch; a queued key's is its receipt ([`delivery_edge`]).
+#[cfg(unix)]
 pub(super) fn observing_frame(edge: Instant, nth: u32) -> Instant {
     Instant::now().min(edge + OBSERVING_FRAME * nth)
 }
@@ -331,6 +333,7 @@ pub(super) fn observing_frame(edge: Instant, nth: u32) -> Instant {
 /// (`delivery_seen`), placed as the render prelude places it. Waited for,
 /// because a finished FIFO job can hold its receipt until its spill reaches
 /// the kernel.
+#[cfg(unix)]
 pub(super) fn delivery_edge(app: &App, wid: WindowId, receipts: u64) -> Instant {
     let session = app.front_terminal(wid).expect("a terminal").session;
     let after = app.windows[&wid]
@@ -560,6 +563,11 @@ fn ime_and_external_local_boundaries_retire_older_candidates_before_consumers() 
     });
     assert_boundary_dark(App::headless_for_test(), |app, _wid| {
         app.clear_tab_surface_move_license(None);
+    });
+    // The titlebar needs pill's click, as its wake delivers it, even one that
+    // acts on nothing (no pill stands).
+    assert_boundary_dark(App::headless_for_test(), |app, wid| {
+        app.on_pill_wake(wid, 0, crate::presence::PillHit::Go);
     });
 }
 
@@ -1214,8 +1222,10 @@ fn close_pty(
     // SAFETY: both fds are the caller's and open; the borrowed-fd sink did
     // not close the master.
     unsafe {
-        libc::close(slave);
+        // The master first: a slave closed over output its master never read
+        // waits out the tty's drain (0.6 s on macOS).
         libc::close(master);
+        libc::close(slave);
     }
 }
 
@@ -1399,8 +1409,10 @@ fn a_password_prompt_clicks_one_tone_and_rings_no_ting() {
         // SAFETY: both fds are ours and open; the borrowed-fd sink did
         // not close the master.
         unsafe {
-            libc::close(slave);
+            // The master first: a slave closed over output its master never read
+            // waits out the tty's drain (0.6 s on macOS).
             libc::close(master);
+            libc::close(slave);
         }
     }
 }

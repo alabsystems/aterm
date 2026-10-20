@@ -97,6 +97,37 @@ pub(crate) mod test_support {
         }
     }
 
+    /// The two strings a C-string read of an `NSString` gets wrong, as UTF-16
+    /// code units and the text they must read back as: an embedded U+0000
+    /// (`-UTF8String` stops there) and an unpaired surrogate (`-UTF8String`
+    /// answers NULL; the counted reader gives U+FFFD and keeps the rest).
+    pub(crate) const C_STRING_HOLES: [(&[u16], &str); 2] = [
+        (&[0x61, 0x0000, 0x62], "a\u{0}b"),
+        (&[0x61, 0xD800, 0x62], "a\u{FFFD}b"),
+    ];
+
+    /// A +1 `NSString` of exactly `units`, built without a C string so it may
+    /// hold U+0000 or an unpaired surrogate, which no Rust `str` can spell.
+    pub(crate) fn ns_string_of_units(units: &[u16]) -> Obj {
+        // SAFETY: `+alloc` returns a +1 instance that
+        // `-initWithCharacters:length:` (`@32@0:8r^S16Q24`) consumes, reading
+        // `units.len()` code units during the call and returning +1 or nil.
+        unsafe {
+            let alloc: unsafe extern "C-unwind" fn(ffi::ClassPtr, ffi::Sel) -> ffi::Id =
+                ffi::checked_msg();
+            let raw = alloc(ffi::class(c"NSString"), ffi::sel(c"alloc"));
+            let init: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel, *const u16, usize) -> ffi::Id =
+                ffi::checked_msg();
+            Obj::from_owned(init(
+                raw,
+                ffi::sel(c"initWithCharacters:length:"),
+                units.as_ptr(),
+                units.len(),
+            ))
+        }
+        .expect("NSString from UTF-16")
+    }
+
     /// `-[CALayer sublayers].count` (0 when the property is nil).
     pub(crate) fn sublayer_count(layer: &Obj) -> usize {
         let _pool = ffi::AutoreleasePool::new();
@@ -1408,6 +1439,7 @@ mod tests {
             ph,
             dx: 3 * cw as u32,
             dy: ch as u32,
+            scrim: None,
         };
         let card_a: &'static [u8] = card_a.leak();
         let card_b: &'static [u8] = card_b.leak();
@@ -2604,6 +2636,7 @@ mod tests {
             ph,
             dx: 2 * cw as u32,
             dy: ch as u32,
+            scrim: None,
         };
 
         let (fw_l, fh_l) = gpu.frame_size(ROWS, COLS);

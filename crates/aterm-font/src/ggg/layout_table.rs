@@ -123,7 +123,7 @@ impl<'a, T: RecordListItem<'a>> RecordList<'a, T> {
     /// Returns the tag of the record at `index`, without parsing the value
     /// (the autohinter's script and feature selection reads tags alone, as
     /// read-fonts does).
-    #[cfg(feature = "hint")]
+    #[cfg(any(feature = "hint", debug_assertions))]
     pub(crate) fn tag(&self, index: u16) -> Option<Tag> {
         self.records.get(index).map(|record| record.tag)
     }

@@ -826,6 +826,12 @@ impl Grid {
                 None
             };
 
+            let row_may_have_extras = scan_stale
+                && self
+                    .storage
+                    .extras
+                    .map_may_have_row(cursor_row, usize::from(self.storage.cols));
+
             let Some((row, effective_cols)) = self.storage.row_mut_with_effective_cols(cursor_row)
             else {
                 break;
@@ -852,7 +858,7 @@ impl Grid {
             // Capture stale-extras columns before Phase 1 clobbers the
             // HAS_EXTRAS flags; remove them before Phase 2 creates fresh entries
             // so old extras never merge into the new cells.
-            let stale = if scan_stale {
+            let stale = if row_may_have_extras {
                 StaleExtras::probe(row, cursor_col, cursor_col + to_write_u16)
             } else {
                 StaleExtras::NONE

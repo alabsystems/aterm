@@ -17,10 +17,15 @@
 //! * `pipelined_waits_are_held_while_wait_lanes_are_free`: a wait with a request right behind
 //!   it (a wait then `version`) moves to a wait lane carrying that request, so twice the
 //!   request lanes' worth are held, none told busy.
-//! * `the_connection_past_the_cap_is_told_busy_and_tabs_still_open`: the open-connection cap
-//!   is a quarter of the descriptor limit. Under launchd's default soft `RLIMIT_NOFILE` of 256
-//!   the connection past the cap gets the busy line while the window still opens tabs;
-//!   `aterm ctl` at the cap prints the busy line for a sent verb and for its own discovery.
+//! * `the_connection_past_the_cap_takes_the_stalest_place_and_tabs_still_open`: the
+//!   open-connection cap is a quarter of the descriptor limit. Under launchd's default soft
+//!   `RLIMIT_NOFILE` of 256, with idle drivers holding the cap, the connection past it is
+//!   served in the place of the driver served longest ago, which reads the hang-up, while the
+//!   window still opens tabs; `aterm ctl` at the cap is answered, for a sent verb and for its
+//!   own discovery, and the drivers it displaced are the stalest. Until 2026-10-19 the
+//!   connection past the cap got the busy line for as long as the drivers stayed
+//!   (ATERM-KI-1015-13). At a cap of waits, where nothing gives way, the connection past it
+//!   gets the busy line, and `aterm ctl` prints it for a sent verb and for its discovery.
 //! * `peers_that_stop_mid_exchange_take_no_lane`: peers that dialled and said nothing,
 //!   stopped half way through a request line or a frame's body, or did not read a large
 //!   answer are held by the parker, not a request lane; fresh clients are answered beside
@@ -554,7 +559,7 @@ fn idle_and_waiting_drivers_do_not_starve_a_new_client() {
 }
 
 #[test]
-fn the_connection_past_the_cap_is_told_busy_and_tabs_still_open() {
+fn the_connection_past_the_cap_takes_the_stalest_place_and_tabs_still_open() {
     roomy_test_process();
     let world = world("c");
     let sock = world.0.join("run/aterm/lanes.sock");
@@ -605,73 +610,107 @@ fn the_connection_past_the_cap_is_told_busy_and_tabs_still_open() {
         "cap: {} open at soft limit {soft_limit}; {cleared} momentary refusals retried",
         held.len()
     );
-    // At the cap: the connection past it gets the busy line — not a process
-    // out of descriptors, not a connection served past the cap.
-    let refusal = match idle_driver(&sock, &token) {
-        Ok(_) => panic!(
-            "the connection past {cap} open ones (soft descriptor limit {soft_limit}) was \
-             served: the socket must refuse at a quarter of the limit"
-        ),
-        Err(refused) => refused,
-    };
+    // At the cap the connection past it is served — never refused while drivers sit parked —
+    // in the place of the stalest: the driver served longest ago, closed for it, so the cap is
+    // never passed. The others are untouched.
+    let fresh = idle_driver(&sock, &token).unwrap_or_else(|refused| {
+        panic!(
+            "the connection past {cap} open idle ones (soft descriptor limit {soft_limit}) was \
+             refused: {refused:?}"
+        )
+    });
     assert_eq!(
-        refusal, BUSY,
-        "the connection past {cap} open ones (soft descriptor limit {soft_limit})"
+        held[0].waiting_reply().as_deref(),
+        Some("<EOF>"),
+        "the stalest driver, closed for the connection past the cap"
     );
-    for driver in &held {
-        bound_reads(driver.stream(), HANG);
+    for (index, driver) in held.iter_mut().enumerate().skip(1) {
+        assert_eq!(
+            driver.waiting_reply(),
+            None,
+            "held driver {index}, untouched"
+        );
     }
+    held.remove(0);
+    held.push(fresh);
 
     // The window still has descriptors for what it is for: new tabs.
+    let newest = held.len() - 1;
     for index in 0..3 {
-        let reply = held[0].request("spawn");
+        let reply = held[newest].request("spawn");
         assert!(
             reply.starts_with("OK s-"),
             "tab {index} could not open with {cap} control connections held: {reply:?}"
         );
     }
-    // And the cap still holds, in the documented words.
-    assert_eq!(probe(&sock, &token), BUSY, "a fresh client at the cap");
-    // `aterm ctl` at the cap reports the server's own busy line, for a verb it
-    // sends (`status`) and for the discovery it answers itself (`ls`) — never
-    // the write's `Broken pipe`, never "did not answer".
+    // `aterm ctl` at the cap is answered, for a verb it sends (`status`) and for the discovery
+    // it answers itself (`ls`): each connection it makes there takes the stalest's place.
+    for verb in ["status", "ls"] {
+        let out = aterm_ctl(&world.0, &sock, &[verb]);
+        assert!(
+            out.status.success(),
+            "aterm ctl {verb} at the cap: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // The drivers it displaced are the stalest, oldest first, and no others: every driver
+    // still open is served, in order, on the connection it holds.
+    let mut displaced = 0;
+    while displaced < held.len() && held[displaced].waiting_reply().as_deref() == Some("<EOF>") {
+        displaced += 1;
+    }
+    assert!(
+        displaced >= 1,
+        "aterm ctl at the cap displaced no driver: it was served past the cap"
+    );
+    for (index, driver) in held.iter_mut().enumerate().skip(displaced) {
+        let reply = driver.request("version");
+        assert!(
+            reply.starts_with("OK"),
+            "held driver {index} ({displaced} stalest displaced before it): {reply:?}"
+        );
+    }
+    eprintln!("past the cap: 1 + {displaced} stalest drivers displaced, the rest served");
+
+    // At a cap where nothing gives way — every connection held on a wait, none parked — a fresh
+    // client is refused at admission, and `aterm ctl` reports the server's own busy line, for a
+    // verb it sends (`status`) and for the discovery it answers itself (`ls`): never the write's
+    // `Broken pipe`, never "did not answer".
+    drop(held);
+    let mut reopened = 0;
+    let mut waits = Vec::new();
+    while waits.len() < cap {
+        waits.push(admitted_wait(&sock, &token, 180_000, &mut reopened).0);
+    }
+    // A probe answered just before the last wait landed may still sit parked for a moment, and
+    // gives way to the next client: the cap of waits refuses once it is gone (a hang detector).
+    let refused = aterm_spec::wait::within(HANG, Duration::from_millis(50), || {
+        (probe(&sock, &token) == BUSY).then_some(())
+    });
+    assert!(
+        refused.is_some(),
+        "a fresh client at a cap of {cap} waits was never refused"
+    );
     for verb in ["status", "ls"] {
         let out = aterm_ctl(&world.0, &sock, &[verb]);
         let said = String::from_utf8_lossy(&out.stderr);
         assert!(
             !out.status.success(),
-            "aterm ctl {verb} succeeded at the cap: {said}"
+            "aterm ctl {verb} succeeded at a cap of waits: {said}"
         );
         assert!(
             said.contains(BUSY),
-            "aterm ctl {verb} at the cap must say {BUSY:?}; it said: {said}"
+            "aterm ctl {verb} at a cap of waits must say {BUSY:?}; it said: {said}"
         );
         for wrong in ["did not answer", "Broken pipe"] {
             assert!(
                 !said.contains(wrong),
-                "aterm ctl {verb} at the cap said {wrong:?}: {said}"
+                "aterm ctl {verb} at a cap of waits said {wrong:?}: {said}"
             );
         }
     }
-    // Every held connection is still served (persistent drivers keep theirs).
-    for (index, driver) in held.iter_mut().enumerate() {
-        let reply = driver.request("version");
-        assert!(reply.starts_with("OK"), "held driver {index}: {reply:?}");
-    }
-    // One ends: its place is a fresh client's.
-    drop(held.pop());
-    let deadline = Instant::now() + HANG;
-    loop {
-        let reply = probe(&sock, &token);
-        if reply.starts_with("OK") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "a closed connection never gave its place back: {reply:?}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    eprintln!("a cap of {cap} waits: refused at admission ({reopened} waits opened again)");
+    drop(waits);
 }
 
 /// `aterm ctl --sock <sock> <args…>` in the world's isolation.

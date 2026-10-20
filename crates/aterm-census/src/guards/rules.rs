@@ -4,7 +4,7 @@
 
 //! The token guards: a banned name or literal in a scoped set of files.
 
-use super::{Bound, Finding, Line, Rule, SourceFile, Tree, after_ws, has, hits, is_word};
+use super::{Bound, Corpus, Finding, Line, Rule, SourceFile, Tree, after_ws, has, hits, is_word};
 
 /// Product source: everything the guards call the tree, vendored code aside.
 pub(super) const PRODUCT: &[&str] = &["crates/", "apps/"];
@@ -29,6 +29,7 @@ const ENGINE_CRATES: &[&str] = &[
     "crates/aterm-messages/",
     "crates/aterm-slog/",
     "crates/aterm-restore/",
+    "crates/amacs/",
 ];
 
 /// What an engine crate's shipped code may not name, and what each is.
@@ -73,8 +74,9 @@ const ENGINE_FRAMEWORKS: &[(&str, Bound)] = &[
 ];
 
 /// Is `rel` an engine crate's shipped default build? Test code (any path
-/// naming a test), build scripts, examples and the effects pack reader are
-/// not.
+/// naming a test, or a module its parent declares test-only:
+/// [`declared_test_modules`]), build scripts, examples and the effects pack
+/// reader are not.
 fn engine_shipped(rel: &str) -> bool {
     if !ENGINE_CRATES.iter().any(|c| rel.starts_with(c)) {
         return false;
@@ -96,6 +98,113 @@ pub(super) fn test_path(rel: &str) -> bool {
     })
 }
 
+/// The files that are test code by their parent's say, whatever their names:
+/// every out-of-line module a file declares at its top level inside an item
+/// whose `cfg` proves it test-only (`#[cfg(test)] mod rig;`, its `#[path]`
+/// followed), and everything in that module's own directory. Each entry is a
+/// file, or a directory prefix ending in `/`. A declaration nested in an
+/// inline module, or one whose file the corpus does not hold, names nothing,
+/// so its file stays shipped and read.
+fn declared_test_modules(corpus: &Corpus, prefixes: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    for parent in corpus.under(prefixes) {
+        if !parent.mentions(&["mod "]) {
+            continue;
+        }
+        let shipped: std::collections::BTreeSet<usize> =
+            parent.shipped_lines().map(|l| l.no).collect();
+        let lines: Vec<Line<'_>> = parent.lines().collect();
+        for (at, line) in lines.iter().enumerate() {
+            if shipped.contains(&line.no) || line.code.starts_with([' ', '\t']) {
+                continue;
+            }
+            let Some(name) = out_of_line_mod(line.code) else {
+                continue;
+            };
+            let attrs = lines[..at]
+                .iter()
+                .rev()
+                .take_while(|l| l.code.trim_start().starts_with("#["));
+            let path = attrs.filter_map(|l| path_attr(l.text)).next();
+            if let Some(file) = module_file(corpus, &parent.rel, name, path) {
+                let own = file
+                    .strip_suffix("/mod.rs")
+                    .or_else(|| file.strip_suffix(".rs"))
+                    .unwrap_or(&file);
+                out.push(format!("{own}/"));
+                out.push(file);
+            }
+        }
+    }
+    out
+}
+
+/// The module a body-less `mod` item declares (`pub(crate) mod rig;` gives
+/// `rig`), when `code` is one.
+fn out_of_line_mod(code: &str) -> Option<&str> {
+    let mut rest = code.trim();
+    if let Some(after) = rest.strip_prefix("pub") {
+        rest = after.trim_start();
+        if rest.starts_with('(') {
+            rest = rest.split_once(')')?.1.trim_start();
+        }
+    }
+    let name = rest
+        .strip_prefix("mod ")?
+        .trim_start()
+        .strip_suffix(';')?
+        .trim_end();
+    (!name.is_empty() && name.bytes().all(is_word)).then_some(name)
+}
+
+/// The path a `#[path = "…"]` attribute line names (the TEXT view keeps it).
+fn path_attr(text: &str) -> Option<&str> {
+    let rest = text
+        .trim()
+        .strip_prefix("#[path")?
+        .trim_start()
+        .strip_prefix('=')?;
+    rest.trim_start()
+        .strip_prefix('"')?
+        .split_once('"')
+        .map(|(p, _)| p)
+}
+
+/// The corpus file `mod name;` in `parent` loads: `path` against the parent's
+/// directory, else `name.rs` or `name/mod.rs` in the parent's module directory
+/// (its own directory for a `lib.rs`, `main.rs` or `mod.rs`, else the one its
+/// stem names).
+fn module_file(corpus: &Corpus, parent: &str, name: &str, path: Option<&str>) -> Option<String> {
+    let (dir, file) = parent.rsplit_once('/')?;
+    let candidates = match path {
+        Some(path) => vec![normal_path(&format!("{dir}/{path}"))?],
+        None => {
+            let base = if matches!(file, "lib.rs" | "main.rs" | "mod.rs") {
+                dir.to_string()
+            } else {
+                format!("{dir}/{}", file.strip_suffix(".rs")?)
+            };
+            vec![format!("{base}/{name}.rs"), format!("{base}/{name}/mod.rs")]
+        }
+    };
+    candidates.into_iter().find(|c| corpus.get(c).is_some())
+}
+
+/// `rel` with its `.` and `..` segments resolved; `None` when `..` climbs out.
+fn normal_path(rel: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rel.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            _ => parts.push(part),
+        }
+    }
+    Some(parts.join("/"))
+}
+
 pub(super) const ENGINE_PLATFORM: Rule = Rule {
     id: "engine-platform",
     why: "the engine crates build headless for every host (docs/ATERM_DESIGN.md §2.7): their \
@@ -106,8 +215,14 @@ pub(super) const ENGINE_PLATFORM: Rule = Rule {
 };
 
 fn engine_platform(tree: &Tree<'_>, out: &mut Vec<Finding>) {
+    let test_modules = declared_test_modules(tree.corpus, ENGINE_CRATES);
+    let declared_test = |rel: &str| {
+        test_modules
+            .iter()
+            .any(|t| rel == t || (t.ends_with('/') && rel.starts_with(t.as_str())))
+    };
     for file in tree.corpus.under(ENGINE_CRATES) {
-        if !engine_shipped(&file.rel) {
+        if !engine_shipped(&file.rel) || declared_test(&file.rel) {
             continue;
         }
         let needles: Vec<&str> = ENGINE_BANNED
@@ -413,7 +528,14 @@ fn protected_path(text: &str) -> Option<String> {
         }
     }
     for shape in ["/Volumes", "Library/Containers", "Library/CloudStorage"] {
-        if text.contains(shape) {
+        // `/System/Volumes/<volume>` is where macOS mounts its own volumes (the
+        // firmlinks point into `/System/Volumes/Data`), not the protected
+        // `/Volumes`; that folder spelled on the data volume
+        // (`/System/Volumes/Data/Volumes`) still counts.
+        if text
+            .match_indices(shape)
+            .any(|(at, _)| shape != "/Volumes" || !text[..at].ends_with("/System"))
+        {
             return Some(shape.to_string());
         }
     }
@@ -453,7 +575,7 @@ pub(super) const RUNLOOP_TIMER: Rule = Rule {
     why: "a late repeating CFRunLoopTimer is walked one interval at a time under the run-loop \
           lock (winit's 0.1 µs waker turned a long stop into minutes of main-thread spin); \
           aterm_objc::wake_timer is the one timer, so a second one is argued for there",
-    scope: WINIT_SOURCE,
+    scope: WINDOW_SOURCE,
     check: runloop_timer,
 };
 
@@ -468,7 +590,7 @@ fn runloop_scope(rel: &str) -> bool {
 
 /// The absorbed winit (`crates/aterm-window`), whose run loop the rule exists
 /// for; its scope, so a rename that empties it is reported.
-const WINIT_SOURCE: &[&str] = &["crates/aterm-window/src/"];
+const WINDOW_SOURCE: &[&str] = &["crates/aterm-window/src/"];
 
 fn runloop_timer(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for file in tree.corpus.under(PRODUCT) {
@@ -505,6 +627,7 @@ const GUI_FRAMEWORKS: &[&str] = &[
 const GUI_NAMES: &[&str] = &[
     "objc_msgSend",
     "NSApplication",
+    "aterm_window::",
     "winit::",
     "CGEvent",
     "NSWorkspace",
@@ -513,7 +636,7 @@ const GUI_NAMES: &[&str] = &[
 pub(super) const KEEPER_GUI: Rule = Rule {
     id: "keeper-gui",
     why: "the PTY keeper outlives the window because it is no WindowServer client: linking \
-          AppKit, CoreGraphics or winit, or sending an Objective-C message, would put every \
+          AppKit, CoreGraphics or aterm-window, or sending an Objective-C message, would put every \
           terminal it holds in WindowServer's blast radius",
     scope: KEEPER_SOURCE,
     check: keeper_gui,
@@ -694,6 +817,7 @@ const KEEPER_CRATE: &str = "crates/aterm-keeper";
 /// Workspace crates that are the GUI.
 const GUI_CRATES: &[&str] = &[
     "crates/aterm-gui",
+    "crates/aterm-window",
     "crates/aterm-objc",
     "crates/aterm-gpu",
     "crates/aterm-render",
@@ -1984,12 +2108,9 @@ pub(super) const STORE_CURRENT: Rule = Rule {
 /// How many lines after a `current` join its resolve may sit.
 const RESOLVE_REACH: usize = 6;
 
-/// Shipped Rust outside atpkg, which owns the store and the link, and
-/// aterm-toolchain, atpkg's std-only half (its discovery names the store's
-/// `current` as a candidate and resolves every candidate it chooses).
+/// Shipped Rust outside atpkg, which owns the store and the link.
 fn store_current_scope(rel: &str) -> bool {
     !(rel.starts_with("crates/atpkg/")
-        || rel.starts_with("crates/aterm-toolchain/")
         || rel.contains("/tests/")
         || rel.ends_with("_tests.rs")
         || rel.ends_with("/build.rs")
@@ -2183,6 +2304,44 @@ mod tests {
         );
     }
 
+    /// A module its parent declares test-only is test code whatever its name
+    /// (and so is what lies in its own directory); a shipped declaration, one
+    /// nested in an inline module, or a missing file exempts nothing.
+    #[test]
+    fn a_module_the_parent_declares_test_only_is_test_code() {
+        let threaded = "fn rig() { std::thread::scope(|s| { s.spawn(|| ()); }); }\n";
+        let lib = "pub mod writer;\n#[cfg(test)]\nmod rig;\n\
+                   #[cfg(all(test, unix))]\n#[path = \"../fixtures/deep_rig.rs\"]\nmod deep;\n\
+                   #[cfg(test)]\nmod tests {\n    mod inner;\n}\n#[cfg(test)]\nmod gone;\n";
+        let found = run(
+            &ENGINE_PLATFORM,
+            &[
+                ("crates/aterm-restore/src/lib.rs", lib),
+                ("crates/aterm-restore/src/rig.rs", threaded),
+                ("crates/aterm-restore/src/rig/part.rs", threaded),
+                ("crates/aterm-restore/fixtures/deep_rig.rs", threaded),
+                ("crates/aterm-restore/src/writer.rs", threaded),
+                ("crates/aterm-restore/src/inner.rs", threaded),
+            ],
+        );
+        assert_eq!(
+            spots(&found),
+            [
+                "crates/aterm-restore/src/inner.rs:1",
+                "crates/aterm-restore/src/writer.rs:1",
+            ],
+            "{found:?}"
+        );
+        assert_eq!(out_of_line_mod("pub(crate) mod rig;"), Some("rig"));
+        assert_eq!(out_of_line_mod("mod rig {"), None);
+        assert_eq!(path_attr("#[path = \"a/b.rs\"]"), Some("a/b.rs"));
+        assert_eq!(
+            normal_path("crates/x/src/../t/./y.rs").as_deref(),
+            Some("crates/x/t/y.rs")
+        );
+        assert_eq!(normal_path("../y.rs"), None);
+    }
+
     #[test]
     fn a_test_path_is_named_by_a_word_not_a_substring() {
         for rel in [
@@ -2255,6 +2414,8 @@ mod tests {
         let src = "let a = home.join(\"Documents\");\nlet b = \"~/Downloads/x\";\n\
                    let c = Path::new(\"/Volumes/Ext\");\nlet d = \"Library/CloudStorage\";\n\
                    // ~/Desktop in prose\nlet e = DocumentsView::new();\n\
+                   const DATA: &str = \"/System/Volumes/Data\";\n\
+                   let f = \"/System/Volumes/Data/Volumes/Ext\";\n\
                    #[cfg(test)]\nmod tests {\n    const P: &str = \"~/Documents\";\n}\n";
         let found = run(
             &PROTECTED_FOLDER,
@@ -2271,6 +2432,7 @@ mod tests {
                 "crates/aterm-gui/src/lib.rs:2",
                 "crates/aterm-gui/src/lib.rs:3",
                 "crates/aterm-gui/src/lib.rs:4",
+                "crates/aterm-gui/src/lib.rs:8",
             ]
         );
     }

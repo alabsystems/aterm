@@ -8,6 +8,8 @@ use crate::damage::Damage;
 use crate::extra::{CellCoord, CellExtra};
 use crate::extra_collection::CellExtras;
 
+use super::AnchorSet;
+
 /// Change to the grid's monotonic absolute-row coordinate space.
 ///
 /// Top-anchored partial scrolling inserts new logical rows immediately before
@@ -327,7 +329,10 @@ impl SelectionDamage {
 /// Every resize overwrites the whole record. On a width change `reflowed` says
 /// whether the column rewrap ran, and `pushed`/`revealed`/`appended` count rows
 /// after it, so `revealed - demoted` is a displacement only when `reflowed` is
-/// false.
+/// false. A resize that moves both axes of a reflowing grid that keeps history
+/// runs as its rows-only resize, then the width change (`Grid::split_rows_step`):
+/// the record holds the rows step's counts, with the width change's `reflowed`
+/// and `cut`.
 ///
 /// `Copy` and allocation-free: written by the resize arms, drained through
 /// `Grid::take_last_resize_shape`.
@@ -356,7 +361,9 @@ pub struct ResizeShape {
     /// an earlier shrink with nothing drawn since, now back where they were.
     pub restored_top: u16,
     /// Rows an earlier shrink pushed off the bottom, put back there by this
-    /// grow from the resize undo. Not counted in `appended`; no row moved.
+    /// grow: from the resize undo, or, on a grid that keeps history, from the
+    /// newest history lines the rows hand-back owes (`grid::resize_handback`).
+    /// Not counted in `appended` or `revealed`; no row moved.
     pub restored_bottom: u16,
     /// This grow handed back every row the resize undo held and landed on the
     /// height its first shrink started from: the whole run of resizes since
@@ -366,6 +373,13 @@ pub struct ResizeShape {
     /// A width change ran the column rewrap (primary-screen reflow), which
     /// renumbers rows wholesale.
     pub reflowed: bool,
+    /// Columns of drawn cells a narrowing with no rewrap (the alternate
+    /// screen) cut off the right edge: one past the rightmost visible cell
+    /// at or beyond the new width that was not blank, less the new width. A
+    /// grow back brings blank columns there, so until the program draws them
+    /// again the screen is missing what it painted. 0 on a widening, on a
+    /// rewrap and when every cut cell was blank.
+    pub cut: u16,
 }
 
 #[doc(hidden)]
@@ -423,6 +437,10 @@ pub struct GridPresentationState {
     /// reads this as an exact explanation of that epoch step. Drained once per
     /// batch by `take_row_band_moves()`.
     pub row_band_moves: RowBandMoves,
+    /// The holder fence's span anchors, moved by the same choke points that
+    /// write `row_band_moves` and the splice (see [`AnchorSet`]). Empty, and
+    /// every hook a single branch, until a drawer runs.
+    pub anchors: AnchorSet,
     /// Pending logical-row insertion for durable absolute-row metadata.
     pub pending_absolute_row_update: Option<AbsoluteRowUpdate>,
     /// Independent copy retained until terminal post-processing remaps the

@@ -587,10 +587,11 @@ impl NudgeHost {
                 let view = driver.epoch_view;
                 w.log(format!(
                     "would-nudge session={sid} reason={} class=agent epoch={epoch} shift={:+} \
-                     pushed={} drew={} answered_before={}",
+                     pushed={} cut={} drew={} answered_before={}",
                     reason.word(),
                     view.map_or(0, |v| v.shift),
                     view.map_or(0, |v| v.pushed),
+                    view.map_or(0, |v| v.cut),
                     view.map_or(0, |v| u8::from(v.drew)),
                     driver
                         .last_answer_ms
@@ -758,7 +759,7 @@ impl NudgeWorld for AppWorld<'_> {
             let term = crate::term_try_lock(&s.term)?;
             (
                 term.modes().alternate_screen,
-                term.render_debt() != (0, 0),
+                term.render_debt().owed(),
                 term.text_selection().has_selection(),
                 term.modes().synchronized_output,
                 term.full_clear_count(),
@@ -1163,6 +1164,7 @@ mod tests {
                 epoch: 7,
                 shift: -1,
                 pushed: 0,
+                cut: 0,
                 drew: true,
             })
         }

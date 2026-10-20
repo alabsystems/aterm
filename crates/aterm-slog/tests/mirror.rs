@@ -1418,3 +1418,224 @@ fn a_restored_sessions_lineage_sids_reach_the_bus() {
         .collect();
     assert_eq!(keys, want, "the sid-valued keys on the bus: {take:#?}");
 }
+
+/// Mirror counters read from a carry stay inside the log's sequence domain.
+/// Ordinary mirrored and older carries still adopt; oversized headers and
+/// records are refused before any take can use them as arithmetic operands.
+#[test]
+fn a_mirrored_carry_refuses_counters_past_its_sequence_domain() {
+    let mut log = Log::new(1);
+    session(&mut log);
+    cmd(&mut log, 10, true);
+    let older = log
+        .carry(CarryBudget::SESSION, &[])
+        .expect("older carry")
+        .lines;
+    assert!(Log::from_carry(&older, adopt(&log, 20)).is_ok());
+    let _ = log.bus_copy(1, at(20));
+    let lines = log
+        .carry(CarryBudget::SESSION, &[])
+        .expect("mirrored carry")
+        .lines;
+    let (mut accepted, _, _) =
+        Log::from_carry(&lines, adopt(&log, 30)).expect("valid mirrored carry");
+    assert!(!accepted.bus_copy(64, at(40)).is_empty());
+    let header = |key: &str, value: &str| {
+        let mut changed = lines.clone();
+        let prefix = format!("{key}=");
+        let mut words: Vec<String> = changed[0]
+            .split_whitespace()
+            .filter(|w| !w.starts_with(prefix.as_str()))
+            .map(str::to_string)
+            .collect();
+        words.push(format!("{key}={value}"));
+        changed[0] = words.join(" ");
+        changed
+    };
+    // A prior space inside the domain remains a valid carry addition.
+    assert!(Log::from_carry(&header("prior", "0:0:0:1"), adopt(&log, 30)).is_ok());
+    let mut huge_record = header("ms", &u64::MAX.to_string());
+    let record = huge_record
+        .iter_mut()
+        .find(|l| l.starts_with("R 1 "))
+        .expect("the session's numbered open");
+    *record = record.replacen("R 1 ", &format!("R {} ", u64::MAX), 1);
+    // Keep its following records monotonically numbered, so only the new
+    // domain guard refuses this small record/header pair.
+    let records: Vec<String> = huge_record
+        .iter()
+        .filter(|l| l.starts_with("R "))
+        .cloned()
+        .collect();
+    for old in records.into_iter().skip(1) {
+        let raw = old.splitn(3, ' ').nth(2).expect("record");
+        let i = huge_record.iter().position(|l| l == &old).unwrap();
+        huge_record[i] = format!("r {raw}");
+    }
+    let malformed = [
+        header("ms", &(log.last_seq() + 1).to_string()),
+        header("snap", &(log.ms_head() + 1).to_string()),
+        header("prior", &format!("0:0:0:{}", u64::MAX)),
+        header("prior", &format!("0:{}:0:1", u64::MAX)),
+        header("prior", "0:0:2:1"),
+        huge_record,
+    ];
+    let refused = malformed
+        .iter()
+        .all(|carry| Log::from_carry(carry, adopt(&log, 30)).is_err());
+    assert!(
+        refused,
+        "MIRROR_CARRY_COUNTERS_MUST_STAY_IN_THE_SEQUENCE_DOMAIN"
+    );
+}
+
+/// A real snapshot whose bounded need words omit live claims is partial,
+/// and restoring a mark's provenance never turns its claim into an observation.
+#[test]
+fn a_late_snapshot_reports_omitted_needs_and_keeps_mark_claims_as_claims() {
+    let make = |n: usize| {
+        let mut log = Log::new(1);
+        session(&mut log);
+        for i in 0..n {
+            let sid = ShortId::new(&format!("s-edge-{i:02}")).unwrap();
+            log.mark(
+                Mark::new(Kind::Need, Src::Mark, Conf::Claim)
+                    .by(Actor::Sid(sid))
+                    .fields(Fields::new().word(Key::Word, "help").unwrap()),
+                at(i as u64 + 1),
+            )
+            .unwrap();
+        }
+        log.bus_copy(64, at(20)).encode(Tier::Wire, &alias)
+    };
+    let take = make(8);
+    let snap = take
+        .slots
+        .iter()
+        .find(|s| s.kind == SlotKind::Snap)
+        .unwrap();
+    let snap_rec = decode_bus(&snap.body).unwrap();
+    let retained = snap_rec
+        .rec
+        .f
+        .get_str(Key::Needs)
+        .unwrap()
+        .split(',')
+        .count();
+    assert!(
+        retained < 8,
+        "PRECONDITION: actual field cap omits a live need"
+    );
+    // Holding the complete record stream needs no snapshot and stays whole.
+    let mut full = BusSpace::new(1);
+    for slot in &take.slots {
+        full.offer(decode_bus(&slot.body).unwrap());
+    }
+    let (full_fold, full_seed) = full.fold_seeded();
+    assert_eq!(full_seed, aterm_slog::bus::Seed::Start);
+    assert_eq!(full_fold.state().needs.iter().flatten().count(), 8);
+    // A small new snapshot fits completely and remains a whole seed.
+    let small_take = make(1);
+    let small = small_take
+        .slots
+        .iter()
+        .find(|s| s.kind == SlotKind::Snap)
+        .unwrap();
+    let mut complete = BusSpace::new(1);
+    complete.offer(decode_bus(&small.body).unwrap());
+    assert!(!complete.fold_seeded().1.partial());
+    // Legacy snapshots still decode and seed, but cannot establish that
+    // their bounded words held all needs. Their missing count is not zero.
+    let legacy = small.body.replace(" n=1", "");
+    let mut legacy_view = BusSpace::new(1);
+    legacy_view.offer(decode_bus(&legacy).unwrap());
+    let (legacy_fold, legacy_seed) = legacy_view.fold_seeded();
+    assert_eq!(legacy_fold.state().needs.iter().flatten().count(), 1);
+    let mut late = BusSpace::new(1);
+    late.offer(snap_rec);
+    let (fold, seed) = late.fold_seeded();
+    let text = aterm_slog::brief(
+        "s-late",
+        late.records(),
+        None,
+        fold.state(),
+        512,
+        at(30).wall_ms,
+    )
+    .text;
+    let claim_text = text.contains("claim need help by=e")
+        && text.contains(" ago [?]")
+        && !text.contains("need=help");
+    assert!(
+        seed.partial()
+            && seed.why() == Some("snapshot-needs")
+            && legacy_seed.partial()
+            && legacy_seed.why() == Some("snapshot-needs")
+            && claim_text,
+        "SNAPSHOT_NEED_OMISSION_MUST_BE_PARTIAL_AND_MARKS_MUST_STAY_CLAIMS"
+    );
+}
+
+/// PHASE 3B (A5, §6 items 5 and 6): an exact outcome refinement and an exact
+/// wall confirmation are bus class (a turn amend, a wall step's amend), so a
+/// bus fold holding the space from its first record re-buckets and raises
+/// the need's source exactly as the host fold does: their bus facts and bus
+/// totals agree after each.
+#[test]
+fn an_out_refining_amend_and_a_confirmation_agree_on_host_and_bus() {
+    use aterm_slog::{Amend, TurnTracker, Verdict, WallKind};
+    let mut log = Log::new(1);
+    let run = agent_session(&mut log, 0);
+    let mut tr = TurnTracker::new(run);
+    tr.observe(&mut log, Verdict::Busy, None, at(10));
+    tr.observe(&mut log, Verdict::Idle, None, at(20));
+    tr.tick(&mut log, at(1100));
+    let t1 = log.state().last[1].as_ref().expect("a closed turn").node;
+    let mut view = BusSpace::new(1);
+    drain(&mut log, &mut view, 1200);
+    let agree = |log: &Log, view: &BusSpace, what: &str| {
+        let (bus, _) = view.fold();
+        assert_eq!(bus.bus_facts(&same), log.fold().bus_facts(&alias), "{what}");
+        assert_eq!(bus.bus_totals(), log.fold().bus_totals(), "{what}");
+    };
+    agree(&log, &view, "before");
+    log.amend(
+        t1,
+        Amend::new(
+            Kind::Turn,
+            Src::Transcript,
+            Conf::Exact,
+            Fields::new()
+                .word(Key::Out, "wall:usage-session")
+                .expect("out"),
+        ),
+        at(1300),
+    )
+    .expect("amends");
+    assert_eq!(log.fold().bus_totals().walled, 1);
+    drain(&mut log, &mut view, 1400);
+    agree(&log, &view, "after the refinement");
+    // A wall the screen sees, then the transcript confirms.
+    tr.observe(&mut log, Verdict::Busy, None, at(1500));
+    tr.observe(
+        &mut log,
+        Verdict::Wall(WallKind::UsageWeekly),
+        None,
+        at(1600),
+    );
+    let wall = log.state().step().expect("the wall").node;
+    log.amend(
+        wall,
+        Amend::new(
+            Kind::Wall,
+            Src::Transcript,
+            Conf::Exact,
+            Fields::new().u(Key::Confirmed, 1).expect("confirmed"),
+        ),
+        at(1700),
+    )
+    .expect("confirms");
+    assert_eq!(log.state().top_need().map(|n| n.src), Some(Src::Transcript));
+    drain(&mut log, &mut view, 1800);
+    agree(&log, &view, "after the confirmation");
+}

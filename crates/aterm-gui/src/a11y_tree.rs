@@ -3,20 +3,18 @@
 
 //! Accessibility projection of the terminal window: the visible grid, the tab strip, the
 //! find field and the chrome messages, mapped into an [`aterm_a11y::model::TreeUpdate`] that the
-//! AT-SPI publisher (`aterm_a11y::atspi`, through `a11y_adapter`) serves to Linux screen
-//! readers. Native Settings and Manual publish through `native_accessibility`; the
+//! native publishers (through `a11y_adapter`) serve to screen readers. Native Settings and Manual publish through `native_accessibility`; the
 //! transient overlays build their own trees beside their painters.
 //!
 //! This module is the pure mapping (model → `TreeUpdate`), unit-tested without a window.
 //! The `a11y_adapter::Adapter` that attaches it to a live window is the event-loop
 //! wiring built on this seam.
 //!
-//! Compiled under the `a11y_tree` cfg (`build.rs`): on Linux. macOS publishes through
-//! its own `a11y-appkit` grid publisher; Windows publishes no accessibility tree.
+//! Compiled with the native accessibility publisher under `a11y_tree` (`build.rs`).
 
 use aterm_a11y::model::{
-    Action, Live, Node, NodeId, Rect, Role, TextDirection, TextPosition, TextSelection, Tree,
-    TreeId, TreeUpdate,
+    Action, ActionContext, ActionRequest, Live, Node, NodeId, Rect, Role, TextDirection,
+    TextPosition, TextSelection, Tree, TreeId, TreeUpdate,
 };
 
 /// The window's root accessibility node.
@@ -54,10 +52,11 @@ const MENU_ROWS: u64 = 64;
 /// The bits of a menu's epoch: with [`MENU_ROWS`] slots each, the last item id stays
 /// below [`CHIP_BASE`] (`MENU_BASE + 1 + (2^22 − 1) · 64 + 63 < 2^30`).
 const MENU_EPOCH_BITS: u32 = 22;
-/// The harness's chips in a Claude Code composer rule (design §9.2.1) are
-/// `CHIP_BASE + session · 2 + chip` ([`chip_for`]): Autopilot `0`, `⚙` `1`. Between the
-/// menu's range and [`TAB_BASE`], so [`tab_index_for`] and [`ChromeMessage::from_node`]
-/// refuse a chip and a click on one never decodes as a tab switch or a band's capsule.
+/// The chips in a Claude Code composer rule (design §9.2.1, owner surfaces §5) are
+/// `CHIP_BASE + session · 3 + chip` ([`chip_for`]): Autopilot `0`, `⚙` `1`, Team `2`.
+/// Between the menu's range and [`TAB_BASE`], so [`tab_index_for`] and
+/// [`ChromeMessage::from_node`] refuse a chip and a click on one never decodes as a tab
+/// switch or a band's capsule.
 const CHIP_BASE: u64 = 1 << 30;
 /// Tab items are `TAB_BASE + tab_index`. A high, disjoint range so a tab id can never be
 /// mistaken for any other node by [`crate::App::on_accessibility_action`]'s routing.
@@ -159,6 +158,8 @@ pub(crate) struct GridGeometry {
 pub(crate) struct GridTab {
     /// The tab's index in the window's tab set — the argument `switch_tab_in` takes.
     pub(crate) index: usize,
+    /// The stable tab id captured with this slot.
+    pub(crate) id: u64,
     /// The label the strip painted for this tab.
     pub(crate) title: String,
     /// This is the active tab.
@@ -262,8 +263,8 @@ pub(crate) enum ChromeMessage {
         /// implicit `Details ›` ([`capsule_index`] / [`capsule_action`]).
         index: u8,
     },
-    /// The presence band (`crate::presence`): who is driving this window's session, its
-    /// phase, mail and link, spoken as one sentence ("driven by manager, turn 41").
+    /// The needs pill (`crate::presence`): the window's most pressing need as the pill
+    /// says it, spoken without its age so the sentence moves only with the need.
     PresenceStatus,
 }
 
@@ -436,6 +437,8 @@ pub(crate) struct BandCapsule {
 pub(crate) struct GridMessage {
     /// Which surface this is — and, through it, the node id, the role and the politeness.
     pub(crate) message: ChromeMessage,
+    /// The owner and action-list revision published with this row and its capsules.
+    pub(crate) context: Option<ActionContext>,
     /// The sentence a screen reader speaks. Stable while the surface says the same thing.
     pub(crate) text: String,
     /// Live figures, key hints, the rest of a multi-line banner: read on demand.
@@ -464,7 +467,8 @@ pub(crate) struct GridMessage {
     pub(crate) capsules: Vec<BandCapsule>,
 }
 
-/// One of the harness's two chips in a Claude Code composer rule (design §9.2.1, §2.3).
+/// One of the chips in a Claude Code composer rule the tree publishes: the harness's two
+/// (design §9.2.1, §2.3) and the Team chip (owner surfaces §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HarnessChip {
     /// The Autopilot chip: a click steps the session's word (or opens Settings ▸ Harness
@@ -472,14 +476,21 @@ pub(crate) enum HarnessChip {
     Autopilot,
     /// `⚙`: a click opens Settings ▸ Harness.
     Settings,
+    /// The Team chip (`✋ you`, `⇠ <manager>`, `⇉N`): a click hands the tab back, goes to
+    /// the manager, or opens the Overview at a manager.
+    Team,
 }
 
 impl HarnessChip {
-    /// Its place in its session's pair of ids.
+    /// The chips a session's ids have room for.
+    const SLOTS: u64 = 3;
+
+    /// Its place in its session's ids.
     const fn index(self) -> u64 {
         match self {
             Self::Autopilot => 0,
             Self::Settings => 1,
+            Self::Team => 2,
         }
     }
 }
@@ -548,7 +559,7 @@ pub(crate) struct GridMenu {
 /// range (no local id is).
 fn chip_node_id(session: u64, chip: HarnessChip) -> Option<NodeId> {
     let id = session
-        .checked_mul(2)
+        .checked_mul(HarnessChip::SLOTS)
         .and_then(|at| at.checked_add(chip.index()))
         .and_then(|at| CHIP_BASE.checked_add(at))?;
     (id < TAB_BASE).then_some(NodeId(id))
@@ -561,12 +572,12 @@ pub(crate) fn chip_for(node: NodeId) -> Option<(u64, HarnessChip)> {
         .0
         .checked_sub(CHIP_BASE)
         .filter(|_| node.0 < TAB_BASE)?;
-    let chip = if at % 2 == 0 {
-        HarnessChip::Autopilot
-    } else {
-        HarnessChip::Settings
+    let chip = match at % HarnessChip::SLOTS {
+        0 => HarnessChip::Autopilot,
+        1 => HarnessChip::Settings,
+        _ => HarnessChip::Team,
     };
-    Some((at / 2, chip))
+    Some((at / HarnessChip::SLOTS, chip))
 }
 
 /// Fold a hash of the menu's rows to a menu epoch ([`GridMenu::epoch`]).
@@ -729,14 +740,29 @@ fn tab_node_id(index: usize) -> NodeId {
     NodeId(TAB_BASE + index as u64)
 }
 
-/// Decode a screen reader's action target back to a tab index, or `None` when the id is
-/// not one of [`grid_tree`]'s tab items. Rejects rather than clamps, so a stale request
-/// never switches to the wrong tab.
+/// Decode the slot of a tab node. Action delivery must also validate its
+/// publication's stable owner with [`tab_action_index`].
 pub(crate) fn tab_index_for(node: NodeId) -> Option<usize> {
     node.0
         .checked_sub(TAB_BASE)
         .filter(|offset| *offset < (ROW_BASE - TAB_BASE))
         .map(|offset| offset as usize)
+}
+
+/// The request still addresses the stable tab that occupied its published slot.
+/// The caller supplies the live tab id; the queued context is never restamped.
+pub(crate) fn tab_action_index(
+    request: &ActionRequest,
+    id_at: impl FnOnce(usize) -> Option<u64>,
+) -> Option<usize> {
+    if request.target_tree != TreeId::ROOT
+        || !matches!(request.action, Action::Click | Action::Focus)
+    {
+        return None;
+    }
+    let index = tab_index_for(request.target_node)?;
+    let expected = ActionContext::tab(id_at(index)?);
+    (request.context == Some(expected)).then_some(index)
 }
 
 /// Word starts within one line, in character indices, as the model defines them: index 0
@@ -770,9 +796,8 @@ fn row_run_id(slot: usize, row: usize, chunk: usize) -> NodeId {
 ///
 /// The column is clamped to the text the row publishes (trailing blanks trimmed), so a
 /// position in empty cells lands on the row's hard line break, not past the node's end:
-/// the model's rule, and the clamp
-/// [`crate::accessibility::AccessibleSnapshot::cursor_offset`] applies, so AT-SPI
-/// `CaretOffset` and macOS `AXSelectedTextRange` agree. The position names the run it
+/// the model's rule. Native publishers convert this same model position to their
+/// platform offset units. The position names the run it
 /// sits in, since a row wider than [`RUN_CHARS`] is several runs ([`row_chunks`]).
 fn text_position(slot: usize, lines: &[&str], row: usize, col: usize) -> Option<TextPosition> {
     let line = lines.get(row)?;
@@ -956,6 +981,9 @@ fn push_message(
     node.set_label(message.text.clone());
     node.set_value(message.text.clone());
     node.set_live(message.message.politeness());
+    if let Some(context) = message.context {
+        node.set_action_context(context);
+    }
     if let Some(detail) = &message.detail {
         node.set_description(detail.clone());
     }
@@ -993,7 +1021,10 @@ fn push_message(
                     y1: y0 + g.bar_h,
                 });
             }
-            button.add_action(Action::Click);
+            if let Some(context) = message.context {
+                button.set_action_context(context);
+                button.add_action(Action::Click);
+            }
             let child = kind.node_id();
             nodes.push((child, button));
             children.push(child);
@@ -1009,7 +1040,7 @@ fn push_message(
         node.set_max_numeric_value(1.0);
         node.set_numeric_value(f64::from(fill.clamp(0.0, 1.0)));
     }
-    if message.activates {
+    if message.activates && message.context.is_some() {
         node.add_action(Action::Click);
     }
     nodes.push((id, node));
@@ -1031,7 +1062,11 @@ pub(crate) fn grid_tree(
     geom: Option<GridGeometry>,
     frame: &GridFrame<'_>,
 ) -> TreeUpdate {
-    let rows = snap.value().split_inclusive('\n').count();
+    let rows = if frame.panes.is_empty() {
+        snap.value().split_inclusive('\n').count()
+    } else {
+        snap.rows
+    };
     let mut nodes: Vec<(NodeId, Node)> =
         Vec::with_capacity(rows + frame.tabs.len() + frame.panes.len() + frame.messages.len() + 5);
     let mut root_children: Vec<NodeId> =
@@ -1049,6 +1084,7 @@ pub(crate) fn grid_tree(
                 node.set_description(format!("theme {theme}"));
             }
             node.set_selected(tab.selected);
+            node.set_action_context(ActionContext::tab(tab.id));
             node.add_action(Action::Click);
             node.add_action(Action::Focus);
             if let Some(g) = geom
@@ -1254,6 +1290,15 @@ mod tests {
         assert_eq!(button.role(), Role::Button);
         assert_eq!(button.label(), Some("Packages"));
         assert!(button.supports_action(Action::Click));
+        assert_eq!(button.action_context(), bars[0].context);
+        assert_eq!(
+            node(&update, bars[0].message.node_id()).action_context(),
+            bars[0].context
+        );
+        let mut unbound = bars.clone();
+        unbound[0].context = None;
+        let unbound = grid_tree(&snap, Some(GEOM), &frame(&unbound));
+        assert!(!node(&unbound, capsule.node_id()).supports_action(Action::Click));
         let b = button.bounds().expect("a capsule has its cells");
         assert_eq!(b.x0, GEOM.origin_x + 10.0 * GEOM.cell_w);
         assert_eq!(b.x1, GEOM.origin_x + 16.0 * GEOM.cell_w);
@@ -1364,8 +1409,7 @@ mod tests {
     }
 
     /// The caret is a degenerate selection on the cursor's row run at the cursor's column,
-    /// at exactly the offset `AccessibleSnapshot::cursor_offset` reports (AT-SPI's
-    /// `CaretOffset`, macOS's `AXSelectedTextRange`), so the platforms agree.
+    /// with the same model position consumed by every native publisher.
     #[test]
     fn caret_is_a_degenerate_selection_at_the_cursor() {
         let snap = live_grid(3, 12, b"alpha\r\nbeta", Some((1, 4)));
@@ -1381,12 +1425,10 @@ mod tests {
             "on row 1's run"
         );
         assert_eq!(selection.focus.character_index, 4);
-        // The global offset this resolves to: "alpha\n" is 6 characters, + column 4.
-        assert_eq!(snap.cursor_offset(), Some(10));
     }
 
     /// A caret in a row's trailing blanks clamps onto that row's hard line break
-    /// (the model's rule), matching `cursor_offset`'s own clamp.
+    /// (the model's rule).
     #[test]
     fn caret_in_trailing_blanks_clamps_onto_the_line_break() {
         let snap = live_grid(2, 20, b"hi", Some((0, 17)));
@@ -1397,11 +1439,6 @@ mod tests {
             selection.focus.character_index, 2,
             "clamped to the trimmed row length — the index of the '\\n'"
         );
-        assert_eq!(
-            snap.cursor_offset(),
-            Some(2),
-            "same offset as the AppKit publisher"
-        );
     }
 
     /// A hidden cursor (DECTCEM) publishes no selection; AT-SPI then reports caret
@@ -1411,7 +1448,6 @@ mod tests {
         let snap = live_grid(2, 10, b"hello", None);
         let update = grid_tree(&snap, None, &GridFrame::default());
         assert_eq!(node(&update, GRID).text_selection(), None);
-        assert_eq!(snap.cursor_offset(), None);
     }
 
     /// A row wider than the `[u8]` word-index space is published as several runs, each
@@ -1536,6 +1572,7 @@ mod tests {
         let tabs = vec![
             GridTab {
                 index: 0,
+                id: (1 << 60) + 11,
                 title: "build".into(),
                 selected: false,
                 start_col: 0,
@@ -1544,6 +1581,7 @@ mod tests {
             },
             GridTab {
                 index: 1,
+                id: (1 << 60) + 12,
                 title: "logs".into(),
                 selected: true,
                 start_col: 10,
@@ -1599,6 +1637,39 @@ mod tests {
             None,
             "a row run is not a tab"
         );
+        // The producer's exact stable identity travels with the queued request.
+        let mut request = ActionRequest {
+            context: logs.action_context(),
+            action: Action::Click,
+            target_tree: TreeId::ROOT,
+            target_node: tab_node_id(1),
+            data: None,
+        };
+        let lookup = |index: usize| tabs.get(index).map(|tab| tab.id);
+        assert_eq!(tab_action_index(&request, lookup), Some(1));
+        request.action = Action::Focus;
+        assert_eq!(tab_action_index(&request, lookup), Some(1));
+        assert_eq!(request.context, Some(ActionContext::tab(tabs[1].id)));
+        // A same-count reorder keeps the slot but changes its actual owner.
+        let mut reordered = tabs.clone();
+        reordered.swap(0, 1);
+        assert_eq!(
+            tab_action_index(&request, |index| reordered.get(index).map(|tab| tab.id)),
+            None
+        );
+        assert_eq!(tab_action_index(&request, |_| None), None, "closed tab");
+        for context in [
+            None,
+            Some(ActionContext::new(tabs[1].id, 0)),
+            Some(ActionContext::message(tabs[1].id, 0)),
+        ] {
+            request.context = context;
+            assert_eq!(
+                tab_action_index(&request, lookup),
+                None,
+                "unbound or wrong domain"
+            );
+        }
     }
 
     /// A painted selection is published as the terminal's text selection and outranks
@@ -1775,6 +1846,13 @@ mod tests {
     fn message(message: ChromeMessage, text: &str) -> GridMessage {
         GridMessage {
             message,
+            context: match message {
+                ChromeMessage::BandRow0 | ChromeMessage::BandRow1 | ChromeMessage::BandRow2 => {
+                    Some(ActionContext::message(7, 0))
+                }
+                ChromeMessage::BandOverflow => Some(ActionContext::message_log()),
+                _ => None,
+            },
             text: text.to_string(),
             detail: None,
             progress: None,
@@ -1818,6 +1896,7 @@ mod tests {
         let snap = live_grid(2, 20, b"hi", None);
         let at = |done: &str, fill: f32| GridMessage {
             message: ChromeMessage::BandRow0,
+            context: Some(ActionContext::message(7, 0)),
             text: "Updating to aterm v0.48.0 \u{00b7} downloading".to_string(),
             detail: Some(format!("{done} / 1.2 GB")),
             progress: Some(fill),
@@ -2062,10 +2141,10 @@ mod tests {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | ':' | ','))
     }
 
-    /// THE HARNESS'S CHIPS ARE BUTTONS IN WORDS (design §9.2.1): each drawn chip is one
-    /// clickable `Role::Button` over its cells, named with no symbol, the newest act its
-    /// description and never a live region; their ids decode back to the chip and are
-    /// refused by the tab and message decoders. NEGATIVE CONTROL: the words check
+    /// THE HARNESS'S CHIPS ARE BUTTONS IN WORDS (design §9.2.1): each drawn chip
+    /// (Autopilot, `⚙` and the Team chip) is one clickable `Role::Button` over its cells,
+    /// named with no symbol, the newest act its description and never a live region;
+    /// their ids decode back to the chip and are refused by the tab and message decoders. NEGATIVE CONTROL: the words check
     /// refuses a glyph (`∞ cruise`), and a frame with no chip publishes no chip node.
     #[test]
     fn the_harness_chips_are_buttons_named_in_words() {
@@ -2089,6 +2168,15 @@ mod tests {
                 col: 6,
                 width: 1,
             },
+            GridChip {
+                session: 4,
+                chip: HarnessChip::Team,
+                label: "Worker of fmt".to_string(),
+                description: Some("Goes to its manager.".to_string()),
+                row: 2,
+                col: 8,
+                width: 1,
+            },
         ];
         let update = grid_tree(
             &snap,
@@ -2102,7 +2190,10 @@ mod tests {
             .iter()
             .map(|c| chip_node_id(c.session, c.chip).expect("an id"))
             .collect();
-        assert_eq!(node(&update, ROOT).children(), [ids[0], ids[1], GRID]);
+        assert_eq!(
+            node(&update, ROOT).children(),
+            [ids[0], ids[1], ids[2], GRID]
+        );
         for (chip, id) in chips.iter().zip(&ids) {
             let n = node(&update, *id);
             assert_eq!(n.role(), Role::Button);
@@ -2124,7 +2215,7 @@ mod tests {
             assert_eq!(tab_index_for(*id), None);
             assert_eq!(ChromeMessage::from_node(*id), None);
             // Autopilot's menu is announced and reachable without a pointer (design
-            // §9.3.3); `⚙` has none (NEGATIVE CONTROL).
+            // §9.3.3); `⚙` and Team have none (NEGATIVE CONTROL).
             let menu = chip.chip == HarnessChip::Autopilot;
             assert_eq!(
                 n.has_popup(),

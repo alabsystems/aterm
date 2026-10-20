@@ -58,6 +58,24 @@ pub fn covers_symbol(ch: char) -> bool {
     symbols::covers(ch)
 }
 
+/// Whether `ch` is one of Claude Code's spinner frames the symbol set draws
+/// (`✢ ✳ ✶ ✻ ✽`), which the renderer draws ahead of every face where the
+/// primary yields them to the chain and the chain's faces would draw them
+/// soft, below `bundled::SPINNER_STARS_CRISP_PX`
+/// (`Renderer::spinner_star_preempts`). From that size up the faces draw
+/// them, their weights evened across the cycle (`Renderer::even_spinner_frame`).
+pub fn is_spinner_star(ch: char) -> bool {
+    symbols::is_spinner_star(ch)
+}
+
+/// The [`is_spinner_star`] frames, `✢ ✳ ✶ ✻ ✽`.
+pub const SPINNER_STARS: [char; 5] = symbols::SPINNER_STARS;
+
+/// The spinner frame Claude Code rests on: `✻` also opens the line it leaves
+/// under every finished turn (`✻ Worked for 1m 3s`), so it is the frame a
+/// transcript shows most.
+pub const SPINNER_REST: char = '\u{273B}';
+
 /// The last-resort coverage bitmap for a [`covers_symbol`] char: row-major
 /// `span * cell_w` × `cell_h` bytes (`span` is the glyph's cell count, clamped
 /// to `1..=2`; a wide emoji-presentation symbol is centred across both cells),

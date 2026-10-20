@@ -234,17 +234,19 @@ const FILE_PREFIX: &str = "asked-";
 /// a stamp and a snapshot of the same process compare equal. `None` when it cannot be read (on
 /// macOS also a zombie or another uid's process).
 ///
-/// On macOS it is read by syscall ([`aterm_uds::process::read_process_birth`]) and spelled by
-/// [`super::footer::lstart_utc`]: no `ps` per read, and a `ps` that cannot spawn under memory
-/// pressure (just when an agent freezes) is never read as the leader having moved. Elsewhere `ps`.
+/// On macOS and Windows it is read by syscall ([`aterm_uds::process::read_process_birth`]:
+/// `proc_pidinfo`, `GetProcessTimes`) and spelled by [`super::footer::lstart_utc`]: no `ps` per
+/// read, and a `ps` that cannot spawn under memory pressure (just when an agent freezes) is never
+/// read as the leader having moved. Windows has no `ps` that answers `lstart` (Git's MSYS `ps`
+/// refuses `-o`), so a `ps` there named no start at all. Elsewhere `ps`.
 #[must_use]
 pub fn kernel_start(pid: u32) -> Option<String> {
-    #[cfg(target_vendor = "apple")]
+    #[cfg(any(target_vendor = "apple", windows))]
     {
         let birth = aterm_uds::process::read_process_birth(i32::try_from(pid).ok()?)?;
         Some(super::footer::lstart_utc(birth.seconds))
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(any(target_vendor = "apple", windows)))]
     {
         super::upgrade_drive::kernel_start(pid)
     }

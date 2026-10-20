@@ -19,14 +19,16 @@
 
 use std::time::{Duration, Instant};
 
-use aterm_phase::Program;
 use aterm_phase::wall::WallKind;
+use aterm_phase::{LoginScreen, Program};
 
 use super::super::config::SupervisorConfig;
+use super::notice::{self, Notice, NoticeText};
 use super::outlook::ExceptionKind;
 use super::turn_end::{
-    RenewStep, TurnEndReading, TurnEndState, bucket_model, login_wall_moves, login_wall_stuck,
-    login_wall_waits, renew_step, sign_in_how, waited_login,
+    Composer, ContextFill, RULE_LOGIN, RenewStep, TurnEndAction, TurnEndReading, TurnEndState,
+    bucket_model, decide_turn_end, login_wall_moves, login_wall_waits, renew_step, sign_in_how,
+    waited_login,
 };
 
 /// Whether the person is needed now or only when they next look.
@@ -64,11 +66,48 @@ pub struct Exception {
     /// host says nothing more of it — nothing is said twice. `false`:
     /// nothing of the loop's tells the owner, and the host is the one that
     /// does — the digest for a `Later` one, the owner interrupted for a
-    /// `Now` one (a lost login waited at with no account left to move to).
+    /// `Now` one (Claude Code's lost login the harness carries up to the
+    /// sign-in, [`super::notice`]).
     pub escalated: bool,
+    /// THE OWNER'S FOUR-PART NOTICE ([`super::notice`]): `why` is what
+    /// happened and `action` the one thing to do now; this carries what
+    /// aterm already did and what to expect after, and the title and id the
+    /// host's ask goes by. `None`: an exception of the older kinds, which
+    /// say why and what alone.
+    pub notice: Option<Notice>,
 }
 
 impl Exception {
+    /// A notice's exception ([`super::notice`]): `Now`, and no escalation of
+    /// the loop's carries it — the host raises the one standing ask on the
+    /// glass for it, keyed by the tab and [`NoticeText::code`], and withdraws it
+    /// once the point no longer holds it. `label` and `why` fill its
+    /// placeholders; `clears` is what ends it.
+    #[must_use]
+    pub fn of_notice(
+        text: &NoticeText,
+        label: Option<&str>,
+        why: Option<&str>,
+        clears: &'static str,
+    ) -> Self {
+        let filled = text.fill(label, why);
+        Self {
+            kind: ExceptionKind::Login,
+            when: Urgency::Now,
+            why: filled.happened,
+            action: filled.todo,
+            clears,
+            escalated: false,
+            notice: Some(Notice {
+                id: text.id,
+                code: text.code,
+                title: text.title,
+                did: filled.did,
+                expect: filled.expect,
+            }),
+        }
+    }
+
     /// THE STALL NO READER NAMES (the canary's third rung,
     /// `wall_memory::Session::stuck_busy_note`): the screen has read busy on
     /// the agent's own background work alone for hours while Claude's own title
@@ -87,6 +126,30 @@ impl Exception {
             action: "Open the tab and type keep going".to_string(),
             clears: "the screen moving on, or the agent working",
             escalated: false,
+            notice: None,
+        }
+    }
+
+    /// THE BACKGROUND WORK THAT DOES NOT END (the canary's third rung on agy's
+    /// or Muse Code's own background work,
+    /// `wall_memory::Session::stuck_busy_note`): the turn ended, on a question
+    /// perhaps, and the agent's own work (a task, a timer, a subagent, a
+    /// backgrounded shell, a monitor) has run for hours under words that
+    /// stood still. The loop types nothing into a session the agent wakes
+    /// itself when that work ends, so a server or a daemon left running holds
+    /// it for ever: the owner's to look at. Not raised by [`exception_for`];
+    /// `Later`, as [`Self::stalled`].
+    #[must_use]
+    pub fn stalled_on_work() -> Self {
+        Self {
+            kind: ExceptionKind::Stalled,
+            when: Urgency::Later,
+            why: "Its turn ended hours ago, and its own background work still runs and holds it."
+                .to_string(),
+            action: "Open the tab and type keep going".to_string(),
+            clears: "the screen moving on, or the agent working",
+            escalated: false,
+            notice: None,
         }
     }
 
@@ -109,6 +172,7 @@ impl Exception {
             action: "Open the tab and answer the dialog.".to_string(),
             clears: "the screen moving on, or the agent working",
             escalated: false,
+            notice: None,
         }
     }
 
@@ -128,28 +192,52 @@ impl Exception {
             action: "Press Esc twice in this tab and go back a few messages.".to_string(),
             clears: "the wall leaving the screen, or the agent working",
             escalated: false,
+            notice: None,
         }
     }
 
-    /// [`Self::context`] for the full context whose notice `message` is: a
-    /// conversation of ONE EXCHANGE that the vendor says cannot be compacted
-    /// (`Prompt is too long · … A single-exchange conversation cannot be
-    /// compacted; reduce attached files/tools or start with less context.`,
-    /// 2.1.300) has no messages to go back over, and what fills it is the
-    /// tab's tools and attachments: its own remedy, done in the tab. Any
-    /// other full context is [`Self::context`].
+    /// [`Self::context`] for the full context whose notice `message` is, and
+    /// what its episode's own notice said fills it (`fill`,
+    /// [`TurnEndState::context_fill`]: by the third `/compact` the vendor's
+    /// `Compaction failed` row stands in the notice's place). A conversation
+    /// of ONE EXCHANGE that the vendor says cannot be compacted (`Prompt is too
+    /// long · … A single-exchange conversation cannot be compacted; reduce
+    /// attached files/tools or start with less context.`, 2.1.300) has no
+    /// messages to go back over, and what fills it is the tab's tools and
+    /// attachments: its own remedy, done in the tab. A context an IMAGE or
+    /// ATTACHMENTS fill ([`ContextFill`], by `message` or `fill`) is cleared by
+    /// going back to before them, as the vendor's own notice says
+    /// (ATERM-KI-1016-1: told `go back a few messages`, which need not reach
+    /// them). Any other full context is [`Self::context`].
     #[must_use]
-    pub fn context_of(message: &str) -> Self {
+    pub fn context_of(message: &str, fill: Option<ContextFill>) -> Self {
         let single = message
             .to_lowercase()
             .contains(&aterm_phase::anchor("wall.cannot_be_compacted").to_lowercase());
-        if !single {
-            return Self::context();
+        if single {
+            return Self {
+                why: "One exchange fills the context, and compaction cannot shrink it.".to_string(),
+                action: "Trim this tab's MCP tools and attachments, then run /clear in it."
+                    .to_string(),
+                ..Self::context()
+            };
         }
-        Self {
-            why: "One exchange fills the context, and compaction cannot shrink it.".to_string(),
-            action: "Trim this tab's MCP tools and attachments, then run /clear in it.".to_string(),
-            ..Self::context()
+        match ContextFill::of(message).or(fill) {
+            Some(ContextFill::Images) => Self {
+                why: "An image in this conversation is too large, and compaction cannot remove it."
+                    .to_string(),
+                action: "Press Esc twice in this tab and go back to before the image was added."
+                    .to_string(),
+                ..Self::context()
+            },
+            Some(ContextFill::Attachments) => Self {
+                why: "Its images and attachments make this request too large, and compaction cannot shrink it."
+                    .to_string(),
+                action: "Press Esc twice in this tab and go back to before the attachments."
+                    .to_string(),
+                ..Self::context()
+            },
+            None => Self::context(),
         }
     }
 
@@ -167,6 +255,7 @@ impl Exception {
             action: refused_action(typed, message).to_string(),
             clears: "the agent working",
             escalated: false,
+            notice: None,
         }
     }
 }
@@ -237,11 +326,6 @@ pub fn refused_action(typed: Option<&str>, message: &str) -> &'static str {
         })
         .map_or(REFUSED_ACTIONS[REFUSED_ACTIONS.len() - 1].2, |row| row.2)
 }
-
-/// The step of a stuck RENEWABLE login's exception, up to the label it names
-/// (`Run aterm harness accounts renew <label>.`): the words a host gathers
-/// the labels of such asks by.
-pub const RENEW_STEP: &str = "Run aterm harness accounts renew ";
 
 /// `Goal cleared after an unrecoverable error (<label>)`'s label, from a
 /// wall's message.
@@ -389,17 +473,13 @@ fn futile_action(program: Program) -> &'static str {
     }
 }
 
-/// A lost login's `(why, action, clears)` in a session of `program`, its
-/// wall reading `message`. Claude Code's `/login`, typed at the point, opened
-/// a page in the browser and says `Login successful` when done. Muse Code's step is its key wall's own remedy where it
-/// names one. Any other program's step is its own notice's.
+/// A lost login's `(why, action, clears)` in a session of `program` the
+/// harness does not carry ([`super::login::carried`]: Claude Code's is
+/// [`claude_login`]'s, every point of it), its wall reading `message`. Muse
+/// Code's step is its key wall's own remedy where it names one. Any other
+/// program's step is its own notice's.
 fn login_text(program: Program, message: &str) -> (&'static str, String, &'static str) {
     match program {
-        Program::Claude => (
-            "Its login is gone, and only a browser sign-in restores it.",
-            "Finish signing in on the page /login opened in your browser.".to_string(),
-            "`Login successful` on the screen, or the agent working",
-        ),
         Program::Agy => (
             "Its agy login or Gemini API key was refused, and only your own sign-in or a \
              valid key restores it.",
@@ -416,11 +496,195 @@ fn login_text(program: Program, message: &str) -> (&'static str, String, &'stati
             format!("{}.", title(&sign_in_how(program, message))),
             "the agent working",
         ),
-        Program::Codex | Program::Generic => (
+        Program::Claude | Program::Codex | Program::Generic => (
             "Its login is gone, and only your own sign-in restores it.",
             "Sign the program in again as its notice in this tab says.".to_string(),
             "the agent working",
         ),
+    }
+}
+
+/// What ends a lost login's notice: the login back, or the agent working.
+const LOGIN_CLEARS: &str = "`Login successful` on the screen, or the agent working";
+
+/// CLAUDE CODE'S LOST LOGIN, CARRIED BY THE HARNESS UP TO THE SIGN-IN
+/// ([`super::login`], the owner's ruling of 2026-10-19): `Some` at a point of
+/// such an episode — the wall's row, `/login`'s dialog over the lost login
+/// this loop tracks, `Login interrupted` under it, or the row off the screen
+/// while its track stands with `/login` typed — with the notice that stands
+/// there, `None` inside while aterm is still working on it; `None` for any
+/// other point, a `/login` a person opened on a working session included
+/// (nothing was lost).
+///
+/// THE OWNER IS TOLD WHAT HAPPENED, NOT WHAT MIGHT (the owner, 2026-10-19:
+/// *"if the auto login and account rotation is working be FAILED, then I
+/// need to see that"*): each notice is chosen by what aterm did and decides
+/// at this very point ([`decide_turn_end`], pure, on the same reading), so
+/// none says `/login` ran where it did not. Nothing is told while aterm still
+/// works on its own — `/login` about to be typed or held a moment for a
+/// person's keys, the method picker it answers, the success Enter, an
+/// account move or its wait — nor over a `/login` a person is going through
+/// themselves. Told:
+///
+/// | point | notice |
+/// | --- | --- |
+/// | the browser hand-off of aterm's `/login` | [`notice::LOGIN_SIGN_IN`], or [`notice::LOGIN_SIGN_IN_AS`] naming the roster row the session's login is |
+/// | the method picker of aterm's `/login`, which it does not answer ([`super::login::picks`]) | [`notice::LOGIN_CHOOSE`] |
+/// | Console's menu, an error, an account on hold, anyone's `/login` | [`notice::LOGIN_STOPPED`] |
+/// | aterm's `/login` left (`Login interrupted`, or its dialog gone with no login back) | [`notice::LOGIN_CANCELLED`] |
+/// | a person's own `/login` left | [`notice::LOGIN_LEFT`] |
+/// | `/login` not typed and not about to be | [`notice::LOGIN_NOT_RUN`], with why ([`notice::WHYS`]) |
+/// | a renewed login the tab cannot move onto by itself | [`notice::RENEWED_DRAFT`], [`notice::RENEWED_BY_HAND`] |
+fn claude_login(
+    state: &TurnEndState,
+    reading: &TurnEndReading,
+    cfg: &SupervisorConfig,
+    now: Instant,
+) -> Option<Option<Exception>> {
+    if !super::login::carried(reading.program) {
+        return None;
+    }
+    let track = state.wall_attempts(WallKind::Auth);
+    let typed = track.is_some_and(|n| n > 0);
+    let walled = reading.wall == Some(WallKind::Auth);
+    let episode = walled
+        || (track.is_some() && reading.login_screen.is_some())
+        || (track.is_some() && reading.login_interrupted)
+        || (typed && reading.wall.is_none() && !reading.login_back);
+    if !episode {
+        return None;
+    }
+    // aterm's own `/login` into this loss, not left: the dialog's steps are
+    // aterm's to carry, and what the owner is told says aterm ran it.
+    let own = state.login_typed_at().is_some();
+    let told = |text: &NoticeText, label: Option<&str>, why: Option<&str>| {
+        Some(Some(Exception::of_notice(text, label, why, LOGIN_CLEARS)))
+    };
+    match &reading.login_screen {
+        // The login is back; its one Enter is aterm's, and a success that
+        // stayed up after it is a login back all the same.
+        Some(LoginScreen::Success { .. }) => return Some(None),
+        // A person's own `/login`: theirs, as they go through it.
+        Some(LoginScreen::Picker(_) | LoginScreen::Browser) if !own => return Some(None),
+        // aterm answers its own picker with the method the session already
+        // uses where it can say which; any other is the owner's.
+        Some(LoginScreen::Picker(picker)) => {
+            return match super::login::picks(picker, reading.login_method) {
+                Ok(_) => Some(None),
+                Err(_) => told(&notice::LOGIN_CHOOSE, None, None),
+            };
+        }
+        // The browser sign-in is open: the one step only the owner can
+        // take, as the roster row's own account where the login is one.
+        Some(LoginScreen::Browser) => {
+            let label = reading
+                .login_label
+                .as_deref()
+                .or_else(|| state.account_move().map(|m| m.to.as_str()));
+            return match label {
+                Some(label) => told(&notice::LOGIN_SIGN_IN_AS, Some(label), None),
+                None => told(&notice::LOGIN_SIGN_IN, None, None),
+            };
+        }
+        Some(LoginScreen::ConsoleMenu | LoginScreen::Failed) => {
+            return told(&notice::LOGIN_STOPPED, None, None);
+        }
+        None => {}
+    }
+    // A lost login read before any turn was asked under the login the
+    // session's own move AT A WALL chose is the old process's notice, no
+    // login gone ([`TurnEndState::login_left`]); right after the session's
+    // own account move, or on a login a renewal replaced, it is the move's,
+    // answered by the next account (the renewed login) while one is advised
+    // ([`login_wall_moves`]), or waited at until one is, where the wait has an
+    // end — the instant the host names, the bound's room
+    // ([`login_wall_waits`]): nothing is raised for it, a person's own
+    // `/login` left before it included (the move signs the session in).
+    if state.login_left(reading)
+        || login_wall_moves(state, reading, cfg, now).is_some()
+        || login_wall_waits(state, reading, cfg, now).is_some()
+    {
+        return Some(None);
+    }
+    if state.login_cancelled() || (track.is_some() && reading.login_interrupted) {
+        return if typed {
+            told(&notice::LOGIN_CANCELLED, None, None)
+        } else {
+            told(&notice::LOGIN_LEFT, None, None)
+        };
+    }
+    if typed {
+        // `/login` typed into this loss, and neither its dialog nor the
+        // login back on the screen: inside `/login`'s take window its dialog
+        // may still be drawn ([`TurnEndState::login_opening`]; the point is
+        // decided again at the window's end); past it the dialog was left,
+        // and the policy never types `/login` again into this loss.
+        return if state.login_opening(now).is_some() {
+            Some(None)
+        } else {
+            told(&notice::LOGIN_CANCELLED, None, None)
+        };
+    }
+    if !walled {
+        // The row off the screen with nothing typed (a person's `/status`):
+        // nothing has failed yet.
+        return Some(None);
+    }
+    // A RENEWED login the tab cannot move onto by itself ([`renew_step`]):
+    // nothing typed, the owner told what holds it.
+    let label = reading.login_label.as_deref().filter(|_| cfg.logins);
+    match renew_step(reading, cfg) {
+        Some(RenewStep::Draft) => {
+            return Some(Some(Exception::of_notice(
+                &notice::RENEWED_DRAFT,
+                label,
+                None,
+                "the composer empty, or the agent working",
+            )));
+        }
+        Some(RenewStep::ByHand(why)) => return told(&notice::RENEWED_BY_HAND, label, Some(why)),
+        None => {}
+    }
+    // What the point decides of the wall, nothing typed into it yet.
+    match decide_turn_end(state, reading, cfg, now) {
+        // `/login` about to go, a wait with an end (a person's keys, the
+        // quiet after the prompt the wall answered, the breaker), a move or
+        // a relaunch: aterm is still at it.
+        TurnEndAction::TypeCommand {
+            rule_id: RULE_LOGIN,
+            ..
+        }
+        | TurnEndAction::WaitUntil { .. }
+        | TurnEndAction::Restart { .. } => Some(None),
+        // A screen of the program's own drawn in the composer's place over
+        // the wall, no dialog this reader knows: the sign-in stopped on it.
+        TurnEndAction::Escalate { .. } if reading.composer == Composer::Absent => {
+            told(&notice::LOGIN_STOPPED, None, None)
+        }
+        // `/login` held back: the owner is told why, and types it.
+        TurnEndAction::Escalate { .. } => {
+            // The three that hold it ([`decide_turn_end`]'s draft gate, the
+            // wall's own rule under `retry_api_errors = false`, the hour's
+            // typing budget); the budget is the last left.
+            let why = if reading.composer.drafted() {
+                notice::WHY_DRAFT
+            } else if !cfg.retry_api_errors {
+                notice::WHY_RETRY_OFF
+            } else {
+                notice::WHY_BUDGET
+            };
+            told(&notice::LOGIN_NOT_RUN, None, Some(why))
+        }
+        // Nothing typed into a tab with no task, or one whose task is done.
+        TurnEndAction::Nothing if reading.taskless => {
+            told(&notice::LOGIN_NOT_RUN, None, Some(notice::WHY_NO_TASK))
+        }
+        TurnEndAction::Nothing if state.task_done() => {
+            told(&notice::LOGIN_NOT_RUN, None, Some(notice::WHY_TASK_DONE))
+        }
+        // A point not decided yet (an act still to be taken, a read that is
+        // no point), or one no act of the wall's answers: nothing has failed.
+        _ => Some(None),
     }
 }
 
@@ -444,6 +708,9 @@ pub fn exception_for(
         }
         None => reading,
     };
+    if let Some(told) = claude_login(state, reading, cfg, now) {
+        return told;
+    }
     let kind = reading.wall?;
     let attempts = state.wall_attempts(kind).unwrap_or(0);
     if let Some(label) = goal_cleared_label(&reading.wall_message) {
@@ -454,95 +721,17 @@ pub fn exception_for(
             action: "Run /goal again in this tab.".to_string(),
             clears: "the /goal indicator back on the screen, or the agent working",
             escalated: false,
-        });
-    }
-    // A lost login after the session's own move, waited at with NO end — the
-    // host advises nothing at all ([`login_wall_stuck`]): only the owner's
-    // sign-in changes it, so the owner is needed now, and the step is
-    // `accounts login` of the session's own login — never the page `/login`
-    // opens: none was opened. A wait with an end (below) raises nothing.
-    // Nothing of the loop's escalates a wait, so the host is the one that
-    // asks the owner; the wait goes on beside it, and the sign-in recorded
-    // is news that decides the point again: the move to that login.
-    //
-    // A RENEWABLE LOGIN ([`TurnEndReading::login_label`]) is renewed, never
-    // signed in where it stands: its step is `accounts renew`
-    // ([`RENEW_STEP`]), which signs in to a staging directory and checks the
-    // account before any session uses it.
-    if kind == WallKind::Auth
-        && let Some(label) = login_wall_stuck(state, reading, cfg, now)
-    {
-        let renews = reading.login_label.as_deref() == Some(label.as_str());
-        return Some(Exception {
-            kind: ExceptionKind::Login,
-            when: Urgency::Now,
-            why: if renews {
-                "Its login has ended, and only a renewal in your browser restores it.".to_string()
-            } else {
-                "Its login is gone, and the roster has no other account to move it to.".to_string()
-            },
-            action: if renews {
-                format!("{RENEW_STEP}{label}.")
-            } else {
-                format!("Run aterm harness accounts login {label}.")
-            },
-            clears: "the login signed in again, an account to move to, or the agent working",
-            escalated: false,
+            notice: None,
         });
     }
     match kind {
-        // A lost login read before any turn was asked under the login the
-        // session's own move AT A WALL chose is the old process's notice, no
-        // login gone ([`TurnEndState::login_left`]).
-        WallKind::Auth if state.login_left(reading) => None,
         // A bucket the fallback's relaunch moved the session off, its notice
         // redrawn by the relaunched process ([`TurnEndState::bucket_left`]).
         WallKind::ModelBucket { .. } if state.bucket_left(reading) => None,
-        // A lost login right after the session's own account move is the
-        // move's, not the person's: it is answered by the next account while
-        // one is advised, and nothing is raised for it ([`login_wall_moves`]).
-        WallKind::Auth if login_wall_moves(state, reading, cfg, now).is_some() => None,
-        // …or waited at until one is, where the wait has an end — the instant
-        // the host names, the bound's room: the move goes by itself, and the
-        // strike's `signed-out` line is the owner's word
-        // ([`login_wall_waits`]).
-        WallKind::Auth if login_wall_waits(state, reading, cfg, now).is_some() => None,
-        // A renewable login not waited at (no relaunch to follow its renewal
-        // with, a draft in the composer): nothing typed, and the point's act
-        // is the loop's escalation, whose step is the renewal — or, renewed
-        // already, what holds the relaunch onto the renewed login
-        // ([`renew_step`]): no renewal reaches this process.
-        WallKind::Auth
-            if attempts == 0
-                && let Some(step) = renew_step(reading, cfg) =>
-        {
-            let (why, action, clears) = match step {
-                RenewStep::Renew(label) => (
-                    "Its login has ended, and only a renewal in your browser restores it.",
-                    format!("{RENEW_STEP}{label}."),
-                    "the login renewed, or the agent working",
-                ),
-                RenewStep::Draft => (
-                    "Its login was renewed, and the draft in its composer holds the move onto it.",
-                    "Send the draft in this tab, and it moves onto the renewed login.".to_string(),
-                    "the composer empty, or the agent working",
-                ),
-                RenewStep::ByHand(_) => (
-                    "Its login was renewed, and nothing here moves this tab onto the new one.",
-                    "Quit Claude Code here and start it with the line accounts renew printed."
-                        .to_string(),
-                    "the agent working",
-                ),
-            };
-            Some(Exception {
-                kind: ExceptionKind::Login,
-                when: Urgency::Now,
-                why: why.to_string(),
-                action,
-                clears,
-                escalated: true,
-            })
-        }
+        // Any other program's lost login (Claude Code's is [`claude_login`]'s,
+        // and only Claude Code moves accounts or waits at a lost login): its
+        // own sign-in, told with the loop's escalation (owner = supervisor,
+        // design-exceptions 8.4), raised as the point's act.
         WallKind::Auth if attempts > 0 || !cfg.retry_api_errors => {
             let (why, action, clears) = login_text(reading.program, &reading.wall_message);
             Some(Exception {
@@ -551,11 +740,8 @@ pub fn exception_for(
                 why: why.to_string(),
                 action,
                 clears,
-                // The loop's own escalation (owner = supervisor) is the surface
-                // for this login (design-exceptions 8.4): raised with the
-                // `/login` the point typed, or as the point's act under
-                // `retry_api_errors = false`.
                 escalated: true,
+                notice: None,
             })
         }
         WallKind::Spend if reading.reset_at.is_none() || !cfg.resume_limits => {
@@ -567,6 +753,7 @@ pub fn exception_for(
                 action: action.to_string(),
                 clears: "the agent working",
                 escalated: false,
+                notice: None,
             })
         }
         // A bucket no reset ends, and the tab has not switched off it an hour
@@ -612,6 +799,7 @@ pub fn exception_for(
                 action,
                 clears: "the agent working",
                 escalated: false,
+                notice: None,
             })
         }
         WallKind::UsageSession
@@ -630,6 +818,7 @@ pub fn exception_for(
                 action: futile_action(reading.program).to_string(),
                 clears: "the agent working",
                 escalated: false,
+                notice: None,
             })
         }
         // A full context that `/compact` does not lower: Claude Code itself said so
@@ -641,7 +830,10 @@ pub fn exception_for(
         WallKind::Context
             if attempts >= CONTEXT_EXHAUSTED_AFTER && state.compaction_exhausted() =>
         {
-            Some(Exception::context_of(&reading.wall_message))
+            Some(Exception::context_of(
+                &reading.wall_message,
+                state.context_fill(),
+            ))
         }
         // A request the API refuses the same way each time: tried three times
         // on its slow ladder, which goes on; a person's change in the tab ends

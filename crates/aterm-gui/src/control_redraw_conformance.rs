@@ -23,11 +23,11 @@ use aterm_control::{HostCapabilities, SessionHost};
 use aterm_core::terminal::Terminal;
 use aterm_session::sink::SinkWriter;
 use aterm_session::{EdgeTable, LaunchNonce, SessionId};
-use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
-use winit::window::WindowId as WinitWindowId;
+use aterm_window::application::ApplicationHandler;
+use aterm_window::event::WindowEvent;
+use aterm_window::event_loop::{ActiveEventLoop, EventLoop};
+use aterm_window::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
+use aterm_window::window::WindowId as WinitWindowId;
 
 use super::control_host::GuiHost;
 use crate::session_store::{self, SessionHandle};
@@ -153,9 +153,9 @@ fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHand
         rewrap_gauge: std::sync::Arc::default(),
         human_input: Default::default(),
         launch: Default::default(),
-        generation_look: Default::default(),
         reset_lane: Default::default(),
         crash_journal: Default::default(),
+        typed: Default::default(),
         update_parked: Default::default(),
         witness: Default::default(),
         fenced_writes: Default::default(),

@@ -60,7 +60,10 @@ pub enum Progress {
     Verifying { version: String },
     /// Verified and published: the in-session apply lane applies it in place
     /// (automatic by default, landing within `aterm-gui`'s `LANDS_WITHIN`, 15
-    /// minutes); the next launch picks it up only if no handoff ever completes.
+    /// minutes; on a press while `[update] auto_apply` is off). A stage no handoff
+    /// completed stays for the next launch's in-session lane; that launch's boot swaps it
+    /// only if it is a replaceable one (`ImageReplacement::Replaceable`), or a window's
+    /// with the automatic lane on once `LEFT_STAGE_ESCAPE` launches that left it ended.
     Staged { version: String, build: u64 },
     /// The download was cut short by something that will heal on its own (the
     /// download host answering 429); the check backs off and retries later.

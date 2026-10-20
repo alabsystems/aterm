@@ -1016,8 +1016,8 @@ mod tests {
     /// so 3.3 rows of finger over the rows output attached is 3 rows.
     #[test]
     fn a_trackpad_swipe_during_a_rewrap_moves_the_view_by_the_finger_once() {
-        use winit::dpi::PhysicalPosition;
-        use winit::event::{MouseScrollDelta, TouchPhase};
+        use aterm_window::dpi::PhysicalPosition;
+        use aterm_window::event::{MouseScrollDelta, TouchPhase};
 
         let (mut app, _sink, _reader) = app_with_reader();
         let wid = WindowId(0);
@@ -1159,7 +1159,11 @@ mod tests {
 
     /// Session 0 given a tiered history of `n` short lines, detached for a
     /// width change with its gauge booked — a rewrap in flight, as the loop's
-    /// hand-off leaves it. Returns the job to finish.
+    /// hand-off leaves it. Returns the job to finish. The newest history line
+    /// is longer than the 8-row ring, so the ring holds no line whole and the
+    /// detach holds none back (`HOLD_BACK_SCREENS`), and its head is further
+    /// up than a width change walks to bring it onto the screen
+    /// (`Grid::head_walk`, four screens): the history is away.
     fn rewrapping_history(
         app: &mut App,
         n: usize,
@@ -1185,6 +1189,11 @@ mod tests {
             for i in 0..n {
                 buf.extend_from_slice(format!("H{i}\r\n").as_bytes());
             }
+            buf.resize(
+                buf.len() + usize::from(cols) * (5 * usize::from(rows) + 8 + 6),
+                b'y',
+            );
+            buf.extend_from_slice(b"\r\n");
             t.process(&buf);
             t.resize_offloading_scrollback(rows, cols - 10)
                 .expect("a width change detaches the tiered history")

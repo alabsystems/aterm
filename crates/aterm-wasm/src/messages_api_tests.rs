@@ -27,7 +27,7 @@ type Host = AtermTerminal;
 
 /// A frame, drawn: the CPU twin's `render`.
 fn draw(t: &mut Host) {
-    t.render();
+    t.render().expect("renderable frame");
 }
 
 /// Whether two terminals drew the same picture: the CPU twin's pixels.
@@ -194,13 +194,13 @@ fn a_resize_before_the_render_wakes_for_the_new_width() {
     t.set_band_motion_at(false, at);
     let narrow = t.messages_next_wake_ms_at(at);
     assert!(narrow > 60_000.0, "no words tick at 20 columns: {narrow}");
-    t.resize(20, 80);
+    t.resize(20, 80).expect("admitted geometry");
     let before_render = t.messages_next_wake_ms_at(at);
     assert!(
         (0.0..=1000.0).contains(&before_render),
         "the grown page's elapsed words tick: {before_render}"
     );
-    t.render();
+    t.render().expect("renderable frame");
     assert_eq!(t.messages_next_wake_ms_at(at), before_render);
 }
 
@@ -269,9 +269,9 @@ fn a_settled_band_needs_no_frame() {
     let (mut t, t0) = clocked(20, 80);
     let _ = t.notice_at("post ci sev=warn Disk nearly full", t0, stamp());
     assert!(t.needs_frame());
-    t.render();
+    t.render().expect("renderable frame");
     assert!(!t.needs_frame(), "the band's frame is on the glass");
-    t.render();
+    t.render().expect("renderable frame");
     assert!(t.last_render_skipped());
     assert_eq!(
         t.messages_tick_at(t0 + ms(40)),
@@ -288,14 +288,14 @@ fn an_echo_frame_under_a_band_takes_the_scoped_refill() {
     let (mut t, t0) = clocked(20, 80);
     let _ = t.notice_at("post ci sev=warn Disk nearly full", t0, stamp());
     t.process(b"$ ");
-    t.render();
+    t.render().expect("renderable frame");
     // The first frames are full refills of their own (a fresh grid is
     // full damage, and a prepend onto a full-damage fill is not blessed),
     // exactly as on the native window; the steady state is what counts.
     t.process(b"x");
-    t.render();
+    t.render().expect("renderable frame");
     t.process(b"y");
-    t.render();
+    t.render().expect("renderable frame");
     assert!(
         matches!(t.last_refill, Some(FrameRefill::Scoped { .. })),
         "{:?}",
@@ -319,9 +319,9 @@ fn no_band_row_leaves_the_frame_byte_identical() {
     let _ = quiet.notice_at("post ci Build finished", t0, stamp());
     let _ = quiet.messages_tick_at(t0 + ms(40));
     for t in [&mut plain, &mut quiet] {
-        t.set_chrome(6, 0);
+        t.set_chrome(6, 0).expect("admitted geometry");
         t.process(b"$ ls\r\nCargo.toml  src\r\n$ ");
-        t.render();
+        t.render().expect("renderable frame");
     }
     assert_eq!(
         (plain.width(), plain.height()),
@@ -341,9 +341,9 @@ fn the_frame_grows_by_the_band_rows() {
     let _ = banded.notice_at("post ci sev=warn Disk nearly full", t0, stamp());
     let _ = banded.notice_at("post ci sev=error Deploy failed", t0 + ms(40), stamp());
     for t in [&mut plain, &mut banded] {
-        t.set_chrome(6, 0);
+        t.set_chrome(6, 0).expect("admitted geometry");
         t.process(b"$ ");
-        t.render();
+        t.render().expect("renderable frame");
     }
     let ch = banded.cell_height();
     assert_eq!(banded.band_rows(), 2);
@@ -371,12 +371,12 @@ fn the_band_leaving_restores_the_bandless_frame() {
     let mut plain = term(12, 60);
     let (mut banded, t0) = clocked(12, 60);
     for t in [&mut plain, &mut banded] {
-        t.set_chrome(6, 4);
+        t.set_chrome(6, 4).expect("admitted geometry");
         t.process(b"$ ls\r\nCargo.toml  src\r\n$ ");
     }
     let _ = banded.notice_at("progress p pct=50 Downloading assets", t0, stamp());
     let _ = banded.messages_tick_at(t0 + ms(2500));
-    banded.render();
+    banded.render().expect("renderable frame");
     assert_eq!(banded.band_rows(), 1);
     let _ = banded.notice_at("done p withdraw", t0 + ms(3000), stamp());
     let mut at = t0 + ms(3000);
@@ -387,15 +387,15 @@ fn the_band_leaving_restores_the_bandless_frame() {
         }
         at += ms(wake as u64).max(ms(1));
         let _ = banded.messages_tick_at(at);
-        banded.render();
+        banded.render().expect("renderable frame");
     }
     assert_eq!(banded.band_rows(), 0, "the row left and the count followed");
     assert!(
         banded.messages_next_wake_ms_at(at) < 0.0,
         "and nothing is armed"
     );
-    banded.render();
-    plain.render();
+    banded.render().expect("renderable frame");
+    plain.render().expect("renderable frame");
     assert_eq!(
         (plain.width(), plain.height()),
         (banded.width(), banded.height())
@@ -506,13 +506,13 @@ fn details_chip(t: &AtermTerminal, row: usize) -> (usize, usize) {
 )]
 fn the_pointer_lights_only_the_chip_and_a_press_is_notice_act() {
     let (mut t, t0) = clocked(12, 60);
-    t.set_chrome(6, 0);
+    t.set_chrome(6, 0).expect("admitted geometry");
     let _ = t.notice_at(
         "post ci sev=warn Disk nearly full -- 2 GB left",
         t0,
         stamp(),
     );
-    t.render();
+    t.render().expect("renderable frame");
     let (x, y) = band_px(&t, 0, 20);
     assert!(
         !t.band_hover_at(x, y, t0),
@@ -523,7 +523,7 @@ fn the_pointer_lights_only_the_chip_and_a_press_is_notice_act() {
     // The page says it has a Details view: the rows gain their links.
     t.set_details_view_at(true, t0);
     assert!(t.needs_frame(), "the links are a new frame");
-    t.render();
+    t.render().expect("renderable frame");
     let words: String = t.frame_scratch.cells[0].iter().map(|c| c.ch).collect();
     assert!(words.contains("Details"), "{words}");
     let rest = t.rgba();
@@ -534,7 +534,7 @@ fn the_pointer_lights_only_the_chip_and_a_press_is_notice_act() {
         !t.band_hover_at(x + 3.0, y, t0 + ms(2)),
         "same chip: no change"
     );
-    t.render();
+    t.render().expect("renderable frame");
     let lit = t.rgba();
     let m = t.band_metrics();
     let w = t.width();
@@ -554,7 +554,7 @@ fn the_pointer_lights_only_the_chip_and_a_press_is_notice_act() {
     assert!(moved > 0, "the chip lit");
     // Leaving restores the resting frame.
     assert!(t.band_hover_at(-1.0, -1.0, t0 + ms(3)));
-    t.render();
+    t.render().expect("renderable frame");
     assert!(t.rgba() == rest, "the resting frame, byte for byte");
     // The press is native's `notice act 1 details`, on a twin.
     let (mut twin, _) = clocked(12, 60);
@@ -618,7 +618,7 @@ fn the_overflow_row_opens_the_details_view_only_with_one() {
             stamp(),
         );
         let fit = 3 - t.band_rows() as u16;
-        t.resize(fit, 60);
+        t.resize(fit, 60).expect("admitted geometry");
     }
     let _ = t.messages_tick_at(t0 + ms(10));
     assert_eq!(t.band_rows(), 2);
@@ -644,9 +644,9 @@ fn the_overflow_row_opens_the_details_view_only_with_one() {
 #[test]
 fn forced_colors_own_the_band_ungraded() {
     let (mut t, t0) = clocked(12, 60);
-    t.set_chrome(6, 0);
+    t.set_chrome(6, 0).expect("admitted geometry");
     let _ = t.notice_at("post ci sev=warn Disk nearly full", t0, stamp());
-    t.render();
+    t.render().expect("renderable frame");
     let themed = t.rgba();
     let graded = t.band.inks;
     // Five distinct colours, so a swap between any two of the five
@@ -680,7 +680,7 @@ fn forced_colors_own_the_band_ungraded() {
     );
     assert!(!t.band.look().graded, "ungraded under forced colours");
     assert!(t.needs_frame(), "re-inked");
-    t.render();
+    t.render().expect("renderable frame");
     assert!(t.frame_scratch.cells[0].iter().all(|c| c.bg == hc.btn_face));
     assert!(t.rgba() != themed);
     let forced_frame = t.rgba();
@@ -692,7 +692,7 @@ fn forced_colors_own_the_band_ungraded() {
     t.set_theme(FG, BG, CURSOR, SEL);
     assert_eq!(t.band.inks, graded, "the theme's inks again");
     assert!(t.band.look().graded);
-    t.render();
+    t.render().expect("renderable frame");
     assert!(t.rgba() == themed, "the themed frame, byte for byte");
     assert!(forced_frame != themed);
 }
@@ -1154,7 +1154,7 @@ fn band_row_is_the_pixel_rows_band_row() {
 #[test]
 fn cell_under_is_the_band_cell_under_a_pixel() {
     let (mut t, t0) = clocked(12, 60);
-    t.set_chrome(6, 4);
+    t.set_chrome(6, 4).expect("admitted geometry");
     let _ = t.notice_at("post ci sev=warn Disk nearly full", t0, stamp());
     let _ = t.notice_at("post ci sev=error Deploy failed", t0 + ms(40), stamp());
     assert_eq!(t.band.committed(), 2);
@@ -1433,7 +1433,7 @@ fn effects_under_a_band_are_the_bandless_frame_translated() {
                 lit: &mut std::collections::BTreeSet<&'static str>| {
         for t in [&mut *plain, &mut *banded] {
             t.advance_effects(33.0);
-            t.render();
+            t.render().expect("renderable frame");
         }
         let grid_top = banded.renderer.grid_top();
         lit.extend(assert_translated(
@@ -1445,7 +1445,7 @@ fn effects_under_a_band_are_the_bandless_frame_translated() {
         ));
     };
     for t in [&mut plain, &mut banded] {
-        t.set_chrome(6, 4);
+        t.set_chrome(6, 4).expect("admitted geometry");
         t.set_effects_focused(true);
         t.set_sparkle_words_enabled(true);
         t.process(b"a curious cat watched the build fail: fuck\r\n$ ");
@@ -1571,6 +1571,48 @@ fn golden_line(key: &str, t: &AtermTerminal) -> String {
     line
 }
 
+/// One theme at one width of [`the_web_band_is_the_native_golden`]: every
+/// scene in both looks, replayed through `notice`, tick and `render` on a
+/// terminal of its own; its frames' golden lines, and the RGBA pixels digested.
+fn replay_golden(
+    (tname, [fg, bg, cursor, sel, blue, cyan, red, yellow]): &(String, [u32; 8]),
+    cols: u16,
+    scenes: &[Scene],
+) -> (Vec<String>, usize) {
+    let mut got = Vec::new();
+    let mut px = 0usize;
+    let mut t =
+        AtermTerminal::new(20, cols, FONT, 20.0, *fg, *bg, *cursor, *sel).expect("bundled font");
+    // On wasm32 the portable rasterizer is the ONLY one; this
+    // native test run would otherwise draw with the host's
+    // (CoreText on macOS). The golden pins the same path.
+    t.renderer.debug_force_fontdue();
+    t.set_chrome(6, 0).expect("admitted geometry");
+    for (i, c) in [(4u8, blue), (6, cyan), (1, red), (3, yellow)] {
+        t.set_palette_color(i, (*c >> 16) as u8, (*c >> 8) as u8, *c as u8);
+    }
+    for (lname, moving) in [("moving", true), ("still", false)] {
+        for (name, events) in scenes {
+            let t0 = Instant::now();
+            t.band.reset_at(t0);
+            t.set_band_motion_at(moving, t0);
+            for (at, line) in events {
+                let now = t0 + ms(*at);
+                if let Some(line) = line {
+                    let _ = t.notice_at(line, now, stamp());
+                    continue;
+                }
+                let _ = t.messages_tick_at(now);
+                t.render().expect("renderable frame");
+                let key = format!("{name}\t{tname}\t{cols}\t{lname}\t{at}");
+                px += t.width() * (t.renderer.grid_top() + t.band_height_px() as usize);
+                got.push(golden_line(&key, &t));
+            }
+        }
+    }
+    (got, px)
+}
+
 /// THE WEB BAND IS THE NATIVE GOLDEN (design ruling 333): every scene of
 /// `tests/fixtures/band_native.tsv` — which aterm-gui writes from the
 /// native window's band — replayed through THIS module's `notice`, tick
@@ -1626,40 +1668,20 @@ fn the_web_band_is_the_native_golden() {
     }
     assert_eq!(themes.len(), 4);
     assert_eq!(scenes.len(), 16);
+    // Each theme and width replays on a terminal of its own, so on every core
+    // (one thread for all twelve was the test's 12 s, 2026-10-17); the frames
+    // are joined in the golden's order.
+    let runs: Vec<(&(String, [u32; 8]), u16)> = themes
+        .iter()
+        .flat_map(|theme| [60u16, 80, 120].map(|cols| (theme, cols)))
+        .collect();
+    let replays =
+        aterm_spec::check::each(&runs, |&(theme, cols)| replay_golden(theme, cols, &scenes));
     let mut got = Vec::new();
     let mut px = 0usize;
-    for (tname, [fg, bg, cursor, sel, blue, cyan, red, yellow]) in &themes {
-        for cols in [60u16, 80, 120] {
-            let mut t = AtermTerminal::new(20, cols, FONT, 20.0, *fg, *bg, *cursor, *sel)
-                .expect("bundled font");
-            // On wasm32 the portable rasterizer is the ONLY one; this
-            // native test run would otherwise draw with the host's
-            // (CoreText on macOS). The golden pins the same path.
-            t.renderer.debug_force_fontdue();
-            t.set_chrome(6, 0);
-            for (i, c) in [(4u8, blue), (6, cyan), (1, red), (3, yellow)] {
-                t.set_palette_color(i, (*c >> 16) as u8, (*c >> 8) as u8, *c as u8);
-            }
-            for (lname, moving) in [("moving", true), ("still", false)] {
-                for (name, events) in &scenes {
-                    let t0 = Instant::now();
-                    t.band.reset_at(t0);
-                    t.set_band_motion_at(moving, t0);
-                    for (at, line) in events {
-                        let now = t0 + ms(*at);
-                        if let Some(line) = line {
-                            let _ = t.notice_at(line, now, stamp());
-                            continue;
-                        }
-                        let _ = t.messages_tick_at(now);
-                        t.render();
-                        let key = format!("{name}\t{tname}\t{cols}\t{lname}\t{at}");
-                        px += t.width() * (t.renderer.grid_top() + t.band_height_px() as usize);
-                        got.push(golden_line(&key, &t));
-                    }
-                }
-            }
-        }
+    for (frames, digested) in replays {
+        got.extend(frames);
+        px += digested;
     }
     assert_eq!(got.len(), frames.len(), "one frame per golden frame");
     let (mut cells, mut rasters, mut pixels, mut other) = (0usize, 0usize, 0usize, 0usize);
@@ -1757,7 +1779,7 @@ fn page_chrome(all: usize, problems: usize, chip: Option<&str>) -> String {
     let on = u8::from(chip.is_none());
     let current = chip.unwrap_or("All");
     format!(
-        "\theading=Messages\tsubtitle=What aterm reported, newest first.\tall_words=All \u{00b7} {all}\tproblems_words=Problems \u{00b7} {problems}\tall_tags=All tags\tall_tags_on={on}\ttag_menu=Tag: {current}\ttag_menu_name=Filter by tag: {current}\tcopy_all_button=Copy All\tcopy_all_name=Copy the shown messages\tempty=Nothing yet.\ttechnical_caption=Technical details\tcopy_button=Copy"
+        "\theading=Messages\tsubtitle=What aterm reported, newest first.\tall_words=All \u{00b7} {all}\tproblems_words=Problems \u{00b7} {problems}\tall_tags=All tags\tall_tags_on={on}\ttag_menu=Tag: {current}\ttag_menu_name=Filter by tag: {current}\tcopy_all_button=Copy All\tcopy_all_name=Copy All shown messages\tempty=Nothing yet.\ttechnical_caption=Technical details\tcopy_button=Copy"
     )
 }
 

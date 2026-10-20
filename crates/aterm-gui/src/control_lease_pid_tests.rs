@@ -148,6 +148,20 @@ impl super::control_lanes::LaneService for LeaseService {
     fn subscribe(&self, _line: String, _scope: super::Scope, _stream: CtlStream) {}
 
     fn release(&self, _id: u64) {}
+
+    fn has_live_claim(&self, id: u64) -> bool {
+        let now = crate::metrics::now_us();
+        self.ctx
+            .turn_lease
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|lease| {
+                matches!(lease, crate::Lease::Drive { conn: Some(owner), here: true, .. }
+                    if *owner == id)
+                    && lease.is_live(now)
+            })
+    }
 }
 
 /// The forger: `perl` connecting to `sock` and taking a hard lease under

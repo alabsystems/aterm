@@ -36,10 +36,14 @@ use aterm_spec::derive::{Liveness, Model, eq, gt, int, le, or_, var};
 ///   that never checked in was answered with its pid, never "terminated" (stand-in
 ///   bundles, and this build through `ATERM_DEBUG_DIE_BEFORE_DIAL`).
 /// * The pid an `AnswerNamed` names is the successor's: LaunchServices names the process
-///   it launched (this process's own pid is an `AnswerOther`), and the successor keeps its
-///   pid across the boot apply's same-pid `execve`, which raises no exit on a watch. So
-///   the kernel's word that the pid is gone (an exit on the watch, or the pid vacant or
-///   recycled) is `EndOnNamedExit`'s `successor == 2`.
+///   it launched (this process's own pid is an `AnswerOther`), and the successor never
+///   replaces its image: since 2026-10-19 its parent swaps before the launch, so its
+///   boot apply execs nothing. An older build's successor did re-exec, keeping its pid
+///   and raising no exit on a watch; LaunchServices then answered it with that pid (an
+///   `AnswerNamed`, still the successor's) or, after an exec some hundred milliseconds
+///   into the launch, with -1 (an `AnswerOther`). So the kernel's word that the pid is
+///   gone (an exit on the watch, or the pid vacant or recycled) is `EndOnNamedExit`'s
+///   `successor == 2`.
 ///
 /// `AnswerOther` and `AnswerNamed` are enabled for a live and a dead successor alike: an
 /// error is never evidence of death, and a named process may die later.

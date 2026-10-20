@@ -1,0 +1,26 @@
+# agy 1.4.0 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Antigravity CLI, launched by path with a scratch `HOME` whose settings name the Gemini API provider, its Google hosts black-holed, a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · the turn ended while the stub's `run_command` (`sleep 150; echo LAB-BG-DONE`, `WaitMsBeforeAsync` 500) runs on as a background task: the empty composer, then under its bottom rule the PANEL (`  ● [17:50:42] <command> running`), a second rule, and the footer counting `1 task(s) · /tasks` · cursor=20,2
+
+      ▄▀▀▄        Antigravity CLI 1.4.0
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     /private/tmp/at.juck/proj
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> hi, remember the word OSPREY-3
+
+  Hi! I am the local lab stub, not a model. (reply 1)
+
+────────────────────────────────────────────────────────────
+> toolstart
+
+○ Running (sleep 150; echo LAB-BG-DONE) (ctrl+o to expand)
+
+  Tool call done.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ● [17:50:42] sleep 150; echo LAB-BG-DONE running
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                        Gemini 3.1 Pro · low · 1 task(s) · /tasks

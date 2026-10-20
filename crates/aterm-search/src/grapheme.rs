@@ -170,6 +170,10 @@ pub(crate) struct ColumnMap {
     source: MapSource,
 }
 
+// A map is one hash-map entry per indexed line, ASCII lines included: at most 32
+// bytes.
+const _: () = assert!(std::mem::size_of::<ColumnMap>() <= 32);
+
 /// Where a [`ColumnMap`]'s columns came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MapSource {
@@ -796,13 +800,6 @@ mod tests {
         assert_eq!(map.span(0, 2), (0, 0));
         assert_eq!(map.span(2, 4), (0, 2));
         assert_eq!(map.span(4, 6), (2, 2));
-    }
-
-    /// A map is one hash-map entry per indexed line, ASCII lines included: at most 32
-    /// bytes.
-    #[test]
-    fn a_map_is_no_larger_than_before() {
-        assert!(std::mem::size_of::<ColumnMap>() <= 32);
     }
 
     /// A line of one shape is one run however long it is, and runs are sized exactly:

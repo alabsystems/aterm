@@ -15,6 +15,9 @@ use std::process::ExitCode;
 #[must_use]
 pub fn hello(sys: &dyn System, layout: &Layout) -> Hello {
     let facts = crate::facts::gather(sys);
+    let hardware = crate::hardware::describe(&facts)
+        .map(|d| d.parts().to_vec())
+        .unwrap_or_default();
     let floors = state::floors_or_refuse(sys, layout).unwrap_or_default();
     Hello {
         schema: crate::SCHEMA,
@@ -34,11 +37,17 @@ pub fn hello(sys: &dyn System, layout: &Layout) -> Hello {
         os_version: facts.os_version,
         os_build: facts.os_build,
         arch: facts.arch,
+        hardware,
         console_user: facts.console_user,
         floors,
         cached: cached(sys, layout),
         busy: state::busy(sys, layout),
         last_run: state::last_run(sys, layout),
+        sessions: if sys.own_uuid().is_some() && crate::sessions::is_live_account() {
+            crate::sessions::scan_local_aterm_sessions()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -67,7 +76,7 @@ pub fn print(sys: &dyn System, layout: &Layout, out: &mut dyn Write) -> ExitCode
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::port::Fake;
+    use crate::port::{Fake, Ran};
 
     #[test]
     fn hello_reports_the_floors_cache_and_busy_run_from_root_owned_state() {
@@ -90,10 +99,34 @@ mod tests {
         assert_eq!(h.busy.as_deref(), Some("1800000000-41"));
         assert_eq!(h.last_run.as_deref(), Some("1799999000-40"));
         assert!(h.families.iter().any(|f| f == "keyboard"));
+        // No hardware fact answered: no description, never a partial one.
+        assert!(h.hardware.is_empty());
         let mut out = Vec::new();
         assert_eq!(print(&fake, &layout, &mut out), ExitCode::SUCCESS);
         let line = String::from_utf8(out).unwrap();
         let back: Hello = aterm_json::from_str(line.trim()).unwrap();
         assert_eq!(back.floors, h.floors);
+    }
+
+    #[test]
+    fn hello_describes_the_mac_as_names_fills_hardware() {
+        // The VM's own answers (27.0, VirtualMac2,1).
+        let fake = Fake::root();
+        fake.on("/usr/sbin/sysctl -n hw.model", Ran::ok("VirtualMac2,1\n"))
+            .on(
+                &crate::hardware::product_cmd().display(),
+                Ran::ok(crate::hardware::tests::VM_PRODUCT),
+            )
+            .on(
+                "/usr/sbin/sysctl -n machdep.cpu.brand_string",
+                Ran::ok("Apple M5 (Virtual)\n"),
+            )
+            .on("/usr/sbin/sysctl -n hw.memsize", Ran::ok("8589934592\n"))
+            .on(
+                &crate::hardware::disk_cmd().display(),
+                Ran::ok(crate::hardware::tests::VM_DISKS),
+            );
+        let h = hello(&fake, &Layout { root: "/A".into() });
+        assert_eq!(h.hardware, ["Virtual Machine", "M5", "8GB", "90GB"]);
     }
 }

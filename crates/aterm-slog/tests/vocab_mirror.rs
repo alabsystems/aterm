@@ -153,3 +153,24 @@ fn vocab_mirrors_the_screen_reader() {
         Verdict::Unknown
     );
 }
+
+/// The mail and inbox words hold every word the fabric speaks (phase 3B,
+/// ruling S20): each kind `deliver` accepts is a `mail kind=` word, each
+/// receipt verdict a `word=` word, and each story verb `aterm ctl story`
+/// tells a `word=` word, so a mark of any of them never reads `unknown`.
+#[test]
+fn mail_story_and_verdict_words_mirror_the_fabric_and_the_story() {
+    use aterm_slog::vocab::{MAIL_KIND_WORDS, WORD_WORDS};
+    for k in aterm_types::fabric_grammar::KINDS {
+        assert!(MAIL_KIND_WORDS.contains(&k), "mail kind {k:?}");
+    }
+    for v in aterm_types::fabric_grammar::VERDICTS {
+        assert!(WORD_WORDS.contains(&v), "inbox verdict {v:?}");
+    }
+    for w in aterm_messages::presence::StoryVerb::TOLD_WORDS {
+        assert!(WORD_WORDS.contains(&w), "story verb {w:?}");
+    }
+    // Negative control: a kind the fabric does not speak is no mail word.
+    assert!(!aterm_types::fabric_grammar::is_kind("teleport"));
+    assert!(!MAIL_KIND_WORDS.contains(&"teleport"));
+}

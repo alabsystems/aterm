@@ -107,6 +107,30 @@ fn published_index_hint_is_a_stripped_scheduling_witness_only() {
     }
 }
 
+/// What a discovery may guess the channel publishes: a store that verified nothing takes
+/// the highest build its cache holds, its release cut compiled in, or the window's probe
+/// saw, and where the run starts from the cut; a store with a floor takes only the probe's
+/// build, and never reads its cache for this.
+#[test]
+fn a_discovery_guesses_from_every_build_seen_published() {
+    use crate::net::IndexHint;
+    let hint = |low, newest| Some(IndexHint { low, newest });
+    let cut = hint(Some(8), 72);
+    assert_eq!(discovery_hint(0, || None, cut, None), cut);
+    assert_eq!(
+        discovery_hint(0, || Some(vec![74, 71]), cut, None),
+        hint(Some(8), 74)
+    );
+    assert_eq!(
+        discovery_hint(0, || Some(vec![70]), None, Some(75)),
+        hint(None, 75)
+    );
+    assert_eq!(discovery_hint(0, || None, None, None), None);
+    let unread = || -> Option<Vec<u64>> { panic!("a store with a floor reads no cache for this") };
+    assert_eq!(discovery_hint(72, unread, cut, None), None);
+    assert_eq!(discovery_hint(72, unread, cut, Some(73)), hint(None, 73));
+}
+
 /// THE PACKAGE LOG'S LANES (Phase 4): read off how the pass was spawned — the head
 /// watch's flag, the session's detached spawner, the window's queue-and-report flags,
 /// the intercept's queue without a progress file — else it was typed. And the exit
@@ -1103,6 +1127,41 @@ fn repair_refuses_a_read_only_rc_and_a_linked_aterm_dir() {
 
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&layout.prefix);
+}
+
+/// THE FIRST LAUNCH'S TWO `[machine]` APPLIES MEET ON ONE QUEUE. Before any pass has made
+/// the store's prefix, the window's (or a session's) launch apply and the launch seed's edge
+/// both start: the apply's queue makes the prefix ([`super::machine_apply_queue`]), and the
+/// edge, asking while it is held, finds it taken and leaves the table to that apply
+/// ([`super::MachineTurn::Busy`]); once it is let go the edge takes it. Negative control: a
+/// queue that answers "no prefix, no queue" leaves both to apply unqueued, side by side.
+#[test]
+fn the_first_launchs_machine_applies_meet_on_one_queue_before_any_prefix_exists() {
+    let home = crate::testdir::dir("atpkg-machine-queue-");
+    let layout = crate::store::Layout {
+        prefix: crate::store::default_prefix(&home),
+    };
+    assert!(
+        !layout.prefix.exists(),
+        "precondition: a first launch, no prefix yet"
+    );
+    let launch_apply = super::machine_apply_queue_in(&layout)
+        .expect("the launch apply's queue makes the prefix and takes the queue");
+    assert!(
+        matches!(
+            super::machine_apply_turn_in(&layout),
+            super::MachineTurn::Busy
+        ),
+        "the seed's edge finds the queue taken"
+    );
+    drop(launch_apply);
+    assert!(
+        matches!(
+            super::machine_apply_turn_in(&layout),
+            super::MachineTurn::Mine(_)
+        ),
+        "and takes it once it is let go"
+    );
 }
 
 fn temp_layout(label: &str) -> crate::testdir::ScratchLayout {
@@ -2978,17 +3037,6 @@ fn a_system_install_satisfies_a_default_set_member_and_retires_the_managed_copy(
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// The triple this client reports for itself is one of the six the schema serves —
-/// a row can only ever be selected under a spelling `TARGETS` carries.
-#[test]
-fn the_current_triple_is_a_schema_target() {
-    assert!(
-        crate::manifest::TARGETS.contains(&current_triple()),
-        "{} is not in TARGETS",
-        current_triple()
-    );
-}
-
 /// A verdict the AUTHORITY never gave must not become a resident of the record.
 ///
 /// `NotReachable` means the signed index resolved, verified, and does not name the
@@ -4374,7 +4422,9 @@ fn the_pass_reconcile_routes_an_up_to_date_affected_install() {
     }
 }
 
-/// REPAIR ROUTES, AND SAYS SO IN ITS EXIT CODE WHEN IT CANNOT. Over an affected build
+/// REPAIR ROUTES, AND SAYS SO IN ITS EXIT CODE WHEN IT CANNOT. An empty store still
+/// reconciles roots left by a partial removal, and a failure there also exits 1.
+/// Over an affected build
 /// with plain shims, [`repair_store`] re-lays them through the root it lays and exits
 /// 0; with the root unlayable (an unreadable directory in the build's `lib/`, standing
 /// in for the EXDEV of a store on another volume) every shim is still re-laid — plain,
@@ -4382,6 +4432,19 @@ fn the_pass_reconcile_routes_an_up_to_date_affected_install() {
 /// PATH tippy that cannot run is exactly this verb.
 #[test]
 fn repair_routes_the_trust_shims_and_exits_1_when_the_root_cannot_be_laid() {
+    let empty = temp_layout("exec-root-repair-empty");
+    for reconciled in [false, true] {
+        assert_eq!(
+            repair_store_reconciling(&empty, &[], |_, _| reconciled),
+            if reconciled {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            },
+            "an empty store must retain its exec-root operation's verdict"
+        );
+    }
+
     let l = temp_layout("exec-root-repair");
     seed_affected_trust(&l, 8595);
     assert_eq!(repair_store(&l, &[]), ExitCode::SUCCESS);
@@ -6853,6 +6916,26 @@ fn an_up_to_date_pass_migrates_legacy_rows_and_restamps_the_index() {
     let _ = update_pass(&layout, &fetcher);
     let status = crate::status::read(&layout).unwrap();
     assert_eq!(status.programs["ay"].state, crate::state::managed(18, 41));
+    // A live build cannot inherit the recorded attestation of an older build,
+    // even while this same reporting pass migrates the row's state spelling.
+    record_status(
+        &layout,
+        "ay",
+        crate::ProgramStatus {
+            installed_build: Some(17),
+            state: "active".into(),
+            tree_root: "signed-for-17".into(),
+        },
+        "previous pass".into(),
+    );
+    let (_, failures) = update_pass(&layout, &fetcher);
+    assert_eq!(failures, 0);
+    let status = crate::status::read(&layout).unwrap();
+    assert_eq!(status.programs["ay"].installed_build, Some(18));
+    assert!(
+        status.programs["ay"].tree_root.is_empty(),
+        "a root never migrates between builds"
+    );
     let _ = std::fs::remove_dir_all(&layout.prefix);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -8158,6 +8241,72 @@ fn a_command_stub_reports_and_waits_for_its_program() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
+/// A WAIT ON A PROMISE ITS CALLER SAW ends at once on a plan that left the program out,
+/// even when the update retired the promise before the wait's first read: the stub said
+/// "on its way" and then found no promise, so a live default-set pass with no row for
+/// `trust` is the honesty edge (127). The pass keeps its heartbeat until the wait has
+/// answered, as a real one runs on: a wait that missed the promise waits it out, and the
+/// hang detector says so.
+#[test]
+fn a_wait_on_a_promise_its_caller_saw_answers_a_plan_that_left_it_out_at_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let l = temp_layout("pend-seen-promise");
+    // Written whole and renamed in, as a pass writes it: a reader never sees half a plan.
+    let plan = |l: &crate::store::Layout| {
+        let tmp = l.progress_file().with_extension("tmp");
+        std::fs::write(
+            &tmp,
+            live_snapshot(
+                "{\"other\":{\"phase\":\"download\",\"bytes_done\":1,\"bytes_total\":4}}",
+                "[\"other\"]",
+            ),
+        )
+        .unwrap();
+        std::fs::rename(&tmp, l.progress_file()).unwrap();
+    };
+    plan(&l);
+    assert!(
+        !crate::progress::pass_owed(&l, now_secs()),
+        "the promise is retired"
+    );
+    let answered = std::sync::Arc::new(AtomicBool::new(false));
+    let heartbeat = {
+        let (layout, answered) = ((*l).clone(), std::sync::Arc::clone(&answered));
+        std::thread::spawn(move || {
+            while !answered.load(Ordering::SeqCst) {
+                plan(&layout);
+                std::thread::park_timeout(std::time::Duration::from_millis(200));
+            }
+        })
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let layout = (*l).clone();
+    std::thread::spawn(move || {
+        let code = wait_then_run(
+            &layout,
+            "targo",
+            &[],
+            WaitShow::Lines,
+            crate::progress::Asker::Script,
+            WaitSeen {
+                snapshot: None,
+                running: false,
+                promise: true,
+            },
+        );
+        let _ = tx.send(code);
+    });
+    let code = rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    answered.store(true, Ordering::SeqCst);
+    heartbeat.thread().unpark();
+    heartbeat.join().unwrap();
+    assert_eq!(
+        code.expect("hang detector: the wait never answered while the pass ran"),
+        ExitCode::from(127)
+    );
+    let _ = std::fs::remove_dir_all(&l.prefix);
+}
+
 /// A PROMISED PASS IS WAITED FOR before it begins (`pass-owed.json`, the window's first-run
 /// seed or an update about to plan): an unattended `targo` waits for `trust`, bumped first,
 /// where it used to find nothing installing — and keeps waiting through the begun pass's
@@ -8180,7 +8329,7 @@ fn a_promised_pass_is_waited_for_until_it_plans() {
     let l = temp_layout("pend-promised");
     crate::progress::promise_pass(&l, std::process::id(), crate::progress::SEED_PROMISE_SECS);
     let (lines, next) = lines_waiting_unattended(&l);
-    assert_eq!(next, PendingNext::WaitThenRun, "{lines:?}");
+    assert_eq!(next, PendingNext::WaitForPromise, "{lines:?}");
     assert!(
         lines
             .iter()
@@ -8208,7 +8357,7 @@ fn a_promised_pass_is_waited_for_until_it_plans() {
     // The pass begun, its plan not in yet: still the promise's wait, never the edge…
     std::fs::write(l.progress_file(), live_snapshot("{}", "[]")).unwrap();
     let (lines, next) = lines_waiting_unattended(&l);
-    assert_eq!(next, PendingNext::WaitThenRun, "{lines:?}");
+    assert_eq!(next, PendingNext::WaitForPromise, "{lines:?}");
     assert!(
         !lines
             .iter()
@@ -13218,6 +13367,24 @@ fn a_vendor_rollback_moves_to_the_retained_build_without_the_index() {
     use crate::vendor_direct::lane::{self, Verdict};
     use crate::vendor_direct::policy::Policy;
     let layout = world::layout("rollback-by-hand");
+    let index = CountingFetcher::new(layout.prefix.join("unused-index"));
+    let absent = crate::flow::rollback(
+        &index,
+        &layout,
+        &crate::sig::testkit::anchor(),
+        "stable",
+        "ay",
+        &[],
+        vendor_floor(),
+        world_now(),
+    )
+    .unwrap_err();
+    assert!(matches!(absent, crate::FlowError::Rollback(_)), "{absent}");
+    assert_eq!(
+        index.resolves(),
+        0,
+        "the flow refuses before any index read"
+    );
     let f = Fake::default();
     let trust = world::trust();
     let none = Policy::default();
@@ -13699,4 +13866,161 @@ fn a_rollback_to_the_legacy_build_is_attested_by_its_kept_root() {
         }
     );
     let _ = std::fs::remove_dir_all(&layout.prefix);
+}
+
+/// A PROGRAM BUILT INTO aterm IS ANSWERED AS SUCH (amacs design §8.5). An `amacs` on
+/// PATH outside the prefix is what the store's arms would call `system: … — not managed by
+/// aterm`; `which` answers in the built-in state instead, naming the alias beside the
+/// running aterm, or the other copy that runs ahead of it.
+#[test]
+fn which_amacs_is_built_in() {
+    let l = temp_layout("which-built-in");
+    let amacs = crate::builtin::builtin("amacs").unwrap();
+    let version = aterm_types::version::app_version();
+    let alias_dir = crate::builtin::alias_dir();
+    let path = empty_path(&l);
+    assert_eq!(
+        which_line_in(&l, "amacs", Some(&path), crate::reroute::StubEnv::default()),
+        Ok(crate::builtin::which_line_at(
+            amacs,
+            alias_dir.as_deref(),
+            None,
+            version
+        ))
+    );
+    // Another aterm's alias first on PATH, outside the prefix: built in, shadowed by it,
+    // and never `system:`.
+    let bundle = crate::testdir::dir("atpkg-built-in-bundle-");
+    std::fs::write(bundle.join("aterm"), b"#!/bin/true\n").unwrap();
+    std::fs::set_permissions(bundle.join("aterm"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("aterm", bundle.join("amacs")).unwrap();
+    let line = which_line_in(
+        &l,
+        "amacs",
+        Some(bundle.as_os_str()),
+        crate::reroute::StubEnv::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        line,
+        crate::builtin::which_line_at(
+            amacs,
+            alias_dir.as_deref(),
+            Some(&bundle.join("amacs")),
+            version
+        )
+    );
+    assert!(
+        line.starts_with(&format!("amacs → {}", bundle.join("amacs").display())),
+        "{line}"
+    );
+    assert!(!line.contains("system:"), "{line}");
+}
+
+/// `list`'s human form ends with the programs built into aterm (ahead of a closing
+/// `next` line, which stays last); its piped form is the store's alone, byte for byte as
+/// before, on an empty store and on a live one.
+#[test]
+fn list_human_shows_built_in_row_and_porcelain_is_unchanged() {
+    let section = crate::builtin::list_human_lines(aterm_types::version::app_version());
+    assert!(
+        section
+            .iter()
+            .any(|row| row.trim_start().starts_with("amacs ")),
+        "{section:?}"
+    );
+    let human = |store: &[&str]| -> Vec<String> {
+        store
+            .iter()
+            .map(ToString::to_string)
+            .chain(section.iter().cloned())
+            .collect()
+    };
+
+    let l = temp_layout("list-built-in");
+    assert_eq!(
+        list_lines(&l, false).unwrap(),
+        ["atpkg: no programs installed"]
+    );
+    assert_eq!(list_lines(&l, true).unwrap(), human(&[EMPTY_LIST_HUMAN]));
+
+    make_live(&l, "ay", 18);
+    assert_eq!(list_lines(&l, false).unwrap(), ["ay\t18\tlive"]);
+    assert_eq!(
+        list_lines(&l, true).unwrap(),
+        human(&["atpkg: 1 program(s) — 1 live", "  ay  18  live"])
+    );
+
+    let closing = with_built_in_section(vec!["rows".to_string(), LIST_NEXT_DOCTOR.to_string()]);
+    let mut expected = human(&["rows"]);
+    expected.push(LIST_NEXT_DOCTOR.to_string());
+    assert_eq!(closing, expected, "the one next act stays the last line");
+}
+
+/// `install amacs` has nothing to fetch: it exits 0 at the dispatch edge, before the store
+/// lock (`update amacs` likewise).
+#[test]
+fn install_amacs_is_a_noop_exit_0() {
+    let run = |argv: &[&str]| main_entry(argv.iter().map(std::ffi::OsString::from).collect());
+    assert_eq!(run(&["install", "amacs"]), ExitCode::SUCCESS);
+    assert_eq!(run(&["update", "amacs"]), ExitCode::SUCCESS);
+}
+
+/// Each store verb's answer for a built-in name reads that verb's own flags off the table,
+/// as the arity gate does: `update amacs --retry` is `update amacs`, never a pass that asks
+/// the index for amacs; `--vendor`/`--alab`, `pin`, `unpin` and `rollback` refuse; and any
+/// other argv is left to the verb's own grammar.
+#[test]
+fn built_in_answers_read_the_verbs_own_flags() {
+    let argv = |xs: &[&str]| xs.iter().map(ToString::to_string).collect::<Vec<_>>();
+    for (verb, xs, code) in [
+        ("install", &["amacs"][..], ExitCode::SUCCESS),
+        ("update", &["amacs", "--retry"], ExitCode::SUCCESS),
+        ("update", &["--retry", "amacs"], ExitCode::SUCCESS),
+        ("update", &["amacs", "--vendor"], ExitCode::from(1)),
+        ("update", &["--alab", "amacs"], ExitCode::from(1)),
+        ("verify", &["amacs"], ExitCode::SUCCESS),
+        ("pin", &["amacs"], ExitCode::from(1)),
+        ("unpin", &["amacs"], ExitCode::from(1)),
+        ("rollback", &["amacs"], ExitCode::from(1)),
+    ] {
+        assert_eq!(
+            built_in_answer(verb, &argv(xs)),
+            Some(code),
+            "{verb} {xs:?}"
+        );
+    }
+    for (verb, xs) in [
+        ("install", &["ay"][..]),
+        ("install", &["--default-set", "amacs"]),
+        ("update", &["--retry"]),
+        ("run", &["amacs"]),
+        ("remove", &["amacs"]),
+    ] {
+        assert_eq!(built_in_answer(verb, &argv(xs)), None, "{verb} {xs:?}");
+    }
+}
+
+/// `uninstall amacs` refuses with exit 1: a built-in program cannot leave the binary, so
+/// the refusal names the setting that ends its role instead. atpkg has no `remove`; the
+/// word other package managers use is answered with `uninstall`.
+#[test]
+fn remove_amacs_refuses_naming_the_setting() {
+    let run = |argv: &[&str]| main_entry(argv.iter().map(std::ffi::OsString::from).collect());
+    let answer = crate::builtin::verb_answer(
+        "uninstall",
+        &["amacs".to_string()],
+        &[],
+        aterm_types::version::app_version(),
+    )
+    .unwrap();
+    assert!(answer.refused);
+    assert!(
+        answer.line.contains("`[amacs] default_editor = false`"),
+        "{}",
+        answer.line
+    );
+    assert_eq!(run(&["uninstall", "amacs"]), ExitCode::from(1));
+    assert_eq!(did_you_mean("remove"), Some("uninstall"));
+    assert_eq!(did_you_mean("rm"), Some("uninstall"));
 }

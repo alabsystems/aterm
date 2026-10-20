@@ -1,65 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `App` glue for the session picker ([`crate::session_picker`], design
-//! §2.3/§2.5 — the wave-2 "picker slice"): open with an intent
-//! (Connect / Configure / Disconnect), type-to-filter over the live registry,
-//! and settle a choice — Connect/Configure open the shared confirm card
-//! ([`crate::app_conn_card`]) for subject ⇄ chosen; Disconnect dissolves both
-//! directions through the same seam the tab menu's Disconnect row uses.
+//! `App` glue for the picker ([`crate::session_picker`]): File ▸ New Window /
+//! New Tab With Identity… opens it over the identity roster, type-to-filter,
+//! and a choice spawns under the identity (or provisions the one the filter
+//! names). The connection intents it once carried (Connect / Configure /
+//! Disconnect) were retired (`docs/DESIGN-owner-surfaces-2026-10-16.md` §7).
 //!
 //! Modelled on `app_palette.rs`: the state lives in the one modal
 //! [`crate::overlay::Overlay`] slot (keys structurally gated before the
 //! terminal), every mutator repaints + refreshes the a11y tree, and the
 //! pointer follows the palette's claim/hover/arm discipline.
 
-use aterm_session::SessionId;
-
 use crate::App;
 use crate::WindowId;
-use crate::session_picker::{
-    PickerChoice, PickerIntent, PickerRow, SessionPickerState, SessionRow,
-};
+use crate::session_picker::{PickerChoice, PickerIntent, PickerRow, SessionPickerState};
 
 impl App {
-    /// Gather the picker's choosable rows for `subject` under `intent`:
-    /// Connect lists every live registered session except the subject
-    /// (connected peers annotated); Configure/Disconnect list ONLY the
-    /// subject's connected peers (§2.3 — those ids act on an existing pair).
-    /// Registry facts only; titles resolve user meta title ▸ registry title
-    /// without an agent's spinner frame (`SessionHandle::display_title`).
-    fn picker_rows(&self, subject: &SessionId, intent: PickerIntent) -> Vec<PickerRow> {
-        let peers: std::collections::HashSet<String> = self
-            .connection_facts(subject)
-            .into_iter()
-            .map(|f| f.peer_sid.as_str().to_string())
-            .collect();
-        let g = self.store.read().unwrap_or_else(|p| p.into_inner());
-        let mut rows: Vec<PickerRow> = g
-            .snapshot()
-            .into_iter()
-            .filter(|h| h.sid != *subject)
-            .filter(|h| !matches!(h.state, crate::session_store::SessionState::Exited))
-            .filter(|h| matches!(intent, PickerIntent::Connect) || peers.contains(h.sid.as_str()))
-            .map(|h| {
-                let title = h.display_title();
-                PickerRow::Session(SessionRow {
-                    connected: peers.contains(h.sid.as_str()),
-                    sid: h.sid,
-                    local_id: h.local_id,
-                    title,
-                })
-            })
-            .collect();
-        // Stable listing (the connection_facts BTreeMap discipline): by sid.
-        rows.sort_by(|a, b| {
-            a.sid()
-                .map(SessionId::as_str)
-                .cmp(&b.sid().map(SessionId::as_str))
-        });
-        rows
-    }
-
     /// The identity picker's rows: every identity on disk by name (the
     /// `identities` roster), each with the number of live sessions wearing it,
     /// then the row that creates the identity the filter names.
@@ -86,33 +43,8 @@ impl App {
     /// Identity… (`intent` must be one of the two identity intents). Always
     /// opens: an empty roster still offers the new-identity row.
     pub(crate) fn open_identity_picker(&mut self, wid: WindowId, intent: PickerIntent) -> bool {
-        debug_assert!(intent.picks_identity());
         let rows = self.identity_picker_rows();
-        let state = SessionPickerState::new(wid, None, String::new(), intent, rows);
-        self.install_session_picker(wid, state)
-    }
-
-    /// Open the session picker on `wid` for `subject` under `intent`. Returns
-    /// `false` — nothing opens — when the subject is unregistered, or when a
-    /// Configure/Disconnect intent has no connected peer to act on (those ids
-    /// NEVER guess, §2.3; an empty Connect picker still opens and states its
-    /// empty truth).
-    pub(crate) fn open_session_picker(
-        &mut self,
-        wid: WindowId,
-        subject: SessionId,
-        intent: PickerIntent,
-    ) -> bool {
-        let Some(subject_title) = self.session_title_by_sid(&subject) else {
-            aterm_log::info!("session picker refused: subject not registered");
-            return false;
-        };
-        let rows = self.picker_rows(&subject, intent);
-        if rows.is_empty() && !matches!(intent, PickerIntent::Connect) {
-            aterm_log::info!("session picker: no connected peer to act on");
-            return false;
-        }
-        let state = SessionPickerState::new(wid, Some(subject), subject_title, intent, rows);
+        let state = SessionPickerState::new(wid, intent, rows);
         self.install_session_picker(wid, state)
     }
 
@@ -169,63 +101,36 @@ impl App {
         self.repaint_session_picker_pointer(wid, true);
     }
 
-    /// Settle the chosen session (Enter / a pointer activation): close the
-    /// picker, then dispatch by intent — Connect/Configure open THE shared
-    /// confirm card for subject ⇄ chosen (§2.5 prefill from the live tables,
-    /// origin `menu`), Disconnect dissolves both directions. An empty filter
-    /// (no cursor row) is a no-op and the picker stays open.
+    /// Settle the chosen row (Enter / a pointer activation): close the picker,
+    /// then spawn under the chosen identity, provisioning the one the filter
+    /// names. An empty filter (no cursor row), or a new-identity row whose
+    /// query is no new valid name, is a no-op and the picker stays open.
     pub(crate) fn session_picker_activate(&mut self, wid: WindowId) {
-        let Some((subject, intent, chosen)) = self
+        let Some((intent, chosen)) = self
             .windows
             .get(&wid)
             .and_then(|ws| ws.session_picker())
             .and_then(|p| {
                 p.selected_row()
                     .and_then(|row| p.choice_for(row))
-                    .map(|choice| (p.subject.clone(), p.intent, choice))
+                    .map(|choice| (p.intent, choice))
             })
         else {
             return;
         };
         self.session_picker_exit(wid);
-        self.settle_picker_choice(wid, subject, intent, chosen);
+        self.settle_picker_choice(wid, intent, chosen);
     }
 
-    /// The one intent-dispatch seam keyboard and pointer activation share.
-    fn settle_picker_choice(
-        &mut self,
-        wid: WindowId,
-        subject: Option<SessionId>,
-        intent: PickerIntent,
-        chosen: PickerChoice,
-    ) {
-        match (intent, chosen, subject) {
-            (
-                PickerIntent::Connect | PickerIntent::Configure,
-                PickerChoice::Session(chosen),
-                Some(subject),
-            ) => {
-                let _ = self.open_confirm_card(wid, subject, chosen, None, "menu");
-            }
-            (PickerIntent::Disconnect, PickerChoice::Session(chosen), Some(subject)) => {
-                self.disconnect_pair(&subject, &chosen, "menu");
-            }
-            (
-                PickerIntent::NewWindowWithIdentity | PickerIntent::NewTabWithIdentity,
-                PickerChoice::Identity { name, create },
-                _,
-            ) => {
-                self.spawn_with_identity(
-                    wid,
-                    intent == PickerIntent::NewWindowWithIdentity,
-                    &name,
-                    create,
-                );
-            }
-            // Rows are built per intent, so a session row never reaches an
-            // identity intent (or the reverse); nothing to do if one did.
-            _ => {}
-        }
+    /// The one dispatch seam keyboard and pointer activation share.
+    fn settle_picker_choice(&mut self, wid: WindowId, intent: PickerIntent, chosen: PickerChoice) {
+        let PickerChoice::Identity { name, create } = chosen;
+        self.spawn_with_identity(
+            wid,
+            intent == PickerIntent::NewWindowWithIdentity,
+            &name,
+            create,
+        );
     }
 
     /// Spawn under identity `name` — a new WINDOW or a new TAB in `wid`.
@@ -267,9 +172,9 @@ impl App {
     pub(crate) fn on_key_session_picker_mode(
         &mut self,
         wid: WindowId,
-        ev: &winit::event::KeyEvent,
+        ev: &aterm_window::event::KeyEvent,
     ) -> bool {
-        use winit::keyboard::{Key, NamedKey};
+        use aterm_window::keyboard::{Key, NamedKey};
         if self
             .windows
             .get(&wid)
@@ -431,20 +336,20 @@ impl App {
         if !activate {
             return;
         }
-        let Some((subject, intent, chosen)) = self
+        let Some((intent, chosen)) = self
             .windows
             .get(&wid)
             .and_then(|ws| ws.session_picker())
             .and_then(|p| {
                 hit.and_then(|idx| p.row_at_filtered(idx))
                     .and_then(|row| p.choice_for(row))
-                    .map(|choice| (p.subject.clone(), p.intent, choice))
+                    .map(|choice| (p.intent, choice))
             })
         else {
             return;
         };
         self.session_picker_exit(wid);
-        self.settle_picker_choice(wid, subject, intent, chosen);
+        self.settle_picker_choice(wid, intent, chosen);
     }
 
     /// Scroll the band, then re-resolve the stationary pointer (the palette's
@@ -467,71 +372,10 @@ impl App {
             .is_some_and(|p| p.pointer_hover(hit));
         self.repaint_session_picker_pointer(wid, changed);
     }
-
-    /// Route a connection COMMAND id invoked against `subject` (design §2.3):
-    /// the shared dispatch for the menu-bar-less ids — `session.connect_to`
-    /// opens the Connect picker; `session.configure_connection` opens the
-    /// sheet directly with exactly one peer, the picker with several, and
-    /// refuses with none; `session.disconnect` disconnects directly with one
-    /// peer, picks with several — NEVER guesses.
-    pub(crate) fn open_connection_ui(
-        &mut self,
-        wid: WindowId,
-        subject: SessionId,
-        action: crate::menu::MenuAction,
-    ) {
-        use crate::menu::MenuAction;
-        match action {
-            MenuAction::ConnectToSession => {
-                let _ = self.open_session_picker(wid, subject, PickerIntent::Connect);
-            }
-            MenuAction::ConfigureConnection | MenuAction::DisconnectSession => {
-                let peers: Vec<SessionId> = self
-                    .connection_facts(&subject)
-                    .into_iter()
-                    .map(|f| f.peer_sid)
-                    .collect();
-                let configure = matches!(action, MenuAction::ConfigureConnection);
-                match peers.as_slice() {
-                    [] => {
-                        aterm_log::info!(
-                            "{}: session {} has no connection",
-                            if configure { "configure" } else { "disconnect" },
-                            subject.as_str()
-                        );
-                        self.post_message(crate::message_reporters::no_connection(configure));
-                    }
-                    [peer] => {
-                        // Unambiguous: one peer acts directly (§2.3 — the
-                        // sheet when one; disconnect needs no picker).
-                        let peer = peer.clone();
-                        if configure {
-                            let _ = self.open_confirm_card(wid, subject, peer, None, "menu");
-                        } else {
-                            self.disconnect_pair(&subject, &peer, "menu");
-                        }
-                    }
-                    _ => {
-                        let intent = if configure {
-                            PickerIntent::Configure
-                        } else {
-                            PickerIntent::Disconnect
-                        };
-                        let _ = self.open_session_picker(wid, subject, intent);
-                    }
-                }
-            }
-            other => {
-                aterm_log::info!("open_connection_ui: {other:?} is not a connection id");
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use aterm_session::ConnectionKind;
-
     use crate::App;
     use crate::WindowId;
     use crate::input::InputEvent;
@@ -564,22 +408,6 @@ mod tests {
             handles.into_iter().map(|h| h.sid).collect()
         };
         (app, wid, sids)
-    }
-
-    fn connect(app: &App, src: &aterm_session::SessionId, dst: &aterm_session::SessionId) {
-        let ctx = {
-            let g = app.store.read().unwrap();
-            g.by_sid(dst).unwrap().ctx.clone()
-        };
-        assert!(crate::connections::connect_in(
-            &app.connections,
-            src,
-            dst,
-            &ctx.edges,
-            &ctx.nonce,
-            ConnectionKind::Both,
-            "test",
-        ));
     }
 
     /// ROUND 18'S IDENTITY ROWS, through the one picker surface: New Tab /
@@ -616,7 +444,8 @@ mod tests {
         };
         let listed = lines(&app);
         assert!(
-            listed[0].contains("intent=new-window-identity") && listed[0].contains("subject=-")
+            listed[0].contains("intent=new-window-identity"),
+            "{listed:?}"
         );
         assert!(listed[1].contains("identity=alpha") && listed[2].contains("identity=beta"));
         assert!(listed[3].contains("identity=+new"), "{listed:?}");
@@ -689,211 +518,33 @@ mod tests {
         assert_eq!(crate::agent_identity::roster(), ["alpha", "beta"]);
     }
 
-    /// The Connect picker lists every OTHER live session (never the subject),
-    /// annotates connected peers, and its selection opens THE shared confirm
-    /// card for subject ⇄ chosen.
+    /// Filter narrows in the palette style and Esc closes without acting: no
+    /// identity is created, no tab opens.
     #[test]
-    fn connect_picker_lists_others_and_selection_opens_the_card() {
-        let (mut app, wid, sids) = app_with_three();
-        connect(&app, &sids[0], &sids[2]);
-        assert!(app.open_session_picker(wid, sids[0].clone(), PickerIntent::Connect));
+    fn filter_narrows_and_esc_closes_without_acting() {
+        let (mut app, wid, _sids) = app_with_three();
+        let tabs = app.windows[&wid].tab_set.len();
+        assert!(app.open_identity_picker(wid, PickerIntent::NewTabWithIdentity));
         assert_eq!(
             app.windows[&wid].overlay().map(|o| o.kind()),
             Some(OverlayKind::SessionPicker)
         );
+        app.session_picker_input_event(wid, &InputEvent::Text("zzzz no".to_string()));
         let lines = app.windows[&wid].session_picker().unwrap().controls_lines();
-        assert!(
-            !lines
-                .iter()
-                .any(|l| l.contains(&format!("sid={}", sids[0].as_str())) && l.contains("row")),
-            "the subject never lists itself: {lines:?}"
-        );
-        assert!(
-            lines.iter().any(
-                |l| l.contains(&format!("sid={}", sids[2].as_str())) && l.contains("connected")
-            ),
-            "connected peers are annotated: {lines:?}"
-        );
-
-        // Walk the cursor to the connected peer's row and choose it.
-        let target = picker_row_ordinal(&app, wid, &sids[2]);
-        app.session_picker_move(wid, target as isize);
-        app.session_picker_input_event(wid, &key(aterm_types::keyboard::NamedKey::Enter));
-        let card = app.windows[&wid]
-            .conn_card()
-            .expect("selection opens the card");
-        assert_eq!(card.src, sids[0]);
-        assert_eq!(card.dst, sids[2]);
-        // Prefilled from the live pair (Both exists already).
-        assert_eq!(card.kind, ConnectionKind::Both);
-    }
-
-    /// THE PICKER'S ROWS AND THE CONNECTION LINES NAME A SESSION WITHOUT ITS
-    /// AGENT'S SPINNER FRAME (the Together run's D7, on the surfaces the first
-    /// fix missed): the registry title `⠦ Add tested …` is listed as `Add
-    /// tested …` in the Connect picker's row and in the subject's connection
-    /// facts (the tab menu's and tooltip's `⇆ peer "…"` lines). NEGATIVE
-    /// CONTROL: a title the person set (`meta set title`) is theirs, whole,
-    /// frame and all.
-    #[test]
-    fn the_pickers_rows_and_connection_lines_drop_an_agents_spinner_frame() {
-        let (mut app, wid, sids) = app_with_three();
-        connect(&app, &sids[0], &sids[2]);
-        let local = app.store.read().unwrap().by_sid(&sids[2]).unwrap().local_id;
-        app.store
-            .write()
-            .unwrap()
-            .set_title(local, "\u{2826} Add tested calculator functions");
-        let picker_row = |app: &App| {
-            app.windows[&wid]
-                .session_picker()
-                .expect("picker open")
-                .controls_lines()
-                .into_iter()
-                .find(|l| l.contains(&format!("sid={}", sids[2].as_str())))
-                .expect("the peer is listed")
-        };
-        let peer_title = |app: &App| {
-            app.connection_facts(&sids[0])
-                .into_iter()
-                .find(|f| f.peer_sid == sids[2])
-                .expect("the pair is a connection fact")
-                .peer_title
-        };
-        assert!(app.open_session_picker(wid, sids[0].clone(), PickerIntent::Connect));
-        let row = picker_row(&app);
-        assert!(
-            row.contains("text=\"\\\"Add tested calculator functions\\\""),
-            "the row names the subject, not the frame: {row}"
-        );
-        assert_eq!(peer_title(&app), "Add tested calculator functions");
-        app.session_picker_exit(wid);
-
-        app.store
-            .read()
-            .unwrap()
-            .by_sid(&sids[2])
-            .unwrap()
-            .ctx
-            .meta
-            .lock()
-            .unwrap()
-            .set("title", Some("\u{2826} deploy".to_string()));
-        assert!(app.open_session_picker(wid, sids[0].clone(), PickerIntent::Connect));
-        let row = picker_row(&app);
-        assert!(
-            row.contains("\u{2826} deploy"),
-            "a person's title stays whole: {row}"
-        );
-        assert_eq!(peer_title(&app), "\u{2826} deploy");
-    }
-
-    /// The open picker's FILTERED ordinal of the row for `sid` — cursor
-    /// navigation by exact identity, immune to fuzzy-filter cross-matches.
-    fn picker_row_ordinal(app: &App, wid: WindowId, sid: &aterm_session::SessionId) -> usize {
-        app.windows[&wid]
-            .session_picker()
-            .expect("picker open")
-            .controls_lines()
-            .iter()
-            .skip(1)
-            .position(|l| l.contains(&format!("sid={}", sid.as_str())))
-            .expect("the target session is listed")
-    }
-
-    /// Filter narrows in the palette style and Esc closes without acting.
-    #[test]
-    fn filter_narrows_and_esc_closes_without_acting() {
-        let (mut app, wid, sids) = app_with_three();
-        assert!(app.open_session_picker(wid, sids[0].clone(), PickerIntent::Connect));
-        app.session_picker_input_event(wid, &InputEvent::Text("zzzz-no-match".to_string()));
-        let lines = app.windows[&wid].session_picker().unwrap().controls_lines();
-        assert!(lines[0].contains("shown=0"), "{lines:?}");
-        // Enter with no cursor row is a no-op — the picker stays open.
+        // Only the new-identity row never filters out.
+        assert!(lines[0].contains("shown=1"), "{lines:?}");
+        // Enter on a name the grammar refuses is a no-op — the picker stays.
         app.session_picker_input_event(wid, &key(aterm_types::keyboard::NamedKey::Enter));
         assert!(app.windows[&wid].session_picker().is_some());
-        // Backspace widens again.
-        for _ in 0.."zzzz-no-match".len() {
-            app.session_picker_input_event(wid, &key(aterm_types::keyboard::NamedKey::Backspace));
-        }
-        assert!(
-            app.windows[&wid].session_picker().unwrap().controls_lines()[0].contains("shown=2")
-        );
         app.session_picker_input_event(wid, &key(aterm_types::keyboard::NamedKey::Escape));
         assert!(
             app.windows[&wid].session_picker().is_none(),
             "Esc closed it"
         );
-        assert!(
-            app.connections.records().is_empty(),
-            "closing minted nothing"
-        );
-    }
-
-    /// `session.configure_connection` (id-invoked): one peer opens the sheet
-    /// DIRECTLY; several route through the picker; none refuses. The
-    /// disconnect id acts directly with one peer and never guesses among
-    /// several (§2.3).
-    #[test]
-    fn id_invoked_configure_and_disconnect_route_through_the_picker() {
-        use crate::menu::MenuAction;
-        let (mut app, wid, sids) = app_with_three();
-
-        // No connection: both ids refuse (no picker, no card, no guess)…
-        let rows_before = app.messages.live_rows().count();
-        app.open_connection_ui(wid, sids[0].clone(), MenuAction::ConfigureConnection);
-        assert!(app.windows[&wid].overlay().is_none());
-        app.open_connection_ui(wid, sids[0].clone(), MenuAction::DisconnectSession);
-        assert!(app.windows[&wid].overlay().is_none());
-        // ... and say why nothing opened: one row per press.
         assert_eq!(
-            app.messages.live_rows().count(),
-            rows_before + 2,
-            "one row per refused press"
+            app.windows[&wid].tab_set.len(),
+            tabs,
+            "closing opened nothing"
         );
-
-        // ONE peer: configure opens the sheet directly, prefilled.
-        connect(&app, &sids[0], &sids[1]);
-        app.open_connection_ui(wid, sids[0].clone(), MenuAction::ConfigureConnection);
-        {
-            let card = app.windows[&wid].conn_card().expect("one peer ⇒ the sheet");
-            assert_eq!(card.dst, sids[1]);
-        }
-        app.conn_card_exit(wid);
-
-        // SEVERAL peers: configure routes through the picker (never guesses).
-        connect(&app, &sids[0], &sids[2]);
-        app.open_connection_ui(wid, sids[0].clone(), MenuAction::ConfigureConnection);
-        let picker = app.windows[&wid]
-            .session_picker()
-            .expect("several ⇒ picker");
-        assert_eq!(picker.intent, PickerIntent::Configure);
-        let lines = picker.controls_lines();
-        assert!(lines[0].contains("rows=2"), "peers only: {lines:?}");
-        app.session_picker_exit(wid);
-
-        // Disconnect with several peers: picker; choosing one dissolves BOTH
-        // directions of exactly that pair.
-        app.open_connection_ui(wid, sids[0].clone(), MenuAction::DisconnectSession);
-        assert_eq!(
-            app.windows[&wid].session_picker().unwrap().intent,
-            PickerIntent::Disconnect
-        );
-        let target = picker_row_ordinal(&app, wid, &sids[1]);
-        app.session_picker_move(wid, target as isize);
-        app.session_picker_input_event(wid, &key(aterm_types::keyboard::NamedKey::Enter));
-        assert!(app.windows[&wid].session_picker().is_none());
-        let records = app.connections.records();
-        assert!(records.get(&(sids[0].clone(), sids[1].clone())).is_none());
-        assert!(
-            records.get(&(sids[0].clone(), sids[2].clone())).is_some(),
-            "the other pair is untouched"
-        );
-
-        // Down to ONE peer: the disconnect id acts directly, no picker.
-        drop(records);
-        app.open_connection_ui(wid, sids[0].clone(), MenuAction::DisconnectSession);
-        assert!(app.windows[&wid].overlay().is_none(), "direct, no picker");
-        assert!(app.connections.records().is_empty());
     }
 }

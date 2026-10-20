@@ -29,8 +29,8 @@ use aterm_uds::CtlStream;
 
 use super::control_lanes::{Census, LaneLimits, LaneReader, LaneService, Lanes, lane_reader};
 use super::{
-    ActiveHandle, Scope, ServeDisposition, authenticate_connection, control_denials,
-    read_request_line,
+    AUTH_READ_TIMEOUT, ActiveHandle, MAX_REQUEST_LINE, Scope, ServeDisposition,
+    authenticate_connection, control_denials, read_request_line,
 };
 
 /// The instance token the handshake tests present.
@@ -124,6 +124,10 @@ impl LaneService for Stub {
     fn subscribe(&self, _line: String, _scope: Scope, _stream: CtlStream) {}
 
     fn release(&self, _id: u64) {}
+
+    fn has_live_claim(&self, _id: u64) -> bool {
+        false
+    }
 }
 
 /// One request lane (so a lane held is a fresh client refused) and a parker.
@@ -194,8 +198,15 @@ impl Rig {
 
 /// One line the server sent, without its newline.
 fn line_of(client: &CtlStream) -> String {
+    next_line(&mut BufReader::new(client))
+}
+
+/// The next line on `reader`, without its newline: `<EOF>` at the end, the
+/// error in angle brackets. Lines read one after another go through ONE
+/// reader, which may buffer past the first.
+fn next_line(reader: &mut impl std::io::BufRead) -> String {
     let mut reply = String::new();
-    match BufReader::new(client).read_line(&mut reply) {
+    match reader.read_line(&mut reply) {
         Ok(0) => "<EOF>".to_string(),
         Ok(_) => reply.trim_end().to_string(),
         Err(error) => format!("<{error}>"),
@@ -297,6 +308,62 @@ fn a_frame_header_is_acted_on_at_once_and_its_body_keeps_no_lane() {
     );
 }
 
+/// A LARGE REQUEST ARRIVING SLOWLY is held off the heap: half a 200 000-byte
+/// frame body, then half of a line that has no newline yet, are held parked in
+/// a mapping sized for the whole request (the frame's line and body; the
+/// longest line plus one), whether the parker read them or a lane began to
+/// before it parked — the census counts exactly that, and no heap buffer — and
+/// each is served whole once the rest comes, the request pipelined behind the
+/// frame after it.
+#[test]
+fn a_large_request_arriving_slowly_is_held_off_the_heap() {
+    const BODY: usize = 200_000;
+    let rig = Rig::new();
+    let client = rig.dial().expect("admitted");
+    let header = format!("feed-bin {BODY}\n");
+    (&client)
+        .write_all(format!("AUTH ok\n{header}").as_bytes())
+        .expect("the header");
+    (&client)
+        .write_all(&vec![b'z'; BODY / 2])
+        .expect("half the body");
+    rig.answers_a_fresh_client_while(1, "the half-sent frame parked");
+    rig.settle("half the body gathered", |census| {
+        census.held == header.len() + BODY
+    });
+    let mut rest = vec![b'z'; BODY - BODY / 2];
+    rest.extend_from_slice(b"ping\n");
+    (&client)
+        .write_all(&rest)
+        .expect("the rest, and a request behind it");
+    let mut reader = BufReader::new(&client);
+    let answer = next_line(&mut reader);
+    assert_eq!(
+        answer.len(),
+        format!("OK {BODY} ").len() + BODY,
+        "the frame served whole"
+    );
+    assert_eq!(
+        next_line(&mut reader),
+        "OK ping",
+        "and the request behind it"
+    );
+
+    let line = vec![b'y'; 40 * 1024];
+    (&client)
+        .write_all(&line)
+        .expect("a line with no newline yet");
+    rig.settle("the begun line gathered", |census| {
+        census.parked == 1 && census.held == MAX_REQUEST_LINE + 1
+    });
+    (&client).write_all(b"\n").expect("its newline");
+    assert_eq!(
+        next_line(&mut reader).len(),
+        "OK ".len() + line.len(),
+        "the line served whole"
+    );
+}
+
 /// A frame refused on its header is answered and closed without its body
 /// being waited for.
 #[test]
@@ -309,6 +376,55 @@ fn a_frame_refused_on_its_header_closes_without_waiting_for_its_body() {
     assert_eq!(line_of(&refused), "ERR refused");
     assert_eq!(line_of(&refused), "<EOF>", "and the connection is closed");
     rig.settle("the connection closed", |census| census.open == 0);
+}
+
+/// A line too long for any request is answered why, then closed, the request
+/// behind it unserved: on a lane with a parker and without one, and in the
+/// handshake. Before, the peer read a bare EOF. The server stops reading at
+/// the cap, so the rest of each write may fail; it is written apart.
+#[test]
+fn an_over_long_line_is_answered_why_then_closed() {
+    let refusal = "ERR request line too long (max 65536 bytes)";
+    let over_long = |head: &[u8]| {
+        let mut wire = head.to_vec();
+        wire.resize(head.len() + MAX_REQUEST_LINE + 1, b'x');
+        wire.extend_from_slice(b"\nping\n");
+        wire
+    };
+    for open in [16, 0] {
+        let rig = Rig::with_open(open);
+        let client = rig.dial().expect("admitted");
+        let wire = over_long(b"AUTH ok\n");
+        std::thread::scope(|scope| {
+            scope.spawn(|| (&client).write_all(&wire));
+            let mut reader = BufReader::new(&client);
+            assert_eq!(next_line(&mut reader), refusal, "open={open}");
+            let after = next_line(&mut reader);
+            assert!(
+                after.starts_with('<'),
+                "open={open}: `ping` was served: {after}"
+            );
+        });
+        rig.settle("the connection closed", |census| census.open == 0);
+    }
+    let (client, server) = CtlStream::pair().expect("socket pair");
+    client
+        .set_read_timeout(Some(HANG))
+        .expect("bound client reads");
+    let wire = over_long(b"AUTH ");
+    std::thread::scope(|scope| {
+        scope.spawn(|| (&client).write_all(&wire));
+        let handshake = scope.spawn(move || {
+            let active: ActiveHandle = Arc::new(Mutex::new(None));
+            let denials = control_denials::AuthDenials::new();
+            let mut reader = lane_reader(&server, Vec::new());
+            let deadline = Instant::now() + AUTH_READ_TIMEOUT;
+            authenticate_connection(&server, &mut reader, TOKEN, &active, &denials, deadline)
+                .is_some()
+        });
+        assert_eq!(line_of(&client), refusal, "the handshake's line");
+        assert!(!handshake.join().expect("the handshake returns"));
+    });
 }
 
 /// The stub, with `@<sid> paste-bin <n>` a wait (as the real classifier has it
@@ -347,6 +463,10 @@ impl LaneService for FramedWaits {
     fn subscribe(&self, _line: String, _scope: Scope, _stream: CtlStream) {}
 
     fn release(&self, _id: u64) {}
+
+    fn has_live_claim(&self, _id: u64) -> bool {
+        false
+    }
 }
 
 /// A framed wait refused busy (no wait lane takes it, no inline place is
@@ -437,6 +557,10 @@ impl LaneService for Forwarder {
     fn subscribe(&self, _line: String, _scope: Scope, _stream: CtlStream) {}
 
     fn release(&self, _id: u64) {}
+
+    fn has_live_claim(&self, id: u64) -> bool {
+        super::connection_has_live_claim(&self.store, id, crate::metrics::now_us())
+    }
 }
 
 /// A stand-in sibling instance on `listener`: it answers a forward's connect

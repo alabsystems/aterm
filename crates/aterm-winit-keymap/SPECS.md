@@ -20,8 +20,8 @@ Result: **7 specs**, covering **14 tests**. **1 test is not a spec sample** (§4
 
 ## 0. Notation used in the statements
 
-- `WN` = `winit::keyboard::NamedKey` (foreign, `#[non_exhaustive]`); `KC` = `winit::keyboard::KeyCode`
-  (foreign, `#[non_exhaustive]`, ~200 variants); `WK` = `winit::keyboard::Key<SmolStr>`
+- `WN` = `aterm_window::keyboard::NamedKey` (foreign, `#[non_exhaustive]`); `KC` = `aterm_window::keyboard::KeyCode`
+  (foreign, `#[non_exhaustive]`, ~200 variants); `WK` = `aterm_window::keyboard::Key<SmolStr>`
   (`Character(s) | Named(n) | Dead(_) | Unidentified(_)`); `PK` = `PhysicalKey`
   (`Code(kc) | Unidentified(_)`); `Loc` = `KeyLocation {Standard, Left, Right, Numpad}`.
 - `Key`, `NamedKey` = `aterm_types::keyboard::{Key, NamedKey}` (the engine's types).

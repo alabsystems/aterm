@@ -70,6 +70,7 @@ use crate::profile::{self, Profile};
 use crate::spec::{Spec, Tier};
 use crate::stats;
 
+#[path = "run/pingpong.rs"]
 mod pingpong;
 
 /// What a run hands back.
@@ -1600,10 +1601,10 @@ fn binary_identity() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn an_inbox_listing_yields_its_message_rows() {
+        use super::*;
+
         let reply = Reply::Lines {
             header: "OK 3 hold=0 holder=- seen=0 bus_head=9 oldest_on_bus=@4 dropped=0 pending=0"
                 .to_string(),
@@ -1630,12 +1631,14 @@ mod tests {
         );
     }
 
-    fn seen(j: usize, off: u64) -> Seen {
-        Seen { j, off, t: 0 }
-    }
-
     #[test]
     fn every_message_is_seen_exactly_once_or_the_tally_says_which_was_not() {
+        use super::*;
+
+        fn seen(j: usize, off: u64) -> Seen {
+            Seen { j, off, t: 0 }
+        }
+
         assert_eq!(
             tally(&[seen(1, 11), seen(0, 10)], 2),
             Ok(vec![seen(0, 10), seen(1, 11)])
@@ -1668,6 +1671,8 @@ mod tests {
 
     #[test]
     fn the_burst_never_has_more_in_flight_than_its_window() {
+        use super::*;
+
         // A window of 3: posts 0, 1 and 2 go with nothing listed; post 3 waits
         // for the reader to list one.
         assert!(may_post(2, 0, 3));
@@ -1690,6 +1695,8 @@ mod tests {
 
     #[test]
     fn an_attach_is_the_new_bridges_rows_in_whatever_order_they_land() {
+        use super::*;
+
         let node = "/f/f1/pub/n-1/node/presence";
         let sa = "/f/f1/pub/n-1/s-a/presence".to_string();
         let sb = "/f/f1/pub/n-1/s-b/presence".to_string();

@@ -62,7 +62,7 @@ impl HyperlinkSpan {
     /// Serialized size in bytes (for memory accounting), as in the v3 record:
     /// start_col (u16) + end_col (u16) + url_len (u32) + url + id_len (u32) + id.
     ///
-    /// Saturating only discharges the strict gate's overflow obligation; in-memory
+    /// Saturating only discharges the Trust lane's overflow obligation; in-memory
     /// string lengths always fit.
     #[must_use]
     pub fn serialized_size(&self) -> usize {

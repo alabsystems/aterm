@@ -21,12 +21,12 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use aterm_types::native_window::{HasNativeWindow, NativeWindow};
+use aterm_window::window::Window;
 use aterm_x11::Connection;
 use aterm_x11::proto::xproto::{
     self, GetInputFocusReply, Setup, gc, image_format, image_order, visual_class,
 };
 use aterm_x11::proto::{ValueList, shm};
-use winit::window::Window;
 
 use super::shm_mem::ShmMem;
 use super::{CpuFrameBuffer, DamageRect};

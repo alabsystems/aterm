@@ -421,7 +421,7 @@ fn busy_lane(
     let sink = Arc::clone(posted);
     PkgLane {
         atpkg: std::path::Path::new("atpkg"),
-        child_path: || "",
+        child_path: |_| "".into(),
         layout: None,
         private_state_root: false,
         post: move |e| sink.lock().unwrap().push(e),

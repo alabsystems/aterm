@@ -33,6 +33,69 @@ pub mod kind {
     pub const GETTER: u8 = 5;
     /// A constructor.
     pub const CONSTRUCTOR: u8 = 6;
+
+    /// Return `true` when `k` is one of the 6 valid descriptor record kinds (`1..=6`).
+    #[must_use]
+    pub const fn is_valid(k: u8) -> bool {
+        k >= CLASS && k <= CONSTRUCTOR
+    }
+
+    /// Return `true` when `k` is a class member kind (`METHOD`, `STATIC`, `GETTER`, `CONSTRUCTOR`).
+    #[must_use]
+    pub const fn is_member(k: u8) -> bool {
+        matches!(k, METHOD | STATIC | GETTER | CONSTRUCTOR)
+    }
+
+    /// Encode the four descriptor header string lengths (`class_len`, `js_name_len`,
+    /// `symbol_len`, `docs_len`) into 16 little-endian bytes.
+    #[must_use]
+    pub const fn encode_record_lengths_le(
+        class_len: u32,
+        js_name_len: u32,
+        symbol_len: u32,
+        docs_len: u32,
+    ) -> [u8; 16] {
+        [
+            class_len as u8,
+            (class_len >> 8) as u8,
+            (class_len >> 16) as u8,
+            (class_len >> 24) as u8,
+            js_name_len as u8,
+            (js_name_len >> 8) as u8,
+            (js_name_len >> 16) as u8,
+            (js_name_len >> 24) as u8,
+            symbol_len as u8,
+            (symbol_len >> 8) as u8,
+            (symbol_len >> 16) as u8,
+            (symbol_len >> 24) as u8,
+            docs_len as u8,
+            (docs_len >> 8) as u8,
+            (docs_len >> 16) as u8,
+            (docs_len >> 24) as u8,
+        ]
+    }
+
+    /// Decode 16 little-endian bytes into the four descriptor header string lengths.
+    #[must_use]
+    pub const fn decode_record_lengths_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
+        let c = (bytes[0] as u32)
+            | ((bytes[1] as u32) << 8)
+            | ((bytes[2] as u32) << 16)
+            | ((bytes[3] as u32) << 24);
+        let j = (bytes[4] as u32)
+            | ((bytes[5] as u32) << 8)
+            | ((bytes[6] as u32) << 16)
+            | ((bytes[7] as u32) << 24);
+        let s = (bytes[8] as u32)
+            | ((bytes[9] as u32) << 8)
+            | ((bytes[10] as u32) << 16)
+            | ((bytes[11] as u32) << 24);
+        let d = (bytes[12] as u32)
+            | ((bytes[13] as u32) << 8)
+            | ((bytes[14] as u32) << 16)
+            | ((bytes[15] as u32) << 24);
+        (c, j, s, d)
+    }
 }
 
 /// The custom section (`aterm_wasm_abi::descriptor::SECTION`).
@@ -65,6 +128,15 @@ fn enc_str(out: &mut Vec<u8>, s: &str) {
 
 /// The bytes of a record's fixed head.
 pub fn head(kind: u8, class: &str, js_name: &str, symbol: &str, docs: &str) -> Vec<u8> {
+    debug_assert!(kind::is_valid(kind));
+    debug_assert!(!kind::is_member(kind) || !class.is_empty());
+    let lens = kind::encode_record_lengths_le(
+        class.len() as u32,
+        js_name.len() as u32,
+        symbol.len() as u32,
+        docs.len() as u32,
+    );
+    let _ = kind::decode_record_lengths_le(lens);
     let mut out = vec![kind];
     for s in [class, js_name, symbol, docs] {
         enc_str(&mut out, s);

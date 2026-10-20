@@ -32,7 +32,7 @@ use std::process::{Command, Stdio};
 const STOP_INPUT: &[u8] = br#"{"session_id":"x","hook_event_name":"Stop"}"#;
 
 fn run(exe: &Path, args: &[&str]) -> std::process::Output {
-    let mut child = Command::new(exe)
+    let mut child = isolated(exe)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -44,10 +44,20 @@ fn run(exe: &Path, args: &[&str]) -> std::process::Output {
     child.wait_with_output().expect("wait")
 }
 
+/// `exe` in this test binary's own per-user folders (`aterm_uds::test_binary`):
+/// the front door reads `aterm.toml` before it routes, and on the inherited
+/// `$HOME` that is the person's.
+fn isolated(exe: &Path) -> Command {
+    let mut cmd = Command::new(exe);
+    let root = aterm_uds::test_binary::scratch_root().expect("this test binary's own root");
+    crate::launch_isolation::apply(&mut cmd, &root.join("hook-shape"));
+    cmd
+}
+
 /// `args` with `stdin` written in full (an EPIPE fails the test: the verb must
 /// drain what the vendor writes), or with no stdin at all.
 fn run_with(exe: &Path, args: &[&str], stdin: Option<&[u8]>) -> std::process::Output {
-    let mut child = Command::new(exe)
+    let mut child = isolated(exe)
         .args(args)
         .stdin(if stdin.is_some() {
             Stdio::piped()

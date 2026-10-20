@@ -16,10 +16,9 @@
 //! repairs the pair only when no output lands between its halves, and any byte
 //! the program wrote meanwhile left ~N/2 rows stale.
 //!
-//! The coalescing sits at the source of the transient, the way the presence
-//! row's fold quiet ([`aterm_messages::presence::FOLD_QUIET`]) holds its grow:
-//! the split's shrink stays IMMEDIATE (the new pane needs the room at once),
-//! and only the TAKE-BACK waits — the COLLAPSE of a pane the split made
+//! The coalescing sits at the source of the transient: the split's shrink
+//! stays IMMEDIATE (the new pane needs the room at once), and only the
+//! TAKE-BACK waits — the COLLAPSE of a pane the split made
 //! (`apply_close_outcome`, a Cmd-W, a control `close`, an exited shell)
 //! growing that very pane back to exactly the grid it had before the split —
 //! until the shrink has stood [`SPLIT_REGRID_QUIET`], so the program has read

@@ -51,12 +51,12 @@ pub(crate) fn binary_search_counted(
 
     while left < right {
         // Wrapping: the loop runs at most `usize::BITS` times, so this small
-        // diagnostic count never wraps; it only discharges the strict gate's
+        // diagnostic count never wraps; it only discharges the Trust lane's
         // overflow obligation.
         *steps = steps.wrapping_add(1);
         // Keep this one composite expression: splitting it did not discharge
         // the overflow obligation, and restructuring this loop-carried division
-        // can send the strict gate's integer engine into a non-terminating
+        // can send the Trust lane's integer engine into a non-terminating
         // solve. Neither op wraps: `left <= right` and
         // `left + (right - left) / 2 <= right <= len`.
         let mid = left.wrapping_add(right.wrapping_sub(left) / 2);

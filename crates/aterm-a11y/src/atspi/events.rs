@@ -13,7 +13,7 @@
 
 use aterm_dbus::{Message, Value};
 
-use super::semantics::{CacheNode, NodeId, NodeIdOrRoot, ObjectEvent, Property, WindowEvent};
+use super::semantics::{CacheNode, NodeIdOrRoot, NodeIdentity, ObjectEvent, Property, WindowEvent};
 use super::wire::{self, CACHE_PATH, ObjectId};
 
 const OBJECT: &str = "org.a11y.atspi.Event.Object";
@@ -36,7 +36,7 @@ pub(crate) fn object_event(
     event: ObjectEvent,
 ) -> Message {
     let path = ObjectId::in_adapter(adapter, target).path();
-    let node = |node: NodeId| ObjectId::Node { adapter, node };
+    let node = |node: NodeIdentity| ObjectId::Node { adapter, node };
     let default_any = || Value::U32(0);
     let (member, body) = match event {
         ObjectEvent::ActiveDescendantChanged(child) => (
@@ -117,7 +117,7 @@ pub(crate) fn object_event(
 /// any-data is the window's name.
 pub(crate) fn window_event(
     adapter: usize,
-    target: NodeId,
+    target: NodeIdentity,
     name: String,
     event: WindowEvent,
 ) -> Message {
@@ -153,7 +153,7 @@ pub(crate) fn cache_add(bus: &str, node: CacheNode) -> Message {
 
 /// `Cache.RemoveAccessible`: the removed object's reference, as its two
 /// fields `so` for the same reason as [`cache_add`]'s.
-pub(crate) fn cache_remove(bus: &str, adapter: usize, node: NodeId) -> Message {
+pub(crate) fn cache_remove(bus: &str, adapter: usize, node: NodeIdentity) -> Message {
     let reference = wire::object_ref(bus, ObjectId::Node { adapter, node });
     let fields = match reference {
         Value::Struct(fields) => fields,

@@ -5,6 +5,8 @@
 //! Terminal grid with O(1) display scrolling and O(n × cols) content scrolling.
 
 mod accessors;
+mod anchor_hooks;
+mod anchor_lend;
 mod checkpoint_lines;
 mod construct;
 mod content_queries;
@@ -16,6 +18,7 @@ mod line_ops;
 mod pin_methods;
 pub mod reflow;
 mod reflow_pullback;
+mod resize_handback;
 mod resize_undo;
 mod ring_extras;
 mod scroll;
@@ -73,9 +76,11 @@ pub(in crate::grid) use crate::test_counters::{
     take_row_to_line_ops,
 };
 
+pub use anchor_lend::{AnchorLend, LendReach};
 pub use history_carry::{
     HistoryFence, HistoryFenceBroken, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal,
 };
+pub use resize_handback::ResizeLaw;
 pub(crate) use scroll_convert::ScrolledRowExtras;
 pub use scroll_materialize::{MaterializedRow, materialize_from_line, stored_line_cells};
 pub use scrollback_access::HistoryLines;

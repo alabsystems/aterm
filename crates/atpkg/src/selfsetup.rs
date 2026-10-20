@@ -502,12 +502,159 @@ fn uninstall_bundle(p: &Places) -> Option<PathBuf> {
         })
 }
 
+/// What `aterm caffeine` keeps in the support dir: the copy of the app the mug runs from,
+/// the session plists, the mode and the one-mug lock.
+const CAFFEINE_FILES: [&str; 4] = [
+    "caffeine-code.noindex",
+    "caffeine",
+    "caffeine.state",
+    "caffeine.lock",
+];
+
+/// The prefix of every launchd label `aterm caffeine` makes, its login plists' names.
+const CAFFEINE_LABEL_PREFIX: &str = "com.aterm.aterm.caffeine";
+
+/// Retire the going builds' startup jobs and the running mug through their own command.
+/// Shared files go only after every admitted step succeeded and the existing mug lock is
+/// acquired for the whole cleanup. A refusal, unsupported helper, or unknown/busy lock keeps
+/// them. The lock rendezvous itself stays: unlinking a held lock would let another serve
+/// create a different inode while this cleanup still holds the old one.
+fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) {
+    let support = p.support();
+    let files: Vec<PathBuf> = CAFFEINE_FILES
+        .iter()
+        .map(|name| support.join(name))
+        .filter(|path| present(path))
+        .collect();
+    let login_plist = sorted_entries(&p.home.join("Library/LaunchAgents"))
+        .iter()
+        .filter_map(|plist| plist.file_name().and_then(|n| n.to_str()))
+        .any(|name| name.starts_with(CAFFEINE_LABEL_PREFIX) && name.ends_with(".plist"));
+    if files.is_empty() && !login_plist {
+        return;
+    }
+    let steps: &[&[&str]] = if s.outsider.is_some() {
+        &[&["caffeine", "startup", "off"]]
+    } else {
+        &[&["caffeine", "startup", "off"], &["caffeine", "quit"]]
+    };
+    let mut supported = false;
+    let mut failed = false;
+    for dir in app_dirs {
+        let app = dir.join("aterm.app");
+        let aterm = app.join("Contents/MacOS/aterm");
+        if !bundle_is_ours(&app) || !crate::toolchain::is_executable_file(&aterm) {
+            continue;
+        }
+        if s.dry {
+            s.say(&format!(
+                "would ask {} help caffeine, then if supported:",
+                aterm.display()
+            ));
+            for args in steps {
+                s.say(&format!("would run {} {}", aterm.display(), args.join(" ")));
+            }
+            continue;
+        }
+        if run_quietly(&aterm, &["help", "caffeine"]) != 0 {
+            continue;
+        }
+        supported = true;
+        for args in steps {
+            let line = format!("{} {}", aterm.display(), args.join(" "));
+            match run_quietly(&aterm, args) {
+                0 => s.say(&format!("ran {line}")),
+                rc => {
+                    failed = true;
+                    s.skip(
+                        &line,
+                        &format!("it failed (exit {rc}) — run it by hand to see why"),
+                    );
+                }
+            }
+        }
+    }
+    if s.outsider.is_some() {
+        for path in files {
+            s.rm_shared(&path, "Caffeine file");
+        }
+        return;
+    }
+    if s.dry {
+        s.say("Caffeine file removal requires an acquired idle lock; the lock itself stays");
+        return;
+    }
+    if files.is_empty() {
+        return;
+    }
+    if !supported || failed {
+        s.skip(
+            &support.display().to_string(),
+            "Caffeine stop was not confirmed; its files are kept",
+        );
+        return;
+    }
+    let lock = support.join("caffeine.lock");
+    let Some(_hold) = caffeine_cleanup_hold(&lock) else {
+        s.skip(
+            &lock.display().to_string(),
+            "Caffeine lock is busy or could not be acquired; its files are kept",
+        );
+        return;
+    };
+    for path in files {
+        if path == lock {
+            s.say(&format!(
+                "left Caffeine lock rendezvous: {}",
+                path.display()
+            ));
+            s.kept += 1;
+        } else {
+            s.rm_shared(&path, "Caffeine file");
+        }
+    }
+}
+
+/// Hold the existing, physical, owned regular rendezvous without waiting. Missing/error is
+/// unknown; a temporary probe would not preserve custody through the removals.
+fn caffeine_cleanup_hold(path: &Path) -> Option<crate::lock::Flock> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let opened = file.metadata().ok()?;
+    if !opened.is_file() || opened.uid() != aterm_uds::peer::our_uid() || opened.nlink() != 1 {
+        return None;
+    }
+    let held = crate::lock::Flock::try_lock(file).ok()?;
+    let named = std::fs::symlink_metadata(path).ok()?;
+    if !named.is_file() || (named.dev(), named.ino()) != (opened.dev(), opened.ino()) {
+        return None;
+    }
+    Some(held)
+}
+
+/// Run `program args`, its stdio `/dev/null`: its exit status, 127 when it could not run
+/// and 128 when a signal ended it.
+fn run_quietly(program: &Path, args: &[&str]) -> i32 {
+    aterm_uds::spawnfd::command(program)
+        .args(args)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .status()
+        .map_or(127, |st| st.code().unwrap_or(128))
+}
+
 /// Everything install.sh placed, swept: the toolchain store (through the bundle's own
-/// atpkg, before the bundle that carries it), the app bundles, the decline that sweep
-/// recorded, the command links, the source-built store, man pages, completions, the Linux
-/// desktop entry and icons, an EMPTY support dir and the PATH block. `dry` says what a real
-/// run would do and changes nothing; `man_src` is a checkout's `man/`, whose pages are
-/// aterm's too. `false` when anything was SKIPPED.
+/// atpkg, before the bundle that carries it), the Caffeine mug (through the bundle's own
+/// aterm, likewise), the app bundles, the decline that sweep recorded, the command links,
+/// the source-built store, man pages, completions, the Linux desktop entry and icons, an
+/// EMPTY support dir and the PATH block. `dry` says what a real run would do and changes
+/// nothing; `man_src` is a checkout's `man/`, whose pages are aterm's too. `false` when
+/// anything was SKIPPED.
 pub fn self_uninstall(
     p: &Places,
     man_src: Option<&Path>,
@@ -603,6 +750,9 @@ pub fn self_uninstall(
         }
         (None, _) => {}
     }
+
+    // 0b. THE CAFFEINE MUG, BEFORE THE BUNDLE IT RUNS FROM: see `sweep_caffeine`.
+    sweep_caffeine(&mut s, p, &app_dirs);
 
     // 1. App bundles — every candidate dir (the scope alone, when set), aterm's only. The
     //    updater's apply leaves the outgoing bundle at `aterm.app.rollback`.

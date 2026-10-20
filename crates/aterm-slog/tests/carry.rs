@@ -461,6 +461,11 @@ fn a_carried_log_reads_like_its_predecessor_and_says_the_handoff_hole() {
             .collect::<Vec<_>>(),
         "the same open path and rollups"
     );
+    assert_eq!(
+        new.pinned_bytes(),
+        log.pinned_bytes(),
+        "the same records pinned"
+    );
     let mark = new.window().last().expect("the handoff mark");
     assert_eq!(mark.seq, a.next_seq);
     assert_eq!(
@@ -1059,9 +1064,22 @@ fn a_hostile_carry_never_panics_and_is_refused_whole() {
         .expect("an open line");
     v[open_at] = v[open_at].replacen("open r", "open r9999", 1);
     refused(v, "a node past the counters");
-    let mut v = good.lines.clone();
-    v.extend((0..9000).map(|i| format!("r {i} mark - bell src=engine conf=exact t=1")));
-    refused(v, "more lines than a carry holds");
+    // The line count is a bound of its own: lines short enough to stay
+    // within the byte bound, one past the count, are refused for it; at
+    // the count, for something else.
+    let lines_long = |n: usize| {
+        let mut v = good.lines.clone();
+        v.resize(n, String::new());
+        matches!(
+            Log::from_carry(&v, a),
+            Err(aterm_slog::CarryError::Bound(_))
+        )
+    };
+    assert!(
+        lines_long(aterm_slog::CARRY_MAX_LINES + 1),
+        "more lines than a carry holds"
+    );
+    assert!(!lines_long(aterm_slog::CARRY_MAX_LINES));
     let mut v = good.lines.clone();
     v[recs[0]] = format!("r {}", "x".repeat(2000));
     refused(v, "a line past its bound");
@@ -1109,17 +1127,75 @@ fn a_hostile_carry_never_panics_and_is_refused_whole() {
     );
     v.push("fold closed - spawn out=ui-close dur_ms=1 t=1 by=human opened_by=aterm src=aterm conf=exact".into());
     refused(v, "a carried closed fold despite an open flag");
+
+    // THE RECEIVER'S BYTE BOUND, on well-formed carries: one a little past
+    // a session's budget reads (an earlier build's writer estimated its
+    // header's and rollups' widths); one at the bound reads; one byte past
+    // it (in an opaque host line) is refused whole.
+    let mut big = Log::new(2);
+    agent_session(&mut big, 0);
+    let fat = Fields::new()
+        .text(Key::Cwd, &"/w".repeat(128))
+        .and_then(|f| f.tok(Key::Detail, &"d".repeat(48)))
+        .and_then(|f| f.tok(Key::Prog, &"p".repeat(48)))
+        .expect("fat fields");
+    for ms in 1..=200 {
+        let c = big
+            .open(
+                Open::new(Kind::Cmd, Src::Shell, Conf::Strong).fields(fat.clone()),
+                at(ms),
+            )
+            .expect("a command");
+        big.close(
+            c,
+            Close::new(Out::Run(RunOut::Ok), Src::Shell, Conf::Exact).fields(fat.clone()),
+            at(ms),
+        )
+        .expect("it closes");
+    }
+    let wrote = |total: usize| {
+        big.carry(
+            CarryBudget {
+                total,
+                ..CarryBudget::SESSION
+            },
+            &["h v=1 pad=".into()],
+        )
+        .expect("carried")
+    };
+    let a = adopt_at(&big, 900_000);
+    let over = wrote(CarryBudget::SESSION.total + 1024);
+    assert!(
+        over.bytes > CarryBudget::SESSION.total,
+        "PRECONDITION: past a session's budget"
+    );
+    assert!(Log::from_carry(&over.lines, a).is_ok());
+    let mut v = wrote(aterm_slog::CARRY_MAX_BYTES).lines;
+    let host = v
+        .iter()
+        .position(|l| l.starts_with("host "))
+        .expect("the host's line");
+    let bytes = |v: &[String]| v.iter().map(|l| l.len() + 1).sum::<usize>();
+    let pad = aterm_slog::CARRY_MAX_BYTES - bytes(&v);
+    v[host].push_str(&"x".repeat(pad));
+    assert!(Log::from_carry(&v, a).is_ok(), "a carry at the bound reads");
+    v[host].push('x');
+    assert!(matches!(
+        Log::from_carry(&v, a),
+        Err(aterm_slog::CarryError::Bound(_))
+    ));
 }
 
 /// The carry's `ids=` never let a successor issue a node id the manifest's
-/// counters reserved: the successor takes the larger.
+/// counters reserved: the successor takes the larger, and issues past a
+/// 16-bit id (a long session's commands pass 65,535 runs).
 #[test]
 fn a_carried_log_takes_the_manifests_reserved_ids() {
     let mut log = Log::new(1);
     agent_session(&mut log, 0);
     let out = log.carry(CarryBudget::SESSION, &[]).expect("carried");
     let reserved = IdCounters {
-        run: 4097,
+        run: 65_535,
         turn: 4096,
         step: 4096,
     };
@@ -1134,7 +1210,7 @@ fn a_carried_log_takes_the_manifests_reserved_ids() {
     let n = new
         .open(Open::new(Kind::Cmd, Src::Shell, Conf::Strong), at(2_000))
         .expect("a run");
-    assert_eq!(n.n, 4098);
+    assert_eq!(n.n, 65_536);
 }
 
 /// THE SEQS A CARRY CONTINUES ARE ONES A LOG CAN REACH, AND BELOW THE
@@ -1276,4 +1352,50 @@ fn a_host_line_past_the_bound_is_left_out_and_the_carry_reads() {
         .expect("a host line");
     lines[i] = format!("host {}", "x".repeat(2000));
     assert!(Log::from_carry(&lines, a).is_err());
+    // Nor do host lines past the count or the bytes a carry passes, each
+    // line within its own bound.
+    let refused = |lines: &[String]| {
+        matches!(
+            Log::from_carry(lines, a),
+            Err(aterm_slog::CarryError::Bound(_))
+        )
+    };
+    let mut more = out.lines.clone();
+    more.insert(i, "host pending n=99".into());
+    more[0] = more[0].replace(
+        &format!("lines={}", out.lines.len()),
+        &format!("lines={}", out.lines.len() + 1),
+    );
+    assert!(refused(&more), "a 17th host line");
+    let mut wide = out.lines.clone();
+    for l in wide.iter_mut().filter(|l| l.starts_with("host ")).take(5) {
+        *l = format!("host {}", "x".repeat(900));
+    }
+    assert!(refused(&wide), "five 900-byte host lines");
+    // AT THE BOUNDS, SENDER AND RECEIVER AGREE: host lines each a whole
+    // carry line with their tag, together the host bytes exactly, all
+    // cross, where a line one byte longer before them, and one more line
+    // of one byte after them, are left out; one byte more in a line, or in
+    // all of them, refuses the carry.
+    let max = aterm_slog::CARRY_MAX_LINE - "host ".len();
+    let whole = (aterm_slog::CARRY_MAX_HOST_BYTES - 1) / (max + 1);
+    let mut full = vec!["x".repeat(max); whole];
+    full.push("y".repeat(aterm_slog::CARRY_MAX_HOST_BYTES - whole * (max + 1) - 1));
+    let offered = [&["w".repeat(max + 1)], full.as_slice(), &["z".to_string()]].concat();
+    let at_bounds = log.carry(CarryBudget::SESSION, &offered).expect("carried");
+    let (_, back, _) = Log::from_carry(&at_bounds.lines, a).expect("the carry reads");
+    assert_eq!(back, full, "every host line at the bounds crossed");
+    let first = at_bounds
+        .lines
+        .iter()
+        .position(|l| l.starts_with("host "))
+        .expect("a host line");
+    let last = first + whole;
+    let mut long = at_bounds.lines.clone();
+    long[first].push('x');
+    long[last].pop();
+    assert!(refused(&long), "a line one byte past its bound");
+    let mut over = at_bounds.lines.clone();
+    over[last].push('y');
+    assert!(refused(&over), "host lines one byte past their bytes");
 }

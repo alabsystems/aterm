@@ -23,6 +23,24 @@ fn temp_dir(tag: &str) -> aterm_tempfile::TempDir {
         .expect("the temp directory is created")
 }
 
+/// A child running `line` in this host's shell: `/bin/sh -c`, or on Windows
+/// `cmd.exe /D /C`, which is handed the line verbatim and parses it itself.
+fn shell(line: &str) -> Command {
+    #[cfg(unix)]
+    {
+        let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
+        cmd.arg("-c").arg(line);
+        cmd
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        let mut cmd = aterm_uds::spawnfd::command("cmd.exe");
+        cmd.args(["/D", "/C"]).raw_arg(line);
+        cmd
+    }
+}
+
 // -- the bounded runner every subprocess in this tree borrows -------------------
 
 #[test]
@@ -31,9 +49,13 @@ fn a_child_that_never_returns_is_killed_at_the_deadline() {
     // returns, and a stale NFS mount does that to `df`. The child hangs for
     // two minutes and the capture must return inside a minute's hang detector
     // — the spawn is inside that window, so a loaded machine's slow spawn never
-    // reads as a capture that waited the child out.
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg("sleep 120");
+    // reads as a capture that waited the child out. On Windows the shell itself
+    // loops (no `sleep` there), so the kill reaches the one process that hangs.
+    let cmd = if cfg!(windows) {
+        shell("for /L %i in (0,0,1) do @rem")
+    } else {
+        shell("sleep 120")
+    };
     let started = std::time::Instant::now();
     let got = capture_bounded(cmd, Duration::from_millis(250), 1024);
     let why = got.expect_err("a hung child is an error, not a wait");
@@ -450,24 +472,26 @@ fn escaped_descendant_holding_stdout_cannot_retain_a_reader_thread() {
 
 #[test]
 fn stdout_is_capped_and_the_exit_code_reported() {
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg("printf 'hello'");
-    let got = capture_bounded(cmd, HANG_DETECTOR, 1024).expect("it runs");
+    // `printf`, and on Windows `set /p`'s prompt: both print with no newline.
+    let print = |text: &str| {
+        if cfg!(windows) {
+            shell(&format!("<nul set /p ={text}& exit 0"))
+        } else {
+            shell(&format!("printf '{text}'"))
+        }
+    };
+    let got = capture_bounded(print("hello"), HANG_DETECTOR, 1024).expect("it runs");
     assert_eq!(got.stdout, b"hello");
     assert!(got.success());
 
     // The cap is a CUT, not an error: a child that prints more than the
     // caller asked for loses the tail rather than the whole answer.
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg("printf 'aaaaaaaaaaaaaaaaaaaa'");
-    let got = capture_bounded(cmd, HANG_DETECTOR, 4).expect("it runs");
+    let got = capture_bounded(print("aaaaaaaaaaaaaaaaaaaa"), HANG_DETECTOR, 4).expect("it runs");
     assert_eq!(got.stdout, b"aaaa");
 
     // The exit code is REPORTED, never swallowed: the caller decides what a
     // non-zero means.
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg("exit 7");
-    let got = capture_bounded(cmd, HANG_DETECTOR, 16).expect("it runs");
+    let got = capture_bounded(shell("exit 7"), HANG_DETECTOR, 16).expect("it runs");
     assert_eq!(got.code, Some(7));
     assert!(!got.success());
 }

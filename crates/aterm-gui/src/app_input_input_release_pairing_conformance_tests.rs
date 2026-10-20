@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use aterm_models_misc::input_release_pairing_model;
 use aterm_types::keyboard::{Key as TKey, Modifiers, NamedKey};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use aterm_window::keyboard::{KeyCode, PhysicalKey};
 
 use super::{PhysicalReleaseTrace, clear_physical_release_trace, take_physical_release_trace};
 use crate::input::InputEvent;
@@ -98,6 +98,18 @@ fn model_window(actual: WindowId, window_a: WindowId, window_b: WindowId) -> i64
         2
     } else {
         panic!("window {actual:?} is outside the two-window projection")
+    }
+}
+
+/// The delivery a key encoded against the stub's sentinel (`-1`) sink reads: the
+/// inline write's failure where keys are written inline (unix), accepted where every
+/// key is handed to the session's ordered writer, which writes it off this thread
+/// (Windows: `app_input`'s `UI_WRITES_CAN_BLOCK`). Either way it was encoded there.
+fn encoded_delivery() -> crate::input::Delivery {
+    if cfg!(windows) {
+        crate::input::Delivery::Full
+    } else {
+        crate::input::Delivery::Failed
     }
 }
 
@@ -234,7 +246,14 @@ fn two_window_app() -> (App, WindowId, WindowId, u64, u64) {
     (app, window_a, window_b, session_a, session_b)
 }
 
-pub(crate) fn run_conformance() {
+/// The two-window owner-map Tier-1 body, on the conformance stack: its `two_window_app`
+/// outgrows libtest's 2 MiB thread stack in an unoptimized build.
+#[test]
+fn the_real_input_release_pairing_conforms() {
+    crate::conformance_support::on_conformance_stack("input_release_pairing", run_conformance);
+}
+
+fn run_conformance() {
     let model = input_release_pairing_model();
 
     // A repeat arriving without any observed press epoch is fail-closed.
@@ -408,7 +427,7 @@ pub(crate) fn run_conformance() {
     assert_eq!(event_type, aterm_types::keyboard::KeyEventType::Repeat);
     assert_eq!(
         delivery,
-        crate::input::Delivery::Failed,
+        encoded_delivery(),
         "Kitty repeat was encoded against original session A's sentinel sink"
     );
     assert!(
@@ -454,7 +473,7 @@ pub(crate) fn run_conformance() {
     assert_eq!(event_type, aterm_types::keyboard::KeyEventType::Release);
     assert_eq!(
         delivery,
-        crate::input::Delivery::Failed,
+        encoded_delivery(),
         "Kitty release was encoded against original session A's sentinel sink"
     );
 
@@ -490,6 +509,7 @@ pub(crate) fn run_conformance() {
         raw_window_a,
         raw_physical,
         InputEvent::KeySequence(raw_bytes.clone()),
+        None,
     );
     assert_eq!(
         take_physical_release_trace(),
@@ -499,7 +519,7 @@ pub(crate) fn run_conformance() {
             session: raw_session_a,
             event: InputEvent::KeySequence(raw_bytes.clone()),
             repeated: false,
-            delivery: crate::input::Delivery::Failed,
+            delivery: encoded_delivery(),
         }),
         "initial literal sequence is pinned to session A"
     );
@@ -531,7 +551,7 @@ pub(crate) fn run_conformance() {
             session: raw_session_a,
             event: InputEvent::KeySequence(raw_bytes),
             repeated: true,
-            delivery: crate::input::Delivery::Failed,
+            delivery: encoded_delivery(),
         }),
         "raw repeat must use original session/bytes"
     );
@@ -650,14 +670,14 @@ pub(crate) fn run_conformance() {
     // never saw; `[keybindings]` (`ctrl+=` zoom) misses the same way. Each real
     // miss, applied to the real released state, is the `Buggy=1` release, and
     // the healthy model refuses it.
-    let ctrl = winit::keyboard::ModifiersState::CONTROL;
-    let none = winit::keyboard::ModifiersState::empty();
+    let ctrl = aterm_window::keyboard::ModifiersState::CONTROL;
+    let none = aterm_window::keyboard::ModifiersState::empty();
     let sequences = crate::keybinding::KeySequences::from_config(Some(
         &[("ctrl+c".to_string(), "\\e[99~".to_string())]
             .into_iter()
             .collect(),
     ));
-    let c = winit::keyboard::Key::Character("c".into());
+    let c = aterm_window::keyboard::Key::Character("c".into());
     assert_eq!(
         sequences.lookup(&c, ctrl),
         Some(&b"\x1b[99~"[..]),
@@ -668,7 +688,7 @@ pub(crate) fn run_conformance() {
             .into_iter()
             .collect(),
     ));
-    let equals = winit::keyboard::Key::Character("=".into());
+    let equals = aterm_window::keyboard::Key::Character("=".into());
     assert_eq!(
         bindings.lookup(&equals, ctrl),
         Some(crate::keybinding::Action::FontIncrease),
@@ -787,65 +807,3 @@ pub(crate) fn run_conformance() {
          repeat/release routes conform; original identities preserved; mutants rejected."
     );
 }
-
-// The machine has 21 actions: twelve carry `#[refines]` anchors on their
-// `app_input.rs` seams, and these nine are explicit scope boundaries.
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "input_release_pairing",
-    action = "TransferFocusWhileHeld",
-    reason = "OS/winit environment transition: Tier-1 drives real App::on_focus(A,false) then \
-              App::on_focus(B,true) and validates that physical ownership is unchanged; no \
-              key-owner mutator implements the focus arrival itself."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "input_release_pairing",
-    action = "OpenOverlay",
-    reason = "Orthogonal overlay environment step; cross-window physical-owner conformance \
-              fixes overlays closed, while overlay_gate_pairing_tests drives the real open."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "input_release_pairing",
-    action = "CloseOverlay",
-    reason = "Orthogonal overlay environment step; cross-window physical-owner conformance \
-              fixes overlays closed, while overlay_gate_pairing_tests drives the real close."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "input_release_pairing",
-    action = "ConsumeOverlayPress",
-    reason = "Controller/engine-key overlay ownership uses overlay_consumed_keys, not the \
-              process-wide winit PhysicalKey owner map bound by this Tier-1 runner."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "input_release_pairing",
-    action = "RepeatOfConsumedPress",
-    reason = "Repeat is a read-only peek of the retained physical owner; dedicated shipping \
-              tests prove it neither removes the owner nor emits bytes."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "input_release_pairing",
-    action = "GateConsumesRepeatOfForwardedPress",
-    reason = "Controller/engine-key repeats enter App::input without a winit PhysicalKey; \
-              overlay_gate_pairing_tests drives the real pre-overlay press/open/repeat/release \
-              seam. Physical repeats bypass current-content gates through route_physical_repeat."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "input_release_pairing",
-    action = "PhysicalFocusLoss",
-    reason = "Terminal OS epoch where no matching key-up is delivered. A focus transfer that \
-              does deliver key-up is the separately validated TransferFocusWhileHeld action."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "input_release_pairing",
-    action = "SettledRelease",
-    reason = "Abstract terminal stutter after owner removal; no shipping state mutation exists."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "input_release_pairing",
-    action = "SettledFocusEpoch",
-    reason = "Abstract terminal stutter after an OS-cancelled epoch; no shipping mutation exists."
-)]
-#[expect(
-    dead_code,
-    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it"
-)]
-fn explicit_scope_waivers() {}

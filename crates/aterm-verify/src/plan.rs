@@ -31,10 +31,6 @@ pub enum Lane {
     /// artifact with the test build, so a dir of its own lets the two compile
     /// at once instead of queueing on cargo's lock.
     TippyTarget,
-    /// `<target>/verify/sealed`: the sealed rung, the one feature build of the
-    /// shipped binary (`--features sealed`), kept out of the main cache so it
-    /// never relinks the `aterm` a plain build made.
-    SealedTarget,
     /// `<target>/verify/checkers`: the workspace's tests under
     /// `--features aterm-spec/checkers`, a feature build the main cache never holds.
     CheckersTarget,
@@ -63,9 +59,6 @@ pub enum StageId {
     TestCompile,
     Test,
     Doctests,
-    /// The sealed cross-host rung of the fabric bridge (`--features sealed`),
-    /// in its own lane: its suites boot the `aterm` it builds first.
-    SealedLane,
     Tippy,
     Formatting,
     /// The publication engine's export guards (`ship check --export`).
@@ -107,8 +100,8 @@ pub enum StageId {
     /// The JS glue generator on aterm-wasm-abi's toy module
     /// ([`crate::wasm_glue`]).
     WasmGlue,
-    /// Both web modules in headless Chromium: a WebGL2 boot, GPU vs CPU
-    /// pixels (`crate::browser`).
+    /// Both web modules in headless Chromium and Firefox: a WebGL2 boot,
+    /// GPU vs CPU pixels, on the page and in a worker (`crate::browser`).
     BrowserLane,
     Forge,
     /// The codex-alab native harness end to end (`lab codex-alab-proof`): the
@@ -185,7 +178,6 @@ pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
         Lane::Pure => None,
         Lane::MainTarget | Lane::AfterCompile => Some(ctx.target_dir.clone()),
         Lane::TippyTarget => side("tippy"),
-        Lane::SealedTarget => side("sealed"),
         Lane::CheckersTarget => side("checkers"),
         Lane::GpuOracleTarget => side("gpu-oracle"),
         Lane::TrustTarget => side("trust"),
@@ -323,13 +315,8 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
         ),
         spec(
             StageId::BrowserLane,
-            "browser lane (both web modules in headless Chromium: WebGL2, GPU vs CPU pixels)",
+            "browser lane (both web modules in headless Chromium and Firefox: WebGL2, GPU vs CPU pixels)",
             Lane::CellsTarget,
-        ),
-        spec(
-            StageId::SealedLane,
-            "sealed fabric lane (aterm --features sealed)",
-            Lane::SealedTarget,
         ),
         spec(
             StageId::MeasurePrebuild,

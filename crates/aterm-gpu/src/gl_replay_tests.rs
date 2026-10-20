@@ -450,14 +450,57 @@ fn fixtures(gpu: &GpuRenderer, glow_add: bool) -> Vec<(&'static str, RenderInput
         mode,
     };
 
-    // The emoji draws through the colour row where the host has a colour font
-    // (the Linux lane's guest has none), so the fixture claims only what
-    // every host draws.
+    // The emoji draws through the colour row where the host has a colour face,
+    // so this fixture claims only what every host draws; `colour_emoji` below
+    // claims the colour row.
     let mut out: Vec<(&'static str, RenderInput, Vec<StreamId>)> = vec![(
         "text_cursor",
         base_input(),
         vec![S::Bg, S::Glyph, S::Deco, S::CursorBlock],
     )];
+
+    // Colour emoji through the colour atlas: a face, a skin-tone sequence, a
+    // ZWJ family, a flag and a keycap, beside plain text. Only where the host
+    // has a colour face (the Linux lane provisions Noto Color Emoji); a test
+    // that would otherwise pass without it ends COULD NOT RUN
+    // (`end_unless_the_colour_row_ran`).
+    if colour_face_installed() {
+        let mut term = Terminal::new(ROWS as u16, COLS as u16);
+        term.process("\u{1F642} \u{1F680} \u{1F44D}\u{1F3FD} ok\r\n".as_bytes());
+        term.process(
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} \u{1F1FA}\u{1F1F8} \u{31}\u{FE0F}\u{20E3}"
+                .as_bytes(),
+        );
+        out.push((
+            "colour_emoji",
+            term.cell_frame(ROWS, COLS),
+            vec![S::Bg, S::Glyph, S::Color],
+        ));
+    }
+
+    // The wallpaper: a host-prepared RGBA8 image at the frame's pixel size,
+    // under the text, through the wallpaper row and its upload.
+    {
+        let mut input = base_input();
+        let (fw, fh) = gpu.frame_size(ROWS, COLS);
+        input.wallpaper = Some(Arc::new(SceneAtlas {
+            width: fw as u32,
+            height: fh as u32,
+            rgba: (0..fw * fh)
+                .flat_map(|i| {
+                    let (x, y) = (i % fw, i / fw);
+                    [
+                        (x * 3 % 256) as u8,
+                        (y * 5 % 256) as u8,
+                        ((x + y) % 97) as u8,
+                        255,
+                    ]
+                })
+                .collect(),
+            version: 1,
+        }));
+        out.push(("wallpaper", input, vec![S::Wallpaper, S::Glyph]));
+    }
 
     // Halos in both modes (and the LUMEN aurora when the oracle can draw it).
     {
@@ -648,6 +691,81 @@ fn fixtures(gpu: &GpuRenderer, glow_add: bool) -> Vec<(&'static str, RenderInput
     out
 }
 
+/// The colour-emoji face the renderer's Linux fallback chain finds first
+/// (`aterm_render`'s emoji candidates); the Linux lane provisions it.
+const COLOUR_FACE: &str = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
+
+/// Whether this host has [`COLOUR_FACE`], read from the file, never from a
+/// frame, so a renderer that lost its colour glyphs fails the claim rather
+/// than blaming the host.
+fn colour_face_installed() -> bool {
+    std::path::Path::new(COLOUR_FACE).is_file()
+}
+
+/// End a differential that passed every fixture it could build COULD NOT
+/// RUN when the host has no colour face: its `colour_emoji` fixture, the
+/// colour row's only GL differential, was not built.
+fn end_unless_the_colour_row_ran() {
+    if !colour_face_installed() {
+        aterm_spec::host::could_not_run(format!(
+            "{COLOUR_FACE} is not installed here: the colour row was not compared"
+        ));
+    }
+}
+
+/// The image plane, which the replay does not reach (it keeps to the glyph
+/// and sprite atlases): a placement over the text and one under it, for the
+/// armed differentials, whose renderers upload the plane through their own
+/// residency. Its claims are the plane's streams.
+fn image_fixture(gpu: &GpuRenderer) -> (&'static str, RenderInput, Vec<StreamId>) {
+    use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef, ImageScaling};
+    use aterm_core::terminal::Terminal;
+    let (cw, ch) = gpu.cell_size();
+    let mut term = Terminal::new(ROWS as u16, COLS as u16);
+    term.set_cell_pixel_size(cw as u16, ch as u16);
+    term.process(b"$ images over and under >_\r\nunder the picture 0123456789\r\n");
+    let mut input = term.cell_frame(ROWS, COLS);
+    // (z, first row, first col, seed): a raster with translucent texels, so
+    // the plane's blend is in the comparison, not only its copy.
+    for (z, row0, col0, seed) in [(0, 0usize, 2usize, 7usize), (-1, 1, 12, 41)] {
+        let (w, h) = (17u16, 11u16);
+        let image = Arc::new(ImageData {
+            bytes: (0..usize::from(w) * usize::from(h) * 4)
+                .map(|i| ((i * 29 + seed) % 256) as u8)
+                .collect(),
+            format: ImageFormat::RawRgba8 {
+                width: w,
+                height: h,
+            },
+            cols: 4,
+            rows: 2,
+            z_index: z,
+            band_lift_px: 0,
+            cell_offset_px: (0, 0),
+            scaling: ImageScaling::Fit,
+            source_rect: None,
+        });
+        for r in 0..2u16 {
+            for c in 0..4u16 {
+                input.images[row0 + usize::from(r)].push((
+                    col0 + usize::from(c),
+                    ImageRef {
+                        image: image.clone(),
+                        cell_row: r,
+                        cell_col: c,
+                        kitty: None,
+                    },
+                ));
+            }
+        }
+    }
+    (
+        "images",
+        input,
+        vec![StreamId::Image, StreamId::ImageUnder, StreamId::Glyph],
+    )
+}
+
 /// Every pixel equal, else a panic naming the first differing texel.
 fn assert_frames_identical(name: &str, expected: &Frame, actual: &Frame) {
     assert_eq!(
@@ -749,6 +867,7 @@ fn gl_frames_match_wgpu_gles_byte_for_byte() {
     for line in run_differential(wgpu::Backends::GL, false) {
         crate::stderr_line!("gles oracle: {line}");
     }
+    end_unless_the_colour_row_ran();
 }
 
 /// Against wgpu's Vulkan backend on the same driver (Linux's production
@@ -758,6 +877,7 @@ fn gl_frames_match_wgpu_vulkan_byte_for_byte() {
     for line in run_differential(wgpu::Backends::VULKAN, true) {
         crate::stderr_line!("vulkan oracle: {line}");
     }
+    end_unless_the_colour_row_ran();
 }
 
 /// The negative control: one flipped instance byte in the GL replay is a
@@ -849,7 +969,9 @@ fn armed_gl_readbacks_match_the_wgpu_arm_byte_for_byte() {
     let (mut armed, _dev2) = arms_on(wgpu::Backends::VULKAN);
     armed.arm_gl();
     let (mut win_o, mut win_a) = (WindowGpu::new(), WindowGpu::new());
-    for (name, input, _) in fixtures(&oracle, true) {
+    let mut fixtures = fixtures(&oracle, true);
+    fixtures.push(image_fixture(&oracle));
+    for (name, input, drive) in fixtures {
         for pass in 0..3 {
             let expected = oracle
                 .try_render_input(&mut win_o, &input, None)
@@ -862,10 +984,20 @@ fn armed_gl_readbacks_match_the_wgpu_arm_byte_for_byte() {
                 armed.last_frame_on_gl(),
                 "{name}: the armed renderer fell back to wgpu (see the gl arm note)"
             );
+            if pass == 0 {
+                let drawn: Vec<StreamId> = armed.frame_plan.iter().map(|i| i.stream).collect();
+                for want in &drive {
+                    assert!(
+                        drawn.contains(want),
+                        "{name}: the fixture claims {want:?} but the armed plan never drew it"
+                    );
+                }
+            }
             assert_frames_identical(&format!("armed {name} (frame {pass})"), &expected, &actual);
         }
-        crate::stderr_line!("armed gl: {name}: byte-identical x3");
+        crate::stderr_line!("armed gl: {name}: byte-identical x3 ({drive:?})");
     }
+    end_unless_the_colour_row_ran();
 }
 
 /// The readback's present-time layers on the armed GL arm: bloom (the glow
@@ -926,6 +1058,7 @@ fn armed_gl_effect_layers_match_the_wgpu_arm_byte_for_byte() {
         ph: 10,
         dx: 5,
         dy: 3,
+        scrim: None,
     };
     assert!(
         armed.shimmer_live(&input) && oracle.shimmer_live(&input),
@@ -1029,6 +1162,7 @@ fn armed_gl_presents_match_the_wgpu_arm_byte_for_byte() {
         ph: 8,
         dx: 3,
         dy: 2,
+        scrim: None,
     };
     let overlay = DropOverlay {
         accent: 0x0040_a0ff,
@@ -1037,6 +1171,7 @@ fn armed_gl_presents_match_the_wgpu_arm_byte_for_byte() {
         border_scale_q4: 16,
     };
     let mut fixtures = fixtures(&oracle, true);
+    fixtures.push(image_fixture(&oracle));
     fixtures.push(("heat", heat_input(&oracle), Vec::new()));
     // The layers the fixtures drive: the bloom halo and the SDR crown (cursor
     // glow), the shimmer (an additive fire patch), the sub-row glide (scroll).
@@ -1117,6 +1252,7 @@ fn armed_gl_presents_match_the_wgpu_arm_byte_for_byte() {
         assert_frames_identical(&format!("present {name} (cropped)"), &expected, &actual);
         crate::stderr_line!("armed gl present: {name}: byte-identical x5");
     }
+    end_unless_the_colour_row_ran();
 }
 
 /// The negative control for the present differential: the bell inversion and

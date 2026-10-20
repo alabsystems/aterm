@@ -147,7 +147,7 @@ impl Line {
         let content_len = self.content.as_bytes().len();
         // Closure-free shapes and fn-item accessors (`attr_runs`,
         // `Line::hyperlinks`): called directly, the tiny aterm-rle/aterm-alloc
-        // methods get MIR-inlined and the strict gate's hardened-unsafe check
+        // methods get MIR-inlined and the Trust lane's hardened-unsafe check
         // fails closed on their std internals (see `attr_runs` in line.rs).
         let attrs_size = if self.attrs.is_some() {
             // has_attrs + run_count + runs
@@ -220,7 +220,7 @@ impl Line {
         result.extend_from_slice(&content_len_u32.to_le_bytes());
         result.extend_from_slice(content);
 
-        // Attributes, via `attr_runs` for the strict gate (see
+        // Attributes, via `attr_runs` for the Trust lane (see
         // `serialized_size_estimate`).
         if self.attrs.is_some() {
             let runs = super::attr_runs(self.attrs.as_deref());
@@ -237,7 +237,7 @@ impl Line {
         }
 
         // Hyperlinks (v3: with OSC 8 IDs), from the plain slice `Line::hyperlinks`
-        // returns, for the strict gate (see `serialized_size_estimate`).
+        // returns, for the Trust lane (see `serialized_size_estimate`).
         if let Some(spans) = self.hyperlinks() {
             let count = u16::try_from(spans.len()).unwrap_or(u16::MAX);
             result.extend_from_slice(&count.to_le_bytes());

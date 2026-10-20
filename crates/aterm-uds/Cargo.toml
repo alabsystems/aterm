@@ -33,3 +33,9 @@ workspace = true
 [[bench]]
 name = "spawn_cost"
 harness = false
+
+# Explicit mounted-volume acceptance; not an ordinary test or a release dependency.
+[[bench]]
+name = "dmg_acceptance"
+harness = false
+test = false

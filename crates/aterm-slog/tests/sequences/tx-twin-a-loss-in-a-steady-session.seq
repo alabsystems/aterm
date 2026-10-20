@@ -1,0 +1,31 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_loss_in_a_steady_session_is_said_once_at_the_batchs_end (S23,
+# S27): the count crosses an update; an off source counts too.
+bind 0
+see busy
+tx prompt v1
+tx flush
+tx tool c0
+tx tool c1
+tx tool c2
+tx tool c3
+tx tool c4
+tx tool c5
+tx tool c6
+tx tool c7
+tx tool c8
+tx flush
+tx flush
+tx result never-opened
+tx lost 2
+adopt keep-tx after=100
+tx flush
+state off
+tx lost 0
+tx lost 3
+tx flush
+expect mark r1 source state=on skipped=0
+expect mark r1 source state=on dropped=1
+expect mark r1 source dropped=4
+expect mark r1 source state=off dropped=4
+expect mark r1 source dropped=7 state=off

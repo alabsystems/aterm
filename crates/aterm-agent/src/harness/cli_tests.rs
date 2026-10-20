@@ -20,6 +20,7 @@ use aterm_phase::prompt::fixtures::{composer, rows};
 use aterm_tempfile::TempDir as Tmp;
 
 use super::*;
+use crate::harness::host_path::{self, abs};
 use crate::supervise::run::CtlReply;
 
 /// A fresh, empty directory under the system temp dir, removed on drop.
@@ -516,7 +517,11 @@ fn usage_folds_the_session_claude_code_names_not_the_newest() {
     // The neighbour wrote last: newest-by-mtime would pick it.
     let theirs = dir.join("theirs-2.jsonl");
     std::fs::write(&theirs, row("t1", "claude-opus-5-5", 99_999)).expect("theirs");
-    std::fs::File::open(&theirs)
+    // Opened for writing: Windows sets a time only through a handle that may
+    // write the file's attributes.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&theirs)
         .and_then(|f| {
             f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
         })
@@ -575,7 +580,7 @@ fn usage_folds_the_session_claude_code_names_not_the_newest() {
         claude.join("sessions").join("777.json"),
         format!(
             r#"{{"pid":777,"sessionId":"mine-1","cwd":"{}"}}"#,
-            env.cwd.display()
+            host_path::json(&env.cwd)
         ),
     )
     .expect("sessions file");
@@ -682,7 +687,7 @@ fn usage_names_the_account_its_claude_code_runs_under() {
         format!(
             r#"{{"pid":{},"sessionId":"{session}","cwd":"{}"{start}}}"#,
             FakeClaude::PID,
-            env.cwd.display()
+            host_path::json(&env.cwd)
         )
     };
     let mine = row("mine-1", Some(FakeClaude::STARTED));
@@ -943,9 +948,10 @@ fn usage_from_codex_tools_folds_its_conversation_at_list_prices() {
     );
     // The TUI's thread's rollout, though a subagent named the thread: the
     // subagents are the other two.
-    let root_rollout = codex.join(format!(
-        "sessions/2026/10/15/rollout-2026-10-15T10-00-00-{root}.jsonl"
-    ));
+    let root_rollout = ["sessions", "2026", "10", "15"]
+        .iter()
+        .fold(codex.clone(), |dir, name| dir.join(name))
+        .join(format!("rollout-2026-10-15T10-00-00-{root}.jsonl"));
     assert!(
         out.contains(&format!(
             "SPEND folded from {} (+2 subagent rollouts; 4 turns)",
@@ -1504,6 +1510,7 @@ fn idle_now() -> i64 {
 }
 
 /// The real remover the window's tick runs, at `now`, on any device.
+#[cfg(unix)]
 fn real_remover(now: i64) -> impl FnMut(&disk::Row) -> io::Result<disk::Removed> {
     disk::remover(disk::Judge {
         now,
@@ -1513,12 +1520,14 @@ fn real_remover(now: i64) -> impl FnMut(&disk::Row) -> io::Result<disk::Removed>
 }
 
 /// The host's tick on a cargo-shaped build directory: at or above the
-/// automatic floor it reads and writes nothing; below it only the idle
-/// profile's `incremental/` is reclaimed, and the report, the intent row
+/// warning it reads and writes nothing; below it only the idle profile's
+/// `incremental/` is reclaimed (free space measured again first), and the
+/// report, the intent row
 /// (before the removal) and the outcome row (witness, bytes released, unit)
 /// land in the disk ledger in that order. `[disk] auto_free_gib` moves the
 /// floor; `0` turns it off. The fixture plants no root `.cargo-lock` (cargo
 /// never writes one).
+#[cfg(unix)]
 #[test]
 fn the_disk_tick_reclaims_stale_targets_below_the_floor_and_nothing_above() {
     let tmp = tmp_dir("disk-tick");
@@ -1537,11 +1546,16 @@ fn the_disk_tick_reclaims_stale_targets_below_the_floor_and_nothing_above() {
         discover: None,
         transcripts: None,
         now,
+        room: None,
+        table: None,
+        demand: None,
+        session_cwds: &[],
+        link_dirs: &[],
     };
     let plenty = disk_tick(
-        &look(Some(cfg.auto_free_gib * gib)),
+        &look(Some(cfg.warn_free_gib * gib)),
         cfg,
-        &mut |row| panic!("removed {} above the floor", row.path.display()),
+        &mut |row| panic!("removed {} above the warning", row.path.display()),
         &mut disk::tests::no_pressure,
     );
     assert_eq!(plenty, DiskTick::Plenty);
@@ -1561,12 +1575,11 @@ fn the_disk_tick_reclaims_stale_targets_below_the_floor_and_nothing_above() {
     );
     assert_eq!(tick, DiskTick::Plenty);
 
-    let DiskTick::Reclaimed(done, _) = disk_tick(
-        &look(Some(gib)),
-        cfg,
-        &mut real_remover(now),
-        &mut disk::tests::no_pressure,
-    ) else {
+    let DiskTick::Reclaimed(done, _) =
+        disk_tick(&look(Some(gib)), cfg, &mut real_remover(now), &mut || {
+            Some(gib)
+        })
+    else {
         panic!("below the floor, the tick applies");
     };
     assert_eq!(done.removed.len(), 1, "{done:?}");
@@ -1603,6 +1616,7 @@ fn the_disk_tick_reclaims_stale_targets_below_the_floor_and_nothing_above() {
 }
 
 /// Set the mtime of the directory at `path` to `at` (unix seconds).
+#[cfg(unix)]
 fn set_mtime(path: &Path, at: i64) {
     let when = std::time::UNIX_EPOCH
         + std::time::Duration::from_secs(u64::try_from(at).expect("after the epoch"));
@@ -1613,6 +1627,7 @@ fn set_mtime(path: &Path, at: i64) {
 
 /// A build directory at `<tmp>/<name>` holding `debug/`, built just now, and
 /// `release/`, whose compile outputs were last written two days before `now`.
+#[cfg(unix)]
 fn two_day_old_release(tmp: &Tmp, name: &str, now: i64) -> PathBuf {
     let target = disk::tests::lay_target(&tmp.path().join(name));
     disk::tests::lay_profile(&target.join("release"));
@@ -1624,6 +1639,7 @@ fn two_day_old_release(tmp: &Tmp, name: &str, now: i64) -> PathBuf {
 
 /// One tick below the floor over `target` under `cfg`, on the real remover
 /// with `cfg`'s window, free space re-measured through `measure`.
+#[cfg(unix)]
 fn tick_below_floor(
     tmp: &Tmp,
     target: &Path,
@@ -1641,6 +1657,11 @@ fn tick_below_floor(
         discover: None,
         transcripts: None,
         now,
+        room: None,
+        table: None,
+        demand: None,
+        session_cwds: &[],
+        link_dirs: &[],
     };
     let mut remover = disk::remover(disk::Judge {
         now,
@@ -1659,13 +1680,14 @@ fn tick_below_floor(
 /// idle one's `incremental/` goes and the fresh one's stays. (An explicit
 /// window and the least-recently-used pass under pressure:
 /// `disk_pressure_tests`.)
+#[cfg(unix)]
 #[test]
 fn the_default_window_reclaims_a_profile_idle_two_days_and_keeps_one_built_today() {
     let tmp = tmp_dir("disk-window");
     let now = i64::try_from(aterm_time::unix_secs().unwrap()).unwrap();
     let target = two_day_old_release(&tmp, "repo/target", now);
     let cfg = disk_config_read(None).config;
-    let done = tick_below_floor(&tmp, &target, now, cfg, &mut disk::tests::no_pressure);
+    let done = tick_below_floor(&tmp, &target, now, cfg, &mut || Some(1));
     assert_eq!(done.removed.len(), 1, "{done:?}");
     assert!(done.denials.is_empty(), "{done:?}");
     assert!(
@@ -1693,6 +1715,7 @@ fn the_default_window_reclaims_a_profile_idle_two_days_and_keeps_one_built_today
 /// The intent row is journalled before a removal starts, so a remover that
 /// dies mid-pass leaves the report and the intent on record, naming the build
 /// directory.
+#[cfg(unix)]
 #[test]
 fn a_tick_cut_short_mid_removal_leaves_the_intent_in_the_journal() {
     let tmp = tmp_dir("disk-cut");
@@ -1707,13 +1730,18 @@ fn a_tick_cut_short_mid_removal_leaves_the_intent_in_the_journal() {
         discover: None,
         transcripts: None,
         now: idle_now(),
+        room: None,
+        table: None,
+        demand: None,
+        session_cwds: &[],
+        link_dirs: &[],
     };
     let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         disk_tick(
             &look,
             disk::Config::default(),
             &mut |_| panic!("the window quit mid-removal"),
-            &mut disk::tests::no_pressure,
+            &mut || Some(1),
         )
     }));
     assert!(died.is_err(), "the remover died");
@@ -1756,6 +1784,11 @@ fn the_disk_tick_leaves_a_target_on_another_volume_alone() {
         discover: None,
         transcripts: None,
         now,
+        room: None,
+        table: None,
+        demand: None,
+        session_cwds: &[],
+        link_dirs: &[],
     };
     let DiskTick::Reclaimed(done, _) = disk_tick(
         &look(elsewhere),
@@ -1772,7 +1805,7 @@ fn the_disk_tick_leaves_a_target_on_another_volume_alone() {
         &look(tmp.path()),
         disk::Config::default(),
         &mut real_remover(now),
-        &mut disk::tests::no_pressure,
+        &mut || Some(1),
     ) else {
         panic!("below the floor, the tick runs");
     };
@@ -1786,6 +1819,7 @@ fn the_disk_tick_leaves_a_target_on_another_volume_alone() {
 /// `incremental/` and nothing else, prints what went and what it freed —
 /// "freed about": a count of the blocks it unlinked, not a measurement — and
 /// journals the intent and the outcome.
+#[cfg(unix)]
 #[test]
 fn the_verb_applies_cargo_targets_with_the_same_unit() {
     let tmp = tmp_dir("disk-verb");
@@ -1829,6 +1863,7 @@ fn the_verb_applies_cargo_targets_with_the_same_unit() {
 /// where it should be), or the append fails on a full disk — the tick removes
 /// nothing: each row it would have reclaimed is a denial saying the intent
 /// could not be journalled, and the cache stays.
+#[cfg(unix)]
 #[test]
 fn the_tick_removes_nothing_whose_intent_it_cannot_journal() {
     let tmp = tmp_dir("disk-unjournalled");
@@ -1845,12 +1880,17 @@ fn the_tick_removes_nothing_whose_intent_it_cannot_journal() {
         discover: None,
         transcripts: None,
         now,
+        room: None,
+        table: None,
+        demand: None,
+        session_cwds: &[],
+        link_dirs: &[],
     };
     let DiskTick::Reclaimed(done, _) = disk_tick(
         &look,
         disk::Config::default(),
         &mut real_remover(now),
-        &mut disk::tests::no_pressure,
+        &mut || Some(1),
     ) else {
         panic!("below the floor, the tick runs");
     };
@@ -3514,9 +3554,12 @@ fn a_refused_roster_is_said_by_name_and_nothing_acts_on_it() {
     let tmp = tmp_dir("accounts-refused");
     let env = env_at(&tmp);
     let roster = env.accounts_roster().expect("a config dir");
-    let bad = "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
-               [[account]]\nlabel = \"main\"\nclass = \"shared\"\ndir = \"/logins/x\"\n";
-    std::fs::write(&roster, bad).expect("write");
+    let bad = format!(
+        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
+         [[account]]\nlabel = \"main\"\nclass = \"shared\"\ndir = \"{}\"\n",
+        abs("/logins/x")
+    );
+    std::fs::write(&roster, &bad).expect("write");
 
     let (code, out, err) = acc_quiet(AccountsCmd::Report { json: false }, &env);
     assert_eq!(code, exit(1));
@@ -3728,12 +3771,15 @@ fn an_add_to_a_roster_with_rows_lists_no_login_of_its_own() {
     let tmp = tmp_dir("accounts-add-existing");
     let env = env_at(&tmp);
     let roster = env.accounts_roster().expect("a config dir");
-    let hand = "# written by hand\n[[account]]\nlabel = \"pool-a\"\nclass = \"shared\"\ndir = \"/logins/pool-a\"\n";
-    std::fs::write(&roster, hand).expect("write");
+    let hand = format!(
+        "# written by hand\n[[account]]\nlabel = \"pool-a\"\nclass = \"shared\"\ndir = \"{}\"\n",
+        abs("/logins/pool-a")
+    );
+    std::fs::write(&roster, &hand).expect("write");
     let (code, _, err) = acc_quiet(add("work-2", Class::Dedicated), &env);
     assert_eq!(code, exit(0), "{err}");
     let text = std::fs::read_to_string(&roster).expect("read");
-    assert!(text.starts_with(hand), "what was there is kept: {text}");
+    assert!(text.starts_with(&hand), "what was there is kept: {text}");
     assert_eq!(
         Roster::load(&roster)
             .expect("admits")
@@ -5335,8 +5381,11 @@ fn the_accounts_report_shows_the_record_of_usage() {
     let roster = env.accounts_roster().expect("a config dir");
     std::fs::write(
         &roster,
-        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
-         [[account]]\nlabel = \"work-2\"\nclass = \"dedicated\"\ndir = \"/logins/work-2\"\n",
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
+             [[account]]\nlabel = \"work-2\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
+            abs("/logins/work-2")
+        ),
     )
     .expect("write");
     let (_, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
@@ -5916,4 +5965,80 @@ fn the_reserve_is_released_first_at_an_emergency_and_rewritten_when_space_is_bac
     ));
     assert_eq!(std::fs::read(&victim).expect("victim"), b"keep");
     assert_eq!(rows(), ["written", "released", "refused"]);
+}
+
+/// A state-preserving cut streams bounded main rows and reads predecessors
+/// within the input cap; anything it cannot read whole keeps the ledger as it is.
+#[test]
+fn a_stateful_ledger_cut_keeps_input_it_cannot_read_whole() {
+    let tmp = tmp_dir("ledger-cut-input");
+    let path = tmp.path().join("ledger.jsonl");
+    let side = tmp.path().join("earlier.jsonl");
+    let original = "one\ntwo\nthree\n";
+    std::fs::write(&path, original).expect("ledger");
+    let called = std::cell::Cell::new(false);
+    let cut = |rows: &mut dyn Iterator<Item = String>, _: &dyn Fn(&Path) -> Option<String>| {
+        called.set(true);
+        Some(vec![rows.last().expect("row")])
+    };
+    assert!(!bound_ledger_cut_with_cap(&path, 100, 64, &cut).unwrap());
+    assert!(!called.get());
+    assert!(bound_ledger_cut_with_cap(&path, 1, 64, &cut).unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "three\n");
+    std::fs::write(&path, original).expect("ledger");
+    std::fs::write(&side, "standing\n").expect("earlier ledger");
+    let earlier = |rows: &mut dyn Iterator<Item = String>,
+                   read: &dyn Fn(&Path) -> Option<String>| {
+        rows.for_each(drop);
+        Some(read(&side).map_or_else(Vec::new, |body| body.lines().map(str::to_string).collect()))
+    };
+    assert!(bound_ledger_cut_with_cap(&path, 1, 64, &earlier).unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "standing\n");
+    std::fs::write(&path, original).expect("ledger");
+    // The main input is streamed: one past the input cap is cut.
+    assert!(bound_ledger_cut_with_cap(&path, 1, 8, &cut).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "three\n",
+        "a main input past the cap is streamed and cut"
+    );
+    // One oversized row refuses before it can grow the line buffer past cap + 1.
+    let oversized = "one\n123456789\nthree\n";
+    std::fs::write(&path, oversized).expect("oversized row");
+    assert!(!bound_ledger_cut_with_cap(&path, 1, 8, &cut).unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), oversized);
+    let boundary = "1234567\n";
+    std::fs::write(&path, boundary).expect("row at the bound");
+    assert!(bound_ledger_cut_with_cap(&path, 1, 8, &cut).unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), boundary);
+    std::fs::write(&path, original).expect("ledger");
+    // A cut that leaves rows unread, or keeps the file, keeps it.
+    let partial = |rows: &mut dyn Iterator<Item = String>, _: &dyn Fn(&Path) -> Option<String>| {
+        Some(rows.next().into_iter().collect())
+    };
+    assert!(!bound_ledger_cut_with_cap(&path, 1, 64, &partial).unwrap());
+    let keep = |rows: &mut dyn Iterator<Item = String>, _: &dyn Fn(&Path) -> Option<String>| {
+        rows.for_each(drop);
+        None
+    };
+    assert!(!bound_ledger_cut_with_cap(&path, 1, 64, &keep).unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    // A main input that is not UTF-8 is no input read whole.
+    std::fs::write(&path, b"one\n\xff\nthree\n").expect("invalid main text");
+    assert!(!bound_ledger_cut_with_cap(&path, 1, 64, &cut).unwrap());
+    assert_eq!(std::fs::read(&path).unwrap(), b"one\n\xff\nthree\n");
+    std::fs::write(&path, original).expect("ledger");
+    assert!(!bound_ledger_cut_with_cap(&path, 1, 4, &earlier).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original,
+        "UNKNOWN_PREDECESSOR_MUST_KEEP_LEDGER"
+    );
+    std::fs::write(&side, [0xff]).expect("invalid predecessor text");
+    assert!(!bound_ledger_cut_with_cap(&path, 1, 64, &earlier).unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    std::fs::remove_file(&side).expect("remove predecessor");
+    std::fs::create_dir(&side).expect("nonregular predecessor");
+    assert!(!bound_ledger_cut_with_cap(&path, 1, 64, &earlier).unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }

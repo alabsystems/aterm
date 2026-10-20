@@ -12,5 +12,9 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 fn main() {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this dev-only image is the window and nothing else; it is never shipped"
+    )]
     aterm_gui::main_entry(std::env::args_os().skip(1).collect());
 }

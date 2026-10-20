@@ -167,7 +167,7 @@ pub fn written(home: &Path) -> bool {
 /// rides `--rcfile`), so [`crate::cli::shell_remedy_command`] names the hook source
 /// everywhere and keys only on whether the hook FILE exists ([`hook_file`]).
 #[must_use]
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn rc_hook_wired(home: &Path, shell: &str) -> Option<(bool, &'static str)> {
     let rcs: &[&str] = match shell {
         "zsh" => &[".zshrc", ".zprofile"],
@@ -667,9 +667,9 @@ fn refresh_at(
 /// found, refreshed and removed exactly — never matched by content, which drifts.
 /// `pub(crate)` so callers outside this module — the repair report's pin test, `doctor`'s rc
 /// lines — read the marker the code actually writes rather than a copy of it that can drift.
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 pub(crate) const RC_BEGIN: &str = "# >>> atpkg shell integration >>>";
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 pub(crate) const RC_END: &str = "# <<< atpkg shell integration <<<";
 
 /// The rc files atpkg wires: each row is a path relative to `$HOME` and the `shell.d` hook
@@ -1893,7 +1893,7 @@ mod tests {
             ("bash", &["--noprofile", "--norc", "-c"][..], ".bashrc"),
             ("zsh", &["-f", "-c"][..], ".zshrc"),
         ] {
-            match std::process::Command::new(shell)
+            match aterm_uds::spawnfd::command(shell)
                 .args(args)
                 .arg("true")
                 .output()
@@ -1906,7 +1906,7 @@ mod tests {
                 Ok(_) => {}
             }
             let line = line_of(rc);
-            let out = std::process::Command::new(shell)
+            let out = aterm_uds::spawnfd::command(shell)
                 .args(args)
                 .arg(format!("{line}\nprintf 'X=%s\\n' \"$ATPKG_RC_TEST\""))
                 // Non-interactive bash sources $BASH_ENV even under --noprofile --norc.
@@ -1974,7 +1974,7 @@ mod tests {
             ("bash", &["--noprofile", "--norc", "-c"][..], ".bashrc"),
             ("zsh", &["-f", "-c"][..], ".zshrc"),
         ] {
-            match std::process::Command::new(shell)
+            match aterm_uds::spawnfd::command(shell)
                 .args(args)
                 .arg("true")
                 .output()
@@ -1987,7 +1987,7 @@ mod tests {
                 Ok(_) => {}
             }
             let line = line_of(rc);
-            let out = std::process::Command::new(shell)
+            let out = aterm_uds::spawnfd::command(shell)
                 .args(args)
                 .arg(&line)
                 // Non-interactive bash sources $BASH_ENV even under --noprofile --norc.
@@ -3082,8 +3082,10 @@ mod tests {
     /// included — in order, append bin/ last, and change nothing on a second source.
     ///
     /// EVERY DIALECT a person's shell sources is executed where its shell exists: bash
-    /// (macOS's 3.2 when that is what `bash` is) must; zsh, fish and pwsh are skipped only
-    /// when the spawn itself finds no such program, and say so. The fish and pwsh arms were
+    /// (macOS's 3.2 when that is what `bash` is) must; a missing zsh or fish (macOS's own
+    /// zsh, fish a machine prerequisite) ends the test COULD NOT RUN once the others ran.
+    /// pwsh, which no unix host ships and no machine prerequisite names, is skipped when the
+    /// spawn finds none, saying so. The fish and pwsh arms were
     /// cut from this test by a merge on 2026-09-27 and restored the same day; they last ran
     /// on 2026-09-27 against fish 4.9.3 and PowerShell 7.6.6 on macOS 27 (arm64), from the
     /// vendors' own release archives. Each shell runs with a scratch HOME/XDG root, so a
@@ -3112,6 +3114,7 @@ mod tests {
                         [Console]::Out.Write('PATH=' + $env:PATH + [char]10)";
         let home = root.join("home");
         fs::create_dir_all(&home).unwrap();
+        let mut absent = Vec::new();
         for (shell, args, ext, cmd) in [
             (
                 "bash",
@@ -3135,21 +3138,30 @@ mod tests {
             // be started is skipped. Every run after that must exit 0 and print its
             // PATH line, or the test fails with the shell's own words (review finding
             // 2026-09-10: a fatal zsh error used to read as "zsh not installed").
-            match std::process::Command::new(shell)
+            // spawnfd's spawn, not std's: std's is glibc's posix_spawn on Linux, whose
+            // child reports a failed exec through memory it shares with its parent,
+            // and Rosetta runs that child in a copy, so std started a missing pwsh as
+            // a child that exited 127 (the lane's x86_64 cell, 2026-10-19); spawnfd's
+            // forked child reports it through a pipe.
+            match aterm_uds::spawnfd::command(shell)
                 .arg("--version")
                 .env("HOME", &home)
                 .output()
             {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     assert_ne!(shell, "bash", "bash must be runnable on a unix host");
-                    eprintln!("SKIP: {shell} is not installed; its hook dialect did not run");
+                    if shell == "pwsh" {
+                        eprintln!("SKIP: pwsh is not installed; its hook dialect did not run");
+                    } else {
+                        absent.push(shell);
+                    }
                     continue;
                 }
                 Err(error) => panic!("{shell}: cannot start: {error}"),
                 Ok(_) => {}
             }
             let run = |path: &str| -> String {
-                let out = std::process::Command::new(shell)
+                let out = aterm_uds::spawnfd::command(shell)
                     .args(args)
                     .arg(cmd)
                     // A scratch HOME and XDG root: pwsh and fish write first-run state.
@@ -3221,7 +3233,7 @@ mod tests {
         // alone fronts the reroute dir only.
         let hook = root.join("hook.bash");
         let outside = |handle: Option<&Path>| -> String {
-            let mut command = std::process::Command::new("bash");
+            let mut command = aterm_uds::spawnfd::command("bash");
             command
                 .args(["--noprofile", "--norc", "-c", posix_cmd])
                 .env("HOME", &home)
@@ -3260,5 +3272,12 @@ mod tests {
             "the reroute handle alone fronts the reroute dir"
         );
         let _ = fs::remove_dir_all(&root);
+        if !absent.is_empty() {
+            aterm_spec::host::could_not_run(format!(
+                "{} not installed here, so its hook dialect did not run (zsh is macOS's own; \
+                 fish is a machine prerequisite: `brew install fish`)",
+                absent.join(" and ")
+            ));
+        }
     }
 }

@@ -82,6 +82,49 @@ const ATLAS_WIDTH: u32 = 1024;
 /// full repack into a taller texture. Unwritten headroom rows are never sampled.
 const ATLAS_GROW_HEADROOM: u32 = 256;
 
+#[cfg(clean_islands)]
+macro_rules! trust_island {
+    ($($item:item)*) => {
+        $($item)*
+    };
+}
+
+#[cfg(not(clean_islands))]
+macro_rules! trust_island {
+    ($($tt:tt)*) => {};
+}
+
+trust_island! {
+    clean {
+        namespace GpuRowEncodeProofs
+
+        -- When a row has no selection span (rowHasSel = false), no column on
+        -- that row can be selected, so skipping selection_hit is exact.
+        def cellSelectedOnRow (rowHasSel colInSpan : Bool) : Bool :=
+          if rowHasSel then colInSpan else false
+
+        theorem unselected_row_has_no_selected_cell (colInSpan : Bool) :
+            cellSelectedOnRow false colInSpan = false := by
+          rfl
+
+        -- Consecutive cells on a row sharing (base_fg, cell.bg, hit) resolve to
+        -- identical (glyph_color, bg_under) under the fixed frame
+        -- selection_palette and min_contrast.
+        def resolveRowFg (key memoKey memoVal freshVal : Nat) : Nat :=
+          if Nat.beq key memoKey then memoVal else freshVal
+
+        theorem row_fg_memo_hit_is_exact (val : Nat) :
+            resolveRowFg 7 7 val val = val := by
+          rfl
+
+        theorem row_fg_memo_miss_recomputes (memoVal freshVal : Nat) :
+            resolveRowFg 8 7 memoVal freshVal = freshVal := by
+          rfl
+
+        end GpuRowEncodeProofs
+    }
+}
+
 /// `unsafe impl` the [`aterm_bits`] `Pod`/`Zeroable` pair for a `#[repr(C)]`
 /// struct, with compile-time checks standing in for a derive:
 ///
@@ -1359,7 +1402,7 @@ fn fs_bloom(in: VsOut) -> @location(0) vec4<f32> {
 
 /// Bloom uniform, matching WGSL `BloomU` (32 B with tail pad). `texel` is
 /// 1/half-res dims; `radius` spreads the white part, `chroma_radius` the colour
-/// (see [`BLOOM_CHROMA_RADIUS`]).
+/// (see [`aterm_render::bloom::BLOOM_CHROMA_RADIUS`]).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq)]
 struct BloomUniform {
@@ -1731,6 +1774,23 @@ pub struct TrayQuad<'a> {
     pub dx: u32,
     /// Destination top-left Y in device px.
     pub dy: u32,
+    /// The smoke layer the card's modal lays over the window behind it, if any.
+    /// Drawn by the wgpu arm and the frontend's CPU composite; the Metal and GL
+    /// arms, whose platforms show no scrim, refuse one in debug builds.
+    pub scrim: Option<TrayScrim>,
+}
+
+/// A modal's smoke layer under its tray card ([`TrayQuad::scrim`]): one solid
+/// straight-alpha `rgba` fill over every target pixel from device row `top`
+/// down, composited source-over before the card. A colour, not a raster, so a
+/// window-sized image is never made, compared or uploaded for it: the card's
+/// own raster stays card-sized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrayScrim {
+    /// Straight (non-premultiplied) RGBA8.
+    pub rgba: [u8; 4],
+    /// First device row the fill covers; a banner above it stays clear.
+    pub top: u32,
 }
 
 /// Why an on-screen present did not acquire a drawable. Reconfigured/timeout
@@ -1767,6 +1827,23 @@ pub(crate) struct TrayOverlay {
     /// Resident texture dims; the reuse-vs-recreate key.
     w: u32,
     h: u32,
+}
+
+/// The tray scrim's fill ([`TrayScrim`]) on the wgpu arm: a 1×1 texture of its
+/// colour, which the tray pipeline's linear sampler reads as that colour across
+/// any rect, so the scrim is one more tray-pipeline quad with no shader of its
+/// own. Its placement uniform is its own because the card's is written for the
+/// same encoder. Shared by every window, like the tray pipelines.
+#[cfg(wgpu_arm)]
+pub(crate) struct TrayScrimLayer {
+    texture: crate::device_layer::LayerTexture,
+    /// Bind group on `tray_bgl`: the texel's view (0), the tray's linear
+    /// sampler (1) and [`Self::uniform`] (2).
+    bind: wgpu::BindGroup,
+    /// The scrim's placement uniform ([`TrayUniform`]).
+    uniform: wgpu::Buffer,
+    /// The colour resident in `texture`.
+    rgba: [u8; 4],
 }
 
 /// Inset border thickness in device px for a `w`×`h` framebuffer. MUST stay in
@@ -1881,6 +1958,11 @@ fn present_copy_rect(
     (w, h): (u32, u32),
 ) -> [u32; 4] {
     union_rect_opt(dirty, fx, (w, h)).unwrap_or([0, 0, w, h])
+}
+
+/// Nanoseconds since `started`, saturating.
+fn elapsed_ns(started: aterm_time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// The offscreen frame's stream groups in draw order: the index space of
@@ -2167,6 +2249,143 @@ impl StreamId {
         Self::CursorColor,
         Self::Cursor,
     ];
+
+    /// The stable wire label `metrics` prints for this stream
+    /// (`instances_by_stream=`); [`FrameShape::STREAMS`] lists them by index.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Wallpaper => "wallpaper",
+            Self::Bg => "bg",
+            Self::ImageBelowBg => "image_below_bg",
+            Self::ImageBgCover => "image_bg_cover",
+            Self::RainUnder => "rain_under",
+            Self::CatOver => "cat_over",
+            Self::FreeUnder => "free_under",
+            Self::Trail => "trail",
+            Self::GlowUnder => "glow_under",
+            Self::FireAdd => "fire_add",
+            Self::FireOver => "fire_over",
+            Self::ImageUnder => "image_under",
+            Self::GlyphHalo => "glyph_halo",
+            Self::Glyph => "glyph",
+            Self::Color => "color",
+            Self::Image => "image",
+            Self::Deco => "deco",
+            Self::Curl => "curl",
+            Self::GlowAdd => "glow_add",
+            Self::GlowHalo => "glow_halo",
+            Self::GlowHaloOver => "glow_halo_over",
+            Self::NovaAdd => "nova_add",
+            Self::RainAdd => "rain_add",
+            Self::RainAddOver => "rain_add_over",
+            Self::WdecoOver => "wdeco_over",
+            Self::WdecoAdd => "wdeco_add",
+            Self::FreeOver => "free_over",
+            Self::CursorBlock => "cursor_block",
+            Self::CursorGlyph => "cursor_glyph",
+            Self::CursorColor => "cursor_color",
+            Self::Cursor => "cursor",
+        }
+    }
+}
+
+/// The latest encoded frame's shape ([`GpuRenderer::frame_shape`]): what the
+/// frontend's `metrics` reports as `passes_last`, `instances_by_stream=` and
+/// `instance_bytes_last`, plus the CPU split of the offscreen encode. Written by
+/// every arm's tail (wgpu, Metal, GL) when its frame drew.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameShape {
+    /// Render passes the offscreen frame plan opened (`coalesce_frame_passes`).
+    /// The present's compose and blit (Submit B) are not counted here.
+    pub passes: u32,
+    /// Instances built per stream this frame, indexed like [`Self::STREAMS`].
+    pub instances: [u32; STREAM_COUNT],
+    /// Instance bytes built for staging this frame. A backend may refuse a
+    /// stream (for example above wgpu's `max_buffer_size`), so this is not a
+    /// successful-transfer counter.
+    pub instance_bytes: u64,
+    /// CPU time from the encode's entry to the arm's tail: instance building
+    /// and atlas packing.
+    pub build_ns: u64,
+    /// CPU time staging the instance bytes onto the device (excluding the
+    /// Metal frame-slot park).
+    pub stage_ns: u64,
+    /// The pass-economy ablation the plan ran under
+    /// ([`GpuRenderer::unorm_ablation`]); [`UnormAblation::Off`] in a shipped
+    /// binary.
+    pub ablation: UnormAblation,
+}
+
+/// The pass-economy ablation, a development seam (`ATERM_GPU_ABLATE_UNORM`,
+/// [`GpuRenderer::set_unorm_ablation`]) that a shipped binary never sets: how
+/// a frame plan treats the groups that draw on the Unorm view (`GROUP_SRGB`
+/// false, the One/One light), each of which costs the frame a view change and
+/// so a pass. Measured against [`Self::Off`] on the same frame, [`Self::Drop`]
+/// prices the light (its passes and its draws) and [`Self::Thin`] its draws
+/// alone, so `Thin - Drop` is what the passes themselves cost: what merging
+/// them would save.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnormAblation {
+    /// The shipped plan.
+    #[default]
+    Off,
+    /// Leave every Unorm group out: the frame costs what it would with no
+    /// One/One stream at all, in one pass when everything else is sRGB.
+    Drop,
+    /// Keep every Unorm group, and so the full plan's passes, but draw one
+    /// instance per Unorm item: the passes stay and almost all of their draws
+    /// go. Every instance is still built and staged.
+    Thin,
+}
+
+impl UnormAblation {
+    /// The seam's spelling, and `metrics`' `unorm_ablation=` word.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Drop => "drop",
+            Self::Thin => "thin",
+        }
+    }
+
+    /// The `ATERM_GPU_ABLATE_UNORM` value's mode: `drop` (or `1`) and `thin`;
+    /// anything else is the shipped plan.
+    fn from_seam(value: &str) -> Self {
+        match value {
+            "drop" | "1" => Self::Drop,
+            "thin" => Self::Thin,
+            _ => Self::Off,
+        }
+    }
+}
+
+impl FrameShape {
+    /// Every stream's wire label, in [`Self::instances`] order.
+    pub const STREAMS: [&'static str; STREAM_COUNT] = {
+        let mut names = [""; STREAM_COUNT];
+        let mut i = 0;
+        while i < STREAM_COUNT {
+            names[i] = StreamId::ALL[i].name();
+            i += 1;
+        }
+        names
+    };
+
+    /// The non-empty streams as `(label, instances)`, in draw order.
+    pub fn streams(&self) -> impl Iterator<Item = (&'static str, u32)> + '_ {
+        Self::STREAMS
+            .iter()
+            .zip(self.instances.iter())
+            .filter(|&(_, &n)| n > 0)
+            .map(|(&name, &n)| (name, n))
+    }
+
+    /// Instances across every stream.
+    #[must_use]
+    pub fn total_instances(&self) -> u64 {
+        self.instances.iter().map(|&n| u64::from(n)).sum()
+    }
 }
 
 /// One draw: bind `pipe` and `atlas` on change, bind `stream`, draw `count`
@@ -2203,6 +2422,9 @@ pub(crate) struct FramePlanCtx {
     /// `cursor_opaque` — picks the cursor FILL pipe (REPLACE bg vs the
     /// translucent `CursorBlend`), exactly the pre-plan `cursor_fill_pipe`.
     pub(crate) cursor_opaque: bool,
+    /// The pass-economy ablation ([`GpuRenderer::unorm_ablation`], a dev
+    /// seam): what the plan does with the groups that draw on the Unorm view.
+    pub(crate) ablation: UnormAblation,
 }
 
 /// Build the frame's [`DrawItem`] plan from per-stream instance counts (`None`
@@ -2222,7 +2444,15 @@ pub(crate) fn build_frame_plan(
 ) {
     plan.clear();
     let mut push = |group: usize, stream: StreamId, pipe: DrawPipe, atlas: Option<DrawAtlas>| {
-        if let Some(count) = counts[stream as usize] {
+        let mut count = counts[stream as usize];
+        if !GROUP_SRGB[group] {
+            match ctx.ablation {
+                UnormAblation::Off => {}
+                UnormAblation::Drop => return,
+                UnormAblation::Thin => count = count.map(|n| n.min(1)),
+            }
+        }
+        if let Some(count) = count {
             plan.push(DrawItem {
                 group: group as u8,
                 pipe,
@@ -2947,6 +3177,9 @@ impl MetalArmLive {
     /// own resident slot; this serves the present rows' libraries).
     fn library(&mut self, lib: ShaderLibrary) -> Result<&crate::metal::ffi::Library, String> {
         if !self.libs.iter().any(|(l, _)| *l == lib) {
+            // A compile the first-frame warm has in flight is waited out, not
+            // repeated (`metal::warm`).
+            crate::metal::warm::FIRST_FRAME.await_item(crate::metal::warm::WarmItem::Library(lib));
             let compiled = crate::metal::pipelines::compile_library(self.mint.device(), lib)?;
             self.libs.push((lib, compiled));
         }
@@ -2978,6 +3211,8 @@ impl MetalArmLive {
             .find(|(l, _)| *l == spec.library)
             .map(|(_, c)| c)
             .expect("compiled above");
+        crate::metal::warm::FIRST_FRAME
+            .await_item(crate::metal::warm::WarmItem::pipeline(row, present));
         let pso = crate::metal::pipelines::build(self.mint.device(), lib, spec, present)?;
         self.present_psos
             .push(((row, present), pso.clone_retained()));
@@ -3147,6 +3382,10 @@ impl MetalArmLive {
         }
         let slot = &mut self.psos[row as usize];
         if slot.is_none() {
+            crate::metal::warm::FIRST_FRAME.await_item(crate::metal::warm::WarmItem::pipeline(
+                row,
+                crate::metal::ffi::PixelFormat::Bgra8Unorm,
+            ));
             *slot = Some(crate::metal::pipelines::build(
                 self.mint.device(),
                 &self.lib,
@@ -4598,6 +4837,9 @@ pub struct WindowGpu {
     // successful present, between acquisition and `present()`. Not a GPU
     // timestamp. Per window, so load shedding excludes FIFO/drawable pacing.
     last_present_work_ns: u64,
+    // CPU wall time encoding the latest successful present up to its last
+    // commit, excluding recorded GPU parks and virtual-present readback waits.
+    last_present_encode_ns: u64,
     // Wall time in the latest completed swapchain acquisition (measured on the
     // worker for native Metal). An empty poll adds no sample.
     last_acquire_wait_ns: u64,
@@ -4825,8 +5067,14 @@ pub struct WindowGpu {
     // Whether winit last reported `WindowEvent::Occluded(true)`. The Metal
     // present arm classifies a bounded nil-acquire as `Occluded` (park) when
     // set and `Timeout` (bounded retry) when clear, since `CAMetalLayer` offers
-    // no occlusion signal. The wgpu arm ignores it.
+    // no occlusion signal. The wgpu arm refuses a present while it is set on
+    // Windows, where it means minimized (DXGI would present anyway), unless
+    // something waits on that present (`parks_while_minimized`); elsewhere the
+    // wgpu arm ignores it.
     occluded_hint: bool,
+    // The frontend's present is a capture's (`set_capture_present`), set around
+    // that one redraw: it goes through to a minimized window.
+    capture_present: bool,
 }
 
 /// The present's CPU encode/submit cost with the GPU park taken out.
@@ -4857,6 +5105,25 @@ impl WindowGpu {
         self.occluded_hint
     }
 
+    /// Mark the frontend's next presents as a capture's (`on`), or no longer
+    /// (`!on`): set around the one redraw a capture barrier makes, so a capture
+    /// of a minimized window still presents ([`Self::parks_while_minimized`]).
+    pub fn set_capture_present(&mut self, on: bool) {
+        self.capture_present = on;
+    }
+
+    /// Whether the wgpu arm refuses this window's present as `Occluded` on
+    /// Windows: it is minimized ([`Self::occluded_hint`]) and nothing waits on
+    /// the present. A capture's present ([`Self::set_capture_present`]), an
+    /// armed presented-frame snapshot and a live recording all go through.
+    #[must_use]
+    pub fn parks_while_minimized(&self) -> bool {
+        self.occluded_hint
+            && !self.capture_present
+            && self.presented_snapshot.is_none()
+            && self.video.is_none()
+    }
+
     /// Test/diagnostic: whether this window holds the half-res bloom texture.
     /// A session whose glow never lights must read `false` throughout (see
     /// `GpuRenderer::ensure_bloom_target`).
@@ -4881,6 +5148,14 @@ impl WindowGpu {
     #[must_use]
     pub fn last_present_work_ns(&self) -> u64 {
         self.last_present_work_ns
+    }
+
+    /// CPU wall time encoding the latest successful present up to its last
+    /// commit, excluding recorded frame-slot/ring parks. The virtual present's
+    /// Submit B wait and readback are excluded too.
+    #[must_use]
+    pub fn last_present_encode_ns(&self) -> u64 {
+        self.last_present_encode_ns
     }
 
     /// Wall time inside the latest completed drawable acquisition, including
@@ -5357,6 +5632,9 @@ pub struct GpuRenderer {
     tray_uniform_buf: wgpu::Buffer,
     #[cfg(wgpu_arm)]
     tray_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    /// The tray scrim's resident fill ([`TrayScrimLayer`]), built on first use.
+    #[cfg(wgpu_arm)]
+    tray_scrim: Option<TrayScrimLayer>,
     /// Cached swapchain-format choice. `pick_surface_format`'s non-sRGB pick is
     /// stable per adapter, so the blocking `get_capabilities` call runs once.
     #[cfg(wgpu_arm)]
@@ -5468,6 +5746,9 @@ pub struct GpuRenderer {
     // Persistent bloom-glow instance scratch for `build_bloom_glow`, cleared per
     // call.
     bloom_glow_scratch: Vec<GlowInstance>,
+    /// The bloom's extract set before upload ([`Self::build_bloom_glow`]),
+    /// resident like `bloom_glow_scratch`.
+    bloom_quad_scratch: Vec<aterm_render::GlowQuad>,
     // Per-cell resolved glyph keys from the atlas-key prepass (indexed
     // `r * cols + c`, `None` for skipped cells), read back by the emission loop
     // instead of re-deriving them.
@@ -5506,6 +5787,20 @@ pub struct GpuRenderer {
     // Test/diagnostic: render passes the last `encode_frame` opened on the
     // offscreen. Each costs a full-framebuffer tile load and store on TBDR.
     last_frame_passes: u32,
+    /// The latest drawn frame's shape (passes, per-stream instances, staged
+    /// bytes, CPU build/stage split); see [`FrameShape`].
+    frame_shape: FrameShape,
+    /// The pass-economy ablation (`ATERM_GPU_ABLATE_UNORM`, a dev seam; see
+    /// [`UnormAblation`]). [`UnormAblation::Off`] in a shipped binary.
+    ablation: UnormAblation,
+    /// The `crate::gpu_time` serial of the latest present this renderer
+    /// timed, `None` when it timed none (no sink, or an arm with no clock).
+    last_gpu_time_serial: Option<u64>,
+    /// The wgpu arm's `gpu_time` clock (per-pass timestamp queries), built on
+    /// the first present timed while a sink listens; stays `None` on a device
+    /// without `TIMESTAMP_QUERY`.
+    #[cfg(wgpu_arm)]
+    wgpu_timer: Option<crate::wgpu_timer::WgpuGpuTimer>,
     /// The latest frame's [`DrawItem`] plan, kept to reuse capacity and so the
     /// full-frame differential can replay it through the Metal arm.
     frame_plan: Vec<DrawItem>,
@@ -6138,27 +6433,15 @@ fn build_atlas_resources(
     (atlas_bgl, sampler)
 }
 
-/// Half-resolution divisor for the bloom texture: the glow halo is soft, so a
-/// quarter of the pixels is plenty and keeps the blur cheap + naturally wider.
-const BLOOM_DOWNSCALE: u32 = 2;
-/// Bloom additive strength — fraction of the blurred glow added back over the frame.
-const BLOOM_STRENGTH: f32 = 0.85;
-/// Bloom blur radius in half-res texels — how far the radiant halo spreads.
-/// This is the WHITE part's radius (see [`BLOOM_CHROMA_RADIUS`]).
-const BLOOM_RADIUS: f32 = 2.2;
-/// The chroma radius of the same 25-tap kernel (half-res texels): colour
-/// spreads less than white, so less coloured light smears into neighbouring
-/// glyphs. Always the shorter radius, so the scissor dilated by the white
-/// radius bounds it.
-const BLOOM_CHROMA_RADIUS: f32 = 1.2;
-/// Chroma radius as a share of the white one, so `cursor_trail_bloom_radius`
-/// ([`GpuRenderer::set_bloom_params`]) moves both halves together.
-const BLOOM_CHROMA_SHARE: f32 = BLOOM_CHROMA_RADIUS / BLOOM_RADIUS;
+// The bloom's constants and extract set are `aterm_render::bloom`'s, shared
+// with the CPU twin the Settings preview blooms through, so the two cannot
+// drift.
+use aterm_render::bloom::{BLOOM_DOWNSCALE, BLOOM_RADIUS, BLOOM_STRENGTH};
 
 /// The chroma radius paired with a white blur `radius`, used by every uniform
-/// write site.
+/// write site ([`aterm_render::bloom::chroma_radius`]).
 pub(crate) fn bloom_chroma_radius(radius: f32) -> f32 {
-    radius * BLOOM_CHROMA_SHARE
+    aterm_render::bloom::chroma_radius(radius)
 }
 
 /// Build the bloom resources: shader module, bind-group layout (half-res glow
@@ -6865,16 +7148,45 @@ impl GpuRenderer {
     /// is identical to [`GpuRenderer::new`]. Native only.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new_with_family(family: Option<&str>, px: f32, theme: Theme) -> Result<Self, String> {
+        let family_owned = family.map(String::from);
+        Self::new_loading(family.map(String::from), theme, move || {
+            Renderer::from_system_with_family(family_owned.as_deref(), px, theme)
+        })
+    }
+
+    /// Like [`GpuRenderer::new_with_family`], but builds from an already
+    /// resolved FACE (a file and its collection index, what the host admitted
+    /// for `font_family`), mirroring [`Renderer::from_system_with_face`].
+    /// `family` is the configured name it was resolved from. Native only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new_with_face(
+        face: Option<aterm_render::FaceRef>,
+        family: Option<&str>,
+        px: f32,
+        theme: Theme,
+    ) -> Result<Self, String> {
+        Self::new_loading(family.map(String::from), theme, move || {
+            Renderer::from_system_with_face(face.as_ref(), px, theme)
+        })
+    }
+
+    /// The shared construction: `load` builds the CPU face on a background
+    /// thread while the GPU device initializes here, then the two join.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn new_loading(
+        family: Option<String>,
+        theme: Theme,
+        load: impl FnOnce() -> Option<Renderer> + Send + 'static,
+    ) -> Result<Self, String> {
         // Load the font on a background thread while the GPU device initializes
         // here, then join; the two share no state. Both legs are timed
         // (crate::startup_probe), including the join wait.
-        let family_owned = family.map(String::from);
         let font_handle = std::thread::spawn(move || {
             let font_started = aterm_time::Instant::now();
             // No glyph prewarm here: hosts seal the generation right after this
             // returns, and sealing clears the glyph cache. Hosts warm after the
             // seal via [`GpuRenderer::prewarm_ascii`].
-            let cpu = Renderer::from_system_with_family(family_owned.as_deref(), px, theme);
+            let cpu = load();
             crate::startup_probe::record(
                 crate::startup_probe::Leg::FontThread,
                 font_started.elapsed(),
@@ -6891,7 +7203,7 @@ impl GpuRenderer {
             crate::startup_probe::Leg::FontJoin,
             font_join_started.elapsed(),
         );
-        Self::from_parts(ctx, cpu, family.map(String::from), theme)
+        Self::from_parts(ctx, cpu, family, theme)
     }
 
     /// Assemble a `GpuRenderer` from an acquired [`GpuContext`] and a CPU
@@ -7056,6 +7368,8 @@ impl GpuRenderer {
             #[cfg(wgpu_arm)]
             tray_pipelines: HashMap::new(),
             #[cfg(wgpu_arm)]
+            tray_scrim: None,
+            #[cfg(wgpu_arm)]
             cached_surface_format: None,
             mono_res: None,
             color_res: None,
@@ -7109,6 +7423,7 @@ impl GpuRenderer {
             curl_spans_scratch: Vec::new(),
             ligature_break_scratch: Vec::new(),
             bloom_glow_scratch: Vec::new(),
+            bloom_quad_scratch: Vec::new(),
             key_scratch: Vec::new(),
             image_order_scratch: Vec::new(),
             image_seen_scratch: FxHashMap::default(),
@@ -7120,6 +7435,14 @@ impl GpuRenderer {
             last_instances: 0,
             last_bg_instances: 0,
             last_frame_passes: 0,
+            frame_shape: FrameShape::default(),
+            // A development seam (`dev_seam!`), never read by a shipped binary.
+            ablation: aterm_types::dev_seam!("ATERM_GPU_ABLATE_UNORM")
+                .and_then(|v| v.to_str().map(UnormAblation::from_seam))
+                .unwrap_or_default(),
+            last_gpu_time_serial: None,
+            #[cfg(wgpu_arm)]
+            wgpu_timer: None,
             frame_plan: Vec::new(),
             last_frame_load: crate::device_layer::FrameLoad::Load,
             last_frame_scissor: None,
@@ -7407,7 +7730,13 @@ impl GpuRenderer {
     /// Set a real bold face (`FaceId::BoldPrimary`) so SGR bold is not synthetic.
     /// Invalidates the atlas.
     pub fn set_bold_font_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.raster_changed(|cpu| cpu.set_bold_font(bytes))
+        self.set_bold_face(bytes, 0)
+    }
+
+    /// [`Self::set_bold_font_bytes`] for face `index` of `bytes` (a bold face
+    /// inside a collection, [`aterm_render::FaceRef::index`]).
+    pub fn set_bold_face(&mut self, bytes: &[u8], index: u32) -> Result<(), String> {
+        self.raster_changed(|cpu| cpu.set_bold_face(bytes, index))
     }
 
     /// Set a symbol fallback face (config `symbol_font`) from font bytes and
@@ -7419,7 +7748,13 @@ impl GpuRenderer {
     /// Set a real styled face (`slot` 0 = bold, 1 = italic, 2 = bold-italic) and
     /// invalidate the atlas.
     pub fn set_styled_font_bytes(&mut self, slot: usize, bytes: &[u8]) -> Result<(), String> {
-        self.raster_changed(|cpu| cpu.set_styled_font_bytes(slot, bytes))
+        self.set_styled_face(slot, bytes, 0)
+    }
+
+    /// [`Self::set_styled_font_bytes`] for face `index` of `bytes` (a styled
+    /// face inside a collection, [`aterm_render::FaceRef::index`]).
+    pub fn set_styled_face(&mut self, slot: usize, bytes: &[u8], index: u32) -> Result<(), String> {
+        self.raster_changed(|cpu| cpu.set_styled_face(slot, bytes, index))
     }
 
     /// Enable/disable synthetic bold/italic (`font_synthetic_style`). The atlas
@@ -7444,6 +7779,21 @@ impl GpuRenderer {
     /// invalidated only on a real change.
     pub fn set_config_emoji_font(&mut self, path: Option<&str>) {
         self.raster_changed(|cpu| cpu.set_config_emoji_font(path));
+    }
+
+    /// Install the display layer (`display_font`, [`Renderer::set_display_faces`])
+    /// and invalidate the atlas when it changed. The grid never changes with it.
+    ///
+    /// # Errors
+    ///
+    /// A bundled face that does not parse; the layer is left as it was.
+    pub fn set_display_faces(&mut self, ids: &[&str]) -> Result<(), String> {
+        let before = self.cpu.display_faces();
+        self.cpu.set_display_faces(ids)?;
+        if self.cpu.display_faces() != before {
+            self.invalidate_atlas();
+        }
+        Ok(())
     }
 
     /// Swap the primary face and invalidate the atlas. The host resizes the grid
@@ -7556,6 +7906,13 @@ impl GpuRenderer {
         let cpu = self.cpu.rebuild_from_admitted(px, self.theme)?;
         let ctx = GpuContext::new()?;
         Self::from_parts(ctx, cpu, self.font_family.clone(), self.theme)
+    }
+
+    /// What the wrapped sealed generation draws each style with. See
+    /// [`Renderer::drawn_faces`].
+    #[must_use]
+    pub fn drawn_faces(&self) -> Option<&aterm_render::DrawnFaces> {
+        self.cpu.drawn_faces()
     }
 
     /// The wrapped CPU face's real BOLD sibling of the primary family for the
@@ -7729,6 +8086,107 @@ impl GpuRenderer {
         self.last_frame_passes
     }
 
+    /// The latest drawn frame's shape: passes, per-stream instances, staged
+    /// bytes and the CPU build/stage split. Default before the first frame.
+    #[must_use]
+    pub fn frame_shape(&self) -> FrameShape {
+        self.frame_shape
+    }
+
+    /// The pass-economy ablation frame plans run under
+    /// ([`UnormAblation`]); [`UnormAblation::Off`] in every shipped binary.
+    #[must_use]
+    pub fn unorm_ablation(&self) -> UnormAblation {
+        self.ablation
+    }
+
+    /// Set the pass-economy ablation (the `ATERM_GPU_ABLATE_UNORM` seam's
+    /// programmatic twin, for the effects perf lane and tests). Compare a
+    /// window's frames under one mode only: give each mode its own window, so
+    /// each repaints what its own last frame left.
+    #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+    pub fn set_unorm_ablation(&mut self, ablation: UnormAblation) {
+        self.ablation = ablation;
+    }
+
+    /// The `crate::gpu_time` serial of the latest present this renderer timed:
+    /// look its GPU time up with [`crate::gpu_time::settled`]. `None` when no
+    /// present was timed (no sink installed, or an arm with no GPU clock).
+    #[must_use]
+    pub fn last_gpu_time_serial(&self) -> Option<u64> {
+        self.last_gpu_time_serial
+    }
+
+    /// Whether this renderer's presents can report GPU time once a sink is
+    /// installed: the first-party Metal arm (command-buffer clocks) and a wgpu
+    /// device granted `TIMESTAMP_QUERY` can; the GL arm and a wgpu device
+    /// without timestamps cannot.
+    #[must_use]
+    pub fn gpu_time_supported(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        let metal = self.metal_armed;
+        #[cfg(not(target_os = "macos"))]
+        let metal = false;
+        #[cfg(gl_arm)]
+        let gl = self.gl_armed;
+        #[cfg(not(gl_arm))]
+        let gl = false;
+        #[cfg(wgpu_arm)]
+        let timestamps = self
+            .ctx
+            .device
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY);
+        #[cfg(not(wgpu_arm))]
+        let timestamps = false;
+        metal || (!gl && timestamps)
+    }
+
+    /// Settle what GPU-time readbacks have landed without presenting again.
+    /// The Metal arm reports from completion handlers and needs no poll; the
+    /// wgpu arm maps its timestamp readbacks and harvests them here (and at
+    /// each timed present).
+    pub fn poll_gpu_time(&mut self) {
+        #[cfg(wgpu_arm)]
+        if let Some(timer) = self.wgpu_timer.as_mut() {
+            timer.harvest(&self.ctx.device);
+        }
+    }
+
+    /// Open a `crate::gpu_time` frame for the wgpu present about to encode,
+    /// building the clock on first need; `None` serial when no sink listens or
+    /// the device has no timestamp queries.
+    #[cfg(wgpu_arm)]
+    fn wgpu_gpu_time_begin(&mut self) {
+        self.last_gpu_time_serial = None;
+        if !crate::gpu_time::sink_installed() {
+            return;
+        }
+        if self.wgpu_timer.is_none() {
+            self.wgpu_timer =
+                crate::wgpu_timer::WgpuGpuTimer::new(&self.ctx.device, &self.ctx.queue);
+        }
+        if let Some(timer) = self.wgpu_timer.as_mut() {
+            self.last_gpu_time_serial = timer.begin(&self.ctx.device);
+        }
+    }
+
+    /// The wgpu present returned: resolve and map its timestamps, seal its
+    /// frame.
+    #[cfg(wgpu_arm)]
+    fn wgpu_gpu_time_finish(&mut self) {
+        if let Some(timer) = self.wgpu_timer.as_mut() {
+            timer.finish(&self.ctx.device, &self.ctx.queue);
+        }
+    }
+
+    /// Timestamp writes for one wgpu pass of a timed present (`None` when no
+    /// present is being timed).
+    #[cfg(wgpu_arm)]
+    fn wgpu_pass_timestamps(&self) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        self.wgpu_timer.as_ref()?.pass_writes()
+    }
+
     /// Cell size (pixels), straight from the CPU renderer so geometry matches.
     pub fn cell_size(&self) -> (usize, usize) {
         self.cpu.cell_size()
@@ -7848,8 +8306,10 @@ impl GpuRenderer {
         }
         // The launch's first-frame warm may be compiling `cell.metal` on its
         // worker right now; wait for it (bounded) so the compile below is a
-        // cache hit instead of a duplicate.
-        crate::metal::warm::FIRST_FRAME.await_cell();
+        // cache hit instead of a duplicate. The arm's later compiles and
+        // builds wait the same way (`library`, `pso`, `present_pso`).
+        crate::metal::warm::FIRST_FRAME
+            .await_item(crate::metal::warm::WarmItem::Library(ShaderLibrary::Cell));
         match MetalArmLive::new(self.ctx.metal_loss_latch_or_wire()) {
             Ok(live) => {
                 self.metal_arm = Some(MetalArmCell::new(live));
@@ -9142,12 +9602,19 @@ impl GpuRenderer {
     /// [`aterm_core::terminal::Terminal::cell_frame_into`]) on the GPU and read it
     /// back, with no `&Terminal` borrow. `tray` bakes the settings card into the
     /// offscreen before readback.
+    ///
+    /// # Panics
+    /// Panics if the shared framebuffer size limit rejects the input. Artifact
+    /// producers should use [`Self::try_render_input`] to report that error.
     pub fn render_input(
         &mut self,
         win: &mut WindowGpu,
         input: &RenderInput,
         tray: Option<TrayQuad<'_>>,
     ) -> Frame {
+        self.cpu
+            .checked_frame_size(input.rows, input.cols)
+            .expect("renderable framebuffer");
         let (texture, width, height) = self.render_input_target(win, input, tray);
         #[cfg(gl_arm)]
         if self.last_frame_arm_gl {
@@ -9203,7 +9670,8 @@ impl GpuRenderer {
         }
     }
 
-    /// Fallible twin of [`Self::render_input`].
+    /// Fallible twin of [`Self::render_input`], rejecting excessive dimensions
+    /// before changing window tracking or encoding a frame.
     ///
     /// Artifact producers (`image`, SIGUSR1 snapshots) must use this: a device
     /// loss or map failure is a capture failure, not a black frame. The
@@ -9214,6 +9682,7 @@ impl GpuRenderer {
         input: &RenderInput,
         tray: Option<TrayQuad<'_>>,
     ) -> Result<Frame, String> {
+        self.cpu.checked_frame_size(input.rows, input.cols)?;
         let (texture, width, height) = self.render_input_target(win, input, tray);
         #[cfg(gl_arm)]
         if self.last_frame_arm_gl {
@@ -9510,6 +9979,10 @@ impl GpuRenderer {
         t: &TrayQuad<'_>,
         tray_uploads: &mut u64,
     ) -> Result<(), String> {
+        debug_assert!(
+            t.scrim.is_none(),
+            "the Metal arm draws no tray scrim (`TrayQuad::scrim`): macOS shows none"
+        );
         let unchanged = win
             .metal_tray_card
             .as_ref()
@@ -9638,12 +10111,12 @@ impl GpuRenderer {
             ]
         });
         let scissor = if let Some([x0, y0, x1, y1]) = bbox {
-            let d = ((2.0 * self.bloom_radius + 1.0) * BLOOM_DOWNSCALE as f32).ceil() as u32 + 1;
+            let d = aterm_render::bloom::reach_px(self.bloom_radius);
             Some([
                 x0.saturating_sub(d),
                 y0.saturating_sub(d),
-                (x1 + d).min(fw),
-                (y1 + d).min(fh),
+                x1.saturating_add(d).min(fw),
+                y1.saturating_add(d).min(fh),
             ])
         } else {
             clip.map(|_| [0, 0, fw, fh])
@@ -10180,6 +10653,64 @@ impl GpuRenderer {
         source_crop: Option<PresentCrop>,
         effects_transport_shift_y: i32,
     ) -> Result<(), SurfacePresentFailure> {
+        // The body opens a GPU-time frame once the drawable is acquired; every
+        // exit seals it here, so a refused present still settles.
+        let out = self.metal_present_input_with_crop_timed(
+            win,
+            surf,
+            input,
+            invert,
+            overlay,
+            tray,
+            source_crop,
+            effects_transport_shift_y,
+        );
+        self.metal_seal_gpu_frame();
+        out
+    }
+
+    /// Open a `crate::gpu_time` frame on the armed session for the present
+    /// about to encode (only when a sink listens), and remember its serial.
+    /// The arm is minted lazily by the first armed frame; a timed present
+    /// mints it here instead, so its first Submit A is a part too.
+    #[cfg(target_os = "macos")]
+    fn metal_open_gpu_frame(&mut self) {
+        self.last_gpu_time_serial = None;
+        if !crate::gpu_time::sink_installed() || !self.metal_arm_ready() {
+            return;
+        }
+        self.last_gpu_time_serial = self
+            .metal_arm
+            .as_ref()
+            .and_then(|cell| cell.live_ref().session.open_gpu_frame());
+    }
+
+    /// Seal the open `crate::gpu_time` frame: command buffers committed after
+    /// this are not part of the present. A no-op when none is open.
+    #[cfg(target_os = "macos")]
+    fn metal_seal_gpu_frame(&self) {
+        if let Some(cell) = self.metal_arm.as_ref() {
+            cell.live_ref().session.seal_gpu_frame();
+        }
+    }
+
+    /// [`Self::metal_present_input_with_crop`]'s body.
+    #[cfg(target_os = "macos")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared swapchain seam's established tuple"
+    )]
+    fn metal_present_input_with_crop_timed(
+        &mut self,
+        win: &mut WindowGpu,
+        surf: &mut GpuSurface,
+        input: &RenderInput,
+        invert: bool,
+        overlay: Option<DropOverlay>,
+        tray: Option<TrayQuad<'_>>,
+        source_crop: Option<PresentCrop>,
+        effects_transport_shift_y: i32,
+    ) -> Result<(), SurfacePresentFailure> {
         let _pool = crate::metal::ffi::AutoreleasePool::new();
         let source_crop = self
             .resident_present_crop(input, source_crop)
@@ -10271,6 +10802,8 @@ impl GpuRenderer {
             }
         };
         let work_started = aterm_time::Instant::now();
+        // GPU time covers Submit A and Submit B (the caller seals after them).
+        self.metal_open_gpu_frame();
 
         // The armed frame encode. A mid-frame degrade leaves pixels on the wgpu
         // offscreen, so refuse this present; the next redraw re-arms or presents
@@ -10333,6 +10866,12 @@ impl GpuRenderer {
             u64::try_from(work_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             frame_slot_parked_ns,
         );
+        // Frame-slot parks are already excluded from work; exclude any late
+        // pending-ring park from the encode-only slice as well.
+        win.last_present_encode_ns = win.last_present_work_ns.saturating_sub(late_ring_parked_ns);
+        // The present's own command buffer (`presentDrawable:` only) draws
+        // nothing and is not part of its GPU time.
+        self.metal_seal_gpu_frame();
         // Present after the commit, then hold both handles for status polling;
         // never a blocking wait on the present path.
         let Some(cell) = self.metal_arm.as_mut() else {
@@ -10412,6 +10951,38 @@ impl GpuRenderer {
         effects_transport_shift_y: i32,
         destination: (u32, u32),
     ) -> Result<(), String> {
+        // As on glass: the body opens the GPU-time frame, every exit seals it.
+        let out = self.metal_present_virtual_with_crop_timed(
+            win,
+            input,
+            invert,
+            overlay,
+            tray,
+            source_crop,
+            effects_transport_shift_y,
+            destination,
+        );
+        self.metal_seal_gpu_frame();
+        out
+    }
+
+    /// [`Self::metal_present_virtual_with_crop`]'s body.
+    #[cfg(target_os = "macos")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the armed twin preserves the shared virtual-present seam's tuple"
+    )]
+    fn metal_present_virtual_with_crop_timed(
+        &mut self,
+        win: &mut WindowGpu,
+        input: &RenderInput,
+        invert: bool,
+        overlay: Option<DropOverlay>,
+        tray: Option<TrayQuad<'_>>,
+        source_crop: Option<PresentCrop>,
+        effects_transport_shift_y: i32,
+        destination: (u32, u32),
+    ) -> Result<(), String> {
         use crate::metal::ffi as mtl;
         let _pool = mtl::AutoreleasePool::new();
         let source_crop = self
@@ -10430,6 +11001,9 @@ impl GpuRenderer {
             win.virtual_target = Some(self.make_virtual_target(w, h));
         }
         let work_started = aterm_time::Instant::now();
+        // GPU time covers Submit A and Submit B; it is sealed before the wait
+        // and the oracle readback below, which are not present work.
+        self.metal_open_gpu_frame();
         // The armed frame encode. A mid-frame degrade leaves pixels on the wgpu
         // offscreen, so refuse this present.
         let (fw, fh) = self.encode_present_frame(win, input);
@@ -10495,6 +11069,14 @@ impl GpuRenderer {
             cfg!(not(wgpu_arm)),
             &target,
         )?;
+        self.metal_seal_gpu_frame();
+        // The encode, as the on-glass arm counts it: up to Submit B's commit,
+        // without the parks (which this path otherwise keeps in its work).
+        let encode_parked_ns = self.metal_arm.as_mut().map_or(0, |cell| {
+            let (slot, ring) = cell.live_mut().take_park_ns();
+            slot.saturating_add(ring)
+        });
+        win.last_present_encode_ns = elapsed_ns(work_started).saturating_sub(encode_parked_ns);
         if submitted.wait_outcome() != crate::metal::loss::CbOutcome::Completed {
             return Err("Submit B did not complete".to_owned());
         }
@@ -10825,13 +11407,12 @@ impl GpuRenderer {
                 ]
             });
             let scissor = if let Some([x0, y0, x1, y1]) = bbox {
-                let d =
-                    ((2.0 * self.bloom_radius + 1.0) * BLOOM_DOWNSCALE as f32).ceil() as u32 + 1;
+                let d = aterm_render::bloom::reach_px(self.bloom_radius);
                 Some([
                     x0.saturating_sub(d),
                     y0.saturating_sub(d),
-                    (x1 + d).min(fw),
-                    (y1 + d).min(fh),
+                    x1.saturating_add(d).min(fw),
+                    y1.saturating_add(d).min(fh),
                 ])
             } else {
                 clip.map(|_| [0, 0, fw, fh])
@@ -11247,6 +11828,64 @@ impl GpuRenderer {
         full_repaint: bool,
     ) -> Result<Vec<u8>, String> {
         use crate::metal::ffi as mtl;
+        self.metal_present_standalone_for_test(
+            win,
+            input,
+            (dw, dh),
+            (translucent, full_repaint),
+            crate::device_layer::TexelFormat::Bgra8Unorm,
+            |gpu, target| {
+                // Read the drawable (never presented — the test consumes it).
+                let live = gpu
+                    .metal_arm
+                    .as_mut()
+                    .ok_or("the arm is not live")?
+                    .live_mut();
+                let row = (dw * 4) as usize;
+                let rb = live
+                    .layer()
+                    .try_create_readback_buffer(
+                        "aterm-gpu metal readback",
+                        (row * dh as usize) as u64,
+                    )?
+                    .into_metal()
+                    .into_obj();
+                let mut cb = live.session.begin()?;
+                cb.copy_texture_to_buffer(target, dw as usize, dh as usize, &rb, row)?;
+                if cb.commit().wait_outcome() != crate::metal::loss::CbOutcome::Completed {
+                    return Err("the readback copy did not complete".to_owned());
+                }
+                // SAFETY: shared storage sized row * dh; the command buffer
+                // above is terminal.
+                let bgra = unsafe { mtl::buffer_bytes(&rb, row * dh as usize) };
+                let mut rgba = vec![0u8; bgra.len()];
+                for (dst, src) in rgba
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(bgra.as_chunks::<4>().0)
+                {
+                    *dst = [src[2], src[1], src[0], src[3]];
+                }
+                Ok(rgba)
+            },
+        )
+    }
+
+    /// [`Self::metal_present_bytes_with_scope_for_test`]'s present onto a
+    /// standalone drawable of `format` (an EDR window's `Rgba16Float` too),
+    /// handing the drawable to `read` once Submit B completed.
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) fn metal_present_standalone_for_test<T>(
+        &mut self,
+        win: &mut WindowGpu,
+        input: &RenderInput,
+        (dw, dh): (u32, u32),
+        (translucent, full_repaint): (bool, bool),
+        format: crate::device_layer::TexelFormat,
+        read: impl FnOnce(&mut Self, &crate::metal::resources::SealedTexture) -> Result<T, String>,
+    ) -> Result<T, String> {
+        use crate::metal::ffi as mtl;
         let _pool = mtl::AutoreleasePool::new();
         if full_repaint {
             win.present_prev = None;
@@ -11269,7 +11908,7 @@ impl GpuRenderer {
             )
         };
         let config = crate::metal::swapchain::SwapchainConfig {
-            format: mtl::PixelFormat::Bgra8Unorm,
+            format: format.metal(),
             width: dw as usize,
             height: dh as usize,
             // The test's copy-out (the reconcile's COPY_SRC arm).
@@ -11293,7 +11932,7 @@ impl GpuRenderer {
             None,
             (fw, fh),
             (dw, dh),
-            crate::device_layer::TexelFormat::Bgra8Unorm,
+            format,
             translucent,
             false,
             true,
@@ -11302,36 +11941,38 @@ impl GpuRenderer {
         if submitted.wait_outcome() != crate::metal::loss::CbOutcome::Completed {
             return Err("Submit B did not complete".to_owned());
         }
-        // Read the drawable (never presented — the test consumes it).
-        let live = self
-            .metal_arm
-            .as_mut()
-            .ok_or("the arm is not live")?
-            .live_mut();
-        let row = (dw * 4) as usize;
-        let rb = live
-            .layer()
-            .try_create_readback_buffer("aterm-gpu metal readback", (row * dh as usize) as u64)?
-            .into_metal()
-            .into_obj();
-        let mut cb = live.session.begin()?;
-        cb.copy_texture_to_buffer(&target, dw as usize, dh as usize, &rb, row)?;
-        if cb.commit().wait_outcome() != crate::metal::loss::CbOutcome::Completed {
-            return Err("the readback copy did not complete".to_owned());
+        read(self, &target)
+    }
+
+    /// Test probe: every library and PSO this renderer's Metal arm has built,
+    /// each PSO keyed by the colour attachment it resolved to — the identity
+    /// Metal's pipeline cache keys on, and so what a warm must have built for
+    /// the build here to be a cache hit.
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) fn metal_built_for_test(&self) -> Vec<crate::metal::warm::WarmItem> {
+        use crate::metal::warm::WarmItem;
+        let Some(cell) = self.metal_arm.as_ref() else {
+            return Vec::new();
+        };
+        let live = cell.live_ref();
+        let mut built = vec![WarmItem::Library(ShaderLibrary::Cell)];
+        built.extend(live.libs.iter().map(|(lib, _)| WarmItem::Library(*lib)));
+        for (i, pso) in live.psos.iter().enumerate() {
+            if pso.is_some() {
+                let row = pipeline_table::ALL_PIPELINES[i];
+                built.push(WarmItem::pipeline(
+                    row,
+                    crate::metal::ffi::PixelFormat::Bgra8Unorm,
+                ));
+            }
         }
-        // SAFETY: shared storage sized row * dh; the command buffer above is
-        // terminal.
-        let bgra = unsafe { mtl::buffer_bytes(&rb, row * dh as usize) };
-        let mut rgba = vec![0u8; bgra.len()];
-        for (dst, src) in rgba
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .zip(bgra.as_chunks::<4>().0)
-        {
-            *dst = [src[2], src[1], src[0], src[3]];
+        for ((row, present), _) in &live.present_psos {
+            let item = WarmItem::pipeline(*row, *present);
+            if !built.contains(&item) {
+                built.push(item);
+            }
         }
-        Ok(rgba)
+        built
     }
 
     /// Test hook: the wgpu `present_to_view` with a translucent
@@ -11570,6 +12211,7 @@ impl GpuRenderer {
         let mut enc = crate::device_layer::FrameEncoder::wgpu(
             &self.ctx.device,
             &self.ctx.queue,
+            None,
             "aterm-gpu m1b scroll shift",
         );
         let off_copy = crate::device_layer::FrameCopyTexture::Wgpu(&off_tex);
@@ -11610,7 +12252,7 @@ impl GpuRenderer {
     }
 
     /// Create an on-screen presentation surface for `target` (e.g. an
-    /// `Arc<winit::window::Window>`) at the given pixel size, on the same
+    /// `Arc<aterm_window::window::Window>`) at the given pixel size, on the same
     /// instance and adapter as the offscreen renderer.
     ///
     /// The swapchain format is non-sRGB (preferring `Bgra8Unorm`), so the raw
@@ -12803,6 +13445,9 @@ impl GpuRenderer {
         source_crop: Option<PresentCrop>,
         effects_transport_shift_y: i32,
     ) -> Result<(), SurfacePresentFailure> {
+        self.cpu
+            .checked_frame_size(input.rows, input.cols)
+            .map_err(|_| SurfacePresentFailure::Validation)?;
         win.begin_surface_present();
         // After a disarm, a previously armed window still holds its Metal
         // swapchain, whose layer sits above the wgpu layer. Drop it at this
@@ -12846,6 +13491,16 @@ impl GpuRenderer {
         }
         #[cfg(wgpu_arm)]
         {
+            // A minimized Windows window cannot be seen, and DXGI acquires and
+            // presents to it all the same: refuse before any compose, so the
+            // frontend parks it as the Metal arm's nil drawable parks an occluded
+            // macOS window. aterm-window reports a minimize as `Occluded`. A
+            // present something waits on still goes through, as it did before
+            // the park: a capture's (`ctl image`/`window`) and a recording's.
+            #[cfg(windows)]
+            if win.parks_while_minimized() {
+                return Err(SurfacePresentFailure::Occluded);
+            }
             let source_crop = self
                 .resident_present_crop(input, source_crop)
                 .map_err(|()| SurfacePresentFailure::Validation)?;
@@ -12929,6 +13584,7 @@ impl GpuRenderer {
             );
             win.last_present_work_ns =
                 u64::try_from(work_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            win.last_present_encode_ns = win.last_present_work_ns;
             frame.present();
             Ok(())
         }
@@ -12977,6 +13633,8 @@ impl GpuRenderer {
         // survives it on every frame.
         let tray_over_copy = tray.is_some() || win.tray_overlay.is_some();
         let frac = input.scroll_frac_px;
+        // GPU time: every timed pass from the offscreen encode to the blit.
+        self.wgpu_gpu_time_begin();
         let (fw, fh) = self.encode_present_frame(win, input);
         win.resident_input_effects_transport_shift_y = effects_transport_shift_y;
 
@@ -13143,7 +13801,7 @@ impl GpuRenderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self.wgpu_pass_timestamps(),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -13225,6 +13883,7 @@ impl GpuRenderer {
             );
         }
         self.ctx.queue.submit([enc.finish()]);
+        self.wgpu_gpu_time_finish();
     }
 
     /// Sub-row scroll on the present copy (wgpu arm): translate the grid band
@@ -13753,6 +14412,7 @@ impl GpuRenderer {
             win.virtual_presented_input_epoch = win.resident_input_epoch;
             win.last_present_work_ns =
                 u64::try_from(work_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            win.last_present_encode_ns = win.last_present_work_ns;
             true
         }
     }
@@ -14155,76 +14815,28 @@ impl GpuRenderer {
     /// row gate, so the halo spreads from the whole comet on scissored frames.
     /// Returns `(count, bbox, extract_first)`; `count == 0` means no glow.
     ///
-    /// Half-res stability: a quad thinner than one half-res texel
-    /// ([`BLOOM_DOWNSCALE`] px) covers a texel centre only at some alignments,
-    /// so thin hairlines would blink in the halo. When any quad is that thin, a
-    /// second copy of the set is appended with thin axes widened to one texel and
-    /// colour scaled down to conserve energy. The extract draws
+    /// The set, its half-res stability copy of thin quads and the box are
+    /// [`aterm_render::bloom::source_quads_into`]'s, the law the CPU twin
+    /// blooms the Settings preview by. The extract draws
     /// `extract_first..extract_first + count`; the crowns draw `0..count`.
-    /// Without thin quads `extract_first == 0`.
     fn build_bloom_glow(&mut self, input: &RenderInput) -> (u32, Option<[u32; 4]>, u32) {
-        let rows = input.rows;
-        let ds = BLOOM_DOWNSCALE as u16;
         // Reuse the resident scratch (taken, cleared, restored below).
+        let mut quads = std::mem::take(&mut self.bloom_quad_scratch);
+        let (bbox, extract_first) =
+            aterm_render::bloom::source_quads_into(&input.cursor_glow_add, input.rows, &mut quads);
         let mut v = std::mem::take(&mut self.bloom_glow_scratch);
         v.clear();
-        // Window-space glow bounding box for the composite scissor (x1/y1
-        // exclusive). Thin axes use their widened extent; over-covering is safe.
-        let (mut bx0, mut by0, mut bx1, mut by1) = (u16::MAX, u16::MAX, 0u16, 0u16);
-        // Whether any pushed quad is thinner than one half-res texel, folded in
-        // the push loop (the instance stores `q.w`/`q.h` verbatim).
-        let mut any_thin = false;
-        for q in &input.cursor_glow_add {
-            // Mirror the GPU aurora emission: skip quads past the grid's last row.
-            if (q.row as usize) >= rows {
-                continue;
-            }
-            any_thin |= (q.w > 0 && q.w < ds) || (q.h > 0 && q.h < ds);
-            // Effect-stream quads are window-absolute; no pad offset.
-            let rx = q.x;
-            let ry = q.y;
-            let ew = if q.w > 0 { q.w.max(ds) } else { 0 };
-            let eh = if q.h > 0 { q.h.max(ds) } else { 0 };
-            bx0 = bx0.min(rx);
-            by0 = by0.min(ry);
-            bx1 = bx1.max(rx.saturating_add(ew));
-            by1 = by1.max(ry.saturating_add(eh));
-            v.push(GlowInstance::of([rx, ry, q.w, q.h], q));
-        }
-        let n = v.len();
-        let extract_first = if any_thin {
-            for i in 0..n {
-                let mut inst = v[i];
-                let [x, y, w0, h0] = inst.rect;
-                let (w1, num_w, den_w) = if w0 > 0 && w0 < ds {
-                    (ds, u32::from(w0), u32::from(ds))
-                } else {
-                    (w0, 1, 1)
-                };
-                let (h1, num_h, den_h) = if h0 > 0 && h0 < ds {
-                    (ds, u32::from(h0), u32::from(ds))
-                } else {
-                    (h0, 1, 1)
-                };
-                let (num, den) = (num_w * num_h, den_w * den_h);
-                if den > 1 {
-                    // BOTH ends of the ramp scale by the same area ratio, so
-                    // the widened quad's gradient is the thin quad's, dimmed.
-                    for c in inst.color[..3]
-                        .iter_mut()
-                        .chain(inst.color2[..3].iter_mut())
-                    {
-                        *c = ((u32::from(*c) * num + den / 2) / den) as u8;
-                    }
-                }
-                inst.rect = [x, y, w1, h1];
-                v.push(inst);
-            }
-            n as u32
+        // Effect-stream quads are window-absolute; no pad offset.
+        v.extend(
+            quads
+                .iter()
+                .map(|q| GlowInstance::of([q.x, q.y, q.w, q.h], q)),
+        );
+        let n = if extract_first > 0 {
+            extract_first
         } else {
-            0
-        };
-        let n = n as u32;
+            v.len()
+        } as u32;
         #[cfg(wgpu_arm)]
         if n > 0 {
             let device = &self.ctx.device;
@@ -14233,10 +14845,10 @@ impl GpuRenderer {
                 .bloom_glow
                 .upload(device, queue, aterm_bits::cast_slice(&v));
         }
-        // Hand the (grown) allocation back for the next frame to reuse.
+        // Hand the (grown) allocations back for the next frame to reuse.
         self.bloom_glow_scratch = v;
-        let bbox = (n > 0).then_some([bx0 as u32, by0 as u32, bx1 as u32, by1 as u32]);
-        (n, bbox, extract_first)
+        self.bloom_quad_scratch = quads;
+        (n, bbox, extract_first as u32)
     }
 
     /// (Re)create this window's [`PresentOffscreen`] when absent or resized, at
@@ -14335,7 +14947,7 @@ impl GpuRenderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self.wgpu_pass_timestamps(),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -14360,7 +14972,7 @@ impl GpuRenderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self.wgpu_pass_timestamps(),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -14382,12 +14994,11 @@ impl GpuRenderer {
             });
             let (w, h) = dims;
             let scissor = if let Some([x0, y0, x1, y1]) = bbox {
-                let d =
-                    ((2.0 * self.bloom_radius + 1.0) * BLOOM_DOWNSCALE as f32).ceil() as u32 + 1;
+                let d = aterm_render::bloom::reach_px(self.bloom_radius);
                 let sx0 = x0.saturating_sub(d);
                 let sy0 = y0.saturating_sub(d);
-                let sx1 = (x1 + d).min(w);
-                let sy1 = (y1 + d).min(h);
+                let sx1 = x1.saturating_add(d).min(w);
+                let sy1 = y1.saturating_add(d).min(h);
                 Some([sx0, sy0, sx1, sy1])
             } else {
                 // No bbox: a pane clip still bounds the composite.
@@ -14909,7 +15520,7 @@ impl GpuRenderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self.wgpu_pass_timestamps(),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -15860,6 +16471,83 @@ impl GpuRenderer {
         self.tray_uploads += 1;
     }
 
+    /// Make the scrim's resident fill ([`TrayScrimLayer`]) `scrim.rgba` and
+    /// place it over every pixel of an `fb`-sized target from `scrim.top` down.
+    /// Returns that footprint (`[x0, y0, x1, y1]`), or `None` when it covers
+    /// nothing. Four bytes are uploaded only when the colour changes.
+    #[cfg(wgpu_arm)]
+    fn place_tray_scrim(&mut self, scrim: TrayScrim, (fw, fh): (u32, u32)) -> Option<[u32; 4]> {
+        let top = scrim.top.min(fh);
+        if top >= fh || fw == 0 {
+            return None;
+        }
+        let fresh = self.tray_scrim.is_none();
+        if fresh {
+            let texture = self.ctx.device_layer().create_texture_2d(
+                "aterm-gpu tray scrim",
+                crate::device_layer::TexelFormat::Rgba8Unorm,
+                1,
+                1,
+                crate::device_layer::TexUsage::UPLOADED_SAMPLED,
+                None,
+            );
+            let view = texture
+                .wgpu()
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let uniform = self
+                .ctx
+                .device_layer()
+                .create_uniform_buffer(
+                    "aterm-gpu tray scrim placement uniform",
+                    std::mem::size_of::<TrayUniform>() as u64,
+                )
+                .into_wgpu();
+            let bind = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("aterm-gpu tray scrim bg"),
+                    layout: &self.tray_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.tray_sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: uniform.as_entire_binding(),
+                        },
+                    ],
+                });
+            self.tray_scrim = Some(TrayScrimLayer {
+                texture,
+                bind,
+                uniform,
+                rgba: scrim.rgba,
+            });
+        }
+        let layer = self.tray_scrim.as_mut().expect("tray_scrim set above");
+        if fresh || layer.rgba != scrim.rgba {
+            self.ctx
+                .device_layer()
+                .upload_texture_full(&layer.texture, &scrim.rgba, 4, 1, 1);
+            layer.rgba = scrim.rgba;
+        }
+        let want = TrayUniform {
+            rect: [0.0, top as f32, fw as f32, (fh - top) as f32],
+            fb: [fw as f32, fh as f32],
+            _pad: [0.0, 0.0],
+        };
+        self.ctx
+            .queue
+            .write_buffer(&layer.uniform, 0, aterm_bits::bytes_of(&want));
+        Some([0, top, fw, fh])
+    }
+
     /// Composite the settings-card tray into the offscreen, so readback and the
     /// on-glass blit both show it. A separate encoder and submit after the frame,
     /// so queue order puts the tray on top.
@@ -15885,6 +16573,9 @@ impl GpuRenderer {
         // Written outside any scissor: invalidate the present copy's sync
         // (`note_offscreen_written`).
         note_offscreen_written(win, None, (fw, fh));
+        let scrim = tray
+            .scrim
+            .and_then(|scrim| self.place_tray_scrim(scrim, (fw, fh)));
         let want = TrayUniform {
             rect: [
                 tray.dx as f32,
@@ -15925,7 +16616,7 @@ impl GpuRenderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self.wgpu_pass_timestamps(),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -15934,6 +16625,13 @@ impl GpuRenderer {
                 .as_ref()
                 .expect("ensure_tray_overlay set it above");
             pass.set_pipeline(&self.tray_pipelines[&format]);
+            // The scrim first, so the card composites over it.
+            if scrim.is_some()
+                && let Some(layer) = self.tray_scrim.as_ref()
+            {
+                pass.set_bind_group(0, &layer.bind, &[]);
+                pass.draw(0..4, 0..1);
+            }
             pass.set_bind_group(0, &t.bind, &[]);
             pass.draw(0..4, 0..1); // 4-vert triangle-strip quad
         }
@@ -15989,6 +16687,14 @@ impl GpuRenderer {
             tray.dy.saturating_add(tray.ph).min(fh),
         ];
         win.present_offscreen_fx = union_rect_opt(win.present_offscreen_fx, Some(rect), (fw, fh));
+        // The scrim's footprint too, so the next compose erases a closed one.
+        let scrim = tray
+            .scrim
+            .and_then(|scrim| self.place_tray_scrim(scrim, (fw, fh)));
+        if let Some(rect) = scrim {
+            win.present_offscreen_fx =
+                union_rect_opt(win.present_offscreen_fx, Some(rect), (fw, fh));
+        }
         // (4) The copy's view and the overlay bind; `LoadOp::Load` keeps the
         //     composed frame under the card.
         let po = win
@@ -16011,11 +16717,18 @@ impl GpuRenderer {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes: self.wgpu_pass_timestamps(),
             occlusion_query_set: None,
             multiview_mask: None,
         });
         pass.set_pipeline(&self.tray_pipelines[&format]);
+        // The scrim first, so the card composites over it.
+        if scrim.is_some()
+            && let Some(layer) = self.tray_scrim.as_ref()
+        {
+            pass.set_bind_group(0, &layer.bind, &[]);
+            pass.draw(0..4, 0..1);
+        }
         pass.set_bind_group(0, &t.bind, &[]);
         pass.draw(0..4, 0..1); // 4-vert triangle-strip quad
     }
@@ -16056,14 +16769,16 @@ impl GpuRenderer {
 
         // Expected dims at the padded size (`+ 2*pad`), to cross-check the cached
         // frame.
-        let (cw, ch) = self.cpu.cell_size();
-        let pad2 = 2 * self.cpu.pad();
-        let head = self.cpu.head();
+        let (_, ch) = self.cpu.cell_size();
         // Clamp with the helper that sizes the cached frame, so oversized grids
         // still match.
+        let (raw_w, raw_h) = self
+            .cpu
+            .checked_frame_size(input.rows, input.cols)
+            .expect("renderable framebuffer");
         let (w, h) = (
-            self.clamp_fb_dim((input.cols * cw + pad2) as u32) as usize,
-            self.clamp_fb_dim((input.rows * ch + pad2 + head) as u32) as usize,
+            self.clamp_fb_dim(raw_w as u32) as usize,
+            self.clamp_fb_dim(raw_h as u32) as usize,
         );
 
         // GATE-HIT: a prior frame exists, it is pixel-identical to this input,
@@ -16249,9 +16964,22 @@ impl GpuRenderer {
         );
     }
 
-    /// Per-frame instance-total diagnostics, shared by the wgpu and armed Metal
-    /// tails.
-    fn record_frame_instance_totals(&mut self) {
+    /// Per-frame instance-total diagnostics and the [`FrameShape`], shared by
+    /// the wgpu, armed Metal and GL tails once their frame drew.
+    fn record_frame_instance_totals(&mut self, passes: u32, build_ns: u64, stage_ns: u64) {
+        let mut shape = FrameShape {
+            passes,
+            build_ns,
+            stage_ns,
+            ablation: self.ablation,
+            ..FrameShape::default()
+        };
+        for id in StreamId::ALL {
+            let (bytes, count) = self.inst.stream_bytes(id);
+            shape.instances[id as usize] = count;
+            shape.instance_bytes = shape.instance_bytes.saturating_add(bytes.len() as u64);
+        }
+        self.frame_shape = shape;
         self.last_bg_instances = self.inst.bg.len();
         self.last_instances = self.inst.bg.len()
             + self.inst.image_below_bg.len()
@@ -16307,6 +17035,9 @@ impl GpuRenderer {
         input: &RenderInput,
         scope: &RepaintScope,
     ) -> (u32, u32) {
+        // The frame shape's CPU split: instance building runs from here to the
+        // arm's tail (`FrameShape::build_ns`).
+        let build_started = aterm_time::Instant::now();
         // Take the deferred band shift unconditionally so a plan never outlives
         // its present: the armed tail records it into Submit A, any other tail
         // drops it (a degrade re-encodes Full).
@@ -16330,19 +17061,15 @@ impl GpuRenderer {
         // identically: the framebuffer grows by `2·pad` per axis and cell origins
         // shift by `(pad, grid_top)`. Keeps CPU/GPU and image/window parity.
         let pad = self.cpu.pad();
-        // Chrome headroom above the padded grid: the framebuffer grows by `head`
-        // on Y.
-        let head = self.cpu.head();
         // The grid's Y origin from the CPU renderer, so a top-only `pad_top`
         // override (grid_top == pad_top + head) matches across backends.
         let grid_top = self.cpu.grid_top();
         // Clamp the padded framebuffer with `clamp_fb_dim` here so the texture,
         // projection uniform, scissor rects and stored `Offscreen { w, h }` all
         // agree, and the blit source matches the equally clamped swapchain.
-        let fb_w = (cols * cw + 2 * pad) as u32;
-        let fb_h = (rows * ch + 2 * pad + head) as u32;
-        let w = self.clamp_fb_dim(fb_w);
-        let h = self.clamp_fb_dim(fb_h);
+        let (fb_w, fb_h) = self.cpu.frame_size(rows, cols);
+        let w = self.clamp_fb_dim(fb_w as u32);
+        let h = self.clamp_fb_dim(fb_h as u32);
         // The chrome rows this offscreen holds, stamped with the pixels for the
         // present's blit (`WindowGpu::chrome_y1`).
         let chrome = self.cpu.chrome_extent_px(h as usize);
@@ -16358,7 +17085,7 @@ impl GpuRenderer {
         // `break` gated on `clip_cols`, true only when the width was clamped; the
         // `+ rcw` margin keeps a boundary cell's bearing.
         let vis_rows = (h as usize / ch).saturating_add(2).min(rows);
-        let clip_cols = w < fb_w;
+        let clip_cols = (w as usize) < fb_w;
         // Per-cell `(origin, advance, run box)`: `c · rcw` on a uniform row, the
         // cell's own run on a mixed DEC line-size row (see `row_uniform`).
         let place = |r: usize, c: usize, row_uniform: bool, rcw: usize| {
@@ -17056,6 +17783,18 @@ impl GpuRenderer {
                     });
                 }
             }
+            // Materialized wide halves can remain selected after their logical
+            // span is clipped out; only an empty frame selection skips the hit.
+            let may_have_sel = input.any_selection();
+            let has_pane_defaults = input
+                .default_bg_spans
+                .get(r)
+                .is_some_and(|spans| !spans.is_empty());
+            let row_has_below_bg_images = input.images.get(r).is_some_and(|imgs| {
+                imgs.iter().any(|(_, image)| {
+                    aterm_render::kitty_image_is_below_non_default_bg(image.image.z_index)
+                })
+            });
             for (c, cell) in cells.iter().take(cols).enumerate() {
                 // This cell's origin, advance and (mixed rows) run box.
                 let (cx, ccw, run) = place(r, c, row_uniform, rcw);
@@ -17068,15 +17807,23 @@ impl GpuRenderer {
                     continue;
                 }
                 let x0u = sat_pos_u16(pad + cx);
-                // A lead cell is wide iff the NEXT cell is its continuation.
-                let is_wide_lead = cells.get(c + 1).is_some_and(|n| n.wide);
                 // Which selection paints this cell; its index selects the owning
                 // pane's colour (CPU `render_row_bg`'s `resolve`).
-                let hit = input.selection_hit(r, c, is_wide_lead, cell.wide);
+                let hit = if may_have_sel {
+                    // A lead cell is wide iff the NEXT cell is its continuation.
+                    let is_wide_lead = cells.get(c + 1).is_some_and(|n| n.wide);
+                    input.selection_hit(r, c, is_wide_lead, cell.wide)
+                } else {
+                    None
+                };
                 let selected = hit.is_some();
                 let theme_selection = selection_palette.at_hit(hit).bg;
                 let cell_bg = aterm_render::rgb_to_u32(cell.bg);
-                let default_bg = aterm_render::resolved_default_bg_at(input, r, c, self.theme.bg);
+                let default_bg = if has_pane_defaults {
+                    aterm_render::resolved_default_bg_at(input, r, c, self.theme.bg)
+                } else {
+                    frame_bg
+                };
                 // Under a wallpaper an unselected default-bg cell pushes no quad
                 // (CPU `resolve` None arm).
                 if wallpaper_on && !selected && cell_bg == default_bg {
@@ -17116,9 +17863,11 @@ impl GpuRenderer {
                 // Kitty's deepest z tier sits below selected and non-default-bg
                 // cells but above the default clear, so repaint only those
                 // covering backgrounds after the image stream.
-                if input.images_at(r, c).iter().any(|(_, image)| {
-                    aterm_render::kitty_image_is_below_non_default_bg(image.image.z_index)
-                }) && (selected || cell_bg != default_bg)
+                if row_has_below_bg_images
+                    && (selected || cell_bg != default_bg)
+                    && input.images_at(r, c).iter().any(|(_, image)| {
+                        aterm_render::kitty_image_is_below_non_default_bg(image.image.z_index)
+                    })
                 {
                     self.inst.image_bg_cover.push(instance);
                 }
@@ -17129,10 +17878,6 @@ impl GpuRenderer {
             // selected-image arm keeps Kitty's `deepest image < selection`
             // order for an image in an unmaterialized cell.
             let materialized = cells.len().min(cols);
-            let has_pane_defaults = input
-                .default_bg_spans
-                .get(r)
-                .is_some_and(|spans| !spans.is_empty());
             let selection_reaches_tail = input
                 .selection_row_span(r)
                 .is_some_and(|(_, end)| usize::from(end) >= materialized);
@@ -17147,11 +17892,18 @@ impl GpuRenderer {
                         continue;
                     }
                     // An unmaterialized cell holds no wide lead or continuation.
-                    let hit = input.selection_hit(r, c, false, false);
+                    let hit = if selection_reaches_tail {
+                        input.selection_hit(r, c, false, false)
+                    } else {
+                        None
+                    };
                     let selected = hit.is_some();
                     let theme_selection = selection_palette.at_hit(hit).bg;
-                    let default_bg =
-                        aterm_render::resolved_default_bg_at(input, r, c, self.theme.bg);
+                    let default_bg = if has_pane_defaults {
+                        aterm_render::resolved_default_bg_at(input, r, c, self.theme.bg)
+                    } else {
+                        frame_bg
+                    };
                     let color = if selected {
                         rgb4_u32(theme_selection)
                     } else if wallpaper_on {
@@ -17184,6 +17936,7 @@ impl GpuRenderer {
                     // still open and contiguous at the seam.
                     push_bg_run(bg_inst, &mut bg_run, bg_y, bg_h, bx, bw, color);
                     if selected
+                        && row_has_below_bg_images
                         && input.images_at(r, c).iter().any(|(_, image)| {
                             aterm_render::kitty_image_is_below_non_default_bg(image.image.z_index)
                         })
@@ -17239,6 +17992,9 @@ impl GpuRenderer {
                 }
             }
             let raster_split = raster.and_then(|m| m.split);
+            // The last cell's (fg, bg-under, run) key and the glyph colours it resolved to.
+            type FgMemo = ((u32, [u8; 3], Option<usize>), ([u8; 4], [u8; 4]));
+            let mut fg_memo: Option<FgMemo> = None;
             for (c, cell) in cells.iter().take(cols).enumerate() {
                 // Same per-column placement as the bg loop above (uniform rows keep
                 // `c · rcw`), so a cell's glyph lands on its own fill.
@@ -17316,28 +18072,43 @@ impl GpuRenderer {
                 };
                 if slot.gw == 0 || slot.gh == 0 {
                     continue;
-                }
+                };
                 // Normal fg through the shared ink policy (`effective_glyph_fg`,
                 // as the CPU blit): the ink override, then char_fg (ink wins),
                 // then the selection and min-contrast floors. Emoji cells never
                 // reach here. The cut-out slice is pushed separately below.
                 let base_fg = cell_base_fg(&mut ink_walk, &mut char_fg_walk, c, cell);
-                let (
-                    cell_selected,
-                    aterm_render::SelectionColors {
-                        bg: theme_selection,
-                        fg: selection_fg,
-                    },
-                    bg_under,
-                ) = cell_selection(r, c, cells, cell);
-                let glyph_color = rgb4_u32(aterm_render::effective_glyph_fg(
-                    selection_fg,
-                    min_contrast,
-                    base_fg,
-                    aterm_render::rgb_to_u32(cell.bg),
-                    cell_selected,
-                    theme_selection,
-                ));
+                let hit = if may_have_sel {
+                    input.selection_hit(r, c, cells.get(c + 1).is_some_and(|n| n.wide), cell.wide)
+                } else {
+                    None
+                };
+                let cell_selected = hit.is_some();
+                let aterm_render::SelectionColors {
+                    bg: theme_selection,
+                    fg: selection_fg,
+                } = selection_palette.at_hit(hit);
+                let fg_key = (base_fg, cell.bg, hit);
+                let (glyph_color, bg_under) = match fg_memo {
+                    Some((k, pair)) if k == fg_key => pair,
+                    _ => {
+                        let gc = rgb4_u32(aterm_render::effective_glyph_fg(
+                            selection_fg,
+                            min_contrast,
+                            base_fg,
+                            aterm_render::rgb_to_u32(cell.bg),
+                            cell_selected,
+                            theme_selection,
+                        ));
+                        let bu = if cell_selected {
+                            rgb4_u32(theme_selection)
+                        } else {
+                            rgb4(cell.bg)
+                        };
+                        fg_memo = Some((fg_key, (gc, bu)));
+                        (gc, bu)
+                    }
+                };
                 let Some((rect, uv)) =
                     slot.quad((pad + cx) as f32, anchor_y, baseline, scale, (aw, ah))
                 else {
@@ -18469,6 +19240,7 @@ impl GpuRenderer {
         // else to the lost frame below.
         #[cfg(gl_arm)]
         if gl_armed {
+            let build_ns = elapsed_ns(build_started);
             let live = self.gl_arm.as_mut().expect("gl_arm_ready minted it");
             let tail = gl_arm::encode_tail(
                 live,
@@ -18489,6 +19261,7 @@ impl GpuRenderer {
                     clear: theme_color_alpha(frame_bg, f64::from(bg_opacity)),
                     text_blend,
                     cursor_opaque,
+                    ablation: self.ablation,
                 },
             );
             match tail {
@@ -18496,7 +19269,7 @@ impl GpuRenderer {
                     self.last_frame_passes = out.passes as u32;
                     self.last_frame_load = out.load0;
                     self.last_frame_scissor = out.scissor;
-                    self.record_frame_instance_totals();
+                    self.record_frame_instance_totals(out.passes as u32, build_ns, out.stage_ns);
                     self.last_frame_arm_gl = true;
                     return (w, h);
                 }
@@ -18525,6 +19298,8 @@ impl GpuRenderer {
                 // 1. Stage the instance streams (write-from-0, geometric grow):
                 //    `Some` count iff the stream uploaded, as on the wgpu tail.
                 let mut counts: [Option<u32>; STREAM_COUNT] = [None; STREAM_COUNT];
+                let build_ns = elapsed_ns(build_started);
+                let stage_ns;
                 {
                     let live = self
                         .metal_arm
@@ -18534,6 +19309,7 @@ impl GpuRenderer {
                     // This ring slot's Submit A must be terminal before its
                     // shared-storage buffers are rewritten.
                     live.await_frame_slot();
+                    let stage_started = aterm_time::Instant::now();
                     for id in StreamId::ALL {
                         let (bytes, count) = self.inst.stream_bytes(id);
                         match live.upload_stream(id, bytes) {
@@ -18547,6 +19323,7 @@ impl GpuRenderer {
                             }
                         }
                     }
+                    stage_ns = elapsed_ns(stage_started);
                 }
 
                 // 2. The plan: same builder, same counts. The image plane's
@@ -18577,6 +19354,7 @@ impl GpuRenderer {
                         has_free: win.free_atlas.is_some(),
                         has_wallpaper: win.wallpaper_tex.is_some(),
                         cursor_opaque,
+                        ablation: self.ablation,
                     },
                 );
                 macro_rules! armed_try {
@@ -18949,7 +19727,7 @@ impl GpuRenderer {
                 self.frame_plan = plan;
                 self.last_frame_load = load0;
                 self.last_frame_scissor = scissor;
-                self.record_frame_instance_totals();
+                self.record_frame_instance_totals(passes as u32, build_ns, stage_ns);
                 self.last_frame_arm_metal = true;
                 return (w, h);
             }
@@ -18981,6 +19759,8 @@ impl GpuRenderer {
             // [`StreamId`]. `Some` mirrors `upload`'s gate (empty stream or
             // max-buffer-size degrade means no draw), which the plan builder
             // gates on. Upload order is invisible; draw order is the plan's.
+            let build_ns = elapsed_ns(build_started);
+            let stage_started = aterm_time::Instant::now();
             let mut streams: [Option<wgpu::BufferSlice<'_>>; STREAM_COUNT] = [None; STREAM_COUNT];
             let mut counts: [Option<u32>; STREAM_COUNT] = [None; STREAM_COUNT];
             for (&id, vb) in StreamId::ALL.iter().zip(self.vbufs.streams.iter_mut()) {
@@ -18990,6 +19770,7 @@ impl GpuRenderer {
                     counts[id as usize] = Some(count);
                 }
             }
+            let stage_ns = elapsed_ns(stage_started);
 
             // Resident offscreen target: reused while `(w, h)` is unchanged,
             // (re)created on the first frame or a resize, replacing the
@@ -19127,6 +19908,7 @@ impl GpuRenderer {
                     has_free: free_bind.is_some(),
                     has_wallpaper: wallpaper_bind.is_some(),
                     cursor_opaque,
+                    ablation: self.ablation,
                 },
             );
             let load0 = load_op;
@@ -19151,6 +19933,7 @@ impl GpuRenderer {
             let mut fenc = crate::device_layer::FrameEncoder::wgpu(
                 &self.ctx.device,
                 &self.ctx.queue,
+                self.wgpu_timer.as_ref(),
                 "aterm-gpu frame",
             );
             let passes = run_frame_plan(&mut fenc, &res, &plan, load0, scissor)
@@ -19180,7 +19963,7 @@ impl GpuRenderer {
             self.last_frame_scissor = scissor;
             // Record this frame's instance totals (diagnostic); on the scissored
             // path they scale with the dirty-row count.
-            self.record_frame_instance_totals();
+            self.record_frame_instance_totals(passes as u32, build_ns, stage_ns);
             // This frame's pixels are on the wgpu offscreen (the armed arm
             // degraded above with a named note, or is not selected).
             #[cfg(target_os = "macos")]
@@ -20127,13 +20910,12 @@ impl GpuRenderer {
                 ]
             });
             let scissor = if let Some([x0, y0, x1, y1]) = bbox {
-                let d =
-                    ((2.0 * self.bloom_radius + 1.0) * BLOOM_DOWNSCALE as f32).ceil() as u32 + 1;
+                let d = aterm_render::bloom::reach_px(self.bloom_radius);
                 Some([
                     x0.saturating_sub(d),
                     y0.saturating_sub(d),
-                    (x1 + d).min(fw),
-                    (y1 + d).min(fh),
+                    x1.saturating_add(d).min(fw),
+                    y1.saturating_add(d).min(fh),
                 ])
             } else {
                 clip.map(|_| [0, 0, fw, fh])
@@ -20629,6 +21411,25 @@ mod tests {
     };
     use super::{FRAME_GROUPS, GROUP_SRGB, WindowGpu};
 
+    /// A minimized window parks its ordinary presents, but not the one a
+    /// capture waits on (`ctl image` / `ctl window` of a minimized window
+    /// failed after three refused attempts). Negative control: an unminimized
+    /// window never parks, captured or not.
+    #[test]
+    fn a_minimized_window_parks_all_but_a_captures_present() {
+        let mut win = WindowGpu::new();
+        assert!(!win.parks_while_minimized(), "a visible window presents");
+        win.set_occluded_hint(true);
+        assert!(win.parks_while_minimized(), "a minimized one parks");
+        win.set_capture_present(true);
+        assert!(!win.parks_while_minimized(), "but presents for a capture");
+        win.set_capture_present(false);
+        assert!(win.parks_while_minimized(), "and parks again after it");
+        win.set_occluded_hint(false);
+        win.set_capture_present(true);
+        assert!(!win.parks_while_minimized());
+    }
+
     /// The staged band move's pure arithmetic: the copy plan for an up-glide, a
     /// down-bounce and every no-op arm, matching the CPU
     /// `translate_grid_band_in_place` term for term (both backends share it).
@@ -20827,6 +21628,95 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The pass-economy ablation touches exactly the Unorm (One/One) groups:
+    /// `Drop` is the full plan minus its Unorm items, in the same order, so
+    /// every sRGB draw is untouched, and with every stream live the view
+    /// changes those groups forced collapse into one pass; `Thin` is the full
+    /// plan, item for item and so pass for pass, with each Unorm item drawing
+    /// one instance and every sRGB item its own count.
+    #[test]
+    fn the_unorm_ablation_drops_or_thins_exactly_the_one_one_groups() {
+        let counts = [Some(7u32); STREAM_COUNT];
+        let ctx = |ablation| FramePlanCtx {
+            has_image_plane: true,
+            has_deco: true,
+            has_rain: true,
+            has_cat: true,
+            has_free: true,
+            has_wallpaper: true,
+            cursor_opaque: true,
+            ablation,
+        };
+        let passes_of = |plan: &[DrawItem]| {
+            let mut enabled = [false; FRAME_GROUPS];
+            enabled[G_BASE_BG] = true;
+            for item in plan {
+                enabled[item.group as usize] = true;
+            }
+            super::coalesce_frame_passes(&enabled, &GROUP_SRGB).2
+        };
+        let plan = |ablation| {
+            let mut plan = Vec::new();
+            build_frame_plan(&mut plan, &counts, ctx(ablation));
+            plan
+        };
+        let (full, dropped, thinned) = (
+            plan(UnormAblation::Off),
+            plan(UnormAblation::Drop),
+            plan(UnormAblation::Thin),
+        );
+        let unorm = |i: &DrawItem| !GROUP_SRGB[i.group as usize];
+        assert!(
+            full.iter().any(unorm),
+            "the full plan draws One/One streams, or there is nothing to ablate"
+        );
+        let kept: Vec<(u8, StreamId)> = full
+            .iter()
+            .filter(|i| !unorm(i))
+            .map(|i| (i.group, i.stream))
+            .collect();
+        let got: Vec<(u8, StreamId)> = dropped.iter().map(|i| (i.group, i.stream)).collect();
+        assert_eq!(got, kept, "Drop removes only Unorm items, in order");
+        assert_eq!(
+            passes_of(&dropped),
+            1,
+            "all-sRGB groups coalesce to one pass"
+        );
+        assert!(
+            passes_of(&full) > passes_of(&dropped),
+            "the Unorm groups cost passes: {} vs {}",
+            passes_of(&full),
+            passes_of(&dropped)
+        );
+        assert_eq!(
+            thinned
+                .iter()
+                .map(|i| (i.group, i.stream))
+                .collect::<Vec<_>>(),
+            full.iter().map(|i| (i.group, i.stream)).collect::<Vec<_>>(),
+            "Thin keeps every item, in order"
+        );
+        assert_eq!(passes_of(&thinned), passes_of(&full), "and so every pass");
+        for (thin, item) in thinned.iter().zip(&full) {
+            let want = if unorm(item) { 1 } else { item.count };
+            assert_eq!(thin.count, want, "{:?}", item.stream);
+        }
+    }
+
+    /// The seam's spellings: `drop` (or `1`) and `thin`, anything else off.
+    #[test]
+    fn the_ablation_seam_reads_its_modes() {
+        assert_eq!(UnormAblation::from_seam("drop"), UnormAblation::Drop);
+        assert_eq!(UnormAblation::from_seam("1"), UnormAblation::Drop);
+        assert_eq!(UnormAblation::from_seam("thin"), UnormAblation::Thin);
+        assert_eq!(UnormAblation::from_seam("0"), UnormAblation::Off);
+        assert_eq!(UnormAblation::from_seam(""), UnormAblation::Off);
+        for mode in [UnormAblation::Off, UnormAblation::Drop, UnormAblation::Thin] {
+            let back = UnormAblation::from_seam(mode.name());
+            assert_eq!(back, mode, "{}", mode.name());
         }
     }
 
@@ -21179,13 +22069,18 @@ mod tests {
     /// styles of a proportional symbol served from a mono fallback face: the
     /// regular, bold, italic and bold-italic U+26A0 masks are fitted to one
     /// cell before the shared image, so the atlas gets the CPU's final fit,
-    /// texel for texel. A host that serves U+26A0 from no mono fallback face
-    /// could not run it.
+    /// texel for texel. The primary is the checked-in Cascadia Mono PL, which
+    /// maps no U+26A0, so the symbol reaches the fallback chain on every host
+    /// (a host's own primary can map it: Linux's DejaVu Sans Mono does). A
+    /// host that serves U+26A0 from no mono fallback face could not run it.
     #[test]
     fn fitted_fallback_styles_reach_the_atlas_as_the_cpu_fit_them() {
-        let Some(mut cpu) = Renderer::from_system(18.0, Theme::default()) else {
-            aterm_spec::host::could_not_run("no system monospace font");
-        };
+        const PRIMARY: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../aterm-render/assets/bundled/CascadiaMonoPL-Regular.ttf"
+        );
+        let mut cpu = Renderer::from_system_with_family(Some(PRIMARY), 18.0, Theme::default())
+            .unwrap_or_else(|| panic!("{PRIMARY} does not load"));
         // Settle the lazy slots before asking which face serves the symbol.
         cpu.debug_block_on_lazy_fallbacks();
         let warning = cpu.glyph_key('\u{26A0}');
@@ -21860,6 +22755,7 @@ mod tests {
                 ph,
                 dx: 4,
                 dy: 4,
+                scrim: None,
             }
         }
 
@@ -21892,6 +22788,7 @@ mod tests {
             ph: pw,
             dx: 4,
             dy: 4,
+            scrim: None,
         };
         let _ = gpu.render_input(&mut win, &input, Some(swapped));
         assert_eq!(gpu.tray_uploads(), 3, "a recreate must always upload");
@@ -21919,6 +22816,7 @@ mod tests {
             ph,
             dx,
             dy,
+            scrim: None,
         };
 
         input.scroll_frac_px = 0;
@@ -22038,7 +22936,11 @@ mod tests {
         let mut warm = crate::metal::warm::FIRST_FRAME
             .begin()
             .expect("no other test claims the process's first-frame warm");
-        let failed = warm.run_on(&dev, true, |_, _| Err("injected warm failure".to_owned()));
+        let failed = warm.run_on(
+            &dev,
+            crate::metal::warm::FirstFrameKnobs::default(),
+            |_, _| Err("injected warm failure".to_owned()),
+        );
         assert_eq!(failed, Err("injected warm failure".to_owned()));
         drop(warm);
         assert!(
@@ -22055,6 +22957,107 @@ mod tests {
         assert_eq!(
             gpu.metal_start_error(),
             "the Metal renderer could not start: injected mint failure"
+        );
+    }
+
+    /// THE FIRST FRAMES' PSO SET (2026-10-17), found without a window: a
+    /// default window's first frames rendered offscreen on the Metal arm —
+    /// the window before its shell prints (a blank grid, the cursor home),
+    /// then its first prompt with the aurora the cursor's move there lit, as
+    /// plain text and as a prompt that carries an emoji (starship's module
+    /// symbols) —
+    /// under the launch's default knobs (`aterm-gui`'s
+    /// `pin_gpu_effect_config`: bloom, shimmer, the EDR crown, the SDR crown at
+    /// 0.25), on an SDR window (`Bgra8Unorm`) and an EDR one (`Rgba16Float`,
+    /// headroom 2). What those frames build is what the first-frame warm builds
+    /// (`metal::warm::first_frame_rows`), and the warm builds nothing they do
+    /// not: a row the frames bind and the warm missed is a cold compile on the
+    /// main thread, one the warm builds and no frame binds is worker time
+    /// spent on nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_first_frame_warm_builds_what_a_default_windows_first_frames_build() {
+        use crate::device_layer::TexelFormat;
+        use crate::metal::warm::{FirstFrameKnobs, WarmItem, first_frame_rows};
+        if crate::metal::ffi::Device::preferred().is_none() {
+            aterm_spec::host::could_not_run("no Metal device");
+        }
+        let (rows, cols) = (24usize, 80usize);
+        let mut built: Vec<WarmItem> = Vec::new();
+        for (format, edr) in [
+            (TexelFormat::Bgra8Unorm, 1.0),
+            (TexelFormat::Rgba16Float, 2.0),
+        ] {
+            let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
+            gpu.arm_metal_for_test();
+            gpu.set_bloom(true);
+            gpu.set_bloom_params(0.85, 2.2);
+            gpu.set_shimmer(true);
+            gpu.set_hdr_glow(true);
+            gpu.set_sdr_glow_boost(0.25);
+            let mut win = WindowGpu::new();
+            win.set_edr_max(edr);
+            let blank = Terminal::new(rows as u16, cols as u16).cell_frame(rows, cols);
+            let (cw, ch) = gpu.cpu.cell_size();
+            let prompt = |text: &str| {
+                let mut term = Terminal::new(rows as u16, cols as u16);
+                term.process(text.as_bytes());
+                let mut input = term.cell_frame(rows, cols);
+                // The aurora: additive light over the cursor's cell, window px.
+                input.cursor_glow_add.push(aterm_render::GlowQuad {
+                    row: 0,
+                    x: (14 * cw) as u16,
+                    y: 0,
+                    w: (2 * cw) as u16,
+                    h: ch as u16,
+                    color: 0x0040_6080,
+                    alpha: 0,
+                    color2: 0x0040_6080,
+                    alpha2: 0,
+                });
+                input
+            };
+            let (fw, fh) = gpu.frame_size(rows, cols);
+            for input in [&blank, &prompt("user@host ~ % "), &prompt("\u{1f680} ~ % ")] {
+                gpu.metal_present_standalone_for_test(
+                    &mut win,
+                    input,
+                    (fw as u32, fh as u32),
+                    (false, true),
+                    format,
+                    |_, _| Ok(()),
+                )
+                .expect("the armed present");
+            }
+            for item in gpu.metal_built_for_test() {
+                if !built.contains(&item) {
+                    built.push(item);
+                }
+            }
+        }
+        let knobs = FirstFrameKnobs {
+            aurora: true,
+            bloom: true,
+            hdr_glow: true,
+            sdr_glow: true,
+        };
+        let mut warmed: Vec<WarmItem> = Vec::new();
+        for (row, present) in first_frame_rows(knobs) {
+            for item in [
+                WarmItem::Library(row.spec().library),
+                WarmItem::pipeline(row, present),
+            ] {
+                if !warmed.contains(&item) {
+                    warmed.push(item);
+                }
+            }
+        }
+        let missed: Vec<&WarmItem> = built.iter().filter(|i| !warmed.contains(i)).collect();
+        let idle: Vec<&WarmItem> = warmed.iter().filter(|i| !built.contains(i)).collect();
+        assert!(
+            missed.is_empty() && idle.is_empty(),
+            "the first frames built {built:?}\nthe warm builds {warmed:?}\nmissed by the \
+             warm: {missed:?}\nbuilt by the warm for nothing: {idle:?}"
         );
     }
 
@@ -22698,50 +23701,6 @@ impl<W> wgpu::rwh::HasDisplayHandle for AppKitSurfaceTarget<W> {
     }
 }
 
-#[cfg(all(test, target_os = "macos", wgpu_arm))]
-mod appkit_surface_target_tests {
-    use wgpu::rwh::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
-
-    use super::AppKitSurfaceTarget;
-
-    /// A window stand-in answering a fixed view. Never messaged: the handle
-    /// only carries the pointer.
-    struct View(aterm_objc::Id);
-
-    // SAFETY: the tests below never dereference the answer, and nil is always
-    // a permitted one.
-    unsafe impl aterm_objc::HasNsView for View {
-        fn ns_view(&self) -> aterm_objc::Id {
-            self.0
-        }
-    }
-
-    /// The oracle hands wgpu exactly the view the Metal arm attaches under,
-    /// and a target with no view (read off the main thread) is `Unavailable`
-    /// rather than a null AppKit handle.
-    #[test]
-    fn the_oracle_target_carries_the_content_view_or_nothing() {
-        let mut word = 0_u64;
-        let view = aterm_objc::Id::from_ptr(std::ptr::from_mut(&mut word).cast());
-        let target = AppKitSurfaceTarget(View(view));
-        let handle = target.window_handle().expect("a view is a handle");
-        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-            panic!("an AppKit handle, got {:?}", handle.as_raw());
-        };
-        assert_eq!(h.ns_view.as_ptr(), view.as_ptr());
-        assert!(matches!(
-            target.display_handle().expect("AppKit display").as_raw(),
-            RawDisplayHandle::AppKit(_)
-        ));
-
-        let none = AppKitSurfaceTarget(View(aterm_objc::Id::NIL));
-        assert!(matches!(
-            none.window_handle(),
-            Err(wgpu::rwh::HandleError::Unavailable)
-        ));
-    }
-}
-
 /// The wgpu-oracle arm's surface target on Linux: a [`WindowTarget`]'s X11 or
 /// Wayland handles in raw-window-handle's words, through wgpu's own re-export.
 /// Only the oracle build has wgpu, so the shipped graph never gets the handle
@@ -22794,74 +23753,6 @@ impl<W: aterm_types::native_window::HasNativeWindow> wgpu::rwh::HasDisplayHandle
         // SAFETY: as for the window handle: the connection stays open as long
         // as `self.0` lives.
         Ok(unsafe { wgpu::rwh::DisplayHandle::borrow_raw(raw) })
-    }
-}
-
-#[cfg(all(test, target_os = "linux", wgpu_arm))]
-mod native_surface_target_tests {
-    use aterm_types::native_window::{HasNativeWindow, NativeWindow};
-    use wgpu::rwh::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
-
-    use super::NativeSurfaceTarget;
-
-    /// A window stand-in answering fixed handles. Never dereferenced: the
-    /// handles only carry the pointers.
-    struct Handles(Option<NativeWindow>);
-
-    // SAFETY: the tests below never dereference the answer, and `None` is
-    // always a permitted one.
-    unsafe impl HasNativeWindow for Handles {
-        fn native_window(&self) -> Option<NativeWindow> {
-            self.0
-        }
-    }
-
-    /// The oracle hands wgpu exactly the handles the GL arm makes its EGL
-    /// surface on, on X11 and on Wayland, and a target with none is
-    /// `Unavailable` rather than a null handle.
-    #[test]
-    fn the_oracle_target_carries_the_native_handles_or_nothing() {
-        let mut words = [0_u64; 2];
-        let display = std::ptr::NonNull::from(&mut words[0]).cast();
-        let surface = std::ptr::NonNull::from(&mut words[1]).cast();
-
-        let x11 = NativeSurfaceTarget(Handles(Some(NativeWindow::Xlib {
-            display,
-            screen: 1,
-            window: 0x0040_0007,
-            visual: 0x21,
-        })));
-        let RawWindowHandle::Xlib(w) = x11.window_handle().expect("an X11 window").as_raw() else {
-            panic!("an Xlib window handle");
-        };
-        assert_eq!((w.window, w.visual_id), (0x0040_0007, 0x21));
-        let RawDisplayHandle::Xlib(d) = x11.display_handle().expect("an X11 display").as_raw()
-        else {
-            panic!("an Xlib display handle");
-        };
-        assert_eq!((d.display, d.screen), (Some(display), 1));
-
-        let wl = NativeSurfaceTarget(Handles(Some(NativeWindow::Wayland { display, surface })));
-        let RawWindowHandle::Wayland(w) = wl.window_handle().expect("a Wayland window").as_raw()
-        else {
-            panic!("a Wayland window handle");
-        };
-        assert_eq!(w.surface, surface);
-        let RawDisplayHandle::Wayland(d) = wl.display_handle().expect("a Wayland display").as_raw()
-        else {
-            panic!("a Wayland display handle");
-        };
-        assert_eq!(d.display, display);
-
-        let none = NativeSurfaceTarget(Handles(None));
-        assert!(matches!(
-            none.window_handle(),
-            Err(wgpu::rwh::HandleError::Unavailable)
-        ));
-        assert!(matches!(
-            none.display_handle(),
-            Err(wgpu::rwh::HandleError::Unavailable)
-        ));
     }
 }
 

@@ -64,14 +64,57 @@
 //! * on the subscription pool (unchanged: a `subscribe` flips it to push).
 //!
 //! **Admission.** A fresh connection gets `ERR control server busy; retry`
-//! when every request lane is taken by work, or when the open-connection cap
-//! is reached (`control_connections_cap`: a quarter of the soft descriptor
-//! limit, at most `CONTROL_CONNECTIONS_MAX`). That cap is the parker's
-//! capacity, so an idle connection always has a place to park and never keeps
-//! a lane (which would also starve the resumes queued behind it). The cap
-//! bounds open connections, not requests, and leaves most descriptors to tabs
-//! and files; it is also what a peer that keeps connections open costs —
-//! idle, half-sent or unread alike — never a lane.
+//! when every request lane is taken by work. The placed connections are capped
+//! (`control_connections_cap`: a quarter of the soft descriptor limit, at most
+//! `CONTROL_CONNECTIONS_MAX`), and that cap is the parker's capacity, so an
+//! idle connection always has a place to park and never keeps a lane (which
+//! would also starve the resumes queued behind it). The cap bounds open
+//! placed connections, not requests. Pending admissions hold additional sockets:
+//! the parker's inbox and its current batch each hold at most this cap, so up
+//! to three times the cap may occupy these admission/parking stages, apart
+//! from the listener's current socket and the separate subscription pool.
+//! This is not a strict physical descriptor cap.
+//! AT the cap a fresh connection is handed to the parker — as many at once as
+//! there are parked connections, each owed one — which parks it to wait for
+//! its handshake like any begun request: in the slots of a connection that
+//! ended since, or else in those of the STALEST parked connection that GIVES
+//! WAY, which it closes ([`Lanes::take_the_stalest_place`]). One gives way
+//! when it has made its handshake and holds no live connection-bound claim (a claim is a
+//! supervisor's or a driver's, and would end with it; one still making its
+//! handshake has not been served once, and ends by its own deadline,
+//! `AUTH_READ_TIMEOUT`, if it never makes it); of those, the one whose peer
+//! has gone longest without sending or taking a byte is the stalest. So the
+//! placed cap is never passed, clients arriving together never close one another
+//! before either is served, and a fresh client is turned away busy only for
+//! work or when no parked connection gives way to it. Before (2026-10-19),
+//! one same-user process holding the cap open — idle, half-sent or unread
+//! alike — had every fresh client answered busy for as long as it liked. A
+//! client whose idle connection is closed so rides it out as it does any
+//! hang-up: by dialling again.
+//!
+//! **What the parked hold.** Each parked connection holds at most one answer
+//! its peer has not taken (`help --full` is 279 KB) and one request not yet
+//! whole (a `feed-bin` up to `MAX_FEED_BIN`); an idle one holds no buffer at
+//! all. Across them the parker keeps at most [`PARKED_BYTES_PER_LANE`] per
+//! request lane — an answer at the protocol's line limit for each, so the
+//! answers the lanes make at once are never cut for the budget: past it, it
+//! closes the stalest connection holding bytes, by the same order (a claim
+//! holder last, but not spared), until the rest fit — never the last one
+//! holding any, so one answer is never cut for its size alone. An unsent
+//! answer of [`SPILL_FROM`] or more leaves the heap as its connection parks,
+//! for a mapping of its own ([`Outbox::spill`]) whose pages go back to the
+//! system the moment it is delivered or its connection closes; a request that
+//! will need as much (a `feed-bin`'s body) gathers in such a mapping too
+//! (`Conn::room_for_the_request`). Measured on a headless instance
+//! (2026-10-19), rounds of 1024 connections each owed an unread `help --full`,
+//! closed between rounds: with the cap times one answer as the only bound,
+//! 292 MB of live heap; with the budget, 21 MB live, but the heap kept the
+//! pages of every answer freed on the parker's thread — footprint +256 MB the
+//! first round, +510 MB by the second, none of it given back when every
+//! connection closed; with the spill, +72 MB while owed (the budget's
+//! mappings) and +5.5 MB once all closed, the malloc zone 49 MB to 53 MB.
+//! 1024 connections each 200 KB into a 256 KB `feed-bin` body kept +145 MB
+//! after closing with the budget alone, +8 MB with the request spill.
 //!
 //! **If the parker fails.** Every parked connection lives in the parker, so a
 //! parker that died would strand them all — every supervisor loop and every
@@ -156,12 +199,24 @@ pub(super) trait LaneService: Send + Sync {
         let _ = (line, scope, out);
         true
     }
+    /// The reply `line` owes once it writes into a session's input, counted from
+    /// before its dispatch until the lane delivers it (`control::InputReplies`):
+    /// an update's Commit does not `_exit` over it. None by default.
+    fn owed_input_reply(&self, line: &str) -> Option<super::FinalReply> {
+        let _ = line;
+        None
+    }
     /// Whether `line` belongs on a wait lane (see the module doc).
     fn is_wait(&self, line: &str, scope: Scope) -> bool;
     /// Take over a connection that flipped to push.
     fn subscribe(&self, line: String, scope: Scope, stream: CtlStream);
     /// Release every claim bound to connection `id`: it ended.
     fn release(&self, id: u64);
+    /// Whether a live supervisor or drive lease still ends with connection
+    /// `id`. The parker asks only for connections that acquired one before;
+    /// that sticky cleanup flag does not say whether it still stands.
+    #[cfg(unix)]
+    fn has_live_claim(&self, id: u64) -> bool;
 }
 
 /// The caps. Production: `CONTROL_WORKERS`, `CONTROL_WAIT_WORKERS`,
@@ -178,7 +233,8 @@ pub(super) struct LaneLimits {
     /// `rpc`, so a request lane is always left for requests; the scheduling
     /// tests' old-design rigs set it to `rpc`, the fallback as first shipped.
     pub(super) inline: usize,
-    /// Connections open at once while the parker runs — its capacity.
+    /// Placed connections while the parker runs — its parking capacity.
+    /// Pending admissions hold additional sockets (see the module doc).
     pub(super) open: usize,
 }
 
@@ -191,6 +247,22 @@ const PARKER_PANICS_IN_A_ROW: usize = 3;
 /// The read buffer a lane serves a connection through (`BufReader::new`'s),
 /// and the most read from a peer at once while a request is gathered.
 const READ_BUFFER: usize = 8 * 1024;
+
+/// The most the parked connections hold at once, together, PER REQUEST LANE —
+/// answers their peers have not taken and requests not whole yet — past which
+/// the parker closes the stalest that hold any (see the module doc): an answer
+/// at the protocol's own line limit (`MAX_CONTROL_REPLY_LINE_BYTES`, an image
+/// reply's row) for each lane, so the answers the lanes make at once are never
+/// cut for the budget. 64 MiB at the production eight lanes.
+#[cfg(unix)]
+const PARKED_BYTES_PER_LANE: usize = aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE_BYTES;
+
+/// An unsent answer, or a request still arriving, at least this long leaves the
+/// heap while its connection is parked ([`Outbox::spill`],
+/// [`Conn::gather_parked`]). A socket takes far less of an answer at once
+/// (8 KiB on Darwin), so every answer this long parks owing most of it.
+#[cfg(unix)]
+const SPILL_FROM: usize = 16 << 10;
 
 /// What a connection's unread bytes hold of the request at their head.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -247,6 +319,11 @@ fn servable(buffered: &[u8], authenticated: bool, header_done: bool) -> bool {
 pub(super) struct Outbox {
     bytes: Vec<u8>,
     sent: usize,
+    /// The unsent rest of a large answer, moved off the heap as its connection
+    /// parked ([`Self::spill`]): `bytes` is empty meanwhile, and `sent` counts
+    /// into this.
+    #[cfg(unix)]
+    spilled: Option<Spill>,
     /// Close the connection once the answer is delivered: its request ended it.
     then_close: bool,
     /// The answer is one the exit waits for ([`super::FinalReplies`]): its request
@@ -256,9 +333,46 @@ pub(super) struct Outbox {
 }
 
 impl Outbox {
+    /// What of the answer is still the peer's to take.
+    fn unsent(&self) -> &[u8] {
+        #[cfg(unix)]
+        if let Some(spill) = &self.spilled {
+            return &spill.bytes()[self.sent..];
+        }
+        &self.bytes[self.sent..]
+    }
+
     /// Whether some of the answer is still the peer's to take.
     fn owed(&self) -> bool {
-        self.sent < self.bytes.len()
+        !self.unsent().is_empty()
+    }
+
+    /// Move the unsent rest of a large answer off the heap, into a mapping of
+    /// its own ([`Spill`]), as its connection parks: the heap buffer is zeroed
+    /// and freed on the lane that filled it, so the heap churns as it does for
+    /// an answer taken whole, and the parked answer's pages go back to the
+    /// system the moment it is delivered or its connection closes. Held in the
+    /// heap past their lane and freed later on the parker's thread, such
+    /// answers left every freed page dirty and kept (see the module doc). A
+    /// mapping that cannot be made keeps the answer where it is.
+    #[cfg(unix)]
+    fn spill(&mut self) {
+        if self.spilled.is_some() || self.bytes.len() - self.sent < SPILL_FROM {
+            return;
+        }
+        let Some(spill) = Spill::copy_of(&self.bytes[self.sent..], 0) else {
+            return;
+        };
+        self.scrub();
+        self.bytes = Vec::new();
+        self.sent = 0;
+        self.spilled = Some(spill);
+    }
+
+    /// The bytes it holds for its peer, as allocated or mapped.
+    #[cfg(unix)]
+    fn held(&self) -> usize {
+        self.bytes.capacity() + self.spilled.as_ref().map_or(0, |spill| spill.cap)
     }
 
     /// Zero initialized reply bytes before clearing, reusing or freeing the
@@ -278,7 +392,7 @@ impl Outbox {
     fn deliver(&mut self, stream: &CtlStream, nonblocking: bool) -> std::io::Result<bool> {
         let mut writer = stream;
         while self.owed() {
-            match writer.write(&self.bytes[self.sent..]) {
+            match writer.write(self.unsent()) {
                 Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
                 Ok(written) => self.sent += written,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -293,6 +407,11 @@ impl Outbox {
         // does). Done once the whole answer is out, so a `WouldBlock` return
         // above leaves the not-yet-sent bytes in place.
         self.scrub();
+        // A spilled answer's mapping goes now, its pages with it.
+        #[cfg(unix)]
+        {
+            self.spilled = None;
+        }
         // A large answer's buffer is not kept for the next one.
         if self.bytes.capacity() > 8 * READ_BUFFER {
             self.bytes = Vec::new();
@@ -310,7 +429,87 @@ impl Drop for Outbox {
     fn drop(&mut self) {
         // A connection dropped before its answer was fully delivered (an error
         // or hangup mid-reply) must not leave a relayed secret in freed heap.
+        // (A spilled answer leaves with its mapping.)
         self.scrub();
+    }
+}
+
+/// Bytes a parked connection holds off the heap, in an anonymous mapping of
+/// their own of a fixed capacity: a large answer's unsent rest
+/// ([`Outbox::spill`]), or a large request while it arrives
+/// ([`Conn::gather_parked`]). Unmapped on drop: its pages go back to the
+/// system at once, and no byte of it — a relayed secret included — is left
+/// anywhere in this process (what [`Outbox::scrub`] does for the heap).
+#[cfg(unix)]
+struct Spill {
+    base: std::ptr::NonNull<u8>,
+    /// The mapping's length.
+    cap: usize,
+    /// The bytes held, from its start.
+    len: usize,
+}
+
+// SAFETY: the mapping is owned by this value alone and reached only through it.
+#[cfg(unix)]
+unsafe impl Send for Spill {}
+
+#[cfg(unix)]
+impl Spill {
+    /// A fresh mapping of `cap` (not 0) zeroed bytes holding none yet, or
+    /// `None` when none can be made.
+    fn with_capacity(cap: usize) -> Option<Self> {
+        // SAFETY: a fresh private anonymous read-write mapping with no address
+        // hint; the result is checked before any use.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                cap,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return None;
+        }
+        Some(Self {
+            base: std::ptr::NonNull::new(base.cast::<u8>())?,
+            cap,
+            len: 0,
+        })
+    }
+
+    /// A fresh mapping of `cap` bytes holding a copy of `bytes` (no longer).
+    fn copy_of(bytes: &[u8], cap: usize) -> Option<Self> {
+        let mut spill = Self::with_capacity(cap.max(bytes.len()))?;
+        spill.spare()[..bytes.len()].copy_from_slice(bytes);
+        spill.len = bytes.len();
+        Some(spill)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: `len <= cap` bytes of the mapping, all initialized (an
+        // anonymous mapping starts zeroed), mapped for as long as `self` lives.
+        unsafe { std::slice::from_raw_parts(self.base.as_ptr(), self.len) }
+    }
+
+    /// The room left after the bytes held.
+    fn spare(&mut self) -> &mut [u8] {
+        // SAFETY: `len..cap` lies in the mapping, initialized (zeroed at
+        // mapping or written since), and borrowed exclusively through `self`.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.base.as_ptr().add(self.len), self.cap - self.len)
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Spill {
+    fn drop(&mut self) {
+        // SAFETY: the mapping `with_capacity` made, unmapped once, here; no
+        // borrow of it outlives `self`.
+        unsafe { libc::munmap(self.base.as_ptr().cast(), self.cap) };
     }
 }
 
@@ -490,12 +689,21 @@ pub(super) struct Conn {
     /// Who presented its token (phase 3A, the session log's `by=`), from the
     /// handshake.
     principal: Principal,
+    /// Who it is, as its typing is credited (S9): read at its first typing
+    /// verb and kept for its life ([`super::ServingCaller`]).
+    caller: Option<Arc<crate::typed_by::Caller>>,
     tenure: ConnTenure,
     /// Bytes read from the peer and not served yet, read first wherever the
     /// connection lands ([`lane_reader`]): the requests a request lane had read
     /// past the wait it moved to a wait lane, or what has come of the next
     /// request while it is not whole (the parker adds to it as more arrives).
     carry: Vec<u8>,
+    /// What has come of a large next request while it is not whole — the
+    /// parker gathers one that needs [`SPILL_FROM`] or more off the heap
+    /// ([`Self::gather_parked`]) — `carry` empty meanwhile. Folded back into
+    /// `carry` on the lane that serves it.
+    #[cfg(unix)]
+    carry_spill: Option<Spill>,
     /// The part of its last answer the peer has not taken yet.
     reply: Outbox,
     /// The frame header at the head of [`Self::carry`] has been acted on
@@ -504,6 +712,11 @@ pub(super) struct Conn {
     /// Until the handshake: when the parker drops the connection if its first
     /// line is still not whole (`AUTH_READ_TIMEOUT` from admission).
     expires: Option<Instant>,
+    /// When its peer last sent or took a byte or a lane last served it: of
+    /// the parked connections, the one with the oldest is the STALEST, closed
+    /// first when room is needed ([`stalest`]).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    stirred: Instant,
     /// Held from parking until a request lane takes it back.
     parked: Option<Slot>,
     /// Held from admission until the connection ends (or flips to push). Last,
@@ -576,14 +789,15 @@ impl Conn {
 }
 
 /// The request lanes' work: a freshly accepted connection (holding the open
-/// slot its admission took), or a parked one that turned readable.
+/// slot its admission took), or a parked one that turned readable (boxed, so
+/// every queued job is the size of a stream, not of a connection's buffers).
 enum Job {
     Fresh(CtlStream, Slot),
     #[cfg_attr(
         not(unix),
         expect(dead_code, reason = "only the unix parker resumes a connection")
     )]
-    Resume(Conn),
+    Resume(Box<Conn>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -623,11 +837,22 @@ struct WaitState {
 #[cfg(unix)]
 struct Parker {
     parked: Arc<AtomicUsize>,
-    /// Connections handed to the parker and not yet polled — `None` once it has
-    /// STOPPED, which a lane parking a connection reads under this lock (so
-    /// nothing is handed over after the stop's last look) and answers by
-    /// keeping its connection.
-    inbox: Mutex<Option<Vec<Conn>>>,
+    /// What was handed to the parker and not yet taken — `None` once it has
+    /// STOPPED, which a lane parking a connection and admission at the cap
+    /// read under this lock (so nothing is handed over after the stop's last
+    /// look) and answer by keeping the connection, or turning it away.
+    inbox: Mutex<Option<Inbox>>,
+    /// What the parked connections held at the end of the parker's last pass,
+    /// in bytes ([`Conn::held_bytes`]).
+    held: AtomicUsize,
+    /// Of the parked connections at the end of the parker's last pass, those
+    /// that did not give way ([`Conn::gives_way`]): the tests' census.
+    #[cfg(test)]
+    spared: AtomicUsize,
+    /// Held by a test to keep the parker from taking what it is handed
+    /// ([`Lanes::parker_pause`]).
+    #[cfg(test)]
+    pause: Mutex<()>,
     /// Whether the parker still polls: `inbox.is_some()`, readable without the
     /// lock by admission and [`Lanes::parker_runs`].
     running: AtomicBool,
@@ -637,6 +862,17 @@ struct Parker {
     /// what woke it — the scheduling tests' injected failure.
     #[cfg(test)]
     faults: AtomicUsize,
+}
+
+/// What lanes and admission hand the parker, taken at its next pass.
+#[cfg(unix)]
+#[derive(Default)]
+struct Inbox {
+    /// Connections parked between requests.
+    parked: Vec<Conn>,
+    /// Fresh connections admitted at the cap, each to take the place of the
+    /// stalest parked connection ([`Lanes::take_the_stalest_place`]).
+    fresh: Vec<CtlStream>,
 }
 
 /// The whole lane set of one control socket.
@@ -652,18 +888,25 @@ pub(super) struct Lanes {
     service: OnceLock<Arc<dyn LaneService>>,
     /// The scheduling tests' own [`super::FinalReplies`]
     /// ([`Self::count_final_replies_on`]); the instance's otherwise.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     final_replies: OnceLock<&'static super::FinalReplies>,
     /// How long a fresh connection has to make its handshake line whole
     /// (milliseconds): `AUTH_READ_TIMEOUT`, short in the tests.
     handshake_ms: AtomicU64,
+    /// What the parked connections may hold at once, in bytes:
+    /// [`PARKED_BYTES_PER_LANE`] per request lane, small in the tests.
+    #[cfg(unix)]
+    parked_bytes_max: AtomicUsize,
     /// The negative control's switch ([`Self::keep_pipelined_waits`]).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pipelined_waits_stay: std::sync::atomic::AtomicBool,
+    /// The negative control's switch ([`Self::refuse_at_the_cap`]).
+    #[cfg(all(test, unix))]
+    cap_refuses: std::sync::atomic::AtomicBool,
 }
 
 /// What the lanes hold right now (the Tier-1 bind's projection).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Census {
     /// Request-lane work, queued plus running (fresh admission reads this).
@@ -677,8 +920,16 @@ pub(super) struct Census {
     pub(super) inline: usize,
     /// Whether idle connections park (a parker runs, and has not stopped).
     pub(super) parking: bool,
-    /// Connections open (admitted, not yet ended or flipped to push).
+    /// Placed connections (not yet ended or flipped to push), excluding placing.
     pub(super) open: usize,
+    /// What the parked connections held at the parker's last pass, in bytes.
+    pub(super) held: usize,
+    /// Parked connections that did not give way to a fresh client at the
+    /// parker's last pass ([`Conn::gives_way`]).
+    pub(super) spared: usize,
+    /// Fresh connections admitted at the cap, handed to the parker and not
+    /// placed yet.
+    pub(super) placing: usize,
 }
 
 impl Lanes {
@@ -698,27 +949,38 @@ impl Lanes {
             #[cfg(unix)]
             parker: OnceLock::new(),
             service: OnceLock::new(),
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             final_replies: OnceLock::new(),
             handshake_ms: AtomicU64::new(
                 u64::try_from(AUTH_READ_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
             ),
-            #[cfg(test)]
+            #[cfg(unix)]
+            parked_bytes_max: AtomicUsize::new(limits.rpc.saturating_mul(PARKED_BYTES_PER_LANE)),
+            #[cfg(all(test, unix))]
             pipelined_waits_stay: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(test, unix))]
+            cap_refuses: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     /// Give fresh connections `lifetime` to make their handshake line whole
     /// (the tests' short one).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn set_handshake_lifetime(&self, lifetime: Duration) {
         let ms = u64::try_from(lifetime.as_millis()).unwrap_or(u64::MAX);
         self.handshake_ms.store(ms, Ordering::Release);
     }
 
+    /// Let the parked connections hold `bytes` at once (the tests' small
+    /// budget) rather than [`PARKED_BYTES_PER_LANE`] per request lane.
+    #[cfg(all(test, unix))]
+    pub(super) fn set_parked_bytes_max(&self, bytes: usize) {
+        self.parked_bytes_max.store(bytes, Ordering::Release);
+    }
+
     /// Count the answers these lanes owe at exit on `replies` rather than the
     /// instance's, so a test reads its own lanes' count alone.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn count_final_replies_on(&self, replies: &'static super::FinalReplies) {
         assert!(
             self.final_replies.set(replies).is_ok(),
@@ -728,7 +990,7 @@ impl Lanes {
 
     /// Where these lanes count the answers the exit waits for.
     fn final_replies(&self) -> &'static super::FinalReplies {
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         if let Some(replies) = self.final_replies.get() {
             return replies;
         }
@@ -776,9 +1038,10 @@ impl Lanes {
         let _ = self.service.set(service);
     }
 
-    /// Admit a freshly accepted connection onto a request lane, or hand it back
-    /// (for the listener's busy reply) when every request lane is taken by work
-    /// or the open-connection bound is reached.
+    /// Admit a freshly accepted connection onto a request lane, or at the
+    /// open-connection bound hand it to the parker ([`Self::admit_at_the_cap`]);
+    /// or hand it back, for the listener's busy reply, when every request lane
+    /// is taken by work, or at the bound when the parker cannot take it.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -804,7 +1067,7 @@ impl Lanes {
             usize::MAX
         };
         let Some(open) = Slot::take(&self.open, cap) else {
-            return Err(stream);
+            return self.admit_at_the_cap(stream);
         };
         self.rpc
             .try_submit(Job::Fresh(stream, open))
@@ -814,7 +1077,80 @@ impl Lanes {
             })
     }
 
-    #[cfg(test)]
+    /// Admission at the cap: hand the fresh connection to the parker, which
+    /// places it ([`Self::take_the_stalest_place`]); or hand it back for the
+    /// busy reply — every request lane taken by work (as below the cap), no
+    /// parker, or as many fresh ones already waiting as there are parked
+    /// connections (each is owed one). As many wait at once as are parked: a
+    /// placed one later goes back to the request lanes' queue as a resume, in
+    /// the room it already keeps for every parked connection.
+    #[cfg(unix)]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ControlLaneTenure",
+            action = "Hand",
+            project = "aterm_gui::control::control_lanes::conformance::project"
+        )
+    )]
+    fn admit_at_the_cap(&self, stream: CtlStream) -> Result<(), CtlStream> {
+        #[cfg(test)]
+        if self.cap_refuses.load(Ordering::Acquire) {
+            return Err(stream);
+        }
+        let Some(parker) = self.parker.get() else {
+            return Err(stream);
+        };
+        if !self.rpc.has_room() {
+            return Err(stream);
+        }
+        let mut inbox = parker.inbox.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(waiting) = inbox.as_mut() else {
+            return Err(stream);
+        };
+        if waiting.fresh.len() >= parker.parked.load(Ordering::Acquire) {
+            return Err(stream);
+        }
+        waiting.fresh.push(stream);
+        drop(inbox);
+        // Non-blocking: a full bell already has a wake pending.
+        let _ = (&parker.bell).write(&[1]);
+        Ok(())
+    }
+
+    /// No parker off unix: the cap refuses.
+    #[cfg(not(unix))]
+    fn admit_at_the_cap(&self, stream: CtlStream) -> Result<(), CtlStream> {
+        Err(stream)
+    }
+
+    /// A freshly admitted connection holding the open slot `open`, its
+    /// handshake's lifetime counted from now.
+    fn fresh_conn(&self, stream: CtlStream, open: Slot) -> Conn {
+        let now = Instant::now();
+        Conn {
+            stream,
+            scope: None,
+            principal: Principal::Instance,
+            caller: None,
+            tenure: ConnTenure {
+                id: super::NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed),
+                claimed: false,
+                service: Arc::clone(self.service()),
+            },
+            carry: Vec::new(),
+            #[cfg(unix)]
+            carry_spill: None,
+            reply: Outbox::default(),
+            header_done: false,
+            expires: Some(now + self.handshake_lifetime()),
+            stirred: now,
+            parked: None,
+            _open: open,
+        }
+    }
+
+    #[cfg(all(test, unix))]
     pub(super) fn census(&self) -> Census {
         let waits = self
             .waits
@@ -829,6 +1165,21 @@ impl Lanes {
             inline: self.inline.load(Ordering::Acquire),
             parking: self.parker_runs(),
             open: self.open.load(Ordering::Acquire),
+            held: self
+                .parker
+                .get()
+                .map_or(0, |p| p.held.load(Ordering::Acquire)),
+            spared: self
+                .parker
+                .get()
+                .map_or(0, |p| p.spared.load(Ordering::Acquire)),
+            placing: self.parker.get().map_or(0, |p| {
+                p.inbox
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                    .map_or(0, |inbox| inbox.fresh.len())
+            }),
         }
     }
 
@@ -848,11 +1199,6 @@ impl Lanes {
         }
     }
 
-    #[cfg(all(test, not(unix)))]
-    fn parked(&self) -> usize {
-        0
-    }
-
     fn service(&self) -> &Arc<dyn LaneService> {
         self.service
             .get()
@@ -863,25 +1209,11 @@ impl Lanes {
         loop {
             if !self.rpc.serve_next(|job| match job {
                 Job::Fresh(stream, open) => {
-                    let conn = Conn {
-                        stream,
-                        scope: None,
-                        principal: Principal::Instance,
-                        tenure: ConnTenure {
-                            id: super::NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed),
-                            claimed: false,
-                            service: Arc::clone(self.service()),
-                        },
-                        carry: Vec::new(),
-                        reply: Outbox::default(),
-                        header_done: false,
-                        expires: Some(Instant::now() + self.handshake_lifetime()),
-                        parked: None,
-                        _open: open,
-                    };
+                    let conn = self.fresh_conn(stream, open);
                     self.drive(conn, None, Lane::Rpc);
                 }
-                Job::Resume(mut conn) => {
+                Job::Resume(conn) => {
+                    let mut conn = *conn;
                     if conn.take_back() {
                         self.drive(conn, None, Lane::Rpc);
                     } else {
@@ -1028,10 +1360,16 @@ impl Lanes {
         mut may_defer: bool,
     ) -> Here {
         let service = Arc::clone(self.service());
+        #[cfg(unix)]
+        if let Some(gathered) = conn.carry_spill.take() {
+            // Back on the heap of the lane that serves it, freed there.
+            conn.carry = gathered.bytes().to_vec();
+        }
         let Conn {
             stream,
             scope,
             principal,
+            caller,
             tenure,
             carry,
             reply,
@@ -1093,6 +1431,7 @@ impl Lanes {
         // The session log names this connection's Owner requests by who
         // presented its token, for as long as this lane serves it.
         let _principal = super::ServingPrincipal::enter(*principal);
+        let _caller = super::ServingCaller::enter(caller);
         loop {
             let parking = (may_park || served) && self.parker_runs();
             // The last answer goes out first, and nothing more is read until the
@@ -1127,9 +1466,13 @@ impl Lanes {
                         Next::Closed => return Here::Closed,
                     }
                 }
-                None => match read_authenticated_request_line(&mut reader) {
-                    Some(line) => line,
-                    None => return Here::Closed,
+                None => match read_next_line(&mut reader, reply) {
+                    Next::Line(line) => line,
+                    Next::Refused => {
+                        reply.then_close = true;
+                        continue;
+                    }
+                    Next::Park | Next::Closed => return Here::Closed,
                 },
             };
             // A wait read on a request lane moves to a wait lane when it can —
@@ -1160,7 +1503,10 @@ impl Lanes {
             may_defer = true;
             // Owed from BEFORE the dispatch (the action may end the process) until
             // the answer is delivered ([`Outbox::final_reply`]).
-            let final_reply = self.final_replies().enter(&line);
+            let final_reply = self
+                .final_replies()
+                .enter(&line)
+                .or_else(|| service.owed_input_reply(&line));
             let disposition =
                 service.serve_line(line, scope, stream, &mut reader, &mut reply.bytes);
             if reply.owed() {
@@ -1199,7 +1545,7 @@ impl Lanes {
     /// rule before the carry ([`Self::keep_pipelined_waits`]): only with
     /// nothing buffered.
     fn moves_with(&self, reader: &LaneReader<'_>) -> bool {
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         if self.pipelined_waits_stay.load(Ordering::Acquire) {
             return reader.buffer().is_empty();
         }
@@ -1211,9 +1557,25 @@ impl Lanes {
     /// stays on its request lane (and so takes one of the budget's places, or
     /// is answered busy, whatever the wait lanes hold) — the lanes before the
     /// carry.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn keep_pipelined_waits(&self) {
         self.pipelined_waits_stay.store(true, Ordering::Release);
+    }
+
+    /// The parker's pause: while a test holds it locked, the parker takes
+    /// nothing it is handed, so the test hands it several fresh connections at
+    /// the cap before its next pass.
+    #[cfg(all(test, unix))]
+    pub(super) fn parker_pause(&self) -> &Mutex<()> {
+        &self.parker.get().expect("a parker runs").pause
+    }
+
+    /// The negative control's rule: the cap refuses every fresh client, however
+    /// many parked connections could make room — the admission before
+    /// 2026-10-19.
+    #[cfg(all(test, unix))]
+    pub(super) fn refuse_at_the_cap(&self) {
+        self.cap_refuses.store(true, Ordering::Release);
     }
 
     #[cfg(unix)]
@@ -1281,7 +1643,9 @@ impl Lanes {
             return Err(Box::new(conn));
         }
         conn.parked = Some(slot);
-        waiting.push(conn);
+        conn.stirred = Instant::now();
+        conn.hold_only_what_is_owed();
+        waiting.parked.push(conn);
         drop(inbox);
         // Non-blocking: a full bell already has a wake pending.
         let _ = (&parker.bell).write(&[1]);
@@ -1303,7 +1667,12 @@ impl Lanes {
         }
         let parker = Arc::new(Parker {
             parked: Arc::default(),
-            inbox: Mutex::new(Some(Vec::new())),
+            inbox: Mutex::new(Some(Inbox::default())),
+            held: AtomicUsize::new(0),
+            #[cfg(test)]
+            spared: AtomicUsize::new(0),
+            #[cfg(test)]
+            pause: Mutex::new(()),
             running: AtomicBool::new(true),
             bell,
             #[cfg(test)]
@@ -1370,8 +1739,13 @@ impl Lanes {
             parker.running.store(false, Ordering::Release);
             inbox.take().unwrap_or_default()
         };
-        let closed = parked.len() + arrivals.len();
-        for conn in parked.into_iter().chain(arrivals) {
+        parker.held.store(0, Ordering::Release);
+        // Fresh connections admitted at the cap never got a place: busy.
+        for stream in &arrivals.fresh {
+            turn_away(stream);
+        }
+        let closed = parked.len() + arrivals.parked.len();
+        for conn in parked.into_iter().chain(arrivals.parked) {
             // A claim's release that panics must not leave the rest open.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| conn.close()));
         }
@@ -1399,7 +1773,7 @@ impl Lanes {
         use std::os::fd::AsRawFd;
 
         // A restart may follow a drained bell whose arrivals were never taken.
-        take_arrivals(parker, parked);
+        self.take_arrivals(parker, parked);
         let mut fds: Vec<libc::pollfd> = Vec::new();
         loop {
             fds.clear();
@@ -1461,8 +1835,15 @@ impl Lanes {
             if fds[0].revents != 0 {
                 let mut drain = [0u8; 64];
                 while matches!((&*listen).read(&mut drain), Ok(n) if n > 0) {}
-                take_arrivals(parker, parked);
+                self.take_arrivals(parker, parked);
             }
+            let held = self.keep_parked_bytes_within(parked);
+            parker.held.store(held, Ordering::Release);
+            #[cfg(test)]
+            parker.spared.store(
+                parked.iter().filter(|conn| !conn.gives_way()).count(),
+                Ordering::Release,
+            );
             *panics = 0;
         }
     }
@@ -1485,7 +1866,14 @@ impl Lanes {
                 self.resume(conn);
                 None
             }
-            Step::Stay if !conn.expires.is_some_and(|at| at <= now) => Some(conn),
+            Step::Stay if !conn.expires.is_some_and(|at| at <= now) => {
+                // Its peer sent or took bytes (or the wake was spurious, and
+                // nothing came of it but a stamp).
+                if events != 0 {
+                    conn.stirred = now;
+                }
+                Some(conn)
+            }
             // Closed: its peer hung up, its connection failed, it asked to be
             // once answered, or its handshake did not come whole in time.
             Step::Close | Step::Stay => {
@@ -1507,12 +1895,12 @@ impl Lanes {
         )
     )]
     fn resume(&self, conn: Conn) {
-        if let Err(job) = self.rpc.submit_resumed(Job::Resume(conn)) {
+        if let Err(job) = self.rpc.submit_resumed(Job::Resume(Box::new(conn))) {
             // Unreachable while the open bound sizes the queue; close rather
             // than silently strand a live connection if that ever breaks.
             aterm_log::warn!("control parker: resume refused, closing");
             if let Job::Resume(conn) = job {
-                conn.close();
+                (*conn).close();
             }
         }
     }
@@ -1524,7 +1912,8 @@ enum Next {
     Line(String),
     /// Not whole yet, and nothing more there now: the parker gathers the rest.
     Park,
-    /// A frame's header was refused, its answer in the outbox: close.
+    /// A frame's header, or a line too long for any request, was refused, its
+    /// answer in the outbox: close.
     Refused,
     /// Nothing more will come, or the connection failed.
     Closed,
@@ -1546,7 +1935,7 @@ fn next_request<'a>(
         match held(reader.buffer(), true) {
             Held::Whole => {
                 *header_done = false;
-                return read_authenticated_request_line(reader).map_or(Next::Closed, Next::Line);
+                return read_next_line(reader, reply);
             }
             Held::Header(end) if !*header_done => {
                 let line = decode_request_line(reader.buffer()[..end].to_vec());
@@ -1567,9 +1956,23 @@ fn next_request<'a>(
             Gathered::Ended if reader.buffer().is_empty() => return Next::Closed,
             Gathered::Ended => {
                 *header_done = false;
-                return read_authenticated_request_line(reader).map_or(Next::Closed, Next::Line);
+                return read_next_line(reader, reply);
             }
             Gathered::Broken => return Next::Closed,
+        }
+    }
+}
+
+/// The request line `reader` holds next, read on a lane: one too long for any
+/// request is answered in the outbox ([`Next::Refused`]), never a bare close.
+fn read_next_line(reader: &mut LaneReader<'_>, reply: &mut Outbox) -> Next {
+    let mut refusal = Vec::new();
+    match read_authenticated_request_line(reader, &mut refusal) {
+        Some(line) => Next::Line(line),
+        None if refusal.is_empty() => Next::Closed,
+        None => {
+            reply.bytes.extend_from_slice(&refusal);
+            Next::Refused
         }
     }
 }
@@ -1622,14 +2025,87 @@ enum Step {
 
 #[cfg(unix)]
 impl Conn {
+    /// The bytes it holds of its peer's and for its peer: the answer not yet
+    /// taken and what has come of its next request, as allocated.
+    fn held_bytes(&self) -> usize {
+        let request = self.carry.capacity() + self.carry_spill.as_ref().map_or(0, |s| s.cap);
+        request + self.reply.held()
+    }
+
+    /// Let go of every buffer it holds no byte in — an idle connection holds
+    /// none (its next answer is made on a lane, in a buffer of its own) — and
+    /// move a large unsent answer off the heap ([`Outbox::spill`]), and a
+    /// large request a lane began to read before it parked
+    /// ([`Self::room_for_the_request`], as the parker's own reads would).
+    fn hold_only_what_is_owed(&mut self) {
+        if self.reply.owed() {
+            self.reply.spill();
+        } else {
+            // Delivered whole, so scrubbed already ([`Outbox::deliver`]).
+            self.reply.bytes = Vec::new();
+        }
+        if self.carry.is_empty() {
+            self.carry = Vec::new();
+        } else {
+            self.room_for_the_request(self.scope.is_some());
+        }
+    }
+
+    /// Whether a fresh client at the cap may take its place: it has made its
+    /// handshake and holds no claim. A claim is a supervisor's or a driver's,
+    /// and would end with it. A connection still making its handshake has not
+    /// been served once, and ends by its own deadline (`AUTH_READ_TIMEOUT`) if
+    /// it never makes it: clients arriving together never close one another
+    /// before either is served. (The byte budget spares neither: it closes a
+    /// claim holder last.)
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ControlLaneTenure",
+            action = "Spare",
+            project = "aterm_gui::control::control_lanes::conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ControlLaneTenure",
+            action = "Unspare",
+            project = "aterm_gui::control::control_lanes::conformance::project"
+        )
+    )]
+    fn gives_way(&self) -> bool {
+        self.scope.is_some() && !self.has_live_claim()
+    }
+
+    /// Keep the cleanup flag until Drop even after the last claim was released.
+    /// Eviction uses the service's current authority, not that history bit.
+    fn has_live_claim(&self) -> bool {
+        self.tenure.claimed && self.tenure.service.has_live_claim(self.tenure.id)
+    }
+
+    /// Close it to make room for another: its peer sees the hang-up any close
+    /// is, and its open and parked slots are handed over to the connection
+    /// taking its place (`None`, both given back, if it held no parked one).
+    fn give_up_place(mut self) -> Option<(Slot, Slot)> {
+        aterm_uds::hangup::hang_up(&self.stream);
+        let place = self.parked.take();
+        let Self { _open: open, .. } = self;
+        Some((open, place?))
+    }
+
     /// Deliver what the peer has room for of the answer it is owed.
     fn deliver_parked(&mut self) -> Step {
-        match self.reply.deliver(&self.stream, true) {
+        let delivered = self.reply.deliver(&self.stream, true);
+        if matches!(delivered, Ok(true)) {
+            self.hold_only_what_is_owed();
+        }
+        match delivered {
             Ok(false) => Step::Stay,
             Ok(true) if self.reply.then_close => Step::Close,
             // Delivered: the next request may be whole already (read behind
             // the answer); otherwise the parker waits for it.
-            Ok(true) if servable(&self.carry, self.scope.is_some(), self.header_done) => {
+            Ok(true) if servable(self.carried(), self.scope.is_some(), self.header_done) => {
                 Step::Serve
             }
             Ok(true) => Step::Stay,
@@ -1637,18 +2113,76 @@ impl Conn {
         }
     }
 
-    /// Read what has come of the next request.
+    /// Read what its peer has sent of its next request, until it is whole or
+    /// nothing more is there. A request that needs [`SPILL_FROM`] or more —
+    /// a frame whose line and body come to that, or a line not whole past it
+    /// — is gathered off the heap, into a mapping sized for the whole of it
+    /// ([`Self::room_for_the_request`]), read straight into, and so never read
+    /// past: the heap holds no large request while its peer is slow to send
+    /// it (the same churn as an unsent answer, [`Outbox::spill`]).
     fn gather_parked(&mut self) -> Step {
         let (authenticated, header_done) = (self.scope.is_some(), self.header_done);
-        match gather(&self.stream, &mut self.carry, |buffered| {
-            servable(buffered, authenticated, header_done)
-        }) {
-            Gathered::Enough => Step::Serve,
-            Gathered::Short => Step::Stay,
-            // The peer sends no more: a lane serves what it left (and then
-            // reads the end), or there is nothing left to serve.
-            Gathered::Ended if !self.carry.is_empty() => Step::Serve,
-            Gathered::Ended | Gathered::Broken => Step::Close,
+        let mut chunk = [0u8; READ_BUFFER];
+        loop {
+            if servable(self.carried(), authenticated, header_done) {
+                return Step::Serve;
+            }
+            self.room_for_the_request(authenticated);
+            let mut reader = &self.stream;
+            let read = match self.carry_spill.as_mut() {
+                Some(spill) => reader.read(spill.spare()).inspect(|n| spill.len += n),
+                None => reader
+                    .read(&mut chunk)
+                    .inspect(|n| self.carry.extend_from_slice(&chunk[..*n])),
+            };
+            match read {
+                // The peer sends no more: a lane serves what it left (and then
+                // reads the end), or there is nothing left to serve.
+                Ok(0) if self.carried().is_empty() => return Step::Close,
+                Ok(0) => return Step::Serve,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Step::Stay;
+                }
+                Err(_) => return Step::Close,
+            }
+        }
+    }
+
+    /// What has come of its next request.
+    fn carried(&self) -> &[u8] {
+        self.carry_spill.as_ref().map_or(&self.carry, Spill::bytes)
+    }
+
+    /// Before a read: a request that needs [`SPILL_FROM`] or more goes into a
+    /// mapping with room for the whole of it — a frame's line and the body it
+    /// announces, once its line is whole; a line not whole yet, once the next
+    /// read could take it past [`SPILL_FROM`], the longest line any request may
+    /// have plus one — moved again if it turns out to need more. A mapping
+    /// that cannot be made leaves it on the heap.
+    fn room_for_the_request(&mut self, authenticated: bool) {
+        let carried = self.carried();
+        let (need, large) = match held(carried, authenticated) {
+            Held::Header(end) => {
+                let need = end + 1 + announced_body(&decode_request_line(carried[..end].to_vec()));
+                (need, need >= SPILL_FROM)
+            }
+            Held::Partial => (
+                MAX_REQUEST_LINE + 1,
+                carried.len() + READ_BUFFER >= SPILL_FROM,
+            ),
+            Held::Whole => return,
+        };
+        let cap = self.carry_spill.as_ref().map_or(0, |spill| spill.cap);
+        if need <= cap || (cap == 0 && !large) {
+            return;
+        }
+        if let Some(spill) = Spill::copy_of(carried, need) {
+            self.carry = Vec::new();
+            self.carry_spill = Some(spill);
+        } else if let Some(spill) = self.carry_spill.take() {
+            self.carry = spill.bytes().to_vec();
         }
     }
 }
@@ -1668,17 +2202,169 @@ fn until_a_handshake_expires(parked: &[Conn], now: Instant) -> libc::c_int {
         })
 }
 
-/// Move what lanes handed the parker into its polled set.
 #[cfg(unix)]
-fn take_arrivals(parker: &Parker, parked: &mut Vec<Conn>) {
-    // `append` leaves the inbox its capacity for the next arrivals.
-    if let Some(inbox) = parker
-        .inbox
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .as_mut()
-    {
-        parked.append(inbox);
+impl Lanes {
+    /// Move what lanes handed the parker into its polled set, then place each
+    /// fresh connection admitted at the cap.
+    fn take_arrivals(&self, parker: &Parker, parked: &mut Vec<Conn>) {
+        #[cfg(test)]
+        drop(parker.pause.lock().unwrap_or_else(PoisonError::into_inner));
+        let fresh = {
+            let mut inbox = parker.inbox.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(inbox) = inbox.as_mut() else {
+                return;
+            };
+            // `append` leaves the inbox its capacity for the next arrivals.
+            parked.append(&mut inbox.parked);
+            std::mem::take(&mut inbox.fresh)
+        };
+        for stream in fresh {
+            self.take_the_stalest_place(parker, parked, stream);
+        }
+    }
+
+    /// Place a fresh connection admitted at the cap
+    /// ([`Self::admit_at_the_cap`]): it is parked, to wait for its handshake
+    /// like any begun request, in the slots — open and parked — of a
+    /// connection that ended since it was admitted (none is closed for it
+    /// then), or else in those of the stalest parked connection that gives way
+    /// ([`Conn::gives_way`]), which is closed for it (its peer sees a hang-up).
+    /// With none to give way, it is turned away busy.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ControlLaneTenure",
+            action = "Place",
+            project = "aterm_gui::control::control_lanes::conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ControlLaneTenure",
+            action = "TurnAway",
+            project = "aterm_gui::control::control_lanes::conformance::project"
+        )
+    )]
+    fn take_the_stalest_place(&self, parker: &Parker, parked: &mut Vec<Conn>, stream: CtlStream) {
+        let place = self.free_place(parker).or_else(|| {
+            let index = stalest(parked, |conn| conn.gives_way().then_some(false))?;
+            let victim = parked.swap_remove(index);
+            note_eviction("a fresh client at the connection cap");
+            // A close that panics costs that connection alone, as a wake's
+            // does: its slots went back as it unwound, and are taken again.
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| victim.give_up_place()))
+                .unwrap_or_else(|_| {
+                    aterm_log::warn!(
+                        "control parker: a connection closed for a fresh client panicked as it \
+                         closed; it is closed"
+                    );
+                    None
+                })
+                .or_else(|| self.free_place(parker))
+        });
+        let Some((open, place)) = place else {
+            turn_away(&stream);
+            return;
+        };
+        let mut conn = self.fresh_conn(stream, open);
+        conn.parked = Some(place);
+        if conn.stream.set_nonblocking(true).is_err() {
+            close_parked(conn);
+            return;
+        }
+        parked.push(conn);
+    }
+
+    /// An open slot and a parked one, both free: the cap has room again.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ControlLaneTenure",
+            action = "PlaceFreed",
+            project = "aterm_gui::control::control_lanes::conformance::project"
+        )
+    )]
+    fn free_place(&self, parker: &Parker) -> Option<(Slot, Slot)> {
+        let open = Slot::take(&self.open, self.limits.open)?;
+        let place = Slot::take(&parker.parked, self.limits.open)?;
+        Some((open, place))
+    }
+
+    /// Keep what the parked connections hold within the budget
+    /// ([`PARKED_BYTES_PER_LANE`] per request lane): close the stalest of
+    /// those holding any until the rest fit, never the last one holding any.
+    /// Returns what they hold.
+    fn keep_parked_bytes_within(&self, parked: &mut Vec<Conn>) -> usize {
+        let budget = self.parked_bytes_max.load(Ordering::Acquire);
+        let holds = |conn: &Conn| conn.held_bytes() > 0;
+        let mut held: usize = parked.iter().map(Conn::held_bytes).sum();
+        while held > budget && parked.iter().filter(|conn| holds(conn)).nth(1).is_some() {
+            let Some(index) = stalest(parked, |conn| holds(conn).then(|| conn.has_live_claim()))
+            else {
+                break;
+            };
+            let victim = parked.swap_remove(index);
+            held -= victim.held_bytes();
+            note_eviction("the parked connections' byte budget");
+            // A close that panics (a claim's release) costs that connection
+            // alone, as a wake's does.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| close_parked(victim)))
+                .is_err()
+            {
+                aterm_log::warn!(
+                    "control parker: a connection closed for the byte budget panicked as it \
+                     closed; it is closed"
+                );
+            }
+        }
+        held
+    }
+}
+
+/// Of the parked connections `claim_rank` admits, the one to close first when
+/// room is needed: one holding no claim before one that does (a claim is a
+/// supervisor's or a driver's, and ends with its connection), then the one
+/// [`Conn::stirred`] longest ago. Closing for a fresh client admits only those
+/// that give way ([`Conn::gives_way`]), the byte budget every one holding
+/// bytes. `Some` carries the candidate's live-claim rank, read once per scan;
+/// `None` excludes it.
+#[cfg(unix)]
+fn stalest(parked: &[Conn], claim_rank: impl Fn(&Conn) -> Option<bool>) -> Option<usize> {
+    parked
+        .iter()
+        .enumerate()
+        .filter_map(|(index, conn)| claim_rank(conn).map(|live| (index, live, conn.stirred)))
+        .min_by_key(|&(_, live, stirred)| (live, stirred))
+        .map(|(index, _, _)| index)
+}
+
+/// Parked connections closed to make room, since start.
+#[cfg(unix)]
+static EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Count one parked connection closed to make room for `why`, and say so in
+/// the log at the first, second, fourth, eighth… so a process squatting the
+/// cap shows there without a line per client it displaced.
+#[cfg(unix)]
+fn note_eviction(why: &str) {
+    let count = EVICTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        aterm_log::warn!(
+            "control parker closed the stalest parked connection for {why} ({count} so far)"
+        );
+    }
+}
+
+/// Answer a fresh connection the parker cannot place with the busy reply,
+/// without waiting: it never got as far as a request, and its empty send
+/// buffer takes the line.
+#[cfg(unix)]
+fn turn_away(stream: &CtlStream) {
+    crate::control_listener::note_busy_reply();
+    if stream.set_nonblocking(true).is_ok() {
+        let mut writer = stream;
+        let _ = writer.write_all(aterm_types::control_verbs::CONTROL_BUSY_LINE.as_bytes());
     }
 }
 
@@ -1754,6 +2440,55 @@ impl Drop for Serving<'_> {
 #[cfg(all(test, unix))]
 #[path = "control_lanes_conformance.rs"]
 mod conformance;
+
+#[cfg(all(test, unix))]
+mod outbox_spill_tests {
+    use super::{CtlStream, Outbox, SPILL_FROM};
+    use std::io::Read as _;
+    use std::time::Duration;
+
+    /// An answer the socket does not take at once leaves the heap as its
+    /// connection parks: the heap buffer is let go, the mapping holds exactly
+    /// the unsent rest, every byte arrives in order, and the mapping goes once
+    /// it is delivered. One shorter than [`SPILL_FROM`] stays where it is.
+    #[test]
+    fn a_large_unsent_answer_leaves_the_heap_and_arrives_whole() {
+        let (server, mut peer) = CtlStream::pair().expect("private control pair");
+        let hang_detector = Some(Duration::from_secs(60));
+        server.set_write_timeout(hang_detector).unwrap();
+        peer.set_read_timeout(hang_detector).unwrap();
+        let answer: Vec<u8> = (0..256 * 1024_u32)
+            .map(|i| u8::try_from(i % 251).expect("below 251"))
+            .collect();
+        let mut out = Outbox::default();
+        out.bytes.extend_from_slice(&answer);
+        server.set_nonblocking(true).unwrap();
+        assert!(
+            !out.deliver(&server, true).unwrap(),
+            "the socket takes part of it"
+        );
+        let unsent = answer.len() - out.sent;
+        out.spill();
+        assert_eq!(out.bytes.capacity(), 0, "the heap buffer let go");
+        assert_eq!(out.held(), unsent, "the mapping holds the unsent rest");
+        assert!(out.owed());
+        let reader = std::thread::spawn(move || {
+            let mut got = vec![0u8; answer.len()];
+            peer.read_exact(&mut got).expect("the whole answer");
+            (answer, got)
+        });
+        server.set_nonblocking(false).unwrap();
+        assert!(out.deliver(&server, false).unwrap());
+        assert!(out.spilled.is_none(), "the mapping goes once delivered");
+        let (answer, got) = reader.join().expect("the reader");
+        assert!(got == answer, "every byte, in order");
+
+        let mut small = Outbox::default();
+        small.bytes.extend_from_slice(&vec![b'x'; SPILL_FROM - 1]);
+        small.spill();
+        assert!(small.spilled.is_none(), "a short answer stays on the heap");
+    }
+}
 
 #[cfg(test)]
 mod outbox_delivery_tests {

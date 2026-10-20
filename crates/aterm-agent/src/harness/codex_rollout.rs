@@ -9,7 +9,8 @@
 //! Never the screen, and no supervision: the spend fold (`harness::spend`),
 //! `aterm harness usage` from a Codex session's own shell
 //! (`harness::cli::run_codex_usage`), `aterm ai`'s limit reader
-//! (`ai::codex_limits`) and the codex-alab path read Codex through it. Codex's
+//! (`ai::codex_limits`), the session log's Codex step fold
+//! (`harness::codex_steps`) and the codex-alab path read Codex through it. Codex's
 //! files are a third party's, so every reader refuses a shape it was not
 //! written for.
 //!
@@ -414,7 +415,8 @@ fn turn_key(total: &TurnTokens, total_tokens: u64, last: &TurnTokens) -> u64 {
 /// A `token_count` payload's running total, its `total_tokens` (else input
 /// plus output), and its last turn; `None` where `info` holds no readable
 /// pair of counts (the rate limits alone, or counts that cannot be read).
-fn counts_of(payload: Option<&Value>) -> Option<(TurnTokens, u64, TurnTokens)> {
+/// The Codex step fold reads a turn's counts by it (`super::codex_steps`).
+pub(crate) fn counts_of(payload: Option<&Value>) -> Option<(TurnTokens, u64, TurnTokens)> {
     let info = payload?.get("info").filter(|i| i.is_object())?;
     let total_usage = info.get("total_token_usage");
     let total = TurnTokens::of(total_usage)?;
@@ -590,6 +592,31 @@ pub(crate) fn stream_lines(
     cap: u64,
     mut each: impl FnMut(u64, Option<&str>) -> std::ops::ControlFlow<()>,
 ) -> Option<RolloutRead> {
+    stream_lines_ends(path, cap, |start, _, line| match line {
+        Streamed::Line(text) => each(start, text),
+        Streamed::Long => std::ops::ControlFlow::Continue(()),
+    })
+}
+
+/// One line [`stream_lines_ends`] hands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Streamed<'a> {
+    /// A complete line: its text, `None` for one that is not UTF-8.
+    Line(Option<&'a str>),
+    /// A complete line longer than
+    /// [`crate::harness::usage::MAX_LINE_BYTES`], skipped unread.
+    Long,
+}
+
+/// [`stream_lines`], each complete line handed on with the offsets it
+/// starts and ends at (past its newline), a long one too, unread
+/// ([`Streamed::Long`]): for a reader that places every line it could not
+/// read (the Codex step fold, `super::codex_steps::fold_rollout`).
+pub(crate) fn stream_lines_ends(
+    path: &Path,
+    cap: u64,
+    mut each: impl FnMut(u64, u64, Streamed<'_>) -> std::ops::ControlFlow<()>,
+) -> Option<RolloutRead> {
     use std::io::BufRead as _;
     let max_line = crate::harness::usage::MAX_LINE_BYTES;
     let file = crate::harness::footer::open_regular(path)?;
@@ -627,9 +654,13 @@ pub(crate) fn stream_lines(
         out.read += used as u64;
         if newline.is_some() {
             let flow = if skipping {
-                std::ops::ControlFlow::Continue(())
+                each(start, out.read, Streamed::Long)
             } else {
-                each(start, std::str::from_utf8(&line).ok())
+                each(
+                    start,
+                    out.read,
+                    Streamed::Line(std::str::from_utf8(&line).ok()),
+                )
             };
             line.clear();
             skipping = false;
@@ -1474,31 +1505,29 @@ mod tests {
     /// is unset.
     #[test]
     fn codex_home_is_codex_home_else_the_users() {
+        use crate::harness::host_path::abs;
+        let (home, alt, pj) = (abs("/Users//x"), abs("/alt/home"), abs("/w/pj"));
+        let dot_codex = Some(Path::new(&home).join(".codex"));
+        let user = Some(home.as_str());
+        assert_eq!(codex_home(None, user, None), dot_codex);
         assert_eq!(
-            codex_home(None, Some("/Users//x"), None),
-            Some(PathBuf::from("/Users//x/.codex"))
-        );
-        assert_eq!(
-            codex_home(Some("/alt/home"), Some("/Users//x"), None),
-            Some(PathBuf::from("/alt/home"))
+            codex_home(Some(&alt), user, None),
+            Some(PathBuf::from(&alt))
         );
         assert_eq!(codex_home(Some("rel"), None, None), None);
         assert_eq!(
-            codex_home(Some("rel"), Some("/Users//x"), None),
+            codex_home(Some("rel"), user, None),
             None,
             "never another home's records"
         );
         assert_eq!(
-            codex_home(Some("rel"), Some("/Users//x"), Some(Path::new("/w/pj"))),
-            Some(PathBuf::from("/w/pj/rel"))
+            codex_home(Some("rel"), user, Some(Path::new(&pj))),
+            Some(Path::new(&pj).join("rel"))
         );
+        assert_eq!(codex_home(Some("rel"), user, Some(Path::new("pj"))), None);
         assert_eq!(
-            codex_home(Some("rel"), Some("/Users//x"), Some(Path::new("pj"))),
-            None
-        );
-        assert_eq!(
-            codex_home(Some(""), Some("/Users//x"), Some(Path::new("/w/pj"))),
-            Some(PathBuf::from("/Users//x/.codex")),
+            codex_home(Some(""), user, Some(Path::new(&pj))),
+            dot_codex,
             "an empty one is unset"
         );
     }

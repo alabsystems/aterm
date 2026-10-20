@@ -15,14 +15,16 @@ repository.workspace = true
 description = "First-party no-op `tracing` facade for aterm (replaces tracing + tracing-core + tracing-attributes; also pin-project-lite on mac/windows)"
 
 [features]
-# Upstream's feature table, without `attributes`: `default` and `std` are
-# reachable; the rest are no-ops declared so a transitive `tracing/log` request
-# still resolves. No consumer writes `#[instrument]` since zbus, the one that did,
-# left the graph at A11Y.4, so `attributes` and its pass-through proc macro
-# (crates/aterm-tracing-attributes) were deleted at A11Y.6
-# (docs/AUDIT-third-party-2026-10-15.md, unit a11y): a crate that asks for it
-# again fails to resolve, loudly.
-default = ["std"]
+# Upstream's feature table, without `attributes`: `std` is reachable; the
+# rest are no-ops declared so a transitive `tracing/log` request still
+# resolves. No `default` key (upstream's is `std`): an inert default still
+# forked the build, since a `--workspace` build selects this member with it
+# and the shipped graph's consumers ask for none, so the two compiled two
+# tracings and everything above them (P4). No consumer writes `#[instrument]`
+# since zbus, the one that did, left the graph at A11Y.4, so `attributes` and
+# its pass-through proc macro (crates/aterm-tracing-attributes) were deleted
+# at A11Y.6 (docs/AUDIT-third-party-2026-10-15.md, unit a11y): a crate that
+# asks for it again fails to resolve, loudly.
 # Ignored: the shim is `no_std` regardless.
 std = []
 async-await = []

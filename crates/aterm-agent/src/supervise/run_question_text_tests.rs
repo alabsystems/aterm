@@ -23,9 +23,9 @@ fn texting(screens: Vec<Vec<String>>) -> Mock {
     m
 }
 
-/// The CLI loop answering questions under `p` (`--question-priority`).
-fn answering_by(p: QuestionPriority, notes: Option<PathBuf>) -> SuperviseOpts {
-    let mut opts = answering(30, notes);
+/// The stop-at-review loop answering questions under `p`.
+fn answering_by(p: QuestionPriority) -> SuperviseOpts {
+    let mut opts = answering(30);
     opts.policy.question_priority = p;
     opts
 }
@@ -102,11 +102,7 @@ fn a_lone_single_select_is_answered_by_the_long_term_text() {
         idle_screen(),
     ]);
     m.vanish_after = Some(1);
-    let (ndir, notes) = notes_file("text-single-chose");
-    let opts = SuperviseOpts {
-        notes: Some(notes.clone()),
-        ..hosted_by(LONG)
-    };
+    let opts = hosted_by(LONG);
     let mut out: Vec<u8> = Vec::new();
     {
         let mut s = session(&mut m, None);
@@ -175,14 +171,6 @@ fn a_lone_single_select_is_answered_by_the_long_term_text() {
         "{}",
         approved[0]
     );
-    let noted = read_notes(&ndir, &notes);
-    assert!(
-        noted.iter().any(|l| l.contains(&format!(
-            "chose ({RULE_ANSWER_LONG_TERM}, long-term): Which colour do you prefer? → decided by \
-             the worker (long-term)"
-        ))),
-        "{noted:#?}"
-    );
     let _ = std::fs::remove_dir_all(&ldir);
 }
 
@@ -233,8 +221,7 @@ fn tier1_the_policy_text_goes_only_where_the_model_allows() {
         let (opt1, opt2, free, typed) = single_screens(text_of(p));
         let mut m = texting(vec![opt1, opt2, free, typed, idle_screen()]);
         let model = text_model(1, 0, 0);
-        let (st, keys, _) =
-            q_bound_with(&mut m, &model, 0, Some(p), &answering_by(p, None), |_| {});
+        let (st, keys, _) = q_bound_with(&mut m, &model, 0, Some(p), &answering_by(p), |_| {});
         assert_eq!(
             keys,
             ["down", "down", "text", "enter"],
@@ -247,14 +234,7 @@ fn tier1_the_policy_text_goes_only_where_the_model_allows() {
     // 2. The lone multi-select.
     let mut m = texting(multi_screens(LONG_TERM_TEXT));
     let model = text_model(1, 1, 1);
-    let (st, keys, _) = q_bound_with(
-        &mut m,
-        &model,
-        0,
-        Some(LONG),
-        &answering_by(LONG, None),
-        |_| {},
-    );
+    let (st, keys, _) = q_bound_with(&mut m, &model, 0, Some(LONG), &answering_by(LONG), |_| {});
     assert_eq!(
         keys,
         ["down", "down", "down", "text", "down", "enter", "enter"],
@@ -281,7 +261,7 @@ fn tier1_the_policy_text_goes_only_where_the_model_allows() {
             &text_model(1, 0, 0),
             0,
             Some(LONG),
-            &answering_by(LONG, None),
+            &answering_by(LONG),
             move |s| {
                 s.question.typed.insert(key, LONG);
                 s.question.mode = Some(LONG);
@@ -320,14 +300,17 @@ fn hosted_run(m: &mut Mock, opts: &SuperviseOpts, ledger: Option<&Path>) -> Vec<
         .collect()
 }
 
-/// The CLI loop over `m` with `notes`: the notes' lines.
-fn supervised(m: &mut Mock, opts: &SuperviseOpts, dir: &Path, notes: &Path) -> Vec<String> {
+/// The stop-at-review loop over `m`: why it handed boxes over, its ledger's
+/// `escalated` rows' reasons ([`Book::escalated`]).
+fn supervised(m: &mut Mock, opts: &SuperviseOpts, tag: &str) -> Vec<String> {
+    let book = Book::new(tag);
     {
         let mut s = session(m, None);
         s.set_approval_env(owner_env());
+        book.keep(&mut s);
         s.supervise(opts).expect("supervise");
     }
-    read_notes(dir, notes)
+    book.escalated()
 }
 
 /// The badge the loop raised, if any (`meta set attention owner=supervisor`).
@@ -401,7 +384,7 @@ fn a_tail_cut_at_the_focused_submit_is_read_whole_and_submitted() {
     m.cursor_on_caret = true;
     let mut s = session(&mut m, None);
     s.set_approval_env(owner_env());
-    s.supervise(&answering_by(LONG, None)).expect("supervise");
+    s.supervise(&answering_by(LONG)).expect("supervise");
     drop(s);
     assert_eq!(badge(&m), None, "handed over: {:#?}", m.requests);
     assert_eq!(
@@ -418,6 +401,74 @@ fn a_tail_cut_at_the_focused_submit_is_read_whole_and_submitted() {
         m.requests
     );
     let enter = m.presses()[4];
+    assert!(
+        enter.contains(&guarded("❯    Submit")) && enter.ends_with(" enter"),
+        "the Enter is on the button: {enter}"
+    );
+}
+
+/// ATERM-KI-1015-1's F2 residual, at the loop: a fresh 2.1.302 multi-select at 41 columns drawn
+/// from row 7 of a pane whose 40-row tail begins AT `5. Chat about this`, where a person's keys
+/// moved the focus (the loop never puts it there). That tail is the dialog with its head off
+/// the screen, so it is read again whole, where the focus is on the chat row: the loop moves it
+/// up off that row to the free-text row, types the long-term text, moves down to `Submit` and
+/// presses Enter there. Nothing is handed over. Every screen is scripted twice (its tail, then
+/// the grid whole): each tail begins at the chat row or inside the typed text.
+#[test]
+fn a_tail_cut_at_a_chat_row_a_person_focused_is_read_whole_and_answered() {
+    use aterm_phase::prompt::fixtures as f;
+    let (cols, pristine) = f::QUESTION_MULTI_PRISTINE_2_1_302[1];
+    let (kept_cols, kept) = f::QUESTION_MULTI_REFLOW_LONG_KEPT_2_1_302[1];
+    assert_eq!((cols, kept_cols), (41, 41));
+    let pristine = q(pristine);
+    let chat_at = in_fresh_pane(&pristine, 40)
+        .iter()
+        .position(|r| r.trim() == "5. Chat about this")
+        .expect("the chat row");
+    let pane = chat_at + 40;
+    let chat = in_fresh_pane(&focused_on(&pristine, "5. Chat about this"), pane);
+    assert_eq!(
+        chat[chat_at], "❯ 5. Chat about this",
+        "PRECONDITION: focused"
+    );
+    let tail = aterm_phase::parse_prompt_v2(&chat[chat_at..]).expect("a box");
+    assert!(
+        tail.kind == aterm_phase::PromptKind::Question && tail.head_off_screen,
+        "PRECONDITION: the tail at the chat row is the dialog with its head off: {tail:?}"
+    );
+    let mut screens = Vec::new();
+    for rows in [
+        chat,
+        in_fresh_pane(&focused_on(&pristine, "Submit"), pane),
+        in_fresh_pane(&focused_on(&pristine, "4. [ ] Type"), pane),
+        in_fresh_pane(&q(f::QUESTION_MULTI_TYPED_41X60_2_1_302), pane),
+        in_fresh_pane(&q(kept), pane),
+    ] {
+        screens.push(rows.clone());
+        screens.push(rows);
+    }
+    screens.push(idle_screen());
+    let mut m = texting(screens);
+    m.pane_cols = Some(41);
+    m.cursor_on_caret = true;
+    let mut s = session(&mut m, None);
+    s.set_approval_env(owner_env());
+    s.supervise(&answering_by(LONG)).expect("supervise");
+    drop(s);
+    assert_eq!(badge(&m), None, "handed over: {:#?}", m.requests);
+    assert_eq!(
+        m.writes(),
+        [
+            "up".to_string(),
+            "up".to_string(),
+            format!("text:{LONG_TERM_TEXT}"),
+            "down".to_string(),
+            "enter".to_string(),
+        ],
+        "{:#?}",
+        m.requests
+    );
+    let enter = m.presses()[3];
     assert!(
         enter.contains(&guarded("❯    Submit")) && enter.ends_with(" enter"),
         "the Enter is on the button: {enter}"
@@ -489,14 +540,8 @@ fn a_multi_select_text_that_moves_against_its_checkbox_is_still_submitted_by_its
         if stands {
             screens.truncate(6);
         }
-        let (dir, notes) = notes_file("text-against-checkbox");
         let mut m = texting(screens);
-        let lines = supervised(
-            &mut m,
-            &answering_by(LONG, Some(notes.clone())),
-            &dir,
-            &notes,
-        );
+        let lines = supervised(&mut m, &answering_by(LONG), "text-against-checkbox");
         (m, lines)
     };
     let (m, _) = run(landed.clone(), false);
@@ -547,12 +592,7 @@ fn a_multi_select_text_that_moves_against_its_checkbox_is_still_submitted_by_its
             "{why}: {:#?}",
             m.requests
         );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains(&format!("handed to the manager ({why}"))),
-            "{why}: {lines:#?}"
-        );
+        assert!(lines.iter().any(|l| l.contains(why)), "{why}: {lines:#?}");
     }
 }
 
@@ -666,14 +706,8 @@ fn a_text_that_reads_back_short_twice_is_handed_over_never_written_again() {
         f::QUESTION_283_TYPED_LONG_TERM,
         "Decide yourself: choose the option that best serves long term",
     );
-    let (dir, notes) = notes_file("text-prefix");
     let mut m = texting(vec![free, prefix.clone(), prefix]);
-    let lines = supervised(
-        &mut m,
-        &answering_by(LONG, Some(notes.clone())),
-        &dir,
-        &notes,
-    );
+    let lines = supervised(&mut m, &answering_by(LONG), "text-prefix");
     assert_eq!(sends(&m).len(), 1, "{:#?}", m.requests);
     assert!(m.presses().is_empty(), "{:#?}", m.requests);
     assert!(
@@ -683,8 +717,8 @@ fn a_text_that_reads_back_short_twice_is_handed_over_never_written_again() {
     );
     assert!(
         lines.iter().any(|l| l.contains(
-            "handed to the manager (the policy text read back short of what was written: a \
-             text is never written twice)"
+            "the policy text read back short of what was written: a \
+             text is never written twice"
         )),
         "{lines:#?}"
     );
@@ -696,20 +730,16 @@ fn a_text_that_reads_back_short_twice_is_handed_over_never_written_again() {
 #[test]
 fn a_text_that_disappears_after_it_read_back_is_handed_over_never_rewritten() {
     let (_, _, free, typed) = single_screens(LONG_TERM_TEXT);
-    let (dir, notes) = notes_file("text-gone");
     let (ldir, ledger) = ledger_file("text-gone");
     let mut m = texting(vec![free.clone(), typed]);
     // The field emptied between the read-back and the Enter.
     m.swap_at_key = Some(free);
-    let lines = {
+    {
         let mut s = session(&mut m, None);
         s.set_approval_env(owner_env());
         s.set_approval_ledger(Some(ledger.clone()));
-        s.supervise(&answering_by(LONG, Some(notes.clone())))
-            .expect("supervise");
-        drop(s);
-        read_notes(&dir, &notes)
-    };
+        s.supervise(&answering_by(LONG)).expect("supervise");
+    }
     assert_eq!(sends(&m).len(), 1, "{:#?}", m.requests);
     let presses = m.presses();
     assert!(
@@ -723,14 +753,12 @@ fn a_text_that_disappears_after_it_read_back_is_handed_over_never_rewritten() {
             && r.contains("the screen moved past the judged read")),
         "the Enter skipped by its fence: {rows:#?}"
     );
-    let _ = std::fs::remove_dir_all(&ldir);
     assert!(
-        lines.iter().any(|l| l.contains(
-            "handed to the manager (the policy text the supervisor wrote is gone from its \
-             free-text row)"
-        )),
-        "{lines:#?}"
+        rows.iter().any(|r| r.contains("\"decision\":\"escalated\"")
+            && r.contains("the policy text the supervisor wrote is gone from its free-text row")),
+        "handed over: {rows:#?}"
     );
+    let _ = std::fs::remove_dir_all(&ldir);
     // Before the text, though no key moved the focus first: the send is the
     // tab's first key (the dialog drawn still a second, the person's stamp
     // asked again after it).
@@ -767,6 +795,90 @@ fn a_question_asked_again_after_its_dialog_went_is_written_afresh() {
     let _ = hosted_run(&mut m, &hosted_by(LONG), None);
     assert_eq!(badge(&m), None, "never handed over: {:#?}", m.requests);
     assert_eq!(sends(&m).len(), 2, "{:#?}", m.requests);
+}
+
+/// ATERM-KI-1016-1 (Questions): the loop answered a question by its own text and its Enter
+/// went, and the worker asked the same question again in a new dialog with no read between
+/// them (no busy read, no composer: the gap the reads did not sample). The re-ask's pristine
+/// field read as the loop's text "gone" from the dialog it had answered, and was handed over.
+/// The loop's Enter on its own text answered that question, and no person's key has come
+/// since (the person count the Enter was fenced on still stands), so the pristine field is a
+/// new dialog's: it is written afresh, the first dialog told once. NEGATIVE CONTROLS: a
+/// person's key between (the count moved) still hands it over as "gone"; and
+/// [`a_text_that_disappears_after_it_read_back_is_handed_over_never_rewritten`] (the Enter
+/// skipped by its fence: the text gone from the same dialog) is unchanged.
+#[test]
+fn a_question_asked_again_with_no_read_between_after_the_loops_enter_is_written_afresh() {
+    let (_, _, free, typed) = single_screens(LONG_TERM_TEXT);
+    let run = |person_between: bool| {
+        let mut m = texting(vec![
+            free.clone(),
+            typed.clone(),
+            free.clone(),
+            typed.clone(),
+            busy_screen(),
+            idle_screen(),
+        ]);
+        m.vanish_after = Some(1);
+        if person_between {
+            // The re-ask's first read counts one person's key more.
+            for i in 2..6 {
+                m.human_seq_on.insert(i, Some(1));
+            }
+        }
+        let lines = hosted_run(&mut m, &hosted_by(LONG), None);
+        (m, lines)
+    };
+    let (m, lines) = run(false);
+    assert_eq!(badge(&m), None, "never handed over: {:#?}", m.requests);
+    assert_eq!(
+        m.writes(),
+        [
+            format!("text:{LONG_TERM_TEXT}"),
+            "enter".to_string(),
+            format!("text:{LONG_TERM_TEXT}"),
+            "enter".to_string(),
+        ],
+        "{:#?}",
+        m.requests
+    );
+    let told = lines.iter().filter(|l| l.starts_with("CHOSE ")).count();
+    assert_eq!(told, 2, "each dialog told once: {lines:#?}");
+    let (m, _) = run(true);
+    assert_eq!(sends(&m).len(), 1, "{:#?}", m.requests);
+    assert!(
+        badge(&m).is_some_and(|b| b.contains("is gone")),
+        "a person's key between: {:?}",
+        badge(&m)
+    );
+    // A lone multi-select, answered by its button and its review, asked
+    // again straight after the review's Enter.
+    let mut once = multi_screens(LONG_TERM_TEXT);
+    let idle = once.pop().expect("the idle screen");
+    let mut screens = once.clone();
+    screens.extend(once);
+    screens.push(idle);
+    let mut m = texting(screens);
+    let mut s = session(&mut m, None);
+    s.set_approval_env(owner_env());
+    s.supervise(&answering_by(LONG)).expect("supervise");
+    drop(s);
+    assert_eq!(badge(&m), None, "never handed over: {:#?}", m.requests);
+    let answer = [
+        "down".to_string(),
+        "down".to_string(),
+        "down".to_string(),
+        format!("text:{LONG_TERM_TEXT}"),
+        "down".to_string(),
+        "enter".to_string(),
+        "enter".to_string(),
+    ];
+    assert_eq!(
+        m.writes(),
+        [answer.clone(), answer].concat(),
+        "{:#?}",
+        m.requests
+    );
 }
 
 /// `typed` with its key-hint footer row blanked: the loop's text still in a
@@ -895,20 +1007,14 @@ fn a_dialog_the_reader_misses_after_the_loops_enter_is_told_once() {
 #[test]
 fn a_text_the_dialog_never_took_is_handed_over_never_written_twice() {
     let (_, _, free, _) = single_screens(LONG_TERM_TEXT);
-    let (dir, notes) = notes_file("text-not-taken");
     let mut m = texting(vec![free]);
-    let lines = supervised(
-        &mut m,
-        &answering_by(LONG, Some(notes.clone())),
-        &dir,
-        &notes,
-    );
+    let lines = supervised(&mut m, &answering_by(LONG), "text-not-taken");
     assert_eq!(sends(&m).len(), 1, "{:#?}", m.requests);
     assert!(m.presses().is_empty(), "{:#?}", m.requests);
     assert!(
         lines.iter().any(|l| l.contains(
-            "handed to the manager (the dialog did not take the policy text: a text is never \
-             written twice)"
+            "the dialog did not take the policy text: a text is never \
+             written twice"
         )),
         "{lines:#?}"
     );
@@ -972,7 +1078,7 @@ fn a_window_that_cannot_fence_a_typed_answer_gets_the_recommended_option_said() 
         s.set_approval_ledger(Some(ledger.clone()));
         let opts = SuperviseOpts {
             journal: Some(journal.clone()),
-            ..answering_by(LONG, None)
+            ..answering_by(LONG)
         };
         s.supervise(&opts).expect("supervise");
         drop(s);
@@ -1010,7 +1116,7 @@ fn a_window_that_cannot_fence_a_typed_answer_gets_the_recommended_option_said() 
     ]);
     let mut s = session(&mut m, None);
     s.set_approval_env(owner_env());
-    let _ = s.supervise(&answering_by(LONG, None));
+    let _ = s.supervise(&answering_by(LONG));
     drop(s);
     assert_eq!(sends(&m).len(), 1, "{:#?}", m.requests);
 }
@@ -1027,14 +1133,8 @@ fn a_persons_key_between_the_read_and_the_send_skips_the_policy_text() {
     m.human = vec!["15000"];
     m.person_at_send = 1;
     let model = text_model(1, 0, 0);
-    let (st, keys, raced) = q_bound_with(
-        &mut m,
-        &model,
-        0,
-        Some(LONG),
-        &answering_by(LONG, None),
-        |_| {},
-    );
+    let (st, keys, raced) =
+        q_bound_with(&mut m, &model, 0, Some(LONG), &answering_by(LONG), |_| {});
     assert_eq!(
         keys,
         ["down", "down", "text", "enter"],
@@ -1204,10 +1304,8 @@ fn a_persons_input_after_the_text_leaves_the_enter_but_not_the_told_choice() {
             m.vanish_after = Some(1);
         }
         let (jdir, journal) = journal_file("text-person-after");
-        let (ndir, notes) = notes_file("text-person-after-notes");
         let mut opts = SuperviseOpts {
             journal: Some(journal.clone()),
-            notes: Some(notes.clone()),
             ..hosted_by(LONG)
         };
         opts.policy.human_grace_s = PERSON_GRACE_S;
@@ -1268,11 +1366,6 @@ fn a_persons_input_after_the_text_leaves_the_enter_but_not_the_told_choice() {
             "{case}: {:#?}",
             m.requests
         );
-        let noted = read_notes(&ndir, &notes);
-        assert!(
-            !noted.iter().any(|l| l.contains("chose (")),
-            "{case}: {noted:#?}"
-        );
     }
 }
 
@@ -1286,17 +1379,11 @@ fn the_loops_own_text_unticked_on_a_multi_select_is_handed_over() {
         .map(|r| r.replace("[✔]", "[ ]").replace("☒ Toppings", "☐ Toppings"))
         .collect();
     screens.truncate(5);
-    let (dir, notes) = notes_file("text-unticked");
     let mut m = texting(screens);
     // Unticked after the three moves onto the field, at the move off it.
     m.swap_at_key = Some(unticked);
     m.swap_after_keys = 3;
-    let lines = supervised(
-        &mut m,
-        &answering_by(LONG, Some(notes.clone())),
-        &dir,
-        &notes,
-    );
+    let lines = supervised(&mut m, &answering_by(LONG), "text-unticked");
     assert_eq!(sends(&m).len(), 1, "{:#?}", m.requests);
     assert!(
         !m.presses().iter().any(|p| p.ends_with(" enter")),
@@ -1305,8 +1392,8 @@ fn the_loops_own_text_unticked_on_a_multi_select_is_handed_over() {
     );
     assert!(
         lines.iter().any(|l| l.contains(
-            "handed to the manager (the long-term policy text's row reads unticked: its answer \
-             would be none)"
+            "the long-term policy text's row reads unticked: its answer \
+             would be none"
         )),
         "{lines:#?}"
     );
@@ -1418,7 +1505,6 @@ fn an_enter_never_goes_after_the_field_changed_under_the_moves() {
     for (changed, enters) in [(true, 0), (false, 1)] {
         let on_two = focused_on(if changed { &person } else { &free }, "2. Blue");
         let on_one = focused_on(if changed { &person } else { &free }, "1. Red");
-        let (dir, notes) = notes_file(&format!("field-changed-{changed}"));
         // The first read waits out the stand-in quiet; the second decides.
         let mut m = questioned(vec![
             free.clone(),
@@ -1430,9 +1516,8 @@ fn an_enter_never_goes_after_the_field_changed_under_the_moves() {
         m.human = vec![];
         let lines = supervised(
             &mut m,
-            &answering_by(LONG, Some(notes.clone())),
-            &dir,
-            &notes,
+            &answering_by(LONG),
+            &format!("field-changed-{changed}"),
         );
         assert_eq!(
             m.presses().iter().filter(|p| p.ends_with(" enter")).count(),
@@ -1446,9 +1531,9 @@ fn an_enter_never_goes_after_the_field_changed_under_the_moves() {
         );
         if changed {
             assert!(
-                lines.iter().any(|l| l.contains(
-                    "handed to the manager (the free-text row changed since the decision read)"
-                )),
+                lines
+                    .iter()
+                    .any(|l| l.contains("the free-text row changed since the decision read")),
                 "{lines:#?}"
             );
         }
@@ -1467,19 +1552,13 @@ fn a_multi_select_text_that_reads_back_unticked_is_handed_over_at_once() {
         .collect();
     screens.truncate(4);
     screens.push(unticked);
-    let (dir, notes) = notes_file("text-read-back-unticked");
     let mut m = texting(screens);
-    let lines = supervised(
-        &mut m,
-        &answering_by(LONG, Some(notes.clone())),
-        &dir,
-        &notes,
-    );
+    let lines = supervised(&mut m, &answering_by(LONG), "text-read-back-unticked");
     assert_eq!(sends(&m).len(), 1, "{:#?}", m.requests);
     assert!(
         lines.iter().any(|l| l.contains(
-            "handed to the manager (the policy text did not read back as written (its \
-             multi-select row reads unticked): a text is never written twice)"
+            "the policy text did not read back as written (its \
+             multi-select row reads unticked): a text is never written twice"
         )),
         "{lines:#?}"
     );
@@ -1781,7 +1860,7 @@ fn tier1_a_tab_that_falls_back_goes_only_where_the_model_allows() {
         &text_model(1, 0, 0),
         0,
         Some(LONG),
-        &answering_by(LONG, None),
+        &answering_by(LONG),
         |_| {},
     );
     assert_eq!(keys, ["up", "up", "enter"], "{:#?}", m.requests);
@@ -1814,7 +1893,7 @@ fn tier1_a_tab_that_falls_back_goes_only_where_the_model_allows() {
         &text_model(3, 1, 0),
         0,
         Some(LONG),
-        &answering_by(LONG, None),
+        &answering_by(LONG),
         |_| {},
     );
     assert_eq!(

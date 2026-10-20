@@ -9,9 +9,9 @@
 //! `GridStorage.rows` is `pub(crate)`, so external code cannot extract owned
 //! rows that outlive their store.
 //!
-//! These tests check the correct `unsafe` pattern at runtime (Miri-exercisable)
-//! and pin at compile time, at the bottom of this file, that both functions
-//! stay `unsafe fn`. The compiler rejects the unsound uses:
+//! These tests check the correct `unsafe` pattern at runtime (Miri-exercisable),
+//! and the items at the bottom of this file pin at compile time that both
+//! functions stay `unsafe fn`. The compiler rejects the unsound uses:
 //!
 //! ```text
 //! // COMPILE ERROR: call to unsafe function requires unsafe block
@@ -121,13 +121,12 @@ trait RowResizeIsUnsafe<A> {}
 impl<T> RowResizeIsUnsafe<()> for T {}
 impl<T: Fn(&mut Row, u16, &mut PageStore)> RowResizeIsUnsafe<SafeFn> for T {}
 
-fn assert_row_new_is_unsafe<T: RowNewIsUnsafe<A>, A>(_: &T) {}
-fn assert_row_resize_is_unsafe<T: RowResizeIsUnsafe<A>, A>(_: &T) {}
+const fn assert_row_new_is_unsafe<T: RowNewIsUnsafe<A>, A>(_: &T) {}
+const fn assert_row_resize_is_unsafe<T: RowResizeIsUnsafe<A>, A>(_: &T) {}
 
 /// `Row::new` and `Row::resize` are not callable from safe code. The proof is
-/// that this function compiles (see [`RowNewIsUnsafe`]).
-#[test]
-fn row_new_and_resize_stay_unsafe_fns() {
+/// that this item compiles (see [`RowNewIsUnsafe`]).
+const _: () = {
     assert_row_new_is_unsafe(&Row::new);
     assert_row_resize_is_unsafe(&Row::resize);
-}
+};

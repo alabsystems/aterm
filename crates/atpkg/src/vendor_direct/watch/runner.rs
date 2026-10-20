@@ -1188,15 +1188,24 @@ mod tests {
             Duration::from_millis(self.0.mono_ms.load(Ordering::SeqCst))
         }
 
-        /// A head in flight is waited for on the real clock — its worker's completion
-        /// unparks this thread; the bound is only a backstop — then the slice passes.
+        /// A head in flight is waited for on the real clock until its worker's
+        /// completion notice is in — [`HANG`] is only a backstop — then the slice passes.
+        /// One `park_timeout` is not that wait: any unpark of this thread ends it (an
+        /// index probe's, a dropped session's worker's: every host in a test runs on the
+        /// test's thread) and so may a spurious wake, and passing the slice then runs the
+        /// fake clock a slice ahead of a GET its worker has not yet made.
         fn park(&mut self, watch: &mut HeadWatch, slice: Duration) {
             self.0
                 .last_park_ms
                 .store(u64::try_from(slice.as_millis()).unwrap(), Ordering::SeqCst);
             self.0.parks.fetch_add(1, Ordering::SeqCst);
-            if watch.has_pending() {
-                watch.park_for_hint(HANG);
+            let backstop = Instant::now() + HANG;
+            while watch.has_pending()
+                && watch.ready_notices.is_empty()
+                && watch.deferred_moved.is_empty()
+                && Instant::now() < backstop
+            {
+                watch.park_for_hint(backstop.saturating_duration_since(Instant::now()));
             }
             self.0.advance(slice);
             let nap = self.0.nap_ms.swap(0, Ordering::SeqCst);
@@ -1496,13 +1505,42 @@ mod tests {
             "a second tab tries the seat at most once a minute, not every slice: {}",
             second.watch.session_admission_attempts()
         );
+        // The first session goes as a process goes, its threads with it: the GET its last
+        // step left in flight ends before the drop. A dropped runner's worker outlives it,
+        // and one the scheduler had not finished held the store's `.watch` lock through the
+        // second's rounds, each of which read it busy and asked nothing, until the fake
+        // minute had passed (3 runs of 40 on the Linux lane).
+        let ending = Instant::now();
+        while first
+            .watch
+            .pending
+            .iter()
+            .flatten()
+            .any(|head| !head.handle.is_finished())
+        {
+            assert!(
+                ending.elapsed() < HANG,
+                "the first session's GET never ended"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         drop(first);
         let gone = time.wall();
         while vendors.count("second") == 0 {
             assert!(
                 time.wall() <= gone + CADENCE + SLICE * 2,
-                "the next session took the seat within a minute"
+                "the next session took the seat within a minute: seat {:?}, {} round(s) \
+                 pending, {} admission(s) tried, GETs {:?}",
+                watcher(&l),
+                second.watch.pending_count(),
+                second.watch.session_admission_attempts(),
+                vendors.gets.lock().unwrap()
             );
+            // A stray wake ahead of every park, as an index probe's or the dropped
+            // session's worker's leaves on this thread: the fake park still waits for the
+            // GET in flight rather than passing its slice on the wake (a park that passed
+            // it ran the clock past the minute in every run).
+            std::thread::current().unpark();
             second.step();
         }
         assert_eq!(watcher(&l), Watcher::Session(Some(std::process::id())));
@@ -2601,11 +2639,13 @@ mod tests {
     /// failed assertion included: the pass is detached and loops until `go` stands or its
     /// directory is gone. A killed test runs no drop; the fake's own loop covers that
     /// ([`fake_pass`]).
+    #[cfg(unix)]
     struct Release {
         go: PathBuf,
         prefix: PathBuf,
     }
 
+    #[cfg(unix)]
     impl Drop for Release {
         fn drop(&mut self) {
             let _ = std::fs::write(&self.go, b"");
@@ -2615,6 +2655,7 @@ mod tests {
 
     /// The most turns a fake pass's wait takes, 50 ms apart: ten minutes, far past any
     /// test's [`HANG`].
+    #[cfg(unix)]
     const FAKE_PASS_TURNS: u32 = 12_000;
 
     /// A fake `aterm` pass for the detached launch: `warm` exits at once (its first exec is
@@ -2623,6 +2664,7 @@ mod tests {
     /// test) is gone, and after [`FAKE_PASS_TURNS`] turns at most: a test killed outright
     /// runs no drop, and the fake's own process group gets no signal sent to the test's, so
     /// it would otherwise leave a ppid-1 `sh` forking `sleep` 20 times a second.
+    #[cfg(unix)]
     fn fake_pass(owner: u32) -> String {
         format!(
             "#!/bin/sh\n[ \"$1\" = warm ] && exit 0\nd=$(dirname \"$0\")\nprintf '%s %s %s\\n' \

@@ -195,10 +195,14 @@ impl Compiler {
 /// Where a stock toolchain lives, read off a canonical path: rustup's directory (and a system
 /// `RUSTUP_HOME`'s `/usr/local/rustup/toolchains/<name>`), `~/.cargo`, Homebrew; `None`
 /// anywhere else. A rustup `trust` channel is a link onto a sealed toolchain, so its canonical
-/// path is the seal and never lands here.
+/// path is the seal and never lands here. Windows spells the same places with `\`
+/// (`%USERPROFILE%\.rustup\toolchains\…`), read here as `/`.
 #[must_use]
 pub fn stock_location(path: &Path) -> Option<&'static str> {
-    let s = path.to_string_lossy();
+    let mut s = path.to_string_lossy();
+    if cfg!(windows) {
+        s = s.replace('\\', "/").into();
+    }
     if s.contains("/.rustup/") || s.contains("/rustup/toolchains/") {
         return Some("rustup's directory");
     }

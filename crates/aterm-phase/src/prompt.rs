@@ -424,17 +424,52 @@
 //! [`Role::Other`] and nothing approves by them. An unnumbered label Ink
 //! wrapped is one option: a row at the label column of the option above, no
 //! pointer row, that the row above had no room to take the first word of in
-//! the Select's label room (the held message's `Deny — drop it and tell the
-//! sender it was` over `declined` at 50 columns read as three options, so
-//! its delivery was no longer its one other option and it was escalated).
-//! Such a row opens with no capital: every Select label is a capitalised
-//! sentence, so a next label that merely fits nowhere on the row above (the
-//! held message's `Deliver this message to Claude` under its whole Deny label
-//! at 54-63 columns, the trust backstop's `Yes, I trust this folder` under its
-//! whole `No` at 42-48) stays an option of its own. A label Ink wrapped at
-//! a capital (`Deliver this message to` over `Claude`, narrower than 34
-//! columns) is read as two options, as before, and the held message is
-//! escalated. A plan approval's numbered label Ink wrapped is its label too:
+//! the Select's label room, read off a rule on the screen (the next
+//! paragraph; the held message's `Deny — drop it and tell the sender it
+//! was` over `declined` at 50 columns read as three options, so its delivery
+//! was no longer its one other option and it was escalated). Such a row
+//! opens with no capital: every Select label is a capitalised sentence, the
+//! several-server MCP server dialog's server rows (`[✔] lab-probe-b`)
+//! aside, so a next label that merely has no room a cell short of the edge
+//! (the held message's `Deliver this message to Claude` under its whole
+//! Deny label at 54-61 columns, the trust backstop's `Yes, I trust this
+//! folder` under its whole `No` at 42-46) stays an option of its own —
+//! unless the label above with it still spells a
+//! [`kept_answer`] or its first words
+//! ([`kept_answer_head`]: `Use this and all future` over `MCP servers in
+//! this` at 30 columns), or the row opens with a NAME that the label above
+//! carries on to in a label the vendor draws with it mid-sentence
+//! (`NAMED_LABELS`, from the anchor table: the held message's `Deliver this
+//! message to` over `Claude` under 34 columns, Computer Use's `Deny, and
+//! tell` over `Claude what to do differently (esc)` at 18-24, each once read
+//! as two options, the held message escalated). And where a label's row is
+//! full and Ink may have broken a WORD there (`wrap-ansi` breaks a word
+//! longer than its room where the row ends: the usage-limit dialog's
+//! `automaticall` over `y at 12:23pm` at 16-21 columns, once read
+//! `automaticall y`, no wait row, and escalated), the halves are joined with
+//! nothing only where that makes a label the vendor draws (a usage-limit
+//! menu row or a named label); `Upgrade your` over `plan`, its row as full,
+//! stays three words. And a row the join leaves to open an option of its own though
+//! it opens with no capital (a lowercase letter, a digit, punctuation, CJK,
+//! an emoji: the join's own test, [`opens_with_capital`]) is a label's rest
+//! it could not prove wrapped (the held message's Deny label drawn two
+//! cells short of the edge, `it was declined` alone): the block reads no
+//! role a press is chosen by. The several-server MCP server dialog's
+//! server rows open with a checkbox, so the rule holds wherever one is
+//! drawn under another option; read as that dialog, its every role is
+//! [`Role::Persist`] and stays so, and cut, its `Enable selected` still
+//! reads Persist. An answer that reaches past this ask ([`Role::standing`]: kept for good by its label,
+//! `always`, or its rows, for the session, or the session's mode) keeps
+//! its role, so it is never taken for a one-shot allow, nor an answer kept
+//! for good for a reworded box. With no rule
+//! on the screen the join takes a label's rows only as far as they spell a
+//! kept answer whole, so any other label's rest opens an option of its own
+//! there, and the rule blanks that block too: the folder-trust dialog
+//! MEASURED at 20 columns ([`fixtures::TRUST_NARROW`]) cut from `Security
+//! guide` down (its head and rule off the screen) reads `No, exit`
+//! [`Role::Other`], where it read [`Role::Exit`] before the rule; the box,
+//! of no kind, is escalated at every level either way. A plan approval's
+//! numbered label Ink wrapped is its label too:
 //! a row at the label's column (past its number) that the label's last row
 //! had no room to take the first word of in the same room. Its other rows
 //! are the option's description (2.1.281's `shift+tab to approve with this
@@ -444,6 +479,60 @@
 //! 2.1.300's `Yes, and use auto` over `mode` under 29 columns named no
 //! standing mode, so full power took it for the plan's least-power yes and
 //! pressed `1`, auto mode.
+//!
+//! An UNNUMBERED option's label is its whole line ([`unnumbered`]). Ink
+//! wraps it at the label's column, two in from the cursor's, in the room
+//! from there to the pane's edge, past the box's padding that its body keeps:
+//! MEASURED on 2.1.302 in narrow panes on the MCP server dialog
+//! (`claude-2.1.302-mcp-server-*`: `❯ Continue without using this MCP` over
+//! `server` at 40 columns, 36 cells from column 4) and on the folder-trust
+//! dialog (`claude-2.1.302-trust-*`: `Yes, I trust this folder` whole on its
+//! row at 27 columns from column 3). The held message's Select is drawn at
+//! the trust dialog's columns but is not measured, and aterm's hand-built
+//! frames of it ([`fixtures::rewrap_box`]) wrap its labels a cell short of
+//! the edge; so a row is the label's rest where Ink could have wrapped it at
+//! either edge: its first word has no room a cell short of the pane's, on
+//! the row above as Ink's wrap filled it. Under a full row the space before
+//! the next row's first word takes a cell of that row and is drawn nowhere,
+//! and the reader counts that cell under a row at or past the room a cell
+//! short of the edge: exactly full there, or full to the pane's edge, one
+//! cell past it (`Use this and all future MCP`, 27 cells against 26 at 31
+//! columns, MEASURED) ([`crate::wrap::lead`]: READ in the 2.1.302 bundle, whose
+//! Ink wraps a Text with `Bun.wrapAnsi`, `trim` off, and slices that space
+//! off the row it draws; MEASURED on that build's titles, bodies and
+//! descriptions, [`fixtures::ink_wrap`], though on no label row it decides).
+//! Counted from its text alone, the
+//! held message re-wrapped so at 22 columns read its Deny label's last row
+//! (`it was declined`, under `tell the sender` under the full `Deny — drop it
+//! and`) as an option of its own, which full power focused while the
+//! delivery under it was not yet drawn. And a
+//! pane too short for the box shows fewer options, scrolled to the cursor, the
+//! vendor's `↑`/`↓` in the pointer column of an end option that has more
+//! past it — unless the cursor is on that option, whose `❯` is drawn there
+//! instead (the dialog for several servers draws no arrow at all). Read a
+//! row at a time, the MCP server dialog's whole-label answers
+//! ([`kept_answer`]) were fragments: its kept refusal read as a bare
+//! `Continue without …`, pressed by full power on the dialog retitled, and
+//! its frame with the head cut Escaped by the reset step. But no row says
+//! where a label ends: the next option's first row is drawn at the same
+//! column as a wrapped label's rest, and under a row filled close to the
+//! edge (`❯ Use this and all future MCP servers in this project` at 60
+//! columns) it reads as one. So what an answer KEPT for good is never rests
+//! on the join: an option is kept
+//! ([`Opt::kept`]) when any run of its block's rows that takes in one of its
+//! own spells a [`kept_answer`] whole — or, ending the block as a frame half
+//! drawn may, its first two words or more ([`kept_answer_head`]) — and it
+//! reads [`Role::Persist`]: a label joined too far, or not far enough, is
+//! still the kept answer it holds.
+//!
+//! A Select that draws its options' DESCRIPTIONS draws them beside the
+//! labels, in a column of their own ([`beside_column`]; MEASURED on the
+//! 2.1.302 model picker): the description's rows are no options, and a
+//! label too long for its column is cut short with `…` ([`cut_short`]),
+//! which reads no role. Read row by row, the Chrome setup panel's
+//! `Continue with browser tools` took its description into its label and
+//! was no kept answer, and in a narrow pane its description's rows were
+//! options of their own.
 //!
 //! **NOTE ROWS** ([`Prompt::notes`]): the rows of a Bash (or PowerShell)
 //! box left of the command's column (at the box's own column), before `Do
@@ -925,6 +1014,16 @@ impl Role {
             Role::Other => "other",
         }
     }
+
+    /// The answer reaches past this one ask: for the rest of the session
+    /// ([`Role::Session`]), for good ([`Role::Persist`]) or as the
+    /// session's mode ([`Role::ModeSwitch`]). No rule takes one for a
+    /// one-shot allow, and the no-capital rule ([`options_of`]) never takes
+    /// one away, so that still holds in a block it blanks.
+    #[must_use]
+    pub fn standing(self) -> bool {
+        matches!(self, Role::Session | Role::Persist | Role::ModeSwitch)
+    }
 }
 
 /// One option of a box.
@@ -939,6 +1038,19 @@ pub struct Opt {
     pub focused: bool,
     /// The row it starts on.
     pub row: usize,
+    /// Its answer is KEPT for good by the rows it is drawn on: some run of
+    /// its unnumbered block's label rows that takes in one of its own,
+    /// joined with one space, its marks and any description beside it left
+    /// out, is a [`kept_answer`] whole (module header, "OPTIONS"). So a
+    /// label read joined too far (`Use this and all future MCP servers in
+    /// this project Continue without using this MCP server`) or not far
+    /// enough (`Continue without using this MCP` over `server`) still holds
+    /// the answer it does; and so does a run that ends the block, as a frame
+    /// half drawn shows it, spelling a kept answer's first words (two at
+    /// least: `Continue with browser` over rows not yet drawn). `false` for a
+    /// numbered option and every other reader's: their labels are read
+    /// whole.
+    pub kept: bool,
 }
 
 impl Opt {
@@ -1767,6 +1879,7 @@ fn question_opts(d: &QuestionDialog, rows: &[String]) -> Vec<Opt> {
         role: Role::Other,
         focused,
         row,
+        kept: false,
     };
     let options = |options: &[QuestionOption]| -> Vec<Opt> {
         options
@@ -2503,9 +2616,24 @@ fn last_hint(rows: &[String]) -> Option<(usize, usize)> {
 /// footer that is not this box's (`Esc to cancel`, the question dialog's
 /// last item alone), and the first is none either (`… · Esc to`): read row
 /// by row, the box had no footer, or the wrong one.
+///
+/// A footer, on one row or wrapped, holds an `Esc` ([`is_hint_footer`]), so
+/// a row with none within [`FOOTER_ROWS`] above it ends none and is passed
+/// over before the walk up, which measures the cells of each row it reads:
+/// taken at every row, the walk was half the panic sweep's CPU (2026-10-18).
 fn last_footer(rows: &[String]) -> Option<(usize, usize)> {
+    let esc: Vec<bool> = rows
+        .iter()
+        .map(|r| crate::text::contains(r, "Esc"))
+        .collect();
+    if !esc.contains(&true) {
+        return None;
+    }
     let width = crate::question::screen_width(rows);
     (0..rows.len()).rev().find_map(|last| {
+        if !esc[last.saturating_sub(FOOTER_ROWS - 1)..=last].contains(&true) {
+            return None;
+        }
         let mut found = is_hint_footer(&rows[last]).then_some(last);
         let mut first = last;
         while last - first + 1 < FOOTER_ROWS
@@ -3412,15 +3540,21 @@ fn is_title(line: &str) -> bool {
 }
 
 /// The pane's width in cells, for a reader of the rows [`unwrapped`] joined
-/// (a joined footer runs past the pane's edge): the widest of the rules
-/// Claude Code draws across the whole pane — the composer's and a box's `─`,
-/// the panel's `▔`, a bracket's `╌` — else the widest row.
+/// (a joined footer runs past the pane's edge): [`rule_width`], else the
+/// widest row.
 fn pane_width(rows: &[String]) -> usize {
+    rule_width(rows).unwrap_or_else(|| crate::question::screen_width(rows))
+}
+
+/// The pane's width in cells as a rule says it: the widest of the rules
+/// Claude Code draws across the whole pane — the composer's and a box's `─`,
+/// the panel's `▔`, a bracket's `╌`. `None` with no rule on the rows: the
+/// widest row is then all there is, and it may be cells short of the pane.
+fn rule_width(rows: &[String]) -> Option<usize> {
     rows.iter()
         .filter(|r| crate::phase::is_rule(r) || is_panel_rule(r) || is_dashed_rule(r))
         .map(|r| crate::text::trim_end(r).chars().count())
         .max()
-        .unwrap_or_else(|| crate::question::screen_width(rows))
 }
 
 /// The kind a box's title row names (module header, "EVERY BOX IS NAMED BY
@@ -3530,18 +3664,6 @@ fn pointer_row(row: &str, cur: &[char]) -> bool {
             .is_some_and(|rest| rest.starts_with(' ') && !crate::text::trim(rest).is_empty())
 }
 
-/// The column an option row's label starts at: past its cursor (one of
-/// `cur`) and the space after it, or its own indent.
-fn label_column(row: &str, cur: &[char]) -> usize {
-    use crate::question::cells;
-    let t = crate::text::trim_start(row);
-    let lead = crate::phase::leading_spaces(row);
-    match strip_cursor(t, cur) {
-        Some(rest) => lead + cells(t) - cells(crate::text::trim_start(rest)),
-        None => lead,
-    }
-}
-
 /// The cursor every measured box draws, `❯` ([`cursors`] of any title but
 /// the usage-limit dialog's, and of a box read with no title of its own).
 const ARROW: &[char] = &['❯'];
@@ -3635,6 +3757,38 @@ pub fn kept_answer(label: &str) -> bool {
         .any(|id| l == crate::anchors::anchor_text(id).to_lowercase())
 }
 
+/// Whether `text` (trimmed, `’` read as `'`, any case) is the first words of
+/// one of [`KEPT_ANSWERS`], two words at least and not the whole of it:
+/// `Continue with browser`, `Use this and all future MCP servers`, never
+/// `Continue` alone. What [`kept_rows`] reads at the end of a block that may
+/// be half drawn, and what lets a row that opens with a capital carry on a
+/// label ([`unnumbered`]).
+fn kept_answer_head(text: &str) -> bool {
+    let t = crate::text::trim(text).replace('’', "'").to_lowercase();
+    t.split(' ').filter(|w| !w.is_empty()).count() >= 2
+        && KEPT_ANSWERS.iter().any(|id| {
+            crate::anchors::anchor_text(id)
+                .to_lowercase()
+                .strip_prefix(&t)
+                .is_some_and(|rest| rest.starts_with(' '))
+        })
+}
+
+/// Whether Claude Code cut `label` short to fit its column: it ends in `…`,
+/// as the Select cuts a label in the column it gives the labels when it
+/// draws their descriptions beside them ([`beside_column`]), and then draws
+/// ` ✔` after it when the option is the one already selected (2.1.302's
+/// model picker at 40 columns, MEASURED: `Default (recomme… ✔`). Such a
+/// label is not read whole: what was cut may say its answer is kept for
+/// good (`Continue without using t…`), so no role is read from what is left.
+#[must_use]
+pub fn cut_short(label: &str) -> bool {
+    let l = crate::text::trim_end(label);
+    l.strip_suffix('✔')
+        .map_or(l, crate::text::trim_end)
+        .ends_with('…')
+}
+
 /// Whether `label` is the usage-limit dialog's wait row, in any of the three
 /// spellings the 2.1.282 binary builds (`dt()` in its
 /// `rate_limit_options_menu`): `Wait here, then continue automatically
@@ -3715,15 +3869,31 @@ fn divider_row(row: &str) -> bool {
 /// rows wrapped under it (indented past its number, before a blank row)
 /// joined onto its label — a question's and a plan approval's only where
 /// they are the label's Ink wrap (module header, "OPTIONS"), the rest its
-/// description; or, when none is numbered, the rows of the last
-/// block above `to` when that block holds the `❯` cursor, one option each,
-/// save a row that is the Ink wrap of the label above it (module header,
-/// "OPTIONS"), joined onto it.
+/// description; or, when none is numbered, the rows of the last block above
+/// `to` when that block holds the `❯` cursor, read by [`unnumbered`]: a
+/// label wrapped over rows is one option, and a description drawn beside
+/// the labels is none.
 /// Roles come from [`role_of`] only when the options are SOUND: numbered
 /// `1.` to `n.` in order with nothing but blank and divider rows among and
 /// under them, or unnumbered with exactly one cursor; and at most one
-/// cursor either way. Otherwise every role is [`Role::Other`], so nothing
-/// approves by a label the model may have written.
+/// cursor either way — an option kept for good by its rows ([`Opt::kept`])
+/// then reads [`Role::Persist`] whatever its label. Otherwise every role is
+/// [`Role::Other`], so nothing approves by a label the model may have
+/// written. And in an unnumbered block where an option under another opens
+/// with no capital ([`opens_with_capital`]: a lowercase letter, a digit,
+/// punctuation, CJK, an emoji), which no vendor answer does but the
+/// several-server MCP server dialog's server rows (`[✔] lab-probe-b`,
+/// [`Role::Persist`] where it is read as that dialog), every role reads
+/// [`Role::Other`] but the standing ones ([`Role::standing`]):
+/// [`Role::Persist`], which the label table (`always`, a whole
+/// [`kept_answer`]) or the rows ([`Opt::kept`]) give an answer kept for
+/// good, [`Role::Session`] and
+/// [`Role::ModeSwitch`]. Such an option is a wrapped label's rest the join
+/// could not prove (the held message's Deny label wrapped two cells short
+/// of the edge, `it was declined` under `tell the sender`), and the rule
+/// only takes away the roles a press is chosen by: an answer that reaches
+/// past this ask keeps the role that keeps a one-shot allow off it, and no
+/// answer kept for good is taken for a reworded one.
 fn options_of(rows: &[String], from: usize, to: usize, kind: PromptKind, cur: &[char]) -> Options {
     use crate::phase::leading_spaces;
     let question = (from..to).rev().find(|&i| question_row(&rows[i], kind));
@@ -3735,17 +3905,25 @@ fn options_of(rows: &[String], from: usize, to: usize, kind: PromptKind, cur: &[
     // A plan approval's label still open under its option row: its column
     // and its last row's text (module header, "A WRAPPED TITLE").
     let mut label_at: Option<(usize, String)> = None;
+    // Each option's breaks Ink may have put inside a word ([`broken_word`]):
+    // where its label's joining spaces stand.
+    let mut breaks: Vec<Vec<usize>> = Vec::new();
+    // The text of the last row joined onto the last option.
+    let mut tail = String::new();
     let width = pane_width(rows);
     for (i, r) in rows.iter().enumerate().take(to).skip(start) {
         if let Some((n, label)) = option_row(r, cur) {
             number_col = r.chars().position(|c| c.is_ascii_digit());
             label_at = number_col.map(|col| (col + n.to_string().len() + 2, label.clone()));
+            tail.clone_from(&label);
+            breaks.push(Vec::new());
             out.push(Opt {
                 n: Some(n),
                 label,
                 role: Role::Other,
                 focused: strip_cursor(crate::text::trim_start(r), cur).is_some(),
                 row: i,
+                kept: false,
             });
             continue;
         }
@@ -3776,8 +3954,15 @@ fn options_of(rows: &[String], from: usize, to: usize, kind: PromptKind, cur: &[
                 }
             }
             (Some(col), Some(last)) if !t.is_empty() && leading_spaces(r) > col => {
+                let room = width.saturating_sub(leading_spaces(r) + 1);
+                if let Some(b) = breaks.last_mut()
+                    && broken_word(&tail, t, room)
+                {
+                    b.push(last.label.len());
+                }
                 last.label.push(' ');
                 last.label.push_str(t);
+                t.clone_into(&mut tail);
             }
             _ => {
                 number_col = None;
@@ -3801,63 +3986,54 @@ fn options_of(rows: &[String], from: usize, to: usize, kind: PromptKind, cur: &[
             .collect();
         match block.last() {
             Some(&top) if block.iter().any(|&j| pointer_row(&rows[j], cur)) => {
-                // A label Ink wrapped is one option: a row that is no
-                // pointer row and opens with no capital, at the label column
-                // of the option above, which that option's last row had no
-                // room to take the first word of in the Select's label room
-                // (the pane less the label column and the frame's one column
-                // of padding). Every Select label is a capitalised sentence
-                // and the rest of one carries on mid-sentence (`declined`),
-                // while a next label that fits under a whole one opens with
-                // a capital (`Deliver this message to Claude` under the
-                // whole Deny label at 54-63 columns, `Yes, I trust this
-                // folder` under the backstop's `No` at 42-48).
-                // The row read last.
-                let mut prev: Option<usize> = None;
-                out = Vec::new();
-                for &i in block.iter().rev().filter(|&&i| !divider_row(&rows[i])) {
-                    let t = crate::text::trim(&rows[i]);
-                    if let (Some(last), Some(above)) = (out.last_mut(), prev)
-                        && !pointer_row(&rows[i], cur)
-                        && !t.chars().next().is_some_and(char::is_uppercase)
-                    {
-                        let col = label_column(&rows[last.row], cur);
-                        let room = width.saturating_sub(col + 1);
-                        if above + 1 == i
-                            && crate::wrap::continues(
-                                crate::text::trim(
-                                    strip_cursor(crate::text::trim(&rows[above]), cur)
-                                        .unwrap_or(rows[above].as_str()),
-                                ),
-                                col,
-                                &rows[i],
-                                room,
-                            )
-                        {
-                            last.label.push(' ');
-                            last.label.push_str(t);
-                            prev = Some(i);
-                            continue;
-                        }
-                    }
-                    out.push(Opt {
-                        n: None,
-                        label: strip_cursor(t, cur).unwrap_or(t).trim().to_string(),
-                        role: Role::Other,
-                        focused: strip_cursor(t, cur).is_some(),
-                        row: i,
-                    });
-                    prev = Some(i);
-                }
+                let block: Vec<usize> = block
+                    .iter()
+                    .rev()
+                    .copied()
+                    .filter(|&i| !divider_row(&rows[i]))
+                    .collect();
+                // The pane's width read over the rows above the footer: a
+                // footer Ink wrapped is one row here, wider than the pane.
+                (out, breaks) =
+                    unnumbered(rows, &block, cur, rule_width(&rows[..to.min(rows.len())]));
                 (true, question.unwrap_or(top))
             }
             _ => (false, question.unwrap_or(to)),
         }
     };
+    // A label Ink broke inside a word reads as the label it is where the
+    // halves, joined with nothing, make one the vendor draws.
+    for (o, b) in out.iter_mut().zip(&breaks) {
+        if let Some(whole) = unbroken(&o.label, b) {
+            o.label = whole;
+        }
+    }
     let sound = sound && out.iter().filter(|o| o.focused).count() <= 1;
+    // Every vendor label is a capitalised sentence, the several-server MCP
+    // server dialog's server rows aside, Persist read as that dialog (module
+    // header, "OPTIONS"): an unnumbered option under another that opens with no
+    // capital ([`opens_with_capital`], the join's own test) is the rest of a
+    // label the join could not prove wrapped, so no option of the block
+    // reads a role a press is chosen by. The rule only takes roles away: an
+    // answer that reaches past this ask (`Role::standing`: kept for good by
+    // its rows or its label, for the session, or the session's mode) keeps
+    // its role, and every other role reads Other.
+    let premise = !out
+        .iter()
+        .skip(1)
+        .any(|o| o.n.is_none() && !opens_with_capital(&o.label));
     if sound {
         for o in &mut out {
-            o.role = role_of(&o.label, kind);
+            let role = if o.kept {
+                Role::Persist
+            } else {
+                role_of(&o.label, kind)
+            };
+            o.role = if premise || role.standing() {
+                role
+            } else {
+                Role::Other
+            };
         }
     }
     Options {
@@ -3866,6 +4042,360 @@ fn options_of(rows: &[String], from: usize, to: usize, kind: PromptKind, cur: &[
         content_end,
         sound,
     }
+}
+
+/// The options of an unnumbered block, its rows `block` top down, dividers
+/// left out (module header, "OPTIONS"), in a pane `width` cells wide where a
+/// rule on the screen says so ([`rule_width`]). A row marked in the Select's
+/// pointer column ([`marked`]) opens an option, and a row of the description
+/// drawn beside the labels ([`beside_column`]) is no option's label. An
+/// unmarked row at the label's column is the rest of the label above it
+/// only where that is sure. Ink wraps a label at that column, two in from
+/// the cursor's, in the room from there to the pane's edge: MEASURED on
+/// 2.1.302's MCP server dialog at 30, 35, 40, 54 and 55 columns (from column
+/// 4: `Continue without using this MCP` fills its 31 cells at 35, `… in this
+/// project` its 51 at 55 and wraps at 54) and its folder-trust dialog at 20
+/// and 27 ([`fixtures::TRUST_NARROW`], from column 3). The held message, its
+/// Select at the trust dialog's columns, is not measured: aterm's hand-built
+/// frames of it ([`fixtures::rewrap_box`]) wrap a label a cell short of the
+/// edge. So:
+/// * the pane's width known, a row is the rest when the row above could not
+///   have taken its first word a cell short of the edge, that row counted as
+///   Ink's wrap filled it (under a row at or past that room, a cell for the
+///   space it draws nowhere: [`crate::wrap::lead`]), so Ink could have wrapped it at either
+///   ([`crate::wrap::continues_exactly`]), the label so far
+///   is not one of the vendor's whole answers ([`kept_answer`]), and the
+///   row opens with no capital, unless the label so far with it
+///   still spells a kept answer or its first words ([`kept_answer_head`]:
+///   `Use this and all future` over `MCP servers in this` at 30 columns) or
+///   opens a label the vendor draws with that capital's NAME mid-sentence
+///   ([`opens_named_label`]: `Deliver this message to` over `Claude`):
+///   under a row filled close to the edge the next option's first row reads
+///   to the rule as wrapped (`❯ Use this and all future MCP servers in this
+///   project` over `Continue without using this MCP server` at 60 columns,
+///   and the held message's whole `Deny …` label over `Deliver this message
+///   to Claude` at 54 to 61);
+/// * not known, the rows from an option's first are its label only as far as
+///   they spell a kept answer whole: the widest row may be cells short of
+///   the pane, and proves no wrap.
+///
+/// Every other row opens an option. Each option is then [`Opt::kept`] by
+/// its block's rows ([`kept_rows`]), however the join read it; and handed
+/// back with the joining spaces of its label where, the pane's width known,
+/// Ink may have broken a word ([`broken_word`]), for [`unbroken`] to read.
+fn unnumbered(
+    rows: &[String],
+    block: &[usize],
+    cur: &[char],
+    width: Option<usize>,
+) -> (Vec<Opt>, Vec<Vec<usize>>) {
+    use crate::phase::leading_spaces;
+    let pointer = block
+        .iter()
+        .find(|&&i| pointer_row(&rows[i], cur))
+        .map_or(0, |&i| leading_spaces(&rows[i]));
+    let at = pointer + 2;
+    let beside = beside_column(rows, block, pointer, cur);
+    // The block's label rows, each as (its row, `Some(focused)` when marked,
+    // its text with the mark and any description beside it cut off).
+    let mut lines: Vec<(usize, Option<bool>, &str)> = Vec::new();
+    for &i in block {
+        let r = &rows[i];
+        let (mark, text) = match marked(r, cur) {
+            Some((focused, text)) => (Some(focused), text),
+            None if !lines.is_empty() && beside.is_some_and(|col| leading_spaces(r) == col) => {
+                continue;
+            }
+            None => (None, crate::text::trim(r)),
+        };
+        let text = match beside {
+            Some(_) => text.split("  ").next().unwrap_or(text).trim(),
+            None => text,
+        };
+        lines.push((i, mark, text));
+    }
+    let rest = |j: usize| lines[j].1.is_none() && leading_spaces(&rows[lines[j].0]) == at;
+    let joined = |a: usize, b: usize| {
+        lines[a..b]
+            .iter()
+            .map(|l| l.2)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let whole = |a: usize, b: usize| kept_answer(spelled(&joined(a, b)));
+    // Whether line `j` may carry on the label opened at line `a`: every
+    // vendor label is a capitalised sentence (the several-server MCP server
+    // dialog's `[✔] <server>` rows aside) and a wrapped one's rest carries
+    // on mid-sentence, so a row that opens with a capital opens a label of
+    // its own, unless the label so far with it still spells a kept answer or
+    // its first words (`Use this and all future` over `MCP servers in this`
+    // at 30 columns), or opens a label the vendor draws with that capital's
+    // NAME mid-sentence ([`opens_named_label`]: `Deliver this message to`
+    // over `Claude`).
+    let carries_on = |a: usize, j: usize| {
+        let so_far = joined(a, j + 1);
+        !opens_with_capital(lines[j].2)
+            || kept_answer(spelled(&so_far))
+            || kept_answer_head(spelled(&so_far))
+            || opens_named_label(&so_far)
+    };
+    // The line each option opens on.
+    let mut starts = Vec::new();
+    let mut j = 0;
+    while j < lines.len() {
+        let first = j;
+        starts.push(first);
+        j += 1;
+        match width {
+            _ if beside.is_some() => {}
+            Some(width) => {
+                // The room at the nearer of the two right edges a label is
+                // read against: the pane's (MEASURED) and one cell short of
+                // it (MODELLED: aterm's hand-built held-message frames). A
+                // word too wide for the nearer is the row's rest: Ink could
+                // have wrapped it at either. The row above is read as
+                // wrap-ansi filled it: under a row at or past that room, the
+                // space before its first word took a cell, drawn nowhere
+                // ([`crate::wrap::lead`]), the cell the row above's own lead
+                // took counted in it.
+                let room = width.saturating_sub(at + 1);
+                let mut lead = 0;
+                while j < lines.len()
+                    && rest(j)
+                    && !whole(first, j)
+                    && carries_on(first, j)
+                    && crate::wrap::continues_exactly(
+                        lines[j - 1].2,
+                        lead,
+                        at,
+                        &rows[lines[j].0],
+                        room,
+                    )
+                {
+                    lead = crate::wrap::lead(lead + crate::question::cells(lines[j - 1].2), room);
+                    j += 1;
+                }
+            }
+            None => {
+                if let Some(last) = (first..lines.len())
+                    .take_while(|&k| k == first || rest(k))
+                    .find(|&k| whole(first, k + 1))
+                {
+                    j = last + 1;
+                }
+            }
+        }
+    }
+    let texts: Vec<&str> = lines.iter().map(|l| spelled(l.2)).collect();
+    let kept = kept_rows(&texts, &starts);
+    // The room a label is read in, where a rule says the pane's width.
+    let room = width
+        .filter(|_| beside.is_none())
+        .map(|width| width.saturating_sub(at + 1));
+    starts
+        .iter()
+        .enumerate()
+        .map(|(k, &a)| {
+            let b = starts.get(k + 1).copied().unwrap_or(lines.len());
+            // Where Ink may have broken a word between two of the label's
+            // rows ([`broken_word`]): the joining spaces, as byte offsets.
+            let breaks = room.map_or_else(Vec::new, |room| {
+                (a + 1..b)
+                    .filter(|&j| broken_word(lines[j - 1].2, lines[j].2, room))
+                    .map(|j| joined(a, j).len())
+                    .collect()
+            });
+            let opt = Opt {
+                n: None,
+                label: joined(a, b),
+                role: Role::Other,
+                focused: lines[a].1 == Some(true),
+                row: lines[a].0,
+                kept: kept[k],
+            };
+            (opt, breaks)
+        })
+        .unzip()
+}
+
+/// Which options of an unnumbered block hold an answer KEPT for good by
+/// their rows ([`Opt::kept`]): `lines` the texts of its label rows top down
+/// ([`spelled`]), `starts` the line each option opens on. An option is kept
+/// when some run of the lines that takes in one of its own — from its
+/// start up to the next option's — joined with one space is a
+/// [`kept_answer`] whole: a run inside one label read joined too far, or
+/// across two read where one label was cut in two. A run that ends the
+/// block's rows may be a frame half drawn, the rest of its label not yet
+/// on the screen: it is kept when it spells the first words of one, two at
+/// least ([`kept_answer_head`]: `Continue with browser` over rows not yet
+/// drawn).
+fn kept_rows(lines: &[&str], starts: &[usize]) -> Vec<bool> {
+    let longest = KEPT_ANSWERS
+        .iter()
+        .map(|id| crate::anchors::anchor_text(id).chars().count())
+        .max()
+        .unwrap_or(0);
+    // The option line `i` is a row of.
+    let owner = |i: usize| starts.partition_point(|&s| s <= i).saturating_sub(1);
+    let mut kept = vec![false; starts.len()];
+    for a in 0..lines.len() {
+        let mut run = String::new();
+        for (b, line) in lines.iter().enumerate().skip(a) {
+            if b > a {
+                run.push(' ');
+            }
+            run.push_str(line);
+            if run.trim().chars().count() > longest {
+                break;
+            }
+            if kept_answer(&run) || (b + 1 == lines.len() && kept_answer_head(&run)) {
+                for k in &mut kept[owner(a)..=owner(b)] {
+                    *k = true;
+                }
+            }
+        }
+    }
+    kept
+}
+
+/// Whether `text` opens with a capital letter: its first character is
+/// uppercase, as each of the vendor's answers opens, a capitalised sentence
+/// (module header, "OPTIONS"), but the several-server MCP server dialog's
+/// server rows (`[✔] lab-probe-b`). A row that opens with anything else — a
+/// lowercase letter, a digit, punctuation, CJK, an emoji, or nothing — may
+/// carry on the label above it ([`unnumbered`]), and an option that still
+/// opens so under another is a label's rest the join could not prove
+/// wrapped ([`options_of`]): the one test for both.
+fn opens_with_capital(text: &str) -> bool {
+    text.chars().next().is_some_and(char::is_uppercase)
+}
+
+/// A label row's text as its answer spells it: a checkbox it opens with
+/// (`[✔] `, `[ ] `, the MCP server dialog for several) left out.
+fn spelled(text: &str) -> &str {
+    let mut c = text.chars();
+    match (c.next(), c.next(), c.next(), c.next()) {
+        (Some('['), Some(_), Some(']'), Some(' ')) => c.as_str().trim_start(),
+        _ => text,
+    }
+}
+
+/// An unnumbered option row's text after the mark that opens an option:
+/// `Some((true, text))` after the cursor (one of `cur`); `Some((false,
+/// text))` after the `↑` or `↓` the vendor draws in the pointer column of
+/// the first or last option it shows when options are scrolled out above or
+/// below it (MEASURED on 2.1.302 in a 40x10 pane, which shows two of the MCP
+/// server dialog's three: `↑ Use this and all future MCP servers`) — but
+/// never on the cursor's option, whose `❯` is drawn there instead, and
+/// never in the dialog for several servers, which draws none; `None` for a
+/// row with no mark.
+fn marked<'a>(row: &'a str, cur: &[char]) -> Option<(bool, &'a str)> {
+    let t = crate::text::trim(row);
+    if let Some(rest) = strip_cursor(t, cur) {
+        return Some((true, rest.trim()));
+    }
+    ['↑', '↓']
+        .iter()
+        .find_map(|&a| t.strip_prefix(a))
+        .filter(|rest| rest.starts_with(' '))
+        .map(|rest| (false, rest.trim()))
+}
+
+/// The column of the DESCRIPTIONS a Select draws beside its options' labels,
+/// in the block `block` whose pointer column is `pointer`; `None` when it
+/// draws none there. Claude Code's Select lays an option list with
+/// descriptions out in two columns (2.1.302's Select in its default layout):
+/// each label in a column of its own, no wider than 60% of the pane and cut
+/// short there with `…` ([`cut_short`]), then two blanks and the
+/// description, wrapped in the rest of the row at its own column. MEASURED on
+/// 2.1.302's model picker (`claude-2.1.302-model-picker-40col.txt`): at 40
+/// columns `❯ 1. Default (recomme… ✔  Use the` over `default` at column 28.
+/// So the first option row whose text holds a gap of two blanks or more
+/// names the column: where the text after its gap starts.
+fn beside_column(rows: &[String], block: &[usize], pointer: usize, cur: &[char]) -> Option<usize> {
+    let at = pointer + 2;
+    block.iter().find_map(|&i| {
+        let r = &rows[i];
+        let text = match marked(r, cur) {
+            Some((_, text)) => text,
+            None if crate::phase::leading_spaces(r) == at => crate::text::trim(r),
+            None => return None,
+        };
+        let gap = text.find("  ")?;
+        let blanks = text[gap..].len() - text[gap..].trim_start().len();
+        Some(at + text[..gap].chars().count() + blanks)
+    })
+}
+
+/// The Select labels the vendor draws with a NAME mid-sentence (anchors
+/// `held.deliver`, `computer_use.deny`): a capital Ink may wrap onto a row of
+/// its own in a narrow pane, where a row that opens with a capital is
+/// otherwise the next label (module header, "OPTIONS").
+const NAMED_LABELS: [&str; 2] = [
+    crate::anchors::anchor_text("held.deliver"),
+    crate::anchors::anchor_text("computer_use.deny"),
+];
+
+/// Whether `label`, an option's label read so far, its ` (esc)` mark aside,
+/// is one of [`NAMED_LABELS`] or opens one up to the end of a word.
+fn opens_named_label(label: &str) -> bool {
+    let l = label
+        .strip_suffix(const { crate::anchors::anchor_text("option.esc") })
+        .unwrap_or(label);
+    NAMED_LABELS.iter().any(|n| {
+        n.strip_prefix(l)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    })
+}
+
+/// Whether `label` is one the vendor's dialogs draw whole that a reader
+/// goes by: a usage-limit menu row ([`is_limit_menu_label`]) or one of
+/// [`NAMED_LABELS`] (its ` (esc)` mark aside).
+fn vendor_label(label: &str) -> bool {
+    let l = label
+        .strip_suffix(const { crate::anchors::anchor_text("option.esc") })
+        .unwrap_or(label);
+    is_limit_menu_label(label) || NAMED_LABELS.contains(&l)
+}
+
+/// Whether Ink may have broken a WORD between a label's row `above` and the
+/// row under it, `below` (both trimmed), in a label room of `room` cells (the
+/// pane less the label's column and one column of the frame): `wrap-ansi`'s
+/// hard wrap breaks only a word longer than the room, filling the row to its
+/// edge, so the row above is full (a cell short of the room at most: the
+/// frame's right padding is not on the screen) and its last word and the
+/// row's first are together wider than the room less one. A whole word that
+/// happens to fill its row reads so too (`Upgrade your` over `plan` at 20
+/// columns): what decides is the label the halves make ([`unbroken`]).
+fn broken_word(above: &str, below: &str, room: usize) -> bool {
+    use crate::question::cells;
+    let last = above.rsplit(' ').next().map_or(0, cells);
+    let first = below.split(' ').next().map_or(0, cells);
+    cells(above) + 1 >= room && last + first + 1 >= room
+}
+
+/// `label`, its joining spaces at `breaks` (byte offsets, ascending: where
+/// [`broken_word`] said Ink may have broken a word), read with some of them
+/// taken out — the fewest first — where that makes a label the vendor draws
+/// ([`vendor_label`]) and `label` as joined is none. `None` otherwise: the
+/// label stays as its rows read, joined with spaces.
+fn unbroken(label: &str, breaks: &[usize]) -> Option<String> {
+    // Four breaks are sixteen readings; a label broken more often than that
+    // stays as read.
+    if breaks.is_empty() || breaks.len() > 4 || vendor_label(label) {
+        return None;
+    }
+    let mut masks: Vec<u32> = (1..1u32 << breaks.len()).collect();
+    masks.sort_by_key(|m| m.count_ones());
+    masks.into_iter().find_map(|mask| {
+        let mut l = label.to_string();
+        for (k, &at) in breaks.iter().enumerate().rev() {
+            if mask & (1 << k) != 0 {
+                l.remove(at);
+            }
+        }
+        vendor_label(&l).then_some(l)
+    })
 }
 
 /// A box's options as [`options_of`] reads them.
@@ -3899,7 +4429,11 @@ struct Options {
 /// [`Role::Persist`], and so is each [`kept_answer`] under any title, in a
 /// box of any kind but the usage-limit dialog, whose rows are read by its
 /// own table first (every row but the wait row [`Role::Other`]). A label
-/// the table does not know is [`Role::Other`].
+/// the table does not know is [`Role::Other`], and so is a label cut short
+/// ([`cut_short`]), which may say more than its head: `Continue without
+/// using t…` reads no refusal. The kind comes first: an MCP server
+/// dialog's option, cut short or not, is a [`Role::Persist`], and the
+/// usage-limit dialog's table reads its rows before [`cut_short`] does.
 fn role_of(label: &str, kind: PromptKind) -> Role {
     if kind == PromptKind::McpServer {
         // Every answer of it is saved for good, the checkbox rows and the
@@ -3914,6 +4448,9 @@ fn role_of(label: &str, kind: PromptKind) -> Role {
         } else {
             Role::Other
         };
+    }
+    if cut_short(label) {
+        return Role::Other;
     }
     let l = label.replace('’', "'").to_lowercase();
     let l = l
@@ -4130,6 +4667,16 @@ pub mod fixtures {
     pub const BOX_RM_WORKFLOW: &str = include_str!("fixtures/claude-2.1.28x-box-rm-workflow.txt");
     /// Claude Code 2.1.280: the folder-trust dialog.
     pub const TRUST: &str = include_str!("fixtures/claude-2.1.280-trust.txt");
+    /// MEASURED on 2.1.302 (each file's line): the folder-trust dialog in a
+    /// pane 27 and 20 columns wide, its Select at the columns the held
+    /// message's is drawn at (the cursor at 1, the labels at 3): `Yes, I
+    /// trust this folder` whole on its row to the pane's edge at 27, `Yes, I
+    /// trust this` to the edge over `folder` at 20 — a label's room is the
+    /// pane's width less its column, where the box's body wraps a cell short.
+    pub const TRUST_NARROW: [&str; 2] = [
+        include_str!("fixtures/claude-2.1.302-trust-27col.txt"),
+        include_str!("fixtures/claude-2.1.302-trust-20col.txt"),
+    ];
     /// Claude Code 2.1.283, LIVE (2026-09-26, a private headless aterm at
     /// 149x62): the folder-trust dialog of a fresh start in a pane whose
     /// shell prompt sat at the top — drawn on rows 5-20 of 62, WHOLLY above
@@ -4373,6 +4920,85 @@ pub mod fixtures {
     /// `/effort`, `/rate-limit-options` and `/team-onboarding`.
     pub const SLASH_MENU_USAGE_MEASURED: &str =
         include_str!("fixtures/claude-2.1.300-slash-menu-usage-subscriber.txt");
+    /// MEASURED on 2.1.302 (2026-10-17, the real-Claude lab): `@` typed, the
+    /// file and agent menu open with NO entry selected and none pointed, its
+    /// entries at column 4 led by `+` (a file) or `*` (an agent); Enter sent
+    /// `@` as the prompt.
+    pub const AT_MENU_2_1_302: &str = include_str!("fixtures/claude-2.1.302-at-menu.txt");
+    /// MEASURED on 2.1.302: `and @RE` over `+ README.md` and `* Explore
+    /// (agent) – …`, none pointed; Enter sent the draft as shown.
+    pub const AT_MENU_PARTIAL_2_1_302: &str =
+        include_str!("fixtures/claude-2.1.302-at-menu-partial.txt");
+    /// MEASURED on 2.1.302: `read @no` after `down`, the pointer on the one
+    /// entry (`  ❯ + notes.txt`); Enter completed it (`read @notes.txt`) and
+    /// sent nothing.
+    pub const AT_MENU_POINTED_2_1_302: &str =
+        include_str!("fixtures/claude-2.1.302-at-menu-pointed.txt");
+    /// MEASURED on 2.1.268, a build that draws no pointer: `/cl` over the
+    /// slash menu at column 2, its top entry `/clear` highlighted in colour
+    /// only; Enter ran `/clear`.
+    pub const SLASH_MENU_2_1_268: &str = include_str!("fixtures/claude-2.1.268-slash-menu.txt");
+    /// MEASURED on 2.1.268: `and @RE` over `+ README.md` at column 2, no entry
+    /// highlighted; Enter sent the draft.
+    pub const AT_MENU_PARTIAL_2_1_268: &str =
+        include_str!("fixtures/claude-2.1.268-at-menu-partial.txt");
+    /// MEASURED on 2.1.268: the same after `down`, the text unchanged and
+    /// `README.md` highlighted in colour only; Enter after `down` completed
+    /// the entry instead of sending.
+    pub const AT_MENU_DOWN_2_1_268: &str = include_str!("fixtures/claude-2.1.268-at-menu-down.txt");
+    /// The `cell` of each entry's first glyph on [`AT_MENU_PARTIAL_2_1_268`] as
+    /// the menu opened: `+` and `*` both in `999999`, none selected.
+    pub const AT_MENU_PARTIAL_CELLS_2_1_268: &str =
+        include_str!("fixtures/claude-2.1.268-at-menu-partial-cells.txt");
+    /// The same after `down` ([`AT_MENU_DOWN_2_1_268`]): `+ README.md` in
+    /// `b1b9f9`.
+    pub const AT_MENU_DOWN_CELLS_2_1_268: &str =
+        include_str!("fixtures/claude-2.1.268-at-menu-down-cells.txt");
+    /// The same after a second `down`: `* Explore (agent)` in `b1b9f9`; Enter
+    /// completed it and sent nothing.
+    pub const AT_MENU_DOWN2_CELLS_2_1_268: &str =
+        include_str!("fixtures/claude-2.1.268-at-menu-down2-cells.txt");
+    /// MEASURED on 2.1.268: `read @no` over four files at column 2, the same
+    /// text whichever is selected; Enter after `down` completed `novel.txt`.
+    pub const AT_MENU_NO_2_1_268: &str = include_str!("fixtures/claude-2.1.268-at-menu-no.txt");
+    /// The `cell` of each entry's first glyph on [`AT_MENU_NO_2_1_268`] as the
+    /// menu opened: all four in `999999`.
+    pub const AT_MENU_NO_CELLS_2_1_268: &str =
+        include_str!("fixtures/claude-2.1.268-at-menu-no-cells.txt");
+    /// The same after `down`: `novel.txt` in `b1b9f9`.
+    pub const AT_MENU_NO_DOWN_CELLS_2_1_268: &str =
+        include_str!("fixtures/claude-2.1.268-at-menu-no-down-cells.txt");
+    /// MEASURED on 2.1.268: `see @nort` over its one file; Enter sent the
+    /// draft as the menu opened (`+` in `999999`) and completed the entry after
+    /// `down` (`+` in `b1b9f9`), the text the same.
+    pub const AT_MENU_ONE_2_1_268: &str = include_str!("fixtures/claude-2.1.268-at-menu-one.txt");
+    /// MEASURED on 2.1.268: `/config` over the slash menu, no pointer drawn,
+    /// two descriptions wrapped onto rows of their own; the same text whichever
+    /// entry is selected. As the menu opened `/config` was selected
+    /// ([`SLASH_MENU_CONFIG_CELLS_2_1_268`]) and Enter opened the settings; after
+    /// `down` `/update-config` was ([`SLASH_MENU_CONFIG_DOWN_CELLS_2_1_268`]) and
+    /// Enter ran it.
+    pub const SLASH_MENU_CONFIG_2_1_268: &str =
+        include_str!("fixtures/claude-2.1.268-slash-menu-config.txt");
+    /// The `cell` of each menu row's first glyph on [`SLASH_MENU_CONFIG_2_1_268`]
+    /// as the menu opened: `/config` in `b1b9f9`, the others in `999999`.
+    pub const SLASH_MENU_CONFIG_CELLS_2_1_268: &str =
+        include_str!("fixtures/claude-2.1.268-slash-menu-config-cells.txt");
+    /// The same after `down`: `/update-config` in `b1b9f9`.
+    pub const SLASH_MENU_CONFIG_DOWN_CELLS_2_1_268: &str =
+        include_str!("fixtures/claude-2.1.268-slash-menu-config-down-cells.txt");
+    /// MEASURED on 2.1.268: `/copy` over a slash menu of two entries, `/copy`
+    /// and `/fork`, no pointer drawn; the same text whichever is selected.
+    pub const SLASH_MENU_COPY_2_1_268: &str =
+        include_str!("fixtures/claude-2.1.268-slash-menu-copy.txt");
+    /// The `cell` of each entry's `/` on [`SLASH_MENU_COPY_2_1_268`] as the menu
+    /// opened: `/copy` in `b1b9f9`, `/fork` in `999999`.
+    pub const SLASH_MENU_COPY_CELLS_2_1_268: &str =
+        include_str!("fixtures/claude-2.1.268-slash-menu-copy-cells.txt");
+    /// The same after `down`: `/fork` in `b1b9f9`, `/copy` in `999999`; Enter
+    /// then ran `/fork`.
+    pub const SLASH_MENU_COPY_DOWN_CELLS_2_1_268: &str =
+        include_str!("fixtures/claude-2.1.268-slash-menu-copy-down-cells.txt");
     /// MEASURED on 2.1.292 (2026-10-06): auto mode's CLASSIFIER-BILLING NOTICE
     /// behind a gateway — four paragraphs and `Enter to continue · Esc to
     /// cancel` under ONE rule, over the pending `⏺ Bash(…)` row: no options and
@@ -4619,6 +5245,28 @@ pub mod fixtures {
     /// wall with no blank row between —
     pub const STOP_HOOK_DECISION_BLOCK_THEN_CONTEXT_WALL_MEASURED: &str =
         include_str!("fixtures/claude-2.1.302-stop-hook-decision-block-then-context-wall.txt");
+    /// ... (2.1.304, 2026-10-19) a Stop hook that adds context once
+    /// (`{"hookSpecificOutput": {"hookEventName": "Stop", "additionalContext":
+    /// …}}`), the continuation it asks for too long: the summary, its own
+    /// `⎿  Stop hook feedback: …` row, then the context wall with no blank row
+    /// between —
+    pub const STOP_HOOK_FEEDBACK_THEN_CONTEXT_WALL_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.304-stop-hook-feedback-then-context-wall.txt");
+    /// ... (2.1.304, 2026-10-19) a Stop hook stopping the turn with a
+    /// 35-line `stopReason` whose last line is `Usage limit reached · resets
+    /// 3pm`: the summary on row 6 of 50, above the loop's 40-row tail —
+    pub const STOP_HOOK_STOP_REASON_35_LINES_LIMIT_PHRASE_MEASURED: &str = include_str!(
+        "fixtures/claude-2.1.304-stop-hook-stop-reason-35-lines-limit-phrase-last.txt"
+    );
+    /// ... the same with 60 lines, taller than the pane: the summary and the
+    /// first 18 lines in the history ([`STOP_HOOK_STOP_REASON_60_LINES_SCROLLBACK_MEASURED`]) —
+    pub const STOP_HOOK_STOP_REASON_60_LINES_LIMIT_PHRASE_MEASURED: &str = include_str!(
+        "fixtures/claude-2.1.304-stop-hook-stop-reason-60-lines-limit-phrase-last.txt"
+    );
+    /// ... and the history rows right above that screen, read with `line`.
+    pub const STOP_HOOK_STOP_REASON_60_LINES_SCROLLBACK_MEASURED: &str = include_str!(
+        "fixtures/claude-2.1.304-stop-hook-stop-reason-60-lines-limit-phrase-last-scrollback.txt"
+    );
     /// ... a PostToolUse hook answers `{"decision": "block"}` with no reason,
     /// the follow-up request too long: the hook's row, Claude Code's own
     /// default reason (`⎿  Blocked by hook`), then the context wall, under
@@ -4633,6 +5281,99 @@ pub mod fixtures {
     pub const PROMPT_HOOK_ERROR_NO_STDERR_THEN_TOO_LONG_WALL_MEASURED: &str = include_str!(
         "fixtures/claude-2.1.302-user-prompt-submit-hook-error-no-stderr-then-too-long-wall.txt"
     );
+    /// MEASURED on 2.1.304 (the real-Claude lab, 2026-10-19, KI-1015-14):
+    /// the footer's two columns. A `statusLine` command printing `Not logged
+    /// in · Run /login` at column 2 under the bottom rule, logged in, after
+    /// an ordinary turn — no wall anywhere —
+    pub const STATUS_LINE_LOGIN_WORDS_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.304-statusline-login-words-after-reply.txt");
+    /// ... Claude Code's OWN `Not logged in · Run /login` (no login at all,
+    /// no status line), right-aligned on the mode row —
+    pub const FOOTER_NOT_LOGGED_IN_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.304-footer-not-logged-in-no-statusline.txt");
+    /// ... the same at 26 columns, the notification column stacked under the
+    /// mode row and filling its row from column 2 —
+    pub const FOOTER_NOT_LOGGED_IN_26COL_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.304-footer-not-logged-in-no-statusline-26col.txt");
+    /// ... both: the status line's words at column 2 and the vendor's
+    /// notice right-aligned on the same row —
+    pub const FOOTER_NOT_LOGGED_IN_AND_STATUS_LINE_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.304-footer-not-logged-in-statusline-same-words.txt");
+    /// ... both at 26 columns: the status line, the mode row, the vendor's
+    /// notice under it —
+    pub const FOOTER_NOT_LOGGED_IN_AND_STATUS_LINE_26COL_MEASURED: &str = include_str!(
+        "fixtures/claude-2.1.304-footer-not-logged-in-statusline-same-words-26col.txt"
+    );
+    /// ... a subscriber at its five-hour limit with that status line: the
+    /// vendor's `⚠ Usage limit reached · …` banner and countdown ABOVE the
+    /// status line, the status line right above the mode row —
+    pub const WALL_SESSION_ARMED_STATUS_LINE_LOGIN_WORDS_MEASURED: &str = include_str!(
+        "fixtures/claude-2.1.304-wall-session-auto-continue-armed-statusline-login-words.txt"
+    );
+    /// ... the countdown cancelled (`⏺ Automatic continue cancelled · …`),
+    /// no banner: the status line alone right above the mode row.
+    pub const WALL_SESSION_CANCELLED_STATUS_LINE_LOGIN_WORDS_MEASURED: &str = include_str!(
+        "fixtures/claude-2.1.304-wall-session-auto-continue-cancelled-statusline-login-words.txt"
+    );
+    /// MEASURED on 2.1.304 (KI-1015-14): a `claude --verbose` call whose
+    /// output fills the screen, its call row and first 40 rows scrolled off
+    /// into the history, and Claude Code's real context wall right under the
+    /// output (at column 2, under rows at column 5) —
+    pub const VERBOSE_LONG_OUTPUT_CONTEXT_WALL_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.304-verbose-long-output-context-wall.txt");
+    /// ... and the main screen's HISTORY right above that screen, oldest
+    /// first, as `line` read it (the launch banner, the person's turn, the
+    /// call row, the output's first 40 rows) —
+    pub const VERBOSE_LONG_OUTPUT_CONTEXT_WALL_SCROLLBACK_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.304-verbose-long-output-context-wall-scrollback.txt");
+    /// ... a background Bash under `--verbose` whose command printed `Not
+    /// logged in · Please run /login`, delivered: the notice row alone, no
+    /// output drawn under it —
+    pub const VERBOSE_BACKGROUND_COMMAND_LOGIN_WORDS_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.304-verbose-background-command-login-words.txt");
+    /// ... a background Agent whose reply was those words: the same —
+    pub const VERBOSE_BACKGROUND_AGENT_LOGIN_WORDS_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.304-verbose-background-agent-login-words.txt");
+    /// ... a PostToolUse hook blocking with a reason of BLANK SPACE, the
+    /// follow-up request too long: the hook's row (`⎿  PostToolUse:Bash hook
+    /// returned blocking error`) with no row of the hook's under it, and the
+    /// real context wall right there —
+    pub const POST_HOOK_BLANK_REASON_THEN_CONTEXT_WALL_MEASURED: &str = include_str!(
+        "fixtures/claude-2.1.304-bash-output-and-posttooluse-hook-blank-reason-then-context-wall.txt"
+    );
+    /// ... the same hook blocking with the wall's words as its reason, the
+    /// reply EMPTY: a screen no row of which tells it from the one above —
+    pub const POST_HOOK_REASON_CONTEXT_PHRASE_MEASURED: &str = include_str!(
+        "fixtures/claude-2.1.304-bash-output-and-posttooluse-hook-blocking-reason-context-phrase-empty-reply.txt"
+    );
+    /// ... `--verbose` Stop hooks, a prompt hook and a command hook whose
+    /// stopReason is `Not logged in · Please run /login`: `⏺ Ran 2 stop
+    /// hooks`, one row per hook (the command's path; the prompt's words, no
+    /// label), the stopReason, `Stop hook error: JSON validation failed` —
+    pub const STOP_HOOKS_VERBOSE_PROMPT_ROW_MEASURED: &str = include_str!(
+        "fixtures/claude-2.1.304-stop-hooks-verbose-prompt-and-command-stop-reason-login-phrase.txt"
+    );
+    /// ... the prompt's words opening with a label (`Review: …`) —
+    pub const STOP_HOOKS_VERBOSE_LABELLED_PROMPT_ROW_MEASURED: &str = include_str!(
+        "fixtures/claude-2.1.304-stop-hooks-verbose-labelled-prompt-row-stop-reason-login-phrase.txt"
+    );
+    /// ... and the prompt hook answering `{"ok": true}`, so the stopReason is
+    /// the last thing said, right under the labelled prompt row —
+    pub const STOP_HOOKS_VERBOSE_LABELLED_PROMPT_ROW_LAST_MEASURED: &str = include_str!(
+        "fixtures/claude-2.1.304-stop-hooks-verbose-labelled-prompt-row-stop-reason-login-phrase-last.txt"
+    );
+    /// ... a UserPromptSubmit hook's stopReason, 108 characters of prose
+    /// then `Usage limit reached · resets 3pm`: `⏺ Operation stopped by
+    /// hook: …` WRAPS, its continuation row at column 2 opening with those
+    /// words —
+    pub const PROMPT_HOOK_STOPPED_WRAPPED_LIMIT_PHRASE_MEASURED: &str = include_str!(
+        "fixtures/claude-2.1.304-user-prompt-submit-hook-continue-false-long-reason-wrapped-limit-phrase.txt"
+    );
+    /// ... a Monitor whose command printed one line of 147 characters ending
+    /// in `Usage limit reached · resets 3pm`: its event row is cut with `…`
+    /// at the pane's edge, never wrapped.
+    pub const MONITOR_EVENT_LONG_LINE_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.304-monitor-event-long-line-truncated.txt");
     /// MEASURED on 2.1.294 (H6-HARNESS-1 pass 5): a real session limit
     /// standing — its notice under the prompt, its auto-continue row, the
     /// banner over the footer — and under it a person's `/usage`, `/login`
@@ -4700,6 +5441,14 @@ pub mod fixtures {
     /// was pressed on it.
     pub const LIMIT_DIALOG_NO_RESET_ROWS_2_1_301: &str =
         include_str!("fixtures/claude-2.1.301-limit-dialog-no-reset-rows.txt");
+    /// MEASURED on 2.1.304 (the lab, 2026-10-19, `r304`): the usage-limit
+    /// dialog at a five-hour wall, `autoContinueAtUsageLimit` off in the
+    /// scratch settings.json (2.1.304 reads it there), opened by Claude Code
+    /// itself after the second wall's turn. No reset is on offer (the stub's
+    /// account has none: the reset rows are first-party): `Stop and wait …`,
+    /// `Wait here, …`, `Upgrade your plan`. Nothing was pressed on it.
+    pub const LIMIT_DIALOG_NO_RESET_ROWS_2_1_304: &str =
+        include_str!("fixtures/claude-2.1.304-limit-dialog-no-reset-rows.txt");
     /// MEASURED on 2.1.300 (the lab, 2026-10-15): after a `/clear`,
     /// conversation B at its own five-hour limit (`resets 9:19am`), the
     /// countdown armed — the footer's banner over `Continuing automatically
@@ -4734,6 +5483,33 @@ pub mod fixtures {
     /// footer. Claude Code does not arm it again.
     pub const RESUMED_BACK_INTO_LIMITED_CONVERSATION_2_1_301: &str =
         include_str!("fixtures/claude-2.1.301-resumed-back-into-limited-conversation.txt");
+    /// MEASURED on 2.1.302 (the lab, 2026-10-17, `lim`): a Sonnet bucket
+    /// (`seven_day_sonnet`) whose reset is under a day away answering a turn
+    /// after a `/clear`. No usage-limit dialog: the bucket's notice, then the
+    /// GENERIC countdown row Claude Code draws under a usage window's,
+    /// `⏺ Usage limit reached · continuing automatically at 9:13am · esc to
+    /// cancel`, and the footer's generic banner over its countdown.
+    pub const WALL_SONNET_BUCKET_GENERIC_COUNTDOWN_ARMED_2_1_302: &str =
+        include_str!("fixtures/claude-2.1.302-wall-sonnet-bucket-generic-countdown-armed.txt");
+    /// MEASURED on 2.1.302, the same lab and bucket: the countdown gone on by
+    /// itself at the reset (`⏺ Usage limit reset · continuing automatically`,
+    /// the stub's reply under it), then the harness's `usage-resume@v1 keep
+    /// going` typed at the reset plus the grace into the conversation Claude
+    /// Code had resumed, and the stub's reply to it.
+    pub const WALL_SONNET_BUCKET_GENERIC_COUNTDOWN_GONE_ON_2_1_302: &str = include_str!(
+        "fixtures/claude-2.1.302-wall-sonnet-bucket-generic-countdown-gone-on-then-usage-resume.txt"
+    );
+    /// MEASURED on 2.1.302, the same lab: a Sonnet bucket's generic countdown
+    /// (`resets 10:06am`) cancelled by Esc — `⏺ Automatic continue cancelled
+    /// · /rate-limit-options to re-arm` under it, and in the footer.
+    /// MEASURED on 2.1.302, the same lab: a person's `/model opus` under a
+    /// Sonnet bucket's generic countdown (`resets 9:40am`), its switch box
+    /// answered — `⎿  Set model to Opus 5.5 …` — and the countdown still
+    /// armed in the footer.
+    pub const WALL_SONNET_BUCKET_GENERIC_COUNTDOWN_MODEL_SET_2_1_302: &str =
+        include_str!("fixtures/claude-2.1.302-wall-sonnet-bucket-generic-countdown-model-set.txt");
+    pub const WALL_SONNET_BUCKET_AUTO_CONTINUE_CANCELLED_2_1_302: &str =
+        include_str!("fixtures/claude-2.1.302-wall-sonnet-bucket-auto-continue-cancelled.txt");
 
     // MEASURED on 2.1.300 and 2.1.301 (the lab, 2026-10-15 and -16;
     // `crate::credits`, `crate::phase`'s retry status): usage credits
@@ -5051,6 +5827,39 @@ pub mod fixtures {
     /// Claude Code's synthetic `authentication_failed` row drawn as
     /// `⏺ Login expired · Please run /login` in column 0.
     pub const LOGIN_EXPIRED: &str = include_str!("fixtures/claude-2.1.281-login-expired.txt");
+    /// MEASURED on 2.1.303 (the real-Claude lab, 2026-10-19): `/login`'s
+    /// method picker as a stored login draws it, the focus on the
+    /// subscription ([`crate::login`]).
+    pub const LOGIN_PICKER: &str = include_str!("fixtures/claude-2.1.303-login-picker-plain.txt");
+    /// MEASURED on 2.1.303: the same picker under an environment OAuth token,
+    /// its warning above the question.
+    pub const LOGIN_PICKER_WARNED: &str = include_str!("fixtures/claude-2.1.303-login-picker.txt");
+    /// MEASURED on 2.1.303: the picker, its focus moved onto Console.
+    pub const LOGIN_PICKER_CONSOLE: &str =
+        include_str!("fixtures/claude-2.1.303-login-picker-console-focused.txt");
+    /// MEASURED on 2.1.303: Console's own menu, which can mint an API key.
+    pub const LOGIN_CONSOLE_MENU: &str =
+        include_str!("fixtures/claude-2.1.303-login-console-menu.txt");
+    /// HAND-BUILT on 2.1.303's render (no lab may open the host's browser):
+    /// the browser hand-off's first three seconds, `Opening browser to sign
+    /// in…` and no URL yet.
+    pub const LOGIN_OPENING: &str = include_str!("fixtures/claude-2.1.303-login-opening.txt");
+    /// MEASURED on 2.1.303: the browser hand-off, its URL and paste field.
+    pub const LOGIN_HANDOFF: &str = include_str!("fixtures/claude-2.1.303-login-handoff.txt");
+    /// MEASURED on 2.1.303: the dialog after a code exchange failed, `Press
+    /// Enter to retry.`
+    pub const LOGIN_ERROR: &str = include_str!("fixtures/claude-2.1.303-login-error.txt");
+    /// MEASURED on 2.1.303 (transcribed from the lab's text): Esc out of the
+    /// dialog, `⎿  Login interrupted`, the composer back.
+    pub const LOGIN_INTERRUPTED: &str =
+        include_str!("fixtures/claude-2.1.303-login-interrupted.txt");
+    /// MEASURED on 2.1.303: what origin/main's harness (b3946413c4) did in the
+    /// lab after Esc out of the dialog: `keep going` into the standing wall,
+    /// then `/login` a second time — its picker up again.
+    pub const LOGIN_RELOOPED: &str = include_str!("fixtures/claude-2.1.303-login-relooped.txt");
+    /// HAND-BUILT from the 2.1.303 bundle over the measured hand-off frame:
+    /// the success state, `Login successful. Press Enter to continue…`.
+    pub const LOGIN_SUCCESS: &str = include_str!("fixtures/claude-2.1.303-login-success.txt");
     /// Measured 2026-09-21 (version unrecorded): `◎ /goal active (3h)` over
     /// the frame and the dim suggestion `❯ keep going`, cursor at column 2.
     pub const GOAL_ACTIVE_SUGGESTION: &str =
@@ -5740,6 +6549,16 @@ pub mod fixtures {
     /// ` Claude wants to use your browser` (lpe(), unnumbered, `❯ Not now`).
     pub const SETUP_CHROME_UPSELL: &str =
         include_str!("fixtures/claude-2.1.282-setup-chrome-upsell.txt");
+    /// HAND-BUILT from the 2.1.302 render code (sCe(); each file's line):
+    /// the same offer, ` Claude wants to use your browser`, its three options
+    /// each with its description beside its label in the Select's two
+    /// columns ([`MODEL_PICKER_40COL`]), the cursor on its default `Not now`,
+    /// at 120 columns and at 40, where the descriptions wrap in their own
+    /// column.
+    pub const SETUP_CHROME_UPSELL_302: [&str; 2] = [
+        include_str!("fixtures/claude-2.1.302-setup-chrome-upsell.txt"),
+        include_str!("fixtures/claude-2.1.302-setup-chrome-upsell-40col.txt"),
+    ];
     /// ` Remote Control` (Cz(), numbered).
     pub const SETUP_REMOTE_CONTROL: &str =
         include_str!("fixtures/claude-2.1.282-setup-remote-control.txt");
@@ -5757,6 +6576,135 @@ pub mod fixtures {
     /// selected`, the footer ` Space to select · Esc to reject all` at column
     /// ONE.
     pub const MCP_SERVER_TWO: &str = include_str!("fixtures/claude-2.1.301-mcp-server-two.txt");
+    /// MEASURED on 2.1.302, 2026-10-16, in NARROW panes (`ctl resize`; each
+    /// file's line names its size): [`MCP_SERVER_ONE`] at 40 and 30 columns,
+    /// its title, body and labels wrapped (`❯ Continue without using this
+    /// MCP` over `server` at 40), its footer too at 30 (`Enter to confirm ·
+    /// Esc to` over `cancel`); and in panes too short for its head, where the
+    /// vendor's Select shows `rows - 8` options at most (one at least),
+    /// scrolled to the cursor, an `↑` or `↓` in the pointer column of an end
+    /// option that has options past it — unless the cursor is on it, whose
+    /// `❯` is drawn there instead: at 40x6 the cursor's option alone,
+    /// wrapped; at 30x9 the same under the body's last rows; at 40x10 the last
+    /// two (`↑ Use this and all future MCP servers`), and after Up twice the
+    /// first two (`↓ …`); at 40x11 all three; at 30x5 the wrapped option's
+    /// last row alone (`this MCP server`), which reads no box. And
+    /// [`MCP_SERVER_TWO`] at 40 columns, and in a 40x8 pane its focused server
+    /// row and `Enable selected` alone (that dialog draws no arrow). Then the
+    /// cursor moved Up to the second option (`Use this and all future …`):
+    /// in 10-row panes at 60 and 35 columns, the Select scrolled to the first
+    /// two (at 35 wrapped, redrawn a row short); in 11-row panes at 60 and 35,
+    /// all three under no rule, the cursor's label filling its row to within
+    /// five cells of the edge (`… in this project` at 60) or wrapped
+    /// (`servers in this project` at 35) over the unmarked `Continue without
+    /// using this MCP …`; at 35, 54 and 55 columns drawn whole under its
+    /// rule (`… in this` over `project` at 54, whole on its row at 55: a
+    /// label's room is the pane's width less 4). And at 30x12, the cursor on
+    /// its default, all three under no rule, the last two wrapped (`Use this
+    /// MCP server`, whole on its row, over `Use this and all future`). And
+    /// on 2026-10-17, the cursor on its default, drawn whole under its rule
+    /// at 21, 24, 26, 27, 31 and 34 columns: at 21 `Use this MCP` over
+    /// `server`; at 24 `Use this and all` over `future MCP servers` over `in
+    /// this project`, which `in` fits beside the label's first row and not
+    /// beside the row above it; at 26 `… future MCP servers in`, one cell
+    /// short of the pane's edge, over `this project`; at 31 and 34 `Continue
+    /// without using this` (to the edge at 31) over
+    /// `MCP server`, a row that opens with a capital and is still the rest of
+    /// a kept answer; at 27 the title `New MCP server found in`, its row full,
+    /// over `this project:` over `lab-probe`, and at 21 the body's `require
+    /// approval.`, full, over `Learn more in` over `the MCP`: the row under a
+    /// full row has a cell less ([`crate::wrap::lead`]).
+    pub const MCP_SERVER_NARROW: [&str; 24] = [
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-40col.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-30col.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-head-cut-40x6.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-head-cut-30x9.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-head-cut-40x10.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-head-cut-40x10-cursor-first.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-head-cut-40x11.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-head-cut-30x5.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-two-40col.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-two-head-cut-40x8.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-head-cut-60x10-cursor-second.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-head-cut-35x10-cursor-second.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-head-cut-60x11-cursor-second.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-head-cut-35x11-cursor-second.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-35col-cursor-second.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-54col-cursor-second.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-55col-cursor-second.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-head-cut-30x12.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-21col.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-24col.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-26col.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-27col.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-31col.txt"),
+        include_str!("fixtures/claude-2.1.302-mcp-server-one-34col.txt"),
+    ];
+    /// DERIVED, not measured (each file's line): [`MCP_SERVER_ONE`] in 10-row
+    /// panes at 60 and 35 columns, its head cut, the Select showing its last
+    /// two options, the cursor on the second over the unmarked `Continue
+    /// without using this MCP server` — as the safety check's frame generator
+    /// draws that window. Of the 48 single-server 2.1.302 capture files of
+    /// the dialog (41 distinct frames, 37 taken on 2026-10-16 and 11 on
+    /// 2026-10-17), the generator draws 46 row for row,
+    /// and the other two (the MEASURED `…-35x10-cursor-second` and
+    /// `…-40x10-cursor-first` frames) only drawn one row short, a blank row
+    /// under the frame. 2.1.302 was not seen drawing it: one Up from
+    /// the default scrolls to the first two ([`MCP_SERVER_NARROW`]). With the
+    /// first option off the screen, no whole kept answer is left if the
+    /// cursor's label is read joined onto the row under it. And
+    /// [`MCP_SERVER_TWO`] MEASURED at 35x10 with its top three rows cut away,
+    /// as a pane whose top rows scrolled off shows it: its two server rows
+    /// under no rule and no body row, the widest row above the footer
+    /// `Enable selected`'s, which taken for the pane's width reads the second
+    /// server row as the first's rest.
+    pub const MCP_SERVER_DERIVED: [&str; 3] = [
+        include_str!(
+            "fixtures/claude-2.1.302-mcp-server-one-head-cut-60x10-cursor-second-over-last.txt"
+        ),
+        include_str!(
+            "fixtures/claude-2.1.302-mcp-server-one-head-cut-35x10-cursor-second-over-last.txt"
+        ),
+        include_str!("fixtures/claude-2.1.302-mcp-server-two-head-cut-35col-servers-only.txt"),
+    ];
+    /// MEASURED on 2.1.302: `/model`'s picker in a 40x64 pane, its five
+    /// numbered options laid out in the Select's two columns (module header,
+    /// "OPTIONS"): `❯ 1. Default (recomme… ✔  Use the` over `default` at
+    /// column 28.
+    pub const MODEL_PICKER_40COL: &str =
+        include_str!("fixtures/claude-2.1.302-model-picker-40col.txt");
+    /// HAND-BUILT from the 2.1.302 render code (est(); each file's line):
+    /// Claude Code's Chrome setup panel ` Setting up Claude in Chrome`, its
+    /// options' descriptions beside their labels in the measured two-column
+    /// layout ([`MODEL_PICKER_40COL`]), at 120 columns in three phases —
+    /// connecting offers `Continue without browser tools` alone (as every
+    /// phase but the next two does), stalled `Keep waiting` before it,
+    /// connected `Continue with browser tools` before it — and at 40 columns
+    /// stalled and connected in a label column 24 wide, where both `Continue
+    /// …` labels are cut short (`Continue with browser…`) and the stalled
+    /// phase's `Keep waiting` is whole.
+    pub const CHROME_SETUP: [(&str, &str); 5] = [
+        (
+            "connecting",
+            include_str!("fixtures/claude-2.1.302-chrome-setup-connecting.txt"),
+        ),
+        (
+            "stalled",
+            include_str!("fixtures/claude-2.1.302-chrome-setup-stalled.txt"),
+        ),
+        (
+            "connected",
+            include_str!("fixtures/claude-2.1.302-chrome-setup-connected.txt"),
+        ),
+        (
+            "stalled-40col",
+            include_str!("fixtures/claude-2.1.302-chrome-setup-stalled-40col.txt"),
+        ),
+        (
+            "connected-40col",
+            include_str!("fixtures/claude-2.1.302-chrome-setup-connected-40col.txt"),
+        ),
+    ];
     /// MEASURED on 2.1.301: ` Settings Error` at launch over a project
     /// `.claude/settings.json` its validator rejects, numbered `Fix with
     /// Claude` / `Exit and fix manually` / `Continue without these settings`
@@ -5927,6 +6875,23 @@ pub mod fixtures {
         out
     }
 
+    /// A cells fixture's replies (`SLASH_MENU_CONFIG_CELLS_2_1_268`), its
+    /// provenance line dropped: the row, the column, and the `cell` reply.
+    #[must_use]
+    pub fn cells(text: &str) -> Vec<(usize, usize, String)> {
+        screen(text)
+            .iter()
+            .filter_map(|l| {
+                let mut f = l.splitn(3, ' ');
+                Some((
+                    f.next()?.parse().ok()?,
+                    f.next()?.parse().ok()?,
+                    f.next()?.to_string(),
+                ))
+            })
+            .collect()
+    }
+
     /// A fixture's rows, its provenance line dropped.
     #[must_use]
     pub fn screen(text: &str) -> Vec<String> {
@@ -5945,9 +6910,129 @@ pub mod fixtures {
     /// rows go on at that column), in `width` less that column and the
     /// frame's one column of padding, a word wider than the room on rows of
     /// its own, broken where each ends; every other row is kept. A row the
-    /// capture already wrapped is wrapped on its own.
+    /// capture already wrapped is wrapped on its own. The box's body is so
+    /// drawn; a Select's label 2.1.302 draws a cell further, to the pane's
+    /// edge ([`TRUST_NARROW`], MEASURED), which the reader takes either way.
+    /// Ink's own wrap counts a cell more under a full row ([`ink_wrap`],
+    /// [`rewrap_box_ink`]).
     #[must_use]
     pub fn rewrap_box(capture: &str, width: usize) -> Vec<String> {
+        rewrapped(capture, width, greedy)
+    }
+
+    /// [`rewrap_box`]'s frame with each row too wide for its room wrapped as
+    /// Ink wraps it ([`ink_wrap`]) instead of greedily: in the same room, a
+    /// cell short of the pane's edge (MODELLED for the held message's labels,
+    /// as [`rewrap_box`]; the body's room, MEASURED on 2.1.302's trust
+    /// dialog), the row under a full row a cell shorter.
+    #[must_use]
+    pub fn rewrap_box_ink(capture: &str, width: usize) -> Vec<String> {
+        rewrapped(capture, width, ink_wrap)
+    }
+
+    /// One line as 2.1.302's Ink draws it in a box `room` cells wide (READ
+    /// in its bundle: `Ku` wraps a Text with `Bun.wrapAnsi(text, room,
+    /// {trim: false, hard: true})`, and `Vb` draws each row under the first
+    /// without the one space wrap-ansi may start it with;
+    /// [`crate::wrap::lead`]): each word on the row it fits on, the space
+    /// before it counted, at a row's start too once the row above is exactly
+    /// full; a word wider than the box broken where the rows end, from the
+    /// row it opens on unless the next row breaks it fewer times. The rows as
+    /// `ctl text` reads them, no blank at their end. It draws every label,
+    /// title and body row of the MCP server and folder-trust dialogs MEASURED
+    /// on 2.1.302, and the model picker's descriptions
+    /// (`inks_wrap_draws_the_measured_rows`).
+    #[must_use]
+    pub fn ink_wrap(text: &str, room: usize) -> Vec<String> {
+        let room = room.max(1);
+        let width = |c: char| crate::question::cells(c.encode_utf8(&mut [0; 4]));
+        // Each row as wrap-ansi builds it, and the cells it fills.
+        let mut rows: Vec<(String, usize)> = vec![(String::new(), 0)];
+        for (k, word) in text.split(' ').enumerate() {
+            if k > 0 {
+                if rows.last().is_some_and(|r| r.1 >= room) {
+                    rows.push((String::new(), 0));
+                }
+                let row = rows.last_mut().expect("a row");
+                row.0.push(' ');
+                row.1 += 1;
+            }
+            let n = crate::question::cells(word);
+            let used = rows.last().map_or(0, |r| r.1);
+            if n > room {
+                let left = room.saturating_sub(used);
+                let here = 1 + (n - left - 1) / room;
+                if (n - 1) / room < here {
+                    rows.push((String::new(), 0));
+                }
+                let count = word.chars().count();
+                for (i, c) in word.chars().enumerate() {
+                    let w = width(c);
+                    if rows.last().is_some_and(|r| r.1 + w > room) {
+                        rows.push((String::new(), 0));
+                    }
+                    let row = rows.last_mut().expect("a row");
+                    row.0.push(c);
+                    row.1 += w;
+                    if row.1 == room && i + 1 < count {
+                        rows.push((String::new(), 0));
+                    }
+                }
+                continue;
+            }
+            if used + n > room && used > 0 && n > 0 {
+                rows.push((String::new(), 0));
+            }
+            let row = rows.last_mut().expect("a row");
+            row.0.push_str(word);
+            row.1 += n;
+        }
+        rows.into_iter()
+            .enumerate()
+            .map(|(k, (row, _))| {
+                let drawn = row
+                    .strip_prefix(' ')
+                    .filter(|rest| k > 0 && !rest.trim().is_empty())
+                    .unwrap_or(&row);
+                drawn.trim_end().to_string()
+            })
+            .collect()
+    }
+
+    /// `text` wrapped greedily at single spaces in `room` cells, a word wider
+    /// than the room on rows of its own, broken where each ends
+    /// ([`rewrap_box`]).
+    pub(super) fn greedy(text: &str, room: usize) -> Vec<String> {
+        let mut lines: Vec<String> = vec![String::new()];
+        for word in text.split(' ') {
+            let n = word.chars().count();
+            assert!(n > 0, "one space between words: {text:?}");
+            if n > room {
+                let chars: Vec<char> = word.chars().collect();
+                for piece in chars.chunks(room) {
+                    if !lines.last().is_some_and(String::is_empty) {
+                        lines.push(String::new());
+                    }
+                    lines.last_mut().expect("a line").extend(piece.iter());
+                }
+                continue;
+            }
+            let line = lines.last_mut().expect("a line");
+            if line.is_empty() {
+                line.push_str(word);
+            } else if line.chars().count() + 1 + n <= room {
+                line.push(' ');
+                line.push_str(word);
+            } else {
+                lines.push(word.to_string());
+            }
+        }
+        lines
+    }
+
+    /// [`rewrap_box`]'s frame, each row too wide for its room wrapped by
+    /// `wrap`.
+    fn rewrapped(capture: &str, width: usize, wrap: fn(&str, usize) -> Vec<String>) -> Vec<String> {
         let mut out = Vec::new();
         for r in screen(capture) {
             let t = r.trim_start();
@@ -5977,31 +7062,7 @@ pub mod fixtures {
                 out.push(r);
                 continue;
             }
-            let mut lines: Vec<String> = vec![String::new()];
-            for word in text.split(' ') {
-                let n = word.chars().count();
-                assert!(n > 0, "one space between words: {text:?}");
-                if n > room {
-                    let chars: Vec<char> = word.chars().collect();
-                    for piece in chars.chunks(room) {
-                        if !lines.last().is_some_and(String::is_empty) {
-                            lines.push(String::new());
-                        }
-                        lines.last_mut().expect("a line").extend(piece.iter());
-                    }
-                    continue;
-                }
-                let line = lines.last_mut().expect("a line");
-                if line.is_empty() {
-                    line.push_str(word);
-                } else if line.chars().count() + 1 + n <= room {
-                    line.push(' ');
-                    line.push_str(word);
-                } else {
-                    lines.push(word.to_string());
-                }
-            }
-            for (k, line) in lines.iter().enumerate() {
+            for (k, line) in wrap(text, room).iter().enumerate() {
                 let at = if k == 0 {
                     head.clone()
                 } else {
@@ -6088,6 +7149,15 @@ pub mod fixtures {
             "─".repeat(120),
             footer.to_string(),
         ]
+    }
+
+    /// A footer row of [`composer`]'s 120 columns: `left`, then `notice`
+    /// right-aligned to end two columns short of the rule, where Claude Code
+    /// draws its notifications (measured on 2.1.304, `claude-2.1.304-footer-*`).
+    #[must_use]
+    pub fn right_aligned(left: &str, notice: &str) -> String {
+        let gap = 118usize.saturating_sub(left.chars().count() + notice.chars().count());
+        format!("{left}{}{notice}", " ".repeat(gap.max(2)))
     }
 
     #[must_use]
@@ -7476,6 +8546,30 @@ mod tests {
             p.footer.as_deref(),
             Some("Enter to confirm · Esc to cancel")
         );
+        // FOUR ROWS ([`FOOTER_ROWS`]), as Ink wraps them under a blank row:
+        // the question dialog's longest footer at 28 columns, its `Esc` on
+        // the third row, and a Bash box's at 11, its `Esc` on the first row
+        // alone, the rows [`last_footer`] skips when no row within four of
+        // them holds an `Esc`. Each is read from its first row. Read across
+        // three rows, each was a shorter footer: `keys to navigate · …`, or
+        // `Esc to cancel ·`.
+        for (width, footer) in [
+            (
+                28,
+                [
+                    "Enter to select · Tab/Arrow",
+                    "keys to navigate · ctrl+g to",
+                    "edit in VS Code · Esc to",
+                    "cancel",
+                ],
+            ),
+            (11, [" Esc to", " cancel ·", " Tab to", " amend"]),
+        ] {
+            let rule = "─".repeat(width);
+            let mut r = rows(&[&rule, ""]);
+            r.extend(rows(&footer));
+            assert_eq!(last_footer(&r), Some((2, 5)), "{footer:?}");
+        }
     }
 
     /// A TITLE INK WRAPPED NAMES ITS BOX (module header, "A WRAPPED TITLE").
@@ -7649,13 +8743,14 @@ mod tests {
         let p = parse_prompt_v2(&screen(HELD_MESSAGE_2_1_287)).expect("the box");
         assert_eq!(p.options[1].label, "Deliver this message to Claude");
         // A next label that fits nowhere on the WHOLE label above it, where
-        // the geometry alone would read it as that label's rest, opens with a
-        // capital and stays its own option: the held message at 54-63
-        // columns, the trust backstop at 42-48.
+        // the join's room alone would read it as that label's rest (one cell
+        // short of the pane's edge, [`unnumbered`]), opens with a capital and
+        // stays its own option: the held message at 54-61 columns, the trust
+        // backstop at 42-46.
         for (fixture, widths, labels) in [
             (
                 HELD_MESSAGE_2_1_287,
-                54..=63,
+                54..=61,
                 [
                     "Deny — drop it and tell the sender it was declined",
                     "Deliver this message to Claude",
@@ -7663,7 +8758,7 @@ mod tests {
             ),
             (
                 TRUST_BACKSTOP,
-                42..=48,
+                42..=46,
                 [
                     "No, continue without these permissions",
                     "Yes, I trust this folder",
@@ -7674,7 +8769,13 @@ mod tests {
                 let r = rewrap_box(fixture, width);
                 let whole = format!(" ❯ {}", labels[0]);
                 let at = r.iter().position(|row| *row == whole).expect("whole");
-                assert!(crate::wrap::continues(labels[0], 3, &r[at + 1], width - 4));
+                assert!(crate::wrap::continues_exactly(
+                    labels[0],
+                    0,
+                    3,
+                    &r[at + 1],
+                    width - 4
+                ));
                 let p = parse_prompt_v2(&r).expect("the box");
                 let read: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
                 assert_eq!(read, labels, "{width}");
@@ -7689,6 +8790,75 @@ mod tests {
             rewrap_box(HELD_MESSAGE_2_1_287, 50),
             screen(HELD_MESSAGE_50_2_1_300)
         );
+    }
+
+    /// The dialog rows of `fixture`: from its last full-width rule down, the
+    /// transcript over it (whose banner [`rewrap_box`] does not re-wrap) left
+    /// out.
+    fn dialog_rows(fixture: &str) -> String {
+        let r = screen(fixture);
+        let top = r
+            .iter()
+            .rposition(|x| crate::phase::is_rule(x) && x.chars().count() > 40)
+            .expect("the dialog's rule");
+        r[top..].join("\n")
+    }
+
+    /// ATERM-KI-1016-1, "Dialogs in narrow panes". Each label below Ink wraps
+    /// in a narrow pane where a row-by-row reading cuts it: at a capital
+    /// that is a name, mid-sentence (the held message's `Deliver this
+    /// message to` over `Claude` under 34 columns; Computer Use's `Deny, and
+    /// tell` over `Claude what to do differently (esc)` at 18-24), read as
+    /// two options, so the held message was escalated; and inside a word
+    /// longer than the label's room (the usage-limit dialog's
+    /// `automaticall` over `y at 12:23pm` at 16-21), joined with a space, so
+    /// the wait row was no wait row and the dialog escalated. Each is now
+    /// read as the whole dialog is at every width from 16 to 120: its kind,
+    /// each label and role, its focus. NEGATIVE CONTROLS: the held message
+    /// at 54-63 and the trust backstop at 42-48 keep a next label that fits
+    /// nowhere on the whole one above it its own (above), and a label whose
+    /// row ends full is joined with a space unless the word across the break
+    /// makes a label the vendor draws (`Upgrade your` over `plan`).
+    #[test]
+    fn a_label_ink_wrapped_at_a_name_or_inside_a_word_reads_whole() {
+        type Read = (PromptKind, Vec<(String, Role, bool)>);
+        let read = |r: &[String]| -> Read {
+            let p = parse_prompt_v2(r).expect("the dialog");
+            let o = p.options.iter();
+            (
+                p.kind,
+                o.map(|o| (o.label.clone(), o.role, o.focused)).collect(),
+            )
+        };
+        for (name, fixture, kind) in [
+            (
+                "held message",
+                HELD_MESSAGE_2_1_287,
+                PromptKind::HeldMessage,
+            ),
+            (
+                "held message 2.1.282",
+                HELD_MESSAGE,
+                PromptKind::HeldMessage,
+            ),
+            ("computer use", COMPUTER_USE, PromptKind::ComputerUse),
+            ("limit", LIMIT_OPTIONS_DIALOG, PromptKind::UsageLimit),
+            ("weekly limit", LIMIT_OPTIONS_WEEKLY, PromptKind::UsageLimit),
+        ] {
+            let body = dialog_rows(fixture);
+            let whole = read(&screen(&body));
+            assert_eq!(whole.0, kind, "{name}");
+            for width in 16..=120 {
+                let r = rewrap_box(&body, width);
+                assert_eq!(read(&r), whole, "{name} at {width}: {r:#?}");
+            }
+        }
+        // The label grammar alone joins across a full row: `Upgrade your`
+        // over `plan`, its row full at 20 columns, stays three words.
+        let r = rewrap_box(&dialog_rows(LIMIT_OPTIONS_DIALOG), 20);
+        assert!(r.contains(&"    3. Upgrade your".to_string()), "{r:#?}");
+        let p = parse_prompt_v2(&r).expect("the dialog");
+        assert_eq!(p.options[2].label, "Upgrade your plan");
     }
 
     /// ATERM-KI-1015-1 F3 (the harness sweep of 2026-10-15, Claude Code
@@ -10054,6 +11224,898 @@ mod tests {
                 q.options
             );
         }
+    }
+
+    /// A WRAPPED UNNUMBERED OPTION IS ONE OPTION (MEASURED 2026-10-16 on
+    /// 2.1.302 in narrow panes, [`MCP_SERVER_NARROW`]): each of the MCP
+    /// server dialog's answers reads as its whole label wherever Ink wrapped
+    /// it — the head drawn or cut, the Select scrolled under the vendor's
+    /// `↑`/`↓` — so each is the kept answer it is ([`kept_answer`],
+    /// [`Role::Persist`]) under any title: also where a label's third row
+    /// has room beside the label's first row and none beside the row above
+    /// it (`Use this and all` over `future MCP servers` over `in this
+    /// project` at 24 columns, MEASURED 2026-10-17; at 26 `… servers in` over
+    /// `this project`), and where its rest opens with a capital and the
+    /// label with it is a kept answer whole (`Continue without using this`
+    /// over `MCP server` at 31 and 34). Before, each row was an option:
+    /// `Continue without using this MCP` over `server`, a refusal
+    /// ([`Role::Deny`]) and no kept answer. And no option is joined onto the
+    /// one above it: with the cursor on `Use this and all future MCP servers
+    /// in this project`, filled to within five cells of the edge (60x11),
+    /// wrapped (35x11, and at 35 columns under the rule) or filling its row
+    /// to the edge (55 columns under the rule), the
+    /// unmarked `Continue without using this MCP server` under it, which a
+    /// row's fill alone reads as its rest, is an option of its own: joined
+    /// onto the cursor's, the box read as one option that no kept answer
+    /// names, and, with the first option off the screen
+    /// ([`MCP_SERVER_DERIVED`]), the reset step Escaped it. NEGATIVE CONTROLS: two options a
+    /// row apart stay two where the first leaves room for the next one's first
+    /// word (`Use this MCP server` over `Use this and all future`, 30
+    /// columns, under the rule and with no rule on the screen); the dialog
+    /// for several's `Enable selected`, further in than its server rows, is
+    /// no server row's rest, and with no rule on the screen its second server
+    /// row is no rest of the first, though the widest row left above the
+    /// footer would read it so (DERIVED); and the frame that shows the
+    /// wrapped option's last row alone reads no box.
+    #[test]
+    fn a_wrapped_unnumbered_option_is_read_as_one() {
+        let [one, all, skip, submit] =
+            ["mcp.use", "mcp.use_all", "mcp.skip", "mcp.submit"].map(crate::anchors::anchor_text);
+        let (a, b) = ("[✔] lab-probe-a", "[✔] lab-probe-b");
+        let three: &[&str] = &[one, all, skip];
+        let expected: [Option<(PromptKind, &[&str])>; 27] = [
+            Some((PromptKind::McpServer, three)),
+            Some((PromptKind::McpServer, three)),
+            Some((PromptKind::Other, &[skip])),
+            Some((PromptKind::Other, &[skip])),
+            Some((PromptKind::Other, &[all, skip])),
+            Some((PromptKind::Other, &[one, all])),
+            Some((PromptKind::Other, three)),
+            None,
+            Some((PromptKind::McpServer, &[a, b, submit])),
+            Some((PromptKind::Other, &[a, submit])),
+            Some((PromptKind::Other, &[one, all])),
+            Some((PromptKind::Other, &[one, all])),
+            Some((PromptKind::Other, three)),
+            Some((PromptKind::Other, three)),
+            Some((PromptKind::McpServer, three)),
+            Some((PromptKind::McpServer, three)),
+            Some((PromptKind::McpServer, three)),
+            Some((PromptKind::Other, three)),
+            Some((PromptKind::McpServer, three)),
+            Some((PromptKind::McpServer, three)),
+            Some((PromptKind::McpServer, three)),
+            Some((PromptKind::McpServer, three)),
+            Some((PromptKind::McpServer, three)),
+            Some((PromptKind::McpServer, three)),
+            Some((PromptKind::Other, &[all, skip])),
+            Some((PromptKind::Other, &[all, skip])),
+            Some((PromptKind::Other, &[a, b, submit])),
+        ];
+        for (text, want) in MCP_SERVER_NARROW
+            .iter()
+            .chain(&MCP_SERVER_DERIVED)
+            .zip(expected)
+        {
+            let rows = screen(text);
+            let name = text.lines().next().unwrap_or_default();
+            let p = parse_prompt_v2(&rows);
+            let read = p.as_ref().map(|p| {
+                (
+                    p.kind,
+                    p.options
+                        .iter()
+                        .map(|o| o.label.as_str())
+                        .collect::<Vec<_>>(),
+                )
+            });
+            assert_eq!(read, want.map(|(k, l)| (k, l.to_vec())), "{name}");
+            for o in p.iter().flat_map(|p| &p.options) {
+                assert!(
+                    o.label.starts_with("[✔]") || o.role == Role::Persist,
+                    "{name}: {o:?}"
+                );
+            }
+        }
+    }
+
+    /// AN UNNUMBERED LABEL IS JOINED IN THE ROOM AT EITHER EDGE IT MAY BE
+    /// DRAWN TO ([`unnumbered`]), read off the rule on the screen
+    /// ([`rule_width`]). MEASURED on 2.1.302, Ink wraps a Select's label at
+    /// the pane's edge: the MCP server dialog's from column 4
+    /// ([`MCP_SERVER_NARROW`]: `Use this and all future MCP servers in this
+    /// project`, 51 cells, over `project` at 54 columns), the folder-trust
+    /// dialog's from column 3, where the held message's labels are drawn
+    /// ([`TRUST_NARROW`]: `Yes, I trust this folder` whole on its row at 27,
+    /// `Yes, I trust this` over `folder` at 20). MODELLED one cell short of
+    /// it: aterm's hand-built held message ([`rewrap_box`]), its Deny label
+    /// one option and its delivery the other at every width from 35 to 70.
+    /// NEGATIVE CONTROL: the 54-column rows under a rule two cells longer
+    /// leave room for `project` at both edges, and it opens an option of its
+    /// own — both halves still kept for good by their rows ([`Opt::kept`]).
+    #[test]
+    fn an_unnumbered_label_is_joined_in_the_room_at_either_edge() {
+        let rows = screen(MCP_SERVER_NARROW[15]);
+        let width = rule_width(&rows);
+        assert_eq!(width, Some(54));
+        let block = block_from(&rows, "Use this MCP server");
+        let read = |width| -> Vec<(String, bool)> {
+            unnumbered(&rows, &block, ARROW, width)
+                .0
+                .into_iter()
+                .map(|o| (o.label, o.kept))
+                .collect()
+        };
+        let [one, all, skip] =
+            ["mcp.use", "mcp.use_all", "mcp.skip"].map(crate::anchors::anchor_text);
+        let whole = |l: &str| (l.to_string(), true);
+        assert_eq!(read(width), [whole(one), whole(all), whole(skip)]);
+
+        let labels = |rows: &[String]| -> Vec<String> {
+            parse_prompt_v2(rows)
+                .expect("the dialog")
+                .options
+                .into_iter()
+                .map(|o| o.label)
+                .collect()
+        };
+        for (text, (width, head)) in TRUST_NARROW
+            .iter()
+            .zip([(27, "Yes, I trust this folder"), (20, "Yes, I trust this")])
+        {
+            let rows = screen(text);
+            assert_eq!(rule_width(&rows), Some(width));
+            let row = rows
+                .iter()
+                .find(|r| crate::text::trim(r) == head)
+                .expect("the label's first row");
+            assert_eq!(crate::question::cells(row), width, "to the edge");
+            assert_eq!(labels(&rows), ["No, exit", "Yes, I trust this folder"]);
+        }
+        for width in 35..=70 {
+            assert_eq!(
+                labels(&rewrap_box(HELD_MESSAGE_2_1_287, width)),
+                [
+                    "Deny — drop it and tell the sender it was declined",
+                    "Deliver this message to Claude"
+                ],
+                "{width}"
+            );
+        }
+
+        // NEGATIVE CONTROL.
+        assert_eq!(
+            read(Some(56)),
+            [
+                whole(one),
+                whole("Use this and all future MCP servers in this"),
+                whole("project"),
+                whole(skip)
+            ]
+        );
+    }
+
+    /// INK'S WRAP DRAWS THE MEASURED ROWS ([`ink_wrap`]): every title, body
+    /// and label row of 2.1.302's MCP server dialog drawn whole under its
+    /// rule ([`MCP_SERVER_NARROW`], at 21 to 55 columns, title and body from
+    /// column 2 and labels from column 4, each in the pane's width less 4)
+    /// and of its folder-trust dialog ([`TRUST_NARROW`], its workspace path,
+    /// broken inside the word, and body from column 1 in the width less 2,
+    /// labels from column 3 in the width less 3), and the model picker's
+    /// descriptions in their column ten cells wide ([`MODEL_PICKER_40COL`]).
+    /// The row under an exactly full row has a cell less: `New MCP server
+    /// found in` (23 cells at 27 columns) over `this project:` over
+    /// `lab-probe`, `require approval.` (17 at 21) over `Learn more in` over
+    /// `the MCP`, `0 per Mtok` over `($0.50/$2` over `.50 for`. And
+    /// [`crate::wrap::rows_in`] counts each line's rows as it draws them.
+    /// NEGATIVE CONTROL: wrapped with no cell for that space, as
+    /// [`rewrap_box`]'s greedy wrap does, the title at 27 and the body at 21
+    /// are drawn otherwise (`this project: lab-probe`, `Learn more in the`).
+    #[test]
+    fn inks_wrap_draws_the_measured_rows() {
+        // The rows of a block of text at column `col` from row `first`, down
+        // to the first row that is blank or at another column.
+        let block = |rows: &[String], first: usize, col: usize| -> Vec<String> {
+            rows[first..]
+                .iter()
+                .take_while(|r| !r.trim().is_empty() && crate::phase::leading_spaces(r) == col)
+                .map(|r| r.trim().to_string())
+                .collect()
+        };
+        let title = "New MCP server found in this project: lab-probe";
+        let body = "MCP servers may execute code or access system resources. All tool calls \
+                    require approval. Learn more in the MCP documentation.";
+        let labels = ["mcp.use", "mcp.use_all", "mcp.skip"].map(crate::anchors::anchor_text);
+        for k in [0, 1, 14, 15, 16, 18, 19, 20, 21, 22, 23] {
+            let rows = screen(MCP_SERVER_NARROW[k]);
+            let rule = rows.iter().position(|r| r.starts_with('─')).expect("rule");
+            let width = crate::question::cells(&rows[rule]);
+            let room = width - 4;
+            let head = block(&rows, rule + 1, 2);
+            assert_eq!(head, ink_wrap(title, room), "title at {width}");
+            let at = rule + 1 + head.len() + 1;
+            let text = block(&rows, at, 2);
+            assert_eq!(text, ink_wrap(body, room), "body at {width}");
+            let first = at + text.len() + 1;
+            let drawn: Vec<String> = rows[first..]
+                .iter()
+                .take_while(|r| !r.trim().is_empty())
+                .map(|r| {
+                    marked(r, ARROW)
+                        .map_or(crate::text::trim(r), |(_, t)| t)
+                        .to_string()
+                })
+                .collect();
+            let want: Vec<String> = labels.iter().flat_map(|l| ink_wrap(l, room)).collect();
+            assert_eq!(drawn, want, "labels at {width}");
+            for line in [title, body].into_iter().chain(labels) {
+                assert_eq!(crate::wrap::rows_in(line, room), ink_wrap(line, room).len());
+            }
+        }
+        for text in TRUST_NARROW {
+            let rows = screen(text);
+            let rule = rows.iter().position(|r| r.starts_with('─')).expect("rule");
+            let width = crate::question::cells(&rows[rule]);
+            let path = rows
+                .iter()
+                .position(|r| r.trim_start().starts_with("/private/"))
+                .expect("the path");
+            assert_eq!(
+                block(&rows, path, 1),
+                ink_wrap("/private/tmp/at.6AMk/proj", width - 2)
+            );
+            let quick = rows
+                .iter()
+                .position(|r| r.trim_start().starts_with("Quick safety"))
+                .expect("the body");
+            assert_eq!(
+                block(&rows, quick, 1),
+                ink_wrap(
+                    "Quick safety check: Is this a project you created or one you trust? \
+                     (Like your own code, a well-known open source project, or work from \
+                     your team). If not, take a moment to review what's in this folder first.",
+                    width - 2
+                )
+            );
+            let yes = rows
+                .iter()
+                .position(|r| r.trim_start().starts_with("Yes, I trust"))
+                .expect("the label");
+            assert_eq!(
+                block(&rows, yes, 3),
+                ink_wrap("Yes, I trust this folder", width - 3)
+            );
+        }
+        let picker = screen(MODEL_PICKER_40COL);
+        for (number, line) in [
+            "Use the default model (currently Opus 5.5) · $4/$20 per Mtok",
+            "Opus 5.5 · Best for everyday, complex tasks · $4/$20 per Mtok",
+            "Fable 5.1 · Most capable for your hardest and longest-running tasks · $10/$50 per Mtok",
+            "Sonnet 5.5 · Efficient for routine tasks · $2/$10 per Mtok",
+            "Haiku 5.5 · Fastest for quick answers · $0.10/$0.50 per Mtok ($0.50/$2.50 for \
+             prompts over 100k)",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = picker
+                .iter()
+                .position(|r| r.contains(&format!("{}. ", number + 1)))
+                .expect("the option");
+            let mut drawn = vec![picker[at].chars().skip(28).collect::<String>()];
+            drawn.extend(block(&picker, at + 1, 28));
+            assert_eq!(drawn, ink_wrap(line, 10), "{line}");
+            assert_eq!(crate::wrap::rows_in(line, 10), drawn.len());
+        }
+
+        // NEGATIVE CONTROL.
+        let rows = screen(MCP_SERVER_NARROW[21]);
+        assert_eq!(
+            block(&rows, 2, 2),
+            ["New MCP server found in", "this project:", "lab-probe"]
+        );
+        assert_eq!(
+            greedy(title, 23),
+            ["New MCP server found in", "this project: lab-probe"]
+        );
+        let rows = screen(MCP_SERVER_NARROW[18]);
+        let learn = rows
+            .iter()
+            .position(|r| r.trim() == "Learn more in")
+            .expect("row");
+        assert_eq!(crate::text::trim(&rows[learn + 1]), "the MCP");
+        assert!(greedy(body, 17).iter().any(|r| r == "Learn more in the"));
+    }
+
+    /// THE ROW UNDER A FULL LABEL ROW HAS A CELL LESS ([`unnumbered`],
+    /// [`crate::wrap::lead`]): Ink's wrap starts it with the space before
+    /// its first word, which it then draws nowhere (READ in 2.1.302's bundle,
+    /// MEASURED on its Text: [`ink_wrap`]). So the room a label's row above
+    /// leaves is read as wrap-ansi filled it. The held message re-wrapped by
+    /// Ink's wrap ([`rewrap_box_ink`]) at 22 columns (2.1.287, labels at
+    /// column 3) and 23 (2.1.282, at column 4), in the room a cell short of
+    /// the edge (MODELLED): its Deny label `Deny — drop it and`, full, over
+    /// `tell the sender` over `it was declined` is one option, and its
+    /// delivery the other; and in every frame of it half drawn (its rows
+    /// down to one, the rest blank), each option is a label's first rows,
+    /// never a piece from inside one. Before, counted from its text alone,
+    /// `tell the sender` had room for `it`, and `it was declined` was an
+    /// option of its own: the whole frame was escalated, and half drawn,
+    /// its delivery not yet on the screen, full power focused it. NEGATIVE
+    /// CONTROL: the same rows under rules a cell longer leave the first row a
+    /// cell short of full, and `it was declined` opens an option of its own.
+    #[test]
+    fn a_label_row_under_a_full_row_has_a_cell_less() {
+        let (deny, deliver) = (
+            "Deny — drop it and tell the sender it was declined",
+            "Deliver this message to Claude",
+        );
+        let labels = |rows: &[String]| -> Option<Vec<String>> {
+            parse_prompt_v2(rows).map(|p| p.options.into_iter().map(|o| o.label).collect())
+        };
+        // Whether `piece` is the first words of `label`.
+        let head_of = |piece: &str, label: &str| {
+            label == piece
+                || label
+                    .strip_prefix(piece)
+                    .is_some_and(|r| r.starts_with(' '))
+        };
+        for (fixture, width, col) in [(HELD_MESSAGE_2_1_287, 22, 3), (HELD_MESSAGE, 23, 4)] {
+            let rows = rewrap_box_ink(fixture, width);
+            let at = rows
+                .iter()
+                .position(|r| r.trim_start().starts_with("❯ Deny"))
+                .expect("the Deny label");
+            let drawn: Vec<&str> = rows[at..at + 3].iter().map(|r| r.trim_start()).collect();
+            assert_eq!(
+                drawn,
+                ["❯ Deny — drop it and", "tell the sender", "it was declined"]
+            );
+            assert_eq!(crate::question::cells(&rows[at]), width - 1, "full");
+            assert_eq!(crate::phase::leading_spaces(&rows[at + 2]), col);
+            assert_eq!(
+                labels(&rows),
+                Some(vec![deny.to_string(), deliver.to_string()])
+            );
+            for j in 1..rows.len() {
+                let half: Vec<String> = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| if i < j { r.clone() } else { String::new() })
+                    .collect();
+                for label in labels(&half).into_iter().flatten() {
+                    assert!(
+                        head_of(&label, deny) || head_of(&label, deliver),
+                        "{width} columns, half drawn to {j}: {label:?}"
+                    );
+                }
+            }
+
+            // NEGATIVE CONTROL.
+            let wider: Vec<String> = rows
+                .iter()
+                .map(|r| match r.chars().last() {
+                    Some(c @ ('─' | '╌')) => format!("{r}{c}"),
+                    _ => r.clone(),
+                })
+                .collect();
+            assert_eq!(
+                labels(&wider),
+                Some(vec![
+                    "Deny — drop it and tell the sender".to_string(),
+                    "it was declined".to_string(),
+                    deliver.to_string()
+                ])
+            );
+        }
+    }
+
+    /// A ROW AT OR PAST THE ROOM GIVES THE ROW UNDER IT A LEAD
+    /// ([`crate::wrap::lead`], in the room [`unnumbered`] reads a label in,
+    /// a cell short of the pane's edge), on label rows MEASURED on 2.1.302
+    /// ([`MCP_SERVER_NARROW`]): at 31 columns `Use this and all future MCP`,
+    /// 27 cells against the room's 26, a row full to the pane's edge; at 26
+    /// `future MCP servers in`, 21 against 21, exactly full a cell short of
+    /// the edge. NEGATIVE CONTROL: at 24 `future MCP servers`, 18 against
+    /// 19, a cell short of the room, gives none.
+    #[test]
+    fn a_row_at_or_past_the_room_gives_the_row_under_it_a_lead() {
+        for (k, row, lead) in [
+            (22, "Use this and all future MCP", 1),
+            (20, "future MCP servers in", 1),
+            (19, "future MCP servers", 0),
+        ] {
+            let rows = screen(MCP_SERVER_NARROW[k]);
+            let room = rule_width(&rows).expect("the rule") - 5;
+            let text = rows
+                .iter()
+                .map(|r| crate::text::trim(r))
+                .find(|t| *t == row)
+                .expect("the row");
+            assert_eq!(
+                crate::wrap::lead(crate::question::cells(text), room),
+                lead,
+                "{row:?} in {room}"
+            );
+        }
+    }
+
+    /// A ROW'S LEAD IS CARRIED TO THE ROW UNDER IT ([`unnumbered`]): the
+    /// row above is counted with the cell its own lead took, so a row full
+    /// only with that cell is full. SYNTHETIC (no unnumbered label aterm has
+    /// seen draws this at any width): a label Ink's wrap ([`ink_wrap`])
+    /// draws in 13 cells as `Yes, and keep` (13, full) over `allowing any`
+    /// (12, full with its lead) over `reads` (after a lead) over `outside
+    /// the`, whose first word has room beside `reads` only without that
+    /// lead: one option, its whole label. NEGATIVE CONTROL: the same rows
+    /// under a rule a cell longer, where no row above `reads` is full, read
+    /// `outside the` as an option of its own.
+    #[test]
+    fn a_rows_lead_is_carried_to_the_row_under_it() {
+        let label = "Yes, and keep allowing any reads outside the working directories";
+        let wrapped = ink_wrap(label, 13);
+        assert_eq!(
+            wrapped,
+            [
+                "Yes, and keep",
+                "allowing any",
+                "reads",
+                "outside the",
+                "working",
+                "directories"
+            ]
+        );
+        let rows: Vec<String> = wrapped
+            .iter()
+            .enumerate()
+            .map(|(i, r)| format!("{}{r}", if i == 0 { "  ❯ " } else { "    " }))
+            .chain(["    Not now".to_string()])
+            .collect();
+        let block: Vec<usize> = (0..rows.len()).collect();
+        let read = |width| -> Vec<String> {
+            unnumbered(&rows, &block, ARROW, Some(width))
+                .0
+                .into_iter()
+                .map(|o| o.label)
+                .collect()
+        };
+        assert_eq!(read(18), [label, "Not now"]);
+
+        // NEGATIVE CONTROL.
+        assert_eq!(
+            read(19),
+            [
+                "Yes, and keep allowing any reads",
+                "outside the working directories",
+                "Not now"
+            ]
+        );
+    }
+
+    /// AN OPTION THAT OPENS WITH NO CAPITAL UNDER ANOTHER READS NO ROLE
+    /// ([`options_of`]): no vendor label does, so it is the rest of a label
+    /// the join could not prove wrapped. The held message re-wrapped by
+    /// Ink's wrap at 22 and 23 columns ([`rewrap_box_ink`]) under rules a
+    /// cell longer — its labels two cells short of the edge, neither
+    /// measured nor modelled — reads `it was declined` alone, and every
+    /// option of it reads [`Role::Other`] (none is kept for good), whole and
+    /// in every frame half drawn: before, `Deny — drop it and tell the sender` read its Deny
+    /// and `it was declined` was the other option, which full power focused
+    /// while the delivery was not yet drawn, and the reset step pressed Down
+    /// again and again. No capital is more than no lowercase letter
+    /// ([`opens_with_capital`]): the safety check's held frames, SYNTHETIC,
+    /// whose Deny label's rest opens with CJK (`那个 sender it was declined`
+    /// at 33 columns, half drawn) or an emoji (`🚀` at 57) read no role
+    /// either, where a test for a lowercase letter let the Deny read its
+    /// role and full power focused the rest. And the rule only takes roles
+    /// away: an answer kept for good by its label (`always`) still reads
+    /// [`Role::Persist`] — the safety check's SYNTHETIC `Continue with tools,
+    /// always on` over `Keep waiting for` over `now` — where it read Other
+    /// and was taken for a reworded box; and every standing role
+    /// ([`Role::standing`]) stays, on the safety check's SYNTHETIC Tool box:
+    /// `Yes, during this session` reads [`Role::Session`] and `Yes, allow all
+    /// edits during this session (shift+tab)` [`Role::ModeSwitch`] over a
+    /// rest `no`, where they read Other beside a kept Persist and full power
+    /// took them; a plain `Yes` there reads Other. NEGATIVE CONTROLS: at the
+    /// width it was drawn for, the same message reads its Deny and its
+    /// delivery; the CJK and emoji rests made to open with a capital are
+    /// options of their own, and the Deny reads its role; the label without
+    /// `always` reads Other; and the Tool box's rest made `No` reads its
+    /// Deny, and its `Yes` [`Role::Once`].
+    #[test]
+    fn an_option_opening_with_no_capital_under_another_reads_no_role() {
+        let frame = |rows: &[&str]| -> Vec<String> { rows.iter().map(|r| r.to_string()).collect() };
+        let roles = |rows: &[String]| -> Vec<(String, Role)> {
+            parse_prompt_v2(rows)
+                .expect("the box")
+                .options
+                .into_iter()
+                .map(|o| (o.label, o.role))
+                .collect()
+        };
+        let other = |labels: &[&str]| -> Vec<(String, Role)> {
+            labels
+                .iter()
+                .map(|l| (l.to_string(), Role::Other))
+                .collect()
+        };
+        let cjk = [
+            "⏺ Working on it.",
+            "  ⎿  (tool output)",
+            "",
+            "─────────────────────────────────",
+            " Held message from another",
+            " session",
+            "",
+            "  Another Claude session sent a",
+            "  message: from @s-1",
+            "",
+            "  This session is not prompting",
+            "  for permissions.",
+            "",
+            "  ❯ Deny — drop it and tell",
+            "    那个 sender it was declined",
+            "",
+            "",
+        ];
+        let emoji = [
+            "⏺ Working on it.",
+            "  ⎿  (tool output)",
+            "",
+            "─────────────────────────────────────────────────────────",
+            " Held message from another session",
+            "",
+            "  Another Claude session sent a message: from @s-1",
+            "",
+            "  This session is not prompting for permissions.",
+            "",
+            "  ❯ Deny — drop it and tell the sender it was declined",
+            "    🚀",
+            "",
+        ];
+        let (cut, whole) = (
+            "Deny — drop it and tell",
+            "Deny — drop it and tell the sender it was declined",
+        );
+        for (rows, deny, rest, capital) in [
+            (
+                &cjk[..],
+                cut,
+                "那个 sender it was declined",
+                "That sender it was declined",
+            ),
+            (&emoji[..], whole, "🚀", "Go"),
+        ] {
+            assert_eq!(roles(&frame(rows)), other(&[deny, rest]));
+            // NEGATIVE CONTROL: the rest opens with a capital.
+            let control: Vec<String> = rows.iter().map(|r| r.replace(rest, capital)).collect();
+            assert_eq!(
+                roles(&control),
+                [
+                    (deny.to_string(), Role::Deny),
+                    (capital.to_string(), Role::Other)
+                ]
+            );
+        }
+        let always = |label: &str| {
+            frame(&[
+                "⏺ Working on it.",
+                "",
+                "────────────────────────────────────────",
+                " Setting up Claude in Chrome",
+                "",
+                "  ✔ Install the extension",
+                "  ✔ Connect to Chrome",
+                "",
+                &format!("  ❯ {label}"),
+                "    Keep waiting for",
+                "    now",
+                "",
+                "  Enter to confirm · Esc to cancel",
+            ])
+        };
+        assert_eq!(
+            roles(&always("Continue with tools, always on")),
+            [
+                ("Continue with tools, always on".to_string(), Role::Persist),
+                ("Keep waiting for".to_string(), Role::Other),
+                ("now".to_string(), Role::Other),
+            ]
+        );
+        // NEGATIVE CONTROL: no `always`.
+        assert_eq!(
+            roles(&always("Continue with tools, on")),
+            other(&["Continue with tools, on", "Keep waiting for", "now"])
+        );
+
+        // Every standing role stays: the safety check's SYNTHETIC Tool box.
+        let rule = "─".repeat(60);
+        let tool = |opts: [&str; 3]| -> Vec<String> {
+            let mut rows: Vec<String> = [
+                "⏺ Working on it.",
+                "",
+                &rule,
+                " Tool use",
+                "",
+                "  Slack - send_message Tool: (MCP)",
+                "",
+                " Do you want to proceed?",
+            ]
+            .iter()
+            .map(|r| r.to_string())
+            .collect();
+            rows.push(format!(" ❯ {}", opts[0]));
+            rows.extend(opts[1..].iter().map(|o| format!("   {o}")));
+            rows.extend(["".to_string(), " Esc to cancel · Tab to amend".to_string()]);
+            rows
+        };
+        let session = "Yes, during this session";
+        let kept = "Yes, and don't ask again for ls commands in";
+        let mode = "Yes, allow all edits during this session (shift+tab)";
+        let read = |pairs: [(&str, Role); 3]| -> Vec<(String, Role)> {
+            pairs.iter().map(|&(l, r)| (l.to_string(), r)).collect()
+        };
+        assert_eq!(
+            roles(&tool([session, kept, "no"])),
+            read([
+                (session, Role::Session),
+                (kept, Role::Persist),
+                ("no", Role::Other)
+            ])
+        );
+        assert_eq!(
+            roles(&tool([kept, mode, "no"])),
+            read([
+                (kept, Role::Persist),
+                (mode, Role::ModeSwitch),
+                ("no", Role::Other)
+            ])
+        );
+        assert_eq!(
+            roles(&tool([session, "Yes", "no"])),
+            read([
+                (session, Role::Session),
+                ("Yes", Role::Other),
+                ("no", Role::Other)
+            ])
+        );
+        // NEGATIVE CONTROL: the rest opens with a capital.
+        assert_eq!(
+            roles(&tool([session, "Yes", "No"])),
+            read([
+                (session, Role::Session),
+                ("Yes", Role::Once),
+                ("No", Role::Deny)
+            ])
+        );
+
+        for (fixture, width) in [(HELD_MESSAGE_2_1_287, 22), (HELD_MESSAGE, 23)] {
+            let rows = rewrap_box_ink(fixture, width);
+            let wider: Vec<String> = rows
+                .iter()
+                .map(|r| match r.chars().last() {
+                    Some(c @ ('─' | '╌')) => format!("{r}{c}"),
+                    _ => r.clone(),
+                })
+                .collect();
+            let p = parse_prompt_v2(&wider).expect("the box");
+            assert!(p.options.iter().any(|o| o.label == "it was declined"));
+            assert!(
+                p.options.iter().all(|o| o.role == Role::Other),
+                "{:?}",
+                p.options
+            );
+            let mut cut = 0;
+            for j in 1..wider.len() {
+                let half: Vec<String> = wider
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| if i < j { r.clone() } else { String::new() })
+                    .collect();
+                let Some(p) = parse_prompt_v2(&half) else {
+                    continue;
+                };
+                if p.options
+                    .iter()
+                    .skip(1)
+                    .any(|o| o.label.starts_with(char::is_lowercase))
+                {
+                    cut += 1;
+                    assert!(
+                        p.options.iter().all(|o| o.role == Role::Other),
+                        "{width} columns, half drawn to {j}: {:?}",
+                        p.options
+                    );
+                }
+            }
+
+            assert!(
+                cut > 0,
+                "{width} columns: no half-drawn frame shows the rest alone"
+            );
+
+            // NEGATIVE CONTROL.
+            let p = parse_prompt_v2(&rows).expect("the box");
+            assert_eq!(p.options[0].role, Role::Deny, "{:?}", p.options);
+        }
+    }
+
+    /// OPTIONS DESCRIBED BESIDE THEIR LABELS ([`beside_column`]): the Select
+    /// draws each description two blanks after the column its labels take,
+    /// at column 28 in 2.1.302's model picker at 40 columns (MEASURED,
+    /// [`MODEL_PICKER_40COL`]); the Chrome setup panel drawn so
+    /// ([`CHROME_SETUP`], HAND-BUILT on that geometry) reads its options by
+    /// their labels alone. At 120 columns `Continue with browser tools` is the
+    /// kept answer it is and `Continue without browser tools` the refusal; at
+    /// 40, cut short in a column 24 wide, neither reads a role
+    /// ([`cut_short`]). Before, a description was its label's tail
+    /// (`Continue with browser tools     Claude picks …`, no kept answer) and,
+    /// wrapped, each of its rows an option. NEGATIVE CONTROL: the MCP server
+    /// dialog's options, which carry no description, have no such column.
+    #[test]
+    fn options_described_beside_their_labels_are_read_by_their_labels() {
+        let picker = screen(MODEL_PICKER_40COL);
+        let block = block_from(&picker, "❯ 1. Default");
+        assert_eq!(beside_column(&picker, &block, 2, ARROW), Some(28));
+        let mcp = screen(MCP_SERVER_NARROW[0]);
+        let block = block_from(&mcp, "Use this MCP server");
+        assert_eq!(beside_column(&mcp, &block, 2, ARROW), None);
+        let (with, without) = (
+            crate::anchors::anchor_text("setup.chrome_continue"),
+            "Continue without browser tools",
+        );
+        let expected: [&[(&str, Role)]; 5] = [
+            &[(without, Role::Deny)],
+            &[("Keep waiting", Role::Other), (without, Role::Deny)],
+            &[(with, Role::Persist), (without, Role::Deny)],
+            &[
+                ("Keep waiting", Role::Other),
+                ("Continue without brow…", Role::Other),
+            ],
+            &[
+                ("Continue with browser…", Role::Other),
+                ("Continue without brow…", Role::Other),
+            ],
+        ];
+        for ((phase, text), want) in CHROME_SETUP.iter().zip(expected) {
+            let p = parse_prompt_v2(&screen(text)).expect("the panel");
+            let read: Vec<(&str, Role)> = p
+                .options
+                .iter()
+                .map(|o| (o.label.as_str(), o.role))
+                .collect();
+            assert_eq!(read, want, "{phase}");
+        }
+    }
+
+    /// The rows of the block of options whose first row opens with `head`,
+    /// down to the blank row under them.
+    fn block_from(rows: &[String], head: &str) -> Vec<usize> {
+        let first = rows
+            .iter()
+            .position(|r| r.trim_start().starts_with(head))
+            .expect("the first option");
+        (first..rows.len())
+            .take_while(|&i| !rows[i].trim().is_empty())
+            .collect()
+    }
+
+    /// AN ANSWER KEPT FOR GOOD IS READ FROM ITS ROWS ([`Opt::kept`],
+    /// [`kept_rows`]), however a join reads them: an option is kept when a
+    /// run of its block's label rows that takes in one of its own spells a
+    /// [`kept_answer`] whole. On the rows MEASURED at 35x11
+    /// ([`MCP_SERVER_NARROW`]: `Use this MCP server`, `❯ Use this and all
+    /// future MCP`, `servers in this project`, `Continue without using this
+    /// MCP`, `server`) read joined too far — the cursor's label taking every
+    /// row under it — both options are kept; read a row at a time, every row
+    /// is; and drawn only as far as a label's first row, the rows under it
+    /// not yet drawn (a frame half drawn), the first words of a kept answer
+    /// that end the block keep it. And the MEASURED 54-column dialog,
+    /// retitled (no MCP kind) and its rule drawn two cells longer, so that the
+    /// join reads `… in this` over `project` as two options: each half reads
+    /// [`Role::Persist`]. NEGATIVE CONTROLS: the Chrome setup panel's
+    /// `Continue without browser tools` under `Continue with browser tools`
+    /// (a run of the two spells neither) is no kept answer and reads the
+    /// refusal it is; a server row of the dialog for several, its check mark
+    /// left out ([`spelled`]), spells none; a kept answer's first words over
+    /// another option's row, and one word alone at the block's end
+    /// (`Continue`), keep nothing.
+    #[test]
+    fn an_answer_kept_for_good_is_read_from_its_rows() {
+        let [one, skip] = ["mcp.use", "mcp.skip"].map(crate::anchors::anchor_text);
+        let rows = screen(MCP_SERVER_NARROW[13]);
+        let lines: Vec<&str> = block_from(&rows, "Use this MCP server")
+            .into_iter()
+            .map(|i| marked(&rows[i], ARROW).map_or(crate::text::trim(&rows[i]), |(_, t)| t))
+            .collect();
+        assert_eq!(lines.len(), 5);
+        assert_eq!(kept_rows(&lines, &[0, 1]), [true, true]);
+        assert_eq!(kept_rows(&lines, &[0, 1, 2, 3, 4]), [true; 5]);
+        // Drawn only as far as the cursor's first row, the rows under it not
+        // yet: the first words of a kept answer end the block.
+        assert_eq!(kept_rows(&lines[..2], &[0, 1]), [true, true]);
+        assert_eq!(kept_rows(&lines[3..4], &[0]), [true]);
+        let wide: Vec<String> = screen(MCP_SERVER_NARROW[15])
+            .iter()
+            .map(|r| {
+                if r.starts_with('─') {
+                    format!("{r}──")
+                } else {
+                    r.replace("New MCP server found in this project:", "New tool found:")
+                }
+            })
+            .collect();
+        let p = parse_prompt_v2(&wide).expect("the box");
+        assert_eq!(p.kind, PromptKind::Other);
+        let read: Vec<(&str, Role)> = p
+            .options
+            .iter()
+            .map(|o| (o.label.as_str(), o.role))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                (one, Role::Persist),
+                ("Use this and all future MCP servers in this", Role::Persist),
+                ("project", Role::Persist),
+                (skip, Role::Persist)
+            ]
+        );
+        let chrome = parse_prompt_v2(&screen(CHROME_SETUP[2].1)).expect("the panel");
+        let read: Vec<(&str, bool, Role)> = chrome
+            .options
+            .iter()
+            .map(|o| (o.label.as_str(), o.kept, o.role))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                (
+                    crate::anchors::anchor_text("setup.chrome_continue"),
+                    true,
+                    Role::Persist
+                ),
+                ("Continue without browser tools", false, Role::Deny)
+            ]
+        );
+        assert_eq!(spelled("[✔] lab-probe-a"), "lab-probe-a");
+        // The first words of a kept answer above another option's row, and
+        // one word alone at the end, are none.
+        assert_eq!(
+            kept_rows(&[lines[3], "Keep waiting"], &[0, 1]),
+            [false, false]
+        );
+        assert_eq!(
+            kept_rows(&["Keep waiting", "Continue"], &[0, 1]),
+            [false, false]
+        );
+        let two = parse_prompt_v2(&screen(MCP_SERVER_NARROW[9])).expect("the box");
+        let kept: Vec<bool> = two.options.iter().map(|o| o.kept).collect();
+        assert_eq!(kept, [false, true]);
+    }
+
+    /// A LABEL CUT SHORT IS READ SO UNDER ITS SELECTED MARK ([`cut_short`]):
+    /// the Select draws ` ✔` after the label of the option already
+    /// selected, cut or whole — MEASURED on 2.1.302's model picker at 40
+    /// columns ([`MODEL_PICKER_40COL`]): `Default (recomme… ✔` before its
+    /// description — so that label, its description left out, is cut short.
+    /// NEGATIVE CONTROLS: the picker's `Opus`, whole, is not; nor is a whole
+    /// label under the mark (`Opus ✔`).
+    #[test]
+    fn a_label_cut_short_is_read_so_under_its_selected_mark() {
+        let picker = screen(MODEL_PICKER_40COL);
+        let label = |n: u8| -> String {
+            let (_, label) = picker
+                .iter()
+                .find_map(|r| option_row(r, ARROW).filter(|(k, _)| *k == n))
+                .expect("the option");
+            label.split("  ").next().unwrap_or_default().to_string()
+        };
+        assert_eq!(label(1), "Default (recomme… ✔");
+        assert!(cut_short(&label(1)));
+        assert_eq!(label(2), "Opus");
+        assert!(!cut_short(&label(2)));
+        assert!(!cut_short("Opus ✔"));
     }
 
     /// A server name is project text, even when its tail looks like the

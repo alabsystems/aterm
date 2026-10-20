@@ -25,7 +25,11 @@
 //! stand through a motionless trust dialog as `program=sh agent=-`. A shell
 //! interpreter whose first argument is atpkg's OWN shim
 //! for an agent — a script named after it, directly in the managed prefix's
-//! `agents/` or `bin/` ([`atpkg_shim`]) — is that agent ([`program_from_argv`]).
+//! `agents/` or `bin/`, or the session-scoped `reroute/` stub that runs first
+//! inside an aterm session ([`atpkg_shim`]) — is that agent
+//! ([`program_from_argv`]). A reroute stub names the agent only: it is never
+//! proof of an install (its own header says so), so its `copy=` is `-` until
+//! the image it `exec`s is read (card engine §3.5).
 //! Only that file: a user's own wrapper script named `claude` elsewhere keeps
 //! the interpreter's name while the wrapper runs. If it later execs Claude,
 //! the bounded same-group confirmation can name the new image.
@@ -90,9 +94,10 @@ pub(crate) fn program_from_argv0(argv0: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// The interpreters an agent's shim script runs under (`#!/bin/sh`), whose
-/// first argument then names the script ([`program_from_argv`]).
-const SCRIPT_SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh"];
+// The interpreters an agent's shim script runs under (`#!/bin/sh`), whose
+// first argument then names the script ([`program_from_argv`]): atpkg's own
+// list, which its image classifier reads too (`atpkg::image`).
+use atpkg::image::SCRIPT_SHELLS;
 
 /// The published program of a process whose argv begins `argv0 [argv1]`:
 /// [`program_from_argv0`], except that a shell interpreter
@@ -137,14 +142,43 @@ fn script_in(script: &str, dirs: &[std::path::PathBuf]) -> bool {
     })
 }
 
-/// Whether `script` is atpkg's own shim: a file directly in the configured
-/// managed prefix's `agents/` (the twin) or `bin/`
+/// Which of atpkg's shims a script is ([`shim_in`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Shim {
+    /// The managed twin in `agents/`, or a `bin/` shim: proof of a managed
+    /// copy (`copy=managed`).
+    Managed,
+    /// The session-scoped `reroute/` stub: names its agent, proves nothing
+    /// (`copy=-`), as its header says ("never proof of an install").
+    Reroute,
+}
+
+/// Which shim `script` is in `layout`: a file directly in its `agents/` or
+/// `bin/` ([`Shim::Managed`]) or its `reroute/` ([`Shim::Reroute`]), its
+/// directory as spelled or resolved ([`script_in`]).
+pub(crate) fn shim_in(script: &str, layout: &atpkg::store::Layout) -> Option<Shim> {
+    if script_in(script, &[layout.agents_dir(), layout.bin_dir()]) {
+        Some(Shim::Managed)
+    } else if script_in(script, &[layout.reroute_dir()]) {
+        Some(Shim::Reroute)
+    } else {
+        None
+    }
+}
+
+/// [`shim_in`] the configured managed prefix
 /// (`atpkg::store::resolve_configured`, the prefix every reader outside
 /// atpkg's CLI resolves). Reads `aterm.toml` and stats the prefix, so it runs
 /// only for an agent-named script, on the resolver thread.
+pub(crate) fn shim_of(script: &str) -> Option<Shim> {
+    atpkg::store::resolve_configured().and_then(|layout| shim_in(script, &layout))
+}
+
+/// Whether `script` is atpkg's own shim of either kind, for naming
+/// ([`program_from_argv`]): the reroute stub is named its agent too, at its
+/// exec, so the sweep names a launch before the store image's `exec`.
 pub(crate) fn atpkg_shim(script: &str) -> bool {
-    atpkg::store::resolve_configured()
-        .is_some_and(|layout| script_in(script, &[layout.agents_dir(), layout.bin_dir()]))
+    shim_of(script).is_some()
 }
 
 /// argv[0] and argv[1] of `pid`, as the process itself was exec'd with them,
@@ -379,15 +413,18 @@ pub(crate) fn facts_from(
     ppid: Option<i32>,
     shell: i32,
     managed: Option<&atpkg::store::Layout>,
-    is_shim: &dyn Fn(&str) -> bool,
+    shim_of: &dyn Fn(&str) -> Option<Shim>,
     holds_agent: &dyn Fn(&str) -> bool,
 ) -> LeaderFacts {
     let argv0 = args.argv.first().map_or("", String::as_str);
     let argv1 = args.argv.get(1).map(String::as_str);
-    let program = program_from_argv(argv0, argv1, is_shim);
+    let program = program_from_argv(argv0, argv1, &|script| shim_of(script).is_some());
     let shim = program
         .as_deref()
         .is_some_and(|p| program_from_argv0(argv0).as_deref() != Some(p));
+    // A reroute stub names its agent and proves no copy: `copy=-` until the
+    // image it `exec`s is read.
+    let reroute = shim && argv1.and_then(shim_of) == Some(Shim::Reroute);
     let store = managed.map(|layout| layout.prefix.join("store"));
     // A script runtime running an agent's script (an npm install of Claude
     // Code: `node /usr/local/bin/claude`) keeps the runtime's name, as any
@@ -401,12 +438,16 @@ pub(crate) fn facts_from(
         .filter(|script| !script.starts_with('-'))
         .and_then(program_from_argv0)
         .filter(|script| atpkg::stub::is_agent_program(script));
-    let copy = copy_of(
-        script_agent.as_deref().or(program.as_deref()),
-        &args.exec_path,
-        store.as_deref(),
-        shim,
-    );
+    let copy = if reroute {
+        None
+    } else {
+        copy_of(
+            script_agent.as_deref().or(program.as_deref()),
+            &args.exec_path,
+            store.as_deref(),
+            shim,
+        )
+    };
     let path = (shell > 0 && ppid == Some(shell))
         .then(|| args.env_var("PATH"))
         .flatten()
@@ -500,7 +541,7 @@ pub(crate) fn leader_facts(pgid: i32, shell: i32) -> LeaderFacts {
         parent_of(pgid),
         shell,
         managed.as_ref(),
-        &atpkg_shim,
+        &|script| managed.as_ref().and_then(|layout| shim_in(script, layout)),
         &|dir| holds_agent(dir, &laid),
     )
 }
@@ -513,6 +554,9 @@ struct Job {
     timeline: Arc<Mutex<SessionTimeline>>,
     pgid: i32,
     shell: i32,
+    /// What the footer read this job starts wakes when it moves the
+    /// session's log (`claude_footer::LogWake`, session log Phase 3B).
+    wake: crate::claude_footer::LogWake,
 }
 
 /// The leader read a job runs: `(pgid, shell)` to [`LeaderFacts`] — the
@@ -657,6 +701,9 @@ pub(crate) struct ProgramResolver {
     pending: Arc<Mutex<PendingJobs>>,
     lookup: Lookup,
     completion: Option<Completion>,
+    /// The log's wake the footer reads this resolver starts carry
+    /// ([`Self::set_log_wake`]).
+    log_wake: crate::claude_footer::LogWake,
 }
 
 impl Default for ProgramResolver {
@@ -667,6 +714,7 @@ impl Default for ProgramResolver {
             pending: Arc::new(Mutex::new(PendingJobs::default())),
             lookup: Arc::new(leader_facts),
             completion: None,
+            log_wake: crate::claude_footer::LogWake::default(),
         }
     }
 }
@@ -680,6 +728,24 @@ impl std::fmt::Debug for ProgramResolver {
 }
 
 impl ProgramResolver {
+    /// A resolver whose reads are `lookup`'s: the status sweep's binds put a
+    /// program in front with no process (`session_status_edge_inbox_tests`).
+    #[cfg(test)]
+    pub(crate) fn with_lookup(
+        lookup: impl Fn(i32, i32) -> LeaderFacts + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            lookup: Arc::new(lookup),
+            ..Self::default()
+        }
+    }
+
+    /// What the footer reads this resolver starts wake when they move a
+    /// session's log (the instance's subscribers and the clause switch).
+    pub(crate) fn set_log_wake(&mut self, wake: &crate::claude_footer::LogWake) {
+        self.log_wake = wake.clone();
+    }
+
     /// The status subsystem is off: queued work no longer has a consumer.
     /// An in-flight syscall can finish, but cancellation before publication
     /// prevents its result, footer read, and completion wake. A publication
@@ -783,7 +849,7 @@ impl ProgramResolver {
         timeline: &Arc<Mutex<SessionTimeline>>,
         pgid: i32,
         shell: i32,
-        proxy: Option<&winit::event_loop::EventLoopProxy<crate::Wake>>,
+        proxy: Option<&aterm_window::event_loop::EventLoopProxy<crate::Wake>>,
     ) {
         if pgid <= 0 {
             return;
@@ -804,6 +870,7 @@ impl ProgramResolver {
                 timeline: Arc::clone(timeline),
                 pgid,
                 shell,
+                wake: self.log_wake.clone(),
             });
         let Some(started_fresh) = self.ensure_worker() else {
             return;
@@ -871,7 +938,12 @@ fn run_worker(
             // retiring stop would otherwise keep a dead tab's watch alive.
             let pending = pending.lock().unwrap_or_else(|p| p.into_inner());
             if pending.current(&job, incarnation) {
-                crate::claude_footer::request_footer(job.session, &job.timeline, job.pgid);
+                crate::claude_footer::request_footer(
+                    job.session,
+                    &job.timeline,
+                    job.pgid,
+                    &job.wake,
+                );
             }
         }
         let changed_while_running = pending
@@ -1023,6 +1095,7 @@ mod tests {
             timeline: Arc::clone(&timeline),
             pgid,
             shell: 0,
+            wake: crate::claude_footer::LogWake::default(),
         };
 
         assert!(jobs.offer(job(10)));
@@ -1083,6 +1156,7 @@ mod tests {
             timeline: Arc::clone(&timeline),
             pgid: 10,
             shell: 0,
+            wake: crate::claude_footer::LogWake::default(),
         };
 
         assert!(jobs.offer(job()));
@@ -1155,6 +1229,7 @@ mod tests {
                 timeline: Arc::clone(&timeline),
                 pgid: 42,
                 shell: 0,
+                wake: crate::claude_footer::LogWake::default(),
             };
             pending.lock().unwrap().offer(job.clone());
             let (_, _, incarnation) = pending.lock().unwrap().take(7).unwrap();
@@ -1667,7 +1742,7 @@ mod tests {
     fn the_shells_path_is_measured_only_from_its_direct_child() {
         let agents = format!("{PREFIX}/agents");
         let reroute = format!("{PREFIX}/reroute");
-        let no_shim = |_: &str| false;
+        let no_shim = |_: &str| None;
         let facts = |path: &str, ppid: Option<i32>| {
             facts_from(
                 &measured_4205(path),
@@ -1776,6 +1851,68 @@ mod tests {
         );
     }
 
+    /// REROUTE NAMING (card engine §3.5): the session-scoped reroute stub, a
+    /// `#!/bin/sh` script directly in `reroute/`, is named its agent at its
+    /// exec, with no copy: it is never proof of an install, and the store
+    /// image it `exec`s sets the copy when it is read. The managed twin in
+    /// `agents/` stays `copy=managed`, and a user's own wrapper stays `sh`.
+    /// NEGATIVE CONTROL: the old rule (only `agents/` and `bin/` are shims)
+    /// names the stub `sh`.
+    #[test]
+    fn a_reroute_stub_is_named_its_agent_with_no_copy() {
+        let layout = atpkg::store::Layout {
+            prefix: std::path::PathBuf::from(PREFIX),
+        };
+        let stub = layout.reroute_dir().join("claude");
+        let twin = layout.agents_dir().join("claude");
+        let facts = |script: &std::path::Path, shim_of: &dyn Fn(&str) -> Option<Shim>| {
+            let args = atpkg::caller_shell::ProcArgs {
+                exec_path: "/bin/sh".to_string(),
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    script.to_string_lossy().into_owned(),
+                    "--resume".to_string(),
+                ],
+                env: Vec::new(),
+            };
+            facts_from(&args, None, 0, Some(&layout), shim_of, &|_| false)
+        };
+        let now = |script: &str| shim_in(script, &layout);
+        let rerouted = facts(&stub, &now);
+        assert_eq!(rerouted.program.as_deref(), Some("claude"));
+        assert_eq!(rerouted.copy, None, "the stub proves no install");
+        let managed = facts(&twin, &now);
+        assert_eq!(managed.program.as_deref(), Some("claude"));
+        assert_eq!(managed.copy, Some("managed"));
+        assert_eq!(
+            facts(std::path::Path::new("/Users//o/bin/claude"), &now)
+                .program
+                .as_deref(),
+            Some("sh"),
+            "a user's own wrapper"
+        );
+        let old = |script: &str| {
+            script_in(script, &[layout.agents_dir(), layout.bin_dir()]).then_some(Shim::Managed)
+        };
+        assert_eq!(
+            facts(&stub, &old).program.as_deref(),
+            Some("sh"),
+            "NEGATIVE CONTROL: the old rule names the stub sh"
+        );
+        assert_eq!(
+            shim_in(&stub.to_string_lossy(), &layout),
+            Some(Shim::Reroute)
+        );
+        assert_eq!(
+            shim_in(&twin.to_string_lossy(), &layout),
+            Some(Shim::Managed)
+        );
+        assert_eq!(
+            shim_in(&layout.bin_dir().join("claude").to_string_lossy(), &layout),
+            Some(Shim::Managed)
+        );
+    }
+
     /// AN NPM CLAUDE IS A FOREIGN COPY: `node /usr/local/bin/claude` keeps
     /// the runtime's name (`program=node`), and its copy was asked of that
     /// name, which is no agent, so `copy=-` hid exactly the build `copy=`
@@ -1794,7 +1931,7 @@ mod tests {
                 argv: argv.iter().map(|a| (*a).to_string()).collect(),
                 env: Vec::new(),
             };
-            facts_from(&args, None, 0, Some(&layout), &|_| false, &|_| false)
+            facts_from(&args, None, 0, Some(&layout), &|_| None, &|_| false)
         };
         let npm = facts(
             "/usr/local/bin/node",
@@ -1868,8 +2005,7 @@ mod tests {
         let fake = atpkg::store::Layout {
             prefix: std::path::PathBuf::from("/nonexistent"),
         };
-        let facts =
-            |shell: i32| facts_from(&args, ppid, shell, Some(&fake), &|_| false, &|_| false);
+        let facts = |shell: i32| facts_from(&args, ppid, shell, Some(&fake), &|_| None, &|_| false);
         assert_eq!(facts(parent).path, Some(PathVerdict::Live));
         assert_eq!(facts(parent + 1).path, None, "not this shell's child");
     }

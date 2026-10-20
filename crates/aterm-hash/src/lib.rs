@@ -9,7 +9,8 @@
 //! - [`KeyedHashMap`]: a map hashed under a per-process random key, for text
 //!   keys an untrusted party chooses (see its docs for the rule).
 //! - [`fnv1a_64`] and friends: FNV-1a/64, the one hash whose values may
-//!   persist or cross a crate boundary (see the `fnv` module).
+//!   persist or cross a crate boundary (see the `fnv` module), and its
+//!   128-bit sibling [`fnv1a_128`] for content addresses.
 //!
 //! # Example
 //!
@@ -25,7 +26,11 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
 
 mod fnv;
-pub use fnv::{FNV64_OFFSET, FNV64_PRIME, Fnv1a64, fnv_mix_u64, fnv1a_64, fnv1a_64_extend};
+pub use fnv::{
+    FNV64_OFFSET, FNV64_PRIME, FNV128_OFFSET, FNV128_PRIME, Fnv1a64, bucket_index, fnv_mix_u64,
+    fnv1a_64, fnv1a_64_array8, fnv1a_64_extend, fnv1a_64_to_hex16, fnv1a_64_u16_le,
+    fnv1a_64_u32_le, fnv1a_64_u64_le, fnv1a_128, fnv1a_128_extend,
+};
 
 /// Type alias for a hash map using the Fx hashing algorithm.
 pub type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;

@@ -329,6 +329,74 @@ fn the_cell_box_memo_re_pushes_whenever_the_resolved_size_moves() {
     );
 }
 
+/// Session 0's engine with a full-screen program that set DEC 2048 on its
+/// alternate screen, the enable's own report already taken (the reader's).
+fn session_reporting_its_size(
+    app: &App,
+) -> std::sync::Arc<std::sync::Mutex<aterm_core::terminal::Terminal>> {
+    let term = std::sync::Arc::clone(&app.pool.get(0).expect("session 0").term);
+    {
+        let mut t = term_lock(&term);
+        t.process(b"\x1b[?1049h\x1b[?2048h");
+        let _ = t.take_reports();
+        assert!(t.modes().in_band_size_reports);
+    }
+    term
+}
+
+/// A new cell box at the same grid (the first frame's measurement, a font zoom,
+/// a DPI move) re-reports the text area's pixels to a program that set DEC 2048,
+/// and the window sends that report itself, in the same pass, by both seams that
+/// push the box: nothing is left in the engine for the session reader's next
+/// take, which under ConPTY is the program's next output (a resize to the same
+/// size draws nothing). An idle vim had its report wait until it was killed, and
+/// pwsh got it with the console title written after the kill (measured
+/// 2026-10-18).
+#[test]
+fn a_new_cell_box_sends_its_size_report_in_the_same_pass() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let cell = window_with_a_big_cell(&mut app, wid);
+    let term = session_reporting_its_size(&app);
+    app.apply_window_scale(wid);
+    {
+        let mut t = term_lock(&term);
+        assert_eq!(
+            t.cell_pixel_size(),
+            cell,
+            "the box moved, or this proves nothing"
+        );
+        assert_eq!(
+            t.take_reports(),
+            None,
+            "the raster seam's report waits for no reader"
+        );
+    }
+
+    // The pane pass (`resize_panes`) pushes the box too, before its unchanged
+    // grid returns early.
+    app.resize_panes(wid);
+    let grid = {
+        let mut t = term_lock(&term);
+        let _ = t.take_reports();
+        (t.rows(), t.cols())
+    };
+    app.windows.get_mut(&wid).expect("window 0").metrics.font_px = 10.0;
+    app.resize_panes(wid);
+    let mut t = term_lock(&term);
+    assert_eq!(
+        (t.rows(), t.cols()),
+        grid,
+        "the same grid: the early return"
+    );
+    assert_ne!(t.cell_pixel_size(), cell, "a new box again");
+    assert_eq!(
+        t.take_reports(),
+        None,
+        "the pane pass's report waits for no reader"
+    );
+}
+
 /// A metrics change (`refresh_all_window_metrics`: font zoom, `font_size` /
 /// `font_family` reload) reaches a background window's engines immediately,
 /// with no redraw, resize or `apply_window_scale` after it.
@@ -351,10 +419,10 @@ fn a_font_change_reaches_an_unpainted_windows_engines_at_the_change() {
         "the seed must have reached the engine, or this test proves nothing"
     );
 
-    // The font change (the pinned-px shape a zoom or config reload takes), through the
-    // metrics seam only.
+    // The font change (the shape a zoom or config reload takes), through the metrics
+    // seam only.
+    app.font_size = 24.0;
     app.font_px = 24.0;
-    app.font_px_explicit = true;
     app.refresh_all_window_metrics();
 
     let after = {

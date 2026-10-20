@@ -40,9 +40,9 @@
 //! WHERE IT IS ASKED: on the SOCKET seams only — the verb dispatch
 //! (`control::handle`), the `feed-bin`/`paste-bin` frame and the App lane —
 //! each after authorization and after the halt, so an unauthorized caller
-//! learns nothing and a halted session says
-//! `ERR halted` first. NEVER on the input seam the window keyboard travels
-//! (`input.rs`, `app_input.rs`, `control_input.rs`'s write path, the sink): a
+//! learns nothing and a halted session says `ERR halted` first. NEVER on the
+//! input seam the window keyboard travels (`input.rs`, `app_input.rs`,
+//! `control_input.rs`'s write path, the sink): a
 //! person typing into a frozen program is refused nothing, exactly as the
 //! fleet halt refuses them nothing.
 //!
@@ -1739,8 +1739,8 @@ fn act_of(ctx: &SessionCtx, fact: &InputStallFact) -> Option<StallAct> {
 /// owner-class turn, no driver, is the host's own loop's and holds nothing
 /// against it). What the explicit restart's fences
 /// (`crate::restart_act::unavailable`), the one predicate its words choose
-/// by ([`crate::restart_act::offered`]) and the memory row's word
-/// (`crate::status_item::SessionRow::restarts`) read alike. Three leaf
+/// by ([`crate::restart_act::offered`]) and the memory wall's restart word
+/// ([`crate::needs::NeedFacts::restarts`], `App::need_facts`) read alike. Three leaf
 /// locks, each released before the next (`ctx.meta`, the fabric state,
 /// `ctx.turn_lease`).
 ///
@@ -1809,8 +1809,8 @@ pub(crate) fn episode_key(fact: &InputStallFact) -> u64 {
     h.finish()
 }
 
-/// The menu-bar row's stall half ([`crate::status_item::SessionRow::input_stall`])
-/// for a session whose timeline carries a published stall: the server's own
+/// The need's stall words ([`crate::needs::NeedFacts::stall`], read by
+/// `App::need_facts`) for a session whose timeline carries a published stall: the server's own
 /// attention words and the episode's key. Built for EVERY program — a frozen
 /// `vim` is as stuck as a frozen Claude Code — and what follows the restart
 /// rides it only where one is known ([`after_restart`]).
@@ -2001,7 +2001,7 @@ impl crate::App {
         // be a resting one: the session log's settle wake is owed from here.
         self.session_status.slog_wakes.note(id, wake);
         if agent_moved {
-            // The A/B clock (Settings ▸ Harness): a stall moves the word too.
+            // The A/B book (Settings ▸ Harness): a stall moves the word too.
             self.note_harness_phase(id);
         }
         let attention_moved =
@@ -2016,9 +2016,9 @@ impl crate::App {
             // What `Wake::MetaChanged` refreshes for a driver's `meta set
             // attention`: the tab labels and the menu-bar item.
             self.refresh_meta_dependent_chrome(id);
-            self.refresh_operator_status_item();
+            self.mark_status_dirty();
         }
-        self.refresh_presence_session(id, false);
+        self.refresh_presence_session(id);
     }
 }
 
@@ -2458,6 +2458,7 @@ pub(crate) mod tests {
                     key: &key,
                     momentum: &momentum,
                     driver: None,
+                    by: crate::turn_ledger::TurnBy::Ctl,
                     actor: aterm_slog::Actor::Ctl,
                     cause: None,
                     mark: None,
@@ -3398,6 +3399,7 @@ pub(crate) mod tests {
     fn hosted_claude(sid: &str) -> aterm_agent::harness::relaunch::Snapshot {
         let snap = aterm_agent::harness::relaunch::Snapshot {
             stored_login: false,
+            profile: None,
             tab: sid.to_string(),
             pid: 7,
             start: "Sat Sep 27 01:02:03 2026".to_string(),
@@ -3470,8 +3472,9 @@ pub(crate) mod tests {
             ..stalled(Instant::now())
         };
         // Publish (the watch's copy first, as a probe leaves it), then read
-        // every word of it: the attention entry, the menu row, the band's
-        // spoken sentence, and what the loop's mail would name.
+        // every word of it: the attention entry, the menu row (the published
+        // need's words, which the needs pill prints), and what the loop's mail
+        // would name.
         let read = |app: &mut crate::App, fact: InputStallFact| {
             let now = Instant::now();
             app.session_status
@@ -3486,21 +3489,21 @@ pub(crate) mod tests {
                 .clone()
                 .expect("attention");
             let row = {
-                let store = app.store.read().unwrap();
-                crate::App::status_session_row(
-                    store.by_local(0).expect("session 0"),
+                // Copied out of the store's guard, as `App::publish_need` does.
+                let handle = app.store.read().unwrap().by_local(0).cloned();
+                app.need_facts_with(
+                    handle.as_ref().expect("session 0"),
                     |_| true,
                     &Default::default(),
+                    crate::metrics::now_us(),
+                    0,
                 )
-                .input_stall
+                .stall
                 .expect("the stall row")
                 .text
             };
-            let band =
-                crate::presence::words(app.presence.slot(0).expect("a slot"), Instant::now(), 0)
-                    .sentence;
             let mail = crate::harness_host::offered_now(&app.store, &sid);
-            (attention, row, band, mail)
+            (attention, row, mail)
         };
         // Offered for `pid`: the act named everywhere, the conversation
         // promised (`tail`) only where `promised`.
@@ -3511,52 +3514,39 @@ pub(crate) mod tests {
             } else {
                 String::new()
             };
-            let (attention, row, band, mail) = read(app, fact(leader, false));
+            let (attention, row, mail) = read(app, fact(leader, false));
             assert!(
                 attention.ends_with(&format!("restart it: {act}{tail}")),
                 "{why}: {attention}"
             );
             assert_eq!(row, attention, "{why}: the row is the entry's words");
-            assert!(
-                band.contains(&format!("; restart it with {act}")),
-                "{why}: {band}"
-            );
             assert_eq!(mail, Some(promised), "{why}: the loop names the act too");
-            let (attention, row, band, mail) = read(app, fact(leader, true));
+            let (attention, row, mail) = read(app, fact(leader, true));
             assert!(
                 attention.ends_with(&format!("restart it: {act}{tail}"))
                     && !attention.contains("kill"),
                 "{why}: {attention}"
             );
             assert_eq!(row, attention, "{why}");
-            assert!(
-                band.contains(&format!("restart signal; restart it with {act}")),
-                "{why}: {band}"
-            );
             assert_eq!(mail, Some(promised), "{why}");
         };
         let carried = |app: &mut crate::App, why: &str| offered(app, Some(7), (7, true), why);
         // Refused: `signal term` and then `after` (this tab's own resume
         // line where the footer read one for the process in front).
         let refused_then = |app: &mut crate::App, leader: Option<i32>, after: &str, why: &str| {
-            let (attention, row, band, mail) = read(app, fact(leader, false));
+            let (attention, row, mail) = read(app, fact(leader, false));
             assert!(
                 attention.ends_with(&format!("signal term{after}")),
                 "{why}: {attention}"
             );
             assert_eq!(row, attention, "{why}");
-            assert!(
-                band.contains("not reading input for") && !band.contains("restart it with"),
-                "{why}: {band}"
-            );
             assert_eq!(mail, None, "{why}: the loop names no act");
-            let (attention, row, band, _) = read(app, fact(leader, true));
+            let (attention, row, _) = read(app, fact(leader, true));
             assert!(
                 attention.contains("end it: aterm ctl @") && attention.contains("signal kill"),
                 "{why}: {attention}"
             );
             assert_eq!(row, attention, "{why}");
-            assert!(band.contains("end it with signal kill"), "{why}: {band}");
         };
         let own_line = format!(", then {OWN}");
         let refused = |app: &mut crate::App, leader: i32, why: &str| {
@@ -3592,6 +3582,7 @@ pub(crate) mod tests {
             expires_us: now_us + 60_000_000,
             conn: None,
             hard: false,
+            here: false,
             holder_pid: None,
         }));
         refused(&mut app, 7, "a live drive lease");
@@ -3720,10 +3711,6 @@ pub(crate) mod tests {
                 .clone()
                 .expect("attention")
         };
-        let band = |app: &crate::App| {
-            crate::presence::words(app.presence.slot(77).expect("a slot"), Instant::now(), 0)
-                .sentence
-        };
         let term = format!("restart it: aterm ctl @{sid} signal term");
         let act = format!("aterm ctl @{sid} restart pid=7 if-stalled");
         assert!(entry().ends_with(&term), "{}", entry());
@@ -3752,11 +3739,6 @@ pub(crate) mod tests {
             "{}",
             entry()
         );
-        assert!(
-            band(&app).contains(&format!("; restart it with {act}")),
-            "{}",
-            band(&app)
-        );
         assert!(probe(&mut app).is_empty(), "nothing moved since");
         crate::harness_host::publish_snapshot_for_test(&sid, None);
         assert_eq!(slave_read_all(slave), b"\r");
@@ -3764,31 +3746,73 @@ pub(crate) mod tests {
         aterm_pty::close_fd(slave);
     }
 
-    /// THE MEMORY ROW'S WORD (resume-hint review, 2026-09-26): the menu row
-    /// says the host restarts an agent at its next idle point
-    /// ([`crate::status_item::SessionRow::restarts`], whose label
-    /// `status_item`'s tests read) only where the host would relaunch its
-    /// launch AND its own hand holds the session (of an agent it supervises:
-    /// never on supervision alone). Relaunch off
-    /// (`relaunching` empty), no claim, and a `drive watch` claim — which
-    /// restarts nothing — are each promised nothing. NEGATIVE CONTROL: the
-    /// host's own claim with a launch it would plan.
+    /// THE MEMORY ROW RIDES THE SAME WORD, END TO END (resume-hint review,
+    /// 2026-09-26). A Claude Code showing its critical-memory banner, under
+    /// a window whose host SUPERVISES (every such row counts as supervised,
+    /// claim or not): `App::need_facts` hands the classifier the host's word
+    /// (`relaunching` and its own hand, as `NeedFacts::restarts`), and only on
+    /// it is the banner a wait on the host's restart (`WaitWord::MemoryRestart`),
+    /// never a need. Relaunch off (`relaunching` empty), no claim, and another
+    /// holder's `meta set supervisor` claim (a manager session, codex-alab's
+    /// self-claim), which restarts nothing, each leave it the person's memory
+    /// need, its remedy naming the tab's own `claude --resume <id>`.
+    /// NEGATIVE CONTROL: the host's own claim with a launch it would plan.
     #[test]
     fn the_memory_row_promises_the_restart_only_on_the_hosts_word() {
         let app = crate::App::headless_for_test();
         let ctx = app.pool.get(0).expect("session 0").ctx.clone();
-        claude_in_front(&ctx, 7, "wall:memory");
+        {
+            let mut tl = ctx.timeline.lock().unwrap();
+            tl.note_foreground_group(7);
+            tl.set_program(7, Some("claude".into()));
+            tl.publish_agent(
+                "wall:memory",
+                None,
+                None,
+                Some(aterm_phase::Program::Claude),
+                crate::session_timeline::AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                    fp: 1,
+                },
+            );
+            assert!(tl.set_claude_footer(
+                7,
+                None,
+                Some(aterm_agent::harness::footer::FooterFacts {
+                    resume: Some(OWN.to_string()),
+                    ..Default::default()
+                }),
+            ));
+        }
         let now_us = crate::metrics::now_us();
         let relaunching: std::collections::HashSet<String> =
             std::iter::once(ctx.self_id.as_str().to_string()).collect();
+        // Whether the verdict waits on the host's restart: else it is the
+        // person's memory need, whose remedy names the tab's own resume.
         let restarts = |relaunching: &std::collections::HashSet<String>| {
-            let store = app.store.read().unwrap();
-            crate::App::status_session_row(
-                store.by_local(0).expect("session 0"),
+            // Copied out of the store's guard, as `App::publish_need` does.
+            let handle = app.store.read().unwrap().by_local(0).cloned();
+            let facts = app.need_facts_with(
+                handle.as_ref().expect("session 0"),
                 |_| true,
                 relaunching,
-            )
-            .restarts
+                now_us,
+                0,
+            );
+            assert!(facts.supervised, "the host supervises it: {facts:?}");
+            let verdict = crate::needs::of(&facts);
+            match (verdict.need, verdict.waiting) {
+                (Some(need), _) => {
+                    assert_eq!(need.word, aterm_types::needs::NeedWord::Memory);
+                    assert!(need.what.contains(OWN), "the tab's own resume");
+                    false
+                }
+                (None, Some(wait)) => {
+                    assert_eq!(wait.word, aterm_types::needs::WaitWord::MemoryRestart);
+                    true
+                }
+                (None, None) => panic!("the memory wall is something"),
+            }
         };
         let claim = |holder: &str| {
             ctx.meta.lock().unwrap().supervisor = None;
@@ -3796,12 +3820,16 @@ pub(crate) mod tests {
                 .expect("claimed");
         };
 
+        // `[harness] relaunch = false`: `HostHandle::relaunching` is empty.
         claim(&crate::harness_host::holder());
         assert!(!restarts(&Default::default()), "relaunch off");
+        // No claim yet, though the host would relaunch its launch.
         ctx.meta.lock().unwrap().supervisor = None;
         assert!(!restarts(&relaunching), "no claim");
-        claim("drive-watch@4242");
+        // Another holder's claim: it restarts nothing.
+        claim("manager@4242");
         assert!(!restarts(&relaunching), "another holder");
+        // NEGATIVE CONTROL: the host's own claim, a launch it would plan.
         claim(&crate::harness_host::holder());
         assert!(restarts(&relaunching), "the host restarts it");
     }
@@ -3953,7 +3981,7 @@ pub(crate) mod tests {
         assert_eq!(app.session_status.next_input_wake(), None);
         let record = app.session_status_record(77).expect("live session");
         assert!(
-            record.contains(" input=clear input_bytes=0 input_wait_ms=0 fg_rss_mb=- supervisor="),
+            record.contains(" input=clear input_bytes=0 input_wait_ms=0 fg_rss_mb=- disk="),
             "{record}"
         );
         aterm_pty::close_fd(master);

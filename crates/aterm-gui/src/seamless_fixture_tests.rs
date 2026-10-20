@@ -34,7 +34,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use aterm_core::scrollback::Line;
 use aterm_core::terminal::Terminal;
 
-use super::tests::{ENV_LOCK, ScratchEnv, child_proof_from, pipe_pair, restore_env};
+use super::tests::{
+    ENV_LOCK, ScratchEnv, child_proof_from, pipe_pair, restore_env, run_in_children,
+};
 use super::*;
 
 /// The fixture root: one directory per release, one per desk inside it.
@@ -179,6 +181,19 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.105.0", "shell-integration"),
     ("v0.105.0", "stalled-sequence"),
     ("v0.105.0", "twelve-panes"),
+    ("v0.106.0", "claude-code-1049"),
+    ("v0.106.0", "colour-and-shell"),
+    ("v0.106.0", "held-pane"),
+    ("v0.106.0", "history"),
+    ("v0.106.0", "history-carry"),
+    ("v0.106.0", "incident-55x149"),
+    ("v0.106.0", "link-dense"),
+    ("v0.106.0", "link-dense-history"),
+    ("v0.106.0", "policy-repaint"),
+    ("v0.106.0", "policy-visible"),
+    ("v0.106.0", "shell-integration"),
+    ("v0.106.0", "stalled-sequence"),
+    ("v0.106.0", "twelve-panes"),
 ];
 
 /// THE DESK SET, one `("vX.Y.0", "<desk>")` row per desk: from that release on,
@@ -1349,11 +1364,17 @@ fn assert_meta_state_crosses(
     }
 }
 
-/// The render debt `parent.toml` recorded for a session, `"<shift>,<pushed>"`,
-/// read here rather than by the consumer's parser, which is what is checked.
-fn recorded_render_debt(label: &str, row: &str) -> (i32, i32) {
+/// The render debt `parent.toml` recorded for a session, `"<shift>,<pushed>"`
+/// (every recorded producer predates the `render_debt_cut` key), read here
+/// rather than by the consumer's parser, which is what is checked.
+fn recorded_render_debt(label: &str, row: &str) -> aterm_core::terminal::RenderDebt {
     row.split_once(',')
-        .and_then(|(shift, pushed)| Some((shift.parse().ok()?, pushed.parse().ok()?)))
+        .and_then(|(shift, pushed)| {
+            Some(aterm_core::terminal::RenderDebt::of_rows(
+                shift.parse().ok()?,
+                pushed.parse().ok()?,
+            ))
+        })
         .unwrap_or_else(|| panic!("{label}: a recorded render debt reads: {row:?}"))
 }
 
@@ -1536,8 +1557,41 @@ fn assert_settings_drafts_placed(desk: &Desk, incoming: &IncomingHandoff) -> usi
 /// ([`assert_history_taken`]) and imported whole after it
 /// ([`assert_history_imports`]), a held pane's too
 /// ([`assert_held_history_imports`]).
+///
+/// FOUR CHILD PROCESSES, EVERY FOURTH DESK EACH (test-run speed), as
+/// `every_app_desk_the_gui_can_build_hands_every_session_over_exactly`. A
+/// desk sets the process's HOME and publishes the successor's handoff
+/// environment, so in one process the desks run one after another under
+/// [`ENV_LOCK`] — 3.0 s alone at load 60-90 (2026-10-18), and in the
+/// `-p aterm-gui --lib` binary the fifteen tests of this module the runner
+/// started meanwhile parked on the lock for 13 to 17 s against 0.01 to 0.1 s
+/// alone. Each shard checks its desks exactly as the single pass did, in a
+/// process whose environment is its own, and prints how many Settings drafts
+/// it placed; this test holds their sum to the same floor.
 #[test]
 fn every_shipped_producers_desk_adopts_exactly_and_proves() {
+    const SHARDS: usize = 4;
+    const SHARD: &str = "ATERM_SHIPPED_DESK_SHARD";
+    const DRAFTS: &str = "settings drafts placed: ";
+    let Some(shard) = std::env::var(SHARD)
+        .ok()
+        .map(|text| text.parse::<usize>().expect("the shard is a number"))
+    else {
+        let drafts_carried = run_in_children(SHARD, SHARDS)
+            .iter()
+            .map(|stdout| {
+                stdout
+                    .lines()
+                    .find_map(|line| line.split_once(DRAFTS)?.1.trim().parse::<usize>().ok())
+                    .expect("every shard prints the drafts it placed")
+            })
+            .sum::<usize>();
+        assert!(
+            drafts_carried > 0,
+            "the guard reads at least one shipped Settings draft (v0.98.0/link-dense-history)"
+        );
+        return;
+    };
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let _restore = restore_env();
     let desks = every_desk();
@@ -1550,7 +1604,7 @@ fn every_shipped_producers_desk_adopts_exactly_and_proves() {
             "the {release} fixture {name} is checked in"
         );
     }
-    for desk in &desks {
+    for desk in desks.iter().skip(shard).step_by(SHARDS) {
         let label = desk.label();
         assert_eq!(
             format!("v{}", desk.parent.producer_version),
@@ -1701,10 +1755,7 @@ fn every_shipped_producers_desk_adopts_exactly_and_proves() {
         staged.ready_write = None;
         staged.teardown();
     }
-    assert!(
-        drafts_carried > 0,
-        "the guard reads at least one shipped Settings draft (v0.98.0/link-dense-history)"
-    );
+    println!("{DRAFTS}{drafts_carried}");
 }
 
 /// THE META CHECK IS NOT VACUOUS (the round-4 update audit, plan item 4), and

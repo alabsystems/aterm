@@ -1,0 +1,67 @@
++-o NS_01@1  <class IOEmbeddedNVMeBlockDevice, id 0x10000099d, registered, matched, active, busy 0 (171 ms), retain 7>
+  | {
+  |   "Logical Block Size" = 4096
+  |   "IOMaximumBlockCountWrite" = 256
+  |   "IOMaximumSegmentByteCountRead" = 1048576
+  |   "IOReportLegendPublic" = Yes
+  |   "IOMaximumSegmentByteCountWrite" = 1048576
+  |   "NamespaceID" = 1
+  |   "IOMaximumSegmentCountRead" = 256
+  |   "IOMaximumSegmentCountWrite" = 256
+  |   "IOStorageFeatures" = {"Unmap"=Yes,"Priority"=Yes,"Barrier"=Yes,"QueuedFlush"=Yes}
+  |   "IOUnit" = 1
+  |   "NamespaceUUID" = 0
+  |   "Encryption" = Yes
+  |   "Device Characteristics" = {"Medium Type"="Solid State","Product Name"="APPLE SSD AP4096Z","Vendor Name"="","Product Revision Level"="241.0.12"}
+  |   "IOMaximumBlockCountRead" = 256
+  |   "IOCFPlugInTypes" = {"AA0FA6F9-C2D6-457F-B10B-59A13253292F"="NVMeSMARTLib.plugin"}
+  |   "IOMinimumSegmentAlignmentByteCount" = 4096
+  |   "IOMaximumByteCountRead" = 1048576
+  |   "IOMaximumByteCountWrite" = 1048576
+  |   "device-type" = "Generic"
+  |   "EmbeddedDeviceTypeRoot" = Yes
+  |   "Physical Block Size" = 4096
+  |   "Protocol Characteristics" = {"Physical Interconnect"="Apple Fabric","Physical Interconnect Location"="Internal"}
+  |   "IOReportLegend" = ({"IOReportGroupName"="NVMe","IOReportChannels"=((6082504312848663127,6442450945,"Tier0 BW Scale Factor"),(6082504312865440343,6442450945,"Tier1 BW Scale Factor"),(6082504312882217559,6442450945,"Tier2 BW Scale Factor"),(6082504312898994775,6442450945,"Tier3 BW Scale Factor")),"IOReportChannelInfo"={"IOReportChannelUnit"=0},"IOReportSubGroupName"="BW Limits"},{"IOReportGroupName"="NVMe","IOReportChannels"=((6084209303804800357,6442450945,"Total time elapsed"),(6082504312848654368,6442450945,"Tier0 Throttle Time"),(6082504312865431584,6442450945,"Tier1 Throttle Time"),(6082504312882208800,6442450945,"Tier2 Throttle Time"),(6082504312898986016,6442450945,"Tier3 Throttle Time")),"IOReportChannelInfo"={"IOReportChannelUnit"=0},"IOReportSubGroupName"="Time weighted throttle statistics"})
+  |   "ThermalThrottlingSupported" = Yes
+  |   "NVMe SMART Capable" = Yes
+  | }
+  | 
+  +-o IOBlockStorageDriver  <class IOBlockStorageDriver, id 0x10000099f, registered, matched, active, busy 0 (171 ms), retain 8>
+    | {
+    |   "IOClass" = "IOBlockStorageDriver"
+    |   "CFBundleIdentifier" = "com.apple.iokit.IOStorageFamily"
+    |   "IOProviderClass" = "IOBlockStorageDevice"
+    |   "IOPropertyMatch" = {"device-type"="Generic"}
+    |   "IOPowerManagement" = {"CapabilityFlags"=0,"CurrentPowerState"=0}
+    |   "IOProbeScore" = 0
+    |   "IOMatchedAtBoot" = Yes
+    |   "IOGeneralInterest" = "IOCommand is not serializable"
+    |   "IOMatchCategory" = "IODefaultMatchCategory"
+    |   "Statistics" = {"Operations (Write)"=50639554,"Latency Time (Write)"=0,"Bytes (Read)"=3294332960768,"Errors (Write)"=0,"Total Time (Read)"=19075753303870,"Latency Time (Read)"=0,"Retries (Read)"=0,"Errors (Read)"=0,"Total Time (Write)"=1737421768236,"Bytes (Write)"=1803910754304,"Operations (Read)"=156216805,"Retries (Write)"=0}
+    |   "IOPersonalityPublisher" = "com.apple.iokit.IOStorageFamily"
+    |   "CFBundleIdentifierKernel" = "com.apple.iokit.IOStorageFamily"
+    | }
+    | 
+    +-o APPLE SSD AP4096Z Media  <class IOMedia, id 0x1000009a0, registered, matched, active, busy 0 (171 ms), retain 12>
+        {
+          "Content" = "GUID_partition_scheme"
+          "Removable" = No
+          "Whole" = Yes
+          "Leaf" = No
+          "BSD Name" = "disk0"
+          "Ejectable" = No
+          "Preferred Block Size" = 4096
+          "IOMediaIcon" = {"IOBundleResourceFile"="Internal.icns","CFBundleIdentifier"="com.apple.iokit.IOStorageFamily"}
+          "BSD Minor" = 0
+          "IOGeneralInterest" = "IOCommand is not serializable"
+          "Writable" = Yes
+          "BSD Major" = 1
+          "Size" = 4002222325760
+          "IOBusyInterest" = "IOCommand is not serializable"
+          "Open" = Yes
+          "Content Hint" = ""
+          "BSD Unit" = 0
+        }
+        
+

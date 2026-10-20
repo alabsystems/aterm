@@ -32,7 +32,7 @@
 //! `Resized`; `None` everywhere the window system decorates (X11, server-side
 //! Wayland, macOS, Windows), where none of this runs.
 
-use winit::window::CursorIcon;
+use aterm_window::window::CursorIcon;
 
 /// One of the header's window buttons, laid out left to right as
 /// [`ClientFrame::buttons`] lists them.
@@ -75,8 +75,8 @@ impl ClientFrame {
     /// The frame window `window` must draw itself, or `None` where the window
     /// system decorates it.
     #[cfg(target_os = "linux")]
-    pub(crate) fn of_window(window: &winit::window::Window) -> Option<Self> {
-        use winit::platform::wayland::WindowExtWayland as _;
+    pub(crate) fn of_window(window: &aterm_window::window::Window) -> Option<Self> {
+        use aterm_window::platform::wayland::WindowExtWayland as _;
         window.client_decorations().map(|d| Self {
             minimize: d.minimize,
             maximize: d.maximize,
@@ -241,8 +241,8 @@ pub(crate) enum FrameEdge {
 impl FrameEdge {
     /// The handle as the direction `drag_resize_window` takes.
     #[cfg(target_os = "linux")]
-    pub(crate) fn direction(self) -> winit::window::ResizeDirection {
-        use winit::window::ResizeDirection as D;
+    pub(crate) fn direction(self) -> aterm_window::window::ResizeDirection {
+        use aterm_window::window::ResizeDirection as D;
         match self {
             Self::North => D::North,
             Self::NorthEast => D::NorthEast,

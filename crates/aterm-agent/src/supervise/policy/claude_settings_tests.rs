@@ -316,7 +316,7 @@ fn the_chain_is_read_where_claude_code_reads_it() {
     let proj = s.join("proj");
     std::fs::create_dir_all(&proj).expect("proj");
     let relative = WorkerEnv::hermetic(None).with("CLAUDE_CONFIG_DIR=cc");
-    let user = proj.join("cc/settings.json");
+    let user = proj.join("cc").join("settings.json");
     write(&user, &asks(&["Write"]));
     assert_eq!(
         found(owner_asks(&relative, &proj)),
@@ -389,7 +389,13 @@ fn the_managed_file_and_its_drop_ins_open_the_chain() {
     write(&managed.join("managed-settings.d/20-b.json"), "{}");
     write(&managed.join("managed-settings.d/10-a.json"), "{}");
     write(&managed.join("managed-settings.d/notes.txt"), "x");
-    let named = |p: &str| managed.join(p).display().to_string();
+    // Listed from the directory: each path a component at a time, as the platform spells it.
+    let named = |p: &str| {
+        p.split('/')
+            .fold(managed.clone(), |at, part| at.join(part))
+            .display()
+            .to_string()
+    };
     assert_eq!(
         there(Some(&managed)),
         [
@@ -453,6 +459,10 @@ fn a_settings_file_under_a_file_provider_domain_is_reported_never_opened() {
     for file in [&provider, &ordinary] {
         write(file, "{}");
     }
+    #[cfg_attr(
+        not(unix),
+        expect(unused_mut, reason = "the link is made on unix alone")
+    )]
     let mut fenced = vec![provider.clone()];
     #[cfg(unix)]
     {

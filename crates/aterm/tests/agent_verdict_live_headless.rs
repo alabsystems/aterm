@@ -558,9 +558,10 @@ fn launch_fake(inst: &Instance, sid: &str, script: &Path, go: &Path, quit: &Path
     );
 }
 
-/// With a fake launched and nothing of its REPL drawn, `await agent idle` parks
-/// (`agent=unknown`); then `go` is created and the wait latches on the REPL.
-/// Returns the screen it answered on.
+/// With a fake launched and nothing of its REPL drawn, `await agent idle` does not
+/// answer (`agent=unknown`): the server's own latched predicate, asked with `timeout=0`,
+/// says not yet, with no sleep standing in for it. Then `go` is created and the parked
+/// wait latches on the REPL. Returns the screen it answered on.
 fn parks_then_latches(inst: &Instance, sid: &str, go: &Path, what: &str) -> String {
     let named = status_until(inst, sid, HANG, "program=claude, read as an agent", |s| {
         field(s, "program") == Some("claude") && field(s, "agent") != Some("-")
@@ -573,10 +574,17 @@ fn parks_then_latches(inst: &Instance, sid: &str, go: &Path, what: &str) -> Stri
         );
         move || cmd.output().expect("await agent idle")
     });
+    // The verdict is LATCHED (`await agent`): a wait arriving now answers at once if
+    // `idle` is already published, so `timeout=0` is the check itself.
+    let now = ctl(
+        inst,
+        &[&format!("@{sid}"), "await", "agent", "idle", "timeout=0"],
+    );
+    let now = String::from_utf8_lossy(&now.stdout).into_owned();
     let before = status(inst, sid);
     assert!(
-        !waiter.is_finished(),
-        "{what}: `await agent idle` answered before the REPL was drawn: {before} \
+        now.trim() == "OK timeout" && !waiter.is_finished(),
+        "{what}: `await agent idle` answered before the REPL was drawn: {now} {before} \
          (named: {named})\n{}",
         ctl_ok(inst, &[&format!("@{sid}"), "text"])
     );

@@ -85,13 +85,23 @@ impl std::fmt::Display for HttpError {
 /// `curl`→`Invoke-WebRequest` alias — only real executables on `PATH`). The argv
 /// assembled by [`curl_argv`] is identical on every platform.
 #[cfg(not(windows))]
-fn curl_bin() -> &'static str {
-    "/usr/bin/curl"
-}
+const CURL_BIN: &str = "/usr/bin/curl";
 
 #[cfg(windows)]
-fn curl_bin() -> &'static str {
-    "curl.exe"
+const CURL_BIN: &str = "curl.exe";
+
+/// `ATERM_DEV_CURL` — a DEVELOPMENT SEAM (`aterm_types::dev_seam!`): the program a
+/// development build runs in place of [`CURL_BIN`], so a test can count the curl processes
+/// a lane starts and script what each answers (atpkg's first-round link probe). A shipped
+/// binary does not read it, and a child shell never inherits it
+/// (`aterm_types::domain::ENV_DENY_VARS`).
+pub const CURL_SEAM: &str = "ATERM_DEV_CURL";
+
+/// The curl every lane spawns: [`CURL_BIN`], or a development build's [`CURL_SEAM`].
+fn curl_bin() -> std::ffi::OsString {
+    aterm_types::dev_seam!(CURL_SEAM)
+        .filter(|seam| !seam.is_empty())
+        .unwrap_or_else(|| CURL_BIN.into())
 }
 
 // Skip: Vec growth (`extend`) — the audited-alloc class; capacity is
@@ -553,7 +563,7 @@ fn require_https_url(url: &str) -> Result<(), String> {
 /// one buffer — and the buffer is exactly what the Ed25519 check reads.
 /// [`download_bytes`] retries the subprocess instead.
 ///
-/// NOTE: no `-w "\n%{http_code}"` here (and none in [`download_to_args`]). These carry
+/// NOTE: no `-w "\n%{http_code}"` here (and none in [`download_resume_args`]). These carry
 /// `-f`, so curl's exit status already reports a non-2xx, and appending the status to
 /// stdout would CORRUPT the downloaded bytes — including the appcast the Ed25519
 /// signature covers. Asset downloads therefore stay unclassified; every public/private
@@ -757,50 +767,6 @@ fn download_max_time_secs(max_filesize: u64) -> u64 {
     (max_filesize / 65_536).clamp(600, 21_600)
 }
 
-/// The option list for [`download_to`], extracted so the flag set is assertable in a
-/// unit test.
-///
-/// This is the ONE lane that keeps curl's own `--retry`: the sink is a file (`-o`), and
-/// curl DOES truncate a file sink between attempts (verified), so no failed attempt's
-/// bytes can survive into `dest` the way they survive on a pipe — see
-/// [`CURL_ATTEMPTS`].
-fn download_to_args<'a>(cap: &'a str, max_time: &'a str, dest: &'a str) -> [&'a str; 19] {
-    [
-        // `-s`: without it curl writes its PROGRESS METER to stderr, which this lane
-        // captures into the failure message, burying the cause. `-S` keeps real
-        // errors, the pairing `download_bytes_args` uses.
-        "-fsSL",
-        // https-only redirects — see `download_bytes_args`.
-        "--proto-redir",
-        "=https",
-        "--retry",
-        "2",
-        // Bound the CONNECT, not the transfer — a black-holed TCP/TLS setup must
-        // still fail fast.
-        "--connect-timeout",
-        "30",
-        // Abort only on a REAL stall: under 4 KiB/s for 120 s. This — not the wall
-        // clock — is what tells a dead link from a merely slow one, and it exits 28
-        // just like a `--max-time` expiry, so the error text and the `pipeline`-class
-        // health accounting are unchanged for genuinely dead links.
-        "--speed-limit",
-        "4096",
-        "--speed-time",
-        "120",
-        "--max-time",
-        max_time,
-        "--max-filesize",
-        cap,
-        "-H",
-        "Accept: application/octet-stream",
-        "-o",
-        dest,
-        // The `--` guard before the server-controlled asset URL is appended by
-        // `curl_argv` (see `download_bytes_args`); `require_https_url` rejects
-        // non-https schemes.
-    ]
-}
-
 /// Download an asset (e.g. a DMG) to a file, following the storage redirect.
 /// Bounded at `max_filesize` bytes (caller-supplied) so an attacker-controlled or
 /// mis-pointed release asset can't fill the disk — curl aborts before writing past
@@ -810,38 +776,26 @@ fn download_to_args<'a>(cap: &'a str, max_time: &'a str, dest: &'a str) -> [&'a 
 /// with a stall detector, so a slow link finishes instead of dying at a fixed wall it
 /// can never beat.
 ///
-/// THIS lane does not resume. That used to be argued as an absolute — "a ranged request
-/// would make `--max-filesize` bound only the REMAINING range rather than total bytes
-/// written" — and the accounting half of that is real, but it is arithmetic, not a
-/// barrier: [`download_to_resumable`] subtracts the offset from the cap and keeps the
-/// total bound exactly. What remains true is that resuming needs a `.part` lifecycle the
-/// CALLER owns, and this lane's caller (the app-container download, 26–29 MB, whose
-/// scratch dir is swept wholesale before every attempt by design) neither has one nor
-/// has much to gain. The 630 MB toolchain artifact does, and uses the resumable form.
+/// A stalled or cut attempt continues IN THIS CALL exactly as [`download_to_resumable`]'s
+/// does — the same option list, stall bounds and retries — but into `dest` itself, and every
+/// call begins afresh, cutting `dest` to nothing in place first: this lane's callers (the
+/// app-container download, 26–29 MB, whose scratch dir is swept wholesale before every
+/// attempt by design and whose progress row polls this very file; the Linux updater's
+/// private temp file; the publisher's probe copy) own the file and remove it after a
+/// failure, so nothing resumes across calls, and bytes that stood there before the call are
+/// never continued. Before, a silent drop held this lane for three 120 s stalls on one dead
+/// HTTP/2 connection (curl's own `--retry` reused it) and then failed the check.
 // Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn download_to(asset_url: &str, dest: &Path, max_filesize: u64) -> Result<(), String> {
-    require_https_url(asset_url)?;
-    let dest_s = dest.to_str().ok_or("non-UTF-8 destination path")?;
-    let cap = max_filesize.to_string();
-    // Both must outlive the argv array, which borrows them as `&str`.
-    let max_time = download_max_time_secs(max_filesize).to_string();
-    let out = curl_fetch(&download_to_args(&cap, &max_time, dest_s), asset_url)?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        // Same per-host classification as `download_bytes`: a rate limit is named so
-        // the check lane can defer instead of booking a broken pipeline; a web-host
-        // 403/404 is named for what it is.
-        if let Some(verdict) = classify_asset_failure(asset_url, &stderr) {
-            return Err(verdict);
-        }
-        return Err(format!(
-            "curl download failed ({}): {}",
-            out.status,
-            stderr.trim()
-        ));
-    }
-    Ok(())
+    download_to_resumable_with(
+        asset_url,
+        dest,
+        max_filesize,
+        ResumeLane::Release,
+        Sink::Dest,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// The `.part` sibling a resumable download writes into: the destination file name with
@@ -941,16 +895,124 @@ fn range_refused(exit_code: Option<i32>, stderr: &str) -> bool {
     exit_code == Some(33) || curl_http_error_code(stderr) == Some(416)
 }
 
-/// [`download_to_args`] plus the resume flags. `offset == 0` adds NOTHING — a fresh
-/// transfer must go out as the byte-for-byte historical request, with no `Range` header
-/// for a server to mishandle.
+/// How long a resumable attempt may run under 4 KiB/s before curl calls it stalled
+/// (`--speed-time`), chosen per attempt from how the one before it went
+/// ([`StallBound::after`]).
+///
+/// The bound is what a silent drop costs — a Wi-Fi switch, a NAT timeout or a sleeping peer
+/// sends no reset, so nothing but this ends the attempt — and every later ALab download
+/// waits behind it, since they take the link in turns. A stall resumes from the `.part`
+/// ([`download_to_resumable`]), so ending one early costs a reconnect, never a byte.
+/// Measured with curl 8.7.1 against a tunnel held open with no bytes: curl reports the
+/// stall about six seconds after `--speed-time` (its speed is a five-second average, which
+/// has to drain first) — 9.0 s at 3, 16.1 s at 10, 21.1 s at 15 — and at 64 kB/s a link
+/// survived any silence up to 12 s at 8 and tripped at 13.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallBound {
+    /// 8 s: the stall is reported about 14 s after the last byte, where the historical 120 s
+    /// took 126 s. A call's first attempt, and every attempt after one that beat 4 KiB/s.
+    Quick,
+    /// The historical 120 s, after an attempt that never beat 4 KiB/s on average: a proxy
+    /// that holds or trickles a body while it scans it is not a dead link, and the quick
+    /// bound would end every attempt it makes before its first real byte.
+    Patient,
+}
+
+impl StallBound {
+    /// The `--speed-time` value.
+    fn secs(self) -> &'static str {
+        match self {
+            Self::Quick => "8",
+            Self::Patient => "120",
+        }
+    }
+
+    /// The bound for the attempt after one that moved `moved` bytes in `took`: quick while
+    /// the attempt beat curl's 4 KiB/s floor on average, stalled minutes included; patient
+    /// once it did not — a body held back by a scanning proxy, a trickle, or a link that
+    /// moved nothing.
+    fn after(moved: u64, took: std::time::Duration) -> Self {
+        if u128::from(moved) * 1000 >= 4096 * took.as_millis() {
+            Self::Quick
+        } else {
+            Self::Patient
+        }
+    }
+}
+
+/// curl's TCP keepalive for a resumable attempt (`--keepalive-time`, seconds idle before the
+/// first probe and between probes). Its default is 60 s, and a reset that reached the host
+/// while curl sat in a read was reported only at the first probe — 60 s after the cut, in
+/// 3 of 24 dropped-transfer replays. A probe is sent only on a connection idle this long,
+/// so a transfer that is moving sends none. Two seconds, not five: through a proxy that cut
+/// with a reset, plain curl learned of the cut late in 6 of 12 tries at 5 (5.7–6.0 s after
+/// it) and in 2 of 12 at 2 (2.6 s); every other try saw it in 0.6 s. Two keeps a dead peer's
+/// keepalive verdict (the first probe plus macOS's eight unanswered ones, 18 s) past the
+/// quick stall report (about 14 s), so a keepalive never ends an attempt the stall bound would
+/// have let run.
+const RESUME_KEEPALIVE_SECS: &str = "2";
+
+/// The option list for one attempt of a FILE download ([`download_to_resumable`],
+/// [`download_to`]), extracted so the flag set is assertable in a unit test. Three of its
+/// flags differ from the list this lane carried before, each because a stalled attempt now
+/// continues from the bytes it wrote and so costs a reconnect, never those bytes:
+///
+/// * no `--retry`. curl truncates its `-o` file to where the attempt began before it retries
+///   (measured, curl 8.7.1: a stall at 1.5 of 2 MB went back for byte 0), so its own retry
+///   threw away everything a stalled attempt had moved — 700 MB at 95 % of a fresh `trust`.
+///   Over HTTP/2 it also retried on the SAME connection: after a silent drop all three
+///   attempts stalled on the one dead tunnel (371 s in a first-launch replay) and left the
+///   `.part` empty. [`download_to_resumable`] makes the next attempt itself, a new curl and a
+///   new connection, from the `.part`.
+/// * `--speed-time` is `stall` ([`StallBound`]) rather than 120 s.
+/// * `--keepalive-time` is [`RESUME_KEEPALIVE_SECS`] rather than curl's 60 s.
+///
+/// `offset == None` adds no range — a fresh transfer carries no `Range` header for a server
+/// to mishandle.
+///
+/// NOTE: no `-w` trailer: the body goes to `-o`, and curl's exit status already reports a
+/// non-2xx under `-f` (see `download_bytes_args`).
 fn download_resume_args<'a>(
     cap: &'a str,
     max_time: &'a str,
     dest: &'a str,
     offset: Option<&'a str>,
+    stall: StallBound,
 ) -> Vec<&'a str> {
-    let mut args: Vec<&str> = download_to_args(cap, max_time, dest).to_vec();
+    let mut args: Vec<&str> = vec![
+        // `-s`: without it curl writes its PROGRESS METER to stderr, which this lane
+        // captures into the failure message, burying the cause. `-S` keeps real
+        // errors, the pairing `download_bytes_args` uses.
+        "-fsSL",
+        // https-only redirects — see `download_bytes_args`.
+        "--proto-redir",
+        "=https",
+        // Bound the CONNECT, not the transfer — a black-holed TCP/TLS setup must
+        // still fail fast.
+        "--connect-timeout",
+        "30",
+        // A stall is under 4 KiB/s for `stall` — this, not the wall clock, is what tells a
+        // dead link from a merely slow one, and it exits 28 just like a `--max-time`
+        // expiry, so the error text and the `pipeline`-class health accounting are
+        // unchanged for genuinely dead links.
+        "--speed-limit",
+        "4096",
+        "--speed-time",
+        stall.secs(),
+        "--keepalive-time",
+        RESUME_KEEPALIVE_SECS,
+        "--max-time",
+        max_time,
+        "--max-filesize",
+        cap,
+        "-H",
+        "Accept: application/octet-stream",
+        "-o",
+        dest,
+        // The `--` guard before the server-controlled asset URL is appended by
+        // `curl_argv` (see `download_bytes_args`); `require_https_url` rejects
+        // non-https schemes.
+    ];
     if let Some(offset) = offset {
         // An EXPLICIT offset, not `-C -`: `-` asks curl to size the local file itself,
         // which is a second source of truth for a number we already hold and have already
@@ -967,7 +1029,7 @@ fn download_resume_args<'a>(
 /// `--proto =https` constrains the INITIAL request too. `require_https_url` checks the
 /// URL's spelling, and this makes curl enforce the same rule on the wire — a second,
 /// independent gate for the one lane whose URL is a vendor's, not GitHub's. The release
-/// lanes are deliberately untouched (byte-for-byte historical argv).
+/// lanes are deliberately untouched (the plain argv).
 const HTTPS_ONLY_ARGS: [&str; 2] = ["--proto", "=https"];
 
 /// [`download_resume_args`] with the initial-request scheme pinned to `https` as well.
@@ -976,10 +1038,89 @@ fn download_resume_args_https_only<'a>(
     max_time: &'a str,
     dest: &'a str,
     offset: Option<&'a str>,
+    stall: StallBound,
 ) -> Vec<&'a str> {
     let mut args: Vec<&str> = HTTPS_ONLY_ARGS.to_vec();
-    args.extend(download_resume_args(cap, max_time, dest, offset));
+    args.extend(download_resume_args(cap, max_time, dest, offset, stall));
     args
+}
+
+/// What a resumable download does after a failed attempt that carried no verdict about the
+/// URL ([`next_attempt`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextAttempt {
+    /// Continue from the `.part` at once: the attempt moved it.
+    Resume,
+    /// The same offset again after curl's own backoff: the attempt moved nothing, and its
+    /// failure is one curl's `--retry` retried.
+    Retry,
+    /// Return the failure.
+    Stop,
+}
+
+/// [`NextAttempt`] for an attempt that ended with curl's `exit` and `stderr`, having moved
+/// the `.part` or not ([`keep_partial`]).
+///
+/// An attempt that MOVED it resumes whatever ended it — a stall, a reset, a closed
+/// connection — except a failure no reconnect changes: the size cap, or this machine
+/// failing to store the bytes ([`download_error_is_local_write`]). One that moved nothing
+/// retries only what curl's own `--retry` retried here before this lane took the retry
+/// over: a timeout (28), a name that did not resolve (5, 6) and a transient status
+/// ([`transient_status`]; 429 is a verdict the caller reads first, as on every lane).
+fn next_attempt(exit: Option<i32>, stderr: &str, moved: bool) -> NextAttempt {
+    if filesize_exceeded(exit, stderr) || download_error_is_local_write(stderr) {
+        NextAttempt::Stop
+    } else if moved {
+        NextAttempt::Resume
+    } else if matches!(exit, Some(5 | 6 | 28))
+        || curl_http_error_code(stderr).is_some_and(|code| transient_status(&code.to_string()))
+    {
+        NextAttempt::Retry
+    } else {
+        NextAttempt::Stop
+    }
+}
+
+/// How many times one download continues its file after an attempt that moved less than
+/// [`RESUME_EARNED_AT`] ([`resume_allowed`]): a host that cuts every attempt after a few
+/// bytes is never asked in a loop.
+const SHORT_RESUMES_PER_CALL: u32 = 16;
+
+/// What an attempt must move for the resume after it to spend none of
+/// [`SHORT_RESUMES_PER_CALL`] ([`resume_allowed`]). A link that keeps moving between its
+/// hiccups — 64 kB/s with a silence past the quick stall bound every minute, a Wi-Fi that
+/// drops every few minutes — keeps continuing, where a flat count of sixteen failed the
+/// install on its seventeenth hiccup (a 745 MB archive at 64 kB/s takes over three hours, and
+/// the stall bound it replaced never tripped on a silence under 120 s). 1 MiB is 16 s at the
+/// 64 kB/s average the derived wall clock assumes ([`download_max_time_secs`]).
+const RESUME_EARNED_AT: u64 = 1 << 20;
+
+/// Whether a download continues its file once more ([`NextAttempt::Resume`]) after an
+/// attempt that moved `moved` bytes, having resumed `short` times after attempts that moved
+/// less than [`RESUME_EARNED_AT`] and `all` times in all, toward a cap of `cap` bytes. A
+/// short attempt spends one of [`SHORT_RESUMES_PER_CALL`]; every resume spends one of
+/// `SHORT_RESUMES_PER_CALL + cap / RESUME_EARNED_AT`, which bounds the call however the bytes
+/// fall.
+fn resume_allowed(moved: u64, short: u32, all: u32, cap: u64) -> bool {
+    let budget = u64::from(SHORT_RESUMES_PER_CALL).saturating_add(cap / RESUME_EARNED_AT);
+    u64::from(all) < budget && (moved >= RESUME_EARNED_AT || short < SHORT_RESUMES_PER_CALL)
+}
+
+/// Empty the file a download's attempts write, so the next attempt begins at byte 0: the
+/// `.part` is removed, and `dest` ([`Sink::Dest`]) — its caller's file, made with the caller's
+/// mode and flags (the Linux updater creates it `0600` with `O_NOFOLLOW`) — is cut to nothing
+/// in place.
+fn clear_sink(file: &Path, sink: Sink) {
+    match sink {
+        Sink::Part => {
+            let _ = std::fs::remove_file(file);
+        }
+        Sink::Dest => {
+            if let Ok(open) = std::fs::OpenOptions::new().write(true).open(file) {
+                let _ = open.set_len(0);
+            }
+        }
+    }
 }
 
 /// Download an asset to `dest`, RESUMABLY: bytes land in a sibling `<dest>.part` that
@@ -1007,8 +1148,26 @@ fn download_resume_args_https_only<'a>(
 /// never do is make a WRONG artifact acceptable.
 ///
 /// The total-bytes cap is preserved by subtracting the offset ([`resume_plan`]); a
-/// failed attempt that made no progress discards its prefix ([`keep_partial`]) so a dead
+/// failed call that made no progress discards its prefix ([`keep_partial`]) so a dead
 /// offset can never wedge the lane.
+///
+/// # A stalled or cut attempt resumes in-call, at once
+///
+/// A connection that dies silently — a Wi-Fi switch, a NAT timeout, a sleeping peer — ends
+/// only at curl's stall bound, and every later ALab download waits behind it. So an
+/// attempt is held to a quick bound unless the one before it never beat 4 KiB/s
+/// ([`StallBound`]; a silent drop is reported about 14 s after the last byte, where the
+/// historical bound took 126 s), probes an idle connection every 2 s, and an attempt that moved the `.part`
+/// continues from it in this call, at once ([`next_attempt`]) — for as long as each attempt
+/// moves at least [`RESUME_EARNED_AT`], [`SHORT_RESUMES_PER_CALL`] times after attempts that
+/// moved less ([`resume_allowed`]). Once the call's elapsed time reaches the derived limit,
+/// no further progressed resume is scheduled. An attempt already started still gets the full
+/// per-attempt `--max-time`; the no-progress retries and the one range-refused fresh retry keep
+/// their separate budgets. The elapsed check is not a deadline for the whole call. A slow link
+/// loses nothing to the quick bound: a stall it trips costs one reconnect. curl's own `--retry` is gone
+/// from this lane ([`download_resume_args`]): it went back to where the attempt began. An
+/// attempt that moved nothing is retried as curl's `--retry` retried it, twice, 1 s and
+/// 2 s apart, under the patient bound.
 ///
 /// # A range-refused resume retries fresh ONCE, in-call
 ///
@@ -1030,8 +1189,14 @@ pub fn download_to_resumable(
     dest: &Path,
     max_filesize: u64,
 ) -> Result<(), String> {
-    download_to_resumable_with(asset_url, dest, max_filesize, ResumeLane::Release)
-        .map_err(|e| e.to_string())
+    download_to_resumable_with(
+        asset_url,
+        dest,
+        max_filesize,
+        ResumeLane::Release,
+        Sink::Part,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// [`download_to_resumable`] for a VENDOR-hosted asset: identical transfer, `.part`
@@ -1044,14 +1209,20 @@ pub fn download_to_resumable_https_only(
     dest: &Path,
     max_filesize: u64,
 ) -> Result<(), String> {
-    download_to_resumable_with(asset_url, dest, max_filesize, ResumeLane::HttpsOnly)
-        .map_err(|e| e.to_string())
+    download_to_resumable_with(
+        asset_url,
+        dest,
+        max_filesize,
+        ResumeLane::HttpsOnly,
+        Sink::Part,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Which request and child a resumable download runs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ResumeLane {
-    /// The release lanes: the historical argv and child.
+    /// The release lanes: the plain argv and child.
     Release,
     /// A signed index row's vendor URL: `--proto =https` added to the argv.
     HttpsOnly,
@@ -1060,10 +1231,21 @@ enum ResumeLane {
     VendorDirect,
 }
 
-/// The shared body of [`download_to_resumable`], [`download_to_resumable_https_only`] and
-/// [`vendor_download_to`]; `lane` selects the argv, the child and the verdicts. Every
-/// error but a vendor-direct verdict is [`HttpError::Transport`], whose text is the
-/// historical message.
+/// Where a file download's bytes land ([`download_to_resumable_with`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sink {
+    /// `<dest>.part`, kept across calls for the next one to continue and renamed onto `dest`
+    /// on success: the resumable lanes.
+    Part,
+    /// `dest` itself, cut to nothing in place as every call begins ([`clear_sink`]) and left
+    /// as it stands after a failure for its caller to remove: [`download_to`].
+    Dest,
+}
+
+/// The shared body of [`download_to_resumable`], [`download_to_resumable_https_only`],
+/// [`vendor_download_to`] and [`download_to`]; `lane` selects the argv, the child and the
+/// verdicts, and `sink` the file. Every error but a vendor-direct verdict is
+/// [`HttpError::Transport`], whose text is the historical message.
 // Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn download_to_resumable_with(
@@ -1071,29 +1253,50 @@ fn download_to_resumable_with(
     dest: &Path,
     max_filesize: u64,
     lane: ResumeLane,
+    sink: Sink,
 ) -> Result<(), HttpError> {
     require_https_url(asset_url).map_err(HttpError::Transport)?;
-    let Some(part) = part_path(dest) else {
-        return Err(HttpError::Transport(
-            "destination has no file name".to_string(),
-        ));
+    // The file the attempts write: the `.part`, or `dest` itself.
+    let part = match sink {
+        Sink::Part => part_path(dest)
+            .ok_or_else(|| HttpError::Transport("destination has no file name".to_string()))?,
+        Sink::Dest => dest.to_path_buf(),
     };
     let part_s = part
         .to_str()
         .ok_or_else(|| HttpError::Transport("non-UTF-8 destination path".to_string()))?;
-    // At most ONE fresh retry per call: the loop runs a second iteration only through
-    // the range-refused arm below, which sets this flag and deletes the `.part` — so
-    // the second iteration is provably a fresh (offset-0) attempt and provably the last.
+    // `dest` is begun afresh by each call: cut it to nothing now, so bytes that stood there
+    // before this call never read as an attempt's progress (an attempt that fails before its
+    // first byte — a 503 under `-f` — leaves the file as it found it).
+    if sink == Sink::Dest {
+        clear_sink(&part, sink);
+    }
+    // TERMINATION: the loop goes around only through three arms, each bounded. The
+    // range-refused arm runs at most ONCE per call (it sets this flag and empties the file,
+    // so the iteration after it is a fresh, offset-0 attempt). The resume arm runs at most
+    // `SHORT_RESUMES_PER_CALL + cap / RESUME_EARNED_AT` times (`resume_allowed`), and the
+    // retry arm at most `CURL_ATTEMPTS - 1` times in a row (its count restarts only after
+    // one of the other two).
     let mut retried_fresh = false;
+    let mut resumes: u32 = 0;
+    let mut short_resumes: u32 = 0;
+    // Attempts in a row that moved nothing, the one just made included.
+    let mut idle: u32 = 0;
+    let mut stall = StallBound::Quick;
+    // What the `.part` held when this call began, or when its fresh retry discarded it:
+    // the anti-wedge rule asks whether the CALL moved it, whichever attempt did.
+    let mut call_began: Option<u64> = None;
+    let started = std::time::Instant::now();
     loop {
         let existing = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
         let plan = resume_plan(existing, max_filesize);
         let existing = if plan.discard {
-            let _ = std::fs::remove_file(&part);
+            clear_sink(&part, sink);
             0
         } else {
             existing
         };
+        let began = *call_began.get_or_insert(existing);
         // Both must outlive the argv, which borrows them as `&str`.
         let cap = plan.remaining_cap.to_string();
         // The wall clock stays derived from the FULL cap, not the remainder: it is a
@@ -1106,10 +1309,11 @@ fn download_to_resumable_with(
         // `None` at offset 0: a fresh transfer must carry no range at all.
         let offset = (plan.offset > 0).then_some(offset_text.as_str());
         let args = if lane == ResumeLane::Release {
-            download_resume_args(&cap, &max_time, part_s, offset)
+            download_resume_args(&cap, &max_time, part_s, offset, stall)
         } else {
-            download_resume_args_https_only(&cap, &max_time, part_s, offset)
+            download_resume_args_https_only(&cap, &max_time, part_s, offset, stall)
         };
+        let attempt_began = std::time::Instant::now();
         let out = if lane == ResumeLane::VendorDirect {
             vendor_fetch(&args, asset_url)
         } else {
@@ -1124,33 +1328,77 @@ fn download_to_resumable_with(
             // carries no range for a server to refuse — so termination holds even if
             // curl exit 33 ever appeared on a rangeless transfer.
             if plan.offset > 0 && !retried_fresh && range_refused(out.status.code(), &stderr) {
-                let _ = std::fs::remove_file(&part);
+                clear_sink(&part, sink);
                 retried_fresh = true;
+                call_began = Some(0);
+                idle = 0;
                 continue;
             }
             let after = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-            // The anti-wedge discard, EXCEPT when the failure was an answer about the
-            // URL (a web-host 403/404): that prefix is still a valid prefix for the
-            // other host serving the same signed object, and the caller tries it next.
-            if !keep_partial_after_failure(asset_url, &stderr, existing, after) {
+            // A verdict about the URL or the document ends the call whatever the attempt
+            // moved: the vendor lane's own first, then the per-host classification
+            // `download_to` makes (a rate limit is named so the check lane can defer
+            // instead of booking a broken pipeline).
+            let verdict = if lane == ResumeLane::VendorDirect {
+                vendor_download_verdict(out.status.code(), &stderr, asset_url, max_filesize)
+            } else {
+                None
+            }
+            .or_else(|| classify_asset_failure(asset_url, &stderr).map(HttpError::Transport));
+            if verdict.is_none() {
+                let moved = keep_partial(existing, after);
+                let moved_bytes = after.saturating_sub(existing);
+                // The next attempt's stall bound, from how this one went.
+                stall = StallBound::after(moved_bytes, attempt_began.elapsed());
+                match next_attempt(out.status.code(), &stderr, moved) {
+                    // A stall or a cut after bytes moved: schedule another resume only while
+                    // the resume budget and elapsed-time check allow. The check does not
+                    // shorten an attempt already started: it gets the full `--max-time`.
+                    NextAttempt::Resume
+                        if resume_allowed(moved_bytes, short_resumes, resumes, max_filesize)
+                            && started.elapsed().as_secs()
+                                < download_max_time_secs(max_filesize) =>
+                    {
+                        resumes += 1;
+                        if moved_bytes < RESUME_EARNED_AT {
+                            short_resumes += 1;
+                        }
+                        idle = 0;
+                        continue;
+                    }
+                    NextAttempt::Retry => {
+                        idle += 1;
+                        // Handshake unknown: the `-o` lanes carry no trailer. A name that
+                        // did not resolve keeps its retries only while the link is not
+                        // already known down.
+                        if attempt_again(out.status.code(), Handshake::Unknown, idle, CURL_ATTEMPTS)
+                        {
+                            // curl's own `--retry` backoff, preserved: 1 s, then 2 s.
+                            std::thread::sleep(std::time::Duration::from_secs(1 << (idle - 1)));
+                            continue;
+                        }
+                    }
+                    NextAttempt::Resume | NextAttempt::Stop => {}
+                }
+            }
+            // The anti-wedge discard over the whole CALL, EXCEPT when the failure was an
+            // answer about the URL (a web-host 403/404): that prefix is still a valid
+            // prefix for the other host serving the same signed object, and the caller
+            // tries it next. `dest` is its caller's to remove.
+            if sink == Sink::Part && !keep_partial_after_failure(asset_url, &stderr, began, after) {
                 let _ = std::fs::remove_file(&part);
             }
-            if lane == ResumeLane::VendorDirect
-                && let Some(verdict) =
-                    vendor_download_verdict(out.status.code(), &stderr, asset_url, max_filesize)
-            {
+            if let Some(verdict) = verdict {
                 return Err(verdict);
-            }
-            // Same per-host classification as `download_to`: a rate limit is named so
-            // the check lane can defer instead of booking a broken pipeline.
-            if let Some(verdict) = classify_asset_failure(asset_url, &stderr) {
-                return Err(HttpError::Transport(verdict));
             }
             return Err(HttpError::Transport(format!(
                 "curl download failed ({}): {}",
                 out.status,
                 stderr.trim()
             )));
+        }
+        if sink == Sink::Dest {
+            return Ok(());
         }
         // ONLY a curl success promotes the part. `dest` therefore never holds a prefix,
         // and every existing caller's "the file at `dest` is the whole asset" assumption
@@ -1797,7 +2045,7 @@ pub fn vendor_download_to(url: &str, dest: &Path, cap: u64) -> Result<(), HttpEr
             "refusing a zero byte cap for {url}"
         )));
     }
-    download_to_resumable_with(url, dest, cap, ResumeLane::VendorDirect)
+    download_to_resumable_with(url, dest, cap, ResumeLane::VendorDirect, Sink::Part)
 }
 
 #[cfg(test)]
@@ -1880,11 +2128,11 @@ mod tests {
 
     use super::{Handshake, Link, link_after};
     use super::{
-        HttpError, LANE_BOUNDS, RELEASE_ASSET_DOWNLOAD_BOUND, curl_argv, download_bytes_args,
-        download_max_time_secs, download_resume_args, download_resume_args_https_only,
-        download_to_args, download_to_resumable, download_to_resumable_https_only, head_args,
-        keep_partial, keep_partial_after_failure, location_header, part_path, range_refused,
-        resume_plan, transient_status, vendor_get_args,
+        HttpError, LANE_BOUNDS, NextAttempt, RELEASE_ASSET_DOWNLOAD_BOUND, StallBound, curl_argv,
+        download_bytes_args, download_max_time_secs, download_resume_args,
+        download_resume_args_https_only, download_to_resumable, download_to_resumable_https_only,
+        head_args, keep_partial, keep_partial_after_failure, location_header, next_attempt,
+        part_path, range_refused, resume_allowed, resume_plan, transient_status, vendor_get_args,
     };
     use aterm_uds::spawnfd::Command;
 
@@ -1959,7 +2207,13 @@ mod tests {
     fn the_asset_download_bounds_the_stall_not_the_transfer() {
         let cap = RELEASE_ASSET_DOWNLOAD_BOUND.to_string();
         let max_time = download_max_time_secs(RELEASE_ASSET_DOWNLOAD_BOUND).to_string();
-        let args = download_to_args(&cap, &max_time, "/tmp/aterm.dmg.part");
+        let args = download_resume_args(
+            &cap,
+            &max_time,
+            "/tmp/aterm.dmg.part",
+            None,
+            StallBound::Quick,
+        );
         let value_of = |flag: &str| {
             let i = args
                 .iter()
@@ -1974,7 +2228,7 @@ mod tests {
         );
         assert_eq!(value_of("--connect-timeout"), "30");
         assert_eq!(value_of("--speed-limit"), "4096");
-        assert_eq!(value_of("--speed-time"), "120");
+        assert_eq!(value_of("--speed-time"), StallBound::Quick.secs());
         // The size cap and the sink are untouched by the timing change.
         assert_eq!(value_of("--max-filesize"), cap);
         assert_eq!(value_of("-o"), "/tmp/aterm.dmg.part");
@@ -1983,14 +2237,14 @@ mod tests {
         assert!(!args.contains(&"--"), "no caller-side `--`: {args:?}");
     }
 
-    /// Only the FILE-sink lane may use curl's own `--retry`. On a pipe curl cannot
-    /// truncate what a failed attempt already wrote, so a retried capture returns the
-    /// failed attempt's bytes CONCATENATED in front of the good ones under a single
-    /// `-w` status trailer — a blip curl had recovered from, read as a malformed
-    /// answer. Those lanes retry the subprocess instead; `download_to` writes to `-o`,
-    /// which curl DOES truncate.
+    /// NO lane lets curl retry. On a pipe curl cannot truncate what a failed attempt already
+    /// wrote, so a retried capture returns the failed attempt's bytes CONCATENATED in front
+    /// of the good ones under a single `-w` status trailer — a blip curl had recovered from,
+    /// read as a malformed answer. On a file it truncates back to where the attempt began, so
+    /// a retried stall throws its bytes away (and over HTTP/2 retries on the same dead
+    /// connection). Every lane retries the subprocess instead.
     #[test]
-    fn only_the_file_sink_lane_uses_curls_own_retry() {
+    fn no_lane_lets_curl_retry() {
         assert!(
             !head_args().contains(&"--retry"),
             "a stdout-captured HEAD must not let curl retry: {:?}",
@@ -2002,10 +2256,13 @@ mod tests {
             "the buffer the Ed25519 check reads must hold ONE attempt's bytes: {:?}",
             download_bytes_args(cap)
         );
-        assert!(
-            download_to_args(cap, "600", "/tmp/x").contains(&"--retry"),
-            "the -o lane keeps curl's retry — a file sink is truncated between attempts"
-        );
+        for stall in [StallBound::Quick, StallBound::Patient] {
+            let file = download_resume_args(cap, "600", "/tmp/x", None, stall);
+            assert!(
+                !file.contains(&"--retry"),
+                "a file lane continues its bytes itself: {file:?}"
+            );
+        }
     }
 
     /// The in-process retry decision: the transient server-side set curl itself
@@ -2131,8 +2388,14 @@ mod tests {
         let lanes: [Vec<&str>; 4] = [
             head_args().to_vec(),
             download_bytes_args(cap).to_vec(),
-            download_to_args(cap, "600", "/tmp/x").to_vec(),
-            download_resume_args_https_only(cap, "600", "/tmp/x.part", Some("4")),
+            download_resume_args(cap, "600", "/tmp/x", None, StallBound::Quick),
+            download_resume_args_https_only(
+                cap,
+                "600",
+                "/tmp/x.part",
+                Some("4"),
+                StallBound::Quick,
+            ),
         ];
         for lane in &lanes {
             assert!(
@@ -2848,17 +3111,14 @@ mod tests {
         }
     }
 
-    /// A FRESH transfer must be the byte-for-byte historical request — no `--continue-at`,
-    /// no `Range` for a server to mishandle — and a resumed one adds exactly the offset.
+    /// A FRESH transfer carries no `--continue-at` — no `Range` for a server to mishandle —
+    /// and a resumed one adds exactly the offset.
     #[test]
     fn only_a_resumed_attempt_carries_a_range() {
-        let fresh = download_resume_args("100", "600", "/s/a.tar.zst.part", None);
-        assert_eq!(
-            fresh,
-            download_to_args("100", "600", "/s/a.tar.zst.part").to_vec(),
-            "a fresh attempt must spawn the historical option list, unchanged"
-        );
-        let resumed = download_resume_args("60", "600", "/s/a.tar.zst.part", Some("40"));
+        let quick = StallBound::Quick;
+        let fresh = download_resume_args("100", "600", "/s/a.tar.zst.part", None, quick);
+        assert!(!fresh.contains(&"--continue-at"), "{fresh:?}");
+        let resumed = download_resume_args("60", "600", "/s/a.tar.zst.part", Some("40"), quick);
         assert_eq!(resumed.len(), fresh.len() + 2);
         assert_eq!(resumed[fresh.len()], "--continue-at");
         assert_eq!(
@@ -2873,8 +3133,9 @@ mod tests {
         for flag in [
             "--speed-limit",
             "--speed-time",
+            "--keepalive-time",
             "--connect-timeout",
-            "--retry",
+            "--max-time",
         ] {
             assert!(resumed.contains(&flag), "{flag} must survive: {resumed:?}");
         }
@@ -2884,13 +3145,549 @@ mod tests {
         );
     }
 
+    /// THE FILE LANES' FLAG SET (the resumable lanes and the app container's). A silent drop
+    /// ends at curl's stall bound and keepalive, and every later ALab download waits behind
+    /// it: an attempt is held to 4 KiB/s for 8 s (patient 120 s only after one that never beat
+    /// 4 KiB/s), probes an idle connection every 2 s, and never lets curl retry — curl's
+    /// retry truncates the file back to where the attempt began.
+    #[test]
+    fn a_resumable_attempt_is_held_to_a_quick_stall_and_never_lets_curl_retry() {
+        let value_of = |args: &[&str], flag: &str| -> String {
+            let i = args
+                .iter()
+                .position(|a| *a == flag)
+                .unwrap_or_else(|| panic!("{flag} present in {args:?}"));
+            args[i + 1].to_string()
+        };
+        for stall in [StallBound::Quick, StallBound::Patient] {
+            for args in [
+                download_resume_args("100", "600", "/s/a.part", Some("40"), stall),
+                download_resume_args_https_only("100", "600", "/s/a.part", None, stall),
+            ] {
+                assert!(!args.contains(&"--retry"), "{args:?}");
+                assert_eq!(value_of(&args, "--speed-limit"), "4096");
+                assert_eq!(value_of(&args, "--keepalive-time"), "2");
+                assert_eq!(value_of(&args, "--connect-timeout"), "30");
+                assert_eq!(value_of(&args, "--max-time"), "600");
+                assert_eq!(value_of(&args, "--max-filesize"), "100");
+                assert_eq!(value_of(&args, "--proto-redir"), "=https");
+                assert_eq!(
+                    value_of(&args, "--speed-time"),
+                    if stall == StallBound::Quick {
+                        "8"
+                    } else {
+                        "120"
+                    }
+                );
+            }
+        }
+    }
+
+    /// The quick bound is earned by a transfer that beat 4 KiB/s, stalled time included; one
+    /// that never did — a body a scanning proxy holds back, a trickle, nothing at all — gets
+    /// the historical 120 s next.
+    #[test]
+    fn only_an_attempt_that_beat_the_speed_floor_keeps_the_quick_stall_bound() {
+        let secs = std::time::Duration::from_secs;
+        // A silent drop: 30 MB in a second, then 14 s of nothing.
+        assert_eq!(StallBound::after(30_000_000, secs(15)), StallBound::Quick);
+        // 64 kB/s for a minute, then a 13 s silence that tripped the bound.
+        assert_eq!(StallBound::after(3_840_000, secs(73)), StallBound::Quick);
+        assert_eq!(StallBound::after(4096 * 15, secs(15)), StallBound::Quick);
+        // A held body, a trickle, a link that moved nothing.
+        assert_eq!(StallBound::after(0, secs(14)), StallBound::Patient);
+        assert_eq!(
+            StallBound::after(4096 * 15 - 1, secs(15)),
+            StallBound::Patient
+        );
+        assert_eq!(StallBound::after(1024 * 14, secs(14)), StallBound::Patient);
+    }
+
+    /// WHAT A FAILED ATTEMPT LEADS TO. One that moved the `.part` resumes from it at once,
+    /// whatever ended it, but for the cap and a full disk; one that moved nothing retries only
+    /// the failures curl's own `--retry` retried (a timeout, an unresolved name, a transient
+    /// status), and everything else is returned.
+    #[test]
+    fn a_failed_attempt_resumes_if_it_moved_and_retries_only_curls_set_if_not() {
+        use NextAttempt::{Resume, Retry, Stop};
+        let stall = "curl: (28) Operation too slow. Less than 4096 bytes/sec transferred";
+        let reset = "curl: (56) Recv failure: Connection reset by peer";
+        let closed = "curl: (18) transfer closed with 123 bytes remaining to read";
+        for (exit, stderr) in [(28, stall), (56, reset), (18, closed)] {
+            assert_eq!(next_attempt(Some(exit), stderr, true), Resume, "{stderr}");
+        }
+        // NEGATIVE CONTROL: the same failures that moved nothing are not resumes.
+        assert_eq!(next_attempt(Some(28), stall, false), Retry);
+        assert_eq!(next_attempt(Some(56), reset, false), Stop);
+        assert_eq!(next_attempt(Some(18), closed, false), Stop);
+        // No reconnect changes the cap or a full disk, moved or not.
+        let full = "curl: (23) Failure writing output to destination";
+        let over = "curl: (63) Maximum file size exceeded";
+        for moved in [true, false] {
+            assert_eq!(next_attempt(Some(23), full, moved), Stop);
+            assert_eq!(next_attempt(Some(63), over, moved), Stop);
+        }
+        // Moved nothing: curl's retry set, and only it.
+        assert_eq!(
+            next_attempt(Some(6), "curl: (6) Could not resolve host", false),
+            Retry
+        );
+        assert_eq!(
+            next_attempt(Some(5), "curl: (5) Could not resolve proxy", false),
+            Retry
+        );
+        assert_eq!(next_attempt(Some(22), &curl_err(503), false), Retry);
+        assert_eq!(next_attempt(Some(22), &curl_err(408), false), Retry);
+        assert_eq!(
+            next_attempt(Some(7), "curl: (7) Failed to connect", false),
+            Stop
+        );
+        assert_eq!(next_attempt(Some(22), &curl_err(416), false), Stop);
+        assert_eq!(
+            next_attempt(Some(35), "curl: (35) SSL connect error", false),
+            Stop
+        );
+    }
+
+    /// THE RESUME BUDGET'S BOUNDS. Sixteen resumes after attempts that moved under 1 MiB, not
+    /// seventeen; an attempt that moved 1 MiB or more resumes past them; and every resume
+    /// counts toward `16 + cap / 1 MiB`, so the call ends however the bytes fall.
+    #[test]
+    fn a_resume_is_free_of_the_short_budget_only_after_an_attempt_that_moved_a_mebibyte() {
+        let mib: u64 = 1 << 20;
+        let cap: u64 = 745_000_000;
+        assert!(resume_allowed(1000, 15, 15, cap));
+        assert!(!resume_allowed(1000, 16, 16, cap));
+        assert!(resume_allowed(mib, 16, 300, cap));
+        assert!(!resume_allowed(mib - 1, 16, 300, cap));
+        let all = 16 + u32::try_from(cap / mib).unwrap();
+        assert!(resume_allowed(mib, 0, all - 1, cap));
+        assert!(!resume_allowed(mib, 0, all, cap));
+        // A payload under 1 MiB keeps the sixteen, and no more.
+        assert!(resume_allowed(mib, 15, 15, 4096));
+        assert!(!resume_allowed(mib, 16, 16, 4096));
+    }
+
+    /// The directory [`probe_a_transfer_over_real_curl`] downloads into, set only for the
+    /// children [`start_transfer`] starts.
+    #[cfg(unix)]
+    const RESUME_PROBE_ENV: &str = "ATERM_TEST_RESUME_PROBE_DIR";
+    /// Which file lane that probe downloads with: `part` ([`download_to_resumable`]) or
+    /// `dest` ([`super::download_to`]).
+    #[cfg(unix)]
+    const RESUME_PROBE_LANE: &str = "ATERM_TEST_RESUME_PROBE_LANE";
+    /// The size of the payload that probe downloads, which is also its cap.
+    #[cfg(unix)]
+    const RESUME_PROBE_SIZE: &str = "ATERM_TEST_RESUME_PROBE_SIZE";
+    /// That probe's name, as `--exact` wants it.
+    #[cfg(unix)]
+    const RESUME_PROBE: &str = "http::tests::probe_a_transfer_over_real_curl";
+
+    /// The probe's payload of `size` bytes, the same for the server and the check.
+    #[cfg(unix)]
+    fn payload(size: usize) -> Vec<u8> {
+        (0..size).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    /// The child's half: one download over a PRODUCTION file lane — its argv, its retries,
+    /// its file — whose curl is the real one behind the parent's wrapper
+    /// ([`super::CURL_SEAM`]), pointed at the parent's server. Nothing without the parent's
+    /// directory.
+    #[cfg(unix)]
+    #[test]
+    fn probe_a_transfer_over_real_curl() {
+        let Some(dir) = std::env::var_os(RESUME_PROBE_ENV) else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let size: u64 = std::env::var(RESUME_PROBE_SIZE).unwrap().parse().unwrap();
+        let url = "https://github.com/alabsystems/aterm/releases/download/atpkg-a-1/a-1.bin";
+        let dest = dir.join("a-1.bin");
+        let got = if std::env::var_os(RESUME_PROBE_LANE).is_some_and(|lane| lane == "dest") {
+            super::download_to(url, &dest, size)
+        } else {
+            download_to_resumable(url, &dest, size)
+        };
+        let said = match got {
+            Ok(()) => "ok".to_string(),
+            Err(e) => format!("err {e}"),
+        };
+        // Publish a complete result before waiting for the owning parent to stop
+        // this stand-in. It must not exit/reap before the parent kills its group.
+        let pending = dir.join("said.pending");
+        std::fs::write(&pending, said).unwrap();
+        std::fs::rename(pending, dir.join("said")).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    /// What the test server answers one request with ([`start_transfer`]).
+    #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// `503`, no body.
+        Busy,
+        /// The payload from the requested offset (`200` from byte 0, `206` past it),
+        /// announcing all of the rest but sending at most `send` bytes of it; then, when
+        /// `hold`, nothing at all — open, no byte, no FIN, no reset — until the client
+        /// closes, else a close.
+        Body { send: usize, hold: bool },
+    }
+
+    /// The transfer's one server thread. Shutdown closes its current connection before
+    /// joining, including while a request or a deliberately held body is being read.
+    #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+    struct TransferServer {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        current: std::sync::Arc<std::sync::Mutex<Option<std::net::TcpStream>>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+    impl Drop for TransferServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            let current = self
+                .current
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(conn) = current.as_ref() {
+                let _ = conn.shutdown(std::net::Shutdown::Both);
+            }
+            drop(current);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// One transfer in flight: a server answering its `n`th request with `script(n)`, and a
+    /// child running the probe on `lane` against it.
+    #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+    struct Transfer {
+        lane: &'static str,
+        child: Option<aterm_uds::spawnfd::Child>,
+        ranges: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        _server: TransferServer,
+        dir: aterm_tempfile::TempDir,
+    }
+
+    #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+    impl Transfer {
+        /// End the owned group before the one reap. No numeric signal follows a
+        /// reap. This handle has never waited: its unreaped pid reserves the group
+        /// identity even if the probe failed before publishing its completion.
+        fn reap_probe(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            if self.child.is_none() {
+                return Ok(None);
+            }
+            let Some(mut child) = self.child.take() else {
+                return Ok(None);
+            };
+            let pid = i32::try_from(child.id()).map_err(std::io::Error::other)?;
+            if pid <= 1 {
+                return Err(std::io::Error::other("the probe must lead its own group"));
+            }
+            // SAFETY: process_group(0) made this exclusively held, still-unreaped
+            // child its group leader; no wait above released its pid for reuse.
+            let killed = unsafe { libc::kill(-pid, libc::SIGKILL) };
+            let group_error = (killed != 0).then(std::io::Error::last_os_error);
+            let _ = child.kill();
+            let status = child.wait()?;
+            if let Some(error) = group_error
+                && error.raw_os_error() != Some(libc::ESRCH)
+            {
+                return Err(error);
+            }
+            Ok(Some(status))
+        }
+    }
+
+    #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+    impl Drop for Transfer {
+        fn drop(&mut self) {
+            let _ = self.reap_probe();
+            // Fields then stop/join the server before the private directory drops.
+        }
+    }
+
+    /// Start a [`Transfer`] of a `size`-byte payload on `lane`, with `stale` already standing
+    /// at the destination when given.
+    #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+    fn start_transfer(
+        lane: &'static str,
+        size: usize,
+        stale: Option<&[u8]>,
+        script: fn(usize) -> Answer,
+    ) -> Transfer {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::fs::PermissionsExt as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ranges = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = std::sync::Arc::clone(&ranges);
+        listener.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let current = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let stopping = std::sync::Arc::clone(&stop);
+        let serving = std::sync::Arc::clone(&current);
+        let thread = std::thread::spawn(move || {
+            let mut n = 0;
+            while !stopping.load(std::sync::atomic::Ordering::Acquire) {
+                let mut conn = match listener.accept() {
+                    Ok((conn, _)) => conn,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return,
+                };
+                conn.set_nonblocking(false).unwrap();
+                {
+                    let mut serving = serving.lock().unwrap();
+                    *serving = Some(conn.try_clone().unwrap());
+                    if stopping.load(std::sync::atomic::Ordering::Acquire) {
+                        let _ = conn.shutdown(std::net::Shutdown::Both);
+                        break;
+                    }
+                }
+                let seen = std::sync::Arc::clone(&seen);
+                (move || {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match conn.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(k) => head.extend_from_slice(&buf[..k]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                    let range = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("range: ").map(str::to_string))
+                        .unwrap_or_else(|| "none".to_string());
+                    seen.lock().unwrap().push(range.clone());
+                    let Answer::Body { send, hold } = script(n) else {
+                        let _ = conn.write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
+                              Connection: close\r\n\r\n",
+                        );
+                        return;
+                    };
+                    let body = payload(size);
+                    let from = range
+                        .strip_prefix("bytes=")
+                        .and_then(|r| r.trim_end_matches('-').parse::<usize>().ok())
+                        .unwrap_or(0)
+                        .min(size);
+                    let reply = if from == 0 {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n"
+                        )
+                    } else {
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\
+                             Content-Range: bytes {from}-{}/{size}\r\nConnection: close\r\n\r\n",
+                            size - from,
+                            size - 1
+                        )
+                    };
+                    let _ = conn.write_all(reply.as_bytes());
+                    let _ = conn.write_all(&body[from..size.min(from.saturating_add(send))]);
+                    if hold {
+                        while matches!(conn.read(&mut buf), Ok(k) if k > 0) {}
+                    }
+                })();
+                serving.lock().unwrap().take();
+                n += 1;
+            }
+        });
+        let server = TransferServer {
+            stop,
+            current,
+            thread: Some(thread),
+        };
+        let dir = aterm_tempfile::tempdir().unwrap();
+        if let Some(stale) = stale {
+            std::fs::write(dir.path().join("a-1.bin"), stale).unwrap();
+        }
+        let wrapper = dir.path().join("curl");
+        // The real curl, every option as the lane wrote it, the URL swapped for the server's.
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nunset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY\n\
+                 n=$#; i=0\nfor a do\n  i=$((i+1))\n  [ $i -eq 1 ] && set --\n  \
+                 if [ $i -eq $n ]; then set -- \"$@\" http://127.0.0.1:{port}/a-1.bin; \
+                 else set -- \"$@\" \"$a\"; fi\ndone\nexec /usr/bin/curl \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap())
+            .args(["--exact", "--nocapture", RESUME_PROBE])
+            .process_group(0)
+            .env(RESUME_PROBE_ENV, dir.path())
+            .env(RESUME_PROBE_LANE, lane)
+            .env(RESUME_PROBE_SIZE, size.to_string())
+            .env(super::CURL_SEAM, &wrapper)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .unwrap();
+        Transfer {
+            lane,
+            child: Some(child),
+            ranges,
+            _server: server,
+            dir,
+        }
+    }
+
+    /// Wait for `run`'s probe to finish — a one-minute hang detector, never a latency budget
+    /// — and return what its download said: `ok`, or `err` and the error.
+    #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+    fn finished(run: &mut Transfer) -> String {
+        const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + HANG_DETECTOR;
+        let said = loop {
+            match std::fs::read_to_string(run.dir.path().join("said")) {
+                Ok(said) => break said,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("{}: reading the probe's completion: {error}", run.lane),
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "{}: the transfer never finished; requests: {:?}",
+                    run.lane,
+                    run.ranges.lock().unwrap()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        use std::os::unix::process::ExitStatusExt as _;
+        let status = run.reap_probe().unwrap().expect("the probe is still owned");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "{}: {status}",
+            run.lane
+        );
+        said
+    }
+
+    /// A SILENT DROP, OVER REAL CURL, on both file lanes at once: the resumable `.part` lane
+    /// (`atpkg`'s archives) and the app container's (`download_to`). The server's first
+    /// connection moves 1 MiB of 4 and then goes silent — open, no byte, no FIN, no reset: a
+    /// Wi-Fi switch, a NAT timeout, a sleeping peer. Each lane must notice within its quick
+    /// stall bound and continue its file in the same call, so its server sees exactly two
+    /// requests, the second for `bytes=1048576-`, and the file is whole. On the lanes before
+    /// this, curl waited 120 s for the stall and then retried from byte 0: the hang detector
+    /// fires, and a second request carries no range.
+    #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+    #[test]
+    fn a_silently_held_transfer_continues_within_the_call() {
+        const SIZE: usize = 4 << 20;
+        const HELD_AT: usize = 1 << 20;
+        let script = |n| Answer::Body {
+            send: if n == 0 { HELD_AT } else { usize::MAX },
+            hold: n == 0,
+        };
+        let mut runs = [
+            start_transfer("part", SIZE, None, script),
+            start_transfer("dest", SIZE, None, script),
+        ];
+        for run in &mut runs {
+            let lane = run.lane;
+            assert_eq!(finished(run), "ok", "{lane}");
+            assert_eq!(
+                *run.ranges.lock().unwrap(),
+                ["none".to_string(), format!("bytes={HELD_AT}-")],
+                "{lane}: one fresh request, then one continuing the file"
+            );
+            let dir = run.dir.path();
+            assert!(
+                std::fs::read(dir.join("a-1.bin")).unwrap() == payload(SIZE),
+                "{lane}: the continued file is the whole payload, byte for byte"
+            );
+            assert!(!dir.join("a-1.bin.part").exists(), "{lane}");
+        }
+    }
+
+    /// THE RESUME BUDGET, OVER REAL CURL. A link that keeps moving — every connection cut
+    /// after a little more than 1 MiB, twenty cuts in a 20 MiB payload — is continued to the
+    /// end in one call: a flat budget of sixteen failed it on the seventeenth cut, a slow
+    /// link's install lost to hiccups the 120 s bound before never even noticed. NEGATIVE
+    /// CONTROL, the same budget's other half: a host that cuts every connection after 1000
+    /// bytes is asked exactly seventeen times (one request and sixteen resumes) and the call
+    /// fails, keeping the `.part` it moved.
+    #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+    #[test]
+    fn a_link_that_keeps_moving_is_continued_and_one_that_cuts_short_is_not_asked_in_a_loop() {
+        const MOVING: usize = 20 << 20;
+        const STEP: usize = (1 << 20) + 1024;
+        const SHORT: usize = 4 << 20;
+        let mut moving = start_transfer("part", MOVING, None, |_| Answer::Body {
+            send: STEP,
+            hold: false,
+        });
+        let mut short = start_transfer("part", SHORT, None, |_| Answer::Body {
+            send: 1000,
+            hold: false,
+        });
+        assert_eq!(finished(&mut moving), "ok");
+        let asked = moving.ranges.lock().unwrap().clone();
+        assert_eq!(asked.len(), MOVING.div_ceil(STEP), "{asked:?}");
+        assert_eq!(asked[19], format!("bytes={}-", 19 * STEP));
+        assert!(std::fs::read(moving.dir.path().join("a-1.bin")).unwrap() == payload(MOVING));
+
+        let said = finished(&mut short);
+        assert!(said.starts_with("err curl download failed"), "{said}");
+        let asked = short.ranges.lock().unwrap().clone();
+        assert_eq!(asked.len(), 17, "{asked:?}");
+        assert_eq!(
+            std::fs::read(short.dir.path().join("a-1.bin.part")).unwrap(),
+            payload(17 * 1000)
+        );
+    }
+
+    /// A FILE ALREADY AT `download_to`'s DESTINATION IS NOT THIS CALL'S PROGRESS. Its first
+    /// attempt is answered 503 — under `-f` curl writes nothing, so the 2 MiB that stood at
+    /// `dest` before the call are still there — and the lane must retry from byte 0 as for
+    /// any transient status, never read those bytes as an attempt that moved and continue
+    /// them at `bytes=2097152-`: that file would be 2 MiB of something else in front of the
+    /// payload's tail.
+    #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+    #[test]
+    fn bytes_already_at_the_destination_are_never_continued() {
+        const SIZE: usize = 4 << 20;
+        let stale = vec![0xEE_u8; 2 << 20];
+        let mut run = start_transfer("dest", SIZE, Some(&stale), |n| {
+            if n == 0 {
+                Answer::Busy
+            } else {
+                Answer::Body {
+                    send: usize::MAX,
+                    hold: false,
+                }
+            }
+        });
+        assert_eq!(finished(&mut run), "ok");
+        assert_eq!(*run.ranges.lock().unwrap(), ["none", "none"]);
+        assert!(std::fs::read(run.dir.path().join("a-1.bin")).unwrap() == payload(SIZE));
+    }
+
     /// The VENDOR lane pins the scheme on BOTH hops: `--proto =https` for the initial
     /// request and `--proto-redir =https` for every redirect — and is otherwise the
-    /// historical resumable argv, byte for byte (the release lanes keep theirs unchanged).
+    /// plain resumable argv, byte for byte (the release lanes keep theirs unchanged).
     #[test]
     fn the_vendor_lane_pins_https_on_the_first_hop_and_every_redirect() {
-        let plain = download_resume_args("100", "600", "/s/claude.part", None);
-        let pinned = download_resume_args_https_only("100", "600", "/s/claude.part", None);
+        let quick = StallBound::Quick;
+        let plain = download_resume_args("100", "600", "/s/claude.part", None, quick);
+        let pinned = download_resume_args_https_only("100", "600", "/s/claude.part", None, quick);
         assert_eq!(&pinned[..2], ["--proto", "=https"]);
         assert_eq!(
             &pinned[2..],
@@ -2905,7 +3702,8 @@ mod tests {
         // The release lane is untouched: no `--proto` on its own.
         assert!(!plain.contains(&"--proto"), "{plain:?}");
         // Resume flags ride behind the pin exactly as before.
-        let resumed = download_resume_args_https_only("60", "600", "/s/claude.part", Some("40"));
+        let resumed =
+            download_resume_args_https_only("60", "600", "/s/claude.part", Some("40"), quick);
         assert_eq!(resumed.len(), pinned.len() + 2);
         assert_eq!(&resumed[resumed.len() - 2..], ["--continue-at", "40"]);
         // And the scheme gate still refuses a non-https URL before spawning anything.

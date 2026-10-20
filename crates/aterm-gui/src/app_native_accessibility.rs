@@ -409,7 +409,10 @@ impl App {
             RoutedAccessibilityAction::Activate { action, value, .. } => {
                 AppEvent::Action(ActionInvocation { id: action, value })
             }
-            RoutedAccessibilityAction::Scroll { lines, .. } => AppEvent::ScrollLines(lines),
+            // Aimed at its node, so a reader scrolling Settings' sidebar
+            // scrolls the sidebar (every other view lowers it to its list's).
+            RoutedAccessibilityAction::Scroll { key, lines } => AppEvent::ScrollAt { lines, key },
+            RoutedAccessibilityAction::ScrollIntoView { key } => AppEvent::RevealControl(key),
             RoutedAccessibilityAction::ReplaceSelectedText { text, .. } => {
                 AppEvent::InsertText(text)
             }
@@ -872,6 +875,10 @@ mod tests {
             .common_mut()
             .last_focus = None;
         let request = ActionRequest {
+            context: Some(aterm_a11y::model::ActionContext::new(
+                view.get(),
+                generation,
+            )),
             action: Action::Focus,
             target_tree: TreeId::ROOT,
             target_node: node,
@@ -886,6 +893,34 @@ mod tests {
                 .common()
                 .last_focus,
             Some(key.clone())
+        );
+
+        // A queued event retains its original owner context even when a fresh
+        // publication at the same semantic key is current on receipt.
+        app.native_runtime
+            .view_state_mut(view)
+            .unwrap()
+            .common_mut()
+            .last_focus = None;
+        let winit_id = aterm_window::window::WindowId::from(17u64);
+        app.winit_to_window.insert(winit_id, wid);
+        let mut delayed = request.clone();
+        delayed.context = Some(aterm_a11y::model::ActionContext::new(
+            view.get(),
+            generation.saturating_sub(1),
+        ));
+        app.on_accessibility_event(crate::a11y_adapter::Event {
+            window_id: winit_id,
+            window_event: crate::a11y_adapter::WindowEvent::ActionRequested(delayed),
+        });
+        assert!(
+            app.native_runtime
+                .view_state(view)
+                .unwrap()
+                .common()
+                .last_focus
+                .is_none(),
+            "Wake delivery must not restamp an old action with the current lifecycle"
         );
 
         let (_, routes) = project_native_accessibility(&compiled, None)
@@ -966,6 +1001,10 @@ mod tests {
         app.on_native_accessibility_action(
             wid,
             ActionRequest {
+                context: Some(aterm_a11y::model::ActionContext::new(
+                    view.get(),
+                    generation,
+                )),
                 action: Action::Click,
                 target_tree: TreeId::ROOT,
                 target_node: node,
@@ -1134,6 +1173,10 @@ mod tests {
             app.on_native_accessibility_action(
                 wid,
                 ActionRequest {
+                    context: Some(aterm_a11y::model::ActionContext::new(
+                        first.get(),
+                        app.native_runtime.view_generation(first).unwrap(),
+                    )),
                     action: Action::Focus,
                     target_tree: TreeId::ROOT,
                     target_node: target,
@@ -1308,7 +1351,7 @@ mod tests {
 
     #[test]
     fn retained_native_pointer_and_accessibility_survive_a_signed_surface_crop() {
-        use winit::dpi::PhysicalSize;
+        use aterm_window::dpi::PhysicalSize;
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -1504,6 +1547,10 @@ mod tests {
         app.on_native_accessibility_action(
             wid,
             ActionRequest {
+                context: Some(aterm_a11y::model::ActionContext::new(
+                    first.get(),
+                    first_generation,
+                )),
                 action: Action::Focus,
                 target_tree: TreeId::ROOT,
                 target_node: first_node,
@@ -1542,6 +1589,10 @@ mod tests {
         app.on_native_accessibility_action(
             wid,
             ActionRequest {
+                context: Some(aterm_a11y::model::ActionContext::new(
+                    first.get(),
+                    first_generation,
+                )),
                 action: Action::Focus,
                 target_tree: TreeId::ROOT,
                 target_node: first_node,
@@ -1665,6 +1716,10 @@ mod tests {
         stale_app.on_native_accessibility_action(
             wid,
             ActionRequest {
+                context: Some(aterm_a11y::model::ActionContext::new(
+                    stale_second.get(),
+                    stale_second_owner.generation,
+                )),
                 action: Action::Focus,
                 target_tree: TreeId::ROOT,
                 target_node: stale_node,

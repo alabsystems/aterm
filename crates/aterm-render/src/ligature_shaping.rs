@@ -525,10 +525,19 @@ fn map_shaped_run(
 /// the whole run-coalescing + shaping path for non-ligature fonts — byte-identical
 /// output, no per-frame shaping cost.
 ///
-/// `false` when there is no `GSUB` table or the bytes don't parse as a face.
+/// `false` when there is no `GSUB` table or face `index` of the bytes doesn't
+/// parse.
 #[must_use]
-pub fn font_has_ligature_features(rb_bytes: &[u8]) -> bool {
-    gsub_has(rb_bytes, |t| t == *b"liga" || t == *b"calt")
+pub fn font_has_ligature_features(rb_bytes: &[u8], index: u32) -> bool {
+    aterm_font::Face::parse(rb_bytes, index).is_ok_and(|face| face_has_ligature_features(&face))
+}
+
+/// [`font_has_ligature_features`] of an already-parsed face: the one answer
+/// the renderer's shaping gate and the font picker's "has ligatures" fact
+/// share.
+#[must_use]
+pub fn face_has_ligature_features(face: &aterm_font::Face<'_>) -> bool {
+    face_gsub_has(face, |t| t == *b"liga" || t == *b"calt")
 }
 
 /// Whether the primary face's `GSUB` table advertises `tag` (e.g. `zero`, `ss01`,
@@ -538,19 +547,18 @@ pub fn font_has_ligature_features(rb_bytes: &[u8]) -> bool {
 /// per-cell. Used for the GUI's "font_features had no effect on this font" diagnostic
 /// so a configured-but-unsupported feature is a warning, not a silent no-op.
 #[must_use]
-pub fn font_advertises_feature(rb_bytes: &[u8], tag: [u8; 4]) -> bool {
-    gsub_has(rb_bytes, |t| t == tag)
+pub fn font_advertises_feature(rb_bytes: &[u8], index: u32, tag: [u8; 4]) -> bool {
+    aterm_font::Face::parse(rb_bytes, index).is_ok_and(|face| face_gsub_has(&face, |t| t == tag))
 }
 
-/// Whether face 0's `GSUB` feature list holds a tag `hit` accepts. LINEAR: FeatureList
+/// Whether the face's `GSUB` feature list holds a tag `hit` accepts. LINEAR: FeatureList
 /// records are stored in arbitrary, not tag-sorted, order, so a binary `find` could
 /// miss a present tag. Read through aterm-font, whose `GSUB` lists are the ones
 /// the shaper shapes with (the TF.1 reader corpus pins them, and its
 /// `ligature_gate` answer pins this gate).
-fn gsub_has(rb_bytes: &[u8], hit: impl Fn([u8; 4]) -> bool) -> bool {
-    aterm_font::Face::parse(rb_bytes, 0)
-        .ok()
-        .and_then(|face| face.tables().gsub)
+fn face_gsub_has(face: &aterm_font::Face<'_>, hit: impl Fn([u8; 4]) -> bool) -> bool {
+    face.tables()
+        .gsub
         .is_some_and(|gsub| gsub.features.into_iter().any(|f| hit(f.tag.to_bytes())))
 }
 

@@ -1,0 +1,63 @@
+(version 1)
+(allow default)
+;; NETWORK: loopback TCP, and unix sockets in the lab's own socket dir only (not another agent's private instance,
+;; not ssh-agent or docker.sock, not mDNSResponder: no name resolution). Nothing else leaves the machine.
+(deny network*)
+(allow network-bind network-inbound (local ip "localhost:*"))
+(allow network-outbound (remote ip "localhost:*"))
+(allow network-bind network-inbound (local unix-socket))
+(allow network-outbound (remote unix-socket (subpath "@SOCKDIR@")))
+;; THE DIRECTORIES THE LAB MAKES IN /tmp: every lab's socket dir (/tmp/at.*, shared with other agents' private instances) and
+;; the probes' scratch (/tmp/labprobe.*) are read and written by aterm-lab from OUTSIDE the jail, so no jail writes one but its
+;; own socket dir (a link one lab's jail planted in another lab's would lead that lab's aterm-lab where the link points)
+(deny file-write* (regex #"^/private/tmp/(at|labprobe)\.[^/]+(/|$)"))
+(allow file-write* (subpath "@SOCKDIR@"))
+@TMP_REPLICA@
+;; THE CONTROL SOCKET: the lab's unjailed client dereferences whatever stands at these two paths, so a jailed process may
+;; neither remove nor move them nor their directory (a link planted in their place made the client drive another lab's tab
+;; and send the aterm token to a jailed listener); the door also refuses a link
+(deny file-write-unlink (literal "@SOCKDIR@/a.sock") (literal "@SOCKDIR@/a.sock.token") (literal "@SOCKDIR@"))
+;; THE TERMINAL: no keystroke may be put into a terminal's input queue (TIOCSTI). The tree is also started in a session of
+;; its own with no controlling terminal; this closes the ioctl for every other terminal it can open
+(deny file-ioctl (ioctl-command TIOCSTI))
+;; SIGNALS: only the lab's own processes
+(deny signal)
+(allow signal (target self) (target same-sandbox) (target children))
+;; THE JAIL'S MARK: a Mach name nobody serves, random per lab, denied here and named by no other profile. The kernel answers
+;; whether it is denied to a process for any process of the user, and no process leaves its sandbox, so aterm-lab finds every
+;; process in this jail by it (the egress witness, egress, lsof, ps, down), an orphan or a daemon among them
+(deny mach-lookup (global-name "@MARK@"))
+;; THE XCRUN SHIMS' CACHE: /usr/bin/python3, cc, git and the other xcrun shims run the binary their per-user cache names,
+;; unchecked. aterm-lab turns it off for what it runs (xcrun_nocache), the owner's own shells do not: no jailed process may
+;; write it or put a file in its place, nor move the temp dir that holds it (its parent is the user's, but sits in a
+;; root-owned /var/folders/<xx>, so that parent cannot be moved either)
+(deny file-write* (literal "@UT@/xcrun_db"))
+(deny file-write-unlink (literal "@UT@"))
+;; A sandboxed process cannot exec a setuid binary (forbidden-exec-sugid), and aterm reads process facts through
+;; /bin/ps (setuid root): without this rule the harness is blind ("upgrade step=wait:no-process") and behaves
+;; differently from the real thing. ps runs OUTSIDE the sandbox, as it would anywhere (aterm-lab's docs: what that leaves open).
+(allow process-exec (literal "/bin/ps") (with no-sandbox))
+;; KEYCHAIN: the daemons behind /usr/bin/security and Security.framework, and the CLI itself (bare-name calls land on the
+;; lab's tripwire stand-in instead)
+@MACH_DENY@
+(deny process-exec (literal "/usr/bin/security"))
+;; THE DESKTOP: nothing may open a URL or an app there (a sign-in's browser): Launch Services' open doors, and /usr/bin/open
+;; (a bare-name open call lands on the lab's recorder instead)
+@MACH_DENY_OPEN@
+(deny process-exec (literal "/usr/bin/open"))
+;; THE OWNER'S DATA, neither read nor written: one rule for each entry of the protected list
+@PROTECTED@
+@AGENT_STORE@
+;; WRITES: nowhere in the owner's home, nor in what aterm-lab trusts from outside the jail (its state dir, whose runs/*/env.sh
+;; it reads, its program and source, the aterm it runs and the checkout's target/debug and target/release another lab's up may
+;; run), nor in the lab's run directory, but its scratch
+(deny file-write* (subpath "@HOME@"))
+(deny file-write* @TRUSTED@)
+;; ... and no parent of those may be moved (a directory put in a parent's place would hand aterm-lab another state dir)
+(deny file-write-unlink @TRUSTED_PARENTS@)
+(deny file-write* (subpath "@RUN@"))
+(allow file-write* (subpath "@RUN@/scratch"))
+;; ... and the scratch's own directories, the scratch and the project dir stay where they are: aterm-lab writes and reads
+;; through them from OUTSIDE the jail, so none may be removed or moved (a link planted in its place would lead aterm-lab into
+;; the owner's data)
+(deny file-write-unlink @SCRATCH_DIRS@)

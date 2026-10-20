@@ -142,14 +142,33 @@ pub(crate) fn stalled_for(tl: &crate::session_timeline::SessionTimeline, pgrp: i
 /// WHY THE ACT CANNOT BE MADE in `ctx`'s session for the leader `pgrp`
 /// started at `start` (`None`: it can): the host keeps no snapshot naming
 /// that very process (`not-the-hosts-agent`), its relaunch would not bring
-/// it back (`not-relaunchable`), or the host's hand is not the one on the
-/// session ([`crate::input_stall::host_hand_refusal`]: `not-supervised`,
-/// `halted`, `driver-lease`, `driver-turn`).
+/// it back (`not-relaunchable`: an aterm tab's own program among them, whose
+/// snapshot names no shell, `relaunch::NO_SHELL`), or the host's hand is not
+/// the one on the session ([`crate::input_stall::host_hand_refusal`]:
+/// `not-supervised`, `halted`, `driver-lease`, `driver-turn`).
 pub(crate) fn unavailable(
     ctx: &SessionCtx,
     pgrp: i32,
     start: &str,
     now_us: u64,
+) -> Option<&'static str> {
+    unavailable_for(
+        ctx,
+        pgrp,
+        start,
+        now_us,
+        aterm_primer::home_dir().as_deref(),
+    )
+}
+
+/// [`unavailable`] for the tab's shell's home `home`, which a test names so the
+/// relaunch's predicate never reads the person's own (its hook files).
+fn unavailable_for(
+    ctx: &SessionCtx,
+    pgrp: i32,
+    start: &str,
+    now_us: u64,
+    home: Option<&std::path::Path>,
 ) -> Option<&'static str> {
     let snap = crate::harness_host::published_snapshot(ctx.self_id.as_str())
         .filter(|snap| i32::try_from(snap.pid).ok() == Some(pgrp) && snap.start == start);
@@ -167,8 +186,8 @@ pub(crate) fn unavailable(
         Some(copy) => copy.resume.is_ok(),
         None => {
             lane_relaunches(&snap)
-                && aterm_primer::home_dir().is_some_and(|home| {
-                    aterm_agent::harness::relaunch::carries_restart(&home, &snap)
+                && home.is_some_and(|home| {
+                    aterm_agent::harness::relaunch::carries_restart(home, &snap)
                 })
         }
     };
@@ -179,19 +198,26 @@ pub(crate) fn unavailable(
 }
 
 /// Whether `snap`'s agent comes back with no copy of its own record: by its
-/// lane's relaunch — Claude Code's. A Codex never does (the Codex screen
+/// lane's relaunch — Claude Code's and agy's. A Codex never does (the Codex screen
 /// lane's retirement, 2026-10-16): aterm supervises no Codex, and codex-alab
 /// comes back only on the line aterm's copy of its record validated, so with
 /// no such copy the act would end what nothing brings back
 /// (`not-relaunchable`). Nor a Muse Code: its lane relaunches a crash, but
 /// what the act's SIGTERM does to one in the middle of a turn is unmeasured
-/// (`relaunch::carries_restart`). An exhaustive `match` (the agent-gate
+/// (`relaunch::carries_restart`). An agy does, by its lane: the act's SIGTERM
+/// is one of agy's graceful ways out, measured mid-turn too, and its relaunch
+/// resumes the conversation (`relaunch::carries_restart` asks the rest). Nor
+/// a Gemini CLI: the act signals the tab's foreground job, its parent node,
+/// which ignores SIGTERM (measured), so the act would end it only by the
+/// SIGKILL that orphans its child. An exhaustive `match` (the agent-gate
 /// guard).
 fn lane_relaunches(snap: &aterm_agent::harness::relaunch::Snapshot) -> bool {
     match &snap.run {
-        aterm_agent::harness::relaunch::AgentRun::Claude => true,
+        aterm_agent::harness::relaunch::AgentRun::Claude
+        | aterm_agent::harness::relaunch::AgentRun::Agy(_) => true,
         aterm_agent::harness::relaunch::AgentRun::Codex(_)
-        | aterm_agent::harness::relaunch::AgentRun::Muse(_) => false,
+        | aterm_agent::harness::relaunch::AgentRun::Muse(_)
+        | aterm_agent::harness::relaunch::AgentRun::Gemini(_) => false,
     }
 }
 
@@ -224,6 +250,25 @@ pub(crate) struct Offer {
 /// Takes only leaf locks for the published snapshot, self-claim copy, timeline,
 /// meta, fabric and lease, each released before the next. The caller holds none.
 pub(crate) fn offered(ctx: &SessionCtx, leader: Option<i32>, now_us: u64) -> Option<Offer> {
+    offered_unless(ctx, leader, now_us, None)
+}
+
+/// Whether the act WOULD be offered but for a hold: every fence of
+/// [`offered`] holds except the host's hand, which a hold alone refuses
+/// (`halted`, [`crate::input_stall::host_hand_refusal`]). A frozen tab's
+/// words then tell the person that Hand Back lets aterm restart it
+/// (`needs::stall_remedy`).
+pub(crate) fn offered_but_for_hold(ctx: &SessionCtx, leader: Option<i32>, now_us: u64) -> bool {
+    offered_unless(ctx, leader, now_us, Some("halted")).is_some()
+}
+
+/// [`offered`], the host hand's refusal `waived` not counted.
+fn offered_unless(
+    ctx: &SessionCtx,
+    leader: Option<i32>,
+    now_us: u64,
+    waived: Option<&str>,
+) -> Option<Offer> {
     let snap = crate::harness_host::published_snapshot(ctx.self_id.as_str())?;
     let pid = i32::try_from(snap.pid).ok()?;
     let agent = snap.agent().program();
@@ -250,7 +295,7 @@ pub(crate) fn offered(ctx: &SessionCtx, leader: Option<i32>, now_us: u64) -> Opt
     if leader.is_some_and(|leader| leader != pid)
         || !relaunchable
         || !in_front()
-        || crate::input_stall::host_hand_refusal(ctx, now_us).is_some()
+        || crate::input_stall::host_hand_refusal(ctx, now_us).is_some_and(|why| Some(why) != waived)
     {
         return None;
     }
@@ -1311,6 +1356,7 @@ mod tests {
             expires_us,
             conn: None,
             hard: true,
+            here: false,
             holder_pid: None,
         };
         let driver = fresh(0).self_id.clone();
@@ -1426,6 +1472,7 @@ mod tests {
                 dialect: Some(aterm_agent::harness::upgrade::Dialect::Zsh),
                 login: None,
                 stored_login: false,
+                profile: None,
                 home: None,
                 claude_dir,
             };
@@ -1464,6 +1511,150 @@ mod tests {
         );
     }
 
+    /// AN AGY IS OFFERED THE ACT WHERE ITS RELAUNCH BRINGS ITS CONVERSATION
+    /// BACK (its SIGTERM is one of agy's graceful ways out, measured mid-turn
+    /// too): a witnessed conversation and a launch its line carries, under
+    /// the host's claim — the relaunch's own predicate, at a fish shell too
+    /// (whose relaunch from the launch's directory types no `cd`, so one no
+    /// `cd` could name is carried). NEGATIVE CONTROLS: an agy whose witness
+    /// proved no conversation, one launched with `--remote-control` (its line
+    /// refuses), one under a `HOME` no line can hold (its relaunch refuses the
+    /// line), one at zsh in a directory no `cd` can name, and a Muse Code with
+    /// the same witness (its mid-turn SIGTERM is unmeasured) are
+    /// `not-relaunchable`.
+    /// (A store build with no managed twin, which its relaunch refuses too,
+    /// is the lane's own test's: this machine's store may hold a twin.)
+    #[test]
+    fn an_agy_is_offered_the_act_where_its_relaunch_resumes_it() {
+        use aterm_agent::harness::relaunch::{AgentRun, AgyRun, MuseRun};
+        let now = crate::metrics::now_us();
+        // The tab's home: a scratch one, so the relaunch reads no hook of the
+        // person's.
+        let tab_home = aterm_tempfile::tempdir().expect("a scratch home");
+        let conversation = "eaeec4fb-4e43-47da-b46f-8a10c0fee186";
+        let refusal =
+            |n: u64,
+             session: Option<&str>,
+             extra: &[&str],
+             muse: bool,
+             home: &str,
+             (dialect, cwd): (aterm_agent::harness::upgrade::Dialect, &str)| {
+                let ctx = crate::session_store::test_handle_on(7800 + n, -1).ctx;
+                assert_eq!(
+                    crate::session_timeline::claim_supervisor(
+                        &ctx,
+                        &crate::harness_host::holder(),
+                        None,
+                        None,
+                        now
+                    ),
+                    Ok(true),
+                    "the host's claim"
+                );
+                let mut argv = vec!["/opt/agy".to_string()];
+                argv.extend(extra.iter().map(|w| (*w).to_string()));
+                let run = if muse {
+                    AgentRun::Muse(MuseRun {
+                        data: "/h/.local/share".into(),
+                        env: Vec::new(),
+                        workspace: None,
+                        lock: None,
+                        started_ms: 0,
+                        block: None,
+                    })
+                } else {
+                    AgentRun::Agy(AgyRun {
+                        config: "/h/.gemini/antigravity-cli".into(),
+                        env: if home.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![("HOME".to_string(), home.to_string())]
+                        },
+                        lock: None,
+                        crash: None,
+                        started_ms: 0,
+                        block: None,
+                    })
+                };
+                let snap = aterm_agent::harness::relaunch::Snapshot {
+                    tab: ctx.self_id.as_str().to_string(),
+                    pid: 0x3fff_ff21,
+                    start: "t".to_string(),
+                    shell: 1,
+                    program: std::path::PathBuf::from("/opt/agy"),
+                    argv,
+                    session: session.map(str::to_string),
+                    cwd: cwd.to_string(),
+                    version: None,
+                    run,
+                    dialect: Some(dialect),
+                    login: None,
+                    stored_login: false,
+                    profile: None,
+                    home: None,
+                    claude_dir: None,
+                };
+                crate::harness_host::publish_snapshot_for_test(ctx.self_id.as_str(), Some(&snap));
+                let why = unavailable_for(&ctx, 0x3fff_ff21, "t", now, Some(tab_home.path()));
+                crate::harness_host::publish_snapshot_for_test(ctx.self_id.as_str(), None);
+                why
+            };
+        use aterm_agent::harness::upgrade::Dialect;
+        let zsh = (Dialect::Zsh, "/");
+        assert_eq!(
+            refusal(1, Some(conversation), &["--effort=high"], false, "", zsh),
+            None,
+            "a witnessed agy whose line carries its launch"
+        );
+        assert_eq!(
+            refusal(2, None, &[], false, "", zsh),
+            Some("not-relaunchable"),
+            "no conversation proven"
+        );
+        assert_eq!(
+            refusal(3, Some(conversation), &["--remote-control"], false, "", zsh),
+            Some("not-relaunchable"),
+            "its line refuses the launch"
+        );
+        assert_eq!(
+            refusal(4, Some(conversation), &[], true, "", zsh),
+            Some("not-relaunchable"),
+            "a Muse Code: never yet"
+        );
+        assert_eq!(
+            refusal(5, Some(conversation), &[], false, "/h/a\nb", zsh),
+            Some("not-relaunchable"),
+            "a HOME its relaunch line cannot hold"
+        );
+        assert_eq!(
+            refusal(6, Some(conversation), &[], false, "/h", zsh),
+            None,
+            "CONTROL: another HOME its line carries"
+        );
+        assert_eq!(
+            refusal(
+                7,
+                Some(conversation),
+                &[],
+                false,
+                "/h",
+                (Dialect::Fish, "/")
+            ),
+            None,
+            "a fish shell"
+        );
+        for (n, dialect, want) in [
+            (8, Dialect::Fish, None),
+            (9, Dialect::Zsh, Some("not-relaunchable")),
+        ] {
+            assert_eq!(
+                refusal(n, Some(conversation), &[], false, "", (dialect, "/w/a\nb")),
+                want,
+                "{dialect:?}: a directory no `cd` names"
+            );
+        }
+    }
+
     /// A CODEX IS RESTARTED ONLY ON A LINE ITS COPY VALIDATED (the Codex
     /// screen lane's retirement, 2026-10-16): aterm supervises no Codex, so
     /// with no copy of codex-alab's own record naming that very process the
@@ -1500,6 +1691,7 @@ mod tests {
                 dialect: Some(aterm_agent::harness::upgrade::Dialect::Zsh),
                 login: None,
                 stored_login: false,
+                profile: None,
                 home: None,
                 claude_dir: None,
             };

@@ -424,6 +424,26 @@ impl Host {
         self.label = "after relayout".into();
     }
 
+    fn backspace(&mut self) {
+        let t = self.last_key + Duration::from_millis(KEY_MS);
+        self.advance_to(t);
+        self.now = t;
+        self.last_key = t;
+        self.label = "backspace".into();
+        self.glow.note_backspace_erasing(t, Some(1));
+        self.text.pop();
+        let bytes = self.screen();
+        self.term.process(&bytes);
+    }
+
+    fn keyless_relay(&mut self) {
+        self.agents += 1;
+        self.row -= 1;
+        let bytes = self.screen();
+        self.term.process(&bytes);
+        self.label = "keyless relayout".into();
+    }
+
     /// The first census frame labelled `label`.
     fn first_frame_labelled(&self, label: &str) -> usize {
         self.census
@@ -629,4 +649,83 @@ fn the_band_laid_before_the_relayout_stays_lit_under_the_hand() {
             h.dump(h.census.len() - 1)
         );
     }
+}
+
+/// Regression for the `Screenshot 2026-10-19 at 12.17.46 PM.png` gap (`gaps and `):
+/// typing a prefix, pausing past `SWOOSH_TOTAL_S` so its cells expire, typing a
+/// typo key that revives the prefix via `recent_typed_run`, erasing the typo
+/// with Backspace, suffering a keyless 1-row composer relayout, and typing the
+/// suffix (`"and "`) must keep the revived prefix and new suffix in one solid
+/// cohort without a hole or an expired prefix cell.
+#[test]
+fn revived_prefix_survives_backspace_and_keyless_relayout_without_holes_or_drift() {
+    for post_relay_idle_ms in [34, 600] {
+        let mut h = Host::new();
+        h.type_str(" gaps ");
+        // Pause past `SWOOSH_TOTAL_S` (920 ms) while still inside `RECENT_TYPED_RUN_TTL` (3.2 s).
+        h.idle(1_300);
+        h.last_key = h.now;
+        // Typo key revives `" gaps "` via `recent_typed_run` in the same frame as `Event::Typed`.
+        h.type_str("n");
+        h.backspace();
+        h.idle(34);
+        // Keyless 1-row composer relayout while `key_in_flight` is false (`pc == cc`).
+        h.keyless_relay();
+        h.idle(post_relay_idle_ms);
+        h.last_key = h.now;
+        h.type_str("and ");
+        h.idle(17);
+        let last = h.census.last().expect("frames ran");
+        let total_chars = h.text.chars().count();
+        let lit_all = last.lit.as_bytes()[COL0..COL0 + total_chars]
+            .iter()
+            .filter(|&&b| b == b'#')
+            .count();
+        assert_eq!(
+            lit_all,
+            total_chars,
+            "idle={post_relay_idle_ms}ms: revived prefix or suffix went dark after backspace + keyless relayout\n{}",
+            h.dump(h.census.len() - 1)
+        );
+        assert!(
+            last.holes.is_empty(),
+            "idle={post_relay_idle_ms}ms: band after backspace + keyless relayout carries a hole\n{}",
+            h.dump(h.census.len() - 1)
+        );
+    }
+}
+
+#[test]
+fn no_fresh_hint_flood_preserves_licensed_admissions_in_ring() {
+    use aterm_effects::cursor_glow::AdmissionPhase;
+
+    let mut h = Host::new();
+    h.type_str("hello");
+    h.idle(600);
+    let licensed_before: Vec<u64> = h
+        .glow
+        .admission_log()
+        .filter(|r| r.phase == AdmissionPhase::Licensed)
+        .map(|r| r.seq)
+        .collect();
+    assert_eq!(licensed_before.len(), 5);
+
+    // Simulate 40 keyless background cursor bounces (`no-fresh-hint`) after the
+    // typing license window has expired.
+    for step in 0..40u16 {
+        let bounce_row = if step % 2 == 0 { 1 } else { h.row as u16 };
+        h.term.process(format!("\x1b[{bounce_row};3H").as_bytes());
+        h.idle(20);
+    }
+
+    let licensed_after: Vec<u64> = h
+        .glow
+        .admission_log()
+        .filter(|r| r.phase == AdmissionPhase::Licensed)
+        .map(|r| r.seq)
+        .collect();
+    assert_eq!(
+        licensed_after, licensed_before,
+        "uncontested no-fresh-hint bounces must not evict Licensed records from the ring"
+    );
 }

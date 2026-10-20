@@ -1,0 +1,11 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# isSidechain rows are summarized as a subagent step.
+bind 0
+see busy
+tx prompt v1
+tx tool c1 tool=Task cls=agent subagent
+expect open p1 subagent par=t1 cls=agent tool=Task vref=c1
+tx result c1
+expect close p1 subagent out=ok
+tx end
+expect close t1 turn out=done steps=1

@@ -52,24 +52,36 @@ impl Grid {
 
     /// Extract only the ring's scrollback rows as logical [`Line`]s (oldest
     /// first), removing them from the ring; their history extras ride inside
-    /// the [`Line`]s and `ring_extras` is cleared. The offloaded width change
-    /// uses this to hand the ring history to the detached job.
+    /// the [`Line`]s and `ring_extras` is cleared.
     // COST: O(ring-scrollback-rows): bounded by the ring capacity (a
     // construction-time constant), not by session history.
     pub(super) fn take_ring_scrollback_lines(&mut self) -> Vec<Line> {
+        self.take_older_ring_scrollback_lines(0)
+    }
+
+    /// Extract the ring's scrollback rows but the `keep` newest as logical
+    /// [`Line`]s (oldest first), removing them from the ring with their
+    /// `ring_extras` (their history extras ride inside the [`Line`]s). The
+    /// offloaded width change uses this to hand the ring history to the
+    /// detached job, keeping the newest lines it holds back
+    /// ([`Self::ring_rows_to_hold_back`]).
+    // COST: O(ring-scrollback-rows): bounded by the ring capacity (a
+    // construction-time constant), not by session history.
+    pub(super) fn take_older_ring_scrollback_lines(&mut self, keep: usize) -> Vec<Line> {
         let ring_scrollback = self.storage.ring_buffer_scrollback();
-        if ring_scrollback == 0 {
+        let take = ring_scrollback.saturating_sub(keep);
+        if take == 0 {
             return Vec::new();
         }
         // Linearize so logical order == Vec order.
         self.storage.linearize_ring();
-        let mut lines = Vec::with_capacity(ring_scrollback);
+        let mut lines = Vec::with_capacity(take);
         // Borrow the stored extras rather than clone them (`ring_extras` and
         // `rows` are disjoint fields); one empty default covers the `None` rows.
         // Declared after `linearize_ring` so the shared borrows never overlap
         // its `&mut`.
         let no_extras = super::ScrolledRowExtras::default();
-        for i in 0..ring_scrollback {
+        for i in 0..take {
             let extras = self.storage.ring_history_extras(i).unwrap_or(&no_extras);
             let row = &self.storage.rows[i];
             // The successor is the next ring row or the first visible row.
@@ -78,11 +90,41 @@ impl Grid {
                 row, extras, len,
             ));
         }
-        // Drop the scrollback rows; keep only the visible window.
-        self.storage.recycle_rows(0..ring_scrollback);
-        self.storage.ring_extras.clear();
-        self.storage.total_lines = self.storage.rows.len();
+        // Drop the taken rows; keep the newest `keep` and the visible window.
+        self.storage.recycle_rows(0..take);
+        if take == ring_scrollback {
+            self.storage.ring_extras.clear();
+        } else {
+            for _ in 0..take {
+                self.storage.ring_extras.pop_front();
+            }
+        }
+        self.storage.total_lines -= take;
         lines
+    }
+
+    /// How many of the ring's newest scrollback rows an offloaded width change
+    /// holds back in the grid instead of handing them to the job: the newest
+    /// whole logical lines (each opens on a row that continues nothing) whose
+    /// rows fit `cells` cells at the ring's width. The resize and every step
+    /// inside the detach window rewrap them with the screen, so the deficit
+    /// fill and a reveal draw on them as the synchronous resize draws on the
+    /// same newest history. 0 when the newest line alone does not fit.
+    // COST: O(held rows): the scan stops at the cell budget.
+    pub(super) fn ring_rows_to_hold_back(&self, cells: usize) -> usize {
+        let ring = self.storage.ring_buffer_scrollback();
+        let cols = usize::from(self.storage.cols).max(1);
+        let max_rows = (cells / cols).min(ring);
+        let mut held = 0;
+        for back in 1..=max_rows {
+            let Some(row) = self.storage.ring_history_row(ring - back) else {
+                break;
+            };
+            if !row.is_wrapped() {
+                held = back;
+            }
+        }
+        held
     }
 
     /// Push rewrapped scrollback [`Line`]s back into history as its oldest part,
@@ -169,16 +211,40 @@ impl Grid {
         if kept.is_empty() {
             return;
         }
+        let added = self.seat_lines_at_ring_front(kept, new_cols);
+        // Lines put back in front of the ring scroll nothing into history, so
+        // what a rows-only resize owes stands (`grid::resize_handback`).
+        self.renumber_rows(
+            self.storage
+                .absolute_row_counter
+                .saturating_add(added as u64),
+        );
+        // A width rewrap changes how many rows the same history occupies, so
+        // every absolute row number shifts: bump `history_renumber_epoch` so
+        // absolute-row-keyed caches (search index, viewport row cache) rebuild.
+        // A spurious rebuild is harmless; a missed one is silently wrong.
+        self.storage.history_renumber_epoch = self.storage.history_renumber_epoch.saturating_add(1);
+        // A bulk re-entry into the ring (and, detached, the staged rows).
+        self.enforce_history_link_budget();
+    }
 
+    /// Seat `lines` (oldest first) at the front of the ring, as its oldest
+    /// history rows at width `cols`, with their extras at the front of
+    /// `ring_extras`; returns how many. The counter is the caller's: a seat that
+    /// adds retained rows raises it, one that moves rows between tiers does not.
+    pub(super) fn seat_lines_at_ring_front(&mut self, lines: &[Line], cols: u16) -> usize {
+        if lines.is_empty() {
+            return 0;
+        }
         // Linearize so we can splice scrollback rows at the front (index 0).
         self.storage.linearize_ring();
 
         // Build the scrollback rows at the new width, capturing extras keyed by
         // their ring-scrollback index for ring_extras (front = oldest).
-        let mut new_rows = Vec::with_capacity(kept.len());
-        let mut new_extras = Vec::with_capacity(kept.len());
-        for line in kept {
-            let (row, extras) = self.build_scrollback_row(line, new_cols);
+        let mut new_rows = Vec::with_capacity(lines.len());
+        let mut new_extras = Vec::with_capacity(lines.len());
+        for line in lines {
+            let (row, extras) = self.build_scrollback_row(line, cols);
             new_rows.push(row);
             new_extras.push(if extras.is_empty() {
                 None
@@ -196,17 +262,7 @@ impl Grid {
             self.storage.ring_extras.insert(i, extra);
         }
         self.storage.total_lines = self.storage.rows.len();
-        self.storage.absolute_row_counter = self
-            .storage
-            .absolute_row_counter
-            .saturating_add(added as u64);
-        // A width rewrap changes how many rows the same history occupies, so
-        // every absolute row number shifts: bump `history_renumber_epoch` so
-        // absolute-row-keyed caches (search index, viewport row cache) rebuild.
-        // A spurious rebuild is harmless; a missed one is silently wrong.
-        self.storage.history_renumber_epoch = self.storage.history_renumber_epoch.saturating_add(1);
-        // A bulk re-entry into the ring (and, detached, the staged rows).
-        self.enforce_history_link_budget();
+        added
     }
 
     /// Build a single scrollback [`Row`](crate::Row) plus its preserved extras
@@ -300,6 +356,70 @@ pub(super) fn reflow_scrollback_lines(lines: &[Line], new_cols: u16) -> Vec<Line
         emit_logical_line(run, new_cols, &mut units, &mut out);
     }
     out
+}
+
+/// The rows [`reflow_scrollback_lines`]`(lines, new_cols)` makes, and the
+/// output `(row, col)` that the cell `cells` cells into `lines[line]` lands
+/// on (a cell past that line's content: where the next cell of its logical
+/// line lands, else just past its last cell).
+// COST: O(cells of `lines`), as the rewrap.
+#[must_use]
+pub(super) fn rewrap_cell_row(
+    lines: &[Line],
+    new_cols: u16,
+    line: usize,
+    cells: usize,
+) -> (usize, Option<(usize, u16)>) {
+    let cols = usize::from(new_cols.max(1));
+    let mut point = None;
+    let mut rows = 0usize;
+    let mut units: Vec<Unit<'_>> = Vec::new();
+    let mut firsts: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        // One logical line, collected as `emit_logical_line` collects it.
+        let start = i;
+        i += 1;
+        while i < lines.len() && lines[i].is_wrapped() {
+            i += 1;
+        }
+        units.clear();
+        firsts.clear();
+        for line in &lines[start..i] {
+            firsts.push(units.len());
+            if units.len() < MAX_LOGICAL_WIDTH {
+                collect_units(line, &mut units);
+            }
+        }
+        // Its wrap points, as `emit_logical_line` chooses them: a wide char
+        // that would straddle the right edge goes to the next row.
+        let mut placed = Vec::with_capacity(units.len());
+        let (mut col, mut row) = (0usize, 0usize);
+        for unit in &units {
+            let w = usize::from(unit.width);
+            if col + w > cols && col > 0 {
+                row += 1;
+                col = 0;
+            }
+            placed.push((row, col));
+            col += w;
+        }
+        if (start..i).contains(&line) {
+            // The unit holding the cell, counted from the line's first.
+            let first = firsts[line - start];
+            let end = firsts.get(line - start + 1).copied().unwrap_or(units.len());
+            let mut at = first;
+            let mut width = 0usize;
+            while at < end && width + usize::from(units[at].width) <= cells {
+                width += usize::from(units[at].width);
+                at += 1;
+            }
+            let (row, col) = placed.get(at).copied().unwrap_or((row, col));
+            point = Some((rows + row, u16::try_from(col).unwrap_or(u16::MAX)));
+        }
+        rows += row + 1;
+    }
+    (rows, point)
 }
 
 /// The newest `rows` rows of [`reflow_scrollback_lines`]`(lines, new_cols)`,
@@ -480,14 +600,10 @@ fn collect_units<'a>(line: &'a Line, units: &mut Vec<Unit<'a>>) {
     let Some(text) = line.as_str() else {
         return;
     };
-    let mut byte_idx = 0usize;
-    let mut char_idx = 0usize;
     let mut col: u16 = 0;
-    // `unit_char_start` and `col` are monotone, so advancing cursors read the
-    // RLE attrs and the sorted, disjoint link and underline-colour spans in
-    // O(runs + spans) total, not per cell: this walk covers all retained
-    // history on every width change.
-    let mut attr_cursor = line.attr_cursor();
+    // `col` is monotone, so advancing cursors read the sorted, disjoint link
+    // and underline-colour spans in O(spans) total, not per cell: this walk
+    // covers all retained history on every width change.
     let spans = line.hyperlinks().unwrap_or(&[]);
     debug_assert!(
         spans.windows(2).all(|w| w[0].start_col <= w[1].start_col),
@@ -502,27 +618,15 @@ fn collect_units<'a>(line: &'a Line, units: &mut Vec<Unit<'a>>) {
         "underline-colour spans must be sorted by start_col for the cursor scan"
     );
     let mut ul_idx = 0usize;
-    while byte_idx < text.len() {
-        let c = super::scroll_materialize::char_at(text, byte_idx);
-        if super::scroll_materialize::is_zero_width(c) {
-            // Orphan zero-width char with no base; skip (matches materialize).
-            byte_idx += c.len_utf8();
-            char_idx += 1;
-            continue;
-        }
-        let unit_byte_start = byte_idx;
-        let unit_char_start = char_idx;
+    for stored in super::scroll_materialize::StoredUnits::new(line, text) {
+        let attrs = stored.attrs;
         // Effective width, replaying the live VS15 transitions and taking a
         // VS16 widening from the stored bit (`stored_unit_is_wide`), so
         // reflowed rows keep the live columns (`❤️` two, `⌚︎` one) and `col`
         // stays the column the line's link and underline-colour spans name. An
         // edge-pinned VS16 unit stays narrow, as the screen's own rewrap keeps
         // it; re-widening it would shift every later unit's span lookup.
-        let unit = super::scroll_materialize::advance_grapheme_unit_wide(text, &mut byte_idx);
-        let chars_consumed = unit.chars;
-        char_idx += chars_consumed;
-        let attrs = attr_cursor.attr_at(unit_char_start);
-        let width = if super::scroll_materialize::stored_unit_is_wide(unit, attrs) {
+        let width = if super::scroll_materialize::stored_unit_is_wide(stored.unit, attrs) {
             2
         } else {
             1
@@ -544,7 +648,7 @@ fn collect_units<'a>(line: &'a Line, units: &mut Vec<Unit<'a>>) {
             .filter(|s| s.contains(col))
             .map(|s| s.color);
         units.push(Unit {
-            text: &text[unit_byte_start..byte_idx],
+            text: stored.text,
             attrs,
             link,
             underline_color,
@@ -576,16 +680,23 @@ fn build_line(units: &[Unit<'_>], wrapped: bool) -> Line {
     let mut ul_open: Option<(u16, u32)> = None;
     let mut col: u16 = 0;
 
+    // Where the unit before starts in `text`: each unit is one cell, and a
+    // unit the text alone would fold into the one before (flag halves drawn
+    // apart, a skin tone after a VS16 glyph kept narrow at a row's edge, the
+    // two from different rows) is marked to open its own cell.
+    let mut prev: Option<usize> = None;
     for unit in units {
-        // A one-byte unit (ASCII, most history) is one char.
-        let char_count = if unit.text.len() == 1 {
-            1
-        } else {
-            unit.text.chars().count()
-        };
+        let at = text.len();
         text.push_str(unit.text);
-        for _ in 0..char_count {
-            attrs_rle.push(unit.attrs);
+        let opens =
+            prev.is_some_and(|prev| super::scroll_materialize::walk_folds_across(&text, prev, at));
+        prev = Some(at);
+        attrs_rle.push(unit.attrs.with_opens_cell(opens));
+        // A one-byte unit (ASCII, most history) is one char.
+        if unit.text.len() > 1 {
+            for _ in 1..unit.text.chars().count() {
+                attrs_rle.push(unit.attrs);
+            }
         }
         match (&open, &unit.link) {
             (None, Some((url, id))) => open = Some((col, url.clone(), id.clone())),

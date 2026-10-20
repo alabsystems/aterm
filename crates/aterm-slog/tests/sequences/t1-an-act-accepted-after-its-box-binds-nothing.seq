@@ -1,0 +1,15 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# T1: an approve admitted under box 1 whose acceptance came after one
+# screen read replaced box 1 with box 2: it binds neither, and box 2 closes
+# by nobody (its input mark says `re=p1`).
+see busy
+half
+see prompt edit
+expect open p1 approval par=t1 box=edit at=500
+admit harness act=approve
+see prompt bash:not-read-only
+expect close p1 approval out=passed by=-
+expect open p2 approval par=t1 box=bash:not-read-only
+accept
+see busy
+expect close p2 approval out=passed by=-

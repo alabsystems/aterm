@@ -10,14 +10,14 @@ use std::time::Instant;
 use crate::native_app::AppViewState;
 use crate::{App, WindowId, term_lock};
 
-fn link_modifier() -> winit::keyboard::ModifiersState {
+fn link_modifier() -> aterm_window::keyboard::ModifiersState {
     #[cfg(target_os = "macos")]
     {
-        winit::keyboard::ModifiersState::SUPER
+        aterm_window::keyboard::ModifiersState::SUPER
     }
     #[cfg(not(target_os = "macos"))]
     {
-        winit::keyboard::ModifiersState::CONTROL
+        aterm_window::keyboard::ModifiersState::CONTROL
     }
 }
 
@@ -40,6 +40,9 @@ fn in_front(app: &mut App, wid: WindowId, pgid: i32, program: &str) {
 fn named_front(app: &mut App, wid: WindowId, fresh: i32, named: i32, program: &str) {
     let session = app.front_terminal(wid).expect("terminal").session;
     app.session_factory.fg_probe = |master| master;
+    // The fixture's groups lead no process: the kernel's reading of a shell in
+    // front is put in, a shell alone in its group by default.
+    app.session_factory.lone_leader = |_| Some("zsh".to_string());
     app.pool.sessions.get_mut(&session).unwrap().session.master = fresh;
     let ctx = app.pool.get(session).unwrap().ctx.clone();
     let mut timeline = ctx.timeline.lock().unwrap();
@@ -49,6 +52,7 @@ fn named_front(app: &mut App, wid: WindowId, fresh: i32, named: i32, program: &s
 
 /// The status sweep's witness of the engine's current cwd report: the group
 /// in front at its look.
+#[cfg(unix)]
 fn sweep_sees_cwd(app: &App, wid: WindowId, pgid: i32) {
     let front = app.front_terminal(wid).expect("terminal");
     let seq = term_lock(&front.term).reported_cwd_seq();
@@ -59,7 +63,20 @@ fn sweep_sees_cwd(app: &App, wid: WindowId, pgid: i32) {
         .timeline
         .lock()
         .unwrap()
-        .witness_cwd_report(seq, pgid);
+        .witness_cwd_report(seq, pgid, pgid);
+}
+
+/// `dir` as the path of an OSC 7 `file://` URI, as a shell reports it: the
+/// path itself, or on Windows `/C:/Users/…` (forward slashes, a leading `/`,
+/// no `\\?\` prefix).
+fn uri_path(dir: &std::path::Path) -> String {
+    let text = dir.display().to_string();
+    if cfg!(windows) {
+        let plain = text.strip_prefix(r"\\?\").unwrap_or(&text);
+        format!("/{}", plain.replace('\\', "/"))
+    } else {
+        text
+    }
 }
 
 /// A scratch project (`src/foo.rs`, `src/sub/`) and a headless App whose
@@ -74,7 +91,7 @@ fn app_with(row: &str) -> (App, WindowId, aterm_tempfile::TempDir, std::path::Pa
     let wid = WindowId(0);
     let term = app.front_terminal(wid).expect("terminal").term.clone();
     term_lock(&term)
-        .process(format!("\x1b]7;file://localhost{}\x07{row}\r\n", root.display()).as_bytes());
+        .process(format!("\x1b]7;file://localhost{}\x07{row}\r\n", uri_path(&root)).as_bytes());
     in_front(&mut app, wid, SHELL, "zsh");
     app.on_modifiers_changed(wid, link_modifier());
     (app, wid, dir, root)
@@ -140,9 +157,19 @@ fn cmd_click_on_a_citation_opens_aterms_editor_at_its_line() {
         "the citation is disclosed"
     );
     let caption = band(&mut app, wid);
+    let named = std::path::Path::new("src").join("foo.rs");
     assert!(
-        caption.contains("opens in aterm: ") && caption.contains("/src/foo.rs:3:2"),
+        caption.contains("opens in aterm: ")
+            && caption.contains(&format!(
+                "{}{}:3:2",
+                std::path::MAIN_SEPARATOR,
+                named.display()
+            )),
         "the band names aterm, where the file is, and the line: {caption:?}"
+    );
+    assert!(
+        !caption.contains(r"\\?\"),
+        "as a shell writes it: {caption:?}"
     );
     assert_eq!(
         app.link_under_pointer(wid),
@@ -220,7 +247,7 @@ fn a_press_opens_only_the_file_the_drawn_caption_named() {
     feed(
         &app,
         wid,
-        format!("\x1b]7;file://localhost{}\x07", other.display()).as_bytes(),
+        format!("\x1b]7;file://localhost{}\x07", uri_path(&other)).as_bytes(),
     );
     assert_eq!(
         app.path_link_under_pointer(wid).map(|target| target.path),
@@ -283,12 +310,13 @@ fn a_citation_never_opens_before_its_caption_is_drawn() {
 /// The rule the press is held to, arm by arm ([`crate::app_mouse::caption_admits`]):
 /// a citation only under a caption that named its file, line and column; a
 /// URL under a caption only when it is the URL the caption named, and under
-/// no caption as before. NEGATIVE CONTROLS: the same file at another line or
-/// column, another file, a URL caption over a citation press, a citation
-/// caption over a URL press, and a URL the caption did not name.
+/// no caption only a plain-text one. NEGATIVE CONTROLS: the same file at
+/// another line or column, another file, a URL caption over a citation press,
+/// a citation caption over a URL press, a URL the caption did not name, and
+/// an OSC 8 link with no caption drawn.
 #[test]
 fn a_press_opens_only_what_the_caption_named() {
-    use crate::app_mouse::{CaptionNames, caption_admits};
+    use crate::app_mouse::{CaptionNames, PressedUrl, caption_admits};
     let target = |path: &str, line, col| crate::path_link::PathTarget {
         path: path.into(),
         line,
@@ -326,22 +354,36 @@ fn a_press_opens_only_what_the_caption_named() {
     ));
     assert!(!caption_admits(
         Some(&named),
-        Some("https://a.example/"),
+        Some(PressedUrl::Plain("https://a.example/")),
         None
     ));
-    assert!(caption_admits(
-        Some(&url("https://a.example/")),
-        Some("https://a.example/"),
-        None
-    ));
-    assert!(!caption_admits(
-        Some(&url("https://a.example/")),
-        Some("https://b.example/"),
-        None
-    ));
+    for pressed in [
+        PressedUrl::Plain("https://a.example/"),
+        PressedUrl::Osc8("https://a.example/"),
+    ] {
+        assert!(caption_admits(
+            Some(&url("https://a.example/")),
+            Some(pressed),
+            None
+        ));
+    }
+    for pressed in [
+        PressedUrl::Plain("https://b.example/"),
+        PressedUrl::Osc8("https://b.example/"),
+    ] {
+        assert!(!caption_admits(
+            Some(&url("https://a.example/")),
+            Some(pressed),
+            None
+        ));
+    }
     assert!(
-        caption_admits(None, Some("https://a.example/"), None),
-        "a plain URL"
+        caption_admits(None, Some(PressedUrl::Plain("https://a.example/")), None),
+        "a plain URL, drawn in full, with no caption"
+    );
+    assert!(
+        !caption_admits(None, Some(PressedUrl::Osc8("https://a.example/")), None),
+        "an OSC 8 link, whose text need not be its URL, with no caption drawn"
     );
     assert!(caption_admits(None, None, None), "nothing to open");
 }
@@ -372,7 +414,7 @@ fn a_url_press_opens_only_the_url_the_drawn_caption_named() {
     assert!(
         !crate::app_mouse::caption_admits(
             shown.as_ref().map(|shown| &shown.names),
-            Some("sftp://two.example/"),
+            Some(crate::app_mouse::PressedUrl::Osc8("sftp://two.example/")),
             None
         ),
         "the drawn caption named the first URL"
@@ -382,7 +424,7 @@ fn a_url_press_opens_only_the_url_the_drawn_caption_named() {
     let shown = app.windows[&wid].shown_caption.clone();
     assert!(crate::app_mouse::caption_admits(
         shown.as_ref().map(|shown| &shown.names),
-        Some("sftp://two.example/"),
+        Some(crate::app_mouse::PressedUrl::Osc8("sftp://two.example/")),
         None
     ));
 }
@@ -396,7 +438,16 @@ fn a_url_press_opens_only_the_url_the_drawn_caption_named() {
 /// reporting `localhost` or this machine's own name; a shell, an agent by
 /// name and Claude Code under `node` by its screen in front; a local
 /// command; the remote report once its ssh has left the front; the shell's
-/// next report after the carry.
+/// next report after the carry. Refused too: a shell that shares its group
+/// with what it runs, one an `exec` replaced, and the root shell in front
+/// while its integration runs a command; NEGATIVE CONTROLS: a shell alone,
+/// the root shell at its prompt. An unidentified runtime remains refused
+/// even while a Codex report is shown: the report names no current writer.
+///
+/// Unix only: it reads the PTY's foreground process group and a process's OS
+/// cwd, which a ConPTY has neither of; Windows reads the shell's own
+/// integration instead (`with_no_foreground_group_the_shells_own_reading_stands_in`).
+#[cfg(unix)]
 #[test]
 fn a_citation_resolves_only_while_the_session_runs_here() {
     let (mut app, wid, _dir, root) = app_with("error: src/foo.rs:3:2 here");
@@ -545,14 +596,66 @@ fn a_citation_resolves_only_while_the_session_runs_here() {
     }
     assert_eq!(press(&app), None, "a carried cwd");
     feed(&app, wid, osc7("localhost").as_bytes());
-    assert_eq!(press(&app), Some(local), "the shell's next report"); // The fixture's master was a group's number, never an fd; give it back.
+    assert_eq!(press(&app), Some(local.clone()), "the shell's next report");
+
+    // A shell that shares its group with what it runs (a script whose body is
+    // `ssh prod`, `sh -c 'ssh h; echo done'`, a `#!/bin/sh` wrapper around
+    // `ssh box -t claude`): its name says nothing of where the output comes
+    // from.
+    app.session_factory.lone_leader = |_| None;
+    assert_eq!(press(&app), None, "a shell sharing its group");
+    assert!(!rehover(&mut app), "and no hand offers it");
+    // A shell an `exec` replaced (`exec tmux`) before the sweep names it anew.
+    app.session_factory.lone_leader = |_| Some("tmux".to_string());
+    assert_eq!(press(&app), None, "exec'd into tmux, still named zsh");
+    app.session_factory.lone_leader = |_| Some("bash".to_string());
+    assert_eq!(press(&app), Some(local.clone()), "control: a shell alone");
+
+    // The session's own root shell in front while its integration says a
+    // command runs (an `exec`, which no prompt follows).
+    let root = SHELL - 7;
     let session = app.front_terminal(wid).unwrap().session;
+    app.pool.sessions.get_mut(&session).unwrap().session.pid = root;
+    in_front(&mut app, wid, root, "zsh");
+    feed(
+        &app,
+        wid,
+        b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07\x1b]633;E;exec tmux\x07\x1b]133;C\x07",
+    );
+    assert_eq!(press(&app), None, "the root shell running `exec tmux`");
+    feed(&app, wid, b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+    assert_eq!(press(&app), Some(local.clone()), "control: at its prompt");
+    app.pool.sessions.get_mut(&session).unwrap().session.pid = -1;
+
+    // An OSC 7501 report is a display claim, not the current writer's identity.
+    // An old unseen report can cross a foreground move, so a shown claim
+    // cannot turn an unidentified runtime into a known-local citation source.
+    let npm = SHELL - 9;
+    in_front(&mut app, wid, npm, "node");
+    assert_eq!(press(&app), None, "node with no report");
+    let report = {
+        let term = app.front_terminal(wid).unwrap().term.clone();
+        let mut term = term_lock(&term);
+        term.process(b"\x1b]7501;state=working:app=codex\x1b\\");
+        term.program_state()
+    };
+    assert!(
+        app.session_status
+            .observe_program_state(session, report, true, false, Instant::now())
+    );
+    assert_eq!(
+        press(&app),
+        None,
+        "a displayed Codex report grants no local citation"
+    );
+    // The fixture's master was a group's number, never an fd; give it back.
     app.pool.sessions.get_mut(&session).unwrap().session.master = -1;
 }
 
 /// Where no foreground group can be read (a ConPTY), the shell's own
-/// integration is the reading: at its prompt, or running a shell or an agent
-/// by its command's word. NEGATIVE CONTROLS: no integration at all, and any
+/// integration is the reading: at its prompt, or running a bare shell or an
+/// agent by its command's word. NEGATIVE CONTROLS: no integration at all, an
+/// integration that marks only its prompts, a shell given a command, and any
 /// other command (a remote shell, an editor).
 #[test]
 fn with_no_foreground_group_the_shells_own_reading_stands_in() {
@@ -568,9 +671,31 @@ fn with_no_foreground_group_the_shells_own_reading_stands_in() {
         assert!(shell_reads_local(true, Some(command)), "{command}");
     }
     assert!(!shell_reads_local(false, None), "no integration");
-    for command in ["ssh build-box", "ssh.exe host", "vim", "tmux"] {
+    for command in [
+        "ssh build-box",
+        "ssh.exe host",
+        "vim",
+        "tmux",
+        "bash -c 'ssh h'",
+        "pwsh -c ssh h",
+        "C:\\Windows\\System32\\cmd.exe /c ssh h",
+    ] {
         assert!(!shell_reads_local(true, Some(command)), "{command}");
     }
+    // An integration that marks only its prompts (pwsh without PSReadLine)
+    // never says a command runs: its `integrated` reading is false
+    // (`CitationProbe::new` asks `quit_safety::shell_reports_commands` too).
+    let mut term = aterm_core::terminal::Terminal::new(24, 80);
+    term.process(b"\x1b]133;A\x07PS> \x1b]133;B\x07");
+    assert!(
+        term.current_block().is_some() && !crate::quit_safety::shell_reports_commands(&term),
+        "precondition: prompts marked, no command ever reported"
+    );
+    term.process(b"\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07PS> \x1b]133;B\x07");
+    assert!(
+        crate::quit_safety::shell_reports_commands(&term),
+        "control: a command reported once, its prompt reads local"
+    );
 }
 
 #[test]
@@ -608,7 +733,7 @@ fn a_url_over_a_citation_still_wins_and_a_refused_scheme_opens_nothing() {
 #[test]
 fn a_scripted_modifier_ends_at_the_persons_next_input() {
     use crate::app_mouse::PointerAction;
-    use winit::keyboard::ModifiersState as M;
+    use aterm_window::keyboard::ModifiersState as M;
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.on_modifiers_changed(wid, M::SHIFT);
@@ -689,4 +814,34 @@ fn only_an_accepted_present_changes_the_caption_a_press_may_open() {
     commit_presented_caption(&mut pending, None, &Ok(Some(5)));
     assert_eq!(pending, None);
     assert!(held, "LINK_CAPTION_COMMITTED_WITHOUT_AN_ACCEPTED_PRESENT");
+}
+
+/// A citation's hover refused while a build held the front comes back under a
+/// still pointer once the sweep names the shell again
+/// (`App::reask_renamed_hovers`, which the status sweep calls), with no output
+/// and no motion, and the first press under the caption opens. NEGATIVE
+/// CONTROL: a re-ask with the naming unchanged keeps the memo it has.
+#[test]
+fn a_citation_refused_under_a_build_comes_back_when_the_shell_is_named() {
+    let (mut app, wid, _dir, _root) = app_with("error: src/foo.rs:3:2 here");
+    let session = app.front_terminal(wid).unwrap().session;
+    let cargo = SHELL - 3;
+    in_front(&mut app, wid, cargo, "cargo");
+    assert!(!hover(&mut app, wid, 0, 10), "a build in front");
+    app.reask_renamed_hovers(session);
+    assert!(
+        app.windows[&wid]
+            .hover_memo
+            .as_ref()
+            .is_some_and(|memo| memo.answered_citation_of(session)),
+        "control: the naming did not move, the memo stands"
+    );
+    assert!(!app.windows[&wid].hover_pointer);
+    // The build exits and the sweep names the shell: nothing on screen moves.
+    in_front(&mut app, wid, SHELL, "zsh");
+    app.reask_renamed_hovers(session);
+    assert!(app.windows[&wid].hover_pointer, "the hand is back");
+    band(&mut app, wid);
+    assert!(app.open_link_under_pointer(wid), "the first press opens");
+    app.pool.sessions.get_mut(&session).unwrap().session.master = -1;
 }

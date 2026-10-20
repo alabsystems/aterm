@@ -74,10 +74,9 @@ pub(crate) struct Birth {
 /// after that read's start (so the process read is never younger than the
 /// pairing). Every read through one `Clocks` places one process at one instant,
 /// so two reads of it agree exactly; a judgement takes a fresh one, so a client
-/// that lives on (the fleet bridge's repeated discovery, `aterm fleet events`)
-/// still places a process born after its earlier judgements — a start later
-/// than a pairing places nowhere. Elsewhere it holds nothing: macOS keeps the
-/// wall-clock record itself.
+/// that lives on (a bridge's repeated discovery) still places a process born
+/// after its earlier judgements — a start later than a pairing places nowhere.
+/// Elsewhere it holds nothing: macOS keeps the wall-clock record itself.
 #[derive(Debug, Default)]
 pub(crate) struct Clocks {
     #[cfg(any(target_os = "linux", target_os = "android"))]

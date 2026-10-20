@@ -2,6 +2,10 @@
 # Copyright 2026 Andrew Yates
 [package]
 name = "aterm-predict"
+# Integration tests are declared below, not discovered: the files are modules of
+# one suite binary where they can share a process. With autotests off a
+# `tests/*.rs` file listed nowhere never compiles.
+autotests = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -26,6 +30,10 @@ aterm-core = { workspace = true }
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-core = { workspace = true }
+
+[[test]]
+name = "predict_suite"
+path = "tests/predict_suite.rs"
 
 [lints]
 workspace = true

@@ -19,7 +19,7 @@
 use std::sync::PoisonError;
 
 use aterm_core::terminal::TerminalCheckpoint;
-use winit::dpi::PhysicalSize;
+use aterm_window::dpi::PhysicalSize;
 
 use super::ladder_tests::{assert_only_over_cap_links_dropped, hostile_walk_step, xorshift};
 use super::tests::{
@@ -361,7 +361,7 @@ fn hand_over_as(
         &mut manifest,
         &parked.screens,
         &parked.history_heads,
-        parked.history.results(&dir),
+        parked.history.results_for_test(&dir),
         &dir,
         &nonce,
     );
@@ -1456,7 +1456,7 @@ fn hand_over_held(
             crate::handoff_history::HistoryPlan::Unexported
         }
     }
-    .results(&crate::control_auth::socket_dir().expect("the scratch control dir"))
+    .results_for_test(&crate::control_auth::socket_dir().expect("the scratch control dir"))
     .take_held(
         &parked
             .held
@@ -2059,7 +2059,7 @@ fn a_held_exited_pane_keeps_its_screen() {
 
 /// ROUND EIGHT, FINDING 730: A HELD PANE'S TURN LEDGER CROSSES. A pane a
 /// manager drove with `turn` before its command ended keeps the records, so
-/// `history` lists them (`carried=1`) and `aterm drive report` finds them: they
+/// `history` lists them (`carried=1`) and the report reader finds them: they
 /// ride the pane's own control sidecar, read before the proof as a handed
 /// session's is. RED before the fix: the successor's held pane answered
 /// `history` with exactly `OK 0` and no `unheld_below=`, and `drive ledger`
@@ -2096,6 +2096,7 @@ fn a_held_panes_turn_ledger_crosses_the_update() {
             screen_hash: 9,
             seq: 3,
             arch: crate::turn_ledger::ArchMark::default(),
+            by: crate::turn_ledger::TurnBy::Ctl,
             carried: false,
         });
     app.store
@@ -2502,5 +2503,119 @@ fn a_held_panes_seen_failure_stays_seen_across_the_update() {
         0,
         "{at}: NO `status-change` ROW FOR AN EXIT FROM BEFORE THE UPDATE"
     );
+    ptys.release(app);
+}
+
+/// WHAT THE OWNER WAS TOLD AND HAS SEEN CROSSES THE UPDATE
+/// (`SessionRecord::status_seen`): the park stamps each session's status item
+/// memory on its manifest record (`App::status_carry_rows`), the shipping
+/// writer writes it, and this build's successor reads it back by sid — the
+/// asking session's told need, and the done its owner looked at, by when its
+/// task entered it — and, on the manifest itself
+/// (`SessionHandoff::fleet_told`), the fleet need its herald told.
+/// NEGATIVE CONTROL: a session the status item knows nothing of carries no
+/// row.
+#[test]
+fn what_the_owner_was_told_and_has_seen_crosses_the_update() {
+    use crate::status_item::StatusCarry;
+    use crate::task_record::TaskState;
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _restore = restore_env();
+    let _scratch = enter_scratch("status-seen");
+    let mut app = crate::App::headless_for_test();
+    let wid = WindowId(0);
+    let quiet = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(quiet));
+    let mut ptys = DeskPtys::default();
+    ptys.attach_rest(&mut app);
+    // Session 0: a finished `ctl` worker its owner looked at, now asking,
+    // told by a windowed herald.
+    let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+    let subscribers = app.subscribers.clone();
+    for state in [TaskState::Working, TaskState::Done] {
+        let mark = crate::task_record::TaskMark::new(state);
+        crate::task_record::mark_session_task(&ctx, 0, &mark, &subscribers).expect("marked");
+    }
+    app.on_task_changed(0);
+    // The owner looks at its tab once (in front, the window on screen), then
+    // goes back to the quiet tab.
+    app.windows
+        .get_mut(&wid)
+        .expect("window 0")
+        .band_on_screen_for_test = true;
+    app.switch_tab_in(wid, 0);
+    app.note_done_seen_looking();
+    app.switch_tab_in(wid, 1);
+    app.windows
+        .get_mut(&wid)
+        .expect("window 0")
+        .band_on_screen_for_test = false;
+    ctx.meta
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set("attention", Some("wedged on CI".to_string()));
+    app.publish_need(0);
+    app.headless = false;
+    app.config.desktop_alerts = Some(true);
+    crate::app_tabs::HERALD_REFUSAL.set(None);
+    app.herald_session(0);
+    // A stalled worker on mac-17, told by the same herald.
+    let mac = crate::fleet_glance::FleetMac {
+        name: "mac-17".to_string(),
+        dial: "mac-17".to_string(),
+        ..crate::fleet_glance::FleetMac::default()
+    };
+    let need = crate::fleet_glance::FleetNeed {
+        sid: "s-w".to_string(),
+        word: aterm_types::needs::NeedWord::Stalled,
+        who: "claude".to_string(),
+        worker_of: None,
+        age_ms: None,
+        what: None,
+    };
+    let fleet = crate::fleet_glance::escalation(&mac, &need);
+    app.herald_deliver(fleet.session, Some(&fleet), false);
+    app.fleet_heralded
+        .insert(fleet.session, (mac.dial.clone(), need.word));
+    app.headless = true;
+    let since_ms = ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .task()
+        .expect("the task")
+        .since_unix_ms;
+    let sid_of = |app: &crate::App, id: u64| {
+        app.store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_local(id)
+            .expect("registered")
+            .sid
+            .as_str()
+            .to_string()
+    };
+    let (asking, untouched) = (sid_of(&app, 0), sid_of(&app, quiet));
+
+    let at = "a told ask and a read done";
+    let (_parked, incoming, _nonce, _expected) =
+        hand_over_held(&mut app, ReceiverShape::Current, HeldPlan::Export, at);
+    let carried: std::collections::HashMap<String, String> =
+        incoming.status_seen.iter().cloned().collect();
+    let carry = StatusCarry::parse(carried.get(&asking).expect("the asking session's row"));
+    assert_eq!(
+        carry.need.map(|(word, _)| word),
+        Some(aterm_types::needs::NeedWord::Ask),
+        "{at}"
+    );
+    assert!(carry.told, "{at}: told");
+    assert_eq!(carry.done, Some(since_ms), "{at}: the done read");
+    assert!(!carried.contains_key(&untouched), "{at}: nothing known");
+    assert_eq!(
+        incoming.fleet_told,
+        vec![crate::fleet_glance::told_row(fleet.session, need.word)],
+        "{at}: the told fleet need"
+    );
+    drop(incoming);
     ptys.release(app);
 }

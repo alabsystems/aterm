@@ -691,6 +691,7 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         kitty_file_resolver: _,
         last_bell_time: _,
         bell_total: _,
+        notify_total: _,
         default_cursor_style: _,
         host_alternate_scroll: _,
         notifications: _,
@@ -717,6 +718,8 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         // dispatchers (forwarded so they can set it), taken by the host.
         evidence_asserted: _,
         absolute_row_revision: _,
+        // The holder fence: the alt-screen and full-clear dispatches mark it.
+        holder_fence: _,
         // --- Session-only (not forwarded to handler) ---
         // Host config's last-applied values for the app-negotiated modes: an
         // escape sequence moves `modes`, never the host setting the reload diffs

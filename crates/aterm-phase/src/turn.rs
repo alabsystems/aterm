@@ -663,17 +663,109 @@ pub(crate) fn asks(said: &str) -> bool {
 /// (`⎿  Read …`) and a `※ recap:` drawn before them are the vendor's, so the
 /// last words are the worker's above them — a finished report still ends
 /// with ATERM-TASK-DONE, a question held for a person still asks it.
+///
+/// A PROMPT A HOOK STOPPED OR BLOCKED is answered by Claude Code itself
+/// (`⏺ Operation stopped by hook: <stopReason>`, `⏺ UserPromptSubmit
+/// operation blocked by hook:` over its stderr; `is_hook_verdict`): the
+/// hook's words are no worker's, and the worker never got the prompt, so
+/// there are no last words — never the label's, which a done check's
+/// reader took for an idle report (the review of a00553122d), nor the
+/// worker's above it, which answered an earlier prompt.
 #[must_use]
 pub fn said_tail(rows: &[String]) -> Option<String> {
+    said_message(rows).map(|(_, said)| said)
+}
+
+/// The message [`said_tail`] reads: its head's index ([`message_at`]) and
+/// its words. `None` where it is CLAUDE CODE'S OWN LABEL OVER A HOOK'S
+/// VERDICT ON A PROMPT ([`is_hook_verdict`]): the words behind it are the
+/// hook's, and the prompt it stopped or blocked was never the worker's to
+/// answer — so neither are the worker's words above it, which answered an
+/// earlier prompt.
+fn said_message(rows: &[String]) -> Option<(usize, String)> {
     let (head, said) = message_at(rows, last_said_index(rows)?)?;
-    if !is_idle_notice(&said) {
-        return Some(said);
+    let (head, said) = if is_idle_notice(&said) {
+        let above = before_idle_compaction(rows, head);
+        let last = (0..above)
+            .rev()
+            .find(|&i| crate::phase::is_said(&rows[i], None))?;
+        message_at(rows, last)?
+    } else {
+        (head, said)
+    };
+    (!is_hook_verdict(&said)).then_some((head, said))
+}
+
+/// Whether a message's words `said` ([`message_at`]) open with Claude Code's
+/// own label over a hook's verdict on a prompt (the anchors `hook.stopped`,
+/// `hook.prompt_blocked`, `hook.expansion_blocked`), however its rows wrap:
+/// `Operation stopped by hook` alone or followed by `: <stopReason>` (a
+/// hook's `{"continue": false}`, MEASURED on 2.1.302 under the prompt's own
+/// `❯` row), or `UserPromptSubmit operation blocked by hook:` /
+/// `UserPromptExpansion operation blocked by hook:` over the hook's stderr (its
+/// exit 2). Negative: the label's words anywhere but at the message's head,
+/// and words that only begin as the label does (`Operation stopped by hooks
+/// in CI…`).
+fn is_hook_verdict(said: &str) -> bool {
+    let words = said.split_whitespace().collect::<Vec<_>>().join(" ");
+    let stopped = const { crate::anchors::anchor_text("hook.stopped") };
+    let opens = |label: &str| {
+        words
+            .strip_prefix(label)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    };
+    words
+        .strip_prefix(stopped)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+        || opens(const { crate::anchors::anchor_text("hook.prompt_blocked") })
+        || opens(const { crate::anchors::anchor_text("hook.expansion_blocked") })
+}
+
+/// THE PROMPT THE WORKER'S LAST WORDS ANSWER: the words of the user's `❯`
+/// row that opened the turn the [`said_tail`] message ends, its rows under it
+/// (wrapped at column two, a paragraph break's blank rows among them) joined
+/// with one space. Walking up from that message's `⏺` row, only the turn's
+/// own rows are passed over — blank rows, the model's other `⏺` rows (a
+/// tool's call, a reply before it) and every row indented under one; the
+/// first other row in column 0 ends the walk: the `❯` row is the prompt,
+/// anything else (a done row, `✻ Worked for 0s`, which closes a turn of its
+/// own; the launch card) says no prompt of the screen opened this turn.
+///
+/// What a supervisor reads an act's answer by where no read of its saw the
+/// turn run (the lab's done-check scenario `d1l` on 2.1.303: the
+/// stub answered the done check in 41 ms, the same idle line as before, and
+/// the screen's only news was the check's own `❯` row over it). `None` where
+/// the last words are no message — a user row not answered yet, a tool's
+/// call, a shell's screen, Claude Code's own label over a hook that stopped
+/// the prompt ([`said_tail`]: the `❯` row it draws above that label was
+/// never the worker's to answer) — where that message's head is above the
+/// screen, with no composer frame, and for the composer's own `❯` row: a
+/// draft is no prompt.
+#[must_use]
+pub fn answered_prompt(rows: &[String]) -> Option<String> {
+    let frame = composer_frame(rows)?;
+    let (head, _) = said_message(rows)?;
+    if head >= frame.top || !rows[head].starts_with(['⏺', '●']) {
+        return None;
     }
-    let above = before_idle_compaction(rows, head);
-    let last = (0..above)
-        .rev()
-        .find(|&i| crate::phase::is_said(&rows[i], None))?;
-    message_at(rows, last).map(|(_, said)| said)
+    let open = (0..head).rev().find(|&i| {
+        let r = &rows[i];
+        !crate::text::blank(r) && leading_spaces(r) == 0 && !r.starts_with(['⏺', '●'])
+    })?;
+    let first = rows[open].strip_prefix('❯')?;
+    let mut words = vec![crate::text::trim(first)];
+    for row in &rows[open + 1..head] {
+        let t = crate::text::trim(row);
+        if t.is_empty() {
+            continue;
+        }
+        if leading_spaces(row) == 0 || t.starts_with('⎿') {
+            break;
+        }
+        words.push(t);
+    }
+    let said = words.join(" ");
+    (!crate::text::trim(&said).is_empty()).then_some(said)
 }
 
 /// The `⏺` message whose last row is `last` ([`said_tail`]): its head's index
@@ -2358,5 +2450,185 @@ mod tests {
         // Garbage indices never panic.
         let _ = launch_card_unmoved(&blank, Some(usize::MAX), &[usize::MAX, 0]);
         assert!(launch_card_unmoved(&blank, Some(1), &[0, usize::MAX]));
+    }
+
+    /// The turn the screen's last words close, by the `❯` row that opened it
+    /// ([`answered_prompt`]), on the measured screen of answers drawn faster
+    /// than any read (2.1.303, the lab's `d1l`): every answer the same idle
+    /// line, each under the harness's own row. The rows under a wrapped
+    /// prompt are its words; the composer's row (a draft), a row nothing
+    /// answered yet, and words a done row parts from any prompt are no
+    /// answered prompt.
+    #[test]
+    fn the_answered_prompt_is_the_row_over_the_last_words() {
+        let measured = screen(include_str!(
+            "fixtures/claude-2.1.303-fast-answers-same-idle-line-measured.txt"
+        ));
+        let idle = "Both branches have landed and no lander is running.";
+        assert_eq!(said_tail(&measured).as_deref(), Some(idle));
+        assert_eq!(answered_prompt(&measured).as_deref(), Some("keep going"));
+        let caret = measured
+            .iter()
+            .position(|r| r == "❯")
+            .expect("the caret row");
+        let top = caret - 1;
+        let keep = measured
+            .iter()
+            .rposition(|r| r == "❯ keep going")
+            .expect("the last act's row");
+        // The screen the check's answer drew, before `keep going` went: its
+        // four rows joined, each wrap one space.
+        let checked: Vec<String> = measured[..keep]
+            .iter()
+            .chain(&measured[top..])
+            .cloned()
+            .collect();
+        let check = answered_prompt(&checked).expect("the check's row");
+        assert!(
+            check.starts_with("Before you stop: do every open item"),
+            "{check}"
+        );
+        assert!(
+            check.contains("(build, test, measure where numbers"),
+            "{check}"
+        );
+        assert!(
+            check.ends_with("a slow check is not a blocker. Otherwise continue."),
+            "{check}"
+        );
+        assert_eq!(said_tail(&checked).as_deref(), Some(idle));
+        // NEGATIVE CONTROL: the act's words still in the composer are a
+        // draft; the turn the screen closes is still the check's.
+        let mut drafted = checked.clone();
+        let at = drafted
+            .iter()
+            .position(|r| r == "❯")
+            .expect("the caret row");
+        drafted[at] = "❯ keep going".to_string();
+        assert_eq!(answered_prompt(&drafted).as_deref(), Some(check.as_str()));
+        // NEGATIVE CONTROL: the act's row submitted with nothing under it
+        // yet closes no turn: the last words are still the check's answer,
+        // under the check's row.
+        let pending: Vec<String> = measured[..keep + 2]
+            .iter()
+            .chain(&measured[top..])
+            .cloned()
+            .collect();
+        assert_eq!(said_tail(&pending).as_deref(), Some(idle));
+        assert_eq!(answered_prompt(&pending).as_deref(), Some(check.as_str()));
+        let unanswered = framed(&["⏺ Done.", "", "❯ keep going", ""], "  ? for shortcuts");
+        assert_eq!(answered_prompt(&unanswered), None);
+        // A tool's call and its output inside the turn are passed over.
+        let tooled = framed(
+            &[
+                "❯ run the suite",
+                "",
+                "⏺ Bash(targo --unverified test -p aterm-phase)",
+                "  ⎿  test result: ok. 412 passed",
+                "",
+                "⏺ All green.",
+                "",
+            ],
+            "  ? for shortcuts",
+        );
+        assert_eq!(answered_prompt(&tooled).as_deref(), Some("run the suite"));
+        // NEGATIVE CONTROL: words under a done row with no prompt over them
+        // (a wake of Claude Code's own) close a turn no prompt on the screen
+        // opened.
+        let woke = framed(
+            &[
+                "❯ keep going",
+                "",
+                &format!("⏺ {idle}"),
+                "",
+                "✻ Baked for 0s · done 11:06 PM",
+                "",
+                "⏺ The background suite finished: all green.",
+                "",
+            ],
+            "  ? for shortcuts",
+        );
+        assert_eq!(answered_prompt(&woke), None);
+        // NEGATIVE CONTROL: the launch card alone, and no frame at all.
+        assert_eq!(answered_prompt(&measured[..4]), None);
+        assert_eq!(
+            answered_prompt(&rows(&["❯ keep going", "", "⏺ Done."])),
+            None
+        );
+    }
+
+    /// A PROMPT A HOOK STOPPED OR BLOCKED CLOSES NO TURN, AND CLAUDE CODE'S
+    /// LABEL OVER THE HOOK'S WORDS IS NO WORDS OF THE WORKER'S ([`said_tail`],
+    /// [`answered_prompt`]), on the measured screens of a UserPromptSubmit
+    /// hook (2.1.302) that answers `{"continue": false, "stopReason": …}` —
+    /// the prompt's own `❯` row, then `⏺ Operation stopped by hook: <reason>`
+    /// — and of one that exits 2 — `⏺ UserPromptSubmit operation blocked by
+    /// hook:` over its stderr and the original prompt. Read as the worker's
+    /// answer to the `❯` row over it, a done check a hook stopped was taken
+    /// and its stopReason (`No lander is running.`) read as the worker's idle
+    /// report: the task ended on a check the worker never received (the
+    /// review of a00553122d). So too the label with no reason (the bundle's
+    /// own `Operation stopped by hook`), a reason wrapped onto a second row,
+    /// and a slash command's prompt a UserPromptExpansion hook blocked.
+    /// NEGATIVE CONTROLS: the worker's own words in the label's place answer
+    /// the prompt; the label's words quoted inside the worker's message, or
+    /// leading words of its own that only begin as the label does, are its.
+    #[test]
+    fn a_prompt_a_hook_stopped_closes_no_turn_and_its_label_is_no_words() {
+        use crate::prompt::fixtures::{
+            PROMPT_HOOK_BLOCKED_LOGIN_PHRASE_MEASURED, PROMPT_HOOK_STOPPED_LOGIN_PHRASE_MEASURED,
+        };
+        let stopped = screen(PROMPT_HOOK_STOPPED_LOGIN_PHRASE_MEASURED);
+        let label = stopped
+            .iter()
+            .position(|r| r == "⏺ Operation stopped by hook: Not logged in · Please run /login")
+            .expect("the measured label row");
+        let with = |words: &[&str]| -> Vec<String> {
+            let mut r = stopped[..label].to_vec();
+            r.extend(words.iter().map(|w| (*w).to_string()));
+            r.extend_from_slice(&stopped[label + 1..]);
+            r
+        };
+        for (name, read) in [
+            ("measured", stopped.clone()),
+            ("no reason", with(&["⏺ Operation stopped by hook"])),
+            (
+                "a reason on two rows",
+                with(&[
+                    "⏺ Operation stopped by hook: Not logged in ·",
+                    "  Please run /login",
+                ]),
+            ),
+        ] {
+            assert_eq!(answered_prompt(&read), None, "{name}");
+            assert_eq!(said_tail(&read), None, "{name}");
+        }
+        let blocked = screen(PROMPT_HOOK_BLOCKED_LOGIN_PHRASE_MEASURED);
+        assert_eq!(said_tail(&blocked), None);
+        assert_eq!(answered_prompt(&blocked), None);
+        let expansion: Vec<String> = blocked
+            .iter()
+            .map(|r| r.replace("⏺ UserPromptSubmit ", "⏺ UserPromptExpansion "))
+            .collect();
+        assert_ne!(expansion, blocked);
+        assert_eq!(said_tail(&expansion), None);
+        // NEGATIVE CONTROLS: the worker's words.
+        let answered = with(&["⏺ Nothing to say."]);
+        assert_eq!(answered_prompt(&answered).as_deref(), Some("say nothing"));
+        assert_eq!(said_tail(&answered).as_deref(), Some("Nothing to say."));
+        for own in [
+            "The hook printed Operation stopped by hook: Not logged in.",
+            "Operation stopped by hooks in CI, so I removed them.",
+            "I read UserPromptSubmit operation blocked by hook: in the log.",
+            "The operation blocked by hook: none, the suite ran.",
+        ] {
+            let mine = with(&[&format!("⏺ {own}")]);
+            assert_eq!(
+                answered_prompt(&mine).as_deref(),
+                Some("say nothing"),
+                "{own}"
+            );
+            assert_eq!(said_tail(&mine).as_deref(), Some(own), "{own}");
+        }
     }
 }

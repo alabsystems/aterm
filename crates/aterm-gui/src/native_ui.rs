@@ -157,6 +157,16 @@ impl LogicalRect {
             (self.height - vertical).max(0.0),
         )
     }
+
+    /// This rect grown by `insets` on each side ([`Layout::outdent`]).
+    fn outset(self, insets: Insets) -> Self {
+        Self::new(
+            self.x - insets.left,
+            self.y - insets.top,
+            self.width + insets.left + insets.right,
+            self.height + insets.top + insets.bottom,
+        )
+    }
 }
 
 /// Whether an effective ancestor clip removes a perceptible part of a node.
@@ -245,6 +255,14 @@ pub(crate) struct Layout {
     /// first starts this far before the content edge, so a clipped list
     /// anchored at its end shows its earliest child cut at the leading edge.
     pub(crate) offset: f32,
+    /// How far this node reaches past its parent's content rect into the
+    /// parent's padding, per side: the parent lays it out, then its rect
+    /// grows by these insets, and where the parent clips its children to
+    /// its content rect this node's clip grows the same way (never past the
+    /// parent's own clip). A Settings page's own scrolling list reaches into
+    /// the page's right gutter, where its thumb stands clear of the cards
+    /// (`settings_scroll::seat_page_scroller`).
+    pub(crate) outdent: Insets,
 }
 
 impl Default for Layout {
@@ -257,6 +275,7 @@ impl Default for Layout {
             gap: 0.0,
             clip: false,
             offset: 0.0,
+            outdent: Insets::default(),
         }
     }
 }
@@ -307,8 +326,15 @@ impl Layout {
         self
     }
 
+    /// Reach `outdent` past the parent's content rect ([`Self::outdent`]).
+    pub(crate) fn outdent(mut self, outdent: Insets) -> Self {
+        self.outdent = outdent;
+        self
+    }
+
     fn is_valid(self) -> bool {
         self.padding.is_valid()
+            && self.outdent.is_valid()
             && self.gap.is_finite()
             && self.gap >= 0.0
             && self.offset.is_finite()
@@ -345,6 +371,13 @@ pub(crate) enum SemanticRole {
     /// the a11y model's `List` with its scroll actions, lowered to the same
     /// `ScrollLines` the wheel and the arrow keys send.
     List,
+    /// A list of options one of which is chosen (Settings ▸ Themes' theme
+    /// list): scrolls like [`Self::List`], and its rows are
+    /// [`Self::ListBoxOption`]s.
+    ListBox,
+    /// One option of a [`Self::ListBox`]; `selected` marks the highlighted
+    /// one. Pressing it chooses it.
+    ListBoxOption,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -414,6 +447,13 @@ pub(crate) enum StyleRef {
     Navigation,
     Setting,
     Code,
+    /// A FILTER CHIP (Settings ▸ Messages' severity and tag filters): a toggle
+    /// whose state is a LUMINANCE change, not a hue — at rest the card's fill in
+    /// a [`crate::native_appearance::NativeRoles::control_edge`] rim (3:1, the
+    /// non-text floor for a control's boundary); selected, a solid accent fill
+    /// inked in `on_accent` (4.5:1). Its label is centred in the slot its author
+    /// measured for it.
+    Chip,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -423,6 +463,18 @@ pub(crate) struct Control<T> {
     pub(crate) state: ControlState,
     pub(crate) action: ActionId,
     pub(crate) style: StyleRef,
+    /// The role assistive technology hears in place of the control kind's
+    /// own: a button that is one option of a list box
+    /// ([`SemanticRole::ListBoxOption`]). Paint and actions are the kind's.
+    pub(crate) role: Option<SemanticRole>,
+    /// THE PRESS GOES WHERE THE POINTER LOOKED ([`Self::look_first`]): a
+    /// pointer press lands on this control only where the pointer moved onto
+    /// it, or the person scrolled it there; where the layout moved it under a
+    /// still pointer, the press chooses nothing and lights it, and the next
+    /// press may take it. The same holds for any control the layout moves
+    /// under a pointer resting on this one. Keyboard, assistive and `act`
+    /// presses name the control and are never refused.
+    pub(crate) look_first: bool,
 }
 
 impl<T> Control<T> {
@@ -433,7 +485,23 @@ impl<T> Control<T> {
             state: ControlState::default(),
             action,
             style: StyleRef::default(),
+            role: None,
+            look_first: false,
         }
+    }
+
+    /// Ask for a look before a pointer press ([`Self::look_first`]): for a
+    /// control whose one press writes many things at once (SESSIONS'
+    /// `Every session` row), where a press the layout moved under a still
+    /// pointer would do more harm than a press that waits.
+    pub(crate) fn look_first(mut self) -> Self {
+        self.look_first = true;
+        self
+    }
+
+    pub(crate) fn role(mut self, role: SemanticRole) -> Self {
+        self.role = Some(role);
+        self
     }
 
     pub(crate) fn value(mut self, value: SemanticValue) -> Self {
@@ -479,6 +547,19 @@ impl GroupSpec {
     pub(crate) fn style(mut self, style: StyleRef) -> Self {
         self.style = style;
         self
+    }
+
+    /// Whether the group paints a backdrop of its own (a card, a sidebar, a
+    /// code canvas, the application surface), so all of its rect is drawn,
+    /// not only its children ([`paint_compiled_node`]).
+    pub(crate) fn paints_backdrop(&self) -> bool {
+        matches!(
+            self.role,
+            SemanticRole::Application | SemanticRole::Navigation
+        ) || matches!(
+            self.style,
+            StyleRef::Primary | StyleRef::Secondary | StyleRef::Code
+        )
     }
 }
 
@@ -564,7 +645,7 @@ pub(crate) enum ButtonIcon {
     Swatch,
     /// A page with a folded corner: Manual's aterm.toml.
     Document,
-    /// A robot's head: Agents.
+    /// A robot's head: the Harness page (coding agents).
     Agents,
     /// A cursor with a fading trail behind it: the Cursor Styles page.
     Trail,
@@ -576,6 +657,13 @@ pub(crate) enum ButtonIcon {
     /// A four-pointed spark: Settings ▸ AI CLIs, whose row sits right under
     /// Harness's robot while it shows.
     Spark,
+    /// A waste bin: move a file to the Trash (Settings ▸ Themes' own rows).
+    Trash,
+    /// An arrow turning back on itself: put a value back as it was
+    /// (Settings ▸ Themes' colour rows).
+    Reset,
+    /// A cross: empty the field it sits in (Settings ▸ Themes' filter).
+    Clear,
 }
 
 impl ButtonSpec {
@@ -640,15 +728,45 @@ pub(crate) struct SliderSpec {
     pub(crate) label: String,
     pub(crate) step: f64,
     pub(crate) display_value: String,
+    /// What a reader says after the name ([`UiContent::description`]): a
+    /// Settings row's note, as a switch's or a button's carries it.
+    pub(crate) description: Option<String>,
+    /// THE TRACK, where it is not the whole value domain: the span the bar
+    /// draws and a drag maps over (Font size shows 8–36, the sizes people
+    /// use), while the value's domain — what the keys, automation and a
+    /// screen reader may set — stays the control's semantic minimum and
+    /// maximum (Font size 6–200). `None`: the track is the domain. A value
+    /// past the track's end fills the bar to that end.
+    pub(crate) track: Option<(f64, f64)>,
 }
 
-/// The `audit_id` naming the Tab Color HSV wheel — one of the TWO
-/// [`UiContent::Custom`] nodes with a special paint lowering (an
-/// [`crate::widget::DrawPrim::HsvDisk`] + the committed-color marker) and a
-/// positional pointer mapping ([`CompiledUi::color_wheel_color_at`]).
-pub(crate) const TAB_COLOR_WHEEL_AUDIT: &str = "settings.tab-color.wheel";
+impl SliderSpec {
+    /// The span the bar draws and a drag maps over, for a value domain of
+    /// `minimum..=maximum` ([`Self::track`]).
+    pub(crate) fn track_span(&self, minimum: f64, maximum: f64) -> (f64, f64) {
+        self.track.unwrap_or((minimum, maximum))
+    }
+}
 
-/// The `audit_id` naming the Top Settings rainbow hero banner — the other
+/// A COLOUR WHEEL ([`UiContent::ColorWheel`]): the HSV disk at the colour's
+/// brightness, with a marker at its hue and saturation. One control for any
+/// colour a page picks (Settings' colour picker, every colour key alike).
+///
+/// The wheel draws the picker's own model, never one re-derived from the
+/// saved 8-bit `#RRGGBB`: black has no hue, so a colour taken to brightness
+/// 0 still marks the hue it was picked at, and raising the brightness again
+/// gives that hue back. The control's value is the colour in words for
+/// assistive technology and automation.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ColorWheelSpec {
+    pub(crate) label: String,
+    /// Hue (turns from 12 o'clock, clockwise), saturation (the radius) and
+    /// brightness (the disk's), each in `0..=1`; `None` while no colour is
+    /// known, which marks nothing on a full-brightness disk.
+    pub(crate) hsv: Option<[f32; 3]>,
+}
+
+/// The `audit_id` naming the Top Settings rainbow hero banner — a
 /// custom-paint node ([`crate::settings::paint_rainbow_banner`]): a purely
 /// decorative, static composition (no action, not focusable) whose semantic
 /// label simply names the scenery for accessibility.
@@ -668,19 +786,28 @@ pub(crate) const MESSAGES_SEVERITY_AUDIT: &str = "settings.messages.severity";
 /// separator role across its rect.
 pub(crate) const MESSAGES_RULE_AUDIT: &str = "settings.messages.rule";
 
-/// Settings ▸ Themes' card TILE: a paint-only custom node whose value carries
-/// one theme's colours ([`crate::settings_preview::theme_card::ShowcaseCard::tile_value`]).
-/// It draws that theme's miniature specimen — prompt, `ls`, a diff, a code
-/// line, the cursor, the contrast badge and all sixteen ANSI swatches — from
-/// panels and text alone. Decorative: the card's button carries its name,
-/// appearance and contrast in words.
-pub(crate) const THEME_CARD_AUDIT: &str = "settings.themes.card";
+/// Settings ▸ Themes' row SLAB: a paint-only custom node whose value carries
+/// one theme's background, foreground and four hues
+/// ([`crate::settings_preview::theme_card::ShowcaseCard::slab_value`]). It
+/// draws a 44×20 chip of that theme — its background, "Aa" in its foreground
+/// and four dots — from panels and text alone. Decorative: the row's option
+/// carries its name, appearance and contrast in words.
+pub(crate) const THEME_SLAB_AUDIT: &str = "settings.themes.slab";
 
 /// Settings ▸ Themes' palette SWATCH: a paint-only custom node whose value is
-/// one `#rrggbb` colour, drawn as a rounded chip with a hairline so a colour
+/// one `#rrggbb` colour (then `changed` for a slot the person tuned, which
+/// wears an accent dot), drawn as a rounded chip with a hairline so a colour
 /// equal to the page still shows its edge. The slot's button says which
 /// colour it is in words.
 pub(crate) const THEME_SWATCH_AUDIT: &str = "settings.themes.swatch";
+
+/// A COLOUR CHIP after words that name a colour (Modified's "Default:
+/// Automatic"): the chip a colour field and a colour button wear
+/// ([`TextFieldSpec::swatch`], [`ButtonSpec::chip`]), drawn a gap after the
+/// node's left edge and centred down it. Paint only; its value is the
+/// `#RRGGBB`, and the words beside it name the colour for assistive
+/// technology.
+pub(crate) const COLOR_CHIP_AUDIT: &str = "settings.color.chip";
 
 /// Settings ▸ Messages' SCROLL INDICATOR (design ruling 264): the log is one
 /// scrolling list with no pager, and this paint-only custom node, laid over
@@ -689,6 +816,13 @@ pub(crate) const THEME_SWATCH_AUDIT: &str = "settings.themes.swatch";
 /// `first,shown,total` in entries. Decorative: the list itself is the
 /// screen reader's scrolling surface ([`SemanticRole::List`]).
 pub(crate) const MESSAGES_SCROLL_AUDIT: &str = "settings.messages.scroll";
+
+/// A Settings page's own SCROLL INDICATOR: [`MESSAGES_SCROLL_AUDIT`]'s node
+/// for the page's list, its node reaching across the page's right gutter
+/// (`settings_scroll::seat_page_scroller`), drawn in the gutter outside the
+/// cards in the terminal's resting idiom ([`paint_page_scroll`]). Value and
+/// semantics are [`MESSAGES_SCROLL_AUDIT`]'s.
+pub(crate) const PAGE_SCROLL_AUDIT: &str = "settings.page.scroll";
 
 /// A display face's NAME drawn in that face (Text & Fonts' Display faces
 /// card): the label is the name, the value the face's id. A sample of the
@@ -744,20 +878,12 @@ pub(crate) fn color_wheel_geometry(rect: LogicalRect) -> ColorWheelGeometry {
     }
 }
 
-/// The brightness the wheel paints and picks at: the committed color's
-/// (`value` is its `#rrggbb`), or full brightness while none is set.
-pub(crate) fn color_wheel_value(value: Option<&str>) -> f32 {
-    value
-        .and_then(aterm_types::scheme::parse_hex)
-        .map_or(1.0, |rgb| {
-            crate::widget::rgb_to_hsv([rgb.r, rgb.g, rgb.b]).2
-        })
-}
-
-/// The color under `(x, y)` on the disk painted in `rect` at `value`
-/// brightness, or `None` outside it. Hue/saturation use EXACTLY the raster's
-/// per-pixel convention (clockwise turns from 12 o'clock; radius = saturation).
-pub(crate) fn color_wheel_rgb_at(rect: LogicalRect, x: f32, y: f32, value: f32) -> Option<[u8; 3]> {
+/// The hue and saturation under `(x, y)` on the disk painted in `rect`, or
+/// `None` outside it. Hue/saturation use EXACTLY the raster's per-pixel
+/// convention (clockwise turns from 12 o'clock; radius = saturation), and do
+/// not depend on the brightness the disk is painted at: a pick on a black
+/// disk still picks a hue.
+pub(crate) fn color_wheel_pick_at(rect: LogicalRect, x: f32, y: f32) -> Option<(f32, f32)> {
     let geometry = color_wheel_geometry(rect);
     let dx = x - geometry.cx;
     let dy = y - geometry.cy;
@@ -766,16 +892,13 @@ pub(crate) fn color_wheel_rgb_at(rect: LogicalRect, x: f32, y: f32, value: f32) 
         return None;
     }
     let hue = dx.atan2(-dy).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
-    let saturation = (distance / geometry.r).min(1.0);
-    Some(crate::widget::hsv_to_rgb(hue, saturation, value))
+    Some((hue, (distance / geometry.r).min(1.0)))
 }
 
-/// The marker position for a committed color on the wheel in `rect` — the
-/// exact inverse of [`color_wheel_rgb_at`]'s polar mapping (value is projected
-/// onto the full-value disk, so a dark pick still marks its hue/saturation).
-pub(crate) fn color_wheel_marker_at(rect: LogicalRect, rgb: [u8; 3]) -> (f32, f32) {
+/// The marker position for `hue` and `saturation` on the wheel in `rect`:
+/// the exact inverse of [`color_wheel_pick_at`]'s polar mapping.
+pub(crate) fn color_wheel_marker_at(rect: LogicalRect, hue: f32, saturation: f32) -> (f32, f32) {
     let geometry = color_wheel_geometry(rect);
-    let (hue, saturation, _) = crate::widget::rgb_to_hsv(rgb);
     let theta = hue * std::f32::consts::TAU;
     (
         geometry.cx + geometry.r * saturation * theta.sin(),
@@ -848,6 +971,98 @@ pub(crate) struct TextFieldSpec {
     /// A parsed, truthful RGB cue for color values. Malformed values have no
     /// swatch, making invalid text visually distinct from a valid color.
     pub(crate) swatch: Option<[u8; 3]>,
+    /// Quiet words at the field's end, ahead of its swatch: a Settings field
+    /// holding an unsaved draft says "Unsaved" there, in the field it is
+    /// typed into, so the draft adds no line to its row. Paint only: the
+    /// control's description says it.
+    pub(crate) trailing_hint: Option<String>,
+    /// What a reader says after the name ([`UiContent::description`]): a
+    /// Settings row's note, why a value was refused, that a draft waits.
+    pub(crate) description: Option<String>,
+    /// A button laid over the field's end ([`TEXT_FIELD_END_BUTTON`] square,
+    /// its own node: the filter's Clear): the text stops short of it.
+    pub(crate) end_button: bool,
+}
+
+/// The room a text field's trailing hint takes, its gap included, and the
+/// hint's size: the caption rung, in the UI face.
+fn text_field_hint_width(control: &Control<TextFieldSpec>) -> f32 {
+    control.spec.trailing_hint.as_deref().map_or(0.0, |hint| {
+        crate::tray_raster::ui_text_width(hint, native_type_px(TypeStep::Caption).get())
+            + TEXT_FIELD_SWATCH_GAP
+    })
+}
+
+/// The side of the button a field keeps room for at its end
+/// ([`TextFieldSpec::end_button`]), and the gap before it.
+pub(crate) const TEXT_FIELD_END_BUTTON: f32 = 20.0;
+pub(crate) const TEXT_FIELD_END_BUTTON_GAP: f32 = 4.0;
+
+/// THE WORDS AN EMPTY FIELD SHOWS, FITTED TO ITS BOX: whole where they fit
+/// `room` (at `px` in `face`); else without a trailing " (default)" — the
+/// quiet tint already says the value is unset, and the semantic value keeps
+/// the words — else elided, never cut mid-glyph.
+fn fit_placeholder_to(
+    placeholder: &str,
+    room: f32,
+    px: f32,
+    face: crate::widget::TextFace,
+) -> String {
+    let fits = |text: &str| visual_text_width(text, px, face) <= room + 0.01;
+    if fits(placeholder) {
+        return placeholder.to_string();
+    }
+    let plain = placeholder
+        .strip_suffix(" (default)")
+        .unwrap_or(placeholder);
+    if fits(plain) {
+        return plain.to_string();
+    }
+    elide_text_label(plain, room, px, face)
+}
+
+/// A field's placeholder fitted to the text box its geometry gives it: the
+/// painter's safety net ([`fit_placeholder_to`]). A page fits it when it is
+/// authored ([`fit_native_field_placeholder`]), so the audit, which compares
+/// this with the authored words, reports a placeholder nobody fitted.
+fn fitted_placeholder(
+    control: &Control<TextFieldSpec>,
+    geometry: &TextFieldGeometry,
+    px: f32,
+) -> String {
+    let face = if control.style == StyleRef::Code {
+        crate::widget::TextFace::Mono
+    } else {
+        crate::widget::TextFace::Ui
+    };
+    fit_placeholder_to(
+        control.spec.placeholder.as_deref().unwrap_or_default(),
+        (geometry.text_right - geometry.text_x).max(0.0),
+        px,
+        face,
+    )
+}
+
+/// `placeholder` fitted, when it is authored, to a text field `field_width`
+/// points wide that does (`swatch`) or does not draw a color swatch: the
+/// text box [`text_field_geometry`] gives an empty field, at the field's
+/// size in the UI face ([`fit_placeholder_to`]).
+pub(crate) fn fit_native_field_placeholder(
+    placeholder: &str,
+    field_width: f32,
+    swatch: bool,
+) -> String {
+    let swatch_space = if swatch {
+        TEXT_FIELD_SWATCH_SIZE + TEXT_FIELD_SWATCH_GAP
+    } else {
+        0.0
+    };
+    fit_placeholder_to(
+        placeholder,
+        (field_width - 2.0 * TEXT_FIELD_HORIZONTAL_PADDING - swatch_space).max(0.0),
+        native_type_px(TypeStep::Secondary).get(),
+        crate::widget::TextFace::Ui,
+    )
 }
 
 fn text_field_visual_text(control: &Control<TextFieldSpec>) -> &str {
@@ -863,9 +1078,13 @@ fn text_field_visual_text(control: &Control<TextFieldSpec>) -> &str {
     )
 }
 
-const TEXT_FIELD_HORIZONTAL_PADDING: f32 = 10.0;
-const TEXT_FIELD_SWATCH_SIZE: f32 = 22.0;
-const TEXT_FIELD_SWATCH_GAP: f32 = 8.0;
+/// Where a text button's (and a disclosure row's) label starts from its own
+/// left edge. A list that sets rows of words beside such buttons starts its
+/// words here too, so the column has one left edge.
+pub(crate) const BUTTON_LABEL_INSET: f32 = 10.0;
+pub(crate) const TEXT_FIELD_HORIZONTAL_PADDING: f32 = 10.0;
+pub(crate) const TEXT_FIELD_SWATCH_SIZE: f32 = 22.0;
+pub(crate) const TEXT_FIELD_SWATCH_GAP: f32 = 8.0;
 const TEXT_FIELD_GEOMETRY_BYTES: usize = 8 * 1024;
 
 /// The horizontally windowed source interval and exact painted text band for a
@@ -877,6 +1096,60 @@ pub(crate) struct TextFieldGeometry {
     pub(crate) text_x: f32,
     pub(crate) text_right: f32,
     pub(crate) visible: std::ops::Range<usize>,
+    /// A field not being edited whose value is wider than it shows what it
+    /// cuts as an ellipsis ([`TEXT_FIELD_ELLIPSIS`]): before the value's end
+    /// for a path (`lead`, so the file's name shows), after its start
+    /// otherwise (`trail`). `text_x` already stands after a leading one.
+    pub(crate) ellipsis: TextFieldEllipsis,
+}
+
+/// Where a field not being edited marks the part of its value it cannot
+/// show ([`TextFieldGeometry::ellipsis`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TextFieldEllipsis {
+    /// The value shows whole, or the field is being edited.
+    #[default]
+    None,
+    /// "…" then the value's end: a path, whose file name is its end.
+    Lead,
+    /// The value's start then "…".
+    Trail,
+}
+
+/// The mark a field draws for the part of its value it cannot show.
+pub(crate) const TEXT_FIELD_ELLIPSIS: &str = "…";
+
+/// Whether a field's value reads as a filesystem path, whose end (the file's
+/// name) says more than its start: `/…`, `~/…`, `C:\…`, `\\server\…`.
+fn reads_as_path(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    text.starts_with('/')
+        || text.starts_with("~/")
+        || text.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
+}
+
+/// How wide a field with no colour chip must be to show `words` whole.
+pub(crate) fn text_field_width_for_text(words: &str) -> f32 {
+    let size = native_type_px(TypeStep::Secondary).get();
+    crate::tray_raster::ui_text_width(words, size) + 2.0 * TEXT_FIELD_HORIZONTAL_PADDING
+}
+
+/// The width a text field needs to show `words` whole, its insets and, with
+/// `swatch`, its colour swatch included: the width the fit audit holds it to.
+/// A row that would squeeze the field narrower lays its neighbours out on
+/// another line instead.
+pub(crate) fn text_field_width_for(words: &str, swatch: bool) -> f32 {
+    let size = native_type_px(TypeStep::Secondary).get();
+    let swatch = if swatch {
+        TEXT_FIELD_SWATCH_SIZE + TEXT_FIELD_SWATCH_GAP
+    } else {
+        0.0
+    };
+    crate::tray_raster::ui_text_width(words, size) + 2.0 * TEXT_FIELD_HORIZONTAL_PADDING + swatch
 }
 
 pub(crate) fn text_field_geometry(
@@ -890,7 +1163,17 @@ pub(crate) fn text_field_geometry(
     } else {
         0.0
     };
-    let text_right = (rect.right() - TEXT_FIELD_HORIZONTAL_PADDING - swatch_space).max(text_x);
+    let button_space = if control.spec.end_button {
+        TEXT_FIELD_END_BUTTON + TEXT_FIELD_END_BUTTON_GAP
+    } else {
+        0.0
+    };
+    let text_right = (rect.right()
+        - TEXT_FIELD_HORIZONTAL_PADDING
+        - swatch_space
+        - button_space
+        - text_field_hint_width(control))
+    .max(text_x);
     let available = (text_right - text_x).max(0.0);
     let text = text_field_visual_text(control);
     if text.is_empty() || available <= 0.0 {
@@ -898,10 +1181,57 @@ pub(crate) fn text_field_geometry(
             text_x,
             text_right,
             visible: 0..0,
+            ellipsis: TextFieldEllipsis::None,
         };
     }
 
     let focused = control.state.focused && control.spec.input.is_some();
+    // NOT BEING EDITED AND TOO WIDE: the field says what it cuts with an
+    // ellipsis, and a path keeps its end (the file's name) rather than its
+    // start. Editing scrolls the value under the caret instead.
+    if !focused && crate::tray_raster::ui_text_width(text, text_px) > available {
+        let mark = crate::tray_raster::ui_text_width(TEXT_FIELD_ELLIPSIS, text_px);
+        let room = (available - mark).max(0.0);
+        if reads_as_path(text) {
+            let scan_start = grapheme_boundary_at_or_before(
+                text,
+                text.len().saturating_sub(TEXT_FIELD_GEOMETRY_BYTES),
+            );
+            let mut start = text.len();
+            let boundaries = text[scan_start..]
+                .grapheme_indices()
+                .map(|(offset, _)| scan_start + offset)
+                .collect::<Vec<_>>();
+            for candidate in boundaries.into_iter().rev() {
+                if crate::tray_raster::ui_text_width(&text[candidate..], text_px) > room {
+                    break;
+                }
+                start = candidate;
+            }
+            return TextFieldGeometry {
+                text_x: text_x + mark,
+                text_right,
+                visible: start..text.len(),
+                ellipsis: TextFieldEllipsis::Lead,
+            };
+        }
+        let scan_end =
+            grapheme_boundary_at_or_before(text, TEXT_FIELD_GEOMETRY_BYTES.min(text.len()));
+        let mut end = 0;
+        for (offset, grapheme) in text[..scan_end].grapheme_indices() {
+            let candidate = offset + grapheme.len();
+            if crate::tray_raster::ui_text_width(&text[..candidate], text_px) > room {
+                break;
+            }
+            end = candidate;
+        }
+        return TextFieldGeometry {
+            text_x,
+            text_right,
+            visible: 0..end,
+            ellipsis: TextFieldEllipsis::Trail,
+        };
+    }
     let anchor = if focused {
         control
             .spec
@@ -972,6 +1302,7 @@ pub(crate) fn text_field_geometry(
         text_x,
         text_right,
         visible: start..end,
+        ellipsis: TextFieldEllipsis::None,
     }
 }
 
@@ -1269,8 +1600,16 @@ pub(crate) fn text_viewport_geometry_at_scale(
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct EditorShellMetrics {
     pub(crate) outer_padding: f32,
-    pub(crate) compact_commands: bool,
+    /// A narrow window's denser toolbar rhythm (gap and button height). Not a
+    /// layout switch: which buttons share a row is the toolbar plan's
+    /// ([`plan_editor_toolbar`]).
+    pub(crate) dense_commands: bool,
     pub(crate) command_gap: f32,
+    /// The toolbar's width: the buttons flow into rows of it.
+    pub(crate) command_bar_width: f32,
+    /// Rows the toolbar plan fills.
+    pub(crate) command_rows: usize,
+    pub(crate) command_button_height: f32,
     pub(crate) command_bar_height: f32,
     pub(crate) content_gap: f32,
     pub(crate) palette_padding: f32,
@@ -1303,16 +1642,182 @@ impl From<usize> for EditorPalette {
     }
 }
 
+/// What the editor's toolbar holds beyond its fixed commands — the facts the
+/// view and the host both read, so the rows the view draws and the file rows
+/// the host sizes the caret for come out of one plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EditorToolbar {
+    /// Previous and Next config problem: a config file with findings.
+    pub(crate) problem_navigation: bool,
+    /// Reload in Commands' place: the file changed on disk under local edits.
+    pub(crate) reload: bool,
+}
+
+/// One button of the editor's toolbar: its key, its words (the long form,
+/// and a shorter real word where one exists), and where it stands in the
+/// order buttons give way when even short words need more rows than the bar
+/// allows (`None`: it never does).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EditorToolbarItem {
+    pub(crate) key: &'static str,
+    pub(crate) long: &'static str,
+    pub(crate) short: &'static str,
+    /// Lower gives way first. Only commands `M-x` also lists give way.
+    pub(crate) yields: Option<u8>,
+}
+
+/// The toolbar's buttons, in reading order.
+pub(crate) fn editor_toolbar_items(toolbar: EditorToolbar) -> Vec<EditorToolbarItem> {
+    let item = |key, long, short, yields| EditorToolbarItem {
+        key,
+        long,
+        short,
+        yields,
+    };
+    let mut items = vec![
+        item("editor/save-button", "Save", "Save", None),
+        item("editor/undo-button", "Undo", "Undo", None),
+        item("editor/redo-button", "Redo", "Redo", Some(0)),
+        item("editor/find-button", "Find", "Find", Some(2)),
+        item(
+            "editor/goto-line-button",
+            "Go to Line",
+            "Go to Line",
+            Some(1),
+        ),
+        if toolbar.reload {
+            item("editor/revert-button", "Reload", "Reload", None)
+        } else {
+            item("editor/commands-button", "Commands", "Commands", None)
+        },
+    ];
+    if toolbar.problem_navigation {
+        items.push(item(
+            "editor/config-problem-previous-button",
+            "Prev Issue",
+            "Prev",
+            None,
+        ));
+        items.push(item(
+            "editor/config-problem-next-button",
+            "Next Issue",
+            "Next",
+            None,
+        ));
+    }
+    items
+}
+
+/// A toolbar button's width for `label`: its words and padding, never under
+/// the touch minimum.
+pub(crate) fn editor_toolbar_button_width(label: &str) -> f32 {
+    (native_button_label_width(label) + 28.0).max(56.0)
+}
+
+/// The rows the editor's toolbar draws: each a run of `(key, words, width)`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct EditorToolbarPlan {
+    pub(crate) rows: Vec<Vec<(&'static str, &'static str, f32)>>,
+}
+
+/// The most rows the toolbar takes before buttons give way.
+pub(crate) const EDITOR_TOOLBAR_MAX_ROWS: usize = 3;
+
+/// THE EDITOR TOOLBAR, MEASURED: `items` flow in order into rows of
+/// `bar_width` at their own widths. The fewest rows the bar can hold them in
+/// win; within them every button keeps its long words where it can, the last
+/// buttons taking their short words first. Only where even short words need
+/// more than [`EDITOR_TOOLBAR_MAX_ROWS`] rows do the buttons whose commands
+/// `M-x` also lists give way, in their `yields` order. A label is never cut
+/// to make a row fit.
+pub(crate) fn plan_editor_toolbar(
+    items: &[EditorToolbarItem],
+    bar_width: f32,
+    gap: f32,
+) -> EditorToolbarPlan {
+    let flow = |chosen: &[(usize, &'static str)]| {
+        let mut rows: Vec<Vec<(&'static str, &'static str, f32)>> = Vec::new();
+        let mut used = 0.0_f32;
+        for &(index, label) in chosen {
+            let width = editor_toolbar_button_width(label);
+            match rows.last_mut() {
+                Some(row) if used + gap + width <= bar_width + 0.01 => {
+                    row.push((items[index].key, label, width));
+                    used += gap + width;
+                }
+                _ => {
+                    rows.push(vec![(items[index].key, label, width)]);
+                    used = width;
+                }
+            }
+        }
+        rows
+    };
+    let mut kept: Vec<usize> = (0..items.len()).collect();
+    loop {
+        for target in 1..=EDITOR_TOOLBAR_MAX_ROWS {
+            let mut chosen: Vec<(usize, &'static str)> = kept
+                .iter()
+                .map(|&index| (index, items[index].long))
+                .collect();
+            // Short words from the last button back, one at a time.
+            let mut next_short = chosen.len();
+            loop {
+                let rows = flow(&chosen);
+                if rows.len() <= target {
+                    return EditorToolbarPlan { rows };
+                }
+                let Some(at) = (0..next_short)
+                    .rev()
+                    .find(|&at| items[chosen[at].0].short != chosen[at].1)
+                else {
+                    break;
+                };
+                chosen[at].1 = items[chosen[at].0].short;
+                next_short = at;
+            }
+        }
+        // Even short words need more rows: the next button that yields goes.
+        let yielding = kept
+            .iter()
+            .enumerate()
+            .filter_map(|(at, &index)| items[index].yields.map(|rank| (rank, at)))
+            .min();
+        match yielding {
+            Some((_, at)) => {
+                kept.remove(at);
+            }
+            None => {
+                // Nothing left to give way: as many rows as the words need.
+                let chosen: Vec<(usize, &'static str)> = kept
+                    .iter()
+                    .map(|&index| (index, items[index].short))
+                    .collect();
+                return EditorToolbarPlan {
+                    rows: flow(&chosen),
+                };
+            }
+        }
+    }
+}
+
 pub(crate) fn editor_shell_metrics(
     viewport: LogicalRect,
     palette: impl Into<EditorPalette>,
+    toolbar: EditorToolbar,
 ) -> EditorShellMetrics {
-    editor_shell_metrics_at_scale(viewport, palette, crate::native_appearance::text_scale())
+    editor_shell_metrics_at_scale(
+        viewport,
+        palette,
+        toolbar,
+        crate::native_appearance::text_scale(),
+    )
 }
 
 pub(crate) fn editor_shell_metrics_at_scale(
     viewport: LogicalRect,
     palette: impl Into<EditorPalette>,
+    toolbar: EditorToolbar,
     text_scale: f32,
 ) -> EditorShellMetrics {
     let palette = palette.into();
@@ -1326,7 +1831,7 @@ pub(crate) fn editor_shell_metrics_at_scale(
         1.0
     };
     let chrome_scale = text_scale.min(1.35);
-    let compact_commands = viewport.width < 390.0 * text_scale.min(1.4);
+    let dense_commands = viewport.width < 390.0 * text_scale.min(1.4);
     let short = viewport.height < 440.0 * text_scale.min(1.2);
     let outer_padding = if short {
         6.0 * chrome_scale
@@ -1335,21 +1840,27 @@ pub(crate) fn editor_shell_metrics_at_scale(
     } else {
         16.0 * chrome_scale
     };
-    let command_gap = if compact_commands {
+    let command_gap = if dense_commands {
         4.0 * chrome_scale
     } else {
         6.0 * chrome_scale
     };
-    let command_button_height = if compact_commands {
+    let command_button_height = if dense_commands {
         (34.0 * text_scale).clamp(34.0, 48.0)
     } else {
         (36.0 * text_scale).clamp(36.0, 48.0)
     };
-    let command_bar_height = if compact_commands {
-        command_button_height * 2.0 + command_gap
-    } else {
-        command_button_height
-    };
+    let command_bar_width = (viewport.width - outer_padding * 2.0).max(0.0);
+    let command_rows = plan_editor_toolbar(
+        &editor_toolbar_items(toolbar),
+        command_bar_width,
+        command_gap,
+    )
+    .rows
+    .len()
+    .max(1);
+    let command_bar_height =
+        command_button_height * command_rows as f32 + command_gap * (command_rows - 1) as f32;
     let content_gap = 8.0 * chrome_scale;
     let palette_padding = 6.0 * chrome_scale;
     let palette_header_height = (28.0 * text_scale).clamp(28.0, 40.0);
@@ -1395,8 +1906,11 @@ pub(crate) fn editor_shell_metrics_at_scale(
     };
     EditorShellMetrics {
         outer_padding,
-        compact_commands,
+        dense_commands,
         command_gap,
+        command_bar_width,
+        command_rows,
+        command_button_height,
         command_bar_height,
         content_gap,
         palette_padding,
@@ -1423,16 +1937,23 @@ const MINIMUM_EDITOR_DOCUMENT_ROWS: usize = 6;
 pub(crate) fn editor_text_viewport_rect_with_palette(
     viewport: LogicalRect,
     palette: impl Into<EditorPalette>,
+    toolbar: EditorToolbar,
 ) -> LogicalRect {
-    editor_text_viewport_rect_at_scale(viewport, palette, crate::native_appearance::text_scale())
+    editor_text_viewport_rect_at_scale(
+        viewport,
+        palette,
+        toolbar,
+        crate::native_appearance::text_scale(),
+    )
 }
 
 fn editor_text_viewport_rect_at_scale(
     viewport: LogicalRect,
     palette: impl Into<EditorPalette>,
+    toolbar: EditorToolbar,
     text_scale: f32,
 ) -> LogicalRect {
-    let metrics = editor_shell_metrics_at_scale(viewport, palette, text_scale);
+    let metrics = editor_shell_metrics_at_scale(viewport, palette, toolbar, text_scale);
     let gaps = if metrics.palette_height <= 0.0 {
         1.0
     } else {
@@ -1458,9 +1979,11 @@ fn editor_text_viewport_rect_at_scale(
 pub(crate) fn editor_visible_line_capacity_with_palette(
     viewport: LogicalRect,
     palette: impl Into<EditorPalette>,
+    toolbar: EditorToolbar,
 ) -> usize {
-    let geometry =
-        text_viewport_geometry(editor_text_viewport_rect_with_palette(viewport, palette));
+    let geometry = text_viewport_geometry(editor_text_viewport_rect_with_palette(
+        viewport, palette, toolbar,
+    ));
     whole_editor_rows(&geometry)
 }
 
@@ -1469,9 +1992,11 @@ pub(crate) fn editor_visible_line_capacity_with_palette(
 pub(crate) fn editor_painted_line_capacity_with_palette(
     viewport: LogicalRect,
     palette: impl Into<EditorPalette>,
+    toolbar: EditorToolbar,
 ) -> usize {
-    let geometry =
-        text_viewport_geometry(editor_text_viewport_rect_with_palette(viewport, palette));
+    let geometry = text_viewport_geometry(editor_text_viewport_rect_with_palette(
+        viewport, palette, toolbar,
+    ));
     ((geometry.body_h / geometry.line_h).ceil() as usize)
         .saturating_add(1)
         .clamp(1, 256)
@@ -1553,32 +2078,47 @@ pub(crate) enum UiContent {
     /// Paint is lowered from the same semantic node as accessibility and
     /// introspection; no PTY, platform widget, or web surface is involved.
     SettingsPreview(Box<crate::settings_preview::SettingsPreviewSpec>),
+    ColorWheel(Control<ColorWheelSpec>),
     Custom(AuditedCustomNode),
 }
 
 impl UiContent {
+    /// Whether a pointer press on this control waits for a look
+    /// ([`Control::look_first`]).
+    fn look_first(&self) -> bool {
+        match self {
+            Self::Button(control) => control.look_first,
+            Self::Switch(control) => control.look_first,
+            Self::Slider(control) => control.look_first,
+            Self::TextField(control) => control.look_first,
+            _ => false,
+        }
+    }
+
+    /// The words this control's value reads as, where they are not its
+    /// bare value: a slider's painted readout, with its unit
+    /// ([`SliderSpec::display_value`]). Every observer that says the value
+    /// says these words ([`SemanticNode::value_text`]).
+    pub(crate) fn value_text(&self) -> Option<String> {
+        match self {
+            Self::Slider(control) => {
+                let readout = control.spec.display_value.trim();
+                (!readout.is_empty()).then(|| readout.to_string())
+            }
+            _ => None,
+        }
+    }
+
     /// The control's description, where it authored one (ruling 267).
     fn description(&self) -> Option<String> {
         match self {
             Self::Button(control) => control.spec.description.clone(),
             Self::Switch(control) => control.spec.description.clone(),
+            Self::Slider(control) => control.spec.description.clone(),
+            Self::TextField(control) => control.spec.description.clone(),
             _ => None,
         }
         .filter(|description| !description.trim().is_empty())
-    }
-
-    /// A SURFACE: a button that paints no words or pictogram of its own (a
-    /// theme card's frame, a Cursor Styles row's wash), its words drawn over
-    /// it by other nodes. Where a peek over a list's top cuts it, it is the
-    /// card or row the peek shows, not a button to press, so it stays drawn
-    /// ([`UiNode::peek_above`]).
-    fn is_surface(&self) -> bool {
-        matches!(
-            self,
-            Self::Button(control)
-                if control.spec.visual_label.as_deref() == Some("")
-                    && control.spec.visual_icon.is_none()
-        )
     }
 
     fn semantic(&self) -> SemanticProjection {
@@ -1612,6 +2152,9 @@ impl UiContent {
             }
             Self::TextField(control) => {
                 control_projection(SemanticRole::TextField, &control.spec.label, control)
+            }
+            Self::ColorWheel(control) => {
+                control_projection(SemanticRole::Button, &control.spec.label, control)
             }
             Self::RichText(spec) => SemanticProjection {
                 role: SemanticRole::RichText,
@@ -1686,7 +2229,7 @@ fn control_projection<T>(
     control: &Control<T>,
 ) -> SemanticProjection {
     SemanticProjection {
-        role,
+        role: control.role.unwrap_or(role),
         label: label.to_string(),
         value: control.value.clone(),
         state: Some(control.state),
@@ -1716,14 +2259,40 @@ pub(crate) struct UiNode {
     /// projection. This is reserved for responsive visual copies whose parent
     /// already carries the complete semantic label.
     pub(crate) paint_only: bool,
-    /// This subtree is a scrolling list's PEEK ([`Self::peek`]).
+    /// This subtree is cut on purpose by an edge that is not a list's
+    /// ([`Self::peek`]).
     pub(crate) peek: bool,
-    /// This node (not its children) is cut by a list's edge on purpose
-    /// ([`Self::cut`]).
-    pub(crate) cut: bool,
-    /// This subtree is a peek over a list's top edge ([`Self::peek_above`]).
-    pub(crate) peek_above: bool,
+    /// This node is a scrolling list and this its ROOM ([`Self::room`]).
+    pub(crate) room: Option<ListRoom>,
+    /// This subtree is a list's row off its screen ([`Self::offscreen`]).
+    pub(crate) offscreen: bool,
+    /// This group is a SEGMENTED CONTROL ([`Self::segmented`]).
+    pub(crate) segmented: bool,
 }
+
+/// A scrolling list's ROOM ([`UiNode::room`]): the height from its top where
+/// it shows its stops — the room a status bar leaves it — and whether the
+/// strip under that, which the page keeps for a bar that is not up, holds the
+/// peek of a list that goes on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ListRoom {
+    pub(crate) height: f32,
+    pub(crate) fades: bool,
+    /// The list holds every row it has in the accessibility and control
+    /// trees: the rows it does not draw are its rows [`UiNode::offscreen`],
+    /// and a node of a row it draws that its room does not show — cut away
+    /// by its edge, or a picture in the strip under its room — is in the
+    /// tree off its screen too, with its whole bounds, never hit or in the
+    /// Tab order.
+    pub(crate) lists_all: bool,
+}
+
+/// How opaque a list's peek is where its strip begins ([`ListRoom::fades`]),
+/// and at the strip's end: it fades from the one to the other, eased out, so
+/// nothing steps at the room's edge and a control under it reads at once as
+/// going out of view, never as one to press.
+const LIST_FADE_FROM: f32 = 1.0;
+const LIST_FADE_TO: f32 = 0.0;
 
 impl UiNode {
     pub(crate) fn new(key: impl Into<Arc<str>>, content: UiContent) -> Self {
@@ -1734,9 +2303,25 @@ impl UiNode {
             children: Vec::new(),
             paint_only: false,
             peek: false,
-            cut: false,
-            peek_above: false,
+            room: None,
+            offscreen: false,
+            segmented: false,
         }
+    }
+
+    /// A SEGMENTED CONTROL: this group's control children are one choice,
+    /// one control to the keyboard. The compiler makes them ONE Tab stop —
+    /// the focused segment, else the selected one, else the first enabled
+    /// ([`CompiledUi::focus_order`]) — and records the group
+    /// ([`CompiledUi::segment_groups`]): Left and Right move the keyboard
+    /// between its segments ([`CompiledUi::segment_step`]) and Return or
+    /// Space chooses the one it is on (its own action), as a platform
+    /// segmented control does. Every segment stays in the tree and the hit
+    /// regions, so a screen reader, a click and automation reach each one,
+    /// under the group's one label.
+    pub(crate) fn segmented(mut self) -> Self {
+        self.segmented = true;
+        self
     }
 
     pub(crate) fn layout(mut self, layout: Layout) -> Self {
@@ -1754,40 +2339,57 @@ impl UiNode {
         self
     }
 
-    /// Mark this subtree a scrolling list's PEEK: the part of the list's next
-    /// stop drawn after its screen, cut at the list's edge so the reader sees
-    /// the list goes on. A node of it that shows whole is live — a control
-    /// painted whole is never dead to the pointer, the keyboard or a screen
-    /// reader, and focusing it scrolls its stop into view — while what the
-    /// edge cuts is a picture of what scrolling shows, never a sliver of a
-    /// target. Its cut is the point, so the paint audit does not count its
-    /// nodes as clipped; every other clip still counts.
+    /// [`Self::paint_only`] for this node and everything under it: a
+    /// decorative face whose words and marks its parent's control already
+    /// carries, so no part of it reaches the accessibility or controls tree
+    /// (`paint_only` alone hides the one node, never its children).
+    pub(crate) fn paint_only_tree(mut self) -> Self {
+        self.paint_only = true;
+        self.children = self
+            .children
+            .into_iter()
+            .map(Self::paint_only_tree)
+            .collect();
+        self
+    }
+
+    /// Mark this subtree as cut on purpose by an edge of its own (a pager's
+    /// window of options): the paint audit does not count its nodes as
+    /// clipped, every other clip still counts. A scrolling list's edges need
+    /// no mark ([`Self::room`]).
     pub(crate) fn peek(mut self) -> Self {
         self.peek = true;
         self
     }
 
-    /// Mark this node — a card whose last rows are a list's peek — as cut
-    /// by the list's edge on purpose. Unlike [`Self::peek`] it marks only
-    /// itself: its children are audited as ever.
-    pub(crate) fn cut(mut self) -> Self {
-        self.cut = true;
+    /// Make this clipped column a scrolling list whose ROOM is the first
+    /// `height` of it (THE LIST'S EDGE RULE). Whatever part of a node shows
+    /// inside the room is live — read out, in the Tab order, answering the
+    /// pointer over exactly what shows — whole or cut by either edge, as in
+    /// any native scroll view; a press on one an edge cuts scrolls its stop
+    /// into view ([`crate::native_settings`]'s reveal). What the list draws
+    /// past its room, in the strip the page keeps for a status bar that is not
+    /// up, is a picture: never live, so a bar that comes takes nothing a
+    /// person can press, and where the list goes on (`fades`) drawn fading
+    /// out, so nothing there reads as a control to press. A list's edges cut
+    /// on purpose: the paint audit counts no node they cut, or the strip
+    /// holds, as clipped.
+    pub(crate) fn room(mut self, height: f32, fades: bool) -> Self {
+        self.room = Some(ListRoom {
+            height,
+            fades,
+            lists_all: false,
+        });
         self
     }
 
-    /// [`Self::peek`] for a row drawn over a list's TOP edge: the stop before
-    /// a list's last screen, which fills that screen. Where the edge cuts the
-    /// row none of it is live, a control it still shows whole included: the
-    /// edge takes a row's top first — its label — so a control left whole
-    /// under it would answer without the words that say what it does. Nor is
-    /// such a control drawn: a control is whole and live or not shown, so the
-    /// peek's words and card say the list goes on and no dead button reads
-    /// as one to press. A surface button (a theme card's frame, whose tile
-    /// and words are other nodes) is the card itself, and is drawn. A row it
-    /// shows whole is live, as a peek is.
-    pub(crate) fn peek_above(mut self) -> Self {
-        self.peek = true;
-        self.peek_above = true;
+    /// Mark this subtree a scrolling list's row OFF ITS SCREEN: laid out
+    /// where scrolling would bring it, and in the accessibility and control
+    /// trees there with its whole bounds, so a screen reader and `controls`
+    /// see every row the list holds — but never painted, hit or in the Tab
+    /// order: what is not on screen answers no pointer and takes no focus.
+    pub(crate) fn offscreen(mut self) -> Self {
+        self.offscreen = true;
         self
     }
 }
@@ -1834,6 +2436,7 @@ impl UiTree {
                 UiContent::Switch(control) => Some(&mut control.state),
                 UiContent::Slider(control) => Some(&mut control.state),
                 UiContent::TextField(control) => Some(&mut control.state),
+                UiContent::ColorWheel(control) => Some(&mut control.state),
                 UiContent::Group(_)
                 | UiContent::Text(_)
                 | UiContent::RichText(_)
@@ -1850,7 +2453,11 @@ impl UiTree {
             };
             if let Some(state) = state {
                 let is = |target: Option<&UiKey>| target == Some(key);
-                state.focused = is(focus);
+                // A control that cannot be pressed is never painted focused: one
+                // that disabled itself under the keyboard (a pager's Older at its
+                // end, s-25) left the focus order, and a ring on it would claim
+                // a focus Tab cannot reach.
+                state.focused = is(focus) && state.enabled;
                 state.hovered = is(hovered);
                 state.pressed = is(pressed) && state.hovered;
                 state.focus_visible = state.focused && focus_visible;
@@ -1878,6 +2485,7 @@ impl UiTree {
         }
         let mut compiler = Compiler {
             seen: FxHashSet::default(),
+            not_tab_stops: FxHashSet::default(),
             output: CompiledUi {
                 bounds: viewport,
                 ..CompiledUi::default()
@@ -1898,7 +2506,7 @@ impl UiTree {
             node.children.iter().find_map(find_default)
         }
         let default_action = find_default(&self.root);
-        compiler.node(self.root, viewport, viewport, None, false, false)?;
+        compiler.node(self.root, viewport, viewport, None, false, None)?;
         compiler.output.default_action = default_action;
         Ok(compiler.output)
     }
@@ -1910,16 +2518,31 @@ pub(crate) struct PaintNode {
     pub(crate) rect: LogicalRect,
     pub(crate) clip: LogicalRect,
     pub(crate) content: UiContent,
-    /// Part of a scrolling list's peek ([`UiNode::peek`]): cut on purpose.
+    /// Cut on purpose: by a scrolling list's edge, drawn in the strip under
+    /// its room ([`UiNode::room`]), or marked so ([`UiNode::peek`]).
     pub(crate) peek: bool,
+    /// The band, top to bottom, over which this node fades: the strip under a
+    /// scrolling list's room where the list goes on ([`ListRoom::fades`]).
+    pub(crate) fade: Option<(f32, f32)>,
 }
 
 impl PaintNode {
     /// Whether an ancestor clip removes a perceptible part of this node by
     /// accident: a peek's cut is deliberate.
-    fn clipped(&self) -> bool {
+    pub(crate) fn clipped(&self) -> bool {
         !self.peek && materially_clipped(self.rect, self.clip)
     }
+}
+
+/// What a node inside a scrolling list inherits from it ([`UiNode::room`]).
+#[derive(Clone, Copy, Debug)]
+struct ListContext {
+    /// The list's room on screen: where what it draws is live.
+    room: LogicalRect,
+    /// The strip under the room where the list fades, top to bottom.
+    fade: Option<(f32, f32)>,
+    /// The list holds every row in the tree ([`ListRoom::lists_all`]).
+    lists_all: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1927,6 +2550,8 @@ pub(crate) struct HitRegion {
     pub(crate) key: UiKey,
     pub(crate) rect: LogicalRect,
     pub(crate) action: ActionId,
+    /// A pointer press here waits for a look ([`Control::look_first`]).
+    pub(crate) look_first: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1945,6 +2570,13 @@ pub(crate) struct SemanticNode {
     /// only, so no observer saw it (design ruling 267): every observer —
     /// the accessibility projection and `inspect … tree` — reads it here.
     pub(crate) description: Option<String>,
+    /// A list's row off its screen ([`UiNode::offscreen`]): in the tree at
+    /// the bounds scrolling would give it, with nothing painted or hit.
+    pub(crate) offscreen: bool,
+    /// The words a numeric value reads as, where they are not the bare
+    /// number ([`UiContent::value_text`]): a slider's readout with its unit
+    /// ("12 px"), so a screen reader hears what the control paints.
+    pub(crate) value_text: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1968,9 +2600,36 @@ pub(crate) struct CompiledUi {
     /// the call site, and Space never falls back to this (Space activates only
     /// the focused control on macOS).
     pub(crate) default_action: Option<(UiKey, ActionId)>,
+    /// Every segmented control ([`UiNode::segmented`]): its group's key and
+    /// its segments, in order.
+    pub(crate) segment_groups: Vec<SegmentGroup>,
+}
+
+/// One segmented control as compiled ([`UiNode::segmented`]).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SegmentGroup {
+    pub(crate) key: UiKey,
+    pub(crate) segments: Vec<UiKey>,
 }
 
 impl CompiledUi {
+    /// THE ARROW MODEL OF A SEGMENTED CONTROL: from segment `key`, `step`
+    /// segments on (Left -1, Right 1), stopping at its ends. `None` where
+    /// `key` is no segment; `Some(None)` at the end it would pass, where the
+    /// arrow is still the control's and moves nothing.
+    pub(crate) fn segment_step(&self, key: &UiKey, step: isize) -> Option<Option<UiKey>> {
+        let group = self
+            .segment_groups
+            .iter()
+            .find(|group| group.segments.contains(key))?;
+        let at = group.segments.iter().position(|segment| segment == key)?;
+        Some(
+            at.checked_add_signed(step)
+                .and_then(|target| group.segments.get(target))
+                .cloned(),
+        )
+    }
+
     /// The focused input's visible caret, in this retained leaf's logical
     /// pixels. Uses the same geometry as paint; a clipped or unfocused caret
     /// cannot anchor an OS candidate window over unrelated content.
@@ -2036,24 +2695,25 @@ impl CompiledUi {
     }
 
     /// Snap one pointer position through the exact HSV disk painted for `key`
-    /// (the Tab Color wheel — a [`UiContent::Custom`] node whose `audit_id` is
-    /// [`TAB_COLOR_WHEEL_AUDIT`]). Returns the picked `[r, g, b]` only for a
-    /// point INSIDE the disk, using the SAME polar-hue math the rasterizer
-    /// paints (`tray_raster::hsv_disk`), so the committed color and the pixel
-    /// under the pointer can never disagree. Anywhere else (including the
-    /// node's corners outside the disk) is `None` — a miss, not a pick.
-    pub(crate) fn color_wheel_color_at(&self, key: &UiKey, x: f32, y: f32) -> Option<[u8; 3]> {
+    /// (a [`UiContent::ColorWheel`]): the hue and saturation under it, only
+    /// for a point INSIDE the disk of a wheel that takes a pick, using the
+    /// SAME polar-hue math the rasterizer paints (`tray_raster::hsv_disk`), so
+    /// the committed colour and the pixel under the pointer can never
+    /// disagree. Anywhere else (including the node's corners outside the disk)
+    /// is `None`: a miss, not a pick. The brightness is the picker's own, so
+    /// a pick on a black disk keeps its hue.
+    pub(crate) fn color_wheel_pick_at(&self, key: &UiKey, x: f32, y: f32) -> Option<(f32, f32)> {
         if !x.is_finite() || !y.is_finite() {
             return None;
         }
         let paint = self.paint.iter().find(|node| &node.key == key)?;
-        let UiContent::Custom(spec) = &paint.content else {
+        let UiContent::ColorWheel(control) = &paint.content else {
             return None;
         };
-        if spec.audit_id != TAB_COLOR_WHEEL_AUDIT {
+        if !control.state.enabled {
             return None;
         }
-        color_wheel_rgb_at(paint.rect, x, y, color_wheel_value(spec.value.as_deref()))
+        color_wheel_pick_at(paint.rect, x, y)
     }
 
     /// Snap one pointer x-coordinate through the exact slider track painted for
@@ -2089,9 +2749,15 @@ impl CompiledUi {
         if x < geometry.track_x || x > geometry.track_right {
             return None;
         }
+        // A drag maps over the track the bar draws, never past the domain.
+        let (low, high) = control.spec.track_span(minimum, maximum);
+        let (low, high) = (low.max(minimum), high.min(maximum));
+        if high <= low {
+            return Some(low);
+        }
         let fraction = ((x - geometry.track_x) / width).clamp(0.0, 1.0) as f64;
-        let raw = minimum + (maximum - minimum) * fraction;
-        Some(snap_slider_value(raw, minimum, maximum, control.spec.step))
+        let raw = low + (high - low) * fraction;
+        Some(snap_slider_value(raw, low, high, control.spec.step))
     }
 
     /// Resolve a pointer x-coordinate to the nearest UTF-8 grapheme boundary
@@ -2196,8 +2862,11 @@ impl CompiledUi {
                         )
                     },
                 );
+                // A row its list holds off screen says so: its rect is
+                // where scrolling puts it, over whatever shows there now.
+                let offscreen = if node.offscreen { " offscreen=true" } else { "" };
                 format!(
-                    "ui key={:?} role={:?} label={:?} value={} action={} state={} rect={:.1},{:.1},{:.1},{:.1}",
+                    "ui key={:?} role={:?} label={:?} value={} action={} state={} rect={:.1},{:.1},{:.1},{:.1}{offscreen}",
                     node.key.as_str(),
                     node.role,
                     node.label,
@@ -2404,6 +3073,9 @@ impl CompiledUi {
             node.clip.y.to_bits().hash(&mut hash);
             node.clip.width.to_bits().hash(&mut hash);
             node.clip.height.to_bits().hash(&mut hash);
+            node.fade
+                .map(|(top, bottom)| (top.to_bits(), bottom.to_bits()))
+                .hash(&mut hash);
             ui_content_kind(&node.content).hash(&mut hash);
             match &node.content {
                 UiContent::SettingsPreview(spec) => spec.paint_fingerprint().hash(&mut hash),
@@ -2453,6 +3125,14 @@ impl CompiledUi {
         let roles = crate::settings::Roles::from_theme(chrome);
         let mut prims = Vec::with_capacity(self.paint.len() * 5);
         for node in &self.paint {
+            if let Some((top, bottom)) = node.fade {
+                prims.push(crate::widget::DrawPrim::FadePush {
+                    y: top,
+                    h: bottom - top,
+                    from: LIST_FADE_FROM,
+                    to: LIST_FADE_TO,
+                });
+            }
             prims.push(crate::widget::DrawPrim::ClipPush {
                 x: node.clip.x,
                 y: node.clip.y,
@@ -2461,6 +3141,9 @@ impl CompiledUi {
             });
             paint_compiled_node(&mut prims, node, roles, theme, base_px);
             prims.push(crate::widget::DrawPrim::ClipPop);
+            if node.fade.is_some() {
+                prims.push(crate::widget::DrawPrim::FadePop);
+            }
         }
         crate::widget::TrayInput {
             prims,
@@ -2506,11 +3189,9 @@ impl CompiledUi {
                 entry.2 = Some(&node.action);
             }
         }
-        for semantic in self
-            .semantics
-            .iter()
-            .filter(|node| node.action.is_some() && node.state.is_none_or(|state| state.enabled))
-        {
+        for semantic in self.semantics.iter().filter(|node| {
+            !node.offscreen && node.action.is_some() && node.state.is_none_or(|state| state.enabled)
+        }) {
             // A key absent from the index tallies 0/0 and therefore fails the
             // same way the scans did.
             let (painted, hit, hit_action) = index.get(&semantic.key).copied().unwrap_or_default();
@@ -2709,6 +3390,7 @@ const fn ui_content_kind(content: &UiContent) -> &'static str {
         UiContent::MarkdownBlock(_) => "markdown-block",
         UiContent::TextViewport(_) => "text-viewport",
         UiContent::SettingsPreview(_) => "settings-preview",
+        UiContent::ColorWheel(_) => "color-wheel",
         UiContent::Custom(_) => "custom",
     }
 }
@@ -2779,7 +3461,7 @@ fn finish_text_fit(
 ///   because the column it is stacked in is the rail.
 /// * a TOOLBAR CHIP — a `visual_label` CENTERED in a slot the AUTHOR measured
 ///   for that exact label (`markdown_toolbar_label_width` = the REGULAR advance
-///   of the word plus a fixed pad; `compact_toolbar_leading_width` the same
+///   of the word plus a fixed pad; `compact_toolbar_leading` the same
 ///   idea), one of a group laid out along a single toolbar ROW. There is no rail
 ///   under it and no edge for anything to dock to.
 ///
@@ -2797,6 +3479,16 @@ fn navigation_is_chip(control: &Control<ButtonSpec>) -> bool {
         && control.spec.visual_label.is_some()
 }
 
+/// Whether a text button paints its `visual_label` CENTRED in its slot: a
+/// toolbar chip ([`navigation_is_chip`]) and a filter chip ([`StyleRef::Chip`]),
+/// whose authors measured the slot for the word. The painter and the fit audit
+/// read this one predicate.
+fn centres_its_label(control: &Control<ButtonSpec>) -> bool {
+    matches!(control.style, StyleRef::Navigation | StyleRef::Chip)
+        && control.spec.visual_icon.is_none()
+        && control.spec.visual_label.is_some()
+}
+
 /// Is this [`StyleRef::Navigation`] control a rail DESTINATION — one of a fixed,
 /// authored set of places the rail can go?
 ///
@@ -2806,7 +3498,8 @@ fn navigation_is_chip(control: &Control<ButtonSpec>) -> bool {
 /// set lands in, so the labels and the slot were measured against each other and
 /// the slack between them is deliberate. `route_icon` and `SettingsRoute::label`
 /// are that vocabulary — 16 members, longest `Keyboard & Input`, which clears
-/// the narrower of the two rails by 7pt in SEMIBOLD.
+/// the narrower of the two rails by 7pt in SEMIBOLD; and the Settings rail grows
+/// where a wider face would not clear it (`settings_navigation_width`).
 ///
 /// (Other `Navigation` controls carry a pictogram — the compact toolbar's
 /// leading Home/Back button, the reader's history and copy buttons — but none of
@@ -2833,6 +3526,16 @@ fn navigation_is_rail_destination(control: &Control<ButtonSpec>) -> bool {
     control.style == StyleRef::Navigation && control.spec.visual_icon.is_some()
 }
 
+/// Whether a `Navigation` row stacked in a column (not a chip) is selected the
+/// way WinUI's `NavigationView` selects one: a neutral subtle fill and a 3x16pt
+/// accent pill at its leading edge, its ink and icon unchanged. Windows only:
+/// there the accent is the user's own (`native_appearance::system_accent`), and
+/// a row washed, rimmed, inked and barred in it read as four selections at once
+/// (the 2026-10-17 audit's `accent-not-windows-accent`). The pill needs no
+/// contrast trade: the label stays the primary ink. Chips keep the accent cell
+/// a segmented control's selection is.
+const FLUENT_RAIL_SELECTION: bool = cfg!(windows);
+
 /// THE decision about what type a button's label is painted in — read by
 /// [`paint_compiled_node`], which draws it, and by [`text_fit_audit`], which
 /// measures and elides it. One function, so the repo's own paint-truth audit
@@ -2847,9 +3550,10 @@ fn navigation_is_rail_destination(control: &Control<ButtonSpec>) -> bool {
 ///
 /// THE WHOLE `Navigation` + `selected` SET, and what each member gets:
 ///
-/// * `settings/nav{path}` — the Settings rail, wide (216pt) and medium (196pt).
-///   A route pictogram always, plus the full label. SEMIBOLD, and this is the
-///   row the mark was measured on and repaired for.
+/// * `settings/nav{path}` — the Settings rail, wide (216pt) and medium (196pt),
+///   or wider where a label in SEMIBOLD needs it (the rail is sized from its
+///   labels in this face). A route pictogram always, plus the full label.
+///   SEMIBOLD, and this is the row the mark was measured on and repaired for.
 /// * `settings/categories{path}` — the compact category list, and the
 ///   side-by-side pager that shows one of it at a time. Route pictogram plus the
 ///   same 16 authored labels. SEMIBOLD.
@@ -2857,8 +3561,8 @@ fn navigation_is_rail_destination(control: &Control<ButtonSpec>) -> bool {
 ///   heading, capped at 32 characters, in a column sized for the reader. NO
 ///   semibold: it fits at rest and elides in bold, so the mark meant to say
 ///   "selected" would say it by deleting a word. It keeps the rail bar, the
-///   accent wash, the accent rim and the accent ink — every mark that costs it
-///   no width.
+///   accent wash and the accent ink — every mark that costs it no width. (No
+///   row wears an outline at rest: on a row the outline is focus's alone.)
 /// * `markdown/preview-mode`, `/source-mode`, `/split-mode`, `/mode-compact`,
 ///   `/selection-button` — toolbar chips in author-measured fixed slots. NO
 ///   semibold (and no rail bar): a chip is the selected cell of a segmented
@@ -2886,6 +3590,16 @@ fn navigation_label_type(
 fn badge_reserve(spec: &ButtonSpec) -> f32 {
     if spec.badge { 16.0 } else { 0.0 }
 }
+
+/// Where a navigation destination's label starts in its row: the 6pt lead, the
+/// 28pt icon slot and a 6pt gap. It stops [`NAVIGATION_LABEL_END`] short of the
+/// row's end. The painter, the fit audit and the Settings rail's width read
+/// these two numbers.
+pub(crate) const NAVIGATION_LABEL_LEAD: f32 = 40.0;
+
+/// How far a navigation destination's label stops short of its row's end, ahead
+/// of its badge ([`NAVIGATION_LABEL_LEAD`]).
+pub(crate) const NAVIGATION_LABEL_END: f32 = 12.0;
 
 /// The width a text button's label gives up at its end, ahead of the trailing
 /// slot: its attention badge ([`badge_reserve`]) and its colour chip
@@ -2993,8 +3707,8 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                             .visual_label
                             .as_ref()
                             .unwrap_or(&control.spec.label),
-                        node.rect.x + 40.0,
-                        node.rect.right() - 12.0 - badge_reserve(&control.spec),
+                        node.rect.x + NAVIGATION_LABEL_LEAD,
+                        node.rect.right() - NAVIGATION_LABEL_END - badge_reserve(&control.spec),
                     )
                 } else {
                     return None;
@@ -3005,11 +3719,11 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                     .visual_label
                     .as_ref()
                     .unwrap_or(&control.spec.label);
-                let text_x = if navigation && control.spec.visual_label.is_some() {
+                let text_x = if centres_its_label(control) {
                     let width = crate::tray_raster::ui_text_width_for(face, label, size);
                     node.rect.x + ((node.rect.width - width) / 2.0).max(0.0)
                 } else {
-                    node.rect.x + if navigation { 12.0 } else { 10.0 }
+                    node.rect.x + if navigation { 12.0 } else { BUTTON_LABEL_INSET }
                 };
                 let trailing_reserve =
                     text_button_trailing_reserve(&control.spec) + button_end_reserve(&control.spec);
@@ -3079,12 +3793,29 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                 actual.to_string()
             };
             let painted = if actual.is_empty() {
-                source.clone()
+                fitted_placeholder(control, &geometry, size)
             } else {
-                actual[geometry.visible.clone()].to_string()
+                let shown = &actual[geometry.visible.clone()];
+                match geometry.ellipsis {
+                    TextFieldEllipsis::None => shown.to_string(),
+                    TextFieldEllipsis::Lead => format!("{TEXT_FIELD_ELLIPSIS}{shown}"),
+                    TextFieldEllipsis::Trail => format!("{shown}{TEXT_FIELD_ELLIPSIS}"),
+                }
             };
-            let authored_available = (geometry.text_right - geometry.text_x).max(0.0);
-            let available = effective_horizontal_width(node, geometry.text_x, geometry.text_right);
+            // A declared ellipsis is deliberate fitting, as a fitted button
+            // label is: the field is held to the words it chose to paint.
+            let (source, field_x) = if geometry.ellipsis == TextFieldEllipsis::None {
+                (source, geometry.text_x)
+            } else {
+                let mark = crate::tray_raster::ui_text_width(TEXT_FIELD_ELLIPSIS, size);
+                let field_x = match geometry.ellipsis {
+                    TextFieldEllipsis::Lead => geometry.text_x - mark,
+                    _ => geometry.text_x,
+                };
+                (painted.clone(), field_x)
+            };
+            let authored_available = (geometry.text_right - field_x).max(0.0);
+            let available = effective_horizontal_width(node, field_x, geometry.text_right);
             let required = crate::tray_raster::ui_text_width(&source, size);
             Some(finish_text_fit(
                 node,
@@ -3707,19 +4438,25 @@ fn paint_compiled_node(
             paint_disclosure_button(prims, rect, control, &roles);
         }
         UiContent::Button(control) => {
-            let primary = control.style == StyleRef::Primary;
+            // The style the surface is painted in ([`button_paint_style`]).
+            let style = button_paint_style(control);
+            let primary = style == StyleRef::Primary;
             // A destructive action (Reset All, Discard): a danger-tinted
             // button with a danger rim and label.
-            let danger = control.style == StyleRef::Danger;
+            let danger = style == StyleRef::Danger;
             let selected = control.state.selected;
-            let navigation = control.style == StyleRef::Navigation;
-            let quiet = control.style == StyleRef::Quiet;
+            let navigation = style == StyleRef::Navigation;
+            let quiet = style == StyleRef::Quiet;
+            // A filter chip ([`StyleRef::Chip`]): selected is a solid accent
+            // fill, resting the card's fill in its control edge.
+            let chip = style == StyleRef::Chip;
+            let chip_selected = chip && selected;
             // A button that cannot be pressed LOOKS inert, not only grey-texted:
             // its surface and rim sink toward the background, so a disabled
             // Save beside a live Find reads as a button at rest, never as an
             // empty field with a placeholder. A busy one (Save while saving)
             // keeps its surface: it is working, not unavailable.
-            let inert = control.style == StyleRef::Secondary
+            let inert = style == StyleRef::Secondary
                 && !control.state.enabled
                 && !control.state.busy
                 && !control.state.focus_visible;
@@ -3767,6 +4504,10 @@ fn paint_compiled_node(
             // deleting a word, which is not a selection mark but a loss.
             let nav_selected = navigation && selected;
             let nav_selected_row = nav_selected && !navigation_is_chip(control);
+            // A row stacked in a column ([`FLUENT_RAIL_SELECTION`]): its states
+            // are neutral fills, and a selected one wears the pill, not the
+            // accent wash, ink and bar described above.
+            let fluent_row = FLUENT_RAIL_SELECTION && navigation && !navigation_is_chip(control);
             let (nav_weight, nav_face) = navigation_label_type(control);
             // IDLE ([`ControlState::muted`]): what the control sets does nothing
             // right now (a Harness row while supervision is off), so every mark
@@ -3787,7 +4528,17 @@ fn paint_compiled_node(
             // The two accent-tinted states a SELECTED navigation row can be in
             // paint the accent as their own ink, so their mix amounts are the
             // ones `native_appearance` floors that accent against.
-            let fill = if primary {
+            let fill = if chip_selected {
+                // A luminance step from a resting chip, not only a hue: the
+                // accent itself, a little deeper under the pointer or a press.
+                if control.state.pressed || control.state.hovered {
+                    mix_rgb(mark, roles.text_primary, 0.12)
+                } else {
+                    mark
+                }
+            } else if chip && !control.state.hovered && !control.state.pressed {
+                roles.elevated
+            } else if primary {
                 mix_rgb(roles.elevated, mark, 0.20)
             } else if danger && !control.state.pressed {
                 mix_rgb(
@@ -3795,6 +4546,18 @@ fn paint_compiled_node(
                     roles.danger,
                     if control.state.hovered { 0.24 } else { 0.16 },
                 )
+            } else if fluent_row && (selected || control.state.pressed) {
+                // WinUI's subtle fills: a selected row rests at the hover step
+                // (its pill tells the two apart), steps up under the pointer,
+                // and a press is lighter than either.
+                let step = if control.state.pressed {
+                    0.05
+                } else if control.state.hovered {
+                    0.12
+                } else {
+                    0.09
+                };
+                mix_rgb(roles.elevated, roles.text_primary, step)
             } else if control.state.pressed {
                 mix_rgb(
                     roles.elevated,
@@ -3836,28 +4599,35 @@ fn paint_compiled_node(
             }
             if primary
                 || danger
+                || chip
                 || control.state.focus_visible
                 || control.state.invalid
-                || nav_selected
-                || matches!(control.style, StyleRef::Secondary | StyleRef::Setting)
+                || (nav_selected && !nav_selected_row)
+                || matches!(style, StyleRef::Secondary | StyleRef::Setting)
             {
-                // The selected rail row earns a rim of its own — quieter than the
-                // focus ring (which must stay unmistakably louder than any resting
-                // state) but in the accent hue, so the row reads as an OBJECT
-                // sitting on the rail rather than as a patch of tint on it. Edge
-                // is the cheapest contrast there is: it works at the 3:1 the
-                // accent is floored to, and it costs the accent identity nothing.
-                // An invalid value (a font that was not found) is marked
-                // the way an invalid text field is, in the danger hue.
+                // ON A ROW, THE OUTLINE MEANS FOCUS ALONE: a selected rail or
+                // list row is spelled by its wash, its docked accent bar and
+                // its accent ink, as a macOS sidebar's is, and wears no rim at
+                // rest — so the keyboard's ring, wherever it is, is the only
+                // outline on the rail. A selected segment chip keeps a cell rim
+                // in the accent hue, framing the chosen cell inside its group's
+                // own outline (on a chip focus and selection move together).
+                // An invalid value (a font that was not found) is marked the
+                // way an invalid text field is, in the danger hue.
                 let (rim, rim_alpha) = if control.state.invalid {
                     (roles.danger, 220)
                 } else if control.state.focus_visible {
                     (roles.accent, 255)
+                } else if chip_selected {
+                    (mark, 255)
+                } else if chip {
+                    (roles.control_edge, 255)
                 } else if primary {
                     (mark, 176)
                 } else if danger {
                     (roles.danger, 200)
                 } else if nav_selected {
+                    // The chosen segment's cell rim.
                     (mark, 150)
                 } else if inert {
                     (roles.separator, 96)
@@ -3878,24 +4648,39 @@ fn paint_compiled_node(
                     color: rgba(rim, rim_alpha),
                 });
             }
-            if control.state.focus_visible && (nav_selected || primary || danger) {
-                // A selected, default or destructive control already rests in
-                // a coloured rim, so the 2pt accent ring alone barely changes
-                // it. An inner ring in the label colour makes keyboard focus
-                // on the selected segment, rail row or default button as
-                // plain as on any other control.
-                let inset = if nav_selected_row { 7.5 } else { 3.5 };
+            if control.state.focus_visible
+                && ((nav_selected && !nav_selected_row) || chip_selected || primary || danger)
+            {
+                // A selected segment or chip, default or destructive control
+                // already rests in a coloured rim or fill, so the 2pt accent
+                // ring alone barely changes it. An inner ring in the label
+                // colour makes keyboard focus on it as plain as on any other
+                // control. A selected row rests in no rim, so its ring is plain
+                // on its own.
                 prims.push(DrawPrim::Stroke {
-                    x: rect.x + inset,
+                    x: rect.x + 3.5,
                     y: rect.y + 3.5,
-                    w: (rect.width - inset - 3.5).max(0.0),
+                    w: (rect.width - 7.0).max(0.0),
                     h: (rect.height - 7.0).max(0.0),
                     radius: 5.0,
                     width: 1.5,
                     color: rgba(roles.text_primary, 255),
                 });
             }
-            if nav_selected_row {
+            if nav_selected_row && fluent_row {
+                // WinUI's selection pill: 3pt by 16pt, rounded, at the row's
+                // leading edge, centred; a short dense row keeps 4pt above and
+                // below it.
+                let h = 16.0_f32.min((rect.height - 8.0).max(0.0));
+                prims.push(DrawPrim::Panel {
+                    x: rect.x,
+                    y: rect.y + (rect.height - h) / 2.0,
+                    w: 3.0,
+                    h,
+                    radius: 1.5,
+                    fill: rgba(mark, 255),
+                });
+            } else if nav_selected_row {
                 // The rail indicator. 4pt and nearly full-bleed: a bar this
                 // shape is read as structure (the row is docked to the rail's
                 // edge) rather than as decoration, and structure survives the
@@ -3909,9 +4694,12 @@ fn paint_compiled_node(
                     fill: rgba(mark, 255),
                 });
             }
-            let color = if nav_selected && !idle {
+            let color = if chip_selected && control.state.enabled {
+                crate::native_appearance::ensure_text_contrast(roles.on_accent, fill)
+            } else if nav_selected && !idle && !fluent_row {
                 // The accent as text: legible on its own wash, as every
                 // label is ([`crate::native_appearance::NativeRoles::accent_ink`]).
+                // A Fluent row keeps its ink; the pill says selected.
                 roles.accent_ink
             } else if danger && control.state.enabled {
                 crate::native_appearance::ensure_text_contrast(roles.danger, fill)
@@ -3944,13 +4732,17 @@ fn paint_compiled_node(
                     // let the one row that grew ink overflow its own slot.
                     let label = elide_text_label(
                         visual_label,
-                        (rect.width - 52.0 - trailing_reserve - badge_reserve(&control.spec))
-                            .max(0.0),
+                        (rect.width
+                            - NAVIGATION_LABEL_LEAD
+                            - NAVIGATION_LABEL_END
+                            - trailing_reserve
+                            - badge_reserve(&control.spec))
+                        .max(0.0),
                         size.get(),
                         nav_face,
                     );
                     prims.push(text_prim(
-                        rect.x + 40.0,
+                        rect.x + NAVIGATION_LABEL_LEAD,
                         row_baseline(rect.y, rect.height, size.get()),
                         label,
                         size,
@@ -3994,11 +4786,11 @@ fn paint_compiled_node(
                     .visual_label
                     .as_ref()
                     .unwrap_or(&control.spec.label);
-                let text_x = if navigation && control.spec.visual_label.is_some() {
+                let text_x = if centres_its_label(control) {
                     let width = crate::tray_raster::ui_text_width_for(nav_face, label, size.get());
                     rect.x + ((rect.width - width) / 2.0).max(0.0)
                 } else {
-                    rect.x + if navigation { 12.0 } else { 10.0 }
+                    rect.x + if navigation { 12.0 } else { BUTTON_LABEL_INSET }
                 };
                 let trailing_reserve = text_button_trailing_reserve(&control.spec);
                 let painted_label = elide_text_label(
@@ -4018,16 +4810,23 @@ fn paint_compiled_node(
                 }
                 // The colour the button names, as its field would show it:
                 // after the label, ahead of the badge and the trailing icon.
+                // A button that paints no words and no icon is a colour well,
+                // its chip centred in it.
                 if let Some(color) = control.spec.chip {
+                    let well = label.is_empty()
+                        && control.spec.trailing_icon.is_none()
+                        && !control.spec.badge;
+                    let x = if well {
+                        rect.x + (rect.width - TEXT_FIELD_SWATCH_SIZE) / 2.0
+                    } else {
+                        rect.right()
+                            - trailing_reserve
+                            - badge_reserve(&control.spec)
+                            - TEXT_FIELD_SWATCH_SIZE
+                    };
                     paint_color_chip(
                         prims,
-                        (
-                            rect.right()
-                                - trailing_reserve
-                                - badge_reserve(&control.spec)
-                                - TEXT_FIELD_SWATCH_SIZE,
-                            rect.y + (rect.height - TEXT_FIELD_SWATCH_SIZE) / 2.0,
-                        ),
+                        (x, rect.y + (rect.height - TEXT_FIELD_SWATCH_SIZE) / 2.0),
                         color,
                         roles,
                     );
@@ -4059,8 +4858,9 @@ fn paint_compiled_node(
             // A PLAIN switch (`StyleRef::Quiet`, design ruling 262): the track and
             // the thumb alone, flush right in its slot — no boxed surface and no
             // `On` word beside it, a focus ring only when the keyboard is on it.
+            // On Windows no switch is boxed ([`FLUENT_SWITCH`]).
             let plain = control.style == StyleRef::Quiet;
-            if plain {
+            if plain || FLUENT_SWITCH {
                 if control.state.focus_visible {
                     prims.push(DrawPrim::Stroke {
                         x: rect.x + 0.5,
@@ -4077,6 +4877,27 @@ fn paint_compiled_node(
             }
             let on = matches!(control.value, SemanticValue::Bool(true));
             let enabled = control.state.enabled;
+            if FLUENT_SWITCH {
+                paint_fluent_switch(prims, rect, control.state, on, roles);
+                if plain {
+                    return;
+                }
+                // The word sits just left of the track, as Windows Settings sets it.
+                let size = native_type_px(TypeStep::Secondary);
+                let word = if on { "On" } else { "Off" };
+                let width = crate::tray_raster::ui_text_width_for(TextFace::Ui, word, size.get());
+                let right = rect.right() - 8.0 - FLUENT_TRACK.0 - 12.0;
+                prims.push(text_prim(
+                    (right - width).max(rect.x + 10.0),
+                    row_baseline(rect.y, rect.height, size.get()),
+                    word.to_string(),
+                    size,
+                    TextWeight::Regular,
+                    TextFace::Ui,
+                    rgba(control_text_color(control.state, &roles), 255),
+                ));
+                return;
+            }
             let track_w = 42.0_f32.min((rect.width - 8.0).max(0.0));
             let track_h = 22.0_f32.min((rect.height - 8.0).max(0.0));
             // A switch that cannot be operated must LOOK inert: the track
@@ -4142,13 +4963,20 @@ fn paint_compiled_node(
         }
         UiContent::Slider(control) => {
             paint_control_surface(prims, rect, control.state, roles);
+            // The bar draws the track ([`SliderSpec::track`]); a value past
+            // its end fills it to that end.
             let fraction = match control.value {
                 SemanticValue::Number {
                     value,
                     minimum,
                     maximum,
-                } if maximum > minimum => {
-                    ((value - minimum) / (maximum - minimum)).clamp(0.0, 1.0) as f32
+                } => {
+                    let (low, high) = control.spec.track_span(minimum, maximum);
+                    if high > low {
+                        ((value - low) / (high - low)).clamp(0.0, 1.0) as f32
+                    } else {
+                        0.0
+                    }
                 }
                 _ => 0.0,
             };
@@ -4192,11 +5020,13 @@ fn paint_compiled_node(
             let size = native_type_px(TypeStep::Secondary);
             let geometry = text_field_geometry(control, rect, size.get());
             let actual = text_field_visual_text(control);
+            // An empty field's placeholder is fitted to its text box, never
+            // cut mid-glyph ([`fitted_placeholder`]); the audit still says
+            // where authoring did not fit it.
+            let placeholder;
             let (value, quiet) = if actual.is_empty() {
-                (
-                    control.spec.placeholder.as_deref().unwrap_or_default(),
-                    true,
-                )
+                placeholder = fitted_placeholder(control, &geometry, size.get());
+                (placeholder.as_str(), true)
             } else {
                 (
                     &actual[geometry.visible.start.min(actual.len())
@@ -4204,10 +5034,24 @@ fn paint_compiled_node(
                     false,
                 )
             };
+            // A cut value says so: "…" before a path's end, after anything
+            // else's start ([`TextFieldGeometry::ellipsis`]).
+            let value = match geometry.ellipsis {
+                TextFieldEllipsis::None => value.to_string(),
+                TextFieldEllipsis::Lead => format!("{TEXT_FIELD_ELLIPSIS}{value}"),
+                TextFieldEllipsis::Trail => format!("{value}{TEXT_FIELD_ELLIPSIS}"),
+            };
+            let value_x = match geometry.ellipsis {
+                TextFieldEllipsis::Lead => {
+                    geometry.text_x
+                        - crate::tray_raster::ui_text_width(TEXT_FIELD_ELLIPSIS, size.get())
+                }
+                _ => geometry.text_x,
+            };
             prims.push(DrawPrim::ClipPush {
-                x: geometry.text_x,
+                x: value_x,
                 y: rect.y + 2.0,
-                w: (geometry.text_right - geometry.text_x).max(0.0),
+                w: (geometry.text_right - value_x).max(0.0),
                 h: (rect.height - 4.0).max(0.0),
             });
             if control.state.focused
@@ -4231,9 +5075,9 @@ fn paint_compiled_node(
                 }
             }
             prims.push(text_prim(
-                geometry.text_x,
+                value_x,
                 row_baseline(rect.y, rect.height, size.get()),
-                value.to_string(),
+                value,
                 size,
                 TextWeight::Regular,
                 if control.style == StyleRef::Code {
@@ -4284,6 +5128,33 @@ fn paint_compiled_node(
                 });
             }
             prims.push(DrawPrim::ClipPop);
+            if let Some(hint) = control.spec.trailing_hint.as_deref() {
+                let caption = native_type_px(TypeStep::Caption);
+                let width = crate::tray_raster::ui_text_width(hint, caption.get());
+                let swatch_space = if control.spec.swatch.is_some() {
+                    TEXT_FIELD_SWATCH_SIZE + TEXT_FIELD_SWATCH_GAP
+                } else {
+                    0.0
+                };
+                let button_space = if control.spec.end_button {
+                    TEXT_FIELD_END_BUTTON + TEXT_FIELD_END_BUTTON_GAP
+                } else {
+                    0.0
+                };
+                prims.push(text_prim(
+                    rect.right()
+                        - TEXT_FIELD_HORIZONTAL_PADDING
+                        - swatch_space
+                        - button_space
+                        - width,
+                    row_baseline(rect.y, rect.height, caption.get()),
+                    hint.to_string(),
+                    caption,
+                    TextWeight::Regular,
+                    TextFace::Ui,
+                    rgba(quiet_text(&roles), 255),
+                ));
+            }
             if let Some(color) = control.spec.swatch {
                 paint_color_chip(
                     prims,
@@ -4324,6 +5195,56 @@ fn paint_compiled_node(
         UiContent::SettingsPreview(spec) => {
             spec.paint(prims, rect, theme, roles);
         }
+        // A colour wheel: the shared HSV disk primitive at the picker's
+        // brightness, and a two-tone marker at its hue and saturation, in
+        // the colour they make.
+        UiContent::ColorWheel(control) => {
+            let geometry = color_wheel_geometry(rect);
+            // The keyboard's focus ring, in the accent every control's ring
+            // uses, just outside the disk.
+            if control.state.focus_visible {
+                let ring = geometry.r + 4.0;
+                prims.push(crate::widget::DrawPrim::Stroke {
+                    x: geometry.cx - ring,
+                    y: geometry.cy - ring,
+                    w: ring * 2.0,
+                    h: ring * 2.0,
+                    radius: ring,
+                    width: 2.0,
+                    color: rgba(roles.accent, 255),
+                });
+            }
+            let brightness = control.spec.hsv.map_or(1.0, |[_, _, value]| value);
+            prims.push(crate::widget::DrawPrim::HsvDisk {
+                cx: geometry.cx,
+                cy: geometry.cy,
+                r: geometry.r,
+                value: brightness,
+            });
+            if let Some([hue, saturation, value]) = control.spec.hsv {
+                let rgb = crate::widget::hsv_to_rgb(hue, saturation, value);
+                let (mx, my) = color_wheel_marker_at(rect, hue, saturation);
+                // Contrast ring first, then the colour's dot: the marker reads
+                // on every hue at every saturation and brightness.
+                let ring = if crate::tab_bar::bg_is_light(rgb) {
+                    [0u8, 0, 0]
+                } else {
+                    [255u8, 255, 255]
+                };
+                prims.push(crate::widget::DrawPrim::Dot {
+                    cx: mx,
+                    cy: my,
+                    r: 7.0,
+                    color: rgba(ring, 255),
+                });
+                prims.push(crate::widget::DrawPrim::Dot {
+                    cx: mx,
+                    cy: my,
+                    r: 5.0,
+                    color: rgba(rgb, 255),
+                });
+            }
+        }
         UiContent::Custom(spec) => {
             // TWO custom nodes carry a raster lowering; every other custom node
             // keeps the plain label projection below. The rainbow banner is
@@ -4336,12 +5257,35 @@ fn paint_compiled_node(
                 paint_messages_scroll(prims, rect, spec.value.as_deref(), &roles);
                 return;
             }
-            if spec.audit_id == THEME_SWATCH_AUDIT {
+            if spec.audit_id == PAGE_SCROLL_AUDIT {
+                paint_page_scroll(prims, rect, spec.value.as_deref(), &roles);
+                return;
+            }
+            if spec.audit_id == COLOR_CHIP_AUDIT {
                 if let Some(rgb) = spec
                     .value
                     .as_deref()
                     .and_then(aterm_types::scheme::parse_hex)
                 {
+                    paint_color_chip(
+                        prims,
+                        (
+                            rect.x + TEXT_FIELD_SWATCH_GAP,
+                            rect.y + (rect.height - TEXT_FIELD_SWATCH_SIZE) / 2.0,
+                        ),
+                        [rgb.r, rgb.g, rgb.b],
+                        roles,
+                    );
+                }
+                return;
+            }
+            if spec.audit_id == THEME_SWATCH_AUDIT {
+                // `#rrggbb`, then `changed` for a slot the person tuned: it
+                // wears a 4pt accent dot at its top right.
+                let mut words = spec.value.as_deref().unwrap_or("").split_whitespace();
+                let hex = words.next().and_then(aterm_types::scheme::parse_hex);
+                let changed = words.next() == Some("changed");
+                if let Some(rgb) = hex {
                     prims.push(crate::widget::DrawPrim::Panel {
                         x: rect.x,
                         y: rect.y,
@@ -4359,11 +5303,21 @@ fn paint_compiled_node(
                         width: 1.0,
                         color: rgba(roles.separator, 200),
                     });
+                    if changed && rect.width >= 10.0 && rect.height >= 10.0 {
+                        prims.push(crate::widget::DrawPrim::Panel {
+                            x: rect.right() - 7.0,
+                            y: rect.y + 3.0,
+                            w: 4.0,
+                            h: 4.0,
+                            radius: 2.0,
+                            fill: rgba(roles.accent, 255),
+                        });
+                    }
                 }
                 return;
             }
-            if spec.audit_id == THEME_CARD_AUDIT {
-                crate::settings_preview::theme_card::paint_card_tile(
+            if spec.audit_id == THEME_SLAB_AUDIT {
+                crate::settings_preview::theme_card::paint_row_slab(
                     prims,
                     rect,
                     spec.value.as_deref(),
@@ -4393,60 +5347,6 @@ fn paint_compiled_node(
                     sky,
                     rim,
                 );
-                return;
-            }
-            // The Tab Color wheel: the shared HSV disk primitive at the
-            // committed color's brightness, plus a two-tone marker ring at its
-            // polar position (spec.value = "#rrggbb").
-            if spec.audit_id == TAB_COLOR_WHEEL_AUDIT {
-                let geometry = color_wheel_geometry(rect);
-                // The keyboard's focus ring, in the accent every control's
-                // ring uses, just outside the disk.
-                if spec.focus_visible {
-                    let ring = geometry.r + 4.0;
-                    prims.push(crate::widget::DrawPrim::Stroke {
-                        x: geometry.cx - ring,
-                        y: geometry.cy - ring,
-                        w: ring * 2.0,
-                        h: ring * 2.0,
-                        radius: ring,
-                        width: 2.0,
-                        color: rgba(roles.accent, 255),
-                    });
-                }
-                prims.push(crate::widget::DrawPrim::HsvDisk {
-                    cx: geometry.cx,
-                    cy: geometry.cy,
-                    r: geometry.r,
-                    value: color_wheel_value(spec.value.as_deref()),
-                });
-                if let Some(rgb) = spec
-                    .value
-                    .as_deref()
-                    .and_then(aterm_types::scheme::parse_hex)
-                {
-                    let rgb = [rgb.r, rgb.g, rgb.b];
-                    let (mx, my) = color_wheel_marker_at(rect, rgb);
-                    // Contrast ring first, then the committed color's dot — the
-                    // marker reads on every hue at every saturation.
-                    let ring = if crate::tab_bar::bg_is_light(rgb) {
-                        [0u8, 0, 0]
-                    } else {
-                        [255u8, 255, 255]
-                    };
-                    prims.push(crate::widget::DrawPrim::Dot {
-                        cx: mx,
-                        cy: my,
-                        r: 7.0,
-                        color: rgba(ring, 255),
-                    });
-                    prims.push(crate::widget::DrawPrim::Dot {
-                        cx: mx,
-                        cy: my,
-                        r: 5.0,
-                        color: rgba(rgb, 255),
-                    });
-                }
                 return;
             }
             if spec.audit_id == DISPLAY_FACE_NAME_AUDIT {
@@ -4506,6 +5406,22 @@ pub(crate) fn native_button_label_width(value: &str) -> f32 {
     visual_text_width(
         value,
         native_type_px(TypeStep::Secondary).get(),
+        crate::widget::TextFace::Ui,
+    )
+}
+
+/// THE ONE SEPARATOR between facts a native page paints in a run: a setting
+/// row's name and its tags, the tags it moves to its second line, a
+/// caption's counts, a package's details. One owner, so the same facts read
+/// the same wherever they are placed, beside a name or under it.
+pub(crate) const FACT_SEPARATOR: &str = " \u{b7} ";
+
+/// The width a one-line native body label needs to paint WHOLE, in the face
+/// and rung [`fit_native_text_label`] elides against.
+pub(crate) fn native_text_label_width(value: &str) -> f32 {
+    visual_text_width(
+        value,
+        native_type_px(TypeStep::Body).get(),
         crate::widget::TextFace::Ui,
     )
 }
@@ -4571,15 +5487,39 @@ pub(crate) fn elide_text_label(
     }
     let ellipsis = "…";
     let ellipsis_width = visual_text_width(ellipsis, px, face);
-    while !output.is_empty() && visual_text_width(&output, px, face) + ellipsis_width > max_width {
-        let Some((offset, _)) = output.grapheme_indices().last() else {
-            output.clear();
-            break;
-        };
-        output.truncate(offset);
-        elided = true;
+    if face != crate::widget::TextFace::Mono {
+        // The longest leading run of whole graphemes that fits beside the
+        // ellipsis — every boundary measured in one pass of the pen, as the
+        // shed-one-and-measure-again loop below finds it.
+        let cuts = output
+            .grapheme_indices()
+            .map(|(at, _)| at)
+            .chain(std::iter::once(output.len()))
+            .collect::<Vec<_>>();
+        let widths = crate::tray_raster::ui_text_widths_at(face, &output, &cuts, "", px);
+        let keep = (1..cuts.len())
+            .rev()
+            .find(|&at| widths[at] + ellipsis_width <= max_width)
+            .map_or(0, |at| cuts[at]);
+        if keep < output.len() {
+            output.truncate(keep);
+            elided = true;
+        }
+    } else {
+        while !output.is_empty()
+            && visual_text_width(&output, px, face) + ellipsis_width > max_width
+        {
+            let Some((offset, _)) = output.grapheme_indices().last() else {
+                output.clear();
+                break;
+            };
+            output.truncate(offset);
+            elided = true;
+        }
     }
     if elided && ellipsis_width <= max_width {
+        // "Typeset…", never "Typeset …": the ellipsis follows the last word.
+        output.truncate(output.trim_end().len());
         output.push('…');
     }
     output
@@ -4646,6 +5586,13 @@ fn paint_button_icon(
         ButtonIcon::Copy => {
             prims.push(outline(cx - 8.0, cy - 8.0, 11.0, 12.0, 2.0));
             prims.push(outline(cx - 3.0, cy - 3.0, 11.0, 12.0, 2.0));
+        }
+        // Windows draws the thin chevron of WinUI's ComboBox (Segoe Fluent Icons
+        // E70D) as two antialiased segments meeting at the point, like Back and
+        // Forward; the stepped filled triangle read as a foreign widget there.
+        ButtonIcon::ChevronDown if FLUENT_SWITCH => {
+            prims.push(segment(cx - 4.5, cy - 2.25, cx, cy + 2.25));
+            prims.push(segment(cx, cy + 2.25, cx + 4.5, cy - 2.25));
         }
         ButtonIcon::ChevronDown => {
             // A compact filled disclosure triangle. The former disconnected
@@ -4806,6 +5753,47 @@ fn paint_button_icon(
                 r: 1.3,
                 color: rgba(color, 220),
             });
+        }
+        ButtonIcon::Trash => {
+            // The lid and its handle, then the bin with two ribs.
+            prims.push(line(cx - 6.0, cy - 5.0, 12.0, 1.0));
+            prims.push(line(cx - 2.0, cy - 7.0, 4.0, 1.0));
+            prims.push(outline(cx - 4.5, cy - 3.5, 9.0, 10.0, 1.5));
+            prims.push(line(cx - 1.5, cy - 1.0, 1.0, 5.0));
+            prims.push(line(cx + 0.5, cy - 1.0, 1.0, 5.0));
+        }
+        ButtonIcon::Clear => {
+            prims.push(segment(cx - 3.5, cy - 3.5, cx + 3.5, cy + 3.5));
+            prims.push(segment(cx - 3.5, cy + 3.5, cx + 3.5, cy - 3.5));
+        }
+        ButtonIcon::Reset => {
+            // Most of a circle, open at the top right, and the arrowhead on
+            // its open end pointing back the way it turns.
+            let r = 5.5_f32;
+            let steps = 10;
+            let (from, to) = (-0.25_f32, 1.45_f32);
+            let point = |t: f32| {
+                let angle = std::f32::consts::PI * t;
+                (cx + r * angle.cos(), cy + r * angle.sin())
+            };
+            for step in 0..steps {
+                let (x1, y1) = point(from + (to - from) * step as f32 / steps as f32);
+                let (x2, y2) = point(from + (to - from) * (step + 1) as f32 / steps as f32);
+                prims.push(segment(x1, y1, x2, y2));
+            }
+            // The head's two barbs lean back from the tip, either side of
+            // the way the arc runs there.
+            let (tip_x, tip_y) = point(to);
+            let along = std::f32::consts::PI * to + std::f32::consts::FRAC_PI_2;
+            for lean in [0.7_f32, -0.7] {
+                let back = along + std::f32::consts::PI + lean;
+                prims.push(segment(
+                    tip_x,
+                    tip_y,
+                    tip_x + 3.5 * back.cos(),
+                    tip_y + 3.5 * back.sin(),
+                ));
+            }
         }
         ButtonIcon::Document => {
             prims.push(outline(cx - 6.0, cy - 8.0, 12.0, 16.0, 2.0));
@@ -5972,7 +6960,57 @@ fn column_offset(column: usize, origin: usize) -> usize {
 /// `text_primary` (contrast-ensured against `surface`) keeps comfortable
 /// margin on top of it.
 fn control_rest_fill(roles: &crate::settings::Roles) -> [u8; 3] {
-    mix_rgb(roles.elevated, roles.text_primary, 0.05)
+    control_rest_fill_over(roles.elevated, roles)
+}
+
+/// Whether a light theme's resting controls rise toward white above the card
+/// they sit on, as WinUI's `ControlFillColorDefault` (white at 70%) does, rather
+/// than sinking a step toward the ink. Windows only, with the cards that rise
+/// there (`native_appearance`'s light elevation): a light Settings page drew its
+/// dropdowns, buttons and search box darker than their cards (the 2026-10-18
+/// judge's `light-settings-controls-sunken`). macOS and Linux keep their look.
+const LIGHT_CONTROLS_RISE: bool = cfg!(windows);
+
+/// How far toward white a light resting control rises over its ground
+/// ([`LIGHT_CONTROLS_RISE`]): WinUI's 70% white.
+const LIGHT_CONTROL_RISE: f32 = 0.7;
+
+/// Whether a QUIET button that shows words is painted as WinUI's standard
+/// Button: `ControlFillColorDefault` (the resting control fill, opaque) inside
+/// `ControlElevationBorder` (the separator rim), as a Secondary button is.
+/// Windows only. A quiet text button rested at 72/255 of that fill with no rim
+/// (`#F8F8F8` on a `#F6F6F6` card in Default Light, 1.01:1; `#2B2B2C` on
+/// `#29292A` in dark), so Browse themes…, Reset, Import… and Folder read as
+/// plain text beside the bordered Customize (the 2026-10-18 Fluent judge's
+/// `J4F-8-settings-secondary-buttons-invisible`). Windows 11 Settings and
+/// Windows Terminal's settings draw such text actions as standard buttons; a
+/// subtle button (no fill until hovered) is WinUI's for icon commands, so a
+/// quiet button that shows only a pictogram keeps its quiet look. macOS and
+/// Linux keep their quiet buttons.
+const FLUENT_TEXT_BUTTONS: bool = cfg!(windows);
+
+/// The style a button's surface is painted in: its own, except that a quiet
+/// button that shows words is painted as a Secondary one where
+/// [`FLUENT_TEXT_BUTTONS`]. Its label, metrics and semantics are its own.
+fn button_paint_style(control: &Control<ButtonSpec>) -> StyleRef {
+    if FLUENT_TEXT_BUTTONS && control.style == StyleRef::Quiet && control.spec.visual_icon.is_none()
+    {
+        StyleRef::Secondary
+    } else {
+        control.style
+    }
+}
+
+/// A resting control's fill over `ground`, the surface it sits on: a step toward
+/// the ink on a dark theme; on a light one toward white where
+/// [`LIGHT_CONTROLS_RISE`], else toward the ink. The Settings controls sit on
+/// `elevated`; the command palette's filter field on its card's `surface`.
+pub(crate) fn control_rest_fill_over(ground: [u8; 3], roles: &crate::settings::Roles) -> [u8; 3] {
+    if LIGHT_CONTROLS_RISE && !crate::native_appearance::surface_is_dark(roles.surface) {
+        mix_rgb(ground, [0xFF, 0xFF, 0xFF], LIGHT_CONTROL_RISE)
+    } else {
+        mix_rgb(ground, roles.text_primary, 0.05)
+    }
 }
 
 /// A DISCLOSURE button ([`ControlState::expanded`], design ruling 262): a row
@@ -6029,7 +7067,7 @@ fn paint_disclosure_button(
     if !label.is_empty() {
         let size = native_type_px(TypeStep::Secondary);
         prims.push(text_prim(
-            rect.x + 10.0,
+            rect.x + BUTTON_LABEL_INSET,
             row_baseline(rect.y, rect.height, size.get()),
             elide_text_label(
                 label,
@@ -6083,19 +7121,9 @@ fn paint_messages_scroll(
 ) {
     use crate::widget::{DrawPrim, rgba};
 
-    let mut parts = value
-        .unwrap_or("")
-        .split(',')
-        .map(|part| part.trim().parse::<u32>().unwrap_or(0));
-    let (first, shown, total) = (
-        parts.next().unwrap_or(0),
-        parts.next().unwrap_or(0),
-        parts.next().unwrap_or(0),
-    );
-    if total == 0 || shown >= total {
+    let Some((first, shown, total)) = scroll_share(value) else {
         return;
-    }
-    let (first, shown, total) = (first as f32, shown as f32, total as f32);
+    };
     let track_y = rect.y + 10.0;
     let track_h = (rect.height - 20.0).max(0.0);
     let thumb_h = (track_h * shown / total).max(18.0).min(track_h);
@@ -6107,6 +7135,74 @@ fn paint_messages_scroll(
         h: thumb_h,
         radius: 1.5,
         fill: rgba(readable_secondary(roles), 120),
+    });
+}
+
+/// The `first,shown,total` of a scroll indicator's value, as floats, or
+/// `None` where every entry is shown.
+fn scroll_share(value: Option<&str>) -> Option<(f32, f32, f32)> {
+    let mut parts = value
+        .unwrap_or("")
+        .split(',')
+        .map(|part| part.trim().parse::<u32>().unwrap_or(0));
+    let (first, shown, total) = (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    );
+    (total > 0 && shown < total).then_some((first as f32, shown as f32, total as f32))
+}
+
+/// A Settings page's scroll indicator ([`PAGE_SCROLL_AUDIT`]) in the page's
+/// right gutter: the terminal's resting thumb in points, the sizes of the
+/// 100% Windows cell's ([`crate::scrollbar::Metrics`]): under the Fluent
+/// chrome WinUI's thin panning indicator (`Metrics::fine`, 2 pt), elsewhere
+/// the Classic thin thumb (3 pt, [`crate::scrollbar::rest_width`]), at the
+/// Fluent terminal's doubled resting opacity on every chrome
+/// ([`crate::scrollbar::rest_alpha`]; the Classic terminal's own, a third
+/// lighter, would leave the page's only scroll cue under 3:1, and macOS and
+/// Linux show no terminal thumb by default to match), in the page's primary
+/// ink as the terminal's is its foreground, composed
+/// over the page's surface as the terminal's quads compose over its ground
+/// and drawn opaque ([`crate::scrollbar::over_ground`]: this raster blends
+/// a translucent fill in linear light, which lifted the thumb toward the
+/// page); the margin from the pane's right edge is the terminal thumb's from
+/// the window's, so it falls on whole device pixels at 100%, 150% and 200%,
+/// and the track is the list's height less the terminal's inset. It used to be a
+/// 3 pt thumb in the secondary ink at 47%, 7 pt inside the list's edge: over
+/// the cards' right padding and across the gaps between them, antialiased
+/// at both edges (the 2026-10-18 judge's `J4F-6-settings-scroller-own-idiom`).
+/// It does not widen under the pointer: it is a picture of where the list
+/// is, with nothing to drag, and the list moves a stop at a time.
+fn paint_page_scroll(
+    prims: &mut Vec<crate::widget::DrawPrim>,
+    rect: LogicalRect,
+    value: Option<&str>,
+    roles: &crate::settings::Roles,
+) {
+    use crate::scrollbar::{ALPHA_REST, Metrics, over_ground, rest_alpha, rest_width};
+    use crate::widget::{DrawPrim, rgba};
+
+    let Some((first, shown, total)) = scroll_share(value) else {
+        return;
+    };
+    let m = Metrics::for_cell(9, 23);
+    let fluent = crate::pane_chrome::split_chrome() == crate::pane_chrome::SplitChrome::Fluent;
+    let width = rest_width(m, fluent) as f32;
+    let inset = m.inset as f32;
+    let track_y = rect.y + inset;
+    let track_h = (rect.height - 2.0 * inset).max(0.0);
+    let thumb_h = (track_h * shown / total).max(m.min_len as f32).min(track_h);
+    let scrolled = (first / (total - shown)).clamp(0.0, 1.0);
+    let alpha = rest_alpha(ALPHA_REST, true);
+    let (tone, opaque) = over_ground(roles.text_primary, roles.surface, alpha, alpha);
+    prims.push(DrawPrim::Panel {
+        x: rect.right() - m.margin as f32 - width,
+        y: (track_h - thumb_h).mul_add(scrolled, track_y),
+        w: width,
+        h: thumb_h,
+        radius: width / 2.0,
+        fill: rgba(tone, opaque),
     });
 }
 
@@ -6223,6 +7319,93 @@ fn paint_button_swatches(
         }
     }
     BUTTON_SWATCH_RESERVE
+}
+
+/// Windows draws its switches as WinUI's ToggleSwitch ([`paint_fluent_switch`]): no
+/// boxed surface around them, an outlined track when Off, a 12 px thumb. The boxed
+/// switch with a filled Off track read as disabled there (the 2026-10-17 audit). macOS
+/// and Linux keep the switch they had.
+const FLUENT_SWITCH: bool = cfg!(windows);
+
+/// WinUI's ToggleSwitch track, `(width, height)` in logical px.
+const FLUENT_TRACK: (f32, f32) = (40.0, 20.0);
+
+/// One switch as WinUI's ToggleSwitch, flush right in `rect`: On is the accent-filled
+/// track with the thumb in the on-accent ink at its right; Off is the track OUTLINED in
+/// a strong stroke over a faint wash, the thumb in secondary ink at its left. The thumb
+/// is 12 px, 14 px under the pointer. A switch that cannot be operated sinks both
+/// toward the surface, as the boxed switch does.
+fn paint_fluent_switch(
+    prims: &mut Vec<crate::widget::DrawPrim>,
+    rect: LogicalRect,
+    state: ControlState,
+    on: bool,
+    roles: crate::settings::Roles,
+) {
+    use crate::widget::{DrawPrim, rgba};
+
+    let (w, h) = (
+        FLUENT_TRACK.0.min((rect.width - 8.0).max(0.0)),
+        FLUENT_TRACK.1.min((rect.height - 4.0).max(0.0)),
+    );
+    let (x, y) = (rect.right() - w - 8.0, rect.y + (rect.height - h) / 2.0);
+    let enabled = state.enabled;
+    let alpha = if enabled { 255 } else { 120 };
+    if on {
+        let fill = if enabled && !state.muted {
+            roles.accent
+        } else if enabled {
+            roles.text_tertiary
+        } else {
+            mix_rgb(roles.accent, roles.elevated, 0.55)
+        };
+        prims.push(DrawPrim::Capsule {
+            x,
+            y,
+            w,
+            h,
+            frac: 1.0,
+            fill: rgba(fill, alpha),
+            track: rgba(fill, alpha),
+        });
+    } else {
+        let wash = if state.hovered { 0x1A } else { 0x0F };
+        prims.push(DrawPrim::Capsule {
+            x,
+            y,
+            w,
+            h,
+            frac: 0.0,
+            fill: rgba(roles.text_primary, wash),
+            track: rgba(roles.text_primary, wash),
+        });
+        prims.push(DrawPrim::Stroke {
+            x: x + 0.5,
+            y: y + 0.5,
+            w: (w - 1.0).max(0.0),
+            h: (h - 1.0).max(0.0),
+            radius: (h - 1.0).max(0.0) / 2.0,
+            width: 1.0,
+            color: rgba(roles.text_secondary, if enabled { 200 } else { 90 }),
+        });
+    }
+    let r: f32 = if state.hovered && enabled { 7.0 } else { 6.0 };
+    let inset = h / 2.0;
+    prims.push(DrawPrim::Dot {
+        cx: if on { x + w - inset } else { x + inset },
+        cy: y + h / 2.0,
+        r: r.min((h / 2.0 - 2.0).max(2.0)),
+        color: rgba(
+            if !enabled {
+                mix_rgb(roles.text_tertiary, roles.text_secondary, 0.35)
+            } else if on {
+                roles.on_accent
+            } else {
+                roles.text_secondary
+            },
+            if enabled { 255 } else { 170 },
+        ),
+    });
 }
 
 fn paint_control_surface(
@@ -6426,9 +7609,11 @@ fn style_text_color(style: StyleRef, roles: &crate::settings::Roles) -> [u8; 3] 
         StyleRef::Success => roles.success,
         StyleRef::Danger => roles.danger,
         StyleRef::Quiet => quiet_text(roles),
-        StyleRef::Plain | StyleRef::Secondary | StyleRef::Navigation | StyleRef::Setting => {
-            readable_secondary(roles)
-        }
+        StyleRef::Plain
+        | StyleRef::Secondary
+        | StyleRef::Navigation
+        | StyleRef::Setting
+        | StyleRef::Chip => readable_secondary(roles),
         StyleRef::Code => roles.text_primary,
     }
 }
@@ -6442,6 +7627,68 @@ pub(crate) enum CompileError {
     CustomWithoutAudit(UiKey),
     PaintOnlyAction(UiKey),
     ObserverMismatch(UiKey),
+    /// A button whose painted words are not one phrase of its accessible
+    /// name ([`visible_label_in_name`]).
+    VisibleLabelNotInName(UiKey),
+}
+
+/// THE WORDS A CONTROL PAINTS ARE IN ITS NAME (WCAG 2.5.3, Label in Name):
+/// a speech user says what they see, so a button's painted words
+/// (`visual_label`) must be one phrase of its accessible name (`label`),
+/// whole words, case and spacing aside, an elision's "…" taken off;
+/// anything the name adds beyond them belongs after them or in the
+/// description. A painted word is a word of the name, never the inside of a
+/// longer one ("View" is not said by "Review"), except where an ellipsis
+/// cut it. An empty painted label (a card surface) or a glyph with no word
+/// in it (an arrow) carries no words to match.
+pub(crate) fn visible_label_in_name(visual: &str, name: &str) -> bool {
+    let words = |text: &str| {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let visual = words(visual).replace("...", "\u{2026}");
+    // A glyph with no word in it ("‹") is an icon: there is nothing to say.
+    if !visual.chars().any(char::is_alphanumeric) {
+        return true;
+    }
+    // An elided label is pieces of its words, in order, wherever the
+    // ellipsis took the rest ("More sty…", "bidi — Bi…onal text"): a piece
+    // may end inside a word where an ellipsis follows it, and start inside
+    // one where an ellipsis comes before it, and nowhere else.
+    let name = words(name);
+    let edge = |text: &str, at: usize, before: bool| {
+        let next = if before {
+            text[..at].chars().next_back()
+        } else {
+            text[at..].chars().next()
+        };
+        next.is_none_or(|ch| !ch.is_alphanumeric())
+    };
+    let pieces: Vec<&str> = visual.split('\u{2026}').collect();
+    let mut from = 0;
+    for (index, raw) in pieces.iter().enumerate() {
+        let piece = raw.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        // Cut where an ellipsis touches the piece (no space between).
+        let cut_before = index > 0 && !raw.starts_with(' ');
+        let cut_after = index + 1 < pieces.len() && !raw.ends_with(' ');
+        let found = name[from..]
+            .match_indices(piece)
+            .map(|(at, _)| from + at)
+            .find(|&at| {
+                (cut_before || edge(&name, at, true))
+                    && (cut_after || edge(&name, at + piece.len(), false))
+            });
+        match found {
+            Some(at) => from = at + piece.len(),
+            None => return false,
+        }
+    }
+    true
 }
 
 struct Compiler {
@@ -6450,7 +7697,30 @@ struct Compiler {
     // and is rebuilt from scratch every native frame — the DoS resistance was
     // paying for nothing.
     seen: FxHashSet<UiKey>,
+    /// Segments that are not their control's Tab stop ([`UiNode::segmented`]).
+    not_tab_stops: FxHashSet<UiKey>,
     output: CompiledUi,
+}
+
+/// A segmented control's segments ([`UiNode::segmented`]): the buttons and
+/// switches under it, in order, with their state — its children, or the
+/// lines a narrow column wraps them onto.
+pub(crate) fn segments_of(children: &[UiNode]) -> Vec<(UiKey, ControlState)> {
+    fn walk(children: &[UiNode], out: &mut Vec<(UiKey, ControlState)>) {
+        for child in children {
+            if child.paint_only {
+                continue;
+            }
+            match &child.content {
+                UiContent::Button(control) => out.push((child.key.clone(), control.state)),
+                UiContent::Switch(control) => out.push((child.key.clone(), control.state)),
+                _ => walk(&child.children, out),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(children, &mut out);
+    out
 }
 
 impl Compiler {
@@ -6465,7 +7735,7 @@ impl Compiler {
         inherited_clip: LogicalRect,
         parent: Option<&UiKey>,
         inherited_peek: bool,
-        inherited_dead: bool,
+        list: Option<ListContext>,
     ) -> Result<(), CompileError> {
         let UiNode {
             key,
@@ -6474,9 +7744,30 @@ impl Compiler {
             children,
             paint_only,
             peek,
-            cut,
-            peek_above,
+            room,
+            offscreen,
+            segmented,
         } = node;
+        if segmented {
+            // One Tab stop for the control: the focused segment, else the
+            // selected one, else the first that takes the keyboard.
+            let segments = segments_of(&children);
+            let stop = segments
+                .iter()
+                .find(|(_, state)| state.focused)
+                .or_else(|| segments.iter().find(|(_, state)| state.selected))
+                .or_else(|| segments.iter().find(|(_, state)| state.enabled))
+                .map(|(key, _)| key.clone());
+            for (segment, _) in &segments {
+                if stop.as_ref() != Some(segment) {
+                    self.not_tab_stops.insert(segment.clone());
+                }
+            }
+            self.output.segment_groups.push(SegmentGroup {
+                key: key.clone(),
+                segments: segments.into_iter().map(|(key, _)| key).collect(),
+            });
+        }
         let peek = inherited_peek || peek;
         if key.as_str().trim().is_empty() {
             return Err(CompileError::EmptyKey);
@@ -6497,43 +7788,101 @@ impl Compiler {
         // only the labels it needs.
         let projection = content.semantic();
         let description = content.description();
+        let look_first = content.look_first();
+        let value_text = content.value_text();
         if paint_only && (projection.action.is_some() || projection.focusable) {
             return Err(CompileError::PaintOnlyAction(key));
+        }
+        // An authoring rule, held where every page compiles in development
+        // and in the tests that walk every route; a release never refuses a
+        // page over a wording.
+        #[cfg(debug_assertions)]
+        if let UiContent::Button(control) = &content
+            && !paint_only
+            && let Some(visual) = control.spec.visual_label.as_deref()
+            && !visible_label_in_name(visual, &control.spec.label)
+        {
+            return Err(CompileError::VisibleLabelNotInName(key));
+        }
+        if offscreen {
+            return self.offscreen_node(
+                key,
+                &layout,
+                children,
+                rect,
+                parent,
+                (projection, description, value_text, paint_only),
+            );
         }
 
         let own_clip = inherited_clip.intersect(rect);
         let Some(visible) = own_clip else {
+            // A row the list's edge cuts away entirely is off its screen in a
+            // list that holds every row in the tree ([`UiNode::offscreen`]).
+            if list.is_some_and(|list| list.lists_all) {
+                return self.offscreen_node(
+                    key,
+                    &layout,
+                    children,
+                    rect,
+                    parent,
+                    (projection, description, value_text, paint_only),
+                );
+            }
             // A clipped subtree is not materialized in any observer.  Virtualized
             // views can compile requested semantic ranges separately.
             return Ok(());
         };
-        // A peek is live where it shows whole ([`UiNode::peek`]): what the
-        // list's edge cuts is a picture of what scrolling shows, never a
-        // sliver of a target. A row over the list's top that the edge cuts is
-        // a picture to its last node ([`UiNode::peek_above`]).
-        let dead = inherited_dead || (peek_above && materially_clipped(rect, visible));
-        // ...and a picture with no controls in it: a control there is whole
-        // and live or not drawn, so a button the top edge cuts in half (or
-        // one whole under its cut label) never reads as one to press. Its
-        // words and its card still show the list goes on. A surface (a
-        // card's frame under its tile and words) is that card: drawn.
-        let dead_control =
-            dead && (projection.action.is_some() || projection.focusable) && !content.is_surface();
-        if !dead_control {
-            self.output.paint.push(PaintNode {
-                key: key.clone(),
-                rect,
-                clip: visible,
-                content,
-                peek: peek || cut,
-            });
-        }
-        let live = !paint_only && !dead && !(peek && materially_clipped(rect, visible));
-        if live {
+        // THE LIST'S EDGE RULE ([`UiNode::room`]): inside a scrolling list a
+        // node is live over exactly the part of it its room shows, whole or
+        // cut by either edge; what the strip under the room holds is a picture.
+        let live_visible = match list {
+            Some(list) => visible.intersect(list.room),
+            None => Some(visible),
+        };
+        let edge_cut = list.is_some_and(|list| {
+            rect.y < list.room.y - CLIP_EDGE_EPSILON
+                || rect.bottom() > list.room.bottom() + CLIP_EDGE_EPSILON
+        });
+        let fade = list
+            .and_then(|list| list.fade)
+            .filter(|(top, _)| visible.bottom() > top + CLIP_EDGE_EPSILON);
+        self.output.paint.push(PaintNode {
+            key: key.clone(),
+            rect,
+            clip: visible,
+            content,
+            peek: peek || edge_cut,
+            fade,
+        });
+        let live = match live_visible {
+            Some(shown) if !paint_only => Some(shown),
+            _ => None,
+        };
+        // A list that holds every row in the tree has a node its room does
+        // not show there off its screen, with its whole bounds.
+        let listed = live.is_none() && !paint_only && list.is_some_and(|list| list.lists_all);
+        if listed {
             self.output.semantics.push(SemanticNode {
                 key: key.clone(),
                 parent: parent.cloned(),
-                rect: visible,
+                rect,
+                role: projection.role,
+                label: projection.label.clone(),
+                value: projection.value.clone(),
+                state: projection.state,
+                action: projection.action.clone(),
+                audit_id: projection.audit_id,
+                description: description.clone(),
+                offscreen: true,
+                value_text: value_text.clone(),
+            });
+        }
+        if let Some(shown) = live {
+            self.output.semantics.push(SemanticNode {
+                key: key.clone(),
+                parent: parent.cloned(),
+                rect: shown,
                 role: projection.role,
                 label: projection.label,
                 value: projection.value,
@@ -6541,8 +7890,10 @@ impl Compiler {
                 action: projection.action.clone(),
                 audit_id: projection.audit_id,
                 description,
+                offscreen: false,
+                value_text,
             });
-            if projection.focusable {
+            if projection.focusable && !self.not_tab_stops.contains(&key) {
                 self.output.focus_order.push(key.clone());
             }
             if let Some(action) = projection.action
@@ -6550,8 +7901,9 @@ impl Compiler {
             {
                 self.output.hits.push(HitRegion {
                     key: key.clone(),
-                    rect: visible,
+                    rect: shown,
                     action,
+                    look_first,
                 });
             }
         }
@@ -6565,10 +7917,82 @@ impl Compiler {
         if child_clip.is_empty() {
             return Ok(());
         }
+        // A list's children inherit its room and the strip under it.
+        let list = match room {
+            Some(room) => {
+                let shown = LogicalRect::new(rect.x, rect.y, rect.width, room.height.max(0.0));
+                let shown = match list {
+                    Some(outer) => shown.intersect(outer.room).unwrap_or_default(),
+                    None => shown,
+                };
+                Some(ListContext {
+                    room: shown,
+                    fade: (room.fades && rect.height > room.height + CLIP_EDGE_EPSILON)
+                        .then(|| (rect.y + room.height, rect.bottom())),
+                    lists_all: room.lists_all || list.is_some_and(|outer| outer.lists_all),
+                })
+            }
+            None => list,
+        };
         let child_rects = layout_children(&layout, &children, content_rect)?;
-        let semantic_parent = if live { Some(&key) } else { parent };
+        let semantic_parent = if live.is_some() || listed {
+            Some(&key)
+        } else {
+            parent
+        };
         for (child, child_rect) in children.into_iter().zip(child_rects) {
-            self.node(child, child_rect, child_clip, semantic_parent, peek, dead)?;
+            // A child reaching into this node's padding ([`Layout::outdent`])
+            // is clipped to the content rect grown as far as it reaches.
+            let clip = if layout.clip && child.layout.outdent != Insets::default() {
+                inherited_clip
+                    .intersect(content_rect.outset(child.layout.outdent))
+                    .unwrap_or_default()
+            } else {
+                child_clip
+            };
+            self.node(child, child_rect, clip, semantic_parent, peek, list)?;
+        }
+        Ok(())
+    }
+
+    /// A list's row off its screen ([`UiNode::offscreen`]) and everything in
+    /// it: semantics at the laid-out bounds, nothing painted, hit or
+    /// focusable, whatever the list's clip.
+    fn offscreen_node(
+        &mut self,
+        key: UiKey,
+        layout: &Layout,
+        children: Vec<UiNode>,
+        rect: LogicalRect,
+        parent: Option<&UiKey>,
+        (projection, description, value_text, paint_only): (
+            SemanticProjection,
+            Option<String>,
+            Option<String>,
+            bool,
+        ),
+    ) -> Result<(), CompileError> {
+        if !paint_only {
+            self.output.semantics.push(SemanticNode {
+                key: key.clone(),
+                parent: parent.cloned(),
+                rect,
+                role: projection.role,
+                label: projection.label,
+                value: projection.value,
+                state: projection.state,
+                action: projection.action,
+                audit_id: projection.audit_id,
+                description,
+                offscreen: true,
+                value_text,
+            });
+        }
+        let parent = if paint_only { parent } else { Some(&key) };
+        let child_rects = layout_children(layout, &children, rect.inset(layout.padding))?;
+        for (mut child, child_rect) in children.into_iter().zip(child_rects) {
+            child.offscreen = true;
+            self.node(child, child_rect, child_rect, parent, false, None)?;
         }
         Ok(())
     }
@@ -6582,6 +8006,22 @@ fn layout_children(
     if children.is_empty() {
         return Ok(Vec::new());
     }
+    let mut rects = layout_children_in(layout, children, content)?;
+    // Each child reaching past the content rect grows by its outdent.
+    for (rect, child) in rects.iter_mut().zip(children) {
+        if child.layout.outdent != Insets::default() {
+            *rect = rect.outset(child.layout.outdent);
+        }
+    }
+    Ok(rects)
+}
+
+/// [`layout_children`] before any child's [`Layout::outdent`].
+fn layout_children_in(
+    layout: &Layout,
+    children: &[UiNode],
+    content: LogicalRect,
+) -> Result<Vec<LogicalRect>, CompileError> {
     if layout.flow == Flow::Overlay {
         return children
             .iter()
@@ -6677,6 +8117,41 @@ fn resolve_length(length: Length, available: f32) -> f32 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A CONTROL THAT CANNOT BE PRESSED IS NEVER PAINTED FOCUSED (s-25): a button
+    /// that disabled itself under the keyboard (a pager's Older at its end) kept
+    /// its focus ring though it had left the focus order. NEGATIVE CONTROL: the
+    /// same button enabled takes the focus.
+    #[test]
+    fn a_disabled_control_is_never_painted_focused() {
+        let button = |enabled: bool| {
+            UiNode::new(
+                "test/older",
+                UiContent::Button(
+                    Control::new(ButtonSpec::new("Older"), ActionId::new("test/older")).state(
+                        ControlState {
+                            enabled,
+                            ..ControlState::default()
+                        },
+                    ),
+                ),
+            )
+            .layout(Layout::default().height(Length::Fixed(32.0)))
+        };
+        for enabled in [false, true] {
+            let tree = UiTree::new(
+                UiNode::new("test", UiContent::Group(GroupSpec::new("test")))
+                    .layout(Layout::column())
+                    .children(vec![button(enabled)]),
+            )
+            .apply_focus(Some(&UiKey::new("test/older")));
+            let UiContent::Button(control) = &tree.root.children[0].content else {
+                unreachable!();
+            };
+            assert_eq!(control.state.focused, enabled, "enabled={enabled}");
+            assert_eq!(control.state.focus_visible, enabled, "enabled={enabled}");
+        }
+    }
 
     /// The hero banner's sky survives a MID-TONE terminal theme.
     ///
@@ -6814,6 +8289,7 @@ pub(crate) mod tests {
         let roles = crate::settings::Roles::from_theme(theme);
         let node = |spec: ButtonSpec, rect: LogicalRect| PaintNode {
             peek: false,
+            fade: None,
             key: UiKey::new("settings/nav/packages"),
             rect,
             clip: rect,
@@ -6906,6 +8382,7 @@ pub(crate) mod tests {
                 .trailing_icon(ButtonIcon::Forward);
             PaintNode {
                 peek: false,
+                fade: None,
                 key: UiKey::new("settings/control/active_tab_color"),
                 rect,
                 clip: rect,
@@ -7038,6 +8515,7 @@ pub(crate) mod tests {
             control.state.selected = selected;
             PaintNode {
                 peek: false,
+                fade: None,
                 key: UiKey::new("chrome/nav"),
                 rect,
                 clip: rect,
@@ -7113,6 +8591,7 @@ pub(crate) mod tests {
         control.state.selected = true;
         let chip_node = PaintNode {
             peek: false,
+            fade: None,
             key: UiKey::new("markdown/preview-mode"),
             rect: chip_rect,
             clip: chip_rect,
@@ -7130,6 +8609,97 @@ pub(crate) mod tests {
             "the selected mode chip elided its own word inside its authored {slot}pt slot \
              (semibold in a space measured for regular at {px}px)"
         );
+    }
+
+    /// ON WINDOWS A SELECTED RAIL ROW IS A WINUI NAVIGATION ITEM
+    /// ([`FLUENT_RAIL_SELECTION`]): a 3x16pt accent pill at its leading edge
+    /// and its own primary ink, with no accent rim or accent label; a toolbar
+    /// chip keeps its accent cell. Elsewhere the row keeps the accent ink and
+    /// the 4pt bar, and wears no rim either: on a row the outline is keyboard
+    /// focus's alone. NEGATIVE CONTROL: the row unselected wears neither pill
+    /// nor bar.
+    #[test]
+    fn a_selected_rail_row_wears_its_platforms_selection() {
+        use crate::native_appearance::forced_chrome_theme;
+        use crate::widget::DrawPrim;
+        use aterm_render::Theme;
+
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let theme = forced_chrome_theme(Theme::default(), false);
+        let roles = crate::settings::Roles::from_theme(theme);
+        let rect = LogicalRect::new(8.0, 40.0, 180.0, 34.0);
+        let paint = |spec: ButtonSpec, selected: bool| {
+            let mut control =
+                Control::new(spec, ActionId::new("chrome/nav")).style(StyleRef::Navigation);
+            control.state.selected = selected;
+            let node = PaintNode {
+                peek: false,
+                fade: None,
+                key: UiKey::new("chrome/nav"),
+                rect,
+                clip: rect,
+                content: UiContent::Button(control),
+            };
+            let mut prims = Vec::new();
+            paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
+            prims
+        };
+        // The leading accent mark, as `(width, height)`.
+        let mark = |prims: &[DrawPrim]| {
+            prims.iter().find_map(|p| match p {
+                DrawPrim::Panel { x, w, h, fill, .. }
+                    if *x == rect.x && *w <= 4.0 && fill[..3] == roles.accent =>
+                {
+                    Some((*w, *h))
+                }
+                _ => None,
+            })
+        };
+        // A stroke around the row (the pictogram's own strokes are ink).
+        let accent_rim = |prims: &[DrawPrim]| {
+            prims.iter().any(|p| {
+                matches!(
+                    p,
+                    DrawPrim::Stroke { w, color, .. }
+                        if *w >= rect.width - 8.0 && color[..3] == roles.accent
+                )
+            })
+        };
+        let ink = |prims: &[DrawPrim]| {
+            prims.iter().find_map(|p| match p {
+                DrawPrim::Text { color, .. } => Some([color[0], color[1], color[2]]),
+                _ => None,
+            })
+        };
+        let rail_row = || ButtonSpec::new("Appearance").visual_icon(ButtonIcon::Home);
+        let selected = paint(rail_row(), true);
+        assert_eq!(
+            mark(&paint(rail_row(), false)),
+            None,
+            "a resting row is unmarked"
+        );
+        if FLUENT_RAIL_SELECTION {
+            assert_eq!(mark(&selected), Some((3.0, 16.0)), "WinUI's pill");
+            assert!(!accent_rim(&selected), "no accent rim around the row");
+            assert_eq!(
+                ink(&selected),
+                Some(roles.text_primary),
+                "the ink is unchanged"
+            );
+            let chip = paint(
+                ButtonSpec::new("Preview mode").visual_label("Preview"),
+                true,
+            );
+            assert!(accent_rim(&chip), "a chip keeps its accent cell");
+        } else {
+            assert_eq!(
+                mark(&selected),
+                Some((4.0, rect.height - 8.0)),
+                "the rail bar"
+            );
+            assert!(!accent_rim(&selected), "no rim: the outline is focus's");
+            assert_eq!(ink(&selected), Some(roles.accent_ink), "the accent as text");
+        }
     }
 
     /// The paint-truth audit measures the face the painter DRAWS.
@@ -7174,6 +8744,7 @@ pub(crate) mod tests {
                 control.state.selected = selected;
                 let node = PaintNode {
                     peek: false,
+                    fade: None,
                     key: UiKey::new("chrome/nav"),
                     rect,
                     clip: rect,
@@ -7235,6 +8806,87 @@ pub(crate) mod tests {
         );
     }
 
+    /// ON A RAIL ROW THE OUTLINE IS FOCUS ALONE: in all four (selected,
+    /// focused) combinations, on both forced sides, a full-width accent
+    /// stroke appears exactly when the row has keyboard focus, 2pt wide; and
+    /// a focused selected row keeps its bar and wash, so it still reads as
+    /// selected under the ring.
+    #[test]
+    fn a_rail_rows_outline_is_focus_alone_never_selection() {
+        use crate::native_appearance::forced_chrome_theme;
+        use crate::widget::DrawPrim;
+        use aterm_render::Theme;
+
+        let terminal_light = Theme {
+            fg: 0x0065_7B83,
+            bg: 0x00FD_F6E3,
+            cursor: 0x0085_9900,
+            selection: 0x00EE_E8D5,
+        };
+        let rect = LogicalRect::new(8.0, 40.0, 180.0, 34.0);
+        let row = |selected: bool, focus_visible: bool| {
+            let mut control = Control::new(
+                ButtonSpec::new("Top Settings").visual_icon(ButtonIcon::Home),
+                ActionId::new("settings/nav/top"),
+            )
+            .style(StyleRef::Navigation);
+            control.state.selected = selected;
+            control.state.focus_visible = focus_visible;
+            PaintNode {
+                peek: false,
+                fade: None,
+                key: UiKey::new("settings/nav/top"),
+                rect,
+                clip: rect,
+                content: UiContent::Button(control),
+            }
+        };
+        for (label, theme) in [
+            ("forced-light", forced_chrome_theme(Theme::default(), false)),
+            ("forced-dark", forced_chrome_theme(terminal_light, true)),
+        ] {
+            let roles = crate::settings::Roles::from_theme(theme);
+            for selected in [false, true] {
+                for focus_visible in [false, true] {
+                    let mut prims = Vec::new();
+                    paint_compiled_node(
+                        &mut prims,
+                        &row(selected, focus_visible),
+                        roles,
+                        theme,
+                        14.0,
+                    );
+                    let ring = prims.iter().find_map(|p| match p {
+                        DrawPrim::Stroke {
+                            w, width, color, ..
+                        } if *w >= rect.width - 2.0 && color[..3] == roles.accent => Some(*width),
+                        _ => None,
+                    });
+                    assert_eq!(
+                        ring,
+                        focus_visible.then_some(2.0),
+                        "{label}: selected={selected} focus={focus_visible}"
+                    );
+                    if selected {
+                        let bar = prims.iter().any(|p| {
+                            matches!(
+                                p,
+                                DrawPrim::Panel { x, w, fill, .. }
+                                    if (*x - rect.x).abs() < 0.01
+                                        && *w <= 6.0
+                                        && fill[..3] == roles.accent
+                            )
+                        });
+                        let wash = prims.iter().any(
+                            |p| matches!(p, DrawPrim::Panel { w, .. } if *w >= rect.width - 0.01),
+                        );
+                        assert!(bar && wash, "{label}: focus={focus_visible}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn responsive_button_and_status_labels_preserve_complete_graphemes() {
         for (source, expected) in [("A👩‍💻WWWW", "A👩‍💻…"), ("AéWWWW", "Aé…"), ("A🇺🇳WWWW", "A🇺🇳…")]
@@ -7261,6 +8913,25 @@ pub(crate) mod tests {
                 crate::widget::TextFace::Ui,
             ),
             capped_expected
+        );
+    }
+
+    /// An elided label ends on its last word: a cut that lands just past a
+    /// space draws "Typeset…", never "Typeset …".
+    #[test]
+    fn an_elided_label_never_leaves_a_space_before_its_ellipsis() {
+        let px = native_type_px(TypeStep::Body).get();
+        let face = crate::widget::TextFace::Ui;
+        // Room for "Typeset " and the ellipsis, not for the next letter.
+        let width =
+            visual_text_width("Typeset ", px, face) + visual_text_width("…", px, face) + 0.01;
+        assert!(
+            visual_text_width("Typeset M", px, face) + visual_text_width("…", px, face) > width,
+            "the cut lands on the space"
+        );
+        assert_eq!(
+            elide_text_label("Typeset Mirage", width, px, face),
+            "Typeset…"
         );
     }
 
@@ -8206,6 +9877,220 @@ pub(crate) mod tests {
         );
     }
 
+    /// THE WORDS A BUTTON PAINTS ARE IN ITS NAME (WCAG 2.5.3): one phrase,
+    /// case and spacing aside, an elision matched as the pieces it kept in
+    /// order, a glyph with no word exempt; a button that paints words its
+    /// name lacks does not compile. Negative controls: "Open Log" over "Open
+    /// the package log", "Colors" over "Appearance".
+    #[test]
+    fn a_buttons_painted_words_are_in_its_name() {
+        for (visual, name) in [
+            ("Clear", "Clear search"),
+            ("More sty\u{2026}", "More styles"),
+            (
+                "bidi \u{2014} Bi\u{2026}onal text",
+                "Insert bidi \u{2014} Bidirectional text",
+            ),
+            (
+                "Show  in finder",
+                "Show in Finder: the folder that holds aterm.toml",
+            ),
+            ("\u{2039}", "Previous config completions"),
+            (
+                "View",
+                "Review in Modified: view the unsaved Settings drafts",
+            ),
+            ("Open\u{2026} site", "Open Project Site"),
+            ("", "A card's surface"),
+        ] {
+            assert!(
+                visible_label_in_name(visual, name),
+                "{visual:?} in {name:?}"
+            );
+        }
+        for (visual, name) in [
+            ("Open Log", "Open the package log"),
+            ("Colors", "Appearance"),
+            ("Updates", "Software Update"),
+            ("Card\u{2026}dis", "Discard"),
+            // A word inside a longer one is not that word.
+            ("View", "Review in Modified: the unsaved Settings drafts"),
+            ("Art", "Restart now"),
+        ] {
+            assert!(
+                !visible_label_in_name(visual, name),
+                "{visual:?} in {name:?}"
+            );
+        }
+        let compile = |visual: &str, name: &str| {
+            UiTree::new(UiNode::new(
+                "button",
+                UiContent::Button(Control::new(
+                    ButtonSpec::new(name).visual_label(visual),
+                    ActionId::new("button"),
+                )),
+            ))
+            .compile(LogicalRect::new(0.0, 0.0, 200.0, 36.0))
+        };
+        assert!(compile("Open Log", "Open Log").is_ok());
+        assert_eq!(
+            compile("Open Log", "Open the package log").err(),
+            Some(CompileError::VisibleLabelNotInName(UiKey::new("button")))
+        );
+    }
+
+    /// A SEGMENTED CONTROL IS ONE TAB STOP ([`UiNode::segmented`]): the
+    /// focused segment, else the selected one; every segment stays in the
+    /// tree and is hit; Left/Right step between them and stop at the ends.
+    /// Negative control: the same buttons in a plain group are three stops.
+    #[test]
+    fn a_segmented_control_is_one_tab_stop() {
+        let segment = |key: &str, selected: bool, focused: bool| {
+            UiNode::new(
+                key,
+                UiContent::Button(
+                    Control::new(ButtonSpec::new(key), ActionId::new(key)).state(ControlState {
+                        selected,
+                        focused,
+                        ..ControlState::default()
+                    }),
+                ),
+            )
+            .layout(Layout::default().width(Length::Fill).height(Length::Fill))
+        };
+        let compile = |segmented: bool, focused: Option<&str>| {
+            let mut group = UiNode::new("choice", UiContent::Group(GroupSpec::new("Choice")))
+                .layout(
+                    Layout::row()
+                        .width(Length::Fill)
+                        .height(Length::Fixed(36.0)),
+                )
+                .children(
+                    ["a", "b", "c"]
+                        .into_iter()
+                        .map(|key| segment(key, key == "a", focused == Some(key)))
+                        .collect(),
+                );
+            if segmented {
+                group = group.segmented();
+            }
+            UiTree::new(group)
+                .compile(LogicalRect::new(0.0, 0.0, 300.0, 36.0))
+                .unwrap()
+        };
+        let keys = |compiled: &CompiledUi| {
+            compiled
+                .focus_order
+                .iter()
+                .map(|key| key.as_str().to_string())
+                .collect::<Vec<_>>()
+        };
+        let rest = compile(true, None);
+        assert_eq!(keys(&rest), ["a"], "the selected segment");
+        assert_eq!(rest.hits.len(), 3, "every segment is hit");
+        assert_eq!(keys(&compile(true, Some("b"))), ["b"], "the focused one");
+        assert_eq!(
+            rest.segment_step(&UiKey::new("a"), 1),
+            Some(Some(UiKey::new("b")))
+        );
+        assert_eq!(
+            rest.segment_step(&UiKey::new("c"), 1),
+            Some(None),
+            "its end"
+        );
+        assert_eq!(
+            rest.segment_step(&UiKey::new("choice"), 1),
+            None,
+            "no segment"
+        );
+        assert_eq!(
+            keys(&compile(false, None)),
+            ["a", "b", "c"],
+            "a plain group"
+        );
+    }
+
+    /// A PLACEHOLDER FITS ITS BOX: whole where it fits, its plain words
+    /// without " (default)" where only they fit, else elided; a swatch takes
+    /// its room from the box.
+    #[test]
+    fn a_field_placeholder_fits_its_box() {
+        let placeholder = "Automatic (default)";
+        assert_eq!(
+            fit_native_field_placeholder(placeholder, 200.0, false),
+            placeholder
+        );
+        assert_eq!(
+            fit_native_field_placeholder(placeholder, 118.0, false),
+            "Automatic"
+        );
+        let narrow = fit_native_field_placeholder(placeholder, 40.0, false);
+        assert!(narrow.ends_with('\u{2026}'), "{narrow:?}");
+        let px = native_type_px(TypeStep::Secondary).get();
+        let box_of = |field: f32| field - 2.0 * TEXT_FIELD_HORIZONTAL_PADDING;
+        assert!(visual_text_width(&narrow, px, crate::widget::TextFace::Ui) <= box_of(40.0) + 0.01);
+        // The width where the whole words just fit, less a swatch, drops
+        // the "(default)".
+        let whole = visual_text_width(placeholder, px, crate::widget::TextFace::Ui)
+            + 2.0 * TEXT_FIELD_HORIZONTAL_PADDING;
+        assert_eq!(
+            fit_native_field_placeholder(placeholder, whole, false),
+            placeholder
+        );
+        assert_ne!(
+            fit_native_field_placeholder(placeholder, whole, true),
+            placeholder
+        );
+    }
+
+    /// The painter never cuts a placeholder mid-glyph: one nobody fitted is
+    /// painted elided inside the box, and the audit still reports it
+    /// (overflow=true, painted the elided words) — the negative control for
+    /// a page that forgot to fit its own.
+    #[test]
+    fn an_unfitted_placeholder_paints_elided_and_is_reported() {
+        use crate::widget::DrawPrim;
+        let control = Control::new(
+            TextFieldSpec {
+                label: "Selected tab color".to_string(),
+                placeholder: Some("Automatic (default)".to_string()),
+                secret: false,
+                visual_value: None,
+                input: None,
+                swatch: None,
+                trailing_hint: None,
+                description: None,
+                end_button: false,
+            },
+            ActionId::new("set/tab"),
+        )
+        .value(SemanticValue::Text(String::new()));
+        let compiled = UiTree::new(UiNode::new("tab", UiContent::TextField(control)))
+            .compile(LogicalRect::new(0.0, 0.0, 70.0, 36.0))
+            .unwrap();
+        let prims = compiled.tray(aterm_render::Theme::default(), 13.0).prims;
+        let painted = prims
+            .iter()
+            .find_map(|prim| match prim {
+                DrawPrim::Text { s, .. } if !s.is_empty() => Some(s.clone()),
+                _ => None,
+            })
+            .expect("the placeholder paints");
+        assert!(painted.ends_with('\u{2026}'), "{painted:?}");
+        let px = native_type_px(TypeStep::Secondary).get();
+        assert!(
+            visual_text_width(&painted, px, crate::widget::TextFace::Ui)
+                <= 70.0 - 2.0 * TEXT_FIELD_HORIZONTAL_PADDING + 0.01
+        );
+        let audit = compiled
+            .paint_audit_lines()
+            .into_iter()
+            .find(|line| line.starts_with("paint-text") && line.contains("kind=text-field"))
+            .expect("the field is audited");
+        assert!(audit.contains("overflow=true"), "{audit}");
+        assert!(audit.contains(&format!("painted={painted:?}")), "{audit}");
+    }
+
     #[test]
     fn text_field_paints_the_canonical_selection_caret_preedit_and_swatch() {
         use crate::widget::DrawPrim;
@@ -8222,6 +10107,9 @@ pub(crate) mod tests {
                 visual_value: None,
                 input: Some(projection.clone()),
                 swatch: Some([12, 34, 56]),
+                trailing_hint: None,
+                description: None,
+                end_button: false,
             },
             ActionId::new("set/accent"),
         )
@@ -8282,6 +10170,9 @@ pub(crate) mod tests {
                 visual_value: None,
                 input: Some(input.projection()),
                 swatch: Some([30, 40, 50]),
+                trailing_hint: None,
+                description: None,
+                end_button: false,
             },
             ActionId::new("set/color"),
         )
@@ -8340,6 +10231,9 @@ pub(crate) mod tests {
                 visual_value: None,
                 input: Some(input.projection()),
                 swatch: None,
+                trailing_hint: None,
+                description: None,
+                end_button: false,
             },
             ActionId::new("set/fonts"),
         )
@@ -8381,6 +10275,8 @@ pub(crate) mod tests {
     fn slider_pointer_value_uses_the_painted_track_and_authored_step() {
         let slider = Control::new(
             SliderSpec {
+                description: None,
+                track: None,
                 label: "Font size".to_string(),
                 step: 2.0,
                 display_value: "14".to_string(),
@@ -8460,6 +10356,9 @@ pub(crate) mod tests {
             ButtonIcon::Sound,
             ButtonIcon::Themes,
             ButtonIcon::Spark,
+            ButtonIcon::Trash,
+            ButtonIcon::Reset,
+            ButtonIcon::Clear,
         ] {
             let mut prims = Vec::new();
             paint_button_icon(
@@ -8554,6 +10453,76 @@ pub(crate) mod tests {
         assert_eq!(geometry.cell_w, measured);
     }
 
+    /// THE TOOLBAR PLAN: buttons flow in order at their own widths into the
+    /// fewest rows; within them the last buttons take their short words
+    /// first; past three rows the buttons M-x also lists give way (Redo, then
+    /// Go to Line, then Find), never Save, Commands or the problem pair; and
+    /// no plan cuts a label.
+    #[test]
+    fn the_editor_toolbar_plan_wraps_shortens_and_yields_in_order() {
+        let toolbar = EditorToolbar {
+            problem_navigation: true,
+            reload: false,
+        };
+        let items = editor_toolbar_items(toolbar);
+        let gap = 4.0;
+        let width = |label: &str| editor_toolbar_button_width(label);
+        let long_total: f32 =
+            items.iter().map(|item| width(item.long)).sum::<f32>() + gap * (items.len() - 1) as f32;
+        let words = |plan: &EditorToolbarPlan| {
+            plan.rows
+                .iter()
+                .map(|row| row.iter().map(|(_, label, _)| *label).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        // Room for all in long words: one row.
+        let plan = plan_editor_toolbar(&items, long_total, gap);
+        assert_eq!(plan.rows.len(), 1);
+        assert_eq!(words(&plan)[0].last(), Some(&"Next Issue"));
+        // A little short: the last button takes its short word, still one row.
+        let less = long_total - (width("Next Issue") - width("Next")) + 0.5;
+        let plan = plan_editor_toolbar(&items, less, gap);
+        assert_eq!(plan.rows.len(), 1, "{:?}", words(&plan));
+        assert_eq!(words(&plan)[0].last(), Some(&"Next"));
+        assert_eq!(words(&plan)[0][6], "Prev Issue", "the last first");
+        // Half the room: two rows, in long words, in reading order.
+        let plan = plan_editor_toolbar(&items, long_total * 0.55, gap);
+        assert_eq!(plan.rows.len(), 2);
+        let flat: Vec<&str> = words(&plan).concat();
+        assert_eq!(
+            flat,
+            items.iter().map(|item| item.long).collect::<Vec<_>>(),
+            "order kept, long words kept"
+        );
+        // Barely more than one button wide: past three rows, the M-x-listed
+        // buttons give way in order, and what stays is whole.
+        let narrow = width("Next Issue") + 1.0;
+        let plan = plan_editor_toolbar(&items, narrow, gap);
+        let flat: Vec<&str> = words(&plan).concat();
+        for kept in ["Save", "Undo", "Commands"] {
+            assert!(flat.contains(&kept), "{kept}: {flat:?}");
+        }
+        assert!(flat.contains(&"Prev") || flat.contains(&"Prev Issue"));
+        assert!(!flat.contains(&"Redo"), "Redo gives way first: {flat:?}");
+        for row in &plan.rows {
+            let used: f32 = row.iter().map(|(_, _, w)| w).sum::<f32>()
+                + gap * (row.len().saturating_sub(1)) as f32;
+            assert!(used <= narrow + 0.01 || row.len() == 1, "{row:?}");
+            for (_, label, w) in row {
+                assert_eq!(*w, width(label), "never squeezed");
+            }
+        }
+        // Between: three rows of short words keep every button.
+        let three = plan_editor_toolbar(&items, long_total * 0.36, gap);
+        assert!(three.rows.len() <= EDITOR_TOOLBAR_MAX_ROWS);
+        assert_eq!(
+            three.rows.concat().len(),
+            items.len(),
+            "{:?}",
+            words(&three)
+        );
+    }
+
     /// The floor is a promise about DOCUMENT rows, so it has to hold across the
     /// window sizes a person actually uses — not only at the default one. Below
     /// ~335 px of viewport the palette's own "always show one candidate" floor
@@ -8565,7 +10534,12 @@ pub(crate) mod tests {
             for height in 335..=1_200 {
                 for candidates in [1_usize, 3, 8] {
                     let viewport = LogicalRect::new(0.0, 0.0, width as f32, height as f32);
-                    let editor = editor_text_viewport_rect_at_scale(viewport, candidates, 1.0);
+                    let editor = editor_text_viewport_rect_at_scale(
+                        viewport,
+                        candidates,
+                        EditorToolbar::default(),
+                        1.0,
+                    );
                     let geometry = text_viewport_geometry_at_scale(editor, 1.0);
                     let rows = (geometry.body_h / geometry.line_h).floor() as usize;
                     assert!(
@@ -8579,7 +10553,8 @@ pub(crate) mod tests {
         // Dynamic Type scales the floor with the text it protects: a 2× reader
         // keeps whole rows of their own 40 px lines rather than a taller list.
         let large_type = LogicalRect::new(0.0, 0.0, 744.0, 760.0);
-        let editor = editor_text_viewport_rect_at_scale(large_type, 8_usize, 2.0);
+        let editor =
+            editor_text_viewport_rect_at_scale(large_type, 8_usize, EditorToolbar::default(), 2.0);
         let geometry = text_viewport_geometry_at_scale(editor, 2.0);
         assert!(
             (geometry.body_h / geometry.line_h).floor() as usize >= MINIMUM_EDITOR_DOCUMENT_ROWS,
@@ -8957,6 +10932,44 @@ pub(crate) mod tests {
         assert_ne!(compiled.fingerprint(), other.fingerprint());
     }
 
+    /// A paint-only tree paints every node of a decorative face and puts
+    /// none of them in the tree; `paint_only` alone hides only the node it
+    /// marks (the negative control: its child still projects).
+    #[test]
+    fn paint_only_tree_hides_the_whole_face() {
+        let compile = |face: UiNode| {
+            UiTree::new(
+                UiNode::new("row", UiContent::Group(GroupSpec::new("Row"))).children(vec![face]),
+            )
+            .compile(LogicalRect::new(0.0, 0.0, 240.0, 40.0))
+            .unwrap()
+        };
+        let face = || {
+            UiNode::new(
+                "row/face",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .children(vec![UiNode::new(
+                "row/face/name",
+                UiContent::Text(TextSpec {
+                    text: "Row".to_string(),
+                    role: SemanticRole::Text,
+                    style: StyleRef::Primary,
+                }),
+            )])
+        };
+        let whole = compile(face().paint_only_tree());
+        assert_eq!(whole.paint.len(), 3);
+        let keys: Vec<&str> = whole
+            .semantics
+            .iter()
+            .map(|node| node.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["row"]);
+        let shallow = compile(face().paint_only());
+        assert!(shallow.semantic(&UiKey::new("row/face/name")).is_some());
+    }
+
     #[test]
     fn fixed_and_fill_layout_is_deterministic() {
         let tree = UiTree::new(
@@ -8985,57 +10998,180 @@ pub(crate) mod tests {
         );
     }
 
-    /// The Tab Color wheel's pointer mapping and marker placement are exact
-    /// inverses on the SAME polar convention the raster paints (clockwise
-    /// turns from 12 o'clock, radius = saturation, at the committed color's
-    /// brightness): a pick at the marker of any committed color re-picks that
-    /// color, the disk centre is the gray of that brightness (saturation 0),
-    /// and a point outside the disk is a miss — so a click can never commit a
-    /// color the pixels did not show.
+    /// The wheel's polar mapping (clockwise turns from 12 o'clock, radius =
+    /// saturation) is one map both ways: a pick at the marker of any hue and
+    /// saturation picks them again, the centre is saturation 0, a point
+    /// outside the disk is a miss, and the pick does not depend on the
+    /// brightness the disk is painted at.
     #[test]
     fn color_wheel_pick_and_marker_round_trip() {
         let rect = LogicalRect::new(10.0, 20.0, 240.0, 240.0);
         let geometry = color_wheel_geometry(rect);
+        let (_, centre) = color_wheel_pick_at(rect, geometry.cx, geometry.cy).unwrap();
+        assert_eq!(centre, 0.0, "disk centre is saturation 0");
         assert_eq!(
-            color_wheel_rgb_at(rect, geometry.cx, geometry.cy, 1.0),
-            Some([255, 255, 255]),
-            "disk centre is the zero-saturation white axis"
-        );
-        assert_eq!(
-            color_wheel_rgb_at(rect, geometry.cx + geometry.r + 2.0, geometry.cy, 1.0),
+            color_wheel_pick_at(rect, geometry.cx + geometry.r + 2.0, geometry.cy),
             None,
             "outside the disk is a miss, not a pick"
         );
-        // 12 o'clock at full radius is pure red (hue 0, saturation 1).
-        let top =
-            color_wheel_rgb_at(rect, geometry.cx, geometry.cy - geometry.r + 0.5, 1.0).unwrap();
+        // 12 o'clock at full radius is hue 0; 3 o'clock a quarter turn.
+        let (top, full) =
+            color_wheel_pick_at(rect, geometry.cx, geometry.cy - geometry.r + 0.01).unwrap();
+        assert!(top < 1e-3 || top > 1.0 - 1e-3, "top is hue 0: {top}");
+        assert!(full > 0.99, "full radius is saturation 1: {full}");
+        let (right, _) =
+            color_wheel_pick_at(rect, geometry.cx + geometry.r - 0.01, geometry.cy).unwrap();
         assert!(
-            top[0] > 250 && top[1] < 8 && top[2] < 8,
-            "top is red: {top:?}"
+            (right - 0.25).abs() < 1e-3,
+            "3 o'clock is hue 0.25: {right}"
         );
-        for rgb in [
-            [255, 42, 165],
-            [255, 233, 74],
-            [18, 171, 52],
-            [64, 64, 255],
-            [40, 20, 90],
-        ] {
-            let hex = format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
-            let value = color_wheel_value(Some(&hex));
-            let (mx, my) = color_wheel_marker_at(rect, rgb);
-            let picked = color_wheel_rgb_at(rect, mx, my, value).expect("marker is on the disk");
-            for channel in 0..3 {
-                assert!(
-                    (i32::from(picked[channel]) - i32::from(rgb[channel])).abs() <= 3,
-                    "marker roundtrip drifted for {rgb:?}: picked {picked:?}"
-                );
-            }
+        for (hue, saturation) in [(0.0889, 1.0), (0.5, 0.4), (0.91, 0.75), (0.33, 0.05)] {
+            let (mx, my) = color_wheel_marker_at(rect, hue, saturation);
+            let (h, s) = color_wheel_pick_at(rect, mx, my).expect("marker is on the disk");
+            assert!(
+                (h - hue).abs() < 1e-3 && (s - saturation).abs() < 1e-3,
+                "marker round trip drifted for {hue}/{saturation}: {h}/{s}"
+            );
         }
-        assert_eq!(color_wheel_value(None), 1.0, "no color: full brightness");
     }
 
-    /// Keyboard focus on a SELECTED segment (or rail row, or default button)
-    /// is as plain as on any other control: an inner ring in the label
+    /// A FIELD NOT BEING EDITED SAYS WHAT IT CUTS: a path wider than its
+    /// field paints "…" and its end, the file's name included, and a click at
+    /// the field's end lands on the value's end; any other value paints its
+    /// start and "…". Both are deliberate fitting to the fit audit. Negative
+    /// control: a value that fits, or a field being edited, paints no mark.
+    #[test]
+    fn an_unfocused_field_marks_what_it_cuts() {
+        let theme = aterm_render::Theme::default();
+        let roles = crate::settings::Roles::from_theme(theme);
+        // As wide as a settings row's field.
+        let rect = LogicalRect::new(0.0, 0.0, 300.0, 36.0);
+        let field = |value: &str, focused: bool| {
+            let mut control = Control::new(
+                TextFieldSpec {
+                    label: "Wallpaper image".to_string(),
+                    description: None,
+                    trailing_hint: None,
+                    placeholder: None,
+                    secret: false,
+                    visual_value: None,
+                    input: focused.then(|| {
+                        crate::native_text_input::TextInputState::new(value.to_string())
+                            .projection()
+                    }),
+                    swatch: None,
+                    end_button: false,
+                },
+                ActionId::new("settings/set/wallpaper"),
+            )
+            .value(SemanticValue::Text(value.to_string()));
+            control.state.enabled = true;
+            control.state.focused = focused;
+            PaintNode {
+                key: UiKey::new("settings/control/wallpaper"),
+                rect,
+                clip: rect,
+                content: UiContent::TextField(control),
+                peek: false,
+                fade: None,
+            }
+        };
+        let painted = |node: &PaintNode| {
+            let mut prims = Vec::new();
+            paint_compiled_node(&mut prims, node, roles, theme, 14.0);
+            prims
+                .into_iter()
+                .find_map(|prim| match prim {
+                    crate::widget::DrawPrim::Text { s, .. } => Some(s),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        let path =
+            "/Users//someone/Library/Mobile Documents/Pictures/Backdrops/sunset-over-the-bay.png";
+        let node = field(path, false);
+        let shown = painted(&node);
+        assert!(
+            shown.starts_with(TEXT_FIELD_ELLIPSIS) && shown.ends_with("sunset-over-the-bay.png"),
+            "a path keeps its end: {shown:?}"
+        );
+        let UiContent::TextField(control) = &node.content else {
+            unreachable!()
+        };
+        let size = native_type_px(TypeStep::Secondary).get();
+        let geometry = text_field_geometry(control, rect, size);
+        assert_eq!(geometry.visible.end, path.len());
+        let audit = text_fit_audit(&node).expect("audited");
+        assert!(!audit.overflow, "deliberate fitting: {audit:?}");
+        let words = "an ordinary value far too long to show whole in this field";
+        let shown = painted(&field(words, false));
+        assert!(
+            shown.starts_with("an ordinary") && shown.ends_with(TEXT_FIELD_ELLIPSIS),
+            "anything else keeps its start: {shown:?}"
+        );
+        // Negative controls.
+        assert_eq!(painted(&field("/tmp/wall.png", false)), "/tmp/wall.png");
+        assert!(!painted(&field(path, true)).contains(TEXT_FIELD_ELLIPSIS));
+    }
+
+    /// A wheel at brightness 0 still marks the hue it was picked at: the
+    /// marker is the picker's model, not the black `#000000` it saves.
+    /// Negative control: no colour marks nothing.
+    #[test]
+    fn a_black_wheel_marks_the_kept_hue() {
+        use crate::widget::DrawPrim;
+        let theme = aterm_render::Theme::default();
+        let roles = crate::settings::Roles::from_theme(theme);
+        let rect = LogicalRect::new(0.0, 0.0, 200.0, 200.0);
+        let paint = |hsv: Option<[f32; 3]>| {
+            let node = PaintNode {
+                key: UiKey::new("wheel"),
+                rect,
+                clip: rect,
+                content: UiContent::ColorWheel(Control::new(
+                    ColorWheelSpec {
+                        label: "Foreground color wheel".to_string(),
+                        hsv,
+                    },
+                    ActionId::new("settings/color-pick/foreground"),
+                )),
+                peek: false,
+                fade: None,
+            };
+            let mut prims = Vec::new();
+            paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
+            prims
+        };
+        let prims = paint(Some([0.25, 1.0, 0.0]));
+        let disk = prims.iter().find_map(|prim| match prim {
+            DrawPrim::HsvDisk { value, .. } => Some(*value),
+            _ => None,
+        });
+        assert_eq!(disk, Some(0.0), "the disk is painted black");
+        let (mx, my) = color_wheel_marker_at(rect, 0.25, 1.0);
+        let dots: Vec<(f32, f32)> = prims
+            .iter()
+            .filter_map(|prim| match prim {
+                DrawPrim::Dot { cx, cy, .. } => Some((*cx, *cy)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !dots.is_empty() && dots.iter().all(|&(x, y)| x == mx && y == my),
+            "the marker sits at 3 o'clock on the rim: {dots:?} vs {mx},{my}"
+        );
+        let geometry = color_wheel_geometry(rect);
+        assert!(mx > geometry.cx + geometry.r * 0.9, "off centre: {mx}");
+        assert!(
+            paint(None)
+                .iter()
+                .all(|prim| !matches!(prim, DrawPrim::Dot { .. })),
+            "no colour, no marker"
+        );
+    }
+
+    /// Keyboard focus on a SELECTED segment (or default button) is as plain
+    /// as on any other control: an inner ring in the label
     /// colour, which a selected control at rest does not wear; a destructive
     /// button wears a danger rim and label.
     #[test]
@@ -9059,6 +11195,7 @@ pub(crate) mod tests {
                 clip: rect,
                 content: UiContent::Button(control),
                 peek: false,
+                fade: None,
             };
             let mut prims = Vec::new();
             paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
@@ -9110,6 +11247,7 @@ pub(crate) mod tests {
                     clip: rect,
                     content: UiContent::Button(control),
                     peek: false,
+                    fade: None,
                 };
                 let mut prims = Vec::new();
                 paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
@@ -9190,6 +11328,153 @@ pub(crate) mod tests {
                 ink(&paint(StyleRef::Setting, false, true, false)),
                 [quiet_text(&roles)]
             );
+        }
+    }
+
+    /// A RESTING CONTROL IS RAISED, NOT SUNKEN, on a Windows light theme: a
+    /// Secondary button ("More styles…") and a Setting popup ("Default Light")
+    /// rest lighter than the card under them, WinUI's near-white control fill,
+    /// where they used to mix a step toward the ink and sit darker (#ececec on a
+    /// #f6f6f6 card, the 2026-10-18 judge). Dark themes keep the step toward the
+    /// ink, which is lighter there too. NEGATIVE CONTROL: macOS and Linux keep
+    /// their light controls a step darker than the card.
+    #[test]
+    fn resting_controls_rise_above_their_card_on_windows_light_themes() {
+        use crate::native_appearance::{contrast_ratio, surface_is_dark};
+        use crate::widget::DrawPrim;
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let openness = |c: [u8; 3]| contrast_ratio(c, [0, 0, 0]);
+        let mut light = 0;
+        for name in aterm_types::scheme::builtin_names() {
+            let scheme = aterm_types::scheme::builtin(name).expect("a built-in scheme");
+            let theme = aterm_render::Theme::from(&scheme);
+            let roles = crate::settings::Roles::from_theme(theme);
+            let rect = LogicalRect::new(10.0, 10.0, 160.0, 36.0);
+            for style in [StyleRef::Secondary, StyleRef::Setting] {
+                let control = Control::new(
+                    ButtonSpec::new("More styles").visual_label("More styles"),
+                    ActionId::new("settings/open/cursor.styles"),
+                )
+                .style(style);
+                let node = PaintNode {
+                    key: UiKey::new("settings/control/cursor.styles"),
+                    rect,
+                    clip: rect,
+                    content: UiContent::Button(control),
+                    peek: false,
+                    fade: None,
+                };
+                let mut prims = Vec::new();
+                paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
+                let fill = prims
+                    .iter()
+                    .find_map(|prim| match prim {
+                        DrawPrim::Panel { fill, .. } => Some([fill[0], fill[1], fill[2]]),
+                        _ => None,
+                    })
+                    .expect("a resting control paints its fill");
+                assert_eq!(fill, control_rest_fill(&roles), "{name} {style:?}");
+                let card = roles.elevated;
+                if surface_is_dark(roles.surface) {
+                    assert!(openness(fill) > openness(card), "{name}: dark rest");
+                } else {
+                    light += 1;
+                    assert_eq!(
+                        openness(fill) > openness(card),
+                        cfg!(windows),
+                        "{name} {style:?}: rest fill {fill:?} on card {card:?}"
+                    );
+                }
+            }
+        }
+        assert!(light >= 8, "light built-ins measured: {light}");
+    }
+
+    /// A QUIET BUTTON THAT SHOWS WORDS IS A BUTTON on Windows: Browse
+    /// themes…, Reset, Import… and Folder paint WinUI's standard Button, the
+    /// opaque resting fill inside the separator rim, exactly as the
+    /// Secondary Customize beside them does, at rest, hovered and disabled.
+    /// They rested at 72/255 of that fill with no rim, 1.01:1 on a light card
+    /// (the 2026-10-18 Fluent judge's
+    /// `J4F-8-settings-secondary-buttons-invisible`). A quiet icon button
+    /// stays subtle (no rim). NEGATIVE CONTROL: macOS and Linux keep the quiet
+    /// text button rimless.
+    #[test]
+    fn quiet_text_buttons_are_standard_buttons_on_windows() {
+        use crate::widget::DrawPrim;
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let rimmed = |prims: &[DrawPrim]| {
+            prims
+                .iter()
+                .any(|prim| matches!(prim, DrawPrim::Stroke { width, .. } if *width == 1.0))
+        };
+        for name in ["Default Light", "Default"] {
+            let scheme = aterm_types::scheme::builtin(name).expect("a built-in scheme");
+            let theme = aterm_render::Theme::from(&scheme);
+            let roles = crate::settings::Roles::from_theme(theme);
+            let rect = LogicalRect::new(10.0, 10.0, 120.0, 36.0);
+            let paint = |spec: ButtonSpec, style: StyleRef, state: ControlState| {
+                let control = Control::new(spec, ActionId::new("settings/route/themes"))
+                    .state(state)
+                    .style(style);
+                let node = PaintNode {
+                    key: UiKey::new("settings/theme/browse"),
+                    rect,
+                    clip: rect,
+                    content: UiContent::Button(control),
+                    peek: false,
+                    fade: None,
+                };
+                let mut prims = Vec::new();
+                paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
+                prims
+            };
+            let words = || ButtonSpec::new("Browse themes").visual_label("Browse themes\u{2026}");
+            for state in [
+                ControlState::default(),
+                ControlState {
+                    hovered: true,
+                    ..ControlState::default()
+                },
+                ControlState {
+                    enabled: false,
+                    ..ControlState::default()
+                },
+            ] {
+                let quiet = paint(words(), StyleRef::Quiet, state);
+                let secondary = paint(words(), StyleRef::Secondary, state);
+                assert_eq!(rimmed(&quiet), cfg!(windows), "{name} {state:?}");
+                assert_eq!(
+                    format!("{quiet:?}") == format!("{secondary:?}"),
+                    cfg!(windows),
+                    "{name} {state:?}: a quiet text button is a Secondary one on Windows only"
+                );
+            }
+            let rest = paint(words(), StyleRef::Quiet, ControlState::default());
+            let fill = rest
+                .iter()
+                .find_map(|prim| match prim {
+                    DrawPrim::Panel { fill, .. } => Some(*fill),
+                    _ => None,
+                })
+                .expect("a resting quiet button paints its fill");
+            let rest_fill = control_rest_fill(&roles);
+            if cfg!(windows) {
+                assert_eq!(
+                    fill,
+                    [rest_fill[0], rest_fill[1], rest_fill[2], 255],
+                    "{name}"
+                );
+            } else {
+                assert_eq!(fill[3], 72, "{name}: the quiet wash elsewhere");
+            }
+            // A quiet icon button stays subtle on every platform.
+            let icon = paint(
+                ButtonSpec::new("Browse themes").visual_icon(ButtonIcon::Forward),
+                StyleRef::Quiet,
+                ControlState::default(),
+            );
+            assert!(!rimmed(&icon), "{name}: a quiet icon button has no rim");
         }
     }
 }

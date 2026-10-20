@@ -1,63 +1,60 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SETTINGS ▸ THEMES, the Theme Showcase: every theme aterm can draw as a
-//! live miniature, a way to try one on the whole app before keeping it, the
-//! colour and type settings a theme is tuned with, and "Save as theme…".
+//! SETTINGS ▸ THEMES: one job, show your terminal in another theme, then
+//! keep it or go back.
 //!
-//! The page has two views behind one toolbar segment:
+//! The page is three parts ([`view`] lays them out):
 //!
-//! * **Gallery** — a grid of theme cards ([`ShowcaseCard`], built once per
-//!   catalog generation): aterm's signature themes first, then the other
-//!   built-ins, then the person's own files. Chips narrow it to dark, light or
-//!   yours, and a filter field matches a name, id, description or appearance.
-//!   Each card is one button labelled `<name>, dark|light, text contrast X:1`
-//!   over a paint-only specimen tile in that theme's own colours.
-//!   Your own themes' cards also carry Open (the file) and Trash (moves the
-//!   file to the Trash, after a second press; never the theme in use).
-//! * **Customize** — the existing registry rows for the font family, size,
-//!   line height, ligatures and weight, the five colour overrides and the
-//!   look rows (minimum contrast, bold is bright, background opacity), each
-//!   with its Reset; the sixteen palette slots as chips; and the stage
-//!   specimen, which draws the drafts as they are typed. A slot is written
-//!   as one `palette_overrides.<index>` key, so a tuned slot follows every
-//!   theme without pinning the slots before it; a person who already has a
-//!   positional `palette` list edits that list where it reaches. Every edit
-//!   goes through the page's ordinary draft and patch lane: the same drafts,
-//!   the same Return, the same OCC patch, the same Undo.
+//! * **The chooser** — one 32pt row per theme ([`ShowcaseCard`], built once
+//!   per catalog generation): aterm's signature themes first, then the other
+//!   built-ins, the person's own files, and the community pack behind one
+//!   disclosure. A filter matches a name, id, description, `dark`/`light`,
+//!   `yours`, `font` or `community`. The row the keyboard or the pointer
+//!   picks is the trial: highlight equals trial, and the theme in use is no
+//!   trial. Hover only tints.
+//! * **The demo** — a real terminal parser and the shipping renderer playing
+//!   a scripted shell session ([`crate::settings_theme_demo`]) in the
+//!   candidate theme, its window chrome in the theme's chrome tokens.
+//! * **The strip** — one row under the demo, always reserved, offering one
+//!   obvious action per moment: Customize while idle, Revert and Keep while a
+//!   theme is tried, Done while the Customize sheet is open.
 //!
-//! On a Wide page the stage stands beside both views, drawing the card under
-//! the pointer or the keyboard in the terminal's own font before anything is
-//! tried. While colour settings of the person's are in force, the bar over
-//! the gallery says so: they draw on top of every theme tried.
+//! TRYING A THEME. The view records the trial ([`ShowcaseTrial::Trying`]) and
+//! the host draws it everywhere through the transient preview lane
+//! ([`crate::App::sync_settings_theme_trial`]), writing nothing; a community
+//! pack theme is drawn from the embedded pack, so no file is written either.
+//! Keep writes `theme` once through the patch lane (only the side the
+//! segment names while the theme follows the system); a pack theme's Keep
+//! adds its file first and writes `theme` once the catalog lists it. Revert,
+//! Esc, leaving the page and closing Settings all end the trial the same way:
+//! no view asks for it any more, so the host reverts.
 //!
-//! TRYING A THEME. Activating a card tries it: the view records the trial
-//! ([`ShowcaseTrial::Trying`]) and the host draws it everywhere through the
-//! transient preview lane ([`crate::App::sync_settings_theme_trial`]), writing
-//! nothing. A sticky bar reads "Trying <name>" with Keep and Revert. Keep (or
-//! activating the tried card again, or Return with nothing focused) writes
-//! `theme` once through the patch lane — the one side shown when the theme
-//! follows the system — and the trial stands until that write's reload draws
-//! the theme for real. Revert, Esc, leaving the page and closing Settings all
-//! end it the same way: no view asks for it any more, so the host reverts.
-//!
-//! SAVE AS THEME writes the colours the stage shows (the theme with every
-//! override and draft over it) as a new theme file through the host's one
-//! theme write path, then — once the catalog lists it — selects it and clears
-//! the overrides it now carries, in one patch. The drafts it carried stay
-//! drafts until that patch lands; a failed write reopens the name row with
-//! the reason, and nothing typed is lost.
+//! THE CUSTOMIZE SHEET ([`customize`]) replaces the chooser: the five colour
+//! overrides with their Resets, the sixteen palette slots, and "Save as
+//! theme…", which writes the colours the demo shows as a new theme file
+//! through the host's one theme write path, then — once the catalog lists it
+//! — selects it and clears the overrides it now carries, in one patch.
 
 use super::*;
 use crate::control_theme::ThemeTrialIntent;
-use crate::settings_preview::theme_card::{
-    ShowcaseCard, ShowcaseTier, showcase_cards, tile_height,
-};
+use crate::settings_preview::theme_card::{AttentionRow, Section, ShowcaseCard, showcase_cards};
+
+/// The Customize sheet: colour rows, the palette and Save as theme.
+#[path = "native_settings_showcase_customize.rs"]
+mod customize;
+/// The page's layout: the chooser, the demo and the strip.
+#[path = "native_settings_showcase_view.rs"]
+mod view;
+
+pub(super) use view::{demo_font_candidate, demo_spec, themes_page};
 
 /// Every action the page mints starts with this.
 pub(super) const SHOWCASE_ACTION_PREFIX: &str = "settings/showcase/";
-/// The gallery's filter field (its node key and its action).
+/// The chooser's filter field (its node key and its action).
 pub(super) const SHOWCASE_FILTER: &str = "settings/showcase/filter";
+/// The filter's Clear, over its end while it holds a query.
+const FILTER_CLEAR: &str = "settings/showcase/filter-clear";
 /// The Save as theme name field.
 pub(super) const SHOWCASE_SAVE_NAME: &str = "settings/showcase/save-name";
 /// The palette slot editor's field.
@@ -72,14 +69,22 @@ pub(super) const SHOWCASE_KEEP_COLOURS: &str = "settings/showcase/keep-colours";
 pub(super) const SHOWCASE_SAVE_TYPE: &str = "settings/showcase/save-type";
 /// Open the Save as theme row.
 pub(super) const SHOWCASE_SAVE_AS: &str = "settings/showcase/save-as";
-/// A card: `settings/showcase/card/<slug>`.
+/// The chooser's list of themes (a list box).
+pub(super) const SHOWCASE_LIST: &str = "settings/showcase/list";
+/// A row: `settings/showcase/card/<slug>`.
 const CARD_PREFIX: &str = "settings/showcase/card/";
-/// A chip: `settings/showcase/chip/<all|dark|light|yours>`.
-const CHIP_PREFIX: &str = "settings/showcase/chip/";
-/// The footer's Get More: the More chip's filter, from the footer.
-const FOOTER_GET_MORE: &str = "settings/showcase/footer/get-more";
-const VIEW_GALLERY: &str = "settings/showcase/view/gallery";
-const VIEW_CUSTOMIZE: &str = "settings/showcase/view/customize";
+/// The Keep split button's chevron: shows Keep colours only.
+const KEEP_MORE: &str = "settings/showcase/keep-more";
+/// Open the Customize sheet, and close it.
+const CUSTOMIZE: &str = "settings/showcase/customize";
+const CUSTOMIZE_DONE: &str = "settings/showcase/customize-done";
+/// The community pack's disclosure.
+const PACK: &str = "settings/showcase/pack";
+/// Match system appearance.
+const FOLLOW_SYSTEM: &str = "settings/showcase/follow-system";
+/// The Dark | Light segment while the theme follows the system:
+/// `settings/showcase/side/<dark|light>`.
+const SIDE_PREFIX: &str = "settings/showcase/side/";
 const SAVE_CONFIRM: &str = "settings/showcase/save";
 const SAVE_CANCEL: &str = "settings/showcase/save-cancel";
 const IMPORT: &str = "settings/showcase/import";
@@ -91,27 +96,17 @@ const PALETTE_SLOT_CLOSE: &str = "settings/showcase/palette-slot-close";
 /// Reset every palette slot: the `palette` list and the `palette_overrides`
 /// table.
 const PALETTE_RESET_ALL: &str = "settings/showcase/palette-reset";
-/// From the bar's override note to the Customize view, where each override
-/// has its Reset.
-const SHOW_OVERRIDES: &str = "settings/showcase/show-overrides";
-/// A Yours card's file actions: `settings/showcase/card/<slug>/<verb>`.
+/// A Yours row's file actions: `settings/showcase/card/<slug>/<verb>`.
 const CARD_OPEN: &str = "open";
 const CARD_TRASH: &str = "trash";
 
 /// The page's heading.
 const SHOWCASE_TITLE: &str = "Themes";
-/// The gap between cards, and between the gallery and the stage.
-const GUTTER: f32 = 12.0;
-/// The room a scrolling gallery keeps clear at its trailing edge for the
-/// list's scroll thumb, which paints 3pt wide at 7pt in: clear of a card's
-/// frame and of the tile inset inside it.
-const THUMB_GUTTER: f32 = 12.0;
-/// The padding between a card's edge and its tile and text.
-const CARD_PAD: f32 = 6.0;
-/// The stage column beside a Wide gallery.
-const STAGE_WIDTH: f32 = 280.0;
+/// The room a scrolling column keeps clear at its trailing edge for the
+/// list's scroll thumb, which paints 3pt wide at 7pt in.
+pub(super) const THUMB_GUTTER: f32 = 12.0;
 
-/// The colour overrides the Customize view edits, in the order it lists
+/// The colour overrides the Customize sheet edits, in the order it lists
 /// them (`COLOR_KEYS` also holds the cursor trail's two colours, which a
 /// theme does not set).
 pub(super) const SHOWCASE_COLOR_KEYS: [&str; 5] = [
@@ -121,88 +116,6 @@ pub(super) const SHOWCASE_COLOR_KEYS: [&str; 5] = [
     prefs::EDIT_SELECTION_COLOR,
     prefs::EDIT_SELECTION_FOREGROUND,
 ];
-
-/// The look settings the Customize view edits beside the colours: they
-/// change how any theme reads, so Save as theme neither writes nor clears
-/// them (a theme file may carry `bold_is_bright` or `palette_generate`, but
-/// these rows stay the person's own settings).
-pub(super) const SHOWCASE_LOOK_KEYS: [&str; 4] = [
-    prefs::EDIT_MINIMUM_CONTRAST,
-    prefs::EDIT_BOLD_IS_BRIGHT,
-    prefs::EDIT_PALETTE_GENERATE,
-    prefs::EDIT_BACKGROUND_OPACITY,
-];
-
-/// The type settings the Customize view edits. `font_weight` is a real key
-/// (it acts on a font with a `wght` axis), so it is listed.
-pub(super) const SHOWCASE_TYPE_KEYS: [&str; 6] = [
-    prefs::EDIT_FONT_FAMILY,
-    prefs::EDIT_FONT_PX,
-    prefs::EDIT_FONT_SIZE_SCALE,
-    prefs::EDIT_LINE_HEIGHT,
-    prefs::EDIT_LIGATURES,
-    prefs::EDIT_FONT_WEIGHT,
-];
-
-/// The gallery's appearance and origin chips.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum ShowcaseChip {
-    #[default]
-    All,
-    Dark,
-    Light,
-    Yours,
-    /// The community pack's themes not yet in the themes folder.
-    More,
-}
-
-impl ShowcaseChip {
-    pub(crate) const ALL: [Self; 5] = [Self::All, Self::Dark, Self::Light, Self::Yours, Self::More];
-
-    /// The filter chips every toolbar seats. Get More joins them where the
-    /// row has room ([`toolbar_chips`]); it is always in the footer, beside
-    /// Import… and the themes folder. A fifth chip on a narrow row would
-    /// push the chips onto a row of their own, and a small window's first
-    /// screen would then hold no card.
-    pub(crate) const TOOLBAR: [Self; 4] = [Self::All, Self::Dark, Self::Light, Self::Yours];
-
-    const fn word(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::Dark => "dark",
-            Self::Light => "light",
-            Self::Yours => "yours",
-            Self::More => "more",
-        }
-    }
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::All => "All",
-            Self::Dark => "Dark",
-            Self::Light => "Light",
-            Self::Yours => "Yours",
-            Self::More => "Get More",
-        }
-    }
-
-    fn from_word(word: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|chip| chip.word() == word)
-    }
-
-    /// Whether the chip admits `card`. The pack's cards are only under
-    /// Get More: every other chip shows what can be drawn now.
-    pub(crate) fn admits(self, card: &ShowcaseCard) -> bool {
-        let pack = card.tier == ShowcaseTier::Pack;
-        match self {
-            Self::All => !pack,
-            Self::Dark => !pack && card.appearance == aterm_types::Appearance::Dark,
-            Self::Light => !pack && card.appearance == aterm_types::Appearance::Light,
-            Self::Yours => card.tier == ShowcaseTier::Yours,
-            Self::More => pack,
-        }
-    }
-}
 
 /// Where the page's trial stands.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -283,67 +196,118 @@ pub(crate) struct SlotEditor {
     opened: aterm_types::Rgb,
 }
 
+/// A community pack theme being kept: the add request, the theme id, and
+/// whether its file is written. Once written and listed by the catalog, Keep
+/// writes `theme`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingKeep {
+    pub(crate) operation: OperationId,
+    pub(crate) id: String,
+    pub(crate) written: bool,
+}
+
 /// Settings ▸ Themes' view state. View-local, never config.
 #[derive(Debug)]
 pub(crate) struct ShowcaseState {
     pub(crate) filter: crate::native_text_input::TextInputState,
-    pub(crate) chip: ShowcaseChip,
-    /// The Customize view (else the Gallery).
-    pub(crate) customize: bool,
-    /// The gallery's cards, built from the catalog this view admitted.
+    /// The Customize sheet stands in the chooser's place.
+    pub(crate) sheet_open: bool,
+    /// The community pack's rows are shown (a filter shows its matches
+    /// whether or not).
+    pub(crate) pack_open: bool,
+    /// The Keep split button's one-item list (Keep colours only) is open.
+    pub(crate) keep_more: bool,
+    /// The chooser's rows, built from the catalog this view admitted.
     pub(crate) cards: Arc<[ShowcaseCard]>,
+    /// The theme files that did not load, for NEEDS ATTENTION.
+    pub(crate) attention: Arc<[AttentionRow]>,
     pub(crate) trial: ShowcaseTrial,
     /// The palette slot being edited.
     pub(crate) slot: Option<SlotEditor>,
     pub(crate) save: Option<SaveAsState>,
     pub(crate) pending_select: Option<PendingSelect>,
-    /// A Get More card's add: the themes request, the pack id, and whether
-    /// the file is written. Once written and listed by the catalog, the
-    /// theme is tried (never kept: that is still Keep's).
-    pub(crate) pending_try: Option<(OperationId, String, bool)>,
+    /// A community theme's Keep, waiting for its file and the catalog.
+    pub(crate) pending_keep: Option<PendingKeep>,
     /// The select patch a save sent, and the drafts it carries: they go
     /// when it lands.
-    selecting: Option<(OperationId, CarriedDrafts)>,
-    /// The Yours card whose Trash was pressed once: a second press moves it.
+    selecting: Option<(OperationId, String, CarriedDrafts)>,
+    /// The Yours row whose Trash was pressed once: a second press moves it.
     pub(crate) trash_armed: Option<String>,
-    /// The gallery's cards as the last render laid them out, row by row:
-    /// Left and Right step through them in order, Up and Down by row.
-    drawn: RefCell<Vec<Vec<String>>>,
+    /// Why the last Keep (or a community theme's add) did not land: the
+    /// strip's second line, in the danger ink, until the next trial.
+    pub(crate) error: Option<String>,
+    /// What the strip's live region last settled on ("Kept Dracula",
+    /// "Reverted to Aterm Night"), until the next trial starts.
+    pub(crate) settled: Option<String>,
+    /// The rows the chooser lists, in order, as the last render laid them
+    /// out: the arrows, Home, End and the page keys walk them.
+    order: RefCell<Vec<String>>,
+    /// The rows a screen of the list holds, as the last render laid it out
+    /// (Page Up and Page Down move by it).
+    page_rows: Cell<usize>,
+    /// The animation clock's reading when the page opened: the demo's
+    /// phase counts from it, so a theme change never restarts the tape.
+    pub(crate) demo_epoch_ms: Cell<Option<u64>>,
+    /// The clock's reading at the last input on the page: three loops after
+    /// it the demo rests on its settled frame.
+    pub(crate) last_input_phase_ms: Cell<u64>,
+    /// An input arrived since the last render read the clock (reducers have
+    /// none): the next render stamps it.
+    pub(crate) input_pending: Cell<bool>,
 }
 
 impl ShowcaseState {
     pub(super) fn new(themes: &crate::app_config::ThemeCatalog) -> Self {
+        let cards: Arc<[ShowcaseCard]> = showcase_cards(themes).into();
         Self {
             filter: crate::native_text_input::TextInputState::new(String::new()),
-            chip: ShowcaseChip::All,
-            customize: false,
-            cards: showcase_cards(themes).into(),
+            sheet_open: false,
+            pack_open: false,
+            keep_more: false,
+            attention: crate::settings_preview::theme_card::attention_rows(themes, &cards).into(),
+            cards,
             trial: ShowcaseTrial::Idle,
             slot: None,
             save: None,
             pending_select: None,
-            pending_try: None,
+            pending_keep: None,
             selecting: None,
             trash_armed: None,
-            drawn: RefCell::new(Vec::new()),
+            error: None,
+            settled: None,
+            order: RefCell::new(Vec::new()),
+            page_rows: Cell::new(8),
+            demo_epoch_ms: Cell::new(None),
+            last_input_phase_ms: Cell::new(0),
+            input_pending: Cell::new(true),
         }
     }
 
-    /// The cards the chip and filter admit, as indices into `cards`.
+    /// The filter's query, trimmed and lowercased.
+    pub(crate) fn query(&self) -> String {
+        self.filter.value().trim().to_lowercase()
+    }
+
+    /// The rows the filter admits, as indices into `cards`, in list order.
+    /// Community rows are admitted while the disclosure is open or a query
+    /// is typed.
     pub(crate) fn visible(&self) -> Vec<usize> {
-        let query = self.filter.value().trim().to_lowercase();
+        let query = self.query();
         self.cards
             .iter()
             .enumerate()
-            .filter(|(_, card)| self.chip.admits(card) && card.matches(&query))
+            .filter(|(_, card)| {
+                (card.section != Section::Community || self.pack_open || !query.is_empty())
+                    && card.matches(&query)
+            })
             .map(|(index, _)| index)
             .collect()
     }
 
-    /// The gallery's cards as the last render laid them out, row by row.
+    /// The rows the last render listed, in order.
     #[cfg(test)]
-    pub(crate) fn drawn_rows(&self) -> Vec<Vec<String>> {
-        self.drawn.borrow().clone()
+    pub(crate) fn listed(&self) -> Vec<String> {
+        self.order.borrow().clone()
     }
 
     fn card(&self, id: &str) -> Option<&ShowcaseCard> {
@@ -352,16 +316,8 @@ impl ShowcaseState {
             .find(|card| card.id.eq_ignore_ascii_case(id))
     }
 
-    fn card_by_slug(&self, slug: &str) -> Option<&ShowcaseCard> {
+    pub(super) fn card_by_slug(&self, slug: &str) -> Option<&ShowcaseCard> {
         self.cards.iter().find(|card| card.slug == slug)
-    }
-
-    /// Whether the last render listed the card `slug`.
-    fn is_drawn(&self, slug: &str) -> bool {
-        self.drawn
-            .borrow()
-            .iter()
-            .any(|row| row.iter().any(|drawn| drawn == slug))
     }
 
     /// The id the trial is about, while there is one.
@@ -370,6 +326,17 @@ impl ShowcaseState {
             ShowcaseTrial::Idle => None,
             ShowcaseTrial::Trying { id } | ShowcaseTrial::Keeping { id, .. } => Some(id),
         }
+    }
+
+    /// The label a theme id reads by: its row's name, else the id.
+    pub(super) fn label_of(&self, id: &str) -> String {
+        self.card(id)
+            .map_or_else(|| id.to_string(), |card| card.label.clone())
+    }
+
+    /// Something happened on the page: the demo plays again.
+    pub(crate) fn note_input(&self) {
+        self.input_pending.set(true);
     }
 }
 
@@ -396,7 +363,7 @@ impl SettingsViewState {
     }
 
     /// The host could not draw the tried theme `id`: the trial ends and the
-    /// page says why.
+    /// status line says why (the strip is back to Idle).
     pub(crate) fn refuse_theme_trial(&mut self, id: &str, why: &str) {
         if self
             .showcase
@@ -409,40 +376,79 @@ impl SettingsViewState {
         }
     }
 
-    /// The page's cards follow a new catalog; a trial whose theme is gone
-    /// ends, and says so.
+    /// The page's rows follow a new catalog; a trial whose theme no longer
+    /// draws ends, and says why: its file is gone (and the community pack
+    /// has none by that name), or its file no longer loads.
     pub(super) fn refresh_showcase(&mut self) {
-        self.showcase.cards = showcase_cards(&self.assets.themes).into();
+        let cards: Arc<[ShowcaseCard]> = showcase_cards(&self.assets.themes).into();
+        self.showcase.attention =
+            crate::settings_preview::theme_card::attention_rows(&self.assets.themes, &cards).into();
+        self.showcase.cards = cards;
         self.showcase.trash_armed = None;
         if let Some(id) = self.showcase.trial_id().map(str::to_string)
-            && self.assets.themes.resolve(&id).is_err()
+            && let Err(reason) = self.assets.themes.resolve(&id)
+            && self.assets.themes.pack_fallback(&id).is_none()
         {
             self.showcase.trial = ShowcaseTrial::Idle;
-            self.feedback = Some(format!("{id} is no longer in the themes folder"));
+            self.showcase.error = Some(if self.assets.themes.lists(&id) {
+                reason
+            } else {
+                format!("{id} is no longer in the themes folder")
+            });
         }
     }
 
     /// Leaving the page: the trial ends (the host reverts it) and the page's
-    /// transient state goes. The chip, the filter and the view stay, so a
-    /// return finds the gallery as it was left.
+    /// transient state goes. The filter and the disclosure stay, so a return
+    /// finds the list as it was left; the demo starts its tape again.
     pub(super) fn leave_showcase(&mut self) {
         self.showcase.trial = ShowcaseTrial::Idle;
         self.showcase.slot = None;
         self.showcase.save = None;
+        self.showcase.sheet_open = false;
+        self.showcase.keep_more = false;
         self.showcase.pending_select = None;
-        self.showcase.pending_try = None;
+        self.showcase.pending_keep = None;
         self.showcase.trash_armed = None;
+        self.showcase.error = None;
+        self.showcase.settled = None;
+        self.showcase.demo_epoch_ms.set(None);
+        self.showcase.note_input();
     }
 
-    /// Escape on the page, deepest first: a Trash waiting for its second
-    /// press, the palette slot editor (its draft let go), the Save as row,
-    /// the trial, the filter. Whether it took the Escape.
+    /// End the trial: the highlight goes back to the theme in use, and the
+    /// live region says so once.
+    pub(super) fn revert_showcase(&mut self) {
+        self.showcase.pending_keep = None;
+        self.showcase.keep_more = false;
+        if matches!(self.showcase.trial, ShowcaseTrial::Trying { .. }) {
+            self.showcase.trial = ShowcaseTrial::Idle;
+            self.showcase.error = None;
+            let label = self.showcase.label_of(&self.configured_theme_id());
+            self.showcase.settled = Some(format!("Reverted to {label}"));
+            self.common.last_focus = self
+                .highlighted_slug()
+                .map(|slug| UiKey::new(format!("{CARD_PREFIX}{slug}")))
+                .or_else(|| self.common.last_focus.take());
+        }
+    }
+
+    /// Escape on the page, first applicable step: a Trash waiting for its
+    /// second press, the palette slot editor or the save name (its draft let
+    /// go), the Customize sheet, the filter's text (while the keyboard is in
+    /// it), a save or community add still waiting, the trial. Whether it took
+    /// the Escape; otherwise the page is left the normal way.
     pub(super) fn cancel_showcase(&mut self) -> bool {
         if self.route != SettingsRoute::Themes {
             return false;
         }
         if self.showcase.trash_armed.take().is_some() {
             self.feedback = None;
+            return true;
+        }
+        if self.showcase.keep_more {
+            self.showcase.keep_more = false;
+            self.common.last_focus = Some(UiKey::new(KEEP_MORE));
             return true;
         }
         if let Some(slot) = self.showcase.slot.take() {
@@ -453,26 +459,38 @@ impl SettingsViewState {
             self.common.last_focus = Some(UiKey::new(SHOWCASE_SAVE_AS));
             return true;
         }
-        if self.showcase.pending_select.take().is_some() {
-            self.feedback = Some("The saved theme will not be selected automatically".to_string());
+        if self.showcase.sheet_open {
+            self.close_showcase_sheet();
             return true;
         }
-        if self.showcase.pending_try.take().is_some() {
-            self.feedback = Some("The added theme will not be tried automatically".to_string());
-            return true;
-        }
-        if matches!(self.showcase.trial, ShowcaseTrial::Trying { .. }) {
-            self.showcase.trial = ShowcaseTrial::Idle;
-            self.feedback = Some("Reverted".to_string());
-            return true;
-        }
-        if !self.showcase.filter.value().is_empty() {
+        if !self.showcase.filter.value().is_empty()
+            && self.showcase_text_focus() == Some(ShowcaseText::Filter)
+        {
             self.showcase.filter = crate::native_text_input::TextInputState::new(String::new());
             self.invalidate_result_page_limit();
             self.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
             return true;
         }
+        if self.showcase.pending_select.take().is_some() {
+            self.feedback = Some("The saved theme will not be selected automatically".to_string());
+            return true;
+        }
+        if matches!(self.showcase.trial, ShowcaseTrial::Trying { .. }) {
+            self.revert_showcase();
+            return true;
+        }
         false
+    }
+
+    /// Close the Customize sheet: the chooser comes back, the keyboard on
+    /// Customize.
+    pub(super) fn close_showcase_sheet(&mut self) {
+        self.showcase.sheet_open = false;
+        self.showcase.slot = None;
+        self.showcase.save = None;
+        self.invalidate_result_page_limit();
+        self.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
+        self.common.last_focus = Some(UiKey::new(CUSTOMIZE));
     }
 
     /// The page text field the keyboard is in, if any.
@@ -481,7 +499,7 @@ impl SettingsViewState {
             return None;
         }
         match self.common.last_focus.as_ref()?.as_str() {
-            SHOWCASE_FILTER => Some(ShowcaseText::Filter),
+            SHOWCASE_FILTER if !self.showcase.sheet_open => Some(ShowcaseText::Filter),
             SHOWCASE_SAVE_NAME if self.showcase.save.is_some() => Some(ShowcaseText::SaveName),
             SHOWCASE_PALETTE_SLOT if self.showcase.slot.is_some() => {
                 Some(ShowcaseText::PaletteSlot)
@@ -501,52 +519,17 @@ impl SettingsViewState {
         }
     }
 
-    /// The card under the pointer, else the one the keyboard is on: what the
-    /// stage beside a Wide gallery previews before anything is tried. None
-    /// while a Settings search shows its results in the page's place: no card
-    /// is on screen then.
-    pub(super) fn showcase_candidate(&self) -> Option<&ShowcaseCard> {
-        if self.route != SettingsRoute::Themes
-            || self.showcase.customize
-            || !self.search.trim().is_empty()
-        {
-            return None;
-        }
-        [
-            self.common.hovered.as_ref(),
-            self.common.last_focus.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(card_slug_of)
-        .find(|slug| self.showcase.is_drawn(slug))
-        .and_then(|slug| self.showcase.card_by_slug(slug))
-    }
-
-    /// Whether the page draws the stage: in Customize, and beside a Wide
-    /// gallery (before the first frame the width is not known, so yes).
-    pub(super) fn showcase_draws_stage(&self) -> bool {
-        self.showcase.customize
-            || !matches!(
-                self.presented_width.get(),
-                Some(SettingsWidth::Compact | SettingsWidth::Medium)
-            )
-    }
-
-    /// The theme selector the stage draws for the page's candidate: the
-    /// hovered or focused card, else the trial.
+    /// The theme the page draws in place of the configured one: the trial.
+    /// Hover never previews (highlight equals trial).
     pub(super) fn showcase_preview_id(&self) -> Option<String> {
         if self.route != SettingsRoute::Themes {
             return None;
         }
-        self.showcase_candidate()
-            .map(|card| card.id.clone())
-            .or_else(|| self.showcase.trial_id().map(str::to_string))
+        self.showcase.trial_id().map(str::to_string)
     }
 
-    /// The theme the stage's badge names: the candidate it draws, else the
-    /// configured theme on the side the page shows (never the raw
-    /// `dark:…,light:…` value).
+    /// The theme the demo draws: the trial, else the configured theme on the
+    /// side the page shows (never the raw `dark:…,light:…` value).
     pub(super) fn showcase_stage_theme_id(&self) -> Option<String> {
         if self.route != SettingsRoute::Themes {
             return None;
@@ -557,17 +540,258 @@ impl SettingsViewState {
         )
     }
 
-    /// The card the keyboard is on, as its slug.
+    /// The row the keyboard is on, as its slug.
     pub(super) fn showcase_focused_card(&self) -> Option<String> {
-        if self.route != SettingsRoute::Themes {
+        if self.route != SettingsRoute::Themes || self.showcase.sheet_open {
             return None;
         }
         card_slug_of(self.common.last_focus.as_ref()?).map(str::to_string)
     }
 
+    /// Whether Up, Down, Home, End and the page keys move the chooser's
+    /// highlight: the keyboard is on a row, or in the filter.
+    pub(super) fn showcase_steps_highlight(&self) -> bool {
+        self.showcase_focused_card().is_some()
+            || self.showcase_pack_focused()
+            || self.showcase_text_focus() == Some(ShowcaseText::Filter)
+    }
+
+    /// Move the highlight to `id`: that theme is tried, or, when it is the
+    /// theme in use, the trial ends. Nothing is written, and a saved theme
+    /// waiting to be selected no longer is: the person chose another row.
+    /// The live region says it once, after the frame's install. Whether the
+    /// highlight moved (it stays while a Keep is landing).
+    pub(super) fn highlight_card(&mut self, id: &str) -> bool {
+        self.showcase.note_input();
+        if matches!(self.showcase.trial, ShowcaseTrial::Keeping { .. }) {
+            self.feedback = Some("Keeping the theme you tried\u{2026}".to_string());
+            return false;
+        }
+        self.showcase.pending_select = None;
+        self.showcase.keep_more = false;
+        self.showcase.error = None;
+        self.showcase.pending_keep = None;
+        if id.eq_ignore_ascii_case(&self.configured_theme_id()) {
+            if self.showcase.trial != ShowcaseTrial::Idle {
+                self.showcase.settled = Some(format!("Reverted to {}", self.showcase.label_of(id)));
+            }
+            self.showcase.trial = ShowcaseTrial::Idle;
+        } else {
+            self.showcase.settled = None;
+            self.showcase.trial = ShowcaseTrial::Trying { id: id.to_string() };
+        }
+        true
+    }
+
+    /// Up and Down (`delta` ±1), Page Up and Page Down (± a screen), Home and
+    /// End (± everything) in the chooser: the highlight moves along the rows
+    /// the list shows, trying the one it lands on, and the keyboard goes with
+    /// it — unless it is in the filter, where it stays. From the Community
+    /// disclosure it moves as from between the rows over it and its own, so
+    /// the keyboard never lands on a row the highlight is not on.
+    pub(super) fn step_highlight(&mut self, delta: isize) -> bool {
+        let order = self.showcase.order.borrow().clone();
+        if order.is_empty() {
+            return true;
+        }
+        let from_pack = self.showcase_pack_focused();
+        let target = if from_pack {
+            let first = order
+                .iter()
+                .position(|slug| {
+                    self.showcase
+                        .card_by_slug(slug)
+                        .is_some_and(|card| card.section == Section::Community)
+                })
+                .unwrap_or(order.len());
+            if delta > 0 && first == order.len() {
+                // Closed: no row is under it, so Down leaves it as it
+                // leaves any control in the list.
+                let _ = self.step_list_focus(1);
+                return true;
+            }
+            // The disclosure sits at `first - ½`: Down lands on `first`, Up
+            // on the row over it.
+            let from = first as isize - isize::from(delta > 0);
+            usize::try_from(from.saturating_add(delta).max(0))
+                .unwrap_or(0)
+                .min(order.len() - 1)
+        } else {
+            let current = self
+                .showcase_focused_card()
+                .filter(|slug| order.contains(slug))
+                .or_else(|| self.highlighted_slug().filter(|slug| order.contains(slug)));
+            match current.and_then(|slug| order.iter().position(|row| *row == slug)) {
+                Some(at) => at.saturating_add_signed(delta).min(order.len() - 1),
+                None if delta < 0 => order.len() - 1,
+                None => 0,
+            }
+        };
+        let slug = order[target].clone();
+        let Some(id) = self
+            .showcase
+            .card_by_slug(&slug)
+            .map(|card| card.id.clone())
+        else {
+            return true;
+        };
+        if !self.highlight_card(&id) {
+            // The keyboard stays with the highlight on the row being kept.
+            return true;
+        }
+        if from_pack || self.showcase_focused_card().is_some() {
+            let key = UiKey::new(format!("{CARD_PREFIX}{slug}"));
+            self.common.last_focus = Some(key.clone());
+            self.common.focus_visible = true;
+            self.reveal_control(key);
+        } else {
+            self.land_on_control(UiKey::new(format!("{CARD_PREFIX}{slug}")));
+        }
+        true
+    }
+
+    /// THE THEME LIST IS ONE TAB STOP (the list-box pattern its roles
+    /// claim): Tab (`forward`) or Shift-Tab from `current` toward `next`,
+    /// where `next` is a theme row or a Yours row's file action, enters the
+    /// run of rows it belongs to at the highlighted row, and from inside
+    /// the run leaves it in one step for the control past its far end; the
+    /// highlighted row's own Open and Trash stay on the way. A run that does
+    /// not hold the highlighted row, while another does, is passed over;
+    /// where none does (the filter hides it), a run is entered at its first
+    /// row. `order` is the window's Tab order, for leaving a run the list
+    /// ends with. The arrows move between rows. `None` keeps `next`.
+    pub(crate) fn tab_past_options(
+        &self,
+        current: Option<&UiKey>,
+        next: &UiKey,
+        forward: bool,
+        order: &[UiKey],
+    ) -> Option<UiKey> {
+        if self.route != SettingsRoute::Themes || self.showcase.sheet_open {
+            return None;
+        }
+        // The card a row or a Yours row's file action belongs to.
+        let owner = |key: &UiKey| {
+            let rest = key.as_str().strip_prefix(CARD_PREFIX)?;
+            let slug = rest.split('/').next().unwrap_or(rest);
+            self.showcase
+                .card_by_slug(slug)
+                .map(|card| card.slug.as_str())
+        };
+        let row = |key: &UiKey| card_slug_of(key).is_some() && owner(key).is_some();
+        let plan = self.scroll_plan()?;
+        let controls: Vec<UiKey> = plan.controls().map(|(_, key)| key.clone()).collect();
+        let at = controls.iter().position(|key| key == next)?;
+        owner(next)?;
+        let mut start = at;
+        while start > 0 && owner(&controls[start - 1]).is_some() {
+            start -= 1;
+        }
+        let mut end = at;
+        while controls
+            .get(end + 1)
+            .is_some_and(|key| owner(key).is_some())
+        {
+            end += 1;
+        }
+        let run = &controls[start..=end];
+        let highlighted = self
+            .highlighted_slug()
+            .map(|slug| UiKey::new(format!("{CARD_PREFIX}{slug}")))
+            .filter(|key| controls.contains(key));
+        let leave = || {
+            let past = if forward {
+                controls.get(end + 1)
+            } else {
+                start.checked_sub(1).and_then(|index| controls.get(index))
+            };
+            past.cloned().or_else(|| {
+                // The list ends with this run: the window's next stop.
+                let inside = |key: &UiKey| run.contains(key);
+                let target = if forward {
+                    let last = order.iter().rposition(inside)?;
+                    order.get(last + 1).or_else(|| order.first())
+                } else {
+                    let first = order.iter().position(inside)?;
+                    first
+                        .checked_sub(1)
+                        .and_then(|index| order.get(index))
+                        .or_else(|| order.last())
+                }?;
+                (!inside(target)).then(|| target.clone())
+            })
+        };
+        if let Some(current) = current.filter(|current| run.contains(current)) {
+            // The highlighted row's own file actions are on the way out.
+            if owner(current) == owner(next) {
+                return None;
+            }
+            return leave().filter(|target| target != next);
+        }
+        let stop = match &highlighted {
+            Some(key) if run.contains(key) => key.clone(),
+            Some(_) => return leave().filter(|target| target != next),
+            None => run.iter().find(|key| row(key))?.clone(),
+        };
+        (stop != *next).then_some(stop)
+    }
+
+    /// Whether the keyboard is on the Community disclosure.
+    pub(super) fn showcase_pack_focused(&self) -> bool {
+        self.route == SettingsRoute::Themes
+            && !self.showcase.sheet_open
+            && self
+                .common
+                .last_focus
+                .as_ref()
+                .is_some_and(|key| key.as_str() == PACK)
+    }
+
+    /// Open or close the Community disclosure.
+    pub(super) fn set_showcase_pack_open(&mut self, open: bool) {
+        if self.showcase.pack_open != open {
+            self.showcase.pack_open = open;
+            self.invalidate_result_page_limit();
+            self.common.presentation_revision = self.common.presentation_revision.saturating_add(1);
+        }
+    }
+
+    /// The rows a screen of the chooser holds.
+    pub(super) fn showcase_page_rows(&self) -> usize {
+        self.showcase.page_rows.get().max(1)
+    }
+
+    /// The highlighted row: the trial's, else the theme in use's.
+    pub(crate) fn highlighted_slug(&self) -> Option<String> {
+        let id = self
+            .showcase
+            .trial_id()
+            .map(str::to_string)
+            .unwrap_or_else(|| self.configured_theme_id());
+        self.showcase.card(&id).map(|card| card.slug.clone())
+    }
+
+    /// Open the Community disclosure when `key` is the row of a community
+    /// theme it holds closed: `true` when it did.
+    pub(crate) fn open_disclosure_holding(&mut self, key: &UiKey) -> bool {
+        let Some(slug) = card_slug_of(key) else {
+            return false;
+        };
+        let closed = !self.showcase.pack_open
+            && self
+                .showcase
+                .card_by_slug(slug)
+                .is_some_and(|card| card.section == Section::Community);
+        if closed {
+            self.showcase.pack_open = true;
+            self.invalidate_result_page_limit();
+        }
+        closed
+    }
+
     /// The theme the configuration draws on the side the page shows (what
     /// Keep replaces, and what a card marked Current names).
-    fn configured_theme_id(&self) -> String {
+    pub(super) fn configured_theme_id(&self) -> String {
         let side = theme_visible_side(self, self.presented_motion.get().system_dark);
         let config = Config {
             theme: self.raw_value(prefs::EDIT_THEME).or_else(|| {
@@ -591,9 +815,9 @@ impl SettingsViewState {
         (Some(value), side)
     }
 
-    /// The colours the page's stage draws with nothing hovered: the trial
+    /// The colours the page's demo draws: the trial
     /// (else the configured theme) under every override and draft.
-    fn showcase_colors(&self) -> crate::resolved_colors::ResolvedColors {
+    pub(super) fn showcase_colors(&self) -> crate::resolved_colors::ResolvedColors {
         let system_dark = self.presented_motion.get().system_dark;
         preview_resolved_colors_with(self, system_dark, self.showcase.trial_id())
     }
@@ -629,7 +853,7 @@ impl SettingsViewState {
             ..Config::default()
         };
         config
-            .resolved_colors(side, &self.assets.themes, self.showcase.trial_id())
+            .resolved_colors_previewing(side, &self.assets.themes, self.showcase.trial_id())
             .scheme
             .ansi
     }
@@ -907,6 +1131,17 @@ impl SettingsViewState {
         }
         typography
     }
+
+    /// Whether any type setting is in force beyond aterm's defaults: set in
+    /// aterm.toml, drafted, or carried by the current theme. Only then does
+    /// Save as theme offer "Include type settings".
+    pub(super) fn save_type_in_force(&self) -> bool {
+        SAVE_TYPE_KEYS.iter().any(|key| {
+            self.raw_value(key).is_some()
+                || self.field_has_unsaved_draft(key)
+                || self.theme_fallback_for(key).is_some()
+        })
+    }
 }
 
 /// The config keys a theme saved from `resolved` now carries: every colour
@@ -973,43 +1208,44 @@ pub(super) fn carried_override_keys(
     keys
 }
 
-/// What the person's colour settings in force do to every theme tried, in
-/// words (`Your background and 3 palette colours`), or `None` when none is.
-pub(super) fn override_note(resolved: &crate::resolved_colors::ResolvedColors) -> Option<String> {
-    let mut named: Vec<String> = Vec::new();
+/// How many of the person's colour settings draw on top of every theme: each
+/// of the five colour overrides in force, and each palette slot the `palette`
+/// list or the `palette_overrides` table sets.
+pub(super) fn override_count(resolved: &crate::resolved_colors::ResolvedColors) -> usize {
+    let mut named = 0;
     let mut slots = BTreeSet::new();
     for key in resolved.config_keys() {
-        let word = match key.as_str() {
-            "foreground" => "foreground",
-            "background" => "background",
-            "cursor_color" => "cursor colour",
-            "selection_color" => "selection colour",
-            "selection_foreground" => "selection text colour",
-            _ => {
-                let slot = key
-                    .strip_prefix("palette[")
-                    .and_then(|rest| rest.strip_suffix(']'))
-                    .or_else(|| {
-                        key.strip_prefix(prefs::EDIT_PALETTE_OVERRIDES)
-                            .and_then(|rest| rest.strip_prefix('.'))
-                    })
-                    .and_then(|index| index.parse::<usize>().ok());
-                slots.extend(slot);
-                continue;
-            }
-        };
-        named.push(word.to_string());
+        if SHOWCASE_COLOR_KEYS.contains(&key.as_str()) {
+            named += 1;
+            continue;
+        }
+        let slot = key
+            .strip_prefix("palette[")
+            .and_then(|rest| rest.strip_suffix(']'))
+            .or_else(|| {
+                key.strip_prefix(prefs::EDIT_PALETTE_OVERRIDES)
+                    .and_then(|rest| rest.strip_prefix('.'))
+            })
+            .and_then(|index| index.parse::<usize>().ok());
+        slots.extend(slot);
     }
-    match slots.len() {
-        0 => {}
-        1 => named.push("1 palette colour".to_string()),
-        count => named.push(format!("{count} palette colours")),
-    }
-    let last = named.pop()?;
-    Some(if named.is_empty() {
-        format!("Your {last}")
-    } else {
-        format!("Your {} and {last}", named.join(", "))
+    named + slots.len()
+}
+
+/// `count` and its noun, singular or plural: `1 colour`, `3 colours`.
+pub(super) fn count_noun(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
+/// The strip's note while the person's colour settings draw on top of every
+/// theme (`2 colours of your own on top`), or `None` when none does.
+pub(super) fn override_note(resolved: &crate::resolved_colors::ResolvedColors) -> Option<String> {
+    let count = override_count(resolved);
+    (count > 0).then(|| {
+        format!(
+            "{} of your own on top",
+            count_noun(count, "colour", "colours")
+        )
     })
 }
 
@@ -1062,6 +1298,7 @@ impl SettingsApp {
             Some(SemanticInput::Text(text)) => Some(text.as_str()),
             _ => None,
         };
+        view.showcase.note_input();
         // A Trash press arms only the next press of that same Trash.
         let armed = view.showcase.trash_armed.take();
         if let Some(rest) = action.strip_prefix(CARD_PREFIX) {
@@ -1073,38 +1310,66 @@ impl SettingsApp {
             }
         } else if action == SHOWCASE_KEEP {
             self.keep_trial(view, cx);
+        } else if action == KEEP_MORE {
+            view.showcase.keep_more = !view.showcase.keep_more;
+            view.common.last_focus = Some(UiKey::new(if view.showcase.keep_more {
+                SHOWCASE_KEEP_COLOURS
+            } else {
+                KEEP_MORE
+            }));
         } else if action == SHOWCASE_KEEP_COLOURS {
+            view.showcase.keep_more = false;
             self.keep_colours_only(view, cx);
         } else if action == SHOWCASE_REVERT {
             view.showcase.pending_select = None;
-            view.showcase.pending_try = None;
+            view.revert_showcase();
+        } else if action == CUSTOMIZE {
+            view.showcase.sheet_open = true;
+            view.showcase.keep_more = false;
+            view.invalidate_result_page_limit();
+            view.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
+            view.common.last_focus = Some(UiKey::new(CUSTOMIZE_DONE));
+        } else if action == CUSTOMIZE_DONE {
+            // The open slot's draft is saved first, as its own Done saves it.
+            self.close_palette_slot(view, cx);
+            view.close_showcase_sheet();
+        } else if action == PACK {
+            view.showcase.pack_open = match value {
+                Some(SemanticInput::Bool(open)) => *open,
+                _ => !view.showcase.pack_open,
+            };
+            view.invalidate_result_page_limit();
+            view.common.last_focus = Some(UiKey::new(PACK));
+        } else if action == FOLLOW_SYSTEM {
+            // The switch is Appearance's Follow system, written at once:
+            // a setting, not a trial.
+            let _ = self.reduce_action(
+                view,
+                ActionInvocation {
+                    id: ActionId::new(THEME_MODE_ACTION),
+                    value: value.cloned(),
+                },
+                cx,
+            );
+            view.common.last_focus = Some(UiKey::new(FOLLOW_SYSTEM));
+        } else if let Some(side) = action
+            .strip_prefix(SIDE_PREFIX)
+            .and_then(parse_appearance_word)
+        {
+            // The segment picks the side Keep writes; the highlight goes to
+            // that side's theme.
+            view.theme_preview_side = Some(side);
             if matches!(view.showcase.trial, ShowcaseTrial::Trying { .. }) {
                 view.showcase.trial = ShowcaseTrial::Idle;
-                view.feedback = Some("Reverted".to_string());
             }
-        } else if let Some(word) = action
-            .strip_prefix(CHIP_PREFIX)
-            .or((action == FOOTER_GET_MORE).then_some(ShowcaseChip::More.word()))
-        {
-            let Some(chip) = ShowcaseChip::from_word(word) else {
-                return EventResult::Handled;
-            };
-            view.showcase.chip = chip;
-            view.invalidate_result_page_limit();
-            view.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
+            view.showcase.error = None;
             view.common.last_focus = Some(UiKey::new(action));
-        } else if action == VIEW_GALLERY || action == VIEW_CUSTOMIZE || action == SHOW_OVERRIDES {
-            view.showcase.customize = action != VIEW_GALLERY;
-            self.close_palette_slot(view, cx);
+        } else if action == FILTER_CLEAR {
+            view.showcase.filter = crate::native_text_input::TextInputState::new(String::new());
             view.invalidate_result_page_limit();
             view.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
-            // The keyboard stays on the segment pressed (the bar's link lands
-            // on the segment it switched to).
-            view.common.last_focus = Some(UiKey::new(if action == SHOW_OVERRIDES {
-                VIEW_CUSTOMIZE
-            } else {
-                action
-            }));
+            // The field takes the keyboard: Clear is gone with the query.
+            view.common.last_focus = Some(UiKey::new(SHOWCASE_FILTER));
         } else if action == SHOWCASE_FILTER {
             if let Some(text) = text {
                 view.showcase.filter = crate::native_text_input::TextInputState::new(text.into());
@@ -1131,11 +1396,8 @@ impl SettingsApp {
                 error: None,
                 include_type: false,
             });
-            view.showcase.customize = true;
+            view.showcase.sheet_open = true;
             view.invalidate_result_page_limit();
-            // The name row leads the Customize view's first page: turn to
-            // it, or the field the keyboard is now in is on a page not shown.
-            view.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
             view.common.last_focus = Some(UiKey::new(SHOWCASE_SAVE_NAME));
         } else if action == SHOWCASE_SAVE_NAME {
             if let (Some(text), Some(save)) = (text, view.showcase.save.as_mut()) {
@@ -1194,6 +1456,7 @@ impl SettingsApp {
             });
             view.invalidate_result_page_limit();
             view.common.last_focus = Some(UiKey::new(SHOWCASE_PALETTE_SLOT));
+            view.reveal_control(UiKey::new(SHOWCASE_PALETTE_SLOT));
         } else if action == SHOWCASE_PALETTE_SLOT {
             if let Some(text) = text {
                 self.edit_palette_slot(view, text);
@@ -1216,57 +1479,45 @@ impl SettingsApp {
         EventResult::Handled
     }
 
-    /// A card was activated: try it, or keep it when it is the one tried.
+    /// A row was pressed (a click, Return or Space on it, or `act`): the
+    /// highlight moves to it, which tries it. The theme in use is no trial,
+    /// so pressing its row reverts. The row already tried is pressed by Return
+    /// (the keyboard is on it), so that press keeps it.
     fn activate_card(&mut self, view: &mut SettingsViewState, slug: &str, cx: &mut UpdateCx<'_>) {
         let Some(card) = view.showcase.card_by_slug(slug).cloned() else {
             view.feedback = Some("That theme is no longer listed".to_string());
             return;
         };
-        view.showcase.pending_select = None;
-        view.showcase.pending_try = None;
         view.common.last_focus = Some(UiKey::new(format!("{CARD_PREFIX}{slug}")));
-        if card.tier == ShowcaseTier::Pack {
-            if themes_busy(view) {
-                view.feedback = Some("Working on the themes folder\u{2026}".to_string());
-                return;
-            }
-            let operation = cx.themes(ThemesRequest::AddPack {
-                id: card.id.clone(),
-            });
-            view.pending.insert(operation, PendingAction::Themes);
-            view.showcase.pending_try = Some((operation, card.id.clone(), false));
-            view.feedback = Some(format!("Adding {}\u{2026}", card.label));
+        if matches!(&view.showcase.trial, ShowcaseTrial::Trying { id } if id.eq_ignore_ascii_case(&card.id))
+        {
+            self.keep_trial(view, cx);
             return;
         }
-        match &view.showcase.trial {
-            ShowcaseTrial::Trying { id } if id.eq_ignore_ascii_case(&card.id) => {
-                self.keep_trial(view, cx);
-            }
-            ShowcaseTrial::Keeping { .. } => {
-                view.feedback = Some("Keeping the theme you tried\u{2026}".to_string());
-            }
-            _ if card.id.eq_ignore_ascii_case(&view.configured_theme_id()) => {
-                view.showcase.trial = ShowcaseTrial::Idle;
-                view.feedback = Some(format!("{} is the theme in use", card.label));
-            }
-            _ => {
-                view.showcase.trial = ShowcaseTrial::Trying {
-                    id: card.id.clone(),
-                };
-                // The sticky bar says it, with Keep and Revert.
-                view.feedback = None;
-            }
+        // A community row pressed while its section is closed (a filter or
+        // `act` reached it) opens the section, so the row it tries is shown.
+        if card.section == Section::Community {
+            view.showcase.pack_open = true;
+            view.invalidate_result_page_limit();
         }
+        let _ = view.highlight_card(&card.id);
     }
 
-    /// A Yours card's Open: show its file.
+    /// A Yours row's Open, or a NEEDS ATTENTION row's: show its file.
     fn open_card_file(view: &mut SettingsViewState, slug: &str, cx: &mut UpdateCx<'_>) {
-        let Some(card) = view
+        let file = view
             .showcase
             .card_by_slug(slug)
-            .filter(|card| card.tier == ShowcaseTier::Yours)
-            .cloned()
-        else {
+            .filter(|card| card.section == Section::Yours)
+            .map(|card| (card.id.clone(), card.label.clone()))
+            .or_else(|| {
+                view.showcase
+                    .attention
+                    .iter()
+                    .find(|row| row.slug == slug)
+                    .map(|row| (row.id.clone(), row.id.clone()))
+            });
+        let Some((id, label)) = file else {
             view.feedback = Some("That theme is no longer listed".to_string());
             return;
         };
@@ -1275,9 +1526,9 @@ impl SettingsApp {
             view.feedback = Some("Working on the themes folder\u{2026}".to_string());
             return;
         }
-        let operation = cx.themes(ThemesRequest::OpenFile { id: card.id });
+        let operation = cx.themes(ThemesRequest::OpenFile { id });
         view.pending.insert(operation, PendingAction::Themes);
-        view.feedback = Some(format!("Opening {}\u{2026}", card.label));
+        view.feedback = Some(format!("Opening {label}\u{2026}"));
     }
 
     /// A Yours card's Trash: the first press asks, the second moves the file
@@ -1292,7 +1543,7 @@ impl SettingsApp {
         let Some(card) = view
             .showcase
             .card_by_slug(slug)
-            .filter(|card| card.tier == ShowcaseTier::Yours)
+            .filter(|card| card.section == Section::Yours)
             .cloned()
         else {
             view.feedback = Some("That theme is no longer listed".to_string());
@@ -1341,6 +1592,30 @@ impl SettingsApp {
         let ShowcaseTrial::Trying { id } = view.showcase.trial.clone() else {
             return;
         };
+        view.showcase.keep_more = false;
+        // A community theme is drawn from the embedded pack: Keep adds its
+        // file first, and writes `theme` once the catalog lists it
+        // ([`Self::showcase_after_snapshot`]).
+        if view.assets.themes.resolve(&id).is_err()
+            && view.assets.themes.pack_fallback(&id).is_some()
+        {
+            if view.showcase.pending_keep.is_some() {
+                return;
+            }
+            if themes_busy(view) {
+                view.feedback = Some("Working on the themes folder\u{2026}".to_string());
+                return;
+            }
+            let operation = cx.themes(ThemesRequest::AddPack { id: id.clone() });
+            view.pending.insert(operation, PendingAction::Themes);
+            view.feedback = Some(format!("Adding {}\u{2026}", view.showcase.label_of(&id)));
+            view.showcase.pending_keep = Some(PendingKeep {
+                operation,
+                id,
+                written: false,
+            });
+            return;
+        }
         if Self::reject_pending_key(view, prefs::EDIT_THEME, cx) {
             return;
         }
@@ -1433,38 +1708,65 @@ impl SettingsApp {
 
     /// A config patch finished. A Keep (or a save's select) that landed
     /// ends the trial (the reload draws the kept theme); one that did not
-    /// goes back to trying. A save's select that landed also lets go of the
-    /// drafts the saved theme now carries.
+    /// goes back to trying, and this says so (`true`). A save's select that
+    /// landed also lets go of the drafts the saved theme now carries.
     pub(super) fn finish_showcase_keep(
         view: &mut SettingsViewState,
         operation: OperationId,
         applied: bool,
-    ) {
+    ) -> bool {
+        // The theme the patch wrote: a save's select writes the saved one,
+        // whatever trial it ended.
+        let mut written = None;
         if view
             .showcase
             .selecting
             .as_ref()
-            .is_some_and(|(selecting, _)| *selecting == operation)
-            && let Some((_, drafts)) = view.showcase.selecting.take()
-            && applied
+            .is_some_and(|(selecting, ..)| *selecting == operation)
+            && let Some((_, saved, drafts)) = view.showcase.selecting.take()
         {
-            drop_carried_drafts(view, &drafts);
+            if applied {
+                drop_carried_drafts(view, &drafts);
+            }
+            written = Some(saved);
         }
         let ShowcaseTrial::Keeping {
             id,
             operation: keeping,
         } = &view.showcase.trial
         else {
-            return;
+            return false;
         };
         if *keeping != operation {
-            return;
+            return false;
         }
-        view.showcase.trial = if applied {
-            ShowcaseTrial::Idle
+        if applied {
+            let kept = written.as_deref().unwrap_or(id).to_string();
+            view.showcase.settled = Some(format!("Kept {}", view.showcase.label_of(&kept)));
+            view.showcase.error = None;
+            view.showcase.trial = ShowcaseTrial::Idle;
+            // The strip's Keep, Keep colours only and Revert go with the
+            // trial: a keyboard on one of them lands on the kept row (else
+            // on Customize, which takes their place), never on nothing.
+            if view.common.last_focus.as_ref().is_some_and(|key| {
+                [
+                    SHOWCASE_KEEP,
+                    KEEP_MORE,
+                    SHOWCASE_KEEP_COLOURS,
+                    SHOWCASE_REVERT,
+                ]
+                .contains(&key.as_str())
+            }) {
+                view.common.last_focus = Some(UiKey::new(view.showcase.card(&kept).map_or_else(
+                    || CUSTOMIZE.to_string(),
+                    |card| format!("{CARD_PREFIX}{}", card.slug),
+                )));
+            }
         } else {
-            ShowcaseTrial::Trying { id: id.clone() }
-        };
+            // The trial stands; the strip says why the write did not land.
+            view.showcase.trial = ShowcaseTrial::Trying { id: id.clone() };
+        }
+        !applied
     }
 
     /// Save as theme: write the colours the stage shows as a new theme file.
@@ -1598,25 +1900,18 @@ impl SettingsApp {
         view: &mut SettingsViewState,
         cx: &mut UpdateCx<'_>,
     ) {
-        // A Get More add whose file is written and now listed: try it, with
-        // the keyboard on Keep. Nothing is written to aterm.toml until Keep.
-        if let Some((_, id, true)) = &view.showcase.pending_try
+        // A community theme's Keep whose file is written and now listed:
+        // the `theme` write follows, as any Keep's.
+        if let Some(PendingKeep {
+            id, written: true, ..
+        }) = &view.showcase.pending_keep
             && view.assets.themes.resolve(id).is_ok()
         {
             let id = id.clone();
-            view.showcase.pending_try = None;
-            if id.eq_ignore_ascii_case(&view.configured_theme_id()) {
-                // aterm.toml already names it: it is drawn now, not tried.
-                view.feedback = Some(format!("Added {id} \u{b7} it is the theme in use"));
-            } else {
-                view.feedback = None;
-                view.showcase.trial = ShowcaseTrial::Trying { id };
-                view.common.last_focus = Some(UiKey::new(SHOWCASE_KEEP));
-                // Get More no longer lists it: show it among your themes.
-                if view.showcase.chip == ShowcaseChip::More {
-                    view.showcase.chip = ShowcaseChip::Yours;
-                    view.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
-                }
+            view.showcase.pending_keep = None;
+            if matches!(&view.showcase.trial, ShowcaseTrial::Trying { id: tried } if tried.eq_ignore_ascii_case(&id))
+            {
+                self.keep_trial(view, cx);
             }
             view.invalidate_result_page_limit();
         }
@@ -1661,7 +1956,7 @@ impl SettingsApp {
         };
         let operation = cx.config_patch(patch.clone());
         view.pend_config(operation, patch);
-        view.showcase.selecting = Some((operation, select.drafts));
+        view.showcase.selecting = Some((operation, select.id.clone(), select.drafts));
         view.showcase.trial = match view.showcase.trial_id() {
             Some(tried) => ShowcaseTrial::Keeping {
                 id: tried.to_string(),
@@ -1718,7 +2013,7 @@ impl SettingsApp {
             error: Some(reason),
             include_type: false,
         });
-        view.showcase.customize = true;
+        view.showcase.sheet_open = true;
         view.common.last_focus = Some(UiKey::new(SHOWCASE_SAVE_NAME));
         view.invalidate_result_page_limit();
         false
@@ -1728,7 +2023,7 @@ impl SettingsApp {
     /// `palette` list reaches, a valid colour becomes that entry in the list's
     /// draft; on any other slot the field itself is the draft (the stage and
     /// chips follow both).
-    fn edit_palette_slot(&mut self, view: &mut SettingsViewState, text: &str) {
+    pub(super) fn edit_palette_slot(&mut self, view: &mut SettingsViewState, text: &str) {
         let Some(slot) = view.showcase.slot.as_mut() else {
             return;
         };
@@ -1914,8 +2209,8 @@ impl SettingsApp {
         view.invalidate_result_page_limit();
     }
 
-    /// One editing event in a page text field. Return in the filter moves the
-    /// keyboard to the first card; in the name field it saves; in the palette
+    /// One editing event in a page text field. Return in the filter keeps
+    /// the trial its rows list; in the name field it saves; in the palette
     /// slot it saves the palette.
     pub(super) fn reduce_showcase_text(
         &mut self,
@@ -1937,12 +2232,17 @@ impl SettingsApp {
                     view.invalidate_result_page_limit();
                     view.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
                 }
-                if submit {
-                    let first = view.showcase.visible().first().copied();
-                    if let Some(first) = first {
-                        let slug = view.showcase.cards[first].slug.clone();
-                        view.common.last_focus = Some(UiKey::new(format!("{CARD_PREFIX}{slug}")));
-                    }
+                // Return in the filter keeps the theme its arrows tried,
+                // while the filter still lists it: a row the text hid is not
+                // what Return in a search field takes.
+                let listed = view.showcase.trial_id().is_some_and(|id| {
+                    view.showcase
+                        .visible()
+                        .into_iter()
+                        .any(|index| view.showcase.cards[index].id.eq_ignore_ascii_case(id))
+                });
+                if submit && listed {
+                    self.keep_trial(view, cx);
                 }
             }
             ShowcaseText::SaveName => {
@@ -2016,53 +2316,6 @@ impl SettingsApp {
                 }
             }
         }
-    }
-
-    /// An arrow key while a card has the keyboard: Left and Right step along
-    /// the gallery's cards (`rows` 0, `delta` ±1), Up and Down to the card
-    /// below or above in the next row (`rows` ±1), and the list follows. Past
-    /// the first or last card the keyboard leaves the gallery for the control
-    /// before or after it. Whether the key was the gallery's.
-    pub(super) fn step_card_focus(
-        &mut self,
-        view: &mut SettingsViewState,
-        rows: i32,
-        delta: i32,
-    ) -> bool {
-        let Some(slug) = view.showcase_focused_card() else {
-            return false;
-        };
-        let grid = view.showcase.drawn.borrow().clone();
-        let Some((row, column)) = grid.iter().enumerate().find_map(|(row, cards)| {
-            cards
-                .iter()
-                .position(|card| *card == slug)
-                .map(|column| (row, column))
-        }) else {
-            return false;
-        };
-        let target = if rows == 0 {
-            let flat: Vec<&String> = grid.iter().flatten().collect();
-            let at = grid[..row].iter().map(Vec::len).sum::<usize>() + column;
-            usize::try_from(at as i64 + i64::from(delta))
-                .ok()
-                .and_then(|index| flat.get(index).map(|card| (*card).clone()))
-        } else {
-            usize::try_from(row as i64 + i64::from(rows.signum()))
-                .ok()
-                .and_then(|row| grid.get(row))
-                .and_then(|cards| cards.get(column.min(cards.len().saturating_sub(1))))
-                .cloned()
-        };
-        let Some(card) = target else {
-            view.step_list_focus(if rows == 0 { delta } else { rows }.signum());
-            return true;
-        };
-        let key = UiKey::new(format!("{CARD_PREFIX}{card}"));
-        view.common.last_focus = Some(key.clone());
-        view.common.focus_visible = true;
-        view.reveal_control(key);
-        true
     }
 }
 
@@ -2157,9 +2410,11 @@ fn button(
     )
 }
 
-/// A button as wide as its label needs.
+/// A button as wide as its label needs: the painter's 10pt lead and its
+/// 10pt end, so the words sit centred, and a point of slack so the measure
+/// never elides them.
 fn hug_width(label: &str) -> f32 {
-    crate::native_ui::native_button_label_width(label) + 28.0
+    crate::native_ui::native_button_label_width(label) + 21.0
 }
 
 fn focused(state: &SettingsViewState, key: &str) -> bool {
@@ -2192,6 +2447,9 @@ fn text_field(
                     visual_value: None,
                     input: Some(input.projection()),
                     swatch,
+                    trailing_hint: None,
+                    description: None,
+                    end_button: false,
                 },
                 ActionId::new(key),
             )
@@ -2207,9 +2465,14 @@ fn text_field(
     .layout(Layout::default().width(Length::Fill).height(Length::Fill))
 }
 
+/// The height of the strip's buttons and the chooser's small controls.
+fn strip_button_height() -> f32 {
+    28.0_f32.max(24.0 * settings_text_scale())
+}
+
 /// A row of controls one control tall.
 fn control_row(key: &str, label: &str, children: Vec<UiNode>) -> (UiNode, f32) {
-    let height = scaled_control_height();
+    let height = customize::sheet_row_height();
     (
         UiNode::new(key, UiContent::Group(GroupSpec::new(label)))
             .layout(Layout::row().height(Length::Fixed(height)).gap(6.0))
@@ -2218,19 +2481,14 @@ fn control_row(key: &str, label: &str, children: Vec<UiNode>) -> (UiNode, f32) {
     )
 }
 
-/// The sticky bars over the page: the trial bar while a theme is tried
-/// (what is tried, with Keep and Revert), and over the gallery the note that
-/// the person's colour settings draw on top of every theme, with the way to
-/// them. Nothing while neither applies (the cards mark the theme in use).
 /// One type setting a tried theme would change once kept: its key, the
-/// theme's value, and the value in force now with who sets it.
+/// value it takes, and what keeps the value in force now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct TypeChange {
     pub(super) key: &'static str,
+    /// The value the setting takes once the theme is kept, as aterm.toml
+    /// writes it (empty: aterm's own choice).
     pub(super) theme: String,
-    pub(super) current: String,
-    /// `default`, or `theme <label>` when the current theme names it.
-    pub(super) origin: String,
     /// What "Keep colours only" writes to keep the current value, `None`
     /// when no setting keeps it (aterm's own `font_weight`).
     pub(super) pin: Option<String>,
@@ -2239,22 +2497,8 @@ pub(super) struct TypeChange {
 /// What a tried theme's typography would do once kept.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct TrialTypography {
-    /// The theme's type settings that would apply, in table order.
+    /// The type settings that would change, in table order.
     pub(super) changes: Vec<TypeChange>,
-    /// The theme's type settings something of yours beats.
-    pub(super) kept: Vec<TypeKept>,
-}
-
-/// One of the tried theme's type settings that your own setting beats.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct TypeKept {
-    /// The theme key it would set (`font_family`).
-    pub(super) key: &'static str,
-    /// What wins, as a person would look for it: the aterm.toml key
-    /// (`font_family`, `display_font`) or the flag (`--font`).
-    pub(super) by: &'static str,
-    /// The value that stays, in the delta's words (empty when unknown).
-    pub(super) value: String,
 }
 
 impl TrialTypography {
@@ -2318,26 +2562,19 @@ impl SettingsViewState {
     }
 
     /// The value in force now for the typography key `key` (aterm.toml
-    /// leaves it unset): the current theme's, else aterm's default, with
-    /// who sets it and what keeps it.
-    fn current_type_value(&self, key: &'static str) -> (String, String, Option<String>) {
-        if let Some((value, label)) = self.theme_fallback_for(key) {
-            let pin = Some(value.clone());
-            return (value, format!("theme {label}"), pin);
+    /// leaves it unset): the current theme's, else aterm's default, in the
+    /// words [`type_value_words`] compares in, with what keeps it.
+    fn current_type_value(&self, key: &'static str) -> (String, Option<String>) {
+        if let Some((value, _)) = self.theme_fallback_for(key) {
+            return (type_value_words(key, &value), Some(value));
         }
-        let field = self.field_by_key(key);
-        let shown = field.map_or_else(String::new, |field| {
-            field
-                .seed
-                .clone()
-                .unwrap_or_else(|| field.placeholder.clone())
-        });
-        let shown = shown
-            .strip_suffix(" (default)")
-            .unwrap_or(&shown)
-            .trim()
-            .to_string();
-        let default = "default".to_string();
+        self.default_type_value(key)
+    }
+
+    /// aterm's own value for the typography key `key`, whatever the theme:
+    /// its words and the aterm.toml value that keeps it (`None` for aterm's
+    /// own `font_weight`, which no value names).
+    fn default_type_value(&self, key: &'static str) -> (String, Option<String>) {
         match key {
             prefs::EDIT_FONT_FAMILY => {
                 let name = self
@@ -2346,79 +2583,66 @@ impl SettingsViewState {
                     .and_then(|families| families.automatic.clone())
                     .unwrap_or_else(|| "aterm's own face".to_string());
                 // A blank family is aterm's own choice and outranks a theme.
-                (name, default, Some(String::new()))
+                (name, Some(String::new()))
             }
             prefs::EDIT_FONT_FAMILY_BOLD
             | prefs::EDIT_FONT_FAMILY_ITALIC
             | prefs::EDIT_FONT_FAMILY_BOLD_ITALIC
             | prefs::EDIT_SYMBOL_FONT
             | prefs::EDIT_EMOJI_FONT
-            | prefs::EDIT_FALLBACK_FONTS => (
-                "aterm's own choice".to_string(),
-                default,
-                Some(String::new()),
-            ),
-            prefs::EDIT_FONT_FEATURES => ("none".to_string(), default, Some("[]".to_string())),
+            | prefs::EDIT_FALLBACK_FONTS => ("aterm's own choice".to_string(), Some(String::new())),
+            prefs::EDIT_FONT_FEATURES => ("none".to_string(), Some("[]".to_string())),
             prefs::EDIT_LIGATURES | prefs::EDIT_FONT_SYNTHETIC_STYLE => {
-                let on = shown.parse::<bool>().unwrap_or(true);
-                let word = if on { "on" } else { "off" };
-                (word.to_string(), default, Some(on.to_string()))
+                ("on".to_string(), Some("true".to_string()))
             }
-            prefs::EDIT_FONT_WEIGHT => ("the font's own".to_string(), default, None),
-            _ => {
-                let number = shown
-                    .split_whitespace()
-                    .next()
-                    .filter(|n| n.parse::<f64>().is_ok())
-                    .unwrap_or("1.0")
-                    .to_string();
-                (number.clone(), default, Some(number))
+            prefs::EDIT_FONT_WEIGHT => ("the font's own".to_string(), None),
+            prefs::EDIT_LINE_HEIGHT => {
+                let milli = (crate::app_config::DEFAULT_LINE_HEIGHT * 1000.0).round() as u16;
+                let number = aterm_types::scheme_typography::milli_text(milli);
+                (number.clone(), Some(number))
             }
+            _ => ("1.0".to_string(), Some("1.0".to_string())),
         }
     }
 
     /// What trying `id` would change in the type once kept: computed against
     /// the value Keep would write, the side the page shows, and the keys
-    /// aterm.toml sets (and `--font`). Empty for a colours-only theme.
+    /// aterm.toml sets (and `--font`). A setting the tried theme sets that
+    /// differs from the value in force is a change; so is one only the
+    /// configured theme sets, which Keep returns to aterm's own. Empty
+    /// between two colours-only themes.
     pub(super) fn trial_typography(&self, id: &str) -> TrialTypography {
         let (value, _) = self.keep_value(id);
         let side = theme_visible_side(self, self.presented_motion.get().system_dark);
         let flag = self
             .environment_override(prefs::EDIT_FONT_FAMILY)
             .map(|active| active.effective.clone());
-        let config = self.typography_presence_config(value);
-        let typo = config.resolved_typography_with_flag(side, &self.assets.themes, flag.as_deref());
+        let resolve = |theme: Option<String>| {
+            self.typography_presence_config(theme)
+                .resolved_typography_with_flag(side, &self.assets.themes, flag.as_deref())
+        };
+        let tried = resolve(value);
+        let configured = resolve(self.raw_value(prefs::EDIT_THEME));
         let mut out = TrialTypography::default();
         for spec in aterm_types::scheme::THEME_KEYS
             .iter()
             .filter(|spec| spec.group == aterm_types::scheme::ThemeKeyGroup::Typography)
         {
-            if let Some(theme) = typo.applied.value_text(spec.key) {
-                let theme = type_value_words(spec.name, &theme);
-                let (current, origin, pin) = self.current_type_value(spec.name);
-                if current != theme {
-                    out.changes.push(TypeChange {
-                        key: spec.name,
-                        theme,
-                        current,
-                        origin,
-                        pin,
-                    });
+            let theme = match tried.applied.value_text(spec.key) {
+                Some(theme) => theme,
+                // Keep drops the configured theme's setting: aterm's own
+                // value comes back.
+                None if configured.applied.value_text(spec.key).is_some() => {
+                    self.default_type_value(spec.name).1.unwrap_or_default()
                 }
-            } else if let Some(shadow) = typo.shadowed.iter().find(|shadow| shadow.key == spec.name)
-            {
-                // The setting that actually wins, and its value.
-                let value = if shadow.origin == crate::resolved_typography::TypeOrigin::Flag {
-                    flag.clone()
-                } else {
-                    self.raw_value(shadow.by)
-                }
-                .map(|value| type_value_words(spec.name, &value))
-                .unwrap_or_default();
-                out.kept.push(TypeKept {
+                None => continue,
+            };
+            let (current, pin) = self.current_type_value(spec.name);
+            if current != type_value_words(spec.name, &theme) {
+                out.changes.push(TypeChange {
                     key: spec.name,
-                    by: shadow.by,
-                    value,
+                    theme,
+                    pin,
                 });
             }
         }
@@ -2426,8 +2650,8 @@ impl SettingsViewState {
     }
 }
 
-/// A typography value in the delta's words, the same on both sides of a
-/// line: a switch reads `on`/`off`, anything else as written.
+/// A typography value in one vocabulary on both sides of a comparison: a
+/// switch reads `on`/`off`, anything else as written.
 fn type_value_words(key: &str, value: &str) -> String {
     match (key, value.trim()) {
         (prefs::EDIT_LIGATURES | prefs::EDIT_FONT_SYNTHETIC_STYLE, "true") => "on".to_string(),
@@ -2441,1980 +2665,4 @@ fn type_label(state: &SettingsViewState, key: &str) -> String {
     state
         .field_by_key(key)
         .map_or_else(|| key.to_string(), |field| field.label.to_string())
-}
-
-/// One delta line, in field labels: `Font family: Berkeley Mono replaces SF
-/// Mono (default)`.
-fn type_change_line(state: &SettingsViewState, change: &TypeChange) -> String {
-    format!(
-        "{}: {} replaces {} ({})",
-        type_label(state, change.key),
-        change.theme,
-        change.current,
-        change.origin
-    )
-}
-
-/// One kept line, naming what wins: `Font family stays pixel (your
-/// display_font)`.
-fn type_kept_line(state: &SettingsViewState, kept: &TypeKept) -> String {
-    let label = type_label(state, kept.key);
-    if kept.value.is_empty() {
-        format!("{label} stays as your {} sets it", kept.by)
-    } else {
-        format!("{label} stays {} (your {})", kept.value, kept.by)
-    }
-}
-
-/// The height of one delta line: a line of text, not a control.
-fn delta_line_height() -> f32 {
-    20.0_f32.max(18.0 * settings_text_scale())
-}
-
-/// The bar's typography delta while a typography theme is tried: what its
-/// font settings would change once kept, and what aterm.toml keeps.
-fn typography_delta_row(
-    state: &SettingsViewState,
-    trial: &TrialTypography,
-    page_width: f32,
-) -> (UiNode, f32) {
-    let height = delta_line_height();
-    // What Try draws now, on a line of its own so it is never cut off.
-    let mut lines = vec![
-        if trial.keeps_colours_only() {
-            "Trying shows colours only. Keep theme also changes:"
-        } else {
-            "Trying shows colours only. Keeping it also changes:"
-        }
-        .to_string(),
-    ];
-    lines.extend(
-        trial
-            .changes
-            .iter()
-            .map(|change| type_change_line(state, change)),
-    );
-    lines.extend(trial.kept.iter().map(|kept| type_kept_line(state, kept)));
-    if let Some(why) = trial.why_not_colours_only(state) {
-        lines.push(why);
-    }
-    let rows = lines.len().max(1);
-    let children = lines
-        .iter()
-        .enumerate()
-        .map(|(index, text)| {
-            line(
-                format!("settings/top/showcase-typography/{index}"),
-                text,
-                SemanticRole::Text,
-                StyleRef::Quiet,
-                (page_width - 24.0).max(0.0),
-                height,
-            )
-        })
-        .collect();
-    let total = height * rows as f32;
-    (
-        UiNode::new(
-            "settings/top/showcase-typography",
-            UiContent::Group(GroupSpec {
-                label: Some(lines.join("; ")),
-                role: SemanticRole::Status,
-                style: StyleRef::Secondary,
-            }),
-        )
-        .layout(
-            Layout::column()
-                .height(Length::Fixed(total))
-                .padding(Insets {
-                    top: 0.0,
-                    right: 0.0,
-                    bottom: 0.0,
-                    left: 12.0,
-                }),
-        )
-        .children(children),
-        total,
-    )
-}
-
-fn trial_bar(
-    state: &SettingsViewState,
-    width: SettingsWidth,
-    page_width: f32,
-) -> Vec<(UiNode, f32)> {
-    let mut rows: Vec<(UiNode, f32)> = trial_row(state, width, page_width).into_iter().collect();
-    if let ShowcaseTrial::Trying { id } = &state.showcase.trial {
-        let trial = state.trial_typography(id);
-        if !trial.changes.is_empty() {
-            rows.push(typography_delta_row(state, &trial, page_width));
-        }
-    }
-    if !state.showcase.customize
-        && let Some(note) = override_note(&state.showcase_colors())
-    {
-        rows.push(override_row(state, width, page_width, &note));
-    }
-    rows
-}
-
-/// The bar's override note: `<Your background and 2 palette colours> stay
-/// on top of every theme`, and Customize, where each has its Reset.
-fn override_row(
-    state: &SettingsViewState,
-    width: SettingsWidth,
-    page_width: f32,
-    note: &str,
-) -> (UiNode, f32) {
-    let text = if width == SettingsWidth::Compact {
-        format!("{note} stay on top")
-    } else {
-        format!("{note} stay on top of every theme")
-    };
-    let link = hug_width("Customize");
-    let text_width = (page_width - link - 6.0 - 12.0).max(0.0);
-    let height = scaled_control_height();
-    (
-        UiNode::new(
-            "settings/top/showcase-overrides",
-            UiContent::Group(GroupSpec::new("Your colour settings").style(StyleRef::Secondary)),
-        )
-        .layout(
-            Layout::row()
-                .height(Length::Fixed(height))
-                .padding(Insets {
-                    top: 0.0,
-                    right: 0.0,
-                    bottom: 0.0,
-                    left: 12.0,
-                })
-                .gap(6.0),
-        )
-        .children(vec![
-            line(
-                "settings/top/showcase-overrides/note",
-                &text,
-                SemanticRole::Status,
-                StyleRef::Quiet,
-                text_width,
-                height,
-            ),
-            button(
-                SHOW_OVERRIDES,
-                "Show your colour settings in Customize",
-                "Customize",
-                StyleRef::Quiet,
-                ControlState {
-                    focused: focused(state, SHOW_OVERRIDES),
-                    ..ControlState::default()
-                },
-                Some(link),
-            ),
-        ]),
-        height,
-    )
-}
-
-/// The trial bar while a theme is tried.
-fn trial_row(
-    state: &SettingsViewState,
-    width: SettingsWidth,
-    page_width: f32,
-) -> Option<(UiNode, f32)> {
-    let showcase = &state.showcase;
-    let label_of = |id: &str| {
-        showcase
-            .card(id)
-            .map_or_else(|| id.to_string(), |card| card.label.clone())
-    };
-    let compact = width == SettingsWidth::Compact;
-    let action_width = |label: &str| {
-        if compact {
-            hug_width(label).min(96.0 * settings_text_scale().min(1.5))
-        } else {
-            hug_width(label).max(88.0)
-        }
-    };
-    let pending = state.config_key_pending(prefs::EDIT_THEME);
-    let (status, mut controls): (String, Vec<UiNode>) = match &showcase.trial {
-        ShowcaseTrial::Trying { id } => {
-            let label = label_of(id);
-            // A theme that would change the face: Try is colours only, and
-            // the bar offers to keep the colours alone.
-            let typed = !state.trial_typography(id).changes.is_empty();
-            let keep_word = if typed { "Keep theme" } else { "Keep" };
-            let keep = action_width(keep_word);
-            let revert = action_width("Revert");
-            // The typed case says "colours only" on the delta's own line.
-            let hint = if compact {
-                format!("Trying {label}")
-            } else {
-                format!("Trying {label} \u{2014} Return keeps, Esc reverts")
-            };
-            let mut buttons = vec![button(
-                SHOWCASE_KEEP,
-                &if typed {
-                    format!("Keep theme: keep {label}, colours and type settings")
-                } else {
-                    format!("Keep {label}")
-                },
-                keep_word,
-                StyleRef::Primary,
-                ControlState {
-                    enabled: !pending,
-                    focused: focused(state, SHOWCASE_KEEP),
-                    ..ControlState::default()
-                },
-                Some(keep),
-            )];
-            if typed {
-                let colours = action_width("Keep colours only");
-                let pinnable = state.trial_typography(id).keeps_colours_only();
-                buttons.push(button(
-                    SHOWCASE_KEEP_COLOURS,
-                    &format!(
-                        "Keep colours only: {label}'s colours with your current type settings"
-                    ),
-                    "Keep colours only",
-                    StyleRef::Secondary,
-                    ControlState {
-                        enabled: !pending && pinnable,
-                        focused: focused(state, SHOWCASE_KEEP_COLOURS),
-                        ..ControlState::default()
-                    },
-                    Some(colours),
-                ));
-            }
-            (
-                hint,
-                buttons
-                    .into_iter()
-                    .chain([button(
-                        SHOWCASE_REVERT,
-                        &format!("Revert {label}"),
-                        "Revert",
-                        StyleRef::Secondary,
-                        ControlState {
-                            focused: focused(state, SHOWCASE_REVERT),
-                            ..ControlState::default()
-                        },
-                        Some(revert),
-                    )])
-                    .collect(),
-            )
-        }
-        ShowcaseTrial::Keeping { id, .. } => (
-            format!("Keeping {}\u{2026}", label_of(id)),
-            vec![button(
-                SHOWCASE_KEEP,
-                "Keep",
-                "Keep",
-                StyleRef::Primary,
-                ControlState {
-                    enabled: false,
-                    busy: true,
-                    ..ControlState::default()
-                },
-                Some(action_width("Keep")),
-            )],
-        ),
-        ShowcaseTrial::Idle => return None,
-    };
-    let controls_width: f32 = controls
-        .iter()
-        .map(|node| match node.layout.width {
-            Length::Fixed(width) => width + 6.0,
-            _ => 0.0,
-        })
-        .sum();
-    let text_width = (page_width - controls_width).max(0.0);
-    let height = scaled_control_height();
-    let status_node = UiNode::new(
-        "settings/showcase/status",
-        UiContent::Group(GroupSpec {
-            label: Some(status.clone()),
-            role: SemanticRole::Status,
-            style: StyleRef::Plain,
-        }),
-    )
-    .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-    .children(vec![
-        UiNode::new(
-            "settings/showcase/status/visual",
-            UiContent::Text(TextSpec {
-                text: fit_text(
-                    &status,
-                    SemanticRole::Text,
-                    StyleRef::Plain,
-                    text_width - 24.0,
-                ),
-                role: SemanticRole::Text,
-                style: StyleRef::Plain,
-            }),
-        )
-        .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-        .paint_only(),
-    ]);
-    controls.insert(0, status_node);
-    Some((
-        UiNode::new(
-            "settings/top/showcase-bar",
-            UiContent::Group(GroupSpec::new("Theme trial").style(StyleRef::Secondary)),
-        )
-        .layout(
-            Layout::row()
-                .height(Length::Fixed(height))
-                .padding(Insets {
-                    top: 0.0,
-                    right: 0.0,
-                    bottom: 0.0,
-                    left: 12.0,
-                })
-                .gap(6.0),
-        )
-        .children(controls),
-        height,
-    ))
-}
-
-/// The gallery's footer: how many theme files loaded (and how many more
-/// the community pack offers), Import…, Get More and the themes folder.
-fn gallery_footer(state: &SettingsViewState, column_width: f32) -> (UiNode, f32) {
-    let themes = &state.assets.themes;
-    let loaded = themes.ready_names().count();
-    let files = themes.limits().seen.max(themes.listing().count());
-    let status = match (loaded, files) {
-        (_, 0) => "No theme files of your own yet".to_string(),
-        (loaded, files) if loaded == files => format!(
-            "{files} theme {} of your own",
-            if files == 1 { "file" } else { "files" }
-        ),
-        (loaded, files) => format!("{loaded} of {files} theme files loaded"),
-    };
-    // Get More shows the community pack's themes not yet in the folder;
-    // the status says how many there are while another chip is on.
-    let more = state
-        .showcase
-        .cards
-        .iter()
-        .filter(|card| card.tier == ShowcaseTier::Pack)
-        .count();
-    let status = if more > 0 && state.showcase.chip != ShowcaseChip::More {
-        format!("{status} \u{b7} {more} more in the pack")
-    } else {
-        status
-    };
-    let get_more_key = FOOTER_GET_MORE;
-    let import = hug_width("Import\u{2026}");
-    let get_more = hug_width(ShowcaseChip::More.label());
-    let folder = hug_width("Themes Folder");
-    let text_width = (column_width - import - get_more - folder - 18.0).max(0.0);
-    control_row(
-        "settings/showcase/footer",
-        "Theme files",
-        vec![
-            line(
-                "settings/showcase/footer/status",
-                &status,
-                SemanticRole::Status,
-                StyleRef::Quiet,
-                text_width,
-                scaled_control_height(),
-            ),
-            button(
-                IMPORT,
-                "Import a theme from another terminal\u{2026}",
-                "Import\u{2026}",
-                StyleRef::Quiet,
-                ControlState {
-                    enabled: crate::menu::local_file_picker_available(),
-                    focused: focused(state, IMPORT),
-                    ..ControlState::default()
-                },
-                Some(import),
-            ),
-            button(
-                get_more_key,
-                "Get More: community pack themes you can add",
-                ShowcaseChip::More.label(),
-                StyleRef::Quiet,
-                ControlState {
-                    selected: state.showcase.chip == ShowcaseChip::More,
-                    focused: focused(state, get_more_key),
-                    ..ControlState::default()
-                },
-                Some(get_more),
-            ),
-            button(
-                OPEN_FOLDER,
-                "Open themes folder",
-                "Themes Folder",
-                StyleRef::Quiet,
-                ControlState {
-                    focused: focused(state, OPEN_FOLDER),
-                    ..ControlState::default()
-                },
-                Some(folder),
-            ),
-        ],
-    )
-}
-
-/// The narrowest the gallery's filter field gets on a row shared with the
-/// chips: its placeholder, inset as a button's label is.
-fn filter_minimum_width() -> f32 {
-    hug_width("Filter themes")
-}
-
-/// Whether the gallery's toolbar row at `row_width` seats the chips beside
-/// the view segment while the filter keeps [`filter_minimum_width`]. A row
-/// too narrow for them gives the chips a row of their own.
-pub(super) fn gallery_toolbar_fits_chips(row_width: f32) -> bool {
-    toolbar_fits(&ShowcaseChip::TOOLBAR, row_width)
-}
-
-/// The chips a toolbar of `shape`, `row_width` wide, seats: every chip on a
-/// row of their own or where they all fit beside the filter, else the four
-/// filter chips (Get More stays in the footer).
-fn toolbar_chips(shape: ToolbarShape, row_width: f32) -> &'static [ShowcaseChip] {
-    if shape == ToolbarShape::ChipsBelow || toolbar_fits(&ShowcaseChip::ALL, row_width) {
-        &ShowcaseChip::ALL
-    } else {
-        &ShowcaseChip::TOOLBAR
-    }
-}
-
-/// Whether `chips` fit beside the view segment and the filter on a row
-/// `row_width` wide.
-fn toolbar_fits(chips: &[ShowcaseChip], row_width: f32) -> bool {
-    const ROW_GAP: f32 = 6.0;
-    let segments: f32 = ["Gallery", "Customize"]
-        .iter()
-        .map(|visual| hug_width(visual).max(72.0))
-        .sum();
-    let widths: f32 = chips
-        .iter()
-        .map(|chip| hug_width(chip.label()).max(56.0))
-        .sum();
-    // The segment's two buttons and the filter, with their gaps.
-    let base = segments + filter_minimum_width() + 2.0 * ROW_GAP;
-    base + widths + chips.len() as f32 * ROW_GAP <= row_width
-}
-
-/// How the toolbar lays out its controls.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ToolbarShape {
-    /// One row: the view segment, the filter (or Save as theme), the chips.
-    Row,
-    /// The chips on a row of their own under the segment and filter.
-    ChipsBelow,
-}
-
-impl ToolbarShape {
-    /// The shape a toolbar `row_width` wide takes: a row too narrow for the
-    /// chips beside the filter ([`gallery_toolbar_fits_chips`]) puts them on
-    /// a row of their own, at any page width — a Medium page at large type
-    /// is as narrow, in its own type, as a Compact one.
-    fn for_row(row_width: f32) -> Self {
-        if !gallery_toolbar_fits_chips(row_width) {
-            Self::ChipsBelow
-        } else {
-            Self::Row
-        }
-    }
-}
-
-/// The toolbar: the view segment, then the gallery's filter and chips or
-/// the Customize view's Save as theme, in `shape`.
-fn toolbar_rows(
-    state: &SettingsViewState,
-    shape: ToolbarShape,
-    page_width: f32,
-) -> Vec<(UiNode, f32)> {
-    let compact = shape != ToolbarShape::Row;
-    let showcase = &state.showcase;
-    let segment = |key: &str, label: &str, visual: &str, selected: bool| {
-        let width = hug_width(visual).max(72.0);
-        UiNode::new(
-            key,
-            UiContent::Button(
-                Control::new(
-                    ButtonSpec::new(label).visual_label(visual),
-                    ActionId::new(key),
-                )
-                .state(ControlState {
-                    selected,
-                    focused: focused(state, key),
-                    ..ControlState::default()
-                })
-                .style(StyleRef::Navigation),
-            ),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fixed(width))
-                .height(Length::Fill),
-        )
-    };
-    let gallery = segment(
-        VIEW_GALLERY,
-        "Gallery: every theme",
-        "Gallery",
-        !showcase.customize,
-    );
-    let customize = segment(
-        VIEW_CUSTOMIZE,
-        "Customize: fonts, colours and palette",
-        "Customize",
-        showcase.customize,
-    );
-    let mut rows = Vec::new();
-    if showcase.customize {
-        let save = button(
-            SHOWCASE_SAVE_AS,
-            "Save as theme\u{2026}",
-            "Save as Theme\u{2026}",
-            StyleRef::Secondary,
-            ControlState {
-                selected: showcase.save.is_some(),
-                focused: focused(state, SHOWCASE_SAVE_AS),
-                ..ControlState::default()
-            },
-            Some(hug_width("Save as Theme\u{2026}").min(page_width / 2.0)),
-        );
-        let spacer = UiNode::new(
-            "settings/showcase/toolbar/spacer",
-            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-        )
-        .layout(Layout::default().width(Length::Fill).height(Length::Fill));
-        rows.push(control_row(
-            "settings/showcase/toolbar",
-            "Theme view",
-            vec![gallery, customize, spacer, save],
-        ));
-        return rows;
-    }
-    let chips: Vec<UiNode> = toolbar_chips(shape, page_width)
-        .iter()
-        .copied()
-        .map(|chip| {
-            let key = format!("{CHIP_PREFIX}{}", chip.word());
-            let visual = chip.label();
-            UiNode::new(
-                key.clone(),
-                UiContent::Button(
-                    Control::new(
-                        // Each name starts with the chip's visible words.
-                        ButtonSpec::new(match chip {
-                            ShowcaseChip::All => "All: show every theme".to_string(),
-                            ShowcaseChip::Yours => "Yours: show your own themes".to_string(),
-                            ShowcaseChip::More => {
-                                "Get More: community pack themes you can add".to_string()
-                            }
-                            _ => format!("{}: show {} themes", visual, chip.word()),
-                        })
-                        .visual_label(visual),
-                        ActionId::new(key.clone()),
-                    )
-                    .state(ControlState {
-                        selected: showcase.chip == chip,
-                        focused: focused(state, &key),
-                        ..ControlState::default()
-                    })
-                    .style(StyleRef::Navigation),
-                ),
-            )
-            .layout(
-                Layout::default()
-                    .width(if compact {
-                        Length::Fill
-                    } else {
-                        Length::Fixed(hug_width(visual).max(56.0))
-                    })
-                    .height(Length::Fill),
-            )
-        })
-        .collect();
-    let filter = text_field(
-        state,
-        SHOWCASE_FILTER,
-        "Filter themes by name, description, dark or light",
-        "Filter themes",
-        &showcase.filter,
-        None,
-        false,
-    );
-    if compact {
-        rows.push(control_row(
-            "settings/showcase/toolbar",
-            "Theme view",
-            vec![gallery, customize, filter],
-        ));
-        rows.push(control_row(
-            "settings/showcase/chips",
-            "Theme filters",
-            chips,
-        ));
-    } else {
-        let mut children = vec![gallery, customize, filter];
-        children.extend(chips);
-        rows.push(control_row(
-            "settings/showcase/toolbar",
-            "Theme view",
-            children,
-        ));
-    }
-    rows
-}
-
-/// A card's height at the page's text scale; `short` draws the shorter
-/// specimen, and its caption takes `meta_lines` lines.
-fn card_height(short: bool, meta_lines: usize) -> f32 {
-    let scale = settings_text_scale();
-    CARD_PAD
-        + tile_height(short, scale)
-        + 5.0
-        + title_height()
-        + 1.0
-        + meta_lines as f32 * meta_height()
-        + CARD_PAD
-}
-
-/// The most lines a card's caption wraps to before it ends in an ellipsis.
-const META_LINES: usize = 3;
-
-/// A card's caption: Dark or Light, then its description. The tier is the
-/// heading over the card's row ("SIGNATURE · 4 THEMES"), filtered or not, so
-/// the caption does not say it again.
-fn card_meta(card: &ShowcaseCard) -> String {
-    let mut description = vec![
-        if card.appearance == aterm_types::Appearance::Dark {
-            "Dark"
-        } else {
-            "Light"
-        }
-        .to_string(),
-    ];
-    if !card.description.is_empty() {
-        description.push(card.description.clone());
-    }
-    // The type settings the theme names, after what it looks like.
-    if let Some(typography) = &card.typography {
-        description.push(format!("Aa {typography}"));
-    }
-    if card.partial {
-        description.push("Some settings need a newer aterm".to_string());
-    }
-    description.join(" \u{b7} ")
-}
-
-/// The lines a row of cards `card_width` wide gives its captions: what its
-/// longest caption wraps to, so a description reads whole, up to `most`
-/// (at most [`META_LINES`]).
-fn row_meta_lines<'a>(
-    cards: impl Iterator<Item = &'a ShowcaseCard>,
-    card_width: f32,
-    most: usize,
-) -> usize {
-    let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
-    let inner = (card_width - 2.0 * CARD_PAD).max(0.0);
-    cards
-        .map(|card| wrapped_copy_lines(&card_meta(card), px, inner).len())
-        .max()
-        .unwrap_or(1)
-        .clamp(1, most.clamp(1, META_LINES))
-}
-
-fn title_height() -> f32 {
-    18.0_f32.max(17.0 * settings_text_scale())
-}
-
-fn meta_height() -> f32 {
-    16.0_f32.max(15.0 * settings_text_scale())
-}
-
-/// How many cards a row of `width` points holds.
-fn card_columns(width: f32) -> usize {
-    let minimum = 200.0 * settings_text_scale().min(1.5);
-    (((width + GUTTER) / (minimum + GUTTER)).floor() as usize).clamp(1, 4)
-}
-
-/// One card: the button that tries it (its whole area), the tile, and its
-/// name and line under the tile; a Yours card also carries Open and Trash on
-/// a row of their own under those.
-fn card_node(
-    state: &SettingsViewState,
-    card: &ShowcaseCard,
-    short: bool,
-    card_width: f32,
-    meta_lines: usize,
-    configured: &str,
-) -> UiNode {
-    let key = format!("{CARD_PREFIX}{}", card.slug);
-    let tried = state
-        .showcase
-        .trial_id()
-        .is_some_and(|id| id.eq_ignore_ascii_case(&card.id));
-    // A pack card is a theme not yet in the folder: it is never tried or in
-    // use as drawn, and pressing it adds it first.
-    let pack = card.tier == ShowcaseTier::Pack;
-    let tried = tried && !pack;
-    let current = !pack && card.id.eq_ignore_ascii_case(configured);
-    // A Yours card's Open and Trash take a row of their own under its name
-    // and line: beside them, at three cards a row, they left the name no
-    // room at all ("…  IN USE").
-    let yours = card.tier == ShowcaseTier::Yours;
-    let inner = (card_width - 2.0 * CARD_PAD).max(0.0);
-    // A pack card says to the eye what a press does: it adds the theme.
-    let kicker = if pack {
-        "+ ADD"
-    } else if tried {
-        "TRYING"
-    } else if current {
-        "IN USE"
-    } else {
-        ""
-    };
-    let kicker_width = if kicker.is_empty() {
-        0.0
-    } else {
-        let (px, face) =
-            crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Accent);
-        crate::tray_raster::ui_text_width_for(face, kicker, px).ceil() + 2.0
-    };
-    let meta = card_meta(card);
-    // The kicker is paint: assistive technology hears the same state in the
-    // description, the theme in use included while another is tried.
-    let spoken = match (tried, current) {
-        _ if pack => {
-            let appearance = if card.appearance == aterm_types::Appearance::Dark {
-                "Dark"
-            } else {
-                "Light"
-            };
-            if card.description.is_empty() {
-                format!(
-                    "Add {} to your themes and try it. {appearance}.",
-                    card.label
-                )
-            } else {
-                format!(
-                    "Add {} to your themes and try it. {appearance}, {}",
-                    card.label, card.description
-                )
-            }
-        }
-        (true, _) => format!("Trying \u{b7} {meta}"),
-        (false, true) => format!("In use \u{b7} {meta}"),
-        (false, false) => meta.clone(),
-    };
-    let mut spec = ButtonSpec::new(card.accessible_label()).visual_label("");
-    spec.description = Some(spoken);
-    let hit = UiNode::new(
-        key.clone(),
-        UiContent::Button(
-            Control::new(spec, ActionId::new(key.clone()))
-                .value(SemanticValue::Text(card.id.clone()))
-                .state(ControlState {
-                    selected: tried || (current && state.showcase.trial_id().is_none()),
-                    focused: focused(state, &key),
-                    ..ControlState::default()
-                })
-                .style(StyleRef::Secondary),
-        ),
-    )
-    .layout(Layout::default().width(Length::Fill).height(Length::Fill));
-    let tile = UiNode::new(
-        format!("{key}/tile"),
-        UiContent::Custom(AuditedCustomNode {
-            audit_id: crate::native_ui::THEME_CARD_AUDIT,
-            role: SemanticRole::Group,
-            label: card.label.clone(),
-            value: Some(card.tile_value(short)),
-            action: None,
-            focusable: false,
-            focused: false,
-            focus_visible: false,
-        }),
-    )
-    .layout(
-        Layout::default()
-            .width(Length::Fill)
-            .height(Length::Fixed(tile_height(short, settings_text_scale()))),
-    )
-    .paint_only();
-    let mut title_children = vec![
-        UiNode::new(
-            format!("{key}/name"),
-            UiContent::Text(TextSpec {
-                text: fit_text(
-                    &card.label,
-                    SemanticRole::Text,
-                    StyleRef::Primary,
-                    inner - kicker_width - 4.0,
-                ),
-                role: SemanticRole::Text,
-                style: StyleRef::Primary,
-            }),
-        )
-        .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-        .paint_only(),
-    ];
-    if !kicker.is_empty() {
-        title_children.push(
-            UiNode::new(
-                format!("{key}/kicker"),
-                UiContent::Text(TextSpec {
-                    text: kicker.to_string(),
-                    role: SemanticRole::Status,
-                    style: StyleRef::Accent,
-                }),
-            )
-            .layout(
-                Layout::default()
-                    .width(Length::Fixed(kicker_width))
-                    .height(Length::Fill),
-            )
-            .paint_only(),
-        );
-    }
-    let title = UiNode::new(
-        format!("{key}/title"),
-        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-    )
-    .layout(Layout::row().height(Length::Fixed(title_height())).gap(4.0))
-    .children(title_children)
-    .paint_only();
-    // The caption wraps to its row's lines, the last ending in an ellipsis
-    // only where it is longer still; the button's description holds it whole.
-    let (mut meta, _) = wrapped_copy_node(
-        &format!("{key}/meta"),
-        &meta,
-        SemanticRole::Text,
-        StyleRef::Quiet,
-        inner,
-        meta_height(),
-        Some(meta_lines),
-    );
-    meta.layout.height = Length::Fixed(meta_lines as f32 * meta_height());
-    let meta = meta.paint_only();
-    let face = UiNode::new(
-        format!("{key}/face"),
-        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-    )
-    .layout(
-        Layout::column()
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(Insets::all(CARD_PAD))
-            .gap(0.0),
-    )
-    .children(vec![
-        tile,
-        spacer_node(&format!("{key}/gap-1"), 5.0),
-        title,
-        spacer_node(&format!("{key}/gap-2"), 1.0),
-        meta,
-    ])
-    .paint_only();
-    let mut children = vec![hit, face];
-    if yours {
-        children.push(card_file_actions(state, card, &key));
-    }
-    UiNode::new(
-        format!("{key}/frame"),
-        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-    )
-    .layout(
-        Layout::default()
-            .width(Length::Fill)
-            .height(Length::Fixed(card_height_for(card.tier, short, meta_lines))),
-    )
-    .children(children)
-}
-
-/// The height of a Yours card's Open and Trash row.
-fn file_actions_height() -> f32 {
-    22.0_f32.max(20.0 * settings_text_scale())
-}
-
-/// A card of `tier` whose caption takes `meta_lines` lines: a Yours card is
-/// taller by its Open and Trash row.
-fn card_height_for(tier: ShowcaseTier, short: bool, meta_lines: usize) -> f32 {
-    card_height(short, meta_lines)
-        + if tier == ShowcaseTier::Yours {
-            file_actions_height() + 4.0
-        } else {
-            0.0
-        }
-}
-
-/// A Yours card's Open and Trash, right-aligned on the card's last row, under
-/// its name and line (the tile keeps its contrast badge and swatches in
-/// view). Trash reads Confirm while one more press moves the file.
-fn card_file_actions(state: &SettingsViewState, card: &ShowcaseCard, key: &str) -> UiNode {
-    let height = file_actions_height();
-    let armed = state.showcase.trash_armed.as_deref() == Some(card.slug.as_str());
-    let open_key = format!("{key}/{CARD_OPEN}");
-    let trash_key = format!("{key}/{CARD_TRASH}");
-    let trash_visual = if armed { "Confirm" } else { "Trash" };
-    // The theme in use (either side of a split) is never moved.
-    let in_use = state
-        .configured_theme_ids()
-        .iter()
-        .any(|id| id.eq_ignore_ascii_case(&card.id));
-    let small = |action: &str, label: String, visual: &str| {
-        let mut node = button(
-            action,
-            &label,
-            visual,
-            StyleRef::Secondary,
-            ControlState {
-                enabled: action == open_key || !in_use,
-                focused: focused(state, action),
-                ..ControlState::default()
-            },
-            Some(hug_width(if action == open_key {
-                "Open"
-            } else {
-                "Confirm"
-            })),
-        );
-        node.layout.height = Length::Fixed(height);
-        node
-    };
-    let spacer = UiNode::new(
-        format!("{key}/actions/spacer"),
-        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-    )
-    .layout(Layout::default().width(Length::Fill).height(Length::Fill));
-    let row = UiNode::new(
-        format!("{key}/actions/row"),
-        UiContent::Group(GroupSpec::new(format!("{} file", card.label))),
-    )
-    .layout(Layout::row().height(Length::Fixed(height)).gap(4.0))
-    .children(vec![
-        spacer,
-        small(
-            &open_key,
-            format!("Open the {} theme file", card.label),
-            "Open",
-        ),
-        small(
-            &trash_key,
-            if armed {
-                format!("Confirm moving {} to the Trash", card.label)
-            } else {
-                format!("Move {} to the Trash", card.label)
-            },
-            trash_visual,
-        ),
-    ]);
-    let top = UiNode::new(
-        format!("{key}/actions/top"),
-        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-    )
-    .layout(Layout::default().width(Length::Fill).height(Length::Fill));
-    UiNode::new(
-        format!("{key}/actions"),
-        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-    )
-    .layout(
-        Layout::column()
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(Insets {
-                top: 0.0,
-                right: CARD_PAD,
-                bottom: CARD_PAD,
-                left: CARD_PAD,
-            }),
-    )
-    .children(vec![top, row])
-}
-
-fn spacer_node(key: &str, height: f32) -> UiNode {
-    UiNode::new(
-        key,
-        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-    )
-    .layout(
-        Layout::default()
-            .width(Length::Fill)
-            .height(Length::Fixed(height)),
-    )
-    .paint_only()
-}
-
-/// The height of a tier heading.
-fn tier_heading_height() -> f32 {
-    22.0_f32.max(16.0 * settings_text_scale())
-}
-
-/// A block of the paged body: a node built already, or a gallery row whose
-/// cards are built only when its page is drawn.
-enum PageBlock {
-    Node(Box<UiNode>),
-    Row(GalleryRow),
-}
-
-/// One row of gallery cards, unbuilt: the tier, the row's place in it, the
-/// cards (indices into the gallery's cards), on a tier's first row how many
-/// cards the tier holds (for its heading), and its captions' line count.
-struct GalleryRow {
-    tier: ShowcaseTier,
-    row_index: usize,
-    cards: Vec<usize>,
-    heading: Option<usize>,
-    /// The lines every caption in the row takes, so the cards stand level.
-    meta_lines: usize,
-}
-
-/// The gallery's blocks — each a whole row of cards (the first row of a
-/// tier with its heading) — with their heights and the slugs each draws.
-/// No card is built here: the list builds a row's node when it lays it out
-/// ([`gallery_row_node`]). A `gutter` (the scroll thumb's) is kept clear at
-/// the trailing edge: the column count is the full width's, so a list that
-/// scrolls keeps its columns.
-fn gallery_blocks(
-    state: &SettingsViewState,
-    short: bool,
-    column_width: f32,
-    most_lines: usize,
-    gutter: f32,
-) -> Vec<(PageBlock, f32, Vec<String>)> {
-    let columns = card_columns(column_width);
-    let column_width = (column_width - gutter).max(0.0);
-    let showcase = &state.showcase;
-    let visible = showcase.visible();
-    if visible.is_empty() {
-        let query = showcase.filter.value().trim();
-        let text = if query.is_empty() && showcase.chip == ShowcaseChip::More {
-            "Every pack theme is in your themes folder".to_string()
-        } else if query.is_empty() {
-            format!(
-                "No {} themes",
-                showcase
-                    .chip
-                    .word()
-                    .replace("yours", "theme files of your own")
-            )
-        } else {
-            format!("No theme matches \u{201c}{query}\u{201d}")
-        };
-        let height = scaled_control_height();
-        return vec![(
-            PageBlock::Node(Box::new(line(
-                "settings/showcase/empty",
-                &text,
-                SemanticRole::Status,
-                StyleRef::Quiet,
-                column_width,
-                height,
-            ))),
-            height,
-            Vec::new(),
-        )];
-    }
-    let card_width = (column_width - GUTTER * (columns - 1) as f32) / columns as f32;
-    let mut blocks = Vec::new();
-    let mut start = 0;
-    while start < visible.len() {
-        let tier = showcase.cards[visible[start]].tier;
-        let end = visible[start..]
-            .iter()
-            .position(|index| showcase.cards[*index].tier != tier)
-            .map_or(visible.len(), |offset| start + offset);
-        for (row_index, row) in visible[start..end].chunks(columns).enumerate() {
-            let slugs: Vec<String> = row
-                .iter()
-                .map(|index| showcase.cards[*index].slug.clone())
-                .collect();
-            let meta_lines = row_meta_lines(
-                row.iter().map(|index| &showcase.cards[*index]),
-                card_width,
-                most_lines,
-            );
-            let heading = (row_index == 0).then_some(end - start);
-            let height = card_height_for(tier, short, meta_lines)
-                + if heading.is_some() {
-                    tier_heading_height() + 4.0
-                } else {
-                    0.0
-                };
-            blocks.push((
-                PageBlock::Row(GalleryRow {
-                    tier,
-                    row_index,
-                    cards: row.to_vec(),
-                    heading,
-                    meta_lines,
-                }),
-                height,
-                slugs,
-            ));
-        }
-        start = end;
-    }
-    blocks
-}
-
-/// Build one gallery row's node: its cards (a short last row padded to the
-/// others' width) under the tier's heading on its first row.
-fn gallery_row_node(
-    state: &SettingsViewState,
-    row: &GalleryRow,
-    short: bool,
-    column_width: f32,
-    gutter: f32,
-    configured: &str,
-) -> UiNode {
-    let showcase = &state.showcase;
-    // The columns are the full width's; the cards share it less the gutter.
-    let columns = card_columns(column_width);
-    let column_width = (column_width - gutter).max(0.0);
-    let card_width = (column_width - GUTTER * (columns - 1) as f32) / columns as f32;
-    let GalleryRow {
-        tier,
-        row_index,
-        cards,
-        heading,
-        meta_lines,
-    } = row;
-    let mut cells: Vec<UiNode> = cards
-        .iter()
-        .map(|index| {
-            card_node(
-                state,
-                &showcase.cards[*index],
-                short,
-                card_width,
-                *meta_lines,
-                configured,
-            )
-        })
-        .collect();
-    let row_key = format!(
-        "settings/showcase/row/{}/{row_index}",
-        tier.label().to_ascii_lowercase().replace(' ', "-")
-    );
-    // A short last row keeps its cards the width of the rest.
-    for pad in cards.len()..columns {
-        cells.push(
-            UiNode::new(
-                format!("{row_key}/pad-{pad}"),
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-            )
-            .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
-        );
-    }
-    let row_height = card_height_for(*tier, short, *meta_lines);
-    let row_node = UiNode::new(
-        row_key.clone(),
-        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-    )
-    .layout(Layout::row().height(Length::Fixed(row_height)).gap(GUTTER))
-    .children(cells);
-    let Some(count) = heading else {
-        return row_node;
-    };
-    let heading_height = tier_heading_height();
-    let heading = line(
-        format!("{row_key}/heading"),
-        &format!(
-            "{} \u{b7} {count} {}",
-            tier.label(),
-            if *count == 1 { "THEME" } else { "THEMES" }
-        ),
-        SemanticRole::Heading,
-        StyleRef::Quiet,
-        column_width,
-        heading_height,
-    );
-    UiNode::new(
-        format!("{row_key}/block"),
-        UiContent::Group(GroupSpec::new(format!(
-            "{} themes",
-            tier.label().to_lowercase()
-        ))),
-    )
-    .layout(
-        Layout::column()
-            .height(Length::Fixed(heading_height + 4.0 + row_height))
-            .gap(4.0),
-    )
-    .children(vec![heading, row_node])
-}
-
-/// The stage: the Appearance specimen in the terminal's own font, drawing
-/// the hovered or focused card (else the trial, else the configured theme)
-/// under every override and draft.
-fn stage_node(state: &SettingsViewState, height: f32, cx: &ViewCx<'_>) -> Option<UiNode> {
-    // The stage shows the theme, or — while the font picker is open — the
-    // typography sample of the family under the highlight.
-    let key = state
-        .choice_picker
-        .as_ref()
-        .filter(|picker| picker.fonts)
-        .map_or(prefs::EDIT_THEME, |picker| picker.key.as_str());
-    let spec = renderer_preview_spec_for_key_with_font(
-        state,
-        key,
-        cx.animation_phase_ms,
-        cx.motion,
-        cx.terminal_font_px,
-        cx.terminal_scale,
-        cx.semantic_font.as_ref(),
-    )?
-    // The stage shows one theme: its window sample takes that theme's side,
-    // not the OS's, so a light theme is not framed by a dark titlebar.
-    .with_window_following_theme(true);
-    Some(crate::settings_preview::preview_node(
-        "settings/showcase/stage",
-        spec,
-        height,
-    ))
-}
-
-/// A Customize section's heading over its first row.
-fn with_heading(key: &str, heading: &str, block: (UiNode, f32), width: f32) -> (UiNode, f32) {
-    let heading_height = tier_heading_height();
-    let height = heading_height + 4.0 + block.1;
-    (
-        UiNode::new(
-            format!("{key}/block"),
-            UiContent::Group(GroupSpec::new(heading.to_lowercase())),
-        )
-        .layout(Layout::column().height(Length::Fixed(height)).gap(4.0))
-        .children(vec![
-            line(
-                format!("{key}/heading"),
-                heading,
-                SemanticRole::Heading,
-                StyleRef::Quiet,
-                width,
-                heading_height,
-            ),
-            block.0,
-        ]),
-        height,
-    )
-}
-
-/// One registry row of the Customize view, with its Reset (enabled only
-/// for a value the file sets, or Discard while a draft is held).
-fn customize_row(
-    state: &SettingsViewState,
-    key: &str,
-    width: SettingsWidth,
-    column_width: f32,
-) -> Option<(UiNode, f32)> {
-    let index = state.field_index_of(key)?;
-    let field = state.legacy.fields.get(index)?;
-    // The page's column is narrower than a field page's beside the stage:
-    // the control gives up width before the label is cut.
-    let control_width = (column_width * 0.42).clamp(160.0, 300.0 * settings_text_scale().min(1.25));
-    let mut row = finish_setting_row_narrowed(
-        state,
-        index,
-        field,
-        width,
-        column_width,
-        prefs::footnote_of(key),
-        control_width,
-    );
-    let explicit = state.is_explicit(key);
-    let colour = SHOWCASE_COLOR_KEYS.contains(&key).then_some(field.label);
-    reset_button_for_theme(&mut row, key, explicit, colour);
-    let height = fixed_height(&row);
-    Some((row, height))
-}
-
-/// The row's Reset says what it resets to and is off while there is nothing
-/// to reset. `colour` is a colour row's label: its Reset names the setting
-/// as the row does.
-fn reset_button_for_theme(node: &mut UiNode, key: &str, explicit: bool, colour: Option<&str>) {
-    let reset_key = format!("settings/reset/{key}");
-    if node.key.as_str() == reset_key {
-        if let UiContent::Button(control) = &mut node.content {
-            control.state.enabled = control.state.enabled && explicit;
-            if let Some(label) = colour {
-                control.spec.label = format!("Reset {label} to the theme's colour");
-            }
-        }
-        return;
-    }
-    for child in &mut node.children {
-        reset_button_for_theme(child, key, explicit, colour);
-    }
-}
-
-/// The palette: sixteen chips (normal over bright), the open slot's editor,
-/// and Reset palette.
-fn palette_blocks(state: &SettingsViewState, column_width: f32) -> Vec<(UiNode, f32)> {
-    let colors = state.showcase_colors().scheme.ansi;
-    let chip_height = 32.0_f32.max(28.0 * settings_text_scale());
-    let chip_row = |row: usize| {
-        let chips: Vec<UiNode> = (row * 8..row * 8 + 8)
-            .map(|index| {
-                let key = format!("{PALETTE_PREFIX}{index}");
-                let hex = hex_of(colors[index]);
-                let selected = state
-                    .showcase
-                    .slot
-                    .as_ref()
-                    .is_some_and(|slot| slot.index == index);
-                let hit = UiNode::new(
-                    key.clone(),
-                    UiContent::Button(
-                        Control::new(
-                            ButtonSpec::new(format!(
-                                "Palette colour {index}, {}: {hex}",
-                                SLOT_NAMES[index]
-                            ))
-                            .visual_label(""),
-                            ActionId::new(key.clone()),
-                        )
-                        .value(SemanticValue::Text(hex.clone()))
-                        .state(ControlState {
-                            selected,
-                            focused: focused(state, &key),
-                            ..ControlState::default()
-                        })
-                        // The slot being edited wears the selected chip's
-                        // accent rim and wash; a Secondary button's selected
-                        // state is all but hidden under its swatch.
-                        .style(if selected {
-                            StyleRef::Navigation
-                        } else {
-                            StyleRef::Secondary
-                        }),
-                    ),
-                )
-                .layout(Layout::default().width(Length::Fill).height(Length::Fill));
-                let swatch = UiNode::new(
-                    format!("{key}/swatch"),
-                    UiContent::Custom(AuditedCustomNode {
-                        audit_id: crate::native_ui::THEME_SWATCH_AUDIT,
-                        role: SemanticRole::Group,
-                        // The swatch paints no words: its button above says
-                        // the slot and its hex.
-                        label: String::new(),
-                        value: Some(hex),
-                        action: None,
-                        focusable: false,
-                        focused: false,
-                        focus_visible: false,
-                    }),
-                )
-                .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-                .paint_only();
-                let face = UiNode::new(
-                    format!("{key}/face"),
-                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-                )
-                .layout(
-                    Layout::default()
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .padding(Insets::all(4.0)),
-                )
-                .children(vec![swatch])
-                .paint_only();
-                UiNode::new(
-                    format!("{key}/frame"),
-                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-                )
-                .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-                .children(vec![hit, face])
-            })
-            .collect();
-        UiNode::new(
-            format!("settings/showcase/palette-row/{row}"),
-            UiContent::Group(GroupSpec::new(if row == 0 {
-                "Normal colours"
-            } else {
-                "Bright colours"
-            })),
-        )
-        .layout(Layout::row().height(Length::Fixed(chip_height)).gap(6.0))
-        .children(chips)
-    };
-    let grid_height = 2.0 * chip_height + 6.0;
-    let grid = UiNode::new(
-        "settings/showcase/palette",
-        UiContent::Group(GroupSpec::new("Palette")),
-    )
-    .layout(Layout::column().height(Length::Fixed(grid_height)).gap(6.0))
-    .children(vec![chip_row(0), chip_row(1)]);
-    let pending = state.config_key_pending(prefs::EDIT_PALETTE)
-        || state.config_key_pending(prefs::EDIT_PALETTE_OVERRIDES);
-    let mut controls = Vec::new();
-    if let Some(SlotEditor { index, input, .. }) = state.showcase.slot.as_ref() {
-        let swatch = aterm_types::scheme::parse_hex(input.value().trim())
-            .map(|color| [color.r, color.g, color.b]);
-        controls.push(text_field(
-            state,
-            SHOWCASE_PALETTE_SLOT,
-            &format!("Palette colour {index}, {}", SLOT_NAMES[*index]),
-            "#rrggbb",
-            input,
-            swatch,
-            swatch.is_none(),
-        ));
-        controls.push(button(
-            PALETTE_SLOT_RESET,
-            &format!("Reset palette colour {index} to the theme's"),
-            "Reset Colour",
-            StyleRef::Quiet,
-            ControlState {
-                enabled: !pending,
-                ..ControlState::default()
-            },
-            Some(hug_width("Reset Colour")),
-        ));
-        controls.push(button(
-            PALETTE_SLOT_CLOSE,
-            "Close the palette colour editor",
-            "Done",
-            StyleRef::Quiet,
-            ControlState::default(),
-            Some(hug_width("Done")),
-        ));
-    } else {
-        controls.push(
-            UiNode::new(
-                "settings/showcase/palette-hint",
-                UiContent::Text(TextSpec {
-                    text: fit_text(
-                        "Choose a colour to change it; Return saves",
-                        SemanticRole::Text,
-                        StyleRef::Quiet,
-                        column_width - hug_width("Reset Palette") - 6.0,
-                    ),
-                    role: SemanticRole::Text,
-                    style: StyleRef::Quiet,
-                }),
-            )
-            .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
-        );
-    }
-    controls.push(button(
-        PALETTE_RESET_ALL,
-        "Reset the palette to the theme's colours",
-        "Reset Palette",
-        StyleRef::Quiet,
-        ControlState {
-            enabled: (state.is_explicit(prefs::EDIT_PALETTE)
-                || state.is_explicit(prefs::EDIT_PALETTE_OVERRIDES)
-                || state.field_has_unsaved_draft(prefs::EDIT_PALETTE))
-                && !pending,
-            focused: focused(state, PALETTE_RESET_ALL),
-            ..ControlState::default()
-        },
-        Some(hug_width("Reset Palette")),
-    ));
-    // The swatches and their editor are one block, so they page together:
-    // choosing a swatch never opens its editor on a page not shown.
-    let (tools, tools_height) = control_row(
-        "settings/showcase/palette-tools",
-        "Palette colour",
-        controls,
-    );
-    let section_height = grid_height + 6.0 + tools_height;
-    let section = UiNode::new(
-        "settings/showcase/palette-and-tools",
-        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-    )
-    .layout(
-        Layout::column()
-            .height(Length::Fixed(section_height))
-            .gap(6.0),
-    )
-    .children(vec![grid, tools]);
-    vec![with_heading(
-        "settings/showcase/palette-section",
-        "PALETTE",
-        (section, section_height),
-        column_width,
-    )]
-}
-
-/// The Save as theme row: the name, Save and Cancel, and why a name cannot
-/// be used.
-fn save_blocks(state: &SettingsViewState, column_width: f32) -> Vec<(UiNode, f32)> {
-    let Some(save) = state.showcase.save.as_ref() else {
-        return Vec::new();
-    };
-    let problem = save.error.clone();
-    let field = text_field(
-        state,
-        SHOWCASE_SAVE_NAME,
-        "New theme name",
-        "Theme name",
-        &save.name,
-        None,
-        problem.is_some(),
-    );
-    let confirm = button(
-        SAVE_CONFIRM,
-        "Save the colours shown as a new theme",
-        "Save",
-        StyleRef::Secondary,
-        ControlState {
-            enabled: problem.is_none(),
-            focused: focused(state, SAVE_CONFIRM),
-            ..ControlState::default()
-        },
-        Some(hug_width("Save").max(72.0)),
-    );
-    let cancel = button(
-        SAVE_CANCEL,
-        "Cancel saving a theme",
-        "Cancel",
-        StyleRef::Quiet,
-        ControlState {
-            focused: focused(state, SAVE_CANCEL),
-            ..ControlState::default()
-        },
-        Some(hug_width("Cancel")),
-    );
-    let include_type = UiNode::new(
-        SHOWCASE_SAVE_TYPE,
-        UiContent::Switch(
-            Control::new(
-                SwitchSpec {
-                    label: "Include type settings".to_string(),
-                    description: Some(
-                        "Also write the font, line height, ligatures, weight and size scale \
-                         shown in Customize"
-                            .to_string(),
-                    ),
-                },
-                ActionId::new(SHOWCASE_SAVE_TYPE),
-            )
-            .value(SemanticValue::Bool(save.include_type))
-            .state(ControlState {
-                focused: focused(state, SHOWCASE_SAVE_TYPE),
-                ..ControlState::default()
-            })
-            .style(StyleRef::Setting),
-        ),
-    )
-    .layout(
-        Layout::default()
-            .width(Length::Fixed(104.0 * settings_text_scale().min(1.4)))
-            .height(Length::Fill),
-    );
-    let mut blocks = vec![with_heading(
-        "settings/showcase/save-section",
-        "SAVE AS THEME",
-        control_row(
-            "settings/showcase/save-row",
-            "Save as theme",
-            vec![field, confirm, cancel],
-        ),
-        column_width,
-    )];
-    // The switch's own words, drawn beside it: the Setting switch paints
-    // only On/Off.
-    blocks.push(control_row(
-        "settings/showcase/save-type-row",
-        "Include type settings",
-        vec![
-            line(
-                "settings/showcase/save-type-label",
-                "Include type settings",
-                SemanticRole::Text,
-                StyleRef::Plain,
-                (column_width - 104.0 * settings_text_scale().min(1.4) - 6.0).max(0.0),
-                scaled_control_height(),
-            )
-            .paint_only(),
-            include_type,
-        ],
-    ));
-    let note = problem.unwrap_or_else(|| {
-        if save.include_type {
-            "Writes the colours and type settings shown to your themes folder, then uses it"
-        } else {
-            "Writes the colours shown to your themes folder, then uses it"
-        }
-        .to_string()
-    });
-    let height = 20.0_f32.max(18.0 * settings_text_scale());
-    blocks.push((
-        line(
-            "settings/showcase/save-note",
-            &note,
-            SemanticRole::Status,
-            StyleRef::Quiet,
-            column_width,
-            height,
-        ),
-        height,
-    ));
-    blocks
-}
-
-/// The Customize view's blocks: the stage (unless it stands beside), the
-/// Save as row, the type rows, the colour rows, the look rows and the
-/// palette.
-fn customize_blocks(
-    state: &SettingsViewState,
-    width: SettingsWidth,
-    column_width: f32,
-    stage_beside: bool,
-    cx: &ViewCx<'_>,
-) -> Vec<(UiNode, f32)> {
-    let mut blocks = Vec::new();
-    if !stage_beside {
-        let height = renderer_preview_height(width);
-        if let Some(stage) = stage_node(state, height, cx) {
-            blocks.push((stage, height));
-        }
-    }
-    blocks.extend(save_blocks(state, column_width));
-    for (heading, keys) in [
-        ("TYPE", SHOWCASE_TYPE_KEYS.as_slice()),
-        ("COLOURS", SHOWCASE_COLOR_KEYS.as_slice()),
-        ("LOOK", SHOWCASE_LOOK_KEYS.as_slice()),
-    ] {
-        let mut first = true;
-        for key in keys {
-            let Some(row) = customize_row(state, key, width, column_width) else {
-                continue;
-            };
-            blocks.push(if first {
-                with_heading(
-                    &format!("settings/showcase/{}", heading.to_lowercase()),
-                    heading,
-                    row,
-                    column_width,
-                )
-            } else {
-                row
-            });
-            first = false;
-        }
-    }
-    blocks.extend(palette_blocks(state, column_width));
-    blocks
-}
-
-/// THE PAGE: its heading, the trial bar and toolbar (pinned above the list
-/// where a screen still holds a block under them), then the gallery's rows
-/// or the Customize view's sections as one scrolling list; on a Wide page
-/// the stage stands beside it.
-pub(super) fn theme_showcase_page(
-    state: &SettingsViewState,
-    width: SettingsWidth,
-    cx: &ViewCx<'_>,
-) -> Vec<UiNode> {
-    let viewport = cx.viewport;
-    let compact = width == SettingsWidth::Compact;
-    let gap = settings_page_gap(state, width, viewport);
-    let maximum = page_maximum(SettingsRoute::Themes, width);
-    let page_width = settings_page_content_width(viewport.width, width, maximum);
-    let (mut out, mut used) = pinned_heading(
-        width,
-        viewport,
-        gap,
-        SHOWCASE_TITLE,
-        route_subtitle(SettingsRoute::Themes),
-    );
-    // An open picker (the Customize view's font family) is the page's whole
-    // decision surface, as on a field page: the stage above it previews the
-    // highlighted row, and Done or Escape brings the rows back.
-    if state.showcase.customize && state.choice_picker.is_some() {
-        if let Some(stage) = stage_node(state, renderer_preview_height(width), cx) {
-            out.push(stage);
-        }
-        out.extend(choice_picker_node(state, width, viewport, &out));
-        return out;
-    }
-    let body = settings_list_body_height(state, width, viewport);
-    // On a Wide page the stage, in the terminal's own font, stands beside
-    // the gallery (drawing the card under the pointer or the keyboard) and
-    // beside the Customize view's rows.
-    let stage_beside = width == SettingsWidth::Wide;
-    let column_width = if stage_beside {
-        (page_width - STAGE_WIDTH - GUTTER).max(0.0)
-    } else {
-        page_width
-    };
-    // The trial bar and toolbar are built for the width they are placed in:
-    // pinned over the page, the page's; moved into a list that stands
-    // beside the stage, the gallery column's.
-    let sticky_rows = |base: f32, gutter: f32| -> Vec<(UiNode, f32)> {
-        let row_width = (base - gutter).max(0.0);
-        let mut sticky: Vec<(UiNode, f32)> = trial_bar(state, width, row_width);
-        sticky.extend(toolbar_rows(
-            state,
-            ToolbarShape::for_row(row_width),
-            row_width,
-        ));
-        sticky
-    };
-    let mut sticky = sticky_rows(page_width, 0.0);
-    // A short page draws the shorter specimen, so a screen holds two rows.
-    let short = compact || body < 640.0;
-    // The trial bar and the toolbar stay pinned over the list while it keeps
-    // room for its tallest block; on a short host or at large type they
-    // scroll with it instead.
-    let sticky_height: f32 = sticky.iter().map(|(_, height)| height + gap).sum();
-    let to_first_cards = |blocks: &[(PageBlock, f32, Vec<String>)]| -> f32 {
-        blocks
-            .iter()
-            .position(|(_, _, slugs)| !slugs.is_empty())
-            .map_or(0.0, |row| {
-                blocks[..=row]
-                    .iter()
-                    .map(|(_, height, _)| height + gap)
-                    .sum()
-            })
-    };
-    let list_blocks = |gutter: f32| -> Vec<(PageBlock, f32, Vec<String>)> {
-        if state.showcase.customize {
-            // Its rows are cards, whose own padding holds the thumb.
-            return customize_blocks(state, width, column_width, stage_beside, cx)
-                .into_iter()
-                .map(|(node, height)| (PageBlock::Node(Box::new(node)), height, Vec::new()))
-                .collect();
-        }
-        // Captions read whole where a screen holds the toolbar and a whole
-        // row of cards; a host too short for that wraps them to fewer lines
-        // (the card's description is whole in its spoken label) before its
-        // first screen would hold no card at all.
-        let mut most_lines = META_LINES;
-        let mut blocks = gallery_blocks(state, short, column_width, most_lines, gutter);
-        while most_lines > 1 && body - sticky_height < to_first_cards(&blocks) {
-            most_lines -= 1;
-            blocks = gallery_blocks(state, short, column_width, most_lines, gutter);
-        }
-        let (footer, height) = gallery_footer(state, (column_width - gutter).max(0.0));
-        blocks.push((PageBlock::Node(Box::new(footer)), height, Vec::new()));
-        blocks
-    };
-    let mut blocks = list_blocks(0.0);
-    // A short gallery's title gives way where that is what lets its first
-    // screen hold the toolbar and a whole row of cards (the default 80x24
-    // window): the sidebar and the window already name the page.
-    let first_cards = to_first_cards(&blocks);
-    if !state.showcase.customize
-        && body - used - sticky_height < first_cards
-        && body - sticky_height >= first_cards
-    {
-        out.clear();
-        used = 0.0;
-    }
-    let tallest = blocks
-        .iter()
-        .map(|(_, height, _)| *height)
-        .fold(0.0_f32, f32::max);
-    // A feedback bar can leave too little room even after the toolbar
-    // scrolls away. Give the optional title to the tallest complete block
-    // when that alone makes it fit; otherwise no page can show it whole.
-    if !state.showcase.customize && body - used < tallest && body >= tallest {
-        out.clear();
-        used = 0.0;
-    }
-    let moved = body - used - sticky_height < tallest;
-    if !moved {
-        used += sticky_height;
-    }
-    let sticky_base = if moved { column_width } else { page_width };
-    if moved && stage_beside {
-        sticky = sticky_rows(sticky_base, 0.0);
-    }
-    // THE THUMB'S GUTTER: a list that scrolls draws its thumb at its trailing
-    // edge (`paint_messages_scroll`, 3pt at 7pt in), and the gallery's rows
-    // run to that edge (the Filter field, the chips, the last card's frame),
-    // so where the list scrolls they are laid out THUMB_GUTTER short of it.
-    // Other pages' cards hold the thumb in their own padding.
-    let span = |sticky: &[(UiNode, f32)], blocks: &[(PageBlock, f32, Vec<String>)]| {
-        let heights: Vec<f32> = sticky
-            .iter()
-            .filter(|_| moved)
-            .map(|(_, height)| *height)
-            .chain(blocks.iter().map(|(_, height, _)| *height))
-            .collect();
-        heights.iter().sum::<f32>() + heights.len().saturating_sub(1) as f32 * gap
-    };
-    let overhang = settings_list_overhang(state, width, viewport);
-    let scrolls = span(&sticky, &blocks) > (body - used).max(0.0) + overhang + 0.01;
-    let gutter = if scrolls { THUMB_GUTTER } else { 0.0 };
-    if scrolls {
-        blocks = list_blocks(gutter);
-        if moved {
-            sticky = sticky_rows(sticky_base, gutter);
-        }
-    }
-    let clear_of_thumb = |mut node: UiNode| {
-        node.layout.padding.right += gutter;
-        node
-    };
-    // A gallery block clears the thumb (a row of cards does when it is
-    // built, below); the Customize view's cards hold it in their padding.
-    let clear_block = |block: PageBlock| match block {
-        PageBlock::Node(node) if !state.showcase.customize => {
-            PageBlock::Node(Box::new(clear_of_thumb(*node)))
-        }
-        block => block,
-    };
-    if moved {
-        let mut list: Vec<(PageBlock, f32, Vec<String>)> = std::mem::take(&mut sticky)
-            .into_iter()
-            .map(|(node, height)| {
-                (
-                    PageBlock::Node(Box::new(clear_of_thumb(node))),
-                    height,
-                    Vec::new(),
-                )
-            })
-            .collect();
-        list.extend(
-            blocks
-                .into_iter()
-                .map(|(block, height, slugs)| (clear_block(block), height, slugs)),
-        );
-        blocks = list;
-    } else {
-        out.extend(sticky.into_iter().map(|(node, _)| node));
-        blocks = blocks
-            .into_iter()
-            .map(|(block, height, slugs)| (clear_block(block), height, slugs))
-            .collect();
-    }
-    // Every card is in the list; the keyboard steps through them in order
-    // and the list follows (`step_card_focus`).
-    *state.showcase.drawn.borrow_mut() = blocks
-        .iter()
-        .filter(|(_, _, slugs)| !slugs.is_empty())
-        .map(|(_, _, slugs)| slugs.clone())
-        .collect();
-    let room = (body - used).max(0.0);
-    let configured = state.configured_theme_id();
-    let items: Vec<ListItem> = blocks
-        .into_iter()
-        .map(|(block, height, slugs)| {
-            let node = match block {
-                PageBlock::Node(node) => *node,
-                PageBlock::Row(row) => clear_of_thumb(gallery_row_node(
-                    state,
-                    &row,
-                    short,
-                    column_width,
-                    gutter,
-                    &configured,
-                )),
-            };
-            // A row of cards is one stop: its cards scroll together.
-            if slugs.is_empty() {
-                ListItem::of(node, height)
-            } else {
-                ListItem::Card(Box::new(node), height)
-            }
-        })
-        .collect();
-    let list = scroll::list_page_peeking(
-        state,
-        "settings/list",
-        if state.showcase.customize {
-            "Customize theme"
-        } else {
-            "Themes"
-        },
-        items,
-        room,
-        gap,
-        overhang,
-    );
-    if stage_beside {
-        out.push(showcase_beside_stage(state, list, room, cx));
-    } else {
-        out.push(list);
-    }
-    out
-}
-
-/// The words under the stage. The stage draws a sample (the card pointed at
-/// or the one being tried), never the app-wide state: whether a theme is
-/// being tried across the app is the trial bar's to say, so a caption that
-/// outlives a Revert never claims a preview the window is not showing.
-pub(super) fn stage_caption(sample: Option<&str>, customize: bool) -> String {
-    match sample {
-        Some(label) => format!("Sample: {label}"),
-        None if customize => "In your terminal font and colours".to_string(),
-        None => "Point at a theme to see a sample here".to_string(),
-    }
-}
-
-/// The list with the stage column beside it: the rows scroll, the stage
-/// stays.
-fn showcase_beside_stage(
-    state: &SettingsViewState,
-    list: UiNode,
-    room: f32,
-    cx: &ViewCx<'_>,
-) -> UiNode {
-    let caption_height = 20.0_f32.max(16.0 * settings_text_scale());
-    // The Appearance specimen draws three rows and its palette: past the
-    // height every other Settings page gives it, the stage is empty ground.
-    let stage_height =
-        (room - caption_height - 6.0).min(renderer_preview_height(SettingsWidth::Wide));
-    let mut side = Vec::new();
-    if stage_height >= 96.0
-        && let Some(stage) = stage_node(state, stage_height, cx)
-    {
-        let sample = state
-            .showcase_candidate()
-            .map(|card| card.label.clone())
-            .or_else(|| {
-                state.showcase.trial_id().map(|id| {
-                    state
-                        .showcase
-                        .card(id)
-                        .map_or_else(|| id.to_string(), |card| card.label.clone())
-                })
-            });
-        let caption = stage_caption(sample.as_deref(), state.showcase.customize);
-        side.push(stage);
-        side.push(line(
-            "settings/showcase/stage-caption",
-            &caption,
-            SemanticRole::Text,
-            StyleRef::Quiet,
-            STAGE_WIDTH,
-            caption_height,
-        ));
-    }
-    let height = fixed_height(&list).max(if side.is_empty() {
-        0.0
-    } else {
-        stage_height + 6.0 + caption_height
-    });
-    let column = UiNode::new(
-        "settings/showcase/body",
-        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-    )
-    .layout(Layout::column().width(Length::Fill).height(Length::Fill))
-    .children(vec![list]);
-    let stage_column = UiNode::new(
-        "settings/showcase/stage-column",
-        UiContent::Group(GroupSpec::new("Theme preview")),
-    )
-    .layout(
-        Layout::column()
-            .width(Length::Fixed(STAGE_WIDTH))
-            .height(Length::Fill)
-            .gap(6.0),
-    )
-    .children(side);
-    UiNode::new(
-        "settings/showcase/layout",
-        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-    )
-    .layout(Layout::row().height(Length::Fixed(height)).gap(GUTTER))
-    .children(vec![column, stage_column])
 }

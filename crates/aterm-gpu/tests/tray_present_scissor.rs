@@ -11,6 +11,8 @@
 // No GPU or no font: COULD NOT RUN.
 
 use aterm_core::terminal::Terminal;
+#[cfg(wgpu_arm)]
+use aterm_gpu::TrayScrim;
 use aterm_gpu::video_tap::{CaptureOpts, DEFAULT_BUDGET, VideoTake};
 use aterm_gpu::{GpuRenderer, TrayQuad, WindowGpu};
 use aterm_render::{GlowQuad, RenderInput, Theme, premul_rgb};
@@ -94,6 +96,7 @@ fn tray_present_scissors_and_stays_byte_identical_to_a_full_repaint() {
         ph,
         dx: (cw * 2) as u32,
         dy: (ch * 2) as u32,
+        scrim: None,
     };
     let (fw, fh) = gpu.frame_size(rows, cols);
     let (fw, fh) = (fw as u32, fh as u32);
@@ -144,6 +147,7 @@ fn dropping_the_tray_leaves_no_stale_card_pixels() {
         ph,
         dx: cw as u32,
         dy: ch as u32,
+        scrim: None,
     };
     let (fw, fh) = gpu.frame_size(rows, cols);
     let (fw, fh) = (fw as u32, fh as u32);
@@ -213,6 +217,7 @@ fn an_opaque_tray_still_covers_the_comet_halo() {
         ph: fh,
         dx: 0,
         dy: 0,
+        scrim: None,
     };
     let covered_glow = harvest(&mut gpu, fw, fh, &[(&glowing, Some(quad))]);
     let covered_plain = harvest(&mut gpu, fw, fh, &[(&plain, Some(quad))]);
@@ -225,5 +230,88 @@ fn an_opaque_tray_still_covers_the_comet_halo() {
             .iter()
             .zip(covered_plain.frames[0].rgba.iter())
             .position(|(x, y)| x != y)
+    );
+}
+
+/// A scrim is the window-sized smoke layer a modal used to bake into its card:
+/// a small opaque card over a scrim presents byte-identical to a frame-sized
+/// card of the scrim colour with that card painted into it (rows above the
+/// scrim's `top` clear), a steady scrim does not deepen frame over frame, and
+/// closing it leaves none behind. Negative control: the scrim reaches the
+/// presented frame. On the wgpu arm, the one that draws a scrim: the Metal and
+/// GL arms' platforms show none, and they refuse one in debug builds
+/// (`TrayQuad::scrim`), so on macOS and Linux this runs on the oracle arm
+/// (`--features wgpu-oracle`).
+#[cfg(wgpu_arm)]
+#[test]
+fn a_tray_scrim_presents_as_the_frame_sized_card_it_replaces() {
+    let mut gpu = common::wgpu_oracle(18.0, Theme::default());
+    let (rows, cols) = (6usize, 20usize);
+    let (a, _b) = two_frames(rows, cols);
+    let (cw, ch) = gpu.cell_size();
+    let (fw, fh) = gpu.frame_size(rows, cols);
+    let (fw, fh) = (fw as u32, fh as u32);
+    let smoke = [0, 0, 0, 0x4D];
+    let card_px = [220, 30, 180, 255];
+    let (pw, ph) = ((cw * 4) as u32, (ch * 2) as u32);
+    let (dx, dy, top) = (cw as u32, (ch * 2) as u32, ch as u32);
+    let small = card(pw, ph, card_px);
+    let scrimmed = TrayQuad {
+        rgba: &small,
+        pw,
+        ph,
+        dx,
+        dy,
+        scrim: Some(TrayScrim { rgba: smoke, top }),
+    };
+    let mut full = Vec::with_capacity((fw * fh * 4) as usize);
+    for y in 0..fh {
+        for x in 0..fw {
+            let on_card = (dx..dx + pw).contains(&x) && (dy..dy + ph).contains(&y);
+            full.extend_from_slice(&if on_card {
+                card_px
+            } else if y >= top {
+                smoke
+            } else {
+                [0; 4]
+            });
+        }
+    }
+    let baked = TrayQuad {
+        rgba: &full,
+        pw: fw,
+        ph: fh,
+        dx: 0,
+        dy: 0,
+        scrim: None,
+    };
+
+    let layered = harvest(
+        &mut gpu,
+        fw,
+        fh,
+        &[(&a, Some(scrimmed)), (&a, Some(scrimmed)), (&a, None)],
+    );
+    let reference = harvest(&mut gpu, fw, fh, &[(&a, Some(baked))]);
+    let never = harvest(&mut gpu, fw, fh, &[(&a, None)]);
+    let first_diff = |x: &[u8], y: &[u8]| x.iter().zip(y).position(|(p, q)| p != q);
+    assert!(
+        layered.frames[0].rgba != never.frames[0].rgba,
+        "negative control: the scrim must reach the presented frame"
+    );
+    assert_eq!(
+        first_diff(&layered.frames[0].rgba, &reference.frames[0].rgba),
+        None,
+        "the scrim layer presents as the baked frame-sized card"
+    );
+    assert_eq!(
+        first_diff(&layered.frames[1].rgba, &reference.frames[0].rgba),
+        None,
+        "a steady scrim does not deepen frame over frame"
+    );
+    assert_eq!(
+        first_diff(&layered.frames[2].rgba, &never.frames[0].rgba),
+        None,
+        "closing the scrim leaves no smoke behind"
     );
 }

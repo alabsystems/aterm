@@ -9,8 +9,8 @@
 //! The text is one `atape <format>` line, then `key=value` lines in sections
 //! (`[roots]`, `[setup]`, `[env]`, `[opts]`, `[policy]`), the run's own
 //! facts (`tape`, `build`, `os`, `entry`) ahead of the first. A key alone on
-//! its line, with no `=`, is a value the run did not have (`manager` with no
-//! manager); `key=` is an empty one. Each value is one line: a backslash, a
+//! its line, with no `=`, is a value the run did not have (`ledger` with no
+//! ledger); `key=` is an empty one. Each value is one line: a backslash, a
 //! newline, a carriage return, a tab and every other control character are
 //! escaped (`\\`, `\n`, `\r`, `\t`, `\xHH`), and so is each byte of a path
 //! that is not UTF-8, so a value comes back byte for byte. A duration is
@@ -27,7 +27,8 @@
 //! spell, as a test builds one, says `false`).
 //!
 //! THE ROOTS are the directories the run's own files live in: the ledger's,
-//! the journal's, the notes', the standing rules', the state root and the home directory ([`Roots`]). Every path the
+//! the journal's, the standing rules', the state root and the home directory
+//! ([`Roots`]; an older build's header may name a `notes` root too). Every path the
 //! loop opens is written under the most specific one, `@ledger/s-1.jsonl`,
 //! so a replay can move every root to a directory that does not exist
 //! ([`Header::decode_remapped`]) and the same paths still come out under
@@ -80,7 +81,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::super::config::{PolicyTexts, SupervisorConfig};
-use super::super::mail::MailOpts;
 use super::super::run::{SessionSetup, SuperviseOpts};
 
 /// The header's format, the `atape <n>` of its first line. A build refuses a
@@ -91,8 +91,10 @@ pub const FORMAT: u32 = 1;
 /// The first line's word.
 const MAGIC: &str = "atape";
 
-/// Which loop a tape recorded: the CLI's `watch` or `supervise`, or the
-/// window's own hosted loop ([`super::super::run::Session::run_hosted`]).
+/// Which loop a tape recorded: the window's own hosted loop
+/// ([`super::super::run::Session::run_hosted`]), or the engine tests' `watch`
+/// or `supervise` seams — an older build's `aterm drive watch|supervise`,
+/// whose tapes still read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entry {
     Watch,
@@ -138,7 +140,7 @@ pub struct Roots(Vec<(&'static str, PathBuf)>);
 
 impl Roots {
     /// The roots of a run under this setup and these options: the
-    /// directories of its ledger, journal, notes file and standing rules,
+    /// directories of its ledger, journal and standing rules,
     /// then `state` (the state root the caller names: the process's own,
     /// `aterm_types::dirs::state_dir`, for a live run) and the approval
     /// policy's home.
@@ -148,7 +150,9 @@ impl Roots {
         let found = [
             dir_of(setup.ledger_path().or(opts.ledger.as_deref())),
             dir_of(opts.journal.as_deref()),
-            dir_of(opts.notes.as_deref()),
+            // The notes file went with `aterm drive watch --notes`; its root's
+            // name stays taken, so an older header reads.
+            None,
             dir_of(opts.policy.rules_file.as_deref()),
             state.map(Path::to_path_buf),
             setup.approval_env().home.clone(),
@@ -640,6 +644,32 @@ impl Reader {
         Ok(())
     }
 
+    /// A retired text (a value, an empty one or none), if present: validate
+    /// its old wire type and consume it, as [`Self::retired_duration`] does.
+    pub(crate) fn retired_text(&mut self, key: &str) -> Result<(), String> {
+        if self
+            .lines
+            .iter()
+            .any(|line| line.section == self.section && line.key == key)
+        {
+            let _ = self.opt_text(key)?;
+        }
+        Ok(())
+    }
+
+    /// A retired switch or number, if present, read by its old type `T`, as
+    /// [`Self::retired_duration`] does.
+    pub(crate) fn retired_parsed<T: std::str::FromStr>(&mut self, key: &str) -> Result<(), String> {
+        if self
+            .lines
+            .iter()
+            .any(|line| line.section == self.section && line.key == key)
+        {
+            let _ = self.parsed::<T>(key)?;
+        }
+        Ok(())
+    }
+
     /// Take keys from `[name]` from here on.
     pub(crate) fn section(&mut self, name: &str) {
         self.section = name.to_string();
@@ -827,8 +857,8 @@ impl Header {
     /// state root ([`Roots::capture`]) and the run's setup and options, the
     /// policy's rebuild checked once, here.
     ///
-    /// Each file the loop opens — the ledger, the journal, the notes, the
-    /// standing rules — is held by the path it opens (`opened`): one given
+    /// Each file the loop opens — the ledger, the journal, the standing
+    /// rules — is held by the path it opens (`opened`): one given
     /// relative is named from this process's directory, the one the loop
     /// opens it from, so it has a root a replay moves.
     #[must_use]
@@ -846,7 +876,7 @@ impl Header {
             ..opts.clone()
         };
         for file in [
-            &mut opts.notes,
+            &mut opts.tasks,
             &mut opts.journal,
             &mut opts.ledger,
             &mut opts.policy.rules_file,
@@ -901,37 +931,24 @@ impl Header {
         let SuperviseOpts {
             max,
             python_allow,
-            notes,
-            report,
             context_warn,
             journal,
             ledger,
-            mail,
             policy,
             yield_when_held,
             idle_host: _,
+            tasks,
         } = opts;
         w.section("opts");
         w.duration("max", *max);
         w.texts("python_allow", python_allow);
-        w.opt_path("notes", notes.as_deref(), roots);
-        w.shown("report", report);
         w.shown("context_warn", context_warn);
         w.opt_path("journal", journal.as_deref(), roots);
         w.opt_path("ledger", ledger.as_deref(), roots);
-        match mail {
-            Some(MailOpts {
-                inbox,
-                report_window,
-                idle_grace,
-            }) => {
-                w.text("mail", "on");
-                w.opt_text("mail.inbox", inbox.as_deref());
-                w.duration("mail.report_window", *report_window);
-                w.duration("mail.idle_grace", *idle_grace);
-            }
-            None => w.opt_text("mail", None),
-        }
+        // The directory a done's result is written under: a value the
+        // result's round trip names (`doors::TASK_RESULT`), never opened by a
+        // replay.
+        w.opt_path("tasks", tasks.as_deref(), roots);
         w.shown("yield_when_held", yield_when_held);
         w.shown("idle_host", idle_host);
         w.section("policy");
@@ -939,7 +956,6 @@ impl Header {
             keys,
             agents,
             withheld,
-            session_questions,
         } = policy.policy_texts();
         for (key, value) in &keys {
             // The standing rules are a file the loop reads: under a root,
@@ -956,7 +972,6 @@ impl Header {
         for (key, value) in &withheld {
             w.text(&format!("{WITHHELD}{key}"), value);
         }
-        w.shown("session_questions", session_questions);
         w.shown("exact", policy_exact);
         w.out
     }
@@ -1027,32 +1042,33 @@ impl Header {
         r.section("opts");
         let max = r.duration("max")?;
         let python_allow = r.texts("python_allow")?;
-        let notes = r.opt_io_path("notes", &roots)?;
-        let report = r.parsed("report")?;
+        // Retired with `aterm drive watch --notes|--report|--mail`: an older
+        // build's header reads, its values dropped (a recording refused
+        // `--mail`, so no tape has the lane's keys on).
+        r.retired_text("notes")?;
+        r.retired_parsed::<bool>("report")?;
+        r.retired_text("mail")?;
+        r.retired_text("mail.inbox")?;
+        r.retired_duration("mail.report_window")?;
+        r.retired_duration("mail.idle_grace")?;
         let context_warn = r.parsed("context_warn")?;
         let journal = r.opt_io_path("journal", &roots)?;
         let ledger = r.opt_io_path("ledger", &roots)?;
-        let mail = match r.opt_text_at("mail")? {
-            (None, _) => None,
-            (Some(on), _) if on == "on" => Some(MailOpts {
-                inbox: r.opt_text("mail.inbox")?,
-                report_window: r.duration("mail.report_window")?,
-                idle_grace: r.duration("mail.idle_grace")?,
-            }),
-            (Some(other), at) => return Err(r.bad(at, "mail", &format!("not on: {other:?}"))),
-        };
+        // Arrived after the format did: a tape from before wrote no result.
+        let tasks = r.or_shipped("tasks", None, |r, key| r.opt_path(key, &roots))?;
         let yield_when_held = r.parsed("yield_when_held")?;
         let idle_host = r.parsed("idle_host")?;
         r.section("policy");
-        // The session's word and the verdict first: both are always written
-        // (`exact` last of all, what a torn header lacks). Then the withheld
+        // The verdict first: always written (`exact` last of all, what a torn
+        // header lacks); an older build's `session_questions` beside it, a
+        // switch no key sets any more, read and dropped. Then the withheld
         // rules by their prefix, and every line left is one of the policy's
         // texts — a `[harness]` key, or an agent's `<agent>.<key>` — in the
         // order written: which keys there are is the recording build's, and
         // the rebuild reads them as the owner's file is read, a key this build
         // has and they lack at its default and one it lacks refused
         // ([`SupervisorConfig::rebuild`]).
-        let session_questions = r.parsed("session_questions")?;
+        r.retired_parsed::<bool>("session_questions")?;
         let policy_exact = r.parsed("exact")?;
         let mut withheld = Vec::new();
         for (key, value, at) in r.prefixed(WITHHELD) {
@@ -1087,7 +1103,6 @@ impl Header {
             keys,
             agents,
             withheld,
-            session_questions,
         })
         .map_err(|e| format!("atape header: [policy] {e}"))?;
         let mut supplied = r.supplied;
@@ -1108,15 +1123,13 @@ impl Header {
             opts: SuperviseOpts {
                 max,
                 python_allow,
-                notes,
-                report,
                 context_warn,
                 journal,
                 ledger,
-                mail,
                 policy: rebuilt.policy,
                 yield_when_held,
                 idle_host: None,
+                tasks,
             },
             idle_host,
             policy_exact,

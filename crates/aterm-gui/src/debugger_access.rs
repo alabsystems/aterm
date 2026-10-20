@@ -15,17 +15,26 @@
 //! asks for an administrator in its own dialog, which aterm never sees or answers;
 //! then aterm re-probes and reports only what it reads.
 //!
+//! THE LAUNCH ASK (owner ruling O29, 2026-10-19): once per Mac, aterm raises the same
+//! alert by itself — after the first-launch Full Disk Access and Developer Tools pages,
+//! at a quiet moment, and only to turn debugger access on where it reads off and was
+//! never seen on or turned off here ([`admit_launch_ask`]). The Mac is written into
+//! [`ASKED_RECORD`] before the alert is raised, and the owner's yes takes the same
+//! path as a press ([`DebuggerChangeLane::offer`], then the same worker).
+//!
 //! The deciding parts live here, testable without a window, process or dialog:
 //! the pure reducer [`DebuggerAccessFlow`], the worker's result slot
 //! [`ChangeSlot`] (the result never rides the wake, because an uncommitted
 //! incoming handoff drops every wake but Commit), the [`DriftWatch`], the
-//! `App`-owned [`DebuggerChangeLane`] that bundles them, and [`DebuggerFacts`].
+//! `App`-owned [`DebuggerChangeLane`] that bundles them, [`DebuggerFacts`], and the
+//! launch ask's admission, record and queue ([`LaunchAskQueue`]).
 //!
 //! It never answers SecurityAgent, retries a change the re-probe reads unchanged,
-//! re-enables after drift, trusts an exit code, or starts a change from anything but
-//! the owner's confirmed press. No control verb, config key, environment variable
-//! or band capsule reaches it, and the two action ids sit under
-//! `MACOS_ACCESS_GESTURE_PREFIX`, which `app act` refuses.
+//! re-enables after drift, trusts an exit code, or starts a change without the
+//! owner's yes in aterm's alert — the one their press raises, or the launch ask's.
+//! No control verb, config key, environment variable or band capsule reaches it (a
+//! key can only silence the launch ask: `[privacy] notice = false`), and the two
+//! action ids sit under `MACOS_ACCESS_GESTURE_PREFIX`, which `app act` refuses.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -271,6 +280,7 @@ pub(crate) enum LockTry {
 
 /// [`take_change_lock`] in one try, never waiting.
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn try_change_lock(config_path: &Path) -> LockTry {
     take_change_lock(config_path, Duration::ZERO)
 }
@@ -683,6 +693,7 @@ impl DebuggerAccessFlow {
     }
 
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) const fn direction(&self) -> DebuggerChange {
         self.direction
     }
@@ -774,20 +785,27 @@ impl DebuggerAccessFlow {
         Some(outcome)
     }
 
+    /// Why a press of `change` would be refused now, taking nothing: what
+    /// [`Self::on_press`] checks, for the launch ask, which writes its record
+    /// only where the press it stands for would be taken.
+    pub(crate) fn press_refusal(&self, change: DebuggerChange) -> Option<Refusal> {
+        if !self.records_read {
+            return Some(Refusal::RecordsUnread);
+        }
+        match self.phase {
+            Phase::Idle => {}
+            Phase::Rechecking(_) | Phase::InFlight { .. } => return Some(Refusal::InFlight),
+            Phase::Confirming(_) | Phase::Exited(_) => return Some(Refusal::Busy),
+        }
+        (self.observed != change.precondition()).then_some(Refusal::State(change, self.observed))
+    }
+
     /// The owner pressed the button for `change`. Refused unless the
     /// predecessor's records are read, nothing is under way, and the last probe
     /// shows the change's precondition. Never refused for aterm's own hardening.
     pub(crate) fn on_press(&mut self, change: DebuggerChange) -> Result<(), Refusal> {
-        if !self.records_read {
-            return Err(Refusal::RecordsUnread);
-        }
-        match self.phase {
-            Phase::Idle => {}
-            Phase::Rechecking(_) | Phase::InFlight { .. } => return Err(Refusal::InFlight),
-            Phase::Confirming(_) | Phase::Exited(_) => return Err(Refusal::Busy),
-        }
-        if self.observed != change.precondition() {
-            return Err(Refusal::State(change, self.observed));
+        if let Some(refusal) = self.press_refusal(change) {
+            return Err(refusal);
         }
         self.direction = change;
         self.phase = Phase::Confirming(change);
@@ -1003,10 +1021,11 @@ impl ChangeSlot {
 }
 
 /// One confirmed change: the direction, its job number and the owner's yes. Only
-/// [`DebuggerChangeLane::begin`] mints one, on an [`OwnerAnswer::Yes`] whose
-/// [`OwnerYes`] only `owner_confirms` mints, so a [`DevtoolsJob`] and its
-/// `DevToolsSecurity` worker exist only after the owner's yes in aterm's alert.
-/// Not `Clone`: one yes, one job.
+/// [`DebuggerChangeLane::begin`] mints one (for a press, or inside
+/// [`DebuggerChangeLane::offer`] for the launch ask), on an [`OwnerAnswer::Yes`]
+/// whose [`OwnerYes`] only `native_settings::owner_confirms_with` mints, after
+/// aterm's alert, so a [`DevtoolsJob`] and its `DevToolsSecurity` worker exist only
+/// after the owner's yes in that alert. Not `Clone`: one yes, one job.
 ///
 /// [`OwnerAnswer::Yes`]: crate::native_settings::OwnerAnswer::Yes
 /// [`OwnerYes`]: crate::native_settings::OwnerYes
@@ -1609,8 +1628,8 @@ impl DebuggerChangeLane {
         *self.ask_records().lock().unwrap_or_else(|p| p.into_inner()) = Some(read);
     }
 
-    /// Record why the last confirmed press started nothing (the page shows it
-    /// until the next press starts).
+    /// Record why the last confirmed change — a press, or the launch ask's yes —
+    /// started nothing (the page shows it until the next one starts).
     pub(crate) fn note_refusal(&mut self, refusal: Option<Refusal>) {
         self.refusal = refusal;
     }
@@ -1643,11 +1662,24 @@ impl DebuggerChangeLane {
         matches!(self.flow.phase(), Phase::Exited(_))
     }
 
+    /// Whether the shared records have been read (a press's first gate).
+    pub(crate) const fn records_read(&self) -> bool {
+        self.flow.records_read()
+    }
+
+    /// Whether a change is under way: aterm's alert, the worker's re-read, a
+    /// child in flight (this process's or an inherited one, whose macOS dialog
+    /// may be up), or the re-probe that ends it.
+    pub(crate) fn under_way(&self) -> bool {
+        self.flow.phase() != Phase::Idle
+    }
+
     /// The owner's press and their answer in aterm's alert (`menu::confirm_owner`,
-    /// which only the owner's press reaches), and on a yes only, a new job armed in
-    /// the slot. The press is refused unless the records are read, nothing is
-    /// under way and the last probe shows the precondition. `Err` names why
-    /// nothing may start.
+    /// which only the owner's press and the once-per-Mac launch ask reach, the
+    /// latter through [`Self::offer`]), and on a yes only, a new job armed in the
+    /// slot. The press is refused unless the records are read, nothing is under
+    /// way and the last probe shows the precondition. `Err` names why nothing may
+    /// start.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1965,6 +1997,790 @@ impl DebuggerChangeLane {
 }
 
 // ---------------------------------------------------------------------------
+// The launch ask (owner ruling O29, 2026-10-19)
+// ---------------------------------------------------------------------------
+
+/// The record beside `aterm.toml` of the Macs on which aterm has asked, by itself,
+/// whether to allow debugger access: one `<host-uuid> <secs>` line per Mac
+/// (`aterm_containment::consent::host_uuid`), oldest first. The config folder may
+/// sync between Macs, hence the host key: a Mac whose synced record names only
+/// others is asked once too.
+pub(crate) const ASKED_RECORD: &str = "privacy-debugger-asked";
+
+/// The Macs the asked record keeps. Past that the oldest line goes, and that Mac
+/// is asked again, once, the next time aterm runs there.
+pub(crate) const MAX_ASKED_LINES: usize = 8;
+
+/// A host key's longest spelling (the kernel's UUID is 36 bytes).
+const MAX_HOST_BYTES: usize = 64;
+
+/// The asked record's bound: [`MAX_ASKED_LINES`] lines of the longest host key
+/// and a `u64`. Anything bigger is not a record this build wrote.
+const MAX_ASKED_BYTES: usize = MAX_ASKED_LINES * (MAX_HOST_BYTES + 1 + 20 + 1);
+
+/// A host key the record can hold: one plain word (ASCII letters, digits and `-`,
+/// as the kernel's UUID is spelled), so every line splits back exactly.
+fn host_key_ok(host: &str) -> bool {
+    (1..=MAX_HOST_BYTES).contains(&host.len())
+        && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// The asked record's lines, strictly as [`note_asked`] writes them, or `None`:
+/// newline-terminated, each line a host key, one space and its seconds, and at
+/// most [`MAX_ASKED_LINES`] of them.
+fn parse_asked(text: &str) -> Option<Vec<(&str, u64)>> {
+    let body = text.strip_suffix('\n')?;
+    let mut lines = Vec::new();
+    for line in body.split('\n') {
+        let (host, secs) = line.split_once(' ')?;
+        if !host_key_ok(host) || secs.is_empty() || !secs.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        lines.push((host, secs.parse().ok()?));
+    }
+    (lines.len() <= MAX_ASKED_LINES).then_some(lines)
+}
+
+/// Where the asked record lives beside `config_path`.
+fn asked_path(config_path: &Path) -> std::io::Result<PathBuf> {
+    marker_path(config_path, ASKED_RECORD).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no config directory to record in",
+        )
+    })
+}
+
+/// The asked record's text: `Ok(None)` for a genuine absence. Anything else at
+/// the path goes through the bounded, regular, no-final-link marker reader, and
+/// what it refuses — a link, a folder, an oversized or non-UTF-8 file — is an
+/// error, as is a folder that cannot be read.
+fn read_asked_text(path: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+        Ok(_) => crate::config_marker::read_marker(path, MAX_ASKED_BYTES)
+            .map(Some)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the asked record is not a bounded regular UTF-8 record",
+                )
+            }),
+    }
+}
+
+/// Whether the asked record names `host`. It fails toward NOT asking: a record
+/// that is there but cannot be read whole — a link, a folder, too big, not UTF-8,
+/// malformed — a folder that cannot be read, and a host key no record could hold
+/// all read as asked. Only an absent record, or a whole one naming other Macs
+/// only, is not asked.
+pub(crate) fn read_asked(config_path: &Path, host: &str) -> bool {
+    if !host_key_ok(host) {
+        return true;
+    }
+    match asked_path(config_path).and_then(|path| read_asked_text(&path)) {
+        Ok(None) => false,
+        Ok(Some(text)) => {
+            parse_asked(&text).is_none_or(|lines| lines.iter().any(|&(named, _)| named == host))
+        }
+        Err(_) => true,
+    }
+}
+
+/// Write `host` into the asked record, AHEAD of the alert it stands for
+/// ([`Flush::Durable`]: once the alert is up, a crash, quit or update must never
+/// ask again, and this record is all that remembers it). A record that names
+/// `host` already is left as it is; past [`MAX_ASKED_LINES`] the oldest lines go.
+/// A record that cannot be read whole is never overwritten (`InvalidData`; it
+/// reads as asked anyway), and nothing is written through a link
+/// (`config_marker::write_marker`).
+///
+/// [`Flush::Durable`]: crate::durable::Flush::Durable
+pub(crate) fn note_asked(config_path: &Path, host: &str, now: u64) -> std::io::Result<()> {
+    use std::fmt::Write as _;
+    if !host_key_ok(host) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a host key the asked record can hold",
+        ));
+    }
+    let path = asked_path(config_path)?;
+    let _serial = DEBUGGER_MARKS.lock().unwrap_or_else(|p| p.into_inner());
+    let text = read_asked_text(&path)?;
+    let mut lines = match text.as_deref() {
+        None => Vec::new(),
+        Some(text) => parse_asked(text).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the asked record is malformed and is left as found",
+            )
+        })?,
+    };
+    if lines.iter().any(|&(named, _)| named == host) {
+        return Ok(());
+    }
+    lines.push((host, now));
+    let keep = lines.len().saturating_sub(MAX_ASKED_LINES);
+    let mut record = String::new();
+    for (named, secs) in &lines[keep..] {
+        let _ = writeln!(record, "{named} {secs}");
+    }
+    crate::config_marker::write_marker(
+        &path,
+        &record,
+        MAX_ASKED_BYTES,
+        crate::durable::Flush::Durable,
+    )
+}
+
+/// What the change marker and lock beside `aterm.toml` say to the launch ask,
+/// judged as the worker ([`run_devtools_job`]) and the records reader
+/// ([`read_records`]) judge them, so the three never disagree about one disk
+/// ([`DebuggerChangeLane::change_on_disk`]).
+#[derive(Debug)]
+enum OnDisk {
+    /// Nothing a press's worker would be refused over: no change marker, or one
+    /// that names no change (a link, a folder, a file too big, not UTF-8 or
+    /// malformed — the records reader ignores or removes it and the worker
+    /// ignores it) or a gone child this lane follows already; and no lock file,
+    /// or a free one.
+    Clear(ChangeLock),
+    /// A change this lane does not follow, or one still running: a marker
+    /// naming a running child (a peer's, or a predecessor's whose worker died
+    /// with it), a marker naming a gone child nobody has recorded (the model's
+    /// `stale`), or the lock held (a peer's worker between its re-read and its
+    /// spawn).
+    Change,
+    /// The lock file is there but cannot be opened or locked (a link, a folder,
+    /// another owner's file, a filesystem that refuses `flock`): the worker
+    /// would refuse a yes (`WorkerRefusal::NoLock`), so nothing can start.
+    NoLock,
+}
+
+/// This Mac in the asked record, as the launch ask reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostAsked {
+    /// The host key is not read yet: it is read once, off the event loop.
+    Cold,
+    /// The kernel names no host, so no record could be keyed to this Mac.
+    Unnamed,
+    /// The record names this Mac, or cannot be read whole.
+    Asked,
+    /// The record is absent, or names other Macs only.
+    NotAsked,
+}
+
+/// What the launch ask is judged on (design §3.4 step 0, owner ruling O29). Pure
+/// data, gathered by the App at its look.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LaunchAskFacts {
+    /// A windowed instance.
+    pub(crate) windowed: bool,
+    pub(crate) macos: bool,
+    /// `[privacy] enabled && check`.
+    pub(crate) privacy: bool,
+    /// `[privacy] notice`, the switch that silences aterm's launch questions. A
+    /// key may only silence the ask, never start it (design §3.9).
+    pub(crate) notice: bool,
+    /// A config folder to keep the record in: without one nothing would remember
+    /// the answer, and every launch would ask again.
+    pub(crate) config: bool,
+    pub(crate) host: HostAsked,
+    /// The shared debugger records (a predecessor's change, the observed mode)
+    /// are read.
+    pub(crate) records_read: bool,
+    /// A change under way ([`DebuggerChangeLane::under_way`]), this process's or
+    /// an inherited one.
+    pub(crate) under_way: bool,
+    /// The owner answered a debugger-access alert in this process, yes or no
+    /// (`OwnerQuiet::debugger_answered`).
+    pub(crate) answered: bool,
+    /// The cached probe, `None` until the look reads it: a look dispatches the
+    /// probe worker only while no answer is cached, so an ask a gate above
+    /// already decides reads nothing, and one waiting for its moment re-reads
+    /// nothing.
+    pub(crate) probe: Option<DebuggerProbe>,
+    /// The probe was read within [`ASK_PROBE_FRESH`] (or by an instance's
+    /// syscall-free arm, which answers at every read). The alert is raised only
+    /// on such a reading, so a rule switched on meanwhile — by the owner's own
+    /// `sudo DevToolsSecurity -enable` in an aterm tab, which retires no cached
+    /// answer — settles [`AskSettle::AlreadyOn`] instead of asking to allow
+    /// what is allowed.
+    pub(crate) probe_fresh: bool,
+    /// The observed record, as the lane holds it.
+    pub(crate) recorded: Option<ObservedMarker>,
+    /// This process saw debugger access go from allowed to off.
+    pub(crate) drift: bool,
+    /// aterm's own hardening, read with the probe.
+    pub(crate) self_hardened: SelfHardening,
+    /// This process's Full Disk Access launch decision is made (not
+    /// `FdaLaunch::Undecided`). Its hand-over still queued, or its panel up, is
+    /// [`Self::page`]; a hand-over gone with nothing to end it holds nothing.
+    pub(crate) fda_decided: bool,
+    /// This process's Developer Tools launch reading has completed, whatever it
+    /// read (a refusal included).
+    pub(crate) devtools_decided: bool,
+    /// A Full Disk Access or Developer Tools hand-over waits, or aterm's helper
+    /// panel is up.
+    pub(crate) page: bool,
+    /// The folder warm-up is walking (a macOS folder dialog may be up).
+    pub(crate) warmup: bool,
+    /// The quiet moment (`App::devtools_moment_is_quiet`): an aterm window
+    /// focused, the owner present but hands off, this process settled.
+    pub(crate) quiet: bool,
+    /// The owner declined a Security gesture recently (`OwnerQuiet`).
+    pub(crate) owner_quiet: bool,
+}
+
+/// What the launch ask does now ([`admit_launch_ask`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchAsk {
+    /// Write the record, then raise the alert ([`DebuggerChangeLane::offer`]).
+    Ask,
+    /// Look again later ([`AskWait::look_again`]).
+    Wait(AskWait),
+    /// Write the record and raise nothing: the question is answered on this Mac
+    /// ([`DebuggerChangeLane::forgo`]).
+    Settle(AskSettle),
+    /// Nothing more this process, and nothing written: a later launch judges
+    /// again.
+    Drop(AskDrop),
+}
+
+/// Why the launch ask asks nothing this process and writes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AskDrop {
+    /// A headless instance: nobody to ask.
+    Headless,
+    /// Debugger access is a macOS setting.
+    NotMacos,
+    /// `[privacy] enabled` or `check` is off.
+    PrivacyOff,
+    /// `[privacy] notice` is off.
+    NoticeOff,
+    /// No config folder to keep the record in.
+    NoConfig,
+    /// The kernel names no host.
+    NoHost,
+    /// The record names this Mac, or cannot be read whole.
+    Asked,
+    /// The probe reads a rule Apple's tool does not recognise, which `-enable`
+    /// would overwrite.
+    Unrecognized,
+    /// The probe gave no answer (refused, failed, timed out).
+    Unread,
+    /// The account is in neither admin nor _developer, or that is unknown: the
+    /// switch might not help it.
+    NotMember,
+    /// This aterm is not hardened, or that is unknown: the ask is aterm's own
+    /// initiative, which design §3.6 keeps to a hardened aterm. Its button still
+    /// offers the change (O8).
+    NotHardened,
+}
+
+impl AskDrop {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Headless => "headless",
+            Self::NotMacos => "not_macos",
+            Self::PrivacyOff => "privacy_off",
+            Self::NoticeOff => "notice_off",
+            Self::NoConfig => "no_config",
+            Self::NoHost => "no_host",
+            Self::Asked => "asked",
+            Self::Unrecognized => "unrecognized",
+            Self::Unread => "unread",
+            Self::NotMember => "not_member",
+            Self::NotHardened => "not_hardened",
+        }
+    }
+}
+
+/// Why the launch ask looks again later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AskWait {
+    /// The host key is not read yet.
+    HostCold,
+    /// The shared debugger records are not read yet.
+    RecordsUnread,
+    /// The probe has not answered yet.
+    ProbePending,
+    /// The Full Disk Access launch decision is not made yet.
+    BehindFullDiskAccess,
+    /// The Developer Tools launch reading has not completed.
+    BehindDeveloperTools,
+    /// A hand-over waits, or aterm's helper panel is up.
+    BehindPage,
+    /// The folder warm-up is walking.
+    BehindWarmup,
+    /// Not the quiet moment.
+    NotQuiet,
+    /// The owner declined a Security gesture recently.
+    OwnerQuiet,
+    /// The moment has come, but the probe is older than [`ASK_PROBE_FRESH`]:
+    /// it is read again before the alert.
+    ProbeStale,
+}
+
+/// How old a probe the launch ask raises its alert on may be. Older, it is
+/// retired and read again first ([`AskWait::ProbeStale`]). Longer than
+/// [`crate::devtools_helper::PANEL_TICK`], the look's cadence while that read
+/// is out, so the reading it waited for is fresh at the next look.
+pub(crate) const ASK_PROBE_FRESH: Duration = Duration::from_secs(5);
+
+impl AskWait {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::HostCold => "host_cold",
+            Self::RecordsUnread => "records_unread",
+            Self::ProbePending => "probe_pending",
+            Self::BehindFullDiskAccess => "behind_full_disk_access",
+            Self::BehindDeveloperTools => "behind_developer_tools",
+            Self::BehindPage => "behind_page",
+            Self::BehindWarmup => "behind_warmup",
+            Self::NotQuiet => "not_quiet",
+            Self::OwnerQuiet => "owner_quiet",
+            Self::ProbeStale => "probe_stale",
+        }
+    }
+
+    /// How long until the next look: [`crate::devtools_helper::PANEL_TICK`]
+    /// while a read the look started (the host key, the probe) completes — its
+    /// completion wakes the window; this is the backstop — and
+    /// [`crate::devtools_helper::RECHECK_EVERY`] otherwise, as the hand-overs'
+    /// looks for their quiet moment do. Never zero, so a park never spins on it.
+    pub(crate) const fn look_again(self) -> Duration {
+        match self {
+            Self::HostCold | Self::ProbePending | Self::ProbeStale => {
+                crate::devtools_helper::PANEL_TICK
+            }
+            _ => crate::devtools_helper::RECHECK_EVERY,
+        }
+    }
+}
+
+/// Why the launch ask settles: the question is answered on this Mac, and the
+/// record says so with no alert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AskSettle {
+    /// A change is under way: the owner is answering one already.
+    Underway,
+    /// The owner answered a debugger-access alert in this process.
+    Answered,
+    /// Debugger access is allowed already.
+    AlreadyOn,
+    /// It reads off, but this process saw it go off, or the record says it was
+    /// allowed or that aterm or something else turned it off: aterm never turns
+    /// it back on (design §6).
+    TurnedOff,
+}
+
+impl AskSettle {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Underway => "under_way",
+            Self::Answered => "answered",
+            Self::AlreadyOn => "already_on",
+            Self::TurnedOff => "turned_off",
+        }
+    }
+}
+
+/// THE LAUNCH ASK'S ADMISSION (owner ruling O29). Pure, and the order is the
+/// contract: the instance's gates; this Mac in the record; the reads it waits
+/// on; whether the question is answered here already; whether turning debugger
+/// access on can help this account from this aterm; then the moment — behind
+/// the Full Disk Access and Developer Tools launch pages, with no page, panel
+/// or folder dialog up, the owner present and paused, and no recent decline;
+/// and last a probe fresh enough to raise the alert on.
+pub(crate) fn admit_launch_ask(facts: &LaunchAskFacts) -> LaunchAsk {
+    let gates = [
+        (facts.windowed, AskDrop::Headless),
+        (facts.macos, AskDrop::NotMacos),
+        (facts.privacy, AskDrop::PrivacyOff),
+        (facts.notice, AskDrop::NoticeOff),
+        (facts.config, AskDrop::NoConfig),
+    ];
+    if let Some(&(_, why)) = gates.iter().find(|(open, _)| !*open) {
+        return LaunchAsk::Drop(why);
+    }
+    match facts.host {
+        HostAsked::Cold => return LaunchAsk::Wait(AskWait::HostCold),
+        HostAsked::Unnamed => return LaunchAsk::Drop(AskDrop::NoHost),
+        HostAsked::Asked => return LaunchAsk::Drop(AskDrop::Asked),
+        HostAsked::NotAsked => {}
+    }
+    if !facts.records_read {
+        return LaunchAsk::Wait(AskWait::RecordsUnread);
+    }
+    let Some(probe) = facts
+        .probe
+        .filter(|probe| probe.label != DebuggerProbeLabel::Pending)
+    else {
+        return LaunchAsk::Wait(AskWait::ProbePending);
+    };
+    if facts.under_way {
+        return LaunchAsk::Settle(AskSettle::Underway);
+    }
+    if facts.answered {
+        return LaunchAsk::Settle(AskSettle::Answered);
+    }
+    match probe.mode {
+        DebuggerMode::Enabled => return LaunchAsk::Settle(AskSettle::AlreadyOn),
+        DebuggerMode::Disabled
+            if facts.drift
+                || facts.recorded.is_some_and(|was| {
+                    was.mode == DebuggerMode::Enabled || was.origin != Origin::Unknown
+                }) =>
+        {
+            return LaunchAsk::Settle(AskSettle::TurnedOff);
+        }
+        DebuggerMode::Disabled => {}
+        DebuggerMode::Unrecognized => return LaunchAsk::Drop(AskDrop::Unrecognized),
+        DebuggerMode::Unknown => return LaunchAsk::Drop(AskDrop::Unread),
+    }
+    if !matches!(
+        probe.member,
+        DebuggerMember::Admin | DebuggerMember::Developer
+    ) {
+        return LaunchAsk::Drop(AskDrop::NotMember);
+    }
+    if facts.self_hardened != SelfHardening::Hardened {
+        return LaunchAsk::Drop(AskDrop::NotHardened);
+    }
+    let waits = [
+        (!facts.fda_decided, AskWait::BehindFullDiskAccess),
+        (!facts.devtools_decided, AskWait::BehindDeveloperTools),
+        (facts.page, AskWait::BehindPage),
+        (facts.warmup, AskWait::BehindWarmup),
+        (!facts.quiet, AskWait::NotQuiet),
+        (facts.owner_quiet, AskWait::OwnerQuiet),
+        (!facts.probe_fresh, AskWait::ProbeStale),
+    ];
+    waits
+        .iter()
+        .find(|(holds, _)| *holds)
+        .map_or(LaunchAsk::Ask, |&(_, why)| LaunchAsk::Wait(why))
+}
+
+/// Why [`DebuggerChangeLane::offer`] gave no ticket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OfferEnd {
+    /// No config folder to keep the record in: nothing was written or asked.
+    NoRecord,
+    /// The press the ask stands for would be refused now (here, or a change on
+    /// disk): nothing was written or asked.
+    Refused(Refusal),
+    /// The change lock beside `aterm.toml` is there but cannot be opened or
+    /// locked, so the worker would refuse a yes (`WorkerRefusal::NoLock`):
+    /// nothing was written or asked, and looking again changes nothing.
+    NoLock,
+    /// The record names this Mac (or cannot be read whole): nothing was asked.
+    Asked,
+    /// The record could not be written: nothing was asked, since an alert no
+    /// record remembers would come back at every launch.
+    NotRecorded,
+    /// The owner said no. The record stands: they are not asked again.
+    Declined,
+    /// No alert could be shown, or a recent decline quieted it: not a yes. The
+    /// record stands.
+    NotAsked,
+}
+
+impl OfferEnd {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoRecord => "no_record",
+            Self::Refused(_) => "refused",
+            Self::NoLock => "no_lock",
+            Self::Asked => "asked",
+            Self::NotRecorded => "not_recorded",
+            Self::Declined => "declined",
+            Self::NotAsked => "not_asked",
+        }
+    }
+}
+
+impl DebuggerChangeLane {
+    /// THE LAUNCH ASK'S ALERT AND ANSWER (owner ruling O29): write this Mac into
+    /// [`ASKED_RECORD`], raise aterm's alert through `confirm`, and take the answer
+    /// exactly as a press of *Allow debugger access…* ([`Self::begin`]: a yes arms
+    /// a job and mints the ticket the worker needs). Nothing is written or asked
+    /// unless that press would be taken now — the records read, nothing under way
+    /// here, no change on disk the worker would be refused over
+    /// ([`Self::change_on_disk`]), the last probe reading debugger access off —
+    /// and the record does not name this Mac yet. A change lock that cannot be
+    /// taken at all ends it ([`OfferEnd::NoLock`]): no yes could start anything.
+    /// The record goes to disk before `confirm` runs, so an alert left up through
+    /// a crash, quit or update never comes back; a record that cannot be written
+    /// asks nothing. Only On: aterm never asks by itself to turn it off.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DebuggerAccessChange",
+            action = "Offer",
+            project = "aterm_gui::debugger_access::conformance::project"
+        )
+    )]
+    pub(crate) fn offer(
+        &mut self,
+        config_path: Option<&Path>,
+        host: &str,
+        confirm: impl FnOnce() -> crate::native_settings::OwnerAnswer,
+    ) -> Result<ChangeTicket, OfferEnd> {
+        use crate::native_settings::OwnerAnswer;
+        let Some(config_path) = config_path else {
+            return Err(OfferEnd::NoRecord);
+        };
+        if let Some(refusal) = self.flow.press_refusal(DebuggerChange::On) {
+            return Err(OfferEnd::Refused(refusal));
+        }
+        let claim = match self.change_on_disk(config_path, now_secs()) {
+            OnDisk::Clear(claim) => claim,
+            OnDisk::Change => return Err(OfferEnd::Refused(Refusal::InFlight)),
+            OnDisk::NoLock => return Err(OfferEnd::NoLock),
+        };
+        if read_asked(config_path, host) {
+            return Err(OfferEnd::Asked);
+        }
+        if let Err(error) = note_asked(config_path, host, now_secs()) {
+            aterm_log::warn!("debugger launch ask: this Mac could not be recorded: {error}");
+            return Err(OfferEnd::NotRecorded);
+        }
+        // The record is now visible to every contender. Never keep the change
+        // lock while an alert runs its modal loop or a confirmed worker starts.
+        drop(claim);
+        let answer = confirm();
+        let declined = answer == OwnerAnswer::No;
+        self.begin(DebuggerChange::On, answer)
+            .map_err(|refusal| match refusal {
+                Refusal::NotConfirmed if declined => OfferEnd::Declined,
+                Refusal::NotConfirmed => OfferEnd::NotAsked,
+                other => OfferEnd::Refused(other),
+            })
+    }
+
+    /// Whether a change on disk would refuse the press [`Self::offer`] stands
+    /// for, judged as the worker judges it: a change marker counts only when it
+    /// names a child that is running, or a gone one this lane does not follow
+    /// (the model's `stale`), and the lock only when it is held (one try, never
+    /// a wait: the UI thread asks). A marker that names no change is no change,
+    /// as it is to [`read_records`] and [`run_devtools_job`], so a stray file
+    /// at its path cannot hold the ask. A marker this idle lane does not follow
+    /// asks for a records read at once (`now_wall`): the park then follows that
+    /// change, or adopts a gone one and re-probes it, and the next look finds
+    /// it under way and settles — rather than waiting on a marker an idle lane
+    /// would never read again.
+    fn change_on_disk(&mut self, config_path: &Path, now_wall: u64) -> OnDisk {
+        // A first launch may have no config directory yet. The record writer
+        // already creates it; the lock must be able to precede that write.
+        if let Some(parent) = config_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let claim = match take_change_lock(config_path, Duration::ZERO) {
+            LockTry::Held(claim) => claim,
+            LockTry::Busy => return OnDisk::Change,
+            LockTry::Unavailable(error) => {
+                aterm_log::warn!("debugger launch ask: the change lock cannot be taken: {error}");
+                return OnDisk::NoLock;
+            }
+        };
+        let marker = read_debugger_marker(config_path, CHANGE_MARKER)
+            .and_then(|text| ChangeMarker::parse(&text));
+        if let Some(marker) = marker {
+            let followed = self.follows(&marker.child);
+            if !followed && !self.records_out && self.records_again_at.is_none() {
+                self.records_again_at = Some(now_wall);
+            }
+            if !followed || (self.alive)(&marker.child) {
+                return OnDisk::Change;
+            }
+        }
+        // Retain one kernel lock across the record's read and durable write:
+        // another process cannot pass the same absent-host reading meanwhile.
+        OnDisk::Clear(claim)
+    }
+
+    /// THE LAUNCH ASK SETTLED (owner ruling O29): write this Mac into
+    /// [`ASKED_RECORD`] and nothing else. The question is answered here — a
+    /// change is under way, the owner answered the alert in this process,
+    /// debugger access is on, or it was on or turned off before — so no later
+    /// launch asks it.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DebuggerAccessChange",
+            action = "Forgo",
+            project = "aterm_gui::debugger_access::conformance::project"
+        )
+    )]
+    pub(crate) fn forgo(config_path: Option<&Path>, host: &str) -> std::io::Result<()> {
+        let Some(config_path) = config_path else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no config directory to record in",
+            ));
+        };
+        note_asked(config_path, host, now_secs())
+    }
+}
+
+/// The App's launch ask: queued on a windowed macOS instance until it asks,
+/// settles or drops, with the park's next look. It holds the host-key reader
+/// (injected; the live one, `host_uuid_if_warm`, never makes a syscall) and the
+/// record's answer for this Mac, read once.
+#[derive(Debug)]
+pub(crate) struct LaunchAskQueue {
+    queued: bool,
+    /// When the next look is due; `None`: at the next park.
+    next_look: Option<Instant>,
+    host: fn() -> Option<&'static str>,
+    /// The host key's read off the event loop: `None` until it is started, then
+    /// whether it has ended.
+    host_read: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The record's answer, as read for a host.
+    asked: Option<(&'static str, bool)>,
+    /// What the last look waited on.
+    waiting: Option<AskWait>,
+    /// When the first offer this process was refused before anything was
+    /// written ([`Self::refused`]).
+    refused_since: Option<Instant>,
+}
+
+/// How long offers refused before anything was written (a change on disk, the
+/// lane busy) may keep the launch ask queued, from the first refusal. A change
+/// that is really under way is followed or adopted by the lane well within it
+/// and settles the ask; past it the ask ends for this process with nothing
+/// written, so a disk state nothing here settles can never hold the folder
+/// warm-up, which waits while the ask is queued, for longer.
+pub(crate) const REFUSED_FOR: Duration = Duration::from_secs(5 * 60);
+
+impl LaunchAskQueue {
+    /// Queued when `queued` (a windowed macOS instance), with the live host key.
+    pub(crate) fn new(queued: bool) -> Self {
+        Self {
+            queued,
+            next_look: None,
+            host: aterm_containment::consent::host_uuid_if_warm,
+            host_read: None,
+            asked: None,
+            waiting: None,
+            refused_since: None,
+        }
+    }
+
+    /// A queued ask with a stand-in host key whose read has ended.
+    #[cfg(test)]
+    pub(crate) fn queued_for_test(host: fn() -> Option<&'static str>) -> Self {
+        Self {
+            host,
+            host_read: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+            ..Self::new(true)
+        }
+    }
+
+    /// A queued ask with a stand-in host key whose read is out, ended once
+    /// `done` is set.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn reading_host_for_test(
+        host: fn() -> Option<&'static str>,
+        done: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            host,
+            host_read: Some(done),
+            ..Self::new(true)
+        }
+    }
+
+    /// Whether the ask is still to come this process.
+    pub(crate) const fn queued(&self) -> bool {
+        self.queued
+    }
+
+    /// Whether a look is due at `now`.
+    pub(crate) fn due(&self, now: Instant) -> bool {
+        self.queued && self.next_look.is_none_or(|at| now >= at)
+    }
+
+    /// Look again at `at`.
+    pub(crate) fn look_later(&mut self, at: Instant) {
+        self.next_look = Some(at);
+    }
+
+    /// The look waits on `why`: look again at `at`. `true` when that is not
+    /// what the last look waited on (worth one line in the log).
+    pub(crate) fn wait(&mut self, why: AskWait, at: Instant) -> bool {
+        self.look_later(at);
+        self.waiting.replace(why) != Some(why)
+    }
+
+    /// The offer at `now` was refused before anything was written or asked
+    /// ([`OfferEnd::Refused`]): look again after
+    /// [`crate::devtools_helper::RECHECK_EVERY`], unless refusals have kept the
+    /// ask queued for [`REFUSED_FOR`] since the first one — then it is over for
+    /// this process (`false`), with nothing written, and a later launch judges
+    /// again. The span is never restarted, so refusals met only at the quiet
+    /// moments between the owner's typing still end it.
+    pub(crate) fn refused(&mut self, now: Instant) -> bool {
+        let since = *self.refused_since.get_or_insert(now);
+        if now.saturating_duration_since(since) >= REFUSED_FOR {
+            self.end();
+            return false;
+        }
+        self.look_later(now + crate::devtools_helper::RECHECK_EVERY);
+        true
+    }
+
+    /// The park's deadline: the next look, while the ask is queued.
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.next_look.filter(|_| self.queued)
+    }
+
+    /// The host key, once warm.
+    pub(crate) fn warm_host(&self) -> Option<&'static str> {
+        (self.host)()
+    }
+
+    /// A cold host key's read: `Some(done)` the first time — the caller reads it
+    /// off the event loop and sets `done` when that read ends — `None` after.
+    pub(crate) fn start_host_read(&mut self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        if self.host_read.is_some() {
+            return None;
+        }
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.host_read = Some(Arc::clone(&done));
+        Some(done)
+    }
+
+    /// Whether the host key's read has ended: a key still cold then is none.
+    pub(crate) fn host_read_ended(&self) -> bool {
+        self.host_read
+            .as_ref()
+            .is_some_and(|done| done.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Whether the record names `host` ([`read_asked`]), read once per process.
+    pub(crate) fn asked(&mut self, config_path: &Path, host: &'static str) -> bool {
+        match self.asked {
+            Some((read_for, asked)) if read_for == host => asked,
+            _ => {
+                let asked = read_asked(config_path, host);
+                self.asked = Some((host, asked));
+                asked
+            }
+        }
+    }
+
+    /// The ask is over for this process.
+    pub(crate) fn end(&mut self) {
+        self.queued = false;
+        self.next_look = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // What the Security page renders
 // ---------------------------------------------------------------------------
 
@@ -1988,8 +2804,9 @@ pub(crate) struct DebuggerFacts {
     /// The cached probe: the rule's mode, the account's membership, and why. The
     /// only source of what the row says the rule is.
     pub(crate) probe: DebuggerProbe,
-    /// aterm's own hardening. Not a gate: when it is not `Hardened` the row and
-    /// the alert say what that exposes.
+    /// aterm's own hardening. Not a gate for the owner's press (O8): when it is
+    /// not `Hardened` the row and the alert say what that exposes. aterm's own
+    /// launch ask does gate on it ([`admit_launch_ask`]).
     pub(crate) self_hardened: SelfHardening,
     /// A change child in flight, this process's or a predecessor's.
     pub(crate) in_flight: Option<InFlightFacts>,
@@ -2003,7 +2820,8 @@ pub(crate) struct DebuggerFacts {
     pub(crate) drift_since: Option<u64>,
     /// What the last change in this process came to.
     pub(crate) last_outcome: Option<Outcome>,
-    /// Why the last confirmed press started nothing.
+    /// Why the last confirmed change (a press, or the launch ask's yes)
+    /// started nothing.
     pub(crate) refusal: Option<Refusal>,
 }
 
@@ -2161,6 +2979,7 @@ mod tests {
 
     /// A held change lock is waited out for the patience given and no longer;
     /// one released inside it is taken.
+    #[cfg(unix)]
     #[test]
     fn a_busy_change_lock_is_waited_out_only_for_its_patience() {
         let dir = scratch("patience");
@@ -2190,6 +3009,7 @@ mod tests {
     /// The change lock is exclusive — across open descriptions, so a second
     /// worker in this process is refused too — released on drop (free at once,
     /// in one try), and never taken through a planted link.
+    #[cfg(unix)]
     #[test]
     fn the_change_lock_is_exclusive_released_on_drop_and_never_followed() {
         let dir = scratch("lock");
@@ -2315,6 +3135,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_records_reader_keeps_a_live_child_names_a_stale_one_and_drops_an_unreadable_one() {
         let dir = scratch("records");
@@ -2407,6 +3228,7 @@ mod tests {
     /// A records read while a worker holds the change lock before its child (and
     /// marker) exist settles nothing: the lane keeps its buttons off and reads
     /// again, and the second read finds the orphaned child in flight.
+    #[cfg(unix)]
     #[test]
     fn a_change_lock_held_before_its_marker_is_written_is_read_again() {
         let dir = scratch("unsettled");
@@ -2538,6 +3360,7 @@ mod tests {
     /// result, leaves the marker for the park, and nudges once per event. A
     /// panicking runner still reads as gone; a lock or live marker held elsewhere
     /// runs nothing.
+    #[cfg(unix)]
     #[test]
     fn the_worker_holds_the_lock_publishes_the_child_then_the_result_and_leaves_the_marker() {
         let dir = scratch("worker");
@@ -2782,6 +3605,7 @@ mod tests {
     /// records it. Peer B, re-reading the shared records inside that window, finds
     /// A's change marker (its child dead) and re-reads the change as aterm's, not
     /// as set outside aterm. The marker goes once the change is recorded.
+    #[cfg(unix)]
     #[test]
     fn a_peer_reading_between_a_changes_result_and_its_record_files_it_as_aterms() {
         let dir = scratch("result-window");
@@ -2882,6 +3706,7 @@ mod tests {
     /// A released change is not adopted again: a records read that still finds
     /// this aterm's own dead marker (its removal runs on another thread) neither
     /// re-opens the change nor asks to remove the marker twice.
+    #[cfg(unix)]
     #[test]
     fn a_released_changes_marker_read_before_its_removal_is_not_adopted_again() {
         let dir = scratch("released-marker");
@@ -2957,6 +3782,7 @@ mod tests {
     /// gone, before the park read the child from the slot: one park re-read takes
     /// both, and the marker stays until the re-probe is recorded rather than being
     /// removed as a stranger's.
+    #[cfg(unix)]
     #[test]
     fn a_records_read_naming_the_jobs_own_exited_child_keeps_its_marker() {
         let dir = scratch("own-marker");
@@ -3035,6 +3861,7 @@ mod tests {
     /// A re-probe that lands while the drift watch waits for a fresh records read
     /// is judged at that read, and the change's marker waits with it, so a peer
     /// re-reading in between files the change as aterm's.
+    #[cfg(unix)]
     #[test]
     fn a_re_probe_judged_at_a_pending_records_read_keeps_the_marker_until_then() {
         let dir = scratch("drift-pending");
@@ -3494,6 +4321,895 @@ mod tests {
             })
         );
     }
+
+    // -----------------------------------------------------------------------
+    // The launch ask (owner ruling O29)
+    // -----------------------------------------------------------------------
+
+    /// Facts under which the launch ask asks: every gate open, this Mac not in
+    /// the record, the records and the probe read (off, an admin), a hardened
+    /// aterm, both launch pages over, nothing up, and a quiet moment.
+    fn ready() -> LaunchAskFacts {
+        LaunchAskFacts {
+            windowed: true,
+            macos: true,
+            privacy: true,
+            notice: true,
+            config: true,
+            host: HostAsked::NotAsked,
+            records_read: true,
+            under_way: false,
+            answered: false,
+            probe: Some(probe(DebuggerMode::Disabled)),
+            probe_fresh: true,
+            recorded: None,
+            drift: false,
+            self_hardened: SelfHardening::Hardened,
+            fda_decided: true,
+            devtools_decided: true,
+            page: false,
+            warmup: false,
+            quiet: true,
+            owner_quiet: false,
+        }
+    }
+
+    fn off_as(member: DebuggerMember) -> Option<DebuggerProbe> {
+        Some(DebuggerProbe {
+            member,
+            ..probe(DebuggerMode::Disabled)
+        })
+    }
+
+    fn recorded(mode: DebuggerMode, origin: Origin) -> Option<ObservedMarker> {
+        Some(ObservedMarker {
+            mode,
+            since: 1_790_000_000,
+            origin,
+        })
+    }
+
+    /// THE LAUNCH ASK'S TABLE: every named outcome, each from the ready facts with
+    /// one fact changed, then the order between neighbours. An aterm that is not
+    /// hardened, or cannot tell, asks nothing by itself (its button still offers
+    /// the change); neither does an account whose membership is unknown; debugger
+    /// access on, or seen go off, settles the question for this Mac; and
+    /// `[privacy] notice = false` silences it.
+    #[test]
+    fn the_launch_ask_names_every_outcome_in_its_order() {
+        use LaunchAsk::{Ask, Drop, Settle, Wait};
+        /// A row: its name, the one change to the ready facts, the outcome.
+        type Row = (&'static str, fn(&mut LaunchAskFacts), LaunchAsk);
+        assert_eq!(admit_launch_ask(&ready()), Ask);
+        let rows: &[Row] = &[
+            ("headless", |f| f.windowed = false, Drop(AskDrop::Headless)),
+            ("not macOS", |f| f.macos = false, Drop(AskDrop::NotMacos)),
+            (
+                "privacy off",
+                |f| f.privacy = false,
+                Drop(AskDrop::PrivacyOff),
+            ),
+            ("notice off", |f| f.notice = false, Drop(AskDrop::NoticeOff)),
+            (
+                "no config folder",
+                |f| f.config = false,
+                Drop(AskDrop::NoConfig),
+            ),
+            (
+                "host cold",
+                |f| f.host = HostAsked::Cold,
+                Wait(AskWait::HostCold),
+            ),
+            (
+                "no host",
+                |f| f.host = HostAsked::Unnamed,
+                Drop(AskDrop::NoHost),
+            ),
+            ("asked", |f| f.host = HostAsked::Asked, Drop(AskDrop::Asked)),
+            (
+                "records unread",
+                |f| f.records_read = false,
+                Wait(AskWait::RecordsUnread),
+            ),
+            (
+                "probe unread",
+                |f| f.probe = None,
+                Wait(AskWait::ProbePending),
+            ),
+            (
+                "probe pending",
+                |f| f.probe = Some(DebuggerProbe::pending()),
+                Wait(AskWait::ProbePending),
+            ),
+            (
+                "under way",
+                |f| f.under_way = true,
+                Settle(AskSettle::Underway),
+            ),
+            (
+                "answered",
+                |f| f.answered = true,
+                Settle(AskSettle::Answered),
+            ),
+            (
+                "enabled",
+                |f| f.probe = Some(probe(DebuggerMode::Enabled)),
+                Settle(AskSettle::AlreadyOn),
+            ),
+            ("drift", |f| f.drift = true, Settle(AskSettle::TurnedOff)),
+            (
+                "recorded on",
+                |f| f.recorded = recorded(DebuggerMode::Enabled, Origin::Outside),
+                Settle(AskSettle::TurnedOff),
+            ),
+            (
+                "turned off by aterm",
+                |f| f.recorded = recorded(DebuggerMode::Disabled, Origin::Aterm),
+                Settle(AskSettle::TurnedOff),
+            ),
+            (
+                "seen turned off outside aterm",
+                |f| f.recorded = recorded(DebuggerMode::Disabled, Origin::Outside),
+                Settle(AskSettle::TurnedOff),
+            ),
+            (
+                "unrecognized",
+                |f| f.probe = Some(probe(DebuggerMode::Unrecognized)),
+                Drop(AskDrop::Unrecognized),
+            ),
+            (
+                "status unread",
+                |f| f.probe = Some(probe(DebuggerMode::Unknown)),
+                Drop(AskDrop::Unread),
+            ),
+            (
+                "probe timed out",
+                |f| f.probe = Some(DebuggerProbe::refused(DebuggerProbeLabel::TimedOut)),
+                Drop(AskDrop::Unread),
+            ),
+            (
+                "not a member",
+                |f| f.probe = off_as(DebuggerMember::NotMember),
+                Drop(AskDrop::NotMember),
+            ),
+            (
+                "membership unknown",
+                |f| f.probe = off_as(DebuggerMember::Unknown),
+                Drop(AskDrop::NotMember),
+            ),
+            (
+                "not hardened",
+                |f| f.self_hardened = SelfHardening::NotHardened,
+                Drop(AskDrop::NotHardened),
+            ),
+            (
+                "hardening unknown",
+                |f| f.self_hardened = SelfHardening::Unknown,
+                Drop(AskDrop::NotHardened),
+            ),
+            (
+                "full disk access undecided",
+                |f| f.fda_decided = false,
+                Wait(AskWait::BehindFullDiskAccess),
+            ),
+            (
+                "developer tools unread",
+                |f| f.devtools_decided = false,
+                Wait(AskWait::BehindDeveloperTools),
+            ),
+            ("a page", |f| f.page = true, Wait(AskWait::BehindPage)),
+            (
+                "the warm-up",
+                |f| f.warmup = true,
+                Wait(AskWait::BehindWarmup),
+            ),
+            ("not quiet", |f| f.quiet = false, Wait(AskWait::NotQuiet)),
+            (
+                "owner quiet",
+                |f| f.owner_quiet = true,
+                Wait(AskWait::OwnerQuiet),
+            ),
+            (
+                "the probe stale at the moment",
+                |f| f.probe_fresh = false,
+                Wait(AskWait::ProbeStale),
+            ),
+            // Off at first sight is no reason to hold back: asked.
+            (
+                "first sight off",
+                |f| f.recorded = recorded(DebuggerMode::Disabled, Origin::Unknown),
+                Ask,
+            ),
+            (
+                "a developer",
+                |f| f.probe = off_as(DebuggerMember::Developer),
+                Ask,
+            ),
+        ];
+        for (name, change, expected) in rows {
+            let mut facts = ready();
+            change(&mut facts);
+            assert_eq!(admit_launch_ask(&facts), *expected, "{name}");
+        }
+        // Every named outcome is reached by some row.
+        let every = [
+            Ask,
+            Drop(AskDrop::Headless),
+            Drop(AskDrop::NotMacos),
+            Drop(AskDrop::PrivacyOff),
+            Drop(AskDrop::NoticeOff),
+            Drop(AskDrop::NoConfig),
+            Drop(AskDrop::NoHost),
+            Drop(AskDrop::Asked),
+            Drop(AskDrop::Unrecognized),
+            Drop(AskDrop::Unread),
+            Drop(AskDrop::NotMember),
+            Drop(AskDrop::NotHardened),
+            Wait(AskWait::HostCold),
+            Wait(AskWait::RecordsUnread),
+            Wait(AskWait::ProbePending),
+            Wait(AskWait::BehindFullDiskAccess),
+            Wait(AskWait::BehindDeveloperTools),
+            Wait(AskWait::BehindPage),
+            Wait(AskWait::BehindWarmup),
+            Wait(AskWait::NotQuiet),
+            Wait(AskWait::OwnerQuiet),
+            Wait(AskWait::ProbeStale),
+            Settle(AskSettle::Underway),
+            Settle(AskSettle::Answered),
+            Settle(AskSettle::AlreadyOn),
+            Settle(AskSettle::TurnedOff),
+        ];
+        for outcome in every {
+            assert!(
+                rows.iter().any(|(_, _, expected)| *expected == outcome),
+                "{outcome:?} has a row"
+            );
+        }
+        let mut words = std::collections::BTreeSet::new();
+        for outcome in every {
+            let word = match outcome {
+                Ask => "ask",
+                Drop(why) => why.as_str(),
+                Wait(why) => why.as_str(),
+                Settle(why) => why.as_str(),
+            };
+            assert!(words.insert(word), "{word} names one outcome");
+        }
+
+        // The order between neighbours: the first that holds decides.
+        let order: &[Row] = &[
+            (
+                "a gate before the host",
+                |f| {
+                    f.notice = false;
+                    f.host = HostAsked::Cold;
+                },
+                Drop(AskDrop::NoticeOff),
+            ),
+            (
+                "the record before the reads",
+                |f| {
+                    f.host = HostAsked::Asked;
+                    f.records_read = false;
+                    f.probe = None;
+                },
+                Drop(AskDrop::Asked),
+            ),
+            (
+                "the records before the probe",
+                |f| {
+                    f.records_read = false;
+                    f.probe = None;
+                    f.under_way = true;
+                },
+                Wait(AskWait::RecordsUnread),
+            ),
+            (
+                "the probe before a settle",
+                |f| {
+                    f.probe = Some(DebuggerProbe::pending());
+                    f.under_way = true;
+                },
+                Wait(AskWait::ProbePending),
+            ),
+            (
+                "under way before the rule",
+                |f| {
+                    f.under_way = true;
+                    f.probe = Some(probe(DebuggerMode::Unrecognized));
+                },
+                Settle(AskSettle::Underway),
+            ),
+            (
+                "on before aterm's hardening",
+                |f| {
+                    f.probe = Some(probe(DebuggerMode::Enabled));
+                    f.self_hardened = SelfHardening::NotHardened;
+                },
+                Settle(AskSettle::AlreadyOn),
+            ),
+            (
+                "turned off before the account",
+                |f| {
+                    f.drift = true;
+                    f.probe = Some(DebuggerProbe {
+                        member: DebuggerMember::NotMember,
+                        ..probe(DebuggerMode::Disabled)
+                    });
+                },
+                Settle(AskSettle::TurnedOff),
+            ),
+            (
+                "the account before the hardening",
+                |f| {
+                    f.probe = off_as(DebuggerMember::NotMember);
+                    f.self_hardened = SelfHardening::Unknown;
+                },
+                Drop(AskDrop::NotMember),
+            ),
+            (
+                "a drop before the pages",
+                |f| {
+                    f.self_hardened = SelfHardening::NotHardened;
+                    f.fda_decided = false;
+                },
+                Drop(AskDrop::NotHardened),
+            ),
+            (
+                "full disk access before developer tools",
+                |f| {
+                    f.fda_decided = false;
+                    f.devtools_decided = false;
+                    f.page = true;
+                },
+                Wait(AskWait::BehindFullDiskAccess),
+            ),
+            (
+                "the pages before the moment",
+                |f| {
+                    f.page = true;
+                    f.quiet = false;
+                },
+                Wait(AskWait::BehindPage),
+            ),
+            (
+                "the moment before the owner's quiet",
+                |f| {
+                    f.quiet = false;
+                    f.owner_quiet = true;
+                },
+                Wait(AskWait::NotQuiet),
+            ),
+            // A stale reading is re-read only at the moment, never while the ask
+            // waits for it; and a stale `Enabled` still settles at once.
+            (
+                "the moment before a stale probe",
+                |f| {
+                    f.owner_quiet = true;
+                    f.probe_fresh = false;
+                },
+                Wait(AskWait::OwnerQuiet),
+            ),
+            (
+                "a stale reading of on settles",
+                |f| {
+                    f.probe = Some(probe(DebuggerMode::Enabled));
+                    f.probe_fresh = false;
+                },
+                Settle(AskSettle::AlreadyOn),
+            ),
+        ];
+        for (name, change, expected) in order {
+            let mut facts = ready();
+            change(&mut facts);
+            assert_eq!(admit_launch_ask(&facts), *expected, "{name}");
+        }
+    }
+
+    /// A wait looks again soon only while a read it started completes, and
+    /// never at once: a past deadline would spin the park.
+    #[test]
+    fn a_waiting_launch_ask_looks_again_soon_only_for_a_read() {
+        use crate::devtools_helper::{PANEL_TICK, RECHECK_EVERY};
+        for why in [
+            AskWait::HostCold,
+            AskWait::ProbePending,
+            AskWait::ProbeStale,
+        ] {
+            assert_eq!(why.look_again(), PANEL_TICK, "{why:?}");
+        }
+        assert!(
+            ASK_PROBE_FRESH > PANEL_TICK,
+            "the reading a stale probe waits for is fresh at the next look"
+        );
+        for why in [
+            AskWait::RecordsUnread,
+            AskWait::BehindFullDiskAccess,
+            AskWait::BehindDeveloperTools,
+            AskWait::BehindPage,
+            AskWait::BehindWarmup,
+            AskWait::NotQuiet,
+            AskWait::OwnerQuiet,
+        ] {
+            assert_eq!(why.look_again(), RECHECK_EVERY, "{why:?}");
+        }
+        assert!(!PANEL_TICK.is_zero() && !RECHECK_EVERY.is_zero());
+    }
+
+    /// THE ASKED RECORD: absent is not asked; the write is DURABLE (it goes down
+    /// before the alert it stands for); one line per Mac, the same Mac never
+    /// twice; bounded to the newest [`MAX_ASKED_LINES`] Macs, the oldest dropped
+    /// (and so asked again); and a host key no line could hold is refused.
+    #[test]
+    fn the_asked_record_is_durable_one_line_per_mac_and_bounded() {
+        use aterm_durable::{Flush, seam::Recording};
+        let dir = scratch("asked");
+        let config = dir.join("aterm.toml");
+        let path = dir.join(ASKED_RECORD);
+        assert!(!read_asked(&config, "MAC-A"), "a genuine absence");
+        let recording = Recording::start();
+        note_asked(&config, "MAC-A", 100).unwrap();
+        assert_eq!(recording.take(), [Flush::Durable], "written ahead, durably");
+        drop(recording);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "MAC-A 100\n");
+        assert!(read_asked(&config, "MAC-A"));
+        assert!(
+            !read_asked(&config, "MAC-B"),
+            "another Mac on a synced config"
+        );
+        note_asked(&config, "MAC-A", 200).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "MAC-A 100\n",
+            "one line per Mac"
+        );
+        for (n, host) in ["B", "C", "D", "E", "F", "G", "H"].iter().enumerate() {
+            note_asked(&config, &format!("MAC-{host}"), 300 + n as u64).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().lines().count(),
+            MAX_ASKED_LINES
+        );
+        assert!(read_asked(&config, "MAC-A"));
+        note_asked(&config, "MAC-I", 400).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), MAX_ASKED_LINES);
+        assert!(text.starts_with("MAC-B 300\n") && text.ends_with("MAC-I 400\n"));
+        assert!(!read_asked(&config, "MAC-A"), "the oldest Mac went");
+        // The longest record this build writes fits its own bound.
+        let long = |i: u8| format!("{}{}", "F".repeat(MAX_HOST_BYTES - 1), char::from(b'0' + i));
+        for i in 0..8 {
+            note_asked(&config, &long(i), u64::MAX).unwrap();
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() as usize <= MAX_ASKED_BYTES);
+        assert!(read_asked(&config, &long(7)));
+        let before = std::fs::read(&path).unwrap();
+        let too_long = "F".repeat(MAX_HOST_BYTES + 1);
+        for bad in [
+            "",
+            "MAC A",
+            "MAC-A\n",
+            "MAC-A 1",
+            "mac/a",
+            too_long.as_str(),
+        ] {
+            assert!(read_asked(&config, bad), "{bad:?} reads as asked");
+            assert_eq!(
+                note_asked(&config, bad, 1).map_err(|e| e.kind()),
+                Err(std::io::ErrorKind::InvalidInput),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record that is there but cannot be read whole reads as ASKED — fail
+    /// toward not asking — and is never followed, overwritten or replaced: a
+    /// planted link (to a record naming another Mac), a folder, an oversized
+    /// file, and every malformed shape.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_asked_record_reads_as_asked_and_is_left_as_found() {
+        let dir = scratch("asked-unreadable");
+        let config = dir.join("aterm.toml");
+        let path = dir.join(ASKED_RECORD);
+
+        let target = dir.join("elsewhere");
+        std::fs::write(&target, "MAC-B 1\n").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(read_asked(&config, "MAC-A"), "a link is never read through");
+        assert!(note_asked(&config, "MAC-A", 2).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "MAC-B 1\n");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_file(&path).unwrap();
+
+        std::fs::create_dir(&path).unwrap();
+        assert!(read_asked(&config, "MAC-A"), "a folder");
+        assert!(note_asked(&config, "MAC-A", 2).is_err());
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_dir());
+        std::fs::remove_dir(&path).unwrap();
+
+        let nine = (0..=MAX_ASKED_LINES)
+            .map(|i| format!("MAC-{i} 1\n"))
+            .collect::<String>();
+        let oversized = format!("MAC-B 1\n{}\n", "x".repeat(MAX_ASKED_BYTES));
+        for bytes in [
+            oversized.as_bytes(),
+            nine.as_bytes(),
+            &b""[..],
+            &b"\n"[..],
+            &b"MAC-B\n"[..],
+            &b"MAC-B 1"[..],
+            &b"MAC-B x\n"[..],
+            &b"MAC-B -1\n"[..],
+            &b"MAC-B +1\n"[..],
+            &b"MAC-B 1 2\n"[..],
+            &b"MAC-B  1\n"[..],
+            &b"MAC/B 1\n"[..],
+            &b"MAC-B 1\n\n"[..],
+            &b"MAC-B 99999999999999999999999\n"[..],
+            &b"\xff 1\n"[..],
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(
+                read_asked(&config, "MAC-A"),
+                "{:?} reads as asked",
+                String::from_utf8_lossy(bytes)
+            );
+            assert!(note_asked(&config, "MAC-A", 2).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "left as found");
+        }
+        // A whole record naming other Macs only is not this Mac's answer.
+        std::fs::write(&path, "MAC-B 1\nMAC-C 2\n").unwrap();
+        assert!(!read_asked(&config, "MAC-A"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lane where a press of *Allow debugger access…* would be taken: records
+    /// read, the probe reading it off.
+    #[cfg(unix)]
+    fn askable() -> DebuggerChangeLane {
+        let mut lane = DebuggerChangeLane::with_liveness(|_| false);
+        lane.settle_records(RecordsRead::default());
+        lane.poll(1);
+        lane.observe(probe(DebuggerMode::Disabled), 2);
+        lane
+    }
+
+    #[cfg(unix)]
+    fn never_confirmed() -> OwnerAnswer {
+        panic!("no alert may be raised here")
+    }
+
+    /// THE LAUNCH OFFER takes the owner's answer exactly as a press: a yes arms the
+    /// same job a press arms and gives the ticket; no, nobody asked, and a quiet
+    /// give none. The record is written BEFORE the alert in every case, so a
+    /// second offer on the same config folder — this lane, or a new one as after
+    /// a relaunch — asks nothing; another Mac on that folder is asked.
+    #[cfg(unix)]
+    #[test]
+    fn the_launch_offer_writes_ahead_and_takes_the_answer_as_a_press() {
+        let dir = scratch("offer");
+        let config = dir.join("aterm.toml");
+        let mut lane = askable();
+        let ticket = lane
+            .offer(Some(&config), "MAC-A", || {
+                assert!(read_asked(&config, "MAC-A"), "written before the alert");
+                OwnerAnswer::yes_for_test()
+            })
+            .expect("a yes gives the ticket");
+        let mut pressed = askable();
+        let press = pressed
+            .begin(DebuggerChange::On, OwnerAnswer::yes_for_test())
+            .unwrap();
+        assert_eq!(ticket, press, "the same job a press arms");
+        assert_eq!(lane.flow().phase(), Phase::Rechecking(DebuggerChange::On));
+        lane.slot().publish_spawned(ticket.job(), child(9));
+        lane.poll(3);
+        assert!(
+            lane.flow().in_flight().is_some(),
+            "the worker's job is armed"
+        );
+        assert_eq!(
+            askable().offer(Some(&config), "MAC-A", never_confirmed),
+            Err(OfferEnd::Asked),
+            "a relaunch on the same config asks nothing"
+        );
+
+        for (host, answer, end) in [
+            ("MAC-B", OwnerAnswer::No, OfferEnd::Declined),
+            ("MAC-C", OwnerAnswer::NotAsked, OfferEnd::NotAsked),
+            ("MAC-D", OwnerAnswer::Quiet, OfferEnd::NotAsked),
+        ] {
+            let mut lane = askable();
+            assert_eq!(
+                lane.offer(Some(&config), host, move || answer),
+                Err(end),
+                "{host}"
+            );
+            assert_eq!(
+                lane.flow().phase(),
+                Phase::Idle,
+                "{host}: nothing under way"
+            );
+            assert!(read_asked(&config, host), "{host}: recorded all the same");
+            assert_eq!(
+                lane.offer(Some(&config), host, never_confirmed),
+                Err(OfferEnd::Asked),
+                "{host}: asked once"
+            );
+            assert_eq!(
+                askable().offer(Some(&config), host, never_confirmed),
+                Err(OfferEnd::Asked),
+                "{host}: and not after a relaunch"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An offer the press would refuse writes NOTHING and raises nothing: no config
+    /// folder, records unread, the probe not showing it off, a change under way
+    /// here, a peer's change lock held, a change marker on disk. A record that
+    /// cannot be written raises nothing either. `forgo` writes the record alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_launch_offer_writes_nothing_and_forgo_writes_only_the_record() {
+        let dir = scratch("offer-refused");
+        let config = dir.join("aterm.toml");
+        let unwritten = |dir: &Path| !dir.join(ASKED_RECORD).exists();
+        assert_eq!(
+            askable().offer(None, "MAC-A", never_confirmed),
+            Err(OfferEnd::NoRecord)
+        );
+        let unread = &mut DebuggerChangeLane::with_liveness(|_| false);
+        assert_eq!(
+            unread.offer(Some(&config), "MAC-A", never_confirmed),
+            Err(OfferEnd::Refused(Refusal::RecordsUnread))
+        );
+        let mut on = askable();
+        on.observe(probe(DebuggerMode::Enabled), 3);
+        assert_eq!(
+            on.offer(Some(&config), "MAC-A", never_confirmed),
+            Err(OfferEnd::Refused(Refusal::State(
+                DebuggerChange::On,
+                DebuggerMode::Enabled
+            )))
+        );
+        let mut busy = askable();
+        busy.begin(DebuggerChange::On, OwnerAnswer::yes_for_test())
+            .unwrap();
+        assert_eq!(
+            busy.offer(Some(&config), "MAC-A", never_confirmed),
+            Err(OfferEnd::Refused(Refusal::InFlight))
+        );
+        {
+            let LockTry::Held(_peer) = take_change_lock(&config, Duration::ZERO) else {
+                panic!("the scratch lock is free");
+            };
+            assert_eq!(
+                askable().offer(Some(&config), "MAC-A", never_confirmed),
+                Err(OfferEnd::Refused(Refusal::InFlight)),
+                "a peer's worker holds the lock"
+            );
+        }
+        let marker = ChangeMarker::new(DebuggerChange::On, child(4242), 7).unwrap();
+        std::fs::write(dir.join(CHANGE_MARKER), marker.encode()).unwrap();
+        assert_eq!(
+            askable().offer(Some(&config), "MAC-A", never_confirmed),
+            Err(OfferEnd::Refused(Refusal::InFlight)),
+            "a change marker on disk"
+        );
+        std::fs::remove_file(dir.join(CHANGE_MARKER)).unwrap();
+        assert!(unwritten(&dir), "no refusal wrote the record");
+
+        // A folder the record cannot be created in: nothing is asked.
+        let locked = dir.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        let beyond = locked.join("sub").join("aterm.toml");
+        assert!(!read_asked(&beyond, "MAC-A"), "absent");
+        assert_eq!(
+            askable().offer(Some(&beyond), "MAC-A", never_confirmed),
+            Err(OfferEnd::NoLock)
+        );
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        assert!(DebuggerChangeLane::forgo(None, "MAC-A").is_err());
+        DebuggerChangeLane::forgo(Some(&config), "MAC-A").unwrap();
+        assert!(read_asked(&config, "MAC-A"));
+        assert!(!dir.join(CHANGE_MARKER).exists(), "the record alone");
+        assert_eq!(
+            askable().offer(Some(&config), "MAC-A", never_confirmed),
+            Err(OfferEnd::Asked),
+            "settled: never asked after"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The App's queue: queued only when asked to be, due at once, then at the
+    /// look it was put off to; the record read once per process; over at `end`.
+    #[test]
+    fn the_launch_ask_queue_looks_when_due_and_reads_the_record_once() {
+        let idle = LaunchAskQueue::new(false);
+        assert!(!idle.queued() && !idle.due(Instant::now()));
+        assert_eq!(idle.next_deadline(), None);
+        let mut queue = LaunchAskQueue::queued_for_test(|| Some("MAC-A"));
+        let now = Instant::now();
+        assert!(queue.due(now) && queue.host_read_ended());
+        assert_eq!(
+            queue.next_deadline(),
+            None,
+            "the first look is the next park's"
+        );
+        assert_eq!(queue.start_host_read().map(|_| ()), None, "read already");
+        assert!(
+            queue.wait(AskWait::NotQuiet, now + RESULT_RECHECK),
+            "a new wait"
+        );
+        assert!(
+            !queue.wait(AskWait::NotQuiet, now + RESULT_RECHECK),
+            "the same wait is not logged twice"
+        );
+        assert!(!queue.due(now) && queue.due(now + RESULT_RECHECK));
+        assert_eq!(queue.next_deadline(), Some(now + RESULT_RECHECK));
+        assert!(queue.wait(AskWait::BehindPage, now + RESULT_RECHECK));
+        let dir = scratch("queue");
+        let config = dir.join("aterm.toml");
+        assert!(!queue.asked(&config, "MAC-A"));
+        note_asked(&config, "MAC-A", 1).unwrap();
+        assert!(!queue.asked(&config, "MAC-A"), "read once per process");
+        assert!(queue.asked(&config, "MAC-B") == read_asked(&config, "MAC-B"));
+        queue.end();
+        assert!(!queue.queued() && !queue.due(now + RESULT_RECHECK));
+        assert_eq!(queue.next_deadline(), None);
+        let mut cold = LaunchAskQueue::new(true);
+        let done = cold.start_host_read().expect("the first time");
+        assert!(cold.start_host_read().is_none() && !cold.host_read_ended());
+        done.store(true, std::sync::atomic::Ordering::Release);
+        assert!(cold.host_read_ended());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Refused offers keep the ask queued, looking again later, for at most
+    /// [`REFUSED_FOR`] from the first refusal, whatever waits came between: then
+    /// it is over for this process, so a disk state the lane never settles cannot
+    /// hold the folder warm-up (which waits while the ask is queued) for longer.
+    #[test]
+    fn refused_offers_hold_the_launch_ask_for_a_bounded_span() {
+        use crate::devtools_helper::RECHECK_EVERY;
+        let mut queue = LaunchAskQueue::queued_for_test(|| Some("MAC-A"));
+        let first = Instant::now();
+        assert!(queue.refused(first), "the first refusal looks again");
+        assert!(queue.queued() && !queue.due(first));
+        assert_eq!(queue.next_deadline(), Some(first + RECHECK_EVERY));
+        let mut at = first;
+        while at + RECHECK_EVERY < first + REFUSED_FOR {
+            at += RECHECK_EVERY;
+            assert!(queue.due(at));
+            // A wait between refusals does not restart the span.
+            queue.wait(AskWait::NotQuiet, at + RECHECK_EVERY);
+            assert!(queue.refused(at), "still within the span");
+        }
+        assert!(!queue.refused(first + REFUSED_FOR), "the span is over");
+        assert!(!queue.queued() && queue.next_deadline().is_none());
+    }
+
+    /// THE OFFER JUDGES THE DISK AS THE WORKER DOES. A file at the change marker's
+    /// path that names no change — a link, a folder, an oversized or malformed
+    /// file — is no change: the records reader and the worker ignore it, so the
+    /// offer asks. A marker naming a gone child this lane does not follow is
+    /// refused, and asks the park for a records read at once, so the lane adopts
+    /// it and the next look settles; one this lane follows already is no change.
+    /// A lock file the offer cannot open or lock ends it with nothing written: no
+    /// yes could start the worker, which refuses without the lock.
+    #[cfg(unix)]
+    #[test]
+    fn the_launch_offer_judges_the_disk_as_the_worker_does() {
+        let root = aterm_tempfile::TempDir::new().expect("owned offer-disk fixture");
+        let dir = root.path();
+        let config = dir.join("aterm.toml");
+        let marker_at = dir.join(CHANGE_MARKER);
+        let lock_at = dir.join(CHANGE_LOCK);
+        let asked = |host| read_asked(&config, host);
+        let yes = || OwnerAnswer::yes_for_test();
+        let claim = match askable().change_on_disk(&config, now_secs()) {
+            OnDisk::Clear(claim) => claim,
+            other => panic!("a fresh record can be claimed: {other:?}"),
+        };
+        assert_eq!(
+            askable().offer(Some(&config), "MAC-CLAIM", never_confirmed),
+            Err(OfferEnd::Refused(Refusal::InFlight)),
+            "another lane cannot ask before the claimed record is written"
+        );
+        assert!(!asked("MAC-CLAIM"), "the refused contender wrote nothing");
+        drop(claim);
+        assert!(askable().offer(Some(&config), "MAC-CLAIM", yes).is_ok());
+        assert_eq!(
+            askable().offer(Some(&config), "MAC-CLAIM", never_confirmed),
+            Err(OfferEnd::Asked),
+            "the durable claim is visible after the lock is released"
+        );
+        /// What a stray puts at the marker's path.
+        type Plant = fn(&Path);
+        let strays: [(&str, &str, Plant); 4] = [
+            ("a link", "MAC-A", |at| {
+                std::os::unix::fs::symlink("/dev/null", at).unwrap();
+            }),
+            ("a folder", "MAC-B", |at| std::fs::create_dir(at).unwrap()),
+            ("an oversized file", "MAC-C", |at| {
+                std::fs::write(at, vec![b'x'; MAX_MARKER_BYTES + 1]).unwrap();
+            }),
+            ("a malformed file", "MAC-D", |at| {
+                std::fs::write(at, "not a change marker\n").unwrap();
+            }),
+        ];
+        for (name, host, plant) in strays {
+            plant(&marker_at);
+            let mut lane = askable();
+            assert!(
+                lane.offer(Some(&config), host, yes).is_ok(),
+                "{name} at the marker's path is no change"
+            );
+            assert!(asked(host), "{name}: asked");
+            if marker_at.is_dir() && !marker_at.is_symlink() {
+                std::fs::remove_dir(&marker_at).unwrap();
+            } else {
+                std::fs::remove_file(&marker_at).unwrap();
+            }
+        }
+
+        // A gone child nobody recorded: refused, and read again at once.
+        let mut lane = askable();
+        // The read its first probe asked for, which seeds the drift watch.
+        lane.settle_records(read_records(&config, |_| false));
+        lane.poll(3);
+        assert!(
+            !lane.records_due(now_secs()),
+            "an idle lane reads nothing more"
+        );
+        let gone = ChangeMarker::new(DebuggerChange::On, child(4242), 7).unwrap();
+        std::fs::write(&marker_at, gone.encode()).unwrap();
+        assert_eq!(
+            lane.offer(Some(&config), "MAC-E", never_confirmed),
+            Err(OfferEnd::Refused(Refusal::InFlight))
+        );
+        assert!(!asked("MAC-E"), "nothing written");
+        assert!(lane.records_due(now_secs()), "the park reads the records");
+        lane.settle_records(read_records(&config, |_| false));
+        lane.poll(now_secs());
+        assert!(lane.under_way(), "adopted: the next look settles");
+        // The same marker, followed by the lane that let it go: no change.
+        let mut released = askable();
+        released.released = Some(child(4242));
+        assert!(
+            released.offer(Some(&config), "MAC-E", yes).is_ok(),
+            "a gone child this lane follows is no change"
+        );
+        std::fs::remove_file(&marker_at).unwrap();
+
+        // A lock file that cannot be opened: nothing written, nothing asked.
+        std::fs::remove_file(&lock_at).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &lock_at).unwrap();
+        assert_eq!(
+            askable().offer(Some(&config), "MAC-F", never_confirmed),
+            Err(OfferEnd::NoLock)
+        );
+        assert!(!asked("MAC-F"), "nothing written");
+        std::fs::remove_file(&lock_at).unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3510,13 +5226,18 @@ mod tests {
 ///
 /// `phase`, `obs` and `polling` come from the lane (phase 5 is a result it has not taken);
 /// `claim` from `native_settings::debugger_row_states`; `lock` from the real `flock` and a marker
-/// naming a live child; the counters from what the stand-in environment saw, never the lane's
-/// own; `world` and `clobbered` are the environment's.
+/// naming a live child; `asked` from the asked record on disk, through the real reader, for the
+/// rig's one Mac; the counters from what the stand-in environment saw, never the lane's own;
+/// `world` and `clobbered` are the environment's.
 ///
-/// Two steps are compound: the owner's press-and-answer runs `Press`, `Consent`/`Decline` and, on
-/// a yes, `Recheck` and `Launch` up to the park reading the spawned child; and a probe the lane
-/// refuses leaves the row's cached answer alone.
+/// Three steps are compound: the owner's press-and-answer runs `Press`, `Consent`/`Decline` and,
+/// on a yes, `Recheck` and `Launch` up to the park reading the spawned child; the launch ask runs
+/// `Offer` and then the same answer (On only: aterm never asks by itself to turn it off); and a
+/// probe the lane refuses leaves the row's cached answer alone. A relaunch over the same config
+/// folder starts a new lane where the model can be, and is checked from there on.
 #[cfg(test)]
+// Its harness runs where the change lock does (unix); see the tests below.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) mod conformance {
     use super::*;
     use crate::native_settings::OwnerAnswer;
@@ -3618,6 +5339,11 @@ pub(crate) mod conformance {
         armed: i64,
         unarmed: i64,
         misadopted: i64,
+        /// A launch ask went past its gates while the asked record already
+        /// named this Mac.
+        reasked: i64,
+        /// A launch ask went past its gates while a change was under way.
+        overlapped: i64,
     }
 
     /// The projection's inputs besides the lane.
@@ -3629,13 +5355,16 @@ pub(crate) mod conformance {
         /// A change marker on disk naming a dead child the lane does not
         /// follow.
         stale: i64,
+        /// The asked record on disk names the rig's Mac (`read_asked`).
+        asked: i64,
         seen: &'a Seen,
     }
 
     /// The projection (the anchors' `project`).
     ///
-    /// The model's other actions are the environment's or the `Buggy = 1`
-    /// mutants', waived here by name; each mutant's negative control runs the
+    /// The model's other actions are the environment's or the mutants' (the
+    /// press's on `Buggy = 1`, the launch ask's on `Buggy = 2`), waived here by
+    /// name; each mutant's negative control runs the
     /// harness over a composition carrying that defect and requires it to fail
     /// (`the_harness_fails_every_faulty_composition`).
     #[aterm_spec_anchor::spec_unmodeled(
@@ -3732,6 +5461,27 @@ pub(crate) mod conformance {
                   whatever the wake did; the negative control drops the re-read while a child \
                   is in flight and the harness fails."
     )]
+    #[aterm_spec_anchor::spec_unmodeled(
+        machine = "DebuggerAccessChange",
+        action = "OfferAgain",
+        reason = "Buggy = 2 mutant: offer reads the asked record before it writes it, and \
+                  writes it before the alert; the negative control offers over a record it \
+                  never reads, and the harness fails."
+    )]
+    #[aterm_spec_anchor::spec_unmodeled(
+        machine = "DebuggerAccessChange",
+        action = "OfferWhileInFlight",
+        reason = "Buggy = 2 mutant: offer is refused while a change is under way (the press's \
+                  own refusal, then a change marker or held lock on disk); the negative \
+                  control raises the alert over our running child, and the harness fails."
+    )]
+    #[aterm_spec_anchor::spec_unmodeled(
+        machine = "DebuggerAccessChange",
+        action = "OfferRunsUnasked",
+        reason = "Buggy = 2 mutant: offer takes its answer only from the alert it raises, \
+                  through begin; the negative control answers yes without raising one, and the \
+                  harness fails (a launch no alert was answered for)."
+    )]
     pub(crate) fn project(lane: &DebuggerChangeLane, observed: &Observed<'_>) -> State {
         let flow = &lane.flow;
         let change = flow.direction();
@@ -3763,6 +5513,9 @@ pub(crate) mod conformance {
         state.insert("clobbered", observed.seen.clobbered);
         state.insert("stale", observed.stale);
         state.insert("misadopted", observed.seen.misadopted);
+        state.insert("asked", observed.asked);
+        state.insert("reasked", observed.seen.reasked);
+        state.insert("overlapped", observed.seen.overlapped);
         state
     }
 
@@ -3792,6 +5545,12 @@ pub(crate) mod conformance {
         RetryAfterCancel,
         /// A records reader that takes every marker's child for dead.
         AdoptLive,
+        /// A launch ask that never reads the asked record.
+        OfferAgain,
+        /// A launch ask that never asks whether a change is under way.
+        OfferWhileInFlight,
+        /// A launch ask that takes a yes no alert gave.
+        OfferRunsUnasked,
     }
 
     /// The worker thread the harness started, as `ConsentGestures::live`
@@ -3843,9 +5602,15 @@ pub(crate) mod conformance {
             if let Some(child) = self.inherited.take() {
                 set_alive(child.pid, false);
             }
-            let _ = std::fs::remove_dir_all(&self.dir);
+            // A rig whose folder a relaunch took over leaves it to that one.
+            if !self.dir.as_os_str().is_empty() {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
         }
     }
+
+    /// The Mac every rig runs on, as the asked record keys it.
+    const RIG_HOST: &str = "00000000-0000-4000-8000-00000000d1b6";
 
     fn hang_detector(what: &str, done: impl Fn() -> bool) {
         let started = Instant::now();
@@ -3945,6 +5710,56 @@ pub(crate) mod conformance {
             rig
         }
 
+        /// The next launch on this Mac over the same config folder, with
+        /// nothing running: a new lane reads the shared records afresh and has
+        /// read no probe yet, while the asked record, the observed record and
+        /// the change marker stay as the last process left them, and what
+        /// that process saw happen stays seen. The model has no process
+        /// boundary, so the new lane must start in a state the model reaches.
+        /// Checked from there on.
+        fn relaunch(mut self) -> Self {
+            assert!(
+                self.worker.is_none() && self.peer.is_none() && self.inherited.is_none(),
+                "the rig relaunches with nothing running"
+            );
+            let mut lane = DebuggerChangeLane::with_liveness(alive);
+            lane.flow.direction = self.change;
+            let mut rig = Self {
+                model: debugger_access_change_model(),
+                lane,
+                change: self.change,
+                fault: self.fault,
+                // The folder moves to the new rig, which removes it.
+                dir: std::mem::take(&mut self.dir),
+                config: self.config.clone(),
+                world: self.world,
+                cached: DebuggerProbe::pending(),
+                seen: Seen {
+                    fresh: 0,
+                    armed: 0,
+                    ..self.seen
+                },
+                consumed: 0,
+                worker: None,
+                peer: None,
+                peer_gone: self.peer_gone,
+                inherited: None,
+                state: State::new(),
+            };
+            drop(self);
+            rig.lane.settle_records(read_records(&rig.config, alive));
+            let step = rig.lane.poll(now_secs());
+            rig.apply(step);
+            rig.state = rig.now();
+            rig.check_invariants();
+            assert!(
+                aterm_spec::interp::reachable_states(&rig.model).contains(&rig.state),
+                "the relaunched lane starts where the model can be: {:?}",
+                rig.state
+            );
+            rig
+        }
+
         /// An earlier aterm's observed record of the rule as it is now, so the
         /// drift watch judges the change's re-probe at once.
         fn record_world(&self) {
@@ -4030,6 +5845,11 @@ pub(crate) mod conformance {
             )
         }
 
+        /// The asked record on disk names this Mac, as the real reader judges it.
+        fn asked_now(&self) -> i64 {
+            i64::from(read_asked(&self.config, RIG_HOST))
+        }
+
         fn needs_poll(&self) -> bool {
             let real = self.lane.needs_poll();
             if self.fault == Fault::DropPollInFlight
@@ -4049,6 +5869,7 @@ pub(crate) mod conformance {
                     lock: self.lock_now(),
                     inflight: self.inflight_now(),
                     stale: self.stale_now(),
+                    asked: self.asked_now(),
                     seen: &self.seen,
                 },
             );
@@ -4348,6 +6169,127 @@ pub(crate) mod conformance {
             );
             self.state = post;
             self.check_invariants();
+        }
+
+        /// The launch ask at its moment, as `App::offer_debugger_access_at_launch`
+        /// runs it: the real `DebuggerChangeLane::offer` writes this Mac into
+        /// the asked record, raises the alert (here, `answer`) and takes the
+        /// answer as a press's; on a yes the host starts the worker, and the
+        /// park reads what it did. `None` is a ticket given; otherwise why
+        /// there was none. The offer goes past its gates exactly when the
+        /// model's `Offer` is enabled.
+        fn offer(&mut self, answer: OwnerAnswer) -> Option<OfferEnd> {
+            assert_eq!(
+                self.change,
+                DebuggerChange::On,
+                "aterm never asks by itself to turn debugger access off"
+            );
+            let pre = self.now();
+            assert_eq!(
+                pre, self.state,
+                "offer: the projection drifted from the model"
+            );
+            let offer_enabled = self.model.action_enabled("Offer", &pre);
+            let answered_yes = matches!(answer, OwnerAnswer::Yes(_));
+            let answer_label = format!("{answer:?}");
+            let fault = self.fault;
+            // Whether the offer went past its gates, its record written, to
+            // the moment its alert is raised.
+            let mut reached = false;
+            let offered = match fault {
+                Fault::OfferWhileInFlight
+                    if matches!(self.lane.flow.phase(), Phase::InFlight { .. }) =>
+                {
+                    // The fault: an ask that never looks for a change under way.
+                    note_asked(&self.config, RIG_HOST, now_secs()).expect("the scratch record");
+                    reached = true;
+                    self.lane
+                        .begin(DebuggerChange::On, answer)
+                        .map_err(OfferEnd::Refused)
+                }
+                _ => {
+                    if fault == Fault::OfferAgain {
+                        // The fault: an ask that never reads the record.
+                        let _ = std::fs::remove_file(self.dir.join(ASKED_RECORD));
+                    }
+                    let confirm = || {
+                        reached = true;
+                        if fault == Fault::OfferRunsUnasked {
+                            // The fault: a yes no alert gave.
+                            OwnerAnswer::yes_for_test()
+                        } else {
+                            answer
+                        }
+                    };
+                    self.lane.offer(Some(&self.config), RIG_HOST, confirm)
+                }
+            };
+            if reached {
+                if pre["asked"] == 1 {
+                    self.seen.reasked = 1;
+                }
+                if pre["phase"] != 0 || pre["lock"] != 0 || pre["inflight"] != 0 {
+                    self.seen.overlapped = 1;
+                }
+            }
+            assert_eq!(
+                reached,
+                offer_enabled,
+                "Offer: the composition {} what the model {}: {pre:?}",
+                if reached { "took" } else { "refused" },
+                if offer_enabled { "allows" } else { "forbids" },
+            );
+            let (end, targets) = match offered {
+                Ok(ticket) => {
+                    if fault != Fault::OfferRunsUnasked {
+                        assert!(answered_yes, "a ticket only on a yes");
+                        self.seen.fresh = 1;
+                    }
+                    self.start_worker(ticket);
+                    let launched = self
+                        .worker
+                        .as_ref()
+                        .is_some_and(|w| w.env.stage.load(Ordering::SeqCst) == 1);
+                    // The park reads the spawned child, or why none started.
+                    let step = self.lane.poll(now_secs());
+                    self.apply(step);
+                    self.account();
+                    let targets = if launched {
+                        self.chain(&pre, &["Offer", "Consent", "Recheck", "Launch"])
+                    } else {
+                        self.chain(&pre, &["Offer", "Consent", "Recheck"])
+                    };
+                    (None, targets)
+                }
+                Err(end @ (OfferEnd::Declined | OfferEnd::NotAsked)) => {
+                    (Some(end), self.chain(&pre, &["Offer", "Decline"]))
+                }
+                Err(end) => {
+                    assert_eq!(self.now(), pre, "a refused offer ({end:?}) changed nothing");
+                    return Some(end);
+                }
+            };
+            let post = self.now();
+            assert!(
+                targets.contains(&post),
+                "offer ({answer_label}): {pre:?} -> {post:?} is none of {targets:?}"
+            );
+            self.state = post;
+            self.check_invariants();
+            end
+        }
+
+        /// The launch ask settled, as the App settles it (a change under way,
+        /// an alert the owner answered, the rule on, or on or turned off
+        /// before): the real `DebuggerChangeLane::forgo` writes this Mac into
+        /// the asked record, in whatever phase the lane is, and nothing else.
+        fn forgo(&mut self) {
+            self.step("Forgo", |rig| {
+                let before = rig.now();
+                DebuggerChangeLane::forgo(Some(&rig.config), RIG_HOST)
+                    .expect("the scratch record is writable");
+                rig.now() != before
+            });
         }
 
         /// The child exits: applied, unchanged, or over a customised rule —
@@ -4683,8 +6625,122 @@ pub(crate) mod conformance {
             rig.probe();
             assert_eq!(rig.lane.flow.last(), Some(Outcome::Changed(change)));
         }
+        launch_ask_scenarios(fault);
     }
 
+    /// The launch ask (owner ruling O29), On only: refused before the probe; a
+    /// yes that runs the change as a press's would, after which the record
+    /// refuses every later ask; a No, or no alert, that the record carries into
+    /// the next launch while the button stays the owner's; refused under a
+    /// peer's lock and over its dead marker; refused during our own child,
+    /// which settles it; settled first and never asked; and refused over a
+    /// predecessor's running child.
+    fn launch_ask_scenarios(fault: Fault) {
+        let on = DebuggerChange::On;
+        let yes = OwnerAnswer::yes_for_test;
+        let unread = Some(OfferEnd::Refused(Refusal::State(on, DebuggerMode::Unknown)));
+        let in_flight = Some(OfferEnd::Refused(Refusal::InFlight));
+
+        let mut rig = Rig::new(on, DebuggerMode::Disabled, fault);
+        assert_eq!(
+            rig.offer(yes()),
+            unread,
+            "nothing is asked before the probe"
+        );
+        assert_eq!(rig.state["asked"], 0, "and nothing is recorded");
+        rig.probe();
+        assert_eq!(rig.offer(yes()), None);
+        assert_eq!(rig.offer(yes()), in_flight);
+        rig.exit("ChildApplied");
+        rig.notice();
+        rig.probe();
+        assert_eq!(rig.lane.flow.last(), Some(Outcome::Changed(on)));
+        assert_eq!(
+            rig.recorded(),
+            Some((1, Origin::Aterm)),
+            "filed as a press's"
+        );
+        rig.environment("Drift", 0);
+        rig.probe();
+        assert_eq!(
+            rig.offer(yes()),
+            Some(OfferEnd::Asked),
+            "asked once per Mac"
+        );
+        rig.forgo(); // refused: the record names this Mac already
+
+        let mut rig = Rig::new(on, DebuggerMode::Disabled, fault);
+        rig.probe();
+        assert_eq!(rig.offer(OwnerAnswer::No), Some(OfferEnd::Declined));
+        assert_eq!(rig.offer(yes()), Some(OfferEnd::Asked));
+        let mut rig = rig.relaunch();
+        assert_eq!(rig.offer(yes()), unread);
+        rig.probe();
+        assert_eq!(
+            rig.offer(yes()),
+            Some(OfferEnd::Asked),
+            "the next launch asks nothing"
+        );
+        rig.press(yes());
+        rig.exit("ChildUnchanged");
+        rig.notice();
+        rig.probe();
+        assert_eq!(rig.lane.flow.last(), Some(Outcome::NotChanged(on)));
+        assert_eq!(rig.seen.launches, 1, "the button is the owner's still");
+
+        for answer in [OwnerAnswer::NotAsked, OwnerAnswer::Quiet] {
+            let mut rig = Rig::new(on, DebuggerMode::Disabled, fault);
+            rig.probe();
+            assert_eq!(rig.offer(answer), Some(OfferEnd::NotAsked));
+            assert_eq!(rig.offer(yes()), Some(OfferEnd::Asked), "the record stands");
+            assert_eq!(rig.seen.launches, 0);
+        }
+
+        let mut rig = Rig::new(on, DebuggerMode::Disabled, fault);
+        rig.probe();
+        rig.peer_launch();
+        assert_eq!(
+            rig.offer(yes()),
+            in_flight,
+            "a peer's change holds the lock"
+        );
+        rig.peer_exit();
+        assert_eq!(
+            rig.offer(yes()),
+            in_flight,
+            "its marker waits for that peer"
+        );
+        rig.peer_settle();
+        assert_eq!(rig.offer(OwnerAnswer::No), Some(OfferEnd::Declined));
+
+        let mut rig = Rig::new(on, DebuggerMode::Disabled, fault);
+        rig.probe();
+        rig.press(yes());
+        assert_eq!(rig.offer(yes()), in_flight, "our own child is in flight");
+        rig.forgo();
+        rig.exit("ChildUnchanged");
+        rig.notice();
+        rig.probe();
+        assert_eq!(rig.offer(yes()), Some(OfferEnd::Asked), "settled under way");
+
+        let mut rig = Rig::new(on, DebuggerMode::Disabled, fault);
+        rig.forgo();
+        rig.probe();
+        assert_eq!(
+            rig.offer(yes()),
+            Some(OfferEnd::Asked),
+            "settled, never asked"
+        );
+
+        let mut rig = Rig::inherited(on, DebuggerMode::Disabled);
+        assert_eq!(rig.offer(yes()), in_flight, "a predecessor's child runs");
+        rig.forgo();
+    }
+
+    // The change lock is a `flock` (`take_change_lock`): off unix it is
+    // unavailable by design, so the harness and its negative controls run
+    // where the lock does.
+    #[cfg(unix)]
     #[test]
     fn debugger_access_conforms_to_the_model() {
         scenarios(Fault::None);
@@ -4692,6 +6748,7 @@ pub(crate) mod conformance {
 
     /// Negative controls: the same harness over a composition carrying each defect
     /// the model exists to catch must fail.
+    #[cfg(unix)]
     #[test]
     fn the_harness_fails_every_faulty_composition() {
         for fault in [
@@ -4702,6 +6759,9 @@ pub(crate) mod conformance {
             Fault::DropPollInFlight,
             Fault::RetryAfterCancel,
             Fault::AdoptLive,
+            Fault::OfferAgain,
+            Fault::OfferWhileInFlight,
+            Fault::OfferRunsUnasked,
         ] {
             let caught = std::panic::catch_unwind(|| match fault {
                 // Each needs the step that exercises it.
@@ -4719,12 +6779,178 @@ pub(crate) mod conformance {
                     rig.notice();
                     rig.probe();
                 }
+                // A No, then the next launch's ask over the record it wrote.
+                Fault::OfferAgain => {
+                    let mut rig = Rig::new(DebuggerChange::On, DebuggerMode::Disabled, fault);
+                    rig.probe();
+                    rig.offer(OwnerAnswer::No);
+                    let mut rig = rig.relaunch();
+                    rig.probe();
+                    rig.offer(OwnerAnswer::No);
+                }
+                Fault::OfferWhileInFlight => {
+                    let mut rig = Rig::new(DebuggerChange::On, DebuggerMode::Disabled, fault);
+                    rig.probe();
+                    rig.press(OwnerAnswer::yes_for_test());
+                    rig.offer(OwnerAnswer::No);
+                }
+                // The owner would say no; the composition never asks them.
+                Fault::OfferRunsUnasked => {
+                    let mut rig = Rig::new(DebuggerChange::On, DebuggerMode::Disabled, fault);
+                    rig.probe();
+                    rig.offer(OwnerAnswer::No);
+                }
                 _ => scenarios(fault),
             });
-            assert!(
-                caught.is_err(),
-                "{fault:?}: the harness passed a faulty composition"
-            );
+            // A launch-ask fault is caught by the step that carries it, not by
+            // whatever else breaks after.
+            let caught_by = match fault {
+                Fault::OfferAgain | Fault::OfferWhileInFlight => {
+                    Some("Offer: the composition took what the model forbids")
+                }
+                Fault::OfferRunsUnasked => Some("offer (No): "),
+                _ => None,
+            };
+            match (caught, caught_by) {
+                (Ok(()), _) => panic!("{fault:?}: the harness passed a faulty composition"),
+                (Err(payload), Some(expected)) => {
+                    let message = payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| payload.downcast_ref::<&str>().copied())
+                        .unwrap_or_default();
+                    assert!(
+                        message.contains(expected),
+                        "{fault:?}: caught by something else: {message}"
+                    );
+                }
+                (Err(_), None) => {}
+            }
         }
     }
 }
+
+/// `DebuggerAccessChange` actions no shipping function here performs, each waived where
+/// its Tier-1 (`conformance`) binds it.
+#[cfg(any(test, debug_assertions))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "DebuggerAccessChange",
+    action = "Drift",
+    reason = "Environment: an administrator, a macOS upgrade or a -disable elsewhere moves \
+              the rule back to the change's precondition. The Tier-1 harness moves `world`; \
+              the shipping drift watch only records what a probe reads and never re-enables."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "DebuggerAccessChange",
+    action = "SetOutside",
+    reason = "Environment: the rule reaches the change's target outside any child of \
+              aterm's. The Tier-1 harness moves `world`; the worker's re-read then reads \
+              NotDue and spawns nothing."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "DebuggerAccessChange",
+    action = "Customize",
+    reason = "Environment: a rule in a shape Apple's tool does not recognise. The Tier-1 \
+              harness moves `world`; the worker's re-read then reads NotDue and spawns nothing."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "DebuggerAccessChange",
+    action = "Normalize",
+    reason = "Environment: a recognised rule written back. The Tier-1 harness moves `world`."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "DebuggerAccessChange",
+    action = "PeerLaunch",
+    reason = "Environment: another aterm sharing the config takes the change lock and \
+              starts its child. The Tier-1 harness takes the real flock and names a live \
+              child in the real change marker; the lane's worker then runs nothing."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "DebuggerAccessChange",
+    action = "PeerExit",
+    reason = "Environment: the peer's child exits and its worker releases the lock. The \
+              Tier-1 harness drops the flock."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "DebuggerAccessChange",
+    action = "PressWhileInFlight",
+    reason = "Buggy = 1 mutant: the lane refuses a press while a child is in flight \
+              (on_press: InFlight); the negative control forces one through and the \
+              harness fails."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "DebuggerAccessChange",
+    action = "SkipRecheck",
+    reason = "Buggy = 1 mutant: the only order, devtools_change_with, re-reads -status \
+              before it spawns; the negative control runs an order that does not, and the \
+              harness fails."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "DebuggerAccessChange",
+    action = "IgnorePeerLock",
+    reason = "Buggy = 1 mutant: run_devtools_job takes the change lock before the re-read \
+              and holds it through the child; the negative control runs a worker that takes \
+              no lock, and the harness fails (the projected lock is not held)."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "DebuggerAccessChange",
+    action = "ClaimFromExitCode",
+    reason = "Buggy = 1 mutant: the reducer's observation and the row's claim come only \
+              from a probe; the negative control makes the lane take the exit as the \
+              target, and the harness fails."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "DebuggerAccessChange",
+    action = "RetryAfterCancel",
+    reason = "Buggy = 1 mutant: an unchanged result ends the change (NotChanged) and the \
+              host starts a worker only after the owner's yes; the negative control retries \
+              without one, and the harness fails."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "DebuggerAccessChange",
+    action = "SpendBanked",
+    reason = "Buggy = 1 mutant: the lane arms a job only inside begin, on the owner's yes \
+              (the scenarios' No/NotAsked/Quiet presses launch nothing); a worker started with no \
+              answer is the RetryAfterCancel control's shape."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "DebuggerAccessChange",
+    action = "AdoptLive",
+    reason = "Buggy = 1 mutant: read_records files a change marker as stale only when its \
+              child is gone by pid and birth; the negative control runs a records reader \
+              that skips that check over a peer's running child, and the harness fails."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "DebuggerAccessChange",
+    action = "ResultWakeLost",
+    reason = "Buggy = 1 mutant: the lane's needs_poll holds while a change is under way, \
+              whatever the wake did; the negative control drops the re-read while a child \
+              is in flight and the harness fails."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "DebuggerAccessChange",
+    action = "OfferAgain",
+    reason = "Buggy = 2 mutant: offer reads the asked record before it writes it, and \
+              writes it before the alert; the negative control offers over a record it \
+              never reads, and the harness fails."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "DebuggerAccessChange",
+    action = "OfferWhileInFlight",
+    reason = "Buggy = 2 mutant: offer is refused while a change is under way (the press's \
+              own refusal, then a change marker or held lock on disk); the negative \
+              control raises the alert over our running child, and the harness fails."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "DebuggerAccessChange",
+    action = "OfferRunsUnasked",
+    reason = "Buggy = 2 mutant: offer takes its answer only from the alert it raises, \
+              through begin; the negative control answers yes without raising one, and the \
+              harness fails (a launch no alert was answered for)."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn debugger_access_change_waivers() {}

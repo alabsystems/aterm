@@ -21,7 +21,7 @@ contract_fn! {
     /// Verified check that a broker record version byte matches the current format
     /// (`ver == 2`), linked via `clean-kernel-defeq` to `brecord_version_current_isl`.
     #[must_use]
-    pub fn brecord_version_current(ver: u8) -> bool
+    pub const fn brecord_version_current(ver: u8) -> bool
     clauses [ensures result == (ver == 2)]
     {
         ver == 2
@@ -116,7 +116,7 @@ pub(crate) enum Mark {
 impl Mark {
     /// Whether a unit of the log ENDS at this record — a batch's seal, or a record a
     /// build that predates the marks wrote whole — so the next record starts a new one.
-    pub(crate) fn ends_a_unit(self) -> bool {
+    pub(crate) const fn ends_a_unit(self) -> bool {
         !matches!(self, Mark::Continues)
     }
 }
@@ -170,6 +170,185 @@ pub struct GroupCommit {
     pub upto: u64,
 }
 
+const fn encode_u32_le_bytes(v: u32) -> [u8; 4] {
+    [v as u8, (v >> 8) as u8, (v >> 16) as u8, (v >> 24) as u8]
+}
+
+const fn encode_u64_le_bytes(v: u64) -> [u8; 8] {
+    [
+        v as u8,
+        (v >> 8) as u8,
+        (v >> 16) as u8,
+        (v >> 24) as u8,
+        (v >> 32) as u8,
+        (v >> 40) as u8,
+        (v >> 48) as u8,
+        (v >> 56) as u8,
+    ]
+}
+
+const fn encode_record_header(seq: u64, producer_id: u64, producer_seq: u64) -> [u8; HEADER] {
+    [
+        BREC_VERSION,
+        seq as u8,
+        (seq >> 8) as u8,
+        (seq >> 16) as u8,
+        (seq >> 24) as u8,
+        (seq >> 32) as u8,
+        (seq >> 40) as u8,
+        (seq >> 48) as u8,
+        (seq >> 56) as u8,
+        producer_id as u8,
+        (producer_id >> 8) as u8,
+        (producer_id >> 16) as u8,
+        (producer_id >> 24) as u8,
+        (producer_id >> 32) as u8,
+        (producer_id >> 40) as u8,
+        (producer_id >> 48) as u8,
+        (producer_id >> 56) as u8,
+        producer_seq as u8,
+        (producer_seq >> 8) as u8,
+        (producer_seq >> 16) as u8,
+        (producer_seq >> 24) as u8,
+        (producer_seq >> 32) as u8,
+        (producer_seq >> 40) as u8,
+        (producer_seq >> 48) as u8,
+        (producer_seq >> 56) as u8,
+    ]
+}
+
+/// The fixed record fields, subject length, and unconsumed payload.
+type RecordHeader<'a> = (u8, Offset, u64, u64, usize, &'a [u8]);
+
+const fn decode_u32_le_bytes(b: &[u8; 4]) -> u32 {
+    (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24)
+}
+
+const fn decode_u64_le_bytes(b: &[u8; 8]) -> u64 {
+    (b[0] as u64)
+        | ((b[1] as u64) << 8)
+        | ((b[2] as u64) << 16)
+        | ((b[3] as u64) << 24)
+        | ((b[4] as u64) << 32)
+        | ((b[5] as u64) << 40)
+        | ((b[6] as u64) << 48)
+        | ((b[7] as u64) << 56)
+}
+
+const fn decode_record_header_bytes(raw: &[u8; 29]) -> (u8, Offset, u64, u64, usize) {
+    let version = raw[0];
+    let seq = (raw[1] as u64)
+        | ((raw[2] as u64) << 8)
+        | ((raw[3] as u64) << 16)
+        | ((raw[4] as u64) << 24)
+        | ((raw[5] as u64) << 32)
+        | ((raw[6] as u64) << 40)
+        | ((raw[7] as u64) << 48)
+        | ((raw[8] as u64) << 56);
+    let producer_id = (raw[9] as u64)
+        | ((raw[10] as u64) << 8)
+        | ((raw[11] as u64) << 16)
+        | ((raw[12] as u64) << 24)
+        | ((raw[13] as u64) << 32)
+        | ((raw[14] as u64) << 40)
+        | ((raw[15] as u64) << 48)
+        | ((raw[16] as u64) << 56);
+    let producer_seq = (raw[17] as u64)
+        | ((raw[18] as u64) << 8)
+        | ((raw[19] as u64) << 16)
+        | ((raw[20] as u64) << 24)
+        | ((raw[21] as u64) << 32)
+        | ((raw[22] as u64) << 40)
+        | ((raw[23] as u64) << 48)
+        | ((raw[24] as u64) << 56);
+    let sl = ((raw[25] as u32)
+        | ((raw[26] as u32) << 8)
+        | ((raw[27] as u32) << 16)
+        | ((raw[28] as u32) << 24)) as usize;
+    (version, Offset(seq), producer_id, producer_seq, sl)
+}
+
+const fn decode_record_header_and_sl(p: &[u8]) -> Option<RecordHeader<'_>> {
+    let &[version, s0, s1, s2, s3, s4, s5, s6, s7, pid0, pid1, pid2, pid3, pid4, pid5, pid6, pid7, pseq0, pseq1, pseq2, pseq3, pseq4, pseq5, pseq6, pseq7, sl0, sl1, sl2, sl3, ref rest @ ..] =
+        p
+    else {
+        return None;
+    };
+    let (v, seq, producer_id, producer_seq, sl) = decode_record_header_bytes(&[
+        version, s0, s1, s2, s3, s4, s5, s6, s7, pid0, pid1, pid2, pid3, pid4, pid5, pid6, pid7,
+        pseq0, pseq1, pseq2, pseq3, pseq4, pseq5, pseq6, pseq7, sl0, sl1, sl2, sl3,
+    ]);
+    Some((v, seq, producer_id, producer_seq, sl, rest))
+}
+
+const fn take_u8(s: &[u8]) -> Option<(u8, &[u8])> {
+    let &[b0, ref rest @ ..] = s else {
+        return None;
+    };
+    Some((b0, rest))
+}
+
+const fn take_u32_le(s: &[u8]) -> Option<(u32, &[u8])> {
+    let &[b0, b1, b2, b3, ref rest @ ..] = s else {
+        return None;
+    };
+    Some((decode_u32_le_bytes(&[b0, b1, b2, b3]), rest))
+}
+
+const fn take_u64_le(s: &[u8]) -> Option<(u64, &[u8])> {
+    let &[b0, b1, b2, b3, b4, b5, b6, b7, ref rest @ ..] = s else {
+        return None;
+    };
+    Some((decode_u64_le_bytes(&[b0, b1, b2, b3, b4, b5, b6, b7]), rest))
+}
+
+const fn decode_mark(rest: &[u8]) -> Option<Mark> {
+    match rest {
+        [] => Some(Mark::Unmarked),
+        [CONTINUES_TAG] => Some(Mark::Continues),
+        &[SEAL_TAG, c0, c1, c2, c3] => {
+            let count = decode_u32_le_bytes(&[c0, c1, c2, c3]);
+            if count == 0 {
+                None
+            } else {
+                Some(Mark::Seal(count))
+            }
+        }
+        _ => None,
+    }
+}
+
+const fn encode_seal(count: u32) -> [u8; SEAL_LEN] {
+    [
+        SEAL_TAG,
+        count as u8,
+        (count >> 8) as u8,
+        (count >> 16) as u8,
+        (count >> 24) as u8,
+    ]
+}
+
+const fn decode_newer_format_bytes(raw: &[u8; 9], offset: Option<u64>) -> Option<u8> {
+    let version = raw[0];
+    let seq = (raw[1] as u64)
+        | ((raw[2] as u64) << 8)
+        | ((raw[3] as u64) << 16)
+        | ((raw[4] as u64) << 24)
+        | ((raw[5] as u64) << 32)
+        | ((raw[6] as u64) << 40)
+        | ((raw[7] as u64) << 48)
+        | ((raw[8] as u64) << 56);
+    let offset_matches = match offset {
+        None => true,
+        Some(o) => o == seq,
+    };
+    if version > BREC_VERSION && offset_matches {
+        Some(version)
+    } else {
+        None
+    }
+}
+
 /// The record format a stored payload names, when it is NEWER than this build reads,
 /// judged by the prefix every version keeps (see [`BREC_VERSION`]): a version byte
 /// above this build's, then — when `offset` is known — the record's own offset. Asked
@@ -177,10 +356,11 @@ pub struct GroupCommit {
 /// newer astream, not damaged; the offset check is what keeps a payload this build
 /// cannot read for another reason (an encrypted log opened without its key, whose
 /// first byte is a random nonce byte) from passing as one. `None` otherwise.
-pub(crate) fn newer_format(p: &[u8], offset: Option<u64>) -> Option<u8> {
-    let version = *p.first()?;
-    let seq = u64::from_le_bytes(p.get(1..9)?.try_into().ok()?);
-    (version > BREC_VERSION && offset.is_none_or(|o| o == seq)).then_some(version)
+pub(crate) const fn newer_format(p: &[u8], offset: Option<u64>) -> Option<u8> {
+    let &[version, b1, b2, b3, b4, b5, b6, b7, b8, ref _rest @ ..] = p else {
+        return None;
+    };
+    decode_newer_format_bytes(&[version, b1, b2, b3, b4, b5, b6, b7, b8], offset)
 }
 
 impl BrokerRecord {
@@ -207,39 +387,53 @@ impl BrokerRecord {
     pub(crate) fn encode_payload_marked(&self, mark: Mark) -> Result<Vec<u8>, FrameError> {
         // Sized exactly (header, two length-prefixed fields, the commit tag and its
         // body, the mark), so a large body is copied once and never reallocated.
-        let commit_len = self
-            .commit
-            .as_ref()
-            .map_or(Some(0usize), |c| c.group.len().checked_add(12))
-            .ok_or(FrameError::TooLarge)?;
-        let unmark_len = HEADER
-            .saturating_add(9)
-            .checked_add(self.subject.len())
-            .and_then(|n| n.checked_add(self.body.len()))
-            .and_then(|n| n.checked_add(commit_len))
-            .ok_or(FrameError::TooLarge)?;
+        let commit_len = match &self.commit {
+            None => 0usize,
+            Some(c) => {
+                let Some(n) = c.group.len().checked_add(12) else {
+                    return Err(FrameError::TooLarge);
+                };
+                n
+            }
+        };
+        let Some(n1) = HEADER.saturating_add(9).checked_add(self.subject.len()) else {
+            return Err(FrameError::TooLarge);
+        };
+        let Some(n2) = n1.checked_add(self.body.len()) else {
+            return Err(FrameError::TooLarge);
+        };
+        let Some(unmark_len) = n2.checked_add(commit_len) else {
+            return Err(FrameError::TooLarge);
+        };
         if unmark_len > MAX_RECORD_PAYLOAD {
             return Err(FrameError::TooLarge);
         }
         let mut p = Vec::new();
-        p.push(BREC_VERSION);
-        p.extend_from_slice(&self.seq.0.to_le_bytes());
-        p.extend_from_slice(&self.producer_id.to_le_bytes());
-        p.extend_from_slice(&self.producer_seq.to_le_bytes());
-        let sl = u32::try_from(self.subject.len()).map_err(|_| FrameError::TooLarge)?;
-        p.extend_from_slice(&sl.to_le_bytes());
+        p.extend_from_slice(&encode_record_header(
+            self.seq.0,
+            self.producer_id,
+            self.producer_seq,
+        ));
+        let Ok(sl) = u32::try_from(self.subject.len()) else {
+            return Err(FrameError::TooLarge);
+        };
+        p.extend_from_slice(&encode_u32_le_bytes(sl));
         p.extend_from_slice(self.subject.as_bytes());
-        let bl = u32::try_from(self.body.len()).map_err(|_| FrameError::TooLarge)?;
-        p.extend_from_slice(&bl.to_le_bytes());
+        let Ok(bl) = u32::try_from(self.body.len()) else {
+            return Err(FrameError::TooLarge);
+        };
+        p.extend_from_slice(&encode_u32_le_bytes(bl));
         p.extend_from_slice(&self.body);
         match &self.commit {
             None => p.push(0),
             Some(c) => {
                 p.push(1);
-                let gl = u32::try_from(c.group.len()).map_err(|_| FrameError::TooLarge)?;
-                p.extend_from_slice(&gl.to_le_bytes());
+                let Ok(gl) = u32::try_from(c.group.len()) else {
+                    return Err(FrameError::TooLarge);
+                };
+                p.extend_from_slice(&encode_u32_le_bytes(gl));
                 p.extend_from_slice(c.group.as_bytes());
-                p.extend_from_slice(&c.upto.to_le_bytes());
+                p.extend_from_slice(&encode_u64_le_bytes(c.upto));
             }
         }
         if p.len() > MAX_RECORD_PAYLOAD {
@@ -249,10 +443,7 @@ impl BrokerRecord {
             Mark::Unmarked => {}
             Mark::Continues => p.push(CONTINUES_TAG),
             Mark::Seal(0) => return Err(FrameError::TooLarge),
-            Mark::Seal(count) => {
-                p.push(SEAL_TAG);
-                p.extend_from_slice(&count.to_le_bytes());
-            }
+            Mark::Seal(count) => p.extend_from_slice(&encode_seal(count)),
         }
         p.shrink_to_fit();
         Ok(p)
@@ -262,7 +453,10 @@ impl BrokerRecord {
     /// (see [`BREC_VERSION`]); the mark itself is the store's business. Every read is
     /// bounds-checked, so hostile bytes yield `None`, never a panic.
     pub fn from_payload(p: &[u8]) -> Option<BrokerRecord> {
-        Self::from_payload_marked(p).map(|(rec, _)| rec)
+        let Some((rec, _)) = Self::from_payload_marked(p) else {
+            return None;
+        };
+        Some(rec)
     }
 
     /// [`from_payload`](Self::from_payload), with the batch [`Mark`] the record
@@ -270,55 +464,52 @@ impl BrokerRecord {
     /// continues byte, or exactly one well-formed seal (its tag and a count of at least
     /// 1); anything else is not a record this build reads.
     pub(crate) fn from_payload_marked(p: &[u8]) -> Option<(BrokerRecord, Mark)> {
-        if p.len() < HEADER || p[0] != BREC_VERSION {
+        let (version, seq, producer_id, producer_seq, sl, rest) = decode_record_header_and_sl(p)?;
+        if !brecord_version_current(version) {
             return None;
         }
-        let seq = Offset(u64::from_le_bytes(p[1..9].try_into().ok()?));
-        let producer_id = u64::from_le_bytes(p[9..17].try_into().ok()?);
-        let producer_seq = u64::from_le_bytes(p[17..25].try_into().ok()?);
-        let mut pos = HEADER;
-        let sl_end = pos.checked_add(4)?;
-        let sl = u32::from_le_bytes(p.get(pos..sl_end)?.try_into().ok()?) as usize;
-        pos = sl_end;
-        let send = pos.checked_add(sl)?;
-        let subject = String::from_utf8(p.get(pos..send)?.to_vec()).ok()?;
-        pos = send;
-        let bl_end = pos.checked_add(4)?;
-        let bl = u32::from_le_bytes(p.get(pos..bl_end)?.try_into().ok()?) as usize;
-        pos = bl_end;
-        let bend = pos.checked_add(bl)?;
-        let body = p.get(pos..bend)?.to_vec();
-        pos = bend;
-        let commit_tag = *p.get(pos)?;
-        pos = pos.checked_add(1)?;
+        let Some(subj_bytes) = rest.get(..sl) else {
+            return None;
+        };
+        let Some(rest) = rest.get(sl..) else {
+            return None;
+        };
+        let Ok(subject_str) = core::str::from_utf8(subj_bytes) else {
+            return None;
+        };
+        let subject = subject_str.to_owned();
+        let (bl_u32, rest) = take_u32_le(rest)?;
+        let bl = bl_u32 as usize;
+        let Some(body_bytes) = rest.get(..bl) else {
+            return None;
+        };
+        let Some(rest) = rest.get(bl..) else {
+            return None;
+        };
+        let body = body_bytes.to_vec();
+        let (commit_tag, mut rest) = take_u8(rest)?;
         let commit = match commit_tag {
             0 => None,
             1 => {
-                let gl_end = pos.checked_add(4)?;
-                let gl = u32::from_le_bytes(p.get(pos..gl_end)?.try_into().ok()?) as usize;
-                pos = gl_end;
-                let gend = pos.checked_add(gl)?;
-                let group = String::from_utf8(p.get(pos..gend)?.to_vec()).ok()?;
-                pos = gend;
-                let upto_end = pos.checked_add(8)?;
-                let upto = u64::from_le_bytes(p.get(pos..upto_end)?.try_into().ok()?);
-                pos = upto_end;
+                let (gl_u32, after_gl) = take_u32_le(rest)?;
+                let gl = gl_u32 as usize;
+                let Some(grp_bytes) = after_gl.get(..gl) else {
+                    return None;
+                };
+                let Some(after_grp) = after_gl.get(gl..) else {
+                    return None;
+                };
+                let Ok(group_str) = core::str::from_utf8(grp_bytes) else {
+                    return None;
+                };
+                let group = group_str.to_owned();
+                let (upto, after_upto) = take_u64_le(after_grp)?;
+                rest = after_upto;
                 Some(GroupCommit { group, upto })
             }
             _ => return None,
         };
-        let mark = match p.get(pos..)? {
-            [] => Mark::Unmarked,
-            [CONTINUES_TAG] => Mark::Continues,
-            [SEAL_TAG, count @ ..] => {
-                let count = u32::from_le_bytes(<[u8; 4]>::try_from(count).ok()?);
-                if count == 0 {
-                    return None;
-                }
-                Mark::Seal(count)
-            }
-            _ => return None,
-        };
+        let mark = decode_mark(rest)?;
         let rec = BrokerRecord {
             seq,
             producer_id,

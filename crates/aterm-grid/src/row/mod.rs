@@ -68,8 +68,18 @@ aterm_types::bitflags! {
         /// `Row::set`/`overwrite_span` of a wide cell; cleared by whole-row
         /// clears. Gates the wide fixups so narrow-only rows skip the scan.
         const HAS_WIDE_CHARS = 1 << 5;
-        // Bit 6 is unassigned (it was HAS_STYLE_ID, for style-interned
-        // cells, which nothing writes).
+        /// The row was filled from a history [`Line`](aterm_scrollback::Line)
+        /// that ends two or more cells before the last column: its line goes on
+        /// at the row's length when the next row continues it, as the line
+        /// does in the tiered store, not at the last column an autowrap would
+        /// have filled. A rewrap makes such a line where it splits a line the
+        /// screen continues (the straddling line under a cursor on its tail).
+        /// The one-cell case is [`Self::EARLY_WRAP_HOLE`].
+        ///
+        /// Set by a row filled from a history line (`fill_row_cells`). Cleared
+        /// by a write into the last cell and every whole-row clear/reset; moved
+        /// with a margined row move as the hole is.
+        const ENDS_AT_LEN = 1 << 6;
         /// The row's last cell is an early-wrap hole: a width-2 glyph that
         /// could not start there wrapped to the next row and left the cell
         /// unwritten (xterm blanks it with the current background; Ghostty's
@@ -267,20 +277,58 @@ impl Row {
     /// How many cells this row contributes to its logical line when the next
     /// row continues it (soft wrap): autowrap filled it to its last column, so
     /// every cell is content, blanks included, except a recorded early-wrap
-    /// hole. Single-width rows only; the caller checks the continuation.
+    /// hole. A row filled from a history line that ends short of that
+    /// ([`RowFlags::ENDS_AT_LEN`]) contributes its length. Single-width rows
+    /// only; the caller checks the continuation.
     #[must_use]
     #[inline]
     pub(crate) fn continued_len(&self) -> u16 {
+        if self.flags.contains(RowFlags::ENDS_AT_LEN) {
+            return self.len;
+        }
         self.cols()
             .saturating_sub(u16::from(self.has_early_wrap_hole()))
     }
 
+    /// Record (or forget) that this row's line goes on at its length when the
+    /// next row continues it ([`RowFlags::ENDS_AT_LEN`]). Not a visual change.
+    #[inline]
+    pub(crate) fn set_ends_at_len(&mut self, short: bool) {
+        if short {
+            self.flags |= RowFlags::ENDS_AT_LEN;
+        } else {
+            self.flags -= RowFlags::ENDS_AT_LEN;
+        }
+    }
+
+    /// The marks that say where a continued row's content ends, as a margined
+    /// row move carries them from one row to another: a recorded early-wrap
+    /// hole (only while the cell still holds the blank the wrap left) and
+    /// [`RowFlags::ENDS_AT_LEN`].
+    #[must_use]
+    #[inline]
+    pub(crate) fn end_marks(&self) -> RowFlags {
+        let mut marks = self.flags & RowFlags::ENDS_AT_LEN;
+        if self.has_early_wrap_hole() {
+            marks |= RowFlags::EARLY_WRAP_HOLE;
+        }
+        marks
+    }
+
+    /// Replace this row's [`Self::end_marks`] with `marks`.
+    #[inline]
+    pub(crate) fn set_end_marks(&mut self, marks: RowFlags) {
+        let both = RowFlags::EARLY_WRAP_HOLE | RowFlags::ENDS_AT_LEN;
+        self.flags = (self.flags - both) | (marks & both);
+    }
+
     /// A write that lands on the last cell (`end`, exclusive, reaches the row
-    /// end) fills an early-wrap hole: the cell is content from now on.
+    /// end) fills an early-wrap hole: the cell is content from now on, and the
+    /// row is as full as an autowrap leaves it.
     #[inline]
     fn note_write_through(&mut self, end: usize) {
         if end >= self.cells.len() {
-            self.flags -= RowFlags::EARLY_WRAP_HOLE;
+            self.flags -= RowFlags::EARLY_WRAP_HOLE | RowFlags::ENDS_AT_LEN;
         }
     }
 

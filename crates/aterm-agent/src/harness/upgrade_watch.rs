@@ -373,9 +373,8 @@ fn look_at(
 fn reads_transcript(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
-        // Muse Code: no upgrade record of its is watched, and no Claude Code
-        // transcript is read for it. No lane yet (agy, Gemini CLI): no Claude
-        // Code transcript is read for them.
+        // Muse Code, agy and Gemini CLI: no upgrade record of theirs is
+        // watched, and no Claude Code transcript is read for them.
         upgrade::Agent::Codex
         | upgrade::Agent::Muse
         | upgrade::Agent::Agy

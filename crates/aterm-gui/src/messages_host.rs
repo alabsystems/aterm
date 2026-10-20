@@ -239,9 +239,8 @@ fn adopt_updater_announced_health(class: &'static str) {
 }
 
 /// How many window re-grids the message band has paid for ON THIS THREAD
-/// (test-only: the launch-pass test's "at most two re-grids" — the
-/// `PTY_RESIZES_FOR_PRESENCE` shape; a headless App is driven on its test's
-/// own thread).
+/// (test-only: the launch-pass test's "at most two re-grids"; a headless App
+/// is driven on its test's own thread).
 #[cfg(test)]
 pub(crate) fn message_regrids() -> u64 {
     PTY_RESIZES_FOR_MESSAGES.with(|c| c.get())
@@ -474,10 +473,16 @@ impl App {
     /// ✓ (round 44); out of scope always, the owner who fixed or cleared the
     /// family kept `Couldn't apply the font` up to its fold and in Problems
     /// for good (round 44's review, ruling 418 (c)).
+    ///
+    /// `fixed_as` holds, by key, the words each family's fix is logged in as this
+    /// reload SAW it end ([`crate::message_reporters::config_fix_words`]: a
+    /// wallpaper taken out reads "Wallpaper removed", one that now decodes
+    /// "Wallpaper loaded") — decided now, not when the warning was posted.
     pub(crate) fn replace_config_messages_after_font_work(
         &mut self,
         msgs: impl IntoIterator<Item = Message>,
         family_admitted: bool,
+        fixed_as: &std::collections::BTreeMap<String, String>,
     ) {
         let reloads = |key: &String| {
             key.starts_with("config.")
@@ -501,14 +506,18 @@ impl App {
             .filter(reloads)
             .collect();
         rederived.extend(scope.iter().cloned());
-        self.replace_config_set(&scope, &rederived, msgs.into_iter().collect());
+        self.replace_config_set(&scope, &rederived, msgs.into_iter().collect(), fixed_as);
     }
 
     /// The full reload's replace when its font work admitted no family
     /// ([`Self::replace_config_messages_after_font_work`]).
     #[cfg(test)]
     pub(crate) fn replace_config_messages(&mut self, msgs: impl IntoIterator<Item = Message>) {
-        self.replace_config_messages_after_font_work(msgs, false);
+        self.replace_config_messages_after_font_work(
+            msgs,
+            false,
+            &std::collections::BTreeMap::new(),
+        );
     }
 
     /// [`Self::replace_config_messages_after_font_work`] for a reload that re-derived only
@@ -525,7 +534,12 @@ impl App {
     ) {
         let scope: Vec<String> = keys.iter().map(|key| (*key).to_string()).collect();
         let rederived = scope.iter().cloned().collect();
-        self.replace_config_set(&scope, &rederived, msgs.into_iter().collect());
+        self.replace_config_set(
+            &scope,
+            &rederived,
+            msgs.into_iter().collect(),
+            &std::collections::BTreeMap::new(),
+        );
     }
 
     /// The replace itself, over the live rows under `scope`. A reload runs on
@@ -559,6 +573,7 @@ impl App {
         scope: &[String],
         rederived: &std::collections::BTreeSet<String>,
         msgs: Vec<Message>,
+        fixed_as: &std::collections::BTreeMap<String, String>,
     ) {
         let now = Instant::now();
         let mut resolved = 0usize;
@@ -567,8 +582,11 @@ impl App {
                 self.config_cleared.insert(key.clone());
                 // FIXED, whether or not its row was still up (ruling 367):
                 // a warning folded by the `Open aterm.toml` or `Details`
-                // press that sent the person to fix it closes as fixed too.
-                resolved += self.messages.fix_closed(key, now);
+                // press that sent the person to fix it closes as fixed too,
+                // in the words this reload saw it end in.
+                resolved +=
+                    self.messages
+                        .fix_closed_as(key, fixed_as.get(key).map(String::as_str), now);
             }
         }
         for key in scope {
@@ -577,7 +595,18 @@ impl App {
             };
             let Some(next) = msgs.iter().find(|m| m.key.as_deref() == Some(key.as_str())) else {
                 // GONE from the reload's set: the problem is fixed, and the
-                // record takes the words its family declared for the fix.
+                // record takes the words this reload saw it end in, else the
+                // ones its family declared for any fix.
+                if let Some(words) = fixed_as.get(key) {
+                    self.messages.restate(
+                        id,
+                        Restatement {
+                            finished: Some(Some(words.clone())),
+                            ..Restatement::default()
+                        },
+                        now,
+                    );
+                }
                 resolved += usize::from(self.messages.resolve(id, Outcome::Ok, now));
                 continue;
             };
@@ -662,6 +691,9 @@ impl App {
         if self.config_cleared.contains(key) {
             return false;
         }
+        // A record keeps the sentences without the band's painted excerpt
+        // (`config_record`): the same words in either form are a repeat.
+        let as_record = crate::message_reporters::config_record(msg);
         self.messages
             .log()
             .records()
@@ -670,7 +702,7 @@ impl App {
             .is_some_and(|r| {
                 r.retired_at.is_some()
                     && r.title == msg.title
-                    && r.detail == msg.detail
+                    && (r.detail == msg.detail || r.detail == as_record.detail)
                     && matches!(
                         r.retired(),
                         Some(
@@ -696,12 +728,12 @@ impl App {
 
     /// The post itself, logged, with no settle: the callers above sync once
     /// for what they posted.
-    fn post_unsynced(&mut self, msg: Message, stamp: WallStamp) -> MessageId {
+    pub(crate) fn post_unsynced(&mut self, msg: Message, stamp: WallStamp) -> MessageId {
         self.post_unsynced_at(msg, stamp, Instant::now())
     }
 
     /// [`Self::post_unsynced`] at the caller's instant: a post the settle makes
-    /// on its own clock ([`Self::show_owed_rows`]).
+    /// on its own clock ([`Self::keep_owed_rows`]).
     fn post_unsynced_at(&mut self, msg: Message, stamp: WallStamp, now: Instant) -> MessageId {
         let posted = self.messages.post(msg, stamp, now);
         if let Some(live) = self.messages.live(posted.id) {
@@ -736,12 +768,85 @@ impl App {
         self.messages.reword_record(id, msg)
     }
 
-    /// A RECORD REPLACED by the row `by` that tells its story on
-    /// ([`aterm_messages::MessageCenter::supersede_record`]); `false` when
-    /// `id` is no record. As a record's re-wording, no settle and no repaint:
-    /// the glass did not move, and the park's sweep persists and publishes it.
+    /// A ROW OR RECORD REPLACED by the later row `by` that tells its story on
+    /// ([`aterm_messages::MessageCenter::supersede_record`]), so Settings ▸
+    /// Messages lists the story once; `false` when the center refuses it. A
+    /// live row leaves the glass, which settles; a record's re-retirement, as
+    /// its re-wording, needs no settle and no repaint: the park's sweep
+    /// persists and publishes it.
     pub(crate) fn supersede_record(&mut self, id: MessageId, by: MessageId) -> bool {
-        self.messages.supersede_record(id, by)
+        let live = self.messages.live(id).is_some();
+        let replaced = self.messages.supersede_record(id, by, Instant::now());
+        if replaced && live {
+            self.sync_messages();
+        }
+        replaced
+    }
+
+    /// Whether a Settings view is the frontmost window's active tab: what is on
+    /// screen when a config problem Settings says on its own row decides between
+    /// a band row and a record.
+    pub(crate) fn settings_in_front(&self) -> bool {
+        self.frontmost_window
+            .and_then(|wid| self.active_native_view(wid))
+            .is_some_and(|(instance, _)| {
+                self.native_runtime
+                    .app(instance)
+                    .is_some_and(|app| app.kind() == crate::native_app::AppKind::Settings)
+            })
+    }
+
+    /// Note which config families' current problems Settings says on the row of
+    /// the setting they are about (`shown`), for the keys a reload re-derived
+    /// (`scope`): what [`Self::record_config_rows_settings_shows`] reads.
+    pub(crate) fn note_config_settings_shows(&mut self, scope: &[&str], shown: &[&'static str]) {
+        for key in scope {
+            self.config_settings_shows.remove(*key);
+        }
+        self.config_settings_shows
+            .extend(shown.iter().map(|key| (*key).to_string()));
+    }
+
+    /// The band-or-record decision for a config problem Settings says on its own
+    /// row, made again now that Settings is what is on screen: such a row raised
+    /// while a terminal was in front becomes its record in place (kept in Settings
+    /// ▸ Messages), so the band never repeats the row above it or pushes the page
+    /// down. A record, its next repeat stays one ([`Self::config_repeat`]); a new
+    /// or changed problem still raises its row. Called wherever the front window
+    /// or tab changes (`App::sync_active_session`).
+    pub(crate) fn record_config_rows_settings_shows(&mut self) {
+        if self.keep_config_rows_settings_shows_as_records() > 0 {
+            self.sync_messages();
+        }
+    }
+
+    /// [`Self::record_config_rows_settings_shows`] without the sync, for a caller
+    /// that syncs once for everything it posted: how many rows became records.
+    fn keep_config_rows_settings_shows_as_records(&mut self) -> usize {
+        if self.config_settings_shows.is_empty() || !self.settings_in_front() {
+            return 0;
+        }
+        let rows: Vec<(MessageId, Message)> = self
+            .messages
+            .live_rows()
+            .filter(|row| {
+                row.msg
+                    .key
+                    .as_deref()
+                    .is_some_and(|key| self.config_settings_shows.contains(key))
+            })
+            .map(|row| (row.id, row.msg.clone()))
+            .collect();
+        let now = Instant::now();
+        let mut kept = 0usize;
+        for (id, msg) in rows {
+            kept += usize::from(self.messages.keep_as_record(
+                id,
+                &crate::message_reporters::config_record(&msg),
+                now,
+            ));
+        }
+        kept
     }
 
     /// A live row that becomes its own RECORD in place, in `msg`'s words
@@ -824,6 +929,9 @@ impl App {
     /// afford and the rows its geometry reserves, re-grids between the two
     /// halves, and hands the drained lines to its writer.
     pub(crate) fn settle_messages(&mut self, now: Instant) -> bool {
+        // The tab strip's fall a Settings edit made inside the regrow floor
+        // commits here once the floor has run, like the band's below.
+        let strip = self.settle_strip_fall(now);
         // The digest's own clock (an entry a reporter stopped naming ends, an
         // aged one files itself): read here, on the loop's own sweep, so an
         // entry cannot outlive its cause because no second look came.
@@ -833,9 +941,9 @@ impl App {
         // ... and the facts that mend themselves, once one has outlasted its
         // horizon (a supervisor stopping for an hour, updates failing for a day).
         self.ripen_exceptions(now);
-        // A row said while no band was on screen, shown now that one is — before
-        // the commit, which reveals it.
-        self.show_owed_rows(now);
+        // A row said while no band was on screen: kept until one shows it, and
+        // shown now if one does — before the commit, which reveals it.
+        self.keep_owed_rows(now);
         let commit = self.band_commit(now);
         let step = drive::settle_and_commit(&mut self.messages, commit);
         let committed = self.regrid_message_band(step.regrid, now);
@@ -845,7 +953,7 @@ impl App {
         let (lines, wire) =
             drive::drain_and_pace(&mut self.messages, &mut self.wire_gate, now, persist);
         self.append_message_lines(&lines);
-        let changed = step.glass_changed || committed || wire;
+        let changed = step.glass_changed || committed || wire || strip;
         if changed {
             // The chips moved under a still pointer (round 44).
             self.refresh_band_hover();
@@ -935,6 +1043,9 @@ impl App {
         if self.message_persist_frozen() {
             return 0;
         }
+        // A held tab lifted on the last turn, its wake unread, is said before
+        // the log closes (`App::let_go_every_lifted_held`).
+        self.let_go_every_lifted_held();
         let closed = self.messages.quit(Instant::now());
         self.flush_messages_log_within(MESSAGES_FLUSH_EXIT_WAIT);
         closed
@@ -1111,6 +1222,9 @@ impl App {
             self.messages_publish_due_at(),
             self.messages.digest_deadline(),
             self.ripening_deadline(),
+            // The tab strip's fall waiting the regrow floor, which
+            // `settle_messages` commits.
+            self.strip_fall_due(),
         ]
         .into_iter()
         .flatten()
@@ -1127,8 +1241,16 @@ impl App {
             return;
         }
         for m in queued {
-            self.post_unsynced(m.message, m.stamp);
+            match m.restored {
+                Some(row) => self.post_restored_row(row, m.stamp),
+                None => {
+                    self.post_unsynced(m.message, m.stamp);
+                }
+            }
         }
+        // The launch's config problems meet what is on screen now: with Settings
+        // restored in front, one it says on its own row is its record.
+        let _ = self.keep_config_rows_settings_shows_as_records();
         if !folders.is_empty() {
             self.fold_folder_faults(&folders);
         }
@@ -1171,15 +1293,18 @@ impl App {
 
     /// [`Self::update_bar_press_applies`]'s law for row `id`'s `Install now`: the press
     /// applies in place where the row still offers this build, the stage is
-    /// really ready and the seamless handoff can run; otherwise it opens the
-    /// details page. ONE reading, for the press and for its feedback words.
+    /// really ready and the seamless handoff can run with something to carry (a
+    /// process that keeps its image and has no terminal open is refused,
+    /// `App::kept_image_waits_for_terminal`); otherwise it opens the details page.
+    /// ONE reading, for the press and for its feedback words.
     fn apply_press_applies(&self, id: MessageId, build: u64) -> bool {
         let offered = self
             .messages
             .live(id)
             .is_some_and(|l| l.msg.actions.contains(&Intent::ApplyUpdate { build }));
         let staged_ready = self.staged_update_ready();
-        let handoff_available = self.seamless_handoff_unavailable().is_none();
+        let handoff_available =
+            self.seamless_handoff_unavailable().is_none() && !self.kept_image_waits_for_terminal();
         Self::update_bar_press_applies(offered, staged_ready, handoff_available)
     }
 
@@ -1295,6 +1420,10 @@ impl App {
                 if pane == crate::menu::PrivacyPane::FullDiskAccess {
                     if opened {
                         // aterm's panel, with its icon to drag, joins the page.
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "the owner's own press of the digest entry"
+                        )]
                         self.fda_page_opened_by_owner(crate::devtools_helper::Origin::Digest);
                     }
                     self.note_macos_access_settings_opened(now);
@@ -1412,14 +1541,16 @@ impl App {
     }
 
     /// [`Self::open_messages_entry`] from outside any window (a "To look at"
-    /// line in the menu-bar item): the frontmost window, else the first.
-    /// `false` when there is none to open it in.
+    /// line in the menu-bar item): the frontmost window, else the first —
+    /// the window it opened in, which the caller raises. `None` when there
+    /// is none to open it in, or the page did not open.
     #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn open_messages_entry_anywhere(&mut self, id: u64) -> bool {
+    pub(crate) fn open_messages_entry_anywhere(&mut self, id: u64) -> Option<WindowId> {
         let wid = self
             .frontmost_window
-            .or_else(|| self.windows.keys().next().copied());
-        wid.is_some_and(|wid| self.open_messages_entry(wid, MessageId::from_raw(id)))
+            .or_else(|| self.windows.keys().next().copied())?;
+        self.open_messages_entry(wid, MessageId::from_raw(id))
+            .then_some(wid)
     }
 
     /// THE PAGE'S OWN PRESS on an entry's button (design §4.4,
@@ -2295,7 +2426,7 @@ impl App {
 
     /// One `Wake::UpdateHealth` from the check thread (R38), on the band and on
     /// record; `true` when it ANNOUNCED a failing class, which is the one case
-    /// owed the OS banner (the caller's). The three shapes:
+    /// owed the OS banner (the caller's). The shapes:
     ///
     /// * THE LEDGER HEALED (`aterm_update::HEALTH_RECOVERED_TITLE`): the warning
     ///   leaves if it is still up, and the healing is on record against what it
@@ -2306,6 +2437,11 @@ impl App {
     ///   (`HEALTH_RESTATED_TITLE`): a log line, nothing else — the row says which
     ///   half is broken and since when, neither of which a count moves, and the
     ///   person was told when it was announced (design ruling 59).
+    /// * A LINUX CRASH LOOP ENDED (`aterm_update::INSTALL_CRASH_LOOP_TITLE`): the
+    ///   install half's warning in the words that name the build that failed, said
+    ///   EVERY TIME — each crash loop is news of its own, so it re-opens the install
+    ///   latch first; a second before the first was answered was a log line and no
+    ///   row (ATERM-KI-1015-2, U21).
     /// * A CLASS IS FAILING: say what is wrong, where the user is looking — the
     ///   title names the broken half ("Couldn't install updates"), the excerpt
     ///   since when; the whole sentence — count, cause, command — is the row's
@@ -2369,6 +2505,18 @@ impl App {
         if title == aterm_update::HEALTH_RESTATED_TITLE {
             aterm_log::info!("update-health: {title}: {body}");
             return false;
+        }
+        // A Linux crash loop's end is news of its own each time (ATERM-KI-1015-2, U21): a
+        // second before the first was answered is a row too, never the latch's log line.
+        if title == aterm_update::INSTALL_CRASH_LOOP_TITLE {
+            let kind = update_words::HealthKind::Install;
+            self.update_health_latched
+                .retain(|latched| *latched != kind);
+            return self.note_update_health_as(
+                kind,
+                aterm_update::health_failing_title("apply"),
+                body,
+            );
         }
         self.note_update_health_as(
             update_words::HealthKind::of_updater_title(title),
@@ -2442,9 +2590,7 @@ impl App {
             "update: {}: {body}",
             aterm_update::INSTALL_AWAITS_START_TITLE
         );
-        let msg = update_words::install_awaits_start(body);
-        self.post_message(msg.clone());
-        self.owe_unless_seen(msg);
+        self.say_owed_unless_seen(update_words::install_awaits_start(body));
     }
 
     /// The wait is over (`aterm_update::INSTALL_WAIT_OVER_TITLE`, `version` the
@@ -2455,25 +2601,35 @@ impl App {
             "update: {}: {version}",
             aterm_update::INSTALL_WAIT_OVER_TITLE
         );
-        self.forget_owed(update_words::KEY_AWAITS_START);
-        if let Some(id) = self
-            .messages
-            .live_by_key(update_words::KEY_AWAITS_START)
-            .map(|l| l.id)
-        {
+        self.withdraw_owed_row(update_words::KEY_AWAITS_START);
+    }
+
+    /// Post `msg`, owed to a band that can show it when none can now
+    /// ([`Self::owe_unless_seen`]).
+    pub(crate) fn say_owed_unless_seen(&mut self, msg: Message) {
+        self.post_message(msg.clone());
+        self.owe_unless_seen(msg);
+    }
+
+    /// The row under `key` is answered: it leaves the band, withdrawn, and is
+    /// owed no more.
+    pub(crate) fn withdraw_owed_row(&mut self, key: &str) {
+        self.forget_owed(key);
+        if let Some(id) = self.messages.live_by_key(key).map(|l| l.id) {
             self.withdraw_message(id);
         }
     }
 
     /// A ROW NOBODY COULD SEE IS OWED TO THE FIRST WINDOW THAT CAN SHOW IT
     /// (ATERM-KI-1015-2, U37). Said while no window's band is on screen
-    /// ([`band_on_screen`]: every window minimized or covered, or none open),
-    /// the row held its 45 s and folded unseen — and an update-health warning's
-    /// latch kept its kind from being said again for the rest of the launch: a
-    /// stuck update was told to nobody. So the row is owed, by its key, in the
-    /// words it was said in, and the settle shows it once a band is on screen
-    /// ([`Self::show_owed_rows`]). A row owed already takes the new words. A
-    /// row with no key has nothing to be owed by.
+    /// ([`band_on_screen`]: every window minimized, covered or not yet shown,
+    /// or none open), the row held its 45 s and folded unseen — and an
+    /// update-health warning's latch kept its kind from being said again for
+    /// the rest of the launch: a stuck update was told to nobody. So the row is
+    /// owed, by its key, in the words it was said in, and the settle keeps it
+    /// until a band has shown it for its whole hold ([`Self::keep_owed_rows`]).
+    /// A row owed already takes the new words. A row with no key has nothing to
+    /// be owed by.
     fn owe_unless_seen(&mut self, msg: Message) {
         let Some(key) = msg.key.clone() else {
             return;
@@ -2481,7 +2637,11 @@ impl App {
         if let Some(owed) = self.rows_owed.iter_mut().find(|owed| owed.key == key) {
             owed.msg = msg;
         } else if !self.any_band_on_screen() {
-            self.rows_owed.push(OwedRow { key, msg });
+            self.rows_owed.push(OwedRow {
+                key,
+                msg,
+                seen: false,
+            });
         }
     }
 
@@ -2503,18 +2663,35 @@ impl App {
         self.windows.values().any(|ws| band_on_screen(ws))
     }
 
-    /// The owed rows ([`Self::owe_unless_seen`]), shown at `now` once a band
-    /// is on screen: a row still live under the key takes its hold again from
-    /// here, so it is seen for the whole of it; one that folded unseen is
-    /// posted again in the words it is owed in. What answered a row since — an
-    /// update-health warning healed, the Linux wait over — forgot it
-    /// ([`Self::forget_owed`]). Asks nothing of the windows while nothing is
-    /// owed, so an idle settle stays free.
-    fn show_owed_rows(&mut self, now: Instant) {
-        if self.rows_owed.is_empty() || !self.any_band_on_screen() {
+    /// The owed rows ([`Self::owe_unless_seen`]) at `now`: each waits on the
+    /// band until a band on screen has shown it for its whole hold, then is paid.
+    ///
+    /// * WHILE NO BAND IS ON SCREEN its hold starts again at every settle, and
+    ///   so does its queue patience when other rows hold the band's slots, so it
+    ///   never folds unseen however long nobody looks — and it stays the one
+    ///   record it was posted as. Posting it again once seen put a second entry
+    ///   in Settings ▸ Messages beside the fold nobody saw (U37's reviews).
+    /// * WHEN THE ROW REACHES AN ON-SCREEN BAND it takes its whole hold from
+    ///   there. A visible band with this row still queued pays nothing: queue
+    ///   patience keeps restarting, including after a partly seen row was
+    ///   requeued. Seen for part of it and then hidden — the window minimized or
+    ///   covered, or a handoff's boot window not yet shown — it waits again, and
+    ///   is not used up unseen.
+    /// * ONE THAT LEFT UNSEEN ANYWAY (a staleness cap, or a flood that took the
+    ///   queued rows) is posted again in the words it is owed in once a band is
+    ///   on screen.
+    ///
+    /// What answered a row since — an update-health warning healed, the Linux
+    /// wait over — forgot it ([`Self::forget_owed`]). Nothing moves under a
+    /// handoff's freeze, which suspends the holds itself. Asks nothing of the
+    /// windows while nothing is owed, so an idle settle stays free.
+    fn keep_owed_rows(&mut self, now: Instant) {
+        if self.rows_owed.is_empty() || self.message_holds_frozen() {
             return;
         }
-        for owed in std::mem::take(&mut self.rows_owed) {
+        let on_screen = self.any_band_on_screen();
+        let mut owed_rows = std::mem::take(&mut self.rows_owed);
+        owed_rows.retain_mut(|owed| {
             let live: Vec<MessageId> = self
                 .messages
                 .live_rows()
@@ -2522,22 +2699,50 @@ impl App {
                 .map(|l| l.id)
                 .collect();
             if live.is_empty() {
+                // Shown on screen and gone: its hold ran out where it was seen,
+                // or the person put it away.
+                if owed.seen {
+                    return false;
+                }
+                // Wait for a real vacancy before re-posting. At the cap a
+                // protected queue may evict the newcomer immediately; retrying
+                // that post every settle would flood the log without a row.
+                if on_screen && self.messages.has_live_capacity() {
+                    aterm_log::info!(
+                        "message: left unseen, posted again for a visible band: {}",
+                        owed.msg.title
+                    );
+                    let id = self.post_unsynced_at(owed.msg.clone(), wall_stamp_now(), now);
+                    owed.seen = self.messages.live(id).is_some_and(|live| !live.is_queued());
+                }
+                return true;
+            }
+            let showing = on_screen
+                && live
+                    .iter()
+                    .any(|id| self.messages.live(*id).is_some_and(|row| !row.is_queued()));
+            if showing && owed.seen {
+                return true;
+            }
+            let hold = Restatement {
+                hold: Some(owed.msg.hold),
+                ..Restatement::default()
+            };
+            for id in live {
+                self.messages.restate(id, hold.clone(), now);
+                self.messages.restart_patience(id, now);
+            }
+            if showing {
                 aterm_log::info!(
                     "message: said while no window was on screen, shown now: {}",
                     owed.msg.title
                 );
-                self.post_unsynced_at(owed.msg, wall_stamp_now(), now);
-            } else {
-                let hold = Restatement {
-                    hold: Some(owed.msg.hold),
-                    ..Restatement::default()
-                };
-                for id in live {
-                    self.messages.restate(id, hold.clone(), now);
-                }
                 self.note_message_rule();
             }
-        }
+            owed.seen = showing;
+            true
+        });
+        self.rows_owed = owed_rows;
     }
 
     /// The digest line a failing `kind` owes once it has gone on for a day
@@ -2645,8 +2850,16 @@ impl App {
         {
             let banner = update_words::health_notification_body(body, remedy);
             let title = update_words::health_notification_title(title);
+            let center = self.notice_center;
+            let own_alerts = std::sync::Arc::clone(&self.notify_own_alerts);
             std::thread::spawn(move || {
-                crate::notify::deliver_update_health_banner(HealthBannerVoice(()), &title, &banner);
+                crate::notify::deliver_update_health_banner(
+                    HealthBannerVoice(()),
+                    center,
+                    &own_alerts,
+                    &title,
+                    &banner,
+                );
             });
             true
         }
@@ -2994,19 +3207,23 @@ impl App {
 /// frames while focused or recorded). Wayland answers `None` (it cannot
 /// say); macOS reports minimizing as occlusion.
 pub(crate) fn band_on_screen(ws: &crate::WindowState) -> bool {
+    // A handoff boot's window is hidden until its first real present
+    // (`pending_reveal`), and not yet occluded: nothing on it is seen
+    // (ATERM-KI-1015-2, U37).
+    let shown = ws.pending_reveal.is_none() && !ws.occluded;
     #[cfg(test)]
     {
         crate::work_counts::on_screen_asked();
         if ws.band_on_screen_for_test {
-            return !ws.occluded;
+            return shown;
         }
     }
     // macOS reports minimizing as occlusion, and asking AppKit on every loop
     // turn would buy nothing there.
-    let minimized = |w: &winit::window::Window| {
+    let minimized = |w: &aterm_window::window::Window| {
         cfg!(not(target_os = "macos")) && w.is_minimized() == Some(true)
     };
-    ws.os_window.as_deref().is_some_and(|w| !minimized(w)) && !ws.occluded
+    shown && ws.os_window.as_deref().is_some_and(|w| !minimized(w))
 }
 
 impl App {
@@ -3513,6 +3730,7 @@ impl App {
                         self.rows_owed.push(OwedRow {
                             key: kind.key().to_string(),
                             msg: update_words::health_warning(kind, &said.title, words),
+                            seen: false,
                         });
                     }
                 }
@@ -3590,11 +3808,13 @@ impl App {
 }
 
 /// A row said while no window's band was on screen ([`App::owe_unless_seen`]):
-/// the key it is owed by, and the words it is shown in once a band is.
+/// the key it is owed by, the words it is shown in once a band is, and whether
+/// a band on screen is showing it now ([`App::keep_owed_rows`]).
 #[derive(Clone, Debug)]
 pub(crate) struct OwedRow {
     key: String,
     msg: Message,
+    seen: bool,
 }
 
 /// What an update-health warning said ([`App::remember_update_health_said`]):
@@ -3661,65 +3881,6 @@ fn describes_the_old_process(key: &str) -> bool {
 #[cfg(all(test, unix))]
 #[path = "carried_health_conformance.rs"]
 pub(crate) mod carried_health_conformance;
-
-/// `NativeUpdateCarriedHealth`'s actions no shipping function here performs,
-/// each waived with where it is bound instead.
-#[cfg(test)]
-mod carried_health_waivers {
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_carried_health",
-        action = "LedgerHeals",
-        reason = "The environment: a check of this process's or a sibling's clears the shared \
-                  ledger's streak. The updater's half is aterm-update's persistent_notice_tests."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_carried_health",
-        action = "LedgerFails",
-        reason = "The environment: the shared ledger's check streak fails again."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_carried_health",
-        action = "CheckCompletes",
-        reason = "The environment: this process's checker thread completes a check, which the \
-                  watchdog reads off the heartbeat; the conformance moves the beat's count."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_carried_health",
-        action = "SeedRemembersOnly",
-        reason = "The Buggy=1 mutant: the seed before finding 206, a carried warning kept with \
-                  no healer; the negative control replays it on the real seed's remember-only \
-                  branch (a title naming no ledger class)."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_carried_health",
-        action = "SeedStallRemembersOnly",
-        reason = "The Buggy=1 mutant: a carried stall kept with the watchdog unarmed; \
-                  replayed on the real successor by the negative control."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_carried_health",
-        action = "RecoverHealsStall",
-        reason = "The Buggy=1 mutant: the ledger's healing read as `Checked`, which answers the \
-                  stall; replayed on the real successor by the negative control."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_carried_health",
-        action = "SeedForgetsEntry",
-        reason = "The Buggy=1 mutant: the parent's pending digest claim lost at the handoff; \
-                  replayed on the real successor by the negative control."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_carried_health",
-        action = "StallHealKeepsEntry",
-        reason = "The Buggy=1 mutant: the stall's heal before this change, its digest claim \
-                  left ripening; replayed on the real successor by the negative control."
-    )]
-    #[expect(
-        dead_code,
-        reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it"
-    )]
-    fn carried_health_waivers() {}
-}
 
 /// The band's motion on the host side — the idle law, hidden windows, the
 /// frame cadence, the per-frame cost, the still looks, the faces that must
@@ -3822,3 +3983,128 @@ impl HealthProof {
 #[cfg(test)]
 #[path = "messages_host_tests.rs"]
 pub(crate) mod tests;
+
+/// `NativeUpdateCarriedHealth`'s actions no shipping function here performs, each waived
+/// with where it is bound instead.
+#[cfg(any(test, debug_assertions))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_carried_health",
+    action = "LedgerHeals",
+    reason = "The environment: a check of this process's or a sibling's clears the shared \
+              ledger's streak. The updater's half is aterm-update's persistent_notice_tests."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_carried_health",
+    action = "LedgerFails",
+    reason = "The environment: the shared ledger's check streak fails again."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_carried_health",
+    action = "CheckCompletes",
+    reason = "The environment: this process's checker thread completes a check, which the \
+              watchdog reads off the heartbeat; the conformance moves the beat's count."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_carried_health",
+    action = "SeedRemembersOnly",
+    reason = "The Buggy=1 mutant: the seed before finding 206, a carried warning kept with \
+              no healer; the negative control replays it on the real seed's remember-only \
+              branch (a title naming no ledger class)."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_carried_health",
+    action = "SeedStallRemembersOnly",
+    reason = "The Buggy=1 mutant: a carried stall kept with the watchdog unarmed; \
+              replayed on the real successor by the negative control."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_carried_health",
+    action = "RecoverHealsStall",
+    reason = "The Buggy=1 mutant: the ledger's healing read as `Checked`, which answers the \
+              stall; replayed on the real successor by the negative control."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_carried_health",
+    action = "SeedForgetsEntry",
+    reason = "The Buggy=1 mutant: the parent's pending digest claim lost at the handoff; \
+              replayed on the real successor by the negative control."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_carried_health",
+    action = "StallHealKeepsEntry",
+    reason = "The Buggy=1 mutant: the stall's heal before this change, its digest claim \
+              left ripening; replayed on the real successor by the negative control."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn carried_health_scope_waivers() {}
+
+#[cfg(any(test, debug_assertions))]
+// The machine's other actions: the environment's steps, time, the frame and
+// the `Buggy` members. `BandRise`/`BandFall`/`BandTaken` carry `#[refines]`
+// anchors on `App::regrid_message_band`, `StripRise`/`StripUnwant`/`StripBack`
+// on `App::set_tab_strip_rows`, `StripFall` on `App::settle_strip_fall`.
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ChromeRegrowFloor",
+    action = "BandUnwant",
+    reason = "The band row's want drops (a dismissal, a hold's end): the center's state. \
+              Tier-1 dismisses a real row and settles the real host step."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ChromeRegrowFloor",
+    action = "BandBack",
+    reason = "A band row wanted again while its shrink waits: no re-grid (D1). The engine's \
+              `commit_rows` Equal arm; pinned by the center's own D1 tests."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ChromeRegrowFloor",
+    action = "BandQuiet",
+    reason = "Time: the band's own `SHRINK_QUIET` runs out. Tier-1 steps the clock past \
+              `MessageCenter::quiet_shrink_at`."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ChromeRegrowFloor",
+    action = "Tick",
+    reason = "Time: the floor's `CHROME_REGROW_SETTLE` runs out. Tier-1 steps the clock past \
+              the window's `RegrowFloor::floor`."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ChromeRegrowFloor",
+    action = "Cramp",
+    reason = "The window's frame loses its room (a drag, a zoom): the OS window's size, \
+              booked by `on_resize`. Tier-1 takes the stand-in's terminal rows to none and \
+              drives the take (`BandTaken`) inside the floor."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ChromeRegrowFloor",
+    action = "Uncramp",
+    reason = "The window's frame gets its room back: the OS window's size."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ChromeRegrowFloor",
+    action = "BandFallOwnQuiet",
+    reason = "`Buggy = 1` mutant: the band's quiet shrink before the floor. The Tier-1 \
+              negative control is admitted only as this."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ChromeRegrowFloor",
+    action = "StripFallAtOnce",
+    reason = "`Buggy = 1` mutant: the strip's fall at once, unfloored (the law before \
+              2026-10-19). The Tier-1 negative control is admitted only as this."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ChromeRegrowFloor",
+    action = "Restart",
+    reason = "`Buggy = 1` mutant: a floor re-anchored on a step that is no rise. No shipping \
+              code re-anchors: `RegrowFloor::rose` alone moves it, pinned by the engine's \
+              `chrome` tests."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn chrome_regrow_waivers() {}

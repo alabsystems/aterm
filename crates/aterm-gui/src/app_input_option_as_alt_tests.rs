@@ -91,8 +91,8 @@ fn the_sync_carries_each_change_to_the_window() {
 #[cfg(target_os = "macos")]
 #[test]
 fn an_option_chord_carries_the_layouts_character_only_while_option_is_an_alt() {
-    use winit::event::{ElementState, KeyEvent};
-    use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr};
+    use aterm_window::event::{ElementState, KeyEvent};
+    use aterm_window::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr};
 
     let press = |text: &str| {
         KeyEvent::synthetic_for_test_with_base(

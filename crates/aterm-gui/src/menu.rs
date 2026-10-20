@@ -10,7 +10,9 @@
 //!
 //! **No behavior duplication.** A menu item is a thin DISPATCH stub: it carries a
 //! VISUAL key-equivalent only (so the shortcut shows next to the item) and, when
-//! clicked, posts a [`Wake::MenuAction`](crate::Wake) carrying a [`MenuAction`].
+//! clicked, posts a [`Wake::MenuAction`](crate::Wake) carrying a [`MenuAction`],
+//! marked so the keys typed behind its key equivalent wait for its dispatch
+//! (`tab_spawn::post_native_menu_action`).
 //! The main loop's `user_event` turns that into a call on the SAME `App` command
 //! method the existing keybinding uses (see `App::dispatch_menu_action`). The
 //! real keypresses still flow through `App::on_key` exactly as before — the menu
@@ -26,7 +28,7 @@
 //!
 //! Everything imperative is `#[cfg(target_os = "macos")]`. On other targets the
 //! [`MenuAction`] enum and a no-op [`install`] still exist so the workspace builds
-//! everywhere and `Wake::MenuAction { action }` is a valid variant on every target.
+//! everywhere and `Wake::MenuAction { action, mark }` is a valid variant on every target.
 
 // macOS-only menu bar: off macOS `install` is a no-op stub, and the helpers
 // only the AppKit menu reads are gated to macOS (and the tests).
@@ -274,19 +276,6 @@ pub(crate) enum MenuAction {
     /// Open Session in New Window — show the active session in a SECOND window
     /// (same live grid in two windows; `App::open_active_session_in_new_window`).
     ViewSessionInNewWindow,
-    /// New Controlled Session in New Window (session connections, design §2.3):
-    /// spawn a session the FOCUSED session holds a `both` connection over, in a
-    /// fresh window; lineage `parent = focused` (`App::spawn_connected_session`).
-    NewControlledWindow,
-    /// New Controlled Session as Tab — the same mint, placed beside the focused
-    /// session in its window.
-    NewControlledTab,
-    /// New Controller Session in New Window — the INVERSE preset: the newborn
-    /// holds `both` over the focused session (a supervisor), its shell receives
-    /// `ATERM_OBSERVE_SESSION_ID=<focused sid>`; a lineage root.
-    NewControllerWindow,
-    /// New Controller Session as Tab — the controller preset placed as a tab.
-    NewControllerTab,
     /// Close Tab — close the focused pane; a tab's last pane closes the tab
     /// (`App::close_active_tab`). The row reads Close Pane on a split tab
     /// ([`close_row_title`]).
@@ -307,11 +296,11 @@ pub(crate) enum MenuAction {
     // View menu
     /// Toggle the window's full-screen state (winit `set_fullscreen`).
     ToggleFullScreen,
-    /// Increase font size (`set_font_px(font_px + step)`).
+    /// Increase font size (`set_font_size(font_size + step)`).
     FontIncrease,
-    /// Decrease font size (`set_font_px(font_px - step)`).
+    /// Decrease font size (`set_font_size(font_size - step)`).
     FontDecrease,
-    /// Actual Size — reset to the default font size (`set_font_px(default)`).
+    /// Actual Size — reset to the default font size (`set_font_size(default)`).
     FontActualSize,
     /// Split the focused pane left/right (`split_focused_pane(Vertical)`).
     SplitVertical,
@@ -353,16 +342,13 @@ pub(crate) enum MenuAction {
     /// Focus or create the process-singleton Settings tab. The app-menu Settings…
     /// item — ⌘, — uses the standard macOS settings chord.
     ToggleSettings,
-    /// View ▸ Presence Band — checkable. Checked (the default): the band row
-    /// under the tab bar follows its fold law; unchecked: the row is hidden
-    /// and the window's `chrome` reports an empty band. Persisted as
-    /// `[presence] band` in aterm.toml through the one serialized config lane
-    /// (`App::user_toggle_presence`).
-    TogglePresenceBand,
-    /// View ▸ Presence Rim — checkable. Unchecked hides the colour rim (the
-    /// band, when shown, still says the fact in words). Persisted as
-    /// `[presence] rim`.
-    TogglePresenceRim,
+    /// View ▸ Show Needs in Windows — checkable
+    /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4): the window's needs
+    /// border and its pill, on or off together. Persisted as `[presence] rim`
+    /// through the one serialized config lane
+    /// (`App::user_toggle_needs_in_windows`). It replaces Presence Band and
+    /// Presence Rim; `TogglePresenceRim` (the same key) is its alias.
+    ToggleNeedsInWindows,
     /// Open Settings AT the Packages route (the batteries-included toolchain
     /// surface: install/update the ALab toolset, posture, consent switches).
     /// The app-menu Packages… item beneath Settings… — the menu-bar path to the
@@ -407,57 +393,59 @@ pub(crate) enum MenuAction {
     /// Copy the right-clicked tab's shell-reported cwd (RAW, never
     /// `~`-abbreviated — a pasted path must be real) to the clipboard.
     CopyCwd,
-    /// Connect to Session… (session connections, design §2.3): open the
-    /// connection PICKER for the subject session (`session.connect_to`) —
-    /// its selection opens the shared confirm/configure card for
-    /// subject ⇄ chosen. Context-menu + palette; the tab-menu path carries
-    /// the clicked tab as the subject, the palette/invoke path the front one.
-    ConnectToSession,
-    /// Show Connection Map (design §5): raise the instance's aggregated
-    /// connection map — `App::open_connection_map` (app_connection_map.rs) on
-    /// the front window.
-    ShowConnectionMap,
-    /// Configure Connection… (`session.configure_connection`, design §2.3):
-    /// the §2.5 sheet directly when the subject has exactly ONE connected
-    /// peer, the picker when several, a refusal when none. Not a bar item;
-    /// palette + `invoke` reachable like the picker/map ids.
-    ConfigureConnection,
-    /// Disconnect Session… (`session.disconnect`, design §2.3): dissolve the
-    /// subject's connection — directly with one peer, via the picker when
-    /// ambiguous, NEVER by guessing. A Fabric-menu row since round 19.
-    DisconnectSession,
-    // Fabric menu (round 19, SPEC19 §9): the menu bar's face of the fabric —
-    // what `aterm fabric`, the inbox, the halt and the ledger already do on
-    // the wire, reachable by a human from the bar.
-    /// Inbox — THIS window's focused session's inbox, METADATA ONLY (the
-    /// `inbox --peek --meta` rows: id, offset, sender, kind, trust — never a
-    /// body), opened as a Markdown tab. Terminal-only: a native tab has no
-    /// inbox.
-    Inbox,
-    /// Ledger for This Session — the round-19 ledger key's action
-    /// (`App::open_session_ledger`: `aterm drive ledger @<sid> --format html`,
-    /// opened in the browser), with its ⇧⌘L accelerator shown on the row.
-    LedgerForSession,
-    /// Hold This Session — the Owner's LOCAL halt on the focused session
-    /// (`fabric::cmd_hold` with `HoldIssuer::Owner`, `origin=local`). Greyed
-    /// while any hold already stands; under a FLEET hold the row carries the
-    /// fleet's reason and says it cannot be lifted here.
-    HoldSession,
-    /// Lift Hold (This Session) — lift the LOCAL hold. Enabled only while a
-    /// local hold stands: a fleet hold is the bridge's to lift, so the row
-    /// greys with the fleet reason (design §11.2, the withdrawn "a human
-    /// lifts it at the GUI" — this is that lift, for the LOCAL origin only).
-    LiftHold,
-    /// Fabric Status — runs `aterm fabric` (the status screen: config,
-    /// broker, every instance's bridge, every inbox) as a child and opens its
-    /// text in a Markdown tab.
+    /// Overview… ⌃⌘O (`docs/DESIGN-owner-surfaces-2026-10-16.md` §6, was
+    /// Show Connection Map): every session of this aterm on one card — what
+    /// each needs, else what it is doing, its task, who drives it, and who
+    /// manages whom — `App::open_overview` (app_overview.rs) on the front
+    /// window. Its old names (`ShowConnectionMap`, `Fleet`, `ShowFleet`) are
+    /// aliases.
+    Overview,
+    // The Agents menu (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4, was the
+    // Fabric menu): what needs the person, everyone at a glance, stepping in.
+    /// Next That Needs You ⇧⌘J: go to the most pressing local need, stuck
+    /// before decide; pressed again, to the next (`App::next_need`, the cursor
+    /// keyed by need so a need that resolved drops out).
+    NextNeed,
+    /// Harness Log for This Tab ⇧⌘L (was Ledger for This Session): the ledger
+    /// key's action (`App::open_session_ledger`: `aterm drive ledger @<sid>
+    /// --format html`, opened in the browser). `LedgerForSession` and
+    /// `OpenLedger` are its aliases.
+    HarnessLog,
+    /// Take Over This Tab (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4):
+    /// the PERSON'S hold on the focused session (`fabric::person_hold`,
+    /// `origin=person`, `App::take_over`) — only the person types there until
+    /// they hand it back. Greyed while the person's hold already stands.
+    /// [`InvokeAuthority::PersonOnly`]: no socket fires it. Its old name,
+    /// `HoldSession`, is an alias.
+    TakeOver,
+    /// Hand Back This Tab: lift the person's hold, and only it
+    /// (`App::hand_back`). Enabled only while it stands.
+    /// [`InvokeAuthority::PersonOnly`]; its old name, `LiftHold`, is an alias.
+    HandBack,
+    /// Read This Mac: `aterm ctl survey` as a child, its text in a document
+    /// tab (`App::run_cli_to_tab`).
+    ReadThisMac,
+    /// Read the Fleet: `aterm ctl survey --fleet --timeout 3` into a
+    /// document tab. Live only in a fleet (`summarize::in_fleet`).
+    ReadFleet,
+    /// Summarize the Fleet in a New Tab (Summarize This Mac in a New Tab with
+    /// no fleet): one worker, raised, no role, `from=ctl`
+    /// (`App::summarize_in_new_tab`). Grey with the reason when no worker can
+    /// start here.
+    SummarizeFleet,
+    // Palette-only rows (`PALETTE_ONLY`): no bar item, a palette row and an
+    // `invoke` name each.
+    /// Message Bus: Status — `aterm fabric` (the bus's status screen) into a
+    /// document tab. A bus that is off is an Info record, never an error.
     FabricStatus,
-    /// Turn Fabric On… — the round-13 `aterm fabric on`, behind a
-    /// confirmation sheet. Owner only.
+    /// Message Bus: Turn On… — `aterm fabric on`, behind a confirmation
+    /// sheet. Owner only.
     FabricOn,
-    /// Turn Fabric Off… — `aterm fabric off`, behind a confirmation sheet.
-    /// Owner only.
+    /// Message Bus: Turn Off… — `aterm fabric off`, behind a confirmation
+    /// sheet. Owner only.
     FabricOff,
+    /// Fleet Machines — `aterm fleet peers` into a document tab.
+    FleetMachines,
     // Window menu
     /// Edit the FOCUSED PANE's session pin in place on the tab strip — the
     /// keyboard/menu twin of double-clicking a tab. Named "Rename SESSION", not
@@ -569,28 +557,25 @@ impl MenuAction {
             MenuAction::FavouriteKitty => 46,
             MenuAction::Packages => 47,
             MenuAction::RenameSession => 48,
-            MenuAction::NewControlledWindow => 49,
-            MenuAction::NewControlledTab => 50,
-            MenuAction::NewControllerWindow => 51,
-            MenuAction::NewControllerTab => 52,
-            MenuAction::ConnectToSession => 53,
-            MenuAction::ShowConnectionMap => 54,
-            MenuAction::ConfigureConnection => 55,
-            MenuAction::DisconnectSession => 56,
+            // 49-53, 55 and 56 were the connection presets and ids, retired
+            // 2026-10-16 (their invoke names answer `ERR retired`).
+            MenuAction::Overview => 54,
             MenuAction::NextKitty => 57,
             // Round 19 (SPEC19 §9): the Fabric menu, Set Role…, the presence
             // toggles. Dense from 59; the retired tags above stay retired.
             // 58 is retired (was Fleet).
-            MenuAction::Inbox => 59,
-            MenuAction::LedgerForSession => 60,
-            MenuAction::HoldSession => 61,
-            MenuAction::LiftHold => 62,
+            // 59 was Inbox, retired 2026-10-16. 60 is the ledger row, now
+            // Harness Log.
+            MenuAction::HarnessLog => 60,
+            MenuAction::TakeOver => 61,
+            MenuAction::HandBack => 62,
             MenuAction::FabricStatus => 63,
             MenuAction::FabricOn => 64,
             MenuAction::FabricOff => 65,
             MenuAction::SetRole => 66,
-            MenuAction::TogglePresenceBand => 67,
-            MenuAction::TogglePresenceRim => 68,
+            // 67 was Presence Band, retired 2026-10-16; 68 is the rim's key,
+            // now Show Needs in Windows.
+            MenuAction::ToggleNeedsInWindows => 68,
             // Phase 2 of the unified message system (2026-09-22).
             MenuAction::Messages => 69,
             // Round 18's identity rows (SPEC19 §9), 2026-09-25.
@@ -605,6 +590,12 @@ impl MenuAction {
             MenuAction::ChooseTheme => 75,
             // Settings ▸ Themes, the Theme Showcase (the theme overhaul).
             MenuAction::BrowseThemes => 76,
+            // The Agents menu (2026-10-16), after the per-session themes'.
+            MenuAction::NextNeed => 79,
+            MenuAction::ReadThisMac => 80,
+            MenuAction::ReadFleet => 81,
+            MenuAction::SummarizeFleet => 82,
+            MenuAction::FleetMachines => 83,
             // Per-session themes (palette-256-session).
             MenuAction::ChooseTabTheme => 77,
             MenuAction::ClearTabTheme => 78,
@@ -662,26 +653,20 @@ impl MenuAction {
             46 => MenuAction::FavouriteKitty,
             47 => MenuAction::Packages,
             48 => MenuAction::RenameSession,
-            49 => MenuAction::NewControlledWindow,
-            50 => MenuAction::NewControlledTab,
-            51 => MenuAction::NewControllerWindow,
-            52 => MenuAction::NewControllerTab,
-            53 => MenuAction::ConnectToSession,
-            54 => MenuAction::ShowConnectionMap,
-            55 => MenuAction::ConfigureConnection,
-            56 => MenuAction::DisconnectSession,
+            // 49-53, 55 and 56 retired (the connection presets and ids).
+            54 => MenuAction::Overview,
             57 => MenuAction::NextKitty,
             // 58 retired (was Fleet) — see `tag`.
-            59 => MenuAction::Inbox,
-            60 => MenuAction::LedgerForSession,
-            61 => MenuAction::HoldSession,
-            62 => MenuAction::LiftHold,
+            // 59 retired (was Inbox).
+            60 => MenuAction::HarnessLog,
+            61 => MenuAction::TakeOver,
+            62 => MenuAction::HandBack,
             63 => MenuAction::FabricStatus,
             64 => MenuAction::FabricOn,
             65 => MenuAction::FabricOff,
             66 => MenuAction::SetRole,
-            67 => MenuAction::TogglePresenceBand,
-            68 => MenuAction::TogglePresenceRim,
+            // 67 retired (was Presence Band).
+            68 => MenuAction::ToggleNeedsInWindows,
             69 => MenuAction::Messages,
             70 => MenuAction::ShowIdentity,
             71 => MenuAction::NewWindowWithIdentity,
@@ -692,6 +677,11 @@ impl MenuAction {
             76 => MenuAction::BrowseThemes,
             77 => MenuAction::ChooseTabTheme,
             78 => MenuAction::ClearTabTheme,
+            79 => MenuAction::NextNeed,
+            80 => MenuAction::ReadThisMac,
+            81 => MenuAction::ReadFleet,
+            82 => MenuAction::SummarizeFleet,
+            83 => MenuAction::FleetMachines,
             _ => return None,
         })
     }
@@ -701,24 +691,63 @@ impl MenuAction {
 /// this table: a wire name an agent may already call is NEVER broken — it is
 /// aliased. Round 19's menu rework (SPEC19 §9) renamed no variant, so every
 /// pre-round-19 name still resolves as itself (pinned by
-/// `every_pre_round_19_invoke_name_still_resolves`); the aliases here are the
+/// `every_earlier_invoke_name_resolves_or_is_retired`); the aliases here are the
 /// spellings a caller could reasonably have written for a row whose bar
 /// identity moved:
 ///
-/// * `OpenLedger` — the `[keybindings]` action name of the ledger key, for a
-///   script that reaches the Fabric menu's "Ledger for This Session" row by
-///   the name it already knows ([`MenuAction::LedgerForSession`]).
-/// * `Fleet` / `ShowFleet` — the Fabric menu's retired Fleet row, which opened
-///   the Connection Map ([`MenuAction::ShowConnectionMap`]).
-/// * `ShowInbox` — the `Show…` spelling every earlier map row used, for the
-///   Fabric menu's Inbox row.
+/// * `OpenLedger`, `LedgerForSession` — the ledger key's `[keybindings]`
+///   action name and the Fabric menu's "Ledger for This Session" row, both
+///   now Harness Log for This Tab ([`MenuAction::HarnessLog`]).
+/// * `ShowConnectionMap`, `Fleet` / `ShowFleet` — the Connection Map's row and
+///   the Fabric menu's retired Fleet row, both now the Overview
+///   ([`MenuAction::Overview`]).
+/// * `HoldSession` / `LiftHold` — the Fabric menu's halt pair, now Take Over
+///   and Hand Back on the person's slot (2026-10-16): the same row, the hold
+///   the person meant. [`InvokeAuthority::PersonOnly`], so both spellings
+///   answer `ERR denied` over the wire.
+/// * `TogglePresenceRim` — View ▸ Presence Rim, whose key (`[presence] rim`)
+///   Show Needs in Windows writes ([`MenuAction::ToggleNeedsInWindows`]).
+///
+/// A name whose row is gone with nothing in its place is not aliased: it is
+/// RETIRED ([`retired_invoke_name`]) and answers `ERR retired: <what to use>`.
 #[must_use]
 pub(crate) fn canonical_invoke_name(name: &str) -> &str {
     match name {
-        "OpenLedger" => "LedgerForSession",
-        "Fleet" | "ShowFleet" => "ShowConnectionMap",
-        "ShowInbox" => "Inbox",
+        "HoldSession" => "TakeOver",
+        "LiftHold" => "HandBack",
+        "OpenLedger" | "LedgerForSession" => "HarnessLog",
+        "ShowConnectionMap" | "Fleet" | "ShowFleet" => "Overview",
+        "TogglePresenceRim" => "ToggleNeedsInWindows",
         other => other,
+    }
+}
+
+/// What a RETIRED `invoke` name answers instead (`ERR retired: <this>`), or
+/// `None` for a name that is not retired. These rows went
+/// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4, §7) with nothing that does
+/// what they did, so the name is refused with the thing to use instead —
+/// never resolved to a different act, never an unknown-action error that
+/// says nothing.
+#[must_use]
+pub(crate) fn retired_invoke_name(name: &str) -> Option<&'static str> {
+    match name {
+        "Inbox" | "ShowInbox" => Some("use aterm ctl @<sid> inbox"),
+        "ConnectToSession"
+        | "ConfigureConnection"
+        | "DisconnectSession"
+        | "NewControlledWindow"
+        | "NewControlledTab"
+        | "NewControllerWindow"
+        | "NewControllerTab" => Some(
+            "every in-session client already holds Owner; start workers with spawn agent=claude",
+        ),
+        // The row went with S7 and the band itself with the needs border
+        // (S8): what replaces it has a switch of its own.
+        "TogglePresenceBand" => Some(
+            "the presence band is gone; the needs border and its pill replace it \
+             (ToggleNeedsInWindows)",
+        ),
+        _ => None,
     }
 }
 
@@ -739,29 +768,13 @@ pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
             // The pin is SESSION metadata; a native whole tab owns no session,
             // so the item greys rather than opening an editor over nothing.
             | MenuAction::RenameSession
-            // The connected-spawn presets take the FOCUSED session as their
-            // origin (the S of the §2.3 spawn rows) — a native whole tab has
-            // no session to connect, so they grey out there.
-            | MenuAction::NewControlledWindow
-            | MenuAction::NewControlledTab
-            | MenuAction::NewControllerWindow
-            | MenuAction::NewControllerTab
-            // The picker connects THIS session to a chosen peer — same
-            // origin-needs-a-session rule as the presets, which also covers
-            // the configure/disconnect ids (they act FROM the subject
-            // session). (The map is instance-wide and deliberately not
-            // listed.)
-            | MenuAction::ConnectToSession
-            | MenuAction::ConfigureConnection
-            | MenuAction::DisconnectSession
-            // The Fabric menu's SESSION rows (round 19): the inbox, the
-            // ledger and the halt are the focused session's; the role is its
-            // metadata, like the pin. The map and the three fabric
-            // commands are instance-wide and deliberately not listed.
-            | MenuAction::Inbox
-            | MenuAction::LedgerForSession
-            | MenuAction::HoldSession
-            | MenuAction::LiftHold
+            // The Agents menu's SESSION rows: the harness log and the person's
+            // hold are the focused session's; the role is its metadata, like
+            // the pin. Overview, the reads, Summarize and the bus commands
+            // are instance-wide and deliberately not listed.
+            | MenuAction::HarnessLog
+            | MenuAction::TakeOver
+            | MenuAction::HandBack
             | MenuAction::SetRole
             // The focused session's identity: no session under a native tab.
             // (The two identity SPAWNS need no focused session — a new window
@@ -776,118 +789,219 @@ pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
     )
 }
 
-/// The active-content bit read synchronously by AppKit's `validateMenuItem:`.
-/// `sync_active_session` publishes it at the same stabilization point used for
-/// title, toolbar, and control-handle changes, so opening the menu never exposes
-/// terminal-only actions as enabled over a native whole tab.
-static ACTIVE_TAB_IS_TERMINAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
-
-pub(crate) fn set_active_tab_is_terminal(terminal: bool) {
-    ACTIVE_TAB_IS_TERMINAL.store(terminal, std::sync::atomic::Ordering::Relaxed);
+/// A value the App publishes for AppKit's synchronous `validateMenuItem:`,
+/// which cannot reach the App; [`Published::published`] is its one access.
+/// A shipping build keeps ONE PER PROCESS, written and read on the main
+/// thread. A TEST BINARY keeps ONE PER THREAD (`menu_static!`): each test
+/// runs on a thread of its own and every test App publishes (each focus runs
+/// `sync_active_session`), so a value shared by the process would hand a test
+/// another test's bits between its write and its read. A test reads exactly
+/// what it, or the App it drives, published.
+trait Published<T: 'static> {
+    fn published<R>(&'static self, f: impl FnOnce(&T) -> R) -> R;
 }
 
-/// Whether the front window can actually PRESENT an inline rename editor. Off
-/// macOS the editor is drawn by the tab strip, so `tab_strip_rows = 0` leaves
-/// nowhere to put it — and an action that cannot run must not look available.
-/// Published exactly like [`set_active_tab_is_terminal`], from the same
-/// stabilization point, because AppKit validates menu commands synchronously
-/// when a menu opens.
-static RENAME_SURFACE_AVAILABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+#[cfg(not(test))]
+impl<T: 'static> Published<T> for T {
+    fn published<R>(&'static self, f: impl FnOnce(&T) -> R) -> R {
+        f(self)
+    }
+}
+
+#[cfg(test)]
+impl<T: 'static> Published<T> for std::thread::LocalKey<T> {
+    fn published<R>(&'static self, f: impl FnOnce(&T) -> R) -> R {
+        self.with(f)
+    }
+}
+
+/// Declare a [`Published`] value: a `static` in a shipping build, a
+/// `thread_local!` in a test binary.
+macro_rules! menu_static {
+    ($(#[$meta:meta])* static $name:ident: $ty:ty = $init:expr;) => {
+        $(#[$meta])*
+        #[cfg(not(test))]
+        static $name: $ty = $init;
+        #[cfg(test)]
+        thread_local! {
+            $(#[$meta])*
+            static $name: $ty = const { $init };
+        }
+    };
+}
+
+menu_static! {
+    /// The active-content bit read synchronously by AppKit's `validateMenuItem:`.
+    /// `sync_active_session` publishes it at the same stabilization point used for
+    /// title, toolbar, and control-handle changes, so opening the menu never exposes
+    /// terminal-only actions as enabled over a native whole tab.
+    static ACTIVE_TAB_IS_TERMINAL: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
+}
+
+pub(crate) fn set_active_tab_is_terminal(terminal: bool) {
+    ACTIVE_TAB_IS_TERMINAL
+        .published(|bit| bit.store(terminal, std::sync::atomic::Ordering::Relaxed));
+}
+
+menu_static! {
+    /// Whether the front window can actually PRESENT an inline rename editor. Off
+    /// macOS the editor is drawn by the tab strip, so `tab_strip_rows = 0` leaves
+    /// nowhere to put it — and an action that cannot run must not look available.
+    /// Published exactly like [`set_active_tab_is_terminal`], from the same
+    /// stabilization point, because AppKit validates menu commands synchronously
+    /// when a menu opens.
+    static RENAME_SURFACE_AVAILABLE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
+}
 
 pub(crate) fn set_rename_surface_available(available: bool) {
-    RENAME_SURFACE_AVAILABLE.store(available, std::sync::atomic::Ordering::Relaxed);
+    RENAME_SURFACE_AVAILABLE
+        .published(|bit| bit.store(available, std::sync::atomic::Ordering::Relaxed));
 }
 
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn rename_surface_available() -> bool {
-    RENAME_SURFACE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+    RENAME_SURFACE_AVAILABLE.published(|bit| bit.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// The standing hold on the FRONT window's focused session, as the native
-/// menu's synchronous `validateMenuItem:` needs it (the Packages doctrine —
-/// SPEC19 §9: "every item's enabled state comes from the live projection,
-/// never a stale index"). Published by [`set_front_hold`] from the same
-/// stabilization point as [`set_active_tab_is_terminal`] AND from every
-/// presence refresh of the front window, because a hold arrives on a fabric
-/// wake, not on a tab switch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FrontHold {
-    /// No hold stands: Hold This Session is live, Lift Hold is not.
-    None,
-    /// An `origin=local` hold stands: Lift Hold is live, Hold is not.
-    Local,
-    /// An `origin=fleet` hold stands: NEITHER is live — the bridge's to lift.
-    Fleet,
+menu_static! {
+    /// Whether Hand Back has a hold to lift on the FRONT window's focused
+    /// session — the PERSON'S (`origin=person`, Take Over), or an Owner
+    /// client's where no person's stands (`fabric::Holds::hand_back_origin`)
+    /// — as the native menu's synchronous `validateMenuItem:` needs it: Take
+    /// Over is live without it, Hand Back with it. Published by
+    /// `App::publish_front_hold` from the same stabilization point as
+    /// [`set_active_tab_is_terminal`] AND from every presence refresh of the
+    /// front window, because a hold arrives on a fabric wake, not on a tab
+    /// switch. A fleet hold moves neither row: it is not the window's to lift.
+    static FRONT_PERSON_HOLD: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 }
 
-static FRONT_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-/// The standing hold's reason (the pct-encoded token `status hold=` carries),
-/// beside the kind: the native bar's greyed halt pair says it when the hold
-/// is the fleet's (SPEC19 §9), as the palette's rows already did.
-static FRONT_HOLD_REASON: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// Publish whether Hand Back has a hold to lift on the front session.
+pub(crate) fn set_front_person_hold(held: bool) {
+    FRONT_PERSON_HOLD.published(|bit| bit.store(held, std::sync::atomic::Ordering::Relaxed));
+}
 
-/// Publish the front session's hold and its reason (`""` with no hold).
-pub(crate) fn set_front_hold(hold: FrontHold, reason: &str) {
-    let v = match hold {
-        FrontHold::None => 0,
-        FrontHold::Local => 1,
-        FrontHold::Fleet => 2,
+/// The published front person hold ([`set_front_person_hold`]).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn front_person_hold() -> bool {
+    FRONT_PERSON_HOLD.published(|bit| bit.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+menu_static! {
+    /// Whether the hold Hand Back would lift on the front session is ANOTHER
+    /// MAC'S (the step-in's `origin=remote`): Take Over is live beside Hand
+    /// Back then — the person wins. Published with [`FRONT_PERSON_HOLD`] by
+    /// `App::publish_front_hold`.
+    static FRONT_REMOTE_HOLD: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+}
+
+/// Publish whether another Mac holds the front session.
+pub(crate) fn set_front_remote_hold(held: bool) {
+    FRONT_REMOTE_HOLD.published(|bit| bit.store(held, std::sync::atomic::Ordering::Relaxed));
+}
+
+/// The published front remote hold ([`set_front_remote_hold`]).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn front_remote_hold() -> bool {
+    FRONT_REMOTE_HOLD.published(|bit| bit.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+menu_static! {
+    /// View ▸ Show Needs in Windows' LIVE state (`[presence] rim`, as the App
+    /// currently applies it), so `validateMenuItem:` can stamp the checkmark
+    /// synchronously when the menu opens. Published through
+    /// [`set_needs_in_windows`] by `App::adopt_presence_config` (load, reload),
+    /// `App::set_presence_bit` (every toggle) and `App::sync_active_session`.
+    static NEEDS_IN_WINDOWS: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
+}
+
+/// Publish View ▸ Show Needs in Windows' checkmark.
+pub(crate) fn set_needs_in_windows(on: bool) {
+    NEEDS_IN_WINDOWS.published(|bit| bit.store(on, std::sync::atomic::Ordering::Relaxed));
+}
+
+/// THE AGENTS MENU'S LIVE BITS, as `validateMenuItem:` needs them when the
+/// menu opens (it cannot reach the App): Next That Needs You is live while a
+/// local need stands, Overview while a window exists, Read the Fleet and
+/// Fleet Machines in a fleet, and Summarize while a worker can start here —
+/// its tool tip says why not, and its title names the fleet or this Mac.
+/// Published by `App::publish_menu_live` on the way to every wait. The
+/// default (every bit off) is the palette's pure-test state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AgentsLive {
+    /// A session of this aterm has a need ([`MenuAction::NextNeed`]).
+    pub needs_local: bool,
+    /// This Mac is in a fleet ([`MenuAction::ReadFleet`]).
+    pub in_fleet: bool,
+    /// A window exists ([`MenuAction::Overview`]).
+    pub any_window: bool,
+    /// Why Summarize cannot start a worker here, `None` when it can.
+    pub summarize_block: Option<String>,
+}
+
+impl AgentsLive {
+    /// Before the first publish: the rows that need no fact live, the rest
+    /// grey (a fleet, a need are facts).
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) const UNPUBLISHED: AgentsLive = AgentsLive {
+        needs_local: false,
+        in_fleet: false,
+        any_window: true,
+        summarize_block: None,
     };
-    {
-        let mut r = FRONT_HOLD_REASON.lock().unwrap_or_else(|p| p.into_inner());
-        r.clear();
-        if hold != FrontHold::None {
-            r.push_str(reason);
+}
+
+#[cfg(any(target_os = "macos", test))]
+menu_static! {
+    /// The Agents menu's live bits as last published: read by the native menu's
+    /// `validateMenuItem:` (macOS), written on the way to a wait
+    /// (`App::publish_agents_live`), so neither exists where no native menu does.
+    static AGENTS_LIVE: std::sync::Mutex<AgentsLive> =
+        std::sync::Mutex::new(AgentsLive::UNPUBLISHED);
+}
+
+/// Publish the Agents menu's live bits.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn set_agents_live(live: AgentsLive) {
+    AGENTS_LIVE.published(|slot| {
+        let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+        if *slot != live {
+            *slot = live;
         }
-    }
-    FRONT_HOLD.store(v, std::sync::atomic::Ordering::Relaxed);
+    });
 }
 
+/// The last published [`AgentsLive`].
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn front_hold() -> FrontHold {
-    match FRONT_HOLD.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => FrontHold::Local,
-        2 => FrontHold::Fleet,
-        _ => FrontHold::None,
+pub(crate) fn agents_live() -> AgentsLive {
+    AGENTS_LIVE.published(|slot| slot.lock().unwrap_or_else(|p| p.into_inner()).clone())
+}
+
+/// Summarize's title: the fleet's, or this Mac's with no fleet.
+pub(crate) const fn summarize_title(in_fleet: bool) -> &'static str {
+    if in_fleet {
+        "Summarize the Fleet in a New Tab"
+    } else {
+        "Summarize This Mac in a New Tab"
     }
 }
 
-/// The published hold's reason token (empty with no hold).
+/// The LIVE tool tip a native row carries at the moment the menu opens, where
+/// it says live state: Summarize's says why it cannot start. `None` keeps the
+/// row's help sentence.
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn front_hold_reason() -> String {
-    FRONT_HOLD_REASON
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone()
-}
-
-/// The tool tip a native row carries at the moment the menu opens — the LIVE
-/// projection, like its enabled bit: the row's help sentence, except the halt
-/// pair under a FLEET hold, which says the fleet's reason and that the hold
-/// cannot be lifted here. Stamped by `validateMenuItem:` on macOS.
-#[cfg(any(target_os = "macos", test))]
-pub(crate) fn native_item_tip(action: MenuAction) -> String {
-    if matches!(action, MenuAction::HoldSession | MenuAction::LiftHold)
-        && front_hold() == FrontHold::Fleet
-    {
-        return hold_row_reason(&front_hold_reason());
+pub(crate) fn native_item_tip(action: MenuAction) -> Option<String> {
+    match action {
+        MenuAction::SummarizeFleet => agents_live()
+            .summarize_block
+            .map(|why| format!("{} {why}", action.help())),
+        _ => None,
     }
-    action.help().to_string()
-}
-
-/// The two View ▸ Presence checkables' LIVE state (`[presence] band` / `rim`,
-/// as the App currently applies them), so `validateMenuItem:` can stamp the
-/// checkmark synchronously when the menu opens. Published through
-/// [`set_presence_toggles`] by `App::adopt_presence_config` (load, reload),
-/// `App::set_presence_bit` (every toggle) and `App::sync_active_session`.
-static PRESENCE_BAND_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-static PRESENCE_RIM_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-pub(crate) fn set_presence_toggles(band: bool, rim: bool) {
-    PRESENCE_BAND_ON.store(band, std::sync::atomic::Ordering::Relaxed);
-    PRESENCE_RIM_ON.store(rim, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The full-screen row's title: it names what the row does now. The palette
@@ -979,19 +1093,21 @@ impl MenuLive {
 }
 
 #[cfg(any(target_os = "macos", test))]
-static MENU_LIVE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(MenuLive::UNPUBLISHED.bits());
+menu_static! {
+    static MENU_LIVE: std::sync::atomic::AtomicU8 =
+        std::sync::atomic::AtomicU8::new(MenuLive::UNPUBLISHED.bits());
+}
 
 /// Publish the front window's [`MenuLive`].
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn set_menu_live(live: MenuLive) {
-    MENU_LIVE.store(live.bits(), std::sync::atomic::Ordering::Relaxed);
+    MENU_LIVE.published(|bits| bits.store(live.bits(), std::sync::atomic::Ordering::Relaxed));
 }
 
 /// The last published [`MenuLive`] ([`MenuLive::UNPUBLISHED`] before any).
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn menu_live() -> MenuLive {
-    MenuLive::from_bits(MENU_LIVE.load(std::sync::atomic::Ordering::Relaxed))
+    MenuLive::from_bits(MENU_LIVE.published(|bits| bits.load(std::sync::atomic::Ordering::Relaxed)))
 }
 
 /// The checkmark a checkable native row shows, or `None` for a plain command.
@@ -999,11 +1115,8 @@ pub(crate) fn menu_live() -> MenuLive {
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn native_menu_checked(action: MenuAction) -> Option<bool> {
     match action {
-        MenuAction::TogglePresenceBand => {
-            Some(PRESENCE_BAND_ON.load(std::sync::atomic::Ordering::Relaxed))
-        }
-        MenuAction::TogglePresenceRim => {
-            Some(PRESENCE_RIM_ON.load(std::sync::atomic::Ordering::Relaxed))
+        MenuAction::ToggleNeedsInWindows => {
+            Some(NEEDS_IN_WINDOWS.published(|bit| bit.load(std::sync::atomic::Ordering::Relaxed)))
         }
         MenuAction::ToggleSeriousMode => Some(menu_live().serious_mode),
         MenuAction::ToggleMatrixRain => Some(menu_live().rain_on),
@@ -1018,6 +1131,7 @@ pub(crate) fn native_menu_checked(action: MenuAction) -> Option<bool> {
 pub(crate) fn native_live_title(action: MenuAction) -> Option<&'static str> {
     match action {
         MenuAction::CloseTab => Some(close_row_title(menu_live().front_tab_split)),
+        MenuAction::SummarizeFleet => Some(summarize_title(agents_live().in_fleet)),
         _ => None,
     }
 }
@@ -1034,13 +1148,6 @@ pub(crate) fn native_row_title(tag: isize, stamped: String) -> String {
         .map_or(stamped, str::to_string)
 }
 
-/// The process-wide menu statics above (`ACTIVE_TAB_IS_TERMINAL`, `FRONT_HOLD`,
-/// the presence bits, `MENU_LIVE`) are shared by every test in the binary: a test that
-/// MUTATES one holds this lock so two of them cannot interleave (the App-side
-/// tests in `app_fabric_menu` publish through the same statics).
-#[cfg(test)]
-pub(crate) static MENU_STATICS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[cfg(any(target_os = "macos", test))]
 fn native_menu_action_enabled(action: MenuAction) -> bool {
     if matches!(action, MenuAction::RenameSession | MenuAction::SetRole)
@@ -1048,13 +1155,27 @@ fn native_menu_action_enabled(action: MenuAction) -> bool {
     {
         return false;
     }
-    // The halt pair reads the live hold projection: Hold only with nothing
-    // standing, Lift only against a LOCAL hold; a fleet hold greys both, and
-    // its reason rides the greyed row's tool tip, stamped at the same moment
-    // (`native_item_tip`, `hold_row_reason`).
+    // The person's hold pair reads the live projection: Take Over without
+    // it, Hand Back with it. The Agents rows read their own live bits.
     match action {
-        MenuAction::HoldSession if front_hold() != FrontHold::None => return false,
-        MenuAction::LiftHold if front_hold() != FrontHold::Local => return false,
+        MenuAction::TakeOver if front_person_hold() && !front_remote_hold() => return false,
+        MenuAction::HandBack if !front_person_hold() => return false,
+        MenuAction::NextNeed
+        | MenuAction::Overview
+        | MenuAction::ReadFleet
+        | MenuAction::FleetMachines
+        | MenuAction::SummarizeFleet => {
+            let agents = agents_live();
+            let live = match action {
+                MenuAction::NextNeed => agents.needs_local,
+                MenuAction::Overview => agents.any_window,
+                MenuAction::ReadFleet | MenuAction::FleetMachines => agents.in_fleet,
+                _ => agents.summarize_block.is_none(),
+            };
+            if !live {
+                return false;
+            }
+        }
         _ => {}
     }
     // The palette's own preconditions (`PaletteState::resolve`): a row whose
@@ -1074,25 +1195,21 @@ fn native_menu_action_enabled(action: MenuAction) -> bool {
     };
     precondition
         && (!requires_terminal_tab(action)
-            || ACTIVE_TAB_IS_TERMINAL.load(std::sync::atomic::Ordering::Relaxed))
+            || ACTIVE_TAB_IS_TERMINAL
+                .published(|bit| bit.load(std::sync::atomic::Ordering::Relaxed)))
 }
 
-/// The words a greyed halt row carries when a FLEET hold stands: the reason,
-/// and that it cannot be lifted here — the same sentence the presence band
-/// speaks (`held, <reason>, fleet, cannot be lifted here`). `reason` is the
-/// hold's pct-encoded token as `status hold=` carries it; a human reads the
-/// decoded words (`main broken`, not `main%20broken`) — through the band's
-/// own [`crate::presence::hold_reason_words`], which sanitizes what the
-/// decode lets out: the token is bridge-supplied, and a `%e2%80%ae` in it
-/// would otherwise reverse the row's text in the native tool tip, the
-/// palette row and the a11y description (round 19's second review).
-#[must_use]
-pub(crate) fn hold_row_reason(reason: &str) -> String {
-    format!(
-        "fleet hold: {}, cannot be lifted here",
-        crate::presence::hold_reason_words(reason)
-    )
-}
+/// Take Over's tool tip (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4): what
+/// the person's hold does, and what any hold costs the whole instance, in
+/// the one sentence the You hold section and `aterm ctl help hold` use too
+/// ([`aterm_types::control_verbs::HOLD_COST`]). Gated as [`MenuAction::help`],
+/// its one reader.
+#[cfg(any(unix, a11y_tree, test))]
+pub(crate) const TAKE_OVER_TIP: &str = concat!(
+    "Only you type here until you hand it back. aterm's harness, managers and scripts get ERR \
+     halted; the agent keeps running its turn. ",
+    aterm_types::hold_cost!()
+);
 
 /// The CONTROL-AUTHORITY a socket caller must hold to reach a [`MenuAction`] through the
 /// `invoke <action>` verb (and its `open <surface>` twins). The `invoke` verb's BASE op
@@ -1108,7 +1225,7 @@ pub(crate) enum InvokeAuthority {
     /// navigation state, runtime-only font zoom — nothing durable or exfiltrating).
     WriteInput,
     /// Rewrites durable `aterm.toml` on invoke or raises the durable-config surface
-    /// (`Preferences` opens Settings ▸ Manual;
+    /// (`Preferences` opens aterm.toml in the native editor;
     /// `ToggleSettings` raises Top Settings) — the `ConfigWrite` fine op.
     ConfigWrite,
     /// Moves the selection onto / reads it off the OS pasteboard — the same exfil/inject
@@ -1119,6 +1236,12 @@ pub(crate) enum InvokeAuthority {
     /// staged update (`SoftwareUpdate`/`ApplyUpdate`, the MenuAction twins of the
     /// already-Owner-only `update` verb). Only the per-instance god token may run these.
     OwnerOnly,
+    /// THE PERSON'S OWN: no socket scope fires it, the Owner token included —
+    /// every in-session client holds Owner, so [`Self::OwnerOnly`] would let
+    /// the held agent invoke its own Hand Back. Take Over and Hand Back
+    /// (`invoke TakeOver|HandBack`, and their aliases) answer `ERR denied`;
+    /// the window's menu, palette, tab menu, Overview and pill reach them.
+    PersonOnly,
 }
 
 impl MenuAction {
@@ -1131,7 +1254,7 @@ impl MenuAction {
         // before adapting to the legacy socket-op vocabulary below. The registry
         // carries the finer effect ceiling used by native reducers.
         let _ = crate::command_registry::menu_command(self);
-        use InvokeAuthority::{ClipboardWrite, ConfigWrite, OwnerOnly, WriteInput};
+        use InvokeAuthority::{ClipboardWrite, ConfigWrite, OwnerOnly, PersonOnly, WriteInput};
         match self {
             // Clipboard exfil/inject boundary — the `copy` verb's fine op. The
             // tab-context copies land here too: `CopySessionId`/`CopyCwd` move
@@ -1157,57 +1280,45 @@ impl MenuAction {
             MenuAction::OpenPalette | MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => {
                 OwnerOnly
             }
-            // The connected-spawn presets MINT standing session-connection
-            // authority over the focused session (design §5.3/§6) — the
-            // `invoke` twin of the `spawn connected=` OwnerOnly escalation
-            // fence: no fine op expresses "may create authority between
-            // sessions", so only the god token may fire them.
-            MenuAction::NewControlledWindow
-            | MenuAction::NewControlledTab
-            | MenuAction::NewControllerWindow
-            | MenuAction::NewControllerTab => OwnerOnly,
             // Round 18's identity rows: a spawn under an identity may CREATE it
             // (`spawn identity=` is Owner-only on the wire), and Show Identity
             // discloses the `identities` roster row (Owner-only too).
             MenuAction::NewWindowWithIdentity
             | MenuAction::NewTabWithIdentity
             | MenuAction::ShowIdentity => OwnerOnly,
-            // The connection PICKER can mint the same standing authority the
-            // presets do, the MAP is the instance-wide aggregated view (§5.3),
-            // and configure/disconnect REWRITE/DISSOLVE standing authority —
-            // all `invoke` twins of the `open connections` / `connect` /
-            // `disconnect` OwnerOnly class.
-            MenuAction::ConnectToSession
-            | MenuAction::ShowConnectionMap
-            | MenuAction::ConfigureConnection
-            | MenuAction::DisconnectSession => OwnerOnly,
-            // The Fabric menu (round 19). Inbox puts a session's mail METADATA on the
-            // human's screen — a disclosure of the same class as the map. The
-            // ledger runs a child on THIS instance's own socket and raises the
-            // browser. Hold/Lift are the `hold` verb, which is Owner-class on
-            // the wire (`Access::OwnerOnly`) — a child edge must not halt or
-            // lift. The three fabric commands run `aterm fabric` as a child:
-            // `on`/`off` rewrite the machine's fabric (the round-13 verb is
-            // Owner-only by its own doc), and `status` discloses the whole
-            // fabric. No fine op expresses any of these.
-            MenuAction::Inbox
-            | MenuAction::LedgerForSession
-            | MenuAction::HoldSession
-            | MenuAction::LiftHold
+            // The Agents menu. The Overview lists every session of the
+            // instance (the `open overview` OwnerOnly class). The harness log
+            // runs a child on THIS instance's own socket and raises the
+            // browser; Read This Mac / the Fleet and Fleet Machines run a
+            // child that discloses the whole Mac or fleet; Summarize starts a
+            // worker (`spawn agent=` is Owner-only on the wire). The three bus
+            // commands run `aterm fabric` as a child: `on`/`off` rewrite the
+            // machine's bus (the round-13 verb is Owner-only by its own doc),
+            // and `status` discloses all of it. No fine op expresses any of
+            // these.
+            MenuAction::Overview
+            | MenuAction::HarnessLog
+            | MenuAction::ReadThisMac
+            | MenuAction::ReadFleet
+            | MenuAction::SummarizeFleet
+            | MenuAction::FleetMachines
             | MenuAction::FabricStatus
             | MenuAction::FabricOn
             | MenuAction::FabricOff => OwnerOnly,
-            // The two presence checkables write `[presence]` in aterm.toml —
+            // The person's hold is the person's: a held agent holds Owner,
+            // so no scope may take a tab over or hand it back for them.
+            MenuAction::TakeOver | MenuAction::HandBack => PersonOnly,
+            // Show Needs in Windows writes `[presence] rim` in aterm.toml —
             // durable config, the `ConfigWrite` fine op, exactly as Serious
             // Mode is classified.
-            MenuAction::TogglePresenceBand | MenuAction::TogglePresenceRim => ConfigWrite,
+            MenuAction::ToggleNeedsInWindows => ConfigWrite,
             // The theme palette writes `theme` to aterm.toml on Enter, and a
             // caller that may open it may also press that Enter: the
             // `settings set theme` class, not the palette gateway's Owner-only
             // one (its rows reach no other action).
             MenuAction::ChooseTheme => ConfigWrite,
             // Benign runtime/view/window/tab state. Font zoom is runtime-only
-            // (`set_font_px` pins `font_px`; it does NOT persist to `aterm.toml`), so it
+            // (`set_font_size` changes the live size; it does NOT persist to `aterm.toml`), so it
             // stays `WriteInput`. `Quit` is a denial of service, not a capability escalation, so it
             // is left with the base gate rather than over-reaching to Owner-only.
             MenuAction::About
@@ -1250,6 +1361,9 @@ impl MenuAction {
             | MenuAction::RenameSession
             // Same editor, same eventual write (`meta set role`), same class.
             | MenuAction::SetRole
+            // Moves focus to the tab that needs the person: what `raise`
+            // does, and it writes nothing.
+            | MenuAction::NextNeed
             // The `reset` verb's twin, and the verb is `Write`: it moves the
             // front session's terminal modes, writes no input and nothing
             // durable.
@@ -1293,10 +1407,6 @@ impl MenuAction {
             | MenuAction::MoveTabToNewWindow
             | MenuAction::MoveTabToNextWindow
             | MenuAction::ViewSessionInNewWindow
-            | MenuAction::NewControlledWindow
-            | MenuAction::NewControlledTab
-            | MenuAction::NewControllerWindow
-            | MenuAction::NewControllerTab
             | MenuAction::CloseTab
             | MenuAction::Copy
             | MenuAction::SelectAll
@@ -1314,8 +1424,7 @@ impl MenuAction {
             | MenuAction::NextKitty
             | MenuAction::ToggleSeriousMode
             | MenuAction::ToggleSettings
-            | MenuAction::TogglePresenceBand
-            | MenuAction::TogglePresenceRim
+            | MenuAction::ToggleNeedsInWindows
             | MenuAction::Packages
             | MenuAction::HarnessSettings
             | MenuAction::Messages
@@ -1324,14 +1433,15 @@ impl MenuAction {
             | MenuAction::BrowseThemes
             | MenuAction::CopySessionId
             | MenuAction::CopyCwd
-            | MenuAction::ConnectToSession
-            | MenuAction::ShowConnectionMap
-            | MenuAction::ConfigureConnection
-            | MenuAction::DisconnectSession
-            | MenuAction::Inbox
-            | MenuAction::LedgerForSession
-            | MenuAction::HoldSession
-            | MenuAction::LiftHold
+            | MenuAction::Overview
+            | MenuAction::NextNeed
+            | MenuAction::HarnessLog
+            | MenuAction::TakeOver
+            | MenuAction::HandBack
+            | MenuAction::ReadThisMac
+            | MenuAction::ReadFleet
+            | MenuAction::SummarizeFleet
+            | MenuAction::FleetMachines
             | MenuAction::FabricStatus
             | MenuAction::FabricOn
             | MenuAction::FabricOff
@@ -1371,6 +1481,7 @@ impl MenuAction {
                  Update."
             }
             MenuAction::Preferences => "Open aterm.toml in the assisted config editor.",
+            MenuAction::Quit if cfg!(windows) => "Close every aterm window and exit.",
             MenuAction::Quit => "Quit aterm.",
             MenuAction::NewWindow => "Open a new window of this aterm.",
             MenuAction::NewTab => "Open a new terminal tab in this window.",
@@ -1385,16 +1496,6 @@ impl MenuAction {
             MenuAction::MoveTabToNextWindow => "Move this tab into the next window.",
             MenuAction::ViewSessionInNewWindow => {
                 "Show this session in a second window, the same live grid in both."
-            }
-            MenuAction::NewControlledWindow => {
-                "Open a new window this session can read and type into."
-            }
-            MenuAction::NewControlledTab => "Open a new tab this session can read and type into.",
-            MenuAction::NewControllerWindow => {
-                "Open a new window that can read and type into this session."
-            }
-            MenuAction::NewControllerTab => {
-                "Open a new tab that can read and type into this session."
             }
             MenuAction::CloseTab => "Close the focused pane; a tab's last pane closes the tab.",
             MenuAction::Copy => "Copy the selection.",
@@ -1434,30 +1535,41 @@ impl MenuAction {
                 "Copy this session's id, which scripts and other sessions use to reach it."
             }
             MenuAction::CopyCwd => "Copy this session's working directory.",
-            MenuAction::ConnectToSession => {
-                "Choose a session to connect this one to, then confirm the direction."
+            MenuAction::Overview => {
+                "Show every session in this aterm: what it needs, what it is doing, its task, \
+                 who drives it, and who manages whom."
             }
-            MenuAction::ShowConnectionMap => {
-                "Show every session in this aterm and its connections."
+            MenuAction::NextNeed => {
+                "Go to the tab that needs you most; again, to the next one that needs you."
             }
-            MenuAction::ConfigureConnection => "Change the direction of this session's connection.",
-            MenuAction::DisconnectSession => "Dissolve this session's connection.",
-            MenuAction::Inbox => {
-                "Open this session's inbox as a tab: who wrote, what kind, how trusted; \
-                 never the text of a message."
+            MenuAction::HarnessLog => {
+                "Write what the harness did in this tab, and what was typed, and open it in the \
+                 browser."
             }
-            MenuAction::LedgerForSession => {
-                "Write this session's ledger and open it in the browser."
+            MenuAction::TakeOver => TAKE_OVER_TIP,
+            MenuAction::HandBack => {
+                "Hand this tab back: your hold lifts; any other hold on it stays."
             }
-            MenuAction::HoldSession => {
-                "Halt every driver of this session (a local hold); its shell keeps running."
+            MenuAction::ReadThisMac => {
+                "Read every session on this Mac (aterm ctl survey) in a tab; no model runs."
             }
-            MenuAction::LiftHold => "Lift this session's local hold.",
-            MenuAction::FabricStatus => "Show the fabric's status as a tab.",
-            MenuAction::FabricOn => "Turn the fabric on for this machine, after you confirm.",
-            MenuAction::FabricOff => "Turn the fabric off for this machine, after you confirm.",
+            MenuAction::ReadFleet => {
+                "Read every Mac in the fleet (aterm ctl survey --fleet) in a tab; no model runs."
+            }
+            MenuAction::SummarizeFleet => {
+                "Start one agent in a new tab that reads the survey once and writes what needs \
+                 you, what everyone is doing and what finished."
+            }
+            MenuAction::FabricStatus => "Show the message bus's status as a tab.",
+            MenuAction::FabricOn => "Turn the message bus on for this machine, after you confirm.",
+            MenuAction::FabricOff => {
+                "Turn the message bus off for this machine, after you confirm."
+            }
+            MenuAction::FleetMachines => "List the fleet's machines (aterm fleet peers) in a tab.",
             MenuAction::RenameSession => "Name this session; the tab shows the name.",
-            MenuAction::SetRole => "Give this session a role; the presence band shows it first.",
+            MenuAction::SetRole => {
+                "Give this session a role; its tab and every list of needs use it."
+            }
             MenuAction::ShowIdentity => {
                 "Open this session's agent identity as a tab: its name, directory and agents."
             }
@@ -1477,14 +1589,13 @@ impl MenuAction {
             }
             MenuAction::ClearTabTheme => "Draw this tab in the window's theme again.",
             MenuAction::Minimize => "Minimise this window.",
+            MenuAction::Zoom if cfg!(windows) => "Maximize this window, or restore it.",
             MenuAction::Zoom => "Zoom this window.",
             MenuAction::NextTab => "Show the next tab.",
             MenuAction::PrevTab => "Show the previous tab.",
-            MenuAction::TogglePresenceBand => {
-                "Show or hide the presence band under the tab bar; saved in aterm.toml."
-            }
-            MenuAction::TogglePresenceRim => {
-                "Show or hide the presence rim around the window; saved in aterm.toml."
+            MenuAction::ToggleNeedsInWindows => {
+                "Show or hide the border and the titlebar pill that say a window's tab needs \
+                 you; saved in aterm.toml."
             }
             MenuAction::Help => "Open the aterm guide.",
         }
@@ -1533,10 +1644,6 @@ impl MenuAction {
             "MoveTabToNewWindow" => Some(MenuAction::MoveTabToNewWindow),
             "MoveTabToNextWindow" => Some(MenuAction::MoveTabToNextWindow),
             "ViewSessionInNewWindow" => Some(MenuAction::ViewSessionInNewWindow),
-            "NewControlledWindow" => Some(MenuAction::NewControlledWindow),
-            "NewControlledTab" => Some(MenuAction::NewControlledTab),
-            "NewControllerWindow" => Some(MenuAction::NewControllerWindow),
-            "NewControllerTab" => Some(MenuAction::NewControllerTab),
             "CloseTab" => Some(MenuAction::CloseTab),
             "Copy" => Some(MenuAction::Copy),
             "Paste" => Some(MenuAction::Paste),
@@ -1569,14 +1676,15 @@ impl MenuAction {
             "Help" => Some(MenuAction::Help),
             "CopySessionId" => Some(MenuAction::CopySessionId),
             "CopyCwd" => Some(MenuAction::CopyCwd),
-            "ConnectToSession" => Some(MenuAction::ConnectToSession),
-            "ShowConnectionMap" => Some(MenuAction::ShowConnectionMap),
-            "ConfigureConnection" => Some(MenuAction::ConfigureConnection),
-            "DisconnectSession" => Some(MenuAction::DisconnectSession),
-            "Inbox" => Some(MenuAction::Inbox),
-            "LedgerForSession" => Some(MenuAction::LedgerForSession),
-            "HoldSession" => Some(MenuAction::HoldSession),
-            "LiftHold" => Some(MenuAction::LiftHold),
+            "Overview" => Some(MenuAction::Overview),
+            "NextNeed" => Some(MenuAction::NextNeed),
+            "HarnessLog" => Some(MenuAction::HarnessLog),
+            "ReadThisMac" => Some(MenuAction::ReadThisMac),
+            "ReadFleet" => Some(MenuAction::ReadFleet),
+            "SummarizeFleet" => Some(MenuAction::SummarizeFleet),
+            "FleetMachines" => Some(MenuAction::FleetMachines),
+            "TakeOver" => Some(MenuAction::TakeOver),
+            "HandBack" => Some(MenuAction::HandBack),
             "FabricStatus" => Some(MenuAction::FabricStatus),
             "FabricOn" => Some(MenuAction::FabricOn),
             "FabricOff" => Some(MenuAction::FabricOff),
@@ -1584,8 +1692,7 @@ impl MenuAction {
             "ShowIdentity" => Some(MenuAction::ShowIdentity),
             "NewWindowWithIdentity" => Some(MenuAction::NewWindowWithIdentity),
             "NewTabWithIdentity" => Some(MenuAction::NewTabWithIdentity),
-            "TogglePresenceBand" => Some(MenuAction::TogglePresenceBand),
-            "TogglePresenceRim" => Some(MenuAction::TogglePresenceRim),
+            "ToggleNeedsInWindows" => Some(MenuAction::ToggleNeedsInWindows),
             "ResetTerminal" => Some(MenuAction::ResetTerminal),
             "ChooseTabTheme" => Some(MenuAction::ChooseTabTheme),
             "ClearTabTheme" => Some(MenuAction::ClearTabTheme),
@@ -1622,49 +1729,26 @@ pub(crate) enum MenuEntry {
         key: &'static str,
         mods: MenuMods,
     },
-    /// A nested menu (round 19: File ▸ Driving). Its `entries` are the same
-    /// vocabulary — items and separators — one level down; the serialiser
-    /// prints the row as `<label> ▸` in its parent's line and then the
-    /// submenu on a line of its own (`menu "File ▸ Driving": …`), the
-    /// palette flattens its items under `label`, and the macOS builder
-    /// attaches it as a real `NSMenu`. One level deep on purpose: the chrome
-    /// grammar and the palette chip both read better flat.
-    Submenu {
-        label: &'static str,
-        entries: &'static [MenuEntry],
-    },
 }
 
 impl MenuEntry {
-    /// Walk this entry's ITEMS — its own, or a submenu's, in order — the one
-    /// flattening every consumer shares (the completeness proof, the palette,
-    /// the accelerator hints), so a submenu can never hide a command from one
-    /// of them.
+    /// This entry's ITEM, if it is one — the one walk every consumer shares
+    /// (the completeness proof, the palette, the accelerator hints). (File ▸
+    /// Driving, the one submenu the bar had, went with the connection presets,
+    /// 2026-10-16; the bar is flat.)
     pub(crate) fn items(
         &self,
     ) -> impl Iterator<Item = (&'static str, MenuAction, &'static str, MenuMods)> {
-        let own = match self {
+        match self {
             MenuEntry::Item {
                 label,
                 action,
                 key,
                 mods,
             } => Some((*label, *action, *key, *mods)),
-            MenuEntry::Separator | MenuEntry::Submenu { .. } => None,
-        };
-        let nested: &'static [MenuEntry] = match self {
-            MenuEntry::Submenu { entries, .. } => entries,
-            _ => &[],
-        };
-        own.into_iter().chain(nested.iter().filter_map(|e| match e {
-            MenuEntry::Item {
-                label,
-                action,
-                key,
-                mods,
-            } => Some((*label, *action, *key, *mods)),
-            MenuEntry::Separator | MenuEntry::Submenu { .. } => None,
-        }))
+            MenuEntry::Separator => None,
+        }
+        .into_iter()
     }
 }
 
@@ -1688,8 +1772,8 @@ const APP_MENU: &[MenuEntry] = &[
     Separator,
     // The ONE update entry point: opens the Software Update route and checks in one gesture.
     // Live only where the in-app updater exists (`MenuAction::offered_on_this_platform`):
-    // elsewhere the palette's resolve pass disables this row (`palette::PaletteState::resolve`)
-    // rather than letting it silently no-op, and the `chrome` menu lines leave it out.
+    // elsewhere the palette leaves the row out (`palette::PaletteState::new`) rather than
+    // listing a row that can never act, and the `chrome` menu lines leave it out too.
     Item {
         label: "Check for Updates…",
         action: MenuAction::SoftwareUpdate,
@@ -1729,12 +1813,33 @@ const APP_MENU: &[MenuEntry] = &[
     },
     Separator,
     Item {
-        label: "Quit aterm",
+        label: QUIT_LABEL,
         action: MenuAction::Quit,
         key: "q",
         mods: MenuMods::Command,
     },
 ];
+
+/// The quit row's words: Windows names the verb Exit (every Windows app's File ▸
+/// Exit); macOS and Linux keep Quit aterm.
+const QUIT_LABEL: &str = if cfg!(windows) { "Exit" } else { "Quit aterm" };
+
+/// Window ▸ Zoom's words in the model, before [`zoom_title`] reads the window's
+/// state. On Windows "Zoom" reads as the font zoom beside Increase Font Size; the
+/// verb there is Maximize (and Restore Down on a maximized window).
+const ZOOM_LABEL: &str = zoom_title(false);
+
+/// Window ▸ Zoom's title for a window that is (or is not) `maximized`: the
+/// caption button's own tooltip on Windows, the green button's Zoom elsewhere.
+pub(crate) const fn zoom_title(maximized: bool) -> &'static str {
+    if !cfg!(windows) {
+        "Zoom"
+    } else if maximized {
+        "Restore Down"
+    } else {
+        "Maximize"
+    }
+}
 
 const FILE_MENU: &[MenuEntry] = &[
     Item {
@@ -1763,15 +1868,6 @@ const FILE_MENU: &[MenuEntry] = &[
         action: MenuAction::NewTabWithIdentity,
         key: "",
         mods: MenuMods::None,
-    },
-    Separator,
-    // DRIVING (round 19): the session-connection spawn presets (design §2.3)
-    // — the pre-fabric driving model's four rows, moved under one submenu
-    // UNCHANGED: same labels, same actions, still no key equivalents
-    // (deliberate, authority-minting acts).
-    MenuEntry::Submenu {
-        label: "Driving",
-        entries: DRIVING_MENU,
     },
     Separator,
     Item {
@@ -1826,114 +1922,89 @@ const FILE_MENU: &[MenuEntry] = &[
     },
 ];
 
-/// File ▸ Driving — the four connected-spawn presets, exactly the rows the
-/// File menu carried flat before round 19.
-const DRIVING_MENU: &[MenuEntry] = &[
+/// The AGENTS menu (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4, was the
+/// Fabric menu): what needs the person, everyone at a glance, stepping in,
+/// and reading the Mac or the fleet. Placed between View and Window, where an
+/// application's own menus go on macOS. Live greying comes from
+/// `validateMenuItem:`'s statics ([`AgentsLive`], [`front_person_hold`]); the
+/// keystrokes are the menu's own key equivalents (`MENU_CMD_CHORDS`), and
+/// ⇧⌘L is `App::on_key`'s (`BUILTIN_CMD_CHORDS`).
+const AGENTS_MENU: &[MenuEntry] = &[
     Item {
-        label: "New Controlled Session in New Window",
-        action: MenuAction::NewControlledWindow,
+        label: "Next That Needs You",
+        action: MenuAction::NextNeed,
+        key: "j",
+        mods: MenuMods::CommandShift,
+    },
+    Item {
+        label: "Overview…",
+        action: MenuAction::Overview,
+        key: "o",
+        mods: MenuMods::CommandControl,
+    },
+    Separator,
+    Item {
+        label: "Take Over This Tab",
+        action: MenuAction::TakeOver,
         key: "",
         mods: MenuMods::None,
     },
     Item {
-        label: "New Controlled Session as Tab",
-        action: MenuAction::NewControlledTab,
+        label: "Hand Back This Tab",
+        action: MenuAction::HandBack,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Separator,
+    Item {
+        label: "Harness Log for This Tab",
+        action: MenuAction::HarnessLog,
+        key: "l",
+        mods: MenuMods::CommandShift,
+    },
+    Item {
+        label: "Set Role…",
+        action: MenuAction::SetRole,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Separator,
+    Item {
+        label: "Read This Mac",
+        action: MenuAction::ReadThisMac,
         key: "",
         mods: MenuMods::None,
     },
     Item {
-        label: "New Controller Session in New Window",
-        action: MenuAction::NewControllerWindow,
+        label: "Read the Fleet",
+        action: MenuAction::ReadFleet,
         key: "",
         mods: MenuMods::None,
     },
     Item {
-        label: "New Controller Session as Tab",
-        action: MenuAction::NewControllerTab,
+        label: summarize_title(true),
+        action: MenuAction::SummarizeFleet,
         key: "",
         mods: MenuMods::None,
     },
 ];
 
-/// The FABRIC menu (round 19, SPEC19 §9) — the bar's face of the fabric,
-/// replacing the palette-only "Connections" section: this session's inbox and ledger, the halt pair, the four connection rows
-/// (unchanged), and the three `aterm fabric` commands. Placed between View
-/// and Window, where an application's own menus go on macOS.
-const FABRIC_MENU: &[MenuEntry] = &[
-    Item {
-        label: "Inbox",
-        action: MenuAction::Inbox,
-        key: "",
-        mods: MenuMods::None,
-    },
-    // The ledger key's accelerator, shown: ⇧⌘L is the chord `on_key` handles
-    // (`cmd+shift+l` in BUILTIN_CMD_CHORDS); as with every ⌘ equivalent here
-    // the keystroke itself is `App::on_key`'s. Off macOS the palette shows
-    // the effective `open_ledger` chord instead (`menu_binding`).
-    Item {
-        label: "Ledger for This Session",
-        action: MenuAction::LedgerForSession,
-        key: "l",
-        mods: MenuMods::CommandShift,
-    },
-    Separator,
-    Item {
-        label: "Hold This Session",
-        action: MenuAction::HoldSession,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Item {
-        label: "Lift Hold (This Session)",
-        action: MenuAction::LiftHold,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Separator,
-    Item {
-        label: "Connect to Session…",
-        action: MenuAction::ConnectToSession,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Item {
-        label: "Configure Connection…",
-        action: MenuAction::ConfigureConnection,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Item {
-        label: "Disconnect Session…",
-        action: MenuAction::DisconnectSession,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Item {
-        label: "Show Connection Map",
-        action: MenuAction::ShowConnectionMap,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Separator,
-    Item {
-        label: "Fabric Status",
-        action: MenuAction::FabricStatus,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Item {
-        label: "Turn Fabric On…",
-        action: MenuAction::FabricOn,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Item {
-        label: "Turn Fabric Off…",
-        action: MenuAction::FabricOff,
-        key: "",
-        mods: MenuMods::None,
-    },
+/// The PALETTE-ONLY rows (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4):
+/// commands with no bar item, listed in the palette under [`PALETTE_ONLY_SECTION`]
+/// and reachable by `invoke`. The message bus's administration lives here and
+/// on the CLI (`aterm fabric`), never in a menu: a bus that is off (the
+/// default) is mentioned nowhere else.
+pub(crate) const PALETTE_ONLY: &[(&str, MenuAction)] = &[
+    ("Message Bus: Status", MenuAction::FabricStatus),
+    ("Message Bus: Turn On…", MenuAction::FabricOn),
+    ("Message Bus: Turn Off…", MenuAction::FabricOff),
+    ("Show Identity", MenuAction::ShowIdentity),
+    ("Fleet Machines", MenuAction::FleetMachines),
 ];
+
+/// The palette section the [`PALETTE_ONLY`] rows sit in: the menu whose
+/// matter they are.
+pub(crate) const PALETTE_ONLY_SECTION: &str = "Agents";
 
 const EDIT_MENU: &[MenuEntry] = &[
     Item {
@@ -2025,17 +2096,11 @@ const VIEW_MENU: &[MenuEntry] = &[
         mods: MenuMods::CommandControl,
     },
     Separator,
-    // The presence surfaces (round 19): both checkable, both on by default,
-    // both persisted under `[presence]`.
+    // The needs border and its pill (design §4, replacing Presence Band and
+    // Presence Rim): checkable, on by default, persisted as `[presence] rim`.
     Item {
-        label: "Presence Band",
-        action: MenuAction::TogglePresenceBand,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Item {
-        label: "Presence Rim",
-        action: MenuAction::TogglePresenceRim,
+        label: "Show Needs in Windows",
+        action: MenuAction::ToggleNeedsInWindows,
         key: "",
         mods: MenuMods::None,
     },
@@ -2121,7 +2186,7 @@ const WINDOW_MENU: &[MenuEntry] = &[
         mods: MenuMods::Command,
     },
     Item {
-        label: "Zoom",
+        label: ZOOM_LABEL,
         action: MenuAction::Zoom,
         key: "",
         mods: MenuMods::None,
@@ -2146,19 +2211,6 @@ const WINDOW_MENU: &[MenuEntry] = &[
     Item {
         label: "Rename Session…",
         action: MenuAction::RenameSession,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Item {
-        label: "Set Role…",
-        action: MenuAction::SetRole,
-        key: "",
-        mods: MenuMods::None,
-    },
-    // Round 18's read-only identity row, directly under Set Role….
-    Item {
-        label: "Show Identity",
-        action: MenuAction::ShowIdentity,
         key: "",
         mods: MenuMods::None,
     },
@@ -2208,9 +2260,9 @@ const VERSION_MENU: &[MenuEntry] = &[
 /// version label) must use plain `↑` instead — the own-rendered text stack has no
 /// color-emoji face (verified coverage).
 ///
-/// The text between the glyphs is [`version_signature`]'s FULL rung, the same
-/// string Windows' tab strip shows ([`strip_version_label`]): one signature, two
-/// surfaces, and the bar alone adds the colour glyphs AppKit can draw.
+/// The text between the glyphs is [`version_signature`]'s FULL rung; Windows' tab
+/// strip shows its quiet form ([`strip_version_label`]), and the bar alone adds
+/// the colour glyphs AppKit can draw.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn version_menu_bar_title(attention: bool) -> String {
@@ -2315,18 +2367,42 @@ pub(crate) fn version_signature(facts: VersionFacts<'_>, rung: VersionRung) -> O
 }
 
 /// The text of Windows' tab-strip VERSION LABEL (`tab_bar::TabHit::Version`): this
-/// build's [`version_signature`] at `rung`, plus ` ↑` (a space and U+2191) while
-/// `attention` holds — the macOS bar title's text without its colour glyphs, because
-/// the own-rendered strip has no colour-emoji face. `attention` is the bar's own
-/// staged-only rule ([`staged_for_version_menu`]), so a realized update never lights
-/// it. `None` for a release's short rung.
+/// build's [`strip_version_text`] at `rung`, plus ` ↑` (a space and U+2191) while
+/// `attention` holds — plain, because the own-rendered strip has no colour-emoji
+/// face. `attention` is the bar's own staged-only rule ([`staged_for_version_menu`]),
+/// so a realized update never lights it. `None` for a release's short rung.
 #[must_use]
 pub(crate) fn strip_version_label(rung: VersionRung, attention: bool) -> Option<String> {
-    let signature = version_signature(VersionFacts::this_build(), rung)?;
+    let text = strip_version_text(VersionFacts::this_build(), rung)?;
     Some(if attention {
-        format!("{signature} \u{2191}")
+        format!("{text} \u{2191}")
     } else {
-        signature
+        text
+    })
+}
+
+/// The strip label's QUIET form of the version: `v<maj.min>.<dev commits>` on a
+/// dev build (`v0.106.3605`) and `v<maj.min>` on its short rung; a release's
+/// `v<version>` and no short rung, as [`version_signature`].
+///
+/// The owner asked for the version at a glance on Windows (2026-10-01), and the
+/// strip used to carry the whole dev signature, `v0.106.3605+g8b6f0a8* · DEV`:
+/// 22 columns of the band, permanently, and on Windows every build reads `· DEV`
+/// (no Windows build goes through the release cutter), so the mark told nothing.
+/// The commit and a dirty tree's mark stay one click away: the label opens
+/// Settings ▸ About ([`version_slot_click`]), which names the whole build.
+#[must_use]
+pub(crate) fn strip_version_text(facts: VersionFacts<'_>, rung: VersionRung) -> Option<String> {
+    if facts.release {
+        return version_signature(facts, rung);
+    }
+    let majmin = facts
+        .version
+        .rsplit_once('.')
+        .map_or(facts.version, |(mm, _)| mm);
+    Some(match rung {
+        VersionRung::Full => format!("v{majmin}.{}", facts.dev_commits),
+        VersionRung::Short => format!("v{majmin}"),
     })
 }
 
@@ -2486,13 +2562,13 @@ pub(crate) fn handoff_target_bar_title(
 /// `NSMenu`s from item-for-item (`macos::build_section`), so the model IS the menu:
 /// what `chrome` prints off macOS and what the live bar reads back agree by
 /// construction, not by a second hand-kept list. Order is the standard Mac arrangement
-/// (App / File / Edit / View / <the app's own: Fabric> / Window / Help), the App section
+/// (App / File / Edit / View / <the app's own: Agents> / Window / Help), the App section
 /// titled with the app name by convention; the Version menu is the one section the
 /// builder composes dynamically ([`macos::build_version_menu`], the documented
 /// divergence — its rows depend on the update state).
 ///
 /// A `#[test]` asserts every [`MenuAction`] appears here exactly once (the tab-context
-/// copies excepted), submenus included.
+/// copies and the [`PALETTE_ONLY`] rows excepted), submenus included.
 pub(crate) const MENU_MODEL: &[MenuSection] = &[
     MenuSection {
         title: "aterm",
@@ -2511,8 +2587,8 @@ pub(crate) const MENU_MODEL: &[MenuSection] = &[
         entries: VIEW_MENU,
     },
     MenuSection {
-        title: "Fabric",
-        entries: FABRIC_MENU,
+        title: "Agents",
+        entries: AGENTS_MENU,
     },
     MenuSection {
         title: "Window",
@@ -2536,11 +2612,9 @@ pub(crate) const MENU_MODEL: &[MenuSection] = &[
 /// `app_introspect::read_native_chrome`, so the cross-platform (off-macOS) `chrome`
 /// reports the SAME logical menu the macOS bar shows.
 ///
-/// A SUBMENU (round 19, File ▸ Driving) prints twice, by the same rule both readers
-/// follow: in its parent's line as `<label> ▸` (so the parent line stays one
-/// comma-separated list of rows a human sees), and then on the very next line as its
-/// own section titled `"<parent> ▸ <label>"` with its rows. One level deep, which is
-/// all the model allows.
+/// One line per section: the model holds no submenu since File ▸ Driving went with the
+/// connection presets (2026-10-16). (The macOS live reader still prints a submenu AppKit
+/// adds on its own as `<label> ▸` in its parent's line, then that submenu's own line.)
 ///
 /// The Version menu's first row is DYNAMIC, as on the macOS bar and in the palette:
 /// `apply_row` is its live label ([`crate::palette::apply_row_label`] — the staged
@@ -2562,8 +2636,7 @@ pub(crate) fn menu_chrome_lines(apply_row: Option<&str>, front_tab_split: bool) 
     out
 }
 
-/// One section's line(s): the section itself, then each submenu's own line, in the
-/// order the submenus appear. Shared with nothing on macOS (the live reader walks the
+/// One section's line. Shared with nothing on macOS (the live reader walks the
 /// `NSMenu`), but the SHAPE it prints is the contract that reader byte-matches.
 #[cfg(any(not(target_os = "macos"), test))]
 fn chrome_lines_for(
@@ -2573,7 +2646,6 @@ fn chrome_lines_for(
     front_tab_split: bool,
 ) -> Vec<String> {
     let mut labels: Vec<String> = Vec::new();
-    let mut nested: Vec<String> = Vec::new();
     for e in entries {
         match e {
             // A row this platform cannot act on is not reported as offered:
@@ -2592,31 +2664,17 @@ fn chrome_lines_for(
             } => labels.push(close_row_title(front_tab_split).to_string()),
             MenuEntry::Item { label, .. } => labels.push((*label).to_string()),
             MenuEntry::Separator => {}
-            MenuEntry::Submenu {
-                label,
-                entries: sub,
-            } => {
-                labels.push(format!("{label} \u{25b8}"));
-                let sub_title = format!("{title} \u{25b8} {label}");
-                nested.extend(chrome_lines_for(
-                    &sub_title,
-                    sub,
-                    apply_row,
-                    front_tab_split,
-                ));
-            }
         }
     }
-    let mut out = vec![format!("menu {title:?}: {}", labels.join(", "))];
-    out.append(&mut nested);
-    out
+    vec![format!("menu {title:?}: {}", labels.join(", "))]
 }
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
     MenuHandle, choose_local_file, choose_local_image, confirm, confirm_owner,
     defer_quit_for_terminate, install, notify, open_file_in_workspace, open_help_url,
-    order_front_regardless, show_handoff_target_version, update_version_menu,
+    order_front_regardless, reveal_file_in_workspace, show_handoff_target_version,
+    update_version_menu,
 };
 
 /// Whether this process was launched `--headless`, published ONCE by
@@ -2643,9 +2701,10 @@ pub(crate) fn mark_process_headless() {
 }
 
 /// Whether this process is headless, for a presenter that refuses quietly: the
-/// Linux desktop-notification delivery (`notify::deliver`), whose refusal would
-/// otherwise print one stderr line per program notification.
-#[cfg(target_os = "linux")]
+/// desktop-notification delivery (`notify::deliver`), whose refusal would
+/// otherwise print one stderr line per program notification, and the macOS
+/// notice center (`notice_center`), which a headless process never opens.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(crate) fn process_is_headless() -> bool {
     PROCESS_HEADLESS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -2672,6 +2731,13 @@ pub(crate) fn open_file_in_workspace(_path: &std::path::Path) -> bool {
     false
 }
 
+/// Off macOS there is no Finder to select a file in: `false`, and the Manual
+/// page names the file's path instead.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn reveal_file_in_workspace(_path: &std::path::Path) -> bool {
+    false
+}
+
 /// Non-macOS no-op handle: there is no platform menu off macOS. Held by `App` in
 /// the same field on every target so the struct shape is platform-independent.
 #[cfg(not(target_os = "macos"))]
@@ -2682,7 +2748,7 @@ pub(crate) type MenuHandle = ();
 /// site (`self._menu = menu::install(..)`) is identical on every target.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn install(
-    _proxy: &winit::event_loop::EventLoopProxy<crate::Wake>,
+    _proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>,
 ) -> Option<MenuHandle> {
     None
 }
@@ -3021,7 +3087,7 @@ mod macos {
     // monitor, so W13 ported the whole modal-alert subsystem in one move:
     // `alert_keys.rs`, this function, and the sheet. There is no seam left to
     // import, which is why this block names only first-party crates.
-    use winit::event_loop::EventLoopProxy;
+    use aterm_window::event_loop::EventLoopProxy;
 
     use crate::appkit::consts::{
         NS_ALERT_FIRST_BUTTON_RETURN, NS_ALERT_SECOND_BUTTON_RETURN,
@@ -3093,7 +3159,7 @@ mod macos {
                 if let Some(action) = MenuAction::from_tag(tag) {
                     // Fire-and-forget: a closed loop (app shutting down) just
                     // drops the event — mirrors every other `send_event` here.
-                    let _ = self.ivars().send_event(Wake::MenuAction { action });
+                    let _ = crate::tab_spawn::post_native_menu_action(self.ivars(), action);
                 }
             }
 
@@ -3117,7 +3183,7 @@ mod macos {
                 let Some(action) = MenuAction::from_tag(tag) else {
                     return aterm_objc::Bool::NO;
                 };
-                // A CHECKABLE row (View ▸ Presence Band / Rim, Serious Mode,
+                // A CHECKABLE row (View ▸ Show Needs in Windows, Serious Mode,
                 // Matrix Rain, Favourite This Kitty) shows the live
                 // state as its checkmark, stamped here because AppKit asks at
                 // exactly the moment the menu opens — the same live-projection
@@ -3133,15 +3199,21 @@ mod macos {
                 if matches!(action, MenuAction::ToggleFullScreen) {
                     stamp_full_screen_title(sender);
                 }
-                // So does ⌘W's: Close Pane on a split tab, Close Tab otherwise.
+                // So does ⌘W's: Close Pane on a split tab, Close Tab otherwise
+                // (and Summarize names the fleet or this Mac).
                 if let Some(title) = super::native_live_title(action) {
                     set_item_title(sender, title);
                 }
-                // The halt pair's tool tip is live too: under a FLEET hold the
-                // greyed row says the fleet's reason and that it cannot be
-                // lifted here (SPEC19 §9), and it returns to the row's help
-                // when the hold lifts.
-                stamp_native_tip(sender, action);
+                // Summarize's tool tip says why it cannot start, when it cannot.
+                if matches!(action, MenuAction::SummarizeFleet) {
+                    let tip = super::native_item_tip(action)
+                        .unwrap_or_else(|| action.help().to_string());
+                    if let Some(tip) = appkit::nsstring(&tip) {
+                        // SAFETY: `-setToolTip:` is `-(void)(NSString *)` on the
+                        // live NSMenuItem AppKit passed; it COPIES its argument.
+                        unsafe { appkit::send_v_id(sender, sel!(setToolTip:), tip.id()) };
+                    }
+                }
                 aterm_objc::Bool::new(super::native_menu_action_enabled(action))
             }
         }
@@ -3179,21 +3251,6 @@ mod macos {
             // SAFETY: `-setTitle:` is `-(void)(NSString *)` on the live
             // NSMenuItem the caller holds; it COPIES its argument.
             unsafe { appkit::send_v_id(item, sel!(setTitle:), title.id()) };
-        }
-    }
-
-    /// Stamp the halt pair's LIVE tool tip on `item` (`native_item_tip`):
-    /// called by `validateMenuItem:` at the moment the menu opens, so the
-    /// greyed row explains itself. Every other row keeps the help sentence
-    /// `add_item_mods` set once.
-    fn stamp_native_tip(item: Id, action: MenuAction) {
-        if !matches!(action, MenuAction::HoldSession | MenuAction::LiftHold) {
-            return;
-        }
-        if let Some(tip) = appkit::nsstring(&super::native_item_tip(action)) {
-            // SAFETY: `-setToolTip:` is `-(void)(NSString *)` on the live
-            // NSMenuItem the caller holds; it COPIES its argument.
-            unsafe { appkit::send_v_id(item, sel!(setToolTip:), tip.id()) };
         }
     }
 
@@ -3409,8 +3466,7 @@ mod macos {
     /// Build one menu from the model's entries: every [`MenuEntry::Item`] as an
     /// item wired to `menuAction:` with the model's key equivalent and modifier
     /// mask and the action's [`MenuAction::help`] as its tool tip, every
-    /// separator as a separator, and every [`MenuEntry::Submenu`] as a real
-    /// nested `NSMenu` (one level, as the model allows). The ONE builder for
+    /// separator as a separator. The ONE builder for
     /// every static section since round 19 — so the live bar the `chrome`
     /// verb reads back on macOS and the model `menu_chrome_lines` prints off
     /// it are the same tree by construction.
@@ -3425,14 +3481,6 @@ mod macos {
                     mods,
                 } => add_item_mods(&menu, target, label, *action, key, mods_mask(*mods)),
                 super::MenuEntry::Separator => add_separator(&menu),
-                super::MenuEntry::Submenu {
-                    label,
-                    entries: sub,
-                } => {
-                    if let Some(sub) = build_section(target, sub) {
-                        let _ = attach_submenu(&menu, label, sub);
-                    }
-                }
             }
         }
         Some(menu)
@@ -3981,6 +4029,40 @@ mod macos {
         path.to_str().is_some_and(|s| open_in_workspace(s, true))
     }
 
+    /// Show the LOCAL FILE `path` aterm itself names — Settings ▸ Manual's
+    /// aterm.toml — selected in a Finder window: `NSWorkspace
+    /// selectFile:inFileViewerRootedAtPath:` with an empty root (Finder's own
+    /// viewer). Its answer is Finder's: `false` when the file could not be
+    /// selected (a missing file), so "Showed" is said only of what was shown.
+    /// Main thread only; `false` when refused.
+    pub(crate) fn reveal_file_in_workspace(path: &std::path::Path) -> bool {
+        let Some(s) = path.to_str() else {
+            return false;
+        };
+        if super::os_ui_refused(&format!("revealing {s}")) || MainThread::new().is_none() {
+            return false;
+        }
+        let (Some(file), Some(root)) = (appkit::nsstring(s), appkit::nsstring("")) else {
+            return false;
+        };
+        // SAFETY: `+sharedWorkspace` is the `-(id)` singleton;
+        // `-selectFile:inFileViewerRootedAtPath:` is `-(BOOL)(NSString *,
+        // NSString *)`, and its answer is handed straight back. The two
+        // strings live inside this pool.
+        autoreleasepool(|_| unsafe {
+            let ws = appkit::send_id(class(c"NSWorkspace").as_id(), sel!(sharedWorkspace));
+            if ws.is_null() {
+                return false;
+            }
+            appkit::send_bool_id_id(
+                ws,
+                sel!(selectFile:inFileViewerRootedAtPath:),
+                file.id(),
+                root.id(),
+            )
+        })
+    }
+
     /// How long after the first open the same URL is issued again. The anchor
     /// after `?` is not Apple-documented and is not always honoured on the
     /// first open (design Appendix A.2); a second issue about a second later is
@@ -4263,11 +4345,30 @@ mod tests {
         }
     }
 
-    /// Every `invoke` name that resolved BEFORE round 19's menu rework, verbatim
-    /// — the names an agent's script may already carry. SPEC19 §9: "add
-    /// aliases, never break a name an agent may already call". Pinned by
-    /// `every_pre_round_19_invoke_name_still_resolves`.
-    const PRE_ROUND_19_INVOKE_NAMES: &[&str] = &[
+    /// The palette-only actions (`PALETTE_ONLY`): no bar item, a palette row
+    /// and an `invoke` name each.
+    fn palette_only_actions() -> Vec<MenuAction> {
+        super::PALETTE_ONLY.iter().map(|(_, a)| *a).collect()
+    }
+
+    /// Every action the bar, the palette and the tab menu offer: the model's
+    /// items, the palette-only rows and the tab menu's own copy rows.
+    fn offered_actions() -> Vec<MenuAction> {
+        model_items()
+            .into_iter()
+            .map(|(_, action, _, _)| action)
+            .chain(palette_only_actions())
+            .chain([MenuAction::CopySessionId, MenuAction::CopyCwd])
+            .collect()
+    }
+
+    /// Every `invoke` name an agent's script may already carry, verbatim:
+    /// the names that resolved before round 19's menu rework, and the round's
+    /// own and the Agents menu's predecessors. Each still resolves (to the
+    /// action it named, or the alias its row became) or answers `ERR retired:
+    /// <what to use>` — never an unknown action. Pinned by
+    /// `every_earlier_invoke_name_resolves_or_is_retired`.
+    const EARLIER_INVOKE_NAMES: &[&str] = &[
         "About",
         "SoftwareUpdate",
         "Version",
@@ -4319,6 +4420,22 @@ mod tests {
         "ShowConnectionMap",
         "ConfigureConnection",
         "DisconnectSession",
+        // Round 19's Fabric menu and View checkables.
+        "Inbox",
+        "ShowInbox",
+        "LedgerForSession",
+        "OpenLedger",
+        "HoldSession",
+        "LiftHold",
+        "Fleet",
+        "ShowFleet",
+        "FabricStatus",
+        "FabricOn",
+        "FabricOff",
+        "SetRole",
+        "ShowIdentity",
+        "TogglePresenceBand",
+        "TogglePresenceRim",
     ];
 
     /// Every item of the model, submenus flattened.
@@ -4334,9 +4451,7 @@ mod tests {
     /// names round-trip (so `invoke CopySessionId` is fenceable + dispatchable),
     /// each classifies at its honest boundary (the copies move text onto the
     /// pasteboard), and they must NOT leak into `MENU_MODEL` (the bar mirror
-    /// stays exactly the bar). The connection ids, once in this list, are bar
-    /// rows of the Fabric menu since round 19 and keep their OwnerOnly class
-    /// there (`the_fabric_menu_is_owner_only_and_its_session_rows_need_a_session`).
+    /// stays exactly the bar).
     #[test]
     fn tab_context_actions_round_trip_and_stay_out_of_the_bar() {
         for a in [MenuAction::CopySessionId, MenuAction::CopyCwd] {
@@ -4354,177 +4469,261 @@ mod tests {
         }
     }
 
-    /// ROUND 19 (SPEC19 §9): every pre-rework `invoke` name still resolves —
-    /// to the same action it always named — and the three aliases the rework
-    /// added resolve to the rows whose bar identity moved. A renamed variant
-    /// would fail the first loop; a dropped alias the second.
+    /// EVERY EARLIER `invoke` NAME RESOLVES OR IS RETIRED (SPEC19 §9: "add
+    /// aliases, never break a name an agent may already call"; design §4: a
+    /// row that went with nothing in its place answers `ERR retired: <what to
+    /// use>`). A name resolves to the action its canonical spelling names, or
+    /// it is retired with a replacement, and no name is both. The aliases the
+    /// Agents menu added land on the rows whose identity moved.
     #[test]
-    fn every_pre_round_19_invoke_name_still_resolves() {
-        for name in PRE_ROUND_19_INVOKE_NAMES {
-            let action = MenuAction::from_invoke_name(name)
-                .unwrap_or_else(|| panic!("{name} resolved before round 19 and must still"));
-            let canonical = super::canonical_invoke_name(name);
-            assert_eq!(
-                format!("{action:?}"),
-                canonical,
-                "{name} must name the action it always named"
-            );
+    fn every_earlier_invoke_name_resolves_or_is_retired() {
+        for name in EARLIER_INVOKE_NAMES {
+            match (
+                MenuAction::from_invoke_name(name),
+                super::retired_invoke_name(name),
+            ) {
+                (Some(action), None) => assert_eq!(
+                    format!("{action:?}"),
+                    super::canonical_invoke_name(name),
+                    "{name} names the action its canonical spelling does"
+                ),
+                (None, Some(instead)) => assert!(!instead.is_empty(), "{name}"),
+                other => panic!("{name}: resolves or is retired, never both or neither: {other:?}"),
+            }
         }
-        assert_eq!(
-            MenuAction::from_invoke_name("OpenLedger"),
-            Some(MenuAction::LedgerForSession)
-        );
-        assert_eq!(
-            MenuAction::from_invoke_name("ShowFleet"),
-            Some(MenuAction::ShowConnectionMap)
-        );
-        assert_eq!(
-            MenuAction::from_invoke_name("Fleet"),
-            Some(MenuAction::ShowConnectionMap)
-        );
-        assert_eq!(
-            MenuAction::from_invoke_name("ShowInbox"),
-            Some(MenuAction::Inbox)
-        );
-    }
-
-    /// THE FABRIC MENU (SPEC19 §9): every row is Owner-only on the `invoke`
-    /// fence, no exception; the session rows need a focused session, the
-    /// instance rows never grey.
-    #[test]
-    fn the_fabric_menu_is_owner_only_and_its_session_rows_need_a_session() {
-        let fabric = MENU_MODEL
-            .iter()
-            .find(|s| s.title == "Fabric")
-            .expect("a Fabric menu");
-        let rows: Vec<MenuAction> = fabric
-            .entries
-            .iter()
-            .flat_map(MenuEntry::items)
-            .map(|(_, action, _, _)| action)
-            .collect();
-        assert!(rows.len() >= 11, "{rows:?}");
-        for action in &rows {
-            assert_eq!(
-                action.invoke_authority(),
-                super::InvokeAuthority::OwnerOnly,
-                "{action:?}: the fabric is the owner's"
-            );
-        }
-        for a in [
-            MenuAction::Inbox,
-            MenuAction::LedgerForSession,
-            MenuAction::HoldSession,
-            MenuAction::LiftHold,
-            MenuAction::ConnectToSession,
-            MenuAction::ConfigureConnection,
-            MenuAction::DisconnectSession,
+        for (old, new) in [
+            ("HoldSession", MenuAction::TakeOver),
+            ("LiftHold", MenuAction::HandBack),
+            ("LedgerForSession", MenuAction::HarnessLog),
+            ("OpenLedger", MenuAction::HarnessLog),
+            ("ShowConnectionMap", MenuAction::Overview),
+            ("Fleet", MenuAction::Overview),
+            ("ShowFleet", MenuAction::Overview),
+            ("TogglePresenceRim", MenuAction::ToggleNeedsInWindows),
         ] {
-            assert!(super::requires_terminal_tab(a), "{a:?} is the session's");
+            assert_eq!(MenuAction::from_invoke_name(old), Some(new), "{old}");
         }
-        for a in [
-            MenuAction::ShowConnectionMap,
-            MenuAction::FabricStatus,
-            MenuAction::FabricOn,
-            MenuAction::FabricOff,
+        for retired in [
+            "Inbox",
+            "ShowInbox",
+            "ConnectToSession",
+            "ConfigureConnection",
+            "DisconnectSession",
+            "NewControlledWindow",
+            "NewControlledTab",
+            "NewControllerWindow",
+            "NewControllerTab",
+            "TogglePresenceBand",
         ] {
-            assert!(!super::requires_terminal_tab(a), "{a:?} is instance-wide");
-        }
-    }
-
-    /// THE HALT PAIR reads the live hold projection (the Packages doctrine):
-    /// nothing standing ⇒ Hold live, Lift not; a LOCAL hold ⇒ Lift live, Hold
-    /// not; a FLEET hold ⇒ neither (the bridge's to lift), and the greyed row's
-    /// words carry the fleet's reason.
-    #[test]
-    fn hold_and_lift_follow_the_front_hold_projection() {
-        let _statics = super::MENU_STATICS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        set_active_tab_is_terminal(true);
-        super::set_front_hold(super::FrontHold::None, "");
-        assert!(native_menu_action_enabled(MenuAction::HoldSession));
-        assert!(!native_menu_action_enabled(MenuAction::LiftHold));
-        assert_eq!(
-            super::native_item_tip(MenuAction::HoldSession),
-            MenuAction::HoldSession.help()
-        );
-        super::set_front_hold(super::FrontHold::Local, "pause");
-        assert!(!native_menu_action_enabled(MenuAction::HoldSession));
-        assert!(native_menu_action_enabled(MenuAction::LiftHold));
-        assert_eq!(super::front_hold_reason(), "pause");
-        assert_eq!(
-            super::native_item_tip(MenuAction::LiftHold),
-            MenuAction::LiftHold.help(),
-            "a local hold's rows say their help: the pair is not greyed"
-        );
-        super::set_front_hold(super::FrontHold::Fleet, "main%20broken");
-        assert!(!native_menu_action_enabled(MenuAction::HoldSession));
-        assert!(!native_menu_action_enabled(MenuAction::LiftHold));
-        assert_eq!(
-            super::hold_row_reason("main%20broken"),
-            "fleet hold: main broken, cannot be lifted here"
-        );
-        // The decode is not the step that lets a bridge-supplied byte
-        // through: a bidi override, a newline and an escape in the token are
-        // stripped before the words reach the native tool tip, the palette
-        // row or the a11y description (round 19's second review).
-        let s = super::hold_row_reason("main%e2%80%aebroken%0a%1b[31m");
-        assert!(!s.contains('\u{202e}'), "bidi override leaks: {s:?}");
-        assert!(!s.contains('\n'), "newline leaks: {s:?}");
-        assert!(!s.contains('\u{1b}'), "escape leaks: {s:?}");
-        assert_eq!(s, "fleet hold: mainbroken [31m, cannot be lifted here");
-        for a in [MenuAction::HoldSession, MenuAction::LiftHold] {
-            assert_eq!(
-                super::native_item_tip(a),
-                "fleet hold: main broken, cannot be lifted here",
-                "{a:?}: the greyed row says why"
+            let refusal = crate::control::control_media::invoke_refusal(retired)
+                .unwrap_or_else(|| panic!("{retired} is refused before the hop"));
+            assert!(refusal.starts_with("ERR retired: "), "{retired}: {refusal}");
+            assert!(
+                crate::palette::PaletteState::new()
+                    .action_by_name(retired)
+                    .is_err_and(|e| e.starts_with("retired: ")),
+                "{retired}: the palette's lookup says so too"
             );
         }
-        super::set_front_hold(super::FrontHold::None, "");
-        assert_eq!(super::front_hold_reason(), "");
-        // No session at all: the pair greys with every other session row.
-        set_active_tab_is_terminal(false);
-        assert!(!native_menu_action_enabled(MenuAction::HoldSession));
-        assert!(!native_menu_action_enabled(MenuAction::Inbox));
-        assert!(native_menu_action_enabled(MenuAction::ShowConnectionMap));
-        set_active_tab_is_terminal(true);
-    }
-
-    /// The two View ▸ Presence rows are CHECKABLE and read their checkmark
-    /// from the published live state; every other row is a plain command.
-    #[test]
-    fn the_presence_rows_are_checkable_from_the_live_state() {
-        let _statics = super::MENU_STATICS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        super::set_presence_toggles(true, false);
+        // CONTROL: a live name is neither refused nor retired.
         assert_eq!(
-            super::native_menu_checked(MenuAction::TogglePresenceBand),
-            Some(true)
-        );
-        assert_eq!(
-            super::native_menu_checked(MenuAction::TogglePresenceRim),
-            Some(false)
-        );
-        assert_eq!(
-            super::native_menu_checked(MenuAction::ShowConnectionMap),
+            crate::control::control_media::invoke_refusal("NewTab"),
             None
         );
-        super::set_presence_toggles(true, true);
-        assert_eq!(
-            MenuAction::TogglePresenceBand.invoke_authority(),
-            super::InvokeAuthority::ConfigWrite,
-            "the toggles write aterm.toml"
-        );
-        let view = MENU_MODEL.iter().find(|s| s.title == "View").unwrap();
-        let labels: Vec<&str> = view
+    }
+
+    /// THE AGENTS MENU (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4) sits
+    /// where an app's own menu goes, between View and Window, and holds its
+    /// rows in the design's order with their chords (⇧⌘J, ⌃⌘O, ⇧⌘L). Its
+    /// classification: Take Over and Hand Back are the person's own; Next
+    /// That Needs You and Set Role… are `WriteInput` (they move focus or open
+    /// an editor); every other row sees the whole Mac or fleet and is
+    /// Owner-only. The session rows need a focused session; the rest never
+    /// grey for want of one.
+    #[test]
+    fn the_agents_menu_holds_its_rows_in_order_with_their_classes() {
+        use super::{InvokeAuthority, MenuMods};
+        let titles: Vec<&str> = MENU_MODEL.iter().map(|s| s.title).collect();
+        let agents_at = titles
+            .iter()
+            .position(|t| *t == "Agents")
+            .expect("an Agents menu");
+        assert_eq!(titles[agents_at - 1], "View");
+        assert_eq!(titles[agents_at + 1], "Window");
+        assert!(!titles.contains(&"Fabric"), "the Fabric menu is gone");
+        let agents = &MENU_MODEL[agents_at];
+        let rows: Vec<(MenuAction, &str, MenuMods)> = agents
             .entries
             .iter()
             .flat_map(MenuEntry::items)
-            .map(|(l, _, _, _)| l)
+            .map(|(_, action, key, mods)| (action, key, mods))
             .collect();
-        assert!(labels.contains(&"Presence Band") && labels.contains(&"Presence Rim"));
+        assert_eq!(
+            rows,
+            [
+                (MenuAction::NextNeed, "j", MenuMods::CommandShift),
+                (MenuAction::Overview, "o", MenuMods::CommandControl),
+                (MenuAction::TakeOver, "", MenuMods::None),
+                (MenuAction::HandBack, "", MenuMods::None),
+                (MenuAction::HarnessLog, "l", MenuMods::CommandShift),
+                (MenuAction::SetRole, "", MenuMods::None),
+                (MenuAction::ReadThisMac, "", MenuMods::None),
+                (MenuAction::ReadFleet, "", MenuMods::None),
+                (MenuAction::SummarizeFleet, "", MenuMods::None),
+            ]
+        );
+        assert_eq!(
+            agents
+                .entries
+                .iter()
+                .filter(|e| matches!(e, MenuEntry::Separator))
+                .count(),
+            3
+        );
+        for (action, ..) in &rows {
+            let want = match action {
+                MenuAction::TakeOver | MenuAction::HandBack => InvokeAuthority::PersonOnly,
+                MenuAction::NextNeed | MenuAction::SetRole => InvokeAuthority::WriteInput,
+                _ => InvokeAuthority::OwnerOnly,
+            };
+            assert_eq!(action.invoke_authority(), want, "{action:?}");
+            let session_row = matches!(
+                action,
+                MenuAction::TakeOver
+                    | MenuAction::HandBack
+                    | MenuAction::HarnessLog
+                    | MenuAction::SetRole
+            );
+            assert_eq!(
+                super::requires_terminal_tab(*action),
+                session_row,
+                "{action:?}"
+            );
+        }
+        // The palette-only rows: no bar item, Owner-only like the menu's reads.
+        for (_, action) in super::PALETTE_ONLY {
+            assert!(
+                !model_items().iter().any(|(_, a, _, _)| a == action),
+                "{action:?} is palette-only"
+            );
+            assert_eq!(
+                action.invoke_authority(),
+                InvokeAuthority::OwnerOnly,
+                "{action:?}"
+            );
+        }
+    }
+
+    /// THE PERSON'S HOLD PAIR reads the live projection: no person hold ⇒
+    /// Take Over live, Hand Back not; the person's hold ⇒ the other way. No
+    /// session at all greys both with every other session row.
+    #[test]
+    fn take_over_and_hand_back_follow_the_front_person_hold() {
+        set_active_tab_is_terminal(true);
+        super::set_front_person_hold(false);
+        assert!(native_menu_action_enabled(MenuAction::TakeOver));
+        assert!(!native_menu_action_enabled(MenuAction::HandBack));
+        super::set_front_person_hold(true);
+        assert!(!native_menu_action_enabled(MenuAction::TakeOver));
+        assert!(native_menu_action_enabled(MenuAction::HandBack));
+        // Another Mac's hold: the person may take it or hand it back.
+        super::set_front_remote_hold(true);
+        assert!(native_menu_action_enabled(MenuAction::TakeOver));
+        assert!(native_menu_action_enabled(MenuAction::HandBack));
+        super::set_front_remote_hold(false);
+        super::set_front_person_hold(false);
+        set_active_tab_is_terminal(false);
+        assert!(!native_menu_action_enabled(MenuAction::TakeOver));
+        assert!(!native_menu_action_enabled(MenuAction::HarnessLog));
+        set_active_tab_is_terminal(true);
+    }
+
+    /// THE AGENTS ROWS GREY FROM THEIR LIVE BITS, as the palette's do: Next
+    /// That Needs You only with a local need, Overview only with a window,
+    /// Read the Fleet only in a fleet; Summarize greys with its block, and
+    /// its tool tip says why, and its title names the fleet or this Mac.
+    #[test]
+    fn the_agents_rows_grey_from_their_live_bits() {
+        use super::{AgentsLive, native_item_tip, native_live_title, set_agents_live};
+        set_active_tab_is_terminal(true);
+        let quiet = AgentsLive::default();
+        set_agents_live(quiet.clone());
+        for a in [
+            MenuAction::NextNeed,
+            MenuAction::Overview,
+            MenuAction::ReadFleet,
+            MenuAction::FleetMachines,
+        ] {
+            assert!(
+                !native_menu_action_enabled(a),
+                "{a:?} greys without its fact"
+            );
+        }
+        assert!(native_menu_action_enabled(MenuAction::SummarizeFleet));
+        assert!(
+            native_menu_action_enabled(MenuAction::ReadThisMac),
+            "always live"
+        );
+        assert_eq!(native_item_tip(MenuAction::SummarizeFleet), None);
+        set_agents_live(AgentsLive {
+            needs_local: true,
+            in_fleet: true,
+            any_window: true,
+            summarize_block: Some("(claude not found)".to_string()),
+        });
+        for a in [
+            MenuAction::NextNeed,
+            MenuAction::Overview,
+            MenuAction::ReadFleet,
+            MenuAction::FleetMachines,
+        ] {
+            assert!(native_menu_action_enabled(a), "{a:?} live with its fact");
+        }
+        assert!(!native_menu_action_enabled(MenuAction::SummarizeFleet));
+        assert!(
+            native_item_tip(MenuAction::SummarizeFleet)
+                .is_some_and(|tip| tip.ends_with("(claude not found)")),
+            "the greyed row says why"
+        );
+        assert_eq!(
+            native_live_title(MenuAction::SummarizeFleet),
+            Some(super::summarize_title(true))
+        );
+        set_agents_live(quiet);
+        assert_eq!(
+            native_live_title(MenuAction::SummarizeFleet),
+            Some(super::summarize_title(false))
+        );
+        set_agents_live(AgentsLive::UNPUBLISHED);
+    }
+
+    /// View ▸ Show Needs in Windows is CHECKABLE and reads its checkmark from
+    /// the published live state; it replaced the two presence rows.
+    #[test]
+    fn the_needs_row_is_checkable_from_the_live_state() {
+        super::set_needs_in_windows(false);
+        assert_eq!(
+            super::native_menu_checked(MenuAction::ToggleNeedsInWindows),
+            Some(false)
+        );
+        super::set_needs_in_windows(true);
+        assert_eq!(
+            super::native_menu_checked(MenuAction::ToggleNeedsInWindows),
+            Some(true)
+        );
+        assert_eq!(super::native_menu_checked(MenuAction::Overview), None);
+        assert_eq!(
+            MenuAction::ToggleNeedsInWindows.invoke_authority(),
+            super::InvokeAuthority::ConfigWrite,
+            "the toggle writes aterm.toml"
+        );
+        let view = MENU_MODEL.iter().find(|s| s.title == "View").unwrap();
+        assert!(
+            view.entries
+                .iter()
+                .flat_map(MenuEntry::items)
+                .any(|(_, a, _, _)| a == MenuAction::ToggleNeedsInWindows)
+        );
     }
 
     /// THE NATIVE BAR SAYS WHAT THE PALETTE SAYS. The palette checkmarks Serious
@@ -4536,9 +4735,6 @@ mod tests {
     #[test]
     fn the_native_bar_checks_and_greys_what_the_palette_does() {
         use super::{MenuLive, menu_live, native_live_title, native_menu_checked, set_menu_live};
-        let _statics = super::MENU_STATICS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
         set_active_tab_is_terminal(true);
         let before = menu_live();
         // Nothing staged yet: the bar reads as it always did.
@@ -4614,9 +4810,6 @@ mod tests {
     #[test]
     fn chrome_reads_the_close_row_live_not_as_last_stamped() {
         use super::{MenuLive, menu_live, native_row_title, set_menu_live};
-        let _statics = super::MENU_STATICS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
         let before = menu_live();
         let close = MenuAction::CloseTab.tag();
         set_menu_live(MenuLive {
@@ -4646,28 +4839,37 @@ mod tests {
         set_menu_live(before);
     }
 
-    /// The connected-spawn presets MINT session-connection authority over the
-    /// focused session, so their `invoke` fence is OwnerOnly — the MenuAction
-    /// twin of the `spawn connected=` escalation arm (design §5.3/§6). They
-    /// are also terminal-only: the origin is the FOCUSED session, absent under
-    /// a native whole tab.
+    /// ROUND 18'S IDENTITY ROWS sit right under New Terminal Tab in the File
+    /// menu, with no key equivalents (choosing may create an identity), and
+    /// the File menu holds no submenu: File ▸ Driving went with the
+    /// connection presets.
     #[test]
-    fn connected_spawn_presets_are_owner_only_and_terminal_only() {
-        for a in [
-            MenuAction::NewControlledWindow,
-            MenuAction::NewControlledTab,
-            MenuAction::NewControllerWindow,
-            MenuAction::NewControllerTab,
+    fn the_identity_rows_sit_under_new_terminal_tab() {
+        let file = MENU_MODEL.iter().find(|s| s.title == "File").unwrap();
+        let rows: Vec<(MenuAction, &str)> = file
+            .entries
+            .iter()
+            .flat_map(MenuEntry::items)
+            .map(|(_, a, k, _)| (a, k))
+            .collect();
+        let at = |action: MenuAction| {
+            rows.iter()
+                .position(|(a, _)| *a == action)
+                .unwrap_or_else(|| panic!("File menu lacks {action:?}"))
+        };
+        assert_eq!(
+            at(MenuAction::NewWindowWithIdentity),
+            at(MenuAction::NewTab) + 1
+        );
+        assert_eq!(
+            at(MenuAction::NewTabWithIdentity),
+            at(MenuAction::NewWindowWithIdentity) + 1
+        );
+        for action in [
+            MenuAction::NewWindowWithIdentity,
+            MenuAction::NewTabWithIdentity,
         ] {
-            assert_eq!(
-                a.invoke_authority(),
-                super::InvokeAuthority::OwnerOnly,
-                "{a:?} mints standing authority — only the god token may invoke it"
-            );
-            assert!(
-                super::requires_terminal_tab(a),
-                "{a:?} needs a focused session"
-            );
+            assert_eq!(rows[at(action)].1, "", "{action:?}: no key equivalent");
         }
     }
 
@@ -4683,11 +4885,7 @@ mod tests {
     #[test]
     fn every_action_decodes_from_its_tag_and_its_invoke_name() {
         let mut by_tag = std::collections::HashMap::new();
-        let actions = model_items()
-            .into_iter()
-            .map(|(_, action, _, _)| action)
-            .chain([MenuAction::CopySessionId, MenuAction::CopyCwd]);
-        for a in actions {
+        for a in offered_actions() {
             if let Some(other) = by_tag.insert(a.tag(), a) {
                 assert_eq!(other, a, "{a:?} and {other:?} share tag {}", a.tag());
             }
@@ -4712,9 +4910,6 @@ mod tests {
 
     #[test]
     fn staged_update_menu_action_is_selectable_on_every_active_tab_kind() {
-        let _statics = super::MENU_STATICS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
         let model = aterm_models_misc::native_update_menu_activation_model();
         let mut state = model.init_state();
         for action in ["StageUpdate", "RefreshStagedVersionMenu"] {
@@ -4757,6 +4952,50 @@ mod tests {
         assert_eq!(disabled["terminal_tab"], 0);
         assert_eq!(disabled["row_enabled"], 0);
         assert!(buggy.successors("DecodeApplyTag", &disabled).is_empty());
+    }
+
+    /// THE MENU TREE, STRUCTURALLY — the `chrome` serialiser's lines over
+    /// section titles and row counts, so a label's rewording never churns it
+    /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §10). One `menu "<title>":
+    /// …` line per section, in the standard Mac order with the app's own
+    /// Agents menu between View and Window; each line lists exactly the rows
+    /// its section offers here (the dynamic update row only while live); no
+    /// separator artifacts and no submenu (the bar is flat since File ▸
+    /// Driving went, 2026-10-16).
+    #[test]
+    fn chrome_lines_render_titled_sections() {
+        let lines = menu_chrome_lines(None, false);
+        let titles: Vec<&str> = MENU_MODEL.iter().map(|s| s.title).collect();
+        assert_eq!(
+            titles,
+            [
+                "aterm", "File", "Edit", "View", "Agents", "Window", "Help", "Version"
+            ]
+        );
+        assert_eq!(lines.len(), titles.len(), "one line per section");
+        for (line, section) in lines.iter().zip(MENU_MODEL) {
+            let head = format!("menu {:?}: ", section.title);
+            assert!(line.starts_with(&head), "{line}");
+            let offered = section
+                .entries
+                .iter()
+                .flat_map(MenuEntry::items)
+                .filter(|(_, a, _, _)| {
+                    a.offered_on_this_platform() && *a != MenuAction::ApplyUpdate
+                })
+                .count();
+            let listed = line[head.len()..]
+                .split(", ")
+                .filter(|label| !label.is_empty())
+                .count();
+            assert_eq!(listed, offered, "{line}");
+        }
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains(", ,") || l.contains('\u{25b8}')),
+            "no separator artifact, no submenu: {lines:?}"
+        );
     }
 
     /// The `chrome` verb's menu lines offer "Check for Updates…" exactly where an
@@ -4847,17 +5086,21 @@ mod tests {
         );
         assert_eq!(item(MenuAction::OpenMarkdown), ("", super::MenuMods::None));
         // ⇧⌘L is the ledger key (`cmd+shift+l` in BUILTIN_CMD_CHORDS), shown on
-        // the Fabric row; no other row may claim it.
-        assert_eq!(
-            item(MenuAction::LedgerForSession),
-            ("l", super::MenuMods::CommandShift)
-        );
-        let on_l: Vec<MenuAction> = model_items()
-            .into_iter()
-            .filter(|(_, _, k, m)| *k == "l" && *m == super::MenuMods::CommandShift)
-            .map(|(_, a, _, _)| a)
-            .collect();
-        assert_eq!(on_l, [MenuAction::LedgerForSession]);
+        // the Harness Log row; ⇧⌘J and ⌃⌘O are the Agents menu's own. No other
+        // row may claim any of them.
+        for (action, key, mods) in [
+            (MenuAction::HarnessLog, "l", super::MenuMods::CommandShift),
+            (MenuAction::NextNeed, "j", super::MenuMods::CommandShift),
+            (MenuAction::Overview, "o", super::MenuMods::CommandControl),
+        ] {
+            assert_eq!(item(action), (key, mods), "{action:?}");
+            let claimed: Vec<MenuAction> = model_items()
+                .into_iter()
+                .filter(|(_, _, k, m)| *k == key && *m == mods)
+                .map(|(_, a, _, _)| a)
+                .collect();
+            assert_eq!(claimed, [action], "{key} {mods:?}");
+        }
     }
 
     /// THE SIGNATURE FOR EVERY KIND OF BUILD, on both rungs, composed from
@@ -4914,14 +5157,17 @@ mod tests {
         );
     }
 
-    /// ONE SIGNATURE, TWO SURFACES. The macOS bar title is the strip label's
-    /// text plus the colour glyphs only AppKit can draw: the wrench before it on
-    /// a dev build and ⬆️ after it under attention, where the strip writes a
-    /// plain ` ↑` instead.
+    /// The macOS bar title is the full signature plus the colour glyphs only
+    /// AppKit can draw: the wrench before it on a dev build and ⬆️ after it under
+    /// attention. The strip writes its quiet form with a plain ` ↑` instead.
     #[test]
-    fn the_bar_title_is_the_strip_label_plus_its_colour_glyphs() {
-        use super::{VersionRung, strip_version_label, version_menu_bar_title};
-        let plain = strip_version_label(VersionRung::Full, false).expect("a full rung");
+    fn the_bar_title_is_the_full_signature_plus_its_colour_glyphs() {
+        use super::{
+            VersionFacts, VersionRung, strip_version_label, version_menu_bar_title,
+            version_signature,
+        };
+        let plain =
+            version_signature(VersionFacts::this_build(), VersionRung::Full).expect("a full rung");
         let wrench = if crate::build_info::is_release_build() {
             ""
         } else {
@@ -4935,11 +5181,43 @@ mod tests {
                 "attention={attention}"
             );
         }
+        let quiet = strip_version_label(VersionRung::Full, false).expect("a full rung");
         assert_eq!(
             strip_version_label(VersionRung::Full, true),
-            Some(format!("{plain} \u{2191}")),
+            Some(format!("{quiet} \u{2191}")),
             "the strip's attention mark is a plain U+2191 after one space"
         );
+    }
+
+    /// The strip's version is quiet: the version and the dev counter, no hash,
+    /// no dirty mark, no `· DEV` (every Windows build is one); the short rung is
+    /// the bare `v<maj.min>`. A release keeps its `v<version>`.
+    #[test]
+    fn the_strip_label_is_the_quiet_version() {
+        use super::{VersionFacts, VersionRung, strip_version_text};
+        let dirty = VersionFacts {
+            release: false,
+            version: "0.106.0",
+            dev_commits: "3605",
+            commit: "8b6f0a8c1d2e-dirty",
+        };
+        assert_eq!(
+            strip_version_text(dirty, VersionRung::Full).as_deref(),
+            Some("v0.106.3605")
+        );
+        assert_eq!(
+            strip_version_text(dirty, VersionRung::Short).as_deref(),
+            Some("v0.106")
+        );
+        let release = VersionFacts {
+            release: true,
+            ..dirty
+        };
+        assert_eq!(
+            strip_version_text(release, VersionRung::Full).as_deref(),
+            Some("v0.106.0")
+        );
+        assert_eq!(strip_version_text(release, VersionRung::Short), None);
     }
 
     /// The own-rendered strip has no colour-emoji face, so its label must never
@@ -4964,9 +5242,10 @@ mod tests {
                         "{c:?} is a colour glyph in {label:?}"
                     );
                 }
-                if !crate::build_info::is_release_build() {
-                    assert!(label.contains(" \u{00B7} DEV"), "{label:?}");
-                }
+                assert!(
+                    !label.contains("DEV"),
+                    "the strip label is quiet: {label:?}"
+                );
             }
         }
         let dirty = VersionFacts {

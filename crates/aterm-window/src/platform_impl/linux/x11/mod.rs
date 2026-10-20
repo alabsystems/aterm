@@ -7,7 +7,8 @@
 // Modified by the aterm project in 2026; see the repository NOTICE. (Dropped the startup
 // notification flow's token request, which served only the deleted `startup_notify`
 // extension; the launchee's half lives on in `startup_notify.rs`. A broken X connection ends
-// the loop with the errno Xlib saw: `end_if_connection_lost`. The server is spoken to through
+// the loop, as `EventLoopError::DisplayLost` when its transport failed and as an error of its
+// own when libxcb closed it: `end_if_connection_lost`. The server is spoken to through
 // first-party `aterm-x11` and the loop waits in `common::poll`, where upstream used x11rb,
 // x11-dl and calloop: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
 
@@ -143,6 +144,9 @@ pub struct ActiveEventLoop {
 
 pub struct EventLoop<T: 'static> {
     loop_running: bool,
+    /// What the run ends with in place of `ExitFailure` once the connection ended under it
+    /// (`end_if_connection_lost`).
+    failure: Option<EventLoopError>,
     waker: Waker,
     event_processor: EventProcessor,
     redraw_receiver: PeekableReceiver<WindowId>,
@@ -303,6 +307,7 @@ impl<T: 'static> EventLoop<T> {
 
         EventLoop {
             loop_running: false,
+            failure: None,
             waker,
             event_processor,
             redraw_receiver: PeekableReceiver::from_recv(redraw_channel),
@@ -331,7 +336,7 @@ impl<T: 'static> EventLoop<T> {
                     break Ok(());
                 },
                 PumpStatus::Exit(code) => {
-                    break Err(EventLoopError::ExitFailure(code));
+                    break Err(self.failure.take().unwrap_or(EventLoopError::ExitFailure(code)));
                 },
                 _ => {
                     continue;
@@ -342,12 +347,23 @@ impl<T: 'static> EventLoop<T> {
         // Applications aren't allowed to carry windows between separate
         // `run_on_demand` calls but if they have only just dropped their
         // windows we need to make sure those last requests are sent to the
-        // X Server. A broken connection has no server to sync with.
+        // X Server. A lost display (a broken connection, or a socket the poll
+        // saw hang up before Xlib read that far) has no server to sync with.
+        // An X error the sync reports answers some earlier request nobody
+        // checked (`x_error_callback` keeps the latest), not the run's end:
+        // the run ends as its loop did, so an application that asked to exit
+        // gets `Ok`. The error goes to stderr, not to `warn!`: aterm's
+        // `tracing` has no subscriber, and the unchecked request is a bug
+        // someone should see.
         let wt = EventProcessor::window_target(&self.event_processor.target);
-        if wt.x_connection().connection_lost().is_none() {
-            wt.x_connection().sync_with_server().map_err(|x_err| {
-                EventLoopError::Os(os_error!(OsError::XError(Arc::new(X11Error::Xlib(x_err)))))
-            })?;
+        let lost = matches!(exit, Err(EventLoopError::DisplayLost(_)));
+        if !lost && !wt.x_connection().is_broken() {
+            if let Err(x_err) = wt.x_connection().sync_with_server() {
+                eprintln!(
+                    "aterm-window: an X error was pending when the event loop ended \
+                     (an earlier request's, not the run's end): {x_err}"
+                );
+            }
         }
 
         exit
@@ -366,7 +382,7 @@ impl<T: 'static> EventLoop<T> {
 
         // Consider the possibility that the `StartCause::Init` iteration could
         // request to Exit.
-        if !self.exiting() && !self.end_if_connection_lost() {
+        if !self.exiting() && !self.end_if_connection_lost(false) {
             self.poll_events_with_timeout(timeout, &mut callback);
         }
         if let Some(code) = self.exit_code() {
@@ -380,24 +396,29 @@ impl<T: 'static> EventLoop<T> {
         }
     }
 
-    /// End the loop, with the errno Xlib saw when it names a connection's end
-    /// (else 1), once the connection to the X server is broken
-    /// ([`XConnection::connection_lost`]): no further iteration runs, so no
-    /// callback makes a request on the dead connection. Whether it was.
-    fn end_if_connection_lost(&self) -> bool {
+    /// End the loop once the connection to the X server is broken, or the
+    /// poll saw its socket hang up or fail (`hung_up`): no further iteration
+    /// runs, so no callback makes a request on the dead connection. The run
+    /// then ends with the connection's end ([`XConnection::connection_end`]):
+    /// [`EventLoopError::DisplayLost`] when its transport failed, the server
+    /// dead (the Linux lane, 2026-10-17, both arches: Xvfb killed at rest read
+    /// as end of file in every run, and killed mid-resize, with aterm-gui's
+    /// requests unread in it, as `ECONNRESET`); libxcb's error
+    /// when it closed the connection for a reason of its own. An exit the
+    /// application asked for first stands. Whether it was broken.
+    fn end_if_connection_lost(&mut self, hung_up: bool) -> bool {
         let wt = EventProcessor::window_target(&self.event_processor.target);
-        let Some(errno) = wt.x_connection().connection_lost() else {
+        let Some(end) = wt.x_connection().connection_end(hung_up) else {
             return false;
         };
         if self.exit_code().is_none() {
-            // Xlib's errno is whatever the last call left: with Xvfb killed
-            // under aterm-gui it was EPIPE, EAGAIN or EINVAL from run to run
-            // (the Linux lane, 2026-10-17), and only the first says why.
-            let names_the_end = matches!(
-                errno,
-                libc::EPIPE | libc::ECONNRESET | libc::ECONNABORTED | libc::ENOTCONN
-            );
-            self.set_exit_code(if names_the_end { errno } else { 1 });
+            self.failure = Some(match end {
+                xdisplay::ConnectionEnd::Transport(why) => EventLoopError::DisplayLost(why),
+                xdisplay::ConnectionEnd::Closed(error) => {
+                    EventLoopError::Os(os_error!(OsError::XError(Arc::new(X11Error::X11(error)))))
+                },
+            });
+            self.set_exit_code(1);
         }
         true
     }
@@ -417,7 +438,7 @@ impl<T: 'static> EventLoop<T> {
         // `XPending` reads the connection, so it is where Xlib usually finds
         // it broken.
         let has_pending = self.has_pending();
-        if self.end_if_connection_lost() {
+        if self.end_if_connection_lost(false) {
             return;
         }
 
@@ -444,14 +465,21 @@ impl<T: 'static> EventLoop<T> {
         if let Err(error) = poll::wait(&mut fds, timeout) {
             tracing::error!("Failed to poll for events: {error:?}");
             let exit_code = error.raw_os_error().unwrap_or(1);
-            self.set_exit_code(exit_code);
+            if self.exit_code().is_none() {
+                let failure = Arc::new(X11Error::Io(error));
+                self.failure = Some(EventLoopError::Os(os_error!(OsError::XError(failure))));
+                self.set_exit_code(exit_code);
+            }
             return;
         }
         if poll::ready(&fds[1]) {
             // No extra handling is required, we just need to wake-up.
             self.waker.drain();
         }
-        if self.end_if_connection_lost() {
+        // A socket that hung up or failed is a dead server's, whether or not
+        // Xlib has read that far yet.
+        let hung_up = fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0;
+        if self.end_if_connection_lost(hung_up) {
             return;
         }
 
@@ -503,7 +531,7 @@ impl<T: 'static> EventLoop<T> {
         self.drain_events(callback);
         // Reading them can find the connection broken: nothing after this
         // may make a request on it.
-        if self.end_if_connection_lost() {
+        if self.end_if_connection_lost(false) {
             return;
         }
 
@@ -543,7 +571,13 @@ impl<T: 'static> EventLoop<T> {
     {
         let mut xev = MaybeUninit::uninit();
 
-        while unsafe { self.event_processor.poll_one_event(xev.as_mut_ptr()) } {
+        // Xlib keeps handing out the events it queued before it found the
+        // connection broken; handling one makes requests on the dead
+        // connection (its own round trips, and the callback's). Once broken,
+        // the rest stay queued and the loop ends.
+        while !self.connection_broken()
+            && unsafe { self.event_processor.poll_one_event(xev.as_mut_ptr()) }
+        {
             let mut xev = unsafe { xev.assume_init() };
             self.event_processor.process_event(&mut xev, |window_target, event| {
                 if let Event::WindowEvent {
@@ -558,6 +592,11 @@ impl<T: 'static> EventLoop<T> {
                 }
             });
         }
+    }
+
+    /// Whether the connection to the X server is broken ([`XConnection::is_broken`]).
+    fn connection_broken(&self) -> bool {
+        EventProcessor::window_target(&self.event_processor.target).x_connection().is_broken()
     }
 
     fn control_flow(&self) -> ControlFlow {
@@ -774,6 +813,9 @@ pub enum X11Error {
 
     /// Failed to get property.
     GetProperty(util::GetPropertyError),
+
+    /// A system call the event loop made failed (its poll).
+    Io(std::io::Error),
 }
 
 impl fmt::Display for X11Error {
@@ -790,6 +832,7 @@ impl fmt::Display for X11Error {
             X11Error::XsettingsParse(err) => {
                 write!(f, "Failed to parse xsettings: {err:?}")
             },
+            X11Error::Io(e) => write!(f, "IO error: {e}"),
         }
     }
 }
@@ -799,6 +842,7 @@ impl std::error::Error for X11Error {
         match self {
             X11Error::Xlib(e) => Some(e),
             X11Error::X11(e) => Some(e),
+            X11Error::Io(e) => Some(e),
             _ => None,
         }
     }

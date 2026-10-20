@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use aterm_core::grid::ResizeLaw;
 use aterm_core::terminal::Terminal;
 
 /// Default byte budget for retained event payloads; an idle terminal costs nothing.
@@ -583,13 +584,19 @@ impl CastRecorder {
             Duration::ZERO
         };
         // Header: integers and static ASCII, so nothing needs escaping; players ignore
-        // the `aterm_*` keys. `aterm_resize_undo` names the engine's resize law (an
+        // the `aterm_*` keys. `aterm_resize_undo` names the engine's resize law so
+        // `cast drift` replays under it (`ResizeLaw::header_value`): 1, an
         // alternate-screen shrink's rows go back to a grow that follows with no output
-        // between) so `cast drift` replays under it; a recording without the key is
-        // matched to its screen instead.
+        // between; 2, also the rows hand-back (a grow appends the blanks earlier trims
+        // took before it reveals history, and a shrink demotes the history lines earlier
+        // grows revealed before it trims); 3, also a width change that lays the rows out
+        // where the hand-back puts them. A recording without the key is matched to its
+        // screen instead.
         let mut out = format!(
-            "{{\"version\": 2, \"width\": {}, \"height\": {}, \"aterm_resize_undo\": 1",
-            self.width, self.height
+            "{{\"version\": 2, \"width\": {}, \"height\": {}, \"aterm_resize_undo\": {}",
+            self.width,
+            self.height,
+            ResizeLaw::default().header_value()
         );
         if truncated {
             out.push_str(&format!(
@@ -720,8 +727,10 @@ impl CastSnapshot {
                 bursts: self.dropped.0,
                 bytes: self.dropped.1,
             }),
-            // This engine keeps the resize undo, and its replay says so.
+            // This engine keeps the resize undo and lays its rows out under the
+            // current law, and its replay says so.
             resize_undo: Some(true),
+            resize_laws: CastHeader::laws_named(Some(ResizeLaw::default().header_value())),
         };
         (header, events)
     }
@@ -1264,7 +1273,7 @@ mod tests {
         rec.record_output(Duration::from_millis(100), b"hi");
         assert_eq!(
             rec.to_asciicast().lines().next().unwrap(),
-            "{\"version\": 2, \"width\": 80, \"height\": 24, \"aterm_resize_undo\": 1}"
+            "{\"version\": 2, \"width\": 80, \"height\": 24, \"aterm_resize_undo\": 3}"
         );
         let drops = rec.drop_counter();
         drops.note(4096);
@@ -1273,7 +1282,7 @@ mod tests {
         let header = cast.lines().next().unwrap();
         assert_eq!(
             header,
-            "{\"version\": 2, \"width\": 80, \"height\": 24, \"aterm_resize_undo\": 1, \
+            "{\"version\": 2, \"width\": 80, \"height\": 24, \"aterm_resize_undo\": 3, \
              \"aterm_dropped\": {\"bursts\": 2, \"bytes\": 4106}}"
         );
         assert_eq!(rec.snapshot().dropped(), (2, 4106));
@@ -1306,11 +1315,18 @@ mod tests {
         let rec = CastRecorder::new(80, 24);
         let cast = rec.to_asciicast();
         let header = cast.lines().next().unwrap();
-        assert!(header.contains("\"aterm_resize_undo\": 1"), "{header}");
+        assert!(header.contains("\"aterm_resize_undo\": 3"), "{header}");
         assert!(header.starts_with("{\"version\": 2, \"width\": 80, \"height\": 24"));
         let parsed = aterm_control::cast_drift::parse_asciicast(&cast).expect("parses");
-        assert_eq!(parsed.header.resize_undo, Some(true));
-        assert_eq!(rec.snapshot().drift_input().0.resize_undo, Some(true));
+        assert_eq!(
+            (parsed.header.resize_undo, parsed.header.resize_laws),
+            (Some(true), &[ResizeLaw::default()][..])
+        );
+        let (snapshot, _) = rec.snapshot().drift_input();
+        assert_eq!(
+            (snapshot.resize_undo, snapshot.resize_laws),
+            (Some(true), &[ResizeLaw::default()][..])
+        );
     }
 
     /// `cast drift` reads the snapshot on the timeline the `cast` text prints (rebased

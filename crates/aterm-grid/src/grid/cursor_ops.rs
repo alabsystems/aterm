@@ -15,17 +15,47 @@ use super::Grid;
 use super::clamp_u16;
 
 impl Grid {
-    /// Set cursor position (clamped to bounds).
+    /// Set cursor position (clamped to bounds): the program addressing the
+    /// screen (CUP, HVP, VPA, a home).
+    ///
+    /// A move to another row addresses the screen the program sees, the
+    /// synchronous resize's, where the rows sit as many lower as an in-flight
+    /// offloaded reflow owes: what follows is drawn there, and the re-attach
+    /// must not move it, so the move drops the debt (`FillDebt`). A position
+    /// that follows the content instead takes
+    /// [`Self::set_cursor_following_content`].
     ///
     /// REQUIRES: self.storage.visible_rows > 0
     /// ENSURES: self.storage.cursor.row < self.storage.visible_rows
     /// ENSURES: self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
     #[inline]
     pub fn set_cursor(&mut self, row: u16, col: u16) {
+        if self.storage.fill_debt.rows != 0
+            && row.min(self.storage.visible_rows.saturating_sub(1)) != self.storage.cursor.row
+        {
+            self.drop_fill_debt();
+        }
+        self.set_cursor_following_content(row, col);
+    }
+
+    /// [`Self::set_cursor`] for a position that follows the content rather
+    /// than addressing the screen: a saved cursor (DECRC, the 1049 restore),
+    /// whose slot moves with the rows a resize and its re-attach move, or one
+    /// row up or down from the cursor (VT52 `ESC A`/`ESC B`, the reverse
+    /// wrap). Like CUU and CUD it keeps an offloaded reflow's fill debt: the
+    /// rows it lands on move down with the re-attach's fill as the synchronous
+    /// resize moved them.
+    ///
+    /// REQUIRES: self.storage.visible_rows > 0
+    /// ENSURES: self.storage.cursor.row < self.storage.visible_rows
+    /// ENSURES: self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
+    #[inline]
+    pub fn set_cursor_following_content(&mut self, row: u16, col: u16) {
         self.storage.clear_pending_wrap();
         let row = row.min(self.storage.visible_rows.saturating_sub(1));
         let col = self.storage.clamp_col_for_row(row, col);
         self.storage.set_cursor_position(row, col);
+        self.note_cursor_moved_up();
         debug_assert!(self.storage.cursor.row < self.storage.visible_rows);
         debug_assert!(
             self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
@@ -75,6 +105,7 @@ impl Grid {
         let at_or_below_top = self.storage.cursor.row >= region.top;
         let min_row = if at_or_below_top { region.top } else { 0 };
         self.storage.cursor.row = self.storage.cursor.row.saturating_sub(n).max(min_row);
+        self.note_cursor_moved_up();
         // Only clamp column when double-width rows exist. Row-only movement
         // cannot invalidate cursor.col when all rows share the same column count.
         if self.storage.any_double_width {
@@ -362,6 +393,7 @@ impl Grid {
                 }
             }
         }
+        self.note_cursor_moved_up();
         if self.storage.any_double_width {
             let row = self.storage.cursor.row;
             self.storage.cursor.col = self.storage.clamp_col_for_row(row, self.storage.cursor.col);
@@ -422,6 +454,7 @@ impl Grid {
             }
         }
 
+        self.note_cursor_moved_up();
         if self.storage.any_double_width {
             let row = self.storage.cursor.row;
             self.storage.cursor.col = self.storage.clamp_col_for_row(row, self.storage.cursor.col);

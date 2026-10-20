@@ -765,6 +765,64 @@ fn aterm_forms_are_judged_by_their_full_subform() {
     }
 }
 
+/// A manager's worker verbs: the task record, the wait on it, the result and
+/// the survey only read, so a box that runs one is a read; `task mark` writes
+/// the record and `spawn agent=claude` starts a worker on a task, so a box
+/// that runs either goes to a person under `approve = "safe"`. `aterm drive
+/// ledger` reads unless `--out` names the file it writes.
+#[test]
+fn the_worker_verbs_are_judged_by_their_form() {
+    for read in [
+        "aterm ctl @s-1 task",
+        "aterm ctl await task @s-1,@s-2",
+        "aterm ctl await task @s-1,@s-2 all timeout=600000",
+        "aterm ctl await task @s-1,@s-2 since=0",
+        "aterm ctl await task @s-1:7,@s-2:4",
+        "aterm ctl @s-1 await task since=3",
+        "aterm ctl @s-1 result",
+        "aterm ctl @s-1 result full",
+        "aterm ctl survey",
+        "aterm ctl survey --json --budget 4000",
+        "aterm ctl survey --sid s-1",
+        "aterm ctl --sock /tmp/a.sock survey --fleet",
+        "aterm-ctl survey",
+        "aterm drive ledger @s-1",
+        "aterm drive ledger @s-1 --format md --since 2026-10-15",
+        "aterm drive --socket /tmp/a.sock ledger @s-1",
+        "aterm drive --help",
+        "aterm-drive ledger @s-1",
+    ] {
+        assert!(ro(read), "{read:?}: {:?}", classify_command(read));
+    }
+    for (write, reason) in [
+        ("aterm ctl @s-1 task mark done", "aterm ctl task mark"),
+        (
+            "aterm ctl @self spawn agent=claude - <<'EOF'\nrun the suite\nEOF",
+            "aterm ctl spawn agent=claude",
+        ),
+        (
+            "aterm ctl spawn agent=claude model=opus - < task.md",
+            "aterm ctl spawn agent=claude",
+        ),
+        (
+            "aterm drive ledger @s-1 --format html --out /tmp/l.html",
+            "aterm drive ledger --out (writes a file)",
+        ),
+        (
+            "aterm-drive ledger --out /tmp/l.html",
+            "aterm-drive ledger --out (writes a file)",
+        ),
+        (
+            "aterm drive --socket /tmp/a.sock answer @s-1 2",
+            "aterm drive answer",
+        ),
+    ] {
+        let v = classify_command(write);
+        assert!(!v.read_only, "{write:?} must not be read-only");
+        assert_eq!(v.reason, reason, "{write:?}");
+    }
+}
+
 /// `mark` (phase 3A) writes a claim into a session's log: a worker's `aterm
 /// ctl … mark …` box is judged a write, never auto-approved as a read; the
 /// session log's reads (`log`, `brief`, `await log …`) stay reads.

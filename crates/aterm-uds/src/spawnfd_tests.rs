@@ -8,6 +8,7 @@
 //! what it stages leaks into no sibling test's child.
 
 use super::*;
+use crate::host::could_not_run;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -24,46 +25,30 @@ const BOUND_NAME: &str = if cfg!(target_vendor = "apple") {
     "the hard RLIMIT_NOFILE"
 };
 
-/// Whether this host can hold a descriptor numbered `need` (its
-/// [`descriptor_bound`] lies above it). When not, ONE line on stderr names
-/// what the scenario needs and what this host gives — said, never passed.
-pub(super) fn host_holds(need: RawFd, what: &str) -> bool {
+/// End the calling test COULD NOT RUN unless this host can hold a descriptor numbered
+/// `need` (its [`descriptor_bound`] lies above it), naming what the scenario needs and
+/// what this host gives.
+#[track_caller]
+pub(super) fn require_host_holds(need: RawFd, what: &str) {
     let bound = descriptor_bound();
-    if bound > need {
-        return true;
+    if bound <= need {
+        could_not_run(format!(
+            "{what}needs {BOUND_NAME} above {need}, this host allows {bound}"
+        ));
     }
-    eprintln!("skipped here{what}: needs {BOUND_NAME} above {need}, this host allows {bound}");
-    false
 }
 
-/// The binary translator this process runs under, named, when one does: its
-/// code is built for one architecture and the kernel is another's. Linux names
-/// its own in `/proc/sys/kernel/arch`, which the translator leaves alone while
-/// it rewrites `uname` and `/proc/cpuinfo` (Rosetta answers `x86_64` and
-/// `VirtualApple` there, measured 2026-10-17). `None` natively, on a kernel
-/// that names no architecture, and off Linux, where no test here depends on
-/// one (Darwin's `posix_spawn` is a single system call, and no `binfmt_misc`
-/// names an interpreter as a process's executable).
-#[cfg(target_os = "linux")]
-pub(crate) fn translator() -> Option<String> {
-    let kernel = std::fs::read_to_string("/proc/sys/kernel/arch").ok()?;
-    let (kernel, code) = (kernel.trim(), std::env::consts::ARCH);
-    if kernel.is_empty() || kernel == code {
-        return None;
+/// Raise the soft descriptor limit toward `request`, and end the calling test COULD NOT
+/// RUN when it cannot pass `floor`: the hard limit is the host's.
+#[track_caller]
+pub(super) fn require_soft_limit(request: u64, floor: RawFd) {
+    if raise_soft_limit(request) <= u64::try_from(floor).unwrap_or(0) {
+        could_not_run(format!("the hard descriptor limit is below {floor}"));
     }
-    let rosetta =
-        std::fs::read_to_string("/proc/cpuinfo").is_ok_and(|info| info.contains("VirtualApple"));
-    Some(if rosetta {
-        "Rosetta".to_string()
-    } else {
-        format!("a translator ({code} code on an {kernel} kernel)")
-    })
 }
 
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn translator() -> Option<String> {
-    None
-}
+/// The binary translator this process runs under ([`crate::process::translator`]).
+pub(crate) use crate::process::translator;
 
 /// Why `std` is no oracle for a spawn that fails under Rosetta on Linux, for
 /// the line a test prints instead of the comparison ([`translator`]).
@@ -191,6 +176,15 @@ fn launch_staged(mut launch: std::process::Command, stage: &str) -> String {
     }
     let out = launch.output().expect("start the staged child");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    // A stage the host could not run ends this test the same way, with its words.
+    if !out.status.success()
+        && let Some(why) = String::from_utf8_lossy(&out.stderr).lines().find_map(|l| {
+            l.split_once(crate::host::COULD_NOT_RUN)
+                .map(|(_, why)| why.to_owned())
+        })
+    {
+        could_not_run(format!("stage {stage}{why}"));
+    }
     assert!(
         out.status.success(),
         "stage {stage}: {:?}\nstdout: {stdout}\nstderr: {}",
@@ -396,8 +390,8 @@ fn every_lane_source_reaches_its_number_wherever_it_started() {
         return;
     }
     for stage in ["verb", "push", "swapped", "high"] {
-        if stage == "high" && !host_holds(HIGH_VERB + 1, " (stage high)") {
-            continue;
+        if stage == "high" {
+            require_host_holds(HIGH_VERB + 1, "stage high ");
         }
         let out = run_staged_held(NAME, stage);
         assert!(
@@ -427,16 +421,13 @@ fn off_the_targets_moves_only_what_a_file_action_cannot_take() {
     // when that is lower; a host with no number at or above the limit cannot
     // hold such a source, and says so.
     #[cfg(target_vendor = "apple")]
-    if host_holds(
-        ACTION_FD_LIMIT,
-        " (the move from above the file-action limit)",
-    ) {
+    {
+        require_host_holds(
+            ACTION_FD_LIMIT,
+            "the move from above the file-action limit ",
+        );
         let floor = (ACTION_FD_LIMIT + 7).min(descriptor_bound() - 1);
-        let want = u64::try_from(floor).unwrap();
-        if raise_soft_limit(want + 1) <= want {
-            println!("NOT RUN: the hard descriptor limit is below {floor}");
-            return;
-        }
+        require_soft_limit(u64::try_from(floor).unwrap() + 1, floor);
         let high = park(kept, floor);
         let high_raw = high.as_raw_fd();
         let moved = off_the_targets(high).expect("a free number below the limit");
@@ -740,11 +731,7 @@ fn stripped_sh_holds(fd: RawFd) -> bool {
 
 fn staged_above_old_cap() {
     let above = above_old_cap().expect("the parent stages only where the host holds one");
-    let floor = u64::try_from(above).unwrap();
-    if raise_soft_limit(floor + 64) <= floor {
-        println!("NOT RUN: the hard descriptor limit is below {above}");
-        return;
-    }
+    require_soft_limit(u64::try_from(above).unwrap() + 64, above);
     let held = unflagged_at_or_above(above);
     let fd = held.as_raw_fd();
     assert!(fd > OLD_CAP);
@@ -781,14 +768,10 @@ fn an_unflagged_descriptor_above_the_old_cap_reaches_no_child() {
         return;
     }
     if above_old_cap().is_none() {
-        host_holds(OLD_CAP + HEADROOM, "");
-        return;
+        require_host_holds(OLD_CAP + HEADROOM, "");
     }
     let out = run_staged(NAME, "above-old-cap");
-    assert!(
-        out.contains("STAGED above-old-cap ok") || out.contains("NOT RUN"),
-        "{out}"
-    );
+    assert!(out.contains("STAGED above-old-cap ok"), "{out}");
     print!("{out}");
 }
 
@@ -843,9 +826,12 @@ fn race_probe(high: Option<RawFd>) -> String {
 
 fn staged_race() {
     use std::sync::atomic::{AtomicBool, Ordering};
-    let want = above_old_cap().unwrap_or(RACE_LOW) + 64;
-    let high_soft = raise_soft_limit(u64::try_from(want).unwrap());
-    let high = above_old_cap().filter(|&hi| high_soft > u64::try_from(hi).unwrap());
+    require_host_holds(OLD_CAP + HEADROOM, "the above-cap half of the race ");
+    let high = above_old_cap().expect("the admitted host has a number above the old cap");
+    let want = u64::try_from(high).unwrap() + 64;
+    require_soft_limit(want, high);
+    let high_soft = raise_soft_limit(want);
+    let high = Some(high);
     let probe = race_probe(high);
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let racer = {
@@ -901,8 +887,8 @@ fn staged_race() {
 /// raises the soft limit and opens unflagged descriptors (at 2000, and above
 /// the old cap) while this one spawns — the window the old parent-side ceiling
 /// read could fall into (measured on the old code: see the commit). A leaky
-/// spawn under the same race is the control. A host with no number above the
-/// old cap races the low range alone, saying so.
+/// spawn under the same race is the control. A host unable to stage both
+/// ranges ends COULD NOT RUN before the racer starts.
 #[test]
 fn no_descriptor_reaches_a_lane_child_while_another_thread_races_the_spawn() {
     const NAME: &str =
@@ -910,9 +896,6 @@ fn no_descriptor_reaches_a_lane_child_while_another_thread_races_the_spawn() {
     if std::env::var(STAGE_ENV).is_ok() {
         staged_race();
         return;
-    }
-    if above_old_cap().is_none() {
-        host_holds(OLD_CAP + HEADROOM, " (the above-cap half of the race)");
     }
     let out = run_staged(NAME, "race");
     assert!(out.contains("STAGED race"), "{out}");
@@ -1150,4 +1133,48 @@ fn adoption_takes_an_exclusively_owned_inherited_socket() {
     let mut byte = [0u8; 1];
     far.read_exact(&mut byte).expect("the far end reads it");
     assert_eq!(&byte, b"x");
+}
+
+/// THE LANE SPAWN TRIES A PROGRAM STILL OPEN FOR WRITING AGAIN, as [`Command`] does
+/// (2026-10-18): Linux refuses the exec (`ETXTBSY`) while anything holds the file open for
+/// writing, the lane arm's child reports that on its status pipe, and the spawn pauses and
+/// tries again, here the moment this test's writer lets go. A writer that stays is still
+/// refused once the window has passed. NEGATIVE CONTROL: the lane arm with one try was
+/// refused, `Text file busy`, in the first assertion.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_lane_spawn_refused_as_text_busy_starts_once_the_writer_lets_go() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = aterm_tempfile::tempdir().expect("scratch dir");
+    let path = dir.path().join("busy");
+    let mut writer = std::fs::File::create(&path).expect("create");
+    writer.write_all(b"#!/bin/sh\nexit 7\n").expect("write");
+    writer
+        .set_permissions(std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    let tried_again = std::sync::Arc::new(AtomicBool::new(false));
+    let seen = std::sync::Arc::clone(&tried_again);
+    TEXT_BUSY_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            seen.store(true, Ordering::SeqCst);
+            drop(writer);
+        }));
+    });
+    let mut child = spawn(LaneCommand::new(&path)).expect("started once the writer let go");
+    assert_eq!(child.wait().expect("reaped").code(), Some(7));
+    assert!(
+        tried_again.load(Ordering::SeqCst),
+        "the first try was refused and the spawn paused"
+    );
+    let _stays = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("a writer that stays");
+    let refused = spawn(LaneCommand::new(&path)).expect_err("refused once the window passed");
+    assert_eq!(
+        refused.kind(),
+        io::ErrorKind::ExecutableFileBusy,
+        "{refused}"
+    );
 }

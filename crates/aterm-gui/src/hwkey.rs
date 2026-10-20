@@ -45,6 +45,12 @@
 //! clock the age is computed against), so the backdate measures the true queue
 //! residence rather than being discarded as a synthesized event (`timestamp <= 0`).
 //!
+//! `shape=press` builds each event as a key press is instead, from a CoreGraphics keyboard
+//! event wrapped by `+[NSEvent eventWithCGEvent:]`: AppKit then reads its characters off the
+//! current layout, and the input method composes it as it would a physical key (Option+e
+//! starts the U.S. acute dead key), which no event built by `+keyEventWithType:…` does. The
+//! Option-as-Meta lane (`aterm-lab meta-keys --window`) presses its chords this way.
+//!
 //! # The one difference from a physical key, stated plainly
 //!
 //! The event is born inside this process instead of in WindowServer, so it never
@@ -85,6 +91,14 @@ pub(crate) struct HwKeySpec {
     /// Milliseconds to sleep between successive presses. The default paces the
     /// stream like human typing rather than dumping a burst into the queue.
     pub interval_ms: u64,
+    /// `shape=press`: build each event as a key press is, from a CoreGraphics keyboard
+    /// event wrapped by `+[NSEvent eventWithCGEvent:]`, so AppKit reads its characters
+    /// off the CURRENT layout (Option+b is `∫` on the U.S. layout, Option+e the acute
+    /// dead key with empty characters) and the input method may compose it. The default
+    /// builds the event with `+keyEventWithType:…` from [`Self::chars`], a shape the
+    /// input method never composes (measured on macOS 27,
+    /// `docs/measured/desk-appkit-2026-10-19.md`).
+    pub press: bool,
 }
 
 /// `NSEventModifierFlags` bits, spelled out so the pure parser needs no AppKit.
@@ -261,13 +275,24 @@ fn take_inline_mods(body: &str) -> (u64, &str) {
 /// them plus the residual body. Any unparsable token value is an error rather than
 /// a silent default: a typo'd `count=1oo` that silently injected one key would
 /// invalidate a whole measurement run without saying so.
-fn take_tokens(rest: &str) -> Result<(u64, u32, u64, String), String> {
+fn take_tokens(rest: &str) -> Result<(u64, u32, u64, bool, String), String> {
     let mut mods = 0u64;
     let mut count = 1u32;
     let mut interval = DEFAULT_INTERVAL_MS;
+    let mut press = false;
     let mut kept: Vec<&str> = Vec::new();
     for tok in rest.split_whitespace() {
-        if let Some(list) = tok.strip_prefix("mods=") {
+        if let Some(shape) = tok.strip_prefix("shape=") {
+            press = match shape {
+                "press" => true,
+                "built" => false,
+                other => {
+                    return Err(format!(
+                        "ERR hwkey: unknown shape `{other}` (press, built)\n"
+                    ));
+                }
+            };
+        } else if let Some(list) = tok.strip_prefix("mods=") {
             for name in list.split(['+', ',']) {
                 mods |= match name {
                     "shift" => FLAG_SHIFT,
@@ -298,16 +323,16 @@ fn take_tokens(rest: &str) -> Result<(u64, u32, u64, String), String> {
             kept.push(tok);
         }
     }
-    Ok((mods, count, interval, kept.join(" ")))
+    Ok((mods, count, interval, press, kept.join(" ")))
 }
 
-/// PURE parser for `hwkey <name> [mods=<list>] [count=<n>] [interval=<ms>]`.
+/// PURE parser for `hwkey <name> [mods=<list>] [count=<n>] [interval=<ms>] [shape=press|built]`.
 ///
 /// Kept free of AppKit so the whole grammar — including the character→keycode
 /// table a measurement's fidelity rests on — is exercised by `#[test]` on every
 /// platform, not only when someone runs the verb by hand on a Mac.
 pub(crate) fn parse_hwkey(rest: &str) -> Result<HwKeySpec, String> {
-    let (tok_mods, count, interval_ms, body) = take_tokens(rest)?;
+    let (tok_mods, count, interval_ms, press, body) = take_tokens(rest)?;
     let (prefix_mods, body) = take_inline_mods(body.trim());
     let mut flags = tok_mods | prefix_mods;
     let body = body.trim();
@@ -327,6 +352,7 @@ pub(crate) fn parse_hwkey(rest: &str) -> Result<HwKeySpec, String> {
             flags,
             count,
             interval_ms,
+            press,
         });
     }
 
@@ -362,13 +388,16 @@ pub(crate) fn parse_hwkey(rest: &str) -> Result<HwKeySpec, String> {
         flags,
         count,
         interval_ms,
+        press,
     })
 }
 
 fn usage() -> String {
-    "ERR usage: hwkey <char|name> [mods=<list>] [count=<n>] [interval=<ms>] — \
-     posts a REAL NSEvent into this app's own OS event queue so the key takes the \
-     winit hardware path (macOS only). Names: enter tab esc space backspace delete \
+    "ERR usage: hwkey <char|name> [mods=<list>] [count=<n>] [interval=<ms>] \
+     [shape=press|built] — posts a REAL NSEvent into this app's own OS event queue so \
+     the key takes the winit hardware path (macOS only); shape=press builds it from a \
+     CoreGraphics key event, as a key press is, so the layout gives its characters and \
+     the input method may compose it. Names: enter tab esc space backspace delete \
      up down left right home end pageup pagedown f1..f12\n"
         .to_string()
 }
@@ -471,7 +500,7 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
             // lets the event arrive, and wait, while the main thread is parked
             // (in whatever parks it — `nextDrawable` was the motivating case and
             // is off the shipped macOS path since `ea581e158`; see the header).
-            let key_event = |kind: usize| unsafe {
+            let built = |kind: usize| unsafe {
                 let make: unsafe extern "C-unwind" fn(
                     Id,
                     Sel,
@@ -504,6 +533,15 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
                     spec.keycode,
                 )
             };
+            // `shape=press`: the event AppKit would build for a key press (see
+            // [`press_event`]); its window is the key window `sendEvent:` routes it to.
+            let key_event = |kind: usize| {
+                if spec.press {
+                    press_event(spec.keycode, kind == NS_EVENT_TYPE_KEY_DOWN, spec.flags)
+                } else {
+                    built(kind)
+                }
+            };
             let down = key_event(NS_EVENT_TYPE_KEY_DOWN);
             if down.is_null() {
                 return Err("ERR hwkey: NSEvent construction failed\n".to_string());
@@ -530,6 +568,49 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
         posted += 1;
     }
     Ok(posted)
+}
+
+/// A key-down (`down`) or key-up `NSEvent` built as a key press is: a CoreGraphics
+/// keyboard event for `keycode` with `flags` (`CGEventFlags` share the bit positions of
+/// `NSEventModifierFlags`), wrapped by `+[NSEvent eventWithCGEvent:]`, so its
+/// `characters` are the current layout's for that key and modifiers and its timestamp is
+/// the CoreGraphics event's own (the same seconds-since-boot clock). Autoreleased into the
+/// caller's pool; nil when either constructor refuses.
+#[cfg(target_os = "macos")]
+fn press_event(keycode: u16, down: bool, flags: u64) -> aterm_objc::Id {
+    use std::ffi::c_void;
+
+    use aterm_objc::{Id, Sel, class, sel};
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventCreateKeyboardEvent(
+            source: *const c_void,
+            keycode: u16,
+            keydown: bool,
+        ) -> *mut c_void;
+        fn CGEventSetFlags(event: *mut c_void, flags: u64);
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(cf: *const c_void);
+    }
+    // SAFETY: the CoreGraphics prototypes above are the headers'; a null source is
+    // documented. `+eventWithCGEvent:` is `@@:^{__CGEvent=}`: its result is autoreleased
+    // and holds its own reference to the CGEvent, so releasing the one
+    // `CGEventCreateKeyboardEvent` returned is the documented balance.
+    unsafe {
+        let cg = CGEventCreateKeyboardEvent(std::ptr::null(), keycode, down);
+        if cg.is_null() {
+            return Id::NIL;
+        }
+        CGEventSetFlags(cg, flags);
+        let wrap: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) -> Id =
+            aterm_objc::checked_msg();
+        let event = wrap(class(c"NSEvent").as_id(), sel!(eventWithCGEvent:), cg);
+        CFRelease(cg);
+        event
+    }
 }
 
 /// Non-macOS: there is no NSEvent queue to post into, and the queue-age backdate
@@ -667,6 +748,20 @@ mod tests {
         assert!(parse_hwkey("x count=1oo").is_err());
         assert!(parse_hwkey("x interval=100000").is_err());
         assert!(parse_hwkey("x mods=bogus").is_err());
+    }
+
+    /// `shape=press` asks for the key-press shape and changes nothing else about the
+    /// key; the default is the built shape, and an unknown shape is refused.
+    #[test]
+    fn the_press_shape_is_asked_for_by_name_and_keeps_the_key() {
+        let built = parse_hwkey("b mods=alt").unwrap();
+        assert!(!built.press);
+        let press = parse_hwkey("b mods=alt shape=press").unwrap();
+        assert!(press.press);
+        assert_eq!((press.keycode, press.flags), (11, super::FLAG_OPTION));
+        assert_eq!(press.chars_ignoring, built.chars_ignoring);
+        assert_eq!(parse_hwkey("b mods=alt shape=built").unwrap(), built);
+        assert!(parse_hwkey("b shape=cg").is_err());
     }
 
     /// Unknown / multi-character bodies are refused rather than guessed at.

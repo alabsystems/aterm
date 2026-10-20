@@ -46,7 +46,7 @@ use aterm_dbus::{Connection, Error as BusError, Kind, Message, address};
 
 use super::adapter::{Adapter, AdapterState, Entry};
 use super::semantics::{
-    AppContext, Event, InterfaceSet, NodeId, PlatformNode, PlatformRoot, SharedLock,
+    AppContext, Event, InterfaceSet, NodeIdentity, PlatformNode, PlatformRoot, SharedLock,
 };
 use super::serve::{self, Objects};
 use super::{events, proxies};
@@ -81,7 +81,7 @@ pub(crate) enum Change {
     },
     UnregisterInterfaces {
         adapter: usize,
-        node: NodeId,
+        node: NodeIdentity,
         interfaces: InterfaceSet,
     },
     Event {
@@ -93,7 +93,7 @@ pub(crate) enum Change {
     },
     CacheRemove {
         adapter: usize,
-        node: NodeId,
+        node: NodeIdentity,
     },
 }
 

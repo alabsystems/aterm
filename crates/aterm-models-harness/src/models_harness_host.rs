@@ -1823,6 +1823,981 @@ pub fn harness_muse_exit_witness_model() -> Model {
     }
 }
 
+/// MUSE CODE'S LIVE UPGRADE, ITS QUIET FLOW (aterm-agent
+/// `harness/upgrade_muse_live.rs`, the gate and the order, and
+/// `upgrade_muse_live_drive.rs`, the claim; 2026-10-18, measured on
+/// 1.4.10-R6427.1). When atpkg lands a build under a supervised Muse Code, the
+/// window's host restarts it onto that build at a genuinely idle point —
+/// SIGTERM, then the relaunch through the managed twin on the same session —
+/// and types nothing after.
+///
+/// The world: `landed` 0 nothing, 1 a NEWER revision build (`1.4.11-R6500.1`
+/// over `1.4.10-R6427.1`), 2 one that is not newer (an older revision);
+/// `turn` the session's log has a run started with no terminal (G-M1);
+/// `task` a task accepted or started with no end — a backgrounded shell,
+/// which a turn sends there — and `queued` its end's inbox item not yet
+/// drained by Muse's own run (G-M2); `child` a descendant process (G-M3);
+/// `shown` 1 where the reader does not read the screen Idle authoritatively
+/// (the screen and the log move apart: a turn's screen may read idle while
+/// its run is still open); `draft` a person's draft; `held` a hold, a hand
+/// or a person within the grace; `unread` the log is unreadable or holds no
+/// start of this process. `Restart` is the step: SIGTERM with the claim on
+/// disk (`claimed`), the gate's state recorded (`at_*`); `Exit` its `143`;
+/// `ReadExit` the host's read of it: `decided` 1 relaunched onto the twin (the
+/// harness's own restart, `relaunch::ended_by_restart`), 2 left as someone's
+/// graceful exit. `stranded`: a look at an open gate that read a newer build
+/// as not newer.
+///
+/// `NoRunningWorkInterrupted`, `NeverMidTurn`, `NoChildKilled`: the restart
+/// never ends open work, a running turn or a child. `TheRestartIsRelaunched`:
+/// the exit the restart made is never left as someone's.
+/// `NeverStrandedBehind`, `MovesOnlyUp`: the order reads the revision form.
+///
+/// `Buggy = 1` adds six mutants, each dead at `Buggy = 0` and caught alone,
+/// one slip per behaviour: `RestartWithOpenWork` (a backgrounded shell or
+/// its queued end read past: the screen and the run's terminal alone),
+/// `RestartMidTurn` (the log's open run read past: the screen alone),
+/// `RestartWithChild` (Claude Code's shell-name list, which a shell that
+/// `exec`s its command slips past), `RestartUnclaimed` (the signal before
+/// the claim: the `143` read as someone's end, the session left down),
+/// `RevisionReadAsOlder` (the Claude lane's `upgrade::Version`, which refuses
+/// `-R…`: never behind) and `RevisionReadAsNewer` (a move down). Tier-1
+/// (aterm-agent `harness/upgrade_muse_live_drive_tests.rs`,
+/// `tier1_the_real_muse_quiet_upgrade_conforms_to_the_model`) replays every
+/// state through the real order, log reader, screen reader, process rule,
+/// gate and claim.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_muse_quiet_upgrade_model() -> Model {
+    aterm_spec::ty_model! {
+        HarnessMuseQuietUpgrade {
+            const Buggy = 0;
+            var landed = 0;
+            var turn = 0;
+            var task = 0;
+            var queued = 0;
+            var child = 0;
+            var shown = 0;
+            var draft = 0;
+            var held = 0;
+            var unread = 0;
+            var moved = 0;
+            var claimed = 0;
+            var exited = 0;
+            var decided = 0;
+            var stranded = 0;
+            var at_turn = 0;
+            var at_task = 0;
+            var at_queued = 0;
+            var at_child = 0;
+            var slipped = 0;
+
+            action LandNewer when (moved == 0 && landed == 0) {
+                landed = 1;
+            }
+            action LandOlder when (moved == 0 && landed == 0) {
+                landed = 2;
+            }
+            action TurnStarts when (moved == 0 && turn == 0) {
+                turn = 1;
+                shown = 1;
+            }
+            action TurnEnds when (moved == 0 && turn == 1) {
+                turn = 0;
+            }
+            action ScreenBusy when (moved == 0 && shown == 0) {
+                shown = 1;
+            }
+            action ScreenIdle when (moved == 0 && shown == 1) {
+                shown = 0;
+            }
+            // A turn sends a shell to the background; its end queues an
+            // inbox item, which Muse's own run drains.
+            action Backgrounded when (moved == 0 && turn == 1 && task == 0) {
+                task = 1;
+            }
+            action WorkEnds when (moved == 0 && task == 1) {
+                task = 0;
+                queued = 1;
+            }
+            action Drained when (moved == 0 && queued == 1 && turn == 0) {
+                queued = 0;
+                turn = 1;
+                shown = 1;
+            }
+            action ChildUp when (moved == 0 && child == 0) {
+                child = 1;
+            }
+            action ChildGone when (moved == 0 && child == 1) {
+                child = 0;
+            }
+            action DraftTyped when (moved == 0 && draft == 0) {
+                draft = 1;
+            }
+            action DraftCleared when (moved == 0 && draft == 1) {
+                draft = 0;
+            }
+            action Hold when (moved == 0 && held == 0) {
+                held = 1;
+            }
+            action Release when (moved == 0 && held == 1) {
+                held = 0;
+            }
+            action LogUnread when (moved == 0 && unread == 0) {
+                unread = 1;
+            }
+            action LogRead when (moved == 0 && unread == 1) {
+                unread = 0;
+            }
+            // The step: a newer build, the log closed, nothing running in it
+            // or under it, the screen idle and empty, nobody holding it.
+            action Restart when (
+                moved == 0 && landed == 1 &&
+                turn == 0 && task == 0 && queued == 0 && child == 0 &&
+                shown == 0 && draft == 0 && held == 0 && unread == 0
+            ) {
+                moved = 1;
+                claimed = 1;
+                at_turn = turn;
+                at_task = task;
+                at_queued = queued;
+                at_child = child;
+            }
+            action Exit when (moved == 1 && exited == 0) {
+                exited = 1;
+            }
+            action ReadExit when (exited == 1 && decided == 0) {
+                decided = if claimed == 1 { 1 } else { 2 };
+            }
+            // The mutants, each its own dead action.
+            action RestartWithOpenWork when (
+                Buggy == 1 && slipped == 0 && moved == 0 && landed == 1 &&
+                turn == 0 && child == 0 && shown == 0 && draft == 0 && held == 0 && unread == 0 &&
+                (task == 1 || queued == 1)
+            ) {
+                slipped = 1;
+                moved = 1;
+                claimed = 1;
+                at_turn = turn;
+                at_task = task;
+                at_queued = queued;
+                at_child = child;
+            }
+            action RestartMidTurn when (
+                Buggy == 1 && slipped == 0 && moved == 0 && landed == 1 &&
+                turn == 1 && task == 0 && queued == 0 && child == 0 &&
+                shown == 0 && draft == 0 && held == 0 && unread == 0
+            ) {
+                slipped = 1;
+                moved = 1;
+                claimed = 1;
+                at_turn = turn;
+                at_task = task;
+                at_queued = queued;
+                at_child = child;
+            }
+            action RestartWithChild when (
+                Buggy == 1 && slipped == 0 && moved == 0 && landed == 1 &&
+                turn == 0 && task == 0 && queued == 0 && child == 1 &&
+                shown == 0 && draft == 0 && held == 0 && unread == 0
+            ) {
+                slipped = 1;
+                moved = 1;
+                claimed = 1;
+                at_turn = turn;
+                at_task = task;
+                at_queued = queued;
+                at_child = child;
+            }
+            action RestartUnclaimed when (
+                Buggy == 1 && slipped == 0 && moved == 0 && landed == 1 &&
+                turn == 0 && task == 0 && queued == 0 && child == 0 &&
+                shown == 0 && draft == 0 && held == 0 && unread == 0
+            ) {
+                slipped = 1;
+                moved = 1;
+                claimed = 0;
+                at_turn = turn;
+                at_task = task;
+                at_queued = queued;
+                at_child = child;
+            }
+            action RevisionReadAsOlder when (
+                Buggy == 1 && slipped == 0 && moved == 0 && landed == 1 &&
+                turn == 0 && task == 0 && queued == 0 && child == 0 &&
+                shown == 0 && draft == 0 && held == 0 && unread == 0
+            ) {
+                slipped = 1;
+                stranded = 1;
+            }
+            action RevisionReadAsNewer when (
+                Buggy == 1 && slipped == 0 && moved == 0 && landed == 2 &&
+                turn == 0 && task == 0 && queued == 0 && child == 0 &&
+                shown == 0 && draft == 0 && held == 0 && unread == 0
+            ) {
+                slipped = 1;
+                moved = 1;
+                claimed = 1;
+                at_turn = turn;
+                at_task = task;
+                at_queued = queued;
+                at_child = child;
+            }
+
+            invariant NoRunningWorkInterrupted: at_task == 0 && at_queued == 0;
+            invariant NeverMidTurn: at_turn == 0;
+            invariant NoChildKilled: at_child == 0;
+            invariant TheRestartIsRelaunched: decided <= 1;
+            invariant NeverStrandedBehind: stranded == 0;
+            invariant MovesOnlyUp: moved == 0 || landed == 1;
+        }
+    }
+}
+
+/// AGY'S LIVE UPGRADE, ITS QUIET FLOW (aterm-agent `harness/upgrade_agy_live.rs`,
+/// the gate and the order, and `upgrade_agy_live_drive.rs`, the witnesses and the
+/// claim; 2026-10-18, measured on 1.4.0). When atpkg lands a build under a supervised
+/// agy, the window's host restarts it onto that build at a genuinely idle point —
+/// SIGTERM, then the relaunch through the managed twin on the same conversation — and
+/// types nothing after.
+///
+/// The world: `landed` 0 nothing, 1 a NEWER build (`1.4.1` over `1.4.0`), 2 one that is
+/// not newer; `turn` the conversation's summary row reads `RUNNING` (a turn, and a turn's
+/// end a moment after the screen reads it over); `task` a background command task,
+/// timer or cron runs (the screen draws it, the row is not fully idle, the transcript's
+/// `RUNNING` row has no end, a command's shell is a child); `daemon` a DAEMON command
+/// task runs (drawn, its `RUNNING` row open, its command a bare child — and the summary
+/// row BLIND to it: measured); `subagent` a subagent works (drawn, its own row
+/// `RUNNING`, its spawn row with no `has gone idle`; no process); `wake` a message that
+/// wakes agy is pending (a task's end, a timer's firing, a subagent gone idle: agy's own
+/// turn on it still to come); `shown` 1 where the reader does not read the screen Idle
+/// authoritatively (the screen and the row move apart at a turn's end); `panel` 0 where
+/// agy's setting hides the panel (`hideActiveItems`: the footer's count alone is drawn);
+/// `draft` a person's draft; `held` a hold, a hand or a person within the grace;
+/// `unread` the transcript cannot be read or proves no start of this process; `shared`
+/// another live agy has the conversation open (its argv names it, or it holds the
+/// conversation's database with no lock: the relaunch types nothing while it does).
+/// The step is three acts with the world free to move between them, as the drive's
+/// is: `Look` (the first look finds the gate open: `looked`), the claim written
+/// (`ClaimWritten`: `claimed`, on disk) or refused (`ClaimUnwritten`: the step waits,
+/// nothing signalled), then the LAST LOOK — `Restart` where the whole gate is open
+/// still (SIGTERM, the world it ended recorded in `at_*`), `TakeBack` where anything
+/// turned (the record put back). `Exit` is its `0`; `ReadExit` the host's read of it:
+/// `decided` 1 relaunched onto the twin (the harness's own restart,
+/// `relaunch::ended_by_restart`), 2 left as someone's graceful exit. `stranded`: a
+/// look at an open gate that read a newer build as not newer.
+///
+/// `NoRunningWorkInterrupted`, `NoDaemonKilled`, `NeverMidTurn`, `NoWakeLost`: the
+/// restart never ends background work, a daemon task, a running turn, or the turn agy
+/// owes a wake. `NeverStrandedDown`: never an agy whose conversation another agy has
+/// open (its relaunch could never type). `TheRestartIsRelaunched`: the exit the restart
+/// made is never left as someone's. `NeverStrandedBehind`, `MovesOnlyUp`: the order.
+///
+/// `Buggy = 1` adds nine mutants, each dead at `Buggy = 0` and caught alone, one slip
+/// per behaviour: `RestartWithOpenWork` (a task, a timer or a subagent read past: the
+/// reader's phase and the composer alone), `RestartWithDaemonTask` (the summary row
+/// trusted for background work, which a daemon task never sets, and no process rule),
+/// `RestartMidTurn` (the screen read alone at a turn's end, the row still `RUNNING`),
+/// `RestartWithUnreadWake` (the wake's message read past: the turn agy owes it cut off),
+/// `RestartWhileShared` (another agy on the conversation read past),
+/// `RestartUnclaimed` (the signal with no claim on disk — a write that failed, or none
+/// made: the `0` read as someone's end, the conversation left down),
+/// `RestartOnStaleLook` (the signal on the first look's word, the last look its hold
+/// half alone: whatever turned in between is cut off), `BuildReadAsOlder` and
+/// `BuildReadAsNewer` (the order). Tier-1 (aterm-agent
+/// `harness/upgrade_agy_live_drive_tests.rs`,
+/// `tier1_the_real_agy_quiet_upgrade_conforms_to_the_model`) replays every state through
+/// the real order, screen reader, summary rule, transcript reader, process rule, wake
+/// rule, sharers, gate and claim.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_agy_quiet_upgrade_model() -> Model {
+    aterm_spec::ty_model! {
+        HarnessAgyQuietUpgrade {
+            const Buggy = 0;
+            var landed = 0;
+            var turn = 0;
+            var task = 0;
+            var daemon = 0;
+            var subagent = 0;
+            var wake = 0;
+            var shown = 0;
+            var panel = 1;
+            var draft = 0;
+            var held = 0;
+            var unread = 0;
+            var shared = 0;
+            var looked = 0;
+            var moved = 0;
+            var claimed = 0;
+            var exited = 0;
+            var decided = 0;
+            var stranded = 0;
+            var at_turn = 0;
+            var at_task = 0;
+            var at_daemon = 0;
+            var at_subagent = 0;
+            var at_wake = 0;
+            var at_shared = 0;
+            var slipped = 0;
+
+            action LandNewer when (moved == 0 && landed == 0) {
+                landed = 1;
+            }
+            action LandOlder when (moved == 0 && landed == 0) {
+                landed = 2;
+            }
+            action TurnStarts when (moved == 0 && turn == 0) {
+                turn = 1;
+                shown = 1;
+            }
+            action TurnEnds when (moved == 0 && turn == 1) {
+                turn = 0;
+            }
+            action ScreenBusy when (moved == 0 && shown == 0) {
+                shown = 1;
+            }
+            action ScreenIdle when (moved == 0 && shown == 1) {
+                shown = 0;
+            }
+            // A turn starts background work, which runs on after it ends; its
+            // end writes a message that wakes agy, whose own turn takes it.
+            action TaskStarts when (moved == 0 && turn == 1 && task == 0) {
+                task = 1;
+            }
+            action TaskEnds when (moved == 0 && task == 1) {
+                task = 0;
+                wake = 1;
+            }
+            action DaemonStarts when (moved == 0 && turn == 1 && daemon == 0) {
+                daemon = 1;
+            }
+            action DaemonEnds when (moved == 0 && daemon == 1) {
+                daemon = 0;
+                wake = 1;
+            }
+            action SubagentStarts when (moved == 0 && turn == 1 && subagent == 0) {
+                subagent = 1;
+            }
+            action SubagentIdle when (moved == 0 && subagent == 1) {
+                subagent = 0;
+                wake = 1;
+            }
+            action WakeTaken when (moved == 0 && wake == 1 && turn == 0) {
+                wake = 0;
+                turn = 1;
+                shown = 1;
+            }
+            action PanelHidden when (moved == 0 && panel == 1) {
+                panel = 0;
+            }
+            action PanelShown when (moved == 0 && panel == 0) {
+                panel = 1;
+            }
+            action DraftTyped when (moved == 0 && draft == 0) {
+                draft = 1;
+            }
+            action DraftCleared when (moved == 0 && draft == 1) {
+                draft = 0;
+            }
+            action Hold when (moved == 0 && held == 0) {
+                held = 1;
+            }
+            action Release when (moved == 0 && held == 1) {
+                held = 0;
+            }
+            action LogUnread when (moved == 0 && unread == 0) {
+                unread = 1;
+            }
+            action LogRead when (moved == 0 && unread == 1) {
+                unread = 0;
+            }
+            // Another agy opens the conversation (`agy -c` in another tab)
+            // and closes it.
+            action SharedOpens when (moved == 0 && shared == 0) {
+                shared = 1;
+            }
+            action SharedCloses when (moved == 0 && shared == 1) {
+                shared = 0;
+            }
+            // The step's first look: a newer build, no turn by the row,
+            // nothing running in or under it, no wake pending, the screen idle
+            // and empty, nobody holding it, the transcript read, no other agy
+            // on the conversation.
+            action Look when (
+                moved == 0 && looked == 0 && landed == 1 &&
+                turn == 0 && task == 0 && daemon == 0 && subagent == 0 && wake == 0 &&
+                shown == 0 && draft == 0 && held == 0 && unread == 0 && shared == 0
+            ) {
+                looked = 1;
+            }
+            // The claim, on disk before anything else — or refused.
+            action ClaimWritten when (moved == 0 && looked == 1 && claimed == 0) {
+                claimed = 1;
+            }
+            action ClaimUnwritten when (moved == 0 && looked == 1 && claimed == 0) {
+                looked = 0;
+            }
+            // The last look: the whole gate again, the claim on disk.
+            action Restart when (
+                moved == 0 && looked == 1 && claimed == 1 && landed == 1 &&
+                turn == 0 && task == 0 && daemon == 0 && subagent == 0 && wake == 0 &&
+                shown == 0 && draft == 0 && held == 0 && unread == 0 && shared == 0
+            ) {
+                moved = 1;
+                at_turn = turn;
+                at_task = task;
+                at_daemon = daemon;
+                at_subagent = subagent;
+                at_wake = wake;
+                at_shared = shared;
+            }
+            action TakeBack when (
+                moved == 0 && looked == 1 && claimed == 1 &&
+                (turn == 1 || task == 1 || daemon == 1 || subagent == 1 || wake == 1 ||
+                 shown == 1 || draft == 1 || held == 1 || unread == 1 || shared == 1)
+            ) {
+                looked = 0;
+                claimed = 0;
+            }
+            action Exit when (moved == 1 && exited == 0) {
+                exited = 1;
+            }
+            action ReadExit when (exited == 1 && decided == 0) {
+                decided = if claimed == 1 { 1 } else { 2 };
+            }
+            // The mutants, each its own dead action.
+            action RestartWithOpenWork when (
+                Buggy == 1 && slipped == 0 && moved == 0 && landed == 1 &&
+                turn == 0 && daemon == 0 && wake == 0 &&
+                shown == 0 && draft == 0 && held == 0 && unread == 0 && shared == 0 &&
+                (task == 1 || subagent == 1)
+            ) {
+                slipped = 1;
+                moved = 1;
+                claimed = 1;
+                at_turn = turn;
+                at_task = task;
+                at_daemon = daemon;
+                at_subagent = subagent;
+                at_wake = wake;
+                at_shared = shared;
+            }
+            action RestartWithDaemonTask when (
+                Buggy == 1 && slipped == 0 && moved == 0 && landed == 1 &&
+                turn == 0 && task == 0 && daemon == 1 && subagent == 0 && wake == 0 &&
+                shown == 0 && draft == 0 && held == 0 && unread == 0 && shared == 0
+            ) {
+                slipped = 1;
+                moved = 1;
+                claimed = 1;
+                at_turn = turn;
+                at_task = task;
+                at_daemon = daemon;
+                at_subagent = subagent;
+                at_wake = wake;
+                at_shared = shared;
+            }
+            action RestartMidTurn when (
+                Buggy == 1 && slipped == 0 && moved == 0 && landed == 1 &&
+                turn == 1 && task == 0 && daemon == 0 && subagent == 0 && wake == 0 &&
+                shown == 0 && draft == 0 && held == 0 && unread == 0 && shared == 0
+            ) {
+                slipped = 1;
+                moved = 1;
+                claimed = 1;
+                at_turn = turn;
+                at_task = task;
+                at_daemon = daemon;
+                at_subagent = subagent;
+                at_wake = wake;
+                at_shared = shared;
+            }
+            action RestartWithUnreadWake when (
+                Buggy == 1 && slipped == 0 && moved == 0 && landed == 1 &&
+                turn == 0 && task == 0 && daemon == 0 && subagent == 0 && wake == 1 &&
+                shown == 0 && draft == 0 && held == 0 && unread == 0 && shared == 0
+            ) {
+                slipped = 1;
+                moved = 1;
+                claimed = 1;
+                at_turn = turn;
+                at_task = task;
+                at_daemon = daemon;
+                at_subagent = subagent;
+                at_wake = wake;
+                at_shared = shared;
+            }
+            action RestartWhileShared when (
+                Buggy == 1 && slipped == 0 && moved == 0 && landed == 1 &&
+                turn == 0 && task == 0 && daemon == 0 && subagent == 0 && wake == 0 &&
+                shown == 0 && draft == 0 && held == 0 && unread == 0 && shared == 1
+            ) {
+                slipped = 1;
+                moved = 1;
+                claimed = 1;
+                at_turn = turn;
+                at_task = task;
+                at_daemon = daemon;
+                at_subagent = subagent;
+                at_wake = wake;
+                at_shared = shared;
+            }
+            action RestartUnclaimed when (
+                Buggy == 1 && slipped == 0 && moved == 0 && looked == 1 && claimed == 0 &&
+                landed == 1 &&
+                turn == 0 && task == 0 && daemon == 0 && subagent == 0 && wake == 0 &&
+                shown == 0 && draft == 0 && held == 0 && unread == 0 && shared == 0
+            ) {
+                slipped = 1;
+                moved = 1;
+                at_turn = turn;
+                at_task = task;
+                at_daemon = daemon;
+                at_subagent = subagent;
+                at_wake = wake;
+                at_shared = shared;
+            }
+            action RestartOnStaleLook when (
+                Buggy == 1 && slipped == 0 && moved == 0 && looked == 1 && claimed == 1 &&
+                landed == 1 &&
+                (turn == 1 || task == 1 || daemon == 1 || subagent == 1 || wake == 1 ||
+                 shown == 1 || draft == 1 || held == 1 || unread == 1 || shared == 1)
+            ) {
+                slipped = 1;
+                moved = 1;
+                at_turn = turn;
+                at_task = task;
+                at_daemon = daemon;
+                at_subagent = subagent;
+                at_wake = wake;
+                at_shared = shared;
+            }
+            action BuildReadAsOlder when (
+                Buggy == 1 && slipped == 0 && moved == 0 && landed == 1 &&
+                turn == 0 && task == 0 && daemon == 0 && subagent == 0 && wake == 0 &&
+                shown == 0 && draft == 0 && held == 0 && unread == 0 && shared == 0
+            ) {
+                slipped = 1;
+                stranded = 1;
+            }
+            action BuildReadAsNewer when (
+                Buggy == 1 && slipped == 0 && moved == 0 && landed == 2 &&
+                turn == 0 && task == 0 && daemon == 0 && subagent == 0 && wake == 0 &&
+                shown == 0 && draft == 0 && held == 0 && unread == 0 && shared == 0
+            ) {
+                slipped = 1;
+                moved = 1;
+                claimed = 1;
+                at_turn = turn;
+                at_task = task;
+                at_daemon = daemon;
+                at_subagent = subagent;
+                at_wake = wake;
+                at_shared = shared;
+            }
+
+            invariant NoRunningWorkInterrupted: at_task == 0 && at_subagent == 0;
+            invariant NoDaemonKilled: at_daemon == 0;
+            invariant NeverMidTurn: at_turn == 0;
+            invariant NoWakeLost: at_wake == 0;
+            invariant NeverStrandedDown: at_shared == 0;
+            invariant TheRestartIsRelaunched: decided <= 1;
+            invariant NeverStrandedBehind: stranded == 0;
+            invariant MovesOnlyUp: moved == 0 || landed == 1;
+        }
+    }
+}
+
+/// AN AGY EXIT, READ ON ITS SHELL'S WORD AND ITS CRASH FILE (aterm-agent
+/// `upgrade_agy_drive.rs` `look_at_exit` and `after_exit`,
+/// `relaunch::exit_record`; the agy lane of 2026-10-17, measured on 1.4.0).
+/// agy's own table: `0` every graceful way out — its own `/quit`, Ctrl-C or
+/// Ctrl-D twice, and someone's SIGTERM, SIGHUP or SIGINT, mid-turn too —
+/// removes its crash file (`<config>/crashes/crash_<pid>_<uuid>.log`);
+/// SIGKILL `137` leaves it; Ctrl-Z `146` (or another stop signal's status)
+/// STOPS agy, alive, its lock and crash file held; a start agy refuses exits
+/// `2` with no crash file; a Go panic is UNMEASURED — its status and whether
+/// its crash file survives — and is modelled as `2` beside its crash file
+/// (the table reads the file, whichever: a panic that removes it reads as a
+/// refusal, never relaunched). So any status but `0` and a stop's is a crash
+/// only where the dead pid's crash file is left — and
+/// the NEXT agy start deletes a dead pid's file, so the exit's look reads it
+/// as the exit is seen and keeps it. The conversation's presence lock is NO
+/// witness of the end: the file is never removed.
+///
+/// For ONE exit of ONE agy: `exit` 0 it runs, 1 SIGKILL, 2 a graceful way
+/// out, 3 Ctrl-Z (alive), 4 a refused start, 5 a panic; `witness` the
+/// snapshot named the conversation its process held (its presence lock held
+/// open — no witness, nothing to resume); `word` the shell has drawn the
+/// status of the block it ran in; `later` a later command's block is the
+/// newest since; `swept` another agy's start deleted the dead pid's crash
+/// file; `filed` the crash file stood as a look read the shell's word (a fact
+/// of the world, set by every look alike); `seen` the look has decided and
+/// `kept` what it found (1 a crash, 2 a clean end, 3 no verdict — read again
+/// at the attempt — 4 a refusal); `decided` 0 no attempt yet, 1 relaunched,
+/// 2 left. The world stands still once decided.
+///
+/// `TheirsIsLeft`: a graceful way out is never relaunched. `StoppedIsLeft`:
+/// a Ctrl-Z'd agy is never relaunched. `ARefusalIsNeverRetried`: a refused
+/// start is never relaunched. `ACrashReadAtItsExitIsRelaunched`: a witnessed
+/// crash whose crash file stood as its exit was read is never left.
+/// `NothingRelaunchedOnAGuess`: a relaunch had the crash file before it, at
+/// the look or at the attempt. `NoWitnessNoRelaunch`: nothing is relaunched
+/// without the conversation its process held.
+///
+/// `Buggy = 1` adds three looks and two attempts, each dead at `Buggy = 0`
+/// and caught alone: the exit LOOKED AT AS CLAUDE CODE'S, its own record (the
+/// presence lock) surviving every exit read as a crash (`LookAsClaude`:
+/// `Graceful`, `ShellWord`, `LookAsClaude`, `Decide` relaunches it —
+/// `TheirsIsLeft`); a REFUSAL READ AS A CRASH, the status `2` alone
+/// (`RefusalAsCrash`: `Refuse`, `ShellWord`, `RefusalAsCrash`, `Decide` —
+/// `ARefusalIsNeverRetried`); THE CRASH FILE IGNORED, the status alone (`137`
+/// a crash, `2` a refusal: `CrashFileIgnored`: `Crash`, `Sweep`, `ShellWord`,
+/// `CrashFileIgnored`, `Decide` relaunches a crash no file witnesses —
+/// `NothingRelaunchedOnAGuess` — and a panic's `2` beside its file is left —
+/// `ACrashReadAtItsExitIsRelaunched`); CTRL-Z READ AS A CRASH, an attempt
+/// that reads the stopped agy's `146` and the crash file it still holds as a
+/// crash, never asking whether it lives (`StopAsCrash`: `Stop`, `ShellWord`,
+/// `LookGone`, `StopAsCrash` — `StoppedIsLeft`); and one that relaunches a
+/// crash with no witness, fresh (`DecideFresh`: `Unwitnessed`, `Crash`,
+/// `ShellWord`, `Look`, `DecideFresh` — `NoWitnessNoRelaunch`). Tier-1
+/// (aterm-agent `harness/upgrade_agy_drive_tests.rs`,
+/// `tier1_the_real_agy_exit_read_conforms_to_the_model`) replays every look
+/// and every attempt of the model through the real `look_at_exit`,
+/// `exit_record` and `after_exit` over a stand-in tab, the blocks and the
+/// crash file on disk as the model has them, and requires each mutant caught
+/// on its own.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_agy_exit_witness_model() -> Model {
+    aterm_spec::ty_model! {
+        HarnessAgyExitWitness {
+            const Buggy = 0;
+            var exit = 0;
+            var witness = 1;
+            var word = 0;
+            var later = 0;
+            var swept = 0;
+            var filed = 0;
+            var seen = 0;
+            var kept = 0;
+            var decided = 0;
+
+            action Crash when (exit == 0) {
+                exit = 1;
+            }
+            action Graceful when (exit == 0) {
+                exit = 2;
+            }
+            action Stop when (exit == 0) {
+                exit = 3;
+            }
+            action Refuse when (exit == 0) {
+                exit = 4;
+            }
+            action Panic when (exit == 0) {
+                exit = 5;
+            }
+            action Unwitnessed when (exit == 0 && witness == 1) {
+                witness = 0;
+            }
+            action ShellWord when (exit > 0 && word == 0 && decided == 0) {
+                word = 1;
+            }
+            action Later when (word == 1 && later == 0 && decided == 0) {
+                later = 1;
+            }
+            action Sweep when ((exit == 1 || exit == 5) && swept == 0 && decided == 0) {
+                swept = 1;
+            }
+            action Look when (exit > 0 && seen == 0 && word == 1 && later == 0) {
+                seen = 1;
+                filed = if ((exit == 1 || exit == 5) && swept == 0) { 1 } else { 0 };
+                kept = if exit == 3 {
+                    3
+                } else {
+                    if exit == 2 {
+                        2
+                    } else {
+                        if ((exit == 1 || exit == 5) && swept == 0) {
+                            1
+                        } else {
+                            if (exit == 4 || exit == 5) { 4 } else { 3 }
+                        }
+                    }
+                };
+            }
+            action LookGone when (exit > 0 && seen == 0 && (exit == 3 || word == 0 || later == 1)) {
+                seen = 1;
+                kept = 3;
+            }
+            action LookAsClaude when (Buggy == 1 && exit > 0 && seen == 0) {
+                seen = 1;
+                filed = if ((exit == 1 || exit == 5) && swept == 0 && word == 1 && later == 0) { 1 } else { 0 };
+                kept = 1;
+            }
+            action RefusalAsCrash when (Buggy == 1 && exit == 4 && seen == 0 && word == 1 && later == 0) {
+                seen = 1;
+                kept = 1;
+            }
+            action CrashFileIgnored when (Buggy == 1 && (exit == 1 || exit == 5) && seen == 0 && word == 1 && later == 0) {
+                seen = 1;
+                filed = if swept == 0 { 1 } else { 0 };
+                kept = if exit == 1 { 1 } else { 4 };
+            }
+            action Decide when (seen == 1 && decided == 0) {
+                decided = if ((exit <= 2 || exit > 3)
+                    && witness == 1
+                    && (kept == 1
+                        || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5) && swept == 0)))
+                {
+                    1
+                } else {
+                    2
+                };
+            }
+            action StopAsCrash when (Buggy == 1 && seen == 1 && decided == 0 && exit == 3 && word == 1 && later == 0) {
+                decided = if witness == 1 { 1 } else { 2 };
+            }
+            action DecideFresh when (Buggy == 1 && seen == 1 && decided == 0 && witness == 0) {
+                decided = if ((exit <= 2 || exit > 3)
+                    && (kept == 1
+                        || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5) && swept == 0)))
+                {
+                    1
+                } else {
+                    2
+                };
+            }
+
+            invariant TheirsIsLeft: exit <= 1 || exit > 2 || decided == 0 || decided == 2;
+            invariant StoppedIsLeft: exit <= 2 || exit > 3 || decided == 0 || decided == 2;
+            invariant ARefusalIsNeverRetried: exit <= 3 || exit > 4 || decided == 0 || decided == 2;
+            invariant ACrashReadAtItsExitIsRelaunched: filed == 0 || witness == 0 || decided <= 1;
+            invariant NothingRelaunchedOnAGuess: decided == 0
+                || decided == 2
+                || filed == 1
+                || ((exit == 1 || exit == 5) && swept == 0 && word == 1 && later == 0);
+            invariant NoWitnessNoRelaunch: witness == 1 || decided == 0 || decided == 2;
+        }
+    }
+}
+
+/// A GEMINI CLI EXIT, READ ON ITS SHELL'S WORD, ITS SESSION NAMED BY THE
+/// START-TIME RULE AND ITS RESUME PRE-CHECKED (aterm-agent
+/// `upgrade_gemini_drive.rs` `look_at_exit` and `after_exit_onto`,
+/// `relaunch::exit_record`; the Gemini CLI lane of 2026-10-18, measured on
+/// 0.46.0). Gemini CLI's own table: `0` every graceful way out (`/quit`,
+/// `/exit`, Ctrl-C or Ctrl-D twice, SIGTERM to its child); `1` its child
+/// killed and `137` its parent killed — crashes; `41`, `42`, `52` a start it
+/// refused (no credential; an unknown id, another project's session, a
+/// duplicate id; its config) — never a crash; any other status names nothing
+/// measured (the parent ignores SIGTERM, SIGHUP and SIGINT). No file names a
+/// process's session and none is held open, so its session is the ONE
+/// session header of its project begun since it started, within the window
+/// its own lands in (each launch, each resume's duplicate and each `/clear`
+/// writes one), while no other session's file moved since: anything else
+/// names none. And its own `--resume` loads the newest of the session's
+/// files, which after two resumes with no turn between is an empty
+/// duplicate: the resume is typed only where a read-only fold of those files
+/// says it loads every turn.
+///
+/// For ONE exit of ONE Gemini CLI: `exit` 0 it runs, 1 its child killed
+/// (`1`), 2 a graceful way out, 3 a refused start, 4 a status with no word in
+/// the table, 5 its parent killed (`137`); `rule` what the start-time rule
+/// sees — 0 its own header alone since its start, 1 a second header since (a
+/// `/clear`, another launch), 2 its own header never written and another
+/// launch's begun past the window, 3 an in-TUI `/resume` onto an older
+/// session (a switch onto it, no header) with a start's background summary
+/// written after the switch; `dup` its resume would load an empty
+/// duplicate; `word` the shell has drawn the status of the block it ran in;
+/// `later` a later command's block is the newest since; `seen` the look has
+/// decided and `kept` what it found (1 a crash, 2 a clean end, 3 no verdict —
+/// read again at the attempt — 4 a refusal); `decided` 0 no attempt yet, 1
+/// relaunched, 2 left (told, never typed). The world stands still once
+/// decided.
+///
+/// `TheirsIsLeft`: a graceful way out is never relaunched.
+/// `ARefusalIsNeverRetried`: a refused start is never relaunched.
+/// `NothingRelaunchedOnAGuess`: only a crash is relaunched.
+/// `ACrashReadAtItsExitIsRelaunched`: a crash whose shell drew its word, its
+/// session named and its resume safe, is never left. `NoUniqueWitnessNoRelaunch`:
+/// nothing is relaunched where the start-time rule names no one session.
+/// `NeverIntoAnEmptyCopy`: nothing is relaunched where its resume would load
+/// a copy missing its turns.
+///
+/// `Buggy = 1` adds three looks and four attempts, each dead at `Buggy = 0`
+/// and caught alone: the exit LOOKED AT AS CLAUDE CODE'S, its own record (its
+/// session file, which every way out leaves) surviving read as a crash
+/// (`LookAsClaude`: `Graceful`, `ShellWord`, `LookAsClaude`, `Decide`
+/// relaunches it — `TheirsIsLeft`); a REFUSAL READ AS A CRASH, a table that
+/// knows only clean ends and crashes (`RefusalAsCrash`: `Refuse`, `ShellWord`,
+/// `RefusalAsCrash`, `Decide` — `ARefusalIsNeverRetried`); its dual, A
+/// CHILD'S DEATH READ AS A REFUSAL, Muse Code's table (whose `1` is a start
+/// it refused) on Gemini CLI's (whose `1` is its child killed:
+/// `ChildDeathAsRefusal`: `Crash`, `ShellWord`, `ChildDeathAsRefusal`,
+/// `Decide` leaves it — `ACrashReadAtItsExitIsRelaunched`); A NON-UNIQUE
+/// WITNESS TRUSTED, the first header since its start read as its session
+/// whatever came after (`NonUniqueTrusted`: `SecondHeader`, `Crash`,
+/// `ShellWord`, `Look`, `NonUniqueTrusted` — `NoUniqueWitnessNoRelaunch`); A
+/// LATE HEADER TRUSTED, the one header since its start read as its own
+/// however long after it was begun (`LateHeaderTrusted`: `LateHeader`,
+/// `Crash`, `ShellWord`, `Look`, `LateHeaderTrusted` —
+/// `NoUniqueWitnessNoRelaunch`); A SWITCH HIDDEN BY A SUMMARY, an in-TUI
+/// `/resume` read only as a file's last record, so the summary after it
+/// hides it (`SwitchHiddenBySummary`: `SwitchedBehindSummary`, `Crash`,
+/// `ShellWord`, `Look`, `SwitchHiddenBySummary` —
+/// `NoUniqueWitnessNoRelaunch`); and THE PRE-CHECK SKIPPED, the resume typed
+/// whatever it would load (`PrecheckSkipped`: `Duplicate`, `Crash`,
+/// `ShellWord`, `Look`, `PrecheckSkipped` — `NeverIntoAnEmptyCopy`). Tier-1
+/// (aterm-agent `harness/upgrade_gemini_drive_tests.rs`,
+/// `tier1_the_real_gemini_exit_read_conforms_to_the_model`) replays every look
+/// and every attempt of the model through the real `look_at_exit`,
+/// `exit_record` and `after_exit` over a stand-in tab, the blocks and the
+/// project's session files on disk as the model has them, and requires each
+/// mutant caught on its own.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_gemini_exit_witness_model() -> Model {
+    aterm_spec::ty_model! {
+        HarnessGeminiExitWitness {
+            const Buggy = 0;
+            var exit = 0;
+            var rule = 0;
+            var dup = 0;
+            var word = 0;
+            var later = 0;
+            var seen = 0;
+            var kept = 0;
+            var decided = 0;
+
+            action Crash when (exit == 0) {
+                exit = 1;
+            }
+            action Graceful when (exit == 0) {
+                exit = 2;
+            }
+            action Refuse when (exit == 0) {
+                exit = 3;
+            }
+            action Unwitnessed when (exit == 0) {
+                exit = 4;
+            }
+            action ParentKilled when (exit == 0) {
+                exit = 5;
+            }
+            action SecondHeader when (exit == 0 && rule == 0) {
+                rule = 1;
+            }
+            action LateHeader when (exit == 0 && rule == 0) {
+                rule = 2;
+            }
+            action SwitchedBehindSummary when (exit == 0 && rule == 0) {
+                rule = 3;
+            }
+            action Duplicate when (exit == 0 && dup == 0) {
+                dup = 1;
+            }
+            action ShellWord when (exit > 0 && word == 0 && decided == 0) {
+                word = 1;
+            }
+            action Later when (word == 1 && later == 0 && decided == 0) {
+                later = 1;
+            }
+            action Look when (exit > 0 && seen == 0 && word == 1 && later == 0) {
+                seen = 1;
+                kept = if (exit == 1 || exit == 5) {
+                    1
+                } else {
+                    if exit == 2 {
+                        2
+                    } else {
+                        if exit == 3 { 4 } else { 3 }
+                    }
+                };
+            }
+            action LookGone when (exit > 0 && seen == 0 && (word == 0 || later == 1)) {
+                seen = 1;
+                kept = 3;
+            }
+            action LookAsClaude when (Buggy == 1 && exit > 0 && seen == 0) {
+                seen = 1;
+                kept = 1;
+            }
+            action RefusalAsCrash when (Buggy == 1 && exit == 3 && seen == 0 && word == 1 && later == 0) {
+                seen = 1;
+                kept = 1;
+            }
+            action ChildDeathAsRefusal when (Buggy == 1 && exit == 1 && seen == 0 && word == 1 && later == 0) {
+                seen = 1;
+                kept = 4;
+            }
+            action Decide when (seen == 1 && decided == 0) {
+                decided = if ((kept == 1 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5)))
+                    && rule == 0
+                    && dup == 0)
+                {
+                    1
+                } else {
+                    2
+                };
+            }
+            action NonUniqueTrusted when (Buggy == 1 && seen == 1 && decided == 0 && rule == 1) {
+                decided = if ((kept == 1 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5)))
+                    && dup == 0)
+                {
+                    1
+                } else {
+                    2
+                };
+            }
+            action LateHeaderTrusted when (Buggy == 1 && seen == 1 && decided == 0 && rule == 2) {
+                decided = if ((kept == 1 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5)))
+                    && dup == 0)
+                {
+                    1
+                } else {
+                    2
+                };
+            }
+            action SwitchHiddenBySummary when (Buggy == 1 && seen == 1 && decided == 0 && rule == 3) {
+                decided = if ((kept == 1 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5)))
+                    && dup == 0)
+                {
+                    1
+                } else {
+                    2
+                };
+            }
+            action PrecheckSkipped when (Buggy == 1 && seen == 1 && decided == 0 && dup == 1) {
+                decided = if ((kept == 1 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5)))
+                    && rule == 0)
+                {
+                    1
+                } else {
+                    2
+                };
+            }
+
+            invariant TheirsIsLeft: exit <= 1 || exit > 2 || decided == 0 || decided == 2;
+            invariant ARefusalIsNeverRetried: exit <= 2 || exit > 3 || decided == 0 || decided == 2;
+            invariant NothingRelaunchedOnAGuess: decided == 0 || decided == 2 || exit == 1 || exit == 5;
+            invariant ACrashReadAtItsExitIsRelaunched: exit == 0
+                || exit == 2
+                || exit == 3
+                || exit == 4
+                || word == 0
+                || later == 1
+                || rule > 0
+                || dup == 1
+                || decided <= 1;
+            invariant NoUniqueWitnessNoRelaunch: rule == 0 || decided == 0 || decided == 2;
+            invariant NeverIntoAnEmptyCopy: dup == 0 || decided == 0 || decided == 2;
+        }
+    }
+}
+
 /// THE UPGRADE'S LOOKS AT ONE SESSION, as its worker takes them at the
 /// loop's idle points (`aterm-gui`'s `harness_host::WorkerIdle::at_idle`,
 /// over `aterm-agent`'s `upgrade_drive::due`), and ITS NOTE BEHIND
@@ -2059,7 +3034,7 @@ pub fn harness_upgrade_age_model() -> Model {
 /// * `HandOn` / `ClaimOn` / `HandOff` — another hand lands on the session,
 ///   or leaves it, at any point: a fleet halt, the bridge-lost auto-hold,
 ///   the owner's local hold, a driver's lease or turn (`HandOn`), or another
-///   supervisor's claim, `drive watch`'s (`ClaimOn`) — on a free session or
+///   supervisor's claim (`ClaimOn`) — on a free session or
 ///   beside a hand already standing, an end carried through it included (the
 ///   review of ruling 20); `HandOff` lifts what stands.
 /// * `Commit` — at any point; `CarrierFinishes` — the successor's carrier

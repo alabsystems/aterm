@@ -1,0 +1,12 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# T1: the harness's `key act=approve`, admitted under the open box and
+# accepted before the screen read that saw the box go: the box closes
+# approved, by the harness (a proven author with an act).
+see busy
+half
+see prompt bash:not-read-only fixture=claude-2.1.280-box-bash-touch
+expect open p1 approval par=t1 box=bash:not-read-only at=500
+admit harness act=approve
+accept
+at 750 see busy
+expect close p1 approval out=approved by=harness at=750

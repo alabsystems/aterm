@@ -178,8 +178,8 @@ aterm theme install <id>... | --all [--replace]
   Copy pack themes into the themes folder as ordinary files, where Settings
   and `theme = \"<id>\"` find them. A theme already there unchanged is left
   alone; one that differs (you edited it) is kept unless --replace. A file
-  whose name differs only in case blocks the install. Settings ▸ Themes ▸
-  Get More does the same, one theme at a time.
+  whose name differs only in case blocks the install. Keep on a row of
+  Settings ▸ Themes ▸ Community does the same, one theme at a time.
 
   --all       Every pack theme.
   --replace   Overwrite a pack theme's file you changed.

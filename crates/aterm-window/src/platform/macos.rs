@@ -25,76 +25,21 @@
 //! [#2087]: https://github.com/rust-windowing/winit/issues/2087
 //! [`ApplicationHandler::resumed`]: crate::application::ApplicationHandler::resumed
 //!
-//! ## Custom `NSApplicationDelegate`
+//! ## Application termination
 //!
-//! Winit usually handles everything related to the lifecycle events of the application. Sometimes,
-//! though, you might want to do more niche stuff, such as [handle when the user re-activates the
-//! application][reopen]. Such functionality is not exposed directly in Winit, since it would
-//! increase the API surface by quite a lot.
+//! This fork installs its own `NSApplicationDelegate` to deliver application lifecycle events.
+//! Keep that delegate in place. To decide whether AppKit may terminate the application,
+//! register a callback with [`set_application_should_terminate_handler`]. It runs on the main
+//! thread; returning `false` cancels termination. Only the first registration takes effect.
 //!
-//! [reopen]: https://developer.apple.com/documentation/appkit/nsapplicationdelegate/1428638-applicationshouldhandlereopen?language=objc
+//! ```no_run
+//! use aterm_window::platform::macos::set_application_should_terminate_handler;
 //!
-//! Instead, Winit guarantees that it will not register an application delegate, so the solution is
-//! to register your own application delegate, as outlined in the following example (see
-//! `objc2-app-kit` for more detailed information).
-//!
-//! **The example below is upstream's, and it does not build in this fork.** It is written
-//! against the `objc2` family, which this fork stopped depending on at the `objc2` exit
-//! condition (2026-09-03; see the retirement note in this fork's `Cargo.toml`). It is kept as
-//! upstream's statement of the delegate contract and fenced `ignore` on every platform — it
-//! used to be a live doctest on macOS. The fork's own delegates are built on `aterm-objc`;
-//! `platform_impl/macos/app_state.rs` is the shape to copy.
-//!
-//! ```ignore
-//! use objc2::rc::Retained;
-//! use objc2::runtime::ProtocolObject;
-//! use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
-//! use objc2_app_kit::{NSApplication, NSApplicationDelegate};
-//! use objc2_foundation::{NSArray, NSURL, MainThreadMarker, NSObject, NSObjectProtocol};
-//! use winit::event_loop::EventLoop;
-//!
-//! declare_class!(
-//!     struct AppDelegate;
-//!
-//!     unsafe impl ClassType for AppDelegate {
-//!         type Super = NSObject;
-//!         type Mutability = mutability::MainThreadOnly;
-//!         const NAME: &'static str = "MyAppDelegate";
-//!     }
-//!
-//!     impl DeclaredClass for AppDelegate {}
-//!
-//!     unsafe impl NSObjectProtocol for AppDelegate {}
-//!
-//!     unsafe impl NSApplicationDelegate for AppDelegate {
-//!         #[method(application:openURLs:)]
-//!         fn application_openURLs(&self, application: &NSApplication, urls: &NSArray<NSURL>) {
-//!             // Note: To specifically get `application:openURLs:` to work, you _might_
-//!             // have to bundle your application. This is not done in this example.
-//!             println!("open urls: {application:?}, {urls:?}");
-//!         }
-//!     }
-//! );
-//!
-//! impl AppDelegate {
-//!     fn new(mtm: MainThreadMarker) -> Retained<Self> {
-//!         unsafe { msg_send_id![super(mtm.alloc().set_ivars(())), init] }
-//!     }
+//! fn allow_termination() -> bool {
+//!     true
 //! }
 //!
-//! fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let event_loop = EventLoop::new()?;
-//!
-//!     let mtm = MainThreadMarker::new().unwrap();
-//!     let delegate = AppDelegate::new(mtm);
-//!     // Important: Call `sharedApplication` after `EventLoop::new`,
-//!     // doing it before is not yet supported.
-//!     let app = NSApplication::sharedApplication(mtm);
-//!     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-//!
-//!     // event_loop.run_app(&mut my_app);
-//!     Ok(())
-//! }
+//! set_application_should_terminate_handler(allow_termination);
 //! ```
 
 use crate::event_loop::EventLoopBuilder;
@@ -219,9 +164,9 @@ pub trait EventLoopBuilderExtMacOS {
     /// Set the activation policy to "accessory".
     ///
     /// ```
-    /// use winit::event_loop::EventLoop;
+    /// use aterm_window::event_loop::EventLoop;
     /// #[cfg(target_os = "macos")]
-    /// use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+    /// use aterm_window::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
     ///
     /// let mut builder = EventLoop::builder();
     /// #[cfg(target_os = "macos")]

@@ -44,15 +44,15 @@ name = "aterm_font"
 path = "src/lib.rs"
 
 [features]
-default = ["hint"]
 # The automatic hinter (`src/autohint/`, TF.4): FreeType's autofit as skrifa
-# 0.46.2 ports it, carved. On by default so this crate's own tests replay the
-# TF.1 hinting corpus on every host; the workspace row turns default features
-# off, and aterm-render asks for it only where it grid-fits (Linux and
-# Windows), so the shipped macOS and wasm builds compile none of it. A
-# `--workspace` build selects this crate with its defaults, and feature
-# unification turns `hint` on for aterm-render there too; only its
-# target-gated `src/hinted.rs` calls it.
+# 0.46.2 ports it, carved. aterm-render asks for it only where it grid-fits
+# (Linux and Windows), so the shipped macOS and wasm builds compile none of
+# it. Every build with debug assertions compiles it too, whatever the
+# feature (`cfg(any(feature = "hint", debug_assertions))`): this crate's own
+# tests replay the TF.1 hinting corpus on every host, and aterm-render's macOS
+# tests drive its portable raster, with no `default` key or dev row turning
+# the feature on — such a row made a `--workspace` test build and a `-p aterm`
+# build compile two aterm-fonts and two of everything above it (P4).
 hint = []
 
 [dependencies]

@@ -1,0 +1,11 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (35x11, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the single-server .mcp.json approval dialog (one new server lab-probe), the cursor moved Up to its second option (`Use this and all future MCP servers in this project`), the pane resized to 35x11 (`ctl resize 11 35`): its head off the screen, all three options shown, no rule, the cursor's option wrapped (`servers in this project`) over the unmarked, wrapped `Continue without using this MCP`
+  documentation.
+
+    Use this MCP server
+  ❯ Use this and all future MCP
+    servers in this project
+    Continue without using this MCP
+    server
+
+  Enter to confirm · Esc to
+  cancel

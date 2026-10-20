@@ -3839,8 +3839,8 @@ mod tests {
     /// Law: every built-in, Default included, is legible as shipped. Body
     /// text clears 4.5:1, the selection band reads as a band (1.5:1 on the
     /// background), the cursor clears 3:1, and no ANSI slot is the
-    /// background (text in it would be invisible, and `minimum_contrast` is
-    /// off by default, so nothing rescues it).
+    /// background (text in it would be invisible, and outside Windows'
+    /// theme-pair floor nothing rescues it by default).
     #[test]
     fn builtins_are_legible() {
         for theme in builtin_theme_list() {

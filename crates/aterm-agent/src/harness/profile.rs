@@ -41,8 +41,15 @@
 //!   ([`UsageCache`]).
 //! * `cachedGrowthBookFeatures`: the two Fable billing flags by name,
 //!   `tengu_saffron_credits_only_tiers` and `tengu_saffron_lattice`
-//!   ([`FablePlan`]). Their names stay in this file: what leaves it is
-//!   aterm's own word.
+//!   ([`FablePlan`]), and `tengu_calm_seal`, the model families billed to
+//!   usage credits only ([`Profile::credits_only`]). Their names stay in this
+//!   file: what leaves it is aterm's own word.
+//! * `fableOverageConsentV2` and `usageCreditsOnlyModelConsent`: the
+//!   consents Claude Code stores to bill a model to usage credits with no
+//!   dialog (READ in the 2.1.304 bundle: `{ "<org or acct:id>": true }`, the
+//!   second per family), as the families consented
+//!   ([`Profile::consented`]). The ids they are keyed by are read past,
+//!   never kept.
 //!
 //! WHERE THE FILE IS: the home's own profile is [`path_of`], by the one
 //! resolver of a Claude home (`upgrade_drive`'s `Records`):
@@ -53,7 +60,15 @@
 //!
 //! What this module answers is a record (design §8.2): it reads and
 //! decides nothing, and nothing that decides — no supervisor, no rotation —
-//! reads it. Its [`AccountKey`] and [`Word`] types are shared: the Codex
+//! reads it, but for TWO keys: the method `/login`'s picker is answered with
+//! ([`login_method`], a plan word and nothing else), and under `[harness]
+//! usage_credits = false` which models it bills to usage credits
+//! ([`FablePlan`], [`Profile::consented`], [`Profile::credits_only`]): such a
+//! model is moved onto by no upgrade, fallback or return
+//! (`upgrade_drive::credits_billed_for`, `upgrade_models::credits_billed`;
+//! the owner, 2026-10-19) — and where the profile cannot say (no profile
+//! read, a plan not known, two logins listed), Fable is taken for billed:
+//! the review of 2026-10-19, P4. Its [`AccountKey`] and [`Word`] types are shared: the Codex
 //! rollout reader (`ai::codex_limits`) keys each usage reading by the
 //! account its rollout names, and keeps the vendor's words, in them.
 
@@ -499,6 +514,14 @@ pub struct Profile {
     pub usage: Option<UsageCache>,
     /// [`FablePlan`].
     pub fable: FablePlan,
+    /// The model families a stored consent bills to usage credits with no
+    /// dialog, lowercased (`fable` by `fableOverageConsentV2`, a family of
+    /// `usageCreditsOnlyModelConsent`): any id's `true` counts — a home two
+    /// logins share keeps both theirs.
+    pub consented: Vec<String>,
+    /// The model families billed to usage credits only, lowercased
+    /// (`tengu_calm_seal`); `None`: the flag absent or of another shape.
+    pub credits_only: Option<Vec<String>>,
 }
 
 /// WHY NO PROFILE WAS READ, one closed word each ([`NoProfile::word`]).
@@ -596,11 +619,280 @@ pub fn effective(plain: &Path, records: Option<&Path>, custom_oauth: bool) -> Pa
     plain
 }
 
+/// The profile filename selected by a process's own exec environment.
+/// Unknown context never grants a billing decision. No URL or credential is kept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Selection {
+    /// The exec environment was not read, or disagrees on the selector.
+    #[default]
+    Unknown,
+    /// The ordinary `.claude.json` filename.
+    Standard,
+    /// The `.claude-custom-oauth.json` filename.
+    CustomOauth,
+}
+
+impl Selection {
+    /// Read only the selector from a captured exec environment. Empty means
+    /// unread, not a known default. Conflicting duplicate values are unknown.
+    #[must_use]
+    pub fn of_exec_env(env: &[String]) -> Self {
+        if env.is_empty() {
+            return Self::Unknown;
+        }
+        let mut selected = None;
+        for (_, value) in env
+            .iter()
+            .filter_map(|word| word.split_once('='))
+            .filter(|(name, _)| *name == "CLAUDE_CODE_CUSTOM_OAUTH_URL")
+        {
+            let custom = !value.is_empty();
+            if selected.is_some_and(|old| old != custom) {
+                return Self::Unknown;
+            }
+            selected = Some(custom);
+        }
+        if selected.unwrap_or(false) {
+            Self::CustomOauth
+        } else {
+            Self::Standard
+        }
+    }
+}
+
+/// The process's captured profile identity for a billing decision. This
+/// live-only context is separate from older model/access-cache path identity.
+/// It contains paths and a filename choice, never profile bytes or an OAuth URL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Context {
+    /// The exact plain profile path resolved from the process's HOME/config.
+    pub plain: PathBuf,
+    /// The process's resolved Claude record directory, for legacy selection.
+    pub records: PathBuf,
+    /// The filename choice from its own captured exec environment.
+    pub selection: Selection,
+    /// The captured HOME (unset/empty remain distinct).
+    pub home: Option<String>,
+    /// The captured CLAUDE_CONFIG_DIR (unset/empty remain distinct).
+    pub config: Option<String>,
+    /// The captured stored-login selector (unset/empty remain distinct).
+    pub login: Option<String>,
+}
+
+/// One exec variable, known unset versus unknown/conflicting. No environment
+/// of the supervising process is consulted.
+fn exec_var<'a>(env: &'a [String], name: &str) -> Option<Option<&'a str>> {
+    if env.is_empty() {
+        return None;
+    }
+    let mut found = None;
+    for (_, value) in env
+        .iter()
+        .filter_map(|word| word.split_once('='))
+        .filter(|(key, _)| *key == name)
+    {
+        if found.is_some_and(|old| old != value) {
+            return None;
+        }
+        found = Some(value);
+    }
+    Some(found)
+}
+
+impl Context {
+    /// The profile paths of already-resolved records, with the process's
+    /// own HOME/config/login and filename selector. Pure captured data.
+    pub(super) fn of_exec_env(user_home: &Path, records: &Path, env: &[String]) -> Option<Self> {
+        let vars = HomeVars {
+            config: exec_var(env, super::accounts::HOME_ENV)?,
+            home: exec_var(env, "HOME")?,
+        };
+        let selection = Selection::of_exec_env(env);
+        if selection == Selection::Unknown {
+            return None;
+        }
+        Some(Self {
+            plain: super::upgrade_drive::profile_in(user_home, vars, records),
+            records: records.to_path_buf(),
+            selection,
+            home: vars.home.map(str::to_owned),
+            config: vars.config.map(str::to_owned),
+            login: exec_var(env, super::accounts::LOGIN_ENV)?.map(str::to_owned),
+        })
+    }
+
+    /// A Standard model move's complete profile environment. Each relevant
+    /// variable is set or explicitly removed, so a shell's mutable inherited
+    /// environment is never evidence of the target's billing context. The
+    /// required home/login overlay remains authoritative; a changed context
+    /// is refused by the caller. Custom OAuth needs its URL, which is never
+    /// retained here: it cannot take this path with billing disabled.
+    pub(super) fn for_launch(
+        &self,
+        user_home: &Path,
+        cwd: &str,
+        required: &[(&'static str, &str)],
+    ) -> Option<LaunchEnv> {
+        if self.selection != Selection::Standard {
+            return None;
+        }
+        let mut values = Vec::new();
+        let mut unset = Vec::new();
+        for (name, captured) in [
+            ("HOME", self.home.as_deref()),
+            (super::accounts::HOME_ENV, self.config.as_deref()),
+            (super::accounts::LOGIN_ENV, self.login.as_deref()),
+        ] {
+            let value = required
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map_or(captured, |(_, value)| Some(*value));
+            if let Some(value) = value {
+                values.push((name, value.to_string()));
+            } else {
+                unset.push(name);
+            }
+        }
+        if required.iter().any(|(name, _)| {
+            !matches!(*name, "HOME")
+                && *name != super::accounts::HOME_ENV
+                && *name != super::accounts::LOGIN_ENV
+        }) {
+            return None;
+        }
+        // The vendor's selector tests truthiness: an explicit empty value
+        // selects Standard even if the shell currently holds a custom URL.
+        values.push(("CLAUDE_CODE_CUSTOM_OAUTH_URL", String::new()));
+        let env: Vec<String> = values
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        let vars = HomeVars {
+            config: exec_var(&env, super::accounts::HOME_ENV)?,
+            home: exec_var(&env, "HOME")?,
+        };
+        let records = Records::at(user_home, vars, || {
+            Path::new(cwd).is_absolute().then(|| PathBuf::from(cwd))
+        });
+        let context = Self::of_exec_env(user_home, records.dir()?, &env)?;
+        Some(LaunchEnv {
+            values,
+            unset,
+            context,
+        })
+    }
+}
+
+/// Required values and removals, plus the context resolved only from those
+/// words. No shell environment, OAuth URL or profile bytes are retained.
+pub(super) struct LaunchEnv {
+    pub values: Vec<(&'static str, String)>,
+    pub unset: Vec<&'static str>,
+    pub context: Context,
+}
+
+/// The effective profile, with selection uncertainty preserved for a billing
+/// decision. Unlike [`effective`]'s informational fallback, an unreadable
+/// selector is an error; only `NotFound` proves a candidate absent.
+/// A usable legacy file is also unknown here: the documented diskless
+/// branch ignores it, and the captured context does not identify that branch.
+/// This refuses a decision rather than merging two possible accounts.
+///
+/// # Errors
+/// Missing process context or records, or selection metadata that cannot be read.
+pub(super) fn effective_for_billing(
+    plain: &Path,
+    records: Option<&Path>,
+    selection: Selection,
+) -> std::io::Result<PathBuf> {
+    let plain = match selection {
+        Selection::Unknown => return Err(std::io::Error::other("profile selector unknown")),
+        Selection::Standard => plain.to_path_buf(),
+        Selection::CustomOauth => plain.with_file_name(".claude-custom-oauth.json"),
+    };
+    let records = records.ok_or_else(|| std::io::Error::other("records directory unknown"))?;
+    let legacy = records.join(".config.json");
+    let meta = match std::fs::metadata(&legacy) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(plain),
+        Err(e) => return Err(e),
+    };
+    if !meta.is_file() || (meta.len() == 0 && meta.permissions().readonly()) {
+        return Ok(plain);
+    }
+    if meta.len() > 0 {
+        return Err(std::io::Error::other("legacy profile selection unknown"));
+    }
+    match std::fs::metadata(&plain) {
+        Ok(_) => Ok(plain),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(std::io::Error::other("legacy profile selection unknown"))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Whether a raw `CLAUDE_CODE_CUSTOM_OAUTH_URL` renames the profile
 /// ([`effective`]): set and not empty, as JavaScript tests it.
 #[must_use]
 pub fn custom_oauth(raw: Option<&std::ffi::OsStr>) -> bool {
     raw.is_some_and(|url| !url.is_empty())
+}
+
+/// THE METHOD A CLAUDE CODE PROCESS'S LOGIN IS, for the one key the harness
+/// presses on `/login`'s method picker (`supervise::policy::login`): the ONE
+/// decision this module's record feeds. `env` is the process's own exec
+/// environment (`KEY=value`), `user_home` the user's home; `renewable` says a
+/// roster row with an email names the process's login (a claude.ai account:
+/// a renewal's check holds it to `authMethod: claude.ai`).
+///
+/// A SUBSCRIPTION — the picker's `Claude account with subscription` — only
+/// where the process authenticates by a stored login (nothing in its
+/// environment gives it a key, a token, a provider or a route of its own:
+/// [`super::accounts::ProcessLogin::of_exec_env`]) and that login is a
+/// renewable row's, or the profile of its home names one of claude.ai's four
+/// plans (`oauthAccount.organizationType`, [`PlanWord`]): a login Claude
+/// Code's subscription sign-in made. `None` everywhere else — an environment
+/// credential (`/login` cannot change it), a Console login, a profile that
+/// cannot be read or names no plan: never a guess. The profile is the file
+/// [`effective`] selects; unknown records (a relative or empty config directory
+/// with no working directory) name no method. Reads only that allowlisted
+/// profile ([`read`]) and its selection metadata.
+#[must_use]
+pub fn login_method(
+    env: &[String],
+    user_home: &Path,
+    renewable: bool,
+) -> Option<aterm_phase::LoginMethod> {
+    let who = super::accounts::ProcessLogin::of_exec_env(env)?;
+    if !who.stored_login {
+        return None;
+    }
+    if renewable {
+        return Some(aterm_phase::LoginMethod::Subscription);
+    }
+    let var = |name: &str| {
+        env.iter()
+            .filter_map(|kv| kv.split_once('='))
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v)
+    };
+    let records = Records::at(
+        user_home,
+        HomeVars {
+            config: var(super::accounts::HOME_ENV),
+            home: var("HOME"),
+        },
+        || None,
+    );
+    let plain = records.profile(user_home)?;
+    let path = effective(
+        &plain,
+        Some(records.dir()?),
+        custom_oauth(var("CLAUDE_CODE_CUSTOM_OAUTH_URL").map(std::ffi::OsStr::new)),
+    );
+    let plan = read(&path).ok()?.plan.word?;
+    (plan != PlanWord::Other).then_some(aterm_phase::LoginMethod::Subscription)
 }
 
 /// READ THE PROFILE AT `path` ([`parse`]). Opened without blocking (a FIFO
@@ -615,6 +907,11 @@ pub fn read(path: &Path) -> Result<Profile, NoProfile> {
     let mut file = match open_nonblocking(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(NoProfile::Missing),
+        // Windows refuses to open a directory as a file at all (access
+        // denied): what stands there is told by its metadata, nothing read.
+        Err(_) if std::fs::metadata(path).is_ok_and(|meta| !meta.is_file()) => {
+            return Err(NoProfile::NotAFile);
+        }
         Err(_) => return Err(NoProfile::Unreadable),
     };
     let meta = file.metadata().map_err(|_| NoProfile::Unreadable)?;
@@ -711,13 +1008,25 @@ fn profile_of(raw: RawFile) -> Profile {
         .0
         .filter(|cache| key.is_some() && cache.key.0 == key)
         .and_then(usage_of);
-    let fable = fable_plan(&plan, raw.features.0.unwrap_or_default());
+    let features = raw.features.0.unwrap_or_default();
+    let credits_only = features
+        .calm_seal
+        .0
+        .as_ref()
+        .map(|words| words.iter().filter_map(|w| family(w.as_str())).collect());
+    let fable = fable_plan(&plan, features);
+    let mut consented: Vec<String> = raw.model_consent.0;
+    if raw.fable_consent.0 && !consented.iter().any(|f| f == "fable") {
+        consented.insert(0, "fable".to_string());
+    }
     Profile {
         key,
         plan,
         credits,
         usage,
         fable,
+        consented,
+        credits_only,
     }
 }
 
@@ -934,10 +1243,21 @@ pub fn instant(text: &str) -> Option<i64> {
 // The typed reader: the allowlist's shapes, every leaf lenient
 // ---------------------------------------------------------------------------
 
-/// The file: the four keys read; every other key skipped.
+/// A MODEL FAMILY'S NAME as a key or a flag spells it (`Fable`, `nimbus`),
+/// lowercased: letters alone, at most 32 — an id (digits, hyphens) is none.
+fn family(name: &str) -> Option<String> {
+    (!name.is_empty() && name.len() <= 32 && name.bytes().all(|b| b.is_ascii_alphabetic()))
+        .then(|| name.to_ascii_lowercase())
+}
+
+/// The file: the six keys read; every other key skipped.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct RawFile {
+    #[serde(rename = "fableOverageConsentV2")]
+    fable_consent: Consent,
+    #[serde(rename = "usageCreditsOnlyModelConsent")]
+    model_consent: Consents,
     #[serde(rename = "oauthAccount")]
     oauth: Obj<RawOauth>,
     #[serde(rename = "cachedExtraUsageDisabledReason")]
@@ -1051,6 +1371,8 @@ struct RawFeatures {
     tiers: Words,
     #[serde(rename = "tengu_saffron_lattice")]
     lattice: Obj<RawLattice>,
+    #[serde(rename = "tengu_calm_seal")]
+    calm_seal: Words,
 }
 
 #[derive(Default, Deserialize)]
@@ -1374,6 +1696,90 @@ impl<'de> Deserialize<'de> for FableEntries {
             }
         }
         d.deserialize_any(V)
+    }
+}
+
+/// A STORED CONSENT (`{ "<org or acct:id>": true }`): whether any entry
+/// holds `true`. The keys — an organization's or an account's id — are read
+/// past by the parser's ignored-value path, never built.
+#[derive(Default)]
+struct Consent(bool);
+
+impl<'de> Deserialize<'de> for Consent {
+    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Consent;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Consent, A::Error> {
+                let mut given = false;
+                while map.next_key::<IgnoredAny>()?.is_some() {
+                    given |= matches!(map.next_value::<Leaf>()?, Leaf::Flag(true));
+                }
+                Ok(Consent(given))
+            }
+            lenient_scalars!(Consent(false));
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Consent, A::Error> {
+                drain_seq(seq).map(|()| Consent(false))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// THE STORED CONSENTS PER FAMILY (`{ "<family>": { "<org or acct:id>":
+/// true } }`): the families ([`family`]) whose [`Consent`] holds. A key that
+/// names no family is read past, unkept.
+#[derive(Default)]
+struct Consents(Vec<String>);
+
+impl<'de> Deserialize<'de> for Consents {
+    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Consents;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Consents, A::Error> {
+                let mut families = Vec::new();
+                while let Some(Family(name)) = map.next_key::<Family>()? {
+                    let Consent(given) = map.next_value::<Consent>()?;
+                    if let Some(name) = name.filter(|_| given)
+                        && !families.contains(&name)
+                    {
+                        families.push(name);
+                    }
+                }
+                Ok(Consents(families))
+            }
+            lenient_scalars!(Consents(Vec::new()));
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Consents, A::Error> {
+                drain_seq(seq).map(|()| Consents(Vec::new()))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// An object key, kept only where it names a model family ([`family`]).
+struct Family(Option<String>);
+
+impl<'de> Deserialize<'de> for Family {
+    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl Visitor<'_> for V {
+            type Value = Family;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a key")
+            }
+            fn visit_str<E: de::Error>(self, s: &str) -> Result<Family, E> {
+                Ok(Family(family(s)))
+            }
+        }
+        d.deserialize_str(V)
     }
 }
 

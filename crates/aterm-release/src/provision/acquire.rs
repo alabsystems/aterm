@@ -3,20 +3,26 @@
 
 //! The stock exceptions a full `ship provision` acquires before it audits them (`--check`
 //! acquires nothing): rustup itself (no default toolchain, auto-install off), upstream
-//! stable with the `x86_64-apple-darwin` slice and the foreign cells' std (for `verify
-//! cells`, run by hand; the audit does not ask for them), the wasm32 pin
-//! `publish/config.sh`'s wasm32 clause names, with its wasm32 target, and rustup's `trust`
-//! link (atpkg's seam, the pass `aterm pkg repair` runs).
+//! stable with the `x86_64-apple-darwin` slice, the foreign cells' std and the clippy
+//! that lints them (for `verify cells`, run by hand; the audit does not ask for them),
+//! the wasm32 pin `publish/config.sh`'s wasm32 clause names, with its wasm32 target, and
+//! rustup's `trust` link (atpkg's seam, the pass `aterm pkg repair` runs).
 //!
-//! Stock stable builds only the x86_64 slice and the pin only type-checks the wasm32
-//! clause, so each is installed by name; a rustup installed here gets no default
-//! toolchain, so a bare `cargo` in an unpinned directory fails loudly instead of running
-//! stock stable.
+//! Stock stable builds only the x86_64 slice and lints the foreign cells, and the pin
+//! only type-checks the wasm32 clause, so each is installed by name with what its job
+//! needs past the minimal profile; a rustup installed here gets no default toolchain,
+//! so a bare `cargo` in an unpinned directory fails loudly instead of running stock
+//! stable.
 
 use std::path::{Path, PathBuf};
 
 /// The wasm32 target the pin carries.
 const WASM32: &str = "wasm32-unknown-unknown";
+
+/// The component stable carries past the minimal profile: `verify cells` lints each
+/// foreign cell with its toolchain's clippy, and skips a toolchain that has the std
+/// but no clippy.
+const CLIPPY: &str = "clippy";
 
 /// What rustup holds now.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -27,6 +33,9 @@ pub(crate) struct Seen {
     pub toolchains: Vec<String>,
     /// The std targets installed on stable.
     pub stable_targets: Vec<String>,
+    /// The components installed on stable, as rustup names them
+    /// (`clippy-aarch64-apple-darwin`).
+    pub stable_components: Vec<String>,
     /// The std targets installed on the wasm32 pin.
     pub pin_targets: Vec<String>,
 }
@@ -36,10 +45,12 @@ pub(crate) struct Seen {
 pub(crate) enum Step {
     /// rustup-init with no default toolchain and no PATH edits; auto-install off.
     InstallRustup,
-    /// `rustup toolchain install stable --profile minimal`.
+    /// `rustup toolchain install stable --profile minimal --component clippy`.
     StableToolchain,
     /// `rustup target add --toolchain stable <targets>`.
     StableTargets(Vec<String>),
+    /// `rustup component add --toolchain stable clippy`.
+    StableClippy,
     /// `rustup toolchain install <pin> --profile minimal --target wasm32-unknown-unknown`.
     PinToolchain(String),
     /// `rustup target add --toolchain <pin> wasm32-unknown-unknown`.
@@ -48,9 +59,10 @@ pub(crate) enum Step {
     TrustSeam,
 }
 
-/// Whether `toolchains` holds `name` (rustup lists `stable-aarch64-apple-darwin`).
-fn has(toolchains: &[String], name: &str) -> bool {
-    toolchains
+/// Whether `listed` holds `name`, which rustup lists with a triple after it: a toolchain
+/// (`stable-aarch64-apple-darwin`) or a component (`clippy-aarch64-apple-darwin`).
+fn has(listed: &[String], name: &str) -> bool {
+    listed
         .iter()
         .any(|t| t == name || t.starts_with(&format!("{name}-")))
 }
@@ -75,6 +87,9 @@ pub(crate) fn plan(seen: &Seen, pin: Option<&str>, stable_targets: &[&str]) -> V
             .collect();
         if !missing.is_empty() {
             steps.push(Step::StableTargets(missing));
+        }
+        if !has(&seen.stable_components, CLIPPY) {
+            steps.push(Step::StableClippy);
         }
     }
     if let Some(pin) = pin {
@@ -111,12 +126,22 @@ pub(crate) fn argv(step: &Step) -> Vec<Vec<String>> {
             "stable",
             "--profile",
             "minimal",
+            "--component",
+            CLIPPY,
         ])],
         Step::StableTargets(ts) => {
             let mut a = v(&["rustup", "target", "add", "--toolchain", "stable"]);
             a.extend(ts.iter().cloned());
             vec![a]
         }
+        Step::StableClippy => vec![v(&[
+            "rustup",
+            "component",
+            "add",
+            "--toolchain",
+            "stable",
+            CLIPPY,
+        ])],
         Step::PinToolchain(pin) => vec![v(&[
             "rustup",
             "toolchain",
@@ -290,19 +315,21 @@ fn observe(homes: &Homes, rustup: &dyn Rustup, pin: Option<&str>) -> Seen {
             .unwrap_or_default()
     };
     let toolchains = lines(None, &["toolchain", "list"]);
-    let installed = |t: &str| {
+    let installed = |t: &str, what: &str| {
         if has(&toolchains, t) {
-            lines(Some(t), &["target", "list", "--installed"])
+            lines(Some(t), &[what, "list", "--installed"])
         } else {
             Vec::new()
         }
     };
-    let stable_targets = installed("stable");
-    let pin_targets = pin.map(installed).unwrap_or_default();
+    let stable_targets = installed("stable", "target");
+    let stable_components = installed("stable", "component");
+    let pin_targets = pin.map(|p| installed(p, "target")).unwrap_or_default();
     Seen {
         rustup: Some(bin),
         toolchains,
         stable_targets,
+        stable_components,
         pin_targets,
     }
 }
@@ -387,22 +414,32 @@ mod tests {
             rustup: Some(PathBuf::from("/r/rustup")),
             toolchains: names(&["stable-aarch64-apple-darwin", "1.97.1-aarch64-apple-darwin"]),
             stable_targets: names(TARGETS),
+            stable_components: names(&[
+                "cargo-aarch64-apple-darwin",
+                "clippy-aarch64-apple-darwin",
+            ]),
             pin_targets: names(&["aarch64-apple-darwin", WASM32]),
         }
     }
 
     #[test]
-    fn a_missing_target_is_added_to_the_toolchain_that_lacks_it() {
+    fn a_missing_target_or_clippy_is_added_to_the_toolchain_that_lacks_it() {
         let mut s = provisioned();
         s.stable_targets = names(&["wasm32-unknown-unknown"]);
+        s.stable_components = names(&["cargo-aarch64-apple-darwin"]);
         s.pin_targets = names(&["aarch64-apple-darwin"]);
         assert_eq!(
             plan(&s, Some("1.97.1"), TARGETS),
             [
                 Step::StableTargets(names(&["x86_64-apple-darwin"])),
+                Step::StableClippy,
                 Step::PinTarget("1.97.1".into()),
                 Step::TrustSeam,
             ]
+        );
+        assert_eq!(
+            argv(&Step::StableClippy).concat().join(" "),
+            "rustup component add --toolchain stable clippy"
         );
     }
 
@@ -443,6 +480,8 @@ mod stateful {
         auto_install_off: bool,
         /// Installed toolchain (rustup's full name) -> its std targets.
         toolchains: BTreeMap<String, Vec<String>>,
+        /// Installed toolchain -> its components past the minimal profile's.
+        components: BTreeMap<String, Vec<String>>,
         calls: Vec<String>,
         auto_installed: Vec<String>,
     }
@@ -525,19 +564,42 @@ mod stateful {
                     let t = Self::need(&mut s, toolchain.ok_or("no toolchain named")?)?;
                     Ok(s.toolchains[&t].iter().map(|x| format!("{x}\n")).collect())
                 }
+                // As rustup lists them: each with the triple it is for.
+                ["component", "list", "--installed"] => {
+                    let t = Self::need(&mut s, toolchain.ok_or("no toolchain named")?)?;
+                    let extra = s.components.get(&t).into_iter().flatten();
+                    let host = ["cargo", "rustc"]
+                        .into_iter()
+                        .chain(extra.map(String::as_str));
+                    Ok(host
+                        .map(|c| format!("{c}-{HOST}\n"))
+                        .chain(s.toolchains[&t].iter().map(|x| format!("rust-std-{x}\n")))
+                        .collect())
+                }
                 ["set", "auto-install", "disable"] => {
                     s.auto_install_off = true;
                     Ok(String::new())
                 }
                 ["toolchain", "install", name, rest @ ..] => {
-                    let mut targets = vec![HOST.to_string()];
+                    let (mut targets, mut components) = (vec![HOST.to_string()], Vec::new());
                     let mut it = rest.iter();
                     while let Some(x) = it.next() {
-                        if *x == "--target" {
-                            targets.extend(it.next().map(|t| (*t).to_string()));
+                        match *x {
+                            "--target" => targets.extend(it.next().map(|t| (*t).to_string())),
+                            "--component" => {
+                                components.extend(it.next().map(|c| (*c).to_string()));
+                            }
+                            _ => {}
                         }
                     }
                     s.toolchains.insert(format!("{name}-{HOST}"), targets);
+                    s.components.insert(format!("{name}-{HOST}"), components);
+                    Ok(String::new())
+                }
+                ["component", "add", "--toolchain", name, components @ ..] => {
+                    let t = Self::need(&mut s, name)?;
+                    let have = s.components.entry(t).or_default();
+                    have.extend(components.iter().map(|x| (*x).to_string()));
                     Ok(String::new())
                 }
                 ["target", "add", "--toolchain", name, targets @ ..] => {
@@ -602,7 +664,10 @@ mod stateful {
             "auto-install is off before anything is installed: {calls:#?}"
         );
         let pin = pin();
-        position(&calls, "rustup toolchain install stable --profile minimal");
+        position(
+            &calls,
+            "rustup toolchain install stable --profile minimal --component clippy",
+        );
         position(
             &calls,
             &format!(
@@ -623,19 +688,28 @@ mod stateful {
         rustup
             .run(&homes, &bin, &add, None)
             .expect("the pin was installed by name");
-        // A second pass acquires nothing.
-        let mut targets: Vec<&str> = super::super::FOREIGN_CELL_TARGETS.to_vec();
-        if cfg!(target_os = "macos") {
-            targets.insert(0, "x86_64-apple-darwin");
-        }
+        // A second pass acquires nothing: stable has the clippy `verify cells` lints with.
         assert_eq!(
-            plan(&observe(&homes, &rustup, Some(&pin)), Some(&pin), &targets),
+            plan(
+                &observe(&homes, &rustup, Some(&pin)),
+                Some(&pin),
+                &stable_targets()
+            ),
             [Step::TrustSeam]
         );
     }
 
+    /// What [`run`] asks stable for on this host.
+    fn stable_targets() -> Vec<&'static str> {
+        let mut targets: Vec<&str> = super::super::FOREIGN_CELL_TARGETS.to_vec();
+        if cfg!(target_os = "macos") {
+            targets.insert(0, "x86_64-apple-darwin");
+        }
+        targets
+    }
+
     #[test]
-    fn a_pin_without_its_wasm32_target_gets_it_on_that_channel_alone() {
+    fn a_toolchain_missing_a_piece_gets_it_on_that_channel_alone() {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let homes = homes(tmp.path());
         let rustup = FakeRustup::default();
@@ -664,6 +738,8 @@ mod stateful {
             &calls,
             &format!("rustup target add --toolchain {pin} wasm32-unknown-unknown"),
         );
+        // Stable had every std and no clippy: `verify cells` skipped each cell on it.
+        position(&calls, "rustup component add --toolchain stable clippy");
         assert!(
             !calls
                 .iter()
@@ -671,6 +747,14 @@ mod stateful {
             "{calls:#?}"
         );
         assert!(rustup.0.borrow().auto_installed.is_empty());
+        assert_eq!(
+            plan(
+                &observe(&homes, &rustup, Some(&pin)),
+                Some(&pin),
+                &stable_targets()
+            ),
+            [Step::TrustSeam]
+        );
     }
 
     #[test]

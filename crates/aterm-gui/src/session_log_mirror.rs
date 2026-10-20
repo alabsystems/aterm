@@ -165,6 +165,7 @@ pub(crate) struct Tombstone {
 
 impl Tombstone {
     /// `<sid> <ep>:<seq>:<ms>:<head>`: a manifest row.
+    #[cfg(any(unix, test))]
     pub(crate) fn row(&self) -> String {
         format!("{} {}:{}", self.sid, self.landed.word(), self.ms_head)
     }
@@ -214,6 +215,7 @@ struct Retired {
     tombstones: VecDeque<Tombstone>,
     /// What the last handoff manifest drew: each sid and its landed `ms`
     /// ([`StoreMirror::past_draw`]).
+    #[cfg(any(unix, test))]
     drawn: Vec<(String, u64)>,
 }
 
@@ -295,6 +297,7 @@ pub(crate) struct StoreMirror {
     /// under ([`Self::draw_tombstones`]), 0 before any draw: an atomic, so a
     /// draw on a store that never mirrored takes no lock, and a cursor its
     /// export meets after it is still judged against it.
+    #[cfg(any(unix, test))]
     drawn_gen: AtomicU64,
     /// The local id the last take started after.
     rr: AtomicU64,
@@ -305,11 +308,17 @@ pub(crate) struct StoreMirror {
     /// and the tails' lock (a Commit's reading that races the landing).
     #[cfg(test)]
     before_landing: Mutex<Option<LandingHook>>,
+    /// One interleaving before ownership is acquired, after initial admission.
+    #[cfg(any(test, debug_assertions))]
+    before_mutation: Mutex<Option<MutationHook>>,
 }
 
 /// A one-shot test hook `log-landed` runs ([`StoreMirror::arm_before_landing`]).
 #[cfg(test)]
 type LandingHook = Box<dyn FnOnce(&StoreMirror) + Send>;
+
+#[cfg(any(test, debug_assertions))]
+type MutationHook = Box<dyn FnOnce() + Send>;
 
 impl StoreMirror {
     /// The state every session log of this store holds.
@@ -325,6 +334,7 @@ impl StoreMirror {
     }
 
     /// Whether the node mirrors.
+    #[cfg(any(unix, test))]
     pub(crate) fn served(&self) -> bool {
         self.shared.served()
     }
@@ -394,6 +404,11 @@ impl StoreMirror {
         *self.before_landing.lock_or_recover() = Some(Box::new(f));
     }
 
+    #[cfg(test)]
+    pub(crate) fn arm_before_mutation(&self, f: impl FnOnce() + Send + 'static) {
+        *self.before_mutation.lock_or_recover() = Some(Box::new(f));
+    }
+
     /// The adoption latch: on while a seamless successor's restore has not
     /// registered every handed-off session.
     pub(crate) fn set_adopting(&self, on: bool) {
@@ -409,6 +424,7 @@ impl StoreMirror {
     /// (`SessionHandoff::mirror_dropped`), each one's landed `ms` and the bus
     /// log's generation remembered for [`Self::past_draw`]. Empty, and no
     /// lock taken, while nothing was ever mirrored ([`Shared::cursors`]).
+    #[cfg(any(unix, test))]
     pub(crate) fn draw_tombstones(&self) -> Vec<String> {
         self.drawn_gen.store(
             self.shared.generation().saturating_add(1),
@@ -445,6 +461,7 @@ impl StoreMirror {
     /// then another log's. With the mirror off no log ever held one: a
     /// replaced bus log stands nothing down (ruling Q5: off is nothing), and
     /// no lock is taken.
+    #[cfg(any(unix, test))]
     pub(crate) fn past_draw(&self) -> bool {
         // Set before the tails' lock, which a landing reads it under.
         self.committing.store(true, Ordering::Release);
@@ -476,6 +493,7 @@ impl StoreMirror {
     /// that closed under the export's readers' fence with that fence lifted
     /// (its copy of the live log's, `aterm_slog::Log::bus_tail`), so its
     /// take reaches its close. No lock while nothing is retained.
+    #[cfg(any(unix, test))]
     pub(crate) fn lift_commit_fence(&self) {
         if self.shared.cursors() {
             let mut r = self.retired.lock_or_recover();
@@ -631,6 +649,16 @@ pub(crate) fn cmd_log_take(
     if !crate::fabric::bridge_mirrors_logs() {
         return MIRROR_OFF.to_string();
     }
+    crate::fabric::with_current_bridge(generation, || {
+        if !crate::fabric::bridge_mirrors_logs() {
+            return MIRROR_OFF.to_string();
+        }
+        take_owned(store, req)
+    })
+    .unwrap_or_else(|| "OK 0 slots=0 stale=1\n".to_string())
+}
+
+fn take_owned(store: &crate::session_store::Store, req: TakeRequest) -> String {
     let live = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
         if g.mirror().adopting() {
@@ -708,7 +736,7 @@ pub(crate) fn cmd_log_take(
             room -= 1;
         }
     }
-    // Encoded with no lock held.
+    // Encoded with no timeline or retired-tail lock held.
     let key = req.key;
     let alias = move |sid: &ShortId| key.as_ref().and_then(|k| alias_of(k, sid));
     let mut body = String::new();
@@ -770,6 +798,28 @@ pub(crate) fn cmd_log_landed(
     if !crate::fabric::bridge_mirrors_logs() {
         return MIRROR_OFF.to_string();
     }
+    #[cfg(any(test, debug_assertions))]
+    {
+        let before = {
+            let g = store.read().unwrap_or_else(|p| p.into_inner());
+            let before = g.mirror().before_mutation.lock_or_recover().take();
+            drop(g);
+            before
+        };
+        if let Some(before) = before {
+            before();
+        }
+    }
+    crate::fabric::with_current_bridge(generation, || {
+        if !crate::fabric::bridge_mirrors_logs() {
+            return MIRROR_OFF.to_string();
+        }
+        land_owned(store, pairs)
+    })
+    .unwrap_or_else(|| "OK stale=1\n".to_string())
+}
+
+fn land_owned(store: &crate::session_store::Store, pairs: Vec<(&str, BusCursor)>) -> String {
     #[cfg(test)]
     let broken = store
         .read()

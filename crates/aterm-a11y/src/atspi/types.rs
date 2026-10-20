@@ -272,6 +272,7 @@ pub(crate) enum Role {
     Frame = 23,
     Label = 29,
     List = 31,
+    ListItem = 32,
     Menu = 33,
     MenuItem = 35,
     PageTab = 37,

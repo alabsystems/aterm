@@ -199,10 +199,9 @@ pub(crate) enum Cause {
     Input,
     /// The OS window changed size (`App::on_resize`).
     Window,
-    /// The window's chrome rows changed — the tab strip, the message band or
-    /// the presence row appeared or folded: the presence row's one-window
-    /// re-grid (`regrid_window_for_chrome_rows`) and the strip's and band's
-    /// every-window one (`regrid_for_chrome_rows`).
+    /// The window's chrome rows changed — the tab strip or the message band
+    /// appeared or folded: their every-window re-grid
+    /// (`regrid_for_chrome_rows`). Presence owns no chrome row.
     Chrome,
     /// One window's sessions re-gridded directly (`App::apply_term_resize`
     /// under no other entry point).
@@ -362,9 +361,9 @@ pub(crate) struct EngineProbe {
     pub(crate) full_clears: u64,
     /// `Terminal::screen_replaced_count`.
     pub(crate) screen_replaced: u64,
-    /// `Terminal::render_debt`: the rows the alternate screen owes its program.
-    pub(crate) debt_shift: i32,
-    pub(crate) debt_pushed: i32,
+    /// `Terminal::render_debt`: what the alternate screen owes its program (rows
+    /// moved, drawn columns cut).
+    pub(crate) debt: aterm_core::terminal::RenderDebt,
     /// The grid's `(rows, cols)` now.
     pub(crate) geom: (u16, u16),
 }
@@ -378,8 +377,7 @@ impl EngineProbe {
             content_seq: term.content_seq(),
             full_clears: term.full_clear_count(),
             screen_replaced: term.screen_replaced_count(),
-            debt_shift: term.render_debt().0,
-            debt_pushed: term.render_debt().1,
+            debt: term.render_debt(),
             geom: (term.rows(), term.cols()),
         }
     }
@@ -734,14 +732,16 @@ pub(crate) enum Transition {
     },
     /// `healed run=<r> after_ms=<ms>` (after the run's last resize).
     Healed { run: u64, after_ms: u64 },
-    /// `desync-risk epoch=<e> displaced=<+-k> pushed=<k> drew=<0|1> class=<c> at=<ms>`:
-    /// the engine's debt says rows are owed with the geometry back, for a
-    /// program the ledger judges (see [`crate::resize_epoch`]). Pushed only when
-    /// no run already stands at `desync-risk`; `unjudged` is never pushed.
+    /// `desync-risk epoch=<e> displaced=<+-k> pushed=<k> cut=<k> drew=<0|1> class=<c>
+    /// at=<ms>`: the engine's debt says rows or drawn columns are owed with the
+    /// geometry back, for a program the ledger judges (see [`crate::resize_epoch`]).
+    /// Pushed only when no run already stands at `desync-risk`; `unjudged` is never
+    /// pushed.
     EpochRisk {
         epoch: u64,
         shift: i32,
         pushed: i32,
+        cut: u16,
         drew: bool,
         class: crate::resize_epoch::ProgramClass,
         at_ms: u64,
@@ -756,6 +756,15 @@ pub(crate) enum Transition {
 }
 
 impl Transition {
+    /// The verdict it moved to, as the session log's `render state=` word
+    /// (phase 3B): `desync-risk` or `healed`.
+    pub(crate) const fn state_word(&self) -> &'static str {
+        match self {
+            Self::Risk { .. } | Self::EpochRisk { .. } => "desync-risk",
+            Self::Healed { .. } | Self::EpochHealed { .. } => "healed",
+        }
+    }
+
     /// The timeline payload, which is also the pushed EVENT's tail.
     pub(crate) fn payload(&self) -> String {
         match *self {
@@ -773,11 +782,12 @@ impl Transition {
                 epoch,
                 shift,
                 pushed,
+                cut,
                 drew,
                 class,
                 at_ms,
             } => format!(
-                "desync-risk epoch={epoch} displaced={shift:+} pushed={pushed} drew={} \
+                "desync-risk epoch={epoch} displaced={shift:+} pushed={pushed} cut={cut} drew={} \
                  class={} at={at_ms}",
                 u8::from(drew),
                 class.wire()
@@ -1426,7 +1436,7 @@ fn wire_site(site: Site) -> String {
 
 /// `resize <id> t=<ms> run=<r> ord=<n> from=<CxR> to=<CxR> alt=<0|1>
 /// sync=<0|1> trimmed= demoted= pushed= revealed= appended= restored= shift=<+-k>
-/// site=<word> at=<file:line|-> win= chrome=`
+/// cut=<k> site=<word> at=<file:line|-> win= chrome=`
 fn wire_row(out: &mut String, row: &LedgerRow) {
     let r = &row.report;
     let win = row
@@ -1440,7 +1450,8 @@ fn wire_row(out: &mut String, row: &LedgerRow) {
     let _ = writeln!(
         out,
         "resize {} t={} run={} ord={} from={} to={} alt={} sync={} trimmed={} demoted={} \
-         pushed={} revealed={} appended={} restored={} shift={:+} {} win={win} chrome={chrome}",
+         pushed={} revealed={} appended={} restored={} shift={:+} cut={} {} win={win} \
+         chrome={chrome}",
         row.id,
         row.t_ms,
         row.run,
@@ -1456,6 +1467,7 @@ fn wire_row(out: &mut String, row: &LedgerRow) {
         r.appended,
         u32::from(r.restored_top) + u32::from(r.restored_bottom),
         r.shift(),
+        r.cut,
         wire_site(row.attribution.site),
     );
 }
@@ -1570,8 +1582,7 @@ mod tests {
             content_seq,
             full_clears,
             screen_replaced: 0,
-            debt_shift: 0,
-            debt_pushed: 0,
+            debt: aterm_core::terminal::RenderDebt::default(),
             geom: (24, 80),
         }
     }
@@ -2269,9 +2280,9 @@ mod tests {
             format!(
                 "OK 3 total=2 runs=1 flaps=1 risks=0 render=displaced unledgered=0 lost=0 nudge=idle nudged=0\n\
                  resize 1 t=7 run=1 ord=1 from=80x24 to=80x23 alt=1 sync=1 trimmed=0 demoted=1 \
-                 pushed=0 revealed=0 appended=0 restored=0 shift=-1 site=chrome at={at} win=135x63 chrome=2\n\
+                 pushed=0 revealed=0 appended=0 restored=0 shift=-1 cut=0 site=chrome at={at} win=135x63 chrome=2\n\
                  resize 2 t=7 run=1 ord=2 from=80x23 to=80x24 alt=1 sync=0 trimmed=0 demoted=0 \
-                 pushed=0 revealed=0 appended=1 restored=0 shift=+0 site=ctl-cross at=- win=- chrome=-\n\
+                 pushed=0 revealed=0 appended=1 restored=0 shift=+0 cut=0 site=ctl-cross at=- win=- chrome=-\n\
                  run 1 t=7 n=2 alt=1 geom=80x24>80x23>80x24 net=zero displaced=-1 \
                  verdict=silent first_out_ms=- healed_ms=-\n"
             )
@@ -2530,11 +2541,11 @@ mod tests {
         };
         let wid = crate::WindowId(0);
         let mut app = crate::App::headless_for_test();
-        app.on_resize(wid, winit::dpi::PhysicalSize::new(1600, 1000));
+        app.on_resize(wid, aterm_window::dpi::PhysicalSize::new(1600, 1000));
         assert_eq!(sites(&app), ["site=window"], "the plain window pass");
         {
             let _site = SiteScope::enter(Cause::Chrome);
-            app.on_resize(wid, winit::dpi::PhysicalSize::new(1600, 900));
+            app.on_resize(wid, aterm_window::dpi::PhysicalSize::new(1600, 900));
         }
         assert_eq!(SiteScope::current(), None, "the scope left");
         assert_eq!(
@@ -2816,7 +2827,7 @@ mod tests {
             });
             // The engine's debt in rows (`debt`), and the geometry the epoch that
             // owes it began at (`eg`, 0 while nothing is owed).
-            let (shift, pushed) = self.term.render_debt();
+            let (shift, pushed) = self.term.render_debt().rows();
             let debt = i64::from(pushed) - i64::from(shift);
             let eg = if debt == 0 {
                 0
@@ -3011,61 +3022,6 @@ mod tests {
         Step::Classify,
         Step::Evaluate,
     ];
-
-    // The machine's other actions are the environment the ledger reads: the
-    // engine's resize (journalled; the ledger's booking of it is `ingest`,
-    // which every schedule below drives) and the app's own frames. `Grow` is
-    // not waived here: its ledger half, the credit of the rows the grow hands
-    // back to the run that stashed them (the model's `rd - st` in the run the
-    // grow joins, a late one included), is
-    // `ResizeLedger::credit`, which carries its `refines` anchor (spec-link
-    // refuses an action both anchored and waived). Its engine half, the grid's
-    // alt-screen grow that hands back what the resize undo kept, is driven for
-    // real by the Tier-1 rig below, as the shrinks are.
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "ResizeRender",
-        action = "Demote",
-        reason = "The engine's alt-screen shrink with a full tail: aterm-core's grid resize, \
-                  journalled as a ResizeReport. The Tier-1 rig drives the real Terminal \
-                  through it and books it with the real ResizeLedger::ingest."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "ResizeRender",
-        action = "Trim",
-        reason = "The engine's alt-screen shrink with a blank tail: aterm-core's grid resize, \
-                  driven for real by the Tier-1 rig."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "ResizeRender",
-        action = "Output",
-        reason = "Application output that draws nothing (a mode set): an environment step the \
-                  Tier-1 rig's stand-in performs on the real Terminal, which drops the engine's \
-                  resize undo."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "ResizeRender",
-        action = "Step",
-        reason = "The application's SIGWINCH handler and its next frame: an environment step \
-                  the Tier-1 rig's stand-in performs on the real Terminal."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "ResizeRender",
-        action = "Draw",
-        reason = "An application diff frame: an environment step the Tier-1 rig's stand-in \
-                  performs on the real Terminal."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "ResizeRender",
-        action = "Classify",
-        reason = "The presence classifier's reading of the session's program (Claude Code), or \
-                  the session showing it clears its screen when resized: an environment fact the \
-                  Tier-1 rig sets with `ResizeLedger::set_agent`."
-    )]
-    #[expect(
-        dead_code,
-        reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it"
-    )]
-    fn resize_render_scope_waivers() {}
 
     /// Replay `schedule` on a fresh rig, checking every real transition
     /// against the model: the action is enabled in the projected state, the
@@ -3728,7 +3684,7 @@ mod tests {
     /// A probe with the engine owing `shift` rows, the grid at `geom`.
     fn owing(ordinal: u64, content_seq: u64, shift: i32, geom: (u16, u16)) -> EngineProbe {
         EngineProbe {
-            debt_shift: shift,
+            debt: aterm_core::terminal::RenderDebt::of_rows(shift, 0),
             geom,
             ..probe(ordinal, content_seq, 0)
         }
@@ -3807,7 +3763,7 @@ mod tests {
         ));
         assert_eq!(
             risks[0].payload(),
-            "desync-risk epoch=1 displaced=-1 pushed=0 drew=1 class=agent at=1000"
+            "desync-risk epoch=1 displaced=-1 pushed=0 cut=0 drew=1 class=agent at=1000"
         );
         // Asking again says nothing new.
         let again = ledger.evaluate(
@@ -3819,7 +3775,7 @@ mod tests {
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert_eq!(
             lines[0],
-            "epoch 1 t=1000 geom=80x24>80x24 shift=-1 pushed=0 drew=1 class=agent \
+            "epoch 1 t=1000 geom=80x24>80x24 shift=-1 pushed=0 cut=0 drew=1 class=agent \
              verdict=desync-risk by=- tried=0"
         );
         assert!(
@@ -4148,6 +4104,63 @@ mod tests {
         assert_eq!(ledger.render(), Render::DesyncRisk);
     }
 
+    /// S2R-F3 (ATERM-KI-1015-1, the sweep of 2026-10-15 against Claude Code):
+    /// a held net-zero COLUMN flap on the alternate screen, on the real engine.
+    /// The shrink cuts the last cell of every full-width rule the program drew,
+    /// a frame lands in the narrower grid, and the grow back appends blank
+    /// cells; a program whose handler read only the final width never repaints,
+    /// so the rules stay one cell short. No row moved, and a judge that counted
+    /// rows only read `render=ok` with no epoch and no nudge: only `cast drift`
+    /// saw it. Cut cells are debt as moved rows are.
+    #[test]
+    fn a_column_flap_that_cut_cells_is_judged_until_a_repaint() {
+        let mut term = Terminal::new(ROWS, COLS);
+        term.process(b"\x1b[?1049h\x1b[2J");
+        let rule = "\u{2500}".repeat(usize::from(COLS));
+        for r in [ROWS - 3, ROWS - 1] {
+            term.process(format!("\x1b[{};1H{rule}", r + 1).as_bytes());
+        }
+        term.process(format!("\x1b[{};1H> ", ROWS - 1).as_bytes());
+        let mut ledger = ResizeLedger::default();
+        ledger.set_agent(true);
+        term.resize(ROWS, COLS - 1);
+        ledger.ingest(&JournalCopy::take(&term), Some(here()), 1_000);
+        term.process(b"x");
+        term.resize(ROWS, COLS);
+        ledger.ingest(&JournalCopy::take(&term), Some(here()), 1_035);
+        let cells = |term: &Terminal, r: u16| {
+            term.row_text(usize::from(r))
+                .unwrap_or_default()
+                .trim_end()
+                .chars()
+                .count()
+        };
+        assert_eq!(
+            cells(&term, ROWS - 1),
+            usize::from(COLS) - 1,
+            "the rule lost its last cell"
+        );
+
+        ledger.evaluate(EngineProbe::sample(&term), 1_035 + RISK_AFTER_MS + 5);
+        let reply = ledger.reply(0, None);
+        assert_eq!(ledger.render(), Render::DesyncRisk, "{reply}");
+        assert!(reply.contains(" render=desync-risk "), "{reply}");
+        let lines = epoch_lines(&ledger);
+        assert_eq!(lines.len(), 1, "{reply}");
+        assert!(
+            lines[0].contains(" shift=+0 pushed=0 cut=1 ")
+                && lines[0].contains(" verdict=desync-risk "),
+            "{reply}"
+        );
+        assert!(ledger.nudge_view().is_some(), "the nudge is owed");
+
+        // The program's repaint from scratch pays it.
+        term.process(b"\x1b[2J");
+        ledger.evaluate(EngineProbe::sample(&term), 1_035 + RISK_AFTER_MS + 50);
+        assert_eq!(ledger.render(), Render::Ok, "{}", ledger.reply(0, None));
+        assert!(ledger.nudge_view().is_none());
+    }
+
     /// A ConPTY session never accrues engine debt, so its epoch never opens a
     /// line and `render=` stays per run as before.
     #[test]
@@ -4172,3 +4185,62 @@ mod tests {
         assert_ne!(conpty.render(), Render::DesyncRisk);
     }
 }
+
+/// `ResizeRender` actions no shipping function here performs, each waived where its
+/// Tier-1 (`tests`) binds it.
+// The machine's other actions are the environment the ledger reads: the
+// engine's resize (journalled; the ledger's booking of it is `ingest`,
+// which every schedule below drives) and the app's own frames. `Grow` is
+// not waived here: its ledger half, the credit of the rows the grow hands
+// back to the run that stashed them (the model's `rd - st` in the run the
+// grow joins, a late one included), is
+// `ResizeLedger::credit`, which carries its `refines` anchor (spec-link
+// refuses an action both anchored and waived). Its engine half, the grid's
+// alt-screen grow that hands back what the resize undo kept, is driven for
+// real by the Tier-1 rig below, as the shrinks are.
+#[cfg(any(test, debug_assertions))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ResizeRender",
+    action = "Demote",
+    reason = "The engine's alt-screen shrink with a full tail: aterm-core's grid resize, \
+              journalled as a ResizeReport. The Tier-1 rig drives the real Terminal \
+              through it and books it with the real ResizeLedger::ingest."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ResizeRender",
+    action = "Trim",
+    reason = "The engine's alt-screen shrink with a blank tail: aterm-core's grid resize, \
+              driven for real by the Tier-1 rig."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ResizeRender",
+    action = "Output",
+    reason = "Application output that draws nothing (a mode set): an environment step the \
+              Tier-1 rig's stand-in performs on the real Terminal, which drops the engine's \
+              resize undo."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ResizeRender",
+    action = "Step",
+    reason = "The application's SIGWINCH handler and its next frame: an environment step \
+              the Tier-1 rig's stand-in performs on the real Terminal."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ResizeRender",
+    action = "Draw",
+    reason = "An application diff frame: an environment step the Tier-1 rig's stand-in \
+              performs on the real Terminal."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ResizeRender",
+    action = "Classify",
+    reason = "The presence classifier's reading of the session's program (Claude Code), or \
+              the session showing it clears its screen when resized: an environment fact the \
+              Tier-1 rig sets with `ResizeLedger::set_agent`."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn resize_render_scope_waivers() {}

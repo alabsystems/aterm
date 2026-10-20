@@ -39,6 +39,7 @@
 //! ([`TrickLexicon::classify`]).
 
 mod fold;
+mod raw;
 pub mod tricks;
 
 pub use fold::{
@@ -47,6 +48,7 @@ pub use fold::{
 pub use tricks::{RowKind, Trick, TrickLexicon, TrickRole, TrickRow};
 
 use aterm_hash::{FxHashMap, FxHashSet};
+use raw::{RawEntry, RawException, RawExceptions, RawLexicon};
 use std::sync::OnceLock;
 
 /// Which decoration family a matched word belongs to.
@@ -73,6 +75,32 @@ pub enum Class {
     /// sprite overlay). The builtin lexicon ships NO emphasis forms: the class
     /// is populated entirely by the user's `extra_words` / lexicon override.
     Emphasis,
+}
+
+impl Class {
+    /// Canonical lowercase name of this decoration class.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Profanity => "profanity",
+            Self::Feline => "feline",
+            Self::Canine => "canine",
+            Self::Animal => "animal",
+            Self::Emphasis => "emphasis",
+        }
+    }
+
+    /// Return `true` iff this class is [`Class::Animal`].
+    #[must_use]
+    pub const fn is_animal(self) -> bool {
+        matches!(self, Self::Animal)
+    }
+
+    /// Return `true` iff matches in this class paint a sprite/particle overlay (all except [`Class::Emphasis`]).
+    #[must_use]
+    pub const fn has_sprite_overlay(self) -> bool {
+        !matches!(self, Self::Emphasis)
+    }
 }
 
 /// Interned language identifier: an index into the [`Lexicon`]'s language
@@ -113,38 +141,80 @@ impl LangSet {
     /// The empty set.
     pub const EMPTY: LangSet = LangSet(0);
 
+    /// Construct a `LangSet` directly from its raw 64-bit mask.
+    #[must_use]
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    /// Return the raw 64-bit mask of this set.
+    #[must_use]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
     /// This set plus `id`.
     #[must_use]
-    pub fn with(self, id: LangId) -> LangSet {
-        // The `% 64` is a no-op for every id this crate hands out (ids are
+    pub const fn with(self, id: LangId) -> LangSet {
+        // The `& 63` is a no-op for every id this crate hands out (ids are
         // bounded by CAPACITY at intern time); it makes the shift's
-        // no-overflow obligation checkable.
-        LangSet(self.0 | (1u64 << (u32::from(id.0) % 64)))
+        // no-overflow obligation checkable in const contexts.
+        LangSet(self.0 | (1u64 << ((id.0 as u32) & 63)))
     }
 
     /// Whether `id` is in the set.
     #[must_use]
-    #[cfg(test)]
-    pub fn contains(self, id: LangId) -> bool {
-        self.0 & (1u64 << (u32::from(id.0) % 64)) != 0
+    pub const fn contains(self, id: LangId) -> bool {
+        self.0 & (1u64 << ((id.0 as u32) & 63)) != 0
     }
 
     /// Set union.
     #[must_use]
-    pub fn union(self, other: LangSet) -> LangSet {
+    pub const fn union(self, other: LangSet) -> LangSet {
         LangSet(self.0 | other.0)
     }
 
     /// True when no language is set.
     #[must_use]
-    pub fn is_empty(self) -> bool {
+    pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
 
     /// Number of languages in the set.
     #[must_use]
-    pub fn len(self) -> usize {
+    pub const fn len(self) -> usize {
         self.0.count_ones() as usize
+    }
+
+    /// Encode the 64-bit language mask into 8 little-endian bytes.
+    #[must_use]
+    pub const fn encode_le(self) -> [u8; 8] {
+        let v = self.0;
+        [
+            v as u8,
+            (v >> 8) as u8,
+            (v >> 16) as u8,
+            (v >> 24) as u8,
+            (v >> 32) as u8,
+            (v >> 40) as u8,
+            (v >> 48) as u8,
+            (v >> 56) as u8,
+        ]
+    }
+
+    /// Decode 8 little-endian bytes into a `LangSet`.
+    #[must_use]
+    pub const fn decode_le(bytes: [u8; 8]) -> Self {
+        Self(
+            (bytes[0] as u64)
+                | ((bytes[1] as u64) << 8)
+                | ((bytes[2] as u64) << 16)
+                | ((bytes[3] as u64) << 24)
+                | ((bytes[4] as u64) << 32)
+                | ((bytes[5] as u64) << 40)
+                | ((bytes[6] as u64) << 48)
+                | ((bytes[7] as u64) << 56),
+        )
     }
 
     /// Iterate the members in ascending [`LangId`] order — i.e. lexicon
@@ -167,7 +237,7 @@ impl LangSet {
 /// appeared FIRST in the lexicon TOML. An empty set yields the reserved
 /// `"unknown"` id.
 #[must_use]
-pub fn primary_lang(set: LangSet) -> LangId {
+pub const fn primary_lang(set: LangSet) -> LangId {
     if set.is_empty() {
         return UNKNOWN_LANG;
     }
@@ -233,19 +303,68 @@ impl FormId {
     /// from a lexicon scan. Real [`Match`] values never carry this ID.
     pub const UNKNOWN: Self = Self(u64::MAX);
 
+    /// Return the raw 64-bit form identifier.
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// Return the low-byte morphology variant tag (`0` for exact table keys).
+    #[must_use]
+    pub const fn variant_byte(self) -> u8 {
+        self.0 as u8
+    }
+
+    /// Return the base table key index (`self.0 >> 8`).
+    #[must_use]
+    pub const fn base_id(self) -> u64 {
+        self.0 >> 8
+    }
+
+    /// Encode this `FormId` into 8 little-endian bytes.
+    #[must_use]
+    pub const fn encode_le(self) -> [u8; 8] {
+        let v = self.0;
+        [
+            v as u8,
+            (v >> 8) as u8,
+            (v >> 16) as u8,
+            (v >> 24) as u8,
+            (v >> 32) as u8,
+            (v >> 40) as u8,
+            (v >> 48) as u8,
+            (v >> 56) as u8,
+        ]
+    }
+
+    /// Decode 8 little-endian bytes into a `FormId`.
+    #[must_use]
+    pub const fn decode_le(bytes: [u8; 8]) -> Self {
+        Self(
+            (bytes[0] as u64)
+                | ((bytes[1] as u64) << 8)
+                | ((bytes[2] as u64) << 16)
+                | ((bytes[3] as u64) << 24)
+                | ((bytes[4] as u64) << 32)
+                | ((bytes[5] as u64) << 40)
+                | ((bytes[6] as u64) << 48)
+                | ((bytes[7] as u64) << 56),
+        )
+    }
+
     /// Reserve the low byte for the finite, allocation-free morphology variants
     /// recognized by [`Lexicon::classify_token_into`]. Exact table keys use
     /// variant zero; possessive and clitic fallbacks use a nonzero code. This
     /// keeps `kitty`, `kitty's`, and every supported prefix form distinct without
     /// falling back to a probabilistic token hash.
-    fn exact(base: u64) -> Self {
+    const fn exact(base: u64) -> Self {
         Self(base << 8)
     }
 
-    fn with_variant(self, variant: u8) -> Self {
-        debug_assert_ne!(variant, 0);
-        debug_assert_eq!(self.0 & 0xff, 0);
-        Self(self.0 | u64::from(variant))
+    const fn with_variant(self, variant: u8) -> Self {
+        debug_assert!(variant != 0);
+        debug_assert!((self.0 & 0xff) == 0);
+        Self(self.0 | (variant as u64))
     }
 }
 
@@ -323,8 +442,57 @@ impl<T: std::fmt::Debug> std::fmt::Display for DebugText<T> {
     }
 }
 
-const BUILTIN_LEXICON: &str = include_str!("../data/lexicon.toml");
-const BUILTIN_EXCEPTIONS: &str = include_str!("../data/exceptions.toml");
+/// One `[[entry]]` of the embedded `data/lexicon.toml`, decoded by the build
+/// script through the run-time shapes ([`RawEntry`]) and kept as it reads there,
+/// without its reviewer `notes`.
+struct BuiltinEntry {
+    class: &'static str,
+    lang: &'static str,
+    mode: &'static str,
+    stems: &'static [&'static str],
+    suffixes: &'static [&'static str],
+    forms: &'static [&'static str],
+    cjk: bool,
+    ambiguous: bool,
+    species: &'static str,
+}
+
+// `BUILTIN_ENTRIES` (every `[[entry]]` of `data/lexicon.toml`, in file order)
+// and `BUILTIN_EXCEPTION_WORDS` (every `[[exception]]` word of
+// `data/exceptions.toml`), written by `build.rs`.
+include!(concat!(env!("OUT_DIR"), "/builtin_lexicon.rs"));
+
+/// The embedded documents' rows, as decoding `data/lexicon.toml` and
+/// `data/exceptions.toml` would give them: the build script decoded them, so a
+/// launch parses no TOML for the builtin lexicon.
+fn builtin_rows() -> (RawLexicon, RawExceptions) {
+    let owned = |list: &[&str]| -> Vec<String> { list.iter().map(|s| (*s).to_owned()).collect() };
+    let entry = BUILTIN_ENTRIES
+        .iter()
+        .map(|e| RawEntry {
+            class: e.class.to_owned(),
+            lang: e.lang.to_owned(),
+            mode: e.mode.to_owned(),
+            stems: owned(e.stems),
+            suffixes: owned(e.suffixes),
+            forms: owned(e.forms),
+            cjk: e.cjk,
+            ambiguous: e.ambiguous,
+            species: e.species.to_owned(),
+            _notes: String::new(),
+            user: false,
+        })
+        .collect();
+    let exception = BUILTIN_EXCEPTION_WORDS
+        .iter()
+        .map(|word| RawException {
+            word: (*word).to_owned(),
+            _lang: String::new(),
+            _meaning: String::new(),
+        })
+        .collect();
+    (RawLexicon { entry }, RawExceptions { exception })
+}
 
 /// Hard cap on the number of surface forms materialized across *all* lexicon
 /// entries combined during [`Lexicon::build`]. The embedded builtin produces only
@@ -435,78 +603,6 @@ struct LexiconHit {
     marks_required: bool,
 }
 
-// ---- TOML shapes ----
-//
-// `deny_unknown_fields` on all four, the kitty-command loader's law verbatim
-// (see `tricks.rs`): a typo'd key (`form = [...]` for `forms`, `stem` for
-// `stems`) must be a parse error the test suite — and the user's own stderr —
-// trips over, not a list that silently never loads. The host logs a rejected
-// override and falls back to the builtin.
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawLexicon {
-    #[serde(default)]
-    entry: Vec<RawEntry>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawEntry {
-    class: String,
-    #[serde(default)]
-    lang: String,
-    #[serde(default = "default_mode")]
-    mode: String,
-    #[serde(default)]
-    stems: Vec<String>,
-    #[serde(default)]
-    suffixes: Vec<String>,
-    #[serde(default)]
-    forms: Vec<String>,
-    #[serde(default)]
-    cjk: bool,
-    #[serde(default)]
-    ambiguous: bool,
-    /// [`Class::Animal`] only: the species id naming the authored sprite for
-    /// every surface in this entry (e.g. `species = "monkey"`). Ignored (with
-    /// a conflicts-channel note) on other classes; its absence on an animal
-    /// entry is likewise recorded and the entry skipped.
-    #[serde(default)]
-    species: String,
-    /// Reviewer prose in the TOML; type-checked (`deny_unknown_fields`), never read.
-    #[serde(default, rename = "notes")]
-    _notes: String,
-    /// NOT a TOML field: set by [`Lexicon::with_languages_and_override`] on
-    /// every entry that came from the user's override TOML, so the build can
-    /// record its surfaces in [`Lexicon::user_surfaces`] (v3 §6 short-word
-    /// exemption).
-    #[serde(skip)]
-    user: bool,
-}
-
-fn default_mode() -> String {
-    "suffix".to_string()
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawExceptions {
-    #[serde(default)]
-    exception: Vec<RawException>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawException {
-    word: String,
-    /// Reviewer annotations in the TOML; type-checked (`deny_unknown_fields`), never read.
-    #[serde(default, rename = "lang")]
-    _lang: String,
-    #[serde(default, rename = "meaning")]
-    _meaning: String,
-}
-
 /// The set of languages whose `ambiguous` entries are enabled.
 struct Langs {
     all: bool,
@@ -557,21 +653,13 @@ impl Lexicon {
     }
 
     /// The embedded lexicon, un-gating `ambiguous` entries for `langs`
-    /// (`["all"]` un-gates everything). Panics only if the *embedded* data fails
-    /// to parse, which the test suite forbids.
+    /// (`["all"]` un-gates everything). The embedded documents were decoded
+    /// when this crate was built ([`builtin_rows`]); a malformed one fails the
+    /// build.
     #[must_use]
     pub fn with_languages(langs: &[&str]) -> Lexicon {
-        // Explicit match instead of `.expect(..)`: `expect`'s panic-freedom is
-        // not modeled by the verifier. The panic is unreachable for the
-        // embedded data (the test suite parses it).
-        match Self::from_sources(BUILTIN_LEXICON, BUILTIN_EXCEPTIONS, langs) {
-            Ok(lx) => lx,
-            Err(e) => {
-                let mut msg = String::from("embedded lexicon must parse: ");
-                msg.push_str(&DebugText(&e).to_string());
-                std::panic::panic_any(msg)
-            }
-        }
+        let (raw, raw_exc) = builtin_rows();
+        Self::build(raw, raw_exc, &Langs::new(langs))
     }
 
     /// The embedded lexicon with an optional user `[[entry]]` TOML merged OVER it
@@ -583,9 +671,7 @@ impl Lexicon {
         langs: &[&str],
         extra_toml: Option<&str>,
     ) -> Result<Lexicon, LexError> {
-        let mut raw: RawLexicon = aterm_toml::from_str(BUILTIN_LEXICON).map_err(LexError::Toml)?;
-        let raw_exc: RawExceptions =
-            aterm_toml::from_str(BUILTIN_EXCEPTIONS).map_err(LexError::Toml)?;
+        let (mut raw, raw_exc) = builtin_rows();
         if let Some(t) = extra_toml {
             let user: RawLexicon = aterm_toml::from_str(t).map_err(LexError::Toml)?;
             // v3 §6: user entries are marked so their surfaces land in the
@@ -598,8 +684,8 @@ impl Lexicon {
         Ok(Self::build(raw, raw_exc, &Langs::new(langs)))
     }
 
-    /// Build a lexicon from TOML sources (e.g. the embedded data, or a user
-    /// override merged in). `langs` selects which `ambiguous` entries load.
+    /// Build a lexicon from TOML sources (a lexicon document and an exceptions
+    /// document, decoded here). `langs` selects which `ambiguous` entries load.
     pub fn from_sources(
         lexicon_toml: &str,
         exceptions_toml: &str,

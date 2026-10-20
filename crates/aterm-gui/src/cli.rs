@@ -150,8 +150,8 @@ const HELP_HEAD: &str = concat!(
     "    -d, --working-directory <dir>  Start the shell/command in <dir>.\n",
     "        --hold                     Keep the window open after the -e command\n",
     "                                   exits (close it manually).\n",
-    "        --font-px <px>             Glyph size in physical px (6..=200) for this\n",
-    "                                   launch.                 [config: font_px]\n",
+    "        --font-px <px>             Font size in px at 1x, points on macOS\n",
+    "                                   (6..=200), for this launch. [config: font_px]\n",
     "        --font <name|path>         Primary font FAMILY (e.g. \"JetBrains Mono\") or\n",
     "                                   font file for this launch. [config: font_family]\n",
     shell_flag_help!(),
@@ -171,7 +171,11 @@ const HELP_HEAD: &str = concat!(
     "                                   disable); clients reach it with --sock <path>.\n",
     "        --no-control-sock          Disable the control socket.\n",
     "        --headless                 No window; engine + control socket only. The\n",
-    "                                   launch announces the mode on stderr.\n",
+    "                                   launch announces the mode on stderr. Once it\n",
+    "                                   is up, SIGTERM, SIGINT or SIGHUP quits it as\n",
+    "                                   Quit does (a second one ends it at once; one\n",
+    "                                   it was started ignoring, as by nohup, stays\n",
+    "                                   ignored).\n",
     "        --lifeline-fd <n>          With --headless: shut down when descriptor <n>\n",
     "                                   (a pipe's read end) reads end-of-file — the\n",
     "                                   launcher that holds its write end is gone. For\n",
@@ -302,7 +306,7 @@ const HELP_TAIL: &str = concat!(
     "              spare_shell_needs_person.\n",
     "  Cursor      serious_mode (mute all sound/decorative effects), motion,\n",
     "              cursor_style, cursor_blink, cursor_momentum_glow (typing-speed glow),\n",
-    "              cursor_trail, cursor_trail_style (default rainbow kitty pet),\n",
+    "              cursor_trail_style (default rainbow kitty pet; off on Windows),\n",
     "              cursor_trail_color/_accent/_intensity/_radius,\n",
     "              cursor_trail_ms/_length/_ring, cursor_trail_bloom (+_strength/_radius).\n",
     "  Sound       trail_sounds (master), trail_sound_volume (scales every synth\n",
@@ -312,7 +316,6 @@ const HELP_TAIL: &str = concat!(
     "              trail_sound_bed (the ambient texture; default on),\n",
     "              trail_sound_riff (the sing-along song — the loudest voice),\n",
     "              bell_sound (the audible BEL beep; macOS/Windows),\n",
-    "              choice_sound (the chime when the supervisor answers a question),\n",
     "              sparkle_words.profanity.bonk[_detonation] (the curse bonk).\n",
     "  Text        ligatures, font_features, bidi, ambiguous_width,\n",
     "              text_blending (linear-corrected | linear), font_thicken (macOS),\n",
@@ -329,9 +332,10 @@ const HELP_TAIL: &str = concat!(
     "              option_as_meta, search_history_lines, focus_boost (Windows:\n",
     "              shell priority follows window focus; default on),\n",
     "              conpty (Windows: the console host new tabs run in —\n",
-    "              inbox, the default | auto | a path to OpenConsole.exe),\n",
+    "              bundled, the default | inbox | auto | a path to\n",
+    "              OpenConsole.exe),\n",
     "              desktop_alerts (aterm's own alerts also as system\n",
-    "              notifications; default off).\n",
+    "              notifications, needs only; default off).\n",
     "  Security    allow_window_ops, allow_notifications, allow_palette_reconfigure,\n",
     "              allow_kitty_file_transfer, allow_osc52_query,\n",
     "              secure_keyboard_entry (macOS)  (all opt-in, default off).\n",
@@ -451,19 +455,20 @@ const STARTER_CONFIG: &str = concat!(
 # fallback_fonts = [\"Sarasa Mono\"] # ordered Unicode fallbacks, tried before built-in discovery
 # symbol_font = \"Symbols Nerd Font\"   # monochrome symbol fallback
 # emoji_font = \"Noto Color Emoji\"     # colour-emoji face
-# font_px = 16                     # physical px (13 looks small on a 100+ DPI panel)
+# font_px = 16                     # px at 1x (points on macOS); drawn x the display scale
 # theme = \"Default\"               # a built-in scheme, or \"dark:<name>,light:<name>\"
 # foreground = \"#C8D3F5\"
 # background = \"#1A1B26\"
 # cursor_style = \"block\"          # block | bar
 # cursor_blink = true
-# cursor_momentum_glow = true     # the cursor glows with how fast you type and cools when you stop; warm = no blink (default ON)
+# cursor_momentum_glow = true     # the cursor glows with how fast you type and cools when you stop, on every style; warm = no blink (default ON, except on Windows)
 # selection_color = \"#33415E\"
 # selection_foreground = \"#FFFFFF\" # selected-text ink; unset = auto contrast floor
 # selection_inactive = false       # dim the selection band while the window is unfocused
 # split_focus_mark = true          # in a split, ink the divider edge of the pane taking keystrokes
+# scrollbar = true                 # overlay scrollbar in each pane's right gutter (default: Windows on, else off: the brief scroll pill)
 # window_colorspace = \"srgb\"       # macOS GPU CAMetalLayer tag: srgb (colour-managed) | display-p3 (legacy stretched)
-# minimum_contrast = 1.0           # per-cell WCAG contrast floor, 1.0 (off) ..= 21.0
+# minimum_contrast = 1.0           # per-cell WCAG contrast floor, 1.0 (off) ..= 21.0; unset on Windows: theme colours held to 4.5:1
 # background_opacity = 1.0         # macOS GPU window glass, 0.0 (transparent) ..= 1.0 (solid); other renderers stay solid; <1.0 auto-floors contrast to 4.5:1
 # background_material = \"none\"     # macOS vibrancy behind glass: none | hud | sidebar | under-window
 # window_padding = 12.0            # interior padding, logical px per edge (0..=64; hot-applies)
@@ -489,8 +494,7 @@ const STARTER_CONFIG: &str = concat!(
 # serious_mode = false            # mute sounds + hide decorative effects; underlying effect settings return when switched off
 # motion = \"auto\"                 # auto (live Reduce Motion on macOS; sampled at Windows window attach; no OS query elsewhere) | full | reduced
 # load_adaptive_motion = true      # drop decorative effects under sustained render overload (smooth scrolling is never shed); false = never shed (motion=\"full\" also forces effects on)
-# cursor_trail = true              # the cursor motion trail + light crown, plus the walking cat the default style rides it with. Default ON — except on Windows, where it is opt-IN: uncomment this line for the whole show
-# cursor_trail_style = \"rainbow kitty pet\"  # rainbow kitty pet (DEFAULT; the tall full-height rainbow body — letters inside the light — with the walking cat; \"rainbow kitty\"/\"kitty\" name the same resident) | rainbow kitty flying (same tall ribbon under the earned flying head; aliases \"flying kitty\"/\"kitty flying\" and historical \"nyan rainbow\"/\"nyan\"/\"rainbow\") | rainbow kitty underline (the explicit highlighter-plus-under-baseline alternate) | rainbow kitty tall (an explicit spelling of the default tall body; aliases \"rainbow tall\"/\"tall rainbow\"/\"nyan tall\") | rainbow kitty flat (the A/B control: the flat body of 2026-09-13, before the comet body and its vivid rail; aliases \"rainbow flat\"/\"flat rainbow\"/\"nyan flat\") | rainbow dog pet | phaser | comet | lumen | sparkle | fire | laser | water | beam | classic (the v0.28 trail restored: thin comet, soft square bloom, and the jump comet the modern gates no longer draw) | classic mono (the same salvaged trail in ONE hue from the theme cursor colour, following cursor_trail_color/OSC 12, instead of the rolling spectrum) | off
+# cursor_trail_style = \"rainbow kitty pet\"  # the cursor motion trail + light crown; off draws none. rainbow kitty pet (DEFAULT, except on Windows where off is: uncomment this line for the whole show; the tall full-height rainbow body — letters inside the light — with the walking cat; \"rainbow kitty\"/\"kitty\" name the same resident) | rainbow kitty flying (same tall ribbon under the earned flying head; aliases \"flying kitty\"/\"kitty flying\" and historical \"nyan rainbow\"/\"nyan\"/\"rainbow\") | rainbow kitty underline (the explicit highlighter-plus-under-baseline alternate) | rainbow kitty tall (an explicit spelling of the default tall body; aliases \"rainbow tall\"/\"tall rainbow\"/\"nyan tall\") | rainbow kitty flat (the A/B control: the flat body of 2026-09-13, before the comet body and its vivid rail; aliases \"rainbow flat\"/\"flat rainbow\"/\"nyan flat\") | rainbow dog pet | phaser | comet | lumen | sparkle | fire | laser | water | beam | classic (the v0.28 trail restored: thin comet, soft square bloom, and the jump comet the modern gates no longer draw, in shifting colors, or in ONE hue with cursor_trail_color set; \"classic mono\" names the one hue in the cursor colour) | off
 # cursor_trail_color = \"#50FA7B\"      # base colour (default: the theme's cursor colour)
 # cursor_trail_accent = \"#7AA2F7\"     # comet-tail / ring colour (default: brightened base)
 # cursor_trail_ms = 260                # fade duration in ms (30..=2000)
@@ -548,23 +552,31 @@ const STARTER_CONFIG: &str = concat!(
                                    # (the version lives in the menu bar: the v<version> menu opens About)
 # confirm_multiline_paste = true   # confirm an unbracketed paste holding a line break (macOS sheet / Windows dialog / Linux in-window banner)
 # focus_boost = true               # Windows: boost the visible shells' priority while aterm is focused (DEFAULT on; no-op elsewhere)
-# conpty = \"inbox\"                 # Windows: the console host new tabs run in. DEFAULT \"inbox\" (the Windows console host);
-                                   # \"auto\" tries OpenConsole (beside aterm, else a copy of Windows Terminal's), or give the
-                                   # path of an OpenConsole.exe. `aterm doctor` names the host a new tab gets
+# conpty = \"bundled\"               # Windows: the console host new tabs run in. DEFAULT \"bundled\" (the OpenConsole.exe
+                                   # shipped beside aterm, else the Windows console host); \"inbox\" keeps the Windows console
+                                   # host; \"auto\" also tries a copy of Windows Terminal's; or give the path of an
+                                   # OpenConsole.exe. `aterm doctor` names the host a new tab gets
 # desktop_alerts = false           # aterm's OWN alerts (an agent that needs you, a macOS permission, and the one
-                                   # update-health cause only you can end) also as system notifications (macOS:
-                                   # terminal-notifier, else osascript = \"Script Editor\"). DEFAULT off: they stay in the
-                                   # band, the menu bar and messages.log. Programs' OSC 9/99/777
-                                   # notifications are allow_notifications' below
+                                   # update-health cause only you can end) also as system notifications (macOS,
+                                   # run from the app: aterm's own once macOS allows it, which Notify Me asks when
+                                   # turned on and the first notice asks while on, none until then or once it says
+                                   # no, and none from one in your Desktop, Documents or Downloads folder until it
+                                   # moves to Applications; not run from the app, terminal-notifier, found on PATH
+                                   # or in Homebrew, else osascript, whose banner is \"Script Editor\"'s). Needs
+                                   # only. DEFAULT off: they stay in the band, the menu bar and messages.log; the
+                                   # menu bar's Notify Me When I'm Needed turns them on. Programs' OSC 9/99/777 notifications are allow_notifications' below
 
 # --- program permissions (default OFF unless noted) --------------------------
 # allow_window_ops = false         # XTWINOPS title, text-grid-size, text-area-pixels and cell-size reports (window/screen
 #                                  # position and screen size stay unanswered); Linux also applies window
 #                                  # manipulations (move stays denied)
-# allow_notifications = false      # OSC 9/99/777 desktop notifications; macOS delivers through terminal-notifier
-#                                  # if installed, else osascript — a subprocess under aterm's identity; Windows
-#                                  # shows a notification-area balloon/toast from aterm itself (Shell_NotifyIcon,
-#                                  # no subprocess); Linux has no delivery yet — the request is dropped
+# allow_notifications = false      # OSC 9/99/777 desktop notifications; macOS, run from the app, delivers as aterm
+#                                  # itself once macOS allows it (see desktop_alerts; while that is off they ask
+#                                  # nothing), none until then or once it says no, and none from one in your
+#                                  # Desktop, Documents or Downloads folder; not run from the app, through
+#                                  # terminal-notifier if installed, else osascript — a subprocess under aterm's
+#                                  # identity; Windows shows a notification-area balloon/toast from aterm itself
+#                                  # (Shell_NotifyIcon, no subprocess); Linux has no delivery yet — the request is dropped
 # allow_palette_reconfigure = true   # programs may set the 256 indexed colours (OSC 4/21: base16-shell, pywal,
 #                                  # theme.sh) for the session; false refuses
 # allow_kitty_file_transfer = false # let Kitty file/temp-file/shm media read host files; applies to new sessions
@@ -681,11 +693,17 @@ const STARTER_CONFIG: &str = concat!(
 #                                  #   upstream (false silences the line, never the run)
 
 # --- this Mac: host settings, applied once a day at the first window or
-# terminal session, and by the next package pass after an edit here.
-# `aterm pkg machine apply` applies now; `aterm pkg machine` reads them.
-# Settings ▸ Security shows the measured state and has Apply Now. macOS only.
+# terminal session, and by the next package pass after an edit here (while
+# [packages] enabled is on). `aterm pkg machine apply` applies now; `aterm pkg
+# machine` reads them. Settings ▸ Security shows the measured state and offers
+# Apply Now when there is something to apply. macOS only.
 # [machine]
 # universal_control = \"off\"        # \"off\" (default: disable it for this host) | \"leave\"
+
+# --- system awareness: the stats bars under the titlebar (Global, aterm, Tab):
+# every core as a tile, the GPU, memory and swap, the disk the tab is in. Read live.
+# [sys]
+# stats_bars = \"deck\"              # \"deck\" (default: the three bars) | \"off\"
 
 # --- input policy: map a chord to RAW BYTES sent to the program, overriding the
 # default key encoding + non-menu hardcoded chords (NOT macOS menu keys like Cmd-C,

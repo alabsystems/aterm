@@ -243,6 +243,8 @@ fn hand_over(app: &mut App) {
         update_verified_unix_ms: None,
         font_px_milli: None,
         font_reset_px_milli: None,
+        font_size_milli: None,
+        font_reset_size_milli: None,
         update_health_said: carried.update_health_said,
         messages_captured_unix_ms: carried.captured_unix_ms,
         inner_px: None,

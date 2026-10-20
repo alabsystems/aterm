@@ -82,8 +82,8 @@ fn wheel_and_terminal_pixel_geometry_use_the_target_windows_cell_size() {
 #[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn a_free_desktop_notch_scrolls_vtes_distance_and_a_precise_row_scrolls_one() {
-    use winit::dpi::PhysicalPosition;
-    use winit::event::MouseScrollDelta;
+    use aterm_window::dpi::PhysicalPosition;
+    use aterm_window::event::MouseScrollDelta;
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let term = seed_history(&app, wid);
@@ -228,8 +228,8 @@ fn a_precise_chained_delta_tracks_the_finger_and_a_notch_retargets() {
 /// landing), and a second sub-row delta inside the same row pays none.
 #[test]
 fn a_sub_row_precise_delta_moves_the_band_before_a_whole_row_banks() {
-    use winit::dpi::PhysicalPosition;
-    use winit::event::MouseScrollDelta;
+    use aterm_window::dpi::PhysicalPosition;
+    use aterm_window::event::MouseScrollDelta;
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let term = seed_history(&app, wid);
@@ -315,8 +315,8 @@ fn a_sub_row_precise_delta_moves_the_band_before_a_whole_row_banks() {
 /// scroll nothing, take no engine lock, and leave the card up.
 #[test]
 fn a_sub_row_precise_delta_under_the_tab_menu_is_swallowed_like_a_notch() {
-    use winit::dpi::PhysicalPosition;
-    use winit::event::MouseScrollDelta;
+    use aterm_window::dpi::PhysicalPosition;
+    use aterm_window::event::MouseScrollDelta;
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.tab_strip_rows = 1;
@@ -378,8 +378,8 @@ fn a_sub_row_precise_delta_under_the_tab_menu_is_swallowed_like_a_notch() {
 
 #[test]
 fn tab_menu_discards_banked_wheel_fractions_at_both_boundaries() {
-    use winit::dpi::PhysicalPosition;
-    use winit::event::MouseScrollDelta;
+    use aterm_window::dpi::PhysicalPosition;
+    use aterm_window::event::MouseScrollDelta;
 
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -423,8 +423,8 @@ fn tab_menu_discards_banked_wheel_fractions_at_both_boundaries() {
 /// window can lapse and start a settle mid-stream.
 #[test]
 fn a_constant_speed_precise_stream_moves_the_band_evenly() {
-    use winit::dpi::PhysicalPosition;
-    use winit::event::MouseScrollDelta;
+    use aterm_window::dpi::PhysicalPosition;
+    use aterm_window::event::MouseScrollDelta;
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let term = seed_history(&app, wid);
@@ -473,8 +473,8 @@ fn a_constant_speed_precise_stream_moves_the_band_evenly() {
 #[test]
 fn a_gesture_end_starts_the_rest_settle_at_once() {
     use crate::scroll_motion::TRACK_SETTLE_MS;
-    use winit::dpi::PhysicalPosition;
-    use winit::event::{MouseScrollDelta, TouchPhase};
+    use aterm_window::dpi::PhysicalPosition;
+    use aterm_window::event::{MouseScrollDelta, TouchPhase};
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let _term = seed_history(&app, wid);
@@ -534,10 +534,10 @@ fn a_gesture_end_starts_the_rest_settle_at_once() {
 #[test]
 fn a_precise_stream_under_a_tracking_app_reports_whole_rows_only_and_moves_no_band() {
     use aterm_types::mouse::WheelDir;
+    use aterm_window::dpi::PhysicalPosition;
+    use aterm_window::event::MouseScrollDelta;
     use std::io::Read;
     use std::os::fd::FromRawFd;
-    use winit::dpi::PhysicalPosition;
-    use winit::event::MouseScrollDelta;
     let mut pipe = [0; 2];
     assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
     aterm_pty::set_nonblocking(pipe[0], true).expect("nonblocking pipe reader");
@@ -602,8 +602,8 @@ fn a_precise_stream_under_a_tracking_app_reports_whole_rows_only_and_moves_no_ba
 /// bound pans into history with one lock for the row it enters.
 #[test]
 fn a_precise_push_past_the_live_bottom_takes_no_lock_once_parked() {
-    use winit::dpi::PhysicalPosition;
-    use winit::event::MouseScrollDelta;
+    use aterm_window::dpi::PhysicalPosition;
+    use aterm_window::event::MouseScrollDelta;
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let term = seed_history(&app, wid);
@@ -660,10 +660,10 @@ fn a_precise_push_past_the_live_bottom_takes_no_lock_once_parked() {
 #[cfg(unix)]
 #[test]
 fn a_pager_that_comes_up_under_a_parked_band_still_gets_its_arrows() {
+    use aterm_window::dpi::PhysicalPosition;
+    use aterm_window::event::MouseScrollDelta;
     use std::io::Read;
     use std::os::fd::FromRawFd;
-    use winit::dpi::PhysicalPosition;
-    use winit::event::MouseScrollDelta;
     let mut pipe = [0; 2];
     assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
     aterm_pty::set_nonblocking(pipe[0], true).expect("nonblocking pipe reader");
@@ -879,13 +879,13 @@ fn a_delta_that_crosses_the_history_ends_the_other_edges_bounce() {
 /// exempts Alt as well as Shift). Four quarter-row deltas present one row.
 #[test]
 fn alt_over_a_main_screen_tracking_app_tracks_every_pixel() {
-    use winit::dpi::PhysicalPosition;
-    use winit::event::MouseScrollDelta;
+    use aterm_window::dpi::PhysicalPosition;
+    use aterm_window::event::MouseScrollDelta;
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let term = seed_history(&app, wid);
     term_lock(&term).process(b"\x1b[?1000h\x1b[?1006h");
-    app.windows.get_mut(&wid).unwrap().mods = winit::keyboard::ModifiersState::ALT;
+    app.windows.get_mut(&wid).unwrap().mods = aterm_window::keyboard::ModifiersState::ALT;
     let cell_h = app.win_cell_size(wid).1.max(1) as i64;
     assert!(cell_h >= 8, "fixture: a cell tall enough to quarter");
     for _ in 0..4 {

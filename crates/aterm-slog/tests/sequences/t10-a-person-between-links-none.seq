@@ -1,0 +1,13 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# T10, T39: a person's input after the mail (the `human` mark aterm-gui
+# writes of it) stands between the mail and the later `ctl turn`: the
+# turn is not the mail's.
+mail task off=3
+expect mark - mail dir=in kind=task off=3
+at 500 human
+expect mark - human by=human src=input conf=strong at=500
+at 1000 ctl
+wait 300
+see busy
+expect open t1 turn ledger=1 by=harness at=1300
+expect link=none

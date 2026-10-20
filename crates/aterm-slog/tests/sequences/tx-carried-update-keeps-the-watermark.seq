@@ -1,0 +1,16 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# A1: a carried update keeps the join's watermark and its open step: a
+# replayed row is not applied again; the result closes the step.
+bind 0
+see busy
+tx prompt v1
+tx tool c1
+handoff carried
+expect mark - handoff carried=6 shed=0 epoch=2
+expect tx through=400 mapped=t1
+tx prompt v1 off=200
+tx result c1
+expect open p1 tool vref=c1
+expect close p1 tool out=ok
+tx end
+expect close t1 turn out=done steps=1 tools=shell:1

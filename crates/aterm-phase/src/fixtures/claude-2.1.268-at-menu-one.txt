@@ -1,0 +1,51 @@
+# claude-code 2.1.268 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the composer holding `see @nort`, its `@` menu of one file (`+ north.rs`) at column 2, no pointer drawn · the same text as the menu opened, `+` in `999999` (Enter sent `see @nort`), and after `down`, `+` in `b1b9f9` (Enter completed it, `see @north.rs`, and sent nothing): the entry's colour, with no other entry's beside it, is all that tells the two apart
+ ▐▛███▛█   Claude Code v2.1.268
+▝▜██████▀  Opus 5 (1M context) · API Usage Billing
+  ▝▝ ▝▝    /private/tmp/at.ToZM/proj
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ see @nort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  + north.rs
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

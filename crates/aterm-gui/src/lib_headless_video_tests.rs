@@ -54,30 +54,38 @@ fn controller_key(key: Key, event_type: KeyEventType) -> InputEvent {
 }
 
 /// Bounded bookkeeping for pre-routing controller character attempts: press/repeat adds
-/// one sample, release none, never past the cap. Says nothing about delivery or pixels.
-/// `Buggy=1` logs a Kitty release as an attempt (the negative control).
+/// one sample, release none, never past the cap; an attempt past the cap is counted as
+/// dropped, so logged plus dropped is every attempt. Says nothing about delivery or pixels.
+/// `Buggy=1` logs a Kitty release as an attempt (the negative control); the conformance
+/// test's own control is the overflow dropped uncounted, the defect the count fixes.
 fn video_controller_attempt_ledger_model() -> aterm_spec::derive::Model {
     use aterm_spec::ty_model;
     ty_model! {
         VideoControllerAttemptLedger {
             const Cap = 3;
+            const Over = 3;
             const Buggy = 0;
             var attempts = 0;
             var logged = 0;
+            var dropped = 0;
             var releases = 0;
-            action RecordAttempt when (attempts <= Cap - 1) {
+            action RecordAttempt when (logged <= Cap - 1) {
                 attempts = attempts + 1;
                 logged = logged + 1;
+            }
+            action OverflowAttempt when (logged == Cap && dropped <= Over - 1) {
+                attempts = attempts + 1;
+                dropped = dropped + 1;
             }
             action IgnoreRelease when (releases <= Cap - 1) {
                 releases = releases + 1;
                 logged = if Buggy == 1 { logged + 1 } else { logged };
             }
-            action Stay when (attempts == Cap && releases == Cap) {
+            action Stay when (logged == Cap && dropped == Over && releases == Cap) {
                 attempts = attempts;
             }
-            invariant Bounds: attempts <= Cap && logged <= Cap && releases <= Cap;
-            invariant ExactAttemptLedger: logged == attempts;
+            invariant Bounds: attempts <= Cap + Over && logged <= Cap && dropped <= Over && releases <= Cap;
+            invariant ExactAttemptLedger: logged + dropped == attempts;
         }
     }
 }
@@ -97,21 +105,23 @@ fn real_controller_video_attempt_ledger_conforms_to_model() {
     let mut state = model.init_state();
     let mut log = Vec::new();
 
-    record_controller_video_attempts(
+    let below = record_controller_video_attempts(
         &mut log,
         &controller_key(Key::Character('a'), KeyEventType::Press),
         10,
         3,
     );
+    assert_eq!(below, 0, "below the cap nothing is dropped");
     assert!(model.fire("RecordAttempt", &mut state));
     assert_eq!(log, vec![(10, VideoInputSample::Char('a'))]);
 
-    record_controller_video_attempts(
+    let below = record_controller_video_attempts(
         &mut log,
         &controller_key(Key::Character('a'), KeyEventType::Release),
         11,
         3,
     );
+    assert_eq!(below, 0, "below the cap nothing is dropped");
     assert!(model.fire("IgnoreRelease", &mut state));
     assert_eq!(
         log,
@@ -119,12 +129,13 @@ fn real_controller_video_attempt_ledger_conforms_to_model() {
         "release is not a second sample"
     );
 
-    record_controller_video_attempts(
+    let below = record_controller_video_attempts(
         &mut log,
         &controller_key(Key::Named(NamedKey::Space), KeyEventType::Press),
         12,
         3,
     );
+    assert_eq!(below, 0, "below the cap nothing is dropped");
     assert!(model.fire("RecordAttempt", &mut state));
     assert_eq!(
         log.last(),
@@ -132,12 +143,13 @@ fn real_controller_video_attempt_ledger_conforms_to_model() {
         "named Space is represented"
     );
 
-    record_controller_video_attempts(
+    let below = record_controller_video_attempts(
         &mut log,
         &controller_key(Key::Character('r'), KeyEventType::Repeat),
         13,
         3,
     );
+    assert_eq!(below, 0, "below the cap nothing is dropped");
     assert!(model.fire("RecordAttempt", &mut state));
     assert_eq!(
         log.last(),
@@ -147,14 +159,46 @@ fn real_controller_video_attempt_ledger_conforms_to_model() {
     assert_eq!(log.len() as i64, state["logged"]);
     assert!(model.check_invariant("ExactAttemptLedger", &state));
 
-    // The real capped helper stops before scanning/appending the tail.
-    record_controller_video_attempts(&mut log, &InputEvent::Text("overflow".into()), 14, 3);
-    assert_eq!(log.len(), 3);
+    // Past the cap the helper appends nothing and answers what it dropped: one press,
+    // then a two-character text, three attempts the full ledger counts and keeps out.
+    let press = record_controller_video_attempts(
+        &mut log,
+        &controller_key(Key::Character('x'), KeyEventType::Press),
+        14,
+        3,
+    );
+    assert!(model.fire("OverflowAttempt", &mut state));
+    assert_eq!(press, 1, "a press past the cap is counted");
+    let text = record_controller_video_attempts(&mut log, &InputEvent::Text("yz".into()), 15, 3);
+    assert!(model.fire("OverflowAttempt", &mut state));
+    assert!(model.fire("OverflowAttempt", &mut state));
+    assert_eq!(text, 2, "every character past the cap is counted");
+    assert_eq!(
+        log.len() as i64,
+        state["logged"],
+        "the full ledger takes no row"
+    );
+    assert_eq!((press + text) as i64, state["dropped"]);
+    assert!(model.check_invariant("ExactAttemptLedger", &state));
+    // A release past the cap is no attempt, so it is no drop either.
+    assert_eq!(
+        record_controller_video_attempts(
+            &mut log,
+            &controller_key(Key::Character('x'), KeyEventType::Release),
+            16,
+            3,
+        ),
+        0
+    );
+    // Negative control: the overflow dropped uncounted (the old helper) breaks the law.
+    let mut uncounted = state.clone();
+    uncounted.insert("dropped", uncounted["dropped"] - 1);
+    assert!(!model.check_invariant("ExactAttemptLedger", &uncounted));
 
     // Multi-codepoint text/paste records every character below the cap.
     let mut multi = Vec::new();
-    record_controller_video_attempts(&mut multi, &InputEvent::Text("ab".into()), 20, 8);
-    record_controller_video_attempts(
+    let _ = record_controller_video_attempts(&mut multi, &InputEvent::Text("ab".into()), 20, 8);
+    let _ = record_controller_video_attempts(
         &mut multi,
         &InputEvent::Paste(" c".into(), crate::input::PasteFraming::AtDrain),
         21,
@@ -174,7 +218,7 @@ fn real_controller_video_attempt_ledger_conforms_to_model() {
     // pre-routing ledger still records the attempt, so a sample is neither a PTY write
     // receipt nor a visible glyph.
     let mut shortcut = Vec::new();
-    record_controller_video_attempts(
+    let _ = record_controller_video_attempts(
         &mut shortcut,
         &controller_key_with_mods(Key::Character('c'), Modifiers::CTRL, KeyEventType::Press),
         30,
@@ -208,6 +252,7 @@ fn the_key_ledger_refuses_input_from_a_window_it_is_not_recording() {
         pace_ticks: Vec::new(),
         unseamed_at_begin: began,
         unlogged_other_window: 0,
+        unlogged_over_cap: 0,
         mode: VideoMode::SwapchainTap,
         next_frame: None,
         presented: None,
@@ -259,6 +304,63 @@ fn the_key_ledger_refuses_input_from_a_window_it_is_not_recording() {
         (rec.key_log.len(), rec.unlogged_other_window),
         (3, 0),
         "a take without `keys` neither logs nor counts"
+    );
+
+    let _ = app.video_rec.take();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A full ledger counts what it drops: once `key_log` holds `VIDEO_KEY_LOG_CAP` rows, the
+/// recorded window's attempts on both the socket seam and the hardware key path are counted in
+/// `unlogged_over_cap` and reach the take's `unlogged_inputs`, as frames count their drops.
+#[test]
+fn a_full_key_ledger_counts_the_attempts_it_drops() {
+    let mut app = super::App::headless_for_test();
+    let recorded = WindowId(0);
+    let (root, _path, dir) = test_video_dir("video-keys-over-cap");
+    let (reply, _rx) = std::sync::mpsc::channel();
+    app.video_rec = Some(VideoRec {
+        window: recorded,
+        deadline: Instant::now() + Duration::from_secs(3),
+        started_us: 0,
+        keys: true,
+        key_log: vec![(1, VideoInputSample::Char('a')); crate::VIDEO_KEY_LOG_CAP - 1],
+        pace_ticks: Vec::new(),
+        unseamed_at_begin: crate::unseamed_control_inputs(),
+        unlogged_other_window: 0,
+        unlogged_over_cap: 0,
+        mode: VideoMode::SwapchainTap,
+        next_frame: None,
+        presented: None,
+        dir,
+        handoff: None,
+        cancel: VideoCancellation::new(),
+        reply,
+    });
+
+    // One row is left: `hi` fills it with `h` and drops `i`; the hardware key is dropped too.
+    app.note_video_ledger_event(recorded, &InputEvent::KeySequence(b"hi".to_vec()), 100);
+    app.note_video_ledger_sample(recorded, VideoInputSample::Named(NamedKey::ArrowUp), 150);
+
+    let rec = app.video_rec.as_ref().expect("the recording is still live");
+    assert_eq!(
+        rec.key_log.len(),
+        crate::VIDEO_KEY_LOG_CAP,
+        "the ledger stays bounded"
+    );
+    assert_eq!(
+        rec.key_log.last(),
+        Some(&(100, VideoInputSample::Char('h')))
+    );
+    assert_eq!(
+        (rec.unlogged_over_cap, rec.unlogged_other_window),
+        (2, 0),
+        "the two attempts past the cap are counted, as the full ledger's own"
+    );
+    // A lower bound: the control-thread counter is process-wide.
+    assert!(
+        super::App::video_unlogged_total(rec) >= 2,
+        "the take's unlogged_inputs must include the attempts past the cap"
     );
 
     let _ = app.video_rec.take();
@@ -599,6 +701,7 @@ fn live_opacity_transition_aborts_swapchain_recording_fail_closed() {
         pace_ticks: Vec::new(),
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
+        unlogged_over_cap: 0,
         mode: VideoMode::SwapchainTap,
         next_frame: None,
         presented: None,
@@ -642,6 +745,7 @@ fn live_opacity_transition_aborts_swapchain_recording_fail_closed() {
             pace_ticks: Vec::new(),
             unseamed_at_begin: 0,
             unlogged_other_window: 0,
+            unlogged_over_cap: 0,
             mode,
             next_frame: None,
             presented: None,
@@ -700,6 +804,7 @@ fn window_close_app_drop_and_backend_rebuild_abort_recording_ownership() {
         pace_ticks: Vec::new(),
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
+        unlogged_over_cap: 0,
         mode: VideoMode::SwapchainTap,
         next_frame: Some(Instant::now()),
         presented: None,
@@ -741,6 +846,7 @@ fn window_close_app_drop_and_backend_rebuild_abort_recording_ownership() {
             pace_ticks: Vec::new(),
             unseamed_at_begin: 0,
             unlogged_other_window: 0,
+            unlogged_over_cap: 0,
             mode,
             next_frame: Some(Instant::now()),
             presented: None,
@@ -774,6 +880,7 @@ fn window_close_app_drop_and_backend_rebuild_abort_recording_ownership() {
         pace_ticks: Vec::new(),
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
+        unlogged_over_cap: 0,
         mode: VideoMode::OffscreenPresentReal,
         next_frame: Some(Instant::now()),
         presented: None,
@@ -817,6 +924,7 @@ fn finalize_drops_virtual_target_and_timer() {
         pace_ticks: Vec::new(),
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
+        unlogged_over_cap: 0,
         mode: VideoMode::OffscreenPresentReal,
         next_frame: Some(now),
         presented: None,
@@ -911,6 +1019,7 @@ fn service_video_wake_consumes_due_clocks_on_any_wake() {
         pace_ticks: Vec::new(),
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
+        unlogged_over_cap: 0,
         mode: VideoMode::SwapchainTap,
         next_frame: None,
         presented: None,
@@ -950,6 +1059,7 @@ fn service_video_wake_consumes_due_clocks_on_any_wake() {
         pace_ticks: Vec::new(),
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
+        unlogged_over_cap: 0,
         mode: VideoMode::OffscreenPresentReal,
         next_frame: Some(now - Duration::from_millis(5)),
         presented: None,
@@ -1007,6 +1117,7 @@ fn service_video_wake_consumes_due_clocks_on_any_wake() {
         pace_ticks: Vec::new(),
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
+        unlogged_over_cap: 0,
         mode: VideoMode::OffscreenPresentReal,
         next_frame: Some(armed_frame),
         presented: None,
@@ -1056,6 +1167,7 @@ fn device_loss_aborts_virtual_recording_without_a_timer_wedge() {
         pace_ticks: Vec::new(),
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
+        unlogged_over_cap: 0,
         mode: VideoMode::OffscreenPresentReal,
         next_frame: Some(now),
         presented: None,

@@ -13,6 +13,10 @@
 //! Windows only: the font files and the heap it bills are Windows's.
 
 #[cfg(windows)]
+#[expect(
+    dead_code,
+    reason = "`measure` is the `win_heap_attribution` gate's; this bench bills and reports"
+)]
 #[path = "../tests/common/heapprof.rs"]
 mod heapprof;
 
@@ -163,7 +167,10 @@ fn full_font_stack_heap() {
 
     // aterm-gui config font resolution (`native_font_catalog`).
     let batch = heapprof::bill("font_catalog::resolve_and_admit", || {
-        aterm_render::font_catalog::resolve_and_admit(&["Cascadia Mono".to_string()])
+        aterm_render::font_catalog::resolve_and_admit(&[(
+            "Cascadia Mono".to_string(),
+            aterm_render::FaceTarget::REGULAR,
+        )])
     });
 
     // --- the ENGINE side of one tab, for scale against the font terms ---

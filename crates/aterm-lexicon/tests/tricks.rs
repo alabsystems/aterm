@@ -15,7 +15,7 @@
 //! * LOAD-LAW tests feed `TrickLexicon::from_source` documents that BREAK a
 //!   law and assert the loss is named on `conflicts()`, never silent.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use aterm_lexicon::tricks::row_line;
 use aterm_lexicon::{
@@ -93,8 +93,9 @@ fn the_embedded_vocabulary_has_no_conflicts_under_any_language_configuration() {
         configs.push(vec![lang.as_str()]);
         configs.push(vec!["en", lang.as_str()]);
     }
-    for config in configs {
-        let lex = TrickLexicon::with_languages(&config);
+    // Each configuration compiles on its own core.
+    aterm_spec::check::each(&configs, |config| {
+        let lex = TrickLexicon::with_languages(config);
         assert!(
             lex.conflicts().is_empty(),
             "{config:?}: tricks.toml conflicts: {:#?}",
@@ -106,7 +107,7 @@ fn the_embedded_vocabulary_has_no_conflicts_under_any_language_configuration() {
              every configuration must carry at least the English seed",
             lex.surface_count()
         );
-    }
+    });
 }
 
 #[test]
@@ -132,31 +133,34 @@ fn every_authored_surface_round_trips_to_its_own_role() {
     let rows = TrickLexicon::all_rows();
     assert!(rows.len() >= Trick::ALL.len() + 2, "the listing is vacuous");
     let all = TrickLexicon::with_languages(&["all"]);
-    let mut per_lang: HashMap<String, TrickLexicon> = HashMap::new();
-    let mut probed = 0usize;
-    for row in &rows {
-        let own = per_lang
-            .entry(row.lang.clone())
-            .or_insert_with(|| TrickLexicon::with_languages(&[row.lang.as_str()]));
-        for (surface, role) in expected_roles(row) {
-            // The authored spelling carries its own marks, so it is the
-            // marked witness the marks-required gate demands.
-            assert_eq!(
-                classify(&all, surface),
-                Some(role),
-                "{surface:?} ({}) does not classify as its own role under [\"all\"]",
-                row.lang
-            );
-            assert_eq!(
-                classify(own, surface),
-                Some(role),
-                "{surface:?} does not classify as its own role under its own \
-                 language [{:?}]",
-                row.lang
-            );
-            probed += 1;
+    // Each language's rows, under its own lexicon, on their own core.
+    let probed: usize = aterm_spec::check::each(&languages_in_the_file(), |lang| {
+        let own = TrickLexicon::with_languages(&[lang.as_str()]);
+        let mut probed = 0usize;
+        for row in rows.iter().filter(|row| &row.lang == lang) {
+            for (surface, role) in expected_roles(row) {
+                // The authored spelling carries its own marks, so it is the
+                // marked witness the marks-required gate demands.
+                assert_eq!(
+                    classify(&all, surface),
+                    Some(role),
+                    "{surface:?} ({}) does not classify as its own role under [\"all\"]",
+                    row.lang
+                );
+                assert_eq!(
+                    classify(&own, surface),
+                    Some(role),
+                    "{surface:?} does not classify as its own role under its own \
+                     language [{:?}]",
+                    row.lang
+                );
+                probed += 1;
+            }
         }
-    }
+        probed
+    })
+    .into_iter()
+    .sum();
     assert!(probed > 100, "only {probed} surfaces probed");
 }
 
@@ -1168,7 +1172,8 @@ fn every_language_in_the_file_reaches_every_trick() {
     let rows = TrickLexicon::all_rows();
     let langs = languages_in_the_file();
     assert!(langs.iter().any(|l| l == "en"), "the file lost English");
-    for lang in &langs {
+    // Each language compiles and is probed on its own core.
+    aterm_spec::check::each(&langs, |lang| {
         let lex = TrickLexicon::with_languages(&[lang.as_str()]);
         for trick in Trick::ALL {
             let excused = CORE_GAPS
@@ -1189,7 +1194,7 @@ fn every_language_in_the_file_reaches_every_trick() {
                 trick.code()
             );
         }
-    }
+    });
     for (lang, code, _) in CORE_GAPS {
         assert!(
             langs.iter().any(|l| l == lang) && Trick::from_code(code).is_some(),

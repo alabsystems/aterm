@@ -9,11 +9,11 @@ use super::*;
 
 /// A host over one tab `s-a` its Claude Code runs in, supervised, whose
 /// thread panics at its next pass once `boom` is set — its roster read, a
-/// test's panic — and at every pass while `always` is set (its look at
-/// whether a tab with no worker is open, [`forget_closed`]'s, which a pass
-/// takes before it visits its workers whether or not the harness is on:
-/// the session `s-x` is kept for an open tab no agent runs in, so every
-/// pass asks it).
+/// test's panic — and at every pass while its `passes_panic` is set, before the pass
+/// looks at any tab, whether or not the harness is on
+/// ([`Shared::passes_panic`], the test's seam: a tab's own body that panics
+/// is that tab's alone, [`tab_caught`]). The session `s-x` is kept for an
+/// open tab no agent runs in.
 /// Its restart's back-off is held at the `down` gate while that is shut
 /// (the back-off seam, on the host thread alone), and is then quick — or,
 /// `long`, that long, waited for real and cut short only by what cuts it.
@@ -24,7 +24,6 @@ struct Panicking {
     a: Arc<Acting>,
     host: HostHandle,
     boom: Arc<AtomicBool>,
-    always: Arc<AtomicBool>,
     down: Arc<PauseGate>,
     reads: Arc<AtomicUsize>,
     downs: Arc<AtomicUsize>,
@@ -51,7 +50,6 @@ fn panicking_host_hooked(
     a.set(&[("s-a", Program::Claude)]);
     let mut h = a.hooks();
     let boom = Arc::new(AtomicBool::new(false));
-    let always = Arc::new(AtomicBool::new(false));
     let reads = Arc::new(AtomicUsize::new(0));
     let downs = Arc::new(AtomicUsize::new(0));
     let host_thread = format!("{THREAD_PREFIX}host");
@@ -64,15 +62,6 @@ fn panicking_host_hooked(
         );
         r.fetch_add(1, Ordering::SeqCst);
         roster()
-    });
-    let open = Arc::clone(&h.acts.open);
-    let (every, thread) = (Arc::clone(&always), host_thread.clone());
-    h.acts.open = Arc::new(move |sid: &str| {
-        assert!(
-            !(every.load(Ordering::SeqCst) && std::thread::current().name() == Some(&thread)),
-            "every pass of the host panics (a test's)"
-        );
-        open(sid)
     });
     let approves: Arc<Mutex<Vec<_>>> = Arc::default();
     let (body, ran) = (Arc::clone(&h.body), Arc::clone(&approves));
@@ -108,7 +97,6 @@ fn panicking_host_hooked(
         a,
         host,
         boom,
-        always,
         down,
         reads,
         downs,
@@ -131,9 +119,9 @@ impl Panicking {
 
     /// The host thread panics at its next pass, and waits out its
     /// restart's (long) back-off — that pass's panic, its roster read
-    /// having taken `boom`. Arm `always` only after it: armed
+    /// having taken `boom`. Arm `passes_panic` only after it: armed
     /// before, a pass any other test's ring started between the two panicked
-    /// at its `open` look instead, `boom` was left for the next pass that
+    /// at that seam instead, `boom` was left for the next pass that
     /// reads the roster, and that one — the restarted host's first, under
     /// a policy switched on again — panicked too, into a back-off of an
     /// hour (1 in 50 runs of the exit-watch tests on fc5167e43:
@@ -264,7 +252,7 @@ fn a_harness_switched_off_while_the_host_is_down_hands_nothing_from_before() {
 fn a_harness_switched_off_while_the_host_is_down_stops_what_it_carries_itself() {
     let p = panicking_host_with(Some(Duration::from_secs(3600)));
     p.panic_and_back_off();
-    p.always.store(true, Ordering::SeqCst);
+    p.host.shared.passes_panic.store(true, Ordering::SeqCst);
     assert!(watch_armed(&p.host), "the carried worker's agent watched");
     p.host.set_config(off());
     until(
@@ -292,14 +280,14 @@ fn a_harness_switched_off_while_the_host_is_down_stops_what_it_carries_itself() 
 fn a_harness_switched_on_again_during_the_hosts_back_off_is_supervised_at_once() {
     let p = panicking_host_with(Some(Duration::from_secs(3600)));
     p.panic_and_back_off();
-    p.always.store(true, Ordering::SeqCst);
+    p.host.shared.passes_panic.store(true, Ordering::SeqCst);
     let downs = p.downs.load(Ordering::SeqCst);
     p.host.set_config(off());
     until(
         "its run panicked again with nothing to carry, backing off",
         || p.downs.load(Ordering::SeqCst) > downs && all_stopped(&p.host),
     );
-    p.always.store(false, Ordering::SeqCst);
+    p.host.shared.passes_panic.store(false, Ordering::SeqCst);
     let runs = p.a.runs.load(Ordering::SeqCst);
     p.host.set_config(on());
     until("the tab supervised again: its loop runs", || {
@@ -385,7 +373,7 @@ fn a_policy_narrowed_while_the_host_is_down_reaches_the_workers_it_carries() {
     // Every pass of the restarted host panics: the restart hands it over.
     let p = panicking_host_with(Some(Duration::from_secs(3600)));
     p.panic_and_back_off();
-    p.always.store(true, Ordering::SeqCst);
+    p.host.shared.passes_panic.store(true, Ordering::SeqCst);
     p.host.set_config(narrowed());
     until(
         "handed over by the restart itself, its exit left to the host",

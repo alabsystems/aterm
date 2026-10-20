@@ -66,6 +66,13 @@ pub const ENV_EDGE_SIGNAL: &str = "ATERM_EDGE_SIGNAL";
 /// Identity only, never a token: authority stays in the origin's `EdgeTable`.
 pub const ENV_OBSERVE_SESSION_ID: &str = "ATERM_OBSERVE_SESSION_ID";
 
+/// A WORKER's task file (`spawn agent=claude`, the sessions-as-workers design
+/// §2.1): the 0600 file under `<state>/tasks/` holding the task its starter
+/// gave it, named to the worker's shell so the one line aterm types at its
+/// first prompt hands the file's text to the agent as argv. Deny-listed
+/// (below): the task is that session's, never a nested aterm's tabs'.
+pub const ENV_TASK_FILE: &str = "ATERM_TASK_FILE";
+
 /// The shell program this tab runs, as the window resolved it (Windows: an absolute path),
 /// so a CLI typed in the tab (`aterm doctor`, `show-config`) can report the tab's shell; it
 /// cannot see the window's per-launch `--shell` flag. Deny-listed so it describes only the
@@ -81,6 +88,13 @@ pub const ENV_TAB_SHELL: &str = "ATERM_TAB_SHELL";
 /// is a production clock. Denied for inheritance ([`ENV_DENY_VARS`]): a nested aterm
 /// runs its own clock.
 pub const ENV_DEV_FAST_TIMERS: &str = "ATERM_DEV_FAST_TIMERS";
+
+/// The editor hint (`docs/DESIGN-amacs-2026-10-19.md` §8.3): set to the bare word `amacs`
+/// when this instance offers amacs as the default `EDITOR`, which a tab's shell integration
+/// exports only when neither `EDITOR` nor `VISUAL` is set. A per-hop hint: each instance
+/// re-derives it from its own config and PATH, so an inherited copy is denied
+/// ([`ENV_DENY_VARS`]) and a nested aterm never offers what only its parent decided.
+pub const ENV_DEFAULT_EDITOR: &str = "ATERM_DEFAULT_EDITOR";
 
 /// Exact env vars that should not leak into child shells.
 ///
@@ -100,6 +114,8 @@ pub const ENV_DENY_VARS: &[&str] = &[
     "ATERM_DEBUG_CLIPBOARD_FILE",
     "ATERM_DEBUG_LOST_SHELL_NONCE",
     "ATERM_UPDATE_ROOT",
+    // The curl a dev build's update lanes run in place of /usr/bin/curl (aterm-update-core).
+    "ATERM_DEV_CURL",
     "ATERM_HANDOFF_READY_TIMEOUT_MS",
     "ATERM_HANDOFF_PROOF_TIMEOUT_MS",
     "ATERM_NUDGE_CLASS",
@@ -110,6 +126,11 @@ pub const ENV_DENY_VARS: &[&str] = &[
     // launching process's environment, with no child shell in between.
     "ATERM_DEBUG_DIE_BEFORE_DIAL",
     "ATERM_DEBUG_HEADLESS_RESTORE",
+    // A quit that tells its bridge `bye handoff` (aterm-gui `fabric_launch::bye_at_quit`,
+    // the aterm-link roster test's stand-in for a Commit): a nested aterm's quit
+    // withdraws its own sessions.
+    "ATERM_DEBUG_QUIT_BYE",
+    "ATERM_DEBUG_HEADLESS_PKG_LANE",
     // The test values of every harness and host wait: a nested aterm runs its
     // own clock, never the one its parent's test suite asked for.
     ENV_DEV_FAST_TIMERS,
@@ -133,6 +154,10 @@ pub const ENV_DENY_VARS: &[&str] = &[
     // the controller.
     ENV_OBSERVE_SESSION_ID,
     ENV_TAB_SHELL,
+    // A worker's task file: that worker's task, and no descendant's.
+    ENV_TASK_FILE,
+    // The editor hint: each instance re-derives it for its own tabs.
+    ENV_DEFAULT_EDITOR,
     // Fabric credentials: the broker endpoint, cap file and fleet name are the node's
     // identity on the bus, so a nested aterm that inherited them could publish as the outer
     // node under its cap. An inner aterm becomes a node only when a human mints it a cap.
@@ -253,8 +278,10 @@ mod tests {
             "ATERM_DEBUG_DIE_BEFORE_DIAL",
             "ATERM_DEBUG_HEADLESS_RESTORE",
             "ATERM_UPDATE_ROOT",
+            "ATERM_DEV_CURL",
             "ATERM_HANDOFF_READY_TIMEOUT_MS",
             "ATERM_HANDOFF_PROOF_TIMEOUT_MS",
+            "ATERM_DEBUG_QUIT_BYE",
             "ATERM_RESIZE_RUN_GAP_MS",
             "ATERM_SLOG_RING",
             "ATERM_NUDGE_CLASS",
@@ -264,6 +291,16 @@ mod tests {
         ] {
             assert!(is_ai_env_var(v), "{v} must be deny-listed for inheritance");
         }
+    }
+
+    /// The editor hint stops at the hop, under both classifiers the spawn seams apply. The
+    /// `EDITOR` it leads a shell to export reaches the child
+    /// (`the_ordinary_environment_and_aterm_integration_vars_survive`).
+    #[test]
+    fn default_editor_hint_is_denied() {
+        assert_eq!(ENV_DEFAULT_EDITOR, "ATERM_DEFAULT_EDITOR");
+        assert!(is_ai_env_var(ENV_DEFAULT_EDITOR));
+        assert!(is_ai_env_key(std::ffi::OsStr::new(ENV_DEFAULT_EDITOR)));
     }
 
     /// What every child must keep: the ordinary environment; the shell

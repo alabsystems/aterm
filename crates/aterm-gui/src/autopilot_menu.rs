@@ -35,7 +35,15 @@
 //! the tree is built, its items in words, the highlighted row the focus).
 //!
 //! **Where.** It hangs above the chip, its left edge at the chip's column,
-//! and opens downward only where fewer rows are above.
+//! and opens downward only where fewer rows are above — inside the chip's
+//! own pane, across and up and down: shifted left only to stay in it, as
+//! narrow as the pane where the pane is narrower than the card (its side
+//! margins given up first, then the ends of its rows: never over the next
+//! pane), over the chip's row where neither side of the pane holds it
+//! whole, and its first rows only where the pane is shorter than it
+//! ([`place`]). Its name goes on two rows where one would cut it: the
+//! place, then the session's name in quotes; and the place breaks at its
+//! comma where a narrow pane cannot hold it whole ([`rows`]).
 //!
 //! **On top.** It is painted after the frame published its overlays, so its
 //! splice takes its cells back from them (`app_render::scrub_overlay_card`):
@@ -69,7 +77,9 @@
 //! that left leaves a blank [`MenuRow::Gap`]), so no row moves under a still
 //! pointer; where a row arrives and the rest must move, a press on a choice
 //! the rows moved under since the pointer last moved chooses nothing
-//! ([`AutopilotMenu::press_lands`]).
+//! ([`AutopilotMenu::press_lands`]) — and a card painted under a pointer
+//! that rests there (the right press that opened a card over its own chip,
+//! a keyboard open beside a resting pointer) is rows that moved under it.
 //!
 //! **Cost.** Nothing at rest: closed, the menu is one `Option` the frame's
 //! repaint key and the key path test. Opening and closing it are one frame
@@ -89,7 +99,8 @@ use crate::{App, WindowId};
 /// The timed Cruises the menu and Settings offer, in minutes (§9.3.3).
 pub(crate) const LAND_IN_MINUTES: [u32; 3] = [60, 120, 240];
 
-/// Cells of breathing room inside each vertical border.
+/// Cells of breathing room inside each vertical border, where the pane
+/// holds them ([`side_pad`]).
 const H_PAD: usize = 1;
 /// The narrowest and widest the card's content may be, in cells.
 const MIN_CONTENT: usize = 24;
@@ -128,8 +139,15 @@ impl MenuAct {
 /// One row of the menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MenuRow {
-    /// The menu's name: `Autopilot · tab 3 “fix the footer”`.
+    /// The menu's name: `Autopilot · tab 3 “fix the footer”` — or, where
+    /// that is wider than the card's room, its place alone
+    /// (`Autopilot · tab 1, right pane`), the name on the row under it; and
+    /// where the place too is wider, the place broken at its comma onto two
+    /// such rows (`Autopilot · tab 1,` then `right pane`).
     Header(String),
+    /// The session's name under a header that names its place alone
+    /// (`✳ Claude Code`, drawn in quotes, cut inside them).
+    Name(String),
     /// Why the rows below are off: `harness off in Settings`, or the agent's
     /// own switch by name (`Supervise Claude Code sessions is off`).
     Note(String),
@@ -166,6 +184,7 @@ impl MenuRow {
     fn text(&self) -> String {
         match self {
             Self::Header(text) | Self::Note(text) => text.clone(),
+            Self::Name(name) => quoted(name),
             Self::Rule | Self::Gap(_) => String::new(),
             Self::Item { glyph, label, .. } => {
                 let pad = GLYPH_CELLS.saturating_sub(display_cells(glyph));
@@ -175,11 +194,32 @@ impl MenuRow {
     }
 }
 
+/// `name` in the menu's quotes: `“✳ Claude Code”`.
+fn quoted(name: &str) -> String {
+    format!("\u{201c}{name}\u{201d}")
+}
+
+/// `name` in quotes cut to `room` cells inside them, the closing quote kept
+/// (`“✳ Claude Co…”`).
+fn quoted_in(name: &str, room: usize) -> String {
+    if display_cells(&quoted(name)) <= room {
+        return quoted(name);
+    }
+    quoted(&ellipsize(name, room.saturating_sub(2)))
+}
+
 /// What the menu is built from, read once at the open.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MenuFacts {
-    /// The menu's name.
+    /// The menu's name: `Autopilot` and the session's place
+    /// (`Autopilot · tab 1, right pane`).
     pub(crate) title: String,
+    /// The session's own name (`✳ Claude Code`), where it has one: after the
+    /// place in quotes, on the header's row where both fit `room`, else on
+    /// the row under it.
+    pub(crate) name: Option<String>,
+    /// The content cells the card has in its pane ([`content_room`]).
+    pub(crate) room: usize,
     /// Its name as a screen reader says it, in words
     /// (`Autopilot, tab 3, fix the footer`).
     pub(crate) spoken: String,
@@ -225,7 +265,22 @@ pub(crate) fn spoken_when(at: LandAtGlass) -> String {
 #[must_use]
 pub(crate) fn rows(facts: &MenuFacts) -> Vec<MenuRow> {
     let on = facts.carries;
-    let mut out = vec![MenuRow::Header(facts.title.clone())];
+    // THE NAME HAS ITS OWN ROOM: the place and the name on one row where the
+    // card holds them whole, else on two — so the pane word never cuts the
+    // name, and the choices keep their width.
+    let mut out = match &facts.name {
+        Some(name) => {
+            let whole = format!("{} {}", facts.title, quoted(name));
+            if display_cells(&whole) <= facts.room {
+                vec![MenuRow::Header(whole)]
+            } else {
+                let mut out = place_rows(&facts.title, facts.room);
+                out.push(MenuRow::Name(name.clone()));
+                out
+            }
+        }
+        None => place_rows(&facts.title, facts.room),
+    };
     if !on {
         // Why, as the chip's title says it: an agent's own switch by name.
         let why = match facts.view {
@@ -303,6 +358,20 @@ pub(crate) fn rows(facts: &MenuFacts) -> Vec<MenuRow> {
     out
 }
 
+/// The menu's place as header rows: one where it is whole in `room` cells,
+/// else broken after its last comma (`Autopilot · tab 1,` then `right
+/// pane`), so the pane word — what tells two panes' menus apart — is never
+/// the part cut.
+fn place_rows(title: &str, room: usize) -> Vec<MenuRow> {
+    match title.rsplit_once(", ") {
+        Some((head, pane)) if display_cells(title) > room => vec![
+            MenuRow::Header(format!("{head},")),
+            MenuRow::Header(pane.to_string()),
+        ],
+        _ => vec![MenuRow::Header(title.to_string())],
+    }
+}
+
 /// Whether `a` offers the choice `b` offered, in the same words: a lit row
 /// stays lit across a rebuild only where Return would still do what it said.
 fn same_choice(a: &MenuRow, b: &MenuRow) -> bool {
@@ -345,11 +414,51 @@ fn content_width(rows: &[MenuRow]) -> usize {
         .clamp(MIN_CONTENT, MAX_CONTENT)
 }
 
+/// The cells of the card's border and its padding, both sides.
+const CHROME_W: usize = 2 + 2 * H_PAD;
+
+/// The cells of the card's two borders alone: a card in a pane narrower
+/// than its rows ask gives up its padding first ([`side_pad`]).
+const BORDER_W: usize = 2;
+
+/// The content cells a card has in a pane `pane_cols` wide ([`place`]): the
+/// widest card's, or the pane's inside its borders where it is narrower
+/// (its padding given up, [`side_pad`]): the card never leaves its pane, so
+/// its header is broken for the room it has there.
+#[must_use]
+pub(crate) fn content_room(pane_cols: usize) -> usize {
+    pane_cols.saturating_sub(BORDER_W).min(MAX_CONTENT)
+}
+
+/// The padding inside each border of a card `w` cells wide that shows
+/// `rows`: [`H_PAD`] where the card holds its rows with it, none where it is
+/// narrower than they ask — a pane's two cells go to the words first, so in
+/// a narrow pane `Cruise 4 hours, then land` and `tab 1, right pane` stay
+/// whole. Pure, so the paint and the place agree.
+fn side_pad(w: usize, rows: &[MenuRow]) -> usize {
+    if w >= content_width(rows) + CHROME_W {
+        H_PAD
+    } else {
+        0
+    }
+}
+
+/// The rows a card must show to be worth opening in a pane: its header and
+/// the three modes (every row before the first rule), and its borders. A
+/// pane with fewer rows lends it the frame's.
+fn least_rows(rows: &[MenuRow]) -> usize {
+    rows.iter()
+        .position(|row| matches!(row, MenuRow::Rule))
+        .unwrap_or(rows.len())
+        + 2
+}
+
 /// Whether `fresh` may stand where `shown` stood: the same kind of row, and
 /// for a choice the same act (its words, check and state may have moved).
 fn same_place(shown: &MenuRow, fresh: &MenuRow) -> bool {
     match (shown, fresh) {
         (MenuRow::Header(_), MenuRow::Header(_))
+        | (MenuRow::Name(_), MenuRow::Name(_))
         | (MenuRow::Note(_), MenuRow::Note(_))
         | (MenuRow::Rule, MenuRow::Rule) => true,
         (MenuRow::Item { act: a, .. }, MenuRow::Item { act: b, .. }) => a == b,
@@ -378,35 +487,67 @@ pub(crate) fn keep_places(shown: &[MenuRow], fresh: &[MenuRow]) -> Option<Vec<Me
 }
 
 /// THE GEOMETRY: the card hangs ABOVE the chip at frame cell `(chip_row,
-/// chip_col)`, its left edge at the chip's column (shifted left only to
-/// stay whole), never over the first `top` rows (the tab strip); it opens
-/// downward only where fewer rows are above, and where neither side holds it
-/// whole it takes the larger and shows a prefix. `None` where the frame
-/// cannot host a card at all.
+/// chip_col)`, its left edge at the chip's column, never over the first
+/// `top` rows (the tab strip); it opens downward only where it is not whole
+/// above. Where neither side holds it whole, it moves over the chip's row,
+/// whole, from the end of the side with more rows (the AppKit rule for a menu
+/// at a screen's edge: the menu stays whole, its origin covered); only
+/// where there are fewer rows than the card has does it show its first
+/// rows, never ending on a rule. IT STAYS IN ITS PANE (the frame rows and
+/// columns `pane`): across, shifted left only to stay in it, and no wider
+/// than it, however narrow — its padding given up first ([`side_pad`]), then
+/// the ends of its rows, never a cell over the next pane (the chip that
+/// opens it leaves a pane before the pane is too narrow for the rows to say
+/// what they choose: `Cruise 4 hours, then…`); up and down, inside the
+/// pane's rows, down to a pane that holds the header and the three modes
+/// ([`least_rows`]). A pane shorter than that lends the card the frame's
+/// rows, placed as in a frame of one pane. `None` where the frame (`(cols,
+/// frame_rows)`) or the pane cannot host a card at all.
 #[must_use]
 pub(crate) fn place(
     rows: &[MenuRow],
-    chip_row: usize,
-    chip_col: usize,
-    cols: usize,
-    frame_rows: usize,
+    (chip_row, chip_col): (usize, usize),
+    (pane_rows, pane_cols): (std::ops::Range<usize>, std::ops::Range<usize>),
+    (cols, frame_rows): (usize, usize),
     top: usize,
 ) -> Option<MenuRect> {
-    let chrome_w = 2 + 2 * H_PAD;
-    if rows.is_empty() || cols <= chrome_w || chip_row >= frame_rows {
+    if rows.is_empty() || cols <= CHROME_W || chip_row >= frame_rows {
         return None;
     }
-    let w = (content_width(rows) + chrome_w).min(cols);
-    let col = chip_col.min(cols - w);
-    let want = rows.len() + 2;
-    let above = chip_row.saturating_sub(top);
-    let below = frame_rows - chip_row - 1;
-    let (row, h) = if above >= want || above >= below {
-        let h = want.min(above);
-        (chip_row - h, h)
+    // Across: inside the pane, however narrow.
+    let pane = pane_cols.start.min(cols)..pane_cols.end.min(cols);
+    if pane.len() <= BORDER_W {
+        return None;
+    }
+    let w = (content_width(rows) + CHROME_W).min(pane.len());
+    let col = chip_col.min(pane.end - w).max(pane.start);
+    // Up and down: the rows `lo..hi` it may cover, the pane's or the frame's.
+    let (lo, hi) = (pane_rows.start.max(top), pane_rows.end.min(frame_rows));
+    let (lo, hi) = if (lo..hi).contains(&chip_row) && hi - lo >= least_rows(rows) {
+        (lo, hi)
     } else {
-        (chip_row + 1, want.min(below))
+        (top.min(chip_row), frame_rows)
     };
+    let (above, below) = (chip_row - lo, hi - chip_row - 1);
+    let want = rows.len() + 2;
+    let (row, mut h) = if above >= want {
+        (chip_row - want, want)
+    } else if below >= want {
+        (chip_row + 1, want)
+    } else if hi - lo >= want {
+        // Over the chip's row, whole.
+        if above >= below {
+            (lo, want)
+        } else {
+            (hi - want, want)
+        }
+    } else {
+        (lo, hi - lo)
+    };
+    // A prefix never ends on a rule: a line over the bottom border.
+    if h < want && h > 3 && matches!(rows.get(h - 3), Some(MenuRow::Rule)) {
+        h -= 1;
+    }
     // A border pair and one row, or no card.
     (h >= 3).then_some(MenuRect { row, col, w, h })
 }
@@ -499,8 +640,9 @@ pub(crate) fn paint(
 ) -> Vec<Vec<RenderCell>> {
     let c = crate::tab_menu::menu_colors(theme);
     let w = rect.w;
-    let text_start = 1 + H_PAD;
-    let text_end = w.saturating_sub(1 + H_PAD);
+    let pad = side_pad(w, rows);
+    let text_start = 1 + pad;
+    let text_end = w.saturating_sub(1 + pad);
     let cell = crate::chrome_band::cell;
     let edge = |left: char, fill: char, right: char| {
         let mut row = vec![cell(fill, c.rule, c.card_bg, false, false); w];
@@ -522,7 +664,7 @@ pub(crate) fn paint(
         let selected = highlight == Some(i) && row.selectable();
         let bg = if selected { c.sel_bg } else { c.card_bg };
         let (fg, bold) = match row {
-            MenuRow::Header(_) => (c.band.value, true),
+            MenuRow::Header(_) | MenuRow::Name(_) => (c.band.value, true),
             MenuRow::Note(_) | MenuRow::Item { enabled: false, .. } => (c.disabled, false),
             MenuRow::Item { .. } if selected => (c.sel_fg, true),
             _ => (c.band.value, false),
@@ -536,15 +678,11 @@ pub(crate) fn paint(
         let room = text_end
             .saturating_sub(text_start)
             .saturating_sub(if checked { CHECK_CELLS } else { 0 });
-        crate::tab_menu::put_text(
-            &mut cells,
-            text_start,
-            text_end,
-            &ellipsize(&row.text(), room),
-            fg,
-            bg,
-            bold,
-        );
+        let text = match row {
+            MenuRow::Name(name) => quoted_in(name, room),
+            row => ellipsize(&row.text(), room),
+        };
+        crate::tab_menu::put_text(&mut cells, text_start, text_end, &text, fg, bg, bold);
         if checked && text_end >= 1 {
             cells[text_end - 1] = cell('\u{25cf}', fg, bg, bold, false);
         }
@@ -671,7 +809,10 @@ impl AutopilotMenu {
     /// the rows moved under is refused, and the row now under it lit
     /// ([`App::autopilot_menu_press`]), as the reader's click from moved rows
     /// is refused by its epoch — a pointer still since the open, which read
-    /// nothing, included.
+    /// nothing, included. A card painted over the pixel a pointer rests on is
+    /// rows that moved under it ([`App::paint_autopilot_menu`]): the right
+    /// press that opened a card over its own chip saw no choice there, so the
+    /// next press at that pixel lights the row and the one after chooses.
     fn press_lands(&self, frame_row: usize, i: usize) -> bool {
         let rest = &self.rest;
         rest.generation == self.generation
@@ -734,6 +875,12 @@ impl AutopilotMenu {
                 MenuRow::Header(text) | MenuRow::Note(text) => {
                     out.push(format!("autopilot-menu label index={i} text={text:?}"));
                 }
+                MenuRow::Name(_) => {
+                    out.push(format!(
+                        "autopilot-menu label index={i} text={:?}",
+                        row.text()
+                    ));
+                }
             }
         }
         out
@@ -776,6 +923,7 @@ impl std::hash::Hash for MenuRow {
     fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
         match self {
             Self::Header(t) => (0u8, t).hash(h),
+            Self::Name(t) => (5u8, t).hash(h),
             Self::Note(t) => (1u8, t).hash(h),
             Self::Rule => 2u8.hash(h),
             Self::Gap(cells) => (4u8, cells).hash(h),
@@ -834,18 +982,14 @@ impl App {
                 .map(|t| t.trim().to_string())
                 .filter(|t| !t.is_empty())
         });
-        let (title, spoken) = match name {
-            Some(name) => (
-                format!("Autopilot \u{b7} {place} \u{201c}{name}\u{201d}"),
-                format!("Autopilot, {place}, {name}"),
-            ),
-            None => (
-                format!("Autopilot \u{b7} {place}"),
-                format!("Autopilot, {place}"),
-            ),
+        let spoken = match &name {
+            Some(name) => format!("Autopilot, {place}, {name}"),
+            None => format!("Autopilot, {place}"),
         };
         MenuFacts {
-            title,
+            title: format!("Autopilot \u{b7} {place}"),
+            name,
+            room: MAX_CONTENT,
             spoken,
             view,
             carries: view.mode().is_some(),
@@ -876,7 +1020,10 @@ impl App {
         self.close_autopilot_menu();
         // When the `land_at` row's words turn, noted before they are read.
         self.note_land_at_offer();
-        let facts = self.autopilot_menu_facts(session);
+        let facts = MenuFacts {
+            room: content_room(self.autopilot_menu_pane(wid, session).1.len()),
+            ..self.autopilot_menu_facts(session)
+        };
         let rows = rows(&facts);
         let highlight = keyboard
             .then(|| step(&rows, None, true, rows.len()))
@@ -921,7 +1068,13 @@ impl App {
             return;
         }
         self.note_land_at_offer();
-        let facts = self.autopilot_menu_facts(local_id);
+        let Some(wid) = self.autopilot_menu.as_ref().map(|menu| menu.wid) else {
+            return;
+        };
+        let facts = MenuFacts {
+            room: content_room(self.autopilot_menu_pane(wid, local_id).1.len()),
+            ..self.autopilot_menu_facts(local_id)
+        };
         let fresh = rows(&facts);
         let cancels = self.autopilot_timers.land_at_ms(local_id);
         let Some(menu) = self.autopilot_menu.as_mut() else {
@@ -942,6 +1095,34 @@ impl App {
         };
         self.request_menu_frame(menu.wid);
         true
+    }
+
+    /// The frame rows and columns of the pane that shows `session` in window
+    /// `wid`: the card's room ([`place`]); the frame's where no visible pane
+    /// shows it. A pane's rows are counted under the window's chrome rows
+    /// (the tab strip, the message band), which the frame's rows include.
+    fn autopilot_menu_pane(
+        &self,
+        wid: WindowId,
+        session: u64,
+    ) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+        let (rows, cols) = self.windows.get(&wid).map_or((0, 0), |ws| {
+            (ws.input_scratch.cells.len(), ws.input_scratch.cols)
+        });
+        let chrome = usize::from(self.chrome_rows(wid));
+        self.visible_session_rect(wid, session).map_or(
+            (0..rows, 0..cols),
+            |(row, col, height, width)| {
+                let (row, col) = (
+                    (chrome + usize::from(row)).min(rows),
+                    usize::from(col).min(cols),
+                );
+                (
+                    row..(row + usize::from(height)).min(rows),
+                    col..(col + usize::from(width)).min(cols),
+                )
+            },
+        )
     }
 
     /// Ask `wid`'s window, where it has one, for a frame.
@@ -1054,20 +1235,33 @@ impl App {
         let top = usize::from(self.chrome_rows(wid));
         let theme = self.overlay_card_theme(wid);
         let ((cw, ch), pad) = (self.win_cell_size(wid), self.win_pad(wid));
+        let pane = self.autopilot_menu_pane(wid, session);
         let menu = self.autopilot_menu.as_ref()?;
         let ws = self.windows.get(&wid)?;
         let rect = place(
             &menu.rows,
-            anchor.0,
-            anchor.1,
-            ws.input_scratch.cols,
-            ws.input_scratch.cells.len(),
+            anchor,
+            pane,
+            (ws.input_scratch.cols, ws.input_scratch.cells.len()),
             top,
         );
         let Some(rect) = rect else {
             self.close_autopilot_menu();
             return None;
         };
+        // A CARD THAT ARRIVES UNDER A RESTING POINTER (the first paint, or a
+        // card laid out anew): the pointer saw none of the rows now under it
+        // — the right press that opened a card over its own chip, a keyboard
+        // open beside a resting pointer — so they moved under it, as rows
+        // built again do, and its next press chooses nothing
+        // ([`AutopilotMenu::press_lands`]). Only where the rect changed: once
+        // a paint, never a frame's at rest.
+        let arrived = menu.rect != Some(rect)
+            && menu
+                .rest
+                .px
+                .and_then(|(x, y)| self.frame_cell_at(wid, x, y))
+                .is_some_and(|(row, col)| rect.contains(row, col));
         let painted = paint(rect, &menu.rows, menu.highlight, theme);
         let ws = self.windows.get_mut(&wid)?;
         let ground = crate::tab_menu::ground_cell(theme, ws.input_scratch.default_bg);
@@ -1109,6 +1303,9 @@ impl App {
         ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
         if let Some(menu) = self.autopilot_menu.as_mut() {
             menu.rect = Some(rect);
+            if arrived {
+                menu.generation = menu.generation.wrapping_add(1);
+            }
         }
         Some(rect)
     }
@@ -1158,7 +1355,7 @@ impl App {
     pub(crate) fn autopilot_menu_key(
         &mut self,
         wid: WindowId,
-        ev: &winit::event::KeyEvent,
+        ev: &aterm_window::event::KeyEvent,
     ) -> bool {
         let meaning = if crate::keymap::press_is_inert(ev) {
             MenuKey::Inert
@@ -1279,15 +1476,15 @@ impl App {
     /// The pointer moved over window `wid` while the menu is open there: the
     /// highlight follows a choice under it (and stays where the pointer is off
     /// every choice). Where it is on the painted card or off it is noted
-    /// ([`AutopilotMenu::note_pointer`]): a card that then grows under a
-    /// pointer resting beside it takes no press it did not see. Whether the
-    /// menu took the motion — over the card.
+    /// ([`AutopilotMenu::note_pointer`]), before the first paint too: a card
+    /// that then comes up or grows under a pointer resting beside it takes no
+    /// press it did not see. Whether the menu took the motion — over the card.
     pub(crate) fn autopilot_menu_motion(&mut self, wid: WindowId, x: f64, y: f64) -> bool {
         let Some(rect) = self
             .autopilot_menu
             .as_ref()
             .filter(|m| m.wid == wid)
-            .and_then(|m| m.rect)
+            .map(|m| m.rect)
         else {
             return false;
         };
@@ -1295,7 +1492,10 @@ impl App {
         let Some(menu) = self.autopilot_menu.as_mut() else {
             return false;
         };
-        let Some((row, col)) = cell.filter(|(r, c)| rect.contains(*r, *c)) else {
+        let Some((rect, (row, col))) = rect
+            .zip(cell)
+            .filter(|(rect, (r, c))| rect.contains(*r, *c))
+        else {
             menu.note_pointer((x, y), cell.map(|(r, _)| r), None);
             return false;
         };
@@ -1369,7 +1569,7 @@ impl App {
                         row: top + 1 + i,
                     });
                 }
-                MenuRow::Header(_) | MenuRow::Rule | MenuRow::Gap(_) => {}
+                MenuRow::Header(_) | MenuRow::Name(_) | MenuRow::Rule | MenuRow::Gap(_) => {}
             }
         }
         let label = match note {

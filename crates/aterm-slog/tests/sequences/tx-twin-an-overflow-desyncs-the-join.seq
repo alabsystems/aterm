@@ -1,0 +1,18 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of an_overflow_desyncs_the_join_until_the_next_prompt (S23).
+bind 0
+see busy
+tx prompt v1
+tx tool c1
+tx overflow 3
+expect tx desync=1
+tx tool c2
+tx result c1
+tx end
+tx compact
+expect tx dropped=7
+tx prompt v2
+expect tx desync=0
+tx tool c3
+expect open p1 tool par=t1 vref=c1
+expect open p2 tool par=t2 vref=c3

@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "amacs-term"
+# Integration tests are declared below, not discovered: every file is a module
+# of the one `amacs_term_suite` binary. With autotests off a `tests/*.rs` file
+# listed nowhere never compiles.
+autotests = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Placeholder for the planned amacs client, terminal UI and machine protocol; no implementation yet. See docs/DESIGN-amacs-2026-10-19.md."
+
+[[test]]
+name = "amacs_term_suite"
+path = "tests/amacs_term_suite.rs"
+
+[lints]
+workspace = true

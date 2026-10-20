@@ -53,6 +53,9 @@ aterm-uds = { workspace = true }
 aterm-spec-anchor = { workspace = true }
 
 [dev-dependencies]
+# The counting seam (`aterm_durable::seam`) its tests reach, in an optimized test
+# build too.
+aterm-durable = { workspace = true, features = ["test-support"] }
 # install.sh's tests build atpkg's shim from its own block (`build_cache::shim_block`),
 # so the shim writer and the installer's reader answer to one contract.
 atpkg = { workspace = true }
@@ -66,8 +69,8 @@ aterm-spec = { workspace = true }
 aterm-models-misc = { workspace = true }
 aterm-models-update = { workspace = true }
 # Test scratch directories removed on drop, and the shared-inode stand-ins the
-# install.sh tests lay as stub tools (`stand_in`, a debug build's).
-aterm-tempfile = { workspace = true }
+# install.sh tests lay as stub tools (`stand_in`, in an optimized test build too).
+aterm-tempfile = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

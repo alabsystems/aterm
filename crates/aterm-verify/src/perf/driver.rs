@@ -84,6 +84,8 @@ mod tests {
             targo: stage2.join("targo"),
             trustdoc: stage2.join("trustdoc"),
             tippy: None,
+            trustfmt: None,
+            borrowed: Vec::new(),
             refused: Some(stage2.clone()),
             store_bin: None,
             demoted: None,

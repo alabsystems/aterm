@@ -35,6 +35,7 @@ fn leaf(title: &str) -> restore::RestoredSplitTree {
             theme: None,
             agent: None,
             supervised: None,
+            lost: None,
             held: false,
             holds: Vec::new(),
         },
@@ -519,6 +520,7 @@ fn a_system_quit_inside_the_drain_keeps_each_owed_tabs_own_agent_and_hold() {
     let sid = app.session_sid(b).expect("B's sid");
     let published = aterm_agent::harness::relaunch::Snapshot {
         stored_login: false,
+        profile: None,
         tab: sid.clone(),
         pid: 5151,
         start: "Sat Sep 27 02:02:03 2026".into(),
@@ -621,10 +623,23 @@ fn a_persons_own_quit_inside_the_drain_keeps_no_agent_and_no_hold() {
 /// the next launch relaunched it into the tab. The leaf now carries the rows
 /// the restore could not put back (`App::unhanded_restored_holds`), and the
 /// next launch keeps the agent the holder's. NEGATIVE CONTROLS: the owner's
-/// hold put back rides the session's own rows; put back and then lifted by
-/// the owner, it stays lifted (theirs to lift), and that tab's agent is owed
-/// its relaunch as an unheld tab's is; the unheld tab's agent is owed its
-/// relaunch throughout.
+/// hold put back rides the session's own rows; the unheld tab's agent is owed
+/// its relaunch throughout.
+///
+/// PUT BACK AND THEN LIFTED BY THE OWNER, the hold stays lifted (theirs to
+/// lift) and the agent stays down (ruling 23 (ii): a held tab's agent is not
+/// relaunched when the hold lifts; ATERM-KI-1016-1 LC-8): the leaf names no
+/// agent, and the next launch neither holds the tab nor relaunches into it,
+/// as after the drain's last slice. It named the agent with no hold, and the
+/// next launch relaunched it and typed its carry-on into the tab. AND THE
+/// RECORD THAT NAMES THE AGENT AND THE LINE THAT RESUMES IT is said once, as
+/// the lift's wake is read (`App::let_go_lifted_held`; the review's KR-J-5),
+/// or, lifted on the last turn with its wake unread, as the exit closes the
+/// message log before the quit writes its layout
+/// (`App::close_messages_at_exit`): said only at the pass's end, which the
+/// restart came before, it was said nowhere, the next launch having no held
+/// tab to say. A tab whose hold still stands says nothing before the pass's
+/// end: the next launch says it.
 #[test]
 fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
     use crate::fabric::apply_hold_for_test;
@@ -634,6 +649,7 @@ fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
     enum Then {
         Fenced,
         Lifted,
+        LiftedUnread,
         Nothing,
     }
     let mine = |s: &str| Some(s.to_string());
@@ -646,14 +662,31 @@ fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
             Then::Nothing,
             true,
         ),
+        ("the owner's, lifted", "local pause", Then::Lifted, false),
         (
-            "control: the owner's, lifted",
+            "the owner's, lifted on the last turn",
             "local pause",
-            Then::Lifted,
+            Then::LiftedUnread,
             false,
         ),
     ] {
         let mut app = App::headless_for_test();
+        // A host that relaunches restored agents: the hold is what keeps a
+        // held tab's down, and its record names the line that resumes it.
+        let host = crate::harness_host::HostHandle::for_restored_test(std::sync::Arc::new(
+            |_, _, _, _| "wait:shell-prompt".to_string(),
+        ));
+        app.harness = Some(host.clone());
+        let records = app.messages.log().records().count();
+        let resume = carried_agent(X).resume_line().expect("X's resume line");
+        let naming_x = |app: &App, from: usize| {
+            app.messages
+                .log()
+                .records()
+                .skip(from)
+                .filter(|record| record.detail.iter().any(|line| line.contains(&resume)))
+                .count()
+        };
         let wid = WindowId(0);
         // The window's bootstrap shell is the first tab's (session 0).
         let bootstrap = std::sync::Arc::clone(&app.pool.get(0).expect("the bootstrap").ctx);
@@ -681,11 +714,43 @@ fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
         if then == Then::Fenced {
             bootstrap.fabric.lift_hold_fence();
         }
-        if then == Then::Lifted {
+        if matches!(then, Then::Lifted | Then::LiftedUnread) {
             assert!(apply_hold_for_test(&bootstrap, None), "{case}: lifted");
         }
+        if then == Then::Lifted {
+            // The lift's wake, as the loop reads it.
+            app.on_fabric_changed(&bootstrap.self_id);
+            assert_eq!(
+                naming_x(&app, records),
+                1,
+                "{case}: the record naming X and its resume line, said at the lift's wake"
+            );
+        }
+        // The exit's order (`main_entry`): the message log closes, then the
+        // quit writes its layout.
+        let _ = app.close_messages_at_exit();
+        assert_eq!(
+            naming_x(&app, records),
+            usize::from(!held_next),
+            "{case}: said once the hold is lifted, at the latest as the log closes"
+        );
         let mut layout = app.capture_restore_manifest();
         app.quit_agents(&mut layout, true);
+        assert_eq!(
+            naming_x(&app, records),
+            usize::from(!held_next),
+            "{case}: the quit says nothing more"
+        );
+        // Lifted, nothing stands to lift: the record names no lift.
+        let lift = format!("hold {} off", bootstrap.self_id);
+        assert!(
+            !app.messages
+                .log()
+                .records()
+                .skip(records)
+                .any(|record| record.detail.iter().any(|line| line.contains(&lift))),
+            "{case}: no lift is named for a hold already lifted"
+        );
         let kept = carried(&layout.windows[0]);
         assert_eq!(
             kept[0],
@@ -693,9 +758,10 @@ fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
                 "A".into(),
                 Some(0),
                 held_next.then(|| row.to_string()),
-                mine(X)
+                held_next.then(|| X.to_string())
             ),
-            "{case}: the leaf names the agent beside what keeps it down"
+            "{case}: the leaf names the agent beside what keeps it down, and \
+             no agent once nothing does"
         );
         assert_eq!(
             kept[1],
@@ -706,6 +772,7 @@ fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
         let wire = layout.to_toml().expect("the layout writes");
         let back = restore::RestoreManifest::from_toml(&wire).expect("the layout parses back");
         let mut next = App::headless_for_test();
+        next.harness = Some(host.clone());
         next.restore_into_window(WindowId(0), back.windows[0].clone());
         for (&id, pooled) in next.pool.sessions.iter_mut() {
             pooled.session.pid = 40_000 + i32::try_from(id).expect("a small id");
@@ -722,11 +789,23 @@ fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
             .collect();
         if held_next {
             assert_eq!(held, vec![mine(X)], "{case}: still the holder's");
-            assert_eq!(handed, vec![mine(Y)], "{case}: X is not handed");
         } else {
             assert!(held.is_empty(), "{case}: {held:?}");
-            assert_eq!(handed, vec![mine(X), mine(Y)], "{case}: both owed");
         }
+        assert_eq!(
+            handed,
+            vec![mine(Y)],
+            "{case}: X is not handed, held or lifted"
+        );
+        // Said again by the next launch only while held: once in all.
+        let next_records = next.messages.log().records().count();
+        next.say_restored_held();
+        assert_eq!(
+            naming_x(&next, next_records),
+            usize::from(held_next),
+            "{case}: the next launch says X while it is held"
+        );
+        host.shutdown_and_join();
     }
 }
 

@@ -4,8 +4,10 @@
 #[cfg(unix)]
 use super::typed_kitty_summon_tests::drain;
 use crate::{App, WindowId};
-use winit::event::{ElementState, KeyEvent};
-use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr};
+use aterm_window::event::{ElementState, KeyEvent};
+use aterm_window::keyboard::{
+    Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr,
+};
 
 fn named(key: NamedKey) -> KeyEvent {
     KeyEvent::synthetic_for_test(

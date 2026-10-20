@@ -201,6 +201,10 @@ impl CursorGlow {
         self.hand_row = self
             .hand_row
             .and_then(|hand| hand.carried(map, hand_at_caret));
+        self.unowned_caret = self.unowned_caret.and_then(|mut caret| {
+            caret.row = map(caret.row)?;
+            Some(caret)
+        });
         // A typed lay awaiting the caret's rest ([`TornLay`]) stands: the
         // content moved, so where the caret rests no longer judges it.
         self.torn_lay = None;
@@ -323,12 +327,13 @@ impl CursorGlow {
         self.translate_band_state(top, bottom, delta, self.last_ch, self.last_origin_y);
     }
 
-    /// Whether a typed key is in flight: a fresh typed stamp, or a press whose
-    /// cell no echo has laid yet. The hand rides its line only under a key
-    /// ([`Self::lift_hand_row`]).
+    /// Whether input still owes an echo: a typed stamp, an unpaid typed cell,
+    /// or an erase whose retreat is still owed. This sustains an existing
+    /// hand through a content-proved row move; it grants no movement licence.
     pub(super) fn key_in_flight(&self, now: Instant) -> bool {
         self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH)
             || self.type_press_ring.presses_within(now) > 0
+            || self.last_erase.is_some_and(|erase| erase.owed_at(now))
     }
 
     /// The seam's half of the hand riding its line ([`rk::Engine::lift_hand`]):
@@ -368,6 +373,9 @@ impl CursorGlow {
                 hand
             }
         });
+        if let Some(caret) = &mut self.unowned_caret {
+            caret.row = map(caret.row);
+        }
         if let Some(run) = &mut self.recent_typed_run {
             run.row = map(run.row);
         }

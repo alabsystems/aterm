@@ -37,6 +37,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use super::steps::StepFold;
 use super::usage::{LimitNoticeRow, MAX_LINE_BYTES, ModelSpend, TranscriptUsage, model_short};
 
 /// How much one read call asks the kernel for.
@@ -68,6 +69,17 @@ const MAX_SUBAGENT_ENTRIES: usize = 16_384;
 /// subagent's transcript under a subdirectory (`agentTranscriptSubdirs`) and
 /// a workflow's under `workflows/<run>/`.
 const MAX_SUBAGENT_DEPTH: usize = 4;
+
+/// How recently a directory may have changed, at the walk that stamped it, for
+/// its stamp to be RACY ([`DirSeen::racy`]): an entry made in the same tick of
+/// the file system's clock as the walk leaves the directory's stamp as the walk
+/// recorded it. Linux stamps a directory from its coarse clock (one jiffy, up
+/// to 10 ms; ext4 with small inodes and HFS+, a whole second), and there an
+/// ext4 directory's size and link count do not move for a new file either:
+/// measured on the Linux lane (Ubuntu 24.04, kernel 6.8), a subagent file made
+/// just after a refresh left `moved` false. Two seconds covers every one of
+/// those clocks (git's "racily clean" rule is the same idea).
+const RACY_DIR: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The models `aterm harness usage` names; the rest are counted (`+2`).
 /// The footer names none: its `Σ` sums every model ([`UsageGrain::Total`]).
@@ -101,6 +113,73 @@ fn file_id(meta: &std::fs::Metadata) -> Option<FileId> {
 #[cfg(not(unix))]
 fn file_id(_meta: &std::fs::Metadata) -> Option<FileId> {
     None
+}
+
+impl FileId {
+    /// As the step fold keys a file ([`StepFold::read_at`]).
+    const fn pair(self) -> (u64, u64) {
+        (self.dev, self.ino)
+    }
+}
+
+/// A transcript path's fingerprint, as the step fold keys a file
+/// (FNV-1a/64 of its bytes).
+pub(crate) fn path_fp(path: &Path) -> u64 {
+    aterm_hash::fnv1a_64(path.as_os_str().as_encoded_bytes())
+}
+
+/// The identity of the open `file` whose metadata is `meta`, `(device, file
+/// number)`: what tells a file replaced at its path (a rotation, a rename over
+/// it) from the one a fold read. Unix: `meta`'s device and inode. Windows
+/// keeps a file's identity, its volume serial and file index, on the open
+/// handle alone (std reads them only behind an unstable feature), so it is
+/// asked of `file`; without it a file renamed over the one read, no shorter
+/// and with the same byte before the fold's offset, was read on as an append.
+pub(crate) fn open_identity(file: &std::fs::File, meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(windows)]
+    let id = {
+        let _ = meta;
+        handle_id(file)
+    };
+    #[cfg(not(windows))]
+    let id = {
+        let _ = file;
+        file_id(meta)
+    };
+    id.map(|FileId { dev, ino }| (dev, ino))
+}
+
+/// `GetFileInformationByHandle`'s volume serial and file index of `file`.
+#[cfg(windows)]
+fn handle_id(file: &std::fs::File) -> Option<FileId> {
+    use std::os::windows::io::AsRawHandle as _;
+    /// `BY_HANDLE_FILE_INFORMATION` (fileapi.h); each `FILETIME` is two
+    /// `DWORD`s.
+    #[repr(C)]
+    #[derive(Default)]
+    struct Info {
+        attributes: u32,
+        created: [u32; 2],
+        accessed: [u32; 2],
+        written: [u32; 2],
+        volume_serial: u32,
+        size_high: u32,
+        size_low: u32,
+        links: u32,
+        index_high: u32,
+        index_low: u32,
+    }
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(file: *mut core::ffi::c_void, info: *mut Info) -> i32;
+    }
+    let mut info = Info::default();
+    // SAFETY: the handle is `file`'s own, open for the whole call, and `info`
+    // is a writable structure of the layout the call fills.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &raw mut info) };
+    (ok != 0).then(|| FileId {
+        dev: u64::from(info.volume_serial),
+        ino: (u64::from(info.index_high) << 32) | u64::from(info.index_low),
+    })
 }
 
 /// What `stat` says about a file: enough to know it has not moved since a
@@ -273,6 +352,25 @@ impl TranscriptCursor {
     /// The file cannot be opened or read; what was folded before the error is
     /// kept, and the offset is exactly what was consumed.
     pub fn advance(&mut self, budget: u64) -> io::Result<Advance> {
+        self.advance_tapped(budget, None)
+    }
+
+    /// [`Self::advance`], handing every line it completes to the step fold
+    /// `tap` as well, with the line's end offset (addendum A20): the main
+    /// transcript's ([`SessionUsage::refresh_tapped`]). The tap is bound
+    /// ([`StepFold::read_at`]) before the first line of a read, with the
+    /// file's identity, its length and whether the fold started over, so a
+    /// restart drops the tap's in-flight state and keeps its seed. What the
+    /// usage fold does is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::advance`].
+    pub fn advance_tapped(
+        &mut self,
+        budget: u64,
+        mut tap: Option<&mut StepFold>,
+    ) -> io::Result<Advance> {
         if let Ok(meta) = std::fs::metadata(&self.path)
             && self.unchanged(&meta)
         {
@@ -290,7 +388,7 @@ impl TranscriptCursor {
         self.readable = true;
         let meta = file.metadata()?;
         let len = meta.len();
-        let id = file_id(&meta);
+        let id = open_identity(&file, &meta).map(|(dev, ino)| FileId { dev, ino });
         let mut read: u64 = 0;
         let mut restarted = false;
         let frozen = |read: u64| Advance {
@@ -327,6 +425,9 @@ impl TranscriptCursor {
                 restarted = true;
             }
         }
+        if let Some(tap) = tap.as_deref_mut() {
+            tap.read_at(path_fp(&self.path), id.map(FileId::pair), len, restarted);
+        }
         let want = len.saturating_sub(self.offset).min(budget);
         if want > 0 {
             file.seek(SeekFrom::Start(self.offset))?;
@@ -340,7 +441,7 @@ impl TranscriptCursor {
                 if n == 0 {
                     break;
                 }
-                self.consume(&chunk[..n]);
+                self.consume(&chunk[..n], tap.as_deref_mut());
                 let n64 = n as u64;
                 left -= n64.min(left);
                 read += n64;
@@ -362,21 +463,37 @@ impl TranscriptCursor {
         })
     }
 
-    /// Fold every line `bytes` completes; keep the torn tail pending.
-    fn consume(&mut self, mut bytes: &[u8]) {
+    /// Fold every line `bytes` completes; keep the torn tail pending. The
+    /// bytes start at [`Self::offset`]; each completed line goes to `tap`
+    /// too, with the offset just past its newline.
+    fn consume(&mut self, mut bytes: &[u8], mut tap: Option<&mut StepFold>) {
+        let mut end = self.offset;
         while let Some(nl) = bytes.iter().position(|&b| b == b'\n') {
             let line = &bytes[..nl];
+            end += nl as u64 + 1;
             if self.overflow {
                 self.fold.note_long_line();
+                if let Some(tap) = tap.as_deref_mut() {
+                    tap.long_line(end);
+                }
                 self.overflow = false;
             } else if self.pending.is_empty() {
                 self.fold.fold_bytes(line);
+                if let Some(tap) = tap.as_deref_mut() {
+                    tap.push(line, end);
+                }
             } else if self.pending.len().saturating_add(line.len()) > MAX_LINE_BYTES {
                 self.fold.note_long_line();
+                if let Some(tap) = tap.as_deref_mut() {
+                    tap.long_line(end);
+                }
             } else {
                 self.pending.extend_from_slice(line);
                 let whole = std::mem::take(&mut self.pending);
                 self.fold.fold_bytes(&whole);
+                if let Some(tap) = tap.as_deref_mut() {
+                    tap.push(&whole, end);
+                }
                 if whole.capacity() <= PENDING_KEEP {
                     self.pending = whole;
                 }
@@ -438,7 +555,7 @@ pub struct SessionUsage {
     /// Every directory the last walk looked at, with what `stat` said of it
     /// (`None`: not there yet): a new subagent's file, a new workflow run's
     /// directory, or `subagents/` itself appearing changes one.
-    dirs_seen: Vec<(PathBuf, Option<Stamp>)>,
+    dirs_seen: Vec<DirSeen>,
     /// Whether the last refresh caught up (see [`Refresh::caught_up`]), and
     /// whether it read anything: a fold behind that did not move on its last
     /// read is not re-read until a file changes.
@@ -506,6 +623,26 @@ impl SessionUsage {
         &self.main
     }
 
+    /// Bind the step fold `tap` to the transcript as it is now (its length,
+    /// its identity, asked of the open file as the cursor asks it,
+    /// [`open_identity`]): a tap armed after this fold's first read seeds at
+    /// the file's length then, never at its next read's (S1, A20). Nothing
+    /// when the file cannot be opened; the next read binds it.
+    pub fn bind_tap(&self, tap: &mut StepFold) {
+        let path = self.main.path();
+        let Some(file) = super::footer::open_regular(path) else {
+            return;
+        };
+        if let Ok(meta) = file.metadata() {
+            tap.read_at(
+                path_fp(path),
+                open_identity(&file, &meta),
+                meta.len(),
+                false,
+            );
+        }
+    }
+
     /// Where the vendor keeps this session's subagent transcripts:
     /// `<project>/<session>/subagents` beside `<project>/<session>.jsonl`.
     pub fn subagent_dir(&self) -> Option<PathBuf> {
@@ -519,15 +656,14 @@ impl SessionUsage {
     /// file at any depth, or a new run's directory); or any followed subagent
     /// file changed since its last read (every one: an agent in a long tool
     /// call is the least recently written). `stat`s only, one per followed file
-    /// (at most [`MAX_SUBAGENT_FILES`]); nothing is opened or walked.
+    /// (at most [`MAX_SUBAGENT_FILES`]), and a listing of each directory whose
+    /// stamp was racy at the walk ([`DirSeen::racy`]); nothing is opened or
+    /// walked.
     #[must_use]
     pub fn moved(&self) -> bool {
         (!self.caught_up && self.progressed)
             || std::fs::metadata(self.main.path()).map_or(true, |m| !self.main.unchanged(&m))
-            || self
-                .dirs_seen
-                .iter()
-                .any(|(dir, seen)| stamp_of(dir) != *seen)
+            || self.dirs_seen.iter().any(DirSeen::moved)
             || self
                 .subagents
                 .values()
@@ -544,8 +680,15 @@ impl SessionUsage {
     /// is never dropped. A file still new when the budget ran out is not
     /// admitted, and the read is not caught up.
     pub fn refresh(&mut self, budget: u64) -> Refresh {
+        self.refresh_tapped(budget, None)
+    }
+
+    /// [`Self::refresh`], the main transcript's lines handed to the step
+    /// fold `tap` as well ([`TranscriptCursor::advance_tapped`]); no
+    /// subagent file is tapped.
+    pub fn refresh_tapped(&mut self, budget: u64, tap: Option<&mut StepFold>) -> Refresh {
         let mut left = budget;
-        let mut caught_up = match self.main.advance(left) {
+        let mut caught_up = match self.main.advance_tapped(left, tap) {
             Ok(a) => {
                 left = left.saturating_sub(a.read);
                 a.at_end
@@ -664,13 +807,59 @@ impl SessionUsage {
     }
 }
 
+/// A directory the subagent walk looked at ([`SessionUsage::moved`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirSeen {
+    path: PathBuf,
+    /// What `stat` said of it at the walk (`None`: not there).
+    stamp: Option<Stamp>,
+    /// The entries the walk read in it, kept only where its stamp was RACY: it
+    /// changed less than [`RACY_DIR`] before the walk (or after it, or its
+    /// time cannot be read), so an entry made since in the same clock tick
+    /// leaves the stamp as it is. Such a directory is listed again by `moved`.
+    racy: Option<usize>,
+}
+
+impl DirSeen {
+    /// `path` as the walk that began at `walked` found it, holding `entries`.
+    fn at(path: PathBuf, stamp: Option<Stamp>, entries: usize, walked: SystemTime) -> Self {
+        let racy = stamp
+            .is_some_and(|s| {
+                s.mtime
+                    .is_none_or(|m| walked.duration_since(m).map_or(true, |age| age < RACY_DIR))
+            })
+            .then_some(entries);
+        Self { path, stamp, racy }
+    }
+
+    /// Whether this directory changed since the walk: its stamp now, and where
+    /// the stamp was racy, whether its entry count changed. One entry past
+    /// the recorded count is enough to know it grew; never finish listing a
+    /// larger directory just to establish the same difference.
+    fn moved(&self) -> bool {
+        let cap = self.racy.map_or(0, |n| n.saturating_add(1));
+        dir_moved(self, stamp_of(&self.path), || {
+            std::fs::read_dir(&self.path)
+                .ok()
+                .map(|entries| entries.take(cap).count())
+        })
+    }
+}
+
+/// Whether `seen` moved, given its stamp `now` and a count of its entries now
+/// (asked only for a racy stamp): a stamp that differs, or a racy directory
+/// whose entries are not the walk's.
+fn dir_moved(seen: &DirSeen, now: Option<Stamp>, entries: impl FnOnce() -> Option<usize>) -> bool {
+    now != seen.stamp || seen.racy.is_some_and(|n| entries() != Some(n))
+}
+
 /// What the subagent walk found.
 struct Listing {
     /// Every `agent-*.jsonl` regular file, with what `lstat` said of it.
     files: Vec<(PathBuf, std::fs::Metadata)>,
     /// Every directory looked at, with what `stat` said of it — the walk's
     /// root among them even when it is not there (`None`).
-    dirs: Vec<(PathBuf, Option<Stamp>)>,
+    dirs: Vec<DirSeen>,
     /// The walk stopped at its entry bound.
     cut: bool,
 }
@@ -685,14 +874,22 @@ fn list_subagents(dir: &Path, max_entries: usize) -> Listing {
     let mut dirs = Vec::new();
     let mut seen = 0usize;
     let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    let walked = SystemTime::now();
     while let Some((here, depth)) = stack.pop() {
-        dirs.push((here.clone(), stamp_of(&here)));
+        let stamp = stamp_of(&here);
         let Ok(entries) = std::fs::read_dir(&here) else {
+            dirs.push(DirSeen::at(here, stamp, 0, walked));
             continue;
         };
-        for entry in entries.flatten() {
+        let mut held = 0usize;
+        for entry in entries {
+            held += 1;
+            let Ok(entry) = entry else {
+                continue;
+            };
             seen += 1;
             if seen > max_entries {
+                dirs.push(DirSeen::at(here, stamp, held, walked));
                 return Listing {
                     files,
                     dirs,
@@ -716,6 +913,7 @@ fn list_subagents(dir: &Path, max_entries: usize) -> Listing {
                 files.push((path, meta));
             }
         }
+        dirs.push(DirSeen::at(here, stamp, held, walked));
     }
     Listing {
         files,

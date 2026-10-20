@@ -455,6 +455,19 @@ pub(crate) enum InputOutcome {
     /// report OK for bytes that did not land; it is the reply-fidelity contract that
     /// `OK` means delivered).
     WriteFailed,
+    /// The session's input queue refused the event and NOTHING of it was written
+    /// (a refused receipt with no accepted prefix): the program has not read its
+    /// queued input. One answer on every route, the front tab's seam and a
+    /// background control lane alike: `ERR busy input-queue-full`, retryable as is.
+    QueueFull,
+}
+
+impl InputOutcome {
+    /// Whether the event's bytes did not (all) reach the PTY: a failed write or a
+    /// refusal at the input cap.
+    pub(crate) const fn failed(self) -> bool {
+        matches!(self, Self::WriteFailed | Self::QueueFull)
+    }
 }
 
 /// Whether [`seam_egress_receipt`] actually delivered the event's encoded bytes to the PTY.
@@ -930,6 +943,51 @@ pub(crate) fn wheel_route_mirrored(mirror: &ModeMirror, mods: u8) -> WheelRoute 
     )
 }
 
+/// The arrow key alternate scroll (DEC 1007, [`WheelRoute::AltScroll`]) sends
+/// for one wheel line turned `dir`: ArrowUp or ArrowDown, encoded through the
+/// keyboard mode `keyboard` (DECCKM's SS3 arrows and the kitty forms stay
+/// exact, never a hardcoded `ESC[A`), and empty where that mode encodes the
+/// arrow to nothing. `None` for a horizontal wheel: alternate scroll is
+/// VERTICAL ONLY (the reason is at the seam's arm). The seam writes these bytes
+/// under its lock, and [`crate::human_input::reaches_program`] asks the same
+/// rule, on the mode mirror's keyboard mode, whether they would be written.
+pub(crate) fn alt_scroll_arrow(
+    dir: aterm_types::mouse::WheelDir,
+    keyboard: aterm_types::keyboard::KeyboardMode,
+) -> Option<Vec<u8>> {
+    let arrow = if dir.vertical_up()? {
+        NamedKey::ArrowUp
+    } else {
+        NamedKey::ArrowDown
+    };
+    Some(encode_key_with_event(
+        &Key::Named(arrow),
+        Modifiers::empty(),
+        keyboard,
+        KeyEventType::Press,
+    ))
+}
+
+/// How many [`alt_scroll_arrow`] presses one wheel of `lines` (already clamped
+/// to `1..=MAX_WHEEL_BURST`) sends a pager showing `page_rows` rows: the
+/// platform's lines-per-detent for a detent ([`wheel_platform_lines`]),
+/// bounded by [`MAX_WHEEL_BURST`]. Zero only where the platform scrolls a
+/// detent no lines at all (Windows' "wheel scrolling off", `Lines(0)`): every
+/// per-detent factor that depends on the page is floored at one row (VTE's
+/// `ceil(rows / 10)`, Windows' page), so the page height never decides whether
+/// the count is zero, and the mode mirror, which holds no height, answers that
+/// question with any ([`alt_scroll_sends`]).
+pub(crate) fn alt_scroll_repeat(lines: i32, page_rows: u16, detent: bool) -> i32 {
+    wheel_platform_lines(lines, page_rows, detent).clamp(0, MAX_WHEEL_BURST)
+}
+
+/// Whether one wheel of `lines` (as the event carries it; clamped here as the
+/// seam clamps it) sends a pager any [`alt_scroll_arrow`] press at all:
+/// [`alt_scroll_repeat`] is positive, for any page height (its docs).
+pub(crate) fn alt_scroll_sends(lines: i32, detent: bool) -> bool {
+    alt_scroll_repeat(lines.clamp(1, MAX_WHEEL_BURST), 1, detent) > 0
+}
+
 /// The pure arithmetic of Windows' [`wheel_detent_lines`], split out so the multiply
 /// can be tested without a live `SystemParametersInfoW` (whose answer belongs to
 /// whoever's machine runs the suite, and so can never be asserted).
@@ -1392,7 +1450,7 @@ fn seam_egress_inner(
                         None => WheelPlan::Swallow, // X10 (mode 9) is press-only
                     }
                 } else if route == WheelRoute::AltScroll
-                    && let Some(up) = dir.vertical_up()
+                    && let Some(bytes) = alt_scroll_arrow(*dir, t.keyboard_mode())
                 {
                     // Alternate scroll (DEC mode 1007, audit M5): the alt screen has no
                     // scrollback, so when the app did NOT grab the mouse the wheel
@@ -1414,7 +1472,7 @@ fn seam_egress_inner(
                     // (WHEEL_PAGESCROLL) times a large flick would otherwise let one
                     // event flood the PTY.
                     //
-                    // VERTICAL ONLY — the `vertical_up()` guard on this arm. REJECTED:
+                    // VERTICAL ONLY — `alt_scroll_arrow`'s `vertical_up()`. REJECTED:
                     // synthesizing Left/Right arrows for a horizontal flick. DEC 1007's
                     // whole premise is that the alt screen has no scrollback, so the
                     // wheel owes the PAGER the motion it would have made; a pager's
@@ -1424,24 +1482,12 @@ fn seam_egress_inner(
                     // do it either: its alternateScroll only maps the vertical pair. A
                     // horizontal flick over a non-tracking alt-screen app is therefore
                     // nothing, which is exactly what it was before this widening.
-                    let arrow = if up {
-                        NamedKey::ArrowUp
-                    } else {
-                        NamedKey::ArrowDown
-                    };
-                    let bytes = encode_key_with_event(
-                        &Key::Named(arrow),
-                        Modifiers::empty(),
-                        t.keyboard_mode(),
-                        KeyEventType::Press,
-                    );
                     if bytes.is_empty() {
                         WheelPlan::Swallow
                     } else {
                         WheelPlan::Write {
                             bytes,
-                            repeat: wheel_platform_lines(lines, t.rows(), *detent)
-                                .clamp(0, MAX_WHEEL_BURST),
+                            repeat: alt_scroll_repeat(lines, t.rows(), *detent),
                         }
                     }
                 } else {
@@ -2734,6 +2780,100 @@ mod tests {
         assert_eq!(wheel_platform_lines(i32::MAX, 24, true), i32::MAX);
     }
 
+    /// [`alt_scroll_sends`] answers, with no page height, what
+    /// [`alt_scroll_repeat`] answers at every height: whether a wheel sends a
+    /// pager any arrow (`human_input::reaches_program` asks it from the mode
+    /// mirror, which holds no height).
+    #[test]
+    fn whether_alternate_scroll_sends_an_arrow_needs_no_page_height() {
+        for rows in [0, 1, 10, 11, 24, 50, u16::MAX] {
+            for lines in [1, 2, 7, MAX_WHEEL_BURST] {
+                for detent in [true, false] {
+                    assert_eq!(
+                        alt_scroll_repeat(lines, rows, detent) > 0,
+                        alt_scroll_sends(lines, detent),
+                        "{lines} line(s) at {rows} rows, detent={detent}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A WHEEL REACHES THE PROGRAM EXACTLY WHERE THE SEAM SENDS IT BYTES (T1,
+    /// T39). [`crate::human_input::reaches_program`] reads only the session's
+    /// mode mirror; on every tracking mode, screen, DEC 1007 and DECCKM setting,
+    /// direction, modifier and kind of delta below, it says a wheel reaches the
+    /// program where this seam writes the program bytes, and nowhere else. Two
+    /// cases the route alone got wrong are in the matrix, each named: an X10 (9)
+    /// wheel takes the report route and the encoder swallows it (press-only),
+    /// and a horizontal wheel on the alternate screen under DEC 1007 with no
+    /// tracking takes the alternate-scroll route and sends no arrow (vertical
+    /// only). NEGATIVE CONTROL (by scratch revert): "any route but the
+    /// viewport" (the arm until 2026-10-18) counts both as reaching.
+    #[test]
+    fn a_wheel_reaches_the_program_exactly_where_the_seam_sends_it_bytes() {
+        use aterm_types::mouse::{ALT_MASK, SHIFT_MASK};
+        let modes: [&[&[u8]]; 10] = [
+            &[],
+            &[b"\x1b[?9h"],
+            &[b"\x1b[?1000h"],
+            &[b"\x1b[?1002h", b"\x1b[?1006h"],
+            &[b"\x1b[?1003h"],
+            &[b"\x1b[?1049h"],
+            &[b"\x1b[?1049h", b"\x1b[?1007h"],
+            &[b"\x1b[?1049h", b"\x1b[?1007h", b"\x1b[?1h"],
+            &[b"\x1b[?1049h", b"\x1b[?1007h", b"\x1b[?9h"],
+            &[b"\x1b[?1049h", b"\x1b[?1007h", b"\x1b[?1000h"],
+        ];
+        let x10 = String::from_utf8_lossy(b"\x1b[?9h").into_owned();
+        let alt_scroll = String::from_utf8_lossy(b"\x1b[?1049h\x1b[?1007h").into_owned();
+        let mut swallowed = Vec::new();
+        for set in modes {
+            let name = String::from_utf8_lossy(&set.concat()).into_owned();
+            for dir in [
+                WheelDir::Up,
+                WheelDir::Down,
+                WheelDir::Left,
+                WheelDir::Right,
+            ] {
+                for mods in [0, SHIFT_MASK, ALT_MASK] {
+                    for detent in [true, false] {
+                        let term = term_with(set);
+                        let ev = InputEvent::Wheel {
+                            dir,
+                            lines: 1,
+                            detent,
+                            row: 0,
+                            col: 0,
+                            mods,
+                            px_off: PixelOffset::CELL_ORIGIN,
+                        };
+                        let route = wheel_route_for(&term.lock().unwrap(), mods);
+                        let reaches =
+                            crate::human_input::reaches_program(&ev, &crate::mode_mirror_of(&term));
+                        let sent = !egress_bytes(&term, &ev).is_empty();
+                        assert_eq!(
+                            reaches, sent,
+                            "{name:?} {dir:?} mods={mods} detent={detent} on {route:?}"
+                        );
+                        if route != WheelRoute::Viewport && !sent && mods == 0 {
+                            swallowed.push((name.clone(), dir, route));
+                        }
+                    }
+                }
+            }
+        }
+        for witness in [
+            (x10, WheelDir::Up, WheelRoute::Report),
+            (alt_scroll, WheelDir::Left, WheelRoute::AltScroll),
+        ] {
+            assert!(
+                swallowed.contains(&witness),
+                "{witness:?} is not swallowed: {swallowed:?}"
+            );
+        }
+    }
+
     /// A precise device's row is a row on EVERY platform: a `PixelDelta` banked by
     /// the cell height already measured the finger's travel, so no lines-per-detent
     /// (VTE's, or Windows' live setting, which this never reads) multiplies it.
@@ -2807,8 +2947,10 @@ mod tests {
     #[test]
     fn builders_converge() {
         use aterm_types::keyboard::{Key, Modifiers, NamedKey};
+        use aterm_window::keyboard::{
+            Key as WinitKey, KeyCode, NamedKey as WinitNamed, PhysicalKey,
+        };
         use aterm_winit_keymap::{base_layout_key_for, map_logical_key};
-        use winit::keyboard::{Key as WinitKey, KeyCode, NamedKey as WinitNamed, PhysicalKey};
 
         // --- "press the Up arrow" --------------------------------------------
         // Human: build_key_input's pure decision on a winit ArrowUp event.

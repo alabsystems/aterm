@@ -95,7 +95,7 @@ pub(crate) fn absorb(info: &PanicHookInfo<'_>) -> bool {
 }
 
 /// Whether this thread runs inside [`guarded`] now: a test's view of a caller's fence.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn inside() -> bool {
     DEPTH.with(Cell::get) > 0
 }

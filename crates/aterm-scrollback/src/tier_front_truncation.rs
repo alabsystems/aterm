@@ -118,7 +118,7 @@ impl WarmTier {
             self.line_count
         );
         if n > self.line_count {
-            // Pre-composed via the log shim, for the strict gate (see log_shim.rs).
+            // Pre-composed via the log shim, for the Trust lane (see log_shim.rs).
             let mut msg = String::from("warm truncate_front_lines(");
             msg.push_str(&crate::error::dec_string(n));
             msg.push_str(") exceeds line_count(");

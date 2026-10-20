@@ -6,12 +6,13 @@
 //! leak test with its negative control.
 
 use aterm_slog::vocab::{
-    BOX_WORDS, CAUSE_WORDS, CLS_WORDS, DIR_WORDS, MAIL_KIND_WORDS, NEED_WORDS, OUT_WORDS,
-    PHASE_WORDS, STATE_WORDS, VERB_WORDS, WALL_WORDS, WHY_WORDS, WORD_WORDS,
+    ACT_WORDS, BOX_WORDS, CAUSE_WORDS, CLS_WORDS, DIR_WORDS, END_WORDS, MAIL_KIND_WORDS,
+    NEED_WORDS, OUT_WORDS, PHASE_WORDS, STATE_WORDS, VERB_WORDS, WALL_WORDS, WHY_WORDS, WORD_WORDS,
 };
 use aterm_slog::{
-    Actor, Cap, Conf, DecodeError, EncodeError, FIELDS, Fields, Key, Kind, MAX_RECORD_BYTES, Node,
-    Op, Rec, ShortId, Src, Tier, Val, decode, decode_bus, encode, encode_bus, encode_with_table,
+    Actor, Cap, Conf, DecodeError, EncodeError, FIELDS, Fields, Key, Kind, Lvl, MAX_RECORD_BYTES,
+    Node, Op, Rec, ShortId, Src, Tier, Val, decode, decode_bus, encode, encode_bus,
+    encode_with_table,
 };
 
 fn rec(op: Op, node: Node, k: Kind, f: Fields) -> Rec {
@@ -105,6 +106,8 @@ fn every_vocabulary_word_is_one_wire_token_named_once() {
         PHASE_WORDS,
         STATE_WORDS,
         CAUSE_WORDS,
+        ACT_WORDS,
+        END_WORDS,
     ] {
         for (i, w) in list.iter().enumerate() {
             assert!(
@@ -156,6 +159,25 @@ fn the_design_examples_round_trip() {
         encode_bus(&b.rec, Tier::Wire, b.ep, b.ms).as_deref(),
         Ok(body)
     );
+}
+
+/// A level's ids pass 255 within a long session (a 400-turn one numbers its
+/// turns and steps into the hundreds), and an id of every width up to
+/// `u32::MAX` reads back, as the record's node and as its parent.
+#[test]
+fn node_ids_of_every_width_round_trip() {
+    for n in [1, 255, 256, 65_535, 65_536, u32::MAX] {
+        for (lvl, k) in [
+            (Lvl::Run, Kind::Cmd),
+            (Lvl::Turn, Kind::Turn),
+            (Lvl::Step, Kind::Approval),
+        ] {
+            let mut r = rec(Op::Open, Node::new(lvl, n), k, Fields::new());
+            r.par = Some(Node::new(Lvl::Run, n));
+            let line = encode(&r, Tier::Content).expect("fits");
+            assert_eq!(decode(&line), Ok(r), "{line}");
+        }
+    }
 }
 
 #[test]
@@ -364,4 +386,224 @@ fn a_token_is_held_to_its_own_key() {
     assert!(Fields::new().with(Key::Detail, Val::Tok(detail)).is_ok());
     let tools = aterm_slog::BoundedToken::new(Key::Tools, "shell:9,edit:8").expect("a token");
     assert!(Fields::new().with(Key::Tools, Val::Tok(tools)).is_ok());
+}
+
+/// A HARNESS RULE ID CROSSES THE WIRE AS `name.vN` (phase 3B, ruling S18):
+/// the codec is not loosened. The harness producer maps `@` to `.`
+/// (`continue@v1` is written `continue.v1`), which every reader version
+/// decodes; `continue@v1` itself stays refused below the host tier, as an
+/// offset-shaped value is, so the bus guard is unchanged.
+#[test]
+fn a_rule_id_crosses_the_wire_as_name_dot_version() {
+    let f = Fields::new()
+        .id(Key::Rule, "continue.v1")
+        .expect("a rule id");
+    let mut r = rec(Op::Mark, Node::new(aterm_slog::Lvl::Turn, 17), Kind::Act, f);
+    r.f = r.f.word(Key::Word, "continue").expect("an act word");
+    let line = encode(&r, Tier::Wire).expect("fits");
+    assert!(line.contains(" rule=continue.v1"), "{line}");
+    assert_eq!(
+        decode(&line).expect("decodes").f.get_str(Key::Rule),
+        Some("continue.v1")
+    );
+    let body = encode_bus(&r, Tier::Wire, 1, Some(1)).expect("fits");
+    assert!(body.contains(" rule=continue.v1"), "{body}");
+    // As today: an `@` in a wire id is refused, by `Fields` and by the
+    // decoder alike (the value is dropped, the record kept).
+    assert!(Fields::new().id(Key::Rule, "continue@v1").is_err());
+    let at = decode(&line.replace("continue.v1", "continue@v1")).expect("the record decodes");
+    assert_eq!(
+        at.f.get(Key::Rule),
+        None,
+        "an `@` id never rides a wire key"
+    );
+}
+
+/// Phase 3B's keys and kinds: appended, so no discriminant moved, each a
+/// wire number, and every new kind a mark kind.
+#[test]
+fn phase_3b_keys_and_kinds_are_appended_wire_numbers() {
+    // Phase 5 appended one key and one kind after 3B's
+    // (`phase_5_task_key_and_kind_are_appended_and_local`).
+    let n = FIELDS
+        .iter()
+        .position(|r| r.0 == Key::Attention)
+        .expect("phase 5's first key");
+    let tail: Vec<Key> = FIELDS[n - 4..n].iter().map(|r| r.0).collect();
+    assert_eq!(tail, [Key::H5, Key::D7, Key::Skipped, Key::Dropped]);
+    for k in tail {
+        assert_eq!((k.tier(), k.cap()), (Tier::Wire, Cap::U), "{k:?}");
+    }
+    assert_eq!(
+        FIELDS[n - 5].0,
+        Key::Title,
+        "the keys before 3B kept their places"
+    );
+    let kinds = &Kind::ALL[..Kind::ALL.len() - 1];
+    assert_eq!(&kinds[kinds.len() - 2..], &[Kind::Source, Kind::MailLanded]);
+    for k in [Kind::Source, Kind::MailLanded] {
+        assert!(k.is_mark() && k.node_level().is_none(), "{k:?}");
+    }
+}
+
+/// PHASE 5 (5C-1, ruling T21): the `task` kind and its `attention=` key are
+/// appended after 3B's, so no discriminant moved; `task` is a mark kind, and
+/// a task mark is local (never bus class) whatever its fields. Its words
+/// (`state=`, `why=`) are the closed lists' own, so a task mark round-trips
+/// on the line and its words never decode to `unknown`.
+#[test]
+fn phase_5_task_key_and_kind_are_appended_and_local() {
+    let n = 1 + FIELDS
+        .iter()
+        .position(|r| r.0 == Key::Attention)
+        .expect("the task key");
+    assert_eq!(FIELDS[n - 2].0, Key::Dropped, "3B's keys kept their places");
+    assert_eq!(
+        (Key::Attention.tier(), Key::Attention.cap()),
+        (Tier::Wire, Cap::U)
+    );
+    assert_eq!(Kind::ALL.last(), Some(&Kind::Task));
+    assert!(Kind::Task.is_mark() && Kind::Task.node_level().is_none());
+    let f = Fields::new()
+        .u(Key::Rev, 3)
+        .and_then(|f| f.word(Key::State, "stalled"))
+        .and_then(|f| f.u(Key::Attention, 1))
+        .and_then(|f| f.word(Key::Why, "done-check"))
+        .and_then(|f| f.i(Key::Code, -2))
+        .expect("the task words are closed words");
+    let r = Rec {
+        seq: 4,
+        t: 9,
+        op: Op::Mark,
+        node: Node::SESSION,
+        par: None,
+        k: Kind::Task,
+        f,
+        src: Src::Aterm,
+        conf: Conf::Exact,
+        by: Actor::Aterm,
+    };
+    assert!(!r.is_bus_class(), "a task mark stays local");
+    let line = encode(&r, Tier::Content).expect("fits");
+    assert_eq!(
+        line,
+        "4 mark - task rev=3 state=stalled attention=1 why=done-check code=-2 by=aterm src=aterm conf=exact t=9"
+    );
+    assert_eq!(decode(&line), Ok(r));
+}
+
+/// PHASE 5 (5D-2, ruling T1): the input mark's `act=` key is appended after
+/// 5C-1's, a closed word whose list is the act words' own, in their order,
+/// so an acted input mark round-trips and no other word reads as an act.
+#[test]
+fn phase_5_act_key_is_appended_and_closed() {
+    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
+    assert_eq!(
+        at(Key::Act),
+        at(Key::Attention).map(|i| i + 1),
+        "appended after 5C-1's key, which kept its place"
+    );
+    assert_eq!(Key::Act.tier(), Tier::Wire);
+    let words: Vec<&str> = aterm_slog::ActWord::ALL.iter().map(|a| a.word()).collect();
+    assert_eq!(words, ACT_WORDS);
+    for w in ACT_WORDS {
+        assert_eq!(
+            aterm_slog::ActWord::from_word(w).map(aterm_slog::ActWord::word),
+            Some(*w)
+        );
+    }
+    assert!(Fields::new().word(Key::Act, "approve").is_ok());
+    assert!(
+        Fields::new().word(Key::Act, "maybe").is_err(),
+        "a closed word"
+    );
+}
+
+/// PHASE 5 (5D-4, ruling T39): `reached=` is appended after 5D-2's `act=`,
+/// a host value: a person's `human` mark no program-bound input came with
+/// says `reached=0`, round-trips at the host tier, and leaves no trace on
+/// the wire (the mail link it serves has none, T10b).
+#[test]
+fn phase_5_reached_key_is_appended_and_host_only() {
+    let n = 1 + FIELDS
+        .iter()
+        .position(|r| r.0 == Key::Reached)
+        .expect("5D-4's key");
+    assert_eq!(FIELDS[n - 2].0, Key::Act, "5D-2's key kept its place");
+    assert_eq!(Key::Reached.tier(), Tier::Host);
+    let r = Rec {
+        seq: 5,
+        t: 9,
+        op: Op::Mark,
+        node: Node::SESSION,
+        par: None,
+        k: Kind::Human,
+        f: Fields::new().u(Key::Reached, 0).expect("a count"),
+        src: Src::Input,
+        conf: Conf::Strong,
+        by: Actor::Human,
+    };
+    let line = encode(&r, Tier::Host).expect("fits");
+    assert_eq!(
+        line,
+        "5 mark - human reached=0 by=human src=input conf=strong t=9"
+    );
+    assert_eq!(decode(&line), Ok(r.clone()));
+    let wire = encode(&r, Tier::Wire).expect("fits");
+    assert!(!wire.contains("reached="), "{wire}");
+}
+
+/// PHASE 5 (5J, ruling T27): the node log's keys are appended after 5D-4's
+/// `reached=`, wire words: `prev_end=` a closed word whose list is the
+/// recovery ledger's end tokens (a signal's number in `code=`) and `-` for a
+/// ledger not read, and `key=` a config key's NAME, an id (never text: a
+/// value has no place to go). The link states are closed state words.
+#[test]
+fn phase_5_node_log_keys_are_appended_wire_words() {
+    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
+    assert_eq!(at(Key::PrevEnd), at(Key::Reached).map(|i| i + 1));
+    assert_eq!(at(Key::CfgKey), at(Key::PrevEnd).map(|i| i + 1));
+    assert_eq!(FIELDS.len(), at(Key::CfgKey).map_or(0, |i| i + 1));
+    assert_eq!(
+        (Key::PrevEnd.tier(), Key::PrevEnd.cap()),
+        (Tier::Wire, Cap::Word(END_WORDS))
+    );
+    assert_eq!(
+        (Key::CfgKey.tier(), Key::CfgKey.cap()),
+        (Tier::Wire, Cap::Id)
+    );
+    assert_eq!(Key::CfgKey.word(), "key");
+    for w in [
+        "clean", "handoff", "killed", "signal", "panic", "running", "unknown", "none", "-",
+    ] {
+        assert!(Fields::new().word(Key::PrevEnd, w).is_ok(), "{w}");
+    }
+    assert!(Fields::new().word(Key::PrevEnd, "signal-11").is_err());
+    for w in ["connected", "disconnected", "stalled", "absent"] {
+        assert!(Fields::new().word(Key::State, w).is_ok(), "{w}");
+    }
+    assert!(
+        Fields::new()
+            .id(Key::CfgKey, "a value with spaces")
+            .is_err(),
+        "an id, never text"
+    );
+    let r = Rec {
+        seq: 1,
+        t: 9,
+        op: Op::Open,
+        node: Node::INSTANCE,
+        par: None,
+        k: Kind::Start,
+        f: Fields::new().word(Key::PrevEnd, "-").expect("a word"),
+        src: Src::Aterm,
+        conf: Conf::Exact,
+        by: Actor::Aterm,
+    };
+    let line = encode(&r, Tier::Wire).expect("fits");
+    assert_eq!(
+        line,
+        "1 open n start prev_end=- by=aterm src=aterm conf=exact t=9"
+    );
+    assert_eq!(decode(&line), Ok(r));
 }

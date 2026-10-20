@@ -96,41 +96,58 @@ fn grid_scrollback_wrapped_lines() {
     );
 }
 
-/// `ring_extras.len() == ring_buffer_scrollback()` after every `scroll_up`, while the ring grows
-/// and once it reuses slots.
+/// Every ring history row keeps its own extras, and `ring_extras` stays one slot per ring row
+/// (`RingExtrasAligned`), after every `scroll_up`: while the ring grows, once it reuses slots
+/// one row at a time (the ring-only fast path, which recycles the oldest slot's box), and in
+/// batches. Rows `n % 4 != 3` carry a link of their own, so a reuse pops a linked or a plain
+/// slot and pushes a linked or a plain row.
 #[test]
-fn ring_extras_len_equals_ring_buffer_scrollback() {
-    // Capacity 4 + 6 = 10 rows.
+fn ring_history_rows_keep_their_own_extras_through_growth_and_reuse() {
+    use std::sync::Arc;
+
+    // Capacity 4 + 6 = 10 rows, ring only.
     let mut grid = Grid::with_scrollback(4, 10, 6);
+    let url = |n: usize| -> Arc<str> { Arc::from(format!("https://example.com/{n}")) };
+    let linked = |n: usize| n % 4 != 3;
 
-    let check = |grid: &Grid, label: &str| {
-        let ring_sb = grid.storage.ring_buffer_scrollback();
-        let extras_len = grid.storage.ring_extras.len();
-        assert_eq!(
-            extras_len, ring_sb,
-            "{label}: ring_extras.len()={extras_len} != ring_buffer_scrollback()={ring_sb}"
-        );
-    };
-
-    check(&grid, "initial");
-
-    // Growth: each scroll adds a row until capacity.
-    for i in 1..=6 {
+    for n in 0..16 {
+        // Label the row about to scroll off.
+        grid.set_cursor(0, 0);
+        for c in format!("{n:02}").chars() {
+            grid.write_char(c);
+        }
+        if linked(n) {
+            for col in 0..2 {
+                grid.extras_mut()
+                    .get_or_create(CellCoord::new(0, col))
+                    .set_hyperlink(Some(url(n)));
+            }
+        }
         grid.scroll_up(1);
-        check(&grid, &format!("growth scroll {i}"));
-    }
+        grid.assert_invariants();
 
-    // Reuse: rows are recycled.
-    for i in 1..=5 {
-        grid.scroll_up(1);
-        check(&grid, &format!("reuse scroll {i}"));
+        let history = grid.scrollback_lines();
+        assert_eq!(history, (n + 1).min(6));
+        for idx in 0..history {
+            let m = n + 1 - history + idx;
+            let line = grid.get_history_line(idx).expect("ring history line");
+            assert_eq!(line.to_string().trim_end(), format!("{m:02}"));
+            let link = line
+                .hyperlinks()
+                .and_then(|spans| spans.first())
+                .map(|span| span.url.clone());
+            assert_eq!(
+                link,
+                linked(m).then(|| url(m)),
+                "after row {n} scrolled: history row {m}'s link"
+            );
+        }
     }
 
     grid.scroll_up(3);
-    check(&grid, "batch scroll 3");
-
+    grid.assert_invariants();
     grid.scroll_up(20);
-    check(&grid, "large batch scroll 20");
+    grid.assert_invariants();
 }
 
 /// Complex chars, RGB colours and combining marks survive the ring scrollback.

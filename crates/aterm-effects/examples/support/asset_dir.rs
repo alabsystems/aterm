@@ -3,9 +3,8 @@
 
 //! The roster asset-dir reader the `gen_*_glyphs` generators and the drift tests
 //! share (`#[path]`-included, never in the library): every `.toml` under one roster
-//! dir as `(file name, text)` pairs, the shape `aterm_effects::cat_glyphs_codegen`
-//! consumes. It lives beside the examples because the shipped engine names no
-//! `std::fs` (docs/ATERM_DESIGN.md §2.7; the aterm-census guard `engine-platform`).
+//! dir as `(file name, text)` pairs, the shape the shared glyph generator consumes.
+//! It lives beside the examples because the shipped engine names no `std::fs` (docs/ATERM_DESIGN.md §2.7; the aterm-census guard `engine-platform`).
 
 use std::path::Path;
 

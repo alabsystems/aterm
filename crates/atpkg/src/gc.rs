@@ -1167,8 +1167,8 @@ pub(crate) fn running_from_table(dir: &Path, running: &[PathBuf]) -> Option<Path
 }
 
 /// The live process table ([`running_executables`]) under one ungated name, for another
-/// module to hand to [`running_from`]. The three platform declarations below cover every
-/// target between them, but only as a three-way split, and a `crate::`-qualified reference
+/// module to hand to [`running_from`]. The platform declarations below cover every
+/// target between them, but only as a split by platform, and a `crate::`-qualified reference
 /// must name a declaration that survives wherever the reference does: the foreign compile
 /// cells (`verify cells`) type-check it off this host.
 pub(crate) fn process_table() -> Option<Vec<PathBuf>> {
@@ -1287,9 +1287,87 @@ fn running_process_table() -> Option<Vec<(i32, PathBuf)>> {
     Some(out)
 }
 
+/// The pid and executable path of every process alive now, from `K32EnumProcesses` and
+/// `QueryFullProcessImageNameW`, each path resolved (`canonicalize`, the final path) as the
+/// other arms' kernel paths are. A process that exits mid-walk, or that this user may not
+/// query (another user's, the kernel's own), is skipped, as `/proc` skips what it will not
+/// show this user; a failed enumeration is `None` (unknown).
+///
+/// Without it every agent build was kept as possibly running, so each Claude Code or Codex
+/// update left its predecessor in the store for good
+/// (`the_scoped_sweep_touches_only_its_programs`, the first Windows run of this crate's
+/// tests, 2026-10-17).
+#[cfg(windows)]
+fn running_process_table() -> Option<Vec<(i32, PathBuf)>> {
+    use std::os::windows::ffi::OsStringExt as _;
+    // Declared dependency-free, as `platform::windows` declares its Win32 calls: std links
+    // `kernel32`, which exports the `K32` psapi entry points.
+    unsafe extern "system" {
+        fn K32EnumProcesses(pids: *mut u32, bytes: u32, needed: *mut u32) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+        fn QueryFullProcessImageNameW(
+            process: *mut core::ffi::c_void,
+            flags: u32,
+            name: *mut u16,
+            len: *mut u32,
+        ) -> i32;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    /// A pid table this long is not a desktop; refuse rather than allocate for it.
+    const MAX_PIDS: usize = 1 << 20;
+    /// The longest path an image name can be (`UNICODE_STRING`'s bound), in UTF-16 units.
+    const PATH_MAX_UNITS: usize = 32_768;
+    let mut capacity = 1024;
+    let pids = loop {
+        if capacity > MAX_PIDS {
+            return None;
+        }
+        let mut pids: Vec<u32> = vec![0; capacity];
+        let bytes = u32::try_from(capacity * std::mem::size_of::<u32>()).ok()?;
+        let mut needed = 0;
+        // SAFETY: `pids` holds exactly `bytes` bytes and outlives the call, which writes at
+        // most that many and answers in `needed` how many it wrote.
+        if unsafe { K32EnumProcesses(pids.as_mut_ptr(), bytes, &mut needed) } == 0 {
+            return None;
+        }
+        let n = usize::try_from(needed).ok()? / std::mem::size_of::<u32>();
+        // A full buffer may have cut the table short.
+        if n < capacity {
+            pids.truncate(n);
+            break pids;
+        }
+        capacity = capacity.saturating_mul(2);
+    };
+    let mut buf = vec![0u16; PATH_MAX_UNITS];
+    let mut out = Vec::with_capacity(pids.len());
+    for pid in pids.into_iter().filter(|&pid| pid != 0) {
+        // SAFETY: an open by pid for a limited query; null is a failure.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            continue;
+        }
+        let mut len = u32::try_from(buf.len()).ok()?;
+        // SAFETY: `buf` holds `len` UTF-16 units and outlives the call; `len` is a valid
+        // in/out-param.
+        let named = unsafe { QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len) };
+        // SAFETY: the handle `OpenProcess` returned, closed exactly once.
+        unsafe { CloseHandle(process) };
+        let (Some(name), Ok(pid)) = (
+            buf.get(..usize::try_from(len).ok()?).filter(|_| named != 0),
+            i32::try_from(pid),
+        ) else {
+            continue;
+        };
+        let path = PathBuf::from(std::ffi::OsString::from_wide(name));
+        out.push((pid, std::fs::canonicalize(&path).unwrap_or(path)));
+    }
+    Some(out)
+}
+
 /// No process table is read here, so whether a session runs from an agent build is
 /// unknown and every agent build is kept: disk is spent before a running tree is lost.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn running_process_table() -> Option<Vec<(i32, PathBuf)>> {
     None
 }
@@ -2709,24 +2787,19 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn runs_from_sees_a_symlinked_launch_and_not_a_prefix_sibling() {
-        // Re-signing a copy of an Apple binary waits on trustd.
-        if aterm_uds::deadline::trust_service_silent() {
-            return;
-        }
         let scratch = layout("runs-from");
         let root = scratch.prefix.clone();
         let app = root.join("A.app");
         let macos = app.join("Contents/MacOS");
         std::fs::create_dir_all(&macos).expect("layout");
         let sleepy = macos.join("sleepy");
-        std::fs::copy("/bin/sleep", &sleepy).expect("copy sleep");
         // A copy of a platform binary off the system volume keeps Apple's signature
         // but not its standing: the kernel SIGKILLs it (Code Signature Invalid)
         // within about a second, and `runs_from` does not count the dead child. The
         // test passed only when its first poll beat that kill, and every run wrote a
         // `sleepy` crash report (measured 2026-09-27: alive at +260 ms, killed by
         // +1.3 s). Signed ad hoc, the copy sleeps for as long as it is told to.
-        aterm_uds::deadline::sign_ad_hoc(&sleepy);
+        aterm_uds::deadline::ad_hoc_copy(Path::new("/bin/sleep"), &sleepy);
         let link = root.join("via-link");
         std::os::unix::fs::symlink(&sleepy, &link).expect("symlink");
         std::fs::create_dir_all(root.join("A.app.rollback")).expect("sibling");
@@ -2759,7 +2832,7 @@ mod tests {
 
     /// The real enumeration sees this very test process — the proof it reads the table
     /// it claims to, in the resolved spelling [`InUse`] compares against.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     #[test]
     fn the_process_table_includes_this_process() {
         let me = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();

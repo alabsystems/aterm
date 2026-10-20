@@ -1,0 +1,51 @@
+# claude-code 2.1.268 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the composer holding `/config`, the slash menu open under the frame: no pointer drawn, its entries at column 2, two descriptions wrapped onto rows of their own at column 32 · the selected entry is drawn in colour only, so this text is the same with `/config` selected (as the menu opened; Enter then opened the settings panel, MEASURED) and with `/update-config` selected after `down` (Enter then ran `/update-config`, MEASURED): the cells say which (claude-2.1.268-slash-menu-config-cells.txt, claude-2.1.268-slash-menu-config-down-cells.txt)
+ ▐▛███▛█   Claude Code v2.1.268
+▝▜██████▀  Opus 5 (1M context) · API Usage Billing
+  ▝▝ ▝▝    /private/tmp/at.fjWS/proj
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /config
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  /config                       Open settings
+  /update-config                Use this skill to configure the Claude Code harness via settings.json. Automated behaviors ("from now on when
+                                X", "each time X", "whenever X", "before/after X") require hooks configured in settings.json - the harness ex…
+  /doctor                       Health-check the user's Claude Code setup and fix issues: diagnose installation health — what the `claude
+                                doctor` terminal diagnostics cover — from local data (duplicate or leftover installs, PATH, unparseable setti…
+  /hooks                        View hook configurations for tool events
+  /sandbox                      ◯ sandbox disabled (⏎ to configure)
+  /run                          Launch and drive this project's app to see a change working. Use when asked to run, start, or screenshot the
+                                app, or to confirm a change works in the real app (not just tests). First looks for a project skill that alre…
+  /code-review                  Review the current diff, or a PR number/branch/path target, for correctness bugs and
+                                reuse/simplification/efficiency cleanups at the given effort level (low/medium: fewer, high-confidence findin…
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

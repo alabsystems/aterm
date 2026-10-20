@@ -74,7 +74,8 @@
 //! normalization, no mirroring (the bidi step's), positions by advance alone,
 //! and no AAT `morx`.
 //!
-//! `autohint` (the `hint` feature) is FreeType's automatic hinter as skrifa
+//! `autohint` (the `hint` feature, and every build with debug assertions) is
+//! FreeType's automatic hinter as skrifa
 //! 0.46.2 ports it (TF.4): a face's glyphs grid-fitted at a size, instance
 //! and smooth target, answering skrifa's outlines bit for bit.
 
@@ -96,7 +97,7 @@
 #![allow(clippy::same_item_push)]
 #![cfg_attr(test, allow(clippy::bool_assert_comparison))]
 
-#[cfg(feature = "hint")]
+#[cfg(any(feature = "hint", debug_assertions))]
 pub mod autohint;
 mod delta_set;
 mod ggg;
@@ -120,6 +121,8 @@ pub use tables::{
 
 pub use fvar::VariationAxis;
 use head::IndexToLocationFormat;
+#[cfg(all(any(test, debug_assertions), not(trust_verify)))]
+pub use work::{Spent, take_spent};
 
 pub mod opentype_layout {
     //! The [OpenType Layout](
@@ -1074,9 +1077,7 @@ impl<'a> Face<'a> {
         self.tables.name.unwrap_or_default().names
     }
 
-    /// Checks that face is marked as *Regular*.
-    ///
-    /// Returns `false` when OS/2 table is not present.
+    /// Checks that face is marked as *Regular* (upright: see [`Self::style`]).
     #[inline]
     pub fn is_regular(&self) -> bool {
         self.style() == Style::Normal
@@ -1089,12 +1090,13 @@ impl<'a> Face<'a> {
         self.style() == Style::Italic || self.italic_angle() != 0.0
     }
 
-    /// Checks that face is marked as *Bold*.
-    ///
-    /// Returns `false` when OS/2 table is not present.
+    /// Checks that face is marked as *Bold*: `OS/2` `fsSelection`, or the
+    /// `head` table's `macStyle` when the face has no `OS/2` table.
     #[inline]
     pub fn is_bold(&self) -> bool {
-        self.tables.os2.map(|os2| os2.is_bold()).unwrap_or(false)
+        self.tables
+            .os2
+            .map_or_else(|| self.tables.head.mac_bold(), |os2| os2.is_bold())
     }
 
     /// Checks that face is marked as *Oblique*.
@@ -1105,18 +1107,26 @@ impl<'a> Face<'a> {
         self.style() == Style::Oblique
     }
 
-    /// Returns face style.
+    /// Returns face style: `OS/2`'s, or Italic from the `head` table's
+    /// `macStyle` when the face has no `OS/2` table.
     #[inline]
     pub fn style(&self) -> Style {
-        self.tables.os2.map(|os2| os2.style()).unwrap_or_default()
+        match self.tables.os2 {
+            Some(os2) => os2.style(),
+            None if self.tables.head.mac_italic() => Style::Italic,
+            None => Style::default(),
+        }
     }
 
-    /// Returns face's weight.
-    ///
-    /// Returns `Weight::Normal` when OS/2 table is not present.
+    /// Returns face's weight: `OS/2`'s, or Bold from the `head` table's
+    /// `macStyle` when the face has no `OS/2` table (else `Weight::Normal`).
     #[inline]
     pub fn weight(&self) -> Weight {
-        self.tables.os2.map(|os2| os2.weight()).unwrap_or_default()
+        match self.tables.os2 {
+            Some(os2) => os2.weight(),
+            None if self.tables.head.mac_bold() => Weight::Bold,
+            None => Weight::default(),
+        }
     }
 
     /// Returns face's width.
@@ -1725,7 +1735,7 @@ impl<'a> Face<'a> {
     /// autohinter's CFF path, which normalizes in 16.16 as skrifa does
     /// (`autohint/location.rs`). Coordinates past the face's axes are
     /// ignored; axes past the coordinates sit at their default.
-    #[cfg(feature = "hint")]
+    #[cfg(any(feature = "hint", debug_assertions))]
     pub(crate) fn set_normalized_coordinates(
         &mut self,
         coords: impl IntoIterator<Item = NormalizedCoordinate>,

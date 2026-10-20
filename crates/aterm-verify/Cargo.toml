@@ -33,7 +33,7 @@ path = "tests/contract.rs"
 # stops this CLI from building until it is fixed: the price of running the
 # walks in-process rather than as children of a second build.
 [dependencies]
-# `verify census` and `verify guards`: the walks themselves.
+# `verify census` (the census and its guards): the walks themselves.
 aterm-census = { workspace = true }
 # `verify forge` (the third-party surface policy) and `verify cells` (forge's
 # cell list and its resolver). A path dep: the root [workspace.dependencies]

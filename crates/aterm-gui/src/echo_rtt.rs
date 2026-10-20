@@ -302,7 +302,7 @@ static DEFERRED_ARM_SINK: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 
 /// Let `sink`'s deferred arms through for as long as the guard lives. Take
 /// [`fresh_for_test`] first: the guard is only meaningful under that lock.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn deferred_arms_for_test(sink: &aterm_session::sink::SinkWriter) -> impl Drop + use<> {
     struct Guard;
     impl Drop for Guard {

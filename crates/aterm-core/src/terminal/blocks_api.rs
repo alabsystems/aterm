@@ -658,54 +658,38 @@ mod eviction_tests {
         }
     }
 
-    /// A space the program printed in the last column of a wrapped row is text:
-    /// `blocktext` keeps it at the join, on screen and from history, while a
-    /// row that ends its line still loses its trailing blanks.
+    /// A wrapped output line reads as the program printed it, on screen and from
+    /// history: a space the program printed in the last column of a wrapped row
+    /// is text that `blocktext` keeps at the join, while a line that ends in
+    /// blanks loses them, across a wrap too (a padded column wider than the
+    /// window reads as its text).
     #[test]
-    fn block_output_keeps_a_space_printed_in_a_wrapped_rows_last_column() {
-        let mut term = TerminalBuilder::new()
-            .size(4, 10)
-            .ring_buffer_size(100)
-            .build();
+    fn block_output_reads_a_wrapped_line_as_printed() {
         // `abcdefghi ` fills row 0 (the space lands in the last column) and
-        // `jklmn` soft-wraps onto the next row; `pad   ` ends a line in blanks.
-        run_block(&mut term, "ls", &["abcdefghi jklmn", "pad   "]);
-        term.process(b"\x1b]133;A\x07");
-        let block = term.last_completed_block().cloned().expect("sealed block");
-        let want = BlockText::Text("abcdefghi jklmn\npad".to_string());
-        assert_eq!(term.block_output_text(&block), want, "on screen");
+        // `jklmn` soft-wraps onto the next row; `pad   ` ends a line in blanks;
+        // `foo` and its padding wrap.
+        for (lines, want) in [
+            (["abcdefghi jklmn", "pad   "], "abcdefghi jklmn\npad"),
+            (["foo            ", "bar"], "foo\nbar"),
+        ] {
+            let mut term = TerminalBuilder::new()
+                .size(4, 10)
+                .ring_buffer_size(100)
+                .build();
+            run_block(&mut term, "ls", &lines);
+            term.process(b"\x1b]133;A\x07");
+            let block = term.last_completed_block().cloned().expect("sealed block");
+            let want = BlockText::Text(want.to_string());
+            assert_eq!(term.block_output_text(&block), want, "on screen");
 
-        for i in 0..6 {
-            term.process(format!("more {i}\r\n").as_bytes());
+            for i in 0..6 {
+                term.process(format!("more {i}\r\n").as_bytes());
+            }
+            assert_eq!(
+                term.block_output_text(&block),
+                want,
+                "the same block read from history"
+            );
         }
-        assert_eq!(
-            term.block_output_text(&block),
-            want,
-            "the same block read from history"
-        );
-    }
-
-    /// An output line that ends in blanks across a wrap is trimmed whole: a padded
-    /// column wider than the window reads as its text.
-    #[test]
-    fn block_output_trims_a_line_that_ends_in_blanks_across_a_wrap() {
-        let mut term = TerminalBuilder::new()
-            .size(4, 10)
-            .ring_buffer_size(100)
-            .build();
-        run_block(&mut term, "ls", &["foo            ", "bar"]);
-        term.process(b"\x1b]133;A\x07");
-        let block = term.last_completed_block().cloned().expect("sealed block");
-        let want = BlockText::Text("foo\nbar".to_string());
-        assert_eq!(term.block_output_text(&block), want, "on screen");
-
-        for i in 0..6 {
-            term.process(format!("more {i}\r\n").as_bytes());
-        }
-        assert_eq!(
-            term.block_output_text(&block),
-            want,
-            "the same block read from history"
-        );
     }
 }

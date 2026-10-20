@@ -585,3 +585,354 @@ fn a_later_command_supersedes_an_earlier_commands_failure() {
     let b = log.brief("s-1", 600, WALL0 + 600_000);
     assert!(!b.text.contains("failure"), "{}", b.text);
 }
+
+/// A closed, held turn and its log: the screen's `done` close at `strong`.
+fn closed_turn() -> (Log, aterm_slog::Node) {
+    let mut log = Log::new(0);
+    let run = agent_session(&mut log, 0);
+    let turn = log
+        .open(
+            Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
+            at(1),
+        )
+        .expect("turn");
+    log.close(
+        turn,
+        Close::new(
+            Out::Turn(aterm_slog::TurnOut::Done),
+            Src::Screen,
+            Conf::Strong,
+        ),
+        at(5),
+    )
+    .expect("closes");
+    (log, turn)
+}
+
+fn amend_out(log: &mut Log, node: aterm_slog::Node, kind: Kind, out: &str, conf: Conf, ms: u64) {
+    log.amend(
+        node,
+        Amend::new(
+            kind,
+            Src::Transcript,
+            conf,
+            Fields::new().word(Key::Out, out).expect("out"),
+        ),
+        at(ms),
+    )
+    .expect("amends");
+}
+
+/// PHASE 3B (A5, ruling S9): an EXACT amend refines a held turn's outcome
+/// and moves it between the totals' buckets, the bus totals following; a
+/// STRONG one (an unmeasured build's transcript) never overrules the
+/// screen's close, whatever its seq.
+#[test]
+fn an_exact_amend_refines_a_held_outcome_and_a_strong_one_never_does() {
+    let (mut log, turn) = closed_turn();
+    let t0 = log.state().totals.clone();
+    assert_eq!((t0.done, t0.walled), (1, 0));
+    // Strong, later seq: kept as a record, never the outcome.
+    amend_out(
+        &mut log,
+        turn,
+        Kind::Turn,
+        "wall:usage-session",
+        Conf::Strong,
+        6,
+    );
+    assert_eq!(log.state().last[1].as_ref().map(|c| c.out), Some("done"));
+    assert_eq!(log.state().totals, t0, "a strong amend overruled the close");
+    assert_eq!(
+        log.state().last[1]
+            .as_ref()
+            .and_then(|c| c.f.word(Key::Out)),
+        Some("done"),
+        "the held field agrees with the outcome"
+    );
+    // Exact: the outcome is refined and re-bucketed.
+    amend_out(
+        &mut log,
+        turn,
+        Kind::Turn,
+        "wall:usage-session",
+        Conf::Exact,
+        7,
+    );
+    let st = log.state();
+    assert_eq!(
+        st.last[1].as_ref().map(|c| c.out),
+        Some("wall:usage-session")
+    );
+    assert_eq!(
+        (st.totals.done, st.totals.walled, st.totals.turns),
+        (0, 1, 1)
+    );
+    let bus = log.fold().bus_totals();
+    assert_eq!((bus.done, bus.walled), (0, 1));
+    assert_eq!(bus.last_turn.map(|(_, o)| o), Some("wall:usage-session"));
+    // A later strong amend back to `done` changes nothing: exact holds.
+    amend_out(&mut log, turn, Kind::Turn, "done", Conf::Strong, 8);
+    assert_eq!(
+        log.state().last[1].as_ref().map(|c| c.out),
+        Some("wall:usage-session")
+    );
+    // The same fold from the records, applied twice, agrees (idempotent).
+    let mut f = Fold::new(0);
+    for r in log.window() {
+        f.apply(r);
+        f.apply(r);
+    }
+    assert_eq!(f.state(), log.state());
+}
+
+/// PHASE 3B (S9, A5; found by `SessionLogFold`'s `ConfidenceMonotone`): an
+/// exact `out=` amend made while the turn is still open outranks the
+/// screen's strong close that follows it — the close counts the turn in the
+/// exact word's bucket and its held field says the same — while a strong
+/// amend while open never overrules even a weaker (heuristic) close, and
+/// `brief` prints what the fold holds.
+#[test]
+fn an_exact_amend_while_open_outranks_the_later_screen_close() {
+    let mut log = Log::new(0);
+    let run = agent_session(&mut log, 0);
+    let open_turn = |log: &mut Log, ms: u64| {
+        log.open(
+            Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
+            at(ms),
+        )
+        .expect("turn")
+    };
+    let turn = open_turn(&mut log, 1);
+    amend_out(
+        &mut log,
+        turn,
+        Kind::Turn,
+        "wall:usage-session",
+        Conf::Exact,
+        2,
+    );
+    log.close(
+        turn,
+        Close::new(
+            Out::Turn(aterm_slog::TurnOut::Done),
+            Src::Screen,
+            Conf::Strong,
+        ),
+        at(3),
+    )
+    .expect("closes");
+    let held = log.state().last[1].clone().expect("held");
+    assert_eq!(held.out, "wall:usage-session");
+    assert_eq!(held.f.word(Key::Out), Some(held.out), "field and outcome");
+    let t = &log.state().totals;
+    assert_eq!((t.done, t.walled), (0, 1));
+    let b = log.brief("s-1", aterm_slog::DEFAULT_BUDGET, WALL0 + 4);
+    assert!(
+        b.text
+            .lines()
+            .any(|l| l.starts_with("t1 wall:usage-session")),
+        "{}",
+        b.text
+    );
+
+    let second = open_turn(&mut log, 5);
+    amend_out(
+        &mut log,
+        second,
+        Kind::Turn,
+        "wall:context",
+        Conf::Strong,
+        6,
+    );
+    log.close(
+        second,
+        Close::new(
+            Out::Turn(aterm_slog::TurnOut::Asked),
+            Src::Screen,
+            Conf::Heuristic,
+        ),
+        at(7),
+    )
+    .expect("closes");
+    let held = log.state().last[1].clone().expect("held");
+    assert_eq!(held.out, "asked", "a strong amend overruled the close");
+    assert_eq!(held.f.word(Key::Out), Some("asked"), "field and outcome");
+    let t = &log.state().totals;
+    assert_eq!((t.asked, t.walled), (1, 1));
+}
+
+/// A turn no longer held (a newer one closed since) keeps its totals: the
+/// stated approximation (plan §11 Q9); its own record still says the
+/// refinement, which `brief` reads.
+#[test]
+fn an_exact_amend_of_an_unheld_turn_keeps_the_totals() {
+    let (mut log, first) = closed_turn();
+    let run = log.state().run().expect("run").node;
+    let second = log
+        .open(
+            Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
+            at(10),
+        )
+        .expect("turn");
+    log.close(
+        second,
+        Close::new(
+            Out::Turn(aterm_slog::TurnOut::Done),
+            Src::Screen,
+            Conf::Strong,
+        ),
+        at(12),
+    )
+    .expect("closes");
+    let t0 = log.state().totals.clone();
+    amend_out(&mut log, first, Kind::Turn, "wall:context", Conf::Exact, 13);
+    assert_eq!(log.state().totals, t0);
+}
+
+/// PHASE 3B (A5): an exact `confirmed=1` raises the wall step's need to the
+/// transcript's source and confidence; a strong one, or an exact amend
+/// without `confirmed=1`, leaves the need as the screen raised it.
+#[test]
+fn an_exact_confirmation_raises_the_step_needs_confidence() {
+    let mut log = Log::new(0);
+    let run = agent_session(&mut log, 0);
+    let mut tr = TurnTracker::new(run);
+    tr.observe(&mut log, Verdict::Busy, None, at(1));
+    tr.observe(
+        &mut log,
+        Verdict::Wall(WallKind::UsageSession),
+        Some("3pm"),
+        at(2),
+    );
+    let step = log.state().step().expect("the wall step").node;
+    let need = |log: &Log| {
+        let n = log.state().top_need().expect("the wall's need").clone();
+        (n.word, n.src, n.conf)
+    };
+    assert_eq!(
+        need(&log),
+        ("wall:usage-session", Src::Screen, Conf::Strong)
+    );
+    let confirm = |log: &mut Log, conf: Conf, confirmed: u64, ms: u64| {
+        log.amend(
+            step,
+            Amend::new(
+                Kind::Wall,
+                Src::Transcript,
+                conf,
+                Fields::new()
+                    .u(Key::Confirmed, confirmed)
+                    .expect("confirmed"),
+            ),
+            at(ms),
+        )
+        .expect("amends");
+    };
+    confirm(&mut log, Conf::Strong, 1, 3);
+    assert_eq!(
+        need(&log).2,
+        Conf::Strong,
+        "a strong confirmation raised it"
+    );
+    confirm(&mut log, Conf::Exact, 0, 4);
+    assert_eq!(need(&log).2, Conf::Strong, "no confirmation raised it");
+    confirm(&mut log, Conf::Exact, 1, 5);
+    assert_eq!(
+        need(&log),
+        ("wall:usage-session", Src::Transcript, Conf::Exact)
+    );
+    let b = log.brief("s-1", 2000, WALL0 + 6);
+    assert!(b.text.contains("[transcript!]"), "{}", b.text);
+}
+
+/// PHASE 3B (A5): the clause names the row it came from, keeps its head
+/// words without the coarse age, and `clause_of_proven` admits only a
+/// proven author's label: a `ctl` label neither shows nor hides the step
+/// beneath it there, while `clause_of` (brief's) still shows it.
+#[test]
+fn the_clause_names_its_row_and_the_proven_clause_skips_a_ctl_label() {
+    use aterm_slog::{ClauseRow, clause_of, clause_of_proven};
+    let now = |ms: u64| WALL0 + ms;
+    let mut log = Log::new(0);
+    let run = agent_session(&mut log, 0);
+    let row = |log: &Log, ms: u64| {
+        let c = clause_of(log.state(), now(ms)).expect("a clause");
+        (
+            c.row,
+            c.words.as_str().to_string(),
+            c.head.as_str().to_string(),
+        )
+    };
+    assert_eq!(row(&log, 1).0, ClauseRow::Run);
+    let turn = log
+        .open(
+            Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
+            at(1),
+        )
+        .expect("turn");
+    assert_eq!(
+        row(&log, 120_001),
+        (ClauseRow::Turn, "working · 2m".into(), "working".into())
+    );
+    log.open(
+        Open::new(Kind::Tool, Src::Transcript, Conf::Exact)
+            .under(turn)
+            .fields(Fields::new().word(Key::Cls, "shell").expect("cls")),
+        at(2),
+    )
+    .expect("tool");
+    assert_eq!(
+        row(&log, 60_002),
+        (
+            ClauseRow::Step,
+            "running shell · 1m".into(),
+            "running shell".into()
+        )
+    );
+    let label = |log: &mut Log, by: Actor, text: &str, ms: u64| {
+        log.mark(
+            Mark::new(Kind::Label, Src::Mark, Conf::Claim)
+                .by(by)
+                .fields(Fields::new().text(Key::Text, text).expect("text")),
+            at(ms),
+        )
+        .expect("label");
+    };
+    label(&mut log, Actor::Ctl, "ctl says hi", 3);
+    let any = clause_of(log.state(), now(4)).expect("a clause");
+    assert_eq!(
+        (any.row, any.head.as_str()),
+        (ClauseRow::Label, "ctl says hi")
+    );
+    let proven = clause_of_proven(log.state(), now(4)).expect("a clause");
+    assert_eq!(
+        (proven.row, proven.head.as_str()),
+        (ClauseRow::Step, "running shell"),
+        "a ctl label neither shows nor hides the step in the proven clause"
+    );
+    label(&mut log, Actor::Harness, "reviewing", 5);
+    let proven = clause_of_proven(log.state(), now(6)).expect("a clause");
+    assert_eq!(
+        (proven.row, proven.head.as_str(), proven.by),
+        (ClauseRow::Label, "reviewing", Actor::Harness)
+    );
+    // A need outranks every label in both.
+    log.open(
+        Open::new(Kind::Approval, Src::Screen, Conf::Strong)
+            .under(turn)
+            .fields(Fields::new().word(Key::Box, "edit").expect("box")),
+        at(7),
+    )
+    .expect("box");
+    for c in [
+        clause_of(log.state(), now(8)),
+        clause_of_proven(log.state(), now(8)),
+    ] {
+        let c = c.expect("a clause");
+        assert_eq!(
+            (c.row, c.words.as_str(), c.head.as_str()),
+            (ClauseRow::Need, "approval · edit", "approval · edit")
+        );
+    }
+}

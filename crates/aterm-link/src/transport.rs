@@ -1,31 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! How the bridge reaches the broker: the three transports of §11.2's `serve`
-//! synopsis, behind one erased stream type.
+//! How the bridge reaches the broker: its Unix socket, behind one erased
+//! stream type.
 //!
 //! ```text
-//! aterm-link serve --broker <ep> [--tcp] [--key-file PATH]
+//! aterm-link serve --broker <socket>
 //! ```
 //!
-//! * no flag: a Unix socket on this machine, scoped by the socket path's permissions.
-//! * `--tcp`: plaintext TCP to `<host>:<port>`, §8.6's trusted-network-only setting;
-//!   it says so on stderr every time.
-//! * `--tcp --key-file <path>`: the same TCP inside astream's sealed record layer
-//!   (XChaCha20-Poly1305 under a 32-byte pre-shared key; each record's AAD binds both
-//!   hellos, the direction and the sequence, and a key-confirming record each way
-//!   refuses a peer without the key inside the handshake, §8.6).
+//! The bus is one machine's. Reachability is scoped by the socket path's
+//! permissions, and nothing crosses a wire: `aterm link broker` serves its
+//! Unix socket only. The plaintext `--tcp` wire (§8.6's trusted-network-only
+//! setting) went on 2026-10-16: no broker aterm ships served it, and only the
+//! test suites reached it.
 //!
-//! `--handshake` and `--identity` (astream's ephemeral-X25519 and signed-DH
-//! transports) are refused by name (`cli::parse`): §11.2 holds this crate's
-//! third-party crypto to `chacha20poly1305` + `getrandom`, which the curve crates
-//! would break, and `asb` serves no `identity` transport.
+//! ## No wire between machines
 //!
-//! The bridge must end a subscription from another thread (`recv` blocks without a
-//! timeout, and a reconnect that left the old group subscription running would
-//! deliver every record twice and could walk the commit backwards), so
-//! [`astream_broker::connect`] makes a [`astream_broker::Closer`] from a duplicate of
-//! the socket. This module keeps the policy: which transports a node may use.
+//! The sealed record layer (`--tcp --key-file`, astream's `aead`) was compiled
+//! out of every shipped binary and was removed on 2026-10-15 without having
+//! shipped, and astream's `handshake` and `identity` transports were never
+//! offered: a bus that spans machines needs per-machine identity and a guarded
+//! broker, a later design that starts in astream. A machine reads another's
+//! sessions through the fleet listener instead (`aterm fleet`, aterm-net's TLS).
+//!
+//! ## The erased stream and its closer
+//!
+//! The bridge must end a subscription from another thread — `recv` blocks with
+//! no timeout, and a reconnect that left the old group subscription running
+//! would deliver every record twice and could walk the commit backwards. So
+//! astream's [`astream_broker::connect`] makes a [`astream_broker::Closer`] at
+//! connect time from a duplicate of the underlying socket. What stays here is
+//! policy: which transports a node may use, and the bound on every connect.
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -134,83 +139,57 @@ pub const ROW_PAGE: u32 = astream_broker::broker::LAST_PAGE_MAX;
 /// kept small on purpose, whatever it costs in round trips.
 pub const POST_PAGE: u32 = 256;
 
-/// How the bridge reaches the broker.
-#[derive(Clone)]
-pub enum Transport {
-    /// A Unix socket path.
-    Unix,
-    /// Plaintext TCP — a trusted network only.
-    Tcp,
-    /// TCP inside the XChaCha20-Poly1305 sealed record layer, under a PSK.
-    ///
-    /// Boxed so moving or cloning a config does not smear the key across the
-    /// stack.
-    Sealed(Box<[u8; 32]>),
-}
-
-impl std::fmt::Debug for Transport {
-    /// Never prints the key: a logged `Config` must not leak the fleet's PSK.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.name())
-    }
-}
-
-impl Transport {
-    /// The word `ls` and the usage line use for this transport.
-    #[must_use]
-    pub fn name(&self) -> &'static str {
-        match self {
-            Transport::Unix => "unix",
-            Transport::Tcp => "tcp",
-            Transport::Sealed(_) => "tcp+sealed",
-        }
-    }
-}
-
-/// Open one connection under `deadline`, answering it and the closer that can end it.
+/// Open one connection to the broker's socket at `endpoint` UNDER `deadline`,
+/// answering it and the closer that can end it.
 ///
-/// The deadline bounds every step a broker could leave this caller parked in: the
-/// TCP dial (each resolved address in turn), the sealed handshake, and every read and
-/// write after them (`SO_RCVTIMEO`/`SO_SNDTIMEO`, set through the closer before the
-/// first frame). A black-holed address, a broker that never answers, and one that
-/// stopped reading mid-frame all fail `TimedOut`/`WouldBlock` after `deadline`. A
-/// timed-out request leaves the stream unframed: drop the connection, do not retry
-/// on it. A subscriber lifts only the read deadline once subscribed
-/// (`closer.set_read_timeout(None)`); it writes nothing after its request. A Unix
-/// dial is unbounded (std has no bounded one) and fails at once when nothing listens.
+/// The deadline bounds every read AND every write — `SO_RCVTIMEO` and
+/// `SO_SNDTIMEO` on the socket, through the closer, before the first frame.
+/// So a broker that accepts and never answers, and one that stopped reading
+/// part-way through a frame, both fail `TimedOut`/`WouldBlock` after
+/// `deadline`, never at all. A timed-out request leaves the stream unframed:
+/// drop the connection, do not retry on it. The dial itself is not bounded —
+/// std has no bounded Unix connect, and it fails at once when nothing listens.
 ///
-/// The only connect here, so no caller can forget the bound; the sealed wire is
-/// refused by name in a build without it.
+/// A SUBSCRIBER lifts only the READ deadline once its subscription is open
+/// ([`bound_reads`]`(&closer, None)`): parking in `recv` with nothing to deliver
+/// is its normal state, and a subscription writes nothing after its request.
+///
+/// astream's [`astream_broker::connect`] does the work. It is the only connect
+/// here, so no caller can forget the bound.
 ///
 /// # Errors
 ///
-/// The connect itself, `TimedOut` past the bound, the sealed handshake (a peer that
-/// lacks the key fails here, not on the first verb), the descriptor duplication the
-/// closer needs, or a zero `deadline` (`InvalidInput`).
-pub fn connect(
-    transport: &Transport,
-    endpoint: &str,
-    deadline: Duration,
-) -> io::Result<(Conn, Closer)> {
-    let wire = match transport {
-        Transport::Unix => astream_broker::Transport::Unix,
-        Transport::Tcp => astream_broker::Transport::Tcp,
-        #[cfg(not(feature = "sealed"))]
-        Transport::Sealed(_) => {
-            // The variant stays so `--key-file` parses, `Debug` redacts and
-            // `ls` names it; only the connect is absent without `sealed`.
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                SEALED_UNAVAILABLE,
-            ));
-        }
-        #[cfg(feature = "sealed")]
-        Transport::Sealed(key) => astream_broker::Transport::Sealed(key.clone()),
-    };
-    let (conn, closer) = astream_broker::connect(&wire, endpoint, Some(deadline))?;
+/// The connect itself, `TimedOut` past the bound, the descriptor duplication
+/// the closer needs, or a zero `deadline` (`InvalidInput`).
+pub fn connect(endpoint: &str, deadline: Duration) -> io::Result<(Conn, Closer)> {
+    let (conn, closer) =
+        astream_broker::connect(&astream_broker::Transport::Unix, endpoint, Some(deadline))?;
     closer.set_read_timeout(Some(deadline))?;
     closer.set_write_timeout(Some(deadline))?;
     Ok((conn, closer))
+}
+
+/// Re-bound how long reads on `closer`'s connection may park — `SO_RCVTIMEO`, as
+/// [`Closer::set_read_timeout`]; `None` lifts the bound — on a connection the broker
+/// may ALREADY have hung up: it answered and closed, refused a subscription, or went
+/// away between two requests.
+///
+/// A Unix socket whose peer closed is shut down in both directions, and macOS takes
+/// no option on such a socket: `setsockopt` fails `EINVAL`. Nothing is left to bound
+/// there — its reads return what the broker sent, then end of stream, and never park
+/// — so that refusal is not an error: the reads after it say what the broker sent and
+/// that it closed, where a bare "os error 22" said neither. Were `EINVAL` ever answered
+/// for another reason, the reads keep the bound they had, so none parks unbounded.
+///
+/// # Errors
+///
+/// The `setsockopt`, but for that refusal; a zero duration is `InvalidInput` (std's
+/// own refusal, which carries no OS error).
+pub fn bound_reads(closer: &Closer, deadline: Option<Duration>) -> io::Result<()> {
+    match closer.set_read_timeout(deadline) {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+        set => set,
+    }
 }
 
 /// The reconnect back-off floor and ceiling. §7: a bridge reconnects with jittered
@@ -294,36 +273,10 @@ fn random_u64() -> Option<u64> {
     Some(u64::from_le_bytes(raw))
 }
 
-/// Read a `--key-file`: 64 hex characters, surrounding whitespace ignored — the
-/// same shape and the same tolerance as `asb --key-file`, so one key file feeds
-/// the broker and every bridge on the fleet.
-///
-/// The intermediate buffer is scrubbed: hygiene against a stray copy, not a
-/// defence (the key lives on in the `Transport`).
-///
-/// # Errors
-///
-/// The file read, or contents that are not exactly 64 hex characters.
-pub fn read_key_file(path: &str) -> io::Result<[u8; 32]> {
-    let mut raw = std::fs::read(path)?;
-    let text = raw.trim_ascii();
-    let mut key = [0u8; 32];
-    let parsed = aterm_codec::hex::decode_into(text, &mut key);
-    raw.fill(0);
-    std::hint::black_box(&raw);
-    if parsed {
-        Ok(key)
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{path}: key must be 64 hex characters"),
-        ))
-    }
-}
-
-/// One error from [`read_key_file`], [`check_private`], [`read_private_key_file`] or
-/// [`read_mint_secret`] as text naming `path` once: their own refusals lead with it,
-/// and an OS error never carries one. A caller prefixes only its flag.
+/// One error from [`check_private`] or [`read_mint_secret`] as text that
+/// names `path` ONCE: their own refusals already lead with it, and an OS error
+/// (a missing file, a denied `stat`) never carries one. A caller prefixes only
+/// its flag (`--secret-file {…}`).
 #[must_use]
 pub fn describe(path: &str, e: &io::Error) -> String {
     if e.raw_os_error().is_some() {
@@ -333,29 +286,10 @@ pub fn describe(path: &str, e: &io::Error) -> String {
     }
 }
 
-/// Whether this build carries the sealed TCP transport (the `sealed` feature).
-/// Verbs that need it ask first and refuse with [`SEALED_UNAVAILABLE`], rather
-/// than failing later with an `Unsupported` from a connect.
-pub const SEALED: bool = cfg!(feature = "sealed");
-
-/// What a default build says when a verb needs the sealed transport.
-pub const SEALED_UNAVAILABLE: &str = "the sealed TCP transport is not in this build \
-     (the `sealed` cargo feature); rebuild with \
-     `targo --unverified build --release -p aterm --features sealed`";
-
-/// Why this build cannot run a command line: `Some` only when `args` ask for
-/// the sealed wire (`--tcp` and `--key-file`) in a build without it
-/// ([`SEALED`]). `serve`, `ls` and `notify` ask before parsing, so this comes
-/// before any complaint about a key file the build could not use anyway.
-#[must_use]
-pub fn sealed_flags_refusal(args: &[String]) -> Option<&'static str> {
-    let has = |flag: &str| args.iter().any(|a| a == flag);
-    (!SEALED && has("--tcp") && has("--key-file")).then_some(SEALED_UNAVAILABLE)
-}
-
-/// Refuse a secret file (mint secret, pre-shared key, capability) anyone but its
-/// owner can read: `mode & 0o077` must be zero. The refusal names the `chmod` rather
-/// than fixing it silently, since a key that sat readable may already have been read.
+/// Refuse a SECRET file anyone but its owner can read: a mint secret or a
+/// capability file. `mode & 0o077` must be zero — 0600 or
+/// tighter. The refusal names the `chmod` rather than fixing it silently: a key
+/// that sat readable may already have been read.
 ///
 /// # Errors
 ///
@@ -376,13 +310,15 @@ pub fn check_private(path: &str) -> io::Result<()> {
     }
 }
 
-/// Read a mint secret: the one reader for every verb that mints or guards with a
-/// secret (`aterm link broker --secret-file`, `aterm link mint`, `aterm fabric on`,
-/// `mint-for`/`join`). The file must pass [`check_private`] and hold at least
-/// [`crate::enable::SECRET_LEN`] bytes: HMAC takes a key of any length, so a short
-/// one would mint well-formed capabilities that seal nothing. Its bytes are the
-/// secret exactly as read, a trailing newline included, as `asb`'s `load_secret`
-/// reads it: minter and verifier must agree byte for byte.
+/// THE MINT SECRET READER — the one every verb that mints or guards with a
+/// secret goes through: `aterm link broker --secret-file`, `aterm link mint`,
+/// `aterm fabric mint-for` and `aterm fabric on` (its secret step and its
+/// mint). The file must be [`check_private`] (0600 or tighter) and hold at least
+/// [`crate::enable::SECRET_LEN`] bytes — HMAC takes a key of any length, so a
+/// short or empty one would mint capabilities that look well-formed and seal
+/// nothing — and its bytes are the secret EXACTLY as read, a trailing newline
+/// included: the broker that verifies and the verb that mints must agree byte
+/// for byte (`asb`'s `load_secret` reads it the same way).
 ///
 /// # Errors
 ///
@@ -406,91 +342,9 @@ pub fn read_mint_secret(path: &str) -> io::Result<Vec<u8>> {
     Ok(secret)
 }
 
-/// [`read_key_file`] behind [`check_private`]: how the broker and `aterm fabric
-/// on|join` read a pre-shared key. The bridge's own `--key-file` keeps the plain
-/// reader, so a fleet key that is not owner-only still dials.
-///
-/// # Errors
-///
-/// A key file that is not 0600, or not 64 hex characters.
-pub fn read_private_key_file(path: &str) -> io::Result<[u8; 32]> {
-    check_private(path)?;
-    read_key_file(path)
-}
-
-/// A key as the key file spells it: 64 lowercase hex characters and a newline, the
-/// shape [`read_key_file`] and `asb --key-file` read.
-#[must_use]
-pub fn key_file_text(key: &[u8; 32]) -> String {
-    let mut s = aterm_codec::hex::encode_lower(key);
-    s.push('\n');
-    s
-}
-
-/// Whether every address `endpoint` (`<host>:<port>`) resolves to is loopback, the
-/// only kind a TCP broker binds without `--allow-remote`. The unspecified `0.0.0.0`
-/// and `[::]` listen on every interface, so they are not.
-///
-/// # Errors
-///
-/// An endpoint that does not resolve, or resolves to nothing.
-pub fn is_loopback_endpoint(endpoint: &str) -> io::Result<bool> {
-    use std::net::ToSocketAddrs;
-    let addrs: Vec<std::net::SocketAddr> = endpoint.to_socket_addrs()?.collect();
-    if addrs.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("{endpoint} resolves to no address"),
-        ));
-    }
-    Ok(addrs.iter().all(|a| a.ip().is_loopback()))
-}
-
-/// The port of a `<host>:<port>` endpoint, when it has one that parses.
-#[must_use]
-pub fn endpoint_port(endpoint: &str) -> Option<u16> {
-    endpoint.rsplit_once(':')?.1.parse().ok()
-}
-
-/// The address this host's own clients dial for a broker bound at `bind`: the same
-/// family's loopback when `bind` is unspecified (`0.0.0.0:<p>` → `127.0.0.1:<p>`,
-/// `[::]:<p>` → `[::1]:<p>`), which a connect cannot name; `bind` itself otherwise.
-#[must_use]
-pub fn dial_for_bind(bind: &str) -> String {
-    match bind.rsplit_once(':') {
-        Some(("0.0.0.0", port)) => format!("127.0.0.1:{port}"),
-        Some(("[::]", port)) => format!("[::1]:{port}"),
-        _ => bind.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A key file is 64 hex characters and nothing else; a short, long or
-    /// non-hex file is an error, never a zero-padded key.
-    #[test]
-    fn a_key_file_is_exactly_sixty_four_hex_characters() {
-        let dir = std::env::temp_dir().join(format!("atlink-key-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch");
-        let path = dir.join("k");
-        let p = path.to_str().expect("utf8");
-
-        std::fs::write(&path, format!("{}\n", "ab".repeat(32))).expect("write");
-        assert_eq!(read_key_file(p).expect("read"), [0xab; 32]);
-        // Whitespace around it is fine; a short one, a long one and a non-hex
-        // one are not.
-        std::fs::write(&path, format!("  {}  \n", "00".repeat(32))).expect("write");
-        assert_eq!(read_key_file(p).expect("read"), [0x00; 32]);
-        std::fs::write(&path, "ab").expect("write");
-        assert!(read_key_file(p).is_err());
-        std::fs::write(&path, "zz".repeat(32)).expect("write");
-        assert!(read_key_file(p).is_err());
-        std::fs::write(&path, "ab".repeat(33)).expect("write");
-        assert!(read_key_file(p).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     /// A connect's deadline bounds both directions: a `hello` nobody answers and a
     /// post bigger than the socket's buffers to a broker that stopped reading both
@@ -507,7 +361,7 @@ mod tests {
         let path = sock.to_str().expect("utf8").to_string();
         let deadline = Duration::from_millis(300);
         for what in ["hello", "publish"] {
-            let (mut conn, _closer) = connect(&Transport::Unix, &path, deadline).expect("connect");
+            let (mut conn, _closer) = connect(&path, deadline).expect("connect");
             let (peer, _) = listener.accept().expect("accept");
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
@@ -536,8 +390,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 0600 or tighter passes; any group/other bit is refused, and the checked
-    /// key reader applies it before parsing.
+    /// A broker that sent a subscription its mail and hung up BEFORE the subscriber
+    /// re-bounds its reads (macOS: `EINVAL`, the socket is shut down both ways) is no
+    /// error: the bound is set or lifted, and the subscription still reads the mail,
+    /// then the close. The broker side runs on this thread and is closed before the
+    /// re-bound, so the interleaving is the one a race only sometimes produced.
+    #[test]
+    fn a_subscription_whose_broker_already_hung_up_reads_its_mail_then_the_close() {
+        use astream_broker::proto::{
+            decode_request, encode_response, read_frame, write_frame, Request, Response,
+        };
+        use std::os::unix::net::UnixListener;
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("atlink-hungup")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let (conn, closer) =
+            connect(sock.to_str().expect("utf8"), aterm_spec::wait::MUST_HAPPEN).expect("connect");
+        let (mut broker, _) = listener.accept().expect("accept");
+        let mark = Response::Mark {
+            next: 0,
+            head: 0,
+            resume: String::new(),
+            durable: None,
+        };
+        // The answer to the subscription's `IdleMarks`, ahead of it in the socket.
+        write_frame(&mut broker, &encode_response(&mark)).expect("the idle-marks answer");
+        let mut sub = conn.subscribe(0, "/f/f/>").expect("subscribe");
+        for want in ["IdleMarks", "Subscribe"] {
+            let frame = read_frame(&mut broker).expect("read").expect("a request");
+            let got = decode_request(&frame).expect("a request frame");
+            assert!(
+                matches!(
+                    (want, &got),
+                    ("IdleMarks", Request::IdleMarks) | ("Subscribe", Request::Subscribe { .. })
+                ),
+                "{want}: {got:?}"
+            );
+        }
+        let mail = Response::Delivery {
+            offset: 7,
+            subject: "/f/f/in/p/h-x/n-peer/note".into(),
+            body: b"v=1 t=1 text=mail".to_vec(),
+        };
+        write_frame(&mut broker, &encode_response(&mail)).expect("the mail");
+        drop(broker);
+        bound_reads(&closer, Some(astream_broker::IDLE_MARK_DEADLINE))
+            .expect("a hung-up socket has no read to bound");
+        bound_reads(&closer, None).expect("nor one to lift");
+        match sub.recv_event().expect("the mail the broker sent") {
+            Some(astream_broker::Event::Delivery {
+                offset: 7, body, ..
+            }) => {
+                assert_eq!(body, b"v=1 t=1 text=mail");
+            }
+            other => panic!("the mail, not {other:?}"),
+        }
+        assert!(
+            sub.recv_event().expect("then the close").is_none(),
+            "the broker hung up"
+        );
+        assert_eq!(
+            bound_reads(&closer, Some(Duration::ZERO))
+                .expect_err("a zero bound is still refused")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// 0600 or tighter passes; any group/other bit is refused.
     #[test]
     fn a_secret_file_other_users_can_read_is_refused_naming_the_chmod() {
         use std::os::unix::fs::PermissionsExt;
@@ -545,14 +468,11 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("scratch");
         let path = dir.join("k");
         let p = path.to_str().expect("utf8");
-        std::fs::write(&path, key_file_text(&[0x5a; 32])).expect("write");
+        std::fs::write(&path, [0x5a; 32]).expect("write");
         for (mode, ok) in [(0o600, true), (0o400, true), (0o640, false), (0o604, false)] {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
             assert_eq!(check_private(p).is_ok(), ok, "{mode:o}");
-            assert_eq!(read_private_key_file(p).is_ok(), ok, "{mode:o}");
         }
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-        assert_eq!(read_private_key_file(p).expect("read"), [0x5a; 32]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -585,42 +505,6 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    /// Only `--tcp --key-file`, and only in a build without the sealed wire, is
-    /// refused before parsing: a Unix socket, plaintext TCP and a key without
-    /// `--tcp` (which `parse` refuses itself) all pass.
-    #[test]
-    fn only_the_sealed_wire_in_a_build_without_it_is_refused() {
-        let argv = |line: &str| line.split(' ').map(str::to_string).collect::<Vec<_>>();
-        let base = "--fleet f1 --broker 127.0.0.1:7000";
-        assert_eq!(sealed_flags_refusal(&argv(base)), None);
-        assert_eq!(sealed_flags_refusal(&argv(&format!("{base} --tcp"))), None);
-        assert_eq!(
-            sealed_flags_refusal(&argv(&format!("{base} --key-file /none/k"))),
-            None
-        );
-        let sealed = sealed_flags_refusal(&argv(&format!("{base} --tcp --key-file /none/k")));
-        assert_eq!(sealed.is_some(), !SEALED);
-    }
-
-    /// Loopback vs unspecified binds, the address this host dials, the port.
-    #[test]
-    fn loopback_binds_and_the_address_this_host_dials() {
-        assert!(is_loopback_endpoint("127.0.0.1:7000").expect("resolves"));
-        assert!(is_loopback_endpoint("[::1]:7000").expect("resolves"));
-        assert!(!is_loopback_endpoint("0.0.0.0:7000").expect("resolves"));
-        assert!(!is_loopback_endpoint("[::]:7000").expect("resolves"));
-        assert!(is_loopback_endpoint("no-port-here").is_err());
-        assert_eq!(dial_for_bind("0.0.0.0:7000"), "127.0.0.1:7000");
-        assert_eq!(dial_for_bind("[::]:7000"), "[::1]:7000");
-        assert_eq!(dial_for_bind("10.0.0.5:7000"), "10.0.0.5:7000");
-        assert_eq!(dial_for_bind("127.0.0.1:7000"), "127.0.0.1:7000");
-        assert_eq!(endpoint_port("h1:7000"), Some(7000));
-        assert_eq!(endpoint_port("[::1]:0"), Some(0));
-        assert_eq!(endpoint_port("h1"), None);
-        assert_eq!(endpoint_port("h1:x"), None);
-    }
-
     /// Equal jitter: every draw lies in `[b/2, b]`, both ends reachable.
     #[test]
     fn a_jittered_wait_lies_in_the_upper_half_of_the_back_off() {
@@ -662,14 +546,5 @@ mod tests {
             draws[8..].iter().all(|d| within(*d, RECONNECT_MAX)),
             "{draws:?}"
         );
-    }
-
-    /// A `Transport`'s `Debug` never carries the key.
-    #[test]
-    fn a_transports_debug_never_prints_the_key() {
-        let t = Transport::Sealed(Box::new([0xde; 32]));
-        let shown = format!("{t:?}");
-        assert_eq!(shown, "tcp+sealed");
-        assert!(!shown.contains("de"), "{shown}");
     }
 }

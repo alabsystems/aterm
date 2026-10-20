@@ -18,7 +18,7 @@
 //! waiting for the watcher's next poll, so the new theme can be selected. A
 //! card's Trash moves the theme's file to the Trash ([`trash_from`]) —
 //! recoverable, never an unlink — and the folder is read again the same way.
-//! A Get More card adds a community pack theme ([`add_pack_into`]) through
+//! Keep on a Community row adds a community pack theme ([`add_pack_into`]) through
 //! `aterm_theme_pack::install`, the path `aterm theme install` takes.
 
 use crate::native_app::{ThemesOutcome, ThemesRequest};
@@ -411,7 +411,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A Get More add installs the pack's file; again it is already there
+    /// A community add installs the pack's file; again it is already there
     /// (still added); an unknown id or an edited file of that name fails
     /// and leaves the file alone.
     #[test]

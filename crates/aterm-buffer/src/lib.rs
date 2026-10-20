@@ -272,8 +272,8 @@ impl EventLog {
 }
 
 /// A Surface: committed lines plus the event-log spine. It is the native
-/// editor's document model (`aterm-gui`'s `document_store.rs`: one `Document`
-/// owns one `Surface`); terminal cells live in `aterm-grid`.
+/// editor's document model (`amacs`'s `store.rs`: one `Document` owns one
+/// `Surface`); terminal cells live in `aterm-grid`.
 #[derive(Clone, Debug)]
 pub struct Surface {
     /// Immutable snapshot spine. [`Arc::make_mut`] clones this ordered vector
@@ -444,7 +444,7 @@ impl Surface {
             }
         }
         // Seek past the cursor rather than scan the ring. The explicit push
-        // loop lets the strict gate bound growth by the ring length.
+        // loop lets the Trust lane (`ship trust run`) bound growth by the ring length.
         let mut events: Vec<Event> = Vec::new();
         for e in self.log.live_after(cursor.at) {
             events.push(e.clone());
@@ -486,6 +486,141 @@ impl Snapshot {
     pub fn read_text(&self, c: &ReadCap, r: Range) -> TextWithOrigin {
         self.surface.read_text(c, r)
     }
+}
+
+/// Wire size in bytes of an encoded spine event (`"SPNE"`).
+pub const SPINE_EVENT_WIRE_BYTES: usize = 24;
+
+/// Wire size in bytes of an encoded spine cursor state (`"SPNC"`).
+pub const SPINE_CURSOR_WIRE_BYTES: usize = 20;
+
+/// Encode a 24-byte spine [`Event`] wire frame (`"SPNE"`).
+#[inline]
+#[must_use]
+pub const fn encode_spine_event_wire(event: &Event) -> [u8; SPINE_EVENT_WIRE_BYTES] {
+    let (op_tag, payload) = match event.op {
+        Op::Append(id) => (1u8, id.0),
+        Op::Write(id) => (2u8, id.0),
+        Op::Clear(id) => (3u8, id.0),
+        Op::RawIn(id) => (4u8, id.0),
+        Op::Reply(id) => (5u8, id.0),
+        Op::Resize { rows, cols } => (6u8, ((rows as u64) << 16) | (cols as u64)),
+        Op::Keyframe(id) => (7u8, id.0),
+    };
+    let [s0, s1, s2, s3, s4, s5, s6, s7] = event.seq.0.to_le_bytes();
+    let pb = payload.to_le_bytes();
+    let tb = (event.ts.0 as u32).to_le_bytes();
+    [
+        b'S', b'P', b'N', op_tag, s0, s1, s2, s3, s4, s5, s6, s7, pb[0], pb[1], pb[2], pb[3],
+        pb[4], pb[5], pb[6], pb[7], tb[0], tb[1], tb[2], tb[3],
+    ]
+}
+
+/// Decode a 24-byte spine [`Event`] wire frame produced by
+/// [`encode_spine_event_wire`].
+#[inline]
+#[must_use]
+pub const fn decode_spine_event_wire(bytes: &[u8]) -> Option<Event> {
+    if bytes.len() < SPINE_EVENT_WIRE_BYTES {
+        return None;
+    }
+    if bytes[0] != b'S' || bytes[1] != b'P' || bytes[2] != b'N' {
+        return None;
+    }
+    let seq = Seq(u64::from_le_bytes([
+        bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+    ]));
+    let payload = u64::from_le_bytes([
+        bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
+    ]);
+    let ts = Ticks(u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]) as u64);
+    let op = match bytes[3] {
+        1 => Op::Append(LineId(payload)),
+        2 => Op::Write(LineId(payload)),
+        3 => Op::Clear(LineId(payload)),
+        4 => Op::RawIn(BlobId(payload)),
+        5 => Op::Reply(BlobId(payload)),
+        6 => {
+            if payload > 0xFFFF_FFFF {
+                return None;
+            }
+            Op::Resize {
+                rows: (payload >> 16) as u16,
+                cols: (payload & 0xFFFF) as u16,
+            }
+        }
+        7 => Op::Keyframe(KeyframeId(payload)),
+        _ => return None,
+    };
+    Some(Event { seq, op, ts })
+}
+
+/// Encode a 20-byte spine cursor & origin wire frame (`"SPNC"`).
+#[inline]
+#[must_use]
+pub const fn encode_spine_cursor_wire(
+    origin: OriginTag,
+    cursor: Cursor,
+    head: Seq,
+) -> [u8; SPINE_CURSOR_WIRE_BYTES] {
+    let origin_byte = match origin {
+        OriginTag::Source => 1u8,
+        OriginTag::Overlay => 2u8,
+        OriginTag::System => 3u8,
+    };
+    let cb = cursor.at.0.to_le_bytes();
+    let hb = head.0.to_le_bytes();
+    [
+        b'S',
+        b'P',
+        b'C',
+        origin_byte,
+        cb[0],
+        cb[1],
+        cb[2],
+        cb[3],
+        cb[4],
+        cb[5],
+        cb[6],
+        cb[7],
+        hb[0],
+        hb[1],
+        hb[2],
+        hb[3],
+        hb[4],
+        hb[5],
+        hb[6],
+        hb[7],
+    ]
+}
+
+/// Decode a 20-byte spine cursor & origin wire frame produced by
+/// [`encode_spine_cursor_wire`].
+#[inline]
+#[must_use]
+pub const fn decode_spine_cursor_wire(bytes: &[u8]) -> Option<(OriginTag, Cursor, Seq)> {
+    if bytes.len() < SPINE_CURSOR_WIRE_BYTES {
+        return None;
+    }
+    if bytes[0] != b'S' || bytes[1] != b'P' || bytes[2] != b'C' {
+        return None;
+    }
+    let origin = match bytes[3] {
+        1 => OriginTag::Source,
+        2 => OriginTag::Overlay,
+        3 => OriginTag::System,
+        _ => return None,
+    };
+    let at = Seq(u64::from_le_bytes([
+        bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+    ]));
+    let head = Seq(u64::from_le_bytes([
+        bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
+    ]));
+    if at.0 > head.0 {
+        return None;
+    }
+    Some((origin, Cursor { at }, head))
 }
 
 #[cfg(test)]
@@ -779,5 +914,35 @@ mod tests {
         let out2 = s.transact(&write_cap(), snap.at, vec![Edit::AppendLine("z".into())]);
         assert_eq!(out2, TxnOutcome::Conflict);
         assert_eq!(s.seq(), Seq(3), "conflict left the surface untouched");
+    }
+
+    #[test]
+    fn spine_event_and_cursor_wire_roundtrip() {
+        for op in [
+            Op::Append(LineId(1)),
+            Op::Write(LineId(2)),
+            Op::Clear(LineId(3)),
+            Op::RawIn(BlobId(4)),
+            Op::Reply(BlobId(5)),
+            Op::Resize { rows: 24, cols: 80 },
+            Op::Keyframe(KeyframeId(7)),
+        ] {
+            let ev = Event {
+                seq: Seq(42),
+                op,
+                ts: Ticks(99),
+            };
+            let w = encode_spine_event_wire(&ev);
+            assert_eq!(decode_spine_event_wire(&w), Some(ev));
+        }
+
+        let cw = encode_spine_cursor_wire(OriginTag::Source, Cursor { at: Seq(5) }, Seq(10));
+        let (origin, cur, head) = decode_spine_cursor_wire(&cw).expect("decode cursor");
+        assert_eq!(origin, OriginTag::Source);
+        assert_eq!(cur.at, Seq(5));
+        assert_eq!(head, Seq(10));
+        let invalid_cw =
+            encode_spine_cursor_wire(OriginTag::Overlay, Cursor { at: Seq(20) }, Seq(10));
+        assert!(decode_spine_cursor_wire(&invalid_cw).is_none());
     }
 }

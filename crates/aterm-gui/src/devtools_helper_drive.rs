@@ -203,7 +203,7 @@ fn shown_after(
             },
             listed,
             bundle: bundle.then(|| PathBuf::from(TILE_BUNDLE)),
-            skips: aterm_containment::SpikeEvidence::UNMEASURED.devtool_skips_first_run_check,
+            skips: aterm_containment::SpikeEvidence::MEASURED.devtool_skips_first_run_check,
         },
         at,
     )

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use aterm_control::host::SessionPlacement;
 use aterm_core::terminal::Terminal;
 use aterm_session::{ConnectionKind, EdgeTable, EdgeToken, Op, SessionId};
-use winit::event_loop::EventLoopProxy;
+use aterm_window::event_loop::EventLoopProxy;
 
 use super::{Scope, json_ok, json_str_field, pct_encode};
 use crate::Wake;
@@ -24,6 +24,7 @@ use crate::session_timeline::{
     AUTOPILOT_USAGE, MetaEdit, MetaField, MetaWriteError, apply_meta_value, questions_usage,
     write_session_meta,
 };
+use crate::turn_ledger::TurnBy;
 use crate::{SessionCtx, term_lock};
 
 /// `sessions` -> list the process-wide registry: `OK <n>\n` then one line per
@@ -32,10 +33,20 @@ use crate::{SessionCtx, term_lock};
 /// path=<frozen|live> program=<name|-> agent=<word|-> agent_detail=<pct|->
 /// agent_rev=<n> agent_since_ms=<ms> … supervisor=<holder|-> autopilot=<off|cruise|land|->
 /// path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|-> copy=<managed|foreign|->
-/// upgrade=<-|<state>/<to>/<why>/<age>> land_at=<unix s|-> task=<open|landed|done|spent|theirs|->`.
+/// upgrade=<-|<state>/<to>/<why>/<age>> land_at=<unix s|-> task=<open|landed|done|spent|theirs|->
+/// pause=<unix s|-> task_state=<working|done|exited|stalled|-> task_rev=<n>`.
+///
+/// `task_state= task_rev=` (2026-10-15), last: the session's task record
+/// ([`crate::task_record`]), so one roster read tells a manager which of its
+/// workers has news; `-`/`0` for a session with no task. Named apart from
+/// `task=`, the task's face under Land.
+///
+/// `pause=` (2026-10-17, §10.5.1), after `task=`: the unix second the loop's
+/// pause after short turns ends, under the same rule as `task=`
+/// ([`crate::autopilot::pause_field`]).
 ///
 /// `land_at= task=` (2026-10-16, `docs/DESIGN-harness-autopilot-2026-10-15.md`
-/// §9.3.5, §9.4.1), appended last: for an agent session, the instant its
+/// §9.3.5, §9.4.1), after the owner's columns: for an agent session, the instant its
 /// timed Cruise lands (unix seconds) and its task's face under Land as its
 /// loop last told this window's host — `task=` only while that host holds
 /// the session's live claim — and `-` otherwise
@@ -393,28 +404,39 @@ pub(crate) fn sessions_lines(
         // the carried mark — and the owner's columns after `autopilot=`
         // (`path_evidence= copy= upgrade=`, gap audit 2026-09-24), which
         // `land_at= task=` follow.
-        let (agent, (path, owner), (supervised_agent, group), face) = {
+        //
+        // From the same read, `task_state=<state|-> task_rev=<n>` (2026-10-15),
+        // last, after `pause=`: the session's task record
+        // ([`crate::task_record`]), so one roster read tells a manager which of
+        // its workers has news — apart from `task=`, the task's face under
+        // Land.
+        let (agent, (path, owner), task_record, (supervised_agent, group), face, pause) = {
             let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (
                 timeline.agent().wire_fields(),
                 timeline.owner_columns(frozen_path(h.local_id), crate::upgrade_host::now_s()),
+                crate::task_record::status_tokens(timeline.task()),
                 (
                     crate::harness_host::agent_of(timeline.agent()),
                     timeline.agent().program_pgid,
                 ),
                 timeline.task_face().map(|(face, _)| face),
+                timeline.pause(),
             )
         };
         // The agent the host admits (never a vendor `codex`, whose `autopilot=`
         // is `-`), read after the timeline's leaf lock.
         let supervised_agent = crate::harness_host::admitted_as(&h.ctx, supervised_agent, group);
         let autopilot = crate::autopilot::wire_field(posture, word, supervised_agent);
-        // `land_at= task=` (design §9.3.5, §9.4.1), appended last: a timed
+        // `land_at= task=` (design §9.3.5, §9.4.1), after the owner's columns: a timed
         // Cruise's instant and the task's face for an agent session, from
         // the same two reads.
         let land_at =
             crate::autopilot::land_at_field(land_at.filter(|_| supervised_agent.is_some()));
         let task = crate::autopilot::task_field(face, claimed_here, supervised_agent);
+        // `pause=` (§10.5.1) after `task=`: the loop's pause after short
+        // turns, from the same read.
+        let pause = crate::autopilot::pause_field(pause, claimed_here, supervised_agent);
         // `human_ms=<ms|->`: how long since a PERSON last had a hand on the
         // session through a window — the same atomic `status` reads.
         let human = h.ctx.human_input.wire(crate::metrics::now_us());
@@ -429,7 +451,8 @@ pub(crate) fn sessions_lines(
             "{} {} {} {} {} meta={has_meta} nonce={nonce} window={window} active={active} \
              wfocus={wfocus} detail={detail} identity={identity} path={path} {agent} \
              human_ms={human} role={role} attention={attention} user_title={user_title} \
-             supervisor={supervisor} autopilot={autopilot} {owner} land_at={land_at} task={task}",
+             supervisor={supervisor} autopilot={autopilot} {owner} land_at={land_at} task={task} \
+             pause={pause} {task_record}",
             h.local_id,
             h.sid.as_str(),
             parent,
@@ -515,8 +538,8 @@ static NEXT_LEASE_TAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 const LEASE_TTL_DEFAULT_MS: u64 = 30_000;
 const LEASE_TTL_MAX_MS: u64 = 600_000;
 
-/// `lease [status] | lease acquire [ttl=<ms>] [holder=<name>] [hard] | lease
-/// release [holder=<name>] [force]` — the explicit drive lease. One holder at a
+/// `lease [status] | lease acquire [ttl=<ms>] [holder=<name>] [hard] [here] |
+/// lease release [holder=<name>] [force] [here]` — the explicit drive lease. One holder at a
 /// time, TTL-expiring, surfaced in `who` as `driving=lease:<holder>`. It is
 /// mutually exclusive with any live lease (a different holder's `acquire`, and
 /// another connection's `turn`, are refused while it is held) and self-expiring.
@@ -526,7 +549,14 @@ const LEASE_TTL_MAX_MS: u64 = 600_000;
 /// connection's write verbs are refused `ERR busy lease=<holder>` as under a
 /// `turn`, while the holder's own connection writes on — its own `turn` holds
 /// the slot for the turn and hands the lease back after it
-/// ([`crate::Lease::write_block`]). A person's keyboard is never blocked.
+/// ([`crate::Lease::write_block`]). `here` keeps either act to the asking
+/// connection: an acquire never moves a live lease held over another one,
+/// even under the same holder, and a release never frees one — so two
+/// lanes of one process under one holder name cannot take or free each
+/// other's hand. A lease taken `here` is that connection's: it ends with
+/// it ([`release_connection_lease`]), so a hand whose holder hung up, or
+/// whose give-back was lost with its connection, never waits out its TTL.
+/// A person's keyboard is never blocked.
 pub(crate) fn cmd_lease(ctx: &SessionCtx, rest: &str) -> String {
     let mut toks = rest.split_whitespace();
     match toks.next().unwrap_or("status") {
@@ -565,16 +595,20 @@ fn lease_status(ctx: &SessionCtx) -> String {
     }
 }
 
-/// `lease acquire [ttl=<ms>] [holder=<name>] [hard]`: take (or, for the same
-/// holder, renew) the lease — over the connection that asks, which a renewal
-/// moves it to, `hard` or cooperative as this acquire says. Refuses a live
-/// `turn` or a DIFFERENT holder's live lease; steals a lapsed one. Returns the
-/// granted `holder` so an unnamed caller learns the auto-tag it must release
-/// with.
+/// `lease acquire [ttl=<ms>] [holder=<name>] [hard] [here]`: take (or, for the
+/// same holder, renew) the lease — over the connection that asks, which a
+/// renewal moves it to, `hard` or cooperative as this acquire says. Refuses a
+/// live `turn` or a DIFFERENT holder's live lease; steals a lapsed one. With
+/// `here` the same holder's live lease held over ANOTHER connection is
+/// refused as a different holder's is, never moved: only this connection's
+/// own is renewed, and the lease is bound to this connection: it ends when
+/// the connection does ([`release_connection_lease`]). Returns the granted
+/// `holder` so an unnamed caller learns the auto-tag it must release with.
 fn lease_acquire<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> String {
     let mut ttl_ms = LEASE_TTL_DEFAULT_MS;
     let mut holder: Option<String> = None;
     let mut hard = false;
+    let mut here = false;
     for t in args {
         if let Some(v) = t.strip_prefix("ttl=") {
             match v.parse::<u64>() {
@@ -589,8 +623,12 @@ fn lease_acquire<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
             holder = Some(v.to_string());
         } else if t == "hard" {
             hard = true;
+        } else if t == "here" {
+            here = true;
         } else {
-            return format!("ERR lease acquire: unknown arg '{t}' (ttl=<ms> holder=<name> hard)\n");
+            return format!(
+                "ERR lease acquire: unknown arg '{t}' (ttl=<ms> holder=<name> hard here)\n"
+            );
         }
     }
     let holder = holder.unwrap_or_else(|| {
@@ -598,6 +636,7 @@ fn lease_acquire<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
         format!("drv-{n}")
     });
     let now = crate::metrics::now_us();
+    let asking = super::serving_connection();
     let mut lease = ctx.turn_lease.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(held) = lease.as_ref().filter(|h| h.is_live(now)) {
         match held {
@@ -605,8 +644,9 @@ fn lease_acquire<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
             crate::Lease::Drive {
                 holder: h,
                 expires_us,
+                conn,
                 ..
-            } if *h != holder => {
+            } if *h != holder || (here && *conn != asking) => {
                 return format!(
                     "ERR lease held holder={h} expires_in_ms={}\n",
                     (*expires_us - now) / 1000
@@ -618,36 +658,45 @@ fn lease_acquire<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
     *lease = Some(crate::Lease::Drive {
         holder: holder.clone(),
         expires_us: now + ttl_ms.saturating_mul(1000),
-        conn: super::serving_connection(),
+        conn: asking,
         hard,
+        here,
         // Who took it, as the kernel says: read now, while this connection's
         // own request is served (Darwin's `LOCAL_PEERPID` names its last
         // writer). Never the `holder=` text.
         holder_pid: super::serving_peer_pid(),
     });
     drop(lease);
+    if here && asking.is_some() {
+        // The connection's end sweeps it, as it sweeps a bound claim.
+        super::note_connection_claim();
+    }
     // The presence rim follows the lease (round 19): one wake per change of hand.
-    crate::presence::post_lease_changed(&ctx.self_id, false);
+    crate::presence::post_lease_changed(&ctx.self_id);
     format!(
         "OK lease acquired holder={holder} ttl_ms={ttl_ms} expires_in_ms={ttl_ms}{}\n",
         if hard { " hard=1" } else { "" }
     )
 }
 
-/// `lease release [holder=<name>] [force]`: drop the cooperative lease. The holder
-/// releases its own (name must match); `force` steals any cooperative hold; a
-/// lapsed lease releases freely. A `turn`'s hard lease is owned by its own drop
-/// guard and is never released here.
+/// `lease release [holder=<name>] [force] [here]`: drop the cooperative lease. The
+/// holder releases its own (name must match; with `here`, only while it is held
+/// over the asking connection); `force` steals any cooperative hold; a lapsed
+/// lease releases freely. A `turn`'s hard lease is owned by its own drop guard
+/// and is never released here.
 fn lease_release<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> String {
     let mut holder: Option<String> = None;
     let mut force = false;
+    let mut here = false;
     for t in args {
         if let Some(v) = t.strip_prefix("holder=") {
             holder = Some(v.to_string());
         } else if t == "force" {
             force = true;
+        } else if t == "here" {
+            here = true;
         } else {
-            return format!("ERR lease release: unknown arg '{t}' (holder=<name> force)\n");
+            return format!("ERR lease release: unknown arg '{t}' (holder=<name> force here)\n");
         }
     }
     /// The action decided under an immutable read, applied after the borrow ends.
@@ -682,11 +731,15 @@ fn lease_release<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
         Some(crate::Lease::Drive {
             holder: h,
             expires_us,
+            conn,
             ..
         }) => {
             let live = *expires_us > now;
-            if !live || force || holder.as_deref() == Some(h.as_str()) {
+            let named = holder.as_deref() == Some(h.as_str());
+            if !live || force || (named && (!here || *conn == super::serving_connection())) {
                 Act::Release(None)
+            } else if named {
+                Act::Refuse(format!("ERR lease held by {h} over another connection\n"))
             } else {
                 Act::Refuse(format!(
                     "ERR lease held by {h} (pass holder={h} or force)\n"
@@ -699,18 +752,50 @@ fn lease_release<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
         Act::Release(driver) => {
             *lease = None;
             drop(lease);
-            crate::presence::post_lease_changed(&ctx.self_id, false);
+            lease_freed(ctx);
             // Every move of a lease posts a wake to every session whose facts
-            // read it (`DriverGeometry`'s `EveryMovedLeaseOwesAWake`): a
-            // preempted turn's driver too, or its window's row holds on a
-            // lease mark that has moved until something else re-senses it.
+            // read it: a preempted turn's driver too, or its presence facts
+            // (`status hand=`, the hover's who-drives line) keep a lease mark
+            // that has moved until something else re-senses it.
             if let Some(driver) = driver {
-                crate::presence::post_lease_changed(&driver, false);
+                crate::presence::post_lease_changed(&driver);
             }
             "OK lease released\n".to_string()
         }
         Act::Refuse(e) => e,
     }
+}
+
+/// A drive lease was freed: a text the harness typed under the hand and
+/// never submitted is no turn (a later Enter is another act's,
+/// [`ledger_typed_input`]), and the presence rim follows the lease.
+fn lease_freed(ctx: &SessionCtx) {
+    ctx.turns
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take_typed();
+    crate::presence::post_lease_changed(&ctx.self_id);
+}
+
+/// CONNECTION `conn` ENDED: the drive lease it took `here`
+/// ([`crate::Lease::Drive`]'s `here`) ends with it, live or lapsed, as
+/// [`lease_release`] frees it. A hand a stop cut short (the turn-end loop's
+/// connection is the one its interrupter hangs up), or one whose give-back
+/// was lost with a connection that dropped, is free at once, not after its
+/// TTL — while it stood, every other connection's writes were `ERR busy
+/// lease=…`, under a hand the window shows no row for (ruling 313). A lease
+/// taken without `here`, or over another connection, stays: the upgrade's
+/// and relaunch's hand rides a reconnect, its renewal moving it.
+pub(crate) fn release_connection_lease(ctx: &SessionCtx, conn: u64) {
+    let mut lease = ctx.turn_lease.lock().unwrap_or_else(|p| p.into_inner());
+    if !matches!(lease.as_ref(), Some(crate::Lease::Drive { conn: Some(held_by), here: true, .. })
+        if *held_by == conn)
+    {
+        return;
+    }
+    *lease = None;
+    drop(lease);
+    lease_freed(ctx);
 }
 
 /// `edges` / `grants` -> list this session's INBOUND capability edges (the rows
@@ -1081,7 +1166,7 @@ pub(crate) fn cmd_ready(
 }
 
 /// `await <idle <ms> | seq [<n>] | match <re> [rows <a> <b>] | gone <re> [rows <a> <b>]
-/// | block | inbox since=<id> [kinds=<k,...>]> [timeout <ms>]` — block until the
+/// | block | inbox since=<id> [kinds=<k,...>] [topic=<t>]> [timeout <ms>]` — block until the
 /// Observation Kernel (L0) latches the predicate, then return `OK <kind> <seq>`;
 /// `OK timeout` if the overall deadline elapses; `ERR exited` if the session dies.
 /// (`await consent [kind=debugger] [timeout=<ms>]` is dispatched to `control_privacy` before this
@@ -1135,9 +1220,9 @@ pub(crate) fn cmd_await(
     use crate::subscribe::SubscriberSet;
 
     const USAGE: &str = "ERR usage: await <idle <ms>|seq [<n>]|match <re> [rows <a> <b>]|\
-                         gone <re> [rows <a> <b>]|block|inbox since=<id> [kinds=<k,...>]|\
-                         agent <word>[,<word>...]|log need|open=<lvl>|close=<lvl>|kind=<k> \
-                         [since=<seq> ep=<e>]> \
+                         gone <re> [rows <a> <b>]|block|inbox since=<id> [kinds=<k,...>] [topic=<t>]|\
+                         agent <word>[,<word>...] [since=<rev>]|task [@<sel>[:<rev>][,...]] [any|all] [since=<rev>]|\
+                         log need|open=<lvl>|close=<lvl>|kind=<k> [since=<seq> ep=<e>]> \
                          [timeout <ms>] | await consent [kind=debugger] [timeout=<ms>] | await momentum <floor 0..=1> [timeout <ms>]\n";
 
     // Split off an optional `timeout <ms>` anywhere in the args; the rest is the
@@ -1178,15 +1263,49 @@ pub(crate) fn cmd_await(
         return crate::fabric::cmd_await_inbox(ctx, &args[1..], timeout_ms);
     }
 
-    // `await agent <word>[,<word>…]` parks on the SERVER'S published agent
-    // verdict (`status agent=`), not on the screen: no watcher is armed and no
-    // terminal lock is taken. LATCHED — a verdict already in the set answers at
-    // once — and woken by the sweep's own notify when the verdict moves.
+    // `await agent <word>[,<word>…] [since=<rev>]` parks on the SERVER'S
+    // published agent verdict (`status agent=`), not on the screen: no watcher
+    // is armed and no terminal lock is taken. LATCHED — a verdict already in
+    // the set answers at once, with `since=` only one published past that rev
+    // — and woken by the sweep's own notify when the verdict moves.
     if kind == "agent" {
         let Some(words) = args.get(1).and_then(|w| parse_agent_words(w)) else {
             return USAGE.to_string();
         };
-        return await_agent(store, session, ctx, &words, timeout_ms, subscribers);
+        let mut since = None;
+        for arg in &args[2..] {
+            if let Some(v) = arg.strip_prefix("since=") {
+                let Ok(rev) = v.parse::<u64>() else {
+                    return USAGE.to_string();
+                };
+                since = Some(rev);
+            }
+        }
+        return await_agent(store, session, ctx, &words, since, timeout_ms, subscribers);
+    }
+
+    // `await task [since=<rev>]` parks on THIS session's task record, like
+    // `await agent` on its verdict: no watcher, no terminal lock. The
+    // selector-less list form (`await task @a,@b …`) never reaches here — the
+    // dispatcher resolves its targets first (`control::dispatch_await_task`).
+    // `task` is the FIRST word, as the list form's: the reply is Lines-framed
+    // and a client tells that from the second word of the request
+    // (`aterm_types::control_verbs::framing_of`), so `await timeout=5 task`
+    // would answer rows to a reader expecting one line.
+    if kind == "task" {
+        if rest.split_whitespace().next() != Some("task") {
+            return crate::task_record::AWAIT_TASK_USAGE.to_string();
+        }
+        let parsed = match crate::task_record::parse_await_task(&args[1..], false) {
+            Ok(parsed) => parsed,
+            Err(usage) => return usage,
+        };
+        let target = TaskTarget {
+            local_id: session,
+            ctx,
+            since: parsed.since,
+        };
+        return await_task(store, &[target], parsed.combine, timeout_ms, subscribers);
     }
 
     // `await log need|open=<lvl>|close=<lvl>|kind=<k> [since=<seq> ep=<e>]` parks on
@@ -1408,15 +1527,18 @@ fn parse_agent_words(list: &str) -> Option<Vec<AgentWord>> {
 }
 
 /// `await agent`: answer `OK agent <word> rev=<n>` the moment the session's
-/// published verdict is one of `words` (at once if it already is), `OK
-/// timeout` at the deadline, `ERR exited` when the session ends. Parks on the
-/// session's subscriber slot, which the status sweep notifies when it
+/// published verdict is one of `words` (at once if it already is) — with
+/// `since`, only a verdict whose rev is past it, so the one a `turn`'s Enter
+/// found (its `agent_rev=`) is no answer however soon the wait is armed —
+/// `OK timeout` at the deadline, `ERR exited` when the session ends. Parks on
+/// the session's subscriber slot, which the status sweep notifies when it
 /// publishes a new verdict.
 fn await_agent(
     store: &Store,
     session: u64,
     ctx: &SessionCtx,
     words: &[AgentWord],
+    since: Option<u64>,
     timeout_ms: u64,
     subscribers: &crate::subscribe::Subscribers,
 ) -> String {
@@ -1432,7 +1554,7 @@ fn await_agent(
             let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (tl.agent().word, tl.agent().rev)
         };
-        if words.iter().any(|w| w.matches(word)) {
+        if since.is_none_or(|since| rev > since) && words.iter().any(|w| w.matches(word)) {
             return format!("OK agent {word} rev={rev}\n");
         }
         if exited(store) {
@@ -1450,6 +1572,167 @@ fn await_agent(
                 .saturating_duration_since(now)
                 .max(Duration::from_millis(1)),
         ));
+    }
+}
+
+/// One target of an `await task` ([`await_task`]): the session, and the task
+/// rev it waits past — its own `@<sel>:<rev>` or the request's `since=`, else
+/// (`None`) its rev when the wait is armed.
+pub(crate) struct TaskTarget<'a> {
+    /// The session's process-local id (its subscriber slot).
+    pub(crate) local_id: u64,
+    /// The session.
+    pub(crate) ctx: &'a SessionCtx,
+    /// The rev it waits past.
+    pub(crate) since: Option<u64>,
+}
+
+/// `await task`: park until the task records of `targets` have news — a
+/// target whose record's rev is past its `since` with a state to read (`done`,
+/// `exited`, `stalled`) or the supervisor's attention raised
+/// ([`crate::task_record::TaskRecord::has_news`]), or whose session closed —
+/// at the first such target (`any`) or once every target is one (`all`).
+/// EDGE-TRIGGERED on the rev: a target's `since` defaults to its rev at arm,
+/// so news a manager already read does not answer again, and a wait re-armed
+/// with the revs it was answered with (`@<sel>:<rev>`) misses nothing between
+/// the two.
+///
+/// LATCHED within the wait: a target that showed news keeps it, and the row
+/// it showed, until the wait answers — news that came and went between two
+/// wakes (the supervisor's attention raised and cleared, a `done` moved back
+/// to `working`) still counts toward `all`. A wait armed again reads every
+/// record as it stands then.
+///
+/// Answers `OK <n>` and one [`crate::task_record::await_row`] per target, in
+/// request order — a session named twice answers twice; at the deadline the
+/// same rows under `OK <n> status=timeout` (the Lines framing's timeout:
+/// aterm-ctl exits 124 on it); `ERR hangup` when the caller hung up. Parks on
+/// the targets' subscriber slots, which a mark
+/// ([`crate::task_record::mark_session_task`]), an attention write and a
+/// session's exit notify — no poll. The same slots wake on every output burst,
+/// so a wake first compares each unlatched target's rev and news under its
+/// one timeline lock, and builds rows only for news and for the answer.
+pub(crate) fn await_task(
+    store: &Store,
+    targets: &[TaskTarget<'_>],
+    combine: crate::task_record::Combine,
+    timeout_ms: u64,
+    subscribers: &crate::subscribe::Subscribers,
+) -> String {
+    use std::time::{Duration, Instant};
+
+    use crate::subscribe::SubscriberSet;
+    use crate::task_record::Combine;
+
+    let overall = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut locals: Vec<u64> = targets.iter().map(|t| t.local_id).collect();
+    locals.sort_unstable();
+    locals.dedup();
+    // Registered BEFORE the edges are read: a mark landing in between is a
+    // wake below, never a missed edge.
+    let sub = SubscriberSet::register(subscribers, &locals);
+    let edges: Vec<u64> = targets
+        .iter()
+        .map(|t| {
+            t.since
+                .unwrap_or_else(|| task_record_of(t.ctx).map_or(0, |task| task.rev))
+        })
+        .collect();
+    let exits: Vec<_> = targets
+        .iter()
+        .map(|t| exit_probe(store, t.local_id))
+        .collect();
+    let mut latched: Vec<Option<String>> = vec![None; targets.len()];
+    loop {
+        latch_task_news(store, targets, &edges, &exits, &mut latched);
+        let with_news = latched.iter().filter(|latch| latch.is_some()).count();
+        let answered = match combine {
+            Combine::Any => with_news > 0,
+            Combine::All => with_news == targets.len(),
+        };
+        let now = Instant::now();
+        if answered || now >= overall {
+            let tail = if answered { "" } else { " status=timeout" };
+            let mut out = format!("OK {}{tail}\n", targets.len());
+            for ((target, exited), latch) in targets.iter().zip(&exits).zip(latched) {
+                let row = latch.unwrap_or_else(|| {
+                    task_wait_row(target, task_record_of(target.ctx).as_ref(), exited(store))
+                });
+                out.push_str(&row);
+                out.push('\n');
+            }
+            return out;
+        }
+        if crate::control::caller_hung_up() {
+            return crate::control::HUNG_UP_REPLY.to_string();
+        }
+        let _ = sub.wait(crate::control::hangup_park(
+            overall
+                .saturating_duration_since(now)
+                .max(Duration::from_millis(1)),
+        ));
+    }
+}
+
+/// A session's task record, cloned off its timeline leaf.
+fn task_record_of(ctx: &SessionCtx) -> Option<crate::task_record::TaskRecord> {
+    ctx.timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .task()
+        .cloned()
+}
+
+/// `target`'s [`crate::task_record::await_row`] for `record`, with the
+/// session's agent word and attention as they read now.
+fn task_wait_row(
+    target: &TaskTarget<'_>,
+    record: Option<&crate::task_record::TaskRecord>,
+    closed: bool,
+) -> String {
+    let (agent, attention) = crate::task_record::agent_and_attention(target.ctx);
+    crate::task_record::await_row(
+        target.ctx.self_id.as_str(),
+        record,
+        agent,
+        &attention,
+        closed,
+    )
+}
+
+/// One wake of an [`await_task`]: LATCH each target not latched yet that has
+/// news now — its session closed (`exits`), or its record's rev past its edge
+/// with news — with the row it shows. A latched target is never read again,
+/// so its news holds until the wait answers. The read is the cheap one: under
+/// the timeline lock, the rev and the news; the record is cloned, and the row
+/// built, only for news.
+fn latch_task_news<F: Fn(&Store) -> bool>(
+    store: &Store,
+    targets: &[TaskTarget<'_>],
+    edges: &[u64],
+    exits: &[F],
+    latched: &mut [Option<String>],
+) {
+    for (((target, edge), exited), latch) in targets.iter().zip(edges).zip(exits).zip(latched) {
+        if latch.is_some() {
+            continue;
+        }
+        let closed = exited(store);
+        let news = {
+            let timeline = target
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            timeline
+                .task()
+                .filter(|task| task.rev > *edge && task.has_news())
+                .cloned()
+        };
+        if closed || news.is_some() {
+            let record = news.or_else(|| task_record_of(target.ctx));
+            *latch = Some(task_wait_row(target, record.as_ref(), closed));
+        }
     }
 }
 
@@ -1641,7 +1924,7 @@ pub(crate) fn turn_ids_for_handoff() -> u64 {
 /// refuse every later Commit, an update that never lands. A count gets there
 /// only from a carried count no aterm minted; the successor says so
 /// (`seamless::take_incoming`).
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 pub(crate) fn turn_ids_past_handoff_ceiling(ceiling: u64) -> bool {
     past_ceiling(turn_ids_minted(), ceiling)
 }
@@ -1687,11 +1970,20 @@ pub(crate) struct TurnIo<'a> {
     /// WHO is driving: the session the connection's edge token was granted to
     /// (`EdgeTable::src_of` on the resolved target's table — the one that
     /// authorized this request), or `None` for an Owner-class caller (the
-    /// per-instance token, the bridge), neither of which is a session. Recorded
-    /// in [`crate::Lease::Turn`] for the length of the turn; the presence band's hand slot and `status hand=` name the
-    /// driver from it. Resolved by the dispatch site like the routes above,
-    /// because only the dispatch has the scope.
+    /// per-instance token, the bridge), neither of which is a session.
+    /// Recorded in [`crate::Lease::Turn`] for the length of the turn; `status
+    /// hand=` and the tab's hover name the driver from it.
+    /// Resolved by the dispatch site like the routes above, because only the
+    /// dispatch has the scope.
     pub driver: Option<aterm_session::SessionId>,
+    /// WHO is calling, for the turn's ledger record ([`turn_by`]: the
+    /// connection's identity, `ctl`, `bridge` or the edge's sid). The turn
+    /// refines it by the lease it types under ([`typed_by`]: the window
+    /// harness's own hand makes an owner-token turn `harness`), because only
+    /// the turn sees that lease. Resolved by the dispatch site, like
+    /// [`Self::driver`]. The turn ledger's `by=`; the session log's is
+    /// [`Self::actor`].
+    pub by: TurnBy,
     /// THE SESSION LOG'S `by=` for the turn this exchange opens: the
     /// connection's ([`log_actor`]: `harness`, `ctl`, `bridge`, an edge's
     /// minted sid, else `-`), never a parameter. Resolved by the dispatch,
@@ -1709,8 +2001,8 @@ pub(crate) struct TurnIo<'a> {
 /// The end of turn `id`'s INPUT: its lease stops saying the driver may type
 /// ([`crate::Lease::driver_may_type`]) — only while the slot still holds
 /// this turn, never a turn that preempted it — and the presence is woken, so
-/// a window that held its band row for the turn re-grids now. `true` when
-/// this turn's lease was the one changed.
+/// the session's slot reads the lease's end now. `true` when this turn's
+/// lease was the one changed.
 pub(crate) fn end_turn_input(
     turn_lease: &std::sync::Mutex<Option<crate::Lease>>,
     id: u64,
@@ -1728,10 +2020,11 @@ pub(crate) fn end_turn_input(
     }
     *typing = false;
     drop(lease);
-    crate::presence::post_lease_changed(sid, false);
+    crate::presence::post_lease_changed(sid);
     true
 }
 
+#[cfg(test)]
 impl TurnIo<'static> {
     /// The two routes a plain `turn` needs and none of the even-hand ones: a
     /// base for `..TurnIo::paste_only()` at a test site that pastes and presses
@@ -1754,6 +2047,7 @@ impl TurnIo<'static> {
             key: &no_key,
             momentum: &no_momentum,
             driver: None,
+            by: TurnBy::Unknown,
             actor: aterm_slog::Actor::Ctl,
             cause: None,
             mark: None,
@@ -2515,19 +2809,24 @@ fn guarded_submit(
 }
 
 /// `turn`'s usage line.
-pub(crate) const TURN_USAGE: &str = "ERR usage: turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] [if-gen=<epoch>.<seq>] [if-rows=<first>-<last>:<hex16>] [cause=@<off>|<seq>] <text>\n";
+pub(crate) const TURN_USAGE: &str = "ERR usage: turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>|submitted] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] [if-gen=<epoch>.<seq>] [if-rows=<first>-<last>:<hex16>] [cause=@<off>|<seq>] <text>\n";
 
 /// `turn`'s options as parsed ([`turn_options`]): every leading `k=v`, and the
 /// message after them, verbatim.
 pub(crate) struct TurnOptions<'a> {
     idle_ms: u64,
-    timeout_ms: u64,
+    /// The whole turn's budget (`timeout=`, else 240 s), which a drive's
+    /// gate holds to its connection's (`control::drive_turn`).
+    pub(crate) timeout_ms: u64,
     submit: String,
     submit_guard: Option<String>,
     submit_window_ms: u64,
     presses: u32,
     submit_verify: Option<bool>,
     settle_match: Option<(bool, String)>,
+    /// `settle=submitted`: no settle — the turn answers at its verified
+    /// submit (`status=submitted`).
+    settle_submitted: bool,
     trim: bool,
     typed: bool,
     cadence_ms: u64,
@@ -2577,6 +2876,9 @@ pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
     // idle, `settle=gone:<re>` on that pattern LEAVING the screen (the `gone` flag);
     // None => the default idle settle. Compiled below, before any input.
     let mut settle_match: Option<(bool, String)> = None;
+    // `settle=submitted`: no phase-3 settle — the turn answers at its verified
+    // submit (`status=submitted`).
+    let mut settle_submitted = false;
     // `trim=1` drops the settled screen's trailing blank rows from the reply (the
     // `text trim` rule); off by default so a script that counts rows sees the grid.
     let mut trim = false;
@@ -2646,12 +2948,18 @@ pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
                 "auto" => submit_verify = None,
                 _ => return Err(USAGE.to_string()),
             },
+            "settle" if v == "submitted" => {
+                settle_match = None;
+                settle_submitted = true;
+            }
             "settle" => match v.split_once(':') {
                 Some(("match", pat)) if !pat.is_empty() => {
                     settle_match = Some((false, pat.to_string()));
+                    settle_submitted = false;
                 }
                 Some(("gone", pat)) if !pat.is_empty() => {
                     settle_match = Some((true, pat.to_string()));
+                    settle_submitted = false;
                 }
                 _ => return Err(USAGE.to_string()),
             },
@@ -2701,6 +3009,11 @@ pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
     if text.trim().is_empty() && submit != "none" {
         return Err(USAGE.to_string());
     }
+    // `settle=submitted` answers at the submit: a turn that submits nothing has
+    // none to answer at.
+    if settle_submitted && submit == "none" {
+        return Err(USAGE.to_string());
+    }
     Ok(TurnOptions {
         idle_ms,
         timeout_ms,
@@ -2710,6 +3023,7 @@ pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
         presses,
         submit_verify,
         settle_match,
+        settle_submitted,
         trim,
         typed,
         cadence_ms,
@@ -2765,12 +3079,12 @@ pub(crate) fn turn_preflight(rest: &str) -> Result<Option<crate::session_log::Ca
     Ok(o.cause)
 }
 
-/// `turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>]
-/// [submit_window=<ms>] [presses=<n>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [cap=<n>]
-/// [yield=<floor>] <text>` — one complete HUMAN
+/// `turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>]
+/// [settle=match:<re>|gone:<re>|submitted] [submit_window=<ms>] [presses=<n>] [trim=<0|1>]
+/// [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] <text>` — one complete HUMAN
 /// TURN against the target session: type `<text>`, submit it with a real keypress,
 /// block until the app's response settles, and return the settled screen —
-/// `OK <rows> turn submitted=<0|1> status=<settled|timeout> seq=<n> id=<n>
+/// `OK <rows> turn submitted=<0|1> status=<settled|timeout|hangup|submitted> seq=<n> id=<n>
 /// dur_ms=<n> hash=<hex16>[ trimmed=<k>]` then `<rows>` text rows (the same rows
 /// `text` prints). `hash` is the FNV-1a of the settled screen (the SAME value
 /// `history` reports for this `id`), so a driver can diff two turns' outputs inline
@@ -2794,16 +3108,25 @@ pub(crate) fn turn_preflight(rest: &str) -> Result<Option<crate::session_log::Ca
 /// command-start (a command block enters Executing) — ambient-repaint-IMMUNE, so a
 /// periodically-repainting TUI cannot false-verify a swallowed Enter; `seq` keys on a
 /// bare `content_seq` advance. The DEFAULT is AUTO: `block` when the target is at a
-/// shell prompt (a submit will start a command — the sound choice), else `seq` (a
-/// full-screen TUI or a session with no shell integration has no press-attributable
-/// signal). So a shell drive is sound by default. AUTO additionally DEGRADES
+/// shell prompt (a submit will start a command — the sound choice); THE COMPOSER for
+/// a session read as Claude Code whose framed composer shows the typed text — its
+/// echo waited for as the screen moves, within the echo's cap
+/// ([`composer_key_once_shown`]) — the text leaving the composer (its dim
+/// placeholder no text), or a box or menu taking its place by the window's close
+/// ([`composer_after_press`]), which no repaint elsewhere gives (its animated
+/// logo, a ticking row); else `seq` (a full-screen TUI or a session with no shell
+/// integration has no press-attributable signal). So a shell drive and a Claude Code
+/// drive are sound by default. AUTO additionally DEGRADES
 /// honestly: when the window expires with content having moved after the press but
 /// no command block started, the prompt-shaped block AUTO keyed on has proven
 /// STALE (a desynced 133 stream — e.g. a distro integration whose C mark never
 /// lands), so AUTO takes the seq verdict (`submitted=1`) instead of re-pressing —
 /// a press whose echo moved the screen was consumed, and another Enter would land
 /// in the running command. Re-press is reserved for a press after which NOTHING
-/// moved (the true swallowed case). Explicit `submit_verify=block` never degrades.
+/// moved (the true swallowed case) — or, verified by the composer, after which the
+/// text still sits there. Explicit `submit_verify=block` never degrades, and
+/// neither does the composer: a repaint is exactly what it must not take for a
+/// landed Enter.
 /// The whole exchange is one request line — no client-side timing enters the
 /// protocol.
 ///
@@ -2835,6 +3158,36 @@ pub(crate) fn turn_preflight(rest: &str) -> Result<Option<crate::session_log::Ca
 /// show its footer, behaves like a plain `turn` instead of settling instantly on
 /// a screen nothing was read from. A caller who needs certainty follows the turn
 /// with `await gone <re>` while the footer is up.
+///
+/// `settle=submitted` waits for no settle at all: the turn answers the moment its
+/// submit is VERIFIED, `status=submitted` over the screen as it stands then. For a
+/// program whose screen never goes quiet and has no pattern to key on — Claude Code
+/// 2.1.301 animates its header logo's colours every few hundred milliseconds at an
+/// idle prompt, so an idle settle burns the whole timeout (MEASURED on a real login,
+/// 2026-10-15: `submitted=1 status=timeout` after 240 s) — and for a caller with its
+/// own wait to follow, as a manager's follow-up into a worker has (`await task`).
+/// Everything the submit does happens as ever (a done worker's task opens again
+/// here). An unverified submit answers `status=timeout` as any turn does; with
+/// `submit=none` there is no submit to answer on, and the pair is the usage line.
+/// The ledger records the turn as `status=pressed`: its Enter landed and no settle
+/// was awaited after it. Into Claude Code AUTO verifies by the composer (above),
+/// which its animation cannot satisfy; at another program's prompt by `seq`, which
+/// a repaint of its own can: `submitted=1` there says the screen moved, not that
+/// the Enter landed.
+///
+/// A TURN INTO AN AGENT — a session whose published verdict is an agent's word,
+/// not `-` — closes its verdict with `agent_rev=<n>`, the verdict's rev as the
+/// Enter found it: `await agent <words> since=<n>` answers only on a verdict
+/// published after it, so a wait armed the moment a `settle=submitted` turn
+/// answers cannot latch the `idle` from before the submit, which the status
+/// sweep (at most every `AGENT_MIN_INTERVAL`) has not yet republished as busy.
+///
+/// A WORKER'S TURN — into a session with a task record — closes its verdict with
+/// `task_rev=<n>`, the record's rev as the Enter found it: `await task
+/// @<sid>:<n>` waits past it, so the `working` this turn moves a done record to is
+/// no news there and the follow-up's own `done` is, even one marked before the
+/// wait was armed; and that done is the one the turn opens again
+/// ([`crate::task_record::reopen_at_turn`]), never one marked since.
 ///
 /// Fully event-driven like `ready`/`await` (subscriber park + kernel deadlines,
 /// zero polling). Empty `<text>` skips the paste (submit-only: useful to fire a
@@ -2883,6 +3236,13 @@ pub(crate) fn turn_preflight(rest: &str) -> Result<Option<crate::session_log::Ca
 /// `ERR yield timeout momentum=<v>` having typed nothing. The verdict gains
 /// `typed=<keys> pasted=<graphemes>` for a typed turn and `yielded_ms=<n>`
 /// for a yielded one; a plain turn's reply is byte-identical to before.
+///
+/// THE HOLDS, AT EVERY WRITE. A hold set while the turn runs (`hold`, the
+/// person's Take Over) is asked again before each key, paste and Enter: one
+/// that stands before any byte landed answers the dispatch's own `ERR
+/// halted`, and one after stops the turn there, pressing nothing more,
+/// Enter included — `OK 0 turn skipped reason=halted submitted=0 seq=<n>
+/// id=<n>`, a typed turn's with `typed=<k> pasted=<p>`.
 pub(crate) fn cmd_turn(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
@@ -2934,6 +3294,7 @@ pub(crate) fn cmd_turn(
         submit_window_ms,
         presses,
         submit_verify,
+        settle_submitted,
         trim,
         typed,
         cadence_ms,
@@ -2987,18 +3348,21 @@ pub(crate) fn cmd_turn(
             id
         };
         // The lease names its issuer — the dispatch site's resolution of the
-        // connection's scope ([`TurnIo::driver`]) — so the presence band and
-        // `status hand=` credit the hand that is actually on the keyboard.
+        // connection's scope ([`TurnIo::driver`]) — so `status hand=` and the
+        // tab's hover credit the hand that is actually on the keyboard.
         *lease = Some(crate::Lease::Turn {
             id,
             driver: io.driver.clone(),
             // The driver may type from here to its last Enter
-            // ([`crate::Lease::driver_may_type`]): no window re-grids the
-            // session under it until [`end_turn_input`].
+            // ([`crate::Lease::driver_may_type`]): the repaint nudge resizes
+            // nothing under it until [`end_turn_input`].
             typing: true,
         });
         (id, own)
     };
+    // Who typed it, for the ledger: the caller, or the window harness when
+    // the drive lease this connection types under is the harness's hand.
+    let by = typed_by(&io.by, handed_back.as_ref());
     struct LeaseGuard<'a> {
         /// `ctx.turn_lease` — a NAMED field (not a tuple `.0`) so the
         /// lock-order census (OB-7) resolves this Drop-path acquisition to the
@@ -3037,9 +3401,9 @@ pub(crate) fn cmd_turn(
                 *lease = self.handed_back.take();
                 drop(lease);
                 // The turn settled (or timed out, or was refused): the rim lifts.
-                crate::presence::post_lease_changed(self.sid, false);
+                crate::presence::post_lease_changed(self.sid);
                 if let Some(driver) = self.driver {
-                    crate::presence::post_lease_changed(driver, false);
+                    crate::presence::post_lease_changed(driver);
                 }
             }
         }
@@ -3052,11 +3416,12 @@ pub(crate) fn cmd_turn(
         driver: io.driver.as_ref(),
         handed_back,
     };
-    // The turn's lease is held: the presence rim goes teal (round 19) — and
-    // the driver's own band, if it is a local session, gains `▸ @<sid>`.
-    crate::presence::post_lease_changed(&ctx.self_id, false);
+    // The turn's lease is held: both sessions' presence facts are re-read
+    // (`status hand=` names the driver; a lease is a record, never a need,
+    // so nothing is drawn for it).
+    crate::presence::post_lease_changed(&ctx.self_id);
     if let Some(driver) = &io.driver {
-        crate::presence::post_lease_changed(driver, false);
+        crate::presence::post_lease_changed(driver);
     }
 
     // ATTRIBUTION BEFORE DELIVERY: the turn this exchange opens carries `by=` (the
@@ -3181,6 +3546,28 @@ pub(crate) fn cmd_turn(
         hold = typed.then(|| TypingHold::of(&terminal, ctx, if_rows));
     }
 
+    // THE HOLDS, ASKED AGAIN AT EVERY WRITE. The dispatch asked them once,
+    // as the turn arrived ([`crate::fabric::halt_refusal`]); a turn then
+    // types for as long as its budget lets it, so a hold set since — the
+    // person's Take Over above all, which takes the tab from a remote node
+    // mid-turn — is asked again before each key, the remainder's paste, the
+    // paste and every Enter, under the same rule (a remote node's own hold
+    // never refuses its own drive). Before any byte landed (`landed` is
+    // `None`) the turn answers the dispatch's own `ERR halted`; after, it
+    // stops there, `reason=halted`, pressing nothing more — the Enter above
+    // all, which would submit the part typed, or the person's keys with it.
+    let halted = |landed: Option<(usize, usize)>| -> Option<String> {
+        let refusal = crate::fabric::halt_refusal(ctx, "turn")?;
+        Some(match landed {
+            None => refusal,
+            Some((keys, pasted)) if typed => typed_cut(term, "halted", keys, pasted, turn_id),
+            Some(_) => {
+                let seq = term_lock(term).content_seq();
+                format!("OK 0 turn skipped reason=halted submitted=0 seq={seq} id={turn_id}\n")
+            }
+        })
+    };
+
     // ── phase 1: type. Paste semantics by default; the seam strips control
     // bytes. `typed=1`: one key per grapheme on an ABSOLUTE schedule (`t0 +
     // i·cadence`, so the interval never drifts) up to the cap, then the
@@ -3195,6 +3582,9 @@ pub(crate) fn cmd_turn(
     // ([`OnHangup::Finish`]). Before the first byte nothing is half-applied,
     // and a gone caller's first hop is refused as any other is.
     let mut committed: Option<crate::control::CommittedInput> = None;
+    // Where the echo's cap ends: the composer verify waits no later for a
+    // Claude Code composer to show the text (phase 2).
+    let mut echo_until = None;
     if !text.is_empty() {
         if typed {
             use aterm_grapheme::GraphemeClusters;
@@ -3245,6 +3635,9 @@ pub(crate) fn cmd_turn(
                         Err(why) => return typed_cut(term, why, typed_keys, 0, turn_id),
                     }
                 }
+                if let Some(cut) = halted(committed.is_some().then_some((typed_keys, 0))) {
+                    return cut;
+                }
                 if typed_keys == 0 {
                     note_ctl_input();
                 }
@@ -3261,6 +3654,9 @@ pub(crate) fn cmd_turn(
                 {
                     return typed_cut(term, why, typed_keys, 0, turn_id);
                 }
+                if let Some(cut) = halted(committed.is_some().then_some((typed_keys, 0))) {
+                    return cut;
+                }
                 pasted_graphemes = remainder.graphemes().count();
                 if typed_keys == 0 {
                     note_ctl_input();
@@ -3271,6 +3667,9 @@ pub(crate) fn cmd_turn(
                 committed.get_or_insert_with(crate::control::CommittedInput::enter);
             }
         } else {
+            if let Some(refusal) = halted(None) {
+                return refusal;
+            }
             note_ctl_input();
             if !(io.paste)(text) {
                 return "ERR paste delivery failed\n".to_string();
@@ -3282,7 +3681,9 @@ pub(crate) fn cmd_turn(
         let Some(id) = arm(WatcherSpec::IdleFor { dur: ECHO_SETTLE }) else {
             return format!("ERR {WAITS_FULL}\n");
         };
-        match wait_committed(id, deadline.min(Instant::now() + ECHO_CAP)) {
+        let until = deadline.min(Instant::now() + ECHO_CAP);
+        echo_until = Some(until);
+        match wait_committed(id, until) {
             Phase::Exited => return "ERR exited\n".to_string(),
             // A committed park never ends on a hangup (`OnHangup::Finish`):
             // the turn goes on to its submit either way.
@@ -3306,6 +3707,22 @@ pub(crate) fn cmd_turn(
     let mut submitted = false;
     // Enters the guarded submit actually wrote (`pressed=` on its verdict).
     let mut guarded_presses = 0u32;
+    // A worker's task record as the Enter finds it: the rev its verdict's
+    // `task_rev=` names — the edge an `await task @<sid>:<rev>` waits past
+    // for this turn's own done — and the one entry into its state this turn
+    // may open again (`task_record::reopen_at_turn`: that done, re-marked or
+    // not since).
+    let task_found = task_record_of(ctx).map(|task| (task.rev, task.entered));
+    // The agent verdict as the Enter finds it, where the session is an agent's
+    // (its word not `-`): the rev its verdict's `agent_rev=` names, the edge
+    // an `await agent <words> since=<rev>` waits past — so the `idle` from
+    // before this submit, which the status sweep may not have republished yet
+    // when a `settle=submitted` turn answers, is no answer to it.
+    let agent_found = {
+        let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        let agent = tl.agent();
+        (agent.word != "-").then_some(agent.rev)
+    };
     if submit != "none" {
         // EFFECTIVE verification mode. Explicit `submit_verify=` wins; otherwise AUTO:
         // `block` when the target is at a shell prompt (a submit will start a command,
@@ -3332,6 +3749,41 @@ pub(crate) fn cmd_turn(
                 .filter(|b| matches!(b.state, BlockState::Executing | BlockState::Complete))
                 .count()
         };
+        // THE COMPOSER VERIFY: where AUTO keys on `seq` for an identified
+        // Claude Code session whose framed composer shows the typed text, the
+        // submit is verified by that text LEAVING the composer instead — a
+        // signal no repaint gives: Claude Code 2.1.301 animates its logo at an
+        // idle prompt, so a content advance is no proof the Enter landed
+        // ([`composer_after_press`]). An echo still to come is waited for as
+        // the screen moves, up to the echo's cap; one not shown by then (a
+        // composer Claude Code scrolled, a `!` or `#` it took as a mode) keeps
+        // `seq`. The read and the seq the next wait arms past are taken under
+        // one lock, so an echo drawn between the two is never slept through.
+        let composer_key = if auto_mode && !submit_verify_block && read_as_claude(ctx) {
+            let look = || {
+                let t = term_lock(term);
+                (composer_verify_key(&t, text), t.content_seq())
+            };
+            let wait = |after| {
+                let Some(until) = echo_until.filter(|&u| Instant::now() < u) else {
+                    return Ok(false);
+                };
+                let Some(id) = arm(WatcherSpec::SeqAdvanced { after }) else {
+                    return Err(format!("ERR {WAITS_FULL}\n"));
+                };
+                match wait_committed(id, until) {
+                    Phase::Exited => Err("ERR exited\n".to_string()),
+                    Phase::Latched => Ok(true),
+                    Phase::Deadline | Phase::HungUp => Ok(false),
+                }
+            };
+            match composer_key_once_shown(look, wait) {
+                Ok(key) => key,
+                Err(reply) => return reply,
+            }
+        } else {
+            None
+        };
         for press_no in 0..presses {
             // A re-press is for an Enter the program READ and swallowed; one
             // still unread in its queue would only stack another behind it
@@ -3347,6 +3799,19 @@ pub(crate) fn cmd_turn(
             // the turn's own deadline; the press is judged as unverified.
             if press_no > 0 && ctx.update_parked.load(std::sync::atomic::Ordering::Acquire) {
                 break;
+            }
+            // A hold set since the text went in: no Enter. A re-press ends
+            // the presses, the first judged by its verification, as a
+            // guard's miss on one does.
+            if let Some(cut) = halted(
+                committed
+                    .is_some()
+                    .then_some((typed_keys, pasted_graphemes)),
+            ) {
+                if press_no > 0 {
+                    break;
+                }
+                return cut;
             }
             let base_block = commands_started(&term_lock(term));
             let window = deadline.min(Instant::now() + Duration::from_millis(submit_window_ms));
@@ -3399,20 +3864,46 @@ pub(crate) fn cmd_turn(
             // it separates a swallowed press (nothing moved — press again) from a
             // press the app consumed without starting a command block.
             let mut advanced = false;
+            // The composer verify's last read: the composer gone from the
+            // screen (a box or a menu took its place) rather than still
+            // holding the text.
+            let mut composer_gone = false;
             loop {
                 match wait_committed(id, window) {
                     Phase::Exited => return "ERR exited\n".to_string(),
                     Phase::Latched => {
                         advanced = true;
-                        if !submit_verify_block || commands_started(&term_lock(term)) > base_block {
+                        // The composer verify's read and the seq the next
+                        // wait arms past, under one lock: the composer
+                        // clearing between the two is that wait's latch.
+                        let mut read_at = None;
+                        if let Some(key) = composer_key.as_deref() {
+                            let (seen, seq) = {
+                                let t = term_lock(term);
+                                (composer_after_press(&t, key), t.content_seq())
+                            };
+                            read_at = Some(seq);
+                            match seen {
+                                ComposerAfterPress::Left => {
+                                    submitted = true;
+                                    break;
+                                }
+                                ComposerAfterPress::Gone => composer_gone = true,
+                                ComposerAfterPress::Holds => composer_gone = false,
+                                ComposerAfterPress::Unfinished => {}
+                            }
+                        } else if !submit_verify_block
+                            || commands_started(&term_lock(term)) > base_block
+                        {
                             submitted = true;
                             break;
                         }
-                        // block mode, ambient repaint only: keep waiting in-window.
+                        // block mode, ambient repaint only — or the composer
+                        // still holding the text: keep waiting in-window.
                         if Instant::now() >= window {
                             break;
                         }
-                        let after = term_lock(term).content_seq();
+                        let after = read_at.unwrap_or_else(|| term_lock(term).content_seq());
                         match arm(WatcherSpec::SeqAdvanced { after }) {
                             Some(nid) => id = nid,
                             None => return format!("ERR {WAITS_FULL}\n"),
@@ -3421,7 +3912,20 @@ pub(crate) fn cmd_turn(
                     // A committed park never ends on a hangup
                     // (`OnHangup::Finish`); were it to, the press is judged
                     // as one whose window closed, never abandoned unrecorded.
-                    Phase::Deadline | Phase::HungUp => break,
+                    // The composer verify reads the screen once more as the
+                    // window closes: its last word is the screen then, not
+                    // the last read a content advance woke.
+                    Phase::Deadline | Phase::HungUp => {
+                        if let Some(key) = composer_key.as_deref() {
+                            match composer_after_press(&term_lock(term), key) {
+                                ComposerAfterPress::Left => submitted = true,
+                                ComposerAfterPress::Gone => composer_gone = true,
+                                ComposerAfterPress::Holds => composer_gone = false,
+                                ComposerAfterPress::Unfinished => {}
+                            }
+                        }
+                        break;
+                    }
                 }
             }
             // AUTO degrade: the window expired with content moving after the press
@@ -3439,7 +3943,14 @@ pub(crate) fn cmd_turn(
             // would break this fn's "a press VERIFIABLY landed" contract.
             // Explicit `submit_verify=block` stays strict unconditionally:
             // soundness was asked for by name.
-            if !submitted && advanced && auto_mode && base_block == 0 {
+            if !submitted && advanced && auto_mode && base_block == 0 && composer_key.is_none() {
+                submitted = true;
+            }
+            // The composer verify's window closed on a screen whose composer
+            // the Enter took away (a menu or a box drawn over it, which no
+            // repaint of the logo does): the press landed, and another Enter
+            // would go to whatever took its place.
+            if !submitted && composer_gone {
                 submitted = true;
             }
             if submitted || Instant::now() >= deadline {
@@ -3452,17 +3963,26 @@ pub(crate) fn cmd_turn(
     // refused again, as the settle below gives its lane back.
     drop(committed);
 
-    // The submit VERIFIABLY landed: the one edge the presence rim ripples on
-    // (round 19). Posted once, here, after the verdict — never on the press.
+    // The submit VERIFIABLY landed: the lease's turn moved, so the needs
+    // border's facts are re-read (`Wake::LeaseChanged`). Posted once, here,
+    // after the verdict — never on the press.
+    // A turn that lands in a FINISHED worker opens its task again at once,
+    // unless the window harness typed it (`task_record::reopen_at_turn`).
     if submitted {
-        crate::presence::post_lease_changed(&ctx.self_id, true);
+        crate::presence::post_lease_changed(&ctx.self_id);
+        crate::task_record::reopen_at_turn(
+            ctx,
+            session,
+            &by,
+            task_found.map(|(_, entered)| entered),
+            subscribers,
+        );
     }
 
-    // The turn has typed its last key: the window may re-grid the session
-    // now — the band row the lease asked for is born HERE, inside the turn,
-    // where the settle below waits out the program's repaint of it — never
-    // between the caller's read and the paste, nor between the paste and the
-    // Enter. A turn typed under its own connection's drive lease keeps the
+    // The turn has typed its last key: the repaint nudge may resize the
+    // session now — HERE, inside the turn, where the settle below waits out
+    // the program's repaint — never between the caller's read and the paste,
+    // nor between the paste and the Enter. A turn typed under its own connection's drive lease keeps the
     // hold: its holder types on after it. A turn whose submit did not land
     // skips its settle below and releases the lease at once: ending its input
     // first would post a wake that could raise the row only for the release's
@@ -3479,10 +3999,13 @@ pub(crate) fn cmd_turn(
     // A caller that hangs up here gets its lane back at once (`wait` is
     // [`OnHangup::Abort`]), but its turn was typed and submitted, so it is
     // still recorded below, as `status=hangup`: the ledger is what `history`,
-    // the events digest and `aterm drive report` read back. The verdict says
+    // the events digest and the harness's report reader read back. The verdict says
     // `status=hangup` too.
     let mut status = "timeout";
-    if submitted || submit == "none" {
+    if settle_submitted && submitted {
+        // `settle=submitted`: the verified submit is the answer.
+        status = "submitted";
+    } else if submitted || submit == "none" {
         'settle: {
             // Default settle = GLOBAL idle: no content change for `idle_ms`, which
             // assumes the app stops painting when done. `settle=match:<re>` keys on a
@@ -3575,11 +4098,18 @@ pub(crate) fn cmd_turn(
             started_ms,
             dur_ms,
             submitted,
-            status,
+            // A turn answered at its submit awaited no settle: the ledger's word
+            // for an Enter that landed with nothing awaited after it.
+            status: if status == "submitted" {
+                crate::turn_ledger::STATUS_PRESSED
+            } else {
+                status
+            },
             text: crate::turn_ledger::clamp_text(text),
             screen_hash,
             seq,
             arch,
+            by,
             carried: false,
         };
         ledger.record(record, mint_turn_id)
@@ -3620,7 +4150,170 @@ pub(crate) fn cmd_turn(
         use std::fmt::Write as _;
         let _ = write!(verdict, " pressed={guarded_presses}");
     }
+    // A worker's turn names the task rev its Enter found: `await task
+    // @<sid>:<rev>` then answers on this turn's own done, even one that
+    // landed before the wait was armed. A session with no task, nothing.
+    if let Some((rev, _)) = task_found {
+        use std::fmt::Write as _;
+        let _ = write!(verdict, " task_rev={rev}");
+    }
+    // A turn into an agent names the verdict rev its Enter found: `await agent
+    // <words> since=<rev>` then answers on a verdict published after the
+    // submit, never the one before it. A session no agent is in, nothing.
+    if let Some(rev) = agent_found {
+        use std::fmt::Write as _;
+        let _ = write!(verdict, " agent_rev={rev}");
+    }
     super::control_query::frame_rows_reply(&screen, rows, &verdict, trim, 0)
+}
+
+/// The words in Claude Code's composer, every whitespace character dropped
+/// (a draft that wraps is cut at the composer's width, and each of its rows
+/// is read trimmed): the caret row between the composer's two rules down to
+/// its bottom rule ([`aterm_phase::phase::composer_rules`],
+/// [`aterm_phase::phase::composer_draft`]). Its DIM PLACEHOLDER is no words —
+/// a suggestion (`Try "…"`), `Press up to edit queued messages` — which keeps
+/// the cursor at column 2 of the caret row, where typing pushes it right
+/// ([`aterm_phase::phase::is_placeholder`]): a key of a few letters is no
+/// part of it once the Enter took the line. `None` where no framed composer
+/// is on the screen — a box or a menu over it, or another program.
+fn composer_words(t: &Terminal) -> Option<String> {
+    let rows: Vec<String> = (0..t.rows() as usize)
+        .map(|r| super::control_query::visible_row(t, r))
+        .collect();
+    aterm_phase::phase::composer_rules(&rows)?;
+    let (caret, lines) = aterm_phase::phase::composer_draft(&rows)?;
+    let cursor = t.cursor();
+    if usize::from(cursor.row) == caret
+        && aterm_phase::phase::is_placeholder(&rows, usize::from(cursor.col))
+    {
+        return Some(String::new());
+    }
+    Some(
+        lines
+            .concat()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect(),
+    )
+}
+
+/// Whether the session is an identified Claude Code: the agent verdict's
+/// reader ([`crate::session_timeline::AgentPublication::reader`]), which the
+/// composer verify needs.
+fn read_as_claude(ctx: &SessionCtx) -> bool {
+    match ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent()
+        .reader
+    {
+        Some(aterm_phase::Program::Claude) => true,
+        // The verify reads Claude Code's framed composer alone; every other
+        // agent's Enter stands on AUTO's `seq`, as before the verify.
+        Some(
+            aterm_phase::Program::Codex
+            | aterm_phase::Program::Agy
+            | aterm_phase::Program::Muse
+            | aterm_phase::Program::Gemini
+            | aterm_phase::Program::Generic,
+        )
+        | None => false,
+    }
+}
+
+/// What the composer verify reads of an identified Claude Code's screen as
+/// the Enter is about to be pressed ([`composer_verify_key`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ComposerKey {
+    /// Its framed composer shows the typed text: the KEY, that text with
+    /// every whitespace character dropped, verifies the Enter.
+    Shows(String),
+    /// Its framed composer does not show the text yet — the echo late — and
+    /// no `[Pasted text …]` chip stands for it: read again as the screen
+    /// moves, within the echo's cap.
+    NotYet,
+    /// No composer verify — AUTO's `seq` stands: no framed composer on the
+    /// screen, an empty text, or a paste Claude Code folded into a chip.
+    No,
+}
+
+/// THE COMPOSER VERIFY'S KEY in `t`, the screen of a session read as Claude
+/// Code ([`read_as_claude`]), for the typed `text` ([`ComposerKey`]).
+fn composer_verify_key(t: &Terminal, text: &str) -> ComposerKey {
+    let key: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let Some(shown) = composer_words(t) else {
+        return ComposerKey::No;
+    };
+    if key.is_empty() {
+        ComposerKey::No
+    } else if shown.contains(&key) {
+        ComposerKey::Shows(key)
+    } else if shown.contains("[Pastedtext") {
+        ComposerKey::No
+    } else {
+        ComposerKey::NotYet
+    }
+}
+
+/// THE COMPOSER VERIFY'S KEY, ITS ECHO WAITED FOR: `look()` reads the
+/// screen of a session read as Claude Code once — what
+/// [`composer_verify_key`] makes of it, and the content seq it stood at,
+/// under one lock — and `wait(after)` parks until the screen moves past
+/// `after` (`Ok(true)`) or the echo's cap ends (`Ok(false)`); `Err` is the
+/// reply that ends the turn (the session exited, no watcher free). A
+/// composer that does not show the text yet ([`ComposerKey::NotYet`]) is read
+/// again each time the screen moves, and one that shows it gives the key;
+/// nothing — AUTO's `seq` — where there is no composer to verify by, or the
+/// cap ends first.
+fn composer_key_once_shown(
+    mut look: impl FnMut() -> (ComposerKey, u64),
+    mut wait: impl FnMut(u64) -> Result<bool, String>,
+) -> Result<Option<String>, String> {
+    loop {
+        let (seen, after) = look();
+        match seen {
+            ComposerKey::Shows(key) => return Ok(Some(key)),
+            ComposerKey::No => return Ok(None),
+            ComposerKey::NotYet => {}
+        }
+        if !wait(after)? {
+            return Ok(None);
+        }
+    }
+}
+
+/// What a screen after the Enter says of the typed text ([`composer_after_press`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComposerAfterPress {
+    /// A framed composer that no longer holds it: Claude Code took the line
+    /// (the composer emptied, its placeholder back, the line queued above it).
+    Left,
+    /// No framed composer on the screen: a box or a menu took its place (a
+    /// slash command's), or a frame half drawn — judged at the window's
+    /// close, by the last read.
+    Gone,
+    /// The composer still holds it: the Enter has not landed (a repaint
+    /// elsewhere, Claude Code's animated logo), or it made a newline (an open
+    /// bracket).
+    Holds,
+    /// A frame the program has not finished drawing (an open DEC 2026
+    /// bracket, [`Terminal::sync_frame_unfinished`]): torn, so not judged.
+    Unfinished,
+}
+
+/// The composer verify's read of `t` after the Enter, for the key
+/// [`composer_verify_key`] took.
+fn composer_after_press(t: &Terminal, key: &str) -> ComposerAfterPress {
+    if t.sync_frame_unfinished() {
+        return ComposerAfterPress::Unfinished;
+    }
+    match composer_words(t) {
+        None => ComposerAfterPress::Gone,
+        Some(words) if words.contains(key) => ComposerAfterPress::Holds,
+        Some(_) => ComposerAfterPress::Left,
+    }
 }
 
 /// `history [<n>] [since=<id>]` -> the session's TURN LEDGER, newest-last, framed
@@ -3628,9 +4321,16 @@ pub(crate) fn cmd_turn(
 /// last n (default: all retained); `since=<id>` keeps records with id strictly
 /// greater than `<id>` (poll the ledger forward). Each record: `turn <id>
 /// submitted=<0|1> status=<..> started_ms=<..> dur_ms=<..> seq=<..> hash=<hex16>
-/// arch=<origin>:<last> text=<pct-encoded>` — the durable memory of what a driver
-/// typed and what settled, keyed by the same id the `turn` reply and events digest
-/// use. `arch=` is the alt-screen archive's mark when the turn started
+/// by=<harness|ctl|bridge|<sid>|-> arch=<origin>:<last> text=<pct-encoded>` — the
+/// durable memory of what a driver typed and what settled, keyed by the same id
+/// the `turn` reply and events digest use. `by=` names who typed it
+/// ([`crate::turn_ledger::TurnBy`]: this instance's window harness, an
+/// owner-token client, the fabric bridge, an edge-scoped caller's own sid, or
+/// `-` when no one can be named); `status=pressed` is an Enter written with
+/// nothing awaited after it: a text the window harness typed with `send` and
+/// submitted with `key enter` ([`ledger_typed_input`]), or a `turn
+/// settle=submitted`. `arch=` is the alt-screen archive's mark when
+/// the turn started
 /// ([`crate::turn_ledger::ArchMark`]): hand it to `offscreen since=` to read what a
 /// fullscreen app scrolled away since. It sits BEFORE `text=` because `text=` is
 /// the free-text tail every reader cuts a row at (aterm-link's hook splits on
@@ -3685,7 +4385,7 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
     out.push('\n');
     for r in recs {
         out.push_str(&format!(
-            "turn {} submitted={} status={} started_ms={} dur_ms={} seq={} hash={:016x} arch={}{} text={}\n",
+            "turn {} submitted={} status={} started_ms={} dur_ms={} seq={} hash={:016x} by={} arch={}{} text={}\n",
             r.id,
             u8::from(r.submitted),
             r.status,
@@ -3693,6 +4393,7 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
             r.dur_ms,
             r.seq,
             r.screen_hash,
+            super::pct_encode(r.by.as_wire()),
             r.arch,
             if r.carried { " carried=1" } else { "" },
             super::pct_encode(&r.text),
@@ -3707,9 +4408,9 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
 ///   title, reported cwd, lifecycle state) with the USER identity (`meta set`
 ///   fields) — `OK title=<pct> user_title=<pct|-> description=<pct|-> icon=<pct|->
 ///   role=<pct|-> attention=<pct|-> cwd=<pct|-> state=<s>`, then the additive
-///   tail `attention_owner= attention_owners= supervisor= questions= agent_cwd=
-///   autopilot= land_at=` (`land_at=`: the instant a timed Cruise lands, unix
-///   seconds, `-` while none). Every free-text value is pct-encoded so the reply is always
+///   tail `attention_owner= attention_owners= attention_kinds= supervisor=
+///   questions= agent_cwd= trusted_cwd= autopilot= land_at=` (`land_at=`: the
+///   instant a timed Cruise lands, unix seconds, `-` while none). Every free-text value is pct-encoded so the reply is always
 ///   ONE line; `-` marks an unset optional. Readers find a field BY KEY.
 ///   `autopilot=` is printed on EVERY bare `meta`, set or `-`: the supervisor's
 ///   loop reads the session's word only off a reply that names the field
@@ -3722,9 +4423,11 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
 ///   silent truncation (the caller must know its label was refused). C0/C1,
 ///   line separators, bidi controls, and spoof-relevant invisible format
 ///   characters are rejected rather than silently stored. The user title
-///   OUTRANKS the OSC title in tab labels. `role operator` designates the
-///   fleet operator to the menu-bar status item; a non-empty `attention` is
-///   the typed needs-human escalation it badges and lists. `questions` is a
+///   OUTRANKS the OSC title in tab labels; a role is a label the menus and
+///   the pill name the session by first, and no value elects anything; an
+///   `attention` entry that asks is the typed needs-human escalation the
+///   menu-bar status item badges and lists, and a `kind=wait` entry a
+///   record it does not badge (`crate::needs::of` reads which). `questions` is a
 ///   CLOSED set, not text: `ask|recommended|long-term|short-term` (case
 ///   folded, stored lowercase) — how the in-window supervisor treats this
 ///   session's Claude Code question dialog, over `[harness] answer_questions`
@@ -3748,16 +4451,36 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
 ///   `meta unset autopilot` to `[harness] autopilot`).
 ///
 /// Returns `(reply, changed)`: `changed` is `true` only when a stored value
-/// ACTUALLY moved — the dispatch arm keys its side-effects (tab-strip repaint
-/// wake + subscriber notify) on it, so a no-op re-set stays silent. The
-/// `meta-change` timeline record happens HERE (same change gate), so `timeline`
-/// and the `events` digest see exactly one event per real change.
+/// ACTUALLY moved — for `attention`, any entry moving, one under a newer
+/// entry included — and the dispatch arm keys its side-effects (tab-strip
+/// repaint wake, subscriber notify, the need's republish) on it, so a no-op
+/// re-set stays silent. The `meta-change` timeline record happens HERE, and
+/// only when the EFFECTIVE value moves
+/// ([`crate::session_timeline::apply_meta_value`]): `timeline` and the
+/// `events` digest see exactly one event per change a reader of the field
+/// can see, and none for an entry moving under a newer one.
+///
+/// A test's line: [`cmd_meta_by`] as a `ctl` client's.
+#[cfg(test)]
 pub(crate) fn cmd_meta(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
     session: u64,
     ctx: &SessionCtx,
     rest: &str,
+) -> (String, bool) {
+    cmd_meta_by(term, store, session, ctx, rest, aterm_slog::Actor::Ctl)
+}
+
+/// [`cmd_meta`], each write's session log mark by `by` (the wire's
+/// [`log_actor`]; session log phase 3B).
+pub(crate) fn cmd_meta_by(
+    term: &Arc<Mutex<Terminal>>,
+    store: &Store,
+    session: u64,
+    ctx: &SessionCtx,
+    rest: &str,
+    by: aterm_slog::Actor,
 ) -> (String, bool) {
     let mut toks = rest.split_whitespace();
     match toks.next() {
@@ -3778,32 +4501,42 @@ pub(crate) fn cmd_meta(
                 .split_once("set")
                 .and_then(|(_, r)| r.trim_start().split_once(char::is_whitespace))
                 .map_or("", |(_, v)| v);
-            // KEYED ATTENTION: `meta set attention owner=<k> <text>` writes only
-            // owner `<k>`'s entry. The owner LEADS, like every option on this
-            // wire, so a bare text that merely contains `owner=` stays text.
+            // KEYED ATTENTION: `meta set attention owner=<k> [kind=<ask|wait>]
+            // <text>` writes only owner `<k>`'s entry, of that kind. The owner
+            // LEADS, like every option on this wire, so a bare text that merely
+            // contains `owner=` stays text; `kind=` comes only after it.
             // A TIMED CRUISE (§9.3.5): `cruise until=<when>` writes the word
             // and its instant as one; any other autopilot value is a hand
             // write of the word, which drops a timer, the same word included.
             if typed == MetaField::Autopilot
-                && let Some(reply) = meta_set_autopilot_until(ctx, value)
+                && let Some(reply) = meta_set_autopilot_until(ctx, value, by)
             {
                 return reply;
             }
-            if typed == MetaField::Attention
-                && let Some((owner, text)) = leading_attention_owner(value)
-            {
-                return match owner {
-                    Ok(owner) => {
-                        attention_owned_reply(crate::session_timeline::write_attention_owned(
-                            ctx,
-                            owner,
-                            MetaEdit::Set(text),
-                        ))
-                    }
-                    Err(refusal) => (refusal, false),
-                };
+            if typed == MetaField::Attention {
+                if let Some((owner, text)) = leading_attention_owner(value) {
+                    return match owner.and_then(|owner| {
+                        leading_attention_kind(text).map(|(kind, text)| (owner, kind, text))
+                    }) {
+                        Ok((owner, kind, text)) => {
+                            attention_owned_reply(crate::session_timeline::write_attention_kind(
+                                ctx,
+                                owner,
+                                MetaEdit::Set(text),
+                                kind,
+                                by,
+                            ))
+                        }
+                        Err(refusal) => (refusal, false),
+                    };
+                }
+                // A kind names a keyed entry's: the bare entry is a person's
+                // ask, so `kind=` there is a usage error, never stored text.
+                if value.trim_start().starts_with("kind=") {
+                    return (attention_set_usage(), false);
+                }
             }
-            match write_session_meta(ctx, typed, MetaEdit::Set(value)) {
+            match write_session_meta(ctx, typed, MetaEdit::Set(value), by) {
                 Ok(changed) => ("OK\n".to_string(), changed),
                 // On the wire `meta set title ""` is a USAGE ERROR, never a
                 // clear: clearing has its own explicit `meta unset` form. A
@@ -3852,14 +4585,19 @@ pub(crate) fn cmd_meta(
                     );
                 }
                 return match owner {
-                    Ok(owner) => attention_owned_reply(
-                        crate::session_timeline::write_attention_owned(ctx, owner, MetaEdit::Clear),
-                    ),
+                    Ok(owner) => {
+                        attention_owned_reply(crate::session_timeline::write_attention_owned(
+                            ctx,
+                            owner,
+                            MetaEdit::Clear,
+                            by,
+                        ))
+                    }
                     Err(refusal) => (refusal, false),
                 };
             }
             // A clear has no validation ladder to run, so it applies directly.
-            let changed = apply_meta_value(ctx, field, None);
+            let changed = apply_meta_value(ctx, field, None, by);
             ("OK\n".to_string(), changed)
         }
         Some(_) => (
@@ -3890,7 +4628,11 @@ pub(crate) fn cmd_meta(
 ///
 /// Owner-only by the field's gate ([`meta_questions_denied`], answered
 /// before this): `until=` rides the `autopilot` field.
-fn meta_set_autopilot_until(ctx: &SessionCtx, value: &str) -> Option<(String, bool)> {
+fn meta_set_autopilot_until(
+    ctx: &SessionCtx,
+    value: &str,
+    by: aterm_slog::Actor,
+) -> Option<(String, bool)> {
     use crate::autopilot_timers::{local_offset_at, parse_when, resolve, wall_ms};
     let mut until: Vec<&str> = Vec::new();
     let mut word: Vec<&str> = Vec::new();
@@ -3931,6 +4673,7 @@ fn meta_set_autopilot_until(ctx: &SessionCtx, value: &str) -> Option<(String, bo
         ctx,
         Some(aterm_agent::supervise::Autopilot::Cruise.word().to_string()),
         Some(resolved.at_ms),
+        by,
     );
     Some((
         format!(
@@ -3974,6 +4717,30 @@ fn leading_attention_owner(value: &str) -> Option<(Result<&str, String>, &str)> 
     }
 }
 
+/// `ERR usage: meta set attention owner=<k> [kind=ask|wait] <text...>`.
+fn attention_set_usage() -> String {
+    "ERR usage: meta set attention owner=<k> [kind=ask|wait] <text...>\n".to_string()
+}
+
+/// A LEADING `kind=<ask|wait>` token on a keyed attention text (after its
+/// `owner=`), and the text after it: `Ok((None, text))` when the text does
+/// not lead with one, `Err` (the usage line) for a kind outside the closed
+/// set.
+fn leading_attention_kind(
+    text: &str,
+) -> Result<(Option<aterm_types::needs::AttentionKind>, &str), String> {
+    let trimmed = text.trim_start();
+    let (head, rest) = trimmed
+        .split_once(char::is_whitespace)
+        .unwrap_or((trimmed, ""));
+    match head.strip_prefix("kind=") {
+        None => Ok((None, text)),
+        Some(word) => aterm_types::needs::AttentionKind::parse(word)
+            .map(|kind| (Some(kind), rest))
+            .ok_or_else(attention_set_usage),
+    }
+}
+
 /// The reply for a keyed attention write, worded like the bare field's.
 fn attention_owned_reply(
     result: Result<bool, crate::session_timeline::AttentionWriteError>,
@@ -3988,10 +4755,7 @@ fn attention_owned_reply(
             MetaWriteError::Empty
             | MetaWriteError::NotAQuestionsPolicy
             | MetaWriteError::NotAnAutopilot,
-        )) => (
-            "ERR usage: meta set attention owner=<k> <text...>\n".to_string(),
-            false,
-        ),
+        )) => (attention_set_usage(), false),
         Err(AttentionWriteError::Meta(MetaWriteError::ForbiddenFormatting)) => (
             "ERR attention must be single-line and contain no control, bidi, or invisible formatting characters\n"
                 .to_string(),
@@ -4051,6 +4815,7 @@ pub(crate) fn cmd_meta_supervisor(
         return Some(("ERR denied\n".to_string(), false));
     }
     let now = crate::metrics::now_us();
+    let by = log_actor(scope, ctx);
     if sub == "unset" {
         let holder = match toks.next() {
             None => None,
@@ -4063,8 +4828,8 @@ pub(crate) fn cmd_meta_supervisor(
             return Some((USAGE.to_string(), false));
         }
         let changed = match holder {
-            Some(h) => crate::session_timeline::release_supervisor_held_by(ctx, h, now),
-            None => crate::session_timeline::release_supervisor(ctx, None, now),
+            Some(h) => crate::session_timeline::release_supervisor_held_by(ctx, h, now, by),
+            None => crate::session_timeline::release_supervisor(ctx, None, now, by),
         };
         return Some(("OK\n".to_string(), changed));
     }
@@ -4098,8 +4863,9 @@ pub(crate) fn cmd_meta_supervisor(
         prove(holder)
     };
     let proof = proven.clone();
-    match crate::session_timeline::claim_supervisor_as(ctx, holder, bound, expires_us, proven, now)
-    {
+    match crate::session_timeline::claim_supervisor_as(
+        ctx, holder, bound, expires_us, proven, now, by,
+    ) {
         Ok(claimed) => {
             if bound.is_some() {
                 super::note_connection_claim();
@@ -4136,10 +4902,15 @@ pub(crate) fn cmd_meta_supervisor(
 /// act is one `harness-act` row on the session's timeline (`act=<act>
 /// holder=<holder>`) and `status last_act=<act>`; it counts as a change, so
 /// a proven claim's record copy is read again with it
-/// ([`crate::self_claim::meta_changed`]).
+/// ([`crate::self_claim::meta_changed`]). In the same timeline hold, the
+/// session log's `act` mark by `by`, the connection's actor ([`log_actor`]),
+/// for an act the log has a word for (plan 5C-2): its wake is taken in that
+/// hold, and the caller's change wake (`serve_meta`'s `on_change`, which a
+/// recorded act always runs) notifies the subscribers after release.
 pub(crate) fn cmd_meta_harness_act(
     ctx: &SessionCtx,
     conn: Option<u64>,
+    by: aterm_slog::Actor,
     prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
     rest: &str,
 ) -> Option<(String, bool)> {
@@ -4189,10 +4960,12 @@ pub(crate) fn cmd_meta_harness_act(
     {
         return Some(("ERR denied\n".to_string(), false));
     }
-    ctx.timeline
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .note_harness_act(act, &holder);
+    {
+        let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        timeline.note_harness_act(act, &holder, by);
+        // Owed or not, the change wake below notifies (`changed` is true).
+        let _ = timeline.slog_take_wake();
+    }
     Some(("OK\n".to_string(), true))
 }
 
@@ -4273,20 +5046,22 @@ fn meta_status(
         Some(v) => pct_encode(v),
     };
     // After `state=`, additive: which owner's entry `attention=` shows (the bare
-    // owner prints `%2D` by the rule above), how many owners hold one, the
-    // live supervisor, the session's question policy word (2026-09-24), the
-    // foreground program's own working directory (2026-09-27), and the
-    // session's Autopilot word (2026-10-15; ALWAYS named, `-` while unset: the
-    // supervisor's loop reads the word only off a reply that names it), and
-    // after it the instant a timed Cruise lands (`land_at=`, unix seconds,
-    // 2026-10-16; `-` while unset) — each appended LAST: every in-tree reader
-    // keys, none counts. Beside `supervisor=`, `supervisor_proven=<0|1>`
-    // (2026-10-16): whether the live claim is a PROVEN self-claim
-    // ([`crate::self_claim`]), the pair the self-claim contract names (§1).
+    // owner prints `%2D` by the rule above), how many owners hold one, each
+    // entry's kind (2026-10-16, `kind=`), the live supervisor, the session's question policy word (2026-09-24), the
+    // foreground program's own working directory (2026-09-27), the one
+    // folder a worker's starter trusted for it (2026-10-15, `spawn agent=`),
+    // the session's Autopilot word (2026-10-15; ALWAYS named, `-` while
+    // unset: the supervisor's loop reads the word only off a reply that names
+    // it), and after it the instant a timed Cruise lands (`land_at=`, unix
+    // seconds, 2026-10-16; `-` while unset) — each appended LAST: every
+    // in-tree reader keys, none counts. Beside `supervisor=`,
+    // `supervisor_proven=<0|1>` (2026-10-16): whether the live claim is a
+    // PROVEN self-claim ([`crate::self_claim`]), the pair the self-claim
+    // contract names (§1).
     format!(
         "OK title={} user_title={} description={} icon={} role={} attention={} cwd={} state={state} \
-         attention_owner={} attention_owners={} supervisor={} supervisor_proven={} questions={} \
-         agent_cwd={} autopilot={} land_at={}\n",
+         attention_owner={} attention_owners={} attention_kinds={} supervisor={} supervisor_proven={} \
+         questions={} agent_cwd={} trusted_cwd={} autopilot={} land_at={}\n",
         pct_encode(&title),
         opt(meta.user_title.as_deref()),
         opt(meta.description.as_deref()),
@@ -4296,13 +5071,29 @@ fn meta_status(
         opt(cwd.as_deref()),
         opt(attention_owner(&meta)),
         attention_owners(&meta),
+        attention_kinds(&meta),
         opt(meta.live_supervisor(crate::metrics::now_us())),
         u8::from(meta.supervisor_proven(crate::metrics::now_us())),
         opt(meta.questions.as_deref()),
         opt(agent_cwd.as_deref()),
+        opt(meta.trusted_cwd.as_deref()),
         opt(meta.autopilot.as_deref()),
         crate::autopilot::land_at_field(meta.land_at),
     )
+}
+
+/// `attention_kinds=`: each entry's kind by owner, in write order
+/// (`AttentionOwners::kinds_field`); a meta seeded as a value and never keyed
+/// holds the bare owner's implicit ask.
+fn attention_kinds(meta: &crate::session_timeline::SessionMeta) -> String {
+    if meta.attention_owners.is_empty() && meta.attention.is_some() {
+        return format!(
+            "{}:{}",
+            aterm_types::needs::AttentionKind::Ask.word(),
+            crate::session_timeline::BARE_ATTENTION_OWNER
+        );
+    }
+    meta.attention_owners.kinds_field()
 }
 
 /// The owner of the entry `attention=` shows. A meta whose attention was
@@ -4685,13 +5476,15 @@ impl Drop for DriftSlot {
 /// with both released: a replay never holds the engine or the recorder. At
 /// most [`CAST_DRIFT_CONCURRENCY`] analyses fold at once in the instance; a
 /// request that waits [`CAST_DRIFT_SLOT_WAIT`] for a slot is answered `ERR
-/// busy`. `policy` is the session's resize seam
-/// ([`crate::app_render::pty_resize_policy`]), asked by the caller before any
-/// lock. Served on a wait lane (`is_wait_request`), never the main thread.
+/// busy`. `policy` is the session's console-host posture: its resize seam
+/// ([`crate::app_render::pty_resize_policy`]) and, under OpenConsole, the host's
+/// alternate-screen resync (`crate::alt_screen_resync`), asked by the caller
+/// before any lock. Served on a wait lane (`is_wait_request`), never the main
+/// thread.
 pub(crate) fn cmd_cast_drift(
     term: &Arc<Mutex<Terminal>>,
     cast: &Mutex<crate::cast::CastRecorder>,
-    policy: aterm_core::grid::ResizePolicy,
+    policy: impl Into<aterm_control::cast_drift::Posture>,
     rest: &str,
 ) -> String {
     cast_drift_with(term, cast, policy, rest, &|d| std::thread::sleep(d))
@@ -4702,7 +5495,7 @@ pub(crate) fn cmd_cast_drift(
 fn cast_drift_with(
     term: &Arc<Mutex<Terminal>>,
     cast: &Mutex<crate::cast::CastRecorder>,
-    policy: aterm_core::grid::ResizePolicy,
+    policy: impl Into<aterm_control::cast_drift::Posture>,
     rest: &str,
     settle: &dyn Fn(std::time::Duration),
 ) -> String {
@@ -5278,11 +6071,12 @@ pub(super) fn raise_target(store: &Store, rest: &str) -> Result<u64, String> {
 }
 
 /// `raise <sid>` -> raise the window hosting that session and select its tab —
-/// the wire twin of the menu Show / map Enter (design §6; no shipping verb can
-/// do this: `tab` drives only the front window, `focus` is a PTY focus event).
-/// Owner-only. Main-thread hop like `spawn` (window/tab state is `App`-owned):
-/// the event loop runs the `OperatorAction::Show` switch+focus shape for the
-/// resolved session and reports whether any window hosts it.
+/// the wire twin of the status item's Go / map Enter (design §6; no shipping
+/// verb can do this: `tab` drives only the front window, `focus` is a PTY
+/// focus event). Owner-only. Main-thread hop like `spawn` (window/tab state is
+/// `App`-owned): the event loop runs the status item's Go switch+focus shape
+/// (`App::focus_session_window`) for the resolved session and reports whether
+/// any window hosts it.
 pub(crate) fn cmd_raise(
     proxy: &EventLoopProxy<Wake>,
     store: &Store,
@@ -5430,6 +6224,164 @@ pub(crate) fn caller_actor_of(scope: Scope, target: Option<&SessionCtx>) -> Exit
                     .map(|src| ExitActor::Sid(src.as_str().to_string()))
             })
             .unwrap_or(ExitActor::Unknown),
+        // A fleet peer is another machine's reader, no session here and no
+        // local caller; the fleet gate admits no verb that writes a ledger.
+        #[cfg(any(unix, test))]
+        Scope::Fleet { .. } => ExitActor::Unknown,
+    }
+}
+
+/// The turn ledger's `by=` for a `turn` from this connection ([`TurnIo::by`]),
+/// from the scope and the driver the dispatch already resolved from it (an
+/// edge's source in the target's table, `crate::control::turn_driver`): the
+/// caller the exits ledger would name ([`caller_actor`]), so the two ledgers
+/// attribute a connection in the same words — `ctl` for an owner-token
+/// client, `bridge` for the fabric bridge, an edge-scoped caller's own sid,
+/// `-` for an edge whose grant is not in the target's table. Whether the
+/// caller is the window harness is the turn's to say ([`typed_by`]).
+pub(crate) fn turn_by(scope: Scope, driver: Option<&SessionId>) -> TurnBy {
+    match scope {
+        Scope::Owner => TurnBy::Ctl,
+        #[cfg(any(unix, test))]
+        Scope::Bridge => TurnBy::Bridge,
+        Scope::Edge(_) => {
+            driver.map_or(TurnBy::Unknown, |sid| TurnBy::Sid(sid.as_str().to_string()))
+        }
+        // A fleet peer names no caller here, and the fleet gate admits no
+        // verb that types a turn ([`caller_actor`]'s arm says the same).
+        #[cfg(any(unix, test))]
+        Scope::Fleet { .. } => TurnBy::Unknown,
+    }
+}
+
+/// Who typed a turn whose caller is `caller` ([`TurnIo::by`]) and that types
+/// under `under`, the drive lease its own connection holds as it begins (the
+/// one it hands back as it ends): an owner-token turn under THIS process's
+/// window harness's hand ([`crate::harness_host::holder`], the lease the
+/// harness's upgrade and relaunch lanes take a tab by for every line they
+/// type — the live upgrade's notice and release, a relaunched agent's
+/// continuation) is the harness's. This is
+/// the rule by which the presence band reads aterm's own hand (ruling 313:
+/// an Owner-token turn whose lease hands back to that hand), so the band and
+/// the ledger agree on which turns are aterm's. Only an owner-token caller is
+/// refined: an edge-scoped connection is its own sid whatever its lease is
+/// named, and the bridge is the bridge — a holder name is never authority.
+pub(crate) fn typed_by(caller: &TurnBy, under: Option<&crate::Lease>) -> TurnBy {
+    let harness_hand = matches!(under, Some(crate::Lease::Drive { holder, .. })
+        if *holder == crate::harness_host::holder());
+    match caller {
+        TurnBy::Ctl if harness_hand => TurnBy::Harness,
+        other => other.clone(),
+    }
+}
+
+/// A TEXT THE WINDOW HARNESS TYPES WITH `send` AND SUBMITS WITH `key enter`,
+/// INTO THE LEDGER ([`crate::turn_ledger::STATUS_PRESSED`]): wherever the
+/// host fences `send`, the turn-end loop's continuation, done check and
+/// answers go out so (`aterm-agent`'s `Session::type_fenced`), never as a
+/// `turn`, and they are the harness's turns all the same. Called with every
+/// input verb's reply (`verb`, its arguments past the leading options, the
+/// reply), it keeps the books by two rules:
+///
+/// * a `send` this process's harness wrote ([`typed_by`]: an owner-token
+///   caller whose connection holds the harness's hand) is kept as the text it
+///   typed ([`crate::turn_ledger::TurnLedger::typed`]), and the `key enter`
+///   that connection writes next records it: `by=harness`, `status=pressed`,
+///   `submitted=1`, `hash=` the screen as the Enter left it, by the hash
+///   `cmd_turn` takes;
+/// * any other write that WROTE (an `OK` that is no skip) — another key, a
+///   turn, a paste, anyone else's — ends the text unrecorded, as does the
+///   hand's release ([`cmd_lease`]): only the Enter right behind the text
+///   submits it. A write that wrote nothing changes nothing (the hand refuses
+///   every other connection's).
+///
+/// Anyone else's `send` and `key` record nothing: a raw driver's line is no
+/// turn here. `feed-bin` and `paste-bin` are served before this seam; the
+/// harness's Enter is fenced on a read that shows its text in the composer,
+/// so neither can pass for it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the dispatch's resolved request and its reply, as every arm takes them"
+)]
+pub(crate) fn ledger_typed_input(
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &SessionCtx,
+    scope: Scope,
+    verb: &str,
+    rest: &str,
+    reply: &str,
+    subscribers: &crate::subscribe::Subscribers,
+    session: u64,
+) {
+    let wrote = reply.starts_with("OK") && !reply.starts_with("OK skipped");
+    let input = matches!(
+        verb,
+        "send" | "key" | "ctrl" | "feed" | "mouse" | "paste" | "turn"
+    );
+    if !wrote || !input {
+        return;
+    }
+    // The harness's own connection, while it holds the hand.
+    let harness = super::serving_connection().filter(|&conn| {
+        let lease = ctx.turn_lease.lock().unwrap_or_else(|p| p.into_inner());
+        let own = lease
+            .as_ref()
+            .filter(|l| l.held_over(crate::metrics::now_us(), Some(conn)));
+        typed_by(&turn_by(scope, None), own) == TurnBy::Harness
+    });
+    // What a record reads off the terminal is read before the ledger's lock,
+    // never under it.
+    let turns = || ctx.turns.lock().unwrap_or_else(|p| p.into_inner());
+    match harness {
+        Some(conn) if verb == "send" => {
+            let arch = crate::turn_ledger::ArchMark::of(&term_lock(term));
+            turns().typed(crate::turn_ledger::Typed {
+                conn,
+                text: crate::turn_ledger::clamp_text(rest),
+                started_ms: crate::turn_ledger::now_ms(),
+                arch,
+            });
+        }
+        Some(conn) if verb == "key" && rest.trim() == "enter" => {
+            let (seq, screen_hash) = {
+                let t = term_lock(term);
+                let hash = aterm_hash::fnv1a_64(super::screen_text(&t).as_bytes());
+                (t.content_seq(), hash)
+            };
+            let recorded = {
+                let mut turns = turns();
+                match turns.take_typed() {
+                    Some(typed) if typed.conn == conn => {
+                        let record = crate::turn_ledger::TurnRecord {
+                            id: mint_turn_id(),
+                            started_ms: typed.started_ms,
+                            dur_ms: crate::turn_ledger::now_ms().saturating_sub(typed.started_ms),
+                            submitted: true,
+                            status: crate::turn_ledger::STATUS_PRESSED,
+                            text: typed.text,
+                            screen_hash,
+                            seq,
+                            arch: typed.arch,
+                            by: TurnBy::Harness,
+                            carried: false,
+                        };
+                        turns.record(record, mint_turn_id);
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            // The `events` digest scans the fresh record now, as after a `turn`.
+            if recorded && subscribers.any() {
+                subscribers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .notify(session);
+            }
+        }
+        _ => {
+            turns().take_typed();
+        }
     }
 }
 
@@ -5462,6 +6414,10 @@ pub(crate) fn log_actor(scope: Scope, target: &SessionCtx) -> aterm_slog::Actor 
             .src_of(&presented)
             .and_then(|src| crate::session_log::sid_actor(src.as_str()))
             .unwrap_or(Actor::Nobody),
+        // A fleet peer is another machine's reader, no session here and no
+        // local caller; the fleet gate admits no verb that opens a turn.
+        #[cfg(any(unix, test))]
+        Scope::Fleet { .. } => Actor::Nobody,
     }
 }
 
@@ -5486,6 +6442,15 @@ pub(crate) fn cmd_whoami(ctx: &SessionCtx, scope: Scope) -> String {
                 None => "edge unauthorized".to_string(),
             }
         }
+        // Unreachable through the fleet gate (`whoami` is no fleet verb), and
+        // named for what it is should that ever change.
+        #[cfg(any(unix, test))]
+        Scope::Fleet { content, .. } => if content {
+            "fleet content"
+        } else {
+            "fleet facts"
+        }
+        .to_string(),
     };
     format!("OK {} {} {}\n", ctx.self_id.as_str(), ctx.nonce.to_hex(), s)
 }
@@ -5558,6 +6523,7 @@ mod tests {
                 screen_hash: i,
                 seq: i,
                 arch: ArchMark { origin: 7, last: i },
+                by: TurnBy::Ctl,
                 carried: i.is_multiple_of(2),
             });
             h.ctx
@@ -5813,9 +6779,9 @@ mod tests {
             rewrap_gauge: std::sync::Arc::default(),
             human_input: Default::default(),
             launch: Default::default(),
-            generation_look: Default::default(),
             reset_lane: Default::default(),
             crash_journal: Default::default(),
+            typed: Default::default(),
             update_parked: Default::default(),
             witness: Default::default(),
             fenced_writes: Default::default(),
@@ -5846,10 +6812,11 @@ mod tests {
     /// The published program / agent columns, `human_ms=` (2026-09-24), the
     /// typed `role=`/`attention=`/`user_title=` (2026-09-25), `supervisor=`
     /// (2026-09-23), `autopilot=` (2026-10-15), the owner's columns and the
-    /// harness's `land_at=`/`task=` after them (2026-10-16), elided by
+    /// harness's `land_at=`/`task=`/`pause=` after them (2026-10-16), and the
+    /// task record's `task_state=`/`task_rev=` (2026-10-15) last, elided by
     /// [`tail`] and pinned on their own by
     /// [`the_roster_carries_the_published_program_and_agent_verdict`].
-    const AGENT_COLUMNS: [&str; 18] = [
+    const AGENT_COLUMNS: [&str; 21] = [
         "program=",
         "agent=",
         "agent_detail=",
@@ -5868,6 +6835,9 @@ mod tests {
         "upgrade=",
         "land_at=",
         "task=",
+        "pause=",
+        "task_state=",
+        "task_rev=",
     ];
 
     /// The tail every line carries, after the sid and with the per-launch
@@ -5940,7 +6910,7 @@ mod tests {
         let h = handle(0, &t0);
         {
             let mut m = h.ctx.meta.lock().unwrap();
-            m.set("role", Some("operator".into()));
+            m.set("role", Some("reviewer".into()));
             m.set("attention", Some("stuck on CI".into()));
             m.set("title", Some("my build".into()));
         }
@@ -5953,11 +6923,330 @@ mod tests {
         let line = out.lines().nth(1).unwrap();
         assert!(
             line.contains(
-                " role=operator attention=stuck%20on%20CI user_title=my%20build supervisor="
+                " role=reviewer attention=stuck%20on%20CI user_title=my%20build supervisor="
             ),
             "{line}"
         );
         assert!(line.contains(" meta=1 "), "{line}");
+    }
+
+    /// THE TASK RECORD IN THE ROSTER (2026-10-15): one `sessions` read tells a
+    /// manager which of its workers has news — `task_state=<state>
+    /// task_rev=<n>` closing every row, `-`/`0` for a session with no task,
+    /// after `task=`, the task's face under Land (`-` with no live claim).
+    #[test]
+    fn the_roster_carries_each_sessions_task_record() {
+        use crate::task_record::{TaskMark, TaskState, mark_session_task};
+        let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let (worker, shell) = (handle(0, &t0), handle(1, &t0));
+        let subscribers = crate::subscribe::new_registry();
+        mark_session_task(
+            &worker.ctx,
+            0,
+            &TaskMark::new(TaskState::Working),
+            &subscribers,
+        )
+        .expect("unfenced");
+        mark_session_task(
+            &worker.ctx,
+            0,
+            &TaskMark::new(TaskState::Done),
+            &subscribers,
+        )
+        .expect("unfenced");
+        let out = sessions_lines(
+            &[worker, shell],
+            Ok(&[]),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
+        let rows: Vec<&str> = out.lines().skip(1).collect();
+        assert!(
+            rows[0].ends_with(" task=- pause=- task_state=done task_rev=2"),
+            "{out}"
+        );
+        assert!(
+            rows[1].ends_with(" task=- pause=- task_state=- task_rev=0"),
+            "{out}"
+        );
+    }
+
+    /// Three registered workers, each marked `working` (rev 1).
+    fn three_workers(
+        store: &Store,
+        subscribers: &crate::subscribe::Subscribers,
+    ) -> Vec<SessionHandle> {
+        use crate::task_record::{TaskMark, TaskState, mark_session_task};
+        let workers: Vec<SessionHandle> = (1..=3).map(crate::session_store::test_handle).collect();
+        for worker in &workers {
+            store.write().unwrap().register(worker.clone());
+            mark_session_task(
+                &worker.ctx,
+                worker.local_id,
+                &TaskMark::new(TaskState::Working),
+                subscribers,
+            )
+            .expect("unfenced");
+        }
+        workers
+    }
+
+    /// The header and the `state=` of each row of an `await task` reply.
+    fn task_reply(reply: &str) -> (&str, Vec<&str>) {
+        let mut lines = reply.lines();
+        let header = lines.next().expect("a header");
+        let states = lines
+            .map(|row| {
+                row.split_whitespace()
+                    .find_map(|t| t.strip_prefix("state="))
+                    .expect("state=")
+            })
+            .collect();
+        (header, states)
+    }
+
+    /// `await task` is EDGE-TRIGGERED on each target's rev and combines with
+    /// `any`/`all`: news past a target's since answers (`any`) at once; the
+    /// same news does not answer a wait re-armed with the rev it was read at,
+    /// nor one armed without a since (the rev at arm); `since=0` takes news
+    /// from before the wait; `all` waits for the last worker; and with no
+    /// news the deadline answers every row under `status=timeout`. The short
+    /// deadlines are the expected timeouts, never a latency budget.
+    #[test]
+    fn await_task_answers_news_past_each_targets_rev_once() {
+        use crate::task_record::{Combine, TaskMark, TaskState, mark_session_task};
+        let store = crate::session_store::new_store();
+        let subscribers = crate::subscribe::new_registry();
+        let workers = three_workers(&store, &subscribers);
+        let wait = |since: [Option<u64>; 3], combine: Combine, timeout_ms: u64| {
+            let targets: Vec<TaskTarget<'_>> = workers
+                .iter()
+                .zip(since)
+                .map(|(w, since)| TaskTarget {
+                    local_id: w.local_id,
+                    ctx: &w.ctx,
+                    since,
+                })
+                .collect();
+            await_task(&store, &targets, combine, timeout_ms, &subscribers)
+        };
+        let quiet = wait([None; 3], Combine::Any, 20);
+        assert_eq!(
+            task_reply(&quiet),
+            ("OK 3 status=timeout", vec!["working"; 3]),
+            "{quiet}"
+        );
+        assert!(
+            quiet.contains(&format!(
+                "@{} rev=1 state=working agent=- attention=- result_bytes=0\n",
+                workers[0].sid.as_str()
+            )),
+            "{quiet}"
+        );
+
+        let mut done = TaskMark::new(TaskState::Done);
+        done.result_bytes = 64;
+        mark_session_task(&workers[1].ctx, 2, &done, &subscribers).expect("unfenced");
+        let any = wait([Some(1); 3], Combine::Any, 60_000);
+        assert_eq!(
+            task_reply(&any),
+            ("OK 3", vec!["working", "done", "working"])
+        );
+        assert!(
+            any.contains(" rev=2 state=done agent=- attention=- result_bytes=64\n"),
+            "{any}"
+        );
+        // NEGATIVE CONTROLS: `all` still waits on two; re-armed with the rev
+        // each was read at, and armed with none, the same news is no news.
+        for (since, combine) in [
+            ([Some(1); 3], Combine::All),
+            ([Some(1), Some(2), Some(1)], Combine::Any),
+            ([None; 3], Combine::Any),
+        ] {
+            let again = wait(since, combine, 20);
+            assert_eq!(
+                task_reply(&again).0,
+                "OK 3 status=timeout",
+                "{since:?}: {again}"
+            );
+        }
+        // `since=0`: news from before the wait counts.
+        assert_eq!(
+            task_reply(&wait([Some(0); 3], Combine::Any, 60_000)).0,
+            "OK 3"
+        );
+
+        let mut stalled = TaskMark::new(TaskState::Stalled);
+        stalled.why = Some("startup");
+        mark_session_task(&workers[0].ctx, 1, &stalled, &subscribers).expect("unfenced");
+        let mut exited = TaskMark::new(TaskState::Exited);
+        exited.exit = Some(1);
+        mark_session_task(&workers[2].ctx, 3, &exited, &subscribers).expect("unfenced");
+        let all = wait([Some(1); 3], Combine::All, 60_000);
+        assert_eq!(
+            task_reply(&all),
+            ("OK 3", vec!["stalled", "done", "exited"])
+        );
+    }
+
+    /// A parked `await task` is woken by the mark itself (the subscriber
+    /// notify), and the supervisor's attention on a working worker is news;
+    /// a session that closed while waited on answers `state=closed`. The
+    /// 60 s deadlines are hang detectors: each wait must end on its event.
+    #[test]
+    fn await_task_wakes_on_a_mark_attention_and_a_close() {
+        use crate::session_store::SessionState;
+        use crate::session_timeline::{MetaEdit, write_attention_owned};
+        use crate::task_record::{Combine, TaskMark, TaskState, mark_session_task};
+        let store = crate::session_store::new_store();
+        let subscribers = crate::subscribe::new_registry();
+        let workers = three_workers(&store, &subscribers);
+        let one = |worker: &SessionHandle, since: u64| {
+            await_task(
+                &store,
+                &[TaskTarget {
+                    local_id: worker.local_id,
+                    ctx: &worker.ctx,
+                    since: Some(since),
+                }],
+                Combine::Any,
+                60_000,
+                &subscribers,
+            )
+        };
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| one(&workers[0], 1));
+            let parked = std::time::Instant::now();
+            while !subscribers.any() {
+                assert!(
+                    parked.elapsed() < std::time::Duration::from_secs(60),
+                    "the waiter never parked"
+                );
+                std::thread::yield_now();
+            }
+            mark_session_task(
+                &workers[0].ctx,
+                1,
+                &TaskMark::new(TaskState::Done),
+                &subscribers,
+            )
+            .expect("unfenced");
+            let reply = waiter.join().expect("the waiter");
+            assert_eq!(task_reply(&reply), ("OK 1", vec!["done"]), "{reply}");
+        });
+        // The harness escalates on a working worker: its rev moves and the
+        // raised flag is news (the row's attention= is the session's own).
+        write_attention_owned(
+            &workers[1].ctx,
+            crate::harness_host::ATTENTION_OWNER,
+            MetaEdit::Set("a login"),
+            aterm_slog::Actor::Harness,
+        )
+        .unwrap();
+        let reply = one(&workers[1], 1);
+        assert!(
+            reply.ends_with(" rev=2 state=working agent=- attention=a%20login result_bytes=0\n"),
+            "{reply}"
+        );
+        // A worker whose session ended answers `closed`, whatever its record.
+        store
+            .write()
+            .unwrap()
+            .set_state(workers[2].local_id, SessionState::Exited);
+        assert_eq!(task_reply(&one(&workers[2], 1)), ("OK 1", vec!["closed"]));
+    }
+
+    /// `await task`'s single form takes the session's own record through
+    /// `cmd_await`, and refuses a target list after a selector.
+    #[test]
+    fn the_single_await_task_form_waits_on_its_session() {
+        use crate::task_record::{AWAIT_TASK_USAGE, TaskMark, TaskState, mark_session_task};
+        let store = crate::session_store::new_store();
+        let subscribers = crate::subscribe::new_registry();
+        let workers = three_workers(&store, &subscribers);
+        let w = &workers[0];
+        mark_session_task(
+            &w.ctx,
+            w.local_id,
+            &TaskMark::new(TaskState::Done),
+            &subscribers,
+        )
+        .expect("unfenced");
+        let await_ =
+            |rest: &str| cmd_await(&w.term, &store, w.local_id, &w.ctx, rest, &subscribers);
+        assert!(
+            await_("task since=1 timeout=60000").starts_with("OK 1\n@"),
+            "the done news"
+        );
+        assert_eq!(
+            task_reply(&await_("task timeout=20")).0,
+            "OK 1 status=timeout",
+            "armed at rev 2, the news is already read"
+        );
+        assert_eq!(await_("task @s-other since=1"), AWAIT_TASK_USAGE);
+        assert_eq!(await_("task since=x"), AWAIT_TASK_USAGE);
+        // `task` is the first word: a client reads the reply's framing off
+        // the second word of the request (`framing_of`), so any other order
+        // would answer rows to a reader expecting one line.
+        assert_eq!(await_("timeout=20 task"), AWAIT_TASK_USAGE);
+        assert_eq!(await_("timeout 20 task since=1"), AWAIT_TASK_USAGE);
+    }
+
+    /// LATCHED WITHIN A WAIT: a target that showed news keeps it, and the
+    /// row it showed, after its record moves on to no news — so news that
+    /// came and went between two wakes still counts toward `all` — while a
+    /// target without news is read again on every wake. A wait armed again
+    /// reads every record as it stands.
+    #[test]
+    fn await_task_latches_news_that_comes_and_goes() {
+        use crate::task_record::{TaskMark, TaskState, mark_session_task};
+        let store = crate::session_store::new_store();
+        let subscribers = crate::subscribe::new_registry();
+        let workers = three_workers(&store, &subscribers);
+        let mark = |worker: &SessionHandle, state: TaskState| {
+            mark_session_task(
+                &worker.ctx,
+                worker.local_id,
+                &TaskMark::new(state),
+                &subscribers,
+            )
+            .expect("unfenced");
+        };
+        let targets: Vec<TaskTarget<'_>> = workers
+            .iter()
+            .map(|w| TaskTarget {
+                local_id: w.local_id,
+                ctx: &w.ctx,
+                since: Some(1),
+            })
+            .collect();
+        let edges = [1; 3];
+        let exits: Vec<_> = workers
+            .iter()
+            .map(|w| exit_probe(&store, w.local_id))
+            .collect();
+        let mut latched: Vec<Option<String>> = vec![None; 3];
+        mark(&workers[0], TaskState::Done);
+        latch_task_news(&store, &targets, &edges, &exits, &mut latched);
+        let done = latched[0].clone().expect("the done news latches");
+        assert!(done.contains(" rev=2 state=done "), "{done}");
+        assert!(latched[1].is_none() && latched[2].is_none());
+        // Moved back to work (rev 3, no news) while another finishes.
+        mark(&workers[0], TaskState::Working);
+        mark(&workers[1], TaskState::Done);
+        latch_task_news(&store, &targets, &edges, &exits, &mut latched);
+        assert_eq!(latched[0].as_deref(), Some(done.as_str()), "the news holds");
+        assert!(
+            latched[1]
+                .as_deref()
+                .is_some_and(|row| row.contains(" rev=2 state=done ")),
+            "{latched:?}"
+        );
+        assert!(latched[2].is_none());
+        // NEGATIVE CONTROL: a wait armed again reads the record as it stands.
+        let mut again: Vec<Option<String>> = vec![None; 3];
+        latch_task_news(&store, &targets, &edges, &exits, &mut again);
+        assert!(again[0].is_none() && again[1].is_some(), "{again:?}");
     }
 
     /// `path=` IS MEASURED WHERE IT CAN BE (gap audit 2026-09-24: a tab the live
@@ -5987,7 +7276,9 @@ mod tests {
         let carried = line(&h);
         assert!(carried.contains(" path=frozen program=- "), "{carried}");
         assert!(
-            carried.ends_with(" path_evidence=carried copy=- upgrade=- land_at=- task=-"),
+            carried.ends_with(
+                " path_evidence=carried copy=- upgrade=- land_at=- task=- pause=- task_state=- task_rev=0"
+            ),
             "{carried}"
         );
         {
@@ -5998,7 +7289,10 @@ mod tests {
         let late = line(&h);
         assert!(
             late.contains(" path=frozen program=- ")
-                && late.ends_with(" path_evidence=carried copy=- upgrade=- land_at=- task=-"),
+                && late.ends_with(
+                    " path_evidence=carried copy=- upgrade=- land_at=- task=- pause=- task_state=- \
+                     task_rev=0"
+                ),
             "a late reading for another group changes nothing: {late}"
         );
         {
@@ -6022,7 +7316,8 @@ mod tests {
         assert!(measured.contains(" path_evidence=measured:"), "{measured}");
         assert!(
             measured.ends_with(
-                " copy=foreign upgrade=pending/2.1.282/not-idle:busy/2m land_at=- task=-"
+                " copy=foreign upgrade=pending/2.1.282/not-idle:busy/2m land_at=- task=- \
+                 pause=- task_state=- task_rev=0"
             ),
             "{measured}"
         );
@@ -6105,12 +7400,13 @@ mod tests {
         );
         // `human_ms=`, the typed metadata, `supervisor=` and `autopilot=` —
         // `off` for a supervisable agent with no host to supervise it — then
-        // the owner's three columns and the harness's `land_at=`/`task=` (no
-        // timer, no face told) close the row: no person has typed…
+        // the owner's three columns, the harness's `land_at=`/`task=`/
+        // `pause=` (no timer, no face, no pause told) and the task record's
+        // two close the row: no person has typed…
         assert!(
             line.ends_with(
                 " human_ms=- role=- attention=- user_title=- supervisor=- autopilot=off \
-                 path_evidence=- copy=- upgrade=- land_at=- task=-"
+                 path_evidence=- copy=- upgrade=- land_at=- task=- pause=- task_state=- task_rev=0"
             ),
             "{line}"
         );
@@ -6130,7 +7426,8 @@ mod tests {
         assert!(human.parse::<u64>().is_ok(), "{line}");
         assert!(
             line.ends_with(
-                " supervisor=- autopilot=off path_evidence=- copy=- upgrade=- land_at=- task=-"
+                " supervisor=- autopilot=off path_evidence=- copy=- upgrade=- land_at=- task=- \
+                 pause=- task_state=- task_rev=0"
             ),
             "{line}"
         );
@@ -6650,9 +7947,9 @@ mod tests {
             rewrap_gauge: std::sync::Arc::default(),
             human_input: Default::default(),
             launch: Default::default(),
-            generation_look: Default::default(),
             reset_lane: Default::default(),
             crash_journal: Default::default(),
+            typed: Default::default(),
             update_parked: Default::default(),
             witness: Default::default(),
             fenced_writes: Default::default(),
@@ -6988,8 +8285,9 @@ mod tests {
 mod exits_tests {
     use aterm_session::{EdgeToken, Op};
 
-    use super::{Scope, caller_actor, caller_actor_of, cmd_exits};
+    use super::{Scope, caller_actor, caller_actor_of, cmd_exits, turn_by, typed_by};
     use crate::session_store::{ExitActor, ExitReason, RosterChange, new_store, test_handle};
+    use crate::turn_ledger::TurnBy;
 
     /// `exits` on an instance that has lost nothing is `OK 0` — including one
     /// whose journal holds only births (a `Created` row is not an exit).
@@ -7189,6 +8487,85 @@ mod exits_tests {
             "{row}"
         );
     }
+
+    /// The turn ledger's caller is the exits ledger's ([`turn_by`], from the
+    /// driver the dispatch resolved, `turn_driver`), and the one thing that
+    /// refines it is the lease the turn types under ([`typed_by`]): an
+    /// owner-token turn under THIS process's harness hand is the harness's.
+    /// NEGATIVE CONTROLS: another instance's harness (a different pid in the
+    /// holder), a manager's lease, a `turn`'s lease, no lease, and every
+    /// non-owner caller are left as they are — an edge under the harness's
+    /// holder name is still its own sid, because a lease's name is never
+    /// authority.
+    #[test]
+    fn a_turns_by_is_the_callers_and_only_the_harness_hand_makes_it_harness() {
+        let caller = test_handle(1);
+        let target = test_handle(2);
+        let caller_sid = caller.sid.as_str().to_string();
+        let tok = target
+            .ctx
+            .edges
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .grant(
+                caller.sid.clone(),
+                target.sid.clone(),
+                Op::WriteInput,
+                target.ctx.nonce,
+            );
+        let by = |scope: Scope| {
+            let driver = crate::control::turn_driver(scope, &target.ctx);
+            let by = turn_by(scope, driver.as_ref());
+            // The exits ledger names the same caller.
+            let named = match caller_actor(scope, &target.ctx) {
+                ExitActor::Sid(sid) => TurnBy::Sid(sid),
+                ExitActor::Ctl => TurnBy::Ctl,
+                ExitActor::Bridge => TurnBy::Bridge,
+                ExitActor::Human | ExitActor::Unknown => TurnBy::Unknown,
+            };
+            assert_eq!(by, named, "{scope:?}");
+            by
+        };
+        assert_eq!(by(Scope::Owner), TurnBy::Ctl);
+        assert_eq!(by(Scope::Bridge), TurnBy::Bridge);
+        assert_eq!(by(Scope::Edge(tok)), TurnBy::Sid(caller_sid.clone()));
+        assert_eq!(
+            by(Scope::Edge(EdgeToken::generate())),
+            TurnBy::Unknown,
+            "a token the target's table never issued names nobody"
+        );
+
+        let drive = |holder: &str| crate::Lease::Drive {
+            holder: holder.to_string(),
+            expires_us: u64::MAX,
+            conn: Some(1),
+            hard: true,
+            here: false,
+            holder_pid: None,
+        };
+        let hand = drive(&crate::harness_host::holder());
+        assert_eq!(typed_by(&TurnBy::Ctl, Some(&hand)), TurnBy::Harness);
+        assert_eq!(TurnBy::Harness.as_wire(), "harness");
+        for under in [
+            None,
+            Some(drive("aterm-harness@1")),
+            Some(drive("manager")),
+            Some(crate::Lease::Turn {
+                id: 9,
+                driver: None,
+                typing: true,
+            }),
+        ] {
+            assert_eq!(
+                typed_by(&TurnBy::Ctl, under.as_ref()),
+                TurnBy::Ctl,
+                "{under:?}"
+            );
+        }
+        for caller in [TurnBy::Sid(caller_sid), TurnBy::Bridge, TurnBy::Unknown] {
+            assert_eq!(typed_by(&caller, Some(&hand)), caller, "{caller:?}");
+        }
+    }
 }
 
 /// THE SESSION LOG'S `by=` (design §2.5, phase 3A ruling R1): who the
@@ -7354,7 +8731,7 @@ mod update_anchor_tests {
                 .timeline
                 .lock()
                 .unwrap()
-                .record("meta-change", format!("n={i}"));
+                .record_raw_meta_change(format!("n={i}"));
         }
         let producer_timeline = std::sync::Arc::clone(&producer.ctx.timeline);
         let mut store = SessionStore::default();
@@ -7374,7 +8751,7 @@ mod update_anchor_tests {
             producer_timeline
                 .lock()
                 .unwrap()
-                .record("meta-change", format!("overlap={i}"));
+                .record_raw_meta_change(format!("overlap={i}"));
         }
         assert!(!producer_timeline.lock().unwrap().past_handoff_ceiling());
 
@@ -7402,7 +8779,7 @@ mod update_anchor_tests {
             .timeline
             .lock()
             .unwrap()
-            .record("meta-change", "after".to_string());
+            .record_raw_meta_change("after".to_string());
         let page = cmd_timeline(&adopted.ctx, "since=60");
         assert!(page.starts_with("OK 2\n"), "{page}");
         assert!(
@@ -7413,7 +8790,7 @@ mod update_anchor_tests {
         {
             let mut tl = producer_timeline.lock().unwrap();
             for _ in 0..reserve {
-                tl.record("meta-change", String::new());
+                tl.record_raw_meta_change(String::new());
             }
             assert!(tl.past_handoff_ceiling());
         }
@@ -7675,6 +9052,298 @@ mod update_park_wait_tests {
             run(false, aterm_spec::wait::MUST_HAPPEN.as_millis() as u64),
             3,
             "a swallowed press is re-pressed unparked"
+        );
+    }
+}
+
+#[cfg(test)]
+mod turn_halt_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{TurnIo, cmd_turn};
+    use crate::session_store::{new_store, test_handle};
+
+    /// What one turn did: its reply, the keys and pastes it wrote, and its
+    /// Enters.
+    struct Ran {
+        reply: String,
+        writes: usize,
+        presses: usize,
+    }
+
+    /// `line` as one turn, the person's Take Over landing once `take_after`
+    /// keys and pastes have been written (`Some(0)`: before the turn), and
+    /// `remote` the node that holds the tab and drives it, if any.
+    fn run(line: &str, take_after: Option<usize>, remote: bool) -> Ran {
+        let handle = test_handle(0);
+        let (term, ctx) = (handle.term.clone(), handle.ctx.clone());
+        let sid = handle.sid.as_str().to_owned();
+        let store = new_store();
+        store.write().unwrap().register(handle);
+        let registry = crate::subscribe::new_registry();
+        let _driving = remote.then(|| {
+            crate::fabric::DrivingAs::enter(crate::fabric::Driver {
+                node: "0b".repeat(16),
+                host: "mac-0b".to_owned(),
+            })
+        });
+        if remote {
+            assert_eq!(
+                crate::fabric::cmd_hold(
+                    &store,
+                    &format!("{sid} on"),
+                    crate::fabric::HoldIssuer::Remote
+                ),
+                "OK hold=1\n"
+            );
+        }
+        let take_over = || crate::fabric::person_hold(&*ctx, true, &|| {});
+        if take_after == Some(0) {
+            take_over();
+        }
+        let (writes, presses) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let wrote = || {
+            if Some(writes.fetch_add(1, Ordering::SeqCst) + 1) == take_after {
+                take_over();
+            }
+            true
+        };
+        let paste = |_: &str| wrote();
+        let key = |_: crate::input::InputEvent| wrote();
+        let press = |_: &str| {
+            presses.fetch_add(1, Ordering::SeqCst);
+            true
+        };
+        let reply = cmd_turn(
+            &term,
+            &store,
+            0,
+            line,
+            &registry,
+            &ctx,
+            &TurnIo {
+                paste: &paste,
+                press: &press,
+                key: &key,
+                ..TurnIo::paste_only()
+            },
+        );
+        Ran {
+            reply,
+            writes: writes.load(Ordering::SeqCst),
+            presses: presses.load(Ordering::SeqCst),
+        }
+    }
+
+    /// A HOLD SET WHILE A TURN RUNS STOPS IT THERE (the step-in's rule: every
+    /// remote write is refused while the person's hold stands). The person's
+    /// Take Over landing between a typed turn's keys writes no key after it
+    /// and no Enter, and says what landed; one landing after a plain turn's
+    /// paste presses no Enter; one standing before the first byte answers the
+    /// dispatch's own `ERR halted`, typing nothing. FAILS WITHOUT THE FIX:
+    /// the holds were asked once, as the turn arrived, and every key and the
+    /// Enter went on into the tab the person took. NEGATIVE CONTROLS: with
+    /// no Take Over the same turns write every key and press their Enter,
+    /// and a remote node's own hold never stops its own drive's turn.
+    #[test]
+    fn a_hold_set_while_a_turn_runs_presses_nothing_more() {
+        const TYPED: &str = "typed=1 cadence=1 cap=5 idle=1 presses=1 submit_window=50 \
+                             timeout=60000 hello";
+        const PLAIN: &str = "idle=1 presses=1 submit_window=50 timeout=60000 hello";
+        for remote in [false, true] {
+            let cut = run(TYPED, Some(2), remote);
+            assert!(
+                cut.reply
+                    .starts_with("OK 0 turn skipped reason=halted typed=2 pasted=0 submitted=0 "),
+                "{}",
+                cut.reply
+            );
+            assert_eq!((cut.writes, cut.presses), (2, 0), "remote={remote}");
+            let whole = run(TYPED, None, remote);
+            assert!(!whole.reply.contains("reason=halted"), "{}", whole.reply);
+            assert_eq!((whole.writes, whole.presses), (5, 1), "remote={remote}");
+
+            let cut = run(PLAIN, Some(1), remote);
+            assert!(
+                cut.reply
+                    .starts_with("OK 0 turn skipped reason=halted submitted=0 "),
+                "{}",
+                cut.reply
+            );
+            assert_eq!((cut.writes, cut.presses), (1, 0), "remote={remote}");
+            let whole = run(PLAIN, None, remote);
+            assert_eq!((whole.writes, whole.presses), (1, 1), "remote={remote}");
+
+            for line in [TYPED, PLAIN] {
+                let before = run(line, Some(0), remote);
+                assert!(
+                    before.reply.starts_with("ERR halted ")
+                        && before.reply.contains("origin=person"),
+                    "{}",
+                    before.reply
+                );
+                assert_eq!((before.writes, before.presses), (0, 0), "remote={remote}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod composer_verify_tests {
+    use aterm_core::terminal::Terminal;
+
+    use super::{
+        ComposerAfterPress, ComposerKey, composer_after_press, composer_key_once_shown,
+        composer_verify_key,
+    };
+
+    /// A Claude Code screen at 24x80: its composer's caret row between two
+    /// rules holding `caret_row` (the `❯ ` and what follows it), the cursor
+    /// left at `col` (1-based) of that row.
+    fn screen(caret_row: &str, col: u16) -> Terminal {
+        let rule = "\u{2500}".repeat(80);
+        let mut t = Terminal::new(24, 80);
+        t.process(
+            format!(
+                "\x1b[20;1H{rule}\x1b[21;1H{caret_row}\x1b[22;1H{rule}\
+                 \x1b[23;1H  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)\
+                 \x1b[21;{col}H"
+            )
+            .as_bytes(),
+        );
+        t
+    }
+
+    /// THE KEY IS THE TYPED TEXT THE COMPOSER SHOWS, whitespace aside. Not
+    /// shown yet is `NotYet` — read again as the screen moves — save where a
+    /// `[Pasted text …]` chip stands for it, or no framed composer is on the
+    /// screen, or the text is empty: `No`, and AUTO's `seq` stands. Claude
+    /// Code's DIM PLACEHOLDER (the cursor at column 2 of the caret row) is no
+    /// text: a key it spells is not shown. NEGATIVE CONTROL: the same words
+    /// with the cursor after them are the typed text.
+    #[test]
+    fn the_key_is_the_typed_text_the_composer_shows() {
+        let typed = screen("\u{276f} edit the README", 18);
+        assert_eq!(
+            composer_verify_key(&typed, "edit the  README"),
+            ComposerKey::Shows("edittheREADME".to_string())
+        );
+        let empty = screen("\u{276f} ", 3);
+        assert_eq!(composer_verify_key(&empty, "edit"), ComposerKey::NotYet);
+        let chip = screen("\u{276f} [Pasted text #1 +12 lines] ", 30);
+        assert_eq!(
+            composer_verify_key(&chip, "a\nlong\npaste"),
+            ComposerKey::No
+        );
+        assert_eq!(composer_verify_key(&typed, " \n"), ComposerKey::No);
+        let mut boxed = Terminal::new(24, 80);
+        boxed.process(" Select model\r\n \u{276f} 1. Default\r\n   2. Opus".as_bytes());
+        assert_eq!(composer_verify_key(&boxed, "edit"), ComposerKey::No);
+        // The placeholder spells the key; the cursor says it is no text.
+        let placeholder = screen("\u{276f} Press up to edit queued messages", 3);
+        assert_eq!(
+            composer_verify_key(&placeholder, "edit"),
+            ComposerKey::NotYet
+        );
+        // NEGATIVE CONTROL: the cursor after the words.
+        let drafted = screen("\u{276f} Press up to edit queued messages", 35);
+        assert_eq!(
+            composer_verify_key(&drafted, "edit"),
+            ComposerKey::Shows("edit".to_string())
+        );
+    }
+
+    /// AFTER THE ENTER the composer has LEFT the key once it no longer holds
+    /// it — emptied, or Claude Code's placeholder back, though its words
+    /// spell the key (`Press up to edit queued messages` after `edit`) —
+    /// HOLDS it while the typed text stands, is GONE where a box or a menu
+    /// took its place, and is not judged in a frame still being drawn.
+    #[test]
+    fn after_the_enter_the_composer_has_left_holds_or_is_gone() {
+        assert_eq!(
+            composer_after_press(&screen("\u{276f} ", 3), "edit"),
+            ComposerAfterPress::Left
+        );
+        assert_eq!(
+            composer_after_press(
+                &screen("\u{276f} Press up to edit queued messages", 3),
+                "edit"
+            ),
+            ComposerAfterPress::Left
+        );
+        assert_eq!(
+            composer_after_press(&screen("\u{276f} edit", 7), "edit"),
+            ComposerAfterPress::Holds
+        );
+        let mut boxed = Terminal::new(24, 80);
+        boxed.process(" Select model\r\n \u{276f} 1. Default".as_bytes());
+        assert_eq!(
+            composer_after_press(&boxed, "edit"),
+            ComposerAfterPress::Gone
+        );
+        let mut torn = screen("\u{276f} edit", 7);
+        torn.process(b"\x1b[?2026h\x1b[21;1H\x1b[2K");
+        assert_eq!(
+            composer_after_press(&torn, "edit"),
+            ComposerAfterPress::Unfinished
+        );
+    }
+
+    /// A LATE ECHO IS WAITED FOR: the composer read `NotYet` is read again
+    /// each time the screen moves past the seq it was read at, and its key
+    /// taken once shown. The echo's cap ending first, or no composer to
+    /// verify by, gives none (AUTO's `seq`); a reply that ends the turn (the
+    /// session exited) is handed back. NEGATIVE CONTROL: a composer showing
+    /// the text at once waits for nothing.
+    #[test]
+    fn a_late_echo_is_waited_for_within_the_cap() {
+        let script = |looks: Vec<ComposerKey>, moves: Vec<Result<bool, String>>| {
+            let mut looks = looks.into_iter().enumerate();
+            let mut moves = moves.into_iter();
+            let mut waited = Vec::new();
+            let got = composer_key_once_shown(
+                || {
+                    let (seq, seen) = looks.next().expect("a look");
+                    (seen, 10 + seq as u64)
+                },
+                |after| {
+                    waited.push(after);
+                    moves.next().expect("a wait")
+                },
+            );
+            (got, waited)
+        };
+        let shows = || ComposerKey::Shows("edit".to_string());
+        assert_eq!(
+            script(
+                vec![ComposerKey::NotYet, ComposerKey::NotYet, shows()],
+                vec![Ok(true), Ok(true)]
+            ),
+            (Ok(Some("edit".to_string())), vec![10, 11])
+        );
+        assert_eq!(
+            script(
+                vec![ComposerKey::NotYet, ComposerKey::NotYet],
+                vec![Ok(true), Ok(false)]
+            ),
+            (Ok(None), vec![10, 11]),
+            "the cap ends first"
+        );
+        assert_eq!(
+            script(vec![ComposerKey::NotYet, ComposerKey::No], vec![Ok(true)]),
+            (Ok(None), vec![10])
+        );
+        assert_eq!(
+            script(
+                vec![ComposerKey::NotYet],
+                vec![Err("ERR exited\n".to_string())]
+            ),
+            (Err("ERR exited\n".to_string()), vec![10])
+        );
+        // NEGATIVE CONTROL: shown at once.
+        assert_eq!(
+            script(vec![shows()], vec![]),
+            (Ok(Some("edit".to_string())), vec![])
         );
     }
 }

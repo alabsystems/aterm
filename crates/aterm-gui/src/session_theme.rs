@@ -186,7 +186,45 @@ impl App {
         );
         match &colors.source {
             ThemeSource::DefaultFallback { reason } => Err(reason.clone()),
-            ThemeSource::Builtin | ThemeSource::File(_) => Ok(colors),
+            // A session selector never resolves through the pack; the arm
+            // is the preview's.
+            ThemeSource::Builtin | ThemeSource::File(_) | ThemeSource::Pack(_) => Ok(colors),
+        }
+    }
+
+    /// The light/dark side a new session's shell is told it runs on (its
+    /// `COLORFGBG`, Windows): that of the theme the session will draw, by
+    /// [`Self::session_draw`]'s precedence, its own `theme` (asked, inherited
+    /// by a split, restored), else its identity's `identity_themes` entry.
+    /// `None` when it will draw the instance's, whose side the factory already
+    /// carries. Decided at booking, since the session's theme lands only after
+    /// its shell has started.
+    #[cfg(any(windows, test))]
+    pub(crate) fn spawn_shell_appearance(
+        &self,
+        theme: Option<&str>,
+        identity: Option<&str>,
+    ) -> Option<aterm_types::Appearance> {
+        let selector =
+            theme.or_else(|| identity.and_then(|name| self.config.identity_theme(name)))?;
+        self.resolve_session_selector(selector)
+            .ok()
+            .map(|colors| colors.reported)
+    }
+
+    /// The instance's session factory for a fresh shell whose session will
+    /// draw `theme`, else its `identity`'s theme: told that theme's side
+    /// ([`Self::spawn_shell_appearance`]). A spawn that books off the loop sets
+    /// the same field on its own copy (`tab_spawn`).
+    #[cfg(windows)]
+    pub(crate) fn shell_factory(
+        &self,
+        theme: Option<&str>,
+        identity: Option<&str>,
+    ) -> crate::spawn::SessionFactory {
+        crate::spawn::SessionFactory {
+            shell_appearance: self.spawn_shell_appearance(theme, identity),
+            ..self.session_factory.clone()
         }
     }
 
@@ -411,6 +449,7 @@ impl App {
         let source = match colors.source {
             ThemeSource::Builtin => "builtin",
             ThemeSource::File(_) => "file",
+            ThemeSource::Pack(_) => "pack",
             ThemeSource::DefaultFallback { .. } => "default",
         };
         let hex = |c: aterm_types::Rgb| format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b);

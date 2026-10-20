@@ -261,6 +261,10 @@ impl GpuRenderer {
             None => None,
         };
         if let Some(t) = tray.as_ref() {
+            debug_assert!(
+                t.scrim.is_none(),
+                "the GL arm draws no tray scrim (`TrayQuad::scrim`): Linux shows none"
+            );
             let unchanged = win.gl_tray_card.as_ref().is_some_and(|c| {
                 c.tex.on(&live.dev) && c.w == t.pw && c.h == t.ph && c.pixels.as_slice() == t.rgba
             });
@@ -674,6 +678,7 @@ impl GpuRenderer {
         win.virtual_presented_input_epoch = win.resident_input_epoch;
         win.last_present_work_ns =
             u64::try_from(work_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        win.last_present_encode_ns = win.last_present_work_ns;
         self.gl_maybe_inject_loss();
         Ok(())
     }
@@ -919,6 +924,7 @@ impl GpuRenderer {
         }
         win.last_present_work_ns =
             u64::try_from(work_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        win.last_present_encode_ns = win.last_present_work_ns;
         let live = self.gl_arm.as_ref().expect("checked above");
         let posted = win.measure_surface_acquire(|| gs.present(&live.dev));
         posted.map_err(|e| {

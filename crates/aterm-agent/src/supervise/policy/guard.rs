@@ -98,14 +98,55 @@ pub fn server_fences_send(help: &str) -> bool {
     entry_names_gen(help, "send")
 }
 
+/// Whether the server's `help` text says `key` takes `act=` (session log
+/// phase 5, ruling T1): what a press means for the box it dismisses. An
+/// older `key` refuses the option as a key name, so a press carries it only
+/// where this is true. Read off the same `help key` reply as
+/// [`server_fences_gen`], so it costs no request of its own.
+pub fn server_takes_act(help: &str) -> bool {
+    entry_names(help, "key", "act=approve")
+}
+
+/// What a dismissing key means for the box it dismisses (session log phase
+/// 5, ruling T1): the leading `act=<word>` the server's `key` takes. Only the
+/// key that dismisses carries one (the digit, the focused Enter, the
+/// decline's Enter, a question's answering Enter), never an arrow, a Tab or
+/// a text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyAct {
+    /// The box's command is approved.
+    Approve,
+    /// The box is declined.
+    Deny,
+    /// The question is answered.
+    Answer,
+}
+
+impl KeyAct {
+    /// The leading option, `act=<word>`.
+    #[must_use]
+    pub const fn option(self) -> &'static str {
+        match self {
+            KeyAct::Approve => "act=approve",
+            KeyAct::Deny => "act=deny",
+            KeyAct::Answer => "act=answer",
+        }
+    }
+}
+
 /// Whether the help entry of `verb` names `if-gen=`.
 fn entry_names_gen(help: &str, verb: &str) -> bool {
+    entry_names(help, verb, "if-gen=")
+}
+
+/// Whether the help entry of `verb` names `token`.
+fn entry_names(help: &str, verb: &str, token: &str) -> bool {
     let mut in_entry = false;
     for line in help.lines() {
         if !line.starts_with(char::is_whitespace) {
             in_entry = line.split_whitespace().next() == Some(verb);
         }
-        if in_entry && line.contains("if-gen=") {
+        if in_entry && line.contains(token) {
             return true;
         }
     }
@@ -230,5 +271,32 @@ mod tests {
         assert!(!server_fences_gen(
             "key [if=<re>] <name>\n  a named key\nsend [if-gen=<g>] <text>\n  gen fenced"
         ));
+    }
+
+    /// `act=` (session log phase 5, ruling T1) is read off the `help key`
+    /// reply the fence probe already asks for: the shipped `key` entry and
+    /// catalog name it; an older entry, or `act=` under another verb, does
+    /// not.
+    #[test]
+    fn the_act_word_is_sent_only_where_help_key_names_it() {
+        let help_key = aterm_types::control_verbs::spec("key")
+            .expect("the key verb")
+            .entry_lines()
+            .join("\n");
+        assert!(server_takes_act(&help_key), "{help_key}");
+        let shipped = aterm_types::control_verbs::catalog_lines_full()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(server_takes_act(&shipped));
+        assert!(!server_takes_act(
+            "key [id=<key>] [if=<re>] [if-gen=<e.s>] [if-human=<n>] <name>: send a named key"
+        ));
+        assert!(!server_takes_act(
+            "key [if=<re>] <name>\n  a named key\nsend [act=approve] <text>\n  acted"
+        ));
+        assert_eq!(
+            [KeyAct::Approve, KeyAct::Deny, KeyAct::Answer].map(KeyAct::option),
+            ["act=approve", "act=deny", "act=answer"]
+        );
     }
 }

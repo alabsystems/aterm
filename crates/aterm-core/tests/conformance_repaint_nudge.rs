@@ -138,7 +138,7 @@ impl World {
         term.resize(ROWS - 1, COLS);
         term.process(&ui("b")[..40]);
         term.resize(ROWS, COLS);
-        assert_ne!(term.render_debt(), (0, 0), "the flap left a residue");
+        assert!(term.render_debt().owed(), "the flap left a residue");
         Self {
             term,
             pty: (ROWS, COLS),
@@ -248,7 +248,7 @@ impl World {
 
     fn facts(&self) -> Facts {
         let mut f = Facts::eligible(Mode::On, (self.term.rows(), self.term.cols()));
-        f.owed = self.term.render_debt() != (0, 0);
+        f.owed = self.term.render_debt().owed();
         f.halted = self.halted;
         f.output_quiet_ms = self.now - self.last_output_ms;
         f.frame_open = self.term.modes().synchronized_output;
@@ -456,9 +456,8 @@ fn a_program_that_answers_at_once_is_repaired_with_the_engine_untouched() {
     let mut w = World::new(Standin::AnswersAtOnce);
     w.run(4_000);
     assert_eq!(w.acts, ["Hold", "Release", "Finish"]);
-    assert_eq!(
-        w.term.render_debt(),
-        (0, 0),
+    assert!(
+        !w.term.render_debt().owed(),
         "the second repaint cleared the debt"
     );
     assert_eq!(
@@ -493,7 +492,7 @@ fn a_program_that_answers_200ms_late_is_still_repaired() {
     let mut w = World::new(Standin::AnswersLate);
     w.run(6_000);
     assert_eq!(w.acts, ["Hold", "Release", "Finish"]);
-    assert_eq!(w.term.render_debt(), (0, 0));
+    assert!(!w.term.render_debt().owed());
 }
 
 #[test]
@@ -502,7 +501,7 @@ fn ordinary_frames_before_a_late_answer_are_not_taken_for_it() {
     w.run(8_000);
     // The two diff frames did not release the hold: the ED 2 did.
     assert_eq!(w.acts, ["Hold", "Release", "Finish"]);
-    assert_eq!(w.term.render_debt(), (0, 0));
+    assert!(!w.term.render_debt().owed());
 }
 
 #[test]
@@ -511,7 +510,7 @@ fn a_program_that_repaints_without_a_full_clear_is_tried_once_and_abandoned() {
     w.run(8_000);
     assert_eq!(w.acts, ["Hold", "Release", "GiveUp"]);
     assert_eq!(w.machine.nudged(), 1);
-    assert_ne!(w.term.render_debt(), (0, 0), "no ED 2 clears no debt");
+    assert!(w.term.render_debt().owed(), "no ED 2 clears no debt");
     assert_eq!(w.machine.phase(), Phase::Rest);
 }
 
@@ -525,7 +524,7 @@ fn a_program_that_streams_through_both_answers_is_healed() {
     w.run(8_000);
     assert_eq!(w.acts, ["Hold", "Release", "Finish"]);
     assert_eq!(w.sizes, [(ROWS - 1, COLS), (ROWS, COLS)]);
-    assert_eq!(w.term.render_debt(), (0, 0));
+    assert!(!w.term.render_debt().owed());
 }
 
 /// The window flaps while the PTY is held, and a busy program reads neither
@@ -572,7 +571,7 @@ fn a_flap_the_program_never_saw_during_the_hold_is_a_give_up() {
     assert_eq!(w.sizes, [(ROWS - 1, COLS), (ROWS, COLS)], "both answered");
     assert_eq!(w.acts, ["Hold", "Forget", "GiveUp"]);
     assert_eq!(w.ended, Some(Act::Dropped(Dropped::NothingOwed)));
-    assert_eq!(w.term.render_debt(), (0, 0));
+    assert!(!w.term.render_debt().owed());
 }
 
 /// A halt that stands before the hold blocks it. One that lands DURING the

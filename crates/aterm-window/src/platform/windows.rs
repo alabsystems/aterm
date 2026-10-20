@@ -5,12 +5,21 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 // Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
-// Preserve the public integer-handle API with windows-sys 0.61 pointer handles.
+// Preserve the public integer-handle API with windows-sys 0.61 pointer handles; re-export the
+// `recorded` key-message replay for downstream tests (tests and debug builds).
 
 //! # Windows
 //!
 //! The supported OS version is Windows 7 or higher, though Windows 10 is
 //! tested regularly.
+
+/// aterm: recorded Windows key messages, replayed through this backend's real key path, for the
+/// tests of the crates above it (`aterm-gui`'s byte-level layout tests). Tests and debug builds
+/// only.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub use crate::platform_impl::recorded;
+
 use std::borrow::Borrow;
 use std::ffi::c_void;
 use std::path::Path;
@@ -192,9 +201,9 @@ pub trait EventLoopBuilderExtWindows {
     /// Disable process-wide DPI awareness.
     ///
     /// ```
-    /// use winit::event_loop::EventLoop;
+    /// use aterm_window::event_loop::EventLoop;
     /// #[cfg(target_os = "windows")]
-    /// use winit::platform::windows::EventLoopBuilderExtWindows;
+    /// use aterm_window::platform::windows::EventLoopBuilderExtWindows;
     ///
     /// let mut builder = EventLoop::builder();
     /// #[cfg(target_os = "windows")]
@@ -212,9 +221,9 @@ pub trait EventLoopBuilderExtWindows {
     ///
     /// ```
     /// # use windows_sys::Win32::UI::WindowsAndMessaging::{ACCEL, CreateAcceleratorTableW, TranslateAcceleratorW, DispatchMessageW, TranslateMessage, MSG};
-    /// use winit::event_loop::EventLoop;
+    /// use aterm_window::event_loop::EventLoop;
     /// #[cfg(target_os = "windows")]
-    /// use winit::platform::windows::EventLoopBuilderExtWindows;
+    /// use aterm_window::platform::windows::EventLoopBuilderExtWindows;
     ///
     /// let mut builder = EventLoop::builder();
     /// #[cfg(target_os = "windows")]
@@ -343,11 +352,11 @@ pub trait WindowExtWindows {
     /// ## Example
     ///
     /// ```no_run
-    /// # use winit::window::Window;
+    /// # use aterm_window::window::Window;
     /// # fn scope(window: Window) {
     /// use std::thread;
-    /// use winit::platform::windows::WindowExtWindows;
-    /// use winit::raw_window_handle::HasWindowHandle;
+    /// use aterm_window::platform::windows::WindowExtWindows;
+    /// use aterm_window::raw_window_handle::HasWindowHandle;
     ///
     /// // We can get the window handle on the current thread.
     /// let handle = window.window_handle().unwrap();
@@ -732,8 +741,8 @@ pub trait IconExtWindows: Sized {
     /// [`from_resource`]: IconExtWindows::from_resource
     ///
     /// ```rust,no_run
-    /// use winit::platform::windows::IconExtWindows;
-    /// use winit::window::Icon;
+    /// use aterm_window::platform::windows::IconExtWindows;
+    /// use aterm_window::window::Icon;
     ///
     /// assert!(Icon::from_resource_name("app", None).is_ok());
     /// assert!(Icon::from_resource(1, None).is_ok());
@@ -748,8 +757,8 @@ pub trait IconExtWindows: Sized {
     /// [`from_resource`]: IconExtWindows::from_resource
     ///
     /// ```rust,no_run
-    /// # use winit::platform::windows::IconExtWindows;
-    /// # use winit::window::Icon;
+    /// # use aterm_window::platform::windows::IconExtWindows;
+    /// # use aterm_window::window::Icon;
     /// assert!(Icon::from_resource_name("0", None).is_ok());
     /// assert!(Icon::from_resource(0, None).is_err());
     /// ```

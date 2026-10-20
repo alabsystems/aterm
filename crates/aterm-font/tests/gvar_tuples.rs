@@ -24,19 +24,27 @@ const TRIANGLE: [(i16, i16); 3] = [(0, 0), (100, 0), (0, 100)];
 /// A simple glyph's `glyf` record: the triangle, padded to an even length
 /// for short `loca` offsets.
 pub(crate) fn triangle() -> Vec<u8> {
+    simple(&TRIANGLE)
+}
+
+/// A simple glyph's `glyf` record: one contour of the on-curve `points`,
+/// padded to an even length for short `loca` offsets.
+pub(crate) fn simple(points: &[(i16, i16)]) -> Vec<u8> {
     let mut g = Vec::new();
     g.extend(1i16.to_be_bytes()); // one contour
-    for v in [0i16, 0, 100, 100] {
-        g.extend(v.to_be_bytes());
+    let (xs, ys) = (points.iter().map(|p| p.0), points.iter().map(|p| p.1));
+    for v in [xs.clone().min(), ys.clone().min(), xs.max(), ys.max()] {
+        g.extend(v.expect("a point").to_be_bytes());
     }
-    g.extend(2u16.to_be_bytes()); // last point of contour 0
+    let last = u16::try_from(points.len() - 1).expect("a short contour");
+    g.extend(last.to_be_bytes()); // last point of contour 0
     g.extend(0u16.to_be_bytes()); // no instructions
-    g.extend([1u8; 3]); // on curve, coordinates as i16 deltas
+    g.extend(vec![1u8; points.len()]); // on curve, coordinates as i16 deltas
     let mut prev = (0i16, 0i16);
     let (mut xs, mut ys) = (Vec::new(), Vec::new());
-    for (x, y) in TRIANGLE {
-        xs.extend((x - prev.0).to_be_bytes());
-        ys.extend((y - prev.1).to_be_bytes());
+    for &(x, y) in points {
+        xs.extend(x.wrapping_sub(prev.0).to_be_bytes());
+        ys.extend(y.wrapping_sub(prev.1).to_be_bytes());
         prev = (x, y);
     }
     g.extend(xs);

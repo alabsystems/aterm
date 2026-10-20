@@ -2,11 +2,15 @@
 # Copyright 2026 Andrew Yates
 [package]
 name = "aterm-messages"
+# Integration tests are declared below, not discovered: the files are modules of
+# one suite binary where they can share a process. With autotests off a
+# `tests/*.rs` file listed nowhere never compiles.
+autotests = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm's unified message engine — the platform-neutral model, glass policy, single-row width law, tagged log ring and line codec behind the message band, the Settings ▸ Messages page and the `messages`/`notice` verbs; and the per-tab presence row's core (facts, story, levels, words, tones, cells); the host paints cells, appends the file, performs intents and senses the presence facts."
+description = "aterm's unified message engine — the platform-neutral model, glass policy, single-row width law, tagged log ring and line codec behind the message band, the Settings ▸ Messages page and the `messages`/`notice` verbs; and the needs border, pill and tab marks' core (the published need, story, levels, pill words, tones); the host paints cells, appends the file, performs intents and senses the presence facts."
 
 [dependencies]
 # `Instant` is std's on native and a JS clock on wasm32. Every method that
@@ -30,6 +34,10 @@ aterm-codec = { workspace = true }
 # Test-only: the grid's measure (`str_grid_columns`), which hosts inject as
 # `presence::Host::columns`, so the presence width law is proven on real cells.
 aterm-grapheme = { workspace = true }
+
+[[test]]
+name = "messages_suite"
+path = "tests/messages_suite.rs"
 
 [lints]
 workspace = true

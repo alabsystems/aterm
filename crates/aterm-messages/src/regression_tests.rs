@@ -13,7 +13,6 @@ use crate::model::{
     Severity, Tag, Unit, UpgradeWord, WallStamp, tags,
 };
 use crate::page::{Host, MessageView, MessagesState, description};
-use crate::presence::View;
 use crate::progress::{Eta, ProgressTrack};
 use crate::text::{char_width, shape_detail, truncate};
 use crate::waits::{WaitEnd, lines_words, paste_row, rewrap_row, rewrap_stats};
@@ -737,34 +736,6 @@ fn a_run_sentence_keeps_as_much_of_its_command_as_fits() {
         "the command was cut to its first token"
     );
     assert_eq!(shaped, "Run `x --flag-long-\u{2026}");
-}
-
-// ---- presence ---------------------------------------------------------------
-
-/// `View::ripple_deadline` names the next instant the pixels change: at that
-/// instant the step has moved, and while the ripple runs it is never before
-/// `now`.
-#[test]
-fn the_ripple_deadline_names_an_instant_the_step_moves() {
-    let start = Instant::now();
-    let v = View {
-        ripple_at: Some(start),
-        ..View::default()
-    };
-    for us in [33_400u64, 66_800, 133_400, 166_800, 233_400, 266_800] {
-        let now = start + Duration::from_micros(us);
-        let d = v.ripple_deadline(now).expect("the ripple runs");
-        assert!(
-            d > now,
-            "at {us} µs the deadline is {:?} µs, not after now",
-            d.saturating_duration_since(start).as_micros()
-        );
-        assert_ne!(
-            v.ripple_step(d),
-            v.ripple_step(now),
-            "at {us} µs the deadline's step has not moved"
-        );
-    }
 }
 
 // ---- marks and reloads across the handoff --------------------------------

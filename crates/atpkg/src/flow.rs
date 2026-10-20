@@ -2630,6 +2630,9 @@ fn apply_group_txn_inner(
     // member's archive in them, and the last look reads them back into the record of a wait
     // it holds (the archives that wait needs spared, [`crate::quiet::held_archives`]).
     let assets: RefCell<BTreeMap<String, String>> = RefCell::new(std::mem::take(resolved_assets));
+    // Each bundle member's resolve check, started the moment it staged ([`ResolveAhead`]) and
+    // taken by its flip.
+    let ahead: RefCell<BTreeMap<String, ResolveAhead>> = RefCell::new(BTreeMap::new());
     let outcome = transact_holding(
         decisions,
         &mut |m| {
@@ -2646,6 +2649,9 @@ fn apply_group_txn_inner(
                 &mut why,
             ) {
                 Some(s) => {
+                    if let Some(check) = ResolveAhead::start(&s) {
+                        ahead.borrow_mut().insert(m.to_string(), check);
+                    }
                     staged.borrow_mut().insert(m.to_string(), s);
                     Ok(())
                 }
@@ -2685,10 +2691,11 @@ fn apply_group_txn_inner(
         &mut |m| {
             // The flip is the group lane's link phase (label-only, per the schema).
             crate::progress::note_phase(m, crate::progress::Phase::Link);
+            let check = ahead.borrow_mut().remove(m);
             staged
                 .borrow()
                 .get(m)
-                .is_some_and(|s| flip_member(layout, m, s))
+                .is_some_and(|s| flip_member(layout, m, s, check))
         },
         &mut |m| {
             if let Some(s) = staged.borrow().get(m) {
@@ -2697,6 +2704,9 @@ fn apply_group_txn_inner(
         },
     );
     *resolved_assets = assets.into_inner();
+    // A check no flip took (a stage-phase abort, a held flip) is waited out here, before
+    // any tree it runs from is discarded: none outlives the transaction.
+    drop(ahead);
     // On abort, DISCARD the builds this transaction staged. They were never left active (a
     // stage-phase abort flipped nothing; a flip-phase abort re-pointed every shim back to the
     // prior build via rollback), so leaving a complete-but-inactive build on disk would make
@@ -4489,8 +4499,11 @@ fn stage_fetched(
 /// re-pointed) is self-undone via [`rollback_member`] so a `false` return leaves NO live
 /// pointer into the new build — the abort cleanup then discards it. (Shim refusals for
 /// sensitive names are not a flip failure; they are honestly dropped, matching `install`.)
-fn flip_member(layout: &Layout, program: &str, s: &Staged) -> bool {
-    flip_member_with(layout, program, s, activate_build)
+///
+/// A bundle's resolve check is `ahead`'s verdict when it was started at the stage
+/// ([`ResolveAhead`]), else run here.
+fn flip_member(layout: &Layout, program: &str, s: &Staged, ahead: Option<ResolveAhead>) -> bool {
+    flip_member_with(layout, program, s, ahead, activate_build)
 }
 
 /// [`flip_member`] with the activation write injected. The one link write is atomic on
@@ -4502,6 +4515,7 @@ fn flip_member_with(
     layout: &Layout,
     program: &str,
     s: &Staged,
+    ahead: Option<ResolveAhead>,
     activate: impl FnOnce(&Layout, &Path) -> std::io::Result<()>,
 ) -> bool {
     // A sysroot-bundle member gets its pre-activation wiring before the flip; a
@@ -4538,11 +4552,99 @@ fn flip_member_with(
         return false;
     }
     // Fail-loud resolve check for a bundle: a broken toolchain rolls the flip back.
-    if s.reloc.is_some() && bundle_resolve_check(&s.build_dir, &s.exposes).is_err() {
+    if s.reloc.is_some()
+        && ahead
+            .map_or_else(
+                || bundle_resolve_check(&s.build_dir, &s.exposes),
+                ResolveAhead::verdict,
+            )
+            .is_err()
+    {
         rollback_member(layout, program, s);
         return false;
     }
     true
+}
+
+/// A staged bundle's [`bundle_resolve_check`], started on a thread of its own the moment the
+/// member staged, so the first exec of its compilers runs beside the stages that follow and
+/// the flip takes a verdict instead of paying for it. That first exec is the flip's whole
+/// cost and is not disk: the trust toolchain's `trustc` loads its 380 MB driver library in
+/// 2.4 s from a tree just extracted (its pages already cached), 3.7 s from a cold clone,
+/// and 22 ms the second time (measured 2026-10-17, n=4 each); reading the library ahead buys
+/// nothing an extraction has not already. The verdict is the one the flip would reach: the
+/// same `--version` of the same verified tree, whose libraries resolve inside the bundle
+/// whatever `current` and the shims name, and only for the `self-contained` policy, whose
+/// pre-activation wiring is none. No `--version` of the trust toolchain's tools runs
+/// another program, so a pending-program stub on PATH is never reached. Dropped untaken, it
+/// is waited out, so no check outlives its transaction.
+struct ResolveAhead(Option<std::thread::JoinHandle<Result<(), FlowError>>>);
+
+impl ResolveAhead {
+    /// Start `s`'s check, or `None`: not a bundle, a policy with wiring the flip would apply
+    /// first ([`apply_sysroot_bundle`]), or no thread — the flip then runs it as before.
+    fn start(s: &Staged) -> Option<Self> {
+        #[cfg(test)]
+        if let Some(check) = RESOLVE_CHECK.with(|c| c.borrow().clone()) {
+            return Self::start_with(s, move |build_dir, exposes| check(build_dir, exposes));
+        }
+        Self::start_with(s, |build_dir, exposes| {
+            bundle_resolve_check(build_dir, exposes)
+        })
+    }
+
+    /// [`Self::start`] with the check injected.
+    fn start_with(
+        s: &Staged,
+        check: impl FnOnce(&Path, &[ToolName]) -> Result<(), FlowError> + Send + 'static,
+    ) -> Option<Self> {
+        let reloc = s.reloc.as_deref()?;
+        apply_sysroot_bundle(reloc).ok()?;
+        let (build_dir, exposes) = (s.build_dir.clone(), s.exposes.clone());
+        std::thread::Builder::new()
+            .name("atpkg-resolve-ahead".into())
+            .spawn(move || check(&build_dir, &exposes))
+            .ok()
+            .map(|handle| Self(Some(handle)))
+    }
+
+    /// The check's verdict, waiting for it if it is still running. A check thread that
+    /// panicked answers no verdict, so its tree is refused as a failed check is.
+    fn verdict(mut self) -> Result<(), FlowError> {
+        let refused = || FlowError::Activate("resolve check: it answered no verdict".to_string());
+        let handle = self.0.take().ok_or_else(refused)?;
+        handle.join().unwrap_or_else(|_| Err(refused()))
+    }
+}
+
+impl Drop for ResolveAhead {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// The check [`ResolveAhead::start`] runs in place of [`bundle_resolve_check`], injected for
+/// one scope on one thread ([`with_resolve_check`]). Test-only.
+#[cfg(test)]
+type InjectedResolveCheck =
+    std::sync::Arc<dyn Fn(&Path, &[ToolName]) -> Result<(), FlowError> + Send + Sync>;
+
+#[cfg(test)]
+thread_local! {
+    static RESOLVE_CHECK: std::cell::RefCell<Option<InjectedResolveCheck>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `check` as the resolve check every [`ResolveAhead::start`] on this thread
+/// starts, so a transaction test can see when its stage started one. Test-only.
+#[cfg(test)]
+fn with_resolve_check<R>(check: InjectedResolveCheck, f: impl FnOnce() -> R) -> R {
+    let prior = RESOLVE_CHECK.with(|c| c.replace(Some(check)));
+    let out = f();
+    RESOLVE_CHECK.with(|c| *c.borrow_mut() = prior);
+    out
 }
 
 /// `staging/<program>/<asset>` — where a byte-moving row downloads to — or

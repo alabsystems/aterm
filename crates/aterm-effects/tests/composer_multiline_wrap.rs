@@ -663,3 +663,67 @@ fn the_limit_a_line_identical_to_the_one_above_it_or_one_column_off_melts_instea
         );
     }
 }
+
+/// `agy`'s composer has a 3-column prompt (`" > "`, first glyph at 0-based
+/// column 3) on line 1 and a 2-column indent (`"  "`, first glyph at 0-based
+/// column 2) on continuation rows. When a word (`"LOOK! "`) wraps from line 1's
+/// tail onto the continuation row at column 2, `note_rewrap_start` lowers the
+/// row's `hand_floor` from 3 to 2 so `re_anchor` relays `"LOOK!"` at `2..7`
+/// alongside the wrap key at `7`, leaving no unlit gap before `"a gap"`.
+#[test]
+fn agy_three_col_prompt_wraps_to_two_col_continuation_without_a_gap() {
+    let agy_prompt = " > ";
+    let line1_kept = "design a superior solution so that I read what is happening. finally:";
+    let wrapped_word = "LOOK!";
+    let mut c = Core::new(ROWS, COLS, CW, CH, Theme::Default, LOCK_A);
+    c.term.process(b"\x1b[?1049h\x1b[2J\x1b[H");
+    c.term.process(
+        format!(
+            "\x1b[{TOP_RULE_ROW};1H{RULE_PEN}{}\x1b[{TEXT_ROW};1H{TEXT_PEN}{agy_prompt}\x1b[{BOTTOM_RULE_ROW};1H{RULE_PEN}{}{TEXT_PEN}\x1b[{TEXT_ROW};4H",
+            rule(),
+            rule()
+        )
+        .as_bytes(),
+    );
+    let now = c.now;
+    let mut h = Host {
+        c,
+        next_frame: now,
+        last_key: now,
+        col: 4,
+    };
+    h.frame();
+
+    let pre_wrap = format!("{line1_kept} {wrapped_word}");
+    h.type_str(&pre_wrap);
+    h.next_frame();
+    assert_eq!(
+        h.live(CARET_ROW).first(),
+        Some(&3),
+        "line 1's 3-column ` > ` prompt starts live cells at column 3"
+    );
+
+    // Typing Space after `LOOK!` wraps `LOOK! ` onto the continuation row at
+    // 0-based column 2 (`"  LOOK! "`), while line 1 moves up to row 50.
+    let moved = format!("{wrapped_word} ");
+    let wrap_bytes = format!(
+        "{SYNC_BEGIN}\x1b[?25l\x1b[H\r\x1b[{}B{RULE_PEN}{}\r\x1b[1B{TEXT_PEN}{agy_prompt}{line1_kept} \x1b[K{}\x1b[{TEXT_ROW};{}H\x1b[?25h{SYNC_END}",
+        TOP_RULE_ROW - 2,
+        rule(),
+        ink_row(&format!("{agy_prompt}{pre_wrap}"), &format!("  {moved}")),
+        3 + moved.chars().count()
+    )
+    .into_bytes();
+    h.wrap(' ', &wrap_bytes, 3 + moved.chars().count());
+    h.next_frame();
+
+    h.type_str("a gap");
+    h.next_frame();
+
+    let live = h.live(CARET_ROW);
+    let expected: Vec<u16> = (2..13).collect();
+    assert_eq!(
+        live, expected,
+        "every cell of `LOOK! a gap` on the 2-column continuation row is lit without a gap: {live:?}"
+    );
+}

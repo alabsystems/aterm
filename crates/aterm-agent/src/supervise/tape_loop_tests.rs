@@ -10,6 +10,7 @@
 use crate::supervise::tape::doors;
 use crate::supervise::tape::frame_tests::Memory;
 use crate::supervise::tape::header::VERBATIM;
+#[cfg(unix)]
 use crate::supervise::tape::recover::{Tail, recover};
 use crate::supervise::tape::show;
 
@@ -63,25 +64,18 @@ fn tape_on(sink: Memory) -> MemoryTape {
 /// RECORDING CHANGES NOTHING: the same scripted worker watched with the
 /// recorder off and on gives the very same lines, exit code and requests —
 /// an approval's guarded key, a question's and an idle point's EVENTs, the
-/// waits, the notes file written — and the tape holds every request the
-/// worker served, in order.
+/// waits — and the tape holds every request the worker served, in order.
 #[test]
 fn recording_changes_nothing_the_loop_does() {
-    let (off_dir, off_notes) = notes_file("tape-off");
-    let (on_dir, on_notes) = notes_file("tape-on");
     let mut off = decisions_script();
-    let (off_lines, off_code) = watch_on(&mut off, &auto(30, Some(off_notes)), None);
+    let (off_lines, off_code) = watch_on(&mut off, &auto(30), None);
     let mut on = decisions_script();
     let tape = tape_on(Memory::default());
-    let (on_lines, on_code) = watch_on(&mut on, &auto(30, Some(on_notes.clone())), Some(&tape));
+    let (on_lines, on_code) = watch_on(&mut on, &auto(30), Some(&tape));
     assert_eq!(on_lines, off_lines);
     assert_eq!(on_code, off_code);
     assert_eq!(on.requests, off.requests);
     assert_eq!(on.claims, off.claims);
-    assert!(
-        std::fs::read_to_string(&on_notes).is_ok_and(|n| n.contains("git log --oneline -5")),
-        "the notes file is still written"
-    );
     let read = tape.finish("exit 1");
     let taped: Vec<String> = read
         .items
@@ -102,8 +96,6 @@ fn recording_changes_nothing_the_loop_does() {
     let sent: Vec<String> = on.order.iter().map(|(r, _)| r.clone()).collect();
     assert_eq!(taped, sent, "every request, the claim's included, in order");
     assert!(taped.iter().any(|r| r.starts_with("meta set supervisor ")));
-    let _ = std::fs::remove_dir_all(&off_dir);
-    let _ = std::fs::remove_dir_all(&on_dir);
 }
 
 /// A TAPE THAT CANNOT BE WRITTEN — every write refused, from its first — is
@@ -112,12 +104,12 @@ fn recording_changes_nothing_the_loop_does() {
 #[test]
 fn an_unwritable_tape_changes_nothing_the_loop_does() {
     let mut off = decisions_script();
-    let (off_lines, off_code) = watch_on(&mut off, &auto(30, None), None);
+    let (off_lines, off_code) = watch_on(&mut off, &auto(30), None);
     let sink = Memory::default();
     sink.taken().fail_after = Some(0);
     let tape = tape_on(sink);
     let mut on = decisions_script();
-    let (on_lines, on_code) = watch_on(&mut on, &auto(30, None), Some(&tape));
+    let (on_lines, on_code) = watch_on(&mut on, &auto(30), Some(&tape));
     assert_eq!(on_lines, off_lines);
     assert_eq!(on_code, off_code);
     assert_eq!(on.requests, off.requests);
@@ -139,7 +131,7 @@ fn an_unwritable_tape_changes_nothing_the_loop_does() {
 fn a_recorded_approval_reads_back_as_its_decision() {
     let mut m = decisions_script();
     let tape = tape_on(Memory::default());
-    let (lines, _) = watch_on(&mut m, &auto(30, None), Some(&tape));
+    let (lines, _) = watch_on(&mut m, &auto(30), Some(&tape));
     let _ = tape.finish("exit 1");
     let read = show::open(&tape.sink.bytes(), false).expect("the tape reads");
     let decisions = show::decisions(&read);
@@ -202,19 +194,23 @@ fn a_recorded_approval_reads_back_as_its_decision() {
 
 /// What the crashing child of [`a_crashed_run_leaves_a_tape_that_reads_to_its_tear`]
 /// is told, and where its tape goes.
+#[cfg(unix)]
 const CRASH_CHILD: &str = "ATERM_TAPE_CRASH_CHILD";
+#[cfg(unix)]
 const CRASH_TEST: &str =
     "supervise::run::tests::tape_loop::a_crashed_run_leaves_a_tape_that_reads_to_its_tear";
 
 /// A tape file that dies inside its `crash_at`-th frame's write: half the
 /// frame reaches the disk, then the process is killed (`SIGKILL`, no
 /// destructor runs) — a crash inside a frame's one `write(2)`.
+#[cfg(unix)]
 struct DyingFile {
     file: std::fs::File,
     frames: usize,
     crash_at: usize,
 }
 
+#[cfg(unix)]
 impl crate::supervise::tape::frame::FrameSink for DyingFile {
     fn write_frame(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::Write as _;
@@ -235,11 +231,13 @@ impl crate::supervise::tape::frame::FrameSink for DyingFile {
 /// The transport of the crashing child: every request appended to a log
 /// before it is served, so the parent knows what the child had sent when it
 /// died.
+#[cfg(unix)]
 struct Logged<'a> {
     inner: &'a mut Mock,
     log: std::fs::File,
 }
 
+#[cfg(unix)]
 impl Ctl for Logged<'_> {
     fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
         use std::io::Write as _;
@@ -284,7 +282,7 @@ fn a_crashed_run_leaves_a_tape_that_reads_to_its_tear() {
         s.set_fx(fx);
         s.set_clock(TEST_NOW, PDT);
         s.set_zone_lookup(test_zones);
-        let _ = s.watch(&auto(30, None), &mut std::io::sink());
+        let _ = s.watch(&auto(30), &mut std::io::sink());
         panic!("the child was to die inside its fourth frame");
     }
     let dir = crate::supervise::ScratchDir::new("tape-crash", "child");

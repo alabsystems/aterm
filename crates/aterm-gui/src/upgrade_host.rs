@@ -215,6 +215,7 @@ pub(crate) fn word_writer_at(home: PathBuf, state: PathBuf, sock: Option<String>
             // are (`Row::quiet`): `[harness] upgrade_ask` as parsed.
             ask: crate::harness_host::upgrade_ask(),
             several_logins: crate::harness_host::several_logins(),
+            usage_credits: crate::harness_host::usage_credits(),
             // A word is written: no line is typed.
             usage_tap: None,
             instances: upgrade_drive::Instances::Machine,
@@ -370,6 +371,9 @@ pub(crate) struct UpgradeView {
     /// The managed-current wire text last posted, so a change in the rows
     /// re-derives its words (`App::post_managed_current` records only news).
     managed_text: Option<String>,
+    /// The tabs the host's last rows left as they stand ([`App::apply_host_upgrades`]):
+    /// their record could not be read, so what the window shows of them is kept.
+    kept: BTreeSet<String>,
     /// What writes the owner's word ([`WordWriter`]).
     writer: WordWriter,
     /// Where a press's word goes to be written off the winit thread.
@@ -523,7 +527,29 @@ impl App {
     /// `Wake::AgentUpgrade`: the host's rows for this instance's live tabs,
     /// with the owner's words they were read too soon to carry
     /// ([`UpgradeView::words_landed`]).
-    pub(crate) fn apply_host_upgrades(&mut self, mut rows: Vec<Row>) {
+    ///
+    /// THE TABS LEFT AS THEY STAND (`kept`, ATERM-KI-1016-1): tabs whose upgrade
+    /// record the host could not read (`upgrade_drive::View::refresh_keeping`).
+    /// What the window shows of them is kept: the rows it holds for them stay
+    /// beside the host's ([`UpgradeView::kept`]), and a stall row an earlier
+    /// process left on the band for them is not withdrawn
+    /// ([`Self::post_upgrade_stalls`]). Every other tab is renewed. Until then
+    /// the host handed over nothing while such a record stood, and every
+    /// tab's rows stood with it.
+    pub(crate) fn apply_host_upgrades(&mut self, mut rows: Vec<Row>, kept: Vec<String>) {
+        let kept: BTreeSet<String> = kept.into_iter().collect();
+        let held: Vec<Row> = self
+            .upgrade_view
+            .rows
+            .iter()
+            .filter(|r| kept.contains(&r.tab) && !rows.iter().any(|n| n.session == r.session))
+            .cloned()
+            .collect();
+        if !held.is_empty() {
+            rows.extend(held);
+            rows.sort_by(|a, b| a.session.cmp(&b.session));
+        }
+        self.upgrade_view.kept = kept;
         self.upgrade_view.words_landed(&mut rows);
         self.apply_agent_upgrades(rows);
     }
@@ -556,6 +582,10 @@ impl App {
             // The tab's one row (LC-9 of ATERM-KI-1015-1, `upgrade_drive::tab_row`):
             // a finished move of an earlier conversation never stands in for a newer one.
             let row = shown.iter().find(|r| r.tab == h.sid.as_str()).cloned();
+            // A tab left as it stands, with no row: its column and note as they are.
+            if row.is_none() && self.upgrade_view.kept.contains(h.sid.as_str()) {
+                continue;
+            }
             let note = row.as_ref().and_then(|r| r.pause_note(now));
             let mut timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             timeline.set_upgrade(row);
@@ -950,6 +980,14 @@ impl App {
     fn post_upgrade_stalls(&mut self, shown: &[Row], rows: &[Row], now: u64) {
         let stalled: BTreeMap<String, (&Row, String)> = shown
             .iter()
+            // A TAB LEFT AS IT STANDS ([`UpgradeView::kept`], ATERM-KI-1016-1
+            // host-8) is no stall of this pass: what its record says now is
+            // not known, so its entry stays as it is (the `gone` read below
+            // keeps it) and no entry is posted or restated off the row the
+            // window holds for it — that row is the last look's, and read at
+            // `now` it ages: an `Exiting` row past its bound raised `claude
+            // --resume` over a conversation its relaunch already held.
+            .filter(|r| !self.upgrade_view.kept.contains(&r.tab))
             .filter_map(|r| {
                 let stall = r.stall(now)?;
                 // The entry's shape is part of what was said: an interrupt (the agent the
@@ -996,6 +1034,8 @@ impl App {
             .filter_map(|(tab, posted)| {
                 let flying = in_flight.contains(&tab.as_str());
                 match stalled.get(tab) {
+                    // A tab left as it stands keeps its stall ([`UpgradeView::kept`]).
+                    None if self.upgrade_view.kept.contains(tab) => None,
                     // Its restart stuck, and moved again: that stall is over.
                     None if flying && stuck(&posted.said) => Some((tab.clone(), true)),
                     None if flying => None,
@@ -1255,9 +1295,14 @@ impl App {
         // Rows no entry of this view owns (an earlier process's, carried across the
         // handoff and not adopted above) are withdrawn, whatever became of their tab.
         let owned: BTreeSet<MessageId> = self.upgrade_view.stalled.values().map(|p| p.id).collect();
+        // A restart in flight keeps its tab's row, and so does a tab left as it stands
+        // ([`UpgradeView::kept`]): what the host could not read of it may be what that
+        // row says.
         let restarting: BTreeSet<String> = in_flight
             .iter()
-            .map(|tab| message_reporters::agent_upgrade_key(tab))
+            .copied()
+            .chain(self.upgrade_view.kept.iter().map(String::as_str))
+            .map(message_reporters::agent_upgrade_key)
             .collect();
         let left: Vec<MessageId> = self
             .messages
@@ -1463,7 +1508,7 @@ impl App {
     /// With more than one window the window is named too (`in window 2, tab 1`): tabs are
     /// counted per window and the band is every window's, so two agents first in their own
     /// windows would both read `in tab 1`. Windows are counted in id order (the order they
-    /// were opened), as the connection map's `Window 2` counts them; one window keeps the
+    /// were opened), as the Overview's `Window 2` counts them; one window keeps the
     /// short words.
     pub(crate) fn upgrade_place(&self, sid: &str) -> String {
         self.upgrade_spot(sid).place
@@ -1515,17 +1560,37 @@ impl App {
     /// pane.
     pub(crate) fn session_place(&self, sid: &str) -> String {
         let place = self.upgrade_place(sid);
-        match self.session_pane(sid) {
+        match self.session_pane(sid, false) {
             Some(pane) => format!("{place}, {pane}"),
             None => place,
         }
     }
 
-    /// The pane word of session `sid`'s leaf in the tab that shows it
-    /// ([`pane_word`]), or `None` where that tab holds one agent session, or
-    /// none shows it. Leaf locks only: each leaf's program is read from its
-    /// timeline, one at a time.
-    fn session_pane(&self, sid: &str) -> Option<String> {
+    /// WHERE SESSION `sid` IS, ITS PANE NAMED WHEREVER ITS TAB HOLDS MORE
+    /// THAN ONE PANE, an agent's or not, and whether it named one: for a
+    /// record about the PANE rather than an agent in it — a timer's fire over
+    /// a pane no agent runs in, whose shell beside Claude Code read `Tab 1:
+    /// … no agent runs in the tab` (behaviour-4 of the post-landing check of
+    /// Autopilot v3 wave 1). [`Self::session_place`] tells agents apart, so it
+    /// names no pane for a shell beside one agent; here every pane counts, in
+    /// [`pane_word`]'s words (`left pane`, `pane 3`), which never name one
+    /// of the tab's agents' panes. The tab alone where it holds this pane
+    /// alone, or none shows it.
+    pub(crate) fn pane_place(&self, sid: &str) -> (String, bool) {
+        let place = self.upgrade_place(sid);
+        match self.session_pane(sid, true) {
+            Some(pane) => (format!("{place}, {pane}"), true),
+            None => (place, false),
+        }
+    }
+
+    /// The pane word of session `sid`'s leaf in the tab that shows it among
+    /// the tab's agent sessions the Harness page admits
+    /// ([`agent_pane_word`]) — or, with `every_pane`, among all its panes
+    /// ([`pane_word`]) — or `None` where that tab holds one such, or none
+    /// shows it. Leaf locks only: each leaf's program is read from its
+    /// timeline, one at a time (none with `every_pane`).
+    fn session_pane(&self, sid: &str, every_pane: bool) -> Option<String> {
         let local_of = |view: &crate::tab_model::ViewId| {
             self.view_store
                 .get(*view)
@@ -1547,11 +1612,19 @@ impl App {
                 tab.root
                     .any_leaf(&mut |view| local_of(view).is_some_and(is_sid))
                     .then(|| {
-                        agent_pane_word(
-                            &tab.root,
-                            |view| local_of(view).is_some_and(is_sid),
-                            |view| local_of(view).and_then(observed_agent),
-                        )
+                        if every_pane {
+                            pane_word(
+                                &tab.root,
+                                |view| local_of(view).is_some_and(is_sid),
+                                |_| true,
+                            )
+                        } else {
+                            agent_pane_word(
+                                &tab.root,
+                                |view| local_of(view).is_some_and(is_sid),
+                                |view| local_of(view).and_then(observed_agent),
+                            )
+                        }
                     })
             })
         })?
@@ -2333,7 +2406,7 @@ mod tests {
             (vec![faulty.clone()], faulty.clone()),
         ] {
             let mut app = App::headless_for_test();
-            app.apply_host_upgrades(rows.clone());
+            app.apply_host_upgrades(rows.clone(), Vec::new());
             assert_eq!(told(&app), 1, "{:?}", harness_records(&app));
             // The word lands on the tab's newest conversation, or on one the
             // window has no row for.
@@ -2351,7 +2424,7 @@ mod tests {
                 "{}: every conversation's row is kept",
                 answered.session
             );
-            app.apply_host_upgrades(rows.clone());
+            app.apply_host_upgrades(rows.clone(), Vec::new());
             assert_eq!(told(&app), 1, "once: {:?}", harness_records(&app));
             if answered.session == unshown.session {
                 assert!(
@@ -4090,6 +4163,79 @@ mod tests {
         .line("Claude Code 2.1.280 \u{2192} 2.1.283")
         .hold(aterm_messages::Hold::STANDING)
         .key(&message_reporters::agent_upgrade_key(tab))
+    }
+
+    /// A tab the host leaves as it stands (its record could not be read,
+    /// `upgrade_drive::View::refresh_keeping`) keeps what the window shows of
+    /// it: the row an earlier process left up for it is not withdrawn, and this
+    /// process's own row for it stands; every other tab is renewed
+    /// (ATERM-KI-1016-1 host-8).
+    #[test]
+    fn a_tab_left_as_it_stands_keeps_its_rows_and_the_rest_are_renewed() {
+        let (carried, other, mine) = ("s-carried", "s-other", "s-mine");
+        let (mut app, ids) = successor_carrying(&[gave_up_row(carried), gave_up_row(other)]);
+        let retired = |app: &App, id: MessageId| {
+            app.messages
+                .log()
+                .get(id)
+                .and_then(|r| r.retired().cloned())
+        };
+        app.apply_host_upgrades(vec![gone(mine)], vec![carried.to_string()]);
+        assert_eq!(
+            row_of(&app, carried).map(|(id, _)| id),
+            Some(ids[0]),
+            "the carried row of a tab left as it stands stays"
+        );
+        assert_eq!(
+            retired(&app, ids[1]),
+            Some(aterm_messages::Retired::Withdrawn),
+            "another tab's carried row: withdrawn, as ever"
+        );
+        let (own, _) = row_of(&app, mine).expect("this process's own row");
+        // Its record cannot be read now: its row as the window holds it.
+        app.apply_host_upgrades(Vec::new(), vec![carried.to_string(), mine.to_string()]);
+        assert_eq!(row_of(&app, mine).map(|(id, _)| id), Some(own));
+        assert!(app.upgrade_view.rows.iter().any(|r| r.tab == mine));
+        assert_eq!(row_of(&app, carried).map(|(id, _)| id), Some(ids[0]));
+        // Negative control: read whole and gone, both rows go.
+        app.apply_host_upgrades(Vec::new(), Vec::new());
+        assert!(row_of(&app, mine).is_none());
+        assert!(row_of(&app, carried).is_none());
+        assert_eq!(
+            retired(&app, ids[0]),
+            Some(aterm_messages::Retired::Withdrawn)
+        );
+        assert!(app.upgrade_view.rows.is_empty());
+    }
+
+    /// A TAB LEFT AS IT STANDS RAISES NO STALL OFF THE ROW THE WINDOW HOLDS FOR
+    /// IT (ATERM-KI-1016-1 host-8, the review of its first cut): its record
+    /// cannot be read, so the window keeps its last row for it — and that row,
+    /// read at the window's `now`, ages. Here the row the window holds reads a
+    /// stall now (its agent the upgrade ended, ten minutes ago): no entry is
+    /// posted for it while the tab is kept, and a stall entry the tab already
+    /// had stays as it is. CONTROL: the same row handed over by a whole look
+    /// posts its entry.
+    #[test]
+    fn a_tab_left_as_it_stands_raises_no_stall_off_the_row_the_window_holds() {
+        let tab = "s-held";
+        let mut app = App::headless_for_test();
+        app.upgrade_view.rows = vec![refused(tab)];
+        app.apply_host_upgrades(Vec::new(), vec![tab.to_string()]);
+        assert!(
+            row_of(&app, tab).is_none(),
+            "no stall entry off the row the window holds"
+        );
+        assert!(
+            app.upgrade_view.rows.iter().any(|r| r.tab == tab),
+            "its row is kept"
+        );
+        // CONTROL: handed over by a whole look, the stall is the tab's.
+        app.apply_host_upgrades(vec![refused(tab)], Vec::new());
+        let (id, _) = row_of(&app, tab).expect("a whole look's stall is posted");
+        // Left as it stands again, its entry stays as it is.
+        app.apply_host_upgrades(Vec::new(), vec![tab.to_string()]);
+        assert_eq!(row_of(&app, tab).map(|(id, _)| id), Some(id), "kept");
     }
 
     /// Rows carried across a handoff stand until the host's first look, then are withdrawn

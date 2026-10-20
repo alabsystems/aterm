@@ -327,6 +327,86 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
     assert_eq!(std::fs::read(&keylog).unwrap(), b"1");
 }
 
+/// `act=` (session log phase 5, ruling T1) is checked with the key's other
+/// leading options before a byte moves: a malformed or repeated one answers
+/// `ERR usage` and the worker receives nothing. POSITIVE CONTROL:
+/// `key act=approve 1` delivers exactly the key's byte (the option is not
+/// typed), and the log marks the input with its act.
+#[test]
+fn a_refused_act_types_nothing() {
+    let inst = boot("a");
+    let (_local, sid) = boot_session(&inst);
+    let script = inst.tmp.join("fake.sh");
+    let go = inst.tmp.join("go");
+    let keylog = inst.tmp.join("keys.log");
+    std::fs::write(&script, FAKE_WORKER).expect("write the fake worker");
+    type_line(
+        &inst,
+        &sid,
+        &format!(
+            "/bin/sh {} {} {}",
+            script.display(),
+            go.display(),
+            keylog.display()
+        ),
+    );
+    await_match(&inst, &sid, "Esc.to.cancel");
+    assert_eq!(
+        std::fs::metadata(&keylog).map(|m| m.len()).ok(),
+        Some(0),
+        "PRECONDITION: the worker is up and has received nothing"
+    );
+    for bad in [
+        vec!["act=bogus"],
+        vec!["act="],
+        vec!["act=approve", "act=deny"],
+    ] {
+        let mut args = vec![format!("@{sid}"), "key".to_string()];
+        args.extend(bad.iter().map(|s| (*s).to_string()));
+        args.push("1".to_string());
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = ctl(&inst, &args);
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(said.contains("ERR usage: act="), "{bad:?}: {said}");
+    }
+    // Refused in the server, so nothing is in flight: one `await idle` bounds
+    // the wait for a byte that must not come (a hang detector, as above).
+    ctl_ok(
+        &inst,
+        &[&format!("@{sid}"), "await", "idle", "200", HANG_MS],
+    );
+    assert_eq!(
+        std::fs::read(&keylog).expect("the key log"),
+        b"",
+        "a refused act= must deliver nothing"
+    );
+    let reply = ctl_ok(&inst, &[&format!("@{sid}"), "key", "act=approve", "1"]);
+    assert!(reply.starts_with("OK seq="), "{reply}");
+    let deadline = Instant::now() + HANG;
+    while Instant::now() < deadline && std::fs::read(&keylog).unwrap_or_default().is_empty() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    ctl_ok(
+        &inst,
+        &[&format!("@{sid}"), "await", "idle", "200", HANG_MS],
+    );
+    assert_eq!(
+        std::fs::read(&keylog).expect("the key log"),
+        b"1",
+        "key act=approve delivers exactly the key"
+    );
+    let log = ctl_ok(&inst, &[&format!("@{sid}"), "log", "n=400"]);
+    assert!(
+        log.lines()
+            .any(|l| l.contains(" mark - input verb=key act=approve by=ctl ")),
+        "{log}"
+    );
+}
+
 /// One request on an already-authenticated persistent connection.
 fn request(reader: &mut BufReader<std::os::unix::net::UnixStream>, line: &str) -> String {
     use std::io::Write;
@@ -534,8 +614,8 @@ impl<C: aterm_agent::supervise::run::Ctl> aterm_agent::supervise::run::Ctl for R
 }
 
 /// THE MERGED ENGINE'S FENCED PRESS, live (harness/integrate, 2026-09-24):
-/// the engine's `supervise` at its default (every box its answer), over its
-/// real persistent transport, reads the fake worker's read-only Bash box,
+/// the engine's hosted loop (`Session::run_hosted`, the window's) at its
+/// default policy (every box its answer), over its real persistent transport, reads the fake worker's read-only Bash box,
 /// decides it, and presses
 /// `key if-human=<the read's person count> if-gen=<the read's generation>
 /// if=<the judged row> 1` — the generation taken from its own `text --json`
@@ -597,15 +677,18 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
         let mut s = Session::new(&mut ctl, Some(format!("@{sid}")));
         // The approval ledger goes to the scratch world, never the real HOME.
         s.set_approval_ledger(Some(inst.tmp.join("approvals.jsonl")));
-        let ran = s.supervise(&opts);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut out: Vec<u8> = Vec::new();
+        let ran = s.run_hosted(&opts, stop, &mut out);
         drop(s);
         // Ended by `end_after_press` (a wait answered `ERR exited` after the
         // press), or by the budget; anything else is the loop failing.
         assert!(
             ran.as_ref()
-                .map_or_else(|e| e.ends_with("ERR exited"), |_| true),
-            "supervise ran: {ran:?} {:?}",
-            ctl.requests
+                .map_or_else(|e| e.ends_with("ERR exited"), |()| true),
+            "the loop ran: {ran:?} {:?} {}",
+            ctl.requests,
+            String::from_utf8_lossy(&out)
         );
         ran
     };
@@ -614,13 +697,19 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
         .iter()
         .filter(|r| r.split_whitespace().any(|w| w == "key"))
         .collect();
-    // An option-choosing digit goes fenced on the read's person count, its
-    // generation and the judged row: `key if-human=<n> if-gen=<e>.<s> if=^… 1`.
+    // An option-choosing digit says what it means, then goes fenced on the
+    // read's person count, its generation and the judged row:
+    // `key act=approve if-human=<n> if-gen=<e>.<s> if=^… 1`. This server's
+    // `help key` names `act=` (5D-3), so the approving digit carries it.
     assert!(
         presses.iter().any(|p| {
             let words: Vec<&str> = p.split_whitespace().collect();
             let mut at = words.iter().position(|w| *w == "key").unwrap() + 1;
-            // A digit carries the person count it was judged under first.
+            if words.get(at) != Some(&"act=approve") {
+                return false;
+            }
+            at += 1;
+            // A digit carries the person count it was judged under next.
             if words.get(at).is_some_and(|w| {
                 w.strip_prefix("if-human=")
                     .is_some_and(|n| n.parse::<u64>().is_ok())

@@ -17,6 +17,7 @@ fn canonical_host_chrome_order_is_base_then_tray_then_bell_then_overlay() {
         ph: 1,
         dx: 5,
         dy: 5,
+        scrim: None,
     };
     let overlay = OverlayGlow {
         accent: 0x0000_FF00,
@@ -86,6 +87,7 @@ fn band_aware_overlay_twins_shift_without_touching_bands() {
 
     // composite_tray_at: a band offset shifts the card.
     let card = crate::SettingsCard {
+        scrim: None,
         rgba: vec![0xAA, 0xBB, 0xCC, 0xFF],
         pw: 1,
         ph: 1,
@@ -108,11 +110,84 @@ fn band_aware_overlay_twins_shift_without_touching_bands() {
     assert_eq!(t3[0], 0);
 }
 
+/// A card's scrim composites as the window-sized card of that colour it
+/// replaces: byte-identical to baking the colour into every pixel around the
+/// card from the scrim's `top` row down, the banner rows above left clear.
+/// Negative control: without it the frame around the card is untouched.
+#[test]
+fn a_tray_scrim_composites_as_the_window_sized_card_it_replaces() {
+    let (w, h) = (12usize, 9usize);
+    let base: Vec<u32> = (0..w * h)
+        .map(|i| (i as u32).wrapping_mul(0x0003_0507) & 0x00FF_FFFF)
+        .collect();
+    let smoke = [0, 0, 0, 0x4D];
+    let card_px = [0xE0, 0x20, 0x90, 0xFF];
+    let (dx, dy, pw, ph, top) = (3u32, 4u32, 4u32, 2u32, 2u32);
+    let small = card_px.repeat((pw * ph) as usize);
+    let quad = |scrim| aterm_gpu::TrayQuad {
+        rgba: &small,
+        pw,
+        ph,
+        dx,
+        dy,
+        scrim,
+    };
+    let mut layered = base.clone();
+    let scrim = aterm_gpu::TrayScrim { rgba: smoke, top };
+    composite_tray_quad_at(&mut layered, w, h, 0, 0, quad(Some(scrim)));
+
+    let mut full = Vec::with_capacity(w * h * 4);
+    for y in 0..h as u32 {
+        for x in 0..w as u32 {
+            let on_card = (dx..dx + pw).contains(&x) && (dy..dy + ph).contains(&y);
+            full.extend_from_slice(&if on_card {
+                card_px
+            } else if y >= top {
+                smoke
+            } else {
+                [0; 4]
+            });
+        }
+    }
+    let mut baked = base.clone();
+    let window_sized = aterm_gpu::TrayQuad {
+        rgba: &full,
+        pw: w as u32,
+        ph: h as u32,
+        dx: 0,
+        dy: 0,
+        scrim: None,
+    };
+    composite_tray_quad_at(&mut baked, w, h, 0, 0, window_sized);
+    assert_eq!(
+        layered, baked,
+        "the layer is the baked card, pixel for pixel"
+    );
+    let banner = top as usize * w;
+    assert_eq!(
+        layered[..banner],
+        base[..banner],
+        "the banner rows stay clear"
+    );
+
+    let mut bare = base.clone();
+    composite_tray_quad_at(&mut bare, w, h, 0, 0, quad(None));
+    assert_ne!(bare, layered, "negative control: the scrim dims the window");
+    // A crop offset past the surface clips instead of panicking.
+    let mut tiny = vec![0x00FF_FFFFu32; 1];
+    composite_tray_quad_at(&mut tiny, 1, 1, -5, -50, quad(Some(scrim)));
+    assert_ne!(
+        tiny[0], 0x00FF_FFFF,
+        "a fill from above the surface still covers it"
+    );
+}
+
 /// src-over math: `a==255` ⇒ src, `a==0` ⇒ dst untouched, `a==128` ⇒ rounded blend;
 /// and an offset past the surface never panics / writes OOB.
 #[test]
 fn composite_tray_src_over_and_clamps() {
     let card = |rgba: Vec<u8>, dx: u32, dy: u32| crate::SettingsCard {
+        scrim: None,
         rgba,
         pw: 1,
         ph: 1,
@@ -157,6 +232,7 @@ fn composite_tray_src_over_and_clamps() {
 #[test]
 fn tray_floor_crop_preserves_banner_and_exact_rgba_suffix() {
     let card = crate::SettingsCard {
+        scrim: None,
         rgba: vec![
             0x10, 0, 0, 0xFF, 0x11, 0, 0, 0xFF, // row 0
             0x20, 0, 0, 0xFF, 0x21, 0, 0, 0xFF, // row 1

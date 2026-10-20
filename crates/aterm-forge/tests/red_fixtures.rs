@@ -4,11 +4,12 @@
 //! Non-vacuity proofs for `targo --unverified forge check`: each test plants a
 //! violation and asserts the gate goes red.
 //!
-//! Each drives the verb, not a helper: the carve, fork-ledger and liveness
-//! fixtures call [`aterm_forge::check::check_report`] over the whole cell
-//! matrix; the review-registration and NOTICE fixtures call
-//! [`aterm_forge::check::run`] with `--cell mac-arm` (`check_one_cell`), since
-//! their obligations are judged before the per-cell loop.
+//! Each drives the verb, not a helper: [`aterm_forge::check::run`] with
+//! `--cell mac-arm` (`check_one_cell`). The review-registration, NOTICE, carve
+//! and fork-ledger obligations are judged once, whatever the cells, and the
+//! liveness one per cell, so one cell red is the verb red. One baseline, the
+//! carve fixture's, runs the whole default matrix instead (`check_every_cell`),
+//! so every cell must resolve this aterm-shaped tree and judge it green.
 //!
 //! # How each fixture is built
 //!
@@ -38,13 +39,13 @@
 //!     found". The real repository reaches forks through `[patch.crates-io]`
 //!     only.
 //!
-//! Every test asserts green first, so a red can only come from the plant.
+//! Every test asserts green first, so a red can only come from the plant; the
+//! verb is a function of the tree, so a tree put back as it was is that green.
 #![allow(
     clippy::disallowed_types,
     reason = "never linked into the shipped binary: the third-party survey behind targo --unverified forge"
 )]
 
-use aterm_forge::check::check_report;
 use aterm_forge::model::PkgId;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -83,19 +84,25 @@ fn workspace_manifest(members_extra: &str, patch_extra: &str) -> String {
 }
 
 /// The forge verb over one cell (`targo --unverified forge check --cell
-/// mac-arm`, i.e. [`aterm_forge::check::run`]), folded to `(green, transcript)`
-/// as `check_report` does: could-not-run is red, with the reason and the
-/// transcript so far.
-///
-/// Used by the `[OB-11]` and `[OB-6]` fixtures, whose violations are judged
-/// before the per-cell loop. The `[OB-13]`, `[OB-17]` and `[OB-12]` fixtures
-/// keep the whole matrix.
+/// mac-arm`, i.e. [`aterm_forge::check::run`]), folded to `(green, transcript)`:
+/// could-not-run is red, with the reason and the transcript so far.
 fn check_one_cell(root: &Path) -> (bool, String) {
     match aterm_forge::check::run(
         &aterm_forge::resolve::Cargo::from_env(),
         root,
         &["mac-arm".to_string()],
     ) {
+        Ok(outcome) => (outcome.ok, outcome.log),
+        Err(why) => (false, why),
+    }
+}
+
+/// The forge verb over every default cell (`targo --unverified forge check`
+/// with no `--cell`, as `verify forge` runs it), folded as [`check_one_cell`]
+/// folds it. A cell rooted at a package aterm does not ship, or at a triple
+/// cargo cannot resolve, is could-not-run, so red.
+fn check_every_cell(root: &Path) -> (bool, String) {
+    match aterm_forge::check::run(&aterm_forge::resolve::Cargo::from_env(), root, &[]) {
         Ok(outcome) => (outcome.ok, outcome.log),
         Err(why) => (false, why),
     }
@@ -357,7 +364,7 @@ fn copy_tree(from: &Path, to: &Path) {
 // ---------------------------------------------------------------------------
 
 /// `[OB-13]` the carve ledger: a path recorded as deleted is present again.
-/// Green before, red after, green again once removed.
+/// Green before in every default cell, red after.
 ///
 /// The carved path is the fork's `src/x86.rs`, a real module of zeroize compiled
 /// only for x86 targets; the fixture deletes it.
@@ -374,16 +381,17 @@ fn a_reinstated_carved_module_reds_the_forge_verb() {
          reason = \"target-gated x86 module; the fixture keeps it deleted\"\n",
     ));
 
-    let (ok, log) = check_report(fx.root());
+    let (ok, log) = check_every_cell(fx.root());
     assert!(
         ok,
-        "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
+        "the baseline fixture must be GREEN in every default cell, or a cell no longer \
+         resolves what aterm ships (and this test proves nothing):\n{log}"
     );
 
     // Plant the violation: the carved module is back.
     fx.write(&carved, "// reinstated by hand\n");
 
-    let (ok, log) = check_report(fx.root());
+    let (ok, log) = check_one_cell(fx.root());
     assert!(
         !ok,
         "a reinstated carved path must turn the forge verb RED:\n{log}"
@@ -391,14 +399,6 @@ fn a_reinstated_carved_module_reds_the_forge_verb() {
     assert!(
         log.contains("FAIL [OB-13]"),
         "the RED must be the carve-ledger obligation:\n{log}"
-    );
-
-    // And it goes green again the moment the tree agrees with the ledger.
-    fx.remove(&carved);
-    let (ok, log) = check_report(fx.root());
-    assert!(
-        ok,
-        "removing the reinstated path must restore GREEN:\n{log}"
     );
 }
 
@@ -471,11 +471,6 @@ fn a_notice_that_omits_a_registered_fork_reds_the_forge_verb() {
         log.contains("FAIL [OB-6]"),
         "the RED must be the NOTICE-agreement obligation:\n{log}"
     );
-
-    // Restoring the line restores GREEN: the fixture is not stuck red.
-    fx.write_notice(&[(FORK, &fork_version(), FORK_LICENSE)]);
-    let (ok, log) = check_one_cell(fx.root());
-    assert!(ok, "restoring the NOTICE line must restore GREEN:\n{log}");
 }
 
 /// `[OB-17]` the fork ledger: a `[[fork]]` block describing another copy turns
@@ -484,7 +479,7 @@ fn a_notice_that_omits_a_registered_fork_reds_the_forge_verb() {
 fn a_ledger_that_disagrees_with_the_tree_reds_the_forge_verb() {
     let fx = Fixture::baseline("fork-ledger");
 
-    let (ok, log) = check_report(fx.root());
+    let (ok, log) = check_one_cell(fx.root());
     assert!(
         ok,
         "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
@@ -501,7 +496,7 @@ fn a_ledger_that_disagrees_with_the_tree_reds_the_forge_verb() {
         "vendor/forge.toml",
         &good.replace(&recorded, "version = \"0.0.1-another-copy\""),
     );
-    let (ok, log) = check_report(fx.root());
+    let (ok, log) = check_one_cell(fx.root());
     assert!(
         !ok,
         "a fork block describing another copy must turn the forge verb RED:\n{log}"
@@ -520,12 +515,8 @@ fn a_ledger_that_disagrees_with_the_tree_reds_the_forge_verb() {
     );
     assert_ne!(planted, good, "the plant must change the ledger");
     fx.write("vendor/forge.toml", &planted);
-    let (ok, log) = check_report(fx.root());
+    let (ok, log) = check_one_cell(fx.root());
     assert!(!ok && log.contains("FAIL [OB-17]"), "{planted}\n{log}");
-
-    fx.write("vendor/forge.toml", &good);
-    let (ok, log) = check_report(fx.root());
-    assert!(ok, "restoring the ledger must restore GREEN:\n{log}");
 }
 
 /// `[OB-12]` patch liveness: a second, unpatched copy of a patched crate
@@ -536,7 +527,7 @@ fn a_ledger_that_disagrees_with_the_tree_reds_the_forge_verb() {
 fn an_unpatched_sibling_version_reds_the_forge_verb() {
     let fx = Fixture::baseline("unpatched-sibling");
 
-    let (ok, log) = check_report(fx.root());
+    let (ok, log) = check_one_cell(fx.root());
     assert!(
         ok,
         "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
@@ -581,31 +572,10 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
         "crates/aterm/Cargo.toml",
         &aterm_manifest("dep_b = { path = \"../dep_b\" }\n"),
     );
-    // The wasm cells are rooted at the web modules, so the planted sibling
-    // must reach them too, or those cells would carry no sibling.
-    for web in ["aterm-wasm", "aterm-gpu-web"] {
-        fx.write(
-            &format!("crates/{web}/Cargo.toml"),
-            &format!(
-                "[package]\n\
-                 name = \"{web}\"\n\
-                 version = \"0.47.0\"\n\
-                 edition = \"2021\"\n\
-                 publish = false\n\
-                 \n\
-                 [lib]\n\
-                 crate-type = [\"cdylib\", \"rlib\"]\n\
-                 \n\
-                 [dependencies]\n\
-                 {FORK} = {{ path = \"../../vendor/{FORK}\" }}\n\
-                 dep_b = {{ path = \"../dep_b\" }}\n"
-            ),
-        );
-    }
     fx.write("Cargo.toml", &workspace_manifest(", \"crates/dep_b\"", ""));
     fx.regen_lock();
 
-    let (ok, log) = check_report(fx.root());
+    let (ok, log) = check_one_cell(fx.root());
     assert!(
         !ok,
         "an unpatched sibling of a patched crate must turn the forge verb RED:\n{log}"

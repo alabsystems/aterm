@@ -444,7 +444,7 @@ mod tests {
             .output()
             .unwrap_or_else(|e| {
                 panic!(
-                    "{}: node runs the generated glue and could not start ({e}); {}",
+                    "{}: node could not start ({e}); the generated glue runs under node; {}",
                     crate::libtest::COULD_NOT_RUN_SENTINEL,
                     crate::install_fix("node", "node", "nodejs")
                 )

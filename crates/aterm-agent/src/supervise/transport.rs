@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The supervisor's transports: [`RelayCtl`], the [`Ctl`] seam over one persistent control
-//! connection, and [`Transport`], which is that connection or, where it cannot be opened, the
-//! `aterm-ctl`-per-request [`CtlClient`].
+//! The supervisor's persistent transport: [`RelayCtl`], the [`Ctl`] seam over one persistent
+//! control connection ([`RelayClient`] underneath). The other [`Ctl`] is the
+//! `aterm-ctl`-per-request [`crate::CtlClient`].
 //!
 //! A held socket avoids forking `aterm` per request, and an in-GUI host has no binary to fork.
 //! [`RelayCtl`] renders every reply as `aterm-ctl` prints it
@@ -22,7 +22,7 @@ use aterm_types::control_verbs::{Framing, artifact_reply_requires_ack, framing_o
 use aterm_uds::CtlStream;
 
 use super::run::{Ctl, CtlReply, Interrupter};
-use crate::{CtlClient, RelayClient};
+use crate::RelayClient;
 
 /// How long a request that names no `timeout` may wait for its answer.
 const DEFAULT_REPLY_WAIT: Duration = Duration::from_secs(60);
@@ -301,39 +301,6 @@ impl Ctl for RelayCtl {
     }
 }
 
-/// The supervisor's client: the persistent connection where it could be
-/// opened, else one `aterm-ctl` per request.
-pub enum Transport {
-    Relay(RelayCtl),
-    Shell(CtlClient),
-}
-
-impl Transport {
-    /// [`RelayCtl`] on `endpoint` when it dials now, else `fallback`.
-    pub fn open(endpoint: Endpoint, token: Option<String>, fallback: CtlClient) -> Self {
-        let mut relay = RelayCtl::new(endpoint, token);
-        match relay.connect() {
-            Ok(()) => Transport::Relay(relay),
-            Err(_) => Transport::Shell(fallback),
-        }
-    }
-}
-
-impl Ctl for Transport {
-    fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
-        match self {
-            Transport::Relay(r) => r.call(args),
-            Transport::Shell(c) => Ctl::call(c, args),
-        }
-    }
-    fn interrupter(&self) -> Option<Interrupter> {
-        match self {
-            Transport::Relay(r) => r.interrupter(),
-            Transport::Shell(c) => Ctl::interrupter(c),
-        }
-    }
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -516,8 +483,7 @@ mod tests {
         let meta = c.call(&["@s-1", "meta"]).expect("meta");
         assert_eq!(meta.stdout, "OK title=- attention=-\n");
         // `search`'s ` incomplete` marker: the hits on stdout, `aterm-ctl`'s
-        // note for it on stderr, then the header (`aterm drive report` reads
-        // both).
+        // note for it on stderr, then the header (the report reads both).
         let search = c.call(&["@s-1", "search", "^›", "regex"]).expect("search");
         assert_eq!(
             (search.stdout.as_str(), search.stderr.as_str()),

@@ -1,0 +1,18 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_prompt_into_a_turn_holding_another_vendor_turn_supersedes_it
+# (S3, A21): dated at that turn's end, never before the box's close.
+bind 0
+see busy
+pass 100
+tx prompt v1
+pass 100
+see prompt bash:not-read-only
+pass 100
+tx end
+pass 100
+see busy
+pass 500
+tx prompt v2
+expect close t1 turn out=superseded at=400
+expect open t1 turn src=screen
+expect open t2 turn vref=v2

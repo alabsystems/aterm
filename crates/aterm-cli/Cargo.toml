@@ -40,6 +40,10 @@ aterm-primer = { workspace = true }
 # by the print-and-exit path, never the shell hot path; the one binary links the
 # updater already.
 aterm-update = { workspace = true }
+# `aterm help update` names the two update switches by the updater's one name for
+# each (`aterm_update_core::settings::CHECK_LABEL`), the words Settings paints. The
+# updater links it already, so it adds no package.
+aterm-update-core = { workspace = true }
 # `aterm list-kitty-commands` and `aterm help kitty` print the kitty-command
 # vocabulary FROM the table the typed-line listener compiles (aterm-lexicon's
 # `tricks` module), so the listing cannot drift from the words that fire. Pure
@@ -50,7 +54,8 @@ aterm-lexicon = { workspace = true }
 # control socket reaches, counted by aterm-ctl's census over the SAME rendezvous walk
 # `aterm ctl instances`/`ls`/`windows` make, so the doctor and the client cannot
 # disagree about what is reachable. Reached only by that print-and-exit path; the
-# one binary links aterm-ctl already, and it brings only aterm-types and aterm-uds.
+# one binary links aterm-ctl already, and it brings only first-party crates
+# (aterm-types, aterm-uds and aterm-codec).
 aterm-ctl = { path = "../aterm-ctl" }
 # `aterm exceptions` and `aterm doctor`'s `exceptions:` row: what needs a look but not
 # now, read from `messages.log` with NO window running, decoded and replayed by the

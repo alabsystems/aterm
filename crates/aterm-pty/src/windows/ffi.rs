@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! The ConPTY backend's FFI: direct `extern "system"` declarations against kernel32 (std
-//! already links it), ntdll (`NtOpenFile`, the ConDrv opens the OpenConsole launch needs)
-//! and version.dll (an OpenConsole's file version, for the host report), all three system
+//! already links it), ntdll (`NtOpenFile`, the ConDrv opens the OpenConsole launch needs,
+//! and `NtQueryInformationProcess`, a process's parent read through its handle) and
+//! version.dll (an OpenConsole's file version, for the host report), all three system
 //! DLLs. Handles are plain `isize`, so the session registry is `Send + Sync` without unsafe
 //! impls; struct layouts are transcribed from the Windows SDK.
 
@@ -33,6 +34,8 @@ pub(crate) const CREATE_SUSPENDED: u32 = 0x4;
 pub(crate) const STARTF_USESTDHANDLES: u32 = 0x100;
 /// `GetLastError` after `ReadFile` when the pipe's write side is gone (EOF).
 pub(crate) const ERROR_BROKEN_PIPE: u32 = 109;
+/// `GetLastError` after a `WriteFile` that `CancelSynchronousIo` cancelled.
+pub(crate) const ERROR_OPERATION_ABORTED: i32 = 995;
 /// `WaitFor*Object(s)` results.
 pub(crate) const WAIT_OBJECT_0: u32 = 0;
 pub(crate) const WAIT_TIMEOUT: u32 = 258;
@@ -86,6 +89,69 @@ pub(crate) const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
 /// `GetPackagesByPackageFamily` / `GetPackagePathByFullName`: the size probe's
 /// "buffer too small" answer (a Win32 error code, returned, not set).
 pub(crate) const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
+/// `JOBOBJECTINFOCLASS::JobObjectBasicProcessIdList`.
+pub(crate) const JOB_OBJECT_BASIC_PROCESS_ID_LIST_CLASS: i32 = 3;
+/// `OpenProcess` access right: the image path and little else (the console-input
+/// guard's runtime probe).
+pub(crate) const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+/// `OpenProcess` access right: `TerminateProcess` (a tab's programs outside its
+/// job, ended at its close).
+pub(crate) const PROCESS_TERMINATE: u32 = 0x0001;
+/// `PROCESSINFOCLASS::ProcessBasicInformation` (`NtQueryInformationProcess`).
+pub(crate) const PROCESS_BASIC_INFORMATION_CLASS: u32 = 0;
+/// `CreateFileW` disposition: open what exists (`CONIN$`, `CONOUT$`).
+pub(crate) const OPEN_EXISTING: u32 = 3;
+/// `INPUT_RECORD.EventType` of a `MENU_EVENT_RECORD`.
+pub(crate) const MENU_EVENT: u16 = 0x0008;
+/// How many process ids one job query reads ([`JOBOBJECT_BASIC_PROCESS_ID_LIST`]).
+pub(crate) const JOB_PROCESS_IDS: usize = 128;
+/// Console output mode: control characters act (the leave client's buffer).
+pub(crate) const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
+/// Console output mode: VT sequences written are parsed, so a `?1049l` switches
+/// the screen buffer.
+pub(crate) const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+/// Console input mode: a `ReadConsoleW` returns a whole line the console edited
+/// (cmd.exe's prompt); PSReadLine, readline and reedline clear it and read raw.
+pub(crate) const ENABLE_LINE_INPUT: u32 = 0x0002;
+
+/// `JOBOBJECT_BASIC_PROCESS_ID_LIST`, sized for [`JOB_PROCESS_IDS`] ids (a job
+/// holding more reports the first ones, which is all a probe of it needs).
+#[repr(C)]
+pub(crate) struct JOBOBJECT_BASIC_PROCESS_ID_LIST {
+    pub NumberOfAssignedProcesses: u32,
+    pub NumberOfProcessIdsInList: u32,
+    pub ProcessIdList: [usize; JOB_PROCESS_IDS],
+}
+
+/// `INPUT_RECORD`, as the one kind this crate writes: the `EventType` word,
+/// then the 16-byte event union, whose first field for a `MENU_EVENT_RECORD`
+/// is `dwCommandId` (the union is 4-aligned, so it starts at offset 4).
+#[repr(C)]
+pub(crate) struct INPUT_RECORD {
+    pub EventType: u16,
+    pub Event: [u32; 4],
+}
+
+/// `SMALL_RECT` — a console rectangle, edges inclusive.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SMALL_RECT {
+    pub Left: i16,
+    pub Top: i16,
+    pub Right: i16,
+    pub Bottom: i16,
+}
+
+/// `CONSOLE_SCREEN_BUFFER_INFO`; the clients read `srWindow` and `dwCursorPosition`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CONSOLE_SCREEN_BUFFER_INFO {
+    pub dwSize: [i16; 2],
+    pub dwCursorPosition: [i16; 2],
+    pub wAttributes: u16,
+    pub srWindow: SMALL_RECT,
+    pub dwMaximumWindowSize: [i16; 2],
+}
 
 /// `UNICODE_STRING` — the counted (NOT NUL-terminated) name `NtOpenFile` takes.
 /// Lengths are in BYTES.
@@ -242,6 +308,28 @@ pub(crate) struct PROCESSENTRY32W {
     pub szExeFile: [u16; 260],
 }
 
+/// `PROCESS_BASIC_INFORMATION` (64-bit layout): the ids of a process and of the
+/// one that created it, read through a handle (`NtQueryInformationProcess`).
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct PROCESS_BASIC_INFORMATION {
+    pub ExitStatus: isize,
+    pub PebBaseAddress: usize,
+    pub AffinityMask: usize,
+    pub BasePriority: isize,
+    pub UniqueProcessId: usize,
+    pub InheritedFromUniqueProcessId: usize,
+}
+
+/// `FILETIME`: 100 ns ticks since 1601-01-01 UTC, in two halves
+/// (`GetProcessTimes`).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FILETIME {
+    pub dwLowDateTime: u32,
+    pub dwHighDateTime: u32,
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     pub(crate) fn CreatePipe(
@@ -342,6 +430,15 @@ unsafe extern "system" {
         dwProcessId: u32,
     ) -> HANDLE;
     pub(crate) fn GetCurrentProcessId() -> u32;
+    /// A process's creation, exit, kernel and user times; the console guard's
+    /// tree walk reads the creation time to tell a child from a pid reuse.
+    pub(crate) fn GetProcessTimes(
+        hProcess: HANDLE,
+        lpCreationTime: *mut FILETIME,
+        lpExitTime: *mut FILETIME,
+        lpKernelTime: *mut FILETIME,
+        lpUserTime: *mut FILETIME,
+    ) -> i32;
     /// `SetConsoleCtrlHandler(NULL, FALSE)` restores normal CTRL+C processing for this
     /// process, the state a child inherits at `CreateProcessW`: the only public switch
     /// for the "Ctrl+C ignored" flag `CREATE_NEW_PROCESS_GROUP` sets.
@@ -371,6 +468,12 @@ unsafe extern "system" {
         dwOptions: u32,
     ) -> i32;
     pub(crate) fn GetCurrentProcess() -> HANDLE;
+    /// The calling thread's pseudo-handle; `DuplicateHandle` turns it into a
+    /// real one another thread can use.
+    pub(crate) fn GetCurrentThread() -> HANDLE;
+    /// Cancel the synchronous I/O `hThread` is blocked in (the handle needs
+    /// `THREAD_TERMINATE`); 0 with `ERROR_NOT_FOUND` when it is in none.
+    pub(crate) fn CancelSynchronousIo(hThread: HANDLE) -> i32;
     /// Bytes waiting in a pipe, WITHOUT consuming them (the OpenConsole health
     /// check reads the host's first output this way and leaves it for the
     /// session reader).
@@ -398,6 +501,52 @@ unsafe extern "system" {
         pathLength: *mut u32,
         path: *mut u16,
     ) -> i32;
+    /// Whether the process behind a handle is in `JobHandle` (`Result` nonzero).
+    pub(crate) fn IsProcessInJob(ProcessHandle: HANDLE, JobHandle: HANDLE, Result: *mut i32)
+    -> i32;
+    pub(crate) fn QueryInformationJobObject(
+        hJob: HANDLE,
+        JobObjectInformationClass: i32,
+        lpJobObjectInformation: *mut c_void,
+        cbJobObjectInformationLength: u32,
+        lpReturnLength: *mut u32,
+    ) -> i32;
+    pub(crate) fn QueryFullProcessImageNameW(
+        hProcess: HANDLE,
+        dwFlags: u32,
+        lpExeName: *mut u16,
+        lpdwSize: *mut u32,
+    ) -> i32;
+    pub(crate) fn CreateFileW(
+        lpFileName: *const u16,
+        dwDesiredAccess: u32,
+        dwShareMode: u32,
+        lpSecurityAttributes: *mut c_void,
+        dwCreationDisposition: u32,
+        dwFlagsAndAttributes: u32,
+        hTemplateFile: HANDLE,
+    ) -> HANDLE;
+    pub(crate) fn WriteConsoleInputW(
+        hConsoleInput: HANDLE,
+        lpBuffer: *const INPUT_RECORD,
+        nLength: u32,
+        lpNumberOfEventsWritten: *mut u32,
+    ) -> i32;
+    pub(crate) fn GetConsoleScreenBufferInfo(
+        hConsoleOutput: HANDLE,
+        lpConsoleScreenBufferInfo: *mut CONSOLE_SCREEN_BUFFER_INFO,
+    ) -> i32;
+    /// Read and set a console OUTPUT buffer's mode: the leave client touches no
+    /// input handle.
+    pub(crate) fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *mut u32) -> i32;
+    pub(crate) fn SetConsoleMode(hConsoleHandle: HANDLE, dwMode: u32) -> i32;
+    pub(crate) fn WriteConsoleW(
+        hConsoleOutput: HANDLE,
+        lpBuffer: *const u16,
+        nNumberOfCharsToWrite: u32,
+        lpNumberOfCharsWritten: *mut u32,
+        lpReserved: *mut c_void,
+    ) -> i32;
 }
 
 #[link(name = "ntdll")]
@@ -412,6 +561,16 @@ unsafe extern "system" {
         IoStatusBlock: *mut IO_STATUS_BLOCK,
         ShareAccess: u32,
         OpenOptions: u32,
+    ) -> i32;
+    /// One class of facts about a process, read through a handle: here
+    /// [`PROCESS_BASIC_INFORMATION`], whose parent id kernel32 has no call for.
+    /// Returns an NTSTATUS (negative = failure).
+    pub(crate) fn NtQueryInformationProcess(
+        ProcessHandle: HANDLE,
+        ProcessInformationClass: u32,
+        ProcessInformation: *mut c_void,
+        ProcessInformationLength: u32,
+        ReturnLength: *mut u32,
     ) -> i32;
 }
 

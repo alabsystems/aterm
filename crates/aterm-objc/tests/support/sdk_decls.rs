@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SDK-DECLARATION PROBE behind `aterm_objc::cf` (`tests/cf_sdk.rs`) and
-//! `aterm-cg` (`crates/aterm-cg/tests/cg_sdk.rs`): one instrument over each
-//! crate's own source, mounted by `#[path]` in both, so the grammar, the probe
+//! THE SDK-DECLARATION PROBE behind `aterm_objc::cf` (`tests/cf_sdk.rs`),
+//! `aterm-cg` (`crates/aterm-cg/tests/cg_sdk.rs`) and `aterm-sysprobe`'s IOKit
+//! calls (`crates/aterm-sysprobe/tests/iokit_sdk.rs`): one instrument over each
+//! crate's own source, mounted by `#[path]` in each, so the grammar, the probe
 //! and the verdicts live here once.
 //!
 //! The subject is the named files' source: every `pub type`, `#[repr(C)]`
@@ -15,8 +16,9 @@
 //!
 //! * **A prototype** is `__builtin_types_compatible_p` against the SDK
 //!   function's own type, with the Rust spelling translated mechanically:
-//!   `isize` -> `long`, `*const T` -> `T const *`, an opaque `__CFString` ->
-//!   `struct __CFString`, a module alias -> the SDK typedef of the same name.
+//!   `isize` -> `long`, `c_char` -> `char`, `*const T` -> `T const *`, an
+//!   opaque `__CFString` -> `struct __CFString`, a module alias -> the SDK
+//!   typedef of the same name.
 //!   C compatibility is exact where a call can go wrong: integer width and
 //!   signedness, pointer versus value, a struct's tag, `const` on a callback's
 //!   pointee (`void (*)(void *)` is not `void (*)(const void *)`).
@@ -216,7 +218,11 @@ fn parse(file: &str) -> Decls {
             let (name, rhs) = r.trim_end_matches(';').split_once('=').expect("an alias");
             d.aliases
                 .push((name.trim().to_owned(), rhs.trim().to_owned(), gate));
-        } else if let Some(r) = rest.strip_prefix("pub const ") {
+        } else if let Some(r) = rest
+            .strip_prefix("pub const ")
+            // A `pub const fn` is Rust of the crate's own, not a declaration.
+            .filter(|r| !r.starts_with("fn "))
+        {
             let (name, r) = r.split_once(':').expect("a typed const");
             let (ty, value) = r.trim_end_matches(';').split_once('=').expect("a value");
             d.consts.push((
@@ -312,6 +318,7 @@ fn c_type(rust: &str, d: &Decls) -> String {
     let name = t.rsplit("::").next().unwrap_or(t);
     let primitive = match name {
         "()" | "c_void" => Some("void"),
+        "c_char" => Some("char"),
         "isize" => Some("long"),
         "usize" => Some("unsigned long"),
         "i8" => Some("int8_t"),
@@ -365,6 +372,7 @@ fn probe(d: &Decls, invert: Option<&str>) -> String {
     let mut s = String::from(
         "#include <CoreFoundation/CoreFoundation.h>\n\
          #include <CoreGraphics/CoreGraphics.h>\n\
+         #include <IOKit/IOKitLib.h>\n\
          #include <stddef.h>\n\
          #include <stdint.h>\n\
          #define SAME(a, b) __builtin_types_compatible_p(a, b)\n",

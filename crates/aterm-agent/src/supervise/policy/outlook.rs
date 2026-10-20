@@ -4,6 +4,8 @@
 //! The outlook of a wall ([`outlook`]): the one table the policy and whatever
 //! shows a wall (the tab chip, `status`) both read, so the two cannot
 //! disagree about whether a person is needed. Pure, total over [`WallKind`].
+//! So too a session usage credits carry, which is no wall
+//! ([`credits_outlook`]).
 //!
 //! [`ExceptionKind`] names the points only a person can answer;
 //! [`super::exception`] raises them with their why and their one action.
@@ -39,7 +41,9 @@ pub enum ExceptionKind {
     /// `/model`, a rephrased message), so the host files it per tab.
     Refused,
     /// A screen no reader names, busy on background work alone for hours while
-    /// Claude's title says idle ([`super::exception::Exception::stalled`]).
+    /// Claude's title says idle ([`super::exception::Exception::stalled`]);
+    /// and agy's or Muse Code's own background work, run for hours under
+    /// words that stood still ([`super::exception::Exception::stalled_on_work`]).
     Stalled,
     /// A dialog no reader names, unchanged for an hour while Claude's title
     /// says idle ([`super::exception::Exception::dialog`]). Its own kind, not
@@ -78,6 +82,12 @@ pub enum Outlook {
     /// The supervisor tries and a person can lift it faster
     /// ([`ExceptionKind`]): a digest item, never an interruption.
     ResumesAndAsks(ExceptionKind),
+    /// The supervisor carries it to the one step that is the owner's, if
+    /// any: Claude Code's lost login, which an account move or the loop's own
+    /// `/login` signs back in, where only the browser sign-in is the owner's
+    /// — and its notice asks for that then ([`super::notice`]), so nothing is
+    /// the owner's before it stands.
+    Carries(ExceptionKind),
     /// A person is needed; nothing the supervisor types lifts it.
     Person(ExceptionKind),
     /// Nothing supervises this wall here: the owner switched the key off,
@@ -126,13 +136,17 @@ pub fn outlook(
         WallKind::ApiError { .. } | WallKind::Overloaded => Outlook::Unattended,
         WallKind::Context if cfg.compact_on_context_wall => Outlook::Resumes,
         WallKind::Context => Outlook::Unattended,
+        // The loop carries a lost login while it answers API errors at all
+        // (`retry_api_errors`; off, the login is left to the owner, its
+        // notice says so).
+        WallKind::Auth if cfg.retry_api_errors => Outlook::Carries(ExceptionKind::Login),
         WallKind::Auth => Outlook::Person(ExceptionKind::Login),
         WallKind::Memory if cfg.relaunch => Outlook::Resumes,
         WallKind::Memory => Outlook::Unattended,
     }
 }
 
-/// What a surface that shows a wall (the presence row, the tab chip) needs of
+/// What a surface that shows a wall (the needs border's pill, the tab chip) needs of
 /// its [`Outlook`]: who answers it. A wall the supervisor resumes is a record;
 /// only a wall a person must (or can) act on says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,7 +164,8 @@ pub enum Answer {
 /// The [`Answer`] to a wall of `kind` whose notice names a reset (`has_reset`)
 /// or not, under `cfg`, `supervised` by this process's own harness. A
 /// critical-memory banner is nobody's: it is drawn under a running spinner, the
-/// one place the supervisor never decides (`status_item::outlives_supervision`),
+/// one place the supervisor never decides (the window's need classifier,
+/// `aterm-gui`'s `needs::of`, reads it as the host's restart or the person's),
 /// so the stop stays for a person to see whatever `relaunch` says.
 #[must_use]
 pub fn answer(kind: WallKind, has_reset: bool, cfg: &SupervisorConfig, supervised: bool) -> Answer {
@@ -162,8 +177,59 @@ pub fn answer(kind: WallKind, has_reset: bool, cfg: &SupervisorConfig, supervise
         Outlook::ResumesAndAsks(ExceptionKind::Bucket) => Answer::ResumesAsks("/model to switch"),
         Outlook::ResumesAndAsks(ExceptionKind::Spend) => Answer::ResumesAsks("add credits"),
         Outlook::ResumesAndAsks(ExceptionKind::Refused) => Answer::ResumesAsks("fix in the tab"),
-        Outlook::ResumesAndAsks(_) => Answer::Resumes,
+        Outlook::ResumesAndAsks(_) | Outlook::Carries(_) => Answer::Resumes,
         Outlook::Person(_) | Outlook::Unattended => Answer::Nobody,
+    }
+}
+
+/// WHAT BECOMES OF A SESSION USAGE CREDITS CARRY (Claude Code's `Now using
+/// usage credits`): no wall — the vendor goes on, paid for — and the one
+/// table the credits hold ([`super::turn_end::credits_hold`]) and a surface
+/// that shows the session both read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreditsOutlook {
+    /// `[harness] usage_credits` on: credits are work going on, and the
+    /// supervisor carries the session on them as on its subscription.
+    Carried,
+    /// Off (the default), the window they carry past named: the supervisor
+    /// types nothing until it resets, when Claude Code goes back onto the
+    /// subscription by itself, and then goes on. Nobody is needed.
+    WaitsForReset,
+    /// Off, no reset named: the supervisor types nothing, and a person
+    /// decides — their own turns go on credits, or `[harness]
+    /// usage_credits = true` carries the session on them.
+    Person,
+    /// Nothing supervises the session here.
+    Unattended,
+}
+
+impl CreditsOutlook {
+    /// What a surface that shows the session says of it, a short static
+    /// phrase; `None` where the session goes on as any other.
+    #[must_use]
+    pub fn phrase(self) -> Option<&'static str> {
+        match self {
+            Self::WaitsForReset => Some("on usage credits: waits for the subscription's reset"),
+            Self::Person => Some("on usage credits: held, no reset named"),
+            Self::Carried | Self::Unattended => None,
+        }
+    }
+}
+
+/// The [`CreditsOutlook`] of a session usage credits carry, the window they
+/// carry past named (`has_reset`) or not, under `cfg`, `supervised` when a
+/// loop watches it.
+#[must_use]
+pub fn credits_outlook(
+    has_reset: bool,
+    cfg: &SupervisorConfig,
+    supervised: bool,
+) -> CreditsOutlook {
+    match (supervised, cfg.usage_credits, has_reset) {
+        (false, _, _) => CreditsOutlook::Unattended,
+        (true, true, _) => CreditsOutlook::Carried,
+        (true, false, true) => CreditsOutlook::WaitsForReset,
+        (true, false, false) => CreditsOutlook::Person,
     }
 }
 

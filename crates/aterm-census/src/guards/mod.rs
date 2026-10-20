@@ -25,7 +25,7 @@
 //! | `dev-read`          | `fs::read*` of a `/dev/…` literal (a device never EOFs) |
 //! | `input-probe`       | the WindowServer-backed input-probe APIs |
 //! | `test-appkit-door`  | a `#[test]` reaching an AppKit call that opens WindowServer |
-//! | `shared-application`| `+[NSApplication sharedApplication]` in a fn that neither takes nor first fetches the `Windowed` proof (a shrinking list aside) |
+//! | `shared-application`| `+[NSApplication sharedApplication]` in a fn that neither takes nor first fetches the `Windowed` proof |
 //! | `protected-folder`  | a TCC-protected folder path in aterm-gui or aterm-cli |
 //! | `runloop-timer`     | a run-loop timer outside `aterm_objc::wake_timer` |
 //! | `keeper-gui`        | a GUI framework, an ObjC send or winit in the PTY keeper's source |
@@ -38,6 +38,7 @@
 //! | `supervise-fx`      | a clock read, a sleep, the pid, a delivery, the goal record or the ledger by path that skips the supervisor's `Fx` door; a look at the filesystem, a process, the kernel, the zone or the environment that skips a derived door (the policy probe or `Fx`'s) |
 //! | `store-current`     | a store `current` path run unresolved |
 //! | `key-material`      | a master phrase on the key surface, a key file in the checkout |
+//! | `capture-privacy`   | in an encoded test capture's decoded bytes (a pty log's hex, a `.reads` file's escapes), what the export forbids in text, a home path, a banner's plan or a session id |
 //! | `devtools-door`     | a developer-mode change outside the owner's gesture; an admin-rights API |
 //! | `machines-root-door`| a root tool (`installer`, `pmset`, `/etc/sudoers.d`, …) or the machines agent outside aterm-machines |
 //! | `ffi-door`          | a WindowServer or process-creation `extern` declared outside its one file |
@@ -48,6 +49,7 @@
 //! | `installer-network` | a fetch in `tools/install.sh` outside `web_curl`, the GitHub API, `gh` |
 //! | `agent-gate`        | an agent tested by `==`, `matches!` or `if let` instead of an exhaustive `match` |
 //! | `slog-inert`        | a PTY write path or an input-verb request in the session log's code; `dispatch_mark` past its calls |
+//! | `eager-drop`        | `then_some` building a value whose type has a `Drop` (built and dropped on false) |
 //! | `licence-header`    | a `.rs` without its SPDX and copyright lines |
 //!
 //! [`run_guards`] returns typed [`Finding`]s; `aterm-census --guards` (and
@@ -62,7 +64,9 @@ use crate::lex::{Lexed, lex};
 use crate::{CensusOutcome, Floor};
 
 mod agent_gate;
+mod captures;
 mod doors;
+mod eager_drop;
 mod graph;
 mod installer;
 mod keys;
@@ -118,6 +122,7 @@ pub const GUARDS: &[Rule] = &[
     rules::SUPERVISE_FX,
     rules::STORE_CURRENT,
     keys::KEY_MATERIAL,
+    captures::CAPTURE_PRIVACY,
     doors::DEVTOOLS_DOOR,
     machines::MACHINES_ROOT_DOOR,
     doors::FFI_DOOR,
@@ -128,6 +133,7 @@ pub const GUARDS: &[Rule] = &[
     installer::INSTALLER_NETWORK,
     agent_gate::AGENT_GATE,
     slog_inert::SLOG_INERT,
+    eager_drop::EAGER_DROP,
     rules::LICENCE_HEADER,
 ];
 
@@ -234,6 +240,10 @@ pub(crate) fn run_guard_census(root: &Path) -> CensusOutcome {
             return CensusOutcome::red(TITLE, log, format!("the tree could not be read: {why}"));
         }
     };
+    let notes = captures::notes(root);
+    for note in &notes {
+        let _ = writeln!(log, "    note: {note}");
+    }
     let mut by_rule: BTreeMap<usize, Vec<&Finding>> = BTreeMap::new();
     for f in &report.findings {
         let at = GUARDS.iter().position(|r| r.id == f.rule).unwrap_or(0);
@@ -258,27 +268,18 @@ pub(crate) fn run_guard_census(root: &Path) -> CensusOutcome {
                 "the walk lost most of the tree (a wrong root or a moved crates/), so every \
                  guard held vacuously",
             ),
-            // The scripts the tree keeps (17): the installer, publish's config
-            // and transforms, the two hook stubs, the shell-integration
-            // scripts and their fixtures, and the wasm and site JavaScript. A
-            // walk that loses one fails; a port or deletion that leaves fewer
-            // lowers it.
-            Floor::at_least(
-                "scripts the guards read",
-                report.scripts,
-                17,
-                "the walk lost the scripts (a moved tools/, a narrowed script test), so the \
-                 script rules held vacuously",
-            ),
+            // The scripts carry no count: installer-network's anchor
+            // (`tools/install.sh`) fails a walk that lost them.
         ];
         CensusOutcome::green(
             TITLE,
             log,
             format!(
-                "{} rules over {} Rust files and {} scripts; no finding.",
+                "{} rules over {} Rust files and {} scripts; no finding.{}",
                 GUARDS.len(),
                 report.files,
-                report.scripts
+                report.scripts,
+                notes.iter().map(|n| format!(" ({n})")).collect::<String>()
             ),
         )
         .with_floors(floors)

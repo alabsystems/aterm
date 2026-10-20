@@ -87,6 +87,11 @@ pub struct Complete {
     pub bundle_digest: String,
     #[serde(default)]
     pub slices: Vec<SliceRecord>,
+    /// The published index run the bytes compiled in (`buildplan::index_hint_now`), when
+    /// the build found one: a guess its fresh installs' first discovery round follows. Not
+    /// in the [`key`]: a resumed release reuses the bytes whatever the channel did since.
+    #[serde(default)]
+    pub index_hint: Option<String>,
 }
 
 impl Complete {
@@ -383,6 +388,7 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
     }
     crate::snapshot::private_dir(&dir, "release artifact")?;
     let memory = host_memory_bytes();
+    let index_hint = crate::buildplan::index_hint_now();
     let built = crate::buildplan::run(&crate::buildplan::BuildPlan {
         repo_root: repo.to_path_buf(),
         commit: identity.commit.clone(),
@@ -391,6 +397,7 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
         short_version: identity.version.clone(),
         expected_update_pin_sha256: expected_pin,
         one_slice_at_a_time: !slices_fit(&store, memory),
+        index_hint: index_hint.clone(),
     })?;
     if built.app != app_in(&dir) {
         return Err(format!(
@@ -421,6 +428,7 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
                 peak_bytes: s.peak_bytes,
             })
             .collect(),
+        index_hint,
     };
     write_complete(&dir, &complete)?;
     let needed = needed_keys(repo);

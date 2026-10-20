@@ -235,6 +235,7 @@ fn native_route_card_composes_global_priority_and_modal_suppression() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let host = |rgba: [u8; 4], fp: u64| crate::SettingsCard {
+        scrim: None,
         rgba: rgba.to_vec(),
         pw: 1,
         ph: 1,
@@ -246,6 +247,7 @@ fn native_route_card_composes_global_priority_and_modal_suppression() {
     {
         let window = app.windows.get_mut(&wid).expect("window");
         window.settings_card = Some(crate::SettingsCard {
+            scrim: None,
             rgba: vec![0, 0, 0, 255, 0, 0, 0, 255],
             pw: 2,
             ph: 1,
@@ -255,7 +257,6 @@ fn native_route_card_composes_global_priority_and_modal_suppression() {
             geom: 1,
         });
         window.badge_card = Some(host([0, 0, 255, 255], 2));
-        window.conn_wire_card = Some(host([0, 255, 0, 255], 3));
     }
 
     assert!(app.compose_native_route_card(wid));
@@ -265,15 +266,8 @@ fn native_route_card_composes_global_priority_and_modal_suppression() {
             .as_ref()
             .expect("combined route card")
             .rgba[4..8],
-        &[0, 255, 0, 255],
-        "the connection wire outranks the badge over the retained native base"
-    );
-    app.windows.get_mut(&wid).unwrap().conn_wire_card = None;
-    assert!(app.compose_native_route_card(wid));
-    assert_eq!(
-        &app.windows[&wid].route_card.as_ref().unwrap().rgba[4..8],
         &[0, 0, 255, 255],
-        "badge remains visible when no transient card is active"
+        "the badge stays visible over the retained native base"
     );
 
     app.palette_enter();
@@ -322,6 +316,7 @@ fn paint(
         clip: rect,
         content: crate::native_ui::UiContent::Text(crate::native_ui::TextSpec::text(text)),
         peek: false,
+        fade: None,
     }
 }
 
@@ -1356,4 +1351,254 @@ fn heterogeneous_focus_projects_terminal_cursor_color_and_row_metadata() {
         !input.cursor_visible,
         "an unfocused terminal cannot leak its cursor into a native-focused frame"
     );
+}
+
+/// A KEY NEVER COMPILES A PAGE THE WINDOW ALREADY COMPILED: with a long
+/// Search result list warm on glass and the keyboard on one of its controls,
+/// arrows and page keys reach the page without entering the semantic
+/// compiler (they used to compile the whole page, every result row, per key,
+/// just to ask whether a text field had the keyboard); the next redraw
+/// compiles once. Return on a focused control after a warm redraw reads the
+/// retained tree and fires its action with no compile of its own.
+#[test]
+fn keys_reuse_the_retained_compile_instead_of_compiling_the_page() {
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+
+    let press = |key| crate::input::InputEvent::Key {
+        key: Key::Named(key),
+        mods: Modifiers::empty(),
+        base_layout: None,
+        layout_text: None,
+        event_type: KeyEventType::Press,
+    };
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Terminal));
+    let (_, view) = app.active_native_view(wid).expect("native Settings view");
+    let focus_control = |app: &mut App, key: &str| {
+        app.dispatch_native_event(
+            wid,
+            crate::native_app::AppEvent::FocusChanged(Some(crate::native_ui::UiKey::new(key))),
+        )
+        .unwrap();
+    };
+    focus_control(&mut app, "settings/search");
+    app.dispatch_native_event(
+        wid,
+        crate::native_app::AppEvent::TextInput(crate::native_app::TextInputEvent::Commit(
+            "e".to_string(),
+        )),
+    )
+    .unwrap();
+    assert!(app.prepare_native_input_scratch(wid));
+    let first = app
+        .cached_native_ui(wid)
+        .expect("the redraw retained its compile")
+        .compiled
+        .semantics
+        .iter()
+        .find(|node| {
+            (node.key.as_str().starts_with("settings/control/")
+                || node.key.as_str().starts_with("settings/search/page/"))
+                && node.role != crate::native_ui::SemanticRole::TextField
+        })
+        .map(|node| node.key.clone())
+        .unwrap_or_else(|| {
+            panic!(
+                "a control among the results: {:?}",
+                app.cached_native_ui(wid)
+                    .unwrap()
+                    .compiled
+                    .semantics
+                    .iter()
+                    .map(|node| node.key.as_str())
+                    .collect::<Vec<_>>()
+            )
+        });
+    focus_control(&mut app, first.as_str());
+    assert!(app.prepare_native_input_scratch(wid));
+    let warm = crate::app_native::native_ui_compile_count();
+    for _ in 0..10 {
+        assert!(app.native_input_event(wid, &press(NamedKey::ArrowDown)));
+    }
+    for _ in 0..3 {
+        assert!(app.native_input_event(wid, &press(NamedKey::PageDown)));
+    }
+    assert_eq!(
+        crate::app_native::native_ui_compile_count(),
+        warm,
+        "keys compile nothing"
+    );
+    assert!(app.prepare_native_input_scratch(wid));
+    assert_eq!(
+        crate::app_native::native_ui_compile_count(),
+        warm + 1,
+        "the redraw compiles once"
+    );
+    // Return on the focused control reads the retained tree.
+    let Some(crate::native_app::AppViewState::Settings(state)) =
+        app.native_runtime.view_state(view)
+    else {
+        panic!("Settings view");
+    };
+    let focused = state
+        .common
+        .last_focus
+        .clone()
+        .expect("the keyboard is in the list");
+    assert!(app.cached_native_ui(wid).is_some());
+    let before = crate::app_native::native_ui_compile_count();
+    assert!(app.native_input_event(wid, &press(NamedKey::Enter)));
+    assert_eq!(
+        crate::app_native::native_ui_compile_count(),
+        before,
+        "Return on {} compiled the page",
+        focused.as_str()
+    );
+}
+
+/// THE DEMO'S REST IS DRAWN: a Themes demo that comes to rest asks for no
+/// more motion, so the poll that sees it rest still asks for one last edge
+/// while the retained raster shows a playing frame, and that repaint draws
+/// the settled frame, whatever phase the last input left the tape at.
+/// Negative control: once the settled frame is drawn the poll goes idle.
+#[test]
+fn a_resting_theme_demo_draws_its_settled_frame_once() {
+    use crate::settings_theme_demo::{DEMO_LOOP_MS, frame_key};
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    {
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.cols = 160;
+        window.rows = 50;
+        window.focused = true;
+    }
+    // The page has been open ten minutes, its tape touched mid-loop.
+    let open_for = std::time::Duration::from_secs(600);
+    app.lat_epoch = std::time::Instant::now()
+        .checked_sub(open_for)
+        .expect("a clock ten minutes deep");
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Themes));
+    let (_, view) = app.active_native_view(wid).expect("native Settings view");
+    let set_last_input = |app: &mut App, at: u64| {
+        let Some(crate::native_app::AppViewState::Settings(state)) =
+            app.native_runtime.view_state_mut(view)
+        else {
+            panic!("a Settings view")
+        };
+        state.showcase.input_pending.set(false);
+        state.showcase.last_input_phase_ms.set(at);
+        // The tape is mid-loop, away from the frame it opens on.
+        state
+            .showcase
+            .demo_epoch_ms
+            .set(Some(at.saturating_sub(DEMO_LOOP_MS / 3)));
+    };
+    let now = u64::try_from(open_for.as_millis()).unwrap();
+    set_last_input(&mut app, now - 3 * DEMO_LOOP_MS + 4_321);
+    assert!(app.prepare_native_input_scratch(wid));
+    let drawn = |app: &App| {
+        app.windows[&wid].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .expect("retained Themes raster")
+            .compiled
+            .paint
+            .iter()
+            .find_map(|paint| match &paint.content {
+                crate::native_ui::UiContent::SettingsPreview(spec) => spec.demo_frame(),
+                _ => None,
+            })
+            .expect("the demo is drawn")
+    };
+    let settled = frame_key(0, false);
+    assert_ne!(
+        drawn(&app),
+        settled,
+        "the control: a playing frame is drawn"
+    );
+
+    // Three loops pass with nothing touched.
+    set_last_input(&mut app, 0);
+    let phase = now + 7;
+    assert_eq!(
+        app.active_native_settings_preview(wid, phase),
+        Some((
+            view,
+            crate::settings_preview::PreviewAnimation::BlinkEdge { after_ms: 1 }
+        ))
+    );
+    assert!(app.invalidate_active_native_settings_preview(wid, phase));
+    assert!(app.prepare_native_input_scratch(wid));
+    assert_eq!(drawn(&app), settled);
+    assert_eq!(app.active_native_settings_preview(wid, phase), None);
+}
+
+/// A Themes demo tick repaints its terminal grid, never its window: the
+/// regional raster a tick asks for covers the grid alone, a fraction of the
+/// demo's node. Negative control: any other scene's tick covers its whole
+/// node.
+#[test]
+fn a_theme_demo_tick_repaints_only_its_grid() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    {
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.cols = 160;
+        window.rows = 50;
+        window.focused = true;
+    }
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Themes));
+    let (_, view) = app.active_native_view(wid).expect("native Settings view");
+    assert!(app.prepare_native_input_scratch(wid));
+    let (node, spec) = app.windows[&wid].leaf_render_cache[&view]
+        .native
+        .as_ref()
+        .expect("retained Themes raster")
+        .compiled
+        .paint
+        .iter()
+        .find_map(|paint| match &paint.content {
+            crate::native_ui::UiContent::SettingsPreview(spec) => {
+                Some((paint.rect, (**spec).clone()))
+            }
+            _ => None,
+        })
+        .expect("the demo is drawn");
+    let grid = spec.tick_rect(node);
+    // The grid is the frame's inside, under its tab strip: a tick never
+    // repaints the strip, the frame's hairline or the shadow around it. No
+    // share of the node says this, as the strip and the frame are a fixed
+    // band and the grid grows with the window: at 160×50 cells the grid is
+    // 93% of the demo in Windows' 9×23 cell.
+    assert!(
+        grid.y >= node.y + crate::settings_preview::DEMO_STRIP_HEIGHT
+            && grid.x > node.x
+            && grid.right() < node.right()
+            && grid.bottom() < node.bottom(),
+        "a tick's grid {grid:?} reaches the demo's window {node:?}"
+    );
+    let phase = u64::try_from(app.lat_epoch.elapsed().as_millis()).unwrap() + 1;
+    assert!(
+        app.invalidate_active_native_settings_preview(wid, phase),
+        "the demo plays after the page opens"
+    );
+    assert!(app.prepare_native_input_scratch(wid));
+    let raster = app.windows[&wid].leaf_render_cache[&view]
+        .native
+        .as_ref()
+        .unwrap();
+    let crate::NativeRasterWork::Region { pixels, rect } = raster.last_work else {
+        panic!("a demo tick widened to a full-page raster")
+    };
+    let scale = app.windows[&wid].scale as f32;
+    let grid_pixels = ((grid.width + 2.0) * (grid.height + 2.0) * scale * scale) as u64;
+    assert!(
+        pixels <= grid_pixels,
+        "{pixels} > {grid_pixels}: {rect:?} grid {grid:?} node {node:?} scale {scale}"
+    );
+
+    let mut cursor = spec.clone();
+    cursor.scene = crate::settings_preview::PreviewScene::CursorMotion;
+    assert_eq!(cursor.tick_rect(node), node);
 }

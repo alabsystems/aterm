@@ -278,7 +278,8 @@ pub fn project_trail_presentation(cells: &mut Vec<TrailCell>, color: u32, opacit
 /// `self` before borrowing per-window state.
 #[derive(Clone, Copy, Debug)]
 pub struct TrailConfig {
-    /// Master on/off (config `cursor_trail`, default on).
+    /// On/off: the comet style is drawn (`cursor_trail_style = "comet"`) and
+    /// Serious Mode allows it.
     pub enabled: bool,
     /// How long a swept cell takes to fade fully out (config `cursor_trail_ms`).
     pub duration: Duration,

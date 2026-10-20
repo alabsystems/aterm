@@ -262,6 +262,7 @@ pub(crate) fn offer_box(rows: &[String]) -> Option<PromptV2> {
             role: Role::Other,
             focused: is_focused,
             row: r,
+            kept: false,
         });
     }
     let (size, _current) = (size?, current?);

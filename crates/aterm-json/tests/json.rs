@@ -826,6 +826,350 @@ fn a_value_that_cannot_serialize_is_refused() {
     assert!(ours.is_err(), "json! must not substitute null");
 }
 
+// ── map keys ───────────────────────────────────────────────────────────────
+//
+// A JSON object key is a string, so a map keyed by anything else — an integer,
+// a `bool`, a `char`, a unit variant, a newtype over one of them — is written
+// with its key spelled as text. The property: every map the writer accepts
+// reads back as itself, whether the reader takes it straight from the document
+// or from serde's buffer (a flattened map, an untagged or internally tagged
+// enum). It did not: the reader handed every key to `visit_str`, so `{"7":"x"}`
+// refused to read back into the `HashMap<u32, String>` that wrote it
+// (`invalid type: string "7", expected u32`), and the buffer did the same after
+// the reader was fixed.
+
+/// Write `value` and read it back: `Ok` when what comes back equals it, else
+/// what went wrong.
+fn reads_back<T>(value: &T) -> Result<(), String>
+where
+    T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+{
+    let text = aterm_json::to_string(value).map_err(|e| format!("{value:?} was refused: {e}"))?;
+    let back =
+        aterm_json::from_str::<T>(&text).map_err(|e| format!("{text} did not read back: {e}"))?;
+    if back == *value {
+        Ok(())
+    } else {
+        Err(format!("{text} read back as {back:?}, not {value:?}"))
+    }
+}
+
+/// A key drawn where a spelling could go wrong: the type's extremes, zero,
+/// small values of both signs, and wide random ones.
+trait DrawKey: Sized {
+    fn draw(rng: &mut Rng) -> Self;
+}
+
+macro_rules! draw_integer_key {
+    ($($ty:ty),*) => {$(
+        impl DrawKey for $ty {
+            fn draw(rng: &mut Rng) -> Self {
+                match rng.below(5) {
+                    0 => <$ty>::MIN,
+                    1 => <$ty>::MAX,
+                    2 => 0,
+                    3 => (rng.below(20) as $ty).wrapping_sub(10),
+                    _ => {
+                        let bits = (0..4).fold(0u128, |acc, _| (acc << 32) | u128::from(rng.next()));
+                        let wide = bits as $ty;
+                        if rng.below(2) == 0 { wide } else { wide.wrapping_neg() }
+                    }
+                }
+            }
+        }
+    )*};
+}
+
+draw_integer_key!(
+    u8, i8, u16, i16, u32, i32, u64, i64, u128, i128, usize, isize
+);
+
+/// Characters a key spelling can trip on: digits and signs, the escaped ones,
+/// and multi-byte ones.
+const KEY_CHARS: &[char] = &[
+    'a', '7', '0', '-', '+', '.', '"', '\\', '\n', '\u{0}', '\u{7f}', 'é', '世', '😀',
+];
+
+impl DrawKey for bool {
+    fn draw(rng: &mut Rng) -> Self {
+        rng.below(2) == 0
+    }
+}
+
+impl DrawKey for char {
+    fn draw(rng: &mut Rng) -> Self {
+        KEY_CHARS[rng.below(KEY_CHARS.len() as u32) as usize]
+    }
+}
+
+impl DrawKey for String {
+    /// Includes text that LOOKS like another key type's spelling: a string
+    /// key stays the string it is.
+    fn draw(rng: &mut Rng) -> Self {
+        const LOOKALIKES: &[&str] = &["7", "007", "-0", "+7", "true", "True", "1e3", ""];
+        if rng.below(3) == 0 {
+            return LOOKALIKES[rng.below(LOOKALIKES.len() as u32) as usize].to_owned();
+        }
+        (0..rng.below(5)).map(|_| char::draw(rng)).collect()
+    }
+}
+
+/// Newtype keys, as a model wraps an id, a name, or another newtype.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct KeyId(u32);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct KeySigned(i64);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct KeyFlag(bool);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct KeyName(String);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct KeyOuter(KeyId);
+
+/// A unit-variant key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+enum KeyLane {
+    Fast,
+    #[serde(rename = "7")]
+    Seven,
+}
+
+impl DrawKey for KeyId {
+    fn draw(rng: &mut Rng) -> Self {
+        Self(u32::draw(rng))
+    }
+}
+impl DrawKey for KeySigned {
+    fn draw(rng: &mut Rng) -> Self {
+        Self(i64::draw(rng))
+    }
+}
+impl DrawKey for KeyFlag {
+    fn draw(rng: &mut Rng) -> Self {
+        Self(bool::draw(rng))
+    }
+}
+impl DrawKey for KeyName {
+    fn draw(rng: &mut Rng) -> Self {
+        Self(String::draw(rng))
+    }
+}
+impl DrawKey for KeyOuter {
+    fn draw(rng: &mut Rng) -> Self {
+        Self(KeyId::draw(rng))
+    }
+}
+impl DrawKey for KeyLane {
+    fn draw(rng: &mut Rng) -> Self {
+        if rng.below(2) == 0 {
+            Self::Fast
+        } else {
+            Self::Seven
+        }
+    }
+}
+
+/// The same map read back through serde's buffer rather than straight from
+/// the document: flattened into a struct, as an untagged enum's payload, and
+/// inside an internally tagged one. No drawn key spells `name` or `kind`.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct FlatKeyed<K: Ord> {
+    name: String,
+    #[serde(flatten)]
+    rest: std::collections::BTreeMap<K, u8>,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum UntaggedKeyed<K: Ord> {
+    Map(std::collections::BTreeMap<K, u8>),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+enum TaggedKeyed<K: Ord> {
+    Rec {
+        map: std::collections::BTreeMap<K, u8>,
+    },
+}
+
+/// `rounds` maps of up to five `K` keys, each written and read back: alone,
+/// nested under a key of the same type, and through serde's buffer.
+fn every_map_reads_back<K>(rng: &mut Rng, rounds: u32)
+where
+    K: DrawKey + Ord + Clone + Serialize + serde::de::DeserializeOwned + std::fmt::Debug,
+{
+    use std::collections::BTreeMap;
+    for _ in 0..rounds {
+        let flat: BTreeMap<K, u8> = (0..rng.below(6)).map(|i| (K::draw(rng), i as u8)).collect();
+        let nested: BTreeMap<K, BTreeMap<K, u8>> = (0..rng.below(3))
+            .map(|_| {
+                (
+                    K::draw(rng),
+                    (0..rng.below(3)).map(|i| (K::draw(rng), i as u8)).collect(),
+                )
+            })
+            .collect();
+        let outcomes = [
+            reads_back(&nested),
+            reads_back(&FlatKeyed {
+                name: "a".to_owned(),
+                rest: flat.clone(),
+            }),
+            reads_back(&UntaggedKeyed::Map(flat.clone())),
+            reads_back(&TaggedKeyed::Rec { map: flat.clone() }),
+            reads_back(&flat),
+        ];
+        for outcome in outcomes {
+            if let Err(why) = outcome {
+                panic!("a {} key: {why}", std::any::type_name::<K>());
+            }
+        }
+    }
+}
+
+#[test]
+fn every_map_the_writer_accepts_reads_back() {
+    use std::collections::BTreeMap;
+
+    // The negative control first: a key that does NOT read back as itself is
+    // caught, whether the reader refuses its spelling or reads another key.
+
+    /// Written with leading zeros, which no integer key is written with.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+    struct Padded(u32);
+    impl Serialize for Padded {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(&format!("{:03}", self.0))
+        }
+    }
+    /// Written without its low bit: an odd key reads back as the even one.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+    struct Even(u32);
+    impl Serialize for Even {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_u32(self.0 & !1)
+        }
+    }
+
+    let refused = reads_back(&BTreeMap::from([(Padded(7), 1u8)])).expect_err("007 is not 7");
+    assert!(refused.contains("did not read back"), "{refused}");
+    let changed = reads_back(&BTreeMap::from([(Even(7), 1u8)])).expect_err("7 is not 6");
+    assert!(changed.contains("read back as"), "{changed}");
+    assert_eq!(reads_back(&BTreeMap::from([(Even(6), 1u8)])), Ok(()));
+
+    let mut rng = Rng(0x0DDB_A11C_0FFE_E5ED);
+    every_map_reads_back::<u8>(&mut rng, 300);
+    every_map_reads_back::<i8>(&mut rng, 300);
+    every_map_reads_back::<u16>(&mut rng, 300);
+    every_map_reads_back::<i16>(&mut rng, 300);
+    every_map_reads_back::<u32>(&mut rng, 300);
+    every_map_reads_back::<i32>(&mut rng, 300);
+    every_map_reads_back::<u64>(&mut rng, 300);
+    every_map_reads_back::<i64>(&mut rng, 300);
+    every_map_reads_back::<u128>(&mut rng, 300);
+    every_map_reads_back::<i128>(&mut rng, 300);
+    every_map_reads_back::<usize>(&mut rng, 300);
+    every_map_reads_back::<isize>(&mut rng, 300);
+    every_map_reads_back::<bool>(&mut rng, 300);
+    every_map_reads_back::<char>(&mut rng, 300);
+    every_map_reads_back::<String>(&mut rng, 300);
+    every_map_reads_back::<KeyId>(&mut rng, 300);
+    every_map_reads_back::<KeySigned>(&mut rng, 300);
+    every_map_reads_back::<KeyFlag>(&mut rng, 300);
+    every_map_reads_back::<KeyName>(&mut rng, 300);
+    every_map_reads_back::<KeyOuter>(&mut rng, 300);
+    every_map_reads_back::<KeyLane>(&mut rng, 300);
+}
+
+/// A non-string key reads back from exactly the text the writer spells it
+/// with, and from nothing else: a spelling it never writes reaches the key
+/// type as the string it is, which refuses it. `Value` and `String` keys stay
+/// text, however numeric they look.
+#[test]
+fn a_key_reads_back_only_in_the_spelling_the_writer_uses() {
+    use std::collections::{BTreeMap, HashMap};
+
+    let map: HashMap<u32, String> = HashMap::from([(7, "x".to_owned())]);
+    let text = aterm_json::to_string(&map).expect("write");
+    assert_eq!(text, r#"{"7":"x"}"#);
+    assert_eq!(
+        aterm_json::from_str::<HashMap<u32, String>>(&text).expect("the map that wrote it"),
+        map
+    );
+    let flags = BTreeMap::from([(false, 0u8), (true, 1)]);
+    assert_eq!(
+        aterm_json::to_string(&flags).expect("bool keys"),
+        r#"{"false":0,"true":1}"#
+    );
+
+    for (input, read) in [
+        (r#"{"7":1}"#, true),
+        (r#"{"0":1}"#, true),
+        (r#"{"4294967295":1}"#, true),
+        (r#"{"7":1}"#, true),
+        (r#"{"007":1}"#, false),
+        (r#"{"00":1}"#, false),
+        (r#"{"+7":1}"#, false),
+        (r#"{"-0":1}"#, false),
+        (r#"{"-1":1}"#, false),
+        (r#"{" 7":1}"#, false),
+        (r#"{"7 ":1}"#, false),
+        (r#"{"7.0":1}"#, false),
+        (r#"{"1e1":1}"#, false),
+        (r#"{"4294967296":1}"#, false),
+        (r#"{"":1}"#, false),
+        (r#"{"seven":1}"#, false),
+    ] {
+        let got = aterm_json::from_str::<BTreeMap<u32, u8>>(input);
+        assert_eq!(got.is_ok(), read, "{input} into u32 keys: {got:?}");
+    }
+    for (input, read) in [
+        (r#"{"-7":1}"#, true),
+        (r#"{"-2147483648":1}"#, true),
+        (r#"{"-2147483649":1}"#, false),
+        (r#"{"-0":1}"#, false),
+        (r#"{"-07":1}"#, false),
+        (r#"{"--7":1}"#, false),
+        (r#"{"-":1}"#, false),
+    ] {
+        let got = aterm_json::from_str::<BTreeMap<i32, u8>>(input);
+        assert_eq!(got.is_ok(), read, "{input} into i32 keys: {got:?}");
+    }
+    for (input, read) in [
+        (r#"{"true":1}"#, true),
+        (r#"{"false":1}"#, true),
+        (r#"{"True":1}"#, false),
+        (r#"{"1":1}"#, false),
+        (r#"{"":1}"#, false),
+    ] {
+        let got = aterm_json::from_str::<BTreeMap<bool, u8>>(input);
+        assert_eq!(got.is_ok(), read, "{input} into bool keys: {got:?}");
+    }
+    assert_eq!(
+        aterm_json::from_str::<BTreeMap<u32, u8>>(r#"{"007":1}"#)
+            .expect_err("a padded key")
+            .to_string(),
+        r#"invalid type: string "007", expected u32"#
+    );
+    assert_eq!(
+        aterm_json::from_str::<BTreeMap<u8, u8>>(r#"{"300":1}"#)
+            .expect_err("past u8")
+            .to_string(),
+        "invalid value: integer `300`, expected u8"
+    );
+
+    let value: aterm_json::Value = aterm_json::from_str(r#"{"7":1,"true":2}"#).expect("Value");
+    assert_eq!(value.get("7").and_then(aterm_json::Value::as_u64), Some(1));
+    assert_eq!(
+        value.get("true").and_then(aterm_json::Value::as_u64),
+        Some(2)
+    );
+    let names: BTreeMap<String, u8> = aterm_json::from_str(r#"{"007":1,"-0":2}"#).expect("text");
+    assert_eq!(names.get("007"), Some(&1));
+    assert_eq!(names.get("-0"), Some(&2));
+}
+
 #[test]
 fn deny_unknown_fields_denies() {
     for (input, ok) in [

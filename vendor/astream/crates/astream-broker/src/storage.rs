@@ -108,7 +108,10 @@ impl Backing {
     /// Position the next write at the end of the file.
     pub(crate) fn seek_end(&mut self) -> io::Result<()> {
         match self {
-            Backing::Os(f) => (&**f).seek(SeekFrom::End(0)).map(|_| ()),
+            Backing::Os(f) => {
+                let _ = (&**f).seek(SeekFrom::End(0))?;
+                Ok(())
+            }
             #[cfg(test)]
             Backing::Sim(_) => Ok(()),
         }
@@ -245,7 +248,12 @@ impl Backing {
     /// inspection path, never the hot one.
     pub(crate) fn stored(&self, path: &Path) -> Vec<u8> {
         match self {
-            Backing::Os(_) => std::fs::read(path).unwrap_or_default(),
+            Backing::Os(_) => {
+                let Ok(b) = std::fs::read(path) else {
+                    return Vec::new();
+                };
+                b
+            }
             #[cfg(test)]
             Backing::Sim(s) => {
                 let mut all = Vec::new();
@@ -412,7 +420,7 @@ impl Dir {
 
     /// Whether this is the real directory (the paths retention, anti-rollback, the
     /// replica marker and the base sidecar exist on).
-    pub(crate) fn is_os(&self) -> bool {
+    pub(crate) const fn is_os(&self) -> bool {
         matches!(self, Dir::Os(_))
     }
 
@@ -435,15 +443,14 @@ impl Dir {
         match self {
             Dir::Os(p) => {
                 let path = crate::logid::sidecar_path(p);
-                let mut tmp = path.as_os_str().to_os_string();
-                tmp.push(".tmp");
-                let tmp = PathBuf::from(tmp);
+                let mut tmp = path.clone();
+                tmp.as_mut_os_string().push(".tmp");
                 {
                     let mut f = create_fresh(&tmp, &mut OpenOptions::new())?;
                     f.write_all(bytes)?;
                     f.sync_all()?;
                 }
-                std::fs::rename(&tmp, &path)?;
+                crate::store::rename_path(&tmp, &path)?;
                 sync_parent_dir(&path)
             }
             #[cfg(test)]

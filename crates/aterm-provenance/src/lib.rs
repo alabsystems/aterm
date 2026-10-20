@@ -33,5 +33,9 @@ mod provenance;
 mod pty_wrap;
 
 pub use origin::{Origin, Pty};
-pub use provenance::Provenance;
+pub use provenance::{
+    Provenance, pty_slice_byte_at, pty_slice_has_csi_prefix, pty_slice_has_dcs_prefix,
+    pty_slice_has_osc_prefix, pty_slice_u16_be_at, pty_slice_u16_le_at, pty_slice_u32_be_at,
+    pty_slice_u32_le_at, pty_slice_u64_be_at, pty_slice_u64_le_at,
+};
 pub use pty_wrap::pty_wrap_ref;

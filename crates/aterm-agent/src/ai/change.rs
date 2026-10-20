@@ -76,10 +76,11 @@ pub fn repo_roots_of(cwd: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The git a review runs: the first `PATH` entry with a `git` file whose resolved directory
-/// and executable target are inside neither `cwd` nor any repository `cwd` is in. A
-/// repository's git would run before any hardening applies, even when an outside directory
-/// links to it. This checks the selected paths; it does not pin identities against swaps.
+/// The git a review runs: the first `PATH` entry with a `git` file (`git.exe` on Windows)
+/// whose resolved directory and executable target are inside neither `cwd` nor any
+/// repository `cwd` is in. A repository's git would run before any hardening applies, even
+/// when an outside directory links to it. This checks the selected paths; it does not pin
+/// identities against swaps.
 #[must_use]
 pub fn git_program(path_var: Option<&str>, cwd: &Path) -> Option<PathBuf> {
     let mut fenced = repo_roots_of(cwd);
@@ -88,7 +89,7 @@ pub fn git_program(path_var: Option<&str>, cwd: &Path) -> Option<PathBuf> {
         .filter(|dir| dir.is_absolute())
         .filter_map(|dir| std::fs::canonicalize(dir).ok())
         .filter(|dir| !fenced.iter().any(|f| dir.starts_with(f)))
-        .map(|dir| dir.join("git"))
+        .map(|dir| dir.join(if cfg!(windows) { "git.exe" } else { "git" }))
         .filter_map(|path| std::fs::canonicalize(path).ok())
         .filter(|path| !fenced.iter().any(|f| path.starts_with(f)))
         .find(|path| {
@@ -108,10 +109,26 @@ pub fn git_program(path_var: Option<&str>, cwd: &Path) -> Option<PathBuf> {
         })
 }
 
+/// The person's own variables git reads (where their global config is), and the hardening.
+/// Git for Windows finds the home, and so the person's global config (a global
+/// `aterm.aiReview = false` among it), from `USERPROFILE` (or `HOMEDRIVE`/`HOMEPATH`) where
+/// no `HOME` is set, as on Windows it rarely is.
 fn git_env(var: &dyn Fn(&str) -> Option<String>) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = ["HOME", "USER", "LOGNAME"]
-        .into_iter()
-        .filter_map(|k| var(k).map(|v| (k.to_string(), v)))
+    let homes: &[&str] = if cfg!(windows) {
+        &[
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+        ]
+    } else {
+        &["HOME", "USER", "LOGNAME"]
+    };
+    let mut env: Vec<(String, String)> = homes
+        .iter()
+        .filter_map(|k| var(k).map(|v| ((*k).to_string(), v)))
         .collect();
     for (k, v) in [
         ("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
@@ -247,8 +264,34 @@ fn path_of_open(file: &std::fs::File) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
 }
 
+/// Where an open file really is, as the kernel names it (`\\?\C:\…`, every link resolved).
+#[cfg(windows)]
+fn path_of_open(file: &std::fs::File) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFinalPathNameByHandleW(
+            file: *mut std::ffi::c_void,
+            path: *mut u16,
+            len: u32,
+            flags: u32,
+        ) -> u32;
+    }
+    // The longest path the wide-character file APIs take.
+    let mut buf = vec![0u16; 32_768];
+    let len = u32::try_from(buf.len()).ok()?;
+    // SAFETY: the handle is the open file's own for the length of the call, and the call
+    // writes at most `len` UTF-16 units into `buf` (flags 0: the DOS name, normalized).
+    let got = unsafe { GetFinalPathNameByHandleW(file.as_raw_handle(), buf.as_mut_ptr(), len, 0) };
+    let got = usize::try_from(got)
+        .ok()
+        .filter(|n| *n > 0 && *n < buf.len())?;
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&buf[..got])))
+}
+
 /// Where an open file really is: unknown on this platform, so no untracked file is read.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn path_of_open(_file: &std::fs::File) -> Option<PathBuf> {
     None
 }
@@ -268,12 +311,22 @@ fn new_file_hunk(root: &Path, rel: &str) -> Option<String> {
         use std::os::unix::fs::OpenOptionsExt as _;
         open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    // A link (or junction) at the last component is opened as itself, never followed:
+    // FILE_FLAG_OPEN_REPARSE_POINT.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        open.custom_flags(0x0020_0000);
+    }
     let file = open.open(&path).ok()?;
     let meta = file.metadata().ok()?;
     if !meta.is_file() || meta.len() > UNTRACKED_FILE_MAX {
         return None;
     }
-    if path_of_open(&file)? != real(root).join(rel) {
+    // Git names the file with `/` between its components; the repository's own path for it
+    // is built a component at a time, so a platform separator other than `/` compares too.
+    let own = rel.split('/').fold(real(root), |at, part| at.join(part));
+    if path_of_open(&file)? != own {
         return None;
     }
     let mut bytes = Vec::new();

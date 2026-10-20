@@ -14,7 +14,7 @@ is the file name without `.conf`.
 Tokyo Night, Rose Pine, the GitHub themes, Iceberg and more) whose own projects carry a
 permissive licence. aterm carries them inside it: `aterm theme pack` lists them,
 `aterm theme install "<id>"` (or `--all`) copies one into your themes folder, and Settings ▸
-Themes ▸ Get More adds one with a press. `aterm theme pack --licences` prints each palette's
+Themes ▸ Community adds one when you Keep it. `aterm theme pack --licences` prints each palette's
 attribution and licence. Nothing is downloaded. [`pack/README.md`](pack/README.md) says which
 themes qualify and how to add one.
 

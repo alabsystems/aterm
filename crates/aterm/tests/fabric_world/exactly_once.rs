@@ -312,21 +312,8 @@ fn a_keyed_re_post_to_a_session_whose_exit_line_never_arrives_is_unroutable_and_
     });
 
     // The first post under the key lands: one record, its offset the key's.
-    let first = w.verb(&format!(
-        "@{a} post to=@{b} kind=note key=k-gone --wait=60000 once only"
-    ));
-    assert!(
-        first.ok() && !first.header().contains("dup=1"),
-        "first post: {} — log:\n{}",
-        first.header(),
-        w.log_tail()
-    );
-    let off: u64 = first
-        .header()
-        .split_whitespace()
-        .find_map(|t| t.strip_prefix("off="))
-        .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| panic!("the first post names its offset: {}", first.header()));
+    let (first, off) = w.post_landed(&a, &b, "note", "key=k-gone", "once only");
+    assert!(!first.contains("dup=1"), "first post: {first}");
     assert_eq!(
         lane_len(&w, &b, &w.node, "note"),
         1,

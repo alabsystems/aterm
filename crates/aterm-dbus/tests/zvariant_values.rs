@@ -12,12 +12,10 @@
 //! decoder accepts only canonical bytes, so a flipped recording either fails
 //! or re-encodes to exactly the flipped bytes.
 
-mod support;
-
 use std::collections::BTreeMap;
 
+use crate::support::*;
 use aterm_dbus::{Endian, Signature, Type, Value, wire};
-use support::*;
 
 fn cases() -> BTreeMap<&'static str, Value> {
     let sig = |s: &str| Value::Sig(Signature::new(s).unwrap());

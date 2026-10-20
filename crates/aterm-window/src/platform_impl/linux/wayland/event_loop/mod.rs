@@ -16,7 +16,9 @@
 //! come over channels that wake the poll, each with a waker of its own: a user event's wake is
 //! news for the application (`dispatched_events`), and a clipboard request is answered and
 //! flushed within the turn that woke for it, as calloop's channel source answered it, with no
-//! `NewEvents`/`AboutToWait` turn of its own. Key repeat is a deadline the poll waits for. CUT:
+//! `NewEvents`/`AboutToWait` turn of its own. Key repeat is a deadline the poll waits for. A
+//! display call that fails ends the loop with `EventLoopError::DisplayLost` when the
+//! compositor's connection died (`wire_failure`), else with the call's own error. CUT:
 //! the `pump_events` wake-up thread, which existed to wake calloop for an embedder polling the
 //! loop's descriptor (no aterm crate embeds the loop; `AsFd` left with calloop), and the
 //! `AsFd`/`AsRawFd` impls.
@@ -86,6 +88,13 @@ pub struct EventLoop<T: 'static> {
     /// also waits for the socket to take more.
     flush_pending: bool,
 
+    /// Whether the last wait saw the display's socket hang up or fail: a display call that
+    /// fails after it is the compositor's death ([`wire_failure`]).
+    hung_up: bool,
+
+    /// What the run ends with in place of `ExitFailure` once a display call failed.
+    failure: Option<EventLoopError>,
+
     /// The connection to the Wayland server.
     connection: Arc<Connection>,
 
@@ -147,6 +156,8 @@ impl<T: 'static> EventLoop<T> {
             clipboard_requests,
             clipboard_waker,
             flush_pending: false,
+            hung_up: false,
+            failure: None,
             connection,
             window_target: RootActiveEventLoop {
                 p: PlatformActiveEventLoop::Wayland(window_target),
@@ -172,7 +183,7 @@ impl<T: 'static> EventLoop<T> {
                     break Ok(());
                 },
                 PumpStatus::Exit(code) => {
-                    break Err(EventLoopError::ExitFailure(code));
+                    break Err(self.failure.take().unwrap_or(EventLoopError::ExitFailure(code)));
                 },
                 _ => {
                     continue;
@@ -236,20 +247,18 @@ impl<T: 'static> EventLoop<T> {
 
             // Checking for flush error is essential to perform an exit with error, since
             // once we have a protocol error, we could get stuck retrying...
-            if let Err(code) = self.flush() {
-                self.set_exit_code(code);
+            if let Err((failure, code)) = self.flush() {
+                self.fail(failure, code);
                 return;
             }
 
-            if let Err(code) = self.loop_dispatch(timeout) {
+            if let Err((failure, code)) = self.loop_dispatch(timeout) {
                 // NOTE We exit on errors from dispatches, since if we've got protocol error
                 // libwayland-client will inform us anyway, but crashing downstream is
-                // not really an option. Instead we inform that the event loop got
-                // destroyed. We may communicate an error that something was
-                // terminated, but winit doesn't provide us with an API to do that
-                // via some event. Still, we set the exit code to the error's OS
-                // error code, or to 1 if not possible.
-                self.set_exit_code(code);
+                // not really an option. Instead we end the loop with the failure
+                // (`wire_failure`): the display's loss when the compositor died, else
+                // the error itself; the exit code is the error's errno, or 1.
+                self.fail(failure, code);
                 return;
             }
 
@@ -512,22 +521,25 @@ impl<T: 'static> EventLoop<T> {
     }
 
     /// Wait for the display, a wake, a drop being read or a key's repeat, at most `timeout`
-    /// (`None`: for ever); read and dispatch what came, and apply it to the state. `Err` is the
-    /// exit code a dead display ends the loop with.
-    fn loop_dispatch(&mut self, timeout: Option<Duration>) -> Result<(), i32> {
+    /// (`None`: for ever); read and dispatch what came, and apply it to the state. `Err` is
+    /// what the loop ends with, and its exit code ([`wire_failure`]).
+    fn loop_dispatch(&mut self, timeout: Option<Duration>) -> Result<(), (EventLoopError, i32)> {
         let connection = Arc::clone(&self.connection);
         let queue = &connection.queue;
         let wake_fd = self.waker().as_raw_fd();
+        let failed =
+            |hung_up: bool| move |error: aterm_wayland::proxy::Error| wire_failure(error, hung_up);
+        let hung_up = self.hung_up;
 
         // Dispatch what another reader of the display queued for this loop, then announce
         // this read; a queue that filled meanwhile is dispatched first.
         let intent = loop {
-            queue.dispatch_pending().map_err(|error| wire_exit_code(&error))?;
+            queue.dispatch_pending().map_err(failed(hung_up))?;
             self.with_state(WinitState::drain);
             // What the state answered goes out before the wait (calloop-wayland-source's
             // `before_sleep` flushed here).
             self.flush()?;
-            match queue.prepare_read().map_err(|error| wire_exit_code(&error))? {
+            match queue.prepare_read().map_err(failed(hung_up))? {
                 Some(intent) => break intent,
                 None => continue,
             }
@@ -549,7 +561,7 @@ impl<T: 'static> EventLoop<T> {
             min_timeout(timeout, until_repeat)
         };
 
-        let display_fd = connection.display().fd().map_err(|error| wire_exit_code(&error))?;
+        let display_fd = connection.display().fd().map_err(failed(hung_up))?;
         let mut fds = Vec::with_capacity(3 + dnd_fds.len());
         let mut display_events = libc::POLLIN;
         if self.flush_pending {
@@ -563,13 +575,19 @@ impl<T: 'static> EventLoop<T> {
         if let Err(error) = poll::wait(&mut fds, wait) {
             tracing::error!("Error dispatching event loop: {}", error);
             drop(intent);
-            return Err(error.raw_os_error().unwrap_or(1));
+            let code = error.raw_os_error().unwrap_or(1);
+            return Err((
+                EventLoopError::Os(os_error!(OsError::from(WaylandError::Io(error)))),
+                code,
+            ));
         }
 
         // Read what the socket holds (a hang-up or an error is read too, and says the
         // display is gone); a wake that was not the socket's cancels the read.
-        if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            intent.read().map_err(|error| wire_exit_code(&error))?;
+        self.hung_up = fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0;
+        let hung_up = self.hung_up;
+        if fds[0].revents & libc::POLLIN != 0 || hung_up {
+            intent.read().map_err(failed(hung_up))?;
         } else {
             drop(intent);
         }
@@ -584,7 +602,7 @@ impl<T: 'static> EventLoop<T> {
             self.clipboard_waker.drain();
         }
 
-        queue.dispatch_pending().map_err(|error| wire_exit_code(&error))?;
+        queue.dispatch_pending().map_err(failed(hung_up))?;
         let ready_pipes: Vec<_> =
             fds[3..].iter().filter(|p| poll::ready(p)).map(|p| p.fd).collect();
         self.with_state(|state| {
@@ -623,17 +641,22 @@ impl<T: 'static> EventLoop<T> {
     }
 
     /// Write the queued requests. A full socket (EAGAIN) is not an error: the rest stays
-    /// queued, and the next wait also waits for the socket to take it. `Err` is the exit code
-    /// a dead display ends the loop with: the error's errno (a dead compositor's socket answers
-    /// EPIPE or ECONNRESET), as a failed dispatch's is, so the application can say why its
-    /// display connection ended.
-    fn flush(&mut self) -> Result<(), i32> {
+    /// queued, and the next wait also waits for the socket to take it. `Err` is what the loop
+    /// ends with, as for a failed dispatch ([`wire_failure`]).
+    fn flush(&mut self) -> Result<(), (EventLoopError, i32)> {
         match self.connection.display().flush() {
             Ok(()) => self.flush_pending = false,
             Err(aterm_wayland::proxy::Error::Display(libc::EAGAIN)) => self.flush_pending = true,
-            Err(error) => return Err(wire_exit_code(&error)),
+            Err(error) => return Err(wire_failure(error, self.hung_up)),
         }
         Ok(())
+    }
+
+    /// End the loop with `failure`, which `run_on_demand` returns, and `code` for
+    /// `pump_events`.
+    fn fail(&mut self, failure: EventLoopError, code: i32) {
+        self.failure = Some(failure);
+        self.set_exit_code(code);
     }
 
     fn roundtrip(&mut self) -> Result<usize, RootOsError> {
@@ -660,13 +683,35 @@ impl<T: 'static> EventLoop<T> {
     }
 }
 
-/// The exit code a failed display call ends the loop with: the display's errno (`EPIPE` or
-/// `ECONNRESET` when the compositor went, `EPROTO` after a protocol error), else 1.
-fn wire_exit_code(error: &aterm_wayland::proxy::Error) -> i32 {
-    match error {
-        aterm_wayland::proxy::Error::Display(errno) if *errno > 0 => *errno,
-        _ => 1,
-    }
+/// What a failed display call ends the loop with, and its exit code (the display's errno, else
+/// 1). [`EventLoopError::DisplayLost`] when the connection's transport failed: libwayland's
+/// `EPIPE` (which it also reports for end of file) or `ECONNRESET`, the compositor gone (the
+/// Linux lane, 2026-10-17: weston killed at rest read as `EPIPE`, once as `ECONNRESET`, and
+/// killed mid-resize as `ECONNRESET`), or
+/// any error after the wait saw the socket hang up or fail (`hung_up`) but a protocol error
+/// (`EPROTO`: the compositor ended the connection over a request it refused, then closed it).
+/// Any other failure is the call's own error.
+fn wire_failure(error: aterm_wayland::proxy::Error, hung_up: bool) -> (EventLoopError, i32) {
+    let errno = match error {
+        aterm_wayland::proxy::Error::Display(errno) if errno > 0 => Some(errno),
+        _ => None,
+    };
+    let transport = match errno {
+        Some(libc::EPIPE | libc::ECONNRESET) => true,
+        Some(libc::EPROTO) => false,
+        _ => hung_up,
+    };
+    let failure = match (transport, errno) {
+        (true, Some(errno)) => {
+            EventLoopError::DisplayLost(std::io::Error::from_raw_os_error(errno))
+        },
+        (true, None) => EventLoopError::DisplayLost(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            format!("the compositor's socket hung up ({error})"),
+        )),
+        (false, _) => EventLoopError::Os(os_error!(OsError::from(error))),
+    };
+    (failure, errno.unwrap_or(1))
 }
 
 pub struct ActiveEventLoop {
@@ -738,12 +783,31 @@ impl ActiveEventLoop {
 mod tests {
     use super::*;
 
+    /// The display's errno is the exit code, else 1; only a dead transport is
+    /// the display's loss, and a protocol error stays one even when the
+    /// compositor hung up after sending it.
     #[test]
-    fn a_dead_display_s_errno_is_the_exit_code_and_anything_else_is_one() {
+    fn only_a_dead_transport_is_the_display_s_loss() {
         use aterm_wayland::proxy::Error;
-        assert_eq!(wire_exit_code(&Error::Display(libc::EPIPE)), libc::EPIPE);
-        assert_eq!(wire_exit_code(&Error::Display(libc::ECONNRESET)), libc::ECONNRESET);
-        assert_eq!(wire_exit_code(&Error::Display(-1)), 1);
-        assert_eq!(wire_exit_code(&Error::NoObject), 1);
+        let lost = |error, hung_up| {
+            let (failure, code) = wire_failure(error, hung_up);
+            (matches!(failure, EventLoopError::DisplayLost(_)), code)
+        };
+        for hung_up in [false, true] {
+            assert_eq!(lost(Error::Display(libc::EPIPE), hung_up), (true, libc::EPIPE));
+            assert_eq!(lost(Error::Display(libc::ECONNRESET), hung_up), (true, libc::ECONNRESET));
+            assert_eq!(lost(Error::Display(libc::EPROTO), hung_up), (false, libc::EPROTO));
+        }
+        assert_eq!(lost(Error::Display(libc::ENOMEM), false), (false, libc::ENOMEM));
+        assert_eq!(lost(Error::Display(-1), false), (false, 1));
+        assert_eq!(lost(Error::NoObject, false), (false, 1));
+        assert_eq!(lost(Error::Display(libc::ENOMEM), true), (true, libc::ENOMEM));
+        assert_eq!(lost(Error::Display(-1), true), (true, 1));
+        let (EventLoopError::DisplayLost(why), _) =
+            wire_failure(Error::Display(libc::EPIPE), false)
+        else {
+            panic!("EPIPE is the display's loss");
+        };
+        assert_eq!(why.raw_os_error(), Some(libc::EPIPE));
     }
 }

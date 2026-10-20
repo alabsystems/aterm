@@ -22,6 +22,7 @@
 use core::fmt;
 use core::ops::Range;
 
+use serde::de::value::{KeyText, TextKeyDeserializer};
 use serde::de::{
     DeserializeOwned, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor,
 };
@@ -255,10 +256,10 @@ impl<'de, 'a, I: Iterator<Item = (&'a Key, &'a Item)>> MapAccess<'de> for TableA
             return Ok(None);
         };
         self.pending = Some((key, item));
-        seed.deserialize(KeyDeserializer {
+        seed.deserialize(TextKeyDeserializer::new(KeyDeserializer {
             source: self.source,
             key,
-        })
+        }))
         .map(Some)
         .map_err(|e| e.with_span(self.source, key.span()))
     }
@@ -344,10 +345,21 @@ impl<'de, 'a, I: Iterator<Item = &'a Table>> SeqAccess<'de> for TableSeqAccess<'
 }
 
 /// Feeds a table key to whatever the target type wants it as — a field
-/// identifier, a `String`, or a unit enum variant.
+/// identifier, a `String`, or a unit enum variant. TOML keys are strings, so a
+/// key type that is not one (an integer, a `bool`, a newtype or `Some` over
+/// one) is read through [`TextKeyDeserializer`], which reads it back from
+/// exactly the text the serializer spells it with (`7`, `-3`, `true`) and from
+/// no other: `007`, `+7`, `-0` and `True` reach the visitor as the strings they
+/// are, which it refuses.
 struct KeyDeserializer<'a> {
     source: Option<&'a str>,
     key: &'a Key,
+}
+
+impl KeyText for KeyDeserializer<'_> {
+    fn key_text(&self) -> Option<&str> {
+        Some(self.key.get())
+    }
 }
 
 impl<'de> serde::Deserializer<'de> for KeyDeserializer<'_> {

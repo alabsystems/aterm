@@ -1,0 +1,16 @@
+# claude-code 2.1.303 · MEASURED 2026-10-19 in the real-Claude lab (144x50, a fake `apiKeyHelper` key, the stub's 401), transcribed from `lab text`: the person's Esc on the 401's retries, `/login` typed, then Esc out of its dialog · `⎿  Login interrupted` under `❯ /login`, the composer back
+ ▐▛███▛█   Claude Code v2.1.303
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.pCwf/proj
+
+
+❯ hi
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ /login
+  ⎿  Login interrupted
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

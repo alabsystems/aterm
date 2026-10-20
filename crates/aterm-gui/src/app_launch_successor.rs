@@ -268,6 +268,18 @@ pub(crate) enum LaunchError {
     ForeignObject(&'static str),
     /// LaunchServices reported an implausible pid — `NSRunningApplication`
     /// answers `-1` when it does not know one.
+    ///
+    /// AN `execve` AFTER THE LAUNCH IS ONE CAUSE (measured 2026-10-19 on macOS 27,
+    /// on the owner's Mac and with scratch stand-in apps): a process that replaces its
+    /// image some 240–400 ms after LaunchServices launched it is answered `-1` and
+    /// not terminated, `lsappinfo` lists it as `[ NULL ]`, and the record stays stale
+    /// for the process's life (System Settings' Quit & Reopen quits by pid and fails
+    /// with -600, the menu-bar item is refused for a "mismatched pid version", and
+    /// `tccd` attributes it to the bundle it first saw). An exec at 0 ms kept its pid,
+    /// so it is a race and the 2026-09-29 count below did not see it. No successor this
+    /// build launches through LaunchServices execs any more: its parent swaps before it
+    /// launches. (A fork-lane child still swaps and re-execs, but LaunchServices never
+    /// launched it.)
     #[cfg(target_os = "macos")]
     PidUnknown(i32),
     /// LaunchServices answered with an application that had ALREADY TERMINATED
@@ -281,8 +293,9 @@ pub(crate) enum LaunchError {
     /// 0.5, 2 and 8 s, `SIGKILL` after 0.3 and 1 s, and, after a same-pid
     /// re-exec, an immediate `_exit`, `_exit` after 1 s and `SIGKILL` after
     /// 0.3 s. A process that is ALIVE was never answered this way:
-    /// the 8 that checked in (3 after a re-exec) were answered with their pid
-    /// when they did, and the 2 that never did were answered with their pid, not
+    /// the 8 that checked in (3 after a re-exec, at an exec delay not recorded;
+    /// see [`Self::PidUnknown`] for the later exec that loses the pid) were answered
+    /// with their pid when they did, and the 2 that never did were answered with their pid, not
     /// terminated, at LaunchServices' own check-in timeout (30.06 s, 30.08 s). So
     /// this one answer is POSITIVE EVIDENCE OF DEATH, the only one this module
     /// produces ([`launch_answer_proves_exit`]). A launch refused before any
@@ -452,6 +465,76 @@ pub(crate) fn begin_launch(
 ) -> Result<LaunchInFlight, LaunchError> {
     let request = validate_request(bundle, arguments, environment)?;
     begin_launch_validated(&request, activate)
+}
+
+/// What LaunchServices' list of this app says about this process
+/// ([`own_launch_record`]).
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnLaunchRecord {
+    /// An entry carries this process's pid: Quit & Reopen, the menu bar and TCC find it.
+    Named,
+    /// No entry carries it and one carries none (`-1`): the stale record an `execve`
+    /// after a LaunchServices launch leaves ([`LaunchError::PidUnknown`]), which lasts
+    /// the process's life.
+    Stale,
+    /// Neither: no bundle identifier, or no entry without a pid to be this one.
+    Unknown,
+}
+
+/// How long into a windowed launch [`own_launch_record`] is asked: the stale record
+/// formed within about a second of the `execve` in every measured run (2026-10-19),
+/// and the launch's own exec comes before the window.
+#[cfg(target_os = "macos")]
+pub(crate) const OWN_LAUNCH_RECORD_SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ask LaunchServices for every running instance of this bundle
+/// (`+[NSRunningApplication runningApplicationsWithBundleIdentifier:]`) and whether one
+/// carries this process's pid. The process's own measure of what
+/// [`LaunchError::PidUnknown`] infers from its parent's launch: it also sees a successor
+/// an older build launched, which swapped and re-exec'd itself, and a cold launch whose
+/// boot apply did (a window does only at the left-stage escape with its automatic lane
+/// on, after [`aterm_update::LEFT_STAGE_ESCAPE`] launches that left the stage ended or
+/// when the record of them cannot count it, or to revert a crash loop). Any thread
+/// (read-only queries, under their own pool); reads the bundle's `Info.plist` once.
+#[cfg(target_os = "macos")]
+pub(crate) fn own_launch_record() -> OwnLaunchRecord {
+    use aterm_objc::{autoreleasepool, class, sel};
+    let Some(bundle_id) = crate::control_privacy::running_bundle_id() else {
+        return OwnLaunchRecord::Unknown;
+    };
+    let own = i32::try_from(std::process::id()).unwrap_or(-1);
+    autoreleasepool(|_| {
+        let Some(id) = crate::appkit::nsstring(bundle_id) else {
+            return OwnLaunchRecord::Unknown;
+        };
+        // SAFETY: `+runningApplicationsWithBundleIdentifier:` is `+(NSArray *)
+        // (NSString *)`, +0, valid for this pool; `-count` is `-(NSUInteger)`,
+        // `-objectAtIndex:` `-(id)(NSUInteger)` below the count, and
+        // `-processIdentifier` `-(pid_t)` on each element.
+        let pids = unsafe {
+            let apps = crate::appkit::send_id_id(
+                class(c"NSRunningApplication").as_id(),
+                sel!(runningApplicationsWithBundleIdentifier:),
+                id.id(),
+            );
+            if apps.is_null() {
+                return OwnLaunchRecord::Unknown;
+            }
+            (0..crate::appkit::send_usize(apps, sel!(count)))
+                .map(|i| crate::appkit::send_id_usize(apps, sel!(objectAtIndex:), i))
+                .filter(|app| !app.is_null())
+                .map(|app| crate::appkit::send_i32(app, sel!(processIdentifier)))
+                .collect::<Vec<_>>()
+        };
+        if pids.contains(&own) {
+            OwnLaunchRecord::Named
+        } else if pids.contains(&-1) {
+            OwnLaunchRecord::Stale
+        } else {
+            OwnLaunchRecord::Unknown
+        }
+    })
 }
 
 /// A launch LaunchServices has been asked for, whose answer may still be in

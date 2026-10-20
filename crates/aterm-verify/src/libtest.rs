@@ -3,9 +3,9 @@
 
 //! Reading a `targo test` child's log: which binaries ran and passed what,
 //! which failed tests it can account for (each with its binary's re-run spec),
-//! whether every failure was the machine refusing ([`COULD_NOT_RUN_SENTINEL`]),
-//! and which macOS services a binary reported silent ([`host_skips`]). Pure
-//! (`&str` in). A coloured log reads as a plain one.
+//! whether every failure was the machine refusing ([`COULD_NOT_RUN_SENTINEL`])
+//! and what each refusal said ([`refusal_reasons`]). Pure (`&str` in). A
+//! coloured log reads as a plain one.
 
 /// cargo's test-binary header, with its verb dropped.
 pub(crate) fn header(line: &str) -> Option<String> {
@@ -74,89 +74,6 @@ pub fn passed_by_target(log: &str) -> Vec<(String, Option<usize>)> {
     out
 }
 
-/// The lines a test binary prints, once each, when a macOS service it needs
-/// did not answer and its tests of it returned without asserting anything
-/// (`aterm_uds::deadline::{SKIPPED, DISK_IMAGE_SKIPPED}`), included from
-/// aterm-uds's own file.
-pub(crate) mod skipped {
-    include!("../../aterm-uds/src/deadline/skipped.rs");
-}
-
-/// A macOS service whose silence a test binary names with one line: the line,
-/// the head of the test stage's skip row for it, what its tests check, and
-/// what clears it.
-struct Wedged {
-    line: &'static str,
-    head: &'static str,
-    checks: &'static str,
-    remedy: &'static str,
-}
-
-/// Every service a test skips for: each gets its own row ([`host_skips`]).
-const WEDGED: [Wedged; 2] = [
-    Wedged {
-        line: skipped::SKIPPED,
-        head: "tests: trustd did not answer — ",
-        checks: "code-signing and TLS checks",
-        remedy: "rebooting the Mac clears a wedged trustd",
-    },
-    Wedged {
-        line: skipped::DISK_IMAGE_SKIPPED,
-        head: "tests: hdiutil did not answer — ",
-        checks: "disk-image checks",
-        remedy: "rebooting the Mac clears a wedged disk-image service",
-    },
-];
-
-/// The binaries of a `targo test` log that printed `line`: each by its crate
-/// and target, in log order, once. Matched anywhere in a line: on one test
-/// thread libtest has already written `test x ... ` when the notice lands, and
-/// on many another thread's line can follow it before its newline.
-#[must_use]
-fn printed(log: &str, line: &str) -> Vec<String> {
-    let mut at: Option<String> = None;
-    let mut found: Vec<String> = Vec::new();
-    for l in log.lines() {
-        if let Some(h) = header(l) {
-            at = Some(short_binary(&h));
-        } else if l.contains(line) {
-            let name = at.clone().unwrap_or_else(|| "a test binary".to_string());
-            if !found.contains(&name) {
-                found.push(name);
-            }
-        }
-    }
-    found
-}
-
-/// The test stage's skip rows, one per service whose silence any binary named
-/// ([`WEDGED`]): what ran stays decided, and each row names what did not and
-/// what clears it. Empty when none did.
-#[must_use]
-pub fn host_skips(log: &str) -> Vec<String> {
-    if log.contains('\x1b') {
-        return host_skips(&strip_ansi(log));
-    }
-    WEDGED
-        .iter()
-        .filter_map(|w| {
-            let bins = printed(log, w.line);
-            let n = bins.len();
-            (n > 0).then(|| {
-                format!(
-                    "{}{n} test binar{} skipped {} {} ({}); {}",
-                    w.head,
-                    if n == 1 { "y" } else { "ies" },
-                    if n == 1 { "its" } else { "their" },
-                    w.checks,
-                    bins.join(", "),
-                    w.remedy
-                )
-            })
-        })
-        .collect()
-}
-
 /// Drop every CSI escape (`ESC [` … a final byte in `@`–`~`) and every other
 /// two-byte escape, so a coloured log reads exactly like a plain one. Only
 /// called when the log has an `ESC` in it.
@@ -181,22 +98,6 @@ pub(crate) fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// `unittests src/lib.rs (target/debug/deps/aterm_gui-66ca…)` ->
-/// `aterm_gui unittests src/lib.rs`: the crate (the binary's file name less its
-/// hash) and the target, which is what a reader looks for in a table.
-fn short_binary(header: &str) -> String {
-    let Some((target, _)) = header.split_once(" (") else {
-        return header.to_string();
-    };
-    let stem = binary_path(header)
-        .and_then(|p| p.rsplit('/').next())
-        .map(|f| f.rsplit_once('-').map_or(f, |(s, _)| s));
-    match stem {
-        Some(stem) => format!("{stem} {target}"),
-        None => target.to_string(),
-    }
-}
-
 /// The path in a `Running <target> (<path>)` header — the binary to re-run.
 pub(crate) fn binary_path(header: &str) -> Option<&str> {
     header.rsplit_once(" (")?.1.strip_suffix(')')
@@ -210,7 +111,7 @@ pub(crate) fn binary_path(header: &str) -> Option<&str> {
 /// code, so the run records it as COULD NOT RUN, never `FAIL`.
 ///
 /// Producers print it verbatim in their panic message, most through
-/// `aterm_spec::host::could_not_run` (its `COULD_NOT_RUN` is this string); a
+/// `aterm_uds::host::could_not_run` (its `COULD_NOT_RUN` is this string); a
 /// reworded producer turns its refusals into findings, which fails closed.
 pub const COULD_NOT_RUN_SENTINEL: &str = "aterm-gate: COULD NOT RUN";
 
@@ -298,6 +199,60 @@ pub fn environment_refusals(log: &str) -> Option<Vec<String>> {
             named.dedup();
             named.into_iter().map(str::to_string).collect()
         })
+}
+
+/// Why the tests in `names` decided nothing, as a COULD NOT RUN row says it:
+/// `who` (`every failing test`, `3 of its failing tests`) refused the machine,
+/// the first four named, and what the refusals in `log` said
+/// ([`refusal_reasons`]): what the host lacks and its fix, where the row's
+/// reader looks, not only in the log.
+#[must_use]
+pub fn refusal_reason(who: &str, names: &[String], log: &str) -> String {
+    let shown: Vec<&str> = names.iter().take(4).map(String::as_str).collect();
+    let more = names.len().saturating_sub(shown.len());
+    let sentinel = COULD_NOT_RUN_SENTINEL;
+    let why = match refusal_reasons(log).as_slice() {
+        [] => format!("see `{sentinel}` in their output"),
+        [one] => one.clone(),
+        [first, rest @ ..] => format!(
+            "{first} (the first of {} reasons; each follows `{sentinel}` in their output)",
+            rest.len() + 1
+        ),
+    };
+    format!(
+        "{who} refused the machine, not the tree ({}{}) — {why}",
+        shown.join(", "),
+        if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        },
+    )
+}
+
+/// What the refusals in a log said: the rest of each line that carries
+/// [`COULD_NOT_RUN_SENTINEL`] (`… — <why>` or `…: <why>`), each distinct one
+/// once, in log order. A producer's `why` names what the host lacks and its
+/// fix, so a COULD NOT RUN row can say it ([`crate::exec::Run::environment_failure`]);
+/// it decides nothing ([`environment_refusals`] does).
+#[must_use]
+pub fn refusal_reasons(log: &str) -> Vec<String> {
+    if log.contains('\x1b') {
+        return refusal_reasons(&strip_ansi(log));
+    }
+    let mut reasons: Vec<String> = Vec::new();
+    for line in log.lines() {
+        let Some((_, rest)) = line.split_once(COULD_NOT_RUN_SENTINEL) else {
+            continue;
+        };
+        let why = rest
+            .trim_start_matches(|c: char| c == ':' || c == '—' || c.is_whitespace())
+            .trim_end();
+        if !why.is_empty() && !reasons.iter().any(|r| r == why) {
+            reasons.push(why.to_string());
+        }
+    }
+    reasons
 }
 
 /// One failed test, as a `--no-fail-fast` `targo test` log accounts for it.
@@ -584,6 +539,64 @@ mod tests {
                 "measuring::row_two".to_string(),
                 "starts_the_service".to_string(),
             ])
+        );
+        assert_eq!(
+            refusal_reasons(&log),
+            ["a stale peer is alive", "take unproved"],
+            "each distinct why once, in log order"
+        );
+        let colon = format!("{COULD_NOT_RUN_SENTINEL}: node could not start; install node\n");
+        assert_eq!(
+            refusal_reasons(&format!("\x1b[31m{colon}\x1b[0m{colon}")),
+            ["node could not start; install node"]
+        );
+    }
+
+    /// A test that re-runs itself alone in a child (aterm-render's
+    /// `alone::in_own_process`) re-raises the child's refusal with the child's
+    /// why on its own sentinel line and the child's stderr below it: one
+    /// refusal, so the row gives that why once, in full, and no count. The
+    /// control is a re-raise that leads with its own context: a second reason,
+    /// and the row shows the wrapper's line, which names neither the lack nor
+    /// the fix.
+    #[test]
+    fn a_reraised_refusal_is_one_reason_the_childs() {
+        let name = "seal_maps_discovered_faces::the_seal_maps_every_discovered_face";
+        let why = "this host has none of the chain/symbol/emoji candidate files";
+        let child = format!(
+            "\nthread '{name}' (48286027) panicked at tests/seal_maps_discovered_faces.rs:93:9:\n\
+             {COULD_NOT_RUN_SENTINEL} — {why}\nnote: run with `RUST_BACKTRACE=1`\n"
+        );
+        let row = |first_line: &str| {
+            let block = format!(
+                "\nthread '{name}' (48286024) panicked at tests/common/alone.rs:63:9:\n\
+                 {COULD_NOT_RUN_SENTINEL} — {first_line}\n{child}"
+            );
+            let log = failed_binary("render_suite", &[(name, &block)]);
+            let run = crate::exec::Run {
+                ok: false,
+                output: log.clone(),
+                code: Some(101),
+                spawn_error: None,
+            };
+            (refusal_reasons(&log), run.environment_failure())
+        };
+
+        let (reasons, failure) = row(&format!("{why}\n({name}, alone in its own process)"));
+        assert_eq!(reasons, [why], "the child's why, once");
+        let failure = failure.expect("the machine's, not a finding");
+        assert!(
+            failure.ends_with(&format!("({name}) — {why}")),
+            "the row names the child's why in full, with no count: {failure}"
+        );
+
+        let (reasons, failure) = row(&format!("{name}, alone in its own process:"));
+        assert_eq!(reasons.len(), 2, "{reasons:?}");
+        assert!(
+            failure
+                .expect("still the machine's")
+                .contains("alone in its own process: (the first of 2 reasons"),
+            "a wrapper's own line first hides the why"
         );
     }
 

@@ -1,32 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-agent: agent control and supervision outside the engine core.
-//! The basic control primitives are:
+// The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
+// under them (crates/aterm-spec-anchor/anchor_rules.rs).
+#![cfg_attr(anchor_rules, feature(macro_attr))]
+
+//! aterm-agent: the agent interface layer — the window harness's supervisor
+//! ([`supervise`]), its readings and the live upgrade ([`harness`]), the
+//! `aterm drive` CLI over them ([`drive_cli`]), the `aterm fleet` CLI
+//! ([`fleet_cli`]), the AI connections ([`ai`]), and the two control clients
+//! they drive a host through: [`CtlClient`] (this build's own `ctl` verb, one
+//! process per request) and [`RelayClient`] (one persistent, authenticated
+//! connection).
 //!
-//! 1. Turn completion ([`Turn`]): "an agent finished its turn" is
-//!    `IdleFor(d) ∧ RowMatches(prompt-ready)` composed over the engine's
-//!    predicates, plus response-region extraction and the Claude-specific
-//!    prompt-ready patterns.
-//!
-//! 2. The self-reflection feedback governor ([`SelfGovernor`]). When observer
-//!    and observed are the same session, `await-idle` alone does not damp the
-//!    loop (a self-write that produces output keeps `content_seq` advancing).
-//!    Self-writes are off by default, rate-limited by a token bucket, and a
-//!    circuit breaker trips on sustained self-induced churn. Its `FailClosed`
-//!    behaviour is pinned by [`tests`].
-//!
-//! This governor is policy. The un-bypassable floor, a hard per-session rate
+//! The floor against a self-driven feedback storm, a hard per-session rate
 //! limit on self-targeted input injection, lives in the control dispatch path
-//! (`aterm-gui::inject_floor`), because a raw control client can drive `@.` in
-//! a loop without linking this crate. Cross-session self-amplification is
-//! bounded by the proxy's per-op edge tokens (`ProxyEntry::token_for` returns
-//! `None` for `DeriveLoop`).
-//!
-//! [`supervise`] composes the session loop and its approval, question and
-//! turn-end policies; [`harness`] supplies usage/account views and the
-//! relaunch/upgrade adapters. [`drive_cli`] and [`fleet_cli`] expose these
-//! through the shipped executable.
+//! (`aterm-gui::inject_floor`), because any raw control client can drive `@.`
+//! in a loop. Cross-session self-amplification is bounded by the proxy's
+//! per-op edge tokens (`ProxyEntry::token_for` returns `None` for
+//! `DeriveLoop`).
 #![cfg_attr(
     test,
     allow(
@@ -35,206 +27,10 @@
     )
 )]
 
-// `println!` in this crate is a line on stdout beside a verb's answer (`aterm drive watch`'s
-// EXIT line on a failure, run in-process by the `aterm` executable), written through
-// `aterm_uds::stdout`: a reader that closed the pipe drops it, where std's panicked with exit
-// 101 on the EPIPE. An answer itself (`aterm drive`'s reply, `aterm fleet`'s usage) goes
-// through `aterm_uds::stdout::answer_exit`, which also says, and exits 1, when a full disk
-// lost it.
-macro_rules! println {
-    () => {
-        ::aterm_uds::stdout::print(::std::format_args!("\n"))
-    };
-    ($($arg:tt)*) => {
-        ::aterm_uds::stdout::println(::std::format_args!($($arg)*))
-    };
-}
-
 /// The crate's durability flush ([`durable::sync_all`]).
 mod durable;
 
 use std::io::{Read, Write};
-use std::time::Duration;
-
-use aterm_observe::row_matcher;
-
-/// The self-reflection feedback governor. Its model-checked `FailClosed`
-/// property: a self-write is permitted only with a spare token, a non-tripped
-/// breaker, and self-writes explicitly enabled.
-#[derive(Clone, Debug)]
-pub struct SelfGovernor {
-    /// Self-driving is off unless the operator explicitly enables it.
-    self_write_enabled: bool,
-    /// Token bucket: available write permits.
-    tokens: u32,
-    /// Bucket capacity (also the refill ceiling).
-    capacity: u32,
-    /// Permits restored per [`tick`](Self::tick).
-    refill: u32,
-    /// Accumulated self-induced output since the last decay.
-    churn: u32,
-    /// Trip threshold: churn above this trips the breaker.
-    churn_trip: u32,
-    /// Once tripped, all self-writes are refused until [`reset`](Self::reset).
-    tripped: bool,
-}
-
-impl SelfGovernor {
-    /// A governor with self-writes disabled (the default). `capacity` permits,
-    /// refilling `refill` per tick, tripping the breaker once self-induced churn
-    /// exceeds `churn_trip`.
-    #[must_use]
-    pub fn disabled(capacity: u32, refill: u32, churn_trip: u32) -> Self {
-        Self {
-            self_write_enabled: false,
-            tokens: capacity,
-            capacity,
-            refill,
-            churn: 0,
-            churn_trip,
-            tripped: false,
-        }
-    }
-
-    /// Explicitly opt into self-driving (the operator's deliberate choice). Even
-    /// then, every write still passes the token bucket and the breaker.
-    pub fn enable_self_write(&mut self) {
-        self.self_write_enabled = true;
-    }
-
-    /// May a self-write proceed now? Consumes one token on success; `false`
-    /// unless self-writes are enabled, the breaker is not tripped, and a token
-    /// is available.
-    #[must_use]
-    pub fn allow_self_write(&mut self) -> bool {
-        if !self.self_write_enabled || self.tripped || self.tokens == 0 {
-            return false;
-        }
-        self.tokens -= 1;
-        true
-    }
-
-    /// Record `amount` of self-induced output. Sustained churn trips the breaker
-    /// (latching) — the storm backstop that `await-idle` alone cannot provide.
-    pub fn note_self_output(&mut self, amount: u32) {
-        self.churn = self.churn.saturating_add(amount);
-        if self.churn > self.churn_trip {
-            self.tripped = true;
-        }
-    }
-
-    /// One governor tick: refill the bucket (capped) and decay the churn window.
-    pub fn tick(&mut self) {
-        self.tokens = self.tokens.saturating_add(self.refill).min(self.capacity);
-        self.churn = self.churn.saturating_sub(self.refill);
-    }
-
-    /// Whether the breaker has tripped (manual [`reset`](Self::reset) to recover).
-    #[must_use]
-    pub fn tripped(&self) -> bool {
-        self.tripped
-    }
-
-    /// Operator recovery after a trip: clear the breaker and refill.
-    pub fn reset(&mut self) {
-        self.tripped = false;
-        self.churn = 0;
-        self.tokens = self.capacity;
-    }
-}
-
-/// The Claude prompt-ready signal: an input caret (`❯`) on some row. It says
-/// nothing about a spinner (the glyph stays on screen while Claude thinks),
-/// which is why [`DRIVE_HELP`] recommends `await gone` on the busy footer.
-#[must_use]
-pub fn claude_prompt_ready_pattern() -> &'static str {
-    // The input caret at the start of a row; tolerant of the box border glyphs.
-    r"(^|\s)❯(\s|$)"
-}
-
-/// A driven turn: type a prompt, submit it, block until the surface is idle
-/// for [`idle`] with a best-effort prompt-ready confirm, and read the settled
-/// surface. The [`ControlClient`] abstracts the transport (the `aterm ctl`
-/// client or one persistent socket); `aterm-drive` runs this loop over
-/// [`CtlClient`].
-pub struct Turn {
-    /// Quiescence window that counts as "the agent stopped streaming".
-    pub idle: Duration,
-    /// Overall deadline before giving up.
-    pub timeout: Duration,
-    /// The prompt-ready regex (defaults to [`claude_prompt_ready_pattern`]).
-    pub ready_pattern: String,
-}
-
-impl Default for Turn {
-    fn default() -> Self {
-        Self {
-            idle: Duration::from_millis(600),
-            timeout: Duration::from_secs(180),
-            ready_pattern: claude_prompt_ready_pattern().to_string(),
-        }
-    }
-}
-
-/// The transport seam the agent layer drives: `aterm-ctl`'s verbs, or one
-/// persistent connection; the [`Turn`] composition is identical either way.
-pub trait ControlClient {
-    /// The transport's error type.
-    type Error;
-    /// Type bytes into the target's input (the `send` verb).
-    fn send(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
-    /// Submit with a real Enter keypress (the `key enter` verb — never a raw LF).
-    fn key_enter(&mut self) -> Result<(), Self::Error>;
-    /// Settle the surface (`await idle`), then best-effort confirm a prompt-ready
-    /// row (`await match <ready>`), then return the settled surface text. Idle is
-    /// the authoritative turn-complete signal; the ready match only sharpens it.
-    /// `ready_pattern` empty = idle only.
-    fn await_idle_and_ready(
-        &mut self,
-        idle: Duration,
-        ready_pattern: &str,
-        timeout: Duration,
-    ) -> Result<String, Self::Error>;
-}
-
-/// Why a turn could not be driven. The `Display` messages are written for an AI
-/// agent reading them in a tool result: each says what happened, and `Governed`
-/// and `BadPattern` also say what to try next.
-#[derive(Debug)]
-pub enum TurnError<E> {
-    /// The self-reflection governor refused the write (off / rate-limited /
-    /// breaker tripped).
-    Governed,
-    /// The supplied `ready_pattern` did not compile as a regex.
-    BadPattern(regex_error::Error),
-    /// The transport failed. `Display` is the transport's own error: aterm-ctl's
-    /// line or its exit, a turn that did not settle within the timeout, the
-    /// server's `ERR`, or the connection's.
-    Transport(E),
-}
-
-impl<E: std::fmt::Display> std::fmt::Display for TurnError<E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TurnError::Governed => write!(
-                f,
-                "self-reflection governor refused the write. This session is \
-                 driving ITSELF and self-writes are off, the write budget (token \
-                 bucket) is spent, or the churn breaker tripped. Fix: enable \
-                 self-writes deliberately (SelfGovernor::\
-                 enable_self_write) and pace the loop — act only on a settled turn, \
-                 never on every output burst."
-            ),
-            TurnError::BadPattern(e) => write!(
-                f,
-                "the prompt-ready pattern is not a valid regex ({e}). Fix: pass a \
-                 simple anchored pattern, e.g. '❯' for a Claude input box or \
-                 '\\$ $' for a shell prompt."
-            ),
-            TurnError::Transport(e) => write!(f, "{e}"),
-        }
-    }
-}
 
 /// AI connections: one working login per AI CLI, its doctor, and reviews across AIs.
 pub mod ai;
@@ -242,6 +38,15 @@ pub mod ai;
 pub mod drive_cli;
 /// The `aterm fleet` CLI (binary-era `aterm-fleet`), callable in-process.
 pub mod fleet_cli;
+/// `aterm fleet init|join|peers|allow|leave`: this machine's membership in a
+/// fleet.
+#[cfg(unix)]
+mod fleet_member;
+/// `aterm ctl survey --fleet | --host`: the fleet's peers, read over its port
+/// (`aterm_ctl::LocalVerbs::fleet_survey`); `aterm ctl --host <h> …`: another
+/// Mac driven over it (`aterm_ctl::LocalVerbs::fleet_drive`).
+#[cfg(unix)]
+pub use fleet_member::{drive_fleet, survey_fleet};
 /// The harness core: the pure readings behind the aterm wrapper (the usage
 /// view, the disk report, the footer) and the live upgrade and relaunch.
 pub mod harness;
@@ -250,46 +55,8 @@ pub mod harness;
 #[cfg(unix)]
 pub mod ready;
 /// The supervisor: read-only classification, prompt parsing, the worker's phase,
-/// and the `await-turn` / `supervise` / `watch` loop behind `aterm drive`.
+/// and the loop the window's own host runs on every agent session.
 pub mod supervise;
-
-/// Re-export so callers can match on a compile failure without depending on
-/// `regex` directly (it is validated through `aterm-observe`).
-pub mod regex_error {
-    pub use ::aterm_observe::regex_compile_error::Error;
-}
-
-impl Turn {
-    /// Drive one turn through `client`, gated by `gov` (the self-reflection
-    /// governor — pass a permissive one for cross-session driving). Returns the
-    /// settled surface text on completion.
-    ///
-    /// # Errors
-    /// - [`TurnError::Governed`] if the governor refuses the write.
-    /// - [`TurnError::BadPattern`] if the ready pattern is invalid.
-    /// - [`TurnError::Transport`] on a transport failure.
-    pub fn run<C: ControlClient>(
-        &self,
-        client: &mut C,
-        gov: &mut SelfGovernor,
-        prompt: &[u8],
-    ) -> Result<String, TurnError<C::Error>> {
-        // Validate the predicate before touching the transport.
-        row_matcher(&self.ready_pattern).map_err(TurnError::BadPattern)?;
-        // The self-reflection floor: refuse if the governor says so.
-        if !gov.allow_self_write() {
-            return Err(TurnError::Governed);
-        }
-        client.send(prompt).map_err(TurnError::Transport)?;
-        client.key_enter().map_err(TurnError::Transport)?;
-        let screen = client
-            .await_idle_and_ready(self.idle, &self.ready_pattern, self.timeout)
-            .map_err(TurnError::Transport)?;
-        // Account the response toward the churn breaker (self-reflection safety).
-        gov.note_self_output(u32::try_from(screen.len()).unwrap_or(u32::MAX));
-        Ok(screen)
-    }
-}
 
 /// The verb the one binary answers a control request on: `aterm ctl …`.
 pub const CTL_VERB: &str = "ctl";
@@ -309,9 +76,9 @@ pub fn own_exe() -> Result<std::path::PathBuf, String> {
 }
 
 /// `exe` resolved through its links ([`own_exe`]). Where it no longer names a
-/// file (an update replaced the image under a long-running `aterm fleet
-/// events`, whose path then reads `… (deleted)`), Linux still reaches the
-/// running image as `/proc/self/exe`, which answers `ctl` as the front door.
+/// file (an update replaced the image under a long-running client, whose path
+/// then reads `… (deleted)`), Linux still reaches the running image as
+/// `/proc/self/exe`, which answers `ctl` as the front door.
 fn resolved_exe(exe: std::path::PathBuf) -> std::path::PathBuf {
     match std::fs::canonicalize(&exe) {
         Ok(path) => path,
@@ -320,20 +87,14 @@ fn resolved_exe(exe: std::path::PathBuf) -> std::path::PathBuf {
     }
 }
 
-/// A [`ControlClient`] that drives a target aterm by shelling out to a
-/// control client — this program's own `ctl` verb ([`CtlClient::own_at`]) —
-/// reusing the verbs a human would type. Composition (idle, a bounded
-/// prompt-ready confirm, read) lives here, so the core `await` verb stays
-/// single-predicate.
+/// A client that drives a target aterm by shelling out to a control client —
+/// this program's own `ctl` verb ([`CtlClient::own_at`]) — one process per
+/// request, reusing the verbs a human would type.
 pub struct CtlClient {
     ctl: std::path::PathBuf,
     /// The arguments before `--sock` (the `ctl` verb, for [`Self::own_at`]).
     lead: Vec<String>,
     socket: Option<String>,
-    /// The `aterm-ctl` in flight, by pid, for [`CtlClient::cutter`].
-    running: std::sync::Arc<std::sync::Mutex<Option<u32>>>,
-    /// Set by the cutter: every request from then on is cut short.
-    cut: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CtlClient {
@@ -345,8 +106,6 @@ impl CtlClient {
             ctl: ctl.into(),
             lead: Vec::new(),
             socket,
-            running: std::sync::Arc::default(),
-            cut: std::sync::Arc::default(),
         }
     }
 
@@ -356,36 +115,6 @@ impl CtlClient {
         Self {
             lead: vec![CTL_VERB.to_string()],
             ..Self::new(exe, socket)
-        }
-    }
-
-    /// A handle that cuts the request in flight short from another thread
-    /// (`SIGTERM` to the running `aterm-ctl`) and every request after it: the
-    /// client is done once cut. It ends the mail lane's parked `await inbox` as
-    /// soon as its loop has a result ([`supervise::Ctl::interrupter`]). Unix
-    /// only; elsewhere `None`, and the loop ends within one step.
-    #[must_use]
-    pub fn cutter(&self) -> Option<supervise::Interrupter> {
-        #[cfg(unix)]
-        {
-            let running = std::sync::Arc::clone(&self.running);
-            let cut = std::sync::Arc::clone(&self.cut);
-            Some(Box::new(move || {
-                cut.store(true, std::sync::atomic::Ordering::SeqCst);
-                let pid = running.lock().unwrap_or_else(|p| p.into_inner()).take();
-                if let Some(pid) = pid {
-                    // SAFETY: a plain `kill(2)` on a pid this client spawned and
-                    // has not yet reaped (`running` is cleared after the wait,
-                    // under the same lock), so the pid cannot have been reused.
-                    unsafe {
-                        libc::kill(libc::pid_t::try_from(pid).unwrap_or(0), libc::SIGTERM);
-                    }
-                }
-            }))
-        }
-        #[cfg(not(unix))]
-        {
-            None
         }
     }
 
@@ -402,10 +131,8 @@ impl CtlClient {
 
     /// Run `aterm-ctl [--sock S] <args...>` and return the exit code with both
     /// streams, so the supervisor can tell a `124` timeout and an `ERR usage`
-    /// from a failure. `Err` only when the client could not be
-    /// launched.
+    /// from a failure. `Err` only when the client could not be launched.
     pub fn run_raw(&self, args: &[&str]) -> Result<supervise::CtlReply, String> {
-        use std::sync::atomic::Ordering;
         // `aterm-ctl` is a console image: a supervisor in a process with no
         // console (the window's harness host) opened a visible console window
         // for every request on Windows until `spawnfd::command` decided it.
@@ -418,26 +145,10 @@ impl CtlClient {
             .stdin(aterm_uds::spawnfd::Stdio::null())
             .stdout(aterm_uds::spawnfd::Stdio::piped())
             .stderr(aterm_uds::spawnfd::Stdio::piped());
-        let mut child = cmd
+        let out = cmd
             .spawn()
+            .and_then(|child| child.wait_with_output())
             .map_err(|e| format!("could not run {}: {e}", self.ctl.display()))?;
-        // Registered under the lock the cutter takes, and checked after it:
-        // a cut that came between the spawn and the registration still
-        // ends this request, not the next one.
-        {
-            let mut running = self.running.lock().unwrap_or_else(|p| p.into_inner());
-            if self.cut.load(Ordering::SeqCst) {
-                let _ = child.kill();
-            } else {
-                *running = Some(child.id());
-            }
-        }
-        let out = child.wait_with_output();
-        self.running
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take();
-        let out = out.map_err(|e| format!("could not run {}: {e}", self.ctl.display()))?;
         Ok(supervise::CtlReply {
             code: out.status.code().unwrap_or(1),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -456,66 +167,6 @@ fn failure_words(reply: &supervise::CtlReply) -> String {
     match reply.stdout.trim() {
         "" => format!("aterm-ctl exited {}", reply.code),
         out => format!("aterm-ctl exited {}: {out}", reply.code),
-    }
-}
-
-/// The longest single `await` the host runs: it caps every wait there, so a
-/// longer `--timeout` ends at this (`aterm-gui`'s `control_session`).
-const HOST_AWAIT_CAP_MS: u128 = 600_000;
-
-/// The line for a turn whose screen did not settle, naming the wait that ran.
-/// Both transports print it, so they say the same thing.
-fn unsettled(timeout: Duration) -> String {
-    let ms = timeout.as_millis();
-    if ms > HOST_AWAIT_CAP_MS {
-        format!(
-            "the screen did not settle within {HOST_AWAIT_CAP_MS} ms (the host's cap on --timeout)"
-        )
-    } else {
-        format!("the screen did not settle within {ms} ms (--timeout)")
-    }
-}
-
-impl ControlClient for CtlClient {
-    type Error = String;
-    fn send(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
-        let s = String::from_utf8_lossy(bytes);
-        // `--` ends `send`'s options, so a prompt that starts `if=`, `id=` or `--`
-        // (or is `-` / `--stdin`, aterm-ctl's stdin form) is typed as written.
-        self.run(&["send", "--", s.as_ref()]).map(|_| ())
-    }
-    fn key_enter(&mut self) -> Result<(), Self::Error> {
-        self.run(&["key", "enter"]).map(|_| ())
-    }
-    fn await_idle_and_ready(
-        &mut self,
-        idle: Duration,
-        ready_pattern: &str,
-        timeout: Duration,
-    ) -> Result<String, Self::Error> {
-        let idle_ms = idle.as_millis().to_string();
-        let to_ms = timeout.as_millis().to_string();
-        // (1) Wait for the surface to settle with the single-predicate
-        //     `await idle` (a streaming TUI's spinner keeps changing the screen
-        //     until the turn ends). A server timeout (exit 124) prints nothing on
-        //     stderr, so it is named here.
-        let settled = self.run_raw(&["await", "idle", &idle_ms, "timeout", &to_ms])?;
-        if settled.timed_out() {
-            return Err(unsettled(timeout));
-        }
-        if !settled.ok() {
-            return Err(failure_words(&settled));
-        }
-        // (2) Best-effort confirm that a prompt-ready row is present
-        //     (`await match`). The surface is already idle, so a matching row
-        //     returns at once, and the 250 ms bound limits the cost of a
-        //     non-matching pattern (the Claude `❯` default against a `$` shell).
-        //     Non-fatal: idle is authoritative. Skipped when no pattern is set.
-        if !ready_pattern.is_empty() {
-            let _ = self.run(&["await", "match", ready_pattern, "timeout", "250"]);
-        }
-        // (3) Read the settled surface.
-        self.run(&["text"])
     }
 }
 
@@ -559,14 +210,15 @@ fn reply_count(header: &str) -> std::io::Result<Option<usize>> {
     }
 }
 
-/// A [`ControlClient`] over one persistent, authenticated control connection,
-/// the persistent twin of [`CtlClient`]. It speaks the raw control verbs
-/// directly over one connection for its lifetime.
+/// One persistent, authenticated control connection, the in-process twin of
+/// [`CtlClient`]: it speaks the raw control verbs directly, with the same verbs
+/// and framing `CtlClient` drives through `aterm-ctl`.
 ///
 /// Generic over any `Read + Write` transport: a local `CtlStream`
-/// ([`connect_local`](RelayClient::connect_local)), or an in-memory wire in
-/// tests. The verbs and framing are byte-identical to what `CtlClient` drives
-/// through `aterm-ctl`, so [`Turn::run`] behaves the same either way.
+/// ([`connect_local`](RelayClient::connect_local),
+/// [`connect_local_beside`](RelayClient::connect_local_beside)), or an
+/// in-memory one in tests. The live upgrade and the supervisor's persistent
+/// transport ([`supervise::RelayCtl`]) ride it.
 pub struct RelayClient<S: Read + Write> {
     io: S,
     /// Sends only [`READ_VERBS`] ([`Self::reads_only`]): anything else is
@@ -733,36 +385,6 @@ impl<S: Read + Write> RelayClient<S> {
         self.io.write_all(line.as_bytes())?;
         self.io.write_all(b"\n")?;
         self.io.flush()
-    }
-
-    /// Issue a request whose reply is a single status line; `ERR …`/unexpected → Err.
-    fn request_status(&mut self, line: &str) -> std::io::Result<String> {
-        let resp = self.request_line(line)?;
-        if is_ok_reply(&resp) {
-            Ok(resp)
-        } else {
-            Err(std::io::Error::other(resp))
-        }
-    }
-
-    /// Issue `text` and parse the streaming reply (`OK <n>\n` then `n` body lines).
-    /// Each body line is returned with a trailing `\n`, byte-identical to the
-    /// `aterm-ctl` stdout that [`CtlClient`] captures for `text`.
-    fn read_text(&mut self) -> std::io::Result<String> {
-        let header = self.request_line("text")?;
-        if !is_ok_reply(&header) {
-            return Err(std::io::Error::other(header));
-        }
-        // Text requires a count; optional-count requests keep uncounted status
-        // headers. Both read the same grammar, with text's own malformed-header
-        // diagnostic for either an absent or an overflowing count.
-        let count = reply_count(&header).ok().flatten().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("malformed text header: {header:?}"),
-            )
-        })?;
-        self.read_body_lines(count, MAX_REPLY_BYTES)
     }
 
     /// The underlying transport, so a caller can take a second handle on the
@@ -932,161 +554,50 @@ impl RelayClient<aterm_uds::CtlStream> {
     }
 }
 
-impl<S: Read + Write> ControlClient for RelayClient<S> {
-    type Error = std::io::Error;
-
-    fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        let text = String::from_utf8_lossy(bytes);
-        // Reject embedded newline/CR: a multi-line payload would inject a second
-        // authenticated control verb (as aterm-ctl's validate_request_parts).
-        if text.contains('\n') || text.contains('\r') {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "send payload must not contain a newline/CR (would inject a second control verb)",
-            ));
-        }
-        // `--` ends `send`'s options (see `CtlClient::send`).
-        self.request_status(&format!("send -- {text}")).map(|_| ())
-    }
-
-    fn key_enter(&mut self) -> std::io::Result<()> {
-        self.request_status("key enter").map(|_| ())
-    }
-
-    fn await_idle_and_ready(
-        &mut self,
-        idle: Duration,
-        ready_pattern: &str,
-        timeout: Duration,
-    ) -> std::io::Result<String> {
-        let idle_ms = idle.as_millis();
-        let to_ms = timeout.as_millis();
-        // (1) Authoritative settle: the server's own `await idle`. A timed-out
-        //     wait still answers `OK …` (`OK timeout`), so it is named here.
-        let settled = self.request_status(&format!("await idle {idle_ms} timeout {to_ms}"))?;
-        if settled == "OK timeout" {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                unsettled(timeout),
-            ));
-        }
-        // (2) Best-effort prompt-ready confirm. The reply is discarded but must
-        //     be consumed before `text`, or the persistent stream desyncs.
-        if !ready_pattern.is_empty() {
-            self.write_line(&format!("await match {ready_pattern} timeout 250"))?;
-            let _ = self.read_reply()?;
-        }
-        // (3) Read the settled surface.
-        self.read_text()
-    }
-}
-
-/// The AI-oriented help for the `aterm drive` tool — written so a model reading
-/// `--help` in a tool result builds correct intuition for the CORE primitives
-/// (the `await`/`send`/`key`/`text` verbs) and the drive loop, without external
-/// docs. The core protocol stays terse; this is where the teaching lives.
+/// The help for the `aterm drive` tool, written so a model reading `--help` in
+/// a tool result knows what each command reads and prints, and where driving
+/// went (`aterm ctl`), without external docs.
 pub const DRIVE_HELP: &str = "\
-aterm drive — drive an interactive agent (e.g. Claude Code) running inside aterm.
+aterm drive — the window harness's readers, run by hand.
 
 MENTAL MODEL
-    A HOST aterm runs your target program as its child and exposes a Unix control
-    socket. This tool reads the live screen and drives keystrokes with the same
-    control verbs exposed by `aterm ctl`. The key primitive is
-    `await`: block until the surface reaches a condition, so you never sleep-and-
-    hope or scrape for a spinner.
+    Every Claude Code, agy, Muse Code and Gemini CLI session in an aterm window is
+    ALREADY supervised by the window's own host, by default (`status
+    supervisor=aterm-harness@<pid>`), under aterm.toml's [harness] table: `aterm help harness` lists its keys and what
+    it does — every box its answer, a question its `answer_text`, a turn that ended
+    its continuation, a wall its retry, its reset or a relaunch. These commands are
+    that host's own knowledge, run from a terminal: whether a shell line is a read
+    (classify), what a worker's screen says (phase), a choice typed into its
+    question dialog (answer), and how its run went (ledger); `tape` and `replay`
+    read and run again a harness tape a hosted loop recorded. A vendor `codex` is
+    shown (its own OSC 7501 report is `status program_state=`), not supervised;
+    codex-alab supervises itself and the window only watches it.
+    Driving a session goes through `aterm ctl` (`aterm ctl help`): a Claude Code
+    WORKER is started on a task with `aterm ctl @self spawn agent=claude -` (the
+    task on stdin), waited on with `aterm ctl await task @<sid>,… since=0` run as a
+    background command (a later wait names `@<sid>:<rev>`), and read with
+    `aterm ctl @<sid> result`; any session is read with `aterm ctl @<sid> text`,
+    typed to with `turn`, captured with `image`, and waited on with `await`
+    (`await agent idle,prompt,question,wall` for an agent).
+    One session's `aterm ctl @sid meta set questions ask|recommended|long-term|short-term`
+    decides that session's questions over the table: a priority word answers its
+    dialogs and the questions it asks in prose by that priority; `ask` hands each
+    of its DIALOGS to a person or a controller (`answer` below), and a dialog it
+    holds is answered within 2 s of `meta unset questions`.
 
 USAGE
-    aterm drive [--socket PATH] [--idle MS] [--timeout MS] [--ready REGEX]
-                <command> [text...]
-    aterm drive classify [--allow-python GLOB]... <cmd...> | phase [@sid]
+    aterm drive [--socket PATH] <command>
+    aterm drive classify [--allow-python GLOB]... <cmd...>
+              | phase [@sid] [--allow-python GLOB]...
               | answer @sid [--box TOKEN] <answer...>
-              | await-turn [@sid] [--timeout MS] [--reconnect-s S]
-              | supervise [@sid] [--approve safe|none] [--no-continue] [--no-answer] [--max-s S]
-                          [--question-priority recommended|long-term|short-term]
-                          [--allow-python GLOB]... [--notes FILE] [--reconnect-s S]
-                          [--context-warn PCT] [--journal FILE] [--tape FILE]
-                          [--mail [--inbox @sid] [--report-window S] [--idle-grace S]]
-              | watch [@sid] [--approve safe|none] [--no-continue] [--no-answer]
-                      [--question-priority recommended|long-term|short-term]
-                      [--allow-python GLOB]... [--notes FILE] [--max-s S] [--reconnect-s S]
-                      [--report] [--context-warn PCT] [--journal FILE] [--tape FILE]
-                      [--mail [--inbox @sid] [--report-window S] [--idle-grace S]]
-              | task @sid [--deadline S] [--wait] [--inbox @sid] [--reconnect-s S] <text...>
-              | report [@sid] [--since ORIGIN:I] [--max-rows N] [--final | --messages]
               | ledger [@sid] [--journal FILE] [--since TIME] [--format text|md|html] [--out PATH]
+                       [--source anchor|log]
               | tape cat FILE [--text] [--salvage] | tape show FILE --decisions | tape stats FILE
               | tape ls [@sid] | tape forget FILE|@sid...
               | replay FILE [--until door=N]
+              | help
 
 COMMANDS
-    prompt <text...>   Type <text>, press Enter, then BLOCK until the agent's turn
-                       settles (no screen change for --idle ms), and print the
-                       settled screen. This is the one you want for a drive loop.
-                       Real instructions for a MODEL worker (Claude Code) go by
-                       `task` (below), as mail: a plain `aterm ctl turn` delivers
-                       its text as one bracketed paste, which the model reads as
-                       PASTED, not as its human's words — its own injection
-                       safeguard may refuse to act on it and ask.
-    read               Print the live screen (one row per line).
-    await <cond>       Block until a condition, then print the kernel's verdict:
-                         idle <ms>        surface unchanged for <ms> (turn done)
-                         match <regex>    a visible row matches <regex>
-                         gone <regex>     NO visible row matches <regex> (a busy
-                                          footer such as 'esc to interrupt' left)
-                         seq              the next content change lands
-                         block            a shell command completes (OSC-133)
-    shot [name.png]    Save a pixel-true PNG of the terminal content view (the
-                       rendered cells; OS chrome/titlebar are NOT captured). The
-                       name is a BARE filename: captures land in the images/
-                       dir beside the host's control socket (a '/' is refused) and
-                       the reply prints the full written path; auto-named when
-                       omitted.
-    help               Show this text.
-
-SUPERVISING A WORKER (an agent session — Claude Code, agy, Muse Code or Gemini CLI — in another tab; `@sid` from `aterm ctl ls`)
-    A vendor `codex` is shown (its own OSC 7501 report is `status
-    program_state=`), not supervised; codex-alab supervises itself and the
-    window only watches it.
-    Every such session in an aterm window is ALREADY supervised by the
-    window's own host, by default: this engine, one loop per session, under
-    aterm.toml's [harness] table (`aterm help harness` lists its keys and
-    names the few that add power; `enabled = false`, or the Harness row in
-    Settings, turns it off). `supervise` and `watch` below read the same table,
-    and their flags only limit it. `status`/`ls` name it as
-    `supervisor=aterm-harness@<pid>`. Unless the table says otherwise it is
-    FULLY AUTOMATIC — nobody is at the keyboard, so nothing waits on a
-    person: every box gets its answer, a question its `answer_text`, a turn
-    that ended its continuation (on a growing back-off when turns keep ending
-    short), a wall its retry, its reset or a relaunch on the fallback model;
-    a Claude Code or a Muse Code that crashed is relaunched on its
-    conversation where aterm can (`aterm help harness` says where). Within
-    `human_grace_s` of a person's keystroke (but for the folder-trust dialog that keystroke
-    launched, answered at once where `input=clear` is measured, macOS
-    today: `status launch=person`), or while another driver holds a lease
-    or a named turn on the session (`hand=`), it keeps its hands off it.
-    HOW a question is answered is `question_priority`: `recommended` (the
-    default) as above, a dialog by its recommended option; `long-term` or
-    `short-term` and no option is chosen by the
-    harness — that policy's fixed text is written into the free-text row of
-    a dialog and submitted (and typed in place of `answer_text` in prose),
-    and the worker decides. One session's
-    `aterm ctl @sid meta set questions ask|recommended|long-term|short-term`
-    decides that session's questions over `answer_questions` and
-    `question_priority`: a priority word answers its dialogs and the
-    questions it asks in prose by that priority, under `answer_questions =
-    false` too; `ask` hands each of its DIALOGS to a person or a controller
-    (`aterm drive answer` below), and a dialog it holds is answered within
-    2 s of `meta unset questions` — a question in prose, which neither
-    answers, is left to the table's switches; a dialog the harness answered
-    is told once: `CHOSE … policy=<word>` and `story chose <word>` to the
-    window (a chime, a rim pulse), the word the answers were decided by.
-    Only what the table limited, and what nothing can answer (a lost
-    login's browser step, a box no reader can parse), goes to the session's
-    attention (owner=supervisor): one menu-bar row (and one desktop
-    notification with desktop_alerts = true; default off). The commands
-    below are for a manager of its own: a
-    `watch` started on a session the host holds watches only (WATCHING …),
-    and one started first holds the session until it ends.
     classify [--allow-python GLOB]... <cmd...>
                        Is this shell line READ-ONLY, the way the supervisor judges
                        it? Prints `read-only` (exit 0) or `not-read-only <reason>`
@@ -1115,8 +626,11 @@ SUPERVISING A WORKER (an agent session — Claude Code, agy, Muse Code or Gemini
                        date -s, uniq IN OUT, find -fprint, and an assignment
                        to PATH (unless every entry is a system bin dir), HOME,
                        GIT_*, LD_*/DYLD_*, a pager or an editor. `aterm ctl`
-                       reads only by verb AND form (`meta` reads, `meta set`
-                       writes). python3 runs only a script on the
+                       reads only by verb AND form (`meta` and `task` read,
+                       `meta set` and `task mark` write; `await task`,
+                       `result` and `survey` read, `spawn` writes), and so does
+                       `aterm drive` (`ledger` reads unless `--out` writes a
+                       file; `answer` writes). python3 runs only a script on the
                        --allow-python globs (none by default; no `..`). The
                        programs handed to awk and sed are read from the raw
                        words: `system(`, a redirect or a pipe in awk, a `w`/`e`
@@ -1142,9 +656,8 @@ SUPERVISING A WORKER (an agent session — Claude Code, agy, Muse Code or Gemini
                        screen lane was retired on 2026-10-16): on a Codex
                        every read is `idle` with no evidence and names no box
                        (`status agent=unknown`; its own state is `status
-                       program_state=`), so phase, await-turn, answer and
-                       report read nothing there. What follows describes
-                       Claude Code's grammar.
+                       program_state=`), so phase and answer read nothing
+                       there. What follows describes Claude Code's grammar.
                        A prompt wins over busy, busy over limited,
                        limited over question — except a busy that is only a
                        background monitor: a question, a limit notice or any
@@ -1225,8 +738,7 @@ SUPERVISING A WORKER (an agent session — Claude Code, agy, Muse Code or Gemini
                        output does not count unless it, too, ends at that edge.
                        That much of the worker's context is left before Claude
                        Code auto-compacts it, replacing its history with a summary
-                       in which the rules you gave it may not survive (see
-                       --context-warn).
+                       in which the rules you gave it may not survive.
     answer @sid [--box TOKEN] <answer...>
                        Type YOUR choice into the worker's question, read by its
                        own program's grammar (`status program=`, else what its
@@ -1273,648 +785,8 @@ SUPERVISING A WORKER (an agent session — Claude Code, agy, Muse Code or Gemini
                        (a person keyed the session, or `human`; exit 0),
                        `NO-BOX` (exit 1), `REFUSED <why>` (exit 2, nothing
                        typed) or `NOT-SERVED <why> (enters=<k>)` (exit 3).
-    await-turn [@sid] [--timeout MS] [--reconnect-s S]
-                       Block until the phase is no longer busy, then print it
-                       exactly like `phase` (its `survey 0` and `context <n>%`
-                       lines included), by the grammar of the program `status`
-                       names before the wait. The loop is `await idle 2000` →
-                       read → `await seq` (never a sleep); where the host knows
-                       `await gone`, the busy row LEAVING (Claude Code's footer)
-                       is the first wait. A screen
-                       without the composer rules (a build, a script, a REPL) whose
-                       output never held still for the 2 s is busy too: its turn
-                       ends when the output pauses. Exit 124 on --timeout (default:
-                       the global --timeout) with the worker still busy — or with
-                       the connection lost (see --reconnect-s): then the phase of
-                       the last screen read, or `busy` with `reason no screen: no
-                       read answered before the timeout` when none was.
-    supervise [@sid] [--approve safe|none] [--no-continue] [--no-answer] [--max-s S]
-              [--question-priority recommended|long-term|short-term]
-              [--allow-python GLOB]... [--notes FILE] [--reconnect-s S]
-              [--context-warn PCT] [--journal FILE]
-                       The loop: await-turn; the approval policy decides every
-                       box (one decider, the [harness] `approve` level; never a
-                       don't-ask-again, session or mode-switch grant, and never
-                       a purchase). By default (\"all\") every box gets its
-                       answer, read by its program's own reader (Claude Code's,
-                       agy's, Muse Code's — Muse Code's answered by
-                       the cursor and Enter, never a digit — Gemini CLI's,
-                       which runs as `node` and is named by its screen): a
-                       permission box its one-shot allow (`Yes`) —
-                       Bash under any header whatever vendor note it carries,
-                       Edit/Write/Read, a workflow, Fetch, a network request,
-                       Chrome, a skill, Monitor, an MCP tool's box, a model's
-                       or extra usage's consent on Claude Code (`Continue with
-                       …`; credits the account turned off are never turned
-                       back on) — the folder-trust dialog its trust option for
-                       any folder, plan mode's approval its yes that grants no
-                       standing mode (`Yes, manually approve edits`), Claude
-                       Code's model-refusal pause (exactly its switch and its
-                       retry) its switch while model_fallback is set (no
-                       other box's model switch is ever pressed), a held
-                       message its delivery, and a setup dialog, a proposed
-                       goal or a Computer Use grant its refusal (`Continue
-                       without …` is a refusal, never a consent). Claude
-                       Code's MCP server dialog is yours at every level:
-                       each answer, Esc too, is saved for good in the
-                       project's .claude/settings.local.json (`claude mcp
-                       reset-project-choices` undoes it). A box taller
-                       than the pane is pressed at no level: it is answered
-                       once the pane shows it whole, and is yours until then
-                       (in a bypass session one whose foot flags an rm is
-                       declined with that note); no press ever chooses an
-                       answer kept for later asks. An option
-                       whose label OPENS with buy, add funds, upgrade or a
-                       spend limit raised is never chosen: a box whose every
-                       yes buys gets the option that waits, a box with no yes
-                       it may take gets its `No`, and one with none of these,
-                       or options it cannot read, is yours. A press no safe
-                       rule proved carries `unproven: <why>` in its ledger
-                       row, its notes line and the journal.
-                       Gemini CLI's shell, write and edit boxes get their
-                       `Allow once` and its folder-trust dialog `Trust folder`,
-                       each by its digit — never `Allow for this session` or
-                       the external editor; any other box of its, and its
-                       usage-limit dialog (`Keep trying` / `Stop`), is yours,
-                       and so is an API error it ended a turn on and does not
-                       retry by itself.
-                       A question is no permission: at every --approve level
-                       (not under --no-answer) the question dialog — Claude
-                       Code's AskUserQuestion, read whole — gets its
-                       recommended option, or option 1 when none is marked;
-                       every recommended option of a multi-select, then its
-                       button; the review tab submitted — by Enter on the
-                       focused row, moved there one row at a time, every key
-                       fenced (`key if-gen=… if=<the focused row> enter`),
-                       once the session's person stamp (`text --json`'s
-                       human_ms) is `human_grace_s` old; never its free-text
-                       row, its chat row or Cancel, never a digit, and never a
-                       question a person has begun answering, or one the
-                       reader did not read whole (ledgered
-                       `answer-recommended@v1`); an unmarked question that
-                       names a destructive act gets its one `No` answer, and
-                       is yours when it has none. A key the dialog did not take
-                       is sent once more after the screen held still 2 s;
-                       taken by neither, supervise hands it to you, while
-                       watch (and the window's host) keeps trying on the
-                       press back-off below, never before the screen held
-                       still. agy's and Gemini CLI's questions get their
-                       recommended answer, else their first, each by its
-                       own key. That is the
-                       `recommended` priority, the default; under the
-                       [harness] `question_priority` (or --question-priority)
-                       `long-term` or `short-term` the harness chooses no
-                       option: it moves the focus onto the free-text row,
-                       writes that policy's fixed text (one `send`, fenced on
-                       the screen and on a person's keys since the read —
-                       `if-human=` — read back exactly, never written twice)
-                       and submits it (`answer-long-term@v1`,
-                       `answer-short-term@v1`), and the worker decides; a
-                       preview tab, one the text would not fit, or an
-                       unmarked destructive question gets the recommended
-                       path's answer, said.
-                       Claude Code's usage-limit dialog (`What do you want to
-                       do?`) is no permission either: at every --approve level
-                       (not under [harness] limit_wait = false) it gets its
-                       `Wait here, then continue automatically …` row, chosen
-                       by its label with fenced arrows and a confirmed Enter
-                       (`limit-wait@v1`) — never stop, usage credits, an
-                       upgrade or a reset claim; with no wait row it is yours.
-                       A limit reset is never taken by this loop: [harness]
-                       limit_reset (built, off by default, never run against
-                       a real wall) is the window's host's alone, through the
-                       dialog's own reset row and its confirmation, and no
-                       command is typed for it.
-                       Claude Code's autocompact offer (`We recommend
-                       compacting earlier`) is no permission either: at every
-                       --approve level (not under [harness] autocompact_offer
-                       = \"off\") it gets `Autocompact at ‹ 400k › tokens`
-                       (the size [harness] autocompact_offer names), reached
-                       with fenced arrows and stepper keys, one per fresh
-                       read, and a confirmed Enter (`autocompact-offer@v1`) —
-                       never the keep row, never Esc.
-                       Under \"safe\" (--approve safe) only a box proven safe: a
-                       Bash box whose command classifies read-only both with
-                       its rows joined by newlines and by spaces, with no
-                       vendor note row and outside a bypass-permissions
-                       session; the rm circuit breaker (`Dangerous rm operation on possibly-empty
-                       variable path`) in a bypass session,
-                       when every rm operand resolves under a scratch root
-                       (/private/tmp/claude-<uid>/, the supervisor's $TMPDIR,
-                       /tmp/<x>/, <cwd>/target*) as written AND where its
-                       symbolic links lead, built on no variable the line
-                       does not assign (the environment's, $TMPDIR among
-                       them, are never proven) and on no $(mktemp -d) that
-                       can reach it empty — or is a directory the line's own
-                       mktemp -d made: \"$D\" or a path under it, every $D
-                       double-quoted, behind a guard (&&, || exit, ${D:?}) —
-                       the session's cwd is read from its `meta`, and unknown
-                       it is yours (with the retired rm_breaker = false, no
-                       rm is proven at all); a Read box whose one
-                       absolute path lies under a trust root, /usr, /etc or
-                       /opt/homebrew and outside the secrets list (.ssh,
-                       .aws, Keychains, *.pem, .env, *.token, …); and the
-                       folder-trust dialog when its folder is exactly the
-                       session's cwd and lies under a trust root. The trust
-                       roots are the folders you list in [harness]
-                       trust_roots, and none by default: list your own to
-                       have their trust dialog answered under \"safe\". Those
-                       rules decide first under \"all\" too, so a proven
-                       read keeps its rule in the ledger. \"none\" answers
-                       nothing. A person's keystroke within `human_grace_s`
-                       (the server's `status human_ms=`) HOLDS a box the
-                       policy would answer: neither pressed nor escalated,
-                       judged again when the grace ends. The one box it
-                       does not hold is the folder-trust dialog of a launch
-                       the server witnessed (`claude⏎` at an
-                       integrated prompt: `status launch=person`, the count
-                       the shell's signed command start recorded and no
-                       gesture since, `input=clear` — measured on macOS
-                       alone today, elsewhere `input=-` holds — no other
-                       driver's hand): answered at once, every key fenced on
-                       that count (`if-human=`), so a person who keys on it
-                       gets it for their grace. The press is
-                       GUARDED by the row that was judged — `key if=<that
-                       row, anchored> 1`, plus
-                       `if-gen=<the read's generation>` (`text --json`'s gen)
-                       where `help key` names that fence — so a box swapped
-                       between the read and the press matches nothing, even
-                       one redrawn at the same seq after an alternate-screen
-                       re-entry: `OK seq=<n>` is the press, `OK skipped
-                       …` means NOTHING was pressed or approved: the box had
-                       left or the fenced screen moved (the loop reads and
-                       decides again), or the seq is the screen just parsed and
-                       the guard matched no row (the press did not land: see
-                       below). `ERR halted` parks the loop until `status`
-                       says hold=0, `ERR busy …` (`busy sink` too) and `ERR
-                       rate` back it off;
-                       after either the box is read and decided again, never
-                       pressed again as it was; `ERR busy input-unread` (a
-                       published stall or a stopped job) backs it off too, a
-                       press or `turn` answered `OK … warn=input-unread`
-                       (written behind a slow read; a `turn` carries it on its
-                       verdict line) has the next look read `status` first,
-                       and while `status input=stalled|stopped` a
-                       `watch` (or the window's host) presses nothing,
-                       withdraws its badge and waits (the window's host then
-                       relaunches an agent its explicit `restart` ended);
-                       any other `ERR` stops the loop.
-                       Every decision is one row of the approval ledger,
-                       <aterm state>/drive/<sid>.jsonl (rule, outcome, the
-                       command's sha256 and its first 4 KiB, the reason, the
-                       box's seq).
-                       One line is appended to --notes, then `await seq` until
-                       the box has LEFT before the next look (an unchanged
-                       screen is never pressed twice), and the loop continues.
-                       A press that did not land — the box unchanged after it,
-                       fenced presses the screen kept moving under, a focus
-                       move that did not take, a guard that matched no row — is
-                       handed to you by supervise and under --approve safe;
-                       watch at full power reads and presses it again on a
-                       pause that doubles from 250 ms to 60 s (`WAITING … the
-                       press did not land`), badging the session once it has
-                       missed for 2 min. Under --approve safe the same read
-                       coming back after two approvals is handed over too (at
-                       full power a box that comes back is answered again; a
-                       question answered twice is answered again on its third
-                       after a pause that doubles with each return).
-                       ANYTHING ELSE — a box the policy does not answer (under
-                       --approve safe, a write prompt or a workflow), a
-                       question under --no-answer, a limit notice, an idle
-                       composer — prints the compact result (the phase lines,
-                       then the prompt box or the last 28 non-blank rows) and
-                       exits 0: that is YOUR review point. Once --max-s
-                       (default 1800; 0 is no budget) is spent it prints
-                       TIMEOUT, then the last read's compact result, and exits
-                       124 — a turn read at or after the deadline is not
-                       pressed, and a budget spent while a lost connection is
-                       ridden out is the TIMEOUT too. A rating survey is
-                       never rated: when it appears (see phase) supervise
-                       presses its `0` — GUARDED on that card's own question
-                       row (`key if=^●.How.is.Claude.doing 0` for the session
-                       survey), only `0`, 0.8 s after it first saw the card, on
-                       a busy read too (once per appearance), judged only after
-                       the `0` has had 2 s to land, and nothing while a box is
-                       up or text is typed in the composer — and says
-                       `DISMISSED survey seq=<n>[ kind=<k>]` on stderr once a
-                       fresh read shows it gone; still open there, or under the
-                       [harness] `dismiss_surveys = false`, it says watch's
-                       `EVENT survey` line instead (watch presses a `0` that
-                       did not take again at 5 s, 30 s, 2 min, then every 10
-                       min; the host is told from the second miss, no tab is marked); a card
-                       it will not press is said as `EVENT survey seq=<n>
-                       kind=<k> not pressed (<why>); read it with: <command>` —
-                       there is no command to run: the loop withheld the `0` on
-                       purpose. The
-                       worker's context running low, and the compaction after
-                       it, are said there too, as they happen during the run:
-                       watch's `EVENT context` and `EVENT compacted` lines (see
-                       --context-warn; a compaction between two runs is not
-                       seen).
-    watch [@sid] [--approve safe|none] [--no-continue] [--no-answer]
-          [--question-priority recommended|long-term|short-term]
-          [--allow-python GLOB]... [--notes FILE] [--max-s S] [--reconnect-s S]
-          [--report] [--context-warn PCT] [--journal FILE] [--mail …]
-                       supervise's loop for a harness that wakes its agent once per
-                       stdout line (a background monitor, a supervisor process).
-                       Approvals are supervise's, and each prints `APPROVED
-                       seq=<n> <command>`; --notes gets supervise's lines. Each
-                       decision is ALSO told to the worker's window as it is
-                       printed — `aterm ctl @sid story <verb> [<text>]` through
-                       a client of its own, one per journaled APPROVED,
-                       DISMISSED, RECONNECTED, TIMEOUT, EXIT, `EVENT context`
-                       and `EVENT compacted` line (approved dismissed
-                       reconnected warned compacted timeout exit; never the
-                       command, and an APPROVED is told bare) — so the presence
-                       band under the window's tab bar reads `✓ approved` for
-                       three seconds and its `◇ quiet` summary counts the
-                       approvals; the printed lines are byte-identical with or
-                       without a host that knows the verb. A
-                       review point prints ONE line and the loop KEEPS WATCHING:
-                         EVENT <phase> seq=<n> <summary>
-                       the summary being, for a prompt, `kind=<k> classify=
-                       <read-only|not-read-only:<reason>|-> command=<command>` (`-`
-                       for a box that is not Bash; a workflow's description stands
-                       in for its command); for a question or idle, the last line
-                       the worker said (its rows wrapped in the pane joined; past
-                       160 characters its end kept, `…` before it); for limited,
-                       `message=<text> reset=<text|->` — each cut at 160
-                       characters. Then it waits for
-                       the screen to move past that point (`await seq`) before it
-                       looks again, so your `turn` or `key` is picked up by
-                       itself. A point that looks like the one last reported —
-                       the same phase, summary and status row, the same last 8
-                       non-blank transcript rows up to it (their letters: a
-                       timer that ticks is no change), the same box — is neither
-                       pressed nor printed again unless, in between, a read saw
-                       the worker busy, it approved a read, or an outage came
-                       (see --reconnect-s: nothing could be read in it, so the
-                       point still showing after it is printed once more); a new
-                       box, a new reply, your own row or a retry's new notice
-                       changes those rows, however short the busy spell before
-                       it. The two-approvals count restarts at every review
-                       point, as a fresh supervise's would. A worker without the
-                       composer rules is looked at when its output pauses, as
-                       await-turn waits. Every line is flushed. The last line is
-                       TIMEOUT (exit 124) once a --max-s given is spent (by
-                       default none: watch supervises for as long as it runs;
-                       0 is none too) —
-                       no press and no EVENT comes after the deadline, and a
-                       budget spent in an outage is the TIMEOUT too — or `EXIT
-                       <reason>` (exit 1): the session ended (`EXIT session gone
-                       (…)`, seen within one 20 s wait), an outage outlasted its
-                       window (`EXIT reconnect window lapsed: …`, see
-                       --reconnect-s), a request or the notes file failed, or,
-                       before the loop ran, one of its flags or the host (also
-                       on stderr). With --report, an idle, question or limited
-                       point's line carries `complete=<0|1> rows=<n>` of
-                       `report` (read at that point) between the seq and the
-                       summary: `EVENT idle seq=<n> complete=1 rows=57 <summary>`;
-                       run `report` to read the rows. Without it the line is as
-                       above. When a rating survey APPEARS (open at this look,
-                       and seen gone since it was last said — by any read, a
-                       busy one included; see phase) one line comes ahead of
-                       that look's point, and none again while it stays open:
-                         EVENT survey seq=<n>[ kind=<k>] dismiss with: <command>
-                       the command being `aterm ctl @sid key
-                       'if=^●.How.is.Claude.doing' 0` (`aterm ctl key …` with no
-                       @sid given; run the command the line prints — the guard
-                       names THAT card's own question row). While a prompt box is up, or
-                       text is typed in the composer (on any of its rows), the survey waits:
-                       the box is reported or approved first, and the survey
-                       line comes at the next look without them. Unless the
-                       [harness] `dismiss_surveys = false`, the loop presses
-                       that `0` itself (see supervise) and prints `DISMISSED
-                       survey seq=<n>[ kind=<k>]` instead once a fresh read
-                       shows the survey gone. A card it will not press is said
-                       as `EVENT survey seq=<n> kind=<k> not pressed (<why>);
-                       read it with: <command>`: no command to run. As
-                       the worker's context runs low it prints, at the first
-                       read at or below --context-warn (mid-turn too, ahead of
-                       any point) and once a descent:
-                         EVENT context seq=<n> <v>% until auto-compact
-                       and once the indicator has gone again (or jumped 30
-                       points or more), the worker having compacted:
-                         EVENT compacted seq=<n>
-                       (see --context-warn). With no indicator on the screen,
-                       every line is as above. With --mail (see there) the
-                       worker's end-of-turn report comes by mail and its idle
-                       point prints as ONE line, `EVENT turn seq=<n>
-                       report=<id> rows=<n> <summary>`; without the flag every
-                       line is as above, byte for byte.
-                       A usage limit is a decision point the loop handles
-                       ALONE. It never exits on a limit: a --max-s that would
-                       run out before the reset the notice names (`resets Sep
-                       19 at 11am (America/Los_Angeles)`, `resets 7:30pm`,
-                       `resets in 3h`; the zone's offset as `date` reads it
-                       today, the local zone with none; a span counts from the
-                       notice's print; a reset read as more than 8 days off is
-                       misread and extends nothing) plus 10 min is stretched to
-                       that, `EXTEND until=<UTC> reset=<text>` printed once a
-                       reset. Claude Code's auto-continue notice (`⚠ Usage
-                       limit reached · continuing
-                       automatically at 1:50pm · esc to cancel`, or
-                       `continuing shortly`) names that time as its reset and
-                       STAYS on the screen while the worker resumes under it —
-                       a busy status row or footer under it reads busy, never
-                       limited — and the loop types nothing there. A limit the
-                       turn-end policy waits out (below) raises nothing: journaled
-                       `LIMITED seq=<n> handled: …`. Under the [harness]
-                       `resume_limits = false` it is the manager's: the
-                       worker's attention is set (`meta set attention
-                       owner=supervisor limited: <message>`, cut at 200
-                       bytes), the same text posted as `kind=control` mail
-                       from the worker's session to yours (--inbox, else
-                       $ATERM_PARENT_SESSION_ID) only while the worker's
-                       `status` says fabric=connected, and one `ESCALATED
-                       seq=<n> attention=<reply> mail=<reply>` journaled — once
-                       an episode: a retry's notice escalates nothing again —
-                       and cleared (`CLEARED seq=<n> …`) when the worker works
-                       again: at the FIRST busy read after an auto-continue
-                       notice, else when it answers after a busy spell or a box
-                       comes up (a busy spell alone may be a retry that hits
-                       the wall again: the same episode).
-                       THE TURN-END POLICY — the loop's answer at every point
-                       where a turn ended, the [harness] table's switches: a
-                       turn that ended is CONTINUED (`keep going`, the
-                       `continue_text`, with the `rules_file`'s text as `keep
-                       going (standing rules: <the file, line breaks as spaces,
-                       cut at 400 characters>)`; the worker's own suggestion
-                       when it is one, accepted with its accept key); a worker
-                       that asks a person — a stop phrase (`need your
-                       decision`), a choice between listed options, any
-                       question — is ANSWERED with `answer_text` (decide
-                       yourself, prefer reversible steps, keep going;
-                       `CONTINUED … rule=answer@v1`) — under the [harness]
-                       `question_priority` (or --question-priority)
-                       `long-term` or `short-term`, or the session's own
-                       priority word (`meta set questions`), that word's
-                       policy text instead (`CONTINUED …
-                       rule=prose-long-term@v1` / `rule=prose-short-term@v1`),
-                       the session's word read with one `meta` at the point
-                       — and one that names an
-                       irreversible act (an offer to delete, drop, overwrite
-                       or force-push; a choice that would) only with \"take
-                       the option that deletes, overwrites and force-pushes
-                       nothing\", whatever `answer_text` says; a turn
-                       that did under 2 min of busy work, or whose last words
-                       say it is done, is SHORT, and each short turn in a row
-                       doubles the wait before the next act — 2, 4, 8 … min,
-                       never past an hour — while a turn of real work ends the
-                       streak (nothing is ever escalated as \"done\"); a turn
-                       whose last words say it is done gets, past its
-                       back-off and in its continuation's place, the done
-                       check (`continue-done-check@v1`: \"Before you stop:
-                       do every open item … you can still do yourself now …
-                       End your reply with ATERM-TASK-DONE on a line by
-                       itself only when everything left needs a person … or
-                       cannot be done on this host …\"), and a second done
-                       reply, or a reply whose last line is `ATERM-TASK-DONE`
-                       (`finished@v1`, no check), ends the task: nothing is
-                       typed into it again until a turn of work nobody here
-                       typed reopens it (this loop reads no conversation
-                       record, so the screen decides); a session nobody has
-                       asked anything yet (its launch screen) is no turn end
-                       and gets nothing. Walls: an API error is answered by
-                       what it says, never with an ask, each try naming it in
-                       aterm's own words, never the screen's — a network
-                       never reached, or a certificate or proxy refused, is
-                       tried 1, 2, 5, then every 5 min from each appearance
-                       (the window's host continues one as soon as it
-                       measures the API reachable again, and holds it up to
-                       15 min while it measures it down; nothing here
-                       measures), a reply cut off is continued at once and
-                       then on that ladder, and the server's own failure or
-                       an overload is retried for ever, 1, 5, 15, 30, then
-                       every 60 min from each appearance; a reply past its
-                       output token maximum is continued at once (asking for
-                       smaller replies), then on that server ladder, which
-                       the work it leads to does not reset; a request the API
-                       refuses (a 4xx it does not retry, a safeguards
-                       refusal, a model not found) is tried 1 and 30 min,
-                       2 h, then every 6 h from each appearance, never given
-                       up; a usage or
-                       spend limit is continued 150 s past its reset,
-                       each session of an account a share (up to 60 s) later
-                       (nothing is ever bought; the notice again after a
-                       continuation waits 10 min from then, then 30; the screen
-                       leaving the notice with no busy spell — the `/login` of
-                       another account, the `/model` output — is continued at
-                       once); a model bucket is waited out to its reset — the
-                       window's host relaunches the agent on `model_fallback`
-                       instead (`--model`, session-only; never Claude's
-                       `/model`, which saves the default for new sessions) and
-                       back at the reset — and one that asks consent to go on
-                       on usage credits is continued first
-                       (`consent-accept@v1`; the confirm is a box answered
-                       with its yes); a full
-                       context `/compact`, then a continuation; a
-                       lost login `/login` and the one escalation nothing can
-                       answer (finish sign-in in the browser). A continuation
-                       whose `❯` row the worker never takes (no spinner in 30
-                       s) is a short turn: acted again on the back-off. Nothing
-                       is typed under a box or the survey, within
-                       `human_grace_s` of a person's keystroke (the server's
-                       `status human_ms=`, or the draft in the composer last
-                       changing), while another driver's hand is on the session
-                       (`status hand=lease:<holder>` or
-                       `hand=turn:<id>:<holder>`; an unnamed turn is the loop's
-                       own), or — for that grace from the point — on a turn a
-                       person stopped with Esc; the survey's `0` and a stray
-                       digit's backspace wait for the grace too. A draft left
-                       standing past the grace is sent — never over Claude
-                       Code's open `/` menu whose highlighted entry is another
-                       command, where Enter would run that entry (a `/cl`
-                       would run `/clear`): that draft is escalated, once —
-                       where an act was due,
-                       Enter alone, fenced on the read judged (`key if-gen=…
-                       if=<the caret row> enter`), said as that act's
-                       `CONTINUED` line with the draft's words. Other text goes
-                       only at an idle composer read with nothing typed: where
-                       the host fences `send`, written only while the screen is
-                       still the read judged (`send if-gen=<g> if=<the composer
-                       row> -- <text>`; moved — a keystroke of yours — writes
-                       nothing), and Enter only once a read shows the composer
-                       holding exactly that text (`key if-gen=… enter`);
-                       elsewhere through the guarded submit (`turn
-                       submit=guarded:<the text's end> yield=0.2`: parked while
-                       you type, then PASTED — not fenced — and Enter only
-                       while the cursor's row still ends as the text does).
-                       Text it wrote and did not submit is escalated, never
-                       left. It prints `CONTINUED seq=<n> rule=<id> <text>`
-                       (`TYPED …` for a slash command) and journals `WAITING
-                       seq=<n> until=<UTC> <why>` for each wait. A switch in
-                       [harness] (or --no-continue, --no-answer) takes each of
-                       these away: a question then is escalated (below), a turn
-                       end left, a wall escalated.
-                       A box the loop does not answer, and a question it may
-                       not answer (`answer_questions = false`), is the
-                       manager's: the worker's `attention`
-                       meta is set to `claude <kind>: <command, path or
-                       question, cut at 64 cells; else the box's own first
-                       row> (<why no rule approved it>)` (kind bash, read,
-                       edit, write, workflow, rm-breaker, trust, other,
-                       question, and every other box kind `phase` names)
-                       and ONE kind=ask is posted, without waiting
-                       for it to land, to the manager (--inbox, else
-                       $ATERM_PARENT_SESSION_ID) per review point, only while
-                       fabric=connected — a later look at the same point posts
-                       nothing (the box redrawn, re-wrapped, its focus moved,
-                       its countdown ticking, the transcript reflowed above
-                       it), the same box back after the worker worked is
-                       asked again — and the badge is cleared when the point
-                       has left the screen (the `key`/`turn` that answers a
-                       box is the change the loop waits on: it waits for the
-                       box's own row to leave); journaled `ESCALATED seq=<n>
-                       …` (a queued post as `mail=queued id=<n> (…)`) and
-                       `CLEARED seq=<n> box …`. A box the policy answers, or
-                       holds for a person at the keyboard, is never escalated.
-                       A watch starts by settling an
-                       attention a previous watcher left: kept (ADOPTED, no
-                       second ask) when its point still shows, unset
-                       (`CLEARED … stale`) when it does not; and it ends —
-                       TIMEOUT or EXIT, the session itself not gone — by
-                       clearing the badges it raised. supervise, one look with
-                       you right there, escalates nothing.
-    task @sid [--deadline S] [--wait] [--inbox @sid] [--reconnect-s S] <text...>
-                       Give the worker its work BY MAIL: `post to=@sid
-                       kind=task [dl=<S*1000>] <text>` from your own session
-                       (@self: $ATERM_PARENT_SESSION_ID, or --inbox), so the
-                       body never goes through the PTY, then one read of the
-                       worker's screen, and ONLY when its phase is idle, the
-                       one-line nudge
-                         Inbox: task @<off>
-                       typed as a `turn` (idle=600 timeout=2500, not waited
-                       on: its verdict may say status=timeout — submitted=1 is
-                       what counts, or an Enter written and not seen to land,
-                       pressed=, once the composer no longer holds the nudge;
-                       one it still holds, or a composer that cannot be read,
-                       is the error), its Enter guarded on
-                       the composer's caret
-                       row holding the nudge (submit=guarded:), so it never
-                       lands in a box; a guard that missed is the error (the
-                       nudge may be left typed) — a busy worker gets the mail
-                       alone, and
-                       reads it at its next look at the inbox. Nothing wakes
-                       a worker for mail: it is typed to, as a human would
-                       type to it. A Codex worker is never nudged (aterm reads
-                       no Codex screen): it gets the mail alone. Prints
-                       `task @<off> nudged=0|1` once the post
-                       LANDED (the broker's offset, which the worker's `inbox`
-                       row shows as `off=` and its answer carries as `re=`).
-                       A post that did not land is the error, in the server's
-                       words: `queued=1` says it is in the outbox and WILL land
-                       when a bridge drains it (a re-post duplicates it),
-                       `no-bridge=1` that this instance has no bridge to drain
-                       it, `ERR timeout id=<n>` that the landing was not seen
-                       in time (queued all the same), `unroutable|ambiguous|
-                       undeliverable` that the address is wrong. --wait parks
-                       `await inbox` on your inbox (from the newest row id
-                       read BEFORE the post, so nothing lands unseen) for an
-                       `answer`, `report` or `ack` whose `re=` is that offset
-                       — a row of those kinds answering something else re-arms
-                       the wait — and prints its `MAIL id=<n> off=<o>
-                       from=<sid> kind=<k> len=<n> re=<o>` line, then its body
-                       (`inbox get`); bounded by --deadline, else the global
-                       --timeout (ms) — the host clamps one wait at 600 s, so
-                       a bound above it is re-armed until spent: the last line
-                       is then `TIMEOUT no answer, report or ack re=<off>
-                       within <S> s`, exit 124. A wait an aterm self-update
-                       cuts (aterm ctl's exit 75, or any request not served)
-                       is ridden out within the bound and --reconnect-s S
-                       (default 180; 0: the first one is the error), retried
-                       0.5 s apart doubling to 8 s: the inbox is then listed
-                       whole, the answer found by its `re=`, and the wait
-                       re-armed from the new instance's ids. While it lasts,
-                       `ERR no such session` is not yet an answer (the new
-                       instance may not host your @sid yet); an outage past S
-                       is the error `reconnect window lapsed: …`. A post cut
-                       before its answer (exit 75, a connection closed or
-                       timed out under it) may have landed: it is the error,
-                       never posted again. One turned away unread (`ERR
-                       control server busy; retry`, `ERR auth`) or never sent
-                       (a refused or gone socket) is `task not posted: …`.
-                       --deadline S also rides on the post as the advisory
-                       `dl=` the worker's row shows.
-    report [@sid] [--since ORIGIN:I] [--max-rows N]
-                       What the worker said since your turn, in full. Read it
-                       instead of the screen: Claude Code runs on the ALTERNATE
-                       screen and repaints in place, so what scrolled off its top
-                       is gone from the screen — the host keeps those rows (`aterm
-                       ctl @sid offscreen`), and this joins them with the screen's.
-                       Prints one header line, `--`, then the rows:
-                         report complete=<0|1> [reason=<r>[,<r>...]] marker=<m>
-                         turn=<id|-> rows=<n> archived=<a> screen=<s> last=<o:i|->
-                       The start (marker=ledger): your newest `turn` whose submit
-                       landed (the newest at all when none did; `history`); its
-                       `arch=` mark says where the archive stood when it began,
-                       and the report opens at the last `❯` row in column 0 whose
-                       text begins with the turn's first 60 characters
-                       (whitespace ignored, so a wrap never matters) — or, when
-                       the turn's text is a paste (a line break, or 200+
-                       characters) Claude Code shows as `[Pasted text #N +L
-                       lines]`, the last such row if its L fits the text. With no
-                       turn in the ledger (you typed with `prompt` or by hand, or
-                       an aterm self-update could not carry the ledger): the
-                       last `❯` row (marker=user-row). --since ORIGIN:I (a
-                       `last=` from an earlier report) starts right after that
-                       archived row (marker=since). The rows come from ONE
-                       `offscreen … max=<--max-rows> screen=1` read (`since=<mark>`,
-                       or `tail=` with no mark): the archived rows, then the
-                       screen's, less the rows it shows again from the archive
-                       that the read got and everything from the live zone down
-                       (a spinner or `Waiting for …` status row and what hangs
-                       under it — under a done row, only what hangs under it — or,
-                       above an idle composer, the blank rows, right-aligned
-                       hints, tips and survey parked there — the composer, its
-                       footer), found by position; every other row is kept
-                       verbatim (done rows, tables, todo items, code), blank rows
-                       at either end aside. archived=/screen= count where the
-                       rows came from. Every report is read in Claude Code's
-                       grammar: aterm reads no Codex screen (its Codex screen
-                       lane was retired on 2026-10-16). complete=1 only when
-                       the start was found, no row
-                       after it was evicted, --max-rows (default 8000) held
-                       every row, the host kept an archive, the archive is the
-                       one the mark named, the worker is on the alternate
-                       screen and no gap lies after the start; otherwise
-                       reason= lists why: no-archive (a host without `offscreen`
-                       or with its archive off, or an `aterm ctl` too old to
-                       relay the rows: the screen alone), main-screen (the worker
-                       is not on the alternate screen — not a fullscreen app, or
-                       it left one: its main screen's scrollback is not read),
-                       archive-reset (the host restarted since the mark, or an
-                       aterm self-update could not carry the archive — one that
-                       could keeps it, turn ledger and all), archive-gap (rows
-                       evicted, or a redraw with no overlap, a resize or a reset
-                       after the start: something may be missing; a resize as a
-                       self-update takes over loses nothing, rows may repeat),
-                       max-rows (more rows
-                       than --max-rows: some were not read; raise it),
-                       marker-not-found (everything read, from the top). With a
-                       start found in the archive, a gap the read counts after
-                       the mark is placed against it with a one-row `offscreen`
-                       read: one just before your turn (a resize) is not a gap in
-                       it. Exit 0 whatever complete= says; 1 when a request fails
-                       (the session gone, the host unreachable).
-                       --final prints ONLY the worker's last message block —
-                       from its last `⏺` message row (never a tool row: a call
-                       like `⏺ Bash(` or `⏺ Workflow(`, one of Claude Code's
-                       `Background command \"…\"` / `Dynamic workflow \"…\"` /
-                       `Task Output` / `Stop Task` notices, a head whose `⎿`
-                       output hangs on the very next row, or a collapsed
-                       `Ran 3 shell commands` group, running or finished)
-                       through the done row that
-                       ended the turn. --messages prints every message block
-                       and every `❯` row of yours, the done rows with them, and
-                       no tool row or `⎿` output at all. A table, a bullet, a
-                       todo item or indented code inside a message is kept, as
-                       it is without a view. Both add
-                       ` view=<final|messages> kept=<n>` to the header after
-                       `last=`; `rows=` still counts every row the report
-                       holds, and without either flag the output is byte for
-                       byte what it always was.
     ledger [@sid] [--journal FILE] [--since TIME] [--format text|md|html] [--out PATH]
+           [--source anchor|log]
                        How the loop RAN, replayed on one time axis: what you
                        sent, what the watcher decided, how big the worker's
                        replies were, and the fabric mail in between. It joins
@@ -1923,14 +795,16 @@ SUPERVISING A WORKER (an agent session — Claude Code, agy, Muse Code or Gemini
                            start, and how the `turn` verb settled (`settled in
                            1.8s`, `timeout after 6.0s`);
                          * the size of the reply each turn drew, in rows, from
-                           ONE `offscreen tail=20000 max=20000 screen=1` read
-                           joined as `report` joins it — the rows from the
-                           turn's `❯` row to the next turn's (a turn whose own
-                           row is nowhere, queued or lost to a restart, is named
-                           in the count that holds its reply);
-                         * the watcher's --journal (below), when given: every
-                           EVENT, APPROVED, DISMISSED, RECONNECT, TIMEOUT and
-                           EXIT line, with the wall-clock time it was printed;
+                           ONE `offscreen tail=20000 max=20000 screen=1` read,
+                           the archived rows joined with the screen's — the rows
+                           from the turn's `❯` row to the next turn's (a turn
+                           whose own row is nowhere, queued or lost to a
+                           restart, is named in the count that holds its reply);
+                         * a supervisor's journal, --journal FILE, when given
+                           (one JSON object per line; the window's own host keeps
+                           one per session, <aterm state>/drive/<sid>.journal.jsonl):
+                           every EVENT, APPROVED, DISMISSED, RECONNECT, TIMEOUT
+                           and EXIT line, with the wall-clock time it was written;
                          * this session's fabric mail with that worker — the
                            `inbox --peek --meta` rows from it (nothing is listed
                            or handled) and the `post` rows of this session's
@@ -1939,11 +813,11 @@ SUPERVISING A WORKER (an agent session — Claude Code, agy, Muse Code or Gemini
                        response latency (median and max from each EVENT idle or
                        question to the next turn's start), approvals,
                        dismissals, context warnings and compactions,
-                       reconnects, mail in and out, and how many reports were
-                       complete. TIMELINE is one row per item in time order:
-                       time, lane (manager | worker | watcher | fabric), what,
-                       and the duration or latency. --format text (the default)
-                       aligns columns, md writes tables, html writes ONE
+                       reconnects, and mail in and out. TIMELINE is one row
+                       per item in time order: time, lane (manager | worker |
+                       watcher | fabric), what, and the duration or latency.
+                       --format text (the default) aligns columns, md writes
+                       tables, html writes ONE
                        self-contained page — inline style and script, nothing
                        fetched — with the manager, watcher and worker swimlanes
                        on a time axis and the fabric's mail on a fourth, turns
@@ -1964,11 +838,20 @@ SUPERVISING A WORKER (an agent session — Claude Code, agy, Muse Code or Gemini
                        socket. Without that the times are marked `~` and no
                        latency is claimed, and a turn an aterm self-update
                        carried from an earlier process (`carried=1`) is on that
-                       process's clock and has no time at all. It only reads:
+                       process's clock and has no time at all. --source log
+                       reads no clock: each turn is placed by its own session
+                       log record (`log class=turn`, joined to `history` by
+                       `ledger=` alone, never by time; a turn whose open was
+                       evicted by its close, which restates `ledger=`) and each
+                       message by its `mail` mark (`@self log kinds=mail`,
+                       joined by `inbox=`); SOURCES counts what the log no
+                       longer holds. --source anchor, the default, is the
+                       birth-time path above. It only reads:
                        exit 0 even when a source was missing.
     tape cat FILE [--text] [--salvage] | tape show FILE --decisions | tape stats FILE
-                       Read a harness tape a loop recorded (--tape, below),
-                       from the file alone: no aterm is asked anything. `cat`
+                       Read a harness tape a hosted loop recorded (`tape ls`
+                       lists them), from the file alone: no aterm is asked
+                       anything. `cat`
                        prints its items one line each, every value numbered
                        by its place on the tape; --text prints the exact text
                        form instead — one record per line, every body line
@@ -2019,402 +902,39 @@ SUPERVISING A WORKER (an agent session — Claude Code, agy, Muse Code or Gemini
                        differs; output: a line, row or write differs; drift:
                        anything else) and why, or PANICKED (the recorded panic
                        reproduced, or the door it died in reached), then how
-                       many requests the replayed loop asked, how it ended (a
-                       supervise's review under its exit code), each act it
+                       many requests the replayed loop asked, how it ended,
+                       each act it
                        made (`> key 1`: a key, send, post or signal; its reads
                        are only counted) and each line it printed (`| …`).
                        Strict: the build that recorded the tape replays it; on
                        another build a divergence is behaviour changed since
-                       the recording's, and says both builds. A watch,
-                       supervise or hosted tape replays, a window host's
-                       every answer from the tape (no host is asked, its
-                       notifications compared). Exit 0 (reproduced, ended,
+                       the recording's, and says both builds. A hosted tape
+                       replays a window host's every answer from the tape (no
+                       host is asked, its notifications compared). Exit 0 (reproduced, ended,
                        reached), 1 (diverged), 4 (panicked), or 2 for a tape
                        that cannot be replayed or a usage error.
-    --mail             (supervise, watch) Mail is your channel; the screen is
-                       the safety net. The loop parks ONE `await inbox
-                       since=<id>` on YOUR session (@self, or --inbox @sid)
-                       from a thread of its own with a control client of its
-                       own — the worker's socket sees not one request more,
-                       except one read per 20 s step while an idle point is
-                       held (below) — re-armed after each delivery from the
-                       newest row id and after each 20 s step it runs out (no
-                       polling), and prints, on stdout with every other line
-                       as each row lands:
-                         MAIL id=<n> off=<o> from=<sid> kind=<k> len=<n> [re=<o>]
-                       (id: the row `inbox get <id>` reads; off: the bus
-                       offset an answer names as re=; from: the attested
-                       sender; nothing of the body — trust= is in the inbox
-                       row, and the body is yours to read). The worker's
-                       end-of-turn `report` (one the worker posts itself, if
-                       it does — nothing posts one for it; a body that opens
-                       with a `seq=<n> hash=<hex16>[ busy=1]` stamp line has
-                       that line uncounted by `rows=` below) is folded into the idle
-                       point of
-                       the same turn: the point is HELD — nothing printed —
-                       until the report lands or --idle-grace S (default 5)
-                       runs out, the screen read once per 20 s step of the
-                       hold as the safety net (a prompt, a question or the
-                       worker busy again has superseded the point: it is said
-                       as idle-no-report, and what followed right after; a
-                       footer tick is the same point, held on), and prints as
-                         EVENT turn seq=<n> report=<id> rows=<n> <summary>
-                       ONE line per worker turn — report= the row id, rows=
-                       the body's row count, the summary the last line said —
-                       when the report is THIS turn's: one that came after
-                       the worker was read busy for the turn (however long
-                       ago: a report posted mid-turn) or after the point; one
-                       from before the last point handed over, or between it
-                       and the worker's next busy read (the ended turn's late
-                       report), never is; one from before the turn was seen
-                       to begin at all — the loop's first turn, a turn too
-                       short to be read busy — is, when it came within
-                       --report-window S (default 120) before the point, the
-                       only thing then known about it. A late report still
-                       prints MAIL and stays readable from the inbox. With
-                       none in the grace,
-                         EVENT idle-no-report seq=<n> [complete=<0|1> rows=<n>] <summary>
-                       (--report's brief rides only on that line: a folded
-                       turn reads no report from the screen, the mail IS what
-                       was said). A question, a limit notice, a prompt
-                       are not held: they print as they always did, between
-                       the MAIL lines. --journal records the MAIL lines (kind
-                       `mail`) and the fold (`report`, `rows`). When mail
-                       cannot be watched — a host without the fabric verbs, no
-                       $ATERM_PARENT_SESSION_ID for @self, its reconnect
-                       window lapsed — it says `MAIL off: <why> (the loop
-                       goes on without mail)` once, and from then on the
-                       lines are as without the flag; the budget bounds the
-                       hold as it bounds every wait. supervise --mail says
-                       the MAIL lines on stderr, holds its idle review point
-                       the same way, and adds `report <id> rows=<n>` (or
-                       `report -`) after the phase lines of its result; the
-                       journal gets the `EVENT turn` line. --mail needs the
-                       worker's @sid (only that worker's report is folded).
-                       Its parked mail wait is cut short when the loop ends
-                       (its aterm-ctl is signalled), so supervise --mail hands
-                       its result back the moment the point is reached and
-                       watch --mail's process ends with its last line; a
-                       parked wait that outlives an aterm self-update lists
-                       the successor's inbox whole and takes up from the bus
-                       offset (the successor counts its rows from 1 again).
-                       Without the flag, every line is byte for byte what it
-                       was.
-    --reconnect-s S    (await-turn, supervise, watch) An aterm self-update hands
-                       every session to the new instance under the same @sid, and
-                       a request in flight may get no answer (`server closed the
-                       connection without responding`; aterm ctl's exit 75,
-                       `aterm was replaced … before it answered` or `… went away
-                       and nothing replaced it`; a socket refused, gone, reset or
-                       timed out) or be turned away unread (`ERR control server
-                       busy; retry`, `ERR auth`, `ERR main thread stalled …;
-                       retry`, also after a verb's own `ERR <what>: `). That
-                       OUTAGE is ridden out, not the end: one line `RECONNECT
-                       <reason>` (cut at 160 characters), then a screen read of
-                       the same @sid, retried 0.5 s apart doubling to 8 s, until
-                       one answers — `RECONNECTED after <ms> ms` — and the loop
-                       looks again from a fresh read. S (default 180; 0 = off,
-                       the failure ends the loop) bounds the whole outage, from
-                       its first unserved request until the loop gets past it
-                       (that kind of request served again, the screen seen to
-                       move, or a whole look done): a request dropped again after
-                       the RECONNECTED is the same outage — nothing more is
-                       printed, the retries keep backing off, the window keeps
-                       running. While an outage lasts, `ERR no such session` is
-                       not yet an answer (the new instance may not host the @sid
-                       yet); outside one it ends the loop at once, and `ERR
-                       exited` always does. After the outage no seq from before
-                       is waited on (the content seq starts over on the new
-                       instance), the point reported before it is reported once
-                       more if it is still showing, and a press whose answer
-                       never came is not repeated blind or counted as an
-                       approval — the box is read and classified again first. A
-                       wait that runs out is
-                       followed by a read, so a handoff no request saw fail is
-                       noticed too (the seq read is below the one waited on). An
-                       outage ends the loop when its window lapses, with
-                       `reconnect window lapsed: <the last failure>` (watch: an
-                       `EXIT` line; await-turn and supervise: the error, exit 1)
-                       — and when --max-s or --timeout runs out first, that is
-                       the TIMEOUT, exit 124. watch prints its lines on stdout
-                       (informational: nothing to do), await-turn and supervise
-                       on stderr. Every request, the probe included, resolves
-                       the socket afresh: with no --socket, the instance
-                       hosting this terminal, else the newest — after an
-                       update, the new instance, which
-                       hosts the @sid or forwards to the one that does. A
-                       per-instance socket named there (`aterm-<pid>.sock`, as
-                       `aterm ctl instances` prints) goes with its instance, so
-                       every ride-out through one lapses: leave both unset, or
-                       name the `aterm.sock` alias.
-    --approve safe|none
-                       (supervise, watch) Answer at most what that level answers
-                       (see supervise): a LIMIT on the [harness] `approve`, never
-                       a raise (under `approve = \"none\"`, --approve safe is still
-                       none; `all` is refused: it is the default, not a limit).
-    --no-continue      (supervise, watch) Type no continuation at a turn's end
-                       (the [harness] `continue`, switched off for this run).
-    --no-answer        (supervise, watch) Answer no question for a person — in
-                       prose or in the question dialog: hand it over (the
-                       [harness] `answer_questions`, off).
-    --question-priority W
-                       (supervise, watch) HOW a question is answered: the
-                       [harness] `question_priority` for this run —
-                       recommended (the default), long-term or short-term (any
-                       other word is refused): a dialog's policy text in its
-                       free-text row, and a question in prose typed that text
-                       in place of `answer_text` (`prose-long-term@v1` /
-                       `prose-short-term@v1`). It neither limits nor grants:
-                       under --no-answer, or `answer_questions = false`, a
-                       question is still handed over (a session's own
-                       priority word aside, under the latter).
-    --context-warn PCT (supervise, watch) Watch Claude Code's context indicator
-                       (`<n>% until auto-compact` above the composer; see phase) on
-                       every read of a turn, a busy one included. The first reading
-                       at or below PCT (default 10; 0 to 100; 0 = off: neither
-                       line) prints `EVENT context seq=<n> <v>% until
-                       auto-compact`, once a descent. After it, a read that shows
-                       the composer frame, no approval box and no indicator — or
-                       one that reads 30 points or more over the last — prints
-                       `EVENT compacted seq=<n>` once, and the warning is armed
-                       again for the next descent. watch: stdout; supervise:
-                       stderr. supervise's watch lasts one run: each run starts
-                       armed (one that starts low warns again), so a compaction
-                       between two runs, while you act on a result, leaves it
-                       nothing to see and prints no `EVENT compacted`. After an
-                       `EVENT context`, check `phase` before the next run: no
-                       `context <n>%` line (and no box up) is the compaction.
-                       watch keeps one watch for as long as it runs. Only the
-                       indicator is read: nothing Claude Code says about
-                       compacting. A compaction
-                       replaces the worker's history with a summary, and
-                       standing rules you gave it (run nothing heavy while a
-                       flag file exists, say) can silently drop out. On `EVENT
-                       context`, have the worker bring its handoff and notes
-                       up to date before it compacts; on `EVENT compacted`,
-                       re-send your standing rules in one turn. /compact or
-                       /clear typed into the worker rewrites or drops its whole
-                       context, what its human told it included.
-    --journal FILE     (supervise, watch) Append one JSON object per line the
-                       loop prints — and, for supervise, per line watch WOULD
-                       have printed for what it decides silently: its
-                       approvals, its review point, its TIMEOUT, or `EXIT
-                       <reason>` for the error it ends on.
-                         {\"t\":<unix ms>,\"sid\":\"<sid>\"|null,\"kind\":\"event|
-                          approved|declined|dismissed|reconnect|timeout|exit|
-                          mail|extend|escalated|cleared|continued|typed|waiting|
-                          skipped|unverified|limited|unproven\",\"phase\":
-                          \"idle|question|prompt|limited|survey|context|
-                          compacted|turn|idle-no-report|<rule id>|-\",
-                          \"seq\":<n>|null,
-                          \"complete\":0|1|null,
-                          \"rows\":<n>|null,\"summary\":\"<the line's free-text
-                          tail>\",\"line\":\"<the exact line>\",\"turn\":<id>|null}
-                       Every field is read from the line itself, so the record
-                       and the line cannot disagree; `turn` is the ledger turn
-                       `--report` counted its report from. The file is opened
-                       append-only and created 0600 when missing — one that is
-                       already there keeps its mode and its lines — and a
-                       failure to open or write it is said ONCE on stderr and
-                       never stops the loop. `aterm drive ledger --journal
-                       FILE` replays it. --notes is still what it was: one line
-                       per Bash-prompt decision, and nothing else.
-    --tape FILE        (supervise, watch) Record the loop to a HARNESS TAPE at
-                       FILE: what it read through its door, in the order it
-                       read it — each control request and its reply (the
-                       screens it judged among them), each clock read, the
-                       ledger and journal it seeded from, the standing rules,
-                       the goal record, the host's stop — and every line,
-                       journal row, ledger row and decision it made, so
-                       `aterm drive tape show --decisions FILE` can say why it
-                       pressed what it pressed, and `aterm drive replay FILE`
-                       runs the loop again from the tape alone. Its looks at
-                       the machine are on it as what they CONCLUDED, never
-                       what they read: a
-                       hidden twin of a path, where a path's links lead, the
-                       worker (as a digest), git's configuration (only the
-                       keys the policy judges, each value reduced to
-                       true/false/set), the settings' and the shell's
-                       verdicts, the time zone, Codex's own records. The file is
-                       made NEW and 0600 (one already at FILE is never written
-                       over, nor is the run's own --journal, --notes or
-                       ledger); a tape that cannot be made or written is said
-                       once on stderr and the loop runs exactly as without
-                       --tape. The worker's environment is never written. Not
-                       with --mail: the mail lane's thread reaches no tape, so
-                       the two are refused together. Local files only:
-                       nothing is sent anywhere.
+    help               Show this text.
+
 OPTIONS
     --socket PATH   The target aterm's control socket. Defaults to the
                     instance hosting this terminal, else the newest local
                     instance.
-    --idle MS       Quiescence window that counts as 'turn complete' (default 600).
-                    Bigger = more certain the turn ended; smaller = snappier.
-    --timeout MS    Give up after this long (default 180000). One `prompt` or
-                    `await` ends at the host's 600000 cap; await-turn and task
-                    --wait wait out a larger value.
-    --ready REGEX   The prompt-ready row pattern for the BEST-EFFORT settle confirm
-                    after idle. Default matches a Claude input caret, which is only
-                    right when the driven program IS Claude — point it at your own
-                    REPL's prompt otherwise, or pass '' for idle-only. A
-                    non-matching pattern costs a bounded extra wait, never a
-                    failed turn.
-
-WHICH `await` TO USE
-    * A TUI with an animated spinner → `prompt` (idle works: the spinner keeps the
-      screen changing until the turn ends).
-    * Driving Claude Code / an agent whose screen sits STATIC for seconds mid-turn
-      (its prompt glyph stays on screen while it thinks, so matching it returns
-      mid-turn too) → `prompt` can settle early; the signal that holds is its busy
-      footer LEAVING: `await gone esc.to.interrupt` right after the prompt,
-      while the footer is up (gone is level-triggered: a footer that is already
-      absent answers at once). A regex is ONE whitespace-free token — the wire
-      joins argv with spaces and never quotes, so a quoted 'esc to interrupt'
-      arrives as three words and arms `esc` alone. A footer left on the screen
-      by a process that has exited (a new `claude` started with no `clear`)
-      never leaves: `await gone esc.to.interrupt rows <a> <b>` watches only the
-      rows from the live zone down, as the supervisor's own wait does.
-    * A command that pauses SILENTLY mid-run (e.g. `sleep`) → don't trust idle
-      alone; use `await match <regex>` on a known output marker instead.
-    * A plain shell command → `await block` (waits for the command to finish).
 
 EXAMPLES
-    # one driven turn against Claude Code:
-    aterm drive prompt 'Refactor utils.rs to drop the unwrap() calls.'
-    # wait for a specific marker rather than idle:
-    aterm drive await match BUILD.SUCCESSFUL
-    # the turn is over when Claude Code's busy footer leaves the screen:
-    aterm drive await gone esc.to.interrupt
-    # capture the terminal content as rendered pixels (the reply names the path):
-    aterm drive shot screen.png
     # is this line a read? (exit 0/1; the reason names the rule)
     aterm drive classify 'git status --short && git pull | tail'
     # what is the worker doing right now?
     aterm drive phase @s-1e918c46
-    # block until its turn ends (or 10 min), then say what it needs:
-    aterm drive await-turn @s-1e918c46 --timeout 600000
-    # keep it moving through the boxes it can prove safe; stop at the first
-    # thing that needs you:
-    aterm drive supervise @s-1e918c46 --approve safe --max-s 1800 --notes notes.txt
-    # the same loop, fully automatic, never exiting at a review point: one
-    # stdout line per decision — run it under your harness's background monitor:
-    aterm drive watch @s-1e918c46 --notes notes.txt --report
-    # everything the worker said since your turn, what scrolled off included:
-    aterm drive report @s-1e918c46
-
-GOTCHA
-    Submit with a real Enter keypress (this tool uses `key enter`), never a raw
-    newline byte — a TUI line editor reads Enter as a keypress (CR), not LF.";
+    # take its questions, then answer the one on display by its label:
+    aterm ctl @s-1e918c46 meta set questions ask
+    aterm drive answer @s-1e918c46 'Use the existing schema'
+    # how its run went, as one page in the browser:
+    aterm drive ledger @s-1e918c46 --format html --out /tmp/ledger.html";
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A mock transport recording the driven verbs and returning a canned screen.
-    struct MockClient {
-        sent: Vec<u8>,
-        entered: u32,
-        screen: String,
-    }
-    impl ControlClient for MockClient {
-        type Error = std::convert::Infallible;
-        fn send(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
-            self.sent.extend_from_slice(bytes);
-            Ok(())
-        }
-        fn key_enter(&mut self) -> Result<(), Self::Error> {
-            self.entered += 1;
-            Ok(())
-        }
-        fn await_idle_and_ready(
-            &mut self,
-            _idle: Duration,
-            _ready: &str,
-            _timeout: Duration,
-        ) -> Result<String, Self::Error> {
-            Ok(self.screen.clone())
-        }
-    }
-
-    #[test]
-    fn governor_is_off_by_default_fail_closed() {
-        // The default posture refuses self-writes entirely.
-        let mut gov = SelfGovernor::disabled(8, 1, 1000);
-        assert!(!gov.allow_self_write(), "self-write off by default");
-        gov.enable_self_write();
-        assert!(gov.allow_self_write(), "enabled + has tokens -> allowed");
-    }
-
-    #[test]
-    fn governor_rate_limits_and_breaker_latches_fail_closed() {
-        let mut gov = SelfGovernor::disabled(2, 1, 10);
-        gov.enable_self_write();
-        assert!(gov.allow_self_write()); // token 2 -> 1
-        assert!(gov.allow_self_write()); // token 1 -> 0
-        assert!(!gov.allow_self_write(), "bucket empty -> refused");
-        gov.tick(); // refill 1
-        assert!(gov.allow_self_write());
-        // Sustained self-output trips the breaker; thereafter all writes refused.
-        gov.note_self_output(100);
-        assert!(gov.tripped());
-        gov.tick(); // even with tokens, a tripped breaker refuses
-        assert!(
-            !gov.allow_self_write(),
-            "tripped breaker is fail-closed regardless of tokens"
-        );
-        gov.reset();
-        assert!(gov.allow_self_write(), "operator reset recovers");
-    }
-
-    #[test]
-    fn tick_saturates_when_capacity_plus_refill_overflows_u32() {
-        // capacity + refill > u32::MAX would overflow a plain add; tick
-        // saturates like every sibling op, and `.min` clamps to capacity.
-        let mut gov = SelfGovernor::disabled(3_000_000_000, 2_000_000_000, u32::MAX);
-        gov.tick(); // must not panic (would overflow a non-saturating add)
-        assert_eq!(
-            gov.tokens, gov.capacity,
-            "tick refills up to capacity without overflowing"
-        );
-    }
-
-    #[test]
-    fn turn_is_governed_when_self_write_disabled() {
-        let mut client = MockClient {
-            sent: Vec::new(),
-            entered: 0,
-            screen: String::new(),
-        };
-        let mut gov = SelfGovernor::disabled(8, 1, 1000); // NOT enabled
-        let turn = Turn::default();
-        assert!(matches!(
-            turn.run(&mut client, &mut gov, b"x"),
-            Err(TurnError::Governed)
-        ));
-        assert!(client.sent.is_empty(), "no bytes sent when governed");
-    }
-
-    #[test]
-    fn run_rejects_a_bad_ready_pattern_before_touching_the_transport() {
-        let mut client = MockClient {
-            sent: Vec::new(),
-            entered: 0,
-            screen: String::new(),
-        };
-        let mut gov = SelfGovernor::disabled(8, 1, 1000);
-        gov.enable_self_write();
-        let turn = Turn {
-            ready_pattern: "(unclosed".to_string(),
-            ..Turn::default()
-        };
-        assert!(matches!(
-            turn.run(&mut client, &mut gov, b"x"),
-            Err(TurnError::BadPattern(_))
-        ));
-        assert!(client.sent.is_empty(), "no bytes sent on a bad pattern");
-    }
-
-    // --- RelayClient (the persistent-connection ControlClient) ---
+    // --- RelayClient (the persistent connection) ---
 
     /// An in-memory transport for `RelayClient`: records everything written, and
     /// hands back a canned sequence of server response bytes.
@@ -2442,6 +962,178 @@ mod tests {
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[test]
+    fn relay_client_rejects_line_terminators_at_the_framing_boundary() {
+        let mut client = RelayClient::new(RecordingTransport::new(b""));
+        let error = client
+            .write_line("AUTH token\nsend injected")
+            .expect_err("a request must occupy exactly one line");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(client.io.sent.is_empty());
+    }
+
+    #[test]
+    fn relay_client_bounds_a_line_even_when_the_last_read_contains_its_newline() {
+        for (len, accepted) in [(MAX_LINE_BYTES, true), (MAX_LINE_BYTES + 1, false)] {
+            let mut reply = vec![b'x'; len];
+            reply.extend_from_slice(b"\nOK next\n");
+            let mut client = RelayClient::new(RecordingTransport::new(&reply));
+            let result = client.request_line("status");
+            if accepted {
+                assert_eq!(result.expect("the exact content bound").len(), len);
+                assert_eq!(client.request_line("status").unwrap(), "OK next");
+            } else {
+                assert_eq!(
+                    result
+                        .expect_err("the final newline cannot bypass the cap")
+                        .kind(),
+                    std::io::ErrorKind::InvalidData
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn relay_client_counted_body_has_one_aggregate_allowance() {
+        let mut exact = RelayClient::new(RecordingTransport::new(b"a\r\nb\nOK next\n"));
+        assert_eq!(
+            exact
+                .read_body_lines(2, 4)
+                .expect("the normalized body fits"),
+            "a\nb\n"
+        );
+        assert_eq!(exact.read_line().expect("the next reply"), "OK next");
+
+        let mut over = RelayClient::new(RecordingTransport::new(b"a\r\nb\nOK next\n"));
+        let error = over
+            .read_body_lines(2, 3)
+            .expect_err("short rows must share the body allowance");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("aggregate"));
+        assert_eq!(over.read_line().expect("no extra row consumed"), "OK next");
+
+        let mut empty = RelayClient::new(RecordingTransport::new(b"\n\n"));
+        assert_eq!(empty.read_body_lines(2, 2).unwrap(), "\n\n");
+        assert!(empty.read_body_lines(0, 0).unwrap().is_empty());
+        assert_eq!(
+            empty
+                .read_body_lines(MAX_TEXT_LINES + 1, usize::MAX)
+                .expect_err("the count is bounded before a read")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn relay_client_refuses_overflowing_counts_instead_of_reading_them_as_status() {
+        let mut client = RelayClient::new(RecordingTransport::new(
+            b"OK 99999999999999999999999999999999999\nbody\n",
+        ));
+        assert_eq!(
+            client
+                .request_counted("text")
+                .expect_err("a numeric count overflow")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let mut client = RelayClient::new(RecordingTransport::new(
+            b"OK 99999999999999999999999999999999999\nbody\n",
+        ));
+        assert_eq!(
+            client
+                .request_bytes("cast")
+                .expect_err("a numeric count overflow")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(reply_count("OK schema=1").unwrap(), None);
+        assert_eq!(reply_count("OK 2 incomplete").unwrap(), Some(2));
+        assert!(reply_count("OK +99999999999999999999999999999999999").is_err());
+        assert_eq!(reply_count("OK +2 incomplete").unwrap(), Some(2));
+        assert!(reply_count("OK +").is_err());
+        assert_eq!(
+            reply_count("OK 99999999999999999999999999999999999x").unwrap(),
+            None,
+            "an overflowing-looking status token is still not a numeric count"
+        );
+    }
+
+    /// A framed request carries its payload byte for byte after a header that
+    /// counts it, and reads one reply; a header with a line terminator is
+    /// refused before anything is written.
+    #[test]
+    fn relay_client_frames_a_payload_byte_for_byte() {
+        let mut client = RelayClient::new(RecordingTransport::new(b"OK 9 bytes\n"));
+        let reply = client
+            .request_frame("feed-bin", b"id=x go\\n")
+            .expect("a framed request");
+        assert_eq!(reply, "OK 9 bytes");
+        assert_eq!(client.io.sent, b"feed-bin 9\nid=x go\\n");
+
+        let mut client = RelayClient::new(RecordingTransport::new(b""));
+        let err = client
+            .request_frame("feed-bin\nsend evil", b"x")
+            .expect_err("a header occupies one line");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(client.io.sent.is_empty());
+    }
+
+    /// THE HOST THAT WENT AWAY UNDER A FORWARD IS THE CONNECTION CLOSING, NOT
+    /// AN ANSWER. A forwarding aterm's last line, `ERR gone pid=<host>
+    /// sock=<its socket>`, is the same fact as a direct connection's EOF; read
+    /// as a refusal, the supervisor stopped (`Fail::Hard`) where it rides out a
+    /// hang-up. Every read sees it as the connection that closed, saying whose.
+    #[test]
+    fn relay_client_reads_the_host_gone_line_as_the_connection_closing() {
+        let mut client = RelayClient::new(RecordingTransport::new(
+            b"ERR gone pid=4242 sock=/run/aterm/aterm-4242.sock\n",
+        ));
+        let err = client
+            .request_line("@s-abc text")
+            .expect_err("not an answer");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof, "{err}");
+        assert!(err.to_string().contains("pid 4242"), "{err}");
+        // A refusal that only starts alike is still an answer.
+        let mut client = RelayClient::new(RecordingTransport::new(b"ERR gone fishing\n"));
+        assert_eq!(
+            client.request_line("text").expect("an answer"),
+            "ERR gone fishing"
+        );
+        // Only where a reply begins: a screen row that reads alike is a row.
+        let row = "ERR gone pid=4242 sock=/run/aterm/aterm-4242.sock";
+        let mut client =
+            RelayClient::new(RecordingTransport::new(format!("OK 1\n{row}\n").as_bytes()));
+        assert_eq!(
+            client.request_counted("text").expect("a counted reply"),
+            ("OK 1".to_string(), format!("{row}\n"))
+        );
+    }
+
+    /// A failed `aterm-ctl` run is never an empty error: its stderr, else its
+    /// stdout line and exit code, else the exit code alone.
+    #[test]
+    fn a_silent_ctl_failure_still_says_something() {
+        let reply = |code, stdout: &str, stderr: &str| supervise::CtlReply {
+            code,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        };
+        let cases = [
+            (
+                reply(1, "", "aterm-ctl: ERR no such session\n"),
+                &["ERR no such session"][..],
+            ),
+            (reply(124, "OK timeout\n", ""), &["124", "OK timeout"][..]),
+            (reply(3, "", " \n"), &["3"][..]),
+        ];
+        for (failed, tokens) in &cases {
+            let words = failure_words(failed);
+            for token in *tokens {
+                assert!(words.contains(token), "{words:?} lacks {token:?}");
+            }
         }
     }
 
@@ -2544,243 +1236,6 @@ mod tests {
         assert!(plain.request_line("@s-1 meta set attention x").is_ok());
     }
 
-    /// Canned server responses for one full driven turn, in order: send -> `OK`,
-    /// key enter -> `OK`, await idle -> `OK idle 7`, await match -> `OK match 1`,
-    /// text -> `OK 2` + two body lines (`⏺ ANSWER: 391`, `❯ `).
-    const CANNED_TURN: &[u8] =
-        b"OK\nOK\nOK idle 7\nOK match 1\nOK 2\n\xe2\x8f\xba ANSWER: 391\n\xe2\x9d\xaf \n";
-
-    /// Tier-1 conformance: the bytes `RelayClient` emits for a driven `Turn`
-    /// equal the control lines `CtlClient` drives through `aterm-ctl`, and the
-    /// parsed `text` payload matches `aterm-ctl`'s stdout.
-    #[test]
-    fn relay_client_wire_is_ctl_byte_identical() {
-        let mut client = RelayClient::new(RecordingTransport::new(CANNED_TURN));
-        let mut gov = SelfGovernor::disabled(8, 1, 1_000_000);
-        gov.enable_self_write();
-        let out = Turn::default()
-            .run(&mut client, &mut gov, b"what is 17*23?")
-            .expect("driven turn");
-
-        // Exact wire bytes, verb-for-verb, in order — the same request lines
-        // `CtlClient` frames from its argv (send/key/await idle/await match/text).
-        let expected_wire = concat!(
-            "send -- what is 17*23?\n",
-            "key enter\n",
-            "await idle 600 timeout 180000\n",
-            "await match (^|\\s)\u{276f}(\\s|$) timeout 250\n",
-            "text\n",
-        );
-        assert_eq!(
-            String::from_utf8(client.io.sent.clone()).unwrap(),
-            expected_wire,
-            "RelayClient wire bytes must equal the control lines CtlClient drives"
-        );
-        // The settled screen equals the `text` body (each line + '\n'), byte-identical
-        // to aterm-ctl's captured stdout.
-        assert_eq!(out, "\u{23fa} ANSWER: 391\n\u{276f} \n");
-    }
-
-    /// A `meta set` reply is read by its leading `OK` token alone
-    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.6.2): the timed
-    /// Cruise's `OK land_at=<unix s> local=<date>T<HH:MM><offset>` is a
-    /// success to this reader as a bare `OK` is. NEGATIVE CONTROLS: `ERR …`
-    /// and a status that only begins with the letters `OK` are refusals.
-    #[test]
-    fn a_meta_set_reply_is_read_by_its_leading_ok_token() {
-        let canned = b"OK land_at=1792249200 local=2026-10-17T16:00+01:00\nOK\nERR until= goes \
-                       with cruise only: usage: meta set autopilot cruise\nOKAY\n";
-        let mut client = RelayClient::new(RecordingTransport::new(canned));
-        let timed = client
-            .request_status("meta set autopilot cruise until=16:00")
-            .expect("an OK with its tail");
-        assert!(timed.starts_with("OK land_at="), "{timed}");
-        assert_eq!(
-            client.request_status("meta set autopilot cruise").unwrap(),
-            "OK"
-        );
-        assert!(
-            client
-                .request_status("meta set autopilot land until=+1h")
-                .is_err()
-        );
-        assert!(
-            client.request_status("meta").is_err(),
-            "`OKAY` is no OK token"
-        );
-    }
-
-    #[test]
-    fn relay_client_rejects_line_terminators_in_a_payload_and_at_the_framing_boundary() {
-        let mut client = RelayClient::new(RecordingTransport::new(b""));
-        let err = client.send(b"first\nsend evil").unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        let err = client
-            .write_line("AUTH token\rsend injected")
-            .expect_err("a request must occupy exactly one line");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(
-            client.io.sent.is_empty(),
-            "nothing written on a rejected payload"
-        );
-    }
-
-    #[test]
-    fn relay_client_bounds_a_line_even_when_the_last_read_contains_its_newline() {
-        for (len, accepted) in [(MAX_LINE_BYTES, true), (MAX_LINE_BYTES + 1, false)] {
-            let mut reply = vec![b'x'; len];
-            reply.extend_from_slice(b"\nOK next\n");
-            let mut client = RelayClient::new(RecordingTransport::new(&reply));
-            let result = client.request_line("status");
-            if accepted {
-                assert_eq!(result.expect("the exact content bound").len(), len);
-                assert_eq!(client.request_line("status").unwrap(), "OK next");
-            } else {
-                assert_eq!(
-                    result
-                        .expect_err("the final newline cannot bypass the cap")
-                        .kind(),
-                    std::io::ErrorKind::InvalidData
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn relay_client_counted_body_has_one_aggregate_allowance() {
-        let mut exact = RelayClient::new(RecordingTransport::new(b"a\r\nb\nOK next\n"));
-        assert_eq!(
-            exact
-                .read_body_lines(2, 4)
-                .expect("the normalized body fits"),
-            "a\nb\n"
-        );
-        assert_eq!(exact.read_line().expect("the next reply"), "OK next");
-
-        let mut over = RelayClient::new(RecordingTransport::new(b"a\r\nb\nOK next\n"));
-        let error = over
-            .read_body_lines(2, 3)
-            .expect_err("short rows must share the body allowance");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("aggregate"));
-        assert_eq!(over.read_line().expect("no extra row consumed"), "OK next");
-
-        let mut empty = RelayClient::new(RecordingTransport::new(b"\n\n"));
-        assert_eq!(empty.read_body_lines(2, 2).unwrap(), "\n\n");
-        assert!(empty.read_body_lines(0, 0).unwrap().is_empty());
-        assert_eq!(
-            empty
-                .read_body_lines(MAX_TEXT_LINES + 1, usize::MAX)
-                .expect_err("the count is bounded before a read")
-                .kind(),
-            std::io::ErrorKind::InvalidData
-        );
-    }
-
-    #[test]
-    fn relay_client_refuses_overflowing_counts_instead_of_reading_them_as_status() {
-        let mut client = RelayClient::new(RecordingTransport::new(
-            b"OK 99999999999999999999999999999999999\nbody\n",
-        ));
-        assert_eq!(
-            client
-                .request_counted("text")
-                .expect_err("a numeric count overflow")
-                .kind(),
-            std::io::ErrorKind::InvalidData
-        );
-        let mut client = RelayClient::new(RecordingTransport::new(
-            b"OK 99999999999999999999999999999999999\nbody\n",
-        ));
-        assert_eq!(
-            client
-                .request_bytes("cast")
-                .expect_err("a numeric count overflow")
-                .kind(),
-            std::io::ErrorKind::InvalidData
-        );
-        assert_eq!(reply_count("OK schema=1").unwrap(), None);
-        assert_eq!(reply_count("OK 2 incomplete").unwrap(), Some(2));
-        assert!(reply_count("OK +99999999999999999999999999999999999").is_err());
-        assert_eq!(reply_count("OK +2 incomplete").unwrap(), Some(2));
-        assert!(reply_count("OK +").is_err());
-        assert_eq!(
-            reply_count("OK 99999999999999999999999999999999999x").unwrap(),
-            None,
-            "an overflowing-looking status token is still not a numeric count"
-        );
-
-        let header = "OK 99999999999999999999999999999999999";
-        let mut client =
-            RelayClient::new(RecordingTransport::new(format!("{header}\n").as_bytes()));
-        let error = client
-            .read_text()
-            .expect_err("text requires a usable count");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(
-            error.to_string(),
-            format!("malformed text header: {header:?}")
-        );
-    }
-
-    /// A framed request carries its payload byte for byte after a header that
-    /// counts it, and reads one reply; a header with a line terminator is
-    /// refused before anything is written.
-    #[test]
-    fn relay_client_frames_a_payload_byte_for_byte() {
-        let mut client = RelayClient::new(RecordingTransport::new(b"OK 9 bytes\n"));
-        let reply = client
-            .request_frame("feed-bin", b"id=x go\\n")
-            .expect("a framed request");
-        assert_eq!(reply, "OK 9 bytes");
-        assert_eq!(client.io.sent, b"feed-bin 9\nid=x go\\n");
-
-        let mut client = RelayClient::new(RecordingTransport::new(b""));
-        let err = client
-            .request_frame("feed-bin\nsend evil", b"x")
-            .expect_err("a header occupies one line");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(client.io.sent.is_empty());
-    }
-
-    #[test]
-    fn relay_client_maps_err_reply_to_error() {
-        let mut client = RelayClient::new(RecordingTransport::new(b"ERR denied\n"));
-        let err = client.send(b"hello").unwrap_err();
-        assert_eq!(err.to_string(), "ERR denied");
-    }
-
-    /// THE HOST THAT WENT AWAY UNDER A FORWARD IS THE CONNECTION CLOSING, NOT
-    /// AN ANSWER. A forwarding aterm's last line, `ERR gone pid=<host>
-    /// sock=<its socket>`, is the same fact as a direct connection's EOF; read
-    /// as a refusal, the supervisor stopped (`Fail::Hard`) where it rides out a
-    /// hang-up. Every read sees it as the connection that closed, saying whose.
-    #[test]
-    fn relay_client_reads_the_host_gone_line_as_the_connection_closing() {
-        let mut client = RelayClient::new(RecordingTransport::new(
-            b"ERR gone pid=4242 sock=/run/aterm/aterm-4242.sock\n",
-        ));
-        let err = client
-            .request_line("@s-abc text")
-            .expect_err("not an answer");
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof, "{err}");
-        assert!(err.to_string().contains("pid 4242"), "{err}");
-        // A refusal that only starts alike is still an answer.
-        let mut client = RelayClient::new(RecordingTransport::new(b"ERR gone fishing\n"));
-        assert_eq!(
-            client.request_line("text").expect("an answer"),
-            "ERR gone fishing"
-        );
-        // Only where a reply begins: a screen row that reads alike is a row.
-        let row = "ERR gone pid=4242 sock=/run/aterm/aterm-4242.sock";
-        let mut client =
-            RelayClient::new(RecordingTransport::new(format!("OK 1\n{row}\n").as_bytes()));
-        assert_eq!(
-            client.request_counted("text").expect("a counted reply"),
-            ("OK 1".to_string(), format!("{row}\n"))
-        );
-    }
-
     /// THE CLIENT IS THIS BUILD'S OWN `ctl` VERB: [`CtlClient::own_at`] runs
     /// `<exe> ctl --sock <sock> <args>`, in that order, and [`own_exe`] names a
     /// file that exists (this test binary). NEGATIVE CONTROL: a client built
@@ -2808,89 +1263,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A failed `aterm-ctl` run is never an empty error: its stderr, else its
-    /// stdout line and exit code, else the exit code alone.
-    #[test]
-    fn a_silent_ctl_failure_still_says_something() {
-        let reply = |code, stdout: &str, stderr: &str| supervise::CtlReply {
-            code,
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
-        };
-        let cases = [
-            (
-                reply(1, "", "aterm-ctl: ERR no such session\n"),
-                &["ERR no such session"][..],
-            ),
-            (reply(124, "OK timeout\n", ""), &["124", "OK timeout"][..]),
-            (reply(3, "", " \n"), &["3"][..]),
-        ];
-        for (failed, tokens) in &cases {
-            let words = failure_words(failed);
-            for token in *tokens {
-                assert!(words.contains(token), "{words:?} lacks {token:?}");
-            }
-        }
-    }
-
-    /// A turn longer than its timeout: `await idle` answers `OK timeout` and
-    /// exits 124 with nothing on stderr, and the turn's error names the timeout.
-    /// Negative control: with `await` settling, the turn reaches the screen.
-    #[cfg(unix)]
-    #[test]
-    fn a_turn_that_does_not_settle_names_the_timeout() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-agent-ctl-timeout-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("create a scratch directory");
-        let fake = |name: &str, await_arm: &str| {
-            let path = dir.join(name);
-            std::fs::write(
-                &path,
-                format!(
-                    "#!/bin/sh\ncase \"$1\" in\n  await) {await_arm} ;;\n  text) echo settled ;;\n  \
-                     *) exit 0 ;;\nesac\n"
-                ),
-            )
-            .expect("write the fake client");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("make it executable");
-            path
-        };
-        let turn = Turn {
-            idle: Duration::from_millis(7),
-            timeout: Duration::from_millis(1000),
-            ready_pattern: String::new(),
-        };
-
-        let mut gov = SelfGovernor::disabled(64, 8, 5_000_000);
-        gov.enable_self_write();
-        let mut client = CtlClient::new(fake("late", "echo 'OK timeout'; exit 124"), None);
-        let err = turn
-            .run(&mut client, &mut gov, b"hi")
-            .expect_err("a turn past its timeout fails");
-        assert!(err.to_string().contains("1000 ms"), "{err}");
-
-        let mut gov = SelfGovernor::disabled(64, 8, 5_000_000);
-        gov.enable_self_write();
-        let mut client = CtlClient::new(fake("settles", "echo 'OK idle 1'"), None);
-        assert_eq!(
-            turn.run(&mut client, &mut gov, b"hi").expect("it settles"),
-            "settled\n"
-        );
-
-        std::fs::remove_dir_all(&dir).expect("remove the scratch directory");
-    }
-
     /// The control client is THIS image, resolved through its links. An image
-    /// whose file is gone (replaced by an update under a long-running fleet
-    /// stream) is still reached on Linux as `/proc/self/exe`.
+    /// whose file is gone (replaced by an update under a long-running client)
+    /// is still reached on Linux as `/proc/self/exe`.
     #[test]
     fn the_ctl_client_is_this_image_even_once_its_file_is_replaced() {
         let me = std::env::current_exe().expect("the test binary");
@@ -2904,55 +1279,5 @@ mod tests {
             gone.clone()
         };
         assert_eq!(resolved_exe(gone), expect);
-    }
-
-    /// Over a persistent connection, a wait past its timeout answers
-    /// `OK timeout`, which is not taken as settled. Negative control: `OK idle`
-    /// drives the turn to the screen.
-    #[test]
-    fn a_relay_turn_that_does_not_settle_names_the_timeout() {
-        let turn = Turn {
-            idle: Duration::from_millis(7),
-            timeout: Duration::from_millis(1000),
-            ready_pattern: String::new(),
-        };
-
-        let mut gov = SelfGovernor::disabled(64, 8, 5_000_000);
-        gov.enable_self_write();
-        let mut client = RelayClient::new(RecordingTransport::new(
-            b"OK\nOK\nOK timeout\nOK 1\nmid-turn\n",
-        ));
-        let err = turn
-            .run(&mut client, &mut gov, b"hi")
-            .expect_err("a turn past its timeout fails");
-        assert!(err.to_string().contains("1000 ms"), "{err}");
-
-        // The host caps every wait at 600000 ms, so a longer --timeout ends
-        // there and the line names the wait that ran.
-        let long = Turn {
-            idle: Duration::from_millis(7),
-            timeout: Duration::from_millis(900_000),
-            ready_pattern: String::new(),
-        };
-        let mut gov = SelfGovernor::disabled(64, 8, 5_000_000);
-        gov.enable_self_write();
-        let mut client = RelayClient::new(RecordingTransport::new(
-            b"OK\nOK\nOK timeout\nOK 1\nmid-turn\n",
-        ));
-        let err = long
-            .run(&mut client, &mut gov, b"hi")
-            .expect_err("a turn past the host's cap fails")
-            .to_string();
-        assert!(err.contains("600000 ms"), "{err}");
-
-        let mut gov = SelfGovernor::disabled(64, 8, 5_000_000);
-        gov.enable_self_write();
-        let mut client = RelayClient::new(RecordingTransport::new(
-            b"OK\nOK\nOK idle 7\nOK 1\nsettled\n",
-        ));
-        assert_eq!(
-            turn.run(&mut client, &mut gov, b"hi").expect("it settles"),
-            "settled\n"
-        );
     }
 }

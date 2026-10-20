@@ -253,7 +253,7 @@ impl Folder {
     }
 
     /// The current screen.
-    pub fn screen(&self) -> &Screen {
+    pub const fn screen(&self) -> &Screen {
         &self.screen
     }
 
@@ -280,7 +280,7 @@ contract_fn! {
     /// Discharged in the Clean CIC kernel by definitional equality against
     /// `screen_coord_in_bounds_isl` (`clean-kernel-defeq`).
     #[must_use]
-    pub fn screen_coord_in_bounds(coord: u16, dim: u16) -> bool
+    pub const fn screen_coord_in_bounds(coord: u16, dim: u16) -> bool
     clauses [ensures result == (coord < dim)]
     {
         coord < dim
@@ -331,24 +331,24 @@ impl Screen {
     }
 
     /// Current `(cols, rows)`.
-    pub fn dims(&self) -> (u16, u16) {
+    pub const fn dims(&self) -> (u16, u16) {
         (self.cols, self.rows)
     }
 
     /// Cursor position as `(row, col)`, 0-based. `col` equals `cols` while a
     /// line-wrap is pending (deferred wrap: the cursor sits past the last
     /// column until the next glyph wraps or cursor motion resolves it).
-    pub fn cursor(&self) -> (u16, u16) {
+    pub const fn cursor(&self) -> (u16, u16) {
         (self.row, self.col)
     }
 
     /// Whether the cursor is currently visible (`?25`).
-    pub fn cursor_visible(&self) -> bool {
+    pub const fn cursor_visible(&self) -> bool {
         self.cursor_visible
     }
 
     /// Whether the alternate screen is active.
-    pub fn is_altscreen(&self) -> bool {
+    pub const fn is_altscreen(&self) -> bool {
         self.altscreen
     }
 
@@ -405,66 +405,61 @@ impl Screen {
     /// [`serialize`](Self::serialize), streamed into `out` instead of collected, so
     /// a consumer that only hashes the encoding never materializes it.
     pub(crate) fn serialize_into<S: ByteSink>(&self, out: &mut S) {
-        out.extend_from_slice(&self.cols.to_le_bytes());
-        out.extend_from_slice(&self.rows.to_le_bytes());
-        out.extend_from_slice(&self.row.to_le_bytes());
-        out.extend_from_slice(&self.col.to_le_bytes());
-        out.push(self.cursor_visible as u8);
-        out.push(self.altscreen as u8);
-        let put_cell = |out: &mut S, cell: &Cell| {
-            out.extend_from_slice(&(cell.ch as u32).to_le_bytes());
-            let (ft, fv) = enc_color(cell.fg);
-            out.push(ft);
-            out.push(fv);
-            let (bt, bv) = enc_color(cell.bg);
-            out.push(bt);
-            out.push(bv);
-            out.push(cell.attrs);
-        };
+        out.extend_from_slice(&encode_screen_header(
+            self.cols,
+            self.rows,
+            self.row,
+            self.col,
+            self.cursor_visible,
+            self.altscreen,
+        ));
         for cell in &self.grid {
-            put_cell(out, cell);
+            out.extend_from_slice(&encode_cell_bytes(cell));
         }
         // Internal state that derived `Eq` distinguishes but the grid alone does
         // not — without these, two unequal screens could serialize identically
         // (e.g. a pending SGR pen with nothing yet printed). The grid length is
         // fixed by cols*rows above, so what follows is self-delimiting.
-        let (pft, pfv) = enc_color(self.pen.fg);
-        out.push(pft);
-        out.push(pfv);
-        let (pbt, pbv) = enc_color(self.pen.bg);
-        out.push(pbt);
-        out.push(pbv);
-        out.push(self.pen.attrs);
-        let put_cursor = |out: &mut S, cursor: Option<SavedCursor>| match cursor {
-            Some(saved) => {
-                out.push(1);
-                out.extend_from_slice(&saved.row.to_le_bytes());
-                out.extend_from_slice(&saved.col.to_le_bytes());
-                let (ft, fv) = enc_color(saved.pen.fg);
-                let (bt, bv) = enc_color(saved.pen.bg);
-                out.extend_from_slice(&[ft, fv, bt, bv, saved.pen.attrs]);
-            }
+        out.extend_from_slice(&encode_pen_bytes(self.pen.fg, self.pen.bg, self.pen.attrs));
+        match self.saved_cursor {
+            Some(saved) => out.extend_from_slice(&encode_saved_cursor_bytes(
+                saved.row,
+                saved.col,
+                saved.pen.fg,
+                saved.pen.bg,
+                saved.pen.attrs,
+            )),
             None => out.push(0),
-        };
-        put_cursor(out, self.saved_cursor);
-        put_cursor(out, self.alt_saved_cursor);
+        }
+        match self.alt_saved_cursor {
+            Some(saved) => out.extend_from_slice(&encode_saved_cursor_bytes(
+                saved.row,
+                saved.col,
+                saved.pen.fg,
+                saved.pen.bg,
+                saved.pen.attrs,
+            )),
+            None => out.push(0),
+        }
         match &self.inactive {
             Some(cells) => {
                 out.push(1);
-                out.extend_from_slice(&(cells.len() as u32).to_le_bytes());
+                out.extend_from_slice(&encode_u32_le_bytes(cells.len() as u32));
                 for cell in cells {
-                    put_cell(out, cell);
+                    out.extend_from_slice(&encode_cell_bytes(cell));
                 }
             }
             None => out.push(0),
         }
-        out.extend_from_slice(&self.scroll_top.to_le_bytes());
-        out.extend_from_slice(&self.scroll_bottom.to_le_bytes());
+        out.extend_from_slice(&encode_scroll_region_bytes(
+            self.scroll_top,
+            self.scroll_bottom,
+        ));
     }
 
     // --- internal mutators ------------------------------------------------
 
-    fn idx(&self, row: u16, col: u16) -> usize {
+    const fn idx(&self, row: u16, col: u16) -> usize {
         (row as usize)
             .saturating_mul(self.cols as usize)
             .saturating_add(col as usize)
@@ -474,8 +469,11 @@ impl Screen {
     /// xterm's cursor-motion primitives and erases do to the last-column flag
     /// (`ResetWrap`) before they move or clear (CR/LF/BS/CUB/CUU/CUD/CUP,
     /// ED/EL). TAB deliberately does not.
-    fn clear_pending_wrap(&mut self) {
-        self.col = self.col.min(self.cols.saturating_sub(1));
+    const fn clear_pending_wrap(&mut self) {
+        let last_col = self.cols.saturating_sub(1);
+        if self.col > last_col {
+            self.col = last_col;
+        }
     }
 
     fn put(&mut self, ch: char) {
@@ -496,7 +494,7 @@ impl Screen {
         self.col = self.col.saturating_add(1); // may reach `cols`, leaving a wrap pending
     }
 
-    fn carriage_return(&mut self) {
+    const fn carriage_return(&mut self) {
         self.col = 0;
     }
 
@@ -534,7 +532,16 @@ impl Screen {
             .min(self.grid.len());
         let gap = (n as usize).saturating_mul(w);
         let src_start = start.saturating_add(gap).min(end);
-        self.grid.copy_within(src_start..end, start);
+        let copy_len = end.saturating_sub(src_start);
+        let mut i = 0usize;
+        while i < copy_len {
+            if let Some(&cell) = self.grid.get(src_start.saturating_add(i)) {
+                if let Some(dst) = self.grid.get_mut(start.saturating_add(i)) {
+                    *dst = cell;
+                }
+            }
+            i = i.saturating_add(1);
+        }
         let blank = self.bce_blank();
         let fill_start = end.saturating_sub(gap).max(start);
         if let Some(slice) = self.grid.get_mut(fill_start..end) {
@@ -555,7 +562,16 @@ impl Screen {
         let gap = (n as usize).saturating_mul(w);
         let src_end = end.saturating_sub(gap).max(start);
         let dst_start = start.saturating_add(gap).min(end);
-        self.grid.copy_within(start..src_end, dst_start);
+        let copy_len = src_end.saturating_sub(start);
+        let mut i = copy_len;
+        while i > 0 {
+            i = i.saturating_sub(1);
+            if let Some(&cell) = self.grid.get(start.saturating_add(i)) {
+                if let Some(dst) = self.grid.get_mut(dst_start.saturating_add(i)) {
+                    *dst = cell;
+                }
+            }
+        }
         let blank = self.bce_blank();
         if let Some(slice) = self.grid.get_mut(start..dst_start) {
             slice.fill(blank);
@@ -587,7 +603,16 @@ impl Screen {
             .min(self.grid.len());
         let src_end = end.saturating_sub(n).max(at);
         let dst_start = at.saturating_add(n).min(end);
-        self.grid.copy_within(at..src_end, dst_start);
+        let copy_len = src_end.saturating_sub(at);
+        let mut i = copy_len;
+        while i > 0 {
+            i = i.saturating_sub(1);
+            if let Some(&cell) = self.grid.get(at.saturating_add(i)) {
+                if let Some(dst) = self.grid.get_mut(dst_start.saturating_add(i)) {
+                    *dst = cell;
+                }
+            }
+        }
         let blank = self.bce_blank();
         if let Some(slice) = self.grid.get_mut(at..dst_start) {
             slice.fill(blank);
@@ -605,7 +630,16 @@ impl Screen {
             .saturating_add(self.cols as usize)
             .min(self.grid.len());
         let src_start = at.saturating_add(n).min(end);
-        self.grid.copy_within(src_start..end, at);
+        let copy_len = end.saturating_sub(src_start);
+        let mut i = 0usize;
+        while i < copy_len {
+            if let Some(&cell) = self.grid.get(src_start.saturating_add(i)) {
+                if let Some(dst) = self.grid.get_mut(at.saturating_add(i)) {
+                    *dst = cell;
+                }
+            }
+            i = i.saturating_add(1);
+        }
         let blank = self.bce_blank();
         let fill_start = end.saturating_sub(n).max(at);
         if let Some(slice) = self.grid.get_mut(fill_start..end) {
@@ -648,8 +682,9 @@ impl Screen {
     /// screen means the last row, and a region that is empty after that clamp
     /// (`top >= bottom`) is ignored entirely: neither the margins nor the cursor
     /// change.
-    fn set_scroll_region(&mut self, top: u16, bottom: u16) {
-        let bottom = bottom.min(self.rows.saturating_sub(1));
+    const fn set_scroll_region(&mut self, top: u16, bottom: u16) {
+        let last_row = self.rows.saturating_sub(1);
+        let bottom = if bottom < last_row { bottom } else { last_row };
         if top < bottom {
             self.scroll_top = top;
             self.scroll_bottom = bottom;
@@ -658,7 +693,7 @@ impl Screen {
         }
     }
 
-    fn tab(&mut self) {
+    const fn tab(&mut self) {
         // A pending wrap survives a TAB (xterm's TabToNextStop never touches the
         // last-column flag): the next glyph still wraps.
         if self.col >= self.cols {
@@ -666,36 +701,40 @@ impl Screen {
         }
         // Advance to the next 8-column tab stop, not past the last column.
         let next = (self.col / 8).saturating_add(1).saturating_mul(8);
-        self.col = next.min(self.cols.saturating_sub(1));
+        let last_col = self.cols.saturating_sub(1);
+        self.col = if next < last_col { next } else { last_col };
     }
 
-    fn backspace(&mut self) {
+    const fn backspace(&mut self) {
         // From a pending wrap the cursor is ON the last column (xterm), so BS
         // lands on the second-to-last: `abcde BS X` is `abcXe`, never `abcdX`.
         self.clear_pending_wrap();
         self.col = self.col.saturating_sub(1);
     }
 
-    fn move_to(&mut self, row: u16, col: u16) {
-        self.row = row.min(self.rows.saturating_sub(1));
-        self.col = col.min(self.cols.saturating_sub(1));
+    const fn move_to(&mut self, row: u16, col: u16) {
+        let last_row = self.rows.saturating_sub(1);
+        let last_col = self.cols.saturating_sub(1);
+        self.row = if row < last_row { row } else { last_row };
+        self.col = if col < last_col { col } else { last_col };
     }
 
     /// CUU. As in xterm's `CursorUp`, a cursor at or below the top margin stops
     /// at it; one above the region may go to row 0.
-    fn cursor_up(&mut self, n: u16) {
+    const fn cursor_up(&mut self, n: u16) {
         self.clear_pending_wrap();
         let min = if self.row >= self.scroll_top {
             self.scroll_top
         } else {
             0
         };
-        self.row = self.row.saturating_sub(n).max(min);
+        let sub = self.row.saturating_sub(n);
+        self.row = if sub > min { sub } else { min };
     }
 
     /// CUD. As in xterm's `CursorDown`, a cursor at or above the bottom margin
     /// stops at it; one below the region may go to the last row.
-    fn cursor_down(&mut self, n: u16) {
+    const fn cursor_down(&mut self, n: u16) {
         self.clear_pending_wrap();
         let max = if self.row <= self.scroll_bottom {
             self.scroll_bottom
@@ -703,14 +742,17 @@ impl Screen {
             self.rows.saturating_sub(1)
         };
         // saturating_add: a CSI param up to 65535 must not overflow u16.
-        self.row = self.row.saturating_add(n).min(max);
+        let add = self.row.saturating_add(n);
+        self.row = if add < max { add } else { max };
     }
 
-    fn cursor_forward(&mut self, n: u16) {
-        self.col = self.col.saturating_add(n).min(self.cols.saturating_sub(1));
+    const fn cursor_forward(&mut self, n: u16) {
+        let add = self.col.saturating_add(n);
+        let last_col = self.cols.saturating_sub(1);
+        self.col = if add < last_col { add } else { last_col };
     }
 
-    fn cursor_back(&mut self, n: u16) {
+    const fn cursor_back(&mut self, n: u16) {
         // Like BS: resolve a pending wrap onto the last column, then move.
         self.clear_pending_wrap();
         self.col = self.col.saturating_sub(n);
@@ -721,13 +763,13 @@ impl Screen {
     /// wrap is resolved, so a parked glyph is the cursor cell and is erased
     /// either way (xterm `ClearRight` clears from `cur_col`, `ClearLeft`
     /// through it).
-    fn erase_bounds(&self) -> (usize, usize) {
+    const fn erase_bounds(&self) -> (usize, usize) {
         let at = self.idx(self.row, self.col);
         (at, at.saturating_add(1))
     }
 
     fn erase_display(&mut self, mode: u16) {
-        if !(0..=2).contains(&mode) {
+        if mode > 2 {
             // `ED 3` erases saved lines, and there are none; any other
             // parameter is ignored. Neither resets the wrap (xterm
             // `do_erase_display` has no `ResetWrap` outside cases 0-2).
@@ -744,7 +786,7 @@ impl Screen {
     }
 
     fn erase_line(&mut self, mode: u16) {
-        if !(0..=2).contains(&mode) {
+        if mode > 2 {
             return;
         }
         self.clear_pending_wrap();
@@ -761,7 +803,7 @@ impl Screen {
     /// An erased cell under background-colour-erase (`bce`): a space carrying the
     /// **current SGR background**, so `ED`/`EL` after `\x1b[44m` paints blue, not a
     /// hardcoded default blank. (Reverse-video bce is out of scope.)
-    fn bce_blank(&self) -> Cell {
+    const fn bce_blank(&self) -> Cell {
         Cell {
             ch: ' ',
             fg: Color::Default,
@@ -787,11 +829,10 @@ impl Screen {
             self.pen = Pen::reset();
             return;
         }
-        let is_sub = |i: usize| sub.get(i).copied().unwrap_or(false);
         let mut i = 0;
         while let Some(&param) = params.get(i) {
             let mut end = i.saturating_add(1);
-            while end < params.len() && is_sub(end) {
+            while end < params.len() && matches!(sub.get(end), Some(&true)) {
                 end = end.saturating_add(1);
             }
             if end > i.saturating_add(1) {
@@ -809,12 +850,12 @@ impl Screen {
                 22 => self.pen.attrs &= !attr::BOLD,
                 24 => self.pen.attrs &= !attr::UNDERLINE,
                 27 => self.pen.attrs &= !attr::REVERSE,
-                30..=37 => self.pen.fg = Color::Indexed((param - 30) as u8),
+                30..=37 => self.pen.fg = sgr_fg_std(param),
                 39 => self.pen.fg = Color::Default,
-                40..=47 => self.pen.bg = Color::Indexed((param - 40) as u8),
+                40..=47 => self.pen.bg = sgr_bg_std(param),
                 49 => self.pen.bg = Color::Default,
-                90..=97 => self.pen.fg = Color::Indexed((param - (90 - 8)) as u8),
-                100..=107 => self.pen.bg = Color::Indexed((param - (100 - 8)) as u8),
+                90..=97 => self.pen.fg = sgr_fg_bright(param),
+                100..=107 => self.pen.bg = sgr_bg_bright(param),
                 38 => {
                     if let Some(c) = parse_extended(params, &mut i) {
                         self.pen.fg = c;
@@ -832,15 +873,14 @@ impl Screen {
     }
 
     /// One colon group: `g[0]` is the code, `g[1..]` its sub-parameters.
-    fn sgr_colon(&mut self, g: &[u16]) {
-        let Some(&code) = g.first() else {
+    const fn sgr_colon(&mut self, g: &[u16]) {
+        let &[code, ref tail @ ..] = g else {
             return;
         };
-        let tail = g.get(1..).unwrap_or(&[]);
         match code {
             // `4:0` is underline off; `4:n` a styled underline (modelled as plain).
             4 => {
-                if tail.first().copied() == Some(0) {
+                if matches!(tail, &[0, ..]) {
                     self.pen.attrs &= !attr::UNDERLINE;
                 } else {
                     self.pen.attrs |= attr::UNDERLINE;
@@ -941,7 +981,7 @@ impl Screen {
     /// DECSC: save the cursor and the pen into the active buffer's slot (one
     /// per buffer, as xterm) — a save inside the alternate screen never
     /// clobbers the main slot.
-    fn save_cursor(&mut self) {
+    const fn save_cursor(&mut self) {
         let saved = SavedCursor {
             row: self.row,
             col: self.col,
@@ -959,19 +999,31 @@ impl Screen {
     /// without consuming it (a saved pending wrap is kept). With nothing saved
     /// the cursor homes and the pen resets, per DEC STD 070 and xterm (whose
     /// `CursorRestore` then reads a zeroed `SavedCursor`).
-    fn restore_cursor(&mut self) {
+    const fn restore_cursor(&mut self) {
         let slot = if self.altscreen {
             self.alt_saved_cursor
         } else {
             self.saved_cursor
         };
-        let saved = slot.unwrap_or(SavedCursor {
-            row: 0,
-            col: 0,
-            pen: Pen::reset(),
-        });
-        self.row = saved.row.min(self.rows.saturating_sub(1));
-        self.col = saved.col.min(self.cols);
+        let saved = match slot {
+            Some(s) => s,
+            None => SavedCursor {
+                row: 0,
+                col: 0,
+                pen: Pen::reset(),
+            },
+        };
+        let last_row = self.rows.saturating_sub(1);
+        self.row = if saved.row < last_row {
+            saved.row
+        } else {
+            last_row
+        };
+        self.col = if saved.col < self.cols {
+            saved.col
+        } else {
+            self.cols
+        };
         self.pen = saved.pen;
     }
 
@@ -1015,11 +1067,196 @@ impl Screen {
     }
 }
 
-fn enc_color(c: Color) -> (u8, u8) {
-    match c {
-        Color::Default => (0, 0),
-        Color::Indexed(n) => (1, n),
-    }
+/// Encode the 10-byte screen header `(cols, rows, row, col, cursor_visible, altscreen)`.
+#[must_use]
+pub const fn encode_screen_header(
+    cols: u16,
+    rows: u16,
+    row: u16,
+    col: u16,
+    cursor_visible: bool,
+    altscreen: bool,
+) -> [u8; 10] {
+    [
+        cols as u8,
+        (cols >> 8) as u8,
+        rows as u8,
+        (rows >> 8) as u8,
+        row as u8,
+        (row >> 8) as u8,
+        col as u8,
+        (col >> 8) as u8,
+        cursor_visible as u8,
+        altscreen as u8,
+    ]
+}
+
+/// Decode a 10-byte screen header into `(cols, rows, row, col, cursor_visible, altscreen)`.
+#[must_use]
+pub const fn decode_screen_header(raw: &[u8; 10]) -> (u16, u16, u16, u16, bool, bool) {
+    let cols = (raw[0] as u16) | ((raw[1] as u16) << 8);
+    let rows = (raw[2] as u16) | ((raw[3] as u16) << 8);
+    let row = (raw[4] as u16) | ((raw[5] as u16) << 8);
+    let col = (raw[6] as u16) | ((raw[7] as u16) << 8);
+    let cursor_visible = raw[8] != 0;
+    let altscreen = raw[9] != 0;
+    (cols, rows, row, col, cursor_visible, altscreen)
+}
+
+/// Encode one [`Cell`] into its 9-byte canonical screen serialization.
+#[must_use]
+pub const fn encode_cell_bytes(cell: &Cell) -> [u8; 9] {
+    let cp = cell.ch as u32;
+    let (ft, fv) = match cell.fg {
+        Color::Default => (0u8, 0u8),
+        Color::Indexed(n) => (1u8, n),
+    };
+    let (bt, bv) = match cell.bg {
+        Color::Default => (0u8, 0u8),
+        Color::Indexed(n) => (1u8, n),
+    };
+    [
+        cp as u8,
+        (cp >> 8) as u8,
+        (cp >> 16) as u8,
+        (cp >> 24) as u8,
+        ft,
+        fv,
+        bt,
+        bv,
+        cell.attrs,
+    ]
+}
+
+/// Decode a 9-byte canonical cell record into `(codepoint, fg, bg, attrs)`.
+#[must_use]
+pub const fn decode_cell_bytes(raw: &[u8; 9]) -> (u32, Color, Color, u8) {
+    let cp = (raw[0] as u32)
+        | ((raw[1] as u32) << 8)
+        | ((raw[2] as u32) << 16)
+        | ((raw[3] as u32) << 24);
+    let fg = if raw[4] == 0 {
+        Color::Default
+    } else {
+        Color::Indexed(raw[5])
+    };
+    let bg = if raw[6] == 0 {
+        Color::Default
+    } else {
+        Color::Indexed(raw[7])
+    };
+    (cp, fg, bg, raw[8])
+}
+
+/// Encode the 5-byte pen state `(fg, bg, attrs)`.
+#[must_use]
+pub const fn encode_pen_bytes(fg: Color, bg: Color, attrs: u8) -> [u8; 5] {
+    let (ft, fv) = match fg {
+        Color::Default => (0u8, 0u8),
+        Color::Indexed(n) => (1u8, n),
+    };
+    let (bt, bv) = match bg {
+        Color::Default => (0u8, 0u8),
+        Color::Indexed(n) => (1u8, n),
+    };
+    [ft, fv, bt, bv, attrs]
+}
+
+/// Decode a 5-byte pen state into `(fg, bg, attrs)`.
+#[must_use]
+pub const fn decode_pen_bytes(raw: &[u8; 5]) -> (Color, Color, u8) {
+    let fg = if raw[0] == 0 {
+        Color::Default
+    } else {
+        Color::Indexed(raw[1])
+    };
+    let bg = if raw[2] == 0 {
+        Color::Default
+    } else {
+        Color::Indexed(raw[3])
+    };
+    (fg, bg, raw[4])
+}
+
+/// Encode an active saved-cursor slot into its 10-byte serialization (`1 || row || col || pen`).
+#[must_use]
+pub const fn encode_saved_cursor_bytes(
+    row: u16,
+    col: u16,
+    fg: Color,
+    bg: Color,
+    attrs: u8,
+) -> [u8; 10] {
+    let (ft, fv) = match fg {
+        Color::Default => (0u8, 0u8),
+        Color::Indexed(n) => (1u8, n),
+    };
+    let (bt, bv) = match bg {
+        Color::Default => (0u8, 0u8),
+        Color::Indexed(n) => (1u8, n),
+    };
+    [
+        1,
+        row as u8,
+        (row >> 8) as u8,
+        col as u8,
+        (col >> 8) as u8,
+        ft,
+        fv,
+        bt,
+        bv,
+        attrs,
+    ]
+}
+
+/// Decode a 10-byte saved-cursor slot into `(present, row, col, fg, bg, attrs)`.
+#[must_use]
+pub const fn decode_saved_cursor_bytes(raw: &[u8; 10]) -> (bool, u16, u16, Color, Color, u8) {
+    let present = raw[0] != 0;
+    let row = (raw[1] as u16) | ((raw[2] as u16) << 8);
+    let col = (raw[3] as u16) | ((raw[4] as u16) << 8);
+    let fg = if raw[5] == 0 {
+        Color::Default
+    } else {
+        Color::Indexed(raw[6])
+    };
+    let bg = if raw[7] == 0 {
+        Color::Default
+    } else {
+        Color::Indexed(raw[8])
+    };
+    (present, row, col, fg, bg, raw[9])
+}
+
+/// Encode the 4-byte scroll region `(scroll_top, scroll_bottom)`.
+#[must_use]
+pub const fn encode_scroll_region_bytes(scroll_top: u16, scroll_bottom: u16) -> [u8; 4] {
+    [
+        scroll_top as u8,
+        (scroll_top >> 8) as u8,
+        scroll_bottom as u8,
+        (scroll_bottom >> 8) as u8,
+    ]
+}
+
+/// Decode a 4-byte scroll region into `(scroll_top, scroll_bottom)`.
+#[must_use]
+pub const fn decode_scroll_region_bytes(raw: &[u8; 4]) -> (u16, u16) {
+    let top = (raw[0] as u16) | ((raw[1] as u16) << 8);
+    let bottom = (raw[2] as u16) | ((raw[3] as u16) << 8);
+    (top, bottom)
+}
+
+/// Encode a `u32` length field in little-endian bytes.
+#[must_use]
+pub const fn encode_u32_le_bytes(v: u32) -> [u8; 4] {
+    [v as u8, (v >> 8) as u8, (v >> 16) as u8, (v >> 24) as u8]
+}
+
+/// Decode a `u32` length field from little-endian bytes.
+#[must_use]
+pub const fn decode_u32_le_bytes(raw: &[u8; 4]) -> u32 {
+    (raw[0] as u32) | ((raw[1] as u32) << 8) | ((raw[2] as u32) << 16) | ((raw[3] as u32) << 24)
 }
 
 /// Clip/extend a grid into new dimensions, copying the overlapping top-left
@@ -1071,12 +1308,112 @@ fn parse_extended(params: &[u16], i: &mut usize) -> Option<Color> {
     colour
 }
 
+const fn sgr_fg_std(param: u16) -> Color {
+    if param >= 30 && param <= 37 {
+        Color::Indexed((param - 30) as u8)
+    } else {
+        Color::Default
+    }
+}
+
+const fn sgr_bg_std(param: u16) -> Color {
+    if param >= 40 && param <= 47 {
+        Color::Indexed((param - 40) as u8)
+    } else {
+        Color::Default
+    }
+}
+
+const fn sgr_fg_bright(param: u16) -> Color {
+    if param >= 90 && param <= 97 {
+        // 90..=97 -> bright palette 8..=15 (`param - 82`).
+        Color::Indexed((param - 82) as u8)
+    } else {
+        Color::Default
+    }
+}
+
+const fn sgr_bg_bright(param: u16) -> Color {
+    if param >= 100 && param <= 107 {
+        // 100..=107 -> bright palette 8..=15 (`param - 92`).
+        Color::Indexed((param - 92) as u8)
+    } else {
+        Color::Default
+    }
+}
+
 /// The `:`-form colour sub-parameters after `38`/`48`: `5:n` selects a palette
 /// colour; `2:r:g:b` / `2:cs:r:g:b` (truecolour) select nothing.
-fn parse_colon_colour(sub: &[u16]) -> Option<Color> {
-    match sub.first() {
-        Some(5) => sub.get(1).map(|n| Color::Indexed((*n).min(255) as u8)),
+const fn parse_colon_colour(sub: &[u16]) -> Option<Color> {
+    match sub {
+        &[5, n, ..] => {
+            let clamped = if n < 255 { n } else { 255 };
+            Some(Color::Indexed(clamped as u8))
+        }
         _ => None,
+    }
+}
+
+const fn utf8_acc_step(acc: u32, b: u8) -> u32 {
+    (acc << 6) | (b & 0x3f) as u32
+}
+
+#[allow(clippy::implicit_saturating_sub)]
+const fn utf8_needed_dec(needed: u8) -> u8 {
+    if needed > 1 {
+        needed - 1
+    } else {
+        0
+    }
+}
+
+const fn csi_acc_digit(cur: u16, c: u8) -> u16 {
+    if c >= b'0' && c <= b'9' {
+        cur.saturating_mul(10).saturating_add((c - b'0') as u16)
+    } else {
+        cur
+    }
+}
+
+const fn csi_count0(nums: &[u16]) -> u16 {
+    match nums {
+        &[0, ..] | &[] => 1,
+        &[n, ..] => n,
+    }
+}
+
+const fn csi_coord0(nums: &[u16]) -> u16 {
+    match nums {
+        &[0, ..] | &[] => 0,
+        &[n, ..] => n.saturating_sub(1),
+    }
+}
+
+const fn csi_coord1(nums: &[u16]) -> u16 {
+    if let &[_, n, ..] = nums {
+        n.saturating_sub(1)
+    } else {
+        0
+    }
+}
+
+#[allow(clippy::match_ref_pats)]
+const fn csi_mode0(nums: &[u16]) -> u16 {
+    match nums {
+        &[m, ..] => m,
+        &[] => 0,
+    }
+}
+
+const fn csi_bottom0(nums: &[u16], rows: u16) -> u16 {
+    if let &[_, n, ..] = nums {
+        if n == 0 {
+            rows.saturating_sub(1)
+        } else {
+            n.saturating_sub(1)
+        }
+    } else {
+        rows.saturating_sub(1)
     }
 }
 
@@ -1247,10 +1584,10 @@ impl Parser {
             self.ground(screen, b);
             return;
         }
-        let acc = (acc << 6) | (b & 0x3f) as u32;
+        let acc = utf8_acc_step(acc, b);
         if needed > 1 {
             self.state = State::Utf8 {
-                needed: needed - 1,
+                needed: utf8_needed_dec(needed),
                 acc,
                 lo: 0x80,
                 hi: 0xbf,
@@ -1414,7 +1751,7 @@ impl Parser {
             let mut cur_sub = false;
             for c in self.params.bytes() {
                 match c {
-                    b'0'..=b'9' => cur = cur.saturating_mul(10).saturating_add((c - b'0') as u16),
+                    b'0'..=b'9' => cur = csi_acc_digit(cur, c),
                     _ => {
                         if let (Some(v_slot), Some(s_slot)) = (vals.get_mut(n), sub.get_mut(n)) {
                             *v_slot = cur;
@@ -1446,64 +1783,67 @@ impl Parser {
             }
         }
         let nums = nums.get(..m).unwrap_or(&[]);
-        // A movement count: the param, treating 0/absent as 1.
-        let count = |i: usize| match nums.get(i).copied() {
-            Some(0) | None => 1,
-            Some(n) => n,
-        };
-        // A 1-based coordinate → 0-based, treating 0/absent as 1 → 0.
-        let coord = |i: usize| count(i).saturating_sub(1);
 
         match final_byte {
             b'A' => {
-                screen.cursor_up(count(0));
-                self.rec(ScreenOp::CursorUp(count(0)));
+                let n = csi_count0(nums);
+                screen.cursor_up(n);
+                self.rec(ScreenOp::CursorUp(n));
             }
             b'B' => {
-                screen.cursor_down(count(0));
-                self.rec(ScreenOp::CursorDown(count(0)));
+                let n = csi_count0(nums);
+                screen.cursor_down(n);
+                self.rec(ScreenOp::CursorDown(n));
             }
             b'C' => {
-                screen.cursor_forward(count(0));
-                self.rec(ScreenOp::CursorForward(count(0)));
+                let n = csi_count0(nums);
+                screen.cursor_forward(n);
+                self.rec(ScreenOp::CursorForward(n));
             }
             b'D' => {
-                screen.cursor_back(count(0));
-                self.rec(ScreenOp::CursorBack(count(0)));
+                let n = csi_count0(nums);
+                screen.cursor_back(n);
+                self.rec(ScreenOp::CursorBack(n));
             }
             b'E' => {
-                screen.cursor_down(count(0));
+                let n = csi_count0(nums);
+                screen.cursor_down(n);
                 screen.carriage_return();
-                self.rec(ScreenOp::CursorDown(count(0)));
+                self.rec(ScreenOp::CursorDown(n));
                 self.rec(ScreenOp::CarriageReturn);
             }
             b'F' => {
-                screen.cursor_up(count(0));
+                let n = csi_count0(nums);
+                screen.cursor_up(n);
                 screen.carriage_return();
-                self.rec(ScreenOp::CursorUp(count(0)));
+                self.rec(ScreenOp::CursorUp(n));
                 self.rec(ScreenOp::CarriageReturn);
             }
             b'G' => {
                 let (r, _) = screen.cursor();
-                screen.move_to(r, coord(0));
-                self.rec(ScreenOp::MoveTo(r, coord(0)));
+                let c = csi_coord0(nums);
+                screen.move_to(r, c);
+                self.rec(ScreenOp::MoveTo(r, c));
             }
             b'd' => {
                 let (_, c) = screen.cursor();
-                screen.move_to(coord(0), c);
-                self.rec(ScreenOp::MoveTo(coord(0), c));
+                let r = csi_coord0(nums);
+                screen.move_to(r, c);
+                self.rec(ScreenOp::MoveTo(r, c));
             }
             b'H' | b'f' => {
-                screen.move_to(coord(0), coord(1));
-                self.rec(ScreenOp::MoveTo(coord(0), coord(1)));
+                let r = csi_coord0(nums);
+                let c = csi_coord1(nums);
+                screen.move_to(r, c);
+                self.rec(ScreenOp::MoveTo(r, c));
             }
             b'J' => {
-                let m = nums.first().copied().unwrap_or(0);
+                let m = csi_mode0(nums);
                 screen.erase_display(m);
                 self.rec(ScreenOp::EraseDisplay(m));
             }
             b'K' => {
-                let m = nums.first().copied().unwrap_or(0);
+                let m = csi_mode0(nums);
                 screen.erase_line(m);
                 self.rec(ScreenOp::EraseLine(m));
             }
@@ -1531,11 +1871,8 @@ impl Parser {
                 // DECSTBM: set the scrolling region [top; bottom] (1-based, inclusive).
                 // Absent/0 top -> 1; absent/0 bottom -> last row. Converted to 0-based.
                 let (_, rows) = screen.dims();
-                let top0 = count(0).saturating_sub(1);
-                let bottom0 = match nums.get(1).copied() {
-                    Some(0) | None => rows.saturating_sub(1),
-                    Some(n) => n.saturating_sub(1),
-                };
+                let top0 = csi_coord0(nums);
+                let bottom0 = csi_bottom0(nums, rows);
                 screen.set_scroll_region(top0, bottom0);
                 self.rec(ScreenOp::SetScrollRegion {
                     top: top0,
@@ -1543,24 +1880,29 @@ impl Parser {
                 });
             }
             b'@' => {
-                screen.insert_chars(count(0));
-                self.rec(ScreenOp::InsertChars(count(0)));
+                let n = csi_count0(nums);
+                screen.insert_chars(n);
+                self.rec(ScreenOp::InsertChars(n));
             }
             b'P' => {
-                screen.delete_chars(count(0));
-                self.rec(ScreenOp::DeleteChars(count(0)));
+                let n = csi_count0(nums);
+                screen.delete_chars(n);
+                self.rec(ScreenOp::DeleteChars(n));
             }
             b'X' => {
-                screen.erase_chars(count(0));
-                self.rec(ScreenOp::EraseChars(count(0)));
+                let n = csi_count0(nums);
+                screen.erase_chars(n);
+                self.rec(ScreenOp::EraseChars(n));
             }
             b'L' => {
-                screen.insert_lines(count(0), true);
-                self.rec(ScreenOp::InsertLines(count(0)));
+                let n = csi_count0(nums);
+                screen.insert_lines(n, true);
+                self.rec(ScreenOp::InsertLines(n));
             }
             b'M' => {
-                screen.insert_lines(count(0), false);
-                self.rec(ScreenOp::DeleteLines(count(0)));
+                let n = csi_count0(nums);
+                screen.insert_lines(n, false);
+                self.rec(ScreenOp::DeleteLines(n));
             }
             b's' => {
                 screen.save_cursor();

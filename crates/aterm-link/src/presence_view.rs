@@ -611,12 +611,12 @@ fn follow(
     // THE ACK DEADLINE COMES OFF once the tail is open: parking with nothing to
     // deliver is what a subscription does. It comes back as the LIVENESS bound
     // on the broker's first mark, below.
-    closer.set_read_timeout(None)?;
+    crate::transport::bound_reads(closer, None)?;
     loop {
         match sub.recv_event()? {
             None => return Ok(()),
             Some(astream_broker::Event::Mark { next, head, .. }) => {
-                closer.set_read_timeout(Some(astream_broker::IDLE_MARK_DEADLINE))?;
+                crate::transport::bound_reads(closer, Some(astream_broker::IDLE_MARK_DEADLINE))?;
                 if !view.mark(generation, next, head) {
                     return Ok(());
                 }
@@ -788,15 +788,11 @@ mod tests {
             .tempdir_in("/tmp")
             .expect("a scratch dir");
         let socket = dir.path().join("b.sock");
-        let broker = astream_broker::Broker::open(dir.path().join("b.log")).expect("a broker");
+        let broker = crate::test_broker(dir.path().join("b.log")).expect("a broker");
         let _server = broker.serve(&socket).expect("serve");
         let dial = || {
-            crate::transport::connect(
-                &crate::transport::Transport::Unix,
-                &socket.to_string_lossy(),
-                Duration::from_secs(60),
-            )
-            .expect("dial")
+            crate::transport::connect(&socket.to_string_lossy(), Duration::from_secs(60))
+                .expect("dial")
         };
         let alive = |conn: &mut Conn| conn.fetch(0, "/f/>", 0).is_ok();
         let view = PresenceView::default();

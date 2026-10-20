@@ -4,56 +4,26 @@
 
 use super::*;
 
+/// IL and DL shift only inside the scroll region (rows 2..=5) and are no-ops
+/// with the cursor outside it.
 #[test]
-fn grid_insert_lines_with_scroll_region() {
-    let mut grid = lettered(Grid::new(8, 10));
-
-    grid.set_scroll_region(2, 5);
-
-    grid.set_cursor(3, 0);
-    grid.insert_lines(2);
-
-    // Two blanks inserted at row 3; E, F pushed off the region bottom.
-    assert_eq!(col0(&grid), "ABC  DGH");
-}
-
-#[test]
-fn grid_insert_lines_cursor_outside_scroll_region() {
-    let mut grid = lettered(Grid::new(8, 10));
-
-    grid.set_scroll_region(2, 5);
-
-    // Cursor above the region: IL is a no-op.
-    grid.set_cursor(1, 0);
-    grid.insert_lines(2);
-
-    assert_eq!(col0(&grid), "ABCDEFGH");
-}
-
-#[test]
-fn grid_delete_lines_with_scroll_region() {
-    let mut grid = lettered(Grid::new(8, 10));
-
-    grid.set_scroll_region(2, 5);
-
-    grid.set_cursor(3, 0);
-    grid.delete_lines(2);
-
-    // D, E deleted; blanks fill the region bottom.
-    assert_eq!(col0(&grid), "ABCF  GH");
-}
-
-#[test]
-fn grid_delete_lines_cursor_outside_scroll_region() {
-    let mut grid = lettered(Grid::new(8, 10));
-
-    grid.set_scroll_region(2, 5);
-
-    // Cursor below the region: DL is a no-op.
-    grid.set_cursor(7, 0);
-    grid.delete_lines(2);
-
-    assert_eq!(col0(&grid), "ABCDEFGH");
+fn grid_insert_and_delete_lines_with_scroll_region() {
+    type Op = fn(&mut Grid);
+    let cases: [(&str, Op, u16, &str); 4] = [
+        // Two blanks inserted at row 3; E, F pushed off the region bottom.
+        ("IL inside", |g| g.insert_lines(2), 3, "ABC  DGH"),
+        ("IL above", |g| g.insert_lines(2), 1, "ABCDEFGH"),
+        // D, E deleted; blanks fill the region bottom.
+        ("DL inside", |g| g.delete_lines(2), 3, "ABCF  GH"),
+        ("DL below", |g| g.delete_lines(2), 7, "ABCDEFGH"),
+    ];
+    for (name, op, row, want) in cases {
+        let mut grid = lettered(Grid::new(8, 10));
+        grid.set_scroll_region(2, 5);
+        grid.set_cursor(row, 0);
+        op(&mut grid);
+        assert_eq!(col0(&grid), want, "{name}");
+    }
 }
 
 #[test]

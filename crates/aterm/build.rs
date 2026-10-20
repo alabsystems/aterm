@@ -16,6 +16,9 @@
 // prints a banner naming the visible consequence, and `ATERM_REQUIRE_WIN_RESOURCES=1` makes it
 // an error. Off Windows the resource half emits nothing, no link arg included.
 //
+// On Apple silicon the bins link with chained fixups (`chained_fixups`), a launch-time cost
+// before `main`.
+//
 // `mod build_stamp` and `mod compiler` emit the `rustc-env` build facts `src/main.rs`'s
 // `BUILD_STAMP` compiles in, stamped in the binary crate so a commit recompiles only this crate.
 #![allow(
@@ -40,6 +43,7 @@ const VS_VERSION_INFO_ID: u16 = 1;
 fn main() {
     build_stamp::emit();
     compiler::emit();
+    chained_fixups();
 
     // A build script runs on the host, so `cfg!(windows)` would answer for the host, not the
     // target.
@@ -88,6 +92,42 @@ fn main() {
         return;
     }
     report(&outcome.to_string());
+}
+
+/// Apple-silicon macOS bins link with chained fixups (`ld -fixup_chains`), which the linker
+/// emits only from a macOS 12 deployment target on its own; Rust's for `aarch64-apple-darwin`
+/// is 11.0, so without this the shipped executable carries the older rebase/bind opcodes and
+/// dyld rebases every pointer in `__DATA_CONST` (about 46,800 of them) before `main`. With
+/// chains the kernel fixes each page up as it is first touched (page-in linking, macOS 13 on)
+/// and dyld binds the rest from the chain's import table.
+///
+/// Every supported macOS loads it (checked 2026-10-19 against Apple's published sources).
+/// For an 11.0 target the linker picks `DYLD_CHAINED_PTR_64` (its own default at 12.0 is
+/// `DYLD_CHAINED_PTR_64_OFFSET`; it forces chains without a word even at 10.15, so its silence
+/// proves nothing). The dyld of every macOS 11 release (832.7.1 for 11.0.1 and 11.1, 832.7.3,
+/// 851.27, 852, 852.2 for 11.5) accepts that format in `validChainedFixupsInfo` and applies it
+/// in `fixupAllChainedFixups`, from both of its launch paths, and reads `LC_DYLD_EXPORTS_TRIE`;
+/// so did 750.6, macOS 10.15's. The kernel leaves both load commands to dyld. The shipped
+/// binary's x86_64 slice carries no chains (below).
+///
+/// Chains bind every import at launch, where the old opcodes left most lazy until first
+/// called: an import newer than the deployment target stops the app at launch on an older
+/// macOS instead of at its first call. None is newer today: of the 529 on 2026-10-19, those
+/// the SDK declares are from macOS 10.15 or earlier or carry no availability, and the 22 no
+/// public header declares (the ARC runtime's, the stack guard's) are older still. A newer
+/// API is looked up at run time (`dlsym`), as Rust's std does.
+///
+/// Measured 2026-10-18 on a profiling build relinked from the same object both ways (headless
+/// launches through `posix_spawn`, launcher spun 200 ms first, interleaved, n=30 per arm and
+/// kind): birth to Rust `main` 5.67 -> 5.17 ms cold and 5.58 -> 5.05 ms warm; the main
+/// thread's CPU before `main` 4.39 -> 3.92 ms; page faults before `main` 682 -> 583.
+///
+/// Not on `x86_64-apple-darwin`, whose deployment target (10.12) predates chained fixups.
+fn chained_fixups() {
+    let target = |key: &str| std::env::var(key).unwrap_or_default();
+    if target("CARGO_CFG_TARGET_OS") == "macos" && target("CARGO_CFG_TARGET_ARCH") == "aarch64" {
+        println!("cargo:rustc-link-arg-bins=-Wl,-fixup_chains");
+    }
 }
 
 /// Print the "this exe will look unfinished" banner and honour `ATERM_REQUIRE_WIN_RESOURCES`.

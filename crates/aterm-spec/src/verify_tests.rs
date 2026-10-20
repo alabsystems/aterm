@@ -263,11 +263,14 @@ fn store_shim_resolution_is_fail_closed() {
 // resolver, so none reads or mutates the process environment or depends on what is installed.
 // -----------------------------------------------------------------------
 
-/// A scratch HOME and atpkg prefix for one test.
+/// A scratch HOME and atpkg prefix for one test (unix, as every test using it is: the store's
+/// `current` links and the `/bin/sh` stand-ins).
+#[cfg(unix)]
 struct Scratch {
     root: aterm_tempfile::TempDir,
 }
 
+#[cfg(unix)]
 impl Scratch {
     fn new(tag: &str) -> Self {
         // Canonical, so `~` shortening matches the paths discovery returns
@@ -294,7 +297,6 @@ impl Scratch {
         p
     }
     /// `prefix/store/<program>/<build>/bin/<exe>` + `current -> <build>`.
-    #[cfg(unix)]
     fn store_copy(&self, program: &str, build: &str, exe: &str) -> PathBuf {
         let p = self.file(&format!("prefix/store/{program}/{build}/bin/{exe}"));
         let dir = self.root.path().join(format!("prefix/store/{program}"));

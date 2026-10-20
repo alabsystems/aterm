@@ -43,7 +43,16 @@
 //!   ([`App::session_autopilot`]); and the located card's build equal to the
 //!   running process's (`FooterFacts::version`, the rule
 //!   `SessionTimeline::note_claude_card` keeps a card by), so a dead process's
-//!   card left on the screen after a relaunch stays bare.
+//!   card left on the screen after a relaunch stays bare. That build is read
+//!   from the registry row Claude Code writes a moment after it takes the
+//!   foreground, and the footer's resolver reads a new process again every
+//!   `claude_footer::FIRST_ROW_STEP` until a read finds the row (its
+//!   first-row ladder), so the facts, and with them the decoration and the
+//!   kitty's ride-in, come at most a step after the row: on the card's first
+//!   frame where the row leads the card by more than that (measured on the
+//!   fullscreen renderer), a frame or a few into it where it does not (the
+//!   inline renderer writes the row after it draws the card). On the 2 s
+//!   follow-up read alone they came 1.3-1.7 s after the card.
 //! * THE LAYOUT ([`layout`]). The box holds the card's three rows, and the
 //!   line's row under them when that row is blank across the line's span (the
 //!   line goes there at the card's text column); otherwise the line goes on
@@ -57,7 +66,15 @@
 //!   and the border inside the pane; otherwise the kitty and its trail go and
 //!   the border and the line stay. Where the third row — the working
 //!   directory's — is blank too, from the trail's start to the margin's end,
-//!   the kitty stands three rows tall (§10.6), else two.
+//!   the kitty stands three rows tall (§10.6), else two. The border stands
+//!   half a row clear of the box (§10.6.8, the box's AIR) over a pane row
+//!   blank from column 0 to the border's column — the row over the banner
+//!   and the row under the last boxed row, each judged alone; else that
+//!   side closes on the card as before: at the pane's first row (a card
+//!   drawn from a cleared screen's top), under the line that launched
+//!   Claude, over one of Claude's notices, at the pane's last row.
+//!   The air moves the border and nothing else: the kitty, its trail and
+//!   the stars stay where they were.
 //! * THE STREAMS. The border and the trail (the emitter's `under`) go to
 //!   `RenderInput::glow_under` — WINDOW-ABSOLUTE pixels, drawn beneath the
 //!   glyph ink; the kitty and the stars (`over`) to `RenderInput::nova_add` —
@@ -116,7 +133,8 @@
 //!   say what they said — known without a look while the pane's text is the
 //!   same rebuild, else by testing again, once per rebuild, exactly the
 //!   cells the layout read and no others ([`Seen`]: the layout reads each
-//!   cell once, and no further along a row than its decision needs, so a
+//!   cell once, and no further along a row than its decision needs — the
+//!   rows over and under the box no further than the border's column — so a
 //!   wide pane costs it no more than a narrow one; laid anew while a find
 //!   bar is up, whose tint writes cells no revision moves) — and its line —
 //!   cells, ink and star — while what it shows holds. A card laid anew (it
@@ -160,9 +178,6 @@ const TRAIL_MAX: usize = 20;
 const KITTY_MARGIN: usize = 4;
 /// The `✦` and the space after it, ahead of the line's words.
 const LINE_LEAD: usize = 2;
-/// The `✦`'s opacity on a light ground (source-over ink); on a dark ground it
-/// is added light at full coverage.
-const STAR_INK_ALPHA: u8 = 230;
 /// What the card reads off a pane's rows: where the newest launch card sits
 /// ([`CardPlace`]) and the build its banner names. Read at most once per
 /// rebuild of the pane's text (`claude_footer::PaneTextCache::launch_card`),
@@ -220,23 +235,45 @@ pub(crate) struct CardReading {
     /// none does); `None` when the reader panicked, and the reading is never
     /// kept.
     banner: Option<Option<usize>>,
+    /// Which scan supplied `banner` (`3` Claude, `4` Agy, `1` Muse), including
+    /// an incomplete card with no parsed `read`: its fourth and fifth rows can
+    /// still finish later.
+    rows_kind: usize,
     /// The card, `None` when none is placed or its build does not parse.
     pub(crate) read: Option<Arc<CardRead>>,
 }
 
 impl CardReading {
+    /// Which scan supplied the reading: `3` Claude Code, `4` agy, `1` Muse Code.
+    pub(crate) const fn rows_kind(&self) -> usize {
+        self.rows_kind
+    }
+
     /// Whether this reading — of a pane's rows before the rows `changed`
     /// names (ascending) changed — is the reading of `rows` as they are now,
     /// known without a scan (`aterm_phase::launch_card_unmoved`, behind the
     /// reader's panic fence): a keystroke, a spinner or a streamed row under
     /// the card, a pure revision bump and any row above the card keep it.
-    /// Never for a reading the reader could not take.
+    /// [`read_card`] asks Claude Code's scan, then agy's, then Muse Code's,
+    /// and takes the first that finds a banner, so the reading holds while
+    /// the scan that supplied it is unmoved and each scan asked before it
+    /// still finds none; a scan asked after it was never read, and is not
+    /// asked here. Never for a reading the reader could not take.
     pub(crate) fn holds(&self, session: u64, rows: &[String], changed: &[usize]) -> bool {
         let Some(banner) = self.banner else {
             return false;
         };
-        crate::reader_guard::read_or_none(session, "harness card", rows, || {
-            aterm_phase::launch_card_unmoved(rows, banner, changed)
+        crate::reader_guard::read_or_none(session, "harness card", rows, || match self.rows_kind {
+            4 => {
+                aterm_phase::agy::launch_card_unmoved(rows, banner, changed)
+                    && aterm_phase::launch_card_unmoved(rows, None, changed)
+            }
+            1 => {
+                aterm_phase::muse::launch_card_unmoved(rows, banner, changed)
+                    && aterm_phase::launch_card_unmoved(rows, None, changed)
+                    && aterm_phase::agy::launch_card_unmoved(rows, None, changed)
+            }
+            _ => aterm_phase::launch_card_unmoved(rows, banner, changed),
         })
         .unwrap_or(false)
     }
@@ -267,17 +304,36 @@ pub(crate) fn read_card(session: u64, rows: &[String], before: Option<CardBefore
     crate::reader_guard::read_or_none(session, "harness card", rows, || {
         let scan = aterm_phase::launch_card_scan(rows);
         if let Some(CardBefore { card, last: true }) = &before
+            && card.place.rows == 3
             && aterm_phase::launch_card_held(rows, scan, &card.place, card.words())
         {
             return CardReading {
                 banner: Some(Some(card.place.top)),
+                rows_kind: 3,
                 read: Some(Arc::clone(card)),
             };
         }
-        let (banner, place) = scan;
+        let (banner, place, rows_kind) = match scan {
+            (None, None) => match aterm_phase::agy::launch_card_scan(rows) {
+                (None, None) => {
+                    let (b, p) = aterm_phase::muse::launch_card_scan(rows);
+                    (b, p, 1usize)
+                }
+                (b, p) => (b, p, 4usize),
+            },
+            (b, p) => (b, p, 3usize),
+        };
         let read = place.and_then(|place| {
-            let version = aterm_phase::launch_card_version(rows, &place)?;
-            let words = aterm_phase::launch_card_words(rows, &place)?;
+            let version = match rows_kind {
+                4 => aterm_phase::agy::launch_card_version(rows, &place)?,
+                1 => aterm_phase::muse::launch_card_version(rows, &place)?,
+                _ => aterm_phase::launch_card_version(rows, &place)?,
+            };
+            let words = match rows_kind {
+                4 => aterm_phase::agy::launch_card_words(rows, &place)?,
+                1 => aterm_phase::muse::launch_card_words(rows, &place)?,
+                _ => aterm_phase::launch_card_words(rows, &place)?,
+            };
             Some(match before {
                 Some(CardBefore { card: was, .. })
                     if was.place == place && *was.version == *version && was.words() == words =>
@@ -293,6 +349,7 @@ pub(crate) fn read_card(session: u64, rows: &[String], before: Option<CardBefore
         });
         CardReading {
             banner: Some(banner),
+            rows_kind,
             read,
         }
     })
@@ -408,7 +465,10 @@ impl CardLine {
 }
 
 /// What a card's line was made for ([`CardLine::key`]): its place, its words,
-/// the cell its words are drawn in and the ink's palette and polarity.
+/// the cell its words are drawn in and the ink's palette and polarity. The
+/// cell's background is the pane's ground, which a light line's letters are
+/// solved against (`HarnessCard::line_ink_into`), so a new ground inks the
+/// line anew.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LineKey {
     frame_row: usize,
@@ -1092,7 +1152,7 @@ fn line_texts(view: AutopilotView, end: LineEnd) -> &'static [String] {
     // Cruise since §10.2): its words are the face's alone, whichever mode;
     // an armed timer's time follows Cruise's own words (§10.6).
     let end = match (view, end) {
-        (AutopilotView::Cruise, LineEnd::CruiseUntil(at)) => return timed_line_texts(at),
+        (AutopilotView::Cruise, LineEnd::CruiseUntil(at)) => return timed_line_texts(None, at),
         (AutopilotView::Land | AutopilotView::Cruise, _) => end,
         _ => LineEnd::Mode,
     };
@@ -1112,18 +1172,23 @@ fn line_texts(view: AutopilotView, end: LineEnd) -> &'static [String] {
 /// The line's words under Cruise with a timer armed for `at`
 /// ([`LineEnd::CruiseUntil`]), made once per face a timer can wear — its
 /// clock and its day, at most 1440 × 8 of them, in practice the few times a
-/// person sets — and kept for the process like every other line's words
-/// ([`line_texts`]): a timer armed again for the same time takes the words
-/// already made.
-fn timed_line_texts(at: LandAtGlass) -> &'static [String] {
-    static MADE: Mutex<Vec<(LandAtGlass, &'static [String])>> = Mutex::new(Vec::new());
+/// person sets — and kept for the process like every other line's words.
+/// The agent tag is part of the key too: Claude's untagged line, agy's and
+/// muse's each keep their own words. A timer armed again for the same agent
+/// and time takes the words already made.
+fn timed_line_texts(agent: Option<&'static str>, at: LandAtGlass) -> &'static [String] {
+    type TimedFace = (Option<&'static str>, LandAtGlass, &'static [String]);
+    static MADE: Mutex<Vec<TimedFace>> = Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(&(_, texts)) = made.iter().find(|(face, _)| *face == at) {
+    if let Some(&(_, _, texts)) = made
+        .iter()
+        .find(|(who, face, _)| *who == agent && *face == at)
+    {
         return texts;
     }
     let texts: &'static [String] =
-        make_line_texts(AutopilotView::Cruise, LineEnd::CruiseUntil(at)).leak();
-    made.push((at, texts));
+        make_line_texts_for(agent, AutopilotView::Cruise, LineEnd::CruiseUntil(at)).leak();
+    made.push((agent, at, texts));
     texts
 }
 
@@ -1134,12 +1199,44 @@ fn timed_line_texts(at: LandAtGlass) -> &'static [String] {
 /// (`menu::version_signature`), so one build reads the same here as in the
 /// menu bar.
 fn make_line_texts(view: AutopilotView, end: LineEnd) -> Vec<String> {
+    make_line_texts_for(None, view, end)
+}
+
+fn line_texts_for(rows_kind: usize, view: AutopilotView, end: LineEnd) -> &'static [String] {
+    static AGY_TEXTS: [OnceLock<Vec<String>>; 7] = [const { OnceLock::new() }; 7];
+    static MUSE_TEXTS: [OnceLock<Vec<String>>; 7] = [const { OnceLock::new() }; 7];
+    let (agent, table) = match rows_kind {
+        4 => ("agy", &AGY_TEXTS),
+        1 => ("muse", &MUSE_TEXTS),
+        _ => return line_texts(view, end),
+    };
+    let end = match (view, end) {
+        (AutopilotView::Cruise, LineEnd::CruiseUntil(at)) => {
+            return timed_line_texts(Some(agent), at);
+        }
+        (AutopilotView::Land | AutopilotView::Cruise, _) => end,
+        _ => LineEnd::Mode,
+    };
+    let slot = match (view, end) {
+        (AutopilotView::Land | AutopilotView::Cruise, LineEnd::Landed) => &table[5],
+        (AutopilotView::Land | AutopilotView::Cruise, LineEnd::Done) => &table[6],
+        (AutopilotView::Cruise, _) => &table[0],
+        (AutopilotView::Land, LineEnd::Mode | LineEnd::CruiseUntil(_)) => &table[1],
+        (AutopilotView::Off, _) => &table[2],
+        (AutopilotView::MasterOff | AutopilotView::AgentOff(_), _) => &table[3],
+        (AutopilotView::Unhosted, _) => &table[4],
+    };
+    slot.get_or_init(|| make_line_texts_for(Some(agent), view, end))
+}
+
+fn make_line_texts_for(agent: Option<&str>, view: AutopilotView, end: LineEnd) -> Vec<String> {
     use crate::claude_lights::ChipFace;
     use crate::menu::{VersionFacts, VersionRung, version_signature};
     let facts = VersionFacts::this_build();
     let mut texts = Vec::with_capacity(4);
+    let tag = agent.map_or_else(String::new, |a| format!(" \u{b7} {a}"));
     if let Some(full) = version_signature(facts, VersionRung::Full) {
-        let head = format!("enhanced by aterm harness {full}");
+        let head = format!("enhanced by aterm harness {full}{tag}");
         let (glyph, word) = end.words(view);
         let mode = format!("{head} \u{b7} autopilot {glyph} {word}");
         if let LineEnd::CruiseUntil(at) = end {
@@ -1152,7 +1249,7 @@ fn make_line_texts(view: AutopilotView, end: LineEnd) -> Vec<String> {
         texts.push(head);
     }
     if let Some(short) = version_signature(facts, VersionRung::Short) {
-        texts.push(format!("enhanced by aterm harness {short}"));
+        texts.push(format!("enhanced by aterm harness {short}{tag}"));
     }
     texts
 }
@@ -1261,7 +1358,7 @@ impl PaneRow<'_> {
 
 /// Whether the card at `place` sits whole in `pane`, as [`layout`] needs.
 fn sits_in(place: &CardPlace, pane: PaneGeom) -> bool {
-    place.rows == 3 && place.top + place.rows <= pane.rows && pane.cols >= 2
+    matches!(place.rows, 1 | 3 | 4) && place.top + place.rows <= pane.rows && pane.cols >= 2
 }
 
 /// One test a [`layout`] made of a pane's cells, and what it found
@@ -1362,6 +1459,11 @@ struct Layout<'t> {
     /// mascot — where the card's third row, its working directory's, is
     /// blank across the trail, the kitty and its margin; else two.
     kitty_rows: usize,
+    /// The box's AIR, over it and under it (`CardScene::pad_above`,
+    /// `pad_below`): the pane row over the banner row, and the one under the
+    /// last boxed row, read blank across the box's columns `0..=cols` — the
+    /// border stands half a row into each such row, clear of the card's ink.
+    air: (bool, bool),
     line: Option<LinePlace<'t>>,
 }
 
@@ -1372,7 +1474,7 @@ struct Layout<'t> {
 /// sit whole in the pane. A cell is read once, and no further along a row
 /// than the decision it serves needs: the line's run as far as its widest
 /// words inside the border reach, the kitty's as far as decides where it
-/// sits.
+/// sits, the air's no further than the border's column.
 fn layout<'t>(
     cells: &PaneCells<'_>,
     place: &CardPlace,
@@ -1394,10 +1496,25 @@ fn layout<'t>(
     // A row whose last glyph is wide ends one cell later than its text says
     // (the spacer cell reads as a trailing blank; `CardPlace::ends`).
     let mut ends = place.ends;
-    for (k, end) in ends.iter_mut().enumerate() {
-        if seen.wide(cells, top + k, *end) {
-            *end += 1;
+    let logical_end = ends.iter().copied().max().unwrap_or(0);
+    let mut card_end = logical_end;
+    for k in 0..place.rows {
+        // The compact place merges agy's third and fourth text extents in
+        // ends[2]. A fourth row matters at that maximum too; only a trailing
+        // continuation there can extend the card's overall text extent.
+        let end = ends.get(k).copied().unwrap_or(logical_end);
+        if seen.wide(cells, top + k, end) {
+            card_end = card_end.max(end + 1);
+            if let Some(end) = ends.get_mut(k) {
+                *end += 1;
+            }
         }
+    }
+    // Keep the existing clipping fallback for already oversized text. A new
+    // wide extension needs a clear border column after its continuation;
+    // without one, leave the vendor's card undecorated.
+    if card_end > logical_end && card_end > max_border {
+        return None;
     }
     // The line: under the card at its text column, else on the banner row two
     // cells past the banner — each with the widest words that fit, inside
@@ -1441,15 +1558,20 @@ fn layout<'t>(
         .iter()
         .copied()
         .chain(line_end)
-        .chain([row0_end])
+        .chain([row0_end, card_end])
         .max()
         .unwrap_or(0);
     // The kitty and its trail, right of the first two rows' text: the trail
     // from two cells past it, then the kitty, then its margin of stars and
     // the border — every cell blank on both rows, all inside the pane.
     let mut kitty = None;
-    if kc > 0 {
-        let start = row0_end.max(ends[1]) + 2;
+    if kc > 0 && rows >= 2 {
+        let row1_end = if place.rows == 1 {
+            line_end.unwrap_or(ends[0])
+        } else {
+            ends[1]
+        };
+        let start = row0_end.max(row1_end) + 2;
         // `limit`: the first column from `start` where either row is not
         // blank — read no further than `reach`. Blank to there, the kitty
         // sits where any more room would put it (the trail at its longest,
@@ -1478,7 +1600,7 @@ fn layout<'t>(
     // the card's three rows tall, its body (and the trail beside it) reaching
     // into that row; a long path there keeps it two rows tall.
     let kitty_rows = match kitty {
-        Some((start, kitty_col, _)) => {
+        Some((start, kitty_col, _)) if place.rows >= 3 => {
             let end = kitty_col + kc + KITTY_MARGIN;
             if seen.blanks(cells, top + 2, start, end) == end - start {
                 3
@@ -1486,15 +1608,36 @@ fn layout<'t>(
                 2
             }
         }
-        None => 2,
+        _ => 2,
     };
     let cols = kitty.map_or(text_end, |(_, _, cols)| cols).min(max_border);
+    // The air: the border stands half a row clear of the box over a pane row
+    // blank across the columns its edge and corners cross (`0..=cols`), each
+    // read once from column 0 and no further than the border's column — a
+    // glyph right of the box costs nothing. None over the pane's first row
+    // (its padding and chrome are not the card's) nor under its last. The
+    // row under a box of the card's own rows (no line under them; three for
+    // Claude Code's card, four for agy's) is the one the line was tried on
+    // wherever one of the line's texts fits between the text column and the
+    // pane's last: read there, it held a glyph where the line would go, and
+    // is not read again. Where none fits, no line test read it, and it is
+    // read for air as the row over the box is.
+    let span = cols + 1;
+    let below = top + rows;
+    let tried = seen
+        .0
+        .iter()
+        .any(|probe| matches!(*probe, Probe::Blanks { row, .. } if row == below));
+    let blank_row = |seen: &mut Seen, row: usize| seen.blanks(cells, row, 0, span) == span;
+    let air_above = top > 0 && blank_row(seen, top - 1);
+    let air_below = below < pane.rows && !tried && blank_row(seen, below);
     Some(Layout {
         rows,
         cols,
         trail: kitty.map(|(start, kitty_col, _)| (start, kitty_col)),
         kitty_col: kitty.map(|(_, kitty_col, _)| kitty_col),
         kitty_rows,
+        air: (air_above, air_below),
         line,
     })
 }
@@ -1539,8 +1682,10 @@ fn u16_of(v: usize) -> u16 {
 /// The scene the emitter draws for a card laid out on `pane`, in WINDOW
 /// pixels: grid cell `(0, 0)` of the pane at `(pad + col_off·cw, grid_top +
 /// (strip + row_off)·ch)`, its rows tagged with their frame rows, the left
-/// border in the window's padding for a pane at the window's left edge, and
-/// the pane's rect as the clip.
+/// border in the window's padding for a pane at the window's left edge, the
+/// top and bottom borders half a row into the pane rows over and under the
+/// box where the layout read them blank ([`Layout::air`]: a row each, both
+/// inside the clip), and the pane's rect as the clip.
 #[allow(
     clippy::too_many_arguments,
     reason = "the scene's own fields, gathered from the pane, the window and the motion seam"
@@ -1551,7 +1696,7 @@ fn scene(
     place: &CardPlace,
     lay: &Layout,
     view: AutopilotView,
-    dark: bool,
+    (dark, ground): (bool, u32),
     serious: bool,
     (coat, eye): (u32, u32),
 ) -> CardScene {
@@ -1565,6 +1710,8 @@ fn scene(
         ch: u16_of(px.ch),
         row_base: u16_of(pane.frame_row(0)),
         pad_left: u16_of(pad_left),
+        pad_above: if lay.air.0 { u16_of(px.ch) } else { 0 },
+        pad_below: if lay.air.1 { u16_of(px.ch) } else { 0 },
         top: u16_of(place.top),
         rows: u16_of(lay.rows),
         cols: u16_of(lay.cols),
@@ -1583,6 +1730,7 @@ fn scene(
             CardPalette::Cruise
         },
         dark,
+        ground,
         serious,
         coat,
         eye,
@@ -1590,9 +1738,9 @@ fn scene(
 }
 
 /// Whether a pane's ground is dark: the card's light is added there, and
-/// inked on a light one.
+/// inked on a light one (`harness_card::dark_ground`, the line's own test).
 fn dark_ground(blank: RenderCell) -> bool {
-    aterm_effects::color_math::relative_luminance(pack(blank.bg)) < 0.5
+    aterm_effects::harness_card::dark_ground(pack(blank.bg))
 }
 
 /// The kitty's width in cells for a card laid for `key`: none in serious
@@ -1627,7 +1775,7 @@ fn lay_out(
         &cells,
         &read.place,
         kitty_width(key),
-        line_texts(key.view, key.end),
+        line_texts_for(read.place.rows, key.view, key.end),
         seen,
     )?;
     let dark = dark_ground(key.blank);
@@ -1639,7 +1787,7 @@ fn lay_out(
         &read.place,
         &lay,
         key.view,
-        dark,
+        (dark, pack(key.blank.bg)),
         key.serious,
         (pack_fill(fills.coat), pack_fill(fills.iris)),
     );
@@ -1670,9 +1818,10 @@ fn make_line(
 ) {
     let frame_row = pane.frame_row(place.row);
     let star_col = pane.frame_col(place.col);
+    let sample_row = read.place.top + read.place.rows.saturating_sub(1).min(2);
     let gray = scratch
         .cells
-        .get(pane.frame_row(read.place.top + 2))
+        .get(pane.frame_row(sample_row))
         .and_then(|row| row.get(pane.frame_col(read.place.text_col)))
         .map_or(ground.fg, |cell| cell.fg);
     let dark = dark_ground(ground);
@@ -1722,11 +1871,14 @@ fn make_line(
         u16_of(frame_row),
         u16_of(line.col),
         u16_of(line.cells.len()),
-        dark,
+        pack(ground.bg),
         animate,
         &mut line.ink,
     );
     line.settled = still;
+    // The `✦` leads the line in its first letter's ink: added light at full
+    // coverage on dark; on light opaque ink, as the letters are (text, held
+    // to AA by `line_ink_into`), never a see-through tint of it.
     let star_rgb = line.ink.first().map_or(pack(ground.fg), |c| pack(c.color));
     line.star = WordDecoration {
         row: u16_of(frame_row),
@@ -1740,7 +1892,7 @@ fn make_line(
             DecoBlend::Over
         },
         color: star_rgb,
-        alpha: if dark { u8::MAX } else { STAR_INK_ALPHA },
+        alpha: u8::MAX,
     };
 }
 

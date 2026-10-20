@@ -221,6 +221,19 @@ kinds! {
     Config => "config",
     Gap => "gap",
     Snap => "snap",
+    // Phase 3B, appended so no kind moves: a run's view of one of its
+    // sources (`source field=transcript state=on|partial|off skipped= dropped=`,
+    // ruling S31), and a post the broker landed (`mail-landed inbox= off=`: a
+    // mark is no node, so the post's `mail` mark cannot be amended, plan §1
+    // item 5). A reader without them maps either to `unknown`.
+    Source => "source",
+    MailLanded => "mail-landed",
+    // Phase 5 (step 5C-1, ruling T21), appended so no kind moves: a worker's
+    // task moved (`task rev= state= attention= why= code=`, the fact of the
+    // timeline's `task-change` row: closed words and counters only). Local:
+    // never bus class, never journaled while D3 is off, no brief line. A
+    // reader without it maps it to `unknown`.
+    Task => "task",
 }
 
 impl Kind {
@@ -294,6 +307,9 @@ impl Kind {
                 | Kind::Link
                 | Kind::Config
                 | Kind::Start
+                | Kind::Source
+                | Kind::MailLanded
+                | Kind::Task
         )
     }
 
@@ -838,26 +854,75 @@ pub const WORD_WORDS: &[&str] = &[
     "failure",
     "unresponsive",
     "exited",
+    // story: the closed set `aterm ctl story <verb>` tells
+    // (`aterm_messages::presence::StoryVerb::TOLD_WORDS`; phase 3B)
+    "approved",
+    "dismissed",
+    "reconnected",
+    "timeout",
+    "exit",
+    "compacted",
+    "warned",
+    "chose",
+    // an inbox receipt's verdict (`aterm_types::fabric_grammar::VERDICTS`)
+    "handled",
+    "refused",
+    "deferred",
 ];
 
 /// Why records were lost (`gap why=`).
 pub const WHY_WORDS: &[&str] = &[
-    "handoff", "crash", "pruned", "evicted", "reset", "unread", "dropped", "unknown",
+    "handoff",
+    "crash",
+    "pruned",
+    "evicted",
+    "reset",
+    "unread",
+    "dropped",
+    "unknown",
+    // phase 5 (5C-1): what moved a worker's task (`task why=`), the closed
+    // `aterm-gui` task vocabulary, held by `task_record`'s tests (T16)
+    "marker",
+    "done-check",
+    "exit",
+    "shell",
+    "startup",
+    "held",
+    "turn",
+    "moved",
 ];
 
 /// The input verbs an `input` mark names.
 pub const VERB_WORDS: &[&str] = &["send", "key", "paste", "feed", "turn", "unknown"];
 
+/// What a control input says it means for the box it dismisses (`key`/`send
+/// act=`, ruling T1): [`crate::ActWord`]'s words, in its order.
+pub const ACT_WORDS: &[&str] = &["approve", "deny", "answer"];
+
 /// A mail's direction.
 pub const DIR_WORDS: &[&str] = &["in", "out", "unknown"];
 
-/// A mail's kind.
-pub const MAIL_KIND_WORDS: &[&str] = &["task", "ask", "answer", "report", "note", "unknown"];
+/// A mail's kind: every kind `deliver` accepts
+/// (`aterm_types::fabric_grammar::KINDS`, held by `vocab_mirror.rs`).
+pub const MAIL_KIND_WORDS: &[&str] = &[
+    "task",
+    "ask",
+    "answer",
+    "report",
+    "note",
+    "unknown",
+    "control",
+    "ack",
+    "expired",
+    "undeliverable",
+];
 
 /// The phases a `status` mark names (the status classifier's words).
-pub const PHASE_WORDS: &[&str] = &["idle", "running", "waiting", "prompt", "exited", "unknown"];
+pub const PHASE_WORDS: &[&str] = &[
+    "idle", "running", "waiting", "prompt", "exited", "unknown", "starting", "quiet",
+];
 
-/// Shell-integration and progress states.
+/// Shell-integration, progress, render and source states.
 pub const STATE_WORDS: &[&str] = &[
     "on",
     "off",
@@ -868,6 +933,32 @@ pub const STATE_WORDS: &[&str] = &[
     "indeterminate",
     "none",
     "unknown",
+    // phase 3B: a degraded shell integration (`ShellIntegrationPosture`), and
+    // the resize ledger's render verdicts
+    "degraded",
+    "desync-risk",
+    "healed",
+    "unjudged",
+    // phase 5 (5C-1): a worker's task state (`task state=`), the closed
+    // `aterm-gui` task states, held by `task_record`'s tests (T16)
+    "working",
+    "done",
+    "exited",
+    "stalled",
+    // phase 5 (5J-2): the fabric link's states (`link state=` on the node
+    // log), `aterm_gui_fabric::fabric_state`'s words; `stalled` is above
+    "connected",
+    "disconnected",
+    "absent",
+];
+
+/// How the previous run of this instance ended (`start prev_end=` on the
+/// node log, 5J): `aterm_update::recovery_ledger::EndClass`'s row tokens, a
+/// caught signal as `signal` with its number in `code=`, and `-` while the
+/// recovery ledger has not been read (a launch that never reads it, a
+/// headless or dev one, keeps `-`).
+pub const END_WORDS: &[&str] = &[
+    "clean", "handoff", "killed", "signal", "panic", "running", "unknown", "none", "-",
 ];
 
 /// What a `cause=` names (`cause_k=`): mail by its offset, or a record.

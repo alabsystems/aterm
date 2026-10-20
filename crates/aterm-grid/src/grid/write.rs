@@ -114,6 +114,20 @@ verify_island! {
                     (h_no_wide : Not row_has_wide) =>
                     fun (h_or : Or span_has_extras row_has_wide) =>
                         Or.elim h_or h_no_span h_no_wide
+
+            -- When map_may_have_row is false (Not row_in_map), no entry in
+            -- CellExtras lives on row, so removing stale extras for row is a
+            -- no-op regardless of cell flag bits.
+            theorem RowMapGateSkipsProbeWhenRowAbsent :
+                forall (row_in_map stale_on_row : Prop),
+                    (stale_on_row -> row_in_map) ->
+                    Not row_in_map ->
+                    Not stale_on_row :=
+                fun (row_in_map stale_on_row : Prop)
+                    (h_imp : stale_on_row -> row_in_map)
+                    (h_no_row : Not row_in_map) =>
+                    fun (h_stale : stale_on_row) =>
+                        h_no_row (h_imp h_stale)
             end StaleExtrasProbeGate
         }
     }
@@ -164,13 +178,17 @@ impl Grid {
 
     /// [`StaleExtras`] for a 1- or 2-cell overwrite at `(row, col)`.
     ///
-    /// Cost: one branch when the extras map is empty (the plain-text case);
-    /// otherwise a flag read per overwritten column and per orphaned wide
-    /// half, and a hash removal ([`Self::remove_stale_extras_pair`]) only for
-    /// flagged columns.
+    /// Cost: one branch when the extras map is empty or the target row holds no
+    /// extras; otherwise a flag read per overwritten column and per orphaned
+    /// wide half, and a hash removal ([`Self::remove_stale_extras_pair`]) only
+    /// for flagged columns.
     #[inline]
     pub(crate) fn stale_extras_pair(&self, row: u16, col: u16, width: u16) -> StaleGlyph {
-        if self.storage.extras.is_empty() {
+        if !self
+            .storage
+            .extras
+            .map_may_have_row(row, usize::from(width).saturating_add(2))
+        {
             return StaleGlyph::default();
         }
         self.stale_extras_pair_cold(row, col, width)
@@ -435,6 +453,12 @@ impl Grid {
                 None
             };
 
+            let row_may_have_extras = scan_stale
+                && self
+                    .storage
+                    .extras
+                    .map_may_have_row(cursor_row, usize::from(self.storage.cols));
+
             let Some((row, effective_cols)) = self.storage.row_mut_with_effective_cols(cursor_row)
             else {
                 break;
@@ -459,7 +483,7 @@ impl Grid {
 
             // Probe before the overwrite clears the HAS_EXTRAS bits; remove once the row
             // borrow ends.
-            let stale = if scan_stale {
+            let stale = if row_may_have_extras {
                 StaleExtras::probe(row, cursor_col, cursor_col + to_write_u16)
             } else {
                 StaleExtras::NONE
@@ -528,6 +552,12 @@ impl Grid {
                 None
             };
 
+            let row_may_have_extras = scan_stale
+                && self
+                    .storage
+                    .extras
+                    .map_may_have_row(cursor_row, usize::from(self.storage.cols));
+
             let Some((row, effective_cols)) = self.storage.row_mut_with_effective_cols(cursor_row)
             else {
                 break;
@@ -550,7 +580,7 @@ impl Grid {
 
             let to_write_u16 = u16::try_from(to_write).unwrap_or(u16::MAX);
 
-            let stale = if scan_stale {
+            let stale = if row_may_have_extras {
                 StaleExtras::probe(row, cursor_col, cursor_col + to_write_u16)
             } else {
                 StaleExtras::NONE
@@ -651,6 +681,12 @@ impl Grid {
                 None
             };
 
+            let row_may_have_extras = scan_stale
+                && self
+                    .storage
+                    .extras
+                    .map_may_have_row(cursor_row, usize::from(self.storage.cols));
+
             let Some((row, effective_cols)) = self.storage.row_mut_with_effective_cols(cursor_row)
             else {
                 break;
@@ -674,7 +710,7 @@ impl Grid {
 
             let to_write_u16 = u16::try_from(to_write).unwrap_or(u16::MAX);
 
-            let stale = if scan_stale {
+            let stale = if row_may_have_extras {
                 StaleExtras::probe(row, cursor_col, cursor_col + to_write_u16)
             } else {
                 StaleExtras::NONE

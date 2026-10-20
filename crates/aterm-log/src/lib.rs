@@ -73,15 +73,86 @@ pub enum Level {
     Trace = 5,
 }
 
+impl Level {
+    /// Return the uppercase string representation of this level.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "ERROR",
+            Self::Warn => "WARN",
+            Self::Info => "INFO",
+            Self::Debug => "DEBUG",
+            Self::Trace => "TRACE",
+        }
+    }
+
+    /// Return `true` when this level is `Error` or `Warn`.
+    #[must_use]
+    pub const fn is_error_or_warn(self) -> bool {
+        matches!(self, Self::Error | Self::Warn)
+    }
+
+    /// Return the numeric rank (`1 = Error` .. `5 = Trace`).
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Error => 1,
+            Self::Warn => 2,
+            Self::Info => 3,
+            Self::Debug => 4,
+            Self::Trace => 5,
+        }
+    }
+}
+
+/// Encode a compact log record header (`timestamp_ns`, `level_rank`, `line`) into 16 LE bytes.
+#[must_use]
+pub const fn encode_log_header_le(timestamp_ns: u64, level_rank: u32, line: u32) -> [u8; 16] {
+    [
+        timestamp_ns as u8,
+        (timestamp_ns >> 8) as u8,
+        (timestamp_ns >> 16) as u8,
+        (timestamp_ns >> 24) as u8,
+        (timestamp_ns >> 32) as u8,
+        (timestamp_ns >> 40) as u8,
+        (timestamp_ns >> 48) as u8,
+        (timestamp_ns >> 56) as u8,
+        level_rank as u8,
+        (level_rank >> 8) as u8,
+        (level_rank >> 16) as u8,
+        (level_rank >> 24) as u8,
+        line as u8,
+        (line >> 8) as u8,
+        (line >> 16) as u8,
+        (line >> 24) as u8,
+    ]
+}
+
+/// Decode 16 LE bytes into a compact log record header (`timestamp_ns`, `level_rank`, `line`).
+#[must_use]
+pub const fn decode_log_header_le(bytes: [u8; 16]) -> (u64, u32, u32) {
+    let ts = (bytes[0] as u64)
+        | ((bytes[1] as u64) << 8)
+        | ((bytes[2] as u64) << 16)
+        | ((bytes[3] as u64) << 24)
+        | ((bytes[4] as u64) << 32)
+        | ((bytes[5] as u64) << 40)
+        | ((bytes[6] as u64) << 48)
+        | ((bytes[7] as u64) << 56);
+    let lvl = (bytes[8] as u32)
+        | ((bytes[9] as u32) << 8)
+        | ((bytes[10] as u32) << 16)
+        | ((bytes[11] as u32) << 24);
+    let line = (bytes[12] as u32)
+        | ((bytes[13] as u32) << 8)
+        | ((bytes[14] as u32) << 16)
+        | ((bytes[15] as u32) << 24);
+    (ts, lvl, line)
+}
+
 impl fmt::Display for Level {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Error => f.write_str("ERROR"),
-            Self::Warn => f.write_str("WARN"),
-            Self::Info => f.write_str("INFO"),
-            Self::Debug => f.write_str("DEBUG"),
-            Self::Trace => f.write_str("TRACE"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -254,7 +325,13 @@ pub fn sanitize_record_for(level: Level, msg: &str) -> Cow<'_, str> {
 /// The one sanitizer behind [`sanitize_record`] and [`sanitize_record_for`];
 /// `cap` is at most [`MAX_ALERT_RECORD_BYTES`].
 fn sanitize_capped(msg: &str, cap: usize) -> Cow<'_, str> {
-    let clean = !msg.chars().any(char::is_control);
+    let mut clean = true;
+    for c in msg.chars() {
+        if c.is_control() {
+            clean = false;
+            break;
+        }
+    }
     if clean && msg.len() <= cap {
         return Cow::Borrowed(msg);
     }
@@ -262,17 +339,21 @@ fn sanitize_capped(msg: &str, cap: usize) -> Cow<'_, str> {
     // at most `cap <= MAX_ALERT_RECORD_BYTES` plus a 3-byte `…`. The add lives in
     // a `const` so `with_capacity` receives a plain literal.
     const OUT_CAPACITY: usize = MAX_ALERT_RECORD_BYTES + 4;
-    let cap = cap.min(MAX_ALERT_RECORD_BYTES);
+    let cap = if cap > MAX_ALERT_RECORD_BYTES {
+        MAX_ALERT_RECORD_BYTES
+    } else {
+        cap
+    };
     let mut out = String::with_capacity(OUT_CAPACITY);
     for c in msg.chars() {
         // Measure the bytes actually pushed: a 1-byte control char becomes a
         // 3-byte U+FFFD, and the original width would overrun the reservation.
         let (pushed, pushed_len) = if c.is_control() {
-            ('\u{FFFD}', '\u{FFFD}'.len_utf8())
+            ('\u{FFFD}', 3usize)
         } else {
             (c, c.len_utf8())
         };
-        if out.len().saturating_add(pushed_len) > cap {
+        if out.len() > cap || cap - out.len() < pushed_len {
             out.push('…');
             break;
         }
@@ -376,7 +457,10 @@ pub fn set_max_level(level: LevelFilter) {
 ///
 /// Returns `SetLoggerError` if a logger has already been set.
 pub fn set_logger(logger: &'static dyn Log) -> Result<(), SetLoggerError> {
-    LOGGER.set(logger).map_err(|_| SetLoggerError(()))
+    match LOGGER.set(logger) {
+        Ok(()) => Ok(()),
+        Err(_) => Err(SetLoggerError(())),
+    }
 }
 
 /// Error returned when `set_logger` is called more than once.
@@ -531,9 +615,10 @@ pub mod env {
     /// `lock` would carry no `.lock()` token at its call sites and hide those
     /// holds from the graph.
     fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        match ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     /// The one blessed `remove_var`. Callers hold [`ENV_LOCK`].

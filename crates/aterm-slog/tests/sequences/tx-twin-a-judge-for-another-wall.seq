@@ -1,0 +1,14 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_judge_for_another_wall_or_a_partial_build_writes_nothing (§2.6,
+# S9).
+bind 0
+see busy
+see wall:usage-session
+expect open p1 wall par=t1
+tx wall overloaded confirm
+tx wall overloaded refute
+state partial
+tx wall usage-session refute
+expect mark r1 source state=on
+expect mark r1 source state=partial
+expect need=wall:usage-session

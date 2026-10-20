@@ -2,8 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 use crate::{App, WindowId, term_lock};
-use winit::event::{ElementState, KeyEvent};
-use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr};
+use aterm_window::event::{ElementState, KeyEvent};
+use aterm_window::keyboard::{
+    Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr,
+};
 
 /// A pressed key event shaped like the platform's: `text` is what winit reports,
 /// including the control strings for ⎋ (`\u{1b}`), ⏎ (`\r`) and ⇥ (`\t`), which
@@ -449,7 +451,7 @@ fn every_seeded_paste_spelling_pastes_into_the_query() {
 #[test]
 fn ctrl_named_keys_are_word_motions_in_the_field_off_macos() {
     use crate::app_search::SearchEdit;
-    let classify = |mods, ev: &winit::event::KeyEvent| super::field_edit_action(mods, ev);
+    let classify = |mods, ev: &aterm_window::event::KeyEvent| super::field_edit_action(mods, ev);
     let ctrl = ModifiersState::CONTROL;
     assert_eq!(
         classify(ctrl, &named(NamedKey::ArrowLeft)),
@@ -497,7 +499,7 @@ fn ctrl_named_keys_are_word_motions_in_the_field_off_macos() {
 #[test]
 fn ctrl_named_keys_stay_character_motions_on_macos() {
     use crate::app_search::SearchEdit;
-    let classify = |mods, ev: &winit::event::KeyEvent| super::field_edit_action(mods, ev);
+    let classify = |mods, ev: &aterm_window::event::KeyEvent| super::field_edit_action(mods, ev);
     let ctrl = ModifiersState::CONTROL;
     assert_eq!(
         classify(ctrl, &named(NamedKey::ArrowLeft)),
@@ -510,5 +512,42 @@ fn ctrl_named_keys_stay_character_motions_on_macos() {
     assert_eq!(
         classify(ctrl, &named(NamedKey::Delete)),
         Some(SearchEdit::DeleteForward)
+    );
+}
+
+/// Off macOS F3 / Shift+F3 step to the next / previous match while the field is
+/// open — the Windows find-next reflex the hint row teaches there — and type
+/// nothing into the query. With Ctrl held F3 is not the field's.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn f3_and_shift_f3_step_the_matches_off_macos() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let term = app.pool.get(0).expect("session 0").term.clone();
+    term_lock(&term).process(b"hit one\r\nhit two\r\nhit three\r\n");
+    app.search_enter();
+    type_str(&mut app, wid, "hit");
+    let current = |app: &App| app.windows[&wid].search.as_ref().map(|s| s.current);
+    let start = current(&app).expect("the field is open");
+    app.on_key(wid, named(NamedKey::F3));
+    assert_eq!(
+        current(&app),
+        Some((start + 1) % 3),
+        "F3 steps to the next match"
+    );
+    set_mods(&mut app, wid, ModifiersState::SHIFT);
+    app.on_key(wid, named(NamedKey::F3));
+    set_mods(&mut app, wid, ModifiersState::empty());
+    assert_eq!(current(&app), Some(start), "Shift+F3 steps back");
+    assert_eq!(
+        query(&app, wid),
+        Some(("hit".to_string(), 3)),
+        "nothing typed"
+    );
+    let ev = named(NamedKey::F3);
+    assert!(
+        app.search_repeat_action(wid, ModifiersState::CONTROL, &ev)
+            .is_none(),
+        "Ctrl+F3 is not the field's"
     );
 }

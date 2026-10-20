@@ -711,17 +711,16 @@ fn one_take_per_pass_never_invents_a_loss() {
         }
         wrong
     };
-    for seed in 1..=300u64 {
-        for mark in [true, false] {
-            let wrong = walk(seed, mark, false);
-            assert!(wrong.is_empty(), "seed {seed} mark={mark}: {wrong:?}");
-        }
+    let walks: Vec<(u64, bool)> = (1..=300u64)
+        .flat_map(|seed| [(seed, true), (seed, false)])
+        .collect();
+    let wrongs = aterm_spec::check::each(&walks, |&(seed, mark)| walk(seed, mark, false));
+    for (&(seed, mark), wrong) in walks.iter().zip(wrongs) {
+        assert!(wrong.is_empty(), "seed {seed} mark={mark}: {wrong:?}");
     }
-    let caught = (1..=300u64)
-        .filter(|s| !walk(*s, false, true).is_empty())
-        .count();
+    // Caught first on seed 4, and on 15 of the 300 (2026-10-17).
     assert!(
-        caught > 0,
+        (1..=300u64).any(|s| !walk(s, false, true).is_empty()),
         "the writer and reader before the fix are caught"
     );
 }

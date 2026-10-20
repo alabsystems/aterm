@@ -99,6 +99,10 @@ impl Realm {
             #[cfg(any(unix, test))]
             crate::control::Scope::Bridge => Self::Bridge,
             crate::control::Scope::Owner | crate::control::Scope::Edge(_) => Self::Local,
+            // The fleet gate admits no keyed verb; named with the local scopes,
+            // never the bridge's namespace.
+            #[cfg(any(unix, test))]
+            crate::control::Scope::Fleet { .. } => Self::Local,
         }
     }
 }
@@ -455,11 +459,29 @@ pub(crate) fn empty_payload_refusal(key: Option<&str>, payload_is_empty: bool) -
 /// `key` is the raw `id=` value; `None` runs `attempt` unguarded (the key is
 /// opt-in per request). `scope` picks the mark's [`Realm`]; `verb` picks the
 /// duplicate reply's framing.
+#[cfg(test)]
 pub(crate) fn guarded<F>(
     ctx: &SessionCtx,
     scope: crate::control::Scope,
     verb: &str,
     key: Option<&str>,
+    attempt: F,
+) -> String
+where
+    F: FnOnce() -> String,
+{
+    guarded_waking(ctx, scope, verb, key, &|| {}, attempt)
+}
+
+/// [`guarded`], calling `wake` (the control worker's, for this session's
+/// watchers) once the session log's readers are owed one: an `in-doubt`
+/// mark was written, after its timeline hold was released.
+pub(crate) fn guarded_waking<F>(
+    ctx: &SessionCtx,
+    scope: crate::control::Scope,
+    verb: &str,
+    key: Option<&str>,
+    wake: &dyn Fn(),
     attempt: F,
 ) -> String
 where
@@ -490,7 +512,9 @@ where
         // what a human (or the next `timeline since=`) reads afterwards. Recorded
         // after the mark is settled, so the marks lock is never held across the
         // timeline lock.
-        record_in_doubt(ctx, key, &reply);
+        if record_in_doubt(ctx, verb, key, &reply) {
+            wake();
+        }
     }
     reply
 }
@@ -498,26 +522,29 @@ where
 /// Append the `in-doubt` row: a per-session record, not a fabric event kind. It
 /// carries the producer, the sequence and the reply's first two tokens joined with
 /// `-` (`ERR-write` for `ERR write failed`), never the input bytes or the reply's
-/// tail (a `turn` reply is a whole screen).
-fn record_in_doubt(ctx: &SessionCtx, key: Key, reply: &str) {
+/// tail (a `turn` reply is a whole screen). The session log's `in-doubt` mark
+/// goes in the same hold, named by the verb alone; the answer is whether its
+/// readers are owed a wake.
+pub(crate) fn record_in_doubt(ctx: &SessionCtx, verb: &str, key: Key, reply: &str) -> bool {
     let why = reply
         .trim_end_matches(['\r', '\n'])
         .split_whitespace()
         .take(2)
         .collect::<Vec<_>>()
         .join("-");
-    ctx.timeline
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .record(
-            "in-doubt",
-            format!(
-                "producer={} seq={} reply={}",
-                key.producer,
-                key.seq,
-                aterm_control::wire::pct_encode(&why)
-            ),
-        );
+    let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+    tl.record(
+        "in-doubt",
+        format!(
+            "producer={} seq={} reply={}",
+            key.producer,
+            key.seq,
+            aterm_control::wire::pct_encode(&why)
+        ),
+    );
+    let at = tl.slog().now();
+    tl.slog_mut().observe_in_doubt(verb, at);
+    tl.slog_take_wake()
 }
 
 #[cfg(test)]

@@ -113,9 +113,67 @@ pub fn via_ok(via: &str) -> bool {
         && via.split(',').all(is_principal)
 }
 
+/// What an instance tells its bridge before the bridge's lanes close (design
+/// §6, "the roster tells the truth"): `EVENT * bye <word>` on the push lane,
+/// which the bridge takes with `link bye <word>` on its verb lane.
+///
+/// The two ends of one exit that look alike from the bridge — both are the
+/// lanes closing — and need opposite roster answers:
+///
+/// * [`Bye::Quit`]: the instance is quitting and its sessions end with it. The
+///   bridge WITHDRAWS every session it hosts — one `state=exited` row each —
+///   so a post to one is refused at the sender rather than queued for a
+///   session that will never fetch it.
+/// * [`Bye::Handoff`]: a seamless self-update is committing. The bridge
+///   publishes NO exited row: the successor adopts the same sessions under the
+///   same sids and its own bridge re-advertises them.
+///
+/// No word at all — a crash, a `kill -9`, an instance older than the word —
+/// reads like a handoff: nothing is withdrawn, the node's will reads `away`,
+/// and mail to its sessions queues on the bus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bye {
+    /// The instance is quitting: withdraw its sessions.
+    Quit,
+    /// A seamless update is committing: the successor re-attaches.
+    Handoff,
+}
+
+impl Bye {
+    /// The wire word: `quit` or `handoff`.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Bye::Quit => "quit",
+            Bye::Handoff => "handoff",
+        }
+    }
+
+    /// The word back, or `None` for anything else.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "quit" => Some(Bye::Quit),
+            "handoff" => Some(Bye::Handoff),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bye's word reads back as itself, and nothing else reads as a bye.
+    #[test]
+    fn a_bye_word_round_trips_and_nothing_else_parses() {
+        for bye in [Bye::Quit, Bye::Handoff] {
+            assert_eq!(Bye::parse(bye.word()), Some(bye));
+        }
+        for other in ["", "Quit", "exit", "quit ", "handoff=1"] {
+            assert_eq!(Bye::parse(other), None, "{other:?}");
+        }
+    }
 
     /// Principals are bounded and class-prefixed, at every class and both name-bound ends.
     #[test]

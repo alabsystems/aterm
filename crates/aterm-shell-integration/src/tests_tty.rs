@@ -44,7 +44,8 @@ const ZSH_TTY_CALLS: [&str; 2] = [
     "    (( __aterm_tty_frozen || last_status == 0 )) || __aterm_tty_repair\n",
 ];
 #[cfg(unix)]
-const BASH_TTY_CALLS: [&str; 1] = ["    [[ \"$last_status\" == 0 ]] || __aterm_tty_repair\n"];
+const BASH_TTY_CALLS: [&str; 1] =
+    ["    [[ \"$last_status\" == 0 ]] && ! __aterm_line_ran_a_second || __aterm_tty_repair\n"];
 
 /// How a raw-mode program ends.
 #[cfg(unix)]
@@ -53,6 +54,9 @@ enum RawEnd {
     Sigkill,
     Exit1,
     Exit0,
+    /// `exit 0` after running 1.2 s: what a full-screen program killed from outside
+    /// reports under MSYS2.
+    Exit0Late,
 }
 
 #[cfg(unix)]
@@ -65,6 +69,7 @@ impl RawEnd {
             Self::Sigkill => "sh -c 'stty raw -echo; echo RAW$((40+2)); kill -KILL $$'",
             Self::Exit1 => "sh -c 'stty raw -echo; echo RAW$((40+2)); exit 1'",
             Self::Exit0 => "sh -c 'stty raw -echo; echo RAW$((40+2)); exit 0'",
+            Self::Exit0Late => "sh -c 'stty raw -echo; echo RAW$((40+2)); sleep 1.2; exit 0'",
         }
     }
 
@@ -72,7 +77,7 @@ impl RawEnd {
         match self {
             Self::Sigkill => "137",
             Self::Exit1 => "1",
-            Self::Exit0 => "0",
+            Self::Exit0 | Self::Exit0Late => "0",
         }
     }
 }
@@ -334,9 +339,24 @@ fn folder_with_edits(root: &Path, rev: &str, edits: &[ScriptEdits<'_>]) -> PathB
 
 /// An interactive `shell` on a real pty (`script`, macOS or util-linux
 /// spelling), started from the integration folder `dir` the way aterm starts a
-/// tab, in the fixture's home, with `extra` in its environment.
+/// tab, in the fixture's home, with `extra` in its environment; returned at
+/// its first prompt's `133;A`.
 #[cfg(unix)]
 fn spawn_pty_shell(
+    shell: ShellType,
+    program: &str,
+    fx: &LiveFixture,
+    dir: &Path,
+    extra: &[(&str, &str)],
+) -> LiveShell {
+    let mut sh = spawn_pty_shell_unwaited(shell, program, fx, dir, extra);
+    sh.wait_for_after("\x1b]133;A", 0);
+    sh
+}
+
+/// [`spawn_pty_shell`], returned as soon as it is spawned.
+#[cfg(unix)]
+fn spawn_pty_shell_unwaited(
     shell: ShellType,
     program: &str,
     fx: &LiveFixture,
@@ -360,7 +380,12 @@ fn spawn_pty_shell(
             .iter()
             .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
             .collect();
-        cmd.args(["-q", "-c", &quoted.join(" "), "/dev/null"]);
+        // util-linux runs `-c`'s line through `$SHELL -c`: /bin/sh here, never a
+        // bash that reads `~/.bashrc` on the way (Debian's does for a `-c` run
+        // over ssh, `SSH_CLIENT` set), which ran the rig's startup file before
+        // the shell under test began.
+        cmd.args(["-q", "-c", &quoted.join(" "), "/dev/null"])
+            .env("SHELL", "/bin/sh");
     }
     // The hermetic environment of `shell_command`, applied to `script` (the
     // shell inherits it), then the fixture's home and the injection.
@@ -393,9 +418,7 @@ fn spawn_pty_shell(
         ShellType::Zsh => "zsh",
         _ => "bash",
     };
-    let mut sh = LiveShell::spawn(label, &mut cmd).holding(hermetic.into_home());
-    sh.wait_for_after("\x1b]133;A", 0);
-    sh
+    LiveShell::spawn(label, &mut cmd).holding(hermetic.into_home())
 }
 
 /// A zsh and a pty, or COULD NOT RUN that says which is missing.
@@ -473,6 +496,121 @@ fn an_integrated_zsh_whose_rc_broke_the_tty_runs_its_first_command_sane() {
     sh.kill_raw_child(RawEnd::Exit0);
     assert_tty_usable(&mut sh, "a raw child's exit 0 after the repair", false);
     sh.finish();
+}
+
+/// The zsh line that has the line editor take a fresh shell's deferred tty
+/// read the moment it answers (and repair the tty its first prompt runs in);
+/// cut, the scripts are as they were before 2026-10-17 in everything that
+/// matters here: the read waits for the first command.
+#[cfg(unix)]
+const ZSH_FIRST_INTR_CALL: &str =
+    "        zle -F $__aterm_tty_probe_fd __aterm_tty_probe_ready 2>/dev/null\n";
+
+/// The key typed right after a Ctrl-C at a zsh prompt. zsh 5.9's line editor
+/// looks for an interrupt only between keys (`zlecore`'s loop, then
+/// `getbyte`'s blocking `read`, zle_main.c): a SIGINT it takes after that look
+/// and before the read — the ^C landing while the editor is still busy, which
+/// load makes likely — ends the line only when one more byte arrives, and a
+/// ^C flushes the bytes typed ahead of it. Measured 2026-10-19 under 16
+/// parallel runs: a bare `zsh -i` (no aterm scripts) drew no prompt for 8 s,
+/// then took the interrupt at the next byte, 2 times in 640 and 0 in 640 with
+/// this key after the ^C; this test, beside its own copies and the suite, 15
+/// in 480, sampled in `getbyte`'s `read` with ISIG on. The kernel's flush for
+/// the ^C runs before the key is queued, so the key ends the dying line there,
+/// or leads the next line as a harmless space where the interrupt already
+/// took the line. A self-insert in both keymaps, so a ^C that is only a byte
+/// keeps the line.
+#[cfg(unix)]
+const ZLE_INTR_WAKE: &[u8] = b" ";
+
+/// A NEW integrated zsh whose rc left the tty raw (`stty raw -isig`): a
+/// Ctrl-C at its FIRST prompt — no command yet, so the deferred read is not
+/// taken at a preexec — drops the line it was typed on, as a working Ctrl-C
+/// does (`$?` 130), and the tty is repaired: in the emacs keymap and in viins.
+/// Once the read answers the line editor redraws the prompt on the repaired
+/// tty, which is what the test waits for before it types. The ^C waits for
+/// the typed line to be drawn and is followed by a space, as a user types on
+/// (both explained at the ^C). The same rc without the editor's watch on the
+/// read is the negative control: the ^C is a byte the editor beeps at, and
+/// the line survives into the next command.
+#[cfg(unix)]
+#[test]
+fn an_integrated_zsh_whose_rc_left_the_tty_raw_takes_ctrl_c_at_its_first_prompt() {
+    let zsh = live_pty_zsh();
+    let fx = LiveFixture::new();
+    let ours = install_script_set(&fx.base).expect("install");
+    let unfixed = folder_with_edits(
+        &fx.base,
+        "00000000000000ab",
+        &[("zsh", scripts::ZSH, &[(ZSH_FIRST_INTR_CALL, "")])],
+    );
+    let raw_rc = "PS1='@@P@@ '\nstty raw -isig\n";
+    for (dir, rc, fixed) in [
+        (&unfixed, raw_rc.to_owned(), false),
+        (&ours, raw_rc.to_owned(), true),
+        (&ours, format!("bindkey -v\n{raw_rc}"), true),
+    ] {
+        std::fs::write(fx.home.join(".zshrc"), &rc).expect(".zshrc");
+        let mut sh = spawn_pty_shell(ShellType::Zsh, zsh, &fx, dir, &[]);
+        let at = sh.wait_for_zle(0);
+        if fixed {
+            // The prompt drawn again, on the repaired tty.
+            sh.wait_for_after("@@P@@", at);
+        }
+        // The markers are computed, so the echoed lines never match them.
+        let typed = sh.len();
+        sh.send_bytes(b"echo LO$((7*7))");
+        // The ^C goes in once the editor has drawn the line to its end, so has
+        // read all of it and has nothing more to write. A ^C flushes the tty's
+        // output too, and `script` sets its pty master non-blocking and stops
+        // relaying for good when a read of it finds nothing (macOS shell_cmds
+        // script.c: `if (cc <= 0) break;`, then `finish()` waits for the
+        // shell): a ^C that lands with the editor's echo in flight empties the
+        // queue between `script`'s select and its read, and the shell then
+        // waits forever in `tcsetattr(TCSADRAIN)` for an output nobody drains
+        // (sampled 2026-10-19 with the space alone, 1 in 480 beside the suite:
+        // zsh in `hend` → `settyinfo`, `script` in `wait4`).
+        let from = sh.wait_for_after("))", typed);
+        sh.send_bytes(b"\x03");
+        sh.send_bytes(ZLE_INTR_WAKE);
+        if fixed {
+            // An interrupt flushes the tty's input: type on only at the next
+            // prompt. The control's ^C is a byte, and there is none.
+            let next = sh.wait_for_after("\x1b]133;A", from);
+            sh.wait_for_zle(next);
+        }
+        let from = sh.len();
+        sh.send_bytes(b"echo KEPT$((40+2)) $?\r");
+        let kept = sh.wait_for_after("KEPT42", from);
+        let ran = cut_osc(&stdout_between(&sh, from, kept));
+        // What the command printed ahead of the marker, on the marker's line.
+        let line = ran
+            .strip_suffix("KEPT42")
+            .and_then(|r| r.rsplit(['\n', '\r']).next())
+            .unwrap_or_default()
+            .to_owned();
+        let done = sh.wait_for_after("\x1b]133;D;", kept);
+        let status = cut_osc(&stdout_between(&sh, kept, done));
+        sh.wait_for_after("\x1b]133;A", done);
+        if fixed {
+            assert_eq!(
+                (line.as_str(), status.split_whitespace().next()),
+                ("", Some("130")),
+                "zsh ({rc:?}): the first prompt's Ctrl-C dropped its line as an \
+                 interrupt does; the next command printed `{line}KEPT42{status}`\n{}",
+                sh.transcript()
+            );
+            assert_tty_usable(&mut sh, "after the first prompt's Ctrl-C", false);
+        } else {
+            assert_eq!(
+                line,
+                "LO49 echo ",
+                "zsh: the control must keep the line the inert ^C was typed on\n{}",
+                sh.transcript()
+            );
+        }
+        sh.finish();
+    }
 }
 
 /// A user whose rc defines `stty` as a FUNCTION (or `reset` as an ALIAS) keeps
@@ -566,9 +704,10 @@ fn a_running_zsh_with_a_broken_tty_is_repaired_by_the_body_the_loader_delivers()
 }
 
 /// bash: after a raw child's `exit 1` (which bash adopts — it restores the tty
-/// only after a SIGNAL death) the next command's tty is sane, and a SIGKILL
-/// stays fine; a deliberate `stty -ixon` survives. The unfixed scripts are the
-/// negative control, on the `exit 1` that breaks them.
+/// only after a SIGNAL death), and after an `exit 0` from one that ran a second,
+/// the next command's tty is sane, and a SIGKILL stays fine; a deliberate `stty
+/// -ixon` survives. The unfixed scripts are the negative control, on the `exit 1`
+/// that breaks them.
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_repairs_its_tty_after_a_raw_program_fails() {
@@ -588,7 +727,11 @@ fn an_integrated_bash_repairs_its_tty_after_a_raw_program_fails() {
     // bash's own restore after a SIGNAL death puts IXON back too; the repair
     // after an `exit 1` cannot tell a raw mode's IXON-off from the user's and
     // leaves it off (which bash then keeps, as the state it saved).
-    for (end, ixon) in [(RawEnd::Sigkill, true), (RawEnd::Exit1, false)] {
+    for (end, ixon) in [
+        (RawEnd::Sigkill, true),
+        (RawEnd::Exit1, false),
+        (RawEnd::Exit0Late, false),
+    ] {
         sh.kill_raw_child(end);
         assert_tty_usable(&mut sh, &format!("after a raw child's {end:?}"), ixon);
     }
@@ -1209,10 +1352,12 @@ fn an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms() {
         let users = if frame.starts_with("__aterm") {
             matches!(*line, "eval 'echo pc$((40+2))'" | "echo pc42")
         } else {
+            // The hooks' own calls: the DEBUG trap's, PROMPT_COMMAND's and, on
+            // bash 5.3+, PS0's.
             !line.contains("__aterm")
                 || matches!(
                     line.split_whitespace().next(),
-                    Some("__aterm_preexec" | "__aterm_prompt_command")
+                    Some("__aterm_preexec" | "__aterm_prompt_command" | "__aterm_ps0")
                 )
         };
         assert!(
@@ -1322,6 +1467,200 @@ fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bas
     sh.finish();
 }
 
+/// THE RC'S DEBUG TRAP (2026-10-17): a DEBUG trap the user's rc sets — two
+/// lines, a single quote inside — runs, chained, for a typed command, and
+/// aterm's own preexec still marks that command (`133;C`): with a re-key path,
+/// where the wrapper hands the trap over in `<re-key path>.trap` (which then
+/// holds it as `trap -p` prints it — no fork), and without one. NEGATIVE
+/// CONTROL: the same scripts with the wrapper's hand-over cut, where the
+/// integration's own `trap -p DEBUG` inside the `.` sees no trap: bash 3.2
+/// puts the rc's trap back over aterm's when the `.` returns (no mark), bash
+/// 4.4 and later keep aterm's and drop the rc's (no output) — never both.
+#[cfg(unix)]
+#[test]
+fn an_integrated_bash_chains_the_debug_trap_its_rc_set() {
+    need_pty_script();
+    let bash = bash_shell();
+    let fx = LiveFixture::new();
+    std::fs::write(
+        fx.home.join(".bashrc"),
+        "trap '[[ $BASH_COMMAND != \"echo typed\"* ]] ||\n  echo \"DBG'\\''$((40+2))\"' DEBUG\n",
+    )
+    .expect(".bashrc");
+    let ours = install_script_set(&fx.base).expect("install");
+    let unhanded = folder_with_edits(&fx.base, "00000000000000ac", &[]);
+    // The loader this platform starts bash on: `bash/bashrc` off macOS.
+    let rcfile = unhanded.join("bash").join(BASH_LOADER_FILE);
+    let wrapper = std::fs::read_to_string(&rcfile).expect("the control's loader");
+    assert_eq!(
+        wrapper.matches(bash_debug_trap_handover!()).count(),
+        1,
+        "the hand-over moved — keep the control in step"
+    );
+    std::fs::write(&rcfile, wrapper.replace(bash_debug_trap_handover!(), "")).expect("rcfile");
+    let rekey_dir = fx.base.join("rekey");
+    std::fs::create_dir_all(&rekey_dir).expect("re-key dir");
+    let sid = "s-0123456789abcdef0123";
+    let rekey = rekey_dir.join(sid);
+    let trap_file = rekey_dir.join(format!("{sid}{DEBUG_TRAP_SUFFIX}"));
+    let rekey = rekey.to_str().expect("UTF-8");
+    for (dir, channel, fixed) in [
+        (&unhanded, true, false),
+        (&ours, true, true),
+        (&ours, false, true),
+    ] {
+        let _ = std::fs::remove_file(&trap_file);
+        let extra: &[(&str, &str)] = if channel {
+            &[(REKEY_PATH_VAR, rekey)]
+        } else {
+            &[]
+        };
+        let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, dir, extra);
+        let from = sh.len();
+        sh.send_bytes(b"echo typed$((6*7))\r");
+        let ran = sh.wait_for_after("typed42", from);
+        let done = sh.wait_for_after("\x1b]133;A", ran);
+        let text = stdout_between(&sh, from, done);
+        let (chained, marked) = (text.contains("DBG'42"), text.contains("\x1b]133;C"));
+        if fixed {
+            assert!(
+                chained && marked,
+                "bash (channel {channel}): the rc's DEBUG trap ran (chained {chained}) and \
+                 aterm marked the command (marked {marked})\n{}",
+                sh.transcript()
+            );
+            let handed = std::fs::read_to_string(&trap_file).ok();
+            assert_eq!(
+                handed.as_deref(),
+                channel.then_some(
+                    "trap -- '[[ $BASH_COMMAND != \"echo typed\"* ]] ||\n  echo \"DBG'\\''$((40+2))\"' DEBUG\n"
+                ),
+                "bash (channel {channel}): the wrapper hands the trap over in the session \
+                 file exactly when there is one"
+            );
+        } else {
+            assert!(
+                !(chained && marked),
+                "bash: the control must lose the rc's trap or aterm's mark\n{}",
+                sh.transcript()
+            );
+        }
+        sh.finish();
+    }
+}
+
+/// The guard on the wrapper's DEBUG-trap hand-over: only a fresh load takes it.
+#[cfg(unix)]
+const BASH_HANDOVER_GUARD: &str = "if [ -z \"${ATERM_SHELL_INTEGRATION_INSTALLED:-}\" ]; then\n";
+
+/// A `.bashrc` that sources the integration itself (the line its header gives
+/// for a shell aterm did not start) keeps aterm's command marks in an aterm
+/// tab, with a re-key path and without: that load wired the DEBUG trap, and
+/// the wrapper's own load is then an upgrade in place that wires nothing, so
+/// the wrapper hands nothing over. NEGATIVE CONTROL: the hand-over unguarded,
+/// as 195c01197d wrote it, clears the trap the rc's load set, and the typed
+/// command goes unmarked.
+#[cfg(unix)]
+#[test]
+fn an_integrated_bash_whose_rc_sources_the_integration_keeps_its_marks() {
+    need_pty_script();
+    let bash = bash_shell();
+    let fx = LiveFixture::new();
+    std::fs::write(
+        fx.home.join(".bashrc"),
+        ". \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.bash\"\n",
+    )
+    .expect(".bashrc");
+    let ours = install_script_set(&fx.base).expect("install");
+    let unguarded = folder_with_edits(&fx.base, "00000000000000ad", &[]);
+    // The loader this platform starts bash on: `bash/bashrc` off macOS.
+    let rcfile = unguarded.join("bash").join(BASH_LOADER_FILE);
+    let wrapper = std::fs::read_to_string(&rcfile).expect("the control's loader");
+    assert_eq!(
+        wrapper.matches(BASH_HANDOVER_GUARD).count(),
+        1,
+        "the guard moved — keep the control in step"
+    );
+    std::fs::write(
+        &rcfile,
+        wrapper.replace(BASH_HANDOVER_GUARD, "if :; then\n"),
+    )
+    .expect("rcfile");
+    let rekey_dir = fx.base.join("rekey");
+    std::fs::create_dir_all(&rekey_dir).expect("re-key dir");
+    let rekey = rekey_dir.join("s-0123456789abcdef0124");
+    let rekey = rekey.to_str().expect("UTF-8");
+    for (dir, channel, fixed) in [
+        (&unguarded, true, false),
+        (&ours, true, true),
+        (&ours, false, true),
+    ] {
+        let extra: &[(&str, &str)] = if channel {
+            &[(REKEY_PATH_VAR, rekey)]
+        } else {
+            &[]
+        };
+        let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, dir, extra);
+        let from = sh.len();
+        sh.send_bytes(b"echo typed$((6*7))\r");
+        let ran = sh.wait_for_after("typed42", from);
+        let done = sh.wait_for_after("\x1b]133;A", ran);
+        let marked = stdout_between(&sh, from, done).contains("\x1b]133;C");
+        assert_eq!(
+            marked,
+            fixed,
+            "bash (channel {channel}, guarded {fixed}): aterm marked the typed command\n{}",
+            sh.transcript()
+        );
+        sh.finish();
+    }
+}
+
+/// The integration's read of the handed-over DEBUG trap (`read -d ''`, which
+/// answers 1 at the file's end) is no failed command to a `.bashrc`'s ERR trap
+/// or its `set -e`: the shell reaches its first prompt with nothing of the
+/// load reported, chains the rc's DEBUG trap and runs what is typed.
+#[cfg(unix)]
+#[test]
+fn an_integrated_bash_whose_rc_set_errexit_and_an_err_trap_loads_quietly() {
+    need_pty_script();
+    let bash = bash_shell();
+    let fx = LiveFixture::new();
+    std::fs::write(
+        fx.home.join(".bashrc"),
+        "trap 'echo ERR$((40+2))' ERR\nset -e\n\
+         trap '[[ $BASH_COMMAND != \"echo typed\"* ]] || echo DBG$((40+2))' DEBUG\n",
+    )
+    .expect(".bashrc");
+    let dir = install_script_set(&fx.base).expect("install");
+    let rekey_dir = fx.base.join("rekey");
+    std::fs::create_dir_all(&rekey_dir).expect("re-key dir");
+    let rekey = rekey_dir.join("s-0123456789abcdef0125");
+    let mut sh = spawn_pty_shell(
+        ShellType::Bash,
+        bash,
+        &fx,
+        &dir,
+        &[(REKEY_PATH_VAR, rekey.to_str().expect("UTF-8"))],
+    );
+    let loaded = sh.len();
+    sh.send_bytes(b"echo typed$((6*7))\r");
+    let ran = sh.wait_for_after("typed42", loaded);
+    sh.wait_for_after("\x1b]133;A", ran);
+    let load = stdout_between(&sh, 0, loaded);
+    assert!(
+        !load.contains("ERR42"),
+        "bash: the load reported a failed command to the rc's ERR trap\n{}",
+        sh.transcript()
+    );
+    assert!(
+        stdout_between(&sh, loaded, ran).contains("DBG42"),
+        "bash: the rc's DEBUG trap chained\n{}",
+        sh.transcript()
+    );
+    sh.finish();
+}
+
 /// The block's command and the tab title are the LINE as typed — a list, a
 /// pipeline, an alias — where they were its first simple command, alias-expanded
 /// (`true && sleep 3 | cat` showed `true` while it ran, `ll` was `ls -alF`). A
@@ -1331,10 +1670,7 @@ fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bas
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_reports_the_line_as_typed() {
-    if !script_can_allocate_a_pty() {
-        eprintln!("no `script` to allocate a pty; skipping");
-        return;
-    }
+    need_pty_script();
     let fx = LiveFixture::new();
     let dir = install_script_set(&fx.base).expect("install");
     std::fs::write(
@@ -1392,10 +1728,7 @@ fn an_integrated_bash_reports_the_line_as_typed() {
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_with_an_array_prompt_command_reports_only_typed_lines() {
-    if !script_can_allocate_a_pty() {
-        eprintln!("no `script` to allocate a pty; skipping");
-        return;
-    }
+    need_pty_script();
     let fx = LiveFixture::new();
     let dir = install_script_set(&fx.base).expect("install");
     let history = fx.home.join(".bash_history");
@@ -1514,10 +1847,7 @@ fn an_integrated_bash_keeps_the_users_last_argument() {
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_keeps_its_marks_out_of_a_redirected_compound_command() {
-    if !script_can_allocate_a_pty() {
-        eprintln!("no `script` to allocate a pty; skipping");
-        return;
-    }
+    need_pty_script();
     // (the line, the file it writes, what the file must hold)
     let compounds = [
         ("{ echo a; } > out-group", "out-group", "a\n"),
@@ -1582,11 +1912,10 @@ fn an_integrated_bash_keeps_its_marks_out_of_a_redirected_compound_command() {
             .replace('\\', "\\\\")
             .replace(';', "\\x3b")
             .replace(' ', "\\x20");
-        let title: String = line.chars().take(64).collect();
         let mut at = 0;
         for mark in [
             format!("\x1b]633;E;{typed};id={REKEY_OLD}\x07"),
-            format!("\x1b]0;{title}\x07"),
+            format!("\x1b]0;{line}\x07"),
             format!("\x1b]133;C;id={REKEY_OLD}\x07"),
             format!("\x1b]133;D;0;id={REKEY_OLD}\x07"),
         ] {

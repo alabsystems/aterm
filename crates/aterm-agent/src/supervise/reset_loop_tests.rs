@@ -243,6 +243,45 @@ fn the_whole_path_is_three_keys_and_the_hosts_no_is_todays_wait_row() {
     for (m, host) in [(&off, &off_host), (&no, &no_host)] {
         assert_eq!(reset_violations(m, host), Vec::<String>::new());
     }
+    // The same dialog drawn again after a read without it: a new mount (its
+    // review key the same), so the host is asked again.
+    let again_host = ResetHost::refusing(ResetNo::NotQualifying);
+    let first = ResetWorld::new(&RESET_ROWS, 2, &again_host.shared).dialog();
+    let mut again = reset_mock(vec![first, idle_screen()], &RESET_ROWS, 2, &again_host);
+    let _ = reset_watch(
+        "no-again",
+        &mut again,
+        reset_opts(&again_host, true, 120),
+        &fresh,
+        |_| {},
+    );
+    assert_eq!(reset_world(&mut again).chosen, [RESET_WAIT]);
+    assert_eq!(
+        again_host.said("take").len(),
+        2,
+        "asked once a mount: {:#?}",
+        again.requests
+    );
+    // A host that cannot say yet at a mount the dialog then leaves: the next
+    // mount's count of such answers starts afresh, and says so again.
+    let unsure_host = ResetHost::refusing(ResetNo::NotQualifying);
+    *unsure_host.again.lock().unwrap() = vec![1, 2];
+    let first = ResetWorld::new(&RESET_ROWS, 2, &unsure_host.shared).dialog();
+    let mut unsure = reset_mock(vec![first, idle_screen()], &RESET_ROWS, 2, &unsure_host);
+    let unsure_run = reset_watch(
+        "again-again",
+        &mut unsure,
+        reset_opts(&unsure_host, true, 120),
+        &fresh,
+        |_| {},
+    );
+    assert_eq!(unsure_host.said("take").len(), 3, "{:#?}", unsure.requests);
+    let waiting = unsure_run
+        .of_rule()
+        .into_iter()
+        .filter(|l| l.starts_with("WAITING"))
+        .count();
+    assert_eq!(waiting, 2, "once a mount: {:#?}", unsure_run.journal);
 }
 
 /// THE LOOP'S OWN GATES, each shut before the host is asked: `resume_limits`
@@ -264,7 +303,7 @@ fn a_gate_of_the_loops_shut_passes_the_reset_over_before_the_host_is_asked() {
     assert_eq!(said.len(), 1, "{:#?}", run.journal);
     assert!(said[0].ends_with("rule=limit-reset@v1 gate=resume-limits"));
 
-    // No host: `aterm drive watch` with the key in its table.
+    // No host: a loop with no host, the key in its table.
     let host = ResetHost::reading(spent());
     let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
     let mut opts = reset_opts(&host, true, 120);
@@ -383,6 +422,244 @@ fn a_confirmation_with_the_focus_on_no_is_escaped_never_arrowed() {
             placed("Oct 5 at 3pm")
         )]
     );
+    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
+}
+
+/// CLAUDE CODE 2.1.304'S LONE RESET takes the whole path's three keys: the
+/// row of a full reset, the only reset on offer (the reader's composed
+/// dialog), is entered, then its confirmation's `Yes, use my full reset`;
+/// the host is asked with the row's kind, and told the end with the offer
+/// the confirmation showed. NEGATIVE CONTROL: the same row whose
+/// confirmation mounts for a weekly reset is escaped, the reset kept for its
+/// kind, nothing spent.
+#[test]
+fn claude_code_2_1_304s_lone_reset_is_entered_and_another_kinds_confirmation_is_kept() {
+    use aterm_phase::prompt::fixtures::screen;
+    use aterm_phase::reset::fixtures as f;
+    const FULL: &str = "Use a full reset (2 left, until Oct 5)";
+    const HEAD: &str = "Refills your session and weekly limits now · your weekly reset day stays \
+                        Oct 9 at 5am 2 full resets left · use by Oct 5 at 3pm";
+    let kinds = |host: &ResetHost, grant: &str, confirm: Vec<String>, exact: bool| {
+        let rows = [RESET_STOP, grant, RESET_WAIT, RESET_CREDITS];
+        let mut m = reset_mock(vec![], &rows, 0, host);
+        let world = reset_world(&mut m);
+        world.grant = grant.to_string();
+        world.confirm = confirm;
+        world.exact = exact;
+        world.resetting = screen(f::KINDS_RESETTING);
+        m
+    };
+    let host = ResetHost::reading(spent());
+    let mut m = kinds(&host, FULL, screen(f::KINDS_CONFIRM), true);
+    let run = reset_watch(
+        "kinds",
+        &mut m,
+        reset_opts(&host, true, 120),
+        &fresh,
+        |_| {},
+    );
+    let presses: Vec<String> = m.presses().iter().map(|r| ungen(r)).collect();
+    assert_eq!(
+        presses,
+        [
+            format!(
+                "key if-human=0 if-gen=* if={} down",
+                guard_of("   What do you want to do?")
+            ),
+            format!(
+                "key if-human=0 if-gen=* if={} enter",
+                guard_of(&format!("   ❯ 2. {FULL}"))
+            ),
+            format!(
+                "key if-human=0 if-gen=* if={} enter",
+                guard_of("   ❯ Yes, use my full reset")
+            ),
+        ],
+        "{:#?}",
+        m.requests
+    );
+    assert_eq!(
+        reset_keys(&m),
+        ["down@dialog", "enter@dialog", "enter@confirm"]
+    );
+    assert_eq!(reset_world(&mut m).yes_taken, 1);
+    assert_eq!(reset_world(&mut m).chosen, [FULL]);
+    let ask = format!(
+        "take left=2 day=Oct 5 day_start=Some({}) kind=full",
+        placed("Oct 5 at 12am")
+    );
+    assert_eq!(host.said("take"), [ask.clone(), ask]);
+    assert_eq!(
+        host.said("told"),
+        [format!(
+            "told entered=true kept=- offer=Some((2, Some({}))) last=false",
+            placed("Oct 5 at 3pm")
+        )]
+    );
+    assert_eq!(
+        run.rows(),
+        [
+            format!("approved|{FULL}|taken: wall until {}", host.until),
+            format!("approved|Yes, use my reset|{HEAD}"),
+            "waiting|limit reset|ended: used".to_string(),
+        ]
+    );
+    assert_eq!(run.typed(), Vec::<&str>::new());
+    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
+
+    // THE CONTROL: the confirmation is a weekly reset's.
+    let weekly: Vec<String> = screen(f::KINDS_CONFIRM)
+        .iter()
+        .map(|row| row.replace("full reset", "weekly reset"))
+        .collect();
+    let host = ResetHost::reading(ResetOutcome::Kept);
+    let mut m = kinds(&host, FULL, weekly, false);
+    let run = reset_watch(
+        "kinds-other",
+        &mut m,
+        reset_opts(&host, true, 120),
+        &fresh,
+        |_| {},
+    );
+    assert_eq!(
+        reset_keys(&m),
+        ["down@dialog", "enter@dialog", "esc@confirm"],
+        "{:#?}",
+        run.journal
+    );
+    assert_eq!(reset_world(&mut m).yes_taken, 0);
+    assert_eq!(
+        host.said("told"),
+        [format!(
+            "told entered=false kept=kind offer=Some((2, Some({}))) last=false",
+            placed("Oct 5 at 3pm")
+        )]
+    );
+    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
+    // A current confirmation cannot borrow an old grant, and an external
+    // host's partial grant still cannot authorize the global account clear.
+    for (name, grant, confirm) in [
+        ("legacy-cross-kind", RESET_GRANT, screen(f::KINDS_CONFIRM)),
+        (
+            "partial-kind",
+            "Use a 5-hour reset (2 left, until Oct 5)",
+            screen(f::KINDS_CONFIRM)
+                .into_iter()
+                .map(|row| {
+                    row.replace("full reset", "5-hour reset")
+                        .replace("2 5-hour resets left", "2 five-hour resets left")
+                        .replace(
+                            "Refills your session and weekly limits now",
+                            "Refills your session limit now",
+                        )
+                })
+                .collect(),
+        ),
+    ] {
+        let mut host = ResetHost::reading(ResetOutcome::Kept);
+        if name == "partial-kind" {
+            Arc::get_mut(&mut host)
+                .expect("unshared scripted host")
+                .limits = vec!["session".to_string()];
+        }
+        let mut m = kinds(&host, grant, confirm, false);
+        let run = reset_watch(name, &mut m, reset_opts(&host, true, 120), &fresh, |_| {});
+        assert_eq!(
+            reset_keys(&m),
+            ["down@dialog", "enter@dialog", "esc@confirm"],
+            "{name}: {:?}\n{:?}",
+            m.requests,
+            run.journal
+        );
+        assert_eq!(reset_world(&mut m).yes_taken, 0, "{name}");
+        assert!(
+            reset_violations(&m, &host).is_empty(),
+            "{name}: {:?}",
+            run.journal
+        );
+    }
+}
+
+/// A KIND DRAWN UNDER THE ROW WHILE THE ARROWS MOVE: the full reset, the one
+/// reset on offer when the dialog was decided, is reached; as the arrow
+/// lands, the dialog draws a Fable reset's row under it (2.1.304 draws a row
+/// per kind as its offers come in). Two kinds are then on offer and which to
+/// spend is the owner's, so the full reset's row is NOT entered: the host is
+/// told its claim was kept (`not-opened`), and the dialog gets its wait row,
+/// nothing spent. NEGATIVE CONTROL: the same dialog with no row drawn enters
+/// the full reset's row and its confirmation (the lone reset above).
+#[test]
+fn a_kind_drawn_under_the_row_as_the_arrow_lands_is_never_entered() {
+    use aterm_phase::prompt::fixtures::screen;
+    use aterm_phase::reset::fixtures as f;
+    const FULL: &str = "Use a full reset (2 left, until Oct 5)";
+    const FABLE: &str =
+        "Use a Fable reset (1 left, until Oct 6) · frees up only what Fable used this week";
+    let rows = [RESET_STOP, FULL, RESET_WAIT, RESET_CREDITS];
+    let world = |host: &ResetHost, drawn: Option<(usize, String)>| {
+        let mut m = reset_mock(vec![], &rows, 0, host);
+        let world = reset_world(&mut m);
+        world.grant = FULL.to_string();
+        world.confirm = screen(f::KINDS_CONFIRM);
+        world.resetting = screen(f::KINDS_RESETTING);
+        world.drawn_at_arrow = drawn;
+        m
+    };
+    let host = ResetHost::reading(spent());
+    let mut m = world(&host, Some((2, FABLE.to_string())));
+    let run = reset_watch(
+        "kind-drawn",
+        &mut m,
+        reset_opts(&host, true, 120),
+        &fresh,
+        |_| {},
+    );
+    assert_eq!(
+        reset_world(&mut m).labels,
+        [RESET_STOP, FULL, FABLE, RESET_WAIT, RESET_CREDITS],
+        "the row was drawn"
+    );
+    assert_eq!(
+        reset_world(&mut m).chosen,
+        [RESET_WAIT],
+        "{:#?}",
+        run.journal
+    );
+    assert_eq!(reset_world(&mut m).yes_taken, 0);
+    assert!(
+        reset_keys(&m).iter().all(|k| k.ends_with("@dialog")),
+        "{:?}",
+        reset_keys(&m)
+    );
+    assert_eq!(
+        host.said("told"),
+        ["told entered=false kept=not-opened offer=None last=true"],
+        "{:#?}",
+        run.journal
+    );
+    assert!(
+        run.rows().iter().all(|r| !r.starts_with("approved|")),
+        "{:#?}",
+        run.rows()
+    );
+    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
+
+    // THE CONTROL: no row drawn, the lone full reset is taken.
+    let host = ResetHost::reading(spent());
+    let mut m = world(&host, None);
+    let _ = reset_watch(
+        "kind-alone",
+        &mut m,
+        reset_opts(&host, true, 120),
+        &fresh,
+        |_| {},
+    );
+    assert_eq!(
+        reset_keys(&m),
+        ["down@dialog", "enter@dialog", "enter@confirm"]
+    );
+    assert_eq!(reset_world(&mut m).chosen, [FULL]);
+    assert_eq!(reset_world(&mut m).yes_taken, 1);
     assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
 }
 
@@ -1735,7 +2012,19 @@ fn the_box_the_row_opened_is_the_steps_whatever_it_is_reworded_to() {
 /// step's open bound (cut short here) runs out, never keyed; and the
 /// retitled dialog read mid-move, a cursor on a server row and on `Enable
 /// selected` (the reader withholds every role of options with two
-/// cursors). NEGATIVE CONTROLS (seen by
+/// cursors). Nor any frame MEASURED on 2.1.302 in a narrow pane
+/// ([`aterm_phase::prompt::fixtures::MCP_SERVER_NARROW`]): its labels
+/// wrapped, its head cut down to the cursor's wrapped `Continue without using
+/// this MCP` over `server` (40x6), which read a row at a time offered no kept
+/// answer and was Escaped as `inexact-title`; the cursor's label over the
+/// unmarked option under it, which a row's fill alone reads as its rest
+/// (60x11, 35x11, and DERIVED at 60x10 and 35x10 with the first option off
+/// the screen, [`aterm_phase::prompt::fixtures::MCP_SERVER_DERIVED`], where,
+/// joined into one option no kept answer names, it was Escaped the same
+/// way); and the frame that shows no
+/// box (30x5: the option's last row and the footer), read as unread until
+/// the open bound, never keyed, with no box for the policy. NEGATIVE
+/// CONTROLS (seen by
 /// mutation): with the kept-answer test gone from `reset_shows`, the
 /// retitled dialogs are Escaped as `inexact-title`; with `Enable selected`
 /// read as no kept answer, so are the several-server dialog's retitled and
@@ -1744,7 +2033,9 @@ fn the_box_the_row_opened_is_the_steps_whatever_it_is_reworded_to() {
 /// frame (read as another box instead, it is never said to the host).
 #[test]
 fn the_step_never_escapes_an_mcp_server_dialog() {
-    use aterm_phase::prompt::fixtures::{MCP_SERVER_ONE, MCP_SERVER_TWO, screen};
+    use aterm_phase::prompt::fixtures::{
+        MCP_SERVER_DERIVED, MCP_SERVER_NARROW, MCP_SERVER_ONE, MCP_SERVER_TWO, screen,
+    };
     let one = screen(MCP_SERVER_ONE);
     let two = screen(MCP_SERVER_TWO);
     let rule = two
@@ -1792,6 +2083,17 @@ fn the_step_never_escapes_an_mcp_server_dialog() {
         "{p:#?}"
     );
     // Each frame, and whether the step's open bound is run to its end on it.
+    let narrow = MCP_SERVER_NARROW
+        .iter()
+        .chain(&MCP_SERVER_DERIVED)
+        .enumerate()
+        .map(|(k, text)| {
+            let frame = screen(text);
+            let boxed = aterm_phase::read(Some("claude"), &frame, None)
+                .prompt
+                .is_some();
+            (format!("narrow-{k}"), frame, !boxed)
+        });
     let frames = [
         ("one", one.clone(), false),
         (
@@ -1807,8 +2109,16 @@ fn the_step_never_escapes_an_mcp_server_dialog() {
         ("two-head-cut", two[rule + 3..].to_vec(), false),
         ("two-half-drawn-rule-cut", half[rule + 1..].to_vec(), true),
         ("two-retitled-mid-move", retitle(&mid_move), false),
-    ];
+    ]
+    .map(|(name, frame, unread)| (name.to_string(), frame, unread))
+    .into_iter()
+    .chain(narrow);
     for (name, frame, unread) in frames {
+        // A frame with no box is no box the policy can hand on: the step
+        // ends once it has told the host.
+        let boxed = aterm_phase::read(Some("claude"), &frame, None)
+            .prompt
+            .is_some();
         for (read, check_reads) in [("first-read", 0), ("after-checking", 1)] {
             let tag = format!("mcp-{name}-{read}");
             let host = ResetHost::reading(ResetOutcome::Kept);
@@ -1816,7 +2126,11 @@ fn the_step_never_escapes_an_mcp_server_dialog() {
             reset_world(&mut m).confirm = frame.clone();
             reset_world(&mut m).exact = false;
             reset_world(&mut m).check_reads = check_reads;
-            reset_world(&mut m).exits_when = Some(ResetExit::Asked);
+            reset_world(&mut m).exits_when = Some(if boxed {
+                ResetExit::Asked
+            } else {
+                ResetExit::Told
+            });
             let run = reset_watch(&tag, &mut m, reset_opts(&host, true, 120), &fresh, |s| {
                 if unread {
                     s.set_reset_waits(reset_waits_cut(|w| w.open = Duration::from_millis(60)));
@@ -1834,10 +2148,72 @@ fn the_step_never_escapes_an_mcp_server_dialog() {
                 m.presses()
             );
             assert_eq!(reset_world(&mut m).yes_taken, 0, "{tag}");
-            // A frame half drawn is said to the host once its bound runs out.
+            // A frame half drawn, or one with no box, is said to the host
+            // once its bound runs out.
             assert_eq!(host.said("inform").len(), usize::from(unread), "{tag}");
-            // The approval policy's: handed to a person.
-            assert!(m.attention.is_some(), "{tag}: {:#?}", run.journal);
+            // The approval policy's: handed to a person — when there is a
+            // box to hand.
+            assert_eq!(m.attention.is_some(), boxed, "{tag}: {:#?}", run.journal);
+        }
+    }
+}
+
+/// THE STEP NEVER ESCAPES AN ANSWER KEPT FOR GOOD BY ITS LABEL under a rest
+/// that opens with no capital: the safety check's box, SYNTHETIC
+/// ([`crate::supervise::policy::approval::tests::always_under_a_lowercase_rest`]),
+/// of no kind the reader knows, unnumbered, `❯ Continue with tools, always
+/// on` over `Keep waiting for` over `now`, met where the confirmation
+/// should be, on the step's first read and after `Checking…`. Its `always`
+/// still reads Persist where the rest blanks the block's other roles, so it
+/// is no reworded confirmation: the approval policy's, which hands it to a
+/// person — no Esc, no reset spent. With the rule reading it Other, the step
+/// Escaped it as `inexact-title`. NEGATIVE CONTROL: without `always`, the
+/// same box is the reworded confirmation the step Escapes.
+#[test]
+fn the_step_never_escapes_an_answer_kept_for_good_by_its_label() {
+    use crate::supervise::policy::approval::tests::always_under_a_lowercase_rest as frame;
+    for (label, kept) in [
+        ("Continue with tools, always on", true),
+        ("Continue with tools, on", false),
+    ] {
+        for (read, check_reads) in [("first-read", 0), ("after-checking", 1)] {
+            let tag = format!("always-{kept}-{read}");
+            let host = ResetHost::reading(ResetOutcome::Kept);
+            let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
+            reset_world(&mut m).confirm = frame(label);
+            reset_world(&mut m).exact = false;
+            reset_world(&mut m).check_reads = check_reads;
+            if kept {
+                reset_world(&mut m).exits_when = Some(ResetExit::Asked);
+            }
+            let run = reset_watch(&tag, &mut m, reset_opts(&host, true, 120), &fresh, |_| {});
+            let escaped = m.presses().iter().any(|p| p.ends_with(" esc"));
+            assert_eq!(reset_world(&mut m).yes_taken, 0, "{tag}");
+            if kept {
+                assert_eq!(
+                    reset_keys(&m),
+                    ["down@dialog", "enter@dialog"],
+                    "{tag}: {:#?}",
+                    run.journal
+                );
+                assert!(!escaped, "{tag}: {:#?}", m.presses());
+                // The approval policy's: handed to a person.
+                assert!(m.attention.is_some(), "{tag}: {:#?}", run.journal);
+            } else {
+                // NEGATIVE CONTROL.
+                assert_eq!(
+                    reset_keys(&m),
+                    ["down@dialog", "enter@dialog", "esc@confirm"],
+                    "{tag}: {:#?}",
+                    run.journal
+                );
+                assert_eq!(
+                    host.said("told"),
+                    ["told entered=false kept=inexact-title offer=None last=false"],
+                    "{tag}"
+                );
+                assert_eq!(m.attention, None, "{tag}");
+            }
         }
     }
 }

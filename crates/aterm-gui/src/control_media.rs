@@ -14,10 +14,11 @@ use std::sync::{Arc, Mutex};
 use aterm_containment::log_denial;
 use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef};
 use aterm_core::terminal::Terminal;
-use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
+use aterm_window::event_loop::{ActiveEventLoop, EventLoopProxy};
 
 use super::{AUDIT_SUBSYSTEM, ImageQueue, ImageReq};
 use crate::control_auth;
+use crate::platform::AppRt as _;
 use crate::{Wake, term_lock};
 
 /// Main-loop turns are normally sub-millisecond, but a debug build's first native
@@ -954,8 +955,8 @@ fn unknown_window_target(first: &str) -> Option<String> {
 ///     terminal content. This is the original behavior and closes the gap `image`
 ///     leaves (`image` rasterizes only the content framebuffer, no OS chrome).
 ///   * `prefs` / `settings` — the Settings surface.
-///   * `about` / `update` / `menu` / `tab-menu` / `conn-card` / `session-picker` /
-///     `connections` — a Settings route or an overlay of the front window.
+///   * `about` / `update` / `menu` / `tab-menu` / `session-picker` / `overview` — a
+///     Settings route or an overlay of the front window.
 ///
 /// Every target but `front` is photographed IN the front window, so one the front
 /// window is not showing is REFUSED (`App::window_target_refusal`, asked on the main
@@ -1016,9 +1017,8 @@ pub(crate) fn cmd_window(
         AuxTarget::Menu => "aterm-menu",
         AuxTarget::TabMenu => "aterm-tab-menu",
         AuxTarget::AutopilotMenu => "aterm-autopilot-menu",
-        AuxTarget::ConnCard => "aterm-conn-card",
         AuxTarget::SessionPicker => "aterm-session-picker",
-        AuxTarget::Connections => "aterm-connections",
+        AuxTarget::Overview => "aterm-overview",
         AuxTarget::Update => "aterm-update",
     };
     let p = path_arg.trim();
@@ -1132,7 +1132,7 @@ impl crate::App {
     /// front frame, and the capture is the front window's whatever it is called. A
     /// closed overlay therefore answered `OK <w> <h> <path>` with a plain terminal
     /// frame: measured on Windows, `window tab-menu`, `prefs`, `session-picker`,
-    /// `connections`, `conn-card`, `about`, `menu` and `update` with nothing open
+    /// `connections`, `about`, `menu` and `update` with nothing open
     /// all hashed identical to `window front`, while `controls <target>` read
     /// `open=false` and `controls about` refused. A PNG named after a surface it
     /// does not show is worse than no PNG to an agent that looks at it.
@@ -1141,12 +1141,8 @@ impl crate::App {
     /// only as the front window's ACTIVE tab (`controls prefs` also reads one in a
     /// background tab or another window, which the capture cannot see), and
     /// `about` / `update` only on their own route. The action names the verb that
-    /// opens the target. `open` refuses the session picker and the connection
-    /// card, but both open from the wire through the same menu actions a person
-    /// uses: `invoke ConnectToSession` opens the picker for the front session,
-    /// and `invoke ConfigureConnection` opens the card when the front session has
-    /// one connection (the picker when it has several, nothing when it has none —
-    /// `open_connection_ui`), so that refusal names the connection it needs.
+    /// opens the target. `open` refuses the picker, which opens from the wire
+    /// through the menu action a person uses (`invoke NewTabWithIdentity`).
     pub(crate) fn window_target_refusal(
         &self,
         target: crate::app_introspect::AuxTarget,
@@ -1168,11 +1164,10 @@ impl crate::App {
                 .autopilot_menu
                 .as_ref()
                 .is_some_and(|m| Some(m.wid) == self.frontmost_window),
-            AuxTarget::ConnCard => self.front().is_some_and(|ws| ws.conn_card().is_some()),
             AuxTarget::SessionPicker => {
                 self.front().is_some_and(|ws| ws.session_picker().is_some())
             }
-            AuxTarget::Connections => self.front().is_some_and(|ws| ws.connection_map().is_some()),
+            AuxTarget::Overview => self.front().is_some_and(|ws| ws.overview().is_some()),
         };
         if shown {
             return None;
@@ -1180,11 +1175,7 @@ impl crate::App {
         let name = target.keyword();
         Some(match target {
             AuxTarget::SessionPicker => format!(
-                "{name} is not open in the front window; use `invoke ConnectToSession` first"
-            ),
-            AuxTarget::ConnCard => format!(
-                "{name} is not open in the front window; use `invoke ConfigureConnection` first \
-                 (the front session needs a connection)"
+                "{name} is not open in the front window; use `invoke NewTabWithIdentity` first"
             ),
             _ => format!("{name} is not open in the front window; use `open {name}` first"),
         })
@@ -1203,16 +1194,15 @@ mod window_target_refusal_tests {
     use crate::{App, WindowId};
 
     /// Every target `window` takes except `front`.
-    const OVERLAYS: [AuxTarget; 9] = [
+    const OVERLAYS: [AuxTarget; 8] = [
         AuxTarget::Prefs,
         AuxTarget::About,
         AuxTarget::Update,
         AuxTarget::Menu,
         AuxTarget::TabMenu,
         AuxTarget::AutopilotMenu,
-        AuxTarget::ConnCard,
         AuxTarget::SessionPicker,
-        AuxTarget::Connections,
+        AuxTarget::Overview,
     ];
 
     /// `window bogus` answered `OK` and wrote a PNG named `bogus` on 0.95.0
@@ -1233,7 +1223,7 @@ mod window_target_refusal_tests {
     /// `open autopilot-menu` could be found only in the source. The entry now
     /// carries the list of the targets `open` takes, from the one table the
     /// parser reads (`control_verbs::aux_targets!`): each is opened, and each
-    /// target it does not take (`front`, `conn-card`, `session-picker`) is
+    /// target it does not take (`front`, `session-picker`) is
     /// refused with a line naming that list; `close` and an alias resolve.
     /// NEGATIVE CONTROL: the entry without the list (the defect) fails the
     /// first assertion.
@@ -1265,69 +1255,29 @@ mod window_target_refusal_tests {
         );
     }
 
-    /// The step each connection refusal names WORKS: its `invoke` token is a
-    /// real menu action, and running that action for the front session — the
-    /// subject `dispatch_menu_action` gives it, resolved the same way here —
-    /// opens exactly the surface the refusal was about. The card's condition
-    /// holds too: with no connection the action opens nothing.
+    /// The step the picker's refusal names WORKS: its `invoke` token is a real
+    /// menu action, and running it opens exactly the surface the refusal was
+    /// about.
     #[test]
-    fn a_connection_refusal_names_the_invoke_that_opens_it() {
+    fn the_picker_refusal_names_the_invoke_that_opens_it() {
         use crate::menu::MenuAction;
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        app.tab_strip_rows = 1;
-        app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
-        app.splice_tab_strip(wid);
-        let subject = app
-            .frontmost_window
-            .and_then(|w| app.front_terminal(w))
-            .and_then(|t| app.pool.get(t.session))
-            .map(|s| s.ctx.self_id.clone())
-            .expect("the front session");
-        let named = |app: &App, target| {
-            let refusal = app.window_target_refusal(target).expect("closed");
-            let token = refusal
-                .split_once("`invoke ")
-                .and_then(|(_, rest)| rest.split_once('`'))
-                .map(|(token, _)| token.to_string())
-                .expect("names an invoke");
-            MenuAction::from_invoke_name(&token).expect("a real invoke name")
-        };
-
-        let picker = named(&app, AuxTarget::SessionPicker);
-        app.open_connection_ui(wid, subject.clone(), picker);
+        let refusal = app
+            .window_target_refusal(AuxTarget::SessionPicker)
+            .expect("closed");
+        let token = refusal
+            .split_once("`invoke ")
+            .and_then(|(_, rest)| rest.split_once('`'))
+            .map(|(token, _)| token.to_string())
+            .expect("names an invoke");
+        assert_eq!(
+            MenuAction::from_invoke_name(&token),
+            Some(MenuAction::NewTabWithIdentity)
+        );
+        assert!(app.open_identity_picker(wid, PickerIntent::NewTabWithIdentity));
         assert_eq!(app.window_target_refusal(AuxTarget::SessionPicker), None);
         app.session_picker_exit(wid);
-
-        let card = named(&app, AuxTarget::ConnCard);
-        app.open_connection_ui(wid, subject.clone(), card);
-        assert!(
-            app.window_target_refusal(AuxTarget::ConnCard).is_some(),
-            "no connection: nothing opens, as the refusal says"
-        );
-        let other = {
-            let g = app.store.read().unwrap();
-            g.snapshot()
-                .into_iter()
-                .map(|h| h.sid)
-                .find(|sid| *sid != subject)
-                .expect("a second session")
-        };
-        let ctx = {
-            let g = app.store.read().unwrap();
-            g.by_sid(&other).unwrap().ctx.clone()
-        };
-        assert!(crate::connections::connect_in(
-            &app.connections,
-            &subject,
-            &other,
-            &ctx.edges,
-            &ctx.nonce,
-            aterm_session::ConnectionKind::Both,
-            "test",
-        ));
-        app.open_connection_ui(wid, subject, card);
-        assert_eq!(app.window_target_refusal(AuxTarget::ConnCard), None);
     }
 
     /// Each overlay, once open on the front window, is photographed — and only
@@ -1339,12 +1289,6 @@ mod window_target_refusal_tests {
         app.tab_strip_rows = 1;
         app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
         app.splice_tab_strip(wid);
-        let (a, b) = {
-            let g = app.store.read().unwrap();
-            let mut handles = g.snapshot();
-            handles.sort_by_key(|h| h.local_id);
-            (handles[0].sid.clone(), handles[1].sid.clone())
-        };
         let shown = |app: &App| {
             OVERLAYS
                 .into_iter()
@@ -1361,17 +1305,13 @@ mod window_target_refusal_tests {
         assert_eq!(shown(&app), vec![AuxTarget::TabMenu]);
         assert!(app.close_tab_menu(wid));
 
-        assert!(app.open_connection_map().is_ok());
-        assert_eq!(shown(&app), vec![AuxTarget::Connections]);
-        app.connection_map_exit(wid);
+        assert!(app.open_overview().is_ok());
+        assert_eq!(shown(&app), vec![AuxTarget::Overview]);
+        app.overview_exit(wid);
 
-        assert!(app.open_session_picker(wid, a.clone(), PickerIntent::Connect));
+        assert!(app.open_identity_picker(wid, PickerIntent::NewTabWithIdentity));
         assert_eq!(shown(&app), vec![AuxTarget::SessionPicker]);
         app.session_picker_exit(wid);
-
-        assert!(app.open_confirm_card(wid, a, b, None, "menu"));
-        assert_eq!(shown(&app), vec![AuxTarget::ConnCard]);
-        app.conn_card_exit(wid);
 
         assert_eq!(shown(&app), vec![], "every overlay closed again");
     }
@@ -2465,6 +2405,7 @@ fn parse_settings_section_route(input: &str) -> Option<crate::native_settings::S
         // Its AI CLIs sub-page answers to the AI words (an agent's own
         // names are the Harness page's, which holds its switch).
         "ai cli" | "ai reviews" | "ai logins" => Some(SettingsRoute::Ai),
+        "tabs" | "tab control" | "control panel" | "fleet" => Some(SettingsRoute::Tabs),
         // Settings ▸ Themes answers to its own names, never to "theme" (the
         // theme setting lives on Appearance).
         "showcase" | "theme showcase" | "themes gallery" | "gallery" => Some(SettingsRoute::Themes),
@@ -2560,6 +2501,45 @@ fn settings_field_wire_reply(completion: Result<String, String>) -> String {
     }
 }
 
+/// What `invoke <name>` answers before any main-thread hop, or `None` to go
+/// on: a RETIRED name is `ERR retired: <what to use instead>`
+/// (`menu::retired_invoke_name`), and THE PERSON'S OWN ACTS (Take Over / Hand Back, and their aliases
+/// `HoldSession` / `LiftHold`) are `ERR denied` to every scope, the Owner
+/// token included — every in-session client holds Owner, so the held agent
+/// would hand its own tab back (`InvokeAuthority::PersonOnly`).
+pub(crate) fn invoke_refusal(name: &str) -> Option<String> {
+    // A RETIRED name answers with what to use instead, before any hop.
+    if let Some(instead) = crate::menu::retired_invoke_name(name) {
+        return Some(format!("ERR retired: {instead}\n"));
+    }
+    let action = crate::menu::MenuAction::from_invoke_name(name)?;
+    (action.invoke_authority() == crate::menu::InvokeAuthority::PersonOnly
+        && !person_invoke_act(name))
+    .then(|| {
+        format!(
+            "ERR denied: {name} is the person's own act at the window (Agents \u{25b8} Take \
+             Over This Tab / Hand Back This Tab)\n"
+        )
+    })
+}
+
+/// Whether `invoke <name>` is the PERSON'S OWN ACT pressed by a development
+/// build's stand-in for the person at the window: with
+/// `ATERM_DEBUG_PERSON_INVOKE=1` in the instance's environment at launch
+/// (`aterm_types::dev_seam!`, read once), `invoke TakeOver|HandBack` presses
+/// them on the front tab — under any hold, as the person's own gesture is —
+/// so a headless test stands where the person does (the step-in's live test:
+/// Take Over refusing another Mac's writes). A shipped build never reads it,
+/// and an in-session client cannot set it on the instance it runs under.
+pub(crate) fn person_invoke_act(name: &str) -> bool {
+    static SEAM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let seam = *SEAM.get_or_init(|| {
+        aterm_types::dev_seam!("ATERM_DEBUG_PERSON_INVOKE").is_some_and(|value| value == "1")
+    });
+    seam && crate::menu::MenuAction::from_invoke_name(name.trim())
+        .is_some_and(|action| action.invoke_authority() == crate::menu::InvokeAuthority::PersonOnly)
+}
+
 /// `invoke <action>` -> fire a menu action BY NAME — the `action=` tokens `controls
 /// menu` prints (the `MenuAction` Debug names, e.g. `NewTab`) — through the SAME
 /// single dispatch sink the native menu bar and the ⌘K palette use. The live
@@ -2567,20 +2547,27 @@ fn settings_field_wire_reply(completion: Result<String, String>) -> String {
 /// disabled action is a named ERR, never a silent no-op. Main-thread hop like
 /// `open`/`controls` (one-shot reply channel); works headless. `by` is the
 /// caller ([`super::control_session::caller_actor`]), the exit ledger's `by=`
-/// for a session the action retires ([`crate::App::invoke_attributed`]).
+/// for a session the action retires ([`crate::App::invoke_attributed`]);
+/// `typist` is who an action that types (`Paste`) is credited to where its
+/// text lands (S9, `App::invoke_typist`).
 pub(crate) fn cmd_invoke(
     proxy: &EventLoopProxy<Wake>,
     rest: &str,
     by: crate::session_store::ExitActor,
+    typist: Option<std::sync::Arc<crate::typed_by::Caller>>,
 ) -> String {
     let name = rest.trim();
     if name.is_empty() || name.split_whitespace().count() != 1 {
         return "ERR usage: invoke <action>   (list actions with `controls menu`)\n".to_string();
     }
+    if let Some(refusal) = invoke_refusal(name) {
+        return refusal;
+    }
     let name = name.to_string();
     match call_main(proxy, |tx| Wake::InvokeMenuAction {
         name,
         by,
+        typist,
         reply: tx,
     }) {
         Ok(Ok(msg)) => format!("OK {msg}\n"),
@@ -2784,12 +2771,13 @@ pub(crate) fn cmd_theme(proxy: &EventLoopProxy<Wake>, rest: &str, session: Optio
 
 /// Parse the `fx` verb's tail into its op: `""`/`status` reads; `celebrate`
 /// takes `sig=<char>` (default `C`), `bars=<1..4>` (default 2) and
-/// `on=green|enter` (default `green`) in any order, each at most once. A
+/// `on=green|enter|done` (default `green`) in any order, each at most once. A
 /// pure parse so the vocabulary is provable without an event loop; `Err`
 /// carries the whole usage line, so the refusal teaches the grammar.
 pub(crate) fn parse_fx_form(rest: &str) -> Result<crate::FxCtlOp, String> {
     use aterm_effects::kitty_sing::{CELEBRATE_MAX_BARS, CelebrateOn, song_signature};
-    const USAGE: &str = "usage: fx [status|celebrate [sig=<char>] [bars=<1..4>] [on=green|enter]]";
+    const USAGE: &str =
+        "usage: fx [status|celebrate [sig=<char>] [bars=<1..4>] [on=green|enter|done]]";
     let mut words = rest.split_whitespace();
     match words.next() {
         None | Some("status") => {
@@ -2830,7 +2818,8 @@ pub(crate) fn parse_fx_form(rest: &str) -> Result<crate::FxCtlOp, String> {
             "on" => match v {
                 "green" => on.replace(CelebrateOn::Green).is_some(),
                 "enter" => on.replace(CelebrateOn::Enter).is_some(),
-                _ => return Err(format!("{USAGE} (on= wants green|enter, got {v:?})")),
+                "done" => on.replace(CelebrateOn::Done).is_some(),
+                _ => return Err(format!("{USAGE} (on= wants green|enter|done, got {v:?})")),
             },
             _ => return Err(format!("{USAGE} (got {w:?})")),
         };
@@ -3164,9 +3153,56 @@ pub(crate) fn split_quoted_tokens(rest: &str) -> Option<Vec<String>> {
 }
 
 /// The `spawn` verb's usage line — one string for every malformed form, naming
-/// the whole grammar (plain + aimed + connected) so a caller who got one token
-/// wrong sees the complete contract.
-const SPAWN_USAGE: &str = "ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [identity=<name>|-] [theme=<name>] [connected=controlled|controller place=window|tab of=<sid>]\n";
+/// the whole grammar (plain + aimed + connected + worker) so a caller who got
+/// one token wrong sees the complete contract.
+pub(crate) const SPAWN_USAGE: &str = "ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [identity=<name>|-] [theme=<name>] [connected=controlled|controller place=window|tab of=<sid> | agent=claude [model=<m>] [from=<sid>] len=<n>]\n";
+
+/// `agent=<word>` (a WORKER, `task_launch`): which agent the newborn's shell
+/// starts at its first prompt, its task the frame the request carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentSpec {
+    /// `agent=claude`, with `model=` its `--model` when given, and `from=`
+    /// the session that starts it (the client's own): the task's `from=`, and
+    /// the Claude Code whose program, home and login the worker's line
+    /// carries. Without it the task is `from=ctl`.
+    Claude {
+        model: Option<String>,
+        from: Option<aterm_session::SessionId>,
+    },
+    /// `agent=<codex|agy|muse|gemini>`: another agent aterm reads
+    /// ([`aterm_phase::Program`]), reserved: answered `ERR agent <word>: not
+    /// yet`, since a worker's line, task file and done marker are written for
+    /// Claude Code alone. Never a shell, and never Claude Code under another
+    /// name.
+    Reserved(aterm_phase::Program),
+}
+
+/// The agent `agent=<word>` names, by [`aterm_phase::Program::name`]: Claude
+/// Code's word starts a worker, every other agent's is reserved, and a word
+/// no agent goes by (the generic reader's included) is no agent.
+fn agent_spec(word: &str) -> Option<AgentSpec> {
+    use aterm_phase::Program;
+    let program = Program::ALL.into_iter().find(|p| p.name() == word)?;
+    match program {
+        Program::Claude => Some(AgentSpec::Claude {
+            model: None,
+            from: None,
+        }),
+        Program::Codex | Program::Agy | Program::Muse | Program::Gemini => {
+            Some(AgentSpec::Reserved(program))
+        }
+        Program::Generic => None,
+    }
+}
+
+/// Whether `model=<m>` names a model a worker's line may carry:
+/// `[A-Za-z0-9._-]{1,64}`, a word no shell reads anything into.
+fn valid_model(model: &str) -> bool {
+    (1..=64).contains(&model.len())
+        && model
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
 
 /// `identity=<name>|-` as parsed on the control thread (session identities,
 /// 2026-09-17). Three states, because an AIMED spawn (`@<sid> spawn`, or the
@@ -3223,6 +3259,8 @@ enum SpawnForm {
         identity: Option<IdentitySpec>,
         /// `theme=<name>`: the newborn's own theme ([`crate::session_theme`]).
         theme: Option<String>,
+        /// `agent=claude [model=<m>] len=<n>` (a WORKER); `None` = a shell.
+        agent: Option<AgentSpec>,
     },
     Connected {
         kind: crate::connections::ConnectedSpawnKind,
@@ -3255,10 +3293,16 @@ enum SpawnForm {
 /// `window=<id>` is the id `inspect app/v1 tabs` prints (a plain integer);
 /// `raise=` is exactly `true` or `false` — anything else is the usage line, so
 /// a misspelt verdict can never be read as "use the default".
+///
+/// `agent=claude|codex` makes the plain form a WORKER's (`task_launch`):
+/// `model=`, `from=` and the frame's `len=` (read by the serve loop,
+/// `control::spawn_frame_len`) come only with it, and it never joins the
+/// connected form.
 fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
     use crate::connections::{ConnectedSpawnKind, ConnectedSpawnPlace};
     let (mut cwd, mut split, mut kind, mut place, mut origin) = (None, None, None, None, None);
     let (mut window, mut raise, mut identity, mut theme) = (None, None, None, None);
+    let (mut agent, mut model, mut from, mut framed) = (None, None, None, false);
     let Some(tokens) = split_quoted_tokens(rest) else {
         return Err(());
     };
@@ -3316,10 +3360,33 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
                 return Err(());
             }
             origin = Some(aterm_session::SessionId::new(v));
+        } else if let Some(v) = tok.strip_prefix("agent=") {
+            agent = Some(agent_spec(v).ok_or(())?);
+        } else if let Some(v) = tok.strip_prefix("model=") {
+            if !valid_model(v) {
+                return Err(());
+            }
+            model = Some(v.to_string());
+        } else if let Some(v) = tok.strip_prefix("from=") {
+            // A session id, as a task record's `from=` reads one.
+            if v == crate::task_record::FROM_CTL || !crate::task_record::valid_from(v) {
+                return Err(());
+            }
+            from = Some(aterm_session::SessionId::new(v));
+        } else if tok.starts_with("len=") {
+            // The frame's length, which the serve loop read and consumed.
+            framed = true;
         } else {
             return Err(());
         }
     }
+    // `model=`, `from=` and a frame are a worker's alone.
+    let agent = match agent {
+        Some(AgentSpec::Claude { .. }) => Some(AgentSpec::Claude { model, from }),
+        Some(AgentSpec::Reserved(program)) => Some(AgentSpec::Reserved(program)),
+        None if model.is_some() || from.is_some() || framed => return Err(()),
+        None => None,
+    };
     match (kind, place, origin) {
         (None, None, None) => Ok(SpawnForm::Plain {
             window,
@@ -3328,9 +3395,10 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
             split,
             identity,
             theme,
+            agent,
         }),
         (Some(kind), Some(place), Some(origin))
-            if split.is_none() && window.is_none() && raise.is_none() =>
+            if split.is_none() && window.is_none() && raise.is_none() && agent.is_none() =>
         {
             Ok(SpawnForm::Connected {
                 kind,
@@ -3342,8 +3410,8 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
             })
         }
         // A partial connected form (connected= without of=/place=, or a stray
-        // place=/of=), or a connected form carrying split=/window=/raise=,
-        // never guesses.
+        // place=/of=), or a connected form carrying split=/window=/raise= or
+        // agent=, never guesses.
         _ => Err(()),
     }
 }
@@ -3366,29 +3434,9 @@ fn spawn_cwd_refusal(form: &SpawnForm) -> Option<String> {
         Fault::Shut => Some(format!("ERR no access to folder {shown}\n")),
         // Not this check's to say: a folder that did not answer goes on to the
         // spawn, which starts the shell in the home folder when it is on a
-        // volume that is not local.
-        Fault::Unresponsive => None,
+        // volume that is not local (`folder_fault` says neither).
+        Fault::Unresponsive | Fault::HomeUnresponsive => None,
     }
-}
-
-/// `identity=<name>` is created (or brought up to date) HERE, on the control
-/// thread, before the spawn is posted: `ERR identity <name>: <why>` when it
-/// cannot be, and nothing is posted, so no tab is made. Provisioning primes the
-/// identity's agent files, each written with `F_FULLFSYNC`: 35-46 ms measured
-/// for a new identity (2026-10-15, seven files), which the event loop paid as
-/// one frozen turn per spawn. This thread waits for the reply anyway; the
-/// spawner's half only checks that the identity exists
-/// ([`crate::tab_spawn::IdentityPrep::Admit`]). `None` when the request names no
-/// identity: `-` is the human's own config, and an inherited one exists by
-/// construction.
-fn spawn_identity_refusal(form: &SpawnForm) -> Option<String> {
-    let (SpawnForm::Plain { identity, .. } | SpawnForm::Connected { identity, .. }) = form;
-    let Some(IdentitySpec::Named(name)) = identity else {
-        return None;
-    };
-    crate::agent_identity::ensure(name, true)
-        .err()
-        .map(|e| format!("ERR identity {name}: {e}\n"))
 }
 
 /// Where an aimed `spawn` lands (design S3, finding F3): the FRONT window (the
@@ -3488,14 +3536,18 @@ pub(crate) const fn raise_after_spawn(window_named: bool, raise: Option<bool>) -
 /// `place=window` under headless with the NEW `ERR headless` reply (§1.4#7);
 /// `place=tab` works headless. cwd default for the connected form is the
 /// ORIGIN session's cwd.
+///
+/// `spawn … agent=claude [model=<m>] [from=<sid>] len=<n>` starts a WORKER
+/// (`task_launch`; Owner-only, the `escalated_op` fence): the task is the
+/// frame the serve loop read after the line
+/// ([`crate::task_launch::take_frame`]), and `from=` — the client's own
+/// session, which the `@<sid>` aim need not be — is the task's `from=`.
+/// `agent=codex` is `ERR agent codex: not yet`.
 pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Option<u64>) -> String {
     let Ok(form) = parse_spawn_args(rest) else {
         return SPAWN_USAGE.to_string();
     };
     if let Some(refusal) = spawn_cwd_refusal(&form) {
-        return refusal;
-    }
-    if let Some(refusal) = spawn_identity_refusal(&form) {
         return refusal;
     }
     let sent = match form {
@@ -3506,7 +3558,25 @@ pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Optio
             split,
             identity,
             theme,
+            agent,
         } => {
+            let task = match agent {
+                None => None,
+                Some(AgentSpec::Reserved(program)) => {
+                    return format!("ERR agent {}: not yet\n", program.name());
+                }
+                Some(AgentSpec::Claude { model, from }) => {
+                    match crate::task_launch::TaskOrder::of_frame(
+                        crate::task_launch::take_frame(),
+                        model,
+                        cwd.as_deref(),
+                        from,
+                    ) {
+                        Ok(order) => Some(order),
+                        Err(refusal) => return refusal,
+                    }
+                }
+            };
             let aim = SpawnAim::from_request(window, session);
             let raise = raise_after_spawn(aim.is_aimed(), raise);
             call_main(proxy, |tx| Wake::SpawnSession {
@@ -3516,6 +3586,7 @@ pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Optio
                 raise,
                 identity,
                 theme,
+                task,
                 reply: tx,
             })
         }
@@ -3575,6 +3646,155 @@ pub(crate) fn cmd_tab_aimed(
     }
 }
 
+/// Why this instance starts no worker, whatever its task
+/// ([`crate::App::worker_shell`]): the spawn's refusal before anything is
+/// created, and why the menu bar's worker launch (track B's Summarize),
+/// which starts one, is grey.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerBlock {
+    /// No window harness runs here: an instance with no control socket
+    /// (`--no-control-sock`, or a socket that could not be bound) starts no
+    /// host (`HarnessPosture::Unhosted`), so nothing would carry the worker.
+    /// The wire's `spawn` never meets it — it came over the socket — but the
+    /// menu bar's worker launch (track B's Summarize) does.
+    Unhosted,
+    /// The window harness would not carry the worker's Claude Code session,
+    /// so nothing would finish the task: the switch that stops it
+    /// (`harness_host::worker_unsupervised` — `[harness] enabled = false`, a
+    /// headless instance's `headless = false`, `[harness.claude] enabled =
+    /// false`, or `[harness] autopilot = "off"`).
+    Unsupervised(&'static str),
+    /// Shell integration is off (`--no-shell-integration`, or an instance
+    /// started to run a command): no prompt is marked to type the worker's
+    /// line at.
+    NoIntegration,
+    /// The shell is not one a worker's line is written for: its program's
+    /// name (`task_launch::worker_dialect`).
+    Shell(String),
+    /// The shell is a fish its `--version` said is older than 3.4, whose
+    /// parser refuses the line's task operand (`task_launch::fish_known_old`).
+    OldFish,
+}
+
+impl WorkerBlock {
+    /// The spawn's reply: `ERR <this>`.
+    pub(crate) fn refusal(self) -> String {
+        match self {
+            Self::Unhosted => {
+                "unsupervised: no window harness runs here (no control socket)".to_string()
+            }
+            Self::Unsupervised(switch) => format!("unsupervised: {switch}"),
+            Self::NoIntegration => {
+                "spawn agent=claude: shell integration is off, so no prompt is marked to type at"
+                    .to_string()
+            }
+            Self::Shell(name) => {
+                format!("spawn agent=claude: the shell {name} is not zsh, bash or fish")
+            }
+            Self::OldFish => {
+                "spawn agent=claude: the shell is a fish older than 3.4, which cannot take the \
+                 task's operand"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// What a worker's start needs once its checks passed
+/// ([`crate::App::worker_precheck`]).
+pub(crate) struct WorkerStart {
+    order: crate::task_launch::TaskOrder,
+    /// The task's `from=`: the starter's global sid, or `ctl`.
+    from: String,
+    /// The starter's local id (`from=`'s session), whose Claude Code the
+    /// worker's line follows; `None` for `from=ctl`, or a starter another
+    /// instance hosts.
+    caller: Option<u64>,
+    /// The worker's shell and the dialect its line is written in.
+    shell: std::path::PathBuf,
+    dialect: aterm_agent::harness::upgrade::Dialect,
+}
+
+impl WorkerStart {
+    /// The seed of the worker's task file: its task, and the fact line naming
+    /// its `from=` when the order asks for one
+    /// ([`crate::task_launch::TaskOrder::fact_line`]).
+    fn seed(&self) -> crate::task_launch::TaskSeed {
+        let from = self.order.fact_line.then_some(self.from.as_str());
+        crate::task_launch::TaskSeed::new(crate::task_launch::task_text(&self.order.task, from))
+    }
+}
+
+/// A spawn's outcome on the main thread ([`crate::App::spawn_session_aimed`]):
+/// the newborn's sid, and for a WORKER what is left of its start once the
+/// reply is taken ([`crate::App::answer_spawn`]).
+pub(crate) struct Spawned {
+    sid: String,
+    worker: Option<PendingWorker>,
+}
+
+/// A worker spawned and marked `working`, its launcher not yet started
+/// ([`crate::App::ready_worker`]).
+pub(crate) struct PendingWorker {
+    launch: crate::task_launch::Launch,
+    /// The seed that wrote its task file, which an undo removes.
+    seed: crate::task_launch::TaskSeed,
+}
+
+/// What a spawn's booking asks beyond its aim, its identity and a worker's
+/// task ([`crate::App::book_spawn`]).
+pub(crate) struct SpawnBooking {
+    /// `spawn cwd=`: the folder the newborn starts in; `None` inherits the
+    /// focused pane's.
+    pub(crate) cwd: Option<String>,
+    /// `spawn split=<v|h>`: split the window's focused pane instead of
+    /// opening a tab.
+    pub(crate) split: Option<crate::pane::SplitDir>,
+    /// Bring the hosting window to the front once the newborn lands
+    /// ([`raise_after_spawn`]); a TAB that does not raise lands behind the
+    /// window's active one.
+    pub(crate) raise: bool,
+    /// What the landing checks again (`tab_spawn::SpawnAdmission`): the menu
+    /// bar's worker launch's reservation, else nothing.
+    pub(crate) admission: crate::tab_spawn::SpawnAdmission,
+}
+
+/// A spawn checked before anything is booked ([`crate::App::resolve_spawn`]):
+/// the window that hosts it, the identity it wears (`inherited` when the
+/// request named none and the aimed session's is passed down), the theme it
+/// asked for, and a worker's start.
+pub(crate) struct SpawnPlan {
+    owner: crate::WindowId,
+    identity: Option<String>,
+    inherited: bool,
+    theme: Option<crate::session_theme::SessionTheme>,
+    worker: Option<WorkerStart>,
+}
+
+impl SpawnPlan {
+    /// What the spawner is asked for beyond the booking's folder, place and
+    /// admission ([`crate::App::place_spawn`]): the identity, admitted on the
+    /// spawner as a request's is ([`crate::tab_spawn::IdentityPrep::Admit`]),
+    /// the theme, and a worker's task file.
+    fn ask(
+        identity: Option<String>,
+        inherited: bool,
+        theme: Option<crate::session_theme::SessionTheme>,
+        task: Option<crate::task_launch::TaskSeed>,
+    ) -> crate::tab_spawn::SpawnAsk {
+        crate::tab_spawn::SpawnAsk {
+            theme,
+            task,
+            ..crate::tab_spawn::SpawnAsk::requested(None, identity, inherited)
+        }
+    }
+}
+
+/// What takes a booked spawn's outcome on the main thread
+/// ([`crate::App::book_spawn`]): the newborn, registered and, for a worker,
+/// readied — or why there is none.
+pub(crate) type SpawnTaken = Box<dyn FnOnce(&mut crate::App, Result<Spawned, String>)>;
+
 /// Where a wire `tab` verb's `(active_index, tab_count)` or refusal goes.
 pub(crate) type TabCmdReply = std::sync::mpsc::Sender<Result<(usize, usize), String>>;
 
@@ -3631,22 +3851,40 @@ impl crate::App {
     ///
     /// A TAB ([`Self::open_off_loop`]) and a SPLIT
     /// ([`Self::split_focused_pane_in_window`]) are both spawned off the event
-    /// loop: `reply` waits with the session in flight and is answered when it
-    /// lands, with the sid once it is registered, so the reply still comes
-    /// after the sid is addressable. A split the focused pane cannot take is
-    /// refused at once, and again at landing if the window changed meanwhile.
-    /// Either way the raise verdict the control thread already decided
-    /// ([`raise_after_spawn`]) applies only to a SUCCESSFUL spawn (a refused
-    /// request must not steal the foreground), and on the window the session
-    /// actually landed in, so an explicit `raise=true` on an aimed spawn raises
-    /// THAT window, not the front one. The apprt decides what raising means
-    /// (Windows: SW_RESTORE + SetForegroundWindow); the default is nothing, so
-    /// no other platform's focus behaviour moves here.
+    /// loop ([`Self::place_spawn`]): `reply` waits with the session in flight
+    /// and is answered when it lands, with the sid once it is registered, so
+    /// the reply still comes after the sid is addressable. A split the focused
+    /// pane cannot take is refused at once, and again at landing if the window
+    /// changed meanwhile. Either way the raise verdict the control thread
+    /// already decided ([`raise_after_spawn`]) applies only to a SUCCESSFUL
+    /// spawn (a refused request must not steal the foreground), and on the
+    /// window the session actually landed in, so an explicit `raise=true` on
+    /// an aimed spawn raises THAT window, not the front one. The apprt decides
+    /// what raising means (Windows: SW_RESTORE + SetForegroundWindow); the
+    /// default is nothing, so no other platform's focus behaviour moves here.
+    ///
+    /// A spawn that does NOT raise keeps its window's active tab: the newborn
+    /// tab lands behind the tab active then (`tab_spawn::SpawnAsk::background`,
+    /// the `tab_strip` model's NewTab then SelectTab), so the person's view
+    /// stays put. A split focuses its new pane as it always did. `theme=` is
+    /// checked before anything is asked of the spawner ([`Self::spawn_theme`]):
+    /// a name that does not draw spawns nothing.
+    ///
+    /// A WORKER (`task`, `spawn agent=claude`): refused BEFORE anything is
+    /// created when the window harness would not carry it (`ERR unsupervised:
+    /// <switch>`: nothing would finish the task) or the shell is no shell its
+    /// line is written for ([`Self::worker_precheck`]); then spawned with its
+    /// task file, and its task record marked `working` once its newborn is
+    /// registered and before the reply ([`Self::ready_worker`]).
+    /// A worker that spawned and then could not start is closed again, its
+    /// task file removed, and the reply is the reason
+    /// ([`Self::unspawn_worker`]): an `ERR` leaves nothing behind. Its
+    /// launcher starts only once the reply is taken ([`Self::answer_spawn`]).
     #[allow(
         clippy::too_many_arguments,
-        reason = "the wire spawn's facts — aim, cwd, split, raise, identity and theme — \
-                  are each a per-request datum and `reply` is its answer; a wrapper \
-                  struct would relocate the list, not simplify it"
+        reason = "the spawn verb's arguments as the control thread parsed them — aim, cwd, \
+                  split, raise, identity, theme and a worker's task — and `reply` its answer; \
+                  a struct would only rename the Wake's fields"
     )]
     pub(crate) fn spawn_session_aimed(
         &mut self,
@@ -3656,10 +3894,9 @@ impl crate::App {
         raise: bool,
         identity: Option<IdentitySpec>,
         theme: Option<String>,
+        task: Option<crate::task_launch::TaskOrder>,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     ) {
-        // `theme=` is checked before anything is asked of the spawner: a name
-        // that does not draw spawns nothing.
         let theme = match self.spawn_theme(theme) {
             Ok(theme) => theme,
             Err(why) => {
@@ -3667,25 +3904,37 @@ impl crate::App {
                 return;
             }
         };
-        let (host, mut ask) = match self.resolve_spawn(aim, cwd, identity) {
-            Ok(resolved) => resolved,
+        let booking = SpawnBooking {
+            cwd,
+            split,
+            raise,
+            admission: crate::tab_spawn::SpawnAdmission::Plain,
+        };
+        match self.resolve_spawn(aim, identity, task) {
+            // A plain spawn: `OK <sid>` once it lands, its window raised first
+            // when `raise` says so (`TabSpawnThen::Reply`); its tab stays
+            // whether the reply is taken or not, as it always did.
+            Ok(SpawnPlan {
+                owner,
+                identity,
+                inherited,
+                worker: None,
+                ..
+            }) => {
+                let then = crate::tab_spawn::TabSpawnThen::Reply { reply, raise };
+                let ask = SpawnPlan::ask(identity, inherited, theme, None);
+                self.place_spawn(owner, ask, booking, then);
+            }
+            Ok(mut plan) => {
+                plan.theme = theme;
+                self.book_spawn(
+                    plan,
+                    booking,
+                    Box::new(move |app, spawned| app.answer_spawn(spawned, &reply)),
+                );
+            }
             Err(why) => {
                 let _ = reply.send(Err(why));
-                return;
-            }
-        };
-        ask.theme = theme;
-        let Some(owner) = host.or(self.frontmost_window) else {
-            let _ = reply.send(Err("no window to host the session".to_string()));
-            return;
-        };
-        let then = crate::tab_spawn::TabSpawnThen::Reply { reply, raise };
-        match split {
-            None => self.open_off_loop(owner, crate::tab_spawn::SpawnPlace::Tab, ask, then),
-            // A refusal is answered through `then`, verbatim (`ERR Split refused:
-            // this pane is 19x11 cells; ...`).
-            Some(dir) => {
-                let _ = self.split_focused_pane_in_window(owner, dir, ask, then);
             }
         }
     }
@@ -3709,24 +3958,26 @@ impl crate::App {
         }))
     }
 
-    /// The aimed `spawn`'s window and what it asks the spawner for:
-    /// [`Self::aimed_window`], the folder it named, and the identity the newborn
-    /// wears, checked on the spawner.
-    fn resolve_spawn(
+    /// The aimed `spawn`'s checks, before anything is booked: the window
+    /// ([`Self::aimed_window`], else the front one), a worker's checks
+    /// ([`Self::worker_precheck`]), and the identity the newborn wears —
+    /// admitted on the spawner, not here ([`SpawnPlan::ask`]).
+    pub(crate) fn resolve_spawn(
         &self,
         aim: SpawnAim,
-        cwd: Option<String>,
         identity: Option<IdentitySpec>,
-    ) -> Result<(Option<crate::WindowId>, crate::tab_spawn::SpawnAsk), String> {
+        task: Option<crate::task_launch::TaskOrder>,
+    ) -> Result<SpawnPlan, String> {
         let host = self.aimed_window(aim)?;
+        let worker = task.map(|order| self.worker_precheck(order)).transpose()?;
         // IDENTITY (session identities, 2026-09-17): an aimed spawn inherits
         // the aimed session's identity unless `identity=` says otherwise, so a
         // worker's own `aterm ctl spawn` stays under its login instead of
         // falling back to the human's. A named identity is created on the
-        // verb, and nowhere else: by its control-thread half
-        // ([`spawn_identity_refusal`]), before this was posted. The spawner
-        // only checks it, an inherited one too, before the fork
-        // ([`crate::tab_spawn::IdentityPrep::Admit`]): its failure is this
+        // verb, and nowhere else: by the spawner, before the fork, once this
+        // turn has admitted the spawn (the aim above, the theme), so a refused
+        // spawn makes none; an inherited one is only checked there
+        // ([`crate::tab_spawn::IdentityPrep::Admit`]). Its failure is this
         // spawn's reply (`ERR identity <name>: <why>`), never a shell without
         // its env, and the folder's metadata is never read in this turn.
         let aimed = match aim {
@@ -3735,10 +3986,341 @@ impl crate::App {
         };
         let inherited = identity.is_none();
         let identity = resolve_spawn_identity(identity, aimed.as_deref());
-        Ok((
-            host,
-            crate::tab_spawn::SpawnAsk::requested(cwd, identity, inherited),
-        ))
+        let owner = host
+            .or(self.frontmost_window)
+            .ok_or_else(|| "no window to host the session".to_string())?;
+        Ok(SpawnPlan {
+            owner,
+            identity,
+            inherited,
+            theme: None,
+            worker,
+        })
+    }
+
+    /// Book `plan`'s spawn off the event loop ([`Self::place_spawn`]), a
+    /// WORKER's with its task file. `taken` hears the newborn once it is
+    /// registered — a worker readied first, its window raised when
+    /// `booking.raise` says so ([`Self::landed_spawn`]) — or why it never
+    /// landed, a worker's task file then removed.
+    pub(crate) fn book_spawn(&mut self, plan: SpawnPlan, booking: SpawnBooking, taken: SpawnTaken) {
+        let SpawnPlan {
+            owner,
+            identity,
+            inherited,
+            theme,
+            worker,
+        } = plan;
+        let seed = worker.as_ref().map(WorkerStart::seed);
+        let raise = booking.raise;
+        let spawned_as = identity.clone();
+        let ask = SpawnPlan::ask(identity, inherited, theme, seed.clone());
+        let then = crate::tab_spawn::TabSpawnThen::Run(Box::new(move |app, landed| {
+            let spawned = match landed {
+                Ok(sid) => {
+                    let worker = worker.zip(seed);
+                    app.landed_spawn(sid, owner, raise, spawned_as.as_deref(), worker)
+                }
+                Err(why) => {
+                    // A shell that did not start may leave its task file.
+                    if let Some(seed) = &seed {
+                        seed.discard();
+                    }
+                    Err(why)
+                }
+            };
+            taken(app, spawned);
+        }));
+        self.place_spawn(owner, ask, booking, then);
+    }
+
+    /// Book a spawn landing in `owner` (`tab_spawn`), asked for as `ask` says
+    /// (its identity, its theme, a worker's task file): a tab, or a split of
+    /// the focused pane (refused at once when it cannot take one, and again at
+    /// landing, verbatim: `ERR Split refused: this pane is 19x11 cells; ...`).
+    /// A tab that does not raise lands behind the window's active one. `then`
+    /// is its waiter.
+    fn place_spawn(
+        &mut self,
+        owner: crate::WindowId,
+        ask: crate::tab_spawn::SpawnAsk,
+        booking: SpawnBooking,
+        then: crate::tab_spawn::TabSpawnThen,
+    ) {
+        let SpawnBooking {
+            cwd,
+            split,
+            raise,
+            admission,
+        } = booking;
+        let ask = crate::tab_spawn::SpawnAsk {
+            admission,
+            cwd,
+            background: !raise && split.is_none(),
+            ..ask
+        };
+        match split {
+            None => self.open_off_loop(owner, crate::tab_spawn::SpawnPlace::Tab, ask, then),
+            // A refusal is answered through `then`.
+            Some(dir) => {
+                let _ = self.split_focused_pane_in_window(owner, dir, ask, then);
+            }
+        }
+    }
+
+    /// A booked spawn's newborn `sid`, registered in `owner`: a worker made
+    /// one ([`Self::ready_worker`]) — or closed again, the reason the outcome
+    /// — then `owner` raised when `raise` says so. A spawn that failed raises
+    /// nothing. `identity` is the one the newborn spawned under.
+    fn landed_spawn(
+        &mut self,
+        sid: String,
+        owner: crate::WindowId,
+        raise: bool,
+        identity: Option<&str>,
+        worker: Option<(WorkerStart, crate::task_launch::TaskSeed)>,
+    ) -> Result<Spawned, String> {
+        let worker = match worker {
+            Some((worker, seed)) => Some(self.ready_worker(&sid, worker, seed, identity)?),
+            None => None,
+        };
+        if raise && let Some(window) = self.windows.get(&owner).and_then(|ws| ws.os_window.clone())
+        {
+            self.apprt.window_bring_to_front(&window);
+        }
+        Ok(Spawned { sid, worker })
+    }
+
+    /// Answer a spawn on `reply`, and only then start its worker's launcher.
+    /// A worker whose `OK <sid>` nobody took — the control lane stopped
+    /// waiting (`call_main`'s deadline) and dropped its end — is closed again
+    /// and its task file removed before anything is typed
+    /// ([`Self::unspawn_worker`]): no one holds its sid, so it would do its
+    /// task unowned, and the client's retry would run the task twice. A plain
+    /// spawn's tab stays whether its reply was taken or not, as it always did.
+    pub(crate) fn answer_spawn(
+        &mut self,
+        spawned: Result<Spawned, String>,
+        reply: &std::sync::mpsc::Sender<Result<String, String>>,
+    ) {
+        let Spawned { sid, worker } = match spawned {
+            Ok(spawned) => spawned,
+            Err(why) => {
+                let _ = reply.send(Err(why));
+                return;
+            }
+        };
+        let taken = reply.send(Ok(sid.clone())).is_ok();
+        match worker {
+            Some(worker) if taken => {
+                aterm_log::info!(
+                    "worker {sid}: its spawn's reply was taken; its launcher starts (session {})",
+                    worker.launch.local
+                );
+                crate::task_launch::launch_worker(worker.launch);
+            }
+            Some(worker) => {
+                aterm_log::warn!(
+                    "worker {sid}: its spawn's reply was not taken; it is closed again"
+                );
+                self.unspawn_worker(&sid, Some(&worker.seed));
+            }
+            None => {}
+        }
+    }
+
+    /// A spawn the main thread made for itself (Summarize in a New Tab,
+    /// `App::summarize_in_new_tab`): no client waits on a reply, so its
+    /// worker's launcher starts at once. The newborn's sid is returned.
+    pub(crate) fn start_spawned(&mut self, spawned: Spawned) -> String {
+        if let Some(worker) = spawned.worker {
+            aterm_log::info!(
+                "worker {}: its launcher starts (session {}, no reply owed)",
+                spawned.sid,
+                worker.launch.local
+            );
+            crate::task_launch::launch_worker(worker.launch);
+        }
+        spawned.sid
+    }
+
+    /// What a worker needs of this instance, whatever its task (Summarize in
+    /// a New Tab gates on it): a window harness runs
+    /// here (a host: this instance has a control socket) and would carry the
+    /// worker's Claude Code session (`harness_host::worker_unsupervised`, else
+    /// the switch that stops it — the harness off, a headless instance's
+    /// `headless = false`, Claude Code's own table off, or an Autopilot
+    /// default of `off`), the shell marks its prompts (integration on), and
+    /// the shell is one a worker's line is written for
+    /// (`task_launch::worker_dialect`), a fish not known to be older than 3.4
+    /// (`task_launch::fish_known_old`, whose first look at a fish asks its
+    /// version off this thread) — that shell and its dialect.
+    pub(crate) fn worker_shell(
+        &self,
+    ) -> Result<(std::path::PathBuf, aterm_agent::harness::upgrade::Dialect), WorkerBlock> {
+        if self.harness.is_none() {
+            return Err(WorkerBlock::Unhosted);
+        }
+        if let Some(switch) = crate::harness_host::worker_unsupervised(
+            &self.harness_policy.get().policy,
+            self.headless,
+        ) {
+            return Err(WorkerBlock::Unsupervised(switch));
+        }
+        if !self.session_factory.integrate {
+            return Err(WorkerBlock::NoIntegration);
+        }
+        let shell =
+            crate::spawn::interactive_shell_program(self.session_factory.shell_override.as_deref());
+        let dialect = crate::task_launch::worker_dialect(&shell).map_err(WorkerBlock::Shell)?;
+        if dialect == aterm_agent::harness::upgrade::Dialect::Fish
+            && crate::task_launch::fish_known_old(&shell)
+        {
+            return Err(WorkerBlock::OldFish);
+        }
+        Ok((shell, dialect))
+    }
+
+    /// A worker's checks before anything is created ([`Self::worker_shell`]),
+    /// and what its start needs ([`WorkerStart`]). The task's `from=` is the
+    /// spawn's `from=` — the client's own session, which another instance may
+    /// host (then no Claude Code of its rides the line) — or `ctl`.
+    fn worker_precheck(&self, order: crate::task_launch::TaskOrder) -> Result<WorkerStart, String> {
+        let (shell, dialect) = self.worker_shell().map_err(WorkerBlock::refusal)?;
+        let (from, caller) = match &order.caller {
+            None => (crate::task_record::FROM_CTL.to_string(), None),
+            Some(sid) => {
+                let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+                match g.by_sid(sid) {
+                    Some(h) => (h.sid.as_str().to_string(), Some(h.local_id)),
+                    None => (sid.as_str().to_string(), None),
+                }
+            }
+        };
+        Ok(WorkerStart {
+            order,
+            from,
+            caller,
+            shell,
+            dialect,
+        })
+    }
+
+    /// The newborn `sid` made a worker ([`Self::start_worker`]), its
+    /// launcher left for [`Self::answer_spawn`] to start — or, when it cannot
+    /// be one, closed again and its task file removed
+    /// ([`Self::unspawn_worker`]), the reason the reply. `identity` is the one
+    /// the newborn spawned under.
+    fn ready_worker(
+        &mut self,
+        sid: &str,
+        worker: WorkerStart,
+        seed: crate::task_launch::TaskSeed,
+        identity: Option<&str>,
+    ) -> Result<PendingWorker, String> {
+        match self.start_worker(sid, worker, identity) {
+            Ok(launch) => Ok(PendingWorker { launch, seed }),
+            Err(why) => {
+                self.unspawn_worker(sid, Some(&seed));
+                Err(why)
+            }
+        }
+    }
+
+    /// The newborn `sid` is a worker: its folder trusted for it alone (the
+    /// window harness's folder-trust rule reads `meta`'s `trusted_cwd=`), and
+    /// its task record `working` with its `from=` — on the main thread, so
+    /// with no wait on a Commit's fence (`task_record::mark_session_task_within`)
+    /// — before the reply; what its launcher needs is returned
+    /// ([`crate::task_launch::launch_worker`]). The line carries the starter's
+    /// Claude home and login only when the worker's `identity` is the
+    /// starter's (`task_launch::carries_starters_login`).
+    fn start_worker(
+        &self,
+        sid: &str,
+        worker: WorkerStart,
+        identity: Option<&str>,
+    ) -> Result<crate::task_launch::Launch, String> {
+        let (newborn, caller) = {
+            let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+            let newborn = g
+                .by_sid(&aterm_session::SessionId::new(sid))
+                .map(|h| (h.local_id, h.term.clone(), h.ctx.clone()));
+            let caller = worker.caller.and_then(|local| {
+                g.by_local(local)
+                    .map(|h| (h.ctx.clone(), h.identity.clone()))
+            });
+            (newborn, caller)
+        };
+        let Some((local, term, ctx)) = newborn else {
+            return Err("the worker did not register".to_string());
+        };
+        let (caller, starter_identity) = caller.unzip();
+        let carries_login = crate::task_launch::carries_starters_login(
+            identity,
+            starter_identity.flatten().as_deref(),
+        );
+        ctx.meta
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .trusted_cwd
+            .clone_from(&worker.order.trusted_cwd);
+        let mut mark = crate::task_record::TaskMark::new(crate::task_record::TaskState::Working);
+        mark.from = Some(worker.from);
+        crate::task_record::mark_session_task_within(
+            &ctx,
+            local,
+            &mark,
+            &self.subscribers,
+            std::time::Duration::ZERO,
+        )
+        .map_err(|_| "busy update-committing".to_string())?;
+        let human = ctx.human_input.seq();
+        Ok(crate::task_launch::Launch {
+            local,
+            term,
+            ctx,
+            store: self.store.clone(),
+            subscribers: self.subscribers.clone(),
+            proxy: self.proxy.clone(),
+            human,
+            shell: worker.shell,
+            dialect: worker.dialect,
+            model: worker.order.model,
+            caller,
+            carries_login,
+        })
+    }
+
+    /// Undo a worker's spawn that could not start or whose reply nobody took
+    /// ([`Self::ready_worker`], [`Self::answer_spawn`]): close the newborn
+    /// `sid` with no confirm — nothing was typed into it, and its shell's rc
+    /// files are all that can run there — and remove the task file its seed
+    /// wrote.
+    fn unspawn_worker(&mut self, sid: &str, seed: Option<&crate::task_launch::TaskSeed>) {
+        let local = self
+            .store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .by_sid(&aterm_session::SessionId::new(sid))
+            .map(|h| h.local_id);
+        if let Some(local) = local {
+            let _closing = crate::session_store::CloseAttribution::enter(
+                crate::session_store::ExitReason::CtlClose,
+                crate::session_store::ExitActor::Ctl,
+            );
+            let policy = std::mem::replace(
+                &mut self.close_confirm,
+                crate::app_window::CloseConfirm::Programmatic,
+            );
+            if let Err(why) = self.close_session_by_id(local) {
+                aterm_log::warn!("worker {sid} did not start and could not be closed: {why}");
+            }
+            self.close_confirm = policy;
+        }
+        if let Some(seed) = seed {
+            seed.discard();
+        }
     }
 
     /// The identity label of the session with local id `local`, from the
@@ -4052,6 +4634,15 @@ mod fx_parse_tests {
                 on: CelebrateOn::Green
             })
         );
+        // The program's own turn end (OSC 7501 `done`).
+        assert_eq!(
+            parse_fx_form("celebrate on=done"),
+            Ok(FxCtlOp::Celebrate {
+                sig: song_signature('C'),
+                bars: 2,
+                on: CelebrateOn::Done
+            })
+        );
     }
 
     /// Refused: an unknown form, an unknown key, a bare word, a multi-character
@@ -4069,75 +4660,26 @@ mod fx_parse_tests {
             "celebrate bars=5",
             "celebrate bars=two",
             "celebrate on=red",
+            "celebrate on=DONE",
+            "celebrate on=done on=green",
             "celebrate bars=2 bars=3",
         ] {
             assert!(parse_fx_form(bad).is_err(), "{bad:?} must be refused");
         }
+        let usage = parse_fx_form("celebrate on=red").expect_err("refused");
+        assert!(usage.contains("on=green|enter|done"), "{usage}");
     }
 }
 
 #[cfg(test)]
 mod spawn_parse_tests {
+    #[cfg(unix)]
+    use super::spawn_cwd_refusal;
     use super::{
-        IdentitySpec, SpawnForm, parse_spawn_args, resolve_spawn_identity, spawn_cwd_refusal,
-        spawn_identity_refusal, split_quoted_tokens,
+        AgentSpec, IdentitySpec, SpawnForm, parse_spawn_args, resolve_spawn_identity,
+        split_quoted_tokens,
     };
     use crate::connections::{ConnectedSpawnKind, ConnectedSpawnPlace};
-
-    /// `spawn identity=<name>` makes its identity on the CONTROL thread, before
-    /// anything is posted to the event loop: a name that cannot be made is this
-    /// spawn's reply, `ERR identity <name>: <why>`, which `cmd_spawn` returns
-    /// with no tab asked for. One that can is made and primed here, in both
-    /// forms, so the spawner's half only checks it
-    /// ([`crate::agent_identity::check_for_spawn`]) — and that check never
-    /// makes one: a name nobody made is refused there. NEGATIVE CONTROLS: no
-    /// `identity=`, and `identity=-`, make nothing.
-    #[test]
-    fn a_named_identity_is_made_before_the_spawn_is_posted_and_its_failure_is_the_reply() {
-        let scratch = aterm_tempfile::Builder::new()
-            .prefix("aterm-spawn-identity")
-            .tempdir()
-            .expect("scratch dir");
-        let refusal = |rest: &str| spawn_identity_refusal(&parse_spawn_args(rest).expect("parses"));
-        crate::test_env::scoped("ATERM_STATE_HOME", scratch.path().join("state"), || {
-            let identities = aterm_types::dirs::identities_dir().expect("a state root");
-            for rest in [
-                "",
-                "identity=-",
-                "cwd=/tmp",
-                "connected=controller place=tab of=s-abc",
-            ] {
-                assert_eq!(refusal(rest), None, "{rest:?}");
-            }
-            assert!(!identities.exists(), "no identity named, none made");
-            let unmade = crate::agent_identity::check_for_spawn("worker", false)
-                .expect_err("the loop's check refuses an identity nobody made");
-            assert_eq!(unmade.kind(), std::io::ErrorKind::NotFound);
-            assert!(!identities.exists(), "and makes none");
-
-            assert_eq!(refusal("identity=Worker"), None);
-            assert!(
-                identities.join("worker/.claude/CLAUDE.md").is_file(),
-                "primed"
-            );
-            assert_eq!(
-                crate::agent_identity::check_for_spawn("worker", false).expect("made"),
-                identities.join("worker")
-            );
-            assert_eq!(
-                refusal("connected=controlled place=tab of=s-abc identity=reviewer"),
-                None
-            );
-            assert!(identities.join("reviewer/.codex/AGENTS.md").is_file());
-
-            // A name that cannot be made: the identities root is a file.
-            std::fs::remove_dir_all(&identities).expect("clear the root");
-            std::fs::write(&identities, b"").expect("a file in the root's place");
-            let refused = refusal("identity=worker").expect("refused on the control thread");
-            assert!(refused.starts_with("ERR identity worker: "), "{refused:?}");
-            assert!(refused.ends_with('\n') && refused.lines().count() == 1);
-        });
-    }
 
     /// AUDIT #7 FINDING 48 — `spawn cwd=<dir>` naming no folder is refused by
     /// name, in both forms, before anything is spawned: the agent that asked
@@ -4268,6 +4810,75 @@ mod spawn_parse_tests {
         }
     }
 
+    /// A WORKER's spawn (`agent=claude [model=<m>] [from=<sid>] len=<n>`):
+    /// `agent=` is claude, or another agent aterm reads (codex, agy, muse,
+    /// gemini: reserved), `model=` is `[A-Za-z0-9._-]{1,64}`, `from=` a sid,
+    /// and they and the frame's `len=` come only with `agent=`, which never
+    /// joins the connected form. Everything else is the usage line.
+    #[test]
+    fn a_worker_spawn_parses_agent_model_and_its_frame() {
+        let agent_of = |rest: &str| match parse_spawn_args(rest) {
+            Ok(SpawnForm::Plain { agent, .. }) => agent,
+            other => panic!("{rest:?}: {other:?}"),
+        };
+        assert_eq!(agent_of(""), None);
+        assert_eq!(
+            agent_of("agent=claude len=12"),
+            Some(AgentSpec::Claude {
+                model: None,
+                from: None
+            })
+        );
+        assert_eq!(
+            agent_of("cwd=/w raise=false agent=claude model=claude-opus-4.1 from=s-ab12 len=3"),
+            Some(AgentSpec::Claude {
+                model: Some("claude-opus-4.1".to_string()),
+                from: Some(aterm_session::SessionId::new("s-ab12")),
+            })
+        );
+        let longest = "M".repeat(64);
+        assert_eq!(
+            agent_of(&format!("model={longest} agent=claude len=1 split=v")),
+            Some(AgentSpec::Claude {
+                model: Some(longest.clone()),
+                from: None,
+            })
+        );
+        for program in [
+            aterm_phase::Program::Codex,
+            aterm_phase::Program::Agy,
+            aterm_phase::Program::Muse,
+            aterm_phase::Program::Gemini,
+        ] {
+            assert_eq!(
+                agent_of(&format!("agent={} len=1", program.name())),
+                Some(AgentSpec::Reserved(program))
+            );
+        }
+        let too_long = format!("agent=claude model={longest}x len=1");
+        for bad in [
+            "agent=",
+            "agent=generic",
+            "agent=Claude",
+            "model=opus",
+            "from=s-ab12",
+            "len=4",
+            "agent=claude model=",
+            "agent=claude from=",
+            "agent=claude from=ctl",
+            "agent=claude from=s-xyz",
+            "agent=claude model=a/b",
+            "agent=claude model=a$b",
+            "agent=claude model=a\u{e9}",
+            too_long.as_str(),
+            "agent=claude connected=controlled place=tab of=s-a",
+            "connected=controlled place=tab of=s-a len=3",
+        ] {
+            assert_eq!(parse_spawn_args(bad), Err(()), "{bad}");
+        }
+        assert!(super::SPAWN_USAGE.contains("agent=claude [model=<m>] [from=<sid>] len=<n>"));
+    }
+
     #[test]
     fn plain_spawn_parses_with_and_without_cwd() {
         assert_eq!(
@@ -4279,6 +4890,7 @@ mod spawn_parse_tests {
                 split: None,
                 identity: None,
                 theme: None,
+                agent: None,
             })
         );
         assert_eq!(
@@ -4290,6 +4902,7 @@ mod spawn_parse_tests {
                 split: None,
                 identity: None,
                 theme: None,
+                agent: None,
             })
         );
         assert_eq!(
@@ -4301,6 +4914,7 @@ mod spawn_parse_tests {
                 split: Some(crate::pane::SplitDir::Vertical),
                 identity: None,
                 theme: None,
+                agent: None,
             })
         );
         // The quoted `cwd=` reaches the plain form through the same tokenizer.
@@ -4313,6 +4927,7 @@ mod spawn_parse_tests {
                 split: None,
                 identity: None,
                 theme: None,
+                agent: None,
             })
         );
         assert_eq!(parse_spawn_args("bogus"), Err(()));
@@ -4394,6 +5009,7 @@ mod spawn_parse_tests {
                 split: None,
                 identity: Some(IdentitySpec::Named("worker".to_string())),
                 theme: None,
+                agent: None,
             })
         );
         assert_eq!(
@@ -4405,6 +5021,7 @@ mod spawn_parse_tests {
                 split: Some(crate::pane::SplitDir::Vertical),
                 identity: Some(IdentitySpec::Default),
                 theme: None,
+                agent: None,
             })
         );
         assert!(matches!(
@@ -4893,6 +5510,278 @@ mod spawn_aim_app_tests {
         assert_eq!(app.windows[&front].tab_set.len(), 1);
         assert!(!app.windows[&front].pending_close);
         assert!(app.structural_invariants_ok());
+    }
+}
+
+/// A worker's start on the main thread, after its spawn: the newborn made a
+/// worker or closed again ([`crate::App::ready_worker`]), and its launcher
+/// started only once its reply is taken ([`crate::App::answer_spawn`]). The
+/// newborns are stub tabs (no PTY), so what a spawn would have created is
+/// here without one.
+#[cfg(test)]
+mod worker_start_app_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use aterm_agent::harness::upgrade::Dialect;
+    use aterm_session::SessionId;
+    #[cfg(unix)]
+    use aterm_session::sink::SinkWriter;
+
+    #[cfg(unix)]
+    use super::Spawned;
+    use super::WorkerStart;
+    use crate::task_launch::{TaskOrder, TaskSeed, task_text};
+    use crate::task_record::TaskState;
+    use crate::{App, WindowId};
+
+    /// What a worker's start needs, its starter `ctl`.
+    fn worker() -> WorkerStart {
+        WorkerStart {
+            order: TaskOrder {
+                task: b"the task".to_vec(),
+                model: None,
+                caller: None,
+                trusted_cwd: None,
+                fact_line: true,
+            },
+            from: crate::task_record::FROM_CTL.to_string(),
+            caller: None,
+            shell: PathBuf::from("/bin/zsh"),
+            dialect: Dialect::Zsh,
+        }
+    }
+
+    /// The seed of `sid`'s task file, written where the state home says.
+    fn seeded(sid: &str) -> (TaskSeed, PathBuf) {
+        let seed = TaskSeed::new(task_text(b"the task", Some(crate::task_record::FROM_CTL)));
+        let path = seed.write_for(&SessionId::new(sid)).expect("written");
+        (seed, path)
+    }
+
+    fn sid_of(app: &App, local: u64) -> String {
+        app.store
+            .read()
+            .unwrap()
+            .by_local(local)
+            .map(|h| h.sid.as_str().to_string())
+            .expect("registered")
+    }
+
+    fn ctx_of(app: &App, local: u64) -> Arc<crate::SessionCtx> {
+        app.pool.get(local).expect("live session").ctx.clone()
+    }
+
+    /// A WORKER THAT CANNOT START LEAVES NOTHING BEHIND: one that did not
+    /// register is refused and its task file removed; one whose `working`
+    /// mark a committing update's fence refuses is closed again too. The
+    /// NEGATIVE CONTROL is the same start with no fence: a worker, `working`
+    /// from its starter, its tab and its task file standing — until its
+    /// session closes, which removes the file.
+    #[test]
+    fn a_worker_that_cannot_start_is_closed_again_and_leaves_no_task_file() {
+        let state = aterm_tempfile::Builder::new()
+            .prefix("aterm-worker-start")
+            .tempdir()
+            .expect("scratch state home");
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.push_stub_tab(wid, crate::stub_session(1));
+            app.push_stub_tab(wid, crate::stub_session(2));
+
+            let ghost = "s-0123dead";
+            let (seed, path) = seeded(ghost);
+            assert_eq!(
+                app.ready_worker(ghost, worker(), seed, None)
+                    .err()
+                    .as_deref(),
+                Some("the worker did not register")
+            );
+            assert!(!path.exists(), "the task file of a worker that is not");
+
+            let busy = sid_of(&app, 1);
+            let fenced = ctx_of(&app, 1);
+            let _ = fenced.fabric.fence_hold(false);
+            let (seed, path) = seeded(&busy);
+            assert_eq!(
+                app.ready_worker(&busy, worker(), seed, None)
+                    .err()
+                    .as_deref(),
+                Some("busy update-committing")
+            );
+            fenced.fabric.lift_hold_fence();
+            assert!(app.pool.get(1).is_none(), "the newborn is closed again");
+            assert!(!path.exists(), "and its task file removed");
+
+            let ready = sid_of(&app, 2);
+            let (seed, path) = seeded(&ready);
+            let pending = app
+                .ready_worker(&ready, worker(), seed, None)
+                .expect("a worker");
+            assert!(app.pool.get(2).is_some(), "the worker stands");
+            assert!(path.exists(), "with its task file");
+            let record = ctx_of(&app, 2)
+                .timeline
+                .lock()
+                .unwrap()
+                .task()
+                .cloned()
+                .expect("a record");
+            assert_eq!(
+                (record.state, record.from.as_str()),
+                (TaskState::Working, "ctl")
+            );
+            drop(pending);
+            app.close_confirm = crate::app_window::CloseConfirm::Programmatic;
+            assert!(app.close_session_by_id(2).is_ok(), "it closes");
+            assert!(!path.exists(), "a closed worker's task file goes with it");
+        });
+    }
+
+    /// A pipe a stub session's sink writes into, its read end non-blocking.
+    #[cfg(unix)]
+    fn pipe() -> [i32; 2] {
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(pipe[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        pipe
+    }
+
+    /// What the pipe holds now.
+    #[cfg(unix)]
+    fn drained(fd: i32) -> Vec<u8> {
+        let mut bytes = [0u8; 4096];
+        let read = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+        usize::try_from(read).map_or_else(|_| Vec::new(), |n| bytes[..n].to_vec())
+    }
+
+    /// What worker `local`'s launcher said it did with its line, waited for
+    /// at most a minute (a hang detector: the launcher must say).
+    #[cfg(unix)]
+    fn launch_note(app: &App, local: u64) -> String {
+        let ctx = ctx_of(app, local);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let said = ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .worker_launch()
+                .map(|(_, words)| words.clone());
+            if let Some(words) = said {
+                return words;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the launcher said nothing within a minute"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A WORKER'S LAUNCHER STARTS ONLY ONCE ITS REPLY IS TAKEN: a worker
+    /// whose `OK <sid>` nobody took (the lane's end dropped) is closed again,
+    /// its task file removed, and nothing is typed into it. The NEGATIVE
+    /// CONTROL, the same worker with its reply taken, has its launcher run to
+    /// its prompt and on to the line's main-thread admission, and keeps its tab
+    /// and its file, so the first case's silence is the dropped reply's doing.
+    /// A headless App has no event loop to admit the line on, so the launcher
+    /// says so and types nothing; the admission itself is
+    /// `control_tests::a_guarded_key_presses_when_a_row_matches_and_writes_nothing_when_none_does`.
+    #[cfg(unix)]
+    #[test]
+    fn a_workers_launcher_starts_only_once_its_reply_is_taken() {
+        let state = aterm_tempfile::Builder::new()
+            .prefix("aterm-worker-reply")
+            .tempdir()
+            .expect("scratch state home");
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            let (dropped, taken) = (pipe(), pipe());
+            for (local, pipe) in [(1, dropped), (2, taken)] {
+                app.push_stub_tab(
+                    wid,
+                    crate::stub_session_with_sink(local, Arc::new(SinkWriter::new(pipe[1]))),
+                );
+                // The shell's first prompt, its line editor reading.
+                crate::feed_session_for_test(&app, local, b"\x1b]133;A\x07$ \x1b]133;B\x07");
+                assert!(matches!(
+                    app.pool
+                        .get(local)
+                        .unwrap()
+                        .term
+                        .lock()
+                        .unwrap()
+                        .all_blocks()
+                        .last()
+                        .map(|b| b.state),
+                    Some(aterm_core::terminal::BlockState::EnteringCommand)
+                ));
+            }
+
+            let sid = sid_of(&app, 1);
+            let dropped_ctx = ctx_of(&app, 1);
+            let (seed, path) = seeded(&sid);
+            let pending = app
+                .ready_worker(&sid, worker(), seed, None)
+                .expect("a worker");
+            let (tx, rx) = std::sync::mpsc::channel();
+            drop(rx);
+            app.answer_spawn(
+                Ok(Spawned {
+                    sid,
+                    worker: Some(pending),
+                }),
+                &tx,
+            );
+            assert!(
+                app.pool.get(1).is_none(),
+                "an unowned worker is closed again"
+            );
+            assert!(!path.exists(), "and its task file removed");
+            assert_eq!(drained(dropped[0]), b"", "nothing was typed into it");
+            assert!(
+                dropped_ctx
+                    .timeline
+                    .lock()
+                    .unwrap()
+                    .worker_launch()
+                    .is_none(),
+                "and no launcher started for it"
+            );
+
+            let sid = sid_of(&app, 2);
+            let (seed, path) = seeded(&sid);
+            let pending = app
+                .ready_worker(&sid, worker(), seed, None)
+                .expect("a worker");
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.answer_spawn(
+                Ok(Spawned {
+                    sid: sid.clone(),
+                    worker: Some(pending),
+                }),
+                &tx,
+            );
+            assert_eq!(rx.recv().expect("answered"), Ok(sid));
+            // The launcher ran: it says what became of its line (here, that no
+            // event loop admitted it).
+            let said = launch_note(&app, 2);
+            assert_eq!(drained(taken[0]), b"", "nothing typed: {said}");
+            assert!(app.pool.get(2).is_some(), "the worker stands");
+            assert!(path.exists(), "with its task file");
+            drop(app);
+            for fd in dropped.into_iter().chain(taken) {
+                unsafe { libc::close(fd) };
+            }
+        });
     }
 }
 

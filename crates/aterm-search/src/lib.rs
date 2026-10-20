@@ -52,8 +52,6 @@ pub struct TerminalSearch {
     index: SearchIndex,
     /// Number of lines from scrollback that have been indexed.
     indexed_scrollback_lines: usize,
-    /// Bumped on every index mutation.
-    generation: u64,
 }
 
 impl TerminalSearch {
@@ -63,7 +61,6 @@ impl TerminalSearch {
         Self {
             index: SearchIndex::new(),
             indexed_scrollback_lines: 0,
-            generation: 0,
         }
     }
 
@@ -81,7 +78,6 @@ impl TerminalSearch {
         Self {
             index,
             indexed_scrollback_lines: 0,
-            generation: 0,
         }
     }
 
@@ -92,7 +88,6 @@ impl TerminalSearch {
         Self {
             index: SearchIndex::with_capacity_and_max(expected_lines, max_cached_lines),
             indexed_scrollback_lines: 0,
-            generation: 0,
         }
     }
 
@@ -124,26 +119,11 @@ impl TerminalSearch {
         self.index.results_may_be_incomplete()
     }
 
-    /// The generation counter.
-    #[must_use]
-    #[inline]
-    #[cfg(test)]
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    /// Bump the generation counter (internal helper).
-    #[inline]
-    fn bump_generation(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-    }
-
     /// Index a line pushed to scrollback.
     pub fn index_scrollback_line(&mut self, text: &str) {
         self.index.push_line(text);
         // Saturating only to carry the no-overflow proof for the Trust L0 gate.
         self.indexed_scrollback_lines = self.indexed_scrollback_lines.saturating_add(1);
-        self.bump_generation();
     }
 
     /// Index multiple scrollback lines.
@@ -169,11 +149,9 @@ impl TerminalSearch {
                 None,
             );
         }
-        self.bump_generation();
     }
 
     /// Index owned lines at absolute row numbers, moving each `String` into the cache.
-    /// Bumps the generation once per batch.
     pub fn index_numbered_content_owned(
         &mut self,
         lines: impl IntoIterator<Item = (usize, String)>,
@@ -182,7 +160,6 @@ impl TerminalSearch {
             self.index
                 .index_line_cow(absolute_row, Cow::Owned(line), None);
         }
-        self.bump_generation();
     }
 
     /// Index owned grid rows at absolute row numbers, each with the [`LineCells`] its
@@ -197,7 +174,6 @@ impl TerminalSearch {
             self.index
                 .index_line_cow(absolute_row, Cow::Owned(line), Some(&cells));
         }
-        self.bump_generation();
     }
 
     /// Record whether the bulk snapshot just built omitted an older history prefix:
@@ -205,21 +181,12 @@ impl TerminalSearch {
     /// them exhaustive. See [`SearchIndex::set_history_prefix_eviction`].
     pub fn set_history_prefix_eviction(&mut self, lowest_retained_line: Option<usize>) {
         self.index.set_history_prefix_eviction(lowest_retained_line);
-        self.bump_generation();
     }
 
     /// Drop rows the terminal no longer retains, without eviction bookkeeping; see
     /// [`SearchIndex::drop_history_below`].
     pub fn drop_history_below(&mut self, first_retained_line: usize) {
         self.index.drop_history_below(first_retained_line);
-        self.bump_generation();
-    }
-
-    /// Bump the generation after content was invalidated. Does not remove index
-    /// entries; use [`clear`](Self::clear) and re-index for that.
-    #[cfg(test)]
-    pub fn invalidate(&mut self) {
-        self.bump_generation();
     }
 
     /// Check if a query might have matches.
@@ -444,7 +411,6 @@ impl TerminalSearch {
     pub fn clear(&mut self) {
         self.index.clear();
         self.indexed_scrollback_lines = 0;
-        self.bump_generation();
     }
 
     /// Like [`clear`](Self::clear), but returns the grown map and vector capacity to
@@ -453,7 +419,6 @@ impl TerminalSearch {
     pub fn release(&mut self) {
         self.index.release();
         self.indexed_scrollback_lines = 0;
-        self.bump_generation();
     }
 }
 

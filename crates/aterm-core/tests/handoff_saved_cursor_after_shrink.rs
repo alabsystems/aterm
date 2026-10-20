@@ -112,44 +112,45 @@ fn a_shrink_carries_the_alternate_screen_saved_cursor_with_its_row() {
     assert_eq!(saved.cursor_row, ROWS - 2);
 }
 
-/// Same-size parity: the live engine and one restored from the checkpoint
-/// leave the alternate screen onto the same cell, after the prompt.
+/// The live engine and one restored from the checkpoint leave the alternate
+/// screen onto the same cell, after the prompt: at the shrunken size, where both
+/// cursors agree, and grown back, the production sequence (the outgoing process
+/// parks at 55 rows, the successor restores at 55, grows back to 56, and the
+/// full-screen app quits). The live grow reveals the demoted row (prompt back on
+/// row 55); the restored engine has no history behind the saved primary,
+/// appends a row and keeps the prompt on row 54. Both slots followed their
+/// prompt, so both land after `$ claude`.
 #[test]
-fn a_restored_terminal_leaves_the_alternate_screen_onto_the_same_cell_at_the_same_size() {
-    let mut live = prompt_on_the_last_row();
-    live.process(b"\x1b[?1049h");
-    live.resize(ROWS - 1, COLS);
-    let cp = live.checkpoint_carry(CARRY).expect("parser is Ground");
-    let mut restored = Terminal::from_checkpoint(&cp);
+fn a_restored_terminal_leaves_the_alternate_screen_onto_the_same_cell_as_the_live_one() {
+    for grow_back in [false, true] {
+        let mut live = prompt_on_the_last_row();
+        live.process(b"\x1b[?1049h");
+        live.resize(ROWS - 1, COLS);
+        let cp = live.checkpoint_carry(CARRY).expect("parser is Ground");
+        let mut restored = Terminal::from_checkpoint(&cp);
 
-    for t in [&mut live, &mut restored] {
-        t.process(b"\x1b[?1049l");
+        for t in [&mut live, &mut restored] {
+            if grow_back {
+                t.resize(ROWS, COLS);
+            }
+            t.process(b"\x1b[?1049l");
+        }
+        if !grow_back {
+            assert_eq!(restored.cursor(), live.cursor());
+        }
+        let expected = if grow_back { ROWS - 1 } else { ROWS - 2 };
+        assert_eq!(live.cursor().row, expected, "grow_back={grow_back}");
+        assert_eq!(
+            under_cursor(&live),
+            ("$ claude".to_string(), 8),
+            "grow_back={grow_back}"
+        );
+        assert_eq!(
+            under_cursor(&restored),
+            under_cursor(&live),
+            "grow_back={grow_back}"
+        );
     }
-    assert_eq!(restored.cursor(), live.cursor());
-    assert_eq!(live.cursor().row, ROWS - 2);
-    assert_eq!(under_cursor(&live), ("$ claude".to_string(), 8));
-}
-
-/// Grow-back parity, the production sequence: the outgoing process parks at 55 rows, the
-/// successor restores at 55, grows back to 56, and the full-screen app quits. The live
-/// grow reveals the demoted row (prompt back on row 55); the restored engine has no
-/// history behind the saved primary, appends a row and keeps the prompt on row 54. Both
-/// slots followed their prompt, so both land after `$ claude`.
-#[test]
-fn a_restored_terminal_leaves_the_alternate_screen_onto_the_same_cell_after_growing_back() {
-    let mut live = prompt_on_the_last_row();
-    live.process(b"\x1b[?1049h");
-    live.resize(ROWS - 1, COLS);
-    let cp = live.checkpoint_carry(CARRY).expect("parser is Ground");
-    let mut restored = Terminal::from_checkpoint(&cp);
-
-    for t in [&mut live, &mut restored] {
-        t.resize(ROWS, COLS);
-        t.process(b"\x1b[?1049l");
-    }
-    assert_eq!(live.cursor().row, ROWS - 1, "the row the prompt is back on");
-    assert_eq!(under_cursor(&live), ("$ claude".to_string(), 8));
-    assert_eq!(under_cursor(&restored), under_cursor(&live));
 }
 
 /// The same parity for a bare DECRC on the main screen, at the shrunken size

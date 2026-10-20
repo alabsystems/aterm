@@ -19,13 +19,11 @@
 //! tests/decode_libzstd.rs at 13f0e82be); it accepted the two valid
 //! window-limit frames below with the same bytes.
 
-mod support;
-
 use std::io::{self, Read};
 
+use crate::support::noise;
 use aterm_zstd::frame::{self, BLOCK_MAX, Checksum, MAGIC, WINDOW_MAX};
 use aterm_zstd::{DecodeError, Decoder};
-use support::noise;
 
 fn ours(zst: &[u8]) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();

@@ -36,7 +36,7 @@
 //!   released.
 
 use super::super::journal::{
-    ADOPTED, ATTENTION_SKIPPED, CLEARED_HIDDEN, CLEARED_STALE, ESCALATED_BEHIND, MAIL_UNPARKED,
+    ADOPTED, AGAIN_UNPARKED, ATTENTION_SKIPPED, CLEARED_HIDDEN, CLEARED_STALE, ESCALATED_BEHIND,
 };
 use super::escalate::{point_label, status_field};
 use super::*;
@@ -44,6 +44,27 @@ use super::*;
 /// The `<why>` of the `CLEARED seq=<n> attention=<said> <why>` line that takes
 /// a limit's badge down as an Off park starts ([`Session::lower_badges`]).
 const PARKED_OFF: &str = "the session's autopilot is off";
+
+/// The journal's note AN OFF PARK STARTS WITH ([`Session::park_while_off`]):
+/// `PARKED seq=<n> autopilot=off: …`. Every build since Autopilot (0.105.0)
+/// writes it in these words, and a loop that follows reads it as Off standing
+/// where the ledger holds no record of that (a build before
+/// [`approvals::RULE_OFF_STOOD`], [`is_parked_off`]).
+pub(super) fn parked_off_note(seq: u64) -> String {
+    format!(
+        "PARKED seq={seq} autopilot=off: the harness keeps its hands off this session \
+         (nothing pressed, typed or escalated) until its word changes"
+    )
+}
+
+/// Whether journal line `line` is [`parked_off_note`]'s.
+pub(super) fn is_parked_off(line: &str) -> bool {
+    line.strip_prefix("PARKED seq=")
+        .and_then(|rest| rest.split_once(' '))
+        .is_some_and(|(seq, rest)| {
+            seq.bytes().all(|b| b.is_ascii_digit()) && rest.starts_with("autopilot=off")
+        })
+}
 
 /// What makes two refusals THE SAME for the journal ([`Session::refusal_news`]):
 /// the words, with every field that MEASURES dropped — a `<name>=<number>`
@@ -89,16 +110,21 @@ impl<C: Ctl> Session<'_, C> {
         // and stays there after `cd x && claude`, in a worktree and after the
         // harness's own relaunch (`( cd -- DIR && exec claude --resume … )`):
         // `meta` then says `cwd=…/proj agent_cwd=…/proj/sub`, and a relative
-        // `rm` was judged against the wrong folder.
+        // `rm` was judged against the wrong folder. An absolute directory is
+        // `/`-rooted, or on Windows drive-rooted (`C:\…`, what the OS reads
+        // back for `agent_cwd=`).
         let field = |key: &str| {
             line.split_whitespace()
                 .find_map(|w| w.strip_prefix(key))
                 .filter(|v| *v != "-" && !v.is_empty())
                 .map(super::super::report::pct_decode)
-                .filter(|p| p.starts_with('/'))
+                .filter(|p| p.starts_with('/') || std::path::Path::new(p).is_absolute())
                 .map(PathBuf::from)
         };
         self.cwd = field("agent_cwd=").or_else(|| field("cwd="));
+        // The folder an Owner's `spawn agent=claude` trusted for this session
+        // (`ApprovalCtx::trusted_cwd`); an older host prints no such key.
+        self.trusted_cwd = field("trusted_cwd=");
     }
 
     /// A press or a dismissal the server did not take: parked on the hold
@@ -234,7 +260,7 @@ impl<C: Ctl> Session<'_, C> {
     /// it kept ([`Self::raise_parked_badge`]) unless a read of the park saw
     /// the worker working — that badge's end — and the point decided afresh
     /// raises a badge again where its point still shows: a box's or a
-    /// question's anew, a limit's as the same episode with no second mail
+    /// question's anew, a limit's as the same episode with no second ask
     /// (unless a read of the park saw the worker answer past the notice: a
     /// new episode then), and an act's own miss, where its act is tried again
     /// and misses again, as a second ask over the turn-end badge set again. A
@@ -260,10 +286,7 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
-        review.note(&format!(
-            "PARKED seq={seq} autopilot=off: the harness keeps its hands off this session \
-             (nothing pressed, typed or escalated) until its word changes"
-        ));
+        review.note(&parked_off_note(seq));
         self.lower_badges(seq, review)?;
         self.give_back_claim();
         self.off_stood(seq);
@@ -291,7 +314,7 @@ impl<C: Ctl> Session<'_, C> {
                         // notice, as at a look: the limit's episode the park
                         // kept is over for good ([`Retry`]), and so is a
                         // limit adopted from a previous loop — a limit met
-                        // after it is a new one, mailed.
+                        // after it is a new one, a new ask.
                         _ => {
                             self.retry = None;
                             self.adopted_limit_over(screen.seq, ANSWERED_PAST_LIMIT, review)?;
@@ -381,8 +404,10 @@ impl<C: Ctl> Session<'_, C> {
     /// previous supervisor left on the worker (owner `supervisor`) — a
     /// watcher that died, the host before a restart — is settled. When the screen still shows its point (the same box or
     /// question, by [`point_label`]; a limit notice under a `limited:` text)
-    /// it is ADOPTED: the point counts as escalated, so no second badge or
-    /// mail goes out for it. Otherwise it is unset, by its key. The server
+    /// it is ADOPTED: the point counts as escalated, so no second badge goes
+    /// out for it. Otherwise it is unset, by its key — save a window host
+    /// deadline's ([`super::task_mark::deadline_attention`]), which is left as
+    /// it stands for the host that raised it with its task's stall. The server
     /// shows only the most recent entry: one of ours under a person's is
     /// unset unread. Another owner's entry is never touched. Journaled
     /// `ADOPTED seq=<n> attention=<text>` or `CLEARED seq=<n> stale
@@ -427,6 +452,15 @@ impl<C: Ctl> Session<'_, C> {
         let Some(text) = standing_attention(&read.stdout) else {
             return Ok(());
         };
+        // The window host's deadline's (a worker never started, or held
+        // where nothing moves): the host raised it with the task's stall and
+        // takes it down where the stall ends, so it is never this loop's
+        // stale point. Cleared here, a loop restarted over a standing stall
+        // (a seamless update's successor, Autopilot back from Off) left the
+        // record `stalled` with nothing saying what holds it.
+        if super::task_mark::deadline_attention(&text) {
+            return Ok(());
+        }
         let screen = self.screen()?;
         let turn = self.point_of(screen);
         // An idle point the turn-end policy escalated (`claude idle: …`,
@@ -505,12 +539,12 @@ impl<C: Ctl> Session<'_, C> {
     /// episode's close keeps it as a [`Retry`] (as a busy read's does,
     /// `run.rs`'s `limit_on_busy`), and an adopted badge keeps its marker,
     /// so the notice still up after the park sets the badge again with no
-    /// second mail (`mail=skipped: the retry hit the wall again …` or
-    /// `… adopted …`), which the harness's stats count as no second
+    /// second ask (`again=the retry hit the wall again …` or
+    /// `again=adopted …`), which the harness's stats count as no second
     /// escalation. Each is kept only until a read shows the worker answered
     /// on a point that is not the notice — a read of the park, or a look
     /// after it ([`Self::adopted_limit_over`]) — so a limit met after that is
-    /// a new episode, mailed. The TURN-END POLICY'S badge mostly carries no
+    /// a new episode, a new ask. The TURN-END POLICY'S badge mostly carries no
     /// point the rejudge raises it again from — `/login`'s "finish sign-in",
     /// said once — so its text is
     /// kept ([`Session::badge_parked`]) and set again as the park ends on a
@@ -544,9 +578,9 @@ impl<C: Ctl> Session<'_, C> {
     /// THE TURN-END POLICY'S BADGE SET AGAIN as an Off park ends on a word
     /// ([`Self::park_while_off`], after the claim is taken again): the text
     /// [`Self::lower_badges`] kept ([`Session::badge_parked`]) is set as
-    /// this loop's entry again — no mail (the ask went when it was first
-    /// raised), journaled `ESCALATED seq=<n> attention=<reply>
-    /// mail=skipped: set again after an off park` ([`MAIL_UNPARKED`]), which
+    /// this loop's entry again — no second ask (the ask went when it was
+    /// first raised), journaled `ESCALATED seq=<n> attention=<reply>
+    /// again=set again after an off park` ([`AGAIN_UNPARKED`]), which
     /// the harness's stats read as a badge up again, not a second
     /// escalation — and cleared as before, once the worker works. Every
     /// turn-end badge is set again so, whether or not a point raises it
@@ -565,11 +599,11 @@ impl<C: Ctl> Session<'_, C> {
         if let Some(holder) = self.claim.watching_behind() {
             review.note(&format!(
                 "ESCALATED seq={seq} {ATTENTION_SKIPPED}{ESCALATED_BEHIND} ({holder}) answers \
-                 this session mail=skipped: the same"
+                 this session"
             ));
             return Ok(());
         }
-        if self.withhold_badge(seq, "ask", review)? {
+        if self.withhold_badge(seq, super::escalate::Escalation::Ask, review)? {
             return Ok(());
         }
         let owner = format!("owner={ATTENTION_OWNER}");
@@ -579,13 +613,14 @@ impl<C: Ctl> Session<'_, C> {
             self.turn_end_badge = true;
         }
         review.note(&format!(
-            "ESCALATED seq={seq} attention={} mail={MAIL_UNPARKED}",
+            "ESCALATED seq={seq} attention={} again={AGAIN_UNPARKED}",
             reply_word(&r)
         ));
         Ok(())
     }
 
-    /// The in-GUI host's loop: `Self::watch`'s, under `opts` (normally
+    /// The in-GUI host's loop: the engine's watching loop (one flushed line
+    /// per approval and per review point, [`Lines`]), under `opts` (normally
     /// [`SuperviseOpts::hosted`]), until `stop` is set. The flag is checked at
     /// every look and before every wait ([`Self::call`] refuses a wait or a
     /// write once it is set), so the loop ends within one wait: 20 s at most
@@ -602,8 +637,8 @@ impl<C: Ctl> Session<'_, C> {
         out: &mut (dyn Write + Send),
     ) -> Result<(), String> {
         self.stop = Some(stop);
-        // No teller rides beside the hosted loop: the story lines it owes the
-        // window (`story chose …`) go out on its own connection.
+        // The story lines the hosted loop owes the window (`story chose …`)
+        // go out on its own connection.
         self.tell_own = true;
         if self.setup.ledger_path.is_none() {
             self.setup.ledger_path.clone_from(&opts.ledger);
@@ -622,14 +657,13 @@ impl<C: Ctl> Session<'_, C> {
             out,
             journal,
             warn: Some(&mut warn),
-            teller: None,
             fx: self.fx.clone(),
         });
         let mut review = Lines {
             sink: &sink,
             allow: &allow,
         };
-        let end = self.run_loop(opts, &sink, None::<&mut NoLane>, &mut review);
+        let end = self.drive(opts, &mut review);
         // A stop that cut a request short (the transport's interrupter)
         // ends the loop as a stop, not as the failure the cut request saw.
         let end = if self.stopped() { Ok(End::Quit) } else { end };
@@ -659,7 +693,7 @@ impl<C: Ctl> Session<'_, C> {
         let _ = sink
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .line(&line, None);
+            .line(&line);
         result
     }
 }

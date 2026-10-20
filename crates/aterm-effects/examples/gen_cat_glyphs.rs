@@ -15,7 +15,10 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use aterm_effects::cat_glyphs_codegen::generate_from_assets;
+#[path = "../src/cat_glyphs_codegen.rs"]
+pub mod cat_glyphs_codegen;
+
+use cat_glyphs_codegen::generate_from_assets;
 
 /// The shared asset-dir reader: the engine reads no file, the generator does.
 #[path = "support/asset_dir.rs"]

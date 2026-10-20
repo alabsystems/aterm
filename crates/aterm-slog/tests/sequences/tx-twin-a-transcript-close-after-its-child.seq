@@ -1,0 +1,12 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_transcript_close_is_never_dated_before_a_child (A21).
+bind 0
+see busy
+tx prompt v1
+pass 2000
+see prompt bash:not-read-only
+pass 500
+see busy
+pass 500
+tx end dated=1000
+expect close t1 turn at=2500

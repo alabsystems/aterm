@@ -1,0 +1,13 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_row_at_the_watermark_is_never_applied_again (S23).
+bind 0
+see busy
+tx prompt v1 off=200 dated=0
+expect amend t1 turn vref=v1
+tx tool c1 off=200 dated=0
+tx tool c1 off=201 dated=0
+expect open p1 tool vref=c1
+see wall:usage-session
+tx wall usage-session confirm off=201 dated=0
+expect open p2 wall par=t1 wall=usage-session
+expect amend p2 wall confirmed=1

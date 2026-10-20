@@ -42,6 +42,7 @@ fn cell_attrs_from_raw_preserves_main_cell_wide_geometry() {
     const BOLD: u16 = 1 << 0;
     const WIDE: u16 = 1 << 9;
     const CONTINUATION_OR_PROTECTED: u16 = 1 << 10;
+    // Once a style-interned cell's bit; a stored line's `OPENS_CELL`.
     const USES_STYLE_ID: u16 = 1 << 14;
     const COMPLEX: u16 = 1 << 15;
 
@@ -60,6 +61,14 @@ fn cell_attrs_from_raw_preserves_main_cell_wide_geometry() {
         Some(attrs),
         "the existing u16 wire field round-trips WIDE without a format change"
     );
+    let opens = attrs.with_opens_cell(true);
+    assert!(opens.opens_cell() && !attrs.opens_cell());
+    assert_eq!(
+        CellAttrs::deserialize(&opens.serialize()),
+        Some(opens),
+        "the wire field round-trips OPENS_CELL"
+    );
+    assert_eq!(opens.with_opens_cell(false), attrs);
 }
 
 /// The run-cursor matches `get_attr` at every index (monotone walks, repeats,

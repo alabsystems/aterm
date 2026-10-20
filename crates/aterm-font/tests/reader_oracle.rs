@@ -118,6 +118,8 @@ struct Tally {
     families: BTreeMap<String, usize>,
     moved: Vec<String>,
     faces: BTreeSet<&'static str>,
+    /// The faces with a compared `colr.*` answer that paints something.
+    painted: BTreeSet<&'static str>,
 }
 
 /// The table a face's outlines come from, as [`Face::outline_glyph`] picks it.
@@ -171,6 +173,9 @@ fn replay(faces: &[FaceFile], file: &str) -> Tally {
                             *tally.families.entry(family.to_string()).or_default() += 1;
                             if case.starts_with("outline.") {
                                 *tally.outline_lines.entry(source).or_default() += 1;
+                            }
+                            if case.starts_with("colr.") && !answer.starts_with("n=0") {
+                                tally.painted.insert(l.label);
                             }
                         }
                         Some(a) => tally.moved.push(format!(
@@ -246,6 +251,12 @@ fn reader_corpus_answers_hold() {
             tally.families
         );
     }
+    // A bless that recorded empty paint graphs would compare `colr` lines too.
+    assert!(
+        tally.painted.contains("fixture-colr_1"),
+        "the COLR fixture paints no colour glyph: {:?}",
+        tally.painted
+    );
 }
 
 /// NEGATIVE CONTROL: the outline digest sees a one-unit shift. The same

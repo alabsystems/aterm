@@ -1,0 +1,13 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# P8c: nor does a harness turn opened past the attribution window take the
+# ledger, though by its sender.
+see busy
+ctl
+see idle
+half
+half
+expect close t1 turn out=done
+pass 6000
+see busy
+expect open t1 turn
+expect open t2 turn at=7000

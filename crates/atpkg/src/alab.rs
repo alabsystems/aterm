@@ -123,14 +123,22 @@ pub const STORE_WINDOW: (u64, u64) = (LEGACY_PIN_CEILING, crate::vendor_direct::
 /// cross-check test. Which package
 /// names a binary needs no version, and an ALab build's is a pre-release no version reader
 /// here parses, on purpose.
+///
+/// Relative means every component is a name (or `.`): `is_absolute` alone admits Windows'
+/// rooted `\bin\codex` and drive-relative `C:codex`, which `root.join` resolves off the
+/// root.
 #[must_use]
 pub fn package_entrypoint(text: &str) -> Option<PathBuf> {
+    use std::path::Component;
     let v: aterm_json::Value = aterm_json::from_str(text).ok()?;
     if v.get("layoutVersion").and_then(aterm_json::Value::as_u64) != Some(1) {
         return None;
     }
     let entry = Path::new(v.get("entrypoint")?.as_str()?);
-    if entry.is_absolute() || entry.components().any(|c| c.as_os_str() == "..") {
+    if !entry
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    {
         return None;
     }
     Some(entry.to_path_buf())

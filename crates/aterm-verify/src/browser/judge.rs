@@ -34,11 +34,23 @@ pub(crate) struct Init {
     pub probe_error: String,
 }
 
+/// Where the GPU frames were drawn: the global scope's and the canvases'
+/// constructor names (`Window` and `HTMLCanvasElement` on the gpu page,
+/// `DedicatedWorkerGlobalScope` and `OffscreenCanvas` in its worker).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Where {
+    pub scope: String,
+    pub canvas: String,
+    pub diff_canvas: String,
+}
+
 /// What one page answered.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Answer {
     pub module: String,
     pub adapter: String,
+    /// `navigator.userAgent` where the page ran; empty if it sent none.
+    pub user_agent: String,
     pub frames: Vec<Frame>,
     /// The GPU page's differential frames (`spec.diff`); the CPU page has
     /// none.
@@ -49,6 +61,26 @@ pub(crate) struct Answer {
     pub timings: Value,
     /// The GPU page's `init` report; the CPU page has none.
     pub init: Option<Init>,
+    /// Where the GPU page drew; the CPU page says nothing.
+    pub drawn: Option<Where>,
+}
+
+/// The GPU page's `where` report, if the answer carries one.
+fn parse_where(v: &Value) -> Result<Option<Where>, String> {
+    let Some(w) = v.get("where") else {
+        return Ok(None);
+    };
+    let text = |k: &str| {
+        w.get(k)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("the page's `where` has no `{k}`"))
+    };
+    Ok(Some(Where {
+        scope: text("scope")?,
+        canvas: text("canvas")?,
+        diff_canvas: text("diff_canvas")?,
+    }))
 }
 
 /// The GPU page's `init` report, if the answer carries one.
@@ -107,11 +139,13 @@ pub(crate) fn parse(v: &Value) -> Result<Answer, String> {
     Ok(Answer {
         module: text("module")?,
         adapter: text("adapter")?,
+        user_agent: text("user_agent").unwrap_or_default(),
         frames,
         diff,
         readback,
         timings: v.get("timings").cloned().unwrap_or(Value::Null),
         init: parse_init(v)?,
+        drawn: parse_where(v)?,
     })
 }
 
@@ -199,7 +233,7 @@ pub(crate) fn judge(cpu: &Answer, gpu: &Answer, frames: usize) -> Verdict {
     }
     if gpu.adapter.is_empty() {
         v.failures
-            .push("the GPU page reports no adapter: init(canvas) acquired none".to_string());
+            .push("the GPU run reports no adapter: init acquired none".to_string());
     }
     judge_init(gpu.init.as_ref(), &mut v);
     judge_readback(cpu, gpu, &mut v);
@@ -251,6 +285,164 @@ pub(crate) fn judge(cpu: &Answer, gpu: &Answer, frames: usize) -> Verdict {
         ));
     }
     v
+}
+
+/// A later backend's session against the first backend's: the CPU module
+/// draws in wasm whatever WebGL2 runs on, so its frames must be
+/// byte-identical across backends (each backend's GPU frames are judged
+/// against them); the GPU frames' distance from the first backend's is
+/// reported, frame by frame, as the measure of what the backend moved.
+pub(crate) fn across(
+    first: &str,
+    first_cpu: &[Frame],
+    cpu: &[Frame],
+    first_gpu: &[(String, &Frame)],
+    gpu: &[(String, &Frame)],
+) -> Verdict {
+    let mut v = Verdict::default();
+    if first_cpu.len() != cpu.len() {
+        v.failures.push(format!(
+            "the CPU page answered {} frames, under {first} {}",
+            cpu.len(),
+            first_cpu.len()
+        ));
+    }
+    let moved: Vec<String> = first_cpu
+        .iter()
+        .zip(cpu)
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(k, (a, b))| {
+            let delta = if a.rgba.len() == b.rgba.len() {
+                format!("max byte delta {}", max_byte_delta(&a.rgba, &b.rgba))
+            } else {
+                format!("{}x{} against {}x{}", b.width, b.height, a.width, a.height)
+            };
+            format!("CPU frame {k} differs from the {first} session's ({delta})")
+        })
+        .collect();
+    if moved.is_empty() && v.failures.is_empty() {
+        v.lines.push(format!(
+            "the CPU module's {} frames are byte-identical to the {first} session's",
+            cpu.len()
+        ));
+    }
+    v.failures.extend(moved);
+    let each: Vec<String> = first_gpu
+        .iter()
+        .zip(gpu)
+        .filter(|((n, a), (m, b))| n == m && a.rgba.len() == b.rgba.len())
+        .map(|((n, a), (_, b))| {
+            let differing = a.rgba.iter().zip(&b.rgba).filter(|(x, y)| x != y).count();
+            format!("{n} {} ({differing})", max_byte_delta(&a.rgba, &b.rgba))
+        })
+        .collect();
+    v.lines.push(format!(
+        "GPU frames against the {first} session's, max byte delta (bytes that differ): {}",
+        each.join(", ")
+    ));
+    v
+}
+
+/// The scope and canvases the gpu page draws in.
+pub(crate) const DOCUMENT: [&str; 3] = ["Window", "HTMLCanvasElement", "HTMLCanvasElement"];
+/// The scope and canvases its worker draws in: the page's canvas
+/// transferred to it, then an OffscreenCanvas of its own.
+pub(crate) const WORKER: [&str; 3] = [
+    "DedicatedWorkerGlobalScope",
+    "OffscreenCanvas",
+    "OffscreenCanvas",
+];
+
+/// Whether `answer` says it drew in `want` (scope, canvas, differential
+/// canvas); the failure naming what it drew in, if not.
+pub(crate) fn drawn_in(who: &str, answer: &Answer, want: [&str; 3]) -> Option<String> {
+    let Some(w) = answer.drawn.as_ref() else {
+        return Some(format!(
+            "the {who} sent no `where`: it cannot show where it drew"
+        ));
+    };
+    let got = [w.scope.as_str(), w.canvas.as_str(), w.diff_canvas.as_str()];
+    (got != want).then(|| {
+        format!(
+            "the {who} drew in {} on {} then {}, not {} on {} then {}",
+            got[0], got[1], got[2], want[0], want[1], want[2]
+        )
+    })
+}
+
+/// The worker's run (init_offscreen on a transferred OffscreenCanvas, then
+/// one of its own) against the gpu page's (init on the document's canvases)
+/// in the same session: the same module on the same adapter issues the same
+/// GL calls, so every frame and the harness readback must be byte-identical.
+/// NEGATIVE CONTROL: each must have drawn where it says it did, so a worker
+/// page that drew on the document, or a gpu page in a worker, cannot pass as
+/// the other.
+pub(crate) fn worker(gpu: &Answer, worker: &Answer) -> Verdict {
+    let mut v = Verdict::default();
+    v.failures.extend(drawn_in("gpu page", gpu, DOCUMENT));
+    v.failures.extend(drawn_in("worker", worker, WORKER));
+    if worker.adapter != gpu.adapter {
+        v.failures.push(format!(
+            "the worker drew on \"{}\", the gpu page on \"{}\"",
+            worker.adapter, gpu.adapter
+        ));
+    }
+    let pairs = [
+        ("parity", &gpu.frames, &worker.frames),
+        ("diff", &gpu.diff, &worker.diff),
+    ];
+    let mut counted = 0;
+    for (seq, page, off) in pairs {
+        if page.len() != off.len() {
+            v.failures.push(format!(
+                "the worker drew {} {seq} frames, the gpu page {}",
+                off.len(),
+                page.len()
+            ));
+            continue;
+        }
+        for (k, (a, b)) in page.iter().zip(off.iter()).enumerate() {
+            counted += 1;
+            if a != b {
+                v.failures.push(format!(
+                    "{seq}-{k}: the worker's frame differs from the gpu page's ({})",
+                    moved(a, b)
+                ));
+            }
+        }
+    }
+    match (&gpu.readback, &worker.readback) {
+        (Some(a), Some(b)) if a != b => v.failures.push(format!(
+            "readback: the worker's render_offscreen() differs from the gpu page's ({})",
+            moved(a, b)
+        )),
+        (Some(_), None) => v
+            .failures
+            .push("the worker sent no render_offscreen() readback".to_string()),
+        _ => {}
+    }
+    if v.failures.is_empty() {
+        v.lines.push(format!(
+            "the worker (init_offscreen on a transferred OffscreenCanvas, then one of its own) \
+             drew its {counted} frames and its readback byte-identical to the gpu page's"
+        ));
+    }
+    v
+}
+
+/// How frame `b` moved from `a`: the largest byte delta and how many bytes
+/// differ, or the two sizes.
+fn moved(a: &Frame, b: &Frame) -> String {
+    if a.rgba.len() == b.rgba.len() {
+        let differing = a.rgba.iter().zip(&b.rgba).filter(|(x, y)| x != y).count();
+        format!(
+            "max byte delta {}, {differing} bytes",
+            max_byte_delta(&a.rgba, &b.rgba)
+        )
+    } else {
+        format!("{}x{} against {}x{}", b.width, b.height, a.width, a.height)
+    }
 }
 
 /// The harness readback (`render_offscreen()` + `rgba()` after the last
@@ -307,9 +499,8 @@ fn judge_init(init: Option<&Init>, v: &mut Verdict) {
         return;
     };
     if !init.ready_on_return {
-        v.failures.push(
-            "init(canvas) returned before the GPU was ready: init is not synchronous".to_string(),
-        );
+        v.failures
+            .push("init returned before the GPU was ready: init is not synchronous".to_string());
     }
     if !init.probe_rejected {
         v.failures.push(
@@ -324,7 +515,7 @@ fn judge_init(init: Option<&Init>, v: &mut Verdict) {
     }
     if v.failures.len() == before {
         v.lines.push(format!(
-            "init(canvas): synchronous (gpu_ready as it returned); awaited on a canvas with no \
+            "init: synchronous (gpu_ready as it returned); awaited on a canvas with no \
              WebGL2 it rejected its async caller with \"{}\"",
             init.probe_error
         ));
@@ -360,6 +551,8 @@ mod tests {
         Answer {
             module: "m".to_string(),
             adapter: "ANGLE (test)".to_string(),
+            user_agent: String::new(),
+            drawn: None,
             readback: Some(frame(2)),
             frames,
             diff: Vec::new(),
@@ -506,6 +699,86 @@ mod tests {
         assert!(judge(&answer(run()), &gpu, 3).failures[0].contains("no init report"));
     }
 
+    /// Across backends the CPU frames must not move: identical ones pass
+    /// and report the GPU frames' distance, and one changed byte fails and
+    /// names its frame.
+    #[test]
+    fn a_cpu_frame_that_moves_with_the_backend_fails() {
+        fn refs(frames: &[Frame]) -> Vec<(String, &Frame)> {
+            frames
+                .iter()
+                .enumerate()
+                .map(|(k, f)| (format!("parity-{k}"), f))
+                .collect()
+        }
+        let (a, b) = (run(), run());
+        let mut gpu = run();
+        gpu[1].rgba[5] += 3;
+        let first_gpu = run();
+        let v = across("metal", &a, &b, &refs(&first_gpu), &refs(&gpu));
+        assert!(v.failures.is_empty(), "{:?}", v.failures);
+        assert!(
+            v.lines
+                .iter()
+                .any(|l| l.ends_with("parity-0 0 (0), parity-1 3 (1), parity-2 0 (0)")),
+            "{:?}",
+            v.lines
+        );
+        let mut c = run();
+        c[2].rgba[5] += 1;
+        let v = across("metal", &a, &c, &refs(&first_gpu), &refs(&gpu));
+        assert_eq!(
+            v.failures,
+            ["CPU frame 2 differs from the metal session's (max byte delta 1)"]
+        );
+    }
+
+    /// A gpu page and its worker in the same session draw the same bytes:
+    /// identical runs pass, one byte moved fails and names its frame, and a
+    /// run drawn somewhere other than it says trips the control.
+    #[test]
+    fn a_worker_must_draw_where_it_says_and_what_the_page_drew() {
+        let place = |w: [&str; 3]| {
+            Some(Where {
+                scope: w[0].to_string(),
+                canvas: w[1].to_string(),
+                diff_canvas: w[2].to_string(),
+            })
+        };
+        let at = |w| {
+            let mut a = answer(run());
+            a.diff = vec![frame(0), frame(1)];
+            a.drawn = place(w);
+            a
+        };
+        let (page, off) = (at(DOCUMENT), at(WORKER));
+        let v = worker(&page, &off);
+        assert!(v.failures.is_empty(), "{:?}", v.failures);
+        assert!(v.lines[0].contains("its 5 frames"), "{:?}", v.lines);
+        let mut moved = at(WORKER);
+        moved.diff[1].rgba[5] += 1;
+        assert_eq!(
+            worker(&page, &moved).failures,
+            ["diff-1: the worker's frame differs from the gpu page's (max byte delta 1, 1 bytes)"]
+        );
+        // The control: a "worker" that drew on the document's canvas.
+        let mut on_page = at(WORKER);
+        on_page.drawn = place(["Window", "HTMLCanvasElement", "OffscreenCanvas"]);
+        let v = worker(&page, &on_page);
+        assert_eq!(v.failures.len(), 1, "{:?}", v.failures);
+        assert!(
+            v.failures[0].starts_with("the worker drew in Window"),
+            "{:?}",
+            v.failures
+        );
+        let mut silent = at(WORKER);
+        silent.drawn = None;
+        assert!(worker(&page, &silent).failures[0].contains("sent no `where`"));
+        let mut elsewhere = at(WORKER);
+        elsewhere.adapter = "SwiftShader".to_string();
+        assert!(worker(&page, &elsewhere).failures[0].contains("the worker drew on"));
+    }
+
     #[test]
     fn an_answer_parses_its_frames_and_refuses_a_short_one() {
         let rgba = aterm_codec::base64::encode(&[1, 2, 3, 4, 5, 6, 7, 8]).expect("encode");
@@ -540,5 +813,17 @@ mod tests {
             "module": "m", "adapter": "a", "frames": [], "init": {"ready_on_return": true}
         });
         assert!(parse(&no_probe).is_err());
+        let placed = aterm_json::json!({
+            "module": "m", "adapter": "a", "frames": [], "user_agent": "Firefox/155.0",
+            "where": {"scope": "DedicatedWorkerGlobalScope", "canvas": "OffscreenCanvas",
+                      "diff_canvas": "OffscreenCanvas"}
+        });
+        let a = parse(&placed).expect("parses");
+        assert_eq!(a.user_agent, "Firefox/155.0");
+        assert_eq!(drawn_in("worker", &a, WORKER), None);
+        let half = aterm_json::json!({
+            "module": "m", "adapter": "a", "frames": [], "where": {"scope": "Window"}
+        });
+        assert!(parse(&half).is_err());
     }
 }

@@ -62,6 +62,23 @@ use std::time::{Duration, Instant};
 /// session per round.
 pub const REPUBLISH_MIN: Duration = Duration::from_secs(2);
 
+/// [`REPUBLISH_MIN`] at test pace: a quarter, as the round it is matched to
+/// runs a quarter (`bridge.rs`'s `FAST_ROSTER_REFRESH`), so a change inside the
+/// window is still carried by the next round and a row still costs at most one
+/// record per session per round.
+const FAST_REPUBLISH_MIN: Duration = Duration::from_millis(500);
+
+/// The republish window in this process: [`REPUBLISH_MIN`], or
+/// [`FAST_REPUBLISH_MIN`] when the bridge runs at test pace
+/// (`bridge::fast_timers`, a development seam a shipped build never reads).
+fn republish_min() -> Duration {
+    if crate::bridge::fast_timers() {
+        FAST_REPUBLISH_MIN
+    } else {
+        REPUBLISH_MIN
+    }
+}
+
 /// The byte cap on `role=`.
 pub const ROLE_CAP: usize = 64;
 /// The byte cap on `detail=`.
@@ -294,7 +311,7 @@ impl Slot {
         match &self.published {
             None => Due::First,
             Some((on_bus, _)) if *on_bus == self.fields.tokens(mode) => Due::Unchanged,
-            Some((_, at)) if now.saturating_duration_since(*at) < REPUBLISH_MIN => Due::Capped,
+            Some((_, at)) if now.saturating_duration_since(*at) < republish_min() => Due::Capped,
             Some(_) => Due::Changed,
         }
     }

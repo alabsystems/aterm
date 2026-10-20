@@ -3,7 +3,8 @@
 
 //! What every renderer of a bus record needs: the trust label, the screen
 //! label, the one-line escape, and the cap that bounds it. Shared by `fabric.rs`,
-//! `enable.rs` and `join.rs`; nothing here touches a broker, socket or session.
+//! `enable.rs`, `person.rs` and `bridge.rs`; nothing here touches a broker,
+//! socket or session.
 
 /// The most characters of a record's own content one line may carry: wrapping
 /// is normal, but one 16 MiB body may not be the whole scrollback.
@@ -51,30 +52,13 @@ pub const SCREEN: &str = "screen";
 /// logical line can still wrap, and `trust=human` just past a wrap point would
 /// start a row with a forged label. A real backslash is already doubled, so
 /// the single backslash in `trust\=` can only be this escape.
+///
+/// The one copy is `aterm_codec::tty::one_line`, so `aterm ctl survey` (which
+/// cannot depend on this crate) renders a session's excerpts exactly as the
+/// bus renders a body.
 #[must_use]
 pub fn safe(text: &str, cap: usize) -> String {
-    let mut out = String::with_capacity(text.len());
-    for (n, c) in text.chars().enumerate() {
-        if n >= cap {
-            out.push('…');
-            break;
-        }
-        match c {
-            '\\' => out.push_str("\\\\"),
-            // C0 (the line break and tab by name), DEL, C1, and the bidi
-            // controls and separators that reorder or break without being
-            // controls.
-            c if aterm_codec::tty::is_active(c) => aterm_codec::tty::push_escape(&mut out, c),
-            c => out.push(c),
-        }
-    }
-    // The reserved token, after the character escaping so the two rules cannot
-    // interfere: nothing above can produce the letters `trust=`, and nothing
-    // here can produce a control byte.
-    if out.contains("trust=") {
-        out = out.replace("trust=", "trust\\=");
-    }
-    out
+    aterm_codec::tty::one_line(text, cap)
 }
 
 #[cfg(test)]

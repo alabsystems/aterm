@@ -97,7 +97,6 @@ thread_local! {
     static SEARCH_FROM_LINE_CANDIDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static CASE_INSENSITIVE_CANDIDATE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static CASE_INSENSITIVE_LOWERED_LINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static OWNED_INTERSECTION_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LAST_UNIQUE_POSTING_LISTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -194,8 +193,6 @@ fn insert_posting(
 /// more lists start from a borrowed `&a & &b`; only a lone list is cloned.
 #[cfg(test)]
 fn intersect_posting_lists(sorted_lists: &[&SparseBitmap]) -> SparseBitmap {
-    #[cfg(test)]
-    OWNED_INTERSECTION_BUILDS.with(|count| count.set(count.get().saturating_add(1)));
     debug_assert!(!sorted_lists.is_empty());
     if sorted_lists.len() == 1 {
         return sorted_lists[0].clone();
@@ -390,18 +387,6 @@ impl SearchIndex {
         CASE_INSENSITIVE_LOWERED_LINES.with(|c| {
             let value = c.get();
             c.set(0);
-            value
-        })
-    }
-
-    /// Take (read and reset) the count of owned posting-list intersections.
-    /// Point navigation must keep this at zero: it uses borrowed, range-bounded
-    /// posting iterators and stops at the first verified match.
-    #[cfg(test)]
-    pub(crate) fn take_owned_intersection_builds() -> usize {
-        OWNED_INTERSECTION_BUILDS.with(|count| {
-            let value = count.get();
-            count.set(0);
             value
         })
     }
@@ -1502,7 +1487,7 @@ pub enum SearchOptionsError {
 }
 
 // Piece-wise `write_str` + `Display::fmt`, never a runtime-argument
-// `format_args!` (the Trust strict gate fails closed on its unsafe constructor).
+// `format_args!` (the Trust lane fails closed on its unsafe constructor).
 impl std::fmt::Display for SearchOptionsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

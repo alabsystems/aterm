@@ -32,7 +32,8 @@
 //! settled post-burst frame.
 
 use crate::common::{
-    caret_sample, class_of, note_blink, observe_caret_row, observe_ribbon_rows, rainbow_cfg,
+    FrameHold, caret_sample, class_of, note_blink, observe_caret_row, observe_ribbon_rows,
+    rainbow_cfg,
 };
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::{ClockReading, Terminal};
@@ -65,9 +66,6 @@ const SETTLE_MS: u64 = 200;
 
 // ---- Claude Code's recorded shapes -------------------------------------
 
-/// `app_render.rs`'s `SYNC_HOLD_CAP`: a DEC 2026 bracket open longer than
-/// this is presented mid-frame.
-const SYNC_HOLD_CAP: Duration = Duration::from_millis(150);
 /// The turn's spinner cadence.
 const SPINNER_MS: u64 = 100;
 /// The recorded status-row erase, ~0.95 s after the last key of a pause.
@@ -282,39 +280,6 @@ enum Job {
     IdleFrame,
 }
 
-/// `app_render.rs`'s `sync_frame_hold` logic: given the pane's sync level,
-/// whether it was active at the previous present, the armed deadline and close
-/// counter, the terminal's close counter and open-dirty bit, the clock and the
-/// cap, returns `(deadline, hold, armed seq)`.
-#[allow(clippy::too_many_arguments)]
-fn sync_frame_hold(
-    active: bool,
-    open_dirty: bool,
-    end_seq: u64,
-    was_active: bool,
-    armed: Option<Instant>,
-    armed_end_seq: u64,
-    now: Instant,
-    timeout: Duration,
-) -> (Option<Instant>, bool, u64) {
-    if !active {
-        return (None, false, end_seq);
-    }
-    if was_active && end_seq != armed_end_seq {
-        return (Some(now + timeout), open_dirty, end_seq);
-    }
-    let mut deadline = if was_active {
-        armed
-    } else {
-        Some(now + timeout)
-    };
-    let hold = deadline.is_some_and(|d| now < d);
-    if !hold {
-        deadline = None;
-    }
-    (deadline, hold, end_seq)
-}
-
 /// The host: one terminal, the kitty, one clock.
 struct Host {
     term: Terminal,
@@ -360,9 +325,7 @@ struct Host {
     /// letter it has blanked and still owes ([`Shape::mid_rewrite_blank`]).
     blank_idx: Option<usize>,
     // ---- the host's sync hold ----
-    sync_was_active: bool,
-    sync_hold_until: Option<Instant>,
-    sync_armed_seq: u64,
+    hold: FrameHold,
     /// Presents the hold skipped (the frame hold never ran).
     held_frames: usize,
     /// Presents that sampled a bracket still open (past the cap).
@@ -392,7 +355,6 @@ impl Host {
                 .as_bytes(),
             ),
         }
-        let sync_armed_seq = term.sync_end_seq();
         let mut h = Self {
             term,
             glow,
@@ -420,9 +382,7 @@ impl Host {
             drawn: 0,
             writing: false,
             blank_idx: None,
-            sync_was_active: false,
-            sync_hold_until: None,
-            sync_armed_seq,
+            hold: FrameHold::default(),
             held_frames: 0,
             mid_bracket_frames: 0,
         };
@@ -479,20 +439,7 @@ impl Host {
     /// terminal as it stands. For composers that never bracket this is `frame`.
     fn present(&mut self) {
         let active = self.term.modes().synchronized_output();
-        let (deadline, hold, seq) = sync_frame_hold(
-            active,
-            self.term.sync_open_dirty(),
-            self.term.sync_end_seq(),
-            self.sync_was_active,
-            self.sync_hold_until,
-            self.sync_armed_seq,
-            self.now,
-            SYNC_HOLD_CAP,
-        );
-        self.sync_was_active = active;
-        self.sync_hold_until = deadline;
-        self.sync_armed_seq = seq;
-        if hold {
+        if self.hold.withholds(&self.term, self.now) {
             self.held_frames += 1;
             return;
         }
@@ -1316,27 +1263,40 @@ fn an_ink_composer_with_a_hidden_caret_keeps_every_boundary_space_lit() {
 
 // ---- (3) Claude Code's own bytes, mid-turn ------------------------------
 
-/// The Claude Code sweep for each `(spinner, cadence)`: coalesce × chunk ×
-/// split × pause × placement, one printed line per take, buffered so parallel
-/// tests never interleave.
-fn cc_sweep(runs: &[(bool, u64)]) -> Vec<Take> {
+/// The Claude Code sweep: every split × coalesce × pause, the three dials with
+/// more than two values, each once, with the four two-valued dials (spinner,
+/// cadence, chunk, placement) laid over them so every pair of values of any
+/// two dials meets in some take: 36 takes where the full product is 576. The
+/// product was the search for the owner's 2026-09-21 holes (`b920e29a65`: 588
+/// takes, none reproduced them); a hole that needs one dial's value, or two
+/// dials' values together, is in this grid. One printed line per take,
+/// buffered so parallel tests never interleave.
+fn cc_sweep() -> Vec<Take> {
     let mut grid = Vec::new();
-    for &(spinner, key_ms) in runs {
-        for coalesce in [1, 2, 3] {
-            for chunk in [Chunk::Whole, Chunk::Pty64] {
-                for &split_ms in &CC_SPLITS {
-                    let shape = CcShape {
-                        spinner,
-                        coalesce,
-                        chunk,
-                        split_ms,
-                    };
-                    for placement in [Placement::SpaceBeforePause, Placement::SpaceAfterPause] {
-                        for &pause in &CC_PAUSES {
-                            grid.push((shape, placement, pause, key_ms));
-                        }
-                    }
-                }
+    for (s, &split_ms) in CC_SPLITS.iter().enumerate() {
+        for (c, coalesce) in [1, 2, 3].into_iter().enumerate() {
+            for (p, &pause) in CC_PAUSES.iter().enumerate() {
+                // Each two-valued dial reads its own sum of the indices, so
+                // any two of them, and any one beside a three- or four-valued
+                // dial, take every pair of values across the 36.
+                let odd = |n: usize| n % 2 == 1;
+                let shape = CcShape {
+                    spinner: odd(s + c),
+                    coalesce,
+                    chunk: if odd(s + p) {
+                        Chunk::Pty64
+                    } else {
+                        Chunk::Whole
+                    },
+                    split_ms,
+                };
+                let key_ms = CC_CADENCES[usize::from(odd(c + p))];
+                let placement = if odd(s + c + p) {
+                    Placement::SpaceAfterPause
+                } else {
+                    Placement::SpaceBeforePause
+                };
+                grid.push((shape, placement, pause, key_ms));
             }
         }
     }
@@ -1387,14 +1347,9 @@ fn assert_cc_takes(takes: &[Take]) {
 /// The recorded bytes at 10 and 25 cps, with the composer idle (no turn: the
 /// letter, space and mid-pause frames alone, then coalesced, chunked and
 /// split) and mid-turn (the owner's moment: a turn running, the spinner frame
-/// every 100 ms on `ROW - 3` between the keys and their frames).
+/// every 100 ms on `ROW - 3` between the keys and their frames), over
+/// [`cc_sweep`]'s grid.
 #[test]
 fn claude_code_s_recorded_frames_keep_every_boundary_space_lit() {
-    let mut runs = Vec::new();
-    for spinner in [false, true] {
-        for key_ms in CC_CADENCES {
-            runs.push((spinner, key_ms));
-        }
-    }
-    assert_cc_takes(&cc_sweep(&runs));
+    assert_cc_takes(&cc_sweep());
 }

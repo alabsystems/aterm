@@ -443,3 +443,61 @@ fn decoder_is_bounded_on_arbitrary_streams() {
         assert!(unhooked.unhook().is_none(), "case {case}");
     }
 }
+
+#[test]
+fn sixel_const_helpers_round_trip() {
+    assert!(!is_sixel_data_byte(0x3E));
+    assert!(is_sixel_data_byte(0x3F));
+    assert!(is_sixel_data_byte(0x7E));
+    assert!(!is_sixel_data_byte(0x7F));
+    assert_eq!(sixel_data_bits(0x3E), None);
+    for bits in 0..=63u8 {
+        let b = encode_sixel_data_byte(bits);
+        assert!(is_sixel_data_byte(b));
+        assert_eq!(sixel_data_bits(b), Some(bits));
+    }
+    for row in 0..6usize {
+        let mask = sixel_row_mask(row);
+        assert_eq!(mask, 1u8 << row);
+        assert!(sixel_bit_is_set(mask, row));
+        assert!(!sixel_bit_is_set(0, row));
+    }
+    assert_eq!(sixel_row_mask(6), 0);
+    assert!(!sixel_bit_is_set(0x3F, 6));
+    assert_eq!(clamp_color_register(0), 0);
+    assert_eq!(clamp_color_register(99_999), MAX_COLOR_REGISTERS - 1);
+    assert_eq!(clamp_sixel_dimension(100), 100);
+    assert_eq!(clamp_sixel_dimension(99_999), SIXEL_MAX_DIMENSION);
+    assert_eq!(checked_sixel_pixel_count(0, 10), None);
+    assert_eq!(
+        checked_sixel_pixel_count(2048, 2048),
+        Some(SIXEL_MAX_PIXELS)
+    );
+    assert_eq!(checked_sixel_pixel_count(4096, 4096), None);
+    assert_eq!(
+        checked_sixel_image_bytes(2048, 2048),
+        Some(SIXEL_MAX_IMAGE_BYTES)
+    );
+    assert_eq!(checked_sixel_image_bytes(4096, 4096), None);
+    let px = pack_argb_pixel(0x12, 0x34, 0x56);
+    assert_eq!(unpack_argb_channels(px), (0xFF, 0x12, 0x34, 0x56));
+    assert_eq!(decode_argb_pixel_le(encode_argb_pixel_le(px)), px);
+    assert_eq!(scale_pct(0), 0);
+    assert_eq!(scale_pct(100), 255);
+    assert_eq!(scale_pct(200), 255);
+    assert_eq!(rgb_percent(100, 0, 100), 0x00FF_00FF);
+
+    let mut d = SixelDecoder::new();
+    assert!(!d.is_active());
+    d.hook();
+    assert!(d.is_active());
+    for &b in b"\"1;1;4;6#2~~" {
+        d.put(b);
+    }
+    assert_eq!(d.current_color(), 2);
+    assert_eq!(d.cursor_pos(), (2, 0));
+    assert_eq!(d.painted_extent(), (2, 6));
+    assert_eq!(d.declared_dimensions(), (4, 6));
+    let hdr = encode_sixel_header_le(640, 480, 15, 3);
+    assert_eq!(decode_sixel_header_le(hdr), (640, 480, 15, 3));
+}

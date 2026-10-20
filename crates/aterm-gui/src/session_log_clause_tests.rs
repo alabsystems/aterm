@@ -1,0 +1,286 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The session log's clause in a tab's tooltip and context menu (phase 3B,
+//! plan §5; addendum A12, A30; rulings S10, S11, S16), behind
+//! `[session_log] clause`, which ships off: off, the chrome is today's byte
+//! for byte and no lock is taken for it; on, a move of the clause recomposes
+//! the tab once, a shown label leaves at its `until`, and a `ctl` label
+//! neither shows nor hides the step beneath it.
+
+use std::sync::{Arc, Mutex};
+
+use aterm_slog::{Actor, Conf, Fields, Key, Kind, Node, Open, Src};
+
+use crate::session_timeline::SessionTimeline;
+use crate::{App, WindowId};
+
+/// Turn `[session_log] clause` on or off for `app`.
+pub(crate) fn set_clause(app: &mut App, on: bool) {
+    app.config.session_log = Some(crate::app_config::SessionLogConfig {
+        journal: None,
+        clause: Some(on),
+    });
+}
+
+/// An app with the switch `on` or off, and its session 0's timeline.
+pub(crate) fn clause_app(on: bool) -> (App, Arc<Mutex<SessionTimeline>>) {
+    let mut app = App::headless_for_test();
+    set_clause(&mut app, on);
+    let timeline = Arc::clone(&app.pool.get(0).expect("session 0").ctx.timeline);
+    (app, timeline)
+}
+
+/// [`clause_app`] with session 0's log on a hand clock that starts at the
+/// process clock's now.
+fn hand_app(on: bool) -> (App, Arc<Mutex<SessionTimeline>>, super::tests::Hand) {
+    let (app, timeline) = clause_app(on);
+    let hand = super::tests::hand_clock_from(&timeline, crate::turn_ledger::now_ms());
+    (app, timeline, hand)
+}
+
+/// Open an agent run and a turn under it in `timeline`'s log; the turn.
+pub(crate) fn open_turn(timeline: &Mutex<SessionTimeline>) -> Node {
+    let mut g = timeline.lock().unwrap();
+    let now = g.slog().now();
+    let log = g.slog_mut().log_mut_for_journal();
+    let run = log
+        .open(Open::new(Kind::Agent, Src::Status, Conf::Strong), now)
+        .expect("a run opens");
+    log.open(
+        Open::new(Kind::Turn, Src::Screen, Conf::Strong)
+            .under(run)
+            .by(Actor::Vendor),
+        now,
+    )
+    .expect("a turn opens")
+}
+
+/// Open a tool step of class `cls` under `turn` (`running shell` for
+/// `shell`, `editing` for `edit`); the step.
+pub(crate) fn open_step(timeline: &Mutex<SessionTimeline>, turn: Node, cls: &str) -> Node {
+    let mut g = timeline.lock().unwrap();
+    let now = g.slog().now();
+    g.slog_mut()
+        .log_mut_for_journal()
+        .open(
+            Open::new(Kind::Tool, Src::Transcript, Conf::Exact)
+                .under(turn)
+                .by(Actor::Vendor)
+                .fields(Fields::new().word(Key::Cls, cls).expect("a class")),
+            now,
+        )
+        .expect("a step opens")
+}
+
+/// Close `step` `ok`.
+fn close_step(timeline: &Mutex<SessionTimeline>, step: Node) {
+    let mut g = timeline.lock().unwrap();
+    let now = g.slog().now();
+    g.slog_mut()
+        .log_mut_for_journal()
+        .close(
+            step,
+            aterm_slog::Close::new(
+                aterm_slog::Out::Step(aterm_slog::StepOut::Ok),
+                Src::Transcript,
+                Conf::Exact,
+            ),
+            now,
+        )
+        .expect("the step closes");
+}
+
+/// The `mark` verb's label, written as `by` (`ttl` seconds).
+fn label(app: &App, by: Actor, text: &str, ttl: u32) {
+    let ctx = &app.pool.get(0).expect("session 0").ctx;
+    let (reply, _) = super::cmd_mark(ctx, by, true, &format!("- label text={text} ttl={ttl}"));
+    assert!(reply.starts_with("OK "), "{reply}");
+}
+
+/// Session 0's composed chrome, through the strip's own pass.
+fn chrome(app: &mut App) -> crate::session_chrome::TabChromeExt {
+    let wid = WindowId(0);
+    let titles = app.tab_titles(wid);
+    app.tab_chrome_ext(wid, &titles).swap_remove(0)
+}
+
+/// The menu as it pops, mirrored (`chrome` verb words).
+fn menu_words(ext: &crate::session_chrome::TabChromeExt) -> Vec<String> {
+    crate::session_chrome::menu_shown_at(&ext.menu, crate::turn_ledger::now_ms())
+        .iter()
+        .map(crate::session_chrome::menu_entry_mirror)
+        .collect()
+}
+
+fn tooltip(ext: &crate::session_chrome::TabChromeExt) -> &str {
+    ext.tooltip.as_deref().unwrap_or_default()
+}
+
+/// OFF IS TODAY'S CHROME (addendum A30, ruling S10): with the switch off a
+/// log that moves (a turn, a step, a person's label) leaves the tooltip, the
+/// menu and the expiry exactly what they were, even recomposed from
+/// nothing, and the timeline is not acquired for a clause: a held timeline
+/// enlists no retry.
+///
+/// NEGATIVE CONTROL: the same log with the switch on shows the step.
+#[test]
+fn the_clause_off_leaves_the_tooltip_and_menu_byte_identical() {
+    let (mut app, timeline, _hand) = hand_app(false);
+    let before = chrome(&mut app);
+    let expiry = app.session_chrome[&0].expires_ms;
+    let turn = open_turn(&timeline);
+    open_step(&timeline, turn, "shell");
+    label(&app, Actor::Human, "compiling", 60);
+    assert_eq!(chrome(&mut app), before, "a cached compose");
+    app.session_chrome.clear();
+    assert_eq!(chrome(&mut app), before, "a fresh compose");
+    assert_eq!(app.session_chrome[&0].expires_ms, expiry);
+    assert_eq!(app.session_chrome[&0].clause, None);
+    assert!(!app.clause_moved(0), "off reads nothing");
+    {
+        let _held = timeline.lock().unwrap();
+        assert_eq!(
+            app.chrome_clause_read(WindowId(0), 0, &timeline, crate::turn_ledger::now_ms()),
+            None
+        );
+        assert!(
+            !app.session_chrome_retry.contains(&0),
+            "off: no acquisition, so no contention"
+        );
+    }
+    // Negative control.
+    set_clause(&mut app, true);
+    let on = chrome(&mut app);
+    assert!(tooltip(&on).contains("\nnow: compiling"), "{on:?}");
+    assert_ne!(on, before);
+}
+
+/// A MOVE OF THE CLAUSE RECOMPOSES THE TAB (addendum A12 items 1 and 4): a
+/// log append moves none of the cache's other keys, so the clause key is
+/// what misses it; a loop producer that sees the key move refreshes the tab
+/// once, and an unmoved clause is a hit.
+///
+/// NEGATIVE CONTROL: the hit gate without the clause key would serve the
+/// composition from before the step.
+#[test]
+fn a_log_move_recomposes_the_tabs_clause_with_the_switch_on() {
+    let (mut app, timeline, hand) = hand_app(true);
+    let quiet = chrome(&mut app);
+    assert!(!tooltip(&quiet).contains("now:"), "{quiet:?}");
+    let turn = open_turn(&timeline);
+    let step = open_step(&timeline, turn, "shell");
+    assert!(app.clause_moved(0), "the step moved the clause");
+    app.follow_clause(0);
+    assert!(!app.clause_moved(0), "one refresh took the move");
+    let ext = app.session_chrome[&0].ext.clone();
+    assert!(tooltip(&ext).contains("\nnow: running shell"), "{ext:?}");
+    assert!(
+        menu_words(&ext)
+            .iter()
+            .any(|w| w.starts_with("now: running shell \u{b7} ")),
+        "{:?}",
+        menu_words(&ext)
+    );
+    // The clock alone moves nothing: the key holds no age.
+    hand.advance(120_000);
+    assert!(!app.clause_moved(0), "an older step is the same clause");
+    assert_eq!(chrome(&mut app), ext);
+    // The next step is another clause; the turn under it after the close.
+    close_step(&timeline, step);
+    open_step(&timeline, turn, "edit");
+    let edit = chrome(&mut app);
+    assert!(tooltip(&edit).contains("\nnow: editing"), "{edit:?}");
+}
+
+/// RULING S10: a shown label leaves at its `until`, and the composition's
+/// expiry is that instant (no upgrade on the tab), so the scheduler's due
+/// batch recomposes the tab there and the step beneath shows again.
+#[test]
+fn a_shown_label_leaves_the_chrome_at_its_until() {
+    let (mut app, timeline, hand) = hand_app(true);
+    let turn = open_turn(&timeline);
+    open_step(&timeline, turn, "shell");
+    label(&app, Actor::Human, "compiling", 10);
+    let now = crate::turn_ledger::now_ms();
+    let shown = chrome(&mut app);
+    assert!(tooltip(&shown).contains("\nnow: compiling"), "{shown:?}");
+    let until = app.session_chrome[&0]
+        .expires_ms
+        .expect("a shown label arms its until");
+    assert!(
+        until > now && until <= crate::turn_ledger::now_ms() + 10_000,
+        "the label's until on the process clock: {until} vs {now}"
+    );
+    hand.advance(10_001);
+    let progress = app.advance_session_chrome_expiry(until);
+    assert_eq!(progress.admitted_session, Some(0), "due at its until");
+    let after = app.session_chrome[&0].ext.clone();
+    assert!(
+        tooltip(&after).contains("\nnow: running shell"),
+        "{after:?}"
+    );
+    assert!(!tooltip(&after).contains("compiling"));
+    assert_eq!(
+        app.session_chrome[&0].expires_ms, None,
+        "a step arms nothing"
+    );
+}
+
+/// RULING S11: a `ctl` client's label is absent from the tooltip and the
+/// menu, present in `log`, and the step beneath it shows; the harness's
+/// label shows, attributed by being shown at all.
+///
+/// NEGATIVE CONTROL: the person's label over the same step shows.
+#[test]
+fn a_ctl_label_is_absent_from_the_chrome_and_present_in_the_log() {
+    let (mut app, timeline, _hand) = hand_app(true);
+    let turn = open_turn(&timeline);
+    open_step(&timeline, turn, "shell");
+    label(&app, Actor::Ctl, "ctlwords", 60);
+    let ext = chrome(&mut app);
+    assert!(tooltip(&ext).contains("\nnow: running shell"), "{ext:?}");
+    assert!(!tooltip(&ext).contains("ctlwords"), "{ext:?}");
+    assert!(
+        !menu_words(&ext).iter().any(|w| w.contains("ctlwords")),
+        "{:?}",
+        menu_words(&ext)
+    );
+    assert!(
+        super::tests::lines_of(&timeline)
+            .iter()
+            .any(|l| l.contains(" label ") && l.contains("ctlwords") && l.contains(" by=ctl ")),
+        "the label is the log's: {:?}",
+        super::tests::lines_of(&timeline)
+    );
+    // Negative control.
+    label(&app, Actor::Human, "humanwords", 60);
+    let ext = chrome(&mut app);
+    assert!(tooltip(&ext).contains("\nnow: humanwords"), "{ext:?}");
+}
+
+/// THE CLAUSE IS THE TOOLTIP'S AND THE MENU'S ALONE (D6): a move of it adds
+/// no timeline row (the timeline's high id holds) and leaves the tab's label
+/// its identity title.
+#[test]
+fn the_clause_moves_no_row_and_no_label() {
+    let (mut app, timeline, _hand) = hand_app(true);
+    let wid = WindowId(0);
+    let titles = app.tab_titles(wid);
+    let high = timeline.lock().unwrap().high_id();
+    let quiet = chrome(&mut app);
+    let turn = open_turn(&timeline);
+    open_step(&timeline, turn, "shell");
+    label(&app, Actor::Human, "compiling", 60);
+    app.follow_clause(0);
+    assert_eq!(timeline.lock().unwrap().high_id(), high, "no timeline row");
+    assert_eq!(app.tab_titles(wid), titles, "the label is the title");
+    let moved = app.session_chrome[&0].ext.clone();
+    let rows = |ext: &crate::session_chrome::TabChromeExt| -> Vec<String> {
+        menu_words(ext)
+            .into_iter()
+            .filter(|w| !w.starts_with("now: "))
+            .collect()
+    };
+    assert_eq!(rows(&moved), rows(&quiet), "every other row is today's");
+}

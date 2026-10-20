@@ -80,9 +80,9 @@
 //! or reorders text around — C0 but `\n` and `\t`, DEL, C1, the bidi marks,
 //! embeddings, overrides and isolates, U+2028/U+2029 — and every byte that is
 //! not UTF-8 is shown as text (`\x1b`, `\r`, `\u{202e}`, `\xff`) by
-//! [`aterm_codec::tty`], the one rendering `aterm drive task --wait` and the
-//! fabric's `render::safe` share. Printable text, non-ASCII included, is
-//! unchanged. The decision is made in two places, each the only door to its
+//! [`aterm_codec::tty`], the one rendering the fabric's `render::safe` shares.
+//! Printable text, non-ASCII included, is unchanged. The decision is made in
+//! two places, each the only door to its
 //! stream: [`StdoutSink`] (every stdout path) and [`stderr_prefixed`] /
 //! [`drain_refusal_tail`] (every stderr line). The pipe and file branch is the
 //! old behaviour, byte for byte.
@@ -129,6 +129,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use aterm_types::control_socket;
+use aterm_types::control_verbs::{MAX_REQUEST_LINE, MAX_TASK_BYTES};
 use aterm_uds::CtlStream;
 
 /// The `aterm-askpass` role: the `SUDO_ASKPASS` helper for macOS sessions
@@ -138,15 +139,33 @@ pub use askpass::main_entry as askpass_main_entry;
 pub mod census;
 mod conn;
 pub use conn::conn_main_entry;
+/// `aterm ctl await inbox|agent`: the inbox and agent waits, re-armed past
+/// the server's bound.
+mod await_legs;
+/// `aterm ctl await task`: one wait over workers of every instance here.
+mod await_task;
 mod drift;
 mod graph_hygiene;
 pub use drift::{CastDriftFn, CastDriftJob, DriftCut, DriftPeer, LocalVerbs};
 mod redial;
 pub use redial::EXIT_REPLACED;
+/// `aterm ctl --host <h> …`: this Mac driving another Mac's aterm over the
+/// fleet (the step-in).
+mod remote;
+pub use remote::{DriveLink, DriveRefused, DriveStream, FleetDriveFn};
+/// `aterm ctl survey`: every session on this machine (and its fleet), rendered
+/// for a model.
+mod survey;
+pub use survey::{
+    DEFAULT_BUDGET, EXCERPT_CHARS, EXCERPT_WIDE_CHARS, EXCERPTS_CUT, FLEET_WITHIN, FleetAsk,
+    FleetRead, FleetSurveyFn, LEFT_OUT_LEAD, NO_ROUTE_NOTE, PeerFault, PeerSurvey,
+    UNANSWERED_REASON_CHARS, agent_word_shown, survey_rank, survey_urgent,
+};
 
 /// Usage synopsis — the one-line invocation shape, shared by `--help` and the
 /// "no verb given" usage error so they never drift apart.
-const SYNOPSIS: &str = "aterm-ctl [--sock PATH | --pid PID] [--timeout SECS] <verb> [args...]";
+const SYNOPSIS: &str =
+    "aterm-ctl [--sock PATH | --pid PID | --host H] [--timeout SECS] <verb> [args...]";
 
 /// The hand-written prose of `--help`: synopsis, options, exit codes, stdin
 /// payload forms, socket resolution and the cross-terminal note. Ends with the
@@ -156,11 +175,19 @@ const HELP_PROSE: &str = "\
 aterm-ctl — a tiny client for the aterm introspection control socket (v1).
 
 USAGE:
-    aterm-ctl [--sock PATH | --pid PID] [--timeout SECS] <verb> [args...]
+    aterm-ctl [--sock PATH | --pid PID | --host H] [--timeout SECS] <verb> [args...]
 
 OPTIONS:
     --sock PATH   connect to the control socket at PATH.
     --pid PID     connect to a specific instance's <dir>/aterm-<PID>.sock.
+    --host H      drive ANOTHER MAC's aterm over the fleet (its host, node id
+                  or address, as `aterm fleet peers` names it), when its person
+                  lets this Mac (`aterm fleet allow drive --from <this Mac>`
+                  there): a worker's verbs alone, each session by its sid —
+                  spawn agent=claude [cwd=<absolute>] - < task, await task
+                  @<w> since=0 (the first wait; later ones @<w>:<rev>),
+                  @<w> result|status|text|screen|turn|key|send|close,
+                  hold <w> on|off. `aterm help workers`.
     --timeout SECS
                   per-op socket read/write deadline, in SECONDS (default 900;
                   0 disables the deadline). Also accepts --timeout=SECS. Raise
@@ -178,7 +205,7 @@ EXIT CODES:
          (`ls`, `instances`, `windows`): at least one instance answered.
     1    failure — a usage/connect error, or the server replied ERR. For
          `ls`/`instances`/`windows`: the control-socket directory was readable
-         and held NO instance socket — a truly empty fleet, and the ONLY case
+         and held NO instance socket — truly no instance here, and the ONLY case
          that prints `no live aterm instances found`.
     2    `ls`/`instances`/`windows` only — could not LOOK, or could not REACH:
          sockets were found but none answered (a sandbox refusing AF_UNIX
@@ -186,7 +213,7 @@ EXIT CODES:
          token), or the directory is missing, unreadable, or unresolvable
          ($HOME and $XDG_RUNTIME_DIR unset). The report on stderr names every
          socket and its cause, plus one hint for the dominant cause — never
-         the false claim that the fleet is empty.
+         the false claim that no instance is running.
     124  timeout — the client's --timeout deadline fired, OR the server
          reported a timeout (a `turn` verdict status=timeout, or an
          await/ready/wait `OK timeout`); for `ls`/`instances`/`windows`,
@@ -196,7 +223,9 @@ EXIT CODES:
          within 30 s, or within what an explicit --timeout had left (an
          update that did not come back, a crash, a quit): a `subscribe`
          stream, a blocking read (`await`, `wait`, `ready`, `text`,
-         `inbox`), a `turn` or a `post` could not be resumed. An aterm SELF-UPDATE is
+         `inbox`), a `turn` or a `post` could not be resumed. A `subscribe`
+         that was told `EVENT * bye quit` exits 75 as soon as the connection
+         ends, with no wait: nothing replaces a quit. An aterm SELF-UPDATE is
          followed instead: `subscribe` keeps relaying from the successor (a
          stderr line says so; its new `sub` lines start a new stream, each
          target sending its current state after a `GAP <local> replaced`
@@ -206,7 +235,8 @@ EXIT CODES:
          `@<n>` is followed by the session id its `sub` line gave), and a
          blocking read is asked once more — except `await seq`, `await
          block`, `await consent` (each waits for a change after its arm,
-         which the update may have made), `await inbox since=`, `inbox get
+         which the update may have made), `await inbox since=`, `await
+         agent … since=`, `inbox get
          <id>`, `inbox since=<id>` and any request naming its session
          `@<n>`, whose anchor names a position in the old process (a successor numbers its sessions
          afresh): those exit 75 too, and so does a `turn`, which is never
@@ -221,7 +251,7 @@ OUTPUT:
     character a terminal acts on or reorders text around (C0 but newline and
     tab, DEL, C1, the bidi controls, U+2028/U+2029) and every byte that is not
     UTF-8 prints as text (\\x1b, \\r, \\u{202e}, \\xff), so a body another
-    party wrote (`inbox get`, a screen's text)
+    party wrote (`inbox get`, `survey`'s excerpts, a screen's text)
     cannot retitle the tab, move the cursor or write the clipboard. Redirect
     (`> file`, `| cat`) for the bytes themselves.
 
@@ -263,10 +293,14 @@ SOCKET RESOLUTION:
     (plus the <dir>/graph entries of instances bound with --control-sock)
     and dials each one with a 2 s deadline. When $XDG_RUNTIME_DIR is set,
     the per-user default is NOT consulted, so a missing
-    $XDG_RUNTIME_DIR/aterm reports the environment, not an empty fleet. A
-    stale socket (its pid exited without cleanup) is skipped silently while
-    another instance answers, and named — with its cause — only in the
-    failure report when nothing does (see EXIT CODES 1 vs 2).
+    $XDG_RUNTIME_DIR/aterm reports the environment, not a machine with no
+    instance. A stale socket (its pid exited without cleanup) is skipped
+    silently while another instance answers, and named — with its cause —
+    only in the failure report when nothing does (see EXIT CODES 1 vs 2).
+    Discovery covers this machine's instances only: another machine's
+    sessions are read with `aterm ctl survey --fleet` or `survey --host
+    <h>`, and driven with `--host <h>` where its person lets this Mac
+    (`aterm help fleet`).
 
 CROSS-TERMINAL DRIVING:
     Every session of every same-user instance is addressable by its stable
@@ -279,7 +313,8 @@ CROSS-TERMINAL DRIVING:
     `@$ATERM_PARENT_SESSION_ID` — YOUR OWN session, stable across the human's
     tab switches — before the request is framed. Flagless / `@.` instead target
     the currently ACTIVE tab, which retargets on every tab switch. `@self`
-    errors if $ATERM_PARENT_SESSION_ID is unset (not inside an aterm session).
+    errors if $ATERM_PARENT_SESSION_ID is unset (not inside an aterm session),
+    and an `@` that names nothing (`@$W` with $W empty) is a usage error.
 
 PUSH FRAMES (subscribe):
     After the one-shot `OK subscribe <n>` ack (to STDERR) the connection flips
@@ -309,7 +344,7 @@ PUSH FRAMES (subscribe):
                                  resizes, coalesced per wake), `render desync-risk …|healed …`
                                  (see `resizes`), `closing reason= by=`, then `exited`; the
                                  `sessions` stream adds
-                                 `EVENT * session-created|session-exited|fabric-retire`.
+                                 `EVENT * session-created|session-exited|fabric-retire|bye`.
                                  `subscribe --help` prints the full contract.
       BYTES <local> <len>        then <len> RAW PTY bytes + a trailing newline.
       MAIL <local> id=<n> off=<n> from=<p> kind=<k>[ re=<n>][ topic=<t>]   one per
@@ -370,7 +405,9 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
                   autopilot=<off|cruise|land|->
                   path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|->
                   copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>>
-                  land_at=<unix-s|-> task=<open|landed|done|spent|theirs|->[ *]
+                  land_at=<unix-s|-> task=<open|landed|done|spent|theirs|->
+                  pause=<unix-s|-> task_state=<working|done|exited|stalled|->
+                  task_rev=<n>[ *]
                   (* = the calling terminal's own session; window= is the
                   hosting window — a headless instance reports its one logical
                   window 0; none = a session no window holds; - = the instance
@@ -390,15 +427,19 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
                   the mark the shell was adopted with; the row's
                   path_evidence=, copy= and upgrade= columns say which, which
                   build an agent in front runs, and its live upgrade;
-                  autopilot=, land_at= and task= say how the harness carries
-                  an agent tab — its Autopilot, a timed Cruise's landing
-                  instant and the task's face — `help sessions` has them. A
-                  tab whose foreground is an agent is never the place to type
-                  a shell line: it is a prompt there).
+                  autopilot=, land_at=, task= and pause= say how the harness
+                  carries an agent tab — its Autopilot, a timed Cruise's
+                  landing instant, the task's face and when its pause after
+                  short turns ends — `help sessions` has them; task_state=
+                  and task_rev= are a worker's task record, `-` and 0 for a
+                  session with no task (`help task`). A tab whose foreground
+                  is an agent is never the place to type a shell line: it is
+                  a prompt there).
     instances     one line per live same-user instance:
                   <pid> <session-count> <sock>[ self]
                   (self = the instance hosting the calling terminal).
-    windows       one line per WINDOW across the fleet, folded from `sessions`:
+    windows       one line per WINDOW of every instance on this machine, folded
+                  from `sessions`:
                   <pid> window=<id> focused=<0|1> sessions=<n> active=<sid>[,<sid>…]
                   (focused= aterm's most recently focused window — one per
                   instance, unchanged by a minimize or by the app deactivating;
@@ -413,7 +454,7 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
     `instances 1` is `ERR usage: instances`, `windows 1` is `ERR usage:
     windows` (exit 1) — never a listing the caller did not ask for.
     These HONOUR --sock/--pid, which SCOPE the listing to the addressed
-    instance instead of the whole fleet. Use that to keep an automated
+    instance instead of every instance here. Use that to keep an automated
     caller's own instance isolated from the user's real terminals. A
     scoped listing whose instance does not answer reports that distinctly
     (exit 2, or 124 when every probe timed out); `--pid` naming a pid no
@@ -995,7 +1036,9 @@ const SOCK_FILE: &str = control_socket::LATEST_SOCK_FILE;
 
 /// The per-user directory holding the control socket and token, from
 /// [`aterm_uds::control_socket_dir`] (shared with the server). Windows:
-/// `%TMP%\aterm`; Unix: `$XDG_RUNTIME_DIR/aterm`, else the per-user default
+/// `%TMP%\aterm`, and `%TMP%\aterm-elevated` for an elevated client, which so
+/// reaches elevated instances only and an unelevated one never reaches them;
+/// Unix: `$XDG_RUNTIME_DIR/aterm`, else the per-user default
 /// ([`aterm_uds::CONTROL_SOCKET_DIR_DEFAULT`]).
 fn socket_dir() -> Option<PathBuf> {
     aterm_uds::control_socket_dir()
@@ -2064,6 +2107,14 @@ enum Probe {
     /// request lane at work, or its connection cap reached). Carries the line —
     /// the report quotes the server's own words, never "did not answer".
     Busy(String),
+    /// The instance is up and REFUSED the request in its own words: an `ERR`
+    /// line that is neither `ERR auth` nor busy (`ERR usage: …` from a build
+    /// that predates the verb, `ERR no active terminal`, `ERR denied …`).
+    /// Carries the line. Unlike every arm but [`Probe::Answered`] it was
+    /// reached: a walk that asks a newer verb says such an instance's refusal
+    /// rather than that it could not be reached (`survey --brief`, session
+    /// log 5F-6).
+    Replied(String),
     /// NOT DIALED: a private `--control-sock` instance, outside the rendezvous
     /// directory, with no token beside its socket this client can read
     /// ([`graph_hygiene::foreign_token_miss`]). The request could only be
@@ -2193,7 +2244,7 @@ fn probe_exchange(
         } else if status.starts_with(aterm_types::control_verbs::CONTROL_BUSY_REPLY) {
             Probe::Busy(status.to_string())
         } else if status.starts_with("ERR") {
-            Probe::Other(io::Error::other(format!("server replied: {status}")))
+            Probe::Replied(status.to_string())
         } else {
             Probe::Other(malformed_header_error(status))
         };
@@ -2279,8 +2330,8 @@ const DIR_ENV_UNSET: &str = "%TMP%, %TEMP% and %LOCALAPPDATA% are all unset";
 #[cfg(not(windows))]
 fn missing_dir_reason() -> String {
     if env::var_os("XDG_RUNTIME_DIR").is_some() {
-        // `push_str`, not `format!`: the strict Trust gate cannot lower inline
-        // `format_args!` (as `help_text`).
+        // `push_str`, not `format!`: the Trust lane (`ship trust run`) cannot lower
+        // inline `format_args!` (as `help_text`).
         let mut why = String::from("resolved from $XDG_RUNTIME_DIR, which is set — so ");
         why.push_str(aterm_uds::CONTROL_SOCKET_DIR_DEFAULT);
         why.push_str(" was NOT consulted");
@@ -2298,6 +2349,42 @@ fn missing_dir_reason() -> String {
     "resolved from %TMP%/%TEMP% (else %LOCALAPPDATA%\\Temp); no aterm instance has \
      published a socket there"
         .to_string()
+}
+
+/// The line an unscoped discovery that found no instance adds on Windows when
+/// the other elevation's control directory exists: elevated and unelevated
+/// instances keep separate directories ([`aterm_uds::control_socket_dir`]) and
+/// neither side lists the other's, so "none found" speaks for this side only.
+/// `None` off Windows and when there is no such directory.
+fn other_elevation_note() -> Option<String> {
+    #[cfg(windows)]
+    {
+        let elevated = aterm_uds::elevation::is_elevated();
+        let other = socket_dir()?.with_file_name(if elevated {
+            aterm_uds::CONTROL_DIR_NAME
+        } else {
+            aterm_uds::ELEVATED_CONTROL_DIR_NAME
+        });
+        if !other.is_dir() {
+            return None;
+        }
+        let shown = other.display();
+        Some(if elevated {
+            format!(
+                "NOTE: this shell is elevated, so it lists elevated aterm instances only; \
+                 unelevated ones publish in {shown} (name one with --sock)"
+            )
+        } else {
+            format!(
+                "NOTE: elevated aterm instances keep their control sockets in {shown}, which \
+                 only an elevated shell can list"
+            )
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 /// Resolve and CLASSIFY the rendezvous directory, enumerating its instances in
@@ -2846,7 +2933,7 @@ fn run_discovery(
             let is_self_instance = self_sock
                 .as_deref()
                 .is_some_and(|self_s| same_socket_path(self_s, &sock));
-            // The same mapping `fleet_sessions` uses, so `ls`, the fleet bridge and
+            // The same mapping `fleet_sessions` uses, so `ls`, the drive CLI and
             // the sweep agree.
             let rows = instance_sessions(pid, sessions, self_sid.as_deref());
             if verb == "instances" {
@@ -2875,9 +2962,13 @@ fn run_discovery(
         *live_elsewhere = live_instances_besides(&dialled).len();
     }
     let foreign = foreign_note(verb, &probes);
+    let none_here = matches!(dir, DirOutcome::Empty(_) | DirOutcome::Missing { .. });
     let (report, code) = discovery_report(dir, &probes);
     if code != 0 {
         stderr_line(&report)?;
+        if none_here && let Some(note) = other_elevation_note() {
+            stderr_line(&note)?;
+        }
         return Ok(ExitCode::from(code));
     }
     if let Some(note) = foreign {
@@ -2980,8 +3071,8 @@ impl FleetSession {
 }
 
 /// Why a fleet listing produced no sessions, as `ls` reports on stderr.
-/// [`is_empty_fleet`](Self::is_empty_fleet) distinguishes "nothing there" from
-/// "discovery is broken".
+/// [`code`](Self::code) distinguishes "nothing there" from "discovery is
+/// broken".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetListError {
     /// The operator-facing reason, byte-identical to `aterm-ctl ls`'s stderr
@@ -2991,15 +3082,6 @@ pub struct FleetListError {
     /// directory with no instance, [`EXIT_UNREACHABLE`] (2) for could-not-look
     /// or could-not-reach, [`EXIT_TIMEOUT`] (124) when every instance timed out.
     pub code: u8,
-}
-
-impl FleetListError {
-    /// Whether the fleet is genuinely empty (a readable rendezvous directory
-    /// with no instance), as opposed to unreadable or unreachable.
-    #[must_use]
-    pub fn is_empty_fleet(&self) -> bool {
-        self.code == EXIT_EMPTY_FLEET
-    }
 }
 
 impl std::fmt::Display for FleetListError {
@@ -3218,7 +3300,7 @@ const EXIT_UNREACHABLE: u8 = 2;
 
 /// Exit code for a genuinely empty fleet: the rendezvous directory was read and
 /// holds no instance socket and no graph entry. The only status that licenses
-/// "no live aterm instances found" ([`FleetListError::is_empty_fleet`]).
+/// "no live aterm instances found" ([`FleetListError::code`]).
 const EXIT_EMPTY_FLEET: u8 = 1;
 
 /// The `ls`/`instances`/`windows` verdict, pure: `dir` is what the directory
@@ -3409,6 +3491,7 @@ fn probe_cause(pid: u32, probe: &Probe) -> String {
             }
         }
         Probe::Timeout => "timed out after 2s".to_string(),
+        Probe::Replied(said) => format!("server replied: {said}"),
         Probe::Other(e) => e.to_string(),
     }
 }
@@ -3449,7 +3532,7 @@ fn cause_of(probe: &Probe) -> Option<Cause> {
         Probe::Busy(_) => Some(Cause::Busy),
         Probe::Foreign { .. } => Some(Cause::Foreign),
         Probe::Timeout => Some(Cause::Timeout),
-        Probe::Other(_) => Some(Cause::Other),
+        Probe::Replied(_) | Probe::Other(_) => Some(Cause::Other),
     }
 }
 
@@ -4327,6 +4410,8 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
     let mut args = utf8_args(argv)?.into_iter();
     let mut sock: Option<String> = None;
     let mut pid: Option<u32> = None;
+    // `--host`: another Mac's aterm, driven over the fleet ([`remote`]).
+    let mut host: Option<String> = None;
     // The per-op socket read/write deadline. `Some(EXCHANGE_DEADLINE)` is the
     // default; `--timeout SECS` overrides it (0 => `None`, no deadline).
     let mut deadline: Option<std::time::Duration> = Some(EXCHANGE_DEADLINE);
@@ -4372,6 +4457,15 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
             })?);
         } else if let Some(p) = arg.strip_prefix("--sock=") {
             sock = Some(p.to_string());
+        } else if arg == "--host" {
+            host = Some(args.next().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--host requires a HOST (a fleet peer's name, node id or address)",
+                )
+            })?);
+        } else if let Some(h) = arg.strip_prefix("--host=") {
+            host = Some(h.to_string());
         } else if arg == "--pid" {
             let v = args.next().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "--pid requires a PID")
@@ -4431,6 +4525,38 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         }
         request_parts = rewritten;
     }
+    if let [verb, target] = request_parts.as_slice()
+        && verb == "status"
+        && (target.starts_with('@') || target.starts_with("s-"))
+    {
+        request_parts = vec![
+            format!("@{}", target.trim_start_matches('@')),
+            "status".to_string(),
+        ];
+    }
+
+    // `--host <h>`: another Mac's aterm, driven over the fleet ([`remote`]).
+    // Nothing of this Mac's resolution applies — no `@self`, no multiplexer
+    // boundary, no socket — and a verb's `--help` is still answered here.
+    if let Some(host) = host.as_deref() {
+        if sock.is_some() || pid.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--host names another Mac's aterm; --sock and --pid name one of this Mac's",
+            ));
+        }
+        refuse_empty_selectors(&request_parts)?;
+        if let Some(reply) = client_help_reply(&request_parts, help_asked) {
+            print_framed_lines(&reply)?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        return remote::run(
+            host,
+            &request_parts,
+            timeout_explicit.then_some(deadline),
+            &local,
+        );
+    }
 
     // The multiplexer boundary, decided before `@self` is expanded (after
     // expansion the implicit-target shape is gone). `mux` reports the decision;
@@ -4449,8 +4575,9 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         return Err(nested_self_drive_error(n));
     }
 
-    // Expand a leading `@self` / `@env` to `@$ATERM_PARENT_SESSION_ID` before
-    // anything reads the selector.
+    // A selector that names nothing is refused before anything reads it, and
+    // then a leading `@self` / `@env` expands to `@$ATERM_PARENT_SESSION_ID`.
+    refuse_empty_selectors(&request_parts)?;
     expand_self_selector(&mut request_parts, env::var(SELF_SID_ENV).ok())?;
 
     // The boundary notice: a bash/zsh pane never sources the integration (see
@@ -4482,6 +4609,13 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         }
         return run_discovery(verb, sock.as_deref(), pid, nesting.as_ref());
     }
+    // `survey` asks every instance here (or the one `--sock`/`--pid` names)
+    // for its sessions' records — and with `--fleet`/`--host` the fleet's
+    // peers, through the fleet client `local` carries — and renders them here,
+    // budgeted for a model's window ([`survey`]).
+    if survey::is_survey(&request_parts) {
+        return survey::run_survey(&request_parts, sock.as_deref(), pid, &local);
+    }
     // `help <verb>` for a client verb (unknown to the server) or a protocol verb
     // asked as `<verb> --help` is answered here with no socket; an explicit
     // `help <protocol verb>` goes to the server.
@@ -4502,7 +4636,37 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         pid,
         env::var(SELF_SID_ENV).ok(),
     ));
+    let pinned = sock.is_some() || pid.is_some();
     let (path, origin) = resolve_target(sock, pid, env::var(SELF_SID_ENV).ok())?;
+
+    // `await task` waits on workers wherever on this machine they run: the
+    // client groups the targets by the instance hosting each, asks every one at
+    // once, re-arms past the server's 600 s bound up to its own deadline, and
+    // follows a self-update ([`await_task`]).
+    if await_task::is_await_task(&request_parts) {
+        validate_request_parts(&request_parts)?;
+        return await_task::run_await_task(
+            &request_parts,
+            pinned,
+            &path,
+            &redial,
+            timeout_explicit.then_some(deadline),
+        );
+    }
+    // `await inbox` and `await agent` are re-armed past the server's bound
+    // up to their own deadline (the verb's `timeout=`, else `--timeout`, else
+    // an hour), with the same `since=`: a listener's or a driver's background
+    // wait ends at news, never at the server's 30 s default ([`await_legs`]).
+    if await_legs::is_rearmed_await(&request_parts) {
+        validate_request_parts(&request_parts)?;
+        return await_legs::run_rearmed_await(
+            &request_parts,
+            &path,
+            origin,
+            &redial,
+            timeout_explicit.then_some(deadline),
+        );
+    }
 
     // Stdin payloads: `feed-bin`, and the `send`/`paste` `--stdin`/`-` forms,
     // deliver raw stdin bytes through the length-prefixed binary frame, the one
@@ -4547,6 +4711,30 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
             deadline,
         );
     }
+    // A WORKER: `spawn … agent=<a> … -` reads its task from stdin into the
+    // spawn's own length-prefixed frame (`spawn … len=<n>`, then the n bytes),
+    // the one way a task of any bytes and lines reaches the server; the worker
+    // starts where this client stands unless cwd= says otherwise, behind the
+    // session this client runs in unless a selector says otherwise, and from
+    // that session (`from=`) wherever it is aimed.
+    if verb_tok == Some("spawn") && verb_args.iter().any(|a| a.starts_with("agent=")) {
+        let starter = worker_starter(env::var(SELF_SID_ENV).ok());
+        let selector = worker_selector(selector, pinned, starter.as_deref());
+        let head = worker_spawn_head(
+            selector.as_deref(),
+            verb_args,
+            starter.as_deref(),
+            env::current_dir().ok().as_deref(),
+        )?;
+        let payload = read_task_payload()?;
+        return worker_exchange(
+            &path,
+            origin,
+            &format!("{head} len={}", payload.len()),
+            &payload,
+            deadline,
+        );
+    }
 
     // Reject line terminators before framing: the socket is newline-delimited,
     // so an embedded '\n'/'\r' would inject a second authenticated verb.
@@ -4570,16 +4758,22 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         return help_with_fallback(&path, origin, name, deadline, &local);
     }
 
-    // The wire never quotes (see `split_pattern_note`): note which pattern
-    // element the join is about to split, then still send it. A failed note
-    // write is ignored.
+    // The wire quotes nothing but a spawn's folder (see `split_pattern_note`):
+    // note which pattern element the join is about to split, then still send
+    // it. A failed note write is ignored.
     if let Some(note) = split_pattern_note(&request_parts) {
         let _ = stderr_line(&note);
     }
 
-    // One request per line: "VERB [args...]\n", args joined with single spaces
-    // (inter-arg whitespace collapses).
-    let mut request = request_parts.join(" ");
+    // One request per line: "VERB [args...]\n" ([`request_line`]), refused
+    // here when the server would.
+    let mut request = request_line(&request_parts)?;
+    validate_request_line_len(
+        &request,
+        forwarded_request(&request_parts)
+            .first()
+            .map(String::as_str),
+    )?;
     request.push('\n');
 
     let outcome = exchange(
@@ -4627,23 +4821,54 @@ fn binary_frame_prefix(selector: Option<&str>, verb: &str) -> String {
     s
 }
 
+/// The selector token positions of a request: `subscribe` takes its selector
+/// SECOND (`subscribe @self screen`), every other verb an optional leading
+/// `@<sel>` proxy at `parts[0]`.
+fn selector_index(parts: &[String]) -> usize {
+    usize::from(parts.first().map(String::as_str) == Some("subscribe"))
+}
+
+/// Refuse a selector that names nothing
+/// ([`aterm_types::control_verbs::EMPTY_SELECTOR`]) in the request's selector
+/// position, alone or as any element of a comma list (`@s-a,@`). A bare `@` is
+/// what `@$W` becomes when `$W` is empty, and `"@ "` what a quoted blank
+/// makes; sent, the server once read either as the active session, so an
+/// agent whose sid parse failed typed into, or stopped, the person's focused
+/// tab. Fail closed here, before any socket is dialled; the server refuses the
+/// same line too.
+fn refuse_empty_selectors(parts: &[String]) -> io::Result<()> {
+    let Some(tok) = parts
+        .get(selector_index(parts))
+        .filter(|t| t.starts_with('@'))
+    else {
+        return Ok(());
+    };
+    let names_nothing = tok.split(',').any(|element| {
+        element
+            .strip_prefix('@')
+            .is_some_and(|body| !aterm_types::control_verbs::selector_body_names_something(body))
+    });
+    if names_nothing {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            aterm_types::control_verbs::EMPTY_SELECTOR,
+        ));
+    }
+    Ok(())
+}
+
 /// Expand `@self` / `@env` to a concrete `@<sid>` from
 /// `$ATERM_PARENT_SESSION_ID` (`self_sid`) before framing. Unlike flagless and
 /// `@.`, which follow the active tab, this is stable across tab switches.
-/// `@<sid>` and `@.` pass through. Errors when the variable is unset or empty;
-/// `parts` is then unchanged.
+/// `@<sid>` and `@.` pass through. Errors when the variable is unset, empty or
+/// blank (a sid that would frame as a selector naming nothing); `parts` is
+/// then unchanged.
 ///
 /// Expands in every selector position: the leading proxy selector (`@self
 /// screen`), `subscribe`'s selector-second form (`subscribe @self
 /// screen,events`), and inside a comma list (`subscribe @self,@1 screen`).
 fn expand_self_selector(parts: &mut [String], self_sid: Option<String>) -> io::Result<()> {
-    // Selector token position(s): `subscribe` is selector-SECOND, every other verb
-    // takes an optional leading `@<sel>` proxy at parts[0].
-    let sel_idx = if parts.first().map(String::as_str) == Some("subscribe") {
-        1
-    } else {
-        0
-    };
+    let sel_idx = selector_index(parts);
     let Some(tok) = parts.get(sel_idx) else {
         return Ok(());
     };
@@ -4653,7 +4878,7 @@ fn expand_self_selector(parts: &mut [String], self_sid: Option<String>) -> io::R
         return Ok(());
     }
     let sid = self_sid
-        .filter(|s| !s.is_empty())
+        .filter(|s| aterm_types::control_verbs::selector_body_names_something(s))
         .ok_or_else(self_selector_error)?;
     let expanded = tok
         .split(',')
@@ -4675,7 +4900,7 @@ fn expand_self_selector(parts: &mut [String], self_sid: Option<String>) -> io::R
 fn self_selector_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "ERR @self: not inside an aterm session ($ATERM_PARENT_SESSION_ID unset)",
+        "ERR @self: not inside an aterm session ($ATERM_PARENT_SESSION_ID unset or empty)",
     )
 }
 
@@ -4733,6 +4958,192 @@ fn read_stdin_payload() -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// A worker's task off stdin (`spawn agent=… -`): 1 byte to
+/// [`MAX_TASK_BYTES`], refused here before anything is sent, as the server
+/// would refuse it.
+fn read_task_payload() -> io::Result<Vec<u8>> {
+    let mut task = Vec::new();
+    io::stdin()
+        .lock()
+        .take(MAX_TASK_BYTES as u64 + 1)
+        .read_to_end(&mut task)?;
+    validate_task_payload(&task)?;
+    Ok(task)
+}
+
+/// [`read_task_payload`]'s refusals: an empty task, and one past
+/// [`MAX_TASK_BYTES`].
+fn validate_task_payload(task: &[u8]) -> io::Result<()> {
+    if task.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "spawn agent=: the task on stdin is empty",
+        ));
+    }
+    if task.len() > MAX_TASK_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("spawn agent=: the task on stdin is over {MAX_TASK_BYTES} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+/// The session that starts a worker: the one this client runs in. It is the
+/// worker's `from=` however it is aimed — the task's starter, the one its
+/// result returns to.
+fn worker_starter(self_sid: Option<String>) -> Option<String> {
+    self_sid.filter(|sid| !sid.is_empty() && !sid.contains(char::is_whitespace))
+}
+
+/// The selector a worker's spawn aims with: the one given; else, not pinned
+/// to an instance (`--sock`/`--pid`, where the starter may not live), the
+/// `starter` — `@self`, so the worker opens behind its manager's tab; else
+/// none.
+fn worker_selector(given: Option<&str>, pinned: bool, starter: Option<&str>) -> Option<String> {
+    match given {
+        Some(sel) => Some(sel.to_string()),
+        None if pinned => None,
+        None => starter.map(|sid| format!("@{sid}")),
+    }
+}
+
+/// The request line of a worker's spawn, without its `len=`
+/// ([`worker_exchange`] adds it): `[@<sel>] spawn <args>`, where `args` must
+/// end with `-` (the task is on stdin) and name no `len=` (this client's to
+/// write), and gain `from=<starter>` ([`worker_starter`]) and `cwd=<pwd>`
+/// when they name none ([`worker_cwd_arg`]). A RELATIVE `cwd=` is made
+/// absolute against `pwd`: the server would resolve it against its own
+/// folder (`/` for an app launchd started), and the folder named is the one
+/// the window harness trusts for the worker. Every `cwd=` goes quoted when it
+/// holds a space, as `spawn` reads a quoted value ([`spawn_wire_line`]). A
+/// `pwd` this cannot write (a quote beside a space, a newline) is refused:
+/// say an absolute cwd= instead.
+fn worker_spawn_head(
+    selector: Option<&str>,
+    args: &[String],
+    starter: Option<&str>,
+    pwd: Option<&std::path::Path>,
+) -> io::Result<String> {
+    let usage = |why: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "spawn agent=: {why} (aterm ctl @self spawn agent=claude [model=<m>] [cwd=<path>] - < task)"
+            ),
+        )
+    };
+    let Some((last, args)) = args.split_last() else {
+        return Err(usage("the task is read from stdin: end the request with -"));
+    };
+    if last != "-" {
+        return Err(usage("the task is read from stdin: end the request with -"));
+    }
+    if args.iter().any(|a| a.starts_with("len=")) {
+        return Err(usage("len= is the client's to write"));
+    }
+    validate_request_parts(args)?;
+    let here = || pwd.ok_or_else(|| usage("this directory cannot be read: say an absolute cwd="));
+    let mut parts: Vec<String> = selector.map(str::to_string).into_iter().collect();
+    parts.push("spawn".to_string());
+    for arg in args {
+        // `cwd="<dir>"` is how `spawn` reads a folder holding a space.
+        let given = arg.strip_prefix("cwd=").map(|v| {
+            v.strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .unwrap_or(v)
+        });
+        parts.push(match given {
+            Some(dir) if !dir.is_empty() && Path::new(dir).is_relative() => {
+                // `.` folds away (`cwd=.` is this directory); `..` is the
+                // kernel's to resolve, through whatever links it crosses.
+                // On Windows `\x` is rooted on no drive and takes this
+                // directory's; `D:x`, relative to another drive's current
+                // folder, is not made absolute by this one and is refused.
+                let dir: PathBuf = here()?.join(dir).components().collect();
+                if !dir.is_absolute() {
+                    return Err(usage("a folder on another drive: say an absolute cwd="));
+                }
+                worker_cwd_arg(&dir)
+                    .map_err(|why| usage(&format!("{why}: say an absolute cwd=")))?
+            }
+            _ => arg.clone(),
+        });
+    }
+    if let Some(sid) = starter
+        && !args.iter().any(|a| a.starts_with("from="))
+    {
+        parts.push(format!("from={sid}"));
+    }
+    if !args.iter().any(|a| a.starts_with("cwd=")) {
+        parts.push(worker_cwd_arg(here()?).map_err(|why| usage(&format!("{why}: say cwd=")))?);
+    }
+    let head = spawn_wire_line(&parts)?;
+    validate_request_line_len(&head, Some("spawn"))?;
+    Ok(head)
+}
+
+/// The request line `parts` go out as, its newline not yet added: joined
+/// with single spaces (inter-arg whitespace collapses), save a `spawn`'s —
+/// known by its forwarded verb ([`forwarded_verb`]), so aimed by a `@<sel>`
+/// head too — whose folder keeps its spaces ([`spawn_wire_line`]).
+fn request_line(parts: &[String]) -> io::Result<String> {
+    if forwarded_verb(parts).as_deref() == Some("spawn") {
+        spawn_wire_line(parts)
+    } else {
+        Ok(parts.join(" "))
+    }
+}
+
+/// A `spawn` request's line: `parts` joined with single spaces, a `cwd=`
+/// folder that holds whitespace wrapped `cwd="<dir>"` ([`spawn_wire_cwd`]).
+fn spawn_wire_line(parts: &[String]) -> io::Result<String> {
+    let parts = parts
+        .iter()
+        .map(|part| spawn_wire_cwd(part))
+        .collect::<io::Result<Vec<_>>>()?;
+    Ok(parts.join(" "))
+}
+
+/// One `spawn` argument as the request line carries it. The line is re-split
+/// on whitespace server-side, where only a `"…"` value keeps its spaces
+/// (aterm-gui's `split_quoted_tokens`), so a `cwd=` given by its caller — the
+/// shell's `cwd="$PWD"` in a folder with a space — goes `cwd="<dir>"`, as the
+/// folder this client names itself does; a value already so wrapped, and any
+/// other argument, go as given. A folder holding whitespace and a `"` has no
+/// spelling the server reads: refused, before a byte is sent.
+fn spawn_wire_cwd(part: &str) -> io::Result<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
+    let Some(dir) = part.strip_prefix("cwd=") else {
+        return Ok(Cow::Borrowed(part));
+    };
+    let wrapped = dir
+        .strip_prefix('"')
+        .and_then(|d| d.strip_suffix('"'))
+        .is_some_and(|inner| !inner.contains('"'));
+    if !dir.contains(char::is_whitespace) || wrapped {
+        return Ok(Cow::Borrowed(part));
+    }
+    if dir.contains('"') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("spawn: cwd={dir} holds a space and a quote, which no request line can carry"),
+        ));
+    }
+    Ok(Cow::Owned(format!("cwd=\"{dir}\"")))
+}
+
+/// The `cwd=` argument naming the folder `dir` on a worker's spawn line,
+/// which the line's join quotes where it holds a space, and refuses where it
+/// holds a space and a quote ([`spawn_wire_line`]). `Err` where no line can
+/// carry the path at all (not UTF-8, a newline).
+fn worker_cwd_arg(dir: &Path) -> Result<String, &'static str> {
+    dir.to_str()
+        .filter(|p| !p.contains(['\n', '\r']))
+        .map(|dir| format!("cwd={dir}"))
+        .ok_or("this directory's path cannot be sent")
+}
+
 /// Whether a status line reports a timeout: a bare `OK timeout` (the
 /// `await`/`ready`/`wait`/selection-wait reply) or a `turn` verdict with
 /// `status=timeout`. An `ERR ...` line never is.
@@ -4779,23 +5190,84 @@ fn feed_bin_exchange(
         }
 
         let mut reader = BufReader::new(&stream);
-        let mut status_line = String::new();
-        if read_status_line(&mut reader, &mut status_line)? == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "server closed the connection without responding",
-            ));
-        }
-        let status_line = status_line.trim_end_matches(['\r', '\n']);
-        if status_line.split(' ').next() == Some("OK") {
-            print_stdout_line(status_line)?;
-            Ok(ExitCode::SUCCESS)
-        } else {
-            stderr_line(status_line)?;
-            Ok(ExitCode::FAILURE)
-        }
+        print_frame_answer(&read_frame_answer(&mut reader)?)
     })?;
     Ok(served.unwrap_or_else(std::convert::identity))
+}
+
+/// A WORKER's spawn ([`worker_spawn_head`] plus its `len=`) in two steps:
+/// the line `head`; then — only once the server answers it `GO <n>`
+/// ([`aterm_types::control_verbs::task_frame_go`]) — the `task`, and the
+/// server's one-line answer printed as [`feed_bin_exchange`] prints it. Any
+/// other answer to the line is the answer, and not a byte of the task is sent: a
+/// server that predates the frame refuses the line (`ERR usage: spawn …`) and
+/// keeps the connection, and would serve each line of a task sent behind it
+/// as a request under this connection's token. A second `GO` after the task
+/// (a lane that answered the line, then lost its parker, answers it again) is
+/// read past.
+fn worker_exchange(
+    path: &str,
+    origin: TargetOrigin,
+    head: &str,
+    task: &[u8],
+    deadline: Option<std::time::Duration>,
+) -> io::Result<ExitCode> {
+    let path = &aterm_uds::latest::resolve(path);
+    let go = aterm_types::control_verbs::task_frame_go(task.len());
+    let go = go.trim_end_matches('\n');
+    let served = converse_served(path, origin, deadline, |stream| {
+        let mut line = String::from(head);
+        line.push('\n');
+        if let Some(code) = send_served(&stream, line.as_bytes())? {
+            return Ok(code);
+        }
+        let mut reader = BufReader::new(&stream);
+        let mut answer = read_frame_answer(&mut reader)?;
+        if answer != go {
+            if answer.starts_with("ERR usage: spawn") {
+                stderr_line(&answer)?;
+                stderr_line(
+                    "the instance does not take a worker's task (it predates `spawn agent=`): \
+                     no byte of the task was sent; update it first",
+                )?;
+                return Ok(ExitCode::FAILURE);
+            }
+            return print_frame_answer(&answer);
+        }
+        if let Some(code) = send_served(&stream, task)? {
+            return Ok(code);
+        }
+        while answer == go {
+            answer = read_frame_answer(&mut reader)?;
+        }
+        print_frame_answer(&answer)
+    })?;
+    Ok(served.unwrap_or_else(std::convert::identity))
+}
+
+/// One answer line of a frame's exchange, its line end trimmed; a server that
+/// hung up without one is an error.
+fn read_frame_answer<R: BufRead>(reader: &mut R) -> io::Result<String> {
+    let mut line = String::new();
+    if read_status_line(reader, &mut line)? == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "server closed the connection without responding",
+        ));
+    }
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Print a frame's answer: `OK …` on stdout (exit SUCCESS), anything else on
+/// stderr (exit FAILURE).
+fn print_frame_answer(answer: &str) -> io::Result<ExitCode> {
+    if answer.split(' ').next() == Some("OK") {
+        print_stdout_line(answer)?;
+        Ok(ExitCode::SUCCESS)
+    } else {
+        stderr_line(answer)?;
+        Ok(ExitCode::FAILURE)
+    }
 }
 
 /// Reject request arguments containing a line terminator. The server reads one
@@ -4809,6 +5281,25 @@ fn validate_request_parts(parts: &[String]) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Refuse a request line the server would refuse, before a byte of it is sent:
+/// past [`MAX_REQUEST_LINE`] the server answers `ERR` and closes. `verb` is
+/// the request's own ([`forwarded_request`]); the two whose payload has a
+/// stdin form (`send --stdin`, `paste --stdin`, through the length-prefixed
+/// frame) are told it, and every other verb gets the server's words alone.
+fn validate_request_line_len(line: &str, verb: Option<&str>) -> io::Result<()> {
+    if line.len() <= MAX_REQUEST_LINE {
+        return Ok(());
+    }
+    let words = aterm_types::control_verbs::request_line_too_long();
+    let why = match verb {
+        Some(verb @ ("send" | "paste")) => {
+            format!("{words}; a long payload goes on stdin: {verb} --stdin")
+        }
+        _ => words,
+    };
+    Err(io::Error::new(io::ErrorKind::InvalidInput, why))
 }
 
 /// The request from its verb on, skipping an optional proxy selector (`@<sid>` /
@@ -4831,8 +5322,9 @@ fn leading_options(args: &[String]) -> impl Iterator<Item = &str> {
         .take_while(|a| *a != "--" && a.contains('='))
 }
 
-/// The wire never quotes: the request line is the argv joined with single
-/// spaces and re-split server-side, so a pattern with spaces arrives as several
+/// The wire quotes nothing but a spawn's folder ([`spawn_wire_line`]): the
+/// request line is the argv joined with single spaces and re-split
+/// server-side, so a pattern with spaces arrives as several
 /// tokens (`await gone 'esc to interrupt'` would arm `esc`; `turn
 /// settle=match:'BUILD SUCCESSFUL' …` would arm `BUILD` and type the rest).
 /// This names the element about to be split for the pattern-taking shapes:
@@ -5266,8 +5758,8 @@ fn drain_refusal_tail<R: Read>(reader: &mut BufReader<R>) -> io::Result<()> {
 }
 
 /// [`drain_refusal_tail`] into `err`, each line rendered by
-/// [`aterm_codec::tty::safe`] when `terminal` (a refusal is the server's words,
-/// or a forwarded host's). The seam the tests drive both branches through.
+/// [`aterm_codec::tty::safe`] when `terminal` (a refusal is the server's words).
+/// The seam the tests drive both branches through.
 fn drain_refusal_tail_into<R: Read>(
     reader: &mut BufReader<R>,
     err: &mut impl Write,
@@ -5302,9 +5794,10 @@ fn drain_refusal_tail_into<R: Read>(
 }
 
 /// `BufRead::read_line` with the [`MAX_LINE_BYTES`] cap: identical on success
-/// (trailing `\n` kept, a partial line at EOF returned, invalid UTF-8 rejected
-/// with std's message and `line` untouched), but a line past the cap without a
-/// newline fails with [`oversized_reply_error`]. Bytes are UTF-8-checked once
+/// (trailing `\n` kept, clean EOF returned, invalid UTF-8 rejected with std's
+/// message and `line` untouched), but a nonempty line cut at EOF is refused.
+/// A line past the cap without a newline fails with [`oversized_reply_error`].
+/// Bytes are UTF-8-checked once
 /// at the end, so an over-long line always reports "oversized".
 fn read_bounded_line<R: BufRead>(reader: &mut R, line: &mut String) -> io::Result<usize> {
     let mut bytes = Vec::new();
@@ -5313,6 +5806,12 @@ fn read_bounded_line<R: BufRead>(reader: &mut R, line: &mut String) -> io::Resul
         .read_until(b'\n', &mut bytes)?;
     if n > MAX_LINE_BYTES && bytes.last() != Some(&b'\n') {
         return Err(oversized_reply_error());
+    }
+    if n > 0 && bytes.last() != Some(&b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "server hung up mid-reply before the line ended",
+        ));
     }
     match std::str::from_utf8(&bytes) {
         Ok(s) => {
@@ -5781,8 +6280,8 @@ fn acknowledge_artifact_reply(
 /// Write `"aterm-ctl: <msg>\n"` to stderr (manual `eprintln!`). A broken stderr
 /// propagates the error instead of panicking. A write that would block is
 /// [`Worded`], as [`StdoutSink`]'s is. `msg` is often the server's own words
-/// (a status line, an `ERR`): rendered for a
-/// terminal when stderr is one ([`stderr_prefixed`]).
+/// (a status line, an `ERR`): rendered for a terminal when stderr is one
+/// ([`stderr_prefixed`]).
 fn stderr_line(msg: &str) -> io::Result<()> {
     stderr_prefixed("aterm-ctl: ", msg).map_err(worded)
 }
@@ -5817,7 +6316,7 @@ fn prefixed_line(prefix: &str, msg: &str, terminal: bool) -> Vec<u8> {
 /// broken pipe surfaces as an [`io::Error`] through [`StdoutSink`]: a closed
 /// reader ends the run silently with status 0, any other failure exits
 /// non-zero. `io::stdout` is passed as a function item (see `read_token_for`)
-/// so the strict gate treats it as an opaque call.
+/// so the Trust lane treats it as an opaque call.
 #[allow(
     clippy::unnecessary_literal_unwrap,
     reason = "io::stdout is passed as a fn-item to a combinator so the Trust lane (`ship trust run`) keeps it an opaque cross-crate call instead of inlining std's startup-semantics internals it cannot lower"
@@ -5856,7 +6355,7 @@ fn copy_body<R: io::Read, W: Write>(reader: &mut R, out: &mut W, nbytes: u64) ->
 /// line endings while preserving each row's content verbatim (rendered for a
 /// terminal by the [`StdoutSink`]). Early EOF is an error so a guarded artifact
 /// reply is never acknowledged while truncated.
-fn print_payload(reader: &mut BufReader<&CtlStream>, count: usize) -> io::Result<()> {
+fn print_payload<R: BufRead>(reader: &mut R, count: usize) -> io::Result<()> {
     let stdout = stdout_handle();
     // `io::Stdout` is always a `LineWriter`, which would issue one `write(2)` per
     // row. The payload is a bounded one-shot body, so buffer it; the explicit
@@ -5971,7 +6470,7 @@ fn receive_guarded_artifact_reply(
 }
 
 /// Connect to `path`, authenticate, send `request`, and print the response for
-/// `verb`.
+/// `verb`, framed as `request` decides (`framing_of`).
 ///
 /// The server requires `AUTH <hex>\n` first on every connection; the token is
 /// read from beside the socket and sent transparently. The `AUTH` line gets no
@@ -6278,11 +6777,13 @@ fn exchange_on(
         // stderr ("worked, no results"). Some headers carry facts the rows need
         // and always go to stderr: `inbox` (hold/seen/dropped/pending),
         // `offscreen` (`last=` is the next `since=`, `screen_rows=` splits archive
-        // from screen, `lost=`/`breaks=`; `aterm drive report` reads it here),
-        // `resizes` (`render=`, `flaps=`, `unledgered=`, `lost=`), `log`
-        // (`as_of=` and `ep=` are the next `since=` and `ep=`, `lost=`, `more=`)
-        // `brief` (`sid=`, `as_of=`, `ep=`, `budget=`, `used=`), and `search`
-        // (completeness qualifiers a caller must not infer from the hit rows).
+        // from screen, `lost=`/`breaks=`; the supervisor's report reads it here),
+        // `resizes` (`render=`, `flaps=`, `unledgered=`, `lost=`), `result`
+        // (`source=transcript session= uuid= bytes=`: stdout is the worker's
+        // text alone), `log` (`as_of=` and `ep=` are the next `since=` and
+        // `ep=`, `lost=`, `more=`), `brief` (`sid=`, `as_of=`, `ep=`,
+        // `budget=`, `used=`), and `search` (completeness qualifiers a caller
+        // must not infer from the hit rows).
         if drift::is_drift_request(verb, request) {
             // Every `cast drift` is dispatched to the `drift` module before any
             // exchange; this is a backstop. A server predating the verb answers
@@ -6305,6 +6806,7 @@ fn exchange_on(
             || verb == "offscreen"
             || verb == "search"
             || verb == "resizes"
+            || verb == "result"
             || verb == "log"
             || verb == "brief"
             // `history`'s header carries ` unheld_below=<id>` when an update could

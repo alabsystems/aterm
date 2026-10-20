@@ -1,6 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
+// The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
+// under them (crates/aterm-spec-anchor/anchor_rules.rs).
+#![cfg_attr(anchor_rules, feature(macro_attr))]
+
 //! `aterm-update`: silent, signature-pinned in-app self-update for the macOS
 //! `aterm.app` (and, through [`linux`], an enrolled Linux executable).
 //!
@@ -10,12 +14,17 @@
 //! * [`apply_staged_if_ready_preserving_fds_exact`]: call very early in `main()`,
 //!   before any window or thread. If a previous run staged a verified, newer build,
 //!   it atomically swaps it into place and re-execs the new binary (same PID, tty
-//!   and parent); otherwise it returns. This is the one boot apply entry point.
+//!   and parent); otherwise it returns. This is the one boot apply entry point. What
+//!   it may do to the process's image is the caller's [`ImageReplacement`]: after an
+//!   `execve` that follows a LaunchServices launch, LaunchServices answers pid -1 for
+//!   the app for the rest of the process's life. So a seamless successor
+//!   LaunchServices launched never swaps or re-execs here (its parent swaps first,
+//!   [`swap_staged_for_launch`]), and a macOS window no parent handed off to leaves the
+//!   stage for its own in-session lane ([`ApplyOutcome::LeftForSession`]).
 //! * [`spawn_background_check_with_settings`]: call once the GUI is up. A detached
 //!   thread finds a newer release on the channel, downloads and verifies it, and
 //!   stages it for the in-session apply lane (the GUI hands the live session over
-//!   in place); the next launch applies it only if no handoff completes. It never
-//!   touches the UI or blocks the event loop.
+//!   in place). It never touches the UI or blocks the event loop.
 //!
 //! # Delivery model
 //!
@@ -25,8 +34,11 @@
 //!   jittered interval plus the download.
 //! * Applying: in-session through the overlap handoff, at the first quiet moment
 //!   and at the latest within `aterm-gui`'s `LANDS_WITHIN` of the stage, or on one
-//!   click. The top of the next `main()` is the fallback for a stage no handoff
-//!   completed.
+//!   click. The top of the next `main()` swaps a stage no handoff completed only in a
+//!   launch that may replace its image ([`ImageReplacement::Replaceable`]), or, with
+//!   `[update] auto_apply` on, once [`LEFT_STAGE_ESCAPE`] window launches left that
+//!   stage and ended without it landing, or when the left-stage record cannot count
+//!   this launch. With it off a window's stage waits for a press.
 //!
 //! A machine that never runs aterm is never updated, but the first launch after a
 //! release stages it and the running app applies it: at worst one apply behind.
@@ -334,8 +346,10 @@ fn fingerprint_state(encoded: &str) -> String {
 }
 
 /// Outcome of an [`apply_staged_if_ready_preserving_fds_exact`] call. Every variant
-/// is non-fatal: the caller keeps launching the current build. A successful apply
-/// never returns (it `exec`s the new binary), so there is no "applied" variant.
+/// but [`Self::Reverted`] is non-fatal: the caller keeps launching the current build.
+/// A successful apply never returns (it `exec`s the new binary), so there is no
+/// "applied" variant. [`swap_staged_for_launch`] refuses with the same variants, never
+/// with [`Self::LeftForSession`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyOutcome {
     /// Not an installed `.app` launch (dev build / `cargo run` / translocated /
@@ -350,7 +364,67 @@ pub enum ApplyOutcome {
     /// The bundle was swapped but re-exec into the new binary failed; the swap
     /// was rolled back and the caller should keep running the old build.
     ReExecFailed(String),
+    /// A LaunchServices-launched seamless successor found its build crash-looping and
+    /// put the previous build back at the install, without re-executing it (such a
+    /// process never replaces its own image). The caller must exit now, before its
+    /// rendezvous dial: this image is the build just reverted. Carries what happened.
+    Reverted(String),
+    /// A macOS window launch ([`ImageReplacement::WindowKeepsImage`]) found this stage
+    /// ready and admitted, and left it for its window's in-session lane: nothing was
+    /// verified, swapped or exec'd, the apply lock is let go, and the stage is as it
+    /// was. Non-fatal and no refusal: the window's seamless lane installs it (its
+    /// parent swaps, then LaunchServices launches the build it installed), by itself, or
+    /// on a press while `[update] auto_apply` is off.
+    LeftForSession {
+        /// The staged build left.
+        build: u64,
+        /// Its container's SHA-256, as `ready.toml` names it.
+        dmg_sha256: String,
+    },
 }
+
+/// What a launch's boot apply may do to the process's image, decided once by the
+/// caller ([`apply_staged_if_ready_preserving_fds_exact`]).
+///
+/// An `execve` a few hundred milliseconds after LaunchServices launched a process
+/// leaves LaunchServices answering pid -1 for the app for the rest of that process's
+/// life: System Settings' Quit & Reopen misses it, its menu-bar item is never placed,
+/// and TCC attributes it to the rollback path. A launch that cannot tell whether
+/// LaunchServices started it keeps its image whenever its window has a lane that can
+/// install the stage without an exec of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageReplacement {
+    /// The boot may swap a ready stage and exec the build it installed, and a crash-loop
+    /// revert re-execs the restored build: a `--headless` launch, a window with an
+    /// explicit control socket (the one launch-time reason the overlap handoff can be
+    /// missing), the cold lane's relaunch of a running window, a fork-lane successor,
+    /// and every launch off macOS.
+    Replaceable,
+    /// A macOS window no parent handed off to (the Dock, Finder, `open`, a login item, or
+    /// a shell; LaunchServices' launches cannot be told apart from a shell's). It leaves
+    /// a ready stage for its window's in-session lane ([`ApplyOutcome::LeftForSession`]).
+    /// With `[update] auto_apply` off that lane is a person's press, and no window launch
+    /// installs the stage without one. With it on, once [`LEFT_STAGE_ESCAPE`] earlier
+    /// launches left the same stage for that automatic lane and ended without it landing,
+    /// or once the record of them cannot count this launch, the boot swaps and execs it
+    /// as a [`Self::Replaceable`] launch does, so an old build whose own lane cannot land
+    /// the stage never strands it. A crash-loop revert still re-execs the restored build.
+    WindowKeepsImage,
+    /// LaunchServices started this process as a seamless successor (it was handed a
+    /// rendezvous): it swaps nothing, and a crash-loop revert returns
+    /// [`ApplyOutcome::Reverted`] for the caller to exit instead of re-executing.
+    LaunchedSuccessor,
+}
+
+/// How many launches that left one stage for their window's automatic lane
+/// ([`ApplyOutcome::LeftForSession`]) must have ended, cleanly or not, with the stage
+/// still there before the next window launch of the same stage, its automatic lane on
+/// too, swaps and execs it at its boot. One ended launch is ordinary (a window quit
+/// inside the automatic lane's minute); two say the running build's lane may not land
+/// it at all (it crashes before its handoff, or its handoff keeps failing before its
+/// swap). A launch that left the stage for a press (`[update] auto_apply = false`) is
+/// never counted, and never escapes: waiting for the press is the design.
+pub const LEFT_STAGE_ESCAPE: usize = 2;
 
 /// What a launch of this build can PROVE about its boot trial — handed to the boot
 /// apply, which counts the launch, and to the health confirmation, which settles
@@ -397,6 +471,23 @@ pub fn enabled() -> bool {
     cfg!(any(target_os = "macos", target_os = "linux"))
 }
 
+/// Whether the running copy has a bundle the updater could replace: the
+/// [`UpdateStatus::installable`] fact read on its own, for a caller whose [`status`]
+/// read found no ledger to read (no resolvable HOME), so that the copy's own answer
+/// is still observed. `None` where [`status`] always answers it (Linux) and where
+/// there is no updater.
+#[must_use]
+pub fn running_copy_installable() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(bundle::resolve().is_some())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// Whether the running copy is a dev-marked bundle (`ATermDevBuild` in its
 /// `Info.plist`, written by `targo --unverified ship dev-app`), which the updater leaves alone
 /// wherever it sits, so a "move it into Applications" remedy would be wrong. One
@@ -441,6 +532,14 @@ pub fn automatic() -> bool {
 /// same-build/different-source reuse.
 ///
 /// `witness` is what this launch can prove about a boot trial ([`TrialWitness`]).
+///
+/// `image` is what the boot may do to this process's image ([`ImageReplacement`]).
+/// A [`ImageReplacement::LaunchedSuccessor`] swaps nothing, and a crash-loop revert
+/// inside it returns [`ApplyOutcome::Reverted`] instead of re-executing the restored
+/// build; the caller must then exit. A [`ImageReplacement::WindowKeepsImage`] launch
+/// with a ready stage returns [`ApplyOutcome::LeftForSession`] unless the escape
+/// ([`LEFT_STAGE_ESCAPE`]) applies, which it never does while `[update] auto_apply` is
+/// off.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn apply_staged_if_ready_preserving_fds_exact(
@@ -449,6 +548,7 @@ pub fn apply_staged_if_ready_preserving_fds_exact(
     handoff_fds: &[i32],
     handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
     handoff_target_is_this_build: bool,
+    image: ImageReplacement,
     witness: TrialWitness,
 ) -> ApplyOutcome {
     install::apply_staged_if_ready(
@@ -457,8 +557,43 @@ pub fn apply_staged_if_ready_preserving_fds_exact(
         handoff_fds,
         handoff_env,
         handoff_target_is_this_build,
+        image,
         witness,
     )
+}
+
+/// The parent's swap before it asks LaunchServices for a seamless successor: the stage
+/// the attempt authorizes, `expected` = (build, commit, DMG SHA-256), goes into the
+/// install under the apply lock with every gate the boot apply runs, so the process
+/// LaunchServices starts is already that build and never replaces its own image.
+/// `Ok` names the build now installed, its boot trial armed for the successor's launch
+/// to count. The lock is let go before it returns, nothing is exec'd, and no re-exec
+/// stamp is written. A refusal is the boot apply's own outcome (`Deferred` with its
+/// reason, `NoUpdate` when nothing newer is staged, which includes a sibling having
+/// swapped it in already), returned for the caller to file and not booked here.
+///
+/// Blocking (the apply lock's bounded wait, codesign, a start probe): call it from a
+/// worker, never the event loop.
+#[cfg(target_os = "macos")]
+pub fn swap_staged_for_launch(
+    current_build: u64,
+    current_commit: &str,
+    expected: (u64, &str, &str),
+) -> Result<u64, ApplyOutcome> {
+    let (build, commit, dmg_sha256) = expected;
+    let expected = install::ExpectedArtifact::from_parts(build, commit, dmg_sha256)
+        .map_err(ApplyOutcome::Deferred)?;
+    install::swap_staged_for_launch(current_build, current_commit, &expected)
+}
+
+/// Off macOS no launch goes through LaunchServices, so there is nothing to swap first.
+#[cfg(not(target_os = "macos"))]
+pub fn swap_staged_for_launch(
+    _current_build: u64,
+    _current_commit: &str,
+    _expected: (u64, &str, &str),
+) -> Result<u64, ApplyOutcome> {
+    Err(ApplyOutcome::NotApplicable)
 }
 
 /// The clause an apply-path refusal carries when its cause can clear by itself: a
@@ -490,6 +625,31 @@ pub const INSTALL_LOCATION_REFUSAL_KEY: &str = "install location not writable";
 #[must_use]
 pub fn is_install_location_refusal(reason: &str) -> bool {
     reason.contains(INSTALL_LOCATION_REFUSAL_KEY)
+}
+
+/// A tool's output, quoted into a refusal so it can never speak for it. The refusal
+/// keys are read with `contains`, and codesign, spctl, PlistBuddy and a candidate's
+/// own `--version` echo text the bundle chose (a nested path, a file name): a tampered
+/// bundle naming a file after the passing key turned codesign's verdict on it into a
+/// passing refusal (measured). Each key inside the quoted text has its spaces made
+/// no-break, so it still reads the same and no key matches it.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub(crate) fn quote_tool_output(text: &str) -> String {
+    let mut quoted = text.to_string();
+    for key in [
+        PASSING_REFUSAL_KEY,
+        INSTALL_LOCATION_REFUSAL_KEY,
+        ROSTER_UNCONFIRMED_KEY,
+        NOT_INSTALLED_KEY,
+        install::ROLLBACK_SOURCE_REFUSAL_KEY,
+        github::STALE_ANCHOR_KEY,
+    ] {
+        if quoted.contains(key) {
+            quoted = quoted.replace(key, &key.replace(' ', "\u{a0}"));
+        }
+    }
+    quoted
 }
 
 /// Whether an apply-path refusal is a passing moment ([`PASSING_REFUSAL_KEY`]):
@@ -536,8 +696,13 @@ pub fn refusal_needs_person(reason: &str) -> bool {
     !is_passing_refusal(reason)
         && (install::is_rollback_source_refusal(reason)
             || is_install_location_refusal(reason)
-            || reason.contains("does not run from an installed bundle"))
+            || reason.contains(NOT_INSTALLED_KEY))
 }
+
+/// The words of the refusal for an app that does not run from an installed bundle
+/// ([`refusal_needs_person`]).
+#[cfg(target_os = "macos")]
+const NOT_INSTALLED_KEY: &str = "does not run from an installed bundle";
 
 #[cfg(not(target_os = "macos"))]
 pub fn refusal_needs_person(_reason: &str) -> bool {
@@ -1030,6 +1195,7 @@ pub fn apply_staged_if_ready_preserving_fds_exact(
     _handoff_fds: &[i32],
     _handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
     _handoff_target_is_this_build: bool,
+    _image: ImageReplacement,
     _witness: TrialWitness,
 ) -> ApplyOutcome {
     #[cfg(target_os = "linux")]
@@ -1257,26 +1423,65 @@ pub fn installed_update_facts_checked() -> Result<Option<InstalledUpdateFacts>, 
     // never the event loop, so fail-closed verification adds no input latency.
     // Every helper runs at once (`verify::check_bundle`), read in the serial order.
     let checks = verify::check_bundle(&installed.app_root, effective_team_id(), true);
+    installed_facts_from(checks, paths::Staging::resolve().as_ref()).map(Some)
+}
+
+/// The installed bundle's facts from its `checks` and the staging root's records: the
+/// policy and the sealed reads must pass, the receipt is kept only when it binds to the
+/// sealed build and commit, and the floor is a gate read ([`installed_build_yanked`]),
+/// so a floor this pass could not read reports nothing (its passing `Err`).
+#[cfg(target_os = "macos")]
+fn installed_facts_from(
+    checks: verify::BundleChecks,
+    staging: Option<&paths::Staging>,
+) -> Result<InstalledUpdateFacts, String> {
     checks.policy?;
     let build_number = checks.build?;
     let git_commit = checks.commit?;
     let version = checks.short_version.and_then(Result::ok);
-    let staging = paths::Staging::resolve();
     let receipt = staging
-        .as_ref()
         .and_then(|staging| manifest::InstalledReceipt::read(&staging.installed_receipt()))
         .filter(|receipt| receipt.matches_sealed(build_number, &git_commit));
-    let yanked = staging
-        .as_ref()
-        .is_some_and(|staging| build_number < manifest::Floor::read(&staging.floor()).min_build);
-    Ok(Some(InstalledUpdateFacts {
+    let yanked = installed_build_yanked(staging, build_number)?;
+    Ok(InstalledUpdateFacts {
         build_number,
         git_commit,
         version,
         receipt_build_number: receipt.as_ref().map(|receipt| receipt.build_number),
         receipt_dmg_sha256: receipt.map(|receipt| receipt.dmg_sha256),
         yanked,
-    }))
+    })
+}
+
+/// Whether the operator floor yanks the installed bundle's `build`: the one floor read
+/// the GUI's facts and the checker's staged-hook announcement share. It is a gate
+/// read ([`manifest::Floor::read_for_gate`]): a present floor this read could not get
+/// through is its passing `Err`, never "not yanked", so the facts report nothing this
+/// pass and the checker announces nothing, rather than offering an activation every
+/// handoff then refuses. No staging root: no floor.
+#[cfg(target_os = "macos")]
+fn installed_build_yanked(staging: Option<&paths::Staging>, build: u64) -> Result<bool, String> {
+    staging.map_or(Ok(false), |staging| {
+        manifest::Floor::read_for_gate(&staging.floor()).map(|floor| build < floor.min_build)
+    })
+}
+
+/// Whether the checker announces `installed` (the build the bundle under our own
+/// executable now holds) to the staged hook, before verifying it: newer than the
+/// running `current` build, not yanked by a floor this pass could read
+/// ([`installed_build_yanked`]: a build below the operator apply floor is no update
+/// wherever it sits, and a floor that could not be read announces nothing; the next
+/// cycle reads it again), and not the build already `announced`.
+#[cfg(target_os = "macos")]
+fn installed_announcement_due(
+    staging: Option<&paths::Staging>,
+    installed: u64,
+    current: u64,
+    announced: Option<u64>,
+) -> bool {
+    installed > current
+        && installed_build_yanked(staging, installed) == Ok(false)
+        && announced != Some(installed)
 }
 
 /// The activation pre-verify: before the GUI parks a reader to hand off to a newer
@@ -1520,7 +1725,9 @@ pub fn forgive_trial_launch_of(
 /// pid and kernel birth stamp. LaunchServices reports a successor that dies before
 /// checking in with no pid, so the stamp is its parent's one name for it
 /// ([`forgive_stamped_trial_launch`]). Written once, never followed or replaced:
-/// the boot apply's re-exec keeps pid and birth stamp, so it is the same launch.
+/// a launched successor of this build never re-execs (its parent swapped before
+/// launching it), and an older build's boot-apply re-exec keeps pid and birth stamp, so a
+/// stamp already there is the same launch.
 /// Best effort: an unwritten stamp leaves the launch counted, which keeps the
 /// crash signal.
 #[cfg(target_os = "macos")]
@@ -1846,6 +2053,16 @@ pub const INSTALL_AWAITS_START_TITLE: &str = "Start a new aterm to finish the up
 /// without one (rolled back, or kept). The window takes the notice down. The body names
 /// the installed version. It is never shown.
 pub const INSTALL_WAIT_OVER_TITLE: &str = "aterm update no longer waits for a start";
+
+/// The `title` [`HealthNotify`] is called with when a crash loop ended a Linux install's
+/// trial — the build rolled back, or kept because the build before it could not come back
+/// (`linux_notice::InstallWatch`; ATERM-KI-1015-2, U21) — with the body in the record's own
+/// words for it, naming the build that failed. EACH CRASH LOOP IS NEWS OF ITS OWN: the
+/// window says it as the install half's warning (`Couldn't install updates`, as the macOS
+/// lane says a reverted update) every time, a second before the first was answered too,
+/// where a failing title it has already said this launch is only a log line. Pinned so the
+/// window matches on it; [`health_failing_class`] reads no class from it.
+pub const INSTALL_CRASH_LOOP_TITLE: &str = "An aterm update didn\u{2019}t start properly";
 
 /// What the check loop tells the GUI about the ledger's health, decided from the
 /// shared ledger on every cycle, so a cycle skipped because a sibling already
@@ -2652,7 +2869,9 @@ mod persistent_notice_tests {
         assert_eq!(title, super::health_failing_title("pipeline"));
     }
 
-    /// A ledger whose `manifest` streak has persisted, its last failure at `last`.
+    /// A ledger whose `manifest` streak has persisted, its last failure at `last`:
+    /// that failure is the diagnosis class's own, so its dedicated stamp, which
+    /// alone proves the streak's span (5498b845db), is `last` too.
     fn failing_checks(last: &str) -> super::health::Health {
         super::health::Health {
             manifest_failures: 20,
@@ -2922,14 +3141,6 @@ pub struct LinuxUpdateStatus {
     /// This copy rolled back a build newer than the one it runs, and won't install
     /// it again: "up to date" would hide that it runs an older release on purpose.
     pub refused_newer: bool,
-    /// The build this copy refuses ([`Self::refused_newer`]) was rolled back because its
-    /// starts spent their budget ([`LINUX_TRIAL_LAUNCHES`]) without proving it — a crash
-    /// loop — and not by `aterm update rollback` of a build that ran.
-    pub refused_unstarted: bool,
-    /// The installed build's trial ended at a crash loop no rollback could answer: its
-    /// starts spent their budget ([`LINUX_TRIAL_LAUNCHES`]) without proving it, and the
-    /// build before it can't come back, so it stays until a newer release installs over it.
-    pub kept_unproven: bool,
 }
 
 /// The same single background checker, sampling its source before each cycle so
@@ -2976,6 +3187,7 @@ pub fn spawn_background_check_with_source(
         check: std::sync::Arc::new(github::check_and_stage),
         pause: None,
         wake: &cadence::SYSTEM_WOKE,
+        wake_settle: cadence::WAKE_SETTLE,
     });
     let generation = checker_watch::WATCH.register(
         cadence::Cadence::new(std::time::Duration::from_secs(cadence::INTERVAL_SECS))
@@ -3060,6 +3272,9 @@ struct CheckerArgs {
     /// posts on `NSWorkspaceDidWakeNotification` ([`note_system_woke`]); a test
     /// passes its own.
     wake: &'static cadence::WakeSignal,
+    /// How long the network gets after a wake before the next check
+    /// ([`cadence::WAKE_SETTLE`]; a test passes a short one).
+    wake_settle: std::time::Duration,
 }
 
 #[cfg(target_os = "macos")]
@@ -3600,7 +3815,7 @@ fn run_checker(
     let settle = |schedule: &mut cadence::Cadence,
                   failures: &mut cadence::FailureLog,
                   woke_at: &mut Option<std::time::Instant>| {
-        settle_after_wake(schedule, failures, woke_at);
+        settle_after_wake(schedule, failures, woke_at, args.wake_settle);
         wake_seen.set(args.wake.posts());
     };
     // Repeats (an unanswered settings query, a held `checker.lock`, a busy lane) are
@@ -3676,14 +3891,13 @@ fn run_checker(
             if args.has_staged_hook()
                 && let Some(installed) = bundle::resolve()
                 && let Ok(installed_build) = installed_build_observed(&installed.app_root)
-                && installed_build > current_build
-                // A build below the operator apply floor (a yank) is not an update
-                // wherever it sits; announcing it would stage something every
-                // handoff then refuses.
-                && (args.staging)().is_none_or(|s| {
-                    installed_build >= manifest::Floor::read(&s.floor()).min_build
-                })
-                && announced_installed != Some(installed_build)
+                // A yanked build would stage something every handoff then refuses.
+                && installed_announcement_due(
+                    (args.staging)().as_ref(),
+                    installed_build,
+                    current_build,
+                    announced_installed,
+                )
             {
                 // The version is a plist read, so it names the bundle whether or
                 // not it verifies; read only when a line is about to say it.
@@ -4012,7 +4226,8 @@ fn run_checker(
                                 Some(r) => {
                                     log(&format!(
                                         "update {v} is staged; installing it failed {}× \
-                                         ({}); the next launch is the fallback",
+                                         ({}); it stays staged for the next attempt or \
+                                         launch",
                                         r.failures_for_target, r.last_failure
                                     ));
                                 }
@@ -4204,21 +4419,23 @@ fn run_checker(
 /// belonged to a network this Mac may no longer be on), and so is the failure log's
 /// "still failing" carry-over (a pre-sleep DNS failure is not evidence about the
 /// post-wake network); the wake is dated for [`cadence::after_wake`]; and the network
-/// gets [`cadence::WAKE_SETTLE`] to associate before the next check.
+/// gets `settle` ([`cadence::WAKE_SETTLE`] in the shipping loop) to associate before
+/// the next check.
 #[cfg(target_os = "macos")]
 fn settle_after_wake(
     schedule: &mut cadence::Cadence,
     failures: &mut cadence::FailureLog,
     woke_at: &mut Option<std::time::Instant>,
+    settle: std::time::Duration,
 ) {
     log(&format!(
         "woke from sleep; checking for updates in {}s",
-        cadence::WAKE_SETTLE.as_secs()
+        settle.as_secs()
     ));
     schedule.woke();
     *failures = cadence::FailureLog::default();
     *woke_at = Some(std::time::Instant::now());
-    std::thread::sleep(cadence::WAKE_SETTLE);
+    std::thread::sleep(settle);
 }
 
 /// The installed bundle's build number (`CFBundleVersion`), read with PlistBuddy
@@ -5164,18 +5381,16 @@ pub fn delivery() -> Option<Delivery> {
 /// `Staging::resolve` gives up when `ensure_private_dir` fails on `Updates` or
 /// its `download` folder; this re-runs it and names what failed: its own
 /// ownership/mode/symlink refusal, or the system's error (a full disk, a
-/// read-only volume, a parent it may not enter).
+/// read-only volume, a parent it may not enter). It probes the folder
+/// `Staging::resolve` made (`aterm_update_core::seal_guard::updates_base`), so
+/// a development seam or a test binary's root is probed, never the person's.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn ledger_unreadable_cause() -> String {
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(base) = aterm_update_core::seal_guard::updates_base() else {
         return "HOME is not set".to_string();
     };
-    let root = std::path::PathBuf::from(home)
-        .join("Library")
-        .join("Application Support")
-        .join("aterm")
-        .join("Updates");
+    let root = base.join("Updates");
     let shown = "~/Library/Application Support/aterm/Updates";
     let probe = aterm_update_core::ensure_private_dir(&root)
         .and_then(|()| aterm_update_core::ensure_private_dir(&root.join("download")));
@@ -5792,11 +6007,85 @@ mod checker_skip_tests {
 }
 
 /// The per-cycle read of the installed bundle's build number spawns PlistBuddy only
-/// when the plist moved ([`super::observed_build_with`]).
+/// when the plist moved ([`super::observed_build_with`]), and the floor that yanks it
+/// is a gate read ([`super::installed_build_yanked`]).
 #[cfg(all(test, target_os = "macos"))]
 mod installed_build_tests {
     use std::cell::Cell;
     use std::sync::Mutex;
+
+    /// AN UNREADABLE FLOOR DOES NOT ADMIT THE INSTALLED BUILD: build 520 under a floor
+    /// of 530 is yanked, and that floor unreadable this pass (mode 000 standing in for
+    /// `EMFILE`/`EIO`) is a passing `Err`, never "not yanked" — in the GUI's facts of
+    /// the installed bundle ([`super::installed_facts_from`]), which report nothing
+    /// this pass, and in the checker's staged-hook announcement
+    /// ([`super::installed_announcement_due`]), which announces nothing. NEGATIVE
+    /// CONTROL: a readable floor judges by `min_build`, no staging root yanks nothing,
+    /// and a build already announced is not announced again.
+    #[test]
+    fn an_unreadable_floor_does_not_admit_the_installed_build() {
+        use std::os::unix::fs::PermissionsExt;
+        let staging = crate::paths::Staging::scratch("installed-yank-floor");
+        let checks = |build: u64| crate::verify::BundleChecks {
+            policy: Ok(()),
+            build: Ok(build),
+            commit: Ok("0123456789abcdef0123456789abcdef01234567".to_string()),
+            team: None,
+            short_version: Some(Ok(format!("0.{build}.0"))),
+        };
+        let facts = |build| super::installed_facts_from(checks(build), Some(&staging));
+        let due = |build| super::installed_announcement_due(Some(&staging), build, 500, None);
+        std::fs::write(staging.floor(), "min_build = 530\n").unwrap();
+        assert_eq!(super::installed_build_yanked(Some(&staging), 520), Ok(true));
+        assert_eq!(
+            super::installed_build_yanked(Some(&staging), 530),
+            Ok(false)
+        );
+        assert_eq!(super::installed_build_yanked(None, 520), Ok(false));
+        assert!(facts(520).is_ok_and(|facts| facts.yanked));
+        assert!(facts(530).is_ok_and(|facts| !facts.yanked && facts.build_number == 530));
+        assert!(!due(520), "a yanked build is not announced");
+        assert!(due(530));
+        assert!(!super::installed_announcement_due(
+            Some(&staging),
+            530,
+            500,
+            Some(530)
+        ));
+        assert!(!super::installed_announcement_due(
+            Some(&staging),
+            530,
+            530,
+            None
+        ));
+        assert!(super::installed_announcement_due(None, 520, 500, None));
+        let mode =
+            |bits| std::fs::set_permissions(staging.floor(), std::fs::Permissions::from_mode(bits));
+        mode(0o000).unwrap();
+        if std::fs::File::open(staging.floor()).is_ok() {
+            return; // root reads through any mode: nothing to stand in with
+        }
+        let unreadable = super::installed_build_yanked(Some(&staging), 520);
+        let reported = facts(520);
+        let announced = due(520);
+        mode(0o600).unwrap();
+        assert!(
+            unreadable
+                .as_ref()
+                .is_err_and(|e| crate::is_passing_refusal(e)),
+            "an unreadable floor must be a passing refusal, not a verdict: {unreadable:?}"
+        );
+        assert!(
+            reported
+                .as_ref()
+                .is_err_and(|e| crate::is_passing_refusal(e)),
+            "the facts reported an installed build an unreadable floor may yank: {reported:?}"
+        );
+        assert!(
+            !announced,
+            "the checker announced an installed build an unreadable floor may yank"
+        );
+    }
 
     /// AN UNCHANGED PLIST IS READ ONCE. Cycles over the same `Info.plist` reuse the
     /// number its one read gave; a plist rewritten in place (another size, or the

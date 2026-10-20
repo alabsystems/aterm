@@ -3,9 +3,11 @@
 
 //! `aterm fabric brief` (`docs/DESIGN-session-log-2026-10-15.md` §5.5, session
 //! log phase 4): a bounded fold of the session logs the bus mirror put on the
-//! fleet's `ev` faces, from the BUS ALONE — no control socket, no Owner token,
-//! no file written — under whatever caps this host's `[fabric] command` (or
-//! `--cap-file`) reads `pub/>` with.
+//! fleet's `ev` faces, with record contents from the BUS ALONE, no file
+//! written, under whatever caps this host's `[fabric] command` (or
+//! `--cap-file`) reads `pub/>` with. Configuration discovery reuses `tail`'s
+//! path and can inspect local control endpoints; the fold reads no session
+//! records from them.
 //!
 //! THE READER'S VIEW IS THE LAW (ruling Q0): each body is decoded
 //! (`aterm_slog::decode_bus`) into the view of its `(node, sid, ep)` — one per
@@ -27,7 +29,9 @@
 //! rows (each page's scan the broker's `FETCH_SCAN_MAX`), continuing on the
 //! page's mark until the window is read (ruling Q9), so one reply is at most
 //! a page of bodies (each at most 512 bytes: half a MiB). At most
-//! [`SESSIONS_MAX`] sessions are folded, and the whole is held to `--budget`
+//! [`SESSIONS_MAX`] sessions and nodes are retained: a wider roster or
+//! record window refuses the read with an error, rather than silently
+//! returning a subset. The whole successful brief is held to `--budget`
 //! tokens (`used=` counts every line under the header): each session, newest
 //! first, gets its share of what is left, its head line alone when its share
 //! holds no more, and the sessions past the budget are `more=sessions:<k>`.
@@ -123,7 +127,7 @@ impl BriefOpts {
                     }
                     o.sid = Some(sid.to_string());
                     if let Some(node) = parts.next() {
-                        if !crate::join::is_node_id(node) {
+                        if !crate::enable::is_node_id(node) {
                             return Err(format!("{} is not a node id", safe(node, 64)));
                         }
                         o.node = Some(node.to_string());
@@ -161,28 +165,74 @@ struct Read {
 }
 
 impl Read {
+    /// A retained session, shared by the roster and the record fold.
+    fn session_mut(&mut self, node: &str, sid: &str) -> io::Result<&mut Session> {
+        let key = (node.to_string(), sid.to_string());
+        if !self.sessions.contains_key(&key) && self.sessions.len() >= SESSIONS_MAX {
+            return Err(io::Error::other(format!(
+                "fabric brief exceeds {SESSIONS_MAX} sessions; narrow it with @<sid>[@<node>]"
+            )));
+        }
+        Ok(self.sessions.entry(key).or_default())
+    }
+
+    /// One roster row, as the last-value walk delivers it.
+    fn presence(&mut self, node: &str, sid: &str, body: &[u8]) -> io::Result<()> {
+        if sid == "node" {
+            let gone = state_of(body).as_deref() == Some("gone");
+            let inc = inc_of(body);
+            if gone || inc.is_some() {
+                let known =
+                    self.node_inc.contains_key(node) || self.nodes_gone.iter().any(|n| n == node);
+                if !known && self.node_inc.len() + self.nodes_gone.len() >= SESSIONS_MAX {
+                    return Err(io::Error::other(format!(
+                        "fabric brief exceeds {SESSIONS_MAX} nodes; narrow it with @<sid>@<node>"
+                    )));
+                }
+                // The last-value walk normally delivers one row per node;
+                // updating an existing entry also keeps this helper bounded.
+                self.node_inc.remove(node);
+                self.nodes_gone.retain(|n| n != node);
+                if gone {
+                    self.nodes_gone.push(node.to_string());
+                } else if let Some(inc) = inc {
+                    self.node_inc.insert(node.to_string(), inc);
+                }
+            }
+        } else {
+            let s = self.session_mut(node, sid)?;
+            s.presence = state_of(body);
+            s.presence_inc = inc_of(body);
+        }
+        Ok(())
+    }
+
     /// One `ev` record into its `(node, sid, ep)` view.
-    fn ingest(&mut self, fleet: &str, want: Option<&str>, off: u64, subject: &str, body: &[u8]) {
+    fn ingest(
+        &mut self,
+        fleet: &str,
+        want: Option<&str>,
+        off: u64,
+        subject: &str,
+        body: &[u8],
+    ) -> io::Result<()> {
         let Some((node, sid)) = owner(fleet, subject, "ev") else {
-            return;
+            return Ok(());
         };
         if want.is_some_and(|want| want != sid) {
-            return;
+            return Ok(());
         }
         let Ok(b) = aterm_slog::decode_bus(&String::from_utf8_lossy(body)) else {
             self.opaque += 1;
-            return;
+            return Ok(());
         };
-        let key = (node.to_string(), sid.to_string());
-        if !self.sessions.contains_key(&key) && self.sessions.len() >= SESSIONS_MAX {
-            return;
-        }
-        let s = self.sessions.entry(key).or_default();
+        let s = self.session_mut(node, sid)?;
         s.newest_off = s.newest_off.max(off);
         s.spaces
             .entry(b.ep)
             .or_insert_with(|| BusSpace::new(b.ep))
             .offer(b);
+        Ok(())
     }
 }
 
@@ -212,9 +262,8 @@ fn inc_of(body: &[u8]) -> Option<u64> {
 
 fn read(cfg: &Config, opts: &BriefOpts) -> io::Result<Read> {
     let broker = safe(&cfg.broker, 256);
-    let (mut conn, _closer) =
-        transport::connect(&cfg.transport, &cfg.broker, crate::fabric::IO_TIMEOUT)
-            .map_err(|e| io::Error::new(e.kind(), format!("the broker at {broker}: {e}")))?;
+    let (mut conn, _closer) = transport::connect(&cfg.broker, crate::fabric::IO_TIMEOUT)
+        .map_err(|e| io::Error::new(e.kind(), format!("the broker at {broker}: {e}")))?;
     let caps = if opts.cap_files.is_empty() {
         &cfg.cap_files
     } else {
@@ -232,19 +281,11 @@ fn read(cfg: &Config, opts: &BriefOpts) -> io::Result<Read> {
     transport::walk_last(&mut conn, &format!("/f/{fleet}/pub/*/*/presence"), |rec| {
         let (_, subject, body) = rec;
         if let Some((node, sid)) = owner(fleet, subject, "presence") {
-            if sid == "node" {
-                if state_of(body).as_deref() == Some("gone") {
-                    r.nodes_gone.push(node.to_string());
-                } else if let Some(inc) = inc_of(body) {
-                    r.node_inc.insert(node.to_string(), inc);
-                }
-            } else if opts.sid.as_deref().is_none_or(|want| want == sid) {
-                let s = r
-                    .sessions
-                    .entry((node.to_string(), sid.to_string()))
-                    .or_default();
-                s.presence = state_of(body);
-                s.presence_inc = inc_of(body);
+            if opts.node.as_deref().is_some_and(|want| want != node) {
+                return Ok(());
+            }
+            if sid == "node" || opts.sid.as_deref().is_none_or(|want| want == sid) {
+                r.presence(node, sid, body)?;
             }
         }
         Ok(())
@@ -259,7 +300,7 @@ fn read(cfg: &Config, opts: &BriefOpts) -> io::Result<Read> {
         r.pages += 1;
         r.scanned = next.saturating_sub(r.from);
         for (off, subject, body) in rows {
-            r.ingest(fleet, opts.sid.as_deref(), off, &subject, &body);
+            r.ingest(fleet, opts.sid.as_deref(), off, &subject, &body)?;
         }
         if next <= at {
             break;

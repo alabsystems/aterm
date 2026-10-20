@@ -7,7 +7,11 @@
 //! A newer build arrives two ways, each watched: atpkg atomically replaces a
 //! marker after a pass repoints `agents/claude` or `agents/codex`
 //! (`atpkg::activation_notice`), and Claude's native updater repoints
-//! `~/.local/bin/claude` into `~/.local/share/claude/versions`.
+//! `~/.local/bin/claude` into `~/.local/share/claude/versions`. A twin whose
+//! landing only its own agent's sessions look at (Muse Code's) replaces a
+//! marker of its own, watched for a listener of its own
+//! ([`ActivationWake::with_agent`]): it wakes no [`ActivationWake::wait`], so
+//! the host counts it for that agent's workers alone.
 //!
 //! And the OWNER'S WORD on an upgrade (`aterm harness upgrade <sid>
 //! --now|--defer|--skip`, from another process) replaces a marker of its own
@@ -158,6 +162,47 @@ impl ActivationWake {
         #[cfg(not(target_os = "macos"))]
         let _ = path;
         self
+    }
+
+    /// Also watch atpkg's marker of `program`'s OWN twin
+    /// (`atpkg::activation_notice::marker_path_of`: Muse Code's, whose landing
+    /// only its own sessions look at) FOR A LISTENER OF ITS OWN: when atpkg
+    /// replaces it, `told` is called on the waiting thread and the wait GOES
+    /// ON, as for a side mark ([`Self::with_side`]) — the window's host counts
+    /// it for that agent's workers alone, and no other agent's loop is parked
+    /// nor its upgrade's counts started over. Located as the first marker is:
+    /// under the configured package prefix, moved with it (a move is every
+    /// worker's wake, [`Self::wait`]), its notice directory made where the
+    /// prefix exists, looked at again while it does not. Off macOS the
+    /// fallback is already every worker's wake ([`Self::wait`]), this agent's
+    /// among them, so nothing more is watched there and `told` is never
+    /// called.
+    #[must_use]
+    pub fn with_agent(self, program: &'static str, told: Box<dyn FnMut() + Send>) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            self.with_agent_mark(Box::new(move || configured_marker_of(program)), told)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (program, told);
+            self
+        }
+    }
+
+    /// [`Self::with_agent`] at the marker `locate` names (asked again at
+    /// every pass, as the first marker's is).
+    #[cfg(target_os = "macos")]
+    fn with_agent_mark(
+        self,
+        locate: Box<dyn FnMut() -> Option<PathBuf> + Send>,
+        told: Box<dyn FnMut() + Send>,
+    ) -> Self {
+        let mut wake = self;
+        let mut mark = Mark::new(locate).rechecked_before_its_dir();
+        mark.told = Some(told);
+        wake.marks.push(mark);
+        wake
     }
 
     /// Also watch `path` FOR A LISTENER OF ITS OWN: when the file there is
@@ -348,16 +393,29 @@ fn moved<T: PartialEq>(seen: &mut Option<T>, next: Option<T>) -> bool {
     true
 }
 
-/// What a side marker IS to the fallback's poll ([`SidePoll`]): its inode
-/// (unix; `0` elsewhere), its length and when it was last modified. The
-/// marker is replaced by a rename of a new file, so a replacement is another
-/// inode — and another modification time where there is none to read.
+/// What a side marker IS to the fallback's poll ([`SidePoll`]): its file
+/// number (the inode on unix, the file index on Windows; `0` elsewhere), its
+/// length and when it was last modified. The marker is replaced by a rename
+/// of a new file, so a replacement is another file number — and another
+/// modification time where there is none to read. NTFS can date two writes
+/// alike, so on Windows the modification time alone would miss one.
 #[cfg(any(test, not(target_os = "macos")))]
 type SideStamp = (u64, u64, Option<std::time::SystemTime>);
 
 /// [`SideStamp`] of the file at `path`; `None` where no file is there.
+/// Windows names a file's index only on an open handle
+/// ([`super::session_usage::open_identity`]), so the marker is opened there
+/// and its metadata read off the same handle.
 #[cfg(any(test, not(target_os = "macos")))]
 fn side_stamp(path: &Path) -> Option<SideStamp> {
+    #[cfg(windows)]
+    let (m, ino) = {
+        let file = std::fs::File::open(path).ok()?;
+        let m = file.metadata().ok()?;
+        let ino = super::session_usage::open_identity(&file, &m).map_or(0, |(_, index)| index);
+        (m, ino)
+    };
+    #[cfg(not(windows))]
     let m = std::fs::metadata(path).ok()?;
     if !m.is_file() {
         return None;
@@ -367,7 +425,7 @@ fn side_stamp(path: &Path) -> Option<SideStamp> {
         use std::os::unix::fs::MetadataExt as _;
         m.ino()
     };
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let ino = 0;
     Some((ino, m.len(), m.modified().ok()))
 }
@@ -481,7 +539,7 @@ fn zombie(pid: u32) -> bool {
 /// Whether one `/proc/<pid>/stat` line names a process that has exited: its
 /// state, the field after the command's LAST closing parenthesis (a command
 /// may hold one), is `Z` (a zombie) or `X` (dead).
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 fn stat_exited(stat: &str) -> bool {
     stat.rsplit_once(')')
         .and_then(|(_, rest)| rest.trim_start().chars().next())
@@ -653,14 +711,22 @@ impl Mark {
 /// prefix at all keeps the recheck, which its first install ends.
 #[cfg(target_os = "macos")]
 fn configured_marker() -> Option<PathBuf> {
-    atpkg::store::resolve_configured().map(|layout| marker_under(&layout))
+    configured_marker_of("claude")
 }
 
-/// `layout`'s marker path, its notice directory made first where the prefix
-/// exists and the directory does not ([`configured_marker`]).
+/// atpkg's marker of `program`'s twin under the configured package prefix
+/// (`atpkg::activation_notice::marker_name`), as [`configured_marker`] is.
 #[cfg(target_os = "macos")]
-fn marker_under(layout: &atpkg::store::Layout) -> PathBuf {
-    let marker = atpkg::activation_notice::marker_path(layout);
+fn configured_marker_of(program: &str) -> Option<PathBuf> {
+    atpkg::store::resolve_configured().map(|layout| marker_under(&layout, program))
+}
+
+/// `layout`'s marker path of `program`'s twin, its notice directory made
+/// first where the prefix exists and the directory does not
+/// ([`configured_marker`]).
+#[cfg(target_os = "macos")]
+fn marker_under(layout: &atpkg::store::Layout, program: &str) -> PathBuf {
+    let marker = atpkg::activation_notice::marker_path_of(layout, program);
     if layout.prefix.is_dir() && marker.parent().is_some_and(|dir| !dir.is_dir()) {
         atpkg::activation_notice::prepare(layout);
     }
@@ -958,6 +1024,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// AN AGENT'S OWN MARKER ([`ActivationWake::with_agent`], Muse Code's
+    /// `activation-notices/muse`) is told to its own listener and is NO wake:
+    /// atpkg's replacement of it tells the listener once — the host counts it
+    /// for that agent's workers alone — and the wait answers nothing, so no
+    /// other agent's loop is parked. NEGATIVE CONTROLS: the first marker
+    /// beside it (`activation-notices/claude`) replaced IS every worker's
+    /// wake and tells the agent's listener nothing; a write beside both tells
+    /// nobody. Every wait here is no wait at all (a zero fallback).
+    #[test]
+    fn an_agents_own_marker_tells_its_listener_and_wakes_no_other_agent() {
+        let root =
+            std::env::temp_dir().join(format!("aterm-agent-marker-wake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let notices = root.join(atpkg::activation_notice::NOTICE_DIR);
+        std::fs::create_dir_all(&notices).unwrap();
+        let first = notices.join(atpkg::activation_notice::CLAUDE_MARKER);
+        let own = notices.join(atpkg::activation_notice::marker_name("muse"));
+        assert_ne!(first, own, "Muse Code's marker is its own");
+        let replace = |path: &Path| {
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, b"1\n").unwrap();
+            std::fs::rename(&tmp, path).unwrap();
+        };
+        let told = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&told);
+        let heard = move || told.load(std::sync::atomic::Ordering::SeqCst);
+        let mut wake = ActivationWake::with_marks(vec![Mark::new(fixed(first.clone()))])
+            .with_agent_mark(
+                fixed(own.clone()),
+                Box::new(move || {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }),
+            );
+        let now = Duration::ZERO;
+        assert!(!wake.wait(now));
+        assert_eq!(heard(), 0, "nothing changed");
+        replace(&own);
+        assert!(
+            !wake.wait(now),
+            "a Muse landing wakes no other agent's worker"
+        );
+        assert_eq!(heard(), 1, "Muse Code's workers are told");
+        replace(&own);
+        assert!(!wake.wait(now));
+        assert_eq!(heard(), 2);
+        std::fs::write(notices.join("progress.json"), b"{}").unwrap();
+        assert!(!wake.wait(now));
+        assert_eq!(heard(), 2, "a write beside the markers is neither");
+        replace(&first);
+        assert!(wake.wait(now), "the first marker is every worker's wake");
+        assert_eq!(heard(), 2, "and no news of Muse Code's own");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// CLAUDE'S OWN NATIVE UPDATER is a push too: it writes the new build
     /// under `versions/` and repoints `~/.local/bin/claude`, and the link's
     /// new target wakes the parked host. Negative controls: a new build written
@@ -1159,7 +1279,7 @@ mod tests {
         let layout = atpkg::store::Layout {
             prefix: prefix.clone(),
         };
-        let marker = marker_under(&layout);
+        let marker = marker_under(&layout, "claude");
         assert!(marker.parent().is_some_and(Path::is_dir), "{marker:?}");
         let kq = kqueue().expect("kqueue");
         let mut mark = Mark::new(Box::new(move || Some(marker.clone()))).rechecked_before_its_dir();
@@ -1172,7 +1292,7 @@ mod tests {
         let absent = atpkg::store::Layout {
             prefix: root.join("none"),
         };
-        let marker = marker_under(&absent);
+        let marker = marker_under(&absent, "claude");
         assert!(!root.join("none").exists());
         let mut mark = Mark::new(Box::new(move || Some(marker.clone()))).rechecked_before_its_dir();
         mark.ensure_watch(&kq);

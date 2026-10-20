@@ -30,6 +30,21 @@
 //! refuses with `EPERM`/`EACCES` (a sandboxed runner) — ends the test as COULD
 //! NOT RUN (`aterm_spec::host::could_not_run`), never as a pass.
 //!
+//! A STAND-IN IS WHAT THE TAB RUNS, OR THE TEST DOES NOT RUN. A tab runs an
+//! ordinary login shell, and macOS's system profile (`path_helper`) puts the
+//! machine's own folders in front of the PATH the instance was booted with:
+//! measured 2026-10-18, the worker tests' stand-in `claude` lost to Homebrew's
+//! real Claude Code, which they started under the scratch HOME. So every boot
+//! here has the scratch home's login profiles say that PATH again
+//! ([`launch_isolation::pin_login_path`]), and a boot whose `configure` put a
+//! stand-in ([`standin`]) in a folder on that PATH asks the instance's own login
+//! shell — its boot session — what it names each one (`command -v`, which runs
+//! nothing; [`login_resolution`]) before the test gets the instance. A name the
+//! shell resolves to anything but its stand-in ends the test COULD NOT RUN
+//! ([`STANDIN_UNRESOLVED`]): a line typed for the stand-in would have run that
+//! instead. A stand-in off that PATH is reached by its absolute path alone, and
+//! has no name to ask about.
+//!
 //! THE CLOCK. Every instance booted here runs its harness's and hosts' waits at
 //! their test values: the fast-timers development seam
 //! (`aterm_agent::harness::timings::FAST_SEAM`) is set before `configure`
@@ -303,7 +318,24 @@ pub fn boot_with(
         .stderr(err);
     let lifeline = launch_isolation::lifeline(&mut cmd, &tmp);
     let mut signal = arm_ready(&mut cmd, &tmp);
+    CONFIGURED.set(Some(Vec::new()));
     configure(&tmp, &mut cmd);
+    let standins = CONFIGURED.take().unwrap_or_default();
+    let path = launch_path(&cmd);
+    if let Some(path) = &path
+        && let Err(e) = launch_isolation::pin_login_path(&tmp, path)
+    {
+        let _ = std::fs::remove_dir_all(&tmp);
+        could_not_run(format!("cannot pin the scratch home's login PATH ({e})"));
+    }
+    let by_name = reached_by_name(standins, path.as_deref());
+    if !by_name.is_empty() && cmd.get_args().any(|a| a == "-e" || a == "--") {
+        let _ = std::fs::remove_dir_all(&tmp);
+        could_not_run(format!(
+            "{STANDIN_UNRESOLVED}: none was asked — the boot session runs a program of its own \
+             (`-e`), so no login shell of the instance can be asked what it names {by_name:?}"
+        ));
+    }
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -321,7 +353,157 @@ pub fn boot_with(
     };
     let log = inst.log.clone();
     await_ready(&mut inst, |i| &mut i.child, &mut signal, &log, ready);
+    if !by_name.is_empty() {
+        prove_standins_resolve(&inst, &by_name);
+    }
     inst
+}
+
+std::thread_local! {
+    /// The stand-ins [`standin`] puts in place while a boot's `configure` runs
+    /// ([`boot_with`], on that boot's thread); `None` outside one.
+    static CONFIGURED: std::cell::RefCell<Option<Vec<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The opening words of the refusal [`boot_with`] ends a test with when the
+/// instance's login shell names a stand-in by another path (module doc).
+pub const STANDIN_UNRESOLVED: &str = "the instance's login shell names a stand-in by another path";
+
+/// The PATH `cmd` launches with: the one set on it, none where it was removed,
+/// else this process's, which it inherits.
+fn launch_path(cmd: &Command) -> Option<std::ffi::OsString> {
+    match cmd.get_envs().find(|(key, _)| *key == "PATH") {
+        Some((_, value)) => value.map(std::ffi::OsStr::to_owned),
+        None => std::env::var_os("PATH"),
+    }
+}
+
+/// Whether `a` and `b` name one file or folder: the same text, or the same
+/// place once both resolve.
+fn same_place(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+/// The stand-ins of `standins` a shell reaches by name: each whose folder is
+/// an entry of `path`, once.
+fn reached_by_name(standins: Vec<PathBuf>, path: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for standin in standins {
+        let on_path = standin
+            .parent()
+            .is_some_and(|dir| dirs.iter().any(|entry| same_place(entry, dir)));
+        if on_path && !out.contains(&standin) {
+            out.push(standin);
+        }
+    }
+    out
+}
+
+/// THE GUARD ([`boot_with`], module doc): the instance's own login shell names
+/// each of `standins` by the stand-in's path, or the test ends COULD NOT RUN
+/// ([`STANDIN_UNRESOLVED`]) with what it named instead — before the test can
+/// type anything: nothing has been typed but `command -v`.
+#[track_caller]
+fn prove_standins_resolve(inst: &Instance, standins: &[PathBuf]) {
+    let names: Vec<&str> = standins
+        .iter()
+        .map(|standin| {
+            standin
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_else(|| panic!("a stand-in named in UTF-8: {}", standin.display()))
+        })
+        .collect();
+    let said = login_resolution(inst, &names);
+    let wrong: Vec<String> = standins
+        .iter()
+        .zip(&names)
+        .enumerate()
+        .filter_map(|(at, (standin, name))| {
+            let named = said.get(at).map_or("", String::as_str);
+            (named.is_empty() || !same_place(Path::new(named), standin)).then(|| {
+                format!(
+                    "`{name}` is {named:?}, not the stand-in {}",
+                    standin.display()
+                )
+            })
+        })
+        .collect();
+    if said.len() != standins.len() || !wrong.is_empty() {
+        could_not_run(format!(
+            "{STANDIN_UNRESOLVED}, so a line typed for it would run that instead; nothing was \
+             typed but `command -v`: {} (the shell said {said:?})",
+            wrong.join("; ")
+        ));
+    }
+}
+
+/// What the instance's own login shell — its boot session's — names each of
+/// `names` (`command -v`, which runs nothing): one entry a name, empty where
+/// nothing answers. Typed into the boot session as one line and read back
+/// from a file in the scratch home once that line has run (a hang detector);
+/// the line stays in the session's history and on its screen.
+///
+/// # Panics
+/// A name a shell would read as more than one word, or a scratch root it would
+/// read as more than one quoted word, is a broken fixture; a line the shell
+/// has not run within the hang detector fails with the session's screen.
+#[track_caller]
+pub fn login_resolution(inst: &Instance, names: &[&str]) -> Vec<String> {
+    for name in names {
+        assert!(
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
+            "a stand-in name a shell reads as one word: {name:?}"
+        );
+    }
+    let home = inst.tmp.join("home");
+    let done = home.join(".standin-resolved");
+    let part = home.join(".standin-resolved.part");
+    let quoted = |p: &Path| {
+        let text = p.to_str().expect("a UTF-8 scratch root").to_owned();
+        assert!(!text.contains('\''), "quoted below: {text}");
+        format!("'{text}'")
+    };
+    let (done_q, part_q) = (quoted(&done), quoted(&part));
+    let _ = std::fs::remove_file(&done);
+    let asks: String = names
+        .iter()
+        .map(|name| format!("command -v {name} || echo; "))
+        .collect();
+    let (_, sid) = boot_session(inst);
+    type_line(
+        inst,
+        &sid,
+        &format!("{{ {asks}}} >{part_q} 2>/dev/null; mv {part_q} {done_q}"),
+    );
+    let said = aterm_spec::wait::within(MUST_HAPPEN, POLL_GAP, || {
+        std::fs::read_to_string(&done).ok()
+    });
+    let Some(said) = said else {
+        let screen =
+            String::from_utf8_lossy(&ctl(inst, &[&format!("@{sid}"), "text", "trim"]).stdout)
+                .into_owned();
+        panic!(
+            "the boot session's shell did not run the `command -v` line within {MUST_HAPPEN:?}; \
+             its screen:\n{screen}\nprocesses:\n{}\nlog tail:\n{}",
+            process_tree(inst),
+            log_tail(&inst.log)
+        );
+    };
+    let _ = std::fs::remove_file(&done);
+    said.lines().map(str::to_owned).collect()
 }
 
 /// Wait for a spawned headless instance — `inst`, whose child `child` reaches,
@@ -415,6 +597,42 @@ pub fn client_command(inst: &Instance, args: &[&str]) -> Command {
     cmd
 }
 
+/// `aterm drive <args…>` in `root`'s scratch world (its HOME, XDG roots and
+/// `$TMPDIR`, no inherited aterm variable), `extra` set on top and run from
+/// `cwd` where one is named, read until it exits under the client's hang
+/// detector ([`CLIENT_EXIT_DEADLINE`]). No socket is named: a command that
+/// wants one is given `--socket` in `args`.
+pub fn drive_in(root: &Path, args: &[&str], extra: &[(&str, &str)], cwd: Option<&Path>) -> Output {
+    let aterm = launch_isolation::aterm_executable();
+    aterm_spec::wait::first_exec(&aterm, &["--help"]);
+    let mut cmd = Command::new(&aterm);
+    cmd.arg("drive")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    launch_isolation::apply(&mut cmd, root);
+    for (key, value) in extra {
+        cmd.env(key, value);
+    }
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    let child = cmd.spawn().expect("spawn aterm drive");
+    child_output::wait_and_read(child, Instant::now() + CLIENT_EXIT_DEADLINE)
+        .unwrap_or_else(|| panic!("aterm drive {args:?} did not exit in time"))
+}
+
+/// What a finished client `out` said, for a failure's message.
+pub fn said(out: &Output) -> String {
+    format!(
+        "exit {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
 /// One bounded `aterm ctl` call, read until it exits
 /// (`support/child_output.rs`: a sibling's spawn can hold its pipes open).
 ///
@@ -504,6 +722,10 @@ pub fn ctl_ok(inst: &Instance, args: &[&str]) -> String {
 /// Every text given must answer `--version` at once, or end at once with
 /// nothing to draw and nothing written.
 ///
+/// Put from a boot's `configure` ([`boot_with`]) in a folder on the instance's
+/// PATH, the stand-in is one the instance's login shell must name by `path`
+/// before the test gets the instance, or the test does not run (module doc).
+///
 /// # Panics
 /// When `path`'s directory cannot be made or the script cannot be written: a
 /// test without its fake decides nothing.
@@ -514,6 +736,11 @@ pub fn standin(path: &Path, text: &str) {
     static SHARED: Mutex<BTreeMap<String, Arc<OnceLock<Option<PathBuf>>>>> =
         Mutex::new(BTreeMap::new());
 
+    CONFIGURED.with_borrow_mut(|configured| {
+        if let Some(standins) = configured {
+            standins.push(path.to_owned());
+        }
+    });
     let once = Arc::clone(
         SHARED
             .lock()

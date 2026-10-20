@@ -1,0 +1,27 @@
+seq v=1 rig=transcript program=claude build=2.1.300
+# REAL ROWS (5B-2): the rows a real Claude Code 2.1.300 wrote for a turn
+# that read a file and then asked to edit it, the box still up (aterm-agent's
+# fixture, lines 5-8, folded whole there): each row at the offset and time
+# the real reader hands it on (dated= relative, the prompt at 0), read the
+# instant it was written, Partial (S9: 2.1.300 is no measured build). The
+# box the screen shows opens its own approval step beside the pending Edit
+# call: the log keeps both. The screen lines are this test's own (no
+# fixture).
+state partial
+bind 0
+see busy
+expect open t1 turn par=r1 src=screen conf=strong
+tx prompt v1 dated=0 off=1051 slice=claude-2.1.300-transcript-box-edit-pending:5-8
+expect amend t1 turn vref=v1 by=vendor src=transcript conf=strong
+at 47 tx model model=claude-opus-5-5 effort=medium ver=2.1.300 dated=47 off=2342 slice=claude-2.1.300-transcript-box-edit-pending:5-8
+expect amend r1 agent model=claude-opus-5-5 effort=medium ver=2.1.300 by=vendor
+at 47 tx tool c1 tool=Read cls=read dated=47 off=2343 slice=claude-2.1.300-transcript-box-edit-pending:5-8
+expect open p1 tool par=t1 cls=read tool=Read vref=c1 by=vendor conf=strong
+at 74 tx result c1 dated=74 off=3204 slice=claude-2.1.300-transcript-box-edit-pending:5-8
+expect close p1 tool out=ok by=vendor
+at 95 tx tool c2 tool=Edit cls=edit dated=95 off=4558 slice=claude-2.1.300-transcript-box-edit-pending:5-8
+expect open p2 tool par=t1 cls=edit tool=Edit vref=c2 by=vendor conf=strong
+at 200 see prompt edit
+expect open p3 approval par=t1 box=edit src=screen conf=strong
+expect need=approval:edit
+expect turn=t1

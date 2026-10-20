@@ -214,9 +214,28 @@ fn light_theme() -> Theme {
 /// the frame, so the check is non-vacuous.
 #[test]
 fn over_ink_fire_byte_exact_over_dark_and_light_frames() {
+    over_ink_fire_parity("over_ink_fire_byte_exact_over_dark_and_light_frames", false);
+}
+
+/// [`over_ink_fire_byte_exact_over_dark_and_light_frames`] through the wgpu
+/// oracle arm on macOS and Linux, so `fs_fire_over` and wgpu's blend state
+/// (the live renderer on Windows and wasm) draw the ink fire here too.
+#[cfg(all(any(target_os = "macos", target_os = "linux"), wgpu_arm))]
+#[test]
+fn over_ink_fire_byte_exact_cpu_vs_wgpu_oracle() {
+    over_ink_fire_parity("over_ink_fire_byte_exact_cpu_vs_wgpu_oracle", true);
+}
+
+fn over_ink_fire_parity(test: &str, oracle: bool) {
     let exact = ByteExact::default();
     for (label, theme) in [("dark", Theme::default()), ("light", light_theme())] {
         let (mut cpu, mut gpu) = backends(18.0, theme);
+        #[cfg(all(any(target_os = "macos", target_os = "linux"), wgpu_arm))]
+        if oracle {
+            crate::common::disarm_for_oracle(&mut gpu);
+        }
+        #[cfg(not(all(any(target_os = "macos", target_os = "linux"), wgpu_arm)))]
+        let _ = oracle;
         let mut win = aterm_gpu::WindowGpu::new();
         let (rows, cols) = (10usize, 40usize);
         let mut term = block_text_term(rows, cols, 1..8);
@@ -306,7 +325,7 @@ fn over_ink_fire_byte_exact_over_dark_and_light_frames() {
         );
         if exact.holds(&gpu, "byte-exact Over fire gate ({label})") {
             assert_byte_exact(
-                "over_ink_fire_byte_exact_over_dark_and_light_frames",
+                test,
                 &format!("fire Over ({label})"),
                 &gpu,
                 delta,

@@ -58,6 +58,9 @@ pub enum Seed {
     Start,
     /// From the newest snapshot, every cover at or below its `upto=`.
     Snap,
+    /// Seeded from a snapshot whose original need count is absent or
+    /// differs from the needs restored; the bounded summary is incomplete.
+    SnapPartial,
     /// Partial: the view holds neither its start nor a snapshot.
     NoStart,
     /// Partial: the view lost records (a cover) that no snapshot it holds
@@ -69,7 +72,7 @@ impl Seed {
     /// Whether the fold is partial.
     #[must_use]
     pub const fn partial(self) -> bool {
-        matches!(self, Seed::NoStart | Seed::Lost)
+        matches!(self, Seed::SnapPartial | Seed::NoStart | Seed::Lost)
     }
 
     /// The `why=` word of a partial fold.
@@ -77,6 +80,7 @@ impl Seed {
     pub const fn why(self) -> Option<&'static str> {
         match self {
             Seed::Start | Seed::Snap => None,
+            Seed::SnapPartial => Some("snapshot-needs"),
             Seed::NoStart => Some("no-start"),
             Seed::Lost => Some("lost"),
         }
@@ -355,7 +359,8 @@ impl BusSpace {
     /// held records' totals and close when the view holds its start). Short
     /// of one it folds what it holds, which the fold tolerates as a late
     /// join, and is partial: [`Seed::Lost`]; [`Seed::NoStart`] for a view
-    /// that merely began late. Records apply in seq order.
+    /// that merely began late. A chosen snapshot without a matching original
+    /// need count is [`Seed::SnapPartial`]. Records apply in seq order.
     #[must_use]
     pub fn fold_seeded(&self) -> (Fold, Seed) {
         let mut fold = Fold::new(self.ep);
@@ -368,6 +373,16 @@ impl BusSpace {
                 fold.apply(r);
             }
         };
+        // Check immediately after seeding, before later records can raise
+        // or clear needs. A missing legacy count establishes no completeness.
+        let snap_seed = |fold: &Fold, snap: &Rec| {
+            let held = fold.state().needs.iter().flatten().count() as u64;
+            if snap.f.get_u(Key::N) == Some(held) {
+                Seed::Snap
+            } else {
+                Seed::SnapPartial
+            }
+        };
         let seed = match (lost_to, seeds) {
             (None, _) if self.holds_start() => {
                 apply(&mut fold, 0, u64::MAX);
@@ -376,13 +391,15 @@ impl BusSpace {
             (Some(_), Some(snap)) if self.holds_start() => {
                 apply(&mut fold, 0, snap.seq);
                 fold.reseed_needs(snap);
+                let seed = snap_seed(&fold, snap);
                 apply(&mut fold, snap.seq.saturating_add(1), u64::MAX);
-                Seed::Snap
+                seed
             }
             (_, Some(snap)) => {
                 fold.seed_snap(snap);
+                let seed = snap_seed(&fold, snap);
                 apply(&mut fold, snap.seq.saturating_add(1), u64::MAX);
-                Seed::Snap
+                seed
             }
             (None, None) => {
                 apply(&mut fold, 0, u64::MAX);

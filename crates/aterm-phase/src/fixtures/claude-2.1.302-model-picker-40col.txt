@@ -1,0 +1,64 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (40x64, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · `/model`'s model picker (Select model, five numbered options each with a description, the vendor's Select laying them out in two columns), the 144x50 pane resized to 40x64 (`ctl resize 64 40`), the focus on its default
+           Claude Code v2.1.302
+ ▐▛███▛█   Opus 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.RLNk/proj
+
+
+❯ /model
+
+────────────────────────────────────────
+  Select model
+  Switch between Claude models. Your
+  pick becomes the default for new
+  sessions. For other/previous model
+  names, specify with --model.
+
+  ❯ 1. Default (recomme… ✔  Use the
+                            default
+                            model
+                            (currently
+                            Opus 5.5)
+                            · $4/$20
+                            per Mtok
+    2. Opus                 Opus 5.5 ·
+                            Best for
+                            everyday,
+                            complex
+                            tasks ·
+                            $4/$20 per
+                            Mtok
+    3. Fable                Fable 5.1
+                            · Most
+                            capable
+                            for your
+                            hardest
+                            and longes
+                            t-running
+                            tasks ·
+                            $10/$50
+                            per Mtok
+    4. Sonnet               Sonnet 5.5
+                            ·
+                            Efficient
+                            for
+                            routine
+                            tasks ·
+                            $2/$10 per
+                            Mtok
+    5. Haiku                Haiku 5.5
+                            · Fastest
+                            for quick
+                            answers ·
+                            $0.10/$0.5
+                            0 per Mtok
+                            ($0.50/$2
+                            .50 for
+                            prompts
+                            over 100k)
+
+  ◐ Medium effort (default) ←/→ to
+  adjust
+
+  Enter to set as default · s to use
+  this session only · Esc to cancel

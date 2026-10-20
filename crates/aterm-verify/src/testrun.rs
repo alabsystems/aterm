@@ -19,7 +19,8 @@
 //! support). Rebuilding that from the compile's JSON would be a copy of cargo
 //! that drifts. So cargo is asked: the stage runs the very `targo test --tests`
 //! it always ran, with one addition — `--config
-//! target.'cfg(all())'.runner=[<this binary>, --record-test-binary, <dir>]` —
+//! target.'cfg(all())'.runner=[<this binary>, --record-test-binary, <dir>]`,
+//! ahead of the subcommand so it keeps the build cache ([`recording_cmd`]) —
 //! and cargo, instead of executing each test binary, executes this binary with
 //! the test binary's argv, in its directory, with its environment.
 //! [`record_main`] writes those three facts down and exits 0, so cargo walks
@@ -291,18 +292,20 @@ pub fn runner_config(gate: &Path, dir: &Path) -> Option<String> {
     ))
 }
 
-/// The serial `--tests` child with the recording runner added before its
-/// libtest separator — the same selection, flags and environment.
+/// The serial `--tests` child with the recording runner added — the same
+/// selection, flags and environment.
+///
+/// FIRST, BEFORE THE SUBCOMMAND, beside the build-cache `--config` that
+/// [`crate::stages::main_targo`] leads with. A `--config` after the subcommand
+/// replaces every `--config` before it instead of adding to them, so the runner
+/// once put there dropped the build cache: the run built the whole selection a
+/// second time in `target/`, about 150 s of every cold `verify test --all`, after
+/// the compile child had built it in the cache.
 #[must_use]
 pub fn recording_cmd(serial: &Cmd, config: &str) -> Cmd {
     let mut c = serial.clone();
-    let at = c
-        .args
-        .iter()
-        .position(|a| a == "--")
-        .unwrap_or(c.args.len());
     c.args
-        .splice(at..at, [OsString::from("--config"), OsString::from(config)]);
+        .splice(0..0, [OsString::from("--config"), OsString::from(config)]);
     c
 }
 
@@ -644,17 +647,12 @@ fn first_error(log: &str) -> String {
     line.trim().chars().take(200).collect()
 }
 
-/// Decide the test run's row exactly as the serial child's was decided.
-///
-/// A binary whose tests of a macOS service (`trustd`, the disk-image
-/// service) returned early because it did not answer passed without checking
-/// them: the row stays what ran decided, and ONE named skip per service says
-/// what did not ([`crate::libtest::host_skips`]), so `release` refuses.
+/// Decide the test run's row exactly as the serial child's was decided. A test
+/// whose macOS service (`trustd`, the disk-image service) did not answer ends
+/// COULD NOT RUN itself (`aterm_uds::deadline::require_trust_service`), so its
+/// row says so through [`crate::libtest::environment_refusals`].
 fn decide(r: &mut Report, run: &Run, label: &str, env: &[(OsString, OsString)]) {
     r.decide_test_child(run, label, env);
-    for skip in crate::libtest::host_skips(&run.output) {
-        r.skip(skip);
-    }
 }
 
 /// THE TEST RUN (the test stage's second half, after its compile): record,
@@ -795,49 +793,6 @@ static RECORDING: AtomicUsize = AtomicUsize::new(0);
 mod tests {
     use super::*;
 
-    /// A test run whose binaries a silent macOS service skipped stays green
-    /// for what ran, and ONE named skip per service says what did not and
-    /// what clears it; without the line, nothing changes.
-    #[test]
-    fn a_silent_service_is_one_named_skip_beside_a_green_row() {
-        let judge = |output: String| {
-            let run = Run {
-                ok: true,
-                output,
-                code: Some(0),
-                spawn_error: None,
-            };
-            let mut r = Report::new("tests");
-            decide(&mut r, &run, "targo test --workspace", &[]);
-            crate::ladder::tally(&[r])
-        };
-        let log = |skipped: bool| {
-            let line = if skipped {
-                format!("{}\n", crate::libtest::skipped::SKIPPED)
-            } else {
-                String::new()
-            };
-            format!(
-                "     Running unittests src/lib.rs (target/debug/deps/aterm_uds-1f2e)\n\
-                 {line}running 1 test\ntest t::signs ... ok\n\
-                 test result: ok. 1 passed; 0 failed\n"
-            )
-        };
-        let t = judge(log(true));
-        assert_eq!(t.skips.len(), 1, "{t:?}");
-        assert!(!t.failed());
-        // Each service is its own row, both on one binary that printed both.
-        let both = log(true).replace(
-            "running 1 test",
-            &format!(
-                "{}\nrunning 1 test",
-                crate::libtest::skipped::DISK_IMAGE_SKIPPED
-            ),
-        );
-        assert_eq!(judge(both).skips.len(), 2);
-        assert!(judge(log(false)).skips.is_empty());
-    }
-
     fn rec(exe: &str, pkg: &str) -> Record {
         Record {
             cwd: PathBuf::from(format!("/r/crates/{pkg}")),
@@ -932,13 +887,33 @@ mod tests {
                  \"/tmp/q\\\"d\"]"
             )
         );
-        let serial = Cmd::new("targo").args(["test", "--tests", "--", "--skip", "x"]);
+        let serial = Cmd::new("targo").args([
+            "--config",
+            "CACHE",
+            "--unverified",
+            "test",
+            "--tests",
+            "--",
+            "--skip",
+            "x",
+        ]);
         assert_eq!(
             recording_cmd(&serial, "CFG").argv(),
             [
-                "targo", "test", "--tests", "--config", "CFG", "--", "--skip", "x"
+                "targo",
+                "--config",
+                "CFG",
+                "--config",
+                "CACHE",
+                "--unverified",
+                "test",
+                "--tests",
+                "--",
+                "--skip",
+                "x"
             ],
-            "cargo's flag before the separator, libtest's arguments untouched after it"
+            "the runner before the subcommand, beside the build cache's --config (one after \
+             it would replace the cache's); libtest's arguments untouched"
         );
     }
 
@@ -1211,7 +1186,13 @@ mod tests {
             spawn_error: None,
         };
         let all = combined(&bins, &[pass(&bins[0]), refused, pass(&bins[2])]);
-        assert!(all.environment_failure().is_some(), "{}", all.output);
+        let why = all
+            .environment_failure()
+            .expect("the machine's, not a finding");
+        assert!(
+            why.ends_with("— strays"),
+            "the row names the refusal's why: {why}"
+        );
         assert!(combined(&bins, &[pass(&bins[0]), pass(&bins[1]), pass(&bins[2])]).ok);
     }
 

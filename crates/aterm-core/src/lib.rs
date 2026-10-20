@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
+// The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
+// under them (crates/aterm-spec-anchor/anchor_rules.rs).
+#![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
+
 //! # aterm-core
 //!
 //! Terminal emulation core.
@@ -127,6 +131,8 @@ pub use aterm_selection as selection;
 /// [`terminal::Terminal::cell_frame_into`]. Hosted here so the engine can emit
 /// it without a dependency cycle; `aterm_render::render_api` re-exports it.
 pub mod render;
+/// The fx-layer primitive, re-exported from [`render`] beside `GlowQuad`.
+mod render_fx;
 pub mod scrollback;
 pub mod search;
 

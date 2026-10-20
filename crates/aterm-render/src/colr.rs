@@ -652,28 +652,208 @@ impl<'a> Painter<'a> for ColrCanvas<'a> {
     fn pop_layer(&mut self) {}
 }
 
-/// Rasterize the COLR color glyph `gid` into an `w×h` RGBA8 buffer (em square fit
-/// to the box, centered, y-flipped). Returns `None` if `gid` is not a COLR glyph or
-/// the face has no COLR table. Pure + panic-free.
+/// Rasterize the COLR color glyph `gid` into an `w×h` RGBA8 buffer (fitted by
+/// [`colr_fit`], y-flipped). Returns `None` if `gid` is not a COLR glyph or the
+/// face has no COLR table. Pure + panic-free.
 pub(crate) fn rasterize_colr(face: &Face, gid: GlyphId, w: usize, h: usize) -> Option<Vec<u8>> {
-    if w == 0 || h == 0 || !face.is_color_glyph(gid) {
-        return None;
+    rasterize_colr_run(face, &[(gid, 0.0, 0.0)], w, h)
+}
+
+/// A font-unit rectangle, y up.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct UnitBox {
+    x_min: f32,
+    y_min: f32,
+    x_max: f32,
+    y_max: f32,
+}
+
+impl UnitBox {
+    fn width(self) -> f32 {
+        self.x_max - self.x_min
     }
+    fn height(self) -> f32 {
+        self.y_max - self.y_min
+    }
+    fn shifted(self, x: f32, y: f32) -> UnitBox {
+        UnitBox {
+            x_min: self.x_min + x,
+            y_min: self.y_min + y,
+            x_max: self.x_max + x,
+            y_max: self.y_max + y,
+        }
+    }
+    fn union(self, o: UnitBox) -> UnitBox {
+        UnitBox {
+            x_min: self.x_min.min(o.x_min),
+            y_min: self.y_min.min(o.y_min),
+            x_max: self.x_max.max(o.x_max),
+            y_max: self.y_max.max(o.y_max),
+        }
+    }
+    fn is_proper(self) -> bool {
+        self.width() > 0.0
+            && self.height() > 0.0
+            && self.width().is_finite()
+            && self.height().is_finite()
+    }
+}
+
+/// The glyph's LAYOUT box: its advance across, and down the face's line
+/// widened to its global ink box, so no glyph of the face loses its top or
+/// its descent. The fit of a face that declares no emoji frame
+/// ([`emoji_frame`]).
+fn layout_box(face: &Face, gid: GlyphId) -> Option<UnitBox> {
     let upem = f32::from(face.units_per_em());
     if upem <= 0.0 {
         return None;
     }
-    // Fit the em square into the box (by height), centered horizontally, y-flipped:
-    // font (0,0) -> bottom-left, (upem,upem) -> top, so the glyph fills the cell.
-    let scale = h as f32 / upem;
-    let base = Affine {
+    let advance = match face.glyph_hor_advance(gid) {
+        Some(advance) if advance > 0 => f32::from(advance),
+        _ => upem,
+    };
+    let ink = face.global_bounding_box();
+    let (mut top, mut bottom) = (
+        f32::from(face.ascender().max(ink.y_max)),
+        f32::from(face.descender().min(ink.y_min)),
+    );
+    if top <= bottom {
+        (top, bottom) = (upem, 0.0);
+    }
+    Some(UnitBox {
+        x_min: 0.0,
+        y_min: bottom,
+        x_max: advance,
+        y_max: top,
+    })
+}
+
+/// Where `gid` paints, at most: its COLRv1 clip box, else its outline's box,
+/// else its layout box.
+fn paint_box(face: &Face, gid: GlyphId) -> Option<UnitBox> {
+    let clip = face
+        .tables()
+        .colr
+        .and_then(|colr| colr.clip_box(gid, &[]))
+        .map(|b| UnitBox {
+            x_min: b.x_min,
+            y_min: b.y_min,
+            x_max: b.x_max,
+            y_max: b.y_max,
+        });
+    let outline = || {
+        face.glyph_bounding_box(gid).map(|b| UnitBox {
+            x_min: f32::from(b.x_min),
+            y_min: f32::from(b.y_min),
+            x_max: f32::from(b.x_max),
+            y_max: f32::from(b.y_max),
+        })
+    };
+    clip.or_else(outline)
+        .filter(|b| b.is_proper())
+        .or_else(|| layout_box(face, gid))
+}
+
+/// The face's EMOJI FRAME: the COLRv1 clip box of its 😀 (U+1F600), the
+/// square a full-size emoji of the face is drawn in, when the face declares
+/// one. Segoe UI Emoji's is 2050 units square, (369, -287)..(2419, 1763) in
+/// a 2812-unit advance, and every full-bleed emoji (😀 ✅ ❌ ⭐ 🚀) shares
+/// it (measured on Windows 11 26200, 2026-10-17); a smaller emoji (⚡, 👍)
+/// clips tighter inside it. `None` for a face without a ClipList, a COLRv0
+/// face, or one with no 😀.
+fn emoji_frame(face: &Face) -> Option<UnitBox> {
+    let gid = face.glyph_index('\u{1F600}')?;
+    let b = face.tables().colr?.clip_box(gid, &[])?;
+    let frame = UnitBox {
+        x_min: b.x_min,
+        y_min: b.y_min,
+        x_max: b.x_max,
+        y_max: b.y_max,
+    };
+    frame.is_proper().then_some(frame)
+}
+
+/// The base transform that draws the font-unit run `glyphs` (each `(gid, x,
+/// y)`: an origin, y up) into a `w × h` pixel box, y down.
+///
+/// ONE SCALE PER FACE, so the emoji of a line read as one size. A single glyph
+/// fits the face's [`emoji_frame`] — or, for a face that declares none, its
+/// [`layout_box`] — into the box with a pixel of air on every side, centred
+/// both ways. Fitting the em square instead put Segoe UI Emoji's ✅ 382 units
+/// right of centre and cut its side and its descent off; fitting the layout
+/// box drew it whole but at 14 of the 18 px a two-cell slot has (both
+/// measured on Windows 11, 2026-10-17). A glyph that paints past the frame
+/// (❤'s clip box is 2419 units wide) shrinks just enough that its paint box
+/// still fits the box, and is kept inside it.
+///
+/// A RUN of several glyphs (a ZWJ family Segoe UI Emoji draws as figures side
+/// by side, the last members with no advance of their own) fits the union of
+/// their paint boxes the same way.
+fn colr_fit(face: &Face, glyphs: &[(GlyphId, f32, f32)], w: usize, h: usize) -> Option<Affine> {
+    let mut content: Option<UnitBox> = None;
+    for &(gid, x, y) in glyphs {
+        let b = paint_box(face, gid)?.shifted(x, y);
+        content = Some(content.map_or(b, |c| c.union(b)));
+    }
+    let content = content?;
+    let frame = match glyphs {
+        [(gid, x, y)] => emoji_frame(face)
+            .or_else(|| layout_box(face, *gid))?
+            .shifted(*x, *y),
+        _ => content,
+    };
+    let (wf, hf) = (w as f32, h as f32);
+    let air = if w >= 8 && h >= 8 { 1.0 } else { 0.0 };
+    let scale = ((wf - 2.0 * air) / frame.width())
+        .min((hf - 2.0 * air) / frame.height())
+        .min(wf / content.width())
+        .min(hf / content.height());
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    // Centre the frame, then move (never cut) the paint box back inside.
+    let inside = |offset: f32, lo: f32, hi: f32, room: f32| {
+        if lo + offset < 0.0 {
+            -lo
+        } else if hi + offset > room {
+            room - hi
+        } else {
+            offset
+        }
+    };
+    let e = wf / 2.0 - scale * (frame.x_min + frame.x_max) / 2.0;
+    let e = inside(e, scale * content.x_min, scale * content.x_max, wf);
+    // y flips: font `y` lands on pixel row `f - scale·y`.
+    let f = hf / 2.0 + scale * (frame.y_min + frame.y_max) / 2.0;
+    let f = inside(f, -scale * content.y_max, -scale * content.y_min, hf);
+    Some(Affine {
         a: scale,
         b: 0.0,
         c: 0.0,
         d: -scale,
-        e: (w as f32 - upem * scale) / 2.0,
-        f: h as f32,
-    };
+        e,
+        f,
+    })
+}
+
+/// Rasterize the COLR glyphs `glyphs` (each `(gid, x, y)`: its origin in font
+/// units, y up — the shaper's pen plus offsets) into one `w × h` RGBA8 buffer,
+/// fitted by [`colr_fit`]. `None` if any glyph is not a COLR glyph, or the
+/// face has no COLR table. Pure + panic-free.
+pub(crate) fn rasterize_colr_run(
+    face: &Face,
+    glyphs: &[(GlyphId, f32, f32)],
+    w: usize,
+    h: usize,
+) -> Option<Vec<u8>> {
+    if w == 0
+        || h == 0
+        || glyphs.is_empty()
+        || glyphs.iter().any(|&(g, ..)| !face.is_color_glyph(g))
+    {
+        return None;
+    }
+    let base = colr_fit(face, glyphs, w, h)?;
     let fg = RgbaColor::new(0, 0, 0, 255);
     let mut canvas = ColrCanvas {
         face,
@@ -686,7 +866,19 @@ pub(crate) fn rasterize_colr(face: &Face, gid: GlyphId, w: usize, h: usize) -> O
         foreground: fg,
         pending: None,
     };
-    face.paint_color_glyph(gid, 0, fg, &mut canvas)?;
+    for &(gid, x, y) in glyphs {
+        canvas.stack.clear();
+        canvas.pending = None;
+        canvas.cur = base.then(Affine {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: x,
+            f: y,
+        });
+        face.paint_color_glyph(gid, 0, fg, &mut canvas)?;
+    }
     // The blend accumulator stored PREMULTIPLIED rgb — each layer composited over a
     // transparent start yields rgb = color·alpha — but `GlyphImage::Rgba` is blitted
     // as STRAIGHT alpha (blit_rgba_* do bg·(1−a) + rgb·a, like the PNG color-emoji
@@ -735,6 +927,114 @@ fn add_span(cov: &mut [f32], x0: f32, x1: f32, amount: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Segoe UI Emoji's bytes, or this host COULD NOT RUN the test.
+    #[cfg(windows)]
+    fn segoe_ui_emoji() -> Vec<u8> {
+        const SEGOE: &str = r"C:\Windows\Fonts\seguiemj.ttf";
+        std::fs::read(SEGOE).unwrap_or_else(|e| {
+            aterm_spec::host::could_not_run(format!("{SEGOE} does not read here ({e})"))
+        })
+    }
+
+    /// The `(columns, rows)` an RGBA raster inks (alpha >= 32), in order.
+    #[cfg(windows)]
+    fn inked_extent(rgba: &[u8], w: usize, h: usize) -> (Vec<usize>, Vec<usize>) {
+        let inked = |x: usize, y: usize| rgba[(y * w + x) * 4 + 3] >= 32;
+        let cols = (0..w).filter(|&x| (0..h).any(|y| inked(x, y))).collect();
+        let rows = (0..h).filter(|&y| (0..w).any(|x| inked(x, y))).collect();
+        (cols, rows)
+    }
+
+    /// WINDOWS' COLOUR EMOJI FIT THEIR BOX WHOLE, AND FILL IT. Segoe UI Emoji
+    /// draws each glyph centered in an advance wider than its em, with
+    /// descents below the line, so the emoji of an agent's reply (✅ ❌ ⭐ ⚡ ⏳
+    /// 😀 🚀 👍, and ⚠ ❤ asked for with VS16), fitted into the Windows
+    /// default's two-cell box (18 x 23 px), keep a clear texel on every side —
+    /// nothing cut off — sit centered across it within a pixel, and the
+    /// full-bleed ones span at least 15 of its 18 columns (the face's emoji
+    /// frame less a pixel of air each side; the layout-box fit drew them 14
+    /// wide). The faces of one frame share one bottom row.
+    #[test]
+    #[cfg(windows)]
+    fn segoe_ui_emoji_glyphs_draw_whole_and_centred_in_their_box() {
+        let bytes = segoe_ui_emoji();
+        let face = Face::parse(&bytes, 0).expect("Segoe UI Emoji parses");
+        let (w, h) = (18usize, 23usize);
+        let mut bottoms = Vec::new();
+        for ch in ['✅', '❌', '⭐', '⚡', '⏳', '😀', '🚀', '👍', '⚠', '❤'] {
+            let gid = face.glyph_index(ch).expect("Segoe UI Emoji maps it");
+            let rgba = rasterize_colr(&face, gid, w, h).expect("a COLR glyph");
+            let (cols, rows) = inked_extent(&rgba, w, h);
+            let (left, right) = (cols[0], w - 1 - cols[cols.len() - 1]);
+            let (top, bottom) = (rows[0], h - 1 - rows[rows.len() - 1]);
+            assert!(
+                left > 0 && right > 0 && top > 0 && bottom > 0,
+                "{ch}: ink reaches the box's edge (margins l{left} r{right} t{top} b{bottom})"
+            );
+            assert!(
+                left.abs_diff(right) <= 1,
+                "{ch}: not centered across the box (margins l{left} r{right})"
+            );
+            if matches!(ch, '✅' | '❌' | '😀') {
+                assert!(
+                    cols.len() >= 15,
+                    "{ch}: drawn {} columns wide in an 18-column box",
+                    cols.len()
+                );
+            }
+            if !matches!(ch, '⚠' | '❤') {
+                bottoms.push(bottom);
+            }
+        }
+        let (lo, hi) = (bottoms.iter().min(), bottoms.iter().max());
+        assert!(
+            hi.zip(lo).is_some_and(|(hi, lo)| hi - lo <= 1),
+            "the emoji sit on different baselines: {bottoms:?}"
+        );
+    }
+
+    /// A ZWJ FAMILY IS ITS MEMBERS SIDE BY SIDE. Segoe UI Emoji shapes 👨‍👩‍👧
+    /// to three colour glyphs, the last with no advance of its own (it stands
+    /// after the woman by its outline alone). Painted at the shaper's pen
+    /// positions in one canvas, the run fits the two-cell box whole: ink in
+    /// each third of it, a clear texel on every side.
+    #[test]
+    #[cfg(windows)]
+    fn a_segoe_family_paints_every_member_inside_its_box() {
+        let bytes = segoe_ui_emoji();
+        let face = Face::parse(&bytes, 0).expect("Segoe UI Emoji parses");
+        let shape_face = aterm_font::shape::ShapeFace::from_slice(&bytes, 0).expect("shapes");
+        let mut buffer = aterm_font::shape::UnicodeBuffer::new();
+        buffer.push_str("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}");
+        let shaped = aterm_font::shape::shape(&shape_face, &[], buffer);
+        let mut pen = 0i32;
+        let mut run = Vec::new();
+        for (info, pos) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
+            let gid = GlyphId(u16::try_from(info.glyph_id).expect("a u16 glyph id"));
+            if face.is_color_glyph(gid) {
+                run.push((gid, (pen + pos.x_offset) as f32, pos.y_offset as f32));
+            }
+            pen += pos.x_advance;
+        }
+        assert_eq!(run.len(), 3, "three members: {run:?}");
+        let (w, h) = (18usize, 23usize);
+        let rgba = rasterize_colr_run(&face, &run, w, h).expect("a COLR run");
+        let (cols, rows) = inked_extent(&rgba, w, h);
+        assert!(
+            cols[0] > 0
+                && cols[cols.len() - 1] < w - 1
+                && rows[0] > 0
+                && rows[rows.len() - 1] < h - 1,
+            "the family reaches the box's edge: columns {cols:?}, rows {rows:?}"
+        );
+        for third in 0..3 {
+            assert!(
+                cols.iter().any(|&x| x * 3 / w == third),
+                "no member inks third {third} of the box: columns {cols:?}"
+            );
+        }
+    }
 
     #[test]
     fn add_span_full_and_partial_coverage() {

@@ -571,10 +571,11 @@ impl ser::SerializeMap for Compound<'_> {
 
     fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> Result<()> {
         self.comma();
-        // A JSON object key is a string. Integers and chars are rendered AS
-        // strings (what `serde_json` does, so a `HashMap<u32, _>` still
-        // serializes); anything else is a type error rather than a document
-        // that no parser could read back.
+        // A JSON object key is a string. Integers, `bool`s and chars are
+        // rendered AS strings (what `serde_json` does, so a `HashMap<u32, _>`
+        // still serializes), in the one spelling the key reader takes back;
+        // anything else is a type error rather than a document that no parser
+        // could read back.
         key.serialize(KeySerializer { out: self.out })
     }
 
@@ -618,7 +619,10 @@ impl ser::SerializeStructVariant for Compound<'_> {
     }
 }
 
-/// Serializer for object KEYS: string-shaped values only.
+/// Serializer for object KEYS: strings, and the scalars with one obvious
+/// spelling as one (integers, `bool`, `char`, a unit variant's name), through
+/// any newtype. `de::Key`, through serde's `TextKeyDeserializer`, reads each
+/// back from exactly that text.
 struct KeySerializer<'a> {
     out: &'a mut Vec<u8>,
 }
@@ -705,8 +709,8 @@ impl ser::Serializer for KeySerializer<'_> {
     fn serialize_u128(self, v: u128) -> Result<()> {
         self.quoted_number(|out| write_u128(out, v))
     }
-    fn serialize_bool(self, _v: bool) -> Result<()> {
-        Err(key_type_error())
+    fn serialize_bool(self, v: bool) -> Result<()> {
+        self.serialize_str(if v { "true" } else { "false" })
     }
     fn serialize_f32(self, _v: f32) -> Result<()> {
         Err(key_type_error())

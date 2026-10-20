@@ -15,7 +15,7 @@
 //!   drain's fresh posts too, one in flight per sender so per-sender order
 //!   holds ([`Bridge::settle_sender`]);
 //! * registers the `Will` on every connect, so a `kill -9` becomes exactly one
-//!   `state=gone` and a reconnect's `live inc+1` structurally suppresses it;
+//!   `state=away` and a reconnect's `live inc+1` structurally suppresses it;
 //! * drains `/f/<F>/in/<node>/>` as a durable group into `deliver`, committing
 //!   only once the record is ACCOUNTED FOR — an `OK`, or an `ERR` that produced
 //!   an `ev` and a sender notice. A transport failure leaves the cursor where it
@@ -42,7 +42,14 @@
 //!   verdict (`status agent=`, and the `EVENT … agent` push on each move),
 //!   relayed as the word it is: this crate reads no screen and links no
 //!   vendor reader. The row is republished only when a field changed and at
-//!   most once per 2 s. Never a word of the transcript ([`crate::presence`]).
+//!   most once per 2 s. Never a word of the transcript ([`crate::presence`]);
+//! * TELLS THE ROSTER HOW ATERM LEFT: on aterm's `bye quit` it WITHDRAWS every
+//!   session it advertised (one `state=exited` row each), on `bye handoff` it
+//!   publishes none — the successor re-attaches the same sids — and with no
+//!   word at all (a crash, a `kill -9`) it publishes none either, so the
+//!   node's will reads `away` and mail to its sessions queues on the bus
+//!   ([`Bridge::take_bye`]). Routing refuses only an `exited` row
+//!   ([`Bridge::advertisers`]).
 //!
 //! ## A NODE'S DISTINCT-SUBJECT BUDGET IS FINITE, AND NOTHING RECLAIMS IT
 //!
@@ -137,7 +144,7 @@ use std::time::{Duration, Instant};
 
 use astream_broker::Record as BrokerRecord;
 use aterm_hash::fnv1a_64;
-use aterm_types::fabric_grammar::ANSWER_KINDS;
+use aterm_types::fabric_grammar::{Bye, ANSWER_KINDS};
 
 use crate::body::{via_ok, Body};
 use crate::ctl::{Ctl, Reply, REQUEST_LINE_MAX};
@@ -150,7 +157,7 @@ use crate::state::{
     StateDir, TopicCursor, ASKED_KEEP, DEADLINES_KEEP, INC_MAX, WILL_SEQ_LOW,
 };
 use crate::subject::{self, Reject};
-use crate::transport::{self, Backoff, Closer, Conn, Transport};
+use crate::transport::{self, Backoff, Closer, Conn};
 use crate::wait_tally::Recorder;
 
 /// THE BUS MIRROR's wiring (session log phase 4, `[fabric] log = "turns"`):
@@ -206,12 +213,6 @@ pub(crate) const ACK_DEADLINE: Duration = Duration::from_secs(5);
 /// stops, and a fleet that has never had a ghost never starts. Without that
 /// gate every attached bridge reports every 60 s for ever, and
 /// `fabric_link_age_ms=` can never exceed it.
-///
-/// AND ONE THING THIS BRIDGE DOES SEND ON A CLOCK, which is no report: on a
-/// TCP broker, the publisher connection's keepalive ([`Bridge::keep_alive`])
-/// when it has carried nothing for astream's `KEEPALIVE_INTERVAL`. It is a wire
-/// frame to the broker, never a record and never a `link up` (its answer is
-/// not counted as an ack), so `fabric_link_age_ms=` still grows on a quiet link.
 const LINK_REFRESH: Duration = Duration::from_secs(2);
 
 /// The least gap between two reports made because the round trip MOVED by
@@ -253,9 +254,11 @@ const ROSTER_REFRESH: Duration = Duration::from_millis(2_000);
 
 /// The development seam (`aterm_types::dev_seam!`, so a debug or `dev-seams`
 /// build's only: a shipped bridge reads none) that runs the round at test pace
-/// ([`roster_refresh`]): the fast-timers seam every live instance's waits share.
-/// A fabric test whose subject is walked per round (the late subscribers'
-/// replay, [`SAY_REPLAY_PAGES`] per round) sets it on the instance it boots.
+/// ([`roster_refresh`]), and the presence republish window with it: the
+/// fast-timers seam every live instance's waits share. A fabric world whose
+/// test waits ON the round (the backstop itself, a replay walked
+/// [`SAY_REPLAY_PAGES`] per round, a presence change inside the window) sets
+/// it on the instance it boots (`fabric_world`'s `harness::FAST_TIMERS`).
 /// The bridge reads its OWN environment: the instance's bridge launch passes
 /// this one name through its child-environment filter, which drops every other
 /// variable on the inheritance deny list (aterm-gui `fabric_launch.rs`).
@@ -267,19 +270,24 @@ const FAST_TIMERS_SEAM: &str = aterm_types::domain::ENV_DEV_FAST_TIMERS;
 /// finishes inside a backlog it means to overlap.
 const FAST_ROSTER_REFRESH: Duration = Duration::from_millis(500);
 
+/// Whether this process runs at test pace: [`FAST_TIMERS_SEAM`] set in a
+/// build that reads seams. Read once. The round ([`roster_refresh`]) and the
+/// presence republish window matched to it (`presence::republish_min`) both
+/// read it, so the two stay one period.
+pub(crate) fn fast_timers() -> bool {
+    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FAST.get_or_init(|| aterm_types::dev_seam!(FAST_TIMERS_SEAM).is_some())
+}
+
 /// THE ROUND'S PERIOD in this process: [`ROSTER_REFRESH`], or
-/// [`FAST_ROSTER_REFRESH`] when [`FAST_TIMERS_SEAM`] is set in a build that
-/// reads seams. Read once; the round, the replay allowance's refill and the
-/// first deadline check all run on it.
+/// [`FAST_ROSTER_REFRESH`] at test pace ([`fast_timers`]). The round, the
+/// replay allowance's refill and the first deadline check all run on it.
 fn roster_refresh() -> Duration {
-    static PERIOD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *PERIOD.get_or_init(|| {
-        if aterm_types::dev_seam!(FAST_TIMERS_SEAM).is_some() {
-            FAST_ROSTER_REFRESH
-        } else {
-            ROSTER_REFRESH
-        }
-    })
+    if fast_timers() {
+        FAST_ROSTER_REFRESH
+    } else {
+        ROSTER_REFRESH
+    }
 }
 
 /// How long one park of a bridge whose endpoint cannot list its sessions
@@ -793,14 +801,23 @@ enum EndpointHold {
 impl EndpointHold {
     /// A held flag and the origin word beside it, when there was one: the
     /// `origin=` of a `hold` event (the hold it names), or a `hold_origin=`
-    /// list (every origin that stands).
+    /// list (every origin that stands). The person's Take Over (`person`,
+    /// 2026-10-16) and another Mac's drive (`remote`, the step-in) are holds
+    /// the fleet did not make, read as the owner's side: beside the fleet's
+    /// each is [`Self::Both`], alone [`Self::Local`].
     fn of(held: bool, origin: Option<&str>) -> Self {
-        match (held, origin) {
-            (false, _) => Self::Free,
-            (true, Some("local")) => Self::Local,
-            (true, Some("fleet")) => Self::Fleet,
-            (true, Some("fleet,local")) => Self::Both,
-            (true, _) => Self::Unsaid,
+        if !held {
+            return Self::Free;
+        }
+        let Some(list) = origin.filter(|list| origin_list_ok(list)) else {
+            return Self::Unsaid;
+        };
+        let fleet = list.split(',').any(|word| word == "fleet");
+        let other = list.split(',').any(|word| word != "fleet");
+        match (fleet, other) {
+            (true, false) => Self::Fleet,
+            (true, true) => Self::Both,
+            (false, _) => Self::Local,
         }
     }
 
@@ -809,6 +826,22 @@ impl EndpointHold {
     fn fleet(self) -> bool {
         matches!(self, Self::Fleet | Self::Both | Self::Unsaid)
     }
+}
+
+/// Whether `list` is an endpoint's origin list: one to four of `person`,
+/// `remote`, `fleet` and `local`, comma-joined, each at most once and in that
+/// order — the one order the endpoint writes (`fleet,local`, `person,fleet`,
+/// `remote,fleet`).
+fn origin_list_ok(list: &str) -> bool {
+    const ORDER: [&str; 4] = ["person", "remote", "fleet", "local"];
+    let mut next = 0;
+    for word in list.split(',') {
+        let Some(at) = ORDER[next..].iter().position(|known| *known == word) else {
+            return false;
+        };
+        next += at + 1;
+    }
+    true
 }
 
 /// One `status` reply's tokens the bridge reads: `hold=` (with the `sessions
@@ -886,10 +919,10 @@ fn parse_batch_status<'a>(
             }
         } else if let Some(v) = tok.strip_prefix("hold_origin=") {
             // Closed, and contradiction-checked below: a hold says whose it
-            // is, and no hold has an origin. `fleet,local` is both slots, in
-            // the one order the endpoint writes.
-            if !matches!(v, "fleet" | "local" | "fleet,local" | "-") || origin.replace(v).is_some()
-            {
+            // is, and no hold has an origin. `fleet,local` is both slots;
+            // `person` the window's Take Over, `remote` another Mac's drive
+            // (`origin_list_ok`).
+            if !(v == "-" || origin_list_ok(v)) || origin.replace(v).is_some() {
                 return None;
             }
         } else if let Some(v) = tok.strip_prefix("agent=") {
@@ -922,9 +955,7 @@ fn parse_batch_status<'a>(
         // Absent: an endpoint from before the token, which does not say whose.
         (held, None) => EndpointHold::of(held, None),
         (false, Some("-")) => EndpointHold::Free,
-        (true, Some(origin @ ("fleet" | "local" | "fleet,local"))) => {
-            EndpointHold::of(true, Some(origin))
-        }
+        (true, Some(origin)) if origin_list_ok(origin) => EndpointHold::of(true, Some(origin)),
         _ => return None,
     };
     (sid == Some(local)).then_some(StatusSample {
@@ -1752,11 +1783,8 @@ fn rtt_ms_of(rtt: Duration) -> u64 {
 #[derive(Clone)]
 pub struct Config {
     pub fleet: String,
-    /// The broker's endpoint: a Unix socket path, or `<host>:<port>` for the
-    /// two TCP transports.
+    /// The broker's Unix socket path.
     pub broker: String,
-    /// How to reach that endpoint (§8.6).
-    pub transport: Transport,
     pub cap_files: Vec<String>,
     pub state_dir: String,
     /// Principals whose `task`/`control` are delivered as themselves rather than
@@ -1784,14 +1812,13 @@ pub struct Config {
 
 impl std::fmt::Debug for Config {
     /// Every field but the instance TOKEN, which is the control socket's Owner
-    /// credential and prints as `<redacted>` — the rule [`Transport`]'s `Debug`
-    /// keeps for the PSK, so a logged `Config` (or a `fabric::Report` holding
-    /// one) leaks neither. Destructured, so a new field cannot be left out.
+    /// credential and prints as `<redacted>`, so a logged `Config` (or a
+    /// `fabric::Report` holding one) does not leak it. Destructured, so a new
+    /// field cannot be left out.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Config {
             fleet,
             broker,
-            transport,
             cap_files,
             state_dir,
             accept_from,
@@ -1804,7 +1831,6 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("fleet", fleet)
             .field("broker", broker)
-            .field("transport", transport)
             .field("cap_files", cap_files)
             .field("state_dir", state_dir)
             .field("accept_from", accept_from)
@@ -2138,7 +2164,7 @@ pub struct Bridge {
     ///
     /// Built at CONNECT time rather than from the `Subscription`, because
     /// `Subscription::closer` exists only for the concrete `UnixStream` case and
-    /// this bridge also speaks sealed TCP — see [`crate::transport`]. Shared
+    /// this bridge also speaks TCP — see [`crate::transport`]. Shared
     /// with each subscription's reader, which arms its liveness deadline
     /// through the same closer and closes it when its face pauses
     /// ([`spawn_reader`]).
@@ -2160,11 +2186,17 @@ pub struct Bridge {
     /// The last ack's round trip observed during an attach, reported as the
     /// first `link up` when the attach completes.
     attach_rtt: Option<Duration>,
-    /// How long the PUBLISHER connection may go with nothing written before
-    /// [`Bridge::keep_alive`] says it is alive: astream's
-    /// `KEEPALIVE_INTERVAL`, a third of the broker's deadline. A field only so
-    /// a test can reach the broker's side of it without waiting it out.
-    keepalive_every: Duration,
+    /// The last word aterm said before closing the lanes, as this loop TOOK it
+    /// ([`Bridge::take_bye`]; the reader's latch, [`Mailbox::bye`], is what
+    /// the closure arm reads). `Some(Bye::Quit)` is for good: a quitting
+    /// instance's sessions are never advertised `live` again.
+    bye: Option<Bye>,
+    /// The sessions a `bye quit` has published `state=exited` for
+    /// ([`Bridge::withdraw`]) — each once, however many times the withdrawal
+    /// is asked for (the take, a re-attach, the close).
+    withdrawn: BTreeSet<String>,
+    /// Whether the quit's `ev bye reason=quit withdrawn=<n>` is on the bus.
+    withdrawal_told: bool,
     mailbox: Arc<Mailbox>,
     /// The state dir's exclusive hold ([`hold_state_dir`]), kept for this
     /// process's life and never read: dropping it is the release. Last, so it
@@ -2583,7 +2615,9 @@ impl Bridge {
             link: LinkReport::new(),
             attaching: false,
             attach_rtt: None,
-            keepalive_every: astream_broker::KEEPALIVE_INTERVAL,
+            bye: None,
+            withdrawn: BTreeSet::new(),
+            withdrawal_told: false,
             mailbox: Arc::new(Mailbox::default()),
             cfg,
             _state_lock: state_lock,
@@ -2649,29 +2683,25 @@ impl Bridge {
     /// with every cap attached — and the closer that can end it from another
     /// thread.
     ///
-    /// A SEALED connect fails HERE when the key is wrong: the handshake confirms
-    /// the key each way before a single Frame is written, so a peer without it
-    /// is refused inside the handshake rather than on the first verb (§8.6).
-    ///
     /// UNDER THE ACK DEADLINE from the dial: [`ACK_DEADLINE`] bounds the TCP
-    /// and sealed dial and is set on the socket, reads and writes, before the
+    /// dial and is set on the socket, reads and writes, before the
     /// `attach`, so a black-holed address or a broker that accepts and never
     /// answers fails HERE with `TimedOut`/`WouldBlock` rather than parking the
     /// bridge in its first handshake for ever. The publisher keeps both bounds
     /// for its life (every exchange on it is request/reply); a subscription
     /// lifts the read bound once it is open.
     fn connect(&self) -> io::Result<(Conn, Closer)> {
-        let (mut c, closer) =
-            transport::connect(&self.cfg.transport, &self.cfg.broker, ACK_DEADLINE)?;
+        let (mut c, closer) = transport::connect(&self.cfg.broker, ACK_DEADLINE)?;
         transport::attach_ring(&mut c, &self.caps)?;
         Ok((c, closer))
     }
 
     /// READ THE RING AGAIN before a dial, so a renewed cap takes effect
-    /// without a restart: `mint-for` on the host that holds the secret, then
-    /// `join` (or `on`) installs the new `node.cap` over the old one, and the
-    /// next attach — a redial under the back-off, or the one that follows the
-    /// broker ending a lapsed ring's streams — attaches it.
+    /// without a restart: `aterm fabric on` re-mints `node.cap` (one that
+    /// names another node id, or whose tags the root's secret does not
+    /// re-mint) with one rename over the old one, and the next attach — a
+    /// redial under the back-off, or the one that follows the broker ending a
+    /// lapsed ring's streams — attaches it.
     ///
     /// The ring held is KEPT when the one on disk cannot be read or does not
     /// parse, or binds another node or none of this one ([`ring_refusal`]):
@@ -3032,76 +3062,6 @@ impl Bridge {
             self.settle_acks();
         }
         r
-    }
-
-    /// KEEP THE WILL'S CONNECTION TELLABLE FROM A DEAD ONE (§7), on a wire
-    /// whose peer can vanish without a FIN.
-    ///
-    /// The node's will is held on the PUBLISHER connection, and the broker
-    /// fires it only when that connection ends. A request/reply connection
-    /// the bridge has nothing to send on is silent, and an idle TCP socket
-    /// with nothing in flight never times out: a second host that lost power,
-    /// slept past a NAT mapping or changed networks left its connection parked
-    /// in the broker's read for good — the node read `state=live` until host
-    /// 1's broker restarted, and each such departure kept a connection slot.
-    /// astream's `Keepalive` asks the broker to hold this connection to its
-    /// deadline (`KEEPALIVE_DEADLINE`, 60 s) from the first one on, and this
-    /// sends one whenever the connection has carried nothing for
-    /// [`Bridge::keepalive_every`] — any request counts, so a busy bridge
-    /// never sends one. A live bridge is therefore never cut, and a vanished
-    /// one's will fires within the deadline.
-    ///
-    /// TCP ONLY, sealed or not: the broker never holds a Unix-socket
-    /// connection, whose peer cannot vanish without its kernel closing it, so
-    /// a keepalive there is a round trip for nothing. A broker that predates
-    /// the verb answers it as one it does not know, and astream's client then
-    /// sends no more on that connection: it is never cut either.
-    ///
-    /// NOT AN ACK, and not through [`Bridge::observe`]: an answered keepalive
-    /// would otherwise be a `link up` every interval — the report on a timer
-    /// [`LINK_REFRESH`] promises does not exist. A wire frame, never a log
-    /// record: it appends nothing and reaches no endpoint, so it is not the
-    /// republish-on-a-clock §7 rules out. A failed one is the transport
-    /// failing, and the link is reported down and redialled like any other.
-    ///
-    /// Answers whether a keepalive went out.
-    fn keep_alive(&mut self) -> bool {
-        if matches!(self.cfg.transport, Transport::Unix) {
-            return false;
-        }
-        let every = self.keepalive_every;
-        // A CONNECTION WITH PUBLISHES IN FLIGHT HAS SENT A FRAME FOR EACH, and
-        // the newest of them was its last ([`crate::pipeline::Link::last_sent`]):
-        // while that one is younger than the interval the connection is not
-        // idle, and its acks stay owed — reading them just to ask would settle
-        // them on every pass of the loop, which is what pipelining them was for
-        // not doing ([`Bridge::publish_pipelined`]). ONCE IT IS AS OLD AS THE
-        // INTERVAL, the connection HAS been silent that long, however busy the
-        // mailbox: the loop reads acks when it runs out of work or a request
-        // needs the connection, and a stretch of items that publish nothing (a
-        // broadcast flood, a run of events that change nothing) may give it
-        // neither for longer than the broker's deadline. So they are read now —
-        // a keepalive reads its reply as the next frame — and the keepalive goes.
-        if self
-            .conn
-            .as_ref()
-            .and_then(Link::last_sent)
-            .is_some_and(|at| at.elapsed() >= every)
-        {
-            self.settle_acks();
-        }
-        let Some(conn) = self.conn.as_mut().and_then(Link::ready) else {
-            return false;
-        };
-        match conn.keepalive_if_idle(every) {
-            Ok(sent) => sent,
-            Err(e) => {
-                eprintln!("aterm-link: the broker link's keepalive failed: {e}");
-                self.link_down(link_reason(&e, "closed"));
-                self.conn = None;
-                false
-            }
-        }
     }
 
     /// APPLY A QUEUED FLEET HALT NOW, between two requests of whatever duty
@@ -3637,12 +3597,11 @@ impl Bridge {
     /// incarnation's reserved top, then publish `live`.
     ///
     /// THE ORDER IS THE FENCE. Every sequence of incarnation n+1 is above
-    /// incarnation n's reserved top, so when a half-open old connection dies —
-    /// on TCP within the broker's keepalive deadline, because that connection
-    /// kept alive ([`Bridge::keep_alive`]) — its will is suppressed
+    /// incarnation n's reserved top, so when an old connection dies — its
+    /// kernel closes it as its process goes — its will is suppressed
     /// structurally — no reader fold needed, which
     /// matters because `Last` returns one record per subject and a reader could
-    /// never see a `live` hidden behind a later `gone` (§7).
+    /// never see a `live` hidden behind a later `away` (§7).
     fn bring_presence_up(&mut self) -> io::Result<()> {
         let subject = subject::node_face(&self.cfg.fleet, &self.node, "presence");
         // THE SAME READ ANSWERS TWO QUESTIONS. `inc=` gives the incarnation to
@@ -3698,8 +3657,12 @@ impl Bridge {
                 // attach granted, or a sibling that came up in between inherits
                 // a verdict taken before it existed.
                 Some((inc, body)) => {
-                    let gone = body.unknown.get("state").map(String::as_str) == Some("gone");
-                    (inc, gone.then_some(inc))
+                    let will = body
+                        .unknown
+                        .get("state")
+                        .map(String::as_str)
+                        .is_some_and(crate::glance::is_will);
+                    (inc, will.then_some(inc))
                 }
                 None => (0, None),
             }
@@ -3717,13 +3680,18 @@ impl Bridge {
         // CHECKED BEFORE IT IS PERSISTED: an incarnation no will could be
         // registered under is refused there, and the state dir never keeps it.
         self.inc = self.state.take_incarnation(bus_inc)?;
-        // WHAT THIS NODE RUNS rides on the will as on the live row: the will
-        // is the row a reader sees once this node is gone, and a node gone for
-        // speaking another protocol is exactly the one whose release the other
-        // hosts need to read ([`release_tokens`]).
+        // `away`, NOT `exited` ([`crate::glance::AWAY`]): a will is the
+        // broker's word for a connection that ended, and the node behind it may
+        // be back in a second. Its sessions are withdrawn only by aterm's own
+        // `bye quit` ([`Bridge::take_bye`]), never by this. WHAT THIS NODE RUNS
+        // rides on the will as on the live row: the will is the row a reader
+        // sees once this node is away, and a node away for speaking another
+        // protocol is exactly the one whose release the other hosts need to
+        // read ([`release_tokens`]).
         let gone = format!(
-            "v=1 t={} state=gone inc={} fabric=disconnected {}",
+            "v=1 t={} state={} inc={} fabric=disconnected {}",
             crate::now_ms(),
+            crate::glance::AWAY,
             self.inc,
             release_tokens()
         );
@@ -3787,11 +3755,26 @@ impl Bridge {
     ///
     /// A session row carries no `fabric=`. The only `Will` this bridge
     /// registers is on the NODE face, so when a bridge dies the node row flips
-    /// to `state=gone fabric=disconnected` while every session row stays
+    /// to `state=away fabric=disconnected` while every session row stays
     /// retained; a constant `connected` there would lie, while glance renders a
     /// missing token as `-` ("unknown"), which is the truth. The node's own row
     /// carries it, where the will keeps it honest.
-    fn publish_session_presence(&mut self, sid: &str, state: &str) {
+    ///
+    /// ## After `bye quit`, nothing but the withdrawal
+    ///
+    /// A quitting instance's sessions are never advertised `live` again — an
+    /// agent `EVENT`, a roster round or a re-attach between the withdrawal and
+    /// the lanes closing would otherwise put a session back on the roster that
+    /// has seconds to live — and each one's `exited` row is written once
+    /// ([`Bridge::withdraw`]).
+    ///
+    /// Answers whether the row went: a withdrawal's once the broker took it,
+    /// any other once it was sent (pipelined; a refusal is said when its
+    /// answer is read, and the next round owes the row again).
+    fn publish_session_presence(&mut self, sid: &str, state: &str) -> bool {
+        if self.bye == Some(Bye::Quit) && (state == "live" || self.withdrawn.contains(sid)) {
+            return false;
+        }
         // THE FIRST ROW ALREADY MEANS SOMETHING: a live row is read before it
         // is first published, whichever path publishes it (admission, an
         // observer's, a reconnect's), so a session is never on the bus as
@@ -3831,10 +3814,30 @@ impl Bridge {
         if self.attachment == Attachment::Observer {
             body.push_str(" observer=1");
         }
+        let mode = self.cfg.presence;
+        // A WITHDRAWAL IS ANSWERED HERE, never pipelined: `bye quit`'s walk
+        // ([`Bridge::withdraw`]) counts a session withdrawn only once the broker
+        // took its `exited` row, and tries a refused one again at its next
+        // moment. A blocking publish reads every pipelined ack owed first
+        // ([`Bridge::conn_now`]), so the row lands after every row sent before it.
+        if state == "exited" && self.bye == Some(Bye::Quit) {
+            return match self.publish(&subject, body.as_bytes()) {
+                Ok(_) => {
+                    if let Some(slot) = self.per_sid.presence.get_mut(sid) {
+                        let mark = slot.mark_published(mode, Instant::now());
+                        slot.landed(mark);
+                    }
+                    true
+                }
+                Err(e) => {
+                    eprintln!("aterm-link: could not publish presence for {sid}: {e}");
+                    false
+                }
+            };
+        }
         // PIPELINED ([`Bridge::publish_pipelined`]), marked on the bus as it
         // is sent ([`Then::Presence`]): nothing waits on a presence row, and
         // the attach's one row per session went out one flush apart.
-        let mode = self.cfg.presence;
         let mark = self
             .per_sid
             .presence
@@ -3848,6 +3851,7 @@ impl Bridge {
                 mark,
             },
         );
+        true
     }
 
     // -----------------------------------------------------------------------
@@ -5169,10 +5173,10 @@ impl Bridge {
     /// demoted=ack`, `demoted=answer`, `demoted=report` — so no stray reply
     /// settles anything: not the deadline (the caller's `late`/deadline arm
     /// reads the flag), and not a reader that settles on the first `answer
-    /// re=<off>` it is shown (`aterm drive task --wait` did, and printed a third
-    /// node's guess at the offset as the worker's result). An offset this bridge has
-    /// no record of (older than the table, or asked before it existed) is
-    /// judged as before. ONE function for the live delivery and the refill,
+    /// re=<off>` it is shown (the since-removed `aterm drive task --wait` did,
+    /// and printed a third node's guess at the offset as the worker's result).
+    /// An offset this bridge has no record of (older than the table, or asked
+    /// before it existed) is judged as before. ONE function for the live delivery and the refill,
     /// so a refilled row reads exactly as it did the first time.
     ///
     /// WHERE AN ASK WENT IS LEARNED FROM ITS ACK, and a fresh ask's ack is
@@ -5180,9 +5184,9 @@ impl Bridge {
     /// notes the ask, [`Bridge::post_landed`]). Until it is read, the offset
     /// is in neither table, and a reply naming it is "no record" — judged as
     /// before, undemoted: a third node's `answer re=<off>` read in that gap
-    /// was the worker's result to `aterm drive task --wait`, and once the ack
-    /// was read the deadline sweep's bus check refused that same record, so
-    /// delivery and the sweep disagreed. So a reply naming an offset neither
+    /// was the worker's result to the since-removed `aterm drive task --wait`,
+    /// and once the ack was read the deadline sweep's bus check refused that
+    /// same record, so delivery and the sweep disagreed. So a reply naming an offset neither
     /// table holds is judged only once no waiting post is still owed its
     /// answer ([`Bridge::read_where_asks_went`]), as an own-lane record is
     /// judged only once no own-lane post is ([`Bridge::is_forged_self`]).
@@ -5246,7 +5250,8 @@ impl Bridge {
             // speak for it is outside the residual too. `s-w@n-evil` beside the
             // real `s-w@<its node>` differs only in the attested half, and a
             // reader matching the sid took the forgery for the worker's report
-            // (the supervisor's turn) or its answer (`drive task`).
+            // (the supervisor's turn) or its answer (the since-removed
+            // `drive task`).
             Some(sid)
                 if addr.src.starts_with("n-")
                     && sid.starts_with("s-")
@@ -7965,7 +7970,7 @@ impl Bridge {
     /// [`Bridge::refresh_sessions`] does it by LOOKING, for the line that never
     /// arrives. Neither runs when the whole instance dies. The only `Will` this
     /// crate registers is on the NODE face ([`Bridge::bring_presence_up`]), so
-    /// the node row flips to `state=gone` and every SESSION row under it stays
+    /// the node row flips to `state=away` and every SESSION row under it stays
     /// retained at `state=live` — forever, because presence is a last-value
     /// face and nothing supersedes a row whose writer is dead.
     ///
@@ -9483,10 +9488,22 @@ impl Bridge {
                     match self.state.pins().get(&sid).cloned() {
                         Some(pinned) if pinned != n => return Ok(Route::Ambiguous),
                         // Pinned to this node: first sight was its presence.
-                        Some(_) => n,
-                        None if self.node_seen(&n)? => n,
+                        Some(_) => {}
+                        None if self.node_seen(&n)? => {}
                         None => return Ok(Route::Unroutable),
                     }
+                    // AN ADDRESS THAT NAMES ITS NODE IS REFUSED THE SAME WAY
+                    // when that node's row for the sid says `exited`: the
+                    // session ended there or was withdrawn by a quit. A row
+                    // that is `live` — the node away or not — or no row at all
+                    // routes as named.
+                    if !(hosted && n == self.node) {
+                        let seen = self.advertisers(&sid)?;
+                        if seen.exited.contains(&n) && !seen.live.contains(&n) {
+                            return Ok(Route::Unroutable);
+                        }
+                    }
+                    n
                 }
                 (None, true) => self.node.clone(),
                 (None, false) => match self.pinned_node_for(&sid)? {
@@ -9551,11 +9568,18 @@ impl Bridge {
         // sids, so the next one should not have to walk. A walk that lost the
         // connection has left nothing to dial the view on, and opens nothing.
         self.want_presence_view();
-        let advertisers = advertisers?;
+        let seen = advertisers?;
+        let advertisers = seen.live;
         Ok(match (&pinned, advertisers.len()) {
             // A pinned sid that somebody ELSE now advertises is the conflict
             // §6.1 names — whichever of them is lying.
             (Some(node), _) if advertisers.iter().any(|n| n != node) => Err(Route::Ambiguous),
+            // A PINNED SID ITS NODE WITHDREW is refused here, at the sender:
+            // the pin outlives the session, and routing on it put the post on
+            // a lane no session will ever fetch — acked `OK off=` as landed.
+            // A pinned node that went `away` still advertises the row `live`
+            // and routes: that post waits on the bus for the node.
+            (Some(node), 0) if seen.exited.contains(node) => Err(Route::Unroutable),
             (Some(node), _) => Ok(node.clone()),
             (None, 0) => Err(Route::Unroutable),
             (None, 1) => {
@@ -9667,12 +9691,11 @@ impl Bridge {
         }
         self.presence_view_retry_at = Some(Instant::now() + PRESENCE_VIEW_REOPEN);
         // What `connect_on_log` reads off `self`, owned, for the reader's thread.
-        let wire = self.cfg.transport.clone();
         let broker = self.cfg.broker.clone();
         let ring = self.caps.clone();
         let judged = self.bus_log;
         let dial = move || {
-            let (mut c, closer) = transport::connect(&wire, &broker, ACK_DEADLINE)?;
+            let (mut c, closer) = transport::connect(&broker, ACK_DEADLINE)?;
             transport::attach_ring(&mut c, &ring)?;
             same_log(judged, &c)?;
             Ok((c, closer))
@@ -9702,6 +9725,14 @@ impl Bridge {
     /// AND SO ARE THE ROWS THAT SAY THE SESSION IS GONE: a session whose only
     /// row is its node's `state=exited` withdrawal is no routing candidate,
     /// and must not earn a PERMANENT TOFU pin for a sid that no longer exists.
+    /// Those nodes are answered apart, in [`Advertised::exited`] — the session
+    /// ended there, or its instance quit and WITHDREW it (`bye quit`) — so a
+    /// pin or an address naming one is refused rather than routed on.
+    ///
+    /// A row still `live` under a node whose WILL fired (the node reads
+    /// `away`: killed, crashed, its link lost) is a live advertiser ON
+    /// PURPOSE: its mail queues on the bus and is delivered when the node is
+    /// back, which is what `away` means. Only a withdrawn row refuses mail.
     ///
     /// # Errors
     ///
@@ -9710,10 +9741,10 @@ impl Bridge {
     /// retires a post for good), so only a read the broker finished may give
     /// one. A short walk would also miss a second node advertising the sid, so
     /// §6.1's `ERR ambiguous` would never fire.
-    fn advertisers(&mut self, sid: &str) -> io::Result<BTreeSet<String>> {
+    fn advertisers(&mut self, sid: &str) -> io::Result<Advertised> {
         let filter = format!("/f/{}/pub/*/{sid}/presence", self.cfg.fleet);
         let rows = self.last_face(&filter)?;
-        let mut live = BTreeSet::new();
+        let mut seen = Advertised::default();
         for (_, subject, raw) in &rows {
             // `["", "f", "<F>", "pub", "<node>", "<sid>", "presence"]`
             let segs: Vec<&str> = subject.split('/').collect();
@@ -9721,16 +9752,19 @@ impl Bridge {
                 continue;
             }
             let (body, _) = Body::decode(raw);
-            if body.unknown.get("observer").is_some_and(|v| v == "1")
-                || body.unknown.get("state").is_none_or(|s| s != "live")
-            {
+            if body.unknown.get("observer").is_some_and(|v| v == "1") {
                 continue;
             }
-            if let Some(node) = segs.get(4).filter(|n| subject::is_principal(n)) {
-                live.insert((*node).to_string());
-            }
+            let Some(node) = segs.get(4).filter(|n| subject::is_principal(n)) else {
+                continue;
+            };
+            match body.unknown.get("state").map(String::as_str) {
+                Some("live") => seen.live.insert((*node).to_string()),
+                Some("exited") => seen.exited.insert((*node).to_string()),
+                _ => false,
+            };
         }
-        Ok(live)
+        Ok(seen)
     }
 
     // -----------------------------------------------------------------------
@@ -9746,7 +9780,7 @@ impl Bridge {
             // when a watcher fell behind and frames were coalesced away; a
             // reader of the fleet digest must be able to see that its picture of
             // this node has a hole in it, and the alternative — swallowing it —
-            // is the bug `fleet_cli.rs:361` is on record for.
+            // is what the removed `aterm fleet events` bridge did.
             Some("GAP") => {
                 let rest = line.strip_prefix("GAP").unwrap_or("").trim();
                 self.publish_ev(&format!("gap {rest}"));
@@ -9978,6 +10012,14 @@ impl Bridge {
                 };
                 self.retire_on_request(sid);
             }
+            // `EVENT * bye <quit|handoff>`: aterm's last word before it closes
+            // the lanes ([`Bye`]). The reader latched it as it read it; taking
+            // it here acknowledges it while the verb lane still answers.
+            "bye" => {
+                if let Some(bye) = toks.next().and_then(Bye::parse) {
+                    self.take_bye(bye);
+                }
+            }
             "session-exited" => {
                 // THE LINE THAT NEVER ARRIVES — see
                 // [`Fault::DropSessionExitedWhileMarked`]. Everything that
@@ -9992,6 +10034,133 @@ impl Bridge {
                 self.publish_session_presence(&sid, "exited");
                 self.per_sid.epochs.remove(&sid);
                 let _ = self.refresh_sessions();
+            }
+            _ => {}
+        }
+    }
+
+    /// TAKE aterm's last word ([`Bye`]): acknowledge it, then act on it.
+    ///
+    /// THE ACK COMES FIRST, AND IT IS ALL THE INSTANCE WAITS FOR. `link bye
+    /// <word>` tells aterm its word was read, so it may close the lanes now:
+    /// the reader latched the word as it read it ([`Mailbox::note_bye`]) and
+    /// the closure arm acts on that latch ([`Bridge::on_aterm_closed`]), so
+    /// what follows needs aterm no longer. A quit is not held open for the
+    /// broker's round trips.
+    ///
+    /// * `quit` WITHDRAWS: the roster is read once more while the lane still
+    ///   answers, and every session this bridge advertised gets its
+    ///   `state=exited` row ([`Bridge::withdraw`]). A post to one is then
+    ///   `unroutable` at its sender instead of queued for nobody.
+    /// * `handoff` publishes NOTHING but its `ev`: the successor adopts the
+    ///   same sids and its own bridge re-advertises them. Exactly what no word
+    ///   at all does — so a `bye handoff` lost to the `_exit` racing it costs
+    ///   only that `ev`.
+    ///
+    /// An observer hosts nothing and withdraws nothing, and a bridge that has
+    /// already withdrawn has nothing more to say.
+    fn take_bye(&mut self, bye: Bye) {
+        if self.attachment != Attachment::Inherited || self.bye == Some(Bye::Quit) {
+            return;
+        }
+        match self.ctl_request(&format!("link bye {}", bye.word())) {
+            Ok(reply) if !reply.ok() => {
+                eprintln!("aterm-link: `link bye` refused: {}", reply.header());
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("aterm-link: `link bye` failed: {e}"),
+        }
+        self.bye = Some(bye);
+        match bye {
+            Bye::Quit => {
+                // The newest roster: a session created since the last round is
+                // withdrawn too, and one already gone gets its own `exited`.
+                let _ = self.refresh_sessions();
+                self.withdraw();
+            }
+            Bye::Handoff => self.publish_ev("bye reason=handoff"),
+        }
+    }
+
+    /// THE QUIT'S WITHDRAWAL: one `state=exited` row for every session this
+    /// bridge advertised and has not withdrawn yet, then `ev bye reason=quit
+    /// withdrawn=<n>`, written by the first call that walks the whole roster —
+    /// even while a refused row is still owed — and again, with the new count,
+    /// by a later call that lands a row an earlier one could not.
+    ///
+    /// Idempotent and resumable, because it is asked for at three moments and
+    /// the broker may be down at any of them: the take, the first attach after
+    /// a take made while detached, and the lanes closing. A row that could not
+    /// be published is tried again at the next of them; one that was is never
+    /// written twice ([`Bridge::publish_session_presence`]).
+    ///
+    /// ONE REFUSED ROW STOPS ONLY ITSELF. A publish the broker refused over a
+    /// link that stays up (a subject past the producer's bound, say) leaves
+    /// that session owed and the walk goes on to the next; only a link that
+    /// went down with the publish ends the walk, because every row after it
+    /// would fail the same way.
+    ///
+    /// EVERY HOSTED SESSION, admitted or not: one still waiting for admission
+    /// ([`Bridge::pending_admit`]) may carry a predecessor's `live` row — a
+    /// handoff's successor quitting before its first attach finished — and its
+    /// presence subject is the one its admission would have minted anyway.
+    fn withdraw(&mut self) {
+        if self.bye != Some(Bye::Quit) {
+            return;
+        }
+        if self.conn.is_none() {
+            eprintln!(
+                "aterm-link: aterm is quitting and the broker is unreachable: its sessions are \
+                 withdrawn once the link is back, or read `away` until then"
+            );
+            return;
+        }
+        let owed: Vec<String> = self
+            .per_sid
+            .epochs
+            .keys()
+            .filter(|sid| !self.withdrawn.contains(*sid))
+            .cloned()
+            .collect();
+        let mut published = false;
+        for sid in owed {
+            if !self.publish_session_presence(&sid, "exited") {
+                if self.conn.is_none() {
+                    return;
+                }
+                continue;
+            }
+            self.withdrawn.insert(sid);
+            published = true;
+        }
+        // THE `ev` IS WRITTEN BY THE CALL THAT WALKED THE WHOLE ROSTER, with
+        // the whole count — a quit with no session included, once; a later
+        // call with nothing new says nothing, and one that withdrew a row an
+        // earlier one could not says the new count.
+        if published || !self.withdrawal_told {
+            self.withdrawal_told = true;
+            let n = self.withdrawn.len();
+            self.publish_ev(&format!("bye reason=quit withdrawn={n}"));
+        }
+    }
+
+    /// aterm closed the lanes: act on the word the reader LATCHED, which the
+    /// loop may not have taken — a closure notice is taken ahead of every
+    /// event ([`Mailbox::bye`]). Nothing can be acknowledged now; a quit is
+    /// still withdrawn, and a handoff the loop never took still gets its
+    /// `ev`. No word at all publishes nothing: the node's will reads `away`.
+    fn on_aterm_closed(&mut self) {
+        if self.attachment != Attachment::Inherited {
+            return;
+        }
+        match self.mailbox.bye() {
+            Some(Bye::Quit) => {
+                self.bye = Some(Bye::Quit);
+                self.withdraw();
+            }
+            Some(Bye::Handoff) if self.bye.is_none() => {
+                self.bye = Some(Bye::Handoff);
+                self.publish_ev("bye reason=handoff");
             }
             _ => {}
         }
@@ -10178,7 +10347,7 @@ impl Bridge {
                 ),
                 None => eprintln!(
                     "aterm-link: the bus log is not the one this node last read: {} (deleted, \
-                     moved aside, repaired, restored, or another host's); every offset this \
+                     moved aside, repaired, restored, or another broker's); every offset this \
                      node held there is forgotten — the seen and topic cursors, the halt and \
                      self-ack watermarks, {} open deadline(s) no reply here can settle, and {} \
                      in-flight record(s) decided there — and every halt this node held stands \
@@ -10692,6 +10861,11 @@ impl Bridge {
             if let Some((local, sid)) = watch_ack(line) {
                 self.note_watch_ack(local, sid);
             }
+            // A BYE IS ACKNOWLEDGED WHILE PARKED TOO: the instance is waiting
+            // on it to quit. The withdrawal it owes waits for the link.
+            if let Some(bye) = bye_of(line) {
+                self.take_bye(bye);
+            }
         })
     }
 
@@ -10718,8 +10892,7 @@ impl Bridge {
     /// own lane and build — into [`Bridge::endpoint_lane`].
     ///
     /// The bridge binary is whatever `[fabric] command` names, so nothing
-    /// makes it the instance's build: a sealed build a second host needs, a
-    /// dev build first on `PATH`, the installed CLI an update replaced under a
+    /// makes it the instance's build: a dev build first on `PATH`, the installed CLI an update replaced under a
     /// running instance. A build other than the endpoint's is SAID — here on
     /// stderr, which aterm keeps in its log, and by the endpoint in `fabric
     /// status` — and never refused on: the lane is what decides what may be
@@ -10866,6 +11039,10 @@ impl Bridge {
             // the shared `inc`, a will and a `live` row for an aterm that is
             // not there, while the successor's bridge waits on the lock.
             if self.aterm_gone() {
+                // A QUIT IS STILL WITHDRAWN, and a handoff still said: the word
+                // the reader latched is acted on before this process goes
+                // ([`Bridge::on_aterm_closed`]).
+                self.on_aterm_closed();
                 eprintln!("aterm-link: aterm closed the bridge connection; exiting");
                 self.wind_down();
                 return Ok(());
@@ -10879,6 +11056,7 @@ impl Bridge {
                 // that stayed up redials now, as a killed broker wants.
                 if let Some(wait) = backoff.lost(Instant::now()) {
                     if self.park_detached(wait) {
+                        self.on_aterm_closed();
                         eprintln!("aterm-link: aterm closed the bridge connection; exiting");
                         // No connection to commit on: what the inbox owes is
                         // handed over ([`Bridge::hand_over_inbox_commit`]).
@@ -10888,6 +11066,8 @@ impl Bridge {
                 }
                 if self.attach_broker() {
                     backoff.attached(Instant::now());
+                    // A quit taken while the broker was away is withdrawn now.
+                    self.withdraw();
                     // Whatever queued while the broker was away goes now.
                     self.drain_outbox();
                     // And whatever the session logs appended meanwhile.
@@ -10905,6 +11085,7 @@ impl Bridge {
                     // but aterm going away must still end the bridge. See
                     // [`Bridge::park_detached`].
                     if self.park_detached(backoff.failed()) {
+                        self.on_aterm_closed();
                         eprintln!("aterm-link: aterm closed the bridge connection; exiting");
                         self.wind_down();
                         return Ok(());
@@ -10955,11 +11136,6 @@ impl Bridge {
                 self.expire_deadlines(expire_now);
                 self.arm_deadline_sweep(true, true);
             }
-            // AND THE WILL'S CONNECTION SAYS IT IS ALIVE, when it has said
-            // nothing for a keepalive interval ([`Bridge::keep_alive`]). The
-            // roster's deadline wakes this loop every `ROSTER_REFRESH`, far
-            // inside that interval, so no wake of its own is needed.
-            self.keep_alive();
             // THE BROADCAST FACE FOLLOWS THE TOPIC SET that the last item or
             // duty may have changed ([`Bridge::sync_say_face`]).
             if self.conn.is_some() && !self.sync_say_face() {
@@ -11082,8 +11258,9 @@ impl Bridge {
                 true
             }
             Some(Item::Closed(Source::Aterm)) => {
-                eprintln!("aterm-link: aterm closed the bridge connection; exiting");
                 self.in_round = false;
+                self.on_aterm_closed();
+                eprintln!("aterm-link: aterm closed the bridge connection; exiting");
                 self.wind_down();
                 false
             }
@@ -11264,6 +11441,14 @@ fn hold_state_dir(
     }
 }
 
+/// One sid's presence rows as routing reads them ([`Bridge::advertisers`]):
+/// the nodes advertising it `live`, and the nodes whose row says `exited`.
+#[derive(Debug, Default)]
+struct Advertised {
+    live: BTreeSet<String>,
+    exited: BTreeSet<String>,
+}
+
 /// `sub <local> <sid>` — the push lane's ack of a watch — as `(local, sid)`;
 /// `None` for any other line.
 fn watch_ack(line: &str) -> Option<(u64, &str)> {
@@ -11274,6 +11459,16 @@ fn watch_ack(line: &str) -> Option<(u64, &str)> {
     let local = toks.next()?.parse::<u64>().ok()?;
     let sid = toks.next().filter(|s| subject::is_principal(s))?;
     Some((local, sid))
+}
+
+/// `EVENT * bye <quit|handoff>` — aterm's last word before it closes the
+/// lanes ([`Bye`]); `None` for any other line, a malformed word included.
+fn bye_of(line: &str) -> Option<Bye> {
+    let mut toks = line.split_whitespace();
+    if (toks.next(), toks.next(), toks.next()) != (Some("EVENT"), Some("*"), Some("bye")) {
+        return None;
+    }
+    Bye::parse(toks.next()?)
 }
 
 /// Whether a record on this node's own lane at `off` is a FORGERY, or one of
@@ -11715,7 +11910,7 @@ fn carried_elsewhere(body: &Body, inc: u64, self_inc: u64, host: &str) -> Option
 ///
 /// AND NOT `inc <= witnessed_dead` EITHER: a surviving OLDER sibling
 /// does not rewrite the node face when a younger one's will fires, so a node
-/// face reading `state=gone inc=K` proves K dead and says nothing whatever
+/// face reading `state=away inc=K` proves K dead and says nothing whatever
 /// about `K-1`. The equality is the whole of what is proven, so the equality is
 /// what is used.
 fn adoptable(inc: Option<u64>, self_inc: u64, witnessed_dead: Option<u64>) -> bool {
@@ -11749,53 +11944,23 @@ fn replier_of(subject: &str) -> Option<String> {
 /// so nothing puts it back. Every node's row read `host=-`, on both hosts of
 /// the two-host fleet the column exists for.
 ///
-/// So it is asked of the OS, in the order an operator would expect: an explicit
-/// `$HOSTNAME` override first (that is what an operator setting it means),
-/// then `/etc/hostname` where the platform keeps one, then `uname -n`, which is
-/// the POSIX answer and the one macOS has. `-` survives as the last resort and
-/// is honest: the field's readers (`glance`, `aterm-link ls`) render a missing
-/// token as "unknown" already.
-///
-/// `gethostname(2)` would be one call rather than three attempts, and it is not
-/// used: §11.2 confines this crate's raw-descriptor and `libc` surface to
-/// `aterm-uds`, and the crate forbids `unsafe_code` (its inherited lanes are
-/// adopted through `aterm_uds::spawnfd`). A `uname` a bridge runs at most once
-/// is the cheaper promise to keep.
+/// So it is asked of the OS through the one host-name answer every aterm
+/// reader gives ([`aterm_uds::process::host_name`]): an explicit `$HOSTNAME`
+/// override first (that is what an operator setting it means), then
+/// `gethostname(2)`, the POSIX answer `uname -n` prints, from `aterm-uds`, the
+/// crate §11.2 confines this crate's raw-descriptor and `libc` surface to.
+/// The survey's `instance host=` and a fleet member's registration are the
+/// same word. `-` survives as the last resort and is honest: the field's
+/// readers (`glance`, `aterm-link ls`) render a missing token as "unknown"
+/// already.
 ///
 /// ONCE PER PROCESS. The node presence row is republished on every reconnect
 /// and the answer cannot change under a running kernel's process, so the work
-/// — including the one spawn — happens on the first row and never again.
+/// happens on the first row and never again.
 fn hostname() -> String {
     static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    HOST.get_or_init(|| {
-        if let Some(h) = std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()) {
-            return h;
-        }
-        if let Some(h) = std::fs::read_to_string("/etc/hostname")
-            .ok()
-            .map(|h| h.trim().to_string())
-            .filter(|h| !h.is_empty())
-        {
-            return h;
-        }
-        for uname in ["/usr/bin/uname", "/bin/uname"] {
-            let out = aterm_uds::spawnfd::command(uname)
-                .arg("-n")
-                .stdin(aterm_uds::spawnfd::Stdio::null())
-                .stderr(aterm_uds::spawnfd::Stdio::null())
-                .output();
-            if let Some(h) = out
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .filter(|h| !h.is_empty())
-            {
-                return h;
-            }
-        }
-        "-".to_string()
-    })
-    .clone()
+    HOST.get_or_init(|| aterm_uds::process::host_name().unwrap_or_else(|| "-".to_string()))
+        .clone()
 }
 
 /// Mint a node id: `n-<16 hex>`, once, from the OS CSPRNG.
@@ -11807,8 +11972,8 @@ fn mint_node_id() -> String {
 /// The node this bridge runs as: the one `<state>/node` records, CHECKED
 /// AGAINST THE CAPS before the bridge publishes a byte.
 ///
-/// The state dir is the identity (`fabric on` and `join` provision it, then
-/// mint or install the cap for it), and the cap's read-write grants bind every
+/// The state dir is the identity (`fabric on` provisions it, then mints the
+/// cap for it), and the cap's read-write grants bind every
 /// publish to the node they were minted for. The two can disagree only by an
 /// operator's hand — a `--state` that is not the one the cap was minted for,
 /// or a deleted `link-state` — and then a guarded broker refuses the node's
@@ -11839,24 +12004,22 @@ fn node_for(state: &StateDir, caps: &[Cap]) -> io::Result<String> {
     let dir = state.root().display();
     let refuse = |msg: String| io::Error::new(io::ErrorKind::InvalidInput, msg);
     match state.node() {
-        Some(node) if !crate::join::is_node_id(&node) => Err(refuse(format!(
+        Some(node) if !crate::enable::is_node_id(&node) => Err(refuse(format!(
             "{dir}/node holds `{}`, which is not a node id (`n-` and [a-z0-9-]): a node's \
-             identity is provisioned by `aterm fabric on` or `join`",
+             identity is provisioned by `aterm fabric on`",
             crate::render::safe(&node, 64)
         ))),
         Some(node) if bound.is_empty() || bound.contains(&node) => Ok(node),
         Some(node) => Err(refuse(format!(
             "{dir}/node is {node}, but the cap files are minted for {named}: a guarded broker \
-             refuses every publish of {node} under them. On the host that holds the fleet's \
-             mint secret, `aterm fabric on` re-mints that root's cap for {node} (`aterm fabric \
-             mint-for {node}` for a joined host); or give this bridge the --state the cap was \
-             minted for"
+             refuses every publish of {node} under them. `aterm fabric on` re-mints the root's \
+             cap for {node}; or give this bridge the --state the cap was minted for"
         ))),
         None if bound.is_empty() => state.node_id(mint_node_id),
         None => Err(refuse(format!(
             "{dir} records no node id, and the cap files are minted for {named}: give this \
-             bridge the --state that records {named}, or a cap of its own (`aterm fabric \
-             mint-for new` on the host that holds the fleet's mint secret) — taking {named} \
+             bridge the --state that records {named}, or a cap of its own (`aterm link mint` \
+             under the fleet's mint secret, one line per grant of its ring) — taking {named} \
              here would run two bridges as one node"
         ))),
     }
@@ -11869,7 +12032,7 @@ fn ring_binds(caps: &[Cap]) -> BTreeSet<String> {
         .filter_map(|c| astream_cap::Grant::parse(&c.grant).ok())
         .filter(|g| g.mode == astream_cap::Mode::ReadWrite)
         .filter_map(|g| g.principal)
-        .filter(|p| crate::join::is_node_id(p))
+        .filter(|p| crate::enable::is_node_id(p))
         .collect()
 }
 
@@ -12174,6 +12337,13 @@ fn spawn_event_reader(push: Ctl, mailbox: Arc<Mailbox>) {
                     }
                     Ok(_) => {
                         let trimmed = line.trim_end().to_string();
+                        // A BYE IS LATCHED AS IT IS READ, before it is
+                        // queued: aterm closes the lanes right after it, and
+                        // the loop takes that closure ahead of every event
+                        // ([`Mailbox::note_bye`]).
+                        if let Some(bye) = bye_of(&trimmed) {
+                            mailbox.note_bye(bye);
+                        }
                         // `EVENT` is the digest; `GAP` is the digest ADMITTING it
                         // dropped frames, which §4.2 says must be published as an
                         // `ev` record rather than dropped ("a `GAP` frame is
@@ -12470,6 +12640,39 @@ mod tests {
         };
         assert_eq!(parse("hold=1 hold_origin=fleet"), Some(EndpointHold::Fleet));
         assert_eq!(parse("hold=1 hold_origin=local"), Some(EndpointHold::Local));
+        // The person's Take Over is a hold the fleet did not make: alone it
+        // is the owner's side, beside the fleet's it is both — never unsaid,
+        // which the bridge would read as the fleet's and try to lift.
+        assert_eq!(
+            parse("hold=1 hold_origin=person"),
+            Some(EndpointHold::Local)
+        );
+        assert_eq!(
+            parse("hold=1 hold_origin=person,fleet,local"),
+            Some(EndpointHold::Both),
+        );
+        assert!(!EndpointHold::of(true, Some("person")).fleet());
+        assert!(EndpointHold::of(true, Some("person,fleet")).fleet());
+        // Another Mac's drive (the step-in) is no fleet halt either: alone it
+        // is the owner's side, which the bridge never lifts, and beside the
+        // fleet's it is both. Unsaid, every roster tick would write `hold
+        // off origin=fleet` against it and lift nothing.
+        assert_eq!(
+            parse("hold=1 hold_origin=remote"),
+            Some(EndpointHold::Local)
+        );
+        assert_eq!(
+            parse("hold=1 hold_origin=remote,fleet"),
+            Some(EndpointHold::Both)
+        );
+        assert_eq!(
+            parse("hold=1 hold_origin=person,remote,fleet,local"),
+            Some(EndpointHold::Both)
+        );
+        assert!(!EndpointHold::of(true, Some("remote")).fleet());
+        assert!(EndpointHold::of(true, Some("remote,fleet")).fleet());
+        assert_eq!(parse("hold=1 hold_origin=person,person"), None);
+        assert_eq!(parse("hold=1 hold_origin=someone"), None);
         assert_eq!(
             parse("hold=1 hold_origin=fleet,local"),
             Some(EndpointHold::Both),
@@ -12488,6 +12691,10 @@ mod tests {
             "hold=1 hold_origin=local,fleet",
             "hold=1 hold_origin=fleet,fleet",
             "hold=1 hold_origin=fleet,",
+            "hold=1 hold_origin=local,person",
+            "hold=1 hold_origin=fleet,remote",
+            "hold=1 hold_origin=remote,remote",
+            "hold=0 hold_origin=remote",
         ] {
             assert_eq!(parse(malformed), None, "{malformed}");
         }
@@ -12559,7 +12766,6 @@ mod tests {
             let mut bridge = Bridge::new(Config {
                 fleet: "test".into(),
                 broker: String::new(),
-                transport: Transport::Unix,
                 cap_files: Vec::new(),
                 state_dir: scratch.join("state").to_string_lossy().into_owned(),
                 accept_from: Vec::new(),
@@ -12826,7 +13032,7 @@ mod tests {
         // B's own rows for sessions it does not host are B's to retire.
         assert!(adoptable(Some(b), b, None));
         // A DEATH IT WITNESSED. B attaches, finds the node face carrying A's
-        // will (`state=gone inc=1`), and may retire exactly A's rows.
+        // will (`state=away inc=1`), and may retire exactly A's rows.
         assert!(adoptable(Some(a_live), b, Some(a_live)));
         // AND ONLY THAT ONE. A will proves the incarnation it names is gone and
         // says nothing about any other, because a surviving older sibling does
@@ -13130,7 +13336,6 @@ mod tests {
         let cfg = Config {
             fleet: "f".into(),
             broker: "/tmp/b.sock".into(),
-            transport: Transport::Unix,
             cap_files: vec!["/tmp/node.cap".into()],
             state_dir: "/tmp/state".into(),
             accept_from: Vec::new(),
@@ -13188,12 +13393,8 @@ mod tests {
             // Silent, and open, until the reader has given up on it.
             let _ = held.recv();
         });
-        let (conn, closer) = transport::connect(
-            &Transport::Unix,
-            &sock.to_string_lossy(),
-            Duration::from_secs(60),
-        )
-        .expect("connect");
+        let (conn, closer) =
+            transport::connect(&sock.to_string_lossy(), Duration::from_secs(60)).expect("connect");
         let sub = conn.subscribe(0, "/f/f/fleet/>").expect("subscribe");
         closer
             .set_read_timeout(None)
@@ -13540,7 +13741,7 @@ mod tests {
         assert_eq!(link_reason(&skew, "attach"), "protocol");
         assert_eq!(link_reason(&skew, "read"), "protocol");
         assert_eq!(
-            link_reason(&io::Error::new(K::Unsupported, "no sealed"), "attach"),
+            link_reason(&io::Error::new(K::Unsupported, "unsupported"), "attach"),
             "error"
         );
         assert_eq!(rtt_ms_of(Duration::from_micros(1)), 1);
@@ -14096,7 +14297,6 @@ mod tests {
             let bridge = Bridge::new(Config {
                 fleet: "f".to_string(),
                 broker,
-                transport: Transport::Unix,
                 cap_files: Vec::new(),
                 state_dir,
                 accept_from: Vec::new(),
@@ -14270,7 +14470,7 @@ mod tests {
     fn a_live_sequence_collision_reports_the_link_down_before_reconnect() {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
         let socket = lane.dir.path().join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
         let _server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         let (conn, _) = bridge.connect().unwrap();
@@ -14828,7 +15028,7 @@ mod tests {
     fn the_attach_relearns_its_own_in_flight_records_and_no_one_elses() {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
         let socket = lane.dir.path().join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
         let _server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         bridge.conn = Some(bridge.connect().unwrap().0.into());
@@ -14906,7 +15106,7 @@ mod tests {
     fn a_bridge_whose_aterm_is_gone_writes_nothing_and_never_redials() {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
         let socket = lane.dir.path().join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
         let _server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         let (mut reader, _) = bridge.connect().unwrap();
@@ -14947,7 +15147,7 @@ mod tests {
     ) -> (FakeVerbLane, Bridge, astream_broker::BrokerHandle) {
         let (lane, mut bridge) = FakeVerbLane::bridge(sessions);
         let socket = lane.dir.path().join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
         let server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         let (conn, _) = bridge.connect().unwrap();
@@ -15643,7 +15843,7 @@ mod tests {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
         let state = bridge.state.root().to_path_buf();
         let socket = lane.dir.path().join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
         let _server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         bridge.conn = Some(bridge.connect().unwrap().0.into());
@@ -15709,7 +15909,7 @@ mod tests {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
         let state = bridge.state.root().to_path_buf();
         let socket = lane.dir.path().join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
         let _server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         bridge.conn = Some(bridge.connect().unwrap().0.into());
@@ -15768,7 +15968,7 @@ mod tests {
             let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
             let state = bridge.state.root().to_path_buf();
             let socket = lane.dir.path().join("broker.sock");
-            let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+            let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
             let _server = broker.serve(&socket).unwrap();
             bridge.cfg.broker = socket.to_string_lossy().into_owned();
             bridge.conn = Some(bridge.connect().unwrap().0.into());
@@ -15824,7 +16024,7 @@ mod tests {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-host")]);
         let state = bridge.state.root().to_path_buf();
         let socket = lane.dir.path().join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
         let _server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         bridge.conn = Some(bridge.connect().unwrap().0.into());
@@ -16003,8 +16203,7 @@ mod tests {
             let (initial_lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-host")]);
             let state = bridge.state.root().to_path_buf();
             let socket = initial_lane.dir.path().join("broker.sock");
-            let broker =
-                astream_broker::Broker::open(initial_lane.dir.path().join("broker.log")).unwrap();
+            let broker = crate::test_broker(initial_lane.dir.path().join("broker.log")).unwrap();
             let _server = broker.serve(&socket).unwrap();
             bridge.cfg.broker = socket.to_string_lossy().into_owned();
             bridge.conn = Some(bridge.connect().unwrap().0.into());
@@ -16236,7 +16435,7 @@ mod tests {
         const SID: &str = "s-late";
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         let socket = lane.dir.path().join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
         let _server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         let (conn, _) = bridge.connect().unwrap();
@@ -16295,12 +16494,121 @@ mod tests {
         assert_eq!(lane.transcript().len(), want.len());
     }
 
+    /// **A LIVE RECORD DOES NOT CANCEL A BACKLOG STILL OWED**, at the engine: the
+    /// interleaving `fabric_world`'s broadcast test of this name meets by its
+    /// machine's timing, made here by hand. The say face has read past a `deep`
+    /// backlog of one round's pages and one record more before the session asks
+    /// for it from its first offset, so its cursor is BEHIND the drain position.
+    /// A live `deep` record handed over then delivers nothing and leaves the
+    /// cursor where it was, and so does a second one between rounds. Each roster
+    /// round walks at most [`SAY_REPLAY_PAGES`] pages, and the walk delivers
+    /// every record once, in offset order, the live ones last; caught up, the
+    /// session is a live recipient again. Counted in pages and rounds, not time.
+    ///
+    /// Negative control: without the frontier gate in [`Bridge::fan_in_say`]'s
+    /// recipient filter (`cursor.next >= frontier`), the first live record is
+    /// delivered at once and the cursor jumps to `live + 1`, past the whole
+    /// backlog, which the first assertions below refuse.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_record_does_not_cancel_a_backlog_still_owed() {
+        const SID: &str = "s-late";
+        // The catch-up's Fetch page ([`Bridge::catch_up_topic_page`]).
+        const PAGE: usize = 256;
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+        let socket = lane.dir.path().join("broker.sock");
+        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let _server = broker.serve(&socket).unwrap();
+        bridge.cfg.broker = socket.to_string_lossy().into_owned();
+        let (conn, _) = bridge.connect().unwrap();
+        bridge.conn = Some(conn.into());
+
+        let (mut god, _) = bridge.connect().unwrap();
+        let note = Body::new(0).encode();
+        let old = "/f/f/pub/n-x/s-old/say/deep";
+        let bodies = vec![note.as_slice(); SAY_REPLAY_PAGES * PAGE + 1];
+        let backlog: Vec<u64> = god
+            .publish_pipelined(1, old, &bodies, 64)
+            .unwrap()
+            .into_iter()
+            .map(|(off, deduped)| {
+                assert!(!deduped);
+                off
+            })
+            .collect();
+        // The face has read past all of it; the opt-in names its first record.
+        let drained = backlog[backlog.len() - 1] + 1;
+        bridge.say_drained_to = drained;
+        bridge.say_bus_head = drained;
+        bridge.per_sid.topics.insert(
+            SID.to_string(),
+            BTreeMap::from([("deep".to_string(), TopicCursor { next: backlog[0] })]),
+        );
+        let shout = "/f/f/pub/n-y/s-live/say/deep";
+        let delivered = |offs: &[u64]| -> Vec<String> {
+            offs.iter().map(|off| format!("deliver {off}")).collect()
+        };
+        // One roster round: the next interval's allowance, then the walk.
+        let round = |bridge: &mut Bridge| {
+            bridge.say_replay.refill_at = Instant::now();
+            bridge.replay_topics(true);
+        };
+
+        // THE LIVE SHOUT, on the log and handed over by the subscription, while
+        // the whole backlog is owed.
+        let (live, _) = god.publish(2, 1, shout, &note).unwrap();
+        bridge.on_say_record(&(live, shout.to_string(), note.clone()));
+        assert!(
+            lane.transcript().is_empty(),
+            "a behind cursor is no live recipient"
+        );
+        assert_eq!(
+            bridge.per_sid.topics[SID]["deep"].next, backlog[0],
+            "the live record moved a cursor that owes the backlog"
+        );
+        assert_eq!(bridge.say_drained_to, live + 1);
+
+        // ROUND ONE spends the allowance and still owes the backlog's last record.
+        round(&mut bridge);
+        let first = SAY_REPLAY_PAGES * PAGE;
+        assert_eq!(lane.transcript(), delivered(&backlog[..first]));
+        assert_eq!(
+            bridge.per_sid.topics[SID]["deep"].next,
+            backlog[first - 1] + 1
+        );
+
+        // A second shout between rounds is no live delivery either.
+        let (later, _) = god.publish(2, 2, shout, &note).unwrap();
+        bridge.on_say_record(&(later, shout.to_string(), note.clone()));
+        assert_eq!(lane.transcript().len(), first);
+        assert_eq!(
+            bridge.per_sid.topics[SID]["deep"].next,
+            backlog[first - 1] + 1
+        );
+
+        // ROUND TWO: the rest of the backlog, then both shouts, in offset order.
+        round(&mut bridge);
+        let mut want = backlog.clone();
+        want.extend([live, later]);
+        assert_eq!(lane.transcript(), delivered(&want));
+        assert_eq!(bridge.per_sid.topics[SID]["deep"].next, later + 1);
+        assert_eq!(bridge.state.topics(SID), bridge.per_sid.topics[SID]);
+
+        // Caught up, the session is at the frontier: the next shout is live.
+        let (next, _) = god.publish(2, 3, shout, &note).unwrap();
+        bridge.on_say_record(&(next, shout.to_string(), note.clone()));
+        want.push(next);
+        assert_eq!(lane.transcript(), delivered(&want));
+        assert_eq!(bridge.per_sid.topics[SID]["deep"].next, next + 1);
+    }
+
     /// **A NODE SPEAKS FOR ITS OWN SESSIONS, AND A STRAY REPLY IS NO REPLY.**
     /// Another node's ring lets it publish onto every lane, as itself: its claim
     /// to speak for a session THIS node hosts, or one pinned to a third node, is
     /// attributed to the node, and its `answer`/`report` naming an ask that went
     /// elsewhere arrives demoted, like a stray `ack` — so neither a supervisor's
-    /// report fold nor `drive task --wait` can take it for the worker's word.
+    /// report fold nor a wait on the ask's answer can take it for the worker's
+    /// word.
     /// Another node's `expired` is demoted too: only the asker's own bridge
     /// records one. The recipient's own reply, and a node's claim to its own
     /// session, are unchanged.
@@ -16419,7 +16727,7 @@ mod tests {
         // detector, not a budget.
         let give_up = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let broker = loop {
-            match astream_broker::Broker::open(&path) {
+            match crate::test_broker(&path) {
                 Ok(broker) => break broker,
                 Err(e)
                     if e.kind() == std::io::ErrorKind::AlreadyExists
@@ -16798,7 +17106,7 @@ mod tests {
         const SID: &str = "s-host";
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         let socket = lane.dir.path().join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
         let _server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         let (conn, _) = bridge.connect().unwrap();
@@ -16920,7 +17228,7 @@ mod tests {
         const SID: &str = "s-host";
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         let socket = lane.dir.path().join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
         let _server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         let owed = OwedReceipt {
@@ -17045,10 +17353,13 @@ mod tests {
         };
         let (_lane, mut bridge) = FakeVerbLane::bridge(&[]);
         bridge.conn = Some(scripted(13).into());
+        let seen = bridge.advertisers("s-x").unwrap();
         assert_eq!(
-            bridge.advertisers("s-x").unwrap(),
+            seen.live,
             BTreeSet::from(["n-a".to_string(), "n-c".to_string()])
         );
+        // And the withdrawal the stretch carried is the other half, kept.
+        assert_eq!(seen.exited, BTreeSet::from(["n-b".to_string()]));
         bridge.conn = Some(scripted(12).into());
         assert!(
             bridge.advertisers("s-x").is_err(),
@@ -17167,7 +17478,7 @@ mod tests {
                 assert!(bridge.conn.is_none());
             } else {
                 assert_eq!(
-                    answer.unwrap(),
+                    answer.unwrap().live,
                     BTreeSet::from(["n-a".into(), "n-c".into()])
                 );
             }
@@ -17310,7 +17621,7 @@ mod tests {
         const SID: &str = "s-near";
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         let socket = lane.dir.path().join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
         let _server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         let reads = Arc::new(ReadCounts::default());
@@ -17580,11 +17891,10 @@ mod tests {
         assert!(bridge.conn.is_some(), "and nothing of the bridge's link");
     }
 
-    /// The presence view under a GUARDED broker, reached over `wire` at the
-    /// endpoint `serve` answers: see the two tests that call it.
+    /// The presence view under a GUARDED broker, reached at the endpoint
+    /// `serve` answers: see the test that calls it.
     #[cfg(unix)]
     fn presence_view_under_the_guard(
-        wire: &Transport,
         serve: impl FnOnce(
             &astream_broker::Broker,
             &std::path::Path,
@@ -17600,7 +17910,6 @@ mod tests {
         )
         .unwrap();
         let (_server, endpoint) = serve(&broker, lane.dir.path());
-        bridge.cfg.transport = wire.clone();
         bridge.cfg.broker = endpoint.clone();
         // A NODE'S OWN RING, as `fabric on` and `mint-for` mint it — less any
         // grant `keep` drops.
@@ -17620,7 +17929,7 @@ mod tests {
         bridge.caps = ring(&bridge.node, &|_| true);
         bridge.conn = Some(bridge.connect().expect("the publisher attaches").0.into());
         // The far node advertises its session, under its own ring.
-        let (mut far, _) = transport::connect(wire, &endpoint, ACK_DEADLINE).unwrap();
+        let (mut far, _) = transport::connect(&endpoint, ACK_DEADLINE).unwrap();
         transport::attach_ring(&mut far, &ring(FAR, &|_| true)).unwrap();
         let subject = format!("/f/f/pub/{FAR}/s-far/presence");
         let off = far
@@ -17686,26 +17995,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_presence_view_goes_live_under_a_nodes_ring_on_a_guarded_broker() {
-        presence_view_under_the_guard(&Transport::Unix, |broker, dir| {
+        presence_view_under_the_guard(|broker, dir| {
             let socket = dir.join("g.sock");
             let server = broker.serve(&socket).expect("serve");
             (server, socket.to_string_lossy().into_owned())
-        });
-    }
-
-    /// [`the_presence_view_goes_live_under_a_nodes_ring_on_a_guarded_broker`],
-    /// over the SEALED wire a cross-host fleet uses (`--tcp --key-file`): the
-    /// view dials with the bridge's own transport and key.
-    #[cfg(all(unix, feature = "sealed"))]
-    #[test]
-    fn the_presence_view_goes_live_under_a_nodes_ring_over_the_sealed_wire() {
-        let key = [0x3c_u8; 32];
-        presence_view_under_the_guard(&Transport::Sealed(Box::new(key)), |broker, _| {
-            let server = broker
-                .serve_tcp_sealed("127.0.0.1:0", key)
-                .expect("serve sealed");
-            let endpoint = server.tcp_addr().expect("a TCP address").to_string();
-            (server, endpoint)
         });
     }
 
@@ -17744,7 +18037,7 @@ mod tests {
 
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-near")]);
         let socket = lane.dir.path().join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
         // This owner closes the broker's sockets during unwind as well.
         let _server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
@@ -17812,7 +18105,7 @@ mod tests {
         const SID: &str = "s-host";
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         let socket = lane.dir.path().join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
         let _server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         let (conn, _) = bridge.connect().unwrap();
@@ -17850,7 +18143,7 @@ mod tests {
         const SID: &str = "s-optout";
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         let socket = lane.dir.path().join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
         let _server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         bridge.conn = Some(bridge.connect().unwrap().0.into());
@@ -17919,7 +18212,7 @@ mod tests {
         const OTHER: &str = "s-other";
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, HELD), (2, OTHER)]);
         let socket = lane.dir.path().join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
         let _server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         let (conn, _) = bridge.connect().unwrap();
@@ -18018,7 +18311,7 @@ mod tests {
         for unattributed in [None, Some(10)] {
             let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, FIRST), (2, SECOND), (3, HEALTHY)]);
             let socket = lane.dir.path().join("broker.sock");
-            let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+            let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
             let _server = broker.serve(&socket).unwrap();
             bridge.cfg.broker = socket.to_string_lossy().into_owned();
             bridge.conn = Some(bridge.connect().unwrap().0.into());
@@ -18548,7 +18841,7 @@ mod tests {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
         let state = bridge.state.root().to_path_buf();
         let socket = lane.dir.path().join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
         let _server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         bridge.conn = Some(bridge.connect().unwrap().0.into());
@@ -18596,267 +18889,9 @@ mod tests {
         name: &str,
     ) -> (String, astream_broker::Broker, astream_broker::BrokerHandle) {
         let socket = lane.dir.path().join(format!("{name}.sock"));
-        let broker =
-            astream_broker::Broker::open(lane.dir.path().join(format!("{name}.log"))).unwrap();
+        let broker = crate::test_broker(lane.dir.path().join(format!("{name}.log"))).unwrap();
         let server = broker.serve(&socket).unwrap();
         (socket.to_string_lossy().into_owned(), broker, server)
-    }
-
-    /// A TCP relay in front of `upstream` that can FREEZE: from then on it
-    /// forwards nothing either way and closes nothing, which is what a peer
-    /// that lost power or its network path looks like from the broker — no
-    /// byte, no FIN, no RST. Answers the relay's address and the switch.
-    struct RelayGuard {
-        stop: Arc<std::sync::atomic::AtomicBool>,
-        active: Arc<(
-            std::sync::Mutex<Vec<Arc<std::net::TcpStream>>>,
-            std::sync::Condvar,
-        )>,
-        worker: Option<std::thread::JoinHandle<()>>,
-    }
-
-    impl Drop for RelayGuard {
-        fn drop(&mut self) {
-            use std::sync::atomic::Ordering;
-            // Admission and cancellation share this lock: a just-accepted
-            // connection is either shut down here or refused by the worker.
-            let (active, changed) = &*self.active;
-            let active = active.lock().unwrap_or_else(|e| e.into_inner());
-            self.stop.store(true, Ordering::SeqCst);
-            for stream in active.iter() {
-                let _ = stream.shutdown(std::net::Shutdown::Write);
-                let _ = stream.shutdown(std::net::Shutdown::Read);
-            }
-            changed.notify_one();
-            drop(active);
-            if let Some(worker) = self.worker.take() {
-                if let Err(panic) = worker.join() {
-                    if !std::thread::panicking() {
-                        std::panic::resume_unwind(panic);
-                    }
-                }
-            }
-        }
-    }
-
-    fn freezable_relay(upstream: &str) -> (String, Arc<std::sync::atomic::AtomicBool>, RelayGuard) {
-        use std::io::{Read, Write};
-        use std::net::{TcpListener, TcpStream};
-        use std::sync::atomic::{AtomicBool, Ordering};
-        fn pump(mut from: &TcpStream, mut to: &TcpStream, frozen: &AtomicBool, stop: &AtomicBool) {
-            let _ = from.set_read_timeout(Some(Duration::from_millis(20)));
-            let mut buf = [0u8; 8192];
-            while !stop.load(Ordering::SeqCst) {
-                if frozen.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(20));
-                    continue;
-                }
-                match from.read(&mut buf) {
-                    Ok(0) => return,
-                    Ok(n) => {
-                        if to.write_all(&buf[..n]).is_err() {
-                            return;
-                        }
-                    }
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                        ) => {}
-                    Err(_) => return,
-                }
-            }
-        }
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the relay");
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking relay accept");
-        let addr = listener.local_addr().expect("the relay's address");
-        let frozen = Arc::new(AtomicBool::new(false));
-        let stop = Arc::new(AtomicBool::new(false));
-        let active = Arc::new((std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new()));
-        let (switch, upstream) = (
-            frozen.clone(),
-            upstream.parse().expect("the upstream address"),
-        );
-        let (cancelled, connections) = (stop.clone(), active.clone());
-        let worker = std::thread::spawn(move || {
-            let mut pumps = Vec::new();
-            loop {
-                let (active, changed) = &*connections;
-                let mut registered = active.lock().unwrap();
-                let client = loop {
-                    if cancelled.load(Ordering::SeqCst) {
-                        break None;
-                    }
-                    match listener.accept() {
-                        Ok((client, _)) => {
-                            client
-                                .set_nonblocking(false)
-                                .expect("blocking relay stream");
-                            break Some(client);
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            // Cancellation cannot need a new wake socket when
-                            // descriptor exhaustion is what unwound the case.
-                            (registered, _) = changed
-                                .wait_timeout(registered, Duration::from_millis(20))
-                                .unwrap_or_else(|e| e.into_inner());
-                        }
-                        Err(_) => break None,
-                    }
-                };
-                drop(registered);
-                let Some(client) = client else { break };
-                let Ok(broker) =
-                    TcpStream::connect_timeout(&upstream, aterm_spec::wait::MUST_HAPPEN)
-                else {
-                    break;
-                };
-                let (client, broker) = (Arc::new(client), Arc::new(broker));
-                let mut registered = active.lock().unwrap();
-                if cancelled.load(Ordering::SeqCst) {
-                    break;
-                }
-                registered.extend([client.clone(), broker.clone()]);
-                drop(registered);
-                let (c2, b2) = (client.clone(), broker.clone());
-                let (up, down) = (switch.clone(), switch.clone());
-                let (up_stop, down_stop) = (cancelled.clone(), cancelled.clone());
-                pumps.push(std::thread::spawn(move || {
-                    pump(&client, &broker, &up, &up_stop)
-                }));
-                pumps.push(std::thread::spawn(move || {
-                    pump(&b2, &c2, &down, &down_stop)
-                }));
-            }
-            let mut failed = None;
-            for pump in pumps {
-                if let Err(panic) = pump.join() {
-                    failed.get_or_insert(panic);
-                }
-            }
-            if let Some(panic) = failed {
-                std::panic::resume_unwind(panic);
-            }
-        });
-        (
-            addr.to_string(),
-            frozen,
-            RelayGuard {
-                stop,
-                active,
-                worker: Some(worker),
-            },
-        )
-    }
-
-    /// Dropping a frozen test relay closes its listener and both sides of
-    /// every parked connection; its worker threads must own no socket later.
-    #[test]
-    fn a_frozen_relay_drop_closes_its_listener_and_active_connections() {
-        use std::io::Read;
-        use std::net::{TcpListener, TcpStream};
-        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
-        upstream.set_nonblocking(true).unwrap();
-        let (addr, frozen, relay) = freezable_relay(&upstream.local_addr().unwrap().to_string());
-        let endpoint = addr.parse().unwrap();
-        let mut client =
-            TcpStream::connect_timeout(&endpoint, aterm_spec::wait::MUST_HAPPEN).unwrap();
-        let mut peer = aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "the relay to connect its upstream",
-            || match upstream.accept() {
-                Ok((peer, _)) => Some(peer),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => None,
-                Err(e) => panic!("the relay upstream failed: {e}"),
-            },
-        );
-        frozen.store(true, std::sync::atomic::Ordering::SeqCst);
-        drop(relay);
-        assert!(
-            TcpStream::connect_timeout(&endpoint, aterm_spec::wait::MUST_HAPPEN).is_err(),
-            "the relay listener outlived its fixture"
-        );
-        for stream in [&mut client, &mut peer] {
-            stream
-                .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
-                .unwrap();
-            let mut byte = [0];
-            match stream.read(&mut byte) {
-                Ok(0) => {}
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::ConnectionReset | io::ErrorKind::NotConnected
-                    ) => {}
-                answer => panic!("the dropped relay kept a connection alive: {answer:?}"),
-            }
-        }
-    }
-
-    /// **A BRIDGE THAT VANISHES WITHOUT A FIN IS TOLD DEAD BY ITS WILL** (r2-10).
-    /// A bridge attached over TCP keeps its will's connection alive; the path
-    /// then freezes — no byte, no FIN, as a host that lost power leaves it —
-    /// and the broker, holding that connection to its keepalive deadline, ends
-    /// it and fires the will: the node's row reads `state=gone`. The wait is
-    /// the one-minute hang detector, not a latency bound. Negative control: on
-    /// the bridge that sent no keepalive the broker never holds the connection
-    /// to a deadline, the row stays `state=live`, and the detector fails.
-    #[cfg(unix)]
-    #[test]
-    fn a_tcp_bridge_that_goes_silent_without_a_fin_is_marked_gone_by_its_will() {
-        let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
-        let broker = astream_broker::Broker::open(lane.dir.path().join("tcp.log")).unwrap();
-        broker.set_keepalive_deadline(Duration::from_millis(300));
-        let tcp = broker.serve_tcp("127.0.0.1:0").unwrap();
-        let local = lane.dir.path().join("tcp.sock");
-        let _unix = broker.serve(&local).unwrap();
-        let (relay, frozen, _relay) = freezable_relay(tcp.tcp_addr().expect("a TCP address"));
-        bridge.cfg.transport = Transport::Tcp;
-        bridge.cfg.broker = relay;
-        assert!(bridge.attach_broker(), "attached through the relay");
-
-        let presence = subject::node_face("f", &bridge.node, "presence");
-        let (mut reader, _) =
-            transport::connect(&Transport::Unix, &local.to_string_lossy(), ACK_DEADLINE).unwrap();
-        let mut row = || {
-            let (rows, _) = reader.last(&presence, "", 8).unwrap();
-            rows.iter()
-                .find(|(_, s, _)| *s == presence)
-                .map(|(_, _, b)| String::from_utf8_lossy(b).into_owned())
-                .unwrap_or_default()
-        };
-        let state = |row: &str| crate::fabric::kv(row, "state").map(str::to_string);
-        // WHAT THE NODE RUNS is on its row (r2-05): the protocol it speaks and
-        // its release, which a host that did not change reads off this row.
-        let proto = format!(" proto={} aterm=", astream_broker::proto::PROTO_VERSION);
-        let live = row();
-        assert_eq!(state(&live).as_deref(), Some("live"));
-        assert!(live.contains(&proto), "{live}");
-
-        // The will's connection says it is alive — at once, here, rather than
-        // after a keepalive interval of silence.
-        bridge.keepalive_every = Duration::ZERO;
-        bridge.keep_alive();
-        assert!(
-            bridge.conn.is_some(),
-            "an answered keepalive keeps the link"
-        );
-
-        // THE PATH GOES SILENT, and the bridge with it.
-        frozen.store(true, std::sync::atomic::Ordering::SeqCst);
-        let gone = aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "the broker to fire the silent bridge's will",
-            || {
-                let now = row();
-                (state(&now).as_deref() == Some("gone")).then_some(now)
-            },
-        );
-        // And the will says it too: the row a reader sees once the node is gone.
-        assert!(gone.contains(&proto), "{gone}");
-        drop(tcp);
     }
 
     /// The `ev` records on the node's own face, as their bodies read.
@@ -19822,9 +19857,7 @@ mod tests {
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         let node = bridge.node.clone();
         let acks_of = |sock: &std::path::Path| -> Vec<String> {
-            let (mut c, _) =
-                transport::connect(&Transport::Unix, &sock.to_string_lossy(), ACK_DEADLINE)
-                    .unwrap();
+            let (mut c, _) = transport::connect(&sock.to_string_lossy(), ACK_DEADLINE).unwrap();
             let (rows, _) = c
                 .fetch(0, &subject::node_face("f", &node, "ack"), 64)
                 .unwrap();
@@ -20154,9 +20187,7 @@ mod tests {
         let group = subject::inbox_group("f", &bridge.node);
         let filter = subject::inbox_filter("f", &bridge.node);
         let group_offers = |what: &str, n: usize| -> Vec<u64> {
-            let (client, _) =
-                transport::connect(&Transport::Unix, &socket, aterm_spec::wait::MUST_HAPPEN)
-                    .unwrap();
+            let (client, _) = transport::connect(&socket, aterm_spec::wait::MUST_HAPPEN).unwrap();
             let mut sub = client.subscribe_group(&group, &filter).unwrap();
             (0..n).map(|_| next_delivery(&mut sub, what).0).collect()
         };
@@ -20288,8 +20319,7 @@ mod tests {
             [accepted.0],
             "still no endpoint ack"
         );
-        let (client, _) =
-            transport::connect(&Transport::Unix, &socket, aterm_spec::wait::MUST_HAPPEN).unwrap();
+        let (client, _) = transport::connect(&socket, aterm_spec::wait::MUST_HAPPEN).unwrap();
         let group = subject::inbox_group("f", &bridge.node);
         let filter = subject::inbox_filter("f", &bridge.node);
         let mut sub = client.subscribe_group(&group, &filter).unwrap();
@@ -20421,8 +20451,7 @@ mod tests {
     /// a record past the one it expects first, so one is always there.
     #[cfg(unix)]
     fn first_offered(socket: &str, node: &str, what: &str) -> u64 {
-        let (client, _) =
-            transport::connect(&Transport::Unix, socket, aterm_spec::wait::MUST_HAPPEN).unwrap();
+        let (client, _) = transport::connect(socket, aterm_spec::wait::MUST_HAPPEN).unwrap();
         let group = subject::inbox_group("f", node);
         let filter = subject::inbox_filter("f", node);
         let mut sub = client.subscribe_group(&group, &filter).unwrap();
@@ -20709,8 +20738,7 @@ mod tests {
             let _server = reopened.broker.serve(&socket).unwrap();
             // NEW MAIL lands at the reused offsets, past the old high-water.
             let (mut other, _) =
-                transport::connect(&Transport::Unix, &socket.to_string_lossy(), ACK_DEADLINE)
-                    .unwrap();
+                transport::connect(&socket.to_string_lossy(), ACK_DEADLINE).unwrap();
             let mut new_mail = Vec::new();
             let mut seq = 1;
             while reopened.broker.head() <= high {
@@ -20753,51 +20781,6 @@ mod tests {
             next.close_subscriptions();
             drop(next_lane);
         }
-    }
-
-    /// **A KEEPALIVE IS NOT HELD BACK BY AN ACK LEFT OWED FOR A WHOLE
-    /// INTERVAL.** On a TCP bridge, a pipelined `ev` is left owed in the round.
-    /// While it is younger than the interval the connection is not idle: no
-    /// keepalive, and the ack is not read just to ask. Once it is as old as
-    /// the interval — a stretch of items that publish nothing, which leaves
-    /// the loop no reason to read it — the ack is read and the keepalive goes,
-    /// so the broker does not reap a live bridge's will connection.
-    #[cfg(unix)]
-    #[test]
-    fn a_keepalive_is_not_held_back_by_an_ack_left_owed_for_a_whole_interval() {
-        let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
-        let broker = astream_broker::Broker::open(lane.dir.path().join("ka.log")).unwrap();
-        let tcp = broker.serve_tcp("127.0.0.1:0").unwrap();
-        bridge.cfg.transport = Transport::Tcp;
-        bridge.cfg.broker = tcp.tcp_addr().expect("a TCP address").to_string();
-        bridge.conn = Some(bridge.connect().unwrap().0.into());
-        let owed = |bridge: &Bridge| bridge.conn.as_ref().map(Link::unacked);
-
-        bridge.in_round = true;
-        bridge.publish_ev("probe");
-        assert_eq!(owed(&bridge), Some(1), "its ack is owed");
-        bridge.keepalive_every = Duration::from_secs(3600);
-        assert!(
-            !bridge.keep_alive(),
-            "a connection that just sent is not idle"
-        );
-        assert_eq!(
-            owed(&bridge),
-            Some(1),
-            "and its ack is not read just to ask"
-        );
-        bridge.keepalive_every = Duration::ZERO;
-        assert!(
-            bridge.keep_alive(),
-            "silent for the interval: the keepalive goes"
-        );
-        assert_eq!(owed(&bridge), Some(0), "the ack was read first");
-        assert!(
-            bridge.conn.is_some(),
-            "an answered keepalive keeps the link"
-        );
-        bridge.in_round = false;
-        drop(tcp);
     }
 
     /// **A REFUSED LIVE RECORD'S NOTICE CARRIES ITS GROUP COMMIT: ONE RECORD,
@@ -20844,8 +20827,7 @@ mod tests {
         let (sentinel, _) = w
             .publish(94, 1, &face, b"v=1 t=2 from=s-peer text=s")
             .unwrap();
-        let (client, _) =
-            transport::connect(&Transport::Unix, &socket, aterm_spec::wait::MUST_HAPPEN).unwrap();
+        let (client, _) = transport::connect(&socket, aterm_spec::wait::MUST_HAPPEN).unwrap();
         let mut sub = client.subscribe_group(&group, &filter).unwrap();
         assert_eq!(
             next_delivery(&mut sub, "the cursor after the notice").0,
@@ -21153,7 +21135,12 @@ mod tests {
     fn a_senders_post_refused_mid_burst_holds_its_later_posts_and_no_one_elses() {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b"), (3, "s-r")]);
         assert!(bridge.refresh_sessions().is_ok());
-        let (socket, broker, _server) = serve_log(&lane, "refused");
+        // Strict, not `test_broker`'s tier: the fault fails a batch's `fsync`,
+        // which only Strict issues for every batch.
+        let socket = lane.dir.path().join("refused.sock");
+        let broker = astream_broker::Broker::open(lane.dir.path().join("refused.log")).unwrap();
+        let _server = broker.serve(&socket).unwrap();
+        let socket = socket.to_string_lossy().into_owned();
         let broker = Arc::new(broker);
         bridge.cfg.broker = socket;
         bridge.conn = Some(bridge.connect().unwrap().0.into());
@@ -22724,7 +22711,7 @@ mod tests {
         const SID: &str = "s-live-refill";
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         let socket = lane.dir.path().join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
         let _server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
 
@@ -23458,6 +23445,306 @@ mod tests {
         }
     }
 
+    /// A bridge on a real broker with `sessions` hosted and advertised `live`,
+    /// its push lane attached, a reader of the bus, and the broker's handle
+    /// (it serves while the test holds it).
+    #[cfg(unix)]
+    fn advertising(
+        sessions: &[(u64, &str)],
+    ) -> (
+        FakeVerbLane,
+        Bridge,
+        FakePushLane,
+        Conn,
+        astream_broker::BrokerHandle,
+    ) {
+        let (lane, mut bridge) = FakeVerbLane::bridge(sessions);
+        let socket = lane.dir.path().join("broker.sock");
+        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let server = broker.serve(&socket).unwrap();
+        bridge.cfg.broker = socket.to_string_lossy().into_owned();
+        let (conn, _) = bridge.connect().unwrap();
+        bridge.conn = Some(conn.into());
+        let push = FakePushLane::attach(&bridge);
+        bridge.refresh_sessions().unwrap();
+        bridge.admit_fresh_sessions();
+        let (reader, _) = bridge.connect().unwrap();
+        (lane, bridge, push, reader, server)
+    }
+
+    /// Every `state=` a session's presence face has carried, oldest first.
+    #[cfg(unix)]
+    fn presence_states(bridge: &Bridge, reader: &mut Conn, sid: &str) -> Vec<String> {
+        let face = subject::session_face("f", &bridge.node, sid, "presence");
+        let (rows, _) = reader.fetch(0, &face, 256).unwrap();
+        rows.iter()
+            .filter(|(_, s, _)| *s == face)
+            .filter_map(|(_, _, raw)| Body::decode(raw).0.unknown.get("state").cloned())
+            .collect()
+    }
+
+    /// Every `ev` the node's own face carries, decoded.
+    #[cfg(unix)]
+    fn node_ev_words(bridge: &Bridge, reader: &mut Conn) -> Vec<String> {
+        let face = subject::node_face("f", &bridge.node, "ev");
+        let (rows, _) = reader.fetch(0, &face, 256).unwrap();
+        rows.iter()
+            .filter(|(_, s, _)| *s == face)
+            .filter_map(|(_, _, raw)| {
+                let ev = Body::decode(raw).0.unknown.get("ev")?.clone();
+                Some(crate::pct::decode(&ev))
+            })
+            .collect()
+    }
+
+    /// **`bye handoff` WITHDRAWS NOTHING; `bye quit` WITHDRAWS EVERY SESSION,
+    /// ONCE, AND NOTHING ADVERTISES ONE AGAIN** (design §6). Each word is
+    /// acknowledged on the verb lane before anything else — that ack is all
+    /// a quitting instance waits for — and leaves its `ev`. After the quit,
+    /// every path that writes a row in an ordinary life writes nothing: a
+    /// re-attach (which advertises every hosted session `live`), a session
+    /// born since (its admission does), the push lane's `session-exited` for
+    /// a withdrawn sid (its `exited` row), an agent push and a roster round.
+    /// A session with seconds to live is never put back on the roster, and
+    /// the lanes closing withdraws only the one born since, once.
+    #[cfg(unix)]
+    #[test]
+    fn a_quit_withdraws_every_session_once_and_a_handoff_withdraws_none() {
+        const A: &str = "s-a";
+        const B: &str = "s-b";
+        const C: &str = "s-c";
+        let (lane, mut bridge, mut push, mut reader, _server) = advertising(&[(1, A), (2, B)]);
+        for sid in [A, B] {
+            assert_eq!(presence_states(&bridge, &mut reader, sid), ["live"]);
+        }
+
+        push.deliver(&mut bridge, &["EVENT * bye handoff"]);
+        assert!(lane
+            .links
+            .lock()
+            .unwrap()
+            .contains(&"link bye handoff".to_string()));
+        for sid in [A, B] {
+            assert_eq!(
+                presence_states(&bridge, &mut reader, sid),
+                ["live"],
+                "a handoff's successor re-attaches {sid}: nothing is withdrawn"
+            );
+        }
+        assert!(node_ev_words(&bridge, &mut reader).contains(&"bye reason=handoff".to_string()));
+
+        // A HANDOFF THAT ROLLED BACK, THEN A QUIT: the quit is the last word.
+        push.deliver(&mut bridge, &["EVENT * bye quit"]);
+        assert!(lane
+            .links
+            .lock()
+            .unwrap()
+            .contains(&"link bye quit".to_string()));
+        for sid in [A, B] {
+            assert_eq!(
+                presence_states(&bridge, &mut reader, sid),
+                ["live", "exited"]
+            );
+        }
+        push.deliver(&mut bridge, &["EVENT 1 agent busy rev=2 gen=0.1 fp=0"]);
+        bridge.roster_backstop();
+        assert!(bridge.attach_broker(), "the re-attach");
+        lane.sessions.lock().unwrap().push((3, C.to_string()));
+        bridge.refresh_sessions().unwrap();
+        bridge.admit_fresh_sessions();
+        lane.sessions.lock().unwrap().retain(|(_, sid)| sid != A);
+        push.deliver(&mut bridge, &[&format!("EVENT * session-exited {A}")]);
+        for sid in [A, B] {
+            assert_eq!(
+                presence_states(&bridge, &mut reader, sid),
+                ["live", "exited"],
+                "{sid} was advertised again, or withdrawn twice, after the quit"
+            );
+        }
+        assert_eq!(
+            presence_states(&bridge, &mut reader, C),
+            Vec::<String>::new(),
+            "a session born after the quit was advertised"
+        );
+        let quits = |bridge: &Bridge, reader: &mut Conn| -> Vec<String> {
+            node_ev_words(bridge, reader)
+                .into_iter()
+                .filter(|e| e.starts_with("bye reason=quit"))
+                .collect()
+        };
+        assert_eq!(quits(&bridge, &mut reader), ["bye reason=quit withdrawn=2"]);
+
+        bridge.on_aterm_closed();
+        assert_eq!(presence_states(&bridge, &mut reader, C), ["exited"]);
+        for sid in [A, B] {
+            assert_eq!(
+                presence_states(&bridge, &mut reader, sid),
+                ["live", "exited"]
+            );
+        }
+        assert_eq!(
+            quits(&bridge, &mut reader),
+            ["bye reason=quit withdrawn=2", "bye reason=quit withdrawn=3"],
+            "the lanes closing withdraws the session born since, and says the new count"
+        );
+    }
+
+    /// **A ROW THE BROKER REFUSES STOPS ONLY ITSELF.** On a guarded broker
+    /// whose grants do not cover one session's face, that session's `exited`
+    /// is refused over a link that stays up: it stays owed, and the walk goes
+    /// on — the session after it is withdrawn, and the `ev` says the count of
+    /// the rows that landed. A walk that stopped at the refusal left every
+    /// later session `live` and wrote no `ev`.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_withdrawal_row_stops_only_itself() {
+        const A: &str = "s-a";
+        const B: &str = "s-b";
+        const C: &str = "s-c";
+        let secret = [7u8; 32];
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, A), (2, B), (3, C)]);
+        let socket = lane.dir.path().join("broker.sock");
+        let broker = astream_broker::Broker::open_guarded(
+            lane.dir.path().join("broker.log"),
+            secret.to_vec(),
+        )
+        .unwrap();
+        let _server = broker.serve(&socket).unwrap();
+        bridge.cfg.broker = socket.to_string_lossy().into_owned();
+        let node = bridge.node.clone();
+        bridge.caps = [
+            format!("rw,p={node}:/f/f/pub/{node}/node/>"),
+            format!("rw,p={node}:/f/f/pub/{node}/{A}/>"),
+            format!("rw,p={node}:/f/f/pub/{node}/{C}/>"),
+            "ro:/f/f/pub/>".to_string(),
+            format!("ro:/f/f/in/{node}/>"),
+        ]
+        .iter()
+        .map(|grant| {
+            let cap = astream_cap::mint(&secret, grant).unwrap();
+            Cap {
+                grant: cap.filter,
+                tag: cap.tag,
+            }
+        })
+        .collect();
+        let (conn, _) = bridge.connect().unwrap();
+        bridge.conn = Some(conn.into());
+        let mut push = FakePushLane::attach(&bridge);
+        bridge.refresh_sessions().unwrap();
+        bridge.admit_fresh_sessions();
+        let (mut reader, _) = bridge.connect().unwrap();
+        for (sid, rows) in [(A, &["live"][..]), (B, &[]), (C, &["live"])] {
+            assert_eq!(presence_states(&bridge, &mut reader, sid), rows, "{sid}");
+        }
+
+        push.deliver(&mut bridge, &["EVENT * bye quit"]);
+        assert!(bridge.conn.is_some(), "a refusal keeps the link");
+        for (sid, rows) in [
+            (A, &["live", "exited"][..]),
+            (B, &[]),
+            (C, &["live", "exited"]),
+        ] {
+            assert_eq!(presence_states(&bridge, &mut reader, sid), rows, "{sid}");
+        }
+        let evs = node_ev_words(&bridge, &mut reader);
+        assert_eq!(
+            evs.iter()
+                .filter(|e| e.starts_with("bye reason=quit"))
+                .collect::<Vec<_>>(),
+            ["bye reason=quit withdrawn=2"],
+            "{evs:#?}"
+        );
+    }
+
+    /// **A QUIT THE LOOP NEVER TOOK IS STILL WITHDRAWN WHEN THE LANES CLOSE**,
+    /// and no word at all withdraws nothing. aterm writes `bye quit` and
+    /// closes the lanes; the loop takes the closure ahead of every event, so
+    /// the word is read off the reader's latch, not the queue.
+    ///
+    /// NEGATIVE CONTROL first: a closure with no word — a crash, a `kill -9`
+    /// — publishes no row, and the node's will reads `away`.
+    #[cfg(unix)]
+    #[test]
+    fn a_quit_the_loop_never_took_is_withdrawn_when_the_lanes_close() {
+        const A: &str = "s-a";
+        let (_lane, mut bridge, mut push, mut reader, _server) = advertising(&[(1, A)]);
+        bridge.on_aterm_closed();
+        assert_eq!(presence_states(&bridge, &mut reader, A), ["live"]);
+
+        push.write(&["EVENT * bye quit"]);
+        drop(push);
+        // A hang detector: the reader latches the word before it pushes the
+        // closure, and the closure is what this waits for.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match bridge.mailbox.take(Duration::from_millis(50)) {
+                Some(Item::Closed(Source::Aterm)) => break,
+                Some(_) => {}
+                None => assert!(Instant::now() < deadline, "the lane never closed"),
+            }
+        }
+        assert_eq!(bridge.mailbox.bye(), Some(Bye::Quit));
+        bridge.on_aterm_closed();
+        assert_eq!(presence_states(&bridge, &mut reader, A), ["live", "exited"]);
+    }
+
+    /// **ONLY A WITHDRAWN ADDRESS IS REFUSED.** A sid whose only row says
+    /// `exited` is unroutable whether it is pinned from an earlier post or
+    /// named with its node — the pin outlived the session, and routing on it
+    /// put the post on a lane nobody fetches. A row still `live` under a node
+    /// whose will fired routes: that post queues on the bus for the node.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_withdrawn_address_is_refused_and_an_away_one_routes() {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
+        let socket = lane.dir.path().join("broker.sock");
+        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let _server = broker.serve(&socket).unwrap();
+        bridge.cfg.broker = socket.to_string_lossy().into_owned();
+        let (conn, _) = bridge.connect().unwrap();
+        bridge.conn = Some(conn.into());
+        let (mut peer, _) = bridge.connect().unwrap();
+        let mut seq = 0;
+        let mut row = |subject: &str, body: &str| {
+            seq += 1;
+            peer.publish(9_000, seq, subject, body.as_bytes()).unwrap();
+        };
+        row("/f/f/pub/n-far/node/presence", "v=1 t=1 state=away inc=3");
+        row("/f/f/pub/n-far/s-away/presence", "v=1 t=1 inc=3 state=live");
+        row("/f/f/pub/n-far/s-quit/presence", "v=1 t=1 inc=3 state=live");
+        // A FIRST POST pins both while they are live.
+        for sid in ["s-away", "s-quit"] {
+            assert_eq!(
+                bridge.resolve_to(&format!("@{sid}"), Some("s-me")).unwrap(),
+                Route::To(format!("/f/f/in/n-far/{sid}/{}", bridge.node))
+            );
+        }
+        row(
+            "/f/f/pub/n-far/s-quit/presence",
+            "v=1 t=2 inc=3 state=exited",
+        );
+        assert_eq!(
+            bridge.resolve_to("@s-away", Some("s-me")).unwrap(),
+            Route::To(format!("/f/f/in/n-far/s-away/{}", bridge.node)),
+            "an away node's session still routes: its mail queues for the node"
+        );
+        assert_eq!(
+            bridge.resolve_to("@s-quit", Some("s-me")).unwrap(),
+            Route::Unroutable,
+            "a pinned sid its node withdrew routed to a lane nobody fetches"
+        );
+        assert_eq!(
+            bridge.resolve_to("@s-quit@n-far", Some("s-me")).unwrap(),
+            Route::Unroutable,
+            "an address naming the node that withdrew it routed all the same"
+        );
+        assert_eq!(
+            bridge.resolve_to("@s-away@n-far", Some("s-me")).unwrap(),
+            Route::To(format!("/f/f/in/n-far/s-away/{}", bridge.node))
+        );
+    }
+
     /// **THE STATE DIR IS THE IDENTITY, AND THE CAP MUST AGREE WITH IT.** The
     /// node a bridge runs as is `<state>/node`, and a cap whose read-write
     /// grants bind another node is refused before anything is written — never
@@ -23518,7 +23805,7 @@ mod tests {
         // No cap binding a node (a capless bridge, or a person's cap alone):
         // minted, persisted, and the same on the next start.
         let minted = node_for(&state, &person).unwrap();
-        assert!(crate::join::is_node_id(&minted), "{minted}");
+        assert!(crate::enable::is_node_id(&minted), "{minted}");
         assert_eq!(node_for(&state, &[]).unwrap(), minted);
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -23527,6 +23814,77 @@ mod tests {
         assert!(node_for(&state, &[]).is_err());
         assert!(node_for(&state, &person).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **THE DEADLINE SWEEP COUNTS A RECEIPT ONLY FROM THE NODE THE ASK WENT
+    /// TO**, the rule delivery applies
+    /// (`a_remote_node_cannot_speak_for_a_local_session_or_answer_anothers_ask`).
+    /// A third node's cap grants it every lane AS ITSELF, so it can put `ack
+    /// re=<off> verdict=handled` — or an `expired` — on this node's asker's
+    /// lane for an ask that went to `n-far`. Were the bus read to take that
+    /// as the answer, a task nobody answered would never expire. Three asks
+    /// to `n-far`, all due: one with a stray `ack` from `n-evil` on the lane,
+    /// one with a stray `expired` from `n-evil`, and — the negative control —
+    /// one with `n-far`'s own `ack`. The sweep records `expired` for the first
+    /// two only, and retires all three.
+    ///
+    /// The sweep is run with `at_once`, which judges every deadline due: what
+    /// is under test is the bus read, not the clock.
+    #[cfg(unix)]
+    #[test]
+    fn the_deadline_sweep_counts_a_receipt_only_from_the_node_the_ask_went_to() {
+        const SID: &str = "s-asker";
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
+        let socket = lane.dir.path().join("broker.sock");
+        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let _server = broker.serve(&socket).unwrap();
+        bridge.cfg.broker = socket.to_string_lossy().into_owned();
+        let (conn, _) = bridge.connect().unwrap();
+        bridge.conn = Some(conn.into());
+        // Hosted here: the sweep gives a session that is gone no verdict.
+        bridge
+            .per_sid
+            .epochs
+            .insert(SID.to_string(), "e".to_string());
+        let node = bridge.node.clone();
+        let (mut peer, _) = bridge.connect().unwrap();
+
+        // The asks, on `n-far`'s lane: their offsets are what a reply names.
+        let mut asks = Vec::new();
+        for seq in 1..=3 {
+            let lane = format!("/f/f/in/n-far/s-far/{node}/task");
+            let (off, _) = peer.publish(9_100, seq, &lane, b"v=1 t=1 text=q").unwrap();
+            bridge.note_deadline(SID, off, 1_000, Some("n-far".to_string()));
+            asks.push(off);
+        }
+        let mut seq = 0;
+        let mut reply = |src: &str, kind: &str, re: u64| {
+            let mut body = Body::new(1);
+            body.re = Some(re);
+            body.verdict = (kind == "ack").then(|| "handled".to_string());
+            seq += 1;
+            let subject = format!("/f/f/in/{node}/{SID}/{src}/{kind}");
+            peer.publish(9_200, seq, &subject, &body.encode()).unwrap();
+        };
+        reply("n-evil", "ack", asks[0]);
+        reply("n-evil", "expired", asks[1]);
+        reply("n-far", "ack", asks[2]);
+
+        bridge.expire_deadlines(true);
+
+        let verdicts = format!("/f/f/in/{node}/{SID}/{node}/expired");
+        let (rows, _) = peer.fetch(0, &verdicts, 64).unwrap();
+        let expired: Vec<u64> = rows
+            .iter()
+            .filter(|(_, s, _)| *s == verdicts)
+            .filter_map(|(_, _, raw)| Body::decode(raw).0.re)
+            .collect();
+        assert_eq!(
+            expired,
+            [asks[0], asks[1]],
+            "a stray receipt settled a deadline, or the recipient's did not"
+        );
+        assert!(bridge.deadlines.is_empty(), "{:?}", bridge.deadlines);
     }
 
     /// A RING READ AGAIN BEFORE A DIAL IS TAKEN WHEN IT RENEWS THIS NODE'S,

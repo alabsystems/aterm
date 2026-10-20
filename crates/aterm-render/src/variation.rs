@@ -431,7 +431,7 @@ impl<'a> VariedFace<'a> {
     #[cfg(any(
         all(unix, not(target_os = "macos")),
         windows,
-        all(test, feature = "embedded-font", target_os = "macos")
+        all(test, debug_assertions, feature = "embedded-font", target_os = "macos")
     ))]
     pub(crate) fn linear_advance(&self, gid: u16, px: f32) -> Option<f32> {
         let scale = px_scale(&self.face, px)?;

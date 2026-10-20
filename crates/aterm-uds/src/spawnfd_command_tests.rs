@@ -12,8 +12,8 @@
 #[cfg(target_vendor = "apple")]
 use super::tests::flags;
 use super::tests::{
-    STAGE_ENV, STD_SPAWN_MUTE, host_holds, park, raise_soft_limit, run_staged, translator,
-    unflagged_at_or_above,
+    STAGE_ENV, STD_SPAWN_MUTE, park, require_host_holds, require_soft_limit, run_staged,
+    translator, unflagged_at_or_above,
 };
 use super::*;
 use std::io::{Read, Write};
@@ -215,13 +215,8 @@ fn every_stdio_mode_round_trips() {
 #[test]
 fn a_descriptor_at_any_number_reaches_its_slot() {
     let floor: RawFd = 10_300;
-    if !host_holds(floor, "") {
-        return;
-    }
-    if raise_soft_limit(10_400) <= 10_300 {
-        println!("NOT RUN: the hard descriptor limit is below {floor}");
-        return;
-    }
+    require_host_holds(floor, "");
+    require_soft_limit(10_400, floor);
     let scratch = Scratch::new("high");
     let file = std::fs::File::create(scratch.join("out")).expect("out file");
     let high = park(OwnedFd::from(file), floor);
@@ -1266,6 +1261,127 @@ fn a_dropped_handle_of_an_exited_child_leaves_no_zombie() {
     );
 }
 
+/// **A CHILD STARTED SUSPENDED RUNS ONLY ONCE RESUMED.** `spawn` returns with the
+/// child exec'd and stopped (`ps`: `T`) before its first instruction, so the shell has
+/// not left its marker; [`Child::resume`] runs it to a clean exit that leaves it. A held
+/// child killed instead never runs. Control: the same spawn without
+/// [`Command::start_suspended`] is not stopped.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_child_started_suspended_runs_only_once_resumed() {
+    let scratch = Scratch::new("suspended");
+    let marker = scratch.join("ran");
+    let script = format!("printf ran > '{}'", marker.display());
+    let mut held = command("/bin/sh")
+        .args(["-c", &script])
+        .start_suspended(true)
+        .spawn()
+        .expect("spawn suspended");
+    assert!(
+        state_of(held.id()).starts_with('T'),
+        "the child is stopped at its exec: {:?}",
+        state_of(held.id())
+    );
+    assert!(!marker.exists(), "a stopped child ran");
+    held.resume().expect("resume");
+    assert!(held.wait().expect("wait").success());
+    assert_eq!(std::fs::read_to_string(&marker).expect("the marker"), "ran");
+    held.resume()
+        .expect("resume after the reap is Ok and signals nothing");
+
+    let unrun = scratch.join("unrun");
+    let mut killed = command("/bin/sh")
+        .args(["-c", &format!("printf ran > '{}'", unrun.display())])
+        .start_suspended(true)
+        .spawn()
+        .expect("spawn suspended");
+    killed.kill().expect("kill");
+    let status = killed.wait().expect("wait");
+    assert_eq!(status.signal(), Some(SIGKILL), "{status:?}");
+    assert!(!unrun.exists(), "a held child killed unresumed ran");
+
+    let mut control = command("/bin/sleep").arg("60").spawn().expect("spawn");
+    let state = state_of(control.id());
+    control.kill().expect("kill");
+    let _ = control.wait();
+    assert!(
+        !state.starts_with('T'),
+        "CONTROL: a plain child is not stopped: {state:?}"
+    );
+}
+
+/// **A HELD CHILD DIES UNRUN WITH ITS HOLDER, EVEN ONE THAT IGNORES `SIGHUP`.** The
+/// staged holder ignores `SIGHUP` (as `nohup` or a lane that sets `SIG_IGN` would), starts
+/// a shell stopped in a group of its own, and exits without resuming or killing it. The
+/// kernel then sends that orphaned group `SIGHUP` and `SIGCONT`; the child, its `SIGHUP`
+/// back at the default, is gone without leaving its marker. NEGATIVE CONTROL: a child that
+/// inherited the `SIG_IGN` ran on that `SIGCONT` (measured before the reset).
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_held_child_dies_unrun_with_its_holder_even_one_ignoring_hangups() {
+    const NAME: &str =
+        "spawnfd::command_tests::a_held_child_dies_unrun_with_its_holder_even_one_ignoring_hangups";
+    const SIGHUP: i32 = 1;
+    if let Ok(marker) = std::env::var(STAGE_ENV) {
+        // SAFETY: `signal` with `SIG_IGN`, in this staged process of the test's own.
+        unsafe { signal(SIGHUP, SIG_IGN) };
+        let held = command("/bin/sh")
+            .args(["-c", &format!("printf ran > '{marker}'")])
+            .process_group(0)
+            .start_suspended(true)
+            .spawn()
+            .expect("spawn suspended");
+        println!("STAGED held {}", held.id());
+        std::process::exit(0);
+    }
+    let scratch = Scratch::new("held-orphan");
+    let marker = scratch.join("ran");
+    let out = run_staged(NAME, marker.to_str().expect("utf-8 scratch path"));
+    let pid: u32 = out
+        .lines()
+        .find_map(|line| line.split("STAGED held ").nth(1))
+        .and_then(|pid| pid.trim().parse().ok())
+        .unwrap_or_else(|| panic!("the stage named no held child: {out}"));
+    let until = Instant::now() + Duration::from_secs(60);
+    while !state_of(pid).is_empty() {
+        assert!(
+            Instant::now() < until,
+            "the orphaned held child {pid} lives on"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!marker.exists(), "a held child ran when its holder died");
+}
+
+/// **A SUSPENDED START IT CANNOT KEEP STARTS NOTHING.** Beside `exec` it answers
+/// `Unsupported` before trying (the program does not exist, which a tried `exec`
+/// answers `NotFound`, this process untouched either way); off Darwin every spawn
+/// does, and the child never runs.
+#[test]
+fn a_suspended_start_it_cannot_keep_starts_nothing() {
+    let err = command("/nonexistent/spawnfd-suspended-exec")
+        .start_suspended(true)
+        .exec();
+    assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let scratch = Scratch::new("suspended-refused");
+        let marker = scratch.join("started");
+        let mut cmd = command("/bin/sh");
+        cmd.args(["-c", &format!("touch '{}'", marker.display())])
+            .start_suspended(true);
+        for (how, error) in [
+            ("spawn", cmd.spawn().map(drop)),
+            ("output", cmd.output().map(drop)),
+            ("status", cmd.status().map(drop)),
+        ] {
+            let error = error.expect_err(how);
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{how}: {error}");
+        }
+        assert!(!marker.exists(), "a refused suspended start ran the child");
+    }
+}
+
 /// [`Command::process_group`] and [`Command::setsid`] are the spawn's own:
 /// the child leads a group of its own, or a session (and its group) of its
 /// own, read back with `getpgid` and `getsid`. Both at once, the session
@@ -1607,4 +1723,51 @@ fn an_exec_hands_over_a_close_on_exec_source() {
     let _ = run_staged(NAME, path.to_str().expect("utf-8 scratch path"));
     let wrote = std::fs::read_to_string(&path).expect("the new image's stdout");
     assert_eq!(wrote, "wrote\nstderr-open\n");
+}
+
+/// A PROGRAM STILL OPEN FOR WRITING IS TRIED AGAIN, NOT REFUSED AT ONCE (2026-10-17): Linux
+/// refuses its exec (`ETXTBSY`) while anything holds it open for writing — a child another
+/// thread forked while it was being written holds that descriptor until its own exec — and
+/// the spawn tries again after the pause between tries, here the moment this test's writer
+/// lets go. A writer that stays is still refused once the window has passed. NEGATIVE
+/// CONTROL: a spawn that tried once was refused, `Text file busy`, in the first assertion.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_spawn_refused_as_text_busy_starts_once_the_writer_lets_go() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = aterm_tempfile::tempdir().expect("scratch dir");
+    let path = dir.path().join("busy");
+    let mut writer = std::fs::File::create(&path).expect("create");
+    writer.write_all(b"#!/bin/sh\nexit 7\n").expect("write");
+    writer
+        .set_permissions(std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    let tried_again = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = std::sync::Arc::clone(&tried_again);
+    TEXT_BUSY_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(writer);
+        }));
+    });
+    let status = command(&path)
+        .status()
+        .expect("started once the writer let go");
+    assert_eq!(status.code(), Some(7));
+    assert!(
+        tried_again.load(std::sync::atomic::Ordering::SeqCst),
+        "the first try was refused and the spawn paused"
+    );
+    let _stays = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("a writer that stays");
+    let refused = command(&path)
+        .status()
+        .expect_err("refused once the window passed");
+    assert_eq!(
+        refused.kind(),
+        io::ErrorKind::ExecutableFileBusy,
+        "{refused}"
+    );
 }

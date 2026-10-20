@@ -345,9 +345,10 @@ pub(crate) fn is_spinner_frame(ch: char) -> bool {
 /// AN AGENT'S TITLE SUBJECT WITHOUT ITS SPINNER FRAME: `title` past a leading
 /// frame ([`is_spinner_frame`]) and the blanks after it. A surface that
 /// shows the subject as a snapshot — a Settings ▸ Harness row, the
-/// Autopilot menu's name, the menu bar's window rows, a session's name on a
-/// card, a picker, a connection line or the connection map
-/// (`SessionHandle::display_title`) — reads it through here, so it never freezes one frame
+/// Autopilot menu's name or a tooltip's connection line
+/// (`SessionHandle::display_title`) — reads it through here, and the Agents
+/// surfaces' namer drops the same frames
+/// (`app_take_over::title_without_agent_glyph`), so none freezes one frame
 /// of an animation (a braille frame draws as a blank indent in a UI face:
 /// the Together run's D7). The live chrome (the strip, the window title)
 /// keeps the frame and coalesces its phases instead

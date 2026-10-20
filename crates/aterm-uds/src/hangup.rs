@@ -54,13 +54,48 @@ pub fn peer_closed(stream: &CtlStream) -> bool {
 /// client that sent its request and EOF, a relay's child that answered) and then shuts
 /// nothing, so that waiting peer gets no end-of-file.
 ///
+/// The same rule holds for TCP ([`Halves`]): a peer that sent its FIN has
+/// shut this end's read half, and a both-ways `shutdown` then leaves a thread
+/// blocked writing to that peer blocked; the write half's `shutdown` wakes it
+/// (`EPIPE`).
+///
 /// Returns whether this call shut either half. Darwin answers `false` for a socket that is not
 /// connected (a listening one, or one whose peer closed entirely) or already shut both ways;
 /// Linux's `shutdown(2)` succeeds on any AF_UNIX socket, so there it is `true` every time.
-pub fn hang_up(stream: &CtlStream) -> bool {
-    let wrote = stream.shutdown(std::net::Shutdown::Write).is_ok();
-    let read = stream.shutdown(std::net::Shutdown::Read).is_ok();
+pub fn hang_up(stream: &(impl Halves + ?Sized)) -> bool {
+    let wrote = stream.shut(std::net::Shutdown::Write).is_ok();
+    let read = stream.shut(std::net::Shutdown::Read).is_ok();
     wrote || read
+}
+
+/// A connected stream socket [`hang_up`] shuts half by half: a control
+/// stream ([`CtlStream`]) or a TCP one.
+pub trait Halves {
+    /// `shutdown(2)` of the halves `how` names, on the socket every copy of
+    /// this end shares.
+    ///
+    /// # Errors
+    /// The socket's own: on Darwin `ENOTCONN` for a half already shut, or a
+    /// socket whose peer closed entirely.
+    fn shut(&self, how: std::net::Shutdown) -> std::io::Result<()>;
+}
+
+impl Halves for CtlStream {
+    fn shut(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        self.shutdown(how)
+    }
+}
+
+impl Halves for std::net::TcpStream {
+    fn shut(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        self.shutdown(how)
+    }
+}
+
+impl<S: Halves + ?Sized> Halves for &S {
+    fn shut(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        (**self).shut(how)
+    }
 }
 
 /// [`peer_closed`] for a borrowed raw descriptor: for a caller that recorded
@@ -68,9 +103,26 @@ pub fn hang_up(stream: &CtlStream) -> bool {
 /// reference to the stream. The caller guarantees `fd` is open for the call.
 #[must_use]
 #[cfg(unix)]
+pub fn fd_peer_closed(fd: std::os::fd::RawFd) -> bool {
+    poll_now(fd, POLLOUT) & (POLLHUP | POLLERR | POLLNVAL) != 0
+}
+
+// The same four `poll(2)` bits on Darwin, the BSDs and Linux.
+#[cfg(unix)]
+const POLLOUT: i16 = 0x4;
+#[cfg(unix)]
+const POLLERR: i16 = 0x8;
+#[cfg(unix)]
+const POLLHUP: i16 = 0x10;
+#[cfg(unix)]
+const POLLNVAL: i16 = 0x20;
+
+/// The `revents` one zero-timeout `poll(2)` of `fd` for `events` reports now
+/// (0 when nothing is ready). Never blocks; a bad fd reads as `POLLNVAL`.
+#[cfg(unix)]
 // Skip: a zero-timeout `poll(2)` readiness probe (FFI, unverifiable body).
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn fd_peer_closed(fd: std::os::fd::RawFd) -> bool {
+fn poll_now(fd: std::os::fd::RawFd, events: i16) -> i16 {
     #[repr(C)]
     struct PollFd {
         fd: i32,
@@ -86,20 +138,15 @@ pub fn fd_peer_closed(fd: std::os::fd::RawFd) -> bool {
     unsafe extern "C" {
         fn poll(fds: *mut PollFd, nfds: Nfds, timeout: i32) -> i32;
     }
-    // The same four bits on Darwin, the BSDs and Linux.
-    const POLLOUT: i16 = 0x4;
-    const POLLERR: i16 = 0x8;
-    const POLLHUP: i16 = 0x10;
-    const POLLNVAL: i16 = 0x20;
     let mut probe = PollFd {
         fd,
-        events: POLLOUT,
+        events,
         revents: 0,
     };
     // SAFETY: `probe` is one initialized pollfd that outlives the call, and a
     // zero timeout never parks. A bad fd is reported in `revents`, not UB.
     let ready = unsafe { poll(&mut probe, 1, 0) };
-    ready > 0 && probe.revents & (POLLHUP | POLLERR | POLLNVAL) != 0
+    if ready > 0 { probe.revents } else { 0 }
 }
 
 #[cfg(all(test, unix))]
@@ -149,6 +196,72 @@ mod tests {
             Ok(0),
             "a surviving copy reads end-of-file, and nothing written after"
         );
+    }
+
+    /// A HANG-UP WAKES A WRITER BLOCKED ON A TCP PEER THAT SENT ITS FIN AND
+    /// READS NOTHING: the write half's `shutdown` fails the blocked write
+    /// (`EPIPE`). This is how the fleet listener cuts a connection and how an
+    /// answering relay ends one, with a thread writing an answer the peer
+    /// does not take.
+    ///
+    /// NEGATIVE CONTROL (macOS, asserted): the both-ways `shutdown` is refused
+    /// once the peer's FIN is in, shuts nothing, and the writer stays blocked.
+    /// Every wait here is the hang detector, never a latency budget.
+    #[test]
+    fn a_hang_up_wakes_a_writer_blocked_on_a_tcp_peer_that_sent_its_fin() {
+        use std::os::fd::AsRawFd as _;
+        const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let peer =
+            std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (near, _) = listener.accept().expect("accept");
+        // The peer's FIN, in once `near` reads its end-of-file.
+        peer.shutdown(std::net::Shutdown::Write)
+            .expect("the peer's FIN");
+        near.set_read_timeout(Some(HANG)).expect("read timeout");
+        assert_eq!(
+            (&near).read(&mut [0u8; 1]).map_err(|e| e.kind()),
+            Ok(0),
+            "the FIN is in"
+        );
+        let writing = near.try_clone().expect("the writer's copy");
+        let (wrote_tx, wrote) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let chunk = vec![b'a'; 64 * 1024];
+            let failed = loop {
+                if let Err(e) = (&writing).write_all(&chunk) {
+                    break e.kind();
+                }
+            };
+            let _ = wrote_tx.send(failed);
+        });
+        // The writer has filled what the sockets hold and is blocked.
+        let blocked = std::time::Instant::now() + HANG;
+        while super::poll_now(near.as_raw_fd(), super::POLLOUT) & super::POLLOUT != 0 {
+            assert!(
+                std::time::Instant::now() < blocked,
+                "the writer never filled the sockets"
+            );
+            std::thread::yield_now();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                near.shutdown(std::net::Shutdown::Both)
+                    .map_err(|e| e.kind()),
+                Err(ErrorKind::NotConnected),
+                "Darwin refuses a both-ways shutdown of a socket whose peer sent its FIN"
+            );
+            assert!(
+                wrote.try_recv().is_err(),
+                "and that refusal shut no half: the writer is still blocked"
+            );
+        }
+        assert!(hang_up(&near), "the write half was still open to shut");
+        let failed = wrote.recv_timeout(HANG);
+        assert!(failed.is_ok(), "the blocked write fails: {failed:?}");
+        writer.join().expect("the writer");
+        drop(peer);
     }
 
     /// A peer that is open, one that half-closed (still waiting for its

@@ -21,6 +21,10 @@
 //!   (`spare_miss=stale`);
 //! * L7 asks the spare cannot serve go cold, with their reason, and the spare
 //!   stays;
+//! * L13 a tab from a held pane adopts the spare booked in its folder, and
+//!   the next one too while the pane is held;
+//! * L14 a parked spare serves a tab asked for in another folder, `cd`ing
+//!   there at its release;
 //! * L8 `spare_shell = "off"` retires it; `parked` retires a warm one;
 //! * L9 quitting with a spare leaves no shell behind and no history written;
 //! * L10 with the default (a person must be present) a wire-driven instance
@@ -30,8 +34,16 @@
 //!
 //! Every wait for something that must happen is a one-minute hang detector,
 //! never a latency budget; no check retries.
+//!
+//! Linux runs the suite too (2026-10-19, R6), on the lab's lane. Where the
+//! host's zsh reads a system file before aterm's parked hold (Ubuntu's
+//! `/etc/zsh/zshenv`: [`zsh_runs_a_system_file_first`]), a parked spare has run
+//! it before anyone asked, so the product parks only for an eligible gate and
+//! never moves such a spare to another folder: the visible runs that teach the
+//! gate are cold tabs there, a `spare_shell = "parked"` instance is given the
+//! eligible gate, and L14 reads the refusal.
 
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -57,6 +69,9 @@ fn boot_spare(prefix: &str, zshrc: &str, config: &str, seams: &[(&str, &str)]) -
             let base = std::fs::read_to_string(&toml).expect("aterm.toml");
             std::fs::write(&toml, format!("{config}\n{base}")).expect("aterm.toml");
             cmd.env("SHELL", "/bin/zsh");
+            // The gate's own account of every run it judged, for a failure
+            // message ([`gate_log`]).
+            cmd.env("ATERM_LOG", "info");
             for (k, v) in &seams {
                 cmd.env(k, v);
             }
@@ -69,6 +84,49 @@ fn boot_spare(prefix: &str, zshrc: &str, config: &str, seams: &[(&str, &str)]) -
 fn metric(inst: &Instance, key: &str) -> String {
     let m = ctl_ok(inst, &["metrics"]);
     field(&m, key).unwrap_or("-").to_owned()
+}
+
+/// Where the instance keeps its state and its log: its scratch home, and the
+/// `XDG_STATE_HOME` the boot gave it (macOS reads only the home).
+fn instance_dirs(inst: &Instance) -> aterm_types::dirs::StatePlatform {
+    aterm_types::dirs::StatePlatform {
+        home: Some(inst.tmp.join("home")),
+        xdg_state_home: Some(inst.tmp.join("state")),
+        ..Default::default()
+    }
+}
+
+/// Whether this host's zsh reads a system file before aterm's parked hold
+/// (`pre_hold_files`): then its parked spare waits for the gate, and serves
+/// only the folder it was spawned in.
+fn zsh_runs_a_system_file_first() -> bool {
+    aterm_shell_integration::pre_hold_files(aterm_shell_integration::ShellType::Zsh)
+        .iter()
+        .any(|f| Path::new(f).exists())
+}
+
+/// A `spare_shell = "parked"` instance's seams: where zsh runs a system file
+/// before its hold, the eligible gate parking needs there (parked mode
+/// teaches no gate, and never promotes).
+fn parked_seams() -> &'static [(&'static str, &'static str)] {
+    if zsh_runs_a_system_file_first() {
+        &[("ATERM_DEBUG_SPARE_ELIGIBLE", "1")]
+    } else {
+        &[]
+    }
+}
+
+/// The instance log's spare lines (`boot_spare` logs at `info`): the gate's
+/// verdict on each visible run, and why a run was unclean, for a failure
+/// message.
+fn gate_log(inst: &Instance) -> String {
+    let log = aterm_types::dirs::resolve_logs_dir(None, instance_dirs(inst))
+        .and_then(|dir| std::fs::read_to_string(dir.join("aterm.log")).ok())
+        .unwrap_or_default();
+    log.lines()
+        .filter(|l| l.contains("spare"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Wait until `metrics spare=` reads `state`; a hang detector.
@@ -142,13 +200,7 @@ struct GateSnapshot {
 fn gate_snapshot(inst: &Instance) -> Option<GateSnapshot> {
     use std::io::Read as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-    let state = aterm_types::dirs::resolve_state_dir(
-        None,
-        aterm_types::dirs::StatePlatform {
-            home: Some(inst.tmp.join("home")),
-            ..Default::default()
-        },
-    )?;
+    let state = aterm_types::dirs::resolve_state_dir(None, instance_dirs(inst))?;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
@@ -213,8 +265,9 @@ fn await_metric(inst: &Instance, key: &str, word: &str) {
         }
         assert!(
             Instant::now() < give_up,
-            "{key} never reached {word}: {}",
-            ctl_ok(inst, &["metrics"])
+            "{key} never reached {word}: {}\n{}",
+            ctl_ok(inst, &["metrics"]),
+            gate_log(inst)
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -222,16 +275,18 @@ fn await_metric(inst: &Instance, key: &str, word: &str) {
 
 /// The boot session is itself the first visible run. Settle it before making
 /// the next two runs, and observe each fold before asking for another spare.
+/// Each is a parked spare's adoption, or, where zsh runs a system file before
+/// its hold (no parking before the gate opens), a cold tab.
 fn learn_three_visible_runs(inst: &Instance) {
     let (_, boot) = boot_session(inst);
     await_text(inst, &boot, "SPARE%");
     await_gate(inst, "learning_1/3");
     for expected in [2, 3] {
-        await_spare(inst, "parked");
+        let tier = await_visible_run_tier(inst);
         let before = gate_snapshot(inst).expect("one settled generation in the fresh fixture");
         assert_eq!(before.streak, expected - 1);
         let sid = spawn(inst, &[]);
-        assert_eq!(born(inst, &sid), "spare-parked");
+        assert_eq!(born(inst, &sid), tier);
         await_text(inst, &sid, "SPARE%");
         let after = await_sample_after(inst, &before);
         assert_eq!(
@@ -246,6 +301,19 @@ fn learn_three_visible_runs(inst: &Instance) {
                 "eligible"
             },
         );
+    }
+}
+
+/// Before a visible run that teaches the gate: wait for the parked spare it
+/// adopts, and answer the tier it is born from; where zsh runs a system file
+/// before its hold nothing parks before the gate opens, and the run is a cold
+/// tab.
+fn await_visible_run_tier(inst: &Instance) -> &'static str {
+    if zsh_runs_a_system_file_first() {
+        "cold"
+    } else {
+        await_spare(inst, "parked");
+        "spare-parked"
     }
 }
 
@@ -291,7 +359,7 @@ fn a_parked_spare_is_nobodys_session_until_a_spawn_adopts_it() {
         "aterm-spare-l1",
         PROMPT_RC,
         "spare_shell = \"parked\"\nspare_shell_needs_person = false",
-        &[],
+        parked_seams(),
     );
     let (_, boot) = boot_session(&inst);
     await_spare(&inst, "parked");
@@ -336,18 +404,27 @@ fn three_clean_visible_runs_make_the_next_spare_warm() {
     );
     learn_three_visible_runs(&inst);
     await_spare(&inst, "ready");
-    assert_eq!(adopted(&inst, "parked"), 2, "boot was the first clean run");
+    let parked_runs = if zsh_runs_a_system_file_first() { 0 } else { 2 };
+    assert_eq!(
+        adopted(&inst, "parked"),
+        parked_runs,
+        "boot was the first clean run"
+    );
     let sid = spawn(&inst, &[]);
     assert_eq!(born(&inst, &sid), "spare-ready");
 }
 
-/// L4: each negative run must actually finish its gate fold before the
-/// test closes it. The daemon also records its own finite completion before
-/// this fixture proceeds; no discovered PID is signalled.
+/// L4: the boot session is the first clean visible run (`learning_1/3`); the
+/// spare adopted once the rc misbehaves must fold as unclean and reset the
+/// streak to 0, so no number of such runs reaches the three clean ones the gate
+/// needs. Each negative run finishes its gate fold before the test closes it.
+/// The daemon also records its own finite completion before this fixture
+/// proceeds; no discovered PID is signalled. Each misbehaviour boots its own
+/// instance and scratch world, so they run side by side.
 #[test]
 fn an_unclean_rc_never_opens_the_gate() {
     let aterm = env!("CARGO_BIN_EXE_aterm");
-    for (name, misbehave) in [
+    let cases = [
         ("read", "read -r x".to_owned()),
         ("slow", "sleep 3".to_owned()),
         ("exec", "exec /bin/cat".to_owned()),
@@ -357,44 +434,48 @@ fn an_unclean_rc_never_opens_the_gate() {
             "daemon",
             "( { /bin/sleep 8; : > \"$HOME/daemon-finished\"; } & )".to_owned(),
         ),
-    ] {
-        let rc = format!("[[ -e $HOME/armed ]] && {{ {misbehave}; }}\nPS1='SPARE%# '\n");
-        let inst = boot_spare(
-            &format!("aterm-spare-l4{name}"),
-            &rc,
-            "spare_shell_needs_person = false",
-            &[("ATERM_DEBUG_SPARE_IDLE_MS", "100")],
-        );
-        let (_, boot) = boot_session(&inst);
-        await_text(&inst, &boot, "SPARE%");
-        await_gate(&inst, "learning_1/3");
-        std::fs::write(inst.tmp.join("home/armed"), b"").expect("arm");
-        for _ in 0..3 {
-            await_spare(&inst, "parked");
-            let before = gate_snapshot(&inst).expect("one settled generation");
-            let finished = inst.tmp.join("home/daemon-finished");
-            match std::fs::remove_file(&finished) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => panic!("remove the prior owned completion marker: {error}"),
-            }
-            let sid = spawn(&inst, &[]);
-            assert_eq!(born(&inst, &sid), "spare-parked", "{name}");
-            let after = await_sample_after(&inst, &before);
-            assert_eq!(
-                after.streak, 0,
-                "{name}: the actual negative fold reset the streak"
-            );
-            await_gate(&inst, "learning_0/3");
-            if name == "daemon" {
-                await_private_file(&finished);
-            }
-            ctl_ok(&inst, &[&format!("@{sid}"), "close"]);
+    ];
+    std::thread::scope(|scope| {
+        let runs: Vec<_> = cases
+            .iter()
+            .map(|(name, misbehave)| scope.spawn(move || an_unclean_run(name, misbehave)))
+            .collect();
+        for run in runs {
+            run.join()
+                .unwrap_or_else(|why| std::panic::resume_unwind(why));
         }
-        assert_ne!(metric(&inst, "spare_gate"), "eligible", "{name}");
-        assert_eq!(adopted(&inst, "ready"), 0, "{name}");
-        assert_eq!(adopted(&inst, "warming"), 0, "{name}");
+    });
+}
+
+/// One L4 case: `misbehave` armed after the boot session's clean run.
+fn an_unclean_run(name: &str, misbehave: &str) {
+    let rc = format!("[[ -e $HOME/armed ]] && {{ {misbehave}; }}\nPS1='SPARE%# '\n");
+    let inst = boot_spare(
+        &format!("aterm-spare-l4{name}"),
+        &rc,
+        "spare_shell_needs_person = false",
+        &[("ATERM_DEBUG_SPARE_IDLE_MS", "100")],
+    );
+    let (_, boot) = boot_session(&inst);
+    await_text(&inst, &boot, "SPARE%");
+    await_gate(&inst, "learning_1/3");
+    std::fs::write(inst.tmp.join("home/armed"), b"").expect("arm");
+    let tier = await_visible_run_tier(&inst);
+    let before = gate_snapshot(&inst).expect("one settled generation");
+    let sid = spawn(&inst, &[]);
+    assert_eq!(born(&inst, &sid), tier, "{name}");
+    let after = await_sample_after(&inst, &before);
+    assert_eq!(
+        after.streak, 0,
+        "{name}: the actual negative fold reset the streak"
+    );
+    await_gate(&inst, "learning_0/3");
+    if name == "daemon" {
+        await_private_file(&inst.tmp.join("home/daemon-finished"));
     }
+    ctl_ok(&inst, &[&format!("@{sid}"), "close"]);
+    assert_eq!(adopted(&inst, "ready"), 0, "{name}");
+    assert_eq!(adopted(&inst, "warming"), 0, "{name}");
 }
 
 /// L6: an rc edited while a warm spare waits sends the next tab cold, and the
@@ -422,36 +503,137 @@ fn an_rc_edited_under_a_ready_spare_sends_the_next_tab_cold() {
     );
 }
 
-/// L7: an identity, another folder, a held pane: each spawn goes cold with its
-/// reason, and the spare stays parked.
+/// L7: an identity, and another folder for a warm spare (its rc ran in its
+/// own): each spawn goes cold with its reason, and the spare stays.
+///
+/// Both asks land behind the boot tab (`raise=f`), so the focused pane, whose
+/// folder the spare follows, never moves: a tab raised in `/usr` would move
+/// it, and the follow rule retires a misplaced warm spare 10 s later
+/// (`REPLACE_WARM_AFTER`; a parked one 1 s later), a race with this test's own
+/// pace on a loaded host. NEGATIVE CONTROL: raised asks and a pause past that
+/// hold before the last check read `spare=absent`.
 #[test]
 fn asks_a_spare_cannot_serve_go_cold_and_the_spare_stays() {
     let inst = boot_spare(
         "aterm-spare-l7",
         PROMPT_RC,
-        "spare_shell = \"parked\"\nspare_shell_needs_person = false",
-        &[],
+        "spare_shell_needs_person = false",
+        &[
+            ("ATERM_DEBUG_SPARE_ELIGIBLE", "1"),
+            ("ATERM_DEBUG_SPARE_IDLE_MS", "100"),
+        ],
     );
-    let (_, boot) = boot_session(&inst);
-    await_spare(&inst, "parked");
-    let sid = spawn(&inst, &["cwd=/usr"]);
+    let _ = boot_session(&inst);
+    await_spare(&inst, "ready");
+    let sid = spawn(&inst, &["cwd=/usr", "raise=f"]);
     assert_eq!(born(&inst, &sid), "cold");
     assert!(metric(&inst, "spare_miss").contains("folder:1"));
-    assert_eq!(metric(&inst, "spare"), "parked", "the spare stays");
+    assert_eq!(
+        metric(&inst, "spare"),
+        "ready",
+        "the spare stays: {}\n{}",
+        ctl_ok(&inst, &["metrics"]),
+        gate_log(&inst)
+    );
     // An identity is never a spare's (it may not even exist: the ask is
     // judged before the spawn).
-    let _ = headless_boot::ctl(&inst, &["spawn", "identity=nobody-here"]);
+    let _ = headless_boot::ctl(&inst, &["spawn", "identity=nobody-here", "raise=f"]);
     assert!(metric(&inst, "spare_miss").contains("ask:1"));
-    assert_eq!(metric(&inst, "spare"), "parked", "the spare stays");
-    // A held pane: the boot session runs a program.
-    headless_boot::type_line(&inst, &boot, "sleep 600");
+    assert_eq!(
+        metric(&inst, "spare"),
+        "ready",
+        "the spare stays: {}\n{}",
+        ctl_ok(&inst, &["metrics"]),
+        gate_log(&inst)
+    );
+}
+
+/// Wait until session `sid`'s foreground program is `program`: the pane is
+/// held; a hang detector.
+fn await_program(inst: &Instance, sid: &str, program: &str) {
     let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-    while metric(&inst, "spare") != "absent" {
-        // The spare follows the front pane; a held one gets none.
-        assert!(Instant::now() < give_up, "{}", ctl_ok(&inst, &["metrics"]));
-        ctl_ok(&inst, &["@0", "status"]);
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    while field(&status(inst, sid), "program") != Some(program) {
+        assert!(Instant::now() < give_up, "{sid}: {}", status(inst, sid));
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+/// L13 (2026-10-18): Cmd-T while a program holds the focused pane (an agent,
+/// here `sleep`) adopts the warm spare booked in that pane's folder, and the
+/// next spare is booked, warmed and adopted while the pane is still held.
+/// NEGATIVE CONTROL (the code before): a held pane's tab went cold, `held`.
+#[test]
+fn a_tab_from_a_held_pane_adopts_the_spare_booked_in_its_folder() {
+    let inst = boot_spare(
+        "aterm-spare-l13",
+        PROMPT_RC,
+        "spare_shell_needs_person = false",
+        &[
+            ("ATERM_DEBUG_SPARE_ELIGIBLE", "1"),
+            ("ATERM_DEBUG_SPARE_IDLE_MS", "100"),
+        ],
+    );
+    let (_, boot) = boot_session(&inst);
+    await_spare(&inst, "ready");
+    headless_boot::type_line(&inst, &boot, "sleep 600");
+    await_program(&inst, &boot, "sleep");
+    for _ in 0..2 {
+        await_spare(&inst, "ready");
+        let sid = spawn(&inst, &[]);
+        assert_eq!(
+            born(&inst, &sid),
+            "spare-ready",
+            "{}",
+            ctl_ok(&inst, &["metrics"])
+        );
+        await_text(&inst, &sid, "SPARE%");
+        ctl_ok(&inst, &[&format!("@{sid}"), "close"]);
+    }
+    assert_eq!(adopted(&inst, "ready"), 2);
+    assert_eq!(
+        field(&status(&inst, &boot), "program"),
+        Some("sleep"),
+        "still held"
+    );
+}
+
+/// L14 (2026-10-18): a parked spare serves a tab asked for in another folder:
+/// it `cd`s there at its release, before its startup files, and the shell
+/// reads as one started there (zsh: `$PWD`, and `$OLDPWD` the same). A warm
+/// spare does not (L7). NEGATIVE CONTROL (the code before): `cwd=` went cold,
+/// `folder`.
+#[test]
+fn a_parked_spare_serves_a_tab_asked_for_in_another_folder() {
+    let inst = boot_spare(
+        "aterm-spare-l14",
+        PROMPT_RC,
+        "spare_shell = \"parked\"\nspare_shell_needs_person = false",
+        parked_seams(),
+    );
+    let _ = boot_session(&inst);
+    await_spare(&inst, "parked");
+    let sid = spawn(&inst, &["cwd=/usr"]);
+    if zsh_runs_a_system_file_first() {
+        // The system zshenv ran in the spare's own folder before its hold:
+        // the tab goes cold where it was asked for, and the spare stays.
+        assert_eq!(born(&inst, &sid), "cold", "{}", ctl_ok(&inst, &["metrics"]));
+        assert!(metric(&inst, "spare_miss").contains("folder:1"));
+        await_text(&inst, &sid, "SPARE%");
+        headless_boot::type_line(&inst, &sid, "echo \"W$((40+2))[$PWD]\"");
+        await_text(&inst, &sid, "W42[/usr]");
+        assert_eq!(metric(&inst, "spare"), "parked");
+        return;
+    }
+    assert_eq!(
+        born(&inst, &sid),
+        "spare-parked",
+        "{}",
+        ctl_ok(&inst, &["metrics"])
+    );
+    await_text(&inst, &sid, "SPARE%");
+    headless_boot::type_line(&inst, &sid, "echo \"W$((40+2))[$PWD|$OLDPWD]\"");
+    await_text(&inst, &sid, "W42[/usr|/usr]");
+    assert_eq!(adopted(&inst, "parked"), 1);
 }
 
 /// L8: `parked`, hot-reloaded, retires a warm spare and keeps a parked one.
@@ -485,7 +667,7 @@ fn spare_shell_off_retires_the_spare_on_reload() {
         "aterm-spare-l8",
         PROMPT_RC,
         "spare_shell = \"parked\"\nspare_shell_needs_person = false",
-        &[],
+        parked_seams(),
     );
     await_spare(&inst, "parked");
     let toml = inst.tmp.join("cfg/aterm/aterm.toml");

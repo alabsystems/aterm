@@ -1,0 +1,46 @@
+seq v=1 rig=transcript program=claude build=2.1.299
+# REAL ROWS (5B-2): the rows a real Claude Code 2.1.299 wrote for a turn, a
+# turn the session limit ended, and the person's next turn (aterm-agent's
+# fixture, lines 2-4, 5-9 and 10-12, folded whole there, so the third turn,
+# on the model the first named, restates none): each row at the offset and
+# time the real reader hands it on (dated= relative, the first prompt at
+# 0), read the instant it was written, Partial (S9: 2.1.299 is no measured
+# build), so the screen opens and closes each turn and shows the wall. The
+# screen lines are this test's own (no fixture).
+state partial
+bind 0
+see busy
+expect open t1 turn par=r1 src=screen conf=strong
+tx prompt v1 dated=0 off=1153 slice=claude-2.1.299-transcript-session-limit-cancelled-then-person-turn:2-4
+expect amend t1 turn vref=v1 by=vendor src=transcript conf=strong
+at 41 tx model model=claude-sonnet-5-5 effort=medium ver=2.1.299 dated=41 off=2416 slice=claude-2.1.299-transcript-session-limit-cancelled-then-person-turn:2-4
+expect amend r1 agent model=claude-sonnet-5-5 effort=medium ver=2.1.299 by=vendor
+at 46 tx end vdur=54 in=22682 out=12 dated=46 off=2831 slice=claude-2.1.299-transcript-session-limit-cancelled-then-person-turn:2-4
+expect amend t1 turn vdur_ms=54 tok_in=22682 tok_out=12 by=vendor conf=strong
+at 100 see idle
+wait 1000
+expect close t1 turn out=done src=screen at=100
+at 8345 see busy
+expect open t2 turn par=r1 src=screen conf=strong
+tx prompt v2 dated=8345 off=3421 slice=claude-2.1.299-transcript-session-limit-cancelled-then-person-turn:5-9
+expect amend t2 turn vref=v2 by=vendor src=transcript conf=strong
+at 8367 tx end vdur=25 in=0 out=0 dated=8367 off=5889 slice=claude-2.1.299-transcript-session-limit-cancelled-then-person-turn:5-9
+expect amend t2 turn vdur_ms=25 tok_in=0 tok_out=0 by=vendor conf=strong
+at 8367 tx endwall usage-session dated=8367 off=5890 slice=claude-2.1.299-transcript-session-limit-cancelled-then-person-turn:5-9
+at 8400 see wall:usage-session
+expect open p1 wall par=t2 wall=usage-session src=screen conf=strong
+expect need=wall:usage-session
+at 20887 see busy
+expect close p1 wall out=gone src=screen at=8400
+expect close t2 turn out=wall:usage-session steps=1 walls=1 src=screen at=8400
+expect open p2 wall par=r1 wall=usage-session cont=p1 orphan=1 src=screen
+expect close p2 wall out=passed src=screen at=20887
+expect open t3 turn par=r1 src=screen conf=strong at=20887
+tx prompt v3 dated=20887 off=6949 slice=claude-2.1.299-transcript-session-limit-cancelled-then-person-turn:10-12
+expect amend t3 turn vref=v3 by=vendor src=transcript conf=strong
+at 20915 tx end vdur=30 in=22414 out=12 dated=20915 off=8562 slice=claude-2.1.299-transcript-session-limit-cancelled-then-person-turn:10-12
+expect amend t3 turn vdur_ms=30 tok_in=22414 tok_out=12 by=vendor conf=strong
+at 21000 see idle
+wait 1000
+expect close t3 turn out=done src=screen at=21000
+expect turn=none

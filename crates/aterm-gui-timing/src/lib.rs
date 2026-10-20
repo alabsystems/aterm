@@ -99,6 +99,143 @@ impl Timing {
     pub const fn is_fast(self) -> bool {
         self.divisor != 1
     }
+
+    /// Return this timing mode's divisor (`1` for production, `1000` for fast).
+    #[must_use]
+    pub const fn divisor(self) -> u32 {
+        self.divisor
+    }
+
+    /// Scale a production wait given in whole milliseconds (`production_ms`).
+    /// Under [`Timing::PRODUCTION`] returns `production_ms` unchanged; under
+    /// [`Timing::FAST`] divides by `1000`, clamping any non-zero wait to at
+    /// least `1` ms so a cadence loop never spins.
+    #[must_use]
+    pub const fn scale_millis(self, production_ms: u64) -> u64 {
+        if self.divisor <= 1 || production_ms == 0 {
+            return production_ms;
+        }
+        let scaled = production_ms / (self.divisor as u64);
+        if scaled >= 1 { scaled } else { 1 }
+    }
+
+    /// Scale `production_ms`, clamping the scaled wait to `[min(floor_ms, production_ms), production_ms]`.
+    #[must_use]
+    pub const fn scale_millis_at_least(self, production_ms: u64, floor_ms: u64) -> u64 {
+        let scaled = self.scale_millis(production_ms);
+        if self.divisor <= 1 || scaled >= floor_ms {
+            scaled
+        } else if floor_ms < production_ms {
+            floor_ms
+        } else {
+            production_ms
+        }
+    }
+
+    /// Compute a bounded exponential backoff in milliseconds (`base_ms << shift`,
+    /// capped at `cap_ms`, with `shift` clamped to `<= 20`) and scale it by
+    /// `self`.
+    #[must_use]
+    pub const fn exponential_backoff_ms(self, base_ms: u64, attempt: u32, cap_ms: u64) -> u64 {
+        let shift = if attempt > 20 { 20 } else { attempt };
+        let raw = base_ms.saturating_mul(1u64 << shift);
+        let bounded = if raw > cap_ms { cap_ms } else { raw };
+        self.scale_millis(bounded)
+    }
+
+    /// Encode `(self, production_ms, floor_ms)` into a 20-byte little-endian
+    /// wire snapshot (`divisor: u32, production_ms: u64, floor_ms: u64`).
+    #[must_use]
+    pub const fn encode_cadence_wire_le(self, production_ms: u64, floor_ms: u64) -> [u8; 20] {
+        let d = self.divisor.to_le_bytes();
+        let p = production_ms.to_le_bytes();
+        let f = floor_ms.to_le_bytes();
+        [
+            d[0], d[1], d[2], d[3], p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], f[0], f[1],
+            f[2], f[3], f[4], f[5], f[6], f[7],
+        ]
+    }
+
+    /// Decode a 20-byte little-endian cadence snapshot produced by
+    /// [`Self::encode_cadence_wire_le`], accepting only canonical divisors (`1`
+    /// or `1000`).
+    #[must_use]
+    pub const fn decode_cadence_wire_le(wire: &[u8; 20]) -> Option<(Self, u64, u64)> {
+        let divisor = u32_le(wire[0], wire[1], wire[2], wire[3]);
+        let timing = match divisor {
+            1 => Self::PRODUCTION,
+            1000 => Self::FAST,
+            _ => return None,
+        };
+        let production_ms = u64_le(
+            wire[4], wire[5], wire[6], wire[7], wire[8], wire[9], wire[10], wire[11],
+        );
+        let floor_ms = u64_le(
+            wire[12], wire[13], wire[14], wire[15], wire[16], wire[17], wire[18], wire[19],
+        );
+        Some((timing, production_ms, floor_ms))
+    }
+
+    /// Encode `(self, production_ms, floor_ms)` into a 20-byte big-endian
+    /// wire snapshot (`divisor: u32, production_ms: u64, floor_ms: u64`).
+    #[must_use]
+    pub const fn encode_cadence_wire_be(self, production_ms: u64, floor_ms: u64) -> [u8; 20] {
+        let d = self.divisor.to_be_bytes();
+        let p = production_ms.to_be_bytes();
+        let f = floor_ms.to_be_bytes();
+        [
+            d[0], d[1], d[2], d[3], p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], f[0], f[1],
+            f[2], f[3], f[4], f[5], f[6], f[7],
+        ]
+    }
+
+    /// Decode a 20-byte big-endian cadence snapshot produced by
+    /// [`Self::encode_cadence_wire_be`], accepting only canonical divisors (`1`
+    /// or `1000`).
+    #[must_use]
+    pub const fn decode_cadence_wire_be(wire: &[u8; 20]) -> Option<(Self, u64, u64)> {
+        let divisor = u32_be(wire[0], wire[1], wire[2], wire[3]);
+        let timing = match divisor {
+            1 => Self::PRODUCTION,
+            1000 => Self::FAST,
+            _ => return None,
+        };
+        let production_ms = u64_be(
+            wire[4], wire[5], wire[6], wire[7], wire[8], wire[9], wire[10], wire[11],
+        );
+        let floor_ms = u64_be(
+            wire[12], wire[13], wire[14], wire[15], wire[16], wire[17], wire[18], wire[19],
+        );
+        Some((timing, production_ms, floor_ms))
+    }
+}
+
+#[inline]
+const fn u32_le(b0: u8, b1: u8, b2: u8, b3: u8) -> u32 {
+    (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16) | ((b3 as u32) << 24)
+}
+
+#[inline]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "eight bytes as shifts, not `from_*_bytes`, so the Trust lane proves it (e9568a13f7)"
+)]
+const fn u64_le(b0: u8, b1: u8, b2: u8, b3: u8, b4: u8, b5: u8, b6: u8, b7: u8) -> u64 {
+    (u32_le(b0, b1, b2, b3) as u64) | ((u32_le(b4, b5, b6, b7) as u64) << 32)
+}
+
+#[inline]
+const fn u32_be(b0: u8, b1: u8, b2: u8, b3: u8) -> u32 {
+    ((b0 as u32) << 24) | ((b1 as u32) << 16) | ((b2 as u32) << 8) | (b3 as u32)
+}
+
+#[inline]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "eight bytes as shifts, not `from_*_bytes`, so the Trust lane proves it (e9568a13f7)"
+)]
+const fn u64_be(b0: u8, b1: u8, b2: u8, b3: u8, b4: u8, b5: u8, b6: u8, b7: u8) -> u64 {
+    ((u32_be(b0, b1, b2, b3) as u64) << 32) | (u32_be(b4, b5, b6, b7) as u64)
 }
 
 /// The shortest wait [`Timing::FAST`] scales to: a non-zero production wait
@@ -202,5 +339,27 @@ mod tests {
         select_fast();
         assert_eq!(current(), Timing::FAST);
         assert_eq!(current(), Timing::FAST);
+    }
+
+    #[test]
+    fn scale_millis_backoff_and_cadence_wire_round_trip() {
+        assert_eq!(Timing::PRODUCTION.divisor(), 1);
+        assert_eq!(Timing::FAST.divisor(), 1000);
+        assert_eq!(Timing::PRODUCTION.scale_millis(10_000), 10_000);
+        assert_eq!(Timing::FAST.scale_millis(10_000), 10);
+        assert_eq!(Timing::FAST.scale_millis(50), 1);
+        assert_eq!(Timing::FAST.scale_millis(0), 0);
+        assert_eq!(Timing::FAST.scale_millis_at_least(5_000, 1_000), 1_000);
+        assert_eq!(
+            Timing::PRODUCTION.exponential_backoff_ms(100, 3, 5_000),
+            800
+        );
+        assert_eq!(Timing::FAST.exponential_backoff_ms(1_000, 4, 10_000), 10);
+
+        let wire = Timing::FAST.encode_cadence_wire_le(10_000, 250);
+        assert_eq!(
+            Timing::decode_cadence_wire_le(&wire),
+            Some((Timing::FAST, 10_000, 250))
+        );
     }
 }

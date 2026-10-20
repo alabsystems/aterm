@@ -26,6 +26,8 @@
 //! - [`TurnTracker`] turns screen verdict words into turns and steps.
 //! - [`Fold`] reduces records to a [`SessionState`]; [`Fold::clause`] is the
 //!   tab clause, [`brief()`] the token-budgeted rollup.
+//! - [`NodeLog`] is the instance's own ring (node `n`: its start, fabric
+//!   link and config facts), RAM only and never on the bus.
 //!
 //! Producers call typed methods ([`Log::open`], [`Log::close`],
 //! [`Log::mark`], [`TurnTracker::observe`]); no payload string is formatted
@@ -41,6 +43,7 @@ pub mod journal;
 pub mod limit;
 pub mod line;
 pub mod log;
+pub mod node_log;
 pub mod rec;
 pub mod turn;
 pub mod vocab;
@@ -51,10 +54,12 @@ pub use field::{
     BoundedText, BoundedToken, Cap, Charset, FIELDS, FieldError, Fields, Key, MAX_FIELDS, Tier, Val,
 };
 pub use fold::{
-    BusFacts, BusTotals, Claim, Clause, ClosedNode, Fold, Hints, Need, OpenNode, Phase,
-    SessionState, SnapError, Tone, Totals, Words, clause_of, clear_lifts, confidence_law,
-    lifts_failure, mark_may_raise, need_precedence, need_raised, shown_label, shown_verdicts,
-    starts_epoch,
+    BusFacts, BusTotals, Claim, Clause, ClauseRow, ClosedNode, Fold, Hints, MAIL_LINK_WINDOW_MS,
+    MAX_MAIL_WAITING, MailLink, MailLinkOf, MailWaiting, Need, OpenNode, Phase, SessionState,
+    SnapError, Tone, Totals, Words, amend_refines_out, clause_of, clause_of_proven, clear_lifts,
+    confidence_law, lifts_failure, mail_in_window, mail_link_of, mark_may_raise, need_precedence,
+    need_raised, need_takes_amend, shown_label, shown_proven_label, shown_verdicts, starts_epoch,
+    turn_out_rebucket,
 };
 pub use limit::{MARK_ACTORS, MARK_BURST, MARK_REFILL_MS, MarkLimiter};
 pub use line::{
@@ -74,10 +79,13 @@ pub use log::{
     Rollup, SEQ_LIMIT, closes_over_half, evict_class, log_owned, low_water, mark_quota,
     natural_parent, over_limits,
 };
+pub use node_log::{NODE_LOG_RECORDS, NODE_MARKS, NodeLog};
 pub use rec::{Rec, Stamp};
 pub use turn::{
-    ATTRIBUTION_MS, LastClose, SETTLE_MS, ScreenStep, SettleCause, TrackerView, TurnTracker,
-    Verdict, attributes, rebase, settle_due, settle_out,
+    ATTRIBUTION_MS, ActWord, Admission, AttributionView, Binding, LastClose, SETTLE_MS,
+    STEP_ACT_MS, STEP_INPUT_LEAD_MS, ScreenStep, SettleCause, TX_TOOLS_MAX, TrackerView,
+    TurnTracker, TxEvent, TxMark, TxPos, TxState, TxView, Verdict, WallJudge, attributes,
+    dismisses, rebase, settle_due, settle_out, tx_close_at, within_lead,
 };
 pub use vocab::{
     Actor, Conf, Kind, Lvl, Node, Op, RESERVED_ACTOR_WORDS, ShortId, Src, is_reserved_actor_word,

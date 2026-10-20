@@ -92,7 +92,7 @@ impl Rig {
         // Each window's OS identity, which the pre-Commit queue records keys by.
         for (n, window) in [w0, w1, w2].into_iter().enumerate() {
             app.winit_to_window
-                .insert(winit::window::WindowId::from(n as u64), window);
+                .insert(aterm_window::window::WindowId::from(n as u64), window);
         }
         Rig {
             app,
@@ -223,7 +223,9 @@ impl Rig {
                     .0;
                 self.app.queue_pre_commit_input(
                     winit_id,
-                    winit::event::WindowEvent::Ime(winit::event::Ime::Commit("ls".into())),
+                    aterm_window::event::WindowEvent::Ime(aterm_window::event::Ime::Commit(
+                        "ls".into(),
+                    )),
                 );
                 self.app.settle_carried_window_show()
             }

@@ -40,8 +40,8 @@ clean {
     def Satisfies {State : Type} (M : StateMachine State) (F : Formula State) : Prop :=
       ∀ b, Runs M b → F b
 
-    notation:50 M " ⊨ " F:50 => Satisfies M F
-    prefix:75 "□" => Always
+    notation:50 M " ⊨ " F:50 => _root_.Astream.Broker.TlaLogIdentity.Satisfies M F
+    prefix:75 "□" => _root_.Astream.Broker.TlaLogIdentity.Always
 
     theorem invariantAt {State : Type} (M : StateMachine State) (I : State → Prop)
         (hInit : ∀ s : State, M.init s → I s)

@@ -43,7 +43,8 @@ impl Rig {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         Self {
             app,
-            id: 0,
+            // No spare yet: an id no session has (the stub tab took the first).
+            id: u64::MAX,
             fifo_at: dir.path().join("fifo"),
             _dir: dir,
         }
@@ -93,10 +94,19 @@ impl Rig {
             .as_ref()
             .map_or(0, |l| l.witness.host_effects.load(Ordering::Acquire));
         let stale = spares.slot.as_ref().is_some_and(|s| {
-            s.state.warm() && spares.shared.generation.load(Ordering::Acquire) != s.generation
+            let warm_booked = s.state == SlotState::Booked
+                && !aterm_core::shell_integration::has_parked_hold(s.inputs.shell);
+            (s.state.warm() || warm_booked)
+                && spares.shared.generation.load(Ordering::Acquire) != s.generation
         });
         vec![
             ("state", state),
+            (
+                "warm",
+                i64::from(spares.slot.as_ref().is_some_and(|s| {
+                    !aterm_core::shell_integration::has_parked_hold(s.inputs.shell)
+                })),
+            ),
             (
                 "spares",
                 i64::from(spares.slot.is_some()) + spares.transit.len() as i64,
@@ -160,14 +170,36 @@ impl Rig {
                 LANDED.with(|l| *l.borrow_mut() = None);
                 true
             }
-            "Spawned" => {
-                if !self
-                    .app
-                    .spares
-                    .slot
-                    .as_ref()
-                    .is_some_and(|s| s.state == SlotState::Booked)
-                {
+            "BookWarm" => {
+                if self.app.spares.slot.is_some() || !self.app.spares.transit.is_empty() {
+                    return false;
+                }
+                // `spare_book_check`'s last gate for a shell with no PARKED
+                // hold: the WARM gates a `run` passes.
+                if self.app.spare_warm_gates(now, now).is_some() {
+                    return false;
+                }
+                self.id = self.app.next_session_id;
+                self.app.next_session_id += 1;
+                let mut slot = super::tests::parked_slot_for(&self.app, self.id, Some("/tmp"));
+                slot.state = SlotState::Booked;
+                slot.inputs.shell = aterm_core::shell_integration::ShellType::Fish;
+                slot.generation = self.app.spares.shared.generation.load(Ordering::Acquire);
+                let _ = std::fs::remove_file(&self.fifo_at);
+                slot.link
+                    .witness
+                    .hold_fifo(SpareFifo::make_at(self.fifo_at.clone()).expect("fifo"));
+                slot.session = None;
+                self.app.spares.slot = Some(slot);
+                LANDED.with(|l| *l.borrow_mut() = None);
+                true
+            }
+            "Spawned" | "SpawnedWarm" => {
+                let warm = action == "SpawnedWarm";
+                if !self.app.spares.slot.as_ref().is_some_and(|s| {
+                    s.state == SlotState::Booked
+                        && warm != aterm_core::shell_integration::has_parked_hold(s.inputs.shell)
+                }) {
                     return false;
                 }
                 let link = self.link();
@@ -292,6 +324,7 @@ impl Rig {
                             rc_ms: None,
                             inputs: slot.inputs.clone(),
                             miss: Arc::default(),
+                            retarget: Arc::default(),
                         });
                         PENDING.with(|p| *p.borrow_mut() = Some(session));
                         true
@@ -442,4 +475,27 @@ fn the_spare_lifecycle_conforms_to_its_model() {
     lockstep(&["Book", "Spawned", "ParkMark", "Exits", "Adopt", "Retire"]);
     // A host effect before adoption delivers nothing.
     lockstep(&["Book", "Spawned", "ParkMark", "HostEffect", "Retire"]);
+    // A WARM-only spare (fish): booked only through an open gate, landed
+    // Warming, adopted once verified.
+    lockstep(&[
+        "BookWarm",
+        "GateOpens",
+        "BookWarm",
+        "Spawned",
+        "SpawnedWarm",
+        "StartMark",
+        "Verified",
+        "Adopt",
+        "Land",
+    ]);
+    // A generation that moves while it spawns: stale from its landing, and
+    // never adopted.
+    lockstep(&[
+        "GateOpens",
+        "BookWarm",
+        "GenerationMoves",
+        "SpawnedWarm",
+        "Adopt",
+        "Retire",
+    ]);
 }

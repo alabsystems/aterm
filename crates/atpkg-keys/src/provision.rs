@@ -144,8 +144,13 @@ pub fn home_path(rel: &str) -> Result<String, String> {
 /// 44-character transcription risk in a different costume. The flag still exists for
 /// tests and for the operator who really does mean a different tree; this is the default.
 pub fn discover_pins_path() -> Result<String, String> {
-    let mut dir = std::env::current_dir()
+    let dir = std::env::current_dir()
         .map_err(|e| concat(&["cannot read the current directory: ", &e.to_string()]))?;
+    discover_pins_path_from(dir)
+}
+
+/// [`discover_pins_path`]'s walk, from `dir` rather than the current directory.
+fn discover_pins_path_from(mut dir: std::path::PathBuf) -> Result<String, String> {
     // Bounded: a repository is not 24 levels below where anyone runs a CLI, and an
     // unbounded walk to `/` is how a tool ends up editing something it never meant to.
     for _ in 0..24 {
@@ -2223,6 +2228,18 @@ mod tests {
         publish_roster(&fresh_roster, b"BODY", b"SIG").expect("publish with nothing in the way");
         assert_eq!(std::fs::read(&fresh_roster).unwrap(), b"BODY");
         assert_eq!(std::fs::read(&fresh_sig).unwrap(), b"SIG");
+
+        // A lock makes the directory it guards (a fresh checkout has no `dist/`) and guards
+        // that roster and no other, and a commit never replaces whatever holds the
+        // transaction's fixed name, even an empty directory.
+        let (guarded, other) = (fresh.join("dist/a.toml"), fresh.join("b.toml"));
+        let guarded = guarded.to_str().unwrap();
+        let lock = lock_roster(guarded).unwrap();
+        assert!(publish_roster_locked(&lock, other.to_str().unwrap(), None, b"B", b"S").is_err());
+        assert!(!other.exists());
+        std::fs::create_dir(roster_txn_path(guarded)).unwrap();
+        assert!(publish_roster_locked(&lock, guarded, None, b"A", b"S").is_err());
+        assert!(!std::path::Path::new(guarded).exists());
     }
 
     /// A CRASH BETWEEN THE TWO RENAMES CONVERGES FORWARD, NOT SIDEWAYS. This is the
@@ -2288,6 +2305,20 @@ mod tests {
             !std::path::Path::new(&transaction).exists(),
             "a completed transaction is retired, so it cannot replay a second time"
         );
+        // ...and the retired directory is collected: nothing but the pair and its lock.
+        let mut left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "aterm-machines.toml",
+                "aterm-machines.toml.lock",
+                "aterm-machines.toml.sig"
+            ]
+        );
     }
 
     /// RECOVERY NEVER OVERWRITES A PAIR IT DID NOT WRITE. A redo log that replayed
@@ -2335,6 +2366,18 @@ mod tests {
             std::path::Path::new(&transaction).exists(),
             "the evidence stays on disk for the operator to reconcile"
         );
+
+        // A predecessor marker it cannot read is a damaged log, refused rather than read
+        // as "published over nothing", even where nothing is on disk to protect.
+        std::fs::write(
+            std::path::Path::new(&transaction).join("predecessor-state"),
+            b"torn",
+        )
+        .unwrap();
+        std::fs::remove_file(roster).unwrap();
+        std::fs::remove_file(&sig_path).unwrap();
+        assert!(lock_roster(roster).is_err());
+        assert!(!std::path::Path::new(roster).exists());
     }
 
     /// AN OBSERVER OBSERVES. Recovery is a WRITE, and completing a redo transaction as a
@@ -2884,6 +2927,45 @@ mod tests {
         std::fs::write(&paths.roster, b"schema = 1\n").unwrap();
         let err = preflight(Verb::Setup, "m3", &paths).unwrap_err();
         assert!(err.contains("roster already exists"), "{err}");
+
+        // A lone SIGNATURE is a half-published pair, not an absent roster: the fresh path
+        // refuses it, so no first roster is ever planned over one.
+        std::fs::remove_file(&paths.roster).unwrap();
+        std::fs::write(concat(&[&paths.roster, ".sig"]), b"sig").unwrap();
+        let master = seed_of(PAPER).pubkey_b64().unwrap();
+        let expect = RosterExpectation::MayCreateFresh;
+        assert!(load_roster(&paths.roster, &master, NOW, expect).is_err());
+    }
+
+    /// A machine id is 1-32 ASCII letters, digits, `-` and `_`.
+    #[test]
+    fn a_machine_id_is_vetted_at_its_bounds() {
+        let (longest, too_long) = ("a".repeat(32), "a".repeat(33));
+        for (id, ok) in [
+            ("m3-2026b_x", true),
+            (longest.as_str(), true),
+            (too_long.as_str(), false),
+            ("", false),
+            ("m 3", false),
+            ("m3\u{e9}", false),
+        ] {
+            assert_eq!(vet_machine_id(id).is_ok(), ok, "{id:?}");
+        }
+    }
+
+    /// The anchor file is FOUND from inside the checkout: this crate's directory is two
+    /// levels below the root.
+    #[test]
+    fn the_pins_file_is_discovered_from_inside_the_checkout() {
+        let found = discover_pins_path_from(env!("CARGO_MANIFEST_DIR").into()).unwrap();
+        let shipped = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../aterm-update-core/src/pins.rs"
+        );
+        assert_eq!(
+            std::fs::canonicalize(found).unwrap(),
+            std::fs::canonicalize(shipped).unwrap()
+        );
     }
 
     /// A pins file this writer does not recognise stops the run at preflight rather than

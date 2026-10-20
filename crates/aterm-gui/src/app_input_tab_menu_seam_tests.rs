@@ -111,7 +111,7 @@ fn the_controller_walks_and_activates_the_card() {
 /// route (`on_mouse_wheel` and `ctl mouse wheel` both converge here).
 #[test]
 fn a_wheel_notch_under_the_card_is_swallowed() {
-    use winit::event::MouseScrollDelta;
+    use aterm_window::event::MouseScrollDelta;
 
     let (mut app, wid) = app_with_strip();
     let term = app

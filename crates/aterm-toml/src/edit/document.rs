@@ -98,8 +98,8 @@ impl DocumentMut {
     /// the table its LINE sits in, not the one its key does.
     ///
     /// That is for a key-value line. A TABLE goes whole, `[header]`-spelled or
-    /// dotted: every line it printed, with the comment lines above and among
-    /// them.
+    /// dotted: every line it printed, with the comment lines above, among and
+    /// directly under them ([`super::Table`]'s trailing lines).
     pub fn remove_path(&mut self, path: &[&str]) -> Option<Item> {
         let (leaf, parents) = path.split_last()?;
         let Some(depth) = line_owner_depth(self.as_table(), parents) else {

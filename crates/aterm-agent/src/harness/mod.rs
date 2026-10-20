@@ -18,16 +18,13 @@
 //! * [`disk`] — DISK WATCH AND CLEANUP (design §5.5): the free-space figure
 //!   and the stale targets, each row carrying the WITNESS that makes it safe
 //!   to remove. Report-only is the shape of the function, not a flag.
-//! * [`align`] — the bounded child runner [`disk`] reads `df` through.
+//! * [`align`] — the bounded child runner: a child read to a deadline.
 //! * [`footer`] — the Claude Code footer aterm paints in place of the vendor's
 //!   permission-mode row: model + effort, working directory, branch, read
 //!   from the files Claude Code already keeps.
-//! * [`spend`] — THE DOLLAR FIGURES of the account stats: every transcript
-//!   of a Claude Code home folded into list-price dollars per time bucket
-//!   (the shipped, dated `prices.toml`, injected), kept with byte cursors in
-//!   a spend file so a second fold reads only appended bytes, and a window's
-//!   capacity (`C ≥ $ ÷ used`) and what is left (`≈ C × (1 − used)`). A leaf
-//!   that nothing deciding anything imports.
+//! * [`spend`] — the dated list-price table and the Codex conversation fold
+//!   used by `harness usage`; unknown models and token classes stay unpriced.
+//!   It does not scan account homes or estimate remaining account capacity.
 //! * [`session_usage`] — THIS session's usage, one implementation for the
 //!   footer and `harness usage`: its tokens per model, folded incrementally
 //!   from its own transcript and its subagents' (live), and the limit wall
@@ -56,18 +53,41 @@
 //!   chose; never down — on its relaunch line (`--model`, never `/model`).
 //! * [`lanes`] — WHICH LANES ARE WRITTEN FOR AN AGENT: the relaunch on exit,
 //!   the live upgrade and the restart in place, one [`lanes::Lanes`] per
-//!   program. Muse Code has the relaunch on exit (and so the restore) alone;
-//!   agy and Gemini CLI are supervised with none (an exit is not relaunched,
-//!   a build not moved live).
+//!   program. Gemini CLI has the relaunch on exit (and so the restore) alone:
+//!   it is never moved onto a newer build live. Muse Code and agy have the
+//!   relaunch on exit and the live upgrade's quiet flow.
+//! * [`result`] — A WORKER'S RESULT: the report a Claude Code worker ended
+//!   its task with, read from its transcript and snapshotted once at the
+//!   done edge under `<state>/tasks/`, and the `result [full]` reply over
+//!   that snapshot (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §2.3).
 //! * [`upgrade_muse`] — the MUSE CODE lane's pure half (relaunch on exit and
-//!   restore, no live upgrade): its flag table, the UUID-only session id, its
-//!   own exit table (a start it refused is no crash), the session-log
-//!   fallback and the `.session.lock` witness; its I/O half is
-//!   `upgrade_drive`'s `muse` module.
+//!   restore): its flag table, the UUID-only session id, its own exit table
+//!   (a start it refused is no crash), the session-log fallback and the
+//!   `.session.lock` witness; its I/O half is `upgrade_drive`'s `muse` module.
+//! * [`upgrade_muse_live`] — MUSE CODE'S LIVE UPGRADE, its pure half (the
+//!   quiet flow alone): the revision-aware order of two store builds, its
+//!   session log's part of a process and the work open in it, and the gate;
+//!   its I/O half is `upgrade_drive`'s `muse::live` module.
+//! * [`upgrade_agy`] — the AGY lane's pure half (relaunch on exit and
+//!   restore): its Go flag table (the hidden config flags carried), the
+//!   UUIDv4 conversation id, its exit table read with the dead pid's crash
+//!   file (Ctrl-Z alive, a refused start no crash), and the presence-lock
+//!   witness; its I/O half is `upgrade_drive`'s `agy` module.
+//! * [`upgrade_agy_live`] — AGY'S LIVE UPGRADE, its pure half (the quiet flow
+//!   alone): atpkg's order of two store builds, the background work open in
+//!   the conversation's transcript, its summary row, the wakes pending, and
+//!   the gate; its I/O half is `upgrade_drive`'s `agy::live` module.
+//! * [`upgrade_gemini`] — the GEMINI CLI lane's pure half (relaunch on exit
+//!   and restore, no live upgrade): its yargs flag table, the full-UUID
+//!   session id, its exit table (a start it refused is no crash), the
+//!   start-time witness (the one session header of its project begun since
+//!   it started) and the read-only pre-check of what `--resume` would load;
+//!   its I/O half is `upgrade_drive`'s `gemini` module.
 //! * [`relaunch`] — THE RELAUNCH PRIMITIVE both the upgrade and relaunch on
 //!   exit use: an agent that no longer runs started again in its own tab, on
 //!   its own conversation (Claude Code's `--resume`, codex-alab's validated
-//!   line, Muse Code's `resume <uuid>`), and the host's per-session back-off.
+//!   line, Muse Code's `resume <uuid>`, agy's `--conversation=<uuid>`, Gemini
+//!   CLI's `--resume <uuid>`), and the host's per-session back-off.
 //! * [`resume`] — THE RESUME COMMAND a person is told to run for an agent
 //!   the harness cannot bring back itself: for Claude Code, `claude --resume
 //!   <this process's own conversation>` with its launch flags carried, read
@@ -75,8 +95,12 @@
 //!   --continue`, which resumes the directory's newest conversation, a
 //!   sibling tab's where two share it; for Muse Code, its own `muse resume
 //!   <uuid>` ([`upgrade_muse::told_line`]) behind the data and config homes
-//!   it ran under. None for a Codex: codex-alab comes back on the line
-//!   aterm's copy of its own record validated.
+//!   it ran under; for agy, its own `agy --conversation=<uuid>`
+//!   ([`upgrade_agy::told_line`]) after the flags that moved its config and
+//!   behind the `HOME` it ran under; for Gemini CLI, its own `gemini --resume
+//!   <uuid>` ([`upgrade_gemini::told_line`]) in its project, where what that
+//!   resume would load holds every turn. None for a Codex: codex-alab comes
+//!   back on the line aterm's copy of its own record validated.
 //! * [`netwatch`] — THE API'S REACH, pure: which route an agent takes, what
 //!   one probe of the default route may conclude, and the one instance's
 //!   measure and schedule while a supervised session waits at a wall the
@@ -137,26 +161,34 @@ macro_rules! harness_mark {
 pub(crate) use harness_mark;
 
 pub mod accounts;
+pub mod accounts_sync;
 pub mod acts;
 pub mod align;
 pub mod cli;
 pub mod codex_alab;
 pub mod codex_rollout;
+pub mod codex_steps;
 pub mod disk;
+pub mod drive_retention;
+pub mod excerpt;
 pub mod footer;
 pub mod lanes;
 pub mod lights;
+pub mod login_latch;
 pub mod netwatch;
 pub mod open_url;
 pub mod profile;
 pub mod relaunch;
+pub mod repo_work;
 pub mod restart_stamp;
+pub mod result;
 pub mod resume;
 pub mod self_claimed;
 pub mod session_usage;
 pub mod source;
 pub mod spend;
 pub mod stats;
+pub mod steps;
 pub mod tap;
 /// The harness's clock: every bounded wait of the live upgrade and the
 /// relaunch, as one value ([`Timings`]).
@@ -164,10 +196,14 @@ pub mod timings;
 pub use timings::Timings;
 pub(crate) mod transcript;
 pub mod upgrade;
+pub mod upgrade_agy;
+pub mod upgrade_agy_live;
 pub mod upgrade_catalog;
 pub mod upgrade_drive;
+pub mod upgrade_gemini;
 pub mod upgrade_models;
 pub mod upgrade_muse;
+pub mod upgrade_muse_live;
 pub mod upgrade_wake;
 pub mod usage;
 
@@ -493,6 +529,35 @@ impl Drop for FakeInstanceServer {
 #[cfg(test)]
 #[path = "alab_marker_cross_tests.rs"]
 mod alab_marker_cross_tests;
+
+/// How the harness tests spell this host's paths. They are written with POSIX
+/// absolute paths (`/logins/work-2`), which Windows reads as relative: its
+/// absolute paths start with a drive.
+#[cfg(test)]
+pub(crate) mod host_path {
+    /// `posix`, a test's absolute POSIX path, as one this host reads as
+    /// absolute: itself on Unix, on Windows the same path on drive `C:`
+    /// (`/s/main.1` is `C:/s/main.1`, its separators kept).
+    pub(crate) fn abs(posix: &str) -> String {
+        debug_assert!(
+            posix.starts_with('/'),
+            "{posix:?} is not a POSIX absolute path"
+        );
+        if cfg!(windows) {
+            format!("C:{posix}")
+        } else {
+            posix.to_owned()
+        }
+    }
+
+    /// `path` as the inside of a JSON string (its quotes not included), as
+    /// Claude Code and Codex write a path: a Windows path's backslashes
+    /// escaped.
+    pub(crate) fn json(path: &std::path::Path) -> String {
+        let quoted = aterm_json::to_string(&path.display().to_string()).expect("a string");
+        quoted[1..quoted.len() - 1].to_owned()
+    }
+}
 
 #[cfg(test)]
 mod tests {

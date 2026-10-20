@@ -52,8 +52,12 @@ fn libdispatch_invokes_an_arity_zero_block() {
     let seen = Arc::clone(&hits);
     // SAFETY: `dispatch_sync` calls a `void (^)(void)` block, which is exactly
     // the `Fn() -> ()` prototype declared here.
-    let block = unsafe { RcBlock::new0(move || seen.fetch_add(1, Ordering::SeqCst)) }
-        .expect("_Block_copy produced a heap block");
+    let block = unsafe {
+        RcBlock::new0(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+    .expect("_Block_copy produced a heap block");
     let q = queue();
     // SAFETY: `q` is a live queue and `block` a live heap block of the right
     // signature; `dispatch_sync` runs it to completion before returning.
@@ -172,4 +176,94 @@ fn a_retained_block_defers_the_dispose() {
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     drop(second);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+/// A block the SYSTEM made is called through its header, as a declared
+/// method calls a framework's completion handler (`BlockPtr::call0`):
+/// `dispatch_block_create` wraps ours in a block libdispatch built, whose
+/// `invoke` is libdispatch's, and calling it runs ours. A one-argument block
+/// gets its argument (`call1`), and a nil block is not called.
+#[test]
+fn a_framework_block_is_called_through_its_header() {
+    unsafe extern "C" {
+        /// `dispatch_block_create(flags, block)`: a new heap block made by
+        /// libdispatch, `_Block_release`d by its holder.
+        fn dispatch_block_create(flags: usize, block: *mut c_void) -> *mut c_void;
+        fn _Block_release(block: *const c_void);
+    }
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&hits);
+    // SAFETY: `void (^)(void)`, the prototype libdispatch's wrapper calls.
+    let ours = unsafe {
+        RcBlock::new0(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+    .expect("heap block");
+    // SAFETY: flags 0 and a live `dispatch_block_t`; the wrapper copies it.
+    let made = unsafe { dispatch_block_create(0, ours.as_ptr()) };
+    assert!(!made.is_null(), "libdispatch made a block");
+    assert_ne!(made, ours.as_ptr(), "a block of its own, not ours");
+    // SAFETY: `made` is a live `void (^)(void)` block; released once after.
+    unsafe {
+        aterm_objc::BlockPtr::from_ptr(made).call0();
+        _Block_release(made);
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "ours ran, once");
+
+    let sum = Arc::new(AtomicUsize::new(0));
+    let acc = Arc::clone(&sum);
+    // SAFETY: `void (^)(NSUInteger)`, the prototype `call1` names below.
+    let one = unsafe {
+        RcBlock::new1(move |options: usize| {
+            acc.fetch_add(options, Ordering::SeqCst);
+        })
+    }
+    .expect("heap block");
+    // SAFETY: a live `void (^)(NSUInteger)` block, and a nil one.
+    unsafe {
+        one.as_block_ptr().call1(26_usize);
+        aterm_objc::BlockPtr::from_ptr(std::ptr::null_mut()).call0();
+    }
+    assert_eq!(sum.load(Ordering::SeqCst), 26);
+}
+
+/// A block built and called through a named prototype (`BlockFn`), as a
+/// call site whose alias a test checks does it: `RcBlock::of` gets the
+/// closure's arguments, `BlockPtr::call` delivers them, two-argument blocks
+/// included, and a nil block is not called.
+#[test]
+fn a_named_prototype_builds_and_calls_its_block() {
+    /// `void (^)(NSUInteger, NSUInteger)`.
+    type Pair = fn(usize, usize);
+    /// `void (^)(void)`.
+    type Done = fn();
+    let sum = Arc::new(AtomicUsize::new(0));
+    let acc = Arc::clone(&sum);
+    // SAFETY: called below as exactly `Pair`.
+    let pair = unsafe {
+        RcBlock::of::<Pair, _>(move |a: usize, b: usize| {
+            acc.fetch_add(a * 10 + b, Ordering::SeqCst);
+        })
+    }
+    .expect("heap block");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&hits);
+    // SAFETY: called below as exactly `Done`.
+    let done = unsafe {
+        RcBlock::of::<Done, _>(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+    .expect("heap block");
+    // SAFETY: live blocks of exactly these prototypes, and a nil one.
+    unsafe {
+        pair.as_block_ptr().call::<Pair>((2, 6));
+        done.as_block_ptr().call::<Done>(());
+        aterm_objc::BlockPtr::from_ptr(std::ptr::null_mut()).call::<Done>(());
+    }
+    assert_eq!(sum.load(Ordering::SeqCst), 26);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(<Pair as aterm_objc::BlockFn>::types(), "v@?QQ");
+    assert_eq!(<Done as aterm_objc::BlockFn>::types(), "v@?");
 }

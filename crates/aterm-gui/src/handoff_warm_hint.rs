@@ -49,14 +49,20 @@ pub(crate) struct WarmHint {
     /// Window 0's grid, as the carry writes it.
     pub(crate) cols: u16,
     pub(crate) rows: u16,
-    /// The live font zoom in thousandths of a physical px, as the carry
-    /// writes it (`App::handoff_font_zoom`): both halves or neither.
+    /// The live font zoom in thousandths of a device px, as the carry
+    /// writes it for an older successor (`App::handoff_font_zoom`): both
+    /// halves or neither.
     pub(crate) zoom: Option<(u32, u32)>,
+    /// The same zoom in thousandths of a px at 1×, the one font-size unit
+    /// (`WindowCarry::font_size_milli`): both halves or neither. An older
+    /// reader skips its fields.
+    pub(crate) size_zoom: Option<(u32, u32)>,
 }
 
 impl WarmHint {
     /// The launch-environment value: `w1;windows=N;sessions=N;cols=N;rows=N` and,
-    /// while a zoom is live, `;px=N;reset=N`.
+    /// while a zoom is live, `;px=N;reset=N` (device px) and `;size=N;sizereset=N`
+    /// (px at 1×).
     #[must_use]
     pub(crate) fn encode(&self) -> String {
         let mut out = format!(
@@ -65,6 +71,9 @@ impl WarmHint {
         );
         if let Some((px, reset)) = self.zoom {
             out.push_str(&format!(";px={px};reset={reset}"));
+        }
+        if let Some((size, reset)) = self.size_zoom {
+            out.push_str(&format!(";size={size};sizereset={reset}"));
         }
         out
     }
@@ -85,6 +94,7 @@ impl WarmHint {
         }
         let (mut windows, mut sessions, mut cols, mut rows, mut px, mut reset) =
             (None, None, None, None, None, None);
+        let (mut size, mut size_reset) = (None, None);
         for field in fields {
             let (key, value) = field.split_once('=')?;
             let slot = match key {
@@ -94,6 +104,8 @@ impl WarmHint {
                 "rows" => &mut rows,
                 "px" => &mut px,
                 "reset" => &mut reset,
+                "size" => &mut size,
+                "sizereset" => &mut size_reset,
                 _ => continue,
             };
             if slot.is_some() {
@@ -107,15 +119,18 @@ impl WarmHint {
             cols: u16::try_from(cols?).ok()?,
             rows: u16::try_from(rows?).ok()?,
             zoom: px.zip(reset),
+            size_zoom: size.zip(size_reset),
         })
     }
 
-    /// The zoom pair in the carry's shape (`WindowCarry::font_px_milli`,
-    /// `font_reset_px_milli`), for `app_config::launch_font_for_zoom`.
+    /// The zoom in the carry's shape ([`crate::app_config::CarriedZoom`]), for
+    /// `app_config::launch_font_for_zoom`.
     #[must_use]
-    pub(crate) fn zoom_milli(&self) -> (Option<u32>, Option<u32>) {
-        self.zoom
-            .map_or((None, None), |(px, reset)| (Some(px), Some(reset)))
+    pub(crate) fn carried_zoom(&self) -> crate::app_config::CarriedZoom {
+        crate::app_config::CarriedZoom {
+            size: self.size_zoom,
+            device: self.zoom,
+        }
     }
 }
 
@@ -146,16 +161,33 @@ mod tests {
             cols: 100,
             rows: 30,
             zoom: None,
+            size_zoom: None,
         };
         assert_eq!(plain.encode(), "w1;windows=3;sessions=6;cols=100;rows=30");
         assert_eq!(WarmHint::parse(&plain.encode()), Some(plain));
         let zoomed = WarmHint {
             zoom: Some((28_000, 24_000)),
+            size_zoom: Some((14_000, 12_000)),
             ..plain
         };
         assert_eq!(WarmHint::parse(&zoomed.encode()), Some(zoomed));
-        assert_eq!(zoomed.zoom_milli(), (Some(28_000), Some(24_000)));
-        assert_eq!(plain.zoom_milli(), (None, None));
+        assert_eq!(
+            zoomed.carried_zoom(),
+            crate::app_config::CarriedZoom {
+                size: Some((14_000, 12_000)),
+                device: Some((28_000, 24_000)),
+            }
+        );
+        assert_eq!(
+            plain.carried_zoom(),
+            crate::app_config::CarriedZoom::default()
+        );
+        // An older writer's hint holds the device pair alone.
+        let older =
+            WarmHint::parse("w1;windows=3;sessions=6;cols=100;rows=30;px=28000;reset=24000")
+                .expect("an older hint reads");
+        assert_eq!(older.size_zoom, None);
+        assert_eq!(older.zoom, Some((28_000, 24_000)));
     }
 
     /// The successor is the hostile-input boundary: whatever arrives, the

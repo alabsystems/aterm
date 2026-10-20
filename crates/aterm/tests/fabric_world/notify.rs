@@ -6,7 +6,7 @@
 //! The rung's claim is one sentence: `notify --on attention --exec <cmd>` runs
 //! the command exactly once per matching offset ACROSS A RESTART, and never more
 //! than the rate limit. Everything here is the real binary against a real broker
-//! on the sealed wire, with a real `/bin/sh` child doing the notifying.
+//! on the fleet's loopback TCP wire, with a real `/bin/sh` child doing the notifying.
 //!
 //! ## No sleeps as synchronisation
 //!
@@ -43,8 +43,7 @@ struct Watch {
     state: PathBuf,
     cap: PathBuf,
     log: PathBuf,
-    addr: String,
-    key_file: PathBuf,
+    sock: String,
 }
 
 impl Watch {
@@ -55,8 +54,7 @@ impl Watch {
             cap: fleet.cap_file(tag, grants),
             log: fleet.tmp.join(format!("{tag}.log")),
             state,
-            addr: fleet.addr.clone(),
-            key_file: fleet.key_file.clone(),
+            sock: fleet.sock.clone(),
         }
     }
 
@@ -76,14 +74,10 @@ impl Watch {
     }
 
     fn argv(&self, on: &str, exec: &str, extra: &[&str]) -> Vec<String> {
-        let mut v: Vec<String> = ["notify", "--fleet", FLEET, "--broker", &self.addr]
+        let mut v: Vec<String> = ["notify", "--fleet", FLEET, "--broker", &self.sock]
             .into_iter()
             .map(str::to_string)
             .collect();
-        // The fixture's transport, not a spelled one — it serves plaintext
-        // loopback without `--features sealed`, and a child handed `--key-file`
-        // against it is refused by its own `transport::connect`.
-        v.extend(harness::fleet_child_flags(&self.key_file));
         let rest: Vec<String> = [
             "--cap-file",
             self.cap.to_string_lossy().as_ref(),

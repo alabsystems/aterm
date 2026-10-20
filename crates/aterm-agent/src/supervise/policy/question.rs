@@ -127,18 +127,28 @@ enum Chosen {
     Unmarked,
 }
 
+/// What a key's ledger row says where its option was chosen as marked
+/// `(Recommended)` ([`Chosen::Label`], and [`Chosen::Wrapped`] after it):
+/// Settings ▸ Harness's DECIDED FOR YOU reads it back
+/// (`crate::harness::stats`), so the two cannot drift.
+pub const CHOSE_RECOMMENDED: &str = "answered with its recommended option";
+
+/// What a key's ledger row says where no option was marked and the first was
+/// taken ([`Chosen::Unmarked`]), read back as [`CHOSE_RECOMMENDED`] is.
+pub const CHOSE_UNMARKED: &str = "no option is marked (Recommended): option 1";
+
 impl Chosen {
     fn unproven(&self) -> String {
         match self {
-            Chosen::Label => "answered with its recommended option".to_string(),
+            Chosen::Label => CHOSE_RECOMMENDED.to_string(),
             Chosen::Wrapped(rows) => format!(
-                "answered with its recommended option (its label wraps: read to row {})",
+                "{CHOSE_RECOMMENDED} (its label wraps: read to row {})",
                 rows.iter()
                     .map(usize::to_string)
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Chosen::Unmarked => "no option is marked (Recommended): option 1".to_string(),
+            Chosen::Unmarked => CHOSE_UNMARKED.to_string(),
         }
     }
 }

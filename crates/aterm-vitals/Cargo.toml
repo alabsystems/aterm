@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-vitals"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm's system-awareness model: what the machine, aterm and each tab are doing (per-core load with momentum and variance, GPU, memory, disk, scope attribution) and the words every surface prints. Pure: no clock, no platform, no dependencies; the host feeds it samples from aterm-sysprobe."
+
+[dependencies]
+# None: a pure model. The host (aterm-gui's vitals_host) reads the machine
+# through aterm-sysprobe and hands this crate plain numbers.
+
+[lints]
+workspace = true

@@ -51,7 +51,7 @@ use aterm_types::control_verbs::ScreenGen;
 use super::relaunch::{
     Launch, NoPlan, Plan, PromptLook, PromptMark, Relaunch, RelaunchLineError, STALE_S,
     WAIT_HAND_LIFTS, await_new, carry_on, confirm, expired, fallback_carried, fallback_origin,
-    hand_waits_out, plan, recorded, relaunch, relaunch_of, resume_mode, screen_mode,
+    hand_waits_out, launched, plan, recorded, relaunch, relaunch_of, resume_mode, screen_mode,
     type_relaunch_line_with, unplanned, wait_until,
 };
 use super::upgrade::{self, Candidate, Facts, Phase, Request, SessionFile, Source, Step, Version};
@@ -72,7 +72,21 @@ mod codex_alab_drive;
 
 #[path = "upgrade_muse_drive.rs"]
 mod muse;
+/// The exit status of the command that just ran in a tab, from one `blocks 2
+/// --json` reply (`head`, `body`): what a task's `exited` mark reads its
+/// agent's code from (`supervise::task_mark`). The shell-integration reader
+/// the Muse Code and agy lanes read their own exits with
+/// ([`parse_exit_status`]).
+pub(crate) use self::parse_exit_status as shell_exit_status;
 pub(super) use muse::carry_in_flight as muse_carry_in_flight;
+
+#[path = "upgrade_agy_drive.rs"]
+mod agy;
+pub(super) use agy::carry_in_flight as agy_carry_in_flight;
+
+#[path = "upgrade_gemini_drive.rs"]
+mod gemini;
+pub(super) use gemini::carry_in_flight as gemini_carry_in_flight;
 
 #[path = "upgrade_watch.rs"]
 mod watch;
@@ -80,7 +94,7 @@ mod watch;
 #[path = "upgrade_build_start.rs"]
 mod build_start;
 pub use build_start::BUILD_FAILS;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use upgrade_status::pin_awake_since;
 #[cfg(any(test, debug_assertions))]
 pub use upgrade_status::progress_projection;
@@ -464,6 +478,15 @@ pub struct Opts {
     /// a model is judged by the build's own catalog alone. `false` — one
     /// login, the packaged state — reads them as ever.
     pub several_logins: bool,
+    /// `[harness] usage_credits` (`crate::supervise::SupervisorConfig::usage_credits`):
+    /// a session may be moved onto a model the account bills to usage
+    /// credits. `false` — the default, the owner's ruling of 2026-10-19 —
+    /// reads the profile's word on how the plan bills Fable
+    /// ([`credits_billed_for`]): such a model is offered to no upgrade
+    /// ([`models::availability`]) and no relaunch is made onto it, a
+    /// fallback's or a return's ([`super::relaunch`]'s
+    /// `refused:model-on-credits`).
+    pub usage_credits: bool,
     /// `[harness] usage_tap` (`crate::supervise::SupervisorConfig::usage_tap`)
     /// is on: the aterm a tap's status-line command names
     /// ([`super::tap::stable_exe`]) and the login of the machine's one
@@ -490,8 +513,10 @@ pub struct Opts {
     /// whose land policy types the land instruction, a nudge, or nothing once
     /// the landing is spent (`done:landing`; [`super::relaunch::resume`], F2).
     /// The window's host sets it, for the one tab it carries on, from that
-    /// session's effective Autopilot; `false` — the CLI's sweep, which reads
-    /// no Autopilot — carries on as Cruise does.
+    /// session's effective Autopilot; `false` — the CLI's sweep, which
+    /// carries no Autopilot of its own — reads the tab's own `status` at the
+    /// carry-on (`relaunch::tab_under_land`), and carries on as Cruise does
+    /// only where that says no Land.
     pub land: bool,
     /// Every bounded wait this pass takes ([`super::Timings`]): the
     /// production values for the product ([`super::Timings::for_build`], which a
@@ -526,10 +551,71 @@ pub enum Instances {
 /// OBSERVED with two real logins: that the caches then follow the login
 /// that started last is read in the bundle, not measured.
 fn model_evidence(opts: &Opts, records: &Records) -> models::Evidence {
+    // A home's standard-profile view for reports and cheap pre-filters. A
+    // process's final decision is rebuilt with its own captured selector.
+    let profile = records
+        .profile(&opts.home)
+        .zip(records.dir())
+        .map(|(plain, dir)| super::profile::Context {
+            plain,
+            records: dir.to_path_buf(),
+            selection: super::profile::Selection::Standard,
+            home: None,
+            config: None,
+            login: None,
+        });
+    let credits_billed = credits_billed_for(opts, profile.as_ref()).unwrap_or_else(|| {
+        models::CREDITS_BILLED_UNREAD
+            .iter()
+            .map(|f| (*f).to_string())
+            .collect()
+    });
+    model_evidence_with_billing(opts, records, credits_billed)
+}
+
+fn model_evidence_with_billing(
+    opts: &Opts,
+    records: &Records,
+    credits_billed: Vec<String>,
+) -> models::Evidence {
     match (records.dir(), records.profile(&opts.home)) {
-        (Some(dir), Some(profile)) if !opts.several_logins => models::read_evidence(dir, &profile),
-        _ => models::Evidence::default(),
+        (Some(dir), Some(profile)) if !opts.several_logins => models::Evidence {
+            credits_billed,
+            ..models::read_evidence(dir, &profile)
+        },
+        // The unknown — but for what usage credits bill, which fails closed.
+        _ => models::Evidence {
+            credits_billed,
+            ..models::Evidence::default()
+        },
     }
+}
+
+/// THE MODEL FAMILIES THE HOME'S ACCOUNT BILLS TO USAGE CREDITS now, under
+/// `[harness] usage_credits = false` ([`Opts::usage_credits`]): by the
+/// profile Claude Code keeps for the home `records` names
+/// ([`super::profile::read`], [`models::credits_billed`]). None under the
+/// key. FAILING CLOSED (the review of 2026-10-19, P4) with two or more
+/// accounts listed (the profile is whichever login started last,
+/// [`Opts::several_logins`]) and with no profile read: Fable
+/// ([`models::CREDITS_BILLED_UNREAD`]) in the preliminary home view only.
+/// A final process decision keeps unknown billing as `None`, permitting no
+/// model move. `Some([])` is known not to bill a family, or the explicit key.
+pub(super) fn credits_billed_for(
+    opts: &Opts,
+    profile: Option<&super::profile::Context>,
+) -> Option<Vec<String>> {
+    if opts.usage_credits {
+        return Some(Vec::new());
+    }
+    if opts.several_logins {
+        return None;
+    }
+    let profile = profile?;
+    super::profile::effective_for_billing(&profile.plain, Some(&profile.records), profile.selection)
+        .ok()
+        .and_then(|path| super::profile::read(&path).ok())
+        .map(|p| models::credits_billed(&p, i64::try_from(now_s()).unwrap_or(i64::MAX)))
 }
 
 /// THE GLOBAL CONFIG CLAUDE CODE KEEPS FOR THE CLAUDE HOME `claude_dir`
@@ -657,7 +743,14 @@ pub(super) fn kernel_start(pid: u32) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// Whether process `pid` lives (one we may not signal included). Pid 0 is no
+/// process — `kill(0, 0)` asks about the caller's own process group, which
+/// always answers — so it is never alive: [`super::relaunch::NO_SHELL`], the
+/// shell of a tab's own program, reads gone wherever it is asked about.
 pub(super) fn alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
     #[cfg(unix)]
     {
         let Ok(p) = libc::pid_t::try_from(pid) else {
@@ -718,6 +811,31 @@ pub(super) fn table() -> Vec<(u32, u32, String)> {
         .collect()
 }
 
+/// Every descendant of `root` in the process table `table` (`(pid, ppid,
+/// basename)`), breadth first; `None` for an empty table, which no read of a
+/// live machine is (`ps` itself is in it): unread, never "no child". The live
+/// upgrade's process rule of the lanes past Claude Code's (Muse Code's G-M3,
+/// agy's G-A2(d)): an idle agent of theirs has no child at all.
+pub(super) fn descendants_in(
+    table: &[(u32, u32, String)],
+    root: u32,
+) -> Option<Vec<(u32, String)>> {
+    if table.is_empty() {
+        return None;
+    }
+    let mut found = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for (pid, ppid, name) in table {
+            if *ppid == parent && *pid != root && !found.iter().any(|(p, _)| p == pid) {
+                found.push((*pid, name.clone()));
+                frontier.push(*pid);
+            }
+        }
+    }
+    Some(found)
+}
+
 /// A `comm` column's basename, a login shell's leading `-` dropped.
 fn base_name(comm: &str) -> String {
     comm.rsplit('/')
@@ -768,6 +886,31 @@ fn terminal_owner(pid: u32, t: &[(u32, u32, String, String)]) -> Option<(u32, &s
     None
 }
 
+/// [`Kernel::opener`] from one `ps` read of `agent` and `parent` alone: the
+/// walk [`terminal_owner`] makes stops at `parent` exactly when `agent` is on
+/// a terminal and `parent` is on none or another, which is all the job's
+/// read needs to know (a whole table costs some 20 ms on a busy Mac, and
+/// every look at the job pays this one).
+fn opener(agent: u32, parent: u32) -> Option<String> {
+    let out = ps(&["-o", "pid=,tty=,comm=", "-p", &format!("{agent},{parent}")])?;
+    let rows: Vec<(u32, String, String)> = out
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let pid = it.next()?.parse().ok()?;
+            let tty = it.next()?.to_string();
+            Some((pid, tty, base_name(&it.collect::<Vec<_>>().join(" "))))
+        })
+        .collect();
+    let row = |p: u32| rows.iter().find(|(q, _, _)| *q == p);
+    let (_, tty, _) = row(agent)?;
+    if !tty.chars().any(|c| c.is_ascii_digit()) {
+        return None; // `??`, `?`, `-`: no controlling terminal at all.
+    }
+    let (_, parent_tty, name) = row(parent)?;
+    (parent_tty != tty).then(|| name.clone())
+}
+
 /// Whether the terminal `owner` ([`terminal_owner`]) opened is an aterm tab:
 /// the owner is an aterm process (`aterm` or an `aterm-<tool>` alias), or pid
 /// 1 (the aterm that opened the pty handed its tabs to a successor in a live
@@ -795,14 +938,22 @@ fn owner_word(owner: Option<(u32, &str)>) -> String {
     }
 }
 
-/// Where the agent stands among its terminal's jobs, from its `(pgid, tpgid)`
-/// and its parent's `pgid`. A job-control shell starts each job in its own
-/// process group and hands it the terminal; a script, `sh -c`, `make`, an IDE
-/// task or a shell without job control runs its child in its own group. The
-/// restart waits for the parent's `pgid == tpgid` ("the shell took the
-/// terminal back"), which for a parent sharing the agent's group already holds
-/// while the agent runs, so the relaunch line would go to whatever the
-/// launcher runs next, or nowhere.
+/// Where the agent stands among its terminal's jobs, from its `(pgid, tpgid)`,
+/// its parent's `pgid`, and whether its parent opened its terminal. A
+/// job-control shell starts each job in its own process group and hands it
+/// the terminal; a script, `sh -c`, `make`, an IDE task or a shell without job
+/// control runs its child in its own group. The restart waits for the
+/// parent's `pgid == tpgid` ("the shell took the terminal back"), which for a
+/// parent sharing the agent's group already holds while the agent runs, so
+/// the relaunch line would go to whatever the launcher runs next, or nowhere.
+/// An aterm tab's own program (`aterm -e claude`, `exec claude` in a tab)
+/// leads its terminal's session and group as a shell's job does, but its
+/// parent is the aterm that opened the pty ([`terminal_owner`],
+/// [`owned_by_aterm`]): no shell is between them to take the terminal back,
+/// and the tab closes as the agent ends. The own program of a pty another
+/// program opened (`tmux new claude`, `script claude`) is read as that
+/// program's job, and the terminal-owner check holds it back
+/// (`held-back:terminal:<owner>`): what the tab types reaches that program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Job {
     /// A job of a job-control shell, and the terminal's foreground now.
@@ -810,14 +961,30 @@ pub(super) enum Job {
     /// A job, but not the terminal's foreground right now (suspended, or put in
     /// the background): what is typed would reach the shell, not the agent.
     Background,
-    /// Not a job of a job-control shell: nothing will take the terminal back
-    /// when it ends. Refused for good, before anything is typed.
+    /// AN ATERM TAB'S OWN PROGRAM: no shell's job, so never restarted or
+    /// relaunched (refused for good, `not-a-shell-job`), but what the tab
+    /// types reaches it while it leads its terminal's `foreground`
+    /// ([`leads_terminal`]: the release an older build's notice owes it).
+    TabProgram {
+        /// Its group is its terminal's foreground group.
+        foreground: bool,
+    },
+    /// Not a job of a job-control shell, or of no shell at all: nothing will
+    /// take the terminal back when it ends. Refused for good, before anything
+    /// is typed.
     NoJobControl,
 }
 
-/// [`Job`] from the numbers `ps` reports.
-fn job(agent: u32, agent_pgid: i64, tpgid: i64, parent_pgid: i64) -> Job {
-    if agent_pgid != i64::from(agent) || parent_pgid == agent_pgid {
+/// [`Job`] from the numbers `ps` reports, and whether the agent's parent is
+/// the aterm that opened its terminal (`aterm_opened`).
+fn job(agent: u32, agent_pgid: i64, tpgid: i64, parent_pgid: i64, aterm_opened: bool) -> Job {
+    if agent_pgid != i64::from(agent) {
+        Job::NoJobControl
+    } else if aterm_opened {
+        Job::TabProgram {
+            foreground: tpgid == agent_pgid,
+        }
+    } else if parent_pgid == agent_pgid {
         Job::NoJobControl
     } else if tpgid != agent_pgid {
         Job::Background
@@ -826,11 +993,19 @@ fn job(agent: u32, agent_pgid: i64, tpgid: i64, parent_pgid: i64) -> Job {
     }
 }
 
-/// [`job`] read from the kernel now, with the parent it was read against.
-fn job_of(agent: u32) -> Option<(Job, u32)> {
-    let (parent, pgid, tpgid) = ids(agent)?;
-    let (_, parent_pgid, _) = ids(parent)?;
-    Some((job(agent, pgid, tpgid, parent_pgid), parent))
+/// [`job`] read through `k` now, with the parent it was read against: the
+/// agent's and its parent's ids ([`Kernel::ids`]) and whether that parent is
+/// an aterm that opened the agent's terminal ([`Kernel::opener`],
+/// [`owned_by_aterm`]). An opener that cannot be read decides nothing here;
+/// every act asks for the terminal's owner again itself, and waits on one
+/// that is not the tab's.
+fn job_of<K: Kernel + ?Sized>(k: &K, agent: u32) -> Option<(Job, u32)> {
+    let (parent, pgid, tpgid) = k.ids(agent)?;
+    let (_, parent_pgid, _) = k.ids(parent)?;
+    let opened = k
+        .opener(agent, parent)
+        .is_some_and(|name| owned_by_aterm((parent, name.as_str())));
+    Some((job(agent, pgid, tpgid, parent_pgid, opened), parent))
 }
 
 /// What one [`Job`] read lets through: `Ok(shell)` when the agent is its
@@ -841,8 +1016,32 @@ pub(super) fn foreground_shell(job: Option<(Job, u32)>) -> Result<u32, &'static 
     match job {
         Some((Job::Foreground, shell)) => Ok(shell),
         Some((Job::Background, _)) => Err("not-foreground"),
+        Some((Job::NoJobControl | Job::TabProgram { .. }, _)) => Err("not-a-shell-job"),
+        None => Err("ids"),
+    }
+}
+
+/// What one [`Job`] read lets be TYPED to the agent with no restart after it
+/// (the release, [`release`]): the agent leads its terminal's foreground —
+/// its shell's foreground job, or an aterm tab's own program in front — so
+/// the line reaches it; else the wait word.
+pub(super) fn leads_terminal(job: Option<(Job, u32)>) -> Result<(), &'static str> {
+    match job {
+        Some((Job::Foreground | Job::TabProgram { foreground: true }, _)) => Ok(()),
+        Some((Job::Background | Job::TabProgram { foreground: false }, _)) => Err("not-foreground"),
         Some((Job::NoJobControl, _)) => Err("not-a-shell-job"),
         None => Err("ids"),
+    }
+}
+
+/// The [`Job`] of a read that refuses the upgrade for good before anything
+/// is typed or signalled ([`not_a_job`]): no job of a job-control shell, or
+/// an aterm tab's own program. `None` for a shell's job, in front or not,
+/// and for no read.
+pub(super) fn not_a_shell_job(job: Option<(Job, u32)>) -> Option<Job> {
+    match job {
+        Some((job @ (Job::NoJobControl | Job::TabProgram { .. }), _)) => Some(job),
+        Some((Job::Foreground | Job::Background, _)) | None => None,
     }
 }
 
@@ -852,14 +1051,32 @@ pub(super) fn foreground_shell(job: Option<(Job, u32)>) -> Result<u32, &'static 
 /// test can script what each read answers and prove that each re-read guards
 /// its act.
 pub(super) trait Kernel {
-    /// Where the agent stands among its terminal's jobs, and its parent
-    /// ([`job_of`]).
-    fn job(&self, agent: u32) -> Option<(Job, u32)>;
+    /// Where the agent stands among its terminal's jobs, and its parent. The
+    /// default reads it through [`Kernel::ids`] and [`Kernel::opener`]
+    /// ([`job_of`]), as [`Live`] does.
+    fn job(&self, agent: u32) -> Option<(Job, u32)> {
+        job_of(self, agent)
+    }
+    /// `(ppid, pgid, tpgid)` of `pid` ([`ids`]), `None` when it cannot be read
+    /// now. The default reads the kernel, as [`Live`] does.
+    fn ids(&self, pid: u32) -> Option<(u32, i64, i64)> {
+        ids(pid)
+    }
     /// `pid`'s parent, `None` when it cannot be read NOW: the process is gone,
     /// or `ps` could not be run. Never a verdict about the process.
     fn parent(&self, pid: u32) -> Option<u32>;
     /// The program that opened `pid`'s terminal ([`terminal_owner`]).
     fn terminal(&self, pid: u32) -> Option<(u32, String)>;
+    /// `parent`'s basename where `parent` opened `agent`'s terminal (the
+    /// owner [`Kernel::terminal`] names is `parent`); `None` where it did
+    /// not, or that cannot be read now. The default asks
+    /// [`Kernel::terminal`]; [`Live`] reads the two processes alone
+    /// ([`opener`]), never the whole table.
+    fn opener(&self, agent: u32, parent: u32) -> Option<String> {
+        self.terminal(agent)
+            .filter(|(owner, _)| *owner == parent)
+            .map(|(_, name)| name)
+    }
     /// The process's start, read again at each restart fence. `None` is
     /// uncertainty and never establishes that the process is still the same.
     fn process_start(&self, pid: u32) -> Option<String> {
@@ -870,14 +1087,21 @@ pub(super) trait Kernel {
     fn restart_background(&self, pid: u32) -> Vec<String> {
         live_background(pid)
     }
+    /// The executable the kernel mapped for `pid` ([`exe_of`]): with its argv,
+    /// the build the process runs ([`launched`]), which the move's line back
+    /// resumes it on ([`St::back_line`]). `None` where it cannot be read.
+    fn image(&self, pid: u32) -> Option<PathBuf> {
+        exe_of(pid)
+    }
     /// Whether `shell` has its terminal back (a job-control shell leading its
     /// own process group, which is the terminal's foreground); `None` when it
-    /// cannot be read now. The default reads the kernel, as [`Live`] does.
+    /// cannot be read now. The default reads it through [`Kernel::ids`], as
+    /// [`Live`] does.
     fn shell_holds_tab(&self, shell: u32) -> Option<bool> {
         if shell == 0 {
             return None;
         }
-        let (_, pgid, tpgid) = ids(shell)?;
+        let (_, pgid, tpgid) = self.ids(shell)?;
         Some(pgid == i64::from(shell) && pgid == tpgid)
     }
     /// The processes of `procs` (`(pid, basename)` under `agent`,
@@ -902,10 +1126,6 @@ pub(super) trait Kernel {
 pub(super) struct Live;
 
 impl Kernel for Live {
-    fn job(&self, agent: u32) -> Option<(Job, u32)> {
-        job_of(agent)
-    }
-
     fn parent(&self, pid: u32) -> Option<u32> {
         if !alive(pid) {
             return None;
@@ -915,6 +1135,10 @@ impl Kernel for Live {
 
     fn terminal(&self, pid: u32) -> Option<(u32, String)> {
         terminal_owner(pid, &tty_table()).map(|(owner, name)| (owner, name.to_string()))
+    }
+
+    fn opener(&self, agent: u32, parent: u32) -> Option<String> {
+        opener(agent, parent)
     }
 
     fn describe(&self, agent: u32, procs: &[(u32, String)]) -> Vec<upgrade::Held> {
@@ -1079,17 +1303,26 @@ pub(super) fn gave_up_words(agent: upgrade::Agent, held: &[upgrade::Held], quiet
              typed, and the quiet upgrade asks nothing again: this round stops; in {span} a new \
              round moves the session at its next idle point, asking nothing"
         ),
-        // Muse Code: relaunched on exit only, never upgraded, so no round of
-        // its own exists to give up.
+        // Muse Code: its live upgrade is the quiet flow alone, which asks
+        // nothing and so never gives up: no round of its own exists to stop.
         (upgrade::Agent::Muse, _) => {
-            "no upgrade lane moves Muse Code (it is only relaunched on exit): nothing is asked \
-             of it or typed into it for an upgrade"
+            "Muse Code's live upgrade asks nothing (its quiet flow alone): it is restarted onto \
+             the new build at its next genuinely idle point, and nothing is typed into it"
                 .to_string()
         }
-        // No lane yet (agy, Gemini CLI): no round of theirs exists to give
-        // up; said so, never as another agent's round.
-        (upgrade::Agent::Agy | upgrade::Agent::Gemini, _) => {
-            "no lane moves this agent: nothing is asked of it or typed into it".to_string()
+        // agy: its live upgrade is the quiet flow alone, which asks nothing
+        // and so never gives up: no round of its own exists to stop.
+        (upgrade::Agent::Agy, _) => {
+            "agy's live upgrade asks nothing (its quiet flow alone): it is restarted onto the new \
+             build at its next genuinely idle point, and nothing is typed into it"
+                .to_string()
+        }
+        // Gemini CLI: relaunched on exit only, never upgraded, so no round
+        // of its own exists to give up.
+        (upgrade::Agent::Gemini, _) => {
+            "no upgrade lane moves Gemini CLI (it is only relaunched on exit): nothing is asked \
+             of it or typed into it for an upgrade"
+                .to_string()
         }
     };
     let list = upgrade::held_list(held);
@@ -1163,7 +1396,7 @@ pub(super) fn exe_of(pid: u32) -> Option<PathBuf> {
 
 /// Every file `pid` holds open (`lsof -p`), `None` when unreadable: the
 /// lanes' read of a process's own locks (codex-alab's writer lock, a Muse
-/// Code's session lock).
+/// Code's session lock, an agy's presence lock and crash file).
 pub(super) fn lsof_open_files(pid: u32) -> Option<Vec<PathBuf>> {
     let out = aterm_uds::spawnfd::command("lsof")
         .args(["-n", "-P", "-w", "-p", &pid.to_string(), "-Fn"])
@@ -1183,23 +1416,210 @@ pub(super) fn lsof_open_files(pid: u32) -> Option<Vec<PathBuf>> {
 
 /// Every process holding `file` open (`lsof -t`), `None` when unreadable:
 /// the lanes' read of who holds a lock (codex-alab's writer lock, a Muse
-/// Code's session lock) before a line resumes it.
+/// Code's session lock, an agy's presence lock) before a line resumes it.
 pub(super) fn lsof_holders(file: &Path) -> Option<Vec<u32>> {
     let out = aterm_uds::spawnfd::command("lsof")
-        .args(["-n", "-P", "-w", "-t"])
+        .args(["-n", "-P", "-t"])
         .arg(file)
         .output()
         .ok()?;
-    // Exit 1 with nothing on stdout is "no process has it open".
-    let text = String::from_utf8_lossy(&out.stdout);
-    if !out.status.success() && !text.trim().is_empty() {
+    lsof_holder_pids(&out)
+}
+
+/// The readable holder census in one completed `lsof -t` reply.
+fn lsof_holder_pids(out: &std::process::Output) -> Option<Vec<u32>> {
+    if !out.stderr.is_empty() {
         return None;
     }
-    Some(
-        text.split_whitespace()
-            .filter_map(|p| p.parse().ok())
-            .collect(),
-    )
+    match out.status.code()? {
+        0 => std::str::from_utf8(&out.stdout)
+            .ok()?
+            .split_whitespace()
+            .map(str::parse)
+            .collect::<Result<Vec<u32>, _>>()
+            .ok(),
+        // Only lsof's ordinary, empty no-match answer proves no holders.
+        1 if out.stdout.is_empty() => Some(Vec::new()),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------- the relaunch lanes' shared reads
+
+// The reads the relaunch-on-exit lanes past Claude Code's share — Muse Code's
+// (`upgrade_muse_drive.rs`) and agy's (`upgrade_agy_drive.rs`), each of which
+// reads an exit off the shell's word: the tab's command blocks
+// (`blocks --json`), a process's start, the shell's dialect, and the version
+// atpkg's record names for a store build and its twin.
+
+/// The blocks of one `blocks --json` reply.
+pub(super) fn blocks_of(head: &str, body: &str) -> Option<Vec<Value>> {
+    if !crate::is_ok_reply(head) {
+        return None;
+    }
+    let json = if body.trim().is_empty() {
+        head.strip_prefix("OK ")?.to_string()
+    } else {
+        body.to_string()
+    };
+    let v: Value = aterm_json::from_str(json.trim()).ok()?;
+    Some(v.get("blocks")?.as_array()?.clone())
+}
+
+/// The block a TUI runs in, read while it runs: the tab's last block,
+/// executing (`MuseRun::block`, `AgyRun::block`).
+pub(super) fn running_block(c: &mut Client, tab: &str) -> Option<u64> {
+    let (head, body) = c.request_counted(&format!("@{tab} blocks 1 --json")).ok()?;
+    let blocks = blocks_of(&head, &body)?;
+    let last = blocks.last()?;
+    (last.get("state").and_then(Value::as_str) == Some("executing"))
+        .then(|| last.get("id").and_then(Value::as_u64))
+        .flatten()
+}
+
+/// The exit status of the command that just ran in `tab`, per shell
+/// integration: the finished block ending where the entering prompt begins
+/// (`blocks 2 --json`) — block `block` where the TUI's snapshot named the one
+/// it ran in ([`running_block`]), so another command run since is never read
+/// as its exit. `None` while there is none.
+pub(super) fn exit_status(c: &mut Client, tab: &str, block: Option<u64>) -> Option<i64> {
+    let (head, body) = c.request_counted(&format!("@{tab} blocks 2 --json")).ok()?;
+    parse_exit_status(&head, &body, block)
+}
+
+/// [`exit_status`] over one `blocks --json` reply (also a task's `exited`
+/// mark's read, [`shell_exit_status`]).
+pub(crate) fn parse_exit_status(head: &str, body: &str, block: Option<u64>) -> Option<i64> {
+    let blocks = blocks_of(head, body)?;
+    let (last, rest) = blocks.split_last()?;
+    if last.get("state").and_then(Value::as_str) != Some("entering") {
+        return None;
+    }
+    let prompt = last.get("prompt").and_then(Value::as_u64)?;
+    let done = rest.last()?;
+    (done.get("state").and_then(Value::as_str) == Some("complete")
+        && done.get("end").and_then(Value::as_u64) == Some(prompt)
+        && block.is_none_or(|block| done.get("id").and_then(Value::as_u64) == Some(block)))
+    .then(|| done.get("exit").and_then(Value::as_i64))
+    .flatten()
+}
+
+/// How many of the tab's newest command blocks a look at a relaunch line's
+/// own block reads ([`line_status`]): the line's, the prompt after it, and a
+/// few commands a person ran since.
+pub(super) const LINE_BLOCKS: u32 = 8;
+
+/// THE EXIT STATUS OF COMMAND BLOCK `block` in one `blocks --json` reply:
+/// `None` while it runs, or where the reply does not hold it complete (no
+/// shell integration, a block scrolled past the window, blocks reset).
+pub(super) fn block_exit(head: &str, body: &str, block: u64) -> Option<i64> {
+    blocks_of(head, body)?
+        .iter()
+        .find(|b| b.get("id").and_then(Value::as_u64) == Some(block))
+        .filter(|b| b.get("state").and_then(Value::as_str) == Some("complete"))?
+        .get("exit")
+        .and_then(Value::as_i64)
+}
+
+/// THE EXIT STATUS OF A RELAUNCH LINE'S OWN COMMAND (its block `block`,
+/// `St::line_block`, read right before the line was typed), once it ended.
+/// `None` while that command runs, where no block was read before it was
+/// typed (no shell integration), or where the tab no longer shows it. Each
+/// lane reads it by its own table.
+pub(super) fn line_status(c: &mut Client, tab: &str, block: Option<u64>) -> Option<i64> {
+    let block = block?;
+    let (head, body) = c
+        .request_counted(&format!("@{tab} blocks {LINE_BLOCKS} --json"))
+        .ok()?;
+    block_exit(&head, &body, block)
+}
+
+/// When `pid` started, unix milliseconds (to the second: `ps`'s elapsed
+/// time), while it runs (`MuseRun::started_ms`, `AgyRun::started_ms`).
+pub(super) fn started_ms(pid: u32) -> Option<u64> {
+    let etime = ps(&["-o", "etime=", "-p", &pid.to_string()])?;
+    let age_s = parse_etime(etime.trim())?;
+    let now_ms = u64::try_from(aterm_time::since_epoch()?.as_millis()).ok()?;
+    Some(now_ms.saturating_sub(age_s.saturating_mul(1000)))
+}
+
+/// The dialect of the shell `shell` from its executable (`args`, its exec
+/// path, else the process table's name), as a relaunch line is written for
+/// it; `None` for a shell no line is written for (`sh`, tcsh, nushell…),
+/// which a lane's plan waits on for ever.
+pub(super) fn shell_dialect_of(
+    shell: u32,
+    args: Option<atpkg::caller_shell::ProcArgs>,
+) -> Option<upgrade::Dialect> {
+    args.map(|a| a.exec_path)
+        .or_else(|| {
+            table()
+                .into_iter()
+                .find(|(p, _, _)| *p == shell)
+                .map(|(_, _, n)| n)
+        })
+        .as_deref()
+        .map(base_name)
+        .as_deref()
+        .and_then(upgrade::Dialect::from_exe_name)
+}
+
+/// The version a store build names in atpkg's record beside it
+/// (`<store>/<program>/<build>.vendor`: `version = "…"`); `None` for a
+/// program run from no store, or no record. Never `--version`, which may
+/// take an agent's own locks (Muse Code's auth lock, measured) and runs the
+/// vendor's code.
+pub(super) fn store_version(program: &Path) -> Option<String> {
+    let build = program.parent()?.parent()?;
+    let record = build.with_extension("vendor");
+    let text = std::fs::read_to_string(record).ok()?;
+    text.lines().find_map(|l| {
+        let v = l.trim().strip_prefix("version")?.trim_start();
+        let v = v.strip_prefix('=')?.trim().trim_matches('"');
+        (!v.is_empty() && !v.chars().any(char::is_control)).then(|| v.to_string())
+    })
+}
+
+/// `twin` where its script names a build of `program` that exists (an atpkg
+/// twin: `exec '<store build>' "$@"`, whatever it exports before).
+pub(super) fn twin_naming(twin: &Path, program: &str) -> Option<PathBuf> {
+    let exe = catalog::twin_binary(&std::fs::read_to_string(twin).ok()?)?;
+    (exe.file_name().and_then(|n| n.to_str()) == Some(program) && exe.is_file())
+        .then(|| twin.to_path_buf())
+}
+
+/// atpkg's `agents/<program>` twin, where it names a build of `program`
+/// ([`twin_naming`]), in the configured prefix's `agents/` ([`agents_dir`]).
+pub(super) fn managed_agent_twin(program: &str) -> Option<PathBuf> {
+    twin_naming(&agents_dir()?.join(program), program)
+}
+
+/// atpkg's `agents/` directory, where its twins are: the configured
+/// prefix's ([`atpkg::store::resolve_configured`]).
+#[cfg(not(test))]
+fn agents_dir() -> Option<PathBuf> {
+    Some(atpkg::store::resolve_configured()?.agents_dir())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The atpkg `agents/` directory a test's twin lookups read (none unless
+    /// the test names one): the machine's own prefix is never a test's.
+    pub(super) static AGENTS_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`agents_dir`] in a test: the one it named on this thread.
+#[cfg(test)]
+fn agents_dir() -> Option<PathBuf> {
+    AGENTS_DIR.with(|dir| dir.borrow().clone())
+}
+
+/// The version the twin's build names ([`store_version`]), for a record's
+/// `to`.
+pub(super) fn twin_version(twin: &Path) -> Option<String> {
+    let exe = catalog::twin_binary(&std::fs::read_to_string(twin).ok()?)?;
+    store_version(&exe)
 }
 
 /// How long `<exe> --version` may take before it is killed and read as no
@@ -1231,15 +1651,15 @@ fn version_of(exe: &Path) -> Probed {
     version_within(exe, VERSION_WAIT)
 }
 
-/// [`version_of`] with an explicit bound covering the whole probe: the
-/// child's exit and the read of its output. The child runs in its own process
-/// group and its output is read on a thread, so a chatty child cannot stall
-/// on a full pipe. The read ends only when the last writer closes the pipe,
-/// which may be a grandchild left running (`sleep 12 & echo 2.1.282; exit
-/// 0`), so the read is waited for against the same deadline; at the deadline
-/// the group is killed and the probe answers [`Probed::TimedOut`] without
-/// waiting for the reader (which ends when the group's last writer dies, or,
-/// for a writer that left via `setsid`, whenever it exits).
+/// [`version_of`] with an explicit bound covering the child's output and
+/// exit. The leading version token is read from at most the first 64 KiB;
+/// this is a prefix budget, not a complete-output claim. The output is
+/// collected before any wait can reap the child, so every group signal still
+/// has its unreaped child's PID reserved. On Unix the shared nonblocking
+/// reader observes the same deadline even if a writer escaped the group.
+/// On other hosts a blocking reader may outlive the probe until its pipe
+/// closes; only the direct child is killed there. The final blocking reap
+/// still relies on OS completion; escaped descendants are not terminated.
 fn version_within(exe: &Path, limit: Duration) -> Probed {
     let deadline = Instant::now() + limit;
     // From the window's harness host (no console) a bare `claude --version`
@@ -1255,22 +1675,18 @@ fn version_within(exe: &Path, limit: Duration) -> Probed {
     let Ok(mut child) = cmd.spawn() else {
         return Probed::NoVersion;
     };
-    // Unix kills the probe's whole group at the deadline; Windows has no group kill
-    // here, so only the child itself is killed (a grandchild holding the pipe is
-    // abandoned with the reader thread, which the timeout already does not wait on).
     #[cfg(unix)]
     let group = libc::pid_t::try_from(child.id()).ok();
     let kill_group = || {
         #[cfg(unix)]
         if let Some(group) = group {
-            // SAFETY: a signal to the process group this spawn made
-            // (`process_group(0)`: pgid is the child's pid). After the child
-            // is reaped it is sent only while a group member still holds the
-            // pipe, and a group id is not reused while a member lives.
+            // SAFETY: `process_group(0)` made this child's PID its private
+            // PGID. Every call below precedes a successful reap, so this
+            // unreaped Child still reserves the numeric PID.
             unsafe { libc::kill(-group, libc::SIGKILL) };
         }
     };
-    let Some(mut stdout) = child.stdout.take() else {
+    let Some(stdout) = child.stdout.take() else {
         kill_group();
         let _ = child.kill();
         let _ = child.wait();
@@ -1280,10 +1696,37 @@ fn version_within(exe: &Path, limit: Duration) -> Probed {
     let _reader = std::thread::Builder::new()
         .name("agent-version-probe".into())
         .spawn(move || {
-            let mut buf = Vec::new();
-            let _ = (&mut stdout).take(64 * 1024).read_to_end(&mut buf);
-            let _ = tx.send(buf);
+            #[cfg(unix)]
+            let read = super::align::read_capture_pipe(stdout, 64 * 1024, deadline);
+            #[cfg(not(unix))]
+            let read = {
+                let mut buf = Vec::new();
+                stdout.take(64 * 1024).read_to_end(&mut buf).map(|_| buf)
+            };
+            let _ = tx.send(read);
         });
+    // Keep the Child unreaped until the pipe has answered. A child that
+    // exited while a descendant holds stdout still reserves its PID here.
+    let out = match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Ok(out)) => out,
+        Ok(Err(error)) => {
+            kill_group();
+            let _ = child.kill();
+            let _ = child.wait();
+            return if error.kind() == std::io::ErrorKind::TimedOut {
+                Probed::TimedOut
+            } else {
+                Probed::NoVersion
+            };
+        }
+        Err(_) => {
+            // Includes reader startup failure or panic: its sender is gone.
+            kill_group();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Probed::TimedOut;
+        }
+    };
     let succeeded = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.success(),
@@ -1296,11 +1739,6 @@ fn version_within(exe: &Path, limit: Duration) -> Probed {
             }
         }
     };
-    let Ok(out) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) else {
-        // The child is gone and something of its group still holds the pipe.
-        kill_group();
-        return Probed::TimedOut;
-    };
     if !succeeded {
         return Probed::NoVersion;
     }
@@ -1309,6 +1747,25 @@ fn version_within(exe: &Path, limit: Duration) -> Probed {
         .next()
         .and_then(Version::parse)
         .map_or(Probed::NoVersion, Probed::Version)
+}
+
+/// Complete UTF-8 stdout from a successful child within `limit` and `cap`.
+/// Missing, unreadable, oversized or unfinished evidence is unknown. The shared
+/// capture owns the process group, deadline and pipe reader.
+pub(super) fn bounded_output(
+    program: &Path,
+    args: &[&std::ffi::OsStr],
+    limit: Duration,
+    cap: u64,
+) -> Option<String> {
+    let cap = usize::try_from(cap).ok()?;
+    let mut cmd = aterm_uds::spawnfd::command(program);
+    cmd.args(args);
+    let out = super::align::capture_bounded(cmd, limit, cap.checked_add(1)?).ok()?;
+    if !out.success() || out.stdout.len() > cap {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
 }
 
 // ---------------------------------------------------------------- targets
@@ -1786,11 +2243,12 @@ fn parse_screen(json: &str) -> Option<Screen> {
         .and_then(Value::as_str)
         .filter(|g| is_generation(g))
         .map(str::to_owned);
-    // Absent (an older host) is unknown; `null` is never; a number is its
-    // age; anything else is unknown, as the supervisor reads it.
+    // Absent (an older host) is unknown; `null` is never — for how long,
+    // where the host says (`"unkeyed_ms"`); a number is its age; anything
+    // else is unknown, as the supervisor reads it.
     let human = match v.get("human_ms") {
         None => HumanInput::Unknown,
-        Some(Value::Null) => HumanInput::Never,
+        Some(Value::Null) => HumanInput::never(v.get("unkeyed_ms").and_then(Value::as_u64)),
         Some(h) => h.as_u64().map_or(HumanInput::Unknown, HumanInput::Ago),
     };
     Some(Screen {
@@ -2039,7 +2497,7 @@ pub(super) const HAND_TTL_MS: u64 = 60_000;
 
 /// How often a wait under the hand renews it ([`Hand::keep`]): well inside
 /// [`HAND_TTL_MS`], so no relaunch wait (exit 30 s, shell prompt 15 s, new
-/// process 90 s, first idle 15 s) outlasts it.
+/// process 90 s, first idle 15 s, a codex-alab's first idle 60 s) outlasts it.
 const HAND_RENEW: Duration = Duration::from_secs(20);
 
 /// The holder name of this process's hand ([`Hand`]): the name its supervisor
@@ -2053,6 +2511,47 @@ pub fn hand_name() -> String {
 
 /// What every window's host's holder name begins with ([`hand_name`]).
 const HOST_HOLDER: &str = "aterm-harness@";
+
+/// The request that takes (or renews) this process's hand on a tab, without
+/// its `@<tab>` selector: what [`Hand::take`] sends. A renewal from another
+/// connection moves the hand there.
+#[must_use]
+pub fn hand_take_request() -> String {
+    format!(
+        "lease acquire ttl={HAND_TTL_MS} holder={} hard",
+        hand_name()
+    )
+}
+
+/// The request that gives this process's hand back ([`hand_take_request`]'s
+/// pair, [`Hand::give_back`]).
+#[must_use]
+pub fn hand_give_back_request() -> String {
+    format!("lease release holder={}", hand_name())
+}
+
+/// [`hand_take_request`] kept to the asking connection (`lease acquire …
+/// here`): what the turn-end loop types its texts under (`supervise`'s
+/// `Session::type_under_hand`). Every lane of this process takes its hand
+/// under the one [`hand_name`], so a plain acquire would move another
+/// lane's live hand — a relaunch's or an upgrade's [`Hand`], another
+/// loop's — to the loop's connection; this one is refused instead, and
+/// renews only a hand the loop's own connection already holds (one an
+/// earlier give-back failed to return). The hand it takes is that
+/// connection's: the server frees it when the connection ends, so a stop
+/// that hangs the loop's connection up gives it back.
+#[must_use]
+pub fn hand_take_here_request() -> String {
+    format!("{} here", hand_take_request())
+}
+
+/// [`hand_give_back_request`] kept to the asking connection (`lease release
+/// … here`, [`hand_take_here_request`]'s pair): a hand another lane holds
+/// under the same name, over another connection, is never freed by it.
+#[must_use]
+pub fn hand_give_back_here_request() -> String {
+    format!("{} here", hand_give_back_request())
+}
 
 /// Whether a claim's holder (percent-decoded) is a window's own host —
 /// this one's or a predecessor's, whose carried claim names a process that
@@ -2088,10 +2587,7 @@ impl Hand {
     /// a restart waits out. From a server without hard leases, a hand that
     /// holds nothing.
     pub(super) fn take(c: &mut Client, tab: &str) -> Option<Hand> {
-        let reply = c.request_line(&format!(
-            "@{tab} lease acquire ttl={HAND_TTL_MS} holder={} hard",
-            hand_name()
-        ));
+        let reply = c.request_line(&format!("@{tab} {}", hand_take_request()));
         let held = match reply {
             Ok(reply) if reply.starts_with("OK lease acquired") => true,
             Ok(reply) if reply.starts_with("ERR busy") || reply.starts_with("ERR lease held") => {
@@ -2131,11 +2627,7 @@ impl Hand {
     /// ([`HAND_TTL_MS`]).
     pub(super) fn give_back(&mut self, c: &mut Client) {
         if std::mem::take(&mut self.held) {
-            let _ = c.request_line(&format!(
-                "@{} lease release holder={}",
-                self.tab,
-                hand_name()
-            ));
+            let _ = c.request_line(&format!("@{} {}", self.tab, hand_give_back_request()));
         }
     }
 }
@@ -2676,6 +3168,43 @@ impl ModelCtx {
         std::borrow::Cow::Owned(ctx)
     }
 
+    /// The final offer for one process, including a default-home session
+    /// whose cached standard-profile view cannot establish its billing.
+    /// Catalog/access caches keep their existing plain-profile identity.
+    fn for_profile(
+        &self,
+        opts: &Opts,
+        records: &Records,
+        profile: Option<&super::profile::Context>,
+    ) -> ModelCtx {
+        let mut ctx = self.clone();
+        let Some(credits_billed) = credits_billed_for(opts, profile) else {
+            ctx.offered.clear();
+            if let Some((_, offered)) = &mut ctx.native {
+                offered.clear();
+            }
+            return ctx;
+        };
+        let ev = model_evidence_with_billing(opts, records, credits_billed);
+        if records.home_word(&opts.home).is_some() {
+            ctx.grow(&ev);
+        }
+        ctx.offer(&ev);
+        ctx
+    }
+
+    fn at_for_profile(
+        &self,
+        opts: &Opts,
+        sf: &SessionFile,
+        profile: Option<&super::profile::Context>,
+    ) -> ModelCtx {
+        let records = Records::of_file(&opts.home, sf);
+        let mut ctx = self.for_profile(opts, &records, profile);
+        ctx.settle(records.dir().and_then(|dir| agent_settings(opts, sf, dir)));
+        ctx
+    }
+
     /// A Claude home's offer, in place of any other: what each build offers
     /// under that home's caches (`ev`), before any allowlist — which is the
     /// judged agent's settings' ([`ModelCtx::settle`]).
@@ -3017,9 +3546,9 @@ struct ModelRead {
 
 /// Read what the conversation runs now and decide, judged as the managed build
 /// (the tests' seam; a visit reads the build first, [`model_read_for`]).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn model_read(opts: &Opts, sf: &SessionFile, launch: Option<&str>, mctx: &ModelCtx) -> ModelRead {
-    model_read_for(opts, sf, launch, mctx, false, None)
+    model_read_for(opts, sf, launch, mctx, false, None, None)
 }
 
 /// Read what the conversation runs NOW and decide, judged by the build the
@@ -3034,12 +3563,16 @@ fn model_read_for(
     mctx: &ModelCtx,
     native: bool,
     carried: Option<&str>,
+    process_view: Option<&ModelCtx>,
 ) -> ModelRead {
     let before = load_model_record(opts, &sf.session_id);
     let mut record = before.clone();
     let tail = std::cell::OnceCell::new();
     // Judged by the Claude home the agent runs under.
-    let mctx = mctx.at(opts, sf);
+    let mctx = match process_view {
+        Some(view) => std::borrow::Cow::Borrowed(view),
+        None => mctx.at(opts, sf),
+    };
     let (read, rows) = model_judge(
         opts,
         sf,
@@ -3152,11 +3685,20 @@ pub(super) fn riding_model_in(
     sf: &SessionFile,
     argv: &[String],
     mctx: &ModelCtx,
+    process_view: Option<&ModelCtx>,
 ) -> Option<String> {
     let launch = upgrade::launch_model(argv);
     // A native session is judged by the native build's own catalog.
     let native = runs_native(opts, Some(sf.pid), argv);
-    let mread = model_read_for(opts, sf, launch.as_deref(), mctx, native, None);
+    let mread = model_read_for(
+        opts,
+        sf,
+        launch.as_deref(),
+        mctx,
+        native,
+        None,
+        process_view,
+    );
     models::model_to(None, &mread.verdict, mread.cold, true, mread.due_for_s)
 }
 
@@ -3177,6 +3719,10 @@ fn runs_native(opts: &Opts, pid: Option<u32>, argv: &[String]) -> bool {
 /// `start` (its `ps` start, [`kernel_start`]). One catalog read for both, none
 /// when neither can be asked. The transcript is the one in `records`, the
 /// agent's own ([`Records`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the restart's captured process profile selector"
+)]
 pub(super) fn restart_models(
     opts: &Opts,
     records: &Records,
@@ -3185,15 +3731,17 @@ pub(super) fn restart_models(
     session: &str,
     argv: &[String],
     ride: bool,
+    profile: Option<&super::profile::Context>,
 ) -> (Option<String>, Option<String>) {
     let ride = ride && sf.is_some();
     if !ride && upgrade::launch_model(argv).is_none() {
         return (None, None);
     }
     let mctx = ModelCtx::read(opts, &Targets::read(&opts.home));
-    let riding = sf
-        .filter(|_| ride)
-        .and_then(|sf| riding_model_in(opts, sf, argv, &mctx));
+    let riding = sf.filter(|_| ride).and_then(|sf| {
+        let view = mctx.at_for_profile(opts, sf, profile);
+        riding_model_in(opts, sf, argv, &mctx, Some(&view))
+    });
     let native = runs_native(opts, sf.map(|sf| sf.pid), argv);
     let started = sf
         .and_then(|sf| models::parse_lstart(&sf.proc_start))
@@ -3624,6 +4172,16 @@ pub(super) struct St {
     /// The line typed at that prompt — once announced and before the
     /// signal, the line the announcement was planned on.
     pub(super) line: String,
+    /// THE LINE BACK (LC-5 of ATERM-KI-1016-1): the move's relaunch line on
+    /// the build its agent ran — the process's own program, with its launch,
+    /// its Claude home and login and the model it ran (a list's model is the
+    /// move's) — planned at the restart beside [`Self::line`] ([`restart`]).
+    /// Typed once in its place where the move's relaunch ended as it started
+    /// ([`St::roll_back`]), so a build that answers its probe and fails only
+    /// at a real start leaves no agent down. Empty where none was planned (a
+    /// move onto the program the agent runs, a restart on its own program, an
+    /// older record's). On disk `back_line`, written only when set.
+    pub(super) back_line: String,
     /// Where that prompt left the cursor when a relaunch attempt first read it
     /// ([`PromptMark`]): kept across attempts, so a person's typing at the
     /// prompt is judged against the prompt as it came back, never against
@@ -3790,7 +4348,9 @@ pub(super) struct St {
     /// the one it left once the record is written over
     /// ([`super::relaunch::moved_off`]; LIM-1's review: an account move, aterm
     /// ended before the carry-on was answered, and the cold restore's record,
-    /// cause `host`, held the carry-on behind the old account's weekly). On
+    /// cause `host`, held the carry-on behind the old account's weekly) — and
+    /// where the record itself is removed, it stays beside it until the move
+    /// is older than the longest limit ([`record::kept_move`]). On
     /// disk the key `moved_at` is WRITTEN ONLY WHEN SET: a record with none is
     /// byte for byte what it was.
     pub(super) moved_at: u64,
@@ -3926,6 +4486,38 @@ pub(super) struct St {
     /// the line, which is refused rather than typed without them. On disk the
     /// key `muse_env` is WRITTEN ONLY WHEN SET.
     pub(super) muse_env: Vec<String>,
+    /// agy: THE CONFIG DIRECTORY ITS CONVERSATIONS ARE UNDER
+    /// (`$HOME/.gemini/antigravity-cli`, as its `HOME` and its hidden
+    /// `--gemini_dir`/`--app_data_dir` place it, canonical), as the snapshot
+    /// read it: where the relaunch finds the conversation's presence lock (a
+    /// live holder keeps its line untyped) and the crash file of the agy its
+    /// line started. Empty for every other agent. On disk the key `agy_config`
+    /// is WRITTEN ONLY WHEN SET: a record with none is byte for byte what it
+    /// was.
+    pub(super) agy_config: String,
+    /// agy: THE HOME ITS RELAUNCH LINE CARRIES (`HOME=<dir>`, where its own
+    /// exec environment set another than the user's;
+    /// `upgrade_agy::line_env`): REQUIRED on the line, which is refused
+    /// rather than typed without it. On disk the key `agy_env` is WRITTEN
+    /// ONLY WHEN SET.
+    pub(super) agy_env: Vec<String>,
+    /// Gemini CLI: ITS PROJECT'S CHATS DIRECTORY
+    /// (`<GEMINI_CLI_HOME or HOME>/.gemini/tmp/<slug>/chats`), as the snapshot
+    /// read it: where the relaunch's pre-check folds the session's files
+    /// right before its line, and the start-time rule reads which session a
+    /// relaunched process came up on. Empty for every other agent. On disk
+    /// the key `gemini_chats` is WRITTEN ONLY WHEN SET.
+    pub(super) gemini_chats: String,
+    /// Gemini CLI: THE HOMES ITS RELAUNCH LINE CARRIES (`GEMINI_CLI_HOME`
+    /// where set, `HOME` where another than the user's;
+    /// `upgrade_gemini::line_env`): REQUIRED on the line. On disk the key
+    /// `gemini_env` is WRITTEN ONLY WHEN SET.
+    pub(super) gemini_env: Vec<String>,
+    /// Gemini CLI: THE CHILD NODE THE CRASHED PARENT STARTED (`0`: none
+    /// found): orphaned by a parent's SIGKILL, it reads the terminal while
+    /// its old group is the foreground one, and nothing is typed while it
+    /// does. On disk the key `gemini_child` is WRITTEN ONLY WHEN SET.
+    pub(super) gemini_child: u32,
     /// A PROVEN SELF-CLAIMED codex-alab's relaunch (the crash rule,
     /// [`super::self_claimed`]): the resume line its own session record
     /// named, validated against the live process while it ran — typed as it
@@ -4550,9 +5142,10 @@ impl St {
     pub(super) fn failed_start(&self) -> Option<FailedStart> {
         match self.agent {
             upgrade::Agent::Claude => {}
-            // Muse Code: its relaunch types the managed twin, never a build a
-            // move chose, so no build failed to start for its conversation.
-            // No lane yet (agy, Gemini CLI): no relaunch of theirs.
+            // Muse Code and agy: their relaunches type the managed twin, and
+            // Gemini CLI's the shell's own `gemini`, never a build a move
+            // chose, so no build failed to start for a conversation of
+            // theirs.
             upgrade::Agent::Codex
             | upgrade::Agent::Muse
             | upgrade::Agent::Agy
@@ -4594,6 +5187,51 @@ impl St {
         self.failed_at = kept.failed_at;
         "no-resume".clone_into(&mut self.streak_why);
         self.stop_streak = kept.stop_streak;
+    }
+
+    /// THE MOVE'S RELAUNCH ENDED AS IT STARTED, TAKEN BACK ONTO THE BUILD ITS
+    /// AGENT RAN (LC-5 of ATERM-KI-1016-1) at `now`: a Claude Code move's
+    /// line (onto another image than the agent's) was seen to run and end
+    /// with nothing registering the conversation, its shell holding the tab
+    /// again — the build answered its probe and fails only at a real start (a
+    /// crash in its interface, a resume it refuses). Stopped there, that one
+    /// working agent stayed down until a person resumed it, where the
+    /// harness is to need nobody.
+    ///
+    /// The failure is recorded as the stop it replaces would record it
+    /// ([`St::fail`], `no-resume`) and KEPT ([`St::failed_start_kept`]), so
+    /// the build's note counts it ([`build_start::note`]) and the
+    /// conversation's next round onto that build rests as the stop's would
+    /// ([`St::retarget`]). The record becomes a relaunch on the agent's own
+    /// program ([`SAME_PROGRAM`], onto [`Self::from`]) whose line is the line
+    /// back ([`St::back_line`]), asking no model the move asked
+    /// ([`St::model_list`] cleared), in flight again ([`Phase::Exiting`] at
+    /// `now`, its prompt marked afresh): the relaunch types it under every
+    /// guard a relaunch line has, and carries the agent on as it would have
+    /// on the new build. Taken once: a line back that ends as it started too
+    /// is the stop, as before. `false`, nothing changed, where there is no
+    /// line back, the record already runs its own program, or the agent is
+    /// not a Claude Code.
+    pub(super) fn roll_back(&mut self, now: u64) -> bool {
+        let claude = match self.agent {
+            upgrade::Agent::Claude => true,
+            upgrade::Agent::Codex
+            | upgrade::Agent::Agy
+            | upgrade::Agent::Muse
+            | upgrade::Agent::Gemini => false,
+        };
+        if !claude || self.back_line.is_empty() || self.source == SAME_PROGRAM {
+            return false;
+        }
+        self.fail("no-resume", now);
+        self.failed_start_kept = self.failed_start();
+        SAME_PROGRAM.clone_into(&mut self.source);
+        self.to.clone_from(&self.from);
+        self.line = std::mem::take(&mut self.back_line);
+        self.model_list.clear();
+        self.prompt = None;
+        self.phase = Phase::Exiting { at_s: now };
+        true
     }
 
     /// WHAT A PROCESS HAS ANSWERED, to carry onto the next build's record
@@ -5028,8 +5666,8 @@ impl St {
     fn stop_kept_onto(&self) -> String {
         match self.agent {
             upgrade::Agent::Codex => {}
-            // Muse Code: no upgrade round of its own (relaunch on exit only).
-            // No lane yet (agy, Gemini CLI): no round of theirs.
+            // Muse Code, agy and Gemini CLI: no upgrade round of their own
+            // (relaunch on exit only).
             upgrade::Agent::Claude
             | upgrade::Agent::Muse
             | upgrade::Agent::Agy
@@ -5467,11 +6105,29 @@ impl St {
         if !self.muse_data.is_empty() {
             o.insert("muse_data".into(), Value::from(self.muse_data.as_str()));
         }
+        if !self.agy_config.is_empty() {
+            o.insert("agy_config".into(), Value::from(self.agy_config.as_str()));
+        }
+        if !self.gemini_chats.is_empty() {
+            o.insert(
+                "gemini_chats".into(),
+                Value::from(self.gemini_chats.as_str()),
+            );
+        }
+        if self.gemini_child != 0 {
+            o.insert(
+                "gemini_child".into(),
+                Value::from(u64::from(self.gemini_child)),
+            );
+        }
         if let Some(profile) = &self.home_profile {
             o.insert("home_profile".into(), Value::from(profile.as_str()));
         }
         if let Some(failed) = &self.failed_start_kept {
             o.insert("failed_start_kept".into(), Value::from(failed.word()));
+        }
+        if !self.back_line.is_empty() {
+            o.insert("back_line".into(), Value::from(self.back_line.as_str()));
         }
         if let Some(block) = self.line_block {
             o.insert("line_block".into(), Value::from(block));
@@ -5565,6 +6221,8 @@ impl St {
         for (k, list) in [
             ("argv", &self.argv),
             ("muse_env", &self.muse_env),
+            ("agy_env", &self.agy_env),
+            ("gemini_env", &self.gemini_env),
             ("tabs", &self.tabs),
             ("tabs_until", &tabs_until),
             ("resume_argv", &self.resume_argv),
@@ -5615,10 +6273,11 @@ impl St {
         };
         // A record with no word is Claude Code's, as every record before the
         // word was. A word this build does not know is a newer build's
-        // record, and so is one of an agent it has no lane for (agy, Gemini
-        // CLI: read as that agent, whose lanes are not written here): no
-        // record here, so every scan of the directory passes its file by as
-        // it lies. A Muse Code's is its relaunch lane's.
+        // record, and so is one of an agent it has no lane for (read as that
+        // agent, whose lanes are not written here; since Gemini CLI's lane,
+        // every agent has one): no record here, so every scan of the
+        // directory passes its file by as it lies. A Muse Code's, an agy's
+        // and a Gemini CLI's are their relaunch lanes'.
         let agent = match v.get("agent") {
             None => upgrade::Agent::Claude,
             Some(word) => upgrade::Agent::parse(word.as_str()?)?,
@@ -5652,6 +6311,7 @@ impl St {
             shell: small("shell"),
             tab: s("tab"),
             line: s("line"),
+            back_line: s("back_line"),
             prompt: PromptMark::parse(&s("prompt")),
             line_block: v.get("line_block").and_then(Value::as_u64),
             noted: s("noted"),
@@ -5742,6 +6402,11 @@ impl St {
             twin: s("twin"),
             muse_data: s("muse_data"),
             muse_env: list("muse_env"),
+            agy_config: s("agy_config"),
+            agy_env: list("agy_env"),
+            gemini_chats: s("gemini_chats"),
+            gemini_env: list("gemini_env"),
+            gemini_child: small("gemini_child"),
             resume_argv: list("resume_argv"),
             resume_home: s("resume_home"),
             resume_start: s("resume_start"),
@@ -5861,10 +6526,8 @@ impl St {
     pub(super) fn landed_after_stop(&self, sf: &SessionFile, k: &dyn Kernel) -> bool {
         match self.agent {
             upgrade::Agent::Claude => {}
-            // Muse Code: its stopped relaunch is its lane's, and a Claude
-            // Code session file says nothing of it. No lane yet (agy, Gemini
-            // CLI): no relaunch of theirs landed, and a Claude Code record
-            // says nothing of them.
+            // Muse Code, agy and Gemini CLI: a stopped relaunch of theirs is
+            // its lane's, and a Claude Code session file says nothing of it.
             upgrade::Agent::Codex
             | upgrade::Agent::Muse
             | upgrade::Agent::Agy
@@ -5986,9 +6649,8 @@ impl St {
     pub(super) fn carried_through_hand(&mut self, now: u64) -> bool {
         let claude = match self.agent {
             upgrade::Agent::Claude => true,
-            // Muse Code: its lane keeps its own clock (as Codex's does), its
-            // records never a restart's. No lane yet (agy, Gemini CLI): no
-            // relaunch to type.
+            // Muse Code, agy and Gemini CLI: each lane keeps its own clock
+            // (as Codex's does), their records never a restart's.
             upgrade::Agent::Codex
             | upgrade::Agent::Muse
             | upgrade::Agent::Agy
@@ -6201,6 +6863,9 @@ impl St {
         self.shell = shell;
         tab.clone_into(&mut self.tab);
         self.line = line;
+        // A new signal: no line back until its restart plans one
+        // ([`St::back_line`]).
+        self.back_line.clear();
         // A new signal: its agent is not seen gone yet, nor a hand on its
         // line.
         self.exited_at = 0;
@@ -6217,6 +6882,7 @@ impl St {
         self.marker = back.marker;
         self.markers = back.markers;
         self.fallback_from = back.fallback_from;
+        self.back_line.clear();
     }
 
     /// The kernel refused the signal of a recorded restart at `now`: the agent
@@ -6483,9 +7149,9 @@ pub(super) fn settled(st: &St) -> bool {
 fn driven_here(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
-        // Muse Code: its lane's (`muse::prune`, its relaunch's carry), never
-        // Claude Code's. No lane yet (agy, Gemini CLI): driven by nothing,
-        // and never as Claude Code's.
+        // Muse Code, agy and Gemini CLI: their lanes' (`muse::prune`,
+        // `agy::prune`, `gemini::prune`, each relaunch's carry), never Claude
+        // Code's.
         upgrade::Agent::Codex
         | upgrade::Agent::Muse
         | upgrade::Agent::Agy
@@ -6494,7 +7160,8 @@ fn driven_here(agent: upgrade::Agent) -> bool {
 }
 
 /// What a lane's prune of its per-tab records (`<word>-<tab>`: codex-alab's
-/// `codex_alab_drive::prune`, Muse Code's `muse::prune`) knows of a tab.
+/// `codex_alab_drive::prune`, Muse Code's `muse::prune`, agy's `agy::prune`,
+/// Gemini CLI's `gemini::prune`) knows of a tab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TabLife {
     /// Proven live: this pass saw it live, or the rendezvous registry names it.
@@ -6612,6 +7279,12 @@ fn prune_states(opts: &Opts, files: &[SessionFile], now: u64) {
             }
             continue;
         }
+        // A move kept beside a removed record ([`record::kept_move`]): its
+        // own rule, the move's age.
+        if let Some(id) = name.and_then(|name| name.strip_suffix(".move")) {
+            record::prune_kept_move(opts, id, now);
+            continue;
+        }
         let Some(id) = name.and_then(|name| name.strip_suffix(".json")) else {
             continue;
         };
@@ -6633,7 +7306,8 @@ fn prune_states(opts: &Opts, files: &[SessionFile], now: u64) {
                 .session_files()
                 .is_none_or(|files| conversation_live(&files, id));
         if driven_here(st.agent) && settled(&st) && !held_elsewhere {
-            let _ = std::fs::remove_file(&path);
+            // Through the one remover: the move it carried stays.
+            remove(opts, id);
         }
     }
 }
@@ -6698,21 +7372,29 @@ pub(super) fn save(opts: &Opts, session: &str, st: &St) {
     save_at(opts, session, st, now_s());
 }
 
+/// Save the same progress-stamped record, refusing an act that needs the
+/// claim on disk when its write did not complete.
+pub(super) fn save_checked(opts: &Opts, session: &str, st: &St) -> std::io::Result<()> {
+    record::save_at_checked(opts, session, st, now_s())
+}
+
 /// WHETHER AN AGENT MAY BE MOVED ONTO `to` AT `now`
 /// ([`build_start::starts`]): no failure to start noted against the build,
 /// or one a probe run since proved to start without an agent — or, for a
 /// build no probe proves any more, a probe run for the move the owner asked
 /// for (`owner_now`). What the upgrade's visit and a relaunch on exit both
 /// ask before they take `to`; a probe run here is said on the ledger as row
-/// `r`.
+/// `r`. A build no probe has run on is probed first where the step
+/// `moving` stakes an agent on it now ([`build_start::starts`]).
 pub(super) fn build_starts(
     opts: &Opts,
     r: &Report,
     to: &Candidate,
     now: u64,
     owner_now: bool,
+    moving: bool,
 ) -> Result<(), &'static str> {
-    build_start::starts(opts, r, to, now, owner_now)
+    build_start::starts(opts, r, to, now, owner_now, moving)
 }
 
 /// Whether a crashed agent's relaunch may move onto `to` at `now`: the build
@@ -6741,6 +7423,70 @@ mod record {
         state_dir(opts).join(format!("{session}.json"))
     }
 
+    fn move_path(opts: &Opts, session: &str) -> PathBuf {
+        state_dir(opts).join(format!("{session}.move"))
+    }
+
+    /// THE CONVERSATION'S LAST MOVE, KEPT BESIDE ITS RECORD once the one
+    /// remover ([`remove`]) took away a record that carried it: a record that
+    /// holds nothing but the move ([`St::moved_at`] and its target), or
+    /// `None`. The move is the conversation's, not the record's: a record
+    /// closed before the first turn served after the move (an upgrade round
+    /// written over it and then reached by hand,
+    /// [`super::forget_settled_pending`]; a settled record pruned,
+    /// [`super::prune_states`]) took it along, and the limit row the move left
+    /// held a relaunch's carry-on until that limit reset (ATERM-KI-1016-1).
+    /// Read where the record is ([`super::super::relaunch::moved_off`]), and
+    /// carried onto the next record [`save_at`] writes.
+    pub(in super::super) fn kept_move(opts: &Opts, session: &str) -> Option<St> {
+        St::from_json(&std::fs::read_to_string(move_path(opts, session)).ok()?)
+            .filter(|st| st.moved_at != 0)
+    }
+
+    /// Keeps the last move `disk` knows of as `session`'s kept move
+    /// ([`kept_move`]), unless one as new is kept already.
+    fn keep_move(opts: &Opts, session: &str, disk: &St) {
+        let moved = super::super::relaunch::last_move_at(disk);
+        if moved == 0 || kept_move(opts, session).is_some_and(|kept| kept.moved_at >= moved) {
+            return;
+        }
+        let (moved_login, moved_left_model) = super::super::relaunch::last_move_target(disk);
+        let kept = St {
+            phase: super::Phase::Done,
+            agent: disk.agent,
+            moved_at: moved,
+            moved_login,
+            moved_left_model,
+            ..St::default()
+        };
+        let path = move_path(opts, session);
+        let tmp = path.with_extension("move.tmp");
+        if std::fs::write(&tmp, kept.to_json()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    /// Takes away `session`'s kept move ([`kept_move`]) once, at `now`, the
+    /// move is older than the longest limit and its grace
+    /// ([`super::upgrade_status::LONGEST_LIMIT_S`],
+    /// [`super::upgrade_status::LIMIT_GRACE_S`]): every limit row written
+    /// before it has reset, so it hides nothing a reset would not. Answers
+    /// whether one is kept still.
+    pub(in super::super) fn prune_kept_move(opts: &Opts, session: &str, now: u64) -> bool {
+        let Some(kept) = kept_move(opts, session) else {
+            return false;
+        };
+        let spent = kept
+            .moved_at
+            .saturating_add(super::upgrade_status::LONGEST_LIMIT_S)
+            .saturating_add(super::upgrade_status::LIMIT_GRACE_S);
+        if now < spent || opts.dry_run {
+            return true;
+        }
+        let _ = std::fs::remove_file(move_path(opts, session));
+        false
+    }
+
     pub(in super::super) fn load(opts: &Opts, session: &str) -> Option<St> {
         St::from_json(&std::fs::read_to_string(state_path(opts, session)).ok()?)
     }
@@ -6759,8 +7505,34 @@ mod record {
     /// [`St::tabs_until`]): a record written for a new tab keeps the tab on
     /// disk among them.
     pub(in super::super) fn save_at(opts: &Opts, session: &str, st: &St, now: u64) {
+        let _ = save_at_with(opts, session, st, now, |opts, session, out| {
+            // The legacy policy: record writes are best effort and the build
+            // note still runs even when that write did not complete.
+            write_verbatim(opts, session, out);
+            Ok(())
+        });
+    }
+
+    /// The shared writer's checked arm: progress and carry stamps are the
+    /// same as save_at's; a failed write is returned before an act can start.
+    pub(in super::super) fn save_at_checked(
+        opts: &Opts,
+        session: &str,
+        st: &St,
+        now: u64,
+    ) -> std::io::Result<()> {
+        save_at_with(opts, session, st, now, write_verbatim_checked)
+    }
+
+    fn save_at_with(
+        opts: &Opts,
+        session: &str,
+        st: &St,
+        now: u64,
+        writer: impl FnOnce(&Opts, &str, &St) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
         if opts.dry_run {
-            return;
+            return Ok(());
         }
         let key = st.progress_key();
         let on_disk = load(opts, session);
@@ -6770,14 +7542,22 @@ mod record {
             _ => out.progress_at = now,
         }
         out.progress_key = key;
-        if let Some(disk) = &on_disk {
-            // The move on disk is the newer: its target rides with its instant.
+        // The move on disk — its record's, or kept beside a record removed
+        // ([`kept_move`]) — where it is the newer: its target rides with its
+        // instant.
+        let kept = on_disk
+            .is_none()
+            .then(|| kept_move(opts, session))
+            .flatten();
+        for disk in on_disk.iter().chain(kept.iter()) {
             let moved = super::super::relaunch::last_move_at(disk);
             if moved != 0 && moved >= out.moved_at {
                 (out.moved_login, out.moved_left_model) =
                     super::super::relaunch::last_move_target(disk);
             }
             out.moved_at = out.moved_at.max(moved);
+        }
+        if let Some(disk) = &on_disk {
             out.tabs = super::earlier_tabs(
                 &out.tab,
                 disk.tabs
@@ -6798,11 +7578,12 @@ mod record {
             until.retain(|(tab, _)| out.tabs.contains(tab));
             out.tabs_until = until;
         }
-        write_verbatim(opts, session, &out);
+        writer(opts, session, &out)?;
         // A BUILD THAT FAILED TO START is the build's fact too, noted — and a
         // stop taken back, retracted — by the one writer every stop and every
         // reopening is saved through ([`super::build_start::note`]).
         super::build_start::note(opts, session, on_disk.as_ref(), st, now);
+        Ok(())
     }
 
     /// Writes `st` as `session`'s record exactly as it is, progress stamp
@@ -6823,6 +7604,28 @@ mod record {
         }
     }
 
+    fn write_verbatim_checked(opts: &Opts, session: &str, st: &St) -> std::io::Result<()> {
+        if opts.dry_run {
+            return Ok(());
+        }
+        let path = state_path(opts, session);
+        #[cfg(unix)]
+        {
+            aterm_uds::atomic_file::write(&path, st.to_json().as_bytes(), 0o600)
+        }
+        #[cfg(not(unix))]
+        {
+            // Keep the existing portable replacement route, returning its
+            // failure to the checked caller instead of hiding it.
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, st.to_json())?;
+            std::fs::rename(&tmp, &path)
+        }
+    }
+
     /// Puts back `session`'s record from before an act that did not go ahead:
     /// `prior` as read, progress stamp included ([`write_verbatim`]), or no
     /// record.
@@ -6837,25 +7640,30 @@ mod record {
     }
 
     /// The one remover of `session`'s record: a record owed nothing more goes
-    /// here, as does the absence [`restore`] puts back. A dry run removes nothing.
+    /// here, as does the absence [`restore`] puts back. The conversation's last
+    /// move it carried stays, beside it ([`kept_move`]). A dry run removes
+    /// nothing.
     pub(in super::super) fn remove(opts: &Opts, session: &str) {
         if opts.dry_run {
             return;
+        }
+        if let Some(disk) = load(opts, session) {
+            keep_move(opts, session, &disk);
         }
         let _ = std::fs::remove_file(state_path(opts, session));
     }
 
     /// A test's planted record, written exactly as given: the watch suite's
     /// negative controls stamp their own progress.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(in super::super) fn write_verbatim_for_test(opts: &Opts, session: &str, st: &St) {
         write_verbatim(opts, session, st);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use record::write_verbatim_for_test as write_verbatim;
-pub(super) use record::{load, remove, restore, save_at};
+pub(super) use record::{kept_move, load, remove, restore, save_at};
 
 /// One ledger line per step taken: `<state>/upgrade/ledger.jsonl`. `detail`
 /// is the step's own: for a `relaunched`, an `exited` and a
@@ -7196,7 +8004,7 @@ fn claim_still_live(c: &mut Client, pid: u32, claim: &HostClaim) -> bool {
     process_in_tab(c, pid, &claim.tab, Some(claim.group), Some(claim.parent))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn session_file_of(home: &Path, pid: u32) -> Option<SessionFile> {
     session_file_in(&home.join(".claude"), pid)
 }
@@ -7657,6 +8465,18 @@ impl Records {
         })
     }
 
+    /// The exact billing-profile identity from this process's captured exec
+    /// environment and already resolved record directory. This is independent
+    /// of [`Self::profile`], whose older model/access-cache identity is kept.
+    pub(super) fn billing_context(
+        &self,
+        user_home: &Path,
+        args: &atpkg::caller_shell::ProcArgs,
+    ) -> Option<super::profile::Context> {
+        let dir = self.dir()?;
+        super::profile::Context::of_exec_env(user_home, dir, &args.env)
+    }
+
     /// The one transcript of `session` ([`transcript_in`]).
     pub(super) fn transcript(&self, session: &str) -> Option<PathBuf> {
         transcript_in(self.dir.as_deref()?, session)
@@ -7677,12 +8497,41 @@ impl Records {
         Tasked::default().of_in(self.dir.as_deref()?, session, ours)
     }
 
-    /// [`Finished`] over these records, read once from [`TAIL_BYTES`] before
-    /// the transcript's end: a token with more than that of Claude Code's
-    /// wakes written after it reads not finished, and the caller does what
-    /// it did before it asked (the upgrade's look, made at every visit).
+    /// [`Finished`] over these records, as the upgrade's look made at every
+    /// visit asks it: kept per conversation in this process
+    /// ([`LOOK_MEMOS`]), its first read starting [`FINISHED_ONCE_BYTES`]
+    /// back as a restart's one read does ([`finished_where_written`]), and
+    /// every later one reading on from where the last ended. A fresh
+    /// [`TAIL_BYTES`] read at every visit read a token with more than that
+    /// of Claude Code's wakes after it as open, and `upgrade_ask` typed its
+    /// notice into the finished task.
     pub(super) fn finished(&self, session: &str, ours: &[approvals::Typed]) -> Option<bool> {
-        Finished::default().of_in(self.dir.as_deref()?, session, ours)
+        self.finished_in(&LOOK_MEMOS, session, ours)
+    }
+
+    /// [`Self::finished`], its memos kept in `memos` (the process's own,
+    /// [`LOOK_MEMOS`], or a test's).
+    pub(super) fn finished_in(
+        &self,
+        memos: &std::sync::Mutex<Vec<Finished>>,
+        session: &str,
+        ours: &[approvals::Typed],
+    ) -> Option<bool> {
+        let dir = self.dir.as_deref()?;
+        let held = |m: &Finished| m.session == session && m.dir.as_deref() == Some(dir);
+        let taken = memos.lock().ok().and_then(|mut memos| {
+            let at = memos.iter().position(held)?;
+            Some(memos.remove(at))
+        });
+        let mut memo = taken.unwrap_or_default();
+        let finished = memo.of_in_from(dir, session, ours, FINISHED_ONCE_BYTES);
+        if let Ok(mut memos) = memos.lock() {
+            memos.retain(|m| !held(m));
+            memos.push(memo);
+            let over = memos.len().saturating_sub(LOOK_MEMOS_KEPT);
+            memos.drain(..over);
+        }
+        finished
     }
 
     /// The directory, where one is known.
@@ -7751,7 +8600,7 @@ pub fn conversation_typed(
     extra: &[String],
 ) -> Vec<approvals::Typed> {
     let record = session.and_then(|s| load(opts, s));
-    typed_through(opts, tab, record.as_ref(), extra, &[])
+    typed_through(opts, tab, session, record.as_ref(), extra, &[])
 }
 
 /// [`conversation_typed`] for the conversation of record `st` (its
@@ -7763,7 +8612,14 @@ pub(super) fn conversation_typed_by(
     st: &St,
 ) -> Vec<approvals::Typed> {
     let record = load(opts, session);
-    typed_through(opts, tab, record.as_ref(), &st.tabs, &st.tabs_until)
+    typed_through(
+        opts,
+        tab,
+        Some(session),
+        record.as_ref(),
+        &st.tabs,
+        &st.tabs_until,
+    )
 }
 
 /// `stamps`: `(tab, until)` with `until` the newest for its tab.
@@ -7774,12 +8630,14 @@ fn stamp_tab(stamps: &mut Vec<(String, u64)>, tab: &str, until: u64) {
     }
 }
 
-/// [`conversation_typed`]'s reading: `tab`, the earlier tabs `extra` and
-/// `record` name, and those noted beside each ledger, each earlier tab's
-/// rows up to its stamp in `until` or `record` (the newest).
+/// [`conversation_typed`]'s reading: `tab`, the earlier tabs the upgrade
+/// ledger names for `session` ([`ledger_tabs`]), those `extra` and `record`
+/// name, and those noted beside each ledger, each earlier tab's rows up to
+/// its stamp in `until`, `record` or the ledger (the newest).
 fn typed_through(
     opts: &Opts,
     tab: &str,
+    session: Option<&str>,
     record: Option<&St>,
     extra: &[String],
     until: &[(String, u64)],
@@ -7787,6 +8645,15 @@ fn typed_through(
     let Some(root) = opts.aterm_state.as_deref() else {
         return Vec::new();
     };
+    let ledgered = session.map_or_else(Vec::new, |session| {
+        ledger_tabs(
+            std::fs::read_to_string(ledger_path(opts))
+                .unwrap_or_default()
+                .as_str(),
+            session,
+            tab,
+        )
+    });
     let mut stamps: Vec<(String, u64)> = Vec::new();
     for (t, at) in until
         .iter()
@@ -7794,7 +8661,19 @@ fn typed_through(
     {
         stamp_tab(&mut stamps, t, *at);
     }
-    tabs_through(root, tab, record, extra)
+    for (t, at) in &ledgered {
+        if let Some(at) = at {
+            stamp_tab(&mut stamps, t, *at);
+        }
+    }
+    // The ledger's first: the record's and the notes' are kept before them
+    // within [`EARLIER_TABS`].
+    let extra: Vec<String> = ledgered
+        .into_iter()
+        .map(|(t, _)| t)
+        .chain(extra.iter().cloned())
+        .collect();
+    tabs_through(root, tab, record, &extra)
         .iter()
         .flat_map(|t| {
             let rows = approvals::typed_texts(&approvals::ledger_under(root, Some(t)), Some(t));
@@ -7814,24 +8693,71 @@ fn typed_through(
         .collect()
 }
 
+/// THE EARLIER TABS THE UPGRADE LEDGER NAMES FOR CONVERSATION `session`,
+/// now in `tab` (relaunch-7 of ATERM-KI-1016-1, the review's KR-4): every
+/// other tab a row of the ledger text `body` ([`ledger_path`]) names it in —
+/// a step the upgrade took there, which every release records with both its
+/// tab and its conversation — oldest first, each with the second the ledger
+/// last says it held the conversation until: the first row after the last
+/// one naming the two together that names that tab with another
+/// conversation, or the conversation in another tab; `None` while no row
+/// says it left. A tab a cold restore minted before the leaf carried its sid
+/// (no release before v0.106.0) has no note of the tab it was reopened from;
+/// a conversation the upgrade ever moved there is linked to it here by what
+/// the ledger recorded, never by a guess from text.
+pub(super) fn ledger_tabs(body: &str, session: &str, tab: &str) -> Vec<(String, Option<u64>)> {
+    let rows: Vec<(u64, String, String)> = body
+        .lines()
+        .filter_map(|line| {
+            let v: Value = aterm_json::from_str(line).ok()?;
+            let field = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+            Some((v.get("t")?.as_u64()?, field("tab")?, field("session")?))
+        })
+        .collect();
+    let mut last: Vec<(String, usize)> = Vec::new();
+    for (i, (_, t, s)) in rows.iter().enumerate() {
+        if s == session && t != tab && super::tap::is_tab_id(t) {
+            last.retain(|(x, _)| x != t);
+            last.push((t.clone(), i));
+        }
+    }
+    last.into_iter()
+        .map(|(t, i)| {
+            let left = rows.iter().skip(i + 1).find(|(_, rt, rs)| {
+                (*rt == t && rs != session && rs != "-") || (rs == session && *rt != t && rt != "-")
+            });
+            let until = left.map(|(at, _, _)| *at);
+            (t, until)
+        })
+        .collect()
+}
+
 /// The tabs a conversation in `tab` now was held in ([`typed_through`]'s):
 /// `tab` first, then the earlier tabs `extra` and `record` name, then those
 /// noted beside each ledger under `root` ([`note_earlier_tab`]), at most
 /// [`EARLIER_TABS`] earlier ones in all.
 fn tabs_through(root: &Path, tab: &str, record: Option<&St>, extra: &[String]) -> Vec<String> {
-    tabs_through_read(root, tab, record, extra, &|p| {
-        std::fs::read_to_string(p).ok()
-    })
+    tabs_through_read(
+        root,
+        tab,
+        record,
+        extra,
+        &|p| std::fs::read_to_string(p).ok(),
+        &|_| false,
+    )
 }
 
 /// [`tabs_through`], each note beside a ledger read by `read` (a loop's
-/// door, `supervise::Fx::read_text`, for [`lefts_beside_in`]).
+/// door, `supervise::Fx::read_text`, for [`lefts_beside_in`]), the notes
+/// beside an earlier tab `ends` says ended the books before it not followed
+/// ([`earlier_ledgers_in`]).
 fn tabs_through_read(
     root: &Path,
     tab: &str,
     record: Option<&St>,
     extra: &[String],
     read: &dyn Fn(&Path) -> Option<String>,
+    ends: &dyn Fn(&str) -> bool,
 ) -> Vec<String> {
     let mut tabs = vec![tab.to_string()];
     tabs.extend(earlier_tabs(
@@ -7844,6 +8770,10 @@ fn tabs_through_read(
     ));
     let mut at = 0;
     while at < tabs.len() {
+        if at > 0 && ends(&tabs[at]) {
+            at += 1;
+            continue;
+        }
         for t in noted_earlier_tabs_read(root, &tabs[at], read) {
             if tabs.len() > EARLIER_TABS {
                 break;
@@ -7897,20 +8827,76 @@ pub fn lefts_beside_in(
     sid: Option<&str>,
     read: &dyn Fn(&Path) -> Option<String>,
 ) -> Vec<String> {
-    let mut keys: Vec<String> = approvals::open_left_in(body, sid).into_iter().collect();
+    let earlier: Vec<(String, String)> = earlier_ledgers_in(ledger, sid, read)
+        .into_iter()
+        .filter_map(|(t, p)| Some((t, read(&p)?)))
+        .collect();
+    lefts_of(body, sid, &earlier)
+}
+
+/// [`lefts_beside_in`] over the earlier tabs' ledgers already read
+/// (`earlier`: each tab and its ledger's text): the open left exchange of
+/// `body`'s session `sid`, then each earlier tab's own, each key once.
+#[must_use]
+pub fn lefts_of(body: &str, sid: Option<&str>, earlier: &[(String, String)]) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    let open = approvals::open_left_in(body, sid).into_iter().chain(
+        earlier
+            .iter()
+            .filter_map(|(t, body)| approvals::open_left_in(body, Some(t))),
+    );
+    for key in open {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+/// THE EARLIER TABS' LEDGERS beside the loop ledger at `ledger` of session
+/// `sid`: where the ledger sits under a state root's `drive`
+/// (`approvals::path_under`), each tab a cold restore noted the session's tab
+/// was reopened from ([`note_earlier_tab`], and those noted beside each of
+/// theirs: [`tabs_through_read`]) with the path of its loop's ledger, each
+/// note read through `read` (the loop's door). None elsewhere, or with no
+/// session.
+///
+/// THE WALK ENDS AT A TAB WHOSE OWN BOOKS NO LONGER TAKE UP THOSE BEFORE IT
+/// (the review of 3af6c3da7d, KRF-3): its ledger holds rows of its own
+/// session and no take-up's row ([`approvals::took_up_earlier`]) — its loop's
+/// cut dropped that row once no state the books before it began stood, as a
+/// continuous ledger's cut drops their rows ([`approvals::bound`]), or a
+/// build before the take-up wrote it. That tab's rows are of the books; the
+/// tabs noted beside it, reached only through it, are not. Walked through, a
+/// second cold restore (A, then B, then C) read A's model switch again where
+/// B's loop had switched back and its cut had dropped that row, and its
+/// loop relaunched the agent at the bucket's reset onto the model it ran.
+#[must_use]
+pub fn earlier_ledgers_in(
+    ledger: &Path,
+    sid: Option<&str>,
+    read: &dyn Fn(&Path) -> Option<String>,
+) -> Vec<(String, PathBuf)> {
     let root = ledger
         .parent()
         .filter(|d| d.file_name().is_some_and(|n| n == "drive"))
         .and_then(Path::parent);
-    if let (Some(root), Some(tab)) = (root, sid.map(|s| s.trim_start_matches('@'))) {
-        for t in tabs_through_read(root, tab, None, &[], read).iter().skip(1) {
-            keys.extend(
-                read(&approvals::ledger_under(root, Some(t)))
-                    .and_then(|body| approvals::open_left_in(&body, Some(t))),
-            );
-        }
-    }
-    keys
+    let (Some(root), Some(tab)) = (root, sid.map(|s| s.trim_start_matches('@'))) else {
+        return Vec::new();
+    };
+    let ends = |t: &str| {
+        read(&approvals::ledger_under(root, Some(t))).is_some_and(|body| {
+            approvals::holds_rows_of(&body, t) && !approvals::took_up_earlier(&body, t)
+        })
+    };
+    tabs_through_read(root, tab, None, &[], read, &ends)
+        .into_iter()
+        .skip(1)
+        .map(|t| {
+            let path = approvals::ledger_under(root, Some(&t));
+            (t, path)
+        })
+        .collect()
 }
 
 /// Where a cold restore notes the tabs tab `tab` was reopened from
@@ -7961,9 +8947,13 @@ fn noted_earlier_tabs_read(
 /// `tab`) or an empty one notes nothing. Best effort: a write that fails
 /// leaves the reading as it was before this note.
 pub fn note_earlier_tab(opts: &Opts, tab: &str, was: &str) {
-    let Some(root) = opts.aterm_state.as_deref() else {
-        return;
-    };
+    if let Some(root) = opts.aterm_state.as_deref() {
+        note_earlier_tab_under(root, tab, was);
+    }
+}
+
+/// [`note_earlier_tab`] under the aterm state root `root`.
+pub(crate) fn note_earlier_tab_under(root: &Path, tab: &str, was: &str) {
     if !super::tap::is_tab_id(tab) || !super::tap::is_tab_id(was) || was == tab {
         return;
     }
@@ -8205,6 +9195,15 @@ impl Finished {
         self.at_end.then(|| self.scan.last_turn_key()).flatten()
     }
 
+    /// The turn the conversation ends on, by every key that names it
+    /// ([`upgrade::LastTurn`]: its last row's and the prompt that opened
+    /// it), as the last read left it: `None` where that read did not reach
+    /// the transcript's end.
+    #[must_use]
+    pub fn last_turn(&self) -> Option<upgrade::LastTurn> {
+        self.at_end.then(|| self.scan.last_turn())
+    }
+
     /// The Claude Code directory this memo last read its conversation in:
     /// where the agent writes it now ([`conversation_dir`]).
     #[must_use]
@@ -8227,7 +9226,9 @@ impl Finished {
     }
 
     /// [`Finished::of_snapshot`] in the Claude Code directory `claude_dir`
-    /// itself. `ours` is read afresh at every ask, as [`Tasked::of`]'s.
+    /// itself, its first read [`TAIL_BYTES`] back: a test's fresh tail. `ours`
+    /// is read afresh at every ask, as [`Tasked::of`]'s.
+    #[cfg(all(test, unix))]
     pub(super) fn of_in(
         &mut self,
         claude_dir: &Path,
@@ -8237,8 +9238,20 @@ impl Finished {
         self.of_in_from(claude_dir, session, ours, TAIL_BYTES)
     }
 
-    /// [`Finished::of_in`], its first read starting `back` bytes before the
-    /// transcript's end (at most [`TASK_READ_BYTES`], one read's worth).
+    /// [`Finished::of_snapshot`] in the Claude Code directory `claude_dir`
+    /// itself, its first read starting `back` bytes before the transcript's
+    /// end (at most [`TASK_READ_BYTES`], one read's worth) — and, where what
+    /// that read holds SETTLES NOTHING ([`upgrade::FinishedScan::settled`]:
+    /// no prompt of someone's, no challenge, no answer that finishes, only
+    /// rows that leave the finish as it stood before them), read again from
+    /// twice as far back, until a read settles it or starts at the record's
+    /// head. A window of wakes alone cannot say whether the task was finished
+    /// before it: read from [`FINISHED_ONCE_BYTES`] back and no further, a
+    /// token behind more of its background tasks' wakes than that read open,
+    /// and a relaunch typed its carry-on into the finished task
+    /// (ATERM-KI-1016-1). Later reads go on from where the last ended, one
+    /// read's worth at a time. `ours` is read afresh at every ask, as
+    /// [`Tasked::of`]'s.
     fn of_in_from(
         &mut self,
         claude_dir: &Path,
@@ -8267,23 +9280,52 @@ impl Finished {
         let path = self.path.as_ref()?;
         let mut f = std::fs::File::open(path).ok()?;
         let len = f.metadata().ok()?.len();
+        if self.begun && len >= self.read_to {
+            let at_end = self.fold_on(&mut f, len, false)?;
+            self.at_end = at_end;
+            return at_end.then(|| self.scan.finished());
+        }
         // The first read, or a transcript rewritten: from a line's start
         // `back` bytes before its end — the byte before it read too, so a
-        // window that begins on a line's start keeps that line.
-        let skip_cut = if !self.begun || len < self.read_to {
+        // window that begins on a line's start keeps that line — to the end,
+        // and again from twice as far back while it settles nothing.
+        self.begun = true;
+        let mut back = back.min(TASK_READ_BYTES - 1);
+        loop {
             self.scan = upgrade::FinishedScan::default();
             self.scan.supervisor_typed(ours);
-            self.begun = true;
-            self.read_to = len
-                .saturating_sub(back.min(TASK_READ_BYTES - 1))
-                .saturating_sub(1);
-            self.read_to != 0
-        } else {
-            false
-        };
+            self.read_to = len.saturating_sub(back).saturating_sub(1);
+            let from = self.read_to;
+            let mut skip_cut = from != 0;
+            loop {
+                let before = self.read_to;
+                if self.fold_on(&mut f, len, std::mem::take(&mut skip_cut))? {
+                    break;
+                }
+                if self.read_to == before {
+                    return None;
+                }
+            }
+            if from == 0 || self.scan.settled() {
+                break;
+            }
+            back = back.saturating_mul(2);
+        }
+        self.at_end = true;
+        Some(self.scan.finished())
+    }
+
+    /// One read's worth ([`TASK_READ_BYTES`]) of the transcript `f` (`len`
+    /// bytes long when asked) folded in from [`Self::read_to`], whole lines
+    /// only — one caught half-written is read next time — its first line
+    /// skipped where `skip_cut` (a read begun inside a line), and whether it
+    /// reached the end. `None` where it cannot be read.
+    fn fold_on(&mut self, f: &mut std::fs::File, len: u64, skip_cut: bool) -> Option<bool> {
         f.seek(SeekFrom::Start(self.read_to)).ok()?;
         let mut buf = Vec::new();
-        f.take(TASK_READ_BYTES).read_to_end(&mut buf).ok()?;
+        Read::take(&mut *f, TASK_READ_BYTES)
+            .read_to_end(&mut buf)
+            .ok()?;
         let at_end = self.read_to.saturating_add(buf.len() as u64) >= len;
         let cut = if skip_cut {
             buf.iter()
@@ -8292,15 +9334,13 @@ impl Finished {
         } else {
             0
         };
-        // Whole lines only: one caught half-written is read next time.
         let whole = buf.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
         let whole = whole.max(cut);
         self.read_to = self.read_to.saturating_add(whole as u64);
         for line in lossy(buf[cut..whole].to_vec()).lines() {
             self.scan.line(line);
         }
-        self.at_end = at_end;
-        at_end.then(|| self.scan.finished())
+        Some(at_end)
     }
 }
 
@@ -8358,6 +9398,150 @@ pub(super) fn finish_dir(opts: &Opts, records: &Records, session: &str) -> Optio
         .or(filed)
 }
 
+/// WHERE THE AGENT `snap` NAMES WENT ON WRITING CONVERSATION `session`, NOTED
+/// AS A RELAUNCH OR A RESTART FIRST LOOKS AT IT (ATERM-KI-1016-1's relative
+/// home wrong action): the host notes it at its finished read
+/// ([`note_writes`]), and a crash (or aterm's own end) between a worker's
+/// last turn in a worktree's home and that read sent the relaunch to the
+/// filed transcript — ending on the person's prompt and the move — which
+/// read the task open, so its carry-on was typed into the task the worker
+/// finished in the worktree. So the look that has the snapshot in hand
+/// finds it itself: under a RELATIVE home (empty included) its home
+/// resolved where the agent runs now, while that is still the snapshot's
+/// process ([`live_cwd`]), and under each worktree of the repository it
+/// started in (`cwd`, [`repo_worktrees`]: a `process.chdir` moves it only
+/// into a worktree, 2.1.300's `EnterWorktree`), at the worktree's root and
+/// at the start's own place inside it; the one whose transcript of
+/// `session` has the newest row is noted where that row is newer than the
+/// note's and the filed one's. [`finish_dir`] then reads it as it reads the
+/// host's note. An unset or absolute home names one directory wherever it
+/// runs: nothing to find. Best effort, as [`note_writes`].
+pub(super) fn note_moved_writes(
+    opts: &Opts,
+    snap: &super::relaunch::Snapshot,
+    session: &str,
+    cwd: &str,
+) {
+    let Some(home) = snap
+        .home
+        .as_deref()
+        .filter(|home| Path::new(home).is_relative())
+    else {
+        return;
+    };
+    let filed = Records::of_snapshot(&opts.home, snap);
+    let Some(filed_dir) = filed.dir().map(Path::to_path_buf) else {
+        return;
+    };
+    let newest = |dir: &Path| transcript_in(dir, session).and_then(|p| newest_row_at(&p));
+    let start = Path::new(cwd);
+    let mut bases: Vec<PathBuf> = live_cwd(snap).into_iter().collect();
+    if start.is_absolute() {
+        let inside = repo_root(start).and_then(|root| {
+            start
+                .strip_prefix(root)
+                .ok()
+                .map(Path::to_path_buf)
+                .filter(|rel| !rel.as_os_str().is_empty())
+        });
+        for wt in repo_worktrees(start) {
+            if let Some(rel) = inside.as_deref() {
+                bases.push(wt.join(rel));
+            }
+            bases.push(wt);
+        }
+    }
+    let noted = std::fs::read_to_string(writes_note_path(opts, session))
+        .ok()
+        .map(|t| PathBuf::from(t.trim_end()))
+        .filter(|d| !d.as_os_str().is_empty());
+    let floor = [Some(filed_dir.clone()), noted]
+        .into_iter()
+        .flatten()
+        .filter_map(|d| newest(&d))
+        .max();
+    let found = bases
+        .into_iter()
+        .filter_map(|base| {
+            Records::at(&opts.home, HomeVars::config(Some(home)), || Some(base))
+                .dir()
+                .map(Path::to_path_buf)
+        })
+        .filter(|dir| !same_dir(dir, &filed_dir))
+        .filter_map(|dir| newest(&dir).map(|at| (at, dir)))
+        .filter(|(at, _)| floor.is_none_or(|f| *at > f))
+        .max_by_key(|(at, _)| *at);
+    if let Some((_, dir)) = found {
+        note_writes(opts, snap, &dir);
+    }
+}
+
+/// The root of the git worktree `dir` is in: the nearest directory at or
+/// above it holding a `.git` (a repository's directory or a worktree's
+/// file).
+fn repo_root(dir: &Path) -> Option<&Path> {
+    dir.ancestors()
+        .take(REPO_ANCESTORS)
+        .find(|d| std::fs::symlink_metadata(d.join(".git")).is_ok())
+}
+
+/// EVERY WORKTREE OF THE REPOSITORY `dir` IS IN, as git itself registers
+/// them, nothing run: the main worktree (the directory of the common git
+/// directory) and each linked one (`<common>/worktrees/*/gitdir`, each
+/// naming `<worktree>/.git`), where it is a directory. The common git
+/// directory is `dir`'s repository's `.git`, or — `dir` in a linked
+/// worktree — the one its `.git` file's `gitdir:` and that directory's
+/// `commondir` lead to. Each git file is read small and regular
+/// ([`super::footer::read_small`]); at most [`REPO_WORKTREES`] linked ones.
+/// None outside a repository.
+fn repo_worktrees(dir: &Path) -> Vec<PathBuf> {
+    let Some(top) = repo_root(dir) else {
+        return Vec::new();
+    };
+    let dot_git = top.join(".git");
+    let common = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let Some(gitdir) = super::footer::read_small(&dot_git, 4096).and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("gitdir:"))
+                .map(|g| top.join(g.trim()))
+        }) else {
+            return Vec::new();
+        };
+        super::footer::read_small(&gitdir.join("commondir"), 4096)
+            .map_or_else(|| gitdir.clone(), |c| gitdir.join(c.trim()))
+    };
+    let mut out: Vec<PathBuf> = common
+        .file_name()
+        .filter(|n| *n == ".git")
+        .and(common.parent())
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect();
+    if let Ok(linked) = std::fs::read_dir(common.join("worktrees")) {
+        out.extend(
+            linked
+                .flatten()
+                .take(REPO_WORKTREES)
+                .filter_map(|e| super::footer::read_small(&e.path().join("gitdir"), 4096))
+                .map(|t| PathBuf::from(t.trim()))
+                .filter(|p| p.is_absolute())
+                .filter_map(|p| p.parent().map(Path::to_path_buf)),
+        );
+    }
+    out.retain(|wt| std::fs::symlink_metadata(wt).is_ok_and(|m| m.is_dir()));
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// How far up from a start directory [`repo_root`] looks for a `.git`.
+const REPO_ANCESTORS: usize = 32;
+
+/// How many linked worktrees [`repo_worktrees`] reads.
+const REPO_WORKTREES: usize = 64;
+
 /// When the newest row of the transcript at `path` that says so was
 /// written (its `timestamp`, unix seconds), read from its last
 /// [`TAIL_BYTES`].
@@ -8381,23 +9565,80 @@ pub(super) fn finished_where_written(
     session: &str,
     ours: &[approvals::Typed],
 ) -> Option<bool> {
-    read_where_written(opts, records, session, ours).map(|scan| scan.finished())
+    WhereWritten::new(opts, records, session, ours).finished()
 }
 
-/// Whether conversation `session`'s last words are a done report
-/// ([`upgrade::FinishedScan::said_done`]), and whether it names an
-/// irreversible act ([`upgrade::FinishedScan::said_irreversible`]), read as
-/// [`finished_where_written`] reads its finish: what a relaunch's carry-on
-/// asks the done check after (the live lab's LIVE-RL-1), and how
-/// ([`upgrade::checking`], the review's RR4-RL-3).
-pub(super) fn said_done_where_written(
-    opts: &Opts,
-    records: &Records,
-    session: &str,
-    ours: &[approvals::Typed],
-) -> Option<(bool, bool)> {
-    read_where_written(opts, records, session, ours)
-        .map(|scan| (scan.said_done(), scan.said_irreversible()))
+/// ONE READ OF CONVERSATION `session`'S RECORD WHERE IT WAS WRITTEN
+/// ([`read_where_written`]), made when first asked and shared by every
+/// question one relaunch's carry-on asks of it: whether its task is finished
+/// ([`finished_where_written`], the relaunch's `nothing_owed`), then whether
+/// its last words are a done report ([`Self::said_done`]). The read
+/// reaches back past a window that settles nothing, so on a conversation the
+/// harness's own `keep going` drives it reads to the last person's prompt
+/// (the review of ATERM-KI-1016-1, KR-DONE-3: 2.1 s for 109 MiB, a debug
+/// build), and each question read it again.
+pub(super) struct WhereWritten<'a> {
+    opts: &'a Opts,
+    records: &'a Records,
+    session: &'a str,
+    ours: &'a [approvals::Typed],
+    scan: std::cell::OnceCell<Option<upgrade::FinishedScan>>,
+}
+
+impl<'a> WhereWritten<'a> {
+    /// Nothing read yet.
+    pub(super) fn new(
+        opts: &'a Opts,
+        records: &'a Records,
+        session: &'a str,
+        ours: &'a [approvals::Typed],
+    ) -> Self {
+        Self {
+            opts,
+            records,
+            session,
+            ours,
+            scan: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The records the conversation is read in.
+    pub(super) fn records(&self) -> &'a Records {
+        self.records
+    }
+
+    /// The conversation.
+    pub(super) fn session(&self) -> &'a str {
+        self.session
+    }
+
+    /// What the harness typed into it.
+    pub(super) fn ours(&self) -> &'a [approvals::Typed] {
+        self.ours
+    }
+
+    /// The one read: `None` where nothing can be read to the end.
+    fn scan(&self) -> Option<&upgrade::FinishedScan> {
+        self.scan
+            .get_or_init(|| read_where_written(self.opts, self.records, self.session, self.ours))
+            .as_ref()
+    }
+
+    /// [`finished_where_written`], by the one read.
+    pub(super) fn finished(&self) -> Option<bool> {
+        self.scan().map(upgrade::FinishedScan::finished)
+    }
+
+    /// Whether the conversation's last words are a done report
+    /// ([`upgrade::FinishedScan::said_done`]), and whether it names an
+    /// irreversible act ([`upgrade::FinishedScan::said_irreversible`]), by the
+    /// one read: what a relaunch's carry-on asks the done check after (the
+    /// live lab's LIVE-RL-1), and how ([`upgrade::checking`], the review's
+    /// RR4-RL-3).
+    pub(super) fn said_done(&self) -> Option<(bool, bool)> {
+        self.scan()
+            .map(|scan| (scan.said_done(), scan.said_irreversible()))
+    }
 }
 
 /// THE TURN CONVERSATION `session` ENDS ON, by its key
@@ -8413,8 +9654,28 @@ pub(super) fn turn_key_where_written(
     opts: &Opts,
     records: &Records,
     session: &str,
-) -> Option<String> {
-    read_where_written(opts, records, session, &[])?.last_turn_key()
+) -> Option<upgrade::LastTurn> {
+    Some(read_where_written(opts, records, session, &[])?.last_turn())
+}
+
+/// Whether conversation `session` of record `st`, now in tab `tab`, ends on
+/// a person's own exchange a loop left to them: an open `left-to-person@v1`
+/// row of any tab that held it ([`lefts_through`]) names its last turn
+/// ([`turn_key_where_written`], [`upgrade::LastTurn::names`]). A turn since —
+/// anyone's prompt, a wake's answer — names another, and a loop's act since
+/// closed the row. What a relaunch types nothing into (`done:left`) and an
+/// upgrade asks nothing at.
+pub(super) fn left_to_person(
+    opts: &Opts,
+    records: &Records,
+    tab: &str,
+    session: &str,
+    st: &St,
+) -> bool {
+    let lefts = lefts_through(opts, tab, session, st);
+    !lefts.is_empty()
+        && turn_key_where_written(opts, records, session)
+            .is_some_and(|now| lefts.iter().any(|k| now.names(k)))
 }
 
 /// [`finished_where_written`]'s one read, whole: the record folded from
@@ -8436,6 +9697,16 @@ fn read_where_written(
     Some(memo.scan)
 }
 
+/// The upgrade look's [`Finished`] memos ([`Records::finished`]), the most
+/// recently asked last: one per conversation the process looked at, at most
+/// [`LOOK_MEMOS_KEPT`].
+static LOOK_MEMOS: std::sync::Mutex<Vec<Finished>> = std::sync::Mutex::new(Vec::new());
+
+/// How many conversations [`LOOK_MEMOS`] keeps: past it the least recently
+/// asked is forgotten, and read afresh from [`FINISHED_ONCE_BYTES`] back if
+/// it is asked again.
+const LOOK_MEMOS_KEPT: usize = 64;
+
 /// How much of a transcript's end is read for the READY answer and the model
 /// the agent ran.
 pub(super) const TAIL_BYTES: u64 = 262_144;
@@ -8448,7 +9719,7 @@ pub(super) const FINISHED_ONCE_BYTES: u64 = TASK_READ_BYTES / 2;
 
 /// The one transcript holding `session` under the user's home `home` (every
 /// reader of an agent's own reads it in its records: [`Records::transcript`]).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn transcript(home: &Path, session: &str) -> Option<PathBuf> {
     transcript_in(&home.join(".claude"), session)
 }
@@ -8598,6 +9869,37 @@ pub fn process_transcript_tail(
     pid: u32,
     start: &str,
 ) -> Option<String> {
+    let vars = (config_dir, home, started_in);
+    process_transcript_end(vars, pid, start, TAIL_BYTES).map(|(_, tail)| tail)
+}
+
+/// [`process_transcript_tail`] with the file it read, and more of its end
+/// ([`super::result::TRANSCRIPT_READ_BYTES`]): what a tasked session's result
+/// is snapshotted from at the done edge — the done check's prompt and the
+/// report before it, past a check's reply that ran the suites again — the
+/// path kept for `result full` to read later
+/// (`supervise::IdleHost::transcript`).
+#[must_use]
+pub fn process_transcript(
+    config_dir: Option<&str>,
+    home: Option<&str>,
+    started_in: Option<&str>,
+    pid: u32,
+    start: &str,
+) -> Option<(PathBuf, String)> {
+    let vars = (config_dir, home, started_in);
+    process_transcript_end(vars, pid, start, super::result::TRANSCRIPT_READ_BYTES)
+}
+
+/// The transcript the Claude Code `pid` started at `start` writes now, and at
+/// most the last `bytes` of it ([`process_transcript_tail`]), under its
+/// `(CLAUDE_CONFIG_DIR, HOME, PWD)` at exec.
+fn process_transcript_end(
+    (config_dir, home, started_in): (Option<&str>, Option<&str>, Option<&str>),
+    pid: u32,
+    start: &str,
+    bytes: u64,
+) -> Option<(PathBuf, String)> {
     let cwd = aterm_sysprobe::process_cwd(pid);
     // Where its record is filed, and where it writes its conversation now,
     // by the one resolver: an unset home under its own `HOME`, else this
@@ -8629,7 +9931,8 @@ pub fn process_transcript_tail(
     let path = super::footer::sole_transcript_path(&writes, &entry)?;
     let mut f = super::footer::open_regular(&path)?;
     let len = f.metadata().ok()?.len();
-    Some(tail_window(&mut f, len, TAIL_BYTES).0)
+    let tail = tail_window(&mut f, len, bytes).0;
+    Some((path, tail))
 }
 
 /// [`process_transcript_tail`] of the Claude Code `snap` names, its exec
@@ -8638,9 +9941,29 @@ pub fn process_transcript_tail(
 /// `.claude`). `None` for a Codex, which writes no such transcript.
 #[must_use]
 pub fn snapshot_transcript_tail(snap: &super::relaunch::Snapshot) -> Option<String> {
+    snapshot_transcript_end(snap, TAIL_BYTES).map(|(_, tail)| tail)
+}
+
+/// [`snapshot_transcript_tail`] with the file it read, and as much of its end
+/// as [`process_transcript`] reads: what a tasked session's result is
+/// snapshotted from.
+#[must_use]
+pub fn snapshot_transcript(snap: &super::relaunch::Snapshot) -> Option<(PathBuf, String)> {
+    snapshot_transcript_end(snap, super::result::TRANSCRIPT_READ_BYTES)
+}
+
+/// The transcript the Claude Code `snap` names, and at most the last `bytes`
+/// of it ([`snapshot_transcript_tail`]).
+fn snapshot_transcript_end(
+    snap: &super::relaunch::Snapshot,
+    bytes: u64,
+) -> Option<(PathBuf, String)> {
     match &snap.run {
         super::relaunch::AgentRun::Claude => {}
-        super::relaunch::AgentRun::Codex(_) | super::relaunch::AgentRun::Muse(_) => return None,
+        super::relaunch::AgentRun::Codex(_)
+        | super::relaunch::AgentRun::Muse(_)
+        | super::relaunch::AgentRun::Agy(_)
+        | super::relaunch::AgentRun::Gemini(_) => return None,
     }
     let args = atpkg::caller_shell::process_args(snap.pid);
     let home = aterm_types::dirs::home_dir();
@@ -8652,7 +9975,7 @@ pub fn snapshot_transcript_tail(snap: &super::relaunch::Snapshot) -> Option<Stri
         ),
         None => (None, home.as_deref().and_then(Path::to_str), None),
     };
-    process_transcript_tail(config_dir, home, started_in, snap.pid, &snap.start)
+    process_transcript_end((config_dir, home, started_in), snap.pid, &snap.start, bytes)
 }
 
 /// THE QUOTA WALL the conversation `snap` names stands at now
@@ -8875,7 +10198,7 @@ pub fn due(opts: &Opts) -> Due {
 /// Whether the lane of `agent`, past Claude Code's, owns tab
 /// `opts.only_sid` and what is due there. `None`: the tab is not that lane's.
 /// Each lane by name.
-fn lane_due(_opts: &Opts, _tabs: &[LiveTab], agent: upgrade::Agent) -> Option<Due> {
+fn lane_due(opts: &Opts, tabs: &[LiveTab], agent: upgrade::Agent) -> Option<Due> {
     match agent {
         // No Codex is moved live (the Codex screen lane's retirement,
         // 2026-10-16): a Codex tab is due only for a restart in flight
@@ -8883,12 +10206,16 @@ fn lane_due(_opts: &Opts, _tabs: &[LiveTab], agent: upgrade::Agent) -> Option<Du
         upgrade::Agent::Codex => None,
         // Never among the others: its half is read last ([`due_after_lanes`]).
         upgrade::Agent::Claude => None,
-        // Muse Code: no upgrade lane, so no move is due ([`lane_on`] keeps
+        // Muse Code's live upgrade (its quiet flow): a tab its TUI leads is
+        // due while its build is behind the twin's by their store records
+        // ([`muse::live::upgrade_due`]).
+        upgrade::Agent::Muse => muse::live::upgrade_due(opts, tabs),
+        // agy's live upgrade (its quiet flow), the same way by its own
+        // records ([`agy::live::upgrade_due`]).
+        upgrade::Agent::Agy => agy::live::upgrade_due(opts, tabs),
+        // Gemini CLI: no upgrade lane, so no move is due ([`lane_on`] keeps
         // this off; no `due` of its own is written).
-        upgrade::Agent::Muse => None,
-        // No lane yet (agy, Gemini CLI): the tab is no lane's of theirs, so
-        // Claude Code's half reads it, as it always did.
-        upgrade::Agent::Agy | upgrade::Agent::Gemini => None,
+        upgrade::Agent::Gemini => None,
     }
 }
 
@@ -9094,7 +10421,7 @@ impl Homes {
     }
 
     /// The homes' directories, in the order read.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn dirs(&self) -> Vec<PathBuf> {
         self.dirs
             .iter()
@@ -9318,7 +10645,7 @@ fn no_record(
 }
 
 /// The unix second `pid` started, as the kernel says ([`kernel_start`]).
-fn started_s(pid: u32) -> Option<u64> {
+pub(super) fn started_s(pid: u32) -> Option<u64> {
     models::parse_lstart(&kernel_start(pid)?)
 }
 
@@ -9402,22 +10729,21 @@ pub fn note_behind(opts: &Opts, since: u64) -> Behind {
 /// What the lane of `agent`, past Claude Code's, noted of tab
 /// `opts.only_sid` when its agent leads it. `None`: the tab is not that
 /// lane's. Each lane by name.
-fn lane_noted(
-    _opts: &Opts,
-    _tabs: &[LiveTab],
-    agent: upgrade::Agent,
-    _since: u64,
-) -> Option<Behind> {
+fn lane_noted(opts: &Opts, tabs: &[LiveTab], agent: upgrade::Agent, _since: u64) -> Option<Behind> {
     match agent {
         // No Codex is moved live (the Codex screen lane's retirement,
         // 2026-10-16): nothing of one is noted behind.
         upgrade::Agent::Codex => None,
         // Never among the others: its half is read last ([`behind_after_lanes`]).
         upgrade::Agent::Claude => None,
-        // Muse Code: no upgrade lane, so no build it is behind is noted.
-        upgrade::Agent::Muse => None,
-        // No lane yet (agy, Gemini CLI): nothing of theirs is noted.
-        upgrade::Agent::Agy | upgrade::Agent::Gemini => None,
+        // Muse Code: a tab its TUI leads is its lane's, whose quiet flow
+        // mints no ladder state, so nothing is noted (never Claude Code's
+        // half, which would read the tab's foreground as one of its own).
+        upgrade::Agent::Muse => muse::live::leads(opts, tabs).then_some(Behind::Nothing),
+        // agy: the same (its quiet flow mints no ladder state either).
+        upgrade::Agent::Agy => agy::live::leads(opts, tabs).then_some(Behind::Nothing),
+        // Gemini CLI: no upgrade lane, so no build it is behind is noted.
+        upgrade::Agent::Gemini => None,
     }
 }
 
@@ -10033,10 +11359,14 @@ pub const OWNED_SETTLE_LOOKS: u32 = 2;
 /// policy types nothing over a wind-down: an announcement out, and while READY
 /// is given and the restart's gate only waits (its settle for
 /// [`OWNED_SETTLE_LOOKS`] looks, a background drain for
-/// [`OWNED_BACKGROUND_LOOKS`]). An answer without READY (`awaiting-ready`), a
-/// person's hold, an owed release (`wait:release:<why>`), and every last word
-/// own nothing. It lives beside [`after`] because a step's word is this
-/// module's to interpret.
+/// [`OWNED_BACKGROUND_LOOKS`]), and while an owed release's own gate only
+/// waits out the settle at its point ([`release_settles`], for
+/// [`OWNED_SETTLE_LOOKS`] looks as well), and while Muse Code's quiet restart
+/// waits on its session's log to catch up with its idle screen
+/// ([`log_settles`], the same bound). An answer without READY
+/// (`awaiting-ready`), a person's hold, a release held by anything else
+/// (`wait:release:<why>`), and every last word own nothing. It lives beside
+/// [`after`] because a step's word is this module's to interpret.
 ///
 /// A person at the tab (`held-back:attended`, then `wait:attended`) owns them
 /// for as long as the person's grace (`grace_s`, `[harness] human_grace_s`,
@@ -10068,6 +11398,11 @@ pub fn owns_turn_ends(step: &str, looks: u32, grace_s: u32) -> bool {
             | "wait:status-stale"
             | "wait:ready-unrecorded"
             | "wait:superseded" => looks < OWNED_SETTLE_LOOKS,
+            // Muse Code's quiet restart waiting on its session's log to catch
+            // up with its idle screen ([`log_settles`]): bounded as the settle is.
+            _ if log_settles(step) => looks < OWNED_SETTLE_LOOKS,
+            // An owed release whose gate waits the settle at this point.
+            _ if release_settles(step) => looks < OWNED_SETTLE_LOOKS,
             // A session that answered READY waits out a shell under it.
             "wait:background" => looks < OWNED_BACKGROUND_LOOKS,
             // The notice was due at this very point and its own fence refused
@@ -10115,9 +11450,9 @@ fn drains(step: &str) -> bool {
 
 /// Whether a WAIT counts toward the bound its word is owned for
 /// ([`owns_turn_ends`]): the settle's (`settling`, `not-idle`, `busy`,
-/// `status-stale`, `ready-unrecorded`, `superseded`) and the drain's
-/// (`background`), the waits of a gate whose act is
-/// due at the point. Others count nothing: a person at the tab (counted at its
+/// `status-stale`, `ready-unrecorded`, `superseded`, and Muse Code's log
+/// catching up, [`log_settles`]) and the drain's (`background`), the waits of
+/// a gate whose act is due at the point. Others count nothing: a person at the tab (counted at its
 /// point, [`attended_owned`]), `awaiting-ready`, a resting round (`failed`), a
 /// box, a draft, a limit; counting them would spend the settle's looks before
 /// the READY came. An agent's turn never restarts the count, only the
@@ -10134,7 +11469,52 @@ pub fn bounded_wait(step: &str) -> bool {
             | "wait:ready-unrecorded"
             | "wait:superseded"
             | "wait:background"
-    )
+    ) || release_settles(step)
+        || log_settles(step)
+}
+
+/// THE QUIET RESTART OF MUSE CODE OR AGY WAITING ON ITS AGENT'S OWN RECORD TO
+/// CATCH UP WITH ITS IDLE SCREEN (`upgrade_muse_live`'s and
+/// `upgrade_agy_live`'s gates): `wait:turn-open` — Muse's run's `terminal`
+/// written a few hundred milliseconds after the reader reads the turn over
+/// (measured at every turn end of the 2026-10-18 lab runs: the screen idle at
+/// …805.139, the step at …805.327, the terminal at …805.639), agy's summary
+/// row reading `RUNNING` as long after (the screen idle at …674.6, the row
+/// `RUNNING` until …675.4) — and `wait:queued-work`, work's end told and the
+/// turn the agent starts on it by itself still to come (Muse's queued inbox
+/// item, agy's waking message). The settle Claude Code's restart waits out
+/// at a fresh turn end, in their words: the restart is due at this very
+/// point once the record is written, so the point is owned as the settle's
+/// is, for [`OWNED_SETTLE_LOOKS`] looks counted with it ([`bounded_wait`]) —
+/// owning nothing, a loop that continues at turn ends typed its continuation
+/// at once at every one, and a continuously driven Muse was upgraded only
+/// once its loop rested (the review of 2026-10-18). Every other wait of those
+/// gates owns nothing: a turn running, open work, a child, a draft, a person,
+/// an unreadable or unproved record. No step of Claude Code's says either
+/// word.
+#[must_use]
+pub fn log_settles(step: &str) -> bool {
+    matches!(step, "wait:turn-open" | "wait:queued-work")
+}
+
+/// AN OWED RELEASE WAITING OUT THE SETTLE AT ITS POINT
+/// (`wait:release:settling`, `…:not-idle`, `…:busy`, `…:status-stale`): the
+/// release is the upgrade's next act ([`release_is_next`]) and its gate
+/// ([`upgrade::gate_release`], the notice's) only waits for the screen and
+/// the status a fresh turn end left to go quiet, as the notice's and the
+/// restart's settle do. Such a point is owned as theirs is, for
+/// [`OWNED_SETTLE_LOOKS`] looks counted with them ([`bounded_wait`]), and
+/// looked at again at the ladder's first rung ([`after`]): owning nothing,
+/// a give-up's release gated at a fresh turn end (its usual case) left the
+/// point to the loop, whose `keep going` was typed there and then voided
+/// the release as direction taken up since (`release_void`, `directed`) —
+/// a turn typed, and the agent never told the notice no longer applies
+/// (ATERM-KI-1016-1). Every other gate of a release (a box, a draft, a
+/// person, a limit, a READY standing) owns nothing, as before.
+#[must_use]
+pub fn release_settles(step: &str) -> bool {
+    step.strip_prefix("wait:release:")
+        .is_some_and(|why| matches!(why, "settling" | "not-idle" | "busy" | "status-stale"))
 }
 
 /// Whether one [`step`]'s word is a notice its own fence refused
@@ -10263,22 +11643,34 @@ fn sweep_with_roster(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> 
     } else {
         confirmations(opts)
     };
-    // The Muse Code lane's pass moves nothing (no upgrade lane; its relaunch
-    // in flight is its window's host's to carry); its per-tab relaunch records
-    // of tabs that are gone go here, under the lock, as codex-alab's go in its
-    // pass ([`muse::prune`]).
+    // Drive groups share a store across instances. This roster and one
+    // registry cannot exclude live tabs in another namespace or a failed
+    // discovery publication, so automatic sweeps leave those groups alone.
+    // The Muse Code and agy lanes' per-tab records of tabs that are gone go
+    // here, under the lock, as codex-alab's go in its pass ([`muse::prune`],
+    // [`agy::prune`]); each one's pass is its live upgrade's quiet step
+    // (below), and its crash relaunch in flight its window's host's. Gemini
+    // CLI's lane moves nothing, and its records of tabs that are gone go here
+    // ([`gemini::prune`]).
     muse::sweep_prune(opts, live_tabs);
+    agy::sweep_prune(opts, live_tabs);
+    gemini::sweep_prune(opts, live_tabs);
     reports.extend(lanes(opts, live_tabs, &|agent| match agent {
         // Codex restarts in flight, a codex-alab's crash relaunch
         // ([`codex_alab_drive::sweep`]); no Codex is moved live. No Claude
         // session file needed.
         upgrade::Agent::Codex => codex_alab_drive::sweep(opts, live_tabs),
         upgrade::Agent::Claude => claude_pass(opts, live_tabs),
-        // Muse Code: relaunch on exit only, no upgrade lane — never swept
+        // Muse Code's live upgrade: the quiet flow's step for the tab its TUI
+        // leads, by the window's own roster ([`muse::live::upgrade_pass`]; a
+        // hand-run sweep moves no Muse Code).
+        upgrade::Agent::Muse => muse::live::upgrade_pass(opts, live_tabs),
+        // agy's live upgrade: its quiet flow's step, the same way
+        // ([`agy::live::upgrade_pass`]; a hand-run sweep moves no agy).
+        upgrade::Agent::Agy => agy::live::upgrade_pass(opts, live_tabs),
+        // Gemini CLI: relaunch on exit only, no upgrade lane — never swept
         // ([`lane_on`]); its relaunch records are pruned above.
-        upgrade::Agent::Muse => Vec::new(),
-        // No lane yet (agy, Gemini CLI): never swept ([`lane_on`]).
-        upgrade::Agent::Agy | upgrade::Agent::Gemini => Vec::new(),
+        upgrade::Agent::Gemini => Vec::new(),
     }));
     reports
 }
@@ -10324,8 +11716,8 @@ fn lanes(
 /// sweep carries ([`super::lanes::lanes`]: its live upgrade, or its relaunch
 /// on exit where the sweep carries that relaunch's restart in flight on,
 /// [`super::lanes::sweep_carries_relaunch`] — a codex-alab's crash relaunch;
-/// not a Muse Code's, whose relaunch in flight its window's host carries, nor
-/// agy's or Gemini CLI's, whose lanes are not written) and its own switch is
+/// not a Muse Code's, an agy's nor a Gemini CLI's, whose relaunch in flight
+/// its window's host carries) and its own switch is
 /// not off ([`Opts::agents_off`]). The one answer [`lanes`], [`due`] and
 /// [`in_flight`] give, so the window's host is never told a step is due that
 /// its step then leaves alone.
@@ -10428,6 +11820,102 @@ pub(super) fn muse_after_exit(
     cause: super::relaunch::ExitCause,
 ) -> Report {
     muse::after_exit(opts, snap, left, upgrade, cause, &Live)
+}
+
+/// An agy TUI's [`super::relaunch::Snapshot`], read while it runs
+/// ([`agy::snapshot`]).
+pub(super) fn agy_snapshot(
+    opts: &Opts,
+    tab: &str,
+    pid: u32,
+    start: String,
+    shell: u32,
+    args: &atpkg::caller_shell::ProcArgs,
+) -> Result<super::relaunch::Snapshot, &'static str> {
+    agy::snapshot(opts, tab, pid, start, shell, args, &Live)
+}
+
+/// One look at an agy that left its tab ([`agy::look_at_exit`]).
+pub(super) fn agy_look_at_exit(
+    opts: &Opts,
+    snap: &super::relaunch::Snapshot,
+) -> super::relaunch::ExitLook {
+    agy::look_at_exit(opts, snap, &Live)
+}
+
+/// An agy relaunch on exit ([`agy::after_exit`]).
+pub(super) fn agy_after_exit(
+    opts: &Opts,
+    snap: &super::relaunch::Snapshot,
+    left: &super::relaunch::ExitRecord,
+    upgrade: bool,
+    cause: super::relaunch::ExitCause,
+) -> Report {
+    agy::after_exit(opts, snap, left, upgrade, cause, &Live)
+}
+
+/// A Gemini CLI TUI's [`super::relaunch::Snapshot`], read while it runs
+/// ([`gemini::snapshot`]).
+pub(super) fn gemini_snapshot(
+    opts: &Opts,
+    tab: &str,
+    pid: u32,
+    start: String,
+    shell: u32,
+    args: &atpkg::caller_shell::ProcArgs,
+) -> Result<super::relaunch::Snapshot, &'static str> {
+    gemini::snapshot(opts, tab, pid, start, shell, args, &Live)
+}
+
+/// One look at a Gemini CLI that left its tab ([`gemini::look_at_exit`]).
+pub(super) fn gemini_look_at_exit(
+    opts: &Opts,
+    snap: &super::relaunch::Snapshot,
+) -> super::relaunch::ExitLook {
+    gemini::look_at_exit(opts, snap, &Live)
+}
+
+/// A Gemini CLI relaunch on exit ([`gemini::after_exit`]).
+pub(super) fn gemini_after_exit(
+    opts: &Opts,
+    snap: &super::relaunch::Snapshot,
+    left: &super::relaunch::ExitRecord,
+    upgrade: bool,
+    cause: super::relaunch::ExitCause,
+) -> Report {
+    gemini::after_exit(opts, snap, left, upgrade, cause, &Live)
+}
+
+/// THE LINE A PERSON IS TOLD for `snap`'s Gemini CLI ([`gemini::told`]):
+/// Gemini CLI's own `gemini --resume <uuid>` in its project, only where the
+/// read-only pre-check, read now, says that resume loads every turn.
+#[must_use]
+pub fn gemini_told_line(snap: &super::relaunch::Snapshot) -> Option<String> {
+    gemini::told(snap)
+}
+
+/// [`gemini_told_line`] of `session` in the project `root` whose chats
+/// directory is `chats`, behind the homes `env` (a restored leaf's
+/// [`gemini::told_at`]).
+#[must_use]
+pub fn gemini_told(
+    session: &str,
+    chats: Option<&Path>,
+    env: &[(String, String)],
+    root: &str,
+) -> Option<String> {
+    gemini::told_at(session, chats, env, root)
+}
+
+/// Whether the explicit restart of `snap`'s agy would be carried
+/// ([`agy::carries_restart_onto`]), onto the managed twin a store build's
+/// relaunch types ([`managed_agent_twin`], read only for one), behind the
+/// heal its line takes for a user whose home is `user_home`.
+pub(super) fn agy_carries_restart(user_home: &Path, snap: &super::relaunch::Snapshot) -> bool {
+    let twin = super::upgrade_agy::store_build(&snap.program)
+        .then(|| managed_agent_twin(super::upgrade_agy::PROGRAM))
+        .flatten();
+    agy::carries_restart_onto(snap, user_home, twin)
 }
 
 /// The Claude lane's share of one sweep: every live Claude Code session
@@ -10645,6 +12133,17 @@ pub fn in_flight(opts: &Opts) -> Vec<String> {
     out
 }
 
+/// The agent the first conversation [`in_flight`] names ran (its record's
+/// agent): what a successor carrying that restart says it as when it does
+/// not land. `None` while nothing is in flight.
+#[must_use]
+pub fn in_flight_agent(opts: &Opts) -> Option<upgrade::Agent> {
+    in_flight(opts)
+        .first()
+        .and_then(|session| load(opts, session))
+        .map(|st| st.agent)
+}
+
 fn blank(sf: &SessionFile) -> Report {
     Report {
         pid: sf.pid,
@@ -10678,7 +12177,7 @@ fn visit(
     visit_with_claim(opts, sf, files.as_deref(), t, targets, k, None, None)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[allow(clippy::too_many_arguments)]
 fn visit_with_claim(
     opts: &Opts,
@@ -10989,7 +12488,22 @@ fn visit_models(
     // a restart of it would ask for ([`St::carried_model`]), is re-judged by
     // this very read ([`models::ride_bar`]).
     let carried = prior.as_ref().and_then(St::carried_model);
-    let mread = model_read_for(opts, sf, launch.as_deref(), mctx, running_native, carried);
+    // A file parsed without its source directory cannot establish the
+    // process's profile; do not turn the default Records fallback into proof.
+    let profile = sf
+        .claude_dir
+        .as_ref()
+        .and_then(|_| Records::of_file(&opts.home, sf).billing_context(&opts.home, args));
+    let view = mctx.at_for_profile(opts, sf, profile.as_ref());
+    let mread = model_read_for(
+        opts,
+        sf,
+        launch.as_deref(),
+        mctx,
+        running_native,
+        carried,
+        Some(&view),
+    );
     // A model a person chose by hand since the launch, which a restart the
     // list moves to no model carries in place of the launch's `--model`:
     // read only where a line is planned, not on every visit.
@@ -11182,8 +12696,8 @@ fn visit_models(
     // and terminal-owner checks prove typing reaches this agent.
     if matches!(st.phase, Phase::Pending | Phase::Announced { .. }) {
         let job = k.job(sf.pid);
-        if matches!(job, Some((Job::NoJobControl, _))) {
-            let r = not_a_job(opts, r, &mut st);
+        if let Some(job) = not_a_shell_job(job) {
+            let r = not_a_job(opts, r, &mut st, job);
             save(opts, &sf.session_id, &st);
             return r;
         }
@@ -11292,20 +12806,21 @@ fn visit_models(
     // for a move that would not come, and a restart ends a working agent
     // onto a build that exits at once (handoff §4, round eighteen). Nor is
     // a build a crash's probe found exiting. A build never run here is
-    // moved onto unprobed: the upgrade's own first move, at a quiet moment
-    // of an agent that works, is how a build is tried, and only a crash's
-    // relaunch needs a probe's proof first ([`build_proved`], LC-5 of
-    // ATERM-KI-1015-1). A model move on the build the agent already runs
+    // probed once before the first agent is moved onto it, and held only
+    // where that probe saw it exit with a failure (ATERM-KI-1016-1's LC-5;
+    // a probe that could not run it or did not see it end holds none): only
+    // a crash's relaunch needs a probe's proof first ([`build_proved`], LC-5
+    // of ATERM-KI-1015-1). A model move on the build the agent already runs
     // moves it onto no other build.
     // Asked wherever the round would move, and wherever it has asked its
     // agent, whatever its step: such a round is abandoned and its agent
     // released at once, never left winding down, or stopped for a restart,
     // that the hold keeps from coming; a round that asked nothing waits, any
     // release it owes typed ([`upgrade::build_hold`]).
+    let moving = matches!(step, Step::Announce | Step::Terminate | Step::Fresh);
     if target.version != running
-        && (upgrade::asked_for_a_move(&asked_about, ready)
-            || matches!(step, Step::Announce | Step::Terminate | Step::Fresh))
-        && build_starts(opts, &r, &target, now, request == Request::Now).is_err()
+        && (upgrade::asked_for_a_move(&asked_about, ready) || moving)
+        && build_starts(opts, &r, &target, now, request == Request::Now, moving).is_err()
     {
         step = upgrade::build_hold(step, &asked_about, ready);
     }
@@ -11362,6 +12877,11 @@ fn visit_models(
                     opts,
                     &Launch {
                         homedir: homedir.as_deref(),
+                        billing: if model_to.is_some() {
+                            super::relaunch::ModelBilling::Move(profile.as_ref())
+                        } else {
+                            super::relaunch::ModelBilling::Keep
+                        },
                         ..launch_of(
                             sf,
                             &args.argv,
@@ -11549,6 +13069,7 @@ fn visit_models(
                 login: args.env_var(super::accounts::LOGIN_ENV),
                 home: args.env_var(super::accounts::HOME_ENV),
                 stored_login: stored_login_of(&args.env),
+                profile: profile.as_ref(),
             };
             restart(opts, r, &mut st, &mut c, &tab, sf, t, k, &restarting)
         }
@@ -11849,16 +13370,33 @@ pub(super) fn look_facts(
         // `[harness] upgrade_ask = false`, the default: nothing is typed
         // before the move ([`upgrade::Facts::quiet`]). Nor, whatever the
         // key, into a conversation whose record says its task is finished
-        // (asked only before any notice, of the record's last [`TAIL_BYTES`]
-        // since it is asked at every visit: a token older than that is asked
-        // as before): no notice, release or carry-on reopens a task its
-        // worker closed ([`upgrade::FinishedScan`]).
+        // (asked only before any notice, read on from where this process's
+        // last look ended, its first from [`FINISHED_ONCE_BYTES`] back:
+        // [`Records::finished`]): no notice, release or carry-on reopens a
+        // task its worker closed ([`upgrade::FinishedScan`]). Nor into A
+        // PERSON'S OWN EXCHANGE a loop left to them, still the conversation's
+        // last turn ([`left_to_person`], ATERM-KI-1016-1): the harness types
+        // nothing there until someone else's turn ends, and a notice would
+        // ask the agent to answer inside it. The move goes the quiet way, at
+        // a genuinely idle point, resumed with nothing typed (the relaunch's
+        // `done:left`) — a round that announced before the exchange too,
+        // whose re-ask would be typed there (its READY superseded by the
+        // exchange, or its work still running at the re-ask's time). Read
+        // only while a loop's row is open ([`lefts_through`]).
         quiet: !opts.ask
             || (st.phase == Phase::Pending
                 && Records::of_file(&opts.home, sf).finished(
                     &sf.session_id,
                     &conversation_typed(opts, tab, Some(&sf.session_id), &[]),
-                ) == Some(true)),
+                ) == Some(true))
+            || (matches!(st.phase, Phase::Pending | Phase::Announced { .. })
+                && left_to_person(
+                    opts,
+                    &Records::of_file(&opts.home, sf),
+                    tab,
+                    &sf.session_id,
+                    st,
+                )),
         // The owner's waiting record has stood a look before a move that
         // types nothing first ([`upgrade::Facts::unnoticed`]).
         unnoticed: now.saturating_sub(st.behind_since()) < upgrade::quiet_s(),
@@ -12108,9 +13646,11 @@ fn queue_facts(
 /// The release, typed if it may be now ([`upgrade::gate_release`]): one line
 /// ([`upgrade::release_prompt`]) into the session of an upgrade that abandoned
 /// its notice ([`St::release`]), under every fence the notice is typed under
-/// (the agent its shell's foreground job on a terminal the tab owns, the
-/// conversation's one live owner, the tab still the PTY group's claim, a fresh
-/// read with no box or draft whose generation the turn is fenced on). Typed:
+/// (the agent in front of a terminal the tab owns, the conversation's one
+/// live owner, the tab still the PTY group's claim, a fresh read with no box
+/// or draft whose generation the turn is fenced on) — save that the agent
+/// need not be a shell's job: no restart follows the release, so an aterm
+/// tab's own program in front is enough ([`leads_terminal`]). Typed:
 /// nothing owed, markers forgotten ([`St::released`]), ledgered once
 /// (`released:<why>`). Not typed: still owed; `r` is kept when it is an act
 /// the host looks on after (`gave-up`, `drain-expired:…`), else the wait says
@@ -12141,7 +13681,7 @@ fn release(
     if let upgrade::Gate::Wait(why) = upgrade::gate_release(f, ready) {
         return owed(r, why);
     }
-    if let Err(why) = foreground_shell(k.job(sf.pid)) {
+    if let Err(why) = leads_terminal(k.job(sf.pid)) {
         return owed(r, why);
     }
     let owner = k.terminal(sf.pid);
@@ -12688,16 +14228,22 @@ fn build_held(opts: &Opts, r: Report, st: &mut St, now: u64) -> Report {
     r
 }
 
-/// Records that the agent is no job of a job-control shell
-/// ([`Job::NoJobControl`]): the upgrade stops for this (session, target),
-/// ledgered once. No release is owed: the line is typed under the notice's
-/// fences, which require a foreground job, so it could never be typed.
-fn not_a_job(opts: &Opts, r: Report, st: &mut St) -> Report {
+/// Records that the agent is no job of a job-control shell (`job`, a
+/// [`not_a_shell_job`] read): the upgrade stops for this (session, target),
+/// ledgered once. An aterm tab's own program an older build announced to
+/// (one that read it as the foreground job of a "shell" that was the aterm)
+/// keeps the release its round owes ([`St::stop`]): typed where the tab's
+/// own program leads its terminal ([`leads_terminal`]), it tells the agent
+/// the notice no longer stands. An agent no job-control shell started is
+/// owed none: it never leads its terminal, so the line could never be typed.
+fn not_a_job(opts: &Opts, r: Report, st: &mut St, job: Job) -> Report {
     if opts.dry_run {
         return said(r, "would-refuse:not-a-shell-job");
     }
     st.stop("not-a-shell-job", now_s());
-    st.release.clear();
+    if job == Job::NoJobControl {
+        st.release.clear();
+    }
     let r = said(r, "refused:not-a-shell-job");
     ledger(
         opts,
@@ -12862,6 +14408,7 @@ fn launch_of<'a>(
         homedir: None,
         login,
         stored_login,
+        billing: crate::harness::relaunch::ModelBilling::Keep,
     }
 }
 
@@ -13088,7 +14635,7 @@ impl HandAt {
     pub(super) fn of(human: HumanInput) -> HandAt {
         match human {
             HumanInput::Unknown => HandAt::Unknown,
-            HumanInput::Never => HandAt::Never,
+            HumanInput::Never | HumanInput::NeverFor(_) => HandAt::Never,
             HumanInput::Ago(ms) => Instant::now()
                 .checked_sub(Duration::from_millis(ms))
                 .map_or(HandAt::Unknown, HandAt::At),
@@ -13353,6 +14900,8 @@ struct Restarting<'a> {
     /// That exec environment leaves it its stored login
     /// ([`super::relaunch::Launch::stored_login`]).
     stored_login: bool,
+    /// The exact live billing context; not inferred from the user's home.
+    profile: Option<&'a super::profile::Context>,
 }
 
 /// Whether Claude's own status, read again at the restart's last look (`a`),
@@ -13394,6 +14943,7 @@ fn restart(
         login,
         home,
         stored_login,
+        profile,
     } = *how;
     // NEVER `--resume` OF A CONVERSATION WITH NO TRANSCRIPT, whatever the
     // step read ([`transcript_exists_in`]): Claude refuses it and exits, and
@@ -13440,28 +14990,36 @@ fn restart(
     // == tpgid` mean its prompt is back. The line is planned again against the
     // shell just proven, since hooks or directories may have changed since
     // the announcement.
-    let proven = match k.job(sf.pid) {
-        Some((Job::NoJobControl, _)) => return not_a_job(opts, r, st),
-        job => match foreground_shell(job) {
-            Ok(shell) => shell,
-            Err(why) => return said(r, format!("wait:{why}")),
-        },
+    let job = k.job(sf.pid);
+    if let Some(job) = not_a_shell_job(job) {
+        return not_a_job(opts, r, st, job);
+    }
+    let proven = match foreground_shell(job) {
+        Ok(shell) => shell,
+        Err(why) => return said(r, format!("wait:{why}")),
     };
     // The model the list moves it to, else a model a person chose by hand
     // since the launch: its `--model` would undo that `/model`.
     let model = recorded(&st.model_list).or(hand_model);
     let mode = resume_mode(&records, &sf.session_id, shown_mode.map(str::to_owned));
-    let launch = launch_of(
-        sf,
-        argv,
-        target,
-        model,
-        mode.as_deref(),
-        !fresh,
-        home,
-        login,
-        stored_login,
-    );
+    let launch = Launch {
+        billing: if !st.model_list.is_empty() {
+            super::relaunch::ModelBilling::Move(profile)
+        } else {
+            super::relaunch::ModelBilling::Keep
+        },
+        ..launch_of(
+            sf,
+            argv,
+            target,
+            model,
+            mode.as_deref(),
+            !fresh,
+            home,
+            login,
+            stored_login,
+        )
+    };
     let planned = home_carried(&opts.home, home, &sf.cwd, &records).and_then(|homedir| {
         let launch = Launch {
             homedir: homedir.as_deref(),
@@ -13473,6 +15031,39 @@ fn restart(
         Ok(p) => p,
         Err(no) => return unplanned(opts, r, st, no),
     };
+    // THE LINE BACK ([`St::back_line`]): the same resume on the program this
+    // process runs, planned now with the line it stands beside, for a build
+    // that answers its probe and fails only at a real start. The program is
+    // read as a crash's relaunch reads it ([`launched`]): the image, or the
+    // script an interpreter runs (an npm install, the managed twin). A model
+    // the list moves to is the move's, so it carries only a model a person
+    // chose by hand. None where the move runs that very program, or the
+    // program or a line for it cannot be had (the move goes as it did).
+    let back_line = k
+        .image(sf.pid)
+        .and_then(|image| launched(argv, Some(&image), &native_root(&opts.home), true))
+        .map(|(program, _)| program)
+        .filter(|program| *program != target.exe)
+        .and_then(|program| {
+            let back = Launch {
+                exe: &program,
+                model: hand_model,
+                billing: super::relaunch::ModelBilling::Keep,
+                ..launch
+            };
+            home_carried(&opts.home, home, &sf.cwd, &records)
+                .and_then(|homedir| {
+                    let back = Launch {
+                        homedir: homedir.as_deref(),
+                        ..back
+                    };
+                    plan(opts, &back, proven, t)
+                })
+                .ok()
+        })
+        .filter(|back| back.shell == shell)
+        .map(|back| back.line)
+        .unwrap_or_default();
     // The harness's hand on the tab ([`Hand`]): taken before the last look, so
     // from here to the relaunched agent's first idle no other connection's
     // write lands in the dying agent or the bare shell. Given back on every
@@ -13511,6 +15102,7 @@ fn restart(
         // an earlier notice owed are taken off the record with the exit
         // ([`St::signalled`]), and put back if the signal is never sent.
         let back = st.signalled(sf.pid, shell, tab, line, now_s());
+        st.back_line.clone_from(&back_line);
         // The login that line carries, beside it ([`St::login`]).
         st.login = login.map(str::to_owned);
         // Afresh: the new process holds a conversation of its own, and
@@ -13522,7 +15114,11 @@ fn restart(
         // put back with the rest if the signal is never sent.
         st.fallback_from =
             fallback_carried(fallback_origin(st), recorded(&st.model_list), hand_model);
-        save(opts, &sf.session_id, st);
+        if save_checked(opts, &sf.session_id, st).is_err() {
+            st.unsent(back);
+            st.cause.clear();
+            break 'signal Some(said(r.clone(), "wait:claim-unwritten"));
+        }
         // A second owner, a job-control change or a moved terminal during the
         // state write must veto the signal: re-read the session file and
         // kernel claims right before SIGTERM.
@@ -13605,9 +15201,11 @@ pub(super) fn take_back_ask(opts: &Opts, session: &str, asked: Option<models::As
 /// THE CONFIRMATIONS a carry-on left pending ([`confirm`]): each restart whose
 /// continuation was typed before its resumed session had answered is read
 /// again, and says its `done` row once the answer is written or its time is
-/// up. Only files are read and written — no tab is asked or typed into — so
-/// every sweep runs it first, whatever else it finds; a hand-run sweep for one
-/// tab (`only_sid`) confirms only that tab's.
+/// up. Only files are read and written — but for a restore look whose resumed
+/// build warned in an open task, whose one line is typed into its tab where
+/// that tab's own Autopilot is on, under the tab's own guards
+/// (`relaunch::restore_look`) — so every sweep runs it first, whatever else it
+/// finds; a hand-run sweep for one tab (`only_sid`) confirms only that tab's.
 fn confirmations(opts: &Opts) -> Vec<Report> {
     if opts.dry_run {
         return Vec::new();

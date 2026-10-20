@@ -21,7 +21,7 @@ contract_fn! {
     /// Verified check that the SplitMix64 seed is strictly non-zero (`0 < seed`),
     /// linked via `clean-kernel-defeq` to `record_seed_non_zero_isl`.
     #[must_use]
-    pub fn record_seed_non_zero(seed: u64) -> bool
+    pub const fn record_seed_non_zero(seed: u64) -> bool
     clauses [ensures result == (0 < seed)]
     {
         0 < seed
@@ -147,8 +147,12 @@ pub struct RecordingSeam<O: RealEffects, K: RecordSink = EffectsLog> {
 
 impl<O: RealEffects> RecordingSeam<O> {
     /// Record through `inner` (e.g. [`OsEffects`]) into an in-memory log.
-    pub fn new(inner: O) -> RecordingSeam<O> {
-        RecordingSeam::with_sink(inner, EffectsLog::default())
+    pub const fn new(inner: O) -> RecordingSeam<O> {
+        RecordingSeam {
+            inner,
+            sink: EffectsLog(Vec::new()),
+            latches: Latches::EMPTY,
+        }
     }
     /// Consume the seam, returning the tape it recorded.
     pub fn into_log(self) -> EffectsLog {
@@ -160,11 +164,11 @@ impl<O: RealEffects, K: RecordSink> RecordingSeam<O, K> {
     /// Record through `inner`, streaming each record to `sink` as it is made —
     /// a closure `|record: &EffectRecord| ..` or any other [`RecordSink`]. The
     /// seam keeps no copy, so its memory does not grow with the run.
-    pub fn with_sink(inner: O, sink: K) -> RecordingSeam<O, K> {
+    pub const fn with_sink(inner: O, sink: K) -> RecordingSeam<O, K> {
         RecordingSeam {
             inner,
             sink,
-            latches: Latches::default(),
+            latches: Latches::EMPTY,
         }
     }
     /// Tape one record. Every record restarts the
@@ -202,9 +206,21 @@ impl<O: RealEffects, K: RecordSink> EffectSeam for RecordingSeam<O, K> {
     /// auditor reading the log can tell a denied read from an empty file, and
     /// replay hands the program the same empty bytes it saw.
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, Infallible> {
-        match self.try_read_file(path)? {
-            Ok(bytes) => Ok(bytes),
-            Err(_) => Ok(Vec::new()),
+        match self.inner.real_read_file(path) {
+            Ok(bytes) => {
+                self.tape(&EffectRecord::File {
+                    path: path.to_string(),
+                    bytes: bytes.clone(),
+                });
+                Ok(bytes)
+            }
+            Err(e) => {
+                self.tape(&EffectRecord::FileErr {
+                    path: path.to_string(),
+                    kind: e.kind(),
+                });
+                Ok(Vec::new())
+            }
         }
     }
     fn try_read_file(&mut self, path: &str) -> Result<std::io::Result<Vec<u8>>, Infallible> {
@@ -291,10 +307,10 @@ pub struct LiveSeam<O: RealEffects> {
 
 impl<O: RealEffects> LiveSeam<O> {
     /// Run against `inner` (e.g. [`OsEffects`]) untaped.
-    pub fn new(inner: O) -> LiveSeam<O> {
+    pub const fn new(inner: O) -> LiveSeam<O> {
         LiveSeam {
             inner,
-            latches: Latches::default(),
+            latches: Latches::EMPTY,
         }
     }
     /// Consume the seam, returning its backend.

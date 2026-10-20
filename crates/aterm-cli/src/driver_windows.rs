@@ -306,7 +306,8 @@ pub(crate) fn config_shell_from_text(text: &str) -> ConfigShell {
 /// aterm.toml's top-level `conpty` (the console host a new window's tabs run
 /// in), from the file the window loads, read as the window reads it
 /// ([`crate::config_conpty_from_text`]); `None` when the file is missing or
-/// unreadable, which the window's default (the inbox host) then answers.
+/// unreadable, which the window's default (the OpenConsole beside aterm) then
+/// answers.
 pub(crate) fn config_conpty() -> Option<String> {
     let path = aterm_types::dirs::aterm_config_path()?;
     crate::config_conpty_from_text(&std::fs::read_to_string(path).ok()?)

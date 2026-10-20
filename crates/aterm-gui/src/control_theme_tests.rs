@@ -768,3 +768,114 @@ fn theme_status_line_reports_typography() {
         assert_eq!(field(&status, key), "-", "{key}");
     }
 }
+
+/// A community pack theme no file and no built-in answers to.
+fn pack_only_id() -> &'static str {
+    aterm_theme_pack::themes()
+        .iter()
+        .find(|theme| aterm_types::scheme::builtin_theme(theme.id).is_none())
+        .expect("the pack holds a theme that is not a built-in")
+        .id
+}
+
+fn scratch_themes(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "aterm-gui-pack-preview-{tag}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    dir
+}
+
+/// A pack theme resolves from the embedded pack for a preview, and only for
+/// one: a configured `theme` naming it with no file draws Default, as any
+/// missing name does.
+#[test]
+fn pack_ids_resolve_for_preview_only() {
+    use crate::resolved_colors::ThemeSource;
+    let id = pack_only_id();
+    let themes = ThemeCatalog::default();
+    let config = crate::app_config::Config::default();
+    let preview = config.resolved_colors_previewing(Appearance::Dark, &themes, Some(id));
+    assert_eq!(preview.source, ThemeSource::Pack(id.to_string()));
+    let (_, package) = crate::app_config::pack_package(id).expect("the pack parses");
+    assert_eq!(preview.scheme.background, package.colors.background);
+    // Negative controls: the same name configured, or resolved outside a
+    // preview, never reaches the pack.
+    let configured: crate::app_config::Config =
+        aterm_toml::from_str(&format!("theme = {id:?}\n")).expect("valid toml");
+    assert!(matches!(
+        configured
+            .resolved_colors_previewing(Appearance::Dark, &themes, None)
+            .source,
+        ThemeSource::DefaultFallback { .. }
+    ));
+    assert!(matches!(
+        config
+            .resolved_colors(Appearance::Dark, &themes, Some(id))
+            .source,
+        ThemeSource::DefaultFallback { .. }
+    ));
+    // A themes-folder file by that name that does not load is never stood in
+    // for by the pack: the preview says the file is the problem.
+    let dir = aterm_tempfile::tempdir().expect("a themes folder");
+    std::fs::write(
+        dir.path().join(format!("{id}.conf")),
+        "foreground = \"#zz\"\n=\n",
+    )
+    .expect("theme file");
+    let broken = ThemeCatalog::discover_in(dir.path());
+    assert!(broken.lists(id) && broken.resolve(id).is_err());
+    assert!(matches!(
+        config
+            .resolved_colors_previewing(Appearance::Dark, &broken, Some(id))
+            .source,
+        ThemeSource::DefaultFallback { .. }
+    ));
+}
+
+#[test]
+fn theme_preview_unavailable_refuses_an_unknown_id() {
+    let mut app = app_with("");
+    assert!(
+        app.theme_preview_unavailable("No Such Theme Anywhere")
+            .is_some()
+    );
+    // Negative control: a pack id is drawn, and the status says from where.
+    let id = pack_only_id();
+    assert_eq!(app.theme_preview_unavailable(id), None);
+    let now = Instant::now();
+    let status = preview(&mut app, id, Duration::from_secs(60), now).expect("previewed");
+    assert_eq!(field(&status, "source"), "pack", "{status}");
+    assert_eq!(durable(&app).2, 0, "a pack preview writes nothing");
+}
+
+/// Committing a preview the pack draws installs its file first, reads the
+/// folder into the catalog, and only then queues the `theme` write.
+#[test]
+fn committing_a_pack_preview_installs_then_commits() {
+    let id = pack_only_id();
+    let dir = scratch_themes("commit");
+    let mut app = app_with("");
+    let now = Instant::now();
+    preview(&mut app, id, Duration::from_secs(60), now).expect("previewed");
+    assert_eq!(std::fs::read_dir(&dir).expect("dir").count(), 0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut queued = None;
+    app.commit_theme_preview_into(Some(&dir), tx, |app, queued_id, request_id, _reply| {
+        queued = Some((
+            queued_id,
+            app.config_assets.themes.resolve_package(id).is_ok(),
+        ));
+        Some(request_id)
+    });
+    assert_eq!(
+        queued,
+        Some((id.to_string(), true)),
+        "installed before the write"
+    );
+    assert!(rx.try_recv().is_err(), "the write is pending, not refused");
+    assert_eq!(std::fs::read_dir(&dir).expect("dir").count(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}

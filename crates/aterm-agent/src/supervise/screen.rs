@@ -72,6 +72,12 @@ pub enum HumanInput {
     Unknown,
     /// No person has given the session input since the host began serving it.
     Never,
+    /// No person has given the session input in the milliseconds the host
+    /// has served it, this many before the read (`text --json`'s
+    /// `"unkeyed_ms"` beside `"human_ms":null`; the review of LC-4, KR-2):
+    /// [`Self::Never`] that says since when. A seamless update carries it;
+    /// an adopted shell nothing carried for starts at the successor's Commit.
+    NeverFor(u64),
     /// This many milliseconds before the read.
     Ago(u64),
 }
@@ -95,12 +101,20 @@ impl HumanInput {
         }
     }
 
-    /// The stamp's age; `None` for [`Self::Never`] and [`Self::Unknown`].
+    /// A `"human_ms":null` read, with its `"unkeyed_ms"` where the host sent
+    /// one ([`Self::NeverFor`]).
+    #[must_use]
+    pub fn never(unkeyed_ms: Option<u64>) -> Self {
+        unkeyed_ms.map_or(Self::Never, Self::NeverFor)
+    }
+
+    /// The stamp's age; `None` for [`Self::Never`], [`Self::NeverFor`] and
+    /// [`Self::Unknown`].
     #[must_use]
     pub fn ago(self) -> Option<Duration> {
         match self {
             Self::Ago(ms) => Some(Duration::from_millis(ms)),
-            Self::Never | Self::Unknown => None,
+            Self::Never | Self::NeverFor(_) | Self::Unknown => None,
         }
     }
 
@@ -111,7 +125,7 @@ impl HumanInput {
     #[must_use]
     pub fn within(self, grace_s: u32) -> Option<bool> {
         match self {
-            Self::Never => Some(false),
+            Self::Never | Self::NeverFor(_) => Some(false),
             Self::Ago(ms) => Some(ms < u64::from(grace_s).saturating_mul(1000)),
             Self::Unknown => None,
         }
@@ -120,13 +134,16 @@ impl HumanInput {
     /// Whether no person gave the session input at or after `since_ms` (Unix ms), for a
     /// stamp read at `now_ms`. [`Self::Never`] is `None` like [`Self::Unknown`], for the
     /// caller to read as someone: it says only that nobody keyed since the host began serving
-    /// the session, which may be after `since_ms` (a seamless update's successor reads every
-    /// adopted session as never keyed). The input's instant is `now_ms − age`, so a caller's
-    /// clock read after the server's stamp dates it later than it was, the safe way to be wrong.
+    /// the session, which may be after `since_ms`. [`Self::NeverFor`] says when that was:
+    /// `Some(true)` where the host served the session from `since_ms` or before, else `None`
+    /// (an adopted shell a seamless successor carried no row for began at its Commit). Each
+    /// instant is `now_ms − age`, so a caller's clock read after the server's stamp dates it
+    /// later than it was, the safe way to be wrong: a key later, a serving start later.
     #[must_use]
     pub fn quiet_since(self, since_ms: u64, now_ms: u64) -> Option<bool> {
         match self {
             Self::Ago(ms) => Some(now_ms.saturating_sub(ms) < since_ms),
+            Self::NeverFor(ms) => (now_ms.saturating_sub(ms) <= since_ms).then_some(true),
             Self::Never | Self::Unknown => None,
         }
     }
@@ -188,7 +205,7 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
         // its age. Anything else is unknown, never a guess.
         human: match v.get("human_ms") {
             None => HumanInput::Unknown,
-            Some(Json::Null) => HumanInput::Never,
+            Some(Json::Null) => HumanInput::never(v.get("unkeyed_ms").and_then(Json::as_u64)),
             Some(h) => h.as_u64().map_or(HumanInput::Unknown, HumanInput::Ago),
         },
         human_seq: v.get("human_seq").and_then(Json::as_u64),
@@ -445,6 +462,17 @@ pub fn cell_fg_is(line: &str, fg: &str) -> bool {
         .is_some_and(|c| c.eq_ignore_ascii_case(fg))
 }
 
+/// The colour (`rrggbb`, lowercase) a well-formed `cell` reply
+/// ([`aterm_codec::cell::parse_style`]) draws its glyph in, when that glyph is
+/// `glyph`; `None` for any other reply.
+#[must_use]
+pub fn cell_glyph_fg(line: &str, glyph: char) -> Option<String> {
+    let style = aterm_codec::cell::parse_style(line)?;
+    let drawn = line.strip_prefix("OK ")?.split(' ').next()?;
+    let mut want = [0; 4];
+    (drawn == glyph.encode_utf8(&mut want)).then(|| style.fg.to_ascii_lowercase())
+}
+
 /// The `<field>=` word of a `status` reply (`-` and absent are `None`).
 pub fn status_field<'s>(stdout: &'s str, field: &str) -> Option<&'s str> {
     let line = stdout.lines().find(|l| crate::is_ok_reply(l))?;
@@ -563,9 +591,43 @@ mod tests {
         assert_eq!(with(r#","human_ms":12345"#), HumanInput::Ago(12_345));
         assert_eq!(with(r#","human_ms":0,"trimmed":1"#), HumanInput::Ago(0));
         assert_eq!(with(r#","human_ms":null"#), HumanInput::Never);
+        assert_eq!(
+            with(r#","human_ms":null,"trimmed":1,"unkeyed_ms":5000"#),
+            HumanInput::NeverFor(5000),
+            "a never that says since when"
+        );
+        assert_eq!(
+            with(r#","human_ms":null,"unkeyed_ms":"5""#),
+            HumanInput::Never
+        );
         assert_eq!(with(""), HumanInput::Unknown, "an older host");
         assert_eq!(with(r#","human_ms":"12""#), HumanInput::Unknown);
         assert_eq!(with(r#","human_ms":-3"#), HumanInput::Unknown);
+    }
+
+    /// [`HumanInput::quiet_since`] (the review of LC-4, KR-2): an age is
+    /// quiet when the key came before the instant; a never that says since
+    /// when is quiet when the host served the session from the instant or
+    /// before, and cannot say when it began after; a bare never and an
+    /// unknown cannot say.
+    #[test]
+    fn a_never_that_says_since_when_is_quiet_from_before_the_instant() {
+        let (since, now) = (1_000_000, 1_600_000);
+        assert_eq!(HumanInput::Ago(700_000).quiet_since(since, now), Some(true));
+        assert_eq!(
+            HumanInput::Ago(500_000).quiet_since(since, now),
+            Some(false)
+        );
+        assert_eq!(
+            HumanInput::NeverFor(600_000).quiet_since(since, now),
+            Some(true),
+            "served from the instant"
+        );
+        assert_eq!(HumanInput::NeverFor(599_999).quiet_since(since, now), None);
+        assert_eq!(HumanInput::Never.quiet_since(since, now), None);
+        assert_eq!(HumanInput::Unknown.quiet_since(since, now), None);
+        assert_eq!(HumanInput::NeverFor(1).within(u32::MAX), Some(false));
+        assert_eq!(HumanInput::NeverFor(1).ago(), None);
     }
 
     /// `"launch"` (the server's launch witness, in the shape aterm-gui's

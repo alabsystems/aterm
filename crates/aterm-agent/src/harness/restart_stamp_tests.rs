@@ -106,7 +106,8 @@ fn taking_a_stamp_takes_only_the_one_meant() {
 /// The reader's lookup: a stamp naming the process whose exit is read gives its cause and stands
 /// until the relaunch takes it; one naming another process that still runs is left alone; one
 /// naming a gone process, or older than `STALE_S`, is removed as it is found. The live process is
-/// this test's own.
+/// this test's own: its start is read on every platform (on Windows by `GetProcessTimes`, where
+/// no `ps` answers).
 #[test]
 fn the_lookup_names_its_exit_and_sweeps_what_is_over() {
     let tmp = scratch();
@@ -209,6 +210,7 @@ fn the_stamp_standing_for_a_process_is_the_one_its_exit_is_read_by() {
 /// The act reads a start in the snapshot's own spelling: on macOS by syscall, never a `ps`, and
 /// equal to what `ps -o lstart=` in UTC and the C locale says of the same process. A stamp stands a
 /// second short of going stale.
+#[cfg(unix)]
 #[test]
 fn the_act_reads_a_start_in_the_snapshots_own_spelling() {
     let me = std::process::id();
@@ -280,6 +282,7 @@ fn the_relaunch_that_files_an_asked_exit_takes_its_stamp() {
         aterm_state: None,
         ask: false,
         several_logins: false,
+        usage_credits: false,
         usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
@@ -288,6 +291,7 @@ fn the_relaunch_that_files_an_asked_exit_takes_its_stamp() {
     };
     let snap = Snapshot {
         stored_login: false,
+        profile: None,
         tab: "s-1".to_string(),
         pid: 4242,
         start: "Wed Sep 23 20:13:55 2026".to_string(),

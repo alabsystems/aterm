@@ -17,7 +17,7 @@
 //! [`ParserRepr::exact`]: a DCS header goes out as `{"state":"DcsIgnore","exact":{…}}`.
 //! An older build reads the `DcsIgnore` and ignores the key; this build reads `exact`.
 
-use aterm_parser::{ParserCarry, State};
+use aterm_parser::{ParserCarry, State, TmuxPassthrough};
 
 /// [`ParserCarry`] on the handoff wire (see the module docs).
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -58,6 +58,12 @@ pub struct ParserRepr {
     /// hex. An older build ignores it (and reads the string's next `0x9C` as its ST).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub string_utf8_tail: String,
+    /// The tmux passthrough wrapper the parser stands in or at the head of
+    /// ([`aterm_parser::TmuxPassthrough::name`]: `head1`..`head4`, `open`,
+    /// `escape`), absent for none. An older build ignores it and reads the rest of
+    /// the wrapper bare, as it read every wrapper.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tmux: String,
     /// The carry itself, when the fields beside it are the coarser form an older
     /// build reads instead ([`ParserCarry::for_older_builds`]): a DCS header, which
     /// such a build refuses (it would resume at Ground and print the string), rides
@@ -147,6 +153,7 @@ impl ParserRepr {
             utf8_tail: to_hex(&carry.utf8_tail),
             utf8_expected: carry.utf8_expected,
             string_utf8_tail: to_hex(&carry.string_utf8_tail),
+            tmux: carry.tmux.name().to_owned(),
             exact: None,
         }
     }
@@ -174,6 +181,7 @@ impl ParserRepr {
             utf8_tail: from_hex(&self.utf8_tail)?,
             utf8_expected: self.utf8_expected,
             string_utf8_tail: from_hex(&self.string_utf8_tail)?,
+            tmux: TmuxPassthrough::from_name(&self.tmux)?,
         })
     }
 }
@@ -232,6 +240,39 @@ mod tests {
         let repr = ParserRepr::from_carry(&string);
         assert_eq!(repr.string_utf8_tail, "e6");
         assert_eq!(repr.to_carry(), Some(string));
+        // A tmux passthrough wrapper: its head, and an open one at its ESC
+        // with the payload's own CSI beside it.
+        for (carry, name) in [
+            (
+                ParserCarry {
+                    state: State::DcsIgnore,
+                    tmux: TmuxPassthrough::Head(3),
+                    ..ParserCarry::default()
+                },
+                "head3",
+            ),
+            (
+                ParserCarry {
+                    state: State::CsiParam,
+                    params: vec![1],
+                    current_param: 2,
+                    param_started: true,
+                    tmux: TmuxPassthrough::Escape,
+                    ..ParserCarry::default()
+                },
+                "escape",
+            ),
+        ] {
+            let repr = ParserRepr::from_carry(&carry);
+            assert_eq!(repr.tmux, name);
+            assert_eq!(repr.to_carry(), Some(carry));
+        }
+        let unknown = ParserRepr {
+            state: "Ground".into(),
+            tmux: "head9".into(),
+            ..ParserRepr::default()
+        };
+        assert_eq!(unknown.to_carry(), None, "a wrapper no build writes");
     }
 
     /// A DCS header rides under `exact` beside the empty `DcsIgnore` an older build

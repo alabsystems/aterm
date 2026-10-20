@@ -48,6 +48,113 @@ static ACCESSIBILITY_FLAGS: AtomicU8 = AtomicU8::new(0);
 #[cfg(not(test))]
 static TEXT_SCALE_BITS: AtomicU32 = AtomicU32::new(1.0_f32.to_bits());
 
+/// A TEXT SCALE INJECTED IN PLACE OF THE OPERATING SYSTEM'S, for a development
+/// build: the `text-scale` control verb ([`cmd_text_scale`]) or the
+/// `$ATERM_TEXT_SCALE` launch seam set it, so a lab can see and audit the
+/// layouts larger text draws on a host whose own reading never moves (macOS
+/// reports 1.0). [`install_preferences`] lays it over every platform reading,
+/// so a re-sample keeps it until `text-scale os` clears it. `0`: none.
+#[cfg(not(test))]
+static INJECTED_TEXT_SCALE_BITS: AtomicU32 = AtomicU32::new(0);
+#[cfg(test)]
+thread_local! {
+    static TEST_INJECTED_TEXT_SCALE: Cell<Option<f32>> = const { Cell::new(None) };
+}
+
+/// Inject `scale` in place of the operating system's text scale, or clear the
+/// injection (`None`). The caller re-samples the preferences so it takes
+/// effect ([`install_preferences`]).
+pub(crate) fn inject_text_scale(scale: Option<f32>) {
+    #[cfg(test)]
+    TEST_INJECTED_TEXT_SCALE.with(|slot| slot.set(scale));
+    #[cfg(not(test))]
+    INJECTED_TEXT_SCALE_BITS.store(scale.map_or(0, f32::to_bits), Ordering::Release);
+}
+
+/// The text scale a development build injected ([`inject_text_scale`]).
+#[must_use]
+pub(crate) fn injected_text_scale() -> Option<f32> {
+    #[cfg(test)]
+    {
+        TEST_INJECTED_TEXT_SCALE.with(Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        let bits = INJECTED_TEXT_SCALE_BITS.load(Ordering::Acquire);
+        (bits != 0).then(|| f32::from_bits(bits))
+    }
+}
+
+/// The text scale a `text-scale` request or the launch seam names: a number
+/// in `0.85..=2.0`, or `os` (`Some(None)`: clear the injection).
+fn parse_text_scale(word: &str) -> Option<Option<f32>> {
+    if word.eq_ignore_ascii_case("os") {
+        return Some(None);
+    }
+    let scale = word.parse::<f32>().ok().filter(|scale| scale.is_finite())?;
+    (0.85..=2.0).contains(&scale).then_some(Some(scale))
+}
+
+/// The `text-scale` verb's arguments: none (read), or one scale or `os`,
+/// which only a build with `injection` admits.
+fn text_scale_request(rest: &str, injection: bool) -> Result<Option<Option<f32>>, &'static str> {
+    const USAGE: &str = "usage: text-scale [0.85..2.0|os]";
+    let mut words = rest.split_whitespace();
+    let set = match (words.next(), words.next()) {
+        (None, _) => None,
+        (Some(word), None) => Some(parse_text_scale(word).ok_or(USAGE)?),
+        (Some(_), Some(_)) => return Err(USAGE),
+    };
+    if set.is_some() && !injection {
+        return Err("text-scale <scale>|os needs a development build (dev-seams)");
+    }
+    Ok(set)
+}
+
+/// The `text-scale` control verb: answer the text scale native pages lay out
+/// at and where it comes from; a development build sets or clears an
+/// injected one first, through the main thread's re-sample.
+pub(crate) fn cmd_text_scale(
+    proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>,
+    rest: &str,
+) -> String {
+    let set = match text_scale_request(rest, cfg!(any(debug_assertions, feature = "dev-seams"))) {
+        Ok(set) => set,
+        Err(refusal) => return format!("ERR {refusal}\n"),
+    };
+    match crate::control::control_media::call_main(proxy, |reply| crate::Wake::ControlTextScale {
+        set,
+        reply,
+    }) {
+        Ok(line) => format!("OK {line}\n"),
+        Err(e) => format!("ERR {e}\n"),
+    }
+}
+
+/// The `text-scale` verb's answer line.
+#[must_use]
+pub(crate) fn text_scale_status_line() -> String {
+    format!(
+        "text_scale={} source={}",
+        text_scale(),
+        if injected_text_scale().is_some() {
+            "injected"
+        } else {
+            "os"
+        }
+    )
+}
+
+/// The `$ATERM_TEXT_SCALE` launch seam ([`aterm_types::dev_seam!`]): a
+/// development build's text scale from launch, before any window lays out.
+pub(crate) fn inject_launch_text_scale() {
+    if let Some(Some(scale)) = aterm_types::dev_seam!("ATERM_TEXT_SCALE")
+        .and_then(|value| value.to_str().and_then(parse_text_scale))
+    {
+        inject_text_scale(Some(scale));
+    }
+}
+
 /// Sticky flag: an OS-owned chrome input moved and no re-sample has settled the windows
 /// for it yet. Set by [`install_preferences`] and
 /// [`crate::chrome_band::install_forced_chrome`]; drained only by
@@ -112,7 +219,11 @@ thread_local! {
 /// Install the platform-observed appearance snapshot. Returns `true` only when
 /// paint/layout inputs changed, so the host can skip redundant redraws; a `true` also
 /// arms [`CHROME_INPUTS_MOVED`].
-pub(crate) fn install_preferences(preferences: AppearancePreferences) -> bool {
+pub(crate) fn install_preferences(mut preferences: AppearancePreferences) -> bool {
+    // A development build's injected scale stands over every reading.
+    if let Some(scale) = injected_text_scale() {
+        preferences.text_scale = scale;
+    }
     let preferences = preferences.normalized();
     let moved = {
         #[cfg(test)]
@@ -162,6 +273,105 @@ pub(crate) fn text_scale() -> f32 {
     current_preferences().text_scale
 }
 
+/// The operating system's accent colour, one shade per side of the light/dark
+/// split (Windows: Personalization ▸ Colours ▸ Accent colour). The chrome takes it
+/// as its accent wherever the theme and config author none
+/// (`aterm_messages::tokens::AccentSource::System`), so the Settings selection, the
+/// palette row, the strip's marks and the pane focus tick wear the user's Windows
+/// accent rather than the cursor's colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SystemAccent {
+    /// The shade for marks and fills on a DARK surface (WinUI's
+    /// `SystemAccentColorLight2`).
+    pub(crate) on_dark: [u8; 3],
+    /// The shade for a LIGHT surface (`SystemAccentColorDark1`).
+    pub(crate) on_light: [u8; 3],
+}
+
+impl SystemAccent {
+    /// The shade for a surface whose background is `bg`
+    /// ([`aterm_messages::ink::bg_is_light`], the one dark/light classifier).
+    #[must_use]
+    pub(crate) fn for_surface(self, bg: [u8; 3]) -> [u8; 3] {
+        if aterm_messages::ink::bg_is_light(bg) {
+            self.on_light
+        } else {
+            self.on_dark
+        }
+    }
+
+    #[cfg(all(windows, not(test)))]
+    fn pack(self) -> u64 {
+        let rgb = |c: [u8; 3]| (u64::from(c[0]) << 16) | (u64::from(c[1]) << 8) | u64::from(c[2]);
+        (rgb(self.on_dark) << 24) | rgb(self.on_light)
+    }
+
+    #[cfg(not(test))]
+    fn unpack(v: u64) -> Self {
+        let rgb = |v: u64| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+        Self {
+            on_dark: rgb(v >> 24),
+            on_light: rgb(v & 0x00FF_FFFF),
+        }
+    }
+}
+
+/// [`SYSTEM_ACCENT`]'s "the OS gives no accent" value (48 bits hold a pair).
+#[cfg(not(test))]
+const NO_SYSTEM_ACCENT: u64 = u64::MAX;
+
+/// The installed [`SystemAccent`], packed; process-wide like the preferences.
+#[cfg(not(test))]
+static SYSTEM_ACCENT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(NO_SYSTEM_ACCENT);
+
+// Per worker thread under test, like the appearance snapshot: none unless a test
+// installs one, so no test reads the machine's accent.
+#[cfg(test)]
+thread_local! {
+    static TEST_SYSTEM_ACCENT: Cell<Option<SystemAccent>> = const { Cell::new(None) };
+}
+
+/// Install the OS accent the platform read (`None`: it gives none). `true` when it
+/// moved, which also arms [`CHROME_INPUTS_MOVED`] so the windows repaint their
+/// chrome in it (the strip's cached rows included).
+#[cfg(any(windows, test))]
+pub(crate) fn install_system_accent(accent: Option<SystemAccent>) -> bool {
+    let moved = {
+        #[cfg(test)]
+        {
+            TEST_SYSTEM_ACCENT.with(|slot| slot.replace(accent) != accent)
+        }
+
+        #[cfg(not(test))]
+        {
+            let packed = accent.map_or(NO_SYSTEM_ACCENT, SystemAccent::pack);
+            SYSTEM_ACCENT.swap(packed, Ordering::AcqRel) != packed
+        }
+    };
+    if moved {
+        note_chrome_inputs_moved();
+    }
+    moved
+}
+
+/// The installed OS accent, if the platform follows one.
+#[must_use]
+pub(crate) fn system_accent() -> Option<SystemAccent> {
+    #[cfg(test)]
+    {
+        TEST_SYSTEM_ACCENT.with(Cell::get)
+    }
+
+    #[cfg(not(test))]
+    {
+        match SYSTEM_ACCENT.load(Ordering::Acquire) {
+            NO_SYSTEM_ACCENT => None,
+            packed => Some(SystemAccent::unpack(packed)),
+        }
+    }
+}
+
 impl AppearancePreferences {
     pub(crate) fn normalized(self) -> Self {
         Self {
@@ -192,6 +402,10 @@ pub(crate) struct NativeRoles {
     pub(crate) accent_ink: [u8; 3],
     pub(crate) on_accent: [u8; 3],
     pub(crate) separator: [u8; 3],
+    /// A control's own boundary (a filter chip's rim): the separator held to
+    /// 3:1, the non-text contrast floor, against the cards and the page it sits
+    /// on. [`Self::separator`] stays a quiet hairline (1.5:1).
+    pub(crate) control_edge: [u8; 3],
     pub(crate) control_track: [u8; 3],
     pub(crate) elevated: [u8; 3],
     pub(crate) danger: [u8; 3],
@@ -226,6 +440,39 @@ pub(crate) const ACCENT_WASH_PRESSED: f32 = 0.16;
 /// The floor the accent holds as ink against the wash it is inked on. A rule
 /// or fill can be quieter than its surroundings; a label cannot.
 const ACCENT_INK_FLOOR: f32 = 3.0;
+/// How far a light theme's `elevated` (cards, the rail) rises above its
+/// `surface` (the page), in `OkLab` lightness: Fluent's light card step
+/// (#fbfbfb on #f3f3f3 is 0.025) and about what the dark side's mix rises.
+const LIGHT_ELEVATION_STEP: f32 = 0.035;
+/// The most of the way to white that step may take, so a near-white page
+/// still leaves its cards short of pure white (Fluent's step is 0.64 of it).
+const LIGHT_ELEVATION_TOWARD_WHITE: f32 = 0.6;
+
+/// A light theme's `elevated`: `surface` mixed toward white by
+/// [`LIGHT_ELEVATION_STEP`] of lightness, at most
+/// [`LIGHT_ELEVATION_TOWARD_WHITE`] of the way. A fixed share would lift a
+/// mid-grey page's cards far above the ink floored against the page.
+fn light_elevation(surface: [u8; 3]) -> [u8; 3] {
+    let headroom = (1.0 - rgb_to_oklch(surface).l).max(0.0);
+    let amount = (LIGHT_ELEVATION_STEP / headroom).min(LIGHT_ELEVATION_TOWARD_WHITE);
+    neutral_surface(surface, [255, 255, 255], amount)
+}
+
+/// Whether a light theme's cards rise above the page ([`light_elevation`]), as
+/// Windows' own Settings lifts them (#fbfbfb on #f3f3f3). macOS and Linux keep
+/// their grouped fills a step darker than the window, their look until that
+/// lane is reviewed.
+const LIGHT_CARDS_RISE: bool = cfg!(windows);
+
+/// A light theme's `elevated` on this platform: [`light_elevation`] where
+/// [`LIGHT_CARDS_RISE`], else `surface` mixed a further step toward the ink.
+fn light_elevated(surface: [u8; 3], fg: [u8; 3]) -> [u8; 3] {
+    if LIGHT_CARDS_RISE {
+        light_elevation(surface)
+    } else {
+        neutral_surface(surface, fg, 0.065)
+    }
+}
 
 /// Straight sRGB channel lerp, the mix the native painter builds control fills
 /// with ([`crate::native_ui::mix_rgb`] delegates here), as distinct from the
@@ -324,7 +571,14 @@ pub(crate) fn roles(
     let dark = surface_is_dark(bg);
 
     let surface = neutral_surface(bg, fg, if dark { 0.075 } else { 0.055 });
-    let elevated = neutral_surface(surface, fg, if dark { 0.075 } else { 0.065 });
+    // A card sits above the page: toward the ink on a dark theme; on a light
+    // one toward white on Windows ([`light_elevated`]), where mixed toward the
+    // ink its cards sank 1.14:1 below the page.
+    let elevated = if dark {
+        neutral_surface(surface, fg, 0.075)
+    } else {
+        light_elevated(surface, fg)
+    };
     let primary_target = if preferences.high_contrast { 7.0 } else { 4.5 };
     let secondary_target = if preferences.high_contrast { 7.0 } else { 4.5 };
     let tertiary_target = if preferences.high_contrast { 4.5 } else { 3.0 };
@@ -385,6 +639,11 @@ pub(crate) fn roles(
         None => ensure_contrast(mix_oklab(fg, surface, 0.70), surface, separator_target),
     };
     let control_track = ensure_contrast(mix_oklab(fg, surface, 0.57), surface, 2.0);
+    let control_edge = [elevated, surface]
+        .into_iter()
+        .fold(separator, |edge, backdrop| {
+            ensure_contrast(edge, backdrop, 3.0)
+        });
 
     // Status hues take the theme's own ANSI red and green where they carry a
     // colour, else a shared semantic angle; lightness, chroma and final
@@ -431,6 +690,7 @@ pub(crate) fn roles(
         accent_ink,
         on_accent,
         separator,
+        control_edge,
         control_track,
         elevated,
         danger,
@@ -727,6 +987,53 @@ fn ensure_contrast(fg: [u8; 3], bg: [u8; 3], target: f32) -> [u8; 3] {
 mod tests {
     use super::*;
 
+    /// With the OS accent installed and none authored, every chrome surface takes
+    /// it as its accent, in the shade for its side: the Settings roles on a dark
+    /// theme carry Windows' blue, not the cursor's green. Installing it arms the
+    /// chrome latch so the windows repaint; uninstalling hands the cursor back.
+    #[test]
+    fn the_os_accent_leads_the_chrome_where_none_is_authored() {
+        use aterm_messages::tokens::AccentSource;
+        let _ = take_chrome_inputs_moved();
+        let theme = Theme::default();
+        let cursor_accent = crate::chrome_band::ChromePalette::from(theme)
+            .tokens()
+            .accent;
+        let windows = SystemAccent {
+            on_dark: [0x4c, 0xc2, 0xff],
+            on_light: [0x00, 0x67, 0xc0],
+        };
+        assert!(
+            install_system_accent(Some(windows)),
+            "none → some is a move"
+        );
+        assert!(take_chrome_inputs_moved(), "and the windows are told");
+        let tokens = crate::chrome_band::ChromePalette::from(theme).tokens();
+        assert_eq!(tokens.accent_source, AccentSource::System);
+        let bg = [
+            (theme.bg >> 16) as u8,
+            (theme.bg >> 8) as u8,
+            theme.bg as u8,
+        ];
+        assert_eq!(tokens.accent, windows.for_surface(bg));
+        let roles = roles(theme, AppearancePreferences::default());
+        let hue = |c: [u8; 3]| rgb_to_oklch(c).h;
+        assert!(
+            (hue(roles.accent) - hue(windows.for_surface(bg))).abs() < 0.2,
+            "the Settings accent keeps the OS accent's hue: {:?}",
+            roles.accent
+        );
+        assert!(!install_system_accent(Some(windows)), "no move, no repaint");
+        assert!(install_system_accent(None));
+        assert_eq!(
+            crate::chrome_band::ChromePalette::from(theme)
+                .tokens()
+                .accent,
+            cursor_accent
+        );
+        let _ = take_chrome_inputs_moved();
+    }
+
     /// A preference move consumed by another caller (window attach, startup,
     /// settings preview) still reaches the re-sample that settles the windows.
     #[test]
@@ -849,12 +1156,62 @@ mod tests {
             contrast_ratio(r.on_accent, r.accent) >= 4.5,
             "{what}: ink on an accent fill"
         );
+        for (on, backdrop) in [("card", r.elevated), ("page", r.surface)] {
+            let ratio = contrast_ratio(r.control_edge, backdrop);
+            assert!(
+                ratio >= 3.0,
+                "{what}: a control's edge on the {on} is {ratio:.2}:1"
+            );
+        }
         assert!(contrast_ratio(r.danger, r.surface) >= 4.5, "{what}: danger");
         assert!(
             contrast_ratio(r.success, r.surface) >= 4.5,
             "{what}: success"
         );
         assert_ne!(r.surface, r.elevated, "{what}: elevation is visible");
+        if LIGHT_CARDS_RISE || surface_is_dark(r.surface) {
+            assert!(
+                relative_luminance(r.elevated) > relative_luminance(r.surface),
+                "{what}: a card {:?} sits above, so lighter than, the page {:?}",
+                r.elevated,
+                r.surface
+            );
+        }
+    }
+
+    /// On Windows light themes' cards are lighter than their page, as dark
+    /// themes' are; macOS and Linux keep the step toward the ink, darker than
+    /// the page. Each platform's answer is the other's negative control.
+    #[test]
+    fn light_cards_rise_above_the_page_on_windows_only() {
+        let mut light = 0;
+        for (name, theme) in bundled_themes() {
+            let bg = packed_rgb(theme.bg);
+            if surface_is_dark(bg) {
+                continue;
+            }
+            light += 1;
+            let r = default_roles(theme);
+            let toward_ink = neutral_surface(r.surface, packed_rgb(theme.fg), 0.065);
+            let toward_white = light_elevation(r.surface);
+            assert!(
+                relative_luminance(toward_white) > relative_luminance(r.surface),
+                "{name}: Windows' card {toward_white:?} on page {:?}",
+                r.surface
+            );
+            assert!(
+                relative_luminance(toward_ink) < relative_luminance(r.surface),
+                "{name}: the other platforms' card {toward_ink:?} on page {:?}",
+                r.surface
+            );
+            let expected = if cfg!(windows) {
+                toward_white
+            } else {
+                toward_ink
+            };
+            assert_eq!(r.elevated, expected, "{name}: this platform's card");
+        }
+        assert!(light >= 4, "light built-ins measured: {light}");
     }
 
     #[test]
@@ -1070,6 +1427,37 @@ mod tests {
                     >= contrast_ratio(normal.separator, normal.surface)
             );
         }
+    }
+
+    /// A DEVELOPMENT BUILD'S INJECTED TEXT SCALE STANDS OVER THE OS'S
+    /// ([`super::inject_text_scale`]): a re-sample that installs the platform's
+    /// reading keeps it, `text-scale os` clears it, and the verb takes a scale
+    /// in 0.85..=2.0 or `os` and refuses the rest and any injection in a
+    /// build without the seam.
+    #[test]
+    fn an_injected_text_scale_survives_a_resample_until_cleared() {
+        super::inject_text_scale(Some(2.0));
+        super::install_preferences(super::AppearancePreferences::default());
+        assert_eq!(super::text_scale(), 2.0);
+        assert_eq!(
+            super::text_scale_status_line(),
+            "text_scale=2 source=injected"
+        );
+        super::inject_text_scale(None);
+        super::install_preferences(super::AppearancePreferences::default());
+        assert_eq!(super::text_scale(), 1.0);
+        assert_eq!(super::text_scale_status_line(), "text_scale=1 source=os");
+
+        assert_eq!(super::text_scale_request("", false), Ok(None));
+        assert_eq!(super::text_scale_request("1.5", true), Ok(Some(Some(1.5))));
+        assert_eq!(super::text_scale_request("os", true), Ok(Some(None)));
+        for bad in ["3", "0.5", "big", "1.5 2"] {
+            assert!(super::text_scale_request(bad, true).is_err(), "{bad}");
+        }
+        assert!(
+            super::text_scale_request("1.5", false).is_err(),
+            "no injection without the seam"
+        );
     }
 
     #[test]

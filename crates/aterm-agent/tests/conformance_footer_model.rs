@@ -487,13 +487,15 @@ impl World {
 
 /// Write the registry file of the process for its `n`th session: the same
 /// pid, `procStart` and `startedAt` every time — only the session id moves.
+/// The directory is a JSON string as Claude Code writes it (a Windows path's
+/// backslashes escaped).
 fn register(claude: &Path, cwd: &Path, n: u32) {
     std::fs::write(
         claude.join(format!("sessions/{PID}.json")),
         format!(
-            r#"{{"pid":{PID},"sessionId":"{}","cwd":"{}","procStart":"{}","startedAt":{},"version":"2.1.283"}}"#,
+            r#"{{"pid":{PID},"sessionId":"{}","cwd":{},"procStart":"{}","startedAt":{},"version":"2.1.283"}}"#,
             session_id(n),
-            cwd.display(),
+            aterm_json::to_string(&cwd.display().to_string()).unwrap(),
             footer::lstart_utc(START),
             START * 1000 + 684
         ),

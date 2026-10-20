@@ -88,6 +88,12 @@ pub struct Record {
     /// a boolean reads as unknown (`None`, never idle) rather than refusing
     /// the record the exit is decided from.
     pub draft_empty: Option<bool>,
+    /// `state`: what the TUI's frame reads (`working|idle|blocked|done|error`),
+    /// whatever the session still owes. It decides only the relaunch's first
+    /// frame ([`first_frame`]), never the crash rule or the idle point: a value
+    /// that is not a string reads as unknown (`None`), never refusing the
+    /// record.
+    pub frame: Option<String>,
 }
 
 /// Why a record or its line is refused (one word, said in the ledger and
@@ -145,6 +151,7 @@ pub fn parse(text: &str) -> Result<Record, Refusal> {
         exit: opt_str("exit")?,
         cwd: opt_str("cwd")?,
         draft_empty: v.get("draftEmpty").and_then(Value::as_bool),
+        frame: v.get("state").and_then(Value::as_str).map(str::to_owned),
     })
 }
 
@@ -188,18 +195,92 @@ fn live_of(pid: u32) -> Option<(PathBuf, Live)> {
 /// any record that is not at rest.
 #[must_use]
 pub fn read_idle(pid: u32, start: &str) -> bool {
+    read_live(pid, start, |record| idle_point(record).then_some(())).is_some()
+}
+
+/// What a relaunched codex-alab's own record says of its TUI's frame once
+/// it is up ([`first_frame`]): what ends aterm's relaunch hold
+/// (`codex_alab_drive`'s `hold_to_first_idle`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstFrame {
+    /// At rest: its first idle — `state` `idle`, `done` or `error`, or the
+    /// record's own rest ([`idle_point`]).
+    Idle,
+    /// In a turn or a box (`working`, `blocked`): a turn under way that the
+    /// relaunch lease did not hold back — a person's, or a carry-on that went
+    /// before a later step took the hand again — so its first idle is behind
+    /// it, or not the next thing it reaches.
+    Turn,
+}
+
+/// A RELAUNCHED CODEX-ALAB'S FIRST FRAME (the contract §5, carry-on: aterm's
+/// relaunch lease is held "to the new process's first idle"): its own record
+/// names its TUI's frame — [`FirstFrame::Idle`] at rest, [`FirstFrame::Turn`]
+/// in a turn or a box — and no end. Not the idle point alone: a relaunch
+/// whose thread owes its carry-on keeps its record `busy` until that act goes
+/// (§4: `status:"idle"` only when no carry-on is owed), and the act waits for
+/// this very lease to be given back (§5, before every act: `hand=-` or its
+/// own), so a hold to the idle point would always run to its bound exactly
+/// when the carry-on is owed. Nor the frame at rest alone: codex-alab's own
+/// acts in a turn under way (a box it answers) wait for the same lease, so a
+/// hold to the rest that turn ends at would hold them to its bound too.
+/// `None` for no frame named (or one that is no word this reads) and a
+/// record that names its end.
+#[must_use]
+pub fn first_frame(record: &Record) -> Option<FirstFrame> {
+    if record.exit.is_some() {
+        return None;
+    }
+    match record.frame.as_deref() {
+        _ if idle_point(record) => Some(FirstFrame::Idle),
+        Some("idle" | "done" | "error") => Some(FirstFrame::Idle),
+        Some("working" | "blocked") => Some(FirstFrame::Turn),
+        _ => None,
+    }
+}
+
+/// THE FIRST FRAME OF THE PROCESS `pid` STARTED AT `start` ([`first_frame`]),
+/// by its own record read LIVE, as [`read_idle`] reads the idle point: `None`
+/// (fail closed: keep holding) for a process gone or another identity of its
+/// pid, an exec record that cannot be read, and a record missing, unreadable,
+/// of another pid or naming no frame.
+#[must_use]
+pub fn read_first_frame(pid: u32, start: &str) -> Option<FirstFrame> {
+    read_live(pid, start, first_frame)
+}
+
+/// `point` of the process `pid` started at `start`'s own record, read only
+/// while that very process runs (looked at before the read and again after
+/// it), the record naming that pid.
+fn read_live<T>(pid: u32, start: &str, point: fn(&Record) -> Option<T>) -> Option<T> {
     use super::restart_stamp::alive_as;
     if !alive_as(pid, start) {
-        return false;
+        return None;
     }
-    let Some((home, _)) = live_of(pid) else {
-        return false;
+    let (home, _) = live_of(pid)?;
+    let at = match read_record(&record_path(&home, pid)) {
+        Seen::Present(record) if record.pid == pid => point(&record),
+        Seen::Present(_) | Seen::Removed | Seen::Never | Seen::Unreadable(_) => None,
     };
-    let idle = match read_record(&record_path(&home, pid)) {
-        Seen::Present(record) => record.pid == pid && idle_point(&record),
-        Seen::Removed | Seen::Never | Seen::Unreadable(_) => false,
-    };
-    idle && alive_as(pid, start)
+    at.filter(|_| alive_as(pid, start))
+}
+
+/// The pid of the codex-alab one `status` reply names as its PROVEN
+/// self-claim (`supervisor_proven=1` beside `supervisor=codex-alab@<pid>`,
+/// the holder percent-encoded as every `status` field is); `None` for any
+/// other claim, an unproven one, none, or a reply that is not `OK`.
+#[must_use]
+pub fn proven_pid(status: &str) -> Option<u32> {
+    use crate::supervise::screen::status_field;
+    if status_field(status, "supervisor_proven") != Some("1") {
+        return None;
+    }
+    let holder = status_field(status, "supervisor")?;
+    holder
+        .strip_prefix("codex-alab%40")
+        .or_else(|| holder.strip_prefix("codex-alab@"))?
+        .parse()
+        .ok()
 }
 
 /// Whether `id` is a UUID in its one textual form (8-4-4-4-12 hex digits).
@@ -433,6 +514,7 @@ pub fn inherited(typed: Option<&Resume>, pid: u32, live: &Live) -> Result<Resume
         exit: None,
         cwd: typed.cwd.clone(),
         draft_empty: None,
+        frame: None,
     };
     validate(&record, pid, live)
 }

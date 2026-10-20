@@ -35,6 +35,9 @@ aterm-models-session = { workspace = true }
 # The vocabularies the box and wall words mirror (`PromptKind::name`,
 # `WallKind::name`), held equal by `vocab_mirrors_the_screen_reader`.
 aterm-phase = { workspace = true }
+# The fabric's closed kinds and inbox verdicts (`fabric_grammar::KINDS`,
+# `VERDICTS`), which the mail and verdict words must hold (`vocab_mirror.rs`).
+aterm-types = { workspace = true }
 
 [[test]]
 name = "slog_suite"

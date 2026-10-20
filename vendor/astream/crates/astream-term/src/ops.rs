@@ -109,7 +109,7 @@ contract_fn! {
     /// Discharged in the Clean CIC kernel by definitional equality against
     /// `op_scroll_region_nonempty_isl` (`clean-kernel-defeq`).
     #[must_use]
-    pub fn op_scroll_region_nonempty(top: u16, bottom: u16) -> bool
+    pub const fn op_scroll_region_nonempty(top: u16, bottom: u16) -> bool
     clauses [ensures result == (top <= bottom)]
     {
         top <= bottom
@@ -120,10 +120,10 @@ impl ScreenOp {
     /// If `self` is a [`ScreenOp::SetScrollRegion`] with a non-empty `[top, bottom]`
     /// interval, return its normalized `(top, bottom)` pair.
     #[must_use]
-    pub fn normalized_scroll_region(&self) -> Option<(u16, u16)> {
+    pub const fn normalized_scroll_region(&self) -> Option<(u16, u16)> {
         match *self {
-            ScreenOp::SetScrollRegion { top, bottom } if op_scroll_region_nonempty(top, bottom) => {
-                let clamped_top = op_clamp_scroll_top(top as u64, bottom as u64) as u16;
+            ScreenOp::SetScrollRegion { top, bottom } if top <= bottom => {
+                let clamped_top = if top < bottom { top } else { bottom };
                 Some((clamped_top, bottom))
             }
             _ => None,

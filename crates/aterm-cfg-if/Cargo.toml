@@ -4,8 +4,8 @@
 [package]
 # THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE.
 #
-# `[patch.crates-io]` matches on PACKAGE name, so to redirect the twenty-three
-# third-party consumers' `cfg-if = "1"` lines at this code the package must be
+# `[patch.crates-io]` matches on PACKAGE name, so to redirect the third-party
+# consumers' `cfg-if = "1"` lines at this code the package must be
 # called `cfg-if` — nothing else works. The DIRECTORY keeps the `aterm-` prefix
 # so a `ls crates/` or a stack trace still reads as ours and nobody mistakes
 # this for a vendored upstream (those live under `vendor/`, which is where
@@ -13,11 +13,9 @@
 name = "cfg-if"
 # NOT `version.workspace = true`. This version is a SEMVER CONTRACT with the
 # consumers, not an aterm release number: every requirement in the graph is
-# `^1.0` or `1` (getrandom 0.2/0.3/0.4, half, naga, parking_lot_core, ring,
-# wgpu, wgpu-hal, ahash, libloading, polling, async-io, async-process,
-# async-signal, wasm-bindgen, crc32fast,
-# filetime, nix, sha2 …), and 1.0.4 is what the lock held before the swap, so
-# the lockfile's version line does not move.
+# `^1.0` or `1` (ring, half, naga, parking_lot_core, wgpu, wgpu-hal,
+# libloading, wasm-bindgen …), and 1.0.4 is what the lock held before the
+# swap, so the lockfile's version line does not move.
 version = "1.0.4"
 edition.workspace = true
 license.workspace = true

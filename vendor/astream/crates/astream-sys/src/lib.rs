@@ -84,11 +84,88 @@ contract_fn! {
     /// Verified check that a parsed boot session UUID has exactly 32 hex nibbles (`16` bytes),
     /// linked via `clean-kernel-defeq` to `boot_nibble_count_valid_isl`.
     #[must_use]
-    pub fn boot_nibble_count_valid(nibbles: usize) -> bool
+    pub const fn boot_nibble_count_valid(nibbles: usize) -> bool
     clauses [ensures result == (nibbles == 32)]
     {
         nibbles == 32
     }
+}
+
+#[must_use]
+pub const fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0' => Some(0),
+        b'1' => Some(1),
+        b'2' => Some(2),
+        b'3' => Some(3),
+        b'4' => Some(4),
+        b'5' => Some(5),
+        b'6' => Some(6),
+        b'7' => Some(7),
+        b'8' => Some(8),
+        b'9' => Some(9),
+        b'a' | b'A' => Some(10),
+        b'b' | b'B' => Some(11),
+        b'c' | b'C' => Some(12),
+        b'd' | b'D' => Some(13),
+        b'e' | b'E' => Some(14),
+        b'f' | b'F' => Some(15),
+        _ => None,
+    }
+}
+
+/// Pack a 16-byte boot session UUID into two big-endian `u64` words `(hi, lo)`
+/// using fixed-width bitwise shifts.
+#[must_use]
+pub const fn encode_boot_id_u128_be(id: [u8; 16]) -> (u64, u64) {
+    let hi = ((id[0] as u64) << 56)
+        | ((id[1] as u64) << 48)
+        | ((id[2] as u64) << 40)
+        | ((id[3] as u64) << 32)
+        | ((id[4] as u64) << 24)
+        | ((id[5] as u64) << 16)
+        | ((id[6] as u64) << 8)
+        | (id[7] as u64);
+    let lo = ((id[8] as u64) << 56)
+        | ((id[9] as u64) << 48)
+        | ((id[10] as u64) << 40)
+        | ((id[11] as u64) << 32)
+        | ((id[12] as u64) << 24)
+        | ((id[13] as u64) << 16)
+        | ((id[14] as u64) << 8)
+        | (id[15] as u64);
+    (hi, lo)
+}
+
+/// Unpack two big-endian `u64` words `(hi, lo)` into a 16-byte boot session UUID
+/// using fixed-width bitwise shifts.
+#[must_use]
+pub const fn decode_boot_id_u128_be(hi: u64, lo: u64) -> [u8; 16] {
+    [
+        ((hi >> 56) & 0xFF) as u8,
+        ((hi >> 48) & 0xFF) as u8,
+        ((hi >> 40) & 0xFF) as u8,
+        ((hi >> 32) & 0xFF) as u8,
+        ((hi >> 24) & 0xFF) as u8,
+        ((hi >> 16) & 0xFF) as u8,
+        ((hi >> 8) & 0xFF) as u8,
+        (hi & 0xFF) as u8,
+        ((lo >> 56) & 0xFF) as u8,
+        ((lo >> 48) & 0xFF) as u8,
+        ((lo >> 40) & 0xFF) as u8,
+        ((lo >> 32) & 0xFF) as u8,
+        ((lo >> 24) & 0xFF) as u8,
+        ((lo >> 16) & 0xFF) as u8,
+        ((lo >> 8) & 0xFF) as u8,
+        (lo & 0xFF) as u8,
+    ]
+}
+
+/// Whether a Darwin `errno` value (`ENODEV=19`, `EINVAL=22`, `ENOTTY=25`, `ENOTSUP=45`)
+/// indicates that the filesystem or device refuses `F_BARRIERFSYNC`.
+#[must_use]
+pub const fn is_apple_barrier_refused_errno(errno: i32) -> bool {
+    matches!(errno, 19 | 22 | 25 | 45)
 }
 
 /// Order every write to `file` issued before this call ahead of every write issued
@@ -126,11 +203,10 @@ pub fn barrier_refused(err: &io::Error) -> bool {
     // crosses into the kernel, so the cordon's `unsafe` stays in `apple`.
     #[cfg(target_vendor = "apple")]
     {
-        const ENODEV: i32 = 19;
-        const EINVAL: i32 = 22;
-        const ENOTTY: i32 = 25;
-        const ENOTSUP: i32 = 45;
-        matches!(err.raw_os_error(), Some(ENODEV | EINVAL | ENOTTY | ENOTSUP))
+        match err.raw_os_error() {
+            Some(errno) => is_apple_barrier_refused_errno(errno),
+            None => false,
+        }
     }
     #[cfg(not(target_vendor = "apple"))]
     {
@@ -145,7 +221,10 @@ pub fn barrier_refused(err: &io::Error) -> bool {
 pub fn boot_session() -> Option<[u8; 16]> {
     #[cfg(target_vendor = "apple")]
     {
-        parse_boot_id(&apple::boot_session_uuid()?)
+        match apple::boot_session_uuid() {
+            Some(buf) => parse_boot_id(&buf),
+            None => None,
+        }
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -161,6 +240,120 @@ pub fn boot_session() -> Option<[u8; 16]> {
     }
 }
 
+#[must_use]
+pub const fn nul_offset(raw: &[u8]) -> usize {
+    let mut i = 0usize;
+    let mut scan = raw;
+    while let &[b, ref tail @ ..] = scan {
+        if b == 0 {
+            return i;
+        }
+        i = i.saturating_add(1);
+        scan = tail;
+    }
+    raw.len()
+}
+
+/// Call-free `const fn` scanner that parses a NUL-terminated or whitespace-framed
+/// ASCII UUID into two non-zero big-endian `u64` words `(hi, lo)`.
+#[must_use]
+pub const fn scan_boot_id_words(raw: &[u8]) -> Option<(u64, u64)> {
+    let mut scan = raw;
+    let mut hi = 0u64;
+    let mut lo = 0u64;
+    let mut nibbles = 0usize;
+    let mut phase = 0u8;
+    let mut skip = 0u8;
+    while let &[b, ref tail @ ..] = scan {
+        if skip > 0 {
+            skip = (skip & 3).wrapping_sub(1);
+            scan = tail;
+            continue;
+        }
+        if b == 0 {
+            break;
+        }
+        if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C) {
+            if phase == 1 {
+                phase = 2;
+            }
+            scan = tail;
+            continue;
+        }
+        if b == 0xC2 {
+            if matches!(tail, &[0x85 | 0xA0, ..]) {
+                if phase == 1 {
+                    phase = 2;
+                }
+                skip = 1;
+                scan = tail;
+                continue;
+            }
+            return None;
+        }
+        if matches!(b, 0xE1..=0xE3) {
+            if let &[b2, b3, ..] = tail {
+                let is_ws = (b == 0xE1 && b2 == 0x9A && b3 == 0x80)
+                    || (b == 0xE2
+                        && b2 == 0x80
+                        && ((b3 >= 0x80 && b3 <= 0x8A) || b3 == 0xA8 || b3 == 0xA9 || b3 == 0xAF))
+                    || (b == 0xE2 && b2 == 0x81 && b3 == 0x9F)
+                    || (b == 0xE3 && b2 == 0x80 && b3 == 0x80);
+                if is_ws {
+                    if phase == 1 {
+                        phase = 2;
+                    }
+                    skip = 2;
+                    scan = tail;
+                    continue;
+                }
+            }
+            return None;
+        }
+        if phase == 2 {
+            return None;
+        }
+        phase = 1;
+        if b == b'-' {
+            scan = tail;
+            continue;
+        }
+        let v: u64 = match b {
+            b'0' => 0,
+            b'1' => 1,
+            b'2' => 2,
+            b'3' => 3,
+            b'4' => 4,
+            b'5' => 5,
+            b'6' => 6,
+            b'7' => 7,
+            b'8' => 8,
+            b'9' => 9,
+            b'a' | b'A' => 10,
+            b'b' | b'B' => 11,
+            b'c' | b'C' => 12,
+            b'd' | b'D' => 13,
+            b'e' | b'E' => 14,
+            b'f' | b'F' => 15,
+            _ => return None,
+        };
+        if nibbles < 16 {
+            hi = (hi << 4) | v;
+        } else if nibbles < 32 {
+            lo = (lo << 4) | v;
+        } else {
+            return None;
+        }
+        nibbles = nibbles.saturating_add(1);
+        scan = tail;
+    }
+    if nibbles == 32 && (hi | lo) != 0 {
+        Some((hi, lo))
+    } else {
+        None
+    }
+}
+
 /// The kernel's boot id text as 16 bytes: the bytes up to a NUL, whitespace trimmed,
 /// then exactly 32 hexadecimal digits once the hyphens of the UUID form are dropped
 /// (either case). Anything else — empty, too short or long, a stray character — is
@@ -168,39 +361,13 @@ pub fn boot_session() -> Option<[u8; 16]> {
 /// boot is unknown": a damaged answer must never pass as a boot, because two equal
 /// damaged answers would read as "no reboot came between them".
 #[must_use]
+#[allow(clippy::question_mark)]
 pub fn parse_boot_id(raw: &[u8]) -> Option<[u8; 16]> {
-    let mut end = raw.len();
-    let mut i = 0usize;
-    while i < raw.len() {
-        if raw.get(i).copied() == Some(0) {
-            end = i;
-            break;
-        }
-        i = i.saturating_add(1);
-    }
-    let text = match std::str::from_utf8(raw.get(..end)?) {
-        Ok(s) => s.trim(),
-        Err(_) => return None,
+    let Some((hi, lo)) = scan_boot_id_words(raw) else {
+        return None;
     };
-    let mut out = [0u8; 16];
-    let mut nibbles = 0usize;
-    for b in text.bytes() {
-        if b == b'-' {
-            continue;
-        }
-        let v = match b {
-            b'0'..=b'9' => b.saturating_sub(b'0'),
-            b'a'..=b'f' => b.saturating_sub(b'a' - 10),
-            b'A'..=b'F' => b.saturating_sub(b'A' - 10),
-            _ => return None,
-        };
-        let slot = out.get_mut(nibbles / 2)?;
-        *slot = (*slot << 4) | v;
-        let next_nibble = nibbles.saturating_add(1) as u64;
-        nibbles = boot_nibble_advance(nibbles as u64, next_nibble) as usize;
-    }
-    if boot_nibble_count_valid(nibbles) && out != [0u8; 16] {
-        Some(out)
+    if boot_nibble_count_valid(32) {
+        Some(decode_boot_id_u128_be(hi, lo))
     } else {
         None
     }
@@ -224,6 +391,39 @@ mod tests {
             parse_boot_id(format!("{}\n", ID.to_lowercase()).as_bytes()),
             Some(want)
         );
+        let (hi, lo) = encode_boot_id_u128_be(want);
+        assert_eq!(decode_boot_id_u128_be(hi, lo), want);
+        assert_eq!(scan_boot_id_words(ID.as_bytes()), Some((hi, lo)));
+        assert_eq!(nul_offset(b"abc\0def"), 3);
+        assert_eq!(hex_nibble(b'f'), Some(15));
+
+        // The public reading keeps its UTF-8 whitespace contract. The kernel's
+        // normal ASCII spelling and bytes beyond its first NUL remain ordinary.
+        assert_eq!(
+            parse_boot_id(format!(" \t\r\n{ID}\x0b\x0c ").as_bytes()),
+            Some(want)
+        );
+        let mut invalid_prefix = vec![0xff];
+        invalid_prefix.extend_from_slice(ID.as_bytes());
+        assert_eq!(parse_boot_id(&invalid_prefix), None);
+        let mut after_nul = format!("{ID}\0").into_bytes();
+        after_nul.extend_from_slice(&[0xff, 0xfe]);
+        assert_eq!(parse_boot_id(&after_nul), Some(want));
+        let internal = format!("{}\u{a0}{}", &ID[..8], &ID[8..]);
+        assert_eq!(parse_boot_id(internal.as_bytes()), None);
+        for (left, right) in [
+            ("\u{a0}", "\u{2003}"),
+            ("\u{85}", "\u{3000}"),
+            ("\u{202f}", "\u{205f}"),
+            ("\u{2028}", "\u{2029}"),
+        ] {
+            let framed = format!("{left}{ID}{right}");
+            assert_eq!(
+                parse_boot_id(framed.as_bytes()),
+                Some(want),
+                "PUBLIC_BOOT_ID_TRIMS_VALID_UTF8_WHITESPACE: {framed:?}"
+            );
+        }
     }
 
     #[test]

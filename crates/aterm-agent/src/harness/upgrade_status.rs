@@ -25,8 +25,8 @@ use aterm_json::{Map, Value};
 
 use super::{
     LiveTab, Opts, Phase, Report, Request, STALE_S, St, Version, connect, conversation_live,
-    ledger, load, now_s, process_group, roster_aside, save, session_files, state_dir, sweep_lock,
-    tab_is_live, unique_tab_for_group, upgrade,
+    ledger, load, now_s, process_group, roster_aside, save, session_files, started_s, state_dir,
+    sweep_lock, tab_is_live, unique_tab_for_group, upgrade,
 };
 
 /// How long a session may be behind before its upgrade reads stalled on its own
@@ -38,12 +38,19 @@ pub const STALLED_AFTER_S: u64 = upgrade::RUNG_LAND_S + LAND_GRACE_S;
 /// `overdue` ([`STALLED_AFTER_S`]).
 pub const LAND_GRACE_S: u64 = 4 * 3_600;
 
-/// The words of a row of an agent with no lane (agy, Gemini CLI;
-/// [`super::lanes::lanes`]), or of Muse Code's, which has no upgrade lane,
-/// where words are owed: no upgrade record of theirs is read
-/// (`St::from_json`), so none is shown, and were one, it would say this,
-/// never another agent's words.
+/// The words of a row of an agent with no upgrade lane (Gemini CLI:
+/// relaunched on exit only, [`super::lanes::lanes`]) where words are owed: no
+/// upgrade record of its exists, so none is shown, and were one, it would say
+/// this, never another agent's words.
 const NO_LANE_WORDS: &str = "no lane of aterm's moves this agent, so nothing is asked or typed";
+
+/// The words of a row of Muse Code's or agy's where a ladder's words are
+/// owed: each one's live upgrade is the quiet flow alone (`upgrade_muse_live`,
+/// `upgrade_agy_live`), which asks nothing, types nothing and mints no ladder
+/// state, so no such row is ever theirs; were one, it would say this, never
+/// Claude Code's words.
+const QUIET_LANE_WORDS: &str = "aterm restarts this agent onto a newer build at a genuinely \
+                                idle point and types nothing into it";
 
 const _: () = assert!(STALLED_AFTER_S == 6 * 3_600);
 
@@ -197,7 +204,7 @@ thread_local! {
 }
 
 /// Pin this thread's [`awake_since`] for a test (`0`: unknown again).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn pin_awake_since(at: u64) {
     AWAKE_PIN.with(|pin| pin.set(at));
 }
@@ -390,6 +397,9 @@ pub struct Row {
     /// not ended). A move that failed after that has no process to be vetted
     /// against ([`Self::standing`]) and is still shown.
     pub exited_at: u64,
+    /// The agent the record names (`St::pid`; `0`: none recorded): for a restart, the one its
+    /// signal ended, which is never its conversation held again ([`Self::held_again`]).
+    pub pid: u32,
     /// The last look that found a hand the relaunch line waits on standing
     /// on the tab while the restart's line was still to type (`St::hand_seen_s`;
     /// `0`: none): the restart's stale clock does not run while one stands
@@ -531,6 +541,20 @@ pub struct Row {
     /// ([`Self::asks_on_its_own`]), and a limit past its named reset is the
     /// quiet move's before it is told ([`Self::limit_told_at`]).
     pub quiet: bool,
+    /// A restart in flight whose agent was read gone, held again ([`Self::held_again`]): its
+    /// conversation live again (the owner's own line, typed in a tab no worker visits), or, for a
+    /// fresh restart, an agent leading its tab. Its `agent-down` is answered: quiet, and standing
+    /// only for a behind holder of its conversation in its tab ([`Self::standing`]), as a move
+    /// that failed after its exit is once held again. Its record stays as it is: a reader never
+    /// writes the move's record.
+    pub held_back: bool,
+    /// The restart's agent no look stamped gone ([`Self::exited_at`] still `0` on its record)
+    /// that the process table says is gone, read once the restart can be said stuck
+    /// ([`ended_unstamped`]): its stall is `stuck:exited`, never `stuck:exiting`'s "has not
+    /// exited" over a process long gone (the lab's lc5o and lc1, 2026-10-18: under Off, ten
+    /// minutes of it). What the row raises keeps the hung-exit bound ([`exited_seen`]): a
+    /// watched tab's carry stamps such an exit and relaunches the agent (DR-LC-1).
+    pub ended_unstamped: bool,
 }
 
 /// The notices a round record proves by itself: whole rounds in a row that gave up
@@ -553,6 +577,47 @@ pub(super) fn round_notices(phase: &Phase, streak_why: &str, stop_streak: u32) -
         .saturating_add(asks)
 }
 
+/// WHEN THE ROW READS ITS AGENT GONE ([`Row::exited_at`]): the instant a look of the restart
+/// saw it gone ([`St::exited_at`]), or — a restart whose agent no look has seen gone, and that
+/// the process table says is gone now, read as the restart's own looks read it
+/// (`upgrade_wake::wait_exit`, nothing sent; [`St::seen_gone`]) — its signal, as the stale
+/// bound reads an exit no look saw (`relaunch::expired`). A tab no worker visits any more
+/// (Autopilot Off or the agent's own switch off after a relaunch that waited out a slow
+/// shutdown: lifecycle-5 of ATERM-KI-1016-1) has no look to stamp it, and read off the record
+/// alone its row said `hung-exit` ("Press Ctrl-C") over an agent long gone, for good, with no
+/// line that resumes it. A record that names no process is read as it stands.
+///
+/// ONLY PAST THE HUNG-EXIT BOUND ([`HUNG_EXIT_AFTER_S`] from the signal, at `now`), where the row
+/// would otherwise say `hung-exit` (the review of lifecycle-5, DR-LC-1). Sooner, a watched tab's
+/// agent that outlived the stale bound from its signal and has just ended is its host's carry's to
+/// relaunch: the carry stamps the exit as it reads it (`relaunch::carry_restart`), and the bound
+/// counts from that stamp. Read at once, the row raised `agent-down` with the line that resumes it
+/// for an agent aterm was about to bring back, for as long as the carry waited on another actor's
+/// sweep lock. By the hung-exit bound a watched tab's carry has long stamped a gone agent, so the
+/// read holds for a tab no worker visits and a watched one alike; under Off, an agent that ended
+/// sooner is said down at that bound, not at once. `gone` is [`ended_unstamped`]'s read.
+fn exited_seen(st: &St, now: u64, gone: bool) -> u64 {
+    match st.phase {
+        Phase::Exiting { at_s } if gone && now.saturating_sub(at_s) > HUNG_EXIT_AFTER_S => {
+            at_s.max(1)
+        }
+        _ => st.exited_at,
+    }
+}
+
+/// WHETHER THE PROCESS TABLE SAYS A RESTART'S AGENT NO LOOK STAMPED IS GONE
+/// ([`Row::ended_unstamped`]), read as the restart's own looks read it
+/// (`upgrade_wake::wait_exit`, nothing sent) once its restart can be said stuck,
+/// [`STALE_S`] from its signal ([`stuck_on`]); sooner nothing is said of it and the
+/// table is not read. A record that names no process is read as it stands.
+fn ended_unstamped(st: &St, now: u64) -> bool {
+    matches!(st.phase, Phase::Exiting { at_s }
+        if st.exited_at == 0
+            && st.pid != 0
+            && now.saturating_sub(at_s) > STALE_S
+            && super::super::upgrade_wake::wait_exit(st.pid, std::time::Duration::ZERO))
+}
+
 /// Since when the session has been behind, as the view reads a record no visit of this build
 /// has vetted (`St::for_target`). A record an older build wrote (no process named, no wait
 /// log) whose age predates its own minting (`pending_since < salt`) carries an age a retarget
@@ -572,6 +637,7 @@ fn read_age(st: &St) -> u64 {
 
 impl Row {
     fn of(session: &str, st: &St, now: u64) -> Row {
+        let ended_unstamped = ended_unstamped(st, now);
         let mut row = Row {
             session: session.to_string(),
             tab: st.tab.clone(),
@@ -599,7 +665,9 @@ impl Row {
                 && st.ready_since != 0,
             model: st.model_list.clone(),
             agent: st.agent,
-            exited_at: st.exited_at,
+            exited_at: exited_seen(st, now, ended_unstamped),
+            ended_unstamped,
+            pid: st.pid,
             hand_seen: st.hand_seen_s,
             held_by: st.held_by.clone(),
             work_seen: st.work_seen
@@ -649,6 +717,7 @@ impl Row {
             outside: false,
             aside: String::new(),
             quiet: false,
+            held_back: false,
         };
         row.read_at(now);
         row.person_named = row.person_seen(now);
@@ -891,10 +960,16 @@ impl Row {
     }
 
     /// A restart under way that has not moved ([`stuck_on`]), from the row's
-    /// phase and when its agent was seen gone; the sweep's ledger note
-    /// (`St::stuck`) reads the same predicate.
+    /// phase and when its agent was seen gone, by a look or by the process
+    /// table ([`Self::ended_unstamped`]); the sweep's ledger note
+    /// (`St::stuck`) reads the same predicate, its looks stamping the exit.
     fn stuck(&self, now: u64) -> Option<&'static str> {
-        stuck_on(&self.phase, self.exited_at, now)
+        let seen = if self.ended_unstamped {
+            self.exited_at.max(1)
+        } else {
+            self.exited_at
+        };
+        stuck_on(&self.phase, seen, now)
     }
 
     /// How long this session has been behind at `now`, in a person's words
@@ -1310,9 +1385,10 @@ impl Row {
         let gate_spent = match self.agent {
             upgrade::Agent::Claude => self.wait.starts_with("release:") && self.release.is_empty(),
             upgrade::Agent::Codex => false,
-            // Muse Code: no upgrade lane, so no row's wait of its own (its
-            // relaunch records are no upgrade's, [`St::is_upgrade`]). No lane
-            // yet (agy, Gemini CLI): no wait of theirs.
+            // Muse Code: its quiet upgrade records no ladder's wait (its own
+            // waits are its step's words, never a record's). agy and Gemini
+            // CLI: no upgrade lane, so no row's wait of their own (their
+            // relaunch records are no upgrade's, [`St::is_upgrade`]).
             upgrade::Agent::Muse | upgrade::Agent::Agy | upgrade::Agent::Gemini => return None,
         };
         if gate_spent {
@@ -1408,11 +1484,10 @@ impl Row {
                 upgrade::Agent::Claude | upgrade::Agent::Codex => {
                     "it moves once they are sent or cleared in its tab"
                 }
-                // Muse Code: no upgrade lane types into it. No lane yet (agy,
-                // Gemini CLI): nothing is typed into them.
-                upgrade::Agent::Muse | upgrade::Agent::Agy | upgrade::Agent::Gemini => {
-                    NO_LANE_WORDS
-                }
+                // Muse Code and agy: their quiet upgrades type nothing into
+                // them. Gemini CLI: no upgrade lane types into it.
+                upgrade::Agent::Muse | upgrade::Agent::Agy => QUIET_LANE_WORDS,
+                upgrade::Agent::Gemini => NO_LANE_WORDS,
             },
             // Aterm's own notice, which its fence would not type (the
             // no-stall branch's words say why): tried again, nothing to do.
@@ -1469,8 +1544,8 @@ impl Row {
         let owed = matches!(self.phase, Phase::Pending | Phase::Announced { .. });
         let footed = match self.agent {
             upgrade::Agent::Claude => true,
-            // Muse Code: no upgrade lane, no move, no note. No lane yet (agy,
-            // Gemini CLI): no move, no note.
+            // Muse Code: its quiet upgrade asks nothing, so it owes no
+            // note. agy and Gemini CLI: no upgrade lane, no move, no note.
             upgrade::Agent::Codex
             | upgrade::Agent::Muse
             | upgrade::Agent::Agy
@@ -1565,8 +1640,7 @@ impl Row {
     pub fn rests_on_own_work(&self) -> bool {
         let rearms_at_work_end = match self.agent {
             upgrade::Agent::Claude => true,
-            // Muse Code: no upgrade round of its own. No lane yet (agy, Gemini
-            // CLI): no round of theirs.
+            // Muse Code, agy and Gemini CLI: no upgrade round of their own.
             upgrade::Agent::Codex
             | upgrade::Agent::Muse
             | upgrade::Agent::Agy
@@ -1600,6 +1674,31 @@ impl Row {
         self.exited_at != 0 && matches!(self.phase, Phase::Failed(_))
     }
 
+    /// A restart in flight whose agent was read gone ([`Self::exited_at`]) and is not yet held
+    /// again ([`Self::held_back`]): the same fact as a move that failed after its exit, its line
+    /// not typed (`stuck:exited`).
+    fn down_in_flight(&self) -> bool {
+        self.exited_at != 0 && !self.held_back && matches!(self.phase, Phase::Exiting { .. })
+    }
+
+    /// Down after its agent's exit: a move that failed after it ([`Self::failed_after_exit`]) or
+    /// a restart in flight whose agent was read gone ([`Self::down_in_flight`]). Either is
+    /// answered by a holder ([`Self::held_again`]).
+    fn down_after_exit(&self) -> bool {
+        self.failed_after_exit() || self.down_in_flight()
+    }
+
+    /// This row's down answered ([`Self::held_again`], [`View::back`]): a move that failed after
+    /// its exit is an ordinary stopped upgrade again, its exit forgotten; a restart in flight is
+    /// held back ([`Self::held_back`]).
+    fn answer_down(&mut self) {
+        if matches!(self.phase, Phase::Exiting { .. }) {
+            self.held_back = true;
+        } else {
+            self.exited_at = 0;
+        }
+    }
+
     /// A Claude Code move that failed after its exit, held again: once a live process holds its
     /// conversation (resumed by hand, anywhere, any build) it is an ordinary stopped upgrade,
     /// shown only for a behind holder of its own conversation in its tab ([`Self::standing`])
@@ -1619,43 +1718,76 @@ impl Row {
     /// lists a record, never raises an alert) by environment too: the window never lowers an
     /// interrupt on environment proof alone, which a multiplexer's pane attached in another tab
     /// inherits.
+    ///
+    /// A fresh restart's row whose SHELL IS GONE asks the owner to open a new tab and start
+    /// Claude Code there, which no agent in its own tab can ever answer: it is answered by the
+    /// one Claude Code [`holders`] gave it ([`Holder::answers`], the review of LC-2, KR-7) — an
+    /// interactive one a shell started after the row's exit, in another tab, under the row's
+    /// Claude home and in its working directory, each such agent answering one row. The row's
+    /// agent was started afresh, taskless: whoever started that `claude` in its project, nothing
+    /// of the owner's waits on the row. Proven in its tab as the tab's own agent is.
+    ///
+    /// A RESTART IN FLIGHT WHOSE AGENT WAS READ GONE ([`Self::down_in_flight`]) IS ANSWERED BY THE
+    /// SAME HOLDERS (the review of lifecycle-1, DR-LC-2), and held back ([`Self::held_back`]): in
+    /// a tab no worker visits (Autopilot Off, the agent's own switch off) its record stays
+    /// `Exiting`, and the worker's close of an overtaken restart (`St::close_overtaken`) never
+    /// runs, so the owner's own `claude --resume <id>` there left its `agent-down` standing for as
+    /// long as Off stood. NEVER BY THE AGENT THE RESTART ENDED ([`Self::pid`], [`Holder::pid`]): a
+    /// zombie its shell has yet to reap still reads alive, its session file still there, and
+    /// lowered by it the row would stay lowered once it is reaped ([`View::back`]).
     fn held_again(&mut self, holders: &[Holder], unproven_tab: bool) {
+        let in_front = |h: &Holder| !h.aside && (h.led || unproven_tab);
         let leads_its_tab = |h: &Holder| {
             self.answered_by_its_tabs_agent()
-                && !h.aside
                 && h.tab.as_deref() == Some(self.tab.as_str())
-                && (h.led || unproven_tab)
+                && in_front(h)
         };
-        if held_again_after_exit(self.agent)
-            && self.failed_after_exit()
-            && holders
-                .iter()
-                .any(|h| h.session == self.session || leads_its_tab(h))
-        {
-            self.exited_at = 0;
+        let answers = |h: &Holder| {
+            self.shell_gone_afresh()
+                && h.answers.as_deref() == Some(self.session.as_str())
+                && in_front(h)
+        };
+        let ended = |h: &Holder| self.pid != 0 && h.pid == self.pid;
+        let back = held_again_after_exit(self.agent)
+            && self.down_after_exit()
+            && holders.iter().any(|h| {
+                !ended(h) && (h.session == self.session || leads_its_tab(h) || answers(h))
+            });
+        if back {
+            self.answer_down();
         }
     }
 
-    /// A fresh restart's Claude Code move that failed after its exit, in a known tab
-    /// ([`Self::fresh`]): the one row any agent leading that tab answers — a Claude Code of any
-    /// conversation, or the tab's Codex TUI ([`Self::held_again`]) — and the one tab whose leader
-    /// [`holders`] reads whatever conversation it holds.
+    /// A fresh restart's Claude Code move that failed after its exit because the shell it ran in
+    /// is gone ([`Self::answered_by_its_tabs_agent`], `shell-gone`): its remedy is a new tab
+    /// ([`Self::held_again`]).
+    fn shell_gone_afresh(&self) -> bool {
+        self.answered_by_its_tabs_agent()
+            && matches!(&self.phase, Phase::Failed(why) if why == "shell-gone")
+    }
+
+    /// A fresh restart's Claude Code move down after its exit ([`Self::down_after_exit`]: failed
+    /// after it, or in flight with its agent read gone), in a known tab ([`Self::fresh`]): the one
+    /// row any agent leading that tab answers — a Claude Code of any conversation, or the tab's
+    /// Codex TUI ([`Self::held_again`]) — and the one tab whose leader [`holders`] reads whatever
+    /// conversation it holds.
     fn answered_by_its_tabs_agent(&self) -> bool {
         self.fresh
             && held_again_after_exit(self.agent)
-            && self.failed_after_exit()
+            && self.down_after_exit()
             && !self.tab.is_empty()
     }
 
     /// Whether the owner sees or counts this upgrade now: a finished move or a restart in flight
-    /// always; any other only while a live process holds its conversation in its tab on a build
-    /// older than its target ([`Holder`]). Ended, hand-moved and elsewhere-resumed conversations
-    /// read `false`; their files stay. `unproven_tab`: whether a holder in no proven tab still
-    /// counts (the CLI's view, which has no roster). A row with no recorded tab stands in
-    /// whichever tab its holder is proven in ([`Self::proven_tab`]).
+    /// always, but for a restart held back ([`Self::held_back`]); any other only while a live
+    /// process holds its conversation in its tab on a build older than its target ([`Holder`]).
+    /// Ended, hand-moved and elsewhere-resumed conversations read `false`; their files stay.
+    /// `unproven_tab`: whether a holder in no proven tab still counts (the CLI's view, which has
+    /// no roster). A row with no recorded tab stands in whichever tab its holder is proven in
+    /// ([`Self::proven_tab`]).
     #[must_use]
     pub(super) fn standing(&self, holders: &[Holder], unproven_tab: bool) -> bool {
-        if !self.held_by_a_process() {
+        if !self.held_by_a_process() && !self.held_back {
             return true;
         }
         self.behind_holders(holders)
@@ -1779,9 +1911,9 @@ impl Row {
         // A Codex holder has no status ([`Holder`]).
         let has_status = match self.agent {
             upgrade::Agent::Claude => true,
-            // Muse Code: its holder (`muse::holders`) has no status, as a
-            // Codex's has none. No lane yet (agy, Gemini CLI): no Claude Code
-            // status is read for them.
+            // Muse Code, agy and Gemini CLI: their holders (`muse::holders`,
+            // `agy::holders`, `gemini::holders`) have no status, as a Codex's
+            // has none.
             upgrade::Agent::Codex
             | upgrade::Agent::Muse
             | upgrade::Agent::Agy
@@ -3017,6 +3149,9 @@ impl Row {
             // fact as a move that stopped after its exit).
             // A hand the line waits on stops its clock: a held tab is not
             // said down (LC-7 of the 2026-10-15 sweep).
+            // Held again ([`Self::held_back`]): its conversation is live again,
+            // or a fresh restart's tab is led again (DR-LC-2).
+            Phase::Exiting { .. } if self.held_back => Attention::Quiet,
             Phase::Exiting { at_s } if self.exited_at != 0 => {
                 let clock =
                     super::super::relaunch::exit_clock(*at_s, self.exited_at, self.hand_seen);
@@ -3447,17 +3582,34 @@ impl Row {
             (upgrade::Agent::Codex, "no-rollout") => {
                 (cut("Start Codex again in that tab", NEED_THEN_MAX), None)
             }
-            // Muse Code: no upgrade ends it (relaunch on exit only), so no
-            // such row is its; its own resume line where one is ever said.
+            // Muse Code: its quiet upgrade's restart that cannot land, or a
+            // crash relaunch's: its own resume line.
             (upgrade::Agent::Muse, _) => (
                 cut("Resume Muse Code in that tab", NEED_THEN_MAX),
                 Some("muse resume".to_string()),
             ),
-            // No lane yet (agy, Gemini CLI): no upgrade ends them; no command
-            // is told, never Claude Code's.
-            (upgrade::Agent::Agy | upgrade::Agent::Gemini, _) => {
-                (cut("Start it again in that tab", NEED_THEN_MAX), None)
-            }
+            // agy: its quiet upgrade's restart that cannot land, or a crash
+            // relaunch's: agy and its own picker (`/resume`) — never a bare
+            // `agy --conversation`, which agy refuses (the flag takes the
+            // id).
+            (upgrade::Agent::Agy, _) => (
+                cut(
+                    "Start agy in that tab with this command, then /resume",
+                    NEED_THEN_MAX,
+                ),
+                Some("agy".to_string()),
+            ),
+            // Gemini CLI: no upgrade ends it (relaunch on exit only), so no
+            // such row is its; where one is ever said, `gemini` and its own
+            // picker (`/resume`) — never a bare `gemini --resume`, which
+            // resumes the project's newest session.
+            (upgrade::Agent::Gemini, _) => (
+                cut(
+                    "Start Gemini CLI in that tab with this command, then /resume",
+                    NEED_THEN_MAX,
+                ),
+                Some("gemini".to_string()),
+            ),
             // Started afresh: there is no conversation of it to resume.
             (upgrade::Agent::Claude, why) if self.fresh => {
                 let then = if why == "shell-gone" {
@@ -3465,10 +3617,21 @@ impl Row {
                 } else {
                     "Start Claude Code again in that tab with this command"
                 };
-                (
-                    cut(&self.resume_then(then), NEED_THEN_MAX),
-                    Some("claude".to_string()),
-                )
+                let said = cut(&self.resume_then(then), NEED_THEN_MAX);
+                match self.fresh_command() {
+                    Some(command)
+                        if format!(" - {said}: {command}").len() + '…'.len_utf8() <= MARK_MAX =>
+                    {
+                        (said, Some(command))
+                    }
+                    // A home too long for the mark, or one no line can carry:
+                    // the sentence alone, never a bare `claude` under the tab
+                    // shell's home.
+                    _ => {
+                        let then = then.strip_suffix(" with this command").unwrap_or(then);
+                        (cut(then, NEED_THEN_MAX), None)
+                    }
+                }
             }
             (upgrade::Agent::Claude | upgrade::Agent::Codex, "shell-gone") => {
                 self.resume_said("Open a new tab and resume it there with this command")
@@ -3587,17 +3750,29 @@ impl Row {
         }
     }
 
-    /// A launch a resume cannot repeat.
+    /// A launch a resume cannot repeat. For an agent no shell started the
+    /// remedy is a shell prompt in a NEW tab: a tab's own program (`aterm
+    /// -e`, `exec`) takes its tab with it when it ends, so "that tab" could
+    /// not be followed, and a new tab serves a wrapper's agent as well.
     fn refused_launch(&self, why: &str) -> Need {
         let who = self.agent.product();
-        let how = if why == "not-a-shell-job" {
-            "was started through a wrapper, not directly by its shell"
+        let (how, then) = if why == "not-a-shell-job" {
+            (
+                "was started through a wrapper or as the tab's own program, not by its shell",
+                "Start it directly at a shell prompt in a new tab",
+            )
         } else if why.starts_with("line:") {
-            "has a launch line a resume cannot repeat"
+            (
+                "has a launch line a resume cannot repeat",
+                "Start it directly at a shell prompt in that tab",
+            )
         } else {
-            "was started with a flag a resume cannot carry"
+            (
+                "was started with a flag a resume cannot carry",
+                "Start it directly at a shell prompt in that tab",
+            )
         };
-        let (then, command) = self.resume_said("Start it directly at a shell prompt in that tab");
+        let (then, command) = self.resume_said(then);
         Need {
             kind: "refused-launch",
             fingerprint: self.fp("refused-launch"),
@@ -3882,8 +4057,8 @@ impl Row {
     fn resume_then(&self, then: &str) -> String {
         let named = match self.agent {
             upgrade::Agent::Claude => resume_login(&self.line).is_some(),
-            // Muse Code: its relaunch line names no login (Claude Code's
-            // variable). No lane yet (agy, Gemini CLI): no relaunch line.
+            // Muse Code, agy and Gemini CLI: their relaunch lines name no
+            // login (Claude Code's variable).
             upgrade::Agent::Codex
             | upgrade::Agent::Muse
             | upgrade::Agent::Agy
@@ -3914,12 +4089,25 @@ impl Row {
         match self.agent {
             upgrade::Agent::Codex => return (said, Some("codex resume".to_string())),
             upgrade::Agent::Claude => {}
-            // Muse Code: its own resume verb, never Claude Code's.
+            // Muse Code and agy: their own resume verbs, never Claude Code's
+            // — agy's its own picker after it starts (`/resume`), never a
+            // bare `agy --conversation`, which agy refuses (the flag takes
+            // the id).
             upgrade::Agent::Muse => return (said, Some("muse resume".to_string())),
-            // No lane yet (agy, Gemini CLI): no command is told, never Claude
-            // Code's resume.
-            upgrade::Agent::Agy | upgrade::Agent::Gemini => {
-                return (said, None);
+            upgrade::Agent::Agy => {
+                return (
+                    cut(&format!("{then}, then /resume"), NEED_THEN_MAX),
+                    Some("agy".to_string()),
+                );
+            }
+            // Gemini CLI's its own picker after it starts (`/resume`), never
+            // a bare `gemini --resume`, which resumes the project's newest
+            // session.
+            upgrade::Agent::Gemini => {
+                return (
+                    cut(&format!("{then}, then /resume"), NEED_THEN_MAX),
+                    Some("gemini".to_string()),
+                );
             }
         }
         if self.session.is_empty() {
@@ -3968,6 +4156,20 @@ impl Row {
         }
     }
 
+    /// THE COMMAND THAT STARTS AGAIN BY HAND AN AGENT THIS ROW'S RESTART STARTED AFRESH
+    /// ([`Self::fresh`]): a plain `claude` — Claude refuses `--resume` of a conversation with no
+    /// message — under the Claude home the relaunch line carried ([`home_exports`], as
+    /// [`resume_command`] keeps it, ATERM-KI-1015-1 LC-4). The one command of such a row: the
+    /// tab's mark ([`Self::agent_down`]), the band's remedy and `--now`'s refusal
+    /// (ATERM-KI-1016-1: those two said `claude --resume <id>` where the mark said `claude`).
+    /// `None` where that home cannot be told on a line ([`crate::harness::resume::with_env`]).
+    #[must_use]
+    pub fn fresh_command(&self) -> Option<String> {
+        let exports = home_exports(&self.line);
+        let env: Vec<(&str, &str)> = exports.iter().map(|(n, v)| (*n, v.as_str())).collect();
+        crate::harness::resume::with_env(&env, "claude")
+    }
+
     /// The once-only key of a need of `kind` in this row's tab ([`Need::fingerprint`]).
     fn fp(&self, kind: &str) -> String {
         format!("{kind}/{}", word(&self.tab))
@@ -4012,6 +4214,55 @@ impl Need {
             command: None,
             since: 0,
             log_line: format!("upgrade need=upgrade-cannot-run step={}", word_short(step)),
+        }
+    }
+
+    /// The upgrades shown cannot be renewed: the folder agent upgrades keep
+    /// their records in cannot be listed whole ([`View::unlisted`]), so which
+    /// records it holds is not known and the window's rows and marks stay at
+    /// the last whole look. The host says so once it is so, and it ends at
+    /// the first look that lists that folder again. Only the owner can mend a
+    /// folder's permissions.
+    #[must_use]
+    pub fn upgrade_records_unlisted() -> Need {
+        Need {
+            kind: "upgrade-records-unlisted",
+            fingerprint: "upgrade-records-unlisted/-".to_string(),
+            title: "Agent upgrade records unreadable",
+            severity: NeedSeverity::Warn,
+            why: cut(
+                "aterm cannot list the folder agent upgrades keep their records in",
+                NEED_WHY_MAX,
+            ),
+            then: cut("Fix that folder's permissions", NEED_THEN_MAX),
+            command: None,
+            since: 0,
+            log_line: "upgrade need=upgrade-records-unlisted".to_string(),
+        }
+    }
+
+    /// A tab's upgrade row and mark cannot be renewed: a record agent
+    /// upgrades keep is listed but cannot be read ([`View::unreadable`]: its
+    /// file not readable to aterm, a link that loops, a line this build
+    /// cannot read), so what the window shows of its tab stays as it is. The
+    /// host says so while such a record keeps a live tab as it stands, and
+    /// it ends at the first look that reads it. A record written by another
+    /// user (`sudo aterm …`) is the owner's to mend.
+    #[must_use]
+    pub fn upgrade_records_unreadable() -> Need {
+        Need {
+            kind: "upgrade-records-unreadable",
+            fingerprint: "upgrade-records-unreadable/-".to_string(),
+            title: "Agent upgrade record unreadable",
+            severity: NeedSeverity::Warn,
+            why: cut(
+                "aterm cannot read an agent upgrade's record, so its tab's upgrade is not renewed",
+                NEED_WHY_MAX,
+            ),
+            then: cut("Fix that file's owner and permissions", NEED_THEN_MAX),
+            command: None,
+            since: 0,
+            log_line: "upgrade need=upgrade-records-unreadable".to_string(),
         }
     }
 }
@@ -4154,11 +4405,12 @@ fn now_moves_past(wait: &str) -> bool {
 pub(in crate::harness) fn wait_words_of(agent: upgrade::Agent, wait: &str) -> Option<&'static str> {
     match agent {
         upgrade::Agent::Claude => claude_wait_words(wait),
-        // A Muse Code record's words are its relaunch line's too
-        // (`relaunch::stale_exit_line` names them).
-        upgrade::Agent::Codex | upgrade::Agent::Muse => relaunch_line_words(wait),
-        // No lane yet (agy, Gemini CLI): no wait of theirs.
-        upgrade::Agent::Agy | upgrade::Agent::Gemini => None,
+        // A Muse Code's, an agy's or a Gemini CLI's record's words are its
+        // relaunch line's too (`relaunch::stale_exit_line` names them).
+        upgrade::Agent::Codex
+        | upgrade::Agent::Muse
+        | upgrade::Agent::Agy
+        | upgrade::Agent::Gemini => relaunch_line_words(wait),
     }
 }
 
@@ -4169,8 +4421,8 @@ pub(in crate::harness) fn wait_words_of(agent: upgrade::Agent, wait: &str) -> Op
 fn reads_ready_clock(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
-        // Muse Code: no READY is asked of it (no upgrade lane). No lane yet
-        // (agy, Gemini CLI): nothing of theirs is kept.
+        // Muse Code, agy and Gemini CLI: no READY is asked of them (no
+        // upgrade lane).
         upgrade::Agent::Codex
         | upgrade::Agent::Muse
         | upgrade::Agent::Agy
@@ -4184,8 +4436,8 @@ fn reads_ready_clock(agent: upgrade::Agent) -> bool {
 fn types_release(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
-        // Muse Code: no notice is typed into it, so no release is owed. No
-        // lane yet (agy, Gemini CLI): nothing of theirs is kept.
+        // Muse Code, agy and Gemini CLI: no notice is typed into them, so no
+        // release is owed.
         upgrade::Agent::Codex
         | upgrade::Agent::Muse
         | upgrade::Agent::Agy
@@ -4199,8 +4451,8 @@ fn types_release(agent: upgrade::Agent) -> bool {
 fn attended_is_person(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
-        // Muse Code: no upgrade row of its waits on a person. No lane yet
-        // (agy, Gemini CLI): nothing of theirs is kept.
+        // Muse Code, agy and Gemini CLI: no upgrade row of theirs waits on a
+        // person.
         upgrade::Agent::Codex
         | upgrade::Agent::Muse
         | upgrade::Agent::Agy
@@ -4217,8 +4469,8 @@ fn attended_is_person(agent: upgrade::Agent) -> bool {
 fn held_again_after_exit(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
-        // Muse Code: no move of its fails after its exit (no upgrade lane).
-        // No lane yet (agy, Gemini CLI): nothing of theirs is kept.
+        // Muse Code, agy and Gemini CLI: no move of theirs fails after an
+        // exit (no upgrade lane).
         upgrade::Agent::Codex
         | upgrade::Agent::Muse
         | upgrade::Agent::Agy
@@ -4376,8 +4628,9 @@ fn stall_reason(agent: upgrade::Agent, kind: &str) -> String {
     let after_exit = match agent {
         upgrade::Agent::Claude => None,
         upgrade::Agent::Codex => kind.strip_prefix("failed:").and_then(codex_failure),
-        // Muse Code: no move of its stopped (no upgrade lane). No lane yet
-        // (agy, Gemini CLI): no move of theirs stopped.
+        // Muse Code: its quiet upgrade's stop after its exit is said by
+        // [`stop_words`] with its own name. agy and Gemini CLI: no move of
+        // theirs stopped (no upgrade lane).
         upgrade::Agent::Muse | upgrade::Agent::Agy | upgrade::Agent::Gemini => None,
     };
     if let Some(words) = after_exit {
@@ -4423,9 +4676,8 @@ fn stop_words(agent: upgrade::Agent, why: &str) -> String {
     let who = match agent {
         upgrade::Agent::Claude => "Claude",
         upgrade::Agent::Codex => "Codex",
-        // Muse Code: a relaunch of its that stopped is said by its own name.
-        // No lane yet (agy, Gemini CLI): never moved, so never stopped; named
-        // as itself, never as another agent.
+        // Muse Code, agy and Gemini CLI: a relaunch of theirs that stopped
+        // is said by its own name.
         upgrade::Agent::Muse | upgrade::Agent::Agy | upgrade::Agent::Gemini => agent.product(),
     };
     match why {
@@ -4470,7 +4722,8 @@ fn codex_failure(why: &str) -> Option<&'static str> {
 /// What a restart under way that has not moved waits on, once its `phase`
 /// has stood longer than [`STALE_S`]: `exiting` (asked to end and has not),
 /// `exited` (ended at `exited_at`, resume line not typed: a person at the
-/// prompt, a hold) or `relaunched` (line typed, the new agent has not held
+/// prompt, a hold, or a tab Autopilot Off or its agent's switch holds off) or
+/// `relaunched` (line typed, the new agent has not held
 /// the conversation or reached idle; usually a box). Nothing is forced: the
 /// stall only names the wait. `None` for other phases and within the bound.
 /// Read by both [`Row::stuck`] and the sweep's once-only ledger note
@@ -4498,14 +4751,43 @@ pub(super) fn stuck_words(agent: upgrade::Agent, what: &str) -> &'static str {
             "it was asked to end for the upgrade and has not exited, its own shutdown still \
              running; nothing is forced"
         }
+        // A watched tab's carry types the line once nobody holds its prompt; under Off or the
+        // agent's own switch off nothing types it (`agent-down` names it for the owner).
         (upgrade::Agent::Claude | upgrade::Agent::Codex, "exited") => {
-            "it ended for the upgrade, and the line that resumes it waits until a person or a \
-             hold lets go of its prompt; nothing is forced"
+            "it ended for the upgrade, and the line that resumes it is not typed while a person \
+             or a hold is on its prompt, or at all under Autopilot Off or its agent's switch off; \
+             nothing is forced"
         }
-        // Muse Code: no restart of the harness's ends it (relaunch on exit
-        // only), so it is never stuck in one. No lane yet (agy, Gemini CLI):
-        // no restart of theirs.
-        (upgrade::Agent::Muse | upgrade::Agent::Agy | upgrade::Agent::Gemini, _) => NO_LANE_WORDS,
+        // Muse Code's quiet upgrade: its SIGTERM, then its own relaunch line.
+        (upgrade::Agent::Muse, "exiting") => {
+            "it was ended for the upgrade (SIGTERM, at an idle point) and has not exited yet; \
+             nothing is forced"
+        }
+        (upgrade::Agent::Muse, "exited") => {
+            "it ended for the upgrade, and the line that resumes it on the new build is not typed \
+             while a person or a hold is on its prompt, or at all under Autopilot Off or its \
+             agent's switch off; nothing is forced"
+        }
+        (upgrade::Agent::Muse, _) => {
+            "the line that resumes it on the new build was typed, and the Muse Code it started has \
+             not taken its session yet; nothing is forced"
+        }
+        // agy's quiet upgrade: its SIGTERM, then its own relaunch line.
+        (upgrade::Agent::Agy, "exiting") => {
+            "it was ended for the upgrade (SIGTERM, at an idle point) and has not exited yet; \
+             nothing is forced"
+        }
+        (upgrade::Agent::Agy, "exited") => {
+            "it ended for the upgrade, and the line that resumes it on the new build waits until a \
+             person or a hold lets go of its prompt; nothing is forced"
+        }
+        (upgrade::Agent::Agy, _) => {
+            "the line that resumes it on the new build was typed, and the agy it started has not \
+             taken its conversation yet; nothing is forced"
+        }
+        // Gemini CLI: no restart of the harness's ends it (relaunch on exit
+        // only), so none is ever stuck in one.
+        (upgrade::Agent::Gemini, _) => NO_LANE_WORDS,
         (upgrade::Agent::Claude | upgrade::Agent::Codex, _) => {
             "the line that resumes it was typed, and the agent it started has not reached an \
              idle point, perhaps behind a box that waits on a person; nothing is forced"
@@ -4565,12 +4847,37 @@ fn rows_at(opts: &Opts, now: u64) -> Vec<Row> {
 /// listing and read, a directory, and a file that is no upgrade record
 /// (`models.json`, a relaunch record) are not records.
 fn read_rows(opts: &Opts, now: u64) -> (Vec<Row>, bool) {
+    let (rows, listed, unread) = read_records(opts, now);
+    (rows, listed && unread.is_empty())
+}
+
+/// A record listed but not read ([`read_records`]): its conversation, the
+/// tab it names where its text parses as a record (`None`: its file could
+/// not be read, or names no tab it can be read for), and its file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Unread {
+    session: String,
+    tab: Option<String>,
+    path: std::path::PathBuf,
+}
+
+/// [`read_rows`] apart: the rows of the records read, whether the directory
+/// was LISTED whole (`false` for an unlistable directory or a listing that
+/// broke off: which records it holds is not known), and the records listed
+/// but not read ([`Unread`]) — a file unreadable, or a read panicking. The
+/// window's view leaves each of those records' tabs as they stand
+/// ([`View::refresh_keeping`]), so one record's fault holds back no other
+/// record's row or mark.
+fn read_records(opts: &Opts, now: u64) -> (Vec<Row>, bool, Vec<Unread>) {
     let dir = match std::fs::read_dir(state_dir(opts)) {
         Ok(dir) => dir,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), true),
-        Err(_) => return (Vec::new(), false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (Vec::new(), true, Vec::new());
+        }
+        Err(_) => return (Vec::new(), false, Vec::new()),
     };
     let mut whole = true;
+    let mut unread: Vec<Unread> = Vec::new();
     let mut out: Vec<Row> = Vec::new();
     for entry in dir {
         let Ok(entry) = entry else {
@@ -4595,13 +4902,17 @@ fn read_rows(opts: &Opts, now: u64) -> (Vec<Row>, bool) {
                 continue;
             }
             Err(_) => {
-                whole = false;
+                unread.push(Unread {
+                    session,
+                    tab: None,
+                    path,
+                });
                 continue;
             }
         };
         // A RECORD WHOSE READ PANICS is one that cannot be read (F1-R8-G6):
-        // left out, the look not whole — as an unreadable file is — and
-        // every other record read as ever. Uncaught, one record's line (the
+        // left out and named unread — as an unreadable file is — and every
+        // other record read as ever. Uncaught, one record's line (the
         // F1-R6-H1 class) unwound the whole look: no tab's rows, marks or
         // watch were renewed while it stood, a tab whose record came past its
         // watch meanwhile was never watched, and the GUI host's catch could
@@ -4611,11 +4922,20 @@ fn read_rows(opts: &Opts, now: u64) -> (Vec<Row>, bool) {
         })) {
             Ok(Some(row)) => out.push(row),
             Ok(None) => {}
-            Err(_) => whole = false,
+            Err(_) => {
+                // The tab the record names, if its text parses as one (under
+                // its own catch): the view leaves that tab as it stands.
+                let tab = std::panic::catch_unwind(|| St::from_json(&text).map(|st| st.tab))
+                    .ok()
+                    .flatten()
+                    .filter(|tab| !tab.is_empty());
+                unread.push(Unread { session, tab, path });
+            }
         }
     }
     out.sort_by(|a, b| a.session.cmp(&b.session));
-    (out, whole)
+    unread.sort_by(|a, b| a.session.cmp(&b.session));
+    (out, whole, unread)
 }
 
 /// One upgrade record's row ([`read_rows`]): `text` read as session
@@ -4772,12 +5092,13 @@ pub fn tab_row<'a>(rows: &'a [Row], tab: &str) -> Option<&'a Row> {
 }
 
 /// The conversations whose rows [`Row::standing`] must vet — a Claude Code
-/// move that failed after its exit among them, for a process that holds it
-/// again or leads its tab ([`Row::held_again`]).
+/// move down after its exit among them (failed after it, or a restart in
+/// flight whose agent was read gone), for a process that holds it again or
+/// leads its tab ([`Row::held_again`]).
 fn sessions_to_vet(rows: &[Row]) -> BTreeSet<String> {
     rows.iter()
         .filter(|r| {
-            r.held_by_a_process() || (held_again_after_exit(r.agent) && r.failed_after_exit())
+            r.held_by_a_process() || (held_again_after_exit(r.agent) && r.down_after_exit())
         })
         .map(|r| r.session.clone())
         .collect()
@@ -4804,8 +5125,16 @@ fn sessions_to_vet(rows: &[Row]) -> BTreeSet<String> {
 /// every descendant of the tab's shell inherits it, a multiplexer's panes
 /// attached in another tab too. A Codex holder the host's roster proved is
 /// led ([`holders`]).
+///
+/// `answers`: the one fresh `shell-gone` row this agent of another conversation answers
+/// ([`Row::held_again`], [`answering_shell_gone`]); `None` for every other holder.
+///
+/// `pid`: its process (its session file's; `0` unknown, as for another lane's TUI). The agent a
+/// restart ended is never its conversation held again ([`Row::held_again`]): a zombie its shell
+/// has yet to reap still reads alive, its session file still there.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Holder {
+    pub(super) pid: u32,
     pub(super) session: String,
     pub(super) version: String,
     pub(super) tab: Option<String>,
@@ -4813,6 +5142,7 @@ pub(super) struct Holder {
     pub(super) status_since: u64,
     pub(super) aside: bool,
     pub(super) led: bool,
+    pub(super) answers: Option<String>,
 }
 
 /// Whether `pid` is proven not the foreground of its terminal, from the kernel
@@ -4834,16 +5164,19 @@ fn not_in_front(pid: u32) -> bool {
 /// sessions directory means nothing holds anything there.
 ///
 /// The tabs a fresh restart left with no agent ([`agent_down_tabs`]): while one of `sessions` is
-/// a fresh restart's Claude Code move that failed after its exit within the day it is shown
+/// a fresh restart's Claude Code move down after its exit within the day it is shown
 /// ([`Row::answered_by_its_tabs_agent`]), a live agent in its tab is returned too, whatever
 /// conversation it holds (an interactive Claude Code's file proven there, pid-reuse guarded as
 /// above, or the tab's Codex TUI), for [`Row::held_again`]: the owner's `claude` mints a new
-/// conversation, which the vetted files alone never name. No other tab's agent costs a read
+/// conversation, which the vetted files alone never name. While such a row's SHELL IS GONE, its
+/// remedy a new tab, the one Claude Code proven in another tab that [`answering_shell_gone`]
+/// gives it is returned too, naming it ([`Holder::answers`]). No other tab's agent costs a read
 /// (LC-2 of ATERM-KI-1015-1, and its review: a resume row's tab is answered by its conversation
 /// alone). Every other reader of these holders matches by conversation, so the extra ones change
 /// nothing else. Only the files of `sessions` cost a read (a `ps` and a `KERN_PROCARGS2` each);
 /// while such a tab is down, every live interactive file costs a group and a `KERN_PROCARGS2`
-/// read, one `ps` once proven there, and one process table read for its Codex.
+/// read, one `ps` once proven there (and, while a shell is gone, one in any tab, with its start
+/// time), and one process table read for its Codex.
 fn holders(
     opts: &Opts,
     sessions: &BTreeSet<String>,
@@ -4861,15 +5194,16 @@ fn holders(
             .flat_map(|agent| match agent {
                 // Muse Code's TUI leading the record's tab ([`super::muse::holders`]).
                 upgrade::Agent::Muse => super::muse::holders(sessions, tabs),
+                // agy's TUI leading the record's tab ([`super::agy::holders`]).
+                upgrade::Agent::Agy => super::agy::holders(sessions, tabs),
+                // Gemini CLI's TUI leading the record's tab
+                // ([`super::gemini::holders`]).
+                upgrade::Agent::Gemini => super::gemini::holders(sessions, tabs),
                 // No Codex is moved live (the Codex screen lane's retirement,
                 // 2026-10-16): a `codex-<tab>` record has no live holder.
                 // Claude Code is never among the others: its holders are read
-                // below. No lane yet (agy, Gemini CLI): no record of theirs,
-                // no holder.
-                upgrade::Agent::Codex
-                | upgrade::Agent::Claude
-                | upgrade::Agent::Agy
-                | upgrade::Agent::Gemini => Vec::new(),
+                // below.
+                upgrade::Agent::Codex | upgrade::Agent::Claude => Vec::new(),
             })
             .map(|h| Holder {
                 led: tabs.is_some(),
@@ -4907,30 +5241,117 @@ fn holders(
     let files = super::Homes::of_records(opts, sessions).roster(Some(first))?;
     let live =
         |sf: &upgrade::SessionFile| conversation_live(std::slice::from_ref(sf), &sf.session_id);
-    Some(
-        files
-            .iter()
-            .filter_map(|sf| {
-                if sessions.contains(&sf.session_id) {
-                    return live(sf).then(|| holder_of(sf, tabs));
+    let gone = shell_gone_afresh(opts, sessions, now_s());
+    let mut held: Vec<Holder> = Vec::new();
+    let mut elsewhere: Vec<(&upgrade::SessionFile, Holder)> = Vec::new();
+    for sf in &files {
+        if sessions.contains(&sf.session_id) {
+            if live(sf) {
+                held.push(holder_of(sf, tabs));
+            }
+            continue;
+        }
+        // Another conversation: only an interactive Claude Code a shell
+        // started (the lane's own test of a tab's agent), alive, and proven
+        // in a tab a move left with no agent — or, where a fresh move's
+        // shell is gone, in any other tab, for [`answering_shell_gone`].
+        if (down.is_empty() && gone.is_empty())
+            || sf.kind != "interactive"
+            || sf.entrypoint != "cli"
+            || !upgrade::is_session_id(&sf.session_id)
+            || !super::alive(sf.pid)
+        {
+            continue;
+        }
+        let h = holder_of(sf, tabs);
+        match h.tab.as_ref() {
+            Some(t) if down.contains(t) => {
+                if live(sf) {
+                    held.push(h);
                 }
-                // Another conversation: only an interactive Claude Code a
-                // shell started (the lane's own test of a tab's agent),
-                // alive, and proven in a tab a move left with no agent.
-                if down.is_empty()
-                    || sf.kind != "interactive"
-                    || sf.entrypoint != "cli"
-                    || !upgrade::is_session_id(&sf.session_id)
-                    || !super::alive(sf.pid)
-                {
-                    return None;
-                }
-                let h = holder_of(sf, tabs);
-                (h.tab.as_ref().is_some_and(|t| down.contains(t)) && live(sf)).then_some(h)
-            })
-            .chain(lanes)
-            .collect(),
-    )
+            }
+            Some(_) if !gone.is_empty() && live(sf) => elsewhere.push((sf, h)),
+            _ => {}
+        }
+    }
+    held.extend(answering_shell_gone(home, &gone, elsewhere, started_s));
+    Some(held.into_iter().chain(lanes).collect())
+}
+
+/// A fresh restart's row whose shell is gone, as [`answering_shell_gone`]
+/// matches an agent to it ([`Row::shell_gone_afresh`]).
+pub(super) struct ShellGone {
+    /// The row's conversation.
+    pub(super) session: String,
+    /// The Claude Code directory its agent ran under ([`St::agent_records`]).
+    pub(super) dir: Option<std::path::PathBuf>,
+    /// The agent's working directory ([`St::cwd`]).
+    pub(super) cwd: String,
+    /// When its agent exited.
+    pub(super) exited_at: u64,
+}
+
+/// The fresh restarts' rows in `sessions` whose shell is gone and that are
+/// still shown at `now` ([`Row::shell_gone_afresh`],
+/// [`EXITED_FAILURE_SHOWN_S`]).
+fn shell_gone_afresh(opts: &Opts, sessions: &BTreeSet<String>, now: u64) -> Vec<ShellGone> {
+    sessions
+        .iter()
+        .filter(|s| upgrade::Agent::keyed(s).is_none())
+        .filter_map(|s| {
+            let st = load(opts, s)?;
+            let r = Row::of(s, &st, now);
+            (r.shell_gone_afresh() && now.saturating_sub(r.exited_at) <= EXITED_FAILURE_SHOWN_S)
+                .then(|| ShellGone {
+                    session: s.clone(),
+                    dir: st.agent_records(&opts.home).dir().map(Path::to_path_buf),
+                    cwd: st.cwd.clone(),
+                    exited_at: r.exited_at,
+                })
+        })
+        .collect()
+}
+
+/// THE AGENTS THAT ANSWER FRESH `shell-gone` ROWS (the review of LC-2,
+/// KR-7): each row in `gone`, the oldest exit first, takes the
+/// earliest-started agent of `others` (live interactive Claude Codes of
+/// other conversations, each proven in a tab no move left down) that
+/// started after its exit (`started`, unix seconds), under its Claude
+/// directory and in its working directory — one agent a row, one row an
+/// agent ([`Holder::answers`]); an agent's directory is read as
+/// [`super::Records::of_file`] reads it for a user whose home is
+/// `user_home`. A row with no recorded working directory or Claude
+/// directory, or no agent so, keeps standing. PURE but for `started`.
+pub(super) fn answering_shell_gone(
+    user_home: &Path,
+    gone: &[ShellGone],
+    mut others: Vec<(&upgrade::SessionFile, Holder)>,
+    started: impl Fn(u32) -> Option<u64>,
+) -> Vec<Holder> {
+    let mut rows: Vec<&ShellGone> = gone
+        .iter()
+        .filter(|g| !g.cwd.is_empty() && g.dir.is_some())
+        .collect();
+    rows.sort_by(|a, b| (a.exited_at, &a.session).cmp(&(b.exited_at, &b.session)));
+    let mut others: Vec<(u64, &upgrade::SessionFile, Holder)> = others
+        .drain(..)
+        .filter_map(|(sf, h)| Some((started(sf.pid)?, sf, h)))
+        .collect();
+    others.sort_by_key(|(at, sf, _)| (*at, sf.pid));
+    let mut out = Vec::new();
+    for g in rows {
+        let Some(i) = others.iter().position(|(at, sf, _)| {
+            *at > g.exited_at
+                && sf.cwd == g.cwd
+                && super::Records::of_file(user_home, sf).dir() == g.dir.as_deref()
+        }) else {
+            continue;
+        };
+        let (_, _, mut h) = others.remove(i);
+        h.answers = Some(g.session.clone());
+        out.push(h);
+    }
+    out
 }
 
 /// The live holder session file `sf` is: its tab proven by its process group
@@ -4951,6 +5372,7 @@ fn holder_of(sf: &upgrade::SessionFile, tabs: Option<&[LiveTab]>) -> Holder {
         (group, env) => group.or(env),
     };
     Holder {
+        pid: sf.pid,
         session: sf.session_id.clone(),
         version: sf.version.clone(),
         led: led && tab.is_some(),
@@ -4958,12 +5380,14 @@ fn holder_of(sf: &upgrade::SessionFile, tabs: Option<&[LiveTab]>) -> Holder {
         status: sf.status.clone(),
         status_since: sf.status_updated_at_ms / 1_000,
         aside,
+        answers: None,
     }
 }
 
 /// The tabs a fresh restart left with no agent: the recorded tab of each
-/// fresh restart's Claude Code move in `sessions` that failed after its exit
-/// ([`Row::answered_by_its_tabs_agent`]) and is still shown at `now`
+/// fresh restart's Claude Code move in `sessions` down after its exit
+/// ([`Row::answered_by_its_tabs_agent`]: failed after it, or in flight with
+/// its agent read gone) and is still shown at `now`
 /// ([`EXITED_FAILURE_SHOWN_S`]; records are kept a week). [`holders`] reads
 /// any live agent there, whatever conversation it holds ([`Row::held_again`]);
 /// a resume row's tab costs no such read, since only its conversation answers
@@ -5146,8 +5570,12 @@ fn ask_within(
                         return None;
                     }
                     let session = path.file_stem()?.to_string_lossy().into_owned();
-                    // An upgrade's record, never a relaunch's (`St::cause`).
-                    let st = load(opts, &session).filter(|st| st.cause.is_empty())?;
+                    // An upgrade's record, never a relaunch's (`St::cause`):
+                    // the rows the window shows ([`St::is_upgrade`]), the
+                    // upgrade's own afresh restart included — taken by an
+                    // empty cause alone, a word on that row found none
+                    // (ATERM-KI-1016-1).
+                    let st = load(opts, &session).filter(St::is_upgrade)?;
                     // A state with no recorded tab (an older build's pending
                     // one) is a candidate only once a live holder is proven in
                     // `sid`, below.
@@ -5164,9 +5592,8 @@ fn ask_within(
             upgrade::Agent::Claude => "once the agent is signalled",
             // No Codex is ever signalled: its move begins with a typed `/exit`.
             upgrade::Agent::Codex => "once its `/exit` is typed",
-            // Muse Code: only an upgrade's record is a candidate here, and no
-            // upgrade lane moves it. No lane yet (agy, Gemini CLI): no record
-            // of theirs is read (`St::from_json`); none of theirs is under way.
+            // Muse Code, agy and Gemini CLI: only an upgrade's record is a
+            // candidate here, and no upgrade lane moves them.
             upgrade::Agent::Muse | upgrade::Agent::Agy | upgrade::Agent::Gemini => {
                 "by any lane: no lane moves this agent"
             }
@@ -5258,6 +5685,25 @@ fn ask_within(
                              its conversation back, and `--skip` quiets this record",
                             word(why)
                         ),
+                        // Started afresh: its conversation had no message to
+                        // resume, and the row's own command starts it again
+                        // ([`Row::fresh_command`], the tab mark's).
+                        upgrade::Agent::Claude
+                            if crate::harness::relaunch::starts_afresh(&st.cause) =>
+                        {
+                            let row = Row::of(&session, &st, now);
+                            format!(
+                                "the upgrade in tab {sid} stopped after its SIGTERM ended the \
+                                 agent ({}): `--now` re-arms only one that gave up — {} in the tab \
+                                 starts it again (it had no conversation to resume), and `--skip` \
+                                 quiets this record",
+                                word(why),
+                                row.fresh_command().map_or_else(
+                                    || "Claude Code started again".to_string(),
+                                    |c| format!("`{c}`")
+                                )
+                            )
+                        }
                         upgrade::Agent::Claude => format!(
                             "the upgrade in tab {sid} stopped after its SIGTERM ended the agent \
                              ({}): `--now` re-arms only one that gave up — `claude --resume {}` \
@@ -5266,9 +5712,8 @@ fn ask_within(
                             word(why),
                             word(&session)
                         ),
-                        // Muse Code: no upgrade record of its exists (relaunch
-                        // on exit only). No lane yet (agy, Gemini CLI): no
-                        // command told, never Claude Code's.
+                        // Muse Code, agy and Gemini CLI: no upgrade record of
+                        // theirs exists (relaunch on exit only).
                         upgrade::Agent::Muse | upgrade::Agent::Agy | upgrade::Agent::Gemini => {
                             format!(
                                 "the upgrade in tab {sid} stopped ({}): no lane of aterm's moves \
@@ -5386,6 +5831,9 @@ fn same_target(shown: &str, to: &str) -> bool {
 #[derive(Debug, Default)]
 pub struct View {
     sent: Option<Vec<Row>>,
+    /// The tabs the rows last handed over left as they stood
+    /// ([`Self::refresh_keeping`]).
+    sent_kept: Vec<String>,
     badged: BTreeMap<String, String>,
     sock: Option<String>,
     /// Looks in a row whose roster could not be read (socket not bound yet, a
@@ -5395,7 +5843,8 @@ pub struct View {
     /// status, or whose agent the move ended ([`Self::follows`]).
     follows: Vec<String>,
     /// THE TABS' AGENTS BACK ([`Row::held_again`], ATERM-KI-1015-1 LC-2):
-    /// each Claude Code move that failed after its exit whose tab, or
+    /// each Claude Code move down after its exit (failed after it, or a
+    /// restart in flight whose agent was read gone, DR-LC-2) whose tab, or
     /// conversation, a look of this view found held again, by conversation,
     /// with the exit it was found after ([`Row::exited_at`]). The owner
     /// acted (or the relaunch's own agent came up late): its `agent-down` is
@@ -5403,12 +5852,24 @@ pub struct View {
     /// in turn (a person quitting it, a crash its relaunch carries), never
     /// raised again over a tab whose owner acted. A record that left the
     /// down state, or a later exit of the move (another `exited_at`), is a
-    /// new fact. Forgotten with its row. This process's alone: after a
-    /// restart of aterm the record is read afresh.
+    /// new fact. Forgotten with its record's down state. KEPT BESIDE THE
+    /// RECORDS ([`BACK_FILE`], ATERM-KI-1016-1's LC-2): read at this view's
+    /// first look and written as it changes, so a restart of aterm inside the
+    /// day the row is shown does not raise it again over a tab whose owner
+    /// acted; it was this process's alone.
     back: BTreeMap<String, u64>,
+    /// [`Self::back`] was read from [`BACK_FILE`] (at the first whole look).
+    back_read: bool,
     /// Tabs with a record the last whole look found past its watch
     /// ([`Self::watch_due`]).
     watch: Vec<String>,
+    /// EACH RECORD'S TAB AS ITS LAST READ GAVE IT, by conversation
+    /// ([`Self::refresh_keeping`]): a record listed but unreadable at a look
+    /// (its file, or its read panicking: [`read_records`]) whose text names
+    /// no tab leaves this tab as it stands. Renewed by every look that lists
+    /// the records whole; forgotten with a record gone and as the view
+    /// stands down.
+    placed: BTreeMap<String, String>,
     /// Since when this view's host has been watching, unix seconds
     /// ([`Self::note_look`]): its first look since the view began or stood
     /// down, or after the host slept. Within [`WAKE_GRACE_S`] of it no row
@@ -5424,6 +5885,60 @@ pub struct View {
     /// The live tabs whose `owner=upgrade` attention this view has settled (lowered where it
     /// wanted none) since it began or stood down ([`Self::reconcile`]).
     settled: BTreeSet<String>,
+    /// THE RECORDS' FOLDER THE LAST LOOK COULD NOT LIST WHOLE
+    /// ([`Self::unlisted`]): `None` once a look lists it, or no folder is
+    /// there; a look whose roster could not be read leaves it as it stands.
+    unlisted: Option<std::path::PathBuf>,
+    /// THE RECORDS THE LAST WHOLE LOOK COULD NOT READ THAT KEEP A LIVE TAB AS
+    /// IT STANDS ([`Self::unreadable`]): empty once each reads, its tab
+    /// closes or it is gone; a look whose roster could not be read leaves it
+    /// as it stands.
+    unreadable: Vec<std::path::PathBuf>,
+}
+
+/// Where a view keeps [`View::back`] beside the records it reads: one
+/// `<conversation> <exited_at>` a line. No `.json`: it is no record.
+pub const BACK_FILE: &str = "agents-back";
+
+/// The most [`BACK_FILE`] is read of: far past one line per record.
+const BACK_MAX: u64 = 64 * 1024;
+
+/// [`View::back`] as [`write_back`] left it; none where the file is missing
+/// or cannot be read, and a line that does not read is passed over.
+fn read_back(opts: &Opts) -> BTreeMap<String, u64> {
+    let path = state_dir(opts).join(BACK_FILE);
+    let Some(text) = std::fs::File::open(&path).ok().and_then(|f| {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::Read::take(f, BACK_MAX), &mut text)
+            .ok()
+            .map(|_| text)
+    }) else {
+        return BTreeMap::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (session, exited) = line.split_once(' ')?;
+            let exited = exited.parse::<u64>().ok().filter(|at| *at != 0)?;
+            (!session.is_empty() && !session.contains(char::is_whitespace))
+                .then(|| (session.to_string(), exited))
+        })
+        .collect()
+}
+
+/// Writes `back` to [`BACK_FILE`] (renamed into place); an empty one
+/// removes the file. Best effort: a write that fails leaves the next view
+/// reading the records afresh, as before this file.
+fn write_back(opts: &Opts, back: &BTreeMap<String, u64>) {
+    let path = state_dir(opts).join(BACK_FILE);
+    if back.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let body: String = back
+        .iter()
+        .map(|(session, exited)| format!("{session} {exited}\n"))
+        .collect();
+    let _ = crate::harness::upgrade_models::write_atomic(&path, &body);
 }
 
 /// How far the wall clock may run ahead of the monotonic one between two looks
@@ -5449,6 +5964,27 @@ impl View {
     /// ([`UNREAD_RETRY`]). Returns the unix second at which a row next changes
     /// by time alone ([`next_change`]), or `None`; the host looks again then.
     pub fn refresh(&mut self, opts: &Opts, summary: &mut dyn FnMut(&[Row])) -> Option<u64> {
+        self.refresh_keeping(opts, &mut |rows, _| summary(rows))
+    }
+
+    /// [`Self::refresh`], handing over with the rows THE TABS THEY LEAVE AS
+    /// THEY STAND (ATERM-KI-1016-1): each tab whose record this look cannot
+    /// read — its read panicking, its file unreadable — whether this view
+    /// read it before or not: the tab its text names, else the tab its last
+    /// read gave ([`Self::placed`]), and, where neither names one, every
+    /// live tab. The window keeps what it shows for those tabs (their rows,
+    /// a stall row carried across a handoff) as it is, and renews every
+    /// other; this view neither raises nor lowers a mark there. Until then
+    /// such a record made the look not whole: no tab's rows or marks were
+    /// renewed while it stood, for good where it never read. Its last row
+    /// read again in its place (the first cut) aged as if it were read now,
+    /// and raised the owner's interrupt off a row no read gave the look —
+    /// `claude --resume` over a conversation its relaunch already held.
+    pub fn refresh_keeping(
+        &mut self,
+        opts: &Opts,
+        summary: &mut dyn FnMut(&[Row], &[String]),
+    ) -> Option<u64> {
         self.note_look(std::time::Instant::now(), now_s());
         let Some(tabs) = connect(opts, "")
             .ok()
@@ -5463,7 +5999,7 @@ impl View {
             return Some(now_s().saturating_add(pause.as_secs()));
         };
         self.unread = 0;
-        self.refresh_with(
+        self.refresh_with_keeping(
             opts,
             &tabs,
             now_s(),
@@ -5477,6 +6013,7 @@ impl View {
     /// host, a script in tests). Only [`Row::standing`] rows are handed over
     /// or marked. Unreadable session files or upgrade records ([`read_rows`])
     /// change nothing, since what is handed over is taken as a whole look.
+    #[cfg(all(test, unix))]
     fn refresh_with(
         &mut self,
         opts: &Opts,
@@ -5485,7 +6022,66 @@ impl View {
         holders: &dyn Fn(&BTreeSet<String>) -> Option<Vec<Holder>>,
         summary: &mut dyn FnMut(&[Row]),
     ) -> Option<u64> {
-        let (mut all, whole) = read_rows(opts, now);
+        self.refresh_with_keeping(opts, tabs, now, holders, &mut |rows, _| summary(rows))
+    }
+
+    /// [`Self::refresh_with`], handing over the tabs left as they stand
+    /// ([`Self::refresh_keeping`]).
+    fn refresh_with_keeping(
+        &mut self,
+        opts: &Opts,
+        tabs: &[LiveTab],
+        now: u64,
+        holders: &dyn Fn(&BTreeSet<String>) -> Option<Vec<Holder>>,
+        summary: &mut dyn FnMut(&[Row], &[String]),
+    ) -> Option<u64> {
+        let (mut all, whole, unread) = read_records(opts, now);
+        self.unlisted = (!whole).then(|| state_dir(opts));
+        // A RECORD THAT CANNOT BE READ NOW LEAVES ITS TAB AS IT STANDS
+        // (ATERM-KI-1016-1): left out of a look that then counted as not
+        // whole, one record whose read panicked at every look (a line this
+        // build cannot read) kept every tab's rows and marks at the last
+        // whole look for as long as it stood. Now only its tab is kept as it
+        // stands ([`Self::refresh_keeping`]), read before or not: what the
+        // record says now is not known, so no row of it is handed over, and
+        // its tab's mark is neither raised nor lowered. Every other record's
+        // row is renewed.
+        let mut kept: BTreeSet<String> = BTreeSet::new();
+        // The unread records no tab is known for, by conversation: placed
+        // once the holders are read (below).
+        let mut unplaced: BTreeSet<String> = BTreeSet::new();
+        let mut unreadable: Vec<std::path::PathBuf> = Vec::new();
+        if whole {
+            let mut placed: BTreeMap<String, String> = all
+                .iter()
+                .filter(|r| !r.tab.is_empty())
+                .map(|r| (r.session.clone(), r.tab.clone()))
+                .collect();
+            for u in &unread {
+                match u
+                    .tab
+                    .clone()
+                    .or_else(|| self.placed.get(&u.session).cloned())
+                {
+                    Some(tab) => {
+                        if tab_is_live(tabs, &tab) {
+                            unreadable.push(u.path.clone());
+                        }
+                        placed.insert(u.session.clone(), tab.clone());
+                        kept.insert(tab);
+                    }
+                    None => {
+                        if !tabs.is_empty() {
+                            unreadable.push(u.path.clone());
+                        }
+                        unplaced.insert(u.session.clone());
+                    }
+                }
+            }
+            self.placed = placed;
+        }
+        // Said to the owner while it keeps a live tab ([`Self::unreadable`]).
+        self.unreadable = unreadable;
         // What this host has not yet had the chance to watch is not missed
         // ([`Self::note_look`]).
         for r in &mut all {
@@ -5496,9 +6092,10 @@ impl View {
         let (untabbed, all): (Vec<Row>, Vec<Row>) = all
             .into_iter()
             .partition(|r| r.tab.is_empty() && r.watch_at != 0 && r.held_by_a_process());
+        let (all, elsewhere): (Vec<Row>, Vec<Row>) =
+            all.into_iter().partition(|r| tab_is_live(tabs, &r.tab));
         let mut mine: Vec<Row> = all
             .into_iter()
-            .filter(|r| tab_is_live(tabs, &r.tab))
             .filter(|r| {
                 r.phase != Phase::Done
                     || r.restarting(now)
@@ -5522,6 +6119,7 @@ impl View {
         }
         let mut vet = sessions_to_vet(&mine);
         vet.extend(untabbed.iter().map(|r| r.session.clone()));
+        vet.extend(unplaced.iter().cloned());
         let held = if vet.is_empty() {
             None
         } else {
@@ -5530,6 +6128,28 @@ impl View {
             };
             Some(held)
         };
+        // AN UNREAD RECORD NO TAB IS KNOWN FOR (ATERM-KI-1016-1 host-8, the
+        // review of its first cut) keeps the tab its conversation's live
+        // process is proven in — its file is named by that conversation — and
+        // every live tab only where no process holds it in one. Every live
+        // tab was kept for it before, its marks and rows all frozen for as
+        // long as the file stood.
+        for session in &unplaced {
+            let at: Vec<String> = held
+                .iter()
+                .flatten()
+                .filter(|h| h.session == *session)
+                .filter_map(|h| h.tab.clone())
+                .filter(|tab| tab_is_live(tabs, tab))
+                .collect();
+            if at.is_empty() {
+                kept.extend(tabs.iter().map(|t| t.sid.clone()));
+            } else {
+                kept.extend(at);
+            }
+        }
+        kept.retain(|tab| tab_is_live(tabs, tab));
+        let kept: Vec<String> = kept.into_iter().collect();
         let mut untabbed_next: Option<u64> = None;
         if let Some(held) = &held {
             for r in &untabbed {
@@ -5546,32 +6166,51 @@ impl View {
                 }
             }
         }
-        // A Claude Code move that failed after its exit and is held again —
-        // its conversation, or its tab led by any agent — is an ordinary
-        // stopped upgrade, and stays one once that agent ends ([`Self::back`]).
+        // A Claude Code move down after its exit (failed after it, or a
+        // restart in flight whose agent was read gone) and held again — its
+        // conversation, or its tab led by any agent — is answered
+        // ([`Row::held_again`]), and stays answered once that agent ends
+        // ([`Self::back`]).
         // A tab the host runs no worker for by someone else's hand (agent not
         // in front, another supervisor's claim, the agent's own switch off,
         // or the owner's Autopilot off) is out of this host's watch
         // ([`Row::aside`]), read so before its `unwatched` instant is named.
-        let down = |r: &Row| held_again_after_exit(r.agent) && r.failed_after_exit();
+        let down = |r: &Row| held_again_after_exit(r.agent) && r.down_after_exit();
+        if !self.back_read {
+            self.back_read = true;
+            for (session, exited) in read_back(opts) {
+                self.back.entry(session).or_insert(exited);
+            }
+        }
+        let before = self.back.clone();
         // Read off the records before any row is lowered or dropped (a row
         // lowered below is dropped as no longer standing, and forgetting it
         // would raise it again): a record no longer down, or gone, is
-        // forgotten — whether or not this look reads any holder.
-        self.back
-            .retain(|session, _| mine.iter().any(|r| r.session == *session && down(r)));
+        // forgotten — whether or not this look reads any holder. Read off
+        // every record, its tab live or not: a cold restore's first look can
+        // come before the relaunch names the reopened tab.
+        self.back.retain(|session, _| {
+            unread.iter().any(|u| u.session == *session)
+                || mine
+                    .iter()
+                    .chain(&elsewhere)
+                    .any(|r| r.session == *session && down(r))
+        });
         if let Some(held) = &held {
             for r in &mut mine {
                 let was_down = down(r);
                 let exited = r.exited_at;
                 r.held_again(held, false);
-                if was_down && r.exited_at == 0 {
+                if was_down && !down(r) {
                     self.back.insert(r.session.clone(), exited);
                 } else if was_down && self.back.get(&r.session) == Some(&exited) {
-                    r.exited_at = 0;
+                    r.answer_down();
                 }
                 r.set_aside(held, false, &self.aside, now);
             }
+        }
+        if self.back != before {
+            write_back(opts, &self.back);
         }
         mine.retain(|r| {
             !r.failed_after_exit() || now.saturating_sub(r.exited_at) <= EXITED_FAILURE_SHOWN_S
@@ -5603,13 +6242,26 @@ impl View {
         for r in &mut mine {
             r.level = r.attention(now).level();
         }
-        if self.sent.as_ref() != Some(&mine) {
-            summary(&mine);
+        if self.sent.as_ref() != Some(&mine) || self.sent_kept != kept {
+            summary(&mine, &kept);
             self.sent = Some(mine.clone());
+            self.sent_kept.clone_from(&kept);
         }
-        let want = marks(&mine, now);
+        let mut want = marks(&mine, now);
+        // A tab left as it stands keeps its mark exactly as it is: raised,
+        // or not, whatever another record of the tab would want.
+        for tab in &kept {
+            match self.badged.get(tab) {
+                Some(badge) => {
+                    want.insert(tab.clone(), badge.clone());
+                }
+                None => {
+                    want.remove(tab);
+                }
+            }
+        }
         self.sock.clone_from(&opts.sock);
-        self.reconcile(opts, tabs, &want);
+        self.reconcile(opts, tabs, &want, &kept);
         self.mark(opts, &want);
         next
     }
@@ -5622,7 +6274,13 @@ impl View {
     /// first look in its roster, this view unsets that key once on every live tab it does not
     /// want marked; another owner's entry is never touched. A failed write is tried again at the
     /// next look.
-    fn reconcile(&mut self, opts: &Opts, tabs: &[LiveTab], want: &BTreeMap<String, String>) {
+    fn reconcile(
+        &mut self,
+        opts: &Opts,
+        tabs: &[LiveTab],
+        want: &BTreeMap<String, String>,
+        kept: &[String],
+    ) {
         self.settled
             .retain(|tab| tabs.iter().any(|t| t.sid == *tab));
         // A tab this view wants marked, or has marked, is [`Self::mark`]'s:
@@ -5634,6 +6292,7 @@ impl View {
                 !self.settled.contains(tab)
                     && !want.contains_key(tab)
                     && !self.badged.contains_key(tab)
+                    && !kept.contains(tab)
             })
             .collect();
         if due.is_empty() {
@@ -5690,6 +6349,34 @@ impl View {
         &self.follows
     }
 
+    /// THE RECORDS' FOLDER THIS VIEW CANNOT LIST (ATERM-KI-1016-1): the
+    /// folder the last look that read the roster could not list whole — an
+    /// unlistable folder, or a listing that broke off — so which records it
+    /// holds is not known. Such a look renews no row and lowers no mark, and
+    /// until this was named the window kept its rows and marks at the last
+    /// whole look with nothing said to the owner; the window's host says it
+    /// ([`Need::upgrade_records_unlisted`]) while this names a folder.
+    /// `None` once a look lists the folder whole (no folder at all is a
+    /// look), and as the view stands down.
+    #[must_use]
+    pub fn unlisted(&self) -> Option<&std::path::Path> {
+        self.unlisted.as_deref()
+    }
+
+    /// THE RECORDS THIS VIEW CANNOT READ THAT KEEP A LIVE TAB AS IT STANDS
+    /// (ATERM-KI-1016-1 host-8): each record the last whole look listed but
+    /// could not read ([`read_records`]) whose tab is live, or, its tab not
+    /// known, while any tab is ([`Self::refresh_keeping`]). What the window
+    /// shows of those tabs stays as it is, and until this was named nothing
+    /// told the owner so: a record another user wrote (`sudo aterm …`), or a
+    /// link that loops, froze its tab for as long as it stood. The window's
+    /// host says it ([`Need::upgrade_records_unreadable`]) while this names
+    /// one. Empty once each reads, and as the view stands down.
+    #[must_use]
+    pub fn unreadable(&self) -> &[std::path::PathBuf] {
+        &self.unreadable
+    }
+
     /// Tabs due a watch per the last look: a live tab with a record past its [`Row::watch_at`],
     /// which the host hands to `upgrade_drive::watch` whatever point the session offers. A
     /// partial look still names the tabs of records it read (an untabbed record only through its
@@ -5723,8 +6410,12 @@ impl View {
             summary(&[]);
         }
         self.sent = None;
+        self.sent_kept.clear();
         self.follows.clear();
         self.watch.clear();
+        self.placed.clear();
+        self.unlisted = None;
+        self.unreadable.clear();
         // Stood down, nothing is watched: the first look back is the watch's
         // start again ([`Self::note_look`]).
         self.looked = None;
@@ -5747,6 +6438,8 @@ impl View {
                 aterm_state: None,
                 ask: false,
                 several_logins: false,
+                // Nothing is moved here.
+                usage_credits: false,
                 usage_tap: None,
                 instances: crate::harness::upgrade_drive::Instances::Machine,
                 agents_off: Vec::new(),

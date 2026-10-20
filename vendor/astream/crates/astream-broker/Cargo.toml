@@ -1,6 +1,6 @@
 [package]
 name = "astream-broker"
-description = "astream servable broker: durable exactly-once pub/sub, Filter-routed subscribe, resume-from-offset (replay-subscription), durable consumer groups and atomic read-process-write, served over a Unix-domain socket, plaintext TCP, or (feature `aead`) an XChaCha20-Poly1305-sealed TCP transport; capability enforcement on attach behind feature `cap`. std-only concurrency (threads + Mutex/Condvar), zero third-party deps by default, forbid(unsafe)."
+description = "astream servable broker: durable exactly-once pub/sub, Filter-routed subscribe, resume-from-offset (replay-subscription), durable consumer groups and atomic read-process-write, served over a Unix-domain socket, plaintext TCP, or (feature `aead`) an XChaCha20-Poly1305-sealed TCP transport (ring's ChaCha20-Poly1305 under an in-crate HChaCha20 subkey); capability enforcement on attach behind feature `cap`. std-only concurrency (threads + Mutex/Condvar), zero third-party deps by default, forbid(unsafe)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,8 +16,9 @@ rust-version.workspace = true
 # third-party crate.
 cap = ["dep:astream-cap"]
 # Off by default: an XChaCha20-Poly1305-sealed TCP transport (serve_tcp_sealed /
-# Client::connect_tcp_sealed). Pulls astream-aead (and its vetted cipher), so the
-# default broker stays zero-third-party.
+# Client::connect_tcp_sealed). Pulls astream-aead and its cipher (ring's
+# ChaCha20-Poly1305; astream-aead derives the XChaCha20 subkey itself), so the default
+# broker stays zero-third-party.
 aead = ["dep:astream-aead"]
 # Off by default: the Rung-7 forward-secret handshake (serve_tcp_handshake /
 # Client::connect_tcp_handshake) — ephemeral X25519 authenticated by the PSK.

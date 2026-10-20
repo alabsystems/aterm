@@ -13,8 +13,8 @@ aterm theme install "Kanagawa Wave"   # add one (or several, or --all)
 aterm theme pack --licences           # every palette's attribution and licence
 ```
 
-Settings ▸ Themes ▸ **Get More** (a gallery chip, and in its footer) lists the ones you don't have yet; a
-press adds one and tries it, and **Keep** selects it.
+Settings ▸ Themes ▸ **Community** lists the ones you don't have yet: the highlighted one is tried
+in the live demo, and **Keep** adds it and selects it.
 
 A pack theme is not a built-in. Installing one copies its file into your themes folder as an
 ordinary `<id>.conf`, where it loads, previews and can be edited like any theme of yours. A copy

@@ -154,9 +154,10 @@ pub const LOCK_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
         receiver IS each caller's lock, resolved per call site by the token the
         fn implements. The interior is listed with its audit note and keeps a
         unique per-site node (edges reported, never able to close a cycle).
-      - VENDORED-IDENTITY MODE: the vendored [patch] crates that link into the
-        GUI process (vendor/forge.toml [[fork]]) are scanned with every identity
-        in a per-crate namespace (`winit::…`), so a foreign receiver name can
+      - VENDORED-IDENTITY MODE: the vendored [patch] crates (vendor/forge.toml
+        [[fork]]) and the absorbed crates (ABSORBED_CRATES) that link into the
+        GUI process are scanned with every identity in a per-crate namespace
+        (`aterm_window::…`), so a foreign receiver name can
         never merge with an aterm identity or another vendored crate's. The
         namespace is carried by the fn TABLE as well as by the identities, so a
         foreign fn NAME cannot capture an aterm call site either (see NAMESPACE
@@ -262,10 +263,19 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         def_file: "crates/aterm-gui/src/keeper_link.rs",
     },
     GuardHelper {
-        // The disk watch's episode state is returned to its callers. They
-        // release it before logging, journal writes or host callbacks.
+        // The disk board: the watch's volumes, demands, last pass and episode
+        // behind one leaf mutex (`Shelf.board`). `board_lock` is a method so a
+        // test's own shelf and the process's `SHELF` are the one identity.
+        symbol: "board_lock",
+        identity: "board",
+        def_file: "crates/aterm-gui/src/disk_board.rs",
+    },
+    GuardHelper {
+        // The disk watch's episode, read through the board's guard
+        // (`board_lock`). Callers release it before logging, journal writes
+        // or host callbacks.
         symbol: "disk_episode",
-        identity: "DISK_EPISODE",
+        identity: "board",
         def_file: "crates/aterm-gui/src/harness_host.rs",
     },
     GuardHelper {
@@ -538,7 +548,7 @@ const STANDARD_METHOD_NAMES: &[&str] = &[
 // ---------------------------------------------------------------------------
 
 /// The identity namespace of the aterm workspace crates, which carry no
-/// prefix; only vendored `[patch]` forks do (`winit::…`).
+/// prefix; only vendored forks and absorbed crates do (`aterm_window::…`).
 const WORKSPACE_NS: Option<&'static str> = None;
 
 /// One lock-acquisition site.
@@ -3037,20 +3047,22 @@ mod tests {
         ));
         files.push((
             "crates/aterm-gui/src/harness_host.rs".to_string(),
-            "fn disk_episode() -> std::sync::MutexGuard<'static, DiskEpisode> {\n    \
-             DISK_EPISODE.lock().unwrap_or_else(PoisonError::into_inner)\n}\n"
+            "fn disk_episode(board: &Shelf) -> EpisodeGuard<'_> {\n    \
+             EpisodeGuard(board.board_lock())\n}\n"
+                .to_string(),
+        ));
+        files.push((
+            "crates/aterm-gui/src/disk_board.rs".to_string(),
+            "impl Shelf {\n    \
+             pub(crate) fn board_lock(&self) -> MutexGuard<'_, Board> {\n        \
+             self.board.lock().unwrap_or_else(PoisonError::into_inner)\n    \
+             }\n}\n"
                 .to_string(),
         ));
         files.push((
             "crates/aterm-gui/src/keeper_link.rs".to_string(),
             "fn keeper_state() -> std::sync::MutexGuard<'static, State> {\n    \
              KEEPER_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)\n}\n"
-                .to_string(),
-        ));
-        files.push((
-            "crates/aterm-gui/src/harness_host.rs".to_string(),
-            "fn disk_episode() -> std::sync::MutexGuard<'static, DiskEpisode> {\n    \
-             DISK_EPISODE.lock().unwrap_or_else(PoisonError::into_inner)\n}\n"
                 .to_string(),
         ));
         files.push((
@@ -3134,11 +3146,21 @@ mod tests {
                     || SYNTH_HELPER_CRATES.iter().any(|(name, _)| *name == k)
             })
         };
-        let acquires = |contents: &str, identity: &str| -> bool {
+        // A standard acquisition of the identity, or a call of another helper
+        // registered with it, which the census counts as a direct acquisition
+        // (`acquisitions_on`; a `fn <symbol>(` is the definition, not a call).
+        let acquires = |contents: &str, symbol: &str, identity: &str| -> bool {
             STANDARD_METHOD_NAMES.iter().any(|m| {
                 contents.contains(&format!("{identity}.{m}("))
                     || contents.contains(&format!("{identity}().{m}("))
-            })
+            }) || GUARD_HELPERS
+                .iter()
+                .filter(|o| o.symbol != symbol && o.identity == identity)
+                .any(|o| {
+                    contents
+                        .match_indices(&format!("{}(", o.symbol))
+                        .any(|(at, _)| !contents[..at].trim_end().ends_with("fn"))
+                })
         };
         for h in GUARD_HELPERS {
             assert!(
@@ -3166,7 +3188,7 @@ mod tests {
                 h.symbol
             );
             assert!(
-                acquires(contents, h.identity),
+                acquires(contents, h.symbol, h.identity),
                 "the fixture at {} defines `fn {}` but its body never acquires the \
                  registered identity `{}` — the registry's interior check reads the \
                  SCANNED corpus, so the mirror must acquire what the shipping helper does",
@@ -3191,7 +3213,8 @@ mod tests {
                 )
             });
             assert!(
-                contents.contains(&format!("fn {}(", v.symbol)) && acquires(contents, "self"),
+                contents.contains(&format!("fn {}(", v.symbol))
+                    && acquires(contents, v.symbol, "self"),
                 "the fixture at {} must define `fn {}` WITH its bare-`self` acquisition — \
                  both halves of the interior registry are fail-closed",
                 v.def_file,
@@ -4484,12 +4507,16 @@ mod tests {
             out.log
         );
         assert!(
-            out.log.contains("winit::state(1)") && out.log.contains("winit::queue(1)"),
+            out.log.contains("aterm_window::state(1)")
+                && out.log.contains("aterm_window::queue(1)"),
             "vendored identities must be namespaced in the ledger:\n{}",
             out.log
         );
         assert!(
-            out.log.contains("state -> queue") && out.log.contains("winit::queue -> winit::state"),
+            out.log.contains("state -> queue")
+                && out
+                    .log
+                    .contains("aterm_window::queue -> aterm_window::state"),
             "both crates' nestings must be tracked, separately:\n{}",
             out.log
         );
@@ -4511,7 +4538,7 @@ mod tests {
         );
         assert!(out.ok, "GREEN expected:\n{}", out.log);
         assert!(
-            out.log.contains("alpha_lock -> winit::event_state"),
+            out.log.contains("alpha_lock -> aterm_window::event_state"),
             "the aterm-held -> winit-acquire edge must be in the ledger:\n{}",
             out.log
         );
@@ -4679,7 +4706,7 @@ mod tests {
         assert!(
             out.log.contains("CYCLE")
                 && out.log.contains("alpha_lock")
-                && out.log.contains("winit::event_state"),
+                && out.log.contains("aterm_window::event_state"),
             "the cycle must name both sides of the namespace boundary:\n{}",
             out.log
         );
@@ -4718,7 +4745,8 @@ mod tests {
             out.log
         );
         assert!(
-            !out.log.contains("winit::sctk_state") && !out.log.contains("winit::x11_state"),
+            !out.log.contains("aterm_window::sctk_state")
+                && !out.log.contains("aterm_window::x11_state"),
             "slice sites must not appear as graphed identities:\n{}",
             out.log
         );
@@ -4750,13 +4778,13 @@ mod tests {
             out.log
         );
         assert!(
-            out.log.contains("winit: 1 site(s)"),
+            out.log.contains("aterm_window: 1 site(s)"),
             "the per-crate vendored-UNKNOWN ledger must name the crate:\n{}",
             out.log
         );
         assert!(
             out.log.contains(
-                "winit::UNKNOWN@crates/aterm-window/src/planted.rs:2 -> winit::event_state"
+                "aterm_window::UNKNOWN@crates/aterm-window/src/planted.rs:2 -> aterm_window::event_state"
             ),
             "the vendored unknown's held-acquire edge must still be reported, \
              namespaced:\n{}",

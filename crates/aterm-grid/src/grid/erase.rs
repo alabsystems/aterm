@@ -406,9 +406,13 @@ impl Grid {
         let cursor_row = self.storage.cursor.row;
         let visible_rows = self.storage.visible_rows;
         self.clear_rows(cursor_row.saturating_add(1)..visible_rows, selective);
-        // The blanks below the cursor are genuine now — an in-flight offloaded
-        // reflow must not deficit-fill them from pre-erase history.
-        self.invalidate_pending_fill_target();
+        // The rows an in-flight offloaded reflow owes stand for history above
+        // the rows the program drew, which this leaves alone: a prompt redrawn
+        // after a resize keeps them owed (`FillDebt`). A program that homes
+        // the cursor first (`ESC[H ESC[J`) dropped them at the move.
+        // The rows a shrink pushed off the bottom stood below these: erased
+        // with them (`grid::resize_handback`).
+        self.forget_pushed_rows_erased();
         // Visible rows only, so a selection anchored in scrollback survives.
         // `moves_coordinates = false`: an erase rewrites cells in place, so no
         // host-cached coordinate goes stale (and every prompt redraw's `ESC[J`
@@ -441,6 +445,12 @@ impl Grid {
         self.storage.clear_pending_wrap();
         // ED 2 shows the freshly erased live screen, not a scrolled-back view.
         self.storage.display_offset = 0;
+        // The program draws the new screen from the top: the history lines a
+        // grow revealed are no longer owed back to a shrink, and the rows a
+        // shrink pushed off the bottom were erased with the screen
+        // (`grid::resize_handback`).
+        self.forget_revealed_rows();
+        self.forget_pushed_rows_erased();
         let fill = self.storage.cursor_template;
         for row in 0..self.storage.visible_rows {
             if let Some(r) = self.row_mut(row) {
@@ -462,9 +472,9 @@ impl Grid {
         // Visible rows only, `moves_coordinates = false`: see `erase_below_cursor`.
         let last = self.storage.visible_rows.saturating_sub(1);
         self.damage_selection_visible_rows_ext(0, last, false);
-        // ED 2's blanks are genuine — an in-flight offloaded reflow must not
-        // deficit-fill the cleared screen from pre-erase history.
-        self.invalidate_pending_fill_target();
+        // ED 2 erases the rows an in-flight offloaded reflow owes with the
+        // screen: its re-attach must not fill the cleared screen from history.
+        self.drop_fill_debt();
         self.storage.mark_content_full();
     }
 
@@ -511,6 +521,7 @@ impl Grid {
             // ED 3 discards history wholesale: selection damage `All`, but no
             // live coordinate moves (see `discard_history_selection`).
             self.discard_history_selection();
+            self.anchors_clamp_to_oldest();
             // ED 3 keeps the deferred wrap (module note).
             debug_assert_eq!(self.storage.display_offset, 0);
             debug_assert_eq!(self.storage.total_lines, self.storage.visible_rows as usize);
@@ -550,6 +561,7 @@ impl Grid {
         self.storage.mark_content_full();
         // ED 3 discards history wholesale; see `discard_history_selection`.
         self.discard_history_selection();
+        self.anchors_clamp_to_oldest();
         // ED 3 keeps the deferred wrap (module note).
         debug_assert_eq!(self.storage.display_offset, 0);
         debug_assert_eq!(self.storage.total_lines, self.storage.visible_rows as usize);
@@ -641,9 +653,8 @@ impl Grid {
         // any-unprotected rule covers both.
         let visible_rows = self.storage.visible_rows;
         self.clear_rows(0..self.storage.visible_rows, true);
-        // Same debt invalidation as ED 2: the cleared screen's blanks are
-        // genuine, never deficit-fill them from pre-erase history.
-        self.invalidate_pending_fill_target();
+        // As ED 2: the owed rows are erased with the screen.
+        self.drop_fill_debt();
         // Visible rows only, `moves_coordinates = false`: see `erase_below_cursor`.
         let last = self.storage.visible_rows.saturating_sub(1);
         self.damage_selection_visible_rows_ext(0, last, false);
@@ -1174,6 +1185,11 @@ impl Grid {
         // DECCRA replaces the destination cells (the source is only read), so
         // the destination rows are the selection damage.
         self.damage_selection_visible_rows(dst_top, dst_bottom_eff);
+        // Cells copied across rows carry one row's text onto another, which
+        // no anchor rule describes (a copy within its own rows moves none).
+        if dst_top != src_top {
+            self.lose_anchors();
+        }
         let dst_right_eff = dst_left
             .saturating_add(rect_width.saturating_sub(1))
             .min(max_col);

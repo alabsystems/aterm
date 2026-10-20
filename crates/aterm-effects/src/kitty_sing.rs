@@ -124,7 +124,8 @@ pub const DROP_FAN_N: u8 = 9;
 /// `trail_sound::CELEBRATION_OUTRO_S`.
 pub const OUTRO_SECONDS: f32 = 1.2;
 
-/// Which keystroke-caused edge an armed celebration fires on.
+/// Which edge an armed celebration fires on: two keystroke-caused edges, and
+/// the program's own word that its turn is done.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CelebrateOn {
     /// The session's next exit-0 command block (OSC 133/633 `D` with status
@@ -134,15 +135,21 @@ pub enum CelebrateOn {
     /// The session's next keyed Enter (a real key event, or raw bytes ending
     /// in a newline — an agent's `send` counts, program output never does).
     Enter,
+    /// The session's next `done` the host honours from the program in front
+    /// (OSC 7501 `state=done`, shown only while a `codex` is in front): the
+    /// end of a codex turn. A display edge only; the host reports it from the
+    /// status sweep's program-state gate.
+    Done,
 }
 
 impl CelebrateOn {
-    /// The wire spelling (`on=green|enter`).
+    /// The wire spelling (`on=green|enter|done`).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Green => "green",
             Self::Enter => "enter",
+            Self::Done => "done",
         }
     }
 }
@@ -303,7 +310,9 @@ pub struct KittySing {
     /// here.
     handover_from: Option<Instant>,
     /// An armed, not-yet-fired celebration (`fx celebrate`), spent by the first
-    /// keystroke-caused edge it names (§27). Nothing lights until that edge.
+    /// edge it names (§27): a keystroke-caused one (`on=green`, `on=enter`) or the
+    /// session's next honoured program `done` (`on=done`, which no key causes).
+    /// Nothing lights until that edge.
     armed_external: Option<ArmedCelebration>,
     /// The fired run, while it plays and winds down; cleared by `settle`, or
     /// by a human hold that re-earns the stage inside the wind-down.
@@ -574,7 +583,8 @@ impl KittySing {
     // -- the armed celebration (§27) ------------------------------------------
 
     /// Arm a one-shot celebration (`fx celebrate`): latched, fired on the next
-    /// keystroke-caused edge `on` names, in `session`. Refused outside
+    /// edge `on` names (a keystroke-caused one, or the program's `done`), in
+    /// `session`. Refused outside
     /// `1..=CELEBRATE_MAX_BARS`, while an arm is pending, or within
     /// [`CELEBRATE_COOLDOWN`] of the last arm. The cooldown is stamped on the
     /// arm, so a refused arm costs nothing and an admitted one costs thirty
@@ -679,6 +689,22 @@ impl KittySing {
         {
             self.fire_external(now, session, arm);
         }
+    }
+
+    /// The done edge: the host honoured a `done` from the program in front of
+    /// `session` (OSC 7501, the status sweep's program-state gate). Fires a
+    /// pending [`CelebrateOn::Done`] arm bound to this session and answers
+    /// whether it did (the host then wakes the window that draws it); anything
+    /// else is a no-op that answers `false`.
+    pub fn note_program_done(&mut self, now: Instant, session: u64) -> bool {
+        if let Some(arm) = self.armed_external
+            && arm.on == CelebrateOn::Done
+            && arm.session == session
+        {
+            self.fire_external(now, session, arm);
+            return true;
+        }
+        false
     }
 
     /// Spend the arm: anchor the beat clock at `now` and run `bars` bars with
@@ -1932,14 +1958,67 @@ mod tests {
         );
     }
 
-    /// With nothing armed, a green block and a keyed Enter are no-ops: the
-    /// detector stays off and no fan or outro is handed out.
+    /// An `on=done` arm fires on its session's next honoured `done`, once, and
+    /// on nothing else. NEGATIVE CONTROLS: a green block and a keyed Enter in
+    /// that session leave it waiting, another session's `done` leaves it
+    /// waiting, a `done` never fires an `on=green` arm, and a second `done`
+    /// while the run plays (or after it) starts nothing.
+    #[test]
+    fn an_on_done_arm_fires_on_the_session_s_next_done_and_only_once() {
+        let mut d = KittySing::default();
+        let t0 = Instant::now();
+        let sig = song_signature('D');
+        let arm = d
+            .arm_external(t0, S, sig, 2, CelebrateOn::Done)
+            .expect("admitted");
+        assert_eq!(arm.on.as_str(), "done");
+        d.note_green_block(t0 + Duration::from_millis(10), S);
+        d.note_keyed_enter(t0 + Duration::from_millis(20), S);
+        assert!(
+            !d.note_program_done(t0 + Duration::from_millis(30), S + 1),
+            "another session's done is not this one's"
+        );
+        let waiting = t0 + Duration::from_millis(40);
+        assert_eq!(d.armed_external(), Some(arm), "the arm still waits");
+        assert_eq!(d.drive(waiting), 0.0, "nothing lit");
+
+        let done = t0 + Duration::from_millis(500);
+        assert!(d.note_program_done(done, S), "this session's done fires it");
+        assert_eq!(d.armed_external(), None, "the arm is spent by the edge");
+        assert!(d.is_armed(done));
+        assert_eq!(d.drive(done), 1.0);
+        assert_eq!(d.signature(), sig);
+        assert_eq!(
+            d.beat(done),
+            Some(0.0),
+            "the beat clock anchors at the fire"
+        );
+
+        let again = done + Duration::from_secs_f32(SING_BAR_SECONDS + 0.2);
+        assert!(
+            !d.note_program_done(again, S),
+            "a second done fires nothing"
+        );
+        assert_eq!(d.bar(again), Some(1), "the grid did not move");
+
+        // A `done` is not a green block: an `on=green` arm ignores it.
+        let mut g = KittySing::default();
+        g.arm_external(t0, S, sig, 1, CelebrateOn::Green)
+            .expect("admitted");
+        assert!(!g.note_program_done(t0 + Duration::from_millis(5), S));
+        assert!(g.armed_external().is_some(), "the green arm still waits");
+        assert_eq!(g.drive(t0 + Duration::from_millis(5)), 0.0);
+    }
+
+    /// With nothing armed, a green block, a keyed Enter and a program's `done`
+    /// are no-ops: the detector stays off and no fan or outro is handed out.
     #[test]
     fn an_unarmed_session_never_celebrates_on_a_green_block() {
         let mut d = KittySing::default();
         let t0 = Instant::now();
         d.note_green_block(t0, S);
         d.note_keyed_enter(t0 + Duration::from_millis(10), S);
+        assert!(!d.note_program_done(t0 + Duration::from_millis(15), S));
         let t = t0 + Duration::from_millis(20);
         assert_eq!(d.drive(t), 0.0);
         assert!(!d.is_armed(t));

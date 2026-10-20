@@ -45,10 +45,14 @@ fn validate_transition(action_name: &str, prev: [i64; 4], next: [i64; 4]) -> (bo
     )
 }
 
-/// The window-routing Tier-1 body, run only by `spec_xref_gate`'s `spec_xref_closure`,
-/// so the gate's claim holds: if the real close→exit routing diverges from
-/// `WindowRouting.Next`, this and the gate fail.
-pub(crate) fn run_conformance() {
+/// The window-routing Tier-1 body: if the real close→exit routing diverges from
+/// `WindowRouting.Next`, this fails.
+#[test]
+fn the_real_window_routing_conforms() {
+    crate::conformance_support::on_conformance_stack("window_routing", run_conformance);
+}
+
+fn run_conformance() {
     // Unique per-CALL tempdir: a per-process dir would race on the shared
     // spec/cfg/trace files with any other caller in this test binary (same
     // `process::id()`); a monotonic counter makes each invocation's working

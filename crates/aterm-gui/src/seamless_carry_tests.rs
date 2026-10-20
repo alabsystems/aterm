@@ -3,7 +3,8 @@
 
 //! The CONTROL CARRY across a real handoff: `write_outgoing` with sidecars,
 //! the successor's `take_incoming`, the adoption proof, and what drivers read
-//! afterwards — `history`, `offscreen`, and `aterm drive report` itself. Plus
+//! afterwards — `history`, `offscreen`, and the harness's report reader
+//! (`Session::report`) itself. Plus
 //! the rollback lane: the same new sender handing off to a receiver built
 //! BEFORE the carry, proof and all.
 
@@ -19,7 +20,7 @@ use super::*;
 use crate::handoff_carry::{self, ControlCarry};
 use crate::handoff_history::tests::history as shell_history;
 use crate::session_store::SessionRecord;
-use crate::turn_ledger::{ArchMark, TurnLedger, TurnRecord};
+use crate::turn_ledger::{ArchMark, TurnBy, TurnLedger, TurnRecord};
 
 // ------------------------------------------------ the receiver before the carry
 
@@ -114,17 +115,22 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 attention_owners: Vec::new(),
                 viewport_from_bottom: None,
                 render_debt: None,
+                render_debt_cut: 0,
                 fabric: Default::default(),
                 timeline_id: 0,
                 log_ids: None,
                 log_seq: 0,
                 journal_key: None,
+                task: None,
+                status_seen: None,
             })
             .collect(),
         roster_seq: None,
         fabric_attached: Vec::new(),
+        fleet_told: Vec::new(),
         mirror_dropped: Vec::new(),
         mirror_served: false,
+        machine_names: Vec::new(),
     })
 }
 
@@ -222,6 +228,7 @@ fn old_session(app: &mut FakeApp, n: usize) -> (Arc<Mutex<Terminal>>, Arc<Mutex<
         screen_hash: 1,
         seq: 1,
         arch: ArchMark::of(&t),
+        by: TurnBy::Ctl,
         carried: false,
     });
     // The turn: its mark first, as `cmd_turn` takes it, then the echo of the
@@ -239,6 +246,7 @@ fn old_session(app: &mut FakeApp, n: usize) -> (Arc<Mutex<Terminal>>, Arc<Mutex<
         screen_hash: 2,
         seq: t.content_seq(),
         arch,
+        by: TurnBy::Ctl,
         carried: false,
     });
     (Arc::new(Mutex::new(t)), Arc::new(Mutex::new(ledger)))
@@ -325,7 +333,7 @@ fn ctl_files(staged: &StagedHandoff) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-// ------------------------------------------------------- `aterm drive report`
+// --------------------------------------- the report reader (`Session::report`)
 
 /// A `Ctl` over the real verbs: `history` from the session's ledger,
 /// `offscreen` from its engine — the replies a raw client reads.
@@ -382,8 +390,8 @@ fn is_chrome(row: &str) -> bool {
 }
 
 /// Design test 13, end to end: the app answers a turn with N rows, the
-/// session is handed to a new process, the app says M more — and `aterm
-/// drive report` on the new process returns the turn's row and all N+M rows,
+/// session is handed to a new process, the app says M more — and the report
+/// reader (`Session::report`) on the new process returns the turn's row and all N+M rows,
 /// `complete=1`, no chrome; `history` shows the turn `carried=1`.
 #[test]
 fn a_report_across_a_handoff_has_every_row_and_no_chrome() {
@@ -671,7 +679,7 @@ fn a_repainted_session_keeps_its_ledger_and_archive_rows() {
 /// (`spawn::hydrate_adopted_engine`), which installed the control carry
 /// only beside a restored screen and dropped it here: `history` named
 /// `arch=<old origin>:<n>` marks that `offscreen` then read from the start
-/// of a fresh archive, and `aterm drive report` lost the turn's rows.
+/// of a fresh archive, and the report reader lost the turn's rows.
 #[test]
 fn a_receiver_degraded_screen_without_a_meta_keeps_its_archive_rows() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
@@ -853,7 +861,7 @@ fn the_proof_digests_do_not_see_the_sidecar() {
     // The foreground holder rides the record, and is in neither digest either.
     with.fg_holders = vec![(0, 4242)];
     // So does the render debt (R08).
-    with.render_debts = vec![(0, (-1, 0))];
+    with.render_debts = vec![(0, aterm_core::terminal::RenderDebt::of_rows(-1, 0))];
     let without = StageCarry {
         screens: with.screens.clone(),
         controls: Vec::new(),
@@ -999,16 +1007,21 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             // The render debt the parent's engine owed the alternate screen
             // (R08): a record scalar, so an old reader skips it.
             render_debt: Some("-1,0".to_string()),
+            render_debt_cut: 0,
             fabric: Default::default(),
             timeline_id: 0,
             log_ids: None,
             log_seq: 0,
             journal_key: None,
+            task: None,
+            status_seen: None,
         }],
         roster_seq: None,
         fabric_attached: Vec::new(),
+        fleet_told: Vec::new(),
         mirror_dropped: Vec::new(),
         mirror_served: false,
+        machine_names: Vec::new(),
     };
     let wire = new.to_toml().unwrap();
     assert!(new.roundtrips());
@@ -1094,10 +1107,14 @@ fn the_render_debt_crosses_the_handoff_and_only_onto_a_carried_alt_screen() {
         t.resize(ROWS - 1, COLS);
         t.process(b"\x1b[?1004h");
         t.resize(ROWS, COLS);
-        assert_eq!(t.render_debt(), (-1, 0), "the flap left a residue");
+        assert_eq!(
+            t.render_debt(),
+            aterm_core::terminal::RenderDebt::of_rows(-1, 0),
+            "the flap left a residue"
+        );
     }
     let mut with = outgoing(&term, &turns, None);
-    with.render_debts = vec![(0, (-1, 0))];
+    with.render_debts = vec![(0, aterm_core::terminal::RenderDebt::of_rows(-1, 0))];
     let without = StageCarry {
         screens: with.screens.clone(),
         controls: Vec::new(),
@@ -1109,18 +1126,28 @@ fn the_render_debt_crosses_the_handoff_and_only_onto_a_carried_alt_screen() {
     // The producer stamped it: the successor's adoption carries it.
     let staged = stage_carry_handoff("render-debt-with", &with);
     let adopted = as_successor(&staged, |_| take_incoming().adopted);
-    assert_eq!(adopted[0].render_debt, Some((-1, 0)));
+    assert_eq!(
+        adopted[0].render_debt,
+        Some(aterm_core::terminal::RenderDebt::of_rows(-1, 0))
+    );
     let (mut t, _, _) = adopt(&with.screens[0], None);
     assert_eq!(
         t.render_debt(),
-        (0, 0),
+        aterm_core::terminal::RenderDebt::default(),
         "a restored engine starts with none"
     );
-    let (shift, pushed) = adopted[0].render_debt.unwrap();
-    t.seed_render_debt(shift, pushed);
-    assert_eq!(t.render_debt(), (-1, 0), "seeded");
+    t.seed_render_debt(adopted[0].render_debt.unwrap());
+    assert_eq!(
+        t.render_debt(),
+        aterm_core::terminal::RenderDebt::of_rows(-1, 0),
+        "seeded"
+    );
     t.process(b"\x1b[2J");
-    assert_eq!(t.render_debt(), (0, 0), "the first full clear resets it");
+    assert_eq!(
+        t.render_debt(),
+        aterm_core::terminal::RenderDebt::default(),
+        "the first full clear resets it"
+    );
     staged.teardown();
 
     // A record without the key: nothing is carried (a debt-free predecessor,
@@ -1146,7 +1173,7 @@ fn the_render_debt_crosses_the_handoff_and_only_onto_a_carried_alt_screen() {
         controls: Vec::new(),
         next_turn_id: None,
         fg_holders: Vec::new(),
-        render_debts: vec![(0, (-1, 0))],
+        render_debts: vec![(0, aterm_core::terminal::RenderDebt::of_rows(-1, 0))],
     };
     let staged = stage_carry_handoff("render-debt-main", &main);
     let adopted = as_successor(&staged, |_| take_incoming().adopted);
@@ -1488,6 +1515,7 @@ fn history_rec(id: u64, carried: bool) -> TurnRecord {
         screen_hash: 1,
         seq: 1,
         arch: ArchMark::default(),
+        by: TurnBy::Ctl,
         carried,
     }
 }
@@ -1565,6 +1593,7 @@ fn history_on_a_halved_ledger_says_its_floor() {
     let mut halved = ControlCarry {
         turns: vec![history_rec(minted, true)],
         unheld_below: minted,
+        shed_below: 0,
         archive: None,
         log: None,
         log_mirror: None,
@@ -1639,6 +1668,7 @@ fn a_since_turn_resume_after_a_dropped_ledger_is_told_of_the_loss() {
     let mut halved = ControlCarry {
         turns: vec![history_rec(minted, true)],
         unheld_below: minted,
+        shed_below: 0,
         archive: None,
         log: None,
         log_mirror: None,
@@ -1717,6 +1747,7 @@ fn a_scroll_back_past_the_turns_marks_after_a_handoff_archives_nothing_twice() {
         screen_hash: 2,
         seq: pre.content_seq(),
         arch: arch41,
+        by: TurnBy::Ctl,
         carried: false,
     });
     let (term, turns) = (Arc::new(Mutex::new(pre)), Arc::new(Mutex::new(l)));
@@ -1927,9 +1958,9 @@ fn a_receiver_built_before_the_history_carry_skips_it_and_proves() {
 }
 
 /// THE HANDOFF FIXTURE GENERATOR: what this release's producer writes for
-/// every required desk and its rendezvous transport, `#[ignore]`d, run by the
-/// release cut (`tests/fixtures/handoff/README.md`). A child of this module, so
-/// it reuses the carry tests' helpers as they are.
+/// every required desk and its rendezvous transport. Ordinary tests exercise
+/// it in private child processes; the release cut supplies output destinations
+/// and its reserved build stamp (`tests/fixtures/handoff/README.md`).
 #[cfg(test)]
 #[path = "seamless_fixture_generator_tests.rs"]
 mod fixture_generator;

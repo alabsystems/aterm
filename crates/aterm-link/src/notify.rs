@@ -4,10 +4,10 @@
 //! **`aterm-link notify`** — the fabric's only push TO a human (§9.3, story A10).
 //!
 //! ```text
-//! aterm-link notify --fleet <F> --broker <ep> --cap-file <p>...
+//! aterm-link notify --fleet <F> --broker <socket> --cap-file <p>...
 //!                   --on <attention|ask:<person>|halt>,... --exec <cmd>
 //!                   [--rate <n>/<window>] [--state DIR] [--since head|start|<off>] [--once]
-//!                   [--exec-timeout <ms>] [--tcp [--key-file <p>]]
+//!                   [--exec-timeout <ms>]
 //! ```
 //!
 //! `ls` and `aterm fabric` are PULLS, so without this an `attention` raised on
@@ -110,7 +110,7 @@ use std::time::{Duration, Instant};
 use crate::body::Body;
 use crate::bridge::ACK_DEADLINE;
 use crate::subject::{is_fleet, is_principal};
-use crate::transport::{self, Backoff, Closer, Conn, Transport};
+use crate::transport::{self, Backoff, Closer, Conn};
 
 /// How many records one `Fetch` page asks for while catching up.
 ///
@@ -261,7 +261,7 @@ impl Sel {
             }
             Sel::Ask(p) => format!(
                 "`ro:/f/{fleet}/in/p/{p}/>`, which {p}'s own cap holds (`aterm fabric mint-for \
-                 {p} --out <cap>` on the host that holds the fleet's mint secret)"
+                 {p} --out <cap>` on this machine: its fabric root holds the mint secret)"
             ),
             Sel::Halt => format!("`ro:/f/{fleet}/fleet/>`, which node.cap holds"),
         }
@@ -518,11 +518,13 @@ impl Store {
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(value.as_bytes())?;
             f.write_all(b"\n")?;
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "aterm-link's flushes are the Ordered-tier work's to classify; the full flush is kept until then"
-            )]
-            f.sync_all()?;
+            if crate::state::flushes_media() {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "aterm-link's flushes are the Ordered-tier work's to classify; the full flush is kept until then"
+                )]
+                f.sync_all()?;
+            }
         }
         std::fs::rename(&tmp, &target)
     }
@@ -924,7 +926,6 @@ impl Fault {
 pub struct Config {
     pub fleet: String,
     pub broker: String,
-    pub transport: Transport,
     pub cap_files: Vec<String>,
     pub state_dir: String,
     pub on: Vec<Sel>,
@@ -992,8 +993,7 @@ impl Notifier {
     /// it bounded by [`ACK_DEADLINE`]: a wedged broker ends `--once` with an
     /// error, not a cron run that never exits.
     fn connect(&self) -> io::Result<Conn> {
-        let (mut conn, _closer) =
-            transport::connect(&self.cfg.transport, &self.cfg.broker, ACK_DEADLINE)?;
+        let (mut conn, _closer) = transport::connect(&self.cfg.broker, ACK_DEADLINE)?;
         transport::attach_cap_files(&mut conn, &self.cfg.cap_files)?;
         Ok(conn)
     }
@@ -1046,9 +1046,7 @@ impl Notifier {
             astream_broker::broker_refusal(e)
                 .is_some_and(astream_broker::BrokerRefusal::is_permanent)
         };
-        let Ok((mut conn, _closer)) =
-            transport::connect(&self.cfg.transport, &self.cfg.broker, ACK_DEADLINE)
-        else {
+        let Ok((mut conn, _closer)) = transport::connect(&self.cfg.broker, ACK_DEADLINE) else {
             return Ok(());
         };
         match transport::attach_cap_files(&mut conn, &self.cfg.cap_files) {
@@ -1543,7 +1541,7 @@ fn connect_for_reader(
     seen: &mut Option<u64>,
     seen_on: &mut Option<PathBuf>,
 ) -> io::Result<(Conn, Closer, u64, ReadLog)> {
-    let (mut conn, closer) = transport::connect(&cfg.transport, &cfg.broker, ACK_DEADLINE)?;
+    let (mut conn, closer) = transport::connect(&cfg.broker, ACK_DEADLINE)?;
     transport::attach_cap_files(&mut conn, &cfg.cap_files)?;
     // THE CURSOR IS THIS LOG'S ([`Store::for_log`]), and so is what this
     // thread forwarded: offsets read on another log name nothing here.
@@ -1607,7 +1605,7 @@ thread_local! {
 const USAGE: &str = "\
 aterm-link notify — run a command when the fabric needs a human
 
-  aterm-link notify --fleet <F> --broker <ep> --cap-file <path>...
+  aterm-link notify --fleet <F> --broker <socket> --cap-file <path>...
                     --on <attention|ask:<person>|halt>,... --exec <cmd> [options]
 
   --on <sel>,...         what is worth waking someone for; repeatable.
@@ -1623,8 +1621,6 @@ aterm-link notify — run a command when the fabric needs a human
   --once                 catch up to the head and exit, rather than following
   --exec-timeout <ms>    how long the command may run before it is killed (30000)
   --state <dir>          the state dir; the journal lives in <dir>/notify/
-  --tcp                  reach the broker over TCP — PLAINTEXT unless --key-file
-  --key-file <path>      the sealed wire's key (needs --tcp and a `sealed` build)
 
 The command runs once per matching offset, deduped across restarts, and for
 attention once per escalation: a session's row republished with the attention
@@ -1639,12 +1635,6 @@ the exec re-fires it with ATERM_NOTIFY_DUP=1: twice, never zero times.
 /// Never: every failure is an exit code and a line on stderr.
 #[must_use]
 pub fn main(args: &[String]) -> ExitCode {
-    // A build without the sealed wire refuses it by name, before the key file
-    // is read, rather than retrying a subscribe that can never succeed.
-    if let Some(refusal) = transport::sealed_flags_refusal(args) {
-        eprintln!("aterm-link notify: --key-file: {refusal}");
-        return ExitCode::from(2);
-    }
     let cfg = match parse(args) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -1684,13 +1674,12 @@ pub fn main(args: &[String]) -> ExitCode {
     }
 }
 
-/// Parse argv. Every flag takes a value except `--tcp` and `--once`; a flag
+/// Parse argv. Every flag takes a value except `--once`; a flag
 /// without one is a usage error rather than a silently defaulted setting.
 fn parse(args: &[String]) -> Result<Config, String> {
     let mut cfg = Config {
         fleet: String::new(),
         broker: String::new(),
-        transport: Transport::Unix,
         cap_files: Vec::new(),
         state_dir: String::new(),
         on: Vec::new(),
@@ -1701,8 +1690,6 @@ fn parse(args: &[String]) -> Result<Config, String> {
         once: false,
         exec_timeout: DEFAULT_EXEC_TIMEOUT,
     };
-    let mut tcp = false;
-    let mut key_file: Option<String> = None;
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         let mut value = || {
@@ -1713,8 +1700,6 @@ fn parse(args: &[String]) -> Result<Config, String> {
         match flag.as_str() {
             "--fleet" => cfg.fleet = value()?,
             "--broker" => cfg.broker = value()?,
-            "--tcp" => tcp = true,
-            "--key-file" => key_file = Some(value()?),
             "--cap-file" => cfg.cap_files.push(value()?),
             "--state" => cfg.state_dir = value()?,
             "--exec" => cfg.exec = value()?,
@@ -1766,11 +1751,6 @@ fn parse(args: &[String]) -> Result<Config, String> {
     if cfg.exec.is_empty() {
         return Err("--exec is required".to_string());
     }
-    cfg.transport = crate::cli::transport_from_flags(
-        tcp,
-        key_file,
-        "aterm-link notify: --tcp without --key-file is PLAINTEXT. Trusted networks only.",
-    )?;
     if cfg.state_dir.is_empty() {
         cfg.state_dir = crate::cli::default_state_dir();
     }
@@ -1904,7 +1884,6 @@ mod tests {
         Config {
             fleet: "f1".into(),
             broker: String::new(),
-            transport: Transport::Unix,
             cap_files: Vec::new(),
             state_dir: dir.to_string(),
             on: vec![Sel::Attention],
@@ -2364,12 +2343,10 @@ mod tests {
         let base = PathBuf::from(&dir);
         std::fs::create_dir_all(&base).expect("scratch");
         let serve = |name: &str| {
-            let broker = astream_broker::Broker::open(base.join(format!("{name}.log"))).unwrap();
+            let broker = crate::test_broker(base.join(format!("{name}.log"))).unwrap();
             let sock = base.join(format!("{name}.sock"));
             let handle = broker.serve(&sock).unwrap();
-            let (mut c, _) =
-                transport::connect(&Transport::Unix, &sock.to_string_lossy(), ACK_DEADLINE)
-                    .unwrap();
+            let (mut c, _) = transport::connect(&sock.to_string_lossy(), ACK_DEADLINE).unwrap();
             let (off, _) = c
                 .publish(
                     7,
@@ -2472,9 +2449,7 @@ mod tests {
             fired.display()
         );
         let escalate = |text: &str| {
-            let (mut conn, _) =
-                transport::connect(&Transport::Unix, &sock.to_string_lossy(), ACK_DEADLINE)
-                    .unwrap();
+            let (mut conn, _) = transport::connect(&sock.to_string_lossy(), ACK_DEADLINE).unwrap();
             // `help-<d>` publishes as sequence d + 1: one key per text.
             let seq = u64::from(text.as_bytes()[text.len() - 1] - b'0') + 1;
             let body = format!("v=1 t=1 attention={text}");
@@ -2776,8 +2751,7 @@ mod tests {
         }
     }
 
-    /// Argv: what is required, what defaults, and the key-without-`--tcp`
-    /// mistake `serve` also refuses.
+    /// Argv: what is required, what defaults, and a flag with no value.
     #[test]
     fn argv_requires_a_watch_and_a_command() {
         let args = |s: &str| -> Vec<String> { s.split(' ').map(str::to_string).collect() };
@@ -2806,7 +2780,6 @@ mod tests {
             parse(&args("--fleet f1 --broker b --on halt")).is_err(),
             "no --exec"
         );
-        assert!(parse(&args(&format!("{base} --on halt --key-file /dev/null"))).is_err());
         assert!(
             parse(&args(&format!("{base} --on halt --rate"))).is_err(),
             "a flag needs a value"

@@ -209,16 +209,18 @@ pub enum MonitorHandle {
     Wayland(wayland::MonitorHandle),
 }
 
-/// `x11_or_wayland!(match expr; Enum(foo) => foo.something())`
-/// expands to the equivalent of
-/// ```ignore
-/// match self {
+/// Dispatch over the three event-loop backends.
+/// `any_backend!(match expr; Enum(foo) => foo.something())` expands to this
+/// pseudocode, with X11 and Wayland arms included only when their backend is enabled:
+/// ```text
+/// match expr {
 ///    Enum::X(foo) => foo.something(),
 ///    Enum::Wayland(foo) => foo.something(),
+///    Enum::Headless(foo) => foo.something(),
 /// }
 /// ```
-/// The result can be converted to another enum by adding `; as AnotherEnum`
-/// Dispatch over the THREE loop backends. `x11_or_wayland!` stays as it is for the
+/// The result can be converted to another enum by adding `; as AnotherEnum`.
+/// `x11_or_wayland!` stays as it is for the
 /// window/monitor/device types, which a headless run never produces and which therefore
 /// have no headless variant to dispatch to; only the loop trio (`EventLoop`,
 /// `EventLoopProxy`, `ActiveEventLoop`) gained one, and only these sites may use this.
@@ -690,6 +692,9 @@ impl Window {
 pub struct KeyEventExtra {
     pub text_with_all_modifiers: Option<SmolStr>,
     pub key_without_modifiers: Key,
+    /// The press's text with Caps Lock off
+    /// (`KeyEventExtModifierSupplement::text_ignoring_lock`).
+    pub text_ignoring_lock: Option<SmolStr>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -811,11 +816,11 @@ impl<T: 'static> EventLoop<T> {
             // No backend is present.
             (_, wayland_display, x11_display) => {
                 let msg = if wayland_display && !cfg!(wayland_platform) {
-                    "DISPLAY is not set; note: enable the `winit/wayland` feature to support \
+                    "DISPLAY is not set; note: enable the `aterm-window/wayland` feature to support \
                      Wayland"
                 } else if x11_display && !cfg!(x11_platform) {
                     "neither WAYLAND_DISPLAY nor WAYLAND_SOCKET is set; note: enable the \
-                     `winit/x11` feature to support X11"
+                     `aterm-window/x11` feature to support X11"
                 } else {
                     "neither WAYLAND_DISPLAY nor WAYLAND_SOCKET nor DISPLAY is set."
                 };

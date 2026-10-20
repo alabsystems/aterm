@@ -599,6 +599,41 @@ mod tests {
         }
     }
 
+    /// A cell resolves `--offline` first; when that fails, one retry without
+    /// it resolves the cell and leaves a note, since the number may not
+    /// reproduce offline. The fake cargo (`sh` running the root's `tree`
+    /// script as the `tree` verb) refuses `--offline`, as an incomplete
+    /// registry cache does, and roots its graph at the `-p` it is given.
+    #[cfg(unix)]
+    #[test]
+    fn an_offline_miss_retries_online_once_and_notes_it() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("tree"),
+            "while [ $# -gt 0 ]; do\n\
+             case $1 in --offline) exit 101 ;; -p) pkg=$2 ;; esac\n\
+             shift\n\
+             done\n\
+             echo \"0$pkg v0.1.0\"\n",
+        )
+        .expect("fake tree");
+        let cell = Cell {
+            name: "mac-arm".into(),
+            triple: "aarch64-apple-darwin".into(),
+            package: "aterm".into(),
+        };
+        let mut log = String::new();
+        let (graph, _) = graph_and_paths(
+            &Cargo::pinned("/bin/sh", "/usr/bin:/bin"),
+            dir.path(),
+            &cell,
+            &mut log,
+        )
+        .expect("the online retry resolves the cell");
+        assert_eq!(graph.root, PkgId::new("aterm", "0.1.0"));
+        assert!(!log.is_empty(), "the online retry must be noted");
+    }
+
     const FIXTURE: &str = "\
 0root v0.1.0 (/w/crates/root)
 1alpha v1.0.0

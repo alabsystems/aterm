@@ -5,13 +5,15 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 // Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
-// Update IME handle imports and null context arguments for windows-sys 0.61.
+// Update IME handle imports and null context arguments for windows-sys 0.61. Read the
+// composition through `CompositionSource` and decide the IME messages' events in `ime_events`,
+// so a recorded composition can drive both.
 
 use std::ffi::{c_void, OsString};
 use std::os::windows::prelude::OsStringExt;
 use std::ptr::null_mut;
 
-use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows_sys::Win32::UI::Input::Ime::HIMC;
 use windows_sys::Win32::UI::Input::Ime::{
     ImmAssociateContextEx, ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext,
@@ -19,80 +21,199 @@ use windows_sys::Win32::UI::Input::Ime::{
     ATTR_TARGET_NOTCONVERTED, CANDIDATEFORM, CFS_EXCLUDE, CFS_POINT, COMPOSITIONFORM, GCS_COMPATTR,
     GCS_COMPSTR, GCS_CURSORPOS, GCS_RESULTSTR, IACE_CHILDREN, IACE_DEFAULT,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_IMMENABLED};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_IMMENABLED, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
+    WM_IME_STARTCOMPOSITION,
+};
 
 use crate::dpi::{Position, Size};
+use crate::event::Ime;
+use crate::platform_impl::platform::window_state::ImeState;
+
+/// LOCAL PATCH (aterm): what the IME handling reads from the window's input context, so a
+/// recorded composition can stand in for `ImmGetCompositionStringW` (`super::recorded`).
+pub(crate) trait CompositionSource {
+    /// `ImmGetCompositionStringW(gcs_mode)`'s bytes: `None` on an error, empty for nothing.
+    fn data(&self, gcs_mode: u32) -> Option<Vec<u8>>;
+    /// `ImmGetCompositionStringW(GCS_CURSORPOS)`: the caret, in UTF-16 units, negative on an
+    /// error.
+    fn cursor(&self) -> i32;
+}
+
+/// The composition being typed, and the range the IME targets in it (or its caret), in UTF-8
+/// byte offsets.
+pub(crate) fn composing_text_and_cursor(
+    source: &dyn CompositionSource,
+) -> Option<(String, Option<usize>, Option<usize>)> {
+    let text = composition_string(source, GCS_COMPSTR)?;
+    let attrs = source.data(GCS_COMPATTR).unwrap_or_default();
+
+    let mut first = None;
+    let mut last = None;
+    let mut boundary_before_char = 0;
+    let mut attr_idx = 0;
+
+    for chr in text.chars() {
+        let Some(attr) = attrs.get(attr_idx).copied() else {
+            break;
+        };
+
+        let char_is_targeted =
+            attr as u32 == ATTR_TARGET_CONVERTED || attr as u32 == ATTR_TARGET_NOTCONVERTED;
+
+        if first.is_none() && char_is_targeted {
+            first = Some(boundary_before_char);
+        } else if first.is_some() && last.is_none() && !char_is_targeted {
+            last = Some(boundary_before_char);
+        }
+
+        boundary_before_char += chr.len_utf8();
+        attr_idx += chr.len_utf16();
+    }
+
+    if first.is_some() && last.is_none() {
+        last = Some(text.len());
+    } else if first.is_none() {
+        // IME haven't split words and select any clause yet, so trying to retrieve normal
+        // cursor.
+        let cursor = source.cursor();
+        let cursor =
+            (cursor >= 0).then(|| text.chars().take(cursor as _).map(|c| c.len_utf8()).sum());
+        first = cursor;
+        last = cursor;
+    }
+
+    Some((text, first, last))
+}
+
+/// The text the IME committed.
+pub(crate) fn composed_text(source: &dyn CompositionSource) -> Option<String> {
+    composition_string(source, GCS_RESULTSTR)
+}
+
+fn composition_string(source: &dyn CompositionSource, gcs_mode: u32) -> Option<String> {
+    let data = source.data(gcs_mode)?;
+    // SAFETY: reinterpreting initialized bytes as `u16` is sound for every bit pattern;
+    // `align_to` hands back any unaligned head and tail, which refuse the string below.
+    let (prefix, shorts, suffix) = unsafe { data.align_to::<u16>() };
+    if prefix.is_empty() && suffix.is_empty() {
+        OsString::from_wide(shorts).into_string().ok()
+    } else {
+        None
+    }
+}
+
+/// LOCAL PATCH (aterm): the window's answer to an IME message (`WM_IME_STARTCOMPOSITION`,
+/// `WM_IME_COMPOSITION` with its `lparam`, `WM_IME_ENDCOMPOSITION`): the `Ime` events to send,
+/// in order, given whether IME is `allowed` for the window, with its IME `state` updated.
+/// `source` is read only where the composition is. Upstream's window-procedure arms, moved here
+/// unchanged so a recorded composition can drive them (`super::recorded`).
+pub(crate) fn ime_events(
+    msg: u32,
+    lparam: LPARAM,
+    allowed: bool,
+    state: &mut ImeState,
+    source: &dyn CompositionSource,
+) -> Vec<Ime> {
+    let mut events = Vec::new();
+    match msg {
+        WM_IME_STARTCOMPOSITION if allowed => {
+            *state = ImeState::Enabled;
+            events.push(Ime::Enabled);
+        },
+        // Windows Hangul IME sends WM_IME_COMPOSITION after WM_IME_ENDCOMPOSITION, so
+        // check whether composing.
+        WM_IME_COMPOSITION if allowed && *state != ImeState::Disabled => {
+            if lparam == 0 {
+                events.push(Ime::Preedit(String::new(), None));
+            }
+
+            // Google Japanese Input and ATOK have both flags, so
+            // first, receive composing result if exist.
+            if (lparam as u32 & GCS_RESULTSTR) != 0 {
+                if let Some(text) = composed_text(source) {
+                    *state = ImeState::Enabled;
+                    events.push(Ime::Preedit(String::new(), None));
+                    events.push(Ime::Commit(text));
+                }
+            }
+
+            // Next, receive preedit range for next composing if exist.
+            if (lparam as u32 & GCS_COMPSTR) != 0 {
+                if let Some((text, first, last)) = composing_text_and_cursor(source) {
+                    *state = ImeState::Preedit;
+                    let cursor_range = first.map(|f| (f, last.unwrap_or(f)));
+                    events.push(Ime::Preedit(text, cursor_range));
+                }
+            }
+        },
+        WM_IME_ENDCOMPOSITION if allowed || *state != ImeState::Disabled => {
+            if *state == ImeState::Preedit {
+                // Windows Hangul IME sends WM_IME_COMPOSITION after WM_IME_ENDCOMPOSITION, so
+                // trying receiving composing result and commit if exists.
+                if let Some(text) = composed_text(source) {
+                    events.push(Ime::Preedit(String::new(), None));
+                    events.push(Ime::Commit(text));
+                }
+            }
+            *state = ImeState::Disabled;
+            events.push(Ime::Disabled);
+        },
+        _ => {},
+    }
+    events
+}
 
 pub struct ImeContext {
     hwnd: HWND,
     himc: HIMC,
 }
 
+/// LOCAL PATCH (aterm): `window`'s input context, taken (`ImmGetContext`) only once the
+/// composition is read, as upstream's window procedure took it.
+pub(crate) struct LazyImeContext {
+    window: HWND,
+    context: std::cell::OnceCell<ImeContext>,
+}
+
+impl LazyImeContext {
+    pub(crate) fn new(window: HWND) -> Self {
+        Self { window, context: std::cell::OnceCell::new() }
+    }
+
+    fn context(&self) -> &ImeContext {
+        // SAFETY: `self.window` is the live window whose message is being handled.
+        self.context.get_or_init(|| unsafe { ImeContext::current(self.window) })
+    }
+}
+
+impl CompositionSource for LazyImeContext {
+    fn data(&self, gcs_mode: u32) -> Option<Vec<u8>> {
+        self.context().data(gcs_mode)
+    }
+
+    fn cursor(&self) -> i32 {
+        self.context().cursor()
+    }
+}
+
+impl CompositionSource for ImeContext {
+    fn data(&self, gcs_mode: u32) -> Option<Vec<u8>> {
+        // SAFETY: `self.himc` is the context `ImmGetContext` returned for `self.hwnd`, held
+        // until drop.
+        unsafe { self.get_composition_data(gcs_mode) }
+    }
+
+    fn cursor(&self) -> i32 {
+        // SAFETY: as above; a null buffer of length 0 asks for the caret alone.
+        unsafe { ImmGetCompositionStringW(self.himc, GCS_CURSORPOS, null_mut(), 0) }
+    }
+}
+
 impl ImeContext {
     pub unsafe fn current(hwnd: HWND) -> Self {
         let himc = unsafe { ImmGetContext(hwnd) };
         ImeContext { hwnd, himc }
-    }
-
-    pub unsafe fn get_composing_text_and_cursor(
-        &self,
-    ) -> Option<(String, Option<usize>, Option<usize>)> {
-        let text = unsafe { self.get_composition_string(GCS_COMPSTR) }?;
-        let attrs = unsafe { self.get_composition_data(GCS_COMPATTR) }.unwrap_or_default();
-
-        let mut first = None;
-        let mut last = None;
-        let mut boundary_before_char = 0;
-        let mut attr_idx = 0;
-
-        for chr in text.chars() {
-            let Some(attr) = attrs.get(attr_idx).copied() else {
-                break;
-            };
-
-            let char_is_targeted =
-                attr as u32 == ATTR_TARGET_CONVERTED || attr as u32 == ATTR_TARGET_NOTCONVERTED;
-
-            if first.is_none() && char_is_targeted {
-                first = Some(boundary_before_char);
-            } else if first.is_some() && last.is_none() && !char_is_targeted {
-                last = Some(boundary_before_char);
-            }
-
-            boundary_before_char += chr.len_utf8();
-            attr_idx += chr.len_utf16();
-        }
-
-        if first.is_some() && last.is_none() {
-            last = Some(text.len());
-        } else if first.is_none() {
-            // IME haven't split words and select any clause yet, so trying to retrieve normal
-            // cursor.
-            let cursor = unsafe { self.get_composition_cursor(&text) };
-            first = cursor;
-            last = cursor;
-        }
-
-        Some((text, first, last))
-    }
-
-    pub unsafe fn get_composed_text(&self) -> Option<String> {
-        unsafe { self.get_composition_string(GCS_RESULTSTR) }
-    }
-
-    unsafe fn get_composition_cursor(&self, text: &str) -> Option<usize> {
-        let cursor = unsafe { ImmGetCompositionStringW(self.himc, GCS_CURSORPOS, null_mut(), 0) };
-        (cursor >= 0).then(|| text.chars().take(cursor as _).map(|c| c.len_utf8()).sum())
-    }
-
-    unsafe fn get_composition_string(&self, gcs_mode: u32) -> Option<String> {
-        let data = unsafe { self.get_composition_data(gcs_mode) }?;
-        let (prefix, shorts, suffix) = unsafe { data.align_to::<u16>() };
-        if prefix.is_empty() && suffix.is_empty() {
-            OsString::from_wide(shorts).into_string().ok()
-        } else {
-            None
-        }
     }
 
     unsafe fn get_composition_data(&self, gcs_mode: u32) -> Option<Vec<u8>> {

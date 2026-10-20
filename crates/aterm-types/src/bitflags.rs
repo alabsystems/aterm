@@ -8,7 +8,7 @@
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
 /// aterm_types::bitflags! {
 ///     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 ///     pub struct Flags: u8 {
@@ -17,6 +17,8 @@
 ///         const AB = Self::A.bits() | Self::B.bits();
 ///     }
 /// }
+/// assert_eq!(Flags::AB, Flags::A | Flags::B);
+/// assert!(Flags::AB.contains(Flags::A));
 /// ```
 #[macro_export]
 macro_rules! bitflags {

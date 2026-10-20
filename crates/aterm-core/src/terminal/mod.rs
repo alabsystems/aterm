@@ -19,6 +19,7 @@ mod builder;
 mod callback_setters;
 mod callbacks;
 mod checkpoint;
+mod checkpoint_holder;
 mod checkpoint_output;
 #[cfg(feature = "serde")]
 mod checkpoint_parser;
@@ -48,6 +49,10 @@ mod handler_window;
 mod handler_xtgettcap;
 mod handler_xtsmgraphics;
 mod history_carry;
+mod holder_fence;
+/// Tier-1 conformance of the holder fence to `HolderFence`.
+#[cfg(test)]
+mod holder_fence_conformance;
 pub(crate) mod host_traits;
 pub(crate) mod hyperlink_auth;
 /// Inline-image survival across a width-changing reflow (see its module docs).
@@ -145,18 +150,24 @@ pub use checkpoint::{CHECKPOINT_META_REQUIRED_KEYS, CheckpointMeta};
 pub use checkpoint::{
     GridCursorRepr, ShellIntegrationNonce, ShellIntegrationPosture, StyleRepr, TerminalCheckpoint,
 };
+pub use checkpoint_holder::{
+    HolderAnchorRepr, HolderMarkRepr, HolderRepr, HolderSealRepr, HolderSpanRepr,
+};
 pub use checkpoint_output::{
     HyperlinkRepr, OutputStateRepr, SavedModeRepr, SgrPushRepr, Vt52AddressRepr,
 };
 #[cfg(feature = "serde")]
 pub use checkpoint_parser::ParserRepr;
 pub use checkpoint_state::{
-    ColorOverridesRepr, ColorRepr, ColorSlotRepr, ColorStackEntryRepr, OutputBlockRepr,
-    PaletteOverrideRepr, ShellRepr, ShellSpanRepr, TitleRepr,
+    ColorOverridesRepr, ColorRepr, ColorSlotRepr, ColorStackEntryRepr, CwdReportRepr,
+    OutputBlockRepr, PaletteOverrideRepr, ShellRepr, ShellSpanRepr, TitleRepr,
 };
 pub use clipboard_auth::ClipboardAccess;
 pub use custody::CustodyTransition;
 pub use foreground_handback::{ForegroundHandback, evidence as program_evidence};
+pub use holder_fence::{
+    CutKind, HolderAdoption, HolderCut, HolderFence, HolderView, MAX_HOLDER_MARKS, MAX_HOLDER_SPANS,
+};
 pub use mode_mirror::ModeMirror;
 pub use observe::{
     RowMatch, RowRange, RowVerdict, Satisfaction, SurfaceSource, WatchId, WatcherSet, WatcherSpec,
@@ -166,7 +177,7 @@ pub use observe::{
 // feed a fixed clock and get bit-deterministic state.
 pub use processing::{ClockReading, KittyAnimationStep};
 pub use render_cells::{RenderCell, Script, UnderlineStyle};
-pub use resize_journal::{RESIZE_JOURNAL_CAP, ResizeReport};
+pub use resize_journal::{RESIZE_JOURNAL_CAP, RenderDebt, ResizeReport};
 pub use search_budgeted::{BudgetedSearchError, BudgetedSearchStep};
 pub use search_rows::history_line_text_cells;
 pub use selection::smart_word_in_cells;

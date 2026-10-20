@@ -1547,9 +1547,13 @@ fn mouse_button(event: Id) -> MouseButton {
 /// key types without Option, Shift kept); its type, location, modifier flags, timestamp, window,
 /// repeat flag and key code are the original's. `-interpretKeyEvents:` then has no Option glyph
 /// to insert, and `create_key_event` reads the layout's character as the key event's text
-/// (German Option+Shift+2 is `"`), while the flags still report Alt. Whether AppKit's input
-/// method also leaves a dead key (Option+e on the U.S. layout) uncomposed is the windowed IME
-/// drive's to measure (`crates/aterm-gui/examples/objc_ime_drive.rs`, stage 8).
+/// (German Option+Shift+2 is `"`), while the flags still report Alt. That AppKit's input method
+/// then leaves a dead key (Option+e on the U.S. layout) uncomposed is measured by the windowed IME
+/// drive (`crates/aterm-gui/examples/objc_ime_drive.rs`, stage 8, against stage 7's composing
+/// control; `docs/measured/desk-appkit-2026-10-19.md`). What keeps it uncomposed is the rebuild
+/// itself, not the characters it substitutes: on macOS 27 an Option+e built by
+/// `+keyEventWithType:…` with the dead key's `´` as its characters composed nothing, even in the
+/// active app's key window, while the same key built from a CGEvent composed.
 ///
 /// LOCAL PATCH (aterm), 2026-10-16 (ATERM-KI-1015-9): upstream's `replace_event`, which winit-core
 /// step 5 (2026-10-15) had cut with `OptionAsAlt`, restored. Upstream rebuilt any event; this one

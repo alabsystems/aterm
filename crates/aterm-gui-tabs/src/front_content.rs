@@ -57,6 +57,16 @@ impl FrontContent {
             Self::Native { .. } => None,
         }
     }
+
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Terminal { .. })
+    }
+
+    #[must_use]
+    pub const fn is_native(self) -> bool {
+        matches!(self, Self::Native { .. })
+    }
 }
 
 /// Handles for the focused terminal leaf only.
@@ -90,6 +100,21 @@ pub enum WindowFocus {
     Content(ViewId),
 }
 
+impl WindowFocus {
+    #[must_use]
+    pub const fn is_host(self) -> bool {
+        matches!(self, Self::Host)
+    }
+
+    #[must_use]
+    pub const fn focused_view(self) -> Option<ViewId> {
+        match self {
+            Self::Host => None,
+            Self::Content(v) => Some(v),
+        }
+    }
+}
+
 /// Explicit native-view lifecycle. Only adjacent, forward transitions are
 /// accepted; stale async work cannot remount a closing or closed view.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -103,19 +128,79 @@ pub enum ViewLifecycle {
 }
 
 impl ViewLifecycle {
-    pub fn transition(&mut self, next: Self) -> bool {
-        let allowed = matches!(
-            (*self, next),
+    #[must_use]
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
             (Self::Created, Self::Mounted)
                 | (Self::Mounted, Self::Suspended | Self::Closing)
                 | (Self::Suspended, Self::Mounted | Self::Closing)
                 | (Self::Closing, Self::Closed)
-        );
+        )
+    }
+
+    #[must_use]
+    pub const fn is_terminal_state(self) -> bool {
+        matches!(self, Self::Closed)
+    }
+
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Mounted | Self::Suspended)
+    }
+
+    pub const fn transition(&mut self, next: Self) -> bool {
+        let allowed = self.can_transition_to(next);
         if allowed {
             *self = next;
         }
         allowed
     }
+}
+
+/// Encode a `(tab_id, view_id)` pair into 16 little-endian bytes.
+#[must_use]
+pub const fn encode_tab_view_pair_le(tab_id: u64, view_id: u64) -> [u8; 16] {
+    [
+        tab_id as u8,
+        (tab_id >> 8) as u8,
+        (tab_id >> 16) as u8,
+        (tab_id >> 24) as u8,
+        (tab_id >> 32) as u8,
+        (tab_id >> 40) as u8,
+        (tab_id >> 48) as u8,
+        (tab_id >> 56) as u8,
+        view_id as u8,
+        (view_id >> 8) as u8,
+        (view_id >> 16) as u8,
+        (view_id >> 24) as u8,
+        (view_id >> 32) as u8,
+        (view_id >> 40) as u8,
+        (view_id >> 48) as u8,
+        (view_id >> 56) as u8,
+    ]
+}
+
+/// Decode 16 little-endian bytes into a `(tab_id, view_id)` pair.
+#[must_use]
+pub const fn decode_tab_view_pair_le(bytes: [u8; 16]) -> (u64, u64) {
+    let tab_id = (bytes[0] as u64)
+        | ((bytes[1] as u64) << 8)
+        | ((bytes[2] as u64) << 16)
+        | ((bytes[3] as u64) << 24)
+        | ((bytes[4] as u64) << 32)
+        | ((bytes[5] as u64) << 40)
+        | ((bytes[6] as u64) << 48)
+        | ((bytes[7] as u64) << 56);
+    let view_id = (bytes[8] as u64)
+        | ((bytes[9] as u64) << 8)
+        | ((bytes[10] as u64) << 16)
+        | ((bytes[11] as u64) << 24)
+        | ((bytes[12] as u64) << 32)
+        | ((bytes[13] as u64) << 40)
+        | ((bytes[14] as u64) << 48)
+        | ((bytes[15] as u64) << 56);
+    (tab_id, view_id)
 }
 
 #[cfg(test)]
@@ -126,11 +211,15 @@ mod tests {
     fn lifecycle_is_forward_only_and_suspend_is_reversible() {
         let mut state = ViewLifecycle::Created;
         assert!(state.transition(ViewLifecycle::Mounted));
+        assert!(state.is_active());
         assert!(state.transition(ViewLifecycle::Suspended));
         assert!(state.transition(ViewLifecycle::Mounted));
         assert!(state.transition(ViewLifecycle::Closing));
         assert!(!state.transition(ViewLifecycle::Mounted));
         assert!(state.transition(ViewLifecycle::Closed));
+        assert!(state.is_terminal_state());
         assert!(!state.transition(ViewLifecycle::Created));
+        let pair = encode_tab_view_pair_le(11, 22);
+        assert_eq!(decode_tab_view_pair_le(pair), (11, 22));
     }
 }

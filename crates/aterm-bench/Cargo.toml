@@ -17,6 +17,22 @@ aterm-grid = { workspace = true }
 aterm-zstd = { workspace = true }
 # The crash-restore harness (the `crash-restore` lane): the journal's writer and recovery.
 aterm-restore = { workspace = true }
+# The effects harness (the `effects` lane): the harness card and cursor glow emitters, the CPU
+# rasterizer and the GPU presenter with its GPU clock.
+aterm-effects = { workspace = true }
+aterm-gpu = { workspace = true }
+aterm-render = { workspace = true }
+# The effects harness declares its thread user-interactive, the QoS the app's render thread has.
+aterm-pty = { workspace = true }
+# ...and reads the thread's CPU clock and the process's instructions retired (the effects lane's
+# measure of CPU work).
+libc = { workspace = true }
+
+[features]
+# The effects harness's pass-economy ablation (`GpuRenderer::set_unorm_ablation`) is a
+# development seam: the `effects` lane names this on its command line for its `--release` run
+# (a debug build has the seam anyway). No dependency's manifest turns it on.
+dev-seams = ["aterm-gpu/dev-seams"]
 
 [lints]
 workspace = true

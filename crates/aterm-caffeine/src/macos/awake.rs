@@ -1,0 +1,136 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! Keeping the Mac awake: an `NSProcessInfo` activity that disables idle system and display
+//! sleep while it lives.
+//!
+//! Measured 2026-10-19: these options make powerd list `PreventUserIdleSystemSleep` and
+//! `PreventUserIdleDisplaySleep` under this pid (`pmset -g assertions`), and `-endActivity:`
+//! drops both. The kernel drops them too when the process dies, so a crash or a `SIGTERM`
+//! never leaves the Mac held awake. Foundation only: no WindowServer, no IOKit.
+
+use aterm_objc::send::{send_id, send_id_usize_id, send_v_id};
+use aterm_objc::{Id, Obj, autoreleasepool, class, sel};
+
+/// `NSActivityIdleDisplaySleepDisabled` (`NSProcessInfo.h`, `1ULL << 40`).
+const IDLE_DISPLAY_SLEEP_DISABLED: usize = 1 << 40;
+/// `NSActivityUserInitiated` (`0x00FFFFFF | NSActivityIdleSystemSleepDisabled`): includes
+/// `NSActivityIdleSystemSleepDisabled` (`1 << 20`) and keeps App Nap away.
+const USER_INITIATED: usize = 0x00FF_FFFF;
+/// What the mug asks for.
+const OPTIONS: usize = IDLE_DISPLAY_SLEEP_DISABLED | USER_INITIATED;
+
+/// A held keep-awake activity; dropping it ends the activity.
+pub(super) struct Awake {
+    /// The activity token `-beginActivityWithOptions:reason:` answered, retained.
+    token: Obj,
+}
+
+impl Awake {
+    /// Begin keeping the Mac awake, `reason` being what `pmset -g assertions` names it by.
+    /// `None` when Foundation refuses.
+    pub(super) fn begin(reason: &str) -> Option<Self> {
+        let reason = aterm_objc::ns_string(reason)?;
+        autoreleasepool(|_| {
+            // SAFETY: `+processInfo` is `@16@0:8`, a shared instance;
+            // `-beginActivityWithOptions:reason:` is `@32@0:8Q16@24` and answers the
+            // activity token at +0, retained here (the activity lasts while it lives and
+            // until `-endActivity:`). `reason` is a live NSString the call copies.
+            unsafe {
+                let info = process_info();
+                if info.is_null() {
+                    return None;
+                }
+                let token = send_id_usize_id(
+                    info,
+                    sel!(beginActivityWithOptions:reason:),
+                    OPTIONS,
+                    reason.id(),
+                );
+                Obj::retain(token).map(|token| Self { token })
+            }
+        })
+    }
+}
+
+impl Drop for Awake {
+    fn drop(&mut self) {
+        autoreleasepool(|_| {
+            // SAFETY: `-endActivity:` is `v24@0:8@16`, handed the token its own
+            // `-beginActivityWithOptions:reason:` answered; the token is released after.
+            unsafe {
+                let info = process_info();
+                if !info.is_null() {
+                    send_v_id(info, sel!(endActivity:), self.token.id());
+                }
+            }
+        });
+    }
+}
+
+/// `[NSProcessInfo processInfo]`, +0.
+///
+/// # Safety
+/// Inside an autorelease pool.
+unsafe fn process_info() -> Id {
+    // SAFETY: `+processInfo` is `@16@0:8` on a class Foundation always registers.
+    unsafe { send_id(class(c"NSProcessInfo").as_id(), sel!(processInfo)) }
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+
+    #[test]
+    fn the_options_are_display_and_system_sleep_off_user_initiated() {
+        assert_eq!(OPTIONS, 0x100_00FF_FFFF);
+        // `NSActivityIdleSystemSleepDisabled` is inside `NSActivityUserInitiated`.
+        assert_ne!(OPTIONS & (1 << 20), 0);
+    }
+
+    #[test]
+    fn an_activity_begins_and_ends() {
+        let first = Awake::begin("aterm caffeine test").expect("begin");
+        let second = Awake::begin("aterm caffeine test").expect("begin");
+        assert_ne!(first.token.id(), second.token.id());
+        drop(first);
+        drop(second);
+    }
+
+    /// The assertion types `pmset -g assertions` lists under this pid named `reason`.
+    pub(crate) fn assertions_named(reason: &str) -> Vec<String> {
+        let out = aterm_uds::spawnfd::command("/usr/bin/pmset")
+            .args(["-g", "assertions"])
+            .output()
+            .expect("pmset");
+        assert!(out.status.success(), "pmset: {:?}", out.status);
+        let owner = format!("pid {}(", std::process::id());
+        let named = format!("named: \"{reason}\"");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains(&owner) && l.contains(&named))
+            .filter_map(|l| l.split("] ").nth(1))
+            .filter_map(|rest| rest.split_whitespace().nth(1))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// What the mug is for, read from powerd: both idle-sleep assertions under this pid
+    /// while the activity is held, none once it ended. Run 90 times on 2026-10-19 (alone, and
+    /// beside the crate's other tests) with no failure: `pmset`, run right after the
+    /// begin or the end returns, showed the state it left every time.
+    #[test]
+    fn powerd_lists_both_assertions_while_held_and_none_after() {
+        let reason = format!("aterm caffeine pmset test {}", std::process::id());
+        let held = Awake::begin(&reason).expect("begin");
+        let mut while_held = assertions_named(&reason);
+        while_held.sort();
+        drop(held);
+        let after = assertions_named(&reason);
+        assert_eq!(
+            while_held,
+            ["PreventUserIdleDisplaySleep", "PreventUserIdleSystemSleep"]
+        );
+        assert_eq!(after, Vec::<String>::new());
+    }
+}

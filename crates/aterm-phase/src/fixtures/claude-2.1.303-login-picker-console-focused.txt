@@ -1,0 +1,23 @@
+# claude-code 2.1.303 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the /login picker, its focus moved onto Console, 2.1.303
+ ▐▛███▛█   Claude Code v2.1.303
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.pCwf/proj
+
+
+❯ hi
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ /login
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Login
+
+  Claude Code can be used with your Claude subscription or billed based on API usage through your Console account.
+
+  Select login method:
+
+    1. Claude account with subscription · Pro, Max, Team, or Enterprise
+  ❯ 2. Anthropic Console account · API usage billing
+    3. 3rd-party platform · Amazon Bedrock, Microsoft Foundry, Google Vertex AI
+
+  Esc to cancel

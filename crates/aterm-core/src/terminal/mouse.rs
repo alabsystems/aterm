@@ -22,6 +22,36 @@ pub(crate) struct MouseReportMemo {
     y: u16,
 }
 
+/// Whether tracking mode `mode` reports a pointer motion with `button` held
+/// (`3`: none held): button-event tracking (DEC 1002) while a button is
+/// held, any-event tracking (1003) always, and never X10 (9), normal (1000)
+/// or none. The one rule [`Terminal::encode_mouse_motion`] encodes by and the
+/// lock-free mirror answers ([`super::ModeMirror::reports_motion`]), so a
+/// host that asks the mirror whether a drag reaches the program is told what
+/// the encoder will do (its per-cell deduplication aside).
+pub(crate) const fn motion_reported(mode: MouseMode, button: u8) -> bool {
+    match mode {
+        MouseMode::ButtonEvent => button != 3,
+        MouseMode::AnyEvent => true,
+        // None, X10, Normal, and a variant added later: not reported.
+        _ => false,
+    }
+}
+
+/// Whether tracking mode `mode` reports a wheel notch (xterm buttons 4-7):
+/// every tracking mode but X10 (9), which reports presses only, and never
+/// none. The one rule [`Terminal::encode_mouse_wheel`] encodes by and the
+/// lock-free mirror answers ([`super::ModeMirror::reports_wheel`]), so a host
+/// that asks the mirror whether a wheel on the report route reaches the
+/// program is told what the encoder will do.
+pub(crate) const fn wheel_reported(mode: MouseMode) -> bool {
+    match mode {
+        MouseMode::Normal | MouseMode::ButtonEvent | MouseMode::AnyEvent => true,
+        // None, X10, and a variant added later: not reported.
+        _ => false,
+    }
+}
+
 impl Terminal {
     /// Whether a motion report carrying `(x, y)` would only repeat the last report's position,
     /// and so is not to be sent. xterm's DEC 1002/1003 report motion "only if the mouse pointer
@@ -111,15 +141,8 @@ impl Terminal {
         row: u16,
         modifiers: u8,
     ) -> Option<Vec<u8>> {
-        match self.modes.mouse_mode {
-            MouseMode::None | MouseMode::X10 | MouseMode::Normal => return None,
-            MouseMode::ButtonEvent => {
-                if button == 3 {
-                    return None;
-                }
-            }
-            MouseMode::AnyEvent => {}
-            _ => return None, // future variants default to no-op
+        if !motion_reported(self.modes.mouse_mode, button) {
+            return None;
         }
 
         // Motion events have bit 32 set
@@ -141,7 +164,7 @@ impl Terminal {
         modifiers: u8,
     ) -> Option<Vec<u8>> {
         // X10 mode (9) is press-only — no wheel events.
-        if self.modes.mouse_mode == MouseMode::None || self.modes.mouse_mode == MouseMode::X10 {
+        if !wheel_reported(self.modes.mouse_mode) {
             return None;
         }
 

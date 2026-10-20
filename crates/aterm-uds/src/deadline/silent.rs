@@ -2,82 +2,66 @@
 // Copyright 2026 Andrew Yates
 
 //! Test support (test and debug builds, never release ones): whether a macOS service a test
-//! needs answers.
+//! needs answers, and the end of a test that needs one that does not.
 //!
 //! * [`trust_service_silent`] asks once per process, through the shipped [`super::TRUST`]
 //!   gate: one `SecStaticCodeCheckValidity` of the Apple-signed `/usr/bin/true`, whose chain
 //!   `trustd` evaluates. It hangs exactly while `trustd` is wedged (else about 0.24 s); only
 //!   whether there is a verdict matters. A silent service costs the first ask
 //!   [`PROBE_DEADLINE`], and from then on every call through the gate is refused at once.
-//! * [`disk_image_service_silent`] judges an `hdiutil` run the test already made.
-//! * [`notice_once`] prints the skip line.
+//! * [`require_trust_service`] ends the calling test COULD NOT RUN on that silence, and
+//!   [`require_disk_image_service`] on an `hdiutil` run the test made that timed out.
 //!
-//! Only silence skips: any other probe failure is an answer, and the tests run.
+//! Only silence refuses: any other probe failure is an answer, and the tests run.
 
-use std::io::Write as _;
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use super::{Refused, TRUST};
-
-// `SKIPPED` and `DISK_IMAGE_SKIPPED`: their own file, which aterm-verify includes too.
-include!("skipped.rs");
+use crate::host::could_not_run;
 
 /// How long the probe waits for `trustd`: about a hundred times its honest answer, and half a
 /// test's one-minute hang detector.
 pub const PROBE_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Prints `line` once per test binary straight to stderr: libtest discards a passing test's
-/// captured `eprintln!`, and a skipped test passes.
-pub fn notice_once(line: &'static str) {
-    static SAID: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
-    #[cfg(test)]
-    ASKED.with(|n| n.set(n.get() + 1));
-    let mut said = SAID.lock().unwrap_or_else(PoisonError::into_inner);
-    if !said.contains(&line) {
-        said.push(line);
-        let _ = writeln!(std::io::stderr(), "{line}");
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    /// How many notices this thread asked [`notice_once`] for, printed or not.
-    static ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// `true`, after [`notice_once`] of [`SKIPPED`], when macOS's `trustd` does
-/// not answer; the caller then returns without asserting anything. Always
-/// `false` off Apple platforms.
+/// Whether macOS's `trustd` does not answer (asked once per process). Always `false` off
+/// Apple platforms. A test that needs it calls [`require_trust_service`].
 #[must_use]
 pub fn trust_service_silent() -> bool {
     static SILENT: OnceLock<bool> = OnceLock::new();
-    let silent = *SILENT.get_or_init(|| {
+    *SILENT.get_or_init(|| {
         cfg!(target_vendor = "apple")
             && TRUST.run(PROBE_DEADLINE, PROBE_DEADLINE, probe) == Err(Refused::Unanswered)
-    });
-    if silent {
-        notice_once(SKIPPED);
-    }
-    silent
+    })
 }
 
-/// `true`, after [`notice_once`] of [`DISK_IMAGE_SKIPPED`], when `out` is an `hdiutil` run that
-/// failed with `Operation timed out` (a wedged disk-image service, after about 121 s); the
-/// caller then returns without asserting anything. Any other failure is an answer.
-#[must_use]
-pub fn disk_image_service_silent(out: &std::process::Output) -> bool {
-    let silent = timed_out(out);
-    if silent {
-        notice_once(DISK_IMAGE_SKIPPED);
+/// End the calling test COULD NOT RUN when macOS's `trustd` does not answer
+/// ([`trust_service_silent`]): every code-signing and TLS check waits on it, so the silence
+/// is the machine's, not the code's.
+#[track_caller]
+pub fn require_trust_service() {
+    if trust_service_silent() {
+        could_not_run(
+            "macOS's trust service (trustd) did not answer, so no code-signing or TLS check \
+             ran here; rebooting the Mac clears a wedged trustd",
+        );
     }
-    silent
 }
 
-/// [`disk_image_service_silent`]'s judgment without its notice. Tests of the judgment call
-/// this: the notice is the line `verify test` counts as a host skip (aterm-verify
-/// `libtest::host_skips`), so printing it for a made-up run reports a skip, and stops a
-/// `verify release` as COULD NOT RUN, on a host whose service answers.
+/// End the calling test COULD NOT RUN when `out` is an `hdiutil` run that failed with
+/// `Operation timed out` (a wedged disk-image service, after about 121 s). Any other
+/// failure is an answer, and returns.
+#[track_caller]
+pub fn require_disk_image_service(out: &std::process::Output) {
+    if timed_out(out) {
+        could_not_run(
+            "macOS's disk-image service (hdiutil) did not answer, so no disk-image check ran \
+             here; rebooting the Mac clears a wedged disk-image service",
+        );
+    }
+}
+
+/// Whether `out` is a failed `hdiutil` run that timed out.
 fn timed_out(out: &std::process::Output) -> bool {
     !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("Operation timed out")
 }
@@ -87,7 +71,9 @@ pub const CODESIGN_HANG: Duration = Duration::from_secs(60);
 
 /// Sign `path` ad hoc (`codesign --force --sign -`), as a test does to a copy of an Apple
 /// binary so the kernel lets it run off the system volume. Under [`CODESIGN_HANG`]; ask
-/// [`trust_service_silent`] first. Panics, naming why, unless it signed.
+/// [`require_trust_service`] first. Panics, naming why (codesign's exit status, a signal
+/// among them, and its stderr), unless it signed.
+#[track_caller]
 pub fn sign_ad_hoc(path: &std::path::Path) {
     let out = super::output_until(
         crate::spawnfd::command("/usr/bin/codesign")
@@ -95,13 +81,32 @@ pub fn sign_ad_hoc(path: &std::path::Path) {
             .arg(path),
         std::time::Instant::now() + CODESIGN_HANG,
     )
-    .unwrap_or_else(|e| panic!("codesign {}: {e}", path.display()));
+    .unwrap_or_else(|e| panic!("codesign --force --sign - {}: {e}", path.display()));
     assert!(
         out.status.success(),
-        "codesign {}: {}",
+        "codesign --force --sign - {}: {}: {}",
         path.display(),
+        out.status,
         String::from_utf8_lossy(&out.stderr).trim()
     );
+}
+
+/// Copy the Apple binary `from` to `to` and sign the copy ad hoc ([`sign_ad_hoc`]): a test's
+/// stand-in that runs off the system volume under its own identity (the kernel kills a copy
+/// that keeps Apple's signature, and hides a platform binary's environment from other
+/// processes). Re-signing reads the copy's Apple signature through `trustd`, so
+/// [`require_trust_service`] is asked first. Off Apple platforms the copy is all. Panics,
+/// naming why, unless the copy is made and signed.
+#[track_caller]
+pub fn ad_hoc_copy(from: &std::path::Path, to: &std::path::Path) {
+    if cfg!(target_vendor = "apple") {
+        require_trust_service();
+    }
+    std::fs::copy(from, to)
+        .unwrap_or_else(|e| panic!("copy {} to {}: {e}", from.display(), to.display()));
+    if cfg!(target_vendor = "apple") {
+        sign_ad_hoc(to);
+    }
 }
 
 /// One certificate-chained code check; its verdict is discarded.
@@ -173,9 +178,7 @@ mod tests {
     /// Only a failed run that timed out is the service's silence.
     #[test]
     fn only_a_timed_out_failure_is_a_silent_disk_image_service() {
-        // The judgment alone: `disk_image_service_silent` would print the skip line.
         use super::timed_out as silent;
-        let asked = super::ASKED.with(std::cell::Cell::get);
         assert!(silent(&run(
             1,
             "hdiutil: create failed - Operation timed out\n"
@@ -186,11 +189,19 @@ mod tests {
         )));
         assert!(!silent(&run(1, "")));
         assert!(!silent(&run(0, "Operation timed out\n")));
-        assert_eq!(
-            super::ASKED.with(std::cell::Cell::get),
-            asked,
-            "the judgment asked for the skip line: the gate would count a made-up run as a \
-             host check this binary skipped"
-        );
+    }
+
+    /// The silence ends the test COULD NOT RUN; an answer returns.
+    #[test]
+    fn a_silent_disk_image_service_ends_the_test_could_not_run() {
+        super::require_disk_image_service(&run(1, "hdiutil: No space left on device\n"));
+        let refused = std::panic::catch_unwind(|| {
+            super::require_disk_image_service(&run(1, "hdiutil: Operation timed out\n"));
+        })
+        .expect_err("a timed-out run ends the test");
+        let why = refused
+            .downcast_ref::<String>()
+            .expect("could_not_run panics with its words");
+        assert!(why.starts_with(crate::host::COULD_NOT_RUN), "{why}");
     }
 }

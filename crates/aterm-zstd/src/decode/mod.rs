@@ -380,18 +380,4 @@ mod tests {
         );
         assert!(decoder.read(&mut buf).is_err(), "the stream stays failed");
     }
-
-    #[test]
-    fn require_checksum_reads_a_checksummed_stream_whole() {
-        let mut zst = Vec::new();
-        frame::write_raw(&mut zst, b"one", Checksum::Xxh64).unwrap();
-        frame::write_raw(&mut zst, b"", Checksum::Xxh64).unwrap();
-        frame::write_raw(&mut zst, b"two", Checksum::Xxh64).unwrap();
-        let mut out = Vec::new();
-        Decoder::new(&zst[..])
-            .require_checksum()
-            .read_to_end(&mut out)
-            .unwrap();
-        assert_eq!(out, b"onetwo");
-    }
 }

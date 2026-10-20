@@ -554,3 +554,96 @@ fn bloom_halo_follows_a_gradient_quad_s_ramp() {
         }
     }
 }
+
+/// THE CPU BLOOM IS THE GPU'S: a frame the CPU renderer draws and blooms
+/// through `aterm_render::bloom::apply` matches the GPU's bloom pass on the
+/// same input (a comet-like strip, a thin hairline that takes the half-res
+/// stability copy, and a gradient quad), within a level of float rounding
+/// per channel, and adds the same light in total. NEGATIVE CONTROL: the twin
+/// at half the strength misses the GPU frame.
+#[test]
+fn cpu_bloom_twin_matches_the_gpu_bloom() {
+    let theme = Theme::default();
+    let (rows, cols) = (8usize, 40usize);
+    let (mut cpu, mut gpu) = backends(18.0, theme);
+    let (cw, ch) = cpu.cell_size();
+    let mut win = aterm_gpu::WindowGpu::new();
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    let mut input = term.cell_frame(rows, cols);
+    input.cursor_visible = false;
+    input.cursor_glow_add = vec![
+        GlowQuad::flat(
+            3,
+            (4 * cw) as u16,
+            (3 * ch) as u16,
+            (10 * cw) as u16,
+            (ch / 2) as u16,
+            0x0060_A0E0,
+            0,
+        ),
+        GlowQuad::flat(
+            3,
+            (16 * cw) as u16,
+            (3 * ch) as u16,
+            1,
+            ch as u16,
+            0x00F0_F0F0,
+            0,
+        ),
+        GlowQuad::gradient(
+            5,
+            (20 * cw) as u16,
+            (5 * ch) as u16,
+            (12 * cw) as u16,
+            ch as u16,
+            0x00E0_2000,
+            0,
+            0x0000_20E0,
+            0,
+        ),
+    ];
+    let params = aterm_render::bloom::BloomParams::default();
+    gpu.set_bloom(true);
+    gpu.set_bloom_params(params.strength, params.radius);
+    let lit = gpu.render_input(&mut win, &input, None);
+    gpu.set_bloom(false);
+    let base = cpu.render_input(&input);
+    let twin = |strength: f32| {
+        let mut frame = base.clone();
+        aterm_render::bloom::apply(
+            &mut frame,
+            &input.cursor_glow_add,
+            rows,
+            aterm_render::bloom::BloomParams { strength, ..params },
+        )
+        .unwrap();
+        frame
+    };
+    let energy = |frame: &aterm_render::Frame| -> i64 {
+        frame
+            .pixels
+            .iter()
+            .zip(&base.pixels)
+            .map(|(&p, &b)| {
+                [16u32, 8, 0]
+                    .iter()
+                    .map(|&sh| i64::from((p >> sh) & 0xff) - i64::from((b >> sh) & 0xff))
+                    .sum::<i64>()
+            })
+            .sum()
+    };
+    let cpu_lit = twin(params.strength);
+    let worst = max_channel_delta(&cpu_lit.pixels, &lit.pixels);
+    assert!(worst <= 2, "the CPU twin is within float rounding: {worst}");
+    let (gpu_energy, cpu_energy) = (energy(&lit), energy(&cpu_lit));
+    assert!(gpu_energy > 0, "the GPU blooms");
+    assert!(
+        (gpu_energy - cpu_energy).abs() * 100 <= gpu_energy,
+        "the same light in total: {cpu_energy} against {gpu_energy}"
+    );
+    let dim = twin(params.strength / 2.0);
+    assert!(
+        max_channel_delta(&dim.pixels, &lit.pixels) > 2,
+        "negative control: half the strength misses"
+    );
+}

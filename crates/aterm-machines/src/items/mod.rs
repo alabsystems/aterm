@@ -171,3 +171,41 @@ pub fn expand(baseline: &Baseline, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, Stri
     }
     Ok(items)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::items::defaults::tests::{ctx, user};
+
+    #[test]
+    fn every_item_is_of_the_family_its_baseline_table_names() {
+        // `plan|apply --only <table>` merges a report into the saved one by each row's family,
+        // so an item's family is the name of the table it came from.
+        let text = crate::baseline::fill(
+            crate::controller::templates::DEFAULT_BASELINE,
+            &[
+                ("name", "lab-07"),
+                ("tag", "lab-07"),
+                ("serial", "ZNYVNTRJN5"),
+                ("uuid", "C3396674-FCD3-52E5-A1C1-BD5B9E8F5C43"),
+            ],
+        )
+        .unwrap();
+        let baseline = crate::baseline::parse(&text).unwrap();
+        let items = expand(&baseline, &ctx(&[user("admin", 501)])).unwrap();
+        let tables = crate::baseline::tables();
+        let mut seen: Vec<&str> = Vec::new();
+        for item in &items {
+            assert!(
+                tables.contains(&item.family()),
+                "{} is of family {}, which no table is named",
+                item.id(),
+                item.family()
+            );
+            if !seen.contains(&item.family()) {
+                seen.push(item.family());
+            }
+        }
+        assert!(seen.len() >= 10, "the starter baseline's tables: {seen:?}");
+    }
+}

@@ -13,6 +13,10 @@ use aterm_spec::derive::Model;
 /// The slot's `state`: 0 Absent, 1 Booked, 2 Spawned, 3 Parked, 4 Warming,
 /// 5 Verifying, 6 Ready, 7 in transit (adopted, its landing not yet run).
 ///
+/// `warm`: the spare in the slot has the WARM hold alone (fish: no file of
+/// aterm's runs before its startup files), so it is booked WARM, its startup
+/// files running from the spawn, and lands in Warming.
+///
 /// `registered`: the current spare's id is in the store and the pool (it
 /// landed); each booking reserves a fresh id, so a new spare starts unregistered.
 /// `eligible`: the learned gate is open for the current rc generation; `stale`:
@@ -23,7 +27,8 @@ use aterm_spec::derive::Model;
 /// Invariants (design §6, I1–I6):
 /// - I1 `NeverSlotAndRegistered`: a spare id is never both in the slot and in
 ///   the store or pool;
-/// - I2 `RunOnlyWhenEligible`: `run` is written only while the gate is open;
+/// - I2 `RunOnlyWhenEligible`: `run` is written, and a WARM-only spare booked,
+///   only while the gate is open;
 /// - I3 `AdoptOnlyValid`: adoption only from Parked, Warming or Ready, never
 ///   stale, never exited;
 /// - I4 `OneSpare`: at most one spare, slot and transit together;
@@ -33,8 +38,9 @@ use aterm_spec::derive::Model;
 /// - I6 `NoEffectBeforeAdoption`: no host effect is delivered before adoption.
 ///
 /// `Buggy = 1` books a second spare beside a parked one, registers the spare as
-/// it spawns, writes `run` while the gate is closed, adopts a stale or exited
-/// spare, and delivers a host effect before adoption.
+/// it spawns, writes `run` (or books a WARM-only spare) while the gate is
+/// closed, adopts a stale or exited spare, and delivers a host effect before
+/// adoption.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn spare_lifecycle_model() -> Model {
@@ -43,6 +49,7 @@ pub fn spare_lifecycle_model() -> Model {
             const Buggy = 0;
             const MaxEffects = 1;
             var state = 0;
+            var warm = 0;
             var spares = 0;
             var registered = 0;
             var eligible = 0;
@@ -55,15 +62,30 @@ pub fn spare_lifecycle_model() -> Model {
 
             action Book when (state == 0 || Buggy == 1 && state == 3) {
                 state = 1;
+                warm = 0;
                 spares = spares + 1;
                 registered = 0;
                 live = 0;
                 stale = 0;
                 exited = 0;
             }
-            action Spawned when (state == 1) {
+            action BookWarm when (state == 0 && (eligible == 1 || Buggy == 1)) {
+                run_unproven = if eligible == 0 { 1 } else { run_unproven };
+                state = 1;
+                warm = 1;
+                spares = spares + 1;
+                registered = 0;
+                live = 0;
+                stale = 0;
+                exited = 0;
+            }
+            action Spawned when (state == 1 && warm == 0) {
                 registered = if Buggy == 1 { 1 } else { registered };
                 state = 2;
+            }
+            action SpawnedWarm when (state == 1 && warm == 1) {
+                registered = if Buggy == 1 { 1 } else { registered };
+                state = 4;
             }
             action ParkMark when (state == 2) {
                 state = 3;
@@ -73,7 +95,7 @@ pub fn spare_lifecycle_model() -> Model {
             }
             action GenerationMoves when (eligible == 1) {
                 eligible = 0;
-                stale = if state > 3 && state <= 7 { 1 } else { stale };
+                stale = if (state > 3 && state <= 7) || (state == 1 && warm == 1) { 1 } else { stale };
             }
             action Promote when (state == 3 && (eligible == 1 || Buggy == 1)) {
                 run_unproven = if eligible == 0 { 1 } else { run_unproven };
@@ -92,6 +114,7 @@ pub fn spare_lifecycle_model() -> Model {
                 && (Buggy == 1 || stale == 0 && exited == 0 && (state == 3 || eligible == 1))) {
                 bad_adopt = if stale == 1 || exited == 1 { 1 } else { bad_adopt };
                 state = 7;
+                warm = 0;
             }
             action Land when (state == 7) {
                 state = 0;
@@ -101,6 +124,7 @@ pub fn spare_lifecycle_model() -> Model {
             }
             action Retire when (state > 0 && state <= 6) {
                 state = 0;
+                warm = 0;
                 spares = spares - 1;
                 stale = 0;
                 exited = 0;

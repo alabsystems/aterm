@@ -9,18 +9,22 @@ license.workspace = true
 repository.workspace = true
 description = "The registry and anchor records that aterm's #[refines] attributes reference"
 
-[dependencies]
-# The anchor attributes themselves (`refines`, `spec_unmodeled`),
-# re-exported so an anchored crate names one path. Proc macros: host-only, and a
-# release build strips every attribute that would expand them. Behind `macros`
-# so `-p aterm-spec-anchor`'s lib closure holds no proc macro and Trust's loader
-# admits it (PM-1, docs/PLAN-pm1-proc-macro-reach-2026-10-16.md); the workspace
-# row turns `macros` on, so every anchored crate has them.
-aterm-spec-macros = { workspace = true, optional = true }
+# The anchor attributes on a stock compiler, and under Trust's lint driver: the
+# proc macros (`refines`, `spec_unmodeled`), re-exported so an
+# anchored crate names one path. A Trust compiler's cfg query answers
+# `trust_verify` in every other lane, so there this row is not in the graph (Trust's
+# PM-1 boundary refuses to verify a library whose graph holds a proc macro) and the
+# attributes are this crate's own `macro_rules!` ones (src/attrs.rs), chosen by the
+# same fact through `cfg(anchor_rules)` (anchor_rules.rs).
+[target.'cfg(not(trust_verify))'.dependencies]
+aterm-spec-macros = { workspace = true }
 
-[features]
-# Re-export the anchor attributes. On through the workspace row.
-macros = ["dep:aterm-spec-macros"]
+[dev-dependencies]
+# tests/attrs.rs runs the proc macros' own suite (aterm-spec-macros
+# tests/anchors/suite.rs) against the attributes this crate exports; the suite reads
+# the evidence windows through `aterm_spec::xref`. A dev-only cycle, which Cargo
+# permits.
+aterm-spec = { workspace = true }
 
 [lints]
 workspace = true

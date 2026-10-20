@@ -23,18 +23,18 @@
 //!    saying an upgrade restart is coming: let live background work finish,
 //!    stop any wait that can never end ([`STOPPING_POINT`]), with the shells
 //!    aterm sees named ([`running_clause`]), save work, and answer with a
-//!    one-time READY marker ([`prepare_prompt`]). Never at a usage or rate
+//!    readiness answer in ordinary language ([`prepare_prompt`]). Never at a usage or rate
 //!    limit ([`Facts::limited`]) or the login wall ([`Facts::login`]), where
 //!    it would be read by no model; a notice the login wall answered is typed
 //!    again once the login is back ([`Facts::undelivered`]).
-//! 2. **Drain.** Wait until the agent answered with the marker
+//! 2. **Drain.** Wait until the agent answered the current notice that it is ready
 //!    ([`transcript_has_ready`]), Claude's session file says `idle`, nothing
 //!    runs under the agent (Claude Code's own `caffeinate` aside), and the
 //!    composer is empty ([`gate_restart`]). Nothing is ever killed. An
 //!    unanswered notice, or a READY that work outlives, is asked again every
 //!    [`REASK_S`] naming what runs; after [`MAX_ASKS`] the round gives up and
 //!    says what held it ([`next_step`]), and [`RETRY_S`] later a new round
-//!    starts ([`Step::Rearm`]) with new markers. A person's box or unsent
+//!    starts ([`Step::Rearm`]) with new notice references. A person's box or unsent
 //!    draft ([`person_hold`]) standing for [`HOLD_S`] voids a READY older than
 //!    [`DRAIN_S`]; the upgrade asks again at the next idle point. The answer
 //!    is read at the turn end it ends: a READY on screen but not yet in the
@@ -82,7 +82,9 @@
 //! ([`directed_since_ready`]). One exception, outside the derived model
 //! (`harness_upgrade_never_strands_model`): an agent that is no job of a
 //! job-control shell is refused and owed no line (`upgrade_drive::not_a_job`),
-//! since it can never be proven to read it.
+//! since it can never be proven to read it. An aterm tab's own program
+//! (`aterm -e claude`), refused the same way, keeps the line an older build's
+//! notice owes it: it leads its terminal, so the line reaches it.
 //!
 //! Everything here is pure (parsers, the target rule, the argv rewrite, the
 //! prompts, model reads, the outcome line and the gates) over facts a driver
@@ -99,6 +101,7 @@ use std::path::{Path, PathBuf};
 
 use aterm_json::Value;
 
+use super::steps::{BASH_INPUT, BASH_STDERR, BASH_STDOUT, INTERRUPTED, TASK_NOTIFICATION};
 use super::upgrade_models as models;
 use crate::supervise::approvals::Typed;
 use crate::supervise::policy::turn_end;
@@ -289,18 +292,17 @@ impl Source {
 
 /// Which agent an upgrade or a relaunch record is of: the Claude lane's (this
 /// module), a Codex's (a codex-alab's relaunch, `upgrade_drive`'s
-/// `codex_alab_drive`; no Codex is moved live) or a Muse Code's
-/// ([`super::upgrade_muse`]: relaunch on exit and restore only). One state
-/// directory, one ledger and one owner's view carry them all; this word tells
-/// their rows apart. Every variant is in [`Agent::ALL`].
+/// `codex_alab_drive`; no Codex is moved live), a Muse Code's
+/// ([`super::upgrade_muse`]), an agy's ([`super::upgrade_agy`]) or a Gemini
+/// CLI's ([`super::upgrade_gemini`]): each of the last three relaunch on exit
+/// and restore only. One state directory, one ledger and one owner's view
+/// carry them all; this word tells their rows apart. Every variant is in
+/// [`Agent::ALL`].
 ///
-/// agy and Gemini CLI are agents with NO LANE YET ([`super::lanes::lanes`] is
-/// all false for them): each is named by its word when a record or a restore
-/// leaf carries it, and every arm answers that nothing is relaunched,
-/// upgraded, typed or read for it. Nothing writes their words. Muse Code's
-/// word (`muse`) is written by its relaunch on exit (`muse-<tab>` records,
-/// its restore leaf's `[muse]` table) and its upgrade arms still answer that
-/// nothing moves it.
+/// Muse Code's word (`muse`), agy's (`agy`) and Gemini CLI's (`gemini`) are
+/// written by their relaunches on exit (`<word>-<tab>` records, their restore
+/// leaves' `[muse]`, `[agy]` and `[gemini]` tables), and their upgrade arms
+/// still answer that nothing moves them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Agent {
     /// Claude Code (a state written before the word existed is one).
@@ -308,11 +310,16 @@ pub enum Agent {
     Claude,
     /// Codex.
     Codex,
-    /// Google's Antigravity CLI: no lane yet.
+    /// Google's Antigravity CLI: relaunched on exit and restored, and moved
+    /// onto a newer build live by the quiet flow alone (`upgrade_agy_live`:
+    /// ended at an idle point and resumed, nothing typed; never the ask flow).
     Agy,
-    /// Meta's Muse Code: relaunched on exit and restored, never upgraded live.
+    /// Meta's Muse Code: relaunched on exit and restored, and moved onto a
+    /// newer build live by the quiet flow alone (`upgrade_muse_live`: ended at
+    /// an idle point and resumed, nothing typed; never the ask flow).
     Muse,
-    /// Google's Gemini CLI: no lane yet.
+    /// Google's Gemini CLI: relaunched on exit and restored, never upgraded
+    /// live.
     Gemini,
 }
 
@@ -370,17 +377,17 @@ impl Agent {
     /// THE PREFIX OF THIS AGENT'S PER-TAB RECORD KEYS: a lane past Claude
     /// Code's keys the record of its upgrade or relaunch in a tab
     /// `<word>-<tab>` ([`Self::record_key`]); Claude Code's records are keyed
-    /// by its conversation, so it has none (`None`), and an agent with no lane
-    /// keys none (agy, Gemini CLI: nothing writes their records). No
-    /// conversation id starts with one ([`is_session_id`]: hex and dashes).
+    /// by its conversation, so it has none (`None`). No conversation id starts
+    /// with one ([`is_session_id`]: hex and dashes).
     #[must_use]
     pub const fn record_prefix(self) -> Option<&'static str> {
         match self {
-            // No lane yet (agy, Gemini CLI): no record of theirs.
-            Agent::Claude | Agent::Agy | Agent::Gemini => None,
+            Agent::Claude => None,
             Agent::Codex => Some("codex-"),
-            // Its relaunch on exit's record, one per tab, as Codex's.
+            // Their relaunch on exit's records, one per tab, as Codex's.
             Agent::Muse => Some("muse-"),
+            Agent::Agy => Some("agy-"),
+            Agent::Gemini => Some("gemini-"),
         }
     }
 
@@ -410,9 +417,8 @@ impl Agent {
     }
 
     /// The word the state file carries: empty for Claude (every state an
-    /// older build wrote), `codex`, `muse`; an agent with no lane's own name
-    /// ([`aterm_phase::Program::name`]: `agy`, `gemini`), which only a newer
-    /// build's record or leaf carries, since nothing here writes one.
+    /// older build wrote), `codex`, `muse`, `agy`, `gemini`
+    /// ([`aterm_phase::Program::name`]).
     #[must_use]
     pub fn word(self) -> &'static str {
         match self {
@@ -424,10 +430,9 @@ impl Agent {
         }
     }
 
-    /// [`Self::word`] read back, and Claude's own name for its lane. agy's and
-    /// Gemini CLI's words read as those agents, whose lane this build does
-    /// not have, so nothing drives them; Muse Code's is its relaunch lane's.
-    /// `None` for any other
+    /// [`Self::word`] read back, and Claude's own name for its lane. Muse
+    /// Code's, agy's and Gemini CLI's are their relaunch lanes'. `None` for
+    /// any other
     /// word: a record a newer build wrote for an agent this one does not know,
     /// which is never driven as another agent's.
     #[must_use]
@@ -461,9 +466,8 @@ impl Agent {
     }
 
     /// The agent `program` is; `None` for a program that is no agent
-    /// (`Generic`). agy and Gemini CLI are agents with no lane
-    /// ([`super::lanes::lanes`]): whoever asks of one asks of an agent nothing
-    /// moves. Muse Code is relaunched on exit, never moved by an upgrade.
+    /// (`Generic`). Muse Code, agy and Gemini CLI are relaunched on exit,
+    /// never moved by an upgrade ([`super::lanes::lanes`]).
     #[must_use]
     pub fn of(program: aterm_phase::Program) -> Option<Self> {
         match program {
@@ -1032,6 +1036,78 @@ pub fn relaunch_line_env(
     relaunch_line_on(LineDiscipline::HOST, dialect, heal, cd, env, exe, args)
 }
 
+/// [`relaunch_line_env`] with explicit removals as well as values. The
+/// target runs through the absolute env utility, so an unset variable stays
+/// absent even when the interactive shell has since changed its exports.
+/// The parent shell's environment is unchanged. This is used only where
+/// exact target-profile context is required; ordinary relaunch bytes stay
+/// unchanged through [`relaunch_line_env`].
+///
+/// # Errors
+/// As [`relaunch_line_env`], an invalid removal name, or a name both set and
+/// removed. The env utility must support `-u` (the supported Unix shells).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn relaunch_line_env_clear(
+    dialect: Dialect,
+    heal: Option<&Path>,
+    cd: Option<&str>,
+    env: &[(&str, &str)],
+    unset: &[&str],
+    exe: &Path,
+    args: &[String],
+) -> Result<String, String> {
+    relaunch_line_with_clear(
+        LineDiscipline::HOST,
+        dialect,
+        heal,
+        cd,
+        env,
+        Some(unset),
+        exe,
+        args,
+    )
+}
+
+/// THE ONE OPERAND A WORKER'S FIRST LINE ENDS WITH (`spawn agent=claude`,
+/// [`task_line_env`]): the end of options, then the task file's whole text as
+/// ONE argument. The same text in zsh, bash and fish 3.4 or later (`$(…)`
+/// in double quotes, which none of them splits), and FIXED: the task is never
+/// a word of the line, so no byte of it is typed, quoted or parsed by the
+/// shell — `$(…)` leaves its output unexpanded — and a task that opens with
+/// `-` is still an operand. Trailing newlines are trimmed by every shell's
+/// substitution, so the task file ends its last line as it likes. `command
+/// cat --`: the line is typed at an interactive prompt, where zsh and bash
+/// expand the person's aliases inside `$(…)` too, and an `alias cat=bat` (or
+/// a `cat` function) would hand the agent its decorations instead of the task.
+pub const TASK_OPERAND: &str = r#"-- "$(command cat -- "$ATERM_TASK_FILE")""#;
+
+/// [`relaunch_line_env`] for a WORKER's first line (`spawn agent=claude`):
+/// `env` and the quoted `exe` and `args` as a fresh start writes them, then
+/// [`TASK_OPERAND`] unquoted — the one text on any line this module writes
+/// that [`quote`] does not wrap, because it is a constant. Held to the same
+/// bound as every relaunch line, the operand included.
+///
+/// # Errors
+/// As [`relaunch_line_env`], and a line the operand takes past the bound.
+pub fn task_line_env(
+    dialect: Dialect,
+    env: &[(&str, &str)],
+    exe: &Path,
+    args: &[String],
+) -> Result<String, String> {
+    let tty = LineDiscipline::HOST;
+    let line = relaunch_line_on(tty, dialect, None, None, env, exe, args)?;
+    let line = format!("{line} {TASK_OPERAND}");
+    let max = tty.max_line();
+    if line.len() > max {
+        return Err(format!(
+            "the line would be {} bytes (max {max})",
+            line.len()
+        ));
+    }
+    Ok(line)
+}
+
 /// [`relaunch_line`] for the kernel `tty`, whose bound it keeps.
 fn relaunch_line_on(
     tty: LineDiscipline,
@@ -1042,6 +1118,20 @@ fn relaunch_line_on(
     exe: &Path,
     args: &[String],
 ) -> Result<String, String> {
+    relaunch_line_with_clear(tty, dialect, heal, cd, env, None, exe, args)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn relaunch_line_with_clear(
+    tty: LineDiscipline,
+    dialect: Dialect,
+    heal: Option<&Path>,
+    cd: Option<&str>,
+    env: &[(&str, &str)],
+    unset: Option<&[&str]>,
+    exe: &Path,
+    args: &[String],
+) -> Result<String, String> {
     if let Some((name, _)) = env.iter().find(|(n, _)| {
         n.is_empty()
             || !n
@@ -1049,6 +1139,20 @@ fn relaunch_line_on(
                 .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
     }) {
         return Err(format!("{name:?} is not an environment variable name"));
+    }
+    if let Some(names) = unset {
+        for name in names {
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            {
+                return Err(format!("{name:?} is not an environment variable name"));
+            }
+            if env.iter().any(|(key, _)| key == name) {
+                return Err(format!("{name:?} is both set and removed"));
+            }
+        }
     }
     let exe_s = exe.to_string_lossy();
     for w in std::iter::once(exe_s.as_ref())
@@ -1080,8 +1184,18 @@ fn relaunch_line_on(
         cmd.push(' ');
         cmd.push_str(&quote(dialect, a));
     }
+    if let Some(names) = unset {
+        let mut exact = quote(dialect, "/usr/bin/env");
+        for name in names {
+            let _ = write!(exact, " -u {}", quote(dialect, name));
+        }
+        for (name, value) in env {
+            let _ = write!(exact, " {}", quote(dialect, &format!("{name}={value}")));
+        }
+        cmd = format!("{exact} {cmd}");
+    }
     let mut vars = String::new();
-    for (name, value) in env {
+    for (name, value) in env.iter().filter(|_| unset.is_none()) {
         // A plain word needs no quotes (`NAME=1`); anything else is quoted as every word is.
         let plain = !value.is_empty()
             && value
@@ -1187,9 +1301,9 @@ fn with_rekey_on(
     ))
 }
 
-/// The one-time READY marker for one upgrade: fixed words plus a short id the
-/// agent cannot have seen before this announcement, so an assistant message
-/// carrying it can only be the answer to it.
+/// The one-time reference for an upgrade notice. It correlates the recorded
+/// announcement with its round; new prompts never ask the agent to echo it.
+/// Older transcripts that answered with this reference remain readable.
 #[must_use]
 pub fn ready_marker(session_id: &str, to: &Version, salt: u64) -> String {
     format!(
@@ -1218,13 +1332,14 @@ fn is_ready_line(line: &str, marker: &str) -> bool {
     line.trim().trim_matches('`') == marker
 }
 
-/// Whether an agent's `words` answer READY with `marker`: any line is the
-/// marker by itself ([`is_ready_line`]). The one rule for the transcript
-/// ([`transcript_has_ready`]) and the idle screen
-/// ([`Facts::ready_unrecorded`]).
+/// Whether an agent's `words` affirm readiness in ordinary language, or
+/// contain a legacy marker reply. The transcript also requires an ordinary
+/// answer to follow the matching notice ([`transcript_has_ready`]); the
+/// screen uses this only to wait for that answer to be recorded.
 #[must_use]
 pub fn says_ready(words: &str, marker: &str) -> bool {
-    !marker.is_empty() && words.lines().any(|l| is_ready_line(l, marker))
+    !marker.is_empty()
+        && (words.lines().any(|l| is_ready_line(l, marker)) || readiness::says_ready(words))
 }
 
 /// How [`prepare_prompt`]'s announcement opens, distinct from
@@ -1234,19 +1349,24 @@ pub fn says_ready(words: &str, marker: &str) -> bool {
 pub const ANNOUNCE_HEAD: &str = concat!(harness_mark!(), " Claude Code ");
 
 /// The announcement, typed as one ordinary user turn: asks for a good
-/// stopping point ([`STOPPING_POINT`]) and names the one line to answer with,
+/// stopping point ([`STOPPING_POINT`]) and asks for an ordinary-language answer,
 /// never asking to cancel work still making progress.
 #[must_use]
 pub fn prepare_prompt(from: &Version, to: &Version, source: Source, marker: &str) -> String {
     format!(
         "{ANNOUNCE_HEAD}{to} ({}) is installed; this session runs {from}. \
          To move you onto it, aterm will restart this Claude Code in place and resume this \
-         same conversation (claude --resume, same tab, same flags). {STOPPING_POINT} When \
-         nothing of yours is still running, reply with {marker} on a line by itself. \
+         same conversation (claude --resume, same tab, same flags). {STOPPING_POINT} \
+         {READINESS_ANSWER} Notice reference: {marker}. \
          {NOTICE_CLOSE}",
         source.as_str()
     )
 }
+
+/// Readiness is reported in the agent's own words; the notice reference is
+/// input metadata, never a required output token.
+const READINESS_ANSWER: &str = "Say in ordinary language whether this session is ready to \
+    restart now, or explain what must finish first.";
 
 /// What the announcement asks of the agent's own work. Live work is waited
 /// for, never cancelled, but a wait that can never end (a poll loop counting
@@ -1553,10 +1673,7 @@ pub fn prepare_prompt_with_model(
             source.as_str()
         )
     };
-    format!(
-        "{what} {STOPPING_POINT} When nothing of yours is still running, reply with {marker} on \
-         a line by itself. {NOTICE_CLOSE}"
-    )
+    format!("{what} {STOPPING_POINT} {READINESS_ANSWER} Notice reference: {marker}. {NOTICE_CLOSE}")
 }
 
 /// [`continue_prompt`] for a relaunch that asked for `model`: names the model
@@ -1814,13 +1931,13 @@ pub fn restart_outcome_listed(
     }
 }
 
-/// Whether the agent's last answer carries `marker` as a line of its own
-/// text ([`is_ready_line`]). `jsonl` is the transcript tail; non-JSON lines
-/// are skipped. Only assistant rows count (the announcement itself contains
-/// the marker).
+/// Whether the agent's last answer affirms readiness after the announcement
+/// carrying `marker`. Historical replies with the marker on its own line
+/// remain readable even when the notice is outside this transcript tail.
+/// Non-JSON lines are skipped. Only the main-chain assistant's own words count.
 ///
-/// A READY is consent only while it is still the agent's last word, so the
-/// marker counts only in the newest main-chain assistant row of the session's
+/// Readiness is consent only while it is still the agent's last word, so the
+/// answer counts only in the newest main-chain assistant row of the session's
 /// own model (not `isSidechain`, not `<synthetic>`, [`is_model_id`]), and
 /// only when no main-chain user row after it is an announcement
 /// ([`ANNOUNCE_HEAD`]) or a direction ([`is_direction`]: a person's words, an
@@ -1828,11 +1945,15 @@ pub fn restart_outcome_listed(
 /// agent has written since.
 #[must_use]
 pub fn transcript_has_ready(jsonl: &str, marker: &str) -> bool {
-    let mut ready = false;
+    let (mut ready, mut matching_notice) = (false, false);
     for line in jsonl.lines() {
         match turn_of(line) {
-            Some(Turn::Notice | Turn::Direction) => ready = false,
-            Some(Turn::Agent(message)) => ready = answers(&message, marker),
+            Some(Turn::Notice(message)) => {
+                ready = false;
+                matching_notice = notice_matches(&message, marker);
+            }
+            Some(Turn::Direction) => (ready, matching_notice) = (false, false),
+            Some(Turn::Agent(message)) => ready = answers(&message, marker, matching_notice),
             None => {}
         }
     }
@@ -1864,12 +1985,22 @@ pub fn transcript_has_ready(jsonl: &str, marker: &str) -> bool {
 #[must_use]
 pub fn directed_since_ready(jsonl: &str, markers: &[String]) -> bool {
     let (mut told, mut directed) = (false, false);
+    let mut matching_notice = false;
     for line in jsonl.lines() {
         match turn_of(line) {
-            Some(Turn::Notice) => (told, directed) = (false, false),
-            Some(Turn::Direction) => told = true,
+            Some(Turn::Notice(message)) => {
+                (told, directed) = (false, false);
+                matching_notice = markers.iter().any(|m| notice_matches(&message, m));
+            }
+            Some(Turn::Direction) => {
+                told = true;
+                matching_notice = false;
+            }
             Some(Turn::Agent(message)) => {
-                if markers.iter().any(|m| answers(&message, m)) {
+                if markers
+                    .iter()
+                    .any(|m| answers(&message, m, matching_notice))
+                {
                     (told, directed) = (false, false);
                 } else if told {
                     directed = true;
@@ -1929,7 +2060,10 @@ pub fn directed_since_ready(jsonl: &str, markers: &[String]) -> bool {
 /// text is not it). A turn begins at a row that asks something — a prompt, a
 /// command, a check, one of the turns nobody asked above — and at a row that
 /// asks nothing which Claude Code numbered a turn of its own (a `promptId`
-/// other than the last row's: a `/loop`'s wake). A row that asks nothing
+/// other than the last row's: a `/loop`'s wake, known on a build that numbers
+/// no turn by its `scheduledTaskId`, its `turnOrigin` or, for a missed
+/// one-shot task's notice, its fixed words: [`begins_unnumbered`]). A row
+/// that asks nothing
 /// under the running turn's `promptId`, or under none, goes on that turn: a
 /// Stop hook's feedback (`Stop hook feedback: … not met`) or `/goal`'s
 /// check-in, after which the worker works on in the same turn because its
@@ -1984,6 +2118,26 @@ pub struct FinishedScan {
     /// A `turn_duration` row closed the check's turn after that answer: the
     /// record holds the turn's last words.
     check_closed: bool,
+    /// That answer is AN IDLE REPORT ALONE ([`turn_end::says_idle_report`]),
+    /// at the done check or the challenge (never a land act's): where the
+    /// check's turn's work ([`Self::check_work_ms`]) is within
+    /// [`turn_end::MIN_WORK`] it finishes the task at the check, as the
+    /// turn-end policy ends it there (ATERM-KI-1016-1, done-1).
+    check_idle: bool,
+    /// When the row that asked the check's turn was recorded (unix ms,
+    /// [`recorded_ms`]): the check's, or the wall's retry that delivered it
+    /// again. A `turn_duration` row that names no `durationMs` is measured
+    /// from it.
+    check_at_ms: Option<u64>,
+    /// THE CHECK'S TURN'S WORK (ms), by Claude Code's own measure: the
+    /// `durationMs` of each `turn_duration` row read since the check, a
+    /// wall's turn and its retry's summed, as the turn-end policy sums the
+    /// screen's busy work across the wall (`turn_end::check_answer_ends`).
+    /// Never the clock from the check's row: the retry's wait (a 529's
+    /// minutes, a limit's hours) is no work, and read as work the record's
+    /// `Some(false)` continued a task the screen ended (the review's DR-3).
+    /// `None` where a row was measured by neither.
+    check_work_ms: Option<u64>,
     /// A WALL CUT THE CHECK'S TURN (or a land act's): Claude Code's own error
     /// row (`isApiErrorMessage`: an API error, a limit) came while it ran,
     /// and the worker has said nothing since. The turn-end policy's retry of
@@ -2001,9 +2155,20 @@ pub struct FinishedScan {
     turn: Option<String>,
     /// What the session's supervisor typed, and when ([`TaskScan`]'s).
     ours: Vec<Typed>,
-    /// The key of the last turn row read ([`turn_key_of`]): `Some(None)` for
-    /// one that names no `uuid` ([`Self::last_turn_key`]).
-    last_key: Option<Option<String>>,
+    /// The turn the record read so far ends on, by its keys ([`TurnFold`]:
+    /// [`Self::last_turn_key`], [`Self::last_turn`]).
+    turn_fold: TurnFold,
+    /// LAND'S INSTRUCTION WAS READ (or a nudge, typed only after it) since
+    /// the last prompt of someone's: Land's answer to a question
+    /// ([`lands_answer`]) is then Land's check too ([`Asked::Land`]), as
+    /// the turn-end policy lands its done reply once the instruction was
+    /// typed (`TurnEndState::acted`). Read as the harness's own line, the
+    /// done reply to it was a first done report, and a relaunch or the
+    /// upgrade asked the check once more (ATERM-KI-1016-1).
+    land_typed: bool,
+    /// A row read SETTLES THE FINISH, whatever came before it
+    /// ([`Self::settled`]).
+    settled: bool,
 }
 
 /// The done check's words before 2026-09-29 (`3e34e2f6d`), which the
@@ -2036,6 +2201,30 @@ const DONE_CHECK_OPEN_BEFORE: &str = "Before you stop: do every open item, skipp
      a person (a credential, a decision, physical access) or cannot be done on this host, \
      each item named with its blocker; a slow check is not a blocker. Otherwise continue.";
 
+/// The done check from `69a8f68178` (ordinary language) until the owner's
+/// rule of 2026-10-19 (an item left that names its blocker ended the job).
+const DONE_CHECK_ORDINARY_BEFORE: &str = turn_end::DONE_CHECK_ORDINARY_BEFORE;
+
+/// The last check that required a completion marker, from the merge of
+/// `f09ef3b15` until `69a8f68178`. Existing conversations still carry these
+/// words, including inside a restart's carry-on.
+const DONE_CHECK_MARKER_BEFORE: &str = turn_end::DONE_CHECK_MARKER_BEFORE;
+
+/// Historical Land prompts are still recognized when reading old transcripts.
+const LAND_MARKER_BEFORE: &str = concat!(
+    harness_mark!(),
+    " Autopilot is set to Land: wrap up this work cleanly. Finish only the step in hand and \
+     start nothing new. Make sure what is done is verified, and leave it committed (and pushed, \
+     if that is how this repository works). Then write a short summary of what is done and what \
+     is left, and reply with ATERM-TASK-DONE on a line by itself."
+);
+
+const LAND_NUDGE_MARKER_BEFORE: &str = concat!(
+    harness_mark!(),
+    " Still landing: finish only what leaves the work clean, then reply with ATERM-TASK-DONE on \
+     a line by itself."
+);
+
 /// What one user row asks, to [`FinishedScan`].
 enum Asked {
     /// A person's or an orchestrator's prompt.
@@ -2050,20 +2239,23 @@ enum Asked {
     /// worker's own word finishes the task, and the record's closed answer
     /// speaks at a land act's yield as at the check's (the merge review's
     /// XM-LAND-RECORD). A first-only report answering it stays a done report.
-    /// Never Land's answer to a question (`turn_end::LAND_ANSWER`): the
-    /// policy lands on it only once the instruction was typed, which the
-    /// record cannot tell, and read as the harness's own line it costs at
-    /// most one check.
+    /// So too Land's answer to a question (`turn_end::LAND_ANSWER`, by its
+    /// ledger rule: [`lands_answer`]) once the instruction was read since the
+    /// last prompt of someone's ([`FinishedScan::land_typed`]), as the policy
+    /// lands on it only once the instruction was typed; before it, the
+    /// harness's own line.
     Land,
-    /// The supervisor's open-items challenge (`turn_end::open_items_text`,
-    /// [`turn_end::OPEN_ITEMS_HEAD`]), typed where a report ended with
-    /// [`turn_end::FINISHED`] while its own words named open work: the done
-    /// check's kin, as the turn-end policy reads it (`TurnEndState::acted`).
+    /// The supervisor's challenges (`turn_end::open_items_text`,
+    /// `turn_end::uncommitted_text`; [`turn_end::is_challenge_text`]), typed
+    /// where a done report's own words named open work or the session's
+    /// repository held work no remote has: the done check's kin, as the
+    /// turn-end policy reads it (`TurnEndState::acted`).
     /// It TAKES BACK THE FINISH the token made — read as the harness's own
     /// line, the finish stood through it, and a loop that reads the record
-    /// ended the challenged job whatever the worker answered (the merge
-    /// review's MG7-A1) — and a done reply to it in the worker's own word
-    /// finishes the task at the check, as the policy ends it.
+    /// ended the job whatever the worker answered (the merge review's
+    /// MG7-A1) — and a done reply to it in the worker's own word
+    /// that names no open work finishes the task at the check, as the policy
+    /// ends it.
     Challenge,
     /// A turn nobody asked: the harness's own, Claude Code's own wake, a
     /// local command's output.
@@ -2095,15 +2287,43 @@ impl FinishedScan {
         if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
             return self.finished;
         }
-        if let Some(key) = turn_key_of(&v) {
-            self.last_key = Some(key);
-        }
+        self.turn_fold.row(&v);
         match v.get("type").and_then(Value::as_str) {
             Some("assistant") => self.answered(&v),
             Some("user") => self.asked(&v),
             Some("attachment") => self.queued(&v),
             Some("system") if v.get("subtype").and_then(Value::as_str) == Some("turn_duration") => {
                 self.check_closed = self.check && self.check_said.is_some();
+                if self.check {
+                    let worked = v.get("durationMs").and_then(Value::as_u64).or_else(|| {
+                        self.check_at_ms
+                            .zip(recorded_ms(&v))
+                            .map(|(asked, ended)| ended.saturating_sub(asked))
+                    });
+                    self.check_work_ms = self
+                        .check_work_ms
+                        .zip(worked)
+                        .map(|(sum, ms)| sum.saturating_add(ms));
+                }
+                // AN IDLE REPORT ALONE AS A SHORT CHECK TURN'S WHOLE ANSWER
+                // ends the task at the check, as the turn-end policy reads it
+                // (`turn_end::check_answer_ends`): its closed answer says so.
+                // Not where a wall closed the turn ([`Self::cut`]): the words
+                // before it were no whole answer, and the retry's is the
+                // check's.
+                let short = self
+                    .check_work_ms
+                    .is_some_and(|ms| u128::from(ms) < turn_end::MIN_WORK.as_millis());
+                if self.check_closed
+                    && !self.cut
+                    && self.check_said == Some(false)
+                    && self.check_idle
+                    && short
+                {
+                    self.check_said = Some(true);
+                    (self.finished, self.said, self.settled) = (true, true, true);
+                    self.at_check = true;
+                }
             }
             _ => {}
         }
@@ -2114,6 +2334,20 @@ impl FinishedScan {
     #[must_use]
     pub fn finished(&self) -> bool {
         self.finished
+    }
+
+    /// Whether a row read so far SETTLES THE FINISH whatever came before it:
+    /// a prompt of someone's (a command of theirs once it starts a turn, one
+    /// typed while the worker worked), the open-items challenge, or an answer
+    /// that finishes the task. Every other row — Claude Code's own wakes and
+    /// their answers, the harness's own lines, a check not yet answered —
+    /// leaves the finish as it stood before it, so a read that begins after
+    /// the record's head and settles nothing cannot say it
+    /// (`upgrade_drive::Finished`, which reads such a window from further
+    /// back; ATERM-KI-1016-1).
+    #[must_use]
+    pub fn settled(&self) -> bool {
+        self.settled
     }
 
     /// Whether the conversation's LAST WORDS are a done report: the model's
@@ -2146,7 +2380,15 @@ impl FinishedScan {
     /// carry-on into the person's exchange.
     #[must_use]
     pub fn last_turn_key(&self) -> Option<String> {
-        self.last_key.clone().flatten()
+        self.turn_fold.turn().last
+    }
+
+    /// THE TURN THE RECORD READ SO FAR ENDS ON, by every key that names it
+    /// ([`LastTurn`]): its last row's ([`Self::last_turn_key`]) and the
+    /// prompt that opened it — what a left exchange's row is matched by.
+    #[must_use]
+    pub fn last_turn(&self) -> LastTurn {
+        self.turn_fold.turn()
     }
 
     /// WHAT THE DONE CHECK'S CLOSED ANSWER SAYS, by the record: where the
@@ -2200,6 +2442,7 @@ impl FinishedScan {
         if std::mem::take(&mut self.command) {
             (self.finished, self.said, self.check, self.done_said) = (false, false, false, false);
             (self.notice, self.land, self.cut) = (false, false, false);
+            self.settled = true;
         }
         if row.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) {
             // A wall in the check's turn, whatever the check answered before
@@ -2224,7 +2467,9 @@ impl FinishedScan {
         };
         // At the check only the worker's own word is a done report, as the
         // turn-end policy reads it there (and that finishes the task): an
-        // idle report answering it is its work going on. At a land act the
+        // idle report answering it is its work going on — unless it is the
+        // whole answer of a turn that closes short (`turn_duration`, below:
+        // `turn_end::check_answer_ends`). At a land act the
         // worker's own word finishes the task the same, but an idle report
         // answering one stays a done report, so a relaunch asks the check
         // after it, never `keep going` into a landing (fail closed). The
@@ -2237,16 +2482,22 @@ impl FinishedScan {
                     turn_end::Said::Irreversible(_)
                 );
         }
+        // …and never over words that name open work, a blocked item among
+        // it (`turn_end::open_work`; the owner's rule of 2026-10-19): the
+        // turn-end policy challenges such a report at every token, so the
+        // record ends no task there either, and a relaunch or the upgrade
+        // reads the job as going on.
         let ends = if self.check {
             turn_end::says_done_outright(&words)
         } else {
             turn_end::says_finished(Some(&words))
-        };
+        } && turn_end::open_work(Some(&words)).is_empty();
         if self.check {
             (self.check_said, self.check_closed) = (Some(ends), false);
+            self.check_idle = !self.land && !ends && turn_end::says_idle_report(&words);
         }
         if ends {
-            (self.finished, self.said) = (true, true);
+            (self.finished, self.said, self.settled) = (true, true, true);
             self.at_check = self.check && !turn_end::says_finished(Some(&words));
         } else if self.said {
             (self.finished, self.said) = (false, false);
@@ -2258,8 +2509,12 @@ impl FinishedScan {
     /// turn's `promptId` or none (a Stop hook's feedback).
     fn asked(&mut self, row: &Value) {
         let id = row.get("promptId").and_then(Value::as_str);
-        let numbered_anew = id.is_some_and(|id| self.turn.as_deref() != Some(id));
-        if numbered_anew {
+        // A `/loop`'s wake is a turn of its own: by its new `promptId`, and
+        // on a build that numbers no turn as [`begins_unnumbered`] reads it
+        // (ATERM-KI-1016-1: read as part of the token's turn, its answer
+        // took the finish back).
+        let anew = numbered_anew(id, self.turn.as_deref(), || begins_unnumbered(row));
+        if anew {
             self.turn = id.map(str::to_owned);
         }
         if row.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
@@ -2267,8 +2522,11 @@ impl FinishedScan {
         {
             return;
         }
-        let asked = asked_by(row, &self.ours);
-        if matches!(asked, Asked::Nothing) && !numbered_anew {
+        let asked = match asked_by(row, &self.ours) {
+            Asked::Nobody if self.land_typed && lands_answer(row, &self.ours) => Asked::Land,
+            asked => asked,
+        };
+        if matches!(asked, Asked::Nothing) && !anew {
             return;
         }
         // A done report stands until an answer with words says otherwise,
@@ -2282,27 +2540,43 @@ impl FinishedScan {
         // the last words, and the relaunch asks the check again.
         let notice = row.get("message").is_some_and(is_announcement);
         // A WALL'S RETRY DELIVERS AGAIN THE CHECK THE WALL CUT ([`Self::cut`]):
-        // the check (or the land act) stands, its answer still to come. Any
-        // other row that asks something ends the cut.
+        // the check (or the land act) stands, its answer still to come. So
+        // does the vendor's own continuation of the limit that cut it
+        // ([`vendor_continues`]). Any other row that asks something ends the
+        // cut.
         let retry = std::mem::take(&mut self.cut)
             && matches!(asked, Asked::Nobody)
-            && supervisors_plain(row, &self.ours);
+            && (supervisors_plain(row, &self.ours) || vendor_continues(row));
         (self.said, self.notice) = (false, notice);
-        (self.check_said, self.check_closed) = (None, false);
+        (self.check_said, self.check_closed, self.check_idle) = (None, false, false);
         if retry {
             self.command = false;
+            self.check_at_ms = recorded_ms(row);
             return;
         }
         (self.check, self.land) = (false, false);
         match asked {
-            Asked::Theirs => (self.finished, self.command, self.done_said) = (false, false, false),
+            Asked::Theirs => {
+                (self.finished, self.command, self.done_said) = (false, false, false);
+                (self.land_typed, self.settled) = (false, true);
+            }
             Asked::Command => self.command = true,
-            Asked::Check => (self.check, self.command) = (true, false),
-            Asked::Land => (self.check, self.land, self.command) = (true, true, false),
+            Asked::Check => {
+                (self.check, self.command) = (true, false);
+                (self.check_at_ms, self.check_work_ms) = (recorded_ms(row), Some(0));
+            }
+            Asked::Land => {
+                (self.check, self.land, self.command) = (true, true, false);
+                self.land_typed = true;
+            }
             // The challenge opens the finish again and asks the check's
             // answer; a done report it follows stays the last words until
             // its answer says otherwise, as at the check (RR4-RL-4).
-            Asked::Challenge => (self.finished, self.check, self.command) = (false, true, false),
+            Asked::Challenge => {
+                (self.finished, self.check, self.command) = (false, true, false);
+                self.settled = true;
+                (self.check_at_ms, self.check_work_ms) = (recorded_ms(row), Some(0));
+            }
             Asked::Nobody => self.command = false,
             Asked::Nothing => {}
         }
@@ -2336,6 +2610,7 @@ impl FinishedScan {
         if matches!(asked_by(&Value::Object(asked), &self.ours), Asked::Theirs) {
             (self.finished, self.said, self.check, self.command) = (false, false, false, false);
             (self.done_said, self.notice, self.land, self.cut) = (false, false, false, false);
+            self.settled = true;
         }
     }
 }
@@ -2359,7 +2634,9 @@ pub fn transcript_finished(jsonl: &str, ours: &[Typed]) -> bool {
 /// of transcript text `tail`. What a person's own exchange left to them is
 /// ledgered under, and read back by a later loop and a relaunch
 /// (`approvals::open_left`, the review's RR3-TE-2): the same key, the same
-/// last turn. `None`: no such row, or one that names no `uuid`.
+/// last turn. Read past a command run in Claude Code itself ([`local_row`]),
+/// whose turn its answer names, as [`TurnFold`] reads it. `None`: no such
+/// row, or one that names no `uuid`.
 #[must_use]
 pub fn last_turn_key(tail: &str) -> Option<String> {
     tail.lines()
@@ -2369,7 +2646,13 @@ pub fn last_turn_key(tail: &str) -> Option<String> {
                 return None;
             }
             let v = super::transcript::conversation(line).ok()?;
-            if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            if v.get("isSidechain").and_then(Value::as_bool) == Some(true)
+                || (v.get("type").and_then(Value::as_str) == Some("user")
+                    && first_text(&v)
+                        .map(typed_words)
+                        .and_then(local_row)
+                        .is_some())
+            {
                 return None;
             }
             turn_key_of(&v)
@@ -2377,10 +2660,322 @@ pub fn last_turn_key(tail: &str) -> Option<String> {
         .flatten()
 }
 
+/// THE TURN A CONVERSATION ENDS ON, BY EVERY KEY THAT NAMES IT: its last
+/// turn row's ([`last_turn_key`]: `answer:<uuid>`, or a prompt after it) and
+/// the PROMPT THAT OPENED IT (`prompt:<uuid>`). What a person's own exchange
+/// left to them is ledgered under ([`Self::key`]) and matched by
+/// ([`Self::names`]; `approvals::open_left`, the review's RR3-TE-2).
+///
+/// BY ITS PROMPT, because the prompt's row is the exchange's that is on the
+/// record when the turn ends (ATERM-KI-1016-1): Claude Code writes its rows
+/// on a timer, so a loop that leaves the exchange the moment the busy row
+/// leaves can read a tail that still ends on the person's prompt, or on a
+/// tool's call before the reply's last words — and keyed by that row, the
+/// exchange matched no later reading (each names the reply's last row), and
+/// a new loop or a relaunch typed the done check, `answer@v1` or its
+/// carry-on into the person's exchange. The prompt is the same row whether
+/// the reply's rows are written yet or not. A row an earlier build keyed by
+/// the reply's last row is still matched by that row.
+///
+/// A PERSON'S EXCHANGE AT A WALL, ITS RETRY TYPED, is named by the turn the
+/// retry opened ([`crate::supervise::approvals::LEFT_RETRIED`]): its prompt
+/// says the retry's words, and the turn ended — Claude Code's `turn_duration`
+/// row closed it — within [`turn_end::EXCHANGE_WORK`] together with the
+/// work the exchange did before the wall, as the loop that typed the retry
+/// leaves its short answer to the person.
+///
+/// A COMMAND RUN IN CLAUDE CODE ITSELF SINCE, THAT NO ANSWER FOLLOWED, leaves
+/// that turn the conversation's last ([`LastTurn::asked`], the review's
+/// KR-P5-CMD): Claude Code answers `/config`, `/login`, `/usage` or a `!`
+/// shell command itself, and [`FinishedScan`] reads such a command as a turn
+/// only once an answer follows it. Read as a turn of its own, a person's
+/// `/config` after their exchange was left to them named another turn, and a
+/// relaunch typed its carry-on into the exchange.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LastTurn {
+    /// The last turn row's key ([`last_turn_key`]).
+    pub last: Option<String>,
+    /// The key of the prompt that opened that turn: `None` where the tail
+    /// holds none, or another turn began after it with no prompt of its own
+    /// that was answered ([`TurnFold`]: a `/loop`'s wake, a peer's message,
+    /// a task's notification Claude Code records as its own).
+    pub opened: Option<String>,
+    /// That prompt's words, hashed
+    /// ([`crate::supervise::approvals::words_hash`]).
+    pub opened_said: Option<u64>,
+    /// How long that prompt's turn worked, by the `turn_duration` row that
+    /// closed it: `None` while no such row has followed it.
+    pub ended: Option<std::time::Duration>,
+    /// When that prompt was recorded (its row's `timestamp`, unix ms in
+    /// whole seconds): `None` where its row names no time. What A PERSON'S
+    /// EXCHANGE AN OLDER BUILD NOTED LEFT, with no key, is matched by
+    /// (`crate::supervise::approvals::LEFT_BEFORE`, [`Self::names`]).
+    pub opened_ms: Option<u64>,
+    /// The keys of the COMMANDS ASKED SINCE THAT TURN's answer that no
+    /// answer has followed on the record ([`TurnFold`]), oldest first: a
+    /// local command Claude Code answered itself, or a prompt command
+    /// (`/init`, a custom `/review`) whose answer is still to be written —
+    /// the turn a loop that leaves it the moment its busy row leaves has
+    /// just seen run ([`Self::key`]).
+    pub asked: Vec<String>,
+}
+
+impl LastTurn {
+    /// The turn the transcript text `tail` ends on, read from its start
+    /// ([`TurnFold`]).
+    #[must_use]
+    pub fn of(tail: &str) -> Self {
+        let mut fold = TurnFold::default();
+        for line in tail.lines() {
+            if !(line.contains("\"user\"")
+                || line.contains("\"assistant\"")
+                || line.contains("\"turn_duration\""))
+            {
+                continue;
+            }
+            let Ok(v) = super::transcript::conversation(line) else {
+                continue;
+            };
+            if v.get("isSidechain").and_then(Value::as_bool) != Some(true) {
+                fold.row(&v);
+            }
+        }
+        fold.turn()
+    }
+
+    /// The key a left exchange is ledgered under: the last command asked
+    /// since the turn's answer ([`Self::asked`]) — the record may not hold
+    /// its answer yet when the loop decides, and once it does that command
+    /// opened the turn — else the prompt that opened the turn, else its last
+    /// row's. `None` where none is named.
+    #[must_use]
+    pub fn key(&self) -> Option<String> {
+        self.asked
+            .last()
+            .cloned()
+            .or_else(|| self.opened.clone())
+            .or_else(|| self.last.clone())
+    }
+
+    /// Whether `key` (a left exchange's row) names this turn: its last
+    /// row's key, the prompt that opened it, or a command asked since that
+    /// no answer followed ([`Self::asked`]) — or, for an exchange at a
+    /// wall whose retry was typed ([`crate::supervise::approvals::parse_left_retried`]),
+    /// the retry's turn, ended within the exchange's bound with the work
+    /// before the wall ([`Self`]) — or, for an exchange an older build
+    /// noted left at a time and named no turn of
+    /// ([`crate::supervise::approvals::parse_left_before`]), a turn whose
+    /// prompt was recorded at or before it: no turn opened since, so the
+    /// conversation's last turn is the one that build left. A turn no prompt
+    /// with a time opened is not that turn.
+    #[must_use]
+    pub fn names(&self, key: &str) -> bool {
+        if let Some(at_ms) = crate::supervise::approvals::parse_left_before(key) {
+            return self.opened_ms.is_some_and(|o| o <= at_ms);
+        }
+        if let Some((said, wall)) = crate::supervise::approvals::parse_left_retried(key) {
+            let before = crate::supervise::approvals::parse_left_at_wall(wall)
+                .and_then(|(_, work)| work)
+                .unwrap_or_default();
+            return self.opened_said == Some(said)
+                && self
+                    .ended
+                    .is_some_and(|d| before.saturating_add(d) < turn_end::EXCHANGE_WORK);
+        }
+        self.last.as_deref() == Some(key)
+            || self.opened.as_deref() == Some(key)
+            || self.asked.iter().any(|k| k == key)
+    }
+}
+
+/// The fold [`LastTurn`] is read by, one main-chain row at a time, oldest
+/// first. A prompt row ([`turn_key_of`]'s `prompt:`) opens a turn. The turn
+/// goes on through its model's rows and its tools' results, and through a
+/// row that asks nothing under the turn's own `promptId` or under none (a
+/// Stop hook's feedback, `/goal`'s check-in), as [`FinishedScan`] reads a
+/// turn. A row that names no prompt key but is a turn of its own — numbered
+/// anew by Claude Code (a `/loop`'s wake) or asked by someone who is no
+/// person at the terminal (`origin.kind`: a peer's message, a task's
+/// notification, a usage limit's continuation) — ends it once an answer
+/// follows: the answer is that turn's, which no prompt opened. A row after
+/// the turn's answer that nothing answers (an idle compaction's summary, the
+/// files it restores) leaves it the last turn. So does A COMMAND RUN IN
+/// CLAUDE CODE ITSELF ([`local_row`]), as [`FinishedScan`] reads it
+/// ([`Asked::Command`]): held ([`LastTurn::asked`]) until an answer follows,
+/// which opens the turn at the last command held (a prompt command, a `!`
+/// command the model answers); its output and its caveat ask nothing, and
+/// a turn of its own after it drops it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TurnFold {
+    /// The last turn row's key: `Some(None)` for one that names no `uuid`.
+    last: Option<Option<String>>,
+    /// The key of the prompt that opened the turn running now.
+    opened: Option<String>,
+    /// That prompt's words, hashed ([`LastTurn::opened_said`]).
+    said: Option<u64>,
+    /// That prompt's turn's work, once a `turn_duration` row closed it.
+    ended: Option<std::time::Duration>,
+    /// When that prompt was recorded ([`LastTurn::opened_ms`]).
+    opened_ms: Option<u64>,
+    /// That prompt's `promptId`.
+    prompt_id: Option<String>,
+    /// An answer was read since that prompt.
+    answered: bool,
+    /// A turn of its own began after that answer: the next answer is its.
+    aside: bool,
+    /// The commands asked since, no answer yet ([`LastTurn::asked`]), oldest
+    /// first, at most [`HELD_COMMANDS`].
+    held: Vec<HeldCommand>,
+}
+
+/// A command a [`TurnFold`] holds: its row's key, its words hashed and its
+/// `promptId`, what the turn it opens once answered is named by.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct HeldCommand {
+    key: Option<String>,
+    said: Option<u64>,
+    prompt_id: Option<String>,
+    at_ms: Option<u64>,
+}
+
+/// The commands a [`TurnFold`] holds at most: the newest kept.
+const HELD_COMMANDS: usize = 16;
+
+impl TurnFold {
+    /// Folds main-chain row `v` in.
+    fn row(&mut self, v: &Value) {
+        let key = turn_key_of(v);
+        let words = || first_text(v).map(typed_words);
+        match v.get("type").and_then(Value::as_str) {
+            Some("user")
+                if key.is_some() && words().and_then(local_row) == Some(LocalRow::Command) =>
+            {
+                if self.held.len() >= HELD_COMMANDS {
+                    self.held.remove(0);
+                }
+                self.held.push(HeldCommand {
+                    key: key.flatten(),
+                    said: words().map(crate::supervise::approvals::words_hash),
+                    prompt_id: v.get("promptId").and_then(Value::as_str).map(str::to_owned),
+                    at_ms: recorded_ms(v),
+                });
+                return;
+            }
+            Some("user") if key.is_some() => {
+                self.held.clear();
+                self.opened = key.clone().flatten();
+                self.said = first_text(v)
+                    .map(typed_words)
+                    .map(crate::supervise::approvals::words_hash);
+                self.ended = None;
+                self.opened_ms = recorded_ms(v);
+                self.prompt_id = v.get("promptId").and_then(Value::as_str).map(str::to_owned);
+                (self.answered, self.aside) = (false, false);
+            }
+            Some("system")
+                if v.get("subtype").and_then(Value::as_str) == Some("turn_duration")
+                    && self.opened.is_some()
+                    && !self.aside =>
+            {
+                self.ended = v
+                    .get("durationMs")
+                    .and_then(Value::as_u64)
+                    .map(std::time::Duration::from_millis);
+            }
+            Some("user")
+                if (self.answered || !self.held.is_empty())
+                    && !only_tool_results(v)
+                    && self.turn_of_its_own(v) =>
+            {
+                self.aside = true;
+                self.held.clear();
+            }
+            Some("assistant") if key.is_some() => {
+                if let Some(command) = self.held.pop() {
+                    self.held.clear();
+                    (self.opened, self.said) = (command.key, command.said);
+                    (self.prompt_id, self.ended, self.aside) = (command.prompt_id, None, false);
+                    self.opened_ms = command.at_ms;
+                } else if std::mem::take(&mut self.aside) {
+                    (self.opened, self.opened_ms) = (None, None);
+                }
+                self.answered = true;
+            }
+            _ => {}
+        }
+        if let Some(key) = key {
+            self.last = Some(key);
+        }
+    }
+
+    /// Whether user row `v`, which names no prompt key, is a turn of its
+    /// own: numbered anew — against the last command held, whose own rows
+    /// (a prompt command's expansion, its output) share its `promptId` —
+    /// or asked by no person at the terminal.
+    fn turn_of_its_own(&self, v: &Value) -> bool {
+        let origin = v
+            .get("origin")
+            .and_then(|o| o.get("kind"))
+            .and_then(Value::as_str);
+        let id = v.get("promptId").and_then(Value::as_str);
+        let running = self
+            .held
+            .last()
+            .map_or(self.prompt_id.as_deref(), |c| c.prompt_id.as_deref());
+        begins_unnumbered(v)
+            || origin.is_some_and(|k| k != "human")
+            || id.is_some_and(|id| running != Some(id))
+    }
+
+    /// The turn as folded so far.
+    fn turn(&self) -> LastTurn {
+        let opened = self.opened.is_some();
+        LastTurn {
+            last: self.last.clone().flatten(),
+            opened: self.opened.clone(),
+            opened_said: self.said.filter(|_| opened),
+            ended: self.ended.filter(|_| opened),
+            opened_ms: self.opened_ms.filter(|_| opened),
+            asked: self.held.iter().filter_map(|c| c.key.clone()).collect(),
+        }
+    }
+}
+
+/// A row of a COMMAND RUN IN CLAUDE CODE ITSELF, by its words
+/// ([`typed_words`]), as [`asked_by`] reads it: the command — a slash
+/// command's `<command-name>`/`<command-message>`, a `!` shell command's
+/// `<bash-input>` — a turn only if an answer follows it ([`Asked::Command`]),
+/// or its output (`<local-command-…>`, `<bash-stdout>`, `<bash-stderr>`),
+/// which asks nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalRow {
+    Command,
+    Output,
+}
+
+/// [`LocalRow`] of a user row's words: `None` for any other row.
+fn local_row(words: &str) -> Option<LocalRow> {
+    if ["<command-name>", "<command-message>", BASH_INPUT]
+        .iter()
+        .any(|tag| words.starts_with(tag))
+    {
+        Some(LocalRow::Command)
+    } else if ["<local-command-", BASH_STDOUT, BASH_STDERR]
+        .iter()
+        .any(|tag| words.starts_with(tag))
+    {
+        Some(LocalRow::Output)
+    } else {
+        None
+    }
+}
+
 /// The key main-chain row `v` names as a turn ([`last_turn_key`]): `None`
 /// for a row that is no turn's — an API error's, a non-model's, Claude
 /// Code's own expansion, a tool's result, a compaction's summary, a row of
-/// no words — and `Some(None)` for a turn's row that names no `uuid`.
+/// no words, a local command's output ([`LocalRow::Output`]) — and
+/// `Some(None)` for a turn's row that names no `uuid`. A command's own row
+/// is keyed: it names the turn its answer opens ([`TurnFold`]).
 fn turn_key_of(v: &Value) -> Option<Option<String>> {
     let uuid = || v.get("uuid").and_then(Value::as_str).map(str::to_owned);
     match v.get("type").and_then(Value::as_str) {
@@ -2401,6 +2996,7 @@ fn turn_key_of(v: &Value) -> Option<Option<String>> {
                 || v.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
                 || only_tool_results(v)
                 || first_text(v).is_none_or(|t| t.trim().is_empty())
+                || first_text(v).map(typed_words).and_then(local_row) == Some(LocalRow::Output)
             {
                 return None;
             }
@@ -2417,23 +3013,25 @@ fn turn_key_of(v: &Value) -> Option<Option<String>> {
 /// words as [`prompt_of`] reads them, save a shell command's (`!`): a turn
 /// only if one follows it, its output none.
 fn asked_by(row: &Value, ours: &[Typed]) -> Asked {
-    match row
-        .get("origin")
-        .and_then(|o| o.get("kind"))
-        .and_then(Value::as_str)
-    {
-        Some("task-notification" | "auto-continuation") => return Asked::Nobody,
-        Some("human") | None => {}
-        Some(_) => return Asked::Theirs,
+    if origin_is_someone(row) {
+        return Asked::Theirs;
     }
-    let words = first_text(row).map(typed_words);
-    if words.is_some_and(|t| t.starts_with("<task-notification>")) {
+    if matches!(
+        row.get("origin")
+            .and_then(|o| o.get("kind"))
+            .and_then(Value::as_str),
+        Some("task-notification" | "auto-continuation")
+    ) {
         return Asked::Nobody;
     }
-    if words.is_some_and(|t| t.starts_with("<bash-input>")) {
+    let words = first_text(row).map(typed_words);
+    if words.is_some_and(|t| t.starts_with(TASK_NOTIFICATION)) {
+        return Asked::Nobody;
+    }
+    if words.is_some_and(|t| t.starts_with(BASH_INPUT)) {
         return Asked::Command;
     }
-    if words.is_some_and(|t| t.starts_with("<bash-stdout>") || t.starts_with("<bash-stderr>")) {
+    if words.is_some_and(|t| t.starts_with(BASH_STDOUT) || t.starts_with(BASH_STDERR)) {
         return Asked::Nobody;
     }
     if words.is_some_and(is_done_check) {
@@ -2442,7 +3040,7 @@ fn asked_by(row: &Value, ours: &[Typed]) -> Asked {
     if words.is_some_and(is_land_check) {
         return Asked::Land;
     }
-    if words.is_some_and(|t| opens_with(turn_end::OPEN_ITEMS_HEAD, t)) {
+    if words.is_some_and(turn_end::is_challenge_text) {
         return Asked::Challenge;
     }
     match prompt_of(row, ours) {
@@ -2457,16 +3055,24 @@ fn asked_by(row: &Value, ours: &[Typed]) -> Asked {
 /// whatever rides after them (`turn_end::done_check_text`: the reversible
 /// clause, [`turn_end::DONE_CHECK_REVERSIBLE`], and the standing rules), or
 /// an earlier build's check, which records written then still hold
-/// ([`DONE_CHECK_OPEN_BEFORE`], [`DONE_CHECK_LAST_BEFORE`],
+/// ([`DONE_CHECK_ORDINARY_BEFORE`], [`DONE_CHECK_MARKER_BEFORE`],
+/// [`DONE_CHECK_OPEN_BEFORE`],
+/// [`DONE_CHECK_LAST_BEFORE`],
 /// [`DONE_CHECK_TOKEN_BEFORE`], [`DONE_CHECK_BEFORE`]). So too a restart's
 /// carry-on that asks the check ([`checking`], `continued:check`): the
 /// harness's mark, the restart's facts, then the check's words — its answer
 /// read as the check's, the worker's own word that it is done finishing the
 /// task (the review's RR4-RL-5: read as the harness's own line, a done
-/// answer finished nothing and the loop asked the check a second time).
+/// answer finished nothing and the loop asked the check a second time). BY
+/// ITS WORDS ALONE, whoever typed them (ATERM-KI-1016-1, done-2): the ledger
+/// has no row of a real check in a hand `/resume` tab, or past
+/// [`TYPED_WITHIN_MS`] or the ledger's cut, and a person who types the check
+/// word for word asks what it asks.
 fn is_done_check(text: &str) -> bool {
     let checks = [
         turn_end::DONE_CHECK,
+        DONE_CHECK_ORDINARY_BEFORE,
+        DONE_CHECK_MARKER_BEFORE,
         DONE_CHECK_OPEN_BEFORE,
         DONE_CHECK_LAST_BEFORE,
         DONE_CHECK_TOKEN_BEFORE,
@@ -2475,8 +3081,10 @@ fn is_done_check(text: &str) -> bool {
     checks.iter().any(|check| opens_with(check, text))
         || (text.starts_with(HARNESS_MARK) && {
             let words: Vec<&str> = text.split_whitespace().collect();
-            let check: Vec<&str> = turn_end::DONE_CHECK.split_whitespace().collect();
-            words.windows(check.len()).any(|w| w == check.as_slice())
+            checks.iter().any(|check| {
+                let check: Vec<&str> = check.split_whitespace().collect();
+                words.windows(check.len()).any(|w| w == check.as_slice())
+            })
         })
 }
 
@@ -2485,23 +3093,76 @@ fn is_done_check(text: &str) -> bool {
 /// standing rules after it or not). By its opening words alone: a person's
 /// prompt that quotes them is theirs.
 fn is_land_check(text: &str) -> bool {
-    opens_with(turn_end::LAND, text) || opens_with(turn_end::LAND_NUDGE, text)
+    [
+        turn_end::LAND,
+        turn_end::LAND_NUDGE,
+        turn_end::LAND_BEFORE,
+        turn_end::LAND_NUDGE_BEFORE,
+        LAND_MARKER_BEFORE,
+        LAND_NUDGE_MARKER_BEFORE,
+    ]
+    .iter()
+    .any(|prompt| opens_with(prompt, text))
 }
 
-/// Whether user row `row` is a plain text the session's supervisor typed
-/// ([`prompt_of`]'s [`Prompt::Harness`] by its ledger, `ours`): no mark of
-/// the harness's and no command — what the turn-end policy types as a
-/// wall's retry ([`turn_end::wall_retry_text`]) or as the usage resume
+/// Whether user row `row` is CLAUDE CODE'S OWN CONTINUATION of a usage limit
+/// at its reset (`origin.kind` `auto-continuation`): after a limit's row in
+/// the done check's turn or a land act's ([`FinishedScan::cut`]) it delivers
+/// the cut act again, as the wall's retry does, and as the turn-end policy
+/// reads the turn under the vendor's `continuing automatically`
+/// (`TurnEndState::observe`; ATERM-KI-1016-1: read as a turn nobody asked,
+/// the reply to it was a first done report, and the record asked the check
+/// once more).
+fn vendor_continues(row: &Value) -> bool {
+    row.get("origin")
+        .and_then(|o| o.get("kind"))
+        .and_then(Value::as_str)
+        == Some("auto-continuation")
+}
+
+/// Whether user row `row` is LAND'S ANSWER TO A QUESTION the session's
+/// supervisor typed (`turn_end::LAND_ANSWER`): its words, by the ledger row
+/// of its rule (`land-answer@v1`), never the words alone — a person may
+/// type them. Land's check to the record only once the instruction was read
+/// ([`FinishedScan::land_typed`]).
+fn lands_answer(row: &Value, ours: &[Typed]) -> bool {
+    row.get("isMeta").and_then(Value::as_bool) != Some(true)
+        && first_text(row).map(typed_words).is_some_and(|t| {
+            opens_with(turn_end::LAND_ANSWER, t)
+                && typed_by(ours, t, recorded_ms(row), |o| {
+                    o.rule == turn_end::RULE_LAND_ANSWER
+                })
+        })
+}
+
+/// Whether user row `row` is a WALL'S RETRY the session's supervisor typed:
+/// a plain text (no mark of the harness's, no command) its ledger `ours`
+/// records under a wall's retry rule (`turn_end::is_wall_retry`) — the
+/// retry ([`turn_end::wall_retry_text`]) or the usage resume
 /// ([`turn_end::continuation_text`]), the acts that deliver again the check
-/// a wall cut ([`FinishedScan::cut`]). Not `/compact` or `/login` (a
-/// command's row), nor a restart's marked carry-on, which no wall's retry
-/// is: their answers are no check's, and the next done report gets one
-/// (fail closed).
+/// a wall cut ([`FinishedScan::cut`]), as the turn-end policy reads them
+/// (`TurnEndState::acted`). By the ledger's rule, never the words alone:
+/// the usage resume's `keep going` is the continuation's too, and a `keep
+/// going` the continue policy typed after a wall in the check's turn
+/// (`continue@v1`) delivers no check — read as the retry, a done reply to
+/// it was the check's answer, and the record ended the task for a relaunch
+/// or the upgrade where the policy asks the check once more. Not
+/// `/compact` or `/login` (a command's row), nor a restart's marked
+/// carry-on, which no wall's retry is: their answers are no check's, and
+/// the next done report gets one (fail closed). Where a full context cut the
+/// check, the turn-end policy types the check itself as the `/compact`'s
+/// continuation (`TurnEndState::compact_owes`), which [`is_done_check`] reads
+/// as the check by its words (ATERM-KI-1016-1, done-3). A ledger row that
+/// names no rule is none either.
 fn supervisors_plain(row: &Value, ours: &[Typed]) -> bool {
-    first_text(row)
-        .map(typed_words)
-        .is_some_and(|t| !t.starts_with(HARNESS_MARK) && !t.starts_with('<'))
-        && matches!(prompt_of(row, ours), Prompt::Harness)
+    row.get("isMeta").and_then(Value::as_bool) != Some(true)
+        && first_text(row).map(typed_words).is_some_and(|t| {
+            !t.starts_with(HARNESS_MARK)
+                && !t.starts_with('<')
+                && typed_by(ours, t, recorded_ms(row), |o| {
+                    turn_end::is_wall_retry(&o.rule)
+                })
+        })
 }
 
 /// Whether `text` opens with `check`'s words, however spaced or wrapped.
@@ -2511,6 +3172,71 @@ fn opens_with(check: &str, text: &str) -> bool {
 }
 
 /// A user row's first text, as [`prompt_of`] reads it.
+/// The fixed opening words of Claude Code's notice of a one-shot scheduled
+/// task missed while it was not running (`Pcr` in the 2.1.252 bundle, the
+/// same in 2.1.302: `The following one-shot scheduled task was missed …` or
+/// `… tasks were missed …`).
+pub(crate) const MISSED_TASK_NOTICE: &str = "The following one-shot scheduled task";
+
+/// Whether a user row with NO `promptId` is a turn Claude Code begins of its
+/// own ([`FinishedScan`]'s `asked`), never a row of the running turn: one
+/// whose `turnOrigin` names it (Claude Code's own rule, 2.1.302: `promptId ||
+/// turnOrigin || !isMeta`; `scheduled`, `auto_continuation`, `peer`, while a
+/// Stop hook's feedback and `/goal`'s check-in carry none), a `/loop`'s wake
+/// by the scheduled task it fired for (`scheduledTaskId`, the scheduler's
+/// `onFireTask`), and the notice of a missed one-shot task, which the
+/// scheduler's `onFire` gives neither at a start (the review of
+/// ATERM-KI-1016-1, KR-DONE-4: `if(l)l(e);else t(Pcr(e))`, the REPL passing
+/// no `onMissed`), by its fixed opening words ([`MISSED_TASK_NOTICE`]).
+fn begins_unnumbered(row: &Value) -> bool {
+    begins_unnumbered_by(
+        |key| row.get(key).is_some_and(|v| !v.is_null()),
+        row.get("isMeta").and_then(Value::as_bool) == Some(true),
+        first_text(row),
+    )
+}
+
+/// [`begins_unnumbered`] of a row read in parts, as the step fold reads one
+/// (`steps::StepFold`, which keeps no text: `lead` is at most the first
+/// decoded bytes of its first text): `named(key)` says whether the row
+/// names a non-null `key` ([`TURN_ORIGIN`], [`SCHEDULED_TASK_ID`]), `meta`
+/// whether it is `isMeta`.
+pub(crate) fn begins_unnumbered_by(
+    named: impl Fn(&str) -> bool,
+    meta: bool,
+    lead: Option<&str>,
+) -> bool {
+    named(TURN_ORIGIN)
+        || named(SCHEDULED_TASK_ID)
+        || (meta && lead.is_some_and(|t| t.trim_start().starts_with(MISSED_TASK_NOTICE)))
+}
+
+/// The key Claude Code names a turn's origin by (`scheduled`,
+/// `auto_continuation`, `peer`, `human`, `task_notification`).
+pub(crate) const TURN_ORIGIN: &str = "turnOrigin";
+/// The key of the scheduled task a `/loop`'s wake fired for.
+pub(crate) const SCHEDULED_TASK_ID: &str = "scheduledTaskId";
+
+/// Whether a user row whose `promptId` is `id` begins a turn Claude Code
+/// numbered of its own while the turn running is `running` (the last
+/// `promptId` read; [`FinishedScan`]'s rule, which the step fold shares):
+/// a `promptId` other than the running one, or none on a row that
+/// `unnumbered` says begins one ([`begins_unnumbered`]). A row under the
+/// running turn's `promptId` (a Stop hook's feedback, `/goal`'s check-in)
+/// goes on that turn. `FinishedScan` reads from the file's first byte; the
+/// step fold, which can bind mid-turn, passes no `id` while its running
+/// turn is unread (`steps.rs`'s module docs).
+pub(crate) fn numbered_anew<T: PartialEq>(
+    id: Option<T>,
+    running: Option<T>,
+    unnumbered: impl FnOnce() -> bool,
+) -> bool {
+    match id {
+        Some(id) => running != Some(id),
+        None => unnumbered(),
+    }
+}
+
 fn first_text(row: &Value) -> Option<&str> {
     match row.get("message")?.get("content")? {
         Value::String(t) => Some(t.as_str()),
@@ -2556,7 +3282,7 @@ fn answer_words(message: &Value) -> Option<String> {
 enum Turn {
     /// A main-chain user row that IS the live upgrade's announcement
     /// ([`is_announcement`]).
-    Notice,
+    Notice(Value),
     /// A main-chain user row that directs the conversation ([`is_direction`]).
     Direction,
     /// A main-chain assistant row the agent wrote itself — never a
@@ -2578,6 +3304,9 @@ fn turn_of(line: &str) -> Option<Turn> {
     }
     match v.get("type").and_then(Value::as_str) {
         Some("assistant") => {
+            if v.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) {
+                return None;
+            }
             let message = v.as_object_mut()?.remove("message").unwrap_or_default();
             let theirs = message
                 .get("model")
@@ -2588,7 +3317,7 @@ fn turn_of(line: &str) -> Option<Turn> {
         Some("user") => {
             let message = v.get("message")?;
             if is_announcement(message) {
-                return Some(Turn::Notice);
+                return Some(Turn::Notice(message.clone()));
             }
             if v.get("isMeta").and_then(Value::as_bool) == Some(true)
                 || v.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
@@ -2610,21 +3339,31 @@ fn turn_of(line: &str) -> Option<Turn> {
     }
 }
 
-/// Whether an assistant `message` answers with `marker`: a text part with the
-/// marker on a line of its own ([`is_ready_line`]).
-fn answers(message: &Value, marker: &str) -> bool {
-    message
-        .get("content")
-        .and_then(Value::as_array)
-        .is_some_and(|content| {
-            content.iter().any(|part| {
-                part.get("type").and_then(Value::as_str) == Some("text")
-                    && part
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .is_some_and(|t| says_ready(t, marker))
-            })
-        })
+/// A notice's input reference must match the round before an ordinary
+/// answer can consent to a restart. A substring elsewhere in a conversation
+/// is never enough: callers first identify the announcement itself.
+fn notice_matches(message: &Value, marker: &str) -> bool {
+    !marker.is_empty() && answer_words(message).is_some_and(|words| words.contains(marker))
+}
+
+/// Legacy marker answers identify their own request. An ordinary readiness
+/// answer instead needs the matching notice, the session's model, and its
+/// final text row. Text parts are read together so a later caveat cannot be
+/// hidden in a second part.
+fn answers(message: &Value, marker: &str, matching_notice: bool) -> bool {
+    let Some(words) = answer_words(message) else {
+        return false;
+    };
+    if !marker.is_empty() && words.lines().any(|line| is_ready_line(line, marker)) {
+        return true;
+    }
+    matching_notice
+        && message
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(is_model_id)
+        && message.get("stop_reason").and_then(Value::as_str) == Some("end_turn")
+        && readiness::says_ready(&words)
 }
 
 /// Whether the agent's READY was superseded ([`Facts::ready_superseded`]):
@@ -2636,11 +3375,22 @@ fn answers(message: &Value, marker: &str) -> bool {
 #[must_use]
 pub fn ready_superseded(jsonl: &str, markers: &[String]) -> bool {
     let (mut answered, mut superseded) = (false, false);
+    let mut matching_notice = false;
     for line in jsonl.lines() {
         match turn_of(line) {
-            Some(Turn::Notice) => (answered, superseded) = (false, false),
-            Some(Turn::Direction) => superseded |= answered,
-            Some(Turn::Agent(message)) if markers.iter().any(|m| answers(&message, m)) => {
+            Some(Turn::Notice(message)) => {
+                (answered, superseded) = (false, false);
+                matching_notice = markers.iter().any(|m| notice_matches(&message, m));
+            }
+            Some(Turn::Direction) => {
+                superseded |= answered;
+                matching_notice = false;
+            }
+            Some(Turn::Agent(message))
+                if markers
+                    .iter()
+                    .any(|m| answers(&message, m, matching_notice)) =>
+            {
                 (answered, superseded) = (true, false);
             }
             Some(Turn::Agent(_)) | None => {}
@@ -2653,10 +3403,10 @@ pub fn ready_superseded(jsonl: &str, markers: &[String]) -> bool {
 /// long paste is recorded as `\n\n<pasted_content id="…">\n<text>\n
 /// </pasted_content id="…">\n` (the upgrade's own notice, typed as one paste
 /// by the control socket's `turn`, included). Every reader of how a row's
-/// words begin ([`is_announcement`], [`TaskScan`], [`is_direction`]) reads
-/// the pasted text of a wrapped row, tags dropped; any other row as is,
-/// leading blanks trimmed.
-fn typed_words(text: &str) -> &str {
+/// words begin ([`is_announcement`], [`TaskScan`], [`is_direction`], the
+/// survey's prompts in [`super::excerpt`]) reads the pasted text of a wrapped
+/// row, tags dropped; any other row as is, leading blanks trimmed.
+pub(crate) fn typed_words(text: &str) -> &str {
     let t = text.trim_start();
     let Some((tag, body)) = t
         .strip_prefix("<pasted_content")
@@ -2681,7 +3431,7 @@ fn is_direction(text: &str) -> bool {
     if t.is_empty() || t.starts_with("[aterm harness]") {
         return false;
     }
-    !t.starts_with('<') || t.starts_with("<bash-input>")
+    !t.starts_with('<') || t.starts_with(BASH_INPUT)
 }
 
 /// Whether a transcript user `message` is the live upgrade's announcement:
@@ -3654,8 +4404,10 @@ const _: () = {
 /// flight. Someone else's command (`<command-name>…`) is a task once it starts
 /// a turn (an assistant row after it, `<synthetic>` included), none once its
 /// local output shows it started none (`/model`), and a task while neither is
-/// read. Not prompts: subagent rows (`isSidechain`), Claude Code's command or
-/// skill expansions (`isMeta`), tool results, local command output
+/// read. A peer's message (`origin.kind` `peer`, recorded `isMeta`) and a row
+/// of an origin kind not known here are someone's prompts too. Not prompts:
+/// subagent rows (`isSidechain`), Claude Code's command or skill expansions
+/// (`isMeta`), tool results, local command output
 /// (`<local-command-…>`, in a `user` row or, since 2.1.302's `/clear`, a
 /// `system` row of subtype `local_command`), Esc's `[Request interrupted by
 /// user…`. Any other shape counts as a task.
@@ -3728,6 +4480,16 @@ impl TaskScan {
         }
         match v.get("type").and_then(Value::as_str) {
             Some("assistant") => self.tasked = self.command,
+            // A PEER'S MESSAGE is someone's ask (`origin.kind` `peer`, which
+            // Claude Code records `isMeta`, so its words read as no prompt),
+            // and so is a row of any kind not known here, as
+            // [`FinishedScan`] reads them: a conversation only a peer
+            // directed read taskless, and the upgrade restarted it afresh,
+            // its conversation left behind. Claude Code's own wakes and a
+            // person's terminal input are read by their words below (a
+            // background task's notification there is a task: in doubt the
+            // conversation is kept).
+            Some("user") if origin_is_someone(&v) => self.tasked = true,
             Some("user") => match prompt_of(&v, &self.ours) {
                 Prompt::Theirs => self.tasked = true,
                 Prompt::Command => self.command = true,
@@ -3764,6 +4526,18 @@ impl TaskScan {
     pub fn settled(&self) -> bool {
         self.tasked
     }
+}
+
+/// Whether user row `row` is someone's by its origin's kind alone: a peer's
+/// message, or a kind this build does not know — never Claude Code's own
+/// wakes (`task-notification`, `auto-continuation`), a person's terminal
+/// input (`human`) or a row that names no origin, which are read by their
+/// words ([`asked_by`], [`TaskScan`]).
+fn origin_is_someone(row: &Value) -> bool {
+    row.get("origin")
+        .and_then(|o| o.get("kind"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| !matches!(kind, "human" | "task-notification" | "auto-continuation"))
 }
 
 /// [`TaskScan`] over a whole transcript, its session's supervisor having
@@ -3827,21 +4601,7 @@ fn prompt_of(row: &Value, ours: &[Typed]) -> Prompt {
     let Some(text) = text.map(typed_words) else {
         return Prompt::Theirs;
     };
-    // When it was recorded, unix ms (whole seconds): a row with no time is
-    // no row of the loop's.
-    let at_ms = row
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .and_then(models::parse_utc)
-        .map(|s| s.saturating_mul(1000));
-    let supervisors = |said: &str| {
-        at_ms.is_some_and(|at| {
-            ours.iter().any(|o| {
-                same_words(&o.text, said)
-                    && u64::try_from(o.at_ms).is_ok_and(|t| t.abs_diff(at) <= TYPED_WITHIN_MS)
-            })
-        })
-    };
+    let supervisors = |said: &str| typed_by(ours, said, recorded_ms(row), |_| true);
     if text.starts_with(HARNESS_MARK) {
         Prompt::Harness
     } else if text.starts_with("<local-command-") {
@@ -3852,13 +4612,37 @@ fn prompt_of(row: &Value, ours: &[Typed]) -> Prompt {
         } else {
             Prompt::Command
         }
-    } else if text.starts_with("[Request interrupted by user") {
+    } else if text.starts_with(INTERRUPTED) {
         Prompt::None
     } else if supervisors(text) {
         Prompt::Harness
     } else {
         Prompt::Theirs
     }
+}
+
+/// When user row `row` was recorded, unix ms (whole seconds): a row with no
+/// time is no row of the loop's ([`typed_by`]), and opens no turn an older
+/// build's note of a left exchange names ([`LastTurn::opened_ms`]).
+fn recorded_ms(row: &Value) -> Option<u64> {
+    row.get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(models::parse_utc)
+        .map(|s| s.saturating_mul(1000))
+}
+
+/// Whether the session's supervisor typed words `said`, recorded at `at_ms`
+/// ([`recorded_ms`]), by its ledger `ours`: a text of the same words typed
+/// within [`TYPED_WITHIN_MS`] of it, whose row `of` accepts (its rule:
+/// [`supervisors_plain`]). A row with no time is none of the loop's.
+fn typed_by(ours: &[Typed], said: &str, at_ms: Option<u64>, of: impl Fn(&Typed) -> bool) -> bool {
+    at_ms.is_some_and(|at| {
+        ours.iter().any(|o| {
+            same_words(&o.text, said)
+                && u64::try_from(o.at_ms).is_ok_and(|t| t.abs_diff(at) <= TYPED_WITHIN_MS)
+                && of(o)
+        })
+    })
 }
 
 /// Whether two texts are the same words, however spaced or wrapped.
@@ -4016,8 +4800,8 @@ pub struct Facts {
     /// waits on holds an announced round only within the re-ask's window.
     pub work_ended: bool,
     /// The screen shows a READY the transcript has not recorded yet: the
-    /// agent's last words on an idle screen ([`aterm_phase::said_tail`]) carry
-    /// this round's marker on a line of its own ([`says_ready`]), from the
+    /// agent's last words on an idle screen ([`aterm_phase::said_tail`]) affirm
+    /// readiness or carry a legacy marker ([`says_ready`]), from the
     /// process the notice reached, but the transcript tail does not. Claude
     /// Code draws the answer before its batched transcript append lands. The
     /// screen is no consent (only the transcript row lets the restart go), but
@@ -5699,3 +6483,10 @@ pub fn span(secs: u64) -> String {
 #[cfg(test)]
 #[path = "upgrade_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "steps_prompt_agreement_tests.rs"]
+mod steps_prompt_agreement_tests;
+
+#[path = "upgrade_readiness.rs"]
+mod readiness;

@@ -68,7 +68,16 @@ mod imp;
 // and the tests.
 #[cfg(unix)]
 pub(crate) use imp::our_uid;
-pub(crate) use imp::{ensure_private_dir, lock_socket_file, peer_check, provision_token};
+pub(crate) use imp::{
+    ensure_private_dir, harden_private_dir, lock_socket_file, peer_check, provision_token,
+};
+// The directory a control socket and its token go in: on Windows an elevated
+// instance holds it to the elevation law (`control_auth_win.rs`,
+// `docs/WINDOWS_PARAGON_DESIGN.md` §5.7); everywhere else it is a private dir.
+#[cfg(windows)]
+pub(crate) use imp::ensure_control_dir;
+#[cfg(not(windows))]
+pub(crate) use imp::ensure_private_dir as ensure_control_dir;
 // Whether a pid is alive: the stale sweeps' one test, shared with the handoff's
 // sweep of a dead sender's `seamless-<pid>-…` leftovers (`crate::seamless`).
 pub(crate) use imp::pid_alive;
@@ -382,8 +391,24 @@ struct ArtifactLeaseState {
 }
 
 const ARTIFACT_CLEANUP_QUEUE_LIMIT: usize = 32;
-static ARTIFACT_CLEANUP_QUEUE_LIVE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+
+/// The count a cleanup-queue permit is charged to: the process's one, or in a test build
+/// the calling test thread's own (`crate::control::test_thread_budget`), so a sibling
+/// test's backlog at the one cleanup worker never refuses this test's admission.
+fn artifact_cleanup_queue_live() -> &'static std::sync::atomic::AtomicUsize {
+    #[cfg(test)]
+    {
+        crate::control::test_thread_budget!(
+            std::sync::atomic::AtomicUsize,
+            std::sync::atomic::AtomicUsize::new(0)
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        &LIVE
+    }
+}
 
 #[derive(Clone, Debug)]
 struct ArtifactCleanupQueuePermit {
@@ -492,18 +517,16 @@ impl Drop for DeferredVideoCleanup {
 
 impl ArtifactCleanupQueuePermit {
     fn try_acquire() -> Option<Self> {
-        ARTIFACT_CLEANUP_QUEUE_LIVE
-            .try_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |current| (current < ARTIFACT_CLEANUP_QUEUE_LIMIT).then_some(current + 1),
-            )
-            .ok()
-            .map(|_| Self {
-                _inner: std::sync::Arc::new(ArtifactCleanupQueuePermitInner {
-                    live: Some(&ARTIFACT_CLEANUP_QUEUE_LIVE),
-                }),
-            })
+        let live = artifact_cleanup_queue_live();
+        live.try_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |current| (current < ARTIFACT_CLEANUP_QUEUE_LIMIT).then_some(current + 1),
+        )
+        .ok()
+        .map(|_| Self {
+            _inner: std::sync::Arc::new(ArtifactCleanupQueuePermitInner { live: Some(live) }),
+        })
     }
 
     #[cfg(test)]
@@ -1244,7 +1267,7 @@ pub(crate) fn acquire_capture_name_lease(
     acquire_capture_name_lease_with_wait(target, cancelled, CAPTURE_NAMESPACE_WAIT)
 }
 
-fn acquire_capture_name_lease_with_wait(
+pub(crate) fn acquire_capture_name_lease_with_wait(
     target: &ConfinedImage,
     cancelled: impl Fn() -> bool,
     explicit_wait: std::time::Duration,
@@ -1312,8 +1335,9 @@ fn acquire_capture_name_lease_with_wait(
         // Lock the SAME retained authority the writer uses. On Unix the
         // directory inode itself is the advisory-lock object, so a same-uid
         // actor cannot split two writers by replacing a child lockfile. Windows
-        // locks a child file reached through the deny-delete pinned directory;
-        // its share mode prevents replacement for the full lock lifetime.
+        // locks a child file proven to sit inside the pinned directory; its
+        // share mode denies its own replacement, and NTFS refuses to rename a
+        // directory above an open file, for the full lock lifetime.
         #[cfg(unix)]
         let mut file = target.pinned()?.open_directory_lock()?;
         #[cfg(windows)]
@@ -1662,10 +1686,12 @@ fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
         use std::os::windows::fs::MetadataExt as _;
         // FILE_ATTRIBUTE_REPARSE_POINT. This includes junctions, which
         // `FileType::is_symlink` alone does not promise to classify.
-        return metadata.file_attributes() & 0x400 != 0;
+        metadata.file_attributes() & 0x400 != 0
     }
     #[cfg(not(windows))]
-    false
+    {
+        false
+    }
 }
 
 /// Create/validate one real directory immediately below a canonical parent.
@@ -1979,18 +2005,21 @@ impl DeadNamespaceSweep {
     /// Continuations prevent a permanent live/clutter prefix from starving
     /// valid stale namespaces beyond the first scan slice.
     fn run_batch(&mut self, pid_alive: impl FnMut(u32) -> bool) -> bool {
-        self.run_batch_with_hook(pid_alive, || {})
+        self.run_batch_with_hook(DEAD_INSTANCE_DELETE_LIMIT, pid_alive, || {})
     }
 
+    /// [`Self::run_batch`] with its delete budget given and a hook run just
+    /// before each namespace's lease probe.
     fn run_batch_with_hook(
         &mut self,
+        delete_limit: usize,
         mut pid_alive: impl FnMut(u32) -> bool,
         mut before_lease_probe: impl FnMut(),
     ) -> bool {
         if self.root.validate_path_identity().is_err() {
             return true;
         }
-        let mut delete_budget = DEAD_INSTANCE_DELETE_LIMIT;
+        let mut delete_budget = delete_limit;
         let mut mutated = false;
         for _ in 0..DEAD_INSTANCE_SCAN_LIMIT {
             if delete_budget == 0 {
@@ -2271,10 +2300,15 @@ impl VideoTombstoneSweep {
     /// Consume one bounded slice. `true` means this cursor reached EOF or its
     /// lexical root no longer names the retained identity.
     fn run_batch(&mut self) -> bool {
+        self.run_batch_within(VIDEO_PRUNE_WORK_LIMIT)
+    }
+
+    /// [`Self::run_batch`] with its work budget given.
+    fn run_batch_within(&mut self, work_limit: usize) -> bool {
         if self.root.validate_path_identity().is_err() {
             return true;
         }
-        let mut work = VideoPruneWork::new(VIDEO_PRUNE_WORK_LIMIT);
+        let mut work = VideoPruneWork::new(work_limit);
         let mut mutated = false;
         for _ in 0..VIDEO_PRUNE_SCAN_LIMIT {
             let entry_name = match self.entries.next() {
@@ -2656,7 +2690,7 @@ impl Drop for ConfinedVideoDir {
 #[must_use]
 #[cfg(test)]
 pub(crate) fn confine_video_dir(sock_dir: &Path) -> Option<ConfinedVideoDir> {
-    confine_video_dir_with_admission(sock_dir, |_| true).ok()
+    confine_video_dir_for_instance(sock_dir, process_instance_id())
 }
 
 pub(crate) fn confine_video_dir_with_admission(
@@ -2666,10 +2700,30 @@ pub(crate) fn confine_video_dir_with_admission(
     confine_video_dir_for_instance_with_admission(sock_dir, process_instance_id(), admit)
 }
 
+/// The tests' confinement, which waits out an ADMISSION refusal and answers
+/// every other one at once. A refusal there is capacity, not a verdict: each
+/// live recording holds two slots of the process-wide cleanup queue
+/// (`ARTIFACT_CLEANUP_QUEUE_LIMIT`, 32) until the one cleanup worker drains the
+/// sweeps its drop queued, and every test in the binary shares both. A
+/// parallel run's threads (sixteen on the Windows host) recording at once fill
+/// it while the worker is a few sweeps behind, which on Windows, where one
+/// sweep's opens cost tens of milliseconds, they did (2026-10-17: five or six
+/// video tests answered `None` here in four parallel runs of five; none did
+/// alone or single-threaded). The product's `video` answers that refusal as
+/// busy for its client to retry. The wait is a hang detector
+/// ([`aterm_spec::wait::MUST_HAPPEN`]): a queue that never frees is a leak.
 #[must_use]
 #[cfg(test)]
 fn confine_video_dir_for_instance(sock_dir: &Path, instance: &str) -> Option<ConfinedVideoDir> {
-    confine_video_dir_for_instance_with_admission(sock_dir, instance, |_| true).ok()
+    aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        std::time::Duration::from_millis(5),
+        || match confine_video_dir_for_instance_with_admission(sock_dir, instance, |_| true) {
+            Err(ArtifactConfinementError::AdmissionRefused) => None,
+            result => Some(result.ok()),
+        },
+    )
+    .unwrap_or_else(|| panic!("video admission never freed for {sock_dir:?}: a leak, not load"))
 }
 
 fn confine_video_dir_for_instance_with_admission(
@@ -3188,6 +3242,9 @@ fn prune_video_dirs_with_work(
         }
         mutated = true;
         needed -= 1;
+        // The pin the rename moved clears and removes the tombstone itself, on
+        // both backends: Unix by its descriptor, Windows by where its handle now
+        // is (`pinned_dir`'s `remove_contents`), never by the stale old name.
         let cleanup = cleanup_video_tombstone(root, &tombstone, &recording, work);
         mutated |= cleanup.mutated;
         if !cleanup.removed && work.remaining == 0 {
@@ -3317,7 +3374,18 @@ pub(crate) fn sun_path_ok(path: &str) -> bool {
 /// launch flags.
 #[must_use]
 pub(crate) fn resolve_socket_plan() -> SocketResolution {
-    match crate::cli::launch_flags().socket_directive() {
+    resolve_socket_plan_for(
+        crate::cli::launch_flags().socket_directive(),
+        aterm_uds::control_socket_dir,
+    )
+}
+
+/// [`resolve_socket_plan`] for a given directive and per-user directory lookup.
+fn resolve_socket_plan_for(
+    directive: SocketDirective,
+    control_socket_dir: impl FnOnce() -> Option<PathBuf>,
+) -> SocketResolution {
+    match directive {
         SocketDirective::Disabled => SocketResolution::Disabled,
         SocketDirective::Explicit(p) => {
             // An oversized path can never bind (EINVAL) — and its liveness probe
@@ -3339,7 +3407,7 @@ pub(crate) fn resolve_socket_plan() -> SocketResolution {
         // `socket_dir`'s two refusals, told apart: no folder to resolve, and a
         // folder that cannot be made private.
         SocketDirective::PerInstance => {
-            let Some(dir) = aterm_uds::control_socket_dir() else {
+            let Some(dir) = control_socket_dir() else {
                 return SocketResolution::NoDir;
             };
             if let Err(error) = ensure_private_dir(&dir) {
@@ -3767,7 +3835,12 @@ pub(crate) fn harness_token() -> Option<&'static str> {
 /// constant-time compare); `Denied` when there is none.
 #[must_use]
 pub(crate) fn check_harness_line(line: &str) -> AuthOutcome {
-    match harness_token() {
+    check_line_against(line, harness_token())
+}
+
+/// [`check_auth_line`] against `token`, or `Denied` when there is none.
+fn check_line_against(line: &str, token: Option<&str>) -> AuthOutcome {
+    match token {
         Some(token) => check_auth_line(line, token),
         None => AuthOutcome::Denied,
     }
@@ -4120,7 +4193,16 @@ mod tests {
     use crate::native_document_host::HeldAdvisoryLock;
 
     #[test]
-    fn a_session_file_is_named_only_for_a_server_minted_sid() {
+    fn client_named_paths_are_named_only_for_server_minted_ids() {
+        let sock = Path::new("/c");
+        assert_eq!(
+            video_instance_root_for(sock, "p12-ab-3"),
+            Some(sock.join(VIDEO_DIR).join("p12-ab-3"))
+        );
+        for bad in ["", ".", "..", "a/b", "a.b", "a\0b"] {
+            assert_eq!(video_instance_root_for(sock, bad), None, "{bad:?}");
+        }
+
         let dir = Path::new("/c/integration");
         let sid = aterm_session::SessionId::new("s-09035e075d6ee9388965".to_string());
         assert_eq!(
@@ -4232,6 +4314,45 @@ mod tests {
             "the dial blocks: F_GETFL = {status_flags:#x}"
         );
         drop(stream);
+
+        // A path no socket address can carry is refused before any dial: one
+        // with a NUL (the kernel would dial the prefix — the live socket here)
+        // and one that leaves `sun_path` no room for its terminator. The
+        // longest path a plan binds is dialed (nobody is there).
+        for (bad, kind) in [
+            (
+                format!("{}\0junk", path.to_str().unwrap()),
+                std::io::ErrorKind::InvalidInput,
+            ),
+            (
+                "a".repeat(MAX_SUN_PATH + 1),
+                std::io::ErrorKind::InvalidInput,
+            ),
+            ("a".repeat(MAX_SUN_PATH), std::io::ErrorKind::NotFound),
+        ] {
+            let refused = connect_socket_nonblocking(&bad).expect_err("no listener");
+            assert_eq!(refused.kind(), kind, "{bad:?}");
+        }
+
+        // The bind gate: a path a listener answers on is never unlinked —
+        // under either probe — and an absent one is bound.
+        let live = path.to_str().unwrap();
+        let absent = dir.path().join("absent.sock");
+        let absent = absent.to_str().unwrap();
+        for (is_live, want) in [
+            (socket_is_live(live), BindAction::RefuseLiveSocket),
+            (
+                socket_is_live_per_instance(live),
+                BindAction::RefuseLiveSocket,
+            ),
+            (socket_is_live(absent), BindAction::RemoveAndBind),
+            (
+                socket_is_live_per_instance(absent),
+                BindAction::RemoveAndBind,
+            ),
+        ] {
+            assert_eq!(decide_bind(is_live), want);
+        }
         drop(listener);
     }
 
@@ -4287,6 +4408,79 @@ mod tests {
         assert_eq!(MAX_SUN_PATH, 107);
     }
 
+    /// Each way the launch can end up socketless is its own named outcome,
+    /// and each bindable plan pairs the socket with its own token.
+    #[test]
+    fn the_socket_plan_names_every_refusal() {
+        use SocketDirective::{Disabled, Explicit, PerInstance};
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let short = temp.path().join("a.sock").to_string_lossy().into_owned();
+        let SocketResolution::Enabled(plan) =
+            resolve_socket_plan_for(Explicit(short.clone()), || None)
+        else {
+            panic!("a short explicit path binds");
+        };
+        assert_eq!(
+            (plan.sock_path.as_str(), plan.latest_link),
+            (short.as_str(), None)
+        );
+        assert_eq!(plan.token_path, token_path_for_socket(&short));
+        let long = format!("/{}", "a".repeat(MAX_SUN_PATH));
+        assert!(matches!(
+            resolve_socket_plan_for(Explicit(long.clone()), || None),
+            SocketResolution::PathTooLong { path, limit } if path == long && limit == MAX_SUN_PATH
+        ));
+        assert!(matches!(
+            resolve_socket_plan_for(Disabled, || None),
+            SocketResolution::Disabled
+        ));
+        assert!(matches!(
+            resolve_socket_plan_for(PerInstance, || None),
+            SocketResolution::NoDir
+        ));
+        let not_a_dir = temp.path().join("file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        assert!(matches!(
+            resolve_socket_plan_for(PerInstance, || Some(not_a_dir.clone())),
+            SocketResolution::DirUnusable { dir, .. } if dir == not_a_dir
+        ));
+        let dir = temp.path().join("control");
+        let SocketResolution::Enabled(plan) =
+            resolve_socket_plan_for(PerInstance, || Some(dir.clone()))
+        else {
+            panic!("a private per-user directory binds");
+        };
+        let pid = std::process::id();
+        assert_eq!(
+            plan.sock_path,
+            dir.join(control_socket::instance_sock_name(pid))
+                .to_string_lossy()
+        );
+        assert_eq!(
+            plan.token_path,
+            dir.join(control_socket::instance_token_name(pid))
+        );
+        assert_eq!(plan.latest_link, Some(dir.join(SOCK_FILE)));
+    }
+
+    /// The best-effort cleanup queue admits exactly its limit, and a released
+    /// slot is admitted again. The count is this test thread's own
+    /// (`artifact_cleanup_queue_live`), so it starts empty.
+    #[test]
+    fn the_cleanup_queue_admits_exactly_its_limit() {
+        let live = artifact_cleanup_queue_live();
+        assert_eq!(live.load(std::sync::atomic::Ordering::Acquire), 0);
+        let mut permits: Vec<_> = (0..ARTIFACT_CLEANUP_QUEUE_LIMIT)
+            .map(|_| ArtifactCleanupQueuePermit::try_acquire().expect("within the limit"))
+            .collect();
+        assert!(ArtifactCleanupQueuePermit::try_acquire().is_none());
+        drop(permits.pop());
+        permits.push(ArtifactCleanupQueuePermit::try_acquire().expect("a freed slot"));
+        assert!(ArtifactCleanupQueuePermit::try_acquire().is_none());
+        drop(permits);
+        assert_eq!(live.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
     #[test]
     fn random_token_is_64_hex_chars() {
         let t = random_token_hex().expect("entropy available");
@@ -4306,6 +4500,7 @@ mod tests {
         for (line, want) in [
             (format!("AUTH {tok}"), AuthOutcome::Ok(None)),
             (format!("AUTH {tok}\r"), AuthOutcome::Ok(None)),
+            (format!("AUTH {tok} "), AuthOutcome::Ok(None)),
             (format!("AUTH {bad}"), AuthOutcome::Denied),
             ("AUTH".to_string(), AuthOutcome::Denied),
             ("text".to_string(), AuthOutcome::Denied),
@@ -4320,29 +4515,56 @@ mod tests {
             ),
             (format!("TOKEN {tok}"), AuthOutcome::Ok(Some(String::new()))),
             (format!("TOKEN {bad} text"), AuthOutcome::Denied),
+            // The CR goes before the verb is split off, not into the verb.
+            (
+                format!("TOKEN {tok} text\r"),
+                AuthOutcome::Ok(Some("text".to_string())),
+            ),
+            // Exactly one space before the token, and the whole token.
+            (format!("AUTH  {tok}"), AuthOutcome::Denied),
+            ("TOKEN".to_string(), AuthOutcome::Denied),
+            ("TOKEN  text".to_string(), AuthOutcome::Denied),
+            (format!("TOKEN {} text", &tok[..63]), AuthOutcome::Denied),
         ] {
             assert_eq!(check_auth_line(&line, &tok), want, "{line:?}");
         }
+        // The harness's door: its own token only, and nothing at all when
+        // there is none (no entropy at startup).
+        let line = format!("AUTH {tok}");
+        assert_eq!(check_line_against(&line, Some(&tok)), AuthOutcome::Ok(None));
+        assert_eq!(check_line_against(&line, Some(&bad)), AuthOutcome::Denied);
+        assert_eq!(check_line_against(&line, None), AuthOutcome::Denied);
+        assert_eq!(check_line_against("AUTH ", None), AuthOutcome::Denied);
     }
 
+    /// SEC-3: our own loosened directory is forced back to exactly `0700`
+    /// (special bits too), and a directory that is not ours is REFUSED, even
+    /// one already `0700`: a chmod cannot change its owner.
     #[test]
     #[cfg(unix)]
-    fn ensure_private_dir_refuses_group_or_other_writable() {
+    fn ensure_private_dir_hardens_ours_and_refuses_a_strangers() {
         use std::os::unix::fs::PermissionsExt;
-        // SEC-3: a pre-existing dir that is group/other-writable is REFUSED, not
-        // silently provisioned into — even after we force the mode, a foreign
-        // owner / loose bits indicate an unsafe directory.
-        let dir = std::env::temp_dir().join(format!("aterm-dir-gw-{}", std::process::id()));
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let dir = temp.path().join("control");
+        let mode = || std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
         ensure_private_dir(&dir).unwrap();
-        // Loosen it behind ensure_private_dir's back, then call again: it forces
-        // 0700 and the re-stat passes (we own it). Verify the success path.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770)).unwrap();
-        // ensure_private_dir forces 0700, so a subsequent call succeeds (owner is
-        // us, bits tightened). This proves the gate accepts our own dir.
-        ensure_private_dir(&dir).unwrap();
-        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "ensure_private_dir must force 0700");
-        let _ = std::fs::remove_dir_all(&dir);
+        for loose in [0o770, 0o1700] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(loose)).unwrap();
+            ensure_private_dir(&dir).unwrap();
+            assert_eq!(mode(), 0o700, "{loose:o} is forced to 0700");
+        }
+        // Standing as another uid is the one unprivileged way to own nothing.
+        let stranger = our_uid().wrapping_add(1);
+        for planted in [0o700, 0o755] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(planted)).unwrap();
+            let refused = imp::ensure_private_dir_as(&dir, stranger)
+                .expect_err("a directory owned by another uid is never private");
+            assert_eq!(
+                refused.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{planted:o}"
+            );
+        }
     }
 
     #[test]
@@ -4372,6 +4594,12 @@ mod tests {
             md.file_type().is_file(),
             "token path must be a regular file"
         );
+        // What a racer plants in the gap after the unlink — a hard link to a
+        // file of ours — is refused by the exclusive create, not truncated.
+        std::fs::remove_file(&tokpath).unwrap();
+        std::fs::hard_link(&victim, &tokpath).unwrap();
+        assert_eq!(imp::write_fresh_token(&tokpath, "token"), None);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"original");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4461,6 +4689,37 @@ mod tests {
         let allowed =
             confine_image_path(&dir, inside.to_str().unwrap()).expect("absolute-inside allowed");
         assert!(allowed.display_path().ends_with("images/ok.png"));
+
+        // The private namespaces under images/ are no caller's file name, nor is
+        // a name with a NUL, nor a `..` above the root, even one that lands inside.
+        let above_root = format!(
+            "/..{}",
+            std::fs::canonicalize(dir.join(IMAGES_DIR))
+                .unwrap()
+                .join("ok.png")
+                .display()
+        );
+        for refused in [
+            AUTO_IMAGES_DIR,
+            CAPTURE_LOCK_DIR,
+            "a\0b.png",
+            above_root.as_str(),
+        ] {
+            assert!(confine_image_path(&dir, refused).is_none(), "{refused:?}");
+        }
+        // A `..` that would climb above the root refuses the path, never
+        // dropping the step.
+        for (path, want) in [
+            ("/a/./b/../c", Some("/a/c")),
+            ("/..", None),
+            ("/a/../../b", None),
+        ] {
+            assert_eq!(
+                lexically_normalize(Path::new(path)),
+                want.map(PathBuf::from),
+                "{path}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4553,6 +4812,13 @@ mod tests {
         ensure_private_dir(&dir).unwrap();
         let explicit = confine_image_path(&dir, "operator-kept.png").unwrap();
         std::fs::write(explicit.display_path(), b"explicit").unwrap();
+        // A server-chosen stem is one plain word: nothing else is minted.
+        for stem in ["", "a/b", "a.b"] {
+            assert!(
+                confine_automatic_image_path(&dir, stem).is_none(),
+                "{stem:?}"
+            );
+        }
 
         let mut names = std::collections::HashSet::new();
         let mut auto_dir = None;
@@ -4567,15 +4833,35 @@ mod tests {
             auto_dir = Some(target.dir);
         }
         let auto_dir = auto_dir.unwrap();
-        let auto_files = std::fs::read_dir(&auto_dir)
-            .unwrap()
-            .flatten()
-            .filter(|entry| automatic_capture_sequence(&entry.file_name()).is_some())
-            .count();
+        let captures = || {
+            std::fs::read_dir(&auto_dir)
+                .unwrap()
+                .flatten()
+                .filter_map(|entry| {
+                    Some((
+                        automatic_capture_sequence(&entry.file_name())?,
+                        entry.path(),
+                    ))
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
         assert_eq!(
-            auto_files, AUTO_IMAGE_KEEP,
+            captures().len(),
+            AUTO_IMAGE_KEEP,
             "successful auto captures converge to the retention cap"
         );
+        // A capture the sweep cannot remove is no removal: the next oldest goes.
+        #[cfg(target_os = "macos")]
+        {
+            let held = captures().into_values().collect::<Vec<_>>();
+            let _undeletable = Immutable::set(&held[0]);
+            let target = confine_automatic_image_path(&dir, "image").unwrap();
+            std::fs::write(target.display_path(), b"png").unwrap();
+            prune_automatic_image_dir(&target);
+            let left = captures().into_values().collect::<Vec<_>>();
+            assert_eq!(left.len(), AUTO_IMAGE_KEEP);
+            assert!(left.contains(&held[0]) && !left.contains(&held[1]));
+        }
         assert_eq!(
             std::fs::read(explicit.display_path()).unwrap(),
             b"explicit",
@@ -4595,6 +4881,27 @@ mod tests {
             b"explicit",
             "failure cleanup is structurally unable to unlink explicit targets"
         );
+        // Not even one shaped like a capture, in a socket directory named `auto`.
+        let auto_sock = dir.join(AUTO_IMAGES_DIR);
+        ensure_private_dir(&auto_sock).unwrap();
+        let lookalike = confine_image_path(
+            &auto_sock,
+            &automatic_capture_name_for("image", process_instance_id(), 1),
+        )
+        .unwrap();
+        std::fs::write(lookalike.display_path(), b"explicit").unwrap();
+        cleanup_failed_automatic_image(&lookalike);
+        assert!(lookalike.display_path().is_file());
+        // An explicit name stays the caller's to reuse: a capture to it again
+        // replaces it. A minted name is never anything else's: a file found
+        // already at it is refused, never replaced.
+        drop(explicit.write_private(b"again").unwrap());
+        assert_eq!(std::fs::read(explicit.display_path()).unwrap(), b"again");
+        let minted = confine_automatic_image_path(&dir, "image").unwrap();
+        std::fs::write(minted.display_path(), b"planted").unwrap();
+        let refused = minted.write_private(b"png").unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(minted.display_path()).unwrap(), b"planted");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4694,6 +5001,29 @@ mod tests {
             "cancellation wins without acquiring the retained namespace"
         );
         drop(first_lease);
+
+        // A cancellation that lands once the namespace is reserved still wins,
+        // and leaves the namespace free at once.
+        let probes = std::cell::Cell::new(0);
+        let late = acquire_capture_name_lease(&first, || {
+            probes.set(probes.get() + 1);
+            probes.get() > 1
+        });
+        assert!(late.expect("cancellation is not an I/O failure").is_none());
+        let image_lease =
+            acquire_capture_name_lease_with_wait(&first, || false, std::time::Duration::ZERO)
+                .expect("the cancelled reservation let its namespace go")
+                .expect("explicit lease");
+        // An image lease holds no video retention capability to arm.
+        let unrelated = crate::pinned_dir::PinnedDir::open_resolved(&dir).unwrap();
+        assert_eq!(
+            image_lease
+                .arm_video_retention_sweep(&unrelated)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        drop(image_lease);
         drop(first);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4830,6 +5160,9 @@ mod tests {
             .expect("automatic lease acquisition")
             .expect("lease queued capture");
         drop(queued.write_private(b"queued").unwrap());
+        // Retention's last word before it unlinks: a leased reply is never
+        // touched, even when the census raced the lease.
+        assert_eq!(mutate_unleased_artifact(&queued_path, || ()), None);
 
         for _ in 0..(AUTO_IMAGE_KEEP + 3) {
             let later = confine_automatic_image_path(&dir, "image").unwrap();
@@ -4938,6 +5271,24 @@ mod tests {
             "the automatic image root cannot redirect"
         );
 
+        // A namespace whose launch lease is a planted link cannot be leased, so
+        // nothing is confined into it, and nothing is made through the link.
+        let lease_sock =
+            std::env::temp_dir().join(format!("aterm-media-roots-lease-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&lease_sock);
+        ensure_private_dir(&lease_sock).unwrap();
+        let video = ensure_canonical_direct_child(&lease_sock, VIDEO_DIR).unwrap();
+        let images = ensure_canonical_direct_child(&lease_sock, IMAGES_DIR).unwrap();
+        let auto = ensure_canonical_direct_child(&images, AUTO_IMAGES_DIR).unwrap();
+        for namespace in [video.join("p1-planted"), auto.join(process_instance_id())] {
+            std::fs::create_dir(&namespace).unwrap();
+            symlink(outside.join("lease"), namespace.join(INSTANCE_LEASE_FILE)).unwrap();
+        }
+        assert!(confine_video_dir_for_instance(&lease_sock, "p1-planted").is_none());
+        assert!(confine_automatic_image_path(&lease_sock, "image").is_none());
+        assert!(!outside.join("lease").exists());
+
+        let _ = std::fs::remove_dir_all(lease_sock);
         let _ = std::fs::remove_dir_all(image_sock);
         let _ = std::fs::remove_dir_all(video_sock);
         let _ = std::fs::remove_dir_all(auto_sock);
@@ -4969,9 +5320,12 @@ mod tests {
             confine_proxy_sock(&dir, "aterm-42.sock").is_none(),
             "relative rejected"
         );
-        // A nested subdir under the runtime dir is rejected (single component only).
+        // A nested subdir under the runtime dir is rejected (single component only),
+        // and so is a name with a NUL in it.
         let nested = dir.join("sub/aterm-42.sock");
         assert!(confine_proxy_sock(&dir, &nested.to_string_lossy()).is_none());
+        let nul = format!("{}/aterm\0.sock", dir.display());
+        assert!(confine_proxy_sock(&dir, &nul).is_none());
 
         // A SYMLINK planted at the final component (pointing outside) is rejected —
         // `connect()` would otherwise follow it to the attacker socket.
@@ -4996,6 +5350,12 @@ mod tests {
         // caller fails closed, which is the correct conservative behaviour.
         // And the accept gate accepts our own connection.
         assert_eq!(peer_check(&a), Ok(()));
+        // The gate's decision: only our uid; another uid — root's too — or
+        // none the kernel will name, is refused.
+        assert_eq!(imp::peer_verdict(Some(501), 501), Ok(()));
+        for stranger in [Some(502), Some(0), None] {
+            assert!(imp::peer_verdict(stranger, 501).is_err(), "{stranger:?}");
+        }
     }
 
     /// Windows: a same-process pair is the same user, so the pid gate
@@ -5030,6 +5390,18 @@ mod tests {
         let dead = child.id();
         child.wait().unwrap();
         let us = std::process::id();
+        assert!(pid_alive(us) && !pid_alive(dead));
+        assert!(
+            !pid_alive(0) && !pid_alive(u32::MAX),
+            "a pid that cannot be real (0, wider than pid_t) is dead, never a group or broadcast"
+        );
+        // Wider than pid_t, it would name a process group: ours is real.
+        #[cfg(unix)]
+        {
+            // SAFETY: getpgrp has no preconditions and cannot fail.
+            let group = unsafe { libc::getpgrp() } as u32;
+            assert!(!pid_alive(group.wrapping_neg()));
+        }
         let touch = |name: &str| std::fs::write(dir.join(name), b"x").unwrap();
         touch(&control_socket::instance_sock_name(dead));
         touch(&control_socket::instance_token_name(dead));
@@ -5285,6 +5657,31 @@ mod tests {
             .count()
     }
 
+    /// Holds a path immutable (`chflags uchg`, as any same-uid actor can), so
+    /// no unlink or rename of it succeeds until this drops, unwinding included.
+    #[cfg(target_os = "macos")]
+    struct Immutable(std::ffi::CString);
+
+    #[cfg(target_os = "macos")]
+    impl Immutable {
+        fn set(path: &Path) -> Self {
+            use std::os::unix::ffi::OsStrExt as _;
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `path` is NUL-terminated and outlives the call.
+            let set = unsafe { libc::chflags(path.as_ptr(), libc::UF_IMMUTABLE) };
+            assert_eq!(set, 0, "{path:?}");
+            Self(path)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Immutable {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is NUL-terminated and outlives the call.
+            unsafe { libc::chflags(self.0.as_ptr(), 0) };
+        }
+    }
+
     fn artifact_lease_count(path: &Path) -> Option<usize> {
         let (leases, _) = artifact_path_leases();
         let held = leases
@@ -5314,7 +5711,9 @@ mod tests {
         // marker's are only ORDERED (the members land before the marker that makes them
         // visible, nothing depends on the marker after a power loss, and the requester
         // is local); the batch barrier and the marker's entry are the recording
-        // directory's untouched plain `fsync(2)`, which records nothing.
+        // directory's untouched plain `fsync(2)`, which records nothing. Windows' is
+        // its counterpart `FlushFileBuffers`, which records nothing either
+        // (`pinned_dir`'s `flush_directory`), so one expectation holds on both.
         let flushes = aterm_durable::seam::Recording::start();
         let index = producer
             .write_new_private(std::ffi::OsStr::new("index.json"), b"{\"frames\":[]}")
@@ -5325,7 +5724,11 @@ mod tests {
             "the index's bytes"
         );
         producer.publish(&[], &index).unwrap();
-        assert_eq!(flushes.take(), [], "the batch barrier: a plain fsync(2)");
+        assert_eq!(
+            flushes.take(),
+            [],
+            "the batch barrier: the directory's plain flush"
+        );
         assert_eq!(
             artifact_lease_count(&path),
             Some(1),
@@ -5514,7 +5917,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn video_reader_registry_rejects_same_recording_moved_to_replacement_root() {
+    fn video_lease_capabilities_bind_their_own_recording_and_root() {
         let dir = std::env::temp_dir().join(format!(
             "aterm-video-reader-root-identity-{}",
             std::process::id()
@@ -5526,12 +5929,46 @@ mod tests {
         let fresh = std::ffi::OsString::from("rec-00000000000000000000-000");
         write_completed_video_fixture(&root_path, fresh.to_str().unwrap());
 
+        let other = std::ffi::OsString::from("rec-00000000000000000001-000");
+        write_completed_video_fixture(&root_path, other.to_str().unwrap());
+
         let first_root = crate::pinned_dir::PinnedDir::open_resolved(&root_path).unwrap();
         let first_recording = first_root.child(&fresh).unwrap();
+        let other_recording = first_root.child(&other).unwrap();
         let first = retain_video_artifact_path(first_root, fresh.clone(), &first_recording)
             .unwrap()
             .expect("first reader lease");
-        drop(first_recording);
+
+        // Another recording's handle is no capability for this one.
+        let again = crate::pinned_dir::PinnedDir::open_resolved(&root_path).unwrap();
+        let invalid = |result: std::io::Result<()>| result.unwrap_err().kind();
+        assert_eq!(
+            invalid(retain_video_artifact_path(again, fresh.clone(), &other_recording).map(drop)),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            invalid(first.arm_video_retention_sweep(&other_recording)),
+            std::io::ErrorKind::InvalidInput
+        );
+        // A recording replaced at its name: neither the new directory there nor
+        // the old handle, its name now elsewhere, can arm the lease.
+        let aside = root_path.join("rec-aside");
+        std::fs::rename(root_path.join(&fresh), &aside).unwrap();
+        std::fs::create_dir(root_path.join(&fresh)).unwrap();
+        let impostor = crate::pinned_dir::PinnedDir::open_resolved(&root_path)
+            .unwrap()
+            .child(&fresh)
+            .unwrap();
+        for handle in [&impostor, &first_recording] {
+            assert_eq!(
+                invalid(first.arm_video_retention_sweep(handle)),
+                std::io::ErrorKind::NotFound
+            );
+        }
+        drop(impostor);
+        std::fs::remove_dir(root_path.join(&fresh)).unwrap();
+        std::fs::rename(&aside, root_path.join(&fresh)).unwrap();
+        drop((first_recording, other_recording));
 
         let original_root = dir.join("recordings-original");
         std::fs::rename(&root_path, &original_root).unwrap();
@@ -5544,6 +5981,11 @@ mod tests {
             .expect_err("the same recording inode cannot cross into a replacement root");
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         assert_eq!(artifact_lease_count(first.key.as_ref().unwrap()), Some(1));
+        // Nor can it arm the original lease, whose root is no longer at the path.
+        assert_eq!(
+            invalid(first.arm_video_retention_sweep(&same_recording)),
+            std::io::ErrorKind::NotFound
+        );
 
         drop(same_recording);
         drop(first);
@@ -5742,6 +6184,16 @@ mod tests {
             "budget exhaustion cannot affect the freshly published recording"
         );
 
+        // Every probe paid for and the rename one unit short: nothing is renamed.
+        let limit = 10 * VIDEO_SCAN_WORK + 20 * VIDEO_FILE_OPEN_WORK + (VIDEO_DELETE_WORK - 1);
+        let mut work = VideoPruneWork::new(limit);
+        prune_video_dirs_with_work(&pinned, &fresh_name, &mut work).unwrap();
+        assert_eq!((work.file_opens, work.renames), (20, 0));
+        assert!(root.join(format!("rec-{:020}-000", 0)).is_dir());
+        // A budget that covers a step exactly pays for it.
+        let mut exact = VideoPruneWork::new(VIDEO_SCAN_WORK);
+        assert!(exact.scan() && !exact.scan());
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5855,10 +6307,53 @@ mod tests {
             .set_len(32 * 1024 * 1024)
             .unwrap();
 
+        // Neither a completed-looking directory that is no recording, nor a
+        // recording with a marker but no index, is a candidate or takes a place;
+        // one whose marker has a second name is never pruned on its word.
+        write_completed_video_fixture(root, "operator-kept");
+        let marker_only = root.join("rec-00000000000000000000-001");
+        std::fs::create_dir(&marker_only).unwrap();
+        std::fs::write(marker_only.join(VIDEO_PUBLISHED_FILE), b"published").unwrap();
+        let linked_marker = root.join("rec-00000000000000000000-002");
+        std::fs::create_dir(&linked_marker).unwrap();
+        std::fs::write(linked_marker.join("index.json"), b"{\"frames\":[]}").unwrap();
+        std::fs::write(root.join("marker-twin"), b"twin").unwrap();
+        std::fs::hard_link(
+            root.join("marker-twin"),
+            linked_marker.join(VIDEO_PUBLISHED_FILE),
+        )
+        .unwrap();
+        // A reader's lease on a recording of the same name under another root
+        // protects nothing here.
+        let elsewhere = aterm_tempfile::tempdir().expect("temporary second root");
+        let same_name = std::ffi::OsString::from("rec-00000000000000000002-000");
+        write_completed_video_fixture(elsewhere.path(), same_name.to_str().unwrap());
+        let elsewhere_root = crate::pinned_dir::PinnedDir::open_resolved(elsewhere.path()).unwrap();
+        let elsewhere_recording = elsewhere_root.child(&same_name).unwrap();
+        let elsewhere_lease =
+            retain_video_artifact_path(elsewhere_root, same_name.clone(), &elsewhere_recording)
+                .unwrap()
+                .expect("reader lease elsewhere");
+        // A quarantine a crashed sweep left half done is finished first.
+        let crashed = root.join(".prune-crashed");
+        std::fs::create_dir(&crashed).unwrap();
+        std::fs::write(crashed.join("frame-000000.png"), b"png").unwrap();
+        // One the sweep cannot quarantine is no removal: the next oldest goes.
+        #[cfg(target_os = "macos")]
+        let unrenamable = root.join("rec-00000000000000000003-000");
+        #[cfg(target_os = "macos")]
+        let _unrenamable = Immutable::set(&unrenamable);
+
         let fresh = std::ffi::OsString::from("rec-99999999999999999999-000");
         write_completed_video_fixture(root, fresh.to_str().unwrap());
         let pinned = crate::pinned_dir::PinnedDir::open_resolved(root).unwrap();
         prune_video_dirs(&pinned, &fresh).unwrap();
+        drop((elsewhere_lease, elsewhere_recording));
+        assert!(root.join("operator-kept").is_dir() && marker_only.is_dir());
+        assert!(linked_marker.is_dir() && !root.join(&same_name).exists());
+        assert!(!crashed.exists());
+        #[cfg(target_os = "macos")]
+        assert!(unrenamable.is_dir() && !root.join("rec-00000000000000000004-000").exists());
 
         assert!(
             !corrupt.exists(),
@@ -5868,7 +6363,7 @@ mod tests {
             !oversized.exists(),
             "retention never reads an attacker-sized completed index"
         );
-        assert_eq!(completed_video_fixture_count(root), VIDEO_KEEP);
+        assert_eq!(completed_video_fixture_count(root), VIDEO_KEEP + 1);
         assert!(root.join(fresh).is_dir());
     }
 
@@ -6001,6 +6496,32 @@ mod tests {
                 "{name:?} made a directory outside its parent"
             );
         }
+
+        // Something already at the name must be a real directory: a link to a
+        // sibling, or a file, is refused before anything is hardened through it.
+        use std::os::unix::fs::PermissionsExt as _;
+        let sibling = parent.join("sibling");
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&sibling, parent.join("linked")).unwrap();
+        std::fs::write(parent.join("file"), b"").unwrap();
+        for name in ["linked", "file"] {
+            assert_eq!(
+                ensure_canonical_direct_child(&parent, name)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{name}"
+            );
+        }
+        let mode = |dir: &Path| std::fs::metadata(dir).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&sibling), 0o755);
+        // A real directory already there is hardened before it is used.
+        assert_eq!(
+            ensure_canonical_direct_child(&parent, "sibling").unwrap(),
+            std::fs::canonicalize(&sibling).unwrap()
+        );
+        assert_eq!(mode(&sibling), 0o700);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6042,6 +6563,50 @@ mod tests {
             "a contended exact-instance lease is never swept"
         );
         drop(lease);
+
+        // Never the sweeper's own namespace, nor an entry that names no
+        // instance (`p<pid>-<nonce>`), whatever the PID probe says.
+        let current = ensure_canonical_direct_child(&root, "p424240-current").unwrap();
+        let unnamed = ["not-an-instance", "424241-unprefixed", "p424242"]
+            .map(|name| ensure_canonical_direct_child(&root, name).unwrap());
+        // A tombstone an interrupted sweep left is finished by the next.
+        let tombstone = root.join(format!("{DEAD_INSTANCE_TOMBSTONE_PREFIX}left"));
+        std::fs::create_dir(&tombstone).unwrap();
+        std::fs::write(tombstone.join(INSTANCE_LEASE_FILE), b"").unwrap();
+        sweep_dead_instance_namespaces_with(&root, "p424240-current", |_| false);
+        assert!(current.is_dir() && unnamed.iter().all(|dir| dir.is_dir()));
+        assert!(!tombstone.exists());
+
+        // With no delete left, an emptied tombstone stays for a later pass.
+        std::fs::create_dir(&tombstone).unwrap();
+        let pinned_root = crate::pinned_dir::PinnedDir::open_resolved(&root).unwrap();
+        let name = tombstone.file_name().unwrap();
+        let pinned_tombstone = pinned_root.child(name).unwrap();
+        let mut budget = 0;
+        assert!(!cleanup_instance_tombstone(
+            &pinned_root,
+            name,
+            &pinned_tombstone,
+            &mut budget
+        ));
+        assert!(tombstone.is_dir());
+        // One delete left removes it, and is spent.
+        let mut budget = 1;
+        assert!(cleanup_instance_tombstone(
+            &pinned_root,
+            name,
+            &pinned_tombstone,
+            &mut budget
+        ));
+        assert!(!tombstone.exists() && budget == 0);
+        drop((pinned_tombstone, pinned_root));
+
+        // A namespace this process confined into is leased for its lifetime,
+        // so a sweep that reads its PID as dead still keeps it.
+        let ours = format!("p{}-leased", std::process::id());
+        drop(confine_video_dir_for_instance(&root, &ours).unwrap());
+        sweep_dead_instance_namespaces_with(&root.join(VIDEO_DIR), "p1-current", |_| false);
+        assert!(root.join(VIDEO_DIR).join(&ours).is_dir());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6074,6 +6639,7 @@ mod tests {
             .expect("pinned sweep");
         let mut swapped = false;
         assert!(sweep.run_batch_with_hook(
+            DEAD_INSTANCE_DELETE_LIMIT,
             |_| false,
             || {
                 if !swapped {
@@ -6097,6 +6663,64 @@ mod tests {
         std::fs::rename(&root, &replacement).unwrap();
         std::fs::rename(&moved, &root).unwrap();
         drop(held_lease);
+
+        // The same swap under a launch that is gone: the namespace the sweep
+        // proved abandoned is left alone once its root has moved away.
+        let begin = |root: &Path| {
+            let admission = crate::control::ReplyRetention::try_reserve_cleanup_for_path(root)
+                .expect("test cleanup admission");
+            let queue = ArtifactCleanupQueuePermit::unmetered();
+            DeadNamespaceSweep::begin(root, "p1-current".into(), queue, admission)
+                .expect("pinned sweep")
+        };
+        let mut sweep = begin(&root);
+        let mut swapped = false;
+        assert!(sweep.run_batch_with_hook(
+            DEAD_INSTANCE_DELETE_LIMIT,
+            |_| false,
+            || {
+                if !swapped {
+                    std::fs::rename(&root, &moved).unwrap();
+                    std::fs::rename(&replacement, &root).unwrap();
+                    swapped = true;
+                }
+            }
+        ));
+        assert!(swapped && moved.join(name).is_dir());
+        drop(sweep);
+        std::fs::rename(&root, &replacement).unwrap();
+        std::fs::rename(&moved, &root).unwrap();
+
+        // A root moved away before a batch ends the cursor: not even a
+        // tombstone in it is the sweep's any more.
+        let tombstone = format!("{DEAD_INSTANCE_TOMBSTONE_PREFIX}left");
+        std::fs::create_dir(root.join(&tombstone)).unwrap();
+        let mut sweep = begin(&root);
+        std::fs::rename(&root, &moved).unwrap();
+        assert!(sweep.run_batch(|_| false));
+        assert!(moved.join(&tombstone).is_dir());
+        drop(sweep);
+
+        // The delete budget is a hard stop: one delete allowed, one of two dead
+        // namespaces is taken and the other waits for a later batch.
+        let budgeted = temp.path().join("budgeted");
+        ensure_private_dir(&budgeted).unwrap();
+        let dead = ["p424250-dead", "p424251-dead"];
+        for name in dead {
+            let namespace = ensure_canonical_direct_child(&budgeted, name).unwrap();
+            drop(open_instance_lease(&namespace, true).unwrap());
+        }
+        let mut sweep = begin(&budgeted);
+        assert!(!sweep.run_batch_with_hook(1, |_| false, || {}));
+        let left = dead.iter().filter(|name| budgeted.join(name).is_dir());
+        assert_eq!(left.count(), 1);
+        // The rename that took it was that one delete: nothing was emptied.
+        for entry in std::fs::read_dir(&budgeted).unwrap().flatten() {
+            assert!(
+                entry.path().join(INSTANCE_LEASE_FILE).is_file(),
+                "{entry:?}"
+            );
+        }
     }
 
     /// THE SWEEP LETS GO OF A DEAD INSTANCE'S LEASE BY `LOCK_UN`, on every way
@@ -6135,6 +6759,7 @@ mod tests {
         let armed = crate::parked_fork::arm_at(1); // the sweep's take of the lease
         let mut moved_aside = false;
         assert!(sweep.run_batch_with_hook(
+            DEAD_INSTANCE_DELETE_LIMIT,
             |_| true,
             || {
                 if !moved_aside {
@@ -6213,7 +6838,34 @@ mod tests {
         };
         assert_eq!(restarted_root, root);
         assert_eq!(current, "p1-current");
-        clear_pending_dead_namespace_sweep(&root);
+        // The restart took the debt: its generation, finished with no new
+        // kick, retires the root instead of restarting again.
+        finish_or_restart_dead_namespace_sweep(restarted_root, current, _queue, &sender);
+        assert!(receiver.try_recv().is_err());
+        assert!(
+            !pending_dead_namespace_sweeps()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&root)
+        );
+
+        // A cursor stopped by its scan slice is requeued to go on: clutter
+        // ahead of a stale namespace never hides it.
+        let wide = root.join("wide");
+        std::fs::create_dir(&wide).unwrap();
+        for entry in 0..=DEAD_INSTANCE_SCAN_LIMIT {
+            std::fs::write(wide.join(format!("clutter-{entry}")), b"").unwrap();
+        }
+        let task = ArtifactCleanupTask::DeadNamespaces {
+            root: wide,
+            current: "p1-current".into(),
+            _queue: ArtifactCleanupQueuePermit::unmetered(),
+        };
+        run_best_effort_cleanup_task(task, &sender);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ArtifactCleanupTask::DeadNamespaceContinuation(_))
+        ));
     }
 
     /// Run the SHIPPED worker loop, `artifact_cleanup_worker`, over a private
@@ -6342,6 +6994,216 @@ mod tests {
         );
     }
 
+    /// The automatic-image sweep prunes only the directory it was armed for:
+    /// a replacement standing at the same path is not its to prune.
+    #[test]
+    fn the_automatic_image_sweep_prunes_only_the_directory_it_was_armed_for() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let auto = std::fs::canonicalize(temp.path())
+            .unwrap()
+            .join(AUTO_IMAGES_DIR);
+        let dir = auto.join(process_instance_id());
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = |dir: &Path| {
+            crate::pinned_dir::PinnedDir::open(dir)
+                .unwrap()
+                .retained_identity()
+                .unwrap()
+        };
+        let armed_for = identity(&dir);
+        std::fs::rename(&dir, auto.join("moved")).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        let name = |sequence| automatic_capture_name_for("image", process_instance_id(), sequence);
+        for sequence in 0..=(AUTO_IMAGE_KEEP as u64 + 2) {
+            std::fs::write(dir.join(name(sequence)), b"png").unwrap();
+        }
+        let fresh = std::ffi::OsString::from(name(AUTO_IMAGE_KEEP as u64 + 2));
+        // A directory named like a capture is none: it is not pruned, and it
+        // costs no capture its place.
+        let lookalike = dir.join(name(AUTO_IMAGE_KEEP as u64 + 3));
+        std::fs::create_dir(&lookalike).unwrap();
+        // Nor is the temporary a capture is still being written under (the
+        // oldest sequence, were its number read as one).
+        let in_flight = dir.join(format!(".aterm-write-p1-{:020}", 0));
+        std::fs::write(&in_flight, b"partial").unwrap();
+        let sweep = |expected_dir| ArtifactCleanupTask::AutomaticImages {
+            dir: dir.clone(),
+            expected_dir,
+            fresh: fresh.clone(),
+            _queue: ArtifactCleanupQueuePermit::unmetered(),
+        };
+        let count = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "png"))
+                .count()
+        };
+
+        drain_private_cleanup_worker(vec![sweep(armed_for)]);
+        assert_eq!(
+            count(),
+            AUTO_IMAGE_KEEP + 3,
+            "the replacement is left whole"
+        );
+        drain_private_cleanup_worker(vec![sweep(identity(&dir))]);
+        assert_eq!(
+            count(),
+            AUTO_IMAGE_KEEP,
+            "positive control: armed for it, it is pruned"
+        );
+        assert!(lookalike.is_dir() && in_flight.is_file());
+    }
+
+    /// The tombstone sweep removes `.prune-*` entries only, and only under the
+    /// root it was armed for.
+    #[test]
+    fn the_video_tombstone_sweep_removes_only_tombstones_of_its_own_root() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap().join("instance");
+        std::fs::create_dir(&root).unwrap();
+        let identity = |dir: &Path| {
+            crate::pinned_dir::PinnedDir::open(dir)
+                .unwrap()
+                .retained_identity()
+                .unwrap()
+        };
+        let armed_for = identity(&root);
+        std::fs::rename(&root, temp.path().join("moved")).unwrap();
+        for entry in [".prune-x", "rec-kept"] {
+            std::fs::create_dir_all(root.join(entry)).unwrap();
+            std::fs::write(root.join(entry).join("index.json"), b"{}").unwrap();
+        }
+        let sweep = |expected_root| ArtifactCleanupTask::VideoTombstones {
+            root: root.clone(),
+            expected_root,
+            _queue: ArtifactCleanupQueuePermit::unmetered(),
+        };
+
+        drain_private_cleanup_worker(vec![sweep(armed_for)]);
+        assert!(
+            root.join(".prune-x").is_dir(),
+            "a replacement root is not its to sweep"
+        );
+        drain_private_cleanup_worker(vec![sweep(identity(&root))]);
+        assert!(
+            !root.join(".prune-x").exists(),
+            "positive control: its own tombstone goes"
+        );
+        assert!(
+            root.join("rec-kept").is_dir(),
+            "a recording is no tombstone"
+        );
+
+        let begin = |root: &Path| {
+            let admission = crate::control::ReplyRetention::try_reserve_cleanup_for_path(root)
+                .expect("test cleanup admission");
+            let queue = ArtifactCleanupQueuePermit::unmetered();
+            VideoTombstoneSweep::begin(root, identity(root), queue, admission).expect("cursor")
+        };
+        // A root moved away from under a begun cursor ends it (Windows will not
+        // rename a directory the cursor holds open).
+        #[cfg(unix)]
+        {
+            std::fs::create_dir(root.join(".prune-y")).unwrap();
+            let mut cursor = begin(&root);
+            let aside = root.with_file_name("aside");
+            std::fs::rename(&root, &aside).unwrap();
+            assert!(cursor.run_batch());
+            assert!(aside.join(".prune-y").is_dir());
+        }
+
+        // A budget spent inside a tombstone stops the cursor short of EOF and
+        // owes a restart, which finishing it then schedules.
+        let partial = root.with_file_name("partial");
+        std::fs::create_dir_all(partial.join(".prune-a")).unwrap();
+        for file in ["one", "two"] {
+            std::fs::write(partial.join(".prune-a").join(file), b"").unwrap();
+        }
+        let mut cursor = begin(&partial);
+        assert!(!cursor.run_batch_within(VIDEO_SCAN_WORK + VIDEO_DELETE_WORK));
+        assert!(cursor.restart_required);
+        let expected_root = cursor.expected_root;
+        pending_video_tombstone_sweeps()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(PendingVideoTombstoneSweep {
+                root: partial.clone(),
+                expected_root,
+                dirty: false,
+            });
+        let (sender, receiver) = std::sync::mpsc::channel();
+        finish_or_restart_video_tombstone_sweep(cursor, &sender);
+        clear_pending_video_tombstone_sweep(&partial, expected_root);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ArtifactCleanupTask::VideoTombstones { .. })
+        ));
+        // So does a budget too short to scan the next entry.
+        let short = root.with_file_name("short");
+        for tombstone in [".prune-b", ".prune-c"] {
+            std::fs::create_dir_all(short.join(tombstone)).unwrap();
+        }
+        let mut cursor = begin(&short);
+        assert!(!cursor.run_batch_within(VIDEO_SCAN_WORK * 3 / 2 + VIDEO_DELETE_WORK));
+        assert!(cursor.restart_required);
+        drop(cursor);
+
+        // A sweep asked for while one is pending folds into it: the pending one
+        // is marked to run again, and nothing more is queued.
+        let short_identity = identity(&short);
+        let pending = || {
+            pending_video_tombstone_sweeps()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        pending().push(PendingVideoTombstoneSweep {
+            root: short.clone(),
+            expected_root: short_identity,
+            dirty: false,
+        });
+        schedule_video_tombstone_sweep(
+            &short,
+            short_identity,
+            ArtifactCleanupQueuePermit::unmetered(),
+        );
+        let dirty: Vec<bool> = pending()
+            .iter()
+            .filter(|entry| entry.root == short)
+            .map(|entry| entry.dirty)
+            .collect();
+        assert_eq!(dirty, [true]);
+        // The folded kick restarts the cursor once; that generation, finished
+        // with no new kick, retires the root instead of restarting again.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        for restarts in [true, false] {
+            let mut cursor = begin(&short);
+            assert!(cursor.run_batch());
+            finish_or_restart_video_tombstone_sweep(cursor, &sender);
+            assert_eq!(receiver.try_recv().is_ok(), restarts);
+        }
+        assert!(pending().iter().all(|entry| entry.root != short));
+
+        // A cursor stopped by its scan slice is requeued to go on: clutter
+        // ahead of a tombstone never hides it.
+        let wide = root.with_file_name("wide");
+        std::fs::create_dir(&wide).unwrap();
+        for entry in 0..=VIDEO_PRUNE_SCAN_LIMIT {
+            std::fs::write(wide.join(format!("clutter-{entry}")), b"").unwrap();
+        }
+        let task = ArtifactCleanupTask::VideoTombstones {
+            expected_root: identity(&wide),
+            root: wide,
+            _queue: ArtifactCleanupQueuePermit::unmetered(),
+        };
+        run_best_effort_cleanup_task(task, &sender);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ArtifactCleanupTask::VideoTombstoneContinuation(_))
+        ));
+    }
+
     #[test]
     fn instance_sweep_decision_is_total_and_lease_authoritative() {
         use InstanceLeaseState::{Acquirable, Held, Invalid, Missing};
@@ -6416,7 +7278,19 @@ mod tests {
             symlink(&victim, bad_lease.join(INSTANCE_LEASE_FILE)).unwrap();
             sweep_dead_instance_namespaces_with(&root, "p1-current", |_| false);
             assert!(bad_lease.is_dir(), "a symlink lease fails closed");
-            assert_eq!(std::fs::read(victim).unwrap(), b"keep");
+            assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+
+            // A lease with a second name is refused, and never chmodded through.
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode();
+            let linked = ensure_canonical_direct_child(&root, "p424247-hardlease").unwrap();
+            std::fs::hard_link(&victim, linked.join(INSTANCE_LEASE_FILE)).unwrap();
+            let victim_mode = mode(&victim);
+            assert_eq!(
+                open_instance_lease(&linked, true).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(mode(&victim), victim_mode);
             let _ = std::fs::remove_dir_all(outside);
         }
 
@@ -6532,3 +7406,237 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 }
+
+/// The artifact machines' environment actions and Buggy mutants, each waived where its
+/// Tier-1 (`artifact_transaction_conformance`) binds it.
+#[cfg(any(test, debug_assertions))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "SnapshotGenerationCommit",
+    action = "SelectCurrent",
+    reason = "environment scheduling: selecting the newest worker changes which queued job the \
+              bounded model drives; begin/old-commit/current-commit are bound to shipping code"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "AnchoredArtifactTransaction",
+    action = "SwapAncestor",
+    reason = "adversarial filesystem environment action: another same-uid process replaces a \
+              pathname ancestor; the Unix Tier-1 test drives the observation explicitly"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "AnchoredArtifactTransaction",
+    action = "BuggyReresolveRead",
+    reason = "Buggy=1 negative-control action only; shipping reads remain relative to the retained \
+              directory handle and the Tier-1 outside-target mutant is rejected"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "AnchoredArtifactTransaction",
+    action = "BuggyReresolveWrite",
+    reason = "Buggy=1 negative-control action only; shipping writes remain relative to the \
+              retained directory handle and never implement this transition"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "AnchoredArtifactTransaction",
+    action = "BuggyCertifySwapped",
+    reason = "Buggy=1 negative-control action only; reply validation fails closed after identity \
+              drift and the Tier-1 false-success mutant is rejected"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactReplyPublication",
+    action = "BuggyPublishAfterCancel",
+    reason = "Buggy=1 negative control only; the real cancellation/authorization CAS has one \
+              winner and the authorized write hook rejects a cancelled final-name publish"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactReplyPublication",
+    action = "BuggyDropBeforeWrite",
+    reason = "Buggy=1 negative control only; ControlReply owns ReplyRetention through write_all, \
+              flush, and either valid ACK release or central-quarantine expiry"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactReplyPublication",
+    action = "BuggyPruneLeased",
+    reason = "Buggy=1 negative control only; retention holds the shared path-lease mutex across its \
+              exact mutation and skips every still-leased image or recording"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactReplyPublication",
+    action = "BuggyReleaseWithoutAck",
+    reason = "Buggy=1 negative control only; only a matching nonce echo releases immediately, \
+              while EOF/timeout/protocol failure transfers the guard to central quarantine"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactReplyPublication",
+    action = "BuggyAcceptPreChallengeAck",
+    reason = "Buggy=1 negative control only; aterm-ctl can echo only the fresh nonce trailer it \
+              reads after the complete response, never a pre-pipelined acknowledgement"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactReplyPublication",
+    action = "BuggyReleaseQuarantineEarly",
+    reason = "Buggy=1 negative control only; failed or half-closed clients retain the publication guard \
+              through the additional 30-second central-quarantine expiry"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactReplyPublication",
+    action = "BuggyChallengeBeforeBody",
+    reason = "Buggy=1 negative control only; the nonce trailer is written after the complete body \
+              in write_control_reply_with_timeout_arm, and the Tier-1 early trailer is rejected"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactReplyPublication",
+    action = "BuggyOkBeforeRevalidation",
+    reason = "Buggy=1 negative control only; write_control_reply_with_timeout_arm revalidates the \
+              guard before any OK byte, and the Tier-1 OK-then-ERR wire is rejected"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactReplyPublication",
+    action = "BuggyTrailerErrorIgnored",
+    reason = "Buggy=1 negative control only; a failed trailer write returns the error and \
+              quarantines the guard, and the Tier-1 partial frame read as written is rejected"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactReplyPublication",
+    action = "BuggyAbortRetainsArtifact",
+    reason = "Buggy=1 negative control only; an uncommitted reply guard removes its exact file on \
+              drop, and the Tier-1 orphaned-file release is rejected"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactHandoffCapacity",
+    action = "BuggyOverbook",
+    reason = "Buggy=1 negative control only; the real locked admission update refuses when the \
+              process-wide handoff count or descriptor-unit budget reaches its fixed limit"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactHandoffCapacity",
+    action = "BuggyReconcileOverbook",
+    reason = "Buggy=1 negative control only; exact-path reconciliation uses the same locked \
+              aggregate descriptor budget and leaves the provisional charge intact on refusal"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactHandoffCapacity",
+    action = "BuggyRefuseLeaksSlot",
+    reason = "Buggy=1 negative control only; try_acquire_from decides admission before it charges \
+              either counter, so a refusal leaves the pool untouched"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactHandoffCapacity",
+    action = "BuggyReleaseProvisionalCharge",
+    reason = "Buggy=1 negative control only; reconciliation records the permit's new charge, so \
+              its drop returns exactly the units it holds"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactHandoffCapacity",
+    action = "SelectOne",
+    reason = "ghost scheduler choice selecting a one-unit permit from the bounded charge multiset"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactHandoffCapacity",
+    action = "SelectTwo",
+    reason = "ghost scheduler choice selecting a two-unit permit from the bounded charge multiset"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactHandoffCapacity",
+    action = "SelectThree",
+    reason = "ghost scheduler choice selecting a three-unit permit from the bounded charge multiset"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "VideoBatchPublicationDurability",
+    action = "BuggyPublishBeforeSync",
+    reason = "Buggy=1 negative control only; the real marker write is reachable only after \
+              ConfinedVideoDir::publish completes the recording-directory batch barrier"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "VideoBatchPublicationDurability",
+    action = "BuggySyncAhead",
+    reason = "Buggy=1 negative control only; every member write clears batch_synced before it \
+              lands, so a barrier never covers a later member \
+              (video_member_write_after_sync_invalidates_marker_guard)"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactReaderLease",
+    action = "BuggyStartSweepEarly",
+    reason = "Buggy=1 negative control only; the concrete registry starts its capability-bound \
+              sweep only on the last refcount release"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactReaderLease",
+    action = "BuggyAcquireDuringSweep",
+    reason = "Buggy=1 negative control only; retain_video_artifact_path fails closed while the \
+              last-release callback owns the registry's sweeping state"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactReaderLease",
+    action = "ReplaceIdentity",
+    reason = "external same-uid recording replacement is an environment transition; the concrete \
+              registry compares the retained child identity before incrementing its lease count"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactReaderLease",
+    action = "BuggyArmedReleaseDropsEntry",
+    reason = "Buggy=1 negative control only; the last release of an armed entry marks it \
+              sweeping and hands its capability to the priority cleanup lane instead of \
+              removing it"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactReaderLease",
+    action = "BuggyReleaseSweepsUnarmed",
+    reason = "Buggy=1 negative control only; the last release starts a sweep only when \
+              video_sweep_requested is set, and otherwise removes the registry entry"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactReaderLease",
+    action = "BuggyFinishKeepsEntry",
+    reason = "Buggy=1 negative control only; finish_video_retention_sweep removes the finished \
+              entry, taking its arm and recorded identity with it"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ArtifactReaderLease",
+    action = "BuggyAcquireReplacedIdentity",
+    reason = "Buggy=1 negative control only; a mismatched retained recording identity is rejected \
+              without joining the existing lexical-path lease group"
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn artifact_environment_and_mutant_waivers() {}
+
+/// `ExactInstanceRetention` environment actions, each waived where its Tier-1
+/// (`instance_retention_conformance`) binds it.
+// These four actions select facts supplied by the filesystem/OS environment;
+// no shipping state transition implements the observation itself. The real
+// sweeper produces those facts and `Decide` consumes them. Keep that boundary
+// explicit rather than attaching a refinement to a function that does not own
+// the transition.
+#[cfg(any(test, debug_assertions))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ExactInstanceRetention",
+    action = "SelectHeld",
+    reason = "environment observation: advisory-lock contention supplies Held; the exhaustive \
+              Tier-1 matrix projects that real decision input and validates its consumption"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ExactInstanceRetention",
+    action = "SelectFree",
+    reason = "environment observation: successful advisory-lock acquisition supplies Free; the \
+              exhaustive Tier-1 matrix projects that real decision input and validates it"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ExactInstanceRetention",
+    action = "SelectMalformed",
+    reason = "environment observation: link/type/I/O failures supply Invalid; the exhaustive \
+              Tier-1 matrix projects that fail-closed decision input and validates it"
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ExactInstanceRetention",
+    action = "ObservePidAlive",
+    reason = "environment observation: the OS liveness probe supplies this compatibility fact \
+              only for a missing legacy lease; the Tier-1 matrix covers both values"
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn instance_retention_waivers() {}

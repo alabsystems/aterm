@@ -346,9 +346,10 @@ pub struct PkgManifest {
 }
 
 /// The six target triples a program may carry rows for (§17.1) — the spelling a row's
-/// `target` uses and the one the client reports for itself (`cli::current_triple`, pinned
-/// to this list by a test). A program with NO row for the running triple is the
-/// canonical `unavailable on <target>: <hint>` state, never an error.
+/// `target` uses and the one the client reports for itself (`cli::current_triple`: a
+/// spelling outside this list selects no row, and every install test under it fails).
+/// A program with NO row for the running triple is the canonical
+/// `unavailable on <target>: <hint>` state, never an error.
 pub const TARGETS: &[&str] = &[
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -359,8 +360,7 @@ pub const TARGETS: &[&str] = &[
 ];
 
 /// The tools the published trust bundle shims (the pkg-trust-6808 set): the producer packs
-/// and refuses a seal without each, and the candidate gate measures the directory that
-/// holds them. `ty` left it 2026-08-18 when the standalone `ty` pack took the name: never
+/// and refuses a seal without each. `ty` left it 2026-08-18 when the standalone `ty` pack took the name: never
 /// re-add it — one index exposing a name twice shims it twice.
 pub const TRUST_EXPOSES: &[&str] = &[
     "trustc",

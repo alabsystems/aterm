@@ -17,8 +17,17 @@ enum Shape {
     Scalar,
     Object(&'static [Field]),
     /// A list, each element read by the shape: a message's content as its
-    /// [`CONTENT_PART`]s ([`CONTENT`]) or its [`CALL_PART`]s ([`CALLS`]).
+    /// [`CONTENT_PART`]s ([`CONTENT`]), its [`CALL_PART`]s ([`CALLS`]) or its
+    /// [`EXCERPT_PART`]s ([`EXCERPT`]).
     Seq(&'static Shape),
+    /// [`Shape::Seq`] that keeps ONLY a list: any other value (a prompt's
+    /// plain-string content) is validated and read as null, never copied —
+    /// the step fold's [`STEP_PARTS`], which keeps no text (ruling S6).
+    Parts(&'static Shape),
+    /// [`Shape::Object`] that keeps ONLY an object: any other value (a bare
+    /// string where a part belongs) is validated and read as null — the
+    /// step fold's [`STEP_PART`].
+    Record(&'static [Field]),
 }
 
 type Field = (&'static str, Shape);
@@ -35,41 +44,25 @@ const USAGE: Shape = Shape::Object(&[
         Shape::Object(&[
             ("id", Shape::Scalar),
             ("model", Shape::Scalar),
-            (
-                "usage",
-                Shape::Object(&[
-                    ("input_tokens", Shape::Scalar),
-                    ("output_tokens", Shape::Scalar),
-                    ("cache_creation_input_tokens", Shape::Scalar),
-                    ("cache_read_input_tokens", Shape::Scalar),
-                    // The cache writes by lifetime: one-hour writes list
-                    // higher (`usage::TokenUsage::cache_write_1h`).
-                    (
-                        "cache_creation",
-                        Shape::Object(&[
-                            ("ephemeral_5m_input_tokens", Shape::Scalar),
-                            ("ephemeral_1h_input_tokens", Shape::Scalar),
-                        ]),
-                    ),
-                    // What the price table does not price, so the spend
-                    // fold counts the message as approximate
-                    // (`spend::approx`): fast mode, US-only inference,
-                    // web search, a tier other than the standard one, any
-                    // iteration but a plain message — an advisor's, a
-                    // server-side fallback's (each entry's `type` only).
-                    ("speed", Shape::Scalar),
-                    ("inference_geo", Shape::Scalar),
-                    ("service_tier", Shape::Scalar),
-                    (
-                        "server_tool_use",
-                        Shape::Object(&[("web_search_requests", Shape::Scalar)]),
-                    ),
-                    (
-                        "iterations",
-                        Shape::Seq(&Shape::Object(&[("type", Shape::Scalar)])),
-                    ),
-                ]),
-            ),
+            ("usage", MESSAGE_USAGE),
+        ]),
+    ),
+]);
+
+/// A message's token classes, read by the session usage ([`USAGE`]) and
+/// step ([`STEPS`]) folds.
+const MESSAGE_USAGE: Shape = Shape::Object(&[
+    ("input_tokens", Shape::Scalar),
+    ("output_tokens", Shape::Scalar),
+    ("cache_creation_input_tokens", Shape::Scalar),
+    ("cache_read_input_tokens", Shape::Scalar),
+    // The cache writes by lifetime: one-hour writes list
+    // higher (`usage::TokenUsage::cache_write_1h`).
+    (
+        "cache_creation",
+        Shape::Object(&[
+            ("ephemeral_5m_input_tokens", Shape::Scalar),
+            ("ephemeral_1h_input_tokens", Shape::Scalar),
         ]),
     ),
 ]);
@@ -175,6 +168,9 @@ const CONVERSATION: Shape = Shape::Object(&[
     // (`supervise/wall_confirm.rs`'s `waits_on_background`).
     ("pendingBackgroundAgentCount", Shape::Scalar),
     ("pendingWorkflowCount", Shape::Scalar),
+    // …and how long that turn worked: what a person's exchange retried at
+    // a wall is bounded by (`upgrade::LastTurn::names`).
+    ("durationMs", Shape::Scalar),
     ("content", Shape::Scalar),
     // Who asked a user row's turn (`task-notification`, `auto-continuation`,
     // `peer`, `human`): Claude Code's own wakes reopen no finished task
@@ -185,6 +181,13 @@ const CONVERSATION: Shape = Shape::Object(&[
     // prompt typed while the agent worked is recorded only as an attachment
     // absorbed into it (`queued_command`; `upgrade::FinishedScan`).
     ("promptId", Shape::Scalar),
+    // The scheduled task a `/loop`'s wake fired for, stamped on the wake's
+    // user row (the 2.1.252 and 2.1.267 bundles), and the turn's origin
+    // where Claude Code names one (`scheduled`, `auto_continuation`, `peer`;
+    // never a Stop hook's feedback): a turn of its own on a row with no
+    // `promptId` (`upgrade::begins_unnumbered`).
+    ("scheduledTaskId", Shape::Scalar),
+    ("turnOrigin", Shape::Scalar),
     (
         "attachment",
         Shape::Object(&[
@@ -201,7 +204,129 @@ const CONVERSATION: Shape = Shape::Object(&[
     ("quotaLimits", QUOTA_LIMITS),
     (
         "message",
-        Shape::Object(&[("model", Shape::Scalar), ("content", CONTENT)]),
+        Shape::Object(&[
+            ("model", Shape::Scalar),
+            ("stop_reason", Shape::Scalar),
+            ("content", CONTENT),
+        ]),
+    ),
+]);
+
+/// A tool call or a tool's result as the session log's step fold reads it
+/// (`harness::steps`): its kind, the call's id and tool, the id of the call
+/// a result answers and whether it failed. Never a call's `input`, never a
+/// result's `content`, never a text part's `text` (ruling S6).
+const STEP_PART: Shape = Shape::Record(&[
+    ("type", Shape::Scalar),
+    ("id", Shape::Scalar),
+    ("name", Shape::Scalar),
+    ("tool_use_id", Shape::Scalar),
+    ("is_error", Shape::Scalar),
+]);
+/// A message's content as the step fold keeps it: its parts, and nothing
+/// of a plain-string content (a prompt) or of a bare string among the
+/// parts, each read as null.
+const STEP_PARTS: Shape = Shape::Parts(&STEP_PART);
+/// What the step fold reads of every row (addendum A8): [`USAGE`]'s keys,
+/// the row's own id, its parent's, the vendor turn's (`promptId`), its
+/// meta and compaction flags, who asked (`origin.kind`), whether Claude Code
+/// began the turn of its own on a row with no `promptId` (`turnOrigin`,
+/// `scheduledTaskId`: `upgrade::begins_unnumbered_by`), and the build and
+/// effort that wrote it. [`STEPS`] adds the content's parts; this, read for
+/// a row that holds no call or result, never visits the content at all.
+const STEPS_BARE_FIELDS: [Field; 17] = [
+    ("type", Shape::Scalar),
+    ("subtype", Shape::Scalar),
+    ("durationMs", Shape::Scalar),
+    ("isSidechain", Shape::Scalar),
+    ("isApiErrorMessage", Shape::Scalar),
+    ("timestamp", Shape::Scalar),
+    ("uuid", Shape::Scalar),
+    ("parentUuid", Shape::Scalar),
+    ("promptId", Shape::Scalar),
+    ("isMeta", Shape::Scalar),
+    ("isCompactSummary", Shape::Scalar),
+    ("origin", Shape::Object(&[("kind", Shape::Scalar)])),
+    ("turnOrigin", Shape::Scalar),
+    ("scheduledTaskId", Shape::Scalar),
+    ("version", Shape::Scalar),
+    ("effort", Shape::Scalar),
+    (
+        "message",
+        Shape::Object(&[
+            ("id", Shape::Scalar),
+            ("model", Shape::Scalar),
+            ("usage", MESSAGE_USAGE),
+        ]),
+    ),
+];
+const STEPS_BARE: Shape = Shape::Object(&STEPS_BARE_FIELDS);
+/// [`STEPS_BARE`] and the content's parts ([`STEP_PARTS`]): for a row
+/// whose raw bytes hold a call's or a result's key (`steps::wants_parts`).
+const STEPS_FIELDS: [Field; 17] = {
+    let mut fields = STEPS_BARE_FIELDS;
+    fields[16] = (
+        "message",
+        Shape::Object(&[
+            ("id", Shape::Scalar),
+            ("model", Shape::Scalar),
+            ("usage", MESSAGE_USAGE),
+            ("content", STEP_PARTS),
+        ]),
+    );
+    fields
+};
+const STEPS: Shape = Shape::Object(&STEPS_FIELDS);
+
+/// What the survey's excerpts read of a part ([`excerpt`]): its kind, a text
+/// part's text, a tool call's name and id, a tool result's call id. Never a
+/// tool's input, a result's content or an image.
+const EXCERPT_PART: [Field; 5] = [
+    ("type", Shape::Scalar),
+    ("text", Shape::Scalar),
+    ("name", Shape::Scalar),
+    ("id", Shape::Scalar),
+    ("tool_use_id", Shape::Scalar),
+];
+const EXCERPT: Shape = Shape::Object(&[
+    ("type", Shape::Scalar),
+    ("isSidechain", Shape::Scalar),
+    ("isMeta", Shape::Scalar),
+    ("isCompactSummary", Shape::Scalar),
+    ("isApiErrorMessage", Shape::Scalar),
+    (
+        "message",
+        Shape::Object(&[
+            ("id", Shape::Scalar),
+            ("model", Shape::Scalar),
+            ("content", Shape::Seq(&Shape::Object(&EXCERPT_PART))),
+        ]),
+    ),
+]);
+
+/// What the worker's result reader keeps of a row (`super::result`): whose
+/// row it is and which message it belongs to (`uuid`, `sessionId`,
+/// `message.id` — Claude Code writes one row per content block, all under
+/// the message's one id), when it was written (`timestamp`: a turn begun
+/// after the done point is no turn of that done's), the flags that make it
+/// no one's words, and the text blocks. Tool inputs and results are
+/// validated, never kept.
+const EXCHANGE: Shape = Shape::Object(&[
+    ("type", Shape::Scalar),
+    ("uuid", Shape::Scalar),
+    ("timestamp", Shape::Scalar),
+    ("sessionId", Shape::Scalar),
+    ("isSidechain", Shape::Scalar),
+    ("isMeta", Shape::Scalar),
+    ("isCompactSummary", Shape::Scalar),
+    ("isApiErrorMessage", Shape::Scalar),
+    (
+        "message",
+        Shape::Object(&[
+            ("id", Shape::Scalar),
+            ("model", Shape::Scalar),
+            ("content", CONTENT),
+        ]),
     ),
 ]);
 
@@ -350,10 +475,73 @@ pub(crate) fn codex_limits(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<CodexLimits>(line).map(|v| v.0)
 }
 
+/// What the session log's Codex step fold reads of a rollout line
+/// (`harness::codex_steps`): its kind and stamp, and of its payload the
+/// kind, the thread a `session_meta` is (`id`), its fork parent and build,
+/// a `thread_settings_applied`'s thread, a turn's id, a call's id, tool and
+/// namespace, a `turn_context`'s model and effort, a turn's duration, the
+/// closed word of a turn's error (never its message), and a `token_count`'s
+/// running total and last turn. A call's arguments and input, a result's
+/// output, messages, instructions, settings, a compaction's history and the
+/// rate limits are validated, never materialized (ruling S6).
+const CODEX_STEPS: Shape = Shape::Object(&[
+    ("type", Shape::Scalar),
+    ("timestamp", Shape::Scalar),
+    (
+        "payload",
+        Shape::Object(&[
+            ("type", Shape::Scalar),
+            ("id", Shape::Scalar),
+            ("forked_from_id", Shape::Scalar),
+            ("cli_version", Shape::Scalar),
+            ("thread_id", Shape::Scalar),
+            ("turn_id", Shape::Scalar),
+            ("call_id", Shape::Scalar),
+            ("name", Shape::Scalar),
+            ("namespace", Shape::Scalar),
+            ("model", Shape::Scalar),
+            ("effort", Shape::Scalar),
+            ("duration_ms", Shape::Scalar),
+            (
+                "error",
+                Shape::Object(&[("codex_error_info", Shape::Scalar)]),
+            ),
+            (
+                "info",
+                Shape::Object(&[
+                    ("total_token_usage", CODEX_TOKENS),
+                    ("last_token_usage", CODEX_TOKENS),
+                ]),
+            ),
+        ]),
+    ),
+]);
+
+struct CodexSteps(Value);
+
+impl<'de> Deserialize<'de> for CodexSteps {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        CODEX_STEPS.deserialize(de).map(Self)
+    }
+}
+
+pub(crate) fn codex_steps(line: &str) -> aterm_json::Result<Value> {
+    aterm_json::from_str::<CodexSteps>(line).map(|v| v.0)
+}
+
 struct Usage(Value);
 struct Metadata<const CONTENT: bool>(Value);
 struct Conversation(Value);
+struct Exchange(Value);
+
+impl<'de> Deserialize<'de> for Exchange {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        EXCHANGE.deserialize(de).map(Self)
+    }
+}
+struct Excerpt(Value);
 struct Calls(Value);
+struct Steps<const PARTS: bool>(Value);
 
 impl<'de> Deserialize<'de> for Usage {
     fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
@@ -374,9 +562,22 @@ impl<'de> Deserialize<'de> for Conversation {
     }
 }
 
+impl<'de> Deserialize<'de> for Excerpt {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        EXCERPT.deserialize(de).map(Self)
+    }
+}
+
 impl<'de> Deserialize<'de> for Calls {
     fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         CALLS.deserialize(de).map(Self)
+    }
+}
+
+impl<'de, const PARTS: bool> Deserialize<'de> for Steps<PARTS> {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let shape = if PARTS { STEPS } else { STEPS_BARE };
+        shape.deserialize(de).map(Self)
     }
 }
 
@@ -400,10 +601,35 @@ pub(crate) fn conversation(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Conversation>(line).map(|v| v.0)
 }
 
+/// The survey's excerpts ([`super::excerpt`]) need a row's discriminants, its
+/// message id, text parts and tool call names and ids, but never a tool's
+/// input or result.
+pub(super) fn excerpt(line: &str) -> aterm_json::Result<Value> {
+    aterm_json::from_str::<Excerpt>(line).map(|v| v.0)
+}
+
+/// The worker's result reader (`super::result`) needs each row's own id, its
+/// conversation's, its message's id and text blocks, never tool payloads.
+pub(super) fn exchange(line: &str) -> aterm_json::Result<Value> {
+    aterm_json::from_str::<Exchange>(line).map(|v| v.0)
+}
+
 /// The approval loop needs which calls wait on a result, their tools and the
 /// files they name, but never what a call writes or a result holds.
 pub(crate) fn calls(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Calls>(line).map(|v| v.0)
+}
+
+/// The step fold's read of a row that holds a call or a result: ids,
+/// times, flags, usage and the content's parts, never any text.
+pub(crate) fn steps(line: &str) -> aterm_json::Result<Value> {
+    aterm_json::from_str::<Steps<true>>(line).map(|v| v.0)
+}
+
+/// The step fold's read of any other row: [`steps`] without the content,
+/// which the parser passes over without building it.
+pub(crate) fn steps_bare(line: &str) -> aterm_json::Result<Value> {
+    aterm_json::from_str::<Steps<false>>(line).map(|v| v.0)
 }
 
 impl<'de> DeserializeSeed<'de> for Shape {
@@ -426,31 +652,34 @@ impl<'de> Visitor<'de> for Shape {
     }
 
     fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
-        Ok(Value::Bool(v))
+        Ok(self.scalar(Value::Bool(v)))
     }
 
     fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
-        Ok(Value::from(v))
+        Ok(self.scalar(Value::from(v)))
     }
 
     fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
-        Ok(Value::from(v))
+        Ok(self.scalar(Value::from(v)))
     }
 
     fn visit_f64<E>(self, v: f64) -> Result<Value, E> {
-        Ok(Value::from(v))
+        Ok(self.scalar(Value::from(v)))
     }
 
     fn visit_str<E>(self, v: &str) -> Result<Value, E> {
+        if let Shape::Parts(_) | Shape::Record(_) = self {
+            return Ok(Value::Null);
+        }
         Ok(Value::String(v.to_owned()))
     }
 
     fn visit_string<E>(self, v: String) -> Result<Value, E> {
-        Ok(Value::String(v))
+        Ok(self.scalar(Value::String(v)))
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
-        if let Shape::Seq(element) = self {
+        if let Shape::Seq(element) | Shape::Parts(element) = self {
             let mut kept = Vec::new();
             while let Some(one) = seq.next_element_seed(*element)? {
                 kept.push(one);
@@ -462,7 +691,7 @@ impl<'de> Visitor<'de> for Shape {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
-        let Shape::Object(fields) = self else {
+        let (Shape::Object(fields) | Shape::Record(fields)) = self else {
             while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
             return Ok(Value::Null);
         };
@@ -475,6 +704,18 @@ impl<'de> Visitor<'de> for Shape {
             }
         }
         Ok(Value::Object(kept))
+    }
+}
+
+impl Shape {
+    /// A scalar as this shape keeps it: as it is, but under
+    /// [`Shape::Parts`] and [`Shape::Record`], which keep only a list and
+    /// only an object.
+    fn scalar(self, v: Value) -> Value {
+        match self {
+            Shape::Parts(_) | Shape::Record(_) => Value::Null,
+            _ => v,
+        }
     }
 }
 
@@ -507,19 +748,22 @@ mod tests {
 
     fn project(value: Value, shape: Shape) -> Value {
         match (value, shape) {
-            (Value::Array(parts), Shape::Seq(element)) => {
+            (Value::Array(parts), Shape::Seq(element) | Shape::Parts(element)) => {
                 Value::Array(parts.into_iter().map(|p| project(p, *element)).collect())
             }
-            (Value::Object(mut obj), Shape::Object(fields)) => Value::Object(
-                fields
-                    .iter()
-                    .filter_map(|&(name, shape)| {
-                        obj.remove(name)
-                            .map(|v| (name.to_owned(), project(v, shape)))
-                    })
-                    .collect(),
-            ),
-            (Value::Object(_) | Value::Array(_), _) => Value::Null,
+            (_, Shape::Parts(_)) => Value::Null,
+            (Value::Object(mut obj), Shape::Object(fields) | Shape::Record(fields)) => {
+                Value::Object(
+                    fields
+                        .iter()
+                        .filter_map(|&(name, shape)| {
+                            obj.remove(name)
+                                .map(|v| (name.to_owned(), project(v, shape)))
+                        })
+                        .collect(),
+                )
+            }
+            (Value::Object(_) | Value::Array(_), _) | (_, Shape::Record(_)) => Value::Null,
             (scalar, _) => scalar,
         }
     }
@@ -563,6 +807,12 @@ mod tests {
                     r#"{{"payload":{{"forked_from_id":{value},"service_tier":{value},"info":{value}}}}}"#
                 ),
                 format!(
+                    r#"{{"type":"response_item","payload":{{"type":"function_call","call_id":{value},"name":{value},"namespace":{value},"arguments":{value},"turn_id":{value},"cli_version":{value},"effort":{value},"duration_ms":{value},"error":{value}}}}}"#
+                ),
+                format!(
+                    r#"{{"payload":{{"type":"task_complete","error":{{"message":{value},"codex_error_info":{value},"codex_error_info":"usage_limit_exceeded"}},"last_agent_message":{value}}}}}"#
+                ),
+                format!(
                     r#"{{"payload":{{"info":{{"total_token_usage":{value},"last_token_usage":{{"input_tokens":{value},"total_tokens":3,"total_tokens":{value}}},"rate_limits":{value}}}}}}}"#
                 ),
                 format!(
@@ -587,6 +837,19 @@ mod tests {
                     project(full.clone(), CONVERSATION)
                 );
                 assert_eq!(calls(&text).expect("calls"), project(full.clone(), CALLS));
+                assert_eq!(steps(&text).expect("steps"), project(full.clone(), STEPS));
+                assert_eq!(
+                    steps_bare(&text).expect("bare steps"),
+                    project(full.clone(), STEPS_BARE)
+                );
+                assert_eq!(
+                    exchange(&text).expect("exchange"),
+                    project(full.clone(), EXCHANGE)
+                );
+                assert_eq!(
+                    excerpt(&text).expect("excerpt"),
+                    project(full.clone(), EXCERPT)
+                );
                 assert_eq!(
                     codex_spend(&text).expect("Codex spend"),
                     project(full.clone(), CODEX_SPEND)
@@ -597,7 +860,11 @@ mod tests {
                 );
                 assert_eq!(
                     codex_limits(&text).expect("Codex limits"),
-                    project(full, CODEX_LIMITS)
+                    project(full.clone(), CODEX_LIMITS)
+                );
+                assert_eq!(
+                    codex_steps(&text).expect("Codex steps"),
+                    project(full, CODEX_STEPS)
                 );
             }
         }
@@ -619,10 +886,15 @@ mod tests {
                 assert!(usage(&text).is_err(), "{text}");
                 assert!(metadata(&text).is_err(), "{text}");
                 assert!(conversation(&text).is_err(), "{text}");
+                assert!(excerpt(&text).is_err(), "{text}");
+                assert!(exchange(&text).is_err(), "{text}");
                 assert!(calls(&text).is_err(), "{text}");
+                assert!(steps(&text).is_err(), "{text}");
+                assert!(steps_bare(&text).is_err(), "{text}");
                 assert!(codex_spend(&text).is_err(), "{text}");
                 assert!(codex_meta(&text).is_err(), "{text}");
                 assert!(codex_limits(&text).is_err(), "{text}");
+                assert!(codex_steps(&text).is_err(), "{text}");
             }
         }
         let deep = format!("{}0{}", "[".repeat(130), "]".repeat(130));
@@ -632,4 +904,4 @@ mod tests {
 
 #[path = "transcript_corpus_tests.rs"]
 #[cfg(test)]
-mod corpus_tests;
+pub(crate) mod corpus_tests;

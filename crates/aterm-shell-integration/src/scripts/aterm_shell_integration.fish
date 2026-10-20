@@ -18,7 +18,10 @@
 #   build's integration at its next prompt, when the host that owns it points it there
 #   (see "THE LOADER" below)
 #
-# Compatible with: fish 3.1+ (string escape --style=url requires 3.1)
+# Compatible with: fish 3.4+. The guards below `return` outside a function,
+# which fish first allowed in 3.4: fish 3.1.2 refuses the whole file at the
+# first one, and every fish test of this crate passes on 3.4.1 and 4.9.3
+# (2026-10-18). (`string escape --style=url` needs 3.1.)
 
 # Only run in interactive shells.
 # Use `return` (not `exit`) — `exit` in a sourced file kills the entire
@@ -144,10 +147,27 @@ contains -- "$ATERM_MUX" 0 off no none false; and set __aterm_mux ""
 # guard is its own, and the load goes on as an upgrade in place: everything below
 # is idempotent, and what must run once per shell (the package blocks, the prompt
 # wrapper's copy of the user's prompt) is skipped where it already ran.
-set -g __aterm_fresh_load 1
+#
+# An upgrade in place first notes, for the body's AN OLDER SCRIPT'S
+# `~/.aterm/bin`, the script that loaded this shell FRESH — before this load
+# writes over what says so: the loader in `__aterm_si_dir` when its own load was
+# the fresh one (`__aterm_fresh_load` 1), `-` for a shell from before loaders
+# (neither is set), nothing it can name otherwise (a loader that itself came in
+# place). Once per shell, while the body has not settled it.
 if set -q __aterm_shell_nonce; and functions -q __aterm_fish_preexec; and test -n "$ATERM_SHELL_INTEGRATION_INSTALLED"
+    if not set -q __aterm_old_bin_off; and not set -q __aterm_bin_from
+        if not set -q __aterm_fresh_load; and not set -q __aterm_si_dir
+            set -g __aterm_bin_from -
+        else if test "$__aterm_fresh_load" = 1; and test -n "$__aterm_si_dir"
+            set -g __aterm_bin_from "$__aterm_si_dir/aterm_shell_integration.fish"
+        else
+            set -g __aterm_bin_from ""
+        end
+    end
     set -g __aterm_fresh_load 0
     set -gx ATERM_SHELL_INTEGRATION_INSTALLED ""
+else
+    set -g __aterm_fresh_load 1
 end
 
 if test -n "$ATERM_SHELL_INTEGRATION_INSTALLED"
@@ -317,6 +337,37 @@ if test -n "$ATERM_REKEY_PATH"; or not set -q __aterm_rekey_path
 end
 set -e ATERM_REKEY_PATH 2>/dev/null
 
+# THE WARM SPARE (docs/DESIGN-warm-spare-2026-10-16.md), fish's half: the WARM
+# hold alone. fish reads no file of aterm's before the user's startup files (its
+# vendor conf.d runs with theirs), so a fish spare cannot park: it is spawned
+# WARM, its startup files running unseen at once, and waits at its first prompt
+# event (THE WARM HOLD) — the host books one only where the learned gate already
+# admits a WARM run. A spare is a shell whose hold FIFO exists, found from the
+# re-key path as the zsh and bash wrappers find it. Every fresh shell owes one
+# start record at its first prompt (THE START MARK).
+#
+# THE STARTUP ROOTS (R7, 2026-10-19): the record also names the folders fish's
+# own conf.d loop walks, this file among them, so the host stamps the files a
+# spare ran unseen where they really are, never where a guess from the binary's
+# prefix puts them (a build-configured sysconf folder, every inherited
+# $XDG_DATA_DIRS entry): the sysconf folder, then each vendor conf.d folder —
+# fish 4's global list, else fish 3's, local to the share/config.fish whose
+# loop is sourcing this file. A fish 3 that sources this file by hand sees
+# neither and names none, and its host runs none of its starts unseen.
+if test "$__aterm_fresh_load" = 1
+    set -g __aterm_start_pending 1
+    if set -q __fish_vendor_confdirs
+        set -g __aterm_start_roots "$__fish_sysconf_dir" $__fish_vendor_confdirs
+    else if set -q vendor_confdirs
+        set -g __aterm_start_roots "$__fish_sysconf_dir" $vendor_confdirs
+    end
+    set -l __aterm_spare_dir (string replace -r '/rekey/[^/]*$' '/spare' -- "$__aterm_rekey_path")
+    set -l __aterm_spare_sid (string replace -r '^.*/' '' -- "$__aterm_rekey_path")
+    if test -n "$__aterm_rekey_path"; and test -p "$__aterm_spare_dir/$__aterm_spare_sid"
+        set -g __aterm_spare_fifo "$__aterm_spare_dir/$__aterm_spare_sid"
+    end
+end
+
 # THE BODY POINTER (the zsh script's "THE LOADER"), captured and scrubbed exactly
 # like the re-key path: no child process learns it. An upgrade in place keeps the
 # one the shell already has, or takes the one its relaunch line hands it.
@@ -336,6 +387,13 @@ set -g __aterm_si_root (string replace -r '/[^/]*$' '' -- "$__aterm_si_dir")
 set -g __aterm_body_rev (string replace -r '^.*/' '' -- "$__aterm_si_dir")
 if not string match -qr '^[0-9a-f]{16}$' -- "$__aterm_body_rev"
     set -g __aterm_body_rev ""
+end
+
+# A fresh load settles the body's AN OLDER SCRIPT'S `~/.aterm/bin` at once: this
+# loader puts no `~/.aterm/bin` on PATH, so no entry there is an integration's
+# and the body has nothing to look for.
+if test "$__aterm_fresh_load" = 1
+    set -g __aterm_old_bin_off 1
 end
 
 # Source package shell hooks — once per shell: an upgrade in place already ran
@@ -374,6 +432,71 @@ function __aterm_body_check
 end
 
 # @@ATERM-INTEGRATION-BODY-BEGIN@@ — everything from here to the END marker is re-sourced live
+
+# ─── AN OLDER SCRIPT'S `~/.aterm/bin`, taken off (2026-10-19) ───
+#
+# Every script before 613305828c (2026-10-16) put `$HOME/.aterm/bin` FIRST on
+# PATH when it loaded a shell fresh and that folder existed; none since does
+# (the loader's package block says why). Such a shell kept the entry through an
+# upgrade in place — this body sourced at a prompt by its older loader, or this
+# loader sourced over it — until it exited. So the body takes it off, once per
+# shell, where the shell PROVES that such a script put it there, and nowhere
+# else: v0.106.0 and every build from 613305828c up to this one put none there
+# and set no mark, so in their shells a `~/.aterm/bin` on PATH is the user's
+# own. The proof has two halves:
+#
+#  1. The script that loaded this shell fresh carried the prepend. That is the
+#     loader in `__aterm_si_dir` when its own load was the fresh one
+#     (`__aterm_fresh_load` 1), or, when this build's loader came in place, the
+#     one it noted there (`__aterm_bin_from`, the loader's block says how; `-`
+#     for a shell from before loaders, whose every script prepended). The
+#     folder is content-addressed, so its loader still holds the bytes that
+#     loaded the shell, and the prepend line is looked for in it, spelled here
+#     so that this file never holds it. A folder already collected, or a loader
+#     an intermediate build sourced in place, leaves nothing to prove it with:
+#     the entry stays.
+#  2. The folder was there at that load: it is older than the shell process —
+#     its positive birth, or its last change only when birth is unavailable,
+#     by more than the whole seconds `stat`, `date` and `ps -o etime=` count in.
+#     A usable birth takes precedence even if mtime was preserved or backdated.
+#     The clock is read before the shell's age; mtime without a usable birth
+#     remains a fallback reading, not an independent creation-time witness.
+#
+# One `sh` asks both (grep, stat, ps and date: once per shell, and only where
+# PATH holds the entry and the folder exists). Then one copy goes — the first
+# equal to `$HOME/.aterm/bin` — and nothing else moves: the folder stays on
+# PATH once for every copy the user's own startup put there. `contains -i`
+# compares strings, never patterns.
+if not set -q __aterm_old_bin_off
+    set -g __aterm_old_bin_off 1
+    set -l __aterm_from ""
+    if set -q __aterm_bin_from
+        set __aterm_from "$__aterm_bin_from"
+    else if test "$__aterm_fresh_load" = 1; and test -n "$__aterm_si_dir"
+        set __aterm_from "$__aterm_si_dir/aterm_shell_integration.fish"
+    end
+    set -l __aterm_at (contains -i -- "$HOME/.aterm/bin" $PATH)
+    if test -n "$__aterm_from"; and test -n "$__aterm_at"; and test -d "$HOME/.aterm/bin"
+        if command sh -c '
+                    [ "$1" = - ] || grep -qF -e "$2" -- "$1" || exit 1
+                    t=$(stat -f "%B %m" -- "$3") || t=$(stat -c "%W %Y" -- "$3") || exit 1
+                    b=${t%% *}; m=${t##* }
+                    case $m in ""|*[!0-9]*) exit 1 ;; esac
+                    case $b in ""|*[!0-9]*|0) b=$m ;; esac
+                    n=$(date +%s) || exit 1
+                    e=$(ps -o etime= -p "$4") || exit 1
+                    e=${e##* }; d=0
+                    case $e in *-*) d=${e%%-*}; d=${d#0}; e=${e#*-} ;; esac
+                    case $d$e in ""|*[!0-9:]*) exit 1 ;; esac
+                    s=0; IFS=:
+                    for x in $e; do x=${x#0}; s=$((s * 60 + ${x:-0})); done
+                    [ $((b + ${d:-0} * 86400 + s + 1)) -lt "$n" ]
+                ' sh "$__aterm_from" "set -gx PATH \"\$HOME/.aterm/bin\" \$PATH" "$HOME/.aterm/bin" $fish_pid 2>/dev/null
+            set -e PATH[$__aterm_at]
+        end
+    end
+    set -e __aterm_bin_from
+end
 
 # ─── The reroute directory, FIRST — and the agents directory beside it ───
 #
@@ -438,9 +561,27 @@ function __aterm_reroute_path_front
     end
 end
 __aterm_reroute_path_front
+# atpkg's managed bin/ goes LAST, where its hook appends it, so it shadows no
+# directory of the session's. fish runs this file among the other conf.d snippets,
+# in name order, and config.fish after them all: one of those appending a directory
+# (Ubuntu's snapd.fish appends /snap/bin to a PATH without it) left bin/ ahead of
+# that directory. The first prompt, after every startup file, puts bin/ back at the
+# end, as it puts the front back first.
+function __aterm_managed_bin_last
+    test -n "$ATPKG_BIN"; and test "$PATH[-1]" != "$ATPKG_BIN"; and contains -- "$ATPKG_BIN" $PATH
+    or return 0
+    set -l rest
+    for d in $PATH
+        if test "$d" != "$ATPKG_BIN"
+            set -a rest "$d"
+        end
+    end
+    set -gx PATH $rest "$ATPKG_BIN"
+end
 function __aterm_reroute_first_prompt --on-event fish_prompt
     functions -e __aterm_reroute_first_prompt
     __aterm_reroute_path_front
+    __aterm_managed_bin_last
 end
 
 # ─── LIVE: the tab that is ALREADY OPEN picks the managed dirs up the moment atpkg lays them ───
@@ -754,7 +895,12 @@ function __aterm_report_cwd
     # file:// URL format. ONE double-quoted argument, interpolating the two
     # precomputed globals — never a string glued to a command substitution;
     # see the glue rule beside $__aterm_report_host above.
-    __aterm_osc "7;file://$__aterm_report_host$cwd"
+    # SIGNED first, then plain (see the zsh script's __aterm_report_cwd).
+    set -l uri "file://$__aterm_report_host$cwd"
+    if test -n "$__aterm_id_suffix_str"
+        __aterm_osc "633;P;AtermCwd=$uri$__aterm_id_suffix_str"
+    end
+    __aterm_osc "7;$uri"
 end
 
 # Mark prompt start (OSC 133;A). Never from inside a user's prompt: a wrapper's
@@ -1261,48 +1407,157 @@ end
 # break-out, e.g. smuggling an OSC 52 clipboard write). Mirrors the zsh/bash
 # [[:cntrl:]] encoders and the control-byte stripping on the tab-title path,
 # and emits the \xNN form the aterm decoder (unescape_vscode_string) reverses.
+#
+# WHOLE STRINGS, NOT CHARACTERS (LAG-9, 2026-10-18): a loop over the characters
+# ran a `switch`, a regex match and a `set` for each one — 0.45 ms for the start
+# mark's 84-byte rc folder and 0.32 ms for a 44-byte command line (fish 4.9.3),
+# paid at every first prompt and every command (a pasted 40-line block: 24 ms).
+# A string with no byte to encode (most folders) is now printed as it is after
+# one regex match. Any other is split into its lines (a newline cannot ride a
+# command substitution), each reserved byte is one `string replace -a` over all
+# of them — backslash first, so the backslashes the others write are never
+# doubled — and the lines are joined by the newline's escape. The three now
+# cost 0.02, 0.09 and 0.8 ms. Each other control byte —
+# e.g. ESC (0x1b) or BEL (0x07), which terminate an OSC string in the parser
+# and would break out of the 633;E sequence — is found by the same
+# [\x00-\x1f\x7f] class the tab-title path strips, once per distinct byte,
+# turned into %NN by the url-escape helper already trusted by __aterm_urlencode,
+# and written as the decoder's \xNN form, lower-cased to match \x3b. Non-control
+# bytes (multi-byte UTF-8 included) pass through as-is.
+#
+# Captured, then interpolated quoted — never glued. `string replace` without
+# `-f` prints every line it is handed, matched or not (an empty one as an empty
+# line), so `set lines (…)` never takes zero arguments, which would WIPE the
+# line instead of leaving it.
 function __aterm_encode_cmd
-    set -l input "$argv"
-    set -l result ""
-    for i in (string split '' -- "$input")
-        switch "$i"
-            case "\\"
-                set result "$result\\\\"
-            case ';'
-                set result "$result\\x3b"
-            case ' '
-                set result "$result\\x20"
-            case \t
-                set result "$result\\x09"
-            case \n
-                set result "$result\\x0a"
-            case \r
-                set result "$result\\x0d"
-            case '*'
-                # Any remaining C0/DEL control byte (0x00-0x1f, 0x7f) — e.g.
-                # ESC (0x1b) or BEL (0x07) — must be hex-escaped, never passed
-                # through verbatim: raw ESC/BEL terminate an OSC string in the
-                # parser and would break out of the 633;E sequence. Reuse the
-                # same [\x00-\x1f\x7f] class the tab-title path strips, and the
-                # url-escape helper already trusted by __aterm_urlencode to turn
-                # the byte into %NN, then render it as the decoder's \xNN form
-                # (lower-cased to match the \x3b/\x09 style used above). Space
-                # (0x20) and \\t\\n\\r keep their explicit cases; non-control
-                # bytes (including multi-byte UTF-8) still pass through as-is.
-                #
-                # Captured, then interpolated quoted — never glued. A glued
-                # substitution here is the worst of the family: `set result`
-                # with zero arguments does not append nothing, it WIPES the
-                # whole accumulated string built so far.
-                if string match -qr '[\x00-\x1f\x7f]' -- "$i"
-                    set -l hex (string escape --style=url -- "$i" | string sub -s 2 | string lower)
-                    set result "$result\\x$hex"
-                else
-                    set result "$result$i"
-                end
+    if not string match -qr '[\\\\; \x00-\x1f\x7f]' -- "$argv"
+        printf '%s' "$argv"
+        return 0
+    end
+    set -l lines (string split -- \n "$argv")
+    set lines (string replace -a -- '\\' '\\\\' $lines)
+    set lines (string replace -a -- ';' '\x3b' $lines)
+    set lines (string replace -a -- ' ' '\x20' $lines)
+    set -l done
+    for c in (string match -ar '[\x00-\x1f\x7f]' -- $lines)
+        contains -- "$c" $done; and continue
+        set -a done "$c"
+        set -l hex (string escape --style=url -- "$c" | string sub -s 2 | string lower)
+        set lines (string replace -a -- "$c" "\\x$hex" $lines)
+    end
+    string join -- '\x0a' $lines
+end
+
+# ─── THE START MARK and THE WARM HOLD (docs/DESIGN-warm-spare-2026-10-16.md) ───
+#
+# The zsh and bash scripts' twins. Every fresh integrated fish signs ONE start
+# record at its first prompt event, after every startup file: its startup roots,
+# its rc folder ($__fish_config_dir), its flags and `cold` or `spare`, in one
+# fork-free write.
+# `pre` counts the prompt-event handlers that ran ahead of aterm's (fish runs
+# them in the order they were defined, so only a conf.d snippet sourced before
+# aterm's defines one): a warm spare runs them again at its release, as zsh
+# re-runs the precmd hooks ahead of its own. fish has no `sched` or periodic
+# hooks; its jobs are counted by the builtin.
+#
+# CHEAP, because every fish start no spare serves pays for it (LAG-9,
+# 2026-10-18): it cost 0.99 ms of a fish's first prompt (0.97 ms of its CPU),
+# against the same script without the call, and now 0.03 ms (0.12 ms), within
+# the noise (fish 4.9.3, a PTY replay, n=30 interleaved). A folder with nothing
+# to escape (the common case) skips the encoder, as zsh's does; the jobs are
+# listed only when `jobs -q` says there are any; a spare hands in the `pre` it
+# already counted. And the write goes to stdout, as every other mark of this
+# file's does — the event fires outside the prompt's capture, on the tty —
+# not to /dev/tty, whose open cost more than the write: zsh's twin opens
+# /dev/tty because p10k's instant prompt holds its stdout, and fish has no such
+# prompt.
+#
+# The startup roots (THE STARTUP ROOTS, in the loader) ride the same write,
+# ahead of the rc folder, joined by `\x00`, which no path holds. Each folder's
+# backslashes, `;` and control bytes are escaped as the 633 E encoder escapes
+# them, and nothing else: an OSC parameter ends only at a `;` or a control
+# byte, so a space stays as it is. The usual folders need no escape at all;
+# the others are escaped all at once, one substitution for the list, unless
+# one holds a control byte: each then goes through the encoder, which keeps a
+# newline inside its own folder. One regex looks at the rc folder and every
+# root at once (a `string match -r` compiles its pattern at every call, about
+# 0.04 ms here); only a hit looks again, item by item.
+function __aterm_start_mark --argument-names kind pre
+    set -l rc "$__fish_config_dir"
+    set -l folders $__aterm_start_roots
+    if string match -qr '[\\\\; \x00-\x1f\x7f]' -- "$rc" $folders
+        string match -qr '[\\\\; \x00-\x1f\x7f]' -- "$rc"; and set rc (__aterm_encode_cmd "$rc")
+        if string match -qr '[\x00-\x1f\x7f]' -- $folders
+            set -l escaped
+            for folder in $folders
+                set -l one (__aterm_encode_cmd "$folder")
+                set -a escaped "$one"
+            end
+            set folders $escaped
+        else
+            set folders (string replace -a -- '\\' '\\\\' $folders | string replace -a -- ';' '\x3b')
         end
     end
-    printf '%s' "$result"
+    set -l roots
+    if set -q __aterm_start_roots
+        set -l joined (string join '\x00' -- $folders)
+        set roots \e']633;P;AtermStartRoots='"$joined$__aterm_id_suffix_str"\a
+    end
+    set -l jobs 0
+    jobs -q; and set jobs (count (jobs -p))
+    if test -z "$pre"
+        set pre 0
+        set -l ahead (__aterm_prompt_handlers_ahead); and set pre (count $ahead)
+    end
+    printf '%s\e]633;P;AtermStartRc=%s%s\a\e]633;P;AtermStartFlags=pre:%s,s:0,j:%s,r:0%s\a\e]633;P;AtermStart=%s%s\a' \
+        "$roots" "$rc" "$__aterm_id_suffix_str" "$pre" "$jobs" "$__aterm_id_suffix_str" \
+        "$kind" "$__aterm_id_suffix_str"
+end
+
+# The user's prompt-event handlers defined ahead of aterm's, in their order
+# (this body's own first-prompt handlers come first too, and are aterm's), and
+# false when there are none. fish lists the generic handlers as `<event> <name>`
+# lines, by event, each event's in the order they were defined. One regex over
+# them, joined, answers the common case (no `fish_prompt` handler but aterm's
+# own ahead of aterm's): a name with a space in it can only make it look
+# further, never miss one.
+function __aterm_prompt_handlers_ahead
+    set -l handlers (functions --handlers-type generic)
+    string match -qr -- '(^| )fish_prompt (?!__aterm_).* fish_prompt __aterm_fish_prompt_event( |$)' "$handlers"
+    or return 1
+    set -l mine (contains -i -- "fish_prompt __aterm_fish_prompt_event" $handlers); and set -e handlers[$mine..-1]
+    string replace -rf -- '^fish_prompt (?!__aterm_)' '' $handlers
+end
+
+# A WARM spare's hold, from its first prompt event: its startup files have run
+# unseen, and nothing of its prompt has. Released by `go`, it takes in what
+# other sessions added to its history since its own came up (`history merge`,
+# a no-op for a history nothing has read yet, which fish reads afresh at first
+# use as a cold start does), and the prompt-event handlers that ran ahead of
+# aterm's run again, their output dropped, as at an empty Enter. A discard's
+# hang-up writes no history: fish saves only the commands a session ran, and a
+# spare ran none. Nothing here touches the tty, so what is typed before the
+# release waits there for the line editor; fish keeps `$status` across an event
+# handler, so the first prompt still reads the startup files' own.
+function __aterm_spare_hold
+    set -l ahead (__aterm_prompt_handlers_ahead)
+    __aterm_start_mark spare (count $ahead)
+    set -l n 0
+    while true
+        if read -l go <"$__aterm_spare_fifo" 2>/dev/null
+            test "$go" = go; and break
+        else
+            set n (math $n + 1)
+            if test $n -ge 50; or not test -p "$__aterm_spare_fifo"
+                exit 0
+            end
+        end
+    end
+    set -e __aterm_spare_fifo
+    history merge 2>/dev/null
+    for handler in $ahead
+        $handler >/dev/null 2>&1
+    end
 end
 
 # fish_preexec - runs before command execution
@@ -1327,12 +1582,18 @@ function __aterm_fish_preexec --on-event fish_preexec
     # string, so the payload degrades to `633;E;` instead of vanishing.
     set -l encoded (__aterm_encode_cmd "$argv")
     __aterm_osc "633;E;$encoded$__aterm_id_suffix_str"
-    # Set tab title to running command (OSC 0).
-    # Truncate to first 64 chars and strip control characters.
+    # Set tab title to running command (OSC 0): the line, control characters
+    # stripped, at most 256 characters; a longer one is its first 255 and `…`, so
+    # the tab knows its end is cut off (the bash script's "The command title").
     # `test -z`, NOT `not set -q` — same emptiness contract as the prompt-title
     # path above.
+    # The strip comes first: it takes the line's newlines, so the cut below is one
+    # string, not one per line of a multi-line command.
     if test -z "$ATERM_DISABLE_PROMPT_TITLES"
-        set -l cmd_title (string sub -l 64 -- "$argv" | string replace -ra '[\x00-\x1f\x7f]' '')
+        set -l cmd_title (string replace -ra '[\x00-\x1f\x7f]' '' -- "$argv")
+        if test (string length -- "$cmd_title") -gt 256
+            set cmd_title (string sub -l 255 -- "$cmd_title")"…"
+        end
         __aterm_osc "0;$cmd_title"
     end
     __aterm_mark_exec_start
@@ -1435,6 +1696,16 @@ end
 # signed here. The user's prompt is never touched, and fish keeps `$status`
 # across an event handler, so it still reads the command's.
 function __aterm_fish_prompt_event --on-event fish_prompt
+    # The first prompt of a fresh load signs the start record; a warm spare
+    # waits there first (THE WARM HOLD).
+    if set -q __aterm_start_pending
+        set -e __aterm_start_pending
+        if set -q __aterm_spare_fifo
+            __aterm_spare_hold
+        else
+            __aterm_start_mark cold
+        end
+    end
     __aterm_body_check
     functions --no-details fish_prompt 2>/dev/null | string match -q -- '*__aterm_body_prompt*'
     or __aterm_mark_integration_rev

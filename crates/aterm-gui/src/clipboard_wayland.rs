@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The native-Wayland clipboard route: the [`winit::platform::wayland::WaylandClipboard`] handle
+//! The native-Wayland clipboard route: the [`aterm_window::platform::wayland::WaylandClipboard`] handle
 //! the (vendored, patched) winit event loop hands out, installed once at launch and consulted by
 //! every Linux arm in [`crate::clipboard`] before the X11 backend. On Wayland the window's own
 //! seat is what the compositor trusts to set a selection; the X11 backend reaches the clipboard
@@ -12,7 +12,7 @@
 
 use std::sync::OnceLock;
 
-pub(crate) use winit::platform::wayland::{WaylandClipboard, WaylandSelection};
+pub(crate) use aterm_window::platform::wayland::{WaylandClipboard, WaylandSelection};
 
 static HANDLE: OnceLock<WaylandClipboard> = OnceLock::new();
 

@@ -39,7 +39,7 @@ contract_fn! {
     /// Kernel-certified predicate deciding whether a stream frontier `upto` includes
     /// event offset `at_off` (`at_off <= upto`).
     #[must_use]
-    pub fn frontier_includes_raw(upto: u64, at_off: u64) -> bool
+    pub const fn frontier_includes_raw(upto: u64, at_off: u64) -> bool
     clauses [ensures result == (at_off <= upto)]
     {
         at_off <= upto
@@ -58,12 +58,13 @@ pub const fn causal_step_frontier(
     eff_cur: u64,
     eff_cand: u64,
 ) -> u64 {
-    causal_gate_frontier(
-        cause_req,
-        cause_cut,
-        heal_frontier_monotone(eff_cur, eff_cand),
-        eff_cur,
-    )
+    if cause_cut < cause_req {
+        eff_cur
+    } else if eff_cur < eff_cand {
+        eff_cand
+    } else {
+        eff_cur
+    }
 }
 
 /// A directed causal dependency from `(cause.0, cause.1)` to `(effect.0, effect.1)`:
@@ -109,7 +110,7 @@ impl<K: Ord> Default for CausalCut<K> {
 impl<K: Ord> CausalCut<K> {
     /// An empty cut that names no streams (admits nothing).
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             frontiers: BTreeMap::new(),
         }

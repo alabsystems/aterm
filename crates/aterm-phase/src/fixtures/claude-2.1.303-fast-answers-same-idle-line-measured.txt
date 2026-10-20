@@ -1,0 +1,51 @@
+# claude-code 2.1.303 · MEASURED 2026-10-18, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code against the lab's local stub of the API (crates/aterm-lab, scenario d1l) · every turn after the check's long one answered in about 50 ms with the same idle line: each `❯` row the harness typed (the done check, `keep going`) over the same `⏺` answer and a `✻ … for 0s` done row; no read saw those turns run
+ ▐▛███▛█   Claude Code v2.1.303
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.7S2X/proj
+
+
+❯ land the two branches
+
+⏺ Both branches have landed and no lander is running.
+
+✻ Worked for 6s · done 10:54 PM
+
+❯ Before you stop: do every open item, skipped check, follow-up and next step you can still do yourself now, and verify it (build, test,
+  measure where numbers were asked for, commit and land where this repository lands work). End your reply with ATERM-TASK-DONE on a line by
+  itself only when everything left needs a person (a credential, a decision, physical access) or cannot be done on this host, each item named
+  with its blocker; a slow check is not a blocker. Otherwise continue.
+
+⏺ Both branches have landed and no lander is running.
+
+✻ Crunched for 2m 10s · done 10:59 PM
+
+❯ keep going
+
+⏺ Both branches have landed and no lander is running.
+
+✻ Sautéed for 0s · done 10:59 PM
+
+❯ Before you stop: do every open item, skipped check, follow-up and next step you can still do yourself now, and verify it (build, test,
+  measure where numbers were asked for, commit and land where this repository lands work). End your reply with ATERM-TASK-DONE on a line by
+  itself only when everything left needs a person (a credential, a decision, physical access) or cannot be done on this host, each item named
+  with its blocker; a slow check is not a blocker. Otherwise continue.
+
+⏺ Both branches have landed and no lander is running.
+
+✻ Cogitated for 0s · done 11:01 PM
+
+❯ keep going
+
+⏺ Both branches have landed and no lander is running.
+
+✻ Baked for 0s · done 11:06 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+
+
+
+

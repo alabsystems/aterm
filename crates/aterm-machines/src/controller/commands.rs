@@ -7,7 +7,10 @@
 //!
 //! A fleet command runs in three phases:
 //!
-//! 1. A `hello` sweep, in parallel: reachability, agent build, floors and cache.
+//! 1. A `hello` sweep, in parallel: reachability, agent build, floors and cache, and where
+//!    each host answers when a rename left machines.toml's `.local` name behind, or DHCP
+//!    gave it another IP address (`reach`, which every command that contacts an enrolled
+//!    host goes through).
 //! 2. Envelopes built one after another, so the serial counter is never raced, then signed
 //!    in one `ssh-keygen` run, so a passphrase or touch is asked for once per command (and
 //!    not at all when ssh-agent already holds the key).
@@ -16,11 +19,45 @@
 //!
 //! Every host's newest plan or apply report lands in `state/` (a refusal is kept beside it,
 //! never in its place), and `status` and `outstanding` read only that. Everything a host
-//! said is printed through [`shown`].
+//! said is printed through [`shown`], and every line through `outln!` or `errln!`, which
+//! never panic.
+
+// `println!` panics once its terminal is gone; the lines here go through `outln!`/`errln!`.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
+/// `println!` that never panics. Once the terminal is gone (SIGHUP, a closed pty) a write to
+/// it fails, and `println!` would end the command with status 101 there: before a walk's
+/// closing plan saved what it read, or before its last line (VM: a walk hung up after its
+/// lock exited 101). Unit tests keep `println!`, whose output libtest captures.
+macro_rules! outln {
+    ($($arg:tt)*) => {{
+        #[cfg(not(test))]
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stdout(), $($arg)*);
+        }
+        #[cfg(test)]
+        println!($($arg)*);
+    }};
+}
+
+/// `eprintln!` that never panics, as `outln!`.
+macro_rules! errln {
+    ($($arg:tt)*) => {{
+        #[cfg(not(test))]
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), $($arg)*);
+        }
+        #[cfg(test)]
+        eprintln!($($arg)*);
+    }};
+}
 
 use super::artifacts;
 use super::enroll;
 use super::inventory::{self, Host, HostState, Inventory, Paths};
+use super::naming;
 use super::screen;
 use super::ssh::{self, Target};
 use super::templates;
@@ -29,6 +66,7 @@ use crate::envelope::{self, Action, ArtifactRef, Disrupt, Envelope, Exec, Signin
 use crate::model::{Effect, HostReport, ItemReport, Mode, Outcome, Read};
 use crate::port::{Cmd, Ran, System};
 use crate::protocol::{Hello, Line};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -100,90 +138,98 @@ impl Tally {
 
 // ── init ────────────────────────────────────────────────────────────────────────────────
 
-/// `aterm machines init`: the controller directory, the fleet SSH key, the signing and
-/// recovery keys (their passphrases are asked by `ssh-keygen` itself), `allowed_signers`,
-/// and the starter inventory and baseline. Nothing that exists is overwritten.
+/// `aterm machines init [--passphrase]`: the controller directory, the fleet SSH key, the
+/// signing and recovery keys, `allowed_signers`, and the starter inventory and baseline.
+/// Nothing that exists is overwritten, and what it made is printed to `out`.
+///
+/// Every key is made with no passphrase, so nothing is asked and no terminal is needed: a
+/// signing key with none signs unattended (design §3.1). With `passphrase`, `ssh-keygen`
+/// asks one for the signing and recovery keys on the terminal, also for keys an earlier
+/// `init` made without one; the fleet key has none either way (`ssh` uses it in batch mode).
 #[must_use]
-pub fn init(env: &Env<'_>) -> ExitCode {
-    if !env.tty {
-        eprintln!(
-            "aterm machines init: not run: it asks for the signing and recovery keys' \
-             passphrases, and standard input is not a terminal"
+pub fn init(env: &Env<'_>, passphrase: bool, out: &mut dyn std::io::Write) -> ExitCode {
+    if passphrase && !env.tty {
+        errln!(
+            "aterm machines init: not run: --passphrase asks for the signing and recovery \
+             keys' passphrases, and standard input or error is not a terminal"
         );
         return ExitCode::from(2);
     }
     let sys = env.sys;
     let root = &env.paths.root;
     if let Err(why) = env.paths.ensure(sys) {
-        eprintln!("aterm machines init: {why}");
+        errln!("aterm machines init: {why}");
         return ExitCode::FAILURE;
     }
     if let Err(why) = env.paths.ensure_control_dir(sys) {
-        eprintln!("aterm machines init: {why}");
+        errln!("aterm machines init: {why}");
         return ExitCode::FAILURE;
     }
     let host = controller_name(sys);
-    let fleet_key = env.paths.ssh_key();
-    if sys.stat(&fleet_key).is_err() {
-        let made = sys.run(
-            &Cmd::new("/usr/bin/ssh-keygen")
-                .args(["-q", "-t", "ed25519", "-N", "", "-C"])
-                .arg(format!("aterm-machines-fleet@{host}"))
-                .arg("-f")
-                .arg(fleet_key.as_os_str()),
-        );
-        match made {
-            Ok(ran) if ran.success() => println!("made the fleet SSH key: {}", fleet_key.display()),
-            Ok(ran) => {
-                eprintln!(
-                    "aterm machines init: ssh-keygen (fleet key): {}",
-                    ran.describe()
-                );
-                return ExitCode::FAILURE;
-            }
-            Err(e) => {
-                eprintln!("aterm machines init: ssh-keygen (fleet key): {e}");
-                return ExitCode::FAILURE;
-            }
-        }
-    }
+    // Each key, and whether `allowed_signers` names it.
     let keys = [
+        (
+            env.paths.ssh_key(),
+            format!("aterm-machines-fleet@{host}"),
+            "the fleet SSH key",
+            false,
+        ),
         (
             env.paths.signing_key(),
             format!("signing@{host}"),
-            "the daily signing key. An empty passphrase lets automation on this Mac apply \
-             baselines; a passphrase means only you can (design §3.1).",
+            "the signing key",
+            true,
         ),
         (
             root.join("keys").join("recovery"),
             format!("recovery@{host}"),
-            "the recovery key. Give it a passphrase, then move keys/recovery (not the .pub) \
-             to removable media: it re-keys the fleet if the signing key is lost or leaks.",
+            "the recovery key",
+            true,
         ),
     ];
-    for (path, comment, what) in &keys {
-        let public = path.with_extension("pub");
-        if sys.stat(&public).is_ok() {
+    for (path, comment, what, signer) in &keys {
+        let asked = passphrase && *signer;
+        // Either half: a recovery key moved to removable media leaves only its .pub here.
+        if sys.stat(path).is_ok() || sys.stat(&path.with_extension("pub")).is_ok() {
+            // --passphrase is added later too: a key made without one is given one, still
+            // the same key, so every host's allowed_signers still names it.
+            if asked && sys.stat(path).is_ok() {
+                match envelope::needs_passphrase(sys, path) {
+                    Read::Value(true) => {}
+                    Read::Value(false) => {
+                        let _ = writeln!(out, "{what} has no passphrase: ssh-keygen asks for one");
+                        if let Err(why) = add_passphrase(sys, path) {
+                            errln!("aterm machines init: ssh-keygen -p ({what}): {why}");
+                            return ExitCode::FAILURE;
+                        }
+                        let _ = writeln!(out, "gave {what} a passphrase: {}", path.display());
+                    }
+                    Read::Absent => {
+                        errln!("aterm machines init: {}: no key", path.display());
+                        return ExitCode::FAILURE;
+                    }
+                    Read::Unusable(why) => {
+                        errln!("aterm machines init: {}: {why}", path.display());
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             continue;
         }
-        println!("\nNext: {what}");
-        let made = sys.run_tty(
-            &Cmd::new("/usr/bin/ssh-keygen")
-                .args(["-t", "ed25519", "-C"])
-                .arg(comment)
-                .arg("-f")
-                .arg(path.as_os_str()),
-        );
-        if !matches!(made, Ok(Some(0))) {
-            eprintln!("aterm machines init: ssh-keygen ({comment}) did not make the key");
+        if asked {
+            let _ = writeln!(out, "{what}: ssh-keygen asks for its passphrase");
+        }
+        if let Err(why) = make_key(sys, path, comment, asked) {
+            errln!("aterm machines init: ssh-keygen ({what}): {why}");
             return ExitCode::FAILURE;
         }
+        let _ = writeln!(out, "made {what}: {}", path.display());
     }
     if sys.stat(&env.paths.allowed_signers()).is_err() {
         let mut signers = String::new();
-        for (path, comment, _) in &keys {
+        for (path, comment, _, _) in keys.iter().filter(|(_, _, _, signer)| *signer) {
             let Ok(public) = sys.read_file(&path.with_extension("pub")) else {
-                eprintln!(
+                errln!(
                     "aterm machines init: {} is missing",
                     path.with_extension("pub").display()
                 );
@@ -195,7 +241,7 @@ pub fn init(env: &Env<'_>) -> ExitCode {
                     signers.push('\n');
                 }
                 Err(why) => {
-                    eprintln!(
+                    errln!(
                         "aterm machines init: {}: {why}",
                         path.with_extension("pub").display()
                     );
@@ -204,7 +250,7 @@ pub fn init(env: &Env<'_>) -> ExitCode {
             }
         }
         if let Err(e) = sys.write_file(&env.paths.allowed_signers(), signers.as_bytes(), 0o644) {
-            eprintln!("aterm machines init: allowed_signers: {e}");
+            errln!("aterm machines init: allowed_signers: {e}");
             return ExitCode::FAILURE;
         }
     }
@@ -216,23 +262,69 @@ pub fn init(env: &Env<'_>) -> ExitCode {
             continue;
         }
         if let Err(e) = sys.write_file(&path, text.as_bytes(), 0o600) {
-            eprintln!("aterm machines init: {}: {e}", path.display());
+            errln!("aterm machines init: {}: {e}", path.display());
             return ExitCode::FAILURE;
         }
-        println!("wrote {}", path.display());
+        let _ = writeln!(out, "wrote {}", path.display());
     }
-    println!(
-        "\nThe controller is ready in {}.\n\
-         1. Move keys/recovery to removable media, then delete it here. Back up this \
-         directory beside it (keys/ssh_ed25519, known_hosts, machines.toml, serial): the \
-         recovery key re-keys the fleet from here, but without that backup a lost \
-         controller means a visit to every Mac.\n\
-         2. aterm needs Local Network access to reach your Macs: System Settings ▸ Privacy & \
-         Security ▸ Local Network ▸ aterm.\n\
-         3. At each Mac: `aterm machines help enroll` prints the one visit it needs.",
+    let _ = writeln!(
+        out,
+        "The controller is ready in {}. Next: aterm machines help enroll",
         root.display()
     );
     ExitCode::SUCCESS
+}
+
+/// Make the ed25519 key `path` (its `.pub` beside it) with `ssh-keygen`: with no passphrase
+/// in a plain run, or, when `asked`, on the terminal, where `ssh-keygen` asks for one.
+fn make_key(sys: &dyn System, path: &Path, comment: &str, asked: bool) -> Result<(), String> {
+    let keygen = |args: &[&str]| {
+        Cmd::new("/usr/bin/ssh-keygen")
+            .args(args.iter().copied())
+            .arg("-C")
+            .arg(comment)
+            .arg("-f")
+            .arg(path.as_os_str())
+    };
+    if asked {
+        return match sys.run_tty(&keygen(&["-t", "ed25519"])) {
+            Ok(Some(0)) => require_passphrase(sys, path),
+            Ok(code) => Err(format!("did not make the key (status {code:?})")),
+            Err(e) => Err(e.to_string()),
+        };
+    }
+    match sys.run(&keygen(&["-q", "-t", "ed25519", "-N", ""])) {
+        Ok(ran) if ran.success() => Ok(()),
+        Ok(ran) => Err(ran.describe()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Give the key `path`, which has no passphrase, one on the terminal (`ssh-keygen -p` asks
+/// for it twice): the private file is written again, encrypted, and the key and its `.pub`
+/// stay as they are.
+fn add_passphrase(sys: &dyn System, path: &Path) -> Result<(), String> {
+    match sys.run_tty(
+        &Cmd::new("/usr/bin/ssh-keygen")
+            .args(["-p", "-f"])
+            .arg(path.as_os_str()),
+    ) {
+        Ok(Some(0)) => require_passphrase(sys, path),
+        Ok(code) => Err(format!("did not change the passphrase (status {code:?})")),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Confirm what the interactive command left before reporting protection.
+fn require_passphrase(sys: &dyn System, path: &Path) -> Result<(), String> {
+    match envelope::needs_passphrase(sys, path) {
+        Read::Value(true) => Ok(()),
+        Read::Value(false) => Err("the key still has no passphrase".to_string()),
+        Read::Absent => Err("the key's passphrase protection could not be read".to_string()),
+        Read::Unusable(why) => Err(format!(
+            "the key's passphrase protection could not be confirmed: {why}"
+        )),
+    }
 }
 
 /// This Mac's LocalHostName, for key comments and principals.
@@ -256,20 +348,23 @@ pub fn ls(env: &Env<'_>) -> ExitCode {
     };
     if env.json {
         for host in &inv.hosts {
-            println!("{}", aterm_json::to_string(host).unwrap_or_default());
+            outln!("{}", aterm_json::to_string(host).unwrap_or_default());
         }
         return ExitCode::SUCCESS;
     }
     if inv.hosts.is_empty() {
-        println!("no hosts yet: `aterm machines help enroll`");
+        outln!("no hosts yet: `aterm machines help enroll`");
         return ExitCode::SUCCESS;
     }
-    println!(
+    outln!(
         "{:<16} {:<24} {:<12} {:<10} UUID",
-        "NAME", "ADDRESS", "ADMIN", "BASELINE"
+        "NAME",
+        "ADDRESS",
+        "ADMIN",
+        "BASELINE"
     );
     for host in &inv.hosts {
-        println!(
+        outln!(
             "{:<16} {:<24} {:<12} {:<10} {}",
             host.name,
             host.address,
@@ -309,14 +404,19 @@ fn summary(host: &Host, state: &HostState, now: u64) -> String {
     if let Some((was, is)) = os_changed(state, hello.as_ref()) {
         notes.push_str(&format!("; os-changed ({} → {})", shown(&was), shown(&is)));
     }
+    if let Some(only) = &state.only {
+        let rest = only.rest.map_or_else(
+            || "the rest of the baseline not yet".to_owned(),
+            |at| format!("the rest {} ago", age(now.saturating_sub(at))),
+        );
+        let tables: Vec<String> = only.tables.iter().map(|t| shown(t)).collect();
+        notes.push_str(&format!("; {} only ({rest})", tables.join(",")));
+    }
+    // The version alone: the build's hash is `status --json`'s, and a host on another build
+    // than this controller's shows as the planned switch of its helper.
     let agent = hello
         .as_ref()
-        .map(|h| {
-            format!(
-                "agent {}",
-                shown(&build_name(&h.agent_version, &h.agent_sha256))
-            )
-        })
+        .map(|h| format!("agent {}", shown(&h.agent_version)))
         .unwrap_or_default();
     let Some(report) = &state.report else {
         let agent = if agent.is_empty() {
@@ -404,7 +504,7 @@ fn read_state(env: &Env<'_>, host: &Host, tally: &mut Tally) -> Option<HostState
         Ok(state) => Some(state),
         Err(why) => {
             tally.failed = true;
-            println!("{:<16} state unreadable: {why}", host.name);
+            outln!("{:<16} state unreadable: {why}", host.name);
             None
         }
     }
@@ -420,7 +520,7 @@ pub fn status(env: &Env<'_>, names: &[String], all: bool, by_item: bool) -> Exit
     let hosts = match inventory::select(&inv, names, all || names.is_empty()) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("aterm machines: {e}");
+            errln!("aterm machines: {e}");
             return ExitCode::from(2);
         }
     };
@@ -444,28 +544,714 @@ pub fn status(env: &Env<'_>, names: &[String], all: bool, by_item: bool) -> Exit
             }
         }
         if env.json {
-            println!(
+            outln!(
                 "{}",
                 aterm_json::to_string(&aterm_json::json!({
                     "host": host.name, "uuid": host.uuid, "address": host.address,
                     "last_seen": state.last_seen, "unreachable_since": state.unreachable_since,
                     "contact_error": state.contact_error, "last_refusal": state.last_refusal,
                     "os_changed": os_changed(&state, saved_hello(&state).as_ref()),
-                    "report": state.report,
+                    "report": state.report, "only": state.only,
                 }))
                 .unwrap_or_default()
             );
         } else if !by_item {
-            println!("{}", summary(host, &state, now));
+            outln!("{}", summary(host, &state, now));
         }
     }
     if by_item && !env.json {
         for (id, counts) in items {
             let counts: Vec<String> = counts.iter().map(|(w, n)| format!("{n} {w}")).collect();
-            println!("{:<48} {}", shown(&id), counts.join(", "));
+            outln!("{:<48} {}", shown(&id), counts.join(", "));
         }
     }
     tally.code()
+}
+
+/// `aterm machines rename <host> <new-name>` (alias `name`): set or rename any host's
+/// canonical display name in `machines.toml`.
+#[must_use]
+pub fn rename(env: &Env<'_>, selector: &str, new_name: &str) -> ExitCode {
+    match inventory::set_host_name(env.sys, &env.paths, selector, new_name) {
+        Ok(tag_key) => {
+            if env.json {
+                outln!(
+                    "{}",
+                    aterm_json::to_string(&aterm_json::json!({
+                        "selector": selector,
+                        "key": tag_key,
+                        "name": new_name,
+                        "inventory": env.paths.inventory(),
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                outln!(
+                    "renamed {} -> {} in {}",
+                    shown(selector),
+                    shown(new_name),
+                    env.paths.inventory().display()
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            errln!("aterm machines rename: {why}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Format a [`crate::protocol::HostedSession`]'s AI CLI reading (`working: thinking (4s)`).
+fn format_session_ai_status(s: &crate::protocol::HostedSession) -> String {
+    let Some(word) = s.agent.as_deref().filter(|w| !w.is_empty()) else {
+        return "-".to_owned();
+    };
+    let mut out = shown(word);
+    if let Some(detail) = s.agent_detail.as_deref().filter(|d| !d.is_empty()) {
+        out.push_str(": ");
+        out.push_str(&shown(detail));
+    }
+    if let Some(ms) = s.agent_since_ms {
+        out.push_str(&format!(" ({})", age(ms / 1000)));
+    }
+    out
+}
+
+/// The advertised model identifier, without inferring hardware from a host name.
+fn describe_host_hardware(model_id: Option<&str>) -> String {
+    model_id
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or("hardware unknown")
+        .to_owned()
+}
+
+/// Parse `model=` and `osxvers=` from `dns-sd -Q "<instance>._device-info._tcp.local." TXT`
+/// (supporting both ASCII TXT output and `dns-sd -Q`'s hex Rdata after `bytes:`).
+fn parse_device_info_txt(text: &str) -> (Option<String>, Option<u32>) {
+    let mut decoded = String::from(text);
+    for line in text.lines() {
+        if let Some((_, hex_part)) = line.split_once("bytes:") {
+            decoded.push(' ');
+            for tok in hex_part.split_whitespace() {
+                if tok.len() == 2
+                    && let Ok(b) = u8::from_str_radix(tok, 16)
+                {
+                    if (0x21..=0x7e).contains(&b) {
+                        decoded.push(b as char);
+                    } else {
+                        decoded.push(' ');
+                    }
+                }
+            }
+        }
+    }
+    let mut model = None;
+    let mut osxvers = None;
+    for tok in decoded.split(|c: char| c.is_whitespace() || c == '\\') {
+        if let Some(m) = tok.strip_prefix("model=") {
+            let clean: String = m
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == ',')
+                .collect();
+            if !clean.is_empty() {
+                model = Some(clean);
+            }
+        } else if let Some(v) = tok.strip_prefix("osxvers=") {
+            let digits: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = digits.parse::<u32>() {
+                osxvers = Some(n);
+            }
+        }
+    }
+    (model, osxvers)
+}
+
+/// Resolve a `.local` hostname to its IPv4 address and read its port-22 SSH version banner.
+fn resolve_ipv4_and_ssh_banner(hostname: &str, port: u16) -> (Option<String>, Option<String>) {
+    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+    let ipv4 = (hostname, port).to_socket_addrs().ok().and_then(|addrs| {
+        addrs.into_iter().find_map(|a| match a {
+            SocketAddr::V4(v4) => Some(v4.ip().to_string()),
+            SocketAddr::V6(_) => None,
+        })
+    });
+    let target_ip = ipv4
+        .as_deref()
+        .and_then(|ip| ip.parse::<std::net::Ipv4Addr>().ok());
+    let banner = target_ip.and_then(|ip| {
+        let addr = SocketAddr::from((ip, port));
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(60)).ok()?;
+        read_ssh_banner(
+            &stream,
+            std::time::Instant::now() + Duration::from_millis(80),
+        )
+    });
+    (ipv4, banner)
+}
+
+/// One complete SSH identification, bounded by bytes and a single deadline.
+fn read_ssh_banner(
+    mut stream: &std::net::TcpStream,
+    deadline: std::time::Instant,
+) -> Option<String> {
+    use std::io::Read;
+    let mut bytes = [0; 255];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+        if remaining.is_zero() {
+            return None;
+        }
+        stream.set_read_timeout(Some(remaining)).ok()?;
+        let read = stream.read(&mut bytes[filled..]).ok()?;
+        if read == 0 {
+            return None;
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        if let Some(newline) = bytes[filled..filled + read]
+            .iter()
+            .position(|b| *b == b'\n')
+        {
+            let end = filled + newline;
+            return std::str::from_utf8(&bytes[..=end])
+                .ok()?
+                .trim()
+                .strip_prefix("SSH-2.0-")
+                .filter(|banner| !banner.is_empty())
+                .map(str::to_owned);
+        }
+        filled += read;
+    }
+    None
+}
+
+/// Report only observed OS fields and SSH banner; missing data remains unknown.
+fn format_os_and_ssh(
+    os_version: Option<&str>,
+    os_build: Option<&str>,
+    osxvers: Option<u32>,
+    ssh_banner: Option<&str>,
+) -> String {
+    let os_part = if let Some(ver) = os_version.filter(|v| !v.is_empty()) {
+        if let Some(build) = os_build.filter(|b| !b.is_empty()) {
+            format!("macOS {ver} ({build})")
+        } else {
+            format!("macOS {ver}")
+        }
+    } else if let Some(d) = osxvers {
+        format!("Darwin {d}")
+    } else if let Some(build) = os_build.filter(|b| !b.is_empty()) {
+        format!("OS build {build}")
+    } else {
+        "OS version unknown".to_owned()
+    };
+    let ssh_part = if let Some(b) = ssh_banner.filter(|b| !b.trim().is_empty()) {
+        b.split_whitespace().next().unwrap_or(b).to_owned()
+    } else {
+        "SSH banner unknown".to_owned()
+    };
+    format!("{os_part} · {ssh_part}")
+}
+
+fn working_ai_sessions(sessions: &[crate::protocol::HostedSession]) -> usize {
+    sessions
+        .iter()
+        .filter(|s| matches!(s.agent.as_deref(), Some("working" | "busy")))
+        .count()
+}
+
+/// Print one host's row in `aterm machines tabs`, followed by indented `aterm` session lines
+/// and indented tab lines underneath each `aterm` session.
+#[allow(clippy::too_many_arguments)]
+fn print_host_tabs_rows(
+    host_name: &str,
+    status_word: &str,
+    addr_display: &str,
+    hw_display: &str,
+    os_display: &str,
+    services_display: &str,
+    why_not: Option<&str>,
+    sessions: Option<&[crate::protocol::HostedSession]>,
+) {
+    let observed = sessions.is_some();
+    let sessions = sessions.unwrap_or_default();
+    let mut by_instance: BTreeMap<u32, Vec<&crate::protocol::HostedSession>> = BTreeMap::new();
+    for s in sessions {
+        by_instance.entry(s.instance_pid).or_default().push(s);
+    }
+    let inst_count = by_instance.len();
+    let tab_count = sessions.len();
+    let ai_count = sessions
+        .iter()
+        .filter(|s| {
+            s.agent.is_some()
+                || matches!(
+                    s.program.as_deref(),
+                    Some("claude" | "codex" | "agy" | "muse" | "gemini")
+                )
+        })
+        .count();
+    let active_ai = working_ai_sessions(sessions);
+    let summary = if let Some(why) = why_not {
+        format!("unreachable ({})", shown(why))
+    } else if !observed {
+        "sessions unobserved".to_owned()
+    } else if tab_count == 0 {
+        "0 aterm · 0 tabs · no AI CLI".to_owned()
+    } else {
+        format!(
+            "{inst_count} aterm · {tab_count} {} · {ai_count} AI ({active_ai} working)",
+            if tab_count == 1 { "tab" } else { "tabs" }
+        )
+    };
+    outln!(
+        "{:<35}  {:<13}  {:<42}  {:<38}  {:<34}  {:<24}  {}",
+        shown(host_name),
+        shown(status_word),
+        shown(addr_display),
+        shown(hw_display),
+        shown(os_display),
+        shown(services_display),
+        summary
+    );
+    for (pid, tabs) in by_instance {
+        let win = tabs
+            .first()
+            .map(|t| t.window.as_str())
+            .filter(|w| !w.is_empty() && *w != "-")
+            .unwrap_or("0");
+        let focused = tabs.iter().any(|t| t.focused);
+        let dims = tabs
+            .iter()
+            .find_map(|t| t.cols.zip(t.rows))
+            .map_or_else(|| "-".to_owned(), |(c, r)| format!("{c}\u{d7}{r}"));
+        let sup = tabs
+            .iter()
+            .find_map(|t| t.supervisor.as_deref())
+            .filter(|s| !s.is_empty() && *s != "-")
+            .unwrap_or("unsupervised");
+        let sess_ai = tabs
+            .iter()
+            .filter(|s| {
+                s.agent.is_some()
+                    || matches!(
+                        s.program.as_deref(),
+                        Some("claude" | "codex" | "agy" | "muse" | "gemini")
+                    )
+            })
+            .count();
+        outln!(
+            "  \u{2514}\u{2500} aterm-{pid} \u{b7} window {win}{} \u{b7} grid {dims} \u{b7} supervisor {} \u{b7} {} open {} \u{b7} {sess_ai} AI CLIs",
+            if focused { " (focused)" } else { "" },
+            shown(sup),
+            tabs.len(),
+            if tabs.len() == 1 { "tab" } else { "tabs" }
+        );
+        for (idx, s) in tabs.iter().enumerate() {
+            let branch = if idx + 1 == tabs.len() {
+                "\u{2514}\u{2500}"
+            } else {
+                "\u{251c}\u{2500}"
+            };
+            let tab = format!(
+                "Tab #{}{}{}",
+                s.local_id,
+                if s.active { "*" } else { "" },
+                if s.focused { "!" } else { "" }
+            );
+            let tab_dims = s
+                .cols
+                .zip(s.rows)
+                .map_or_else(|| dims.clone(), |(c, r)| format!("{c}\u{d7}{r}"));
+            let cwd = s.cwd.as_deref().map_or_else(|| "-".to_owned(), shown);
+            let prog = s.program.as_deref().map_or_else(|| "-".to_owned(), shown);
+            let ai = format_session_ai_status(s);
+            let auto = s.autopilot.as_deref().map_or_else(|| "-".to_owned(), shown);
+            let human = s
+                .human_ms
+                .map_or_else(|| "-".to_owned(), |ms| format!("{} ago", age(ms / 1000)));
+            let mut title = shown(&s.title);
+            if let Some(role) = s.role.as_deref().filter(|r| !r.is_empty()) {
+                title.push_str(&format!(" [{}]", shown(role)));
+            }
+            if let Some(att) = s.attention.as_deref().filter(|a| !a.is_empty()) {
+                title.push_str(&format!(" ! {}", shown(att)));
+            }
+            if let Some(task) = s.task.as_deref().filter(|t| !t.is_empty()) {
+                title.push_str(&format!(" ({})", shown(task)));
+            }
+            outln!(
+                "       {branch} {:<9}  {:<8}  {:<12}  program: {:<8}  AI: {:<22}  autopilot: {:<8}  human: {:<8}  title: {}",
+                tab,
+                tab_dims,
+                cwd,
+                prog,
+                ai,
+                auto,
+                human,
+                title
+            );
+        }
+    }
+}
+
+/// `aterm machines tabs [<host>…] [--json]`: live spreadsheet of accessible Macs, `aterm`
+/// instances, tabs, stats and AI CLI status.
+#[must_use]
+pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
+    let inv = match inventory::load(env.sys, &env.paths) {
+        Ok(inv) => inv,
+        Err(why) => {
+            if names.is_empty() && why.contains("run `aterm machines init`") {
+                Inventory::default()
+            } else {
+                errln!("aterm machines: {why}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    let hosts = if inv.hosts.is_empty() && names.is_empty() {
+        Vec::new()
+    } else {
+        match inventory::select(&inv, names, all || names.is_empty()) {
+            Ok(h) => h,
+            Err(e) => {
+                errln!("aterm machines tabs: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    };
+    let mut tally = Tally::default();
+    let reached = if hosts.is_empty() {
+        Vec::new()
+    } else {
+        hello_sweep(env, &hosts, parallel(env, &inv))
+    };
+
+    if !env.json {
+        outln!(
+            "{:<35}  {:<13}  {:<42}  {:<38}  {:<34}  {:<24}  SESSIONS / TABS / AI",
+            "HOST",
+            "STATUS",
+            "ADDRESS & IPv4",
+            "MODEL & HARDWARE",
+            "OS & SSH",
+            "SERVICES"
+        );
+    }
+
+    // Include this Mac's own local sessions when no specific remote host filter excluded it
+    // and this Mac is not already an enrolled entry in `hosts`.
+    let own_facts = crate::facts::gather(env.sys);
+    let self_in_hosts = !own_facts.uuid.is_empty()
+        && hosts
+            .iter()
+            .any(|h| h.uuid.eq_ignore_ascii_case(&own_facts.uuid));
+    let live_all = (names.is_empty() || all)
+        && env.sys.own_uuid().is_some()
+        && crate::sessions::is_live_account();
+    if live_all && !self_in_hosts {
+        let local_sessions = crate::sessions::scan_local_aterm_sessions();
+        let raw_self = if !own_facts.local_host_name.is_empty() {
+            own_facts.local_host_name.clone()
+        } else if !own_facts.computer_name.is_empty() {
+            own_facts.computer_name.clone()
+        } else {
+            "this-mac".to_owned()
+        };
+        let self_name = inventory::canonical_host_name(&raw_self, &inv.names);
+        let dot_local = format!("{raw_self}.local");
+        let (ipv4, ssh_banner) = resolve_ipv4_and_ssh_banner(&dot_local, 22);
+        let addr_display = match &ipv4 {
+            Some(ip) => format!("{ip} ({dot_local})"),
+            None => dot_local.clone(),
+        };
+        let hw_desc = crate::hardware::describe(&own_facts)
+            .ok()
+            .map(|d| d.parts().join(" · "))
+            .unwrap_or_else(|| describe_host_hardware(None));
+        let hw_display = if own_facts.model.is_empty() {
+            hw_desc
+        } else {
+            format!("{} · {hw_desc}", own_facts.model)
+        };
+        let os_display = format_os_and_ssh(
+            Some(&own_facts.os_version),
+            Some(&own_facts.os_build),
+            None,
+            ssh_banner.as_deref(),
+        );
+        let local_services = ssh_banner.as_ref().map(|_| vec!["ssh"]);
+        if env.json {
+            outln!(
+                "{}",
+                aterm_json::to_string(&aterm_json::json!({
+                    "host": self_name,
+                    "raw_name": raw_self,
+                    "uuid": own_facts.uuid,
+                    "address": dot_local,
+                    "ipv4": ipv4,
+                    "reachable": true,
+                    "status": "online (local)",
+                    "model": own_facts.model,
+                    "hardware": hw_display,
+                    "os_version": own_facts.os_version,
+                    "os_build": own_facts.os_build,
+                    "os_ssh": os_display,
+                    "services": local_services,
+                    "sessions": local_sessions,
+                }))
+                .unwrap_or_default()
+            );
+        } else {
+            print_host_tabs_rows(
+                &self_name,
+                "online (local)",
+                &addr_display,
+                &hw_display,
+                &os_display,
+                if local_services.is_some() {
+                    "ssh"
+                } else {
+                    "unobserved"
+                },
+                None,
+                Some(&local_sessions),
+            );
+        }
+    }
+
+    for r in reached {
+        let state = inventory::load_state(env.sys, &env.paths, &r.host.uuid).unwrap_or_default();
+        let (reachable, why_not, hello_opt) = match r.hello {
+            Ok(h) => (true, None, Some(h)),
+            Err(why) => {
+                if why.unreachable() {
+                    tally.unreachable = true;
+                } else {
+                    tally.failed = true;
+                }
+                (false, Some(why.why()), saved_hello(&state))
+            }
+        };
+        let sessions = hello_opt
+            .as_ref()
+            .map(|h| h.sessions.as_slice())
+            .unwrap_or(&[]);
+        let host_name = inventory::canonical_host_name(&r.host.name, &inv.names);
+        let hw_display = hello_opt
+            .as_ref()
+            .filter(|h| !h.hardware.is_empty())
+            .map(|h| h.hardware.join(" · "))
+            .unwrap_or_else(|| describe_host_hardware(None));
+        let os_display = format_os_and_ssh(
+            hello_opt.as_ref().map(|h| h.os_version.as_str()),
+            hello_opt.as_ref().map(|h| h.os_build.as_str()),
+            None,
+            None,
+        );
+        if env.json {
+            outln!(
+                "{}",
+                aterm_json::to_string(&aterm_json::json!({
+                    "host": host_name,
+                    "uuid": r.host.uuid,
+                    "address": r.host.address,
+                    "reachable": reachable,
+                    "error": why_not,
+                    "hardware": hw_display,
+                    "os_version": hello_opt.as_ref().map(|h| h.os_version.as_str()).unwrap_or(""),
+                    "os_build": hello_opt.as_ref().map(|h| h.os_build.as_str()).unwrap_or(""),
+                    "sessions": sessions,
+                }))
+                .unwrap_or_default()
+            );
+        } else {
+            print_host_tabs_rows(
+                &host_name,
+                if reachable { "online (ssh)" } else { "offline" },
+                &r.host.address,
+                &hw_display,
+                &os_display,
+                "ssh",
+                why_not.as_deref(),
+                Some(sessions),
+            );
+        }
+    }
+
+    // Also include Bonjour-discovered LAN computers that are not yet enrolled in `machines.toml`.
+    if live_all {
+        let services = [
+            super::discover::SSH_SERVICE,
+            super::discover::SFTP_SERVICE,
+            super::discover::RFB_SERVICE,
+        ];
+        let browsed = ssh::fan_out(&services, services.len(), |svc| {
+            let cmd = crate::port::Cmd::new(super::discover::DNS_SD)
+                .args(["-B", svc, "local."])
+                .budget(Duration::from_millis(200))
+                .until_deadline();
+            env.sys
+                .run(&cmd)
+                .map(|ran| super::discover::parse_browse(&ran.out(), svc))
+                .unwrap_or_default()
+        });
+        let mut ssh_instances = browsed.first().cloned().unwrap_or_default();
+        let sftp_instances = browsed.get(1).cloned().unwrap_or_default();
+        let rfb_instances = browsed.get(2).cloned().unwrap_or_default();
+        ssh_instances.sort_by_key(|inst| natural_host_sort_key(&inst.name));
+
+        let filtered: Vec<_> = ssh_instances
+            .into_iter()
+            .filter(|inst| {
+                let short: String = inst
+                    .name
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join("-")
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .collect();
+                if short.is_empty() {
+                    return false;
+                }
+                if short.eq_ignore_ascii_case(&own_facts.local_host_name)
+                    || inst.name.eq_ignore_ascii_case(&own_facts.computer_name)
+                {
+                    return false;
+                }
+                let address = format!("{short}.local");
+                !inv.hosts.iter().any(|h| {
+                    h.address.eq_ignore_ascii_case(&address)
+                        || h.name.eq_ignore_ascii_case(&short)
+                        || h.name.eq_ignore_ascii_case(&inst.name)
+                })
+            })
+            .collect();
+
+        let enriched = ssh::fan_out(&filtered, 32, |inst| {
+            let canonical = inventory::canonical_host_name(&inst.name, &inv.names);
+            let resolved = super::discover::resolve(
+                env.sys,
+                &inst.name,
+                super::discover::SSH_SERVICE,
+                Duration::from_millis(120),
+            );
+            let (dot_local, port) = resolved.first()?.clone();
+            let txt_q = format!("{}._device-info._tcp.local.", inst.name);
+            let txt_cmd = crate::port::Cmd::new(super::discover::DNS_SD)
+                .args(["-Q", &txt_q, "TXT"])
+                .budget(Duration::from_millis(120))
+                .until_deadline();
+            let (model_id, osxvers) = env
+                .sys
+                .run(&txt_cmd)
+                .map(|ran| parse_device_info_txt(&ran.out()))
+                .unwrap_or((None, None));
+            let (ipv4, ssh_banner) = resolve_ipv4_and_ssh_banner(&dot_local, port);
+            let has_sftp = sftp_instances.iter().any(|s| s.name == inst.name);
+            let has_rfb = rfb_instances.iter().any(|s| s.name == inst.name);
+            let mut svc_list = vec!["ssh"];
+            if has_sftp {
+                svc_list.push("sftp");
+            }
+            if has_rfb {
+                svc_list.push("screen-sharing");
+            }
+            let addr_display = match &ipv4 {
+                Some(ip) => format!("{ip} ({dot_local})"),
+                None => dot_local.clone(),
+            };
+            let hw_display = describe_host_hardware(model_id.as_deref());
+            let reachable = ssh_banner.as_ref().map(|_| true);
+            let status_word = if ssh_banner.is_some() {
+                "reachable (ssh)"
+            } else {
+                "advertised (lan)"
+            };
+            let os_display = format_os_and_ssh(None, None, osxvers, ssh_banner.as_deref());
+            Some((
+                canonical,
+                inst.name.clone(),
+                dot_local,
+                ipv4,
+                addr_display,
+                model_id,
+                hw_display,
+                os_display,
+                svc_list,
+                status_word,
+                reachable,
+            ))
+        });
+
+        for (
+            canonical,
+            raw_name,
+            dot_local,
+            ipv4,
+            addr_display,
+            model_id,
+            hw_display,
+            os_display,
+            svc_list,
+            status_word,
+            reachable,
+        ) in enriched.into_iter().flatten()
+        {
+            if env.json {
+                outln!(
+                    "{}",
+                    aterm_json::to_string(&aterm_json::json!({
+                        "host": canonical,
+                        "raw_name": raw_name,
+                        "address": dot_local,
+                        "ipv4": ipv4,
+                        "reachable": reachable,
+                        "status": status_word,
+                        "enrolled": false,
+                        "model": model_id,
+                        "hardware": hw_display,
+                        "os_ssh": os_display,
+                        "services": svc_list,
+                        "sessions": Option::<&[crate::protocol::HostedSession]>::None,
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                print_host_tabs_rows(
+                    &canonical,
+                    status_word,
+                    &addr_display,
+                    &hw_display,
+                    &os_display,
+                    &svc_list.join(", "),
+                    None,
+                    None,
+                );
+            }
+        }
+    }
+    tally.code()
+}
+
+fn natural_host_sort_key(name: &str) -> (u8, u64, String) {
+    let trimmed = name.trim();
+    if let Some(rest) = trimmed
+        .strip_prefix('m')
+        .or_else(|| trimmed.strip_prefix('M'))
+    {
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(num) = digits.parse::<u64>() {
+            return (0, num, trimmed.to_ascii_lowercase());
+        }
+    }
+    (1, 0, trimmed.to_ascii_lowercase())
 }
 
 /// The report word for an outcome.
@@ -485,8 +1271,9 @@ const fn outcome_word(outcome: Outcome) -> &'static str {
 
 /// `aterm machines outstanding`: one to-do list across the fleet: unreached hosts, hosts
 /// that refused contact or a run, failures, person steps, deferred and blocked items, hosts
-/// whose macOS changed since their last apply, and, when the newest report is an apply's,
-/// the changes it made that wait for a login or a restart.
+/// whose macOS changed since their last apply, hosts only `--only` runs reached, and the
+/// changes an apply made that wait for a login or a restart (until a later run reads them
+/// `ok`).
 #[must_use]
 pub fn outstanding(env: &Env<'_>) -> ExitCode {
     let inv = match load(env) {
@@ -504,7 +1291,7 @@ pub fn outstanding(env: &Env<'_>) -> ExitCode {
         if let Some(since) = state.unreachable_since {
             tally.unreachable = true;
             any = true;
-            println!(
+            outln!(
                 "{}: unreachable for {}",
                 host.name,
                 age(now.saturating_sub(since))
@@ -513,7 +1300,7 @@ pub fn outstanding(env: &Env<'_>) -> ExitCode {
         if let Some((since, why)) = &state.contact_error {
             tally.failed = true;
             any = true;
-            println!(
+            outln!(
                 "{}: failing for {}: {}",
                 host.name,
                 age(now.saturating_sub(*since)),
@@ -523,7 +1310,7 @@ pub fn outstanding(env: &Env<'_>) -> ExitCode {
         if let Some((at, why)) = &state.last_refusal {
             tally.failed = true;
             any = true;
-            println!(
+            outln!(
                 "{}: the agent refused the last run {} ago: {}",
                 host.name,
                 age(now.saturating_sub(*at)),
@@ -532,7 +1319,7 @@ pub fn outstanding(env: &Env<'_>) -> ExitCode {
         }
         if let Some((was, is)) = os_changed(&state, saved_hello(&state).as_ref()) {
             any = true;
-            println!(
+            outln!(
                 "{}: os-changed ({} → {}): apply it again",
                 host.name,
                 shown(&was),
@@ -541,27 +1328,33 @@ pub fn outstanding(env: &Env<'_>) -> ExitCode {
         }
         let Some(report) = &state.report else {
             any = true;
-            println!("{}: never planned or applied", host.name);
+            outln!("{}: never planned or applied", host.name);
             continue;
         };
+        if let Some(todo) = only_todo(host, &state) {
+            any = true;
+            outln!("{todo}");
+        }
         if let Some(why) = &report.refused {
             tally.failed = true;
             any = true;
-            println!(
+            outln!(
                 "{}: the agent refused the last run: {}",
                 host.name,
                 shown(why)
             );
         }
         for row in &report.items {
-            let pending = match (report.mode, row.outcome, row.effect) {
-                (Mode::Apply, Outcome::Changed, Effect::Login) => Some("at the next login"),
-                (Mode::Apply, Outcome::Changed, Effect::Restart) => Some("at the next restart"),
+            // Only an apply changes anything, so a `changed` row is an apply's whichever run
+            // the report's mode names: an `--only` plan merged over an apply keeps its rows.
+            let pending = match (row.outcome, row.effect) {
+                (Outcome::Changed, Effect::Login) => Some("at the next login"),
+                (Outcome::Changed, Effect::Restart) => Some("at the next restart"),
                 _ => None,
             };
             if let Some(when) = pending {
                 any = true;
-                println!("{}: takes effect {when}: {}", host.name, shown(&row.id));
+                outln!("{}: takes effect {when}: {}", host.name, shown(&row.id));
                 continue;
             }
             if matches!(
@@ -572,7 +1365,7 @@ pub fn outstanding(env: &Env<'_>) -> ExitCode {
             }
             tally.failed |= row.outcome.is_failure();
             any = true;
-            println!(
+            outln!(
                 "{}: {} {} — {}{}",
                 host.name,
                 outcome_word(row.outcome),
@@ -586,12 +1379,25 @@ pub fn outstanding(env: &Env<'_>) -> ExitCode {
         }
     }
     if !any {
-        println!("nothing outstanding");
+        outln!("nothing outstanding");
     }
     tally.code()
 }
 
 // ── plan / apply ────────────────────────────────────────────────────────────────────────
+
+/// The to-do a host whose only reports are `--only` runs' carries: the rest of its baseline
+/// was never planned or applied, which its report's rows alone would not show.
+fn only_todo(host: &Host, state: &HostState) -> Option<String> {
+    let only = state.only.as_ref().filter(|o| o.rest.is_none())?;
+    let tables: Vec<String> = only.tables.iter().map(|t| shown(t)).collect();
+    Some(format!(
+        "{name}: only its {} so far (--only); the rest of its baseline (apps, settings) has not \
+         run yet: `aterm machines apply {name}` does it when you want",
+        tables.join(", "),
+        name = host.name
+    ))
+}
 
 /// Why a host's `hello` did not answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -633,11 +1439,22 @@ impl HelloError {
             Self::Run(why) | Self::Answer(why) => why.clone(),
         }
     }
+
+    /// [`HelloError::why`] for a command that reaches `host` alone, where no route to a local
+    /// address also names Local Network privacy ([`ssh::Failure::why_alone`]).
+    fn why_alone(&self, host: &Host) -> String {
+        match self {
+            Self::Ssh(f) => f.why_alone(&host.address),
+            other => other.why(),
+        }
+    }
 }
 
 /// What phase 1 learned about one host.
 struct Reached<'h> {
-    host: &'h Host,
+    /// The host as it answered: machines.toml's, or the same Mac at another `.local` name
+    /// or IP address ([`reach`]).
+    host: Cow<'h, Host>,
     hello: Result<Hello, HelloError>,
 }
 
@@ -646,10 +1463,10 @@ struct Reached<'h> {
 fn not_reached(tally: &mut Tally, host: &Host, why: &HelloError) {
     if why.unreachable() {
         tally.unreachable = true;
-        println!("{:<16} unreachable: {}", host.name, shown(&why.why()));
+        outln!("{:<16} unreachable: {}", host.name, shown(&why.why()));
     } else {
         tally.failed = true;
-        println!("{:<16} failed: {}", host.name, shown(&why.why()));
+        outln!("{:<16} failed: {}", host.name, shown(&why.why()));
     }
 }
 
@@ -686,7 +1503,7 @@ struct AgentArchive<'s> {
 
 /// One host's work for phase 3.
 struct Job<'h> {
-    host: &'h Host,
+    host: Cow<'h, Host>,
     hello: Hello,
     needed: Vec<artifacts::Needed>,
     /// The upgrade envelope that goes first, when the host's agent is another build.
@@ -715,17 +1532,17 @@ fn fleet_hosts<'i>(
     match inventory::select(inv, names, all) {
         Ok(h) if !h.is_empty() => Ok(h),
         Ok(_) => {
-            println!("machines.toml has no hosts yet: `aterm machines help enroll`");
+            outln!("machines.toml has no hosts yet: `aterm machines help enroll`");
             Err(ExitCode::SUCCESS)
         }
         Err(e) => {
-            eprintln!("aterm machines {verb}: {e}");
+            errln!("aterm machines {verb}: {e}");
             Err(ExitCode::from(2))
         }
     }
 }
 
-/// `aterm machines plan|apply`.
+/// `aterm machines plan|apply`, the whole baseline.
 #[must_use]
 pub fn plan_or_apply(
     env: &Env<'_>,
@@ -733,6 +1550,23 @@ pub fn plan_or_apply(
     all: bool,
     mode: Mode,
     now: bool,
+) -> ExitCode {
+    plan_or_apply_only(env, names, all, mode, now, &[])
+}
+
+/// `aterm machines plan|apply [--only <table>,…]`: with `only`, each host's envelope carries
+/// those baseline tables alone (`baseline::keep_only`), so the agent runs their items and no
+/// others; the agent upgrade `apply` sends first is sent all the same. The report is merged
+/// into the host's saved one by its serial (`after_run`), so the other tables keep what their
+/// own last run said.
+#[must_use]
+pub fn plan_or_apply_only(
+    env: &Env<'_>,
+    names: &[String],
+    all: bool,
+    mode: Mode,
+    now: bool,
+    only: &[String],
 ) -> ExitCode {
     let (action, verb) = match mode {
         Mode::Plan => (Action::Plan, "plan"),
@@ -742,6 +1576,9 @@ pub fn plan_or_apply(
         Ok(inv) => inv,
         Err(code) => return code,
     };
+    // A plan changes nothing, so naming no host plans them all, as `status` reads them all;
+    // an apply changes Macs, so it takes the ones it changes, or --all.
+    let all = all || (mode == Mode::Plan && names.is_empty());
     let hosts = match fleet_hosts(&inv, names, all, verb) {
         Ok(h) => h,
         Err(code) => return code,
@@ -751,7 +1588,7 @@ pub fn plan_or_apply(
     let own = match OwnAgent::of(env.sys) {
         Ok(own) => own,
         Err(why) => {
-            eprintln!("aterm machines: {why}");
+            errln!("aterm machines: {why}");
             return ExitCode::FAILURE;
         }
     };
@@ -759,29 +1596,30 @@ pub fn plan_or_apply(
     // Phase 1.
     let reached = hello_sweep(env, &hosts, parallel);
     if let Some(stop) = local_network_wall(&reached) {
-        eprintln!("{stop}");
+        errln!("{stop}");
         return ExitCode::FAILURE;
     }
 
     // Phase 2: one envelope per reachable host (two when its agent is upgraded first),
     // built in order, then signed together.
     let principals = principals(&inv, env);
+    let local_names = naming::wanted(env.sys, &env.paths, &inv);
     let mut resolved = Resolved::default();
     let mut agent_archive: Option<AgentArchive<'_>> = None;
-    let mut built: Vec<(&Host, Hello, Vec<artifacts::Needed>, bool)> = Vec::new();
+    let mut built: Vec<(Cow<'_, Host>, Hello, Vec<artifacts::Needed>, bool)> = Vec::new();
     let mut bodies: Vec<Envelope> = Vec::new();
     for r in reached {
         let hello = match r.hello {
             Ok(h) => h,
             Err(why) => {
-                not_reached(&mut tally, r.host, &why);
+                not_reached(&mut tally, &r.host, &why);
                 continue;
             }
         };
         // A run in progress would refuse the envelope (`busy`) after it raised the floor.
         if let Some(run) = &hello.busy {
             tally.failed = true;
-            println!(
+            outln!(
                 "{:<16} busy run={}: nothing was sent; `aterm machines attach {}` follows it",
                 r.host.name,
                 shown(run),
@@ -789,12 +1627,21 @@ pub fn plan_or_apply(
             );
             continue;
         }
+        // No two Macs are given one Local hostname (design §5.1).
+        if let Some(why) = local_names
+            .get(&r.host.uuid.to_ascii_lowercase())
+            .and_then(|local| naming::clash(&inv, &local_names, &r.host, local))
+        {
+            tally.failed = true;
+            outln!("{:<16} not sent: {why}", r.host.name);
+            continue;
+        }
         let upgrade = mode == Mode::Apply && own.differs(&hello);
         if upgrade && agent_archive.is_none() {
             match build_agent_archive(env.sys, &own) {
                 Ok(a) => agent_archive = Some(a),
                 Err(why) => {
-                    eprintln!("aterm machines: the agent upgrade archive: {why}");
+                    errln!("aterm machines: the agent upgrade archive: {why}");
                     return ExitCode::FAILURE;
                 }
             }
@@ -802,31 +1649,51 @@ pub fn plan_or_apply(
         let floor = floor_of(&hello, &principals);
         let mut host_bodies = Vec::new();
         if let (true, Some(a)) = (upgrade, &agent_archive) {
-            match upgrade_body(env, r.host, floor, a) {
+            match upgrade_body(env, &r.host, floor, a) {
                 Ok(body) => host_bodies.push(body),
                 Err(why) => {
                     tally.failed = true;
-                    println!("{:<16} not sent: {why}", r.host.name);
+                    outln!("{:<16} not sent: {why}", r.host.name);
                     continue;
                 }
             }
         }
-        match baseline_body(env, r.host, &hello, floor, action, now, &mut resolved) {
+        match baseline_body(
+            env,
+            &r.host,
+            &hello,
+            floor,
+            action,
+            now,
+            &mut resolved,
+            only,
+        ) {
             Ok((body, needed)) => {
+                // Unnoted, its report would be saved as the whole baseline's: not sent.
+                if let Err(why) = remember_only(env, &r.host, body.serial, only) {
+                    tally.failed = true;
+                    outln!(
+                        "{:<16} not sent: --only cannot be noted in its state ({}), and its \
+                         report would read as the whole baseline's",
+                        r.host.name,
+                        shown(&why)
+                    );
+                    continue;
+                }
                 host_bodies.push(body);
                 bodies.extend(host_bodies);
                 built.push((r.host, hello, needed, upgrade));
             }
             Err(why) => {
                 tally.failed = true;
-                println!("{:<16} not sent: {why}", r.host.name);
+                outln!("{:<16} not sent: {why}", r.host.name);
             }
         }
     }
     let mut wires = match seal_all(env, &bodies, &env.paths.signing_key()) {
         Ok(w) => w.into_iter(),
         Err(why) => {
-            eprintln!("aterm machines: {why}");
+            errln!("aterm machines: {why}");
             return ExitCode::FAILURE;
         }
     };
@@ -858,17 +1725,13 @@ pub fn plan_or_apply(
                         .insert(0, pending_upgrade_row(&job.hello, &own));
                 }
                 tally.failed |= report.failed();
-                print_report(env, job.host, &report);
-                after_run(env, &inv, job.host, report, Source::Baseline);
-                // The saved hello names the agent that answered before the upgrade; greet
-                // the new one so `status` shows the build the host now runs.
-                if job.upgrade.is_some() {
-                    let _ = hello(env, job.host);
-                }
+                print_report(env, &job.host, &report);
+                let _ = follow_rename(env, &job.host, &report);
+                after_run(env, &inv, &job.host, report, Source::Baseline);
             }
             Err(why) => {
                 tally.failed = true;
-                println!("{:<16} {}", job.host.name, shown(&why));
+                outln!("{:<16} {}", job.host.name, shown(&why));
             }
         }
     }
@@ -880,14 +1743,92 @@ fn parallel(env: &Env<'_>, inv: &Inventory) -> usize {
     env.parallel.unwrap_or_else(|| inv.parallel()).max(1)
 }
 
-/// `hello` every host, `parallel` at a time.
+/// [`reach`] every host, `parallel` at a time, then record in machines.toml, one host after
+/// another, each one found at another address.
 fn hello_sweep<'h>(env: &Env<'_>, hosts: &[&'h Host], parallel: usize) -> Vec<Reached<'h>> {
-    let hellos = ssh::fan_out(hosts, parallel, |host| hello(env, host));
-    hosts
-        .iter()
-        .zip(hellos)
-        .map(|(host, hello)| Reached { host, hello })
-        .collect()
+    let reached = ssh::fan_out(hosts, parallel, |host| reach(env, host));
+    for (host, r) in hosts.iter().zip(&reached) {
+        record_found(env, host, r);
+    }
+    reached
+}
+
+/// [`hello_sweep`] of the one host a command reaches.
+fn reach_one<'h>(env: &Env<'_>, host: &'h Host) -> Reached<'h> {
+    let reached = reach(env, host);
+    record_found(env, host, &reached);
+    reached
+}
+
+/// The one place the controller chooses where a host answers: one `hello` at machines.toml's
+/// address, recorded in its state ([`hello`]), and one more at a `.local` name when that
+/// address may be stale:
+///
+/// * the address is a Local hostname that no longer resolves, or that another Mac now
+///   answers at (its key is not the one pinned for this host: the freed name was taken, or
+///   a cache resolves it to an address another Mac now has): the name its baseline renamed
+///   it to ([`naming::renamed`]), for a rename whose report never came back (the connection
+///   dropped after the run renamed the Mac);
+/// * the Mac answered at a Local hostname that is not its own (a cache still resolves the
+///   old name): the name it says it has ([`naming::own_address`]);
+/// * the address is an IP address that does not answer, or that another Mac now answers
+///   at (DHCP gave the Mac another one): the `.local` name of the Local hostname its
+///   newest hello gave ([`naming::named`]), which every Mac answers at over multicast DNS.
+///
+/// Only this host answers there: `ssh` pins its key under its UUID (`HostKeyAlias`) and
+/// [`ask_hello`] checks the UUID it answers with, so another Mac at that name is refused,
+/// never followed, and the first answer stands, with nothing recorded for the other name.
+/// Not a retry: each address is asked once.
+fn reach<'h>(env: &Env<'_>, host: &'h Host) -> Reached<'h> {
+    let mut answered = ask_hello(env, host);
+    let mut at = Cow::Borrowed(host);
+    let elsewhere = match &answered {
+        Err(HelloError::Ssh(ssh::Failure::Unresolved | ssh::Failure::HostKeyChanged)) => {
+            naming::renamed(env.sys, &env.paths, host)
+        }
+        Ok(hello) => naming::own_address(host, hello).map(|address| Host {
+            address,
+            ..host.clone()
+        }),
+        Err(_) => None,
+    };
+    if let Some(moved) = elsewhere
+        && let Ok(found) = ask_hello(env, &moved)
+    {
+        answered = Ok(found);
+        at = Cow::Owned(moved);
+    }
+    if let Err(HelloError::Ssh(failure)) = &answered
+        && (failure.unreachable() || *failure == ssh::Failure::HostKeyChanged)
+        && let Some(moved) = naming::named(env.sys, &env.paths, host)
+        && let Ok(found) = ask_hello(env, &moved)
+    {
+        answered = Ok(found);
+        at = Cow::Owned(moved);
+    }
+    record_hello(env, host, &answered);
+    Reached {
+        host: at,
+        hello: answered,
+    }
+}
+
+/// Record in machines.toml that `reached` found `host` at another address ([`reach`]): an IP
+/// address it left (`moved`), or a `.local` name it was renamed from (`renamed`).
+fn record_found(env: &Env<'_>, host: &Host, reached: &Reached<'_>) {
+    if let Cow::Owned(moved) = &reached.host {
+        let _ = move_address(env, host, &moved.address, &found_lead(host));
+    }
+}
+
+/// The lead of [`record_found`]'s line for `host`, found away from its address.
+fn found_lead(host: &Host) -> String {
+    let how = if host.address.parse::<std::net::IpAddr>().is_ok() {
+        "moved"
+    } else {
+        "renamed"
+    };
+    format!("{:<16} {how}: ", host.name)
 }
 
 /// One `hello`, recorded in the host's state: an answer as the last contact; a host that
@@ -897,9 +1838,15 @@ fn hello_sweep<'h>(env: &Env<'_>, hosts: &[&'h Host], parallel: usize) -> Vec<Re
 /// host's GitHub key ids).
 fn hello(env: &Env<'_>, host: &Host) -> Result<Hello, HelloError> {
     let answered = ask_hello(env, host);
+    record_hello(env, host, &answered);
+    answered
+}
+
+/// Record what one `hello` of `host` answered in its state ([`hello`]).
+fn record_hello(env: &Env<'_>, host: &Host, answered: &Result<Hello, HelloError>) {
     if let Ok(mut state) = inventory::load_state(env.sys, &env.paths, &host.uuid) {
         let now = env.sys.now();
-        match &answered {
+        match answered {
             Ok(hello) => {
                 state.last_seen = now;
                 state.unreachable_since = None;
@@ -922,7 +1869,6 @@ fn hello(env: &Env<'_>, host: &Host) -> Result<Hello, HelloError> {
         }
         let _ = inventory::save_state(env.sys, &env.paths, &host.uuid, &state);
     }
-    answered
 }
 
 fn ask_hello(env: &Env<'_>, host: &Host) -> Result<Hello, HelloError> {
@@ -963,13 +1909,36 @@ fn local_network_wall(reached: &[Reached<'_>]) -> Option<&'static str> {
     (no_route && none_reached).then_some(ssh::LOCAL_NETWORK_ROW)
 }
 
+/// How many `--only` envelopes a host's state remembers until their reports come back.
+const ONLY_SENT_KEPT: usize = 8;
+
+/// Note in `host`'s state that the envelope with `serial` carries the tables `only` alone
+/// (nothing for a whole baseline's), so its report, read now or by `attach` later, is merged
+/// rather than saved whole.
+///
+/// # Errors
+/// The state cannot be read or written: the envelope is then not sent, since its report would
+/// be saved as the whole baseline's.
+fn remember_only(env: &Env<'_>, host: &Host, serial: u64, only: &[String]) -> Result<(), String> {
+    if only.is_empty() {
+        return Ok(());
+    }
+    let mut state = inventory::load_state(env.sys, &env.paths, &host.uuid)?;
+    state.only_sent.push((serial, only.to_vec()));
+    let excess = state.only_sent.len().saturating_sub(ONLY_SENT_KEPT);
+    state.only_sent.drain(..excess);
+    inventory::save_state(env.sys, &env.paths, &host.uuid, &state)
+}
+
 /// The resolved baseline text for `host`: its file, placeholders filled, `users` defaulted
-/// from the inventory, and `[aterm]` pinned to the release this command resolved.
+/// from the inventory, cut to the tables `only` names (none: all), and `[aterm]` pinned to
+/// the release this command resolved.
 fn resolved_baseline(
     env: &Env<'_>,
     host: &Host,
     hello: &Hello,
     resolved: &mut Resolved,
+    only: &[String],
 ) -> Result<String, String> {
     let name = host.baseline.as_deref().unwrap_or("default");
     if name.contains('/') || name.contains("..") {
@@ -981,15 +1950,12 @@ fn resolved_baseline(
         .read_file(&path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     let text = String::from_utf8(text).map_err(|_| format!("{} is not UTF-8", path.display()))?;
-    let text = crate::baseline::fill(
-        &text,
-        &[
-            ("name", host.name.as_str()),
-            ("serial", hello.serial_number.as_str()),
-            ("uuid", host.uuid.as_str()),
-        ],
-    )?;
+    let mut vars = naming::vars(host).to_vec();
+    vars.push(("serial", hello.serial_number.as_str()));
+    let text = crate::baseline::fill(&text, &vars)?;
     let text = default_users(&text, host)?;
+    // Before `[aterm]` is resolved, so `--only names` asks GitHub for nothing.
+    let text = crate::baseline::keep_only(&text, only)?;
     let text = artifacts::resolve_aterm_once(env.sys, &env.paths, &text, &mut resolved.aterm)?;
     crate::baseline::parse(&text)?;
     Ok(text)
@@ -1057,7 +2023,12 @@ fn body(
     })
 }
 
-/// One host's plan or apply envelope, and the artifacts it needs uploaded.
+/// One host's plan or apply envelope (the tables `only` names, or all), and the artifacts it
+/// needs uploaded.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one input of the envelope"
+)]
 fn baseline_body(
     env: &Env<'_>,
     host: &Host,
@@ -1066,8 +2037,9 @@ fn baseline_body(
     action: Action,
     now: bool,
     resolved: &mut Resolved,
+    only: &[String],
 ) -> Result<(Envelope, Vec<artifacts::Needed>), String> {
-    let text = resolved_baseline(env, host, hello, resolved)?;
+    let text = resolved_baseline(env, host, hello, resolved, only)?;
     let baseline = crate::baseline::parse(&text)?;
     let needed = artifacts::needed(&baseline);
     for item in &needed {
@@ -1086,7 +2058,33 @@ fn baseline_body(
             name: n.name.clone(),
         })
         .collect();
+    if action == Action::Apply && !only.is_empty() {
+        envelope
+            .artifacts
+            .extend(kept_by_only(hello, &envelope.artifacts));
+    }
     Ok((envelope, needed))
+}
+
+/// What an `apply --only` envelope names beyond its own tables' artifacts: each one the host's
+/// cache holds (its `hello`). An apply's agent prunes every cached artifact the envelope does
+/// not name (`agent::apply::prune_cache`), since a whole apply names all its baseline needs;
+/// an `--only` one names its tables' alone, and would otherwise drop the app images and
+/// aterm pins of every other table, for the next whole apply to upload again. Already
+/// cached, they are copied from nowhere.
+fn kept_by_only(hello: &Hello, named: &[ArtifactRef]) -> Vec<ArtifactRef> {
+    let mut kept: Vec<ArtifactRef> = Vec::new();
+    for sha in &hello.cached {
+        let sha = sha.to_ascii_lowercase();
+        let known = named.iter().chain(&kept).any(|a| a.sha256 == sha);
+        if crate::agent::is_sha256(&sha) && !known {
+            kept.push(ArtifactRef {
+                sha256: sha,
+                name: "cached, kept by --only".into(),
+            });
+        }
+    }
+    kept
 }
 
 /// The archive of this controller's own agent, in a fresh private scratch directory, and
@@ -1164,11 +2162,11 @@ fn pending_upgrade_row(hello: &Hello, own: &OwnAgent) -> ItemReport {
     ItemReport {
         id: "agent.upgrade".into(),
         family: "agent".into(),
-        title: "the controller's agent build".into(),
+        title: "aterm's helper on this Mac, switched to the controller's build".into(),
         outcome: Outcome::Planned,
         from: Some(build_name(&hello.agent_version, &hello.agent_sha256)),
         to: Some(build_name(env!("CARGO_PKG_VERSION"), &own.sha256)),
-        why: Some("apply upgrades the agent first".into()),
+        why: Some("apply switches it first".into()),
         revert: None,
         effect: Effect::Now,
         detail: None,
@@ -1315,7 +2313,7 @@ fn send(
     job: &Job<'_>,
     archive: Option<&enroll::Archive>,
 ) -> Result<HostReport, String> {
-    let target = Target::of(job.host);
+    let target = Target::of(&job.host);
     let mut first: Vec<ItemReport> = Vec::new();
     if let (Some(wire), Some(archive)) = (&job.upgrade, archive) {
         put(
@@ -1326,7 +2324,7 @@ fn send(
             "the aterm agent",
             &archive.path,
         )?;
-        let report = submit(env, job.host, wire, UPGRADE_BUDGET).map_err(|why| {
+        let report = submit(env, &job.host, wire, UPGRADE_BUDGET).map_err(|why| {
             format!("the agent upgrade did not finish, so the baseline was not sent: {why}")
         })?;
         if let Some(why) = &report.refused {
@@ -1342,6 +2340,11 @@ fn send(
             ));
         }
         first = report.items;
+        // The saved hello names the agent that answered before the upgrade; greet the new
+        // one before the baseline runs, so `status` shows the build the host now runs and a
+        // run that renames the Mac and loses its report leaves the hello `reach` finds it by
+        // (its hardware, which an older agent's hello does not describe).
+        let _ = hello(env, &job.host);
     }
     for item in &job.needed {
         put(
@@ -1353,7 +2356,7 @@ fn send(
             &env.paths.cached(&item.sha256),
         )?;
     }
-    let mut report = submit(env, job.host, &job.wire, APPLY_BUDGET)?;
+    let mut report = submit(env, &job.host, &job.wire, APPLY_BUDGET)?;
     if !first.is_empty() {
         first.append(&mut report.items);
         report.items = first;
@@ -1395,7 +2398,7 @@ fn read_stream(out: &str, now: u64) -> (Option<HostReport>, Option<String>) {
 /// Print one host's report: a summary line, then each row that needs attention.
 fn print_report(env: &Env<'_>, host: &Host, report: &HostReport) {
     if env.json {
-        println!(
+        outln!(
             "{}",
             aterm_json::to_string(&aterm_json::json!({"host": host.name, "report": report}))
                 .unwrap_or_default()
@@ -1407,33 +2410,38 @@ fn print_report(env: &Env<'_>, host: &Host, report: &HostReport) {
         last_seen: env.sys.now(),
         ..HostState::default()
     };
-    println!("{}", summary(host, &state, env.sys.now()));
+    outln!("{}", summary(host, &state, env.sys.now()));
     for row in &report.items {
         if matches!(row.outcome, Outcome::Ok | Outcome::NotApplicable) {
             continue;
         }
-        println!("    {}", row_line(row));
+        outln!("    {}", row_line(row));
     }
 }
 
-/// One report row as `print_report` shows it: the outcome, the item, the change and why,
+/// One report row as `print_report` and `unenroll` show it: the outcome, the item by its
+/// title (what the owner reads: `Computer Name, shown in Finder, AirDrop and Sharing`, not
+/// `names.computer-name`, which `status --by-item` and `--json` keep), the change and why,
 /// each value the host sent made safe to print.
-fn row_line(row: &ItemReport) -> String {
+pub(crate) fn row_line(row: &ItemReport) -> String {
     let change = match (&row.from, &row.to) {
         (Some(from), Some(to)) if row.outcome != Outcome::Person => {
-            format!(" ({} → {})", shown(from), shown(to))
+            format!(": {} → {}", shown(from), shown(to))
         }
         _ => String::new(),
     };
     let why = row
         .why
         .as_ref()
-        .map(|w| format!(": {}", shown(w)))
+        .map(|w| {
+            let joint = if change.is_empty() { ": " } else { "; " };
+            format!("{joint}{}", shown(w))
+        })
         .unwrap_or_default();
     format!(
         "{:<9} {}{change}{why}",
         outcome_word(row.outcome),
-        shown(&row.id)
+        shown(&row.title)
     )
 }
 
@@ -1444,6 +2452,49 @@ enum Source {
     Baseline,
     /// A run `attach` followed, which may have been any action.
     Followed,
+}
+
+/// Follow a Mac whose Local hostname `report` changed to its new `.local` address in
+/// machines.toml, so the next command reaches it there ([`naming::followed_address`]); the
+/// host as it now stands, when it moved.
+fn follow_rename(env: &Env<'_>, host: &Host, report: &HostReport) -> Option<Host> {
+    let address = naming::followed_address(host, report)?;
+    move_address(env, host, &address, "    names     ")
+}
+
+/// Write `address` for `host` in machines.toml and say so after `lead` (on standard error
+/// under `--json`, whose standard output is NDJSON); the host as it now stands, when the
+/// write took.
+fn move_address(env: &Env<'_>, host: &Host, address: &str, lead: &str) -> Option<Host> {
+    let moved = Host {
+        address: address.to_owned(),
+        ..host.clone()
+    };
+    let (line, took) = match inventory::upsert_host(env.sys, &env.paths, &moved) {
+        Ok(()) => (
+            format!(
+                "{lead}address {} -> {} in machines.toml",
+                shown(&host.address),
+                shown(address)
+            ),
+            true,
+        ),
+        Err(why) => (
+            format!(
+                "{lead}the Mac now answers at {}, but machines.toml still says {}: {}",
+                shown(address),
+                shown(&host.address),
+                shown(&why)
+            ),
+            false,
+        ),
+    };
+    if env.json {
+        errln!("{line}");
+    } else {
+        outln!("{line}");
+    }
+    took.then_some(moved)
 }
 
 /// Whether `report` is a plan or apply run's: an `exec`, `rekey` or `upgrade` run reports
@@ -1466,7 +2517,7 @@ fn after_run(env: &Env<'_>, inv: &Inventory, host: &Host, report: HostReport, so
     let mut state = match inventory::load_state(env.sys, &env.paths, &host.uuid) {
         Ok(s) => s,
         Err(why) => {
-            eprintln!("aterm machines: {}'s report is not saved: {why}", host.name);
+            errln!("aterm machines: {}'s report is not saved: {why}", host.name);
             return;
         }
     };
@@ -1474,12 +2525,21 @@ fn after_run(env: &Env<'_>, inv: &Inventory, host: &Host, report: HostReport, so
     state.last_seen = now;
     state.unreachable_since = None;
     state.contact_error = None;
+    // An `--only` envelope's report covers its tables alone (`remember_only`).
+    let only = state
+        .only_sent
+        .iter()
+        .position(|(serial, _)| *serial == report.serial && report.serial != 0)
+        .map(|at| state.only_sent.remove(at).1);
     if let Some(why) = &report.refused {
         state.last_refusal = Some((now, why.clone()));
     } else if source == Source::Baseline || is_baseline_report(&report) {
         state.last_refusal = None;
-        if report.mode == Mode::Apply {
+        // A macOS update undoes what a whole apply set, so only a whole apply marks the build.
+        if report.mode == Mode::Apply && only.is_none() {
             state.applied_build = Some(report.facts.os_build.clone());
+        }
+        if report.mode == Mode::Apply {
             if let Some(github) = &inv.github {
                 register_keys(env, &github.account, host, &report, &mut state);
             } else if report
@@ -1487,17 +2547,78 @@ fn after_run(env: &Env<'_>, inv: &Inventory, host: &Host, report: HostReport, so
                 .iter()
                 .any(|r| r.id.starts_with("github.key@") && r.detail.is_some())
             {
-                println!(
+                outln!(
                     "    github    keys made but not registered: machines.toml names no \
                      [github] account"
                 );
             }
         }
-        state.report = Some(report);
+        match only {
+            Some(tables) => {
+                let (merged, covers) =
+                    merge_only(state.report.take(), state.only.take(), report, &tables);
+                state.report = Some(merged);
+                state.only = Some(covers);
+            }
+            None => {
+                state.report = Some(report);
+                state.only = None;
+            }
+        }
     }
     if let Err(e) = inventory::save_state(env.sys, &env.paths, &host.uuid, &state) {
-        eprintln!("aterm machines: could not save {}'s state: {e}", host.name);
+        errln!("aterm machines: could not save {}'s state: {e}", host.name);
     }
+}
+
+/// The saved report after an `--only` run reported `report` for `tables`: the earlier
+/// report's rows for every other table kept as their own run left them (never done, never
+/// failed by this one), the run's own rows in place of the earlier rows of its tables (and of
+/// the `agent` rows, which speak for the newest run), and the run's mode, serial, times and
+/// facts. With no earlier report the run's rows are all there is, and the coverage says the
+/// rest was never run. A refused earlier report has no rows to keep.
+fn merge_only(
+    earlier: Option<HostReport>,
+    covered: Option<inventory::Only>,
+    report: HostReport,
+    tables: &[String],
+) -> (HostReport, inventory::Only) {
+    let earlier = earlier.filter(|r| r.refused.is_none());
+    let mut covers = match (&earlier, covered) {
+        // The earlier report was itself an --only run's: its coverage grows.
+        (Some(_), Some(covered)) => covered,
+        // A whole run's: every other table keeps rows from when it finished.
+        (Some(whole), None) => inventory::Only {
+            tables: Vec::new(),
+            rest: Some(whole.finished),
+        },
+        (None, _) => inventory::Only::default(),
+    };
+    for table in tables {
+        if !covers.tables.contains(table) {
+            covers.tables.push(table.clone());
+        }
+    }
+    let Some(earlier) = earlier else {
+        return (report, covers);
+    };
+    let covered = |family: &str| tables.iter().any(|t| t == family);
+    let mut items = Vec::with_capacity(earlier.items.len() + report.items.len());
+    let mut fresh = Some(report.items);
+    for row in earlier.items {
+        if covered(&row.family) {
+            // The run's rows go where its tables' rows were.
+            if let Some(rows) = fresh.take() {
+                items.extend(rows);
+            }
+        } else if row.family != "agent" {
+            items.push(row);
+        }
+    }
+    if let Some(rows) = fresh {
+        items.extend(rows);
+    }
+    (HostReport { items, ..report }, covers)
 }
 
 /// The key a recorded GitHub key id registered, when it was recorded with one.
@@ -1527,7 +2648,7 @@ fn register_keys(
             continue;
         };
         let Some((kind, body)) = crate::items::github::key_material(line) else {
-            println!(
+            outln!(
                 "    github    {}'s key is not an OpenSSH public key; not registered",
                 shown(user)
             );
@@ -1535,7 +2656,7 @@ fn register_keys(
         };
         let text = format!("{kind} {body}");
         if state.github_revoked.contains(&text) {
-            println!(
+            outln!(
                 "    github    {}'s key was revoked (`aterm machines github revoke`); not \
                  registered again",
                 shown(user)
@@ -1561,7 +2682,7 @@ fn register_keys(
                     let Some((_, text)) = fresh.iter().find(|(u, _)| *u == r.user) else {
                         continue;
                     };
-                    println!(
+                    outln!(
                         "    github    registered {}'s key on {account} (id {})",
                         shown(&r.user),
                         r.id
@@ -1573,7 +2694,7 @@ fn register_keys(
                     state.github_key_text.push((r.id, text.clone()));
                 }
             }
-            Err(why) => println!("    github    not registered: {}", shown(&why)),
+            Err(why) => outln!("    github    not registered: {}", shown(&why)),
         }
     }
     // A user's other ids, once the key it reports now is registered: the keys it replaced.
@@ -1597,7 +2718,7 @@ fn register_keys(
     }
     match super::github::revoke(env.sys, account, &stale) {
         Ok(_) => {
-            println!(
+            outln!(
                 "    github    deleted {} replaced key(s) from {account}",
                 stale.len()
             );
@@ -1605,7 +2726,7 @@ fn register_keys(
             state.github_key_text.retain(|(id, _)| !stale.contains(id));
         }
         // Still recorded, so the next apply, `github revoke` or `unenroll` deletes them.
-        Err(why) => println!(
+        Err(why) => outln!(
             "    github    the replaced key(s) are still registered: {}",
             shown(&why)
         ),
@@ -1619,11 +2740,11 @@ fn one_host<'i>(inv: &'i Inventory, name: &str, verb: &str) -> Result<&'i Host, 
     match inventory::select(inv, &[name.to_owned()], false) {
         Ok(h) if h.len() == 1 => Ok(h[0]),
         Ok(_) => {
-            eprintln!("aterm machines {verb}: {name:?} names more than one host");
+            errln!("aterm machines {verb}: {name:?} names more than one host");
             Err(ExitCode::from(2))
         }
         Err(e) => {
-            eprintln!("aterm machines {verb}: {e}");
+            errln!("aterm machines {verb}: {e}");
             Err(ExitCode::from(2))
         }
     }
@@ -1640,32 +2761,37 @@ pub fn attach(env: &Env<'_>, name: &str, run: Option<&str>) -> ExitCode {
         Ok(h) => h,
         Err(code) => return code,
     };
+    // Reached first even when the run is named: the run that dropped its connection may be
+    // the one that renamed the Mac (`reach` finds it at its new name).
+    let reached = reach_one(env, host);
+    let host: &Host = &reached.host;
+    let hello = match reached.hello {
+        Ok(h) => h,
+        Err(why) => {
+            errln!(
+                "aterm machines attach: {}: {}",
+                host.name,
+                shown(&why.why_alone(host))
+            );
+            return if why.unreachable() {
+                ExitCode::from(2)
+            } else {
+                ExitCode::FAILURE
+            };
+        }
+    };
     let run = match run {
         Some(r) => r.to_owned(),
-        None => match hello(env, host) {
-            Ok(h) => match h.busy.or(h.last_run) {
-                Some(r) => r,
-                None => {
-                    eprintln!("aterm machines attach: {} has no run to follow", host.name);
-                    return ExitCode::from(2);
-                }
-            },
-            Err(why) => {
-                eprintln!(
-                    "aterm machines attach: {}: {}",
-                    host.name,
-                    shown(&why.why())
-                );
-                return if why.unreachable() {
-                    ExitCode::from(2)
-                } else {
-                    ExitCode::FAILURE
-                };
+        None => match hello.busy.or(hello.last_run) {
+            Some(r) => r,
+            None => {
+                errln!("aterm machines attach: {} has no run to follow", host.name);
+                return ExitCode::from(2);
             }
         },
     };
     if !run.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
-        eprintln!("aterm machines attach: {run:?} is not a run id");
+        errln!("aterm machines attach: {run:?} is not a run id");
         return ExitCode::from(2);
     }
     let ran = match ssh::request(
@@ -1678,12 +2804,12 @@ pub fn attach(env: &Env<'_>, name: &str, run: Option<&str>) -> ExitCode {
     ) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("aterm machines attach: {}: {e}", host.name);
+            errln!("aterm machines attach: {}: {e}", host.name);
             return ExitCode::FAILURE;
         }
     };
     let Some(report) = read_stream(&ran.out(), env.sys.now()).0 else {
-        eprintln!(
+        errln!(
             "aterm machines attach: {}: no report ({})",
             host.name,
             shown(&ran.describe())
@@ -1692,6 +2818,7 @@ pub fn attach(env: &Env<'_>, name: &str, run: Option<&str>) -> ExitCode {
     };
     let failed = report.failed();
     print_report(env, host, &report);
+    let _ = follow_rename(env, host, &report);
     after_run(env, &inv, host, report, Source::Followed);
     if failed {
         ExitCode::FAILURE
@@ -1711,11 +2838,11 @@ pub fn run(
     argv: &[String],
 ) -> ExitCode {
     let Some(program) = argv.first() else {
-        eprintln!("aterm machines run: name a command after --");
+        errln!("aterm machines run: name a command after --");
         return ExitCode::from(2);
     };
     if !program.starts_with('/') {
-        eprintln!(
+        errln!(
             "aterm machines run: {program:?} must be an absolute path (no shell, no PATH lookup)"
         );
         return ExitCode::from(2);
@@ -1731,18 +2858,18 @@ pub fn run(
     let parallel = parallel(env, &inv);
     let reached = hello_sweep(env, &hosts, parallel);
     if let Some(stop) = local_network_wall(&reached) {
-        eprintln!("{stop}");
+        errln!("{stop}");
         return ExitCode::FAILURE;
     }
     let principals = principals(&inv, env);
     let mut tally = Tally::default();
-    let mut targets: Vec<&Host> = Vec::new();
+    let mut targets: Vec<Cow<'_, Host>> = Vec::new();
     let mut bodies = Vec::new();
     for r in reached {
         let hello = match r.hello {
             Ok(h) => h,
             Err(why) => {
-                not_reached(&mut tally, r.host, &why);
+                not_reached(&mut tally, &r.host, &why);
                 continue;
             }
         };
@@ -1751,13 +2878,13 @@ pub fn run(
             user: user.map(str::to_owned),
             budget_secs: 3600,
         };
-        match exec_body(env, r.host, floor_of(&hello, &principals), exec) {
+        match exec_body(env, &r.host, floor_of(&hello, &principals), exec) {
             Ok(b) => {
                 bodies.push(b);
                 targets.push(r.host);
             }
             Err(why) => {
-                eprintln!("aterm machines run: {why}");
+                errln!("aterm machines run: {why}");
                 return ExitCode::FAILURE;
             }
         }
@@ -1765,11 +2892,11 @@ pub fn run(
     let wires = match seal_all(env, &bodies, &env.paths.signing_key()) {
         Ok(w) => w,
         Err(why) => {
-            eprintln!("aterm machines run: {why}");
+            errln!("aterm machines run: {why}");
             return ExitCode::FAILURE;
         }
     };
-    let jobs: Vec<(&Host, Vec<u8>)> = targets.into_iter().zip(wires).collect();
+    let jobs: Vec<(Cow<'_, Host>, Vec<u8>)> = targets.into_iter().zip(wires).collect();
     let outcomes = ssh::fan_out(&jobs, parallel, |(host, wire)| {
         submit(env, host, wire, Duration::from_secs(3600 + 60))
     });
@@ -1778,12 +2905,12 @@ pub fn run(
             Ok(report) => {
                 tally.failed |= report.failed();
                 for line in exec_lines(&report) {
-                    println!("{:<16} {line}", host.name);
+                    outln!("{:<16} {line}", host.name);
                 }
             }
             Err(why) => {
                 tally.failed = true;
-                println!("{:<16} {}", host.name, shown(&why));
+                outln!("{:<16} {}", host.name, shown(&why));
             }
         }
     }
@@ -1833,7 +2960,7 @@ pub fn person(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
     let hosts = match inventory::select(&inv, names, all || names.is_empty()) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("aterm machines person: {e}");
+            errln!("aterm machines person: {e}");
             return ExitCode::from(2);
         }
     };
@@ -1891,23 +3018,23 @@ pub fn person(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
         }
     }
     if by_step.is_empty() && unknown.is_empty() && notes.is_empty() {
-        println!("no person steps outstanding");
+        outln!("no person steps outstanding");
     }
     for (id, (how, hosts)) in &by_step {
-        println!("{id}: {how}");
-        println!("    {}", hosts.join(" "));
+        outln!("{id}: {how}");
+        outln!("    {}", hosts.join(" "));
     }
     for note in &notes {
-        println!("{note}");
+        outln!("{note}");
     }
     if !unknown.is_empty() {
-        println!(
+        outln!(
             "never planned (run `aterm machines plan` first): {}",
             unknown.join(" ")
         );
     }
     if !by_step.is_empty() {
-        println!(
+        outln!(
             "At the Mac: `aterm machines person <host> --here`. From here: `aterm machines \
              screen <host>`."
         );
@@ -1960,7 +3087,7 @@ fn person_signing<'a>(env: &Env<'a>) -> Result<(Signing, Option<AgentKey<'a>>), 
     if agent_holds(env, &key) {
         return Ok((Signing::Agent, None));
     }
-    eprintln!(
+    errln!(
         "The signing key goes into ssh-agent for this walk (removed when it ends, or after an \
          hour if the walk is interrupted); ssh-add asks its passphrase:"
     );
@@ -2023,7 +3150,7 @@ fn report_for(env: &Env<'_>, host: &Host) -> Result<HostReport, String> {
     if let Some(report) = saved.report.filter(|r| r.refused.is_none()) {
         return Ok(report);
     }
-    println!(
+    outln!(
         "{}: no plan or apply report yet; planning it first",
         host.name
     );
@@ -2108,30 +3235,34 @@ enum Said {
 /// The end of a walk that ran: one line per step ([`tell`]), the closing plan when any reads
 /// granted, then, last, the line saying the Mac was left logged in and unlocked at its
 /// display ([`screen::Session::unlocked_line`]), which fails the command whatever the steps
-/// did: it is what the person must not miss. `emit` prints each in turn.
+/// did: it is what the person must not miss. `emit` prints each in turn. `stops` (what
+/// `screen` still catches, [`screen::Screened::stops`]) is let go only after that line, so a
+/// second Ctrl-C during the closing plan cannot end the command before it.
 fn end_walk(
     host: &Host,
     verb: &str,
     walked: &[screen::Walked],
     session: &screen::Session,
+    stops: Box<dyn std::any::Any>,
     emit: &mut dyn FnMut(Said),
 ) -> ExitCode {
     let (failed, changed) = tell(host, walked, emit);
     if changed {
         emit(Said::Plan);
     }
-    if let Some(line) = session.unlocked_line(&host.name, &host.user) {
+    let code = if let Some(line) = session.unlocked_line(&host.name, &host.user) {
         emit(Said::Last(format!(
             "aterm machines {verb}: {}",
             shown(&line)
         )));
-        return ExitCode::FAILURE;
-    }
-    if failed {
+        ExitCode::FAILURE
+    } else if failed {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
-    }
+    };
+    drop(stops);
+    code
 }
 
 /// One line per walked step, through `emit`. Returns whether any did not end granted, and
@@ -2191,7 +3322,7 @@ pub fn walk(
         "screen"
     };
     if let Err(why) = screen::require_terminals(verb, terminals.stdin, terminals.stderr) {
-        eprintln!("{why}");
+        errln!("{why}");
         return ExitCode::from(2);
     }
     let inv = match load(env) {
@@ -2205,7 +3336,7 @@ pub fn walk(
     let (how, agent_key) = match person_signing(env) {
         Ok(signing) => signing,
         Err(why) => {
-            eprintln!("aterm machines {verb}: {}: {why}", host.name);
+            errln!("aterm machines {verb}: {}: {why}", host.name);
             return ExitCode::FAILURE;
         }
     };
@@ -2213,7 +3344,9 @@ pub fn walk(
         let report = report_for(env, host)?;
         let admin = screen::account(&report, &host.user)?;
         let (steps, waiting) = walk_steps(&report, host, at_console, step)?;
-        let hello = hello(env, host).map_err(|e| e.why())?;
+        let reached = reach_one(env, host);
+        let host: &Host = &reached.host;
+        let hello = reached.hello.map_err(|e| e.why_alone(host))?;
         let remote = LiveRemote {
             env,
             host,
@@ -2233,12 +3366,14 @@ pub fn walk(
             say: &say,
             hang: screen::PERSON_HANG,
         };
-        let (mut walked, session) = if steps.is_empty() && !waiting.is_empty() {
-            (Vec::new(), screen::Session::Kept)
+        let nothing: Box<dyn std::any::Any> = Box::new(());
+        let (mut walked, session, stops) = if steps.is_empty() && !waiting.is_empty() {
+            (Vec::new(), screen::Session::Kept, nothing)
         } else if at_console {
             (
                 screen::here(&flow, &admin, &steps, terminals)?,
                 screen::Session::Kept,
+                nothing,
             )
         } else {
             let screened = screen::screen(
@@ -2250,38 +3385,45 @@ pub fn walk(
                 opener,
                 terminals,
             )?;
-            (screened.walked, screened.session)
+            (screened.walked, screened.session, screened.stops)
         };
         walked.extend(waiting);
-        Ok::<_, String>((walked, session))
+        Ok::<_, String>((walked, session, stops))
     })();
-    let (walked, session) = match walked {
+    let (walked, session, stops) = match walked {
         Ok(w) => w,
         Err(why) => {
-            eprintln!("aterm machines {verb}: {}: {}", host.name, shown(&why));
+            errln!("aterm machines {verb}: {}: {}", host.name, shown(&why));
             return ExitCode::FAILURE;
         }
     };
     // The closing plan signs through the agent too; the key leaves it once the walk ends.
-    // The walk's own lines never panic: after SIGHUP the terminal is gone (VM: `println!`
-    // ended the walk with 101 after its lock), and the exit status is all that is left.
-    let code = end_walk(host, verb, &walked, &session, &mut |said| match said {
-        Said::Step(line) => {
-            let _ = writeln!(std::io::stdout(), "{line}");
-        }
-        Said::Plan => {
-            let _ = plan_or_apply(
-                env,
-                std::slice::from_ref(&host.uuid),
-                false,
-                Mode::Plan,
-                false,
-            );
-        }
-        Said::Last(line) => {
-            let _ = writeln!(std::io::stderr(), "{line}");
-        }
-    });
+    // Nothing here panics on a terminal gone after SIGHUP, the plan's lines included
+    // (`outln!`): the exit status is all that is left.
+    let code = end_walk(
+        host,
+        verb,
+        &walked,
+        &session,
+        stops,
+        &mut |said| match said {
+            Said::Step(line) => {
+                let _ = writeln!(std::io::stdout(), "{line}");
+            }
+            Said::Plan => {
+                let _ = plan_or_apply(
+                    env,
+                    std::slice::from_ref(&host.uuid),
+                    false,
+                    Mode::Plan,
+                    false,
+                );
+            }
+            Said::Last(line) => {
+                let _ = writeln!(std::io::stderr(), "{line}");
+            }
+        },
+    );
     drop(agent_key);
     code
 }
@@ -2302,25 +3444,25 @@ pub fn github_revoke(env: &Env<'_>, name: &str) -> ExitCode {
         Err(code) => return code,
     };
     let Some(github) = &inv.github else {
-        eprintln!("aterm machines github revoke: machines.toml names no [github] account");
+        errln!("aterm machines github revoke: machines.toml names no [github] account");
         return ExitCode::from(2);
     };
     let mut state = match inventory::load_state(env.sys, &env.paths, &host.uuid) {
         Ok(s) => s,
         Err(why) => {
-            eprintln!("aterm machines github revoke: {why}");
+            errln!("aterm machines github revoke: {why}");
             return ExitCode::FAILURE;
         }
     };
     if state.github_keys.is_empty() {
-        println!("{}: no GitHub keys recorded", host.name);
+        outln!("{}: no GitHub keys recorded", host.name);
         return ExitCode::SUCCESS;
     }
     let ids: Vec<u64> = state.github_keys.iter().map(|(_, id)| *id).collect();
     let deleted = match super::github::revoke(env.sys, &github.account, &ids) {
         Ok(deleted) => deleted,
         Err(why) => {
-            eprintln!("aterm machines github revoke: {}: {why}", host.name);
+            errln!("aterm machines github revoke: {}: {why}", host.name);
             return ExitCode::FAILURE;
         }
     };
@@ -2335,7 +3477,7 @@ pub fn github_revoke(env: &Env<'_>, name: &str) -> ExitCode {
             state.github_revoked.push(key);
         }
     }
-    println!(
+    outln!(
         "{}: deleted {} key(s) from {}; they are not registered again (a key the host makes \
          anew is)",
         host.name,
@@ -2345,7 +3487,7 @@ pub fn github_revoke(env: &Env<'_>, name: &str) -> ExitCode {
     state.github_keys.clear();
     state.github_key_text.clear();
     if let Err(why) = inventory::save_state(env.sys, &env.paths, &host.uuid, &state) {
-        eprintln!("aterm machines github revoke: {why}");
+        errln!("aterm machines github revoke: {why}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
@@ -2356,7 +3498,7 @@ pub fn github_revoke(env: &Env<'_>, name: &str) -> ExitCode {
 #[must_use]
 pub fn unenroll(env: &Env<'_>, name: &str, unreachable: bool) -> ExitCode {
     if !env.tty {
-        eprintln!(
+        errln!(
             "aterm machines unenroll: not run: it removes a Mac from the fleet, and standard \
              input or error is not a terminal"
         );
@@ -2367,8 +3509,15 @@ pub fn unenroll(env: &Env<'_>, name: &str, unreachable: bool) -> ExitCode {
         Err(code) => return code,
     };
     let host = match one_host(&inv, name, "unenroll") {
-        Ok(h) => h.clone(),
+        Ok(h) => h,
         Err(code) => return code,
+    };
+    // Where the Mac answers (`reach`), unless the owner says it cannot; one that does not
+    // answer is refused by unenroll's own hello, as before.
+    let host = if unreachable {
+        host.clone()
+    } else {
+        reach_one(env, host).host.into_owned()
     };
     let principals = principals(&inv, env);
     let mut out = std::io::stdout().lock();
@@ -2382,7 +3531,7 @@ pub fn unenroll(env: &Env<'_>, name: &str, unreachable: bool) -> ExitCode {
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(why) => {
-            eprintln!("aterm machines unenroll: {}", shown(&why));
+            errln!("aterm machines unenroll: {}", shown(&why));
             ExitCode::FAILURE
         }
     }
@@ -2473,12 +3622,12 @@ pub fn rekey(
     let text = match env.sys.read_file(signers) {
         Ok(t) => String::from_utf8_lossy(&t).into_owned(),
         Err(e) => {
-            eprintln!("aterm machines rekey: {}: {e}", signers.display());
+            errln!("aterm machines rekey: {}: {e}", signers.display());
             return ExitCode::from(2);
         }
     };
     if let Err(why) = envelope::check_signers(&text) {
-        eprintln!("aterm machines rekey: {}: {why}", signers.display());
+        errln!("aterm machines rekey: {}: {why}", signers.display());
         return ExitCode::from(2);
     }
     // The controller must still be able to sign afterwards: its signing key is one of the
@@ -2500,7 +3649,7 @@ pub fn rekey(
         })
         .unwrap_or(false);
     if !own_listed {
-        eprintln!(
+        errln!(
             "aterm machines rekey: {} does not list this controller's signing key ({}): the \
              fleet would stop accepting it",
             signers.display(),
@@ -2522,7 +3671,7 @@ pub fn rekey(
     {
         Ok(p) => p,
         Err(why) => {
-            eprintln!("aterm machines rekey: {why}");
+            errln!("aterm machines rekey: {why}");
             return ExitCode::from(2);
         }
     };
@@ -2532,20 +3681,20 @@ pub fn rekey(
     let mut bodies = Vec::new();
     let reached = hello_sweep(env, &hosts, parallel);
     if let Some(stop) = local_network_wall(&reached) {
-        eprintln!("{stop}");
+        errln!("{stop}");
         return ExitCode::FAILURE;
     }
     for r in reached {
         let hello = match r.hello {
             Ok(h) => h,
             Err(why) => {
-                not_reached(&mut tally, r.host, &why);
+                not_reached(&mut tally, &r.host, &why);
                 continue;
             }
         };
         match body(
             env,
-            r.host,
+            &r.host,
             floor_of(&hello, &principals),
             Action::Rekey,
             Disrupt::Now,
@@ -2556,7 +3705,7 @@ pub fn rekey(
                 targets.push(r.host);
             }
             Err(why) => {
-                eprintln!("aterm machines rekey: {why}");
+                errln!("aterm machines rekey: {why}");
                 return ExitCode::FAILURE;
             }
         }
@@ -2564,11 +3713,11 @@ pub fn rekey(
     let wires = match seal_all(env, &bodies, &key) {
         Ok(w) => w,
         Err(why) => {
-            eprintln!("aterm machines rekey: {why}");
+            errln!("aterm machines rekey: {why}");
             return ExitCode::FAILURE;
         }
     };
-    let jobs: Vec<(&Host, Vec<u8>)> = targets.into_iter().zip(wires).collect();
+    let jobs: Vec<(Cow<'_, Host>, Vec<u8>)> = targets.into_iter().zip(wires).collect();
     let outcomes = ssh::fan_out(&jobs, parallel, |(host, wire)| {
         submit(env, host, wire, Duration::from_secs(120))
     });
@@ -2578,7 +3727,7 @@ pub fn rekey(
         match outcome {
             Ok(r) if r.refused.is_none() && !r.failed() => {
                 took += 1;
-                println!("{:<16} rekeyed", host.name);
+                outln!("{:<16} rekeyed", host.name);
                 record_signers(env, host, &digest);
             }
             Ok(r) => {
@@ -2588,16 +3737,16 @@ pub fn rekey(
                     .into_iter()
                     .chain(r.items.into_iter().filter_map(|i| i.why))
                     .collect();
-                println!("{:<16} not rekeyed: {}", host.name, shown(&why.join("; ")));
+                outln!("{:<16} not rekeyed: {}", host.name, shown(&why.join("; ")));
             }
             Err(why) => {
                 tally.failed = true;
-                println!("{:<16} not rekeyed: {}", host.name, shown(&why));
+                outln!("{:<16} not rekeyed: {}", host.name, shown(&why));
             }
         }
     }
     if took == 0 {
-        println!(
+        outln!(
             "no host took the new list; the controller's {} is unchanged",
             env.paths.allowed_signers().display()
         );
@@ -2605,10 +3754,10 @@ pub fn rekey(
     }
     if let Err(why) = replace_signers(env, &text) {
         tally.failed = true;
-        eprintln!("aterm machines rekey: {why}");
+        errln!("aterm machines rekey: {why}");
         return tally.code();
     }
-    println!(
+    outln!(
         "the controller's {} is now {} (the old list is {})",
         env.paths.allowed_signers().display(),
         signers.display(),
@@ -2626,7 +3775,7 @@ pub fn rekey(
         .map(|h| h.name.as_str())
         .collect();
     if !behind.is_empty() {
-        println!(
+        outln!(
             "not known to carry the new list yet (rekey them when they answer): {}",
             behind.join(" ")
         );
@@ -2645,10 +3794,10 @@ fn record_signers(env: &Env<'_>, host: &Host, digest: &str) {
         Ok(mut state) => {
             state.signers_sha256 = Some(digest.to_owned());
             if let Err(why) = inventory::save_state(env.sys, &env.paths, &host.uuid, &state) {
-                eprintln!("aterm machines rekey: {why}");
+                errln!("aterm machines rekey: {why}");
             }
         }
-        Err(why) => eprintln!("aterm machines rekey: {}: not recorded: {why}", host.name),
+        Err(why) => errln!("aterm machines rekey: {}: not recorded: {why}", host.name),
     }
 }
 
@@ -2680,13 +3829,13 @@ fn replace_signers(env: &Env<'_>, text: &str) -> Result<(), String> {
 #[must_use]
 pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> ExitCode {
     if mode == Mode::Apply && sys.euid() != 0 {
-        eprintln!("aterm machines here apply: needs root: run it with sudo");
+        errln!("aterm machines here apply: needs root: run it with sudo");
         return ExitCode::from(2);
     }
     let text = match sys.read_file(baseline_path) {
         Ok(b) => String::from_utf8_lossy(&b).into_owned(),
         Err(e) => {
-            eprintln!("aterm machines here: {}: {e}", baseline_path.display());
+            errln!("aterm machines here: {}: {e}", baseline_path.display());
             return ExitCode::FAILURE;
         }
     };
@@ -2696,20 +3845,21 @@ pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> E
         &text,
         &[
             ("name", &name),
+            ("tag", crate::items::names::tag(&name)),
             ("serial", &facts.serial),
             ("uuid", &facts.uuid),
         ],
     ) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("aterm machines here: {e}");
+            errln!("aterm machines here: {e}");
             return ExitCode::FAILURE;
         }
     };
     let baseline = match crate::baseline::parse(&text) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("aterm machines here: {e}");
+            errln!("aterm machines here: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -2723,7 +3873,7 @@ pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> E
         match crate::facts::user(sys, u) {
             Ok(user) => users.push(user),
             Err(e) => {
-                eprintln!("aterm machines here: {e}");
+                errln!("aterm machines here: {e}");
                 return ExitCode::FAILURE;
             }
         }
@@ -2743,7 +3893,7 @@ pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> E
     let items = match crate::items::expand(&baseline, &ctx) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("aterm machines here: {e}");
+            errln!("aterm machines here: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -2789,13 +3939,92 @@ pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> E
 
 // ── helpers ─────────────────────────────────────────────────────────────────────────────
 
-/// Load the inventory, or print why not and return the exit code: 1, since an inventory
-/// that is missing, unreadable or invalid is a failure, never "only some hosts unreachable".
+/// Load the inventory, setting the controller up first when `machines.toml` does not exist
+/// yet, or print why not and return the exit code: 1, since an inventory that is missing,
+/// unreadable or invalid is a failure, never "only some hosts unreachable".
 fn load(env: &Env<'_>) -> Result<Inventory, ExitCode> {
+    set_up_if_new(env.sys, &env.paths);
     inventory::load(env.sys, &env.paths).map_err(|e| {
-        eprintln!("aterm machines: {e}");
+        errln!("aterm machines: {e}");
         ExitCode::FAILURE
     })
+}
+
+/// Set the controller up (as `init` with no passphrase) when `machines.toml` does not exist
+/// yet: the first verb that needs it does, so nobody runs `init` first. A starter baseline
+/// nobody edited is brought to the starter shipped now ([`refresh_starter_baseline`]).
+pub(crate) fn set_up_if_new(sys: &dyn System, paths: &Paths) {
+    if matches!(
+        sys.stat(&paths.inventory()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    ) {
+        let _ = init_quiet(sys, paths);
+    }
+    refresh_starter_baseline(sys, paths);
+}
+
+/// Rewrite `baselines/default.toml` with [`templates::DEFAULT_BASELINE`] when it is an earlier
+/// starter byte for byte ([`templates::EARLIER_DEFAULT_BASELINES`]): nobody edited it, so a
+/// fix to the starter reaches it. The 2026-10-19 rehearsal's `host_name = ""` would otherwise
+/// reach only a controller set up after it: the owner's, set up the day before, kept the
+/// starter that left a hand-set HostName at the old name. A file that differs in any byte, or
+/// cannot be read, is left as it is.
+fn refresh_starter_baseline(sys: &dyn System, paths: &Paths) {
+    let path = paths.baseline("default");
+    let Ok(digest) = sys.sha256(&path) else {
+        return;
+    };
+    if templates::EARLIER_DEFAULT_BASELINES.contains(&digest.as_str()) {
+        let _ = sys.write_file(&path, templates::DEFAULT_BASELINE.as_bytes(), 0o600);
+    }
+}
+
+/// Silently initialize the controller directory when `machines.toml` is missing on first use.
+fn init_quiet(sys: &dyn System, paths: &Paths) -> Result<(), ()> {
+    paths.ensure(sys).map_err(|_| ())?;
+    let _ = paths.ensure_control_dir(sys);
+    let host = controller_name(sys);
+    let keys = [
+        (
+            paths.ssh_key(),
+            format!("aterm-machines-fleet@{host}"),
+            false,
+        ),
+        (paths.signing_key(), format!("signing@{host}"), true),
+        (
+            paths.root.join("keys").join("recovery"),
+            format!("recovery@{host}"),
+            true,
+        ),
+    ];
+    for (path, comment, _) in &keys {
+        if sys.stat(path).is_ok() || sys.stat(&path.with_extension("pub")).is_ok() {
+            continue;
+        }
+        make_key(sys, path, comment, false).map_err(|_| ())?;
+    }
+    if sys.stat(&paths.allowed_signers()).is_err() {
+        let mut signers = String::new();
+        for (path, comment, _) in keys.iter().filter(|(_, _, signer)| *signer) {
+            let public = sys.read_file(&path.with_extension("pub")).map_err(|_| ())?;
+            let line = envelope::signers_line(comment, String::from_utf8_lossy(&public).trim())
+                .map_err(|_| ())?;
+            signers.push_str(&line);
+            signers.push('\n');
+        }
+        sys.write_file(&paths.allowed_signers(), signers.as_bytes(), 0o644)
+            .map_err(|_| ())?;
+    }
+    for (path, text) in [
+        (paths.inventory(), templates::INVENTORY),
+        (paths.baseline("default"), templates::DEFAULT_BASELINE),
+    ] {
+        if sys.stat(&path).is_err() {
+            sys.write_file(&path, text.as_bytes(), 0o600)
+                .map_err(|_| ())?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2952,6 +4181,222 @@ mod tests {
         let inv: Inventory = aterm_toml::from_str(templates::INVENTORY).unwrap();
         assert_eq!(inv.schema, 1);
         assert!(inv.hosts.is_empty());
+    }
+
+    /// A Mac named `ctl` with no controller yet, where each key's `ssh-keygen` run makes its
+    /// `.pub`: on the terminal for the signing and recovery keys when `protected`, else plain.
+    fn uninitialized(protected: bool) -> Fake {
+        let sys = Fake::root();
+        sys.on("/usr/sbin/scutil --get LocalHostName", Ran::ok("ctl\n"));
+        sys.stat_of(
+            &format!("{ROOT}/keys/ctl"),
+            crate::port::Stat {
+                uid: 0,
+                gid: 0,
+                mode: 0o700,
+                dir: true,
+                symlink: false,
+                len: 0,
+            },
+        );
+        for (key, comment, blob, asked) in [
+            (
+                "ssh_ed25519",
+                "aterm-machines-fleet@ctl",
+                SIGNING_BLOB,
+                false,
+            ),
+            ("signing", "signing@ctl", SIGNING_BLOB, protected),
+            ("recovery", "recovery@ctl", RECOVERY_BLOB, protected),
+        ] {
+            let path = format!("{ROOT}/keys/{key}");
+            let run = if asked {
+                format!("tty /usr/bin/ssh-keygen -t ed25519 -C {comment} -f {path}")
+            } else {
+                format!("/usr/bin/ssh-keygen -q -t ed25519 -N '' -C {comment} -f {path}")
+            };
+            sys.on(&run, Ran::ok(""));
+            sys.on_write(
+                &run,
+                Path::new(&format!("{path}.pub")),
+                format!("ssh-ed25519 {blob} {comment}\n").as_bytes(),
+            );
+            if asked {
+                sys.on(
+                    &format!("/usr/bin/ssh-keygen -y -P '' -f {path}"),
+                    Ran::exit(
+                        255,
+                        "Load key: incorrect passphrase supplied to decrypt private key\n",
+                    ),
+                );
+            }
+        }
+        sys
+    }
+
+    #[test]
+    fn init_makes_every_key_with_no_passphrase_asking_nothing_and_needing_no_terminal() {
+        let sys = uninitialized(false);
+        let mut out = Vec::new();
+        // `env` has no terminal.
+        assert_eq!(init(&env(&sys), false, &mut out), ExitCode::SUCCESS);
+        let calls = sys.calls();
+        for key in ["ssh_ed25519", "signing", "recovery"] {
+            assert!(
+                calls.iter().any(
+                    |c| c.starts_with("/usr/bin/ssh-keygen -q -t ed25519 -N '' ")
+                        && c.ends_with(&format!("-f {ROOT}/keys/{key}"))
+                ),
+                "{key}: {calls:?}"
+            );
+        }
+        assert!(!calls.iter().any(|c| c.starts_with("tty ")), "{calls:?}");
+        let signers =
+            String::from_utf8(sys.written(&format!("{ROOT}/allowed_signers")).unwrap()).unwrap();
+        assert!(signers.starts_with("signing@ctl ") && signers.contains("\nrecovery@ctl "));
+        // What it made, then one line: where, and the next command. No to-do list.
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            !out.lines().any(|l| {
+                let l = l.trim_start();
+                l.split_once(". ")
+                    .is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            }),
+            "{out}"
+        );
+        assert_eq!(
+            out.lines().last(),
+            Some(
+                format!("The controller is ready in {ROOT}. Next: aterm machines help enroll")
+                    .as_str()
+            )
+        );
+        assert!(
+            !out.contains("removable media") && !out.contains("Local Network"),
+            "{out}"
+        );
+        // Run again, nothing that exists is made again.
+        let before = sys.calls().len();
+        assert_eq!(init(&env(&sys), false, &mut Vec::new()), ExitCode::SUCCESS);
+        assert!(
+            !sys.calls()[before..]
+                .iter()
+                .any(|c| c.contains("ssh-keygen")),
+            "{:?}",
+            &sys.calls()[before..]
+        );
+    }
+
+    #[test]
+    fn init_with_passphrase_asks_on_the_terminal_and_refuses_without_one() {
+        let sys = uninitialized(true);
+        assert_eq!(init(&env(&sys), true, &mut Vec::new()), ExitCode::from(2));
+        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+        let mut e = env(&sys);
+        e.tty = true;
+        assert_eq!(init(&e, true, &mut Vec::new()), ExitCode::SUCCESS);
+        let calls = sys.calls();
+        let asked: Vec<&String> = calls.iter().filter(|c| c.starts_with("tty ")).collect();
+        assert_eq!(asked.len(), 2, "the signing and recovery keys: {calls:?}");
+        assert!(asked.iter().all(|c| !c.contains("-N")), "{asked:?}");
+        // The fleet key has no passphrase either way.
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("-N '' -C aterm-machines-fleet@ctl"))
+        );
+    }
+
+    #[test]
+    fn init_with_passphrase_later_gives_one_to_a_signing_key_made_without() {
+        let sys = uninitialized(false);
+        assert_eq!(init(&env(&sys), false, &mut Vec::new()), ExitCode::SUCCESS);
+        // The signing key is here with no passphrase; the recovery key went to removable
+        // media, leaving its .pub.
+        for key in ["ssh_ed25519", "signing"] {
+            sys.file(&format!("{ROOT}/keys/{key}"), b"private");
+        }
+        let probe = format!("/usr/bin/ssh-keygen -y -P '' -f {ROOT}/keys/signing");
+        sys.on(&probe, Ran::ok(&format!("ssh-ed25519 {SIGNING_BLOB}\n")));
+        sys.on(
+            &probe,
+            Ran::exit(
+                255,
+                "Load key: incorrect passphrase supplied to decrypt private key\n",
+            ),
+        );
+        let protect = format!("tty /usr/bin/ssh-keygen -p -f {ROOT}/keys/signing");
+        sys.on(&protect, Ran::ok(""));
+        let mut e = env(&sys);
+        e.tty = true;
+        let before = sys.calls().len();
+        let mut out = Vec::new();
+        assert_eq!(init(&e, true, &mut out), ExitCode::SUCCESS);
+        let calls = sys.calls()[before..].to_vec();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.starts_with("tty "))
+                .collect::<Vec<_>>(),
+            [&protect],
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.contains("-t ed25519")), "{calls:?}");
+        assert!(
+            !calls.iter().any(|c| c.contains("keys/ssh_ed25519")),
+            "{calls:?}"
+        );
+        assert!(String::from_utf8(out).unwrap().contains(&format!(
+            "gave the signing key a passphrase: {ROOT}/keys/signing"
+        )));
+        // Once it has one, it is left alone.
+        let before = sys.calls().len();
+        assert_eq!(init(&e, true, &mut Vec::new()), ExitCode::SUCCESS);
+        assert!(
+            !sys.calls()[before..].iter().any(|c| c.starts_with("tty ")),
+            "{:?}",
+            &sys.calls()[before..]
+        );
+    }
+
+    #[test]
+    fn plan_with_no_host_plans_them_all_and_apply_with_none_is_refused() {
+        let (a, b) = (lab(1, UUID_1), lab(2, UUID_2));
+        let sys = controller(&[&a, &b], false);
+        for h in [&a, &b] {
+            sys.on(
+                &request(h, "hello"),
+                Ran::exit(
+                    255,
+                    &format!(
+                        "ssh: connect to host {} port 22: Connection refused\r\n",
+                        h.address
+                    ),
+                ),
+            );
+        }
+        let e = env(&sys);
+        assert_eq!(
+            plan_or_apply(&e, &[], false, Mode::Apply, false),
+            ExitCode::from(2)
+        );
+        assert!(
+            sys.calls().is_empty(),
+            "apply named no host: {:?}",
+            sys.calls()
+        );
+        assert_eq!(
+            plan_or_apply(&e, &[], false, Mode::Plan, false),
+            ExitCode::from(2)
+        );
+        let calls = sys.calls();
+        for h in [&a, &b] {
+            assert!(
+                calls.contains(&request(h, "hello")),
+                "{}: {calls:?}",
+                h.name
+            );
+        }
     }
 
     #[test]
@@ -3138,11 +4583,11 @@ mod tests {
         let reached = |ha: Result<Hello, HelloError>, hb: Result<Hello, HelloError>| {
             local_network_wall(&[
                 Reached {
-                    host: &a,
+                    host: Cow::Borrowed(&a),
                     hello: ha,
                 },
                 Reached {
-                    host: &b,
+                    host: Cow::Borrowed(&b),
                     hello: hb,
                 },
             ])
@@ -3178,7 +4623,7 @@ mod tests {
         };
         assert_eq!(
             local_network_wall(&[Reached {
-                host: &far,
+                host: Cow::Borrowed(&far),
                 hello: no_route()
             }]),
             None
@@ -3214,6 +4659,323 @@ mod tests {
     }
 
     #[test]
+    fn two_macs_their_baseline_would_give_one_local_hostname_are_sent_nothing() {
+        let m1 = Host {
+            name: "m1".into(),
+            ..lab(1, UUID_1)
+        };
+        let spare = Host {
+            name: "m1-spare".into(),
+            ..lab(2, UUID_2)
+        };
+        let sys = controller(&[&m1, &spare], false);
+        // [names] alone, as the starter baseline has it: nothing else stops the envelopes.
+        sys.file(
+            &format!("{ROOT}/baselines/default.toml"),
+            b"schema = 1\n[names]\ncomputer_name = \"{tag} {hardware}\"\nlocal_host_name = \"{tag}-{hardware}\"\n",
+        );
+        for h in [&m1, &spare] {
+            sys.on(
+                &request(h, "hello"),
+                Ran::ok(&aterm_json::to_string(&hello_of(h)).unwrap()),
+            );
+        }
+        // A plan (an apply would stop first at this test binary's agent upgrade).
+        assert_eq!(
+            plan_or_apply(&env(&sys), &[], true, Mode::Plan, false),
+            ExitCode::FAILURE
+        );
+        for h in [&m1, &spare] {
+            assert!(!sys.calls().contains(&request(h, "apply")));
+        }
+        assert!(
+            sys.written(&format!("{ROOT}/serial")).is_none(),
+            "no serial taken"
+        );
+    }
+
+    #[test]
+    fn a_mac_renamed_at_its_dot_local_address_is_found_there_next_time() {
+        let mut m1 = lab(1, UUID_1);
+        m1.address = "m1-Air-M2-24GB-1TB-2.local".into();
+        let sys = controller(&[&m1], false);
+        let mut renamed = row("names.local-host-name", "names", Outcome::Changed);
+        renamed.from = Some("\"m1-Air-M2-24GB-1TB-2\"".into());
+        renamed.to = Some("\"m1-MacBook-Air-M2-24GB-1TB\"".into());
+        let moved = follow_rename(&env(&sys), &m1, &report(Mode::Apply, vec![renamed])).unwrap();
+        assert_eq!(moved.address, "m1-MacBook-Air-M2-24GB-1TB.local");
+        let inv = inventory_of(&sys);
+        assert_eq!(inv.hosts[0].address, "m1-MacBook-Air-M2-24GB-1TB.local");
+        assert_eq!(inv.hosts[0].name, "lab-01");
+    }
+
+    /// lab-03 as the VM was enrolled (`lab-03.local`, the starter `[names]`), its newest hello
+    /// in `state/` describing the VM (27.0: `Virtual Machine M5 8GB 90GB`), and the address
+    /// its baseline renames it to.
+    fn renamed_vm() -> (Fake, Host, Host) {
+        let vm = Host {
+            name: "lab-03".into(),
+            address: "lab-03.local".into(),
+            ..lab(3, UUID_1)
+        };
+        let sys = controller(&[&vm], false);
+        sys.file(
+            &format!("{ROOT}/baselines/default.toml"),
+            b"schema = 1\n[names]\ncomputer_name = \"{tag} {hardware}\"\nlocal_host_name = \"{tag}-{hardware}\"\n",
+        );
+        let mut said = hello_of(&vm);
+        said.hardware = ["Virtual Machine", "M5", "8GB", "90GB"]
+            .map(String::from)
+            .to_vec();
+        let state = HostState {
+            hello: Some(aterm_json::to_string(&said).unwrap()),
+            ..HostState::default()
+        };
+        inventory::save_state(&sys, &paths(), &vm.uuid, &state).unwrap();
+        let moved = Host {
+            address: "lab-03-Virtual-Machine-M5-8GB-90GB.local".into(),
+            ..vm.clone()
+        };
+        (sys, vm, moved)
+    }
+
+    /// What `ssh` prints on this Mac (macOS 27.0.1) for a `.local` name nothing answers for:
+    /// measured for `lab-03-gone.local`, after 5.05 s of looking; here for `lab-03.local`.
+    const UNRESOLVED_OLD: &str = "ssh: Could not resolve hostname lab-03.local: nodename nor servname provided, or not known\r\n";
+
+    #[test]
+    fn a_mac_renamed_by_a_run_whose_report_was_lost_is_found_at_the_name_its_baseline_gives() {
+        let (sys, vm, moved) = renamed_vm();
+        sys.on(&request(&vm, "hello"), Ran::exit(255, UNRESOLVED_OLD));
+        let mut answer = hello_of(&vm);
+        answer.local_host_name = "lab-03-Virtual-Machine-M5-8GB-90GB".into();
+        sys.on(
+            &request(&moved, "hello"),
+            Ran::ok(&aterm_json::to_string(&answer).unwrap()),
+        );
+        // `attach <run>` after the apply's connection dropped: the run renamed the Mac.
+        let finished = report(Mode::Apply, Vec::new());
+        let stream = aterm_json::to_string(&Line::Report(Box::new(finished.clone()))).unwrap();
+        sys.on(
+            &request(&moved, "attach 1800000000-7"),
+            Ran::ok(&format!("{stream}\n")),
+        );
+        let e = env(&sys);
+        assert_eq!(
+            attach(&e, "lab-03", Some("1800000000-7")),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(inventory_of(&sys).hosts[0].address, moved.address);
+        assert!(!sys.calls().contains(&request(&vm, "attach 1800000000-7")));
+        let state = state_of(&sys, &vm);
+        assert_eq!((state.last_seen, state.unreachable_since), (sys.now, None));
+        assert_eq!(state.report, Some(finished));
+        // The next command goes straight to the new name: nothing more is asked of the old.
+        let at_old = |sys: &Fake| {
+            sys.calls()
+                .iter()
+                .filter(|c| **c == request(&vm, "hello"))
+                .count()
+        };
+        let asked = at_old(&sys);
+        let inv = inventory_of(&sys);
+        let reached = reach_one(&e, &inv.hosts[0]);
+        assert!(reached.hello.is_ok());
+        assert_eq!(at_old(&sys), asked);
+    }
+
+    #[test]
+    fn a_mac_still_reached_by_its_old_name_moves_to_the_one_it_says_it_has_once_that_answers() {
+        // Measured with the VM (27.0): a minute after the rename this Mac still resolved
+        // lab-03.local to it, and its hello said lab-03-Virtual-Machine-M5-8GB-90GB.
+        let (sys, vm, moved) = renamed_vm();
+        let mut answer = hello_of(&vm);
+        answer.local_host_name = "lab-03-Virtual-Machine-M5-8GB-90GB".into();
+        let answer = Ran::ok(&aterm_json::to_string(&answer).unwrap());
+        sys.on(&request(&vm, "hello"), answer.clone())
+            .on(&request(&moved, "hello"), answer);
+        let reached = reach_one(&env(&sys), &vm);
+        assert!(reached.hello.is_ok());
+        assert_eq!(reached.host.address, moved.address);
+        assert_eq!(inventory_of(&sys).hosts[0].address, moved.address);
+        assert_eq!(found_lead(&vm), format!("{:<16} renamed: ", vm.name));
+        // Its own name not answering yet: the old one, which did, stands.
+        let (sys, vm, moved) = renamed_vm();
+        let mut answer = hello_of(&vm);
+        answer.local_host_name = "lab-03-Virtual-Machine-M5-8GB-90GB".into();
+        sys.on(
+            &request(&vm, "hello"),
+            Ran::ok(&aterm_json::to_string(&answer).unwrap()),
+        )
+        .on(
+            &request(&moved, "hello"),
+            Ran::exit(
+                255,
+                &UNRESOLVED_OLD.replace("lab-03.local", "lab-03-Virtual-Machine-M5-8GB-90GB.local"),
+            ),
+        );
+        let reached = reach_one(&env(&sys), &vm);
+        assert!(reached.hello.is_ok());
+        assert!(matches!(reached.host, Cow::Borrowed(_)));
+        assert_eq!(inventory_of(&sys).hosts[0].address, "lab-03.local");
+        assert_eq!(state_of(&sys, &vm).contact_error, None);
+    }
+
+    #[test]
+    fn another_mac_at_the_renamed_name_is_never_followed_and_nothing_else_is_tried() {
+        let (sys, vm, moved) = renamed_vm();
+        sys.on(&request(&vm, "hello"), Ran::exit(255, UNRESOLVED_OLD));
+        // A Mac at that name answering as another uuid; then one whose host key is not the
+        // one pinned for this host (ssh refuses it before any request).
+        let other = lab(9, UUID_2);
+        sys.on(
+            &request(&moved, "hello"),
+            Ran::ok(&aterm_json::to_string(&hello_of(&other)).unwrap()),
+        )
+        .on(&request(&moved, "hello"), Ran::exit(255, HOST_KEY_CHANGED));
+        let e = env(&sys);
+        for _ in 0..2 {
+            assert_eq!(
+                attach(&e, "lab-03", Some("1800000000-7")),
+                ExitCode::from(2)
+            );
+            assert_eq!(inventory_of(&sys).hosts[0].address, "lab-03.local");
+            let state = state_of(&sys, &vm);
+            // Unreachable as it was; the guess leaves no contact error behind.
+            assert_eq!(state.unreachable_since, Some(sys.now));
+            assert_eq!(state.contact_error, None);
+        }
+        assert!(!sys.calls().iter().any(|c| c.contains("attach ")));
+        // A name that still resolves, a Mac that just did not answer: its address is the
+        // only one asked.
+        let (sys, vm, moved) = renamed_vm();
+        sys.on(
+            &request(&vm, "hello"),
+            Ran::exit(
+                255,
+                "ssh: connect to host lab-03.local port 22: Operation timed out\r\n",
+            ),
+        );
+        let reached = reach_one(&env(&sys), &vm);
+        assert!(matches!(reached.host, Cow::Borrowed(_)));
+        assert!(!sys.calls().contains(&request(&moved, "hello")));
+    }
+
+    #[test]
+    fn a_mac_whose_old_name_another_mac_took_is_found_at_the_name_its_baseline_gives() {
+        // The report was lost, and since then another Mac answers at lab-03.local: ssh
+        // refuses its key, which is not the one pinned under this host's UUID.
+        let (sys, vm, moved) = renamed_vm();
+        sys.on(&request(&vm, "hello"), Ran::exit(255, HOST_KEY_CHANGED));
+        let mut answer = hello_of(&vm);
+        answer.local_host_name = "lab-03-Virtual-Machine-M5-8GB-90GB".into();
+        sys.on(
+            &request(&moved, "hello"),
+            Ran::ok(&aterm_json::to_string(&answer).unwrap()),
+        );
+        let reached = reach_one(&env(&sys), &vm);
+        assert!(reached.hello.is_ok());
+        assert_eq!(reached.host.address, moved.address);
+        assert_eq!(inventory_of(&sys).hosts[0].address, moved.address);
+        let state = state_of(&sys, &vm);
+        assert_eq!((state.contact_error, state.last_seen), (None, sys.now));
+        // Not there either (a reinstalled Mac, whose key changed): the changed key at the
+        // address machines.toml holds is the failure, as before, and nothing moves.
+        let (sys, vm, moved) = renamed_vm();
+        sys.on(&request(&vm, "hello"), Ran::exit(255, HOST_KEY_CHANGED))
+            .on(
+                &request(&moved, "hello"),
+                Ran::exit(
+                    255,
+                    &UNRESOLVED_OLD
+                        .replace("lab-03.local", "lab-03-Virtual-Machine-M5-8GB-90GB.local"),
+                ),
+            );
+        let reached = reach_one(&env(&sys), &vm);
+        assert_eq!(
+            reached.hello,
+            Err(HelloError::Ssh(ssh::Failure::HostKeyChanged))
+        );
+        assert!(matches!(reached.host, Cow::Borrowed(_)));
+        assert_eq!(inventory_of(&sys).hosts[0].address, "lab-03.local");
+        assert!(
+            state_of(&sys, &vm)
+                .contact_error
+                .is_some_and(|(_, why)| why.contains("host key"))
+        );
+    }
+
+    #[test]
+    fn an_upgraded_agent_is_greeted_before_the_baseline_that_may_rename_the_mac() {
+        // An agent older than the `hardware` field answered the sweep; the apply upgrades
+        // it, then sends the baseline, whose report may be lost after it renames the Mac.
+        let vm = Host {
+            name: "lab-03".into(),
+            address: "lab-03.local".into(),
+            ..lab(3, UUID_1)
+        };
+        let sys = controller(&[&vm], false);
+        let archive = enroll::Archive {
+            path: PathBuf::from("/scratch/agent.zip"),
+            sha256: "cd".repeat(32),
+            exe: PathBuf::from("aterm"),
+            bundle: false,
+        };
+        let mut old = hello_of(&vm);
+        old.cached = vec![archive.sha256.clone()];
+        let stream = |items: Vec<ItemReport>| {
+            let line = Line::Report(Box::new(report(Mode::Apply, items)));
+            Ran::ok(&format!("{}\n", aterm_json::to_string(&line).unwrap()))
+        };
+        sys.on(
+            &request(&vm, "apply"),
+            stream(vec![row("agent.upgrade", "agent", Outcome::Changed)]),
+        )
+        .on(
+            &request(&vm, "apply"),
+            stream(vec![row("names.local-host-name", "names", Outcome::Ok)]),
+        );
+        let mut new = hello_of(&vm);
+        new.agent_sha256 = "ef".repeat(32);
+        new.hardware = ["Virtual Machine", "M5", "8GB", "90GB"]
+            .map(String::from)
+            .to_vec();
+        sys.on(
+            &request(&vm, "hello"),
+            Ran::ok(&aterm_json::to_string(&new).unwrap()),
+        );
+        let job = Job {
+            host: Cow::Borrowed(&vm),
+            hello: old,
+            needed: Vec::new(),
+            upgrade: Some(b"upgrade".to_vec()),
+            wire: b"baseline".to_vec(),
+        };
+        let done = send(&env(&sys), &job, Some(&archive)).unwrap();
+        assert_eq!(done.items.len(), 2);
+        // The new agent answered between the upgrade and the baseline, and its hello, the
+        // one `reach` finds a renamed Mac by, is the one kept.
+        let calls = sys.calls();
+        let at = |cmd: String| -> Vec<usize> {
+            calls
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c == cmd)
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let (applies, hellos) = (at(request(&vm, "apply")), at(request(&vm, "hello")));
+        assert_eq!((applies.len(), hellos.len()), (2, 1), "{calls:?}");
+        assert!(
+            applies[0] < hellos[0] && hellos[0] < applies[1],
+            "{calls:?}"
+        );
+        let kept: Hello =
+            aterm_json::from_str(state_of(&sys, &vm).hello.as_deref().unwrap()).unwrap();
+        assert_eq!(kept, new);
+    }
+
+    #[test]
     fn a_busy_host_is_sent_nothing_and_fails_the_command() {
         let a = lab(1, UUID_1);
         let sys = controller(&[&a], false);
@@ -3235,6 +4997,259 @@ mod tests {
     }
 
     // ── what a run leaves in state ──────────────────────────────────────────────────────
+
+    // ── --only ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_only_envelope_carries_those_tables_and_resolves_nothing_for_the_others() {
+        let a = lab(1, UUID_1);
+        let sys = controller(&[&a], false);
+        sys.file(
+            &format!("{ROOT}/baselines/default.toml"),
+            templates::DEFAULT_BASELINE.as_bytes(),
+        );
+        let e = env(&sys);
+        let text = resolved_baseline(
+            &e,
+            &a,
+            &hello_of(&a),
+            &mut Resolved::default(),
+            &["names".to_owned()],
+        )
+        .unwrap();
+        let b = crate::baseline::parse(&text).unwrap();
+        assert!(b.names.is_some());
+        assert!(b.aterm.is_none() && b.apps.is_empty() && b.homebrew.is_none());
+        assert!(b.power.is_none() && b.keyboard.is_none() && b.developer.is_none());
+        assert_eq!(
+            b.users,
+            std::slice::from_ref(&a.user),
+            "the users stay for user-scope names"
+        );
+        assert!(
+            sys.calls().is_empty(),
+            "no release looked up: {:?}",
+            sys.calls()
+        );
+        // The whole baseline asks for [aterm]'s release, which nothing here answers.
+        assert!(resolved_baseline(&e, &a, &hello_of(&a), &mut Resolved::default(), &[]).is_err());
+    }
+
+    #[test]
+    fn an_only_apply_names_what_the_cache_holds_so_the_agent_prunes_none_of_it() {
+        let a = lab(1, UUID_1);
+        let sys = controller(&[&a], false);
+        sys.file(
+            &format!("{ROOT}/baselines/default.toml"),
+            templates::DEFAULT_BASELINE.as_bytes(),
+        );
+        let e = env(&sys);
+        // The cache an earlier whole apply left: an app image and an aterm pin (and a name
+        // that is no hash, which the agent's hello never lists and is not echoed back).
+        let (app, pin) = ("ab".repeat(32), "CD".repeat(32));
+        let mut hello = hello_of(&a);
+        hello.cached = vec![app.clone(), pin.clone(), "../x".into()];
+        let only = ["names".to_owned()];
+        let body = |action: Action| {
+            baseline_body(
+                &e,
+                &a,
+                &hello,
+                0,
+                action,
+                false,
+                &mut Resolved::default(),
+                &only,
+            )
+            .unwrap()
+        };
+        let (apply, needed) = body(Action::Apply);
+        assert!(needed.is_empty(), "nothing to upload for [names]");
+        let named: Vec<&str> = apply.artifacts.iter().map(|x| x.sha256.as_str()).collect();
+        assert_eq!(named, [app.as_str(), &pin.to_ascii_lowercase()]);
+        // A plan prunes nothing, so it names nothing more.
+        let (plan, _) = body(Action::Plan);
+        assert!(plan.artifacts.is_empty(), "{:?}", plan.artifacts);
+    }
+
+    #[test]
+    fn an_only_run_whose_state_cannot_note_it_is_not_sent() {
+        let a = lab(1, UUID_1);
+        let sys = controller(&[&a], false);
+        sys.file(
+            &format!("{ROOT}/baselines/default.toml"),
+            templates::DEFAULT_BASELINE.as_bytes(),
+        );
+        // Cut off mid-write: its report could not be merged, only saved whole.
+        sys.file(&format!("{ROOT}/state/{UUID_1}.json"), b"{\"report\":");
+        sys.on(
+            &request(&a, "hello"),
+            Ran::ok(&aterm_json::to_string(&hello_of(&a)).unwrap()),
+        );
+        let e = env(&sys);
+        assert_eq!(
+            plan_or_apply_only(&e, &[], true, Mode::Plan, false, &["names".to_owned()]),
+            ExitCode::FAILURE
+        );
+        let calls = sys.calls();
+        // Nothing was signed, nor the signing key so much as read.
+        assert!(!calls.iter().any(|c| c.contains("ssh-keygen")), "{calls:?}");
+        assert_eq!(
+            sys.written(&format!("{ROOT}/state/{UUID_1}.json")),
+            Some(b"{\"report\":".to_vec()),
+            "the state is left as it was"
+        );
+    }
+
+    /// `lab-01`'s whole apply: a name it could not set, a power setting that failed, and a
+    /// Homebrew install that waits for a restart.
+    fn whole_apply() -> HostReport {
+        let mut brew = row("homebrew.pkg", "homebrew", Outcome::Changed);
+        brew.effect = Effect::Restart;
+        let mut r = report(
+            Mode::Apply,
+            vec![
+                row("names.computer-name", "names", Outcome::Failed),
+                row("power.ac.sleep", "power", Outcome::Failed),
+                brew,
+            ],
+        );
+        r.facts.os_build = "26A428".into();
+        r
+    }
+
+    /// The `--only names` plan's report, under the serial its envelope was sent with.
+    fn names_plan(serial: u64) -> HostReport {
+        let mut r = report(
+            Mode::Plan,
+            vec![
+                row("agent.upgrade", "agent", Outcome::Planned),
+                row("names.computer-name", "names", Outcome::Planned),
+                row("names.local-host-name", "names", Outcome::Planned),
+            ],
+        );
+        r.serial = serial;
+        r.finished = 1_800_000_000;
+        r.facts.os_build = "26B5".into();
+        r
+    }
+
+    #[test]
+    fn an_only_report_replaces_its_tables_rows_and_leaves_the_others_as_their_run_left_them() {
+        let a = lab(1, UUID_1);
+        let sys = controller(&[&a], false);
+        let e = env(&sys);
+        let inv = inventory_of(&sys);
+        after_run(&e, &inv, &a, whole_apply(), Source::Baseline);
+        remember_only(&e, &a, 8, &["names".to_owned()]).unwrap();
+        after_run(&e, &inv, &a, names_plan(8), Source::Baseline);
+        let state = state_of(&sys, &a);
+        let saved = state.report.as_ref().unwrap();
+        let rows: Vec<(&str, Outcome)> = saved
+            .items
+            .iter()
+            .map(|r| (r.id.as_str(), r.outcome))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("agent.upgrade", Outcome::Planned),
+                ("names.computer-name", Outcome::Planned),
+                ("names.local-host-name", Outcome::Planned),
+                ("power.ac.sleep", Outcome::Failed),
+                ("homebrew.pkg", Outcome::Changed),
+            ]
+        );
+        assert_eq!((saved.mode, saved.serial), (Mode::Plan, 8));
+        assert_eq!(
+            state.only,
+            Some(inventory::Only {
+                tables: vec!["names".into()],
+                rest: Some(1_799_999_900),
+            })
+        );
+        assert!(state.only_sent.is_empty(), "the serial is spent");
+        // Not a whole apply, even an --only one: the build the baseline was applied on stays.
+        remember_only(&e, &a, 9, &["names".to_owned()]).unwrap();
+        let mut names_apply = names_plan(9);
+        names_apply.mode = Mode::Apply;
+        after_run(&e, &inv, &a, names_apply, Source::Baseline);
+        let state = state_of(&sys, &a);
+        assert_eq!(state.applied_build.as_deref(), Some("26A428"));
+        // The failure and the restart the whole apply left are still outstanding.
+        assert_eq!(outstanding(&e), ExitCode::FAILURE);
+        let line = summary(&a, &state, sys.now);
+        assert!(line.contains("; names only (the rest "), "{line}");
+        assert!(only_todo(&a, &state).is_none(), "the rest was run once");
+        // The next whole run is the report again, whole.
+        after_run(
+            &e,
+            &inv,
+            &a,
+            report(Mode::Plan, Vec::new()),
+            Source::Baseline,
+        );
+        let state = state_of(&sys, &a);
+        assert_eq!(state.only, None);
+        assert!(state.report.unwrap().items.is_empty());
+    }
+
+    #[test]
+    fn a_host_only_only_runs_reached_says_the_rest_was_never_run() {
+        let a = lab(1, UUID_1);
+        let sys = controller(&[&a], false);
+        let e = env(&sys);
+        let inv = inventory_of(&sys);
+        remember_only(&e, &a, 8, &["names".to_owned()]).unwrap();
+        // Followed by `attach`, as a run whose connection dropped would be.
+        after_run(&e, &inv, &a, names_plan(8), Source::Followed);
+        let state = state_of(&sys, &a);
+        assert_eq!(
+            state.only,
+            Some(inventory::Only {
+                tables: vec!["names".into()],
+                rest: None,
+            })
+        );
+        assert_eq!(
+            only_todo(&a, &state).as_deref(),
+            Some(
+                "lab-01: only its names so far (--only); the rest of its baseline (apps, \
+                 settings) has not run yet: `aterm machines apply lab-01` does it when you want"
+            )
+        );
+        let line = summary(&a, &state, sys.now);
+        assert!(
+            line.contains("; names only (the rest of the baseline not yet)"),
+            "{line}"
+        );
+        // A second --only run widens what is covered.
+        remember_only(&e, &a, 9, &["power".to_owned()]).unwrap();
+        let mut power = names_plan(9);
+        power.items = vec![row("power.ac.sleep", "power", Outcome::Ok)];
+        after_run(&e, &inv, &a, power, Source::Baseline);
+        let state = state_of(&sys, &a);
+        assert_eq!(
+            state.only.map(|o| o.tables),
+            Some(vec!["names".to_owned(), "power".to_owned()])
+        );
+        // The names rows stay; the plan's pending agent upgrade row spoke for that run alone.
+        let ids: Vec<String> = state
+            .report
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "names.computer-name",
+                "names.local-host-name",
+                "power.ac.sleep"
+            ]
+        );
+    }
 
     #[test]
     fn a_refused_run_is_kept_beside_the_last_report_never_in_its_place() {
@@ -3324,7 +5339,11 @@ mod tests {
         };
         let line = summary(&a, &state, 1_800_000_000);
         assert!(line.contains("os-changed (26A428 \u{2192} 26B5)"), "{line}");
-        assert!(line.contains("agent 0.106.0 (abababababab)"), "{line}");
+        assert!(line.ends_with(", agent 0.106.0]"), "{line}");
+        assert!(
+            !line.contains("abababababab"),
+            "the build's hash is --json's: {line}"
+        );
         // Unknown on either side says nothing, never "unchanged" or "changed".
         let unknown = HostState {
             applied_build: None,
@@ -3339,6 +5358,33 @@ mod tests {
     }
 
     // ── host text on the terminal ───────────────────────────────────────────────────────
+
+    #[test]
+    fn a_report_row_reads_by_its_title_never_its_id() {
+        // The rehearsal's rename, as the agent reported it (VM 27.0).
+        let mut r = row("names.netbios-name", "names", Outcome::Changed);
+        r.title = "Windows network name, the Computer Name cut to 15 characters".into();
+        r.from = Some("\"VIRTUALMAC-6C5B\"".into());
+        r.to = Some("\"M201-VIRTUAL-MA\"".into());
+        assert_eq!(
+            row_line(&r),
+            "changed   Windows network name, the Computer Name cut to 15 characters: \
+             \"VIRTUALMAC-6C5B\" → \"M201-VIRTUAL-MA\""
+        );
+        r.outcome = Outcome::Failed;
+        r.why = Some("scutil: Permission denied.".into());
+        assert!(
+            row_line(&r).ends_with("→ \"M201-VIRTUAL-MA\"; scutil: Permission denied."),
+            "{}",
+            row_line(&r)
+        );
+        r.from = None;
+        assert!(
+            row_line(&r).ends_with("15 characters: scutil: Permission denied."),
+            "{}",
+            row_line(&r)
+        );
+    }
 
     #[test]
     fn what_a_host_sends_reaches_the_terminal_without_control_characters() {
@@ -3489,16 +5535,25 @@ mod tests {
         };
         let ended = |walked: &[screen::Walked], session: &screen::Session| {
             let mut said = Vec::new();
-            let code = end_walk(&a, "screen", walked, session, &mut |s| said.push(s));
+            let code = end_walk(&a, "screen", walked, session, Box::new(()), &mut |s| {
+                said.push(s);
+            });
             (code, said)
         };
-        let unlocked = screen::Session::Unlocked("SACLockScreenImmediate answered 22".into());
+        let unlocked = |why: &str| screen::Session::Unlocked {
+            why: why.into(),
+            unread: None,
+            watched: false,
+        };
         let line = "aterm machines screen: lab-01: the Mac is still logged in as admin and \
                     unlocked at its display: the lock after the walk failed \
                     (SACLockScreenImmediate answered 22)";
         // Every step granted, so the walk plans again; the line still comes after the plan.
         assert_eq!(
-            ended(&walked(screen::Done::Granted), &unlocked),
+            ended(
+                &walked(screen::Done::Granted),
+                &unlocked("SACLockScreenImmediate answered 22")
+            ),
             (
                 ExitCode::FAILURE,
                 vec![
@@ -3510,7 +5565,7 @@ mod tests {
         );
         // A step the walk stopped at, with no plan: the line is still the last.
         let stopped = walked(screen::Done::NotGranted("stopped by SIGINT".into()));
-        let (code, said) = ended(&stopped, &unlocked);
+        let (code, said) = ended(&stopped, &unlocked("SACLockScreenImmediate answered 22"));
         assert_eq!(code, ExitCode::FAILURE);
         assert_eq!(said.last(), Some(&Said::Last(line.into())));
         assert_eq!(said.len(), 2);
@@ -3529,14 +5584,46 @@ mod tests {
             assert_eq!(ended(&stopped, &session).0, ExitCode::FAILURE);
         }
         // What the host said reaches the terminal inert.
-        let (_, said) = ended(
-            &stopped,
-            &screen::Session::Unlocked("\u{1b}]52;c;aGVsbG8=\u{7}".into()),
-        );
+        let (_, said) = ended(&stopped, &unlocked("\u{1b}]52;c;aGVsbG8=\u{7}"));
         assert!(
             matches!(said.last(), Some(Said::Last(l)) if inert(l)),
             "{said:?}"
         );
+    }
+
+    /// Records into its log when it drops, as `screen`'s caught stops are let go.
+    struct Held(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("stops let go".into());
+        }
+    }
+
+    #[test]
+    fn the_stops_screen_caught_are_let_go_only_after_the_last_line() {
+        // While they are held, a second Ctrl-C during the closing plan is noted and ignored, so
+        // the line saying the Mac was left unlocked still comes out.
+        let a = lab(1, UUID_1);
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let walked = vec![screen::Walked {
+            step: "full_disk_access:aterm".into(),
+            done: screen::Done::Granted,
+        }];
+        let session = screen::Session::Unlocked {
+            why: "SACLockScreenImmediate answered 22".into(),
+            unread: None,
+            watched: true,
+        };
+        let held = Box::new(Held(std::rc::Rc::clone(&log)));
+        let code = end_walk(&a, "screen", &walked, &session, held, &mut |said| {
+            log.borrow_mut().push(format!("{said:?}"));
+        });
+        assert_eq!(code, ExitCode::FAILURE);
+        let log = log.borrow();
+        assert_eq!(log.len(), 4, "{log:?}");
+        assert!(log[1] == "Plan" && log[2].starts_with("Last("), "{log:?}");
+        assert_eq!(log[3], "stops let go");
     }
 
     #[test]
@@ -3894,5 +5981,383 @@ mod tests {
             Source::Baseline,
         );
         assert_eq!(state_of(&sys, &a).github_keys, [("alice".to_owned(), 11)]);
+    }
+
+    /// Successful interactive keygen is followed by the existing protection query.
+    /// A protected result succeeds; an empty, unreadable or interrupted result
+    /// refuses without removing or regenerating the same private key.
+    #[test]
+    fn init_keeps_the_key_and_refuses_an_unconfirmed_passphrase() {
+        for (label, after, protected) in [
+            (
+                "protected",
+                Ran::exit(
+                    255,
+                    "Load key: incorrect passphrase supplied to decrypt private key\n",
+                ),
+                true,
+            ),
+            ("empty", Ran::ok("ssh-ed25519 public\n"), false),
+            ("unreadable", Ran::exit(1, "permission denied\n"), false),
+            (
+                "interrupted",
+                Ran {
+                    status: None,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
+                false,
+            ),
+        ] {
+            let sys = uninitialized(false);
+            assert_eq!(init(&env(&sys), false, &mut Vec::new()), ExitCode::SUCCESS);
+            let key = format!("{ROOT}/keys/signing");
+            let private = b"the same private-key identity";
+            sys.file(&key, private);
+            let query = format!("/usr/bin/ssh-keygen -y -P '' -f {key}");
+            sys.on(&query, Ran::ok("ssh-ed25519 public\n"));
+            sys.on(&query, after);
+            let protect = format!("tty /usr/bin/ssh-keygen -p -f {key}");
+            sys.on(&protect, Ran::ok(""));
+            let mut e = env(&sys);
+            e.tty = true;
+            let before = sys.calls().len();
+            let mut out = Vec::new();
+            assert_eq!(
+                init(&e, true, &mut out),
+                if protected {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                },
+                "INIT_PASSPHRASE_NEEDS_CONFIRMED_PROTECTION: {label}"
+            );
+            assert_eq!(sys.read_file(Path::new(&key)).unwrap(), private, "{label}");
+            let calls = sys.calls()[before..].to_vec();
+            assert!(calls.contains(&protect), "the actual change ran: {calls:?}");
+            assert!(!calls.iter().any(|c| c.contains("-t ed25519")), "{calls:?}");
+            let out = String::from_utf8(out).unwrap();
+            assert_eq!(
+                out.contains("gave the signing key a passphrase"),
+                protected,
+                "{label}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_controller_is_set_up_by_the_first_verb_that_needs_it_and_an_old_one_left() {
+        let sys = uninitialized(false);
+        set_up_if_new(&sys, &paths());
+        assert!(sys.written(&format!("{ROOT}/machines.toml")).is_some());
+        assert!(sys.written(&format!("{ROOT}/allowed_signers")).is_some());
+        assert!(
+            sys.calls()
+                .iter()
+                .any(|c| c.contains("ssh-keygen -q -t ed25519 -N ''")),
+            "{:?}",
+            sys.calls()
+        );
+        // One with an inventory is never touched, whatever else it lacks.
+        let sys = uninitialized(false);
+        sys.file(&format!("{ROOT}/machines.toml"), b"schema = 1\n");
+        set_up_if_new(&sys, &paths());
+        assert!(sys.written(&format!("{ROOT}/allowed_signers")).is_none());
+        assert!(!sys.calls().iter().any(|c| c.contains("ssh-keygen")));
+    }
+
+    #[test]
+    fn a_starter_baseline_nobody_edited_follows_the_starter_shipped_now() {
+        // The owner's controller, set up on 2026-10-18: its default.toml is the starter of
+        // 6045a51374 byte for byte, the one without `host_name = ""`, so the rehearsal's F1
+        // fix to the starter would never have reached it.
+        let earlier = templates::DEFAULT_BASELINE.replace(
+            "# host_name \"\" unsets a HostName set by hand, so `hostname`, shell prompts and \
+             ssh show the\n# new Local hostname rather than the old name; a dotted name sets one \
+             instead.\n",
+            "",
+        );
+        let earlier = earlier.replace("host_name = \"\"\n", "");
+        assert_ne!(earlier, templates::DEFAULT_BASELINE);
+        assert!(
+            templates::EARLIER_DEFAULT_BASELINES.contains(&text_sha256(&earlier).as_str()),
+            "the digest is of the starter as 6045a51374 wrote it"
+        );
+        assert!(
+            !templates::EARLIER_DEFAULT_BASELINES
+                .contains(&text_sha256(templates::DEFAULT_BASELINE).as_str()),
+            "the starter shipped now is not an earlier one"
+        );
+        let default = format!("{ROOT}/baselines/default.toml");
+        for (on_disk, after) in [
+            (earlier.clone(), templates::DEFAULT_BASELINE.to_owned()),
+            // Edited, even by one line: the owner's, never rewritten.
+            (format!("{earlier}# mine\n"), format!("{earlier}# mine\n")),
+            (
+                templates::DEFAULT_BASELINE.to_owned(),
+                templates::DEFAULT_BASELINE.to_owned(),
+            ),
+        ] {
+            let sys = uninitialized(false);
+            sys.file(&format!("{ROOT}/machines.toml"), b"schema = 1\n");
+            sys.file(&default, on_disk.as_bytes());
+            set_up_if_new(&sys, &paths());
+            assert_eq!(
+                String::from_utf8(sys.written(&default).unwrap()).unwrap(),
+                after
+            );
+        }
+        // No baseline at all is no baseline still.
+        let sys = uninitialized(false);
+        sys.file(&format!("{ROOT}/machines.toml"), b"schema = 1\n");
+        set_up_if_new(&sys, &paths());
+        assert!(sys.written(&default).is_none());
+    }
+
+    /// What `ssh` prints when nothing answers at an IP address.
+    fn timed_out(host: &Host) -> Ran {
+        Ran::exit(
+            255,
+            &format!(
+                "ssh: connect to host {} port 22: Operation timed out\r\n",
+                host.address
+            ),
+        )
+    }
+
+    /// lab-09 held by its IP address, its newest hello in `state/` naming its Local hostname
+    /// `lab-09`, and the host at that name.
+    fn dhcp_vm() -> (Fake, Host, Host) {
+        let vm = lab(9, UUID_1);
+        let sys = controller(&[&vm], false);
+        let mut said = hello_of(&vm);
+        said.local_host_name = "lab-09".into();
+        let state = HostState {
+            hello: Some(aterm_json::to_string(&said).unwrap()),
+            ..HostState::default()
+        };
+        inventory::save_state(&sys, &paths(), &vm.uuid, &state).unwrap();
+        let named = Host {
+            address: "lab-09.local".into(),
+            ..vm.clone()
+        };
+        (sys, vm, named)
+    }
+
+    #[test]
+    fn a_mac_whose_dhcp_address_moved_is_followed_to_its_local_hostname_once_its_key_answers() {
+        let (sys, vm, named) = dhcp_vm();
+        sys.on(&request(&vm, "hello"), timed_out(&vm)).on(
+            &request(&named, "hello"),
+            Ran::ok(&aterm_json::to_string(&hello_of(&vm)).unwrap()),
+        );
+        let reached = reach_one(&env(&sys), &vm);
+        assert!(reached.hello.is_ok());
+        assert_eq!(reached.host.address, named.address);
+        assert_eq!(inventory_of(&sys).hosts[0].address, named.address);
+        // `lab-09           moved: address 192.168.64.9 -> lab-09.local in machines.toml`.
+        assert_eq!(found_lead(&vm), format!("{:<16} moved: ", vm.name));
+        // Asked over ssh, under the key pinned for its UUID: only that Mac can answer there.
+        let asked = request(&named, "hello");
+        assert!(sys.calls().contains(&asked));
+        assert!(asked.starts_with("/usr/bin/ssh "), "{asked}");
+        assert!(asked.contains(&format!("HostKeyAlias={UUID_1}")), "{asked}");
+        assert!(asked.contains("StrictHostKeyChecking=yes"), "{asked}");
+        let state = state_of(&sys, &vm);
+        assert_eq!((state.last_seen, state.unreachable_since), (sys.now, None));
+        // Another Mac took its IP address (its key answers there): looked for by name too.
+        let (sys, vm, named) = dhcp_vm();
+        sys.on(&request(&vm, "hello"), Ran::exit(255, HOST_KEY_CHANGED))
+            .on(
+                &request(&named, "hello"),
+                Ran::ok(&aterm_json::to_string(&hello_of(&vm)).unwrap()),
+            );
+        assert!(reach_one(&env(&sys), &vm).hello.is_ok());
+        assert_eq!(inventory_of(&sys).hosts[0].address, named.address);
+    }
+
+    #[test]
+    fn another_mac_at_its_local_hostname_moves_nothing() {
+        let (sys, vm, named) = dhcp_vm();
+        sys.on(&request(&vm, "hello"), timed_out(&vm))
+            .on(&request(&named, "hello"), Ran::exit(255, HOST_KEY_CHANGED));
+        let reached = reach_one(&env(&sys), &vm);
+        assert!(matches!(
+            reached.hello,
+            Err(HelloError::Ssh(ssh::Failure::TimedOut))
+        ));
+        assert_eq!(reached.host.address, vm.address);
+        assert_eq!(inventory_of(&sys).hosts[0].address, vm.address);
+        // The guess leaves no trace: the host is unreachable at its address, not "changed".
+        let state = state_of(&sys, &vm);
+        assert_eq!(state.unreachable_since, Some(sys.now));
+        assert_eq!(state.contact_error, None);
+        // Nor does one whose key passes and that answers as another Mac.
+        let (sys, vm, named) = dhcp_vm();
+        let mut other = hello_of(&vm);
+        other.uuid = UUID_2.into();
+        sys.on(&request(&vm, "hello"), timed_out(&vm)).on(
+            &request(&named, "hello"),
+            Ran::ok(&aterm_json::to_string(&other).unwrap()),
+        );
+        assert!(reach_one(&env(&sys), &vm).hello.is_err());
+        assert_eq!(inventory_of(&sys).hosts[0].address, vm.address);
+    }
+
+    #[test]
+    fn only_an_ip_address_that_does_not_answer_is_looked_for_by_name() {
+        // It answers at its address: nothing else is asked.
+        let (sys, vm, named) = dhcp_vm();
+        sys.on(
+            &request(&vm, "hello"),
+            Ran::ok(&aterm_json::to_string(&hello_of(&vm)).unwrap()),
+        );
+        assert!(reach_one(&env(&sys), &vm).hello.is_ok());
+        assert!(!sys.calls().contains(&request(&named, "hello")));
+        // A refusal that is the Mac's own answer (its fleet key gone) is not a move.
+        let (sys, vm, named) = dhcp_vm();
+        sys.on(
+            &request(&vm, "hello"),
+            Ran::exit(
+                255,
+                "admin@192.168.64.9: Permission denied (publickey).\r\n",
+            ),
+        );
+        assert!(reach_one(&env(&sys), &vm).hello.is_err());
+        assert!(!sys.calls().contains(&request(&named, "hello")));
+        // No hello kept (never answered since enrollment), or one with no Local hostname.
+        let vm = lab(9, UUID_1);
+        let sys = controller(&[&vm], false);
+        sys.on(&request(&vm, "hello"), timed_out(&vm));
+        assert!(reach_one(&env(&sys), &vm).hello.is_err());
+        let ssh_calls = |sys: &Fake| {
+            sys.calls()
+                .iter()
+                .filter(|c| c.starts_with("/usr/bin/ssh "))
+                .count()
+        };
+        assert_eq!(ssh_calls(&sys), 1, "{:?}", sys.calls());
+        let state = HostState {
+            hello: Some(aterm_json::to_string(&hello_of(&vm)).unwrap()),
+            ..HostState::default()
+        };
+        inventory::save_state(&sys, &paths(), &vm.uuid, &state).unwrap();
+        assert!(reach_one(&env(&sys), &vm).hello.is_err());
+        assert_eq!(ssh_calls(&sys), 2, "{:?}", sys.calls());
+        assert_eq!(inventory_of(&sys).hosts[0].address, vm.address);
+    }
+
+    #[test]
+    fn the_verbs_that_read_state_send_nothing() {
+        let (sys, vm, _) = dhcp_vm();
+        let e = env(&sys);
+        let _ = ls(&e);
+        let _ = status(&e, &[], true, false);
+        let _ = outstanding(&e);
+        assert!(
+            !sys.calls().iter().any(|c| c.starts_with("/usr/bin/ssh ")),
+            "{:?}",
+            sys.calls()
+        );
+        let inv = inventory_of(&sys);
+        assert_eq!(inv.hosts.len(), 1);
+        assert_eq!(inv.hosts[0].address, vm.address);
+    }
+
+    #[test]
+    fn tabs_sweeps_live_hosts_and_prints_sessions_and_ai_cli_status() {
+        let host = lab(1, UUID_1);
+        let sys = controller(&[&host], false);
+        let mut h = hello_of(&host);
+        h.sessions.push(crate::protocol::HostedSession {
+            instance_pid: 9001,
+            local_id: 2,
+            sid: "s-tab2".into(),
+            state: "alive".into(),
+            title: "Ship Fleet".into(),
+            window: "0".into(),
+            active: true,
+            focused: true,
+            program: Some("claude".into()),
+            agent: Some("working".into()),
+            agent_detail: Some("thinking".into()),
+            agent_since_ms: Some(12_000),
+            human_ms: Some(45_000),
+            autopilot: Some("cruise".into()),
+            role: Some("operator".into()),
+            attention: None,
+            supervisor: Some("aterm".into()),
+            task: Some("finish lan".into()),
+            cols: Some(211),
+            rows: Some(70),
+            cwd: Some("~/aterm".into()),
+        });
+        let hello_json = format!("{}\n", aterm_json::to_string(&h).unwrap());
+        sys.on(&request(&host, "hello"), Ran::ok(&hello_json));
+
+        let e = env(&sys);
+        assert_eq!(tabs(&e, &[], false), ExitCode::SUCCESS);
+        let saved = state_of(&sys, &host);
+        let parsed: Hello = aterm_json::from_str(saved.hello.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed.sessions.len(), 1);
+        assert_eq!(parsed.sessions[0].program.as_deref(), Some("claude"));
+        assert_eq!(
+            format_session_ai_status(&parsed.sessions[0]),
+            "working: thinking (12s)"
+        );
+        assert_eq!(working_ai_sessions(&parsed.sessions), 1);
+        let mut quiet = parsed.sessions[0].clone();
+        for word in ["waiting", "unknown", "idle"] {
+            quiet.agent = Some(word.into());
+            assert_eq!(working_ai_sessions(std::slice::from_ref(&quiet)), 0);
+        }
+        quiet.agent = Some("busy".into());
+        assert_eq!(working_ai_sessions(std::slice::from_ref(&quiet)), 1);
+        assert_eq!(describe_host_hardware(None), "hardware unknown");
+        assert_eq!(describe_host_hardware(Some("Mac17,4")), "Mac17,4");
+        assert_eq!(
+            format_os_and_ssh(None, None, None, None),
+            "OS version unknown · SSH banner unknown"
+        );
+        assert_eq!(
+            format_os_and_ssh(None, None, Some(u32::MAX), None),
+            format!("Darwin {} · SSH banner unknown", u32::MAX)
+        );
+        assert_eq!(
+            format_os_and_ssh(
+                Some("27.0.1"),
+                Some("26A1"),
+                None,
+                Some("OpenSSH_measured detail")
+            ),
+            "macOS 27.0.1 (26A1) · OpenSSH_measured"
+        );
+        let banner = |bytes: &[u8], expired| {
+            use std::io::Write;
+            use std::net::{Shutdown, TcpListener, TcpStream};
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (mut peer, _) = listener.accept().unwrap();
+            peer.write_all(bytes).unwrap();
+            peer.shutdown(Shutdown::Write).unwrap();
+            let now = std::time::Instant::now();
+            let deadline = if expired {
+                now - Duration::from_secs(1)
+            } else {
+                now + Duration::from_secs(60)
+            };
+            read_ssh_banner(&client, deadline)
+        };
+        assert_eq!(
+            banner(b"SSH-2.0-observed_peer\r\n", false).as_deref(),
+            Some("observed_peer")
+        );
+        let mut oversized = b"SSH-2.0-".to_vec();
+        oversized.extend([b'x'; 255]);
+        oversized.push(b'\n');
+        assert_eq!(banner(&oversized, false), None);
+        assert_eq!(banner(b"SSH-2.0-partial", false), None);
+        assert_eq!(banner(b"SSH-2.0-\xff\r\n", false), None);
+        assert_eq!(banner(b"SSH-2.0-observed_peer\r\n", true), None);
     }
 }

@@ -6,7 +6,7 @@
 //! ONE plain-data snapshot, [`HarnessState`], drives the native `/harness`
 //! route: the App builds it ([`App::harness_state`]) from what it already
 //! holds — the policy in force, every live supervisable agent session's
-//! Autopilot, the ledgers' last reading and the A/B clock — and publishes it
+//! Autopilot, the ledgers' last reading and the A/B book — and publishes it
 //! to every Settings view by revision fan-out (`App::publish_native_harness_
 //! state`, `AppEvent::HarnessChanged`). The page renders its
 //! [`HarnessProjection`], a pure function of the state, so what the screen
@@ -29,23 +29,17 @@
 //! the last 7 days (design §10.3.3, item 1) — and comes back as
 //! `Wake::HarnessStatsCollected`. It creates nothing.
 //!
-//! **With and without** (§4 item 5, the A/B) is measured here, in-process:
-//! per session, how long its agent spent BUSY and how long it spent WAITING
-//! at a point for input (the published agent words `idle`, `prompt` and
-//! `question`), split by the Autopilot state it ran under ([`AbArm`]):
-//! Cruise and Land under this host's live claim, Off — plain Claude Code, no
-//! harness's hands on it: its word Off, the master switch off, or no host,
-//! and nobody's claim live — and the rest, unsupervised. The page compares
-//! Cruise with Off only: a landing ENDS waiting ("landed, then nothing more
-//! typed"), so Land's share is shown on its own and never set beside
-//! Cruise's. The clock ([`AbBook`]) charges the time since the last change to
-//! the bucket in force at each change — a word that moved, or an arm that
-//! moved — so it reads no clock on the render path, and lives for this
-//! process only. No "time saved" figure is derived from it: nothing measures
-//! one (§6). An agent that has finished its work waits too, charged like any
-//! other wait, and the card says so ([`ab_rows`]).
+//! **With and without** (§4 item 5, the A/B) is measured in-process by the
+//! A/B book ([`crate::harness_ab`], §10.5.3 B): per session, its agent's
+//! time by published word — busy, at a box, asked, at its prompt — split by
+//! the Autopilot state it ran under ([`AbArm`]) and, under Cruise and Land
+//! at the prompt, by why ([`AbCause`]: finished, or the harness pausing),
+//! with each box's and question's hold in a histogram, per local day for
+//! seven days. This page feeds it (a moved word, a moved arm) and shows its
+//! week ([`ab_rows`]). No "time saved" figure is derived from it: nothing
+//! measures one (§6).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
 
@@ -60,195 +54,10 @@ use crate::claude_lights::{ChipFace, ChipGlass, LandAtGlass};
 const WEEK_MS: i64 = 7 * 86_400_000;
 
 // ---------------------------------------------------------------------------
-// The A/B clock
+// The A/B book (`harness_ab`)
 // ---------------------------------------------------------------------------
 
-/// Which arm of the A/B a stretch of an agent's time falls in (§4 item 5):
-/// the Autopilot state it ran under.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum AbArm {
-    /// Cruise under this host's live claim: the harness kept the work moving.
-    Cruise,
-    /// Land under this host's live claim: the harness was wrapping the work
-    /// up. A landing ends waiting, so this share is its own, never compared.
-    Land,
-    /// Plain Claude Code, the baseline: no harness's hands on the session —
-    /// its Autopilot Off, the master switch off, or no host here — and no
-    /// supervisor's claim live on it.
-    Off,
-    /// None of these: a mode the harness carries with no claim of this
-    /// host's (the agent not yet attached, another supervisor's claim), or
-    /// Off while a claim is still live. Counted, so no time is dropped; never
-    /// compared.
-    Unsupervised,
-}
-
-impl AbArm {
-    /// The arm of a session whose effective Autopilot is `view`, whose live
-    /// claim is this host's (`supervised`), and on which anyone's claim is
-    /// live (`claimed`; `supervised` implies it).
-    #[must_use]
-    pub(crate) const fn of(view: AutopilotView, supervised: bool, claimed: bool) -> Self {
-        match view {
-            AutopilotView::Cruise if supervised => Self::Cruise,
-            AutopilotView::Land if supervised => Self::Land,
-            AutopilotView::Off
-            | AutopilotView::MasterOff
-            | AutopilotView::AgentOff(_)
-            | AutopilotView::Unhosted
-                if !claimed =>
-            {
-                Self::Off
-            }
-            _ => Self::Unsupervised,
-        }
-    }
-}
-
-/// What an agent was doing in a stretch the A/B counts: busy, or stopped at a
-/// point waiting for input. Every other published word — a wall, a survey,
-/// `unknown`, `-` — is counted in neither.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum AbPhase {
-    /// `busy`: a turn (or background work) runs.
-    Busy,
-    /// `idle`, `prompt` or `question`: the agent waits for an answer, an
-    /// approval or its next instruction.
-    Waiting,
-}
-
-impl AbPhase {
-    /// The phase a published agent word (`AgentPublication::word`) counts as.
-    #[must_use]
-    pub(crate) fn of(word: &str) -> Option<Self> {
-        match word {
-            "busy" => Some(Self::Busy),
-            "idle" | "prompt" | "question" => Some(Self::Waiting),
-            _ => None,
-        }
-    }
-}
-
-/// One arm's totals: how long agents were busy and how long they waited.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub(crate) struct AbArmTotals {
-    /// Milliseconds busy.
-    pub(crate) busy_ms: u64,
-    /// Milliseconds stopped at a point waiting for input.
-    pub(crate) waiting_ms: u64,
-}
-
-impl AbArmTotals {
-    /// All the time this arm measured.
-    #[must_use]
-    pub(crate) const fn measured_ms(self) -> u64 {
-        self.busy_ms.saturating_add(self.waiting_ms)
-    }
-
-    fn add(&mut self, phase: AbPhase, ms: u64) {
-        let bucket = match phase {
-            AbPhase::Busy => &mut self.busy_ms,
-            AbPhase::Waiting => &mut self.waiting_ms,
-        };
-        *bucket = bucket.saturating_add(ms);
-    }
-}
-
-/// The A/B totals for this aterm run ([`App::harness_ab`]): each arm's busy
-/// and waiting time.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub(crate) struct AbTotals {
-    /// Under Cruise ([`AbArm::Cruise`]).
-    pub(crate) cruise: AbArmTotals,
-    /// Under Land ([`AbArm::Land`]).
-    pub(crate) land: AbArmTotals,
-    /// With the harness off ([`AbArm::Off`]).
-    pub(crate) off: AbArmTotals,
-    /// Unsupervised ([`AbArm::Unsupervised`]).
-    pub(crate) unsupervised: AbArmTotals,
-}
-
-impl AbTotals {
-    fn arm_mut(&mut self, arm: AbArm) -> &mut AbArmTotals {
-        match arm {
-            AbArm::Cruise => &mut self.cruise,
-            AbArm::Land => &mut self.land,
-            AbArm::Off => &mut self.off,
-            AbArm::Unsupervised => &mut self.unsupervised,
-        }
-    }
-}
-
-/// One session's open stretch: the phase and arm in force since `since_ms`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct AbClock {
-    phase: AbPhase,
-    arm: AbArm,
-    since_ms: u64,
-}
-
-/// THE A/B CLOCK: each session's open stretch and the settled totals. Fed at
-/// each change ([`Self::observe`]) and at a session's end ([`Self::retire`]);
-/// read with the open stretches counted up to a given instant
-/// ([`Self::totals_at`]). Times are on the ledger clock
-/// (`turn_ledger::now_ms`), the one a published word's `changed_ms` is on.
-#[derive(Debug, Default)]
-pub(crate) struct AbBook {
-    /// Session → its open stretch. A session counted in no phase has none.
-    clocks: HashMap<u64, AbClock>,
-    /// Every closed stretch, summed.
-    settled: AbTotals,
-}
-
-impl AbBook {
-    /// Session `session` is in `phase` under `arm` from `at_ms` on: the time
-    /// since its last change goes to the bucket that was in force (the arm
-    /// and phase of then, never of now), and a new stretch opens. An instant
-    /// before the open stretch's start counts nothing (never a negative).
-    pub(crate) fn observe(&mut self, session: u64, phase: Option<AbPhase>, arm: AbArm, at_ms: u64) {
-        let at_ms = match self.clocks.remove(&session) {
-            Some(open) => {
-                let at = at_ms.max(open.since_ms);
-                self.settled
-                    .arm_mut(open.arm)
-                    .add(open.phase, at - open.since_ms);
-                at
-            }
-            None => at_ms,
-        };
-        if let Some(phase) = phase {
-            self.clocks.insert(
-                session,
-                AbClock {
-                    phase,
-                    arm,
-                    since_ms: at_ms,
-                },
-            );
-        }
-    }
-
-    /// Session `session` ended at `at_ms`: its open stretch is settled and
-    /// the clock forgets it.
-    pub(crate) fn retire(&mut self, session: u64, at_ms: u64) {
-        if let Some(open) = self.clocks.get(&session).copied() {
-            self.observe(session, None, open.arm, at_ms);
-        }
-    }
-
-    /// The totals at `now_ms`: the settled stretches and every open one up
-    /// to `now_ms`.
-    #[must_use]
-    pub(crate) fn totals_at(&self, now_ms: u64) -> AbTotals {
-        let mut totals = self.settled;
-        for open in self.clocks.values() {
-            totals
-                .arm_mut(open.arm)
-                .add(open.phase, now_ms.saturating_sub(open.since_ms));
-        }
-        totals
-    }
-}
+pub(crate) use crate::harness_ab::{AbArm, AbBook, AbCause, AbPhase, AbWeek, ab_rows};
 
 // ---------------------------------------------------------------------------
 // What the harness did
@@ -267,9 +76,22 @@ pub(crate) struct HarnessStatsReport {
     /// The local zone's offset east of UTC at that instant, in seconds, or
     /// `None` where it could not be read (today is then UTC's day).
     pub(crate) offset_s: Option<i64>,
+    /// The A/B book's days of every OTHER aterm process on this state
+    /// directory (`<harness state>/ab/`, §10.5.3 C.3), summed by local day,
+    /// oldest first: what the page adds to the live book's week
+    /// ([`App::harness_ab`]). Empty where none was read.
+    pub(crate) ab_others: Vec<crate::harness_ab::AbDay>,
+    /// Tabs read from sibling local `aterm` processes on this Mac.
+    pub(crate) sibling_tabs: Vec<TabSpreadsheetRow>,
+    /// Managed LAN/remote computers read from `<config>/machines/`.
+    pub(crate) remote_computers: Vec<TabComputer>,
+    /// Open tabs across managed LAN/remote computers read from `<config>/machines/state/`.
+    pub(crate) remote_tabs: Vec<TabSpreadsheetRow>,
     /// Each session's day line, formed by the reader beside its counts.
     /// Projection lends these words without reading the local zone.
     day_lines: BTreeMap<String, String>,
+    /// Each kept decision's event clock, resolved by the reader.
+    decision_clocks: BTreeMap<i64, String>,
 }
 
 impl HarnessStatsReport {
@@ -291,12 +113,29 @@ impl HarnessStatsReport {
                 day_line_at(tally, offset_at).map(|line| (sid.clone(), line))
             })
             .collect();
+        let decision_clocks = today
+            .decided
+            .as_ref()
+            .into_iter()
+            .flat_map(|decided| &decided.rows)
+            .map(|decision| {
+                (
+                    decision.t_ms,
+                    clock_words(decision.t_ms, offset_at(decision.t_ms.div_euclid(1000))),
+                )
+            })
+            .collect();
         Self {
             today,
             week,
             collected_unix_ms,
             offset_s,
+            ab_others: Vec::new(),
+            sibling_tabs: Vec::new(),
+            remote_computers: Vec::new(),
+            remote_tabs: Vec::new(),
             day_lines,
+            decision_clocks,
         }
     }
 }
@@ -374,6 +213,35 @@ pub(crate) fn collect_harness_stats(
     ))
 }
 
+/// THE STATS THREAD'S READING (blocking file I/O: a worker's only): the
+/// ledgers ([`collect_harness_stats`]) and the A/B book's exchange
+/// (§10.5.3 C.2–3, `harness_ab_store::exchange`) — this process's book
+/// (`ab`, the ring the App copied and its today; `None` where it was never
+/// fed) written whole as `own` under `harness_state/ab/`, then every other
+/// process's days read into [`HarnessStatsReport::ab_others`]. The book is
+/// written even where the ledgers cannot be read; nothing of it where no
+/// harness state resolves.
+pub(crate) fn read_harness_stats(
+    state_dir: Option<&Path>,
+    harness_state: Option<&Path>,
+    ab: Option<&crate::harness_ab_store::AbSnapshot>,
+    own: &str,
+    now_ms: i64,
+    offset_at: fn(i64) -> Option<i64>,
+) -> Result<HarnessStatsReport, String> {
+    let others = harness_state
+        .map(|hs| crate::harness_ab_store::exchange(hs, own, ab, now_ms, offset_at))
+        .unwrap_or_default();
+    let (sibling_tabs, remote_computers, remote_tabs) = collect_fleet_and_sibling_tabs();
+    collect_harness_stats(state_dir, harness_state, now_ms, offset_at).map(|mut report| {
+        report.ab_others = others;
+        report.sibling_tabs = sibling_tabs;
+        report.remote_computers = remote_computers;
+        report.remote_tabs = remote_tabs;
+        report
+    })
+}
+
 /// The ledgers' reading as the page has it: the last report, whether a
 /// reading is running, and why none could be taken.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -412,13 +280,15 @@ impl HarnessStatsSlot {
 // ---------------------------------------------------------------------------
 
 /// What the App keeps for Settings ▸ Harness: the projection's revision, the
-/// A/B clock and the ledgers' reading.
+/// A/B book and the ledgers' reading.
 #[derive(Debug, Default)]
 pub(crate) struct HarnessScreen {
     /// The last published revision (bumped by every publish).
     pub(crate) revision: u64,
-    /// The A/B clock ([`AbBook`]).
+    /// The A/B book ([`AbBook`]).
     pub(crate) ab: AbBook,
+    /// Shared capture/write order for this book, retained by its stats workers.
+    pub(crate) ab_writes: std::sync::Arc<crate::harness_ab_store::AbWrites>,
     /// The ledgers' reading.
     pub(crate) stats: HarnessStatsSlot,
     /// The running reading's ticket: a completion for an older one is dropped.
@@ -522,10 +392,18 @@ impl HarnessScreen {
     /// Session `session`'s published agent word just moved (a sweep's
     /// publish, an input stall's): the stretch it closes goes to the bucket in
     /// force, and the new word's opens at the instant the word moved (its
-    /// `changed_ms`, so no clock is read here). `arm` is the session's arm
-    /// now. A session whose program is no supervisable agent counts in no
-    /// phase — a shell's idle hours are no agent's wait.
-    pub(crate) fn note_phase(&mut self, session: u64, ctx: &crate::SessionCtx, arm: AbArm) {
+    /// `changed_ms`, so no clock is read for it). `arm` is the session's arm
+    /// now, and `glass` its glass's say on why it may sit at its prompt
+    /// (`App::harness_ab_glass`: finished, pausing). A session whose program
+    /// is no supervisable agent counts in no phase — a shell's idle hours
+    /// are no agent's wait.
+    pub(crate) fn note_phase(
+        &mut self,
+        session: u64,
+        ctx: &crate::SessionCtx,
+        arm: AbArm,
+        glass: (bool, bool),
+    ) {
         // The timeline's guard ends before the word is read as a phase: the
         // session's locks are taken meta, then timeline, never the reverse
         // (`aterm-census --locks`).
@@ -539,7 +417,23 @@ impl HarnessScreen {
             )
         };
         let phase = agent.and_then(|_| AbPhase::of(word));
-        self.ab.observe(session, phase, arm, at_ms);
+        let cause = AbCause::of(arm, phase, glass.0, glass.1);
+        self.ab_calendar();
+        self.ab.observe(session, phase, cause, arm, at_ms);
+    }
+
+    /// THE A/B BOOK'S CALENDAR, read where the book is first fed: one wall
+    /// read, with the ledger instant it pairs with ([`AbBook::set_calendar`]).
+    /// Nothing once it is read; a moved wall reads it again
+    /// (`App::harness_ab_wall_moved`).
+    pub(crate) fn ab_calendar(&mut self) {
+        if !self.ab.has_calendar() {
+            self.ab.set_calendar(crate::harness_ab::AbCalendar::read(
+                crate::turn_ledger::now_ms(),
+                crate::autopilot_timers::wall_ms(),
+                crate::autopilot_timers::local_offset_at,
+            ));
+        }
     }
 }
 
@@ -658,8 +552,8 @@ pub(crate) struct HarnessState {
     pub(crate) sessions: Vec<HarnessSession>,
     /// The ledgers' reading.
     pub(crate) stats: HarnessStatsSlot,
-    /// The A/B totals at the publish.
-    pub(crate) ab: AbTotals,
+    /// The A/B book's week at the publish ([`AbWeek`]).
+    pub(crate) ab: AbWeek,
     /// The effective `[harness]` table.
     pub(crate) config: Vec<HarnessConfigRow>,
     /// `[harness] land_at` as a session's Timer arms it if chosen at the
@@ -669,10 +563,203 @@ pub(crate) struct HarnessState {
     /// The AI CLIs sub-page's snapshot ([`crate::ai_screen::AiState`]):
     /// published with its parent's, so the one fan-out serves both pages.
     pub(crate) ai: crate::ai_screen::AiState,
+    /// The Tab Control Panel sub-page's snapshot ([`TabControlState`]):
+    /// all accessible computers, `aterm` instances, and open tabs with live
+    /// AI CLI telemetry.
+    pub(crate) tabs: TabControlState,
+    /// The live sessions today's decisions name that SESSIONS does not list
+    /// (an agent that has exited, its tab still open): DECIDED FOR YOU names
+    /// them and shows their tab ([`Self::decided_rows`]).
+    pub(crate) decided_open: Vec<OpenSession>,
     /// The publish's local day (days since 1970-01-01, local time), from its
     /// one wall read: a state line's clock from another day names its
     /// weekday against it (§10.2.3, item 3), so the projection stays pure.
     pub(crate) today: i64,
+}
+
+/// One accessible computer in Settings ▸ Harness ▸ Tab Control (`/tabs`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TabComputer {
+    /// Stable identifier: `"local"`, an enrolled host's UUID/name, or
+    /// `"lan/…"` for advertisement-only discovery without session observations.
+    pub(crate) id: String,
+    /// Display name (`"MacBook-Pro (this Mac)"` or `"mini"`).
+    pub(crate) name: String,
+    /// Network address (`"local"` or `"192.168.1.42"`).
+    pub(crate) address: String,
+    /// OS version (`"macOS"` / `"macOS 15.4"`).
+    pub(crate) os_version: String,
+    /// Reachability word (`"online"`, `"standby"`, `"offline"`).
+    pub(crate) status: String,
+    /// Number of observed active `aterm` instances; unused for `lan/…` hosts.
+    pub(crate) instances: usize,
+    /// Total open tabs/sessions across all `aterm` instances on this computer.
+    pub(crate) tabs: usize,
+    /// Number of tabs running an AI CLI (`Claude Code`, `Codex`, `Antigravity CLI`, `Muse Code`, `Gemini CLI`).
+    pub(crate) ai_clis: usize,
+    /// Number of AI CLI tabs currently working or waiting on input.
+    pub(crate) active_ai: usize,
+}
+
+/// One row in the Tab Control Panel's sessions & tabs spreadsheet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TabSpreadsheetRow {
+    /// Unique row key (`local/7`, `sibling/4120/1`, `remote/mini/500/2`).
+    pub(crate) key: String,
+    /// Computer display name (`"this Mac"`, `"mini"`).
+    pub(crate) computer: String,
+    /// `aterm` instance label (`"this aterm"`, `"aterm-4120"`).
+    pub(crate) instance: String,
+    /// Tab / window place (`"Tab 1*"`, `"Window 1, tab 2"`).
+    pub(crate) place: String,
+    /// Session ID (`"s-1"`).
+    pub(crate) sid: String,
+    /// Resolved tab title.
+    pub(crate) title: String,
+    /// Session state (`"Running"`, `"Idle"`).
+    pub(crate) state: String,
+    /// Foreground program or AI CLI product name (`"Claude Code"`, `"Codex"`, `"zsh"`).
+    pub(crate) program: String,
+    /// Whether this tab is running an AI CLI.
+    pub(crate) is_ai_cli: bool,
+    /// Live AI CLI status (`"working: thinking (14s)"`, `"waiting on permission: Bash (5s)"`, `"idle at prompt"`, or `"-"` for non-AI tabs).
+    pub(crate) ai_status: String,
+    /// Autopilot mode (`"cruise"`, `"land"`, `"off"`, `"-"`).
+    pub(crate) autopilot: String,
+    /// Human activity (`"12s ago"`, `"5m ago"`, `"-"`).
+    pub(crate) human: String,
+    /// Process-local session ID if this tab belongs to THIS `aterm` instance (enables `Show tab`).
+    pub(crate) show_local_id: Option<u64>,
+}
+
+/// Snapshot of all accessible computers, `aterm` instances, and tabs for
+/// Settings ▸ Harness ▸ Tab Control (`/tabs`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TabControlState {
+    /// Accessible computers (`this Mac` first, followed by managed LAN Macs).
+    pub(crate) computers: Vec<TabComputer>,
+    /// All open tabs across accessible computers and `aterm` instances.
+    pub(crate) tabs: Vec<TabSpreadsheetRow>,
+}
+
+/// Pure projection rendered by Settings ▸ Harness ▸ Tab Control (`/tabs`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TabControlProjection {
+    /// Whether the host has published.
+    pub(crate) observed: bool,
+    /// Whether a background refresh is running.
+    pub(crate) collecting: bool,
+    /// Summary facts for the OVERVIEW card (`Computers`, `Sessions & tabs`, `AI CLIs`).
+    pub(crate) summary_rows: Vec<(String, String)>,
+    /// Accessible computers table rows.
+    pub(crate) computers: Vec<TabComputer>,
+    /// Sessions & tabs spreadsheet rows.
+    pub(crate) tabs: Vec<TabSpreadsheetRow>,
+}
+
+impl TabControlState {
+    /// Pure projection for Settings ▸ Harness ▸ Tab Control.
+    #[must_use]
+    pub(crate) fn projection(&self, observed: bool, collecting: bool) -> TabControlProjection {
+        let summary_rows = if !observed {
+            vec![("Fleet".to_string(), "reading\u{2026}".to_string())]
+        } else {
+            let partial = self.computers.iter().any(|c| c.id.starts_with("lan/"));
+            let total_computers = self.computers.len();
+            let online_computers = self
+                .computers
+                .iter()
+                .filter(|c| c.status.starts_with("online"))
+                .count();
+            let total_instances: usize = self.computers.iter().map(|c| c.instances).sum::<usize>();
+            let total_tabs = self.tabs.len();
+            let ai_tabs = self.tabs.iter().filter(|t| t.is_ai_cli).count();
+            let active_ai = self
+                .tabs
+                .iter()
+                .filter(|t| {
+                    t.is_ai_cli
+                        && (t.ai_status.starts_with("working") || t.ai_status.starts_with("busy"))
+                })
+                .count();
+            vec![
+                (
+                    "Computers".to_string(),
+                    format!("{total_computers} known \u{b7} {online_computers} online"),
+                ),
+                (
+                    "Sessions".to_string(),
+                    format!(
+                        "{total_instances} aterm {} \u{b7} {total_tabs} open {}{}",
+                        if total_instances == 1 {
+                            "instance"
+                        } else {
+                            "instances"
+                        },
+                        if total_tabs == 1 { "tab" } else { "tabs" },
+                        if partial { " observed" } else { "" }
+                    ),
+                ),
+                (
+                    "AI CLIs".to_string(),
+                    if ai_tabs == 0 {
+                        if partial {
+                            "none observed"
+                        } else {
+                            "none running"
+                        }
+                        .to_string()
+                    } else {
+                        format!(
+                            "{ai_tabs} {} \u{b7} {active_ai} active",
+                            if partial { "observed" } else { "running" }
+                        )
+                    },
+                ),
+            ]
+        };
+        TabControlProjection {
+            observed,
+            collecting,
+            summary_rows,
+            computers: self.computers.clone(),
+            tabs: self.tabs.clone(),
+        }
+    }
+}
+
+/// A live session a decision names that is no SESSIONS row
+/// ([`HarnessState::decided_open`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OpenSession {
+    /// Its session id, as its rows carry it.
+    pub(crate) sid: String,
+    /// Its process-local id: what `Show tab` raises.
+    pub(crate) local_id: u64,
+    /// Its name as the page gives one ([`App::harness_session_name`], else
+    /// `SessionHandle::display_title`: no spinner frame).
+    pub(crate) title: String,
+}
+
+/// One row of DECIDED FOR YOU (§10.4.1): a choice the harness made in the
+/// person's name today, worded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DecidedRow {
+    /// Its key's last part (`harness/decided/<id>`): its decision's id
+    /// ([`aterm_agent::harness::stats::Decision::id`]), the same at every
+    /// reading, so the row keeps its key (and the focus kept by it) while
+    /// newer rows arrive or a dialog told late sorts in among older ones; a
+    /// second decision with the same id takes `-2`.
+    pub(crate) id: String,
+    /// When it was made, as the local clock (`18:25`).
+    pub(crate) clock: String,
+    /// What was asked and what the harness did, in one sentence
+    /// ([`decision_sentence`]).
+    pub(crate) sentence: String,
+    /// The session's local id while it is open: its `Show tab` raises it.
+    pub(crate) show: Option<u64>,
+    /// The session's name, as the sentence and its `Show tab` say it.
+    pub(crate) name: String,
 }
 
 impl HarnessState {
@@ -685,10 +772,12 @@ impl HarnessState {
             posture: HarnessPosture::default(),
             sessions: Vec::new(),
             stats: HarnessStatsSlot::default(),
-            ab: AbTotals::default(),
+            ab: AbWeek::default(),
             config: Vec::new(),
             land_at_offer: None,
             ai: crate::ai_screen::AiState::default(),
+            tabs: TabControlState::default(),
+            decided_open: Vec::new(),
             today: 0,
         }
     }
@@ -701,9 +790,11 @@ impl HarnessState {
             status_rows: self.status_rows(),
             today: self.today_lines(),
             sessions: self.session_rows(),
+            every: self.every_row(),
             collecting: self.stats.collecting,
             did_rows: self.did_rows(),
-            ab_rows: ab_rows(self.ab),
+            ab_rows: ab_rows(&self.ab, self.today),
+            ab_lead: crate::harness_ab::ab_lead(&self.ab),
             config_rows: self.config.iter().map(config_fact).collect(),
             config_own: self
                 .config
@@ -713,6 +804,101 @@ impl HarnessState {
                 .collect(),
             land_at_offer: self.land_at_offer,
             ai: self.ai.projection(self.observed),
+            tabs: self.tabs.projection(self.observed, self.stats.collecting),
+            decided: self.decided_rows(),
+            decided_total: self.decided_total(),
+        }
+    }
+
+    /// Today's decisions (DECIDED FOR YOU, §10.4), kept or not; none before
+    /// a reading.
+    #[must_use]
+    pub(crate) fn decided_total(&self) -> u64 {
+        self.stats
+            .report
+            .as_deref()
+            .and_then(|report| report.today.decided.as_ref())
+            .map_or(0, |decided| decided.total)
+    }
+
+    /// DECIDED FOR YOU'S ROWS (§10.4.2, item 3), newest first: each of
+    /// today's kept decisions at its clock time, keyed by its decision's id,
+    /// in one sentence that names its session as SESSIONS does — its live
+    /// title, with its place where another row shares the title — else by
+    /// the name of the live session SESSIONS does not list
+    /// ([`Self::decided_open`]), else `A closed session`; `Show tab` only
+    /// while the session is open. Pure.
+    #[must_use]
+    pub(crate) fn decided_rows(&self) -> Vec<DecidedRow> {
+        let Some(report) = self.stats.report.as_deref() else {
+            return Vec::new();
+        };
+        let Some(decided) = report.today.decided.as_ref() else {
+            return Vec::new();
+        };
+        let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut rows: Vec<DecidedRow> = decided
+            .rows
+            .iter()
+            .map(|decision| {
+                let (name, show) = self.decision_session(&decision.sid);
+                let id = decision.id();
+                let same = seen.entry(id.clone()).or_insert(0);
+                *same += 1;
+                let id = if *same > 1 {
+                    format!("{id}-{same}")
+                } else {
+                    id
+                };
+                DecidedRow {
+                    id,
+                    clock: report
+                        .decision_clocks
+                        .get(&decision.t_ms)
+                        .cloned()
+                        .unwrap_or_else(|| clock_words(decision.t_ms, None)),
+                    sentence: decision_sentence(decision, &name),
+                    show,
+                    name,
+                }
+            })
+            .collect();
+        rows.reverse();
+        rows
+    }
+
+    /// The name a decision of session `sid`'s gives it, and its local id
+    /// while it is open.
+    fn decision_session(&self, sid: &str) -> (String, Option<u64>) {
+        if let Some(session) = self.sessions.iter().find(|s| s.sid == sid) {
+            return (self.row_name(session), Some(session.local_id));
+        }
+        if let Some(open) = self.decided_open.iter().find(|s| s.sid == sid) {
+            return (open.title.clone(), Some(open.local_id));
+        }
+        let name = if sid.is_empty() {
+            "A session given no id"
+        } else {
+            "A closed session"
+        };
+        (name.to_string(), None)
+    }
+
+    /// A SESSIONS row's name: its title, and its place too where another row
+    /// shares the title (`✳ Claude Code, tab 1, left pane`).
+    fn row_name(&self, session: &HarnessSession) -> String {
+        let shared = self
+            .sessions
+            .iter()
+            .any(|other| other.local_id != session.local_id && other.title == session.title);
+        if shared {
+            format!(
+                "{}, {}",
+                session.title,
+                session.place.strip_prefix("in ").unwrap_or(&session.place)
+            )
+        } else {
+            session.title.clone()
         }
     }
 
@@ -763,7 +949,7 @@ impl HarnessState {
             return self
                 .stats
                 .collecting
-                .then(|| ("reading\u{2026}".to_string(), String::new()));
+                .then(|| (TODAY_READING.to_string(), String::new()));
         };
         let today = &report.today;
         let mut lead = families(Families::of_stats(today));
@@ -774,11 +960,18 @@ impl HarnessState {
                 duration_words(today.human_wait_ms)
             ));
         }
+        // DECIDED FOR YOU's count (§10.4.1): the card under SESSIONS lists
+        // them.
+        match self.decided_total() {
+            0 => {}
+            1 => rest.push("1 choice made for you".to_string()),
+            n => rest.push(format!("{n} choices made for you")),
+        }
         if lead.is_empty() {
             lead = std::mem::take(&mut rest);
         }
         let Some(first) = lead.first_mut() else {
-            return Some(("nothing yet today".to_string(), String::new()));
+            return Some((TODAY_NOTHING_YET.to_string(), String::new()));
         };
         first.push_str(" today");
         Some((lead.join(JOINT), rest.join(JOINT)))
@@ -794,18 +987,7 @@ impl HarnessState {
             .iter()
             .map(|session| {
                 let tab = place_words(&session.place);
-                let shared = self.sessions.iter().any(|other| {
-                    other.local_id != session.local_id && other.title == session.title
-                });
-                let name = if shared {
-                    format!(
-                        "{}, {}",
-                        session.title,
-                        session.place.strip_prefix("in ").unwrap_or(&session.place)
-                    )
-                } else {
-                    session.title.clone()
-                };
+                let name = self.row_name(session);
                 let today = days.and_then(|days| days.get(&session.sid)).cloned();
                 let how = match session.view {
                     AutopilotView::MasterOff => "harness off in Settings".to_string(),
@@ -853,6 +1035,77 @@ impl HarnessState {
             .collect()
     }
 
+    /// SESSIONS' `Every session` ROW (design §11.5.1): where SESSIONS lists
+    /// two sessions or more — whatever the switches say, so a switch pressed
+    /// in SUPERVISION, under it, never adds or takes away a row and moves
+    /// itself under the pointer — how they stand and what each press would
+    /// move, by the press's own rule ([`EveryPress::moves`]). Pure.
+    #[must_use]
+    pub(crate) fn every_row(&self) -> Option<EveryRow> {
+        use crate::autopilot_timers::TimerChoice;
+        if self.sessions.len() < 2 {
+            return None;
+        }
+        let count = |press: EveryPress| self.sessions.iter().filter(|s| press.moves(s)).count();
+        let mode = |s: &HarnessSession| s.view.mode();
+        let steered = || self.sessions.iter().filter(|s| s.default.is_some());
+        let cruising = self
+            .sessions
+            .iter()
+            .filter(|s| mode(s) == Some(Autopilot::Cruise));
+        let first = self.sessions.first().map(|s| s.program);
+        let follows = || steered().filter(|s| EveryPress::Follow.moves(s));
+        // Where it steers none, why, in the rows' own words for the view they
+        // share (`harness off in Settings`, an agent's switch by name).
+        let views = self
+            .sessions
+            .first()
+            .map(|s| s.view)
+            .filter(|view| self.sessions.iter().all(|s| s.view == *view));
+        let why = match views {
+            Some(AutopilotView::MasterOff) => "harness off in Settings",
+            Some(AutopilotView::Unhosted) => "no harness here",
+            Some(AutopilotView::AgentOff(agent)) => crate::autopilot::agent_switch_off(agent),
+            _ if self
+                .sessions
+                .iter()
+                .all(|s| matches!(s.view, AutopilotView::AgentOff(_))) =>
+            {
+                "each agent's own switch is off"
+            }
+            _ => "the harness steers none of them",
+        };
+        Some(EveryRow {
+            sessions: self.sessions.len(),
+            steered: steered().count(),
+            cruising: cruising.clone().count(),
+            timed: cruising.filter(|s| s.armed_at_ms.is_some()).count(),
+            landing: self
+                .sessions
+                .iter()
+                .filter(|s| mode(s) == Some(Autopilot::Land))
+                .count(),
+            off: self.sessions.iter().filter(|s| !s.view.carries()).count(),
+            pinned_off: steered().filter(|s| s.word == Some(Autopilot::Off)).count(),
+            cruise: count(EveryPress::Mode(Autopilot::Cruise)),
+            land: count(EveryPress::Mode(Autopilot::Land)),
+            timer: count(EveryPress::Timer(TimerChoice::In(60))),
+            follow: count(EveryPress::Follow),
+            cruise_landing: steered()
+                .filter(|s| mode(s) == Some(Autopilot::Land))
+                .count(),
+            cruise_timed: steered()
+                .filter(|s| mode(s) == Some(Autopilot::Cruise) && s.armed_at_ms.is_some())
+                .count(),
+            follow_timed: follows().filter(|s| s.armed_at_ms.is_some()).count(),
+            follow_to_off: follows()
+                .filter(|s| s.default == Some(Autopilot::Off))
+                .count(),
+            why,
+            product: first.filter(|p| self.sessions.iter().all(|s| s.program == *p)),
+        })
+    }
+
     /// The WHAT THE HARNESS DID card's facts: each count today and over 7
     /// days, the person's wait as hours and minutes, a window the ledgers'
     /// cut may have shortened, when the reading was taken, and — where a
@@ -892,35 +1145,33 @@ impl HarnessState {
                     duration_words(w)
                 )
             };
-            // A press full power made that the safe rules could not prove
-            // is said after the window it fell in, only where there was one.
-            let unproven = |n: u64| {
-                if n == 0 {
-                    String::new()
-                } else {
-                    format!(" \u{b7} {n} unproven")
-                }
-            };
-            rows.extend([
-                row(
-                    "Approved",
+            rows.push(row(APPROVED.label, both(today.approved, week.approved)));
+            // Of those, the presses full power made that no safe rule proved:
+            // the row under Approved, labelled as part of it, both windows,
+            // only where the week had one (the week holds today), so it is
+            // said once — in DECIDED FOR YOU's words.
+            if week.unproven > 0 {
+                rows.push(row(
+                    UNPROVEN_OF_APPROVED,
                     format!(
-                        "{} today{} \u{b7} {} in 7 days{}",
-                        today.approved,
-                        unproven(today.unproven),
-                        week.approved,
-                        unproven(week.unproven)
+                        "{NO_SAFE_RULE_PROVED} {}",
+                        both(today.unproven, week.unproven)
                     ),
-                ),
-                row("Declined", both(today.declined, week.declined)),
-                row("Answered", both(today.answered, week.answered)),
-                row("Continued", both(today.continued, week.continued)),
+                ));
+            }
+            rows.extend([
+                row(DECLINED.label, both(today.declined, week.declined)),
+                row(ANSWERED.label, both(today.answered, week.answered)),
+                row(KEPT_GOING.label, both(today.continued, week.continued)),
                 // Land's prompts typed, never the landings they led to.
-                row("Land prompts", both(today.land_prompts, week.land_prompts)),
-                row("Resumed", both(today.resumed, week.resumed)),
-                row("Relaunched", both(today.relaunched, week.relaunched)),
-                row("Upgraded", both(today.upgraded, week.upgraded)),
-                row("Escalated", both(today.escalated, week.escalated)),
+                row(
+                    LAND_PROMPTS.label,
+                    both(today.land_prompts, week.land_prompts),
+                ),
+                row(RESUMED.label, both(today.resumed, week.resumed)),
+                row(RELAUNCHED.label, both(today.relaunched, week.relaunched)),
+                row(UPGRADED.label, both(today.upgraded, week.upgraded)),
+                row(NEEDED_YOU.label, both(today.escalated, week.escalated)),
                 row(
                     "Waited on you",
                     waited(today.human_wait_ms, week.human_wait_ms),
@@ -977,6 +1228,22 @@ pub(crate) fn clock_words(at_ms: i64, offset_s: Option<i64>) -> String {
 /// The joint today's words are cut at where a line does not fit whole.
 pub(crate) const JOINT: &str = " \u{b7} ";
 
+/// STATUS's today line on a day the harness has not acted
+/// ([`HarnessState::today_lines`]): a note, no count.
+pub(crate) const TODAY_NOTHING_YET: &str = "nothing yet today";
+
+/// STATUS's today line before the first reading: a note, no count.
+pub(crate) const TODAY_READING: &str = "reading\u{2026}";
+
+/// Whether STATUS's today `line` counts (`37 approved today · …`), as
+/// against one of its notes ([`TODAY_NOTHING_YET`], [`TODAY_READING`]):
+/// only a line of counts is drawn in Hero type (the post-check of wave 1,
+/// owner-eye-7).
+#[must_use]
+pub(crate) fn today_counts(line: &str) -> bool {
+    line != TODAY_NOTHING_YET && line != TODAY_READING
+}
+
 /// The families of acts a day says, in the order it says them: approved,
 /// kept going, answered, resumed, land prompts, declined, relaunched,
 /// upgraded.
@@ -1015,26 +1282,116 @@ impl Families {
     }
 }
 
+/// ONE NAME FOR EACH COUNT (the post-check of wave 1, owner-eye-6): the
+/// words a count is said in on Settings ▸ Harness — STATUS's today line,
+/// each SESSIONS row's day line, and its label in WHAT THE HARNESS DID — so
+/// a count is named one way on the whole page, and, where the chip lights
+/// the act, in the chip's own word (`↻ kept going`, `✓ approved`:
+/// [`aterm_agent::harness::acts::Act::word`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CountWords {
+    /// WHAT THE HARNESS DID's label (`Kept going`): the line's word for
+    /// more than one, its first letter upper case.
+    pub(crate) label: &'static str,
+    /// A line's word after a count of one (`1 land prompt`).
+    pub(crate) one: &'static str,
+    /// After any other count (`2 land prompts`).
+    pub(crate) many: &'static str,
+}
+
+impl CountWords {
+    /// A count the chip lights as an act: its word, whatever the count.
+    const fn act(label: &'static str, act: aterm_agent::harness::acts::Act) -> Self {
+        Self {
+            label,
+            one: act.word(),
+            many: act.word(),
+        }
+    }
+
+    /// `n` in a line's words: `1 kept going`, `2 land prompts`.
+    #[must_use]
+    pub(crate) fn count(self, n: u64) -> String {
+        format!("{n} {}", if n == 1 { self.one } else { self.many })
+    }
+}
+
+/// Boxes the harness approved.
+pub(crate) const APPROVED: CountWords =
+    CountWords::act("Approved", aterm_agent::harness::acts::Act::Approved);
+/// THE PRESSES NO SAFE RULE PROVED (the ledger's `unproven:` approvals, the
+/// review of v3/polish-page's fixes, finding 4): of the approved, those full
+/// power made where no safe rule proved the box. One wording wherever the
+/// page says them — DECIDED FOR YOU's sentence for one (`…; no safe rule
+/// proved it`) and WHAT THE HARNESS DID's row under Approved, labelled as a
+/// part of it ([`UNPROVEN_OF_APPROVED`]: `of those  no safe rule proved 40
+/// today · 45 in 7 days`), so no one adds it to the approved. Never
+/// "unproven", the ledger's word.
+pub(crate) const NO_SAFE_RULE_PROVED: &str = "no safe rule proved";
+/// WHAT THE HARNESS DID's label for [`NO_SAFE_RULE_PROVED`]'s row: a part of
+/// the Approved row over it.
+pub(crate) const UNPROVEN_OF_APPROVED: &str = "of those";
+/// Turns the harness continued (`Counter::Continued`).
+pub(crate) const KEPT_GOING: CountWords =
+    CountWords::act("Kept going", aterm_agent::harness::acts::Act::Continued);
+/// Questions the harness answered.
+pub(crate) const ANSWERED: CountWords =
+    CountWords::act("Answered", aterm_agent::harness::acts::Act::Answered);
+/// Work carried past a wall.
+pub(crate) const RESUMED: CountWords =
+    CountWords::act("Resumed", aterm_agent::harness::acts::Act::Resumed);
+/// Land's instruction and its nudges typed: prompts, never landings (the
+/// chip's `⤓ landing` and `⤓ nudged` light the same rows).
+pub(crate) const LAND_PROMPTS: CountWords = CountWords {
+    label: "Land prompts",
+    one: "land prompt",
+    many: "land prompts",
+};
+/// Boxes the harness declined.
+pub(crate) const DECLINED: CountWords =
+    CountWords::act("Declined", aterm_agent::harness::acts::Act::Declined);
+/// Agents the harness started again.
+pub(crate) const RELAUNCHED: CountWords = CountWords {
+    label: "Relaunched",
+    one: "relaunched",
+    many: "relaunched",
+};
+/// Agents the harness upgraded.
+pub(crate) const UPGRADED: CountWords = CountWords {
+    label: "Upgraded",
+    one: "upgraded",
+    many: "upgraded",
+};
+/// Times the harness stopped and asked the person (its escalations): a day
+/// line says how often (`needed you once`).
+pub(crate) const NEEDED_YOU: CountWords = CountWords {
+    label: "Needed you",
+    one: "needed you",
+    many: "needed you",
+};
+
+/// [`Families`]' words, in its order.
+pub(crate) const FAMILY_WORDS: [CountWords; 8] = [
+    APPROVED,
+    KEPT_GOING,
+    ANSWERED,
+    RESUMED,
+    LAND_PROMPTS,
+    DECLINED,
+    RELAUNCHED,
+    UPGRADED,
+];
+
 /// The nonzero families, each in its words (`31 approved`, `1 kept going`,
 /// `1 land prompt`), in [`Families`]' order.
 #[must_use]
 pub(crate) fn families(counts: Families) -> Vec<String> {
-    let words: [(&str, &str); 8] = [
-        ("approved", "approved"),
-        ("kept going", "kept going"),
-        ("answered", "answered"),
-        ("resumed", "resumed"),
-        ("land prompt", "land prompts"),
-        ("declined", "declined"),
-        ("relaunched", "relaunched"),
-        ("upgraded", "upgraded"),
-    ];
     counts
         .0
         .iter()
-        .zip(words)
+        .zip(FAMILY_WORDS)
         .filter(|(n, _)| **n > 0)
-        .map(|(n, (one, many))| format!("{n} {}", if *n == 1 { one } else { many }))
+        .map(|(n, words)| words.count(*n))
         .collect()
 }
 
@@ -1068,7 +1425,7 @@ pub(crate) fn day_line(
             2 => "twice".to_string(),
             n => format!("{n} times"),
         };
-        let mut need = format!("needed you {times}");
+        let mut need = format!("{} {times}", NEEDED_YOU.one);
         if tally.human_wait_ms > 0 {
             need.push_str(&format!(", {}", duration_words(tally.human_wait_ms)));
         }
@@ -1082,70 +1439,6 @@ pub(crate) fn day_line(
         parts.push("partial".to_string());
     }
     (!parts.is_empty()).then(|| format!("today: {}", parts.join(JOINT)))
-}
-
-/// The EFFECT OF EACH AUTOPILOT card's facts: the waiting share under each Autopilot
-/// state — Cruise, Land, Off, each "not measured yet" until it has time — and
-/// the unsupervised time where there is any; then, once both have time,
-/// Cruise's share beside Off's. Land is never in that sentence: a landing
-/// ends waiting by design, so its share says how a landing went, not what
-/// the harness changed. Never a "time saved": nothing measures one.
-///
-/// Once any state has time, a last row says what every share counts: an
-/// agent that has FINISHED waits too — under Cruise after its final
-/// statement, when the harness types nothing more; under Off when its
-/// person has nothing more for it — and that wait is charged to its state
-/// like any other. The window does hold each supervised session's task face
-/// (§9.4: the loop tells it, `status task=` prints it and, since §10.2, the
-/// chip wears `✓ done` under Cruise as under Land), but this book is split
-/// by the published agent word alone, which is `idle` either way — so the
-/// card says it rather than leaving it out, until the book splits by the
-/// face (§10.5).
-#[must_use]
-pub(crate) fn ab_rows(ab: AbTotals) -> Vec<(String, String)> {
-    let arm = |label: &str, totals: AbArmTotals| {
-        let measured = totals.measured_ms();
-        let words = if measured == 0 {
-            "not measured yet".to_string()
-        } else {
-            format!(
-                "waited for input {} of the time \u{b7} {} measured",
-                share_words(totals.waiting_ms, measured),
-                duration_words(measured)
-            )
-        };
-        (label.to_string(), words)
-    };
-    let mut rows = vec![
-        arm("Cruise", ab.cruise),
-        arm("Land", ab.land),
-        arm("Off", ab.off),
-    ];
-    if ab.unsupervised.measured_ms() > 0 {
-        rows.push(arm("Unsupervised", ab.unsupervised));
-    }
-    let (cruise, off) = (ab.cruise.measured_ms(), ab.off.measured_ms());
-    if cruise > 0 && off > 0 {
-        rows.push((
-            "This run".to_string(),
-            format!(
-                "agents waited for input {} of the time on Cruise vs {} with the harness off",
-                share_words(ab.cruise.waiting_ms, cruise),
-                share_words(ab.off.waiting_ms, off)
-            ),
-        ));
-    }
-    let measured = [ab.cruise, ab.land, ab.off, ab.unsupervised]
-        .iter()
-        .any(|totals| totals.measured_ms() > 0);
-    if measured {
-        rows.push((
-            "Finished".to_string(),
-            "an agent done with its work still waits for input; each share counts that wait"
-                .to_string(),
-        ));
-    }
-    rows
 }
 
 /// One key of the effective table as the card states it: the key, then its
@@ -1192,6 +1485,91 @@ pub(crate) fn duration_words(ms: u64) -> String {
     }
 }
 
+/// A DECISION IN ONE SENTENCE (§10.4.1), its session named `name`, the
+/// agent's words in quotes:
+///
+/// * a dialog: `<name> asked “<question>” → the harness chose <option>:
+///   <why>`;
+/// * a prose question: `<name> asked “<question>” → <the answer>` (`said`
+///   where the words are the agent's last row at the turn's end);
+/// * an unproven press: `<name>: pressed Yes on <command head> ×N under
+///   Approve permission boxes: All; no safe rule proved it` — or, where full
+///   power chose another of the box's options, `chose “<option>” on <command
+///   head>` — the switch that pressed it named, never "unsafe";
+/// * a refusal: `<name>: declined <command head>: <the reason it gave>`;
+/// * a limit reset kept: `<name>: kept its limit reset unspent: <why>`.
+///
+/// Pure.
+#[must_use]
+pub(crate) fn decision_sentence(
+    decision: &aterm_agent::harness::stats::Decision,
+    name: &str,
+) -> String {
+    use aterm_agent::harness::stats::DecisionKind;
+    let quoted = |text: &str| format!("\u{201c}{text}\u{201d}");
+    let boxed = |head: &str| {
+        if head.is_empty() {
+            "a box".to_string()
+        } else {
+            head.to_string()
+        }
+    };
+    match decision.kind {
+        DecisionKind::Chose => {
+            let asked = if decision.asked.is_empty() {
+                "asked a question".to_string()
+            } else {
+                format!("asked {}", quoted(&decision.asked))
+            };
+            let chose = if decision.did.is_empty() {
+                "an answer"
+            } else {
+                &decision.did
+            };
+            let why = decision
+                .why
+                .as_deref()
+                .map_or_else(String::new, |why| format!(": {why}"));
+            format!("{name} {asked} \u{2192} the harness chose {chose}{why}")
+        }
+        DecisionKind::Answered => {
+            let asked = match (decision.asked.is_empty(), decision.said) {
+                (true, _) => "asked a question in prose".to_string(),
+                (false, true) => format!("said {}", quoted(&decision.asked)),
+                (false, false) => format!("asked {}", quoted(&decision.asked)),
+            };
+            format!("{name} {asked} \u{2192} {}", decision.did)
+        }
+        DecisionKind::Unproven => {
+            let times = if decision.times > 1 {
+                format!(" \u{d7}{}", decision.times)
+            } else {
+                String::new()
+            };
+            let switch = decision
+                .why
+                .as_deref()
+                .unwrap_or("Approve permission boxes: All");
+            let pressed = match &*decision.did {
+                "" | "Yes" => "pressed Yes".to_string(),
+                option => format!("chose {}", quoted(option)),
+            };
+            format!(
+                "{name}: {pressed} on {}{times} under {switch}; {NO_SAFE_RULE_PROVED} it",
+                boxed(&decision.asked)
+            )
+        }
+        DecisionKind::Declined => match decision.why.as_deref() {
+            Some(why) => format!("{name}: declined {}: {why}", boxed(&decision.asked)),
+            None => format!("{name}: declined {}", boxed(&decision.asked)),
+        },
+        DecisionKind::KeptReset => match decision.why.as_deref() {
+            Some(why) => format!("{name}: kept its limit reset unspent: {why}"),
+            None => format!("{name}: kept its limit reset unspent"),
+        },
+    }
+}
+
 /// A tab's place as a row leads with it: `in tab 2` → `Tab 2`, `in window 1,
 /// tab 2` → `Window 1, tab 2`, and a tab no window shows `Its tab`.
 fn place_words(place: &str) -> String {
@@ -1214,12 +1592,17 @@ pub(crate) struct HarnessProjection {
     pub(crate) today: Option<(String, String)>,
     /// The SESSIONS card's rows (empty: no supervisable agent session).
     pub(crate) sessions: Vec<HarnessSessionRow>,
+    /// The `Every session` row after them ([`HarnessState::every_row`]):
+    /// `None` where SESSIONS lists fewer than two sessions.
+    pub(crate) every: Option<EveryRow>,
     /// A ledgers' reading is running (Refresh is busy).
     pub(crate) collecting: bool,
     /// The WHAT THE HARNESS DID card's facts.
     pub(crate) did_rows: Vec<(String, String)>,
     /// The EFFECT OF EACH AUTOPILOT card's facts.
     pub(crate) ab_rows: Vec<(String, String)>,
+    /// What that card opens with, where it leads ([`crate::harness_ab::ab_lead`]).
+    pub(crate) ab_lead: Option<crate::harness_ab::AbLead>,
     /// The SETTINGS IN ATERM.TOML card's facts: each key, and its value with
     /// `default` or `yours` — the card's list with its disclosure open.
     pub(crate) config_rows: Vec<(String, String)>,
@@ -1231,6 +1614,13 @@ pub(crate) struct HarnessProjection {
     /// What Settings ▸ Harness ▸ AI CLIs renders
     /// ([`crate::ai_screen::AiProjection`]).
     pub(crate) ai: crate::ai_screen::AiProjection,
+    /// What Settings ▸ Harness ▸ Tab Control renders ([`TabControlProjection`]).
+    pub(crate) tabs: TabControlProjection,
+    /// DECIDED FOR YOU's rows, newest first ([`HarnessState::decided_rows`]):
+    /// empty on a day with no decision, and the card is not drawn.
+    pub(crate) decided: Vec<DecidedRow>,
+    /// Today's decisions, kept or not ([`HarnessState::decided_total`]).
+    pub(crate) decided_total: u64,
 }
 
 /// One SESSIONS row: what it is and its three-way control.
@@ -1289,8 +1679,10 @@ impl HarnessSessionRow {
     /// `lands at 18:00` (`lands Sat 16:00` on another day), `landed 17:42`,
     /// `done 17:42` — under Cruise as under Land, with ` · lands 18:00` where
     /// a timer is armed over the done task — `quiet: no done reply after 2
-    /// nudges`, `quiet: a person's own exchange`, `held by /goal`, else the
-    /// trail's newest act (`last: ✓ approved 14:05`). Clock times only, never
+    /// nudges`, `quiet: a person's own exchange`, `held by /goal`; else the
+    /// loop's pause after short turns (`pausing until 18:41 (3 short turns
+    /// in a row)`, §10.5.1); else the trail's newest act (`last: ✓ approved
+    /// 14:05`). Clock times only, never
     /// an age (§9.0), each from another local day than the publish's
     /// ([`Self::today`]) with its weekday (`landed Fri 18:11`, `last: ✓
     /// approved Fri 17:58`, §10.2.3 item 3). `None` at rest — v1's row.
@@ -1342,16 +1734,17 @@ impl HarnessSessionRow {
             | ChipFace::AgentOff(_)
             | ChipFace::Unhosted => None,
         };
-        line.or_else(|| {
-            glass.last.map(|(act, stamp)| {
-                format!(
-                    "last: {} {} {}",
-                    act.glyph(),
-                    act.word(),
-                    stamp.words(today)
-                )
+        line.or_else(|| glass.pause.map(|p| p.state_words(today)))
+            .or_else(|| {
+                glass.last.map(|(act, stamp)| {
+                    format!(
+                        "last: {} {} {}",
+                        act.glyph(),
+                        act.word(),
+                        stamp.words(today)
+                    )
+                })
             })
-        })
     }
 }
 
@@ -1443,6 +1836,379 @@ pub(crate) fn hands_back(pressed: Autopilot, default: Autopilot) -> bool {
     pressed == default && AutopilotView::from_mode(default).carries()
 }
 
+/// THE PAGE'S ONE RULE FOR A MODE PRESS (design §11.5.3, item 3): the word a
+/// press of `pressed` writes under a default of `default` — `None`, the
+/// session's own word cleared, where the press hands the session back
+/// ([`hands_back`]), else `pressed`. A SESSIONS row's buttons
+/// ([`App::press_page_mode`]) and the `Every session` row
+/// ([`App::press_autopilot_every`]) both write it, so a bulk Land under a
+/// default of Land hands each session back as the row's Land does. The chip
+/// and the menu keep pinning. Pure.
+#[must_use]
+pub(crate) fn page_word(pressed: Autopilot, default: Autopilot) -> Option<Autopilot> {
+    (!hands_back(pressed, default)).then_some(pressed)
+}
+
+/// The `Every session` row's id in its keys: `harness/session/all/…`, under
+/// [`SESSION_ACTION_PREFIX`] on purpose, so the prefix's one Owner fence
+/// covers them, fail-closed (design §11.5.2). No session's local id reads as
+/// it ([`parse_autopilot_action`] parses a number).
+pub(crate) const EVERY_ID: &str = "all";
+
+/// A PRESS ON SESSIONS' `Every session` ROW (design §11.5.1): one choice for
+/// every session the harness can steer, each moved by [`Self::moves`] and
+/// written as [`Self::write`] says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EveryPress {
+    /// Cruise or Land. There is no bulk Off: the master switch, `Supervise
+    /// coding agents`, is one, and writes no session's word.
+    Mode(Autopilot),
+    /// A timed Cruise, `1 hour`, `2 hours`, `4 hours` or `at 18:00`, resolved ONCE at
+    /// the press, so every session it arms lands at one instant. There is no
+    /// bulk cancel: Cruise drops every timer.
+    Timer(crate::autopilot_timers::TimerChoice),
+    /// Follow the default: every session's own word cleared but a pinned
+    /// Off.
+    Follow,
+}
+
+impl EveryPress {
+    /// Every press the row draws, in its order: Cruise, Land, the Timer's
+    /// choices (`at` only with `[harness] land_at` set, the page's to say),
+    /// Follow the default.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 7] = {
+        use crate::autopilot_timers::TimerChoice;
+        [
+            Self::Mode(Autopilot::Cruise),
+            Self::Mode(Autopilot::Land),
+            Self::Timer(TimerChoice::In(60)),
+            Self::Timer(TimerChoice::In(120)),
+            Self::Timer(TimerChoice::In(240)),
+            Self::Timer(TimerChoice::At),
+            Self::Follow,
+        ]
+    };
+
+    /// Whether this press moves `session` (design §11.5.1's table), a
+    /// session the harness can steer ([`HarnessSession::default`]) by the
+    /// mode it runs under: Land moves every Cruise, timed or not; Cruise
+    /// moves every Land and every timed Cruise (a hand write drops the
+    /// timer); a timer moves every Cruise; Follow moves every own word but
+    /// Off. So no press ever puts the harness's hands on a session whose
+    /// mode is Off, its own word's or the default's, and none moves a
+    /// session its agent's own switch or the master switch takes the
+    /// harness off. Pure.
+    #[must_use]
+    pub(crate) fn moves(self, session: &HarnessSession) -> bool {
+        use crate::autopilot_timers::TimerChoice;
+        if session.default.is_none() {
+            return false;
+        }
+        let mode = session.view.mode();
+        match self {
+            Self::Mode(Autopilot::Land) | Self::Timer(TimerChoice::In(_) | TimerChoice::At) => {
+                mode == Some(Autopilot::Cruise)
+            }
+            Self::Mode(Autopilot::Cruise) => {
+                mode == Some(Autopilot::Land)
+                    || (mode == Some(Autopilot::Cruise) && session.armed_at_ms.is_some())
+            }
+            Self::Mode(Autopilot::Off) | Self::Timer(TimerChoice::Cancel) => false,
+            Self::Follow => matches!(session.word, Some(Autopilot::Cruise | Autopilot::Land)),
+        }
+    }
+
+    /// The pair this press writes on a session it moves, under the session's
+    /// `default`, `(word, land_at)`: a mode by the page's one rule
+    /// ([`page_word`]), with no timer; a timed Cruise at `at`, the instant
+    /// resolved once for the press; Follow, no word. Pure.
+    #[must_use]
+    pub(crate) fn write(
+        self,
+        default: Autopilot,
+        at: Option<i64>,
+    ) -> (Option<Autopilot>, Option<i64>) {
+        match self {
+            Self::Mode(mode) => (page_word(mode, default), None),
+            Self::Timer(_) => (Some(Autopilot::Cruise), at),
+            Self::Follow => (None, None),
+        }
+    }
+}
+
+/// An `Every session` button's action and key (design §11.5.2):
+/// `harness/session/all/autopilot/<cruise|land>`,
+/// `harness/session/all/land-in/<min>`, `harness/session/all/land-at` and
+/// `harness/session/all/follow`. A press the row never draws (Off, the
+/// cancel) is minted as its row's spelling would be, and read back as no
+/// press ([`parse_every_action`]).
+#[must_use]
+pub(crate) fn every_action(press: EveryPress) -> String {
+    use crate::autopilot_timers::TimerChoice;
+    let every = format!("{SESSION_ACTION_PREFIX}{EVERY_ID}");
+    match press {
+        EveryPress::Mode(mode) => format!("{every}/autopilot/{}", mode.word()),
+        EveryPress::Timer(TimerChoice::In(minutes)) => format!("{every}/land-in/{minutes}"),
+        EveryPress::Timer(TimerChoice::At) => format!("{every}/land-at"),
+        EveryPress::Timer(TimerChoice::Cancel) => format!("{every}/land-cancel"),
+        EveryPress::Follow => format!("{every}/follow"),
+    }
+}
+
+/// [`every_action`] read back: the press, or `None` for any other action —
+/// a session's own, an Off (no bulk Off), a cancel (no bulk cancel), a
+/// duration the page does not offer. [`parse_autopilot_action`] refuses
+/// `all` as an id, so these keys are read here.
+#[must_use]
+pub(crate) fn parse_every_action(action: &str) -> Option<EveryPress> {
+    use crate::autopilot_timers::TimerChoice;
+    let rest = action
+        .strip_prefix(SESSION_ACTION_PREFIX)?
+        .strip_prefix(EVERY_ID)?
+        .strip_prefix('/')?;
+    match rest {
+        "follow" => Some(EveryPress::Follow),
+        "land-at" => Some(EveryPress::Timer(TimerChoice::At)),
+        _ => {
+            if let Some(word) = rest.strip_prefix("autopilot/") {
+                return match Autopilot::parse(word)? {
+                    Autopilot::Off => None,
+                    mode if mode.word() == word => Some(EveryPress::Mode(mode)),
+                    _ => None,
+                };
+            }
+            let minutes: u32 = rest.strip_prefix("land-in/")?.parse().ok()?;
+            crate::autopilot_menu::LAND_IN_MINUTES
+                .contains(&minutes)
+                .then_some(EveryPress::Timer(TimerChoice::In(minutes)))
+        }
+    }
+}
+
+/// SESSIONS' `Every session` ROW as the page draws it (design §11.5.1): how
+/// the sessions SESSIONS lists stand, and how many each press moves, read by
+/// [`EveryPress::moves`] — the rule the press itself runs
+/// ([`App::press_autopilot_every`]), so the row never counts what its press
+/// would not write. Built only where SESSIONS lists two sessions or more
+/// ([`HarnessState::every_row`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EveryRow {
+    /// How many sessions SESSIONS lists.
+    pub(crate) sessions: usize,
+    /// Of them, how many the harness can steer now: the row's buttons act
+    /// only where one can.
+    pub(crate) steered: usize,
+    /// Running under Cruise, timed or not.
+    pub(crate) cruising: usize,
+    /// Of those, with a timer armed.
+    pub(crate) timed: usize,
+    /// Running under Land.
+    pub(crate) landing: usize,
+    /// Under no carrying mode: Off by its own word or the default's, or
+    /// under a switch that takes the harness off it.
+    pub(crate) off: usize,
+    /// Of the steered, Off by their own word: what Follow keeps.
+    pub(crate) pinned_off: usize,
+    /// How many each press moves: Cruise, Land, a timer, Follow.
+    pub(crate) cruise: usize,
+    pub(crate) land: usize,
+    pub(crate) timer: usize,
+    pub(crate) follow: usize,
+    /// Of Cruise's, how many are landing and how many timed — the timed
+    /// ones are the timers Land cancels, as it moves every Cruise.
+    pub(crate) cruise_landing: usize,
+    pub(crate) cruise_timed: usize,
+    /// Of Follow's, how many have a timer it cancels, and how many it hands
+    /// to a default of Off (the window's one default, so none or all): the
+    /// harness lets go of them.
+    pub(crate) follow_timed: usize,
+    pub(crate) follow_to_off: usize,
+    /// Where it steers none of them, why: the rows' own words for the view
+    /// they share (`harness off in Settings`).
+    pub(crate) why: &'static str,
+    /// The listed sessions' agent, by product, where they share one: the
+    /// words for its own switch off.
+    pub(crate) product: Option<&'static str>,
+}
+
+/// `1 session`, `3 sessions`.
+pub(crate) fn sessions_words(n: usize) -> String {
+    if n == 1 {
+        "1 session".to_string()
+    } else {
+        format!("{n} sessions")
+    }
+}
+
+impl EveryRow {
+    /// How many `press` moves.
+    #[must_use]
+    pub(crate) fn moved(&self, press: EveryPress) -> usize {
+        use crate::autopilot_timers::TimerChoice;
+        match press {
+            EveryPress::Mode(Autopilot::Cruise) => self.cruise,
+            EveryPress::Mode(Autopilot::Land) => self.land,
+            EveryPress::Timer(TimerChoice::In(_) | TimerChoice::At) => self.timer,
+            EveryPress::Follow => self.follow,
+            EveryPress::Mode(Autopilot::Off) | EveryPress::Timer(TimerChoice::Cancel) => 0,
+        }
+    }
+
+    /// What is there now, beside the buttons: `5 sessions: 3 cruising, 1
+    /// landing, 1 off` (`3 cruising (2 timed)` where timers are armed);
+    /// where the harness steers none of them, why, in the rows' own short
+    /// words (`3 sessions · harness off in Settings`), which fit where a
+    /// row's detail fits.
+    #[must_use]
+    pub(crate) fn line(&self) -> String {
+        let all = sessions_words(self.sessions);
+        if self.steered == 0 {
+            return format!("{all} \u{b7} {}", self.why);
+        }
+        let mut parts = Vec::new();
+        if self.cruising > 0 {
+            parts.push(if self.timed > 0 {
+                format!("{} cruising ({} timed)", self.cruising, self.timed)
+            } else {
+                format!("{} cruising", self.cruising)
+            });
+        }
+        if self.landing > 0 {
+            parts.push(format!("{} landing", self.landing));
+        }
+        if self.off > 0 {
+            parts.push(format!("{} off", self.off));
+        }
+        format!("{all}: {}", parts.join(", "))
+    }
+
+    /// `; the 1 off stays off`, `; the 2 off stay off`, or nothing.
+    fn offs_stay(&self, off: usize) -> String {
+        match off {
+            0 => String::new(),
+            1 => "; the 1 off stays off".to_string(),
+            n => format!("; the {n} off stay off"),
+        }
+    }
+
+    /// The timers a press cancels, for its words: Land's (every timed
+    /// Cruise it lands) and Follow's (every timed own Cruise it clears).
+    /// Cruise drops timers too, but its words count them as what it moves.
+    #[must_use]
+    pub(crate) fn cancels(&self, press: EveryPress) -> usize {
+        match press {
+            EveryPress::Mode(Autopilot::Land) => self.cruise_timed,
+            EveryPress::Follow => self.follow_timed,
+            EveryPress::Mode(_) | EveryPress::Timer(_) => 0,
+        }
+    }
+
+    /// What a button's spoken name adds after its count: the timers it
+    /// cancels (`, cancelling 2 timers`) and, for Follow under a default of
+    /// Off, `, the default is Off`.
+    #[must_use]
+    pub(crate) fn spoken_tail(&self, press: EveryPress) -> String {
+        let mut tail = String::new();
+        if press == EveryPress::Follow && self.follow_to_off > 0 {
+            tail.push_str(", the default is Off");
+        }
+        match self.cancels(press) {
+            0 => {}
+            1 => tail.push_str(", cancelling 1 timer"),
+            n => tail.push_str(&format!(", cancelling {n} timers")),
+        }
+        tail
+    }
+
+    /// The timers `press` cancels, in its words: Land's ` and cancel 2
+    /// timers`, Follow's `, 2 timers cancelled`; or nothing.
+    fn cancelling(&self, press: EveryPress) -> String {
+        let timers = match self.cancels(press) {
+            0 => return String::new(),
+            1 => "1 timer".to_string(),
+            n => format!("{n} timers"),
+        };
+        match press {
+            EveryPress::Follow => format!(", {timers} cancelled"),
+            EveryPress::Mode(_) | EveryPress::Timer(_) => format!(" and cancel {timers}"),
+        }
+    }
+
+    /// What a press does, for its button's description (design §11.5.1):
+    /// the count it moves, the timers it cancels and what stays — `Land 3
+    /// sessions and cancel 2 timers; the 1 off stays off`, `Cruise 4
+    /// sessions: 2 landing, 2 timed` — where Follow hands sessions to a
+    /// default of Off, that the harness lets go of them; or, where it moves
+    /// nothing, that it writes nothing.
+    #[must_use]
+    pub(crate) fn description(&self, press: EveryPress) -> String {
+        use crate::autopilot_timers::TimerChoice;
+        let n = self.moved(press);
+        let stays = self.offs_stay(self.off);
+        let cancel = self.cancelling(press);
+        match press {
+            EveryPress::Mode(Autopilot::Land) if n == 0 => {
+                "No session is cruising, so this changes nothing".to_string()
+            }
+            EveryPress::Mode(Autopilot::Land) => {
+                format!("Land {}{cancel}{stays}", sessions_words(n))
+            }
+            EveryPress::Mode(Autopilot::Cruise) if n == 0 => {
+                "No session is landing or timed, so this changes nothing".to_string()
+            }
+            EveryPress::Mode(Autopilot::Cruise) => {
+                let mut how = Vec::new();
+                if self.cruise_landing > 0 {
+                    how.push(format!("{} landing", self.cruise_landing));
+                }
+                if self.cruise_timed > 0 {
+                    how.push(format!("{} timed", self.cruise_timed));
+                }
+                format!("Cruise {}: {}{stays}", sessions_words(n), how.join(", "))
+            }
+            EveryPress::Timer(TimerChoice::In(_) | TimerChoice::At) if n == 0 => {
+                "No session is cruising, so this changes nothing".to_string()
+            }
+            EveryPress::Timer(TimerChoice::In(_) | TimerChoice::At) if n == 1 => {
+                format!("Time 1 session to land{stays}")
+            }
+            EveryPress::Timer(TimerChoice::In(_) | TimerChoice::At) => {
+                format!("Time {n} sessions to land together{stays}")
+            }
+            EveryPress::Follow => {
+                let kept = match self.pinned_off {
+                    0 => String::new(),
+                    1 => "; the 1 turned off stays off".to_string(),
+                    p => format!("; the {p} turned off stay off"),
+                };
+                let follow = if n == 1 { "follows" } else { "follow" };
+                if n == 0 {
+                    format!("Every session follows [harness] autopilot already{kept}")
+                } else if self.follow_to_off > 0 {
+                    // Configuration only ever takes power away (§11.5.4): under
+                    // a default of Off (the window's one default), following
+                    // it lets go of them.
+                    let them = if n == 1 { "it" } else { "them" };
+                    format!(
+                        "{} {follow} [harness] autopilot, which is Off: the harness lets go \
+                         of {them}{cancel}{kept}",
+                        sessions_words(n)
+                    )
+                } else {
+                    format!(
+                        "{} {follow} [harness] autopilot again{cancel}{kept}",
+                        sessions_words(n)
+                    )
+                }
+            }
+            EveryPress::Mode(Autopilot::Off) | EveryPress::Timer(TimerChoice::Cancel) => {
+                String::new()
+            }
+        }
+    }
+}
+
 /// A session's name on Settings ▸ Harness: its tab's own name, `resolved`
 /// as the tab strip resolves it (the person's title, else the terminal's
 /// live one, else its folder: `app_tabs::resolved_terminal_title_rung`),
@@ -1472,13 +2238,95 @@ fn names_program(title: &str, program: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 impl App {
-    /// THE A/B TOTALS for this aterm run (§4 item 5): each arm's busy and
-    /// waiting time, the open stretches counted to now.
+    /// THE A/B BOOK'S WEEK (§10.5.3 B, C.4): today and the six days before,
+    /// the open stretches counted to now, with the other processes' days of
+    /// the last reading ([`HarnessStatsReport::ab_others`]) added, the
+    /// local clock and day the earliest began ([`AbWeek::since`], one zone
+    /// read: a publish's), and the publish's own clock, the instant the
+    /// numbers stop at ([`AbWeek::until`], §11.6.3 item 3: one wall read, so
+    /// a page republished past midnight says the new day's time).
     #[must_use]
-    pub(crate) fn harness_ab(&self) -> AbTotals {
-        self.harness_screen
+    pub(crate) fn harness_ab(&self) -> AbWeek {
+        let others = self
+            .harness_screen
+            .stats
+            .report
+            .as_ref()
+            .map_or(&[][..], |report| report.ab_others.as_slice());
+        let mut week = self
+            .harness_screen
             .ab
-            .totals_at(crate::turn_ledger::now_ms())
+            .week_at(crate::turn_ledger::now_ms(), others);
+        week.since = week
+            .first
+            .and_then(|(_, unix_ms)| crate::harness_glass::Stamp::at(unix_ms.div_euclid(1000)));
+        week.until =
+            crate::harness_glass::Stamp::at(crate::autopilot_timers::wall_ms().div_euclid(1000));
+        week
+    }
+
+    /// What session `local_id`'s glass says of why it may sit at its
+    /// prompt ([`AbCause::of`]): whether its task's face says finished
+    /// (`done`, `landed`) and whether the harness's pause stands. Read from
+    /// the glass, no lock.
+    #[must_use]
+    pub(crate) fn harness_ab_glass(&self, local_id: u64) -> (bool, bool) {
+        use aterm_agent::harness::acts::TaskFace;
+        self.harness_glass
+            .get(&local_id)
+            .map(crate::harness_glass::SessionGlass::chip)
+            .map_or((false, false), |glass| {
+                (
+                    matches!(glass.task, Some(TaskFace::Done | TaskFace::Landed)),
+                    glass.pause.is_some(),
+                )
+            })
+    }
+
+    /// THE WALL MOVED under the ledger clock (`Wake::WallMoved`, a window's
+    /// focus): the A/B book's calendar is read again where it was read at
+    /// all, so a sleep across a midnight starts the new day's stretches in
+    /// the new day ([`AbBook::set_calendar`]). Nothing before the book is
+    /// first fed.
+    pub(crate) fn harness_ab_wall_moved(&mut self) {
+        if self.harness_screen.ab.has_calendar() {
+            self.harness_screen
+                .ab
+                .set_calendar(crate::harness_ab::AbCalendar::read(
+                    crate::turn_ledger::now_ms(),
+                    crate::autopilot_timers::wall_ms(),
+                    crate::autopilot_timers::local_offset_at,
+                ));
+        }
+    }
+
+    /// THE EXIT SEAM'S WRITE (§10.5.3 C.2): this process's A/B book, its
+    /// open stretches counted to now, written whole to its own file
+    /// (`harness_ab_store::write_own`) once the event loop has returned —
+    /// one small write, never on the frame path. Nothing where the book was
+    /// never fed or no harness state resolves; a failed write is logged.
+    pub(crate) fn write_harness_ab_at_exit(&self) {
+        let Some(harness_state) = crate::harness_host::harness_state() else {
+            return;
+        };
+        let Some((ring, today)) = self.harness_screen.ab.ring_at(crate::turn_ledger::now_ms())
+        else {
+            return;
+        };
+        if let Err(error) = self
+            .harness_screen
+            .ab_writes
+            .snapshot((ring, today))
+            .and_then(|snapshot| {
+                snapshot.write_if_newer(
+                    &harness_state,
+                    &crate::harness_ab_store::own_name(),
+                    unix_ms_now(),
+                )
+            })
+        {
+            aterm_log::warn!("harness A/B book: not written at exit: {error}");
+        }
     }
 
     /// Session `local_id`'s A/B arm now ([`AbArm::of`] its effective
@@ -1488,11 +2336,24 @@ impl App {
     /// live — two reads could straddle a claim's lapse or another's take.
     #[must_use]
     pub(crate) fn harness_ab_arm(&self, local_id: u64) -> AbArm {
+        self.harness_ab_reading(local_id).0
+    }
+
+    /// [`Self::harness_ab_arm`], and whether the session's MODE is Land —
+    /// its own word, else the table's default, whatever the posture or the
+    /// claim (`AbBook::follow_mode`, §11.6.3 item 4) — from the same one
+    /// read of its metadata. A session that is gone has no word.
+    #[must_use]
+    pub(crate) fn harness_ab_reading(&self, local_id: u64) -> (AbArm, bool) {
+        let default = self.harness_policy.get().policy.autopilot;
         let Some(session) = self.pool.get(local_id) else {
-            return AbArm::of(
-                AutopilotView::of(self.harness_posture(), None),
-                false,
-                false,
+            return (
+                AbArm::of(
+                    AutopilotView::of(self.harness_posture(), None),
+                    false,
+                    false,
+                ),
+                default == Autopilot::Land,
             );
         };
         let posture = self.session_harness_posture(local_id);
@@ -1505,10 +2366,13 @@ impl App {
                 .map(|holder| holder == crate::autopilot::own_holder());
             (meta.autopilot_word(), ours)
         };
-        AbArm::of(
-            AutopilotView::of(posture, word),
-            ours == Some(true),
-            ours.is_some(),
+        (
+            AbArm::of(
+                AutopilotView::of(posture, word),
+                ours == Some(true),
+                ours.is_some(),
+            ),
+            word.unwrap_or(default) == Autopilot::Land,
         )
     }
 
@@ -1516,17 +2380,22 @@ impl App {
     /// (an input stall's publish): [`HarnessScreen::note_phase`].
     pub(crate) fn note_harness_phase(&mut self, local_id: u64) {
         let arm = self.harness_ab_arm(local_id);
+        let glass = self.harness_ab_glass(local_id);
         let Some(ctx) = self.pool.get(local_id).map(|s| s.ctx.clone()) else {
             return;
         };
-        self.harness_screen.note_phase(local_id, &ctx, arm);
+        self.harness_screen.note_phase(local_id, &ctx, arm, glass);
     }
 
-    /// Session `local_id`'s ARM may have moved (its Autopilot word written,
-    /// its claim taken or given back): the stretch so far goes to the arm
-    /// that was in force, and the session counts under its arm now from here.
+    /// Session `local_id`'s ARM or CAUSE may have moved (its Autopilot word
+    /// written, its claim taken or given back, its task's face or the
+    /// harness's pause told): the stretch so far goes to the arm and cause
+    /// that were in force, and the session counts under its arm and cause
+    /// now from here. Its mode is read for the time from Land to landed
+    /// (`AbBook::follow_mode`): every write of the word comes here.
     pub(crate) fn note_harness_arm(&mut self, local_id: u64) {
-        let arm = self.harness_ab_arm(local_id);
+        let (arm, lands) = self.harness_ab_reading(local_id);
+        let glass = self.harness_ab_glass(local_id);
         let Some(session) = self.pool.get(local_id) else {
             return;
         };
@@ -1542,9 +2411,24 @@ impl App {
             (crate::harness_host::agent_of(agent), agent.word)
         };
         let phase = agent.and_then(|_| AbPhase::of(word));
-        self.harness_screen
-            .ab
-            .observe(local_id, phase, arm, crate::turn_ledger::now_ms());
+        let cause = AbCause::of(arm, phase, glass.0, glass.1);
+        self.harness_screen.ab_calendar();
+        let now = crate::turn_ledger::now_ms();
+        let book = &mut self.harness_screen.ab;
+        book.follow_mode(local_id, lands, now);
+        book.observe(local_id, phase, cause, arm, now);
+    }
+
+    /// Session `local_id`'s word was CARRIED onto it from before this process
+    /// (`App::graft_restored_user_meta`), its mode read as Land (`lands_before`)
+    /// or not just before: where the carried word moved the mode, the A/B
+    /// book takes it as read with no move (`AbBook::carry_mode`), so a
+    /// landing restored or handed over mid-work is counted with no span.
+    pub(crate) fn harness_mode_carried(&mut self, local_id: u64, lands_before: bool) {
+        let lands = self.harness_ab_reading(local_id).1;
+        if lands != lands_before {
+            self.harness_screen.ab.carry_mode(local_id, lands);
+        }
     }
 
     /// Every session's arm may have moved (the policy in force changed).
@@ -1564,18 +2448,21 @@ impl App {
 
     /// THE SNAPSHOT Settings ▸ Harness renders: the policy in force, every
     /// live supervisable agent session, the ledgers' last
-    /// reading, the A/B totals now and the effective table. Leaf locks only,
+    /// reading, the A/B book's week now and the effective table. Leaf locks only,
     /// never nested (the registry's, then each session's timeline, then its
     /// metadata).
     #[must_use]
     pub(crate) fn harness_state(&self) -> HarnessState {
         let posture = self.harness_posture();
         let policy = self.harness_policy.get();
+        let sessions = self.harness_sessions(posture);
+        let decided_open = self.harness_decided_open(&sessions);
         HarnessState {
             observed: true,
             words: policy.words(),
             posture,
-            sessions: self.harness_sessions(posture),
+            sessions,
+            decided_open,
             stats: self.harness_screen.stats.clone(),
             ab: self.harness_ab(),
             config: config_rows(&policy.policy),
@@ -1588,12 +2475,228 @@ impl App {
                 )
             }),
             ai: self.ai_state(),
+            tabs: self.tab_control_state(posture),
             // One wall read per publish (an event): the day the state lines'
             // clocks are read against.
             today: crate::harness_glass::local_day_at(
                 crate::autopilot_timers::wall_ms().div_euclid(1000),
             ),
         }
+    }
+
+    /// Snapshot of all accessible computers, `aterm` instances, and open tabs
+    /// for Settings ▸ Harness ▸ Tab Control (`/tabs`). Reads this instance's
+    /// live tabs via leaf locks only and merges them with any sibling local
+    /// `aterm` instances and managed LAN Macs collected on the background
+    /// stats worker ([`HarnessStatsReport`]).
+    #[must_use]
+    pub(crate) fn tab_control_state(&self, posture: HarnessPosture) -> TabControlState {
+        let handles = self
+            .store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .snapshot();
+        let holder = crate::harness_host::holder();
+        let now_us = crate::metrics::now_us();
+        let local_comp_name = local_computer_label();
+        let own_instance = format!("this aterm (pid {})", std::process::id());
+        let mut local_tabs = Vec::new();
+        for handle in handles.iter().filter(|h| {
+            h.state != crate::session_store::SessionState::Exited
+                && self.pool.get(h.local_id).is_some()
+        }) {
+            let (raw_program, agent_prog, word, detail, subject, since_ms, task_face) = {
+                let tl = handle
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let ag = tl.agent();
+                (
+                    ag.program.clone(),
+                    crate::harness_host::agent_of(ag),
+                    ag.word,
+                    ag.detail.clone(),
+                    ag.subject.clone(),
+                    ag.since_ms(),
+                    tl.task_face().map(|(f, _)| f.status()),
+                )
+            };
+            let (person, auto_word, supervised) = {
+                let meta = handle.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    meta.presentation_value("title"),
+                    meta.autopilot_word(),
+                    meta.live_supervisor(now_us) == Some(holder.as_str()),
+                )
+            };
+            let admitted = crate::harness_host::admitted(&handle.ctx);
+            let (program_label, is_ai_cli) = if let Some(p) = admitted.or(agent_prog) {
+                (p.product().to_string(), true)
+            } else if let Some(raw) = raw_program
+                .as_deref()
+                .filter(|s| !s.is_empty() && *s != "-")
+            {
+                if let Some(prod) = ai_product_for_name(raw) {
+                    (prod.to_string(), true)
+                } else {
+                    (raw.to_string(), false)
+                }
+            } else {
+                ("shell".to_string(), false)
+            };
+            let title = self
+                .harness_session_name(handle.local_id, person, &handle.title)
+                .unwrap_or_else(|| handle.display_title());
+            let (cols, rows, cwd) = self
+                .pool
+                .get(handle.local_id)
+                .and_then(|s| match s.term.try_lock() {
+                    Ok(t) => {
+                        use crate::cwd_native::ReportedCwd as _;
+                        Some((
+                            t.cols(),
+                            t.rows(),
+                            t.native_working_directory()
+                                .map(std::borrow::Cow::into_owned),
+                        ))
+                    }
+                    Err(std::sync::TryLockError::Poisoned(p)) => {
+                        use crate::cwd_native::ReportedCwd as _;
+                        let t = p.into_inner();
+                        Some((
+                            t.cols(),
+                            t.rows(),
+                            t.native_working_directory()
+                                .map(std::borrow::Cow::into_owned),
+                        ))
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => None,
+                })
+                .unwrap_or((0, 0, None));
+            let base_place = place_words(&self.session_place(handle.sid.as_str()));
+            let place = match (cols > 0 && rows > 0, cwd.as_deref()) {
+                (true, Some(dir)) if !dir.is_empty() => {
+                    format!(
+                        "{base_place} ({cols}\u{d7}{rows} \u{b7} {})",
+                        shorten_home_dir(dir)
+                    )
+                }
+                (true, _) => format!("{base_place} ({cols}\u{d7}{rows})"),
+                (false, Some(dir)) if !dir.is_empty() => {
+                    format!("{base_place} ({})", shorten_home_dir(dir))
+                }
+                _ => base_place,
+            };
+            let autopilot = if is_ai_cli {
+                let view = AutopilotView::of(posture.for_agent(admitted.or(agent_prog)), auto_word);
+                if supervised {
+                    format!("{} (supervised)", view.wire())
+                } else {
+                    view.wire().to_string()
+                }
+            } else {
+                "-".to_string()
+            };
+            let ai_status = if is_ai_cli {
+                format_ai_cli_live_status(
+                    (word != "-").then_some(word),
+                    detail.as_deref(),
+                    subject.as_deref(),
+                    (word != "-").then_some(since_ms),
+                    task_face,
+                )
+            } else {
+                "-".to_string()
+            };
+            let human_wire = handle.ctx.human_input.wire(now_us);
+            let human = human_activity_words(human_wire.parse::<u64>().ok());
+            local_tabs.push(TabSpreadsheetRow {
+                key: format!("local/{}", handle.local_id),
+                computer: local_comp_name.clone(),
+                instance: own_instance.clone(),
+                place,
+                sid: handle.sid.as_str().to_string(),
+                title,
+                state: handle.state.as_str().to_string(),
+                program: program_label,
+                is_ai_cli,
+                ai_status,
+                autopilot,
+                human,
+                show_local_id: Some(handle.local_id),
+            });
+        }
+        local_tabs.sort_by_key(|row| row.show_local_id.unwrap_or(u64::MAX));
+
+        let (sibling_tabs, mut remote_computers, remote_tabs) =
+            self.harness_screen.stats.report.as_deref().map_or_else(
+                || (Vec::new(), Vec::new(), Vec::new()),
+                |r| {
+                    (
+                        r.sibling_tabs.clone(),
+                        r.remote_computers.clone(),
+                        r.remote_tabs.clone(),
+                    )
+                },
+            );
+        let hide_viewer_self_tab = self.headless
+            && !cfg!(test)
+            && aterm_uds::test_binary::scratch_root().is_none()
+            && !sibling_tabs.is_empty();
+        if hide_viewer_self_tab {
+            local_tabs.clear();
+        }
+        let local_meta = remote_computers
+            .iter()
+            .position(|c| c.id == "__local_meta__")
+            .map(|idx| remote_computers.remove(idx));
+        let sibling_instances: std::collections::BTreeSet<&str> =
+            sibling_tabs.iter().map(|t| t.instance.as_str()).collect();
+        let local_instances = if hide_viewer_self_tab {
+            sibling_instances.len().max(1)
+        } else {
+            1 + sibling_instances.len()
+        };
+        let local_ai_clis = local_tabs
+            .iter()
+            .chain(sibling_tabs.iter())
+            .filter(|t| t.is_ai_cli)
+            .count();
+        let local_active_ai = local_tabs
+            .iter()
+            .chain(sibling_tabs.iter())
+            .filter(|t| {
+                t.is_ai_cli
+                    && (t.ai_status.starts_with("working") || t.ai_status.starts_with("waiting"))
+            })
+            .count();
+        let (self_display_name, self_address, self_os_version, self_status) = match local_meta {
+            Some(m) => (m.name, m.address, m.os_version, m.status),
+            None => (
+                format!("{local_comp_name} (this Mac)"),
+                "local".to_string(),
+                std::env::consts::OS.to_string(),
+                "online".to_string(),
+            ),
+        };
+        let mut computers = vec![TabComputer {
+            id: "local".to_string(),
+            name: self_display_name,
+            address: self_address,
+            os_version: self_os_version,
+            status: self_status,
+            instances: local_instances,
+            tabs: local_tabs.len() + sibling_tabs.len(),
+            ai_clis: local_ai_clis,
+            active_ai: local_active_ai,
+        }];
+        computers.extend(remote_computers);
+
+        let mut tabs = local_tabs;
+        tabs.extend(sibling_tabs);
+        tabs.extend(remote_tabs);
+        TabControlState { computers, tabs }
     }
 
     /// Every live session whose program is a supervisable agent
@@ -1652,6 +2755,58 @@ impl App {
         sessions
     }
 
+    /// The live sessions today's decisions name that `sessions` (SESSIONS'
+    /// rows) does not list ([`HarnessState::decided_open`]): one store read,
+    /// only where a decision names such a session. Leaf locks only.
+    fn harness_decided_open(&self, sessions: &[HarnessSession]) -> Vec<OpenSession> {
+        let Some(decided) = self
+            .harness_screen
+            .stats
+            .report
+            .as_deref()
+            .and_then(|report| report.today.decided.as_ref())
+        else {
+            return Vec::new();
+        };
+        let wanted: std::collections::BTreeSet<&str> = decided
+            .rows
+            .iter()
+            .map(|decision| decision.sid.as_str())
+            .filter(|sid| !sid.is_empty() && !sessions.iter().any(|s| s.sid == *sid))
+            .collect();
+        if wanted.is_empty() {
+            return Vec::new();
+        };
+        let handles = self
+            .store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .snapshot();
+        handles
+            .iter()
+            .filter(|h| {
+                h.state != crate::session_store::SessionState::Exited
+                    && self.pool.get(h.local_id).is_some()
+                    && wanted.contains(h.sid.as_str())
+            })
+            .map(|h| {
+                let person = h
+                    .ctx
+                    .meta
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .presentation_value("title");
+                OpenSession {
+                    sid: h.sid.as_str().to_string(),
+                    local_id: h.local_id,
+                    title: self
+                        .harness_session_name(h.local_id, person, &h.title)
+                        .unwrap_or_else(|| h.display_title()),
+                }
+            })
+            .collect()
+    }
+
     /// A SESSION'S NAME as Settings ▸ Harness and its Autopilot menu give it:
     /// the person's name for its tab (`person`, the `title` its metadata
     /// carries), else THE TAB'S NAME AS THE STRIP RESOLVES IT, from the
@@ -1689,10 +2844,11 @@ impl App {
         .map(|title| crate::chrome_label::without_spinner_frame(&title).to_owned())
     }
 
-    /// Whether some Settings view is on the Harness route now.
+    /// Whether some Settings view is on the Harness or Tab Control route now.
     pub(crate) fn harness_page_shown(&self) -> bool {
         self.view_store.iter().any(|(view, link)| {
-            matches!(link, crate::tab_model::View::Native(_)) && self.harness_page_in(view)
+            matches!(link, crate::tab_model::View::Native(_))
+                && (self.harness_page_in(view) || self.tabs_page_in(view))
         })
     }
 
@@ -1705,6 +2861,15 @@ impl App {
             self.native_runtime.view_state(view),
             Some(crate::native_app::AppViewState::Settings(state))
                 if state.route == crate::native_settings::SettingsRoute::Harness
+        )
+    }
+
+    /// Whether native view `view` is a Settings view on the Tab Control route.
+    pub(crate) fn tabs_page_in(&self, view: crate::tab_model::ViewId) -> bool {
+        matches!(
+            self.native_runtime.view_state(view),
+            Some(crate::native_app::AppViewState::Settings(state))
+                if state.route == crate::native_settings::SettingsRoute::Tabs
         )
     }
 
@@ -1744,14 +2909,10 @@ impl App {
                 self.publish_native_harness_state();
             }
             crate::native_app::HarnessRequest::Autopilot { session, word } => {
-                // The session's own posture: its agent's switch Off steers
-                // nothing there, whatever the window's.
-                if let Some(default) = self.session_harness_posture(session).default_mode() {
-                    self.set_session_autopilot(
-                        session,
-                        (!hands_back(word, default)).then_some(word),
-                    );
-                }
+                self.press_page_mode(session, word);
+            }
+            crate::native_app::HarnessRequest::Every(press) => {
+                self.press_autopilot_every(press);
             }
             crate::native_app::HarnessRequest::AiLook => self.ask_ai_look(),
             crate::native_app::HarnessRequest::AiFleetFetch => self.ask_ai_fetch(),
@@ -1770,6 +2931,48 @@ impl App {
                 }
             }
         }
+    }
+
+    /// A SESSIONS ROW'S PRESS of `mode` on session `local_id`: the page's one
+    /// rule's word ([`page_word`]) written through the window's one writer
+    /// ([`Self::set_session_autopilot`], which publishes the page where it
+    /// moved), by the session's own posture — its agent's switch Off, or the
+    /// master switch, steers nothing there, whatever the window's. Whether
+    /// the pair moved.
+    pub(crate) fn press_page_mode(&mut self, local_id: u64, mode: Autopilot) -> bool {
+        let Some(default) = self.session_harness_posture(local_id).default_mode() else {
+            return false;
+        };
+        self.set_session_autopilot(local_id, page_word(mode, default))
+    }
+
+    /// A PRESS ON SESSIONS' `Every session` ROW (design §11.5.3): the live
+    /// sessions SESSIONS lists, read again at the press (a session opened or
+    /// closed since the draw is counted as it is now), each moved where
+    /// [`EveryPress::moves`] says — never one whose mode is Off, and none the
+    /// harness cannot steer — and written as [`EveryPress::write`] says, a
+    /// timer at ONE instant resolved here once
+    /// ([`Self::resolve_timer_choice`]), so every armed timer shares it and
+    /// the index folds one `autopilot_timer` deadline. All in one batch
+    /// ([`Self::write_autopilot_batch`]), which publishes the page once
+    /// however many it writes. A press that moves nothing writes nothing.
+    /// How many sessions' pairs moved.
+    pub(crate) fn press_autopilot_every(&mut self, press: EveryPress) -> usize {
+        let sessions = self.harness_sessions(self.harness_posture());
+        let at = match press {
+            EveryPress::Timer(choice) => self.resolve_timer_choice(choice),
+            EveryPress::Mode(_) | EveryPress::Follow => None,
+        };
+        let writes: Vec<(u64, Option<Autopilot>, Option<i64>)> = sessions
+            .iter()
+            .filter(|session| press.moves(session))
+            .filter(|_| !matches!(press, EveryPress::Timer(_)) || at.is_some())
+            .filter_map(|session| {
+                let (word, land_at) = press.write(session.default?, at);
+                Some((session.local_id, word, land_at))
+            })
+            .collect();
+        self.write_autopilot_batch(&writes, aterm_slog::Actor::Human)
     }
 
     /// AN ACT, TOLD WHILE THE PAGE MAY BE ON SCREEN (§9.2.1, "The page";
@@ -1806,10 +3009,11 @@ impl App {
     }
 
     /// READ THE LEDGERS AGAIN, off the event loop: one named background
-    /// thread folds today and the last 7 days ([`collect_harness_stats`]) and
-    /// posts `Wake::HarnessStatsCollected`. A reading already running is not
-    /// joined by another; a window without an event loop (a test App) reads
-    /// nothing.
+    /// thread folds today and the last 7 days ([`collect_harness_stats`]),
+    /// writes this process's A/B book and reads the others'
+    /// ([`read_harness_stats`]), and posts `Wake::HarnessStatsCollected`. A
+    /// reading already running is not joined by another; a window without
+    /// an event loop (a test App) reads nothing.
     pub(crate) fn start_harness_stats_refresh(&mut self) {
         self.start_harness_stats_refresh_at(Instant::now());
     }
@@ -1826,13 +3030,42 @@ impl App {
         if self.harness_screen.stats.collecting {
             return;
         }
+        let state_dir = aterm_types::dirs::state_dir();
+        let harness_state = crate::harness_host::harness_state();
+        // The A/B book's ring, its open stretches counted to now, copied for
+        // the thread to write (§10.5.3 C.2): about 7 KB, at a reading.
+        let ab = self
+            .harness_screen
+            .ab
+            .ring_at(crate::turn_ledger::now_ms())
+            .and_then(|ring| match self.harness_screen.ab_writes.snapshot(ring) {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    aterm_log::warn!("harness A/B book: snapshot not captured: {error}");
+                    None
+                }
+            });
+        let own = crate::harness_ab_store::own_name();
         let Some(proxy) = self.proxy.clone() else {
+            if !cfg!(test) && aterm_uds::test_binary::scratch_root().is_none() {
+                self.harness_screen.sequence = self.harness_screen.sequence.wrapping_add(1);
+                let sequence = self.harness_screen.sequence;
+                self.harness_screen.began_reading(now);
+                let result = read_harness_stats(
+                    state_dir.as_deref(),
+                    harness_state.as_deref(),
+                    ab.as_ref(),
+                    &own,
+                    unix_ms_now(),
+                    crate::presence::local_offset_at,
+                )
+                .map(Box::new);
+                self.finish_harness_stats(sequence, result);
+            }
             return;
         };
         self.harness_screen.sequence = self.harness_screen.sequence.wrapping_add(1);
         let sequence = self.harness_screen.sequence;
-        let state_dir = aterm_types::dirs::state_dir();
-        let harness_state = crate::harness_host::harness_state();
         let spawn = crate::qos::spawn_lane_thread(
             "aterm-harness-stats",
             crate::qos::Role::Background,
@@ -1841,9 +3074,11 @@ impl App {
                 // A reader that panicked still answers, so Refresh is never
                 // left busy for a reading that will not come.
                 let result = std::panic::catch_unwind(|| {
-                    collect_harness_stats(
+                    read_harness_stats(
                         state_dir.as_deref(),
                         harness_state.as_deref(),
+                        ab.as_ref(),
+                        &own,
                         unix_ms_now(),
                         crate::presence::local_offset_at,
                     )
@@ -1906,6 +3141,1185 @@ impl App {
         }
         self.publish_native_harness_state();
     }
+}
+
+/// Format live AI CLI status for a tab row (`"working: thinking (14s)"`,
+/// `"waiting on permission: Bash (5s)"`, `"idle at prompt · done"`). Pure.
+#[must_use]
+pub(crate) fn format_ai_cli_live_status(
+    word: Option<&str>,
+    detail: Option<&str>,
+    subject: Option<&str>,
+    since_ms: Option<u64>,
+    task: Option<&str>,
+) -> String {
+    fn clean(s: Option<&str>) -> Option<&str> {
+        s.map(str::trim).filter(|s| !s.is_empty() && *s != "-")
+    }
+    let word = clean(word);
+    let detail = clean(detail);
+    let subject = clean(subject);
+    let task = clean(task);
+
+    let mut base = match word {
+        Some("busy" | "working") => match (detail, task) {
+            (Some(d), _) => format!("working: {d}"),
+            (None, Some(t)) => format!("working \u{b7} task {t}"),
+            (None, None) => "working".to_string(),
+        },
+        Some("prompt" | "idle") => {
+            let prompt = match detail {
+                Some(d) => format!("at prompt: {d}"),
+                None => "idle at prompt".to_string(),
+            };
+            match task {
+                Some(t) => format!("{prompt} \u{b7} {t}"),
+                None => prompt,
+            }
+        }
+        Some(w) if w == "permission" || w == "box:permission" || w == "waiting" => {
+            match subject.or(detail) {
+                Some(what) => format!("waiting on permission: {what}"),
+                None => "waiting on permission".to_string(),
+            }
+        }
+        Some(w) if w == "question" || w == "box:question" => match subject.or(detail) {
+            Some(what) => format!("waiting on question: {what}"),
+            None => "waiting on question".to_string(),
+        },
+        Some(w) if w == "limit" || w == "wall:rate-limit" => match detail {
+            Some(d) => format!("rate limit: {d}"),
+            None => "paused at rate limit".to_string(),
+        },
+        Some("wall:unresponsive") => {
+            if detail == Some("stopped") {
+                "stopped (Ctrl-Z)".to_string()
+            } else {
+                "unresponsive".to_string()
+            }
+        }
+        Some(w) => match detail {
+            Some(d) => format!("{w}: {d}"),
+            None => w.to_string(),
+        },
+        None => "running".to_string(),
+    };
+    if let Some(ms) = since_ms.filter(|ms| *ms >= 1_000) {
+        let dur = if ms < 60_000 {
+            format!("{}s", ms / 1_000)
+        } else {
+            duration_words(ms)
+        };
+        base.push_str(&format!(" ({dur})"));
+    }
+    base
+}
+
+/// Format elapsed human input milliseconds (`"12s ago"`, `"5m ago"`, `"-"`). Pure.
+#[must_use]
+pub(crate) fn human_activity_words(human_ms: Option<u64>) -> String {
+    match human_ms {
+        None => "-".to_string(),
+        Some(ms) if ms < 60_000 => format!("{}s ago", (ms / 1_000).max(1)),
+        Some(ms) => format!("{} ago", duration_words(ms)),
+    }
+}
+
+/// Map a foreground binary or product name to its canonical AI CLI product name.
+fn ai_product_for_name(name: &str) -> Option<&'static str> {
+    let lower = name.trim().to_ascii_lowercase();
+    for prog in aterm_phase::Program::ALL {
+        if prog.harness_table() {
+            let prod = prog.product();
+            if prod.eq_ignore_ascii_case(&lower) {
+                return Some(prod);
+            }
+        }
+    }
+    match lower.as_str() {
+        "claude" | "claude-code" => Some("Claude Code"),
+        "codex" | "codex-cli" => Some("Codex"),
+        "agy" | "antigravity" | "antigravity-cli" => Some("Antigravity CLI"),
+        "muse" | "muse-code" => Some("Muse Code"),
+        "gemini" | "gemini-cli" => Some("Gemini CLI"),
+        _ => None,
+    }
+}
+
+/// Real account home directory (independent of a scratch `$HOME` in `lab instance`).
+fn real_account_home() -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        unsafe {
+            let mut pw: libc::passwd = std::mem::zeroed();
+            let mut buf = [0u8; 4096];
+            let mut out: *mut libc::passwd = std::ptr::null_mut();
+            let rc = libc::getpwuid_r(
+                libc::getuid(),
+                &mut pw,
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+                &mut out,
+            );
+            if rc == 0 && !out.is_null() && !pw.pw_dir.is_null() {
+                let bytes = std::ffi::CStr::from_ptr(pw.pw_dir).to_bytes();
+                if !bytes.is_empty() {
+                    return Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes)));
+                }
+            }
+        }
+    }
+    aterm_types::dirs::home_dir()
+}
+
+/// Replace the user's home directory prefix with `~`.
+fn shorten_home_dir(path: &str) -> String {
+    let trimmed = path.trim();
+    for home in [real_account_home(), aterm_types::dirs::home_dir()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(h) = home.to_str().filter(|h| !h.is_empty()) {
+            if trimmed == h {
+                return "~".to_string();
+            }
+            if let Some(rest) = trimmed.strip_prefix(h)
+                && rest.starts_with('/')
+            {
+                return format!("~{rest}");
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Extract a canonical short tag (`m14`, `spark-49f7`) from a host selector or Bonjour name.
+fn host_tag_key_gui(raw: &str) -> String {
+    let clean = raw
+        .trim()
+        .trim_end_matches('.')
+        .strip_suffix(".local")
+        .unwrap_or_else(|| raw.trim().trim_end_matches('.'));
+    let tokens: Vec<&str> = clean
+        .split(|c: char| c.is_whitespace() || c == '-')
+        .filter(|t| !t.is_empty())
+        .collect();
+    if let Some(&first) = tokens.first() {
+        let lower = first.to_ascii_lowercase();
+        if lower == "spark"
+            && let Some(&second) = tokens.get(1)
+        {
+            return format!("spark-{}", second.to_ascii_lowercase());
+        }
+        if lower.starts_with('m')
+            && lower.len() > 1
+            && lower[1..].chars().all(|c| c.is_ascii_digit())
+        {
+            return lower;
+        }
+    }
+    clean.to_ascii_lowercase()
+}
+
+/// Normalize any discovered or local host name into a consistent canonical hyphenated
+/// identifier (`m1-MacBook-Air-M2-24GB-1TB`, `m14-MacBook-Air-M5-32GB-4TB-prime`, `spark-49f7`),
+/// honoring any custom override in `[names]` of `machines.toml`.
+pub(crate) fn canonical_host_name_gui(
+    raw: &str,
+    custom_names: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let trimmed = raw
+        .trim()
+        .trim_end_matches('.')
+        .strip_suffix(".local")
+        .unwrap_or_else(|| raw.trim().trim_end_matches('.'))
+        .trim();
+    if trimmed.is_empty() {
+        return "this-Mac".to_string();
+    }
+    let tag = host_tag_key_gui(trimmed);
+    let slug: String = trimmed.split_whitespace().collect::<Vec<_>>().join("-");
+    for candidate in [trimmed, slug.as_str(), tag.as_str()] {
+        if let Some((_, v)) = custom_names
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(candidate))
+        {
+            return v.clone();
+        }
+    }
+    let mut raw_tokens: Vec<&str> = trimmed
+        .split(|c: char| c.is_whitespace() || c == '-')
+        .filter(|t| !t.is_empty())
+        .collect();
+    if raw_tokens
+        .last()
+        .is_some_and(|last| last.eq_ignore_ascii_case("ssh"))
+        && raw_tokens.len() > 1
+    {
+        raw_tokens.pop();
+    }
+    if raw_tokens.len() >= 2 && raw_tokens[0].eq_ignore_ascii_case("spark") {
+        return format!("spark-{}", raw_tokens[1].to_ascii_lowercase());
+    }
+    let mut norm: Vec<String> = Vec::with_capacity(raw_tokens.len() + 1);
+    for (idx, &tok) in raw_tokens.iter().enumerate() {
+        let low = tok.to_ascii_lowercase();
+        let mapped = if idx == 0
+            && low.starts_with('m')
+            && low.len() > 1
+            && low[1..].chars().all(|c| c.is_ascii_digit())
+        {
+            low
+        } else if idx > 0
+            && low.starts_with('m')
+            && low.len() == 2
+            && low.as_bytes()[1].is_ascii_digit()
+        {
+            tok.to_ascii_uppercase()
+        } else {
+            match low.as_str() {
+                "macbook" => "MacBook".to_string(),
+                "air" => "Air".to_string(),
+                "pro" => "Pro".to_string(),
+                "max" => "Max".to_string(),
+                "ultra" => "Ultra".to_string(),
+                "mini" => "mini".to_string(),
+                "imac" => "iMac".to_string(),
+                "studio" => "Studio".to_string(),
+                "intel" => "Intel".to_string(),
+                "core" => "Core".to_string(),
+                "i3" | "i5" | "i7" | "i9" | "prime" => low,
+                _ if low.ends_with("gb")
+                    && low[..low.len() - 2]
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == '.') =>
+                {
+                    format!("{}GB", &tok[..tok.len() - 2])
+                }
+                _ if low.ends_with("tb")
+                    && low[..low.len() - 2]
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == '.') =>
+                {
+                    format!("{}TB", &tok[..tok.len() - 2])
+                }
+                _ if low.ends_with("ghz")
+                    && low[..low.len() - 3]
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == '.') =>
+                {
+                    format!("{}GHz", &tok[..tok.len() - 3])
+                }
+                _ => tok.to_string(),
+            }
+        };
+        norm.push(mapped);
+    }
+    if norm.len() >= 2
+        && norm[0].starts_with('m')
+        && norm[0][1..].chars().all(|c| c.is_ascii_digit())
+    {
+        if norm[1] == "Air" {
+            norm.insert(1, "MacBook".to_string());
+        } else if norm[1] == "MacBook"
+            && norm.get(2).is_some_and(|t| {
+                t != "Pro"
+                    && t != "Air"
+                    && (t.starts_with('M') || t.chars().next().is_some_and(|c| c.is_ascii_digit()))
+            })
+        {
+            norm.insert(2, "Pro".to_string());
+        }
+    }
+    norm.join("-")
+}
+
+/// Read custom `[names]` mappings from `machines.toml` if present.
+fn load_custom_host_names() -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut candidates = Vec::new();
+    if let Some(cfg) = aterm_types::dirs::aterm_config_dir() {
+        candidates.push(cfg.join("machines/machines.toml"));
+    }
+    if !cfg!(test)
+        && aterm_uds::test_binary::scratch_root().is_none()
+        && let Some(home) = real_account_home()
+    {
+        candidates.push(home.join(".config/aterm/machines/machines.toml"));
+        candidates.push(home.join("Library/Application Support/aterm/machines/machines.toml"));
+    }
+    for path in candidates {
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && let Ok(val) = aterm_toml::from_str::<aterm_toml::Value>(&content)
+            && let Some(names) = val.get("names").and_then(|v| v.as_table())
+        {
+            for (k, v) in names {
+                if let Some(s) = v.as_str() {
+                    out.insert(k.clone(), s.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Cached local computer name for the Tab Control Panel (no subprocess on the frame path).
+fn local_computer_label() -> String {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let raw = NAME
+        .get_or_init(|| {
+            std::env::var("HOSTNAME")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    let h = aterm_uds::process::host_name()?;
+                    let short = h.trim().strip_suffix(".local").unwrap_or(h.trim());
+                    (!short.is_empty()).then(|| short.to_string())
+                })
+                .unwrap_or_else(|| "this Mac".to_string())
+        })
+        .clone();
+    if cfg!(test) || aterm_uds::test_binary::scratch_root().is_some() {
+        raw
+    } else {
+        canonical_host_name_gui(&raw, &load_custom_host_names())
+    }
+}
+
+/// Collect sibling local `aterm` tabs and managed remote computers/tabs on the
+/// background stats worker thread.
+fn collect_fleet_and_sibling_tabs() -> (
+    Vec<TabSpreadsheetRow>,
+    Vec<TabComputer>,
+    Vec<TabSpreadsheetRow>,
+) {
+    if cfg!(test) || aterm_uds::test_binary::scratch_root().is_some() {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    let sibling_tabs = collect_sibling_aterm_tabs();
+    let (remote_computers, remote_tabs) = collect_remote_machines_tabs();
+    (sibling_tabs, remote_computers, remote_tabs)
+}
+
+#[cfg(unix)]
+fn collect_sibling_aterm_tabs() -> Vec<TabSpreadsheetRow> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut dirs = Vec::new();
+    if let Some(dir) = aterm_uds::control_socket_dir() {
+        dirs.push(dir);
+    }
+    if !cfg!(test) && aterm_uds::test_binary::scratch_root().is_none() {
+        if let Some(host_dir) = std::env::var_os("ATERM_TAB_CONTROL_HOST_SOCK_DIR") {
+            let p = std::path::PathBuf::from(host_dir);
+            if !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+        if let Some(home) = real_account_home() {
+            let app_sup = home.join("Library/Application Support/aterm");
+            if !dirs.contains(&app_sup) {
+                dirs.push(app_sup);
+            }
+        }
+    }
+    let own_pid = std::process::id();
+    let comp_name = local_computer_label();
+    let mut rows = Vec::new();
+    let mut pids: Vec<(u32, std::path::PathBuf)> = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(pid_str) = name
+                .strip_prefix("aterm-")
+                .and_then(|s| s.strip_suffix(".sock"))
+            else {
+                continue;
+            };
+            let Ok(pid) = pid_str.parse::<u32>() else {
+                continue;
+            };
+            if pid != own_pid && !pids.iter().any(|(p, _)| *p == pid) {
+                pids.push((pid, path));
+            }
+        }
+    }
+    pids.sort_by_key(|(pid, _)| *pid);
+    for (pid, sock_path) in pids {
+        let Some(sock) = sock_path.to_str() else {
+            continue;
+        };
+        let Ok((mut stream, Ok(token))) = aterm_ctl::connect_then_read_token(sock) else {
+            continue;
+        };
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(150)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(150)));
+        let req = format!("AUTH {token}\nsessions\n");
+        if stream.write_all(req.as_bytes()).is_err() {
+            continue;
+        }
+        let _ = stream.flush();
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let reader = BufReader::new(stream);
+        let mut pid_rows: Vec<(u64, TabSpreadsheetRow)> = Vec::new();
+        for line in reader.lines().map_while(Result::ok) {
+            if let Some((local_id, row)) = parse_sibling_roster_line(&comp_name, pid, &line) {
+                pid_rows.push((local_id, row));
+            }
+        }
+        if !pid_rows.is_empty()
+            && let Ok((mut stream2, _)) = aterm_ctl::connect_then_read_token(sock)
+        {
+            let _ = stream2.set_read_timeout(Some(std::time::Duration::from_millis(80)));
+            let _ = stream2.set_write_timeout(Some(std::time::Duration::from_millis(80)));
+            let mut batch = format!("AUTH {token}\n");
+            for (local_id, _) in &pid_rows {
+                batch.push_str(&format!("@{local_id} dims\n@{local_id} cwd\n"));
+            }
+            if stream2.write_all(batch.as_bytes()).is_ok() {
+                let _ = stream2.flush();
+                let _ = stream2.shutdown(std::net::Shutdown::Write);
+                let mut r2 = BufReader::new(stream2);
+                for (_, row) in &mut pid_rows {
+                    let mut dims_line = String::new();
+                    let mut dims_opt: Option<(u32, u32)> = None;
+                    if r2.read_line(&mut dims_line).is_ok()
+                        && let Some(rest) = dims_line.trim().strip_prefix("OK ")
+                    {
+                        let mut parts = rest.split_whitespace();
+                        if let (Some(r), Some(c)) = (
+                            parts.next().and_then(|x| x.parse::<u32>().ok()),
+                            parts.next().and_then(|x| x.parse::<u32>().ok()),
+                        ) && c > 0
+                            && r > 0
+                        {
+                            dims_opt = Some((c, r));
+                        }
+                    }
+                    let mut cwd_line = String::new();
+                    let mut cwd_opt: Option<String> = None;
+                    if r2.read_line(&mut cwd_line).is_ok()
+                        && let Some(rest) = cwd_line.trim().strip_prefix("OK ")
+                    {
+                        let decoded = aterm_control::wire::pct_decode(rest.trim());
+                        if !decoded.is_empty() && decoded != "-" {
+                            cwd_opt = Some(shorten_home_dir(&decoded));
+                        }
+                    }
+                    match (dims_opt, cwd_opt) {
+                        (Some((c, r)), Some(dir)) => {
+                            row.place = format!("{} \u{b7} {c}\u{d7}{r} \u{b7} {dir}", row.place);
+                        }
+                        (Some((c, r)), None) => {
+                            row.place = format!("{} \u{b7} {c}\u{d7}{r}", row.place);
+                        }
+                        (None, Some(dir)) => {
+                            row.place = format!("{} \u{b7} {dir}", row.place);
+                        }
+                        (None, None) => {}
+                    }
+                }
+            }
+        }
+        rows.extend(pid_rows.into_iter().map(|(_, r)| r));
+    }
+    rows
+}
+
+#[cfg(not(unix))]
+fn collect_sibling_aterm_tabs() -> Vec<TabSpreadsheetRow> {
+    Vec::new()
+}
+
+#[cfg(unix)]
+fn parse_sibling_roster_line(
+    comp_name: &str,
+    pid: u32,
+    line: &str,
+) -> Option<(u64, TabSpreadsheetRow)> {
+    use aterm_control::wire::pct_decode;
+    let mut tokens = line.split_whitespace();
+    let local_id: u64 = tokens.next()?.parse().ok()?;
+    let sid = tokens.next()?.to_string();
+    let _parent = tokens.next()?;
+    let state = tokens.next()?.to_string();
+    if state != "Running" && state != "Idle" && state != "alive" {
+        return None;
+    }
+    let raw_title = pct_decode(tokens.next()?);
+    let mut window = "-".to_string();
+    let mut active = false;
+    let mut focused = false;
+    let mut program: Option<String> = None;
+    let mut agent: Option<String> = None;
+    let mut agent_detail: Option<String> = None;
+    let mut agent_since_ms: Option<u64> = None;
+    let mut human_ms: Option<u64> = None;
+    let mut autopilot: Option<String> = None;
+    let mut role: Option<String> = None;
+    let mut supervisor: Option<String> = None;
+    let mut user_title: Option<String> = None;
+    let mut task: Option<String> = None;
+    for tok in tokens {
+        let Some((k, v)) = tok.split_once('=') else {
+            continue;
+        };
+        match k {
+            "window" => window = v.to_string(),
+            "active" => active = v == "1" || v == "true",
+            "wfocus" => focused = v == "1" || v == "true",
+            "program" if v != "-" => program = Some(pct_decode(v)),
+            "agent" if v != "-" => agent = Some(pct_decode(v)),
+            "agent_detail" if v != "-" => agent_detail = Some(pct_decode(v)),
+            "agent_since_ms" if v != "-" => agent_since_ms = v.parse().ok(),
+            "human_ms" if v != "-" => human_ms = v.parse().ok(),
+            "autopilot" if v != "-" => autopilot = Some(pct_decode(v)),
+            "role" if v != "-" => role = Some(pct_decode(v)),
+            "supervisor" if v != "-" => supervisor = Some(pct_decode(v)),
+            "user_title" if v != "-" => user_title = Some(pct_decode(v)),
+            "task" if v != "-" => task = Some(pct_decode(v)),
+            _ => {}
+        }
+    }
+    let title = user_title
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(raw_title);
+    let raw_prog = program.unwrap_or_else(|| "shell".to_string());
+    let (prog_label, is_ai_cli) = if let Some(prod) = ai_product_for_name(&raw_prog) {
+        if prod.eq_ignore_ascii_case(&raw_prog) {
+            (prod.to_string(), true)
+        } else {
+            (format!("{prod} ({raw_prog})"), true)
+        }
+    } else if agent.is_some() {
+        (raw_prog, true)
+    } else {
+        (raw_prog, false)
+    };
+    let ai_status = if is_ai_cli {
+        format_ai_cli_live_status(
+            agent.as_deref(),
+            agent_detail.as_deref(),
+            None,
+            agent_since_ms,
+            task.as_deref(),
+        )
+    } else {
+        "-".to_string()
+    };
+    let mut auto_full = autopilot.unwrap_or_else(|| "-".to_string());
+    if let Some(sup) = supervisor.as_deref().filter(|s| !s.is_empty()) {
+        auto_full.push_str(&format!(" (supervised by {sup})"));
+    }
+    if let Some(r) = role.as_deref().filter(|r| !r.is_empty()) {
+        auto_full.push_str(&format!(" \u{b7} role {r}"));
+    }
+    let marks = format!(
+        "{}{}",
+        if active { "*" } else { "" },
+        if focused { "!" } else { "" }
+    );
+    let place = if window != "-" {
+        format!("Tab #{local_id}{marks} (Win {window})")
+    } else {
+        format!("Tab #{local_id}{marks}")
+    };
+    Some((
+        local_id,
+        TabSpreadsheetRow {
+            key: format!("sibling/{pid}/{local_id}"),
+            computer: comp_name.to_string(),
+            instance: format!("aterm-{pid}"),
+            place,
+            sid,
+            title,
+            state,
+            program: prog_label,
+            is_ai_cli,
+            ai_status,
+            autopilot: auto_full,
+            human: human_activity_words(human_ms),
+            show_local_id: None,
+        },
+    ))
+}
+
+fn collect_remote_machines_tabs() -> (Vec<TabComputer>, Vec<TabSpreadsheetRow>) {
+    let custom_names = load_custom_host_names();
+    let mut configured: Vec<(String, String, String)> = Vec::new();
+    let mut state_dir_opt = None;
+    if let Some(config_dir) = aterm_types::dirs::aterm_config_dir() {
+        let machines_dir = config_dir.join("machines");
+        let toml_path = machines_dir.join("machines.toml");
+        state_dir_opt = Some(machines_dir.join("state"));
+        if let Ok(content) = std::fs::read_to_string(&toml_path)
+            && let Ok(val) = aterm_toml::from_str::<aterm_toml::Value>(&content)
+            && let Some(hosts) = val.get("host").and_then(|v| v.as_array())
+        {
+            for h in hosts {
+                let uuid = h
+                    .get("uuid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let raw_name = h
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = canonical_host_name_gui(&raw_name, &custom_names);
+                let address = h
+                    .get("address")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !uuid.is_empty() && !name.is_empty() {
+                    configured.push((uuid, name, address));
+                }
+            }
+        }
+    }
+    let mut computers = Vec::new();
+    let mut tabs = Vec::new();
+    for (uuid, name, address) in configured {
+        let state_json = state_dir_opt
+            .as_ref()
+            .and_then(|sd| std::fs::read_to_string(sd.join(format!("{uuid}.json"))).ok())
+            .and_then(|s| aterm_json::from_str::<aterm_json::Value>(&s).ok());
+        let last_seen = state_json
+            .as_ref()
+            .and_then(|v| v.get("last_seen"))
+            .and_then(|v| v.as_u64());
+        let last_error = state_json
+            .as_ref()
+            .and_then(|v| v.get("last_error"))
+            .and_then(|v| v.as_str());
+        let hello_json = state_json
+            .as_ref()
+            .and_then(|v| v.get("hello"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| aterm_json::from_str::<aterm_json::Value>(s).ok());
+        let os_version = hello_json
+            .as_ref()
+            .and_then(|h| h.get("os_version"))
+            .and_then(|v| v.as_str())
+            .map(|s| format!("macOS {s}"))
+            .unwrap_or_else(|| "macOS".to_string());
+        let status = match (last_seen, last_error) {
+            (Some(_), None) => "online (ssh)".to_string(),
+            (Some(_), Some(_)) => "standby".to_string(),
+            (None, Some(_)) => "offline".to_string(),
+            (None, None) => "configured".to_string(),
+        };
+        let mut instance_pids = std::collections::BTreeSet::new();
+        let mut host_tabs = 0usize;
+        let mut host_ai = 0usize;
+        let mut host_active_ai = 0usize;
+        if let Some(sessions) = hello_json
+            .as_ref()
+            .and_then(|h| h.get("sessions"))
+            .and_then(|v| v.as_array())
+        {
+            for s in sessions {
+                let inst_pid = s.get("instance_pid").and_then(|v| v.as_u64()).unwrap_or(0);
+                if inst_pid > 0 {
+                    instance_pids.insert(inst_pid);
+                }
+                let local_id = s.get("local_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                let sid = s
+                    .get("sid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-")
+                    .to_string();
+                let state = s
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Running")
+                    .to_string();
+                let title = s
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-")
+                    .to_string();
+                let window = s.get("window").and_then(|v| v.as_str()).unwrap_or("-");
+                let active = s.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+                let raw_prog = s.get("program").and_then(|v| v.as_str()).unwrap_or("shell");
+                let agent = s.get("agent").and_then(|v| v.as_str());
+                let agent_detail = s.get("agent_detail").and_then(|v| v.as_str());
+                let agent_since_ms = s.get("agent_since_ms").and_then(|v| v.as_u64());
+                let human_ms = s.get("human_ms").and_then(|v| v.as_u64());
+                let autopilot = s
+                    .get("autopilot")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-")
+                    .to_string();
+                let task = s.get("task").and_then(|v| v.as_str());
+                let cols = s.get("cols").and_then(|v| v.as_u64());
+                let rows_n = s.get("rows").and_then(|v| v.as_u64());
+                let cwd = s.get("cwd").and_then(|v| v.as_str());
+                let (prog_label, is_ai_cli) = if let Some(prod) = ai_product_for_name(raw_prog) {
+                    (format!("{prod} ({raw_prog})"), true)
+                } else if agent.is_some() {
+                    (raw_prog.to_string(), true)
+                } else {
+                    (raw_prog.to_string(), false)
+                };
+                let ai_status = if is_ai_cli {
+                    format_ai_cli_live_status(agent, agent_detail, None, agent_since_ms, task)
+                } else {
+                    "-".to_string()
+                };
+                if is_ai_cli {
+                    host_ai += 1;
+                    if ai_status.starts_with("working") || ai_status.starts_with("waiting") {
+                        host_active_ai += 1;
+                    }
+                }
+                host_tabs += 1;
+                let mut place = if window != "-" {
+                    format!(
+                        "Tab #{local_id}{} (Win {window})",
+                        if active { "*" } else { "" }
+                    )
+                } else {
+                    format!("Tab #{local_id}{}", if active { "*" } else { "" })
+                };
+                if let (Some(c), Some(r)) = (cols, rows_n) {
+                    place.push_str(&format!(" \u{b7} {c}\u{d7}{r}"));
+                }
+                if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
+                    place.push_str(&format!(" \u{b7} {dir}"));
+                }
+                tabs.push(TabSpreadsheetRow {
+                    key: format!("remote/{name}/{inst_pid}/{local_id}"),
+                    computer: name.clone(),
+                    instance: format!("aterm-{inst_pid}"),
+                    place,
+                    sid,
+                    title,
+                    state,
+                    program: prog_label,
+                    is_ai_cli,
+                    ai_status,
+                    autopilot,
+                    human: human_activity_words(human_ms),
+                    show_local_id: None,
+                });
+            }
+        }
+        computers.push(TabComputer {
+            id: uuid,
+            name,
+            address,
+            os_version,
+            status,
+            instances: instance_pids.len(),
+            tabs: host_tabs,
+            ai_clis: host_ai,
+            active_ai: host_active_ai,
+        });
+    }
+    #[cfg(target_os = "macos")]
+    if !cfg!(test) && aterm_uds::test_binary::scratch_root().is_none() {
+        discover_bonjour_lan_computers(&mut computers, &custom_names);
+    }
+    (computers, tabs)
+}
+
+#[cfg(target_os = "macos")]
+fn run_dns_sd_bounded(args: &[&str], wait_ms: u64, stop_substr: Option<&str>) -> String {
+    use std::io::{BufRead, BufReader, Read};
+    let Ok((reader, writer)) = std::io::pipe() else {
+        return String::new();
+    };
+    let mut cmd = aterm_uds::spawnfd::command("/usr/bin/dns-sd");
+    cmd.args(args)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::from(writer))
+        .stderr(aterm_uds::spawnfd::Stdio::null());
+    let Ok(mut child) = cmd.spawn() else {
+        return String::new();
+    };
+    drop(cmd);
+    let (finished, finish) = std::sync::mpsc::channel();
+    // One owner kills and reaps the child, even when the reader finishes early.
+    // No detached PID-only signal can outlive the child and hit a reused PID.
+    let watcher = std::thread::spawn(move || {
+        let _ = finish.recv_timeout(std::time::Duration::from_millis(wait_ms));
+        let _ = child.kill();
+        let _ = child.wait();
+    });
+    let mut out = String::new();
+    let mut buf = BufReader::new(reader.take(64 * 1024));
+    loop {
+        let mut line = String::new();
+        match buf.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if !line.ends_with('\n') {
+                    break;
+                }
+                out.push_str(&line);
+                if let Some(needle) = stop_substr
+                    && line.contains(needle)
+                {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = finished.send(());
+    let _ = watcher.join();
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn parse_bonjour_service_instances(text: &str, want_svc: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        let mut cols = line.split_whitespace();
+        let Some(_ts) = cols.next() else { continue };
+        let Some(ar) = cols.next() else { continue };
+        let Some(_flags) = cols.next() else { continue };
+        let Some(_ifx) = cols.next() else { continue };
+        let Some(_dom) = cols.next() else { continue };
+        let Some(svc) = cols.next() else { continue };
+        if svc != want_svc {
+            continue;
+        }
+        let rest: Vec<&str> = cols.collect();
+        if rest.is_empty() {
+            continue;
+        }
+        let inst_name = rest.join(" ");
+        if ar == "Add" {
+            if !out.iter().any(|n| n.eq_ignore_ascii_case(&inst_name)) {
+                out.push(inst_name);
+            }
+        } else if ar == "Rmv" {
+            out.retain(|n| !n.eq_ignore_ascii_case(&inst_name));
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn describe_gui_hardware(model_id: Option<&str>) -> String {
+    model_id
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or("hardware unknown")
+        .to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_host_ipv4_and_banner(hostname: &str, port: u16) -> (Option<String>, Option<String>) {
+    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+    let ipv4 = (hostname, port).to_socket_addrs().ok().and_then(|addrs| {
+        addrs.into_iter().find_map(|a| match a {
+            SocketAddr::V4(v4) => Some(v4.ip().to_string()),
+            SocketAddr::V6(_) => None,
+        })
+    });
+    let banner = ipv4
+        .as_deref()
+        .and_then(|ip| ip.parse::<std::net::Ipv4Addr>().ok())
+        .and_then(|ip| {
+            let addr = SocketAddr::from((ip, port));
+            let stream =
+                TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(120)).ok()?;
+            read_ssh_banner(
+                &stream,
+                Instant::now() + std::time::Duration::from_millis(120),
+            )
+        });
+    (ipv4, banner)
+}
+
+#[cfg(target_os = "macos")]
+fn read_ssh_banner(mut stream: &std::net::TcpStream, deadline: Instant) -> Option<String> {
+    use std::io::Read;
+    let mut bytes = [0; 255];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        if remaining.is_zero() {
+            return None;
+        }
+        stream.set_read_timeout(Some(remaining)).ok()?;
+        let read = stream.read(&mut bytes[filled..]).ok()?;
+        if read == 0 {
+            return None;
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if let Some(newline) = bytes[filled..filled + read]
+            .iter()
+            .position(|b| *b == b'\n')
+        {
+            let end = filled + newline;
+            return std::str::from_utf8(&bytes[..=end])
+                .ok()?
+                .trim()
+                .strip_prefix("SSH-2.0-")
+                .filter(|banner| !banner.is_empty())
+                .map(str::to_owned);
+        }
+        filled += read;
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn bonjour_ssh_target(text: &str) -> Option<(String, u16)> {
+    for line in text.lines() {
+        let Some((_, rest)) = line.split_once(" can be reached at ") else {
+            continue;
+        };
+        let hostport = rest.split(" (interface ").next()?.trim();
+        let Some((host, port)) = hostport.rsplit_once(':') else {
+            continue;
+        };
+        let host = host.trim_end_matches('.');
+        let Ok(port) = port.parse::<u16>() else {
+            continue;
+        };
+        if !host.is_empty()
+            && !host.starts_with('-')
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        {
+            return Some((host.to_owned(), port));
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn parse_bonjour_device_txt(text: &str) -> (Option<String>, Option<u32>) {
+    let mut decoded = String::from(text);
+    for line in text.lines() {
+        if let Some((_, hex_part)) = line.split_once("bytes:") {
+            decoded.push(' ');
+            for tok in hex_part.split_whitespace() {
+                if tok.len() == 2
+                    && let Ok(b) = u8::from_str_radix(tok, 16)
+                {
+                    if (0x21..=0x7e).contains(&b) {
+                        decoded.push(b as char);
+                    } else {
+                        decoded.push(' ');
+                    }
+                }
+            }
+        }
+    }
+    let mut model = None;
+    let mut osxvers = None;
+    for tok in decoded.split(|c: char| c.is_whitespace() || c == '\\') {
+        if let Some(m) = tok.strip_prefix("model=") {
+            let clean: String = m
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == ',')
+                .collect();
+            if !clean.is_empty() {
+                model = Some(clean);
+            }
+        } else if let Some(v) = tok.strip_prefix("osxvers=") {
+            let digits: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = digits.parse::<u32>() {
+                osxvers = Some(n);
+            }
+        }
+    }
+    (model, osxvers)
+}
+
+#[cfg(target_os = "macos")]
+fn discover_bonjour_lan_computers(
+    computers: &mut Vec<TabComputer>,
+    custom_names: &std::collections::BTreeMap<String, String>,
+) {
+    let (ssh_txt, sftp_txt, rfb_txt) = std::thread::scope(|s| {
+        let h1 = s.spawn(|| run_dns_sd_bounded(&["-B", "_ssh._tcp", "local."], 140, None));
+        let h2 = s.spawn(|| run_dns_sd_bounded(&["-B", "_sftp-ssh._tcp", "local."], 140, None));
+        let h3 = s.spawn(|| run_dns_sd_bounded(&["-B", "_rfb._tcp", "local."], 140, None));
+        (
+            h1.join().unwrap_or_default(),
+            h2.join().unwrap_or_default(),
+            h3.join().unwrap_or_default(),
+        )
+    });
+    let mut lan_names = parse_bonjour_service_instances(&ssh_txt, "_ssh._tcp.");
+    let sftp_names = parse_bonjour_service_instances(&sftp_txt, "_sftp-ssh._tcp.");
+    let rfb_names = parse_bonjour_service_instances(&rfb_txt, "_rfb._tcp.");
+    lan_names.sort_by_key(|n| natural_lan_sort_key(n));
+
+    let raw_local = aterm_uds::process::host_name()
+        .map(|h| {
+            h.trim()
+                .strip_suffix(".local")
+                .unwrap_or(h.trim())
+                .to_string()
+        })
+        .unwrap_or_else(|| "this-Mac".to_string());
+    let local_canonical = canonical_host_name_gui(&raw_local, custom_names);
+    let local_dot = format!("{raw_local}.local");
+    let (local_ip, local_ssh) = resolve_host_ipv4_and_banner(&local_dot, 22);
+    let local_addr = match local_ip {
+        Some(ip) => format!("{ip} \u{b7} {local_dot}"),
+        None => local_dot.clone(),
+    };
+    let local_txt_q = format!("{}._device-info._tcp.local.", raw_local.replace('-', " "));
+    let local_txt = run_dns_sd_bounded(&["-Q", &local_txt_q, "TXT"], 80, Some("bytes:"));
+    let (local_model, local_osx) = parse_bonjour_device_txt(&local_txt);
+    let local_hw = describe_gui_hardware(local_model.as_deref());
+    let local_os_str = match local_osx {
+        Some(d) => format!("macOS (Darwin {d})"),
+        None => "macOS version unknown".to_string(),
+    };
+    let local_ssh_str = local_ssh
+        .as_deref()
+        .and_then(|b| b.split_whitespace().next())
+        .unwrap_or("SSH banner unknown");
+    let local_services: Vec<&str> = [
+        ("ssh", &lan_names),
+        ("sftp", &sftp_names),
+        ("screen-sharing", &rfb_names),
+    ]
+    .into_iter()
+    .filter_map(|(service, names)| {
+        names
+            .iter()
+            .any(|name| {
+                canonical_host_name_gui(name, custom_names).eq_ignore_ascii_case(&local_canonical)
+            })
+            .then_some(service)
+    })
+    .collect();
+    let local_services = if local_services.is_empty() {
+        "none observed".to_string()
+    } else {
+        local_services.join(", ")
+    };
+    computers.push(TabComputer {
+        id: "__local_meta__".to_string(),
+        name: format!("{local_canonical} (this Mac)"),
+        address: local_addr,
+        os_version: format!(
+            "{local_hw} \u{b7} {local_os_str} \u{b7} {local_ssh_str} \u{b7} advertised services: {local_services}"
+        ),
+        status: "online (local)".to_string(),
+        instances: 0,
+        tabs: 0,
+        ai_clis: 0,
+        active_ai: 0,
+    });
+
+    let candidates: Vec<String> = lan_names
+        .into_iter()
+        .filter(|inst_name| {
+            let canonical = canonical_host_name_gui(inst_name, custom_names);
+            if canonical.eq_ignore_ascii_case(&local_canonical) {
+                return false;
+            }
+            !computers.iter().any(|c| {
+                c.id != "__local_meta__"
+                    && (c.name.eq_ignore_ascii_case(&canonical)
+                        || c.name.eq_ignore_ascii_case(inst_name))
+            })
+        })
+        .collect();
+
+    let results: Vec<TabComputer> = std::thread::scope(|s| {
+        let handles: Vec<_> = candidates
+            .iter()
+            .map(|inst_name| {
+                let sftp_ref = &sftp_names;
+                let rfb_ref = &rfb_names;
+                s.spawn(move || {
+                    let canonical = canonical_host_name_gui(inst_name, custom_names);
+                    let resolve_out = run_dns_sd_bounded(
+                        &["-L", inst_name, "_ssh._tcp", "local."],
+                        100,
+                        Some("can be reached at"),
+                    );
+                    let (dot_local, port) = bonjour_ssh_target(&resolve_out)?;
+                    let txt_q = format!("{inst_name}._device-info._tcp.local.");
+                    let txt_out = run_dns_sd_bounded(&["-Q", &txt_q, "TXT"], 80, Some("bytes:"));
+                    let (model_id, osxvers) = parse_bonjour_device_txt(&txt_out);
+                    let (ipv4, ssh_banner) = resolve_host_ipv4_and_banner(&dot_local, port);
+                    let addr_display = match ipv4 {
+                        Some(ip) => format!("{ip} \u{b7} {dot_local}"),
+                        None => dot_local.clone(),
+                    };
+                    let has_sftp = sftp_ref.iter().any(|x| x.eq_ignore_ascii_case(inst_name));
+                    let has_rfb = rfb_ref.iter().any(|x| x.eq_ignore_ascii_case(inst_name));
+                    let mut svcs = vec!["ssh"];
+                    if has_sftp {
+                        svcs.push("sftp");
+                    }
+                    if has_rfb {
+                        svcs.push("screen-sharing");
+                    }
+                    let hw_display = describe_gui_hardware(model_id.as_deref());
+                    let os_str = osxvers.map_or_else(|| "OS version unknown".to_string(), |d| format!("Darwin {d}"));
+                    let ssh_short = ssh_banner
+                        .as_deref()
+                        .and_then(|b| b.split_whitespace().next())
+                        .unwrap_or("SSH banner unknown");
+                    let os_full = format!(
+                        "{hw_display} \u{b7} {os_str} \u{b7} {ssh_short} \u{b7} advertised services: {}",
+                        svcs.join(", ")
+                    );
+                    Some(TabComputer {
+                            id: format!("lan/{canonical}"),
+                            name: canonical,
+                            address: addr_display,
+                            os_version: os_full,
+                            status: if ssh_banner.is_some() { "reachable (ssh)".into() } else { "advertised (lan)".into() },
+                            instances: 0,
+                            tabs: 0,
+                            ai_clis: 0,
+                            active_ai: 0,
+                    })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().ok().flatten())
+            .collect()
+    });
+
+    for comp in results {
+        computers.push(comp);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn natural_lan_sort_key(name: &str) -> (u8, u64, String) {
+    let trimmed = name.trim();
+    if let Some(rest) = trimmed
+        .strip_prefix('m')
+        .or_else(|| trimmed.strip_prefix('M'))
+    {
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(num) = digits.parse::<u64>() {
+            return (0, num, trimmed.to_ascii_lowercase());
+        }
+    }
+    (1, 0, trimmed.to_ascii_lowercase())
 }
 
 /// Unix milliseconds now (the wall clock: the ledgers' rows are stamped on

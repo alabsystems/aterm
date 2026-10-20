@@ -181,7 +181,7 @@ fn until_field(w: &World, sid: &str, key: &str, want: &str) -> Duration {
              last row: {last:?}\n  gui/bridge log tail:\n{}",
             w.log_tail()
         );
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -240,7 +240,9 @@ fn write_fake_claude(dir: &std::path::Path) -> (PathBuf, PathBuf) {
 /// NEVER CARRIES THE SCREEN.**
 #[test]
 fn a_sessions_presence_row_relays_the_servers_agent_verdict_and_never_text() {
-    let w = World::boot("r13-presence", &[]);
+    // Every flip below lands inside the republish window of the row before it,
+    // so each waits for the next round: at test pace ([`harness::FAST_TIMERS`]).
+    let w = World::boot_with("r13-presence", &[], &[harness::FAST_TIMERS]);
     w.wait_ready();
     let (_boot, sid) = w.two_sessions();
 
@@ -340,16 +342,17 @@ fn a_sessions_presence_row_relays_the_servers_agent_verdict_and_never_text() {
 
     // `aterm link ls` PRINTS THE SAME FIELDS AS COLUMNS.
     let mut cmd = Command::new(harness::aterm_to_launch());
-    cmd.args([
-        "link",
-        "ls",
-        "--fleet",
-        FLEET,
-        "--broker",
-        &w.broker_sock,
-        "--cap-file",
-    ])
-    .arg(w.tmp.join("node.cap"));
+    harness::scratch_cli(&mut cmd, &w.tmp)
+        .args([
+            "link",
+            "ls",
+            "--fleet",
+            FLEET,
+            "--broker",
+            &w.broker_sock,
+            "--cap-file",
+        ])
+        .arg(w.tmp.join("node.cap"));
     let out = harness::output_within(&mut cmd, "aterm link ls");
     let ls = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -396,10 +399,15 @@ fn write_marked_program(dir: &std::path::Path, name: &str) -> PathBuf {
 /// that republishes the row (a new `detail=`) does NOT carry the change.
 #[test]
 fn a_meta_change_after_the_first_read_rides_the_push_alone() {
+    // The witness `detail=` is the round's to publish, and every change lands
+    // inside the republish window: at test pace ([`harness::FAST_TIMERS`]).
     let w = World::boot_with(
         "r13-meta-push",
         &[],
-        &[("ATERM_LINK_FAULT", "drop-meta-event-while-marked")],
+        &[
+            ("ATERM_LINK_FAULT", "drop-meta-event-while-marked"),
+            harness::FAST_TIMERS,
+        ],
     );
     w.wait_ready();
     let (_boot, sid) = w.two_sessions();

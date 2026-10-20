@@ -308,7 +308,8 @@ fn encode_numpad_named_legacy(
         // NumpadEnter: SS3 M in DECKPAM (VT52: ESC ? M), which tells it from the main Return
         // (#7558); Shift cancels application keypad mode. Outside application mode, and under
         // Alt, it is the main Enter byte for byte (CR, Shift's LF, Alt's ESC CR). Under ConPTY
-        // win32-input-mode a Shift/Ctrl+KP_Enter goes out earlier as an ENHANCED_KEY record.
+        // win32-input-mode a Shift/Ctrl+KP_Enter goes out earlier as an ENHANCED_KEY record, and
+        // so does a DECKPAM KP_Enter, on either console host (`encode_win32_keys`).
         NamedKey::NumpadEnter => {
             let effective_app = app_keypad && !modifiers.contains(Modifiers::SHIFT);
             if !effective_app || modifiers.contains(Modifiers::ALT) {
@@ -326,6 +327,8 @@ fn encode_numpad_named_legacy(
         // NumpadBegin (KP_BEGIN, the centre key with NumLock off): SS3 E in DECKPAM, CSI E
         // otherwise (xterm's `kb2`; the kitty encoder sends `E` too). The key has no glyph, so
         // it never sends a digit. Alt sends ESC + CSI E; VT52 application keypad `ESC ? 5`.
+        // Under OpenConsole, which types an unknown CSI as text, it is the `VK_CLEAR` record
+        // instead (`encode_win32_keys`).
         NamedKey::NumpadBegin => {
             let effective_app = app_keypad && !modifiers.contains(Modifiers::SHIFT);
             if modifiers.contains(Modifiers::ALT) {

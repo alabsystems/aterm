@@ -36,7 +36,8 @@ impl Parser {
     ///
     /// (The checks are `#[cfg(test)]`-gated rather than
     /// `#[cfg(debug_assertions)]`-gated: the only callers are this crate's
-    /// own tests, and Trust's strict gate fails closed on the deliberate
+    /// own tests, and the Trust lane (`ship trust run`) fails closed on the
+    /// deliberate
     /// `assert!` panic paths — which exist precisely to fire on violated
     /// invariants — when they appear in the shipped lib.)
     #[inline]
@@ -176,18 +177,7 @@ impl Parser {
                 );
             }
 
-            // A string payload's UTF-8 head is held only in the three strings
-            // whose 8-bit ST it decides (dispatch.rs drops it as one ends).
-            assert!(
-                self.string_utf8 == crate::utf8::Utf8Prefix::NONE
-                    || matches!(
-                        self.state,
-                        State::DcsPassthrough | State::DcsIgnore | State::SosPmApcString
-                    ),
-                "StringUtf8StateConsistent violated: {:?} held in state={:?}",
-                self.string_utf8,
-                self.state
-            );
+            self.assert_string_invariants();
 
             // NOTE: the param-parsing fields (`param_started`, `last_was_colon`,
             // `subparam_mask`) do NOT admit a clean state coupling — `clear()`
@@ -198,6 +188,35 @@ impl Parser {
             // colon in a local). Their only invariant is `subparam_mask`'s
             // bound vs `params.len()` (the `SubparamMaskValid` conjunct above),
             // which is state-independent.
+        }
+    }
+
+    /// The conjuncts of [`Self::assert_invariants`] over what a string
+    /// sequence holds between bytes.
+    #[cfg(test)]
+    fn assert_string_invariants(&self) {
+        // A string payload's UTF-8 head is held only in the three strings
+        // whose 8-bit ST it decides (dispatch.rs drops it as one ends).
+        assert!(
+            self.string_utf8 == crate::utf8::Utf8Prefix::NONE
+                || matches!(
+                    self.state,
+                    State::DcsPassthrough | State::DcsIgnore | State::SosPmApcString
+                ),
+            "StringUtf8StateConsistent violated: {:?} held in state={:?}",
+            self.string_utf8,
+            self.state
+        );
+
+        // TmuxHeadInIgnore: a tmux passthrough head is read only in the
+        // ignored DCS its `ESC P t` began, and holds 1 to 4 bytes of
+        // `tmux;` (the fifth opens the wrapper).
+        if let crate::TmuxPassthrough::Head(matched) = self.tmux {
+            assert!(
+                self.state == State::DcsIgnore && (1..=4).contains(&matched),
+                "TmuxHeadInIgnore violated: Head({matched}) in state={:?}",
+                self.state
+            );
         }
     }
 }

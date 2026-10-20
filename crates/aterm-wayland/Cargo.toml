@@ -18,6 +18,11 @@ description = "First-party Wayland client for aterm: generated protocol tables h
 # derived from smithay-client-toolkit 0.19.2 (LICENSE-MIT). No
 # smithay-client-toolkit here either: tests/live_seat.rs drives the seat and
 # selection helpers through Mutter.
+#
+# The integration files are modules of `tests/wayland_suite.rs`, one test
+# binary; `tests/live_seat.rs`, which holds Mutter's one seat, is its own.
+# With autotests off a `tests/*.rs` file listed nowhere never compiles.
+autotests = false
 
 [dependencies]
 # libwayland-client, opened at run time.
@@ -37,3 +42,11 @@ aterm-uds = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "wayland_suite"
+path = "tests/wayland_suite.rs"
+
+[[test]]
+name = "live_seat"
+path = "tests/live_seat.rs"

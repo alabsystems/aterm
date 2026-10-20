@@ -364,6 +364,9 @@ mod tests {
         let report = observe().expect("current_exe resolves under test");
         assert!(report.running.is_absolute(), "{report:?}");
         let exe = std::env::current_exe().unwrap();
+        // Resolved where `observe` resolves it: unix only, never into Windows's
+        // verbatim `\\?\C:\…` spelling.
+        #[cfg(unix)]
         let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
         // A test binary is never a `.app`, so the running path IS the executable.
         assert_eq!(report.kind, Running::Binary);

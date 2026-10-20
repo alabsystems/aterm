@@ -16,7 +16,7 @@
 //! Ownership mirrors [`crate::proxy`]'s `PROXIES`: one process-wide table behind a `OnceLock`,
 //! with the mutating helpers taking `&ConnectionStore` so tests run against a private store.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
@@ -114,100 +114,6 @@ pub(crate) enum ConnectedSpawnKind {
 pub(crate) enum ConnectedSpawnPlace {
     Window,
     Tab,
-}
-
-/// The marker file beside `aterm.toml` that latches the first-use notice: present ⇒ it has been
-/// shown in this config lifetime.
-const FIRST_USE_MARKER: &str = "connections-first-use";
-
-/// Whether the first-use notice should show now: true exactly once per config lifetime, deciding
-/// and latching atomically (`create_new`, so two racing processes cannot both claim it). An
-/// absent or unwritable config dir cannot latch and shows: repeating a disclosure beats hiding
-/// one.
-pub(crate) fn first_use_notice_should_show(config_path: Option<std::path::PathBuf>) -> bool {
-    let Some(dir) = config_path.as_deref().and_then(std::path::Path::parent) else {
-        return true;
-    };
-    // The config dir may not exist yet on a fresh install; best-effort, since a
-    // failed create falls through to `create_new`, whose error decides.
-    let _ = std::fs::create_dir_all(dir);
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dir.join(FIRST_USE_MARKER))
-    {
-        Ok(_) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-        // Unwritable dir: cannot latch — show (see above), and say why once.
-        Err(e) => {
-            aterm_log::warn!("connections first-use latch not persisted: {e}");
-            true
-        }
-    }
-}
-
-/// The first-use notice body for a connected spawn: names the authority the preset created
-/// (direction included; controlled vs controller invert who drives) and the undo, as
-/// `"<marker> <title> — <detail>"`, which `message_reporters::session_connection_created` splits
-/// into a message-log record's title and detail lines.
-pub(crate) fn first_use_notice_text(kind: ConnectedSpawnKind) -> String {
-    let direction = match kind {
-        ConnectedSpawnKind::Controlled => "this session can now type into and read the new one",
-        ConnectedSpawnKind::Controller => "the new session can now type into and read this one",
-    };
-    format!(
-        "\u{21c6} Session connection created \u{2014} {direction}, as at its keyboard; \
-         Disconnect (tab menu, or the `disconnect` verb) undoes it"
-    )
-}
-
-/// The first-use notice body for a connect confirmed from the card (drop popover or Configure…
-/// sheet; the same latch as the spawn presets, so the disclosure shows once whichever surface
-/// mints first). Direction comes from the card's selection: which side can act at whose keyboard.
-pub(crate) fn first_use_connect_notice_text(src_drives: bool, dst_drives: bool) -> String {
-    let direction = match (src_drives, dst_drives) {
-        (true, true) => "each session can now act at the other's keyboard",
-        (false, true) => "the peer session can now act at this one's keyboard",
-        _ => "this session can now act at the peer's keyboard",
-    };
-    format!(
-        "\u{21c6} Session connection created \u{2014} {direction}; \
-         Disconnect (tab menu, or the `disconnect` verb) undoes it"
-    )
-}
-
-/// What each direction of the pair `(a → b, b → a)` holds in the live edge tables: the
-/// configure card's prefill. Tables, not the record store, so a wire `grant` with no
-/// [`ConnectionRecord`] prefills honestly. Ops fold to the closed kind vocabulary
-/// (write-input/signal ⇒ push half, read-screen ⇒ pull half, both ⇒ `Both`), so a partial op
-/// set spells the nearest kind rather than hiding the connection.
-pub(crate) fn pair_kinds(
-    sessions: &Store,
-    a: &SessionId,
-    b: &SessionId,
-) -> (Option<ConnectionKind>, Option<ConnectionKind>) {
-    let mut fold = [(false, false), (false, false)]; // (pull, push) per direction
-    for edge in all_edges(sessions) {
-        let slot = if edge.src == *a && edge.dst == *b {
-            0
-        } else if edge.src == *b && edge.dst == *a {
-            1
-        } else {
-            continue;
-        };
-        match edge.op {
-            Op::ReadScreen => fold[slot].0 = true,
-            Op::WriteInput | Op::Signal => fold[slot].1 = true,
-            _ => {}
-        }
-    }
-    let kind = |(pull, push)| match (pull, push) {
-        (true, true) => Some(ConnectionKind::Both),
-        (true, false) => Some(ConnectionKind::Pull),
-        (false, true) => Some(ConnectionKind::Push),
-        (false, false) => None,
-    };
-    (kind(fold[0]), kind(fold[1]))
 }
 
 /// The [`ConnectionKind`] a carried seamless-handoff op set spells, plus the ops the re-mint
@@ -429,20 +335,6 @@ pub(crate) fn all_edges(sessions: &Store) -> Vec<aterm_session::Edge> {
     out
 }
 
-/// Distinct directed non-self-loop `(src → dst)` pairs across the live edge tables: the ❯ status
-/// item's connections count. The same [`all_edges`] fold the map draws its arrows from, so the
-/// menu's number and the map it opens agree; tables, not the record store, so a wire `grant`
-/// with no [`ConnectionRecord`] still counts.
-pub(crate) fn connection_count(sessions: &Store) -> usize {
-    let mut pairs: HashSet<(SessionId, SessionId)> = HashSet::new();
-    for edge in all_edges(sessions) {
-        if edge.src != edge.dst {
-            pairs.insert((edge.src, edge.dst));
-        }
-    }
-    pairs.len()
-}
-
 /// One session's connection roles, for the mark: `outbound` ▲ = it holds authority into some
 /// other session, `inbound` ▽ = some other session holds authority over it, both = ⧗.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -630,9 +522,9 @@ mod tests {
             rewrap_gauge: std::sync::Arc::default(),
             human_input: Default::default(),
             launch: Default::default(),
-            generation_look: Default::default(),
             reset_lane: Default::default(),
             crash_journal: Default::default(),
+            typed: Default::default(),
             update_parked: Default::default(),
             witness: Default::default(),
             fenced_writes: Default::default(),
@@ -1003,45 +895,6 @@ mod tests {
                 inbound: false,
                 outbound: true
             }
-        );
-    }
-
-    #[test]
-    fn first_use_notice_latches_once_per_config_lifetime() {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-test-conn-first-use-{}-{}",
-            std::process::id(),
-            aterm_time::since_epoch().unwrap().as_nanos()
-        ));
-        let cfg = Some(dir.join("aterm.toml"));
-        // First UI connect: shows and latches (marker file appears)…
-        assert!(first_use_notice_should_show(cfg.clone()));
-        assert!(dir.join(FIRST_USE_MARKER).exists());
-        // …every later connect in this config lifetime is quiet.
-        assert!(!first_use_notice_should_show(cfg.clone()));
-        assert!(!first_use_notice_should_show(cfg));
-        let _ = std::fs::remove_dir_all(&dir);
-        // No config dir: cannot latch — a disclosure is never silently skipped.
-        assert!(first_use_notice_should_show(None));
-    }
-
-    #[test]
-    fn first_use_notice_names_the_authority_direction_and_the_undo() {
-        let controlled = first_use_notice_text(ConnectedSpawnKind::Controlled);
-        let controller = first_use_notice_text(ConnectedSpawnKind::Controller);
-        for text in [&controlled, &controller] {
-            assert!(text.contains("Session connection"), "{text}");
-            assert!(text.contains("Disconnect"), "undo named: {text}");
-        }
-        // The two presets invert who drives; the notice must not blur that.
-        assert_ne!(controlled, controller);
-        assert!(
-            controlled.contains("this session can now type into"),
-            "{controlled}"
-        );
-        assert!(
-            controller.contains("the new session can now type into"),
-            "{controller}"
         );
     }
 

@@ -15,6 +15,7 @@ use std::collections::BTreeSet;
 use aterm_tempfile::TempDir as Tmp;
 
 use super::*;
+use crate::harness::host_path::abs;
 
 /// A fixed clock: never `now()`.
 const NOW: i64 = 1_790_000_000;
@@ -184,7 +185,11 @@ fn why_not(
 // 1. The roster
 // ---------------------------------------------------------------------------
 
-const REFERENCE: &str = r#"
+/// [`three`] as the owner writes it, its dirs absolute on this host
+/// ([`abs`]).
+fn reference() -> String {
+    format!(
+        r#"
 # The owner's accounts.
 [[account]]
 label = "main"             # no dir: the login this machine already has
@@ -193,18 +198,32 @@ class = "dedicated"
 [[account]]
 label = "work-2"
 class = "dedicated"
-dir = "/logins/work-2"
+dir = "{}"
 
 [[account]]
 label = "pool-a"
 class = "shared"
-dir = "/logins/pool-a"
-"#;
+dir = "{}"
+"#,
+        abs("/logins/work-2"),
+        abs("/logins/pool-a")
+    )
+}
+
+/// [`three`], its dirs as [`reference`] spells them.
+fn three_here() -> Roster {
+    let (work, pool) = (abs("/logins/work-2"), abs("/logins/pool-a"));
+    roster(&[
+        ("main", Class::Dedicated, None),
+        ("work-2", Class::Dedicated, Some(&work)),
+        ("pool-a", Class::Shared, Some(&pool)),
+    ])
+}
 
 #[test]
 fn a_roster_admits_whole_in_file_order_and_a_missing_file_is_the_empty_roster() {
-    let parsed = Roster::parse(REFERENCE).expect("the reference roster admits");
-    assert_eq!(parsed, three());
+    let parsed = Roster::parse(&reference()).expect("the reference roster admits");
+    assert_eq!(parsed, three_here());
     assert_eq!(
         parsed.row("pool-a").map(|r| r.class),
         Some(Class::Shared),
@@ -223,8 +242,8 @@ fn a_roster_admits_whole_in_file_order_and_a_missing_file_is_the_empty_roster() 
         Ok(Roster::default()),
         "a missing file is not an error"
     );
-    std::fs::write(&path, REFERENCE).expect("write");
-    assert_eq!(Roster::load(&path), Ok(three()));
+    std::fs::write(&path, reference()).expect("write");
+    assert_eq!(Roster::load(&path), Ok(three_here()));
 
     // NEGATIVE CASES for the file itself: unreadable, not text, too large.
     assert!(
@@ -347,7 +366,8 @@ fn every_malformed_roster_is_refused_whole_and_names_the_row_and_the_reason() {
     let many = |n: usize| -> String {
         (0..n)
             .map(|i| {
-                format!("[[account]]\nlabel = \"a{i}\"\nclass = \"shared\"\ndir = \"/x{i}\"\n")
+                let dir = abs(&format!("/x{i}"));
+                format!("[[account]]\nlabel = \"a{i}\"\nclass = \"shared\"\ndir = \"{dir}\"\n")
             })
             .collect()
     };
@@ -401,7 +421,9 @@ fn a_dir_is_used_verbatim_and_two_spellings_of_one_place_are_two_logins() {
         "/logins/ünï/",
         "/logins//double",
         "/logins/trailing-space ",
-    ];
+    ]
+    .map(abs);
+    let spellings = spellings.each_ref().map(String::as_str);
     let mut text = String::new();
     for (i, dir) in spellings.iter().enumerate() {
         let row = row_toml(&format!("w{i}"), Class::Shared, Some(dir)).expect("a row");
@@ -449,18 +471,14 @@ fn append_row_writes_only_what_the_next_read_admits() {
         "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n"
     );
     // An existing file with no final line break still gets a clean block.
-    let two = append_row(
-        one.trim_end(),
-        "pool-a",
-        Class::Shared,
-        Some("/logins/pool-a"),
-    )
-    .expect("the second row");
+    let (pool, w) = (abs("/logins/pool-a"), abs("/logins/w"));
+    let two =
+        append_row(one.trim_end(), "pool-a", Class::Shared, Some(&pool)).expect("the second row");
     assert_eq!(
         Roster::parse(&two).expect("admits").rows,
         roster(&[
             ("main", Class::Dedicated, None),
-            ("pool-a", Class::Shared, Some("/logins/pool-a")),
+            ("pool-a", Class::Shared, Some(&pool)),
         ])
         .rows
     );
@@ -468,14 +486,9 @@ fn append_row_writes_only_what_the_next_read_admits() {
 
     // NEGATIVE CASES, each by name, and nothing is handed back to write.
     let cases: [(&str, &str, Option<&str>, &str); 3] = [
-        (&two, "work-2", Some("/logins/pool-a"), "name one dir"),
+        (&two, "work-2", Some(&pool), "name one dir"),
         (&two, "work-2", None, "both name no dir"),
-        (
-            "oops = 1\n",
-            "work-2",
-            Some("/logins/w"),
-            "unknown key `oops`",
-        ),
+        ("oops = 1\n", "work-2", Some(&w), "unknown key `oops`"),
     ];
     for (existing, label, dir, why) in cases {
         assert!(
@@ -626,6 +639,7 @@ fn full_state() -> State {
     s.reset = Some(ResetClaim {
         account: "main".to_string(),
         until: Some(NOW + HOUR),
+        window: Some(WEEK_LIMIT.to_owned()),
         sid: "s-1a2b".to_string(),
         at: NOW - 4,
         pid: 4242,
@@ -699,7 +713,7 @@ fn the_state_round_trips_through_json_with_sorted_keys_and_null_for_unknown() {
         aterm_json::to_string(&doc["reset"]).expect("text"),
         format!(
             "{{\"account\":\"main\",\"at\":{},\"done\":\"kept\",\"pid\":4242,\
-             \"sid\":\"s-1a2b\",\"start\":\"1790000000.250000\",\"until\":{}}}",
+             \"sid\":\"s-1a2b\",\"start\":\"1790000000.250000\",\"until\":{},\"window\":\"seven_day\"}}",
             NOW - 4,
             NOW + HOUR
         )
@@ -727,7 +741,7 @@ fn the_state_round_trips_through_json_with_sorted_keys_and_null_for_unknown() {
             "{label}"
         );
     }
-    for key in ["pid", "start", "done"] {
+    for key in ["pid", "start", "done", "window"] {
         assert!(at(&mut old, &["reset"]).remove(key).is_some(), "{key}");
     }
     let read = State::from_json(&aterm_json::to_string(&old).expect("text"), NOW).expect("loads");
@@ -736,6 +750,7 @@ fn the_state_round_trips_through_json_with_sorted_keys_and_null_for_unknown() {
         account.ran_at = None;
     }
     want.reset = Some(ResetClaim {
+        window: None,
         pid: 0,
         start: String::new(),
         done: None,
@@ -879,6 +894,7 @@ fn a_stamp_ahead_of_the_clock_is_read_as_made_no_later_than_now_plus_the_skew() 
             at: ahead,
             by: "0a0b".into(),
             attempts: 0,
+            cleared: false,
         },
     );
     main.sample = Some(Sample {
@@ -1268,6 +1284,7 @@ fn a_wall_stands_until_its_instant_and_not_a_second_longer() {
         at,
         by: String::new(),
         attempts,
+        cleared: false,
     };
     let reset = NOW + HOUR;
     // (the wall, the instant it stops standing)
@@ -1289,7 +1306,7 @@ fn a_wall_stands_until_its_instant_and_not_a_second_longer() {
         (wall(None, NOW, 0), NOW + 30 * MIN),
     ];
     for (w, end) in cases {
-        assert_eq!(w.stands_until(), end, "{w:?}");
+        assert_eq!(w.stands_until(), Some(end), "{w:?}");
         let mut s = state();
         s.accounts
             .entry("work-2".into())
@@ -1318,8 +1335,8 @@ fn a_wall_stands_until_its_instant_and_not_a_second_longer() {
         }
     );
     // A hostile instant saturates instead of wrapping.
-    assert_eq!(wall(Some(i64::MAX), 0, 0).stands_until(), i64::MAX);
-    assert_eq!(wall(None, i64::MAX, 3).stands_until(), i64::MAX);
+    assert_eq!(wall(Some(i64::MAX), 0, 0).stands_until(), Some(i64::MAX));
+    assert_eq!(wall(None, i64::MAX, 3).stands_until(), Some(i64::MAX));
 }
 
 #[test]
@@ -3935,7 +3952,8 @@ fn a_stamp_ahead_of_the_clock_is_not_recent_and_shadows_nothing() {
             until: Some(NOW + 2 * HOUR),
             at: NOW,
             by: "0a0b".into(),
-            attempts: 0
+            attempts: 0,
+            cleared: false,
         }
     );
     // …and the same wall seen again brings its stamp back to the clock, so
@@ -3980,7 +3998,7 @@ const START: &str = "1790000000.250000";
 fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
     let until = NOW + 30 * HOUR;
     let take = |s: &mut State, sid: &str, pid: u32, until: i64, now: i64| {
-        claim_reset(s, "main", until, sid, pid, START, now)
+        claim_reset(s, "main", (WEEK_LIMIT, until), sid, pid, START, now)
     };
     let held = ResetClaimed::Held {
         until: NOW + RESET_CLAIM_S,
@@ -3994,6 +4012,7 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
         Some(ResetClaim {
             account: "main".into(),
             until: Some(until),
+            window: Some(WEEK_LIMIT.to_owned()),
             sid: "s-one".into(),
             at: NOW,
             pid: 41,
@@ -4011,12 +4030,25 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
         ResetClaimed::Mine
     );
     assert_eq!(take(&mut s, "s-two", 42, until, NOW + 5), held);
+    assert_eq!(
+        claim_reset(
+            &mut s,
+            "main",
+            (SESSION_LIMIT, until),
+            "s-one",
+            41,
+            START,
+            NOW + 5
+        ),
+        held,
+        "same reset time does not retarget the claim"
+    );
     assert_eq!(take(&mut s, "s-one", 43, until, NOW + 5), held);
     assert_eq!(
         claim_reset(
             &mut s,
             "main",
-            until,
+            (WEEK_LIMIT, until),
             "s-one",
             41,
             "1790000300.000000",
@@ -4027,7 +4059,15 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
     assert_eq!(take(&mut s, "s-two", 42, until + 7 * DAY, NOW + 5), held);
     assert_eq!(take(&mut s, "s-one", 41, until + 7 * DAY, NOW + 5), held);
     assert_eq!(
-        claim_reset(&mut s, "work-2", until, "s-two", 42, START, NOW + 5),
+        claim_reset(
+            &mut s,
+            "work-2",
+            (WEEK_LIMIT, until),
+            "s-two",
+            42,
+            START,
+            NOW + 5
+        ),
         held
     );
     assert_eq!(s, claimed, "none of them wrote anything");
@@ -4124,7 +4164,15 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
     // anyone.
     let renamed = |s: &State, sid: &str, pid: u32, until: i64, now: i64| {
         let mut s = s.clone();
-        let said = claim_reset(&mut s, "personal", until, sid, pid, START, now);
+        let said = claim_reset(
+            &mut s,
+            "personal",
+            (WEEK_LIMIT, until),
+            sid,
+            pid,
+            START,
+            now,
+        );
         (said, s)
     };
     for (name, from, now) in [("done", &done, NOW + 10), ("lapsed", &claimed, lapsed)] {
@@ -4191,7 +4239,15 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
         ("Not A Label", "s-one", 41, START),
     ] {
         assert_eq!(
-            claim_reset(&mut empty, account, until, sid, pid, start, NOW),
+            claim_reset(
+                &mut empty,
+                account,
+                (WEEK_LIMIT, until),
+                sid,
+                pid,
+                start,
+                NOW
+            ),
             ResetClaimed::Attempted,
             "{account:?} {sid:?} {pid} {start:?}"
         );
@@ -4221,9 +4277,9 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
     assert_eq!(take(&mut older, "s-one", 41, until, NOW + 5), held);
 }
 
-/// A RESET USED, OR A LIMIT FOUND LIFTED, ENDS THE ACCOUNT'S WALLS FOR
-/// EVERYONE: the walls are cleared and the instant kept, so the roster
-/// answers `Resume` to a session still standing at the old row. The row is
+/// A reset used or a limit found lifted clears only its claimed raw wall,
+/// with its timestamp retained in
+/// that wall's slot. Other walls still limit the account. The row is
 /// `reset-used` only for `Used`; a limit that lifted by itself is
 /// `reset-kept`. Each outcome is recorded once and wakes the waiting tabs.
 ///
@@ -4232,7 +4288,7 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
 /// session is still rotated; and a reason is one bounded word, never a path
 /// or an address.
 #[test]
-fn a_reset_used_or_a_limit_lifted_ends_the_walls_and_kept_or_failed_changes_none() {
+fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
     let r = three();
     let enrolled = all(&r);
     let written = NOW - HOUR;
@@ -4249,24 +4305,40 @@ fn a_reset_used_or_a_limit_lifted_ends_the_walls_and_kept_or_failed_changes_none
             s,
             &enrolled,
             &me("main"),
-            &wall_at(written),
+            &Point::Wall {
+                window: WEEK_LIMIT.to_owned(),
+                at: Some(written),
+            },
             Mode::Wall,
             NOW,
         )
     };
     let limited_now = |s: &State| matches!(cond(&r, s, "main", NOW), Condition::Limited { .. });
 
-    // Two walls on record for main, a pin's worth of machine-local facts,
+    // Generic, model-specific and unknown walls at shared reset times,
     // and the claim.
     let mut walled = on_main();
-    for (window, end) in [("seven_day", until), ("five_hour", NOW + 2 * HOUR)] {
+    for (window, end) in [
+        (WEEK_LIMIT, until),
+        (SESSION_LIMIT, NOW + 2 * HOUR),
+        ("seven_day_sonnet", until),
+        ("future_quota", until),
+    ] {
         assert_eq!(
             note_wall(&mut walled, "main", window, Some(end), written, written).len(),
             1
         );
     }
     assert_eq!(
-        claim_reset(&mut walled, "main", until, "s-one", 41, START, NOW - MIN),
+        claim_reset(
+            &mut walled,
+            "main",
+            (WEEK_LIMIT, until),
+            "s-one",
+            41,
+            START,
+            NOW - MIN
+        ),
         ResetClaimed::Taken
     );
     // NEGATIVE CONTROL: with the reset only claimed, the wall stands and the
@@ -4289,8 +4361,19 @@ fn a_reset_used_or_a_limit_lifted_ends_the_walls_and_kept_or_failed_changes_none
         );
         assert!(rows[0].wakes(), "{done:?}");
         let main = &s.accounts["main"];
-        assert!(main.walls.is_empty(), "{done:?}: every wall of the account");
-        assert_eq!(main.cleared_at, Some(NOW), "{done:?}");
+        assert!(main.walls[WEEK_LIMIT].cleared, "{done:?}: the claimed wall");
+        for window in [SESSION_LIMIT, "seven_day_sonnet", "future_quota"] {
+            assert_eq!(
+                main.walls[window], walled.accounts["main"].walls[window],
+                "{done:?}: {window}"
+            );
+        }
+        assert_eq!(
+            main.cleared_at, None,
+            "{done:?}: no account-wide owner clear"
+        );
+        assert_eq!(main.cleared_since(WEEK_LIMIT, written, NOW), Some(NOW));
+        assert_eq!(main.cleared_since(SESSION_LIMIT, written, NOW), None);
         assert_eq!(
             s.reset.as_ref().and_then(|c| c.done.as_deref()),
             Some(done.word()),
@@ -4302,26 +4385,53 @@ fn a_reset_used_or_a_limit_lifted_ends_the_walls_and_kept_or_failed_changes_none
         same.accounts = s.accounts.clone();
         assert_eq!(s, same, "{done:?}: active, the proof and the pin are left");
 
-        // THE SESSION AT THE OLD ROW IS RESUMED where it stands (the
-        // clearing's rules are the owner's word's, above) — with no roster
-        // file too, for the one row a reset is judged by.
-        assert!(!limited_now(&s), "{done:?}");
-        assert_eq!(ask(&s), Advice::Resume { cleared_at: NOW }, "{done:?}");
+        // An unrelated standing wall still refuses an account resume. With
+        // only the cleared window left, its old row can resume in place.
+        assert!(limited_now(&s), "{done:?}: unrelated walls still stand");
+        assert_eq!(ask(&s), rotate, "{done:?}: no resume through another wall");
+        let mut only_claimed = s.clone();
+        only_claimed
+            .accounts
+            .get_mut("main")
+            .expect("account")
+            .walls
+            .retain(|window, _| window == WEEK_LIMIT);
+        assert_eq!(
+            ask(&only_claimed),
+            Advice::Resume { cleared_at: NOW },
+            "{done:?}"
+        );
         let before = s.clone();
         let own = Roster::own();
         assert_eq!(
             advise(
                 &own,
-                &s,
+                &only_claimed,
                 &all(&own),
                 &me("main"),
-                &wall_at(written),
+                &Point::Wall {
+                    window: WEEK_LIMIT.to_owned(),
+                    at: Some(written)
+                },
                 Mode::Wall,
                 NOW
             ),
             Advice::Resume { cleared_at: NOW },
             "{done:?}"
         );
+        // The scoped clear survives disk, ignores its old transcript row,
+        // and does not suppress a genuinely new row from the same second.
+        let mut read = State::from_json(&s.to_json(), NOW).expect("scoped clear reads");
+        assert_eq!(read, s);
+        assert!(note_wall(&mut read, "main", WEEK_LIMIT, Some(until), written, NOW + 1).is_empty());
+        assert_eq!(read, s, "an older row cannot resurrect the claimed wall");
+        assert_eq!(
+            note_wall(&mut read, "main", WEEK_LIMIT, Some(until), NOW, NOW + 1).len(),
+            1
+        );
+        assert!(!read.accounts["main"].walls[WEEK_LIMIT].cleared);
+        assert_eq!(read.accounts["main"].walls[WEEK_LIMIT].at, NOW);
+
         // Recorded once.
         assert!(
             reset_outcome(
@@ -4336,6 +4446,49 @@ fn a_reset_used_or_a_limit_lifted_ends_the_walls_and_kept_or_failed_changes_none
             "{done:?}"
         );
         assert_eq!(s, before, "{done:?}");
+    }
+
+    // An old on-disk claim has no raw scope. Its outcome is recorded, but
+    // cannot clear even a wall sharing its reset time.
+    let mut unscoped = walled.clone();
+    unscoped.reset.as_mut().expect("claim").window = None;
+    reset_outcome(
+        &mut unscoped,
+        "main",
+        until,
+        "s-one",
+        &ResetDone::Used { left: None },
+        NOW,
+    );
+    assert_eq!(unscoped.accounts, walled.accounts);
+    assert_eq!(
+        unscoped.reset.as_ref().and_then(|c| c.done.as_deref()),
+        Some("used")
+    );
+
+    // A newer different period, or the old wall found standing past its
+    // grace, must survive a delayed answer to this claim.
+    for (new_until, observed) in [(until + DAY, NOW - 1), (until, until + RESET_GRACE_S + 1)] {
+        let mut newer = walled.clone();
+        note_wall(
+            &mut newer,
+            "main",
+            WEEK_LIMIT,
+            Some(new_until),
+            observed,
+            observed,
+        );
+        assert_eq!(newer.accounts["main"].walls[WEEK_LIMIT].at, observed);
+        let accounts_before = newer.accounts.clone();
+        reset_outcome(
+            &mut newer,
+            "main",
+            until,
+            "s-one",
+            &ResetDone::Lifted,
+            observed + 1,
+        );
+        assert_eq!(newer.accounts, accounts_before);
     }
 
     // KEPT AND FAILED CHANGE NO WALL. The reason is the caller's word; a
@@ -5375,6 +5528,7 @@ fn the_recorder_records_this_process_wall_for_its_account_once() {
             at: NOW - 10,
             by: state.machine.clone(),
             attempts: 0,
+            cleared: false,
         }
     );
     assert_eq!(
@@ -6099,7 +6253,8 @@ fn several_accounts_are_listed_only_by_a_roster_that_admits_two() {
     std::fs::write(&path, one).unwrap();
     assert!(!several_listed(Some(&path)), "one account is one login");
     let two = format!(
-        "{one}\n[[account]]\nlabel = \"work-2\"\nclass = \"dedicated\"\ndir = \"/logins/work-2\"\n"
+        "{one}\n[[account]]\nlabel = \"work-2\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
+        abs("/logins/work-2")
     );
     std::fs::write(&path, &two).unwrap();
     assert!(several_listed(Some(&path)));
@@ -6960,7 +7115,7 @@ fn a_limit_reset_refills_the_walled_window_and_no_other() {
         };
         for s in [
             warned(NOW, true, 96, Some(week_end)),
-            warned(NOW + MIN, false, 91, Some(session_end)),
+            warned(NOW + 5, false, 91, Some(session_end)),
         ] {
             record_usage(&store, &r, "s-1", &stored(), &s, s.at);
         }
@@ -6992,7 +7147,7 @@ fn a_limit_reset_refills_the_walled_window_and_no_other() {
         assert_eq!(windows_full(&r, &state, NOW + 20), line, "the control");
         store
             .transact_within(&LOCK_LADDER, NOW + 30, &mut note, |state| {
-                let taken = claim_reset(state, OWN, until, "s-1", 41, START, NOW + 30);
+                let taken = claim_reset(state, OWN, (limit, until), "s-1", 41, START, NOW + 30);
                 assert_eq!(taken, ResetClaimed::Taken);
                 Ok(reset_outcome(state, OWN, until, "s-1", done, end))
             })
@@ -7043,6 +7198,112 @@ fn a_limit_reset_refills_the_walled_window_and_no_other() {
         assert_eq!(lines, line, "{done:?}");
         assert_eq!(account.warned_week.and_then(|w| w.pct), Some(96));
     }
+
+    // A sample without a captured warning must stop reporting the exact
+    // refilled bucket as low. A model-specific/unknown quota is not either
+    // generic bucket, even when the reset timestamp is shared.
+    let sampled_claim = |window: &str| {
+        let mut s = state();
+        note_sample(
+            &mut s,
+            OWN,
+            Sample {
+                session_pct: Some(98),
+                session_reset: Some(session_end),
+                week_pct: Some(99),
+                week_reset: Some(week_end),
+                at: NOW,
+                by: String::new(),
+            },
+            NOW,
+        );
+        let until = if window == SESSION_LIMIT {
+            session_end
+        } else {
+            week_end
+        };
+        note_wall(&mut s, OWN, window, Some(until), NOW + 10, NOW + 10);
+        assert_eq!(
+            claim_reset(&mut s, OWN, (window, until), "s-1", 41, START, NOW + 30),
+            ResetClaimed::Taken
+        );
+        (s, until)
+    };
+    for window in [
+        WEEK_LIMIT,
+        SESSION_LIMIT,
+        "seven_day_sonnet",
+        "future_quota",
+    ] {
+        let (mut s, until) = sampled_claim(window);
+        reset_outcome(
+            &mut s,
+            OWN,
+            until,
+            "s-1",
+            &ResetDone::Used { left: None },
+            NOW + 40,
+        );
+        let account = s.account(OWN);
+        assert_eq!(
+            account.week_low_until(NOW + 40),
+            (window != WEEK_LIMIT).then_some(week_end),
+            "{window}: week"
+        );
+        assert_eq!(
+            account.session_low_until(NOW + 40),
+            (window != SESSION_LIMIT).then_some(session_end),
+            "{window}: session"
+        );
+    }
+
+    // A later warning or sample can be fresh consumption after the reset,
+    // even when the vendor kept its reset day. A delayed outcome cannot
+    // erase either same-period or different-period evidence.
+    for (newer_sample, changed_period) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let (mut s, until) = sampled_claim(WEEK_LIMIT);
+        let new_end = week_end + if changed_period { DAY } else { 0 };
+        if newer_sample {
+            note_sample(
+                &mut s,
+                OWN,
+                Sample {
+                    week_pct: Some(99),
+                    week_reset: Some(new_end),
+                    at: NOW + 35,
+                    ..Sample::default()
+                },
+                NOW + 35,
+            );
+        } else {
+            note_warning(
+                s.accounts.get_mut(OWN).expect("account"),
+                OWN,
+                WarningRead {
+                    weekly: true,
+                    pct: 99,
+                    reset: Some(new_end),
+                },
+                NOW + 35,
+                NOW + 35,
+            );
+        }
+        reset_outcome(
+            &mut s,
+            OWN,
+            until,
+            "s-1",
+            &ResetDone::Used { left: None },
+            NOW + 40,
+        );
+        assert_eq!(
+            s.account(OWN).week_low_until(NOW + 40),
+            Some(new_end),
+            "sample={newer_sample} changed_period={changed_period}"
+        );
+    }
 }
 
 /// A WARNING DRAWN BEFORE A RESET SAYS NOTHING AFTER IT, ON ANY TAB (the
@@ -7069,7 +7330,7 @@ fn a_warning_drawn_before_a_reset_says_nothing_after_it() {
         .transact_within(&LOCK_LADDER, NOW, &mut note, |state| {
             let mut rows = note_wall(state, OWN, WEEK_LIMIT, Some(week_end), NOW, NOW);
             assert_eq!(
-                claim_reset(state, OWN, week_end, "s-a", 41, START, NOW),
+                claim_reset(state, OWN, (WEEK_LIMIT, week_end), "s-a", 41, START, NOW),
                 ResetClaimed::Taken
             );
             rows.extend(reset_outcome(
@@ -7260,7 +7521,15 @@ fn the_lines_week_is_the_warnings_word_never_a_samples() {
     edit(NOW + 10 * MIN, &|state| {
         let mut rows = note_wall(state, OWN, WEEK_LIMIT, Some(week_end), NOW, NOW + 10 * MIN);
         assert_eq!(
-            claim_reset(state, OWN, week_end, "s-1", 41, START, NOW + 10 * MIN),
+            claim_reset(
+                state,
+                OWN,
+                (WEEK_LIMIT, week_end),
+                "s-1",
+                41,
+                START,
+                NOW + 10 * MIN
+            ),
             ResetClaimed::Taken
         );
         rows.extend(reset_outcome(
@@ -7416,4 +7685,162 @@ fn a_tap_reading_keeps_the_largest_figure_within_a_window_and_writes_only_news()
         probe.accounts["main"].sample.as_ref().unwrap().session_pct,
         Some(58)
     );
+}
+
+/// ON-SCREEN WARNINGS AND OVERAGE CREDITS ROTATE EARLY BEFORE THE WALL: a
+/// five-hour warning at or above [`LOW_SESSION_PCT`] (90%), a weekly warning at
+/// or above [`LOW_WEEK_PCT`] (97%), or overage credits carrying a session
+/// ([`Credits::InUse`]) marks the subscription [`Condition::Low`], ranks it
+/// behind fresh accounts (`WhyNot::LowAheadOfAWall` ahead of a wall, `Rank {
+/// low: true, .. }` at one), and moves the session to the next fresh
+/// subscription at a turn end in [`Mode::Early`] without typing `/usage`. The
+/// 15-minute [`RESET_SOON_S`] guard holds a session whose low window or credits
+/// episode resets within 15 minutes while still keeping the account `Low` so no
+/// other session rotates onto it. NEGATIVE CONTROLS: warnings below the
+/// threshold (89% session, 96% week) and a lapsed credits episode leave the
+/// account usable, and a limit reset that refilled the window supersedes an
+/// older sample from before the refill.
+#[test]
+fn warnings_and_credits_in_use_mark_an_account_low_and_rotate_early_ahead_of_the_wall() {
+    let r = three();
+    let enrolled = all(&r);
+    let ahead = Advice::Move {
+        to: "work-2".into(),
+        ahead: true,
+        rotates: true,
+        takes_canary: false,
+    };
+    let ask = |s: &State, now: i64| {
+        advise_past_probe(
+            &r,
+            s,
+            &enrolled,
+            &me("main"),
+            &Point::TurnEnd,
+            Mode::Early,
+            now,
+        )
+    };
+    let ask_sampled = |s: &State, now: i64| {
+        let mut s = s.clone();
+        fresh(&mut s, "main");
+        advise(
+            &r,
+            &s,
+            &enrolled,
+            &me("main"),
+            &Point::TurnEnd,
+            Mode::Early,
+            now,
+        )
+    };
+    let with_warned = |weekly: bool, pct: u32, reset: Option<i64>| {
+        let mut s = on_main();
+        fresh(&mut s, "work-2");
+        let w = WindowSaid {
+            pct: Some(pct),
+            reset,
+            at: NOW,
+        };
+        let acct = s.accounts.entry("main".into()).or_default();
+        if weekly {
+            acct.warned_week = Some(w);
+        } else {
+            acct.warned_session = Some(w);
+        }
+        s
+    };
+
+    // 1. Five-hour session warning >= 90% rotates early; 89% does not.
+    let s_warn = with_warned(false, 90, Some(NOW + 2 * HOUR));
+    assert_eq!(cond(&r, &s_warn, "main", NOW), Condition::Low);
+    assert_eq!(s_warn.accounts["main"].low_until(NOW), Some(NOW + 2 * HOUR));
+    assert_eq!(ask(&s_warn, NOW), ahead);
+    assert_eq!(ask_sampled(&s_warn, NOW), ahead);
+    assert!(
+        candidates(&r, &s_warn, &enrolled, Some("work-2"), &Point::TurnEnd, NOW)
+            .contains(&("main".to_string(), Err(WhyNot::LowAheadOfAWall)))
+    );
+    let s_sub = with_warned(false, 89, Some(NOW + 2 * HOUR));
+    assert_eq!(cond(&r, &s_sub, "main", NOW), Condition::Usable);
+
+    // 2. Weekly warning >= 97% rotates early and supplies week_reset; 96% does not.
+    let w_end = NOW + 3 * DAY;
+    let w_warn = with_warned(true, 97, Some(w_end));
+    assert_eq!(cond(&r, &w_warn, "main", NOW), Condition::Low);
+    assert_eq!(w_warn.accounts["main"].low_until(NOW), Some(w_end));
+    assert_eq!(w_warn.accounts["main"].week_reset(NOW), Some(w_end));
+    assert_eq!(ask(&w_warn, NOW), ahead);
+    assert_eq!(ask_sampled(&w_warn, NOW), ahead);
+    let w_sub = with_warned(true, 96, Some(w_end));
+    assert_eq!(cond(&r, &w_sub, "main", NOW), Condition::Usable);
+    assert_eq!(w_sub.accounts["main"].week_reset(NOW), Some(w_end));
+
+    // 3. Overage credits carrying a session (`Credits::InUse`) mark the account
+    // Low and rotate early to a subscription with included quota; once the
+    // episode ends, the account is Usable again.
+    let with_credits = |until: Option<i64>| {
+        let mut s = on_main();
+        fresh(&mut s, "work-2");
+        s.accounts.entry("main".into()).or_default().credits = Some(Credits::InUse(CreditsUse {
+            since: NOW,
+            seen: NOW,
+            until,
+            told: true,
+        }));
+        s
+    };
+    let c_end = NOW + 2 * HOUR;
+    let c_in_use = with_credits(Some(c_end));
+    assert_eq!(cond(&r, &c_in_use, "main", NOW), Condition::Low);
+    assert_eq!(c_in_use.accounts["main"].low_until(NOW), Some(c_end));
+    assert_eq!(ask(&c_in_use, NOW), ahead);
+    assert_eq!(ask_sampled(&c_in_use, NOW), ahead);
+    assert_eq!(
+        cond(&r, &c_in_use, "main", c_end),
+        Condition::Usable,
+        "NEGATIVE CONTROL: lapsed credits episode"
+    );
+
+    // 4. The 15-minute RESET_SOON_S guard holds a session whose warning resets
+    // within 15 minutes while still keeping the account Low for candidate
+    // selection; overage credits already in use still rotate immediately.
+    for mut near in [
+        with_warned(false, 95, Some(NOW + RESET_SOON_S)),
+        with_warned(true, 98, Some(NOW + RESET_SOON_S)),
+    ] {
+        fresh(&mut near, "main");
+        assert_eq!(cond(&r, &near, "main", NOW), Condition::Low);
+        assert!(!near.accounts["main"].leave_early(NOW));
+        assert_eq!(ask(&near, NOW), Advice::Stay(StayWhy::NothingDue));
+    }
+    let near_credits = with_credits(Some(NOW + RESET_SOON_S));
+    assert!(near_credits.accounts["main"].leave_early(NOW));
+    assert_eq!(ask(&near_credits, NOW), ahead);
+
+    // 5. NEGATIVE CONTROL: a limit reset that refilled the window (`pct: None`
+    // at `w.at >= s.at`) supersedes a low sample from before the refill.
+    let mut refilled = on_main();
+    refilled.accounts.insert(
+        "main".into(),
+        Account {
+            sample: Some(Sample {
+                at: NOW - MIN,
+                ..sample(95, 99)
+            }),
+            warned_session: Some(WindowSaid {
+                pct: None,
+                reset: Some(NOW + 3 * HOUR),
+                at: NOW,
+            }),
+            warned_week: Some(WindowSaid {
+                pct: None,
+                reset: Some(NOW + 3 * DAY),
+                at: NOW,
+            }),
+            ..Account::default()
+        },
+    );
+    assert_eq!(cond(&r, &refilled, "main", NOW), Condition::Usable);
+    assert!(!refilled.accounts["main"].leave_early(NOW));
 }

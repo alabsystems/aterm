@@ -380,9 +380,19 @@ const FIRE_PAL_ADD: [[i32; 3]; 5] = [
     [0xFF, 0xF0, 0xC0],
 ];
 
+/// The darkest ink the ink-fire ([`FireMode::Over`](crate::render_api::FireMode::Over))
+/// lays: its first palette anchor, where rim darkening drives the index. The
+/// effects side solves the flame's light-ground coverage ceiling against it
+/// (the theme's text must stay legible over the darkest flame).
+pub const FIRE_OVER_RIM_INK: u32 = 0x0066_1804;
+
 // Ink palette (FireMode::Over): red-browns and burnt oranges that read on white.
 const FIRE_PAL_OVER: [[i32; 3]; 5] = [
-    [0x66, 0x18, 0x04],
+    [
+        ((FIRE_OVER_RIM_INK >> 16) & 0xFF) as i32,
+        ((FIRE_OVER_RIM_INK >> 8) & 0xFF) as i32,
+        (FIRE_OVER_RIM_INK & 0xFF) as i32,
+    ],
     [0xA8, 0x28, 0x00],
     [0xD0, 0x46, 0x00],
     [0xEE, 0x6E, 0x00],

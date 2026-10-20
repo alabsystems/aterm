@@ -6,7 +6,8 @@
 // Apache-2.0) src/node.rs, and cut by the aterm project in 2026 to the
 // properties aterm's model carries: no grafts, explicit label or control
 // relations, active descendants, hidden or clipping nodes, and only the
-// roles aterm-gui publishes.
+// roles aterm-gui publishes. An off-screen node (a scrolled list's row) is
+// in the tree but owns no point.
 //
 // Derived from Chromium's accessibility abstraction.
 // Copyright 2021 The Chromium Authors. All rights reserved.
@@ -35,8 +36,8 @@ pub(crate) struct NodeId(pub(crate) LocalNodeId);
 
 impl From<NodeId> for u128 {
     /// The number in the node's AT-SPI object path: the model's id in the
-    /// high 64 bits, the low ones the tree's index, which is always 0 here
-    /// (accesskit_consumer numbered grafted subtrees there).
+    /// high 64 bits. The publisher adds the exported incarnation in the
+    /// low word, so an old object path cannot name a replacement node.
     fn from(id: NodeId) -> Self {
         u128::from(id.0.0) << 64
     }
@@ -48,6 +49,7 @@ pub(crate) struct ParentAndIndex(pub(crate) NodeId, pub(crate) usize);
 #[derive(Clone, Debug)]
 pub(crate) struct NodeState {
     pub(crate) parent_and_index: Option<ParentAndIndex>,
+    pub(crate) incarnation: u64,
     pub(crate) data: NodeData,
 }
 
@@ -59,6 +61,10 @@ pub(crate) struct Node<'a> {
 }
 
 impl<'a> Node<'a> {
+    pub(crate) fn incarnation(&self) -> u64 {
+        self.state.incarnation
+    }
+
     pub(crate) fn data(&self) -> &'a NodeData {
         &self.state.data
     }
@@ -235,7 +241,10 @@ impl<'a> Node<'a> {
                 }
                 Frame::Visit(node, point) => {
                     let filter_result = filter(&node);
-                    if filter_result == FilterResult::ExcludeSubtree {
+                    // An off-screen node and all it holds own no point: its
+                    // bounds lie where its container would scroll it to,
+                    // over whatever is drawn there now.
+                    if filter_result == FilterResult::ExcludeSubtree || node.is_offscreen() {
                         continue;
                     }
                     if filter_result == FilterResult::Include {
@@ -272,6 +281,10 @@ impl<'a> Node<'a> {
 
     pub(crate) fn is_disabled(&self) -> bool {
         self.data().is_disabled()
+    }
+
+    pub(crate) fn is_offscreen(&self) -> bool {
+        self.data().is_offscreen()
     }
 
     pub(crate) fn is_read_only(&self) -> bool {
@@ -497,7 +510,7 @@ impl<'a> Node<'a> {
     pub(crate) fn is_item_like(&self) -> bool {
         matches!(
             self.role(),
-            Role::MenuItem | Role::MenuItemRadio | Role::Tab
+            Role::MenuItem | Role::MenuItemRadio | Role::ListBoxOption | Role::Tab
         )
     }
 

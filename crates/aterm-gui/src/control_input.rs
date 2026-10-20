@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use aterm_core::grid::{MAX_GRID_COLS, MAX_GRID_ROWS};
 use aterm_core::terminal::{RowMatch, RowRange, Terminal, first_matching_row};
 use aterm_session::sink::SinkWriter;
-use winit::event_loop::EventLoopProxy;
+use aterm_window::event_loop::EventLoopProxy;
 
 use super::post_input_reply;
 use crate::input::{Delivery, InputEvent, InputOutcome, ScrollIntent};
@@ -513,6 +513,11 @@ pub(crate) struct LeadingInputOptions {
     /// [`CAUSE_VERBS`]; checked against what the session holds before any
     /// byte moves (`session_log::validate_cause`).
     pub cause: Option<crate::session_log::CauseRef>,
+    /// `act=approve|deny|answer` (phase 5, ruling T1): what this input means
+    /// for the approval box or question it dismisses. Taken on
+    /// [`GUARDED_VERBS`] (`send`, `key`); the box's close reads it only from
+    /// a proven author ([`aterm_slog::Actor::is_proven`]).
+    pub act: Option<aterm_slog::ActWord>,
     /// A leading option that was recognized but malformed (a guard with no
     /// pattern, an option given twice). Carried rather than answered here so the
     /// dispatch answers it AFTER the halt gate: a halted session must say
@@ -528,6 +533,10 @@ pub(crate) const CAUSE_VERBS: &[&str] = &["send", "turn"];
 /// a supervisor types into its session with. On `paste` it is the ONE
 /// leading option (its body is raw: nothing else is taken off it).
 pub(crate) const SUPERVISOR_FENCED_VERBS: &[&str] = &["send", "key", "paste", "turn"];
+
+/// The refusal for a malformed or repeated `act=`: nothing is written.
+pub(crate) const ACT_USAGE: &str =
+    "ERR usage: act=approve|deny|answer says what the input means for the box it dismisses, once\n";
 
 /// The refusal for a malformed `if-supervisor=` value.
 const IF_SUPERVISOR_USAGE: &str =
@@ -710,6 +719,17 @@ pub(crate) fn take_leading_options(verb: &str, rest: &str) -> (LeadingInputOptio
             consumed = true;
             continue;
         }
+        // `act=` (phase 5, ruling T1): a closed word, once, or the line is
+        // refused before a byte moves.
+        if guarded && let Some(value) = head.strip_prefix("act=") {
+            match aterm_slog::ActWord::from_word(value) {
+                Some(act) if opts.act.replace(act).is_none() => {}
+                _ => opts.refusal = Some(ACT_USAGE.to_string()),
+            }
+            cur = tail;
+            consumed = true;
+            continue;
+        }
         if CAUSE_VERBS.contains(&verb)
             && let Some(value) = head.strip_prefix("cause=")
         {
@@ -820,6 +840,9 @@ pub(crate) struct InputFence<'a> {
     /// does — so an any-row guard such as `^❯` cannot vouch for an Enter
     /// that an approval box would take as "Yes".
     pub guard_at_cursor: bool,
+    /// The worker's initial command still targets an input-ready shell
+    /// block. Checked under the same terminal lock as the generation/write.
+    pub entering_command: bool,
 }
 
 impl InputFence<'_> {
@@ -830,6 +853,7 @@ impl InputFence<'_> {
             || self.generation.is_some()
             || self.fp.is_some()
             || self.human.is_some()
+            || self.entering_command
     }
 
     /// Decide the fence against `terminal` (the caller holds its lock).
@@ -848,6 +872,14 @@ impl InputFence<'_> {
             if now != fp {
                 return Some(GuardedInput::Changed);
             }
+        }
+        if self.entering_command
+            && !matches!(
+                terminal.all_blocks().last().map(|b| b.state),
+                Some(aterm_core::terminal::BlockState::EnteringCommand)
+            )
+        {
+            return Some(GuardedInput::Skipped);
         }
         if let Some(guard) = self.guard {
             let range = if self.guard_at_cursor {
@@ -1041,7 +1073,7 @@ pub(crate) fn cmd_key_guarded(
 /// the fenced press — [`cmd_key_guarded`] with every [`InputFence`]
 /// condition. A moved screen answers `OK skipped reason=changed`, a person
 /// who keyed since the read `OK skipped reason=person`; either writes nothing.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn cmd_key_fenced(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
@@ -1087,7 +1119,7 @@ pub(crate) fn cmd_send_guarded(
 
 /// `send [if=<re>] [if-gen=<epoch>.<seq>] [if-fp=<hex16>] [if-human=<n>] <text>`: the
 /// fenced raw write.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn cmd_send_fenced(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
@@ -1121,8 +1153,11 @@ pub(crate) fn cmd_send_fenced_observed(
 /// the same code a physical keypress runs, including the
 /// `note_key_arrival_queued` backdate that prices a parked event loop.
 ///
-/// Reply honesty: `OK posted=<n>` means `n` press events were handed to the OS
-/// event queue, NOT that any of them reached the PTY. That is a weaker claim than
+/// Reply honesty: `OK posted=<n> key=<0|1>` means `n` press events were handed to
+/// the OS event queue, NOT that any of them reached the PTY; `key=1` that the target
+/// window was the key window of the active app when they were posted, where a
+/// person's keys land and the input method composes (`key=0`: another app held the
+/// keyboard, so an Option dead key is not composed as a press there would be). That is a weaker claim than
 /// `key`'s `OK` (which means the seam applied the event), and it is the strongest
 /// claim this path can truthfully make — the whole point is that delivery is the
 /// OS's business from the post onward. Read the result through `metrics`
@@ -1142,17 +1177,28 @@ pub(crate) fn cmd_hwkey(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     // ONE main-thread round trip for the window number, then nothing else touches
     // the main thread: the posting loop must be able to run — and the posted keys
     // must be able to wait — while that thread is parked inside `nextDrawable`.
-    let window_number = match crate::control::control_media::call_main(proxy, |reply| {
+    // A GATEWAY CARD (the palette, Overview, a tab menu) open on the window is
+    // refused there too: the posted keys reach the person's own unmarked key
+    // path, so they could press Take Over through it (`App::hwkey_target`).
+    let (window_number, key) = match crate::control::control_media::call_main(proxy, |reply| {
         Wake::HwKeyTarget { reply }
     }) {
-        Ok(n) => n,
+        Ok(Ok(target)) => target,
+        Ok(Err(refusal)) => return format!("ERR hwkey: {refusal}\n"),
         Err(e) => return format!("ERR hwkey: {e}\n"),
     };
     match crate::hwkey::post(&spec, window_number) {
-        Ok(n) => format!("OK posted={n}\n"),
+        Ok(n) => format!("OK posted={n} key={}\n", u8::from(key)),
         Err(e) => e,
     }
 }
+
+/// A write refused at the session's input cap (the sink's spill, or its ordered
+/// writer's queue) with nothing written ([`InputOutcome::QueueFull`]), on the front
+/// tab and in the background alike. `ERR busy`, so a driver's back-off retries it
+/// and an `id=` mark is given back (`pty_idem`).
+pub(super) const INPUT_QUEUE_FULL: &str =
+    "ERR busy input-queue-full: nothing written (the program has not read its queued input)\n";
 
 /// Map a reply-bearing input outcome to a verb reply line. `Ok` (applied) and
 /// `RangeRejected` (out-of-range geometry — not relevant to key/mouse/paste, but
@@ -1163,7 +1209,17 @@ pub(super) fn input_reply_to_str(r: Result<InputOutcome, String>) -> String {
         Ok(InputOutcome::Ok) => "OK\n".to_string(),
         Ok(InputOutcome::RangeRejected) => "ERR out of range\n".to_string(),
         Ok(InputOutcome::WriteFailed) => "ERR write failed\n".to_string(),
+        Ok(InputOutcome::QueueFull) => INPUT_QUEUE_FULL.to_string(),
         Err(e) => e,
+    }
+}
+
+/// [`input_reply_to_str`] for a verb whose `OK` counts the bytes it wrote
+/// (`paste`, `feed`, `paste-bin`, `feed-bin`): `OK <n> bytes`.
+pub(super) fn bytes_reply(r: Result<InputOutcome, String>, n: usize) -> String {
+    match r {
+        Ok(InputOutcome::Ok) => format!("OK {n} bytes\n"),
+        other => input_reply_to_str(other),
     }
 }
 
@@ -2011,8 +2067,8 @@ const POINTER_MODS_USAGE: &str =
 /// `cmd` (alias `super`), `ctrl`, `alt` (alias `option`), `shift` and `link`
 /// (the platform's open-link modifier: Cmd on macOS, Ctrl elsewhere), or
 /// `none`. `None` for a word outside that set or an empty part.
-fn parse_pointer_mods(list: &str) -> Option<winit::keyboard::ModifiersState> {
-    use winit::keyboard::ModifiersState as M;
+fn parse_pointer_mods(list: &str) -> Option<aterm_window::keyboard::ModifiersState> {
+    use aterm_window::keyboard::ModifiersState as M;
     if list == "none" {
         return Some(M::empty());
     }
@@ -2047,11 +2103,32 @@ pub(crate) fn parse_pointer(rest: &str) -> Result<crate::app_mouse::PointerActio
             Some(_) => Err("ERR usage: pointer leave\n".to_string()),
         },
         Some("move") => {
-            let (Some(rs), Some(cs)) = (it.next(), it.next()) else {
-                return Err("ERR usage: pointer move <r> <c>\n".to_string());
+            let (Some(rs), cs) = (it.next(), it.next()) else {
+                return Err(POINTER_MOVE_USAGE.to_string());
+            };
+            // A native view's control or point (cs-25): `key=<ui-key>` or
+            // `xy=<x>,<y>` in the view's logical coordinates.
+            if cs.is_none() {
+                use crate::app_mouse::NativePointerTarget;
+                if let Some(key) = rs.strip_prefix("key=").filter(|key| !key.is_empty()) {
+                    return Ok(PointerAction::MoveNative(NativePointerTarget::Key(
+                        key.to_string(),
+                    )));
+                }
+                if let Some((x, y)) = rs.strip_prefix("xy=").and_then(|xy| xy.split_once(','))
+                    && let (Ok(x), Ok(y)) = (x.parse::<f32>(), y.parse::<f32>())
+                    && x.is_finite()
+                    && y.is_finite()
+                {
+                    return Ok(PointerAction::MoveNative(NativePointerTarget::Point(x, y)));
+                }
+                return Err(POINTER_MOVE_USAGE.to_string());
+            }
+            let Some(cs) = cs else {
+                return Err(POINTER_MOVE_USAGE.to_string());
             };
             if it.next().is_some() {
-                return Err("ERR usage: pointer move <r> <c>\n".to_string());
+                return Err(POINTER_MOVE_USAGE.to_string());
             }
             let (Ok(row), Ok(col)) = (rs.parse::<i32>(), cs.parse::<u16>()) else {
                 return Err("ERR bad args\n".to_string());
@@ -2060,7 +2137,7 @@ pub(crate) fn parse_pointer(rest: &str) -> Result<crate::app_mouse::PointerActio
                 return Err("ERR out of range\n".to_string());
             }
             // A NEGATIVE row is a chrome row above the grid (`-1` the one
-            // right above it): the band, the presence row, the strip.
+            // right above it): the band, the strip.
             if row < 0 {
                 return match u16::try_from(row.unsigned_abs()) {
                     Ok(up) if up <= MAX_CHROME_ROWS => Ok(PointerAction::MoveChrome { up, col }),
@@ -2082,14 +2159,19 @@ pub(crate) fn parse_pointer(rest: &str) -> Result<crate::app_mouse::PointerActio
                 .ok_or_else(|| POINTER_MODS_USAGE.to_string()),
             _ => Err(POINTER_MODS_USAGE.to_string()),
         },
-        Some(_) => {
-            Err("ERR usage: pointer [move <r> <c>|click|leave|status|mods <list>]\n".to_string())
-        }
+        Some(_) => Err(
+            "ERR usage: pointer [move <r> <c>|move key=<ui-key>|move xy=<x>,<y>|click|leave|status|mods <list>]\n"
+                .to_string(),
+        ),
     }
 }
 
-/// The deepest chrome row `pointer move -<up> <c>` may name: the strip, the
-/// presence row and the message band's rows together stay far below it.
+/// The `pointer move` usage line: a cell, or a native view's control or point.
+const POINTER_MOVE_USAGE: &str =
+    "ERR usage: pointer move <r> <c> | move key=<ui-key> | move xy=<x>,<y>\n";
+
+/// The deepest chrome row `pointer move -<up> <c>` may name: the strip and
+/// the message band's rows together stay far below it.
 const MAX_CHROME_ROWS: u16 = 16;
 
 /// `pointer [move <r> <c>|click|leave|status|mods <list>]` -> put the front window's
@@ -2112,12 +2194,26 @@ pub(crate) fn cmd_pointer(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
         Ok(action) => action,
         Err(usage) => return usage,
     };
+    use crate::app_mouse::PointerAt;
+    let px_field =
+        |px: Option<(i32, i32)>| px.map_or_else(String::new, |(x, y)| format!(" px={x},{y}"));
     match super::control_media::call_main(proxy, |reply| Wake::PointerCmd { action, reply }) {
-        Ok(Ok((Some((row, col)), px))) => match px {
-            Some((x, y)) => format!("OK at={row},{col} px={x},{y}\n"),
-            None => format!("OK at={row},{col}\n"),
-        },
-        Ok(Ok((None, _))) => "OK at=-\n".to_string(),
+        Ok(Ok(PointerAt::Grid {
+            cell: (row, col),
+            px,
+        })) => format!("OK at={row},{col}{}\n", px_field(px)),
+        Ok(Ok(PointerAt::Native {
+            view,
+            x,
+            y,
+            key,
+            px,
+        })) => format!(
+            "OK at=native view={view} x={x:.1} y={y:.1} key={}{}\n",
+            key.as_deref().unwrap_or("-"),
+            px_field(px)
+        ),
+        Ok(Ok(PointerAt::Absent)) => "OK at=-\n".to_string(),
         Ok(Err(why)) => format!("ERR {why}\n"),
         Err(error) => format!("ERR pointer command failed: {error}\n"),
     }
@@ -3207,6 +3303,28 @@ mod tests {
             Ok(PointerAction::Move { row: 3, col: 9 })
         );
         assert_eq!(parse_pointer("leave"), Ok(PointerAction::Leave));
+        // A native view's control or point (cs-25).
+        assert_eq!(
+            parse_pointer("move key=settings/cursor-style/comet"),
+            Ok(PointerAction::MoveNative(
+                crate::app_mouse::NativePointerTarget::Key("settings/cursor-style/comet".into())
+            ))
+        );
+        assert_eq!(
+            parse_pointer("move xy=120.5,64"),
+            Ok(PointerAction::MoveNative(
+                crate::app_mouse::NativePointerTarget::Point(120.5, 64.0)
+            ))
+        );
+        for junk in [
+            "move key=",
+            "move xy=1",
+            "move xy=a,b",
+            "move xy=inf,2",
+            "move 3",
+        ] {
+            assert!(parse_pointer(junk).is_err(), "{junk}");
+        }
         assert_eq!(parse_pointer(""), Ok(PointerAction::Status));
         assert_eq!(
             parse_pointer(&format!("move {MAX_GRID_ROWS} 0")),
@@ -3229,7 +3347,7 @@ mod tests {
         ] {
             assert!(parse_pointer(line).is_err(), "pointer {line:?}");
         }
-        use winit::keyboard::ModifiersState as M;
+        use aterm_window::keyboard::ModifiersState as M;
         assert_eq!(
             parse_pointer("mods none"),
             Ok(PointerAction::Mods(M::empty()))
@@ -3358,7 +3476,8 @@ mod video_keys_ledger_tests {
         let bytes = send_bytes("ls\\n");
         assert_eq!(bytes, b"ls\r".to_vec(), "the verb's bytes, not a stand-in");
         let mut log = Vec::new();
-        record_controller_video_attempts(&mut log, &InputEvent::KeySequence(bytes), 100, 64);
+        let _ =
+            record_controller_video_attempts(&mut log, &InputEvent::KeySequence(bytes), 100, 64);
         assert_eq!(
             log,
             vec![
@@ -3373,7 +3492,8 @@ mod video_keys_ledger_tests {
         // `send` cannot carry.
         let bytes = feed_bytes("1b5b41").expect("valid hex");
         let mut fed = Vec::new();
-        record_controller_video_attempts(&mut fed, &InputEvent::KeySequence(bytes), 200, 64);
+        let _ =
+            record_controller_video_attempts(&mut fed, &InputEvent::KeySequence(bytes), 200, 64);
         assert_eq!(
             fed,
             vec![
@@ -3388,7 +3508,7 @@ mod video_keys_ledger_tests {
         // replacement per maximal invalid subpart, matching from_utf8_lossy.
         let raw = [b'a', 0xff, 0xfe, b'b'];
         let mut lossy = Vec::new();
-        record_controller_video_attempts(
+        let _ = record_controller_video_attempts(
             &mut lossy,
             &InputEvent::KeySequence(raw.to_vec()),
             300,
@@ -3411,13 +3531,14 @@ mod video_keys_ledger_tests {
 
         // The cap still truncates a large paste-shaped sequence exactly.
         let mut capped = Vec::new();
-        record_controller_video_attempts(
+        let dropped = record_controller_video_attempts(
             &mut capped,
             &InputEvent::KeySequence(b"abcdefgh".to_vec()),
             400,
             3,
         );
         assert_eq!(capped.len(), 3, "the bounded ledger is still bounded");
+        assert_eq!(dropped, 5, "and counts the five attempts it could not take");
     }
 
     /// A terminal take is driven with `esc`, the arrows and the F-keys, and the
@@ -3441,7 +3562,7 @@ mod video_keys_ledger_tests {
         ] {
             let ev = parse_key(verb).unwrap_or_else(|| panic!("`key {verb}` parses"));
             let mut log = Vec::new();
-            record_controller_video_attempts(&mut log, &ev, 7, 64);
+            let _ = record_controller_video_attempts(&mut log, &ev, 7, 64);
             assert_eq!(log, vec![(7, expect)], "`key {verb}` must be an attempt");
         }
 

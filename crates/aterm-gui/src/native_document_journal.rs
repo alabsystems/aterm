@@ -33,6 +33,68 @@ use crate::native_document_io::{
     MAX_JOURNAL_BYTES, StoredJournalRecovery, compact_journal, encode_journal, recover_journal_for,
 };
 
+#[cfg(any(unix, windows))]
+#[path = "native_document_journal_owner.rs"]
+mod owner;
+
+/// Where no image can carry an owner set (neither an extended attribute nor an
+/// alternate data stream), nothing is marked and nothing is taken: every
+/// journal stays, as it always did there.
+#[cfg(not(any(unix, windows)))]
+mod owner {
+    use std::fs::File;
+    use std::path::{Path, PathBuf};
+
+    use super::{ContentFingerprint, JournalDocumentKey, JournalImageGeneration};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub(crate) enum JournalOwnerId {}
+
+    #[derive(Debug)]
+    pub(crate) enum JournalOwner {}
+
+    impl JournalOwner {
+        pub(crate) fn id(&self) -> JournalOwnerId {
+            match *self {}
+        }
+    }
+
+    pub(super) enum Candidate {}
+
+    pub(crate) fn establish(_root: &Path) -> Result<JournalOwner, String> {
+        Err("journal owners need extended attributes or streams".to_string())
+    }
+
+    pub(super) fn names_file(_path: &Path, _file: &File) -> bool {
+        true
+    }
+
+    pub(super) fn mark_publication(
+        _temporary: &File,
+        _temporary_path: &Path,
+        _path: &Path,
+        _expected: JournalImageGeneration,
+        _bytes: ContentFingerprint,
+        _owner: Option<JournalOwnerId>,
+    ) -> Vec<u8> {
+        Vec::new()
+    }
+
+    pub(super) fn confirm_publication(_path: &Path, _mark: &[u8]) {}
+
+    pub(super) fn adopt(_path: &Path, _image: ContentFingerprint, _owner: Option<JournalOwnerId>) {}
+
+    pub(super) fn released(_path: PathBuf, _key: JournalDocumentKey) -> Option<Candidate> {
+        None
+    }
+
+    pub(super) fn settle_releases(owner: JournalOwnerId, _released: Vec<Candidate>) {
+        match owner {}
+    }
+}
+
+pub(crate) use owner::JournalOwnerId;
+
 const COMPACT_RECORDS: usize = 128;
 const COMPACT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -65,6 +127,11 @@ pub(crate) struct JournalOpenDecision {
     pub(crate) notice: Option<RecoveryNotice>,
     preserve_existing: bool,
     expected_image: JournalImageGeneration,
+    /// The keyed image the inspection read holds no draft ([`holds_no_draft`]):
+    /// the open decides the same with or without it, so `initialize` publishes
+    /// over its absence too — the launch sweep may take a clean image nobody
+    /// holds yet between the two (`owner`).
+    expected_clean: bool,
     /// The legacy journal this open read in place of the keyed one.
     legacy: Option<LegacyJournal>,
 }
@@ -174,6 +241,8 @@ pub(crate) struct JournalRewritePlan {
     pub(crate) fingerprint: ContentFingerprint,
     /// Retired before this rewrite publishes ([`LegacyJournal`]).
     pub(crate) retire_legacy: Option<LegacyJournal>,
+    /// Named on the image it publishes ([`DraftJournalHost::owner_id`]).
+    pub(crate) owner: Option<JournalOwnerId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,6 +275,11 @@ pub(crate) struct DraftJournalHost {
     root: PathBuf,
     /// Every document key is a MAC under it ([`JournalDocumentKey::keyed`]).
     secret: JournalSecret,
+    /// This store's owner identity, named on every image it publishes, so the
+    /// launch sweep never takes one while this process lives (`owner`). `None`
+    /// (no lease could be taken; never off unix) publishes unmarked images,
+    /// which no sweep takes.
+    owner: Option<Arc<owner::JournalOwner>>,
 }
 
 #[derive(Clone, Debug)]
@@ -308,6 +382,9 @@ pub(crate) struct JournalReseatPlan {
     pub(crate) target_text: Arc<str>,
     /// Retired before this re-seat publishes ([`LegacyJournal`]).
     pub(crate) retire_legacy: Option<LegacyJournal>,
+    /// Named on the image it publishes, or joined to the one it finds
+    /// ([`DraftJournalHost::owner_id`]).
+    pub(crate) owner: Option<JournalOwnerId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -630,6 +707,7 @@ impl DocumentJournalStore {
                 target_seq: entry.desired.seq,
                 target_text: entry.desired.text.clone(),
                 retire_legacy: entry.legacy.clone(),
+                owner: self.host.owner_id(),
             };
             entry.reseat_owed = false;
             entry.reseat_inflight = Some(plan.clone());
@@ -655,6 +733,7 @@ impl DocumentJournalStore {
             )
             .map_err(|error| format!("could not encode journal checkpoint: {error:?}"))?;
             plan.retire_legacy = entry.legacy.clone();
+            plan.owner = self.host.owner_id();
             entry.rewrite_inflight = Some(InflightRewrite {
                 plan: plan.clone(),
                 checkpoint: saved,
@@ -688,6 +767,7 @@ impl DocumentJournalStore {
         };
         plan.expected_image = Some(entry.durable_image);
         plan.retire_legacy = entry.legacy.clone();
+        plan.owner = self.host.owner_id();
         entry.append_text = Some(entry.desired.text.clone());
         Ok(Some(JournalEffect::Append {
             path: entry.path.clone(),
@@ -951,6 +1031,45 @@ impl DocumentJournalStore {
         self.reseat_fenced = fenced;
     }
 
+    /// Whether `document`'s journal has nothing left to do: no write on the
+    /// worker, no re-seat owed, no checkpoint queued, no legacy journal left to
+    /// retire, and its head durable. Only a settled journal is let go with its
+    /// document ([`Self::forget`]); a document without one has none to wait on.
+    pub(crate) fn settled(&self, document: DocumentId) -> bool {
+        self.entries.get(&document).is_none_or(|entry| {
+            !entry_busy(entry)
+                && !entry.reseat_owed
+                && entry.pending_checkpoint.is_none()
+                && entry.legacy.is_none()
+                && entry.desired.seq == entry.reducer.durable_seq()
+        })
+    }
+
+    /// Drop the entries of released documents, whose journals are
+    /// [`Self::settled`], and let go of their images: this process leaves each
+    /// one's owner set, and one that then names no live owner and holds no
+    /// draft goes (`owner::settle_releases`, off the event loop). Opening a
+    /// document again initializes its journal as any open does.
+    pub(crate) fn forget(&mut self, documents: &[DocumentId]) {
+        let entries = documents
+            .iter()
+            .filter_map(|document| {
+                debug_assert!(self.settled(*document));
+                self.entries.remove(document)
+            })
+            .collect::<Vec<_>>();
+        let Some(owner) = self.host.owner_id() else {
+            return;
+        };
+        let released = entries
+            .into_iter()
+            .filter_map(|entry| owner::released(entry.path, entry.key))
+            .collect::<Vec<_>>();
+        if !released.is_empty() {
+            owner::settle_releases(owner, released);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn durable_seq(&self, document: DocumentId) -> Option<Seq> {
         self.entries
@@ -958,7 +1077,7 @@ impl DocumentJournalStore {
             .map(|entry| entry.reducer.durable_seq())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn journal_path(&self, document: DocumentId) -> Option<PathBuf> {
         self.entries.get(&document).map(|entry| entry.path.clone())
     }
@@ -976,7 +1095,7 @@ impl DocumentJournalStore {
     }
 
     /// The image this store last published for `document`.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn durable_image(&self, document: DocumentId) -> Option<ContentFingerprint> {
         self.entries.get(&document).map(|entry| entry.durable_image)
     }
@@ -998,7 +1117,7 @@ pub(crate) fn hold_journal_lock_for_test(
     crate::native_document_host::HeldAdvisoryLock::lock(lock).expect("take journal lock")
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     /// Some while a [`ForkedJournalLockCopies`] lives on this thread: the
     /// copies of every journal lock description this thread has locked since.
@@ -1013,10 +1132,10 @@ thread_local! {
 /// closes only the pty pair and the status pipe before `execve`). The losing
 /// interleaving of the fork-copy race, made deterministic: a lock released by
 /// the close alone stays taken in the copy, and the next take is refused.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) struct ForkedJournalLockCopies(());
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl ForkedJournalLockCopies {
     pub(crate) fn start() -> Self {
         FORKED_LOCK_COPIES.with(|copies| *copies.borrow_mut() = Some(Vec::new()));
@@ -1029,16 +1148,39 @@ impl ForkedJournalLockCopies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for ForkedJournalLockCopies {
     fn drop(&mut self) {
         FORKED_LOCK_COPIES.with(|copies| drop(copies.borrow_mut().take()));
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// What [`between_lock_open_and_take_for_test`] runs.
+    static BETWEEN_LOCK_OPEN_AND_TAKE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `then` once, on this thread, between the next journal lock's open and
+/// its take: the instant a taker that opened the lock file just before another
+/// took it waits through.
+#[cfg(test)]
+pub(crate) fn between_lock_open_and_take_for_test(then: impl FnOnce() + 'static) {
+    BETWEEN_LOCK_OPEN_AND_TAKE.with(|hook| *hook.borrow_mut() = Some(Box::new(then)));
+}
+
+#[cfg(test)]
+fn lock_opened_for_test() {
+    let hook = BETWEEN_LOCK_OPEN_AND_TAKE.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// The fork a [`ForkedJournalLockCopies`] stands in for, at the instant the
 /// lock is held.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn copy_held_lock_for_test(lock: &File) {
     FORKED_LOCK_COPIES.with(|copies| {
         if let Some(copies) = copies.borrow_mut().as_mut() {
@@ -1135,18 +1277,17 @@ fn read_for_open(recovered: &StoredJournalRecovery, disk_bytes: &[u8]) -> OpenRe
 }
 
 /// What a legacy draft that wins an open ([`LegacyJournal`]) does to the keyed
-/// image `bytes` beside it, as the notice that says so: one that does not
+/// image beside it (`keyed`, as it decoded), as the notice that says so: one that does not
 /// decode is kept aside as `Corrupt`; one holding a draft the legacy image does
 /// not is kept aside as `DiskConflict`; `None` leaves it to be replaced, for it
 /// holds nothing the legacy one lacks (no draft, or that draft's migration).
 fn keyed_set_aside_by_legacy(
-    key: JournalDocumentKey,
-    bytes: &[u8],
+    keyed: &Result<StoredJournalRecovery, crate::native_document_io::JournalError>,
     legacy: &StoredJournalRecovery,
 ) -> Option<RecoveryNotice> {
-    match recover_journal_for(key, bytes) {
+    match keyed {
         Err(_) => Some(RecoveryNotice::Corrupt),
-        Ok(keyed) if !holds_no_draft(&keyed) && keyed.text != legacy.text => {
+        Ok(keyed) if !holds_no_draft(keyed) && keyed.text != legacy.text => {
             Some(RecoveryNotice::DiskConflict)
         }
         Ok(_) => None,
@@ -1222,6 +1363,7 @@ pub(crate) fn execute_journal_reseat(
             .as_deref()
             .map_or_else(JournalImageGeneration::missing, JournalImageGeneration::of);
         if found.exists && found.fingerprint == plan.ours {
+            owner::adopt(path, plan.ours, plan.owner);
             return Ok(None);
         }
         let found_baseline = existing
@@ -1282,7 +1424,8 @@ pub(crate) fn execute_journal_reseat(
             }
         };
         let bytes = encode_journal(&records).map_err(|error| format!("encode: {error:?}"))?;
-        atomic_replace_locked(path, &bytes, found).map_err(|error| error.to_string())?;
+        atomic_replace_locked(path, &bytes, found, plan.owner)
+            .map_err(|error| error.to_string())?;
         Ok(Some(JournalReseatResult::Republished {
             image: ContentFingerprint::of(&bytes),
             baseline: baseline_fingerprint,
@@ -1384,17 +1527,41 @@ impl DraftJournalHost {
             let root = default_state_root().ok_or_else(|| {
                 "could not locate a private state directory for document recovery".to_string()
             })?;
-            Self::new(root.join("drafts"))
+            let host = Self::new(root.join("drafts"))?;
+            // After this host's own lease is taken, so it can never read this
+            // process as gone.
+            #[cfg(any(unix, windows))]
+            owner::spawn_launch_sweep(host.root.clone());
+            Ok(host)
         }
     }
 
     /// The host over `root`, with the journal secret read from it (or minted
     /// into it): a secret this process cannot use refuses the whole store, as
     /// a root it cannot make private does ([`load_or_mint_journal_secret`]).
+    /// Its owner lease is taken here; without one the store still works, and
+    /// what it publishes is never swept.
     pub(crate) fn new(root: PathBuf) -> Result<Self, String> {
         create_private_dir(&root).map_err(|error| error.to_string())?;
         let secret = load_or_mint_journal_secret(&root)?;
-        Ok(Self { root, secret })
+        let owner = owner::establish(&root)
+            .inspect_err(|error| {
+                if cfg!(any(unix, windows)) {
+                    aterm_log::warn!("draft journals published unswept: {error}");
+                }
+            })
+            .ok()
+            .map(Arc::new);
+        Ok(Self {
+            root,
+            secret,
+            owner,
+        })
+    }
+
+    /// The owner identity this host names on what it publishes.
+    pub(crate) fn owner_id(&self) -> Option<JournalOwnerId> {
+        self.owner.as_ref().map(|owner| owner.id())
     }
 
     /// `canonical_uri`'s journal identity under this install's secret.
@@ -1416,13 +1583,18 @@ impl DraftJournalHost {
             notice: None,
             preserve_existing: false,
             expected_image: JournalImageGeneration::missing(),
+            expected_clean: false,
             legacy: None,
         };
         let keyed = read_journal_image(&path)
             .map_err(|error| format!("could not read recovery journal: {error}"))?;
-        if let Some(bytes) = &keyed {
+        let keyed_recovery = keyed.as_deref().map(|bytes| {
             decision.expected_image = JournalImageGeneration::of(bytes);
-        }
+            recover_journal_for(key, bytes)
+        });
+        decision.expected_clean = keyed_recovery
+            .as_ref()
+            .is_some_and(|recovered| recovered.as_ref().is_ok_and(holds_no_draft));
         let legacy_key = JournalDocumentKey::legacy_unkeyed(canonical_uri);
         let legacy_path = self.legacy_path_for(legacy_key);
         let legacy = read_journal_image(&legacy_path)
@@ -1444,9 +1616,9 @@ impl DraftJournalHost {
                             carried: reading.made_against_disk,
                             keep_aside: reading.keep_aside,
                         });
-                        let set_aside = keyed
-                            .as_deref()
-                            .and_then(|bytes| keyed_set_aside_by_legacy(key, bytes, &recovered));
+                        let set_aside = keyed_recovery
+                            .as_ref()
+                            .and_then(|keyed| keyed_set_aside_by_legacy(keyed, &recovered));
                         reading.apply(&mut decision, recovered);
                         if let Some(notice) = set_aside {
                             aterm_log::warn!(
@@ -1485,10 +1657,10 @@ impl DraftJournalHost {
                 }
             }
         }
-        let Some(bytes) = keyed else {
+        let Some(keyed_recovery) = keyed_recovery else {
             return Ok(decision);
         };
-        match recover_journal_for(key, &bytes) {
+        match keyed_recovery {
             Ok(recovered) => {
                 let reading = read_for_open(&recovered, disk_bytes);
                 decision.preserve_existing = reading.keep_aside;
@@ -1534,7 +1706,10 @@ impl DraftJournalHost {
         let image_fingerprint = ContentFingerprint::of(&bytes);
         with_journal_lock(&decision.path, JournalLockPatience::EventLoop, || {
             let current = observe_journal_image(&decision.path)?;
-            if current != decision.expected_image {
+            // A clean image gone since the inspection (the launch sweep took
+            // it) decided nothing: publish over its absence.
+            let swept = decision.expected_clean && !current.exists;
+            if current != decision.expected_image && !swept {
                 return Err(format!(
                     "journal changed after recovery inspection (expected {:?}, found {:?}); reopen \
                      the document before initializing recovery",
@@ -1544,7 +1719,7 @@ impl DraftJournalHost {
             if decision.preserve_existing && current.exists {
                 self.preserve_locked(&decision.path, current)?;
             }
-            atomic_replace_locked(&decision.path, &bytes, current)
+            atomic_replace_locked(&decision.path, &bytes, current, self.owner_id())
                 .map_err(|error| error.to_string())
         })?;
         // The keyed image is published: a legacy journal whose draft was not
@@ -1940,7 +2115,8 @@ pub(crate) fn execute_journal_append(
         let image = compact_journal(key, &combined, COMPACT_RECORDS, COMPACT_BYTES)
             .map_err(|error| format!("compact: {error:?}"))?;
         let published_image = ContentFingerprint::of(&image);
-        atomic_replace_locked(path, &image, actual).map_err(|error| error.to_string())?;
+        atomic_replace_locked(path, &image, actual, plan.owner)
+            .map_err(|error| error.to_string())?;
         Ok(JournalAppendProof {
             appended_len: plan.bytes.len(),
             encoded_fingerprint: plan.encoded_fingerprint,
@@ -1975,7 +2151,7 @@ pub(crate) fn execute_journal_rewrite(
             // A prior attempt may have published the exact image but lost its
             // post-publication proof. Re-publishing the already verified bytes
             // avoids a second pathname open (and its final-component swap window).
-            return atomic_replace_locked(path, &plan.bytes, actual)
+            return atomic_replace_locked(path, &plan.bytes, actual, plan.owner)
                 .map_err(|error| format!("reconcile: {error}"));
         }
         if actual.fingerprint != plan.expected_image {
@@ -1992,7 +2168,8 @@ pub(crate) fn execute_journal_rewrite(
                 plan.base_durable.0, recovered.durable_seq.0
             ));
         }
-        atomic_replace_locked(path, &plan.bytes, actual).map_err(|error| error.to_string())
+        atomic_replace_locked(path, &plan.bytes, actual, plan.owner)
+            .map_err(|error| error.to_string())
     });
     match result {
         Ok(()) => JournalRewriteResult::Committed(JournalRewriteProof {
@@ -2030,6 +2207,7 @@ pub(crate) fn checkpoint_plan(
         bytes: Arc::from(bytes),
         fingerprint,
         retire_legacy: None,
+        owner: None,
     })
 }
 
@@ -2038,7 +2216,7 @@ pub(crate) fn checkpoint_plan(
 const TEST_DRAFT_ROOT_PREFIX: &str = "aterm-test-drafts-";
 
 /// aterm's shared per-user state root — the ONE rule
-/// ([`aterm_types::dirs::state_dir`]), so the journal, the operator and the
+/// ([`aterm_types::dirs::state_dir`]), so the journal, the harness and the
 /// session identities never disagree about the directory.
 #[cfg(not(test))]
 fn default_state_root() -> Option<PathBuf> {
@@ -2189,21 +2367,51 @@ fn with_journal_lock<T>(
         .ok_or_else(|| "journal has no parent directory".to_string())?;
     create_private_dir(parent).map_err(|error| format!("journal lock directory: {error}"))?;
     let lock_path = journal_lock_path(path)?;
-    let lock = open_journal_lock(&lock_path)
-        .map_err(|error| format!("open journal lock {}: {error}", lock_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        lock.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|error| format!("protect journal lock {}: {error}", lock_path.display()))?;
-    }
     // Released by `LOCK_UN` on every exit, not by the close: a shell forked while
     // this runs would otherwise keep the lock until its exec, and the event loop's
     // next take has 25 ms (the product fd-hygiene sweep of 2026-09-27).
-    let _held = take_journal_lock(lock, path, patience.budget())?;
-    #[cfg(test)]
+    let _held = take_linked_journal_lock(&lock_path, path, patience)?;
+    #[cfg(all(test, unix))]
     copy_held_lock_for_test(_held.file());
     operation()
+}
+
+/// Take the journal's lock on the file its lock path names. A release or the
+/// launch sweep (`owner`) unlinks a journal's lock file while it holds it, so a
+/// taker that opened the name before that unlink and waited would, once it has
+/// the lock, hold one nobody else will ever take — a later taker creates the
+/// name afresh — and two writers would be in at once. So the lock is proved,
+/// once held, to be the file its name still names, and the name is opened
+/// again when it is not. An unlinker holds the lock it removes, so a lock held
+/// and proved named stays named until it is let go.
+fn take_linked_journal_lock(
+    lock_path: &Path,
+    path: &Path,
+    patience: JournalLockPatience,
+) -> Result<crate::native_document_host::HeldAdvisoryLock, String> {
+    // Each unlink is one sweep's or release's, once per journal.
+    for _ in 0..4 {
+        let lock = open_journal_lock(lock_path)
+            .map_err(|error| format!("open journal lock {}: {error}", lock_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            lock.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|error| {
+                    format!("protect journal lock {}: {error}", lock_path.display())
+                })?;
+        }
+        #[cfg(test)]
+        lock_opened_for_test();
+        let held = take_journal_lock(lock, path, patience.budget())?;
+        if owner::names_file(lock_path, held.file()) {
+            return Ok(held);
+        }
+    }
+    Err(format!(
+        "journal lock {} was removed under every take; retry",
+        lock_path.display()
+    ))
 }
 
 /// THE DEFECT THESE BUDGETS CLOSE, and the two independent mechanisms that size
@@ -2303,6 +2511,14 @@ pub(crate) enum JournalLockPatience {
     /// whose whole job is to keep exactly this work off the event loop. Parking
     /// it costs no frame and drops no input; refusing costs an append.
     Worker,
+    /// The launch sweep and a released journal's settle (`owner`): one try. A
+    /// refusal means a writer is at this journal now, so it is no candidate
+    /// this time, and waiting would only hold up that writer's next take.
+    #[cfg_attr(
+        not(any(unix, windows)),
+        expect(dead_code, reason = "nothing is swept where no image is marked")
+    )]
+    Sweep,
 }
 
 impl JournalLockPatience {
@@ -2333,6 +2549,7 @@ impl JournalLockPatience {
         match self {
             Self::EventLoop => crate::native_document_host::WRITE_LOCK_RETRY_BUDGET,
             Self::Worker => std::time::Duration::from_secs(2),
+            Self::Sweep => std::time::Duration::ZERO,
         }
     }
 }
@@ -2423,10 +2640,13 @@ impl std::fmt::Display for JournalReplaceError {
     }
 }
 
+/// `owner` is the publishing store's owner identity, named on the image
+/// (`owner::mark_publication`); `None` publishes it with its holders unknown.
 fn atomic_replace_locked(
     path: &Path,
     bytes: &[u8],
     expected: JournalImageGeneration,
+    owner: Option<JournalOwnerId>,
 ) -> Result<(), JournalReplaceError> {
     if bytes.len() > MAX_JOURNAL_BYTES {
         return Err(JournalReplaceError::BeforePublication(std::io::Error::new(
@@ -2475,6 +2695,14 @@ fn atomic_replace_locked(
         temporary_file
             .write_all(bytes)
             .map_err(JournalReplaceError::BeforePublication)?;
+        let mark = owner::mark_publication(
+            &temporary_file,
+            &temporary_path,
+            path,
+            expected,
+            ContentFingerprint::of(bytes),
+            owner,
+        );
         crate::durable::sync_all(&temporary_file)
             .map_err(JournalReplaceError::BeforePublication)?;
         drop(temporary_file);
@@ -2491,6 +2719,7 @@ fn atomic_replace_locked(
         }
         replace_file(&temporary_path, path, expected.exists)
             .map_err(JournalReplaceError::BeforePublication)?;
+        owner::confirm_publication(path, &mark);
         sync_directory(parent, Flush::Durable).map_err(JournalReplaceError::PublishedUnverified)?;
         let committed = observe_journal_image(path).map_err(|message| {
             JournalReplaceError::PublishedUnverified(std::io::Error::other(message))

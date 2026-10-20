@@ -6,9 +6,9 @@
 //! and its cap (the value's shape and bound). Nothing else decides either.
 
 use crate::vocab::{
-    BOX_WORDS, CAUSE_WORDS, CLS_WORDS, DIR_WORDS, DUR_WORDS, MAIL_KIND_WORDS, NEED_WORDS,
-    OUT_WORDS, PHASE_WORDS, STATE_WORDS, ShortId, VERB_WORDS, WALL_WORDS, WHY_WORDS, WORD_WORDS,
-    lookup,
+    ACT_WORDS, BOX_WORDS, CAUSE_WORDS, CLS_WORDS, DIR_WORDS, DUR_WORDS, END_WORDS, MAIL_KIND_WORDS,
+    NEED_WORDS, OUT_WORDS, PHASE_WORDS, STATE_WORDS, ShortId, VERB_WORDS, WALL_WORDS, WHY_WORDS,
+    WORD_WORDS, lookup,
 };
 
 /// Where a value may be stored (§3.6). Ordered: a reply, journal or body at
@@ -189,6 +189,37 @@ keys! {
     To "to" Host Cap::Text(64),
     Off "off" Host Cap::U,
     Title "title" Content Cap::Text(240),
+    // Phase 3B, appended so no discriminant moves. The usage tap's reading
+    // (`mark - usage h5= d7=`, percent of the 5-hour and 7-day limits).
+    H5 "h5" Wire Cap::U,
+    D7 "d7" Wire Cap::U,
+    // A source mark's counts (`source field=transcript skipped= dropped=`,
+    // ruling S31): what was skipped at a bind without a watermark, and
+    // transcript events dropped (an over-long line, a restart, a ninth
+    // parallel tool, an unmapped result, a queue overflow). Never `lost=`:
+    // they were never records, so no reader folds them as ring loss (S27).
+    Skipped "skipped" Wire Cap::U,
+    Dropped "dropped" Wire Cap::U,
+    // Phase 5 (5C-1), appended so no discriminant moves: a task mark's
+    // supervisor-attention flag (`task attention=0|1`). The task's exit code is
+    // `code=`, as a command's is.
+    Attention "attention" Wire Cap::U,
+    // Phase 5 (5D-2, ruling T1), appended: what an acted control input says
+    // it means (`mark - input verb=key act=approve`).
+    Act "act" Wire Cap::Word(ACT_WORDS),
+    // Phase 5 (5D-4, ruling T39), appended: a person's `human` mark that no
+    // input reaching the program came with (`mark - human reached=0`: a view
+    // scroll, a selection, a composition). The fold's mail link reads it as
+    // no answer to waiting mail; absent, as before, the input reached the
+    // program. Host only: the link it serves has no wire (T10b).
+    Reached "reached" Host Cap::U,
+    // Phase 5 (5J, ruling T27), appended: the node log's facts. How the
+    // previous run ended (`start prev_end=`, a caught signal's number in
+    // `code=`), and a config key that changed (`config key=`): the schema's
+    // NAME, a static word of aterm's own, never its value and never a name
+    // a person chose (a map's member).
+    PrevEnd "prev_end" Wire Cap::Word(END_WORDS),
+    CfgKey "key" Wire Cap::Id,
 }
 
 impl Key {

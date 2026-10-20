@@ -1,0 +1,15 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (26x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, no login (no `apiKeyHelper`, no OAuth token) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · Claude Code's OWN footer notice with no login and no statusLine at 26 columns: the notification column's 'Not logged in · Run /…' fills its own row from column 2 to the right margin
+           Claude Code
+           v2.1.304
+ ▐▛███▛█   Opus 5.5
+▝▜██████▀  API Usage
+ ▝▝   ▝▝   Billing
+           /…/tmp/at.0000/
+           proj
+
+
+──────────────────────────
+❯
+──────────────────────────
+  ⏵⏵ auto mode on
+  Not logged in · Run /…

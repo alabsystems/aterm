@@ -27,7 +27,7 @@ fn glass_window(app: &mut App, session: u64, cols: u16, pad: usize, extra: usize
     let extra = extra.min(cw.saturating_sub(1));
     let width = usize::from(cols) * cw + 2 * pad + extra;
     let height = 21 * ch + 2 * pad;
-    app.windows.get_mut(&wid).unwrap().win_px = Some(winit::dpi::PhysicalSize::new(
+    app.windows.get_mut(&wid).unwrap().win_px = Some(aterm_window::dpi::PhysicalSize::new(
         u32::try_from(width).unwrap_or(u32::MAX),
         u32::try_from(height).unwrap_or(u32::MAX),
     ));
@@ -262,7 +262,25 @@ fn web_portable(theme: aterm_render::Theme) -> aterm_render::Renderer {
 fn web_golden_text() -> String {
     use std::fmt::Write as _;
     let scheme = |name: &str| aterm_types::scheme::builtin(name).expect("builtin scheme");
-    let default_palette = aterm_types::ColorPalette::new();
+    // Pinned to the portable palette: the golden is shared with the web
+    // module, which never draws Windows' default palette (slots 4 and 12
+    // differ there, `ColorPalette::BLUE`, slots 2, 3 and 6 are One Dark's,
+    // `ColorPalette::GREEN`/`YELLOW`/`CYAN`, and 10, 11, 13 and 14 their
+    // lighter shades, `ColorPalette::BRIGHT_GREEN` and the rest).
+    let mut default_palette = aterm_types::ColorPalette::new();
+    for (slot, [r, g, b]) in [
+        (2, [0x00, 0xCD, 0x00]),
+        (3, [0xCD, 0xCD, 0x00]),
+        (4, [0x3B, 0x8E, 0xEA]),
+        (6, [0x00, 0xCD, 0xCD]),
+        (10, [0x50, 0xFA, 0x7B]),
+        (11, [0xF1, 0xFA, 0x8C]),
+        (12, [0x5C, 0x5C, 0xFF]),
+        (13, [0xFF, 0x79, 0xC6]),
+        (14, [0x8B, 0xE9, 0xFD]),
+    ] {
+        default_palette.set(slot, aterm_types::Rgb::new(r, g, b));
+    }
     let rgb = |c: aterm_types::Rgb| (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b);
     let mut themes: Vec<(&str, aterm_render::Theme, aterm_types::ColorPalette)> = vec![(
         "dark",
@@ -380,7 +398,7 @@ fn web_golden_theme_frames(
         .terminal_config
         .clone()
         .unwrap_or_default();
-    tc.custom_palette = (tname != "dark").then(|| palette.clone());
+    tc.custom_palette = Some(palette.clone());
     app.session_factory.terminal_config = Some(tc);
     for &(cols, wid) in &windows {
         app.frontmost_window = Some(wid);

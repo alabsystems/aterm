@@ -3,7 +3,8 @@
 
 //! The files `aterm machines init` writes once: the inventory and the lab baseline the owner
 //! asked for (design ruling M1). Both are the owner's to edit afterwards; `init` never
-//! overwrites an existing file.
+//! overwrites an existing file. The one exception is a starter baseline nobody edited
+//! ([`EARLIER_DEFAULT_BASELINES`]), which follows the starter shipped now.
 //!
 //! Every pin below was downloaded and checked on 2026-10-16: the SHA-256 of the bytes at the
 //! URL, and the Developer ID Team ID on the app or binary inside
@@ -29,7 +30,9 @@ parallel = 8
 /// started this design.
 pub const DEFAULT_BASELINE: &str = r#"# The baseline every host gets unless its [[host]] block names another.
 # `aterm machines plan --all` shows what it would change; `apply --all` changes it.
-# {name}, {serial} and {uuid} are filled per host; {user} per account.
+# {name}, {tag}, {serial} and {uuid} are filled per host ({tag} is the name's leading
+# letters and digits: m10 of m10-MacBook-M4-Max-36GB-1TB); {hardware} by each Mac from what
+# it reads of itself; {user} per account.
 schema = 1
 
 # Caps Lock acts as Control, for every keyboard model the Mac has seen (takes effect at
@@ -54,9 +57,14 @@ bluetooth_setup_assistant = false
 [setup]
 skip_assistant = true
 
+# Each Mac named for what it is, read from the Mac: "m10 MacBook Pro M4 Max 36GB 1TB",
+# m10-MacBook-Pro-M4-Max-36GB-1TB.local. For the inventory name alone, write "{name}" in both.
+# host_name "" unsets a HostName set by hand, so `hostname`, shell prompts and ssh show the
+# new Local hostname rather than the old name; a dotted name sets one instead.
 [names]
-computer_name = "{name}"
-local_host_name = "{name}"
+computer_name = "{tag} {hardware}"
+local_host_name = "{tag}-{hardware}"
+host_name = ""
 
 [sharing]
 remote_apple_events = false
@@ -141,3 +149,17 @@ screen_sharing = true
 full_disk_access = ["aterm"]
 developer_tools = ["aterm"]
 "#;
+
+/// The SHA-256 of every earlier [`DEFAULT_BASELINE`], as `init` wrote it. A controller's
+/// `baselines/default.toml` that is one of these byte for byte is a starter nobody edited,
+/// so it follows the starter shipped now ([`super::commands::set_up_if_new`]): a fix to the
+/// starter (the 2026-10-19 rehearsal's `host_name = ""`) reaches a controller set up before
+/// it. A file anyone changed, even by a byte, is the owner's and is never rewritten.
+pub const EARLIER_DEFAULT_BASELINES: &[&str] = &[
+    // 06ba4438d0: the first starter.
+    "cde13089544c52e4e8746fe671b083d4483482637c84221d9539303b3fd74363",
+    // 97176941d2 and 031293a41b: Homebrew's release asset.
+    "74dcb0817721f664b3a2b1d4c349e07cd110b6b76e5963f75a0fddc5586323e8",
+    // 6045a51374: [names] names each Mac for what it is, HostName left alone.
+    "e38407721722b11a0faac79954f4906f57eb92d4760bae3f092a00737380a11a",
+];

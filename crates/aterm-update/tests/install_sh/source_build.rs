@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::support::{
-    Home, Lib, Rec, SYSTEM_PATH, Scratch, chmod, install_sh, installer, q, read, root, s, symlink,
+    Home, Lib, Rec, Scratch, chmod, install_sh, installer, q, read, root, s, symlink, system_path,
     tree, write,
 };
 
@@ -330,7 +330,7 @@ impl Lab {
         let mut parts: Vec<String> = dirs.iter().map(|d| self.p(d)).collect();
         parts.push(self.p("macos"));
         parts.push(self.p("nonet"));
-        parts.push(SYSTEM_PATH.into());
+        parts.push(system_path().into());
         parts.join(":")
     }
 
@@ -459,7 +459,10 @@ fn gate(
     lib.step(setup);
     let find = lib.call(format!("find_cargo_and_rustup {}", q(root)), FOUND);
     let proof = prove.then(|| lib.call(format!("cargo_honours_pin {}", q(root)), PROVED));
-    lib.step("unset FAKE_TOOLCHAIN_MISSING FAKE_DIR_OVERRIDE FAKE_NO_ALIAS RUSTUP_TOOLCHAIN; export PATH=/usr/bin:/bin");
+    lib.step(format!(
+        "unset FAKE_TOOLCHAIN_MISSING FAKE_DIR_OVERRIDE FAKE_NO_ALIAS RUSTUP_TOOLCHAIN; export PATH={}",
+        q(system_path())
+    ));
     Gate { find, proof }
 }
 
@@ -485,10 +488,6 @@ fn case_changed(path: &Path) -> Option<PathBuf> {
         (a.dev(), a.ino()) == (b.dev(), b.ino())
     };
     (flipped != path && same(&flipped, path)).then_some(flipped)
-}
-
-fn has_system_cargo() -> bool {
-    std::env::split_paths(SYSTEM_PATH).any(|d| d.join("cargo").exists())
 }
 
 /// rustup's dist channels — what one `rustup toolchain install` fetches —
@@ -1360,10 +1359,6 @@ fn a_stock_pin_never_takes_the_store_lane() {
 /// rustup with no proxy beside it says where the proxy should have been.
 #[test]
 fn with_no_toolchain_in_reach_the_one_remedy_depends_on_an_aterm() {
-    if has_system_cargo() {
-        eprintln!("NOTE: a cargo lives in {SYSTEM_PATH}: the no-cargo cases are not exercised");
-        return;
-    }
     let scratch = Scratch::new();
     let lab = Lab::new(&scratch);
     let root = s(&lab.checkout).to_string();
@@ -1776,24 +1771,22 @@ fn the_dry_run_plan_reports_the_source_build_as_the_run_would() {
             pinned("cargo-home/bin/cargo"),
         ));
     }
-    if !has_system_cargo() {
-        rows.push(row(
-            "neither lane, no aterm",
-            &trust,
-            &["none"],
-            "nohome",
-            vec![],
-            Want::skip(&rustup_remedy, &[product]),
-        ));
-        rows.push(row(
-            "neither lane, aterm in BIN_DIR",
-            &trust,
-            &["none"],
-            "nohome",
-            vec![("ATERM_BIN_DIR", &bare_aterm)],
-            Want::skip(&[product], &["https://rustup.rs"]),
-        ));
-    }
+    rows.push(row(
+        "neither lane, no aterm",
+        &trust,
+        &["none"],
+        "nohome",
+        vec![],
+        Want::skip(&rustup_remedy, &[product]),
+    ));
+    rows.push(row(
+        "neither lane, aterm in BIN_DIR",
+        &trust,
+        &["none"],
+        "nohome",
+        vec![("ATERM_BIN_DIR", &bare_aterm)],
+        Want::skip(&[product], &["https://rustup.rs"]),
+    ));
     let plans: Vec<Plan> = std::thread::scope(|scope| {
         let handles: Vec<_> = rows
             .iter()

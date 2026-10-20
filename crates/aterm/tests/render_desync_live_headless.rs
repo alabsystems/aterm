@@ -45,8 +45,8 @@ use crate::headless_boot::{self, Instance};
 use crate::live_ctl::{Ctl, fields};
 use crate::standin;
 
-/// This lane's stand-in entry (see `support/standin.rs`).
-const ENTRY: &str = "render_desync_live_headless::standin";
+/// The real test that dispatches this lane's child app before its parent body.
+const ENTRY: &str = "render_desync_live_headless::a_quiet_flap_is_undone";
 
 /// `cast drift`'s run gap, equal to the ledger's (`aterm-gui`
 /// `resize_ledger::RUN_GAP_MS`): two resizes farther apart, with a draw
@@ -271,11 +271,9 @@ impl Tui {
     }
 }
 
-/// The stand-in entry: plays the [`Tui`] whose [`Repaint`] is named in
-/// [`standin::ENV`].
-#[test]
-#[ignore = "the app this lane flaps under: the lane runs it as a program"]
-fn standin() {
+/// Play the [`Tui`] whose [`Repaint`] is named in [`standin::ENV`], or return
+/// to the parent test.
+fn play_standin_if_asked() {
     let Some(spec) = standin::spec() else { return };
     match Repaint::parse(&spec) {
         Some(repaint) => Tui::play(repaint),
@@ -760,6 +758,7 @@ impl Lane {
 /// the truecolor row where it was.
 #[test]
 fn a_quiet_flap_is_undone() {
+    play_standin_if_asked();
     let mut lane = Lane::boot("q", Setup::new(Repaint::OnChange));
     let before = lane.colours(3, 4);
     lane.flap(Between::Nothing);

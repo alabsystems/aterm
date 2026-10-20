@@ -179,9 +179,14 @@ const TWINKLE_DOT_COV: f32 = 38.0;
 /// pop envelope, phase-shifted per flare so consecutive twinkles differ.
 ///
 /// Photosensitivity bound: the flash rate is `TWINKLE_SCINT / TWINKLE_DUR` Hz;
-/// keep it `<= 3.2` (WCAG 2.3.1's general-flash threshold is 3 Hz). Pinned by
-/// `twinkle_flash_rate_stays_under_the_photosensitivity_bound`.
+/// keep it `<= 3.2` (WCAG 2.3.1's general-flash threshold is 3 Hz), pinned at
+/// build time below so retuning either constant cannot reintroduce a strobe.
 const TWINKLE_SCINT: f32 = 0.5;
+const _: () = assert!(
+    TWINKLE_SCINT / TWINKLE_DUR <= 3.2,
+    "twinkle scintillation over the 3 Hz general-flash bound"
+);
+const _: () = assert!(TWINKLE_SCINT > 0.0, "the flare must still scintillate");
 
 /// Per-tick dt clamp (seconds) across a charged interval, so a stalled but
 /// charged window does not fling the phase forward. Idle time is never
@@ -788,10 +793,17 @@ impl CursorRainbow {
         // about light, so it is enforced last and in luminance. The floor rides
         // the colour envelope (the ribbon's sparkle field lives as long as the
         // ribbon does) and is zero at rest, where the block is the cursor's own
-        // colour. The knee is a quarter of the range.
+        // colour. The knee is a quarter of the range. On a light page the
+        // caret is the deepest ink instead, already solved into `head_rgb`
+        // (`paper_caret_ink`), and a lift toward white would sink it into the
+        // page.
         let caret_floor =
             RAINBOW_CARET_LIGHT_FLOOR * aterm_render::smoothstep01(paint / CARET_LIGHT_KNEE);
-        let fill = lift_to_light_floor(fill, caret_floor);
+        let fill = if dark_theme {
+            lift_to_light_floor(fill, caret_floor)
+        } else {
+            fill
+        };
         // The flare (§7.1): on a v2 meteor's birth frame the block fills white
         // (the vivid hue on a light theme), then springs back to `fill` on a
         // critically damped `spring-snap`. `None` leaves `fill` untouched.
@@ -2759,22 +2771,6 @@ mod tests {
             "the walk must cross the wrap to prove it"
         );
         assert!(worst > 0, "…and the rim must actually turn");
-    }
-
-    /// The twinkle's photosensitivity bound, pinned as a rate, so retuning
-    /// either constant cannot reintroduce a strobe above WCAG 2.3.1's threshold.
-    #[test]
-    fn twinkle_flash_rate_stays_under_the_photosensitivity_bound() {
-        let hz = TWINKLE_SCINT / TWINKLE_DUR;
-        assert!(
-            hz <= 3.2,
-            "twinkle scintillation is {hz} Hz — over the 3 Hz general-flash bound"
-        );
-        // It must still wobble: a zero rate would remove the glint. Checked at
-        // build time.
-        const {
-            assert!(TWINKLE_SCINT > 0.0, "the flare must still scintillate");
-        }
     }
 
     /// The shared-phase path closes on the ribbon's 1024-unit ring, checked on

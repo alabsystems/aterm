@@ -325,7 +325,8 @@ fn stalled_sink_case(hidden: bool) {
     assert!(old_offset > 0);
     assert_eq!(
         submit(&mut app, paste("REJECTED".into())),
-        InputOutcome::WriteFailed
+        InputOutcome::QueueFull,
+        "the queue is full now: busy, nothing written"
     );
     {
         let term = term.lock().unwrap();
@@ -342,7 +343,7 @@ fn stalled_sink_case(hidden: bool) {
     );
     assert_eq!(
         submit(&mut app, InputEvent::KeySequence(b"REJECTED-KEY".to_vec())),
-        InputOutcome::WriteFailed
+        InputOutcome::QueueFull
     );
     assert_eq!(budget.used.load(Ordering::Acquire) >> 32, 3);
     let rows = |app: &App| {

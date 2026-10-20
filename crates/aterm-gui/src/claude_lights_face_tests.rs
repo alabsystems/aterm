@@ -185,8 +185,8 @@ fn rows() -> Vec<Row> {
             (Accent, Accent),
             "autopilot: cruise, done 17:42, lands 18:00 \u{2014} the agent said it was finished; \
              the harness types nothing more until someone else's turn, then keeps the work \
-             moving; at 18:00 the word turns land, with nothing left to land \u{b7} click: land \
-             now \u{b7} right-click: more",
+             moving; at 18:00 Autopilot switches to land, with nothing left to land \u{b7} \
+             click: land now \u{b7} right-click: more",
             "autopilot: cruise, done 17:42, lands 18:00",
             "Autopilot: cruise. Done at 17:42. Lands at 18:00.",
         ),
@@ -199,8 +199,8 @@ fn rows() -> Vec<Row> {
             (Accent, Accent),
             "autopilot: cruise, landed 17:42, lands Sat 16:00 \u{2014} a landing ended the task; \
              the harness types nothing more until someone else's turn, then keeps the work \
-             moving; at Sat 16:00 the word turns land, with nothing left to land \u{b7} click: \
-             land now \u{b7} right-click: more",
+             moving; at Sat 16:00 Autopilot switches to land, with nothing left to land \u{b7} \
+             click: land now \u{b7} right-click: more",
             "autopilot: cruise, landed 17:42, lands Sat 16:00",
             "Autopilot: cruise. Landed at 17:42. Lands Saturday at 16:00.",
         ),
@@ -616,7 +616,8 @@ fn each_mode_phrase_holds_no_cut_mark() {
             // without its trail, where it has one, then v1's words — the
             // whole with neither the trail nor the menu's line — each wider
             // than the short form and narrower than the one before.
-            let [no_trail, words] = lean_titles(&whole).map(|(head, tail)| format!("{head}{tail}"));
+            let [no_trail, words, clicks, click] =
+                lean_titles(&whole).map(|(head, tail)| format!("{head}{tail}"));
             let (bare, _) = autopilot_title(row.view, &row.glass, "", Some(TODAY));
             if trail.is_empty() {
                 assert_eq!(no_trail, "", "no trail, no form without one: {whole}");
@@ -635,11 +636,238 @@ fn each_mode_phrase_holds_no_cut_mark() {
                 "the click stays: {words}"
             );
             assert_eq!(short_title(&words), row.short, "{words}");
+            // THE CLICKS OUTLAST THE EXPLANATION (owner-eye-1 of the
+            // post-landing check): the phrase with both clicks, where that
+            // is narrower than v1's words, then the phrase with the click —
+            // each narrower than the form before it and wider than the
+            // short form; none where the title has no explanation.
+            let explained = row.face.explanation(&row.glass);
+            let click_words = format!(" \u{b7} click: {}", row.face.click(&row.glass));
+            match explained {
+                None => assert_eq!(
+                    (clicks.as_str(), click.as_str()),
+                    ("", ""),
+                    "no explanation, nothing to give up: {whole}"
+                ),
+                Some(e) => {
+                    assert_eq!(click, format!("{}{click_words}", row.short), "{whole}");
+                    let cells = |t: &str| t.chars().count();
+                    if cells(&e) + 3 > cells(" \u{b7} right-click: more") {
+                        assert_eq!(
+                            clicks,
+                            format!("{click} \u{b7} right-click: more"),
+                            "{whole}"
+                        );
+                        assert!(cells(&clicks) < cells(&words), "{whole}");
+                        assert!(cells(&click) < cells(&clicks), "{whole}");
+                    } else {
+                        assert_eq!(clicks, "", "no narrower than v1's words: {whole}");
+                        assert!(cells(&click) < cells(&words), "{whole}");
+                    }
+                    assert!(cells(&click) > cells(row.short), "{whole}");
+                    assert!(!click.contains(" \u{2014} "), "{click}");
+                    assert_eq!(short_title(&click), row.short, "{click}");
+                }
+            }
         }
     }
     // NEGATIVE CONTROL: a title that is no Autopilot whole title has none.
-    assert_eq!(lean_titles(SETTINGS_TITLE), [("", ""); 2]);
-    assert_eq!(lean_titles("autopilot: cruise"), [("", ""); 2]);
+    assert_eq!(lean_titles(SETTINGS_TITLE), [("", ""); LEAN_FORMS]);
+    assert_eq!(lean_titles("autopilot: cruise"), [("", ""); LEAN_FORMS]);
+}
+
+/// EVERY FACE KEEPS ITS CLICKS AFTER ITS EXPLANATION (owner-eye-1 of the
+/// post-landing check of Autopilot v3 wave 1, Claude Code 2.1.302: hovering
+/// `∞ ✓ done` on a 160-column rule showed `autopilot: cruise, done 13:04`
+/// alone, its explanation and both clicks gone below about 240 columns,
+/// where main before wave 1 kept `click: land` from 120). For every face of
+/// the table, with a trail and without one, the hovered block laid as a
+/// frame lays it and fitted beside the whole facts (`◆ Opus 5.5 xhigh   ⌂
+/// ~/aterm   ⎇ main`) over every room from 400 cells down: the title is the
+/// whole, then without its trail (where it has one), then v1's words, then
+/// the phrase with both clicks (where that is narrower), then the phrase
+/// with the click, then the phrase alone, then none — in that order, never
+/// back; each form stands from exactly the room the one before it no
+/// longer fits in down to exactly its own width; the facts stay whole
+/// wherever a title is drawn; and every form wider than the phrase keeps `·
+/// click: `. Then the done face's own rule at 160, 120, 110 and 90 columns.
+///
+/// NEGATIVE CONTROL: the same block with the two forms taken out (their
+/// widths 0, the ladder main had) goes from v1's words straight to the
+/// phrase, and the done face's 160-column rule shows no click.
+#[test]
+fn every_face_keeps_its_clicks_after_its_explanation() {
+    use aterm_agent::harness::footer::{self, FooterFacts, LightsWidth, TitleFit};
+    let now = Instant::now();
+    let facts = FooterFacts {
+        model: Some("Opus 5.5".into()),
+        effort: Some("xhigh".into()),
+        path: Some("~/aterm".into()),
+        branch: Some("main".into()),
+        ..FooterFacts::default()
+    };
+    let whole_facts = footer::fit_rule(&facts, 400, None).segments;
+    let hovered = |row: &Row, trail: &str| {
+        let (whole, short) = autopilot_title(row.view, &row.glass, trail, Some(TODAY));
+        let w = lights(row.view, row.glass);
+        let mut block = Block::default();
+        assert!(w.fit_into(
+            7,
+            blank(),
+            now,
+            ACCENT,
+            None,
+            Some(Chip::Autopilot),
+            400,
+            Some((&whole, &short)),
+            &mut block,
+        ));
+        let widths = LightsWidth {
+            chips: block.holds,
+            title: block.title.len(),
+            lean: block.lean.each_ref().map(Vec::len),
+            short: block.short_title.len(),
+            reason: block.reason,
+        };
+        (block, widths)
+    };
+    let laid = |block: &Block, title: TitleFit| match title {
+        TitleFit::Full => text(&block.title),
+        TitleFit::Lean(n) => text(&block.lean[usize::from(n)]),
+        TitleFit::Short => text(&block.short_title),
+        TitleFit::None => String::new(),
+    };
+    // The forms a walk meets, widest first, and the narrowest room each
+    // stood at.
+    let walk = |widths: LightsWidth| {
+        let mut met: Vec<(TitleFit, usize)> = Vec::new();
+        for room in (0..=400).rev() {
+            let fit = footer::fit_rule(&facts, room, Some(widths));
+            if !fit.chips {
+                break;
+            }
+            match met.last_mut() {
+                Some((title, narrowest)) if *title == fit.title => *narrowest = room,
+                _ => met.push((fit.title, room)),
+            }
+            if fit.title != TitleFit::None {
+                assert_eq!(fit.segments, whole_facts, "{room}: the facts stay whole");
+            }
+        }
+        met
+    };
+    for row in rows() {
+        if row.view == AutopilotView::Unhosted {
+            // No Autopilot chip is drawn in Claude Code's rule with no host.
+            continue;
+        }
+        let what = format!("{:?} {:?}", row.view, row.glass);
+        for trail in ["", "\u{2713} approved 14:05"] {
+            let (block, widths) = hovered(&row, trail);
+            let explained = row.face.explanation(&row.glass).is_some();
+            let both = widths.lean[2] > 0;
+            let mut want = vec![TitleFit::Full];
+            if !trail.is_empty() {
+                want.push(TitleFit::Lean(0));
+            }
+            want.push(TitleFit::Lean(1));
+            if both {
+                want.push(TitleFit::Lean(2));
+            }
+            if explained {
+                want.push(TitleFit::Lean(3));
+            }
+            want.extend([TitleFit::Short, TitleFit::None]);
+            let met = walk(widths);
+            assert_eq!(
+                met.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+                want,
+                "{what} {trail:?}: the forms in order"
+            );
+            for &(title, narrowest) in &met {
+                if title == TitleFit::None {
+                    continue;
+                }
+                let fit = footer::fit_rule(&facts, narrowest, Some(widths));
+                assert_eq!(
+                    fit.width(Some(widths)),
+                    narrowest,
+                    "{what} {trail:?}: {title:?} stands down to its own width"
+                );
+                let drawn = laid(&block, title);
+                assert_eq!(
+                    drawn.contains(" \u{b7} click: "),
+                    title != TitleFit::Short,
+                    "{what} {trail:?}: {title:?} keeps the click: {drawn:?}"
+                );
+                if title == TitleFit::Lean(2) {
+                    assert!(drawn.ends_with("right-click: more  "), "{drawn:?}");
+                    assert!(!drawn.contains(" \u{2014} "), "{drawn:?}");
+                }
+            }
+            // NEGATIVE CONTROL: the ladder main had.
+            let main = LightsWidth {
+                lean: [widths.lean[0], widths.lean[1], 0, 0],
+                ..widths
+            };
+            let before: Vec<TitleFit> = walk(main).into_iter().map(|(t, _)| t).collect();
+            assert!(
+                !before.contains(&TitleFit::Lean(2)) && !before.contains(&TitleFit::Lean(3)),
+                "CONTROL {what}: {before:?}"
+            );
+        }
+    }
+    // The finding's own rule: the done face under Cruise, hovered.
+    let done = rows()
+        .into_iter()
+        .find(|r| r.face == ChipFace::CruiseDone && r.glass.land_at.is_none())
+        .expect("the done face");
+    let (block, widths) = hovered(&done, "");
+    let rule = |cols: usize, widths: LightsWidth| {
+        let fit = footer::fit_rule(&facts, footer::rule_room(&(0..cols)), Some(widths));
+        laid(&block, fit.title)
+    };
+    assert_eq!(
+        rule(160, widths),
+        "autopilot: cruise, done 17:42 \u{b7} click: land \u{b7} right-click: more  "
+    );
+    assert_eq!(rule(120, widths), rule(160, widths), "both clicks at 120");
+    assert_eq!(
+        rule(110, widths),
+        "autopilot: cruise, done 17:42 \u{b7} click: land  ",
+        "the click at 110 columns"
+    );
+    assert_eq!(
+        rule(90, widths),
+        "autopilot: cruise, done 17:42  ",
+        "the phrase alone at 90"
+    );
+    let from = |title: TitleFit| {
+        (40..=400)
+            .filter(|cols| {
+                footer::fit_rule(&facts, footer::rule_room(&(0..*cols)), Some(widths)).title
+                    == title
+            })
+            .min()
+    };
+    eprintln!(
+        "the done face: whole from {:?} columns, v1's words from {:?}, both clicks from {:?}, \
+         the click from {:?}, the phrase from {:?}",
+        from(TitleFit::Full),
+        from(TitleFit::Lean(1)),
+        from(TitleFit::Lean(2)),
+        from(TitleFit::Lean(3)),
+        from(TitleFit::Short)
+    );
+    let main = LightsWidth {
+        lean: [widths.lean[0], widths.lean[1], 0, 0],
+        ..widths
+    };
+    assert_eq!(
+        rule(160, main),
+        "autopilot: cruise, done 17:42  ",
+        "CONTROL: main's ladder gives the clicks up"
+    );
 }
 
 /// EACH SPOKEN LABEL HOLDS NO GLYPH: letters, digits, spaces and `.:,`
@@ -827,7 +1055,7 @@ fn the_default_glass_is_v1s_chip() {
             "{view:?}"
         );
         assert_eq!(short, short_title(view.title()), "{view:?}");
-        let [_, (head, tail)] = lean_titles(&whole);
+        let [_, (head, tail), ..] = lean_titles(&whole);
         assert_eq!(
             format!("{head}{tail}"),
             view.title(),
@@ -962,6 +1190,7 @@ fn the_autopilot_terms_bit_table_round_trips() {
                         }),
                         last: Some((Act::Approved, stamp(14, 5))),
                         trail,
+                        pause: None,
                     };
                     let back = unpack(glass_bits(glass, reading));
                     assert_eq!(

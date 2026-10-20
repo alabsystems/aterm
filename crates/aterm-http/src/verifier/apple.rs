@@ -240,7 +240,7 @@ fn cf_string(s: &str) -> Option<CfOwned> {
             0,
         )
     };
-    (!r.is_null()).then_some(CfOwned(r))
+    (!r.is_null()).then(|| CfOwned(r))
 }
 
 /// Copy a `CFString` out as a Rust `String`. Diagnostics only.
@@ -287,7 +287,7 @@ fn cf_array(items: &[CfOwned]) -> Option<CfOwned> {
             &raw const kCFTypeArrayCallBacks,
         )
     };
-    (!r.is_null()).then_some(CfOwned(r))
+    (!r.is_null()).then(|| CfOwned(r))
 }
 
 /// Wrap one DER certificate as a `SecCertificate`.
@@ -306,7 +306,7 @@ fn sec_certificate(der: &[u8]) -> Option<CfOwned> {
     // call; `SecCertificateCreateWithData` copies what it needs and returns
     // NULL (not a diagnostic) when the DER does not parse.
     let cert = unsafe { SecCertificateCreateWithData(ptr::null(), data.0) };
-    (!cert.is_null()).then_some(CfOwned(cert))
+    (!cert.is_null()).then(|| CfOwned(cert))
 }
 
 // ---------------------------------------------------------------------------

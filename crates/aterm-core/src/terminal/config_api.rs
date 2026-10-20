@@ -360,20 +360,28 @@ impl Terminal {
             changes.push(ConfigChange::AmbiguousWidth);
         }
 
-        // Style-attribute policy: bold-to-bright promotion + faint opacity.
-        // This is resolved at render time, so existing cells do not need to be
-        // rewritten. They do need to be repainted: without full damage the
-        // frontend's damage-epoch early-out can swallow a style-only reload.
+        // Style-attribute policy: bold-to-bright promotion, faint opacity and
+        // the theme-pair contrast floor. This is resolved at render time, so
+        // existing cells do not need to be rewritten. They do need to be
+        // repainted: without full damage the frontend's damage-epoch early-out
+        // can swallow a style-only reload.
         let new_faint = if config.faint_opacity.is_finite() {
             config.faint_opacity.clamp(0.0, 1.0)
         } else {
             aterm_types::DIM_FACTOR
         };
+        let new_floor = if config.indexed_minimum_contrast.is_finite() {
+            config.indexed_minimum_contrast.clamp(1.0, 21.0)
+        } else {
+            1.0
+        };
         if self.color.bold_is_bright != config.bold_is_bright
             || (self.color.faint_opacity - new_faint).abs() > f32::EPSILON
+            || (self.color.indexed_minimum_contrast - new_floor).abs() > f32::EPSILON
         {
             self.color.bold_is_bright = config.bold_is_bright;
             self.color.faint_opacity = new_faint;
+            self.color.indexed_minimum_contrast = new_floor;
             changes.push(ConfigChange::StylePolicy);
             visual_repaint = true;
         }

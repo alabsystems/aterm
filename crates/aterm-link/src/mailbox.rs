@@ -194,6 +194,12 @@ struct Queues {
     closed: VecDeque<Item>,
     /// Paused faces whose queue has drained: `Item::Resume`'s.
     resume: VecDeque<(Source, u64)>,
+    /// The last `EVENT * bye <word>` the push reader read, LATCHED as it is
+    /// read ([`Mailbox::note_bye`]). Not a queue entry: the loop takes a
+    /// closure notice ahead of every event, so a bye that arrived just before
+    /// aterm closed the lanes would sit behind `Closed(Aterm)` and be lost
+    /// with the loop. The latch is what the closure arm reads instead.
+    bye: Option<aterm_types::fabric_grammar::Bye>,
 }
 
 /// Whether one source is over a bound AND non-empty: an empty queue must accept
@@ -447,6 +453,21 @@ impl Mailbox {
         q.closed.push_back(item);
         drop(q);
         self.ready.notify_all();
+    }
+
+    /// Latch aterm's last word before it closes the lanes — called by the push
+    /// reader the moment it reads `EVENT * bye <word>`, BEFORE the line is
+    /// queued, so the word is never behind the `Closed(Aterm)` the reader
+    /// pushes at end-of-file. A later word replaces an earlier one: a handoff
+    /// that rolled back and then quit says `quit` last.
+    pub fn note_bye(&self, bye: aterm_types::fabric_grammar::Bye) {
+        self.lock().bye = Some(bye);
+    }
+
+    /// The word [`Mailbox::note_bye`] latched, if aterm said one.
+    #[must_use]
+    pub fn bye(&self) -> Option<aterm_types::fabric_grammar::Bye> {
+        self.lock().bye
     }
 
     /// Report that ATERM went away — never generation-scoped.

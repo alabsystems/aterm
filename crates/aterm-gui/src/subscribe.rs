@@ -1225,6 +1225,9 @@ fn drain_title_event(
 ///   `await seq|idle|gone`, and it must read the rows anyway to parse the
 ///   approval box, so it classifies those rows with aterm-phase itself and uses
 ///   the verdict only for one bounded `await agent prompt`.
+/// * `EVENT <sid> task rev=<n> state=<s> attention=<0|1> [why=<w>] [exit=<n>]`
+///   for a `task-change` — a worker's task record moved (`task`), the edge a
+///   manager's `await task` parks on, pushed for a watcher that holds a stream.
 /// * `EVENT <sid> status phase=<p> outcome=<o> exit_code=<n|-> signal=<n|->
 ///   confidence=<c>` for a `status-change` — the session's classified status
 ///   moved phase or outcome (`status phase=`), one per transition that survived
@@ -1385,8 +1388,13 @@ pub(crate) fn timeline_wire_kind(kind: &str) -> Option<&'static str> {
         // face of `status agent=` — a client that does not need the rows may
         // park on it instead of re-reading screens.
         "agent-change" => Some("agent"),
+        // The session's TASK RECORD moved (`crate::task_record::mark_session_task`, or the
+        // supervisor's attention on a tasked session): `EVENT <local> task
+        // rev=<n> state=<s> attention=<0|1> [why=<w>] [exit=<n>]`, the push face
+        // of `task` — no result text and no path; `task` reads the record.
+        "task-change" => Some("task"),
         // The session's published status moved phase or outcome
-        // (`session_status::StatusObserver::take_status_event`): `EVENT <local>
+        // (`session_status::StatusObserver::take_status_transition`): `EVENT <local>
         // status phase=<p> outcome=<o> exit_code=<n|-> signal=<n|->
         // confidence=<c>`, the push face of `status` — one per transition that
         // survived dwell, so a spinner cannot flood it.
@@ -1455,7 +1463,7 @@ struct RosterCursor {
 }
 
 /// Append `EVENT * session-created <sid>[ watch=deferred]` / `EVENT * session-exited <sid> reason=<…>` /
-/// `EVENT * fabric-retire <sid>` to `out` for every roster change since the cursor's watermark — the INSTANCE lifecycle
+/// `EVENT * fabric-retire <sid>` / `EVENT * bye <quit|handoff>` to `out` for every roster change since the cursor's watermark — the INSTANCE lifecycle
 /// stream (`*` = instance-level, not a per-channel event). Surfaces a SIBLING
 /// spawn/exit a fleet supervisor is not watching, so it need not poll `ls`.
 ///
@@ -1549,6 +1557,11 @@ fn drain_roster(
                     crate::session_store::RosterChange::RetireRequested => {
                         out.push_str(&format!("EVENT * fabric-retire {}\n", rec.sid));
                     }
+                    // The instance's last word to its bridge: how it leaves.
+                    #[cfg(any(unix, test))]
+                    crate::session_store::RosterChange::Bye(bye) => {
+                        out.push_str(&format!("EVENT * bye {}\n", bye.word()));
+                    }
                 }
             }
         }
@@ -1613,17 +1626,21 @@ fn diff_session_events(
 
 /// Scan the target's TURN LEDGER and emit a turn EVENT for every record whose id
 /// is strictly greater than `last_turn_id`, advancing it — the turn-lifecycle
-/// twin of `drain_block_events`. The small `(id, submitted, status, dur_ms)`
+/// twin of `drain_block_events`. The small `(id, submitted, status, dur_ms, by)`
 /// tuples are cloned OUT under the lock; the lock is never held across a write.
 /// Digest form (no text/hash — that is what the `turns` verb is for):
-/// `EVENT <sid> turn <id> submitted=<0|1> status=<..> dur_ms=<..>\n`.
+/// `EVENT <sid> turn <id> submitted=<0|1> status=<..> dur_ms=<..> by=<who>\n`,
+/// `by=` the `history` word ([`crate::turn_ledger::TurnBy`]), so a watcher
+/// tells the window harness's own turns (`by=harness`: its continuations,
+/// done checks and `/usage`, the most common turn on an autonomous run)
+/// from a manager's without a `history` read.
 fn drain_turn_events(
     turns: &Arc<Mutex<TurnLedger>>,
     sid: &str,
     last_turn_id: Option<u64>,
     out: &mut String,
 ) -> Option<u64> {
-    let fresh: Vec<(u64, bool, &'static str, u64)> = {
+    let fresh: Vec<(u64, bool, &'static str, u64, String)> = {
         let l = turns.lock().unwrap_or_else(|p| p.into_inner());
         // O(1) HIGH-WATER COMPARE BEFORE THE SCAN — the timeline twin. `high_id()`
         // is `back()`. An idle wake (the common case: 4 Hz liveness ticks on a
@@ -1640,15 +1657,21 @@ fn drain_turn_events(
                 .map(|r| {
                     #[cfg(test)]
                     crate::work_counts::retained_record_touched();
-                    (r.id, r.submitted, r.status, r.dur_ms)
+                    (
+                        r.id,
+                        r.submitted,
+                        r.status,
+                        r.dur_ms,
+                        r.by.as_wire().to_string(),
+                    )
                 })
                 .collect(),
         }
     };
     let mut high = last_turn_id;
-    for (id, submitted, status, dur_ms) in fresh {
+    for (id, submitted, status, dur_ms, by) in fresh {
         out.push_str(&format!(
-            "EVENT {sid} turn {id} submitted={} status={status} dur_ms={dur_ms}\n",
+            "EVENT {sid} turn {id} submitted={} status={status} dur_ms={dur_ms} by={by}\n",
             u8::from(submitted)
         ));
         high = Some(high.map_or(id, |h| h.max(id)));
@@ -2333,6 +2356,106 @@ pub(crate) struct PushScopes {
 struct PushCursors {
     roster: Option<RosterCursor>,
     adopt_seq: u64,
+    /// This loop's place among the `sessions` stream's readers, beside
+    /// `roster` ([`RosterReader`]).
+    reader: Option<RosterReader>,
+}
+
+/// THE INSTANCE STREAM'S READERS: every live push loop that carries the
+/// `sessions` stream, by a key of its own, with the store it reads (by
+/// address: a process has one, a test process many, each with its own
+/// journal) and the newest roster-journal seq whose lines it has WRITTEN to its
+/// client. The instance's last word, `EVENT * bye quit` (`fabric_launch::bye`),
+/// is a journal row like any other, and the quit closes every connection soon
+/// after it; so the quit waits, bounded, until every reader here has written
+/// past it ([`await_roster_written`]) and a watcher learns the instance quit
+/// instead of meeting a bare end of file.
+struct RosterReaders {
+    next: u64,
+    /// By reader key: its store's address and the seq written.
+    written: std::collections::BTreeMap<u64, (usize, u64)>,
+}
+
+static ROSTER_READERS: Mutex<RosterReaders> = Mutex::new(RosterReaders {
+    next: 0,
+    written: std::collections::BTreeMap::new(),
+});
+
+/// Notified whenever [`ROSTER_READERS`] moves: a reader wrote, joined or left.
+static ROSTER_WRITTEN: std::sync::Condvar = std::sync::Condvar::new();
+
+/// One push loop's place in [`ROSTER_READERS`], left when the loop ends (its
+/// client gone, its targets closed).
+struct RosterReader {
+    key: u64,
+    /// Its store, by address ([`store_key`]).
+    store: usize,
+    /// The seq last published for it.
+    written: u64,
+}
+
+/// A store's key in [`ROSTER_READERS`]: its address, alive as long as any
+/// reader of it is (each holds the store's `Arc`).
+fn store_key(store: &Store) -> usize {
+    Arc::as_ptr(store).addr()
+}
+
+impl RosterReader {
+    /// Join `store`'s readers with `seq` already written. Called UNDER THE STORE
+    /// READ GUARD the loop's cursor was seeded under: a row journaled after the
+    /// seed is one this loop will drain and is waited for, and one journaled
+    /// before is no part of its stream.
+    fn join(store: &Store, seq: u64) -> Self {
+        let store = store_key(store);
+        let mut readers = ROSTER_READERS.lock().unwrap_or_else(|p| p.into_inner());
+        let key = readers.next;
+        readers.next += 1;
+        readers.written.insert(key, (store, seq));
+        Self {
+            key,
+            store,
+            written: seq,
+        }
+    }
+
+    /// The loop has written its client every row up to `seq`.
+    fn wrote(&mut self, seq: u64) {
+        if seq <= self.written {
+            return;
+        }
+        self.written = seq;
+        let mut readers = ROSTER_READERS.lock().unwrap_or_else(|p| p.into_inner());
+        readers.written.insert(self.key, (self.store, seq));
+        drop(readers);
+        ROSTER_WRITTEN.notify_all();
+    }
+}
+
+impl Drop for RosterReader {
+    fn drop(&mut self) {
+        let mut readers = ROSTER_READERS.lock().unwrap_or_else(|p| p.into_inner());
+        readers.written.remove(&self.key);
+        drop(readers);
+        ROSTER_WRITTEN.notify_all();
+    }
+}
+
+/// Wait up to `within` until every live `sessions` stream of `store` has
+/// written its roster row `seq` (and everything before it) to its client, or
+/// has ended; `true` when all had. The quit's `bye` ([`RosterReaders`]).
+#[cfg(any(unix, test))]
+pub(crate) fn await_roster_written(store: &Store, seq: u64, within: Duration) -> bool {
+    let store = store_key(store);
+    let behind = |r: &RosterReaders| {
+        r.written
+            .values()
+            .any(|(of, written)| *of == store && *written < seq)
+    };
+    let readers = ROSTER_READERS.lock().unwrap_or_else(|p| p.into_inner());
+    let (readers, _) = ROSTER_WRITTEN
+        .wait_timeout_while(readers, within, |r| behind(r))
+        .unwrap_or_else(|p| p.into_inner());
+    !behind(&readers)
 }
 
 /// The production push loop with an explicit peer-liveness probe.
@@ -2396,13 +2519,21 @@ pub(crate) fn push_loop_with_peer_probe<W: Write, P: FnMut() -> bool>(
     // between them and be counted twice (once in the baseline set, once again
     // when the journal replayed it), which is exactly the class of bug a
     // watermark is supposed to remove.
-    let roster = instance.sessions().then(|| {
-        let g = store.read().unwrap_or_else(|p| p.into_inner());
-        RosterCursor {
-            seq: g.roster_seq(),
-            known: g.live_sids(),
-        }
-    });
+    // The reader joins under the same guard ([`RosterReader::join`]).
+    let (roster, reader) = instance
+        .sessions()
+        .then(|| {
+            let g = store.read().unwrap_or_else(|p| p.into_inner());
+            let seq = g.roster_seq();
+            (
+                RosterCursor {
+                    seq,
+                    known: g.live_sids(),
+                },
+                RosterReader::join(store, seq),
+            )
+        })
+        .unzip();
 
     // Build the per-target send cursors. `since` seeds `last_sent_seq` so the
     // IMMEDIATE catch-up below fires exactly when the live content advanced past
@@ -2448,6 +2579,7 @@ pub(crate) fn push_loop_with_peer_probe<W: Write, P: FnMut() -> bool>(
     let mut cursors = PushCursors {
         roster,
         adopt_seq: 0,
+        reader,
     };
     let _ = pump(
         store,
@@ -2613,6 +2745,7 @@ pub(crate) mod pace_clock {
         }
 
         /// Stop this thread's pacer clock: it reads this instant until stepped.
+        #[cfg(unix)]
         pub(crate) fn freeze() {
             NOW.with(|now| now.set(Some(Instant::now())));
         }
@@ -2892,6 +3025,10 @@ fn pump<W: Write, P: FnMut() -> bool>(
             }
         }
         egress.end_wake()?;
+        // Written, so said: the roster rows this wake drained reached the client.
+        if let (Some(reader), Some(cursor)) = (cursors.reader.as_mut(), cursors.roster.as_ref()) {
+            reader.wrote(cursor.seq);
+        }
         pacer.rest_from_now();
     }
 }
@@ -3441,7 +3578,7 @@ pub(crate) mod digest_fixture {
                         // that scanned the whole ring, and an all-other fixture
                         // would never exercise the emit path.
                         if j % 8 == 0 {
-                            t.record("meta-change", "field=role value=lead".to_string());
+                            t.record_raw_meta_change("field=role value=lead".to_string());
                         } else {
                             t.record("state-change", "state=alive".to_string());
                         }
@@ -3577,6 +3714,7 @@ pub(crate) mod digest_fixture {
             screen_hash: id.wrapping_mul(0x9E37_79B9_7F4A_7C15),
             seq: id,
             arch: crate::turn_ledger::ArchMark::default(),
+            by: crate::turn_ledger::TurnBy::Ctl,
             carried: false,
         }
     }
@@ -3723,6 +3861,7 @@ mod tests {
         let mut cursors = PushCursors {
             roster: None,
             adopt_seq: 0,
+            reader: None,
         };
         let streams = TargetStreams {
             events: true,
@@ -3782,6 +3921,7 @@ mod tests {
         let mut cursors = PushCursors {
             roster: None,
             adopt_seq: 0,
+            reader: None,
         };
         let streams = TargetStreams {
             log: true,
@@ -4726,7 +4866,7 @@ mod tests {
         timeline
             .lock()
             .unwrap()
-            .record("meta-change", "field=title value=old".to_string());
+            .record_raw_meta_change("field=title value=old".to_string());
         let seeded = initial_timeline_watermark(
             &timeline,
             TargetStreams {
@@ -4750,7 +4890,7 @@ mod tests {
         timeline
             .lock()
             .unwrap()
-            .record("meta-change", "field=title value=build%20agent".to_string());
+            .record_raw_meta_change("field=title value=build%20agent".to_string());
         timeline
             .lock()
             .unwrap()
@@ -4774,6 +4914,44 @@ mod tests {
         let mut out = String::new();
         drain_timeline_events(&timeline, "7", wm2, true, &mut out);
         assert_eq!(out, "EVENT 7 human\n");
+    }
+
+    /// A worker's task record moved (`task_record::mark_session_task`): the digest pushes
+    /// `EVENT <local> task rev=<n> state=<s> attention=<0|1> [why=] [exit=]`,
+    /// the record's own payload — no result text, no path. A mark that
+    /// changes nothing records nothing, so nothing is pushed for it.
+    #[test]
+    fn a_task_change_pushes_its_rev_and_state() {
+        use crate::task_record::{TaskMark, TaskState};
+        let timeline = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::session_timeline::SessionTimeline::default(),
+        ));
+        let seeded = initial_timeline_watermark(
+            &timeline,
+            TargetStreams {
+                events: true,
+                ..Default::default()
+            },
+        );
+        let now = std::time::Instant::now();
+        let mut exited = TaskMark::new(TaskState::Exited);
+        exited.why = Some("exit");
+        exited.exit = Some(3);
+        exited.result_path = Some(std::path::PathBuf::from("/s/tasks/r"));
+        {
+            let mut t = timeline.lock().unwrap();
+            let _ = t.mark_task(&TaskMark::new(TaskState::Working), false, now, 1);
+            let _ = t.mark_task(&exited, false, now, 2);
+            let _ = t.mark_task(&exited, false, now, 3);
+        }
+        let mut out = String::new();
+        let wm = drain_timeline_events(&timeline, "7", seeded, true, &mut out);
+        assert_eq!(
+            out,
+            "EVENT 7 task rev=1 state=working attention=0\n\
+             EVENT 7 task rev=2 state=exited attention=0 why=exit exit=3\n"
+        );
+        assert_eq!(wm, Some(2));
     }
 
     /// A WATERMARK BELOW THE RETAINED LOW IS A HOLE, AND IT IS SAID. The
@@ -4994,7 +5172,7 @@ mod tests {
                     timeline
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .record("meta-change", "field=title value=held".to_string());
+                        .record_raw_meta_change("field=title value=held".to_string());
                 } else if wakes == 2 {
                     assert_eq!(wire.text(), "", "the first wake's live drain was held");
                     store
@@ -5069,7 +5247,7 @@ mod tests {
             timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .record("meta-change", payload);
+                .record_raw_meta_change(payload);
         };
         let mut sink = Stalling {
             wire: Vec::new(),
@@ -5308,6 +5486,128 @@ mod tests {
         }
     }
 
+    /// A BYE RIDES THE INSTANCE STREAM, each one once and in order, as
+    /// `EVENT * bye <word>`, and moves no membership: it is the instance's
+    /// word to its bridge, not a session coming or going.
+    #[test]
+    fn a_bye_rides_the_instance_stream_and_moves_no_membership() {
+        use aterm_types::fabric_grammar::Bye;
+        let store = crate::session_store::new_store();
+        let mut cursor = roster_cursor(&store);
+        let known = cursor.known.clone();
+        for bye in [Bye::Handoff, Bye::Quit] {
+            store
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .say_bye(bye);
+        }
+        assert_eq!(
+            text(&drain_session_events(&store, &mut cursor)),
+            "EVENT * bye handoff\nEVENT * bye quit\n"
+        );
+        assert_eq!(cursor.known, known);
+    }
+
+    /// THE QUIT'S LAST WORD IS ON THE WIRE BEFORE ITS WAIT ANSWERS. A
+    /// `sessions` push loop (the bridge's scopes: `subscribe @* events,sessions`)
+    /// joins its store's readers as it seeds, and a quit's `bye quit` journalled
+    /// after that is waited for ([`await_roster_written`]) until the loop has
+    /// WRITTEN it: when the wait answers `true` the line is in the sink. A
+    /// reader of another store holds nothing up; one that never writes past
+    /// its store's bye makes that wait answer `false` at its bound (the
+    /// control), and once it leaves, `true`.
+    #[test]
+    fn a_quits_bye_is_on_the_wire_before_its_wait_answers() {
+        use aterm_types::fabric_grammar::Bye;
+        struct Shared(Arc<Mutex<String>>);
+        impl Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push_str(&String::from_utf8_lossy(buf));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let readers_of = |store: &Store| {
+            let key = store_key(store);
+            ROSTER_READERS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .written
+                .values()
+                .filter(|(of, _)| *of == key)
+                .count()
+        };
+        let say_quit = |store: &Store| {
+            let mut g = store.write().unwrap_or_else(|p| p.into_inner());
+            g.say_bye(Bye::Quit);
+            g.roster_seq()
+        };
+        let store = crate::session_store::new_store();
+        let wire = Arc::new(Mutex::new(String::new()));
+        let ended = Arc::new(AtomicBool::new(false));
+        let lane = {
+            let (store, wire, ended) = (store.clone(), Arc::clone(&wire), Arc::clone(&ended));
+            std::thread::spawn(move || {
+                let registry = new_registry();
+                let mut hang = hang_detector();
+                push_loop_with_peer_probe(
+                    &registry,
+                    &store,
+                    &[],
+                    bridge_scopes(),
+                    PushOptions::default(),
+                    "",
+                    &mut Shared(wire),
+                    move || ended.load(Ordering::Acquire) || hang(),
+                );
+            })
+        };
+        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        while readers_of(&store) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the loop never joined"
+            );
+            std::thread::yield_now();
+        }
+        // Another store's reader that never writes.
+        let other = crate::session_store::new_store();
+        let stuck = RosterReader::join(&other, 0);
+        let other_seq = say_quit(&other);
+
+        let seq = say_quit(&store);
+        assert!(
+            await_roster_written(&store, seq, aterm_spec::wait::MUST_HAPPEN),
+            "the loop wrote past the bye"
+        );
+        assert!(
+            wire.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains("EVENT * bye quit\n"),
+            "{:?}",
+            wire.lock().unwrap_or_else(|p| p.into_inner())
+        );
+        assert!(!await_roster_written(
+            &other,
+            other_seq,
+            Duration::from_millis(50)
+        ));
+        drop(stuck);
+        assert!(await_roster_written(
+            &other,
+            other_seq,
+            aterm_spec::wait::MUST_HAPPEN
+        ));
+        ended.store(true, Ordering::Release);
+        lane.join().expect("the push loop ends");
+        assert_eq!(readers_of(&store), 0, "the ended loop left the readers");
+    }
+
     /// THE SCP-4 CORRECTNESS FIX, with its own negative control.
     ///
     /// A sibling that BOTH spawns and exits between two wakes used to appear in
@@ -5441,12 +5741,14 @@ mod tests {
     /// The `events` digest surfaces new TURN records as `EVENT <sid> turn …`
     /// lines, scanning the ledger by id watermark exactly like block-complete:
     /// a record past the watermark emits once and advances it; a re-scan with no
-    /// new record emits nothing (no double-report).
+    /// new record emits nothing (no double-report). Each line names who typed
+    /// it, `history`'s `by=`: the window harness's own turn reads `by=harness`
+    /// whatever its status, beside a manager's `by=ctl`.
     #[test]
     fn drain_turn_events_emits_once_per_new_record() {
-        use crate::turn_ledger::{TurnLedger, TurnRecord};
+        use crate::turn_ledger::{TurnBy, TurnLedger, TurnRecord};
         let ledger = Arc::new(Mutex::new(TurnLedger::default()));
-        let push = |id: u64, submitted: bool, status: &'static str| {
+        let push_by = |id: u64, submitted: bool, status: &'static str, by: TurnBy| {
             ledger.lock().unwrap().push(TurnRecord {
                 id,
                 started_ms: id,
@@ -5457,8 +5759,12 @@ mod tests {
                 screen_hash: id,
                 seq: id,
                 arch: crate::turn_ledger::ArchMark::default(),
+                by,
                 carried: false,
             });
+        };
+        let push = |id: u64, submitted: bool, status: &'static str| {
+            push_by(id, submitted, status, TurnBy::Ctl);
         };
 
         // Seed the watermark at the current high (a live stream ignores backlog).
@@ -5475,13 +5781,25 @@ mod tests {
         push(2, false, "timeout");
         out.clear();
         wm = drain_turn_events(&ledger, "3", wm, &mut out);
-        assert_eq!(out, "EVENT 3 turn 2 submitted=0 status=timeout dur_ms=7\n");
+        assert_eq!(
+            out,
+            "EVENT 3 turn 2 submitted=0 status=timeout dur_ms=7 by=ctl\n"
+        );
         assert_eq!(wm, Some(2));
 
         // Re-scan with nothing new: silent.
         out.clear();
         let wm2 = drain_turn_events(&ledger, "3", wm, &mut out);
         assert!(out.is_empty() && wm2 == Some(2), "no double-report");
+
+        // The harness's own turn, a `turn` fallback's `settled` included.
+        push_by(3, true, "settled", TurnBy::Harness);
+        out.clear();
+        let _ = drain_turn_events(&ledger, "3", wm2, &mut out);
+        assert_eq!(
+            out,
+            "EVENT 3 turn 3 submitted=1 status=settled dur_ms=7 by=harness\n"
+        );
     }
 
     /// `every-frame` mode re-emits the `cells` frame even when `content_seq` is
@@ -5803,7 +6121,7 @@ mod tests {
                     .timeline
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .record("meta-change", HEARTBEAT.to_string());
+                    .record_raw_meta_change(HEARTBEAT.to_string());
             }
             line != format!("EVENT {} meta {HEARTBEAT}", self.local)
         }
@@ -5922,6 +6240,7 @@ mod tests {
         let mut cursors = PushCursors {
             roster: Some(roster_cursor(&store)),
             adopt_seq: 0,
+            reader: None,
         };
         let streams = TargetStreams {
             events: true,
@@ -6379,6 +6698,7 @@ mod tests {
             let cursors = PushCursors {
                 roster: Some(roster_cursor(&store)),
                 adopt_seq: 0,
+                reader: None,
             };
             let handle = crate::session_store::test_handle(Self::S);
             AnnounceWorld {
@@ -6917,3 +7237,7 @@ mod log_stream_tests {
         assert!(close < exited, "{out}");
     }
 }
+
+#[cfg(test)]
+#[path = "subscribe_wire_goldens_tests.rs"]
+mod wire_goldens;

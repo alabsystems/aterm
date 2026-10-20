@@ -116,6 +116,10 @@ pub(super) struct ColorState {
     /// Host style policy: fraction of fg retained by SGR 2, blended
     /// toward the cell bg in linear light. Config-level; survives `reset()`.
     pub(super) faint_opacity: f32,
+    /// Host style policy: the theme-pair contrast floor
+    /// (`color_resolve::theme_pair_floor`), `1.0` off. Config-level;
+    /// survives `reset()`.
+    pub(super) indexed_minimum_contrast: f32,
     /// Whether an OSC 4 / numeric OSC 21 palette set has been refused by the
     /// `allow_palette_reconfigure` gate in this session. Session-level, so RIS
     /// leaves it: the host hears about the FIRST refusal only.
@@ -148,6 +152,7 @@ impl ColorState {
             selection_foreground: None,
             bold_is_bright: true,
             faint_opacity: aterm_types::DIM_FACTOR,
+            indexed_minimum_contrast: 1.0,
             palette_set_refused: false,
             palette_refused_callback: None,
         }
@@ -271,6 +276,10 @@ pub(super) enum ShellIntegrationPhase {
 ///
 /// Bundles the shell state machine, command marks and output blocks.
 /// Accessed from OSC 133/633 handlers, shell_api.rs and blocks_api.rs.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent facts about who speaks (the shell's habit, its unmarked run, a re-key's stale phase, the host's foreground word, a carried cwd), not a state machine"
+)]
 pub(super) struct ShellIntegrationState {
     /// Shell integration state machine (OSC 133).
     pub(super) state: ShellState,
@@ -305,8 +314,8 @@ pub(super) struct ShellIntegrationState {
     /// ended it, but no clear takes a C already counted: so a reader that
     /// counts C's knows how many commands ran, wherever their blocks went.
     /// Preserved across `reset()` like `completed_seq`. Nonzero also says the
-    /// shell marks what it runs, which an OSC 7 hold relies on
-    /// (`TerminalHandler::reported_cwd_waits_for_prompt`).
+    /// shell marks what it runs, which the OSC 7 prompt rule relies on
+    /// (`TerminalHandler::shell_sits_at_prompt`).
     pub(super) started_seq: u64,
     /// Number of block command/output reads that found the block's rows
     /// already evicted from scrollback. A `Cell` so the `&self` accessors can
@@ -331,12 +340,60 @@ pub(super) struct ShellIntegrationState {
     /// The warm spare's marks (`633;P;AtermSpare=`, `AtermStart*=`), held for
     /// the host's one-shot takes. Kept across `reset()`, never checkpointed.
     pub(super) spare: super::shell::SpareMarks,
-    /// The latest OSC 7 that arrived while the authenticated shell sat at its
-    /// prompt (`TerminalHandler::reported_cwd_waits_for_prompt`): the shell's
-    /// next `A` applies it, as every integration reports its own cwd
-    /// immediately before that mark; its `B` or `C` drops it, as does its
-    /// signed `633;P;Cwd=`. Cleared by `reset()`, never checkpointed.
+    /// The latest OSC 7 that arrived while an authenticated shell that does
+    /// not sign its own reports sat at its prompt
+    /// (`TerminalHandler::shell_sits_at_prompt`; an integration from before
+    /// the signature, which an adopted PowerShell keeps until it restarts):
+    /// the shell's next `A` applies it, as every integration reports its own
+    /// cwd immediately before that mark; its `B` or `C` drops it, as do its
+    /// signed `633;P;Cwd=` and its signed `AtermCwd`. Cleared by `reset()`; carried
+    /// by a checkpoint (`ShellRepr::held_cwd`).
     pub(super) held_cwd: Option<super::shell::CwdReport>,
+    /// The shell signs its own cwd report (`633;P;AtermCwd=<uri>;id=<nonce>`
+    /// before its OSC 7, which every integration sends since 2026-10-19): one
+    /// verified. A report no one signed while it sits at its prompt is then
+    /// never its own, so it is dropped rather than held for its `A`. Kept across `reset()` (RIS does
+    /// not change the shell's script); carried (`ShellRepr::signs_cwd`).
+    pub(super) signs_cwd: bool,
+    /// The shell finished a command it never marked with `C`: a signed `D`
+    /// arrived at its prompt, which the A→B→C→D order refuses (PowerShell
+    /// after `Import-Module PSReadLine -Force`, which replaces aterm's readline
+    /// shim, its only `C`; measured on pwsh 7.6.7). Its phase
+    /// then says nothing of what runs, so no report waits for its prompt until
+    /// its next `C` clears this. Kept across `reset()`; carried
+    /// (`ShellRepr::unmarked_run`).
+    pub(super) unmarked_run: bool,
+    /// The phase is not the shell's last word: a mark put a key in use that
+    /// was not (a re-key the shell took, the first mark a successor whose
+    /// handoff lost the nonce verifies), so the marks it signed before were
+    /// dropped. Cleared by its next accepted `A`, and by `reset()`. Carried
+    /// (`ShellRepr::phase_stale`): the first accepted property can take the
+    /// nonce before that `A`, while the phase is still stale.
+    pub(super) phase_stale: bool,
+    /// The host's word that a program other than the shell holds the
+    /// terminal's foreground now (`Terminal::set_foreground_job`: a unix host
+    /// compares the foreground process group of the bytes it feeds with the
+    /// shell's). A report then is that program's, though the shell's marks
+    /// say it sits at its prompt (a zsh widget, a bash `bind -x` or a fish
+    /// binding runs one with no `C`). Kept across `reset()` (host knowledge);
+    /// never carried, as the host sets it before the bytes it feeds.
+    pub(super) foreground_job: bool,
+    /// The cwd a program's first report replaced at the shell's prompt
+    /// ([`Self::foreground_job`], [`Self::program_probe`]), as a report:
+    /// restored once the host says no such program runs, as the shell never
+    /// reports its cwd again after a program a key started. Dropped by a
+    /// signed report (the shell's newer word); kept across `reset()`; carried
+    /// (`ShellRepr::cwd_before_job`).
+    pub(super) cwd_before_job: Option<super::shell::CwdReport>,
+    /// The host's word on demand (`Terminal::set_program_probe`): whether a
+    /// program the shell started at or after a wall-clock instant (unix epoch
+    /// ms) runs now where [`Self::foreground_job`] cannot see it (in the
+    /// shell's own process group, where PowerShell keeps its programs, or
+    /// under ConPTY, which has no foreground group). Asked only for a report
+    /// no one signed at the shell's prompt that no foreground word claims, and
+    /// while such a report shows. Host-side: never carried, kept across
+    /// `reset()`.
+    pub(super) program_probe: Option<Box<dyn Fn(u64) -> bool + Send>>,
     /// The host the report that set the stored cwd named
     /// (`Terminal::reported_cwd_host`): an OSC 7 `file://<host>/…`'s host,
     /// verbatim; `None` for an empty host or `localhost`, for a cwd the
@@ -375,6 +432,12 @@ impl ShellIntegrationState {
             integration_rev: None,
             spare: super::shell::SpareMarks::default(),
             held_cwd: None,
+            signs_cwd: false,
+            unmarked_run: false,
+            phase_stale: false,
+            foreground_job: false,
+            cwd_before_job: None,
+            program_probe: None,
             cwd_host: None,
             cwd_reports: 0,
             cwd_carried: false,
@@ -390,11 +453,38 @@ impl ShellIntegrationState {
         self.output_blocks.clear();
         self.current_block = None;
         self.held_cwd = None;
+        self.phase_stale = false;
         // next_block_id, completed_seq and started_seq are not reset: block
         // ids stay unique and the counters monotonic across resets. Nor is
         // last_finished: the command it records did finish. Nor is cwd_host:
         // a RIS keeps the cwd it qualifies, and with it cwd_reports and
-        // cwd_carried, which say where that cwd came from.
+        // cwd_carried, which say where that cwd came from. Nor are the
+        // shell's habits (signs_cwd, unmarked_run), the host's foreground_job
+        // or the cwd a job's report replaced (cwd_before_job): a RIS changes
+        // neither the shell's script nor who holds the terminal.
+    }
+
+    /// When the shell's prompt began by its own marks: its `A` (the current
+    /// mark's `prompt_time_ms`), or, from its `D` until its next `A`, that `D`.
+    /// `None` with no mark or no clock reading.
+    pub(super) fn prompt_since_ms(&self) -> Option<u64> {
+        match &self.current_mark {
+            Some(mark) => mark.prompt_time_ms,
+            None => self
+                .command_marks
+                .back()
+                .and_then(|m| m.command_end_time_ms),
+        }
+    }
+
+    /// Whether the host says a program the shell started since its prompt
+    /// began runs now ([`Self::program_probe`]); `false` with no probe or no
+    /// prompt time.
+    pub(super) fn program_runs_since_prompt(&self) -> bool {
+        match (&self.program_probe, self.prompt_since_ms()) {
+            (Some(probe), Some(since)) => probe(since),
+            _ => false,
+        }
     }
 }
 

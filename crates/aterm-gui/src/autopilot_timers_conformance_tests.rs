@@ -312,6 +312,7 @@ impl TimerDrive {
             identity: None,
             agent: None,
             supervised: None,
+            lost: None,
             held: false,
             holds: Vec::new(),
             theme: None,
@@ -575,7 +576,12 @@ fn the_real_timer_conforms_to_its_model() {
     // 1. A fire that trusts its index: Land written over the stored Off.
     let before = d.state();
     let ctx = d.ctx().unwrap();
-    crate::session_timeline::apply_autopilot(&ctx, Some("land".into()), None);
+    crate::session_timeline::apply_autopilot(
+        &ctx,
+        Some("land".into()),
+        None,
+        aterm_slog::Actor::Ctl,
+    );
     d.app.autopilot_timers.forget(d.session);
     let mut after = d.state();
     after.insert("fires", 1);

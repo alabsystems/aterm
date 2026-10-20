@@ -336,7 +336,13 @@ fn bottom_floated_find_bar_scrubs_upward_neighbour_decoration_spill() {
         rows - band_rows..rows,
         "panel floated to the bottom"
     );
-    assert_eq!(hit.row, rows - band_rows + 1, "field row inside that band");
+    // Under the pad row where the panel has one (not on Windows).
+    let field_offset = usize::from(band_rows >= 3);
+    assert_eq!(
+        hit.row,
+        rows - band_rows + field_offset,
+        "field row inside that band"
+    );
     assert!(ws.input_scratch.word_decorations.is_empty());
 }
 
@@ -1058,6 +1064,67 @@ fn find_toggles_persist_across_sessions() {
     assert!(s.is_regex, "regex toggle persisted across sessions");
 }
 
+/// THE TOOLBAR'S BUTTONS DO WHAT THEIR KEYS DO (Windows,
+/// `find_bar::FIND_TOOLBAR`): a click on `↓`, hit-tested against the geometry
+/// `splice_find_bar` recorded, steps to the next match as F3 does, `↑` back as
+/// Shift+F3 does, and `✕` closes the bar as Esc does. NEGATIVE CONTROL: off
+/// Windows no button is recorded, and a click on the well moves no match.
+#[test]
+fn clicking_the_toolbar_buttons_steps_and_closes() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let term = app.pool.get(0).expect("session 0").term.clone();
+    term_lock(&term).process(b"one hit\r\ntwo hit\r\nthree hit\r\n");
+    app.search_enter();
+    seed_query(&mut app, wid, "hit");
+    app.search_recompute();
+    let current = |app: &App| app.windows[&wid].search.as_ref().map(|s| s.current);
+    let paint = |app: &mut App| {
+        fill_scratch(app, wid);
+        app.splice_find_bar(wid);
+        app.windows[&wid]
+            .find_bar_hit
+            .clone()
+            .expect("splice recorded the panel geometry")
+    };
+    let hit = paint(&mut app);
+    let row = u16::try_from(hit.row).unwrap();
+    let col = |span: &std::ops::Range<usize>| u16::try_from(span.start + 1).unwrap();
+    assert_eq!(
+        hit.next_cols.is_some(),
+        cfg!(windows),
+        "buttons on Windows only"
+    );
+    let before = current(&app);
+    let well = u16::try_from(hit.field_cols.start).unwrap();
+    assert!(app.find_bar_click(wid, row, well));
+    assert_eq!(current(&app), before, "CONTROL: the well moves no match");
+    let (Some(prev), Some(next), Some(close)) = (hit.prev_cols, hit.next_cols, hit.close_cols)
+    else {
+        return;
+    };
+    // The `✕` is the band's drawn cross, on the field row's raster.
+    let raster = app.windows[&wid]
+        .input_scratch
+        .chrome_raster(hit.row)
+        .expect("the field row carries a raster for the close icon");
+    assert_eq!(
+        raster.icon_at(close.start + 1),
+        Some(aterm_render::BandIcon::Error)
+    );
+    assert_eq!(raster.icons.len(), 1, "the arrows keep the face's glyphs");
+    assert!(app.find_bar_click(wid, row, col(&next)), "↓ consumed");
+    let stepped = current(&app);
+    assert_ne!(stepped, before, "↓ stepped to the next match");
+    let hit = paint(&mut app);
+    assert_eq!(hit.prev_cols, Some(prev.clone()), "the buttons hold still");
+    assert!(app.find_bar_click(wid, row, col(&prev)), "↑ consumed");
+    assert_eq!(current(&app), before, "↑ stepped back");
+    let _ = paint(&mut app);
+    assert!(app.find_bar_click(wid, row, col(&close)), "✕ consumed");
+    assert!(app.windows[&wid].search.is_none(), "✕ closed the bar");
+}
+
 /// A click on the `Aa` / `.*` indicators, hit-tested against the geometry
 /// `splice_find_bar` recorded, flips match-case / regex (and the sticky
 /// default); a click off the indicators changes nothing.
@@ -1144,7 +1211,11 @@ fn clicking_indicators_toggles_via_recorded_geometry() {
         4,
         "a click right of the caret lands on the clicked character"
     );
-    let past = u16::try_from(field.start + 40).unwrap();
+    let past = u16::try_from(field.end - 1).unwrap();
+    assert!(
+        field.len() > "target".len() + 1,
+        "the well has room past the text"
+    );
     assert!(app.find_bar_click(wid, row, past), "well click consumed");
     assert_eq!(
         app.windows[&wid].search.as_ref().unwrap().cursor,
@@ -1650,7 +1721,7 @@ fn repeat_recalls_last_accepted_query() {
 /// match-case and its sticky default.
 #[test]
 fn find_bar_toggle_fires_through_on_mouse_input() {
-    use winit::event::{ElementState, MouseButton};
+    use aterm_window::event::{ElementState, MouseButton};
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let term = app.pool.get(0).expect("session 0").term.clone();
@@ -1717,7 +1788,7 @@ fn find_bar_toggle_fires_through_on_mouse_input() {
 /// only presses inside the bar's cell band.
 #[test]
 fn find_bar_pixel_gate_rejects_pad_clamp_click() {
-    use winit::event::{ElementState, MouseButton};
+    use aterm_window::event::{ElementState, MouseButton};
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let term = app.pool.get(0).expect("session 0").term.clone();
@@ -1908,43 +1979,400 @@ fn find_bar_pixel_hit_boundaries_and_right_edge() {
     );
 }
 
-/// In a split the splice cannot place match tints in the focused pane, so
-/// highlight-all is suppressed while the bar row is still spliced.
+/// FIND WORKS IN A SPLIT, on a real composed frame: the panel covers the FOCUSED
+/// pane's top rows only — the sibling beside it keeps its own cells on those rows
+/// and its clicks — and highlight-all tints the focused pane's hits at the pane's
+/// origin in the composite, never the sibling's. Before this the panel spanned
+/// every pane, hid both pane's top rows, and highlight-all was switched off.
 #[test]
-fn highlight_all_suppressed_in_split() {
+fn find_in_a_split_rides_the_focused_pane_with_highlight_all() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    let term = app.pool.get(0).expect("session 0").term.clone();
-    term_lock(&term).process(b"hit one\r\nhit two\r\n"); // two live matches
+    let session = app.split_active_stub_tab(wid);
+    let plan = app.active_visible_leaf_plan(wid).expect("visible plan");
+    let leaf = plan
+        .leaves
+        .iter()
+        .find(|leaf| leaf.focused)
+        .expect("a focused leaf");
+    let at = |v: f32| v.round() as usize;
+    let (row0, col0) = (at(leaf.rect.origin.y), at(leaf.rect.origin.x));
+    let width = at(leaf.rect.size.width);
+    assert!(
+        col0 > 0,
+        "the fixture is side by side: the focused pane is the right one"
+    );
+    // The sibling (session 0, on the left) carries the needle too, on the rows the
+    // panel will cover; the focused pane carries two hits clear of the panel.
+    let sibling = app.pool.get(0).expect("session 0").term.clone();
+    term_lock(&sibling).process(
+        "LEFT hit\r\n"
+            .repeat(crate::find_bar::FIND_BAR_ROWS)
+            .as_bytes(),
+    );
+    let focused = app.pool.get(session).expect("focused pane").term.clone();
+    term_lock(&focused).process(b"\r\n\r\n\r\n\r\naa hit one\r\nbb hit two\r\n");
     app.search_enter();
     seed_query(&mut app, wid, "hit");
     app.search_recompute();
-
-    let split = app
-        .active_tree_mut(wid)
-        .expect("active tree")
-        .split_focused(crate::pane::SplitDir::Vertical, 1);
-    assert!(split, "the tab split into two panes");
-    assert!(
-        app.active_tree(wid).is_some_and(|t| t.len() > 1),
-        "the window is now multi-pane"
-    );
-
-    fill_scratch(&mut app, wid);
+    let (rows, cols) = {
+        let ws = &app.windows[&wid];
+        (usize::from(ws.rows), usize::from(ws.cols))
+    };
+    app.redraw_compose(
+        wid,
+        rows,
+        cols,
+        false,
+        false,
+        None,
+        0,
+        std::time::Instant::now(),
+    )
+    .expect("a composed split frame");
     app.splice_find_bar(wid);
-    let hi = highlight_bg();
-    let field = field_row_text(&app, wid);
-    assert!(
-        field.contains("Find: ") && field.contains("hit"),
-        "the find panel is still spliced in a split: {field:?}"
+
+    let hit = app.windows[&wid]
+        .find_bar_hit
+        .clone()
+        .expect("panel geometry");
+    assert_eq!(
+        hit.cols,
+        col0..col0 + width,
+        "the panel covers the focused pane's columns"
     );
-    let cells = &app.windows.get(&wid).unwrap().input_scratch.cells;
-    for (r, row) in cells.iter().enumerate() {
+    assert_eq!(
+        hit.band,
+        row0..row0 + crate::find_bar::FIND_BAR_ROWS,
+        "the panel rides the focused pane's top rows"
+    );
+    let cells = &app.windows[&wid].input_scratch.cells;
+    let text = |row: usize, span: std::ops::Range<usize>| -> String {
+        cells[row][span].iter().map(|c| c.ch).collect()
+    };
+    let field = text(hit.row, col0..col0 + width);
+    assert!(
+        field.contains("Find: hit"),
+        "the field sits in the pane: {field:?}"
+    );
+    for row in hit.band.clone() {
+        let left = text(row, 0..col0);
         assert!(
-            row.iter().all(|c| c.bg != hi),
-            "no highlight-all tint anywhere in a split (row {r})"
+            left.starts_with("LEFT hit"),
+            "the sibling keeps its own cells beside the panel (row {row}): {left:?}"
         );
     }
+    // Highlight-all in the focused pane, at the pane's origin: both hits.
+    let hi = highlight_bg();
+    for pane_row in [4, 5] {
+        let row = row0 + pane_row;
+        let tinted: String = cells[row][col0..col0 + width]
+            .iter()
+            .filter(|c| c.bg == hi)
+            .map(|c| c.ch)
+            .collect();
+        assert_eq!(
+            tinted, "hit",
+            "pane row {pane_row}: the hit is tinted where it is painted"
+        );
+    }
+    // The sibling's own "hit"s are not the focused pane's matches: never tinted.
+    for (row, line) in cells.iter().enumerate() {
+        assert!(
+            line[..col0].iter().all(|c| c.bg != hi),
+            "the sibling is not tinted (row {row})"
+        );
+    }
+    // Every rail the panel lays rides a frame row the sibling also draws on, and
+    // the renderer lifts a railed row's glyphs whole: so none lifts, at the
+    // renderer's own room, or the sibling's text beside the field sat high.
+    let room = app.backend.band_room();
+    for raster in &app.windows[&wid].input_scratch.chrome_rasters {
+        assert_eq!(
+            aterm_render::chrome_fit(raster, room).0,
+            0,
+            "the {} px rail on frame row {} lifts its row at room {room:?}",
+            raster.rail_h,
+            raster.row
+        );
+    }
+    // A press on the sibling beside the panel is the sibling's, not the panel's.
+    let row = u16::try_from(hit.row).expect("row");
+    assert!(
+        !app.find_bar_click(wid, row, 1),
+        "a click on the sibling is not consumed"
+    );
+    assert!(
+        app.find_bar_click(wid, row, u16::try_from(col0 + 1).expect("col")),
+        "a click on the panel is"
+    );
+}
+
+/// THE TOOLBAR ENDS AT ITS PANE'S MARGIN (Windows, `find_bar::FIND_TOOLBAR`):
+/// in a full-width pane and in the focused pane of a split, the field row's
+/// last mark is the right group's (the `✕`, drawn as the band's cross, or the
+/// count where a narrow pane dropped the buttons), the band's two-cell margin
+/// from the pane's right edge in window columns, as the mouse reads them.
+/// NEGATIVE CONTROL: the 2026-10-18 build packed the group against the well,
+/// its `✕` short of the end; off Windows no button is recorded.
+#[test]
+fn the_toolbar_ends_at_its_panes_margin_full_and_split() {
+    let wid = WindowId(0);
+    let margin = 2;
+    // The field row's last inked column in `span`, and the recorded `✕`.
+    let last_mark = |app: &App, span: std::ops::Range<usize>| {
+        let ws = &app.windows[&wid];
+        let hit = ws.find_bar_hit.clone().expect("geometry");
+        let strip = ws.input_scratch.cells.len() - usize::from(ws.rows);
+        let row = &ws.input_scratch.cells[strip + hit.row];
+        let last = span
+            .rev()
+            .find(|&col| row.get(col).is_some_and(|c| c.ch != ' '))
+            .expect("the field row is painted");
+        (last, hit.close_cols)
+    };
+    let open = |app: &mut App, session: u64| {
+        let term = app.pool.get(session).expect("session").term.clone();
+        term_lock(&term).process(b"one hit\r\ntwo hit\r\n");
+        app.search_enter();
+        seed_query(app, wid, "hit");
+        app.search_recompute();
+    };
+
+    // The farm's 111-column window: wide enough that the old packed cluster
+    // stopped short of the margin, and halves into two 55-column panes.
+    let wide = |app: &mut App| app.windows.get_mut(&wid).expect("window").cols = 111;
+    let mut app = App::headless_for_test();
+    wide(&mut app);
+    open(&mut app, 0);
+    let (_, cols) = fill_scratch(&mut app, wid);
+    app.splice_find_bar(wid);
+    let (last, close) = last_mark(&app, 0..cols);
+    if !crate::find_bar::FIND_TOOLBAR {
+        assert!(close.is_none(), "CONTROL: no buttons off Windows");
+        return;
+    }
+    let close = close.expect("a full-width pane draws the buttons");
+    assert_eq!(close.end, cols - margin, "the `✕` ends the full band");
+    assert_eq!(last, close.start + 1, "and is its last mark");
+
+    let mut app = App::headless_for_test();
+    wide(&mut app);
+    let session = app.split_active_stub_tab(wid);
+    open(&mut app, session);
+    let plan = app.active_visible_leaf_plan(wid).expect("visible plan");
+    let leaf = plan
+        .leaves
+        .iter()
+        .find(|l| l.focused)
+        .expect("focused leaf");
+    let col0 = leaf.rect.origin.x.round() as usize;
+    let end = col0 + leaf.rect.size.width.round() as usize;
+    let (rows, cols) = {
+        let ws = &app.windows[&wid];
+        (usize::from(ws.rows), usize::from(ws.cols))
+    };
+    app.redraw_compose(
+        wid,
+        rows,
+        cols,
+        false,
+        false,
+        None,
+        0,
+        std::time::Instant::now(),
+    )
+    .expect("a composed split frame");
+    app.splice_find_bar(wid);
+    let (last, close) = last_mark(&app, col0..end);
+    assert!(
+        end - col0 < 55 || close.is_some(),
+        "a {}-column pane keeps its buttons",
+        end - col0
+    );
+    match close {
+        Some(close) => {
+            assert_eq!(close.end, end - margin, "the `✕` ends the pane's band");
+            assert_eq!(last, close.start + 1);
+        }
+        None => assert_eq!(last + 1, end - margin, "the count ends the pane's band"),
+    }
+}
+
+/// A pane-scoped panel's rails are as thick as the face's room seats without a
+/// lift: Iosevka at a 23 px cell has two clear pixels below its words, so the
+/// Windows well's 2 px focus line drew 1 px high and lifted the split sibling's
+/// row with it (measured 1 px on `final-dark-split-find.png`); it is 1 px there.
+/// No room below the words: no rail at all.
+#[test]
+fn a_pane_scoped_rail_never_lifts_its_row() {
+    use super::unlifted_rail_h;
+    assert_eq!(unlifted_rail_h(2, (2, 2)), Some(1), "the well line thins");
+    assert_eq!(unlifted_rail_h(1, (2, 2)), Some(1), "the 1 px seam fits");
+    assert_eq!(
+        unlifted_rail_h(2, (4, 3)),
+        Some(2),
+        "room for the whole line"
+    );
+    assert_eq!(unlifted_rail_h(1, (2, 1)), None, "even 1 px would lift");
+    // Negative control: what the whole-row panel lays at (2, 2) lifts its row.
+    let well = super::find_rail(0, 0..1, [0; 3], 2);
+    assert_eq!(aterm_render::chrome_fit(&well, (2, 2)).0, 1);
+}
+
+/// THE PANEL'S RULE RUNS ON ITS LAST PIXEL ROW, NOT THROUGH ITS WORDS. At the top
+/// (content below), where the cell and face can keep the words a clear row off a
+/// rail (`band::seam_can_rail`, the message band's own test), the rule is a 1 px
+/// rail raster on the band's last row, laid under the panel's cells only, and no
+/// band cell carries an underline (which ran through the hints' descenders five
+/// pixels above the edge); elsewhere it stays the face's underline. Never both.
+#[test]
+fn the_top_panel_closes_on_a_rail_under_its_last_row() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let term = app.pool.get(0).expect("session 0").term.clone();
+    term_lock(&term).process(b"\r\n\r\n\r\n\r\nzz hit\r\n");
+    app.search_enter();
+    seed_query(&mut app, wid, "hit");
+    app.search_recompute();
+    let (_, cols) = fill_scratch(&mut app, wid);
+    app.splice_find_bar(wid);
+    let (cell_w, cell_h) = app.win_cell_size(wid);
+    let pad = app.win_pad(wid);
+    let rails = aterm_render::band::seam_can_rail(
+        cell_h,
+        aterm_render::band::native_host_room(|| app.backend.band_room()),
+    );
+    // The Windows default face (Iosevka Term Semibold 17 px on its 23 px cell) has
+    // the room (`band::seam_can_rail`), so the rail branch is the one that ships there.
+    if cfg!(windows) {
+        assert!(rails, "the Windows default cell takes the rail");
+    }
+    let hit = app.windows[&wid]
+        .find_bar_hit
+        .clone()
+        .expect("panel geometry");
+    assert_eq!(hit.band.start, 0, "the panel rides the top");
+    let last = hit.band.end - 1;
+    let input = &app.windows[&wid].input_scratch;
+    let underlined = hit
+        .band
+        .clone()
+        .flat_map(|row| input.cells[row].iter())
+        .any(|c| c.underline != aterm_core::terminal::UnderlineStyle::None);
+    let raster = input.chrome_raster(last);
+    if rails {
+        let raster = raster.expect("a rail on the band's last row");
+        assert_eq!((raster.rail_h, raster.clear_rail), (1, true));
+        assert!(raster.ground.is_empty(), "the cells keep their own ground");
+        assert_eq!(
+            raster.rail.len(),
+            pad + cols * cell_w,
+            "under the cells, not the gutter"
+        );
+        assert!(
+            raster.rail[..pad]
+                .iter()
+                .all(|&p| p == aterm_render::ChromeRaster::KEEP)
+        );
+        let band = crate::chrome_band::band_colors(
+            app.chrome_palette(crate::app_render::ChromeSurface::OverGrid(wid)),
+        );
+        let ink = aterm_render::rgb_to_u32(band.seam);
+        assert!(
+            raster.rail[pad..].iter().all(|&p| p == ink),
+            "one tone, edge to edge"
+        );
+        assert!(
+            !underlined,
+            "no underline crosses the hints: the rail is the rule"
+        );
+        // Windows closes the well on its accent focus line: a 2 px rail under the
+        // well's cells only, on the field row.
+        let well = input.chrome_raster(hit.row);
+        if crate::find_bar::WELL_ACCENT_LINE {
+            let well = well.expect("the well's focus line");
+            assert_eq!((well.rail_h, well.clear_rail), (2, true));
+            let (x0, x1) = (
+                pad + hit.field_cols.start * cell_w,
+                pad + hit.field_cols.end * cell_w,
+            );
+            assert_eq!(well.rail.len(), x1, "it ends at the well's right edge");
+            assert!(
+                well.rail[..x0]
+                    .iter()
+                    .all(|&p| p == aterm_render::ChromeRaster::KEEP)
+            );
+            let accent = aterm_render::rgb_to_u32(band.accent);
+            assert!(
+                well.rail[x0..].iter().all(|&p| p == accent),
+                "the band's accent"
+            );
+        } else {
+            assert!(well.is_none(), "no focus line off Windows");
+        }
+    } else {
+        assert!(
+            raster.is_none(),
+            "a short cell keeps the underline, without a rail"
+        );
+        assert!(underlined, "the underline is the rule");
+    }
+}
+
+/// THE CURRENT MATCH IS PAINTED IN ITS OWN FILL while the bar is open: the live
+/// selection (which `search_apply_current_in` set to it) takes
+/// `find_bar::current_match_fill`, a step in luminance from the other matches'
+/// tint, with its text in `find_bar::current_match_ink` — the background the
+/// fill stands off, not the renderer's automatic floor, which settled the
+/// default theme's text on a mid-grey `#535353` over the green (the 2026-10-18
+/// judge). NEGATIVE CONTROL: with no hit the selection keeps the frame's own
+/// colours.
+#[test]
+fn the_current_match_is_painted_in_its_own_fill() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let term = app.pool.get(0).expect("session 0").term.clone();
+    term_lock(&term).process(b"\r\n\r\n\r\n\r\nxx hit\r\nyy hit\r\n");
+    app.search_enter();
+    seed_query(&mut app, wid, "hit");
+    app.search_recompute();
+    fill_scratch(&mut app, wid);
+    let before = app.windows[&wid].input_scratch.selection_bg;
+    app.splice_find_bar(wid);
+    let t = aterm_render::Theme::default();
+    let tokens = crate::chrome_band::ChromePalette::from(t).tokens();
+    let fill = crate::find_bar::current_match_fill(&tokens, highlight_bg());
+    let input = &app.windows[&wid].input_scratch;
+    assert_eq!(input.selection_bg, aterm_render::rgb_to_u32(fill));
+    let ink = crate::find_bar::current_match_ink(&tokens, fill);
+    assert_eq!(input.selection_fg, aterm_render::rgb_to_u32(ink));
+    assert_eq!(
+        ink, tokens.bg,
+        "the default theme's background clears AAA as is"
+    );
+    assert!(
+        aterm_messages::ink::contrast(ink, fill) >= 10.0,
+        "the text reads at full strength on the fill, not a mid-grey floor"
+    );
+    assert_ne!(
+        input.selection_bg, before,
+        "the fill replaced the selection colour"
+    );
+
+    let mut app = App::headless_for_test();
+    let term = app.pool.get(0).expect("session 0").term.clone();
+    term_lock(&term).process(b"nothing to see\r\n");
+    app.search_enter();
+    seed_query(&mut app, wid, "absent");
+    app.search_recompute();
+    fill_scratch(&mut app, wid);
+    let before = app.windows[&wid].input_scratch.selection_bg;
+    app.splice_find_bar(wid);
+    assert_eq!(
+        app.windows[&wid].input_scratch.selection_bg, before,
+        "CONTROL: no current match, no repaint of the selection"
+    );
 }
 
 /// AN AUTHORED SEARCH MATCH AND BORDER REACH THE FIND SPLICE: with
@@ -2007,4 +2435,213 @@ fn authored_search_match_and_border_reach_the_find_splice() {
     let (tint, seam, band) = paint("");
     assert_eq!(tint, highlight_bg(), "CONTROL: the derived tint");
     assert_eq!(seam, band.label, "CONTROL: the label seam");
+}
+
+/// A find over `lines` with `query`, painted, with this thread's UI faces
+/// installed (`faces`) or cleared: the Fluent face's precondition.
+fn painted_with_faces(faces: bool, lines: &[u8], query: &str) -> App {
+    let mut app = App::headless_for_test();
+    if faces {
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    } else {
+        crate::tray_raster::clear_ui_fonts_for_test();
+    }
+    let wid = WindowId(0);
+    let term = app.pool.get(0).expect("session 0").term.clone();
+    term_lock(&term).process(lines);
+    app.search_enter();
+    seed_query(&mut app, wid, query);
+    app.search_recompute();
+    fill_scratch(&mut app, wid);
+    app.splice_find_bar(wid);
+    app
+}
+
+/// THE WINDOWS BAR LAYS ITS FLUENT FACE OVER THE BAND (`find_bar::fluent_bar`):
+/// with a UI face installed, every band row carries one raster across the
+/// panel's columns, drawn over the cells' glyphs, while the cells keep the
+/// panel's words for the text grid; the raster draws the seam, the focus line
+/// and the `✕` itself, so no chrome raster and no cell rule is left on the band
+/// to draw over it at the cells' places. NEGATIVE CONTROL: without a UI face the
+/// cells stand with their rail and drawn cross, and off Windows no raster is
+/// ever laid.
+#[test]
+fn the_windows_bar_lays_its_fluent_face_over_the_band() {
+    let wid = WindowId(0);
+    let lines = b"\r\n\r\n\r\n\r\none hit\r\ntwo hit\r\n";
+    let band_rows = |app: &App| {
+        let ws = &app.windows[&wid];
+        let hit = ws.find_bar_hit.clone().expect("geometry");
+        let strip = ws.input_scratch.cells.len() - usize::from(ws.rows);
+        (hit.clone(), strip + hit.band.start..strip + hit.band.end)
+    };
+    let app = painted_with_faces(true, lines, "hit");
+    let (hit, rows) = band_rows(&app);
+    let input = &app.windows[&wid].input_scratch;
+    let laid = |input: &aterm_render::RenderInput, row: usize| {
+        input
+            .images
+            .get(row)
+            .is_some_and(|images| !images.is_empty())
+    };
+    if !crate::find_bar::FIND_TOOLBAR || !crate::tray_raster::strip_band_ui_ready() {
+        assert!(
+            rows.clone().all(|row| !laid(input, row)),
+            "CONTROL: no face off Windows"
+        );
+        return;
+    }
+    for row in rows.clone() {
+        let images = &input.images[row];
+        assert_eq!(
+            images.len(),
+            hit.cols.len(),
+            "row {row}: a raster cell a column"
+        );
+        let first = &images[0].1.image;
+        for (i, (col, cell)) in images.iter().enumerate() {
+            assert_eq!(*col, hit.cols.start + i);
+            assert_eq!(usize::from(cell.cell_col), i);
+            assert!(
+                std::sync::Arc::ptr_eq(&cell.image, first),
+                "one raster a row"
+            );
+            assert_eq!(cell.image.z_index, 0, "over the cells' glyphs");
+        }
+        assert!(
+            input.cells[row].iter().all(|cell| {
+                cell.underline == aterm_core::terminal::UnderlineStyle::None && !cell.overline
+            }),
+            "row {row}: no cell rule draws over the raster"
+        );
+        assert!(
+            input.chrome_raster(row).is_none(),
+            "row {row}: no rail, focus line or cross raster"
+        );
+    }
+    let field = field_row_text(&app, wid);
+    assert!(
+        field.contains("Find: hit") && field.contains("1/2"),
+        "the cells keep the words: {field:?}"
+    );
+
+    let cold = painted_with_faces(false, lines, "hit");
+    let (hit, rows) = band_rows(&cold);
+    let input = &cold.windows[&wid].input_scratch;
+    assert!(
+        rows.clone().all(|row| !laid(input, row)),
+        "CONTROL: no UI face, no raster"
+    );
+    let close = hit.close_cols.expect("the buttons");
+    let raster = input
+        .chrome_raster(rows.start + (hit.row - hit.band.start))
+        .expect("CONTROL: the cell bar draws its cross on a raster");
+    assert_eq!(
+        raster.icon_at(close.start + 1),
+        Some(aterm_render::BandIcon::Error)
+    );
+}
+
+/// A PRESS IN THE FLUENT QUERY BOX LANDS ON THE CHARACTER UNDER THE POINTER
+/// (`App::find_bar_click_at`, `find_bar::well_click`), through the full mouse
+/// handler: the box sets the query in the UI face, so the press's pixel, not
+/// its cell, picks the caret, and a press on the prompt's cells the box took is
+/// the box's. NEGATIVE CONTROL: the cell mapping puts the same press several
+/// characters short.
+#[test]
+fn a_press_in_the_fluent_box_lands_on_the_character_under_the_pointer() {
+    use aterm_window::event::{ElementState, MouseButton};
+    let wid = WindowId(0);
+    let query = "needle in the hay";
+    let mut app = painted_with_faces(true, b"a needle in the haystack\r\n", query);
+    if !crate::find_bar::FIND_TOOLBAR || !crate::tray_raster::strip_band_ui_ready() {
+        return;
+    }
+    let hit = app.windows[&wid].find_bar_hit.clone().expect("geometry");
+    let (cell_w, cell_h) = app.win_cell_size(wid);
+    let geom = crate::find_bar::FluentGeom {
+        cell_w,
+        cell_h,
+        scale: app.windows[&wid].scale as f32,
+    };
+    let col0 = hit.cols.start;
+    let field = hit.field_cols.start - col0..hit.field_cols.end - col0;
+    let well = crate::find_bar::well_box(&field, geom);
+    let (ox, oy) = app.frame_origin(wid);
+    let pad = app.win_pad(wid);
+    let strip = app.windows[&wid].input_scratch.cells.len() - usize::from(app.windows[&wid].rows);
+    let y = (oy as usize + app.win_pad_top(wid) + app.win_head(wid) + (strip + hit.row) * cell_h)
+        as f64
+        + cell_h as f64 / 2.0;
+    let window_x = |panel_x: f32| (ox as usize + pad + col0 * cell_w) as f64 + f64::from(panel_x);
+    let press = |app: &mut App, panel_x: f32| {
+        app.windows.get_mut(&wid).expect("window").last_cursor_px = (window_x(panel_x), y);
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        app.windows[&wid].search.as_ref().expect("searching").cursor
+    };
+    // Just right of the boundary after "needle in": that boundary.
+    let body = crate::type_scale::TypeStep::Body
+        .px(crate::tab_bar::chrome_label_base_px(
+            cell_h as f32,
+            geom.scale,
+        ))
+        .get();
+    let width =
+        |s: &str| crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, s, body);
+    let x = well.text_x0 + width("needle in") + 1.0;
+    assert_eq!(
+        press(&mut app, x),
+        "needle in".len(),
+        "the boundary under it"
+    );
+    let by_cell = hit.field_scroll + (x as usize / cell_w).saturating_sub(field.start);
+    assert_ne!(
+        by_cell,
+        "needle in".len(),
+        "CONTROL: by cell it is elsewhere"
+    );
+    // The box's inset over the prompt's cells is the box: the head.
+    assert!(well.x0 < geom.cell_w as f32 * field.start as f32);
+    assert_eq!(press(&mut app, well.x0 + 1.0), 0, "the box's own inset");
+    let s = app.windows[&wid].search.as_ref().expect("searching");
+    assert_eq!(s.query, query, "a press never edits the text");
+}
+
+/// THE FLUENT BOX OWNS THE COMPOSITION: with an IME composition in the find
+/// field, no band cell carries the composition's underline (the raster draws it
+/// under its own characters; a cell rule would draw over the raster at the
+/// cells' places), and the candidate window still anchors on the field.
+/// NEGATIVE CONTROL: the cell bar underlines the composed cell.
+#[test]
+fn the_fluent_box_owns_the_composition_underline() {
+    let wid = WindowId(0);
+    let compose = |faces: bool| {
+        let mut app = painted_with_faces(faces, b"$ ", "ab");
+        app.on_ime_preedit(wid, "cd".to_string(), Some((0, 2)));
+        fill_scratch(&mut app, wid);
+        app.splice_find_bar(wid);
+        app
+    };
+    let underlined = |app: &App| {
+        let ws = &app.windows[&wid];
+        let hit = ws.find_bar_hit.as_ref().expect("geometry");
+        let strip = ws.input_scratch.cells.len() - usize::from(ws.rows);
+        ws.input_scratch.cells[strip + hit.row]
+            .iter()
+            .any(|cell| cell.underline != aterm_core::terminal::UnderlineStyle::None)
+    };
+    let cold = compose(false);
+    assert!(
+        underlined(&cold),
+        "CONTROL: the cell bar underlines the cell"
+    );
+    let app = compose(true);
+    assert!(
+        app.windows[&wid].last_ime_rect.is_some(),
+        "anchored on the field"
+    );
+    if crate::find_bar::FIND_TOOLBAR && crate::tray_raster::strip_band_ui_ready() {
+        assert!(!underlined(&app), "the raster draws it, no cell does");
+    }
 }

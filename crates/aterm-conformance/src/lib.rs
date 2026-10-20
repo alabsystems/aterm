@@ -11,6 +11,11 @@
 #[cfg(unix)]
 pub mod measure;
 
+// Exercise the benches' runner with deterministic rows, without launching an instance.
+#[cfg(all(test, unix))]
+#[path = "../benches/support/mod.rs"]
+pub mod measuring_runner;
+
 use aterm_core::terminal::Terminal;
 
 /// A terminal under test you feed bytes into and read the screen out of.

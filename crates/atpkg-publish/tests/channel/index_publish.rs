@@ -4,8 +4,9 @@
 //! The index PUBLISH over a fake channel: the number is the head's + 1, the baseline must
 //! be published, the packs are made public BEFORE the index, and the upload is a
 //! compare-and-swap that never clobbers another publisher's `atpkg-index-N` (create /
-//! converge / draft / foreign / half-created / race / unreadable state / unserved), and a
-//! moved pin never silently drops an Apple target.
+//! converge / draft / foreign / half-created / race / unreadable state / unserved), a
+//! moved pin never silently drops an Apple target, and a head whose own roster pair has
+//! lapsed is refused.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -685,5 +686,70 @@ fn a_lapsed_head_is_re_signed_with_a_new_horizon_and_never_carried() {
             .published
             .index_build,
         22
+    );
+}
+
+/// A head whose OWN roster pair has lapsed is refused, even beside a newer roster the
+/// paper master signed that this machine holds: the publish verifies the head under the
+/// pair it carries and never re-binds it to a local one (decided: keep refusing a lapsed
+/// roster). The same head under a current pair is built over, and the newer local roster
+/// is then the one shipped — so the local roster is read, and the lapse alone refused.
+#[test]
+fn a_head_whose_own_roster_pair_lapsed_is_refused_under_a_newer_local_roster() {
+    let rig = Rig::new("lapsed-roster");
+    // the newest local roster: a later generation, current, master-signed, installed
+    let mut newer = rig.keys.roster.clone();
+    newer.roster_seq += 1;
+    let newer_bytes = newer.to_toml().expect("the roster emits").into_bytes();
+    let installed = &rig.ctx.identity.roster;
+    std::fs::create_dir_all(installed.parent().expect("a roster dir")).expect("mkdir roster");
+    std::fs::write(installed, &newer_bytes).expect("write local roster");
+    std::fs::write(
+        format!("{}.sig", installed.display()),
+        rig.keys.master_sign(&newer_bytes),
+    )
+    .expect("write local roster sig");
+
+    // the head's own pair: the same machine, a roster whose valid_until has passed
+    let mut lapsed = rig.keys.roster.clone();
+    lapsed.valid_until = "2020-01-01T00:00:00Z".into();
+    let lapsed_bytes = lapsed.to_toml().expect("the roster emits").into_bytes();
+    let head = rig.path("head");
+    let doc = Doc::new(41, &[("ay", 5)]);
+    rig.quad_dir(&head, &doc);
+    std::fs::write(head.join(QUAD_FILES[2]), &lapsed_bytes).expect("write roster");
+    std::fs::write(
+        head.join(QUAD_FILES[3]),
+        rig.keys.master_sign(&lapsed_bytes),
+    )
+    .expect("write roster sig");
+    let over_head = |out: &str| IndexRequest {
+        baseline: Baseline::Dir(head.clone()),
+        delta: Delta::default(),
+        out: rig.path(out),
+        upload: false,
+        pack_dir: None,
+    };
+
+    let refused = over_head("refused");
+    let err = publish_with(&rig.ctx, &refused, &mut Rig::log())
+        .expect_err("a head whose roster pair lapsed is refused");
+    assert!(
+        err.to_string().contains("the roster does not verify"),
+        "{err}"
+    );
+    assert!(
+        !refused.out.join("index.toml").exists(),
+        "nothing was built"
+    );
+
+    rig.quad_dir(&head, &doc);
+    let built = over_head("built");
+    let mut log = Rig::log();
+    let o = publish_with(&rig.ctx, &built, &mut log)
+        .unwrap_or_else(|e| panic!("a current pair is built over: {e}\n{}", log.text()));
+    assert_eq!(
+        o.plan.roster_seq, newer.roster_seq,
+        "the newest roster ships"
     );
 }

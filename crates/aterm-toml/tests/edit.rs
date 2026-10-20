@@ -244,6 +244,83 @@ fn a_removal_prunes_the_tables_it_left_bare() {
     assert_eq!(doc.to_string(), "[rain]\n");
 }
 
+/// THE COMMENT LINES UNDER A TABLE'S LAST LINE ARE THAT TABLE'S: run up to
+/// the first blank line before the next header or the end of the file, they
+/// describe what is above them. Pruning the table's last key keeps the
+/// header with them (it has a comment of its own), putting the key back
+/// gives the original text byte for byte, and a table added after it prints
+/// below them. Negative control: a comment touching the next header, after a
+/// blank line, is that header's, and stays with it when the table above goes.
+#[test]
+fn the_comment_lines_under_a_tables_last_line_are_that_tables() {
+    fn pruned(text: &str, path: &[&str]) -> String {
+        let mut doc: DocumentMut = text.parse().expect("parse");
+        assert!(
+            doc.remove_path_pruning(path).is_some(),
+            "{path:?} in {text:?}"
+        );
+        doc.to_string()
+    }
+    let text = "[machine]\nu = 1\n[s.feline]\nenabled = false\n# kitties\n\n[harness]\nh = 1\n";
+    assert_eq!(
+        pruned(text, &["s", "feline", "enabled"]),
+        "[machine]\nu = 1\n[s.feline]\n# kitties\n\n[harness]\nh = 1\n"
+    );
+    // At the end of the file the comment block is the last table's.
+    let at_end = "[machine]\nu = 1\n[s.feline]\nenabled = false\n# kitties\n";
+    assert_eq!(
+        pruned(at_end, &["s", "feline", "enabled"]),
+        "[machine]\nu = 1\n[s.feline]\n# kitties\n"
+    );
+    // Reset, then the key written again, is the original file.
+    for original in [text, at_end] {
+        let mut doc: DocumentMut = original.parse().expect("parse");
+        doc.remove_path_pruning(&["s", "feline", "enabled"]);
+        set_nested_ours(
+            &mut doc,
+            &["s", "feline", "enabled"],
+            Item::Value(Value::from(false)),
+        );
+        assert_eq!(doc.to_string(), original);
+    }
+    // A table added after it prints below the comment, ahead of the next
+    // header.
+    let mut doc: DocumentMut = text.parse().expect("parse");
+    set_nested_ours(
+        &mut doc,
+        &["s", "emphasis", "enabled"],
+        Item::Value(Value::from(false)),
+    );
+    let out = doc.to_string();
+    assert!(
+        out.contains("enabled = false\n# kitties\n")
+            && out.find("# kitties") < out.find("[s.emphasis]"),
+        "{out:?}"
+    );
+    // Negative control: a comment touching the next header is that header's.
+    assert_eq!(
+        pruned("z = 0\n[a]\nx = 1\n\n# about b\n[b]\ny = 1\n", &["a", "x"]),
+        "z = 0\n\n# about b\n[b]\ny = 1\n"
+    );
+    assert_eq!(
+        pruned("z = 0\n[a]\nx = 1\n# about b\n[b]\ny = 1\n", &["a", "x"]),
+        "z = 0\n# about b\n[b]\ny = 1\n",
+        "with no blank line the comment is the header's"
+    );
+    // Every shape round-trips byte for byte.
+    for shape in [
+        text,
+        at_end,
+        "x = 1\n# root note\n\n[a]\ny = 2\n",
+        "[[r]]\nn = 1\n# first record\n\n[[r]]\nn = 2\n# last\n",
+        "a = 1\n# end without newline",
+        "[a]\n# only a comment\n\n[b]\n",
+    ] {
+        let doc: DocumentMut = shape.parse().expect("parse");
+        assert_eq!(doc.to_string(), shape);
+    }
+}
+
 /// A leading byte-order mark is the file's, so it stays first whatever an edit
 /// removes or adds. The edits are Settings' Reset then Undo, which reads the
 /// reset file back before writing the key again, and the retired

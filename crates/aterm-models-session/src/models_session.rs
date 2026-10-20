@@ -144,172 +144,6 @@ pub fn spawn_locale_model() -> Model {
     }
 }
 
-/// Transaction atomicity (no lost update under optimistic concurrency). A transaction reads the
-/// head at `tbase` (`Begin`); concurrent `Write`s may advance `seq`; it commits only if no write
-/// intervened (`seq = tbase`), else aborts, since committing against a stale `tbase` clobbers
-/// the concurrent write. `Buggy = 1` may commit despite a conflict (`seq' = tbase + K`), setting
-/// `lost` and breaking `NoLostUpdate`.
-#[cfg_attr(trust_verify, trust::skip)]
-#[aterm_spec::model]
-pub fn transact_model() -> Model {
-    Model {
-        name: "Transact",
-        consts: vec![("MaxSeq", 4), ("K", 2), ("Buggy", 0)],
-        vars: vec![
-            StateVar {
-                name: "seq",
-                init: 0,
-            },
-            StateVar {
-                name: "tbase",
-                init: 0,
-            },
-            StateVar {
-                name: "active",
-                init: 0,
-            },
-            StateVar {
-                name: "lost",
-                init: 0,
-            },
-        ],
-        fn_vars: vec![],
-        actions: vec![
-            Action {
-                name: "Write", // a concurrent writer advances the committed head
-                guard: Some(le(var("seq"), sub(cst("MaxSeq"), int(1)))),
-                updates: vec![Update {
-                    var: "seq",
-                    expr: add(var("seq"), int(1)),
-                }],
-            },
-            Action {
-                name: "Begin", // a txn reads the current head as its base version
-                guard: Some(eq(var("active"), int(0))),
-                updates: vec![
-                    Update {
-                        var: "active",
-                        expr: int(1),
-                    },
-                    Update {
-                        var: "tbase",
-                        expr: var("seq"),
-                    },
-                ],
-            },
-            Action {
-                name: "CommitClean", // no write intervened: commit K edits atomically
-                guard: Some(and_(
-                    and_(eq(var("active"), int(1)), eq(var("seq"), var("tbase"))),
-                    le(var("seq"), sub(cst("MaxSeq"), cst("K"))),
-                )),
-                updates: vec![
-                    Update {
-                        var: "seq",
-                        expr: add(var("seq"), cst("K")),
-                    },
-                    Update {
-                        var: "active",
-                        expr: int(0),
-                    },
-                ],
-            },
-            Action {
-                name: "Abort", // a write intervened (seq > tbase): correct path aborts
-                guard: Some(and_(
-                    eq(var("active"), int(1)),
-                    gt(var("seq"), var("tbase")),
-                )),
-                updates: vec![Update {
-                    var: "active",
-                    expr: int(0),
-                }],
-            },
-            Action {
-                name: "BuggyCommit", // conflict committed anyway -> clobbers, lost update
-                guard: Some(and_(
-                    and_(
-                        and_(eq(var("active"), int(1)), gt(var("seq"), var("tbase"))),
-                        eq(cst("Buggy"), int(1)),
-                    ),
-                    le(var("tbase"), sub(cst("MaxSeq"), cst("K"))),
-                )),
-                updates: vec![
-                    Update {
-                        var: "seq",
-                        expr: add(var("tbase"), cst("K")),
-                    },
-                    Update {
-                        var: "active",
-                        expr: int(0),
-                    },
-                    Update {
-                        var: "lost",
-                        expr: int(1),
-                    },
-                ],
-            },
-        ],
-        invariants: vec![Invariant {
-            name: "NoLostUpdate",
-            kind: InvariantKind::Claim,
-            expr: eq(var("lost"), int(0)), // lost = 0
-        }],
-    }
-}
-
-/// The event-log spine: gap-free, monotone, `seq == count`. Each `Emit` assigns the next
-/// contiguous seq and bumps the count, so the head seq equals the number of events; `Buggy`
-/// jumps seq by 2 (a gap), breaking `SeqIsCount`. Tier-1: aterm-buffer's
-/// `tests/conformance_kernel.rs` drives every real edit kind, transactions and the eviction
-/// regime, projecting `count` from the writer and `seq` from the seq stamped on each stored
-/// event (every stored event is one `Emit`).
-#[cfg_attr(trust_verify, trust::skip)]
-#[aterm_spec::model]
-pub fn kernel_model() -> Model {
-    Model {
-        name: "Kernel",
-        consts: vec![("MaxSeq", 5), ("Buggy", 0)],
-        vars: vec![
-            StateVar {
-                name: "seq",
-                init: 0,
-            },
-            StateVar {
-                name: "count",
-                init: 0,
-            },
-        ],
-        // Action `Emit` (not `Append`, which clashes with ty's Sequences builtin in
-        // a single-action spec — see the ring's `Push`).
-        fn_vars: vec![],
-        actions: vec![Action {
-            name: "Emit",
-            guard: Some(le(var("seq"), sub(cst("MaxSeq"), int(1)))),
-            updates: vec![
-                Update {
-                    var: "count",
-                    expr: add(var("count"), int(1)),
-                },
-                // seq' = IF Buggy = 1 THEN seq + 2 ELSE seq + 1   (Buggy opens a gap)
-                Update {
-                    var: "seq",
-                    expr: if_(
-                        eq(cst("Buggy"), int(1)),
-                        add(var("seq"), int(2)),
-                        add(var("seq"), int(1)),
-                    ),
-                },
-            ],
-        }],
-        invariants: vec![Invariant {
-            name: "SeqIsCount",
-            kind: InvariantKind::Claim,
-            expr: eq(var("seq"), var("count")), // seq = count (gap-free, monotone spine)
-        }],
-    }
-}
-
 /// Proof-carrying DSU, the quiescence-safety obligation (Rung 0 of
 /// `docs/RFC-proof-carrying-dsu.md`). A computation begun under the old version's memory layout
 /// tears if resumed under the new one, so a running process may take an update only at a
@@ -512,67 +346,6 @@ pub fn fd_handoff_no_leak_model() -> Model {
     }
 }
 
-/// Snapshot isolation: a snapshot, once taken, is isolated from later writes. `Snap` activates a
-/// snapshot; `Write` advances the head and, under `Buggy = 1 /\ snapped = 1`, leaks into it
-/// (`leaked = 1`), breaking `SnapshotIsolated`.
-#[cfg_attr(trust_verify, trust::skip)]
-#[aterm_spec::model]
-pub fn snapshot_model() -> Model {
-    Model {
-        name: "Snapshot",
-        consts: vec![("MaxSeq", 4), ("Buggy", 0)],
-        vars: vec![
-            StateVar {
-                name: "seq",
-                init: 0,
-            },
-            StateVar {
-                name: "snapped",
-                init: 0,
-            },
-            StateVar {
-                name: "leaked",
-                init: 0,
-            },
-        ],
-        fn_vars: vec![],
-        actions: vec![
-            Action {
-                name: "Snap", // take a single snapshot of the current head
-                guard: Some(eq(var("snapped"), int(0))),
-                updates: vec![Update {
-                    var: "snapped",
-                    expr: int(1),
-                }], // seq, leaked UNCHANGED
-            },
-            Action {
-                name: "Write", // advance the head; must not leak into an active snapshot
-                guard: Some(le(var("seq"), sub(cst("MaxSeq"), int(1)))),
-                updates: vec![
-                    Update {
-                        var: "seq",
-                        expr: add(var("seq"), int(1)),
-                    },
-                    // leaked' = IF Buggy = 1 /\ snapped = 1 THEN 1 ELSE leaked
-                    Update {
-                        var: "leaked",
-                        expr: if_(
-                            and_(eq(cst("Buggy"), int(1)), eq(var("snapped"), int(1))),
-                            int(1),
-                            var("leaked"),
-                        ),
-                    },
-                ], // snapped UNCHANGED
-            },
-        ],
-        invariants: vec![Invariant {
-            name: "SnapshotIsolated",
-            kind: InvariantKind::Claim,
-            expr: eq(var("leaked"), int(0)), // leaked = 0
-        }],
-    }
-}
-
 /// The read-image snapshot-seq protocol. The engine's render snapshot
 /// (`Terminal::cell_frame_into`, outside this crate) is stamped with the monotone
 /// `damage_epoch` as its `snapshot_seq`:
@@ -744,91 +517,6 @@ pub fn fd_lifecycle_model() -> Model {
                 expr: or_(eq(var("fdOpen"), int(1)), eq(var("clones"), int(0))),
             },
         ],
-    }
-}
-
-/// Per-element ring with a function-valued live-set `live: [1..MaxSeq -> BOOLEAN]`, which the
-/// scalar `ring_model` cannot express. `EvictOldestContiguous`: the live region is exactly the
-/// contiguous window `[lo, seq]`, so eviction removes precisely the oldest event, never a hole
-/// and never two. Function-valued, so Tier-0 `ty` only, not the scalar interpreter.
-#[cfg_attr(trust_verify, trust::skip)]
-#[aterm_spec::model]
-pub fn evict_full_model() -> Model {
-    // (seq + 1) - lo + 1 > Cap : the eviction condition (over the pre-state seq).
-    let evicting = || {
-        gt(
-            add(sub(add(var("seq"), int(1)), var("lo")), int(1)),
-            cst("Cap"),
-        )
-    };
-    Model {
-        name: "EvictFull",
-        // `Buggy = 1` advances `lo` but keeps the evicted event live: a hole at the old end.
-        consts: vec![("MaxSeq", 5), ("Cap", 3), ("Buggy", 0)],
-        vars: vec![
-            StateVar {
-                name: "seq",
-                init: 0,
-            },
-            StateVar {
-                name: "lo",
-                init: 1,
-            },
-        ],
-        fn_vars: vec![FnVar {
-            name: "live",
-            range: "MaxSeq",
-        }],
-        actions: vec![Action {
-            name: "Push",
-            guard: Some(le(var("seq"), sub(cst("MaxSeq"), int(1)))),
-            updates: vec![
-                Update {
-                    var: "seq",
-                    expr: add(var("seq"), int(1)),
-                },
-                Update {
-                    var: "lo",
-                    expr: if_(evicting(), add(var("lo"), int(1)), var("lo")),
-                },
-                Update {
-                    var: "live",
-                    // Evicting: rebuild the live-set as (old minus the evicted `lo`)
-                    // plus the new event `seq+1`. Non-evicting: just mark `seq+1`.
-                    expr: if_(
-                        evicting(),
-                        comprehension(
-                            "n",
-                            int(1),
-                            cst("MaxSeq"),
-                            if_(
-                                eq(var("n"), add(var("seq"), int(1))),
-                                bool_lit(true),
-                                and_(
-                                    fn_access("live", var("n")),
-                                    or_(neq(var("n"), var("lo")), eq(cst("Buggy"), int(1))),
-                                ),
-                            ),
-                        ),
-                        except("live", add(var("seq"), int(1)), bool_lit(true)),
-                    ),
-                },
-            ],
-        }],
-        invariants: vec![Invariant {
-            name: "EvictOldestContiguous",
-            kind: InvariantKind::Claim,
-            // \A n \in 1..MaxSeq : live[n] <=> (lo =< n /\ n =< seq)
-            expr: forall(
-                "n",
-                int(1),
-                cst("MaxSeq"),
-                iff(
-                    fn_access("live", var("n")),
-                    and_(le(var("lo"), var("n")), le(var("n"), var("seq"))),
-                ),
-            ),
-        }],
     }
 }
 
@@ -1506,6 +1194,33 @@ pub fn forward_handshake_model() -> Model {
         waiting: "client_waiting",
         relay: "Relay",
         recv: "ClientRecv",
+        done: "Done",
+        inv: "WaitingIsBool",
+    })
+}
+
+/// TLS relay startup liveness. A peer's first application record can be decrypted by the TLS
+/// handshake driver before `tls::relay_answers` begins (the fleet listener's relay into its
+/// control server, aterm-net). The local service is waiting for that request, while the peer
+/// is waiting for its reply. Correct (`Buggy = 0`): `DrainBuffered` forwards the
+/// already-buffered request without requiring another network read. `Buggy = 1` demands a
+/// fresh record first, leaving both parties parked in the initial state.
+///
+/// Deliberately separate from [`forward_handshake_model`]: the abstract wedge is the same, but
+/// each is Tier-1-bound to its own relay — this one to the genuine TLS relay by aterm-net's
+/// `tls::tests::relay_round_trips_guarded_artifact_ack_before_request_half_close`, that one to
+/// the control socket's cross-process forward.
+#[cfg_attr(trust_verify, trust::skip)]
+#[aterm_spec::model]
+pub fn tls_buffered_relay_model() -> Model {
+    props::no_wedge(props::Wedge {
+        name: "TlsBufferedRelay",
+        buffered: "buffered",
+        buffered_init: 1,
+        relayed: "relayed",
+        waiting: "service_waiting",
+        relay: "DrainBuffered",
+        recv: "ServiceRecv",
         done: "Done",
         inv: "WaitingIsBool",
     })

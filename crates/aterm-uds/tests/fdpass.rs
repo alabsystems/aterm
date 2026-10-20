@@ -31,7 +31,6 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
 
 use aterm_uds::fdpass::{self, MAX_FDS};
 use aterm_uds::{CtlListener, CtlStream};
@@ -235,8 +234,9 @@ fn an_over_budget_receive_is_refused_without_leaking_descriptors() {
 }
 
 /// A message with no descriptors (an ordinary write) does not read as a
-/// truncated control message, and a hung-up peer reads as EOF, not an error
-/// or an empty success that loops forever.
+/// truncated control message, a hung-up peer reads as EOF, not an error or an
+/// empty success that loops forever, and a send to it is `EPIPE`, not a
+/// signal.
 #[test]
 fn a_plain_message_and_a_hangup_are_ordinary_receives() {
     let _guard = serial();
@@ -252,6 +252,8 @@ fn a_plain_message_and_a_hangup_are_ordinary_receives() {
     let eof = fdpass::recv_with_fds(&b, &mut buf, 3).expect("hangup is not an error");
     assert_eq!(eof.bytes, 0, "a hung-up peer reads as EOF");
     assert!(eof.fds.is_empty());
+    let gone = fdpass::send_with_fds(&b, b"x", &[]).expect_err("the peer is gone");
+    assert_eq!(gone.kind(), ErrorKind::BrokenPipe);
 }
 
 /// The kernel-attested peer pid over a real bind/connect/accept, on both ends.
@@ -267,6 +269,10 @@ fn peer_pid_is_the_kernel_attested_peer() {
     let us = std::process::id();
     assert_eq!(fdpass::peer_pid(&client).expect("client side"), us);
     assert_eq!(fdpass::peer_pid(&accepted).expect("server side"), us);
+    assert_eq!(
+        fdpass::peer_pid_of_fd(accepted.as_raw_fd()).expect("by descriptor"),
+        us
+    );
 
     drop(listener);
     let _ = std::fs::remove_dir_all(&dir);
@@ -274,13 +280,20 @@ fn peer_pid_is_the_kernel_attested_peer() {
 
 /// Caller misuse is refused before the kernel is asked: the peer sees nothing
 /// afterwards. A zero-length `sendmsg` would transfer nothing on Linux while
-/// consuming the descriptors.
+/// consuming the descriptors. The cap itself is no misuse.
 #[test]
 fn misuse_is_refused_before_the_kernel_is_asked() {
     let _guard = serial();
     let dir = test_dir("fdpass-misuse");
     let f = seeded_file(&dir, "m", 0);
     let (a, b) = CtlStream::pair().expect("pair");
+
+    let at_cap = [f.as_fd(); MAX_FDS];
+    fdpass::send_with_fds(&a, b"1", &at_cap).expect("MAX_FDS descriptors");
+    let mut buf = [0u8; 4];
+    let got = fdpass::recv_with_fds(&b, &mut buf, MAX_FDS).expect("MAX_FDS descriptors");
+    assert_eq!(got.fds.len(), MAX_FDS);
+    drop(got);
 
     let empty_payload = fdpass::send_with_fds(&a, b"", &[f.as_fd()]).expect_err("empty payload");
     assert_eq!(empty_payload.kind(), ErrorKind::InvalidInput);
@@ -289,21 +302,19 @@ fn misuse_is_refused_before_the_kernel_is_asked() {
     let over_cap = fdpass::send_with_fds(&a, b"1", &too_many).expect_err("over the cap");
     assert_eq!(over_cap.kind(), ErrorKind::InvalidInput);
 
-    let mut buf = [0u8; 4];
     let no_room = fdpass::recv_with_fds(&b, &mut [], 1).expect_err("empty buffer");
     assert_eq!(no_room.kind(), ErrorKind::InvalidInput);
     let over_max = fdpass::recv_with_fds(&b, &mut buf, MAX_FDS + 1).expect_err("over the cap");
     assert_eq!(over_max.kind(), ErrorKind::InvalidInput);
 
-    // Nothing was sent: a timed receive finds an empty socket rather than a
-    // message whose descriptors were quietly consumed.
-    b.set_read_timeout(Some(Duration::from_millis(150)))
-        .expect("timeout");
+    // Nothing was sent: a non-blocking receive finds an empty socket rather
+    // than a message whose descriptors were quietly consumed.
+    b.set_nonblocking(true).expect("non-blocking");
     let idle = fdpass::recv_with_fds(&b, &mut buf, 1).expect_err("nothing queued");
-    assert!(
-        matches!(idle.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
-        "a refused send must not have reached the peer, got {:?}",
-        idle.kind()
+    assert_eq!(
+        idle.kind(),
+        ErrorKind::WouldBlock,
+        "a refused send must not have reached the peer"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

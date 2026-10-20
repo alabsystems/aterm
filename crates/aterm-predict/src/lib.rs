@@ -793,6 +793,90 @@ const FAST_SAMPLES_TO_HIDE: u8 = 3;
 /// EWMA weight for a freshly-confirmed echo sample into the smoothed RTT.
 const SRTT_ALPHA: f32 = 0.3;
 
+/// Compute the bounded unconfirmed-prediction glitch expiry window in
+/// milliseconds from an optional smoothed RTT in microseconds (`srtt_us`) and
+/// consecutive expiry backoff count (`expiry_backoff`).
+///
+/// Matches thepredictor's adaptive window:
+/// - floor: `250 ms << min(expiry_backoff, 3)` (capped at `2000 ms`)
+/// - RTT target: `3 * srtt_ms` when `srtt_us` is present
+/// - clamped to `[floor_ms, 2000 ms]`.
+#[must_use]
+pub const fn compute_glitch_window_ms(srtt_us: Option<u32>, expiry_backoff: u8) -> u64 {
+    let shift = if expiry_backoff > EXPIRY_BACKOFF_MAX {
+        EXPIRY_BACKOFF_MAX
+    } else {
+        expiry_backoff
+    };
+    let backed_floor = GLITCH_FLOOR_MS << (shift as u32);
+    let floor_ms = if backed_floor > GLITCH_CEILING_MS {
+        GLITCH_CEILING_MS
+    } else {
+        backed_floor
+    };
+    let target_ms = match srtt_us {
+        Some(us) => ((us as u64).saturating_mul(3)) / 1_000,
+        None => floor_ms,
+    };
+    if target_ms < floor_ms {
+        floor_ms
+    } else if target_ms > GLITCH_CEILING_MS {
+        GLITCH_CEILING_MS
+    } else {
+        target_ms
+    }
+}
+
+/// Fixed-point EWMA SRTT step in microseconds (`alpha = 3/10`, matching
+/// `SRTT_ALPHA = 0.3`): `0.7 * prev_srtt_us + 0.3 * sample_us`.
+#[must_use]
+pub const fn ewma_srtt_step_us(prev_srtt_us: Option<u32>, sample_us: u32) -> u32 {
+    match prev_srtt_us {
+        None => sample_us,
+        Some(prev) => {
+            let weighted = (prev as u64)
+                .saturating_mul(7)
+                .saturating_add((sample_us as u64).saturating_mul(3))
+                / 10;
+            if weighted > (u32::MAX as u64) {
+                u32::MAX
+            } else {
+                weighted as u32
+            }
+        }
+    }
+}
+
+/// Encode a predicted overlay ghost cell `(row, col, ch, epoch)` into a
+/// 16-byte little-endian wire record (`row: u16, col: u16, ch: u32, epoch: u64`).
+#[must_use]
+pub const fn encode_predicted_ghost_wire_le(row: u16, col: u16, ch: char, epoch: u64) -> [u8; 16] {
+    let r = row.to_le_bytes();
+    let c = col.to_le_bytes();
+    let g = (ch as u32).to_le_bytes();
+    let e = epoch.to_le_bytes();
+    [
+        r[0], r[1], c[0], c[1], g[0], g[1], g[2], g[3], e[0], e[1], e[2], e[3], e[4], e[5], e[6],
+        e[7],
+    ]
+}
+
+/// Decode a 16-byte little-endian predicted ghost cell wire record produced by
+/// [`encode_predicted_ghost_wire_le`], rejecting invalid Unicode scalar values.
+#[must_use]
+pub const fn decode_predicted_ghost_wire_le(wire: &[u8; 16]) -> Option<(u16, u16, char, u64)> {
+    let row = u16::from_le_bytes([wire[0], wire[1]]);
+    let col = u16::from_le_bytes([wire[2], wire[3]]);
+    let raw_ch = u32::from_le_bytes([wire[4], wire[5], wire[6], wire[7]]);
+    let Some(ch) = char::from_u32(raw_ch) else {
+        return None;
+    };
+    let epoch = u64::from_le_bytes([
+        wire[8], wire[9], wire[10], wire[11], wire[12], wire[13], wire[14], wire[15],
+    ]);
+    Some((row, col, ch, epoch))
+}
+
 /// Whether `bytes` written to the program are a line terminator and nothing that
 /// could erase or move what was typed before them: UTF-8 text that ends in CR or LF
 /// and holds no other control character (no BS, no ^U/^W, no ESC prefix, no DEL).
@@ -2012,7 +2096,11 @@ impl Predictor {
     /// Reconcile a STATE CHAIN against the screen (`reconcile_seen`).
     ///
     /// 1. Read its row from `lo` to one past the furthest text end any state
-    ///    reaches, into `seen`. An opaque cell there flushes (R-OPAQUE).
+    ///    reaches, into `seen`. An opaque cell there flushes (R-OPAQUE). With
+    ///    an erase pending, so does anything but a blank in that last cell, the
+    ///    SENTINEL no state compares ([`Rule::VacateRefusal`]): a split erase
+    ///    echo may still show the chain's own vacated text, which step 6 waits
+    ///    through, but nothing past every state is the chain's.
     /// 2. Find the SMALLEST state `S_j`, `S_0` the line itself included, that
     ///    the screen matches as a whole (`state_matches`): its text, its
     ///    vacated cells blank, and the real cursor where it leaves it
@@ -7478,6 +7566,26 @@ mod tests {
         assert!(
             !widest.0 && widest.1.is_none_or(|(_, col)| col < u16::MAX),
             "EDIT_CHAIN_LAST_COLUMN_SATURATED: {widest:?}"
+        );
+    }
+
+    #[test]
+    fn glitch_window_ewma_and_ghost_wire_codec_round_trip() {
+        assert_eq!(compute_glitch_window_ms(None, 0), 250);
+        assert_eq!(compute_glitch_window_ms(None, 2), 1000);
+        assert_eq!(compute_glitch_window_ms(None, 9), 2000);
+        assert_eq!(compute_glitch_window_ms(Some(120_000), 0), 360);
+        assert_eq!(compute_glitch_window_ms(Some(900_000), 0), 2000);
+
+        let srtt0 = ewma_srtt_step_us(None, 100_000);
+        assert_eq!(srtt0, 100_000);
+        let srtt1 = ewma_srtt_step_us(Some(srtt0), 200_000);
+        assert_eq!(srtt1, 130_000);
+
+        let wire = encode_predicted_ghost_wire_le(4, 19, 'λ', 42);
+        assert_eq!(
+            decode_predicted_ghost_wire_le(&wire),
+            Some((4, 19, 'λ', 42))
         );
     }
 }

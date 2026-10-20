@@ -142,6 +142,117 @@ pub enum Bracket {
     Close(u32),
 }
 
+impl BaseDirection {
+    /// Return `true` when the direction is explicitly forced (`Ltr` or `Rtl`).
+    #[must_use]
+    pub const fn is_explicit(self) -> bool {
+        !matches!(self, Self::Auto)
+    }
+
+    /// Return the default paragraph embedding level (`1` for `Rtl`, `0` otherwise).
+    #[must_use]
+    pub const fn default_level(self) -> u8 {
+        match self {
+            Self::Rtl => 1,
+            Self::Auto | Self::Ltr => 0,
+        }
+    }
+}
+
+impl BidiClass {
+    /// Return `true` when this class is a strong directional class (`L`, `R`, or `AL`).
+    #[must_use]
+    pub const fn is_strong(self) -> bool {
+        matches!(self, Self::L | Self::R | Self::AL)
+    }
+
+    /// Return `true` when this class is a strong right-to-left class (`R` or `AL`).
+    #[must_use]
+    pub const fn is_rtl_strong(self) -> bool {
+        matches!(self, Self::R | Self::AL)
+    }
+
+    /// Return `true` when this class is a numeric class (`EN` or `AN`).
+    #[must_use]
+    pub const fn is_number(self) -> bool {
+        matches!(self, Self::EN | Self::AN)
+    }
+
+    /// Return `true` when this class is an isolate initiator (`LRI`, `RLI`, or `FSI`).
+    #[must_use]
+    pub const fn is_isolate_initiator(self) -> bool {
+        matches!(self, Self::LRI | Self::RLI | Self::FSI)
+    }
+}
+
+impl Bracket {
+    /// Return `true` when this bracket is an opening bracket (`Open(_)`).
+    #[must_use]
+    pub const fn is_open(self) -> bool {
+        matches!(self, Self::Open(_))
+    }
+
+    /// Return `true` when this bracket is a closing bracket (`Close(_)`).
+    #[must_use]
+    pub const fn is_close(self) -> bool {
+        matches!(self, Self::Close(_))
+    }
+
+    /// Return the canonical opening bracket codepoint, if any.
+    #[must_use]
+    pub const fn canonical_open(self) -> Option<u32> {
+        match self {
+            Self::None => None,
+            Self::Open(cp) | Self::Close(cp) => Some(cp),
+        }
+    }
+}
+
+/// Encode a resolved bidirectional run descriptor (`start`, `end`, `level`, `flags`) into 16 LE bytes.
+#[must_use]
+pub const fn encode_bidi_run_le(start: u32, end: u32, level: u32, flags: u32) -> [u8; 16] {
+    [
+        start as u8,
+        (start >> 8) as u8,
+        (start >> 16) as u8,
+        (start >> 24) as u8,
+        end as u8,
+        (end >> 8) as u8,
+        (end >> 16) as u8,
+        (end >> 24) as u8,
+        level as u8,
+        (level >> 8) as u8,
+        (level >> 16) as u8,
+        (level >> 24) as u8,
+        flags as u8,
+        (flags >> 8) as u8,
+        (flags >> 16) as u8,
+        (flags >> 24) as u8,
+    ]
+}
+
+/// Decode 16 LE bytes into a resolved bidirectional run descriptor (`start`, `end`, `level`, `flags`).
+#[must_use]
+pub const fn decode_bidi_run_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
+    let start = (bytes[0] as u32)
+        | ((bytes[1] as u32) << 8)
+        | ((bytes[2] as u32) << 16)
+        | ((bytes[3] as u32) << 24);
+    let end = (bytes[4] as u32)
+        | ((bytes[5] as u32) << 8)
+        | ((bytes[6] as u32) << 16)
+        | ((bytes[7] as u32) << 24);
+    let level = (bytes[8] as u32)
+        | ((bytes[9] as u32) << 8)
+        | ((bytes[10] as u32) << 16)
+        | ((bytes[11] as u32) << 24);
+    let flags = (bytes[12] as u32)
+        | ((bytes[13] as u32) << 8)
+        | ((bytes[14] as u32) << 16)
+        | ((bytes[15] as u32) << 24);
+    (start, end, level, flags)
+}
+
 /// O(1) lookup table for ASCII `0x00..=0x7F` (`Bidi_Class`), matching
 /// `tables::BIDI_CLASS_RANGES` without a binary search on every ASCII cell.
 const ASCII_BIDI_CLASS: [BidiClass; 128] = {

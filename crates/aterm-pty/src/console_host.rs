@@ -10,16 +10,23 @@
 //! `windows/openconsole.rs`, a port of microsoft/terminal's
 //! `src/winconpty/winconpty.cpp` (MIT).
 //!
-//! OPT-IN. With aterm.toml's `conpty` absent the host is the inbox one, what
-//! every earlier build spawned, and resolving it does nothing at all (no file
-//! is looked for, nothing is copied). `docs/WINDOWS_PARAGON_DESIGN.md` §5.4
-//! plans to ship an OpenConsole beside aterm; until a person sets `conpty =
-//! "auto"` or a path, nothing here changes a tab.
+//! THE DEFAULT. With aterm.toml's `conpty` absent a window's tabs run in the
+//! OpenConsole.exe shipped beside aterm (`apps/aterm-win/build.ps1` lays a
+//! pinned, Microsoft-signed one there), and in the inbox host when there is
+//! none (a bare `cargo build`); the default never copies anything or reaches
+//! into Windows Terminal's package. `conpty = "inbox"` keeps the inbox host,
+//! what every build before 2026-10-17 spawned, and resolves nothing. An
+//! embedder that never states a choice (the CLI's passthrough session, this
+//! crate's own tests) keeps the inbox host too.
 //!
-//! WHY OPENCONSOLE. These are the numbers the 2026-09-29 snapshot (6ad1a274d8)
+//! WHY OPENCONSOLE. Measured again on 2026-10-17 (Windows 11 26200, the
+//! bundled 1.25.2609.30003 against the inbox host, `docs/WINDOWS_PARAGON_DESIGN.md`
+//! §5.4): the terminal's own answers reach the program (DA1, DECRQM
+//! 2026/2027/2031, OSC 10/11/12, XTGETTCAP, the kitty graphics query), sixel
+//! and kitty images draw, `SGR 58` passes whole, and bulk output is faster for
+//! less host CPU. These are the numbers the 2026-09-29 snapshot (6ad1a274d8)
 //! recorded on Windows 11 26200 against a copy of Windows Terminal 1.24's
-//! OpenConsole (1.24.2607.10001), measured 2026-09-28; nothing has been
-//! measured again since the port:
+//! OpenConsole (1.24.2607.10001), measured 2026-09-28:
 //! * pass-through: the inbox host rewrote pwsh's `SGR 58` underline colour to
 //!   `4m … 24m`, hard-wrapped a 110-column line at 80 with CUP, rewrote OSC 8
 //!   `id=` and moved a curly underline across a line break; OpenConsole emitted
@@ -38,9 +45,10 @@
 //! exactly as the inbox host holds it, so every input workaround in this crate
 //! and the frontend applies to both hosts ([`ConsoleHostKind`] says where the
 //! two differ). One it makes worse: a reader in VT-input mode gets text alone,
-//! so the MSYS2 runtime (Git Bash) never sees the record that absorbs its
-//! post-resize drop, and `auto` keeps those programs on conhost
-//! (`policy::runs_a_posix_runtime`).
+//! so the MSYS2 runtime (Git Bash) never sees the inline record that absorbs its
+//! post-resize drop; a second console client writes it there instead (the
+//! Windows backend's `console_guard`), and without that client the default and
+//! `auto` keep those programs on conhost (`policy::runs_a_posix_runtime`).
 
 use std::path::PathBuf;
 
@@ -51,16 +59,23 @@ pub(crate) mod policy;
 /// Read on Windows only; every other platform has no console host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConsoleHostChoice {
-    /// `"inbox"`, and the key absent or empty: the Windows console host
-    /// (`CreatePseudoConsole`), what every build before the OpenConsole host
-    /// spawned. The default, so nothing changes unless a person opts in.
+    /// The key absent or empty, or `"bundled"`: the default. The
+    /// `OpenConsole.exe` beside the running executable (the pinned one the
+    /// Windows build ships), else the Windows console host. Never a copy of
+    /// Windows Terminal's: the default runs a host this build was tested with,
+    /// or none. Git Bash and the other MSYS2/Cygwin programs are treated as
+    /// under [`Self::Auto`].
+    Bundled,
+    /// `"inbox"`: the Windows console host (`CreatePseudoConsole`), what every
+    /// build before the OpenConsole default spawned.
     Inbox,
     /// `"auto"`: an `OpenConsole.exe` beside the running executable, else a
     /// copy of the installed Windows Terminal's (taken into aterm's state
     /// directory, `%LOCALAPPDATA%\aterm\conpty`, because an unpackaged process
     /// may not launch it inside `WindowsApps`), else the Windows console host.
     /// Git Bash and the other MSYS2/Cygwin programs keep the Windows console
-    /// host (`policy::runs_a_posix_runtime`).
+    /// host only when no `aterm.exe` beside aterm can guard their input
+    /// (`policy::runs_a_posix_runtime`).
     Auto,
     /// Any other value: this OpenConsole.exe (an absolute path) for every tab,
     /// falling back to the Windows console host when it does not start.
@@ -69,12 +84,14 @@ pub enum ConsoleHostChoice {
 
 impl ConsoleHostChoice {
     /// The choice aterm.toml's `conpty` value names. `None`, an empty value and
-    /// `inbox` (any case) are [`Self::Inbox`]; `auto` (any case) is
-    /// [`Self::Auto`]; anything else is a path.
+    /// `bundled` (any case) are [`Self::Bundled`]; `inbox` (any case) is
+    /// [`Self::Inbox`]; `auto` (any case) is [`Self::Auto`]; anything else is a
+    /// path.
     #[must_use]
     pub fn from_config(value: Option<&str>) -> Self {
         match value.map(str::trim) {
-            None | Some("") => Self::Inbox,
+            None | Some("") => Self::Bundled,
+            Some(v) if v.eq_ignore_ascii_case("bundled") => Self::Bundled,
             Some(v) if v.eq_ignore_ascii_case("inbox") => Self::Inbox,
             Some(v) if v.eq_ignore_ascii_case("auto") => Self::Auto,
             Some(v) => Self::Path(PathBuf::from(v)),
@@ -92,9 +109,10 @@ impl ConsoleHostChoice {
 /// (OpenConsole asks for `?9001h` too and holds a lone ESC after one record
 /// exactly as conhost does) and the kitty keyboard posture (OpenConsole 1.24
 /// turns a CSI-u report into one typed character per byte for a record
-/// reader). The MSYS resize guard is the exception keyed not here but on the
-/// PROGRAM: OpenConsole never delivers the guard to the MSYS2 runtime's
-/// VT-input reader, so `auto` keeps those programs on conhost.
+/// reader). The MSYS resize guard is the exception: OpenConsole never delivers
+/// its inline record to the MSYS2 runtime's VT-input reader, so an OpenConsole
+/// session's guard is written by a second console client, and only when such
+/// a program is in the tab (the Windows backend's `console_guard`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsoleHostKind {
     /// Windows' own conhost, through kernel32 `CreatePseudoConsole` (or a
@@ -128,12 +146,13 @@ impl ConsoleHostKind {
 pub struct ConsoleHostReport {
     /// The host a new tab gets.
     pub kind: ConsoleHostKind,
-    /// `true` when the choice named an OpenConsole (`auto` or a path) and tabs
-    /// get the Windows console host instead; `false` for an OpenConsole and for
-    /// the inbox host the choice asked for.
+    /// `true` when the choice named an OpenConsole (the bundled default,
+    /// `auto` or a path) and tabs get the Windows console host instead;
+    /// `false` for an OpenConsole and for the inbox host `conpty = "inbox"`
+    /// asked for.
     pub fell_back: bool,
-    /// `OpenConsole 1.24.2607.10001 (bundled beside aterm: …)`, `Windows console
-    /// host (the default; …)`, … — see `policy::report`.
+    /// `OpenConsole 1.25.2609.30003 (bundled beside aterm: …)`, `Windows
+    /// console host (aterm.toml conpty = "inbox")`, … — see `policy::report`.
     pub line: String,
 }
 
@@ -169,22 +188,24 @@ pub fn conpty_host(_master: i32) -> Option<ConsoleHostKind> {
 mod tests {
     use super::*;
 
-    // The opt-in: the key absent, empty or `inbox` is the Windows console host
-    // every earlier build spawned; only `auto` or a path names an OpenConsole.
+    // The default: the key absent, empty or `bundled` is the OpenConsole
+    // beside aterm; only `inbox` names the Windows console host every earlier
+    // build spawned.
     #[test]
-    fn the_config_value_names_the_choice_and_absent_is_inbox() {
-        assert_eq!(
-            ConsoleHostChoice::from_config(None),
-            ConsoleHostChoice::Inbox
-        );
-        assert_eq!(
-            ConsoleHostChoice::from_config(Some("")),
-            ConsoleHostChoice::Inbox
-        );
-        assert_eq!(
-            ConsoleHostChoice::from_config(Some("  ")),
-            ConsoleHostChoice::Inbox
-        );
+    fn the_config_value_names_the_choice_and_absent_is_the_bundled_host() {
+        for absent in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("bundled"),
+            Some(" Bundled "),
+        ] {
+            assert_eq!(
+                ConsoleHostChoice::from_config(absent),
+                ConsoleHostChoice::Bundled,
+                "{absent:?}"
+            );
+        }
         assert_eq!(
             ConsoleHostChoice::from_config(Some("Inbox")),
             ConsoleHostChoice::Inbox

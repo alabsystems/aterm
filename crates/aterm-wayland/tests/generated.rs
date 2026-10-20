@@ -3,19 +3,15 @@
 
 //! The committed protocol modules are what the generator writes from the
 //! committed protocol files: the generator's own code (scan/src, built
-//! outside the workspace) compiled here and run in process.
+//! outside the workspace) compiled into this binary at its root
+//! (`tests/wayland_suite.rs`) and run in process.
 //!
 //! Negative control: a protocol file one attribute away generates other
 //! text.
 
-#[allow(dead_code, reason = "the generator's binary entry is not used here")]
-#[path = "../scan/src/generate.rs"]
-mod generate;
-#[allow(dead_code, reason = "as above")]
-#[path = "../scan/src/xml.rs"]
-mod xml;
-
 use std::path::Path;
+
+use crate::generate;
 
 #[test]
 fn the_committed_modules_are_the_generators_output() {

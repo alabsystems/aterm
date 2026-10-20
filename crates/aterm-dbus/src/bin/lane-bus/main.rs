@@ -26,6 +26,10 @@
 //!   and the steps start once the frame that `<app>` (process `<app-pid>`)
 //!   publishes on the accessibility bus is `active`: the window has the new
 //!   keyboard's focus, so no key is lost while the client binds the keyboard.
+//!   When the steps drive the pointer, a motion parks it in the screen's
+//!   top-left corner before that tap (Mutter makes the pointer with its first
+//!   motion and announces it to the window a frame later, before the keyboard
+//!   made after it), so every step's motion reaches a seat that has it.
 //!   The session ends once the frame is inactive again. An `<app>` of `-`
 //!   awaits no frame: the client paces the steps with files of its own;
 //! * `xdnd <window> <uri> <marks-dir>`: an XDND drag source, a second X

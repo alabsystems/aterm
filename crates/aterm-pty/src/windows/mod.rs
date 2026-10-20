@@ -46,21 +46,46 @@
 //! a Shift key-up record no reader acts on, for it to drop instead. That
 //! record, like (2)'s, switches conhost's parser to holding a trailing lone
 //! ESC, so once one has gone out a raw lone ESC is sent as the Escape key's
-//! record pair; see [`resize_guard`].
+//! record pair; see [`resize_guard`]. OpenConsole hands such a reader no key
+//! record but text, so there a second console client writes the record
+//! ([`console_guard`]). The terminal's answers to (3)'s queries pass the guard
+//! ([`as_reply`]): OpenConsole waits for its own cursor query's answer after a
+//! resize, and the client cannot connect until it has it, so an input writer
+//! runs the client before it takes any lock an answer needs
+//! ([`settle_input`]). The reports the terminal sends unasked (a resize's DEC
+//! 2048 report) are input and wait for the guard. With no input after a size
+//! change, the guard sends its record by itself 50 ms later: a program of the
+//! runtime waits for one more record before it can act on the resize.
+//! (5) conhost hands that runtime a character beyond U+FFFF typed as text
+//! without its high surrogate, so it is sent as records.
+//! (6) A full-screen app that dies on the alternate screen leaves OpenConsole on
+//! it; a second console client leaves it ([`resync_alt_screen`]).
 
 mod cmdline;
+mod console_guard;
 mod ffi;
 mod openconsole;
+mod outside_job;
 mod resize_guard;
 mod shell;
 mod winpath;
+
+// The front door's first call: `aterm.exe` started as one of a tab's console
+// clients (the resize guard's record, the alternate-screen leave) does its one
+// write and exits (`console_guard`).
+pub use console_guard::serve_console_client;
+// The image those clients run from, named by this crate's Windows tests, whose
+// binaries have no `aterm.exe` beside them.
+#[cfg(any(test, debug_assertions))]
+pub use console_guard::set_console_client;
 
 // The console host a pseudoconsole runs in (conhost or OpenConsole): the
 // window states aterm.toml's `conpty` choice, `aterm doctor` and
 // `show-config` report the host a new tab gets, and the frontend keys the
 // workarounds that differ between the two hosts on a session's kind.
 pub use openconsole::{
-    console_host_report, probe_console_host, set_console_host, take_console_host_fallback,
+    console_host_report, preview_console_host, probe_console_host, set_console_host,
+    take_console_host_fallback,
 };
 // Published so config validation can ask the REAL resolver how a `shell` value
 // would resolve, rather than modelling it (see `ShellResolution`), and so
@@ -71,15 +96,16 @@ pub use shell::{ShellOrigin, ShellResolution, classify_shell_name, select_shell_
 use std::collections::HashMap;
 use std::ffi::{OsStr, c_void};
 use std::io;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use aterm_types::MutexExt;
 
 use crate::console_host::policy::OpenConsoleExe;
+use crate::input_release;
 use crate::{ConsoleHostKind, SpawnedShell};
 use cmdline::{build_command_line, build_env_block, wide_nul};
-use resize_guard::ResizeGuard;
+use resize_guard::{ResizeGuard, Writer};
 
 /// One live ConPTY session: the real HANDLEs behind an opaque `i32` master key.
 /// HANDLEs are stored as `isize` (plain integers, not pointers) so the map is
@@ -152,8 +178,15 @@ struct WinSession {
     /// Per-session Job Object (KILL_ON_JOB_CLOSE): last-handle close sweeps any
     /// orphaned descendant tree — slightly stronger than SIGHUP-to-pgid (a
     /// double-forked daemon survives SIGHUP but not the job); accepted and
-    /// documented. Children spawned with CREATE_BREAKAWAY escape it.
+    /// documented. Children spawned with CREATE_BREAKAWAY escape it, and so do
+    /// the programs a packaged shell (pwsh from the Store) starts; those still
+    /// below the shell are ended at the close ([`outside_job`]).
     job: isize,
+    /// Whether [`outside_job::end_once`] has run for this session: the first
+    /// of a close, the shell's own exit and a quit ends the programs outside
+    /// the job, and the rest find it done, or wait the few milliseconds until it
+    /// is (held across the sweep, so a quit never exits in the middle of one).
+    outside_job_ended: Mutex<bool>,
     /// Manual-reset event; [`hangup`] signals it and the waiter thread closes
     /// the pseudoconsole (the console-close analog of SIGHUP).
     close_evt: isize,
@@ -164,6 +197,9 @@ struct WinSession {
     /// The inert record the first writes after a resize lead with, and the
     /// state that decides when it may be written ([`resize_guard`]).
     resize_guard: ResizeGuard,
+    /// Set by [`release_input_writes`]: the session's input is severed, every
+    /// input write in flight was cancelled, and every later one writes nothing.
+    input_severed: AtomicBool,
 }
 
 impl Drop for WinSession {
@@ -367,6 +403,14 @@ fn waiter(s: &WinSession) {
     // SAFETY: both handles are owned by the session entry, which the calling
     // thread keeps alive via its Arc for the whole wait.
     let r = unsafe { ffi::WaitForMultipleObjects(2, handles.as_ptr(), 0, ffi::INFINITE) };
+    // The programs the tab runs outside its job end with it, looked for while
+    // the pseudoconsole is still open: a program sharing the tab's console
+    // still links the shell to what it started (`outside_job`). A close
+    // request found them already (`hangup`, `close_master`); this is the
+    // shell's own exit.
+    if r == ffi::WAIT_OBJECT_0 || r == ffi::WAIT_OBJECT_0 + 1 {
+        outside_job::end_once(s);
+    }
     if r == ffi::WAIT_OBJECT_0 + 1 {
         // Hangup/close requested: close the pseudoconsole. The child console
         // session receives the console-close signal (CTRL_CLOSE_EVENT) — the moral
@@ -525,13 +569,20 @@ enum Pseudoconsole {
 /// inbox host — with its pipes. An OpenConsole that cannot be launched is
 /// noted for the log and the inbox host serves this tab on FRESH pipes, so a
 /// tab always opens (one that launches but never speaks is caught after the
-/// shell starts, by the spawn's step (9b)).
+/// shell starts, by the spawn's step (9b)). A GUI-subsystem `program`
+/// (`aterm -e explorer .`, a `pythonw`) gets the inbox host, as every tab did
+/// before OpenConsole, and nothing is noted: it never connects to its console,
+/// so an OpenConsole could never show it works, and the program is no tab's
+/// shell to keep.
 fn create_pseudoconsole(
     size: ffi::COORD,
     program: &OsStr,
     allow_openconsole: bool,
 ) -> io::Result<(Pseudoconsole, Pipes)> {
-    if let Some(exe) = openconsole::host_for_spawn(program).filter(|_| allow_openconsole) {
+    let wanted = |_: &OpenConsoleExe| {
+        allow_openconsole && !openconsole::is_gui_image(std::path::Path::new(program))
+    };
+    if let Some(exe) = openconsole::host_for_spawn(program).filter(wanted) {
         let pipes = Pipes::new()?;
         match openconsole::launch(&exe, size, &pipes) {
             Ok(host) => return Ok((Pseudoconsole::OpenConsole { host, exe }, pipes)),
@@ -992,6 +1043,12 @@ fn spawn_on_host(req: SpawnRequest<'_>, allow_openconsole: bool) -> io::Result<S
     // SAFETY: zeroed extended-limit info is valid; only LimitFlags is set.
     let mut info: ffi::JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
     info.BasicLimitInformation.LimitFlags = ffi::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // `outside_job`'s tests: a tab whose programs leave its job, as a packaged
+    // shell's do.
+    #[cfg(test)]
+    if outside_job::JOB_LETS_GO.with(std::cell::Cell::get) {
+        info.BasicLimitInformation.LimitFlags |= outside_job::JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+    }
     // SAFETY: valid job handle + fully-initialized info struct of the stated size.
     let set = unsafe {
         ffi::SetInformationJobObject(
@@ -1035,22 +1092,40 @@ fn spawn_on_host(req: SpawnRequest<'_>, allow_openconsole: bool) -> io::Result<S
     drop(h_thread); // done with the thread handle
     // (9b) An OpenConsole proves itself only once its first client connects:
     // it must answer the shell's connect with its first output. Until that
-    // output the shell is held inside its console connect and has run nothing
-    // of its own (`openconsole::await_started` has the snapshot's record), so a host
-    // that fails here is dropped, the shell's job with it, and the spawn is
-    // made again on the inbox host — the tab always opens.
-    let health = match &pcon {
-        Pseudoconsole::Inbox { .. } => Ok(()),
+    // output a console-subsystem shell is held inside its console connect and
+    // has run nothing of its own (`openconsole::await_started` has the
+    // snapshot's record), so a host that fails here is dropped, the shell's job
+    // with it, and the spawn is made again on the inbox host — the tab always
+    // opens. A host that exited or wrote no VT is kept from later tabs; one that
+    // only stayed silent costs this tab, until it has done so three times in a
+    // row. A program that never connects (a GUI image that slipped past
+    // `create_pseudoconsole`'s check, e.g. through an app execution alias) or
+    // exited before it did is no failure of the host's: it has run its own
+    // code, so it is neither ended nor run again, and the session goes on in
+    // this host for the waiter to report its exit.
+    let failed = match &pcon {
+        Pseudoconsole::Inbox { .. } => None,
         Pseudoconsole::OpenConsole { host, exe } => {
-            openconsole::await_started(host, out_read.raw()).map_err(|why| (exe.clone(), why))
+            match openconsole::await_started(host, h_process.raw(), out_read.raw()) {
+                openconsole::Health::Started => {
+                    openconsole::note_started(exe);
+                    None
+                }
+                openconsole::Health::NoClient => None,
+                openconsole::Health::Failed { why, sticky } => Some((exe.clone(), why, sticky)),
+            }
         }
     };
-    if let Err((exe, why)) = health {
+    if let Some((exe, why, sticky)) = failed {
         // SAFETY: the job we just created; it kills the held shell.
         unsafe { ffi::TerminateJobObject(job.raw(), 126) };
         // Every handle of the failed attempt goes before the retry makes its own.
         drop((pcon, attr, job, h_process, close_evt, in_write, out_read));
-        openconsole::note_launch_failure(&exe, &why);
+        if sticky {
+            openconsole::note_launch_failure(&exe, &why);
+        } else {
+            openconsole::note_silent_start(&exe, &why);
+        }
         return spawn_on_host(req, false);
     }
     // Windows pids are small multiples of 4 in practice; a DWORD above i32::MAX
@@ -1079,13 +1154,15 @@ fn spawn_on_host(req: SpawnRequest<'_>, allow_openconsole: bool) -> io::Result<S
         process: h_process.into_raw(),
         conhost,
         job: job.into_raw(),
+        outside_job_ended: Mutex::new(false),
         close_evt: close_evt.into_raw(),
         pid: pi.dwProcessId,
         exit_code: Mutex::new(None),
         resize_guard: {
             let size = coord(cols, rows);
-            ResizeGuard::new(Some((size.y, size.x)))
+            ResizeGuard::new(Some((size.y, size.x)), host)
         },
+        input_severed: AtomicBool::new(false),
     });
     let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
     SESSIONS.lock_or_recover().insert(key, Arc::clone(&session));
@@ -1241,12 +1318,16 @@ pub fn adopt_handoff(
         // client belongs to whoever launched it; see `waiter`'s `s.job != 0`
         // guard for why there is deliberately no kill escalation here.
         job: 0,
+        // Nor are the programs it runs ours to end (`outside_job::end` takes
+        // nothing without a job).
+        outside_job_ended: Mutex::new(false),
         close_evt,
         pid,
         exit_code: Mutex::new(None),
         // conhost sized this pseudoconsole before the handoff and did not say
         // to what, so the first resize counts as a change.
-        resize_guard: ResizeGuard::new(None),
+        resize_guard: ResizeGuard::new(None, ConsoleHostKind::Inbox),
+        input_severed: AtomicBool::new(false),
     });
     let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
     SESSIONS.lock_or_recover().insert(key, Arc::clone(&session));
@@ -1306,8 +1387,11 @@ fn paths_eq_ignore_ascii_case(a: &std::path::Path, b: &std::path::Path) -> bool 
 /// thread runs `ClosePseudoConsole` — the child console session receives the
 /// console-close signal (CTRL_CLOSE_EVENT), the moral equivalent of
 /// SIGHUP-on-controlling-tty, and exits; the broken out pipe then EOFs the
-/// reader. O(1) and non-blocking (the actual close runs on the waiter thread),
-/// so it is UI-thread-safe exactly like the Unix `killpg(SIGHUP)`. Best-effort
+/// reader. First it ends the programs below the shell that the session's job
+/// does not hold ([`outside_job`]), which no close of the job reaches: one
+/// process snapshot, a few milliseconds, once per session. Otherwise
+/// non-blocking (the close itself runs on the waiter thread), so it is
+/// UI-thread-safe like the Unix `killpg(SIGHUP)`. Best-effort
 /// no-op for a non-positive/unknown pid (the ESRCH contract) — and for an
 /// AMBIGUOUS one: see [`session_by_pid`], which refuses a pid two live sessions
 /// claim rather than hang up an arbitrary one of them.
@@ -1316,8 +1400,25 @@ pub fn hangup(pid: i32) {
         return;
     }
     if let Some(s) = session_by_pid(pid) {
+        // On the caller's thread, while the shell still runs: a quit can follow
+        // a tab's close within milliseconds and exit before the waiter wakes,
+        // and the kernel's close of the job reaches only what the job holds.
+        outside_job::end_once(&s);
         // SAFETY: event handle owned by the session Arc we hold.
         unsafe { ffi::SetEvent(s.close_evt) };
+    }
+}
+
+/// End, in every open session, the programs below its shell that its job does
+/// not hold ([`outside_job`]: what a Store pwsh starts): the quit's half of a
+/// tab's close. A quit closes no session one by one: the process exits, and
+/// the kernel's close of each job ends only what that job holds. Synchronous;
+/// a few milliseconds per session (one process snapshot). Nothing for an
+/// adopted session, and nothing twice for a session a close already took.
+pub fn end_programs_outside_jobs() {
+    let open: Vec<Arc<WinSession>> = SESSIONS.lock_or_recover().values().cloned().collect();
+    for s in &open {
+        outside_job::end_once(s);
     }
 }
 
@@ -1461,6 +1562,9 @@ pub fn collect_exit_status(pid: i32) -> Option<crate::ChildExit> {
 pub fn close_master(master: i32) {
     let removed = SESSIONS.lock_or_recover().remove(&master);
     if let Some(s) = removed {
+        // The programs outside the job, as [`hangup`] ends them (nothing when
+        // it already did, or when the shell's own exit did).
+        outside_job::end_once(&s);
         // SAFETY: event/pipe handles owned by the Arc we still hold.
         unsafe {
             ffi::SetEvent(s.close_evt);
@@ -1513,10 +1617,15 @@ pub fn read(master: i32, buf: &mut [u8]) -> isize {
     let Some(s) = session(master) else {
         return -1;
     };
+    read_session(&s, buf)
+}
+
+/// [`read`] on a session already looked up.
+fn read_session(s: &WinSession, buf: &mut [u8]) -> isize {
     let mut n: u32 = 0;
     let want = u32::try_from(buf.len()).unwrap_or(u32::MAX);
     // SAFETY: `buf` is a valid writable slice of >= `want` bytes; the output
-    // handle stays open for the call because we hold the session Arc.
+    // handle stays open for the call because the caller holds the session Arc.
     let ok = unsafe {
         ffi::ReadFile(
             s.output,
@@ -1580,6 +1689,48 @@ pub fn read_or_wake(master: i32, buf: &mut [u8], _wake_rd: i32, _exit_rd: i32) -
 /// reads aren't capped at the macOS ~1 KiB tty outq, so the per-chunk lockstep
 /// the unix drain bridges does not exist here.
 pub fn drain_more(_master: i32, _buf: &mut [u8], filled: usize) -> usize {
+    filled
+}
+
+/// Top `buf[filled..]` up with ConPTY output that is already waiting in the
+/// pipe, never blocking: `PeekNamedPipe` says how much is there, and each
+/// `ReadFile` asks for no more than that. Returns the new fill. A closed
+/// session, a broken pipe or an empty one ends the top-up; the next blocking
+/// [`read`] reports an end.
+///
+/// The reader's gather while its session's output is held (aterm-gui's
+/// `spawn::gather_held_output`): a program that writes a line per call hands
+/// the blocking read one line at a time, and what piled up behind it is
+/// collected here into one batch.
+pub fn drain_available(master: i32, buf: &mut [u8], mut filled: usize) -> usize {
+    let Some(s) = session(master) else {
+        return filled;
+    };
+    while filled < buf.len() {
+        let mut avail: u32 = 0;
+        // SAFETY: a peek of the session's own live output pipe end (the Arc
+        // keeps it open) that reads no bytes: a null buffer of size 0 and a
+        // valid out-param for the count waiting.
+        let peeked = unsafe {
+            ffi::PeekNamedPipe(
+                s.output,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut avail,
+                std::ptr::null_mut(),
+            )
+        };
+        if peeked == 0 || avail == 0 {
+            break;
+        }
+        let want = (avail as usize).min(buf.len() - filled);
+        let n = read_session(&s, &mut buf[filled..filled + want]);
+        if n <= 0 {
+            break;
+        }
+        filled += n as usize;
+    }
     filled
 }
 
@@ -1661,11 +1812,80 @@ pub fn write_all(master: i32, bytes: &[u8]) {
     };
     let mut data = bytes;
     while !data.is_empty() {
-        match s.resize_guard.write_with(data, |b| write_input(&s, b)) {
+        match guarded_write(&s, data, None) {
             Ok(written) if written > 0 => data = &data[written..],
             _ => break,
         }
     }
+}
+
+thread_local! {
+    /// Set while this thread writes inside [`as_reply`].
+    static REPLYING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `write` as the terminal's own ANSWER to a query its program or console
+/// host sent (DA, DSR/CPR, a colour or mode query): every write it makes on
+/// this thread to a session's input passes that session's [`resize_guard`],
+/// which stays owed to the next input. OpenConsole holds its API thread for
+/// the answer to its own `ESC[6n` after a resize, and the guard's client
+/// cannot connect while it does, so a guarded answer stalled the tab 500 ms
+/// and, during a window drag, reached Git Bash as typed text (`resize_guard`,
+/// REPLIES). Returns what `write` returns; the mark is lifted however
+/// `write` ends, and a nested call keeps it until the outer one returns.
+pub fn as_reply<T>(write: impl FnOnce() -> T) -> T {
+    /// Puts the mark back as it was, on return or unwind.
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REPLYING.with(|r| r.set(self.0));
+        }
+    }
+    let _restore = Restore(REPLYING.with(|r| r.replace(true)));
+    write()
+}
+
+/// Settle `master`'s [`resize_guard`] for the INPUT write its caller is about
+/// to make: when the session owes the guard's OpenConsole client, run it now
+/// and return once its record is in ([`console_guard::guard`]). A writer that
+/// serializes its frames under a lock of its own (aterm-session's sink, whose
+/// frame lock the terminal's answers take too) calls this before it takes that
+/// lock: the client cannot connect while OpenConsole waits for the answer to
+/// its own cursor query after a resize, so a client run under that lock held
+/// the answer back until the host gave up on it (`resize_guard`, REPLIES).
+/// An input write that comes while the client runs waits for it here. Inside
+/// [`as_reply`], and for a key no live session has, it does nothing; a write
+/// made without it settles in [`write_some`] all the same.
+pub fn settle_input(master: i32) {
+    if REPLYING.with(std::cell::Cell::get) {
+        return;
+    }
+    let Some(s) = session(master) else {
+        return;
+    };
+    s.resize_guard.settle(Writer::Input, |rows, cols| {
+        console_guard::guard(&s, rows, cols);
+    });
+}
+
+/// One write of `bytes` through the session's [`resize_guard`], with the
+/// guard's OpenConsole client ([`console_guard::guard`]) when one is owed and
+/// the probe of the tab for the MSYS2 runtime its astral rewrite asks; inside
+/// [`as_reply`], as a reply that passes the guard. `stop` is the stop flag of
+/// the frame the write belongs to ([`write_some_stoppable`]).
+fn guarded_write(s: &WinSession, bytes: &[u8], stop: Option<&AtomicBool>) -> io::Result<usize> {
+    let writer = if REPLYING.with(std::cell::Cell::get) {
+        Writer::Reply
+    } else {
+        Writer::Input
+    };
+    s.resize_guard.write_with_client(
+        bytes,
+        writer,
+        |b| write_input(s, b, stop),
+        |rows, cols| console_guard::guard(s, rows, cols),
+        || console_guard::runtime_in_tab(s),
+    )
 }
 
 /// Write `bytes` with a single `WriteFile`, returning the count the kernel
@@ -1678,6 +1898,24 @@ pub fn write_all(master: i32, bytes: &[u8]) {
 /// `NotFound` for a fabricated/closed key; otherwise the OS error when the
 /// pipe is gone.
 pub fn write_some(master: i32, bytes: &[u8]) -> io::Result<usize> {
+    write_some_stoppable(master, bytes, None)
+}
+
+/// [`write_some`] for one write of a frame whose stop flag is `stop` (a
+/// metered paste's `BulkMeter`, in aterm-session): a stop set before the write
+/// begins bars it, and one set while it is blocked in `WriteFile`
+/// ([`release_stopped_writes`]) cancels it. Either way it answers what it
+/// wrote, `Ok(0)` when nothing (a cancelled `WriteFile` reports nothing
+/// written). A sever of the session ([`release_input_writes`]) does the same
+/// to every write, with or without a flag.
+///
+/// # Errors
+/// Exactly those of [`write_some`].
+pub fn write_some_stoppable(
+    master: i32,
+    bytes: &[u8],
+    stop: Option<&AtomicBool>,
+) -> io::Result<usize> {
     if bytes.is_empty() {
         return Ok(0);
     }
@@ -1687,29 +1925,161 @@ pub fn write_some(master: i32, bytes: &[u8]) -> io::Result<usize> {
             "unknown PTY master key (closed or never spawned)",
         ));
     };
-    s.resize_guard.write_with(bytes, |b| write_input(&s, b))
+    guarded_write(&s, bytes, stop)
+}
+
+/// The input writes in a `WriteFile` now ([`input_release`]): a sever
+/// ([`release_input_writes`]) or a paste's stop ([`release_stopped_writes`])
+/// cancels theirs. ConPTY's input is an anonymous pipe, which has no
+/// overlapped mode to wait on, so a write to a program that has stopped
+/// reading blocks inside the call, and `CancelSynchronousIo` on the writer's
+/// thread is what reaches it there.
+static WRITERS: input_release::Registry<WriterThread> = input_release::Registry::new();
+
+/// How often, and for how long, a release tries again for a writer that was
+/// registered but not yet blocked when its cancel came ([`input_release`]).
+const RELEASE_STEP: std::time::Duration = std::time::Duration::from_millis(1);
+const RELEASE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A registered writer's own thread handle (`CancelSynchronousIo` needs a
+/// real handle with `THREAD_TERMINATE`, never the `GetCurrentThread`
+/// pseudo-handle). Open while the thread is registered: the thread owns it
+/// ([`ThisThread`]) and is inside [`input_release::Registry::write`].
+#[derive(Clone, Copy)]
+struct WriterThread(isize);
+
+impl input_release::Blocked for WriterThread {
+    fn cancel(&self) -> bool {
+        // SAFETY: the registry calls this under its lock, for a thread still
+        // registered, so the handle (closed only when that thread exits) is open.
+        unsafe { ffi::CancelSynchronousIo(self.0) != 0 }
+    }
+}
+
+/// The calling thread's own handle, duplicated once per thread from its
+/// pseudo-handle and closed when the thread exits; 0 when the duplicate failed.
+struct ThisThread(isize);
+
+impl ThisThread {
+    fn open() -> Self {
+        let mut handle: isize = 0;
+        // SAFETY: both process handles are the current-process pseudo-handle,
+        // the source is the current-thread pseudo-handle, and `handle` is a
+        // valid out-pointer.
+        let ok = unsafe {
+            ffi::DuplicateHandle(
+                ffi::GetCurrentProcess(),
+                ffi::GetCurrentThread(),
+                ffi::GetCurrentProcess(),
+                &mut handle,
+                0,
+                0,
+                ffi::DUPLICATE_SAME_ACCESS,
+            )
+        };
+        Self(if ok == 0 { 0 } else { handle })
+    }
+}
+
+impl Drop for ThisThread {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            // SAFETY: the duplicate this thread owns; nothing else closes it.
+            unsafe { ffi::CloseHandle(self.0) };
+        }
+    }
+}
+
+thread_local! {
+    static THIS_THREAD: ThisThread = ThisThread::open();
+}
+
+/// This thread as a writer a cancel can reach; `None` without a handle (a
+/// failed duplicate, or the thread's locals already torn down).
+fn this_writer() -> Option<WriterThread> {
+    THIS_THREAD
+        .try_with(|t| t.0)
+        .ok()
+        .filter(|h| *h != 0)
+        .map(WriterThread)
+}
+
+/// A session's identity in [`WRITERS`]: its address, live while any write
+/// tagged with it runs (the writer holds the session's `Arc`).
+fn session_tag(s: &WinSession) -> usize {
+    std::ptr::from_ref(s) as usize
+}
+
+/// Cancel the writes `ids` names now, and keep trying on a thread of its own
+/// for any that was registered but not yet blocked, so the caller (the UI
+/// thread's `Stop paste`, a tab's close) never waits on a writer.
+fn release_soon(mut ids: Vec<u64>) {
+    WRITERS.cancel_round(&mut ids);
+    if ids.is_empty() {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("aterm-input-release".into())
+        .spawn(move || WRITERS.release(ids, RELEASE_STEP, RELEASE_BOUND));
+    // Without the thread, the writer still sees its flag at its next write.
+    drop(spawned);
+}
+
+/// Sever `master`'s input for good (aterm-session's `SinkWriter::sever_input`,
+/// at a tab's close): every input write blocked in `WriteFile` is cancelled and
+/// answers what it wrote, and every later input write on the session writes
+/// nothing. Without it, a writer blocked writing to a program that stopped
+/// reading stayed blocked until the program read again, holding the session.
+/// Idempotent; an unknown key does nothing.
+pub fn release_input_writes(master: i32) {
+    let Some(s) = session(master) else {
+        return;
+    };
+    release_soon(WRITERS.sever(session_tag(&s), &s.input_severed));
+}
+
+/// Release the input writes of the frame whose stop flag is `stop`, which the
+/// caller has just set (aterm-session's `BulkMeter::request_stop`): a write of
+/// the frame blocked in `WriteFile` is cancelled and answers what it wrote, and
+/// one that begins after it writes nothing ([`write_some_stoppable`]).
+pub fn release_stopped_writes(stop: &AtomicBool) {
+    release_soon(WRITERS.stopped(stop));
 }
 
 /// One `WriteFile` of `bytes` to the session's input pipe: the count the
-/// kernel accepted, or the OS error.
-fn write_input(s: &WinSession, bytes: &[u8]) -> io::Result<usize> {
-    let mut written: u32 = 0;
-    let want = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-    // SAFETY: `bytes` is a valid slice of >= `want` bytes; the input handle
-    // stays open for the call because the caller holds the session Arc.
-    let ok = unsafe {
-        ffi::WriteFile(
-            s.input,
-            bytes.as_ptr(),
-            want,
-            &mut written,
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(written as usize)
+/// kernel accepted, or the OS error. Made through [`WRITERS`], so a sever or
+/// `stop` releases it ([`write_some_stoppable`]); a released write answers the
+/// count `WriteFile` gave back.
+fn write_input(s: &WinSession, bytes: &[u8], stop: Option<&AtomicBool>) -> io::Result<usize> {
+    WRITERS.write(
+        session_tag(s),
+        &s.input_severed,
+        stop,
+        this_writer(),
+        || {
+            let mut written: u32 = 0;
+            let want = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+            // SAFETY: `bytes` is a valid slice of >= `want` bytes; the input handle
+            // stays open for the call because the caller holds the session Arc.
+            let ok = unsafe {
+                ffi::WriteFile(
+                    s.input,
+                    bytes.as_ptr(),
+                    want,
+                    &mut written,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(ffi::ERROR_OPERATION_ABORTED) {
+                    return Ok(written as usize);
+                }
+                return Err(error);
+            }
+            Ok(written as usize)
+        },
+    )
 }
 
 /// [`write_some`] twin of the Unix blocking-emulation wrapper. A ConPTY input
@@ -1822,11 +2192,38 @@ pub fn size(_master: i32) -> Option<(u16, u16)> {
 /// same place in the stream, and the two stay in step. Returns once the client
 /// has been started; the switch arrives on the session's output.
 ///
+/// The client is `aterm.exe --conpty-leave-alt-screen` ([`console_guard`]),
+/// which writes to the console's screen and nothing else: the console's input
+/// mode is shared by every client of the tab, and the program the user still
+/// runs there (an ssh session, wsl.exe, PSReadLine) set it. `cmd.exe /c set
+/// /p`, the first client, turned processed, line and echo input back
+/// on as it started (a raw 0x288 read 0x28f after it), so Ctrl+C at an ssh
+/// prompt became a CTRL_C_EVENT that ended ssh.
+///
 /// # Errors
 /// `NotFound` for a key no live session has; `Unsupported` for an inbox
 /// session (its host repaints over the terminal instead — the frontend keeps
-/// its own recovery there); the OS error when the client cannot be started.
+/// its own recovery there) and for a process with no `aterm.exe` beside it to
+/// run the client (the screen then stays up on both sides, in step); the OS
+/// error when the client cannot be started.
 pub fn resync_alt_screen(master: i32) -> io::Result<()> {
+    resync_alt_screen_with(master, None)
+}
+
+/// [`resync_alt_screen`], and after the switch the client writes `carry` (the
+/// prompt the shell drew on the dead buffer, aterm-core's
+/// `Terminal::dead_alt_screen_carry`) when the host's cursor is still `cursor`
+/// (0-based row and column) and the shell reads raw; otherwise the plain leave.
+/// One write, so the shell's line editor, anchored where it drew its prompt,
+/// finds that prompt where it left it on the primary screen.
+///
+/// # Errors
+/// As [`resync_alt_screen`].
+pub fn resync_alt_screen_carrying(master: i32, cursor: (u16, u16), carry: &str) -> io::Result<()> {
+    resync_alt_screen_with(master, Some((cursor, carry)))
+}
+
+fn resync_alt_screen_with(master: i32, carry: Option<((u16, u16), &str)>) -> io::Result<()> {
     let Some(s) = session(master) else {
         return Err(io::Error::new(io::ErrorKind::NotFound, "no such session"));
     };
@@ -1836,6 +2233,12 @@ pub fn resync_alt_screen(master: i32) -> io::Result<()> {
             "the session's console host repaints over the terminal; nothing to resync",
         ));
     }
+    let Some(mut command) = console_guard::leave_alt_screen_command(carry) else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no aterm.exe beside this program to run the console host's leave",
+        ));
+    };
     // Held across the client's CreateProcessW: the close path swaps the signal
     // (then the reference) to 0 under these locks, so the slots stay open for
     // as long as kernelbase reads them.
@@ -1848,7 +2251,6 @@ pub fn resync_alt_screen(master: i32) -> io::Result<()> {
         ));
     }
     let mut slots = [*signal, *reference, s.conhost];
-    let mut command = openconsole::system_command("cmd.exe", "/d /c <nul set /p =\u{1b}[?1049l");
     openconsole::start_client(&mut slots, &mut command).map(drop)
 }
 
@@ -1874,8 +2276,10 @@ pub fn resize_with_cell_px(master: i32, rows: u16, cols: u16, _cell_px: Option<(
     if *g != 0 {
         // SAFETY: the HPCON is live while the lock is held (the waiter swaps it
         // to 0 under this same lock before closing).
-        if unsafe { ffi::ResizePseudoConsole(*g, size) } >= 0 {
-            s.resize_guard.note_resize(size.y, size.x);
+        if unsafe { ffi::ResizePseudoConsole(*g, size) } >= 0
+            && let Some(arming) = s.resize_guard.note_resize(size.y, size.x)
+        {
+            schedule_nudge(master, arming);
         }
         return;
     }
@@ -1904,10 +2308,43 @@ pub fn resize_with_cell_px(master: i32, rows: u16, cols: u16, _cell_px: Option<(
                 std::ptr::null_mut(),
             )
         };
-        if sent != 0 {
-            s.resize_guard.note_resize(size.y, size.x);
+        if sent != 0
+            && let Some(arming) = s.resize_guard.note_resize(size.y, size.x)
+        {
+            schedule_nudge(master, arming);
         }
     }
+}
+
+/// How long after a size change the [`resize_guard`]'s record waits for an
+/// input write to carry it before it goes by itself (`resize_guard`, THE
+/// STALL): long enough for the console host to have queued the size event
+/// behind which the record must land, and for an input that follows at once
+/// (a key, the in-band size report a full-screen program asked for) to carry
+/// it the usual way.
+const NUDGE_AFTER: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Have the guard nudge for `arming` ([`resize_guard::ResizeGuard::nudge`])
+/// [`NUDGE_AFTER`] from now, on a thread of its own: the call runs on the
+/// resizing thread (the UI's), and a nudge may write to the input pipe or wait
+/// for the OpenConsole client. A newer size change makes it a no-op. A thread
+/// that cannot be started leaves the record to the next input, as before.
+fn schedule_nudge(master: i32, arming: u64) {
+    let _ = std::thread::Builder::new()
+        .name("aterm-conpty-nudge".into())
+        .spawn(move || {
+            std::thread::sleep(NUDGE_AFTER);
+            let Some(s) = session(master) else {
+                return;
+            };
+            // A failed write leaves the record owed to the next input.
+            let _ = s.resize_guard.nudge(
+                arming,
+                || console_guard::runtime_in_tab(&s),
+                |rows, cols| console_guard::guard(&s, rows, cols),
+                |b| write_input(&s, b, None),
+            );
+        });
 }
 
 /// Focus-linked QoS boost — the Windows Terminal lesson, public-API edition.
@@ -2165,6 +2602,10 @@ mod tests {
             let exe = std::env::var_os("SystemRoot")
                 .map(|r| std::path::Path::new(&r).join("System32").join("sort.exe"))
                 .unwrap_or_else(|| std::path::PathBuf::from("sort.exe"));
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "aterm-pty links no aterm-uds on Windows (it calls kernel32 itself); System32's sort.exe as a windowless test client"
+            )]
             let child = std::process::Command::new(exe)
                 .stdin(std::process::Stdio::piped()) // held open ⇒ it blocks
                 .stdout(std::process::Stdio::null())
@@ -2284,6 +2725,12 @@ mod tests {
     /// as `Vk/KeyDown` joined by `;`, up to and including a `q` key-down.
     /// Windows PowerShell because it ships with every Windows this seam runs on.
     fn keys_read_through_conpty(drive: impl FnOnce(i32)) -> String {
+        keys_read_through_conpty_after("", drive)
+    }
+
+    /// [`keys_read_through_conpty`], the reader first running `prelude` (a
+    /// PowerShell statement list) in the tab.
+    fn keys_read_through_conpty_after(prelude: &str, drive: impl FnOnce(i32)) -> String {
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
@@ -2291,11 +2738,13 @@ mod tests {
         let authority = unsafe { aterm_cap::Authority::root_authority() };
         let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
         let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
-        let script = "$ui = $Host.UI.RawUI; [Console]::Out.Write('READY'); $keys = @(); \
-                      do { $k = $ui.ReadKey('NoEcho,IncludeKeyDown,IncludeKeyUp'); \
-                      $keys += ('{0}/{1}' -f $k.VirtualKeyCode, $k.KeyDown) } \
-                      until ($k.VirtualKeyCode -eq 81 -and $k.KeyDown); \
-                      [Console]::Out.Write('KEYS ' + ($keys -join ';') + ' END')";
+        let script = format!(
+            "{prelude}$ui = $Host.UI.RawUI; [Console]::Out.Write('READY'); $keys = @(); \
+             do {{ $k = $ui.ReadKey('NoEcho,IncludeKeyDown,IncludeKeyUp'); \
+             $keys += ('{{0}}/{{1}}' -f $k.VirtualKeyCode, $k.KeyDown) }} \
+             until ($k.VirtualKeyCode -eq 81 -and $k.KeyDown); \
+             [Console]::Out.Write('KEYS ' + ($keys -join ';') + ' END')"
+        );
         let shell = spawn_shell_with_pid(
             24,
             80,
@@ -2403,6 +2852,47 @@ mod tests {
         );
     }
 
+    // REPLIES, end to end: a write inside `as_reply` after a size change (here
+    // a plain `x` standing in for an answer, which conhost would otherwise
+    // take for itself) reaches the reader with no record before it, and the
+    // guard is still owed: the next input write, `q`, carries it.
+    #[test]
+    fn a_reply_after_a_resize_passes_the_guard_and_the_next_input_carries_it() {
+        let keys = keys_read_through_conpty(|master| {
+            write_all(master, b"a");
+            resize(master, 25, 80);
+            as_reply(|| write_all(master, b"x"));
+            write_all(master, b"q");
+        });
+        assert_eq!(
+            keys, "65/True;65/False;88/True;88/False;16/False;81/True",
+            "the reply `x` arrives as written; the Shift key-up rides the next input"
+        );
+    }
+
+    // The reply mark covers exactly the closure: set inside it, kept by a
+    // nested call until the outer one returns, and lifted however the closure
+    // ends, a panic included, so a reply writer that unwinds cannot leave
+    // its thread's later input unguarded.
+    #[test]
+    fn the_reply_mark_covers_the_closure_and_no_more() {
+        let marked = || REPLYING.with(std::cell::Cell::get);
+        assert!(!marked());
+        assert_eq!(
+            as_reply(|| {
+                let inner = as_reply(marked);
+                (inner, marked())
+            }),
+            (true, true)
+        );
+        assert!(!marked());
+        let unwound = std::panic::catch_unwind(|| as_reply(|| panic!("a reply writer unwinds")));
+        assert!(unwound.is_err());
+        assert!(!marked(), "lifted on unwind");
+        let other = as_reply(|| std::thread::spawn(marked).join().expect("thread"));
+        assert!(!other, "another thread's writes stay input");
+    }
+
     // THE SWITCH, end to end: once the guard's record has gone to conhost, its
     // parser holds a read that ends in a lone ESC (measured: the ESC then
     // joined the next key as Alt+Q), so a raw lone ESC written after it must
@@ -2422,6 +2912,81 @@ mod tests {
             keys, "65/True;65/False;16/False;88/True;88/False;16/False;27/True;27/False;81/True",
             "after the switch a lone ESC is Escape (27), not held into Alt+Q"
         );
+    }
+
+    /// A stand-in for a program of the MSYS2 runtime, which the tab probe
+    /// recognises by its DLL: a copy of cmd.exe beside an `msys-2.0.dll`,
+    /// under a folder of its own named for `what`. Returns the folder (for the
+    /// test to remove) and a PowerShell prelude that leaves it idling in the
+    /// tab for a minute.
+    fn runtime_standin(what: &str) -> (std::path::PathBuf, String) {
+        let root = std::env::temp_dir().join(format!("aterm-{what}-{}", std::process::id()));
+        let bin = root.join("usr").join("bin");
+        std::fs::create_dir_all(&bin).expect("stand-in dir");
+        let system = std::env::var_os("SystemRoot").expect("SystemRoot");
+        let cmd = std::path::Path::new(&system)
+            .join("System32")
+            .join("cmd.exe");
+        std::fs::copy(&cmd, bin.join("cmd.exe")).expect("copy cmd.exe");
+        std::fs::write(bin.join("msys-2.0.dll"), b"").expect("stand-in runtime");
+        let prelude = format!(
+            "Start-Process -NoNewWindow -FilePath '{}' -ArgumentList '/d /c ping -n 60 127.0.0.1 >nul'; ",
+            bin.join("cmd.exe").display()
+        );
+        (root, prelude)
+    }
+
+    // THE STALL, end to end: in a tab with a program of the MSYS2 runtime, a
+    // size change that no input follows still gets the guard's record, by
+    // itself, once conhost has had time to queue the size event: the reader
+    // gets a Shift key-up that nobody typed, and the next input carries the
+    // second record the resize owes. Without it the runtime that dropped the
+    // record after the size event waited for the next key, and vim redrew only
+    // when one came.
+    #[test]
+    fn a_resize_no_input_follows_sends_the_record_by_itself() {
+        use std::time::{Duration, Instant};
+        let (root, prelude) = runtime_standin("nudge");
+        let keys = keys_read_through_conpty_after(&prelude, |master| {
+            write_all(master, b"a");
+            resize(master, 25, 80);
+            let s = session(master).expect("the live session");
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while s.resize_guard.records_owed() == 2 {
+                assert!(Instant::now() < deadline, "no record went by itself");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            write_all(master, b"q");
+        });
+        assert_eq!(
+            keys, "65/True;65/False;16/False;16/False;81/True",
+            "one Shift key-up by itself, then `q` behind the second"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ASTRAL CHARACTERS, end to end: in a tab with a program of the MSYS2
+    // runtime in its job, an emoji written as UTF-8 reaches the reader as its
+    // surrogate pair's records, both key-downs and then both key-ups with no
+    // virtual key, the layout that runtime pairs (see `resize_guard`); what
+    // conhost makes of the text by itself loses the high surrogate on the way
+    // to it. The runtime is recognised by its DLL, so a copy of cmd.exe beside
+    // an `msys-2.0.dll`, idling in the tab, stands in for one; with no such
+    // program the emoji goes as the text it is.
+    #[test]
+    fn an_astral_character_reaches_the_reader_as_its_surrogate_records() {
+        const RECORDS: &str = "0/True;0/True;0/False;0/False;81/True";
+        let (root, prelude) = runtime_standin("astral");
+        let typed = |master| {
+            write_all(master, "😀".as_bytes());
+            write_all(master, b"q");
+        };
+        let keys = keys_read_through_conpty_after(&prelude, typed);
+        assert_eq!(keys, RECORDS, "a runtime in the tab: the records");
+        let plain = keys_read_through_conpty(typed);
+        assert_ne!(plain, RECORDS, "no runtime in the tab: the text, as typed");
+        assert!(plain.ends_with("81/True"), "{plain}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // adopt_handoff must REFUSE a handoff with no client process handle rather
@@ -2647,6 +3212,83 @@ mod tests {
         close_master(sh.master);
         // SAFETY: the read end was never owned by the session.
         unsafe { ffi::CloseHandle(rd) };
+    }
+
+    /// The held gather's top-up: what a line-per-call writer left in the output
+    /// pipe comes back as one batch, a full buffer leaves the rest queued, and
+    /// an empty pipe answers at once instead of blocking like [`read`].
+    #[test]
+    fn drain_available_collects_what_the_pipe_holds_and_never_blocks() {
+        let client = TestClient::spawn();
+        let pipe = || {
+            let (mut rd, mut wr): (isize, isize) = (0, 0);
+            // SAFETY: two out-params, default attrs, a 64 KiB buffer as a
+            // session's output pipe has.
+            assert_ne!(
+                unsafe { ffi::CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 64 * 1024) },
+                0,
+                "CreatePipe must succeed"
+            );
+            (rd, wr)
+        };
+        let (out_rd, out_wr) = pipe();
+        let (sig_rd, sig_wr) = pipe();
+        // The session owns `out_rd` (its output) and `sig_wr` from here.
+        let sh = adopt_handoff(0, out_rd, sig_wr, client.open())
+            .expect("adopt_handoff must accept a real client handle");
+        let write = |bytes: &[u8]| {
+            let mut put: u32 = 0;
+            // SAFETY: our own live write end; `bytes` outlives the call.
+            let ok = unsafe {
+                ffi::WriteFile(
+                    out_wr,
+                    bytes.as_ptr(),
+                    u32::try_from(bytes.len()).expect("small"),
+                    &mut put,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert!(
+                ok != 0 && put as usize == bytes.len(),
+                "the write lands whole"
+            );
+        };
+        // Empty: answered at once. On a thread, so a blocking read would be a
+        // one-minute hang, not a hung suite.
+        let master = sh.master;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let _ = tx.send(drain_available(master, &mut buf, 5));
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(60)),
+            Ok(5),
+            "an empty pipe leaves the fill as it was, without blocking"
+        );
+        // Three writes, as a line-per-call writer makes them: one batch.
+        for line in [&b"one\r\n"[..], b"two\r\n", b"six\r\n"] {
+            write(line);
+        }
+        let mut buf = [0u8; 64];
+        buf[..2].copy_from_slice(b">>");
+        let filled = drain_available(sh.master, &mut buf, 2);
+        assert_eq!(&buf[..filled], b">>one\r\ntwo\r\nsix\r\n");
+        // A full buffer stops the top-up; the rest stays queued for the next.
+        write(&[b'x'; 100]);
+        let mut small = [0u8; 40];
+        assert_eq!(drain_available(sh.master, &mut small, 0), 40);
+        assert_eq!(drain_available(sh.master, &mut small, 0), 40);
+        assert_eq!(drain_available(sh.master, &mut small, 10), 30);
+        assert_eq!(drain_available(sh.master, &mut small, 0), 0, "drained");
+        // A closed key reads nothing.
+        close_master(sh.master);
+        assert_eq!(drain_available(sh.master, &mut small, 7), 7);
+        // SAFETY: the ends the session never owned.
+        unsafe {
+            ffi::CloseHandle(out_wr);
+            ffi::CloseHandle(sig_rd);
+        }
     }
 
     // THE DUPLICATE-PID GUARD. A pid is not a unique key over the session

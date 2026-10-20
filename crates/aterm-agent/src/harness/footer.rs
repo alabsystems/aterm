@@ -502,19 +502,32 @@ pub fn project_slug(cwd: &Path) -> String {
 /// when the slug guess misses (a vendor spelling change), a scan of the
 /// project directories for the id. `None` until the session writes one.
 pub fn transcript_path(claude_dir: &Path, entry: &SessionEntry) -> Option<PathBuf> {
+    transcript_lookup(claude_dir, entry).map(|(path, _)| path)
+}
+
+/// [`transcript_path`] and whether it is CERTAIN (session log Phase 3B, plan
+/// §2.1): the project's own `<claude dir>/projects/<slug>/<id>.jsonl`, or
+/// the one project directory holding the id ([`sole_transcript_path`]'s
+/// rule), in the same walk. The footer reads the same path either way; the
+/// session log takes an uncertain one's steps as partial (`conf=strong`, no
+/// confirmation, no retraction), so a file planted under another project's
+/// name can never confirm or retract a wall.
+pub fn transcript_lookup(claude_dir: &Path, entry: &SessionEntry) -> Option<(PathBuf, bool)> {
     #[cfg(test)]
     tests::on_transcript_lookup();
     let projects = claude_dir.join("projects");
     let file = format!("{}.jsonl", entry.session_id);
     let direct = projects.join(project_slug(&entry.cwd)).join(&file);
     if direct.is_file() {
-        return Some(direct);
+        return Some((direct, true));
     }
-    std::fs::read_dir(&projects)
+    let mut found = std::fs::read_dir(&projects)
         .ok()?
         .filter_map(Result::ok)
         .map(|dir| dir.path().join(&file))
-        .find(|candidate| candidate.is_file())
+        .filter(|candidate| candidate.is_file());
+    let first = found.next()?;
+    Some((first, found.next().is_none()))
 }
 
 /// [`transcript_path`] for a reader that must not guess between two: the
@@ -597,26 +610,41 @@ const MAX_BACK_BYTES: u64 = 16 * 1024 * 1024;
 /// first sight (e.g. after an update handoff) knows nothing of earlier pins.
 /// Process facts survive [`TailCache::clear`]; another process or a new floor
 /// starts them afresh.
+///
+/// THE SURVEY'S EXCERPTS ride the same reads ([`super::excerpt`]): every
+/// window a fresh read takes is scanned for them too, and the walk back goes
+/// on while they are undecided — to the file's start or [`MAX_BACK_BYTES`],
+/// past which an undecided one is none — and an append scans only the rows
+/// it adds, over what the carry kept. They are the conversation's, so they
+/// are not floored; the facts' walk stops where it always did, and reads
+/// nothing for them past that. [`TailCache::excerpts`] answers the last read.
 #[derive(Debug, Default)]
 pub struct TailCache {
     entry: Option<(TailKey, TailRead)>,
     #[cfg(unix)]
     carry: Option<Carry>,
     process: Option<ProcessFacts>,
+    /// The excerpts of the last read ([`TailCache::excerpts`]).
+    excerpts: Option<super::excerpt::Excerpts>,
+    /// The transcript's length as the last read found it
+    /// ([`TailCache::transcript_len`]).
+    len: Option<u64>,
     #[cfg(test)]
     reads: usize,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     appends: usize,
 }
 
 /// One read of a transcript since the floor: what it decided, whether it met
-/// a row from before the floor (the conversation was resumed), and where the
-/// Bash tool stands ([`last_cwd_since`]).
+/// a row from before the floor (the conversation was resumed), where the
+/// Bash tool stands ([`last_cwd_since`]), and the survey's excerpts of the
+/// rows read, floor or no floor ([`super::excerpt::Scan`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TailRead {
     facts: TailFacts,
     resumed: bool,
     cwd: Option<PathBuf>,
+    excerpts: super::excerpt::Scan,
 }
 
 /// What one Claude Code process last decided, whichever of its sessions said
@@ -709,7 +737,7 @@ impl TailKey {
         #[cfg(not(unix))]
         {
             let _ = (path, pid, started, since, metadata);
-            return None;
+            None
         }
         #[cfg(unix)]
         Some(Self {
@@ -758,6 +786,19 @@ impl TailCache {
         started: Option<u64>,
         since: u64,
     ) -> Option<TailRead> {
+        let read = self.read_tail_since(path, pid, started, since);
+        self.excerpts = read.as_ref().map(|read| read.excerpts.excerpts());
+        read
+    }
+
+    /// [`Self::read_since`], before its excerpts are kept.
+    fn read_tail_since(
+        &mut self,
+        path: &Path,
+        pid: u32,
+        started: Option<u64>,
+        since: u64,
+    ) -> Option<TailRead> {
         let mut file = match open_regular(path) {
             Some(file) => file,
             None => {
@@ -772,6 +813,7 @@ impl TailCache {
                 return None;
             }
         };
+        self.len = Some(before.len());
         let key = TailKey::of(path, pid, started, since, &before);
         if let Some(key) = key.as_ref()
             && let Some((old, facts)) = self.entry.as_ref()
@@ -824,6 +866,10 @@ impl TailCache {
         let mut facts = TailFacts::default();
         let mut resumed = false;
         let mut cwd = None;
+        // The facts' walk is over (a row before the floor, or both decided):
+        // the excerpts' may go on, and reads nothing more for the facts.
+        let mut facts_done = false;
+        let mut excerpts = super::excerpt::Scan::default();
         let mut hi = len;
         // The head of a row a window's start cut: completed by the next,
         // older, window — dropped when it is already longer than any row
@@ -849,20 +895,26 @@ impl TailCache {
             {
                 read_to = Some(lo + nl as u64 + 1);
             }
-            let (older, floored) = scan(&window[from..], Some(since));
-            facts = facts.over(older);
-            resumed |= floored;
-            // The newest stamped row: a window of only oversized rows
-            // has none, so older windows are searched until one does.
-            if cwd.is_none() {
-                cwd = last_cwd_since(&window[from..], Some(since));
+            if !facts_done {
+                let (older, floored) = scan(&window[from..], Some(since));
+                facts = facts.over(older);
+                resumed |= floored;
+                // The newest stamped row: a window of only oversized rows
+                // has none, so older windows are searched until one does.
+                if cwd.is_none() {
+                    cwd = last_cwd_since(&window[from..], Some(since));
+                }
+                facts_done = floored || facts.settled();
+            }
+            if !excerpts.settled() {
+                excerpts = excerpts.over(super::excerpt::Scan::of(&window[from..]));
             }
             cut = if from > MAX_LINE_BYTES {
                 Vec::new()
             } else {
                 window[..from].to_vec()
             };
-            if floored || facts.settled() || lo == 0 || len - lo >= MAX_BACK_BYTES {
+            if (facts_done && excerpts.settled()) || lo == 0 || len - lo >= MAX_BACK_BYTES {
                 break lo == 0;
             }
             hi = lo;
@@ -871,6 +923,7 @@ impl TailCache {
             facts,
             resumed,
             cwd,
+            excerpts,
         };
         #[cfg(unix)]
         if let Some(read_to) = read_to.or(from_start.then_some(0)) {
@@ -937,6 +990,10 @@ impl TailCache {
             .map_or(0, |nl| nl + 1);
         let (newer, floored) = scan(&appended[..whole], Some(since));
         let cwd = last_cwd_since(&appended[..whole], Some(since));
+        // The conversation's excerpts, floor or no floor: the appended rows
+        // over the carried ones.
+        let excerpts = super::excerpt::Scan::of(&appended[..whole])
+            .over(std::mem::take(&mut carry.facts.excerpts));
         // A row stamped before the floor in the append puts every row above
         // it — the carried ones too — before this process.
         let facts = if floored {
@@ -944,12 +1001,14 @@ impl TailCache {
                 facts: newer,
                 resumed: true,
                 cwd,
+                excerpts,
             }
         } else {
             TailRead {
                 facts: newer.over(std::mem::take(&mut carry.facts.facts)),
                 resumed: carry.facts.resumed,
                 cwd: cwd.or_else(|| carry.facts.cwd.take()),
+                excerpts,
             }
         };
         let end = g + whole;
@@ -980,10 +1039,29 @@ impl TailCache {
     /// process decided is kept; it is keyed by the process itself.
     pub fn clear(&mut self) {
         self.entry = None;
+        self.excerpts = None;
+        self.len = None;
         #[cfg(unix)]
         {
             self.carry = None;
         }
+    }
+
+    /// The survey's excerpts of the transcript the last read read
+    /// ([`super::excerpt`]); `None` when it read none (no registry entry, no
+    /// floor, no transcript yet, an unreadable file).
+    #[must_use]
+    pub fn excerpts(&self) -> Option<&super::excerpt::Excerpts> {
+        self.excerpts.as_ref()
+    }
+
+    /// How long the transcript the last read opened was, in bytes; `None`
+    /// when it opened none. It only grows while the conversation is written
+    /// to: what the window host's held deadline reads as the transcript
+    /// moving (aterm-gui's `harness_host::look_at_startups`).
+    #[must_use]
+    pub fn transcript_len(&self) -> Option<u64> {
+        self.len
     }
 
     /// What this cache keeps of the process (`pid`, `started`, `floor`).
@@ -1425,6 +1503,13 @@ pub struct FooterCache {
     wall_basis: Option<WallBasis>,
     /// Transcript bytes one read folds at most ([`FOLD_BUDGET`]).
     budget: u64,
+    /// The session log's step tap on the main transcript
+    /// ([`super::steps::StepFold`]): `None` until the glue arms it
+    /// ([`Self::set_floor`]); it outlives a moved path, which rebinds it.
+    steps: Option<super::steps::StepFold>,
+    /// Whether the last registry read's transcript path was certain
+    /// ([`transcript_lookup`]): an uncertain one's steps are partial.
+    steps_certain: bool,
 }
 
 impl Default for FooterCache {
@@ -1434,6 +1519,8 @@ impl Default for FooterCache {
             refreshed: None,
             wall_basis: None,
             budget: FOLD_BUDGET,
+            steps: None,
+            steps_certain: true,
         }
     }
 }
@@ -1471,7 +1558,7 @@ impl FooterCache {
         if let Some(usage) = self.usage.as_mut() {
             let refresh = match self.refreshed {
                 Some(last) if !usage.moved() => last,
-                _ => usage.refresh(self.budget),
+                _ => usage.refresh_tapped(self.budget, self.steps.as_mut()),
             };
             self.refreshed = Some(refresh);
             if refresh.caught_up {
@@ -1504,6 +1591,96 @@ impl FooterCache {
             ((Vec::new(), super::session_usage::More::default()), 0)
         };
         UsageFacts::of(models, wall, Some(&refresh)).map(|facts| facts.with_runtime(busy_ms))
+    }
+
+    /// ARM the step tap (session log Phase 3B, rulings S1, S23): rows of
+    /// the main transcript older than `floor_ms` (wall ms: the process's
+    /// start, `floor_of` × 1000) or at or below the log's watermark `given`
+    /// for their file are history, folded into the end and never queued.
+    /// The first call arms it, bound at once to a transcript this cache
+    /// already reads (seeded at its length now); a later call moves the
+    /// floor up and hands the watermark to the next bind.
+    pub fn set_floor(&mut self, floor_ms: u64, given: Option<super::steps::StepMark>) {
+        match self.steps.as_mut() {
+            Some(tap) => tap.set_floor(floor_ms, given),
+            None => {
+                let mut tap = super::steps::StepFold::new(floor_ms, given);
+                if let Some(usage) = self.usage.as_ref() {
+                    usage.bind_tap(&mut tap);
+                }
+                self.steps = Some(tap);
+            }
+        }
+    }
+
+    /// Everything the step tap queued since the last take, and the main
+    /// chain's end; an empty batch while it is not armed. A conversation's
+    /// first rows read before its prompt row wait one take at most for it
+    /// (the fold's opening hold, [`super::steps::StepFold::take`]). A transcript whose
+    /// path was not certain ([`transcript_lookup`]) gives partial steps
+    /// only: they add facts and overrule nothing (ruling S9).
+    pub fn take_steps(&mut self) -> super::steps::StepBatch {
+        let mut batch = self
+            .steps
+            .as_mut()
+            .map(super::steps::StepFold::take)
+            .unwrap_or_default();
+        if !self.steps_certain {
+            for step in &mut batch.steps {
+                step.state = super::steps::StepState::Partial;
+            }
+        }
+        batch
+    }
+
+    /// Whether the step tap is armed ([`Self::set_floor`]).
+    #[must_use]
+    pub fn steps_armed(&self) -> bool {
+        self.steps.is_some()
+    }
+
+    /// DISARM the step tap: what it queued and its binding go. The glue
+    /// does so when the log holds no run its steps could go to (none in
+    /// front, or a new run that bound no file), so the next
+    /// [`Self::set_floor`] arms a fresh one, bound at once — what the file
+    /// held then is history (ruling S1).
+    pub fn disarm_steps(&mut self) {
+        self.steps = None;
+    }
+
+    /// Whether the armed step tap has bound a file.
+    #[must_use]
+    pub fn steps_bound(&self) -> bool {
+        self.steps
+            .as_ref()
+            .is_some_and(super::steps::StepFold::is_bound)
+    }
+
+    /// What one registry read says of the tap ([`read_pid`]): the process's
+    /// start (`floor_ms`, wall ms: the floor only rises), the session it
+    /// named (`session`, its id) and the transcript the read found for it,
+    /// `Some((path, certain))` where it found one ([`transcript_lookup`]).
+    /// `None` tells the tap that session's file did not exist, so once a
+    /// read finds that file it is bound from its first byte; a file found
+    /// for any other session is bound at its length
+    /// ([`super::steps::StepFold::note_vacant`]).
+    pub fn note_entry(
+        &mut self,
+        floor_ms: Option<u64>,
+        session: &str,
+        found: Option<(&Path, bool)>,
+    ) {
+        if let Some(tap) = self.steps.as_mut() {
+            if let Some(floor) = floor_ms {
+                tap.raise_floor(floor);
+            }
+            let sid = aterm_hash::fnv1a_64(session.as_bytes());
+            match found {
+                Some((path, _)) => tap.note_found(sid, super::session_usage::path_fp(path)),
+                None => tap.note_vacant(sid),
+            }
+        }
+        self.steps_certain = found.is_some_and(|(_, certain)| certain);
     }
 
     /// Drop the fold and what was read from it.
@@ -2378,8 +2555,19 @@ fn facts_for_entry_from(
 /// is not plainly a name.
 #[must_use]
 pub fn launch_card(rows: &[String]) -> Option<aterm_phase::LaunchCard> {
-    live_repl_row(rows)?;
-    let card = aterm_phase::launch_card(rows)?;
+    if let Some(card) = live_repl_row(rows).and_then(|_| aterm_phase::launch_card(rows)) {
+        return Some(aterm_phase::LaunchCard {
+            model: footer_model_name(&card.model)?,
+            effort: card
+                .effort
+                .as_deref()
+                .and_then(effort_level)
+                .map(str::to_owned),
+            version: card.version,
+        });
+    }
+    let card =
+        aterm_phase::agy::launch_card(rows).or_else(|| aterm_phase::muse::launch_card(rows))?;
     Some(aterm_phase::LaunchCard {
         model: footer_model_name(&card.model)?,
         effort: card
@@ -2407,6 +2595,12 @@ impl FooterFacts {
         if out.effort.as_deref() != effort {
             out.effort = effort.map(str::to_owned);
         }
+        if out.version.is_none()
+            && let Some(card) = card
+            && !card.version.is_empty()
+        {
+            out.version = Some(card.version.clone());
+        }
         out
     }
 
@@ -2420,7 +2614,11 @@ impl FooterFacts {
         card: Option<&'a aterm_phase::LaunchCard>,
     ) -> (Option<&'a str>, Option<&'a str>) {
         let (mut model, mut effort) = (self.model.as_deref(), self.effort.as_deref());
-        if let Some(card) = card.filter(|c| self.version.as_deref() == Some(c.version.as_str())) {
+        if let Some(card) = card.filter(|c| {
+            self.version
+                .as_deref()
+                .is_none_or(|v| v == c.version.as_str())
+        }) {
             if self.model_open && model.is_none() {
                 model = Some(&card.model);
             }
@@ -2505,7 +2703,17 @@ pub fn read_pid(
     };
     let (launch, argv) = launch(&entry);
     // One lookup of the transcript for the facts and the fold alike.
-    let transcript = transcript_path(claude_dir, &entry);
+    let found = transcript_lookup(claude_dir, &entry);
+    // The step tap's floor is this process's start (ms), and its steps are
+    // partial where the path is not certain (session log Phase 3B).
+    fold.note_entry(
+        floor_of(started, &entry).map(|s| s.saturating_mul(1000)),
+        &entry.session_id,
+        found
+            .as_ref()
+            .map(|(path, certain)| (path.as_path(), *certain)),
+    );
+    let transcript = found.map(|(path, _)| path);
     let mut facts = facts_for_entry_from(
         claude_dir,
         pid,
@@ -2950,6 +3158,13 @@ pub fn rule_room(run: &std::ops::Range<usize>) -> usize {
     run.len().saturating_sub(RULE_LEAD + 1)
 }
 
+/// How many leaner forms a light's title may have between its whole and its
+/// short form ([`LightsWidth::lean`], [`TitleFit::Lean`]): Autopilot's
+/// without its trail, v1's words, its phrase with both clicks, and its phrase
+/// with the click alone (design `docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §9.2.1).
+pub const LEAN_FORMS: usize = 4;
+
 /// The widths of the lights' block (`claude_lights`): chips, whole, leaner and
 /// short titles (each including its two-cell gap), and whether the title is a
 /// reason. A title with no short form (`short` 0: the act ticker's label, `✓
@@ -2965,8 +3180,10 @@ pub struct LightsWidth {
     /// than the short form (0: no such form): Autopilot's without its trail of
     /// acts, then without its menu's line too — v1's words (design
     /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §9.2.1), so a rule where
-    /// v1's whole title fit still shows it.
-    pub lean: [usize; 2],
+    /// v1's whole title fit still shows it — then without its explanation but
+    /// with both clicks, then with the click alone, so a rule too narrow to
+    /// explain a face still says what the chip does ([`LEAN_FORMS`]).
+    pub lean: [usize; LEAN_FORMS],
     /// `what  `.
     pub short: usize,
     /// The title says why (a stopped mode return, a refusal, a switch note)
@@ -3238,6 +3455,8 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
         TitleFit::Full,
         TitleFit::Lean(0),
         TitleFit::Lean(1),
+        TitleFit::Lean(2),
+        TitleFit::Lean(3),
         TitleFit::Short,
     ]
     .into_iter()

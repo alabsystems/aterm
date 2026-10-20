@@ -16,8 +16,7 @@
 //!
 //! On `input=stalled|stopped` ([`Session::hold_for_stall`]) the loop unsets its
 //! own badge ([`Session::unset_if_ours`]), forgets the escalated box and the
-//! turn-end decision, presses nothing, mails the manager once per episode
-//! ([`frozen_mail_text`]) and journals `FROZEN …`. Any other word
+//! turn-end decision, presses nothing and journals `FROZEN …`. Any other word
 //! ([`Session::thaw`]) journals `THAWED …` and the point is decided afresh.
 //!
 //! The remedy ([`Session::stall_remedy`]): once a stall of `input=stalled` has
@@ -39,7 +38,7 @@
 //! held or suspected ([`Session::stall_suspect`], set by a refused or warned
 //! key). Every `status` the loop reads is checked ([`Session::note_status`]);
 //! while a stall is in hand ([`Session::stall_in_hand`]) nothing is pressed,
-//! typed, badged or mailed ([`Session::withhold_badge`], [`WITHHELD`]).
+//! typed or badged ([`Session::withhold_badge`], [`WITHHELD`]).
 //! A host that does not measure input ([`Caps::input`]) costs at most one extra
 //! `status` per connection.
 
@@ -64,12 +63,11 @@ pub(super) struct WorkerStall {
 }
 
 /// What one `status` read said of the worker's input: its `input=` word,
-/// the stall when that word is one, and the fields the hold and its remedy
-/// need from the same read (`fabric=`, `program=`, `human_ms=`, `hand=`).
+/// the stall when that word is one, and the fields the hold's remedy needs
+/// from the same read (`program=`, `human_ms=`, `hand=`).
 pub(super) struct StallRead {
     word: String,
     stall: Option<WorkerStall>,
-    fabric: String,
     program: Option<String>,
     /// `human_ms=`: how long ago a person gave the session input (`None`:
     /// never, or a server that does not say).
@@ -78,13 +76,11 @@ pub(super) struct StallRead {
     hand: Option<String>,
 }
 
-/// Why an ask is withheld while a stall is in hand: the mail word of an
-/// escalation whose own `status` read reported the stall
-/// ([`Session::escalate`], `mail=skipped: <this>`) — an ask to answer a point
-/// no answer can reach is not mailed; the hold's own mail tells the manager
-/// what is wrong ([`frozen_mail_text`]) — and the attention word of an ask
-/// whose badge a stall in hand kept down ([`Session::withhold_badge`],
-/// [`ATTENTION_SKIPPED`] then this: no badge, so no person's wait).
+/// Why an ask is withheld while a stall is in hand: the attention word of an
+/// ask whose badge a stall in hand kept down ([`Session::withhold_badge`],
+/// [`ATTENTION_SKIPPED`] then this: no badge, so no person's wait) — a badge
+/// asking to answer a point no answer can reach is not raised; the server's
+/// own "frozen" entry stands instead.
 pub(super) const WITHHELD: &str = "the same status says the worker is not reading its input";
 
 /// Whether a `status` reply carries a measured `input=` word. An absent field
@@ -161,7 +157,7 @@ pub(super) fn reply_line(r: &CtlReply) -> String {
     }
 }
 
-/// What the frozen mail and warning say of a stall after its word: how long
+/// What the frozen warning says of a stall after its word: how long
 /// the input has waited, then what is queued and the resident size —
 /// ` for 2m41s (1 B queued, rss 38.8 GB)`, each part only where the reply
 /// measured it.
@@ -182,54 +178,6 @@ fn stall_facts(stall: &WorkerStall) -> String {
     }
 }
 
-/// The one mail an episode posts to the manager:
-///
-/// ```text
-/// claude frozen: not reading input for 2m41s (1 B queued, rss 38.8 GB); pressing nothing until it reads again — restart it: signal term (signal kill if it survives), then claude --resume <its conversation>
-/// claude frozen: … — restart it: aterm ctl @s-1 restart pid=4242 if-stalled; aterm relaunches it on its conversation
-/// codex frozen: … — restart it: aterm ctl @s-1 restart pid=4242 if-stalled
-/// claude stopped with input queued for 41s (1 B queued); pressing nothing until it reads again — resume it: signal cont
-/// ```
-///
-/// `program` names the worker (`status program=`, else `claude`); `after` is
-/// what follows the restart ([`crate::harness::resume::AfterRestart`]): the
-/// worker's own resume line, the host's relaunch on its conversation, or
-/// nothing. Where the host carries the act (`Relaunch`, `Act`), the restart
-/// named is the explicit one ([`crate::harness::resume::restart_command`]
-/// for tab `sid`'s leader `pid`), which ends a survivor itself — and only a
-/// `Relaunch` promises the conversation; elsewhere `signal term`, with
-/// `signal kill` the fallback for a program that survives it. Never `claude
-/// --continue`, which may resume a sibling tab's conversation.
-pub(super) fn frozen_mail_text(
-    stall: &WorkerStall,
-    program: &str,
-    after: &AfterRestart,
-    sid: Option<&str>,
-    pid: Option<u32>,
-) -> String {
-    let facts = stall_facts(stall);
-    if stall.word == "stopped" {
-        return format!(
-            "{program} stopped with input queued{facts}; pressing nothing until it reads \
-             again \u{2014} resume it: signal cont"
-        );
-    }
-    let remedy = match after {
-        AfterRestart::Unknown => "signal term (signal kill if it survives)".to_string(),
-        AfterRestart::Command(line) => {
-            format!("signal term (signal kill if it survives), then {line}")
-        }
-        AfterRestart::Relaunch => {
-            format!("{}; {RELAUNCH_WORDS}", restart_command(sid, pid))
-        }
-        AfterRestart::Act => restart_command(sid, pid),
-    };
-    format!(
-        "{program} frozen: not reading input{facts}; pressing nothing until it reads \
-         again \u{2014} restart it: {remedy}"
-    )
-}
-
 /// The warning the remedy's bound takes by default, for the person where they
 /// look ([`super::IdleHost::inform`]): the state on its first line (the
 /// record's title), what to do on the second:
@@ -239,7 +187,7 @@ pub(super) fn frozen_mail_text(
 /// aterm leaves it running — `aterm ctl @s-1 restart pid=4242 if-stalled` ends it, and aterm relaunches it on its conversation
 /// ```
 ///
-/// `after` is decided as the mail's is ([`Session::after_restart`]): where
+/// `after` is decided by [`Session::after_restart`]: where
 /// the host carries the act, the explicit restart of the leader `pid`
 /// ([`crate::harness::resume::restart_command`]), with the host's relaunch
 /// ([`RELAUNCH_WORDS`]) only where that is promised; else `signal term` and
@@ -323,11 +271,9 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Before the first step of [`Self::wait_for_next`]: a stall a `status`
-    /// read since the look reported — the escalation's own read of the
-    /// fabric, which comes after its badge ([`Self::escalate`]), or, with no
-    /// manager, the read that kept the badge down ([`Self::withhold_badge`])
-    /// — is held now, a badge withdrawn before the wait, never a step into
-    /// it.
+    /// read since the look reported — the read that kept an ask's badge down
+    /// ([`Self::withhold_badge`]) — is held now, a badge withdrawn before the
+    /// wait, never a step into it.
     pub(super) fn stall_before_wait(
         &mut self,
         seq: u64,
@@ -340,20 +286,22 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Before an ask's badge goes up ([`Self::escalate`]): `true` when a stall
-    /// is in hand ([`Self::stall_in_hand`]), so no badge is raised and nothing
-    /// is mailed; journaled with [`WITHHELD`]. With no manager, reads
-    /// `status` here for this alone, unless the host measures nothing
-    /// ([`Caps::input`]) or a stall is already suspected.
+    /// is in hand ([`Self::stall_in_hand`]), so no badge is raised; journaled
+    /// with [`WITHHELD`]. Reads `status` here for this alone, unless the host
+    /// measures nothing ([`Caps::input`]) or a stall is already suspected.
     pub(super) fn withhold_badge(
         &mut self,
         seq: u64,
-        kind: &str,
+        kind: super::escalate::Escalation,
         review: &mut dyn Review,
     ) -> Result<bool, Fail> {
-        if kind != "ask" || !review.unattended() || self.stalled.is_some() {
+        if kind != super::escalate::Escalation::Ask
+            || !review.unattended()
+            || self.stalled.is_some()
+        {
             return Ok(false);
         }
-        if self.setup.manager.is_none() && !self.stall_suspect && self.caps.input != Some(false) {
+        if !self.stall_suspect && self.caps.input != Some(false) {
             let r = self.call(&["status"])?;
             if self.unserved(&r) {
                 return Err(Fail::Lost(format!("status failed: {}", r.stderr.trim())));
@@ -362,25 +310,20 @@ impl<C: Ctl> Session<'_, C> {
         if !self.stall_in_hand(review) {
             return Ok(false);
         }
-        let mail = if self.setup.manager.is_none() {
-            "skipped: no --inbox and no $ATERM_PARENT_SESSION_ID".to_string()
-        } else {
-            format!("skipped: {WITHHELD}")
-        };
         review.note(&format!(
-            "ESCALATED seq={seq} {ATTENTION_SKIPPED}{WITHHELD} mail={mail}"
+            "ESCALATED seq={seq} {ATTENTION_SKIPPED}{WITHHELD}"
         ));
         Ok(true)
     }
 
-    /// What follows the stall's restart, for the mail ([`frozen_mail_text`])
-    /// and the warning ([`frozen_warning_text`]): the explicit restart where
+    /// What follows the stall's restart, for the warning
+    /// ([`frozen_warning_text`]): the explicit restart where
     /// the host would carry the act ([`super::IdleHost::restart_offered`],
     /// the one predicate the server's own words choose by) — with the host's
     /// relaunch on its conversation only where that is promised — else the
     /// line resuming the worker's own conversation
-    /// ([`super::IdleHost::resume_command`]), else nothing (`drive watch`
-    /// reads no process).
+    /// ([`super::IdleHost::resume_command`]), else nothing (a loop with no
+    /// host reads no process).
     fn after_restart(&self) -> AfterRestart {
         let Some(host) = &self.stall_host else {
             return AfterRestart::Unknown;
@@ -408,7 +351,6 @@ impl<C: Ctl> Session<'_, C> {
         Ok(Some(StallRead {
             word: field("input").unwrap_or_default(),
             stall: worker_stall(&r.stdout),
-            fabric: field("fabric").unwrap_or_else(|| "unknown".to_string()),
             program: field("program"),
             human_ms: field("human_ms").and_then(|v| v.parse().ok()),
             hand: field("hand"),
@@ -418,8 +360,7 @@ impl<C: Ctl> Session<'_, C> {
     /// A stall seen: hold. The loop's own point badge is unset (the server's
     /// `aterm` entry says "frozen" over it, and would leave ours standing as
     /// "answer this box" the moment it cleared), the escalated box and the
-    /// policy's due decision are forgotten, one `kind=ask` goes to the
-    /// manager while the fabric is connected, and the episode is journaled
+    /// policy's due decision are forgotten, and the episode is journaled
     /// `FROZEN …` ([`FROZEN`]). Nothing is pressed or typed here or while it
     /// stands. The badge's end is that line's: its `attention=<reply>` is the
     /// unset's, read back by the harness's stats as the end of the person's
@@ -441,44 +382,19 @@ impl<C: Ctl> Session<'_, C> {
         self.turn_end_due = None;
         self.stall_termed = false;
         let behind = self.claim.watching_behind().map(str::to_string);
-        let (attention, mail) = if let Some(holder) = behind {
-            let why = format!("{ESCALATED_BEHIND} ({holder}) answers this session");
-            (
-                format!("{ATTENTION_SKIPPED}{why}"),
-                format!("skipped: {why}"),
-            )
+        let attention = if let Some(holder) = behind {
+            format!("{ATTENTION_SKIPPED}{ESCALATED_BEHIND} ({holder}) answers this session")
         } else {
             let attention = self.unset_if_ours(|t| !t.starts_with(ATTENTION_PREFIX))?;
             if self.attention_ours.is_none() {
                 // The turn-end policy's badge, if that was ours, went too.
                 self.turn_end_badge = false;
             }
-            let mail = match self.setup.manager.clone() {
-                None => "skipped: no --inbox and no $ATERM_PARENT_SESSION_ID".to_string(),
-                Some(to) if read_rest.fabric == "connected" => {
-                    let rows = self.last.as_ref().map_or(&[][..], |s| s.rows.as_slice());
-                    let reader =
-                        aterm_phase::identify(read_rest.program.as_deref(), rows).program();
-                    let program = read_rest.program.as_deref().unwrap_or(reader.name());
-                    let leader = self.stall_host.as_ref().and_then(|h| h.agent_pid());
-                    let text = frozen_mail_text(
-                        &stall,
-                        program,
-                        &self.after_restart(),
-                        self.setup.sid.as_deref(),
-                        leader,
-                    );
-                    let to = format!("to={to}");
-                    let r = self.call(&["post", &to, "kind=ask", "--wait=0", &text])?;
-                    post_word(&r)
-                }
-                Some(_) => format!("skipped: no fabric (fabric={})", read_rest.fabric),
-            };
-            (format!("attention={attention}"), mail)
+            format!("attention={attention}")
         };
         let dash = || "-".to_string();
         review.note(&format!(
-            "{FROZEN} seq={seq} input={} wait_ms={} bytes={} rss_mb={} {attention} mail={mail}",
+            "{FROZEN} seq={seq} input={} wait_ms={} bytes={} rss_mb={} {attention}",
             stall.word,
             stall.wait_ms.map_or_else(dash, |v| v.to_string()),
             stall.bytes.map_or_else(dash, |v| v.to_string()),
@@ -796,14 +712,26 @@ mod tests {
         assert!(!publishes_input("OK schema=1 hold=0\n"));
     }
 
-    /// A stopped job's remedy is `signal cont`, never a restart of the
-    /// worker's conversation.
+    /// What a stall's warning says after its word: the wait, the backlog
+    /// and the size, each only where the server measured it. A small
+    /// program reads MB, never `0.0 GB`; unknown numbers are left out,
+    /// never printed as `-`.
     #[test]
-    fn a_stopped_jobs_mail_names_signal_cont() {
-        let s = worker_stall("OK input=stopped input_bytes=1 input_wait_ms=41000 fg_rss_mb=-\n")
-            .expect("stopped is a stall");
-        let own = AfterRestart::Command("claude --resume 5f1c2d3e".to_string());
-        let t = frozen_mail_text(&s, "claude", &own, Some("@s-1"), Some(4242));
-        assert!(t.ends_with("signal cont") && !t.contains("--resume"), "{t}");
+    fn the_stall_facts_name_the_wait_the_backlog_and_the_size() {
+        let s = worker_stall(STALLED).expect("stall");
+        assert_eq!(stall_facts(&s), " for 2m41s (1 B queued, rss 38.8 GB)");
+        let small = WorkerStall {
+            rss_mb: Some(12),
+            wait_ms: None,
+            ..s.clone()
+        };
+        assert_eq!(stall_facts(&small), " (1 B queued, rss 12 MB)");
+        let bare = WorkerStall {
+            bytes: None,
+            rss_mb: None,
+            wait_ms: Some(41_000),
+            ..s
+        };
+        assert_eq!(stall_facts(&bare), " for 41s");
     }
 }

@@ -1,0 +1,14 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_turn_end_with_a_screen_step_open_only_amends, its first rig (S2).
+bind 0
+see busy
+tx prompt v1
+see prompt bash:not-read-only
+tx end
+expect amend t1 turn vref=v1
+expect amend t1 turn vdur_ms=4200
+expect tx ended=1
+see busy
+see idle
+wait 1000
+expect close t1 turn src=screen

@@ -8,40 +8,12 @@
 // a cleared idle document still pins its peak footprint. `release()` must return
 // that capacity to the allocator. "Logical clears insufficient" is not provable
 // by asserting emptiness — it needs a REAL net-heap measurement, so this test
-// installs a counting global allocator (the mem_budget / search_harness
-// pattern) and asserts the live-byte delta, not a logical line count.
-//
-// ONE test function on purpose: the counting allocator is a single global
-// counter, so a second #[test] running in parallel would pollute every net()
-// reading. All scenarios run sequentially here.
-
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+// reads the suite's counting global allocator (`search_suite.rs`, per thread)
+// and asserts the live-byte delta, not a logical line count.
 
 use aterm_search::{BudgetedSearch, SearchIndex, TerminalSearch};
 
-static NET: AtomicI64 = AtomicI64::new(0);
-static ALLOCATED: AtomicU64 = AtomicU64::new(0);
-
-struct Counting;
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        NET.fetch_add(l.size() as i64, Ordering::Relaxed);
-        ALLOCATED.fetch_add(l.size() as u64, Ordering::Relaxed);
-        unsafe { System.alloc(l) }
-    }
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        NET.fetch_sub(l.size() as i64, Ordering::Relaxed);
-        unsafe { System.dealloc(p, l) }
-    }
-}
-
-#[global_allocator]
-static ALLOC: Counting = Counting;
-
-fn net() -> i64 {
-    NET.load(Ordering::Relaxed)
-}
+use crate::heap::{allocated, net};
 
 /// Distinct, trigram-diverse lines so the postings, line Strings, column maps
 /// and bloom all grow to a substantial footprint.
@@ -259,13 +231,13 @@ fn release_reclaims_real_heap_that_clear_retains_without_disturbing_siblings() {
     for row in 0..HISTORY_ROWS {
         moving.index_line(row, "aaa");
     }
-    let before_allocated = ALLOCATED.load(Ordering::Relaxed);
+    let before_allocated = allocated();
     let before_live = net();
     for step in 0..ADVANCES {
         moving.drop_history_below(step + 1);
         moving.index_line(step + HISTORY_ROWS, "aaa");
     }
-    let eviction_allocated = ALLOCATED.load(Ordering::Relaxed) - before_allocated;
+    let eviction_allocated = allocated() - before_allocated;
     let eviction_growth = net() - before_live;
     assert!(
         eviction_allocated < 256 * 1024,
@@ -278,12 +250,12 @@ fn release_reclaims_real_heap_that_clear_retains_without_disturbing_siblings() {
     // Allocation control: decoding even ONE posting to a Vec allocates every
     // retained u32 ID per step. It omits re-encoding and text costs, so it is
     // a conservative measure of the traffic a decoding eviction would cost.
-    let before_old = ALLOCATED.load(Ordering::Relaxed);
+    let before_old = allocated();
     for step in 0..ADVANCES as u32 {
         let decoded: Vec<u32> = (step..step + HISTORY_ROWS as u32).collect();
         std::hint::black_box(decoded);
     }
-    let old_decode_allocated = ALLOCATED.load(Ordering::Relaxed) - before_old;
+    let old_decode_allocated = allocated() - before_old;
     assert_eq!(old_decode_allocated, (ADVANCES * HISTORY_ROWS * 4) as u64);
     assert!(old_decode_allocated > eviction_allocated * 20);
     eprintln!(

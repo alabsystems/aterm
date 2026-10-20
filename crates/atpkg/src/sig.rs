@@ -1260,7 +1260,9 @@ mod tests {
         );
 
         // A no-op tick: the recorded value is already 4.
+        let recording = aterm_durable::seam::Recording::start();
         assert_eq!(floor.check_and_record(4), Ok(()));
+        assert_eq!(recording.take(), [], "nothing to persist, nothing flushed");
         assert_eq!(
             ino(&path),
             ino(&witness),
@@ -1275,8 +1277,9 @@ mod tests {
         assert_eq!(floor.check_and_record_classified(4), (Ok(()), None));
         assert_eq!(ino(&path), ino(&witness));
 
-        // A genuine advance is still published durably...
+        // A genuine advance is still published durably: the value, then its directory entry...
         assert_eq!(floor.check_and_record(5), Ok(()));
+        assert_eq!(recording.take(), [aterm_durable::Flush::Durable; 2]);
         assert_ne!(ino(&path), ino(&witness), "an advance must reach the disk");
         assert_eq!(Floor::new(path.clone()).current(), 5);
 
@@ -1369,6 +1372,9 @@ mod tests {
         assert_eq!(floor.read_floor_classified(), (0, false));
         assert_eq!(floor.check_and_record(7), Ok(()));
         assert_eq!(floor.read_floor_classified(), (7, false));
+        // A floor written by hand (`echo 7 >`) still floors: whitespace is not corruption.
+        std::fs::write(&path, b" 7\n").unwrap();
+        assert_eq!(floor.read_floor_classified(), (7, false));
         // Garbage text, non-UTF-8 bytes, over the size bound: all corrupt, all read 0.
         let oversized = vec![b'9'; MAX_FLOOR_BYTES + 1];
         for garbage in [
@@ -1430,6 +1436,18 @@ mod tests {
         assert_eq!(decision, Ok(()));
         assert_eq!(persist_failure, None);
         assert_eq!(Floor::new(path).current(), 8);
+
+        // A parent other users may write is refused before anything is written there
+        // (CWE-379), although the write itself would succeed.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let (decision, persist_failure) = floor.check_and_record_classified(9);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(decision, Ok(()));
+        assert!(
+            persist_failure.is_some(),
+            "a shared parent refuses the write"
+        );
+        assert_eq!(floor.current(), 8);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

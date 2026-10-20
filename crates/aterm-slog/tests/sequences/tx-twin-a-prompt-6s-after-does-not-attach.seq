@@ -1,0 +1,11 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_prompt_6s_after_the_turn_opened_does_not_attach (S13, S3): a
+# prompt 6 s after the screen's turn opened supersedes it.
+bind 0
+see busy
+pass 6000
+tx prompt v1
+expect close t1 turn out=superseded by=vendor src=transcript conf=exact at=6000
+expect open t1 turn src=screen
+expect open t2 turn vref=v1 src=transcript
+expect turn=t2

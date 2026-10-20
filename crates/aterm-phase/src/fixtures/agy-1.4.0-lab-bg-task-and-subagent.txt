@@ -1,0 +1,47 @@
+# agy 1.4.0 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Antigravity CLI, launched by path with a scratch `HOME` whose settings name the Gemini API provider, its Google hosts black-holed, a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · a subagent and a command task both running after the turn ended: one panel row each, the footer counting `1 subagent(s) · 1 task(s) · /tasks` · cursor=40,2
+> hi, remember the word OSPREY-3
+
+  Hi! I am the local lab stub, not a model. (reply 1)
+
+────────────────────────────────────────────────────────────
+> toolstart
+
+● Ran (sleep 150; echo LAB-BG-DONE) (ctrl+o to expand)
+
+  Tool call done.
+
+  Tool call done.
+
+────────────────────────────────────────────────────────────
+> toolstart
+
+● Scheduled 1 timer (90s: lab timer fired) (ctrl+o to expand)
+
+  Tool call done.
+
+  Tool call done.
+
+────────────────────────────────────────────────────────────
+> toolstart
+
+● Spawned 1 subagent (ctrl+o to expand)
+
+  Tool call done.
+
+  Tool call done.
+
+────────────────────────────────────────────────────────────
+> toolstart
+
+● Ran (sleep 400; echo LAB-BG2-DONE)
+● Spawned 1 subagent (ctrl+o to expand)
+
+  Tool call done.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ● Agent(research: Lab Waiter Two)  Working · 4s
+  ● [17:59:45] sleep 400; echo LAB-BG2-DONE running
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                        Gemini 3.1 Pro · low · 1 subagent(s) · 1 task(s) · /tasks

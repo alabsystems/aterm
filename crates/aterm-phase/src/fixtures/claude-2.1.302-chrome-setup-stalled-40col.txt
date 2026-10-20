@@ -1,0 +1,28 @@
+# claude-code 2.1.302 · HAND-BUILT 2026-10-16 from the 2.1.302 render code, not measured (Claude Code opens this panel only from its Chrome install upsell, which needs a Chromium-family browser in /Applications — the lab's machine has none — and the `tengu_chrome_install_upsell` flag): est() in the permission frame `ka` (the title ` Setting up Claude in Chrome` at column one under the full-width rule, the body two columns in, `gap 1` between the body, the steps and the Select, no footer), its Select with `hideIndexes` and no `defaultFocusValue` (the cursor on the first option), each option with its description; the Select lays described options out in two columns as MEASURED on 2.1.302's model picker (`claude-2.1.302-model-picker-40col.txt`): the labels in a column as wide as the longest label and its pointer, at most 60% of the pane, a longer label cut short there with `…`, then two blanks and the description, wrapped at its own column · the stalled phase at 40 columns, both labels in a 24-column label column (60% of 40), the second cut short
+⏺ Working on it.
+
+────────────────────────────────────────
+ Setting up Claude in Chrome
+
+  Finish setup in Chrome. This screen
+  follows along and updates on its own
+  as each step completes.
+
+  ✔ Install the extension
+  … Connect to Chrome
+     Taking longer than expected.
+     Check that the extension is added
+     and that you're signed in to it
+     in Chrome.
+
+  ❯ Keep waiting            Setup
+                            keeps
+                            checking
+                            for the
+                            connection
+    Continue without brow…  Finish
+                            setup
+                            later with
+                            /chrome
+
+

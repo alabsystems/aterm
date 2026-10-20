@@ -187,6 +187,17 @@ fn margined_vertical_moves_keep_printed_blanks_and_wrap_holes_distinct() {
                 "{name}: right={right}, hole belongs to row {expected_row}"
             );
         }
+
+        // The row a move vacates keeps no hole: it left with its cells.
+        let vacated = if matches!(name, "IL" | "SD") { 0 } else { 4 };
+        let mut term = Terminal::new(6, 4);
+        term.process(format!("\x1b[{};1Habc中", vacated + 1).as_bytes());
+        assert!(term.grid().row(vacated).unwrap().has_early_wrap_hole());
+        term.process(format!("\x1b[?69h\x1b[1;5r\x1b[2;4s\x1b[1;2H{op}").as_bytes());
+        assert!(
+            !term.grid().row(vacated).unwrap().has_early_wrap_hole(),
+            "{name}: the vacated row {vacated}"
+        );
     }
 }
 
@@ -341,6 +352,147 @@ fn a_coloured_early_wrap_hole_is_no_text_before_any_rewrap() {
     }
 }
 
+/// The background drawn in the last column of viewport row `row`, as a
+/// renderer resolves it.
+fn bg_in_last_column(term: &mut Terminal, row: usize) -> [u8; 3] {
+    let (rows, cols) = (term.grid().rows(), term.grid().cols());
+    let frame = term.cell_frame(usize::from(rows), usize::from(cols));
+    frame.cells[row].get(usize::from(cols) - 1).map_or_else(
+        || {
+            let [_, r, g, b] = frame.default_bg.to_be_bytes();
+            [r, g, b]
+        },
+        |cell| cell.bg,
+    )
+}
+
+/// A coloured hole is painted as the print path painted it, in the background
+/// of the wide glyph that wrapped, when its row is drawn from history, in
+/// either tier, as the newest line (continued on the screen) and further back,
+/// and it stays no text. A history line leaves the hole out, so the row drawn
+/// from one used to show it unpainted.
+#[test]
+fn a_coloured_early_wrap_hole_keeps_its_paint_in_history() {
+    for text in [
+        "\x1b[41mabcdefghi中\x1b[0mxyz",
+        "\x1b[48;2;17;34;51mabcdefghi中\x1b[0mxyz",
+    ] {
+        for (tier, ring) in [("ring", 8), ("store", 0)] {
+            let mut term = tiered(3, 10, ring);
+            term.process(text.as_bytes());
+            let painted = bg_in_last_column(&mut term, 0);
+            // Newest history line: its continuation is the screen's top row.
+            term.process(b"\r\n\r\n");
+            assert_eq!(term.grid().scrollback_lines(), 1, "fixture");
+            term.scroll_to_top();
+            assert_eq!(
+                bg_in_last_column(&mut term, 0),
+                painted,
+                "{text:?}, {tier}: the newest history line"
+            );
+            assert_eq!(term.grid().row_text(0).as_deref(), Some("abcdefghi"));
+            // Further back: the continuation is history too.
+            term.scroll_to_bottom();
+            term.process(b"1\r\n2\r\n3");
+            term.scroll_to_top();
+            assert_eq!(
+                term.grid().ring_buffer_scrollback() > 0,
+                tier == "ring",
+                "fixture: {tier}"
+            );
+            assert_eq!(
+                bg_in_last_column(&mut term, 0),
+                painted,
+                "{text:?}, {tier}: scrolled back"
+            );
+            assert_eq!(term.grid().row_text(0).as_deref(), Some("abcdefghi"));
+        }
+    }
+}
+
+/// So is a coloured hole on a row that comes back to the screen from history,
+/// either tier, every way one comes back: a rows grow reveals it, a Kitty
+/// `CSI + T` unscrolls it, a widening's bottom anchoring pulls it down.
+#[test]
+fn a_coloured_early_wrap_hole_keeps_its_paint_back_on_the_screen() {
+    for colour in ["41", "48;2;17;34;51"] {
+        // At 10 and at 20 columns alike the wide glyph wraps early:
+        // `abcdefghij` / `klmnopqrs` + hole / `中xyz`, and
+        // `abcdefghijklmnopqrs` + hole / `中xyz`.
+        let text = format!("\x1b[{colour}mabcdefghijklmnopqrs中\x1b[0mxyz");
+        for (tier, ring) in [("ring", 8), ("store", 0)] {
+            for way in ["rows grow", "unscroll", "widening"] {
+                let mut term = tiered(4, 10, ring);
+                term.process(text.as_bytes());
+                let painted = bg_in_last_column(&mut term, 1);
+                term.process(b"\r\n\r\n\r\n\r\n");
+                assert_eq!(term.grid().scrollback_lines(), 3, "fixture: in history");
+                let want = match way {
+                    "rows grow" => {
+                        term.resize(8, 10);
+                        "klmnopqrs"
+                    }
+                    "unscroll" => {
+                        term.process(b"\x1b[3+T");
+                        "klmnopqrs"
+                    }
+                    _ => {
+                        // Two lines that each free a row at 20 columns.
+                        term.process(b"\x1b[H0123456789ABCDEFGHI\r\n0123456789ABCDEFGHI");
+                        term.resize(4, 20);
+                        "abcdefghijklmnopqrs"
+                    }
+                };
+                let rows = screen(&term);
+                let row = rows
+                    .iter()
+                    .position(|r| r == want)
+                    .unwrap_or_else(|| panic!("{way}, {tier}: the row is back: {rows:?}"));
+                assert_eq!(
+                    bg_in_last_column(&mut term, row),
+                    painted,
+                    "{colour}, {tier}: back on the screen by {way}"
+                );
+            }
+        }
+    }
+}
+
+/// A product rule: a hole is no text, so a paint a later erase gives it lasts
+/// only while its row stays on the screen at its width. A rewrap and history,
+/// which hold the line without the hole, paint it as the print path did (the
+/// wrapping glyph's background), and the line reads the same throughout.
+#[test]
+fn a_recoloured_hole_takes_the_print_paths_paint_off_the_screen() {
+    let red = {
+        let mut term = Terminal::new(3, 10);
+        term.process("\x1b[41mabcdefghi中".as_bytes());
+        bg_in_last_column(&mut term, 0)
+    };
+    let recoloured = |term: &mut Terminal| {
+        term.process("\x1b[41mabcdefghi中\x1b[0mxyz".as_bytes());
+        // DECERA over the hole in blue: still a hole, painted blue.
+        term.process(b"\x1b[44m\x1b[1;10;1;10$z\x1b[0m");
+        assert!(term.grid().row(0).unwrap().has_early_wrap_hole(), "fixture");
+        let blue = bg_in_last_column(term, 0);
+        assert_ne!(blue, red, "fixture: recoloured");
+    };
+    // A rewrap round trip.
+    let mut term = Terminal::new(3, 10);
+    recoloured(&mut term);
+    term.resize(3, 20);
+    assert_eq!(logical_lines(&term), vec!["abcdefghi中xyz".to_string()]);
+    term.resize(3, 10);
+    assert_eq!(bg_in_last_column(&mut term, 0), red, "after a rewrap");
+    // History, as the newest line.
+    let mut term = tiered(3, 10, 8);
+    recoloured(&mut term);
+    term.process(b"\r\n\r\n");
+    term.scroll_to_top();
+    assert_eq!(bg_in_last_column(&mut term, 0), red, "in history");
+    assert_eq!(term.grid().row_text(0).as_deref(), Some("abcdefghi"));
+}
+
 /// A hole is a hole until something is written into it: a program that later
 /// prints a space in that last cell (a line editor redrawing its line) made
 /// the space content, and a rewrap keeps it.
@@ -415,6 +567,60 @@ fn a_line_straddling_the_history_boundary_keeps_its_full_rows_last_cells() {
             lines.iter().any(|l| l == LINE),
             "offload={offload}: {lines:?}"
         );
+    }
+}
+
+/// A line split where history meets the screen keeps its text when it is
+/// rejoined from the ring. With the cursor on the line's first screen row and
+/// the line's head further up than a width change walks to bring it onto the
+/// screen (`Grid::head_walk`, four screens), a width change rewraps the
+/// history head alone: its last row ends short of the width while the screen
+/// continues the line. Held in the ring (a ring-only grid, or a tiered one
+/// whose re-attach put the rewrapped rows back in its ring), that row once
+/// read at its full width when the next width change rejoined the line, so
+/// blanks joined the text; in the store it reads at its length. Every tier now
+/// reads it as the store does (`RowFlags::ENDS_AT_LEN`).
+#[test]
+fn a_line_split_at_the_screen_keeps_its_text_when_the_ring_rejoins_it() {
+    // 17 rows of history at 10 columns, past the 16-row walk of a 4-row
+    // screen, then the two rows the screen shows; 170 cells end two cells
+    // into a row of seven.
+    let line: String = (0..170)
+        .map(|i| char::from(b'0' + (i % 10) as u8))
+        .chain("abcdefghijKLMNO".chars())
+        .collect();
+    for (ring_only, offload) in [(true, false), (false, false), (false, true)] {
+        let mut term = if ring_only {
+            Terminal::new(4, 10)
+        } else {
+            tiered(4, 10, 100)
+        };
+        let resize = |term: &mut Terminal, cols: u16| {
+            if offload {
+                offloaded_resize(term, 4, cols);
+            } else {
+                term.resize(4, cols);
+            }
+        };
+        // The head scrolls into history; `abcdefghij` and `KLMNO` lead the
+        // screen.
+        term.process(format!("{line}\r\nx\r\ny").as_bytes());
+        // The cursor on the line's first screen row: the narrowing cannot lift
+        // the tail, so the history head ends two cells into seven.
+        term.process(b"\x1b[H");
+        resize(&mut term, 7);
+        let case = format!("ring_only={ring_only} offload={offload}");
+        assert!(
+            logical_lines(&term).contains(&line),
+            "{case}: fixture {:?}",
+            logical_lines(&term)
+        );
+        // The cursor below the tail: the widening lifts it and rejoins it
+        // with the history head.
+        term.process(b"\x1b[4;1H");
+        resize(&mut term, 10);
+        let lines = logical_lines(&term);
+        assert!(lines.contains(&line), "{case}: {lines:?}");
     }
 }
 
@@ -759,5 +965,58 @@ fn a_vs16_glyph_kept_narrow_in_mid_row_keeps_the_styles_after_it_in_place() {
         resize(&mut term, 12, 9);
         let strays = view_style_strays(&mut term, rocket, &format!("{what} rewrapped"));
         assert!(strays.is_empty(), "{strays:#?}");
+    }
+}
+
+/// A VS16 glyph the writer kept narrow in the last column and the skin tone
+/// that wrapped after it stay two cells through a history rewrap, as the
+/// screen's own rewrap keeps them: the live writer folds a skin tone only into
+/// a wide cell, so `☝️` (narrow, its widening refused at the row edge) and
+/// `🏽` (wide, on the next row) were drawn apart. The rewrapped line's text
+/// read them as one `☝️🏽` unit (the walk replays VS16 widening, and the
+/// skin-tone fold gates on that width), a narrow cell that took the `🏽` and
+/// pulled everything after it two columns left.
+#[test]
+fn a_vs16_glyph_kept_narrow_at_the_edge_and_its_wrapped_skin_tone_stay_apart() {
+    let text = "abcdefghi\u{261D}\u{FE0F}\u{1F3FD}z";
+    let top = |term: &Terminal| -> Vec<(String, bool)> {
+        let mut cells = term.display_row_grapheme_cells(0).expect("the top row");
+        cells.truncate(14);
+        cells
+    };
+    let mut want: Vec<(String, bool)> = "abcdefghi"
+        .chars()
+        .map(|c| (c.to_string(), false))
+        .collect();
+    want.extend([
+        ("\u{261D}\u{FE0F}".to_owned(), false),
+        ("\u{1F3FD}".to_owned(), true),
+        (String::new(), false),
+        ("z".to_owned(), false),
+        (" ".to_owned(), false),
+    ]);
+
+    // The screen's own rewrap: the control.
+    let mut term = Terminal::new(3, 10);
+    term.process(text.as_bytes());
+    term.resize(3, 20);
+    assert_eq!(top(&term), want, "on screen");
+
+    type Make = fn() -> Terminal;
+    let makes: [(&str, Make); 2] = [
+        ("ring", || Terminal::new(3, 10)),
+        ("tiered", || tiered(3, 10, 1)),
+    ];
+    for (tier, make) in makes {
+        for offload in [false, true] {
+            let mut term = in_history(make(), text);
+            if offload {
+                offloaded_resize(&mut term, 3, 20);
+            } else {
+                term.resize(3, 20);
+            }
+            term.scroll_to_top();
+            assert_eq!(top(&term), want, "{tier} history, offload={offload}");
+        }
     }
 }

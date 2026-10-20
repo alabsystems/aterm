@@ -61,7 +61,7 @@ SUBVERBS:
                         ATERM_OBSERVE_SESSION_ID). --window by default; --of
                         is @self inside aterm, required outside
     show <sel>          raise the peer's window and select its tab
-    map                 open the GUI connection map
+    map                 open the GUI Overview (every session; was the connection map)
     help                this help
 
 SELECTORS:
@@ -941,10 +941,11 @@ fn cmd_show(wire: &ConnWire, self_sid: Option<&str>, args: &[String]) -> io::Res
     Ok(ExitCode::SUCCESS)
 }
 
-/// `conn map` — the wire `open connections`: the GUI connection map.
+/// `conn map` — the wire `open overview`: the GUI Overview, which replaced the
+/// connection map (the wire still reads `connections` as its alias).
 fn cmd_map(wire: &ConnWire) -> io::Result<ExitCode> {
-    require_ok(wire.request(&["open".to_string(), "connections".to_string()])?)?;
-    super::print_stdout_line("opened the connection map")?;
+    require_ok(wire.request(&["open".to_string(), "overview".to_string()])?)?;
+    super::print_stdout_line("opened the overview")?;
     Ok(ExitCode::SUCCESS)
 }
 

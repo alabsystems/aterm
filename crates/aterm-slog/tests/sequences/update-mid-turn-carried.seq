@@ -1,0 +1,17 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# §5.2: a seamless update that carries the log in mid-turn: the turn and its
+# box cross whole (the successor's seqs start past the host's reserve); the
+# successor closes them.
+see busy
+see prompt bash:not-read-only
+handoff carried
+expect mark - handoff carried=4 shed=0 epoch=1 by=aterm
+expect turn=t1
+expect need=approval:bash
+see busy
+expect open p1 approval
+expect close p1 approval out=passed
+see idle
+wait 1000
+expect open t1 turn
+expect close t1 turn out=done steps=1 appr=1

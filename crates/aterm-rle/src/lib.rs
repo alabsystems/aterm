@@ -105,6 +105,201 @@ impl fmt::Display for RleCapacityError {
     }
 }
 
+impl<T> Run<T> {
+    /// Construct a run of `length` consecutive cells with attribute `value`.
+    #[must_use]
+    pub const fn new(value: T, length: u32) -> Self {
+        Self { value, length }
+    }
+
+    /// Return `true` iff this run has zero length.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    /// Return `true` iff `offset < self.length`.
+    #[must_use]
+    pub const fn contains_offset(&self, offset: u32) -> bool {
+        offset < self.length
+    }
+}
+
+impl RleCapacityError {
+    /// Number of elements beyond `available` that were requested (`requested.saturating_sub(available)`).
+    #[must_use]
+    pub const fn overflow_amount(self) -> u32 {
+        self.requested.saturating_sub(self.available)
+    }
+
+    /// Return `true` iff zero capacity remained (`available == 0`).
+    #[must_use]
+    pub const fn is_full(self) -> bool {
+        self.available == 0
+    }
+}
+
+/// Remaining elements before reaching `u32::MAX` (`u32::MAX - total_length`).
+#[must_use]
+pub const fn remaining_rle_capacity(total_length: u32) -> u32 {
+    u32::MAX - total_length
+}
+
+/// Clamp `count` to the remaining capacity at `total_length`.
+#[must_use]
+pub const fn clamp_rle_extend_count(total_length: u32, count: u32) -> u32 {
+    let avail = u32::MAX - total_length;
+    if count > avail { avail } else { count }
+}
+
+/// Checked total length after extending `total_length` by `count` elements.
+///
+/// # Errors
+///
+/// Returns [`RleCapacityError`] if `count > u32::MAX - total_length`.
+pub const fn checked_rle_extend_total(
+    total_length: u32,
+    count: u32,
+) -> Result<u32, RleCapacityError> {
+    let available = u32::MAX - total_length;
+    if count > available {
+        Err(RleCapacityError {
+            requested: count,
+            available,
+        })
+    } else {
+        Ok(total_length + count)
+    }
+}
+
+/// Clamp `[start, end)` to `[0, total_length)`, returning `None` when the clamped range is empty.
+#[must_use]
+pub const fn clamp_rle_range(start: u32, end: u32, total_length: u32) -> Option<(u32, u32)> {
+    if start >= end || start >= total_length {
+        return None;
+    }
+    let clamped_end = if end > total_length {
+        total_length
+    } else {
+        end
+    };
+    Some((start, clamped_end))
+}
+
+/// Compute `(prefix_len, mid_len, suffix_len)` when splitting a single run of length `run_len`
+/// across `[start_offset, end_offset_exclusive)`.
+///
+/// Returns `None` if `start_offset >= end_offset_exclusive` or `end_offset_exclusive > run_len`.
+#[must_use]
+pub const fn single_run_split_lengths(
+    run_len: u32,
+    start_offset: u32,
+    end_offset_exclusive: u32,
+) -> Option<(u32, u32, u32)> {
+    if start_offset >= end_offset_exclusive || end_offset_exclusive > run_len {
+        return None;
+    }
+    let prefix = start_offset;
+    let mid = end_offset_exclusive - start_offset;
+    let suffix = run_len - end_offset_exclusive;
+    Some((prefix, mid, suffix))
+}
+
+/// Compute `(prefix_len, 1, suffix_len)` when splitting a run of length `run_len` at `offset_in_run`.
+#[must_use]
+pub const fn point_split_lengths(run_len: u32, offset_in_run: u32) -> Option<(u32, u32, u32)> {
+    if offset_in_run >= run_len {
+        return None;
+    }
+    let prefix = offset_in_run;
+    let suffix = (run_len - 1) - offset_in_run;
+    Some((prefix, 1, suffix))
+}
+
+/// Compute `(prefix_keep_in_start, suffix_keep_in_end)` when a range spans from `start_offset`
+/// in a run of length `start_run_len` through `end_offset_exclusive` in a run of length `end_run_len`.
+#[must_use]
+pub const fn multi_run_edge_lengths(
+    start_run_len: u32,
+    start_offset: u32,
+    end_run_len: u32,
+    end_offset_exclusive: u32,
+) -> Option<(u32, u32)> {
+    if start_offset >= start_run_len
+        || end_offset_exclusive == 0
+        || end_offset_exclusive > end_run_len
+    {
+        return None;
+    }
+    Some((start_offset, end_run_len - end_offset_exclusive))
+}
+
+/// Encode a `(style_id, length)` run pair into an 8-byte little-endian record.
+#[must_use]
+pub const fn encode_run_pair_le(style_id: u32, length: u32) -> [u8; 8] {
+    [
+        style_id as u8,
+        (style_id >> 8) as u8,
+        (style_id >> 16) as u8,
+        (style_id >> 24) as u8,
+        length as u8,
+        (length >> 8) as u8,
+        (length >> 16) as u8,
+        (length >> 24) as u8,
+    ]
+}
+
+/// Decode an 8-byte little-endian `(style_id, length)` run pair.
+#[must_use]
+pub const fn decode_run_pair_le(bytes: [u8; 8]) -> (u32, u32) {
+    let style_id = (bytes[0] as u32)
+        | ((bytes[1] as u32) << 8)
+        | ((bytes[2] as u32) << 16)
+        | ((bytes[3] as u32) << 24);
+    let length = (bytes[4] as u32)
+        | ((bytes[5] as u32) << 8)
+        | ((bytes[6] as u32) << 16)
+        | ((bytes[7] as u32) << 24);
+    (style_id, length)
+}
+
+/// Encode a 3-word RLE span record `(start_offset, run_len, style_id)` into 12 little-endian bytes.
+#[must_use]
+pub const fn encode_rle_span_triple_le(start_offset: u32, run_len: u32, style_id: u32) -> [u8; 12] {
+    [
+        start_offset as u8,
+        (start_offset >> 8) as u8,
+        (start_offset >> 16) as u8,
+        (start_offset >> 24) as u8,
+        run_len as u8,
+        (run_len >> 8) as u8,
+        (run_len >> 16) as u8,
+        (run_len >> 24) as u8,
+        style_id as u8,
+        (style_id >> 8) as u8,
+        (style_id >> 16) as u8,
+        (style_id >> 24) as u8,
+    ]
+}
+
+/// Decode 12 little-endian bytes into a 3-word RLE span record `(start_offset, run_len, style_id)`.
+#[must_use]
+pub const fn decode_rle_span_triple_le(bytes: [u8; 12]) -> (u32, u32, u32) {
+    let start_offset = (bytes[0] as u32)
+        | ((bytes[1] as u32) << 8)
+        | ((bytes[2] as u32) << 16)
+        | ((bytes[3] as u32) << 24);
+    let run_len = (bytes[4] as u32)
+        | ((bytes[5] as u32) << 8)
+        | ((bytes[6] as u32) << 16)
+        | ((bytes[7] as u32) << 24);
+    let style_id = (bytes[8] as u32)
+        | ((bytes[9] as u32) << 8)
+        | ((bytes[10] as u32) << 16)
+        | ((bytes[11] as u32) << 24);
+    (start_offset, run_len, style_id)
+}
+
 impl std::error::Error for RleCapacityError {}
 
 impl<T: Default> Default for Run<T> {

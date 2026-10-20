@@ -32,9 +32,8 @@
 //! each pair of nested doors once on the tape ([`Mark::Nested`]), and in this
 //! crate's own tests a nesting is a failed assertion, so the suite keeps every
 //! door's boundary clean. The count is the run's, not a thread's: every door
-//! is crossed on the loop's own thread — the mail lane, the one other thread
-//! that holds the door, is refused under a tape — so a door crossed while
-//! another's live call runs is one reached inside it.
+//! is crossed on the loop's own thread, so a door crossed while another's
+//! live call runs is one reached inside it.
 //!
 //! **Stamps.** A round trip and a flag's first true read carry where the
 //! clocks stood ([`Stamp`]) — the monotonic clock in nanoseconds since the
@@ -66,12 +65,14 @@ use super::codec::{self, CodecError, End, Item, Mark, Stamp};
 use super::frame::{Hint, TapeWriter};
 use super::header::{Roots, escape};
 use crate::supervise::CtlReply;
+use crate::supervise::policy::sleeps::SleepStamp;
 
 /// A note's kind: a turn-end decision's fold and reading, as `Debug`.
 pub(crate) const NOTE_TURN_END: &str = "turn_end";
 
 /// A note's kind: something happened that no replay of the tape can make
-/// (a mail delivery received under a recorder), said once.
+/// (an older build's mail delivery received under a recorder), said once;
+/// this build writes none, and refuses to replay a tape that holds one.
 pub(crate) const NOTE_UNREPLAYABLE: &str = "unreplayable";
 
 /// A note's kind: the run UNWOUND INSIDE A DOOR'S LIVE CALL — a probe's body
@@ -230,6 +231,64 @@ impl TapeValue for Option<i64> {
     }
 }
 
+/// The machine's count of its sleep ([`SleepStamp`]): its milliseconds and,
+/// after a space, the boot's name; nothing for none.
+impl TapeValue for Option<SleepStamp> {
+    fn to_tape(&self) -> Vec<u8> {
+        self.as_ref().map_or_else(Vec::new, |s| {
+            let ms = u64::try_from(s.asleep.as_millis()).unwrap_or(u64::MAX);
+            match &s.boot {
+                Some(boot) => format!("{ms} {boot}"),
+                None => ms.to_string(),
+            }
+            .into_bytes()
+        })
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let bad = CodecError {
+            at: 0,
+            why: "a sleep count that does not read",
+        };
+        let text = std::str::from_utf8(bytes).map_err(|_| bad.clone())?;
+        let (ms, boot) = match text.split_once(' ') {
+            Some((ms, boot)) => (ms, Some(boot.to_string())),
+            None => (text, None),
+        };
+        let ms: u64 = ms.parse().map_err(|_| bad)?;
+        Ok(Some(SleepStamp {
+            asleep: Duration::from_millis(ms),
+            boot,
+        }))
+    }
+}
+
+/// Two times or none (the machine's last sleep: when it slept and woke, unix
+/// ms): their decimal texts, a space between; nothing for none.
+impl TapeValue for Option<(i64, i64)> {
+    fn to_tape(&self) -> Vec<u8> {
+        self.map_or_else(Vec::new, |(a, b)| format!("{a} {b}").into_bytes())
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|t| t.split_once(' '))
+            .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
+            .map(Some)
+            .ok_or(CodecError {
+                at: 0,
+                why: "two times that do not read",
+            })
+    }
+}
+
 /// A derived door's verdict (the kernel's word on a process): `1` or `0`.
 impl TapeValue for bool {
     fn to_tape(&self) -> Vec<u8> {
@@ -287,8 +346,6 @@ struct Recorder {
     nested: Vec<(String, String)>,
     /// The last screens parsed, each with the record it came in.
     screens: Screens,
-    /// The tape said a run no replay can make ([`NOTE_UNREPLAYABLE`]).
-    unreplayable: bool,
 }
 
 /// A screen the loop parsed: its sequence and generation, and the ordinal of
@@ -444,7 +501,6 @@ impl TapeCore {
                 stage,
                 nested: Vec::new(),
                 screens: Screens::default(),
-                unreplayable: false,
             }),
             depth: AtomicUsize::new(0),
             outer: Mutex::new(String::new()),
@@ -662,18 +718,6 @@ impl TapeCore {
                 kind: NOTE_UNWOUND_IN.to_string(),
                 text: unwound_in_text(door, request),
             });
-    }
-
-    /// Something no replay of this tape can make happened: said once.
-    pub(crate) fn unreplayable(&self, why: &str) {
-        let mut rec = self.lock();
-        if std::mem::replace(&mut rec.unreplayable, true) {
-            return;
-        }
-        rec.stage.lock_or_recover().writer.append(&Item::Note {
-            kind: NOTE_UNREPLAYABLE.to_string(),
-            text: why.to_string(),
-        });
     }
 
     /// Close the open frame now, for `why`.

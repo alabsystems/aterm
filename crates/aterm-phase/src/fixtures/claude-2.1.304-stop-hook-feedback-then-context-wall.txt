@@ -1,0 +1,22 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Stop hook (command ./sf.sh) answering {"hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": "run the tests again before you stop"}} after an ordinary reply, the stub then answering every request 400 prompt is too long: the summary `⏺ Ran 1 stop hook`, its `⎿  Stop hook feedback: …` row, and the continuation's real context wall right under it, no blank row between
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ say nothing
+
+⏺ Hi! I am the local lab stub, not a model. (reply 5)
+
+⏺ Ran 1 stop hook (ctrl+o to expand)
+  ⎿  Stop hook feedback: run the tests again before you stop
+  ⎿  Context limit reached · /compact or /clear to continue
+
+✻ Churned for 6s · done 7:59 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

@@ -13,6 +13,10 @@ use crate::lib::*;
 use crate::de::{self, IntoDeserializer};
 use crate::ser;
 
+// aterm's own (`de/text_key.rs`): a map key read back from the text a
+// string-keyed format wrote it as.
+pub use crate::de::text_key::{KeyText, TextKeyDeserializer};
+
 ////////////////////////////////////////////////////////////////////////////////
 
 // For structs that contain a PhantomData. We do not want the trait

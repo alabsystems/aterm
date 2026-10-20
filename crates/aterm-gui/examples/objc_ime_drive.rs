@@ -28,20 +28,35 @@
 //! 5. `doCommandBySelector:` and `unmarkText`, the two rows that leave preedit
 //!    without committing.
 //! 6. The candidate-window rectangle, against a cursor area this file sets.
-//! 7. A real `NSEvent` through `keyDown:` (the dead-key path). Whether the input
-//!    source produces marked text depends on the machine's keyboard layout, so the
-//!    stage reports, and fails only on an outcome wrong under every layout.
-//! 8. The same Option+E with Option as Alt (`WindowExtMacOS::set_option_as_alt`,
+//! 7. A real `NSEvent` through `keyDown:` (the dead-key path): each Option chord
+//!    of [`macos::CHORDS`] (the U.S. Option dead keys E, U, I, N and the grave key,
+//!    and Option+B, which types `∫` there) built by CoreGraphics, as a key press is,
+//!    sent while the window is key in the active app. The input method composes only then: an event built by
+//!    `+keyEventWithType:…`, or one sent to an inactive app, composed nothing on
+//!    macOS 27 (measured 2026-10-19). Whether the input source produces marked text
+//!    depends on the machine's keyboard layout, so the stage reports, and fails only
+//!    on an outcome wrong under every layout.
+//! 8. The same chords with Option as Alt (`WindowExtMacOS::set_option_as_alt`,
 //!    which aterm sets in Meta mode while the terminal takes the window's typing):
-//!    no dead key, no preedit, and a key event whose text is the bare `e`
-//!    (ATERM-KI-1015-9).
+//!    for each, no dead key, no preedit, and one key event whose text is the key's
+//!    bare character (ATERM-KI-1015-9), so Option+B is `b`, never `∫`. Stage 7 is
+//!    its control. "No dead key" claims something only for a chord whose stage 7
+//!    press started one. Stages 7 and 8 judge only presses of the keys they send:
+//!    while the drive is the active app a person's typing reaches its window (seen
+//!    at the desk on 2026-10-19), and any other key is shown and left out.
 //! 9. The non-key mouse paths through `update_modifiers`.
 //!
 //! # Exit codes (read by `aterm_verify::stages::OBJC_DRIVES`)
 //!
-//! * `0`: every stage that could run, ran, and agreed.
+//! * `0`: every stage that could run, ran, and agreed, and stage 7's control
+//!   composed for every dead key of [`macos::CHORDS`], so stage 8's "no dead key"
+//!   was measured for each.
 //! * `1`: a finding.
 //! * `2`: not run (no event loop, no view, or no input context). Never a pass.
+//! * `3`: every stage agreed, but stage 7's control did not compose for every
+//!   dead key (macOS did not make the drive the active app, or this layout's
+//!   Option chords are other keys), so stage 8 measured the keys' text and not "no
+//!   dead key" for each. A weaker pass.
 
 /// Every stage agreed.
 #[cfg(target_os = "macos")]
@@ -51,6 +66,10 @@ const PASS: i32 = 0;
 const FAIL: i32 = 1;
 /// The drive could not execute here. Not a pass.
 const NOT_RUN: i32 = 2;
+/// Every stage agreed, but stage 8's control did not compose, so "no dead key"
+/// was not measured.
+#[cfg(target_os = "macos")]
+const PASS_UNCONTROLLED: i32 = 3;
 
 #[cfg(not(target_os = "macos"))]
 fn main() -> std::process::ExitCode {
@@ -68,21 +87,28 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::ffi::c_void;
     use std::time::{Duration, Instant};
 
     use aterm_objc::{Bool, CGRect, Id, NSRange, Obj, Sel, checked_msg, class, ns_string, sel};
-    use winit::application::ApplicationHandler;
-    use winit::event::{Ime, WindowEvent};
-    use winit::event_loop::ActiveEventLoop;
-    use winit::platform::macos::{OptionAsAlt, WindowExtMacOS as _};
-    use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
-    use winit::window::{Window, WindowId};
+    use aterm_window::application::ApplicationHandler;
+    use aterm_window::event::{Ime, WindowEvent};
+    use aterm_window::event_loop::ActiveEventLoop;
+    use aterm_window::keyboard::{KeyCode, PhysicalKey};
+    use aterm_window::platform::macos::{OptionAsAlt, WindowExtMacOS as _};
+    use aterm_window::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
+    use aterm_window::window::{Window, WindowId};
 
-    use super::{FAIL, NOT_RUN, PASS};
+    use super::{FAIL, NOT_RUN, PASS, PASS_UNCONTROLLED};
 
     /// Long enough for macOS to launch its `NSApplication` and hand back a
     /// window; past it the drive reports NOT RUN rather than passing.
     const BUDGET: Duration = Duration::from_secs(30);
+
+    /// How long stage 7 waits for macOS to make the drive the active app before
+    /// it runs anyway and reports that its control could not compose. Past it the
+    /// drive still passes, with exit 3, which says what went unmeasured.
+    const FOCUS_WAIT: Duration = Duration::from_secs(10);
 
     /// `NSNotFound`, which is `NSIntegerMax`. `replacementRange:` is documented
     /// to be `{NSNotFound, 0}` when the input method is not replacing anything,
@@ -188,53 +214,160 @@ mod macos {
         }
     }
 
-    /// An Option+E key-down `NSEvent` as AppKit builds it on the U.S. layout:
-    /// `keyCode` 14 (`E` on ANSI), `NSEventModifierFlagOption`, `characters` the
-    /// acute dead key's `´`, `charactersIgnoringModifiers` `e`. `None` if a string or
-    /// the event could not be built.
-    fn option_e_key_down() -> Option<Obj> {
-        let (Some(chars), Some(bare)) = (ns_string("´"), ns_string("e")) else {
-            return None;
-        };
-        const NS_KEY_DOWN: usize = 10;
-        const NS_ALTERNATE: usize = 1 << 19;
-        // SAFETY: `+[NSEvent keyEventWithType:location:modifierFlags:timestamp:
-        // windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:
-        // keyCode:]`, twelve parameters counting the class and `_cmd`, inside
-        // `MsgFn`'s sixteen; a nil `context:` is documented. The result is
-        // autoreleased, and `Obj::retain` takes the +1 the caller holds.
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventCreateKeyboardEvent(
+            source: *const c_void,
+            keycode: u16,
+            keydown: bool,
+        ) -> *mut c_void;
+        fn CGEventSetFlags(event: *mut c_void, flags: u64);
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(cf: *const c_void);
+    }
+
+    /// One Option chord stages 7 and 8 press: its ANSI `keyCode`, the key winit
+    /// reports, and whether the U.S. layout makes it a dead key.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct Chord {
+        code: u16,
+        key: KeyCode,
+        dead: bool,
+    }
+
+    /// The U.S. layout's Option dead keys (acute, umlaut, circumflex, tilde,
+    /// grave) and Option+B, which types `∫` there: the chord ATERM-KI-1015-9 names,
+    /// whose Meta form must be ESC `b`.
+    pub(super) const CHORDS: [Chord; 6] = [
+        Chord {
+            code: 14,
+            key: KeyCode::KeyE,
+            dead: true,
+        },
+        Chord {
+            code: 32,
+            key: KeyCode::KeyU,
+            dead: true,
+        },
+        Chord {
+            code: 34,
+            key: KeyCode::KeyI,
+            dead: true,
+        },
+        Chord {
+            code: 45,
+            key: KeyCode::KeyN,
+            dead: true,
+        },
+        Chord {
+            code: 50,
+            key: KeyCode::Backquote,
+            dead: true,
+        },
+        Chord {
+            code: 11,
+            key: KeyCode::KeyB,
+            dead: false,
+        },
+    ];
+
+    /// An Option+`code` key-down `NSEvent` built as a key press is: a CoreGraphics
+    /// keyboard event (`keyCode` `code` with `kCGEventFlagMaskAlternate`) wrapped by
+    /// `+eventWithCGEvent:`, so AppKit reads its characters off the current layout
+    /// (on the U.S. layout Option+E's `characters` is empty, the acute dead key, and
+    /// its `charactersIgnoringModifiers` is `e`). Only an event of this shape reaches
+    /// the input method's dead-key handling; one built by `+keyEventWithType:…` with
+    /// the same strings composed nothing. `None` if the event could not be built.
+    fn option_key_down(code: u16) -> Option<Obj> {
+        const CG_FLAG_ALTERNATE: u64 = 1 << 19;
+        // SAFETY: the CoreGraphics prototypes above are the headers'. A null
+        // source is documented. `+eventWithCGEvent:` is `@@:^{__CGEvent=}`; its
+        // result is autoreleased and holds its own reference to the CGEvent, so
+        // releasing the one `CGEventCreateKeyboardEvent` returned is the
+        // documented balance, and `Obj::retain` takes the +1 the caller holds.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(
-                Id,
-                Sel,
-                usize,
-                aterm_objc::CGPoint,
-                usize,
-                f64,
-                isize,
-                Id,
-                Id,
-                Id,
-                Bool,
-                u16,
-            ) -> Id = checked_msg();
-            let event = f(
-                class(c"NSEvent").as_id(),
-                sel!(
-                    keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:
-                ),
-                NS_KEY_DOWN,
-                aterm_objc::CGPoint { x: 0.0, y: 0.0 },
-                NS_ALTERNATE,
-                0.0,
-                0,
-                Id::NIL,
-                chars.id(),
-                bare.id(),
-                Bool::NO,
-                14,
-            );
+            let cg = CGEventCreateKeyboardEvent(std::ptr::null(), code, true);
+            if cg.is_null() {
+                return None;
+            }
+            CGEventSetFlags(cg, CG_FLAG_ALTERNATE);
+            let f: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) -> Id = checked_msg();
+            let event = f(class(c"NSEvent").as_id(), sel!(eventWithCGEvent:), cg);
+            CFRelease(cg);
             Obj::retain(event)
+        }
+    }
+
+    /// A key event's `-charactersIgnoringModifiers`, `None` if nil.
+    ///
+    /// # Safety
+    /// `event` must be a live key `NSEvent` (the getter raises on any other type).
+    unsafe fn chars_ignoring_modifiers(event: Id) -> Option<String> {
+        // SAFETY: `-charactersIgnoringModifiers` is `@16@0:8` and answers for a
+        // key event, which the caller guarantees; the string is +0 and copied out.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+            let s = f(event, sel!(charactersIgnoringModifiers));
+            (!s.is_null()).then(|| aterm_objc::ns_string_to_rust(s))
+        }
+    }
+
+    /// `+[NSApplication sharedApplication]`.
+    fn ns_app() -> Id {
+        // SAFETY: `+sharedApplication` is `@16#0:8` on a linked class; the
+        // event loop has already created the application object.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+            f(class(c"NSApplication").as_id(), sel!(sharedApplication))
+        }
+    }
+
+    /// Whether the input method sees `view`'s keys: the app is active, the
+    /// view's window is key, and the view's input context is the current one.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct Focus {
+        active: bool,
+        key: bool,
+        current: bool,
+    }
+
+    impl Focus {
+        fn sees_keys(self) -> bool {
+            self.active && self.key && self.current
+        }
+
+        fn show(self) -> String {
+            format!(
+                "app active = {}, window key = {}, the view's input context is the current one = {}",
+                self.active, self.key, self.current
+            )
+        }
+    }
+
+    /// `view`'s [`Focus`] now.
+    ///
+    /// # Safety
+    /// `view` must be a live `WinitView`.
+    unsafe fn focus_of(view: Id) -> Focus {
+        // SAFETY: `-isActive` and `-isKeyWindow` are `B16@0:8`; `-window`,
+        // `-inputContext` and `+currentInputContext` are `@16@0:8` (+0). `view`
+        // is live, so its window is live or nil, and a send to nil answers NO.
+        unsafe {
+            let b: unsafe extern "C-unwind" fn(Id, Sel) -> Bool = checked_msg();
+            let o: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+            let window = o(view, sel!(window));
+            let ctx = o(view, sel!(inputContext));
+            let current = o(
+                class(c"NSTextInputContext").as_id(),
+                sel!(currentInputContext),
+            );
+            Focus {
+                active: b(ns_app(), sel!(isActive)).as_bool(),
+                key: !window.is_null() && b(window, sel!(isKeyWindow)).as_bool(),
+                current: !ctx.is_null() && current == ctx,
+            }
         }
     }
 
@@ -316,8 +449,19 @@ mod macos {
         ime: Vec<Ime>,
         /// The non-IME window events stage 9 needs, as short names.
         mouse: Vec<&'static str>,
-        /// The text of every key press winit has delivered since stage 8 cleared it.
-        keys: Vec<Option<String>>,
+        /// Every press of a key stages 7 and 8 send ([`CHORDS`]) that winit has
+        /// delivered since stage 7 or 8 cleared it, with its text.
+        keys: Vec<(KeyCode, Option<String>)>,
+        /// Every other key press since then. The drive sends none, so these are a
+        /// person's, typed while the drive held the keyboard: shown, and left out
+        /// of the checks.
+        foreign: Vec<String>,
+        /// When stage 7 asked macOS to make the drive the active app.
+        focus_asked: Option<Instant>,
+        /// The chords whose stage 7 press started a composition: `None` until it ran.
+        control_composed: Option<Vec<KeyCode>>,
+        /// Stage 8 ran without a control that composed (exit 3).
+        uncontrolled: bool,
         done: bool,
         stage: usize,
         /// Expectations a stage queued for AFTER the next pump, because the
@@ -335,6 +479,17 @@ mod macos {
         /// Everything winit has queued, in order, cleared.
         fn drain(&mut self) -> Vec<Ime> {
             std::mem::take(&mut self.ime)
+        }
+
+        /// Prints, and clears, the key presses the drive did not send.
+        fn show_foreign(&mut self) {
+            let foreign = std::mem::take(&mut self.foreign);
+            if !foreign.is_empty() {
+                println!(
+                    "    NOTE: key presses this drive did not send arrived while it held the \
+                     keyboard (a person typing), left out of the checks: {foreign:?}"
+                );
+            }
         }
     }
 
@@ -360,7 +515,7 @@ mod macos {
             }
             let attrs = Window::default_attributes()
                 .with_title("objc-ime-drive")
-                .with_inner_size(winit::dpi::LogicalSize::new(480.0, 320.0))
+                .with_inner_size(aterm_window::dpi::LogicalSize::new(480.0, 320.0))
                 .with_visible(false);
             match el.create_window(attrs) {
                 Ok(w) => {
@@ -378,9 +533,18 @@ mod macos {
         fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, e: WindowEvent) {
             match e {
                 WindowEvent::Ime(ime) => self.ime.push(ime),
-                // Stage 8's evidence that Option+E reached the app as a key.
+                // Stages 7 and 8's evidence of what each chord reached the app as.
                 WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
-                    self.keys.push(event.text.as_ref().map(|t| t.to_string()));
+                    let text = event.text.as_ref().map(|t| t.to_string());
+                    let sent = CHORDS
+                        .iter()
+                        .find(|c| event.physical_key == PhysicalKey::Code(c.key));
+                    if let Some(c) = sent {
+                        self.keys.push((c.key, text));
+                    } else {
+                        self.foreign
+                            .push(format!("{:?} {text:?}", event.physical_key));
+                    }
                 }
                 // Stage 9's evidence that its synthetic events really reached
                 // `view.rs`'s mouse path, and were not dropped by
@@ -421,7 +585,14 @@ mod macos {
                 4 => self.stage_clamp(view),
                 5 => self.stage_leave_preedit(view),
                 6 => self.stage_candidate_rect(view),
-                7 => self.stage_dead_key(view),
+                7 => {
+                    if !self.focused_for_control(view) {
+                        // Asked again after the next pump.
+                        self.stage = 7;
+                        return;
+                    }
+                    self.stage_dead_key(view);
+                }
                 8 => self.stage_option_as_alt(view),
                 9 => self.stage_mouse_paths(view),
                 _ => {
@@ -733,8 +904,8 @@ mod macos {
             };
             let scale = w.scale_factor();
             w.set_ime_cursor_area(
-                winit::dpi::LogicalPosition::new(40.0, 60.0),
-                winit::dpi::LogicalSize::new(10.0, 20.0),
+                aterm_window::dpi::LogicalPosition::new(40.0, 60.0),
+                aterm_window::dpi::LogicalSize::new(10.0, 20.0),
             );
             // SAFETY: `view` is live; a null `actualRange:` is what AppKit
             // passes when it wants no out-parameter, and the body ignores it.
@@ -802,18 +973,38 @@ mod macos {
             );
         }
 
-        /// Stage 7: a real `NSEvent` through `keyDown:`, the only path into
+        /// Stage 7's precondition: the input method sees only the keys of the
+        /// key window in the active app, so the first call shows the window and
+        /// asks macOS to activate the drive (the quiet builder launched it inactive,
+        /// beside whatever the developer is typing in). `true` once the input
+        /// method sees the view's keys, or once [`FOCUS_WAIT`] has passed without
+        /// that: macOS may refuse the activation, and stage 7 then runs and says its
+        /// control could not compose.
+        fn focused_for_control(&mut self, view: Id) -> bool {
+            let asked = *self.focus_asked.get_or_insert_with(|| {
+                if let Some(window) = self.window.as_ref() {
+                    window.set_visible(true);
+                    window.focus_window();
+                }
+                Instant::now()
+            });
+            // SAFETY: `view` is live.
+            unsafe { focus_of(view) }.sees_keys() || asked.elapsed() > FOCUS_WAIT
+        }
+
+        /// Stage 7: real `NSEvent`s through `keyDown:`, the only path into
         /// `-interpretKeyEvents:` and so the system input method (where a dead key
-        /// becomes marked text). What the input method does depends on the machine's
-        /// keyboard layout, so the outcome is reported; only an outcome wrong under
-        /// every layout is a finding (preedit while the view believes IME is
-        /// disabled; an abort takes the process).
-        ///
-        /// `keyCode` 14 is `E` on ANSI: with Option, the acute dead key on the U.S.
-        /// layout.
+        /// becomes marked text): each chord of [`CHORDS`], its composition (if any)
+        /// discarded before the next. What the input method does depends on the
+        /// machine's keyboard layout, so the outcome is reported; only an outcome wrong
+        /// under every layout is a finding (preedit while the view believes IME is
+        /// disabled; an abort takes the process). Which chords composed is stage 8's
+        /// control.
         fn stage_dead_key(&mut self, view: Id) {
-            println!("\n=== 7. A REAL KEY EVENT (dead-key path) ===");
+            println!("\n=== 7. REAL KEY EVENTS (the dead-key path) ===");
             let _ = self.drain();
+            self.keys.clear();
+            self.foreign.clear();
             // SAFETY: `-inputContext` is `@@:` on `NSResponder`; `view` is live.
             let ctx: Id = unsafe {
                 let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
@@ -823,28 +1014,49 @@ mod macos {
                 println!("    SKIPPED: no NSTextInputContext, so interpretKeyEvents: goes nowhere");
                 return;
             }
-            let Some(event) = option_e_key_down() else {
-                self.report
-                    .fail("+[NSEvent keyEventWithType:…] could not be built".to_owned());
-                return;
-            };
-            println!("    built an Option+E NSEvent (keyCode 14, NSEventModifierFlagOption)");
-            // SAFETY: `keyDown:` is registered `v@:@` and `event` is the live
-            // `NSEvent` just built — exactly what AppKit delivers.
-            unsafe {
-                let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
-                f(view, sel!(keyDown:), event.id());
+            // SAFETY: `view` is live.
+            let focus = unsafe { focus_of(view) };
+            println!("    {}", focus.show());
+            let mut composed = Vec::new();
+            for chord in CHORDS {
+                let Some(event) = option_key_down(chord.code) else {
+                    self.report.fail(format!(
+                        "+[NSEvent eventWithCGEvent:] built no Option+{:?} key event",
+                        chord.key
+                    ));
+                    return;
+                };
+                // SAFETY: `keyDown:` is registered `v@:@` and `event` is the live
+                // `NSEvent` just built — exactly what AppKit delivers.
+                unsafe {
+                    let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
+                    f(view, sel!(keyDown:), event.id());
+                }
+                // SAFETY: `view` is live.
+                let marked = unsafe { has_marked_text(view) };
+                println!(
+                    "    Option+{:?} (keyCode {}, built from a CGEvent): hasMarkedText = {marked}",
+                    chord.key, chord.code
+                );
+                if marked {
+                    composed.push(chord.key);
+                    // SAFETY: `view` is live; `unmarkText` discards the composition
+                    // in the view and its input context, so the next chord starts
+                    // from none.
+                    unsafe { send_void(view, sel!(unmarkText)) };
+                }
             }
             println!(
-                "    keyDown: returned without aborting — the trampoline and its panic \
-                      guard both held"
+                "    keyDown: returned {} times without aborting — the trampoline and its panic \
+                 guard both held",
+                CHORDS.len()
             );
-            // SAFETY: `view` is live.
-            let marked = unsafe { has_marked_text(view) };
-            println!("    hasMarkedText after the dead key = {marked}");
+            self.control_composed = Some(composed);
             self.pending = Some(Box::new(|d: &mut Driver| {
                 let got = d.drain();
-                println!("    events: {}", show_all(&got));
+                let keys = std::mem::take(&mut d.keys);
+                println!("    events: {}; key texts: {keys:?}", show_all(&got));
+                d.show_foreign();
                 // The one outcome that is wrong under every layout.
                 let disabled_then_preedit = got
                     .windows(2)
@@ -856,9 +1068,10 @@ mod macos {
                 );
                 println!(
                     "    NOTE: whether a dead key composes here depends on the machine's \
-                     keyboard layout; the encoding-level claim this stage makes is that a real \
-                     NSEvent reaches keyDown: through the registered v@:@ trampoline and \
-                     interpretKeyEvents: runs."
+                     keyboard layout, and on macOS making this drive the active app; the \
+                     encoding-level claim this stage makes is that a real NSEvent reaches \
+                     keyDown: through the registered v@:@ trampoline and interpretKeyEvents: \
+                     runs."
                 );
             }));
         }
@@ -867,15 +1080,16 @@ mod macos {
         /// `option_as_meta`, the default) on a window whose typing reaches the
         /// terminal (`App::sync_option_as_alt`). `keyDown:` hands `-interpretKeyEvents:`
         /// the event rebuilt with its `-charactersIgnoringModifiers` (`replace_event`
-        /// in `view.rs`), so the same Option+E as stage 7 starts no dead key under any
-        /// layout: no marked text, no preedit, and the key event's text is the bare
-        /// `e` the encoder sends after ESC. Stage 7's composition (if the layout made
-        /// one) is discarded first.
+        /// in `view.rs`), so each chord of stage 7 starts no dead key under any layout:
+        /// no marked text, no preedit, and one key event whose text is the key's bare
+        /// character (`e`, `u`, `i`, `n`, `` ` `` and `b` on the U.S. layout), which the
+        /// encoder sends after ESC.
+        ///
+        /// Stage 7 is the control. "No marked text" here says that Option as Alt
+        /// stopped a dead key only for a chord whose identical stage 7 press composed;
+        /// the drive's verdict says which.
         fn stage_option_as_alt(&mut self, view: Id) {
-            println!("\n=== 8. OPTION AS ALT: Option+E is no dead key ===");
-            // SAFETY: `view` is live; `unmarkText` discards stage 7's composition in
-            // the view and its input context.
-            unsafe { send_void(view, sel!(unmarkText)) };
+            println!("\n=== 8. OPTION AS ALT: no Option chord is a dead key ===");
             let Some(window) = self.window.as_ref() else {
                 self.report.fail("the window is gone".to_owned());
                 return;
@@ -888,39 +1102,81 @@ mod macos {
             );
             let _ = self.drain();
             self.keys.clear();
-            let Some(event) = option_e_key_down() else {
-                self.report
-                    .fail("+[NSEvent keyEventWithType:…] could not be built".to_owned());
-                return;
-            };
-            // SAFETY: `keyDown:` is registered `v@:@` and `event` is the live
-            // `NSEvent` just built — exactly what AppKit delivers.
-            unsafe {
-                let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
-                f(view, sel!(keyDown:), event.id());
-            }
+            self.foreign.clear();
             // SAFETY: `view` is live.
-            let marked = unsafe { has_marked_text(view) };
-            self.report.expect(
-                "Option as Alt leaves no marked text after Option+E",
-                !marked,
-                format!("hasMarkedText = {marked}"),
-            );
-            self.pending = Some(Box::new(|d: &mut Driver| {
+            let focus = unsafe { focus_of(view) };
+            println!("    {}", focus.show());
+            let mut bare = Vec::new();
+            for chord in CHORDS {
+                let Some(event) = option_key_down(chord.code) else {
+                    self.report.fail(format!(
+                        "+[NSEvent eventWithCGEvent:] built no Option+{:?} key event",
+                        chord.key
+                    ));
+                    return;
+                };
+                // SAFETY: `event` is the key event just built.
+                let ignoring = unsafe { chars_ignoring_modifiers(event.id()) };
+                // SAFETY: `keyDown:` is registered `v@:@` and `event` is the live
+                // `NSEvent` just built — exactly what AppKit delivers.
+                unsafe {
+                    let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
+                    f(view, sel!(keyDown:), event.id());
+                }
+                // SAFETY: `view` is live.
+                let marked = unsafe { has_marked_text(view) };
+                self.report.expect(
+                    &format!(
+                        "Option as Alt leaves no marked text after Option+{:?}",
+                        chord.key
+                    ),
+                    !marked,
+                    format!("hasMarkedText = {marked}"),
+                );
+                if marked {
+                    // SAFETY: as in stage 7.
+                    unsafe { send_void(view, sel!(unmarkText)) };
+                }
+                bare.push((chord.key, ignoring));
+            }
+            // The control speaks for a chord only if the input method saw both of
+            // its presses: a stage 7 that composed, then a focus lost before this
+            // stage, would make "no marked text" here mean nothing.
+            let composed = self.control_composed.clone().unwrap_or_default();
+            let dead: Vec<KeyCode> = CHORDS.iter().filter(|c| c.dead).map(|c| c.key).collect();
+            let controlled = focus.sees_keys() && dead.iter().all(|k| composed.contains(k));
+            self.pending = Some(Box::new(move |d: &mut Driver| {
                 let got = d.drain();
                 let keys = std::mem::take(&mut d.keys);
                 println!("    events: {}; key texts: {keys:?}", show_all(&got));
+                d.show_foreign();
                 d.report.expect(
-                    "no preedit arrives for Option+E with Option as Alt",
+                    "no preedit arrives for an Option chord with Option as Alt",
                     !got.iter()
                         .any(|e| matches!(e, Ime::Preedit(s, _) if !s.is_empty())),
                     show_all(&got),
                 );
                 d.report.expect(
-                    "Option+E arrives as a key press whose text is the bare e",
-                    keys == [Some("e".to_owned())],
-                    format!("{keys:?}"),
+                    "each chord arrives as one key press whose text is the key's bare character",
+                    bare.iter()
+                        .all(|(_, b)| b.as_deref().is_some_and(|b| !b.is_empty()))
+                        && keys == bare,
+                    format!("{keys:?} against charactersIgnoringModifiers {bare:?}"),
                 );
+                if controlled {
+                    println!(
+                        "    CONTROLLED: stage 7's identical presses of {dead:?} each started a \
+                         dead key, so the checks above judge what Option as Alt does to one"
+                    );
+                } else {
+                    println!(
+                        "    UNCONTROLLED: of the dead keys {dead:?}, stage 7 composed only \
+                         {composed:?} (or the input method stopped seeing this view's keys), so \
+                         this stage measured the keys' text, not that Option as Alt stops a \
+                         dead key for each"
+                    );
+                    d.uncontrolled = true;
+                }
                 if let Some(window) = d.window.as_ref() {
                     window.set_option_as_alt(OptionAsAlt::None);
                 }
@@ -1033,8 +1289,11 @@ mod macos {
 
     /// Drive the loop until every stage has run, then report.
     pub fn run() -> i32 {
-        // The quiet builder (Accessory, no launch activation): `verify appkit` runs
-        // this drive beside a developer who is typing somewhere else.
+        // The quiet builder (Accessory, no launch activation), so stages 1 to 6 run
+        // without taking the keyboard from whoever is at the desk. Stage 7's control
+        // needs the drive to be the active app and asks for that; from then until
+        // the drive exits, tens of milliseconds, keys a person types reach this
+        // window. Stages 7 and 8 judge only the key they send and show any other.
         let mut el = match aterm_gui::quiet_driver_event_loop_builder::<()>().build() {
             Ok(el) => el,
             Err(e) => {
@@ -1048,6 +1307,10 @@ mod macos {
             ime: Vec::new(),
             mouse: Vec::new(),
             keys: Vec::new(),
+            foreign: Vec::new(),
+            focus_asked: None,
+            control_composed: None,
+            uncontrolled: false,
             done: false,
             stage: 0,
             pending: None,
@@ -1074,7 +1337,14 @@ mod macos {
             return NOT_RUN;
         }
         println!("\n=== VERDICT ===");
-        if driver.report.findings.is_empty() {
+        if driver.report.findings.is_empty() && driver.uncontrolled {
+            println!(
+                "objc-ime-drive: OK, WEAKER — every stage that ran agreed, but stage 8's \
+                 control did not compose for every dead key, so whether Option as Alt stops \
+                 each dead key was not measured."
+            );
+            PASS_UNCONTROLLED
+        } else if driver.report.findings.is_empty() {
             println!("objc-ime-drive: OK — every stage that ran agreed.");
             PASS
         } else {

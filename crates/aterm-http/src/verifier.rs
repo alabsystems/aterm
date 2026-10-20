@@ -13,13 +13,14 @@
 //! | platform | who decides | revocation |
 //! | --- | --- | --- |
 //! | macOS / iOS | `SecTrustEvaluateWithError` ([`apple`]) | end-entity, from a stapled OCSP response only (network fetch is off) |
-//! | Windows | `CertGetCertificateChain` + `CertVerifyCertificateChainPolicy` ([`windows`]) | end-entity, may retrieve over the network |
+//! | Windows | `CertGetCertificateChain` + `CertVerifyCertificateChainPolicy` ([`windows`]), the name then held to the subjectAltName by webpki | end-entity, may retrieve over the network |
 //! | Linux, BSD | the distro's on-disk CA store, verified by `rustls`'s own webpki (`unix`) | **none** |
 //! | wasm32, Android, anything else | nothing — construction fails ([`unsupported`]) | n/a |
 //!
 //! These match `rustls-platform-verifier` except that macOS forbids network
-//! fetching during verification (see [`apple`]) and the remaining targets fail
-//! closed instead of falling back to a BUNDLED root set.
+//! fetching during verification (see [`apple`]), Windows refuses a leaf crypt32
+//! would match on its subject CN alone (see [`windows`]), and the remaining targets
+//! fail closed instead of falling back to a BUNDLED root set.
 //!
 //! # Fail closed, and the shapes that enforce it
 //!
@@ -32,8 +33,9 @@
 //!   `ServerCertVerified::assertion()` after an arm returned `Ok(())`. There is
 //!   no `match` here whose catch-all accepts, and no arm returns `Ok` except on
 //!   an explicit positive result from the OS — `true` from
-//!   `SecTrustEvaluateWithError`, `dwError == 0` from the Windows SSL policy, an
-//!   `Ok` from `WebPkiServerVerifier`.
+//!   `SecTrustEvaluateWithError`, `dwError == 0` from the Windows SSL policy (and
+//!   then a subjectAltName that names the server), an `Ok` from
+//!   `WebPkiServerVerifier`.
 //! * An FFI call that fails, a certificate the OS will not parse, a hostname
 //!   that will not encode, an empty root store: all `Err`. So is a platform
 //!   that never answers: macOS's evaluation runs under a deadline

@@ -303,8 +303,12 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// the upgrade's notice (first, or a re-ask after `upgrade::REASK_S`) or
     /// the release line owed by a give-up, void or stop; or it may give up
     /// asking. It returns what it took (`Some`, journaled `HOST seq=<n>
-    /// background <word>`) or `None`. Ending the agent is an idle point's alone.
-    act fn at_background(&self) -> Option<String> {
+    /// background <word>`) and WHICH TURN IT TYPED
+    /// ([`crate::supervise::policy::turn_end::HostTurn`], from its step's own word as
+    /// at an idle point: the notice asks for a stopping point, the release
+    /// is the worker's work resumed), or `None`. Ending the agent is an idle
+    /// point's alone.
+    act fn at_background(&self) -> Option<(String, crate::supervise::policy::turn_end::HostTurn)> {
         None
     }
     /// THE AGENT RESTS AT A POINT A GUARD WITHHELD FROM THE HOST: the host
@@ -361,8 +365,8 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// front, and the host's hand the one on the session). `[harness]
     /// relaunch = false` does not limit it: it does not refuse a person's
     /// explicit restart (ruling 1, 2026-10-08). `Some(promised)` where it
-    /// would: the frozen mail and the warning name that restart instead of
-    /// `signal term` and [`Self::resume_command`] — as the server's own words
+    /// would: the warning names that restart instead of `signal term` and
+    /// [`Self::resume_command`] — as the server's own words
     /// do — and, only where `promised` (its exit relaunched on the agent's
     /// own conversation, [`crate::harness::relaunch::resumes_on_exit`]: never
     /// a Codex's), say "aterm relaunches it on its conversation". The
@@ -470,16 +474,27 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn finished_at_check(&self) -> bool {
         false
     }
-    /// THE TURN THE CONVERSATION ENDS ON, by its key
-    /// (`crate::harness::upgrade::FinishedScan::last_turn_key`), as the read
-    /// [`Self::finished`] just made left it — as far back as the finish is
-    /// read, so Claude Code's idle compaction after a person's exchange (its
-    /// summary and restored files, past [`Self::transcript_tail`]'s 256 KiB)
-    /// hides the turn not: what a left exchange's ledger row is matched by
-    /// at a later loop's points ([`TurnEndReading::left_record`]; the merge
-    /// review's XR-1). The default reads none, and the loop keys the turn by
+    /// THE TURN THE CONVERSATION ENDS ON, by every key that names it
+    /// (`crate::harness::upgrade::FinishedScan::last_turn`: its last row's
+    /// and the prompt that opened it), as the read [`Self::finished`] just
+    /// made left it — as far back as the finish is read, so Claude Code's
+    /// idle compaction after a person's exchange (its summary and restored
+    /// files, past [`Self::transcript_tail`]'s 256 KiB) hides the turn not:
+    /// what a left exchange's ledger row is matched by at a later loop's
+    /// points ([`TurnEndReading::left_record`]; the merge review's XR-1). The
+    /// default reads none, and the loop reads the turn from
     /// [`Self::transcript_tail`].
-    fn last_turn_key(&self) -> Option<String> {
+    fn last_turn(&self) -> Option<crate::harness::upgrade::LastTurn> {
+        None
+    }
+    /// WHAT THE SESSION'S REPOSITORY HOLDS THAT NO REMOTE HAS
+    /// ([`crate::harness::repo_work::probe`] in the session's working
+    /// directory: uncommitted, untracked, stashed or unpushed work), asked
+    /// where the worker's words say it is done: the token ends no job while
+    /// any is left (`TurnEndReading::repo`, the turn-end policy's
+    /// `RULE_UNCOMMITTED`; the owner's rule of 2026-10-19). The default
+    /// finds none, as a probe that cannot run does.
+    fn repo_work(&self) -> Option<crate::harness::repo_work::RepoWork> {
         None
     }
     /// THE HOST STARTED THIS LOOP AS THE SESSION'S AUTOPILOT LEFT OFF: it
@@ -545,9 +560,10 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// move's carry-on is never held behind the limit it left. Asked where
     /// the screen draws no wall and the loop tracks no limit: at the first
     /// decisions after the loop starts or the agent's process or
-    /// conversation changes ([`Session::read_standing_limit`]), and where a
-    /// host step is about to be taken ([`Session::host_steps_here`]). The
-    /// host may read the agent again to answer: [`Self::agent_pid`] and
+    /// conversation changes ([`Session::read_standing_limit`]), at the
+    /// decisions of points the host wants a step at or a turn was seen
+    /// running before, and where a host step is about to be taken
+    /// ([`Session::host_steps_here`]). The host may read the agent again to answer: [`Self::agent_pid`] and
     /// [`Self::agent_conversation`] are read after it. The default reads none.
     fn standing_limit(&self) -> Option<crate::harness::upgrade::StandingLimit> {
         None
@@ -574,6 +590,16 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn transcript_tail_again(&self) -> Option<String> {
         self.transcript_tail()
     }
+    /// THE AGENT'S OWN TRANSCRIPT AND WHERE IT IS: the file the Claude Code
+    /// in the tab writes its conversation to now, found as
+    /// [`Self::transcript_tail`] finds it, and that same tail. What a tasked
+    /// session's result is snapshotted from at the done edge
+    /// (`supervise::task_mark`, [`crate::harness::result`]), and the file
+    /// `result full` reads later. `None`: none this host can read. The
+    /// default reads none.
+    fn transcript(&self) -> Option<(PathBuf, String)> {
+        None
+    }
 
     /// When the Claude Code whose transcript [`Self::transcript_tail`] last
     /// read was launched, unix seconds (its kernel start, as the host's
@@ -587,16 +613,23 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         None
     }
 
-    /// The loop's next try, told to the host (`Some`) or gone (`None`): the
-    /// deadline of the API wall's retry wait
-    /// ([`Session::wait_for_next`]'s `turn_end_due`, a
-    /// [`TurnEndAction::WaitUntil`] with `retry`), as a unix second,
-    /// and why. Told when the deadline changes or the wall clock and the
-    /// loop's (which stops while the machine sleeps) drift apart, never on
-    /// every step, so a tab can show `→ 14:05 · 3m00s` without ticking.
-    /// `None` when no retry wait stands (the try is being typed, the worker
-    /// works, the point waits for another reason, or the loop ended).
-    /// Reporting only. The default ignores it.
+    /// The loop's told wait, told to the host (`Some`) or gone (`None`): the
+    /// deadline of the API wall's retry wait (the next try, [`WaitKind::Retry`])
+    /// or of the short streak's back-off (a pause, [`WaitKind::BackOff`] with
+    /// the streak; `docs/DESIGN-harness-autopilot-2026-10-15.md` §10.5.3)
+    /// — [`Session::wait_for_next`]'s `turn_end_due`, a
+    /// [`TurnEndAction::WaitUntil`] of that `wait` — as a unix second, why,
+    /// and its kind. Told when the deadline or its kind changes or the wall
+    /// clock and the loop's (which stops while the machine sleeps) drift
+    /// apart, never on every step, so a tab can show `→ 14:05 · 3m00s`
+    /// without ticking. `None` when neither stands (the try is being typed,
+    /// the back-off ended in a decision, the worker works, the point waits
+    /// for another reason, or the loop ended). Reporting only: nothing the
+    /// loop decides reads what it told. The default ignores it, and so a
+    /// CLI `watch`, which has no host, pays nothing.
+    ///
+    /// [`WaitKind::Retry`]: crate::supervise::WaitKind::Retry
+    /// [`WaitKind::BackOff`]: crate::supervise::WaitKind::BackOff
     fn waiting(&self, plan: Option<WaitPlan>) {
         let _ = plan;
     }
@@ -619,6 +652,18 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// loop decides reads it back. The default ignores it.
     fn task_face(&self, face: crate::harness::acts::TaskFace) {
         let _ = face;
+    }
+
+    /// THE TASK'S FACE AT A LOOP'S START, RESTATED FROM THE JOURNAL
+    /// (§9.4.8, §10.2.7): a landing or a done a loop before this one read,
+    /// seeded and told again, with `noted_ms` — the wall time (unix ms) the
+    /// journal noted that end at — so a window that holds no face of the
+    /// session (a seamless update's new one) shows the time the work ended,
+    /// not the start's. Reporting only, as [`Self::task_face`]; the default
+    /// tells the face alone.
+    fn task_face_noted(&self, face: crate::harness::acts::TaskFace, noted_ms: i64) {
+        let _ = noted_ms;
+        self.task_face(face);
     }
 
     /// The line a person runs to resume the agent's own conversation after a
@@ -704,20 +749,24 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         let _ = standing;
     }
 
-    /// THE STALL CANARY'S SECOND RUNG ([`super::super::wall_memory`]): a screen no
-    /// reader names has stood, the agent's own title resting on the idle glyph,
-    /// for `Some(minutes)` — the screen has read busy on the agent's own
-    /// background work alone (told once when the stall passes 90 minutes), or
-    /// it is a dialog with no composer, box or busy row whose words have not
-    /// changed (30 minutes) — and `None` when it is over (the screen moved,
-    /// the agent works, the loop ended). A fault of aterm's own reading, not a
-    /// wait: the host keeps a record and an error line. The third rung (three
-    /// hours; an hour for a dialog) is an [`Exception`] of
+    /// THE STALL CANARY'S SECOND RUNG ([`super::super::wall_memory`]), told
+    /// once as it is reached, `Some` with what it stood on and for how long
+    /// ([`StallSeen`]), and `None` when it is over (the screen moved, the
+    /// agent works, its words moved, the loop ended). [`StallSeen::Unread`]:
+    /// a screen no reader names has stood, Claude Code's own title resting on
+    /// the idle glyph — busy on the agent's own background work alone (90
+    /// minutes), or a dialog with no composer, box or busy row whose words
+    /// have not changed (30) — a fault of aterm's own reading, not a wait.
+    /// [`StallSeen::OwnWork`]: agy's or Muse Code's own background work, which
+    /// their reader names, has run 90 minutes under words that stood still —
+    /// no title read and no screen unread, work that has not ended. Either
+    /// way the host keeps a record and a log line in the witness's words. The
+    /// third rung (three hours; an hour for a dialog) is an [`Exception`] of
     /// `ExceptionKind::Stalled` or `ExceptionKind::Dialog` through
     /// [`Self::exception`]. Nothing is typed either way. The default ignores
     /// it: the journal's `STALLED` line says it anyway.
-    fn stall_unread(&self, minutes: Option<u64>) {
-        let _ = minutes;
+    fn stall_unread(&self, stall: Option<StallSeen>) {
+        let _ = stall;
     }
 
     /// WHAT THE AGENT'S OWN SCREEN SAYS OF ITS ACCOUNT'S USAGE ([`UsageSeen`]:
@@ -725,9 +774,11 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// is filling), told from every read the loop makes, busy reads included:
     /// once per change, and again every
     /// [`crate::harness::accounts::CREDITS_RETELL_S`] while it says something.
-    /// FOR THE RECORD (accounts v2 §3.3): credits are work going on, never a
-    /// wall, and nothing the loop decides reads this — the host keeps it for
-    /// the account and its digest. The default ignores it.
+    /// FOR THE RECORD (accounts v2 §3.3): credits are never a wall, and
+    /// nothing the loop decides reads this — the host keeps it for the account
+    /// and its digest (the credits hold under `[harness] usage_credits =
+    /// false` reads the screen itself, `TurnEndReading::credits`). The default
+    /// ignores it.
     fn usage_seen(&self, seen: &UsageSeen) {
         let _ = seen;
     }
@@ -837,6 +888,52 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn login_superseded(&self) -> bool {
         false
     }
+
+    /// THE METHOD THE SESSION'S LOGIN ALREADY IS: what Claude Code's `/login`
+    /// method picker is answered with
+    /// ([`super::super::policy::login::pick_method`]) — read from what the
+    /// agent's own process and profile say, never guessed. Asked only where
+    /// a lost login of a carried agent or its `/login` dialog is on the
+    /// screen: the turn-end loop's reading (what the owner's notice says
+    /// aterm can choose) and the approval loop's, at the picker of its own
+    /// `/login`. `None` (the default): nothing says, and the picker is the
+    /// owner's.
+    fn login_method(&self) -> Option<aterm_phase::LoginMethod> {
+        None
+    }
+
+    /// THE LOGIN'S ONE SIGN-IN AS THIS HOST'S TABS SHARE IT
+    /// ([`crate::harness::login_latch`]): another tab's `/login` standing for
+    /// the login this session's process signs in with, or that login back in
+    /// another tab since this one waited on it
+    /// ([`super::super::policy::login::LoginShared`]). Asked at each reading
+    /// of a lost login of a carried agent
+    /// ([`super::super::policy::turn_end::TurnEndReading::login_shared`]);
+    /// one lock. `None` (the default): nothing shares it, and this tab's
+    /// `/login` is the login's.
+    fn login_shared(&self) -> Option<super::super::policy::login::LoginShared> {
+        None
+    }
+
+    /// TAKE THE LOGIN'S ONE SIGN-IN, as the loop is about to type `/login`
+    /// into this session's lost login: `Ok` — this tab's `/login` is the
+    /// login's; `Err(by)` — tab `by` took it first, and nothing is typed (the
+    /// point is decided again, and waits on that tab). The default: `Ok`.
+    act fn login_carry(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// RELEASE THIS WORKER'S SIGN-IN RESERVATION: its `/login` attempt was
+    /// not acknowledged, or the worker ended. This reports no successful
+    /// login. The default ignores it.
+    fn login_abandon(&self) {}
+
+    /// THIS SESSION'S LOST LOGIN IS BACK: its track ended with no wall at the
+    /// point (`Login successful`, the worker's work past it, its turn
+    /// delivered again and answered), told once a loss. A host hands the news
+    /// to every tab that waited on this login's sign-in
+    /// ([`Self::login_shared`]). The default ignores it.
+    fn login_back(&self) {}
 
     /// CLAUDE CODE SAID THE STORED LOGIN ENDS IN `days` DAYS
     /// ([`super::super::policy::turn_end::TurnEndReading::login_notice`]): told

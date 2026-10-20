@@ -368,6 +368,7 @@ fn the_muse_sniff_claims_no_other_programs_screen() {
         assert_eq!(wall(&r), None, "{name}");
         assert_eq!(retrying(&r), None, "{name}");
         assert!(!interrupted(&r), "{name}");
+        assert_eq!(background_wait(&r), None, "{name}");
     }
     assert!(swept > 150, "only {swept} other captures");
 }
@@ -1613,6 +1614,100 @@ fn a_relaunched_session_is_fresh_under_its_new_banner() {
     let quoted = edited(&rows, "$ muse-fake", "❯ what does the banner say?");
     assert!(!fresh(&quoted), "the control");
 
+    // Eligibility depends on the prefix, including the prefix of a later
+    // candidate: a banner need not change for the newest reading to change.
+    for (before, changed_row, replacement, wanted_before, wanted_after) in [
+        (
+            vec!["$ muse", "  Muse Code 1.4.10"],
+            0,
+            "  quoted reply",
+            Some(1),
+            None,
+        ),
+        (
+            vec!["  quoted reply", "  Muse Code 1.4.10"],
+            0,
+            "$ muse",
+            None,
+            Some(1),
+        ),
+        (
+            vec![
+                "$ muse",
+                "  Muse Code 1.4.9",
+                "",
+                "  quoted reply",
+                "",
+                "  Muse Code 1.4.10",
+            ],
+            3,
+            "$ muse",
+            Some(1),
+            Some(5),
+        ),
+    ] {
+        let before: Vec<String> = before.into_iter().map(str::to_owned).collect();
+        let reading = launch_card_scan(&before);
+        assert_eq!(reading.0, wanted_before);
+        assert!(launch_card_unmoved(&before, reading.0, &[]));
+        let mut after = before;
+        after[changed_row] = replacement.to_owned();
+        assert_eq!(launch_card_scan(&after).0, wanted_after);
+        assert_ne!(launch_card_scan(&after), reading);
+        assert!(!launch_card_unmoved(&after, reading.0, &[changed_row]));
+    }
+    // A keystroke in the composer under the banner keeps the reading, with
+    // a banner and with none; and on every row of the screen, a reading
+    // kept is the reading a scan takes.
+    let composer = rows
+        .iter()
+        .rposition(|r| r.starts_with('❯'))
+        .expect("the composer");
+    let typed = edited(&rows, "❯", "❯ typed");
+    assert!(launch_card_unmoved(
+        &typed,
+        launch_card_scan(&rows).0,
+        &[composer]
+    ));
+    let gone = edited(&rows, "  Muse Code 1.4.9", "");
+    assert_eq!(launch_card_scan(&gone).0, None, "CONTROL: no banner");
+    assert!(launch_card_unmoved(
+        &edited(&gone, "❯", "❯ typed"),
+        None,
+        &[composer]
+    ));
+    for invalid in [rows.len(), usize::MAX] {
+        assert!(!launch_card_unmoved(
+            &rows,
+            launch_card_scan(&rows).0,
+            &[invalid]
+        ));
+        assert!(!launch_card_unmoved(&gone, None, &[invalid]));
+    }
+    assert!(!launch_card_unmoved(&[], None, &[usize::MAX]));
+    for before in [&rows, &quoted, &gone] {
+        let reading = launch_card_scan(before);
+        for i in 0..before.len() {
+            for replacement in [
+                "",
+                "  quoted reply",
+                "$ muse",
+                "  Muse Code 1.4.11",
+                "❯ typed",
+            ] {
+                let mut after = before.clone();
+                after[i] = replacement.to_owned();
+                if launch_card_unmoved(&after, reading.0, &[i]) {
+                    assert_eq!(
+                        launch_card_scan(&after),
+                        reading,
+                        "row {i}: {replacement:?}"
+                    );
+                }
+            }
+        }
+    }
+
     let busy = screen(BUSY);
     let message = busy
         .iter()
@@ -2031,20 +2126,21 @@ fn the_unix_socket_box_is_a_persons_box_whose_esc_refuses() {
 /// monitor, a backgrounded shell): between the bottom rule and the footer it
 /// draws `main · ↓ to select` (`main` alone while a draft is typed) over a
 /// branch per piece of work, and the composer over it reads as without it —
-/// a turn's end idle as evidence at its empty caret, a draft the draft, a
-/// running turn busy, a box a box. Before it was read, each of these read as
-/// no composer at all, and the network box over it as idle. NEGATIVE
-/// CONTROLS: a head with no branch under it, a branch with no head, and a
-/// head of another word leave no composer to type into (not idle as
-/// evidence).
+/// a turn's end at its empty caret (busy as evidence while its work runs,
+/// idle once that work failed: [`the_panels_running_work_is_the_agents_own`]),
+/// a draft the draft, a running turn busy, a box a box. Before it was read,
+/// each of these read as no composer at all, and the network box over it as
+/// idle. NEGATIVE CONTROLS: a head with no branch under it, a branch with no
+/// head, and a head of another word leave no composer to type into (not
+/// idle as evidence).
 #[test]
 fn the_work_panel_under_the_composer_is_no_part_of_it() {
-    for text in [END_OF_TURN_WORK_PANEL, END_OF_TURN_WORK_RUNNING] {
+    for (text, phase) in [
+        (END_OF_TURN_WORK_PANEL, Phase::Idle),
+        (END_OF_TURN_WORK_RUNNING, Phase::Busy),
+    ] {
         let r = muse(text);
-        assert_eq!(
-            (r.phase.clone(), r.phase_authoritative),
-            (Phase::Idle, true)
-        );
+        assert_eq!((r.phase.clone(), r.phase_authoritative), (phase, true));
         assert_eq!(r.composer.map(|(_, l)| l), Some(vec![String::new()]));
         assert_eq!(r.prompt, None);
     }
@@ -2074,20 +2170,293 @@ fn the_work_panel_under_the_composer_is_no_part_of_it() {
     }
 }
 
+/// The branch a backgrounded shell's panel showed once the shell ended
+/// (measured on 1.4.10, 2026-10-17: the row the lab's log kept, standing
+/// 8-11 s before the panel went), 144 columns wide.
+fn finished_branch() -> String {
+    format!(
+        "└ ◆ Q3 background wait  ran 1s, exit 0{}1m 40s",
+        " ".repeat(100)
+    )
+}
+
+/// THE PANEL'S RUNNING WORK IS THE AGENT'S OWN (1.4.10, measured 2026-10-16
+/// and 2026-10-17): a turn's end over a branch whose state is `running` (a
+/// backgrounded shell) or `watching` (a monitor) is BUSY as evidence, its
+/// background work named ([`background_wait`]), as Claude Code's reader
+/// reads a shell or a monitor left running — Muse Code wakes itself when
+/// the work ends (`◆ Finished · … · ✓`, then a turn of its own), so nothing
+/// is typed into it meanwhile. A question the turn ended on is held by a
+/// shell, as a shell Claude Code left running holds its question (the hard
+/// rule), and stands over a monitor (the soft rule); a shell and a monitor
+/// together name the shell, and hold the question. The composer and the
+/// reply's last words read as before, a draft the draft; a running turn
+/// over the panel is the turn, not background work. NEGATIVE CONTROLS: the
+/// panel gone after the work ended ([`END_OF_TURN_BG_FINISHED`]), a branch
+/// that finished (`ran 1s, exit 0`, measured) or failed, a state no build
+/// drew, a branch whose time is no time, and a screen with no panel read no
+/// background work, and the turn's end idle as evidence.
+#[test]
+fn the_panels_running_work_is_the_agents_own() {
+    for text in [
+        END_OF_TURN_WORK_RUNNING,
+        END_OF_TURN_WORK_HINT,
+        END_OF_TURN_BG_RUNNING,
+    ] {
+        let rows = screen(text);
+        let r = muse(text);
+        assert_eq!((r.phase, r.phase_authoritative), (Phase::Busy, true));
+        assert_eq!(r.composer.map(|(_, l)| l), Some(vec![String::new()]));
+        assert!(
+            r.said_tail
+                .is_some_and(|t| t.starts_with("Tool call done."))
+        );
+        assert_eq!(background_wait(&rows), Some("background work running"));
+        assert_eq!(
+            MuseReader.background_wait(&rows),
+            Some("background work running")
+        );
+        // A question the turn ended on (the reply's two rows made one that
+        // asks) is held by the shell, the work still named.
+        let head = rows
+            .iter()
+            .rposition(|r| r.starts_with("◆ Tool call done."))
+            .expect("the reply");
+        let mut asks = rows.clone();
+        asks[head] = "◆ Should I wait for it to finish?".to_string();
+        asks[head + 1] = String::new();
+        assert_eq!(phase(&asks), (Phase::Busy, true));
+        assert_eq!(background_wait(&asks), Some("background work running"));
+        assert_eq!(
+            said_tail(&asks).as_deref(),
+            Some("Should I wait for it to finish?")
+        );
+        // A monitor watching in the shell's place: the question stands, the
+        // work named; the plain end is busy.
+        let at = rows
+            .iter()
+            .rposition(|r| r.starts_with("└ "))
+            .expect("a branch");
+        let watching = |rows: &[String]| {
+            let row = rows[at]
+                .replace(
+                    "Wait in the background  running ",
+                    "Watch the lab socket  watching",
+                )
+                .replace(
+                    "Q3 background wait  running ",
+                    "Watch the lab socket  watching",
+                );
+            assert_ne!(row, rows[at], "the branch rewritten");
+            edited(rows, "└ ", &row)
+        };
+        assert_eq!(phase(&watching(&asks)), (Phase::Question, true));
+        assert_eq!(
+            background_wait(&watching(&asks)),
+            Some("a monitor watching")
+        );
+        assert_eq!(phase(&watching(&rows)), (Phase::Busy, true));
+        // A monitor's branch over the shell's: the shell named, the question
+        // held.
+        let mut both = asks.clone();
+        both.insert(at, "├ ◇ Watch the lab socket  watching  14s".to_string());
+        assert_eq!(phase(&both), (Phase::Busy, true));
+        assert_eq!(background_wait(&both), Some("background work running"));
+        // The controls: the branch over, or of a shape no build drew.
+        let failed = rows[at].replace("running ", "failed  ");
+        let named = rows[at].replace("running", "pending");
+        let timeless = crate::text::trim_end(&rows[at])
+            .rsplit_once("  ")
+            .map(|(head, _)| format!("{head}  soon"))
+            .expect("a time");
+        for branch in [finished_branch(), failed, named, timeless] {
+            let over = edited(&rows, "└ ", &branch);
+            assert_eq!(phase(&over), (Phase::Idle, true), "{branch}");
+            assert_eq!(background_wait(&over), None, "{branch}");
+            let over = edited(&asks, "└ ", &branch);
+            assert_eq!(phase(&over), (Phase::Question, true), "{branch}");
+        }
+    }
+    let draft = screen(DRAFT_WORK_RUNNING);
+    assert_eq!(phase(&draft), (Phase::Busy, true));
+    assert_eq!(background_wait(&draft), Some("background work running"));
+    assert_eq!(
+        composer_draft(&draft).map(|(_, l)| l),
+        Some(vec!["carry on with the task".to_string()])
+    );
+    let busy = screen(BUSY_WORK_RUNNING);
+    assert_eq!(phase(&busy), (Phase::Busy, true));
+    assert_eq!(background_wait(&busy), None, "the running turn's own");
+    // A monitor watching, its box answered: its turn's end over the panel.
+    let monitor = screen(END_OF_TURN_WORK_RUNNING);
+    let at = monitor
+        .iter()
+        .rposition(|r| r.starts_with("└ "))
+        .expect("a branch");
+    let watching = edited(
+        &monitor,
+        "└ ",
+        &monitor[at].replace(
+            "Wait in the background  running ",
+            "Watch the lab socket  watching",
+        ),
+    );
+    assert_eq!(phase(&watching), (Phase::Busy, true));
+    assert_eq!(background_wait(&watching), Some("a monitor watching"));
+    // The work over: no panel, the turn Muse Code took on its end idle.
+    let r = muse(END_OF_TURN_BG_FINISHED);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, true));
+    assert_eq!(background_wait(&screen(END_OF_TURN_BG_FINISHED)), None);
+    for text in [
+        END_OF_TURN_1_4_10,
+        END_OF_TURN_WORK_PANEL,
+        BOX_NETWORK_MONITOR,
+    ] {
+        assert_eq!(background_wait(&screen(text)), None);
+    }
+    assert_eq!(muse(END_OF_TURN_1_4_10).phase, Phase::Idle);
+}
+
+/// A LIMIT OR A WALL THE TURN ENDED ON STANDS OVER THE AGENT'S OWN
+/// BACKGROUND WORK (1.4.10's screens): the panel and a running shell's
+/// branch spliced under the composer of a turn that ended on the final 500
+/// and on the usage wall read as those walls still — idle on the error (so
+/// the retry ladder runs), limited until the reset — while
+/// [`background_wait`] names the work, as Claude Code's reader reads the
+/// wall a turn ended on behind a shell it left running
+/// (`phase::background_wall`). Read busy, the ladder would never run.
+/// NEGATIVE CONTROL: the same splice under a turn that ended on no wall
+/// reads busy.
+#[test]
+fn a_wall_the_turn_ended_on_stands_over_the_background_work() {
+    let splice = |text: &str| -> Vec<String> {
+        let mut rows = screen(text);
+        let footer = rows.iter().rposition(|r| !blank(r)).expect("the footer");
+        rows.insert(
+            footer,
+            format!("└ ◈ Q3 background wait  running{}2s", " ".repeat(100)),
+        );
+        rows.insert(footer, "main · ↓ to select".to_string());
+        rows
+    };
+    let api = splice(SERVER_ERROR_FINAL);
+    let r = read(Some("muse"), &api, None);
+    assert_eq!(
+        (r.phase.clone(), r.phase_authoritative),
+        (Phase::Idle, true)
+    );
+    assert!(
+        matches!(r.wall.map(|w| w.kind), Some(WallKind::ApiError { .. })),
+        "the 500"
+    );
+    assert!(r.composer.is_some());
+    assert_eq!(background_wait(&api), Some("background work running"));
+    let usage = splice(USAGE_WALL);
+    let r = read(Some("muse"), &usage, None);
+    assert!(
+        matches!(r.phase, Phase::Limited { .. }) && r.phase_authoritative,
+        "{:?}",
+        r.phase
+    );
+    assert_eq!(r.wall.map(|w| w.kind), Some(WallKind::UsageSession));
+    assert_eq!(background_wait(&usage), Some("background work running"));
+    let ended = splice(END_OF_TURN_1_4_10);
+    assert_eq!(phase(&ended), (Phase::Busy, true), "the control");
+    assert_eq!(
+        background_wait(&ended),
+        Some("background work running"),
+        "the control"
+    );
+}
+
+/// THE PANEL'S BRANCHES IN EITHER ORDER, AND A TURN'S END THAT IS NO
+/// EVIDENCE (the review of the hard rule's guards). A shell's branch drawn
+/// ABOVE a monitor's (`├ ` then `└ `) holds the question the turn ended on
+/// as a lone shell does, the shell named: read without its `├ ` row it
+/// would be a lone monitor, the soft rule, and the question answered over a
+/// running shell. A turn that stopped on a fault only a person can fix
+/// (`A configuration problem stopped this turn.`) over a running shell is
+/// `idle` NOT as evidence still, no background work named: only an ended
+/// turn the reader vouches for is held busy by the work. NEGATIVE CONTROLS:
+/// the monitor alone under the question is the question; the fault with no
+/// panel reads the same as over it.
+#[test]
+fn a_shell_over_a_monitor_holds_the_question_and_a_fault_is_no_evidence_over_work() {
+    let rows = screen(END_OF_TURN_BG_RUNNING);
+    let head = rows
+        .iter()
+        .rposition(|r| r.starts_with("◆ Tool call done."))
+        .expect("the reply");
+    let ended_on = |words: &str| {
+        let mut out = rows.clone();
+        out[head] = words.to_string();
+        out[head + 1] = String::new();
+        out
+    };
+    let asks = ended_on("◆ Should I deploy it now?");
+    let at = asks
+        .iter()
+        .rposition(|r| r.starts_with("└ "))
+        .expect("the shell's branch");
+    let shell_first = {
+        let mut out = asks.clone();
+        out[at] = out[at].replacen("└ ", "├ ", 1);
+        out.insert(
+            at + 1,
+            "└ ◇ Watch the lab socket  watching  14s".to_string(),
+        );
+        out
+    };
+    assert_eq!(phase(&shell_first), (Phase::Busy, true));
+    assert_eq!(
+        background_wait(&shell_first),
+        Some("background work running")
+    );
+    assert_eq!(
+        MuseReader.background_wait(&shell_first),
+        Some("background work running")
+    );
+    let monitor_alone = {
+        let mut out = asks.clone();
+        out[at] = "└ ◇ Watch the lab socket  watching  14s".to_string();
+        out
+    };
+    assert_eq!(
+        phase(&monitor_alone),
+        (Phase::Question, true),
+        "the control"
+    );
+    assert_eq!(background_wait(&monitor_alone), Some("a monitor watching"));
+    // A fault over the running shell: no evidence, no work named.
+    let fault = ended_on("◆ A configuration problem stopped this turn. Fix it in /settings.");
+    assert_eq!(phase(&fault), (Phase::Idle, false));
+    assert_eq!(background_wait(&fault), None);
+    let r = read(Some("muse"), &fault, None);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, false));
+    let plain = edited(
+        &screen(END_OF_TURN),
+        "◆ echo",
+        "◆ A configuration problem stopped this turn. Fix it in /settings.",
+    );
+    assert_eq!(phase(&plain), (Phase::Idle, false), "the control");
+}
+
 /// THE PANEL'S POINTER UNDER A REPLY IS NO PART OF IT (1.4.10, measured: a
 /// fresh session's first backgrounded shell): `  (↓ to view terminals)`,
 /// drawn as a block of its own under the reply a moment after it, is
 /// skipped as a card is — the turn ends on the reply as evidence, its words
 /// the last words — so a report ending `ATERM-TASK-DONE` still ends on the
-/// token and a reply asking still asks with the pointer under it. Before,
-/// the pointer was read as the reply's last row: the token and the question
-/// were hidden while the work ran. NEGATIVE CONTROLS: the same row with no
-/// blank row above it is the reply's own last row, and a pointer naming no
-/// kind is no pointer.
+/// token and a reply asking still asks with the pointer under it. While the
+/// shell runs that end is the agent's own background work (busy as
+/// evidence, a question's too, as a shell Claude Code left running holds
+/// its question); once its branch is over it is idle, or the question. Before, the pointer was read as the reply's last row: the token and
+/// the question were hidden. NEGATIVE CONTROLS: the same row with no blank
+/// row above it is the reply's own last row, and a pointer naming no kind
+/// is no pointer.
 #[test]
 fn the_panels_pointer_under_a_reply_is_no_part_of_it() {
     let r = muse(END_OF_TURN_WORK_HINT);
-    assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, true));
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Busy, true));
     assert_eq!(r.composer.map(|(_, l)| l), Some(vec![String::new()]));
     let said = r.said_tail.expect("the reply");
     assert!(said.starts_with("Tool call done. Result: {"), "{said}");
@@ -2106,13 +2475,22 @@ fn the_panels_pointer_under_a_reply_is_no_part_of_it() {
         out
     };
     let done = with_reply(&["◆ Done: the probe is written.", "  ATERM-TASK-DONE"]);
-    assert_eq!(phase(&done), (Phase::Idle, true));
+    assert_eq!(phase(&done), (Phase::Busy, true), "its shell runs");
     assert_eq!(
         said_tail(&done).as_deref(),
         Some("Done: the probe is written.\nATERM-TASK-DONE")
     );
+    let over = edited(&done, "└ ", &finished_branch());
+    assert_eq!(phase(&over), (Phase::Idle, true), "its shell over");
+    assert_eq!(said_tail(&over), said_tail(&done));
     let asks = with_reply(&["◆ Should I wait for it to finish?"]);
-    assert_eq!(phase(&asks), (Phase::Question, true));
+    assert_eq!(phase(&asks), (Phase::Busy, true), "its shell runs");
+    assert_eq!(
+        said_tail(&asks).as_deref(),
+        Some("Should I wait for it to finish?")
+    );
+    let over = edited(&asks, "└ ", &finished_branch());
+    assert_eq!(phase(&over), (Phase::Question, true), "its shell over");
     // The controls.
     let mut joined = done.clone();
     let blank = joined

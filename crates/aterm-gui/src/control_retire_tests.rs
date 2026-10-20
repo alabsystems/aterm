@@ -98,6 +98,10 @@ impl LaneService for MainThreadVerbs {
     fn subscribe(&self, _line: String, _scope: Scope, _stream: CtlStream) {}
 
     fn release(&self, _id: u64) {}
+
+    fn has_live_claim(&self, _id: u64) -> bool {
+        false
+    }
 }
 
 /// A fresh connection is served: it authenticates and `ping` is answered.
@@ -117,6 +121,17 @@ fn assert_answers(path: &std::path::Path, what: &str) {
 /// A client holds an authenticated connection whose verb the main thread owes while the main
 /// thread prepares the `exec`. By the time the `exec` runs the held connection reads EOF and a
 /// new client is refused; when the `exec` returns the same path serves again.
+///
+/// First the steps before the `exec` (`App::prepare_cold_exec`): they retire
+/// nothing, so the held connection must stay open (WouldBlock) and the socket
+/// keep answering — retired there, a refusal after them would leave the held
+/// connection reading EOF for an `exec` that never ran.
+///
+/// Then the `exec` runs: by then the held connection must already read EOF
+/// and a new client be refused — not, as before, left open (WouldBlock) and
+/// queued (a connect that succeeds) for as long as the `exec` takes to
+/// terminate every other thread, which is seconds on a saturated machine.
+/// The `exec` returns: the same path must serve again.
 ///
 /// Runs alone in its own process: a forked child holds a copy of the listening socket until it
 /// execs, so a sibling test's not-yet-exec'd child keeps a retired listener accepting. macOS has
@@ -168,15 +183,20 @@ fn a_cold_exec_retires_the_control_socket_and_a_failed_one_reopens_it() {
     let mut app = crate::App::headless_for_test();
     app.control_endpoint = endpoint;
     app.prepare_cold_exec(7, true, false);
+
     assert_eq!(
         held_read(),
         Err(ErrorKind::WouldBlock),
-        "preparing the exec leaves the held connection open"
+        "the steps before the exec leave the held connection open"
+    );
+    assert_answers(
+        &path,
+        "the steps before the exec leave the socket answering",
     );
 
-    let exec_ran = std::cell::Cell::new(false);
-    app.run_cold_exec(|| {
-        exec_ran.set(true);
+    let mut exec_ran = false;
+    let returned = app.run_cold_exec(|| {
+        exec_ran = true;
         assert_eq!(
             held_read(),
             Ok(0),
@@ -191,7 +211,12 @@ fn a_cold_exec_retires_the_control_socket_and_a_failed_one_reopens_it() {
         );
         std::io::Error::from(ErrorKind::NotFound)
     });
-    assert!(exec_ran.get(), "the exec ran");
+    assert!(exec_ran, "the exec ran");
+    assert_eq!(
+        returned.kind(),
+        ErrorKind::NotFound,
+        "its error is returned"
+    );
 
     app.resume_after_cold_exec();
     assert_answers(&path, "the reopened socket answers");

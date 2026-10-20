@@ -38,6 +38,15 @@ path = "benches/footer_pass_cost.rs"
 harness = false
 required-features = ["bench-support"]
 
+# The byte arm's C cut (card engine §3.6), timed over `verify perf
+# throughput`'s corpus without and with the cut; by hand it is
+# `targo --unverified bench -p aterm-gui --features bench-support --bench c_cut_cost`.
+[[bench]]
+name = "c_cut_cost"
+path = "benches/c_cut_cost.rs"
+harness = false
+required-features = ["bench-support"]
+
 # THE LIVE-CLASS AUDITOR (D1). `crates/aterm-window`'s ported `WinitWindowDelegate` had
 # NOTHING IN CI READING THE REGISTERED CLASS: two compile-verified plants — an
 # argument retyped `Id` -> `Bool`, and `NSWindowDelegate` deleted from the
@@ -124,34 +133,8 @@ name = "objc_event_drive"
 path = "examples/objc_event_drive.rs"
 
 [features]
-# Accessibility is not a feature. Linux publishes the window's tree to screen
-# readers unconditionally, over AT-SPI through the first-party aterm-a11y (A11Y.4
-# of docs/AUDIT-third-party-2026-10-15.md; see the linux dependency row). macOS has
-# the aterm-owned `a11y-appkit` publisher below, OFF by default for its per-frame
-# publish cost. Windows has no publisher: the `a11y-accesskit` feature that
-# reached UIA (and AT-SPI and NSAccessibility) through AccessKit's platform
-# adapters was deleted with them, since its rows kept accesskit_winit, zbus and
-# accesskit_macos/windows/ios in the lock; a first-party UIA provider is its own
-# project (the audit's unit a11y, "Risks").
-#
-# Opt-in macOS NSAccessibility publishing (accessibility.rs): publishes the
-# visible grid text / role / label to the content NSView so VoiceOver can read
-# the terminal. OFF by default — the pure accessibility snapshot builder always
-# compiles (and is unit-tested), but the AppKit imperative wiring is only built
-# when this is enabled, so the default GUI build is byte-identical and carries
-# no per-frame a11y publish cost.
-#
-# W13: THE LIST IS EMPTY, AND THAT IS THE POINT. It used to name four binding
-# features — `objc2-app-kit/NSAccessibility`, `/NSAccessibilityProtocols`,
-# `/NSAccessibilityConstants` and `objc2-foundation/NSRange` (the last for the
-# caret's AXSelectedTextRange) — which is what made this a feature that pulled
-# EXTRA third-party bindings into the build. The publisher is first-party now:
-# it sends `NSAccessibility*` through `aterm-objc`, and the caret range is an
-# `aterm_objc::NSRange`, so enabling this adds aterm code and no dependency at
-# all. The FEATURE STAYS: `diagnostics.rs` reports it, and `--features a11y-appkit`
-# is the documented way to build the VoiceOver path. An empty list is a real
-# feature; deleting the row would break both.
-a11y-appkit = []
+# Accessibility delivery is native and unconditional on supported platforms:
+# macOS NSAccessibility, Linux AT-SPI and Windows UIA use one semantic tree.
 # Lends the `footer_pass_cost` bench the headless test App and the footer's
 # probe fixture (`claude_footer::probe`). Bench builds only; the release cutter
 # never names it.
@@ -213,6 +196,12 @@ aterm-gui-timing = { workspace = true }
 # the Markdown reader's model), extracted below this crate and
 # re-exported under their old module names.
 aterm-gui-documents = { workspace = true }
+# amacs: its input reducer (`amacs::input`), which the native Editor hands
+# every key, text commit, paste and pointer press, the one path from an input
+# to an editor command (docs/DESIGN-amacs-2026-10-19.md §4.4); and the wire
+# forms the `edit` and `await edit` verbs serve, the edit request and ticket
+# replies and the file-URI codec (`amacs::protocol`).
+amacs = { workspace = true }
 # The access card's decision and words, its marker files and the durability
 # flushes, extracted below this crate and re-exported under their old
 # module names.
@@ -238,6 +227,7 @@ aterm-messages = { workspace = true }
 # ceiling in `harness_host.rs`, the scrollback budget). Every platform `cfg` of
 # those readers lives in that crate, so the host adds none.
 aterm-sysprobe = { workspace = true }
+aterm-vitals = { workspace = true }
 aterm-buffer = { path = "../aterm-buffer" }
 aterm-grapheme = { workspace = true }
 aterm-codec = { workspace = true }
@@ -251,6 +241,9 @@ aterm-phase = { workspace = true }
 # record (session > run > turn > step), its turn tracker, fold and brief. Pure:
 # no clock, file, thread or socket (time enters as the host's `Stamp`).
 aterm-slog = { workspace = true }
+# The fleet: the opt-in (secure-default-OFF) TLS listener whose proved LAN
+# peers the control server serves as `Scope::Fleet` (see fleet_listen.rs).
+aterm-net = { workspace = true }
 # Portable control-socket stream (std Unix sockets on Unix, AF_UNIX-over-winsock
 # on Windows) + the latest-alias/CSPRNG/pid-liveness helpers control_auth uses.
 aterm-uds = { workspace = true }
@@ -275,7 +268,7 @@ aterm-hash = { workspace = true }
 # consumer of aterm-types in the same resolve too, which is how `aterm-ctl`
 # acquired AppKit; keep this edge featureless.
 aterm-types = { workspace = true }
-# Settings ▸ Themes ▸ Get More: the community theme pack, embedded.
+# Settings ▸ Themes ▸ Community: the community theme pack, embedded.
 aterm-theme-pack = { workspace = true }
 # The workspace's one epoch-clock read (`aterm_time::unix_secs` and kin), already in
 # the graph via aterm-types.
@@ -283,7 +276,13 @@ aterm-time = { workspace = true }
 # K-2: the winit→engine key map, so the GUI and the future native shell share one
 # table instead of an inline match that drifts.
 aterm-winit-keymap = { workspace = true }
-aterm-policy = { workspace = true }
+# `toml` (the serde derives on Policy, `Policy::to_toml`) is asked for here,
+# where serde's derive is already in the closure, and not only by the
+# `serde_corpus_tests.rs` and aterm-policy's own test rows: a dev row turns it
+# on for every `--workspace` test build, so a shipped-graph build that left it
+# off recompiled aterm-policy and every crate above it, aterm-core first (P4).
+# aterm-policy's and aterm-core's own closures still carry no proc macro (PM-1).
+aterm-policy = { workspace = true, features = ["toml"] }
 # Silent in-app self-update: checks the release channel, verifies the notarized +
 # Team-ID-pinned DMG, and stages it for the in-session apply lane (the next-launch
 # swap is only the fallback). Inert in a plain build (no pinned Team ID) and a
@@ -302,7 +301,7 @@ aterm-update-core = { workspace = true }
 # the `atpkg update <program>` it triggers re-verifies everything).
 atpkg = { workspace = true }
 libc = { workspace = true }
-winit = { workspace = true }
+aterm-window = { workspace = true }
 # Config file parsing. Both crates are ALREADY in this binary's tree (via the
 # engine's config + policy crates), so this adds bindings, not weight.
 serde = { workspace = true, features = ["derive"] }
@@ -330,6 +329,12 @@ aterm-http = { workspace = true }
 # on the way in. The SAME first-party crate aterm-render uses for the `image`
 # verb's framebuffer PNG, so this adds no dep to the tree.
 aterm-png = { workspace = true }
+# First-party JPEG decode: the wallpaper lane reads PNG and JPEG on every
+# platform (`app_config::decode_wallpaper_portable`), not PNG alone off macOS.
+aterm-jpeg = { workspace = true }
+# The development Security-posture catalog owns its scratch bundle through the
+# existing exclusive directory guard; the shipped catalog is compiled out.
+aterm-tempfile = { workspace = true }
 # NOTE: the tray's glyph rasterization no longer takes a font dependency of its
 # own — `aterm_render::font::Font` (first-party: the aterm-font reader + this
 # workspace's own coverage fill) retired `fontdue` here and in aterm-render
@@ -362,12 +367,17 @@ aterm-digest = { workspace = true }
 aterm-winres = { workspace = true }
 
 [dev-dependencies]
+# `verify perf throughput`'s corpus, for the `c_cut_cost` bench (a lib with no
+# dependencies of its own).
+aterm-bench = { path = "../aterm-bench" }
+# The counting seam (`aterm_durable::seam`) its tests reach, in an optimized test
+# build too.
+aterm-durable = { workspace = true, features = ["test-support"] }
 # Scratch home directories for the auto-prime pass test (spawn.rs): the pass
-# must be driven against a directory that is NOT the developer's real $HOME.
-aterm-tempfile = { workspace = true }
-# `serde_corpus_tests.rs` round-trips `aterm_policy::Policy`, whose serde impls
-# sit behind `toml` (PM-1). TEST builds only.
-aterm-policy = { workspace = true, features = ["toml"] }
+# must be driven against a directory that is NOT the developer's real $HOME;
+# and the harness tests' stand-in programs (`stand_in`, in an optimized test
+# build too).
+aterm-tempfile = { workspace = true, features = ["test-support"] }
 
 # Tier-1 conformance: bind the real `App` window lifecycle to the ty-proven
 # `window_routing_model()`. Same model that is Tier-0 `ty check`ed in
@@ -466,34 +476,26 @@ aterm-x11 = { workspace = true }
 # (present/wayland.rs) on winit's display, over libwayland-client opened at
 # run time. With it and aterm-x11 softbuffer left Linux (the row below).
 aterm-wayland = { workspace = true }
-# LINUX CARRIES THE TREE UNCONDITIONALLY (owner's call, 2026-08-26). It is the only
-# accessibility surface there: with no publisher the AT-SPI registry reports ZERO
-# applications for aterm while a GTK app sits in the same registry, i.e. a blind
-# Linux user gets no terminal at all. `build.rs` turns the `a11y_tree` cfg on for
-# Linux so the code never has to spell the platform.
-# The tree model (`aterm_a11y::model`, A11Y.5) and the AT-SPI publisher Orca
-# reads, over aterm-dbus (A11Y.4). They replaced the AccessKit crates:
-# accesskit, accesskit_consumer, accesskit_atspi_common, atspi-common,
-# accesskit_winit, accesskit_unix and zbus with its async executor
-# (docs/AUDIT-third-party-2026-10-15.md, unit a11y); `a11y_adapter.rs` is the
-# window glue accesskit_winit was.
-aterm-a11y = { workspace = true }
 # Desktop notifications (notify.rs `freedesktop`): org.freedesktop.Notifications
 # Notify over the session bus, through the first-party blocking client — no
 # libnotify, no `notify-send` subprocess.
 aterm-dbus = { workspace = true }
 
 [target.'cfg(not(any(target_os = "macos", target_os = "linux")))'.dependencies]
-# winit's raw-window-handle traits, for the presenters that take a window
+# aterm-window's raw-window-handle traits, for the presenters that take a window
 # through them here: wgpu's surface (`aterm_gpu::WindowTarget`), softbuffer's
-# CPU presenter and the Win32 HWND reads. `rwh_06` is not a winit default: on
+# CPU presenter and the Win32 HWND reads. `rwh_06` is not an aterm-window default: on
 # macOS the Metal presenter and the AppKit chrome take the content view through
 # first-party `aterm_objc::HasNsView`, and on Linux the GL arm and the X11 and
 # Wayland CPU presenters take the window's handles through first-party
 # `aterm_types::native_window::HasNativeWindow`, so raw-window-handle is out of
 # both graphs (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6; mac-arm
 # and linux each -1 package, -1,984 lines).
-winit = { workspace = true, features = ["rwh_06"] }
+aterm-window = { workspace = true, features = ["rwh_06"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dependencies]
+# Shared semantic model and target-native publisher; macOS does not load D-Bus.
+aterm-a11y = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # THE FOUR objc2-FAMILY ROWS THAT STOOD HERE ARE RETIRED — `objc2-app-kit`,
@@ -554,3 +556,9 @@ harness = false
 
 [lints]
 workspace = true
+
+# Explicit shell-profile acceptance under a test identity; never an ordinary test.
+[[bench]]
+name = "jumplist_acceptance"
+harness = false
+test = false

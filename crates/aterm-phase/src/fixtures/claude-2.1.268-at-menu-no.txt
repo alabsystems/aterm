@@ -1,0 +1,51 @@
+# claude-code 2.1.268 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the composer holding `read @no` (typed by `send`), its `@` menu open with four files at column 2, no pointer drawn · the text is the same as the menu opened (none selected) and after `down` (`novel.txt` selected in colour only: claude-2.1.268-at-menu-no-down-cells.txt); Enter after `down` completed the entry, `read @novel.txt`, and sent nothing
+ ▐▛███▛█   Claude Code v2.1.268
+▝▜██████▀  Opus 5 (1M context) · API Usage Billing
+  ▝▝ ▝▝    /private/tmp/at.ToZM/proj
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ read @no
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  + novel.txt
+  + north.rs
+  + nodes.md
+  + notes.txt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

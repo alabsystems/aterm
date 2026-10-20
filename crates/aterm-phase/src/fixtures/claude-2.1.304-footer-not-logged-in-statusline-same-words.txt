@@ -1,0 +1,11 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, no login (no `apiKeyHelper`, no OAuth token) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · no login (no apiKeyHelper, no OAuth token) and a statusLine printing 'Not logged in · Run /login': the status line at column 2 under the composer's bottom rule, Claude Code's OWN notice right-aligned on the same row (its notification column)
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Not logged in · Run /login                                                                                        Not logged in · Run /login
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                       ◐ medium · /effort

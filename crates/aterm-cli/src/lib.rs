@@ -209,9 +209,11 @@ pub enum Verb {
     Conn,
     /// `aterm pkg` — the toolchain package manager.
     Pkg,
-    /// `aterm fleet` — fleet federation (events + exec).
+    /// `aterm fleet` — this machine's membership in a fleet (`init`, `join`,
+    /// `peers`, `leave`): the machines `aterm ctl survey --fleet` reads.
     Fleet,
-    /// `aterm drive` — the agent drive CLI (sugar over await/send).
+    /// `aterm drive` — the window harness's readers by hand (classify, phase,
+    /// answer, ledger; tape and replay for a harness tape).
     Drive,
     /// `aterm link` — the fabric bridge (`serve`, `ls`, `hook`, `notify`, …).
     Link,
@@ -234,13 +236,17 @@ pub enum Verb {
     Machines,
     /// `aterm harness` — the Claude Code harness's read views, the accounts
     /// roster (docs/DESIGN-claude-accounts-2026-10-01.md) and the live agent
-    /// upgrade (docs/DESIGN-aterm-wrapper-2026-09-17.md §0.4). `aterm drive`
-    /// supervises; `upgrade` only restarts an agent onto a newer build.
+    /// upgrade (docs/DESIGN-aterm-wrapper-2026-09-17.md §0.4). The window host
+    /// supervises; `upgrade` restarts an agent onto a newer build.
     Harness,
     /// `aterm keeper`: the PTY keeper (`start | stop | status | serve`), the
     /// per-login holder of a custody copy of every terminal's master
     /// (docs/DESIGN-pty-keeper-2026-09-26.md). Opt-in via `[keeper] enabled`.
     Keeper,
+    /// `aterm caffeine`: the menu-bar keep-awake mug (`start | on | off |
+    /// status | startup | quit | serve`), its own launchd job run from its own
+    /// copy of the app. macOS only: elsewhere the verb refuses by name.
+    Caffeine,
     /// `aterm theme` — list, validate, create, export and import themes, and
     /// inspect the native theme schema.
     Theme,
@@ -269,6 +275,7 @@ impl Verb {
         Verb::Machines,
         Verb::Harness,
         Verb::Keeper,
+        Verb::Caffeine,
         Verb::Theme,
         Verb::NewTab,
         Verb::NewWindow,
@@ -292,6 +299,7 @@ impl Verb {
             Verb::Machines => "machines",
             Verb::Harness => "harness",
             Verb::Keeper => "keeper",
+            Verb::Caffeine => "caffeine",
             Verb::Theme => "theme",
             // Hyphenated, exactly like Windows Terminal's — the whole value of a
             // familiar grammar is that the words are the same words.
@@ -326,6 +334,7 @@ impl Verb {
             | Verb::Machines
             | Verb::Harness
             | Verb::Keeper
+            | Verb::Caffeine
             | Verb::Theme
             | Verb::NewTab
             | Verb::NewWindow
@@ -358,6 +367,7 @@ impl Verb {
             | Verb::Machines
             | Verb::Harness
             | Verb::Keeper
+            | Verb::Caffeine
             | Verb::Theme => false,
         }
     }
@@ -379,6 +389,7 @@ impl Verb {
             Verb::Machines => "aterm machines <cmd>",
             Verb::Harness => "aterm harness <cmd>",
             Verb::Keeper => "aterm keeper <cmd>",
+            Verb::Caffeine => "aterm caffeine [<cmd>]",
             Verb::Theme => "aterm theme <cmd>",
             // `[-d dir]` rather than `[-d <dir>]`: the synopsis column is 26
             // wide and the blurb is pinned to column 30.
@@ -401,20 +412,21 @@ impl Verb {
             ],
             Verb::Pkg => &["Install / update / verify the toolchain (the package manager)."],
             Verb::Fleet => &[
-                "Watch and drive the sessions of every aterm window",
-                "on this machine.",
+                "This machine's membership in a fleet, the aterms of one LAN",
+                "that read each other (init | join | peers | leave).",
             ],
             Verb::Link => {
                 &["The fabric bridge: carry inbox/post between this instance and the bus."]
             }
             Verb::Fabric => &[
-                "The fabric: mail between sessions, people and hosts (status |",
-                "tail | on | off | doctor | mint-for | join | halt | inbox |",
-                "post); `status` is the default.",
+                "The fabric: mail between sessions and people (status | tail |",
+                "on | off | doctor | mint-for | halt | inbox | post); `status`",
+                "is the default.",
             ],
             Verb::Drive => &[
-                "Drive an agent (prompt | read | await | shot) and supervise",
-                "it (supervise | watch | task | report | ledger).",
+                "The window harness's readers, run by hand (classify | phase |",
+                "answer | ledger | tape | replay); workers and reads are",
+                "`aterm ctl`'s.",
             ],
             Verb::Ship => &[
                 "Publish aterm: provision a signing machine, cut and release",
@@ -438,11 +450,15 @@ impl Verb {
             Verb::Harness => &[
                 "Claude Code's spend, limits and accounts, the disk, the ledger",
                 "(usage | limits | accounts | disk | ledger); `upgrade` moves a",
-                "live Claude Code onto a newer build. `aterm drive` supervises.",
+                "live Claude Code onto a newer build. The window supervises.",
             ],
             Verb::Keeper => &[
                 "The PTY keeper: hold every terminal's master so a crashed",
                 "window's shells live on (start | stop | status | serve). macOS, opt-in.",
+            ],
+            Verb::Caffeine => &[
+                "The menu-bar keep-awake mug: a click keeps this Mac awake,",
+                "a right click picks 1, 8, 24 h or forever (on | off | status). macOS.",
             ],
             Verb::Theme => &[
                 "List every theme (list); write and test your own (new, check,",
@@ -716,10 +732,11 @@ const WINDOWS_CONFIG_PARAGRAPH: &str = "\n\
 /// The `[machine]` paragraph of `explain-config`.
 ///
 /// It says when the settings are applied (by `aterm pkg machine apply`, which
-/// the window runs as it opens, a terminal session runs once a day, and a
-/// package pass runs when the table changed); that `defaults` writes the
-/// account's per-host domain, so a redirected `$HOME` is refused; and that
-/// every change is undoable by one printed line.
+/// aterm runs once a day at the first window or interactive terminal session,
+/// and by a package pass when the table changed, while `[packages] enabled` is
+/// on); that `defaults` writes the account's per-host domain, so a redirected
+/// `$HOME` is refused; and that every change is undoable by one printed line. It
+/// names no Settings control shape, so a page change cannot make it stale.
 #[cfg(target_os = "macos")]
 const MACHINE_CONFIG_PARAGRAPH: &str = "\n\
      [machine] — macOS host settings (aterm.toml; applied by `aterm pkg`):\n\
@@ -728,23 +745,26 @@ const MACHINE_CONFIG_PARAGRAPH: &str = "\n\
      \x20                         iPads on the same Apple account; leave never touches them.\n\
      \x20 It is applied by `aterm pkg machine apply`, which aterm runs once a day at the\n\
      \x20 first window or interactive terminal session, and by a package pass (update,\n\
-     \x20 seed, install) when the [machine] table changed since it was last applied;\n\
-     \x20 `aterm pkg machine` reads the measured state, and Settings ▸ Security shows it\n\
-     \x20 with the switch and an Apply Now button. A saved change lands on the next\n\
-     \x20 ALab tools check, or on Apply Now. `defaults` writes\n\
-     \x20 the ACCOUNT's per-host domain regardless of $HOME, so an apply under a redirected\n\
-     \x20 HOME is refused and says so, as is one whose aterm.toml does not parse (fix it\n\
-     \x20 with `aterm --window --validate-config`). Undo Universal Control with the\n\
-     \x20 revert line `aterm pkg machine` prints (`defaults -currentHost delete\n\
-     \x20 com.apple.universalcontrol Disable`, then the same for DisableMagicEdges) AND set\n\
-     \x20 universal_control = \"leave\", or the next apply disables it again.\n";
+     \x20 seed, install) when the [machine] table changed since it was last applied; no\n\
+     \x20 pass runs while [packages] enabled = false, so an edit then waits for the daily\n\
+     \x20 apply. `aterm pkg machine` reads the measured state. Settings ▸ Security sets\n\
+     \x20 it, shows that state under its row and, while there is something to apply,\n\
+     \x20 offers Apply Now, which applies it at once. `defaults` writes the ACCOUNT's\n\
+     \x20 per-host domain regardless of $HOME, so an apply under a redirected HOME is\n\
+     \x20 refused and says so, as is one whose aterm.toml does not parse (fix it with\n\
+     \x20 `aterm --window --validate-config`). Undo Universal Control with the revert\n\
+     \x20 line `aterm pkg machine` prints (`defaults -currentHost delete\n\
+     \x20 com.apple.universalcontrol Disable`, then the same for DisableMagicEdges) AND\n\
+     \x20 set universal_control = \"leave\", or the next apply disables it again.\n";
 
 /// The `[privacy]` paragraph of `explain-config` (design §4).
 ///
 /// It says that the probes (Full Disk Access's `open()` of a `TCC.db` and
 /// `DevToolsSecurity -status`) read existing state and raise no dialog; that
 /// at launch, while the grant reads off, aterm brings up the Full Disk Access
-/// page with its panel (owner ask 2026-10-16); that the warm-up deliberately
+/// page with its panel (owner ask 2026-10-16); that `notice` off also keeps
+/// the once-per-Mac debugger-access alert from coming up (owner ruling O29),
+/// and no key raises it; that the warm-up deliberately
 /// raises the prompts, so it runs on the owner's press or at a quiet moment of
 /// a launch that reads the grant off, never from a session; and that no key is
 /// deferred. It does not claim a grant ends macOS
@@ -773,7 +793,10 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20                         (or refuses aterm a read), it files one entry in aterm's\n\
      \x20                         Messages with an Open Settings button. At most once a week; a\n\
      \x20                         window started before you pressed Open Settings waits 14 days;\n\
-     \x20                         Dismiss all files it for 30 days, then 90.\n\
+     \x20                         Dismiss all files it for 30 days, then 90. Off, it also keeps\n\
+     \x20                         aterm from asking, once per Mac after those pages, whether to\n\
+     \x20                         allow debugger access (macOS's developer mode) in its own\n\
+     \x20                         alert; no key makes aterm ask it.\n\
      \x20 report_attribution      per-session corroboration of the app macOS holds responsible for\n\
      \x20                         each session. It only corroborates: aterm's own adoption record\n\
      \x20                         decides whether a session reads `live` or `adopted`.\n\
@@ -844,8 +867,9 @@ fn show_face_report(family: Option<&str>) -> (String, i32) {
     match aterm_render::face_info(family) {
         Some(info) => (
             format!(
-                "family={family}\npath={}\npx={}\ncell_width={}\ncell_height={}\nbaseline={}\nglyph_count={}\n",
+                "family={family}\npath={}\nindex={}\npx={}\ncell_width={}\ncell_height={}\nbaseline={}\nglyph_count={}\n",
                 info.path,
+                info.index,
                 aterm_render::FaceInfo::PROBE_PX,
                 info.cell_width,
                 info.cell_height,
@@ -1674,8 +1698,9 @@ fn machine_facts(fix: bool) -> MachineFacts {
 }
 
 /// Windows: the console host a new window's tab runs in under aterm.toml's
-/// `conpty`, STARTED once to prove it (`aterm_pty::probe_console_host`; the
-/// default inbox choice starts nothing). `None` elsewhere: no console host.
+/// `conpty`, STARTED once to prove it (`aterm_pty::probe_console_host`: the
+/// default starts the OpenConsole beside aterm, `inbox` starts nothing). `None`
+/// elsewhere: no console host.
 fn console_host_fact() -> Option<aterm_pty::ConsoleHostReport> {
     #[cfg(windows)]
     {
@@ -2077,7 +2102,7 @@ fn opened_ago_words(ago: u64) -> String {
 /// say so). Pure.
 fn devtools_banner(facts: &atpkg::devtools::Facts, full: bool, listed_terminal: bool) -> String {
     use atpkg::devtools as dt;
-    let skips = aterm_containment::SpikeEvidence::UNMEASURED.devtool_skips_first_run_check;
+    let skips = aterm_containment::SpikeEvidence::MEASURED.devtool_skips_first_run_check;
     let status = format!("  {}", dt::STATUS_LINK);
     if !full {
         let mut short = format!(
@@ -2112,8 +2137,9 @@ fn config_conpty_from_text(text: &str) -> Option<String> {
 }
 
 /// The `conpty:` row (Windows): `ok` for OpenConsole and for the Windows
-/// console host the choice asked for (the default), a `note` when an
-/// opted-in OpenConsole fell back — never a failure: every tab opens either way.
+/// console host the choice asked for (`inbox`), a `note` when the OpenConsole
+/// the choice named (the bundled default, `auto` or a path) fell back — never a
+/// failure: every tab opens either way.
 fn console_host_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
     let Some(host) = &facts.console_host else {
         return Vec::new();
@@ -3185,8 +3211,9 @@ pub fn session_main(quiet: bool) -> ! {
     } else if std::env::var_os(AGENTS_DIR_ENV).is_some() {
         env_add.push((AGENTS_DIR_ENV.to_string(), String::new()));
     }
-    // `ATERM_CHILD` is not set in this lane: the reroute gates only on its own
-    // two variables.
+    // `ATERM_CHILD` is not set in this lane: `fleet_listen`'s root-only nesting
+    // guard reads it, and the reroute gates only on its own two variables.
+    env_add.push(("AGY_CLI_FAST_PROMPT_EDITOR".to_string(), "true".to_string()));
 
     // Protected spawn: cap-gated, fail-closed, resource-bounded per
     // `session_limits` (`setrlimit` before execve on POSIX, the Job Object on
@@ -4082,51 +4109,6 @@ mod tests {
         );
     }
 
-    /// The managed `bin/` the front door APPENDED to the inherited PATH
-    /// (`crates/aterm/src/main.rs`, `atpkg::session_bin_dir`) stays last and
-    /// single behind reroute, agents and the front door, as the window's spawn
-    /// seam places it; composing again moves nothing.
-    #[test]
-    fn session_path_keeps_the_appended_bin_dir_last_and_single() {
-        let sep = if cfg!(windows) { ';' } else { ':' };
-        let join = |parts: &[&str]| parts.join(&sep.to_string());
-        let reroute = "/Users//u/Library/Application Support/aterm/pkg/reroute";
-        let agents = "/Users//u/Library/Application Support/aterm/pkg/agents";
-        let managed_bin = "/Users//u/Library/Application Support/aterm/pkg/bin";
-        let front_door = "/opt/aterm/bin";
-        let inherited = atpkg::store::append_bin_to_path(
-            Some(std::ffi::OsStr::new(&join(&[
-                "/opt/homebrew/bin",
-                "/usr/bin",
-            ]))),
-            std::path::Path::new(managed_bin),
-        );
-        let inherited = inherited.to_str().expect("utf-8");
-        let (_, value) = session_path_env(
-            Some(reroute),
-            Some(agents),
-            Some(front_door),
-            Some(inherited),
-        )
-        .expect("injects");
-        assert_eq!(
-            value,
-            join(&[
-                reroute,
-                agents,
-                front_door,
-                "/opt/homebrew/bin",
-                "/usr/bin",
-                managed_bin
-            ])
-        );
-        let (_, again) =
-            session_path_env(Some(reroute), Some(agents), Some(front_door), Some(&value))
-                .expect("injects");
-        assert_eq!(again, value);
-        assert_eq!(value.matches(managed_bin).count(), 1);
-    }
-
     /// The derived agents dir is atpkg's `Layout::agents_dir` for the prefix of
     /// `$ATERM_REROUTE_DIR` (pinned against the real layout), and the
     /// derivation ensures it exists (`0700`), so a fresh machine's first
@@ -4524,9 +4506,10 @@ mod tests {
     }
 
     /// The Windows `conpty:` row lands with the machine rows, in the rows'
-    /// columns: `ok` for OpenConsole and for the default inbox host, a `note`
-    /// when an opted-in OpenConsole fell back, and the verdict untouched either
-    /// way. No fact (every platform but Windows) is no row.
+    /// columns: `ok` for OpenConsole (the default) and for the inbox host
+    /// `conpty = "inbox"` asked for, a `note` when a named OpenConsole fell
+    /// back, and the verdict untouched either way. No fact (every platform but
+    /// Windows) is no row.
     #[test]
     fn the_conpty_row_is_ok_for_the_default_and_a_note_for_a_fallback() {
         let report_with = |host: Option<aterm_pty::ConsoleHostReport>| {
@@ -4553,7 +4536,7 @@ mod tests {
         let inbox = aterm_pty::ConsoleHostReport {
             kind: aterm_pty::ConsoleHostKind::Inbox,
             fell_back: false,
-            line: "Windows console host (the default)".to_string(),
+            line: "Windows console host (aterm.toml conpty = \"inbox\")".to_string(),
         };
         let (r, code) = report_with(Some(inbox));
         assert_eq!(code, 0);
@@ -4564,7 +4547,7 @@ mod tests {
             .expect("the row");
         assert_eq!(
             rows[at],
-            "conpty:     ok    Windows console host (the default)"
+            "conpty:     ok    Windows console host (aterm.toml conpty = \"inbox\")"
         );
         assert!(rows[at + 1].starts_with("instances: "), "{r}");
         assert!(r.contains("health: OK\n"), "{r}");
@@ -5252,7 +5235,7 @@ mod tests {
         use super::{DEVTOOLS_WAIT_LINE, WindowAnswer};
         use aterm_containment::DevToolListing;
         use atpkg::devtools as dt;
-        let skips = aterm_containment::SpikeEvidence::UNMEASURED.devtool_skips_first_run_check;
+        let skips = aterm_containment::SpikeEvidence::MEASURED.devtool_skips_first_run_check;
         let absent = devtools_facts_with(read_list(DevToolListing::Absent, 2));
         let reply = |line: &str| WindowAnswer::Reply(line.to_string());
         let said = |log: &[String]| -> String {
@@ -5679,6 +5662,7 @@ mod tests {
         for key in [
             "family=",
             "path=",
+            "index=",
             "px=16\n",
             "cell_width=",
             "cell_height=",

@@ -1,0 +1,10 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# T10: a turn that names its cause (`ctl turn cause=@3`) keeps it: no
+# heuristic link beside it, though the mail it names is the one waiting.
+mail task off=3
+expect mark - mail dir=in kind=task off=3
+at 1000 ctl cause=@3
+wait 300
+see busy
+expect open t1 turn ledger=1 by=harness cause=@3 cause_k=mail at=1300
+expect link=none

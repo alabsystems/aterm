@@ -16,7 +16,7 @@ contract_fn! {
     ///
     /// Verified against `Astream.Wire.TlaLogOffset.offset_precedes_or_eq_isl` by
     /// `clean-kernel-defeq`.
-    pub fn offset_precedes_or_eq(earlier: u64, later: u64) -> bool
+    pub const fn offset_precedes_or_eq(earlier: u64, later: u64) -> bool
     clauses [ensures result == (earlier <= later)]
     {
         earlier <= later
@@ -41,7 +41,7 @@ impl Offset {
 
     /// `self - earlier`, the number of records in between, or `None` if
     /// `earlier > self`.
-    pub fn delta_from(self, earlier: Offset) -> Option<u64> {
+    pub const fn delta_from(self, earlier: Offset) -> Option<u64> {
         self.0.checked_sub(earlier.0)
     }
 }

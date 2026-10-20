@@ -1,0 +1,24 @@
+# agy 1.4.0 · MEASURED 2026-10-18, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Antigravity CLI, launched by path with a scratch `HOME` whose settings name the Gemini API provider, its Google hosts black-holed, a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · hideActiveItems=true in settings.json (the setting 'Show active subagents and background tasks below the input box' turned off): a run_command task (sleep 30) running after its turn ended: no panel, the footer still counts 1 task(s)
+
+      ▄▀▀▄        Antigravity CLI 1.4.0
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     /private/tmp/at.QNwF/proj
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> hello with the panel off
+
+  Hi! I am the local lab stub, not a model. (reply 15)
+
+────────────────────────────────────────────────────────────
+> toolstart
+
+○ Running (sleep 30; echo LAB-OFF-DONE) (ctrl+o to expand)
+
+  Tool call done.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                        Gemini 3.1 Pro · low · 1 task(s) · /tasks

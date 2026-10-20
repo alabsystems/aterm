@@ -13,6 +13,7 @@ pub use self::content::{
     Content, ContentDeserializer, ContentRefDeserializer, ContentVisitor, EnumDeserializer,
     InternallyTaggedUnitVisitor, TaggedContentVisitor, UntaggedUnitVisitor, content_as_str,
 };
+use self::content::{key_deserializer, key_ref_deserializer};
 
 pub use crate::private::InPlaceSeed;
 
@@ -1411,7 +1412,7 @@ mod content {
             match self.next_pair() {
                 Some((key, value)) => {
                     self.value = Some(value);
-                    seed.deserialize(ContentDeserializer::new(key)).map(Some)
+                    seed.deserialize(key_deserializer(key)).map(Some)
                 }
                 None => Ok(None),
             }
@@ -1439,7 +1440,7 @@ mod content {
         {
             match self.next_pair() {
                 Some((key, value)) => {
-                    let key = tri!(kseed.deserialize(ContentDeserializer::new(key)));
+                    let key = tri!(kseed.deserialize(key_deserializer(key)));
                     let value = tri!(vseed.deserialize(ContentDeserializer::new(value)));
                     Ok(Some((key, value)))
                 }
@@ -2357,7 +2358,7 @@ mod content {
             match self.next_pair() {
                 Some((key, value)) => {
                     self.value = Some(value);
-                    seed.deserialize(ContentRefDeserializer::new(key)).map(Some)
+                    seed.deserialize(key_ref_deserializer(key)).map(Some)
                 }
                 None => Ok(None),
             }
@@ -2385,7 +2386,7 @@ mod content {
         {
             match self.next_pair() {
                 Some((key, value)) => {
-                    let key = tri!(kseed.deserialize(ContentRefDeserializer::new(key)));
+                    let key = tri!(kseed.deserialize(key_ref_deserializer(key)));
                     let value = tri!(vseed.deserialize(ContentRefDeserializer::new(value)));
                     Ok(Some((key, value)))
                 }
@@ -2661,6 +2662,48 @@ mod content {
         }
     }
 
+    // aterm's own from here to the end of `key_ref_deserializer`.
+
+    /// A buffered key is text when the format handed it over as a string,
+    /// which is how JSON and TOML hand over every key.
+    fn content_text<'a>(content: &'a Content<'_>) -> Option<&'a str> {
+        match *content {
+            Content::Str(text) => Some(text),
+            Content::String(ref text) => Some(text),
+            _ => None,
+        }
+    }
+
+    impl<'de, E> de::value::KeyText for ContentDeserializer<'de, E> {
+        fn key_text(&self) -> Option<&str> {
+            content_text(&self.content)
+        }
+    }
+
+    impl<'a, 'de, E> de::value::KeyText for ContentRefDeserializer<'a, 'de, E> {
+        fn key_text(&self) -> Option<&str> {
+            content_text(self.content)
+        }
+    }
+
+    /// The deserializer for a buffered map key. A `#[serde(flatten)]` map, an
+    /// untagged or internally tagged enum, and a struct with a flattened field
+    /// read their keys back from this buffer, not from the format, so the
+    /// buffer reads a key a text format wrote as a string the way the format
+    /// does: `7` back into a `u32` key, `true` into a `bool` one.
+    pub(super) fn key_deserializer<'de, E>(
+        key: Content<'de>,
+    ) -> de::value::TextKeyDeserializer<ContentDeserializer<'de, E>> {
+        de::value::TextKeyDeserializer::new(ContentDeserializer::new(key))
+    }
+
+    /// [`key_deserializer`] over a borrowed buffer.
+    pub(super) fn key_ref_deserializer<'a, 'de, E>(
+        key: &'a Content<'de>,
+    ) -> de::value::TextKeyDeserializer<ContentRefDeserializer<'a, 'de, E>> {
+        de::value::TextKeyDeserializer::new(ContentRefDeserializer::new(key))
+    }
+
     /// Visitor for deserializing an internally tagged unit variant.
     ///
     /// Not public API.
@@ -2934,7 +2977,7 @@ where
                 // is going to be consumed. Borrowing here leaves the entry
                 // available for later flattened fields.
                 self.pending_content = Some(content);
-                return seed.deserialize(ContentRefDeserializer::new(key)).map(Some);
+                return seed.deserialize(key_ref_deserializer(key)).map(Some);
             }
         }
         Ok(None)
@@ -2972,7 +3015,7 @@ where
         for entry in self.iter.by_ref() {
             if let Some((key, content)) = flat_map_take_entry(entry, self.fields) {
                 self.pending_content = Some(content);
-                return seed.deserialize(ContentDeserializer::new(key)).map(Some);
+                return seed.deserialize(key_deserializer(key)).map(Some);
             }
         }
         Ok(None)

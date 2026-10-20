@@ -39,11 +39,22 @@ use super::{
 pub struct LocalVerbs {
     /// The `cast drift` analyzer (`aterm_control::cast_drift` behind an adapter).
     pub cast_drift: Option<CastDriftFn>,
+    /// The fleet client `survey --fleet | --host` asks the fleet's peers
+    /// through (`aterm_net`'s TLS and the fleet's proof, which this
+    /// dependency-free client does not link).
+    pub fleet_survey: Option<crate::FleetSurveyFn>,
+    /// The fleet client `--host` drives another Mac's aterm through (the
+    /// step-in: the fleet's `drive` op, [`crate::FleetDriveFn`]).
+    pub fleet_drive: Option<crate::FleetDriveFn>,
 }
 
 impl LocalVerbs {
     /// No local verbs: every request goes to a server.
-    pub const NONE: Self = Self { cast_drift: None };
+    pub const NONE: Self = Self {
+        cast_drift: None,
+        fleet_survey: None,
+        fleet_drive: None,
+    };
 }
 
 /// Computes a `cast drift` report from fetched (or saved) material: the whole
@@ -611,8 +622,6 @@ fn live_with(
 
 #[cfg(test)]
 mod tests {
-    use std::io::BufRead as _;
-
     use super::*;
 
     fn strings(parts: &[&str]) -> Vec<String> {
@@ -712,6 +721,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_older_server_gets_the_report_computed_client_side() {
+        use std::io::BufRead as _;
         use std::os::unix::net::UnixListener;
         const CAST: &str = "{\"version\": 2, \"width\": 20, \"height\": 8}\n[0.1, \"o\", \"hi\"]\n";
         let dir = std::env::temp_dir().join(format!("aterm-ctl-drift-{}", std::process::id()));
@@ -748,6 +758,8 @@ mod tests {
         let path = sock.to_str().expect("utf8").to_string();
         let local = LocalVerbs {
             cast_drift: Some(echo_pre_undo),
+            fleet_survey: None,
+            fleet_drive: None,
         };
         let code = live_with(
             &path,
@@ -797,6 +809,8 @@ mod tests {
         let with_sel = strings(&["@s-a", "cast", "drift", "--file", "x"]);
         let local = LocalVerbs {
             cast_drift: Some(echo),
+            fleet_survey: None,
+            fleet_drive: None,
         };
         assert!(offline_entry(&with_sel, &local).is_err());
         let live_form = strings(&["@s-a", "cast", "drift", "rows=2"]);
@@ -815,6 +829,8 @@ mod tests {
         let saved = strings(&["cast", "drift", "--file", file.to_str().expect("utf8")]);
         let unknown = LocalVerbs {
             cast_drift: Some(echo_unknown),
+            fleet_survey: None,
+            fleet_drive: None,
         };
         assert_eq!(
             offline_entry(&saved, &unknown).expect("computed offline"),
@@ -822,6 +838,8 @@ mod tests {
         );
         let pre_undo = LocalVerbs {
             cast_drift: Some(echo_pre_undo),
+            fleet_survey: None,
+            fleet_drive: None,
         };
         assert_eq!(
             offline_entry(&saved, &pre_undo).expect("refused by the analyzer"),

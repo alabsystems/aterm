@@ -13,14 +13,13 @@ use aterm_messages::Intent;
 
 use super::*;
 
-/// One CLI as a look would judge it: measured as its row is, wanted.
+/// One CLI as a look would judge it, wanted.
 fn cli(id: &'static str, state: State, mark: Mark, fact: &str) -> AiCli {
     let row = connector::connector(id).expect("a connection");
     AiCli {
         id,
         product: row.product,
         claude: row.is_claude(),
-        measured: row.measured,
         wanted: true,
         state,
         mark,
@@ -30,7 +29,7 @@ fn cli(id: &'static str, state: State, mark: Mark, fact: &str) -> AiCli {
 }
 
 /// A reading: Claude Code fine, Codex CLI signed out (the preferred one),
-/// Antigravity CLI signed out but unmeasured (a note), Muse Code off.
+/// Antigravity CLI's keyring unknown (a note), Muse Code off.
 fn reading() -> AiReading {
     AiReading {
         as_of: 1_000_000,
@@ -46,9 +45,9 @@ fn reading() -> AiReading {
             cli("codex", State::SignedOut, Mark::Fail, "no login is stored"),
             cli(
                 "agy",
-                State::SignedOut,
+                State::Unproven,
                 Mark::Note,
-                "never signed in here (not measured in this build)",
+                "its keyring login is unknown (not measured in this build)",
             ),
             AiCli {
                 wanted: false,
@@ -81,10 +80,10 @@ fn choices(text: &str, fleet: Option<&str>) -> AiChoices {
 
 /// THE PAGE'S PROJECTION (§10): who needs you, then one row per CLI in
 /// `VENDORS` order — its name and version, the preferred one marked, its
-/// state and fact, Sign in only where a wanted, measured CLI needs a person —
+/// state and fact, Sign in only where a wanted CLI definitely needs a person —
 /// the choices the fleet document made said as its, and the reviews grant and
-/// the fleet document as facts. NEGATIVE CONTROLS: an unmeasured CLI that
-/// reads signed out offers no Sign in, the look switched off shows no stale
+/// the fleet document as facts. NEGATIVE CONTROLS: an unknown login
+/// offers no Sign in, the look switched off shows no stale
 /// state and no button, and an unpublished snapshot says it is reading.
 #[test]
 fn the_projection_says_who_needs_you_and_where_each_choice_came_from() {
@@ -112,7 +111,7 @@ fn the_projection_says_who_needs_you_and_where_each_choice_came_from() {
     assert_eq!(
         row("agy").act,
         None,
-        "an unmeasured CLI never needs you on a guess"
+        "an unknown keyring login needs no action on a guess"
     );
     assert_eq!(row("muse").act, None);
     assert!(
@@ -164,6 +163,25 @@ fn the_projection_says_who_needs_you_and_where_each_choice_came_from() {
             .and_then(|row| row.act),
         Some(AiAct::Install)
     );
+
+    // Missing installs and definite missing logins offer the same actions
+    // before a vendor lab has run. Unknown login evidence stays quiet.
+    if let Some(reading) = missing.reading.as_mut() {
+        reading.clis[2] = cli("agy", State::NotInstalled, Mark::Fail, "not installed");
+        reading.clis[3] = cli("muse", State::SignedOut, Mark::Fail, "no login is stored");
+    }
+    missing.choices = choices("", None);
+    let p = missing.projection(true);
+    for (id, action) in [("agy", AiAct::Install), ("muse", AiAct::SignIn)] {
+        assert_eq!(
+            p.clis
+                .iter()
+                .find(|row| row.id == id)
+                .and_then(|row| row.act),
+            Some(action),
+            "{id}"
+        );
+    }
 
     // No one needs you.
     let mut fine = state.clone();
@@ -220,13 +238,13 @@ fn keys(entries: &[Entry]) -> Vec<String> {
     entries.iter().map(Entry::key).collect()
 }
 
-/// WHICH STATES RAISE WHICH LINES (§7.3): a wanted, measured CLI that is
+/// WHICH STATES RAISE WHICH LINES (§7.3): a wanted CLI that is
 /// signed out, not installed or due raises `ai.<cli>.<state>`, Warn for the
 /// preferred CLI and Info otherwise, whose one button opens Settings ▸ Harness
 /// ▸ AI CLIs and whose detail names `aterm ai doctor`; every line passes the
 /// door's word rules. For Claude Code, accounts v2's own: none while its
 /// roster lists rows, and otherwise only signed out and not installed.
-/// NEGATIVE CONTROLS: an unmeasured CLI raises nothing even reading FAIL, an
+/// NEGATIVE CONTROLS: an unknown login raises nothing, an
 /// unwanted CLI nothing, a working or limited one nothing.
 #[test]
 fn the_lines_name_each_cli_that_needs_you_and_leave_claude_to_accounts() {
@@ -301,12 +319,13 @@ fn the_lines_name_each_cli_that_needs_you_and_leave_claude_to_accounts() {
         r.clis[1] = cli("codex", state, mark, "fine");
         assert!(ai_entries(&r, false).is_empty(), "{state:?}");
     }
-    // NEGATIVE CONTROL: an unmeasured CLI raises nothing, even one a guess
-    // would read FAIL; an unwanted one nothing.
+    // A definite missing install remains actionable before a vendor lab;
+    // an unknown login and an unwanted CLI raise nothing.
     r.clis[1] = cli("codex", State::Ok, Mark::Ok, "fine");
     r.clis[2] = cli("agy", State::NotInstalled, Mark::Fail, "not installed");
-    assert!(!r.clis[2].measured);
-    assert!(ai_entries(&r, false).is_empty(), "agy is not measured");
+    assert_eq!(keys(&ai_entries(&r, false)), ["ai.agy.not-installed"]);
+    r.clis[2] = cli("agy", State::Unproven, Mark::Note, "keyring unknown");
+    assert!(ai_entries(&r, false).is_empty(), "agy's login is unknown");
     r.clis[2] = cli("agy", State::Ok, Mark::Ok, "fine");
     r.clis[1] = AiCli {
         wanted: false,

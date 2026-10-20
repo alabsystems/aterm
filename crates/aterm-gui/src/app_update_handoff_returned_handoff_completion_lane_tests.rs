@@ -39,7 +39,7 @@ fn stage_one_build(app: &mut App) -> u64 {
                 apply_failure: String::new(),
                 apply_failure_build: 0,
                 apply_failures_for_target: 0,
-                installable: true,
+                installable: Some(true),
                 channel_unreadable: false,
                 checked_at: None,
             },

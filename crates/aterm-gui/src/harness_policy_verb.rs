@@ -93,7 +93,7 @@ pub(crate) fn effective(cfg: &SupervisorConfig, p: Posture) -> (bool, &'static s
 #[must_use]
 pub(crate) fn questions(cfg: &SupervisorConfig, session: Option<&str>) -> String {
     match session {
-        Some(word) if cfg.session_questions => word.to_string(),
+        Some(word) => word.to_string(),
         _ if !cfg.answer_questions => "ask".to_string(),
         _ => cfg.question_priority.word().to_string(),
     }
@@ -198,15 +198,10 @@ impl crate::App {
     /// `EVENT <local> harness-policy gen=<n>`, so an agent that answers for
     /// itself re-reads `harness policy` on it rather than on a clock.
     pub(crate) fn announce_harness_policy(&self) {
-        let payload = format!("gen={}", self.harness_policy.generation());
+        let generation = self.harness_policy.generation();
         let mut moved = Vec::new();
         for pooled in self.pool.iter() {
-            pooled
-                .ctx
-                .timeline
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .record(HARNESS_POLICY_EVENT, payload.clone());
+            record_policy_move(&pooled.ctx.timeline, generation);
             moved.push(pooled.id);
         }
         if self.subscribers.any() {
@@ -220,6 +215,19 @@ impl crate::App {
 
 /// The timeline kind (and `events` wire word) of the policy cell's move.
 pub(crate) const HARNESS_POLICY_EVENT: &str = "harness-policy";
+
+/// The policy cell's move to `generation`, on one session's timeline: the
+/// `harness-policy gen=<n>` row [`crate::App::announce_harness_policy`] writes on
+/// every session's (the wire goldens write theirs through it too).
+pub(crate) fn record_policy_move(
+    timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
+    generation: u64,
+) {
+    timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .record(HARNESS_POLICY_EVENT, format!("gen={generation}"));
+}
 
 #[cfg(test)]
 mod tests {
@@ -433,9 +441,6 @@ mod tests {
         cfg.answer_questions = false;
         assert_eq!(questions(&cfg, None), "ask");
         assert_eq!(questions(&cfg, Some("short-term")), "short-term");
-        // A loop that gives the session no say reads the table.
-        cfg.session_questions = false;
-        assert_eq!(questions(&cfg, Some("short-term")), "ask");
     }
 
     #[test]

@@ -97,6 +97,7 @@ fn an_unfocused_window_streaks_only_while_typed_into_or_recorded() {
                     pace_ticks: Vec::new(),
                     unseamed_at_begin: 0,
                     unlogged_other_window: 0,
+                    unlogged_over_cap: 0,
                     mode: crate::VideoMode::SwapchainTap,
                     next_frame: None,
                     presented: None,

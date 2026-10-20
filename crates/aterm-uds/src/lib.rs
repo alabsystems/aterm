@@ -50,11 +50,20 @@ pub mod win;
 #[cfg(windows)]
 pub use win::{CtlListener, CtlStream};
 
+/// Unix-only: the one writer of a whole file (a new temp beside it, its mode
+/// on the descriptor, synced, renamed) and aterm.toml's, under the config
+/// service's write lock. See [`atomic_file`].
+#[cfg(unix)]
+pub mod atomic_file;
+
 /// A deadline on a call that can block forever: in this process ([`deadline::Gate`], the
 /// shared [`deadline::TRUST`] gate) or in a child ([`deadline::output_until`]). Native-only:
 /// it starts threads, which the wasm32 build never does.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod deadline;
+/// Whether this process runs elevated (a Windows administrator's full token), which
+/// gives it a control directory of its own ([`control_socket_dir`]). See [`elevation`].
+pub mod elevation;
 /// A kernel witness of another process's death with its `wait(2)` status (the PTY keeper's
 /// death classifier), and the moment of it ([`exitwatch::ExitMoment`], read by
 /// `aterm ctl subscribe`'s redial).
@@ -66,6 +75,7 @@ pub mod hangup;
 /// keeper's holder scan), or use a path under a set of directories (the disk
 /// watch's check before it removes a build directory whole).
 pub mod holders;
+pub mod host;
 pub mod latest;
 /// Unix-only: the descriptor a throwaway `--headless` instance watches so it ends
 /// with the process that started it — both ends. See [`lifeline`].
@@ -127,6 +137,10 @@ pub mod stdout;
 /// The kernel facts a `sudo` askpass relay stands on, and a scrubbed secret
 /// for the password in flight (`docs/DESIGN-sudo-askpass-2026-10-15.md`).
 pub mod sudo;
+/// A Cargo test binary's own per-user root, under which [`control_socket_dir`]
+/// and `aterm_types::dirs` answer in a test, so no test reaches the person's
+/// live socket, state, logs or config. See [`test_binary`].
+pub mod test_binary;
 
 /// The per-user directory holding aterm's control socket and token, resolved
 /// identically for the server and every client. `None` only when the
@@ -134,7 +148,12 @@ pub mod sudo;
 ///
 /// **Windows:** `%TMP%`/`%TEMP%\aterm` (else `%LOCALAPPDATA%\Temp\aterm`). It
 /// stays outside `%APPDATA%`: a OneDrive-style filter there lets afunix `bind`
-/// succeed while `connect` fails with `WSAEINVAL`.
+/// succeed while `connect` fails with `WSAEINVAL`. An ELEVATED process
+/// ([`elevation::is_elevated`]) resolves `aterm-elevated` beside it instead
+/// ([`ELEVATED_CONTROL_DIR_NAME`]), so elevated and unelevated instances of one
+/// user never share the `latest` alias, a token or a socket, and neither side's
+/// `aterm ctl` lists or dials the other's: the server makes that directory
+/// Administrators-only (`docs/WINDOWS_PARAGON_DESIGN.md` §5.7).
 ///
 /// **Unix:** `$XDG_RUNTIME_DIR/aterm` when set, else the per-user default:
 /// on macOS `$HOME/Library/Application Support/aterm` (aterm's state folder
@@ -145,9 +164,15 @@ pub mod sudo;
 /// has no dependencies, and without its `ATERM_STATE_HOME` development seam:
 /// the socket folder does not follow it on macOS either, and the server and
 /// every client must resolve it alike.
+///
+/// **In a Cargo test binary** ([`test_binary`]) the per-user default is
+/// `<the binary's scratch root>/run` instead, on every platform, and so is a
+/// `$XDG_RUNTIME_DIR` naming the login session's own (`/run/user/<uid>`): a test
+/// that names no folder never reaches the person's live socket. A
+/// `$XDG_RUNTIME_DIR` the test set still wins.
 #[must_use]
 pub fn control_socket_dir() -> Option<std::path::PathBuf> {
-    control_socket_dir_inner()
+    control_socket_dir_inner(test_binary::scratch_root())
 }
 
 /// [`control_socket_dir`]'s per-user default when `$XDG_RUNTIME_DIR` is unset,
@@ -160,8 +185,9 @@ pub const CONTROL_SOCKET_DIR_DEFAULT: &str = "~/Library/Application Support/ater
 pub const CONTROL_SOCKET_DIR_DEFAULT: &str = "${XDG_STATE_HOME:-~/.local/state}/aterm/run";
 
 /// Whether [`control_socket_dir`] is private: `$XDG_RUNTIME_DIR` is set, so it
-/// is not the per-user default under `$HOME`. Always `false` on Windows. The
-/// registry there lists only the instances that publish into that directory.
+/// is not the per-user default under `$HOME`, or this is a test binary's scratch
+/// one. Always `false` on Windows. The registry there lists only the instances
+/// that publish into that directory.
 #[must_use]
 pub fn control_socket_dir_is_private() -> bool {
     #[cfg(windows)]
@@ -170,28 +196,50 @@ pub fn control_socket_dir_is_private() -> bool {
     }
     #[cfg(not(windows))]
     {
-        std::env::var_os("XDG_RUNTIME_DIR").is_some()
+        std::env::var_os("XDG_RUNTIME_DIR").is_some() || test_binary::scratch_root().is_some()
     }
 }
 
-fn control_socket_dir_inner() -> Option<std::path::PathBuf> {
-    use std::path::PathBuf;
+/// The Windows control directory's name under the per-user temp folder for an
+/// unelevated process.
+#[cfg(windows)]
+pub const CONTROL_DIR_NAME: &str = "aterm";
+
+/// The Windows control directory's name under the per-user temp folder for an
+/// elevated process ([`control_socket_dir`]).
+#[cfg(windows)]
+pub const ELEVATED_CONTROL_DIR_NAME: &str = "aterm-elevated";
+
+/// [`control_socket_dir`], with `test_root` (a test binary's scratch root,
+/// [`test_binary::scratch_root`]) standing in for the per-user default.
+fn control_socket_dir_inner(test_root: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    // Plain matches, no closures: a closure body is an absent callee to the Trust
+    // panic-freedom verifier.
     #[cfg(windows)]
-    {
-        for var in ["TMP", "TEMP"] {
-            if let Some(v) = std::env::var_os(var).filter(|s| !s.is_empty()) {
-                return Some(PathBuf::from(v).join("aterm"));
+    let default = windows_control_dir(
+        [
+            std::env::var_os("TMP"),
+            std::env::var_os("TEMP"),
+            std::env::var_os("LOCALAPPDATA"),
+        ],
+        elevation::is_elevated(),
+    );
+    #[cfg(not(windows))]
+    let default = {
+        use std::path::PathBuf;
+        if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
+            match test_root {
+                Some(root) if test_binary::is_login_runtime_dir(&xdg) => {
+                    return Some(root.join("run"));
+                }
+                _ => return Some(PathBuf::from(xdg).join("aterm")),
             }
         }
-        let local = std::env::var_os("LOCALAPPDATA").filter(|s| !s.is_empty())?;
-        Some(PathBuf::from(local).join("Temp").join("aterm"))
-    }
-    #[cfg(not(windows))]
-    {
-        if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
-            return Some(PathBuf::from(xdg).join("aterm"));
-        }
         per_user_default(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+    };
+    match (default, test_root) {
+        (Some(_), Some(root)) => Some(root.join("run")),
+        (default, _) => default,
     }
 }
 
@@ -221,10 +269,96 @@ fn per_user_default(
     Some(state.join("aterm").join("run"))
 }
 
+/// [`control_socket_dir`] on Windows over `[%TMP%, %TEMP%, %LOCALAPPDATA%]` and
+/// whether this process is elevated: the first non-empty temp variable, else
+/// `%LOCALAPPDATA%\Temp`, then [`CONTROL_DIR_NAME`] or, elevated,
+/// [`ELEVATED_CONTROL_DIR_NAME`].
+#[cfg(windows)]
+fn windows_control_dir(
+    [tmp, temp, local_app_data]: [Option<std::ffi::OsString>; 3],
+    elevated: bool,
+) -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let non_empty = |v: Option<std::ffi::OsString>| v.filter(|s| !s.is_empty());
+    let base = match non_empty(tmp).or_else(|| non_empty(temp)) {
+        Some(temp) => PathBuf::from(temp),
+        None => PathBuf::from(non_empty(local_app_data)?).join("Temp"),
+    };
+    Some(base.join(if elevated {
+        ELEVATED_CONTROL_DIR_NAME
+    } else {
+        CONTROL_DIR_NAME
+    }))
+}
+
+#[cfg(all(test, windows))]
+mod windows_control_dir_tests {
+    use super::windows_control_dir;
+    use std::path::PathBuf;
+
+    /// An elevated process resolves its own directory beside the shared one,
+    /// under the same temp base, so the two never share `latest`, a token or a
+    /// socket; the base keeps its order (`%TMP%`, `%TEMP%`, `%LOCALAPPDATA%\Temp`).
+    #[test]
+    fn an_elevated_process_gets_a_control_dir_of_its_own() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        let env = [os(r"C:\t"), os(r"C:\u"), os(r"C:\l")];
+        assert_eq!(
+            windows_control_dir(env.clone(), false),
+            Some(PathBuf::from(r"C:\t\aterm"))
+        );
+        assert_eq!(
+            windows_control_dir(env, true),
+            Some(PathBuf::from(r"C:\t\aterm-elevated"))
+        );
+        assert_eq!(
+            windows_control_dir([os(""), os(r"C:\u"), None], true),
+            Some(PathBuf::from(r"C:\u\aterm-elevated"))
+        );
+        assert_eq!(
+            windows_control_dir([None, None, os(r"C:\l")], false),
+            Some(PathBuf::from(r"C:\l\Temp\aterm"))
+        );
+        assert_eq!(windows_control_dir([None, os(""), None], true), None);
+    }
+}
+
 #[cfg(all(test, not(windows)))]
 mod control_dir_tests {
     use super::per_user_default;
     use std::path::PathBuf;
+
+    /// In a test binary the per-user default is the binary's scratch root's `run`
+    /// folder, so a test that names no folder never reaches the person's live
+    /// socket; one the environment names (`$XDG_RUNTIME_DIR`, when this run has
+    /// one of its own) still wins. Negative control: with no scratch root, the
+    /// default is the person's: their login session's runtime folder where one is
+    /// exported (a Linux desktop's `/run/user/<uid>`), else the per-user default.
+    #[test]
+    fn a_test_binary_resolves_a_control_dir_of_its_own() {
+        let root = crate::test_binary::scratch_root().expect("a test binary's root");
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        let chosen = runtime
+            .clone()
+            .filter(|dir| !crate::test_binary::is_login_runtime_dir(dir));
+        let Some(chosen) = chosen else {
+            assert_eq!(super::control_socket_dir(), Some(root.join("run")));
+            let person = super::control_socket_dir_inner(None);
+            let persons = match runtime {
+                Some(login) => Some(PathBuf::from(login).join("aterm")),
+                None => {
+                    per_user_default(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+                }
+            };
+            assert_eq!(person, persons);
+            assert!(person.is_some_and(|dir| !dir.starts_with(root)));
+            return;
+        };
+        assert_eq!(
+            super::control_socket_dir(),
+            Some(PathBuf::from(chosen).join("aterm"))
+        );
+    }
 
     /// With `$XDG_RUNTIME_DIR` unset the control folder is aterm's state folder
     /// on macOS, and on every other Unix a `run` folder under aterm's XDG state

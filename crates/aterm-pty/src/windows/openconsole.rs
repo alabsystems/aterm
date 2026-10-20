@@ -5,22 +5,30 @@
 //! microsoft/terminal's `src/winconpty/winconpty.cpp` (MIT), with the
 //! process's console-host state and the Windows lookups (`WindowsApps`
 //! packages, PE file versions) the policy in `crate::console_host::policy` is
-//! handed. Opt-in: the state starts at the inbox host, and only a window that
-//! states aterm.toml's `conpty = "auto"` or a path ([`set_console_host`]) ever
-//! reaches the launch below. Nothing in this file has run since it was ported
-//! from the 2026-09-29 snapshot; its "measured" notes are that snapshot's.
+//! handed. The state starts at the inbox host for an embedder that states no
+//! choice; a window states aterm.toml's `conpty` ([`set_console_host`]), and
+//! its absence is the bundled host, so every window tab of a shipped build
+//! reaches the launch below. Run on Windows 11 26200 since 2026-10-17 (the
+//! crate's `tests/windows_openconsole.rs`, and the bundled 1.25.2609.30003
+//! measured against the inbox host, `docs/WINDOWS_PARAGON_DESIGN.md` §5.4);
+//! notes marked as the snapshot's are the 2026-09-29 snapshot's.
 //!
-//! WHERE `auto` FINDS ONE: an `OpenConsole.exe` beside the running executable
-//! (a bundle that ships one), else the installed Windows Terminal's, COPIED
+//! WHERE THE DEFAULT FINDS ONE: the `OpenConsole.exe` beside the running
+//! executable (the pinned one `apps/aterm-win/build.ps1` lays there), else
+//! none. WHERE `auto` FINDS ONE: that file, else the installed Windows
+//! Terminal's, COPIED
 //! into aterm's state directory. The snapshot recorded an unpackaged process
 //! launching it inside `WindowsApps` getting ERROR_ACCESS_DENIED (for
 //! `CreateProcessW` and .NET `Process.Start` alike, although the file ACL grants
 //! BUILTIN\Users execute: only a process with package identity may), while
 //! reading it is allowed and the copy keeps its valid Authenticode signature
-//! and runs. ANY failure on the way (no file, a copy that fails, a host that
-//! rejects its command line or dies before it speaks) falls back to the inbox
-//! host for that tab and every later one under the same choice, and is handed
-//! to the frontend's log once ([`take_console_host_fallback`]).
+//! and runs. A failure on the way (no file, a copy that fails, a host that
+//! rejects its command line, dies before it speaks or writes no VT) falls back
+//! to the inbox host for that tab and every later one under the same choice,
+//! and is handed to the frontend's log once ([`take_console_host_fallback`]); a
+//! host that only stays silent costs the one tab, until it has done so three
+//! times in a row. A program that never connects to its console (a GUI image)
+//! or exits before it does is not the host's failure ([`await_started`]).
 //!
 //! THE PORT relies on one ABI fact: the value `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`
 //! takes is a pointer to `{ hSignal, hPtyReference, hConPtyProcess }`
@@ -45,8 +53,8 @@ use crate::{ConsoleHostChoice, ConsoleHostReport};
 
 /// The process's console-host state. Starts at the inbox host: an embedder
 /// that never states a choice (the CLI's passthrough session, this crate's own
-/// tests) and a window whose aterm.toml has no `conpty` keep the host every
-/// earlier build used.
+/// tests) keeps the host every earlier build used; a window states its
+/// aterm.toml `conpty` before its first tab.
 static HOST: Mutex<HostState> = Mutex::new(HostState::new());
 
 /// Set the console host every LATER spawn in this process uses (the window
@@ -65,20 +73,23 @@ pub fn take_console_host_fallback() -> Option<String> {
 }
 
 /// The console host a new tab gets under the current choice, resolved now if
-/// no spawn has resolved it yet. Resolving `auto` can copy Windows Terminal's
-/// OpenConsole.exe into aterm's state directory; it never launches it — a host
-/// that fails to START is reported once a spawn has tried it (or by
-/// [`probe_console_host`]).
+/// no spawn has resolved it yet. Resolving `auto` (never the default) can copy
+/// Windows Terminal's OpenConsole.exe into aterm's state directory; it never
+/// launches it — a host that fails to START is reported once a spawn has tried
+/// it (or by [`probe_console_host`]).
 #[must_use]
 pub fn console_host_report() -> ConsoleHostReport {
-    HOST.lock_or_recover().report(resolve)
+    let mut host = HOST.lock_or_recover();
+    host.set_guarded(super::console_guard::available());
+    host.report(resolve)
 }
 
 /// The console host `choice` gives a new tab, with the host actually STARTED:
 /// the resolved OpenConsole is launched headless on throwaway pipes with
 /// `cmd.exe /d /c exit` as its client, must pass the spawn's health check
 /// ([`await_started`]), and both are ended again. For `aterm doctor`, a
-/// separate process that has spawned nothing. The inbox choice starts nothing.
+/// separate process that has spawned nothing. `inbox` starts nothing; the
+/// default starts the bundled host when there is one.
 #[must_use]
 pub fn probe_console_host(choice: &ConsoleHostChoice) -> ConsoleHostReport {
     let resolved = policy::resolve_choice(choice, resolve).and_then(|exe| {
@@ -88,14 +99,18 @@ pub fn probe_console_host(choice: &ConsoleHostChoice) -> ConsoleHostReport {
         let mut command = system_command("cmd.exe", "/d /c exit");
         let client = start_client(&mut host.slots(), &mut command)
             .map_err(|e| policy::did_not_start(&format!("its probe client did not start: {e}")))?;
-        let started = await_started(&host, pipes.out_read.raw());
+        let started = await_started(&host, client.raw(), pipes.out_read.raw());
         // SAFETY: the probe client we just started, by its handle.
         unsafe { ffi::TerminateProcess(client.raw(), 1) };
-        started
-            .map(|()| exe)
-            .map_err(|why| policy::did_not_start(&why))
+        match started {
+            Health::Started => Ok(exe),
+            Health::NoClient => Err(policy::did_not_start(
+                "its probe client exited before the host wrote anything",
+            )),
+            Health::Failed { why, .. } => Err(policy::did_not_start(&why)),
+        }
     });
-    policy::report(choice, &resolved)
+    policy::report_guarded(choice, &resolved, super::console_guard::available())
 }
 
 /// `"<SystemRoot>\System32\<exe>" <args>`, NUL-terminated: a system program by
@@ -115,8 +130,9 @@ pub(crate) fn system_command(exe: &str, args: &str) -> Vec<u16> {
 /// The OpenConsole a spawn of `program` should launch now, `None` for the
 /// inbox host (`HostState::host_for_spawn`).
 pub(crate) fn host_for_spawn(program: &OsStr) -> Option<OpenConsoleExe> {
-    HOST.lock_or_recover()
-        .host_for_spawn(Path::new(program), resolve, Path::is_file)
+    let mut host = HOST.lock_or_recover();
+    host.set_guarded(super::console_guard::available());
+    host.host_for_spawn(Path::new(program), resolve, Path::is_file)
 }
 
 /// `exe` failed to start for a spawn: every later spawn under this choice takes
@@ -125,17 +141,81 @@ pub(crate) fn note_launch_failure(exe: &OpenConsoleExe, why: &str) {
     HOST.lock_or_recover().note_launch_failure(exe, why);
 }
 
+/// `exe` said nothing to a spawn's waiting client: that tab took the inbox
+/// host, and only the third such silence in a row is kept as a failure
+/// (`HostState::note_silent_start`).
+pub(crate) fn note_silent_start(exe: &OpenConsoleExe, why: &str) {
+    HOST.lock_or_recover().note_silent_start(exe, why);
+}
+
+/// `exe` answered a spawn's client.
+pub(crate) fn note_started(exe: &OpenConsoleExe) {
+    HOST.lock_or_recover().note_started(exe);
+}
+
+/// Whether `path` is a GUI-subsystem image (`aterm_types::pe_image`): a program
+/// Windows starts with no console, which never connects to the pseudoconsole it
+/// is given. A file that cannot be read as an image (none there, a script, the
+/// Store's app execution aliases, which cannot be opened) answers `false`.
+pub(crate) fn is_gui_image(path: &Path) -> bool {
+    use aterm_types::pe_image::{IMAGE_SUBSYSTEM_WINDOWS_GUI, file_subsystem};
+    file_subsystem(path) == Some(IMAGE_SUBSYSTEM_WINDOWS_GUI)
+}
+
+/// The image path of the process behind `process`, read and nothing else: for
+/// a program started through an app execution alias, the packaged program it
+/// named.
+fn image_of(process: HANDLE) -> Option<PathBuf> {
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: a live process handle, a buffer of `len` characters, an in/out length.
+    let ok = unsafe { ffi::QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len) };
+    (ok != 0).then(|| PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
+}
+
+/// The console host `choice` gives a new tab, resolved now WITHOUT making it
+/// this process's choice, copying anything or starting it: `--show-config`'s
+/// `console_host:` row, a print-and-exit report with no side effect. Under
+/// `auto` with no bundled host it names the copy of Windows Terminal's
+/// OpenConsole.exe a first tab makes ([`console_host_report`] resolves the
+/// process's own choice; [`probe_console_host`] starts the host).
+#[must_use]
+pub fn preview_console_host(choice: &ConsoleHostChoice) -> ConsoleHostReport {
+    policy::report_guarded(
+        choice,
+        &policy::resolve_choice(choice, |choice| resolve_as(choice, false)),
+        super::console_guard::available(),
+    )
+}
+
 /// Resolve an opted-in choice to the OpenConsole it names, or say why the
 /// inbox host. Reached through `policy::resolve_choice`, which answers the
 /// inbox choice itself.
 fn resolve(choice: &ConsoleHostChoice) -> Result<OpenConsoleExe, String> {
+    resolve_as(choice, true)
+}
+
+/// [`resolve`], copying Windows Terminal's OpenConsole.exe out of its package
+/// only when `copy` (a preview names the copy without making it).
+fn resolve_as(choice: &ConsoleHostChoice, copy: bool) -> Result<OpenConsoleExe, String> {
+    let exe_dir = || {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    };
     match choice {
         ConsoleHostChoice::Inbox => Err(policy::INBOX_REASON.to_string()),
         ConsoleHostChoice::Path(path) => policy::configured(path, Path::is_file, file_version),
+        ConsoleHostChoice::Bundled => {
+            let path = policy::bundled_source(exe_dir().as_deref(), Path::is_file)?;
+            Ok(OpenConsoleExe {
+                version: file_version(&path),
+                path,
+                origin: Origin::Bundled,
+            })
+        }
         ConsoleHostChoice::Auto => {
-            let exe_dir = std::env::current_exe()
-                .ok()
-                .and_then(|exe| exe.parent().map(Path::to_path_buf));
+            let exe_dir = exe_dir();
             let source = policy::auto_source(
                 exe_dir.as_deref(),
                 Path::is_file,
@@ -153,6 +233,13 @@ fn resolve(choice: &ConsoleHostChoice) -> Result<OpenConsoleExe, String> {
                          (LOCALAPPDATA is unset)"
                             .to_string()
                     })?;
+                    if !copy {
+                        return Ok(OpenConsoleExe {
+                            version: file_version(&source),
+                            path: root.join("conpty").join(&package).join("OpenConsole.exe"),
+                            origin: Origin::WindowsTerminal(package),
+                        });
+                    }
                     let path =
                         policy::copy_out(&source, &root.join("conpty"), &package).map_err(|e| {
                             format!(
@@ -444,21 +531,48 @@ pub(crate) fn launch(
     })
 }
 
-/// The health check: once a client has been started on `host`, the host must
+/// What the health check found ([`await_started`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Health {
+    /// The host wrote its first VT byte: it works.
+    Started,
+    /// The client never connects (a GUI image) or exited before the host said
+    /// anything (a console program whose loader failed): nothing the host did,
+    /// and nothing to retry. The session goes on in this host, and its waiter
+    /// reports the program's exit.
+    NoClient,
+    /// The host failed: it exited or wrote something other than VT (`sticky`:
+    /// it will not work for a later tab either), or said nothing within
+    /// [`HEALTH_WINDOW`] while it and its client both ran.
+    Failed { why: String, sticky: bool },
+}
+
+/// The health check: once `client` has been started on `host`, the host must
 /// write its first byte within [`HEALTH_WINDOW`]. The snapshot recorded
 /// (2026-09-29) OpenConsole writing NOTHING before a client connects (with the
 /// shell still suspended, 250 ms passed in silence), and on the connect writing
 /// `CSI 1 t CSI c` and holding the client until that DA1 is answered (3 s when
-/// it is not). So until this byte the client cannot have run a single
-/// instruction of its own: a host that fails here leaves nothing behind that a
-/// retry on the inbox host would run twice. On failure the host is terminated.
-pub(crate) fn await_started(host: &OpenConsoleHost, out_read: HANDLE) -> Result<(), String> {
-    let result = await_first_output(host.process.raw(), out_read, HEALTH_WINDOW);
-    if result.is_err() {
+/// it is not). A console-subsystem client connects as its process starts,
+/// before any code of its own runs, so until this byte such a client has run
+/// nothing of its own: a host that fails here leaves nothing behind that a
+/// retry on the inbox host would run twice. That holds for nothing else. A
+/// GUI-subsystem image never connects (Windows connects console images only),
+/// so its host never speaks while the program runs freely, and a client that
+/// exits before it connects leaves the host nothing to answer: both are
+/// [`Health::NoClient`], never a failure that would end the program and run it
+/// again. On failure the host is terminated.
+pub(crate) fn await_started(host: &OpenConsoleHost, client: HANDLE, out_read: HANDLE) -> Health {
+    // The image the client really runs, an app execution alias's target
+    // included (a spawn checks the program it names before it picks a host).
+    if image_of(client).is_some_and(|image| is_gui_image(&image)) {
+        return Health::NoClient;
+    }
+    let health = await_first_output(host.process.raw(), client, out_read, HEALTH_WINDOW);
+    if let Health::Failed { .. } = health {
         // SAFETY: the host we launched, by its handle; a dead one ignores the call.
         unsafe { ffi::TerminateProcess(host.process.raw(), 1) };
     }
-    result
+    health
 }
 
 /// Start `command_line` (NUL-terminated) as a client of the pseudoconsole whose
@@ -529,13 +643,25 @@ fn host_command_line(exe: &Path, size: ffi::COORD, signal: HANDLE, server: HANDL
 }
 
 /// Wait for the host's first output byte (left in the pipe for the session
-/// reader), failing when the host exits first, says nothing within `window`,
-/// or speaks something other than VT: a console host's first byte is the ESC
-/// of its `CSI 1 t`, while a program that is not one (a wrong `conpty` path)
-/// writes an error message into the pipe it was handed as stdout.
-fn await_first_output(process: HANDLE, out_read: HANDLE, window: Duration) -> Result<(), String> {
+/// reader). The host fails when it exits first or speaks something other than
+/// VT (a console host's first byte is the ESC of its `CSI 1 t`, while a program
+/// that is not one, a wrong `conpty` path, writes an error message into the
+/// pipe it was handed as stdout), and when it says nothing within `window`
+/// while its client still runs. A client that exits before the host has said
+/// anything, the host still running, is [`Health::NoClient`]: it never
+/// connected. Both exited is the host's failure: a host that dies takes its
+/// waiting client with it.
+fn await_first_output(host: HANDLE, client: HANDLE, out_read: HANDLE, window: Duration) -> Health {
     let start = Instant::now();
+    let failed = |why: String, sticky: bool| Health::Failed { why, sticky };
+    let exited = |process: HANDLE| {
+        // SAFETY: a handle the caller holds open across this wait.
+        unsafe { ffi::WaitForSingleObject(process, 0) == ffi::WAIT_OBJECT_0 }
+    };
     loop {
+        // Asked before the peek, so output the host wrote before the client
+        // went is seen as the start it is.
+        let client_gone = exited(client);
         let mut first = [0u8; 1];
         let (mut got, mut avail) = (0u32, 0u32);
         // SAFETY: a peek of our own live pipe end into a 1-byte local; nothing
@@ -551,27 +677,33 @@ fn await_first_output(process: HANDLE, out_read: HANDLE, window: Duration) -> Re
             )
         };
         if peeked != 0 && got == 1 && first[0] != 0x1b {
-            return Err(format!(
+            let why = format!(
                 "its first output byte was 0x{:02x}, not the ESC of a console host's VT",
                 first[0]
-            ));
+            );
+            return failed(why, true);
         }
-        // SAFETY: the host's live process handle.
-        let exited = unsafe { ffi::WaitForSingleObject(process, 0) } == ffi::WAIT_OBJECT_0;
-        if exited {
+        if exited(host) {
             let mut code = 0u32;
             // SAFETY: valid handle + out-param.
-            unsafe { ffi::GetExitCodeProcess(process, &mut code) };
-            return Err(format!(
+            unsafe { ffi::GetExitCodeProcess(host, &mut code) };
+            let why = format!(
                 "it exited with code 0x{code:08x} after {} ms",
                 start.elapsed().as_millis()
-            ));
+            );
+            return failed(why, true);
         }
         if peeked != 0 && avail > 0 {
-            return Ok(());
+            return Health::Started;
+        }
+        if client_gone {
+            return Health::NoClient;
         }
         if start.elapsed() >= window {
-            return Err(format!("it wrote nothing in {} ms", window.as_millis()));
+            return failed(
+                format!("it wrote nothing in {} ms", window.as_millis()),
+                false,
+            );
         }
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -677,6 +809,88 @@ mod tests {
         let base = slots.as_ptr() as usize;
         assert_eq!(std::ptr::addr_of!(slots[1]) as usize - base, 8);
         assert_eq!(std::ptr::addr_of!(slots[2]) as usize - base, 16);
+    }
+
+    /// An event standing in for a process handle: signalled is exited.
+    fn process_standin(exited: bool) -> Handle {
+        // SAFETY: NULL attributes and name; manual-reset, so a signal stays.
+        let event = unsafe {
+            ffi::CreateEventW(std::ptr::null_mut(), 1, i32::from(exited), std::ptr::null())
+        };
+        assert_ne!(event, 0);
+        Handle::new(event)
+    }
+
+    /// Pipes whose output end holds `bytes`, as a host's first write left them.
+    fn output_holding(bytes: &[u8]) -> super::super::Pipes {
+        let pipes = super::super::Pipes::new().expect("pipes");
+        if !bytes.is_empty() {
+            let mut wrote = 0u32;
+            // SAFETY: our own live pipe end and a buffer of the stated length.
+            let ok = unsafe {
+                ffi::WriteFile(
+                    pipes.out_write.raw(),
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                    &mut wrote,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert!(ok != 0 && wrote as usize == bytes.len());
+        }
+        pipes
+    }
+
+    // The check tells the host's failures from a client that never connected.
+    // A host that speaks VT started; one that exits, or writes anything else,
+    // failed for good; one silent while its client waits failed for this tab
+    // only. A client gone with the host still up and silent never connected
+    // (its loader failed): no failure, no retry. Both gone is the host's.
+    #[test]
+    fn the_health_check_blames_the_host_only_for_what_the_host_did() {
+        let window = Duration::from_millis(30);
+        let check = |host_exited: bool, client_exited: bool, out: &[u8]| {
+            let (host, client) = (process_standin(host_exited), process_standin(client_exited));
+            let pipes = output_holding(out);
+            await_first_output(host.raw(), client.raw(), pipes.out_read.raw(), window)
+        };
+        assert_eq!(check(false, false, b"\x1b[1t"), Health::Started);
+        assert_eq!(
+            check(false, true, b"\x1b[1t"),
+            Health::Started,
+            "it answered before the client went"
+        );
+        assert_eq!(check(false, true, b""), Health::NoClient);
+        assert!(
+            matches!(check(false, false, b""), Health::Failed { ref why, sticky: false } if why == "it wrote nothing in 30 ms")
+        );
+        assert!(matches!(
+            check(true, false, b""),
+            Health::Failed { sticky: true, .. }
+        ));
+        assert!(matches!(
+            check(true, true, b""),
+            Health::Failed { sticky: true, .. }
+        ));
+        assert!(
+            matches!(check(false, false, b"usage"), Health::Failed { ref why, sticky: true } if why.contains("0x75"))
+        );
+    }
+
+    // The subsystem of real images: a console program and a windowed one.
+    #[test]
+    fn a_gui_image_is_told_from_a_console_one() {
+        let root = std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"));
+        assert!(!is_gui_image(&root.join("System32").join("cmd.exe")));
+        assert!(is_gui_image(&root.join("explorer.exe")));
+        assert!(!is_gui_image(&root.join("no-such-program.exe")));
+        assert!(!is_gui_image(
+            &root
+                .join("System32")
+                .join("drivers")
+                .join("etc")
+                .join("hosts")
+        ));
     }
 
     #[test]

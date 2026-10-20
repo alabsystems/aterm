@@ -346,6 +346,10 @@ impl ChromePalette {
             cursor: inks.cursor,
             ansi: self.ansi,
             authored: self.authored,
+            // Windows' accent colour, in the shade for this surface's side, where
+            // the platform installed one (`native_appearance::system_accent`).
+            system_accent: crate::native_appearance::system_accent()
+                .map(|accent| accent.for_surface(inks.bg)),
             base: bar_base(),
         }
     }
@@ -419,18 +423,9 @@ pub(crate) const PLATFORM_BAR_BASE: BarBase = BarBase::Fixed {
 #[cfg(not(target_os = "linux"))]
 pub(crate) const PLATFORM_BAR_BASE: BarBase = BarBase::Blend;
 
-/// The presence tones: the rim's three hues and the story dot
-/// (`aterm_messages::presence::PresenceTones`).
+/// The presence tones: the needs border's two alarm hues and the person's dim
+/// outline (`aterm_messages::presence::PresenceTones`).
 pub(crate) use aterm_messages::presence::PresenceTones;
-
-/// The presence hues as text inks on the band (`aterm_messages::presence::inks`):
-/// [`presence_tones`]' hues held to the AA 4.5:1 text floor against the band. Used by
-/// [`crate::message_band::paint_presence_row`] for the hand and phase slots; the rim
-/// keeps the 3:1 tones.
-pub(crate) fn presence_inks(p: impl Into<ChromePalette>) -> PresenceTones {
-    let p = p.into();
-    aterm_messages::presence::inks(presence_tones(p), band_colors(p).bar_bg)
-}
 
 /// The presence tones for `theme` on its band, or the High Contrast vocabulary's own
 /// words for them under an OS-forced palette (`aterm_messages::presence::tones`).
@@ -451,7 +446,7 @@ pub(crate) fn blank_cell(p: impl Into<ChromePalette>) -> RenderCell {
 }
 
 /// Close a band's content-facing top edge in place, across the whole row in one
-/// tone; the counterpart of [`crate::tab_bar::seal_strip_bottom`].
+/// tone; the counterpart of the strip's bottom seam ([`crate::tab_bar::strip_seam_rail`]).
 ///
 /// Blanking with [`blank_cell`] or `settings::blank_row` stamps the seam, but every
 /// writer then rebuilds the cells it writes from scratch (`settings::write_str` calls

@@ -283,12 +283,17 @@ pub(crate) fn last_stderr_line(stderr: &str) -> Option<&str> {
 /// same-volume path this run finds the first-exec assessment done.
 #[cfg(target_os = "macos")]
 pub fn probe_bundle_starts(app: &Path, expected_build: u64) -> Result<(), String> {
-    probe_starts(app, expected_build, |exe| aterm_uds::spawnfd::command(exe))
+    probe_starts(app, expected_build, |exe| {
+        output_bounded(
+            aterm_uds::spawnfd::command(exe).arg("--version"),
+            START_PROBE,
+        )
+    })
 }
 
 /// [`probe_bundle_starts`] at STAGE time, on the checker thread, before the ready
-/// marker: the same run, its child clamped to utility QoS (`taskpolicy -c utility`,
-/// which execs it in place) because nobody is waiting on it.
+/// marker: the same run, of the child [`hold_staged_start`] started before the
+/// stage's gate.
 ///
 /// WHY START IT TWICE. The first exec of a binary this machine has never run pays
 /// syspolicyd's assessment — measured 0.75 s (0.75-0.95, n=5) for the 90 MB `aterm`
@@ -305,64 +310,155 @@ pub fn probe_bundle_starts(app: &Path, expected_build: u64) -> Result<(), String
 ///
 /// Only after the stage's whole gate has passed (codesign, team, Gatekeeper, the
 /// sealed build and commit rebinds): nothing of the candidate is executed before
-/// that. `--version` answers before any lane starts, so the candidate never reaches
-/// its updater, trial counters or state roots.
+/// that. The held child was exec'd and stopped before its first instruction; this
+/// resumes it, and a stage refused before this call killed it unrun. `--version`
+/// answers before any lane starts, so the candidate never reaches its updater,
+/// trial counters or state roots.
 #[cfg(target_os = "macos")]
-pub(crate) fn probe_staged_bundle_starts(app: &Path, expected_build: u64) -> Result<(), String> {
-    probe_starts(app, expected_build, utility_clamped)
+pub(crate) fn probe_staged_bundle_starts(
+    app: &Path,
+    expected_build: u64,
+    held: HeldStart,
+) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(errno) = STAGE_PROBE_SPAWN_REFUSAL.with(std::cell::Cell::take) {
+        drop(held);
+        return Err(spawn_refusal(
+            START_PROBE,
+            &std::io::Error::from_raw_os_error(errno),
+        ));
+    }
+    match held.0 {
+        Some(held) => probe_starts(app, expected_build, |_| {
+            let (deadline, bound_by_budget) = helper_deadline();
+            held.output_until(deadline, HELPER_REAP).map_err(|error| {
+                run_refusal(START_PROBE, error, timed_out(START_PROBE, bound_by_budget))
+            })
+        }),
+        None => probe_bundle_starts(app, expected_build),
+    }
+}
+
+/// The stage's start probe STARTED BEFORE THE STAGE'S GATE, held at its exec
+/// ([`hold_staged_start`]) for [`probe_staged_bundle_starts`] to run once the gate
+/// has passed; empty when it could not be held, and the probe then starts the
+/// candidate itself after the gate, as it always did. Killed or dropped unrun —
+/// every refusal before the probe kills it — the child dies without ever running.
+#[cfg(target_os = "macos")]
+pub(crate) struct HeldStart(Option<aterm_uds::deadline::Held>);
+
+/// Non-macOS: there is no bundle to start.
+#[cfg(not(target_os = "macos"))]
+pub(crate) struct HeldStart;
+
+/// Start `app`'s executable with `--version` STOPPED AT ITS EXEC, before the stage's
+/// gate runs ([`aterm_uds::deadline::Held`]).
+///
+/// WHY. The first-exec assessment is syspolicyd's work, not the candidate's: the
+/// child sits in the kernel, using no CPU, for ~0.9 s while syspolicyd scans the
+/// 96 MB universal `aterm` (measured: Gatekeeper's scan, then the verdict reaching
+/// the kernel ~0.5 s later), and the gate's helpers take ~0.4 s more. A child
+/// started stopped at its exec has that assessment begun at the spawn and runs as
+/// soon as it answers once resumed (measured: resumed 400 ms after the spawn, it
+/// exited 485 ms later, against 880 ms for a plain exec). Held here, the assessment
+/// runs beside the gate's helpers and the stage pays the slower of the two instead
+/// of their sum.
+///
+/// NOTHING OF THE CANDIDATE RUNS BEFORE THE GATE PASSES. Stopped at its exec, not
+/// one instruction of it — nor of dyld before it — runs until the probe resumes it,
+/// and it dies unrun if this process dies holding it (`aterm_uds::deadline::Held`);
+/// the kernel has only mapped it and checked its signature, which it does for any
+/// file anyone execs. The image it holds is the bytes the gate then verifies:
+/// nothing writes the bundle in between (its private staging parent, under the
+/// stage lock: the exclusion the gate's own concurrent reads rest on).
+///
+/// Never a verdict: a candidate that cannot be held (a missing executable, a spawn
+/// refused just then) holds nothing, and the probe meets the same refusal itself
+/// after the gate, with the words and the passing classification it always had.
+///
+/// No `taskpolicy -c utility` clamp, which the probe had: `taskpolicy` execs its
+/// program in place, so a held `taskpolicy` would hold back the very exec this
+/// overlaps. What it clamped is the candidate's `--version`, ~5 ms of CPU beside the
+/// gate's `codesign`, which hashes the whole bundle unclamped, and the assessment
+/// does not move with it (measured with the clamp set on the held spawn instead:
+/// 850.0 vs 850.0 ms median, n=10 each).
+#[cfg(target_os = "macos")]
+pub(crate) fn hold_staged_start(app: &Path) -> HeldStart {
+    let exe = app.join("Contents/MacOS/aterm");
+    HeldStart(
+        aterm_uds::deadline::Held::start(aterm_uds::spawnfd::command(exe).arg("--version")).ok(),
+    )
 }
 
 /// Non-macOS: there is no bundle to start.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn probe_staged_bundle_starts(_app: &Path, _expected_build: u64) -> Result<(), String> {
-    Ok(())
+pub(crate) fn hold_staged_start(_app: &Path) -> HeldStart {
+    HeldStart
 }
 
-/// `taskpolicy`, which runs a program clamped to a QoS class by execing it in place
-/// (same pid, the program's own exit status).
-#[cfg(target_os = "macos")]
-const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
-
-/// A command for the absolute executable `exe` behind `taskpolicy -c utility` when
-/// that tool is there to run, else `exe` bare: a missing clamp costs priority,
-/// never the probe.
-#[cfg(target_os = "macos")]
-fn utility_clamped(exe: &Path) -> Command {
-    use std::os::unix::fs::PermissionsExt as _;
-    let runnable = std::fs::metadata(TASKPOLICY)
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0);
-    if runnable && exe.is_absolute() {
-        let mut cmd = aterm_uds::spawnfd::command(TASKPOLICY);
-        cmd.args(["-c", "utility"]).arg(exe);
-        cmd
-    } else {
-        aterm_uds::spawnfd::command(exe)
+impl HeldStart {
+    /// Kill the held child without ever running it, and reap it: the stage will not
+    /// start this build (a refusal before the probe, or the records withdrew it).
+    /// Dropping it does the same.
+    pub(crate) fn kill(self) {
+        #[cfg(target_os = "macos")]
+        drop(self.0);
     }
 }
 
-/// Start `app`'s executable with `--version` through `command` (its launcher) and
-/// require a clean exit naming `expected_build`.
+#[cfg(all(test, target_os = "macos"))]
+impl HeldStart {
+    /// The held child's pid, or `None` when nothing is held.
+    pub(crate) fn id(&self) -> Option<u32> {
+        self.0.as_ref().map(aterm_uds::deadline::Held::id)
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    /// The `errno` the next stage probe on this thread is refused its spawn with, instead
+    /// of starting the candidate (a held one is killed unrun): how a test stages a probe
+    /// that runs to no answer (`EAGAIN`, the process table full just then) or to a
+    /// lasting refusal (`EACCES`) without racing a deadline against the gate in front
+    /// of it.
+    pub(crate) static STAGE_PROBE_SPAWN_REFUSAL: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// What the start probe is called in its refusals.
+#[cfg(target_os = "macos")]
+const START_PROBE: &str = "candidate --version probe";
+
+/// Non-macOS: there is no bundle to start.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn probe_staged_bundle_starts(
+    _app: &Path,
+    _expected_build: u64,
+    _held: HeldStart,
+) -> Result<(), String> {
+    Ok(())
+}
+
+/// Run `app`'s executable with `--version` through `run` (which returns its output)
+/// and require a clean exit naming `expected_build`.
 #[cfg(target_os = "macos")]
 fn probe_starts(
     app: &Path,
     expected_build: u64,
-    command: impl FnOnce(&Path) -> Command,
+    run: impl FnOnce(&Path) -> Result<std::process::Output, String>,
 ) -> Result<(), String> {
     let exe = app.join("Contents/MacOS/aterm");
     if !exe.is_file() {
         return Err(format!("no executable at {}", exe.display()));
     }
-    let out = output_bounded(
-        // `--version` answers before any lane starts, so the candidate never reaches
-        // its updater: no switch is needed to keep the probe inert.
-        command(&exe).arg("--version"),
-        "candidate --version probe",
-    )?;
+    // `--version` answers before any lane starts, so the candidate never reaches
+    // its updater: no switch is needed to keep the probe inert.
+    let out = run(&exe)?;
     if !out.status.success() {
         return Err(format!(
             "the staged bundle could not start ({}): {}",
             out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
+            crate::quote_tool_output(String::from_utf8_lossy(&out.stderr).trim())
         ));
     }
     // …and it must be the build we are installing. A probe that starts SOME binary
@@ -376,7 +472,7 @@ fn probe_starts(
     {
         return Err(format!(
             "the staged bundle started but does not report build {expected_build}: {}",
-            text.trim()
+            crate::quote_tool_output(text.trim())
         ));
     }
     Ok(())
@@ -664,21 +760,29 @@ struct GateHelpers {
 }
 
 impl GateHelpers {
-    /// `app`'s helpers, or the gate's answer when a pin cannot make a requirement —
-    /// refused before anything runs.
-    fn of(app: &Path, pinned: Option<&str>, keys: &[&str]) -> Result<Self, Gate> {
+    /// `app`'s helpers, or the gate's answer when a pin cannot make a requirement or
+    /// the bundle holds an entry no helper could read to an answer
+    /// ([`unanswerable_entry`], walked until `deadline`) — refused before anything runs.
+    fn of(
+        app: &Path,
+        pinned: Option<&str>,
+        keys: &[&str],
+        deadline: Instant,
+    ) -> Result<Self, Gate> {
         use aterm_update_core::codesign::developer_id_command;
+        let refused = |refusal: String| Gate {
+            policy: Err(refusal.clone()),
+            team: None,
+            reads: keys.iter().map(|_| Err(refusal.clone())).collect(),
+        };
         let seal = match pinned {
-            Some(team) => developer_id_command(app, team, true).map_err(|error| {
-                let refusal = codesign_refusal(error, false);
-                Gate {
-                    policy: Err(refusal.clone()),
-                    team: None,
-                    reads: keys.iter().map(|_| Err(refusal.clone())).collect(),
-                }
-            })?,
+            Some(team) => developer_id_command(app, team, true)
+                .map_err(|error| refused(codesign_refusal(error, app, false)))?,
             None => structural_command(app),
         };
+        if let Some(refusal) = unanswerable_entry(app, deadline) {
+            return Err(refused(refusal));
+        }
         Ok(Self {
             seal,
             display: pinned.map(|_| display_command(app)),
@@ -696,16 +800,101 @@ impl GateHelpers {
     }
 }
 
+/// Why no helper could read `app` to an answer, or `None` when nothing found stops
+/// one: an entry that is not a directory or a regular file (a FIFO, a socket, a
+/// device), a symlink to one, or a symlink to a directory outside the bundle. codesign
+/// opens what such an entry names and waits there — a FIFO no writer opens holds it for
+/// good. Measured with `/usr/bin/codesign --verify --deep --strict`: a FIFO at
+/// `Contents/_CodeSignature/CodeResources` or at the main executable, a symlink to one
+/// in place of a sealed resource, and `Contents`, `Contents/MacOS` or
+/// `Contents/_CodeSignature` linked to a directory outside holding one each held it
+/// past every deadline. A run past its deadline is a PASSING refusal ([`timed_out`]), so
+/// a bundle tampered this way would be kept and re-verified as a stage, and as the
+/// installed bundle would never ask for a reinstall. A signed bundle holds none of
+/// these (where codesign does answer, it says "unsupported resource found" or, under
+/// `--strict`, "invalid destination for symbolic link in bundle"), so this is a
+/// verdict, and the entry's name, which the bundle chose, is quoted
+/// ([`crate::quote_tool_output`]).
+///
+/// Checks `deadline` between directories and entries. The filesystem operations are
+/// `lstat` (`DirEntry::file_type`), one `stat` of a symlink's target and, for a
+/// directory, its real path; each can still block in the filesystem. Never descends
+/// through a symlink (a directory inside the bundle is walked under its own name).
+/// What it did not reach, or could not list or resolve, is codesign's to judge.
+fn unanswerable_entry(app: &Path, deadline: Instant) -> Option<String> {
+    const SPECIAL: &str = "not a directory, a file or a symlink to one";
+    const OUTSIDE: &str = "a symlink to a directory outside the bundle";
+    let special = |kind: std::fs::FileType| !(kind.is_dir() || kind.is_file());
+    let refusal = |entry: &Path, what: &str| {
+        format!(
+            "refusing {}: it holds {} — {what}, which no signed bundle holds and codesign \
+             can wait on for good",
+            app.display(),
+            crate::quote_tool_output(&format!("{:?}", entry.display().to_string()))
+        )
+    };
+    // The bundle's tree as its links resolve: codesign follows `app` itself.
+    let root = std::fs::canonicalize(app).ok()?;
+    if std::fs::metadata(&root).is_ok_and(|metadata| special(metadata.file_type())) {
+        return Some(refusal(Path::new("."), SPECIAL));
+    }
+    let mut dirs = vec![root.clone()];
+    while let Some(dir) = dirs.pop() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            let within = path.strip_prefix(&root).unwrap_or(&path);
+            let target = if kind.is_symlink() {
+                // A dangling link is codesign's verdict to give.
+                let Ok(target) = std::fs::metadata(&path) else {
+                    continue;
+                };
+                if target.is_dir() {
+                    if std::fs::canonicalize(&path).is_ok_and(|real| !real.starts_with(&root)) {
+                        return Some(refusal(within, OUTSIDE));
+                    }
+                    continue;
+                }
+                target.file_type()
+            } else {
+                kind
+            };
+            if special(target) {
+                return Some(refusal(within, SPECIAL));
+            }
+        }
+    }
+    None
+}
+
 /// The policy gate and the reads of `keys` for each of `apps` ([`GateHelpers`]), every
 /// helper of every bundle started at once under one [`helper_deadline`]. Each verdict
 /// composes its own bundle's answers in [`verify_bundle`]'s serial order: the seal,
 /// then the team (and its pin), then Gatekeeper.
 fn gates_and_reads(apps: &[&Path], pinned: Option<&str>, keys: &[&str]) -> Vec<Gate> {
+    let (deadline, bound_by_budget) = helper_deadline();
     let mut plans: Vec<Result<GateHelpers, Gate>> = apps
         .iter()
-        .map(|app| GateHelpers::of(app, pinned, keys))
+        .map(|app| GateHelpers::of(app, pinned, keys, deadline))
         .collect();
-    let (deadline, bound_by_budget) = helper_deadline();
     let runs = {
         let mut cmds: Vec<&mut Command> = plans
             .iter_mut()
@@ -717,16 +906,18 @@ fn gates_and_reads(apps: &[&Path], pinned: Option<&str>, keys: &[&str]) -> Vec<G
     let mut runs = runs.into_iter();
     plans
         .into_iter()
-        .map(|plan| match plan {
-            Ok(_) => compose_gate(pinned, keys, &mut runs, bound_by_budget),
+        .zip(apps)
+        .map(|(plan, app)| match plan {
+            Ok(_) => compose_gate(app, pinned, keys, &mut runs, bound_by_budget),
             Err(refused) => refused,
         })
         .collect()
 }
 
-/// One bundle's [`Gate`] from its helpers' runs, taken from `runs` in
+/// One bundle's (`app`'s) [`Gate`] from its helpers' runs, taken from `runs` in
 /// [`GateHelpers::commands`]' order.
 fn compose_gate(
+    app: &Path,
     pinned: Option<&str>,
     keys: &[&str],
     runs: &mut impl Iterator<Item = Run>,
@@ -743,9 +934,9 @@ fn compose_gate(
     let (policy, team) = match pinned {
         Some(expected_team) => {
             let seal = developer_id_verdict(seal_run)
-                .map_err(|error| codesign_refusal(error, bound_by_budget));
+                .map_err(|error| codesign_refusal(error, app, bound_by_budget));
             let team = output(next(), TEAM)
-                .and_then(|out| display_from(TEAM, &out))
+                .and_then(|out| display_from(TEAM, app, &out))
                 .and_then(|text| parse_team_id(&text));
             let spctl = output(next(), SPCTL).and_then(|out| spctl_from(&out));
             let policy = seal
@@ -761,7 +952,7 @@ fn compose_gate(
             (policy, Some(team))
         }
         None => (
-            output(seal_run, STRUCTURAL).and_then(|out| structural_from(&out)),
+            output(seal_run, STRUCTURAL).and_then(|out| structural_from(app, &out)),
             None,
         ),
     };
@@ -823,13 +1014,14 @@ fn structural_command(app: &Path) -> Command {
     cmd
 }
 
-/// What one ended [`structural_command`] run says.
-fn structural_from(out: &std::process::Output) -> Result<(), String> {
+/// What one ended [`structural_command`] run on `app` says.
+fn structural_from(app: &Path, out: &std::process::Output) -> Result<(), String> {
     if out.status.success() {
         Ok(())
     } else {
         Err(codesign_exit_refusal(
             STRUCTURAL,
+            app,
             aterm_update_core::codesign::CodesignError::Refused {
                 code: out.status.code(),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -863,8 +1055,8 @@ pub fn bundle_build_number(app: &Path) -> Result<u64, String> {
     )?)
 }
 
-/// The refusal for a `PlistBuddy` read of `key` that did not succeed: its words,
-/// marked passing ([`mark_passing`]) when a signal ended the read. A read killed on
+/// The refusal for a `PlistBuddy` read of `key` that did not succeed: its words
+/// (quoted, [`crate::quote_tool_output`]), marked passing ([`mark_passing`]) when a signal ended the read. A read killed on
 /// a loaded desk said nothing about the plist, as a killed `codesign` or `spctl`
 /// says nothing about the bundle ([`codesign_exit_refusal`], [`spctl_verdict`]);
 /// as a verdict it would discard a healthy stage or a predecessor's revert. Every
@@ -872,7 +1064,7 @@ pub fn bundle_build_number(app: &Path) -> Result<u64, String> {
 fn plist_read_refusal(key: &str, out: &std::process::Output) -> String {
     let refusal = format!(
         "read {key}: {}",
-        String::from_utf8_lossy(&out.stderr).trim()
+        crate::quote_tool_output(String::from_utf8_lossy(&out.stderr).trim())
     );
     if out.status.code().is_none() {
         mark_passing(refusal)
@@ -948,9 +1140,10 @@ fn git_commit_from(out: std::process::Output) -> Result<String, String> {
 ///
 /// Split out so its classification is provable without a codesign that misbehaves on
 /// cue: always a rejection, and a PASSING one ([`mark_passing`]) only when codesign
-/// knowably reached no verdict on the bytes ([`codesign_exit_refusal`]).
+/// knowably reached no verdict on the bytes of `app` ([`codesign_exit_refusal`]).
 pub(crate) fn codesign_refusal(
     error: aterm_update_core::codesign::CodesignError,
+    app: &Path,
     bound_by_budget: bool,
 ) -> String {
     use aterm_update_core::codesign::CodesignError;
@@ -963,7 +1156,7 @@ pub(crate) fn codesign_refusal(
         // [`codesign_exit_refusal`], which the structural lane and the team-id read
         // share.
         refused @ CodesignError::Refused { .. } => {
-            codesign_exit_refusal("codesign --verify (team-pinned requirement)", refused)
+            codesign_exit_refusal("codesign --verify (team-pinned requirement)", app, refused)
         }
         CodesignError::TimedOut => timed_out(WHAT, bound_by_budget),
         CodesignError::Spawn(e) => spawn_refusal(WHAT, &e),
@@ -973,9 +1166,10 @@ pub(crate) fn codesign_refusal(
     }
 }
 
-/// The refusal for a codesign run that ENDED (`refused`, a
-/// [`CodesignError::Refused`]) under `what`: codesign's words, marked passing
-/// ([`mark_passing`]) only when codesign knowably judged nothing.
+/// The refusal for a codesign run on `app` that ENDED (`refused`, a
+/// [`CodesignError::Refused`]) under `what`: codesign's words, quoted
+/// ([`crate::quote_tool_output`]), marked passing ([`mark_passing`]) only when
+/// codesign knowably judged nothing.
 ///
 /// A RUN THAT ENDED WITHOUT A VERDICT IS NOT ONE. codesign killed by a signal
 /// (jetsam on a loaded desk), or exiting 1 for a file it could not read or
@@ -984,32 +1178,35 @@ pub(crate) fn codesign_refusal(
 /// stage. The rejection stands either way — nothing is swapped past a check that
 /// did not pass — but its readers retry it.
 ///
-/// FAIL CLOSED: only [`CodesignError::judged_nothing`] — a signal,
-/// or exit 1 naming only a failure to read or to run and no signature fault — is
+/// FAIL CLOSED: only [`CodesignError::judged_nothing_at`] — a signal, or exit 1
+/// whose first line names only a failure to read or to run on `app` itself — is
 /// passing. Every other exit is a verdict, however codesign words it ("a sealed
-/// resource is missing or invalid", "invalid Info.plist", exit 2's usage error,
-/// exit 3's requirement, words no list knows), so a tampered stage is never kept
-/// and re-verified and a tampered installed bundle still asks for a reinstall.
+/// resource is missing or invalid", "invalid Info.plist", a dangling symlink's "No
+/// such file or directory", exit 2's usage error, exit 3's requirement, words no list
+/// knows, a machine fault on a line naming a path the bundle chose), so a tampered
+/// stage is never kept and re-verified and a tampered installed bundle still asks for
+/// a reinstall.
 ///
 /// [`CodesignError::Refused`]: aterm_update_core::codesign::CodesignError::Refused
-/// [`CodesignError::judged_nothing`]: aterm_update_core::codesign::CodesignError::judged_nothing
+/// [`CodesignError::judged_nothing_at`]: aterm_update_core::codesign::CodesignError::judged_nothing_at
 fn codesign_exit_refusal(
     what: &str,
+    app: &Path,
     refused: aterm_update_core::codesign::CodesignError,
 ) -> String {
     use aterm_update_core::codesign::CodesignError;
     let message = match &refused {
         CodesignError::Refused { code: None, stderr } => format!(
             "{what} was ended by a signal before it reached a verdict: {}",
-            stderr.trim()
+            crate::quote_tool_output(stderr.trim())
         ),
         CodesignError::Refused {
             code: Some(_),
             stderr,
-        } => format!("{what} failed: {}", stderr.trim()),
+        } => format!("{what} failed: {}", crate::quote_tool_output(stderr.trim())),
         other => format!("{what}: {other}"),
     };
-    if refused.judged_nothing() {
+    if refused.judged_nothing_at(app) {
         mark_passing(message)
     } else {
         message
@@ -1035,7 +1232,7 @@ pub fn signing_identifier(app: &Path) -> Result<String, String> {
 /// `codesign -d --verbose=4 <app>`'s text, both streams (it prints to stderr
 /// whether or not it succeeds), bounded like every helper here.
 fn codesign_display(app: &Path, what: &str) -> Result<String, String> {
-    display_from(what, &output_bounded(&mut display_command(app), what)?)
+    display_from(what, app, &output_bounded(&mut display_command(app), what)?)
 }
 
 /// `codesign -d --verbose=4 <app>`.
@@ -1045,8 +1242,8 @@ fn display_command(app: &Path) -> Command {
     cmd
 }
 
-/// What one ended [`display_command`] run (`what`) printed, or its refusal.
-fn display_from(what: &str, out: &std::process::Output) -> Result<String, String> {
+/// What one ended [`display_command`] run (`what`) on `app` printed, or its refusal.
+fn display_from(what: &str, app: &Path, out: &std::process::Output) -> Result<String, String> {
     // A run that ended on a MOMENT — a signal, or a file it could not read just then —
     // reached no verdict, and its output is no evidence of a missing TeamIdentifier.
     if !out.status.success() {
@@ -1054,8 +1251,8 @@ fn display_from(what: &str, out: &std::process::Output) -> Result<String, String
             code: out.status.code(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         };
-        if ended.judged_nothing() {
-            return Err(codesign_exit_refusal(what, ended));
+        if ended.judged_nothing_at(app) {
+            return Err(codesign_exit_refusal(what, app, ended));
         }
     }
     Ok(format!(
@@ -1117,12 +1314,12 @@ fn spctl_verdict(status: std::process::ExitStatus, stderr: &str) -> Result<(), S
     } else if status.code().is_none() {
         Err(mark_passing(format!(
             "spctl assessment was ended by a signal before it reached a verdict: {}",
-            stderr.trim()
+            crate::quote_tool_output(stderr.trim())
         )))
     } else {
         Err(format!(
             "spctl assessment rejected the bundle: {}",
-            stderr.trim()
+            crate::quote_tool_output(stderr.trim())
         ))
     }
 }
@@ -1484,9 +1681,7 @@ mod tests {
     fn verify_bundle_refuses_a_garbage_pin_and_another_signer() {
         verify_bundle(Path::new("/nonexistent"), "AB\"CD").unwrap_err();
         // Judging Apple's `/bin/ls` waits on trustd.
-        if aterm_uds::deadline::trust_service_silent() {
-            return;
-        }
+        aterm_uds::deadline::require_trust_service();
         let refused = verify_bundle(Path::new("/bin/ls"), "ABCDE12345").unwrap_err();
         // A real verdict (exit 3, another signer) carries no passing key.
         assert!(!crate::is_passing_refusal(&refused), "{refused}");
@@ -1498,7 +1693,7 @@ mod tests {
     /// EVERY OTHER EXIT IS A VERDICT, worded as codesign words it and with no key:
     /// the signature faults, exit 3's requirement, exit 2's usage error, codesign's
     /// bundle-seal verdicts — and a line nobody measured, which must stay a verdict too
-    /// ([`aterm_update_core::codesign::CodesignError::judged_nothing`] fails closed).
+    /// ([`aterm_update_core::codesign::CodesignError::judged_nothing_at`] fails closed).
     #[test]
     fn only_a_codesign_moment_is_passing() {
         use aterm_update_core::codesign::CodesignError;
@@ -1514,7 +1709,6 @@ mod tests {
                 "aterm.app: internal error in Code Signing subsystem\n",
             ),
             refused(Some(1), "aterm.app: Permission denied\n"),
-            refused(Some(1), "aterm.app: No such file or directory\n"),
             refused(Some(1), "aterm.app: Too many open files\n"),
             refused(
                 Some(1),
@@ -1523,11 +1717,12 @@ mod tests {
             ),
             CodesignError::Wait(std::io::Error::from_raw_os_error(libc::EINTR)),
         ] {
-            let pinned = codesign_refusal(passing, false);
+            let pinned = codesign_refusal(passing, Path::new("aterm.app"), false);
             assert!(crate::is_passing_refusal(&pinned), "{pinned}");
         }
         let structural = codesign_exit_refusal(
             "codesign --verify (structural)",
+            Path::new("aterm.app"),
             refused(
                 Some(1),
                 "aterm.app: internal error in Code Signing subsystem\n",
@@ -1577,16 +1772,318 @@ mod tests {
             ),
             (Some(1), "aterm.app: nested code is modified or invalid\n"),
             (Some(1), "aterm.app: a verdict nobody has measured yet\n"),
+            // Measured: a dangling symlink added to a sealed bundle.
+            (Some(1), "aterm.app: No such file or directory\n"),
+            // Measured: a symlink out of the bundle named after a machine fault, and
+            // `--verbose=2` progress lines naming nested helpers the bundle called so.
+            (
+                Some(1),
+                "aterm.app: invalid destination for symbolic link in bundle\nfile modified: \
+                 /Applications/aterm.app/Contents/Resources/h: Permission denied\n",
+            ),
+            (
+                Some(1),
+                "--prepared:aterm.app/Contents/Helpers/h\naterm.app: Permission denied\n\
+                 aterm.app: nested code is modified or invalid\n",
+            ),
             (Some(1), ""),
             (Some(2), "codesign: unrecognized option\n"),
         ];
         for (code, stderr) in verdicts {
-            let line = codesign_refusal(refused(code, stderr), false);
+            let line = codesign_refusal(refused(code, stderr), Path::new("aterm.app"), false);
             assert!(!crate::is_passing_refusal(&line), "{line}");
-            let structural =
-                codesign_exit_refusal("codesign --verify (structural)", refused(code, stderr));
+            let structural = codesign_exit_refusal(
+                "codesign --verify (structural)",
+                Path::new("aterm.app"),
+                refused(code, stderr),
+            );
             assert!(!crate::is_passing_refusal(&structural), "{structural}");
         }
+    }
+
+    /// A TOOL CANNOT SPEAK FOR THE REFUSAL THAT QUOTES IT: a helper's output that
+    /// echoes a refusal key (a nested path or a file the bundle named after it) leaves
+    /// a verdict a verdict, and still reads the text it quoted. Every door that quotes
+    /// codesign, spctl, PlistBuddy or the candidate's `--version`. CONTROL: a moment
+    /// stays a moment.
+    #[test]
+    fn a_verdict_that_quotes_a_refusal_key_is_still_a_verdict() {
+        use aterm_update_core::codesign::CodesignError;
+        use std::os::unix::process::ExitStatusExt as _;
+        let exited = std::process::ExitStatus::from_raw(1 << 8);
+        let bundle = aterm_tempfile::Builder::new()
+            .prefix("aterm-quoted-key-")
+            .tempdir()
+            .unwrap();
+        let app = bundle.path().join("aterm.app");
+        std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        std::fs::write(app.join("Contents/MacOS/aterm"), "").unwrap();
+        for key in [
+            crate::PASSING_REFUSAL_KEY,
+            crate::INSTALL_LOCATION_REFUSAL_KEY,
+            crate::ROSTER_UNCONFIRMED_KEY,
+            crate::NOT_INSTALLED_KEY,
+            crate::install::ROLLBACK_SOURCE_REFUSAL_KEY,
+            crate::github::STALE_ANCHOR_KEY,
+        ] {
+            let said = format!("/x/Outer.app/Contents/Helpers/q: {key}.app");
+            let output = |code: i32, stdout: &str| std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: format!("{said}\n").into_bytes(),
+            };
+            let refusals = [
+                codesign_exit_refusal(
+                    "codesign --verify",
+                    Path::new("Outer.app"),
+                    CodesignError::Refused {
+                        code: Some(1),
+                        stderr: format!(
+                            "Outer.app: main executable failed strict validation\n\
+                             In subcomponent: {said}\n"
+                        ),
+                    },
+                ),
+                spctl_verdict(exited, &said).unwrap_err(),
+                plist_read_refusal("CFBundleVersion", &output(1, "")),
+                probe_starts(&app, 9_999_999, |_| Ok(output(1, ""))).unwrap_err(),
+                probe_starts(&app, 9_999_999, |_| Ok(output(0, &said))).unwrap_err(),
+            ];
+            for refusal in refusals {
+                assert!(!refusal.contains(key), "{key}: {refusal}");
+                assert!(
+                    refusal.contains("Helpers/q: "),
+                    "the quote reads: {refusal}"
+                );
+                assert!(!crate::is_passing_refusal(&refusal), "{refusal}");
+                assert!(!crate::is_install_location_refusal(&refusal), "{refusal}");
+                assert!(
+                    !crate::install::is_rollback_source_refusal(&refusal),
+                    "{refusal}"
+                );
+                assert!(
+                    !crate::github::is_stale_anchor_refusal(&refusal),
+                    "{refusal}"
+                );
+                assert!(!crate::refusal_needs_person(&refusal), "{refusal}");
+            }
+        }
+        let moment = codesign_exit_refusal(
+            "codesign --verify",
+            Path::new("Outer.app"),
+            CodesignError::Refused {
+                code: None,
+                stderr: String::new(),
+            },
+        );
+        assert!(crate::is_passing_refusal(&moment), "{moment}");
+    }
+
+    /// A TAMPERED BUNDLE NAMED LIKE A MACHINE FAULT IS A VERDICT, measured on the real
+    /// codesign through the structural lane on ad hoc signed `.app`s: a dangling symlink
+    /// added after signing (codesign's whole word is `<app>: No such file or
+    /// directory`); a symlink out of the bundle named `h: Permission denied`, read from
+    /// stderr or both streams; and nested helpers named `h: Permission denied`,
+    /// `h\nX: Permission denied` and after the passing key, with a sibling re-signed
+    /// after the seal, which codesign names on `--verbose=2` progress lines before its
+    /// verdict. CONTROLS: the untouched bundle verifies, and a sealed resource this user
+    /// cannot read is still the passing moment it was.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_tampered_bundle_named_like_a_machine_fault_is_a_verdict() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Signing and judging a bundle wait on trustd.
+        aterm_uds::deadline::require_trust_service();
+        let root = aterm_tempfile::Builder::new()
+            .prefix("aterm-codesign-tamper-")
+            .tempdir()
+            .unwrap();
+        let unsigned = |name: &str| unsigned_app(root.path(), name);
+        let verdict = |app: &Path, words: &str| {
+            let refusal = verify_bundle_policy(app, "").expect_err(words);
+            assert!(refusal.contains(words), "{refusal}");
+            assert!(!crate::is_passing_refusal(&refusal), "{refusal}");
+        };
+
+        let clean = unsigned("Clean.app");
+        aterm_uds::deadline::sign_ad_hoc(&clean);
+        assert_eq!(verify_bundle_policy(&clean, ""), Ok(()));
+
+        let dangling = unsigned("Dangling.app");
+        aterm_uds::deadline::sign_ad_hoc(&dangling);
+        std::os::unix::fs::symlink(
+            "/nonexistent/aterm-dangling",
+            dangling.join("Contents/Resources/dangling"),
+        )
+        .unwrap();
+        verdict(&dangling, ": No such file or directory");
+
+        let named = unsigned("Named.app");
+        std::os::unix::fs::symlink(
+            "/etc/hosts",
+            named.join("Contents/Resources/h: Permission denied"),
+        )
+        .unwrap();
+        aterm_uds::deadline::sign_ad_hoc(&named);
+        verdict(&named, "invalid destination for symbolic link in bundle");
+        // codesign writes the `file modified: …/h: Permission denied` detail to STDOUT;
+        // a reader handed both streams still reads the first line's verdict.
+        let out = output_bounded(&mut structural_command(&named), STRUCTURAL).unwrap();
+        let both = aterm_update_core::codesign::CodesignError::Refused {
+            code: out.status.code(),
+            stderr: format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stderr),
+                String::from_utf8_lossy(&out.stdout)
+            ),
+        };
+        assert!(!both.judged_nothing_at(&named), "{both:?}");
+
+        let nested = unsigned("Nested.app");
+        let helpers = nested.join("Contents/Helpers");
+        std::fs::create_dir_all(&helpers).unwrap();
+        for name in [
+            "h: Permission denied".to_string(),
+            "h\nX: Permission denied".to_string(),
+            format!("q: {}", crate::PASSING_REFUSAL_KEY),
+            "z".to_string(),
+        ] {
+            std::fs::copy("/bin/ls", helpers.join(&name)).unwrap();
+            aterm_uds::deadline::sign_ad_hoc(&helpers.join(name));
+        }
+        aterm_uds::deadline::sign_ad_hoc(&nested);
+        let resigned = output_bounded(
+            aterm_uds::spawnfd::command("/usr/bin/codesign")
+                .args(["--force", "--sign", "-", "--identifier", "other"])
+                .arg(helpers.join("z")),
+            "codesign --sign (ad hoc)",
+        )
+        .unwrap();
+        assert!(resigned.status.success(), "{resigned:?}");
+        verdict(&nested, "nested code is modified or invalid");
+
+        let unreadable = unsigned("Unreadable.app");
+        aterm_uds::deadline::sign_ad_hoc(&unreadable);
+        let r = unreadable.join("Contents/Resources/r");
+        std::fs::set_permissions(&r, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads a mode-000 file, and then the premise does not hold.
+        let premise = std::fs::read(&r).is_err();
+        let moment = verify_bundle_policy(&unreadable, "");
+        std::fs::set_permissions(&r, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if premise {
+            let refusal = moment.expect_err("an unreadable sealed resource");
+            assert!(crate::is_passing_refusal(&refusal), "{refusal}");
+        }
+    }
+
+    /// A minimal unsigned `.app` at `root/name`: `/bin/ls` as its main executable `A`, an
+    /// `Info.plist` naming it, and one resource, `Contents/Resources/r`.
+    #[cfg(target_os = "macos")]
+    fn unsigned_app(root: &Path, name: &str) -> std::path::PathBuf {
+        let app = root.join(name);
+        std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        std::fs::create_dir_all(app.join("Contents/Resources")).unwrap();
+        std::fs::copy("/bin/ls", app.join("Contents/MacOS/A")).unwrap();
+        std::fs::write(
+            app.join("Contents/Info.plist"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+             <key>CFBundleExecutable</key><string>A</string>\
+             <key>CFBundleIdentifier</key><string>t.a</string></dict></plist>\n",
+        )
+        .unwrap();
+        std::fs::write(app.join("Contents/Resources/r"), "x\n").unwrap();
+        app
+    }
+
+    /// A BUNDLE CODESIGN CANNOT READ TO AN ANSWER IS A VERDICT, refused before any
+    /// helper runs. On the real codesign, a FIFO at the seal
+    /// (`_CodeSignature/CodeResources`) or at the main executable, a symlink to one in
+    /// place of a sealed resource, or a FIFO behind `Contents`, `Contents/MacOS` or
+    /// `Contents/_CodeSignature` linked out of the bundle holds `codesign --verify`
+    /// until its deadline, and a deadline run out alone is the passing moment of a slow
+    /// machine: a tampered stage kept and re-verified at every check, a tampered install
+    /// that never asks for a reinstall. Each is a verdict in both tiers and for the
+    /// sealed reads beside the gate, inside an apply's budget (where a codesign let run
+    /// would answer with the budget's passing refusal), and one named after the passing
+    /// key is still one. CONTROL: the untouched bundle verifies, and so does one whose
+    /// sealed symlink names a directory inside it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bundle_codesign_cannot_read_to_an_answer_is_a_verdict() {
+        // Signing and judging a bundle wait on trustd.
+        aterm_uds::deadline::require_trust_service();
+        let root = aterm_tempfile::Builder::new()
+            .prefix("aterm-codesign-fifo-")
+            .tempdir()
+            .unwrap();
+        let fifo = |at: &Path| {
+            let _ = std::fs::remove_file(at);
+            let path = std::ffi::CString::new(at.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: `path` is a valid NUL-terminated path for the call's duration.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0, "{at:?}");
+        };
+        let signed = |name: &str| {
+            let app = unsigned_app(root.path(), name);
+            aterm_uds::deadline::sign_ad_hoc(&app);
+            app
+        };
+        let clean = signed("Clean.app");
+        assert_eq!(verify_bundle_policy(&clean, ""), Ok(()));
+        let inside = unsigned_app(root.path(), "Inside.app");
+        std::fs::create_dir(inside.join("Contents/Resources/real")).unwrap();
+        std::os::unix::fs::symlink("real", inside.join("Contents/Resources/link")).unwrap();
+        aterm_uds::deadline::sign_ad_hoc(&inside);
+        assert_eq!(verify_bundle_policy(&inside, ""), Ok(()));
+
+        let seal = signed("Seal.app");
+        fifo(&seal.join("Contents/_CodeSignature/CodeResources"));
+        let exe = signed("Exe.app");
+        fifo(&exe.join("Contents/MacOS/A"));
+        let outside = root.path().join("outside");
+        fifo(&outside);
+        let linked = signed("Linked.app");
+        std::fs::remove_file(linked.join("Contents/Resources/r")).unwrap();
+        std::os::unix::fs::symlink(&outside, linked.join("Contents/Resources/r")).unwrap();
+        let named = signed("Named.app");
+        let key = crate::PASSING_REFUSAL_KEY;
+        fifo(&named.join(format!("Contents/Resources/q: {key}")));
+        // A directory of the bundle moved out and linked back, a FIFO where codesign looks.
+        let moved_out = |name: &str, dir: &str, at: &str| {
+            let app = signed(name);
+            let out = root.path().join(format!("{name}.out"));
+            std::fs::rename(app.join(dir), &out).unwrap();
+            std::os::unix::fs::symlink(&out, app.join(dir)).unwrap();
+            fifo(&out.join(at));
+            app
+        };
+        let contents = moved_out("Contents.app", "Contents", "_CodeSignature/CodeResources");
+        let macos = moved_out("MacOS.app", "Contents/MacOS", "A");
+        let sealed = moved_out("Sealed.app", "Contents/_CodeSignature", "CodeResources");
+
+        let _budget = ApplyBudget::start(Duration::from_secs(5));
+        let verdict = |refusal: &str| {
+            refusal.contains("which no signed bundle holds") && !crate::is_passing_refusal(refusal)
+        };
+        for (app, team) in [
+            (&seal, ""),
+            (&seal, "ABCDE12345"),
+            (&exe, ""),
+            (&linked, ""),
+            (&named, ""),
+            (&named, "ABCDE12345"),
+            (&contents, ""),
+            (&macos, ""),
+            (&sealed, "ABCDE12345"),
+        ] {
+            let refusal = verify_bundle_policy(app, team).expect_err("a bundle it cannot read");
+            assert!(verdict(&refusal), "{app:?} {team:?}: {refusal}");
+        }
+        let checks = check_bundle(&seal, "", true);
+        assert!(
+            checks.build.as_ref().is_err_and(|why| verdict(why)),
+            "{:?}",
+            checks.build
+        );
     }
 
     /// A bundle check runs several helpers on the bundle, and a signal ending the
@@ -1636,9 +2133,7 @@ mod tests {
         // The team-id helper, through the real `codesign -d` on a bundle it cannot
         // read: the run ends on a moment, not on the missing line it then prints.
         // `codesign -d` of Apple's `/bin/ls` waits on trustd.
-        if aterm_uds::deadline::trust_service_silent() {
-            return;
-        }
+        aterm_uds::deadline::require_trust_service();
         use std::os::unix::fs::PermissionsExt as _;
         let root = aterm_tempfile::Builder::new()
             .prefix("aterm-team-id-moment-")
@@ -1701,9 +2196,7 @@ mod tests {
     #[test]
     fn each_helper_of_a_bundle_check_answers_for_itself_and_the_verdict_is_the_serial_one() {
         // Signing and judging a bundle wait on trustd.
-        if aterm_uds::deadline::trust_service_silent() {
-            return;
-        }
+        aterm_uds::deadline::require_trust_service();
         let root = aterm_tempfile::Builder::new()
             .prefix("aterm-check-bundle-")
             .tempdir()
@@ -1771,9 +2264,7 @@ mod tests {
     #[test]
     fn several_bundles_checked_at_once_each_get_their_own_answers() {
         // Signing and judging a bundle wait on trustd.
-        if aterm_uds::deadline::trust_service_silent() {
-            return;
-        }
+        aterm_uds::deadline::require_trust_service();
         let root = aterm_tempfile::Builder::new()
             .prefix("aterm-check-bundles-")
             .tempdir()
@@ -1823,7 +2314,9 @@ mod tests {
 
     /// A HELPER OF A BUNDLE CHECK THAT NEVER ANSWERS ends at the deadline, as a
     /// passing refusal naming the budget, and the call comes back: here every
-    /// `PlistBuddy` blocks opening an Info.plist that is a FIFO nobody writes.
+    /// `PlistBuddy` blocks opening an Info.plist that is a FIFO nobody writes, and the
+    /// budget is spent before the bundle's walk ([`unanswerable_entry`]) can refuse the
+    /// FIFO, so what it did not reach is left to the helpers.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_bundle_check_helper_that_never_answers_is_a_passing_refusal_at_the_budget() {
@@ -1843,7 +2336,7 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(plist.as_ptr(), 0o600) }, 0);
         let begun = Instant::now();
         let checks = {
-            let _budget = ApplyBudget::start(Duration::from_secs(2));
+            let _budget = ApplyBudget::start(Duration::ZERO);
             check_bundle(&app, "", false)
         };
         assert!(

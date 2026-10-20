@@ -7,8 +7,7 @@
 
 use aterm_slog::{Actor, Close, Conf, Cursor, GapWhy, Log, Op, Out, SessionOut, Src, Tier, encode};
 
-use crate::measure::realistic_log;
-use crate::support::at;
+use crate::support::{at, realistic_log};
 
 /// A realistic session, closed: `turns` agent turns with their steps and
 /// commands, and the session's close.

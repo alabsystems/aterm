@@ -1,0 +1,10 @@
+# claude-code 2.1.302 · DERIVED 2026-10-16, not measured: drawn by the safety check's frame generator (wrap-ansi, `hard`, each row trimmed; labels in the pane's width less 4 from column 4), which draws 46 of the 48 single-server 2.1.302 capture files of this dialog (41 distinct frames, at 20 to 144 columns and 5 to 50 rows) row for row, and the other two (the MEASURED `…-35x10-cursor-second` and `…-40x10-cursor-first` frames) only drawn one row short, a blank row under the frame · the single-server .mcp.json approval dialog (one new server lab-probe) in a 60x10 pane, its head off the screen, the Select showing its last two options with the cursor on the second (`Use this and all future MCP servers in this project`) and the unmarked `Continue without using this MCP server` under it. Not drawn so in the lab: one Up from the default, 2.1.302's Select scrolls to show the first two options (the MEASURED `…-60x10-cursor-second` fixture); this is the window a Select keeping the last option in view would draw
+
+  MCP servers may execute code or access system resources.
+  All tool calls require approval. Learn more in the MCP
+  documentation.
+
+  ❯ Use this and all future MCP servers in this project
+    Continue without using this MCP server
+
+  Enter to confirm · Esc to cancel

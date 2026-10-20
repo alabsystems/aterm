@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::ai::connector::{AGY, CLAUDE, CODEX};
+use crate::ai::connector::{AGY, CLAUDE, CODEX, MUSE};
 use crate::ai::facts::{ClaudeAccounts, Managed};
 use crate::ai::store::{How, Record};
 
@@ -60,7 +60,7 @@ fn not_wanted_excluded_removed_and_unavailable_are_off_never_a_fault() {
 }
 
 #[test]
-fn a_measured_cli_not_installed_fails_and_an_unmeasured_one_is_a_note() {
+fn a_missing_cli_needs_installation_even_before_its_vendor_lab_has_run() {
     let mut f = facts(&CODEX);
     f.managed = None;
     f.foreign = Some(PathBuf::from("/opt/homebrew/bin/codex"));
@@ -68,9 +68,15 @@ fn a_measured_cli_not_installed_fails_and_an_unmeasured_one_is_a_note() {
     assert_eq!((row.state, row.mark), (State::NotInstalled, Mark::Fail));
     assert_eq!(row.fix.as_deref(), Some("aterm pkg install codex"));
     assert!(row.fact.contains("/opt/homebrew/bin/codex"), "{}", row.fact);
-    let mut g = facts(&AGY);
-    g.managed = None;
-    assert_eq!(assess(&g, true, NOW).mark, Mark::Note);
+    for c in [&AGY, &MUSE] {
+        let mut g = facts(c);
+        g.managed = None;
+        let row = assess(&g, true, NOW);
+        assert_eq!((row.state, row.mark), (State::NotInstalled, Mark::Fail));
+        assert!(row.state.needs_person(row.wanted));
+        assert_eq!(row.fix, Some(format!("aterm pkg install {}", c.id)));
+        assert!(!row.connector.measured, "the evidence metadata stays");
+    }
 }
 
 #[test]
@@ -203,12 +209,20 @@ fn a_credential_in_the_environment_is_named_in_the_fact() {
 }
 
 #[test]
-fn an_unmeasured_cli_never_fails() {
+fn unknown_keyring_evidence_needs_no_action_but_a_definite_login_end_does() {
     let mut f = facts(&AGY);
     f.home_exists = false;
     let row = assess(&f, true, NOW);
     assert_eq!((row.state, row.mark), (State::Unproven, Mark::Note));
     assert!(row.fact.contains("not measured"), "{}", row.fact);
+    assert!(!row.state.needs_person(row.wanted));
+    f.record.ended_at = Some(NOW);
+    f.record.ended_why = Some(crate::ai::store::Ended::ReviewAuth);
+    let row = assess(&f, true, NOW);
+    assert_eq!((row.state, row.mark), (State::SignedOut, Mark::Fail));
+    assert!(row.state.needs_person(row.wanted));
+    assert!(!row.state.needs_person(false));
+    assert_eq!(row.fix.as_deref(), Some("aterm ai login agy"));
 }
 
 #[test]
@@ -222,10 +236,13 @@ fn the_health_line_names_what_needs_a_person() {
     assert_eq!(h.word, "FAIL");
     assert_eq!(
         h.line("aterm ai doctor"),
-        "FAIL — 1 CLI needs you (codex); next: aterm ai doctor"
+        "FAIL — 2 CLIs need you (codex, agy); next: aterm ai doctor"
     );
     let ok = [assess(&b, true, NOW)];
-    assert_eq!(health(&ok).line("x"), "OK — 1 note (agy)");
+    assert_eq!(
+        health(&ok).line("x"),
+        "FAIL — 1 CLI needs you (agy); next: x"
+    );
     assert_eq!(health(&[]).line("x"), "OK");
 }
 

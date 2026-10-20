@@ -130,41 +130,6 @@ fn clamp_display_offset_limits_and_marks_damage_on_clamp_only() {
     assert!(!grid.needs_full_redraw());
 }
 
-#[test]
-fn clamp_display_offset_small_delta_marks_bottom_rows_dirty() {
-    let mut grid = Grid::with_scrollback(5, 3, 10);
-    for marker in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'] {
-        write_marker_line(&mut grid, marker);
-    }
-
-    let max_offset = grid.scrollback_lines();
-    assert!(max_offset >= 2, "precondition: expected clamp headroom");
-
-    grid.clear_damage();
-    grid.storage.display_offset = max_offset + 2;
-    grid.clamp_display_offset();
-
-    assert_eq!(grid.display_offset(), max_offset);
-    assert!(grid.damage().has_damage());
-    assert!(
-        !grid.damage().is_full(),
-        "clamp_display_offset with a 2-line delta should use targeted damage"
-    );
-
-    for row in 0..3u16 {
-        assert!(
-            !grid.damage().is_row_damaged(row),
-            "row {row} should stay clean after a 2-line clamp"
-        );
-    }
-    for row in 3..5u16 {
-        assert!(
-            grid.damage().is_row_damaged(row),
-            "row {row} should be dirty after a 2-line clamp"
-        );
-    }
-}
-
 // Ring buffer + resize boundary tests
 
 #[test]

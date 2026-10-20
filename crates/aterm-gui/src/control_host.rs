@@ -29,7 +29,7 @@ use aterm_core::terminal::Terminal;
 use aterm_session::SessionId;
 #[cfg(test)]
 use aterm_session::sink::SinkWriter;
-use winit::event_loop::EventLoopProxy;
+use aterm_window::event_loop::EventLoopProxy;
 
 use super::control_session;
 use crate::session_store::Store;
@@ -373,9 +373,9 @@ mod tests {
             rewrap_gauge: std::sync::Arc::default(),
             human_input: Default::default(),
             launch: Default::default(),
-            generation_look: Default::default(),
             reset_lane: Default::default(),
             crash_journal: Default::default(),
+            typed: Default::default(),
             update_parked: Default::default(),
             witness: Default::default(),
             fenced_writes: Default::default(),

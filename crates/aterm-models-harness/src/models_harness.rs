@@ -1184,27 +1184,65 @@ pub fn harness_upgrade_work_end_model() -> Model {
 ///
 /// The renewable login (`aterm_agent::harness::accounts`' login lifecycle; the policy's
 /// `login_label` arms): `rostered` (the session's login is a roster row with an email, `Enrol`
-/// from a clean session), `asked` (the owner was asked to renew it), `renewed` (a renewal whose
-/// check answered the row's account bound a new login the session is not on yet). The owner
-/// renews (`Renew`) at any time. A session on a rostered login is never typed `/login`: it is
-/// waited at and the owner asked to renew (`AskRenew`), and once renewed it moves onto the new
-/// login, relaunched at its wall (`Relaunch`) or at an idle point ahead of any wall (`Follow`). A
-/// person's `/status` takes the wall's row off the screen (`Hide`); the wait holds through it.
-/// More ghosts: `typedroster` (`/login` typed on a rostered login), `stranded` (a session left on
-/// a dead login, continued or asked to renew, while a renewed one stood ready), `checked` (a check
-/// run under an idle login, which spends its single-use refresh token: the login dies).
+/// from a clean session), `renewed` (a renewal whose check answered the row's account bound a new
+/// login the session is not on yet). The owner renews (`Renew`) at any time. Once renewed the
+/// session moves onto the new login, relaunched at its wall (`Relaunch`) or at an idle point
+/// ahead of any wall (`Follow`).
+///
+/// THE LOST LOGIN CARRIED (the owner's ruling of 2026-10-19, after v0.106.0 left one to them,
+/// silent: a one-row roster's login was waited at for a renewal nobody was asked for, and the
+/// wall over a finished task was never decided). Every lost login with no renewed one to follow
+/// — rostered or not — gets `/login` ONCE (`TypeLogin`), and the owner is told now (`TellNow`:
+/// the exception the host asks on the glass) wherever the rest is theirs: the sign-in that
+/// `/login` opened (abstracted here as `/login` typed: `told`), a `/login` left. `done` is a
+/// wall that answered the owner's own prompt to a finished task in milliseconds (`WallOverDone`:
+/// no read saw that turn run, and the prompt's key is the person's). The dialog's method picker
+/// (`picker`: 1 behind aterm's `/login`) is answered with the method the session's login already
+/// is (`PickMethod`, `known`: a roster row or the profile's plan, `Profiled`), never a guess;
+/// left to the owner otherwise. `Dismiss` is Esc out of aterm's dialog (`Login interrupted`).
+/// A PERSON'S OWN `/login`: on a working session its picker (`picker` 2, `PersonPicker`) is
+/// theirs whole (`PersonPicked`), and at a lost login one they left (`PersonLeft`: Esc, the
+/// incident of 2026-10-19) is their answer — no `/login` of aterm's follows it, the person's
+/// next prompt answered by the wall again (`PersonPrompt`) included, and the owner is told the
+/// sign-in is theirs. ONE SIGN-IN PER LOGIN (the review's F7: every tab on a shared login typed
+/// its own `/login`, and the owner met as many browser sign-ins): another tab of the host on the
+/// same login (`elsewhere`) may take the login's one sign-in first (`OtherCarries`: its `/login`,
+/// the owner told there), and this tab waits on it, typing nothing; the login comes back there
+/// (`OtherBack`: `elsewhere` 2), and this tab's turn is delivered again (`Continue` at its wall:
+/// the model's answer is its lift), or that tab closes with its sign-in unfinished
+/// (`OtherGone`), and this tab's `/login` is the login's. More ghosts: `stranded` (a session
+/// left on a dead login, continued or
+/// signed in, while a renewed one stood ready), `checked` (a check run under an idle login,
+/// which spends its single-use refresh token: the login dies), `silent` (the supervisor rested
+/// at a lost login with nothing typed and nobody told), `relooped` (`/login` typed again into a
+/// loss its `/login` already met), `guessed` (a method picked that nothing said the session
+/// uses), `overrode` (`/login` typed into a loss a person's own `/login` left), `overpicked` (a
+/// person's own picker answered), `doubled` (`/login` typed while another tab carries the
+/// login's sign-in, or after it came back there).
 ///
 /// Properties: `NoNoticeAtTheWall`, `NoGiveUpUnread`, `NoFutileContinue`, `TheOwnerIsToldFirst`,
-/// `NoLoginTypedOnARoster`, `NoSessionLeftOnADeadLogin`, `NoCheckUnderAnIdleLogin`. One knob per
-/// defect, each caught alone: `NoGate` (the upgrade's gate misses the wall), `NoRefund` (a notice
-/// the wall answered is counted and given up on), `ClockAtWall` (the window runs at the wall and
-/// the lift does not restart it), `NoSee` (the supervisor's reader misses the wall), `NoHold` (a
-/// lost login is continued once its row leaves the screen), `TypeOnRoster` (`/login` typed on a
-/// rostered login, which opens a browser to sign in to the live login, perhaps as another
-/// account), `NoFollow` (a renewed login is not followed: the session continues or asks on the
-/// dead one), `CheckIdle` (the renewal checks the idle login it replaces); `Buggy = 1` is all
-/// eight. Tier-1: aterm-agent's `conformance_login_wall`, over the real readers, reducer,
-/// turn-end decider, exception and renewal on every reachable state.
+/// `NoSessionLeftOnADeadLogin`, `NoCheckUnderAnIdleLogin`, `NoLostLoginLeftSilent`,
+/// `LoginTypedOncePerLoss`, `NoMethodGuessed`, `NoLoginOverAPersonsCancel`,
+/// `NoPersonsPickerAnswered`, `OneSignInPerLogin`. One knob per defect, each caught alone: `NoGate`
+/// (the upgrade's gate misses the wall), `NoRefund` (a notice the wall answered is counted and
+/// given up on), `ClockAtWall` (the window runs at the wall and the lift does not restart it),
+/// `NoSee` (the supervisor's reader misses the wall), `NoHold` (a lost login is continued once
+/// its row leaves the screen), `WaitOnRoster` (v0.106.0: a rostered login is waited at, nothing
+/// typed and nobody told), `NoFollow` (a renewed login is not followed: the session continues or
+/// signs in the dead one), `CheckIdle` (the renewal checks the idle login it replaces),
+/// `NoDoneWall` (v0.106.0: a wall over a finished task is no point, nothing typed and nobody
+/// told), `GraceHolds` (the prompt's own key holds `/login` as a person's), `Relogin` (`/login`
+/// typed again after `Login interrupted`), `GuessMethod` (the picker answered with no method
+/// known), `ReloginOverLeft` (`/login` typed after a person's own was left), `PickAnyPicker`
+/// (any `/login`'s picker answered, a person's own included), `NoLatch` (each tab types its own
+/// `/login`). The dials, each a family whose space stays inside the interpreter's budget (ten
+/// defects at once, or four, outran it): `Buggy = 1` the upgrade's three (`NoGate`, `NoRefund`,
+/// `ClockAtWall`), `2` the supervisor's reader (`NoSee`, `NoHold`), `3` v0.106.0's walls and the
+/// renewal (`WaitOnRoster`, `NoFollow`, `CheckIdle`, `NoDoneWall`, `GraceHolds`), `4` `/login`
+/// typed again (`Relogin`, `ReloginOverLeft`), `5` a picker answered (`GuessMethod`,
+/// `PickAnyPicker`), `6` a second sign-in (`NoLatch`). Tier-1:
+/// aterm-agent's `conformance_login_wall`, over the real readers, reducer, turn-end decider,
+/// exception, picker gate and policy and renewal on every reachable state.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_login_wall_model() -> Model {
@@ -1216,9 +1254,16 @@ pub fn harness_login_wall_model() -> Model {
             const ClockAtWall = 0;
             const NoSee = 0;
             const NoHold = 0;
-            const TypeOnRoster = 0;
+            const WaitOnRoster = 0;
             const NoFollow = 0;
             const CheckIdle = 0;
+            const NoDoneWall = 0;
+            const GraceHolds = 0;
+            const Relogin = 0;
+            const GuessMethod = 0;
+            const ReloginOverLeft = 0;
+            const PickAnyPicker = 0;
+            const NoLatch = 0;
             const MaxAsks = 2;
             var login = 1;
             var wall = 0;
@@ -1240,17 +1285,27 @@ pub fn harness_login_wall_model() -> Model {
             var futile = 0;
             var untold = 0;
             var rostered = 0;
-            var asked = 0;
             var renewed = 0;
-            var typedroster = 0;
             var stranded = 0;
             var checked = 0;
+            var done = 0;
+            var picker = 0;
+            var known = 0;
+            var silent = 0;
+            var relooped = 0;
+            var guessed = 0;
+            var left = 0;
+            var overrode = 0;
+            var overpicked = 0;
+            var elsewhere = 0;
+            var doubled = 0;
 
             // The account and the session, as they please: the login goes; a turn someone else
-            // began (a background completion, a /loop wakeup) is answered by the wall; the
-            // person's `/login` finishes (`Login successful`) and the window restarts from the
-            // lift (`ClockAtWall`: it does not); a `/login` dialog is dismissed with no login.
-            action Expire when (login == 1) {
+            // began (a background completion, a /loop wakeup) is answered by the wall, or the
+            // owner's own prompt to a finished task, in milliseconds; the person's `/login`
+            // finishes (`Login successful`) and the window restarts from the lift
+            // (`ClockAtWall`: it does not); Esc leaves a `/login` dialog with no login.
+            action Expire when (login == 1 && picker <= 1 && elsewhere == 0) {
                 login = 0;
             }
             action WallHit when (login == 0 && wall == 0) {
@@ -1259,17 +1314,66 @@ pub fn harness_login_wall_model() -> Model {
                 back = 0;
                 dark = if (phase == 1 && window == 0) { 1 } else { dark };
             }
+            action WallOverDone when (
+                login == 0 && wall == 0 && stood == 0 && track == 0 && back == 0 && done == 0
+            ) {
+                wall = 1;
+                stood = 1;
+                done = 1;
+                dark = if (phase == 1 && window == 0) { 1 } else { dark };
+            }
             action LoginBack when (login == 0 && stood == 1) {
                 login = 1;
+                elsewhere = 0;
                 wall = 0;
                 stood = 0;
                 back = 1;
-                asked = 0;
-                window = if (phase == 1 && Buggy == 0 && ClockAtWall == 0) { 0 } else { window };
-                dark = if (Buggy == 0 && ClockAtWall == 0) { 0 } else { dark };
+                done = 0;
+                picker = 0;
+                left = 0;
+                window = if (phase == 1 && (Buggy == 0 || Buggy > 1) && ClockAtWall == 0) {
+                    0
+                } else {
+                    window
+                };
+                dark = if ((Buggy == 0 || Buggy > 1) && ClockAtWall == 0) { 0 } else { dark };
             }
             action Dismiss when (track == 1 && wall == 1 && login == 0) {
                 wall = 0;
+                picker = 0;
+            }
+            // A person's own `/login`: on a working session, its picker theirs to answer; at a
+            // lost login aterm has not typed `/login` into yet, left with Esc (`Login
+            // interrupted`), and their next prompt answered by the wall again.
+            action PersonPicker when (picker == 0 && track == 0 && login == 1 && wall == 0) {
+                picker = 2;
+            }
+            action PersonPicked when (picker == 2) {
+                picker = 0;
+            }
+            action PersonLeft when (wall == 1 && track == 0 && left == 0 && login == 0) {
+                wall = 0;
+                left = 1;
+            }
+            action PersonPrompt when (left == 1 && wall == 0 && back == 0 && login == 0) {
+                wall = 1;
+            }
+            // ANOTHER TAB OF THIS HOST ON THE SAME LOGIN: it takes the login's one
+            // sign-in first (its `/login`, the owner told there), the login comes
+            // back there, or the tab closes with its sign-in unfinished.
+            action OtherCarries when (
+                stood == 1 && login == 0 && elsewhere == 0 && track == 0 && renewed == 0 && left == 0
+            ) {
+                elsewhere = 1;
+                told = 1;
+            }
+            action OtherBack when (elsewhere == 1) {
+                login = 1;
+                elsewhere = 2;
+            }
+            action OtherGone when (elsewhere == 1) {
+                elsewhere = 0;
+                told = if (track == 0) { 0 } else { told };
             }
             // A state an older build left: it gave up on every notice, each answered by the wall.
             action Inherit when (phase == 0 && asks == 0 && inherited == 0 && stood == 1) {
@@ -1281,93 +1385,149 @@ pub fn harness_login_wall_model() -> Model {
             }
 
             // The login made renewable: a roster row with an email names it (`accounts
-            // adopt-default`), enrolled from a clean session. A renewal comes at any time,
-            // through a staging directory whose check runs under the new login alone
-            // (`CheckIdle`: under the idle one it replaces, spending that one's refresh token).
+            // adopt-default`), enrolled from a clean session, which says its method too. A
+            // renewal comes at any time, through a staging directory whose check runs under the
+            // new login alone (`CheckIdle`: under the idle one it replaces, spending that one's
+            // refresh token). The profile's plan says the method of a login no row names.
             action Enrol when (
                 rostered == 0 && login == 1 && wall == 0 && stood == 0 && track == 0 && back == 0
             ) {
                 rostered = 1;
+                known = 1;
+            }
+            action Profiled when (known == 0) {
+                known = 1;
             }
             action Renew when (rostered == 1 && renewed == 0) {
                 renewed = 1;
-                checked = if ((Buggy == 1 || CheckIdle == 1) && login == 1) { 1 } else { checked };
-                login = if (Buggy == 1 || CheckIdle == 1) { 0 } else { login };
-            }
-            // A person's `/status` over a rostered login's wall: the row leaves the screen, the
-            // login does not come back.
-            action Hide when (rostered == 1 && wall == 1 && track == 0) {
-                wall = 0;
+                checked = if ((Buggy == 3 || CheckIdle == 1) && login == 1) { 1 } else { checked };
+                login = if (Buggy == 3 || CheckIdle == 1) { 0 } else { login };
             }
 
-            // The supervisor, at a point it reads the wall at: `/login` once, the owner told;
-            // never on a rostered login, which is waited at instead (`TypeOnRoster`: it is).
+            // The supervisor, at a point it reads the wall at: `/login` once, rostered or not,
+            // over a finished task too, its key no person's — never while a renewed login stands
+            // ready (`NoFollow`: it does, leaving the session on the dead one), nor again into a
+            // loss its `/login` met (`Relogin`: after `Login interrupted`). (`WaitOnRoster`,
+            // `NoDoneWall`, `GraceHolds`: not typed there.) The dialog's picker shows.
             action TypeLogin when (
-                wall == 1 && track == 0 &&
-                ((rostered == 0 && Buggy == 0 && NoSee == 0) ||
-                    (rostered == 1 && (Buggy == 1 || TypeOnRoster == 1)))
+                ((wall == 1 && track == 0 &&
+                    (renewed == 0 || Buggy == 3 || NoFollow == 1) &&
+                    (Buggy <= 1 || Buggy > 2) && NoSee == 0 &&
+                    (rostered == 0 || ((Buggy <= 2 || Buggy > 3) && WaitOnRoster == 0)) &&
+                    (done == 0 ||
+                        ((Buggy <= 2 || Buggy > 3) && NoDoneWall == 0 && GraceHolds == 0)) &&
+                    (left == 0 || Buggy == 4 || ReloginOverLeft == 1) &&
+                    (elsewhere == 0 || Buggy == 6 || NoLatch == 1)) ||
+                    (track == 1 && wall == 0 && stood == 1 && back == 0 && renewed == 0 &&
+                        (Buggy == 4 || Relogin == 1)))
             ) {
+                relooped = if (track == 1) { 1 } else { relooped };
+                overrode = if (left == 1) { 1 } else { overrode };
+                doubled = if (elsewhere == 0) { doubled } else { 1 };
+                stranded = if (renewed == 1) { 1 } else { stranded };
                 track = 1;
                 told = 1;
-                typedroster = if (rostered == 1) { 1 } else { typedroster };
+                picker = 1;
             }
-            // At a rostered login's wall, shown or hidden: the owner asked to renew it, and
-            // told; never while a renewed login stands ready (`NoFollow`: it is, leaving the
-            // session on the dead one).
-            action AskRenew when (
-                rostered == 1 && (wall == 1 || stood == 1) && login == 0 &&
-                (renewed == 0 || Buggy == 1 || NoFollow == 1)
+            // The owner told now (the exception the host asks on the glass, not escalated)
+            // wherever the rest of the loss is theirs: a `/login` left (aterm's, or a person's
+            // own with no renewed login to move onto) until the login is back. The sign-in
+            // `/login` opened in the browser is told with it (`TypeLogin` sets `told`); a
+            // `/login` about to be typed, a move and its wait tell nothing: aterm is still at
+            // it.
+            action TellNow when (
+                back == 0 && (track == 1 || (left == 1 && renewed == 0))
             ) {
-                asked = 1;
                 told = 1;
-                stranded = if (renewed == 1) { 1 } else { stranded };
+            }
+            // Where v0.106.0 rested: a lost login with nothing typed and nobody told.
+            action Rest when (
+                wall == 1 && track == 0 && told == 0 && renewed == 0 &&
+                ((rostered == 1 && (Buggy == 3 || WaitOnRoster == 1)) ||
+                    (done == 1 && (Buggy == 3 || NoDoneWall == 1)))
+            ) {
+                silent = 1;
+            }
+            // The picker answered with the method the session's login already is; with none
+            // known, it is left to the owner (`GuessMethod`: a method is picked anyway).
+            action PickMethod when (
+                (picker == 1 && (known == 1 || Buggy == 5 || GuessMethod == 1)) ||
+                (picker == 2 && (Buggy == 5 || PickAnyPicker == 1))
+            ) {
+                guessed = if (picker == 1 && known == 0) { 1 } else { guessed };
+                overpicked = if (picker == 2) { 1 } else { overpicked };
+                picker = 0;
             }
             // Renewed: a session at its wall is relaunched under the renewed login (its
-            // continuation follows), …
+            // continuation follows) — not through a `/login` already typed there, whose
+            // sign-in is the owner's to finish; the old login back in another tab meanwhile
+            // holds none of it — …
             action Relaunch when (
-                renewed == 1 && (wall == 1 || stood == 1) && login == 0 &&
-                Buggy == 0 && NoFollow == 0
+                renewed == 1 && (wall == 1 || stood == 1) && (login == 0 || elsewhere == 2) &&
+                track == 0 &&
+                (Buggy <= 2 || Buggy > 3) && NoFollow == 0
             ) {
                 login = 1;
                 wall = 0;
                 stood = 0;
                 back = 0;
                 renewed = 0;
-                asked = 0;
+                done = 0;
+                picker = 0;
+                left = 0;
+                elsewhere = 0;
                 window = if (phase == 1 && ClockAtWall == 0) { 0 } else { window };
                 dark = if (ClockAtWall == 0) { 0 } else { dark };
             }
             // …and one at an idle point, ahead of any wall, follows it.
             action Follow when (
-                renewed == 1 && wall == 0 && stood == 0 && Buggy == 0 && NoFollow == 0
+                renewed == 1 && wall == 0 && stood == 0 && (Buggy <= 2 || Buggy > 3) && NoFollow == 0
             ) {
                 login = 1;
                 renewed = 0;
-                asked = 0;
+                elsewhere = 0;
             }
             // At a point it reads no wall at, a continuation, never while a lost login's track
-            // stands and the screen does not say it is back, nor while a rostered login's wall
-            // stands, shown or hidden (`NoHold`: it does), nor while a renewed login stands
-            // ready (`NoFollow`: it continues on the dead one). Answered by the model, the login
-            // is back, the track ends and the notices are read; answered by the wall, its row
-            // and the transcript's word.
+            // stands and the screen does not say it is back (`NoHold`: it does), nor while a
+            // renewed login stands ready (`NoFollow`: it continues on the dead one). Answered by
+            // the model, the login is back, the track ends and the notices are read; answered by
+            // the wall, its row and the transcript's word.
             action Continue when (
-                (wall == 0 || Buggy == 1 || NoSee == 1) &&
-                (track == 0 || back == 1 || Buggy == 1 || NoHold == 1) &&
-                (rostered == 0 || stood == 0 || back == 1 || Buggy == 1 || NoHold == 1) &&
-                (renewed == 0 || Buggy == 1 || NoFollow == 1)
+                (wall == 0 || elsewhere == 2 || Buggy == 2 || NoSee == 1) &&
+                ((track == 0 && left == 0) || back == 1 || Buggy == 2 || NoHold == 1) &&
+                (renewed == 0 || Buggy == 3 || NoFollow == 1)
             ) {
                 futile = if (login == 0 && stood == 1) { 1 } else { futile };
                 stranded = if (renewed == 1 && login == 0) { 1 } else { stranded };
-                asked = if (login == 1) { 0 } else { asked };
                 untold = if (stood == 1 && told == 0) { 1 } else { untold };
                 wall = if (login == 1) { 0 } else { 1 };
                 stood = if (login == 1) { 0 } else { 1 };
                 back = 0;
+                done = 0;
+                picker = if (login == 1) { 0 } else { picker };
                 track = if (login == 1) { 0 } else { track };
+                left = if (login == 1) { 0 } else { left };
                 told = if (login == 1) { 0 } else { told };
+                elsewhere = if (login == 1) { 0 } else { elsewhere };
                 holding = if (login == 1 && (phase == 1 || phase == 2)) { 1 } else { holding };
-                dark = if (login == 0 && phase == 1 && window == 0) { 1 } else { dark };
+                // A login back that only another tab's screen said: this
+                // turn the model answers is its lift, as `Login successful`
+                // is ([`LoginBack`]).
+                window = if (
+                    login == 1 && stood == 1 && phase == 1 && (Buggy == 0 || Buggy > 1) &&
+                    ClockAtWall == 0
+                ) {
+                    0
+                } else {
+                    window
+                };
+                dark = if (login == 0 && phase == 1 && window == 0) {
+                    1
+                } else if (login == 1 && stood == 1 && (Buggy == 0 || Buggy > 1) && ClockAtWall == 0) {
+                    0
+                } else {
+                    dark
+                };
             }
 
             // The upgrade. A notice is never typed where the wall shows or stands (`NoGate`: it
@@ -1379,12 +1539,14 @@ pub fn harness_login_wall_model() -> Model {
                 ((wall == 0 && stood == 0) || Buggy == 1 || NoGate == 1) &&
                 (phase == 0 ||
                     (phase == 1 &&
-                        ((unread == 1 && Buggy == 0 && NoRefund == 0) ||
+                        ((unread == 1 && (Buggy == 0 || Buggy > 1) && NoRefund == 0) ||
                             (window == 1 && asks <= MaxAsks - 1))) ||
-                    (phase == 2 && unread == 1 && Buggy == 0 && NoRefund == 0))
+                    (phase == 2 && unread == 1 && (Buggy == 0 || Buggy > 1) && NoRefund == 0))
             ) {
                 blind = if (wall == 1 || stood == 1) { 1 } else { blind };
-                asks = if (phase == 1 && unread == 1 && Buggy == 0 && NoRefund == 0) {
+                asks = if (
+                    phase == 1 && unread == 1 && (Buggy == 0 || Buggy > 1) && NoRefund == 0
+                ) {
                     asks
                 } else if (phase == 2) {
                     got + 1
@@ -1438,9 +1600,14 @@ pub fn harness_login_wall_model() -> Model {
             invariant NoGiveUpUnread: spent == 0;
             invariant NoFutileContinue: futile == 0;
             invariant TheOwnerIsToldFirst: untold == 0;
-            invariant NoLoginTypedOnARoster: typedroster == 0;
             invariant NoSessionLeftOnADeadLogin: stranded == 0;
             invariant NoCheckUnderAnIdleLogin: checked == 0;
+            invariant NoLostLoginLeftSilent: silent == 0;
+            invariant LoginTypedOncePerLoss: relooped == 0;
+            invariant NoMethodGuessed: guessed == 0;
+            invariant NoLoginOverAPersonsCancel: overrode == 0;
+            invariant NoPersonsPickerAnswered: overpicked == 0;
+            invariant OneSignInPerLogin: doubled == 0;
         }
     }
 }

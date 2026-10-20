@@ -182,7 +182,7 @@ pub fn release_reads_build_dir(release: &str) -> bool {
 /// aside while its locks are held, then removed. Never follows a symlink and never leaves
 /// `root`. Mirror folders left empty go too.
 pub fn reclaim(root: &Path, home: Option<&Path>, now: SystemTime) -> Vec<PathBuf> {
-    reclaim_after(root, home, now, RECLAIM_GONE, &mut |_| true)
+    reclaim_after(root, home, now, RECLAIM_GONE, None, &mut |_| true)
 }
 
 /// [`reclaim`] when the volume is short of space (the window's disk watch, below its
@@ -198,7 +198,24 @@ pub fn reclaim_under_pressure(
     now: SystemTime,
     record: &mut dyn FnMut(&Path) -> bool,
 ) -> Vec<PathBuf> {
-    reclaim_after(root, home, now, RECLAIM_GONE_UNDER_PRESSURE, record)
+    reclaim_after(root, home, now, RECLAIM_GONE_UNDER_PRESSURE, None, record)
+}
+
+/// [`reclaim`] as the window's disk watch runs it: a gone workspace's build directory goes
+/// once unwritten for `gone_after` ([`RECLAIM_GONE`] while the volume is only low,
+/// [`RECLAIM_GONE_UNDER_PRESSURE`] below the floor), `record` asked first as in
+/// [`reclaim_under_pressure`]; and with `placing` (the home volume's device and a complete
+/// mount table), a workspace nested in a removed checkout is gone too
+/// ([`checkout::gone_placed`]).
+pub fn reclaim_watched(
+    root: &Path,
+    home: Option<&Path>,
+    now: SystemTime,
+    gone_after: Duration,
+    placing: Option<&checkout::Placing>,
+    record: &mut dyn FnMut(&Path) -> bool,
+) -> Vec<PathBuf> {
+    reclaim_after(root, home, now, gone_after, placing, record)
 }
 
 /// [`reclaim`], a gone workspace's build directory going once unwritten for `gone_after`
@@ -208,6 +225,7 @@ fn reclaim_after(
     home: Option<&Path>,
     now: SystemTime,
     gone_after: Duration,
+    placing: Option<&checkout::Placing>,
     record: &mut dyn FnMut(&Path) -> bool,
 ) -> Vec<PathBuf> {
     let mut removed = Vec::new();
@@ -217,6 +235,7 @@ fn reclaim_after(
             home,
             now,
             gone_after,
+            placing,
             record,
             removed: &mut removed,
         };
@@ -232,6 +251,8 @@ struct Sweep<'a> {
     now: SystemTime,
     /// How long a gone workspace's build directory must be unwritten.
     gone_after: Duration,
+    /// What places a workspace nested in a removed checkout ([`checkout::gone_placed`]).
+    placing: Option<&'a checkout::Placing>,
     /// Asked before each removal, its locks held: `false` keeps it.
     record: &'a mut dyn FnMut(&Path) -> bool,
     removed: &'a mut Vec<PathBuf>,
@@ -269,7 +290,7 @@ impl Sweep<'_> {
             let name = child.file_name().unwrap_or_default();
             if name == LEAF {
                 let Some(held) = workspace_of(root, dir)
-                    .and_then(|ws| unused(&ws, &child, home, now, self.gone_after))
+                    .and_then(|ws| unused(&ws, &child, home, now, self.gone_after, self.placing))
                 else {
                     continue;
                 };
@@ -323,10 +344,13 @@ fn unused(
     home: Option<&Path>,
     now: SystemTime,
     gone_after: Duration,
+    placing: Option<&checkout::Placing>,
 ) -> Option<Vec<crate::lock::Flock>> {
     let seen = look(leaf)?;
     let idle = age(now, seen.newest);
-    if idle < gone_after || (idle < RECLAIM_IDLE && checkout::gone(workspace, home).is_err()) {
+    if idle < gone_after
+        || (idle < RECLAIM_IDLE && checkout::gone_placed(workspace, home, placing).is_err())
+    {
         return None;
     }
     let held = seen
@@ -393,14 +417,25 @@ fn age(now: SystemTime, then: SystemTime) -> Duration {
     now.duration_since(then).unwrap_or(Duration::ZERO)
 }
 
-/// [`reclaim_under_pressure`] over this user's cache, now, `record` asked before each
-/// removal; nothing off macOS or without a home.
-pub fn reclaim_home_under_pressure(record: &mut dyn FnMut(&Path) -> bool) -> Vec<PathBuf> {
+/// [`reclaim_watched`] over this user's cache, now, `record` asked before each removal;
+/// nothing off macOS or without a home.
+pub fn reclaim_home_watched(
+    gone_after: Duration,
+    placing: Option<&checkout::Placing>,
+    record: &mut dyn FnMut(&Path) -> bool,
+) -> Vec<PathBuf> {
     if !cfg!(target_os = "macos") {
         return Vec::new();
     }
     aterm_types::dirs::home_dir().map_or_else(Vec::new, |home| {
-        reclaim_under_pressure(&cache_root(&home), Some(&home), SystemTime::now(), record)
+        reclaim_watched(
+            &cache_root(&home),
+            Some(&home),
+            SystemTime::now(),
+            gone_after,
+            placing,
+            record,
+        )
     })
 }
 

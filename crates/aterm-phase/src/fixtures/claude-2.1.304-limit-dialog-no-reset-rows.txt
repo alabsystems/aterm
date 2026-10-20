@@ -1,0 +1,31 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the usage-limit dialog at a five-hour wall with no limit reset on offer (the stub's account has none: the reset rows are first-party), auto-continue off in settings.json
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.Qz7n/proj
+
+
+❯ hi
+  ⎿  You've hit your session limit · resets 4:42pm (America/Los_Angeles)
+
+⏺ Usage limit reached · continuing automatically at 4:42pm · esc to cancel
+
+✻ Crunched for 0s · done 4:32 PM
+
+⏺ Automatic continue cancelled · /rate-limit-options to re-arm
+
+❯ hello again
+  ⎿  You've hit your session limit · resets 4:47pm (America/Los_Angeles)
+     /upgrade to increase your usage limit.
+
+✻ Sautéed for 0s · done 4:32 PM
+
+❯ /rate-limit-options
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  What do you want to do?
+
+  ❯ 1. Stop and wait for limit to reset
+    2. Wait here, then continue automatically at 4:47pm
+    3. Upgrade your plan
+
+  Enter to confirm · Esc to cancel

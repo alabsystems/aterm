@@ -77,6 +77,7 @@ impl Grid {
         for (i, line) in lines.iter().enumerate() {
             self.fill_row_from_line(row_u16(top + i), line, cols);
         }
+        self.paint_wrap_holes(row_u16(top)..row_u16(top + lines.len()));
 
         // Remove the recovered lines, ring (newest) first. Ring rows go only
         // after the fill: dropping them rotates `ring_head`, which the indices

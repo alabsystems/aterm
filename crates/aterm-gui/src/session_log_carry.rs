@@ -19,8 +19,8 @@
 //! fg pgid=<p> node=<r> name_fp=<hex>         (the group's latest name, fingerprinted)
 //! agent pgid=<p> node=<r> who=<program> by_screen=<0|1>
 //! tracker …                                         (aterm_slog::TurnTracker::carry_line)
-//! pending pgid=<p> name=<pct|-> word=<w> detail=<pct|-> at=<wall> seq=<n>
 //! typed input=<seq>,<wall> [input_by=<actor>] [input_cause=<id>] ctl=<seq>,<actor>,<ledger>,<wall> [ctl_cause=<id>]
+//! pending pgid=<p> name=<pct|-> word=<w> detail=<pct|-> at=<wall> seq=<n>
 //! ```
 //!
 //! Every stamp crosses as its wall time and is rebased onto the successor's
@@ -139,13 +139,13 @@ fn pct_or_dash(v: Option<&str>, max: usize) -> String {
 
 /// The most bytes of a waiting name's program name that cross (more than any
 /// program name a resolver gives).
-const PENDING_NAME_MAX: usize = 200;
+pub(super) const PENDING_NAME_MAX: usize = 200;
 /// The most bytes of a waiting name's verdict word that cross (a word is a
 /// few letters).
-const PENDING_WORD_MAX: usize = 32;
+pub(super) const PENDING_WORD_MAX: usize = 32;
 /// The most bytes of a waiting name's verdict detail that cross (a box's
 /// kind or a wall's reset; the run records at most `Key::Detail`'s 48).
-const PENDING_DETAIL_MAX: usize = 64;
+pub(super) const PENDING_DETAIL_MAX: usize = 64;
 // A `pending` line at its widest, every byte taking three, its numbers at
 // their widest, within the receiver's per-line bound with its `host ` tag.
 const _: () = assert!(
@@ -232,14 +232,17 @@ impl SessionLog {
             || "-".to_string(),
             |c| format!("{},{}", c.base, opt_wall(c.cursor)),
         );
+        // The remaining marks' last values ride as additive tokens (phase
+        // 3B, ruling S5: words, tenths and fingerprints, never text).
         out.push(format!(
-            "state v=1 origin={} opened={} root={} last_blk={} csnap={csnap} cmd_end={} arrivals={}",
+            "state v=1 origin={} opened={} root={} last_blk={} csnap={csnap} cmd_end={} arrivals={}{}",
             origin_word(self.origin),
             opt_wall(self.opened_wall),
             self.root_pgid,
             opt_wall(self.last_blk),
             opt_wall(self.cmd_end.map(|s| s.wall_ms)),
-            self.arrivals
+            self.arrivals,
+            self.observed.carry_tokens()
         ));
         if let Some(c) = self.cmd {
             out.push(format!(
@@ -266,17 +269,6 @@ impl SessionLog {
             ));
             out.push(a.tracker.carry_line(now));
         }
-        for p in &self.pending {
-            out.push(format!(
-                "pending pgid={} name={} word={} detail={} at={} seq={}",
-                p.pgid,
-                pct_or_dash(p.name.as_deref(), PENDING_NAME_MAX),
-                pct_or_dash(Some(&p.word), PENDING_WORD_MAX),
-                pct_or_dash(p.detail.as_deref(), PENDING_DETAIL_MAX),
-                p.at.wall_ms,
-                p.seq
-            ));
-        }
         // Only what can still attribute a turn crosses.
         let fresh = |at: Stamp| aterm_slog::attributes(at, now);
         let input = self.typed.input.filter(|(.., at)| fresh(*at));
@@ -301,6 +293,21 @@ impl SessionLog {
                 }
             }
             out.push(s);
+        }
+        // The waiting names last: each line is read on its own, and the
+        // lines above, present whenever their producer holds state, fit the
+        // carry's host bytes at their worst (`session_log_tests`), so a
+        // burst of wide names costs only names.
+        for p in &self.pending {
+            out.push(format!(
+                "pending pgid={} name={} word={} detail={} at={} seq={}",
+                p.pgid,
+                pct_or_dash(p.name.as_deref(), PENDING_NAME_MAX),
+                pct_or_dash(Some(&p.word), PENDING_WORD_MAX),
+                pct_or_dash(p.detail.as_deref(), PENDING_DETAIL_MAX),
+                p.at.wall_ms,
+                p.seq
+            ));
         }
         out
     }
@@ -394,6 +401,10 @@ impl SessionLog {
                              it goes on from the adoption"
                         );
                     }
+                    // The remaining marks' last values (phase 3B): absent
+                    // from an older line, so unknown, and written afresh.
+                    self.observed
+                        .read_carry(|k| kv(line, k).map(str::to_string));
                 }
                 "cmd" => {
                     self.cmd = read_cmd(line, &self.log, at);

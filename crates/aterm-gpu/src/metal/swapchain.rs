@@ -98,6 +98,19 @@ unsafe extern "C" {
     static kCGColorSpaceSRGB: *const c_void;
 }
 
+/// A borrowed `CFString` as an owned `String`, or `None` for NULL. A CFString
+/// is toll-free bridged to `NSString`, so [`super::ffi::ns_string_text`]
+/// reads it by its counted UTF-16 units, never as a C string.
+///
+/// # Safety
+/// `name` must be NULL or a live `CFString`.
+#[cfg(test)]
+unsafe fn cf_string_text(name: *const c_void) -> Option<String> {
+    // SAFETY: a live CFString is a live NSString to the runtime (toll-free
+    // bridged); the caller vouches for it, and it is copied out at once.
+    (!name.is_null()).then(|| unsafe { super::ffi::ns_string_text(Id::from_ptr(name.cast_mut())) })
+}
+
 /// `CGSize`: two `double`s, passed and returned in `v0`/`v1` on
 /// `aarch64-apple-darwin` like [`super::ffi::ClearColor`].
 #[repr(C)]
@@ -621,25 +634,15 @@ impl Swapchain {
     #[cfg(test)]
     pub(crate) fn colorspace_name(&self) -> Option<String> {
         // SAFETY: `colorspace` returns a +0 `CGColorSpaceRef` or NULL;
-        // `CGColorSpaceGetName` borrows a toll-free-bridged CFString, copied
-        // into an owned `String`. Nothing is retained or released.
+        // `CGColorSpaceGetName` borrows a CFString (or NULL) the colorspace
+        // owns, copied out at once. Nothing is retained or released.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> *mut c_void = checked_msg();
             let space = f(self.layer.id(), sel(c"colorspace"));
             if space.is_null() {
                 return None;
             }
-            let name = CGColorSpaceGetName(space);
-            if name.is_null() {
-                return None;
-            }
-            let utf8: unsafe extern "C-unwind" fn(Id, Sel) -> *const std::ffi::c_char =
-                checked_msg();
-            let p = utf8(Id::from_ptr(name.cast_mut().cast()), sel(c"UTF8String"));
-            if p.is_null() {
-                return None;
-            }
-            Some(std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned())
+            cf_string_text(CGColorSpaceGetName(space))
         }
     }
 
@@ -968,8 +971,24 @@ mod tests {
     use super::*;
     use crate::metal::ffi;
     use crate::metal::test_support::{
-        CellUniforms, as_bytes, device, plain_calayer, sublayer_count,
+        C_STRING_HOLES, CellUniforms, as_bytes, device, ns_string_of_units, plain_calayer,
+        sublayer_count,
     };
+
+    /// [`Swapchain::colorspace_name`]'s CFString is read by its counted UTF-16
+    /// units. CoreGraphics names only its own system colorspaces, so a bridged
+    /// `NSString` built from raw units stands in for the name.
+    #[test]
+    fn a_colorspace_name_is_read_whole() {
+        let _pool = ffi::AutoreleasePool::new();
+        // SAFETY: each `NSString` is live for its read, and a live NSString is
+        // a live CFString (toll-free bridged).
+        let read = C_STRING_HOLES
+            .map(|(units, _)| unsafe { cf_string_text(ns_string_of_units(units).id().as_ptr()) });
+        assert_eq!(read, C_STRING_HOLES.map(|(_, want)| Some(want.to_owned())));
+        // SAFETY: NULL is an accepted input.
+        assert_eq!(unsafe { cf_string_text(std::ptr::null()) }, None);
+    }
 
     /// The config refuses exactly what `CAMetalLayer` would throw on (or never
     /// vend a drawable for), with the reason in the message.

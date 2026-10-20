@@ -108,6 +108,10 @@ pub(crate) struct EncodeSession {
     queue: Obj,
     /// The process device-loss latch every submission answers to.
     latch: Arc<loss::LossLatch>,
+    /// The present being timed (`crate::gpu_time`), between
+    /// [`Self::open_gpu_frame`] and [`Self::seal_gpu_frame`]: every command
+    /// buffer committed meanwhile reports its GPU span to it.
+    gpu_frame: std::cell::Cell<Option<crate::gpu_time::FrameToken<'static>>>,
 }
 
 impl EncodeSession {
@@ -128,7 +132,32 @@ impl EncodeSession {
             latch.unbind_encode_session();
             return Err("MTLCommandQueue allocation failed".to_owned());
         };
-        Ok(Self { queue, latch })
+        Ok(Self {
+            queue,
+            latch,
+            gpu_frame: std::cell::Cell::new(None),
+        })
+    }
+
+    /// Start timing one present: open a `gpu_time` frame (only when a sink
+    /// listens) that every command buffer committed until
+    /// [`Self::seal_gpu_frame`] reports to. A frame left open by a present
+    /// that never sealed is sealed first, so it still settles.
+    pub(crate) fn open_gpu_frame(&self) -> Option<u64> {
+        if let Some(stale) = self.gpu_frame.take() {
+            stale.seal();
+        }
+        let token = crate::gpu_time::open_frame()?;
+        self.gpu_frame.set(Some(token));
+        Some(token.serial())
+    }
+
+    /// Stop timing the present [`Self::open_gpu_frame`] opened. Command buffers
+    /// committed after this are not part of it.
+    pub(crate) fn seal_gpu_frame(&self) {
+        if let Some(token) = self.gpu_frame.take() {
+            token.seal();
+        }
     }
 
     /// The session's latch, for wiring cross-checks (present compares it to
@@ -503,6 +532,10 @@ toTexture:destinationSlice:destinationLevel:destinationOrigin:",
     /// Commit. The returned [`Submitted`] is the non-blocking handle: wait on
     /// it, or poll [`Submitted::try_outcome`] while encoding the next frame.
     pub(crate) fn commit(self) -> Submitted {
+        // A timed present: the handler must be added before `commit`.
+        if let Some(token) = self.session.gpu_frame.get() {
+            report_gpu_span(self.cb.id(), token);
+        }
         // SAFETY: `commit` is a void message on the owned command buffer; all
         // encoders are ended (the `&mut` borrow rule) barring `mem::forget`.
         unsafe {
@@ -514,6 +547,49 @@ toTexture:destinationSlice:destinationLevel:destinationOrigin:",
             latch: Arc::clone(&self.session.latch),
             settled: std::cell::Cell::new(None),
         }
+    }
+}
+
+/// Hang `addCompletedHandler:` on the uncommitted `cb`, reporting its
+/// `GPUEndTime - GPUStartTime` to `token`'s frame (`crate::gpu_time`). The
+/// frame is held for the part before the handler can fire; a command buffer
+/// that errored, or a block that could not be built, completes the part as a
+/// failure so the frame is dropped rather than under-reported.
+fn report_gpu_span(cb: Id, token: crate::gpu_time::FrameToken<'static>) {
+    token.hold();
+    // Defined outside any `unsafe` block so its unsafe operations, the two
+    // clock reads, carry their own scope.
+    let handler = move |done: Id| {
+        let span = if loss::command_buffer_status(done) == loss::STATUS_COMPLETED {
+            // SAFETY: Metal passes the live, completed command buffer;
+            // `GPUStartTime` and `GPUEndTime` are `CFTimeInterval` (double)
+            // getters, valid once the buffer completed.
+            let (start_s, end_s) = unsafe {
+                let get: unsafe extern "C-unwind" fn(Id, Sel) -> f64 = checked_msg();
+                (
+                    get(done, sel(c"GPUStartTime")),
+                    get(done, sel(c"GPUEndTime")),
+                )
+            };
+            crate::gpu_time::span_ns(start_s, end_s)
+        } else {
+            None
+        };
+        token.complete(span);
+    };
+    // SAFETY: `MTLCommandBufferHandler` is `void (^)(id<MTLCommandBuffer>)` —
+    // exactly `(Id) -> ()`, the prototype this block is invoked with. The
+    // closure captures one `Copy` token, does not allocate or panic, and the
+    // sink contract forbids blocking or unwinding.
+    let Some(block) = (unsafe { aterm_objc::RcBlock::new1(handler) }) else {
+        token.complete(None);
+        return;
+    };
+    // SAFETY: `addCompletedHandler:` on an uncommitted buffer copies (retains)
+    // the block, so ours is released independently when `block` drops.
+    unsafe {
+        let add: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::BlockPtr) = checked_msg();
+        add(cb, sel(c"addCompletedHandler:"), block.as_block_ptr());
     }
 }
 

@@ -8,7 +8,7 @@ struct Scratch(aterm_tempfile::TempDir);
 
 impl Scratch {
     fn new(tag: &str) -> Self {
-        let base = std::fs::canonicalize(std::env::temp_dir()).expect("canonical scratch");
+        let base = crate::supervise::test_canonical(&std::env::temp_dir());
         Self(
             aterm_tempfile::Builder::new()
                 .prefix(&format!("aterm-git-config-{tag}-"))
@@ -450,6 +450,20 @@ fn an_executable_post_index_change_hook_is_seen() {
             .index_hook
             .is_some()
     );
+}
+
+/// A `/`-rooted directory names no drive on Windows (Git Bash's `/c/x` is
+/// `C:\x`): a git read placed there is refused, never read at this process's
+/// `\c\x`. Negative control: a drive path is read.
+#[cfg(windows)]
+#[test]
+fn a_slash_rooted_directory_is_refused_on_windows() {
+    let why = isolated()
+        .raw_git_view(Path::new("/c/Users"), &|_| false)
+        .expect_err("no drive");
+    assert!(why.contains("names no drive"), "{why}");
+    let r = repo("drive");
+    assert!(isolated().raw_git_view(r.0.path(), &|_| false).is_ok());
 }
 
 #[test]

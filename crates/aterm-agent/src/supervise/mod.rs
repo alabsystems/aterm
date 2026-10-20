@@ -20,11 +20,11 @@
 //! * [`phase::worker_phase`]: busy / prompt / limited / idle / question, from one
 //!   read; [`phase::survey_open`]: the session survey; [`phase::context_left`]:
 //!   context left before auto-compact.
-//! * [`run::Session`]: `await-turn`, `supervise` and `watch`, over the control
-//!   verbs.
+//! * [`run::Session`]: the loop over the control verbs that the window's host
+//!   runs on every agent session ([`run::Session::run_hosted`]), and that
+//!   `aterm drive phase` and `answer` read and type through.
 //! * [`report`]: what the worker said since the manager's turn, with the rows a
 //!   fullscreen app scrolled off.
-//! * [`mail`]: `watch --mail`'s lane on the manager's inbox, and `task`.
 //! * [`limit`]: when a limit notice says it resets, as a Unix time.
 
 pub mod approvals;
@@ -40,7 +40,6 @@ pub mod journal;
 pub mod ledger;
 pub mod ledger_html;
 pub mod limit;
-pub mod mail;
 pub mod memory;
 pub mod policy;
 pub mod report;
@@ -54,25 +53,25 @@ pub use classify::{DEFAULT_PYTHON_ALLOW, classify_command_with};
 pub use config::{Autopilot, LandAt, SupervisorConfig};
 pub use journal::{Journal, read_journal};
 pub use ledger::{
-    ClockAnchor, Format as LedgerFormat, LedgerHost, LedgerOpts, gather, parse_since,
+    ClockAnchor, Format as LedgerFormat, LedgerHost, LedgerOpts, LedgerSource, gather, parse_since,
     render as render_ledger,
 };
-pub use mail::{DEFAULT_IDLE_GRACE, DEFAULT_REPORT_WINDOW, MailOpts, TaskOpts, task};
 pub use phase::{
     Busy, Phase, Zone, busy_signal, context_left, is_placeholder, limit_notice, survey_open,
     transcript_end, worker_phase,
 };
 pub use policy::approval::QuestionPriority;
+pub use policy::turn_end::WaitKind;
 pub use report::{DEFAULT_MAX_ROWS, Mark, Marker, Reason, Report, ReportOpts};
 pub use run::{
-    ATTENTION_OWNER, AnswerOpts, ApprovalEnv, CLAIM_HELD, CLAIM_RENEW, Caps, Ctl, CtlReply,
-    EXIT_NO_BOX, EXIT_NOT_SERVED, EXIT_REFUSED, EXIT_TIMEOUT, Fold, Guard, HostStep, IdleHost,
-    IdlePoint, Interrupter, NoLane, ProbeMiss, ProbeNo, RELAUNCH_ATTENTION_OWNER, ReportBrief,
-    Session, SessionSetup, StuckSurvey, SuperviseOpts, Turn, UNBOUNDED, UsageSeen, WaitPlan,
-    WorkerSource, event_line, exit_reason, render_phase, render_phase_and_survey, render_result,
-    render_result_mail, reported_event_line,
+    ATTENTION_OWNER, ATTENTION_PREFIX, AnswerOpts, ApprovalEnv, CLAIM_HELD, CLAIM_RENEW, Caps, Ctl,
+    CtlReply, EXIT_NO_BOX, EXIT_NOT_SERVED, EXIT_REFUSED, EXIT_TIMEOUT, Guard, HELD_HEAD, HostStep,
+    IdleHost, IdlePoint, Interrupter, ProbeMiss, ProbeNo, RELAUNCH_ATTENTION_OWNER, STARTUP_HEAD,
+    Session, SessionSetup, StallSeen, StuckSurvey, SuperviseOpts, Turn, UNBOUNDED, UsageSeen,
+    WaitPlan, WorkerSource, deadline_attention, event_line, exit_reason, mark_task_exited,
+    render_phase, render_phase_and_survey,
 };
-pub use transport::{Endpoint, RelayCtl, Transport};
+pub use transport::{Endpoint, RelayCtl};
 
 /// A scratch path of one call's own, for a test:
 /// `<tmp>/aterm-<kind>-<tag>-<pid>-<n>`, `<n>` a per-process call count.
@@ -86,6 +85,21 @@ pub(crate) fn test_scratch_path(kind: &str, tag: &str) -> std::path::PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("aterm-{kind}-{tag}-{}-{n}", std::process::id()))
+}
+
+/// `path` canonicalized, for a test: every link resolved, as the policy's probes
+/// see it. Windows names a canonical path `\\?\C:\…`, which git takes for no
+/// path (a `GIT_CONFIG_GLOBAL`, an `include.path`, a submodule's URL); there it
+/// is the drive path it stands for.
+#[cfg(test)]
+pub(crate) fn test_canonical(path: &std::path::Path) -> std::path::PathBuf {
+    let real = std::fs::canonicalize(path).expect("canonical");
+    let drive = real
+        .to_str()
+        .and_then(|s| s.strip_prefix(r"\\?\"))
+        .filter(|d| cfg!(windows) && !d.starts_with(r"UNC\"))
+        .map(std::path::PathBuf::from);
+    drive.unwrap_or(real)
 }
 
 /// A scratch directory of one call's own, created, and removed on drop (the guard

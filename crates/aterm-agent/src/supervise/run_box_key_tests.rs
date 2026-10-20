@@ -143,47 +143,44 @@ fn edit_other_diff() -> Vec<String> {
 }
 
 /// Every box handed over (`approve = "none"`): each box a look finds is an
-/// `EVENT prompt`, a badge and an ask.
+/// `EVENT prompt` and a badge.
 fn handing() -> SuperviseOpts {
     SuperviseOpts {
         policy: SupervisorConfig {
             approve: Approve::None,
-            ..auto(30, None).policy
+            ..auto(30).policy
         },
-        ..auto(30, None)
+        ..auto(30)
     }
 }
 
-/// What one watch asked the manager.
+/// What one watch handed over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Asked {
     /// `EVENT prompt` lines printed.
     prompts: usize,
-    /// `meta set attention owner=supervisor …` requests (badges raised).
+    /// `meta set attention owner=supervisor …` requests (badges raised: the
+    /// one ask a point gets).
     sets: usize,
-    /// `post to=@s-9 kind=ask --wait=0 …` requests (asks posted).
-    posts: usize,
     /// The journal's `escalated` and `cleared` records.
     escalated: usize,
     cleared: usize,
 }
 
 impl Asked {
-    /// `n` prompts, badges and asks; `n` escalations; `cleared` closes.
+    /// `n` prompts and badges; `n` escalations; `cleared` closes.
     fn each(n: usize, cleared: usize) -> Self {
         Self {
             prompts: n,
             sets: n,
-            posts: n,
             escalated: n,
             cleared,
         }
     }
 }
 
-/// One watch over `m` under `opts`, the manager `@s-9` (the fabric
-/// connected, the mock's default) and a journal of its own, `setup` run on
-/// the session first: what it asked, and the lines it printed.
+/// One watch over `m` under `opts` and a journal of its own, `setup` run on
+/// the session first: what it handed over, and the lines it printed.
 fn watched(
     tag: &str,
     m: &mut Mock,
@@ -195,10 +192,7 @@ fn watched(
         journal: Some(path.clone()),
         ..opts.clone()
     };
-    let (lines, _) = watch_lines_with(m, &opts, |s| {
-        s.set_manager(Some("@s-9".to_string()));
-        setup(s);
-    });
+    let (lines, _) = watch_lines_with(m, &opts, setup);
     let (records, _) = journal_records(&path);
     let _ = std::fs::remove_dir_all(&dir);
     let kind = |k: &str| records.iter().filter(|r| r.kind == k).count();
@@ -208,7 +202,6 @@ fn watched(
             .filter(|l| l.starts_with("EVENT prompt "))
             .count(),
         sets: count(m, "meta set attention owner=supervisor "),
-        posts: count(m, "post to=@s-9 kind=ask --wait=0 "),
         escalated: kind("escalated"),
         cleared: kind("cleared"),
     };
@@ -428,7 +421,7 @@ fn a_box_asked_again_after_work_waits_the_settle_again() {
     m.vanish_after = Some(1);
     let mut s = session(&mut m, None);
     s.set_box_settle(settle);
-    let _ = s.supervise(&full_power_opts(None));
+    let _ = s.supervise(&full_power_opts());
     drop(s);
     assert_eq!(m.presses().len(), 2, "{:#?}", m.requests);
     let presses: Vec<usize> = m
@@ -497,6 +490,37 @@ fn a_box_asked_again_after_work_waits_the_settle_again() {
     assert!(
         settled_between(&m, second_box_read, badges[1]),
         "the second box waited its own settle: {:#?}",
+        m.requests
+    );
+
+    // Handed over, another box drawn straight over the first (no read between without a
+    // box): a new mount, its badge only after its own settle.
+    let mut m = Mock::new(vec![busy_screen(), bash_one_row(), f::screen(f::BOX_FETCH)]);
+    m.attention_gates = vec![(1, 0), (2, 1)];
+    m.stall_sleep = Some(settle);
+    m.vanish_after = Some(2);
+    let (a, lines) = watched("box-key-settle-other", &mut m, &handing(), |s| {
+        s.set_box_settle(settle);
+    });
+    assert_eq!(a, Asked::each(2, 1), "{lines:#?}\n{:#?}", m.requests);
+    let badge = m
+        .requests
+        .iter()
+        .rposition(|r| r.starts_with("meta set attention owner=supervisor "))
+        .expect("the second badge");
+    let other_box_read = m
+        .requests
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.starts_with("text "))
+        .map(|(i, _)| i)
+        .zip(&m.reads)
+        .find(|(_, (script, _))| *script == 2)
+        .map(|(i, _)| i)
+        .expect("the other box's first read");
+    assert!(
+        settled_between(&m, other_box_read, badge),
+        "the other box waited its own settle: {:#?}",
         m.requests
     );
 }
@@ -706,8 +730,8 @@ type KeyOf<'k> = &'k dyn Fn(&[String]) -> String;
 ///   box read is `NextBox` (another request: the next the model draws) or `Redraw`, then
 ///   `Look`, and before the `Look` the model's `key == handed` must hold exactly when `key` of
 ///   this screen equals `key` of the box last looked at;
-/// - the asks the model counts at a read must be the `post … kind=ask` the real loop sent
-///   between that read and the next.
+/// - the asks the model counts at a read must be the badges (`meta set attention
+///   owner=supervisor …`) the real loop raised between that read and the next.
 ///
 /// Every invariant is checked at every state. `key` `None` walks the model alone (the dials'
 /// negative controls). `Ok` the asks the model counts; `Err` the first thing broken, its
@@ -731,7 +755,7 @@ fn walk_reads(
         .requests
         .iter()
         .enumerate()
-        .filter(|(_, r)| r.starts_with("post to=@s-9 kind=ask "))
+        .filter(|(_, r)| r.starts_with("meta set attention owner=supervisor "))
         .map(|(i, _)| i)
         .collect();
     let mut st = model.init_state();
@@ -772,7 +796,7 @@ fn walk_reads(
                     ));
                 }
                 if posted != 0 {
-                    return Err(format!("asks: {posted} posted after the wait's read {k}"));
+                    return Err(format!("asks: {posted} badged after the wait's read {k}"));
                 }
             }
             continue;
@@ -818,7 +842,7 @@ fn walk_reads(
         let asked = past + st["asks"] - before;
         if key.is_some() && asked != posted {
             return Err(format!(
-                "asks: the model asks {asked} at read {k} (script {i}), the loop posted {posted}"
+                "asks: the model asks {asked} at read {k} (script {i}), the loop badged {posted}"
             ));
         }
     }
@@ -997,7 +1021,7 @@ fn tier1_the_box_is_asked_once_per_request() {
         );
         let n = usize::try_from(model_asks).expect("asks");
         assert_eq!(
-            (a.posts, a.prompts),
+            (a.sets, a.prompts),
             (n, n),
             "{tag}: {lines:#?}\n{:#?}",
             m.requests
@@ -1017,4 +1041,25 @@ fn tier1_the_box_is_asked_once_per_request() {
             }
         }
     }
+}
+
+/// A box drawn as one row has no row under its header to anchor a wait on
+/// ([`box_anchor`]): the MEASURED 40x6 frame of Claude Code 2.1.302's MCP
+/// server dialog ([`f::MCP_SERVER_NARROW`]) drawn only as far as the
+/// cursor's row (`❯ Continue without using this MCP`, the rows under it not
+/// yet drawn) reads a box whose span is that one row, and gets no anchor:
+/// before, the rows under its header were sliced backwards and the
+/// supervisor panicked. NEGATIVE CONTROL: the frame drawn whole is anchored.
+#[test]
+fn a_box_drawn_as_one_row_has_no_anchor() {
+    let whole = f::screen(f::MCP_SERVER_NARROW[2]);
+    let half: Vec<String> = whole
+        .iter()
+        .enumerate()
+        .map(|(i, r)| if i <= 1 { r.clone() } else { String::new() })
+        .collect();
+    let claude = aterm_phase::ClaudeReader;
+    assert_eq!(claude.prompt(&half).map(|p| p.span), Some((1, 1)));
+    assert_eq!(box_anchor(&claude, &half), None);
+    assert!(box_anchor(&claude, &whole).is_some(), "{whole:#?}");
 }

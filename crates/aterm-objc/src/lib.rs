@@ -149,7 +149,7 @@ pub mod view;
 pub mod wake_timer;
 pub(crate) mod weak;
 
-pub use block::{BlockPtr, RcBlock};
+pub use block::{BlockFn, BlockPtr, IntoBlock, RcBlock};
 pub use declare::{
     ClassBuilder, ClassMeta, IvarSlot, MainThread, abort_on_unwind, begin, send_super_dealloc,
     super_of,
@@ -163,11 +163,11 @@ pub use runtime::{
     AutoreleasePool, ClassPtr, Id, IvarPtr, MsgFn, Obj, ObjcSuper, ProtocolPtr, Sel, autorelease,
     autoreleasepool, class, class_methods, class_name, class_of, class_protocols, method_imp,
     method_types, msg, msg_super, ns_error_string, ns_string, ns_string_to_rust, protocol,
-    protocol_method_types, protocol_or_register, protocols_registered_by_aterm, returns_indirectly,
-    superclass_of,
+    protocol_method_extended_types, protocol_method_types, protocol_or_register,
+    protocols_registered_by_aterm, returns_indirectly, superclass_of,
 };
 pub use sel_cache::SelCache;
-pub use send::{CheckedFn, Receiver, checked_msg};
+pub use send::{CheckedFn, Receiver, block_check, block_signatures, checked_msg, prototype_check};
 pub use swizzle::{Imp, MethodFn, Swizzle, SwizzleError, SwizzleSite, owning_class};
 pub use view::HasNsView;
 pub use wake_timer::{WakeArm, WakePlan, WakeTarget, WakeTimer};

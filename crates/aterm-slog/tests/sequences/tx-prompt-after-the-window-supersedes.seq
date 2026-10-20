@@ -1,0 +1,12 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# S13: a prompt 6 s after its turn opened is not that turn's: the turn
+# closes superseded and the vendor turn opens its own.
+bind 0
+see busy
+wait 6000
+tx prompt v1
+expect open t1 turn src=screen at=0
+expect close t1 turn out=superseded dur_ms=6000 by=vendor
+expect open t2 turn vref=v1 src=transcript at=6000
+tx end
+expect close t2 turn out=done

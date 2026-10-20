@@ -11,10 +11,13 @@
 //!
 //! The domain, fixed so a rerun measures the same thing:
 //!
-//! - faces: every `.ttf`, `.otf`, `.ttc` and `.otc` under
-//!   `/System/Library/Fonts` (with `Supplemental`) and `/Library/Fonts`, and
-//!   aterm-render's committed fonts (`assets/`, `tests/fixtures/`), every face
-//!   of a collection;
+//! - faces: every `.ttf`, `.otf`, `.ttc` and `.otc` under [`face_files`]'s
+//!   roots: the system font directories of macOS (`/System/Library/Fonts`
+//!   with `Supplemental`, and `/Library/Fonts`), Linux (`/usr/share/fonts`)
+//!   and Windows (`C:\Windows\Fonts`), whichever this host has,
+//!   aterm-render's committed fonts (`assets/`, `tests/fixtures/`), and any
+//!   directory named after the aterm-render directory on the command line;
+//!   every face of a collection;
 //! - instances: the default, and on a variable face each axis alone at its
 //!   minimum and at its maximum, and `wght` 700 where the face has it;
 //! - sizes 11, 16 and 23 px; targets normal and light at every instance,
@@ -83,15 +86,20 @@ fn draw_carve(
     Some(h.hex())
 }
 
-fn face_files(dir: &str) -> Vec<String> {
+/// Every font file under this host's system font directories (an absent one
+/// is skipped), aterm-render's committed fonts under `dir`, and `extra`,
+/// sorted. `budgets` walks the same files.
+pub(crate) fn face_files(dir: &str, extra: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let roots = [
         "/System/Library/Fonts".to_string(),
         "/Library/Fonts".to_string(),
+        "/usr/share/fonts".to_string(),
+        "C:\\Windows\\Fonts".to_string(),
         format!("{dir}/assets"),
         format!("{dir}/tests/fixtures"),
     ];
-    let mut stack: Vec<std::path::PathBuf> = roots.iter().map(Into::into).collect();
+    let mut stack: Vec<std::path::PathBuf> = roots.iter().chain(extra).map(Into::into).collect();
     while let Some(d) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&d) else {
             continue;
@@ -110,6 +118,7 @@ fn face_files(dir: &str) -> Vec<String> {
         }
     }
     out.sort();
+    out.dedup();
     out
 }
 
@@ -126,10 +135,10 @@ struct Tally {
     instance_mismatch: usize,
 }
 
-pub(crate) fn run(dir: &str) {
+pub(crate) fn run(dir: &str, extra: &[String]) {
     let mut t = Tally::default();
     let mut report: Vec<String> = Vec::new();
-    for path in face_files(dir) {
+    for path in face_files(dir, extra) {
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };

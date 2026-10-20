@@ -16,12 +16,14 @@
 //!   pulls the newest history back in until the trailing-blank band returns to
 //!   its pre-resize count.
 //!
-//! Both run inside the synchronous width-reflow resize; the offloaded path runs
-//! the fill at re-attach against the `pending_fill_target` captured at detach.
+//! Both run inside the synchronous width-reflow resize; inside an offloaded
+//! reflow's detach window the history is with the job, so the fill comes up
+//! short and the re-attach pays what is owed ([`FillDebt`]).
 
 use aterm_scrollback::Line;
 
 use super::row_u16;
+use super::state::FillDebt;
 use super::{Grid, LineSize};
 use crate::Damage;
 
@@ -59,17 +61,7 @@ impl Grid {
     /// just took (`take_scrollback_lines` / `take_ring_scrollback_lines`).
     // COST: O(belt rows × cols) — bounded by the viewport height.
     pub(super) fn take_boundary_continuation_lines(&mut self) -> Vec<Line> {
-        let visible = usize::from(self.storage.visible_rows).min(self.storage.rows.len());
-        let cursor_row = usize::from(self.storage.cursor.row);
-        let mut belt = 0usize;
-        // Content coordinates, as in the extraction below (see
-        // `trailing_blank_rows_below_cursor`).
-        while belt < visible.min(cursor_row) {
-            match self.storage.row_at_screen(row_u16(belt)) {
-                Some(r) if r.is_wrapped() && r.line_size() == LineSize::SingleWidth => belt += 1,
-                _ => break,
-            }
-        }
+        let belt = self.boundary_continuation_rows();
         if belt == 0 {
             return Vec::new();
         }
@@ -118,6 +110,64 @@ impl Grid {
                 .saturating_sub(belt_u16);
         }
         lines
+    }
+
+    /// How many rows [`Self::take_boundary_continuation_lines`] lifts: the
+    /// maximal prefix of visible rows that are wrapped single-width
+    /// continuations, strictly above the cursor row.
+    pub(super) fn boundary_continuation_rows(&self) -> usize {
+        let visible = usize::from(self.storage.visible_rows).min(self.storage.rows.len());
+        let cursor_row = usize::from(self.storage.cursor.row);
+        let mut belt = 0usize;
+        // Content coordinates, as the extraction reads them (see
+        // `trailing_blank_rows_below_cursor`).
+        while belt < visible.min(cursor_row) {
+            match self.storage.row_at_screen(row_u16(belt)) {
+                Some(r) if r.is_wrapped() && r.line_size() == LineSize::SingleWidth => belt += 1,
+                _ => break,
+            }
+        }
+        belt
+    }
+
+    /// The rows at `new_cols` of the lines a rows-only shrink just demoted:
+    /// the `demoted` history rows under the `pushed` newest (the bottom-push
+    /// corner rotates its rows in after them). Each logical line that opens
+    /// among them counts whole, its tail still on the screen (the rows
+    /// [`Self::take_boundary_continuation_lines`] lifts) with it, rewrapped as
+    /// the width change rewraps it. A demoted row that continues an older
+    /// history line is that line's, which one pass lifted off the screen too,
+    /// so it counts nothing. A row that cannot be read counts nothing.
+    // COST: O((demoted + belt rows) × cols) — bounded by the viewport height.
+    pub(super) fn demoted_rows_at(&self, pushed: u16, demoted: u16, new_cols: u16) -> u16 {
+        let mut lines: Vec<Line> = (0..usize::from(demoted))
+            .rev()
+            .filter_map(|i| {
+                self.try_history_line_rev(usize::from(pushed) + i)
+                    .ok()
+                    .flatten()
+                    .map(std::borrow::Cow::into_owned)
+            })
+            .collect();
+        let Some(head) = lines.iter().position(|line| !line.is_wrapped()) else {
+            return 0;
+        };
+        lines.drain(..head);
+        for r in 0..self.boundary_continuation_rows() {
+            let screen_row = row_u16(r);
+            let Some(row) = self.storage.row_at_screen(screen_row) else {
+                break;
+            };
+            let extras = Self::extract_row_extras(row, &self.storage.extras, screen_row);
+            let len = super::scrollback_reflow::history_row_len(
+                row,
+                self.storage.row_at_screen(screen_row + 1),
+            );
+            lines.push(Self::row_to_line_with_stored_extras_at_len(
+                row, &extras, len,
+            ));
+        }
+        row_u16(super::scrollback_reflow::reflow_scrollback_lines(&lines, new_cols).len())
     }
 
     /// Pull the newest history lines back into the top of the viewport until the
@@ -189,6 +239,7 @@ impl Grid {
             }
             self.fill_row_from_line(row_u16(i), line, cols);
         }
+        self.paint_wrap_holes(0..row_u16(pull));
 
         // Remove the pulled lines from history — ring first (they are the
         // newest), then the tiered store for any remainder.
@@ -233,12 +284,165 @@ impl Grid {
         pull
     }
 
-    /// Drop the offloaded reflow's deficit-fill debt. An op that mints genuine
-    /// blank rows during the detach window (ED/DECSED 0 and 2, DL, SU) calls this:
-    /// filling them would resurrect pre-clear history. No-op outside a detach.
+    /// Bring up to `want` of the newest history lines held past the ring (the
+    /// lazy buffer's staged rows, then the tiered store's) into the front of
+    /// the ring, oldest first, so a rows-only grow reveals them as it reveals
+    /// ring rows: the reveal draws on history wherever the grid keeps it, as
+    /// the deficit fill does. Without it a grid whose history had gone to its
+    /// store (a rewrap, a restore from a checkpoint) or whose demoted rows the
+    /// ring could not hold grew by appending blanks where the same grid with a
+    /// larger ring revealed history. Returns how many lines came.
+    ///
+    /// The store is reached only through an empty lazy buffer (its lines sit
+    /// behind the staged ones and an open flood cut's marker, which stays). The
+    /// lines move between tiers only, so every retained line keeps its absolute
+    /// row and the counter does not move. Nothing moves during a detach window
+    /// (the store is with the worker) or when a line cannot be read.
+    // COST: O(want × cols) for the lines, plus one splice of the ring's rows;
+    // `want` is bounded by the grow.
+    pub(super) fn pull_history_into_ring(&mut self, want: usize) -> usize {
+        if want == 0 || self.storage.scrollback_detached_for_reflow {
+            return 0;
+        }
+        let staged = self.storage.lazy_buffer.staged_rows();
+        let from_lazy = want.min(staged);
+        let from_store = if from_lazy == self.storage.lazy_buffer.len() {
+            let held = self
+                .storage
+                .scrollback
+                .as_ref()
+                .map_or(0, aterm_scrollback::ScrollbackStorage::line_count);
+            (want - from_lazy).min(held)
+        } else {
+            0
+        };
+        let pull = from_lazy + from_store;
+        if pull == 0 {
+            return 0;
+        }
+        // Read every line before any destructive step, oldest first: a decode
+        // failure moves nothing.
+        let ring = self.storage.ring_buffer_scrollback();
+        let mut lines: Vec<Line> = Vec::with_capacity(pull);
+        for i in (0..pull).rev() {
+            match self.try_history_line_rev(ring + i) {
+                Ok(Some(line)) => lines.push(line.into_owned()),
+                Ok(None) | Err(_) => return 0,
+            }
+        }
+        self.storage
+            .lazy_buffer
+            .drain_back(from_lazy)
+            .for_each(drop);
+        if from_store > 0
+            && let Some(store) = self.storage.scrollback.as_mut()
+            && let Err(error) = store.remove_newest(from_store)
+        {
+            // Lines remain duplicated in history rather than lost.
+            aterm_log::warn!("rows grow: failed to remove {from_store} history lines: {error}");
+        }
+        let cols = self.storage.cols;
+        self.seat_lines_at_ring_front(&lines, cols)
+    }
+
+    /// The rows a detach window owes its re-attach's fill as a resize pass
+    /// begins ([`FillDebt`]). Of the trimmed rows owed back, only those the
+    /// rows hand-back still owes can stand for owed rows: output that scrolled
+    /// or a rewrap that used trimmed rows up took them first.
+    pub(super) fn fill_debt_at_pass_start(&mut self) -> usize {
+        if !self.storage.scrollback_detached_for_reflow {
+            return 0;
+        }
+        let trimmed = self.trimmed_rows();
+        let debt = &mut self.storage.fill_debt;
+        debt.trimmed = debt.trimmed.min(trimmed);
+        debt.rows
+    }
+
+    /// Settle a detach window's fill debt after the rows move of a rows-only
+    /// pass inside it (`grid::resize_handback`'s edge moves). A shrink trims
+    /// the blank rows the synchronous resize trims, then those that stand for
+    /// owed rows, which that resize demotes instead: no longer owed, but the
+    /// trimmed rows a later grow appends back are owed again, where that
+    /// resize reveals the demoted rows. A grow owes the `owed` rows it
+    /// appended for history the job holds (`pull_history_into_ring` moves
+    /// nothing inside a window), which the synchronous grow reveals.
+    pub(super) fn settle_fill_debt_rows(&mut self, owed: usize) {
+        if !self.storage.scrollback_detached_for_reflow {
+            return;
+        }
+        let handed_back = usize::from(self.storage.last_resize_shape.appended).saturating_sub(owed);
+        let trailing = self.trailing_blank_rows_below_cursor();
+        let debt = &mut self.storage.fill_debt;
+        let kept = debt.rows.min(trailing);
+        debt.trimmed = debt.trimmed.saturating_add(row_u16(debt.rows - kept));
+        let again = handed_back.min(usize::from(debt.trimmed));
+        debt.trimmed -= row_u16(again);
+        debt.rows = kept + owed + again;
+    }
+
+    /// A width pass's bottom-anchoring fill: pull the newest history back
+    /// until the trailing band holds the `pre` blank rows it measured before
+    /// the rows moved and the `refilled` blanks it put back. Inside a detach
+    /// window the synchronous pass measured `owed` fewer (the rows owed then
+    /// stand for its history rows), and of the blanks put back, those that
+    /// stood for owed rows (`refill_owed`, `Refill`) are demoted history rows
+    /// it pulled back; what the window cannot fill from the rows it holds is
+    /// owed to the re-attach.
+    pub(super) fn fill_after_width_pass(
+        &mut self,
+        owed: usize,
+        pre: usize,
+        refilled: usize,
+        refill_owed: u16,
+    ) {
+        let back = refilled.min(usize::from(refill_owed));
+        let target = pre - owed.min(pre) + refilled - back;
+        self.fill_viewport_deficit_from_history(target);
+        if self.owe_fill_after_width_pass(target) {
+            let debt = &mut self.storage.fill_debt;
+            debt.trimmed = debt.trimmed.saturating_sub(row_u16(back));
+        }
+    }
+
+    /// After a width pass's bottom-anchoring fill toward `target` blank rows
+    /// under the cursor: inside a detach window, owe the re-attach the blank
+    /// rows past `target` the fill could not pull from the rows the grid holds
+    /// ([`FillDebt`]). Whether a detach window is open.
+    pub(super) fn owe_fill_after_width_pass(&mut self, target: usize) -> bool {
+        if !self.storage.scrollback_detached_for_reflow {
+            return false;
+        }
+        let trailing = self.trailing_blank_rows_below_cursor();
+        self.storage.fill_debt.rows = trailing.saturating_sub(target);
+        true
+    }
+
+    /// Pay a detach window's fill debt at the re-attach that brought the
+    /// history back: pull as many history rows down over the blank rows that
+    /// stood for them, as the synchronous resizes revealed and filled them.
+    /// Returns the rows pulled.
+    pub(super) fn pay_fill_debt(&mut self) -> usize {
+        let owed = std::mem::take(&mut self.storage.fill_debt).rows;
+        if owed == 0 {
+            return 0;
+        }
+        let trailing = self.trailing_blank_rows_below_cursor();
+        self.fill_viewport_deficit_from_history(trailing - owed.min(trailing))
+    }
+
+    /// Drop the offloaded reflow's fill debt. An op that erases the rows it
+    /// stands for, moves the screen past them or addresses the screen around
+    /// them during the detach window (ED and DECSED 2, SU, absolute cursor
+    /// positioning to another row through [`Grid::set_cursor`], a width change
+    /// that pushes rows off the bottom) calls this:
+    /// filling them would resurrect pre-clear history or move what the program
+    /// drew. A move that follows the content
+    /// ([`Grid::set_cursor_following_content`]: DECRC, the 1049 restore, VT52
+    /// cursor up and down, the reverse wrap) keeps it. No-op outside a detach.
     #[inline]
-    pub(super) fn invalidate_pending_fill_target(&mut self) {
-        self.storage.pending_fill_target = None;
+    pub(super) fn drop_fill_debt(&mut self) {
+        self.storage.fill_debt = FillDebt::default();
     }
 
     /// Drop the `n` newest ring-scrollback rows (directly above the viewport)
@@ -257,5 +461,8 @@ impl Grid {
             self.storage.ring_extras.pop_back();
         }
         self.storage.total_lines -= n;
+        // The counter does not move, so the rows hand-back must not go on
+        // owing the pushed rows as the newest lines (`grid::resize_handback`).
+        self.forget_pushed_rows();
     }
 }

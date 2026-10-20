@@ -982,8 +982,11 @@ enum StructTrait {
 impl StructTrait {
     fn serialize_field(&self, span: Span) -> TokenStream {
         match *self {
+            // A field of a struct written as a map (it has a flattened field)
+            // is still a field, which a format may treat unlike a map entry
+            // (TOML leaves a `None` field out but refuses a `None` map value).
             StructTrait::SerializeMap => {
-                q_spanned!(span => "_serde::ser::SerializeMap::serialize_entry")
+                q_spanned!(span => "_serde::ser::SerializeMap::serialize_field_entry")
             }
             StructTrait::SerializeStruct => {
                 q_spanned!(span => "_serde::ser::SerializeStruct::serialize_field")

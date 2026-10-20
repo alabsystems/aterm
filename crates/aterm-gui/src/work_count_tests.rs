@@ -440,7 +440,7 @@ fn a_frame_derives_the_cell_box_only_when_an_input_changed() {
     // before the rebuild replaces it, and the new renderer, which has kept
     // nothing, derives on its first frame: once per renderer, then kept.
     let _ = work_counts::take_cell_geometry_derivations();
-    app.set_font_px(px + 4.0);
+    app.set_font_size(app.font_size + 4.0);
     app.redraw_window(wid);
     assert_eq!(
         work_counts::take_cell_geometry_derivations(),

@@ -42,6 +42,8 @@ impl TerminalHandler<'_> {
             }
             return;
         }
+        // Asked for, whatever the gate says (ruling S19).
+        *self.notify_total = self.notify_total.saturating_add(1);
         if !self.modes.allow_notifications {
             return;
         }
@@ -64,14 +66,25 @@ impl TerminalHandler<'_> {
     /// Same-kind text accumulates, capped at [`MAX_NOTIFICATION_FIELD_BYTES`],
     /// until the final chunk, then goes to the advanced notification callback.
     pub(super) fn handle_osc_99(&mut self, params: &[&[u8]]) {
-        if !self.modes.allow_notifications {
-            return;
-        }
         // params[1] = metadata (key=value pairs), params[2..] = payload.
         let metadata = params
             .get(1)
             .and_then(|p| std::str::from_utf8(p).ok())
             .unwrap_or("");
+        // A final chunk is one notification asked for, counted before the
+        // gate (ruling S19): `d=` absent or not `0`, the last `d=` winning as
+        // in the parse below. Only the metadata is read.
+        if metadata
+            .split(':')
+            .rev()
+            .find_map(|pair| pair.strip_prefix("d="))
+            .is_none_or(|d| d != "0")
+        {
+            *self.notify_total = self.notify_total.saturating_add(1);
+        }
+        if !self.modes.allow_notifications {
+            return;
+        }
         let payload = join_params(params, 2).unwrap_or_default();
 
         let mut id: Option<String> = None;
@@ -145,12 +158,14 @@ impl TerminalHandler<'_> {
     /// goes to the advanced notification callback; other sub-commands are
     /// ignored.
     pub(super) fn handle_osc_777(&mut self, params: &[&[u8]]) {
-        if !self.modes.allow_notifications {
-            return;
-        }
         // params[1] = sub-command. Only "notify" is a notification.
         let subcmd = params.get(1).and_then(|p| std::str::from_utf8(p).ok());
         if subcmd != Some("notify") {
+            return;
+        }
+        // Asked for, whatever the gate says (ruling S19).
+        *self.notify_total = self.notify_total.saturating_add(1);
+        if !self.modes.allow_notifications {
             return;
         }
         let title = params
@@ -524,5 +539,44 @@ mod tests {
             !*fired.lock().expect("poisoned"),
             "non-notify OSC 777 sub-command must be ignored"
         );
+    }
+
+    /// THE NOTIFY COUNT (session log Phase 3B, ruling S19): every desktop
+    /// notification a program asks for is counted, with notifications off
+    /// and on alike — OSC 9 past its `9;4` branch, OSC 99 at its final
+    /// chunk, OSC 777 `notify`. NEGATIVE CONTROLS: a `9;4` progress, a
+    /// non-final 99 chunk and a 777 sub-command other than `notify` count
+    /// nothing; the gate still decides what reaches a callback.
+    #[test]
+    fn every_notification_asked_for_is_counted_whatever_the_gate() {
+        for allowed in [false, true] {
+            let mut term = Terminal::new(24, 80);
+            let fired = Arc::new(Mutex::new(0_u32));
+            let (a, b) = (Arc::clone(&fired), Arc::clone(&fired));
+            term.set_notification_callback(move |_| *a.lock().expect("poisoned") += 1);
+            term.set_advanced_notification_callback(move |_| *b.lock().expect("poisoned") += 1);
+            if allowed {
+                term.authorize_notifications();
+            }
+            let count = |term: &mut Terminal, bytes: &[u8]| {
+                let before = term.notify_total();
+                term.process(bytes);
+                term.notify_total() - before
+            };
+            assert_eq!(count(&mut term, b"\x1b]9;Build finished\x07"), 1);
+            assert_eq!(count(&mut term, b"\x1b]9;4;1;50\x07"), 0, "progress");
+            assert_eq!(count(&mut term, b"\x1b]99;i=1:d=0;Part one\x07"), 0);
+            assert_eq!(count(&mut term, b"\x1b]99;i=1:d=0:p=body;Part two\x07"), 0);
+            assert_eq!(count(&mut term, b"\x1b]99;i=1:p=body;Last\x07"), 1, "final");
+            assert_eq!(count(&mut term, b"\x1b]99;i=2:d=1;Whole\x07"), 1);
+            assert_eq!(count(&mut term, b"\x1b]777;notify;Title;Body\x07"), 1);
+            assert_eq!(count(&mut term, b"\x1b]777;preexec;x\x07"), 0, "not notify");
+            assert_eq!(term.notify_total(), 4);
+            assert_eq!(
+                *fired.lock().expect("poisoned"),
+                if allowed { 4 } else { 0 },
+                "the gate decides delivery, not the count"
+            );
+        }
     }
 }

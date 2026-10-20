@@ -1,0 +1,620 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+// Author: Andrew Yates
+
+//! capture-privacy: an encoded test capture carries nothing the export forbids.
+//!
+//! The export's content guard greps the exported text against the rows of
+//! `publish/forbidden-extra.txt` and of the publication engine's
+//! `baseline/forbidden-content.txt`, after the export's transforms have
+//! rewritten developer homes in text (aterm-release `transforms.rs`). Neither
+//! reads inside an encoded capture: a pty log is `<stamp> <I|O> <hex>` per
+//! record and a `.reads` file escapes its control bytes, so the terminal
+//! stream a test replays (a shell prompt, Claude Code's banner, a cwd) ships
+//! as hex digits and escapes that no grep decodes. The law: whatever the export
+//! forbids in text, a capture's decoded bytes may not carry either.
+//!
+//! Every capture of the checkout ([`FORMATS`], by extension) is decoded, each
+//! direction one stream, and read in four views, each split into lines as
+//! grep splits a file:
+//! * raw: the bytes as recorded, split at LF (an OSC title or cwd report reads
+//!   here with its escape around it);
+//! * joined: escape sequences deleted, each string sequence's payload (OSC,
+//!   DCS, APC, PM, SOS) on a line of its own, every other control byte a line
+//!   break, so a word an SGR or a cursor move splits reads whole;
+//! * spaced: as joined, but a CSI breaks the line, so a word a cursor move
+//!   ends reads ended;
+//! * edited: as joined, but a Backspace or a DEL takes back the byte before it
+//!   on its line, as a shell's echo of an erase (`\b \b`) and a typed DEL do,
+//!   so a word fixed while it was typed reads as the screen shows it.
+//!
+//! Each line is held to the patterns: every row of `publish/forbidden-extra.txt`
+//! (always), every row of the engine's baseline when this host has it
+//! (`$PUBLICATION_ENGINE`, else `~/publication`; elsewhere the census says it
+//! judged without it), and [`CAPTURE_ROWS`], what only a capture shows. A
+//! finding names the capture's record and the row it matched, never the text.
+//! The fix is the SOURCE: scrub the capture with neutral text of the same
+//! display width, so every replay a test reads keeps its rows and columns.
+
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+use aterm_regex::{Regex, RegexBuilder};
+
+use super::{Finding, Rule, Tree};
+
+pub(super) const CAPTURE_PRIVACY: Rule = Rule {
+    id: "capture-privacy",
+    why: "a test capture ships in the public snapshot as hex or escapes, which the export's \
+          content guard and its home rewrites never decode: an account, a home path, a \
+          banner's plan or a session id recorded in one is published as recorded",
+    scope: &[],
+    check: capture_privacy,
+};
+
+/// The export's own rows, relative to the checkout.
+pub(super) const EXTRA: &str = "publish/forbidden-extra.txt";
+
+/// The engine's baseline, relative to the engine's checkout.
+const BASELINE: &str = "baseline/forbidden-content.txt";
+
+/// What only a decoded capture shows, beyond the export's rows: (what, pattern).
+/// In text the export rewrites a home and the baseline names the toolchain
+/// checkouts exactly; a capture is published as recorded, so these hold every
+/// spelling. A scrubbed home keeps the export's doubled separator
+/// (`/Users//owner`, `/home//owner`), and a scrubbed session id is a
+/// zero-padded placeholder (`00000001-0000-4000-8000-000000000001`). Those
+/// are the one capture spelling of each: the home row refuses the plain-text
+/// fixtures' `/Users/_owner` inside a capture.
+pub(super) const CAPTURE_ROWS: &[(&str, &str)] = &[
+    (
+        "a home path that names an account",
+        r"/(Users|home)/[A-Za-z0-9._-]",
+    ),
+    (
+        "the plan on Claude Code's banner",
+        r"Claude (Max|Pro|Team|Enterprise)\b|API Usage Billing",
+    ),
+    (
+        "a session id (a UUID whose second group is not the redaction's 0000)",
+        r"(?i)[0-9a-f]{8}-([1-9a-f][0-9a-f]{3}|0[1-9a-f][0-9a-f]{2}|00[1-9a-f][0-9a-f]|000[1-9a-f])-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    ),
+    (
+        "a toolchain checkout's cwd, or a sibling of one",
+        r"~/(clean|trust)",
+    ),
+];
+
+/// One capture format: the extension its files wear and its decoder.
+struct Format {
+    ext: &'static str,
+    decode: fn(&str) -> Result<Vec<Stream>, Undecodable>,
+}
+
+/// Every encoded capture format the checkout holds. A test that records a new
+/// encoding adds its decoder here.
+const FORMATS: &[Format] = &[
+    // `<stamp> <I|O> <hex>` per record (aterm-effects' pty logs).
+    Format {
+        ext: "ptylog",
+        decode: ptylog,
+    },
+    // One PTY read per line, `\e \a \b \r \n \\` escaped, `#` comment lines
+    // (aterm-core's ConPTY replays).
+    Format {
+        ext: "reads",
+        decode: reads,
+    },
+];
+
+/// One decoded direction of a capture.
+#[derive(Debug, Default)]
+pub(super) struct Stream {
+    /// `output`, `input` or `reads`.
+    name: &'static str,
+    bytes: Vec<u8>,
+    /// `(offset into bytes, 1-based line of the record starting there)`, in
+    /// offset order.
+    records: Vec<(usize, usize)>,
+}
+
+impl Stream {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            ..Self::default()
+        }
+    }
+
+    fn push(&mut self, line: usize, bytes: &[u8]) {
+        self.records.push((self.bytes.len(), line));
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    /// The 1-based line of the record holding byte `at`.
+    fn record_of(&self, at: usize) -> usize {
+        let i = self.records.partition_point(|&(start, _)| start <= at);
+        self.records
+            .get(i.wrapping_sub(1))
+            .map_or(0, |&(_, line)| line)
+    }
+}
+
+/// A record the decoder could not read: its 1-based line and why.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Undecodable(usize, String);
+
+/// A pty log: `<stamp> <I|O> <hex>` per line. A record of another kind
+/// without a payload (a fence) carries no bytes; anything else the guard
+/// cannot read is refused, so no line hides bytes from it.
+fn ptylog(text: &str) -> Result<Vec<Stream>, Undecodable> {
+    let (mut out, mut inp) = (Stream::new("output"), Stream::new("input"));
+    for (i, line) in text.lines().enumerate() {
+        let refuse = |why: &str| Undecodable(i + 1, why.to_string());
+        let mut fields = line.split_ascii_whitespace();
+        let Some(_stamp) = fields.next() else {
+            continue;
+        };
+        let (kind, payload) = (fields.next(), fields.next());
+        if fields.next().is_some() {
+            return Err(refuse("a record with more than one payload"));
+        }
+        let stream = match (kind, payload) {
+            (Some("O"), _) => &mut out,
+            (Some("I"), _) => &mut inp,
+            (Some(_), None) => continue,
+            (Some(_), Some(_)) => return Err(refuse("a record of a kind it does not know")),
+            (None, _) => return Err(refuse("a line that is not a record")),
+        };
+        let bytes =
+            unhex(payload.unwrap_or("")).ok_or_else(|| refuse("a payload that is not hex"))?;
+        stream.push(i + 1, &bytes);
+    }
+    Ok(vec![out, inp])
+}
+
+fn unhex(hex: &str) -> Option<Vec<u8>> {
+    let digit = |c: u8| {
+        char::from(c)
+            .to_digit(16)
+            .and_then(|d| u8::try_from(d).ok())
+    };
+    let (pairs, rest) = hex.as_bytes().as_chunks::<2>();
+    if !rest.is_empty() {
+        return None;
+    }
+    pairs
+        .iter()
+        .map(|&[hi, lo]| Some(digit(hi)? << 4 | digit(lo)?))
+        .collect()
+}
+
+/// PTY reads: one per line, `#` lines comments, escapes decoded.
+fn reads(text: &str) -> Result<Vec<Stream>, Undecodable> {
+    let mut s = Stream::new("reads");
+    for (i, line) in text.lines().enumerate() {
+        if line.starts_with('#') {
+            continue;
+        }
+        let mut bytes = Vec::with_capacity(line.len());
+        let mut it = line.bytes();
+        while let Some(b) = it.next() {
+            if b != b'\\' {
+                bytes.push(b);
+                continue;
+            }
+            bytes.push(match it.next() {
+                Some(b'e') => 0x1b,
+                Some(b'a') => 0x07,
+                Some(b'b') => 0x08,
+                Some(b'r') => b'\r',
+                Some(b'n') => b'\n',
+                Some(b'\\') => b'\\',
+                _ => {
+                    return Err(Undecodable(
+                        i + 1,
+                        "an escape the format does not define".into(),
+                    ));
+                }
+            });
+        }
+        s.push(i + 1, &bytes);
+    }
+    Ok(vec![s])
+}
+
+/// How [`View::printable`] reads the controls it drops.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Read {
+    /// Escape sequences gone, every other control a line break.
+    Joined,
+    /// As [`Read::Joined`], but a CSI breaks the line too.
+    Spaced,
+    /// As [`Read::Joined`], but a Backspace or a DEL takes back the byte
+    /// before it on its line.
+    Edited,
+}
+
+/// One view of a stream: its bytes, each with the stream offset it came from.
+struct View {
+    bytes: Vec<u8>,
+    from: Vec<usize>,
+}
+
+impl View {
+    fn raw(stream: &[u8]) -> Self {
+        Self {
+            bytes: stream.to_vec(),
+            from: (0..stream.len()).collect(),
+        }
+    }
+
+    fn put(&mut self, b: u8, at: usize) {
+        self.bytes.push(b);
+        self.from.push(at);
+    }
+
+    /// A line break, once however many controls make it.
+    fn split(&mut self, at: usize) {
+        if self.bytes.last().is_some_and(|&b| b != b'\n') {
+            self.put(b'\n', at);
+        }
+    }
+
+    /// An erase: the byte before it on its line is taken back.
+    fn take_back(&mut self) {
+        if self.bytes.last().is_some_and(|&b| b != b'\n') {
+            self.bytes.pop();
+            self.from.pop();
+        }
+    }
+
+    /// What the stream prints: escape sequences gone (a string sequence's
+    /// payload on its own line, a CSI a line break when `read` is
+    /// [`Read::Spaced`]), a Backspace or DEL an erase when `read` is
+    /// [`Read::Edited`], every other control a line break.
+    fn printable(stream: &[u8], read: Read) -> Self {
+        const ESC: u8 = 0x1b;
+        let mut v = Self {
+            bytes: Vec::with_capacity(stream.len()),
+            from: Vec::with_capacity(stream.len()),
+        };
+        let n = stream.len();
+        let mut i = 0;
+        while i < n {
+            let b = stream[i];
+            if b != ESC {
+                if read == Read::Edited && (b == 0x08 || b == 0x7f) {
+                    v.take_back();
+                } else if b < 0x20 || b == 0x7f {
+                    v.split(i);
+                } else {
+                    v.put(b, i);
+                }
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            match stream.get(j) {
+                Some(b'[') => {
+                    j += 1;
+                    while j < n && (0x20..=0x3f).contains(&stream[j]) {
+                        j += 1;
+                    }
+                    if j < n && (0x40..=0x7e).contains(&stream[j]) {
+                        j += 1;
+                    }
+                    if read == Read::Spaced {
+                        v.split(i);
+                    }
+                }
+                Some(b']' | b'P' | b'_' | b'^' | b'X') => {
+                    v.split(i);
+                    j += 1;
+                    while j < n {
+                        match stream[j] {
+                            0x07 => {
+                                j += 1;
+                                break;
+                            }
+                            ESC if stream.get(j + 1) == Some(&b'\\') => {
+                                j += 2;
+                                break;
+                            }
+                            ESC => break,
+                            c if c < 0x20 || c == 0x7f => v.split(j),
+                            c => v.put(c, j),
+                        }
+                        j += 1;
+                    }
+                    v.split(j.min(n.saturating_sub(1)));
+                }
+                Some(_) => {
+                    while j < n && (0x20..=0x2f).contains(&stream[j]) {
+                        j += 1;
+                    }
+                    j = (j + 1).min(n);
+                }
+                None => {}
+            }
+            i = j.max(i + 1);
+        }
+        v
+    }
+
+    /// Every line, with the view offset it starts at.
+    fn lines(&self) -> impl Iterator<Item = (usize, &[u8])> {
+        let mut start = 0;
+        self.bytes.split(|&b| b == b'\n').map(move |line| {
+            let at = start;
+            start += line.len() + 1;
+            (at, line)
+        })
+    }
+}
+
+/// One pattern a capture is held to.
+pub(super) struct Row {
+    /// Where it comes from, as a finding names it.
+    source: String,
+    /// The pattern as grep runs it, on one line.
+    line: Regex,
+    /// The same with `(?m)`: a whole view without a match of it holds no line
+    /// with one.
+    any: Regex,
+}
+
+/// The work one whole-view prefilter search may spend; exhausting it only
+/// sends the view to the per-line search.
+const VIEW_STEPS: u64 = 1 << 32;
+
+impl Row {
+    fn new(source: String, pattern: &str) -> Result<Self, String> {
+        let line = Regex::new(pattern).map_err(|e| e.to_string())?;
+        let any = RegexBuilder::new(&format!("(?m){pattern}"))
+            .step_limit(VIEW_STEPS)
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(Self { source, line, any })
+    }
+}
+
+/// The rows of a pattern file (grep -E, one per line, `#` lines and blanks
+/// skipped after trimming, as the engine reads them), named `<label>:<line>`.
+/// A row that does not compile here is a finding at `finding_path`: no capture
+/// would be held to it.
+pub(super) fn file_rows(
+    text: &str,
+    label: &str,
+    finding_path: &str,
+    out: &mut Vec<Finding>,
+) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let pattern = raw.trim();
+        if pattern.is_empty() || pattern.starts_with('#') {
+            continue;
+        }
+        match Row::new(format!("{label}:{}", i + 1), pattern) {
+            Ok(row) => rows.push(row),
+            Err(why) => out.push(Finding {
+                rule: CAPTURE_PRIVACY.id,
+                path: finding_path.to_string(),
+                line: i + 1,
+                detail: format!(
+                    "this row does not compile in aterm-regex ({why}), so no capture is held \
+                     to it"
+                ),
+            }),
+        }
+    }
+    rows
+}
+
+/// [`CAPTURE_ROWS`], compiled.
+pub(super) fn capture_rows() -> Vec<Row> {
+    CAPTURE_ROWS
+        .iter()
+        .map(|(what, pattern)| {
+            Row::new(format!("the capture row for {what}"), pattern)
+                .unwrap_or_else(|e| panic!("capture row {pattern:?} compiles: {e}"))
+        })
+        .collect()
+}
+
+/// Where this host keeps the engine's baseline, if it names one.
+fn baseline_path() -> Option<PathBuf> {
+    std::env::var_os("PUBLICATION_ENGINE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join("publication")))
+        .map(|engine| engine.join(BASELINE))
+}
+
+/// The engine's baseline text, or why the rule judges without it.
+fn baseline() -> Result<(String, String), String> {
+    let path = baseline_path().ok_or("neither PUBLICATION_ENGINE nor HOME names the engine")?;
+    let shown = path.display().to_string();
+    std::fs::read_to_string(&path)
+        .map(|text| (shown.clone(), text))
+        .map_err(|e| format!("{shown}: {e}"))
+}
+
+/// The census's notes on what the rule judged without: the engine's baseline
+/// when this host does not have it, and the export's own rows when the
+/// checkout has none (a public snapshot withholds `publish/`, and the engine
+/// reads an absent extras file as no rows). [`CAPTURE_ROWS`] always hold.
+pub(super) fn notes(root: &Path) -> Vec<String> {
+    let mut without = Vec::new();
+    if let Err(why) = baseline() {
+        without.push(format!("the publication engine's baseline ({why})"));
+    }
+    if !root.join(EXTRA).exists() {
+        without.push(format!("{EXTRA} (absent)"));
+    }
+    if without.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "capture-privacy judged the captures without {}; the capture rows still held",
+        without.join(" or ")
+    )]
+}
+
+fn capture_privacy(tree: &Tree<'_>, out: &mut Vec<Finding>) {
+    held_to(tree, baseline(), out);
+}
+
+/// The rule over `tree`, with the engine's baseline as this host reads it
+/// (`Err` when it has none, which holds the captures to the other rows).
+fn held_to(tree: &Tree<'_>, baseline: Result<(String, String), String>, out: &mut Vec<Finding>) {
+    let captures: Vec<&String> = tree
+        .corpus
+        .paths
+        .iter()
+        .filter(|rel| format_of(rel).is_some())
+        .collect();
+    if captures.is_empty() {
+        return;
+    }
+    let extra = match std::fs::read_to_string(tree.root.join(EXTRA)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            out.push(Finding {
+                rule: CAPTURE_PRIVACY.id,
+                path: EXTRA.to_string(),
+                line: 0,
+                detail: format!("unreadable ({e}), so no capture is held to the export's rows"),
+            });
+            String::new()
+        }
+    };
+    let mut rows = file_rows(&extra, EXTRA, EXTRA, out);
+    if let Ok((path, text)) = baseline {
+        rows.extend(file_rows(&text, "the engine's baseline", &path, out));
+    }
+    rows.extend(capture_rows());
+    for rel in captures {
+        match std::fs::read(tree.root.join(rel)) {
+            Ok(bytes) => judge(rel, &String::from_utf8_lossy(&bytes), &rows, out),
+            Err(e) => out.push(Finding {
+                rule: CAPTURE_PRIVACY.id,
+                path: rel.clone(),
+                line: 0,
+                detail: format!("unreadable: {e}"),
+            }),
+        }
+    }
+}
+
+/// The format a path's extension names.
+fn format_of(rel: &str) -> Option<&'static Format> {
+    let ext = rel.rsplit('/').next()?.rsplit_once('.')?.1;
+    FORMATS.iter().find(|f| f.ext == ext)
+}
+
+/// One capture (`rel`, its text) held to `rows`: one finding per stream and
+/// row it matches, at the first record matching.
+pub(super) fn judge(rel: &str, text: &str, rows: &[Row], out: &mut Vec<Finding>) {
+    let Some(format) = format_of(rel) else {
+        return;
+    };
+    let streams = match (format.decode)(text) {
+        Ok(streams) => streams,
+        Err(Undecodable(line, why)) => {
+            out.push(Finding {
+                rule: CAPTURE_PRIVACY.id,
+                path: rel.to_string(),
+                line,
+                detail: format!("{why}: the guard cannot decode it, so nothing judges its bytes"),
+            });
+            return;
+        }
+    };
+    for stream in &streams {
+        let views = [
+            View::raw(&stream.bytes),
+            View::printable(&stream.bytes, Read::Joined),
+            View::printable(&stream.bytes, Read::Spaced),
+            View::printable(&stream.bytes, Read::Edited),
+        ];
+        // (row index) -> the records whose bytes match it
+        let mut hits: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+        let mut exhausted: BTreeSet<usize> = BTreeSet::new();
+        for view in &views {
+            let whole = String::from_utf8_lossy(&view.bytes);
+            for (k, row) in rows.iter().enumerate() {
+                if matches!(row.any.try_is_match(&whole), Ok(false)) {
+                    continue;
+                }
+                for (start, line) in view.lines() {
+                    let text = String::from_utf8_lossy(line);
+                    match row.line.try_find(&text) {
+                        Ok(Some(m)) => {
+                            // a lossy line's offsets are not the view's
+                            let at = match text {
+                                Cow::Borrowed(_) => start + m.start(),
+                                Cow::Owned(_) => start,
+                            };
+                            let from = view.from.get(at).copied().unwrap_or(0);
+                            hits.entry(k).or_default().insert(stream.record_of(from));
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            exhausted.insert(k);
+                        }
+                    }
+                }
+            }
+        }
+        for (k, records) in hits {
+            let first = records.first().copied().unwrap_or(0);
+            let n = records.len();
+            out.push(Finding {
+                rule: CAPTURE_PRIVACY.id,
+                path: rel.to_string(),
+                line: first,
+                detail: format!(
+                    "its decoded {} matches {} ({n} record{}); scrub the capture with neutral \
+                     text of the same width",
+                    stream.name,
+                    rows[k].source,
+                    if n == 1 { "" } else { "s" }
+                ),
+            });
+        }
+        for k in exhausted {
+            out.push(Finding {
+                rule: CAPTURE_PRIVACY.id,
+                path: rel.to_string(),
+                line: 0,
+                detail: format!(
+                    "a line of its decoded {} exhausted the search for {}, so it is not judged",
+                    stream.name, rows[k].source
+                ),
+            });
+        }
+    }
+}
+
+/// The ptylog format's records as text, for tests: each `(kind, bytes)` one
+/// record, lowercase hex.
+#[cfg(test)]
+pub(super) fn ptylog_text(records: &[(&str, &[u8])]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    for (i, (kind, bytes)) in records.iter().enumerate() {
+        let _ = write!(s, "{} {kind} ", 1000 * (i + 1));
+        for b in *bytes {
+            let _ = write!(s, "{b:02x}");
+        }
+        s.push('\n');
+    }
+    s
+}
+
+#[cfg(test)]
+#[path = "captures_tests.rs"]
+mod tests;

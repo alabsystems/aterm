@@ -6,6 +6,10 @@
 # name. The directory keeps the `aterm-` prefix so it is not mistaken for
 # vendored upstream (`vendor/`), as with crates/aterm-arrayvec.
 name = "smallvec"
+# Integration tests are declared below, not discovered: the files are modules of
+# one suite binary where they can share a process. With autotests off a
+# `tests/*.rs` file listed nowhere never compiles.
+autotests = false
 # Not `version.workspace = true`: this is a semver contract with the consumers.
 # (rustybuzz 0.20.1 asked `^1.6` until TF.6.) parking_lot_core 0.9.12 `^1.6.1`, wayland-backend
 # 0.3.15 `^1.9`, and wgpu, wgpu-core and wgpu-hal 29.0.3 `^1.14`. 1.15.1 is what
@@ -48,6 +52,10 @@ const_generics = []
 const_new = ["const_generics"]
 union = []
 serde = []
+
+[[test]]
+name = "smallvec_suite"
+path = "tests/smallvec_suite.rs"
 
 [lints]
 workspace = true

@@ -17,6 +17,7 @@ use aterm_rle::Rle;
 use aterm_scrollback::{CellAttrs, HyperlinkSpan, ImageSpan, Line, UnderlineColorSpan};
 
 use super::Grid;
+use super::scroll_materialize::walk_folds_across;
 use crate::Cell;
 use crate::CellExtra;
 use crate::CellFlags;
@@ -68,7 +69,7 @@ const RUN_DISQUALIFY: CellFlags =
 /// path. `char_data` is a BMP codepoint whenever `COMPLEX` is clear, so this
 /// is one mask and one range test.
 #[inline]
-pub(in crate::grid) fn plain_ascii_byte(cell: &Cell) -> Option<u8> {
+fn plain_ascii_byte(cell: &Cell) -> Option<u8> {
     if cell.flags().intersects(RUN_DISQUALIFY) {
         return None;
     }
@@ -298,136 +299,133 @@ impl DeferredLine {
             return (line, body);
         }
 
-        #[cfg(any(test, debug_assertions))]
-        super::count_row_to_line_op();
-
         let default_extras = ScrolledRowExtras::default();
         let extras = self.extras.as_deref().unwrap_or(&default_extras);
-        let len = self.len as usize;
-        if len == 0 {
-            let mut line = Line::new();
-            if self.wrapped {
-                line.set_wrapped(true);
-            }
-            attach_image_spans(&mut line, extras);
-            return (line, body);
-        }
-        let cells = &body[..len];
-        let line = if extras.is_empty() {
-            Self::materialize_no_extras(cells, self.wrapped)
-        } else {
-            Self::materialize_with_extras(cells, extras, self.wrapped)
-        };
+        let line = cells_to_line(&body[..self.len as usize], extras, self.wrapped);
         (line, body)
     }
 
     /// Perform the O(cols) conversion from raw cells to Line.
     fn materialize(&self) -> Line {
-        #[cfg(any(test, debug_assertions))]
-        super::count_row_to_line_op();
-
         let default_extras = ScrolledRowExtras::default();
         let extras = self.extras.as_deref().unwrap_or(&default_extras);
-
-        if self.len == 0 {
-            let mut line = Line::new();
-            if self.wrapped {
-                line.set_wrapped(true);
-            }
-            attach_image_spans(&mut line, extras);
-            return line;
-        }
-
-        let cells = &self.cells[..self.len as usize];
-
-        if extras.is_empty() {
-            return Self::materialize_no_extras(cells, self.wrapped);
-        }
-
-        Self::materialize_with_extras(cells, extras, self.wrapped)
+        cells_to_line(&self.cells[..self.len as usize], extras, self.wrapped)
     }
+}
 
-    /// Fast-path materialization for rows with no extras.
-    fn materialize_no_extras(cells: &[Cell], wrapped: bool) -> Line {
-        let mut text = String::with_capacity(cells.len());
-        let mut attrs_rle = AttrRunBuilder::empty();
+/// The stored [`Line`] for a row's first `cells` (spacers included) and the
+/// extras extracted from it at scroll time (RGB overflow colours already
+/// resolved): every cell's text in column order, with its attributes on each of
+/// its characters. A cell the text alone would fold into the cell before
+/// (flag halves or a skin tone and its base the grid drew apart, a cell after
+/// one ending in a ZWJ) has its first character marked
+/// [`CellAttrs::OPENS_CELL`], so every walk of the line draws the cells the
+/// grid drew. The one row-to-line conversion: a staged row and a ring row read
+/// as a line both come here.
+fn cells_to_line(cells: &[Cell], extras: &ScrolledRowExtras, wrapped: bool) -> Line {
+    #[cfg(any(test, debug_assertions))]
+    super::count_row_to_line_op();
 
-        let mut idx = 0;
-        while idx < cells.len() {
-            let run_end = append_plain_run(cells, idx, &mut text, &mut attrs_rle);
-            if run_end > idx {
-                idx = run_end;
-                continue;
-            }
-            let cell = &cells[idx];
-            if !is_spacer(cells, idx) {
-                text.push(cell.char());
-                attrs_rle.push(cell_attrs_of(cell));
-            }
-            idx += 1;
-        }
-
-        let mut line = Line::with_hyperlinks_owned(text, attrs_rle.finish(), Vec::new());
-        if wrapped {
-            line.set_wrapped(true);
-        }
-        line
-    }
-
-    /// Full materialization with extras (hyperlinks, complex chars, combining,
-    /// RGB).
-    fn materialize_with_extras(cells: &[Cell], extras: &ScrolledRowExtras, wrapped: bool) -> Line {
-        let mut text = String::with_capacity(cells.len());
-        let mut attrs_rle = AttrRunBuilder::empty();
-        let mut cursors = RowToLineCursorState::default();
-
-        for (physical_col, cell) in cells.iter().enumerate() {
-            if is_spacer(cells, physical_col) {
-                continue;
-            }
-
-            let col_u16 = u16::try_from(physical_col).unwrap_or(u16::MAX);
-            let char_count = push_cell_text(&mut text, *cell, extras, &mut cursors, col_u16);
-            let fg_raw = resolve_cell_color(
-                cell.fg_needs_overflow(),
-                cell.fg_color().map_or(PackedColor::DEFAULT_FG.0, |c| c.0),
-                &extras.rgb_fg,
-                &mut cursors.rgb_fg_idx,
-                col_u16,
-                PackedColor::DEFAULT_FG.0,
-            );
-            let bg_raw = resolve_cell_color(
-                cell.bg_needs_overflow(),
-                cell.bg_color().map_or(PackedColor::DEFAULT_BG.0, |c| c.0),
-                &extras.rgb_bg,
-                &mut cursors.rgb_bg_idx,
-                col_u16,
-                PackedColor::DEFAULT_BG.0,
-            );
-
-            let attrs = CellAttrs::from_raw(fg_raw, bg_raw, cell.flags().bits());
-            push_repeated_attrs(&mut attrs_rle, attrs, char_count);
-            push_combining_marks(
-                &mut text,
-                &mut attrs_rle,
-                attrs,
-                extras,
-                &mut cursors,
-                col_u16,
-            );
-        }
-
-        let mut line =
-            Line::with_hyperlinks_owned(text, attrs_rle.finish(), extras.hyperlinks.clone());
-        if !extras.underline_colors.is_empty() {
-            line.set_underline_colors(coalesce_underline_spans(&extras.underline_colors));
-        }
+    let mut line = if cells.is_empty() {
+        let mut line = Line::new();
         attach_image_spans(&mut line, extras);
-        if wrapped {
-            line.set_wrapped(true);
-        }
         line
+    } else if extras.is_empty() {
+        // No complex chars and no overflow colours: every cell is one BMP
+        // character with inline colours, and none can fold into the one before.
+        plain_cells_to_line(cells)
+    } else {
+        styled_cells_to_line(cells, extras)
+    };
+    if wrapped {
+        line.set_wrapped(true);
     }
+    line
+}
+
+/// [`cells_to_line`] for cells with no extras.
+fn plain_cells_to_line(cells: &[Cell]) -> Line {
+    let mut text = String::with_capacity(cells.len());
+    let mut attrs_rle = AttrRunBuilder::empty();
+
+    let mut idx = 0;
+    while idx < cells.len() {
+        let run_end = append_plain_run(cells, idx, &mut text, &mut attrs_rle);
+        if run_end > idx {
+            idx = run_end;
+            continue;
+        }
+        let cell = &cells[idx];
+        if !is_spacer(cells, idx) {
+            // No complex chars possible: char_data is always a BMP codepoint.
+            text.push(cell.char());
+            attrs_rle.push(cell_attrs_of(cell));
+        }
+        idx += 1;
+    }
+
+    Line::with_hyperlinks_owned(text, attrs_rle.finish(), Vec::new())
+}
+
+/// [`cells_to_line`] for cells with extras: hyperlinks, complex chars,
+/// combining marks, RGB colours, underline colours and images.
+fn styled_cells_to_line(cells: &[Cell], extras: &ScrolledRowExtras) -> Line {
+    let mut text = String::with_capacity(cells.len());
+    let mut attrs_rle = AttrRunBuilder::empty();
+    let mut cursors = RowToLineCursorState::default();
+    // Where the cell before starts in `text`.
+    let mut prev: Option<usize> = None;
+
+    for (physical_col, cell) in cells.iter().enumerate() {
+        if is_spacer(cells, physical_col) {
+            continue;
+        }
+
+        let col_u16 = u16::try_from(physical_col).unwrap_or(u16::MAX);
+        let at = text.len();
+        let char_count = push_cell_text(&mut text, *cell, extras, &mut cursors, col_u16);
+        let opens = prev.is_some_and(|prev| walk_folds_across(&text, prev, at));
+        prev = Some(at);
+        let fg_raw = resolve_cell_color(
+            cell.fg_needs_overflow(),
+            cell.fg_color().map_or(PackedColor::DEFAULT_FG.0, |c| c.0),
+            &extras.rgb_fg,
+            &mut cursors.rgb_fg_idx,
+            col_u16,
+            PackedColor::DEFAULT_FG.0,
+        );
+        let bg_raw = resolve_cell_color(
+            cell.bg_needs_overflow(),
+            cell.bg_color().map_or(PackedColor::DEFAULT_BG.0, |c| c.0),
+            &extras.rgb_bg,
+            &mut cursors.rgb_bg_idx,
+            col_u16,
+            PackedColor::DEFAULT_BG.0,
+        );
+
+        let attrs = CellAttrs::from_raw(fg_raw, bg_raw, cell.flags().bits());
+        if opens {
+            attrs_rle.push(attrs.with_opens_cell(true));
+            push_repeated_attrs(&mut attrs_rle, attrs, char_count.saturating_sub(1));
+        } else {
+            push_repeated_attrs(&mut attrs_rle, attrs, char_count);
+        }
+        push_combining_marks(
+            &mut text,
+            &mut attrs_rle,
+            attrs,
+            extras,
+            &mut cursors,
+            col_u16,
+        );
+    }
+
+    let mut line = Line::with_hyperlinks_owned(text, attrs_rle.finish(), extras.hyperlinks.clone());
+    if !extras.underline_colors.is_empty() {
+        line.set_underline_colors(coalesce_underline_spans(&extras.underline_colors));
+    }
+    attach_image_spans(&mut line, extras);
+    line
 }
 
 /// Staging buffer between the ring and the tiered store in `GridStorage`.
@@ -882,6 +880,17 @@ impl LazyBuffer {
             .map(move |deferred| deferred.into_line_recycled(&mut *pool))
     }
 
+    /// How many of the newest staged rows make up the logical line the newest
+    /// one belongs to: its head and its continuations, or every staged row
+    /// when no head is staged.
+    pub(crate) fn trailing_run(&self) -> usize {
+        self.lines
+            .iter()
+            .rev()
+            .position(|line| !line.wrapped)
+            .map_or(self.lines.len(), |continuations| continuations + 1)
+    }
+
     /// A line by index (0 = oldest: the flood marker when a cut is open),
     /// materialized on first access.
     #[must_use]
@@ -1181,13 +1190,6 @@ pub(in crate::grid) struct RowToLineCursorState {
     pub(in crate::grid) rgb_bg_idx: usize,
 }
 
-impl RowToLineCursorState {
-    /// The next combining-mark entry [`next_combining`] would read.
-    pub(in crate::grid) const fn combining_idx(&self) -> usize {
-        self.combining_idx
-    }
-}
-
 impl Grid {
     /// Convert a row to a [`Line`] without extras (test helper).
     #[cfg(test)]
@@ -1213,107 +1215,8 @@ impl Grid {
         extras: &ScrolledRowExtras,
         len: u16,
     ) -> Line {
-        #[cfg(any(test, debug_assertions))]
-        super::count_row_to_line_op();
-
         let len = usize::from(len.min(row.cols()));
-        if len == 0 {
-            let mut line = Line::new();
-            if row.is_wrapped() {
-                line.set_wrapped(true);
-            }
-            attach_image_spans(&mut line, extras);
-            return line;
-        }
-
-        // Fast path: no extras (common for plain text).
-        if extras.is_empty() {
-            return Self::row_to_line_no_extras(row, len);
-        }
-
-        let mut text = String::with_capacity(len);
-        let mut attrs_rle = AttrRunBuilder::empty();
-        let mut cursors = RowToLineCursorState::default();
-
-        let cells = &row.as_slice()[..len];
-        for (physical_col, cell) in cells.iter().enumerate() {
-            if is_spacer(cells, physical_col) {
-                continue;
-            }
-
-            let col_u16 = u16::try_from(physical_col).unwrap_or(u16::MAX);
-            let char_count = push_cell_text(&mut text, *cell, extras, &mut cursors, col_u16);
-            let fg_raw = resolve_cell_color(
-                cell.fg_needs_overflow(),
-                cell.fg_color().map_or(PackedColor::DEFAULT_FG.0, |c| c.0),
-                &extras.rgb_fg,
-                &mut cursors.rgb_fg_idx,
-                col_u16,
-                PackedColor::DEFAULT_FG.0,
-            );
-            let bg_raw = resolve_cell_color(
-                cell.bg_needs_overflow(),
-                cell.bg_color().map_or(PackedColor::DEFAULT_BG.0, |c| c.0),
-                &extras.rgb_bg,
-                &mut cursors.rgb_bg_idx,
-                col_u16,
-                PackedColor::DEFAULT_BG.0,
-            );
-
-            let attrs = CellAttrs::from_raw(fg_raw, bg_raw, cell.flags().bits());
-            push_repeated_attrs(&mut attrs_rle, attrs, char_count);
-            push_combining_marks(
-                &mut text,
-                &mut attrs_rle,
-                attrs,
-                extras,
-                &mut cursors,
-                col_u16,
-            );
-        }
-
-        let mut line =
-            Line::with_hyperlinks_owned(text, attrs_rle.finish(), extras.hyperlinks.clone());
-        if !extras.underline_colors.is_empty() {
-            line.set_underline_colors(coalesce_underline_spans(&extras.underline_colors));
-        }
-        attach_image_spans(&mut line, extras);
-        if row.is_wrapped() {
-            line.set_wrapped(true);
-        }
-        line
-    }
-
-    /// Row-to-line for a row with no extras: no cursor tracking or overflow
-    /// resolution.
-    fn row_to_line_no_extras(row: &Row, len: usize) -> Line {
-        let cells = &row.as_slice()[..len];
-        let mut text = String::with_capacity(len);
-        let mut attrs_rle = AttrRunBuilder::empty();
-
-        let mut idx = 0;
-        while idx < cells.len() {
-            let run_end = append_plain_run(cells, idx, &mut text, &mut attrs_rle);
-            if run_end > idx {
-                idx = run_end;
-                continue;
-            }
-
-            let cell = &cells[idx];
-            if !is_spacer(cells, idx) {
-                // No complex chars possible — char_data is always a BMP codepoint.
-                text.push(cell.char());
-                // No overflow — read inline colors directly.
-                attrs_rle.push(cell_attrs_of(cell));
-            }
-            idx += 1;
-        }
-
-        let mut line = Line::with_hyperlinks_owned(text, attrs_rle.finish(), Vec::new());
-        if row.is_wrapped() {
-            line.set_wrapped(true);
-        }
-        line
+        cells_to_line(&row.as_slice()[..len], extras, row.is_wrapped())
     }
 
     /// Extract a row's extras (hyperlinks, complex chars, combining marks and

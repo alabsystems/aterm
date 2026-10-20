@@ -17,7 +17,7 @@
 //! the [`EventLoop::new()`] function.
 //!
 //! ```no_run
-//! use winit::event_loop::EventLoop;
+//! use aterm_window::event_loop::EventLoop;
 //!
 //! # // Intentionally use `fn main` for clarity
 //! fn main() {
@@ -58,10 +58,10 @@
 //!
 //!
 //! ```no_run
-//! use winit::application::ApplicationHandler;
-//! use winit::event::WindowEvent;
-//! use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-//! use winit::window::{Window, WindowId};
+//! use aterm_window::application::ApplicationHandler;
+//! use aterm_window::event::WindowEvent;
+//! use aterm_window::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+//! use aterm_window::window::{Window, WindowId};
 //!
 //! #[derive(Default)]
 //! struct App {

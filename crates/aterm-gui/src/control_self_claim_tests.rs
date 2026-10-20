@@ -23,14 +23,14 @@ use crate::session_timeline::{
     ClaimRule, claim_rule, claim_supervisor_as, release_proven_if_gone, release_supervisor,
 };
 
-/// The proof of a process that runs: this test process, by its own pid and
-/// kernel start.
+/// The proof of a process that runs ([`crate::self_claim::stand_in`]).
 fn running() -> Proven {
-    let pid = std::process::id();
-    Proven {
-        pid,
-        start: aterm_agent::harness::restart_stamp::kernel_start(pid).expect("our start"),
-    }
+    crate::self_claim::stand_in::running()
+}
+
+/// The pid of the process [`running`] proves.
+fn stand_in() -> u32 {
+    crate::self_claim::stand_in::pid()
 }
 
 /// A proof whose process is gone: this pid under a start it never had.
@@ -124,34 +124,42 @@ fn a_proven_claim_replaces_the_hosts_and_a_dead_proofs_and_leaves_with_its_proce
     let now = crate::metrics::now_us();
     // The window host's loop holds the session.
     let host = format!("aterm-harness@{}", std::process::id());
-    assert!(claim_supervisor_as(ctx, &host, None, None, None, now).is_ok());
+    assert!(claim_supervisor_as(ctx, &host, None, None, None, now, aterm_slog::Actor::Ctl).is_ok());
     // An unproven self-claim is an ordinary foreign claim: busy.
     let me = format!("codex-alab@{}", std::process::id());
     assert_eq!(
-        claim_supervisor_as(ctx, &me, Some(1), None, None, now),
+        claim_supervisor_as(ctx, &me, Some(1), None, None, now, aterm_slog::Actor::Ctl),
         Err(host.clone())
     );
     assert_eq!(shown(ctx), (Some(host.clone()), false));
     // Proven: it replaces the host's, and says whose it replaced.
-    let claimed = claim_supervisor_as(ctx, &me, Some(1), None, Some(running()), now)
-        .expect("a proof replaces the host's claim");
+    let claimed = claim_supervisor_as(
+        ctx,
+        &me,
+        Some(1),
+        None,
+        Some(running()),
+        now,
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("a proof replaces the host's claim");
     assert!(claimed.changed);
     assert_eq!(claimed.replaced.as_deref(), Some(host.as_str()));
     assert_eq!(shown(ctx), (Some(me.clone()), true));
     // A forgery of its spelling from another connection is refused and
     // moves nothing: the claim stays bound and proven.
     assert_eq!(
-        claim_supervisor_as(ctx, &me, Some(2), None, None, now),
+        claim_supervisor_as(ctx, &me, Some(2), None, None, now, aterm_slog::Actor::Ctl),
         Err(me.clone())
     );
     assert_eq!(shown(ctx), (Some(me.clone()), true));
     // The host's own claim cannot take it back.
     assert_eq!(
-        claim_supervisor_as(ctx, &host, None, None, None, now),
+        claim_supervisor_as(ctx, &host, None, None, None, now, aterm_slog::Actor::Ctl),
         Err(me.clone())
     );
     // While its process leads the group in front, the claim stands…
-    let pid = i32::try_from(std::process::id()).expect("a pid");
+    let pid = i32::try_from(stand_in()).expect("a pid");
     assert!(!release_proven_if_gone(ctx, pid, now));
     assert_eq!(shown(ctx), (Some(me.clone()), true));
     // …and once another group leads, it is cleared and recorded.
@@ -163,16 +171,57 @@ fn a_proven_claim_replaces_the_hosts_and_a_dead_proofs_and_leaves_with_its_proce
     );
     // A proven claim whose process is gone is replaced by a new proof, and
     // cleared even while its pid is the one in front.
-    assert!(claim_supervisor_as(ctx, &me, Some(3), None, Some(gone()), now).is_ok());
+    assert!(
+        claim_supervisor_as(
+            ctx,
+            &me,
+            Some(3),
+            None,
+            Some(gone()),
+            now,
+            aterm_slog::Actor::Ctl
+        )
+        .is_ok()
+    );
     assert!(release_proven_if_gone(ctx, pid, now), "its process is gone");
-    assert!(claim_supervisor_as(ctx, &me, Some(4), None, Some(gone()), now).is_ok());
+    assert!(
+        claim_supervisor_as(
+            ctx,
+            &me,
+            Some(4),
+            None,
+            Some(gone()),
+            now,
+            aterm_slog::Actor::Ctl
+        )
+        .is_ok()
+    );
     let other = "codex-alab@4242";
-    let claimed = claim_supervisor_as(ctx, other, Some(5), None, Some(running()), now)
-        .expect("a proof replaces a dead proof");
+    let claimed = claim_supervisor_as(
+        ctx,
+        other,
+        Some(5),
+        None,
+        Some(running()),
+        now,
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("a proof replaces a dead proof");
     assert_eq!(claimed.replaced.as_deref(), Some(me.as_str()));
     // An unproven claim is never cleared by the foreground's move.
-    assert!(release_supervisor(ctx, None, now));
-    assert!(claim_supervisor_as(ctx, "watcher", None, None, None, now).is_ok());
+    assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
+    assert!(
+        claim_supervisor_as(
+            ctx,
+            "watcher",
+            None,
+            None,
+            None,
+            now,
+            aterm_slog::Actor::Ctl
+        )
+        .is_ok()
+    );
     assert!(!release_proven_if_gone(ctx, pid + 1, now));
     assert_eq!(shown(ctx), (Some("watcher".to_string()), false));
 }
@@ -193,10 +242,21 @@ fn a_fenced_write_lands_only_under_its_holders_claim() {
         supervisor_fence(ctx, host, now).as_deref(),
         Some("ERR busy supervisor=-\n")
     );
-    assert!(claim_supervisor_as(ctx, host, None, None, None, now).is_ok());
+    assert!(claim_supervisor_as(ctx, host, None, None, None, now, aterm_slog::Actor::Ctl).is_ok());
     assert_eq!(supervisor_fence(ctx, host, now), None);
     let me = format!("codex-alab@{}", std::process::id());
-    assert!(claim_supervisor_as(ctx, &me, Some(1), None, Some(running()), now).is_ok());
+    assert!(
+        claim_supervisor_as(
+            ctx,
+            &me,
+            Some(1),
+            None,
+            Some(running()),
+            now,
+            aterm_slog::Actor::Ctl
+        )
+        .is_ok()
+    );
     assert_eq!(
         supervisor_fence(ctx, host, now),
         Some(format!("ERR busy supervisor={me}\n")),
@@ -218,14 +278,22 @@ fn a_replacement_waits_for_the_writes_the_replaced_fence_admitted() {
     let now = crate::metrics::now_us();
     let host = "aterm-harness@1";
     let me = format!("codex-alab@{}", std::process::id());
-    assert!(claim_supervisor_as(&ctx, host, None, None, None, now).is_ok());
+    assert!(claim_supervisor_as(&ctx, host, None, None, None, now, aterm_slog::Actor::Ctl).is_ok());
     let writing = FencedWrite::enter(&ctx, host, now).expect("the host holds the claim");
     let (answered_tx, answered) = std::sync::mpsc::channel();
     let claimant = {
         let ctx = Arc::clone(&ctx);
         let me = me.clone();
         std::thread::spawn(move || {
-            let claimed = claim_supervisor_as(&ctx, &me, Some(1), None, Some(running()), now);
+            let claimed = claim_supervisor_as(
+                &ctx,
+                &me,
+                Some(1),
+                None,
+                Some(running()),
+                now,
+                aterm_slog::Actor::Ctl,
+            );
             answered_tx.send(claimed.map(|c| c.replaced)).expect("send");
         })
     };
@@ -257,9 +325,20 @@ fn a_replacement_waits_for_the_writes_the_replaced_fence_admitted() {
         Some(format!("ERR busy supervisor={me}\n").as_str())
     );
     // NEGATIVE CONTROL: nothing in flight, answered at once.
-    assert!(release_supervisor(&ctx, None, now));
-    assert!(claim_supervisor_as(&ctx, host, None, None, None, now).is_ok());
-    assert!(claim_supervisor_as(&ctx, &me, Some(2), None, Some(running()), now).is_ok());
+    assert!(release_supervisor(&ctx, None, now, aterm_slog::Actor::Ctl));
+    assert!(claim_supervisor_as(&ctx, host, None, None, None, now, aterm_slog::Actor::Ctl).is_ok());
+    assert!(
+        claim_supervisor_as(
+            &ctx,
+            &me,
+            Some(2),
+            None,
+            Some(running()),
+            now,
+            aterm_slog::Actor::Ctl
+        )
+        .is_ok()
+    );
 }
 
 /// `meta set harness_act <act>` (§5): only the live PROVEN self-claim's
@@ -289,37 +368,83 @@ fn only_a_proven_claims_holder_records_an_act() {
     let ok = Some(("OK\n".to_string(), true));
     // Not this form: falls through to `meta`.
     assert_eq!(
-        cmd_meta_harness_act(ctx, Some(1), &proof, "set title x"),
+        cmd_meta_harness_act(ctx, Some(1), aterm_slog::Actor::Ctl, &proof, "set title x"),
         None
     );
-    assert_eq!(cmd_meta_harness_act(ctx, Some(1), &proof, ""), None);
+    assert_eq!(
+        cmd_meta_harness_act(ctx, Some(1), aterm_slog::Actor::Ctl, &proof, ""),
+        None
+    );
     // No claim.
     assert_eq!(
-        cmd_meta_harness_act(ctx, Some(1), &proof, "set harness_act continue"),
+        cmd_meta_harness_act(
+            ctx,
+            Some(1),
+            aterm_slog::Actor::Ctl,
+            &proof,
+            "set harness_act continue"
+        ),
         denied
     );
     // An unproven claim, on its own connection.
     let me = format!("codex-alab@{}", std::process::id());
-    assert!(claim_supervisor_as(ctx, &me, Some(1), None, None, now).is_ok());
+    assert!(
+        claim_supervisor_as(ctx, &me, Some(1), None, None, now, aterm_slog::Actor::Ctl).is_ok()
+    );
     assert_eq!(
-        cmd_meta_harness_act(ctx, Some(1), &proof, "set harness_act continue"),
+        cmd_meta_harness_act(
+            ctx,
+            Some(1),
+            aterm_slog::Actor::Ctl,
+            &proof,
+            "set harness_act continue"
+        ),
         denied
     );
     assert_eq!(acts(ctx), (Vec::new(), None));
     // Proven, bound to connection 2.
-    assert!(release_supervisor(ctx, None, now));
-    assert!(claim_supervisor_as(ctx, &me, Some(2), None, Some(running()), now).is_ok());
+    assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
+    assert!(
+        claim_supervisor_as(
+            ctx,
+            &me,
+            Some(2),
+            None,
+            Some(running()),
+            now,
+            aterm_slog::Actor::Ctl
+        )
+        .is_ok()
+    );
     assert_eq!(
-        cmd_meta_harness_act(ctx, Some(2), &no_proof, "set harness_act continue"),
+        cmd_meta_harness_act(
+            ctx,
+            Some(2),
+            aterm_slog::Actor::Ctl,
+            &no_proof,
+            "set harness_act continue"
+        ),
         ok
     );
     // Another connection: only with the kernel's proof again.
     assert_eq!(
-        cmd_meta_harness_act(ctx, Some(3), &no_proof, "set harness_act approve"),
+        cmd_meta_harness_act(
+            ctx,
+            Some(3),
+            aterm_slog::Actor::Ctl,
+            &no_proof,
+            "set harness_act approve"
+        ),
         denied
     );
     assert_eq!(
-        cmd_meta_harness_act(ctx, Some(3), &proof, "set harness_act approve"),
+        cmd_meta_harness_act(
+            ctx,
+            Some(3),
+            aterm_slog::Actor::Ctl,
+            &proof,
+            "set harness_act approve"
+        ),
         ok
     );
     assert_eq!(
@@ -337,18 +462,41 @@ fn only_a_proven_claims_holder_records_an_act() {
     // cannot speak for the standing claim.
     let reused = |_: &str| Some(gone());
     assert_eq!(
-        cmd_meta_harness_act(ctx, Some(3), &reused, "set harness_act continue"),
+        cmd_meta_harness_act(
+            ctx,
+            Some(3),
+            aterm_slog::Actor::Ctl,
+            &reused,
+            "set harness_act continue"
+        ),
         denied
     );
     // A release and new claim can land during the off-lock kernel look.
     // Even the same holder/pid/start cannot authorize the older request.
     let moved = |_: &str| {
-        assert!(release_supervisor(ctx, None, now));
-        assert!(claim_supervisor_as(ctx, &me, Some(2), None, Some(running()), now).is_ok());
+        assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
+        assert!(
+            claim_supervisor_as(
+                ctx,
+                &me,
+                Some(2),
+                None,
+                Some(running()),
+                now,
+                aterm_slog::Actor::Ctl
+            )
+            .is_ok()
+        );
         Some(running())
     };
     assert_eq!(
-        cmd_meta_harness_act(ctx, Some(3), &moved, "set harness_act continue"),
+        cmd_meta_harness_act(
+            ctx,
+            Some(3),
+            aterm_slog::Actor::Ctl,
+            &moved,
+            "set harness_act continue"
+        ),
         denied
     );
     assert_eq!(acts(ctx), before, "a stale act records nothing");
@@ -361,11 +509,130 @@ fn only_a_proven_claims_holder_records_an_act() {
         "unset harness_act",
     ] {
         assert_eq!(
-            cmd_meta_harness_act(ctx, Some(2), &proof, rest),
+            cmd_meta_harness_act(ctx, Some(2), aterm_slog::Actor::Ctl, &proof, rest),
             usage,
             "{rest}"
         );
     }
+}
+
+/// A PROVEN HOLDER'S ACT IS ONE ACT MARK (plan 5C-2; rulings T21, T24): in
+/// the hold that records the `harness-act` row, an act the log has a word
+/// for writes `mark act word=<w> rule=<act, @ written .> by=<the
+/// connection's actor> src=mark conf=claim`, and its wake is taken in that
+/// hold (the caller's change wake notifies). The mark lands on the deepest
+/// open node, as `aterm help` teaches (`mark <node> act`): the session (`-`)
+/// while nothing is open, the approval's step while one is. An act with no
+/// word (`finished@v1`) is its row alone. NEGATIVE CONTROL: a denied act
+/// writes neither row nor mark.
+#[test]
+fn a_proven_holders_act_is_one_act_mark_by_the_connection() {
+    use super::control_session::cmd_meta_harness_act;
+    use aterm_slog::{Actor, Conf, Key, Kind, Node, Op, Src};
+    let h = crate::session_store::test_handle_on(7506, -1);
+    let ctx = h.ctx.as_ref();
+    let now = crate::metrics::now_us();
+    let proof = |_: &str| -> Option<Proven> { Some(running()) };
+    let no_proof = |_: &str| -> Option<Proven> { None };
+    let marks = |ctx: &crate::SessionCtx| {
+        let timeline = ctx.timeline.lock().unwrap_or_else(PoisonError::into_inner);
+        let rows = timeline
+            .since(None)
+            .filter(|e| e.kind == crate::session_timeline::HARNESS_ACT)
+            .count();
+        let acts: Vec<(String, String, Actor, Src, Conf, Node)> = timeline
+            .slog()
+            .log()
+            .window()
+            .filter(|r| r.op == Op::Mark && r.k == Kind::Act)
+            .map(|r| {
+                (
+                    r.f.get_word(Key::Word).unwrap_or("-").to_string(),
+                    r.f.get_str(Key::Rule).unwrap_or("-").to_string(),
+                    r.by,
+                    r.src,
+                    r.conf,
+                    r.node,
+                )
+            })
+            .collect();
+        (rows, acts)
+    };
+    let me = format!("codex-alab@{}", std::process::id());
+    assert!(claim_supervisor_as(ctx, &me, Some(2), None, Some(running()), now, Actor::Ctl).is_ok());
+    let ok = Some(("OK\n".to_string(), true));
+    assert_eq!(
+        cmd_meta_harness_act(
+            ctx,
+            Some(2),
+            Actor::Ctl,
+            &proof,
+            "set harness_act approve-all@v1"
+        ),
+        ok
+    );
+    assert!(
+        !ctx.timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .slog_take_wake(),
+        "the act's wake was taken in its own hold"
+    );
+    // An approval box opens: the next act lands on its step.
+    let step = super::tests::with_open_approval(&h);
+    assert_eq!(
+        cmd_meta_harness_act(
+            ctx,
+            Some(2),
+            Actor::Harness,
+            &proof,
+            "set harness_act upgrade@v1"
+        ),
+        ok
+    );
+    assert_eq!(
+        cmd_meta_harness_act(
+            ctx,
+            Some(2),
+            Actor::Ctl,
+            &proof,
+            "set harness_act finished@v1"
+        ),
+        ok
+    );
+    let claim = (Src::Mark, Conf::Claim);
+    let want = vec![
+        (
+            "approve".to_string(),
+            "approve-all.v1".to_string(),
+            Actor::Ctl,
+            claim.0,
+            claim.1,
+            Node::SESSION,
+        ),
+        (
+            "relaunch".to_string(),
+            "upgrade.v1".to_string(),
+            Actor::Harness,
+            claim.0,
+            claim.1,
+            step,
+        ),
+    ];
+    assert_eq!(marks(ctx), (3, want.clone()));
+    // NEGATIVE CONTROL: another connection with no proof is denied, and
+    // writes nothing.
+    assert_eq!(
+        cmd_meta_harness_act(
+            ctx,
+            Some(3),
+            Actor::Ctl,
+            &no_proof,
+            "set harness_act continue@v1"
+        ),
+        Some(("ERR denied\n".to_string(), false))
+    );
+    assert_eq!(marks(ctx), (3, want));
 }
 
 #[test]
@@ -375,7 +642,18 @@ fn a_proven_claim_is_never_carried_across_an_update() {
     let now = crate::metrics::now_us();
     let me = format!("codex-alab@{}", std::process::id());
     let ttl = Some(now + 60_000_000);
-    assert!(claim_supervisor_as(ctx, &me, None, ttl, Some(running()), now).is_ok());
+    assert!(
+        claim_supervisor_as(
+            ctx,
+            &me,
+            None,
+            ttl,
+            Some(running()),
+            now,
+            aterm_slog::Actor::Ctl
+        )
+        .is_ok()
+    );
     let meta = ctx
         .meta
         .lock()
@@ -386,8 +664,8 @@ fn a_proven_claim_is_never_carried_across_an_update() {
         (None, false)
     );
     // Negative control: the same lease unproven is carried.
-    assert!(release_supervisor(ctx, None, now));
-    assert!(claim_supervisor_as(ctx, &me, None, ttl, None, now).is_ok());
+    assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
+    assert!(claim_supervisor_as(ctx, &me, None, ttl, None, now, aterm_slog::Actor::Ctl).is_ok());
     let meta = ctx
         .meta
         .lock()
@@ -488,8 +766,22 @@ impl LaneService for MetaService {
 
     fn subscribe(&self, _line: String, _scope: Scope, _stream: CtlStream) {}
 
+    fn has_live_claim(&self, id: u64) -> bool {
+        self.ctx
+            .meta
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .live_claim(crate::metrics::now_us())
+            .is_some_and(|claim| claim.conn == Some(id))
+    }
+
     fn release(&self, id: u64) {
-        let _ = release_supervisor(&self.ctx, Some(id), crate::metrics::now_us());
+        let _ = release_supervisor(
+            &self.ctx,
+            Some(id),
+            crate::metrics::now_us(),
+            aterm_slog::Actor::Ctl,
+        );
     }
 }
 

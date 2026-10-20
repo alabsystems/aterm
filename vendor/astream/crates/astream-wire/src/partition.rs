@@ -30,7 +30,7 @@ contract_fn! {
     ///
     /// Verified against `Astream.Wire.TlaPartitionRouter.partition_in_bounds_isl` by
     /// `clean-kernel-defeq`.
-    pub fn partition_in_bounds(partition: u64, modulus: u64) -> bool
+    pub const fn partition_in_bounds(partition: u64, modulus: u64) -> bool
     clauses [ensures result == (partition < modulus)]
     {
         partition < modulus
@@ -42,8 +42,28 @@ contract_fn! {
 pub const TIME_BUCKET_MS: u64 = 2000;
 
 /// Map a millisecond timestamp to its sticky bucket index.
-pub fn time_bucket(timestamp_ms: u64) -> u64 {
+#[must_use]
+pub const fn time_bucket(timestamp_ms: u64) -> u64 {
     timestamp_ms / TIME_BUCKET_MS
+}
+
+const fn slice_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut ar = a;
+    let mut br = b;
+    while let &[x, ref ta @ ..] = ar {
+        let &[y, ref tb @ ..] = br else {
+            return false;
+        };
+        if x != y {
+            return false;
+        }
+        ar = ta;
+        br = tb;
+    }
+    true
 }
 
 /// What determines a message's partition. Borrowed, so this stays allocation-
@@ -65,7 +85,7 @@ pub enum PartitionKey<'a> {
 impl PartialEq for PartitionKey<'_> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Keyed(a), Self::Keyed(b)) => *a == *b,
+            (Self::Keyed(a), Self::Keyed(b)) => slice_eq(a, b),
             (
                 Self::UnkeyedDurable {
                     topic: t1,
@@ -77,7 +97,11 @@ impl PartialEq for PartitionKey<'_> {
                     origin: o2,
                     time_bucket: b2,
                 },
-            ) => *t1 == *t2 && *o1 == *o2 && *b1 == *b2,
+            ) => {
+                slice_eq(t1.as_bytes(), t2.as_bytes())
+                    && slice_eq(o1.as_bytes(), o2.as_bytes())
+                    && *b1 == *b2
+            }
             (Self::UnkeyedEphemeral { msg_id: a }, Self::UnkeyedEphemeral { msg_id: b }) => {
                 *a == *b
             }
@@ -91,8 +115,14 @@ impl PartialEq for PartitionKey<'_> {
 /// Assign a partition in `0..num_partitions.max(1)`. Deterministic, allocation-free,
 /// and always in bounds (the `.max(1)` guard — matching [`partition_modulus_clamp`]
 /// with `floor = 1` — means `num_partitions == 0` maps to 1).
-pub fn assign_partition(key: PartitionKey<'_>, num_partitions: u32) -> u32 {
-    let n = num_partitions.max(1) as u64;
+#[must_use]
+pub const fn assign_partition(key: PartitionKey<'_>, num_partitions: u32) -> u32 {
+    let clamped = if num_partitions > 1 {
+        num_partitions
+    } else {
+        1
+    };
+    let n = clamped as u64;
     let h = match key {
         PartitionKey::Keyed(k) => fnv1a_64(k),
         PartitionKey::UnkeyedDurable {

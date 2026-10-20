@@ -24,7 +24,7 @@ contract_fn! {
     /// Verified check that a stop-poll index `idx` is strictly within `max_reads`,
     /// linked via `clean-kernel-defeq` to `demo_poll_in_range_isl`.
     #[must_use]
-    pub fn demo_poll_in_range(idx: u64, max_reads: u64) -> bool
+    pub const fn demo_poll_in_range(idx: u64, max_reads: u64) -> bool
     clauses [ensures result == (idx < max_reads)]
     {
         idx < max_reads
@@ -32,12 +32,14 @@ contract_fn! {
 }
 
 /// Fold the four effects into a digest. Non-commutative in `r0`/`r1`.
-fn digest(c: u64, r0: u64, r1: u64, bytes: &[u8]) -> u64 {
+const fn digest(c: u64, r0: u64, r1: u64, bytes: &[u8]) -> u64 {
     let mut d = c;
     d = d.wrapping_mul(P).wrapping_add(r0);
     d = d.wrapping_mul(P).wrapping_add(r1);
-    for &b in bytes {
+    let mut rest = bytes;
+    while let &[b, ref tail @ ..] = rest {
         d = d.wrapping_mul(P).wrapping_add(b as u64);
+        rest = tail;
     }
     d
 }
@@ -61,15 +63,19 @@ pub fn run<S: EffectSeam>(seam: &mut S, path: &str) -> Result<u64, S::Error> {
 /// on correct inputs. So `run(replay) == oracle(recorded values)` catches both
 /// replay-machinery bugs (value flows through the seam on one side, directly on the
 /// other) AND a shared fold-algorithm bug — never `f(x) == f(x)`.
-pub fn oracle(c: u64, r0: u64, r1: u64, bytes: &[u8]) -> u64 {
-    let head = c
+#[must_use]
+pub const fn oracle(c: u64, r0: u64, r1: u64, bytes: &[u8]) -> u64 {
+    let mut d = c
         .wrapping_mul(P)
         .wrapping_add(r0)
         .wrapping_mul(P)
         .wrapping_add(r1);
-    bytes
-        .iter()
-        .fold(head, |d, &b| d.wrapping_mul(P).wrapping_add(b as u64))
+    let mut rest = bytes;
+    while let &[b, ref tail @ ..] = rest {
+        d = d.wrapping_mul(P).wrapping_add(b as u64);
+        rest = tail;
+    }
+    d
 }
 
 /// Extract the `(clock, rand0, rand1, file-bytes)` a tape recorded, in order.
@@ -96,17 +102,154 @@ pub const STOP_READS: usize = 4;
 /// all-zero run does not digest to zero.
 const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
+/// Pack the [`STOP_READS`] boolean polls into a single `u64` word (`bit i = stops[i]`).
+#[must_use]
+pub const fn pack_stop_bits(stops: &[bool; STOP_READS]) -> u64 {
+    (stops[0] as u64)
+        | ((stops[1] as u64) << 1)
+        | ((stops[2] as u64) << 2)
+        | ((stops[3] as u64) << 3)
+}
+
+/// Unpack a `u64` stop-bit word back into its [`STOP_READS`] boolean polls.
+#[must_use]
+pub const fn unpack_stop_bits(bits: u64) -> [bool; STOP_READS] {
+    [
+        (bits & 1) != 0,
+        ((bits >> 1) & 1) != 0,
+        ((bits >> 2) & 1) != 0,
+        ((bits >> 3) & 1) != 0,
+    ]
+}
+
+/// Encode the four scalar `u64` words of a [`ConverseValues`] tape
+/// `(mono0, clock, rand, mono1)` into a 32-byte little-endian array.
+#[must_use]
+pub const fn encode_converse_scalars(mono0: u64, clock: u64, rand: u64, mono1: u64) -> [u8; 32] {
+    [
+        mono0 as u8,
+        (mono0 >> 8) as u8,
+        (mono0 >> 16) as u8,
+        (mono0 >> 24) as u8,
+        (mono0 >> 32) as u8,
+        (mono0 >> 40) as u8,
+        (mono0 >> 48) as u8,
+        (mono0 >> 56) as u8,
+        clock as u8,
+        (clock >> 8) as u8,
+        (clock >> 16) as u8,
+        (clock >> 24) as u8,
+        (clock >> 32) as u8,
+        (clock >> 40) as u8,
+        (clock >> 48) as u8,
+        (clock >> 56) as u8,
+        rand as u8,
+        (rand >> 8) as u8,
+        (rand >> 16) as u8,
+        (rand >> 24) as u8,
+        (rand >> 32) as u8,
+        (rand >> 40) as u8,
+        (rand >> 48) as u8,
+        (rand >> 56) as u8,
+        mono1 as u8,
+        (mono1 >> 8) as u8,
+        (mono1 >> 16) as u8,
+        (mono1 >> 24) as u8,
+        (mono1 >> 32) as u8,
+        (mono1 >> 40) as u8,
+        (mono1 >> 48) as u8,
+        (mono1 >> 56) as u8,
+    ]
+}
+
+/// Decode the four scalar `u64` words `(mono0, clock, rand, mono1)` from a 32-byte
+/// little-endian array.
+#[must_use]
+pub const fn decode_converse_scalars(raw: &[u8; 32]) -> (u64, u64, u64, u64) {
+    let mono0 = (raw[0] as u64)
+        | ((raw[1] as u64) << 8)
+        | ((raw[2] as u64) << 16)
+        | ((raw[3] as u64) << 24)
+        | ((raw[4] as u64) << 32)
+        | ((raw[5] as u64) << 40)
+        | ((raw[6] as u64) << 48)
+        | ((raw[7] as u64) << 56);
+    let clock = (raw[8] as u64)
+        | ((raw[9] as u64) << 8)
+        | ((raw[10] as u64) << 16)
+        | ((raw[11] as u64) << 24)
+        | ((raw[12] as u64) << 32)
+        | ((raw[13] as u64) << 40)
+        | ((raw[14] as u64) << 48)
+        | ((raw[15] as u64) << 56);
+    let rand = (raw[16] as u64)
+        | ((raw[17] as u64) << 8)
+        | ((raw[18] as u64) << 16)
+        | ((raw[19] as u64) << 24)
+        | ((raw[20] as u64) << 32)
+        | ((raw[21] as u64) << 40)
+        | ((raw[22] as u64) << 48)
+        | ((raw[23] as u64) << 56);
+    let mono1 = (raw[24] as u64)
+        | ((raw[25] as u64) << 8)
+        | ((raw[26] as u64) << 16)
+        | ((raw[27] as u64) << 24)
+        | ((raw[28] as u64) << 32)
+        | ((raw[29] as u64) << 40)
+        | ((raw[30] as u64) << 48)
+        | ((raw[31] as u64) << 56);
+    (mono0, clock, rand, mono1)
+}
+
 /// The question [`converse`] asks: built from the random word and the file it
 /// read, so a replay fed a wrong value asks a DIFFERENT question — which the
 /// reply door refuses as a diverged request — instead of silently receiving
 /// the recorded answer to a question it did not ask.
 pub fn ask(rand: u64, file: &[u8]) -> Vec<u8> {
-    format!("ask rand={rand:016x} len={}", file.len()).into_bytes()
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+    let mut out = Vec::with_capacity(50);
+    out.extend_from_slice(b"ask rand=");
+    let hex_bytes = [
+        HEX[((rand >> 60) & 0xF) as usize],
+        HEX[((rand >> 56) & 0xF) as usize],
+        HEX[((rand >> 52) & 0xF) as usize],
+        HEX[((rand >> 48) & 0xF) as usize],
+        HEX[((rand >> 44) & 0xF) as usize],
+        HEX[((rand >> 40) & 0xF) as usize],
+        HEX[((rand >> 36) & 0xF) as usize],
+        HEX[((rand >> 32) & 0xF) as usize],
+        HEX[((rand >> 28) & 0xF) as usize],
+        HEX[((rand >> 24) & 0xF) as usize],
+        HEX[((rand >> 20) & 0xF) as usize],
+        HEX[((rand >> 16) & 0xF) as usize],
+        HEX[((rand >> 12) & 0xF) as usize],
+        HEX[((rand >> 8) & 0xF) as usize],
+        HEX[((rand >> 4) & 0xF) as usize],
+        HEX[(rand & 0xF) as usize],
+    ];
+    out.extend_from_slice(&hex_bytes);
+    out.extend_from_slice(b" len=");
+    let mut n = file.len();
+    let mut dec = [0u8; 32];
+    let mut idx = 19usize;
+    dec[19] = b'0' | ((n % 10) as u8);
+    n /= 10;
+    while n > 0 && idx > 0 {
+        idx -= 1;
+        dec[idx & 31] = b'0' | ((n % 10) as u8);
+        n /= 10;
+    }
+    while idx < 20 {
+        out.push(dec[idx & 31]);
+        idx += 1;
+    }
+    out
 }
 
 /// What [`converse`] prints for a reply.
 pub fn say(reply: &[u8]) -> Vec<u8> {
-    let mut line = b"got ".to_vec();
+    let mut line = Vec::new();
+    line.extend_from_slice(b"got ");
     line.extend_from_slice(reply);
     line
 }
@@ -116,13 +259,15 @@ pub fn say(reply: &[u8]) -> Vec<u8> {
 struct Digest(u64);
 
 impl Digest {
-    fn word(&mut self, w: u64) {
+    const fn word(&mut self, w: u64) {
         self.0 = self.0.wrapping_mul(P).wrapping_add(w);
     }
-    fn bytes(&mut self, b: &[u8]) {
+    const fn bytes(&mut self, b: &[u8]) {
         self.word(b.len() as u64);
-        for &x in b {
-            self.word(u64::from(x));
+        let mut rest = b;
+        while let &[x, ref tail @ ..] = rest {
+            self.word(x as u64);
+            rest = tail;
         }
     }
 }
@@ -169,9 +314,7 @@ pub fn converse<S: EffectSeam>(
     d.bytes(&reply);
     d.bytes(&said);
     // The flag reads as one word, bit i = read i.
-    d.word(stops.iter().enumerate().fold(0, |w, (i, &up)| {
-        w | u64::from(up).checked_shl(i as u32).unwrap_or(0)
-    }));
+    d.word(pack_stop_bits(&stops));
     d.word(mono1);
     Ok(d.0)
 }
@@ -245,17 +388,21 @@ pub fn converse_values(log: &EffectsLog) -> Option<ConverseValues> {
         ),
         _ => return None,
     };
-    (peer == PEER && out == OUT).then(|| ConverseValues {
-        mono0: *mono0,
-        clock: *clock,
-        rand: *rand,
-        file: file.clone(),
-        request: request.clone(),
-        reply: reply.clone(),
-        said: said.clone(),
-        raised_at,
-        mono1: *mono1,
-    })
+    if peer == PEER && out == OUT {
+        Some(ConverseValues {
+            mono0: *mono0,
+            clock: *clock,
+            rand: *rand,
+            file: file.clone(),
+            request: request.clone(),
+            reply: reply.clone(),
+            said: said.clone(),
+            raised_at,
+            mono1: *mono1,
+        })
+    } else {
+        None
+    }
 }
 
 /// A GENUINELY INDEPENDENT recomputation of [`converse`]'s digest from the

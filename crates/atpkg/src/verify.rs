@@ -82,6 +82,19 @@ pub enum VerifyOutcome {
     },
 }
 
+impl VerifyOutcome {
+    /// Whether `atpkg verify` counts this outcome a pass (exit 0): the tree matches its
+    /// signed root or its vendor record, or it is a wired sysroot (informational). Every
+    /// other verdict fails closed.
+    #[must_use]
+    pub fn passes(&self) -> bool {
+        matches!(
+            self,
+            Self::Match { .. } | Self::WiredSysroot { .. } | Self::VendorRoot { drift: None, .. }
+        )
+    }
+}
+
 /// Verify one program's active build against the signed `tree_root` recorded in `status.toml`.
 /// Fail-closed, in order: not installed ⇒ [`VerifyOutcome::NotInstalled`]; no recorded root ⇒
 /// [`VerifyOutcome::NoSignedRoot`] (not a pass); recorded root for a different build ⇒
@@ -341,6 +354,19 @@ mod tests {
             VerifyOutcome::Match { build: legacy },
             "a rollback row recorded with no root"
         );
+        crate::vendor_direct::ProgramStamp::record_legacy_root(
+            &l,
+            "claude",
+            legacy,
+            &"c".repeat(64),
+        )
+        .unwrap();
+        record(&l, "claude", Some(legacy), &root);
+        assert_eq!(
+            verify_program(&l, "claude"),
+            VerifyOutcome::Match { build: legacy },
+            "a row that attests its own build outranks the root the stamp kept"
+        );
         std::fs::write(dir.join("bin").join(exe_name("claude")), b"tampered").unwrap();
         assert!(matches!(
             verify_program(&l, "claude"),
@@ -402,6 +428,17 @@ mod tests {
             ),
             "a mutated vendor tree drifts"
         );
+        #[cfg(unix)]
+        {
+            fifo(&dir.join("pipe"));
+            assert!(
+                matches!(
+                    verify_program(&l, "claude"),
+                    VerifyOutcome::Unreadable { build: b, .. } if b == build
+                ),
+                "a vendor tree the walk refuses is unreadable, never a match"
+            );
+        }
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -419,6 +456,92 @@ mod tests {
             }
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A FIFO at `path`: an entry no bundle holds, which the walk refuses.
+    #[cfg(unix)]
+    fn fifo(path: &std::path::Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a live NUL-terminated path in this test's scratch layout.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    }
+
+    /// What the walk meets decides the verdict. A build carrying the retired wiring's
+    /// `toolchain` link is reported as wired, never walked into or called drifted; a plain
+    /// `toolchain` directory is walked like the rest; an entry the walk refuses makes the
+    /// tree unreadable, never a pass.
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_decides_wired_drifted_or_unreadable() {
+        let l = layout("wired");
+        let dir = install(&l, "ay", 18);
+        record(&l, "ay", Some(18), &signed_root(&dir, "ay"));
+        let link = dir.join("toolchain");
+        std::os::unix::fs::symlink("../../no-such-toolchain", &link).unwrap();
+        assert_eq!(
+            verify_program(&l, "ay"),
+            VerifyOutcome::WiredSysroot { build: 18 }
+        );
+        std::fs::remove_file(&link).unwrap();
+        std::fs::create_dir(&link).unwrap();
+        std::fs::write(link.join("extra"), b"walked").unwrap();
+        assert!(matches!(
+            verify_program(&l, "ay"),
+            VerifyOutcome::Drift { build: 18, .. }
+        ));
+        std::fs::remove_dir_all(&link).unwrap();
+        fifo(&dir.join("pipe"));
+        assert!(matches!(
+            verify_program(&l, "ay"),
+            VerifyOutcome::Unreadable { build: 18, .. }
+        ));
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// The exit decision of `atpkg verify`: only a match, a vendor build matching its
+    /// record, or a wired sysroot passes.
+    #[test]
+    fn only_a_matching_tree_or_a_wired_sysroot_passes() {
+        use VerifyOutcome as V;
+        let root = || "a".repeat(64);
+        let vendor = |drift| V::VendorRoot {
+            build: 1,
+            vendor: "Anthropic".into(),
+            drift,
+        };
+        for (o, pass) in [
+            (V::Match { build: 1 }, true),
+            (V::WiredSysroot { build: 1 }, true),
+            (vendor(None), true),
+            (vendor(Some(root())), false),
+            (
+                V::Drift {
+                    build: 1,
+                    expected: root(),
+                    got: root(),
+                },
+                false,
+            ),
+            (V::NoSignedRoot { build: Some(1) }, false),
+            (V::NotInstalled, false),
+            (
+                V::Unreadable {
+                    build: 1,
+                    error: String::new(),
+                },
+                false,
+            ),
+            (
+                V::BuildMismatch {
+                    active: 1,
+                    recorded: None,
+                },
+                false,
+            ),
+        ] {
+            assert_eq!(o.passes(), pass, "{o:?}");
+        }
     }
 
     #[test]
@@ -461,7 +584,13 @@ mod tests {
         let l = layout("all");
         let ay = install(&l, "ay", 18);
         let ny = install(&l, "ny", 9);
-        record(&l, "ay", Some(18), &signed_root(&ay, "ay"));
+        // A recorded root matches in either case, as the install-time re-verify compares.
+        record(
+            &l,
+            "ay",
+            Some(18),
+            &signed_root(&ay, "ay").to_ascii_uppercase(),
+        );
         record(&l, "ny", Some(9), &signed_root(&ny, "ny"));
         std::fs::write(ny.join("bin/ny"), b"tampered").unwrap();
         let outcomes: std::collections::BTreeMap<_, _> = verify_all(&l).into_iter().collect();

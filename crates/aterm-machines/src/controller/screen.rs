@@ -22,22 +22,31 @@
 //!    comes before this reading, and it alone says whether the session was there before;
 //! 4. makes the fleet's `screen` request once with no input and refuses unless an RFB
 //!    greeting comes back ([`screen_answers`]: something answers, nothing more);
-//! 5. opens a relay on a free local port ([`System::relay`]): each connection to it runs the
+//! 5. when step 3 found no session, arms the host's screen watch ([`arm_cmd`],
+//!    `crate::agent::watch`), and refuses with nothing relayed when it is not armed: the
+//!    watcher locks the session itself once no request has reached the host for
+//!    [`watch::QUIET`], which is what is left when the controller is killed (`SIGKILL`),
+//!    crashes, or loses the host before step 10. A gap of [`REARM`] between two of the walk's
+//!    requests that ran arms it again ([`Watched`]), since the watcher may have locked and
+//!    ended in it;
+//! 6. opens a relay on a free local port ([`System::relay`]): each connection to it runs the
 //!    fleet's `screen` request ([`relay_cmd`]), whose bytes the host relays to its own
 //!    screensharingd. The fleet key forwards no port, so this is the only way in. From here
-//!    until the end, SIGINT, SIGTERM and SIGHUP stop the walk rather than the process
-//!    ([`System::catch_stops`]), so steps 8 and 9 still run;
-//! 6. opens `vnc://<admin>@127.0.0.1:<port>`, and waits until the admin's login session
+//!    until the command's last line, SIGINT, SIGTERM and SIGHUP stop the walk rather than the
+//!    process ([`System::catch_stops`]), so steps 9 to 11 still run, and a second stop during
+//!    the closing plan cannot end the command before that line ([`Screened::stops`]);
+//! 7. opens `vnc://<admin>@127.0.0.1:<port>`, and waits until the admin's login session
 //!    exists;
-//! 7. for each outstanding step, Full Disk Access before Developer Tools, opens the pane in
+//! 8. for each outstanding step, Full Disk Access before Developer Tools, opens the pane in
 //!    the admin's session and re-probes until the row reads granted;
-//! 8. closes the relay, which ends every connection still open;
-//! 9. when step 3 found no session and one exists now, locks it ([`lock_cmd`]): macOS relocks
-//!    a session Screen Sharing found locked when the connection closes, and leaves one logged
-//!    in over it unlocked at the Mac's display. A session that was there at step 3 is left to
-//!    macOS. A lock that does not read back is reported ([`Session::Unlocked`]), never taken
-//!    as done. Nothing on the controller can lock after it is killed (`SIGKILL`) or loses the
-//!    host, so the walk says so once the admin has logged in over the relay.
+//! 9. closes the relay, which ends every connection still open;
+//! 10. when step 3 found no session and one exists now, locks it ([`lock_cmd`]): macOS
+//!     relocks a session Screen Sharing found locked when the connection closes, and leaves
+//!     one logged in over it unlocked at the Mac's display. A session that was there at step 3
+//!     is left to macOS. A lock that does not read back is reported ([`Session::Unlocked`]),
+//!     never taken as done;
+//! 11. disarms the watch ([`disarm_cmd`]) once the session is known safe: locked, or never
+//!     there. A lock that did not read back leaves it armed, to try once more itself.
 //!
 //! `person <host> --here` is the same walk with no relay and no viewer, for a person at the
 //! Mac's own keyboard, who can also do the two steps that need it (Remote Login and Screen
@@ -47,10 +56,12 @@
 
 use super::inventory::Paths;
 use super::ssh::{self, Target};
+use crate::agent::watch;
 use crate::envelope::Exec;
 use crate::items::person::{self, Kind, Known, PersonStep};
 use crate::model::{HostReport, Outcome, Probe, User};
 use crate::port::{Cmd, Ran, RunFailed, System};
+use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 /// How long one wait for a person may last before the flow decides nobody is there.
@@ -360,6 +371,202 @@ pub fn session_cmd(user: &User) -> Exec {
     }
 }
 
+/// The request that arms the host's screen watch for `user` before anything is relayed: the
+/// agent's `screen-watch arm` ([`crate::agent::watch`]) as root, answered `armed <id>` once
+/// the watcher runs.
+#[must_use]
+pub fn arm_cmd(user: &User) -> Exec {
+    let uid = user.uid.to_string();
+    Exec {
+        argv: [
+            crate::protocol::AGENT_EXE,
+            "machines",
+            "agent",
+            "screen-watch",
+            "arm",
+            "--uid",
+            uid.as_str(),
+            "--user",
+            user.name.as_str(),
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+        user: None,
+        budget_secs: EXEC_BUDGET_SECS,
+    }
+}
+
+/// The request that disarms the host's screen watch `id`: the agent's `screen-watch disarm`.
+#[must_use]
+pub fn disarm_cmd(id: &str) -> Exec {
+    Exec {
+        argv: [
+            crate::protocol::AGENT_EXE,
+            "machines",
+            "agent",
+            "screen-watch",
+            "disarm",
+            id,
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+        user: None,
+        budget_secs: EXEC_BUDGET_SECS,
+    }
+}
+
+/// The first line a request printed that is not blank.
+fn first_line(ran: &Ran) -> String {
+    ran.out()
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Arm the host's screen watch for `admin` ([`arm_cmd`]); the arm's id.
+///
+/// # Errors
+/// Why it is not armed: the agent's own `not armed: <why>`, how the run ended and what it
+/// printed (an agent from before the watch refuses the verb), or that the request did not run.
+fn arm_watch(remote: &dyn Remote, admin: &User) -> Result<String, String> {
+    let ran = remote
+        .exec(&arm_cmd(admin))
+        .map_err(|why| format!("the request did not run: {why}"))?;
+    let line = first_line(&ran);
+    if ran.success()
+        && let Some(id) = line
+            .strip_prefix("armed ")
+            .and_then(|rest| rest.split(' ').next())
+            .filter(|id| crate::agent::is_run_id(id))
+    {
+        return Ok(id.to_owned());
+    }
+    Err(match line.strip_prefix("not armed: ") {
+        Some(why) => why.to_owned(),
+        None if line.is_empty() => ran.describe(),
+        None => format!("{}: {line}", ran.describe()),
+    })
+}
+
+/// Disarm the host's screen watch `id` ([`disarm_cmd`]). A watcher that had ended first (it
+/// locked during an outage, say) is one line saying what it did; a disarm that did not go
+/// through is one line too, and changes nothing else: the watcher then reads the session
+/// itself and locks it if it is there, which is harmless.
+fn disarm_watch(remote: &dyn Remote, say: &dyn Fn(&str), admin: &User, id: &str) {
+    let failed = match remote.exec(&disarm_cmd(id)) {
+        Ok(ran) if ran.success() => {
+            let line = first_line(&ran);
+            if let Some(ended) = line
+                .strip_prefix(&format!("disarmed {id} (it had ended: "))
+                .and_then(|rest| rest.strip_suffix(')'))
+            {
+                say(&format!(
+                    "the host's screen watch had already ended: {ended}"
+                ));
+            }
+            return;
+        }
+        Ok(ran) => match first_line(&ran) {
+            line if line.is_empty() => ran.describe(),
+            line => line
+                .strip_prefix("not disarmed: ")
+                .map_or_else(|| format!("{}: {line}", ran.describe()), str::to_owned),
+        },
+        Err(why) => format!("the request did not run: {why}"),
+    };
+    say(&format!(
+        "the host's screen watch was not disarmed ({failed}): once no request has reached the \
+         host for {}s it locks {}'s session if there is one, which is harmless",
+        watch::QUIET.as_secs(),
+        admin.name
+    ));
+}
+
+/// How long a walk with the screen watch armed may go between two requests that ran before
+/// it arms the watch again: half the watcher's [`watch::QUIET`], which it measures from what
+/// it saw on the host, so no gap that let the watcher lock is shorter than this here.
+pub const REARM: Duration = Duration::from_secs(watch::QUIET.as_secs() / 2);
+
+/// `screen`'s requests to the host once its screen watch is armed. A watcher that locked
+/// while the walk still ran (an outage shorter than the walk, another command's run holding
+/// the host, a host a login keeps busy that long) has ended, and the person may unlock the
+/// session over the relay once the host answers again: a kill after that would leave the Mac
+/// unlocked. So after a gap of [`REARM`] between two requests that ran, the walk arms the
+/// replacement before retiring the arm it holds, which says what an ended watcher did
+/// ([`disarm_watch`]). An arm that fails retains the old id, is said once, and is tried
+/// again at the next request that runs; that retained id is not promised as a live watch.
+struct Watched<'a> {
+    remote: &'a dyn Remote,
+    clock: &'a dyn Clock,
+    say: &'a dyn Fn(&str),
+    admin: &'a User,
+    /// The last acknowledged arm, retained until its replacement is acknowledged.
+    id: RefCell<Option<String>>,
+    /// When the last request that ran came back; `None` after a replacement refusal,
+    /// so the next successful request retries it and no live replacement is promised.
+    ran: Cell<Option<Duration>>,
+}
+
+impl Watched<'_> {
+    /// The arm held now, if any.
+    fn id(&self) -> Option<String> {
+        self.id.borrow().clone()
+    }
+
+    /// Acknowledge the replacement before retiring the arm held, if any.
+    fn arm_again(&self) {
+        let old = self.id.borrow().clone();
+        let pending = self.ran.get().is_none();
+        match arm_watch(self.remote, self.admin) {
+            Ok(id) => {
+                *self.id.borrow_mut() = Some(id.clone());
+                self.ran.set(Some(self.clock.elapsed()));
+                if let Some(old) = &old
+                    && old != &id
+                {
+                    disarm_watch(self.remote, self.say, self.admin, old);
+                }
+                if old.is_none() || pending {
+                    (self.say)("the host's screen watch is armed again");
+                }
+            }
+            Err(why) => {
+                self.ran.set(None);
+                if old.is_some() && !pending {
+                    (self.say)(&format!(
+                        "the host's screen watch was not armed again ({why}): if aterm is killed or \
+                         loses the Mac before the walk's own lock, {}'s session stays as it is left; \
+                         tried again at the next request",
+                        self.admin.name
+                    ));
+                }
+            }
+        }
+    }
+}
+
+impl Remote for Watched<'_> {
+    fn exec(&self, exec: &Exec) -> Result<Ran, String> {
+        let got = self.remote.exec(exec);
+        if got.is_ok() {
+            let now = self.clock.elapsed();
+            if self
+                .ran
+                .get()
+                .is_none_or(|last| now.saturating_sub(last) >= REARM)
+                || self.id.borrow().is_none()
+            {
+                self.arm_again();
+            } else {
+                self.ran.set(Some(now));
+            }
+        }
+        got
+    }
+}
+
 /// What each connection to `screen`'s relay runs: the fleet's `screen` request of `target`
 /// ([`ssh::request_cmd`]), with the connection as its standard input and output.
 ///
@@ -470,6 +677,33 @@ pub fn await_granted(flow: &Flow<'_>, step: &PersonStep) -> Result<String, Strin
     }
 }
 
+/// Open `url` in `admin`'s session ([`open_pane_cmd`]). A request that did not run is sent
+/// again every [`POLL`], as the walk's readings are: right after a login over the relay the
+/// host can be too busy to answer for a while (VM, 27.0: `Connection timed out during banner
+/// exchange` on the walk's first two requests after the login, and the walk ended with the
+/// step not granted). One that ran and failed is final.
+///
+/// # Errors
+/// How the open ran, when it failed; the last reason it did not run once [`Flow::hang`]
+/// passes; or the signal that stopped the walk ([`System::stopped`]).
+fn open_pane(flow: &Flow<'_>, admin: &User, url: &str) -> Result<(), String> {
+    let start = flow.clock.elapsed();
+    loop {
+        let why = match flow.remote.exec(&open_pane_cmd(admin, url)) {
+            Ok(ran) if ran.success() => return Ok(()),
+            Ok(ran) => return Err(ran.describe()),
+            Err(why) => format!("the request did not run: {why}"),
+        };
+        if let Some(sig) = flow.sys.stopped() {
+            return Err(format!("{} ({why})", stopped_by(sig)));
+        }
+        if flow.clock.elapsed().saturating_sub(start) >= flow.hang {
+            return Err(format!("{why} (sent for {}s)", flow.hang.as_secs()));
+        }
+        flow.clock.pause(POLL);
+    }
+}
+
 /// The line a walk a signal stopped ends a step or a wait with.
 fn stopped_by(sig: i32) -> String {
     format!("stopped by {}", crate::port::stop_name(sig))
@@ -491,6 +725,10 @@ pub enum Reading {
 pub fn read_session(flow: &Flow<'_>, admin: &User) -> Result<Reading, String> {
     match flow.remote.exec(&session_cmd(admin)) {
         Ok(ran) if ran.success() => Ok(Reading::There),
+        Ok(ran) if ran.status.is_none() => Err(format!(
+            "the session query did not exit normally: {}",
+            ran.describe()
+        )),
         Ok(ran) => Ok(Reading::Absent(format!(
             "launchctl print gui/{}: {}",
             admin.uid,
@@ -611,17 +849,7 @@ fn walk(flow: &Flow<'_>, admin: &User, steps: &[Step], at_console: bool) -> Vec<
             });
             continue;
         }
-        let opened = flow
-            .remote
-            .exec(&open_pane_cmd(admin, s.url()))
-            .and_then(|ran| {
-                if ran.success() {
-                    Ok(())
-                } else {
-                    Err(ran.describe())
-                }
-            });
-        if let Err(why) = opened {
+        if let Err(why) = open_pane(flow, admin, s.url()) {
             stopped = Some(step.clone());
             out.push(Walked {
                 step,
@@ -683,41 +911,74 @@ pub enum Session {
     Kept,
     /// The admin logged in over the relay, and `screen` locked the session after it.
     Locked,
-    /// The admin logged in over the relay and the lock did not read back: why. The Mac is
-    /// logged in and unlocked at its display.
-    Unlocked(String),
+    /// The lock after the walk did not read back. The Mac is logged in and unlocked at its
+    /// display, or may be when no reading saw the login.
+    Unlocked {
+        /// Why the lock failed.
+        why: String,
+        /// Why the last reading did not run, when none saw the login: the wait for it ended
+        /// (a stop, the hang detector) and the reading after that did not run, so whether the
+        /// admin logged in at all is not known.
+        unread: Option<String>,
+        /// The host's screen watch stays armed, to try the lock itself.
+        watched: bool,
+    },
 }
 
 impl Session {
-    /// The one line `screen` ends with when it left the Mac logged in and unlocked, after the
-    /// walk's own lines and its closing plan; `None` otherwise.
+    /// The one line `screen` ends with when it left the Mac logged in and unlocked, or may
+    /// have, after the walk's own lines and its closing plan; `None` otherwise.
     #[must_use]
     pub fn unlocked_line(&self, host: &str, admin: &str) -> Option<String> {
-        match self {
-            Self::Unlocked(why) => Some(format!(
+        let Self::Unlocked {
+            why,
+            unread,
+            watched,
+        } = self
+        else {
+            return None;
+        };
+        let then = if *watched {
+            format!(
+                "; the host's screen watch locks it once no request has reached the host for {}s",
+                watch::QUIET.as_secs()
+            )
+        } else {
+            String::new()
+        };
+        Some(match unread {
+            None => format!(
                 "{host}: the Mac is still logged in as {admin} and unlocked at its display: \
-                 the lock after the walk failed ({why})"
-            )),
-            Self::Kept | Self::Locked => None,
-        }
+                 the lock after the walk failed ({why}){then}"
+            ),
+            Some(read) => format!(
+                "{host}: the Mac may be logged in as {admin} and unlocked at its display: \
+                 whether {admin} logged in over Screen Sharing is not known (the last reading: \
+                 {read}), and the lock after the walk failed ({why}){then}"
+            ),
+        })
     }
 }
 
 /// What `screen` did: each step, and the session it left.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Screened {
     /// Each step's result.
     pub walked: Vec<Walked>,
     /// The admin's session at the end.
     pub session: Session,
+    /// The stops [`System::catch_stops`] caught from the relay's opening, still caught. The
+    /// command drops this once its last line is out, so a further stop (a second Ctrl-C during
+    /// the closing plan) is noted and ignored rather than ending it before that line.
+    pub stops: Box<dyn std::any::Any>,
 }
 
 /// Lock the session `admin` logged in to over the relay ([`lock_cmd`]). macOS leaves a login
 /// made over Screen Sharing unlocked at the Mac's display when the connection closes (VM,
 /// 27.0: 3 of 3 logins, watched for 5 minutes), so `screen` does what ScreensharingAgent does
 /// for a session it found locked. Lock, never log out: a logout would end what the person
-/// opened in that session.
-fn lock_session(flow: &Flow<'_>, admin: &User) -> Session {
+/// opened in that session. `unread` and `watched` go into a [`Session::Unlocked`].
+fn lock_session(flow: &Flow<'_>, admin: &User, unread: Option<String>, watched: bool) -> Session {
     let why = match flow.remote.exec(&lock_cmd(admin)) {
         Ok(ran) if ran.success() => {
             (flow.say)(&format!(
@@ -729,18 +990,79 @@ fn lock_session(flow: &Flow<'_>, admin: &User) -> Session {
         }
         // The agent's own `not locked: <why>`; else how the run ended and what it printed (an
         // agent from before `lock-screen` refuses the verb on standard output).
-        Ok(ran) => {
-            let out = ran.out();
-            match out.lines().map(str::trim).find(|l| !l.is_empty()) {
-                Some(line) => line
-                    .strip_prefix("not locked: ")
-                    .map_or_else(|| format!("{}: {line}", ran.describe()), str::to_owned),
-                None => ran.describe(),
-            }
-        }
+        Ok(ran) => match first_line(&ran) {
+            line if line.is_empty() => ran.describe(),
+            line => line
+                .strip_prefix("not locked: ")
+                .map_or_else(|| format!("{}: {line}", ran.describe()), str::to_owned),
+        },
         Err(why) => format!("the request did not run: {why}"),
     };
-    Session::Unlocked(why)
+    Session::Unlocked {
+        why,
+        unread,
+        watched,
+    }
+}
+
+/// The line once the admin logged in over the relay: what locks the session, and when.
+fn logged_in_line(admin: &User, watched: bool) -> String {
+    let otherwise = if watched {
+        format!(
+            "the host locks it itself once no request has reached it for {}s",
+            watch::QUIET.as_secs()
+        )
+    } else {
+        "the Mac stays logged in and unlocked at its display".to_owned()
+    };
+    format!(
+        "{} logged in over Screen Sharing: the session is locked again when the walk ends or is \
+         stopped; if aterm is killed or loses the Mac first, {otherwise}",
+        admin.name
+    )
+}
+
+/// After the relay closed: the steps, and the session decided. A session there before the
+/// relay ([`Found::Existing`]) is kept; one the walk saw begin ([`Found::LoggedIn`]) is
+/// locked. A wait for the login that ended without one (a stop, the hang detector, the viewer
+/// not opening) reads the session once more, because the login may have come after the last
+/// reading: a session there, or a reading that did not run, is locked too, and the steps
+/// read not attempted. One that reads none ends the walk with `waited`'s error.
+fn decide(
+    flow: &Flow<'_>,
+    admin: &User,
+    steps: &[Step],
+    waited: Result<(Vec<Walked>, Found), String>,
+    absent: bool,
+    watched: bool,
+) -> Result<(Vec<Walked>, Session), String> {
+    let (walked, unread) = match waited {
+        Ok((walked, Found::Existing)) => return Ok((walked, Session::Kept)),
+        Ok((walked, Found::LoggedIn)) => (walked, None),
+        Err(why) if !absent => return Err(why),
+        Err(why) => {
+            let unread = match read_session(flow, admin) {
+                Ok(Reading::Absent(_)) => return Err(why),
+                Ok(Reading::There) => None,
+                Err(read) => Some(read),
+            };
+            let walked = if flow.sys.stopped().is_some() {
+                walk(flow, admin, steps, false)
+            } else {
+                steps
+                    .iter()
+                    .map(|s| Walked {
+                        step: s.id(),
+                        done: Done::NotGranted(format!("not attempted: {why}")),
+                    })
+                    .collect()
+            };
+            (walked, unread)
+        }
+    };
+    // After the close, so the lock is the last thing that happens at the display; measured
+    // on 27 that it still holds then (§11).
+    Ok((walked, lock_session(flow, admin, unread, watched)))
 }
 
 /// `aterm machines screen <host>`: walk `steps` over Screen Sharing through a relay
@@ -751,16 +1073,18 @@ fn lock_session(flow: &Flow<'_>, admin: &User) -> Session {
 /// control, whatever the report said: with it off, launchd holds no socket on port 5900,
 /// and any account on the host could listen there and be handed the admin's login. The
 /// admin's session is read then too, so no login over the relay can come before the reading
-/// the lock is decided by. A signal ([`System::catch_stops`]) from the relay's opening on
-/// ends the walk, not the process: the relay closes and the lock is decided the same way.
+/// the lock is decided by; with none there, the host's screen watch is armed before anything
+/// is relayed ([`arm_watch`]), and disarmed once the session is known safe. A signal
+/// ([`System::catch_stops`]) from the relay's opening on ends the walk, not the process: the
+/// relay closes and the lock is decided the same way.
 ///
 /// # Errors
 /// One line when the flow could not start: no terminal, Screen Sharing itself outstanding or
-/// not reading on, the session not read (nothing is relayed, since no lock could then be
-/// promised), the host did not answer ([`screen_answers`]), the relay or the viewer did not
-/// open, or the admin never logged in (a signal stopped the wait for it, or the hang
-/// detector did). A lock that failed is not an error here: it is [`Screened::session`],
-/// which the command prints last.
+/// not reading on, the session not read or the watch not armed (nothing is relayed, since no
+/// lock could then be promised), the host did not answer ([`screen_answers`]), the relay or
+/// the viewer did not open, or the admin never logged in (a signal stopped the wait for it,
+/// or the hang detector did). A lock that failed is not an error here: it is
+/// [`Screened::session`], which the command prints last.
 pub fn screen(
     flow: &Flow<'_>,
     paths: &Paths,
@@ -779,6 +1103,7 @@ pub fn screen(
         return Ok(Screened {
             walked: Vec::new(),
             session: Session::Kept,
+            stops: Box::new(()),
         });
     }
     match reprobe(flow.remote, &PersonStep::of(Kind::ScreenSharing)) {
@@ -816,65 +1141,90 @@ pub fn screen(
     let cmd = relay_cmd(paths, target)?;
     screen_answers(flow.sys, &cmd)
         .map_err(|e| format!("Screen Sharing on {} did not answer: {e}", target.address))?;
-    // Held until the lock is decided: a stop from here on closes the relay first.
+    // Nobody is logged in, so the walk may let a login in: the host is asked to lock it should
+    // this controller vanish first, before anything is relayed.
+    let watching = if absent {
+        let id = arm_watch(flow.remote, admin).map_err(|why| {
+            format!(
+                "the screen watch on {} was not armed ({why}), so no lock could be promised \
+                 if aterm is killed or loses the Mac; nothing was relayed",
+                target.address
+            )
+        })?;
+        Some(Watched {
+            remote: flow.remote,
+            clock: flow.clock,
+            say: flow.say,
+            admin,
+            id: RefCell::new(Some(id)),
+            ran: Cell::new(Some(flow.clock.elapsed())),
+        })
+    } else {
+        None
+    };
+    // From here on the walk's requests go through the watch, which arms itself again after a
+    // gap that may have let it lock and end ([`Watched`]).
+    let flow = &Flow {
+        sys: flow.sys,
+        remote: watching.as_ref().map_or(flow.remote, |w| w as &dyn Remote),
+        clock: flow.clock,
+        say: flow.say,
+        hang: flow.hang,
+    };
+    // Held until the command's last line ([`Screened::stops`]): a stop from here on closes the
+    // relay first.
     let stops = flow.sys.catch_stops();
-    let mut relay = flow
-        .sys
-        .relay(&cmd)
-        .map_err(|e| format!("the relay to {} did not open: {e}", target.address))?;
-    let result = (|| {
-        opener.open(&vnc_url(&target.user, relay.port()))?;
-        (flow.say)(&format!(
-            "Screen Sharing is opening {}: log in as {}",
-            target.address, admin.name
-        ));
-        let found = await_session_observed(flow, admin, &mut absent)?;
-        if found == Found::LoggedIn {
-            (flow.say)(&format!(
-                "{} logged in over Screen Sharing: the session is locked again when the walk \
-                 ends or is stopped; if aterm is killed or loses the Mac first, the Mac stays \
-                 logged in and unlocked at its display",
-                admin.name
-            ));
-        }
-        Ok::<_, String>((walk(flow, admin, steps, false), found))
-    })();
-    if let Err(e) = relay.close() {
-        (flow.say)(&format!("the relay did not close cleanly: {e}"));
-    }
-    let (walked, found) = match result {
-        Ok(done) => done,
-        // Every failed open-relay path keeps its observed absence: a login may
-        // have arrived after the last reading. Close first, then decide the lock.
-        // An unread final state cannot establish that there is nothing to lock.
-        Err(why) if absent => match read_session(flow, admin) {
-            Ok(Reading::Absent(_)) => return Err(why),
-            Ok(Reading::There) | Err(_) => {
-                (flow.say)(&why);
-                let walked = if flow.sys.stopped().is_some() {
-                    walk(flow, admin, steps, false)
-                } else {
-                    steps
-                        .iter()
-                        .map(|s| Walked {
-                            step: s.id(),
-                            done: Done::NotGranted(format!("not attempted: {why}")),
-                        })
-                        .collect()
-                };
-                (walked, Found::LoggedIn)
+    let watched = watching.is_some();
+    let ended = match flow.sys.relay(&cmd) {
+        Err(e) => Err(format!("the relay to {} did not open: {e}", target.address)),
+        Ok(mut relay) => {
+            let waited = (|| {
+                opener.open(&vnc_url(&target.user, relay.port()))?;
+                (flow.say)(&format!(
+                    "Screen Sharing is opening {}: log in as {}",
+                    target.address, admin.name
+                ));
+                let found = await_session_observed(flow, admin, &mut absent)?;
+                if found == Found::LoggedIn {
+                    (flow.say)(&logged_in_line(admin, watched));
+                }
+                Ok::<_, String>((walk(flow, admin, steps, false), found))
+            })();
+            if let Err(e) = relay.close() {
+                (flow.say)(&format!("the relay did not close cleanly: {e}"));
             }
-        },
-        Err(why) => return Err(why),
+            decide(flow, admin, steps, waited, absent, watched)
+        }
     };
-    // After the close, so the lock is the last thing that happens at the display; measured
-    // on 27 that it still holds then (§11).
-    let session = match found {
-        Found::Existing => Session::Kept,
-        Found::LoggedIn => lock_session(flow, admin),
-    };
-    drop(stops);
-    Ok(Screened { walked, session })
+    // The watch goes once the session is known safe: locked, or not there. A lock that did
+    // not read back retains its arm, so the host may try once more itself. A prior id kept
+    // after a refused replacement is not promised as a live watch.
+    let held = watching.as_ref().and_then(Watched::id);
+    let current = watching
+        .as_ref()
+        .is_some_and(|watch| watch.ran.get().is_some());
+    let ended = ended.map(|(walked, session)| match session {
+        Session::Unlocked { why, unread, .. } => (
+            walked,
+            Session::Unlocked {
+                why,
+                unread,
+                watched: held.is_some() && current,
+            },
+        ),
+        session => (walked, session),
+    });
+    if let (Some(w), Some(id)) = (&watching, &held)
+        && !matches!(&ended, Ok((_, Session::Unlocked { .. })))
+    {
+        disarm_watch(w.remote, flow.say, admin, id);
+    }
+    let (walked, session) = ended?;
+    Ok(Screened {
+        walked,
+        session,
+        stops,
+    })
 }
 
 /// `aterm machines person <host> --here`: the same walk for a person at the Mac's keyboard,
@@ -953,21 +1303,47 @@ mod tests {
 
     /// A scripted host: replies keyed by the exec's argv, consumed in order, the last one
     /// repeating; every request recorded. The admin has a session unless `sessions` scripts
-    /// the readings, and the lock reads back locked unless `lock` says otherwise.
+    /// the readings, a pane opens unless `panes` scripts the opens, the lock reads back locked
+    /// unless `lock` says otherwise, and the screen watch arms and disarms unless `arm` and
+    /// `disarm` say otherwise.
     #[derive(Default)]
     struct Host<'a> {
         replies: Mutex<BTreeMap<String, Vec<Ran>>>,
         seen: Mutex<Vec<String>>,
         /// `launchctl print gui/501`, reading by reading, the last repeating.
         sessions: Mutex<Vec<Result<Ran, String>>>,
+        /// Each pane open's answer in turn, the last repeating.
+        panes: Mutex<Vec<Result<Ran, String>>>,
         /// The lock request's answer (`locked` when `None`).
-        lock: Option<Ran>,
+        lock: Option<Result<Ran, String>>,
+        /// Each arm's answer in turn, the last repeating (`armed 1800000000-77` when none).
+        arm: Mutex<Vec<Result<Ran, String>>>,
+        /// Each disarm's answer in turn, the last repeating (`disarmed 1800000000-77` when
+        /// none).
+        disarm: Mutex<Vec<Result<Ran, String>>>,
         /// The port whose relay the lock request is checked against.
         sys: Option<&'a Fake>,
+        /// The viewer the arm is checked against.
+        viewer: Option<&'a Recorder>,
         /// Whether that relay had closed when the lock request came.
         closed_at_lock: Mutex<Option<bool>>,
         /// Whether that relay had opened when the first session reading came.
         relayed_at_first_reading: Mutex<Option<bool>>,
+        /// Whether the relay had opened, and the viewer, when the arm came.
+        opened_at_arm: Mutex<Option<(bool, bool)>>,
+    }
+
+    /// The id the scripted host arms.
+    const WATCH: &str = "1800000000-77";
+
+    /// The next answer of `script`, the last repeating; `None` when it is empty.
+    fn next(script: &Mutex<Vec<Result<Ran, String>>>) -> Option<Result<Ran, String>> {
+        let mut script = script.lock().unwrap();
+        match script.len() {
+            0 => None,
+            1 => Some(script[0].clone()),
+            _ => Some(script.remove(0)),
+        }
     }
 
     impl Host<'_> {
@@ -1009,10 +1385,27 @@ mod tests {
                     *self.closed_at_lock.lock().unwrap() =
                         Some(sys.calls().last().map(String::as_str) == Some("relay closed"));
                 }
-                return Ok(self.lock.clone().unwrap_or_else(|| Ran::ok("locked\n")));
+                return self.lock.clone().unwrap_or_else(|| Ok(Ran::ok("locked\n")));
+            }
+            match exec.argv.get(3..5) {
+                Some([verb, arm]) if verb == "screen-watch" && arm == "arm" => {
+                    *self.opened_at_arm.lock().unwrap() = Some((
+                        self.sys
+                            .is_some_and(|sys| sys.calls().iter().any(|c| c.starts_with("relay "))),
+                        self.viewer
+                            .is_some_and(|viewer| !viewer.0.lock().unwrap().is_empty()),
+                    ));
+                    return next(&self.arm)
+                        .unwrap_or_else(|| Ok(Ran::ok(&format!("armed {WATCH}\n"))));
+                }
+                Some([verb, disarm]) if verb == "screen-watch" && disarm == "disarm" => {
+                    return next(&self.disarm)
+                        .unwrap_or_else(|| Ok(Ran::ok(&format!("disarmed {WATCH}\n"))));
+                }
+                _ => {}
             }
             if exec.argv.get(1).map(String::as_str) == Some("asuser") {
-                return Ok(Ran::ok(""));
+                return next(&self.panes).unwrap_or_else(|| Ok(Ran::ok("")));
             }
             if exec.argv.get(1).map(String::as_str) == Some("print") {
                 if let Some(sys) = self.sys {
@@ -1404,6 +1797,9 @@ mod tests {
             walked_requests[0].ends_with("print gui/501"),
             "the session comes first: {walked_requests:?}"
         );
+        // The stops stay caught until the command lets them go after its last line.
+        assert_eq!(sys.calls()[..4], relay_calls()[..4]);
+        drop(screened.stops);
         assert_eq!(sys.calls(), relay_calls());
         assert!(
             said.lock()
@@ -1451,6 +1847,64 @@ mod tests {
             sys.calls(),
             relay_calls(),
             "the relay closed after the hang"
+        );
+    }
+
+    fn pane_opens(host: &Host<'_>) -> usize {
+        host.seen()
+            .iter()
+            .filter(|s| s.contains("/usr/bin/open"))
+            .count()
+    }
+
+    /// What the walk's first two requests after a login over the relay got (VM, 27.0).
+    fn not_answered() -> Result<Ran, String> {
+        Err(
+            "the agent answered no report: exit 255: Connection timed out during banner exchange"
+                .to_owned(),
+        )
+    }
+
+    #[test]
+    fn a_pane_open_that_did_not_run_is_sent_again_until_it_runs() {
+        let sys = relaying();
+        let host = Host::default();
+        *host.panes.lock().unwrap() = vec![not_answered(), not_answered(), Ok(Ran::ok(""))];
+        let (screened, _) = screen_fda(&host, &sys);
+        assert_eq!(screened.walked[0].done, Done::Granted);
+        assert_eq!(pane_opens(&host), 3);
+    }
+
+    #[test]
+    fn a_pane_open_that_ran_and_failed_ends_the_step_at_once() {
+        let sys = relaying();
+        let host = Host::default();
+        *host.panes.lock().unwrap() = vec![Ok(Ran::exit(1, "LSOpenURLsWithRole() failed\n"))];
+        let (screened, _) = screen_fda(&host, &sys);
+        assert_eq!(
+            screened.walked[0].done,
+            Done::NotGranted("the pane did not open: exit 1: LSOpenURLsWithRole() failed".into())
+        );
+        assert_eq!(pane_opens(&host), 1);
+    }
+
+    #[test]
+    fn a_pane_open_that_never_runs_ends_the_step_at_the_hang_detector() {
+        let sys = relaying();
+        let host = Host::default();
+        *host.panes.lock().unwrap() = vec![not_answered()];
+        let (screened, _) = screen_fda(&host, &sys);
+        assert!(
+            matches!(&screened.walked[0].done, Done::NotGranted(why)
+                if why.starts_with("the pane did not open: the request did not run: the agent answered no report")
+                    && why.ends_with("(sent for 60s)")),
+            "{:?}",
+            screened.walked
+        );
+        assert_eq!(
+            pane_opens(&host),
+            31,
+            "one open, then one every 2 s for 60 s"
         );
     }
 
@@ -1727,7 +2181,12 @@ mod tests {
                 &steps(&["full_disk_access:aterm"]),
                 &Recorder::default(),
                 TTY,
-            );
+            )
+            .map(|mut screened| {
+                // The command lets the stops go after its last line.
+                screened.stops = Box::new(());
+                screened
+            });
             let locks = lock_requests(&host);
             let closed = *host.closed_at_lock.lock().unwrap();
             let requests = host.seen();
@@ -1813,7 +2272,7 @@ mod tests {
             say: &say,
             hang: Duration::from_secs(60),
         };
-        let screened = screen(
+        let mut screened = screen(
             &flow,
             &paths(),
             &target(),
@@ -1823,12 +2282,34 @@ mod tests {
             TTY,
         )
         .unwrap();
+        // The command lets the stops go after its last line.
+        screened.stops = Box::new(());
         (screened, said.into_inner().unwrap())
     }
 
     fn lock_requests(host: &Host<'_>) -> usize {
         let lock = lock_cmd(&admin()).argv.join(" ");
         host.seen().iter().filter(|s| **s == lock).count()
+    }
+
+    /// The host's requests that are the lock or the screen watch's, in order: `lock`, `arm`,
+    /// `disarm <id>`.
+    fn lock_and_watch(host: &Host<'_>) -> Vec<String> {
+        let lock = lock_cmd(&admin()).argv.join(" ");
+        let arm = arm_cmd(&admin()).argv.join(" ");
+        host.seen()
+            .into_iter()
+            .filter_map(|s| {
+                if s == lock {
+                    Some("lock".to_owned())
+                } else if s == arm {
+                    Some("arm".to_owned())
+                } else {
+                    s.strip_prefix(&disarm_cmd("").argv.join(" "))
+                        .map(|id| format!("disarm {id}"))
+                }
+            })
+            .collect()
     }
 
     #[test]
@@ -1845,11 +2326,14 @@ mod tests {
         assert_eq!(screened.walked[0].done, Done::Granted);
         assert_eq!(screened.session, Session::Locked);
         assert_eq!(lock_requests(&host), 1);
+        // The watch armed before the relay, then the lock, then the watch disarmed: the
+        // walk's last two requests.
         assert_eq!(
-            host.seen().last(),
-            Some(&lock_cmd(&admin()).argv.join(" ")),
-            "the lock is the walk's last request"
+            lock_and_watch(&host),
+            ["arm", "lock", &format!("disarm {WATCH}")]
         );
+        let seen = host.seen();
+        assert_eq!(seen[seen.len() - 2], lock_cmd(&admin()).argv.join(" "));
         assert_eq!(
             *host.closed_at_lock.lock().unwrap(),
             Some(true),
@@ -1874,7 +2358,13 @@ mod tests {
         let (screened, said) = screen_fda(&host, &sys);
         assert_eq!(screened.walked[0].done, Done::Granted);
         assert_eq!(screened.session, Session::Kept);
-        assert_eq!(lock_requests(&host), 0, "{:?}", host.seen());
+        // Nothing locks it, and no screen watch is armed for it.
+        assert_eq!(
+            lock_and_watch(&host),
+            Vec::<String>::new(),
+            "{:?}",
+            host.seen()
+        );
         assert!(!said.iter().any(|l| l.starts_with("locked")), "{said:?}");
         // The reading before the relay found the session; one that found none during the
         // walk (a logout and a login over the relay) still means the walk let a login in.
@@ -1888,8 +2378,15 @@ mod tests {
             Ok(Ran::exit(112, "Could not find domain for user gui: 501\n")),
             Ok(Ran::ok("")),
         ];
-        let (screened, _) = screen_fda(&host, &sys);
+        let (screened, said) = screen_fda(&host, &sys);
         assert_eq!(screened.session, Session::Locked);
+        // No watch was armed for a session that was there, so the walk says what is left.
+        assert_eq!(lock_and_watch(&host), ["lock"]);
+        assert!(
+            said.iter()
+                .any(|l| l.ends_with("the Mac stays logged in and unlocked at its display")),
+            "{said:?}"
+        );
     }
 
     #[test]
@@ -1971,12 +2468,15 @@ mod tests {
             }]
         );
         assert_eq!(screened.session, Session::Locked);
-        assert_eq!(lock_requests(&host), 1);
+        assert_eq!(
+            lock_and_watch(&host),
+            ["arm", "lock", &format!("disarm {WATCH}")]
+        );
         assert_eq!(*host.closed_at_lock.lock().unwrap(), Some(true));
         assert_eq!(
             sys.calls(),
             relay_calls(),
-            "caught until the lock was decided"
+            "caught until the command let them go"
         );
         assert!(!host.seen().iter().any(|s| s.contains("/usr/bin/open")));
         assert!(said.iter().any(|l| l.starts_with("locked admin's session")));
@@ -2011,7 +2511,8 @@ mod tests {
             err.starts_with("stopped by SIGINT while waiting for admin to log in"),
             "{err}"
         );
-        assert_eq!(lock_requests(&host), 0);
+        // Nobody to lock, so the watch is disarmed.
+        assert_eq!(lock_and_watch(&host), ["arm", &format!("disarm {WATCH}")]);
         assert_eq!(sys.calls(), relay_calls());
     }
 
@@ -2033,12 +2534,17 @@ mod tests {
         assert_eq!(screened.session, Session::Locked);
         assert_eq!(*host.closed_at_lock.lock().unwrap(), Some(true));
         assert_eq!(sys.calls(), relay_calls());
-        // Said once the login was seen: a kill or a lost host leaves it unlocked.
+        // Said once the login was seen: a kill or a lost host leaves it to the host's watch.
         assert!(
-            said.iter()
-                .any(|l| l.starts_with("admin logged in over Screen Sharing")
-                    && l.contains("if aterm is killed")),
+            said.iter().any(|l| l
+                == "admin logged in over Screen Sharing: the session is locked again when the \
+                    walk ends or is stopped; if aterm is killed or loses the Mac first, the host \
+                    locks it itself once no request has reached it for 60s"),
             "{said:?}"
+        );
+        assert_eq!(
+            lock_and_watch(&host),
+            ["arm", "lock", &format!("disarm {WATCH}")]
         );
         // A session there before the relay: the stop locks nothing.
         let mut sys = relaying();
@@ -2094,20 +2600,29 @@ mod tests {
             let sys = relaying();
             let host = Host {
                 sys: Some(&sys),
-                lock: Some(answer),
+                lock: Some(Ok(answer)),
                 ..Host::default()
             };
             host.logs_in_after(2);
             let (screened, said) = screen_fda(&host, &sys);
-            assert_eq!(screened.session, Session::Unlocked(why.clone()));
-            assert_eq!(lock_requests(&host), 1);
+            assert_eq!(
+                screened.session,
+                Session::Unlocked {
+                    why: why.clone(),
+                    unread: None,
+                    watched: true,
+                }
+            );
+            // The watch stays armed, so the host tries the lock once more itself.
+            assert_eq!(lock_and_watch(&host), ["arm", "lock"]);
             assert!(!said.iter().any(|l| l.starts_with("locked")), "{said:?}");
             let line = screened.session.unlocked_line("lab-07", "admin").unwrap();
             assert_eq!(
                 line,
                 format!(
                     "lab-07: the Mac is still logged in as admin and unlocked at its display: \
-                     the lock after the walk failed ({why})"
+                     the lock after the walk failed ({why}); the host's screen watch locks it \
+                     once no request has reached the host for 60s"
                 )
             );
         }
@@ -2147,10 +2662,435 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(&screened.session, Session::Unlocked(why) if why.starts_with("the request did not run") && why.contains("Connection refused")),
+            matches!(&screened.session, Session::Unlocked { why, unread: None, watched: true } if why.starts_with("the request did not run") && why.contains("Connection refused")),
             "{:?}",
             screened.session
         );
+    }
+
+    /// `screen` of the FDA step with `host` and `sys` and the viewer `opener`: what it returned
+    /// and every line it said. The stops are still caught in what it returns.
+    fn screen_with(
+        host: &Host<'_>,
+        sys: &Fake,
+        opener: &Recorder,
+    ) -> (Result<Screened, String>, Vec<String>) {
+        screen_sharing_on(host);
+        host.on(&tcc_aterm(), Ran::ok(ATERM_ROWS_OFF));
+        host.on(&tcc_aterm(), Ran::ok(ATERM_ROWS_FDA));
+        let clock = TestClock::default();
+        let said = Mutex::new(Vec::new());
+        let say = |line: &str| said.lock().unwrap().push(line.to_owned());
+        let flow = Flow {
+            sys,
+            remote: host,
+            clock: &clock,
+            say: &say,
+            hang: Duration::from_secs(60),
+        };
+        let screened = screen(
+            &flow,
+            &paths(),
+            &target(),
+            &admin(),
+            &steps(&["full_disk_access:aterm"]),
+            opener,
+            TTY,
+        );
+        (screened, said.into_inner().unwrap())
+    }
+
+    #[test]
+    fn with_nobody_logged_in_the_watch_is_armed_before_the_relay_and_the_viewer() {
+        let sys = relaying();
+        let opener = Recorder::default();
+        let host = Host {
+            sys: Some(&sys),
+            viewer: Some(&opener),
+            ..Host::default()
+        };
+        host.logs_in_after(1);
+        let (screened, _) = screen_with(&host, &sys, &opener);
+        let screened = screened.unwrap();
+        assert_eq!(screened.session, Session::Locked);
+        assert_eq!(
+            *host.opened_at_arm.lock().unwrap(),
+            Some((false, false)),
+            "neither the relay nor the viewer had opened when the arm came"
+        );
+        // Armed for the admin's own uid, right after the reading that found no session.
+        let seen = host.seen();
+        let arm = arm_cmd(&admin()).argv.join(" ");
+        let at = seen.iter().position(|s| *s == arm).unwrap();
+        assert!(seen[at - 1].ends_with("print gui/501"), "{seen:?}");
+        assert_eq!(
+            arm_cmd(&admin()).argv,
+            [
+                "/Library/Management/aterm/bin/aterm",
+                "machines",
+                "agent",
+                "screen-watch",
+                "arm",
+                "--uid",
+                "501",
+                "--user",
+                "admin"
+            ]
+        );
+        assert_eq!(arm_cmd(&admin()).user, None, "root's");
+        assert_eq!(
+            lock_and_watch(&host),
+            ["arm", "lock", &format!("disarm {WATCH}")]
+        );
+        // The stops are still caught when `screen` returns; the command lets them go.
+        assert_eq!(sys.calls().last().map(String::as_str), Some("relay closed"));
+        drop(screened.stops);
+        assert_eq!(sys.calls(), relay_calls());
+    }
+
+    #[test]
+    fn a_watch_that_is_not_armed_relays_nothing_and_opens_no_viewer() {
+        let old_agent = "refused: `aterm machines agent screen-watch arm --uid 501 --user admin` \
+                         is not an agent verb (ssh, hello, put, apply, run-job, attach, put-file, \
+                         install, lock-screen, version)";
+        for (answer, why) in [
+            (
+                Ok(Ran {
+                    status: Some(1),
+                    stdout: b"not armed: account admin is uid 501, not 502\n".to_vec(),
+                    stderr: Vec::new(),
+                }),
+                "account admin is uid 501, not 502".to_owned(),
+            ),
+            (
+                Ok(Ran {
+                    status: Some(2),
+                    stdout: format!("{old_agent}\n").into_bytes(),
+                    stderr: Vec::new(),
+                }),
+                format!("exit 2: {old_agent}"),
+            ),
+            (
+                Err("ssh: connect to host lab-07.local port 22: Operation timed out".into()),
+                "the request did not run: ssh: connect to host lab-07.local port 22: Operation \
+                 timed out"
+                    .to_owned(),
+            ),
+        ] {
+            let sys = relaying();
+            let opener = Recorder::default();
+            let host = Host {
+                sys: Some(&sys),
+                arm: Mutex::new(vec![answer]),
+                ..Host::default()
+            };
+            host.logs_in_after(1);
+            let (screened, _) = screen_with(&host, &sys, &opener);
+            assert_eq!(
+                screened.unwrap_err(),
+                format!(
+                    "the screen watch on lab-07.local was not armed ({why}), so no lock could \
+                     be promised if aterm is killed or loses the Mac; nothing was relayed"
+                )
+            );
+            // Only the greeting was asked for: no stops caught, no relay, no viewer.
+            assert_eq!(
+                sys.calls(),
+                [relay_cmd(&paths(), &target()).unwrap().display()]
+            );
+            assert!(opener.0.lock().unwrap().is_empty());
+            assert_eq!(lock_and_watch(&host), ["arm"]);
+        }
+    }
+
+    #[test]
+    fn a_disarm_that_fails_is_one_line_and_changes_nothing_else() {
+        for (answer, line) in [
+            (
+                Err("ssh: connect to host lab-07.local port 22: Operation timed out".to_owned()),
+                "the host's screen watch was not disarmed (the request did not run: ssh: connect \
+                 to host lab-07.local port 22: Operation timed out): once no request has reached \
+                 the host for 60s it locks admin's session if there is one, which is harmless",
+            ),
+            (
+                Ok(Ran {
+                    status: Some(1),
+                    stdout: b"not disarmed: Operation not permitted (os error 1)\n".to_vec(),
+                    stderr: Vec::new(),
+                }),
+                "the host's screen watch was not disarmed (Operation not permitted (os error \
+                 1)): once no request has reached the host for 60s it locks admin's session if \
+                 there is one, which is harmless",
+            ),
+            // The watcher had locked and ended first (the network was down for a while).
+            (
+                Ok(Ran::ok(&format!(
+                    "disarmed {WATCH} (it had ended: locked admin's session: no signed \
+                     request reached the host for 61s)\n"
+                ))),
+                "the host's screen watch had already ended: locked admin's session: no signed \
+                 request reached the host for 61s",
+            ),
+        ] {
+            let sys = relaying();
+            let host = Host {
+                sys: Some(&sys),
+                disarm: Mutex::new(vec![answer]),
+                ..Host::default()
+            };
+            host.logs_in_after(1);
+            let (screened, said) = screen_fda(&host, &sys);
+            assert_eq!(screened.walked[0].done, Done::Granted);
+            assert_eq!(screened.session, Session::Locked);
+            assert_eq!(screened.session.unlocked_line("lab-07", "admin"), None);
+            let watch_lines: Vec<&String> =
+                said.iter().filter(|l| l.contains("screen watch")).collect();
+            assert_eq!(watch_lines, [line]);
+            // Said after the lock's own line.
+            assert!(said.last().unwrap().contains("screen watch"), "{said:?}");
+        }
+    }
+
+    /// `n` pane opens that do not run, then one that does: a gap of `2n` s between the
+    /// re-probe before them and the open that ran.
+    fn opens_after(host: &Host<'_>, n: usize) {
+        let mut script: Vec<Result<Ran, String>> = (0..n).map(|_| not_answered()).collect();
+        script.push(Ok(Ran::ok("")));
+        *host.panes.lock().unwrap() = script;
+    }
+
+    #[test]
+    fn a_gap_that_may_have_let_the_watch_lock_and_end_arms_it_again() {
+        // 32 s with no request that ran (the host cut off, or a long run of another command's
+        // holding it): the watcher may have locked and ended, and the person unlocked over the
+        // relay since.
+        let sys = relaying();
+        let host = Host {
+            sys: Some(&sys),
+            ..Host::default()
+        };
+        host.logs_in_after(1);
+        opens_after(&host, 16);
+        *host.disarm.lock().unwrap() = vec![
+            Ok(Ran::ok(&format!(
+                "disarmed {WATCH} (it had ended: locked admin's session: no signed request \
+                 reached the host for 60s)\n"
+            ))),
+            Ok(Ran::ok("disarmed 1800000040-78\n")),
+        ];
+        *host.arm.lock().unwrap() = vec![
+            Ok(Ran::ok(&format!("armed {WATCH}\n"))),
+            Ok(Ran::ok("armed 1800000040-78\n")),
+        ];
+        let (screened, said) = screen_fda(&host, &sys);
+        assert_eq!(screened.walked[0].done, Done::Granted);
+        assert_eq!(screened.session, Session::Locked);
+        // Right after the open that ran: a new arm is acknowledged before the old one
+        // is disarmed, and the new arm is disarmed at the end.
+        assert_eq!(
+            lock_and_watch(&host),
+            [
+                "arm",
+                "arm",
+                &format!("disarm {WATCH}"),
+                "lock",
+                "disarm 1800000040-78"
+            ]
+        );
+        let seen = host.seen();
+        let open = seen
+            .iter()
+            .rposition(|s| s.contains("/usr/bin/open"))
+            .unwrap();
+        assert!(seen[open + 1].contains("screen-watch arm"), "{seen:?}");
+        // What the ended watcher did is said once, and nothing about arming again.
+        let watch_lines: Vec<&String> =
+            said.iter().filter(|l| l.contains("screen watch")).collect();
+        assert_eq!(
+            watch_lines,
+            [
+                "the host's screen watch had already ended: locked admin's session: no signed \
+              request reached the host for 60s"
+            ]
+        );
+        // 28 s is not such a gap: the arm stays as it was.
+        let sys = relaying();
+        let host = Host {
+            sys: Some(&sys),
+            ..Host::default()
+        };
+        host.logs_in_after(1);
+        opens_after(&host, 14);
+        let (screened, _) = screen_fda(&host, &sys);
+        assert_eq!(screened.walked[0].done, Done::Granted);
+        assert_eq!(
+            lock_and_watch(&host),
+            ["arm", "lock", &format!("disarm {WATCH}")]
+        );
+    }
+
+    #[test]
+    fn an_arm_again_that_fails_is_said_tried_at_the_next_request_and_not_promised_at_the_end() {
+        let refused = || {
+            Ok(Ran {
+                status: Some(1),
+                stdout: b"not armed: /A/state/screen-watch: No space left on device\n".to_vec(),
+                stderr: Vec::new(),
+            })
+        };
+        // The arm after the gap fails; the one at the next request that ran goes through.
+        let sys = relaying();
+        let host = Host {
+            sys: Some(&sys),
+            ..Host::default()
+        };
+        host.logs_in_after(1);
+        opens_after(&host, 16);
+        *host.arm.lock().unwrap() = vec![
+            Ok(Ran::ok(&format!("armed {WATCH}\n"))),
+            refused(),
+            Ok(Ran::ok("armed 1800000040-78\n")),
+        ];
+        let (screened, said) = screen_fda(&host, &sys);
+        assert_eq!(screened.session, Session::Locked);
+        assert_eq!(
+            lock_and_watch(&host),
+            [
+                "arm",
+                "arm",
+                "arm",
+                &format!("disarm {WATCH}"),
+                "lock",
+                "disarm 1800000040-78"
+            ]
+        );
+        let watch_lines: Vec<&String> =
+            said.iter().filter(|l| l.contains("screen watch")).collect();
+        assert_eq!(
+            watch_lines,
+            [
+                "the host's screen watch was not armed again (/A/state/screen-watch: No space \
+                 left on device): if aterm is killed or loses the Mac before the walk's own \
+                 lock, admin's session stays as it is left; tried again at the next request",
+                "the host's screen watch is armed again",
+            ]
+        );
+        // It never goes through, and the walk's own lock fails: the last line promises no
+        // replacement; the prior arm is retained without being promised as live.
+        let sys = relaying();
+        let host = Host {
+            sys: Some(&sys),
+            lock: Some(Ok(Ran::exit(1, "sudo: a password is required\n"))),
+            ..Host::default()
+        };
+        host.logs_in_after(1);
+        opens_after(&host, 16);
+        *host.arm.lock().unwrap() = vec![Ok(Ran::ok(&format!("armed {WATCH}\n"))), refused()];
+        let (screened, _) = screen_fda(&host, &sys);
+        assert_eq!(
+            screened.session,
+            Session::Unlocked {
+                why: "exit 1: sudo: a password is required".into(),
+                unread: None,
+                watched: false,
+            }
+        );
+        // Each request that ran tried the arm again; the prior arm was never disarmed.
+        let watched = lock_and_watch(&host);
+        let disarms: Vec<&String> = watched.iter().filter(|r| r.starts_with("disarm")).collect();
+        assert!(disarms.is_empty(), "{watched:?}");
+        assert_eq!(
+            watched.last().map(String::as_str),
+            Some("arm"),
+            "{watched:?}"
+        );
+        assert!(
+            !screened
+                .session
+                .unlocked_line("lab-07", "admin")
+                .unwrap()
+                .contains("screen watch")
+        );
+    }
+
+    #[test]
+    fn a_reading_after_a_stop_that_did_not_run_does_not_claim_a_login() {
+        // Ctrl-C while waiting for the login; the reading after it did not run, and neither did
+        // the lock: whether the admin logged in at all is not known.
+        let mut sys = relaying();
+        sys.stop_after = Some(0);
+        let host = Host {
+            sys: Some(&sys),
+            lock: Some(Err(
+                "ssh: connect to host lab-07.local port 22: Operation timed out".into(),
+            )),
+            ..Host::default()
+        };
+        *host.sessions.lock().unwrap() = vec![
+            Ok(Ran::exit(
+                125,
+                "Could not print domain: 125: Domain does not support specified action\n",
+            )),
+            Ok(Ran::exit(
+                125,
+                "Could not print domain: 125: Domain does not support specified action\n",
+            )),
+            Err("ssh: connect to host lab-07.local port 22: Operation timed out".into()),
+        ];
+        let (screened, _) = screen_fda(&host, &sys);
+        assert_eq!(
+            screened.walked[0].done,
+            Done::NotGranted("not attempted: stopped by SIGINT".into())
+        );
+        let line = screened.session.unlocked_line("lab-07", "admin").unwrap();
+        assert_eq!(
+            line,
+            "lab-07: the Mac may be logged in as admin and unlocked at its display: whether \
+             admin logged in over Screen Sharing is not known (the last reading: the request \
+             did not run: ssh: connect to host lab-07.local port 22: Operation timed out), and \
+             the lock after the walk failed (the request did not run: ssh: connect to host \
+             lab-07.local port 22: Operation timed out); the host's screen watch locks it once \
+             no request has reached the host for 60s"
+        );
+        // The lock was tried, and the watch left armed to try again.
+        assert_eq!(lock_and_watch(&host), ["arm", "lock"]);
+    }
+
+    #[test]
+    fn a_wait_for_the_login_that_outlasts_the_hang_detector_still_locks_a_session_there_now() {
+        // The reading before the relay and every reading of the wait found none; the one after
+        // the hang detector found the session: a login the relay may have let in.
+        let sys = relaying();
+        let host = Host {
+            sys: Some(&sys),
+            ..Host::default()
+        };
+        host.logs_in_after(32);
+        let (screened, _) = screen_fda(&host, &sys);
+        assert!(
+            matches!(&screened.walked[0].done, Done::NotGranted(why) if why.starts_with("not attempted: admin has not logged in on the host after 60s")),
+            "{:?}",
+            screened.walked
+        );
+        assert_eq!(screened.session, Session::Locked);
+        assert_eq!(
+            lock_and_watch(&host),
+            ["arm", "lock", &format!("disarm {WATCH}")]
+        );
+        // None after the hang either: the walk ends with the hang, and the watch is disarmed.
+        let sys = relaying();
+        let host = Host {
+            sys: Some(&sys),
+            ..Host::default()
+        };
+        host.logs_in_after(99);
+        let (screened, _) = screen_with(&host, &sys, &Recorder::default());
+        assert!(
+            screened
+                .unwrap_err()
+                .starts_with("admin has not logged in on the host after 60s")
+        );
+        assert_eq!(lock_and_watch(&host), ["arm", &format!("disarm {WATCH}")]);
     }
 
     #[test]
@@ -2176,7 +3116,13 @@ mod tests {
             host.seen().iter().any(|s| s.ends_with("print gui/501")),
             "the walk read the session"
         );
-        assert_eq!(lock_requests(&host), 0, "{:?}", host.seen());
+        // Neither a lock nor a screen watch.
+        assert_eq!(
+            lock_and_watch(&host),
+            Vec::<String>::new(),
+            "{:?}",
+            host.seen()
+        );
         assert!(sys.calls().is_empty());
     }
 
@@ -2190,5 +3136,85 @@ mod tests {
         assert_eq!(as_user.user.as_deref(), Some("admin"));
         assert!(exec_of(&Cmd::new("/usr/bin/open").as_user(&user).in_session()).is_err());
         assert!(exec_of(&Cmd::new("/usr/bin/true").env("A", "b")).is_err());
+    }
+
+    /// The actual request wrapper keeps a previously acknowledged arm through a failed
+    /// replacement, then retires it only after a later request acknowledges the new one.
+    #[test]
+    fn a_replacement_watch_is_acknowledged_before_the_previous_arm_is_retired() {
+        let ordinary = Host::default();
+        assert_eq!(arm_watch(&ordinary, &admin()).as_deref(), Ok(WATCH));
+        let host = Host {
+            arm: Mutex::new(vec![
+                Ok(Ran::exit(1, "not armed: replacement refused\n")),
+                Ok(Ran::ok("armed 1800000040-78\n")),
+            ]),
+            ..Host::default()
+        };
+        let clock = TestClock::default();
+        let said = Mutex::new(Vec::new());
+        let say = |line: &str| said.lock().unwrap().push(line.to_owned());
+        let admin = admin();
+        let watched = Watched {
+            remote: &host,
+            clock: &clock,
+            say: &say,
+            admin: &admin,
+            id: RefCell::new(Some(WATCH.to_owned())),
+            ran: Cell::new(Some(clock.elapsed())),
+        };
+        // An ordinary request within the gap keeps the acknowledged arm unchanged.
+        assert!(watched.exec(&session_cmd(&admin)).is_ok());
+        assert_eq!(watched.id().as_deref(), Some(WATCH));
+        assert!(lock_and_watch(&host).is_empty());
+        clock.pause(REARM);
+        assert!(watched.exec(&session_cmd(&admin)).is_ok());
+        // REFUSAL: it must not spend the old arm to attempt a replacement.
+        assert_eq!(watched.id().as_deref(), Some(WATCH));
+        assert_eq!(lock_and_watch(&host), ["arm"]);
+        // The next successful request retries immediately, without a new time gap.
+        assert!(watched.exec(&session_cmd(&admin)).is_ok());
+        assert_eq!(watched.id().as_deref(), Some("1800000040-78"));
+        assert_eq!(
+            lock_and_watch(&host),
+            ["arm", "arm", &format!("disarm {WATCH}")]
+        );
+        let before = host.seen().len();
+        assert!(watched.exec(&session_cmd(&admin)).is_ok());
+        assert_eq!(host.seen().len(), before + 1);
+        assert_eq!(watched.id().as_deref(), Some("1800000040-78"));
+    }
+
+    #[test]
+    fn a_session_query_that_does_not_exit_normally_is_never_absence() {
+        let read = |answer: Result<Ran, String>| {
+            let sys = Fake::default();
+            let host = Host::default();
+            *host.sessions.lock().unwrap() = vec![answer];
+            let clock = TestClock::default();
+            let flow = Flow {
+                sys: &sys,
+                remote: &host,
+                clock: &clock,
+                say: &|_| {},
+                hang: Duration::from_secs(60),
+            };
+            read_session(&flow, &admin())
+        };
+        assert_eq!(read(Ok(Ran::ok(""))), Ok(Reading::There));
+        assert!(read(Err("the transport did not run".into())).is_err());
+        for stdout in [
+            Vec::new(),
+            b"Could not find domain for user gui: 501\n".to_vec(),
+        ] {
+            assert!(
+                read(Ok(Ran {
+                    status: None,
+                    stdout,
+                    stderr: Vec::new()
+                }))
+                .is_err()
+            );
+        }
     }
 }

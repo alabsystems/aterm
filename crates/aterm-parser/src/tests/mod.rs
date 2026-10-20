@@ -16,6 +16,7 @@ mod performance;
 mod string_bulk;
 mod string_cancel;
 mod subparams;
+mod tmux;
 mod utf8_errors;
 mod utf8_parity;
 

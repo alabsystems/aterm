@@ -25,7 +25,8 @@
 //! 429) — in memory and, for a loop that follows it, as a ledger row
 //! ([`approvals::RULE_WALL_WAIT`]). While the screen shows nothing but the
 //! agent's own background work ([`aterm_phase::background_only`]: no
-//! spinner, no `esc to interrupt`, no message just submitted), the memory
+//! spinner, no `esc to interrupt`, no message just submitted; on agy and
+//! Muse Code, their readers' [`ScreenReader::background_wait`]), the memory
 //! stands for the wall the screen no longer shows; the standing `WaitUntil`
 //! then fires at the reset and its grace as it would have with the rows
 //! showing — unless the screen draws the wall's end under that wall's own
@@ -107,13 +108,62 @@ pub(super) struct WallMemory {
     written: bool,
 }
 
-/// Whether `p`'s screen can read as the agent's own background work alone
-/// ([`aterm_phase::background_only`], Claude Code's grammar): the remembered
-/// wall stands through it, and the canary climbs on it.
-fn reads_background_work(p: Program) -> bool {
+/// Whether the canary's witness on `p`'s screen is the agent's own title
+/// ([`Witness::Title`]): Claude Code's, which rests on `✳` while it does not
+/// work whatever its screen's words say. agy's and Muse Code's titles are
+/// unmeasured; their own words are the witness ([`Witness::Words`]).
+fn title_witness(p: Program) -> bool {
     match p {
         Program::Claude => true,
         Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
+    }
+}
+
+/// What vouches, at each rung of the canary's ladder
+/// ([`Session::stuck_climb`]), that the agent does not work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Witness {
+    /// Claude Code's own terminal title rests on `✳` (one `status` read): it
+    /// animates while the agent works, and a screen no reader names says
+    /// nothing either way.
+    Title,
+    /// agy's or Muse Code's own words stood still since the episode began
+    /// ([`still_words`]): their reader read the turn's end as evidence and
+    /// names the work (`what`, [`ScreenReader::background_wait`]); a turn of
+    /// the agent's own, a draft typed, or other work moves them.
+    Words(&'static str),
+}
+
+/// What stands still on agy's or Muse Code's screen while the canary climbs
+/// on their own background work ([`Witness::Words`]): the work their reader
+/// names, the letters of the last rows above the composer (the reply or the
+/// question the turn ended on and the tool rows over it, so a clock's digits
+/// are no change and a turn of the agent's own is one), and the draft. The
+/// panel and the footer under the composer, whose glyphs and clocks redraw
+/// every second, are no part of it.
+fn still_words(reader: &dyn ScreenReader, rows: &[String], what: &str) -> String {
+    let mut words = format!("{what}\n");
+    if let Some((caret, draft)) = reader.composer(rows) {
+        push_words_above(&mut words, &rows[..caret.min(rows.len())]);
+        words.push_str(&draft.join("\n"));
+    }
+    words
+}
+
+/// THE SCREEN SHOWS NOTHING BUT THE AGENT'S OWN BACKGROUND WORK, its turn
+/// over: Claude Code's by its grammar ([`aterm_phase::background_only`]: no
+/// spinner, no `esc to interrupt`, no message just submitted); any other
+/// agent's by its reader ([`ScreenReader::background_wait`]: a task, a
+/// timer or a subagent in agy's panel, a backgrounded shell or a monitor in
+/// Muse Code's, under a turn that ended; Codex's and Gemini CLI's readers
+/// have no such read). The remembered wall stands through it, on every
+/// agent as on Claude Code.
+fn background_alone(reader: &dyn ScreenReader, rows: &[String]) -> bool {
+    match reader.program() {
+        Program::Claude => aterm_phase::background_only(rows),
+        Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
+            reader.background_wait(rows).is_some()
+        }
     }
 }
 
@@ -126,19 +176,20 @@ fn is_kept(wall: &aterm_phase::Wall) -> bool {
 
 impl<C: Ctl> Session<'_, C> {
     /// The remembered wall, when `rows` show nothing but the agent's own
-    /// background work — Claude Code's screen, its composer frame drawn, no
-    /// live turn and no message just submitted — and the wall not ended under
-    /// its own notice ([`ended_under`]: a person's short turn under it, which
-    /// no read saw busy, is work since the wall, and so is the vendor's own
-    /// continuation; either under another limit's notice is not).
+    /// background work ([`background_alone`]: Claude Code's screen, its
+    /// composer frame drawn, no live turn and no message just submitted; agy's
+    /// or Muse Code's, its reader naming the work under an ended turn) and
+    /// the wall not ended under its own notice ([`ended_under`]: a person's
+    /// short turn under it, which no read saw busy, is work since the wall,
+    /// and so is the vendor's own continuation; either under another limit's
+    /// notice is not).
     pub(super) fn remembered_wall(
         &self,
         reader: &dyn ScreenReader,
         rows: &[String],
     ) -> Option<aterm_phase::Wall> {
         let memory = self.wall_memory.as_ref()?;
-        (reads_background_work(reader.program())
-            && aterm_phase::background_only(rows)
+        (background_alone(reader, rows)
             && !ended_under(
                 aterm_phase::since_limit(rows).as_ref(),
                 memory.wall.kind,
@@ -149,8 +200,13 @@ impl<C: Ctl> Session<'_, C> {
 
     /// `rows` read `Busy`: a LIVE turn on a screen with a composer (a spinner,
     /// `esc to interrupt`, a message just submitted) ends the memory. A busy
-    /// read that is only background work, or a screen with no composer frame
-    /// (a dialog covering it), leaves it. Where that turn TAKES THE WALL'S
+    /// read that is only background work — by Claude Code's grammar
+    /// ([`aterm_phase::background_only`]) or, on another agent, its reader's
+    /// ([`background_alone`]: agy's panel, Muse Code's; never Claude Code's
+    /// `background_wait`, which names a shell under a live turn's `esc to
+    /// interrupt` too) — or a screen with no composer frame (a dialog
+    /// covering it), leaves it.
+    /// Where that turn TAKES THE WALL'S
     /// RETRY a wall answered inside its take window
     /// ([`TurnEndState::retry_met_untaken`]), the ledger says so
     /// ([`approvals::WALL_TAKEN`]) whether or not the memory still stands:
@@ -169,7 +225,10 @@ impl<C: Ctl> Session<'_, C> {
         rows: &[String],
         seq: u64,
     ) {
-        if reader.composer(rows).is_none() || aterm_phase::background_only(rows) {
+        if reader.composer(rows).is_none()
+            || aterm_phase::background_only(rows)
+            || background_alone(reader, rows)
+        {
             return;
         }
         // The wall's retry this turn takes ([`TurnEndState::took`]) was typed
@@ -406,7 +465,10 @@ impl<C: Ctl> Session<'_, C> {
     /// its predecessor waited on ([`approvals::open_wall`]) when the screen
     /// shows none of its rows — the update that applied while the owner's
     /// scroll hid it, or Esc on the vendor's countdown: the policy is handed
-    /// the reset the notice named ([`TurnEndState::seed_named_reset`]). Kept
+    /// the reset the notice named ([`TurnEndState::seed_named_reset`]) —
+    /// or, its notice placing none (a spend limit, a bucket that names no
+    /// reset), the wall's appearance, its first try's rung counted from there
+    /// ([`TurnEndState::seed_unnamed_wall`]). Kept
     /// for [`MEMORY_TTL`] past its reset (a wall with no placed reset, past its
     /// row).
     pub(super) fn seed_wall_memory(&mut self, open: Option<approvals::OpenWall>) {
@@ -446,6 +508,31 @@ impl<C: Ctl> Session<'_, C> {
                 jitter,
                 limit::resumes_by_itself(&open.message),
                 limit::ResetClock::of(open.reset.as_deref()),
+                self.fx
+                    .mono()
+                    .checked_sub(ago)
+                    .unwrap_or_else(|| self.fx.mono()),
+            );
+        } else {
+            // No reset placed (a spend limit, a bucket that names none): the
+            // track from where the loop that wrote the row counted the wall's
+            // appearance, so the first try's rung counts from there
+            // ([`TurnEndState::seed_unnamed_wall`]): the row, the wall's
+            // first read after the last act — but where that act was the
+            // wall's own retry ([`approvals::OpenWall::retry_ms`]), the
+            // point that judged its answer ([`approvals::OpenWall::judged_ms`]),
+            // or, none judged yet, the end of the take window the row opened.
+            let take = i64::try_from(self.turn_end.timing.take_within.as_millis()).unwrap_or(0);
+            let appearance = if open.retry_ms.is_some() {
+                open.judged_ms.unwrap_or(open.at_ms.saturating_add(take))
+            } else {
+                open.at_ms
+            };
+            let ago = u64::try_from(self.now_unix_ms().saturating_sub(appearance))
+                .map_or(Duration::ZERO, Duration::from_millis);
+            self.turn_end.seed_unnamed_wall(
+                kind,
+                &open.message,
                 self.fx
                     .mono()
                     .checked_sub(ago)
@@ -524,6 +611,18 @@ impl<C: Ctl> Session<'_, C> {
     /// one that moves is a working agent, and the ladder is over. It ends, too,
     /// when the screen stops reading background-only, at the next point and
     /// when the loop ends ([`Self::stuck_over`]).
+    ///
+    /// AGY'S AND MUSE CODE'S OWN BACKGROUND WORK climbs the same ladder
+    /// ([`background_alone`]: their reader names the work under a turn that
+    /// ended as evidence). Their readers hold an ended turn, and a question
+    /// it ended on over a task or a shell (the hard rule), busy while that
+    /// work runs, so a server or a daemon left running would hold the tab
+    /// for ever with nothing typed and nothing said; the ladder is the
+    /// backstop Claude Code's shell has. No title of theirs is measured: the
+    /// witness is their words standing still ([`Witness::Words`],
+    /// [`still_words`]), the episode counted from when they last moved; the
+    /// host's record is told as their work's ([`StallSeen::OwnWork`]), and
+    /// the last rung is [`Exception::stalled_on_work`].
     /// `since`: when the screen began reading background work only
     /// ([`Self::host_steps_in_background`]'s clock). A busy read, background
     /// work alone included, is also the end of a dialog's episode
@@ -539,19 +638,36 @@ impl<C: Ctl> Session<'_, C> {
             self.stuck_over(screen.seq, "the screen moved on", review);
         }
         let reader = self.reader(&screen.rows);
-        let stuck = since.is_some()
-            && reads_background_work(reader.program())
-            && aterm_phase::background_only(&screen.rows);
-        let Some(at) = since.filter(|_| stuck) else {
+        let stuck = since.is_some() && background_alone(reader, &screen.rows);
+        let Some(since) = since.filter(|_| stuck) else {
             self.stuck_over(screen.seq, "the screen moved on", review);
             self.stuck_asked = None;
             return;
+        };
+        let (at, witness) = if title_witness(reader.program()) {
+            (since, Witness::Title)
+        } else {
+            // agy, Muse Code: the episode is the words' (the work named, the
+            // reply, the draft) since they last moved.
+            let what = reader.background_wait(&screen.rows).unwrap_or_default();
+            let words = still_words(reader, &screen.rows, what);
+            let from = match &self.stuck_still {
+                Some((was, from)) if *was == words => *from,
+                _ => {
+                    self.stuck_over(screen.seq, "the agent's words moved", review);
+                    let now = self.fx.mono();
+                    self.stuck_still = Some((words, now));
+                    now
+                }
+            };
+            (from.max(since), Witness::Words(what))
         };
         self.stuck_climb(
             screen,
             at,
             self.setup.stuck_after,
             ExceptionKind::Stalled,
+            witness,
             review,
         );
     }
@@ -600,7 +716,14 @@ impl<C: Ctl> Session<'_, C> {
             Some((was, at)) if *was == words => {
                 let at = *at;
                 let after = self.setup.stuck_after / DIALOG_DIVISOR;
-                self.stuck_climb(screen, at, after, ExceptionKind::Dialog, review);
+                self.stuck_climb(
+                    screen,
+                    at,
+                    after,
+                    ExceptionKind::Dialog,
+                    Witness::Title,
+                    review,
+                );
             }
             // A screen new to the clock, or another dialog on it: its own
             // episode, from now. What the ladder still held under the screen
@@ -648,16 +771,19 @@ impl<C: Ctl> Session<'_, C> {
     /// One climb of the canary's ladder for the episode that began at `at`
     /// ([`Self::stuck_busy_note`], [`Self::dialog_note`]): when the next rung
     /// is due — its multiple of `after`, the title not asked within `after`
-    /// — one `status` read is its witness, and the rung is said in `kind`'s
-    /// words. A title that moves is an agent at work, and, for a dialog, a tab
-    /// that runs no Claude (a shell left in a swapped tab keeps the title it
-    /// had) has none to wait for: either ends the episode.
+    /// — one `status` read is its witness ([`Witness::Title`]; agy's and Muse
+    /// Code's words, [`Witness::Words`], were read on the screen by the
+    /// caller), and the rung is said in `kind`'s and the witness's words. A
+    /// title that moves is an agent at work, and, for a dialog, a tab that
+    /// runs no Claude (a shell left in a swapped tab keeps the title it had)
+    /// has none to wait for: either ends the episode.
     fn stuck_climb(
         &mut self,
         screen: &Screen,
         at: Instant,
         after: Duration,
         kind: ExceptionKind,
+        witness: Witness,
         review: &mut dyn Review,
     ) {
         let Some((next, times)) = self.stuck_rung.next() else {
@@ -668,27 +794,35 @@ impl<C: Ctl> Session<'_, C> {
         {
             return;
         }
-        self.stuck_asked = Some(self.fx.mono());
-        let Ok(r) = self.call(&["status"]) else {
-            return;
-        };
-        if !title_rests(&r.stdout) {
-            // A title that moves is an agent at work: whatever the ladder said,
-            // it is over.
-            self.stuck_over(screen.seq, "the agent's title moves: it works", review);
-            return;
-        }
         let dialog = kind == ExceptionKind::Dialog;
-        if dialog && !names_claude(&r.stdout) {
-            self.stuck_over(screen.seq, "the tab runs no Claude", review);
-            return;
-        }
+        // The words' witness was read by the caller on this screen
+        // ([`Self::stuck_busy_note`]): no `status` is asked for it.
+        let status = match witness {
+            Witness::Words(_) => String::new(),
+            Witness::Title => {
+                self.stuck_asked = Some(self.fx.mono());
+                let Ok(r) = self.call(&["status"]) else {
+                    return;
+                };
+                if !title_rests(&r.stdout) {
+                    // A title that moves is an agent at work: whatever the
+                    // ladder said, it is over.
+                    self.stuck_over(screen.seq, "the agent's title moves: it works", review);
+                    return;
+                }
+                if dialog && !names_claude(&r.stdout) {
+                    self.stuck_over(screen.seq, "the tab runs no Claude", review);
+                    return;
+                }
+                r.stdout
+            }
+        };
         let minutes = self.fx.since(at).as_secs() / 60;
         self.stuck_rung = next;
         match next {
             StuckRung::Quiet => {}
             StuckRung::Said if dialog => {
-                let agent = crate::supervise::screen::status_field(&r.stdout, "agent");
+                let agent = crate::supervise::screen::status_field(&status, "agent");
                 review.note(&format!(
                     "STUCK seq={} the agent's own title says idle, and the screen has stood \
                      unchanged for {minutes} min with no composer, box, wall or busy row \
@@ -699,33 +833,49 @@ impl<C: Ctl> Session<'_, C> {
                     tail_rows(&screen.rows),
                 ));
             }
-            StuckRung::Said => review.note(&format!(
-                "STUCK seq={} the agent's own title says idle, and the screen has read busy on \
-                 background work alone (a shell, a monitor, a workflow) for {minutes} min: no \
-                 wall, question or box is recognised there. If the tab is stalled, this screen \
-                 is one this build does not read.",
-                screen.seq,
-            )),
+            StuckRung::Said => match witness {
+                Witness::Title => review.note(&format!(
+                    "STUCK seq={} the agent's own title says idle, and the screen has read busy \
+                     on background work alone (a shell, a monitor, a workflow) for {minutes} \
+                     min: no wall, question or box is recognised there. If the tab is stalled, \
+                     this screen is one this build does not read.",
+                    screen.seq,
+                )),
+                Witness::Words(what) => review.note(&format!(
+                    "STUCK seq={} the agent's turn ended and its own background work ({what}) \
+                     has run for {minutes} min under words that stood still: nothing is typed \
+                     while it runs, a question the turn ended on included. If that work never \
+                     ends (a server, a daemon, a repeating timer), only a person can end it.",
+                    screen.seq,
+                )),
+            },
             StuckRung::Told => {
-                let what = if dialog {
-                    "a dialog this build does not read"
-                } else {
-                    "a wait this build does not classify"
+                let what = match witness {
+                    _ if dialog => "a dialog this build does not read",
+                    Witness::Title => "a wait this build does not classify",
+                    Witness::Words(_) => "background work of the agent's own that has not ended",
                 };
                 review.note(&format!(
                     "STALLED seq={} still so after {minutes} min: {what}, told to the window as \
                      a record",
                     screen.seq,
                 ));
+                // The host's record speaks in the witness's words: agy's and
+                // Muse Code's own work is read, and no title of theirs is (a
+                // dialog's witness is Claude Code's title).
+                let seen = match witness {
+                    Witness::Title => StallSeen::Unread { minutes },
+                    Witness::Words(_) => StallSeen::OwnWork { minutes },
+                };
                 if let Some(host) = &self.stall_host {
-                    host.stall_unread(Some(minutes));
+                    host.stall_unread(Some(seen));
                 }
             }
             StuckRung::Raised => {
-                let exception = if dialog {
-                    Exception::dialog()
-                } else {
-                    Exception::stalled()
+                let exception = match witness {
+                    _ if dialog => Exception::dialog(),
+                    Witness::Title => Exception::stalled(),
+                    Witness::Words(_) => Exception::stalled_on_work(),
                 };
                 review.note(&format!(
                     "EXCEPTION seq={} kind={} when={} {} => {}",
@@ -748,10 +898,12 @@ impl<C: Ctl> Session<'_, C> {
     /// told ends with it: the record's host is told `None`, and the raised
     /// exception journals `CLEARED seq=<n> exception=<stalled|dialog>
     /// after=<s>s <cause>` and is withdrawn from the host. Quiet where nothing
-    /// was said. A dialog's clock ([`Self::dialog_note`]) ends with it, so
-    /// every end the busy flavour has is the dialog's too.
+    /// was said. A dialog's clock ([`Self::dialog_note`]) and the words' clock
+    /// ([`Witness::Words`]) end with it, so every end the busy flavour has is
+    /// the dialog's too.
     pub(super) fn stuck_over(&mut self, seq: u64, cause: &str, review: &mut dyn Review) {
         self.stuck_dialog = None;
+        self.stuck_still = None;
         let rung = std::mem::replace(&mut self.stuck_rung, StuckRung::Quiet);
         let raised = self.stuck_raised.take();
         if rung >= StuckRung::Told

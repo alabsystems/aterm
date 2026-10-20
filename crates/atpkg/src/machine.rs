@@ -325,7 +325,7 @@ impl UniversalControlState {
     #[must_use]
     pub fn posture(&self) -> UcPosture {
         // An UNMEASURED read is `Unknown`, which is the variant's whole purpose: before
-        // this, a `defaults` that would not run reported the OS default and the card
+        // this, a `defaults` that would not run reported the OS default and Settings
         // told the user the cursor roams, on no evidence.
         if !self.measured {
             return UcPosture::Unknown;

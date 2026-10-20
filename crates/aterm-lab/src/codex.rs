@@ -1,0 +1,829 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The REAL Codex (the managed store binary, by path) in the lab's tab,
+//! against the stub's Responses API. `CODEX_HOME` and `HOME` are the
+//! scratch's (`codex-home/`, `home/`, whose `.codex` is a decoy: Codex must
+//! keep to `CODEX_HOME`), the launch line names every variable it needs and
+//! unsets `OPENAI_API_KEY` and `CODEX_API_KEY`. Three logins (`CODEX_MODE` in
+//! `env.sh`):
+//!
+//! * `lab`: the lab provider, `base_url` = the stub, `wire_api = "responses"`,
+//!   `env_key LAB_CODEX_KEY` = `lab-not-a-key`;
+//! * `chatgpt`: the lab provider with `requires_openai_auth = true` and a
+//!   COMPOSED fake ChatGPT `auth.json` (`codex-auth`): the path on which Codex
+//!   reads `auth.json`, reloads it on a 401 and refreshes a token
+//!   (`chatgpt_base_url` is the stub; `CODEX_REFRESH_TOKEN_URL_OVERRIDE` and the
+//!   revoke override point at it in every mode);
+//! * `signed-out`: the default OpenAI provider and no auth at all: the sign-in
+//!   screen, offline (egress black-holed).
+//!
+//! Neither a key nor a token is a credential anywhere. A login, a server
+//! outside the lab's process tree and the Desktop app are refused
+//! ([`safe_args`]); the sign-in screens offer a browser sign-in, so the harness
+//! is off for those two logins, and the jail denies the desktop's open doors
+//! (a bare-name `open` or `BROWSER` lands on the recorder). `--no-daemon` keeps
+//! Codex's app server inside the process the tab (or `codex-run`) started, in
+//! the tree the witness watches and `down` ends.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::LAB;
+use crate::door::Door;
+use crate::pyjson::{COMPACT, J, Style};
+use crate::run::{Run, take_tag};
+use crate::util::shell_quote;
+use crate::{Fail, Res};
+
+/// The lab provider's `env_key` value: no credential anywhere (the stub logs it as `auth=key`).
+pub use crate::stub::LAB_CODEX_KEY;
+
+fn lab(args: &[String]) -> Result<(Run, Vec<String>), Fail> {
+    let mut a = args.to_vec();
+    let tag = take_tag(&mut a)?;
+    Ok((Run::load(&tag)?, a))
+}
+
+/// The lab has a Codex to run.
+///
+/// # Errors
+/// None is managed in this lab.
+pub fn need_codex(run: &Run) -> Result<(), Fail> {
+    if run.codex_bin.is_empty() || !crate::sys::executable(&run.codex_bin) {
+        return Err(Fail::die(format!(
+            "no managed Codex in lab '{}' (aterm pkg install codex, or LAB_CODEX=/path/to/codex at up)",
+            run.tag
+        )));
+    }
+    Ok(())
+}
+
+/// A TOML string.
+fn q(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// `CODEX_HOME/config.toml` for a login (`lab`, `chatgpt`, `signed-out`); its first line names the login.
+#[must_use]
+pub fn config_text(mode: &str, port: &str, proj: &str, proj_spelled: &str, model: &str) -> String {
+    let stub = format!("http://127.0.0.1:{port}");
+    let mut l: Vec<String> = vec![
+        format!(
+            "# aterm-lab codex (crates/aterm-lab), mode {mode}: rewritten at each launch; Codex may add to it"
+        ),
+        "check_for_update_on_startup = false".into(),
+        // auth.json in this CODEX_HOME, never the keychain
+        "cli_auth_credentials_store = \"file\"".into(),
+        "mcp_oauth_credentials_store = \"file\"".into(),
+    ];
+    if mode != "signed-out" {
+        l.push("model_provider = \"lab\"".into());
+    }
+    if !model.is_empty() {
+        l.push(format!("model = {}", q(model)));
+    }
+    if mode == "chatgpt" {
+        // the ChatGPT backend is the stub too; its built-in apps server has no stand-in: off, or every screen
+        // carries a lab-only `⚠ 1 warning` (its failed initialize)
+        l.extend([
+            format!("chatgpt_base_url = {}", q(&format!("{stub}/backend-api/"))),
+            String::new(),
+            "[features]".into(),
+            "apps = false".into(),
+        ]);
+    }
+    l.extend(
+        [
+            "",
+            "[analytics]",
+            "enabled = false",
+            "",
+            "[feedback]",
+            "enabled = false",
+            "",
+            "[otel]",
+            "exporter = \"none\"",
+            "metrics_exporter = \"none\"",
+            "trace_exporter = \"none\"",
+            "",
+            "[tui]",
+            "notifications = false",
+        ]
+        .map(str::to_string),
+    );
+    if mode != "signed-out" {
+        l.extend([
+            String::new(),
+            "[model_providers.lab]".into(),
+            "name = \"lab stub\"".into(),
+            format!("base_url = {}", q(&format!("{stub}/v1"))),
+            "wire_api = \"responses\"".into(),
+            if mode == "chatgpt" {
+                "requires_openai_auth = true".into()
+            } else {
+                "env_key = \"LAB_CODEX_KEY\"".into()
+            },
+        ]);
+    }
+    let mut projs = vec![proj.to_string(), proj_spelled.to_string()];
+    projs.sort();
+    projs.dedup();
+    for d in projs {
+        l.extend([
+            String::new(),
+            format!("[projects.{}]", q(&d)),
+            "trust_level = \"trusted\"".into(),
+        ]);
+    }
+    let mut out = l.join("\n");
+    out.push('\n');
+    out
+}
+
+/// Write the scratch `config.toml` for `mode` (through no link).
+///
+/// # Errors
+/// The write was refused.
+pub fn write_config(run: &Run, mode: &str) -> Result<(), Fail> {
+    let proj =
+        fs::canonicalize(&run.proj).map_or(run.proj.clone(), |p| p.to_string_lossy().into_owned());
+    let model = std::env::var("LAB_CODEX_MODEL").unwrap_or_default();
+    let text = config_text(mode, &run.port, &proj, &run.proj, &model);
+    crate::sys::put(
+        &run.w.join("codex-home/config.toml"),
+        0o600,
+        &crate::sys::PutSrc::Bytes(text.as_bytes()),
+    )
+    .map_err(|e| Fail::die(format!("codex: cannot write config.toml: {e}")))
+}
+
+/// A composed, FAKE ChatGPT `auth.json`: unsigned JWTs whose payload names the
+/// lab's label (the stub logs `auth=jwt:<label>`, never the token), the
+/// account and the plan, an email at example.com, a refresh token that is a
+/// fixed string. No credential anywhere.
+#[must_use]
+pub fn auth_json(label: &str, account: &str, plan: &str, now: i64) -> String {
+    let seg = |j: &J| crate::util::b64url(j.dump(COMPACT).as_bytes());
+    let jwt = |mut claims: Vec<(String, J)>| {
+        claims.push(("lab".into(), J::s(label)));
+        claims.push(("iat".into(), J::Int(now)));
+        claims.push(("exp".into(), J::Int(now + 30 * 86_400)));
+        format!(
+            "{}.{}.bGFiLW5vdC1zaWduZWQ",
+            seg(&J::obj([("alg", J::s("none")), ("typ", J::s("JWT"))])),
+            seg(&J::Obj(claims))
+        )
+    };
+    let auth = J::obj([
+        ("chatgpt_plan_type", J::s(plan)),
+        ("chatgpt_user_id", J::s("user-lab")),
+        ("user_id", J::s("user-lab")),
+        ("chatgpt_account_id", J::s(account)),
+        (
+            "chatgpt_account_user_id",
+            J::s(format!("user-lab__{account}")),
+        ),
+    ]);
+    let email = "user@example.com";
+    let id = jwt(vec![
+        ("https://api.openai.com/auth".into(), auth.clone()),
+        ("email".into(), J::s(email)),
+        (
+            "https://api.openai.com/profile".into(),
+            J::obj([("email", J::s(email))]),
+        ),
+    ]);
+    let access = jwt(vec![("https://api.openai.com/auth".into(), auth)]);
+    let d = J::obj([
+        ("auth_mode", J::s("chatgpt")),
+        ("OPENAI_API_KEY", J::Null),
+        (
+            "tokens",
+            J::obj([
+                ("id_token", J::s(id)),
+                ("access_token", J::s(access)),
+                ("refresh_token", J::s(format!("lab-refresh-{label}"))),
+                ("account_id", J::s(account)),
+            ]),
+        ),
+        ("last_refresh", J::s(crate::util::utc_stamp(now))),
+    ]);
+    d.dump(Style {
+        indent: Some(2),
+        compact: false,
+        ascii: true,
+    })
+}
+
+/// Write [`auth_json`] into the scratch `CODEX_HOME` (mode 0600, through no link).
+///
+/// # Errors
+/// The write was refused.
+pub fn write_auth(run: &Run, label: &str, account: &str, plan: &str) -> Result<PathBuf, Fail> {
+    let p = run.w.join("codex-home/auth.json");
+    let text = auth_json(label, account, plan, crate::util::now_secs());
+    crate::sys::put(&p, 0o600, &crate::sys::PutSrc::Bytes(text.as_bytes()))
+        .map_err(|e| Fail::die(format!("codex: cannot write auth.json: {e}")))?;
+    Ok(p)
+}
+
+/// Write [`auth_json`] into the live `CODEX_HOME` and a note of it into the
+/// stub's log (a scenario's marker): `codex-auth`'s work.
+///
+/// # Errors
+/// The write was refused, or the stub did not take the note.
+pub fn auth_and_note(run: &Run, label: &str, account: &str, plan: &str) -> Result<PathBuf, Fail> {
+    let p = write_auth(run, label, account, plan)?;
+    let note = format!("codex-auth: auth.json now holds {label} (account {account}, plan {plan})");
+    crate::stub::control(
+        &run.port,
+        &format!("/__note?t={}", crate::stub::query_escape(&note)),
+    )
+    .map_err(|e| {
+        Fail::die(format!(
+            "codex-auth: auth.json holds {label}, but the stub of lab '{}' did not take the note ({e})",
+            run.tag
+        ))
+    })?;
+    Ok(p)
+}
+
+/// Refuse what would start a login, contact a real server, start a server
+/// outside the lab's process tree or open the Desktop app. A `login` anywhere
+/// in `args` (a subcommand, `mcp login`, an option's value) is refused unless
+/// they are exactly `login status`, `login --help` or `login -h` for
+/// `codex-run` (`tab` false; clap reads `login -c status` as a plain login);
+/// the tab takes none. Refused anywhere: `logout`, `app`, `app-server`,
+/// `remote-control`, `agents`, `exec-server`, `cloud`, `update`.
+///
+/// # Errors
+/// What was refused.
+pub fn safe_args(tab: bool, args: &[String]) -> Result<(), String> {
+    let joined = args.join(" ");
+    for a in args {
+        match a.as_str() {
+            "login" => {
+                if !tab && ["login status", "login --help", "login -h"].contains(&joined.as_str()) {
+                    continue;
+                }
+                return Err("codex: a login never runs in the lab (codex-run takes exactly 'login status', 'login --help' or 'login -h'; the tab no login at all)".into());
+            }
+            "logout" | "app" | "app-server" | "remote-control" | "agents" | "exec-server"
+            | "cloud" | "update" => {
+                return Err(format!(
+                    "codex: '{a}' is refused in the lab (a login, a server or an app outside the jail's reach)"
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The launcher: the line the tab types (`clear`, then `exec`), or
+/// `codex-run`'s (`exec`). Both exec, so the process the lab or the tab
+/// started IS Codex, and both put `--no-daemon` first: the app server runs
+/// inside that process, in the tree the witness watches and `down` ends by
+/// pid (Codex's default starts a background daemon that leaves the tree and
+/// outlives it, from a copy of the package it installs into `CODEX_HOME`).
+#[must_use]
+pub fn launcher(run: &Run, tab: bool, mode: &str, envs: &[String], args: &[String]) -> String {
+    let w = run.w.to_string_lossy();
+    let shim = run.run.join("shim");
+    let px = &run.proxy;
+    let mut s = String::from("#!/bin/sh\n");
+    if tab {
+        s.push_str("clear\n");
+    }
+    s.push_str(&format!(
+        "exec env -u OPENAI_API_KEY -u CODEX_API_KEY -u OPENAI_BASE_URL PATH=\"{}:$PATH\" HOME={} CODEX_HOME={} \\\n",
+        shim.display(),
+        shell_quote(&format!("{w}/home")),
+        shell_quote(&format!("{w}/codex-home"))
+    ));
+    s.push_str(&format!(
+        "  HTTP_PROXY={px} HTTPS_PROXY={px} http_proxy={px} https_proxy={px} ALL_PROXY={px} all_proxy={px} \\\n"
+    ));
+    s.push_str("  NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \\\n");
+    s.push_str(&format!(
+        "  LAB_SECURITY_LOG={} LAB_OPEN_LOG={} BROWSER={} \\\n",
+        shell_quote(&format!("{w}/security.log")),
+        shell_quote(&format!("{w}/open.log")),
+        shell_quote(&shim.join("open").to_string_lossy())
+    ));
+    // the refresh and the revoke go to the stub in every mode: a ChatGPT auth.json can stand in any CODEX_HOME
+    s.push_str(&format!(
+        "  CODEX_REFRESH_TOKEN_URL_OVERRIDE=http://127.0.0.1:{0}/oauth/token CODEX_REVOKE_TOKEN_URL_OVERRIDE=http://127.0.0.1:{0}/oauth/revoke \\\n",
+        run.port
+    ));
+    if mode == "lab" {
+        s.push_str(&format!("  LAB_CODEX_KEY={LAB_CODEX_KEY} \\\n"));
+    }
+    for kv in envs {
+        s.push_str(&format!("  {} \\\n", shell_quote(kv)));
+    }
+    s.push_str(&format!("  {} --no-daemon", shell_quote(&run.codex_bin)));
+    for a in args {
+        s.push(' ');
+        s.push_str(&shell_quote(a));
+    }
+    s.push('\n');
+    s
+}
+
+fn write_launcher(path: &Path, text: &str) -> Result<(), Fail> {
+    crate::sys::put(path, 0o755, &crate::sys::PutSrc::Bytes(text.as_bytes()))
+        .map_err(|e| Fail::die(format!("cannot write {}: {e}", path.display())))
+}
+
+/// How `codex` launches.
+#[derive(Debug, Default)]
+pub struct Launch {
+    /// `lab`, `chatgpt` or `signed-out`.
+    pub mode: String,
+    /// The plan of a `--chatgpt` login.
+    pub plan: String,
+    /// `-e K=V`.
+    pub envs: Vec<String>,
+    /// `--no-wait`.
+    pub no_wait: bool,
+    /// `-- <codex args>`.
+    pub args: Vec<String>,
+}
+
+/// Parse `codex`'s options.
+///
+/// # Errors
+/// An unknown option, `-e` with no value, or a plan that is no `plan_type`.
+pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
+    let mut l = Launch {
+        mode: "lab".into(),
+        plan: "plus".into(),
+        ..Launch::default()
+    };
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-e" => l
+                .envs
+                .push(it.next().cloned().ok_or("codex: -e needs K=V")?),
+            "--no-wait" => l.no_wait = true,
+            "--signed-out" => l.mode = "signed-out".into(),
+            "--chatgpt" => l.mode = "chatgpt".into(),
+            "--" => l.args.extend(it.by_ref().cloned()),
+            other => {
+                if let Some(plan) = other.strip_prefix("--chatgpt=") {
+                    l.mode = "chatgpt".into();
+                    l.plan = plan.to_string();
+                } else {
+                    return Err(format!(
+                        "codex: unknown option '{other}' (use --signed-out, --chatgpt[=PLAN], -e K=V, --no-wait, -- <codex args>)"
+                    ));
+                }
+            }
+        }
+    }
+    if l.plan.is_empty()
+        || !l
+            .plan
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
+        return Err("codex: --chatgpt=PLAN is a plan_type (plus, pro, free, team, ...)".into());
+    }
+    Ok(l)
+}
+
+/// Launch the managed Codex in the lab's first tab; the `launched: …` line.
+///
+/// # Errors
+/// No Codex, no witness, a refused argument, or the launch line could not be typed.
+pub fn launch(run: &Run, l: &Launch) -> Result<String, Fail> {
+    need_codex(run)?;
+    crate::procs::need_witness(run)?;
+    safe_args(true, &l.args)?;
+    // The sign-in screens (signed out, a lost ChatGPT login) offer a browser sign-in: nothing in the lab may press
+    // one, so the harness is off for those two logins. The lab provider keeps the lab's harness.
+    if l.mode != "lab" {
+        crate::verbs::set_harness(run, &[("enabled".into(), "false".into())])?;
+    }
+    let mut run = run.clone();
+    run.codex_mode.clone_from(&l.mode);
+    run.agent = "codex".into();
+    run.save();
+    write_config(&run, &l.mode)?;
+    let _ = fs::remove_file(run.w.join("codex-home/auth.json"));
+    if l.mode == "chatgpt" {
+        write_auth(&run, "A", "acct-lab-1", &l.plan)?;
+    }
+    let script = run.run.join("codex.sh");
+    write_launcher(&script, &launcher(&run, true, &l.mode, &l.envs, &l.args))?;
+    let door = Door::new(&run)?;
+    let line = format!("sh {}", shell_quote(&script.to_string_lossy()));
+    if door.ctl(&["send", &line])?.code != 0 {
+        return Err(Fail::die("could not type the launch line"));
+    }
+    door.ctl(&["key", "enter"])?;
+    Ok(format!(
+        "launched: {} ({}) in lab '{}', login: {}{}  (launcher: {})",
+        run.codex_bin,
+        run.codex_ver,
+        run.tag,
+        l.mode,
+        if l.mode == "chatgpt" {
+            format!(" (plan {}, user@example.com)", l.plan)
+        } else {
+            String::new()
+        },
+        script.display()
+    ))
+}
+
+/// `codex [tag] [--signed-out|--chatgpt[=PLAN]] [-e K=V]... [--no-wait] [-- codex args]`.
+pub fn cmd_codex(args: &[String]) -> Res {
+    let (run, a) = lab(args)?;
+    let l = parse_launch(&a)?;
+    println!("{}", launch(&run, &l)?);
+    let run = Run::load(&run.tag)?;
+    if !l.no_wait
+        && Door::new(&run)?
+            .await_match("OpenAI Codex|Sign in|Welcome to Codex|›", 60)
+            .unwrap_or(false)
+    {
+        println!("the TUI is drawing ({LAB} text {})", run.tag);
+    }
+    Ok(0)
+}
+
+/// `codex-run [tag] [--lab|--chatgpt|--signed-out] -- <codex args>`: a
+/// non-interactive Codex command inside the jail (scratch `HOME` and
+/// `CODEX_HOME`, `--no-daemon`), on the config of the login asked for (by
+/// default the tab's): `config.toml` is rewritten when it is another login's,
+/// which a Codex running in the tab then finds on disk too. It runs outside
+/// the instance's tree, so it is started where the witness watches it
+/// (`jailed.pids`). Its exit status.
+pub fn cmd_codex_run(args: &[String]) -> Res {
+    let (run, mut a) = lab(args)?;
+    codex_run(&run, &mut a, crate::procs::JailOut::Inherit).map(|(rc, _)| rc)
+}
+
+/// [`cmd_codex_run`] on a loaded lab: its exit status and, when captured, its output.
+///
+/// # Errors
+/// No Codex, a refused argument, or the jail could not start it.
+pub fn codex_run(
+    run: &Run,
+    a: &mut Vec<String>,
+    out: crate::procs::JailOut,
+) -> Result<(i32, String), Fail> {
+    need_codex(run)?;
+    let mut mode = if run.codex_mode.is_empty() {
+        "lab".to_string()
+    } else {
+        run.codex_mode.clone()
+    };
+    match a.first().map(String::as_str) {
+        Some("--lab") => {
+            mode = "lab".into();
+            a.remove(0);
+        }
+        Some("--chatgpt") => {
+            mode = "chatgpt".into();
+            a.remove(0);
+        }
+        Some("--signed-out") => {
+            mode = "signed-out".into();
+            a.remove(0);
+        }
+        _ => {}
+    }
+    if a.first().map(String::as_str) == Some("--") {
+        a.remove(0);
+    }
+    safe_args(false, a)?;
+    let current = crate::util::scratch_text(&run.w.join("codex-home/config.toml"));
+    if !current
+        .lines()
+        .next()
+        .is_some_and(|l| l.contains(&format!("mode {mode}:")))
+    {
+        write_config(run, &mode)?;
+    }
+    let script = run.run.join("codex-run.sh");
+    write_launcher(&script, &launcher(run, false, &mode, &[], a))?;
+    let user = crate::paths::paths().user.clone();
+    let script_s = script.to_string_lossy().into_owned();
+    crate::procs::jailed(
+        run,
+        Path::new(&run.proj),
+        &[
+            ("LANG", "en_US.UTF-8"),
+            ("TERM", "dumb"),
+            ("USER", &user),
+            ("LOGNAME", &user),
+        ],
+        &["/bin/sh", &script_s],
+        out,
+    )
+    .map_err(Fail::die)
+}
+
+/// `codex-auth [tag] [LABEL [ACCOUNT [PLAN]]]`: write a composed fake
+/// `auth.json` (default `B`, `acct-lab-1`, `plus`) into the LIVE `CODEX_HOME`,
+/// and a note of it into the stub's log.
+pub fn cmd_codex_auth(args: &[String]) -> Res {
+    let (run, a) = lab(args)?;
+    let get = |i: usize, d: &str| a.get(i).cloned().unwrap_or_else(|| d.to_string());
+    let (label, account, plan) = (get(0, "B"), get(1, "acct-lab-1"), get(2, "plus"));
+    let ok = |s: &str| {
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    };
+    if !(ok(&label) && ok(&account) && ok(&plan)) {
+        return Err(Fail::die(
+            "codex-auth: LABEL, ACCOUNT and PLAN are letters, digits, _ and -",
+        ));
+    }
+    let p = auth_and_note(&run, &label, &account, &plan)?;
+    println!(
+        "codex-auth: {} now holds the lab's fake ChatGPT login '{label}' (account {account}, plan {plan}, user@example.com)",
+        p.display()
+    );
+    Ok(0)
+}
+
+/// The `x-codex-*` headers of `ratelimits`' arguments: `off`, or `PRIMARY
+/// SECONDARY` (used percent of the 5h and the weekly window, `-` for none)
+/// and `credits=yes|no|unlimited`, `balance=N`, `reached=TYPE`,
+/// `promo=TEXT`, `active=ID`.
+///
+/// # Errors
+/// A missing window or an unknown key.
+pub fn ratelimit_headers(args: &[String]) -> Result<J, String> {
+    let mut h: Vec<(String, J)> = Vec::new();
+    if args.first().is_none_or(|a| a == "off") {
+        return Ok(J::Obj(h));
+    }
+    let (Some(prim), Some(sec)) = (args.first(), args.get(1)) else {
+        return Err(
+            "ratelimits: PRIMARY SECONDARY (used percent of the 5h and the weekly window), or off"
+                .into(),
+        );
+    };
+    for (slot, used, window, reset) in [
+        ("primary", prim, 300, 3600),
+        ("secondary", sec, 10080, 5 * 86_400),
+    ] {
+        if used == "-" {
+            continue;
+        }
+        let v: f64 = used
+            .parse()
+            .map_err(|_| format!("ratelimits: {used} is not a percent"))?;
+        h.push((
+            format!("x-codex-{slot}-used-percent"),
+            J::s(crate::pyjson::py_float(v)),
+        ));
+        h.push((
+            format!("x-codex-{slot}-window-minutes"),
+            J::s(window.to_string()),
+        ));
+        h.push((
+            format!("x-codex-{slot}-reset-at"),
+            J::s(format!("@NOW+{reset}@")),
+        ));
+    }
+    for kv in &args[2..] {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        match k {
+            "credits" => {
+                let has = matches!(v, "yes" | "unlimited");
+                h.push((
+                    "x-codex-credits-has-credits".into(),
+                    J::s(if has { "true" } else { "false" }),
+                ));
+                h.push((
+                    "x-codex-credits-unlimited".into(),
+                    J::s(if v == "unlimited" { "true" } else { "false" }),
+                ));
+            }
+            "balance" => h.push(("x-codex-credits-balance".into(), J::s(v))),
+            "reached" => h.push(("x-codex-rate-limit-reached-type".into(), J::s(v))),
+            "promo" => h.push(("x-codex-promo-message".into(), J::s(v))),
+            "active" => h.push(("x-codex-active-limit".into(), J::s(v))),
+            _ => {
+                return Err(format!(
+                    "ratelimits: unknown {} (credits= balance= reached= promo= active=)",
+                    crate::util::py_repr(kv)
+                ));
+            }
+        }
+    }
+    Ok(J::Obj(h))
+}
+
+/// `ratelimits [tag] off | PRIMARY SECONDARY [credits=yes|no|unlimited]
+/// [balance=N] [reached=TYPE] [promo=TEXT] [active=ID]`: the `x-codex-*`
+/// headers every stub answer carries, and the account usage a `--chatgpt` Codex
+/// polls; the `on200`/`on429` blocks `headers` wrote stay
+/// ([`crate::verbs::write_headers`]).
+pub fn cmd_ratelimits(args: &[String]) -> Res {
+    let (run, a) = lab(args)?;
+    let h = ratelimit_headers(&a).map_err(Fail::die)?;
+    crate::verbs::write_headers(&run.w, h.clone(), false)?;
+    println!("{}", h.py());
+    Ok(0)
+}
+
+/// The newest rollout of the TAB's Codex under the scratch `CODEX_HOME`, or
+/// `None`. `codex-run`'s `exec` writes its rollouts there too, and is never
+/// the tab: a rollout whose `session_meta` (its first line) names the
+/// originator `codex_exec` is skipped.
+#[must_use]
+pub fn tab_rollout(run: &Run) -> Option<PathBuf> {
+    let mut files = Vec::new();
+    crate::util::walk_files(&run.w.join("codex-home/sessions"), &mut files);
+    let mut files: Vec<PathBuf> = files
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy())
+                .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
+        })
+        .collect();
+    files.sort();
+    files.into_iter().rev().find(|f| {
+        !crate::util::scratch_text(f)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .contains("\"originator\":\"codex_exec\"")
+    })
+}
+
+/// `rollout [tag] [all]`: the `token_count` lines (all: every line) of the tab's newest rollout.
+pub fn cmd_rollout(args: &[String]) -> Res {
+    let (run, a) = lab(args)?;
+    let f = tab_rollout(&run).ok_or_else(|| {
+        Fail::die(format!(
+            "no rollout of the tab's Codex under {}/codex-home/sessions yet",
+            run.w.display()
+        ))
+    })?;
+    println!("# {}", f.display());
+    let all = a.first().map(String::as_str) == Some("all");
+    for l in crate::util::scratch_text(&f).lines() {
+        if all || l.contains("\"token_count\"") {
+            println!("{l}");
+        }
+    }
+    Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_login_or_a_server_never_runs_in_the_lab() {
+        let v = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert!(safe_args(false, &v(&["login", "status"])).is_ok());
+        assert!(safe_args(false, &v(&["login", "--help"])).is_ok());
+        assert!(safe_args(true, &v(&["login", "status"])).is_err());
+        assert!(safe_args(false, &v(&["login", "-c", "status"])).is_err());
+        assert!(safe_args(false, &v(&["mcp", "login", "x"])).is_err());
+        for bad in [
+            "logout",
+            "app",
+            "app-server",
+            "remote-control",
+            "agents",
+            "exec-server",
+            "cloud",
+            "update",
+        ] {
+            assert!(safe_args(false, &v(&["exec", bad])).is_err(), "{bad}");
+        }
+        assert!(safe_args(false, &v(&["exec", "--skip-git-repo-check", "hi"])).is_ok());
+    }
+
+    #[test]
+    fn the_config_names_its_login_and_trusts_the_project_both_ways() {
+        let c = config_text(
+            "chatgpt",
+            "5",
+            "/private/tmp/at.X/proj",
+            "/tmp/at.X/proj",
+            "",
+        );
+        assert!(c.starts_with("# aterm-lab codex (crates/aterm-lab), mode chatgpt:"));
+        assert!(c.contains(
+            "chatgpt_base_url = \"http://127.0.0.1:5/backend-api/\"\n\n[features]\napps = false\n"
+        ));
+        assert!(c.contains("base_url = \"http://127.0.0.1:5/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n"));
+        assert!(
+            c.contains("[projects.\"/private/tmp/at.X/proj\"]")
+                && c.contains("[projects.\"/tmp/at.X/proj\"]")
+        );
+        let lab = config_text("lab", "5", "/p", "/p", "gpt-x");
+        assert!(
+            lab.contains("model_provider = \"lab\"\nmodel = \"gpt-x\"\n")
+                && lab.contains("env_key = \"LAB_CODEX_KEY\"")
+        );
+        assert_eq!(lab.matches("[projects.").count(), 1);
+        let out = config_text("signed-out", "5", "/p", "/p", "");
+        assert!(!out.contains("model_provider") && !out.contains("[model_providers.lab]"));
+    }
+
+    #[test]
+    fn the_composed_login_is_a_jwt_the_stub_reads_by_its_label_only() {
+        let j = J::parse(&auth_json("B", "acct-lab-1", "plus", 1_792_091_823)).unwrap();
+        let tokens = j.get("tokens").unwrap();
+        let access = tokens.get("access_token").and_then(J::as_str).unwrap();
+        assert!(access.ends_with(".bGFiLW5vdC1zaWduZWQ"));
+        assert_eq!(
+            crate::stub::auth_label(Some(&format!("Bearer {access}"))),
+            "jwt:B"
+        );
+        let claims = crate::stub::lab_claims(&format!("Bearer {access}")).unwrap();
+        let auth = claims.get("https://api.openai.com/auth").unwrap();
+        assert_eq!(
+            auth.get("chatgpt_plan_type").and_then(J::as_str),
+            Some("plus")
+        );
+        assert_eq!(
+            auth.get("chatgpt_account_id").and_then(J::as_str),
+            Some("acct-lab-1")
+        );
+        assert_eq!(
+            j.get("last_refresh").and_then(J::as_str),
+            Some("2026-10-15T19:17:03.000000Z")
+        );
+        assert_eq!(
+            tokens.get("refresh_token").and_then(J::as_str),
+            Some("lab-refresh-B")
+        );
+        assert_eq!(crate::stub::auth_label(Some("Bearer lab-not-a-key")), "key");
+        assert_eq!(crate::stub::auth_label(None), "none");
+        assert_eq!(
+            crate::stub::auth_label(Some("Bearer sk-x")),
+            "other(4 chars)"
+        );
+    }
+
+    #[test]
+    fn ratelimits_name_each_window_and_the_credits() {
+        let a: Vec<String> = ["76", "-", "credits=unlimited", "balance=12.5"]
+            .map(String::from)
+            .to_vec();
+        let h = ratelimit_headers(&a).unwrap();
+        assert_eq!(
+            h.get("x-codex-primary-used-percent").and_then(J::as_str),
+            Some("76.0")
+        );
+        assert_eq!(
+            h.get("x-codex-primary-reset-at").and_then(J::as_str),
+            Some("@NOW+3600@")
+        );
+        assert!(h.get("x-codex-secondary-used-percent").is_none());
+        assert_eq!(
+            h.get("x-codex-credits-unlimited").and_then(J::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            ratelimit_headers(&["off".to_string()]).unwrap(),
+            J::Obj(Vec::new())
+        );
+        assert!(ratelimit_headers(&["5".to_string()]).is_err());
+        assert!(ratelimit_headers(&["1".into(), "2".into(), "bogus=1".into()]).is_err());
+    }
+
+    #[test]
+    fn the_launcher_execs_codex_by_path_with_no_daemon() {
+        let run = Run {
+            tag: "t".into(),
+            run: "/s/runs/t".into(),
+            w: "/s/runs/t/scratch".into(),
+            port: "5".into(),
+            proxy: "http://127.0.0.1:6".into(),
+            codex_bin: "/a b/codex".into(),
+            ..Run::default()
+        };
+        let s = launcher(
+            &run,
+            true,
+            "lab",
+            &["K=v 1".into()],
+            &["-C".into(), "/x y".into()],
+        );
+        assert!(s.starts_with("#!/bin/sh\nclear\nexec env -u OPENAI_API_KEY -u CODEX_API_KEY -u OPENAI_BASE_URL PATH=\"/s/runs/t/shim:$PATH\""), "{s}");
+        assert!(
+            s.contains("  LAB_CODEX_KEY=lab-not-a-key \\\n  'K=v 1' \\\n"),
+            "{s}"
+        );
+        assert!(s.ends_with("  '/a b/codex' --no-daemon -C '/x y'\n"), "{s}");
+        let r = launcher(&run, false, "chatgpt", &[], &[]);
+        assert!(!r.contains("clear") && !r.contains("LAB_CODEX_KEY="), "{r}");
+    }
+}

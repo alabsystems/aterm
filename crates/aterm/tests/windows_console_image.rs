@@ -28,7 +28,7 @@
 #![cfg(windows)]
 
 use std::io::Read as _;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 /// `IMAGE_OPTIONAL_HEADER.Subsystem` of the PE file at `path`: `e_lfanew` at
 /// 0x3C, then the 4-byte signature, the 20-byte COFF header, and the field at
@@ -57,7 +57,7 @@ fn bytes<const N: usize>(head: &[u8], offset: usize, path: &str) -> [u8; N] {
 /// Run the CONSOLE image with `args`, stdin on NUL (so the mode fork takes the
 /// window route on its own, whatever `--window` says), everything captured.
 fn console_image(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_aterm"))
+    aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_aterm"))
         .args(args)
         .stdin(Stdio::null())
         .output()

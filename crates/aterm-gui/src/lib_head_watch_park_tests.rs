@@ -1576,7 +1576,7 @@ fn ready_codex_starts_its_pass_before_stalled_claude_finishes() {
 
     let mut lane = PkgLane {
         atpkg: atpkg.as_path(),
-        child_path: || "",
+        child_path: |_| "".into(),
         layout: Some(&layout),
         private_state_root: false,
         post: |_| {},
@@ -1653,7 +1653,7 @@ fn a_targeted_pass_that_stood_aside_ends_the_trigger_on_the_tally() {
     let runs = || std::fs::read_to_string(&argv_log).unwrap_or_default();
     let mut lane = PkgLane {
         atpkg: atpkg.as_path(),
-        child_path: || "",
+        child_path: |_| "".into(),
         layout: None,
         private_state_root: false,
         post: |_| {},
@@ -1722,7 +1722,7 @@ fn a_private_windows_passes_lead_with_the_flag_and_the_owners_do_not() {
         let _ = std::fs::remove_file(&argv_log);
         let mut lane = PkgLane {
             atpkg: atpkg.as_path(),
-            child_path: || "",
+            child_path: |_| "".into(),
             layout: None,
             private_state_root,
             post: |_| {},
@@ -1763,8 +1763,8 @@ fn a_private_windows_passes_lead_with_the_flag_and_the_owners_do_not() {
 /// (once). An update that stood aside at the lock (exit 75) only waited: its exit is
 /// carried like a seed's and the busy park withdraws the row, as it is for one whose only
 /// answer was a fact about the machine (an unserved architecture). The seeds run with this
-/// process's PATH and never ask the login shell; the update gets the login shell's
-/// answer.
+/// process's PATH and never ask for the update's; the update (a first run: no store) gets a
+/// first run's ([`crate::spawn::atpkg_update_path`]).
 #[cfg(unix)]
 #[test]
 fn the_lane_holds_the_first_run_row_ahead_and_only_an_update_asks_the_login_path() {
@@ -1772,9 +1772,13 @@ fn the_lane_holds_the_first_run_row_ahead_and_only_an_update_asks_the_login_path
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static ASKED: AtomicUsize = AtomicUsize::new(0);
-    fn login_path() -> &'static str {
+    fn login_path(first_run: bool) -> std::borrow::Cow<'static, str> {
         ASKED.fetch_add(1, Ordering::SeqCst);
-        "/login/bin:/usr/bin:/bin"
+        if first_run {
+            "/first-run/bin:/usr/bin:/bin".into()
+        } else {
+            "/login/bin:/usr/bin:/bin".into()
+        }
     }
     let dir = std::env::temp_dir().join(format!("aterm-first-run-ahead-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1840,7 +1844,7 @@ fn the_lane_holds_the_first_run_row_ahead_and_only_an_update_asks_the_login_path
     let process_path = std::env::var("PATH").unwrap_or_default();
     assert_eq!(
         std::fs::read_to_string(&said).unwrap(),
-        format!("seed {process_path}\nseed {process_path}\nupdate /login/bin:/usr/bin:/bin\n")
+        format!("seed {process_path}\nseed {process_path}\nupdate /first-run/bin:/usr/bin:/bin\n")
     );
     // No update after the seed: the park withdraws the row, once.
     lane.ahead = true;
@@ -1927,6 +1931,163 @@ fn the_lane_holds_the_first_run_row_ahead_and_only_an_update_asks_the_login_path
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// PKG-6 #9/#10 — THE FIRST RUN A PERSON WAITS ON NEITHER WAITS FOR THE LOGIN SHELL NOR
+/// RUNS CLAMPED. The lane asks for an update child's PATH, and picks its band, by whether a
+/// person waits on the pass ([`pass_is_waited_on`]): over a store whose first install is
+/// still ahead the update asks as a first run, which never waits on the person's rc chain
+/// ([`crate::spawn::atpkg_update_path`]), and runs at the default band; over a stocked
+/// store, and over one a pass already served that still holds no ALab program (an
+/// unserved architecture, a declined machine updating its agents), it asks as a routine
+/// pass, which waits for the login shell's answer, and runs behind the utility clamp (on
+/// macOS, read off the child: `ps` pri 20 or below, against the default band's 31).
+#[cfg(unix)]
+#[test]
+fn only_the_first_run_a_person_waits_on_skips_the_login_path_and_the_clamp() {
+    use std::os::unix::fs::PermissionsExt as _;
+    fn update_path(waited: bool) -> std::borrow::Cow<'static, str> {
+        if waited {
+            "/first-run/bin:/usr/bin:/bin".into()
+        } else {
+            "/login/bin:/usr/bin:/bin".into()
+        }
+    }
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let said = dir.path().join("said");
+    let atpkg = dir.path().join("atpkg");
+    std::fs::write(
+        &atpkg,
+        format!(
+            "#!/bin/sh\nprintf '%s %s %s\\n' \"$1\" \"$PATH\" \"$(/bin/ps -o pri= -p $$ | /usr/bin/tr -d ' ')\" >> '{}'\n",
+            said.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&atpkg, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let fresh = atpkg::store::Layout {
+        prefix: dir.path().join("fresh"),
+    };
+    let served = atpkg::store::Layout {
+        prefix: dir.path().join("served"),
+    };
+    std::fs::create_dir_all(&served.prefix).unwrap();
+    atpkg::status::write(
+        &served,
+        &atpkg::status::Status {
+            schema: 1,
+            last_success_at: "2023-11-14T22:13:20Z".to_string(),
+            ..atpkg::status::Status::default()
+        },
+    )
+    .unwrap();
+    let stocked = atpkg::store::Layout {
+        prefix: dir.path().join("stocked"),
+    };
+    let tool = stocked.build_dir("ay", 1971).join("bin").join("ay");
+    std::fs::create_dir_all(tool.parent().unwrap()).unwrap();
+    std::fs::write(&tool, "").unwrap();
+    std::fs::create_dir_all(stocked.bin_dir()).unwrap();
+    std::os::unix::fs::symlink(&tool, stocked.bin_dir().join("ay")).unwrap();
+    for layout in [&fresh, &served, &stocked] {
+        let mut lane = PkgLane {
+            atpkg: atpkg.as_path(),
+            child_path: update_path,
+            layout: Some(layout),
+            private_state_root: false,
+            post: |_| {},
+            wait_row_open: false,
+            backoff: ContentionBackoff::default(),
+            ran_at: None,
+            switch: LiveSwitch::new(None, LoopGate::On),
+            ahead: false,
+        };
+        assert!(lane.run(PassVerb::Update, None).is_some());
+    }
+    let said = std::fs::read_to_string(&said).unwrap();
+    let runs: Vec<(&str, i32)> = said
+        .lines()
+        .map(|line| {
+            let (head, pri) = line.rsplit_once(' ').expect(line);
+            (head, pri.trim().parse().unwrap_or(-1))
+        })
+        .collect();
+    assert_eq!(
+        runs.iter().map(|(head, _)| *head).collect::<Vec<_>>(),
+        [
+            "update /first-run/bin:/usr/bin:/bin",
+            "update /login/bin:/usr/bin:/bin",
+            "update /login/bin:/usr/bin:/bin"
+        ],
+        "{said}"
+    );
+    if cfg!(target_os = "macos") {
+        let pris: Vec<i32> = runs.iter().map(|(_, pri)| *pri).collect();
+        assert!(pris[0] > 20, "the waited first run ran clamped: {said}");
+        assert!(
+            pris[1..].iter().all(|pri| (0..=20).contains(pri)),
+            "a routine pass ran unclamped: {said}"
+        );
+    }
+}
+
+/// PKG-6 #10 — THE LANE THREAD RUNS AT ITS FIRST RUN'S BAND WHILE IT HOLDS IT, read off the
+/// running thread. A lane that holds the first run ahead is raised from launch, across its
+/// seed, until the update takes the row over; then it rests at the background band it was
+/// spawned at, as it does when a park withdraws the row instead.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_lane_thread_is_raised_while_it_holds_the_first_run_and_rests_after() {
+    use crate::qos::{Role, class_for, class_of_self};
+    use std::os::unix::fs::PermissionsExt as _;
+    std::thread::spawn(|| {
+        crate::qos::set_self(Role::Background);
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let atpkg = dir.path().join("atpkg");
+        std::fs::write(&atpkg, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&atpkg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut lane = PkgLane {
+            atpkg: atpkg.as_path(),
+            child_path: |_| "".into(),
+            layout: None,
+            private_state_root: false,
+            post: |_| {},
+            wait_row_open: false,
+            backoff: ContentionBackoff::default(),
+            ran_at: None,
+            switch: LiveSwitch::new(None, LoopGate::On),
+            ahead: true,
+        };
+        lane.hold_band();
+        assert_eq!(
+            class_of_self(),
+            class_for(Role::Responsive),
+            "raised at launch"
+        );
+        lane.run(PassVerb::Seed, None);
+        assert_eq!(
+            class_of_self(),
+            class_for(Role::Responsive),
+            "across its seed"
+        );
+        lane.run(PassVerb::Update, None);
+        assert!(!lane.ahead, "a failed update takes the row over");
+        assert_eq!(
+            class_of_self(),
+            class_for(Role::Background),
+            "rests after it"
+        );
+        lane.ahead = true;
+        lane.hold_band();
+        lane.drop_ahead();
+        assert_eq!(
+            class_of_self(),
+            class_for(Role::Background),
+            "rests when a park withdraws the row"
+        );
+    })
+    .join()
+    .expect("the lane thread's assertions");
+}
+
 /// TC-5 — the lane starts before the event loop exists: what it posts meanwhile is
 /// delivered once the loop goes live, in order and once, and later posts go straight
 /// through behind them.
@@ -1945,6 +2106,7 @@ fn lane_posts_before_the_loop_exists_are_delivered_when_it_goes_live() {
             Wake::PkgPassEnded { clean } => format!("ended {clean}"),
             _ => "other".to_string(),
         });
+        true
     });
     assert_eq!(*delivered.lock().unwrap(), ["ahead true", "ended true"]);
     early.send_event(Wake::PkgFirstRunAhead { open: false });
@@ -1952,6 +2114,40 @@ fn lane_posts_before_the_loop_exists_are_delivered_when_it_goes_live() {
         *delivered.lock().unwrap(),
         ["ahead true", "ended true", "ahead false"]
     );
+}
+
+/// LAG-11 — session 0's reader posts through the same sink, spawned before the
+/// event loop exists. A post the sink queues is accepted, so the reader's output
+/// latch stays armed for the wake it stands for, and that wake is delivered at
+/// go-live; once live, each post answers what the loop answered, so the reader
+/// hears that the loop is gone.
+#[test]
+fn a_reader_posting_through_the_sink_is_accepted_then_answered_by_the_loop() {
+    use crate::spawn::WakeTarget as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    let sink = LaneSink::new();
+    let post = sink.wake_post();
+    let output = || Wake::Output {
+        session: 0,
+        window: WindowId(0),
+    };
+    assert!(post(output()), "a queued post is accepted");
+    let (open, delivered) = (Arc::new(AtomicBool::new(true)), Arc::new(AtomicU32::new(0)));
+    let (loop_open, loop_got) = (Arc::clone(&open), Arc::clone(&delivered));
+    sink.go_live(move |_| {
+        loop_got.fetch_add(1, Ordering::SeqCst);
+        loop_open.load(Ordering::SeqCst)
+    });
+    assert_eq!(
+        delivered.load(Ordering::SeqCst),
+        1,
+        "the queued wake, at go-live"
+    );
+    assert!(post(output()), "the live loop took it");
+    open.store(false, Ordering::SeqCst);
+    assert!(!post(output()), "the loop is gone, and the reader hears so");
+    assert_eq!(delivered.load(Ordering::SeqCst), 3);
 }
 
 /// TC-5 — the row goes up ahead only for a first run this machine consents to and
@@ -2071,7 +2267,7 @@ fn a_pass_is_a_first_run_only_on_an_empty_store_and_reports_its_exit() {
         let sink = Arc::clone(&posted);
         let mut lane = PkgLane {
             atpkg: atpkg.as_path(),
-            child_path: || "",
+            child_path: |_| "".into(),
             layout: Some(layout),
             private_state_root: false,
             post: move |e| sink.lock().unwrap().push(e),
@@ -2166,7 +2362,7 @@ fn a_whole_pass_that_cannot_launch_is_a_failure() {
         let sink = Arc::clone(&posted);
         let mut lane = PkgLane {
             atpkg: missing.as_path(),
-            child_path: || "",
+            child_path: |_| "".into(),
             layout: None,
             private_state_root: false,
             post: move |e| sink.lock().unwrap().push(e),

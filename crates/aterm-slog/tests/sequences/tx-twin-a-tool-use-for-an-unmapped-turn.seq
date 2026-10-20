@@ -1,0 +1,10 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_tool_use_for_a_closed_or_unmapped_turn_never_opens_a_step, its
+# second rig: a partial build with no turn to attach.
+state partial
+bind 0
+expect mark r1 source state=partial
+tx prompt v1
+expect tx vref=v1 mapped=none
+tx tool c1
+expect tx dropped=1

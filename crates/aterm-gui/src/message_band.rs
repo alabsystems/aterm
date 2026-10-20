@@ -6,9 +6,8 @@
 //! (docs/DESIGN-unified-messages-2026-09-21.md §2, §3.2). The band is a
 //! stack of 0–3 full-width single-cell-height rows exactly where the status
 //! bars paint: under the native titlebar on macOS (strip = 0 rows), under the
-//! in-grid strip elsewhere, below the per-window presence row when one is
-//! up. Rows RESERVE grid rows (D1): nothing floats, nothing overwrites
-//! terminal cells, nothing covers the strip.
+//! in-grid strip elsewhere. Rows RESERVE grid rows (D1): nothing floats,
+//! nothing overwrites terminal cells, nothing covers the strip.
 //!
 //! # Division of labour
 //!
@@ -41,17 +40,15 @@
 //!
 //! # The width measure
 //!
-//! The band writes one `char` per cell (`settings::write_str`, the presence
-//! and strip painters' writer), so the measure handed to the width law is
+//! The band writes one `char` per cell (`settings::write_str`, the strip
+//! painter's writer), so the measure handed to the width law is
 //! the char count (`aterm_messages::text::char_width`, the measure the engine's
 //! `drive::Lay` lays out with): the layout and the writer must agree, or
 //! a right-aligned capsule would be hit one cell off where it is drawn. Every
 //! reporter's words are ASCII plus a few BMP glyphs; a wide-aware writer and
-//! measure move together when one arrives — as they did for the presence
-//! row, whose free text (a role in any script) is laid out and painted in the
-//! grid's cells (`aterm_grapheme::str_grid_columns`, injected as
-//! `presence::Host::columns`; a wide glyph is its lead cell and a
-//! continuation, ruling 2026-10-11).
+//! measure move together when one arrives (the grid's own cells,
+//! `aterm_grapheme::str_grid_columns`, as `presence::Host::columns` measures
+//! a pill's words).
 //!
 //! # Row grammar (§2.2)
 //!
@@ -158,9 +155,8 @@
 //! Under Windows High Contrast every ink is WINDOWTEXT and capsules are
 //! drawn as `[label]` with no fill: HC separates surfaces with borders. The
 //! closing underline seam belongs to the COMPOSED stack, not to any painted
-//! row: the splice seals whichever chrome row ends up last — a message row, a
-//! padded row, or the presence row when no band row follows
-//! (`aterm_render::band::seal_stack`).
+//! row: the splice seals whichever chrome row ends up last — a message row or
+//! a padded row (`aterm_render::band::seal_stack`).
 //!
 //! # The links (design §2.2, §8)
 //!
@@ -175,6 +171,7 @@
 //! is the same `Details ›` press ([`App::press_message_body`], the one law
 //! of §2.2), which is why a pointer on the body lights that chip.
 
+#[cfg(test)]
 use aterm_core::terminal::RenderCell;
 #[cfg(test)]
 use aterm_core::terminal::UnderlineStyle;
@@ -190,6 +187,7 @@ use aterm_render::Theme;
 
 #[cfg(test)]
 use crate::chrome_band::BandColors;
+#[cfg(test)]
 use crate::chrome_band::{self};
 use crate::{App, WindowId};
 
@@ -219,58 +217,26 @@ pub(crate) fn cell_width(s: &str) -> usize {
     char_width(s)
 }
 
-/// Where a window pixel landed among the chrome rows between the strip and
-/// the grid.
+/// Where a window pixel landed on the band rows between the strip and the
+/// grid: a band row and the cell column under the pointer — the pair
+/// [`Presentation::hit`] resolves. (The presence row that once sat above the
+/// band is gone: presence owns no chrome row, owner surfaces §5.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BandTarget {
-    /// The per-window presence row: swallowed, no action (design §2).
-    Presence,
-    /// A band row and the cell column under the pointer — the pair
-    /// [`Presentation::hit`] resolves.
-    Row {
-        /// 0 = the topmost band row.
-        row: usize,
-        /// The cell column, 0 = the window's first cell.
-        col: usize,
-    },
+pub(crate) struct BandTarget {
+    /// 0 = the topmost band row.
+    pub(crate) row: usize,
+    /// The cell column, 0 = the window's first cell.
+    pub(crate) col: usize,
 }
 
-/// One EMPTY band row, in the same colours a painted row uses. The compose
-/// pads with this when the geometry has committed more rows than the cache
-/// holds, so a reserved row is never a hole the terminal's own top row shows
-/// through.
+/// One EMPTY band row, in the same colours a painted row uses (the tests'
+/// probe of the renderer's own pad, `aterm_render::band::blank_band_row`).
+#[cfg(test)]
 pub(crate) fn blank_band_row(
     cols: usize,
     p: impl Into<chrome_band::ChromePalette>,
 ) -> Vec<RenderCell> {
     aterm_render::band::blank_band_row(cols, &chrome_band::band_colors(p))
-}
-
-/// Paint the PRESENCE band's one row (`crate::presence::Words`) at `cols`: the
-/// engine lays the slots out and inks each cell (`aterm_messages::presence::
-/// paint_row`, design ruling 348 — the six slots shed from the right in the
-/// design's order, each in its own ink, the emoji-capable glyphs pinned to
-/// text presentation) on this host's chrome band ([`chrome_band::band_colors`])
-/// with the presence hues at the text floor ([`chrome_band::presence_inks`]);
-/// the renderer's band table writes the cells (`aterm_render::band::rows`,
-/// the one table the web module runs too). The row carries no closing seam of
-/// its own: the splice seals it (`aterm_render::band::seal_stack`) when no
-/// band row follows.
-pub(crate) fn paint_presence_row(
-    words: &crate::presence::Words,
-    cols: usize,
-    palette: impl Into<chrome_band::ChromePalette>,
-) -> Vec<RenderCell> {
-    let palette = palette.into();
-    let c = chrome_band::band_colors(palette);
-    let p = chrome_band::presence_inks(palette);
-    let cells = aterm_messages::presence::paint_row::<crate::presence::Native>(words, cols, &c, &p);
-    let (mut rows, _, _) = aterm_render::band::rows(vec![aterm_messages::ink::Resolved {
-        cells,
-        metered: false,
-        raster: None,
-    }]);
-    rows.pop().unwrap_or_default()
 }
 
 /// A tone's colour against a row's inks — the track mixed toward the fill
@@ -421,8 +387,8 @@ pub(crate) use aterm_render::band::PaintedBand;
 /// PIXEL resolution ([`RowRaster`], ruling 242). `hover` lights the chip
 /// under the pointer (or the body's `Details ›`) on its row. No row carries
 /// the hairline that closes the chrome against the terminal: the splice pads
-/// and trims this cache to the committed count and puts a presence row above
-/// it, so only the COMPOSED stack knows which row is last — `aterm_render::band::seal_stack`
+/// and trims this cache to the committed count, so only the COMPOSED stack
+/// knows which row is last — `aterm_render::band::seal_stack`
 /// draws it there. The engine paints each row's structure
 /// (`aterm_messages::paint::paint`, ruling 319, reading the forced-palette
 /// latch once here, as the painter always has) and resolves it on this
@@ -504,14 +470,9 @@ pub(crate) fn row_inks(c: &BandColors, l: &RowLayout, hc: bool) -> (MeterInks, O
 /// half of [`App::band_hit_at`]. `gx`/`gy` are frame pixels from the frame
 /// origin; `frame` is the cell lattice across the frame (cells at the pad,
 /// `cell_w` wide) and `top` its offset down, `ch` a cell's height; the chrome
-/// rows between the strip and the grid are `presence_rows` then `band_rows`.
-/// The column is the engine's arithmetic ([`BandGeometry::cell_at`], ruling
-/// 328); the rows stack the strip, the presence row and the band, which are
-/// this host's chrome.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the pure hit test takes the geometry as plain numbers so its tests need no App"
-)]
+/// rows between the strip and the grid are the band's `band_rows`. The column
+/// is the engine's arithmetic ([`BandGeometry::cell_at`], ruling 328); the
+/// rows stack the strip and the band, which are this host's chrome.
 fn band_target_for_pixel(
     gx: usize,
     gy: usize,
@@ -519,25 +480,20 @@ fn band_target_for_pixel(
     ch: usize,
     top: usize,
     strip_rows: usize,
-    presence_rows: usize,
     band_rows: usize,
 ) -> Option<BandTarget> {
-    if band_rows == 0 && presence_rows == 0 {
+    if band_rows == 0 {
         return None;
     }
     let ch = ch.max(1);
     let gy = gy.checked_sub(top)?;
     let strip_px = strip_rows * ch;
-    let presence_px = presence_rows * ch;
     let band_px = band_rows * ch;
-    if gy < strip_px || gy >= strip_px + presence_px + band_px {
+    if gy < strip_px || gy >= strip_px + band_px {
         return None;
     }
-    if gy < strip_px + presence_px {
-        return Some(BandTarget::Presence);
-    }
-    Some(BandTarget::Row {
-        row: (gy - strip_px - presence_px) / ch,
+    Some(BandTarget {
+        row: (gy - strip_px) / ch,
         col: frame.cell_at(gx),
     })
 }
@@ -606,14 +562,12 @@ impl App {
         (self.band_lay)(cols).presentation(&self.messages)
     }
 
-    /// If window pixel `(x, y)` lands on one of window `wid`'s chrome rows
-    /// between the strip and the grid — the presence row, or a band row —
-    /// which, and at which cell column. `None` when nothing is up there or the
+    /// If window pixel `(x, y)` lands on one of window `wid`'s band rows
+    /// between the strip and the grid, which, and at which cell column. `None` when nothing is up there or the
     /// point is elsewhere. The band is chrome: a press on it never reaches the
     /// terminal underneath — there is no terminal underneath, the grid starts
     /// below it.
     pub(crate) fn band_hit_at(&self, wid: WindowId, x: f64, y: f64) -> Option<BandTarget> {
-        let presence_rows = self.windows.get(&wid).map_or(0, |ws| ws.presence.rows);
         let (fx, fy) = self.window_to_frame(wid, x, y);
         let (cw, ch) = self.win_cell_size(wid);
         let pad = self.win_pad(wid);
@@ -633,7 +587,6 @@ impl App {
             ch,
             self.win_pad_top(wid) + self.win_head(wid),
             usize::from(self.tab_strip_rows),
-            usize::from(presence_rows),
             usize::from(self.message_band_rows),
         )
     }
@@ -641,17 +594,15 @@ impl App {
     /// What a press at `target` in window `wid` lands on, through the width
     /// law at this window's width — the same layout the painter drew.
     fn band_hit(&self, wid: WindowId, target: BandTarget) -> Hit {
-        let BandTarget::Row { row, col } = target else {
-            return Hit::Nothing;
-        };
+        let BandTarget { row, col } = target;
         let Some(cols) = self.windows.get(&wid).map(|ws| usize::from(ws.cols)) else {
             return Hit::Nothing;
         };
         self.band_presentation(cols).hit(row, col)
     }
 
-    /// A press on window `wid`'s chrome rows between the strip and the grid
-    /// (design §3.4): the presence row is swallowed with no action; a capsule
+    /// A press on window `wid`'s band rows between the strip and the grid
+    /// (design §3.4): a capsule
     /// performs its intent (the engine's `act` logs the press and returns
     /// what to do); the `Details ›` and the row BODY are the same press
     /// ([`App::press_message_body`]: Settings ▸ Messages at that entry, in
@@ -689,12 +640,9 @@ impl App {
     /// (the `Details ›` included), or — on the row BODY, and anywhere on the
     /// overflow row — the link a press there follows: the row's `Details ›`,
     /// or the overflow row's words (the painter's `Body` arm lights the row's
-    /// link capsule, and the overflow row's words). `None` off the band and on
-    /// the presence row.
+    /// link capsule, and the overflow row's words). `None` off the band.
     pub(crate) fn band_hover_for(&self, wid: WindowId, target: BandTarget) -> Option<BandHover> {
-        let BandTarget::Row { row, .. } = target else {
-            return None;
-        };
+        let row = target.row;
         let row = u8::try_from(row).ok()?;
         let target = match self.band_hit(wid, target) {
             Hit::Capsule(_, k) => HoverTarget::Capsule(k),
@@ -729,7 +677,7 @@ impl App {
     /// cursor is the motion path's native branch's (it gives the band's hand
     /// there, ruling 417 (n)), which `update_hover_cursor` leaves alone: that
     /// branch is replayed at the pointer's own pixel instead, as a closed
-    /// card hands the pointer back (`conn_card_exit`), and it lights the chip
+    /// card hands the pointer back (`close_overlay_card`), and it lights the chip
     /// and sets the hand or the arrow (round 44's review, ruling 418 (b)).
     pub(crate) fn refresh_band_hover(&mut self) {
         let wids: Vec<WindowId> = self.windows.keys().copied().collect();
@@ -1069,8 +1017,8 @@ mod tests {
         }
     }
 
-    /// The pixel → row/column map: the presence row first, then the band
-    /// rows, the column from the cell lattice; off the chrome rows is `None`.
+    /// The pixel → row/column map: the band rows under the strip, the column
+    /// from the cell lattice; off the band rows is `None`.
     #[test]
     fn band_target_for_pixel_maps_the_chrome_rows_in_order() {
         // Cells 8 px wide from the pad, 16 px tall.
@@ -1081,35 +1029,33 @@ mod tests {
             cell_w: cw,
         };
         let cell = lattice(8);
-        // strip 1 row, presence 1 row, band 2 rows.
-        let hit = |gx, gy| band_target_for_pixel(gx, gy, cell, 16, top, 1, 1, 2);
+        // strip 1 row, band 2 rows.
+        let hit = |gx, gy| band_target_for_pixel(gx, gy, cell, 16, top, 1, 2);
         assert_eq!(hit(40, top + 5), None, "the strip is not the band");
-        assert_eq!(hit(40, top + 16), Some(BandTarget::Presence));
-        assert_eq!(hit(40, top + 31), Some(BandTarget::Presence));
         assert_eq!(
-            hit(40, top + 32),
-            Some(BandTarget::Row {
+            hit(40, top + 16),
+            Some(BandTarget {
                 row: 0,
                 col: (40 - pad) / 8
             })
         );
-        assert_eq!(hit(4, top + 63), Some(BandTarget::Row { row: 1, col: 0 }));
-        assert_eq!(hit(40, top + 64), None, "the grid starts below the band");
+        assert_eq!(hit(4, top + 47), Some(BandTarget { row: 1, col: 0 }));
+        assert_eq!(hit(40, top + 48), None, "the grid starts below the band");
         assert_eq!(hit(40, 3), None, "above the lattice");
-        // No band and no presence row: nothing to hit.
+        // No band: nothing to hit.
         assert_eq!(
-            band_target_for_pixel(40, top + 20, cell, 16, top, 1, 0, 0),
+            band_target_for_pixel(40, top + 20, cell, 16, top, 1, 0),
             None
         );
         // No strip (macOS): the band starts at the lattice top.
         assert_eq!(
-            band_target_for_pixel(0, top, cell, 16, top, 0, 0, 1),
-            Some(BandTarget::Row { row: 0, col: 0 })
+            band_target_for_pixel(0, top, cell, 16, top, 0, 1),
+            Some(BandTarget { row: 0, col: 0 })
         );
         // A zero cell size never divides by zero.
         assert_eq!(
-            band_target_for_pixel(0, top, lattice(0), 0, top, 0, 0, 1),
-            Some(BandTarget::Row { row: 0, col: 0 })
+            band_target_for_pixel(0, top, lattice(0), 0, top, 0, 1),
+            Some(BandTarget { row: 0, col: 0 })
         );
     }
 
@@ -1151,7 +1097,7 @@ mod tests {
             let lit = HoverTarget::Capsule(cap.action);
             for col in cap.col..cap.col + cap.width {
                 let (x, y) = at(col);
-                let target = BandTarget::Row { row: 0, col };
+                let target = BandTarget { row: 0, col };
                 assert_eq!(app.band_hit_at(wid, x, y), Some(target), "col {col}");
                 assert!(app.band_press_acts(wid, target), "col {col}");
                 assert_eq!(
@@ -1166,7 +1112,7 @@ mod tests {
         }
         // The body: the title cell.
         let (tx, ty) = at(layout.title.0);
-        let body = BandTarget::Row {
+        let body = BandTarget {
             row: 0,
             col: layout.title.0,
         };
@@ -1195,7 +1141,7 @@ mod tests {
         );
         let layout = app.band_presentation(cols).rows[0].clone();
         assert_eq!(layout.capsules.len(), 1, "its Details \u{203a} alone");
-        let body = BandTarget::Row {
+        let body = BandTarget {
             row: 0,
             col: layout.title.0,
         };
@@ -1212,7 +1158,7 @@ mod tests {
             app.post_message(Message::new(tags::CONFIG, Severity::Warn, format!("w{i}")));
         }
         assert_eq!(app.message_band_rows, aterm_messages::MAX_ROWS);
-        let overflow = BandTarget::Row { row: 2, col: 4 };
+        let overflow = BandTarget { row: 2, col: 4 };
         assert!(app.band_press_acts(wid, overflow));
         assert_eq!(
             app.band_hover_for(wid, overflow),
@@ -1225,7 +1171,7 @@ mod tests {
         let (ox, oy) = (tx, ty + 2.0 * ch as f64);
         assert_eq!(
             app.band_hit_at(wid, ox, oy),
-            Some(BandTarget::Row {
+            Some(BandTarget {
                 row: 2,
                 col: layout.title.0
             })

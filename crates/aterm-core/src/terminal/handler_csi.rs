@@ -178,19 +178,22 @@ impl TerminalHandler<'_> {
                 self.cursor_state().handle_erase(params, final_byte);
                 if full_clear {
                     self.transient.full_clears = self.transient.full_clears.wrapping_add(1);
-                    self.transient.render_debt = (0, 0);
+                    self.transient.render_debt = crate::terminal::RenderDebt::default();
                     // The archived blocks on the main screen lost their text,
                     // and the block being built moves onto the cleared screen
                     // the rows the clear blanked (`clear`, Ctrl-L; a prompt
                     // only when the clear came from home, where its line
                     // editor redraws it); an alternate screen clears only its
                     // own grid, and no anchor names an alt-grid row.
-                    if !self.modes.alternate_screen {
-                        super::note_full_clear(
-                            self.grid.visible_to_absolute(0),
-                            from_home,
-                            self.shell,
-                        );
+                    if self.modes.alternate_screen {
+                        // The current drawer cleared the alt screen: all of it
+                        // is its own from here on.
+                        self.holder_fence.note_alt_cleared();
+                    } else {
+                        let top = self.grid.visible_to_absolute(0);
+                        super::note_full_clear(top, from_home, self.shell);
+                        // The blanked rows are the current drawer's.
+                        self.holder_fence.note_full_clear(top, self.grid);
                     }
                 }
                 // ED 3 erases the active grid's history and renumbers no row:
@@ -449,10 +452,15 @@ impl TerminalHandler<'_> {
             CsiHandler::XtermModkeysQuery => {
                 // XTMODKEYS query (CSI ? Pp m). Pp=4 (modifyOtherKeys) is tracked;
                 // Pp=0..3 answer the default `CSI > Pp m` (disabled) so programs do
-                // not wait for a missing response.
+                // not wait for a missing response. Behind a console host the level
+                // offered is 0 (`offered_xterm_keyboard`).
                 let pp = params.first().copied().unwrap_or(0);
                 if pp == 4 {
-                    let response = self.xterm_keyboard.query_modify_other_keys_response();
+                    let response = crate::terminal::keyboard_mode::offered_xterm_keyboard(
+                        self.modes,
+                        *self.xterm_keyboard,
+                    )
+                    .query_modify_other_keys_response();
                     self.send_response(cap, response.as_bytes());
                 } else if pp <= 3 {
                     let response = format!("\x1b[>{pp}m");
@@ -463,7 +471,11 @@ impl TerminalHandler<'_> {
                 // XTFMTKEYS query (CSI ? Pp g), answered as for XTMODKEYS.
                 let pp = params.first().copied().unwrap_or(0);
                 if pp == 4 {
-                    let response = self.xterm_keyboard.query_format_other_keys_response();
+                    let response = crate::terminal::keyboard_mode::offered_xterm_keyboard(
+                        self.modes,
+                        *self.xterm_keyboard,
+                    )
+                    .query_format_other_keys_response();
                     self.send_response(cap, response.as_bytes());
                 } else if pp <= 3 {
                     let response = format!("\x1b[>{pp}g");
@@ -491,12 +503,15 @@ impl TerminalHandler<'_> {
                     self.handle_secondary_da(cap);
                 }
             }
+            // XTMODKEYS / XTFMTKEYS behind a console host (`win32_input_enabled`)
+            // are consumed and ignored like the kitty protocol: conhost reads the
+            // key bytes and cannot read their chords (`offered_xterm_keyboard`).
             CsiHandler::XtmodkeysSet => {
                 // XTMODKEYS: CSI > Pp ; Pv m (set) or CSI > Pp m (reset). An
                 // empty Pv (`CSI > 4 ; m`, vim's t_TE) arrives as 0, which is
                 // the value the reset restores.
                 let pp = params.first().copied().unwrap_or(0);
-                if pp == 4 {
+                if pp == 4 && !self.modes.win32_input_enabled {
                     if let Some(&pv) = params.get(1) {
                         self.xterm_keyboard.set_modify_other_keys(sgr_color_u8(pv));
                         if pv != 0 {
@@ -511,7 +526,7 @@ impl TerminalHandler<'_> {
             CsiHandler::XtmodkeysDisable => {
                 // XTMODKEYS disable: CSI > Ps n (resource value -1)
                 let ps = params.first().copied().unwrap_or(0);
-                if ps == 4 {
+                if ps == 4 && !self.modes.win32_input_enabled {
                     self.xterm_keyboard.disable_modify_other_keys();
                 }
             }
@@ -519,7 +534,7 @@ impl TerminalHandler<'_> {
                 // XTFMTKEYS: CSI > Pp ; Pv f (set) or CSI > Pp f (reset); an
                 // empty Pv arrives as 0, the reset value, as for XTMODKEYS.
                 let pp = params.first().copied().unwrap_or(0);
-                if pp == 4 {
+                if pp == 4 && !self.modes.win32_input_enabled {
                     if let Some(&pv) = params.get(1) {
                         self.xterm_keyboard.set_format_other_keys(sgr_color_u8(pv));
                         if pv != 0 {

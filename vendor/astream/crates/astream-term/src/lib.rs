@@ -20,7 +20,7 @@
 //! does) and `Exit`. Because the fold touches no clock, no randomness, and no
 //! I/O, replaying the same records always yields a byte-identical screen. That
 //! purity *is* the replay guarantee, and it is testable in isolation — which is
-//! exactly what `tests/screen_fold.rs` does, earning the manifest claim
+//! exactly what `tests/suite/screen_fold.rs` does, earning the manifest claim
 //! `term.screen-fold.deterministic`.
 //!
 //! What deliberately does **not** live here: the wire envelope (records riding

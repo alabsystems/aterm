@@ -8,8 +8,8 @@
 use aterm_phase::{ApiCause, WallKind, classify_wall};
 
 use super::{
-    Entry, confirms, ended_with_nothing_pending, found_named, limit_named, limit_words, refined,
-    transcript_ends_on, transcript_wall, waits_on_background,
+    Entry, TranscriptEnd, confirms, ended_with_nothing_pending, found_named, limit_named,
+    limit_words, refined, transcript_ends_on, transcript_wall, waits_on_background,
 };
 
 /// A measured transcript fixture: its header line, then the rows.
@@ -532,7 +532,18 @@ fn a_local_commands_rows_are_no_turn_and_no_notice() {
         assert!(confirms(kind, &all), "{name}: all of them");
         for row in &commands {
             let end = transcript_ends_on(&format!("{notice}\n{row}"));
-            assert_eq!(end, before, "{name}: {row}");
+            // A prompt command's invocation is marked as passed over: its
+            // prompt asks the model, whose answer is not written yet.
+            let prompted = row.contains("\"type\":\"user\"")
+                && row.contains("\"content\":\"<command-message>");
+            assert_eq!(
+                end,
+                TranscriptEnd {
+                    prompted,
+                    ..before.clone()
+                },
+                "{name}: {row}"
+            );
         }
     }
     // The review of pass 4's case, measured whole: a real session limit,
@@ -707,7 +718,7 @@ fn a_closed_error_notice_is_the_wall_its_words_or_its_typed_fields_name() {
         Option<&'a str>,
         Option<WallKind>,
     );
-    let cases: [Case; 23] = [
+    let cases: [Case; 31] = [
         // By the words: the table's own rows.
         (MODEL, "model_not_found", None, None, refused(None)),
         (
@@ -824,6 +835,78 @@ fn a_closed_error_notice_is_the_wall_its_words_or_its_typed_fields_name() {
             Some(401),
             None,
             Some(WallKind::Auth),
+        ),
+        // The same with a 403 (ATERM-KI-1016-1, limits: "an
+        // `authentication_failed` with status 403 that no table names climbs
+        // the refused-request ladder instead of typing `/login`"): the
+        // vendor's typed word that the login failed decides over the status
+        // range, so the lost login's `/login` answers it, never three slow
+        // retries of a request the login refuses. NEGATIVE CONTROL: a 403
+        // whose `error` word is no login's is the refused request.
+        (
+            "Failed to authenticate. API Error: 403 Forbidden",
+            "authentication_failed",
+            Some(403),
+            None,
+            Some(WallKind::Auth),
+        ),
+        (
+            "Something new forbids this request",
+            "unknown",
+            Some(403),
+            None,
+            refused(Some(403)),
+        ),
+        // The same 403 drawn as the bare `API Error: <status> …` (the API's
+        // own words passed on, a JSON body among them): words that name
+        // nothing but the status say only that the API refused, and the typed
+        // word that the LOGIN failed names which refusal (the review's
+        // KR-LIM-3). NEGATIVE CONTROLS: the same words with no login's
+        // `error` word are the refused request, as are a refusal a row of
+        // the table names and one a terminal `apiError` names, whatever the
+        // `error` word; and the status the words print stands where the
+        // typed one is missing.
+        (
+            "API Error: 403 Forbidden",
+            "authentication_failed",
+            Some(403),
+            None,
+            Some(WallKind::Auth),
+        ),
+        (
+            r#"API Error: 403 {"type":"error","error":{"type":"permission_error","message":"OAuth token has been revoked. Please obtain a new token."}}"#,
+            "authentication_failed",
+            Some(403),
+            None,
+            Some(WallKind::Auth),
+        ),
+        (
+            "API Error: 403 Forbidden",
+            "unknown",
+            Some(403),
+            None,
+            refused(Some(403)),
+        ),
+        (
+            "API Error: 403 Request blocked by your organization's data loss prevention policy.",
+            "authentication_failed",
+            Some(403),
+            None,
+            refused(Some(403)),
+        ),
+        (
+            "API Error: 403 Forbidden",
+            "authentication_failed",
+            Some(403),
+            Some("org_disabled_credential"),
+            refused(Some(403)),
+        ),
+        (
+            "API Error: 404 Not Found",
+            "unknown",
+            None,
+            None,
+            refused(Some(404)),
         ),
         (
             "OAuth authentication is currently not allowed for this organization.",
@@ -1028,6 +1111,36 @@ fn a_confirmed_unnamed_api_error_is_the_wall_its_notice_is_typed_as() {
     let end = transcript_ends_on(&notice_turn(REWORDED, "unknown", None, None));
     assert_eq!(transcript_wall(&end), Some(server));
     assert_eq!(refined(&reworded, &end), None);
+    // A 403 THE SCREEN'S WORDS NAME BY ITS STATUS ALONE (the review's
+    // KR-LIM-3): confirmed as the screen's refused request, its class by its
+    // words, and named the lost login by the typed word that the login
+    // failed. NEGATIVE CONTROLS: the same words with no login's word, and a
+    // 403 whose words the table names, rename nothing.
+    const FORBIDDEN: &str = "API Error: 403 Forbidden";
+    let forbidden = on_screen(FORBIDDEN);
+    let end = transcript_ends_on(&notice_turn(
+        FORBIDDEN,
+        "authentication_failed",
+        Some(403),
+        None,
+    ));
+    assert!(confirms(forbidden.kind, &end));
+    assert_eq!(
+        refined(&forbidden, &end).map(|n| n.kind),
+        Some(WallKind::Auth)
+    );
+    let end = transcript_ends_on(&notice_turn(FORBIDDEN, "unknown", Some(403), None));
+    assert_eq!(refined(&forbidden, &end), None, "no login's word");
+    const BLOCKED: &str =
+        "API Error: 403 Request blocked by your organization's data loss prevention policy.";
+    let blocked = on_screen(BLOCKED);
+    let end = transcript_ends_on(&notice_turn(
+        BLOCKED,
+        "authentication_failed",
+        Some(403),
+        None,
+    ));
+    assert_eq!(refined(&blocked, &end), None, "the table's words");
     // An older notice that is still the newest entry (a prompt command's
     // rows are passed over until its reply or notice is written): it
     // confirms the class of the screen's newer `API Error: terminated`, and

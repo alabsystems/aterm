@@ -16,7 +16,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use winit::event_loop::EventLoopProxy;
+use aterm_window::event_loop::EventLoopProxy;
 
 use crate::Wake;
 

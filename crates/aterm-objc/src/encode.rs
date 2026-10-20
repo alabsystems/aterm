@@ -363,6 +363,14 @@ pub struct CGPoint {
     pub y: f64,
 }
 
+impl CGPoint {
+    /// Construct a `CGPoint` at `(x, y)`.
+    #[must_use]
+    pub const fn new(x: f64, y: f64) -> Self {
+        Self { x, y }
+    }
+}
+
 /// A `CGSize` / `NSSize`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -371,12 +379,28 @@ pub struct CGSize {
     pub height: f64,
 }
 
+impl CGSize {
+    /// Construct a `CGSize` of `(width, height)`.
+    #[must_use]
+    pub const fn new(width: f64, height: f64) -> Self {
+        Self { width, height }
+    }
+}
+
 /// A `CGRect` / `NSRect` — the argument `drawRect:` takes and `bounds` returns.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CGRect {
     pub origin: CGPoint,
     pub size: CGSize,
+}
+
+impl CGRect {
+    /// Construct a `CGRect` from `origin` and `size`.
+    #[must_use]
+    pub const fn new(origin: CGPoint, size: CGSize) -> Self {
+        Self { origin, size }
+    }
 }
 
 // SAFETY: these are Foundation's struct encodings for the same layouts;
@@ -404,6 +428,85 @@ pub struct NSRange {
     pub location: usize,
     /// Length in UTF-16 code units, which is what `NSTextInputClient` counts.
     pub length: usize,
+}
+
+impl NSRange {
+    /// Construct an `NSRange` with `(location, length)`.
+    #[must_use]
+    pub const fn new(location: usize, length: usize) -> Self {
+        Self { location, length }
+    }
+
+    /// Return `true` when `length == 0`.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.length == 0
+    }
+
+    /// Return `location.saturating_add(length)`.
+    #[must_use]
+    pub const fn end_saturating(self) -> usize {
+        self.location.saturating_add(self.length)
+    }
+
+    /// Return `true` when `idx >= location` and `idx - location < length`.
+    #[must_use]
+    pub const fn contains_index(self, idx: usize) -> bool {
+        if idx < self.location {
+            return false;
+        }
+        (idx - self.location) < self.length
+    }
+
+    /// Encode this `NSRange` into 16 little-endian bytes (`location` as `u64`, `length` as `u64`).
+    #[must_use]
+    pub const fn encode_le(self) -> [u8; 16] {
+        let loc = self.location as u64;
+        let len = self.length as u64;
+        [
+            loc as u8,
+            (loc >> 8) as u8,
+            (loc >> 16) as u8,
+            (loc >> 24) as u8,
+            (loc >> 32) as u8,
+            (loc >> 40) as u8,
+            (loc >> 48) as u8,
+            (loc >> 56) as u8,
+            len as u8,
+            (len >> 8) as u8,
+            (len >> 16) as u8,
+            (len >> 24) as u8,
+            (len >> 32) as u8,
+            (len >> 40) as u8,
+            (len >> 48) as u8,
+            (len >> 56) as u8,
+        ]
+    }
+
+    /// Decode 16 little-endian bytes into an `NSRange`.
+    #[must_use]
+    pub const fn decode_le(bytes: [u8; 16]) -> Self {
+        let loc = (bytes[0] as u64)
+            | ((bytes[1] as u64) << 8)
+            | ((bytes[2] as u64) << 16)
+            | ((bytes[3] as u64) << 24)
+            | ((bytes[4] as u64) << 32)
+            | ((bytes[5] as u64) << 40)
+            | ((bytes[6] as u64) << 48)
+            | ((bytes[7] as u64) << 56);
+        let len = (bytes[8] as u64)
+            | ((bytes[9] as u64) << 8)
+            | ((bytes[10] as u64) << 16)
+            | ((bytes[11] as u64) << 24)
+            | ((bytes[12] as u64) << 32)
+            | ((bytes[13] as u64) << 40)
+            | ((bytes[14] as u64) << 48)
+            | ((bytes[15] as u64) << 56);
+        Self {
+            location: loc as usize,
+            length: len as usize,
+        }
+    }
 }
 
 // SAFETY: `@encode(NSRange)` is `{_NSRange=QQ}` (the tag is `_NSRange`; `NSRange`

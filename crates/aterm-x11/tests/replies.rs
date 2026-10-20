@@ -11,14 +11,12 @@
 
 #![cfg(target_endian = "little")]
 
-mod support;
-
 use std::collections::BTreeMap;
 
+use crate::support::*;
 use aterm_x11::proto::event::Event;
 use aterm_x11::proto::xproto::*;
 use aterm_x11::proto::{ParseError, Reply, randr, shm, xinput};
-use support::*;
 
 const REPLIES: &str = "x11rb-protocol-0.13.2-replies.tsv";
 const EVENTS: &str = "x11rb-protocol-0.13.2-events.tsv";

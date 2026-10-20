@@ -1,0 +1,14 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# A late wake: the idle held past its settle, then busy: the idle's turn
+# closes first, and the busy opens the next. Two exchanges, never one.
+see busy
+see idle
+elapse
+elapse
+elapse
+expect turn=t1
+see busy
+expect open t1 turn
+expect close t1 turn out=done at=0
+expect open t2 turn at=1500
+expect turn=t2

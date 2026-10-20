@@ -18,7 +18,8 @@
 //! * [`box_facts`]: what the loop learned of a box before deciding it, and the
 //!   context built from those facts alone ([`ApprovalCtx::from`]).
 //! * [`box_call`]: transcript candidates matching a box's possible tool and
-//!   file, without current-mount identity or authority to lift settings holds.
+//!   file, which lift a settings hold only where the screen draws the box
+//!   under the Edit tool's own call row too.
 //! * [`git_config`]: what a git read would load that can run a program.
 //! * [`probe`]: the one door the approval policy looks at the machine by
 //!   ([`PolicyProbe`]), at the level of what it concluded — so a harness tape
@@ -36,6 +37,8 @@
 //!   no steps, and these APIs have no current CLI reader.
 //! * [`turn_end`]: the turn-end decider (continue, wait out a wall, switch a
 //!   model, compact, log in, or escalate).
+//! * [`sleeps`]: the machine's sleeps a loop knows of, which a turn's done
+//!   row counts and its work does not.
 //! * [`exception`], [`outlook`]: the points only a person can answer, and what
 //!   becomes of each wall.
 
@@ -46,6 +49,8 @@ pub mod claude_settings;
 pub mod exception;
 pub mod git_config;
 pub mod guard;
+pub mod login;
+pub mod notice;
 pub mod outlook;
 pub mod probe;
 mod probe_live;
@@ -53,6 +58,7 @@ pub mod question;
 pub mod reset;
 pub mod rm_breaker;
 pub mod shell_startup;
+pub mod sleeps;
 pub mod trace;
 pub mod turn_end;
 
@@ -67,7 +73,9 @@ pub use approval::{
 };
 pub use claude_settings::{AskKind, OwnerAsk};
 pub use git_config::{GitView, WorkerEnv};
-pub use guard::{key_args, row_guard, server_fences_gen, server_fences_send};
+pub use guard::{
+    KeyAct, key_args, row_guard, server_fences_gen, server_fences_send, server_takes_act,
+};
 pub use probe::{LiveProbe, OnDisk, PolicyProbe, WorkerWrites};
 pub use question::{
     LONG_TERM_TEXT, MAX_QUESTION_FOCUS_STEPS, RULE_ANSWER_RECOMMENDED, SHORT_TERM_TEXT,

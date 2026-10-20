@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 
-use winit::event_loop::EventLoopProxy;
+use aterm_window::event_loop::EventLoopProxy;
 
 use crate::document_store::DocumentId;
 use crate::native_config_language::MAX_CONFIG_ANALYSIS_BYTES;

@@ -8,7 +8,7 @@ use aterm_scrollback::ScrollbackStorage;
 
 use super::ViewportRowCache;
 use super::scroll_convert::LazyBuffer;
-use super::state::{GridCursorState, GridPresentationState, GridStorage};
+use super::state::{FillDebt, GridCursorState, GridPresentationState, GridStorage};
 use super::{Cell, Grid, HorizontalMargins, PAGE_SIZE, PageStore, ScrollRegion};
 use crate::CellExtras;
 use crate::Damage;
@@ -62,7 +62,8 @@ impl Grid {
                 lazy_buffer: LazyBuffer::new(),
                 scrollback_detached_for_reflow: false,
                 pending_scrollback_settings: None,
-                pending_fill_target: None,
+                fill_debt: FillDebt::default(),
+                staged_width_stale: false,
                 detached_reader_aim: None,
                 compress_offload_active: false,
                 flood_truncated_lines: 0,
@@ -72,6 +73,8 @@ impl Grid {
                 history_reveal_gen: 0,
                 ring_extras: super::ring_extras::RingExtras::new(),
                 resize_undo: None,
+                handback: super::resize_handback::HandBack::default(),
+                resize_law: super::resize_handback::ResizeLaw::default(),
                 absolute_row_counter: u64::from(rows),
                 // Nonzero, so `0` is a usable "never observed" sentinel.
                 content_gen: 1,
@@ -99,6 +102,7 @@ impl Grid {
                         last_resize_shape: crate::ResizeShape::default(),
                         coordinates_invalidated: false,
                         row_band_moves: crate::RowBandMoves::default(),
+                        anchors: crate::AnchorSet::default(),
                         pending_absolute_row_update: None,
                         pending_selection_row_update: None,
                         row_rev: Vec::new(),
@@ -160,7 +164,8 @@ impl Grid {
                 lazy_buffer: LazyBuffer::new(),
                 scrollback_detached_for_reflow: false,
                 pending_scrollback_settings: None,
-                pending_fill_target: None,
+                fill_debt: FillDebt::default(),
+                staged_width_stale: false,
                 detached_reader_aim: None,
                 compress_offload_active: false,
                 flood_truncated_lines: 0,
@@ -170,6 +175,8 @@ impl Grid {
                 history_reveal_gen: 0,
                 ring_extras: super::ring_extras::RingExtras::new(),
                 resize_undo: None,
+                handback: super::resize_handback::HandBack::default(),
+                resize_law: super::resize_handback::ResizeLaw::default(),
                 absolute_row_counter: u64::from(rows).saturating_add(carried),
                 // Nonzero, so `0` is a usable "never observed" sentinel.
                 content_gen: 1,
@@ -197,6 +204,7 @@ impl Grid {
                         last_resize_shape: crate::ResizeShape::default(),
                         coordinates_invalidated: false,
                         row_band_moves: crate::RowBandMoves::default(),
+                        anchors: crate::AnchorSet::default(),
                         pending_absolute_row_update: None,
                         pending_selection_row_update: None,
                         row_rev: Vec::new(),

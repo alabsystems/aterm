@@ -24,7 +24,7 @@ use crate::harness::disk::target::{Build, Judge};
 use crate::harness::disk::tests::{Tmp, lay_target, now_after_write};
 use crate::harness::disk::{
     Class, Config, Removed, Report, Roots as SurveyRoots, Row, Step, StopBy, Survey, TargetDir,
-    Trigger, Witness, apply_auto, remover, remover_among, report, scan,
+    Tier, Trigger, Witness, apply_auto, pass_plan, remover, remover_among, report, scan,
 };
 use aterm_spec::wait::{MUST_HAPPEN, within};
 use aterm_uds::holders::{PathScan, scan_path_users_of};
@@ -118,6 +118,7 @@ fn roots_at(tmp: &Tmp) -> Roots {
         claude_tmp: Some(tmp.path().join("claude-tmp")),
         device: None,
         mounts: Vec::new(),
+        skip_home_children: false,
     }
 }
 
@@ -838,6 +839,10 @@ fn survey_at(tmp: &Tmp, roots: &Roots, now: i64, free: u64, config: Config) -> (
             claude_dirs: roots.claude_dirs.clone(),
             claudes: roots.claudes.clone(),
             claude_unread: roots.claude_unread.clone(),
+            // The machine's own mount table, read whole: nothing is mounted
+            // under the test's scratch directory.
+            mounts: Some(aterm_sysprobe::volumes::table()),
+            placing: roots.home.as_deref().and_then(super::placing_now),
             ..SurveyRoots::default()
         },
         now,
@@ -897,22 +902,21 @@ fn real(now: i64) -> impl FnMut(&Row) -> std::io::Result<Removed> {
     real_among(now, Vec::new())
 }
 
-/// BELOW THE FLOOR, AN ENDED SESSION'S BUILD GOES WHOLE — AFTER THE IDLE
-/// CACHES, BEFORE ANY LIVE CHECKOUT'S, THE LONGEST UNWRITTEN FIRST, AND THE
-/// PASS STOPS WHEN FREE SPACE IS BACK. Four build directories: a checkout's
-/// idle profile (two days unbuilt), two ended sessions' scratch builds (five
-/// and three days unwritten), and a live checkout's profile built three
-/// hours ago. The report lists them in the order the pass takes them: the
-/// idle cache (taken whole, no re-measure), the ended sessions' build
-/// directories oldest first, then the least recently used profile. Free
-/// space measured again is short before the first whole directory and back
-/// at the target before the second: the pass stops there. The first ended
-/// session's build directory is GONE, root and all; the idle checkout keeps
-/// everything but its `incremental/`; the second ended session's build and
-/// the live checkout's cache are untouched. The journal says it as it
-/// happened: intent, outcome, stop.
+/// BELOW THE FLOOR, ENDED SESSIONS' BUILDS GO WHOLE FIRST (TIER 1, THE
+/// LONGEST UNWRITTEN FIRST, ALL OF THEM: NOBODY BUILDS THERE AGAIN), THEN THE
+/// IDLE CACHES (TIER 2), THEN THE LEAST RECENTLY USED PROFILES (TIER 4), EACH
+/// TIER STOPPED AT ITS OWN TARGET. Four build directories: a checkout's idle
+/// profile (two days unbuilt), two ended sessions' scratch builds (five and
+/// three days unwritten), and a live checkout's profile built three hours
+/// ago. The report lists them in the order the pass takes them, each with its
+/// tier. Tier 1 takes both ended builds with no re-measure; free space
+/// measured before the idle cache is short of the warning, so it goes; before
+/// the recent profile it reads the floor plus the margin, so tier 4 stops
+/// there. The ended sessions' build directories are GONE, root and all; the
+/// idle checkout keeps everything but its `incremental/`; the live checkout's
+/// cache is untouched. The journal says it as it happened.
 #[test]
-fn below_the_floor_an_ended_sessions_build_goes_whole_in_lru_order_after_the_idle_caches() {
+fn below_the_floor_ended_sessions_builds_go_whole_first_then_idle_then_recent_caches() {
     let tmp = Tmp::new("discover-pass");
     let home = mkdirs(&tmp.path().join("home"));
     let claude = tmp.path().join("claude-tmp");
@@ -928,30 +932,33 @@ fn below_the_floor_an_ended_sessions_build_goes_whole_in_lru_order_after_the_idl
     mkdirs(&home.join(".claude/sessions")); // a registry naming nobody
 
     let (_, rep) = survey_at(&tmp, &roots_at(&tmp), now, GIB, cfg(true));
-    let order: Vec<(&str, PathBuf)> = rep
+    let order: Vec<(&str, PathBuf, Option<u8>)> = rep
         .rows
         .iter()
         .filter(|r| r.class == Class::CargoTargets)
-        .map(|r| (r.witness.kind(), r.path.clone()))
+        .map(|r| (r.witness.kind(), r.path.clone(), r.tier().map(Tier::number)))
         .collect();
     assert_eq!(
         order,
         [
-            ("stale-build-dir", idle.clone()),
-            ("owner-gone", old.clone()),
-            ("owner-gone", newer.clone()),
-            ("least-recently-used", live.join("debug")),
+            ("owner-gone", old.clone(), Some(1)),
+            ("owner-gone", newer.clone(), Some(1)),
+            ("stale-build-dir", idle.clone(), Some(2)),
+            ("least-recently-used", live.join("debug"), Some(4)),
         ],
         "{:#?}",
         rep.notes
     );
     assert!(
-        rep.rows[1].witness.describe().contains("ended"),
+        rep.rows[0].witness.describe().contains("ended"),
         "{}",
-        rep.rows[1].witness.describe()
+        rep.rows[0].witness.describe()
     );
-    // Whole rows are pressure rows: counted under pressure, not whole.
-    assert!(rep.reclaimable_under_pressure() > 0);
+    assert!(
+        rep.rows[0].line().contains("tier=1"),
+        "{}",
+        rep.rows[0].line()
+    );
 
     let target = cfg(true).pressure_target_bytes();
     let mut reads = 0;
@@ -975,30 +982,36 @@ fn below_the_floor_an_ended_sessions_build_goes_whole_in_lru_order_after_the_idl
     assert_eq!(
         journal,
         [
-            format!("removing {}", idle.display()),
-            format!("removed {}", idle.display()),
             format!("removing {}", old.display()),
             format!("removed {}", old.display()),
+            format!("removing {}", newer.display()),
+            format!("removed {}", newer.display()),
+            format!("removing {}", idle.display()),
+            format!("removed {}", idle.display()),
             "stopped measured".to_owned(),
         ]
     );
-    assert_eq!(reads, 2, "measured before each pressure row it reached");
+    assert_eq!(reads, 2, "measured before each row of a tier with a target");
     let stop = done.stopped.expect("stopped");
-    assert_eq!((stop.by, stop.left), (StopBy::Measured, 2));
-    assert!(
-        !old.exists(),
-        "the ended session's build directory is gone whole"
+    assert_eq!(
+        (stop.by, stop.left, stop.tier),
+        (StopBy::Measured, 1, Some(4))
     );
-    assert!(
-        old.parent().expect("parent").exists(),
-        "its scratchpad stays"
-    );
+    for gone in [&old, &newer] {
+        assert!(
+            !gone.exists(),
+            "the ended session's build directory is gone whole"
+        );
+        assert!(
+            gone.parent().expect("parent").exists(),
+            "its scratchpad stays"
+        );
+    }
     assert!(!idle.join("debug/incremental").exists());
     assert!(
         idle.join("debug/deps/liblay.rlib").exists(),
         "deps/ is never an idle row's"
     );
-    assert!(newer.join("debug/incremental").exists() && newer.exists());
     assert!(live.join("debug/incremental").exists());
     let freed = done
         .removed
@@ -1009,6 +1022,55 @@ fn below_the_floor_an_ended_sessions_build_goes_whole_in_lru_order_after_the_idl
     assert!(
         freed >= 8192,
         "the unlinks counted what they released: {freed}"
+    );
+}
+
+/// AT `LOW` (below the warning, above the floor) the same ended build goes
+/// whole and the idle cache goes, measured again; no recent profile is a row
+/// at all. NEGATIVE CONTROL: at `ok` neither goes whole — the report notes
+/// that it would once the volume is low.
+#[test]
+fn at_low_an_ended_sessions_build_goes_whole_and_no_recent_profile_is_a_row() {
+    let tmp = Tmp::new("discover-low");
+    let home = mkdirs(&tmp.path().join("home"));
+    let claude = tmp.path().join("claude-tmp");
+    let now = now_after_write(6);
+    let live = canon(&lay_target(&home.join("live/target")));
+    last_used(&live.join("debug"), now - 3 * 3_600);
+    let old = scratch_build(&claude, &home, DEAD, "a");
+    last_used(&old.join("debug"), now - 5 * DAY);
+    mkdirs(&home.join(".claude/sessions"));
+    let low = 20 * GIB;
+    let (_, rep) = survey_at(&tmp, &roots_at(&tmp), now, low, cfg(true));
+    let kinds: Vec<&str> = rep
+        .rows_of(Class::CargoTargets)
+        .iter()
+        .map(|r| r.witness.kind())
+        .collect();
+    assert_eq!(kinds, ["owner-gone"], "{:#?}", rep.rows);
+    let done = apply_auto(&rep, None, &mut real(now), &mut || Some(low), &mut |_| true)
+        .expect("low admits tier 1");
+    assert_eq!(done.removed.len(), 1, "{done:?}");
+    assert!(!old.exists());
+    assert!(live.join("debug/incremental").exists());
+
+    let kept = scratch_build(&claude, &home, DEAD_TOO, "b");
+    last_used(&kept.join("debug"), now - 5 * DAY);
+    let (_, ok) = survey_at(&tmp, &roots_at(&tmp), now, 500 * GIB, cfg(true));
+    assert!(
+        !ok.rows
+            .iter()
+            .any(|r| matches!(r.witness, Witness::OwnerGone { .. })),
+        "{:#?}",
+        ok.rows
+    );
+    assert_eq!(pass_plan(&ok), None);
+    assert!(
+        ok.hogs
+            .iter()
+            .any(|h| h.why.contains("once free space is below")),
+        "{:#?}",
+        ok.hogs
     );
 }
 
@@ -1172,6 +1234,8 @@ fn the_largest_hogs_are_what_no_row_frees_biggest_first() {
         origin,
         owned: Owned::NotOwned,
         total: Some((gib * GIB, false)),
+        foreign: None,
+        idle: None,
     };
     let xpy = Origin::Bootstrap {
         repo: home.join("trust"),
@@ -1292,6 +1356,7 @@ fn the_hogs_a_tick_hands_the_window_name_what_the_pass_left() {
         })
     };
     let roots = roots_at(&tmp);
+    let table = aterm_sysprobe::volumes::table();
     let look = DiskLook {
         state: &state,
         volume: tmp.path(),
@@ -1300,6 +1365,11 @@ fn the_hogs_a_tick_hands_the_window_name_what_the_pass_left() {
         discover: Some(&roots),
         transcripts: None,
         now,
+        room: None,
+        table: Some(&table),
+        demand: None,
+        session_cwds: &[],
+        link_dirs: &[],
     };
     let mut real = real_with(now, processes);
     let mut remove = |row: &Row| {
@@ -1634,7 +1704,7 @@ fn a_process_that_cannot_be_read_keeps_a_gone_owners_build_directory() {
 /// temp root alike. A directory the mount table names is
 /// never entered (nor `stat`ed): its build directory is not found, its
 /// sibling's is; and a `target` link into a mount is never followed. And
-/// the mount table's escapes decode.
+/// the mount table lists the root.
 #[test]
 fn the_search_stays_on_the_measured_volume_and_out_of_mount_points() {
     let tmp = Tmp::new("discover-volume");
@@ -1679,10 +1749,6 @@ fn the_search_stays_on_the_measured_volume_and_out_of_mount_points() {
     assert!(
         !got.contains(&mounted_target),
         "a link into a mount is never followed: {got:#?}"
-    );
-    assert_eq!(
-        super::unescape_mount("/Volumes/My\\040Disk"),
-        PathBuf::from("/Volumes/My Disk")
     );
     assert!(super::mount_points().contains(&PathBuf::from("/")));
 }
@@ -1846,12 +1912,14 @@ fn whole_paths(rep: &Report) -> Vec<PathBuf> {
 /// BELOW THE FLOOR, A REMOVED WORKSPACE'S RUST BUILD CACHE GOES WHOLE AFTER
 /// TEN MINUTES UNWRITTEN — the leftover of a deleted worktree that filled
 /// the disk twice on 2026-10-16. Its owner is the workspace, gone when SEEN
-/// gone (its folder's parent there without it). NEGATIVE CONTROLS, each
-/// kept byte for byte: the workspace present (a `Cargo.toml`); one written
-/// into a minute ago; one gone with the folder above it (away, not
-/// removed); one whose cargo lock a build holds; and the same survey above
-/// the floor. A `.cargo-build` that is a link out of the cache is never
-/// found at all, and its target survives.
+/// gone (its folder's parent there without it) — and, the survey placing it
+/// on the home volume with no mount point between, one gone WITH the folder
+/// above it (a workspace nested in a removed checkout, 2026-10-17's seven
+/// `codex-alab-*/codex-rs` mirrors). NEGATIVE CONTROLS, each kept byte for
+/// byte: the workspace present (a `Cargo.toml`); one written into a minute
+/// ago; one whose cargo lock a build holds; and the same survey above the
+/// warning. A `.cargo-build` that is a link out of the cache is never found
+/// at all, and its target survives.
 #[test]
 fn below_the_floor_a_removed_workspaces_build_cache_goes_whole() {
     let tmp = Tmp::new("discover-build-cache-gone");
@@ -1874,14 +1942,19 @@ fn below_the_floor_a_removed_workspaces_build_cache_goes_whole() {
     mkdirs(linked.parent().expect("mirror"));
     symlink(&outside, &linked).expect("link");
 
-    // Above the floor: nothing goes whole.
+    // Above the warning: nothing goes whole.
     let (_, rep) = survey_at(&tmp, &roots_at(&tmp), now, 500 * GIB, cfg(true));
     assert!(whole_paths(&rep).is_empty(), "{:#?}", rep.rows);
 
     let build = Build::holds(&locked.join("debug/.cargo-lock"));
     let (_, rep) = survey_at(&tmp, &roots_at(&tmp), now, GIB, cfg(true));
     drop(build);
-    assert_eq!(whole_paths(&rep), vec![gone.clone()], "{:#?}", rep.notes);
+    assert_eq!(
+        whole_paths(&rep),
+        vec![gone.clone(), away.clone()],
+        "{:#?}",
+        rep.notes
+    );
     let row = whole_row(&rep).expect("a whole row");
     let Witness::OwnerGone { owner, quiet_s, .. } = &row.witness else {
         unreachable!("a whole row");
@@ -1911,8 +1984,9 @@ fn below_the_floor_a_removed_workspaces_build_cache_goes_whole() {
     .expect("below the floor");
     assert!(journal.contains(&gone), "{journal:?}");
     assert!(!gone.exists(), "the removed workspace's cache went whole");
+    assert!(!away.exists(), "and the one nested in a removed checkout");
     assert!(done.freed_bytes >= 8192, "{}", done.freed_bytes);
-    for kept in [&live, &recent, &away, &locked] {
+    for kept in [&live, &recent, &locked] {
         assert!(
             kept.join("debug/deps/liblay.rlib").is_file(),
             "{} keeps its deps",
@@ -1968,4 +2042,61 @@ fn a_recreated_worktree_or_a_process_inside_keeps_a_build_cache() {
     let removed = real_among(now, vec![inside.id()])(&row).expect("nothing keeps it now");
     assert_eq!(removed.units, std::slice::from_ref(&dir));
     assert!(!dir.exists());
+}
+
+/// This process's captured executable and working directory are checked
+/// against owned real paths. A failed query or unresolved path cannot clear it.
+#[test]
+fn this_processs_own_executable_and_working_directory_are_users() {
+    let tmp = aterm_tempfile::tempdir().expect("owned process-path fixture");
+    let root = std::fs::canonicalize(tmp.path()).expect("canonical fixture");
+    let repo = root.join("repo");
+    let exe = repo.join("target/release/aterm");
+    let cwd = repo.join("src");
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir_all(exe.parent().expect("executable parent")).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(&exe, b"captured executable").unwrap();
+    let dirs = [repo.join("target"), repo.clone()];
+    let found = own_use(
+        &[("exe", Ok(exe.clone())), ("cwd", Ok(elsewhere.clone()))],
+        &dirs,
+    )
+    .expect("complete captured paths");
+    assert_eq!(found, Some(("exe", exe)));
+    let found = own_use(
+        &[("exe", Ok(elsewhere.clone())), ("cwd", Ok(cwd.clone()))],
+        &dirs,
+    )
+    .expect("complete captured paths");
+    assert_eq!(found, Some(("cwd", cwd)));
+    assert!(
+        own_use(
+            &[
+                ("exe", Ok(elsewhere.clone())),
+                ("cwd", Ok(elsewhere.clone()))
+            ],
+            &dirs,
+        )
+        .expect("two resolved outside paths")
+        .is_none()
+    );
+    let denied = || std::io::Error::new(std::io::ErrorKind::PermissionDenied, "captured denial");
+    let exe_unknown = own_use(
+        &[("exe", Err(denied())), ("cwd", Ok(elsewhere.clone()))],
+        &dirs,
+    );
+    let cwd_unknown = own_use(
+        &[("exe", Ok(elsewhere.clone())), ("cwd", Err(denied()))],
+        &dirs,
+    );
+    let unresolved = own_use(
+        &[("exe", Ok(elsewhere)), ("cwd", Ok(root.join("vanished")))],
+        &dirs,
+    );
+    assert!(
+        exe_unknown.is_err() && cwd_unknown.is_err() && unresolved.is_err(),
+        "OWN_PROCESS_UNKNOWN_MUST_NOT_CLEAR: exe={exe_unknown:?}, cwd={cwd_unknown:?}, unresolved={unresolved:?}"
+    );
 }

@@ -3,7 +3,7 @@
 
 //! THE HARNESS'S CLOCK: every bounded wait the live upgrade and the relaunch
 //! take — the Claude Code lane's, codex-alab's crash relaunch and the Muse
-//! Code lane's relaunch — and the supervisor loop's own re-decisions, as ONE value, carried on the pass's options
+//! Code, agy and Gemini CLI lanes' relaunches — and the supervisor loop's own re-decisions, as ONE value, carried on the pass's options
 //! (`upgrade_drive::Opts::timings`) and on the loop
 //! (`supervise::Session::set_timings`).
 //!
@@ -67,6 +67,10 @@ pub struct Timings {
     pub shell_look: Duration,
     /// The relaunched agent's first idle, under the harness's hand.
     pub first_idle: Duration,
+    /// A relaunched codex-alab's first idle, under the harness's hand
+    /// (`codex_alab_drive`'s hold): its launch probe's window (the contract
+    /// §5, carry-on: the probe's read speaks for the start within 60 s).
+    pub alab_first_idle: Duration,
     /// A relaunched agent settling (idle, its composer empty) before it is
     /// told to carry on (the Claude lane's carry-on).
     pub carry_settle: Duration,
@@ -78,6 +82,27 @@ pub struct Timings {
     pub muse_lock: Duration,
     /// The Muse Code lane: an adopted TUI seen in its tab.
     pub muse_adopt: Duration,
+    /// The agy lane: the relaunched TUI found as the shell's child.
+    pub agy_found: Duration,
+    /// The agy lane: the relaunched TUI's composer drawn.
+    pub agy_up: Duration,
+    /// The agy lane: the relaunched TUI holding its conversation's presence
+    /// lock (taken at once with `--conversation`: measured 0.49 s after the
+    /// line's Enter); never held, it started a fresh conversation.
+    pub agy_lock: Duration,
+    /// The agy lane: an adopted TUI seen in its tab.
+    pub agy_adopt: Duration,
+    /// The Gemini CLI lane: the relaunched parent found as the shell's
+    /// child.
+    pub gemini_found: Duration,
+    /// The Gemini CLI lane: the relaunched TUI's composer drawn.
+    pub gemini_up: Duration,
+    /// The Gemini CLI lane: the start-time rule naming the relaunched
+    /// process's session (its header lands 542-1108 ms after its child
+    /// starts, measured).
+    pub gemini_witness: Duration,
+    /// The Gemini CLI lane: an adopted TUI seen in its tab.
+    pub gemini_adopt: Duration,
     /// The supervisor loop: how far off a point whose fenced write the server
     /// skipped (the screen moved between the judged read and the write) is
     /// decided again, on the deadline of the loop's own wait.
@@ -103,11 +128,20 @@ impl Timings {
         ended_at_once: Duration::from_secs(5),
         shell_look: Duration::from_secs(1),
         first_idle: Duration::from_secs(15),
+        alab_first_idle: Duration::from_secs(60),
         carry_settle: Duration::from_secs(120),
         muse_found: Duration::from_secs(90),
         muse_up: Duration::from_secs(60),
         muse_lock: Duration::from_secs(30),
         muse_adopt: Duration::from_secs(30),
+        agy_found: Duration::from_secs(90),
+        agy_up: Duration::from_secs(60),
+        agy_lock: Duration::from_secs(30),
+        agy_adopt: Duration::from_secs(30),
+        gemini_found: Duration::from_secs(90),
+        gemini_up: Duration::from_secs(60),
+        gemini_witness: Duration::from_secs(30),
+        gemini_adopt: Duration::from_secs(30),
         redecide_after_skip: Duration::from_secs(2),
         claim_ttl: Duration::from_secs(90),
     };
@@ -128,11 +162,20 @@ impl Timings {
         ended_at_once: Duration::from_millis(300),
         shell_look: Duration::from_millis(50),
         first_idle: Duration::from_millis(1_000),
+        alab_first_idle: Duration::from_secs(3),
         carry_settle: Duration::from_secs(3),
         muse_found: Duration::from_secs(3),
         muse_up: Duration::from_secs(2),
         muse_lock: Duration::from_millis(1_000),
         muse_adopt: Duration::from_secs(2),
+        agy_found: Duration::from_secs(3),
+        agy_up: Duration::from_secs(2),
+        agy_lock: Duration::from_millis(1_000),
+        agy_adopt: Duration::from_secs(2),
+        gemini_found: Duration::from_secs(3),
+        gemini_up: Duration::from_secs(2),
+        gemini_witness: Duration::from_millis(1_000),
+        gemini_adopt: Duration::from_secs(2),
         redecide_after_skip: Duration::from_millis(100),
         claim_ttl: Duration::from_secs(600),
     };
@@ -187,11 +230,20 @@ mod tests {
             (p.ended_at_once, f.ended_at_once),
             (p.shell_look, f.shell_look),
             (p.first_idle, f.first_idle),
+            (p.alab_first_idle, f.alab_first_idle),
             (p.carry_settle, f.carry_settle),
             (p.muse_found, f.muse_found),
             (p.muse_up, f.muse_up),
             (p.muse_lock, f.muse_lock),
             (p.muse_adopt, f.muse_adopt),
+            (p.agy_found, f.agy_found),
+            (p.agy_up, f.agy_up),
+            (p.agy_lock, f.agy_lock),
+            (p.agy_adopt, f.agy_adopt),
+            (p.gemini_found, f.gemini_found),
+            (p.gemini_up, f.gemini_up),
+            (p.gemini_witness, f.gemini_witness),
+            (p.gemini_adopt, f.gemini_adopt),
             (p.redecide_after_skip, f.redecide_after_skip),
         ] {
             assert!(fast <= prod, "{fast:?} > {prod:?}");

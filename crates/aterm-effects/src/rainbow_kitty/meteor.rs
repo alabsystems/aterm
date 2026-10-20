@@ -74,12 +74,11 @@ use crate::cursor_glow::{BandPx, Geom, InkRole};
 use crate::effect_util::{lerp_rgb, push_fx_quad, push_fx_rect, push_twinkle_star};
 use crate::spectrum::{
     SPECTRUM_STOPS, spectrum, spectrum_snap, spectrum_snap_index, spectrum_stop,
-    spectrum_with_min_saturation,
 };
 
 use super::ribbon::{
-    BED_INK_LUT_LEN, BED_SAT_FLOOR, SLABS_PER_CELL, WALK_FAST_CELLS, WALK_LAY_RATE, hot_edge_ink,
-    walk_pace, walk_t,
+    BED_INK_LUT_LEN, SLABS_PER_CELL, WALK_FAST_CELLS, WALK_LAY_RATE, hot_edge_ink, paper_caret_ink,
+    paper_ink, paper_mark_ink, walk_pace, walk_t,
 };
 // `mix32`/`hash01`: the family's one integer mixer (`lowbias32`) and its
 // `[0, 1)` draw. The meteor hashes only what it decides itself — the spawn
@@ -240,7 +239,7 @@ impl LandingWalk {
 
 /// The landing's ink: the band's hot ink ([`hot_edge_ink`]) at folded arc
 /// position `t` at full chroma (the arc is S 1.00, so the green→blue seam is
-/// the band's teal; [`BED_SAT_FLOOR`] guards an off-arc read) and lifted
+/// the band's teal; [`super::ribbon::BED_SAT_FLOOR`] guards an off-arc read) and lifted
 /// through its own hue to one heat.
 ///
 /// The burst is additive light over the text, the lane the band's hot edge
@@ -272,16 +271,13 @@ pub fn landing_ink(t: f32) -> u32 {
     lerp_rgb(lut[i], lut[j], x - i as f32)
 }
 
-/// The landing's ink on a light theme (section 6.10): the same stop with the
-/// same crossing floor, as source-over ink ([`InkRole::OverText`]) — hue and
-/// saturation intact, scaled to ink weight. The light arm buys "bigger" as
-/// area, never as brightness, so there is no heat to equalize onto.
+/// The landing's ink on a light theme (section 6.10): the same stop as a point
+/// mark's ink on the page `bg` ([`paper_mark_ink`]), hue intact. The light arm
+/// buys "bigger" as area, never as brightness, so there is no heat to equalize
+/// onto.
 #[must_use]
-fn landing_ink_light(t: f32) -> u32 {
-    InkRole::OverText.ink(spectrum_with_min_saturation(
-        spectrum(walk_pace(clamp01(t))),
-        BED_SAT_FLOOR,
-    ))
+fn landing_ink_light(t: f32, bg: u32) -> u32 {
+    paper_mark_ink(spectrum(walk_pace(clamp01(t))), bg)
 }
 
 /// The landing's ink at a named stop: [`hot_edge_ink`] of the anchor itself
@@ -2903,7 +2899,15 @@ fn build_stations(
                     } else {
                         peak * (-(s - f.shoulder) / (COLOUR_FALLOFF_SHARE * f.l)).exp()
                     };
-                    (InkRole::OverText.ink(stop), ink * alpha, half)
+                    // Under the glyphs either way: on the rail, where no letter
+                    // is, the caret's own vivid ink; across rows, the body's
+                    // tint, which carries the legibility bar.
+                    let rgb = if rail > 0.0 {
+                        paper_caret_ink(stop, ctx.cfg.theme_bg)
+                    } else {
+                        paper_ink(stop, ctx.cfg.theme_fg, ctx.cfg.theme_bg, InkRole::OverText)
+                    };
+                    (rgb, ink * alpha, half)
                 } else {
                     // §6.5 layer 1 / §3.4 / §6.6: `118·exp(−s/(0.35·L))` —
                     // the transient ceiling at the head, so the white heat
@@ -3023,7 +3027,7 @@ fn draw_head(m: &Meteor, f: &Flight, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
                     geom,
                     petal_at(i),
                     (petal_x, petal_y),
-                    InkRole::OverText.ink(spectrum_stop(i)),
+                    paper_mark_ink(spectrum_stop(i), ctx.cfg.theme_bg),
                     ink,
                 );
             }
@@ -3141,8 +3145,9 @@ fn draw_pin(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     if light {
         let ink = (cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP) as u8;
         if reach > 0 {
+            let arms_ink = paper_mark_ink(arms_rgb, ctx.cfg.theme_bg);
             for b in arms {
-                push_ink_rect(frame.out, ctx.geom, b, InkRole::OverText.ink(arms_rgb), ink);
+                push_ink_rect(frame.out, ctx.geom, b, arms_ink, ink);
             }
         }
         push_ink_rect(
@@ -3237,7 +3242,7 @@ fn draw_flash(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
                 frame.out,
                 geom,
                 (x, y0, cw, ch),
-                InkRole::OverText.ink(stop),
+                paper_mark_ink(stop, ctx.cfg.theme_bg),
                 ink,
             );
             continue;
@@ -3295,12 +3300,11 @@ fn burst_rise_limit(dy: f32, rise_px: f32, half_thick_px: f32) -> f32 {
 /// of the mark wears the colour of its column, independent of spike and age.
 #[inline]
 #[must_use]
-fn landing_ink_at(l: &Landing, x: f32, cw: f32, light: bool) -> u32 {
+fn landing_ink_at(l: &Landing, x: f32, cw: f32, page: Option<u32>) -> u32 {
     let t = l.field((x - l.x) / cw);
-    if light {
-        landing_ink_light(t)
-    } else {
-        landing_ink(t)
+    match page {
+        Some(bg) => landing_ink_light(t, bg),
+        None => landing_ink(t),
     }
 }
 
@@ -3337,7 +3341,8 @@ fn burst_lance(
     // distant stops (a chord cuts the corner off the arc and skips names),
     // and never the mark's own walk. A near-vertical spike is one colour,
     // the landing's; a near-horizontal one is the band's own gradient.
-    let hue = |s: f32| landing_ink_at(l, ox + dir.0 * s, cw, light);
+    let page = light.then_some(ctx.cfg.theme_bg);
+    let hue = |s: f32| landing_ink_at(l, ox + dir.0 * s, cw, page);
     let mut s0 = root;
     let mut done = 0.0_f32;
     for (k, &thick_ch) in sec_thick_px.iter().enumerate() {
@@ -3454,7 +3459,7 @@ fn burst_jet(
             }
             // The band's walk at this station's column (signed: a jet to the
             // left of the landing reads the band to the left of it).
-            let stop = landing_ink_at(l, l.x + dir.0 * d, cw, light);
+            let stop = landing_ink_at(l, l.x + dir.0 * d, cw, light.then_some(ctx.cfg.theme_bg));
             if light {
                 let w = ((seg / (stations - 1) as f32).round() as i32).max(1) + 1;
                 let h = (thick.round() as i32).max(1);
@@ -3702,7 +3707,7 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
         let (x, y) = ((l.x + dx).round() as i32, (l.y + dy).round() as i32);
         if light {
             let ink = (cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP) as u8;
-            let c = InkRole::OverText.ink(spectrum_stop(stop));
+            let c = paper_mark_ink(spectrum_stop(stop), ctx.cfg.theme_bg);
             push_ink_rect(frame.out, geom, (x - arm, y, 2 * arm + 1, 1), c, ink);
             push_ink_rect(frame.out, geom, (x, y - arm, 1, 2 * arm + 1), c, ink);
             continue;

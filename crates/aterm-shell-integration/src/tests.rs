@@ -454,7 +454,10 @@ fn test_reroute_and_agents_dirs_lead_path_in_each_shell() {
 /// session. Live shells sourcing the real script with a populated
 /// `~/.aterm/bin` holding an `ls`; bash and zsh (`-f`) byte-exactly, fish for
 /// absence (its own startup may add entries). The PowerShell script is checked
-/// as text, as no pwsh runs on the unix lanes.
+/// as text, as no pwsh runs on most unix lanes: it names the folder in no line
+/// of code (it takes an older script's entry off by that script's own
+/// `$__aterm_bin`); `a_pwsh_takes_an_older_scripts_aterm_bin_off_when_sourced_again`
+/// runs it where a pwsh is.
 #[cfg(unix)]
 #[test]
 fn test_an_unmanaged_aterm_bin_is_never_put_on_path() {
@@ -647,6 +650,58 @@ fn test_encoders_answer_in_reply_and_keep_the_users() {
     }
 }
 
+/// FISH ENCODES A COMMAND LINE AS THE 633;E DECODER READS IT, whole strings at a
+/// time (LAG-9): over the bash/zsh corpus above and lines that need more than
+/// one pass — a control byte twice, two kinds of control, a blank line and a
+/// trailing newline, only controls, backslashes beside the bytes whose escapes
+/// write one — fish's `__aterm_encode_cmd`, captured as its callers capture it,
+/// gives exactly [`osc633_encode`]'s bytes.
+#[cfg(unix)]
+#[test]
+fn fish_encodes_a_command_line_as_the_633e_decoder_reads_it() {
+    let fish = need_fish();
+    let corpus = [
+        "/tmp/a b",
+        "/tmp/100%",
+        "/tmp/résumé 🦀",
+        "/tmp/a\nb",
+        "/tmp/tab\there",
+        "/tmp/\u{1b}]52;c;x\u{7}",
+        "/tmp/del\u{7f}",
+        "/x/;\\y",
+        "",
+        "plain/path-1_2.~",
+        "a\tb\tc\u{1b}d\n\ne;f\\g \u{7}\n",
+        "\u{7}\u{7}\r",
+        "\\x3b\\\\ \\;",
+        "for f in *\n    echo \"$f\"\nend",
+    ];
+    let mut body = String::new();
+    let mut want = Vec::new();
+    for (i, line) in corpus.iter().enumerate() {
+        write!(
+            body,
+            "set -l e (__aterm_encode_cmd \"$ATERM_TEST_IN_{i}\"); printf '%s\\0' \"$e\"; "
+        )
+        .expect("write to String");
+        want.extend(osc633_encode(line));
+        want.push(0);
+    }
+    let names: Vec<String> = (0..corpus.len())
+        .map(|i| format!("ATERM_TEST_IN_{i}"))
+        .collect();
+    let env: Vec<(&str, &str)> = names
+        .iter()
+        .map(String::as_str)
+        .zip(corpus.iter().copied())
+        .collect();
+    assert_eq!(
+        run_fish_integration(fish, &env, &body),
+        String::from_utf8_lossy(&want),
+        "fish: 633;E encodings"
+    );
+}
+
 /// OSC 7 from each POSIX lane's `__aterm_report_cwd`: a percent-encoded `file://`
 /// URI for a cwd holding a space, `@`, `[`, `]`, `!` and non-ASCII.
 #[cfg(unix)]
@@ -679,6 +734,192 @@ fn test_report_cwd_emits_percent_encoded_osc_7() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+/// The nonce every lane's cwd report is signed with in the tests below.
+#[cfg(unix)]
+const REPORT_NONCE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// The report a shell with the nonce `REPORT_NONCE` sends for `uri`: the URI
+/// signed as the property `633;P;AtermCwd=`, then the URI as OSC 7, which
+/// carries no nonce (an engine from before the property reads only the OSC 7,
+/// so the nonce never reaches a path it stores).
+#[cfg(unix)]
+fn signed_report(uri: &str) -> String {
+    format!("\u{1b}]633;P;AtermCwd={uri};id={REPORT_NONCE}\u{7}\u{1b}]7;{uri}\u{7}")
+}
+
+/// Each POSIX lane signs its own cwd report as it signs its marks
+/// (docs/DESIGN-cwd-reports-2026-10-19.md): with the nonce it captured, the URI
+/// goes first as the signed `AtermCwd` property, which the engine reads as the
+/// shell's own word (`aterm-core`'s `reported_cwd_tests`), then as the plain
+/// OSC 7. Without one, the OSC 7 alone (above).
+#[cfg(unix)]
+#[test]
+fn test_report_cwd_is_signed_with_the_captured_nonce() {
+    let (_dir, cwd) = create_special_cwd();
+    let expected = signed_report(&format!(
+        "file://aterm.test{}",
+        osc7_percent_encode(cwd.to_str().expect("cwd path should be UTF-8"))
+    ));
+    for (shell, args, script_name, quiet) in posix_lanes() {
+        let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+        let output = shell_command(shell)
+            .args(args)
+            .arg("-c")
+            .arg(format!(
+                "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {quiet}; \
+                 builtin cd -- \"$ATERM_TEST_CWD\"; __aterm_report_cwd"
+            ))
+            .env("ATERM_TEST_SCRIPT", script)
+            .env("ATERM_TEST_CWD", &cwd)
+            .env("ATERM_SHELL_NONCE", REPORT_NONCE)
+            .env("HOSTNAME", "aterm.test")
+            .env("HOST", "aterm.test")
+            .output()
+            .unwrap_or_else(|error| panic!("spawn {shell}: {error}"));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "{shell}; stderr: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// fish's half of [`test_report_cwd_is_signed_with_the_captured_nonce`]: the
+/// report a `cd` sends is signed.
+#[cfg(unix)]
+#[test]
+fn test_fish_report_cwd_is_signed_with_the_captured_nonce() {
+    let fish = need_fish();
+    let (_dir, cwd) = create_special_cwd();
+    assert_eq!(
+        run_fish_integration(
+            fish,
+            &[("HOST", "aterm.test"), ("ATERM_SHELL_NONCE", REPORT_NONCE)],
+            &format!("cd -- '{}'", cwd.display()),
+        ),
+        signed_report(&format!(
+            "file://aterm.test{}",
+            osc7_percent_encode(&cwd.to_string_lossy())
+        )),
+    );
+}
+
+/// pwsh's half of [`test_report_cwd_is_signed_with_the_captured_nonce`]: the
+/// prompt's report is signed (its host is the machine's name, which a test
+/// cannot set).
+#[cfg(unix)]
+#[test]
+fn test_pwsh_report_cwd_is_signed_with_the_captured_nonce() {
+    let pwsh = need_pwsh();
+    let (_dir, cwd) = create_special_cwd();
+    let script = format!(
+        "{}/src/scripts/aterm_shell_integration.ps1",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mut cmd = shell_command(pwsh);
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        ". $env:ATERM_TEST_SCRIPT; Set-Location -LiteralPath $env:ATERM_TEST_CWD; \
+         [Console]::Write((prompt))",
+    ])
+    .env("ATERM_TEST_SCRIPT", &script)
+    .env("ATERM_TEST_CWD", &cwd)
+    .env("ATERM_SHELL_NONCE", REPORT_NONCE)
+    .env("POWERSHELL_TELEMETRY_OPTOUT", "1")
+    .env("POWERSHELL_UPDATECHECK", "Off");
+    let out = cmd
+        .output()
+        .unwrap_or_else(|error| panic!("spawn {pwsh}: {error}"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let uri = stdout
+        .split_once("\u{1b}]7;")
+        .and_then(|(_, rest)| rest.split_once('\u{7}'))
+        .map(|(uri, _)| uri)
+        .unwrap_or_else(|| {
+            panic!(
+                "the prompt reports its cwd: {stdout:?}; stderr: {:?}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+    let encoded = osc7_percent_encode(&cwd.to_string_lossy());
+    assert!(
+        uri.starts_with("file://") && uri.ends_with(&encoded),
+        "the OSC 7 is the URI alone: {uri:?}"
+    );
+    assert!(stdout.contains(&signed_report(uri)), "{stdout:?}");
+}
+
+/// `Import-Module PSReadLine -Force` puts PSReadLine's own
+/// `PSConsoleHostReadLine` back over aterm's readline shim, the only source of
+/// pwsh's `C` and `E` (measured 2026-10-19 on pwsh 7.6.7 / PSReadLine 2.4.5:
+/// every later line went unmarked). The next prompt installs the shim again
+/// over the re-imported function, once, and leaves a wrapper other code put
+/// over the shim alone (wrapping one that calls the shim would loop).
+#[cfg(unix)]
+#[test]
+fn test_pwsh_prompt_installs_the_readline_shim_again_after_a_reimport() {
+    let pwsh = need_pwsh();
+    let script = format!(
+        "{}/src/scripts/aterm_shell_integration.ps1",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let run = |body: &str| -> String {
+        let mut cmd = shell_command(pwsh);
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("Import-Module PSReadLine; . $env:ATERM_TEST_SCRIPT; {body}"),
+        ])
+        .env("ATERM_TEST_SCRIPT", &script)
+        .env("ATERM_SHELL_NONCE", REPORT_NONCE)
+        .env("POWERSHELL_TELEMETRY_OPTOUT", "1")
+        .env("POWERSHELL_UPDATECHECK", "Off");
+        let out = cmd
+            .output()
+            .unwrap_or_else(|error| panic!("spawn {pwsh}: {error}"));
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "{stdout:?}; stderr: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout
+    };
+    // What reads a line now, without reading one: PSReadLine's own function
+    // would wait on a console this test does not have.
+    let report = "$f = $function:PSConsoleHostReadLine; \
+         if ($f.Module) { [Console]::Write('in-place=' + $f.Module.Name + '|'); exit }; \
+         [Console]::Write('wraps=' + $Global:__aterm_original_readline.Module.Name + '|'); \
+         $Global:__aterm_original_readline = { 'Get-Location' }; \
+         [Console]::Write('line=' + (PSConsoleHostReadLine) + '|')";
+
+    let reimported = run(&format!(
+        "Import-Module PSReadLine -Force; $null = prompt; $null = prompt; {report}"
+    ));
+    let marked = format!("\u{1b}]133;C;id={REPORT_NONCE}\u{7}");
+    assert!(
+        reimported.contains("wraps=PSReadLine|"),
+        "the shim wraps the re-imported readline: {reimported:?}"
+    );
+    assert!(
+        reimported.contains(&format!("{marked}line=Get-Location|")),
+        "the shim marks the line it read: {reimported:?}"
+    );
+
+    let wrapped = run("$Global:__test_prev = $function:PSConsoleHostReadLine; \
+         function Global:PSConsoleHostReadLine { 'user:' + (& $Global:__test_prev) }; \
+         $null = prompt; \
+         [Console]::Write('kept=' + ($function:PSConsoleHostReadLine.ToString() -match 'user:') + '|')");
+    assert!(
+        wrapped.contains("kept=True|"),
+        "a wrapper over the shim stays: {wrapped:?}"
+    );
 }
 
 /// Git Bash (MSYS2) and Cygwin report the Windows drive form over OSC 7, not
@@ -1229,6 +1470,60 @@ fn test_fish_empty_disable_prompt_titles_still_emits_titles() {
     );
 }
 
+/// A command line's title is the line whole up to 256 characters, and a longer one its
+/// first 255 and `…`, in bash, zsh and fish (where installed): the cut at 64 characters
+/// before had no mark, so the tab took its cut-off end for the line's file (the
+/// 2026-10-18 judges' J4F-1-cut64-middle-cut-misleads). pwsh and Git Bash are driven
+/// live in `tests_windows_marks.rs`.
+#[cfg(unix)]
+#[test]
+fn test_a_long_command_title_ends_with_its_cut_mark() {
+    let whole = format!("echo {}", "w".repeat(200));
+    let long = format!("echo {}", "l".repeat(300));
+    let cut = format!("{}…", long.chars().take(255).collect::<String>());
+    let title = |wire: &str| {
+        wire.split_once("\u{1b}]0;")
+            .and_then(|(_, rest)| rest.split_once('\u{7}'))
+            .map(|(title, _)| title.to_owned())
+            .unwrap_or_default()
+    };
+    for (line, expected) in [(&whole, &whole), (&long, &cut)] {
+        if let Some(fish) = fish_shell() {
+            let wire = run_fish_integration(
+                fish,
+                &[
+                    ("ATERM_TEST_INPUT", line.as_str()),
+                    ("ATERM_DISABLE_PROMPT_TITLES", ""),
+                ],
+                "__aterm_fish_preexec \"$ATERM_TEST_INPUT\"",
+            );
+            assert_eq!(&title(&wire), expected, "fish: {wire:?}");
+        }
+        for (shell, args, script_name, quiet) in posix_lanes() {
+            let hook = if script_name.ends_with(".bash") {
+                "__aterm_line_start"
+            } else {
+                "__aterm_preexec"
+            };
+            let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+            let output = shell_command(shell)
+                .args(args)
+                .arg("-c")
+                .arg(format!(
+                    "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {quiet}; \
+                     {hook} \"$ATERM_TEST_INPUT\""
+                ))
+                .env("ATERM_TEST_SCRIPT", script)
+                .env("ATERM_TEST_INPUT", line)
+                .env("ATERM_DISABLE_PROMPT_TITLES", "")
+                .output()
+                .unwrap_or_else(|error| panic!("spawn {shell}: {error}"));
+            let wire = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(&title(&wire), expected, "{shell}: {wire:?}");
+        }
+    }
+}
+
 /// EMPTY `ATERM_PROMPT_*_COLOR` values fall back to the defaults bash and zsh get
 /// from `${ATERM_PROMPT_*_COLOR:-N}`; under `set -q` they reached `set_color ""`
 /// on every prompt. Each is a palette INDEX, which fish's `set_color` (names or
@@ -1617,6 +1912,12 @@ fn test_powershell_prompt_emits_osc7_and_prompt_marks() {
         !out.contains("]133;D"),
         "first prompt (no command ran) must not emit OSC 133;D; got: {out:?}"
     );
+    // Bracketed paste and in-band size reports off before the prompt: PowerShell
+    // reads neither, and a program killed with them on must not leave them on.
+    let modes = out
+        .find("\u{1b}[?2004l\u{1b}[?2048l")
+        .expect("prompt must turn off 2004 and 2048");
+    assert!(modes < mark_a, "{out:?}");
 }
 
 #[cfg(windows)]
@@ -1658,7 +1959,8 @@ fn test_cache_dir_windows_uses_localappdata() {
 /// that lies outside every root a Containment shell may write
 /// (`aterm_containment::sbpl::WRITABLE_ROOTS`): a contained shell reads the
 /// scripts the next tab's shell sources and cannot rewrite them. Staging them in
-/// `/tmp` for Containment and Safety (#5575) let it.
+/// `/tmp` for Containment and Safety (#5575) let it. A test binary stages them
+/// under its own root instead, never in the person's cache.
 #[cfg(unix)]
 #[test]
 fn test_cache_dir_is_the_per_user_cache_outside_the_containment_write_roots() {
@@ -1668,10 +1970,14 @@ fn test_cache_dir_is_the_per_user_cache_outside_the_containment_write_roots() {
         (None, None) => (std::env::temp_dir(), "aterm-shell-integration"),
     };
     assert_eq!(
-        cache_dir(),
+        per_user_cache_dir(),
         base.join(tail),
         "the per-user cache, whatever the mode"
     );
+    if std::env::var_os("XDG_CACHE_HOME").is_none() {
+        let root = aterm_uds::test_binary::scratch_root().expect("this test binary's root");
+        assert_eq!(cache_dir(), root.join("cache/aterm/shell-integration"));
+    }
     // Resolved as Seatbelt resolves it.
     let Ok(base) = std::fs::canonicalize(&base) else {
         return;
@@ -1825,6 +2131,8 @@ fn test_prepare_cmd_wraps_the_prompt_with_marks_and_cwd() {
     };
     let order = [
         at("$e]0;$P$e\\"),
+        // Bracketed paste and in-band size reports off: cmd reads neither.
+        at("$e[?2004l$e[?2048l"),
         at(&format!("$e]133;A;id={nonce}$e\\")),
         at(&format!("$e]633;P;Cwd=$P;id={nonce}$e\\")),
         at("$P$G"),
@@ -2047,14 +2355,15 @@ fn test_fish_osc7_is_well_formed_with_an_empty_host() {
 }
 
 /// Every prompt re-asserts the shell's own cwd before its 133;A, as zsh, bash
-/// and pwsh do. OSC 7 carries no nonce (a remote shell over ssh must be able to
-/// report a cwd), so a cwd a program reported — or a remote shell's, left when
-/// ssh exits — went into the next signed block and became the new-tab folder
-/// until the next `cd`, while the nonce gate dropped the same forgery sent as
-/// `633;P;Cwd`. The prompt is drawn without its event: fish's own `fish_prompt`
-/// handler re-sends OSC 7 from 4.3 on, and before that only on a `cd`. The
-/// engine now holds an OSC 7 that arrives while the signed shell sits at its
-/// prompt and applies the latest one at the shell's next `133;A`
+/// and pwsh do. An OSC 7 need not be signed (a remote shell over ssh must be
+/// able to report a cwd), so a cwd a program reported — or a remote shell's,
+/// left when ssh exits — went into the next signed block and became the
+/// new-tab folder until the next `cd`, while the nonce gate dropped the same
+/// forgery sent as `633;P;Cwd`. The prompt is drawn without its event: fish's
+/// own `fish_prompt` handler re-sends OSC 7 from 4.3 on, and before that only
+/// on a `cd`. The shell's report is signed (the `AtermCwd` property, see
+/// [`test_fish_report_cwd_is_signed_with_the_captured_nonce`]), and the engine
+/// drops a report no one signed while the shell sits at its prompt
 /// (`aterm-core`'s `reported_cwd_tests`), so this report, the last before the
 /// mark, is the one that lands.
 #[cfg(unix)]
@@ -2596,6 +2905,20 @@ impl LiveShell {
     }
 }
 
+/// A shell its test lets go of, at its end or in a failed assertion's unwinding,
+/// is killed and reaped. A fish under `script` never sees its stdin close, so
+/// each failed live-fish test left a `script` and its fish running with no
+/// parent: 12 pairs after one fish 3.1.2 run of this crate (2026-10-18).
+#[cfg(unix)]
+impl Drop for LiveShell {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 /// The owner's machine in a temp dir: a home whose rc prepends a FOREIGN `claude`
 /// (their ~/.zshrc prepends ~/.local/bin), and a managed prefix that does not
 /// exist yet — atpkg's first pass lays it while the shell is already running.
@@ -3002,7 +3325,12 @@ fn spawn_live_fish(fish: &str, fx: &LiveFixture, extra: &[(&str, &str)]) -> Live
     if cfg!(target_os = "macos") {
         cmd.args(["-q", "/dev/null", fish, "-i"]);
     } else {
-        cmd.args(["-q", "-c", &format!("{fish} -i"), "/dev/null"]);
+        // util-linux runs `-c`'s line through `$SHELL -c`: /bin/sh here, never a
+        // bash that reads `~/.bashrc` on the way (Debian's does for a `-c` run
+        // over ssh, `SSH_CLIENT` set), which ran the rig's startup file before
+        // the shell under test began.
+        cmd.args(["-q", "-c", &format!("{fish} -i"), "/dev/null"])
+            .env("SHELL", "/bin/sh");
     }
     // The hermetic environment of `shell_command`, applied to `script` (fish
     // inherits it), then the fixture's home and the conf.d injection.
@@ -3063,6 +3391,38 @@ fn script_can_allocate_a_pty() -> bool {
 fn need_zsh() -> &'static str {
     zsh_shell().unwrap_or_else(|| {
         aterm_spec::host::could_not_run("no zsh on this host (ATERM_TEST_ZSH=<zsh> names one)")
+    })
+}
+
+/// Absolute path to a PowerShell 7 `pwsh`, or `None` where the host has none:
+/// `$ATERM_TEST_PWSH` overrides, then the usual install paths, then `$PATH`.
+#[cfg(unix)]
+fn pwsh_shell() -> Option<&'static str> {
+    static PWSH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PWSH.get_or_init(|| {
+        resolve_test_shell(
+            "ATERM_TEST_PWSH",
+            &[
+                "/usr/local/bin/pwsh",
+                "/opt/homebrew/bin/pwsh",
+                "/usr/bin/pwsh",
+                "/snap/bin/pwsh",
+            ],
+            "pwsh",
+        )
+    })
+    .as_deref()
+}
+
+/// [`pwsh_shell`] for a test that needs a real pwsh: COULD NOT RUN where the
+/// host has none (install PowerShell 7, or `ATERM_TEST_PWSH=<pwsh>` names one),
+/// never a silent pass.
+#[cfg(unix)]
+fn need_pwsh() -> &'static str {
+    pwsh_shell().unwrap_or_else(|| {
+        aterm_spec::host::could_not_run(
+            "no pwsh on this host (install PowerShell 7, or ATERM_TEST_PWSH=<pwsh> names one)",
+        )
     })
 }
 

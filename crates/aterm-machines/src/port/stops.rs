@@ -9,7 +9,8 @@
 //! safely do; the walk's waits read it between requests. A caught (not ignored) disposition
 //! is reset to the default across `exec`, so the `ssh` runs the walk starts meet each signal
 //! as they would have. The dispositions are the whole process's, so one flow holds them at a
-//! time: `screen` is the only caller.
+//! time: `screen` is the only caller. The host's screen watcher only ignores hang-ups
+//! ([`ignore_hangups`]).
 
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -57,6 +58,19 @@ pub(super) fn catch() -> Box<dyn std::any::Any> {
         let set = unsafe { libc::sigaction(sig, &action, &mut was) } == 0;
         (sig, set.then_some(was))
     })))
+}
+
+/// Set SIGHUP and SIGPIPE to `SIG_IGN` for good ([`super::System::ignore_hangups`]). An
+/// ignored disposition survives `exec`, but `aterm_uds::spawnfd` puts SIGPIPE back to its
+/// default in every child, and nothing the watcher runs reads SIGHUP.
+pub(super) fn ignore_hangups() {
+    for sig in [libc::SIGHUP, libc::SIGPIPE] {
+        // SAFETY: as in `catch`.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = libc::SIG_IGN;
+        // SAFETY: a valid disposition for `sig`; the one it replaces is not wanted back.
+        unsafe { libc::sigaction(sig, &action, std::ptr::null_mut()) };
+    }
 }
 
 /// The first signal [`catch`] noted, while its handle lives.

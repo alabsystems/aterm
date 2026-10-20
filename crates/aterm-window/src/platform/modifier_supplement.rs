@@ -26,6 +26,16 @@ pub trait KeyEventExtModifierSupplement {
     /// key as `Character` according to the current keyboard layout. This value
     /// cannot be `Dead`.
     fn key_without_modifiers(&self) -> Key;
+
+    /// [`KeyEvent::text`] at the press's <kbd>Shift</kbd> level with <kbd>Caps Lock</kbd>
+    /// off: what a <kbd>Ctrl</kbd> or <kbd>Alt</kbd> chord names, which takes Shift's case
+    /// and never the lock's.
+    ///
+    /// On X11 and Wayland xkb resolves Shift and Lock together, and an alphabetic key's type
+    /// cancels one against the other: Turkish Caps Lock + Shift+i types `i`, where Shift
+    /// alone types `İ`. So there the press is read again without the lock (ATERM-KI-1015-9).
+    /// Elsewhere this is [`KeyEvent::text`].
+    fn text_ignoring_lock(&self) -> Option<&str>;
 }
 
 impl KeyEventExtModifierSupplement for KeyEvent {
@@ -37,5 +47,14 @@ impl KeyEventExtModifierSupplement for KeyEvent {
     #[inline]
     fn key_without_modifiers(&self) -> Key {
         self.platform_specific.key_without_modifiers.clone()
+    }
+
+    #[inline]
+    fn text_ignoring_lock(&self) -> Option<&str> {
+        #[cfg(any(x11_platform, wayland_platform))]
+        let text = &self.platform_specific.text_ignoring_lock;
+        #[cfg(not(any(x11_platform, wayland_platform)))]
+        let text = &self.text;
+        text.as_deref()
     }
 }

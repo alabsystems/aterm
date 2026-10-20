@@ -45,3 +45,17 @@ aterm-containment = { workspace = true }
 
 [lints]
 workspace = true
+
+# The Windows tests' stand-ins (dev-only, never shipped; plain programs off
+# Windows): the console clients `aterm.exe` serves, for a test binary that has
+# none beside it, and a GUI-subsystem program, which never connects to its
+# console (`tests/windows_openconsole.rs`).
+[[bin]]
+name = "aterm-pty-console-client"
+path = "src/bin/console_client.rs"
+test = false
+
+[[bin]]
+name = "aterm-pty-gui-standin"
+path = "src/bin/gui_standin.rs"
+test = false

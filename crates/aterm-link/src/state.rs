@@ -476,6 +476,16 @@ fn safe_line(line: &str) -> String {
     line.chars().filter(|c| !c.is_control()).take(120).collect()
 }
 
+/// Whether a durable write really flushes (`F_FULLFSYNC` on macOS): always, but in
+/// this crate's own unit tests. No test can see a flush — only its count
+/// ([`FileOps::fsyncs`], counted either way) and the kill points around it
+/// ([`IncSeam`]) — and the flushes, serialised across the drive at about 4 ms each,
+/// were most of those tests' wall. Every other build flushes, another crate's tests
+/// of this one included.
+pub(crate) const fn flushes_media() -> bool {
+    !cfg!(test)
+}
+
 /// Flush a directory, so the entries a rename put in it survive a power loss.
 ///
 /// Tolerates what astream's log does (`store.rs`'s `sync_parent_dir`): a filesystem
@@ -489,11 +499,19 @@ pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     } else {
         dir
     };
+    // The open, and what its error is taken for, run in every build: only the
+    // flush is skipped in this crate's tests ([`flushes_media`]).
     #[expect(
         clippy::disallowed_methods,
         reason = "aterm-link's flushes are the Ordered-tier work's to classify; the full flush is kept until then"
     )]
-    match std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+    match std::fs::File::open(dir).and_then(|d| {
+        if flushes_media() {
+            d.sync_all()
+        } else {
+            Ok(())
+        }
+    }) {
         Err(e)
             if !matches!(
                 e.kind(),
@@ -755,9 +773,6 @@ pub(crate) struct IncSeam {
     /// The lease a flush covers, short enough for the walk to run one out (the
     /// model's `Span`); `None` is [`INC_LEASE`].
     pub span: Option<u64>,
-    /// The walk stands in the media (a power loss is its model's step), so a durable
-    /// write skips its two flushes' system calls ([`StateDir::flushes`]).
-    pub simulated_media: bool,
 }
 
 /// The bridge's state directory.
@@ -1425,7 +1440,7 @@ impl StateDir {
             ops.renames += 1;
             ops.fsyncs += 2 * u64::from(durable);
         });
-        let flush = durable && self.flushes();
+        let flush = durable && flushes_media();
         let staged = (|| {
             f.write_all(bytes)?;
             if flush {
@@ -1449,18 +1464,6 @@ impl StateDir {
             }
         }
         Ok(())
-    }
-
-    /// Whether a durable write really flushes: always, but in the incarnation lease's
-    /// walk ([`IncSeam::simulated_media`]), which stands in the media itself and reads
-    /// nothing a flush would change — so thousands of takes run at file speed, not at
-    /// `F_FULLFSYNC`'s. The flushes are still counted ([`FileOps::fsyncs`]).
-    fn flushes(&self) -> bool {
-        #[cfg(test)]
-        if self.inc_seam().simulated_media {
-            return false;
-        }
-        true
     }
 
     /// Take this state dir for one bridge's life: an exclusive `flock` on
@@ -2849,6 +2852,30 @@ mod tests {
         assert!(
             reopened.reserve_sequence_block(5, 64).is_err(),
             "nothing below the will's number is left"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory flush tolerates a directory already gone and one this process
+    /// may write but not open (its file's bytes are flushed), and refuses a path
+    /// no directory can be at.
+    #[test]
+    fn a_directory_flush_tolerates_a_gone_directory_and_refuses_a_broken_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("syncdir");
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).expect("scratch");
+        assert!(sync_dir(&dir).is_ok());
+        assert!(sync_dir(&dir.join("gone")).is_ok());
+        let mode = |m| std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(m));
+        mode(0o300).expect("write but not read");
+        let opened = sync_dir(&locked);
+        mode(0o700).expect("readable again");
+        assert!(opened.is_ok());
+        std::fs::write(dir.join("file"), b"").expect("a file");
+        assert_eq!(
+            sync_dir(&dir.join("file").join("dir")).map_err(|e| e.kind()),
+            Err(io::ErrorKind::NotADirectory)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4362,10 +4389,15 @@ mod tests {
 
     /// Run the REAL take from every planned state `model` reaches, at each kill point,
     /// with `mutant`'s defect, and name every one whose files are not the model's
-    /// successor (or whose answer is not the model's `pn`). A kill point the take does
-    /// not reach (a take that does not flush) must complete it as the model's `Take`
-    /// does; a state whose flush the model's bound cuts off is not compared.
-    fn diverging_takes(model: &aterm_spec::derive::Model, mutant: u8) -> (usize, Vec<String>) {
+    /// successor (or whose answer is not the model's `pn`) — or only the first, when
+    /// `first` (a negative control asks only that one exists). A kill point the take
+    /// does not reach (a take that does not flush) must complete it as the model's
+    /// `Take` does; a state whose flush the model's bound cuts off is not compared.
+    fn diverging_takes(
+        model: &aterm_spec::derive::Model,
+        mutant: u8,
+        first: bool,
+    ) -> (usize, Vec<String>) {
         let span = model
             .consts
             .iter()
@@ -4404,7 +4436,6 @@ mod tests {
                     kill_at: kill,
                     mutant,
                     span: Some(span),
-                    simulated_media: true,
                 });
                 let got = st.take_incarnation(0);
                 let files = read_back(&st);
@@ -4421,6 +4452,10 @@ mod tests {
                          {files:?}, model {want:?}",
                         s["pn"]
                     ));
+                    if first {
+                        let _ = std::fs::remove_dir_all(&dir);
+                        return (compared, diverged);
+                    }
                 }
             }
         }
@@ -4462,7 +4497,7 @@ mod tests {
                     &[("Buggy", i64::from(buggy)), ("MaxBoot", 2)],
                 ),
             };
-            let (compared, diverged) = diverging_takes(&model, buggy);
+            let (compared, diverged) = diverging_takes(&model, buggy, false);
             eprintln!("IncarnationLease Buggy = {buggy}: {compared} takes held to the model");
             assert!(
                 compared > 100,
@@ -4479,7 +4514,7 @@ mod tests {
         // run-out lease, whose committed flush lands above the committed bound.
         let roomier = aterm_spec::interp::with_consts(&committed, &[("MaxTop", 7), ("MaxBoot", 2)]);
         for mutant in 1..=3u8 {
-            let (compared, diverged) = diverging_takes(&roomier, mutant);
+            let (compared, diverged) = diverging_takes(&roomier, mutant, true);
             assert!(
                 !diverged.is_empty(),
                 "the take's defect {mutant} matched the committed model in all {compared} takes"

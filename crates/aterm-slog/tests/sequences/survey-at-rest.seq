@@ -1,0 +1,14 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# §2.4: survey opens a survey step in the turn and arms the settle: once it
+# holds, the turn closes done and the survey step closes with it.
+see busy
+see survey fixture=claude-2.1.284-survey-plugin
+expect open p1 survey par=t1
+expect wake=1000
+half
+half
+expect close p1 survey out=gone
+expect close t1 turn out=done steps=1
+see busy
+expect open t1 turn
+expect open t2 turn at=1000

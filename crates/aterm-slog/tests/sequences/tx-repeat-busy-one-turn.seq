@@ -1,0 +1,12 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# T4: a repeated busy is one turn: the exact turn lists catch a tracker that
+# splits it.
+bind 0
+see busy
+see busy
+see busy
+tx prompt v1
+tx end
+expect open t1 turn
+expect close t1 turn out=done
+expect turn=none

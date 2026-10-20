@@ -69,11 +69,74 @@ pub fn our_uid() -> u32 {
 /// No process groups on Windows: the caller's `Child::kill` is the whole of it.
 pub fn kill_process_group(_leader: u32) {}
 
-/// No start-time reader is wired on Windows: [`crate::platform::Birth::Unreadable`], and a
-/// promise rides on the pid alone (the Unix twin's docs).
+// The start-time reader's calls, declared dependency-free like the file queries below (std
+// links `kernel32`); the handle is closed with their `CloseHandle`. A `FILETIME` is two
+// `u32`s, low half first, as in [`ByHandleFileInformation`].
+unsafe extern "system" {
+    fn OpenProcess(
+        dw_desired_access: u32,
+        b_inherit_handle: i32,
+        dw_process_id: u32,
+    ) -> *mut core::ffi::c_void;
+    fn GetExitCodeProcess(h_process: *mut core::ffi::c_void, lp_exit_code: *mut u32) -> i32;
+    fn GetProcessTimes(
+        h_process: *mut core::ffi::c_void,
+        lp_creation_time: *mut [u32; 2],
+        lp_exit_time: *mut [u32; 2],
+        lp_kernel_time: *mut [u32; 2],
+        lp_user_time: *mut [u32; 2],
+    ) -> i32;
+}
+
+/// The kernel's start-time stamp for `pid` ([`crate::platform::Birth`]), used with the pid
+/// to detect reuse, as the Unix twin's is: `GetProcessTimes`'s creation time, in
+/// 100-nanosecond ticks since 1601, read through a `PROCESS_QUERY_LIMITED_INFORMATION`
+/// handle (the least access that reads it, which Windows grants on most other accounts'
+/// processes too). [`Birth::Gone`](crate::platform::Birth::Gone) for pid 0, for a pid
+/// `OpenProcess` names nothing under (`ERROR_INVALID_PARAMETER`), and for a process that
+/// has exited but whose object a handle still keeps — the zombie's analogue
+/// (`GetExitCodeProcess` no longer `STILL_ACTIVE`; one that exited with code 259 reads as
+/// running, and is still the process born then);
+/// [`Birth::Unreadable`](crate::platform::Birth::Unreadable) when the kernel would not say
+/// (`ERROR_ACCESS_DENIED`: a protected or system process) or a query failed.
 #[must_use]
-pub fn process_birth(_pid: u32) -> crate::platform::Birth {
-    crate::platform::Birth::Unreadable
+pub fn process_birth(pid: u32) -> crate::platform::Birth {
+    use crate::platform::Birth;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    const STILL_ACTIVE: u32 = 259;
+    if pid == 0 {
+        return Birth::Gone;
+    }
+    // SAFETY: three integers in; a process handle, or NULL with the reason in the thread's
+    // last error, out.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        // Read at once, before anything else can move the last error.
+        return if io::Error::last_os_error().raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+            Birth::Gone
+        } else {
+            Birth::Unreadable
+        };
+    }
+    let mut code: u32 = 0;
+    let (mut created, mut exited, mut kernel, mut user) =
+        ([0u32; 2], [0u32; 2], [0u32; 2], [0u32; 2]);
+    // SAFETY: `handle` is the live handle opened above, with the access both queries need;
+    // every out-param is a valid, writable value of the type the API fills.
+    let (coded, timed) = unsafe {
+        (
+            GetExitCodeProcess(handle, &mut code) != 0,
+            GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) != 0,
+        )
+    };
+    // SAFETY: `handle` is live and not closed anywhere else; closed exactly once.
+    unsafe { CloseHandle(handle) };
+    match (coded, timed) {
+        (true, _) if code != STILL_ACTIVE => Birth::Gone,
+        (true, true) => Birth::At((u64::from(created[1]) << 32) | u64::from(created[0])),
+        _ => Birth::Unreadable,
+    }
 }
 
 /// Best-effort private-dir predicate: `true`. POSIX owner/mode bits do not apply;
@@ -603,11 +666,7 @@ unsafe extern "system" fn swallow_ctrl_c(ctrl_type: u32) -> i32 {
 /// reviewed pass-throughs) with `aterm_uds::spawn::set_flags`, both `Console::Quiet`, which
 /// adds nothing from a console: typed at a prompt the tool shares that console, its
 /// Ctrl-C and its code page, exactly as a bare child did.
-#[expect(
-    clippy::disallowed_types,
-    reason = "the pass-throughs' spawn-and-wait: the program stands in for this process"
-)]
-pub fn exec_or_run(command: &mut std::process::Command) -> io::Error {
+pub fn exec_or_run(command: &mut aterm_uds::spawnfd::StdCommand) -> io::Error {
     // Best effort: when the install fails the wrapper keeps the default disposition (it
     // ends on Ctrl-C), and the child still runs — nothing here may stand between the
     // user and the tool.

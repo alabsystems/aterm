@@ -253,81 +253,80 @@ pub(crate) fn seal_layout(
 #[path = "handoff_diet_conformance.rs"]
 pub(crate) mod conformance;
 
-/// The model's actions no shipping function here performs, each waived with
-/// where it is bound instead.
-#[cfg(test)]
-mod waivers {
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_speculative_sidecar",
-        action = "RefuseWrite",
-        reason = "The environment: a file system that refuses the speculative write. The \
-                  conformance realizes it as a directory the writer may not create in."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_speculative_sidecar",
-        action = "LayoutMoves",
-        reason = "The environment: the person changes the desk while the successor boots. The \
-                  conformance realizes it as a second park layout (the negative control)."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_speculative_sidecar",
-        action = "DiskDisturbed",
-        reason = "The environment: something else rewrites the sidecar in the private control \
-                  directory. The conformance realizes it as an in-place overwrite."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_speculative_sidecar",
-        action = "Park",
-        reason = "The main thread's park (`App::park_and_transfer_to_prelaunched_successor`), \
-                  bound by NativeUpdateSeamlessHandoffOwnership's Tier-1; P5 does not change it."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_speculative_sidecar",
-        action = "Grant",
-        reason = "The rendezvous transfer in `run_prelaunched_handoff`, which runs only after \
-                  `prepare_outgoing_artifacts` (and so `seal_layout`) returned: the order is \
-                  that function's straight line, and the rendezvous suites drive the transfer."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_speculative_sidecar",
-        action = "SuccessorReads",
-        reason = "The successor's `take_incoming_from` layout read. The conformance drives its \
-                  halves, `seamless::take_regular_capped` and `layout_wire_digest`, against \
-                  the park's committed `layout_digest`."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_speculative_sidecar",
-        action = "SealUnverified",
-        reason = "The Buggy=1 mutant: a speculation kept without the read-back; no shipping \
-                  code, replayed on the real files by the negative control."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_speculative_sidecar",
-        action = "VerifyTheMemoryCopy",
-        reason = "The Buggy=1 mutant: the bytes meant to be written compared instead of the \
-                  file; no shipping code, replayed on the real files by the negative control."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_speculative_sidecar",
-        action = "GrantBeforeSeal",
-        reason = "The Buggy=1 mutant: a grant with the speculation undecided; no shipping code, \
-                  replayed on the real files by the negative control."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_speculative_sidecar",
-        action = "RetireKeepsSpeculation",
-        reason = "The Buggy=1 mutant: a retire without the prefix sweep; no shipping code, \
-                  replayed on the real files by the negative control."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_speculative_sidecar",
-        action = "AwaitSpeculation",
-        reason = "The Buggy=1 liveness mutant: a park that waits on a refused speculation; no \
-                  shipping code (`seal_layout` writes at the park when there is none)."
-    )]
-    #[expect(
-        dead_code,
-        reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it"
-    )]
-    fn speculative_sidecar_waivers() {}
-}
+/// The model's actions no shipping function here performs, each waived with where it is
+/// bound instead.
+#[cfg(any(test, debug_assertions))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_speculative_sidecar",
+    action = "RefuseWrite",
+    reason = "The environment: a file system that refuses the speculative write. The \
+              conformance realizes it as a directory the writer may not create in."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_speculative_sidecar",
+    action = "LayoutMoves",
+    reason = "The environment: the person changes the desk while the successor boots. The \
+              conformance realizes it as a second park layout (the negative control)."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_speculative_sidecar",
+    action = "DiskDisturbed",
+    reason = "The environment: something else rewrites the sidecar in the private control \
+              directory. The conformance realizes it as an in-place overwrite."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_speculative_sidecar",
+    action = "Park",
+    reason = "The main thread's park (`App::park_and_transfer_to_prelaunched_successor`), \
+              bound by NativeUpdateSeamlessHandoffOwnership's Tier-1; P5 does not change it."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_speculative_sidecar",
+    action = "Grant",
+    reason = "The rendezvous transfer in `run_prelaunched_handoff`, which runs only after \
+              `prepare_outgoing_artifacts` (and so `seal_layout`) returned: the order is \
+              that function's straight line, and the rendezvous suites drive the transfer."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_speculative_sidecar",
+    action = "SuccessorReads",
+    reason = "The successor's `take_incoming_from` layout read. The conformance drives its \
+              halves, `seamless::take_regular_capped` and `layout_wire_digest`, against \
+              the park's committed `layout_digest`."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_speculative_sidecar",
+    action = "SealUnverified",
+    reason = "The Buggy=1 mutant: a speculation kept without the read-back; no shipping \
+              code, replayed on the real files by the negative control."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_speculative_sidecar",
+    action = "VerifyTheMemoryCopy",
+    reason = "The Buggy=1 mutant: the bytes meant to be written compared instead of the \
+              file; no shipping code, replayed on the real files by the negative control."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_speculative_sidecar",
+    action = "GrantBeforeSeal",
+    reason = "The Buggy=1 mutant: a grant with the speculation undecided; no shipping code, \
+              replayed on the real files by the negative control."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_speculative_sidecar",
+    action = "RetireKeepsSpeculation",
+    reason = "The Buggy=1 mutant: a retire without the prefix sweep; no shipping code, \
+              replayed on the real files by the negative control."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_speculative_sidecar",
+    action = "AwaitSpeculation",
+    reason = "The Buggy=1 liveness mutant: a park that waits on a refused speculation; no \
+              shipping code (`seal_layout` writes at the park when there is none)."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn speculative_sidecar_waivers() {}

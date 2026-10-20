@@ -34,8 +34,8 @@ use crate::model::{
 
 use super::semantics::{
     ActionHandlerWrapper, Adapter as Semantics, AdapterCallback, AppContext, CacheNode, Event,
-    Interface, InterfaceSet, NodeId, ObjectEvent, PlatformNode, PlatformRoot, State, WindowBounds,
-    next_adapter_id,
+    Interface, InterfaceSet, NodeIdentity, ObjectEvent, PlatformNode, PlatformRoot, State,
+    WindowBounds, next_adapter_id,
 };
 use super::serve::{self, Fault, Objects};
 use super::wire::{self, ObjectId, ROOT_PATH};
@@ -129,14 +129,14 @@ struct Recorder {
 }
 
 impl AdapterCallback for Recorder {
-    fn register_interfaces(&self, adapter: &Semantics, id: NodeId, interfaces: InterfaceSet) {
+    fn register_interfaces(&self, adapter: &Semantics, id: NodeIdentity, interfaces: InterfaceSet) {
         self.registered
             .lock()
             .unwrap()
             .push((adapter.platform_node(id), interfaces));
     }
 
-    fn unregister_interfaces(&self, _: &Semantics, _: NodeId, _: InterfaceSet) {}
+    fn unregister_interfaces(&self, _: &Semantics, _: NodeIdentity, _: InterfaceSet) {}
 
     fn emit_event(&self, _: &Semantics, event: Event) {
         self.events.lock().unwrap().push(event);
@@ -164,6 +164,10 @@ struct Served {
 
 impl Served {
     fn new() -> Self {
+        Self::over(fixture("hi\n"))
+    }
+
+    fn over(update: TreeUpdate) -> Self {
         let app = AppContext::new(Some("aterm-test".into()));
         let recorder = Recorder::default();
         let actions = Actions::default();
@@ -171,7 +175,7 @@ impl Served {
             next_adapter_id(),
             &app,
             recorder.clone(),
-            fixture("hi\n"),
+            update,
             true,
             WindowBounds::default(),
             Arc::new(ActionHandlerWrapper::new(actions.clone())),
@@ -456,6 +460,97 @@ fn a_link_is_a_hyperlink_and_a_slider_a_value() {
     );
 }
 
+/// A window holding a button and, after it, a list box of two options: ON
+/// selected, OFF not, over the button where the list would scroll it to,
+/// marked off screen when `offscreen`.
+fn list_fixture(offscreen: bool) -> TreeUpdate {
+    const LIST: LocalId = LocalId(20);
+    let mut window = Node::new(Role::Window);
+    window.set_label("Settings");
+    window.set_children(vec![BUTTON, LIST]);
+    window.set_bounds(Rect::new(0.0, 0.0, 200.0, 100.0));
+    let mut button = Node::new(Role::Button);
+    button.set_label("Import");
+    button.set_bounds(Rect::new(0.0, 40.0, 100.0, 60.0));
+    button.add_action(Action::Click);
+    let mut list = Node::new(Role::ListBox);
+    list.set_label("Themes");
+    list.set_bounds(Rect::new(0.0, 0.0, 100.0, 20.0));
+    list.set_children(vec![LINK, SLIDER]);
+    let option = |label: &str, selected: bool, y: f64| {
+        let mut option = Node::new(Role::ListBoxOption);
+        option.set_label(label);
+        option.set_selected(selected);
+        option.set_bounds(Rect::new(0.0, y, 100.0, y + 20.0));
+        option.add_action(Action::Click);
+        option
+    };
+    let mut off = option("OFF", false, 40.0);
+    if offscreen {
+        off.set_offscreen();
+    }
+    TreeUpdate {
+        nodes: vec![
+            (WINDOW, window),
+            (BUTTON, button),
+            (LIST, list),
+            (LINK, option("ON", true, 0.0)),
+            (SLIDER, off),
+        ],
+        tree: Some(Tree::new(WINDOW)),
+        tree_id: TreeId::ROOT,
+        focus: WINDOW,
+    }
+}
+
+/// An option its list holds off screen is in the tree, visible and
+/// selectable but not showing, and owns no point: the button drawn where
+/// its bounds lie answers there. The list's Selection counts its options:
+/// child 0 is selected, child 1 is not and can be. Negative control: the
+/// same option on screen answers its point and shows.
+#[test]
+fn an_offscreen_option_is_listed_not_showing_and_owns_no_point() {
+    const LIST: LocalId = LocalId(20);
+    let bit = |states: &[Value], state: State| {
+        let bit = state as u32;
+        let word = states[0].as_array().unwrap().items()[usize::from(bit >= 32)].clone();
+        matches!(word, Value::U32(w) if w & (1 << (bit % 32)) != 0)
+    };
+    let at = |s: &Served| {
+        let hit = s.ok(
+            &s.path(WINDOW),
+            "org.a11y.atspi.Component",
+            "GetAccessibleAtPoint",
+            vec![50.into(), 50.into(), 1u32.into()],
+        );
+        hit[0].as_struct().unwrap()[1].as_str().unwrap().to_owned()
+    };
+    for offscreen in [true, false] {
+        let s = Served::over(list_fixture(offscreen));
+        let off = s.ok(&s.path(SLIDER), ACCESSIBLE, "GetState", vec![]);
+        assert!(bit(&off, State::Visible) && bit(&off, State::Selectable));
+        assert_eq!(bit(&off, State::Showing), !offscreen, "{offscreen}");
+        let on = s.ok(&s.path(LINK), ACCESSIBLE, "GetState", vec![]);
+        assert!(bit(&on, State::Showing) && bit(&on, State::Selected));
+        let expected = if offscreen { BUTTON } else { SLIDER };
+        assert_eq!(at(&s), s.path(expected), "{offscreen}");
+        let selection = "org.a11y.atspi.Selection";
+        let list = s.path(LIST);
+        assert_eq!(
+            s.ok(&list, selection, "IsChildSelected", vec![0.into()]),
+            vec![Value::Bool(true)]
+        );
+        assert_eq!(
+            s.ok(&list, selection, "IsChildSelected", vec![1.into()]),
+            vec![Value::Bool(false)]
+        );
+        assert_eq!(
+            s.ok(&list, selection, "SelectChild", vec![1.into()]),
+            vec![Value::Bool(true)]
+        );
+    }
+}
+
 #[test]
 fn unknown_objects_interfaces_and_members_answer_as_zbus_did() {
     let s = Served::new();
@@ -513,7 +608,16 @@ fn a_closed_window_s_paths_are_forgotten() {
 
 #[test]
 fn the_actions_an_at_can_send_reach_the_window() {
-    let s = Served::new();
+    let scoped = |generation| {
+        let mut update = fixture("hi\n");
+        for (id, node) in &mut update.nodes {
+            if *id == BUTTON || *id == TERMINAL {
+                node.set_action_context(crate::model::ActionContext::new(41, generation));
+            }
+        }
+        update
+    };
+    let mut s = Served::over(scoped(7));
     let (button, terminal) = (s.path(BUTTON), s.path(TERMINAL));
     let action = "org.a11y.atspi.Action";
     assert_eq!(s.get(&button, action, "NActions"), Value::I32(1));
@@ -554,6 +658,141 @@ fn the_actions_an_at_can_send_reach_the_window() {
         heard,
         [Action::Click, Action::Focus, Action::SetTextSelection]
     );
+    // Routine content updates retain the exported object and its held handle.
+    let held = s._semantics.platform_node(node(BUTTON.0));
+    let mut unchanged_owner = scoped(7);
+    unchanged_owner
+        .nodes
+        .iter_mut()
+        .find(|(id, _)| *id == BUTTON)
+        .unwrap()
+        .1
+        .set_label("Changed label");
+    s._semantics.update(unchanged_owner);
+    assert_eq!(held.name().unwrap(), "Changed label");
+    assert_eq!(
+        s.ok(&button, action, "DoAction", vec![0.into()]),
+        vec![Value::Bool(true)]
+    );
+    assert!(
+        s.recorder
+            .registered
+            .lock()
+            .unwrap()
+            .drain(..)
+            .all(|(_, interfaces)| interfaces.bits() == 0)
+    );
+
+    // A replaced owner retires both a retained object path and a held node.
+    // Old queued requests retain gen7; an old path cannot acquire gen8.
+    s.recorder.events.lock().unwrap().clear();
+    s._semantics.update(scoped(8));
+    for (node, interfaces) in s.recorder.registered.lock().unwrap().drain(..) {
+        s.objects.register(node, interfaces);
+    }
+    assert_eq!(
+        s.fault(&button, action, "DoAction", vec![0.into()]).name,
+        "org.freedesktop.DBus.Error.UnknownObject"
+    );
+    assert!(held.do_action(0).is_err());
+    let children = s.ok(&s.path(WINDOW), ACCESSIBLE, "GetChildren", vec![]);
+    let current = children[0].as_array().unwrap().items()[1]
+        .as_struct()
+        .unwrap()[1]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(current, button);
+    let child_events: Vec<_> = s
+        .recorder
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            Event::Object {
+                target: super::semantics::NodeIdOrRoot::Node(parent),
+                event,
+            } if *parent == node(WINDOW.0) => match event {
+                ObjectEvent::ChildRemoved(child) if child.id.0 == BUTTON => Some((
+                    false,
+                    ObjectId::Node {
+                        adapter: s._semantics.id(),
+                        node: *child,
+                    }
+                    .path(),
+                )),
+                ObjectEvent::ChildAdded(1, child) if child.id.0 == BUTTON => Some((
+                    true,
+                    ObjectId::Node {
+                        adapter: s._semantics.id(),
+                        node: *child,
+                    }
+                    .path(),
+                )),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        child_events,
+        [(false, button.clone()), (true, current.clone())]
+    );
+    assert_eq!(
+        s.ok(&current, action, "DoAction", vec![0.into()]),
+        vec![Value::Bool(true)]
+    );
+    {
+        let queued = s.actions.requests.lock().unwrap();
+        assert_eq!(
+            queued.len(),
+            5,
+            "stale path and held object must emit no action"
+        );
+        assert!(
+            queued[..4]
+                .iter()
+                .all(|request| request.context == Some(crate::model::ActionContext::new(41, 7)))
+        );
+        assert_eq!(
+            queued.last().unwrap().context,
+            Some(crate::model::ActionContext::new(41, 8))
+        );
+    }
+
+    // Removal/reinsertion also retires an object, even with unchanged owner context.
+    let mut absent = scoped(8);
+    absent.nodes.retain(|(id, _)| *id != BUTTON);
+    absent
+        .nodes
+        .iter_mut()
+        .find(|(id, _)| *id == WINDOW)
+        .unwrap()
+        .1
+        .set_children(vec![TERMINAL, LINK, SLIDER]);
+    s._semantics.update(absent);
+    s._semantics.update(scoped(8));
+    for (node, interfaces) in s.recorder.registered.lock().unwrap().drain(..) {
+        s.objects.register(node, interfaces);
+    }
+    assert_eq!(
+        s.fault(&current, action, "DoAction", vec![0.into()]).name,
+        "org.freedesktop.DBus.Error.UnknownObject"
+    );
+    let children = s.ok(&s.path(WINDOW), ACCESSIBLE, "GetChildren", vec![]);
+    let reinserted = children[0].as_array().unwrap().items()[1]
+        .as_struct()
+        .unwrap()[1]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(reinserted, current);
+    assert_eq!(
+        s.ok(&reinserted, action, "DoAction", vec![0.into()]),
+        vec![Value::Bool(true)]
+    );
+    assert_eq!(s.actions.requests.lock().unwrap().len(), 6);
 }
 
 // --- zbus's bytes ---------------------------------------------------------
@@ -583,8 +822,11 @@ fn bytes(mut msg: Message, path: &str, serial: u32) -> Vec<u8> {
     msg.encode().unwrap()
 }
 
-fn node(local: u64) -> NodeId {
-    NodeId(LocalId(local))
+fn node(local: u64) -> NodeIdentity {
+    NodeIdentity {
+        id: crate::tree::NodeId(LocalId(local)),
+        incarnation: 0,
+    }
 }
 
 #[test]

@@ -20,8 +20,14 @@ mod trust_fmt;
 
 // `dev_seam!` — the one reader of a development-only environment variable.
 pub mod dev_seam;
+// The argv0 aliases of the one `aterm` binary: the list the bundle lays and every
+// Rust reader shares.
+pub mod argv0;
 
 pub mod identity;
+// The need words (`docs/DESIGN-owner-surfaces-2026-10-16.md` §2.2): what a
+// session needs of its owner, one vocabulary for the server and its readers.
+pub mod needs;
 pub mod version;
 
 mod cursor;
@@ -54,7 +60,11 @@ pub mod control_verbs;
 // bridge, the endpoint and the supervisor each hold a line to it and none
 // depends on another.
 pub mod fabric_grammar;
+// `[fabric] command`'s two spellings (a whitespace-split line, or an argv
+// array), read alike by the bridge launcher and `aterm fabric`.
+pub mod fabric_command;
 pub mod fs_restricted;
+pub mod pe_image;
 // The inline-image payload: shared vocabulary because the live grid and the history line model
 // must hold the same `Arc`, and neither of those crates can see the other's types.
 mod inline_image;
@@ -162,8 +172,9 @@ impl TerminalSize {
 // ============================================================================
 
 /// Default `faint_opacity`: the fraction of the foreground's contrast SGR 2
-/// (dim/faint) keeps, in log space. Faint is a linear-light blend toward the
-/// cell background, raised to a readable floor where needed; see
+/// (dim/faint) keeps, in log space. Faint is a blend toward the cell
+/// background (for light ink as far as an sRGB alpha blend), raised to a
+/// readable floor where needed; see
 /// `aterm_core::terminal::color_resolve::dim_toward_bg`.
 pub const DIM_FACTOR: f32 = 0.5;
 

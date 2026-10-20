@@ -19,7 +19,7 @@
 //!
 //! **The lines** ([`ai_entries`]) are `Family::Ai`, a LEVEL family: each look
 //! states its whole answer through `App::except_replace`. One
-//! `exceptions::Entry` per wanted, measured CLI that needs a person — signed
+//! `exceptions::Entry` per wanted CLI that needs a person — signed
 //! out, not installed, or a login due — keyed `ai.<cli>.<state>`, Warn for the
 //! preferred CLI and Info for the others, whose one button opens this page.
 //! Never a `Message::now`: signing in needs a terminal and a browser, not one
@@ -76,9 +76,6 @@ pub(crate) struct AiCli {
     pub(crate) product: &'static str,
     /// Whether this is Claude Code, whose login accounts v2 owns.
     pub(crate) claude: bool,
-    /// Whether a lab pass has run its commands on a real install: an
-    /// unmeasured CLI never reads FAIL and never raises a line.
-    pub(crate) measured: bool,
     /// Whether it is wanted here (`[ai.<id>] use`).
     pub(crate) wanted: bool,
     /// Its state.
@@ -92,13 +89,11 @@ pub(crate) struct AiCli {
 }
 
 impl AiCli {
-    /// Whether a person is needed: a wanted, measured CLI that is FAIL, or
-    /// whose login is due (the doctor's own rule for what it fixes).
+    /// Whether a definite install or sign-in action is needed: the doctor's
+    /// own rule, independent of whether a vendor lab has run.
     #[must_use]
     pub(crate) fn needs_you(&self) -> bool {
-        self.wanted
-            && self.measured
-            && (self.mark == Mark::Fail || matches!(self.state, State::Due(_)))
+        self.state.needs_person(self.wanted)
     }
 
     /// The act its row offers where it needs a person.
@@ -143,7 +138,6 @@ impl AiReading {
                 id: row.connector.id,
                 product: row.connector.product,
                 claude: row.connector.is_claude(),
-                measured: row.connector.measured,
                 wanted: row.wanted,
                 state: row.state,
                 mark: row.mark,

@@ -98,7 +98,30 @@ impl SpareRig {
         self.spawn_from(shell, program, &self.dir)
     }
 
+    /// [`Self::spawn`] started in folder `cwd`, as a tab asked for there, with
+    /// `env` added to what it inherits.
+    fn spawn_in(
+        &self,
+        shell: ShellType,
+        program: &str,
+        cwd: &Path,
+        env: &[(&str, &Path)],
+    ) -> LiveShell {
+        self.spawn_with(shell, program, &self.dir, Some(cwd), env)
+    }
+
     fn spawn_from(&self, shell: ShellType, program: &str, dir: &Path) -> LiveShell {
+        self.spawn_with(shell, program, dir, None, &[])
+    }
+
+    fn spawn_with(
+        &self,
+        shell: ShellType,
+        program: &str,
+        dir: &Path,
+        cwd: Option<&Path>,
+        env: &[(&str, &Path)],
+    ) -> LiveShell {
         let InjectionEnv {
             env_add,
             argv_override,
@@ -109,6 +132,9 @@ impl SpareRig {
         }
         argv.push("-i".to_owned());
         let mut cmd = Command::new("script");
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
         if cfg!(target_os = "macos") {
             cmd.args(["-q", "/dev/null"]).args(&argv);
         } else {
@@ -116,7 +142,12 @@ impl SpareRig {
                 .iter()
                 .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
                 .collect();
-            cmd.args(["-q", "-c", &quoted.join(" "), "/dev/null"]);
+            // util-linux runs `-c`'s line through `$SHELL -c`: /bin/sh here, never a
+            // bash that reads `~/.bashrc` on the way (Debian's does for a `-c` run
+            // over ssh, `SSH_CLIENT` set), which ran the rig's startup file before
+            // the shell under test began.
+            cmd.args(["-q", "-c", &quoted.join(" "), "/dev/null"])
+                .env("SHELL", "/bin/sh");
         }
         let hermetic = shell_command(program);
         for (key, value) in hermetic.get_envs() {
@@ -139,15 +170,42 @@ impl SpareRig {
         for (key, value) in env_add {
             cmd.env(key, value);
         }
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        if shell == ShellType::Fish {
+            // As the live fish lanes start it: its config and data in the
+            // rig's home, its data dirs aterm's conf.d and the hermetic one,
+            // and a terminal it sends no queries to (nothing here answers).
+            cmd.env("XDG_CONFIG_HOME", self.home.join(".config"))
+                .env("XDG_DATA_HOME", self.home.join(".local").join("share"))
+                .env(
+                    "XDG_DATA_DIRS",
+                    format!(
+                        "{}:{}",
+                        dir.join("fish-xdg").display(),
+                        hermetic.home().join("data").display()
+                    ),
+                )
+                .env("TERM", "dumb");
+        }
         if shell == ShellType::Zsh {
             cmd.env_remove("ATERM_UNSET_ZDOTDIR")
                 .env("ATERM_ORIGINAL_ZDOTDIR", &self.home);
         }
         let label = match shell {
             ShellType::Zsh => "zsh",
+            ShellType::Fish => "fish",
             _ => "bash",
         };
         LiveShell::spawn(label, &mut cmd).holding(hermetic.into_home())
+    }
+
+    /// Write `name` under fish's config dir (`$XDG_CONFIG_HOME/fish`).
+    fn fish_rc(&self, name: &str, body: &str) {
+        let path = self.home.join(".config").join("fish").join(name);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("fish config dir");
+        std::fs::write(path, body).expect("fish rc");
     }
 }
 
@@ -337,65 +395,150 @@ fn a_spare_runs_no_startup_file_until_asked_and_signs_one_start_record() {
     }
 }
 
+/// THE PARKED RETARGET (2026-10-18): a parked shell started in one folder and
+/// told `go <folder>` reads, at its first prompt, as a cold shell started in
+/// that folder: its `$PWD`, the folder its commands run in (`pwd -P`), and its
+/// `$OLDPWD`, set or not and handed to a command or not, before and after its
+/// first `cd` (zsh starts with `$OLDPWD` at `$PWD`; bash with it unset but
+/// exported, or the one it inherited). NEGATIVE CONTROL: a plain `go` leaves
+/// it in the folder it was started in, even with a `__aterm_spare_cd` in the
+/// environment it inherited: only a line told names a folder.
+#[cfg(unix)]
+#[test]
+fn a_parked_shell_told_a_folder_reads_as_a_cold_shell_started_there() {
+    // `$PWD`, the physical folder, `$OLDPWD` (or `unset`) and whether a
+    // command's environment carries it; the last two again after `cd /`.
+    const PROBE: &str = "printf 'RD=%s|%s|%s|%s|' \"$PWD\" \"$(pwd -P)\" \"${OLDPWD-unset}\" \
+         \"$(env | grep -c '^OLDPWD=')\"; cd /; printf '%s|%s|E%s\\n' \"${OLDPWD-unset}\" \
+         \"$(env | grep -c '^OLDPWD=')\" \"$((40+2))\"";
+    for (shell, program, rc) in spare_shells() {
+        // Both folders spelled as the kernel names them (the host's
+        // `retarget_folder` names nothing else).
+        let scratch = aterm_tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(scratch.path()).expect("canonical scratch");
+        let (there, elsewhere) = (root.join("there"), root.join("elsewhere"));
+        for d in [&there, &elsewhere] {
+            std::fs::create_dir(d).expect("folder");
+        }
+        // `None`: a cold shell started there; else a parked one started
+        // elsewhere and released with this line.
+        let reading = |release: Option<&str>, env: &[(&str, &Path)]| -> String {
+            let rig = SpareRig::new();
+            rig.rc(rc, ": rc ran\n");
+            let mut host = release.map(|_| rig.fifo());
+            let start = if release.is_some() {
+                &elsewhere
+            } else {
+                &there
+            };
+            let mut sh = rig.spawn_in(shell, program, start, env);
+            let from = match (host.as_mut(), release) {
+                (Some(host), Some(line)) => {
+                    let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
+                    tell(host, line);
+                    parked
+                }
+                _ => 0,
+            };
+            let a = sh.wait_for_after("\x1b]133;A", from);
+            let prompt = sh.wait_for_after("\x1b]133;B", a);
+            sh.send(PROBE);
+            let end = sh.wait_for_after("|E42", prompt);
+            let value = sh.value_before("RD=", end);
+            sh.finish();
+            value
+        };
+        let cold = reading(None, &[]);
+        assert!(
+            cold.starts_with(&format!("{0}|{0}|", there.display())),
+            "{program}: the cold reference starts there: {cold}"
+        );
+        assert_eq!(
+            reading(Some(&format!("go {}", there.display())), &[]),
+            cold,
+            "{program}: retargeted, it reads as the cold shell"
+        );
+        assert_ne!(
+            reading(Some("go"), &[]),
+            cold,
+            "{program}: a plain release stays where it started"
+        );
+        assert_ne!(
+            reading(Some("go"), &[("__aterm_spare_cd", &there)]),
+            cold,
+            "{program}: an inherited variable is no folder told"
+        );
+    }
+}
+
 /// S2, zsh: a warm tab's first prompt reads as a cold tab's. The `$?` an rc
 /// ending in `false` leaves; a hook the rc put ahead of aterm's re-run after
 /// the release, silenced
 /// (it reads what the file holds now, and its stderr appears once, from its run
-/// at spare time). The flags name what would keep a generation from running
-/// unseen: a `sched` event, a job, a periodic hook.
+/// at spare time). A history parameter of the rc's is readonly (a hardened rc:
+/// SAVEHIST, which the hold zeroes, then HISTFILE, which `fc -p` sets) and its
+/// history file is not there yet, so the release would read it again: the hold
+/// and the release leave them as they are. The flags name what would keep a
+/// generation from running unseen: a `sched` event, a job, a periodic hook.
 #[cfg(unix)]
 #[test]
 fn a_warm_zsh_first_prompt_reads_as_a_cold_one() {
     let zsh = spare_zsh();
-    let rc = "PS1='ST=%? P> '\n\
-              ahead() { cat \"$HOME/f\" > \"$HOME/seen\" 2>/dev/null; print -u2 HOOKERR$((40+2)); }\n\
-              precmd_functions=(ahead $precmd_functions)\n\
-              false\n";
-    // Cold: the reference prompt.
-    let rig = SpareRig::new();
-    rig.rc(".zshrc", rc);
-    std::fs::write(rig.home.join("f"), "before").unwrap();
-    let mut sh = rig.spawn(ShellType::Zsh, zsh);
-    let a = sh.wait_for_after("\x1b]133;A", 0);
-    let cold_prompt = sh.wait_for_after("P> ", a);
-    let cold = stdout_between(&sh, a, cold_prompt);
-    sh.finish();
+    // The rc's history parameters readonly, one and then the other.
+    for ro in ["SAVEHIST", "HISTFILE"] {
+        let rc = format!(
+            "PS1='ST=%? P> '\nHISTFILE=\"$HOME/hist\"\ntypeset -r {ro}\n\
+             ahead() {{ cat \"$HOME/f\" > \"$HOME/seen\" 2>/dev/null; print -u2 HOOKERR$((40+2)); }}\n\
+             precmd_functions=(ahead $precmd_functions)\n\
+             false\n"
+        );
+        // Cold: the reference prompt.
+        let rig = SpareRig::new();
+        rig.rc(".zshrc", &rc);
+        std::fs::write(rig.home.join("f"), "before").unwrap();
+        let mut sh = rig.spawn(ShellType::Zsh, zsh);
+        let a = sh.wait_for_after("\x1b]133;A", 0);
+        let cold_prompt = sh.wait_for_after("P> ", a);
+        let cold = stdout_between(&sh, a, cold_prompt);
+        sh.finish();
 
-    let rig = SpareRig::new();
-    rig.rc(".zshrc", rc);
-    std::fs::write(rig.home.join("f"), "before").unwrap();
-    let mut host = rig.fifo();
-    let mut sh = rig.spawn(ShellType::Zsh, zsh);
-    let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
-    tell(&mut host, "run");
-    let spare = sh.wait_for_after(&signed_p("AtermStart=spare"), parked);
-    assert!(
-        sh.output()
-            .contains(&signed_p("AtermStartFlags=pre:1,s:0,j:0,r:0")),
-        "one hook ahead of aterm's\n{}",
-        sh.transcript()
-    );
-    std::fs::write(rig.home.join("f"), "after").unwrap();
-    tell(&mut host, "go");
-    let a = sh.wait_for_after("\x1b]133;A", spare);
-    let warm_prompt = sh.wait_for_after("P> ", a);
-    assert_eq!(
-        stdout_between(&sh, a, warm_prompt),
-        cold,
-        "the warm prompt's `$?` is the cold one's"
-    );
-    assert_eq!(
-        std::fs::read_to_string(rig.home.join("seen")).unwrap(),
-        "after",
-        "the hook ahead of aterm's re-ran after the release"
-    );
-    assert_eq!(
-        sh.stderr_text().matches("HOOKERR42").count() + sh.output().matches("HOOKERR42").count(),
-        1,
-        "the re-run is silenced\n{}",
-        sh.transcript()
-    );
-    sh.finish();
+        let rig = SpareRig::new();
+        rig.rc(".zshrc", &rc);
+        std::fs::write(rig.home.join("f"), "before").unwrap();
+        let mut host = rig.fifo();
+        let mut sh = rig.spawn(ShellType::Zsh, zsh);
+        let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
+        tell(&mut host, "run");
+        let spare = sh.wait_for_after(&signed_p("AtermStart=spare"), parked);
+        assert!(
+            sh.output()
+                .contains(&signed_p("AtermStartFlags=pre:1,s:0,j:0,r:0")),
+            "{ro} readonly: one hook ahead of aterm's\n{}",
+            sh.transcript()
+        );
+        std::fs::write(rig.home.join("f"), "after").unwrap();
+        tell(&mut host, "go");
+        let a = sh.wait_for_after("\x1b]133;A", spare);
+        let warm_prompt = sh.wait_for_after("P> ", a);
+        assert_eq!(
+            stdout_between(&sh, a, warm_prompt),
+            cold,
+            "{ro} readonly: the warm prompt's `$?` is the cold one's"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rig.home.join("seen")).unwrap(),
+            "after",
+            "{ro} readonly: the hook ahead of aterm's re-ran after the release"
+        );
+        assert_eq!(
+            sh.stderr_text().matches("HOOKERR42").count()
+                + sh.output().matches("HOOKERR42").count(),
+            1,
+            "{ro} readonly: the re-run is silenced\n{}",
+            sh.transcript()
+        );
+        sh.finish();
+    }
 
     // The flags: a pending `sched` event, a job and a periodic hook.
     let rig = SpareRig::new();
@@ -421,7 +564,7 @@ fn a_warm_zsh_first_prompt_reads_as_a_cold_one() {
 
 /// The history a shell holds and leaves, read back the same way for a cold tab
 /// and a warm one: the in-memory list with its event numbers, `$HISTCMD`, the
-/// prompt's `%!`, then the file after `exit`. Timestamps are blanked.
+/// prompt's `%!`, `$SAVEHIST`, then the file after `exit`. Timestamps are blanked.
 #[cfg(unix)]
 fn zsh_history_reading(rig: &SpareRig, warm: bool, append_during_hold: &str) -> String {
     let zsh = spare_zsh();
@@ -447,7 +590,9 @@ fn zsh_history_reading(rig: &SpareRig, warm: bool, append_during_hold: &str) -> 
     sh.wait_for_zle(at);
     let from = sh.output().len();
     // `DU""MP`: the listing quotes this line, and must not hold the marker.
-    sh.send("print -r -- \"DU\"\"MP $HISTCMD ${(%):-%!}\"; fc -l 1; print -r -- END$((40+2))");
+    sh.send(
+        "print -r -- \"DU\"\"MP $HISTCMD ${(%):-%!} $SAVEHIST\"; fc -l 1; print -r -- END$((40+2))",
+    );
     let end = sh.wait_for_after("END42", from);
     let dump_from = sh.output()[..end].rfind("DUMP ").expect("dump");
     let dump = stdout_between(&sh, dump_from, end);
@@ -469,10 +614,16 @@ fn zsh_history_reading(rig: &SpareRig, warm: bool, append_during_hold: &str) -> 
 }
 
 /// S3, zsh: the history a warm tab holds after its release is exactly a cold
-/// tab's, for 8 history options taken 0 to 3 at a time (93 combinations), with
-/// the file appended during the hold and left unchanged. The release reads the
-/// file again as a cold start reads it (`fc -p`), with the stale list pushed
-/// under at SAVEHIST 0, so it is never written back.
+/// tab's, for 8 history options set as the 16 words of the extended Hamming
+/// code (a strength-3 covering array: every three options take each of their
+/// eight on/off assignments in some rc, so a difference that any three options
+/// make between a warm and a cold tab is met), plus a zsh with no append option
+/// (it rewrites its file at exit) and SAVEHIST under HISTSIZE, and one whose rc
+/// unsets SAVEHIST (at 0: zsh goes on saving at an unset SAVEHIST's last value,
+/// which no parameter reads back), with the file
+/// appended during the hold and left unchanged. The release reads the file
+/// again as a cold start reads it (`fc -p`, the rc's sizes kept), with the
+/// stale list pushed under at SAVEHIST 0, so it is never written back.
 #[cfg(unix)]
 #[test]
 fn a_warm_zsh_holds_and_leaves_the_history_a_cold_one_does() {
@@ -488,17 +639,28 @@ fn a_warm_zsh_holds_and_leaves_the_history_a_cold_one_does() {
         "hist_expire_dups_first",
         "hist_find_no_dups",
     ];
-    let mut combos: Vec<Vec<&str>> = vec![Vec::new()];
-    for (i, a) in OPTS.iter().enumerate() {
-        combos.push(vec![*a]);
-        for (j, b) in OPTS.iter().enumerate().skip(i + 1) {
-            combos.push(vec![*a, *b]);
-            for c in OPTS.iter().skip(j + 1) {
-                combos.push(vec![*a, *b, *c]);
-            }
-        }
-    }
-    assert_eq!(combos.len(), 93);
+    // The extended Hamming code [8,4,4]: the XOR of any subset of these four
+    // words, bit `i` setting `OPTS[i]`. Its dual distance is 4, so any three bits
+    // run through all eight assignments over its 16 words.
+    const GENERATORS: [u8; 4] = [0b0000_1111, 0b0011_0011, 0b0101_0101, 0b1111_1111];
+    let words: Vec<u8> = (0..16u8)
+        .map(|k| {
+            (0..4)
+                .filter(|i| k & (1 << i) != 0)
+                .fold(0, |w, i| w ^ GENERATORS[i])
+        })
+        .collect();
+    let mut combos: Vec<String> = words
+        .iter()
+        .map(|w| {
+            (0..8)
+                .filter(|i| w & (1 << i) != 0)
+                .map(|i| format!("setopt {}\n", OPTS[i]))
+                .collect()
+        })
+        .collect();
+    combos.push("unsetopt append_history\nSAVEHIST=3\n".to_owned());
+    combos.push("SAVEHIST=0\nunset SAVEHIST\n".to_owned());
     let seed = ": 1700000000:0;echo one\n: 1700000001:0;echo two\n: 1700000002:0;echo two\n";
     let appended = ": 1700000003:0;echo three\n: 1700000004:0;echo one\n";
     let failures = std::sync::Mutex::new(Vec::new());
@@ -511,10 +673,7 @@ fn a_warm_zsh_holds_and_leaves_the_history_a_cold_one_does() {
                     let Some(opts) = combos.get(i) else { break };
                     for append in [appended, ""] {
                         let rc = format!(
-                            "HISTFILE=\"$HOME/hist\"\nHISTSIZE=50\nSAVEHIST=50\n{}PS1='P> '\n",
-                            opts.iter()
-                                .map(|o| format!("setopt {o}\n"))
-                                .collect::<String>()
+                            "HISTFILE=\"$HOME/hist\"\nHISTSIZE=50\nSAVEHIST=50\n{opts}PS1='P> '\n"
                         );
                         let warm_rig = SpareRig::new();
                         warm_rig.rc(".zshrc", &rc);
@@ -539,8 +698,9 @@ fn a_warm_zsh_holds_and_leaves_the_history_a_cold_one_does() {
     let failures = failures.into_inner().unwrap();
     assert!(
         failures.is_empty(),
-        "{} of 186 differ:\n{}",
+        "{} of {} differ:\n{}",
         failures.len(),
+        2 * combos.len(),
         failures.join("\n\n")
     );
 }
@@ -654,10 +814,18 @@ fn bash_history_reading(rig: &SpareRig, warm: bool, append_during_hold: &str) ->
     format!("{dump}\n--- file ---\n{blank}")
 }
 
-/// S4, bash: the same for four history knobs in all 16 combinations, plus a
-/// shell with HISTFILE unset. bash 3.2 has no fork-free stat, so the release
-/// always reads the list again (`history -c; history -r`), which is what a cold
-/// start reads from the same file.
+/// S4, bash: the same for four history knobs set as the eight masks of even
+/// weight (each knob is the parity of the other three, so every three knobs
+/// take all eight of their assignments, all four set and none among them), plus
+/// a shell with HISTFILE unset, one under `set -e` whose HISTFILE is a
+/// directory (bash's own load reads nothing and goes on; a release that read
+/// anything but a regular file would end the shell), one whose rc saved a
+/// line of its own (`history -s`: bash then reads no file at its start, and
+/// the release reads none either), and one under `set -e` whose history
+/// variables are readonly (a hardened /etc/profile: the release's assignments
+/// fail alone, and its first prompt is drawn). bash 3.2 has no fork-free stat,
+/// so the release always reads the list again (`history -c; history -r`),
+/// which is what a cold start reads from the same file.
 #[cfg(unix)]
 #[test]
 fn a_warm_bash_holds_and_leaves_the_history_a_cold_one_does() {
@@ -672,6 +840,7 @@ fn a_warm_bash_holds_and_leaves_the_history_a_cold_one_does() {
     let seed = "echo one\necho two\necho two\n";
     let appended = "echo three\necho one\n";
     let mut cases: Vec<String> = (0..16u32)
+        .filter(|mask| mask.count_ones() % 2 == 0)
         .map(|mask| {
             let knobs: String = (0..4)
                 .filter(|b| mask & (1 << b) != 0)
@@ -680,7 +849,16 @@ fn a_warm_bash_holds_and_leaves_the_history_a_cold_one_does() {
             format!("HISTFILE=\"$HOME/hist\"\nHISTSIZE=50\n{knobs}PS1='P> '\n")
         })
         .collect();
-    cases.push("unset HISTFILE\nPS1='P> '\n".to_owned());
+    cases.extend(
+        [
+            "unset HISTFILE\n",
+            "mkdir \"$HOME/hd\"\nHISTFILE=\"$HOME/hd\"\nset -e\n",
+            "HISTFILE=\"$HOME/hist\"\nHISTSIZE=50\nhistory -s 'echo rc'\n",
+            "HISTFILE=\"$HOME/hist\"\nHISTSIZE=50\nHISTFILESIZE=50\n\
+             readonly HISTFILE HISTSIZE HISTFILESIZE\nset -e\n",
+        ]
+        .map(|rc| format!("{rc}PS1='P> '\n")),
+    );
     let failures = std::sync::Mutex::new(Vec::new());
     let next = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {
@@ -713,8 +891,9 @@ fn a_warm_bash_holds_and_leaves_the_history_a_cold_one_does() {
     let failures = failures.into_inner().unwrap();
     assert!(
         failures.is_empty(),
-        "{} of 34 differ:\n{}",
+        "{} of {} differ:\n{}",
         failures.len(),
+        2 * cases.len(),
         failures.join("\n\n")
     );
 }
@@ -820,7 +999,10 @@ fn a_spare_hold_survives_sigwinch_and_only_go_releases_it() {
 }
 
 /// S6: a spare discarded at either hold writes no history (its HISTFILE is
-/// byte for byte what it was), and a shell whose FIFO is gone ends itself.
+/// byte for byte what it was, a line another tab appended during the hold
+/// included), for shells that would write at a hang-up: a zsh with no append
+/// option rewrites its file from its list, and a bash whose rc saved a line
+/// appends it. A shell whose FIFO is gone ends itself.
 #[cfg(unix)]
 #[test]
 fn a_discarded_spare_writes_no_history_and_ends_without_its_fifo() {
@@ -828,18 +1010,17 @@ fn a_discarded_spare_writes_no_history_and_ends_without_its_fifo() {
         let (rc_name, rc) = match shell {
             ShellType::Zsh => (
                 ".zshrc",
-                "HISTFILE=\"$HOME/hist\"\nHISTSIZE=50\nSAVEHIST=50\nsetopt inc_append_history\n",
+                "HISTFILE=\"$HOME/hist\"\nHISTSIZE=50\nSAVEHIST=50\nunsetopt append_history\n",
             ),
             _ => (
                 ".bashrc",
-                "HISTFILE=\"$HOME/hist\"\nHISTSIZE=50\nshopt -s histappend\n",
+                "HISTFILE=\"$HOME/hist\"\nHISTSIZE=50\nshopt -s histappend\nhistory -s 'echo rc'\n",
             ),
         };
-        let seed = "echo kept\n";
         for at_warm in [false, true] {
             let rig = SpareRig::new();
             rig.rc(rc_name, rc);
-            std::fs::write(rig.home.join("hist"), seed).unwrap();
+            std::fs::write(rig.home.join("hist"), "echo kept\n").unwrap();
             let mut host = rig.fifo();
             let mut sh = rig.spawn(shell, program);
             let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
@@ -847,12 +1028,20 @@ fn a_discarded_spare_writes_no_history_and_ends_without_its_fifo() {
                 tell(&mut host, "run");
                 sh.wait_for_after(&signed_p("AtermStart=spare"), parked);
             }
+            {
+                use std::io::Write as _;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(rig.home.join("hist"))
+                    .and_then(|mut f| f.write_all(b"echo other\n"))
+                    .expect("another tab's line");
+            }
             let pid = sh.shell_pid();
             signal("HUP", pid);
             sh.wait_exit();
             assert_eq!(
                 std::fs::read_to_string(rig.home.join("hist")).unwrap(),
-                seed,
+                "echo kept\necho other\n",
                 "{program}: a spare hung up at the {} hold writes no history",
                 if at_warm { "warm" } else { "parked" }
             );
@@ -940,5 +1129,401 @@ fn a_warm_spare_carries_seconds_on_from_its_rc_run() {
             );
         }
         sh.finish();
+    }
+}
+
+/// A fish and a pty: COULD NOT RUN where the host has either missing.
+#[cfg(unix)]
+fn spare_fish() -> &'static str {
+    let fish = need_fish();
+    need_pty_script();
+    fish
+}
+
+/// S1, fish: the WARM hold alone. fish reads no file of aterm's before its
+/// startup files, so with the FIFO present its config runs at once, unseen,
+/// then it signs `spare` and draws no prompt until `go`; what is typed
+/// meanwhile (unechoed: fish has the tty in its own mode) runs after the
+/// release. It never says it is parked, and signs
+/// one start record. Negative control: with no FIFO the same fish signs
+/// `cold` and draws its prompt at once.
+#[cfg(unix)]
+#[test]
+fn a_warm_fish_runs_its_startup_files_at_once_and_holds_its_first_prompt() {
+    let fish = spare_fish();
+    let rc_body = "touch \"$HOME/rc.ran\"\n";
+    let rig = SpareRig::new();
+    rig.fish_rc("config.fish", rc_body);
+    let mut sh = rig.spawn(ShellType::Fish, fish);
+    let start = sh.wait_for_after(&signed_p("AtermStart=cold"), 0);
+    sh.wait_for_after("\x1b]133;A", start);
+    assert!(rig.ran("rc.ran"), "fish: a cold shell runs its config");
+    sh.finish();
+
+    let rig = SpareRig::new();
+    rig.fish_rc("config.fish", rc_body);
+    let mut host = rig.fifo();
+    let mut sh = rig.spawn(ShellType::Fish, fish);
+    let spare = sh.wait_for_after(&signed_p("AtermStart=spare"), 0);
+    assert!(rig.ran("rc.ran"), "fish: a spare's config ran at once");
+    // fish has the tty in its own mode by now, so nothing echoes what is
+    // typed: it waits in the tty for the line editor.
+    sh.send("echo TYPED(math 40 + 2)");
+    assert!(
+        !sh.output().contains("\x1b]133;A"),
+        "fish: no prompt while held\n{}",
+        sh.transcript()
+    );
+    tell(&mut host, "go");
+    let prompt = sh.wait_for_after("\x1b]133;A", spare);
+    sh.wait_for_after("TYPED42", prompt);
+    let out = sh.output();
+    assert!(
+        out.matches("AtermStart=").count() == 1 && !out.contains("AtermSpare="),
+        "fish: one start record, and never parked\n{}",
+        sh.transcript()
+    );
+    sh.finish();
+}
+
+/// One fish's first prompt as the test reads it: the `$status` its prompt
+/// function was handed, the start record's flags, and what a prompt-event
+/// handler defined ahead of aterm's (a conf.d snippet sourced first) read when
+/// it last ran. Warm: held, `state` rewritten, then released.
+#[cfg(unix)]
+fn fish_first_prompt(fish: &str, warm: bool) -> (String, String, String) {
+    let rig = SpareRig::new();
+    rig.fish_rc(
+        "config.fish",
+        "function fish_prompt; printf 'ST=%s> ' $status; end\nfalse\n",
+    );
+    rig.fish_rc(
+        "conf.d/00-ahead.fish",
+        "function __ahead --on-event fish_prompt; cat $HOME/state >$HOME/seen; end\n",
+    );
+    // What the file holds when the shell starts: a warm one is released into
+    // "after", as a cold one starts into it.
+    rig.rc("state", if warm { "before\n" } else { "after\n" });
+    let mut host = warm.then(|| rig.fifo());
+    let mut sh = rig.spawn(ShellType::Fish, fish);
+    let start = sh.wait_for_after(
+        &signed_p(&format!(
+            "AtermStart={}",
+            if warm { "spare" } else { "cold" }
+        )),
+        0,
+    );
+    if let Some(host) = host.as_mut() {
+        rig.rc("state", "after\n");
+        tell(host, "go");
+    }
+    let prompt = sh.wait_for_after("ST=", start);
+    let status_end = sh.wait_for_after("> ", prompt);
+    let status = sh
+        .value_before("ST=", status_end)
+        .trim_end_matches("> ")
+        .to_owned();
+    let flags = stdout_between(&sh, 0, start)
+        .rsplit("AtermStartFlags=")
+        .next()
+        .and_then(|f| f.split(';').next())
+        .unwrap_or_default()
+        .to_owned();
+    // The markers are computed, so the echoed lines never match them.
+    sh.send("echo SEEN(math 40 + 2)=(cat $HOME/seen)");
+    let end = sh.wait_for_after("SEEN42=", prompt);
+    let seen_end = sh.wait_for_after("\n", end);
+    let seen = sh.value_before("SEEN42=", seen_end);
+    sh.finish();
+    (status, flags, seen)
+}
+
+/// S2, fish: a warm tab's first prompt reads as a cold tab's. Its prompt is
+/// handed the `$status` a cold one's is (a config ending in `false`), and a
+/// prompt-event handler defined ahead of aterm's (`pre:1` in the flags) runs
+/// again at the release, so what it read is what the file held then, not at
+/// the spawn. The cold shell, started into what the warm one is released
+/// into, is the reading the warm one must give; without the re-run the warm
+/// one read `before` (the negative control, run by hand).
+#[cfg(unix)]
+#[test]
+fn a_warm_fish_first_prompt_reads_as_a_cold_one() {
+    let fish = spare_fish();
+    let cold = fish_first_prompt(fish, false);
+    let warm = fish_first_prompt(fish, true);
+    assert_eq!(
+        cold.1, "pre:1,s:0,j:0,r:0",
+        "fish: the flags name the one handler ahead of aterm's"
+    );
+    assert_eq!(warm, cold, "fish: (status, flags, the handler's reading)");
+
+    // The flags: a job the config left running.
+    let rig = SpareRig::new();
+    rig.fish_rc("config.fish", "sleep 600 &\n");
+    let _host = rig.fifo();
+    let mut sh = rig.spawn(ShellType::Fish, fish);
+    sh.wait_for_after(&signed_p("AtermStart=spare"), 0);
+    assert!(
+        sh.output()
+            .contains(&signed_p("AtermStartFlags=pre:0,s:0,j:1,r:0")),
+        "fish: the job is counted\n{}",
+        sh.transcript()
+    );
+    sh.kill_now();
+}
+
+/// The prompt-event handlers a fish start record counts as ahead of aterm's
+/// (`pre:`), and a warm spare runs again at its release: the user's, defined
+/// before the integration loaded, in their order — not one named `__aterm_*`,
+/// not one defined after aterm's — and none where aterm's is the first left
+/// (fish's own first-prompt handler and aterm's two erase themselves before
+/// aterm's runs, so the test erases them as that prompt would have).
+#[cfg(unix)]
+#[test]
+fn a_fish_counts_the_prompt_handlers_defined_ahead_of_aterms_alone() {
+    let fish = need_fish();
+    let script = format!(
+        "{}/src/scripts/aterm_shell_integration.fish",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let output = shell_command(fish)
+        .arg("-i")
+        .arg("-c")
+        .arg(
+            "functions -e __fish_on_interactive; \
+             function __user_a --on-event fish_prompt; end; \
+             function __aterm_mine --on-event fish_prompt; end; \
+             function __user_b --on-event fish_prompt; end; \
+             source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; \
+             function __user_after --on-event fish_prompt; end; \
+             functions -e __aterm_reroute_first_prompt __aterm_prompt_wrap_first; \
+             printf 'AHEAD=%s;' (__aterm_prompt_handlers_ahead); \
+             functions -e __user_a __aterm_mine __user_b; \
+             printf 'NONE=%s;' (__aterm_prompt_handlers_ahead)",
+        )
+        .env("ATERM_TEST_SCRIPT", &script)
+        .output()
+        .expect("spawn fish");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "AHEAD=__user_a;AHEAD=__user_b;NONE=;",
+        "fish: the handlers ahead of aterm's; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A fish start record names the config folder as 633;E escapes a command
+/// line: a folder with nothing to escape as it is, and one holding any one of
+/// the reserved bytes (a space, `;`, a backslash, a tab) escaped. It is written
+/// to the shell's stdout, where every other mark of fish's goes (not /dev/tty,
+/// which this test's fish has none of).
+#[cfg(unix)]
+#[test]
+fn a_fish_start_record_names_its_config_folder_escaped_on_stdout() {
+    let fish = need_fish();
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    for name in ["plain-1.~", "my cfg", "a;b", "back\\slash", "tab\there"] {
+        let config = root.path().join(name);
+        std::fs::create_dir_all(config.join("fish")).expect("config dir");
+        let folder = format!("{}/fish", config.to_str().expect("a UTF-8 temp path"));
+        let rc = String::from_utf8(osc633_encode(&folder)).expect("UTF-8 in, UTF-8 out");
+        assert_eq!(
+            run_fish_integration(
+                fish,
+                &[(
+                    "XDG_CONFIG_HOME",
+                    config.to_str().expect("a UTF-8 temp path")
+                )],
+                // fish's own first-prompt handler, which erases itself before
+                // aterm's runs at a real first prompt; and the startup roots
+                // (fish 4 names them even to a copy sourced by hand), which
+                // are the next test's.
+                "functions -e __fish_on_interactive; set -e __aterm_start_roots; \
+                 __aterm_start_mark cold",
+            ),
+            format!(
+                "\x1b]633;P;AtermStartRc={rc}\x07\x1b]633;P;AtermStartFlags=pre:0,s:0,j:0,r:0\x07\
+                 \x1b]633;P;AtermStart=cold\x07"
+            ),
+            "fish: the start record for {folder:?}"
+        );
+    }
+}
+
+/// R7: a fish start record names the startup roots fish's own conf.d loop
+/// walks — its sysconf folder, then every vendor conf.d folder, among them the
+/// one an inherited `$XDG_DATA_DIRS` entry adds, which aterm's script is read
+/// from — joined by `\x00`, ahead of the rc folder: folders holding a space
+/// (left as it is) and a `;` (escaped as the rc folder's is, all at once), and
+/// a folder holding a tab (each through the 633 E encoder, which escapes the
+/// space too: the host decodes both alike). The oracle is fish itself:
+/// a user conf.d snippet, sourced by the same loop ahead of aterm's, writes
+/// down the list that loop walks (fish 4's global one, fish 3's local one).
+/// Negative control: the script before the record named its roots wrote none.
+#[cfg(unix)]
+#[test]
+fn a_fish_start_record_names_the_roots_its_conf_d_loop_walks() {
+    let fish = need_fish();
+    for name in ["x d;s", "tab\there"] {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let inherited = root.path().join(name);
+        let vendor = inherited.join("fish").join("vendor_conf.d");
+        std::fs::create_dir_all(&vendor).expect("vendor conf.d");
+        std::fs::copy(
+            format!(
+                "{}/src/scripts/aterm_shell_integration.fish",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            vendor.join("aterm_shell_integration.fish"),
+        )
+        .expect("the script in a vendor conf.d");
+        let mut cmd = shell_command(fish);
+        let home = cmd.home().to_path_buf();
+        std::fs::write(
+            home.join("config/fish/conf.d/00-probe.fish"),
+            "string join \\n -- \"$__fish_sysconf_dir\" $__fish_vendor_confdirs $vendor_confdirs \
+             >$HOME/walked\n",
+        )
+        .expect("the probe");
+        let output = cmd
+            .arg("-i")
+            .arg("-c")
+            .arg("functions -e __fish_on_interactive; __aterm_start_mark cold")
+            .env(
+                "XDG_DATA_DIRS",
+                format!("{}:{}", inherited.display(), home.join("data").display()),
+            )
+            .output()
+            .expect("spawn fish");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let walked = std::fs::read_to_string(home.join("walked")).expect("the loop's own list");
+        let walked: Vec<&str> = walked.lines().collect();
+        assert!(
+            walked.contains(&vendor.to_str().expect("a UTF-8 temp path")),
+            "fish: the inherited folder is walked: {walked:?}"
+        );
+        // A space escaped only where the encoder ran (a folder list holding a
+        // control byte); these folders hold no backslash, so `\x20` is a space.
+        let encoded = |folder: &&str| {
+            let one = String::from_utf8(osc633_encode(folder)).expect("UTF-8 in, UTF-8 out");
+            if name.contains('\t') {
+                one
+            } else {
+                one.replace("\\x20", " ")
+            }
+        };
+        let roots = walked.iter().map(encoded).collect::<Vec<_>>().join("\\x00");
+        assert!(
+            stdout.contains(&format!(
+                "\x1b]633;P;AtermStartRoots={roots}\x07\x1b]633;P;AtermStartRc="
+            )),
+            "fish: the roots its loop walked, {walked:?}, ahead of the rc folder\n{stdout:?}\n\
+             stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// The `history` a fish holds at its first prompt, cold or warm: `rc_reads`,
+/// its config reads the history at the start (so a warm one holds the file as
+/// it was then); `appended`, another session adds two commands after the
+/// start (during the hold, or before a cold start); `named`, the config names
+/// its own history session (`fish_history`).
+#[cfg(unix)]
+fn fish_history_reading(
+    fish: &str,
+    warm: bool,
+    rc_reads: bool,
+    appended: bool,
+    named: bool,
+) -> String {
+    let rig = SpareRig::new();
+    let name = if named { "aterm_s3" } else { "fish" };
+    let mut config = String::new();
+    if named {
+        config.push_str("set -g fish_history aterm_s3\n");
+    }
+    if rc_reads {
+        config.push_str("history search --max 1 >/dev/null\n");
+    }
+    rig.fish_rc("config.fish", &config);
+    let data = rig.home.join(".local").join("share").join("fish");
+    std::fs::create_dir_all(&data).expect("fish data dir");
+    let file = data.join(format!("{name}_history"));
+    let entry = |cmd: &str, when: u64| format!("- cmd: {cmd}\n  when: {when}\n");
+    std::fs::write(
+        &file,
+        format!(
+            "{}{}",
+            entry("echo one", 1_700_000_001),
+            entry("echo two", 1_700_000_002)
+        ),
+    )
+    .expect("history");
+    let append = || {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .expect("history");
+        f.write_all(
+            format!(
+                "{}{}",
+                entry("echo three", 1_700_000_003),
+                entry("echo four", 1_700_000_004)
+            )
+            .as_bytes(),
+        )
+        .expect("append");
+    };
+    let mut host = warm.then(|| rig.fifo());
+    if appended && !warm {
+        append();
+    }
+    let mut sh = rig.spawn(ShellType::Fish, fish);
+    let kind = if warm { "spare" } else { "cold" };
+    let start = sh.wait_for_after(&signed_p(&format!("AtermStart={kind}")), 0);
+    if let Some(host) = host.as_mut() {
+        if appended {
+            append();
+        }
+        tell(host, "go");
+    }
+    let prompt = sh.wait_for_after("\x1b]133;A", start);
+    // A leading space keeps the line out of the history it reads.
+    sh.send(" echo HIST(math 40 + 2)=(history | string join ,)");
+    let at = sh.wait_for_after("HIST42=", prompt);
+    let reading_end = sh.wait_for_after("\n", at);
+    let reading = sh.value_before("HIST42=", reading_end);
+    sh.finish();
+    reading
+}
+
+/// S3, fish: the history a warm tab holds after its release is a cold tab's,
+/// over the matrix of a config that reads the history at its start or not,
+/// commands another session adds during the hold or not, and the default
+/// history session or one the config names: the release takes in what
+/// arrived (`history merge`), a history nothing read yet is read afresh at
+/// first use, as a cold start reads it. The cold reading is the control each
+/// warm one must match.
+#[cfg(unix)]
+#[test]
+fn a_warm_fish_holds_the_history_a_cold_one_does() {
+    let fish = spare_fish();
+    for rc_reads in [false, true] {
+        for appended in [false, true] {
+            for named in [false, true] {
+                let cold = fish_history_reading(fish, false, rc_reads, appended, named);
+                let warm = fish_history_reading(fish, true, rc_reads, appended, named);
+                assert!(
+                    cold.contains("echo two"),
+                    "fish: the control read the file ({cold:?})"
+                );
+                assert_eq!(
+                    warm, cold,
+                    "fish: rc_reads={rc_reads} appended={appended} named={named}"
+                );
+            }
+        }
     }
 }

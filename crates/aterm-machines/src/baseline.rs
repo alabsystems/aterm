@@ -86,6 +86,95 @@ pub fn parse(text: &str) -> Result<Baseline, String> {
     Ok(baseline)
 }
 
+/// The tables a baseline may hold (`names`, `power`, `app`, …), by the names the file spells
+/// them: [`Baseline`]'s own fields as serde reads them, less `schema` and `users`, so a table
+/// a family adds is known here with no second list to keep.
+#[must_use]
+pub fn tables() -> Vec<&'static str> {
+    use serde::de::{self, Visitor};
+
+    /// A deserializer that answers nothing and notes the fields a struct asks for.
+    struct Fields(&'static [&'static str]);
+
+    impl<'de> de::Deserializer<'de> for &mut Fields {
+        type Error = de::value::Error;
+
+        fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
+            Err(de::Error::custom("only the field names are read"))
+        }
+
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _: &'static str,
+            fields: &'static [&'static str],
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            self.0 = fields;
+            Err(de::Error::custom("only the field names are read"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+            byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map enum
+            identifier ignored_any
+        }
+    }
+
+    let mut fields = Fields(&[]);
+    let _ = Baseline::deserialize(&mut fields);
+    fields
+        .0
+        .iter()
+        .copied()
+        .filter(|f| !matches!(*f, "schema" | "users"))
+        .collect()
+}
+
+/// Check `--only`'s table names against [`tables`].
+///
+/// # Errors
+/// One line naming the unknown table and every known one.
+pub fn check_only(only: &[String]) -> Result<(), String> {
+    let known = tables();
+    if only.is_empty() {
+        return Err(format!(
+            "--only takes table names, comma-separated: {}",
+            known.join(", ")
+        ));
+    }
+    match only.iter().find(|t| !known.contains(&t.as_str())) {
+        Some(unknown) => Err(format!(
+            "--only: no baseline table is named {unknown:?}; the tables are {}",
+            known.join(", ")
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The baseline document `text` with only `schema`, `users` and the tables `only` names: what
+/// `plan|apply --only` sends, so the agent runs those tables' items and no others. Empty
+/// `only` leaves the document whole.
+///
+/// # Errors
+/// The parser's message.
+pub fn keep_only(text: &str, only: &[String]) -> Result<String, String> {
+    if only.is_empty() {
+        return Ok(text.to_owned());
+    }
+    let mut doc: aterm_toml::Value =
+        aterm_toml::from_str(text).map_err(|e| format!("baseline: {e}"))?;
+    let Some(table) = doc.as_table_mut() else {
+        return Err("baseline: not a table".into());
+    };
+    let keys: Vec<String> = table.keys().cloned().collect();
+    for key in keys {
+        if !matches!(key.as_str(), "schema" | "users") && !only.contains(&key) {
+            table.remove(&key);
+        }
+    }
+    aterm_toml::to_string(&doc).map_err(|e| format!("baseline: {e}"))
+}
+
 /// Fill `{key}` placeholders in every string of a baseline document from `vars`, and
 /// return the document re-serialized. A placeholder `vars` does not name is left alone,
 /// so per-user placeholders (`{user}`) survive for the items to fill.
@@ -144,6 +233,45 @@ mod tests {
     fn an_unknown_table_is_refused_rather_than_ignored() {
         let err = parse("schema = 1\n[powr]\nsleep = 0\n").unwrap_err();
         assert!(err.contains("powr"), "{err}");
+    }
+
+    #[test]
+    fn the_tables_are_the_baselines_own_fields_as_the_file_spells_them() {
+        let known = tables();
+        for table in [
+            "names", "power", "consumer", "defaults", "app", "aterm", "person",
+        ] {
+            assert!(known.contains(&table), "{table}: {known:?}");
+        }
+        assert!(
+            !known.contains(&"schema") && !known.contains(&"users"),
+            "{known:?}"
+        );
+        assert!(!known.contains(&"apps"), "the file spells it [[app]]");
+        check_only(&["names".into(), "app".into()]).unwrap();
+        let err = check_only(&["name".into()]).unwrap_err();
+        assert!(
+            err.contains("\"name\"") && err.contains("names, sharing"),
+            "{err}"
+        );
+        assert!(check_only(&[]).is_err());
+    }
+
+    #[test]
+    fn only_the_named_tables_and_the_users_stay() {
+        let starter = crate::controller::templates::DEFAULT_BASELINE;
+        let kept = parse(&keep_only(starter, &["names".into()]).unwrap()).unwrap();
+        assert!(kept.names.is_some());
+        assert!(kept.power.is_none() && kept.keyboard.is_none() && kept.apps.is_empty());
+        assert!(kept.homebrew.is_none() && kept.developer.is_none() && kept.aterm.is_none());
+        let both = parse(&keep_only(starter, &["names".into(), "app".into()]).unwrap()).unwrap();
+        assert!(both.names.is_some() && both.apps.len() == 3 && both.power.is_none());
+        let text = "schema = 1\nusers = [\"admin\"]\n[names]\ncomputer_name = \"x\"\n\
+                    [power.ac]\nsleep = 0\n";
+        let kept = parse(&keep_only(text, &["power".into()]).unwrap()).unwrap();
+        assert_eq!(kept.users, ["admin"]);
+        assert!(kept.names.is_none() && kept.power.is_some());
+        assert_eq!(keep_only(text, &[]).unwrap(), text);
     }
 
     #[test]

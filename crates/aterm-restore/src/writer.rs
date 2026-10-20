@@ -563,7 +563,7 @@ impl<S: RegionStore> JournalWriter<S> {
             action = "Slice",
             reason = "the engine's step, not the journal's: W's parse thread runs \
                       `Terminal::process` (aterm-core) on the slice before this append, \
-                      which is `Commit`; Tier-1 (conformance_region_tests.rs) runs the real \
+                      which is `Commit`; Tier-1 (conformance_region.rs) runs the real \
                       `Terminal::process` for it and projects the units the engine shows"
         )
     )]

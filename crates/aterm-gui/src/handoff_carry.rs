@@ -11,9 +11,9 @@
 //! Measured 2026-09-14, live: after the 0.84 → 0.85 handoff a worker's
 //! `history` was empty, `offscreen` restarted at a new origin (`epoch=2`), and
 //! the first rows the new archive kept were the composer's rule and footer.
-//! A manager's `aterm drive report` could not find the turn it had just
-//! driven: the ledger and the archive were memory of a process that had
-//! exited. (The composer half is `aterm-core`'s, fixed on the receiving side.)
+//! A manager's `aterm drive report` (since removed) could not find the turn
+//! it had just driven: the ledger and the archive were memory of a process
+//! that had exited. (The composer half is `aterm-core`'s, fixed on the receiving side.)
 //!
 //! # Shape
 //!
@@ -24,7 +24,8 @@
 //! * The handoff WORKER, readers still parked, runs [`export`] just before
 //!   `seamless::write_outgoing`: it clones the ledger, picks the archive's
 //!   tail — the rows after the earliest mark among the newest [`TAIL_TURNS`]
-//!   submitted turns (what `aterm drive report` reads back), and never fewer
+//!   submitted turns (what a reader of `history` and `offscreen since=` reads
+//!   back), and never fewer
 //!   than the rows the differ may still point back at (`aterm-core` widens it
 //!   to its reach) — and attaches at most [`CARRY_ARCHIVE_BYTES`] of them
 //!   while the fence still holds, with the differ's state when the freeze had
@@ -88,7 +89,7 @@ use aterm_core::terminal::{
     AltArchiveCarry, AltArchiveDiffer, AltArchiveGap, AltArchiveGapKind, AltArchiveImport, Terminal,
 };
 
-use crate::turn_ledger::{ArchMark, TurnLedger, TurnRecord};
+use crate::turn_ledger::{ArchMark, TurnBy, TurnLedger, TurnRecord};
 
 /// The most archived rows one session carries, charged as the live archive
 /// charges them (text plus 32 bytes a row). The newest rows win.
@@ -106,8 +107,8 @@ pub(crate) const MAX_SIDECAR_BYTES: u64 = 4 * 1024 * 1024;
 /// session its oldest, the longest ledgers alike ([`export`]).
 pub(crate) const MAX_AGGREGATE_BYTES: u64 = 16 * 1024 * 1024;
 /// How many of the newest SUBMITTED turns' marks the carried tail reaches back
-/// to: `aterm drive report` reads `history 8` and starts from the newest
-/// submitted turn among them.
+/// to: a reader of `history 8` that reads on from the newest submitted turn's
+/// `arch=` mark (`offscreen since=`) finds its rows.
 #[cfg(any(unix, test))]
 pub(crate) const TAIL_TURNS: usize = 8;
 /// The sidecar's layout version. Unknown fields are skipped and missing ones
@@ -136,9 +137,9 @@ const LOG_LOCK_PATIENCE: Duration = Duration::from_millis(20);
 /// The most session-log DETAIL (past each log's skeleton) one handoff
 /// carries across every session. Both ends of it are inside the freeze: the
 /// export encodes it on the worker while every reader is parked, and the
-/// receiver decodes it before the reader starts. Set from
-/// `handoff_carry_tests::measure_log_carry_freeze` and aterm-slog's
-/// `measure_carry_encode_and_decode` (2026-10-16, owner Mac): a full 128 KiB
+/// receiver decodes it before the reader starts. Set from a one-off measure of
+/// this export and its decode at 1-128 sessions and of aterm-slog's carry
+/// encode and decode (2026-10-16, owner Mac): a full 128 KiB
 /// log's cut and encode take 0.71 ms and its `Log::from_carry` 0.77 ms in
 /// release (3.5 and 3.6 ms in debug), so this cap, about sixteen full logs,
 /// is on the order of 12 ms of each end at worst in a shipped build. Every
@@ -181,7 +182,7 @@ impl CarrySource {
     }
 
     /// Whether the differ's state may travel with this session.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn carries_differ(&self) -> bool {
         self.keep_differ
     }
@@ -190,6 +191,7 @@ impl CarrySource {
     /// carried as the program drew it (`CarryRung::keeps_differ_state`), so
     /// that state describes nothing the successor shows. The ledger and the
     /// archive's rows still travel.
+    #[cfg(unix)]
     pub(crate) fn without_differ(&mut self) {
         self.head.differ = None;
         self.keep_differ = false;
@@ -276,8 +278,8 @@ impl StatusWords {
     /// `status` in these words. A build from before `hangup` has no word for a
     /// turn whose caller hung up during its settle (that build never recorded
     /// one); its nearest is `timeout`, a settle nobody saw end. The record —
-    /// submitted, its text, its archive mark — is what `aterm drive report`
-    /// anchors on, and that crosses whole.
+    /// submitted, its text, its archive mark — is what a reader of `history`
+    /// and `offscreen since=` anchors on, and that crosses whole.
     fn spell(self, status: &'static str) -> &'static str {
         match (self, status) {
             (Self::PreHangup, "hangup") => "timeout",
@@ -365,7 +367,7 @@ pub(crate) fn export(sources: &[CarrySource], turn_id_ceiling: u64) -> Vec<(u64,
 ///
 /// THE AGGREGATE IS SPENT BY PRIORITY, not first come, first served (round
 /// seven, finding 37): every session's CORE — its ledger and the archive's
-/// counters, what `aterm drive report`, `history` and a resumed `since-turn=`
+/// counters, what `history`, `offscreen since=` and a resumed `since-turn=`
 /// stand on — is set aside first, and the differ's state and the archive's
 /// rows share what is left, in pool order. Spent greedily, a crowded desk's
 /// first sessions carried their optional rows and its last ones lost their
@@ -525,7 +527,7 @@ pub(crate) fn export_noting(
         // A ledger another thread keeps is carried as NOTHING it vouches for:
         // every turn id this process minted, or still mints, may name a
         // record of it. SAID, as every other carry loss is.
-        let (turns, unheld_below) = match patiently(patience, || source.turns.try_lock()) {
+        let (turns, floors) = match patiently(patience, || source.turns.try_lock()) {
             // A turn still open here records into THIS process after the
             // export: the carry does not vouch for the id it lands under.
             // Each record in the receiver's words.
@@ -538,11 +540,20 @@ pub(crate) fn export_noting(
                         record
                     })
                     .collect(),
-                ledger.carry_floor(turn_id_ceiling),
+                Floors {
+                    unheld_below: ledger.carry_floor(turn_id_ceiling),
+                    shed_below: ledger.shed_below(),
+                },
             ),
             None => {
                 noted(source.local_id, CarryLoss::LedgerBusy { unvouched });
-                (Vec::new(), unvouched)
+                (
+                    Vec::new(),
+                    Floors {
+                        unheld_below: unvouched,
+                        shed_below: 0,
+                    },
+                )
             }
         };
         let mut archive = source.head.clone();
@@ -568,8 +579,8 @@ pub(crate) fn export_noting(
         } else {
             noted(source.local_id, CarryLoss::TerminalBusy);
         }
-        let core = core_len(&turns, unheld_below, &archive);
-        taken.push((source.local_id, turns, unheld_below, archive, core));
+        let core = core_len(&turns, floors, &archive);
+        taken.push((source.local_id, turns, floors, archive, core));
     }
     // THE LOG PASS, after every ledger and terminal, with its own patience:
     // each timeline's take (its snapshot and producers' lines, its readers
@@ -629,10 +640,17 @@ pub(crate) fn export_noting(
     if logs {
         crate::session_log_journal::note_handing();
     }
+    // Mirror cursors are mandatory metadata: reserve their bounded members
+    // before any core, archive row, log skeleton or detail spends the cap.
+    let mirror_reserved = log_priors
+        .iter()
+        .flatten()
+        .fold(0_u64, |sum, _| sum.saturating_add(MIRROR_MEMBER_MAX));
+    let control_budget = MAX_AGGREGATE_BYTES.saturating_sub(mirror_reserved);
     let cores: Vec<u64> = taken.iter().map(|(.., core)| *core).collect();
-    let shares = core_shares(&cores, MAX_AGGREGATE_BYTES);
+    let shares = core_shares(&cores, control_budget);
     // The log skeletons from what the cores left, before any archive row.
-    let after_cores = MAX_AGGREGATE_BYTES.saturating_sub(shares.iter().sum());
+    let after_cores = control_budget.saturating_sub(shares.iter().sum());
     let skeletons: Vec<u64> = log_takes
         .iter()
         .map(|t| t.as_ref().map_or(0, |t| t.skeleton_json))
@@ -650,17 +668,23 @@ pub(crate) fn export_noting(
     // source's (`log_takes` is in source order).
     let mut chosen: Vec<(usize, u64, Vec<TurnRecord>, Chosen, u64)> =
         Vec::with_capacity(taken.len());
-    for (index, (((local_id, turns, unheld_below, archive, _), share), skeleton)) in taken
+    for (index, (((local_id, turns, floors, archive, _), share), skeleton)) in taken
         .into_iter()
         .zip(shares)
         .zip(&skeleton_grants)
         .enumerate()
     {
+        let member = if log_priors[index].is_some() {
+            MIRROR_MEMBER_MAX
+        } else {
+            0
+        };
         let room = MAX_SIDECAR_BYTES
+            .saturating_sub(member)
             .saturating_sub(*skeleton)
             .min(share.saturating_add(spare))
-            .min(MAX_AGGREGATE_BYTES.saturating_sub(total));
-        if let Some((pick, shed)) = encode_within(&turns, unheld_below, archive, room) {
+            .min(control_budget.saturating_sub(total));
+        if let Some((pick, shed)) = encode_within(&turns, floors, archive, room) {
             let len = pick.bytes.len() as u64;
             total = total.saturating_add(len);
             spare = spare.saturating_sub(len.saturating_sub(share));
@@ -682,7 +706,7 @@ pub(crate) fn export_noting(
     // THE LOG DETAIL shares what the rows left, capped (the receiver decodes
     // it inside the freeze), and each session's sidecar is written once.
     let reserved: u64 = chosen.iter().map(|(.., skeleton)| *skeleton).sum();
-    let detail_budget = MAX_AGGREGATE_BYTES
+    let detail_budget = control_budget
         .saturating_sub(total)
         .saturating_sub(reserved)
         .min(MAX_AGGREGATE_LOG_DETAIL);
@@ -699,7 +723,7 @@ pub(crate) fn export_noting(
     {
         let take = log_takes[index].as_ref().filter(|_| skeleton > 0);
         let prior = log_priors[index];
-        // The mirror's member is room kept back from the log's.
+        // Its member was reserved before the core and log allocations.
         let member = if prior.is_some() {
             MIRROR_MEMBER_MAX
         } else {
@@ -708,8 +732,8 @@ pub(crate) fn export_noting(
         let bytes = take
             .and_then(|t| {
                 let room = MAX_SIDECAR_BYTES
-                    .min(pick.bytes.len() as u64 + skeleton + detail)
-                    .saturating_sub(member);
+                    .saturating_sub(member)
+                    .min(pick.bytes.len() as u64 + skeleton + detail);
                 with_log(&turns, &pick, t, skeleton + detail, room)
             })
             .unwrap_or_else(|| {
@@ -757,7 +781,7 @@ fn with_log(
 ) -> Option<Vec<u8>> {
     let sidecar = |lines: &[String]| -> Option<Vec<u8>> {
         with_log_member(&pick.bytes, lines)
-            .or_else(|| encode_wire(&turns[pick.cut..], pick.floor, &pick.archive, lines))
+            .or_else(|| encode_wire(&turns[pick.cut..], pick.floors, &pick.archive, lines))
     };
     let fits = |b: &Vec<u8>| b.len() as u64 <= room;
     if log_json <= take.skeleton_json {
@@ -811,10 +835,10 @@ fn core_shares(cores: &[u64], budget: u64) -> Vec<u64> {
 /// counters, without rows or the differ's state — as [`export`] sets it aside
 /// (never more than one sidecar may hold: a ledger past that is shed anyway).
 #[cfg(any(unix, test))]
-fn core_len(turns: &[TurnRecord], unheld_below: u64, archive: &AltArchiveCarry) -> u64 {
+fn core_len(turns: &[TurnRecord], floors: Floors, archive: &AltArchiveCarry) -> u64 {
     let mut core = counters_only(archive.clone());
     core.differ = None;
-    encode(turns, unheld_below, &core).map_or(MAX_SIDECAR_BYTES, |bytes| {
+    encode(turns, floors, &core).map_or(MAX_SIDECAR_BYTES, |bytes| {
         (bytes.len() as u64).min(MAX_SIDECAR_BYTES)
     })
 }
@@ -896,12 +920,12 @@ fn patiently<G>(
 }
 
 /// What [`encode_within`] chose: the ledger's cut (its first record carried
-/// and the floor below which the carry vouches for no id), the archive as it
+/// and the floors below which the carry vouches for no id), the archive as it
 /// crosses, and the sidecar those encode to.
 #[cfg(any(unix, test))]
 struct Chosen {
     cut: usize,
-    floor: u64,
+    floors: Floors,
     archive: AltArchiveCarry,
     bytes: Vec<u8>,
 }
@@ -917,17 +941,17 @@ struct Chosen {
 #[cfg(any(unix, test))]
 fn encode_within(
     turns: &[TurnRecord],
-    unheld_below: u64,
+    floors: Floors,
     archive: AltArchiveCarry,
     room: u64,
 ) -> Option<(Chosen, usize)> {
     let fits = |b: &Vec<u8>| b.len() as u64 <= room;
     let mut archive = archive;
-    if let Some(bytes) = encode(turns, unheld_below, &archive).filter(fits) {
+    if let Some(bytes) = encode(turns, floors, &archive).filter(fits) {
         return Some((
             Chosen {
                 cut: 0,
-                floor: unheld_below,
+                floors,
                 archive,
                 bytes,
             },
@@ -935,11 +959,11 @@ fn encode_within(
         ));
     }
     archive = counters_only(archive);
-    if let Some(bytes) = encode(turns, unheld_below, &archive).filter(fits) {
+    if let Some(bytes) = encode(turns, floors, &archive).filter(fits) {
         return Some((
             Chosen {
                 cut: 0,
-                floor: unheld_below,
+                floors,
                 archive,
                 bytes,
             },
@@ -950,17 +974,23 @@ fn encode_within(
     let mut lens: Option<Vec<u64>> = None;
     let mut cut = 0_usize;
     loop {
-        let floor = cut
+        let unheld_below = cut
             .checked_sub(1)
             .and_then(|newest_shed| turns.get(newest_shed))
-            .map_or(unheld_below, |t| unheld_below.max(t.id.saturating_add(1)));
-        let bytes = encode(&turns[cut..], floor, &archive)?;
+            .map_or(floors.unheld_below, |t| {
+                floors.unheld_below.max(t.id.saturating_add(1))
+            });
+        let floors = Floors {
+            unheld_below,
+            ..floors
+        };
+        let bytes = encode(&turns[cut..], floors, &archive)?;
         let over = (bytes.len() as u64).saturating_sub(room);
         if over == 0 {
             return Some((
                 Chosen {
                     cut,
-                    floor,
+                    floors,
                     archive,
                     bytes,
                 },
@@ -1011,6 +1041,13 @@ struct Wire {
     /// Turn ids below this may have named records `turns` does not hold (a
     /// ledger that could not be carried whole); 0: none.
     unheld_below: u64,
+    /// Turn ids below this may have named a harness record the sender's
+    /// ring evicted from inside (`TurnLedger::shed_below`); 0: none, and
+    /// then absent, so a ledger that shed nothing carries the bytes it did
+    /// before the field. An older receiver ignores it: its `since-turn=`
+    /// resume below it is not told of the harness records it misses.
+    #[serde(skip_serializing_if = "is_zero")]
+    shed_below: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     archive: Option<ArchiveWire>,
     /// THE SESSION LOG (phase 2A): its carry lines, oldest part first
@@ -1049,6 +1086,24 @@ where
     })
 }
 
+/// The two floors a carried ledger names ([`Wire::unheld_below`],
+/// [`Wire::shed_below`]).
+#[cfg(any(unix, test))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Floors {
+    unheld_below: u64,
+    shed_below: u64,
+}
+
+/// `skip_serializing_if` for a floor of none.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if hands the predicate a reference"
+)]
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 #[serde(default)]
 struct TurnWire {
@@ -1056,13 +1111,29 @@ struct TurnWire {
     started_ms: u64,
     dur_ms: u64,
     submitted: bool,
-    /// `settled`, `timeout` or `hangup` — a word, never a code.
+    /// `settled`, `timeout` or `hangup` — a word, never a code. A
+    /// [`crate::turn_ledger::STATUS_PRESSED`] record says `timeout` here, a
+    /// word every build reads, and [`Self::pressed`].
     status: String,
     text: String,
     screen_hash: u64,
     seq: u64,
     arch_origin: u64,
     arch_last: u64,
+    /// Who typed it (`history`'s `by=` word); an older sender's record has
+    /// none and reads as `-` ([`TurnBy::from_wire`]).
+    by: String,
+    /// The window harness's `send` and `key enter`, or a `turn
+    /// settle=submitted` ([`crate::turn_ledger::STATUS_PRESSED`]), whose `status` says
+    /// `timeout`. The word is newer than every release: one a successor did
+    /// not know would leave the record out and raise its floor past it
+    /// ([`decode_why`]), and no build number yet names the first that reads
+    /// it, so it never crosses as the word. An older successor ignores this
+    /// field and holds the record as a settle nobody saw end (`timeout`:
+    /// nothing was awaited after the Enter); this build and every later one
+    /// read it back as `pressed`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pressed: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -1111,30 +1182,33 @@ struct FrameWire {
 /// One record as the sidecar carries it.
 #[cfg(any(unix, test))]
 fn turn_wire(t: &TurnRecord) -> TurnWire {
+    let pressed = t.status == crate::turn_ledger::STATUS_PRESSED;
     TurnWire {
         id: t.id,
         started_ms: t.started_ms,
         dur_ms: t.dur_ms,
         submitted: t.submitted,
-        status: t.status.to_string(),
+        status: if pressed { "timeout" } else { t.status }.to_string(),
         text: t.text.clone(),
         screen_hash: t.screen_hash,
         seq: t.seq,
         arch_origin: t.arch.origin,
         arch_last: t.arch.last,
+        by: t.by.as_wire().to_string(),
+        pressed,
     }
 }
 
 #[cfg(any(unix, test))]
-fn encode(turns: &[TurnRecord], unheld_below: u64, archive: &AltArchiveCarry) -> Option<Vec<u8>> {
-    encode_wire(turns, unheld_below, archive, &[])
+fn encode(turns: &[TurnRecord], floors: Floors, archive: &AltArchiveCarry) -> Option<Vec<u8>> {
+    encode_wire(turns, floors, archive, &[])
 }
 
 /// [`encode`] with the session log's carry `log` as its `log` member.
 #[cfg(any(unix, test))]
 fn encode_wire(
     turns: &[TurnRecord],
-    unheld_below: u64,
+    floors: Floors,
     archive: &AltArchiveCarry,
     log: &[String],
 ) -> Option<Vec<u8>> {
@@ -1142,7 +1216,8 @@ fn encode_wire(
         log: log.to_vec(),
         log_mirror: None,
         version: WIRE_VERSION,
-        unheld_below,
+        unheld_below: floors.unheld_below,
+        shed_below: floors.shed_below,
         turns: turns.iter().map(turn_wire).collect(),
         archive: Some(ArchiveWire {
             origin: archive.origin,
@@ -1185,6 +1260,9 @@ pub(crate) struct ControlCarry {
     /// Turn ids below this may have named records `turns` does not hold (the
     /// ledger could not be carried whole); 0: none.
     pub unheld_below: u64,
+    /// Turn ids below this may have named a harness record the sender's
+    /// ring evicted from inside ([`TurnLedger::with_shed_below`]); 0: none.
+    pub shed_below: u64,
     /// The carried archive.
     pub archive: Option<AltArchiveCarry>,
     /// The carried session log's lines, when the sender wrote them and they
@@ -1200,6 +1278,7 @@ impl ControlCarry {
     /// `carried=1`), for the adopted session's `SessionCtx`.
     pub(crate) fn ledger(&mut self) -> TurnLedger {
         TurnLedger::carried(std::mem::take(&mut self.turns), self.unheld_below)
+            .with_shed_below(self.shed_below)
     }
 
     /// Install the carried archive into the adopted engine, which has just
@@ -1268,6 +1347,11 @@ pub(crate) fn decode_why(bytes: &[u8]) -> Result<ControlCarry, &'static str> {
                 unheld_below = unheld_below.max(t.id.saturating_add(1));
                 return None;
             };
+            let status = if t.pressed {
+                crate::turn_ledger::STATUS_PRESSED
+            } else {
+                status
+            };
             Some(TurnRecord {
                 id: t.id,
                 started_ms: t.started_ms,
@@ -1281,6 +1365,7 @@ pub(crate) fn decode_why(bytes: &[u8]) -> Result<ControlCarry, &'static str> {
                     origin: t.arch_origin,
                     last: t.arch_last,
                 },
+                by: TurnBy::from_wire(&t.by),
                 carried: true,
             })
         })
@@ -1330,6 +1415,7 @@ pub(crate) fn decode_why(bytes: &[u8]) -> Result<ControlCarry, &'static str> {
     Ok(ControlCarry {
         turns,
         unheld_below: unheld_below.min(MAX_TURN_ID.saturating_add(1)),
+        shed_below: wire.shed_below.min(MAX_TURN_ID.saturating_add(1)),
         archive,
         log,
         log_mirror,

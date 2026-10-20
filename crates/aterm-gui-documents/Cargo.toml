@@ -7,24 +7,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm-gui's document models, below the window: the rope text, the document store, the native editor's reducer and the Markdown reader's model. No App, window or event loop; aterm-gui re-exports them under their old module names."
+description = "aterm-gui's document models, below the window: the Markdown reader's model, and amacs's editor engine (the rope, the document store and the reducer) re-exported under their old module names. No App, window or event loop; aterm-gui re-exports them under those names."
 
 [dependencies]
-# The editor's grapheme and width rules, and the rope's chunked buffer.
-aterm-buffer = { path = "../aterm-buffer" }
-aterm-grapheme = { workspace = true }
-# The document store's write capability.
-aterm-cap = { workspace = true }
+# amacs, the editor engine: its reducer, store and rope moved there, and this
+# crate re-exports them under their old module names
+# (docs/DESIGN-amacs-2026-10-19.md §3).
+amacs = { workspace = true }
 
 [dev-dependencies]
-# This crate's own tests mint a root authority for the store's write cap; only
-# a test may, below the launchers (the `launcher-mint` guard).
-aterm-cap = { workspace = true, features = ["launcher-mint"] }
-# The editor's and the Markdown reader's Tier-1 binds to their derived models.
+# The Markdown reader's Tier-1 binds to its derived models.
 aterm-spec = { workspace = true }
 aterm-models-native = { workspace = true }
-# The editor's smart-selection test drives the engine's word rules.
-aterm-core = { workspace = true }
 
 [lints]
 workspace = true

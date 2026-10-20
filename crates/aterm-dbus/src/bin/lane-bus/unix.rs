@@ -895,6 +895,26 @@ enum Step {
     Wait(String),
 }
 
+impl Step {
+    /// Whether the step drives the pointer (Mutter makes the seat's pointer
+    /// with the session's first such event).
+    fn drives_pointer(&self) -> bool {
+        matches!(
+            self,
+            Step::Button { .. } | Step::Motion { .. } | Step::MotionFrom(_)
+        )
+    }
+}
+
+/// The motion that makes a session's pointer before its keyboard: up and left
+/// past any lane screen, so the seat parks it in the top-left corner, where
+/// no lane window lies. Every pointer session starts there, so its steps aim
+/// from the corner, never from where an earlier session left the pointer.
+const PARK: Step = Step::Motion {
+    dx: -4000,
+    dy: -4000,
+};
+
 /// The keysyms `seat` names, beside `0x…`.
 const KEYSYMS: [(&str, u32); 12] = [
     ("Shift_L", 0xffe1),
@@ -1103,6 +1123,20 @@ fn await_file(path: &str, limit: Duration) -> Result<(), Fail> {
 /// see its keys land ends with a `touch` the lab waits for and a `wait` that
 /// keeps the devices until the lab has seen them.
 ///
+/// When the steps drive the pointer, the session makes it first ([`PARK`]),
+/// before the Shift tap, so the awaited focus proves the seat has the pointer
+/// too. Mutter 46 runs an input event's filter, which moves the Wayland
+/// seat's pointer focus, as the event comes, but hands a new device to the
+/// Wayland seat only at the stage's next update (its `DEVICE_ADDED` waits in
+/// the stage's queue). A motion in between moves a pointer the seat does not
+/// have yet: no surface takes its focus, and the window under it hears no
+/// `enter` until a later motion repicks (measured 2026-10-17: the window bound
+/// the pointer 0.2 ms after Mutter announced it, but Mutter had already pinged
+/// that window for the motion onto it, and never sent it an `enter`). The two
+/// devices' `DEVICE_ADDED` keep the stage's queue in the order they were
+/// made, so the pointer is announced before the keyboard whose focus the
+/// steps wait for.
+///
 /// An `app` of `-` names a client that publishes no AT-SPI frame (aterm-wayland's
 /// live seat test): no focus is awaited, and the client paces the steps itself
 /// with `wait` steps on files it creates once its keyboard has the focus.
@@ -1152,6 +1186,9 @@ fn seat(mutter: u32, app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
         }
     };
     call(&mut conn, rd, &session, RD_SESSION, "Start", Vec::new()).map_err(Fail::Fault)?;
+    if a11y.is_some() && steps.iter().any(Step::drives_pointer) {
+        run_steps(&mut conn, rd, &session, &[PARK])?;
+    }
     // Mutter gives the seat its keyboard with the session's first key event,
     // which no client hears (it binds the keyboard only then), and the
     // window takes the keyboard's focus once it has: a harmless Shift tap.
@@ -1402,5 +1439,26 @@ mod tests {
         assert!(parse_steps(&w(&["move:1,x"])).is_err());
         assert!(parse_steps(&w(&["move:200000,0"])).is_err());
         assert!(parse_steps(&w(&["press:nosuchbutton"])).is_err());
+    }
+
+    #[test]
+    fn which_steps_drive_the_pointer() {
+        let w = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let drives = |v: &[&str]| {
+            parse_steps(&w(v))
+                .expect("parses")
+                .iter()
+                .any(Step::drives_pointer)
+        };
+        assert!(drives(&["touch:/tmp/a/ready", "move:640,400"]));
+        assert!(drives(&["move:@/tmp/a/aim"]));
+        assert!(drives(&["button:middle"]));
+        assert!(drives(&["release:left"]));
+        assert!(!drives(&[
+            "chord:ctrl+shift+v",
+            "sleep:5",
+            "wait:/tmp/a/go"
+        ]));
+        assert!(PARK.drives_pointer());
     }
 }

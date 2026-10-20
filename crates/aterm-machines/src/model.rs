@@ -324,6 +324,27 @@ pub struct HostFacts {
     pub serial: String,
     /// `hw.model`, e.g. `Mac16,1`.
     pub model: String,
+    /// The model's marketing name, `MacBook Pro`, `Mac mini`, `Virtual Machine`
+    /// (`hardware::model_name`); empty when unknown.
+    #[serde(default)]
+    pub model_name: String,
+    /// The chip, `Apple M4 Max`, or an Intel processor's family, `Intel Core i7`
+    /// (`sysctl -n machdep.cpu.brand_string`); empty when unknown.
+    #[serde(default)]
+    pub chip: String,
+    /// An Intel processor's speed, `3.1 GHz`; empty on Apple silicon and when unknown.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub processor_speed: String,
+    /// Memory in bytes (`sysctl -n hw.memsize`); 0 when unknown.
+    #[serde(default)]
+    pub memory_bytes: u64,
+    /// The Mac's internal disk in bytes, the whole disk as `ioreg` lists it (the largest
+    /// internal one: `hardware::internal_disk`); 0 when unknown.
+    #[serde(default)]
+    pub disk_bytes: u64,
+    /// That disk is a hard disk (`Medium Type` `Rotational`), named by its decimal size.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disk_rotational: bool,
     /// `arm64` or `x86_64` (`uname -m`).
     pub arch: String,
     /// `sw_vers -productVersion`.

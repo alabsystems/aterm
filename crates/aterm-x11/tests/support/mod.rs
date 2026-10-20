@@ -3,7 +3,7 @@
 
 //! Reading the recordings under tests/recorded/.
 
-#![allow(dead_code, reason = "each test binary uses its own part")]
+#![allow(dead_code, reason = "each module uses its own part")]
 
 use std::collections::BTreeMap;
 

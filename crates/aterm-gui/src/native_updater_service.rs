@@ -19,6 +19,46 @@ const MAX_SHORT_TEXT_BYTES: usize = 512;
 const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 const MAX_CHANGELOG_BYTES: usize = 256 * 1024;
 
+/// Whether THIS copy can replace itself, as far as anything has OBSERVED. A surface
+/// compiled before the first read must claim neither answer: "Applies next launch",
+/// an enabled Update to Latest Now and "can't update itself" are each a fact about
+/// the copy that only a read of its bundle establishes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum UpdateInstallability {
+    /// Nothing has read it yet: the launch could not tell, and no reconcile has
+    /// landed.
+    #[default]
+    Unobserved,
+    /// A read found a bundle the updater can replace.
+    Installable,
+    /// A read (or the launch's own path) found none: a disk image, a translocated
+    /// download, a bare binary, a dev-marked build, or a platform with no updater.
+    NotInstallable,
+}
+
+impl UpdateInstallability {
+    #[must_use]
+    pub(crate) fn observed(installable: bool) -> Self {
+        if installable {
+            Self::Installable
+        } else {
+            Self::NotInstallable
+        }
+    }
+
+    /// A read found a replaceable bundle — the only state that may claim one.
+    #[must_use]
+    pub(crate) fn is_installable(self) -> bool {
+        self == Self::Installable
+    }
+
+    /// A read found NO replaceable bundle — the only state that may say so.
+    #[must_use]
+    pub(crate) fn cannot_install(self) -> bool {
+        self == Self::NotInstallable
+    }
+}
+
 /// Stable logical phase shared by presentation, inspection, and apply policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UpdaterPhase {
@@ -111,11 +151,12 @@ pub(crate) struct DurableUpdateStatus {
     pub(crate) apply_failure_build: u64,
     /// See [`Self::apply_failure_build`].
     pub(crate) apply_failures_for_target: u32,
-    /// This launch has a bundle the updater could REPLACE. `false` for a run from
-    /// the mounted DMG, a Gatekeeper-translocated copy, or a dev-marked install —
+    /// This launch has a bundle the updater could REPLACE. `Some(false)` for a run
+    /// from the mounted DMG, a Gatekeeper-translocated copy, or a dev-marked install —
     /// states in which no check thread ever starts, so every ledger field is the
-    /// pristine default of a machine that structurally cannot update.
-    pub(crate) installable: bool,
+    /// pristine default of a machine that structurally cannot update. `None` where
+    /// nothing read it: a worker that failed before its read observed no bundle.
+    pub(crate) installable: Option<bool>,
     /// The STRANDED verdict ([`aterm_update::UpdateStatus::channel_unreadable`]):
     /// checks complete but the release channel cannot be read, deliberately with
     /// ZERO ledger failures — so `failing_persistent` can never carry it, and any
@@ -342,8 +383,10 @@ pub(crate) struct UpdaterSnapshot {
     pub(crate) apply_failure_build: u64,
     /// See [`Self::apply_failure_build`].
     pub(crate) apply_failures_for_target: u32,
-    /// See [`DurableUpdateStatus::installable`].
-    pub(crate) installable: bool,
+    /// Whether this copy can replace itself, as far as a read has OBSERVED
+    /// ([`DurableUpdateStatus::installable`]); [`UpdateInstallability::Unobserved`]
+    /// until one has.
+    pub(crate) installable: UpdateInstallability,
     /// See [`DurableUpdateStatus::channel_unreadable`].
     pub(crate) channel_unreadable: bool,
     /// See [`DurableUpdateStatus::checked_at`].
@@ -741,7 +784,14 @@ impl NativeUpdaterService {
                 apply_failure: String::new(),
                 apply_failure_build: 0,
                 apply_failures_for_target: 0,
-                installable: true,
+                // No updater on this platform is an observation the build makes;
+                // whether a copy that has one can replace itself is the reconcile's
+                // to read ([`Self::seed_installability`] takes what the launch knows).
+                installable: if enabled {
+                    UpdateInstallability::Unobserved
+                } else {
+                    UpdateInstallability::NotInstallable
+                },
                 channel_unreadable: false,
                 checked_at: None,
             },
@@ -770,6 +820,9 @@ impl NativeUpdaterService {
         service.snapshot.linux = bounded_linux_status(status.linux.clone());
         service.snapshot.outcome = bounded(status.outcome.clone(), MAX_MESSAGE_BYTES);
         service.snapshot.checked_at = status.checked_at;
+        if enabled && let Some(installable) = status.installable {
+            service.snapshot.installable = UpdateInstallability::observed(installable);
+        }
         if !enabled {
             // A leftover ready marker is not apply authority when this build/machine
             // has disabled updates. Keep it invisible and non-actionable.
@@ -875,6 +928,31 @@ impl NativeUpdaterService {
         self.record(action, before);
         self.publish();
         CheckStart::Start(ticket)
+    }
+
+    /// What the launch itself established about this copy before any read: a disk
+    /// image, a translocated download, a bare binary or a dev-marked build cannot
+    /// replace itself, so those never show a neutral flash. Anything else stays
+    /// [`UpdateInstallability::Unobserved`] for the reconcile to read.
+    #[must_use]
+    pub(crate) fn seed_installability(mut self, seed: UpdateInstallability) -> Self {
+        if self.snapshot.installable == UpdateInstallability::Unobserved {
+            self.snapshot.installable = seed;
+        }
+        self
+    }
+
+    /// Record a read of this copy's installability ([`DurableUpdateStatus::
+    /// installable`], or the bundle probe a reconcile makes when the ledger cannot be
+    /// read). Returns whether it changed — the caller republishes on `true`.
+    pub(crate) fn note_installability(&mut self, installable: bool) -> bool {
+        let observed = UpdateInstallability::observed(installable);
+        if !self.snapshot.enabled || self.snapshot.installable == observed {
+            return false;
+        }
+        self.snapshot.installable = observed;
+        self.publish();
+        true
     }
 
     /// Take a newer "last check completed" time from a reconcile: the window's own
@@ -1044,7 +1122,9 @@ impl NativeUpdaterService {
         self.snapshot.apply_failure = bounded(status.apply_failure.clone(), MAX_SHORT_TEXT_BYTES);
         self.snapshot.apply_failure_build = status.apply_failure_build;
         self.snapshot.apply_failures_for_target = status.apply_failures_for_target;
-        self.snapshot.installable = status.installable;
+        if let Some(installable) = status.installable {
+            self.snapshot.installable = UpdateInstallability::observed(installable);
+        }
         // The stranded verdict rides every reduced check exactly like the
         // persistent-failure one: it is what stops the update screen from
         // headlining "You're up to date." at a machine whose channel is
@@ -1834,7 +1914,7 @@ mod tests {
             apply_failure: String::new(),
             apply_failure_build: 0,
             apply_failures_for_target: 0,
-            installable: true,
+            installable: Some(true),
             channel_unreadable: false,
             checked_at: None,
         }
@@ -1854,8 +1934,6 @@ mod tests {
             trial_starts: 0,
             trial_healthy: false,
             refused_newer: false,
-            refused_unstarted: false,
-            kept_unproven: false,
         });
         let mut service = NativeUpdaterService::new(10, "1.0.10", true);
         let CheckStart::Start(ticket) = service.request_check() else {
@@ -2032,7 +2110,7 @@ mod tests {
             apply_failure: String::new(),
             apply_failure_build: 0,
             apply_failures_for_target: 0,
-            installable: true,
+            installable: Some(true),
             channel_unreadable: false,
             checked_at: None,
         };
@@ -2072,7 +2150,7 @@ mod tests {
             apply_failure: String::new(),
             apply_failure_build: 0,
             apply_failures_for_target: 0,
-            installable: true,
+            installable: Some(true),
             channel_unreadable: false,
             checked_at: None,
         };
@@ -2650,6 +2728,55 @@ mod tests {
         assert!(!service.snapshot().attention_pending());
         assert!(service.snapshot().staged.is_some());
         assert!(!service.acknowledge_attention(attention));
+    }
+
+    /// NOTHING READ, NOTHING CLAIMED (s-16): a fresh service has observed nothing
+    /// about whether this copy can replace itself, so it is neither installable nor
+    /// not; a check's read says which, and a platform with no updater knows at
+    /// construction. A worker failure that read nothing leaves it unobserved.
+    #[test]
+    fn installability_is_unobserved_until_a_read_says() {
+        let fresh = NativeUpdaterService::new(10, "1.0.10", true);
+        assert_eq!(
+            fresh.snapshot().installable,
+            UpdateInstallability::Unobserved
+        );
+        assert_eq!(
+            NativeUpdaterService::new(10, "1.0.10", false)
+                .snapshot()
+                .installable,
+            UpdateInstallability::NotInstallable,
+            "no updater on this platform is known without a read"
+        );
+        for (read, want) in [
+            (Some(false), UpdateInstallability::NotInstallable),
+            // NEGATIVE CONTROL: a read that found a bundle says so.
+            (Some(true), UpdateInstallability::Installable),
+            (None, UpdateInstallability::Unobserved),
+        ] {
+            let mut service = NativeUpdaterService::new(10, "1.0.10", true);
+            let ticket = started(&mut service);
+            let mut checked = status(None);
+            checked.installable = read;
+            let _ = service.finish_check(ticket, checked);
+            assert_eq!(service.snapshot().installable, want, "{read:?}");
+        }
+        // The launch's own path seeds only what it knows; a read still decides.
+        let mut seeded = NativeUpdaterService::new(10, "1.0.10", true)
+            .seed_installability(UpdateInstallability::NotInstallable);
+        assert_eq!(
+            seeded.snapshot().installable,
+            UpdateInstallability::NotInstallable
+        );
+        assert!(seeded.note_installability(true));
+        assert_eq!(
+            seeded.snapshot().installable,
+            UpdateInstallability::Installable
+        );
+        assert!(
+            !seeded.note_installability(true),
+            "an unchanged read republishes nothing"
+        );
     }
 
     #[test]

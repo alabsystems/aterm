@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! THE MUSE CODE LANE, ITS PURE HALF: relaunch on exit and the restore of a
-//! Muse Code (Meta's `muse`) tab, never its live upgrade
-//! ([`super::lanes::lanes`]: `relaunch` only). The I/O half is
-//! `upgrade_drive`'s `muse` module (`upgrade_muse_drive.rs`). Every fact here
-//! was measured on 1.4.10-R6427.1 in the lab (`crates/aterm-lab`, the real
-//! binary against its stub, no account):
+//! Muse Code (Meta's `muse`) tab. Its live upgrade's quiet flow is
+//! [`super::upgrade_muse_live`], whose restart this relaunch carries. The I/O
+//! half is `upgrade_drive`'s `muse` module (`upgrade_muse_drive.rs`). Every
+//! fact here was measured on 1.4.10-R6427.1 in the lab (`crates/aterm-lab`,
+//! the real binary against its stub, no account):
 //!
 //! * **One process.** A native arm64 binary launched directly (the managed
 //!   twin `agents/muse` is `exec '<store build>' "$@"`), one TUI process with
@@ -28,7 +28,9 @@
 //!   OLD session's line while the process runs on).
 //! * **The exit table** ([`exit_kind`]): `0` its own `/exit`, `/quit`, Ctrl-C
 //!   or Ctrl-D twice; `130` an external SIGINT and `143` a SIGTERM, both of
-//!   which write a clean `session.end` — someone's end, never relaunched;
+//!   which write a clean `session.end` — someone's end, never relaunched (the
+//!   live upgrade's own SIGTERM is claimed before it is sent, and carried as
+//!   the harness's restart, never read here);
 //!   `129` SIGHUP and `137` SIGKILL write none — a crash; `1` (`retained
 //!   session not found`, an unknown session name, a refused start) and `2`
 //!   (bad arguments) are REFUSALS of the start, never a crash, so never

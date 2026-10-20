@@ -5,7 +5,7 @@
 //! the session, for ANY interleaving of typing, program output and time.
 //!
 //! The donor is astream-term's verified speculation
-//! (`vendor/astream/crates/astream-term/tests/predict.rs`,
+//! (`vendor/astream/crates/astream-term/tests/suite/predict.rs`,
 //! `predictions_never_corrupt_the_final_screen`): there the reconciled view
 //! equals the pure authoritative fold for any interleaving of predictions and
 //! output. This file states and checks the same theorem for `aterm-predict` as
@@ -268,8 +268,12 @@ use world::*;
 fn a_prediction_never_corrupts_the_reconciled_view() {
     let mut adaptive = Stats::default();
     let mut always = Stats::default();
-    for cfg in faithful_configs() {
-        match sweep(cfg, SEED) {
+    let configs = faithful_configs();
+    for (cfg, swept) in configs
+        .iter()
+        .zip(aterm_spec::check::each(&configs, |&cfg| sweep(cfg, SEED)))
+    {
+        match swept {
             Ok(stats) => {
                 if cfg.mode == PredictMode::Adaptive {
                     adaptive.add(stats);
@@ -411,7 +415,7 @@ fn a_prediction_never_corrupts_the_reconciled_view() {
 /// ambiguous width (an `é` guessed one cell where its echo takes two).
 #[test]
 fn the_checker_catches_every_mutant_host_in_its_clause() {
-    for host in MUTANT_HOSTS {
+    let missed = aterm_spec::check::each(&MUTANT_HOSTS, |&host| {
         let clause = host.breaks().expect("a mutant breaks a clause");
         let caught = [PredictMode::Adaptive, PredictMode::Always]
             .iter()
@@ -430,8 +434,10 @@ fn the_checker_catches_every_mutant_host_in_its_clause() {
                     matches!(run(cfg, &ops), Err((_, v)) if v.clause == clause)
                 })
             });
-        assert!(caught, "{host:?}: the checker never reported `{clause}`");
-    }
+        (!caught).then(|| format!("{host:?}: the checker never reported `{clause}`"))
+    });
+    let missed: Vec<String> = missed.into_iter().flatten().collect();
+    assert!(missed.is_empty(), "{}", missed.join("\n"));
 }
 
 /// Interleavings review found that the sweep had not reached, each a FIDELITY

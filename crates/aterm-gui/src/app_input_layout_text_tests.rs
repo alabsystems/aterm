@@ -8,8 +8,10 @@
 //! `option_as_meta = false`.
 
 use crate::{App, WindowId, term_lock};
-use winit::event::{ElementState, KeyEvent};
-use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr};
+use aterm_window::event::{ElementState, KeyEvent};
+use aterm_window::keyboard::{
+    Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr,
+};
 
 /// An App whose session writes to an observer pipe (nonblocking read end).
 fn app_observing_pty() -> (App, i32) {

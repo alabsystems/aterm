@@ -35,6 +35,24 @@ fn typed(c: &GlowConfig, keys: u16) -> (CursorGlow, Vec<GlowQuad>) {
     (glow, out)
 }
 
+/// [`typed`], then the same instant again with the grains cleared: the body
+/// alone, for the tests that read its shape.
+fn typed_body(c: &GlowConfig, keys: u16) -> CursorGlow {
+    let g = geom();
+    let mut glow = CursorGlow::default();
+    let mut out = Vec::new();
+    let mut t = Instant::now();
+    glow.tick(Some((2, 4)), t, c, g, &mut out);
+    for col in 5..5 + keys {
+        t += Duration::from_millis(60);
+        glow.note_synthetic_typed(t, 1);
+        glow.tick(Some((2, col)), t, c, g, &mut out);
+    }
+    glow.particles.clear();
+    glow.tick(Some((2, 4 + keys)), t, c, g, &mut out);
+    glow
+}
+
 /// Nonzero one-pixel cells are a valid effects canvas too: a light beam may
 /// round away, but must not panic or grow outside its row to meet a half-pixel
 /// minimum. Ordinary light cells still draw, and a dark ground stays additive.
@@ -151,7 +169,7 @@ fn light_beam_bodies_are_ink_under_the_letters_inside_their_row() {
 fn light_comet_tapers_and_light_beam_is_even() {
     let g = geom();
     let spread = |style| {
-        let (glow, _) = typed(&light(style), 6);
+        let glow = typed_body(&light(style), 6);
         let heights = ink_heights(glow.under_quads());
         // Two cells behind the caret (col 10) and one cell behind it.
         let at = |col: u16| {
@@ -213,7 +231,8 @@ fn light_beam_is_a_band_around_the_letters_never_a_strike() {
     };
     let third = g.ch as u16 / 3;
     let c = light(GlowStyle::Beam);
-    let (mut glow, mut out) = typed(&c, 6);
+    let mut glow = typed_body(&c, 6);
+    let mut out = Vec::new();
     let mut t = Instant::now() + Duration::from_millis(60 * 7);
     for frame in 0..4 {
         let (peak, rows) = peak_rows(&column_darkness(glow.under_quads(), x));
@@ -225,6 +244,7 @@ fn light_beam_is_a_band_around_the_letters_never_a_strike() {
             "frame {frame}: the beam's darkest ink is {rows} px tall, a line through the letters"
         );
         t += Duration::from_millis(90);
+        glow.particles.clear();
         glow.tick(Some((2, 10)), t, &c, g, &mut out);
     }
     let (laser, _) = typed(&light(GlowStyle::Laser), 6);
@@ -265,4 +285,96 @@ fn light_lumen_glows_around_the_caret() {
         "a glow on both sides: {left} / {right}"
     );
     assert!(glow.under_quads().iter().all(|q| q.alpha > 0));
+}
+
+/// EVERY CROWN IS INK ON PAPER: typed on a light ground, each style with a
+/// crown wears it as source-over ink under the letters around the caret
+/// (inside its row), never as additive light. Negative control: on a dark
+/// ground the same typing lays the additive crown halo.
+#[test]
+fn every_crown_is_ink_on_a_light_ground() {
+    let g = geom();
+    let caret_x = 10 * g.cw as u16 + g.cw as u16 / 2;
+    let row = 2 * g.ch as u16..3 * g.ch as u16;
+    for style in [
+        GlowStyle::Lumen,
+        GlowStyle::Comet,
+        GlowStyle::Phaser,
+        GlowStyle::Sparkle,
+        GlowStyle::Laser,
+        GlowStyle::Water,
+        GlowStyle::Fire,
+    ] {
+        let glow = typed_body(&light(style), 6);
+        let near: Vec<&GlowQuad> = glow
+            .under_quads()
+            .iter()
+            .filter(|q| {
+                let mid = q.x + q.w / 2;
+                mid.abs_diff(caret_x) <= g.cw as u16 / 2
+            })
+            .collect();
+        assert!(!near.is_empty(), "{style:?}: a crown of ink at the caret");
+        assert!(
+            near.iter()
+                .all(|q| q.alpha > 0 && row.contains(&q.y) && q.y + q.h <= row.end),
+            "{style:?}: source-over, inside the caret's row"
+        );
+        assert!(
+            glow.halos().iter().all(|h| h.mode == HaloMode::Over),
+            "{style:?}: no additive halo on paper"
+        );
+        let dark = typed_body(&cfg(style, true), 6);
+        assert!(
+            dark.halos().iter().any(|h| h.mode == HaloMode::Add),
+            "{style:?}: a dark ground lays the additive crown"
+        );
+    }
+}
+
+/// THE LIGHT FIRE BURNS ON THE PAPER: the ink-fire's coverage ceiling is set
+/// by the theme's text over the flame's darkest ink, not the dark ground's
+/// additive cap. On GitHub Light the darkest flame reads clearly on the
+/// paper (at least 2:1) while the text keeps the bar over it; a theme with
+/// paler text gets a lower ceiling that still keeps it. Negative control:
+/// the old shared cap (34) left the darkest flame at under 1.3:1.
+#[test]
+fn light_fire_flames_ink_the_paper_and_keep_text_legible() {
+    let contrast = |a: u32, b: u32| {
+        let luma = crate::color_math::relative_luminance;
+        let (x, y) = (luma(a), luma(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
+    };
+    let rim = aterm_render::fire_field::FIRE_OVER_RIM_INK;
+    let over = |bg: u32, a: u8| aterm_render::over_premul(bg, premul_rgb(rim, a), a) & 0x00FF_FFFF;
+    let (fg, bg) = (0x001F_2328, 0x00FF_FFFF);
+    let ceiling = light_fire_cov_ceiling(fg, bg);
+    let flame = over(bg, ceiling);
+    assert!(
+        contrast(flame, bg) >= 2.0,
+        "the flame reads: {:.2}:1",
+        contrast(flame, bg)
+    );
+    assert!(
+        contrast(fg, flame) >= BODY_CONTRAST_BAR,
+        "the text keeps the bar"
+    );
+    let paler = light_fire_cov_ceiling(0x0040_4040, bg);
+    assert!(
+        paler < ceiling,
+        "paler text, a lower ceiling: {paler} vs {ceiling}"
+    );
+    assert!(contrast(0x0040_4040, over(bg, paler)) >= BODY_CONTRAST_BAR);
+    assert!(contrast(over(bg, 34), bg) < 1.3, "the old cap's flame");
+    // The emitted field carries the ceiling: a hot run's patches reach it.
+    let mut c = light(GlowStyle::Fire);
+    c.theme_fg = fg;
+    c.theme_bg = bg;
+    let (glow, _) = typed(&c, 30);
+    let top = glow.patches().iter().map(|p| p.cov_cap).max().unwrap_or(0);
+    assert!(
+        f32::from(top) >= f32::from(ceiling) * 0.45,
+        "the light field's cap {top} rides the ceiling {ceiling}"
+    );
 }

@@ -1,0 +1,12 @@
+# claude-code 2.1.268 · MEASURED 2026-10-17 · `aterm ctl cell <row> <col>` of the first glyph of each row of the slash menu on claude-2.1.268-slash-menu-config.txt, one per line: the row, the column, the reply (after one `down`)
+8 2 OK / 999999 111318 none
+9 2 OK / b1b9f9 111318 none
+10 32 OK X b1b9f9 111318 none
+11 2 OK / 999999 111318 none
+12 32 OK d 999999 111318 none
+13 2 OK / 999999 111318 none
+14 2 OK / 999999 111318 none
+15 2 OK / 999999 111318 none
+16 32 OK a 999999 111318 none
+17 2 OK / 999999 111318 none
+18 32 OK r 999999 111318 none

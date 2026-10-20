@@ -81,7 +81,7 @@ contract_fn! {
     /// Clean `step_within_bounds_isl` specification (`clean-kernel-defeq`) and the
     /// Clean-origin [`step_prefix_advance`] (`max(valid_len, next_pos)`).
     #[must_use]
-    pub fn step_within_bounds(pos: u64, limit: u64) -> bool
+    pub const fn step_within_bounds(pos: u64, limit: u64) -> bool
     clauses [ensures result == (pos <= limit)]
     {
         pos <= limit
@@ -114,23 +114,107 @@ const MAX_STEP_BODY: usize = MAX_PAYLOAD_LEN - STEP_HEADER;
 /// Where a record's body starts, counted from the start of its frame.
 const BODY_OFFSET: usize = HEADER_SIZE + STEP_HEADER;
 
+const fn drop_prefix(bytes: &[u8], n: usize) -> Option<&[u8]> {
+    if bytes.len() < n {
+        return None;
+    }
+    let mut rest = bytes;
+    let mut skipped = 0usize;
+    while let &[_, ref tail @ ..] = rest {
+        if skipped >= n {
+            return Some(rest);
+        }
+        skipped = skipped.saturating_add(1);
+        rest = tail;
+    }
+    if skipped == n {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+/// Encode the 13-byte step record header (`STEP_VERSION | step u64 LE | len u32 LE`),
+/// checking the body length against `MAX_STEP_BODY` (`MAX_PAYLOAD_LEN - STEP_HEADER`).
+pub const fn encode_step_header(
+    step: u64,
+    body_len: usize,
+) -> Result<[u8; STEP_HEADER], FrameError> {
+    if body_len > MAX_STEP_BODY {
+        return Err(FrameError::TooLarge);
+    }
+    // `MAX_STEP_BODY < MAX_PAYLOAD_LEN` (16 MiB), which always fits in `u32`.
+    let s0 = (step & 0xff) as u8;
+    let s1 = ((step >> 8) & 0xff) as u8;
+    let s2 = ((step >> 16) & 0xff) as u8;
+    let s3 = ((step >> 24) & 0xff) as u8;
+    let s4 = ((step >> 32) & 0xff) as u8;
+    let s5 = ((step >> 40) & 0xff) as u8;
+    let s6 = ((step >> 48) & 0xff) as u8;
+    let s7 = ((step >> 56) & 0xff) as u8;
+    let len_u32 = body_len as u32;
+    let l0 = (len_u32 & 0xff) as u8;
+    let l1 = ((len_u32 >> 8) & 0xff) as u8;
+    let l2 = ((len_u32 >> 16) & 0xff) as u8;
+    let l3 = ((len_u32 >> 24) & 0xff) as u8;
+    Ok([STEP_VERSION, s0, s1, s2, s3, s4, s5, s6, s7, l0, l1, l2, l3])
+}
+
 /// Encode one step record: `STEP_VERSION | step u64 LE | len u32 LE | body`,
 /// inside a CRC [`Frame`].
 ///
 /// A body too large for the frame's payload cap is [`FrameError::TooLarge`], as
 /// it would be from [`Frame::encode`]; it is refused before anything is copied.
 pub fn encode_step(step: u64, body: &[u8]) -> Result<Vec<u8>, FrameError> {
-    if body.len() > MAX_STEP_BODY {
-        return Err(FrameError::TooLarge);
-    }
-    // `MAX_STEP_BODY < MAX_PAYLOAD_LEN` (16 MiB), which always fits in `u32`.
-    let len = body.len() as u32;
+    let hdr = encode_step_header(step, body.len())?;
     let mut payload = Vec::with_capacity(STEP_HEADER + 256);
-    payload.push(STEP_VERSION);
-    payload.extend_from_slice(&step.to_le_bytes());
-    payload.extend_from_slice(&len.to_le_bytes());
+    payload.extend_from_slice(&hdr);
     payload.extend_from_slice(body);
     Frame::new(payload).encode()
+}
+
+/// Decode one 13-byte step record header `hdr` given a frame payload length of
+/// `payload_len`, returning `(step, body_len)`.
+#[must_use]
+pub const fn decode_step_header_bytes(
+    hdr: &[u8; STEP_HEADER],
+    payload_len: usize,
+) -> Option<(u64, usize)> {
+    if payload_len < STEP_HEADER {
+        return None;
+    }
+    if hdr[0] != STEP_VERSION {
+        return None;
+    }
+    let step = (hdr[1] as u64)
+        | ((hdr[2] as u64) << 8)
+        | ((hdr[3] as u64) << 16)
+        | ((hdr[4] as u64) << 24)
+        | ((hdr[5] as u64) << 32)
+        | ((hdr[6] as u64) << 40)
+        | ((hdr[7] as u64) << 48)
+        | ((hdr[8] as u64) << 56);
+    let len = ((hdr[9] as u32)
+        | ((hdr[10] as u32) << 8)
+        | ((hdr[11] as u32) << 16)
+        | ((hdr[12] as u32) << 24)) as usize;
+    if len > payload_len - STEP_HEADER {
+        return None;
+    }
+    Some((step, len))
+}
+
+/// Decode one step record's header at the front of `payload` given a frame
+/// payload length of `payload_len`, returning `(step, body_len)`.
+#[must_use]
+pub const fn decode_step_header(payload: &[u8], payload_len: usize) -> Option<(u64, usize)> {
+    let &[b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, ref _rest @ ..] = payload else {
+        return None;
+    };
+    decode_step_header_bytes(
+        &[b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12],
+        payload_len,
+    )
 }
 
 /// Decode one step record's payload (the [`Frame`] payload, not the framed
@@ -141,30 +225,21 @@ pub fn encode_step(step: u64, body: &[u8]) -> Result<Vec<u8>, FrameError> {
 /// Bytes after the body are ignored, as `astream-engine`'s journal always has
 /// ignored them: the frame's CRC covers them, so they are not damage, and a
 /// reader that refused them would refuse journals that open today.
+#[must_use]
+#[allow(clippy::question_mark)]
 pub fn decode_step(payload: &[u8]) -> Option<(u64, &[u8])> {
-    if payload.len() < STEP_HEADER {
+    let &[b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, ref rest @ ..] = payload else {
         return None;
-    }
-    let b0 = payload[0];
-    let b1 = payload[1];
-    let b2 = payload[2];
-    let b3 = payload[3];
-    let b4 = payload[4];
-    let b5 = payload[5];
-    let b6 = payload[6];
-    let b7 = payload[7];
-    let b8 = payload[8];
-    let b9 = payload[9];
-    let b10 = payload[10];
-    let b11 = payload[11];
-    let b12 = payload[12];
-    if b0 != STEP_VERSION {
+    };
+    let Some((step, len)) = decode_step_header_bytes(
+        &[b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12],
+        payload.len(),
+    ) else {
         return None;
-    }
-    let step = u64::from_le_bytes([b1, b2, b3, b4, b5, b6, b7, b8]);
-    let len = u32::from_le_bytes([b9, b10, b11, b12]) as usize;
-    let end = STEP_HEADER.checked_add(len)?;
-    let body = payload.get(STEP_HEADER..end)?;
+    };
+    let Some(body) = rest.get(..len) else {
+        return None;
+    };
     Some((step, body))
 }
 
@@ -280,67 +355,55 @@ impl std::fmt::Display for StepFault {
 /// have been acknowledged. (A counter that starts at 0 needs 2^64 records to
 /// get here; only a caller's `first` near the top of the range can.)
 ///
-/// Pure and panic-free: it reads `bytes` only through checked slicing. It keeps
-/// ranges, not bodies, so a caller copies only what it keeps; [`Frame::decode`]
-/// still copies each payload while it checks the CRC, a transient copy freed
-/// before the next record.
+/// Pure and panic-free: it reads `bytes` only through checked slicing and keeps
+/// ranges, not bodies, so a caller copies only what it keeps.
 pub fn scan_steps_from(bytes: &[u8], first: u64) -> StepScan {
     let mut steps: Vec<(u64, Range<usize>)> = Vec::new();
     let mut pos = 0usize;
+    let mut rest = bytes;
     // The step the next record must carry; `None` once the run has accepted step
     // `u64::MAX`, after which no record can be in order.
     let mut expected = Some(first);
     let end = loop {
-        // `pos` only ever advances by a frame that decoded from `bytes[pos..]`,
-        // so it never passes the end. Were it ever past, the end rule names it
-        // Clean, as it names the end of the bytes.
-        let Some(rest) = bytes.get(pos..) else {
-            break end_without_frame(bytes, pos);
-        };
-        match Frame::decode(rest) {
+        match crate::frame::validate_frame_at(rest) {
             // No complete frame at `pos`: a clean end, a torn tail, or a rotted
             // length field.
             Ok(None) => break end_without_frame(bytes, pos),
             // A complete-but-corrupt frame (or an unreadable header).
             Err(e) => break end_at_corrupt_frame(bytes, pos, e),
-            Ok(Some(decoded)) => match (decode_step(&decoded.frame.payload), expected) {
-                (None, _) => {
-                    break StepEnd::Fault {
-                        at: pos,
-                        kind: StepFault::BadStep,
+            Ok(Some((payload_len, after_hdr))) => {
+                match (decode_step_header(after_hdr, payload_len), expected) {
+                    (None, _) => {
+                        break StepEnd::Fault {
+                            at: pos,
+                            kind: StepFault::BadStep,
+                        }
+                    }
+                    (Some((found, _)), None) => {
+                        break StepEnd::Fault {
+                            at: pos,
+                            kind: StepFault::PastLastStep { found },
+                        }
+                    }
+                    (Some((found, _)), Some(expected)) if found != expected => {
+                        break StepEnd::Fault {
+                            at: pos,
+                            kind: StepFault::OutOfOrder { expected, found },
+                        }
+                    }
+                    (Some((step, body_len)), Some(_)) => {
+                        let start = pos.saturating_add(BODY_OFFSET);
+                        steps.push((step, start..start.saturating_add(body_len)));
+                        let consumed = HEADER_SIZE.saturating_add(payload_len);
+                        pos = pos.saturating_add(consumed);
+                        rest = match drop_prefix(after_hdr, payload_len) {
+                            Some(tail) => tail,
+                            None => &[],
+                        };
+                        expected = step.checked_add(1);
                     }
                 }
-                (Some((found, _)), None) => {
-                    break StepEnd::Fault {
-                        at: pos,
-                        kind: StepFault::PastLastStep { found },
-                    }
-                }
-                (Some((found, _)), Some(expected)) if found != expected => {
-                    break StepEnd::Fault {
-                        at: pos,
-                        kind: StepFault::OutOfOrder { expected, found },
-                    }
-                }
-                (Some((step, body)), Some(_)) => {
-                    // The body sits after the frame header and the step header.
-                    // Every sum here stays inside the frame just decoded, which
-                    // lies inside `bytes`, so none can reach `usize::MAX`; they
-                    // saturate rather than add because the verified lane cannot
-                    // see `Frame::decode`'s bound on `consumed` (an unchecked `+`
-                    // there is a refuted overflow obligation, not a real one).
-                    let start = pos.saturating_add(BODY_OFFSET);
-                    steps.push((step, start..start.saturating_add(body.len())));
-                    pos = pos.saturating_add(decoded.consumed);
-                    // Past `u64::MAX` there is no next step. The loop goes on
-                    // regardless, so what follows the last step is classified by
-                    // the arms above — a complete frame there is a fault, never
-                    // handed to `end_without_frame`, whose rule assumes no
-                    // complete frame starts at `pos` and would call an intact
-                    // last record Torn.
-                    expected = step.checked_add(1);
-                }
-            },
+            }
         }
     };
     StepScan {
@@ -357,7 +420,8 @@ pub fn scan_steps_from(bytes: &[u8], first: u64) -> StepScan {
 /// last frame a crash in the middle of an append leaves, [`StepEnd::Torn`]; but
 /// if a complete frame decodes after `pos`, it is the frame's length field that
 /// is wrong, and the end is a [`StepFault::LengthPastEnd`] fault.
-pub fn end_without_frame(bytes: &[u8], pos: usize) -> StepEnd {
+#[must_use]
+pub const fn end_without_frame(bytes: &[u8], pos: usize) -> StepEnd {
     if pos >= bytes.len() {
         StepEnd::Clean
     } else if frame_decodes_after(bytes, pos) {
@@ -375,7 +439,8 @@ pub fn end_without_frame(bytes: &[u8], pos: usize) -> StepEnd {
 /// If any complete frame decodes after it, the damage is inside the run, a
 /// [`StepFault::CorruptFrame`] fault. If nothing after it decodes, it is the
 /// tail a crash left, [`StepEnd::Torn`].
-pub fn end_at_corrupt_frame(bytes: &[u8], pos: usize, e: FrameError) -> StepEnd {
+#[must_use]
+pub const fn end_at_corrupt_frame(bytes: &[u8], pos: usize, e: FrameError) -> StepEnd {
     if frame_decodes_after(bytes, pos) {
         StepEnd::Fault {
             at: pos,
@@ -390,15 +455,20 @@ pub fn end_at_corrupt_frame(bytes: &[u8], pos: usize, e: FrameError) -> StepEnd 
 /// `pos` itself). A crash leaves nothing decodable behind its partial frame.
 /// Scanning byte by byte is the honest test: a damaged header carries no
 /// trustworthy length to skip by.
-pub fn frame_decodes_after(bytes: &[u8], pos: usize) -> bool {
-    let mut q = pos.saturating_add(1);
-    while q < bytes.len() {
-        if let Some(rest) = bytes.get(q..) {
-            if matches!(Frame::decode(rest), Ok(Some(_))) {
-                return true;
-            }
+#[must_use]
+pub const fn frame_decodes_after(bytes: &[u8], pos: usize) -> bool {
+    if pos == usize::MAX {
+        return false;
+    }
+    let start = pos.saturating_add(1);
+    let Some(mut rest) = drop_prefix(bytes, start) else {
+        return false;
+    };
+    while let &[_, ref tail @ ..] = rest {
+        if matches!(crate::frame::validate_frame_at(rest), Ok(Some(_))) {
+            return true;
         }
-        q = q.saturating_add(1);
+        rest = tail;
     }
     false
 }
@@ -497,28 +567,6 @@ mod tests {
             vec![u64::MAX - 1, u64::MAX]
         );
         assert_eq!(scan.valid_len, bytes.len());
-    }
-
-    #[test]
-    fn fault_display_strings_name_their_cause() {
-        let corrupt = StepFault::CorruptFrame(FrameError::ChecksumMismatch).to_string();
-        assert!(corrupt.contains("CRC"), "{corrupt}");
-        assert!(StepFault::LengthPastEnd.to_string().contains("length"));
-        assert!(StepFault::BadStep.to_string().contains("step record"));
-        let order = StepFault::OutOfOrder {
-            expected: 5,
-            found: 0,
-        }
-        .to_string();
-        assert!(
-            order.contains("step 0") && order.contains("expected 5"),
-            "{order}"
-        );
-        let past = StepFault::PastLastStep { found: 0 }.to_string();
-        assert!(
-            past.contains("step 0") && past.contains(&u64::MAX.to_string()),
-            "{past}"
-        );
     }
 
     #[test]

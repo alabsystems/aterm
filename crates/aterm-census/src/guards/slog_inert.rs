@@ -25,19 +25,14 @@ const VERB_TABLE: &str = "crates/aterm-types/src/control_verbs.rs";
 /// The session log's engine.
 const SLOG_ENGINE: &str = "crates/aterm-slog/src/";
 
-/// aterm-gui's files that implement marks and the log (the journal's by
-/// prefix: `session_log_journal.rs`, `_fs.rs`, `_read.rs`).
-const GUI_SLOG: &[&str] = &[
-    "crates/aterm-gui/src/session_log.rs",
-    "crates/aterm-gui/src/session_log_mark.rs",
-    "crates/aterm-gui/src/session_log_closed.rs",
-    "crates/aterm-gui/src/session_log_carry.rs",
-    "crates/aterm-gui/src/session_log_journal",
-    // The bus mirror's GUI half (phase 4): what a bridge takes of a log and
-    // lands, never a byte toward a PTY. By name, so a renamed file is a
-    // scope finding rather than silently unguarded.
-    "crates/aterm-gui/src/session_log_mirror.rs",
-];
+/// Every GUI session-log implementation, including future carry/mirror helpers
+/// (phase 3B's `session_log_transcript.rs` and `session_log_observed.rs` by
+/// the same prefix).
+const GUI_SLOG: &str = "crates/aterm-gui/src/session_log";
+
+/// The transcript's step fold (phase 3B, ruling S26 / addendum A24): what it
+/// reads becomes marks, so it names no PTY path either.
+const AGENT_STEPS: &str = "crates/aterm-agent/src/harness/steps.rs";
 
 /// The `mark` arm: the file, the function, and what it may call.
 const DISPATCH: (&str, &str) = ("crates/aterm-gui/src/control.rs", "dispatch_mark");
@@ -59,59 +54,63 @@ fn dispatch_allows(call: &str) -> bool {
 }
 
 /// THE PTY PATH: every symbol that writes a byte to a session's PTY or reaches
-/// a path that does, and what it is.
+/// a path that does, and what it is. A writer's name is a substring needle
+/// (`Bound::Sub`): its `_observed`, `_fenced`, `_guarded` and `_metered`
+/// twins are the same path. Every needle must still name something in
+/// [`PTY_HOME`]'s shipped code ([`dead_needles`]): a rename leaves none
+/// silently blind.
 const PTY_PATH: &[(&str, Bound, &str)] = &[
     ("SinkWriter", Bound::Word, "the PTY's writer"),
-    ("write_input", Bound::Word, "an input write"),
+    ("write_input", Bound::Sub, "an input write"),
     ("post_input", Bound::Sub, "the event loop's input hop"),
     ("InputEvent", Bound::Word, "an input event"),
     ("Wake::Input", Bound::Sub, "the input wake"),
-    ("cmd_key", Bound::Word, "the key verb"),
+    ("cmd_key", Bound::Sub, "the key verb"),
     ("cmd_send", Bound::Sub, "the send verb"),
-    ("cmd_paste", Bound::Word, "the paste verb"),
-    ("cmd_feed", Bound::Sub, "the feed verb"),
+    ("paste_event", Bound::Sub, "the paste verb's event"),
     ("cmd_turn", Bound::Sub, "the turn verb"),
     ("TurnIo", Bound::Word, "a turn's input routes"),
     ("HostCtl", Bound::Word, "a control client"),
     ("RelayCtl", Bound::Word, "a control client"),
     (".master(", Bound::Sub, "the PTY master"),
     ("aterm_pty::", Bound::Sub, "the PTY crate"),
-    ("background_input", Bound::Word, "a background input write"),
-    ("cross_input", Bound::Word, "a cross-session input write"),
-    (
-        "cross_raw_input",
-        Bound::Word,
-        "a cross-session input write",
-    ),
+    ("background_input", Bound::Sub, "a background input write"),
+    ("cross_input", Bound::Sub, "a cross-session input write"),
+    ("cross_raw_input", Bound::Sub, "a cross-session input write"),
     (
         "front_routed_input",
-        Bound::Word,
+        Bound::Sub,
         "the front tab's input seam",
     ),
-    ("tracked_egress", Bound::Word, "an input write"),
-    ("input_if_fenced", Bound::Word, "a fenced input write"),
-    ("send_bytes", Bound::Word, "the send verb's bytes"),
-    ("feed_bytes", Bound::Word, "the feed verb's bytes"),
+    ("local_input", Bound::Sub, "the front tab's input write"),
+    ("tracked_egress", Bound::Sub, "an input write"),
+    ("input_if_fenced", Bound::Sub, "a fenced input write"),
+    ("type_launch_line", Bound::Sub, "a worker's launch line"),
+    ("Wake::WorkerLaunch", Bound::Sub, "the launch line's wake"),
+    ("send_bytes", Bound::Sub, "the send verb's bytes"),
+    ("feed_bytes", Bound::Sub, "the feed verb's bytes"),
 ];
+
+/// Where the PTY path lives: every [`PTY_PATH`] needle names something on a
+/// shipped line here, outside the rule's own scope.
+const PTY_HOME: &str = "crates/aterm-gui/src/";
+
+/// This rule's file, where a dead needle is reported.
+const THIS_RULE: &str = "crates/aterm-census/src/guards/slog_inert.rs";
 
 pub(super) const SLOG_INERT: Rule = Rule {
     id: "slog-inert",
     why: "a mark never becomes input (design §7.4): the session log's code (aterm-slog, \
-          aterm-gui's session_log*.rs) names no PTY write path and no input verb in a request, \
-          and control.rs's dispatch_mark calls only the mark handler, the connection's actor, \
-          the read check and the watchers' wake",
-    scope: &[
-        SLOG_ENGINE,
-        "crates/aterm-gui/src/session_log.rs",
-        "crates/aterm-gui/src/session_log_mark.rs",
-        "crates/aterm-gui/src/session_log_mirror.rs",
-    ],
+          aterm-gui's session_log*.rs, aterm-agent's harness/steps.rs) names no PTY write path \
+          and no input verb in a request, and control.rs's dispatch_mark calls only the mark \
+          handler, the connection's actor, the read check and the watchers' wake",
+    scope: &[SLOG_ENGINE, GUI_SLOG, AGENT_STEPS],
     check: slog_inert,
 };
 
 /// Whether `rel` is a scoped file's shipped source.
 fn scoped(rel: &str) -> bool {
-    (rel.starts_with(SLOG_ENGINE) || GUI_SLOG.iter().any(|p| rel.starts_with(p)))
+    (rel.starts_with(SLOG_ENGINE) || rel.starts_with(GUI_SLOG) || rel == AGENT_STEPS)
         && !super::rules::test_path(rel)
 }
 
@@ -139,11 +138,12 @@ fn slog_inert(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
     let files = tree
         .corpus
-        .under(&[SLOG_ENGINE, "crates/aterm-gui/src/"])
+        .under(&[SLOG_ENGINE, "crates/aterm-gui/src/", AGENT_STEPS])
         .filter(|f| scoped(&f.rel));
     for file in files {
         out.extend(pty_path_findings(file, &verbs));
     }
+    out.extend(dead_needles(tree));
     let (path, func) = DISPATCH;
     match tree.corpus.get(path) {
         Some(file) => out.extend(dispatch_findings(file, func)),
@@ -154,6 +154,48 @@ fn slog_inert(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             detail: format!("no fn {func} in this file, so the rule reads nothing"),
         }),
     }
+}
+
+/// Every [`PTY_PATH`] needle that names nothing on a shipped line of
+/// [`PTY_HOME`] outside the rule's scope: the writer it named was renamed or
+/// removed, so the rule reads nothing for it (as a verb table with too few
+/// verbs, or no `dispatch_mark`, is a finding).
+fn dead_needles(tree: &Tree<'_>) -> Vec<Finding> {
+    let mut unseen: Vec<&(&str, Bound, &str)> = PTY_PATH.iter().collect();
+    let home = [PTY_HOME];
+    let files = tree
+        .corpus
+        .under(&home)
+        .filter(|f| !scoped(&f.rel) && !super::rules::test_path(&f.rel));
+    for file in files {
+        if unseen.is_empty() {
+            break;
+        }
+        if !unseen
+            .iter()
+            .any(|(needle, _, _)| file.raw.contains(needle))
+        {
+            continue;
+        }
+        for line in file.shipped_lines() {
+            unseen.retain(|(needle, bound, _)| hits(line.code, needle, *bound).next().is_none());
+            if unseen.is_empty() {
+                break;
+            }
+        }
+    }
+    unseen
+        .into_iter()
+        .map(|(needle, _, what)| Finding {
+            rule: SLOG_INERT.id,
+            path: THIS_RULE.to_string(),
+            line: 0,
+            detail: format!(
+                "the PTY path's {needle} ({what}) names nothing in {PTY_HOME}'s shipped code: \
+                 renamed, so the rule reads nothing for it"
+            ),
+        })
+        .collect()
 }
 
 /// Every PTY-path symbol (CODE view) and input-verb request (TEXT view) on
@@ -340,12 +382,37 @@ mod tests {
          if owed { wake_watchers(subscribers, session); }\n\
          reply\n}\n";
 
+    /// `needle` in a shipped call, as one line.
+    fn plant(needle: &str) -> String {
+        let planted = if needle.starts_with('.') {
+            format!("x{needle}1)")
+        } else if needle.ends_with("::") {
+            format!("{needle}f(1)")
+        } else {
+            format!("{needle}(1)")
+        };
+        format!("fn bad() {{ let _ = {planted}; }}\n")
+    }
+
+    /// Where the PTY path lives in the test tree: one shipped line per
+    /// needle, `but` left out.
+    const HOME: &str = "crates/aterm-gui/src/input.rs";
+
+    fn home_without(but: &[&str]) -> String {
+        let mut t = String::from(HEADER);
+        for (needle, _, _) in PTY_PATH.iter().filter(|(n, _, _)| !but.contains(n)) {
+            t.push_str(&plant(needle));
+        }
+        t
+    }
+
     fn tree_with(extra: &[(&str, String)]) -> Vec<Finding> {
         let table = verb_table();
         let control = format!("{HEADER}{DISPATCH_OK}");
         let mut files: Vec<(&str, String)> = vec![
             (VERB_TABLE, table),
             ("crates/aterm-gui/src/control.rs", control),
+            (HOME, home_without(&[])),
             (
                 "crates/aterm-slog/src/lib.rs",
                 format!("{HEADER}pub fn f() {{}}\n"),
@@ -357,10 +424,6 @@ mod tests {
             (
                 "crates/aterm-gui/src/session_log_mark.rs",
                 format!("{HEADER}fn h() {{}}\n"),
-            ),
-            (
-                "crates/aterm-gui/src/session_log_mirror.rs",
-                format!("{HEADER}fn m() {{}}\n"),
             ),
         ];
         for (path, body) in extra {
@@ -385,16 +448,7 @@ mod tests {
     fn each_pty_path_symbol_is_found() {
         let mut planted: Vec<String> = PTY_PATH
             .iter()
-            .map(|(needle, _, _)| {
-                let planted = if needle.starts_with('.') {
-                    format!("x{needle}1)")
-                } else if needle.ends_with("::") {
-                    format!("{needle}f(1)")
-                } else {
-                    format!("{needle}(1)")
-                };
-                format!("fn bad() {{ let _ = {planted}; }}\n")
-            })
+            .map(|(needle, _, _)| plant(needle))
             .collect();
         planted.push("fn bad() { let _ = ctx.sink.write_frame(b\"y\"); }\n".to_string());
         for body in planted {
@@ -405,15 +459,8 @@ mod tests {
                 ["crates/aterm-gui/src/session_log_mark.rs:2"],
                 "{body}: {found:?}"
             );
-            let found = tree_with(&[("crates/aterm-slog/src/log.rs", file.clone())]);
+            let found = tree_with(&[("crates/aterm-slog/src/log.rs", file)]);
             assert_eq!(spots(&found), ["crates/aterm-slog/src/log.rs:2"], "{body}");
-            // The bus mirror's GUI half, named in the scope (phase 4).
-            let found = tree_with(&[("crates/aterm-gui/src/session_log_mirror.rs", file)]);
-            assert_eq!(
-                spots(&found),
-                ["crates/aterm-gui/src/session_log_mirror.rs:2"],
-                "{body}"
-            );
         }
         for clean in [
             "// SinkWriter, cmd_key, aterm_pty:: in a comment\n",
@@ -432,6 +479,89 @@ mod tests {
             format!("{HEADER}fn send() {{ let _ = cmd_key(1); }}\n"),
         )]);
         assert!(unscoped.is_empty(), "{unscoped:?}");
+    }
+
+    /// A WRITER'S TWIN IS THE SAME PATH: the `_observed`, `_fenced` and
+    /// `_metered` twins of the input writers, and the worker launch line
+    /// with its wake, each planted in a mark file, are each one finding on
+    /// its line (the land's review planted the first two past the rule).
+    #[test]
+    fn a_writers_twins_and_the_launch_line_are_found() {
+        for call in [
+            "crate::control::input_if_fenced_observed(t, c, e, f, None)",
+            "crate::task_launch::type_launch_line(store, sid, nonce, prompt, \"x\")",
+            "proxy.send_event(crate::Wake::WorkerLaunch { session: 1 })",
+            "crate::control_input::cmd_key_fenced_observed(a, b)",
+            "crate::control::cross_raw_input_observed(a, b)",
+            "crate::control::background_input_observed(a, b)",
+            "crate::app_input::tracked_egress_metered(a, b)",
+            "crate::control::local_input_observed(a, b)",
+        ] {
+            let file = format!("{HEADER}fn bad() {{ let _ = {call}; }}\n");
+            let found = tree_with(&[("crates/aterm-gui/src/session_log_mark.rs", file)]);
+            assert_eq!(
+                spots(&found),
+                ["crates/aterm-gui/src/session_log_mark.rs:2"],
+                "{call}: {found:?}"
+            );
+        }
+    }
+
+    /// A NEEDLE THAT NAMES NOTHING IS A FINDING: each PTY-path needle the
+    /// PTY's home no longer names on a shipped line (renamed away, or left
+    /// only in a comment, a test item or a `*_tests.rs` file, as
+    /// `control_tests.rs` still calls the test-only `cross_raw_input(`) is
+    /// one finding naming it, so a rename cannot leave the rule blind.
+    #[test]
+    fn a_needle_that_names_nothing_is_a_finding() {
+        const TESTS: &str = "crates/aterm-gui/src/control_tests.rs";
+        for (needle, _, _) in PTY_PATH {
+            let (line, rest) = (plant(needle), home_without(&[*needle]));
+            for files in [
+                vec![(HOME, rest.clone())],
+                vec![(HOME, format!("{rest}// {line}"))],
+                vec![(
+                    HOME,
+                    format!("{rest}#[cfg(test)]\nmod t {{ {} }}\n", line.trim_end()),
+                )],
+                vec![(HOME, rest.clone()), (TESTS, format!("{HEADER}{line}"))],
+            ] {
+                let found = tree_with(&files);
+                assert_eq!(
+                    spots(&found),
+                    [format!("{THIS_RULE}:0")],
+                    "{needle}: {found:?}"
+                );
+                assert!(
+                    found[0].detail.contains(&format!("PTY path's {needle} (")),
+                    "{found:?}"
+                );
+            }
+        }
+    }
+
+    /// PHASE 3B'S FILES (ruling S26): a PTY-path symbol planted in the
+    /// transcript glue, the observed-marks glue or the step fold is one
+    /// finding on its line. NEGATIVE CONTROL: the same symbol in the step
+    /// fold's test file, or in a harness file beside it, is none.
+    #[test]
+    fn phase_3b_files_are_in_scope() {
+        let body = format!("{HEADER}fn bad() {{ let _ = cmd_key(1); }}\n");
+        for path in [
+            "crates/aterm-gui/src/session_log_transcript.rs",
+            "crates/aterm-gui/src/session_log_observed.rs",
+            AGENT_STEPS,
+        ] {
+            let found = tree_with(&[(path, body.clone())]);
+            assert_eq!(spots(&found), [format!("{path}:2")], "{found:?}");
+        }
+        for path in [
+            "crates/aterm-agent/src/harness/steps_tests.rs",
+            "crates/aterm-agent/src/harness/footer.rs",
+        ] {
+            let found = tree_with(&[(path, body.clone())]);
+            assert!(found.is_empty(), "{path}: {found:?}");
+        }
     }
 
     /// A request string naming an input verb (`"@. key enter"`) is a finding;
@@ -477,21 +607,6 @@ mod tests {
         assert!(
             gone[0].detail.starts_with("no fn dispatch_mark"),
             "{gone:?}"
-        );
-    }
-
-    /// A renamed scope file reads as a scope finding.
-    #[test]
-    fn a_renamed_scope_file_is_a_scope_finding() {
-        let corpus = super::super::Corpus::of(&[("crates/aterm-slog/src/lib.rs", "")]);
-        let found = super::super::scope_findings(&corpus, std::slice::from_ref(&SLOG_INERT));
-        assert_eq!(
-            found.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
-            [
-                "crates/aterm-gui/src/session_log.rs",
-                "crates/aterm-gui/src/session_log_mark.rs",
-                "crates/aterm-gui/src/session_log_mirror.rs"
-            ]
         );
     }
 }

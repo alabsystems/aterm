@@ -19,7 +19,7 @@ fn only_a_headless_launch_that_may_use_a_gpu_defers_the_device() {
 fn a_headless_boot_claims_no_first_frame_warm() {
     let dir = aterm_tempfile::tempdir().expect("scratch dir");
     crate::test_env::scoped("XDG_CONFIG_HOME", dir.path(), || {
-        let warm = super::warm_config(true, (None, None));
+        let warm = super::warm_config(true, crate::app_config::CarriedZoom::default());
         let _ = warm.backend_handle.join().expect("the backend worker");
     });
     assert!(

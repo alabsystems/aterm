@@ -242,8 +242,12 @@ fn charge_cursor_body(state: &mut WindowState, now: Instant) {
             haze: 0x0018_3040,
             bar: false,
             shimmer: false,
+            dark_theme: true,
+            theme_fg: 0x00C8_D3F5,
+            theme_bg: 0x001A_1B26,
         },
         &mut halo,
+        &mut Vec::new(),
     );
     state.fx.cursor_mut().comet.tick(
         Some((2, 3)),
@@ -255,8 +259,12 @@ fn charge_cursor_body(state: &mut WindowState, now: Instant) {
             intensity: 1.0,
             color: 0x0050_FA7B,
             accent: 0x00FF_FFFF,
+            dark_theme: true,
+            theme_fg: 0x00C8_D3F5,
+            theme_bg: 0x001A_1B26,
         },
         &mut halo,
+        &mut Vec::new(),
     );
     state.fx.cursor_mut().phaser.tick(
         Some((2, 3)),
@@ -528,7 +536,8 @@ fn authoritative_headless_tab_capture_retires_charged_bodies() {
 fn physical_surface_or_scale_change_resets_coordinate_bound_cursor_effects() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    app.windows.get_mut(&wid).unwrap().win_px = Some(winit::dpi::PhysicalSize::new(640, 384));
+    app.windows.get_mut(&wid).unwrap().win_px =
+        Some(aterm_window::dpi::PhysicalSize::new(640, 384));
     let route = app.active_visible_content_route(wid).unwrap();
     assert!(!app.prepare_layout_coordinate_space(wid, route));
 
@@ -556,7 +565,8 @@ fn physical_surface_or_scale_change_resets_coordinate_bound_cursor_effects() {
         .glow
         .note_kill(Instant::now(), true);
     let surface_key = app.windows[&wid].last_layout_coordinate_space;
-    app.windows.get_mut(&wid).unwrap().win_px = Some(winit::dpi::PhysicalSize::new(641, 384));
+    app.windows.get_mut(&wid).unwrap().win_px =
+        Some(aterm_window::dpi::PhysicalSize::new(641, 384));
     assert!(!app.prepare_layout_coordinate_space(wid, route));
     assert_ne!(
         app.windows[&wid].last_layout_coordinate_space, surface_key,

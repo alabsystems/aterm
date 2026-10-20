@@ -48,7 +48,7 @@ fn messages_quiet_gap_folds_mixed_split_feedback_and_visibility() {
         app.settings_messages_quiet_gap(),
         Some(MESSAGES_PUBLISH_TICK)
     );
-    settings(&mut app, sibling).show_messages_feedback_for_test("Copied");
+    settings(&mut app, sibling).show_transient_status_for_test("Copied");
     assert_eq!(
         app.settings_messages_quiet_gap(),
         Some(MESSAGES_PUBLISH_MIN_GAP),
@@ -135,7 +135,11 @@ fn machine_command_timeout_reaps_owned_child() {
     command.arg(JOB.as_secs().to_string());
     LAST_MACHINE_CHILD.set(None);
     let began = Instant::now();
-    let result = machine_command_output(&mut command, "owned machine read", Duration::from_secs(2));
+    let result = machine_command_output(
+        &mut command,
+        "owned machine read",
+        Duration::from_millis(400),
+    );
     let elapsed = began.elapsed();
     let pid = LAST_MACHINE_CHILD
         .get()
@@ -154,9 +158,10 @@ fn machine_command_timeout_reaps_owned_child() {
 
 /// An exited child is not stdout EOF, and a flood is capped; both bounded by cause. The grandchild
 /// holding the inherited stdout sleeps `JOB`, far past the budget, so a read waiting for EOF
-/// instead of the budget returns after `JOB`. The shell runs in its own process group, and the
-/// test kills that group as soon as the call returns, so the grandchild does not hold this
-/// process's unflagged descriptors open for sibling tests.
+/// instead of the budget returns after `JOB`. The budget leaves the shell, which exits at once,
+/// most of a second to do so before the read gives up. The shell runs in its own process group,
+/// and the test kills that group as soon as the call returns, so the grandchild does not hold
+/// this process's unflagged descriptors open for sibling tests.
 #[cfg(unix)]
 #[test]
 fn machine_command_bounds_inherited_pipe_eof_and_output_flood() {
@@ -170,7 +175,7 @@ fn machine_command_bounds_inherited_pipe_eof_and_output_flood() {
     LAST_MACHINE_CHILD.set(None);
     let began = Instant::now();
     let result =
-        machine_command_output(&mut command, "owned inherited pipe", Duration::from_secs(2));
+        machine_command_output(&mut command, "owned inherited pipe", Duration::from_secs(1));
     let elapsed = began.elapsed();
     let group = LAST_MACHINE_CHILD
         .get()
@@ -364,7 +369,7 @@ fn machine_read_dispatch_conforms_and_rejects_the_historical_orphan() {
     broken.insert("rerun", i64::from(historical.machine().rerun));
     assert!(
         !expected.contains(&broken),
-        "the conformance bind must reject a refreshing card with no worker"
+        "the conformance bind must reject a refreshing status with no worker"
     );
 }
 
@@ -424,12 +429,12 @@ fn legacy_serious_mode_set_and_native_toggle_share_one_semantic_projection() {
     complete_next(&mut app);
     assert!(!app.serious_mode_enabled());
     assert_eq!(app.serious_mode_queued_projection, None);
+    // Off is Serious Mode's default, so the toggle removes the key.
     assert_eq!(
         app.native_config_service
             .value(crate::prefs::EDIT_SERIOUS_MODE)
-            .unwrap()
-            .as_deref(),
-        Some("false")
+            .unwrap(),
+        None
     );
 }
 
@@ -539,6 +544,7 @@ fn legacy_control_completion_never_translates_conflict_or_unverified_publication
     let conflict = control_settings_completion_reply(
         crate::prefs::EDIT_COPY_ON_SELECT,
         Some("true"),
+        None,
         &ConfigPatchOutcome::Conflict { revision: 9 },
         None,
     )
@@ -548,6 +554,7 @@ fn legacy_control_completion_never_translates_conflict_or_unverified_publication
     let unverified = control_settings_completion_reply(
         crate::prefs::EDIT_COPY_ON_SELECT,
         Some("true"),
+        None,
         &ConfigPatchOutcome::Indeterminate {
             message: "post-rename observation failed".to_string(),
         },
@@ -563,6 +570,7 @@ fn legacy_control_completion_never_translates_conflict_or_unverified_publication
         control_settings_completion_reply(
             crate::prefs::EDIT_COPY_ON_SELECT,
             Some("true"),
+            None,
             &ConfigPatchOutcome::Applied {
                 revision: 2,
                 undo: Some(1),
@@ -571,6 +579,178 @@ fn legacy_control_completion_never_translates_conflict_or_unverified_publication
         )
         .unwrap(),
         format!("saved: {} = true", crate::prefs::EDIT_COPY_ON_SELECT),
+    );
+    // A removal is never "saved" with an empty value.
+    let removed = control_settings_completion_reply(
+        crate::prefs::EDIT_BIDI,
+        None,
+        None,
+        &ConfigPatchOutcome::Applied {
+            revision: 3,
+            undo: Some(2),
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(removed, "removed: bidi");
+    assert!(!removed.contains(" = "), "{removed}");
+}
+
+/// Enqueue one `aterm ctl settings set|unset` write, reduce it at the lane
+/// head and publish it with its snapshot: the reply the caller gets.
+fn complete_control_field(app: &mut App, key: &str, value: Option<&str>) -> Result<String, String> {
+    let (reply, completion) = std::sync::mpsc::channel();
+    app.enqueue_control_settings_field_intent(key.to_string(), value.map(str::to_string), reply);
+    let NativeConfigRequest { origin, work } = app.native_config_pending.pop_front().unwrap();
+    let (outcome, snapshot) = match app.reduce_native_config_work(work).unwrap() {
+        ConfigPatchResult::Applied { snapshot, undo } => (
+            ConfigPatchOutcome::Applied {
+                revision: snapshot.revision,
+                undo: Some(undo.get()),
+            },
+            snapshot,
+        ),
+        ConfigPatchResult::Unchanged { snapshot } => (
+            ConfigPatchOutcome::Applied {
+                revision: snapshot.revision,
+                undo: None,
+            },
+            snapshot,
+        ),
+        other => panic!("the write must apply: {other:?}"),
+    };
+    app.publish_native_config_origin(origin, outcome, Some(snapshot), false, None);
+    completion.try_recv().expect("answered")
+}
+
+/// THE REPLY SAYS WHAT THE WRITE DID: `settings unset` answers "removed"
+/// with what the key now reads as (the words its Settings row shows), a
+/// `settings set` to the key's default is written as a removal and answered
+/// the same way, and a write that changed nothing says so. Negative
+/// controls: a real value is "saved: k = v".
+#[test]
+fn control_settings_replies_name_removals_defaults_and_no_ops() {
+    let mut app = App::headless_for_test();
+    app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+        "bidi = \"disabled\"\nwindow_theme = \"dark\"\nallow_osc52_query = true\n[matrix_rain]\nenabled = true\n"
+            .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        complete_control_field(&mut app, crate::prefs::EDIT_BIDI, None),
+        Ok("removed: bidi; now implicit (default)".to_string())
+    );
+    assert_eq!(
+        complete_control_field(&mut app, "matrix_rain.enabled", None),
+        Ok("removed: matrix_rain.enabled; now false".to_string())
+    );
+    assert_eq!(
+        complete_control_field(&mut app, crate::prefs::EDIT_BIDI, None),
+        Ok("bidi: unchanged".to_string()),
+        "a second unset of an absent key changes nothing"
+    );
+    // `settings set <key> <default>` removes the key.
+    let reply = complete_control_field(&mut app, crate::prefs::EDIT_WINDOW_THEME, Some("auto"));
+    assert_eq!(
+        reply,
+        Ok("removed: window_theme; now auto (default)".to_string())
+    );
+    let reply = complete_control_field(
+        &mut app,
+        crate::prefs::EDIT_ALLOW_OSC52_QUERY,
+        Some("false"),
+    );
+    assert_eq!(
+        reply,
+        Ok("removed: allow_osc52_query; now false".to_string())
+    );
+    let text = app.native_config_service.snapshot().text;
+    assert!(
+        !text.contains("window_theme")
+            && !text.contains("allow_osc52_query")
+            && !text.contains("bidi"),
+        "{text}"
+    );
+    assert_eq!(
+        complete_control_field(&mut app, crate::prefs::EDIT_WINDOW_THEME, Some("auto")),
+        Ok("window_theme: unchanged".to_string()),
+        "the default again, with the key absent, changes nothing"
+    );
+    assert_eq!(
+        complete_control_field(&mut app, crate::prefs::EDIT_BIDI, Some("disabled")),
+        Ok("saved: bidi = disabled".to_string())
+    );
+}
+
+/// A DURABLE WRITE WHOSE DISK GENERATION COULD NOT BE ADMITTED ANSWERS WITH
+/// WHAT IT WROTE, not the text it was asked for: the worker proved the
+/// service's candidate on disk, so a `settings set` to the key's default is
+/// "removed" (it used to say "saved: window_theme = auto" for a key the file
+/// no longer holds), a number is spelled as written ("15", not the "15.0"
+/// typed), and that the save still needs reconciling comes after what it
+/// did. Negative control: the same writes with their snapshot read the same.
+#[test]
+fn a_durable_write_awaiting_reconciliation_answers_with_what_it_wrote() {
+    let publish_unadmitted = |app: &mut App, key: &str, value: &str| {
+        let (reply, completion) = std::sync::mpsc::channel();
+        app.enqueue_control_settings_field_intent(key.to_string(), Some(value.to_string()), reply);
+        let NativeConfigRequest { origin, work } = app.native_config_pending.pop_front().unwrap();
+        let ConfigPatchResult::Applied { snapshot, undo } =
+            app.reduce_native_config_work(work).unwrap()
+        else {
+            panic!("the write must apply");
+        };
+        app.publish_native_config_origin(
+            origin,
+            ConfigPatchOutcome::Applied {
+                revision: snapshot.revision,
+                undo: Some(undo.get()),
+            },
+            None,
+            false,
+            Some("the file changed again before it could be read".to_string()),
+        );
+        completion.try_recv().expect("answered")
+    };
+    let mut app = App::headless_for_test();
+    app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+        "window_theme = \"dark\"\nfont_px = 13.0\n".to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        publish_unadmitted(&mut app, crate::prefs::EDIT_WINDOW_THEME, "auto"),
+        Ok(
+            "removed: window_theme; now auto (default); reconciliation required: the file \
+            changed again before it could be read"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        publish_unadmitted(&mut app, crate::prefs::EDIT_FONT_PX, "15.0"),
+        Ok(
+            "saved: font_px = 15; reconciliation required: the file changed again before it \
+            could be read"
+                .to_string()
+        )
+    );
+    let text = app.native_config_service.snapshot().text;
+    assert!(
+        !text.contains("window_theme") && text.contains("font_px = 15\n"),
+        "{text}"
+    );
+    // The same writes, admitted, answer the same.
+    let mut app = App::headless_for_test();
+    app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+        "window_theme = \"dark\"\nfont_px = 13.0\n".to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        complete_control_field(&mut app, crate::prefs::EDIT_WINDOW_THEME, Some("auto")),
+        Ok("removed: window_theme; now auto (default)".to_string())
+    );
+    assert_eq!(
+        complete_control_field(&mut app, crate::prefs::EDIT_FONT_PX, Some("15.0")),
+        Ok("saved: font_px = 15".to_string())
     );
 }
 
@@ -610,12 +790,12 @@ fn legacy_control_field_is_materialized_at_the_versioned_lane_head() {
         })
         .unwrap();
     assert!(matches!(reduced, ConfigPatchResult::Applied { .. }));
+    // `true` is copy_on_select's default, so the write removes the key.
     assert_eq!(
         app.native_config_service
             .value(crate::prefs::EDIT_COPY_ON_SELECT)
-            .unwrap()
-            .as_deref(),
-        Some("true")
+            .unwrap(),
+        None
     );
     assert_eq!(
         app.native_config_service
@@ -1088,6 +1268,7 @@ fn sole_worker_stamps_fifo_read_order_not_request_order() {
                 durable: None,
                 installed: None,
                 installed_unproven: false,
+                installable: None,
             },
             |_| {},
             || drained_tx.send(()).unwrap(),
@@ -1704,7 +1885,7 @@ fn status(staged_build: Option<u64>, failing_checks: u32) -> DurableUpdateStatus
         apply_failure: String::new(),
         apply_failure_build: 0,
         apply_failures_for_target: 0,
-        installable: true,
+        installable: Some(true),
         channel_unreadable: false,
         checked_at: None,
     }
@@ -1724,6 +1905,8 @@ fn reconcile_facts_with_installed(
     durable: Option<DurableUpdateStatus>,
     installed: Option<InstalledUpdate>,
 ) -> NativeUpdateReconcileFacts {
+    // The read's installability is the ledger's own answer, as production's.
+    let installable = durable.as_ref().and_then(|durable| durable.installable);
     NativeUpdateReconcileFacts {
         _ticket: NativeUpdateReconcileTicket { request_sequence },
         observation_sequence,
@@ -1731,6 +1914,7 @@ fn reconcile_facts_with_installed(
         durable,
         installed,
         installed_unproven: false,
+        installable,
     }
 }
 
@@ -1985,6 +2169,91 @@ fn a_freshly_imported_stage_raises_no_card_and_no_glow_and_a_repeat_import_is_qu
     );
 }
 
+/// A copy's Linux facts holding `staged` downloaded and unapplied, as the facts
+/// worker reads them on a Linux host.
+fn linux_status_holding(running: u64, staged: Option<u64>) -> DurableUpdateStatus {
+    let mut durable = status(None, 0);
+    durable.current_build = running;
+    durable.linux_host = true;
+    durable.linux = Some(aterm_update::LinuxUpdateStatus {
+        installed_build: running,
+        installed_version: format!("1.0.{running}"),
+        staged_build: staged,
+        staged_version: staged.map(|build| format!("1.0.{build}")),
+        staged_commit: staged.map(|_| "0123456789abcdef0123456789abcdef01234567".to_string()),
+        trial_phase: None,
+        trial_starts: 0,
+        trial_healthy: false,
+        refused_newer: false,
+    });
+    durable
+}
+
+/// A LINUX BUILD HELD FOR A PERSON IS ON THE BAND (ATERM-KI-1015-2, U21). With
+/// automatic install off, a Linux check downloads a newer build and holds it for
+/// `aterm update apply`. Settings ▸ Software Update showed it once re-read; the
+/// band never did, since the macOS apply authority takes no Linux stage
+/// (`staged_from_status`) and no Linux row stood in. The held build is said once
+/// per build — found by the loop's pass or at launch — and its row leaves with the
+/// stage. Negative control: a reduction holding nothing says nothing.
+#[test]
+fn a_linux_build_held_for_a_person_is_said_once_and_leaves_with_its_stage() {
+    let mut app = App::headless_for_test();
+    let running = app.native_updater_service.snapshot().current_build;
+    let held = |app: &App| {
+        app.messages
+            .live_by_key(crate::update_words::KEY_HELD)
+            .map(|l| (l.msg.title.clone(), l.msg.detail.join(" ")))
+    };
+    let mut sequence = 0;
+    let mut reduce = |app: &mut App, purpose, staged| {
+        sequence += 1;
+        app.finish_native_update_reconcile(
+            purpose,
+            reconcile_facts(
+                sequence,
+                sequence,
+                Some(linux_status_holding(running, staged)),
+            ),
+        );
+    };
+    reduce(&mut app, NativeUpdateReconcilePurpose::Startup, None);
+    assert_eq!(held(&app), None, "nothing held, nothing said");
+    let build = running + 2;
+    reduce(
+        &mut app,
+        NativeUpdateReconcilePurpose::StageAvailable,
+        Some(build),
+    );
+    let (title, detail) = held(&app).expect("the held build is on the band");
+    assert!(title.contains(&format!("1.0.{build}")), "{title}");
+    assert!(detail.contains("aterm update apply"), "{detail}");
+    assert!(
+        app.native_updater_service.snapshot().staged.is_none(),
+        "PRECONDITION: no macOS apply authority holds it"
+    );
+    let id = app
+        .messages
+        .live_by_key(crate::update_words::KEY_HELD)
+        .unwrap()
+        .id;
+    app.withdraw_message(id);
+    reduce(
+        &mut app,
+        NativeUpdateReconcilePurpose::StageAvailable,
+        Some(build),
+    );
+    assert_eq!(held(&app), None, "said once per build");
+    reduce(
+        &mut app,
+        NativeUpdateReconcilePurpose::StageAvailable,
+        Some(build + 1),
+    );
+    assert!(held(&app).is_some(), "a newer held build is said");
+    reduce(&mut app, NativeUpdateReconcilePurpose::StageAvailable, None);
+    assert_eq!(held(&app), None, "its row leaves with the stage");
+}
+
 #[test]
 fn a_bundle_newer_than_the_process_becomes_an_activation_stage_and_stays_one() {
     let mut app = App::headless_for_test();
@@ -2155,7 +2424,7 @@ fn installed_environment_repair_conforms_and_preserves_unrelated_budgets() {
         durable.apply_failure_build = 11;
         durable.apply_failures_for_target = 1;
         durable.apply_failure = reason.to_string();
-        durable.installable = case != 9;
+        durable.installable = Some(case != 9);
         let mut facts = reconcile_facts_with_installed(
             1,
             1,
@@ -5156,7 +5425,7 @@ fn durable_download_status(app: &App, build: u64) -> DurableUpdateStatus {
         apply_failure: String::new(),
         apply_failure_build: 0,
         apply_failures_for_target: 0,
-        installable: true,
+        installable: Some(true),
         channel_unreadable: false,
         checked_at: None,
     }
@@ -5270,11 +5539,15 @@ fn park_a_settings_draft_in_a_background_tab(
     let (instance, view) = app
         .active_native_view(wid)
         .expect("PRECONDITION: the new Settings tab is the active native view");
+    // The font row's text entry (what "Other…" opens), then a name typed in.
     for event in [
-        crate::native_app::AppEvent::FocusChanged(Some(crate::native_ui::UiKey::new(format!(
-            "settings/control/{}",
-            crate::prefs::EDIT_FONT_FAMILY
-        )))),
+        crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+            id: crate::native_ui::ActionId::new(format!(
+                "settings/set/{}",
+                crate::prefs::EDIT_FONT_FAMILY
+            )),
+            value: None,
+        }),
         crate::native_app::AppEvent::TextInput(crate::native_app::TextInputEvent::SelectAll),
         crate::native_app::AppEvent::TextInput(crate::native_app::TextInputEvent::Commit(
             "Update Probe Mono".to_string(),
@@ -5406,8 +5679,9 @@ fn spend_one_preflight_block_budget(app: &mut App) {
 
 /// The overdue notice only claims a lane that lands by itself: the updater
 /// is told `false` with `[update] auto_apply` off, when the in-session
-/// handoff cannot run (`HandoffDisabled`), and while a person's unsaved work
-/// holds the lane.
+/// handoff cannot run (`HandoffDisabled`), while a person's unsaved work
+/// holds the lane, and while a process that keeps its image has no terminal
+/// for its only lane to hand over (`KeptImageNeedsTerminal`).
 #[test]
 fn a_lane_that_waits_by_design_is_not_reported_as_landing_by_itself() {
     use crate::app_update_handoff::HandoffUnavailable;
@@ -5429,6 +5703,27 @@ fn a_lane_that_waits_by_design_is_not_reported_as_landing_by_itself() {
         !app.update_lands_by_itself(true),
         "and the live reading agrees (a headless App has no handoff either)"
     );
+    app.update_waits_on_person = None;
+    #[cfg(unix)]
+    {
+        app.launch_image_kept = true;
+        assert!(
+            app.update_lands_by_itself_with(true, None),
+            "CONTROL: a kept image with a live terminal hands it over by itself"
+        );
+        let ids: Vec<u64> = app.pool.iter().map(|session| session.id).collect();
+        assert!(!ids.is_empty(), "PRECONDITION: the test App has a terminal");
+        for id in ids {
+            app.store
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_state(id, crate::session_store::SessionState::Exited);
+        }
+        assert!(
+            !app.update_lands_by_itself_with(true, None),
+            "a kept image with no live terminal waits for one"
+        );
+    }
 }
 
 /// Every wait on a person has its notice: the standing row's key is shared by every wait and a
@@ -6112,8 +6407,13 @@ fn nonannounced_automatic_blocks_are_durable_only_after_real_attempts() {
     app.clear_messages_for_test();
 
     force_auto_apply_attempt_now(&mut app);
+    let attempted_at = std::time::Instant::now();
     app.try_pending_native_auto_apply(false);
     assert_eq!(app.auto_apply_intent.unwrap().attempts, 1);
+    assert!(
+        app.auto_apply_intent.unwrap().retry_at > attempted_at,
+        "the blocked attempt sets its own retry in the future"
+    );
     let report = aterm_update::apply_lane_report(current).unwrap();
     assert_eq!(report.last_refusal, App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY);
     assert!(!report.last_refusal_at.is_empty());
@@ -6134,6 +6434,12 @@ fn nonannounced_automatic_blocks_are_durable_only_after_real_attempts() {
     // a future retry neither spends an attempt nor replaces the standing explanation.
     const BETWEEN: &str = "test marker between actual automatic attempts";
     aterm_update::record_apply_refusal(current, BETWEEN);
+    // The polls run inside the retry window however slowly a loaded machine runs them:
+    // the window is pinned an hour out (what is under test is the poll's `now <
+    // retry_at`, not the length of the first delay).
+    let mut intent = app.auto_apply_intent.unwrap();
+    intent.retry_at = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    app.auto_apply_intent = Some(intent);
     for _ in 0..16 {
         app.try_pending_native_auto_apply(false);
     }
@@ -6771,6 +7077,7 @@ fn a_reaped_abort_restates_the_staged_bar_it_stands_down() {
             .seamless_handoff_unavailable()
             .expect("a headless App has no seamless lane"),
         veto: None,
+        image_kept: false,
     };
     assert_eq!(recorded(&app), staged_detail(unavailable));
     // The ready row a windowed app with automatic install off paints.
@@ -7030,6 +7337,79 @@ fn rejected_native_completion_clears_the_settings_tab_busy_indicator() {
     );
 }
 
+/// A FOCUS THAT LEFT THE FOCUS ORDER RESUMES WHERE IT STOOD (s-25): a control that
+/// disabled itself under the keyboard (the Activity pager's Older at its end) left
+/// the order, and Tab jumped to the page's first control, Shift-Tab to its last.
+/// Now Tab takes the nearest focusable after it in reading order, Shift-Tab the
+/// nearest before. NEGATIVE CONTROL: with no focus at all, Tab starts at the first.
+#[test]
+fn tab_from_a_focus_that_left_the_order_resumes_where_it_stood() {
+    let mut app = App::headless_for_test();
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
+    let wid = WindowId(0);
+    let (_, view) = app.active_native_view(wid).expect("active Settings view");
+    let compiled = app.compiled_native_ui(wid).expect("the page compiles");
+    let order_of = |key: &crate::native_ui::UiKey| {
+        compiled
+            .semantics
+            .iter()
+            .position(|node| &node.key == key)
+            .expect("in the tree")
+    };
+    // A node in the middle of the page that is not a stop of the focus order.
+    let middle = order_of(&compiled.focus_order[compiled.focus_order.len() / 2]);
+    let stranded = compiled.semantics[..middle]
+        .iter()
+        .rev()
+        .map(|node| node.key.clone())
+        .find(|key| !compiled.focus_order.contains(key))
+        .expect("an unfocusable node before the middle control");
+    let at = order_of(&stranded);
+    let after = compiled
+        .focus_order
+        .iter()
+        .find(|key| order_of(key) > at)
+        .cloned()
+        .expect("a control after it");
+    let before = compiled
+        .focus_order
+        .iter()
+        .rev()
+        .find(|key| order_of(key) < at)
+        .cloned()
+        .expect("a control before it");
+    let focus = |app: &App| {
+        app.native_runtime
+            .view_state(view)
+            .and_then(|state| state.common().last_focus.clone())
+    };
+    let strand = |app: &mut App| {
+        app.native_runtime
+            .view_state_mut(view)
+            .expect("the view")
+            .common_mut()
+            .last_focus = Some(stranded.clone());
+    };
+    strand(&mut app);
+    app.move_native_focus(wid, false).unwrap();
+    assert_eq!(
+        focus(&app),
+        Some(after.clone()),
+        "Tab takes the next control"
+    );
+    strand(&mut app);
+    app.move_native_focus(wid, true).unwrap();
+    assert_eq!(focus(&app), Some(before), "Shift-Tab takes the one before");
+    // NEGATIVE CONTROL: nothing focused starts at the first control.
+    app.native_runtime
+        .view_state_mut(view)
+        .expect("the view")
+        .common_mut()
+        .last_focus = None;
+    app.move_native_focus(wid, false).unwrap();
+    assert_ne!(focus(&app), Some(after), "no focus is not a stranded one");
+}
+
 #[test]
 fn tab_focus_walks_the_compiled_semantic_order() {
     let mut app = App::headless_for_test();
@@ -7278,8 +7658,8 @@ fn space_types_into_a_font_list_search_once_a_name_is_begun() {
 /// (`NumpadDelete`) is a forward delete.
 #[test]
 fn keypad_digit_and_delete_reach_a_focused_settings_field() {
-    use winit::event::{ElementState, KeyEvent};
-    use winit::keyboard::{
+    use aterm_window::event::{ElementState, KeyEvent};
+    use aterm_window::keyboard::{
         Key as WinitKey, KeyCode, KeyLocation, NamedKey as WinitNamed, PhysicalKey, SmolStr,
     };
 
@@ -8109,7 +8489,7 @@ fn palette_explicit_default_stays_dark_after_save_on_a_light_os() {
     // The wire/Settings unset draws Default too, on this light OS. Run that
     // real lane, then admit its snapshot as the file watcher does.
     let (reply, unset) = complete_control_theme_field(&mut app, None);
-    reply.expect("the explicit unset is saved");
+    assert_eq!(reply, Ok("removed: theme; now Default".to_string()));
     assert_eq!(unset.config.theme, None);
     assert!(!unset.text.contains("theme ="), "{}", unset.text);
     app.config = (*unset.config).clone();
@@ -8653,5 +9033,245 @@ fn palette_theme_choice_refused_reverts_and_says_why() {
         app.theme_preview.as_ref().map(|p| p.hold),
         Some(PreviewHold::Until(now + std::time::Duration::from_secs(60))),
         "a refusal ends only the committing preview"
+    );
+}
+
+/// THE THEME LIST IS ONE TAB STOP: with a theme tried from the filter, Tab
+/// from the filter lands on the highlighted row (not the list's first), the
+/// next Tab leaves the list in one step, and Shift-Tab comes back to the
+/// highlighted row. Negative control: the first row is not the one tried.
+#[test]
+fn tab_enters_the_theme_list_at_the_highlighted_row_and_leaves_in_one_step() {
+    use crate::native_ui::UiKey;
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    {
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.cols = 160;
+        window.rows = 50;
+    }
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Themes));
+    let (instance, view) = app.active_native_view(wid).expect("active Settings view");
+    let _ = app.compiled_native_ui(wid).unwrap();
+    let filter = UiKey::new("settings/showcase/filter");
+    app.native_runtime
+        .dispatch(instance, view, AppEvent::FocusChanged(Some(filter.clone())))
+        .unwrap();
+    for _ in 0..3 {
+        app.native_runtime
+            .dispatch(instance, view, AppEvent::StepFocus(1))
+            .unwrap();
+    }
+    app.invalidate_native_view_cache(wid, view, DamageRegion::All);
+    let focus = |app: &App| {
+        app.native_runtime
+            .view_state(view)
+            .and_then(|state| state.common().last_focus.clone())
+            .expect("a focused control")
+    };
+    assert_eq!(
+        focus(&app),
+        filter,
+        "the arrows leave the keyboard in the filter"
+    );
+    let Some(crate::native_app::AppViewState::Settings(state)) =
+        app.native_runtime.view_state(view)
+    else {
+        panic!("a Settings view")
+    };
+    let highlighted = UiKey::new(format!(
+        "settings/showcase/card/{}",
+        state.highlighted_slug().expect("a highlighted row")
+    ));
+    let compiled = app.compiled_native_ui(wid).unwrap();
+    let first_row = compiled
+        .focus_order
+        .iter()
+        .find(|key| {
+            key.as_str()
+                .strip_prefix("settings/showcase/card/")
+                .is_some_and(|slug| !slug.contains('/'))
+        })
+        .expect("a row in Tab order")
+        .clone();
+    assert_ne!(first_row, highlighted, "the control: a row below the first");
+
+    app.move_native_focus(wid, false).unwrap();
+    assert_eq!(
+        focus(&app),
+        highlighted,
+        "Tab enters at the highlighted row"
+    );
+    app.move_native_focus(wid, false).unwrap();
+    let out = focus(&app);
+    assert!(
+        !out.as_str().starts_with("settings/showcase/card/"),
+        "the next Tab leaves the list: {}",
+        out.as_str()
+    );
+    app.move_native_focus(wid, true).unwrap();
+    assert_eq!(focus(&app), highlighted, "Shift-Tab comes back to it");
+}
+
+/// A SEGMENTED CONTROL IS ONE CONTROL TO THE KEYBOARD, on every page that
+/// draws one ([`crate::native_ui::UiNode::segmented`]): one Tab stop (the
+/// chosen segment, or the one the keyboard is on); Left and Right move
+/// between its segments and stop at its ends, choosing nothing; Return or
+/// Space chooses the one the keyboard is on. From a segment not chosen, Down
+/// steps to the next row and Tab leaves the control for the one after it
+/// (never to the list's first control, never to another segment), and
+/// Shift-Tab back into the control lands on its chosen segment. Settings ▸
+/// Terminal's Bidirectional text and Messages' severity filter answer alike.
+#[test]
+fn a_segmented_control_is_one_tab_stop_and_one_arrow_model() {
+    use crate::native_ui::UiKey;
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+    let press = |key| crate::input::InputEvent::Key {
+        key: Key::Named(key),
+        mods: Modifiers::empty(),
+        base_layout: None,
+        layout_text: None,
+        event_type: KeyEventType::Press,
+    };
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    {
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.cols = 150;
+        window.rows = 48;
+    }
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Terminal));
+    let (_, view) = app.active_native_view(wid).expect("active Settings view");
+    let focus = |app: &App| {
+        app.native_runtime
+            .view_state(view)
+            .and_then(|state| state.common().last_focus.clone())
+    };
+    let key = |text: &str| UiKey::new(text);
+    let bidi = crate::prefs::EDIT_BIDI;
+    let saved = key(&format!("settings/control/{bidi}"));
+    let off = key(&format!("settings/segment/{bidi}/1"));
+    let asked = key(&format!("settings/segment/{bidi}/2"));
+    let segments = [saved.clone(), off.clone(), asked.clone()];
+    let stops = |app: &App| {
+        let compiled = app.compiled_native_ui(wid).unwrap();
+        segments
+            .iter()
+            .filter(|segment| compiled.focus_order.contains(segment))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        stops(&app),
+        std::slice::from_ref(&saved),
+        "at rest: one stop, the chosen"
+    );
+
+    // Left/Right move, choose nothing, stop at the ends.
+    app.dispatch_native_event(wid, AppEvent::FocusChanged(Some(saved.clone())))
+        .unwrap();
+    assert!(app.native_input_event(wid, &press(NamedKey::ArrowRight)));
+    assert_eq!(focus(&app).as_ref(), Some(&off));
+    assert_eq!(
+        stops(&app),
+        std::slice::from_ref(&off),
+        "the stop is the one the keyboard is on"
+    );
+    assert!(app.native_input_event(wid, &press(NamedKey::ArrowRight)));
+    assert!(app.native_input_event(wid, &press(NamedKey::ArrowRight)));
+    assert_eq!(focus(&app).as_ref(), Some(&asked), "it stops at its end");
+    assert!(app.native_input_event(wid, &press(NamedKey::ArrowLeft)));
+    assert_eq!(focus(&app).as_ref(), Some(&off));
+    let busy = |app: &App, segment: &UiKey| {
+        app.compiled_native_ui(wid)
+            .unwrap()
+            .semantic(segment)
+            .and_then(|node| node.state)
+            .is_some_and(|state| state.busy)
+    };
+    assert!(!busy(&app, &off), "an arrow chooses nothing");
+
+    // Down from a segment not chosen steps to the next row; Up back.
+    let after = key(&format!(
+        "settings/control/{}",
+        crate::prefs::EDIT_AMBIGUOUS_WIDTH
+    ));
+    let before = key(&format!(
+        "settings/control/{}",
+        crate::prefs::EDIT_SEARCH_HISTORY_LINES
+    ));
+    assert!(app.native_input_event(wid, &press(NamedKey::ArrowDown)));
+    assert_eq!(focus(&app).as_ref(), Some(&after), "Down: the next row");
+    app.dispatch_native_event(wid, AppEvent::FocusChanged(Some(off.clone())))
+        .unwrap();
+    assert!(app.native_input_event(wid, &press(NamedKey::ArrowUp)));
+    assert_eq!(focus(&app).as_ref(), Some(&before), "Up: the row before");
+
+    // Tab from a segment not chosen leaves the control; Shift-Tab back in
+    // lands on the chosen segment; Shift-Tab from a segment leaves it.
+    app.dispatch_native_event(wid, AppEvent::FocusChanged(Some(off.clone())))
+        .unwrap();
+    app.move_native_focus(wid, false).unwrap();
+    assert_eq!(focus(&app).as_ref(), Some(&after), "Tab: the control after");
+    app.move_native_focus(wid, true).unwrap();
+    assert_eq!(
+        focus(&app).as_ref(),
+        Some(&saved),
+        "Shift-Tab: the chosen segment"
+    );
+    app.dispatch_native_event(wid, AppEvent::FocusChanged(Some(off.clone())))
+        .unwrap();
+    app.move_native_focus(wid, true).unwrap();
+    assert_eq!(
+        focus(&app).as_ref(),
+        Some(&before),
+        "Shift-Tab: the control before"
+    );
+
+    // Space chooses the one the keyboard is on.
+    app.dispatch_native_event(wid, AppEvent::FocusChanged(Some(off.clone())))
+        .unwrap();
+    assert!(app.native_input_event(wid, &press(NamedKey::Space)));
+    assert!(busy(&app, &off) || busy(&app, &saved), "Space saves Off");
+
+    // Messages' severity filter: the same control.
+    {
+        use aterm_messages::{Message, Severity, tags};
+        app.post_message(Message::new(tags::SYSTEM, Severity::Warn, "a problem"));
+        app.post_message(Message::new(tags::SYSTEM, Severity::Info, "a note"));
+    }
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Messages));
+    let (_, view) = app.active_native_view(wid).expect("active Settings view");
+    let all = key("settings/messages/filter/all");
+    let warn = key("settings/messages/filter/warn");
+    let compiled = app.compiled_native_ui(wid).unwrap();
+    assert_eq!(
+        [&all, &warn]
+            .into_iter()
+            .filter(|segment| compiled.focus_order.contains(segment))
+            .count(),
+        1,
+        "the severity filter is one Tab stop"
+    );
+    app.dispatch_native_event(wid, AppEvent::FocusChanged(Some(all.clone())))
+        .unwrap();
+    assert!(app.native_input_event(wid, &press(NamedKey::ArrowRight)));
+    let state = |app: &App| match app.native_runtime.view_state(view) {
+        Some(crate::native_app::AppViewState::Settings(state)) => (
+            state.common.last_focus.clone(),
+            state.messages_filter.warn_only,
+        ),
+        _ => panic!("Settings view"),
+    };
+    assert_eq!(
+        state(&app),
+        (Some(warn.clone()), false),
+        "Right moves, chooses nothing"
+    );
+    assert!(app.native_input_event(wid, &press(NamedKey::Space)));
+    assert_eq!(
+        state(&app),
+        (Some(warn.clone()), true),
+        "Space chooses Problems"
     );
 }

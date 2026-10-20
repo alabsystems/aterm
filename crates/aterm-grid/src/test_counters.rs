@@ -163,6 +163,30 @@ pub(crate) fn take_reflow_passthrough_lines() -> usize {
     })
 }
 
+// History rows a width change reads on the caller's thread to lay the rows
+// out where the rows hand-back puts them (`Grid::prepare_rewrap`: a line's
+// head brought onto the screen, the rows down to the owed window's top).
+// Must stay bounded by the screen, never by history or a line's length
+// (`tests/reflow/cost_bound.rs`).
+thread_local! {
+    static HANDBACK_HISTORY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Increment the hand-back history-read counter by `n`.
+pub(crate) fn count_handback_history_reads(n: usize) {
+    HANDBACK_HISTORY_READS.with(|c| c.set(c.get() + n));
+}
+
+/// Take (read and reset) the hand-back history-read count.
+#[cfg(test)]
+pub(crate) fn take_handback_history_reads() -> usize {
+    HANDBACK_HISTORY_READS.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    })
+}
+
 // Ring rows a rows-only resize evacuates out of the grid ring
 // (`tests/reflow/rows_only_cost_bound.rs`). Must stay bounded by the height
 // delta, never by history.

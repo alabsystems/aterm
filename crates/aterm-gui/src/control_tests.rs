@@ -2270,6 +2270,31 @@ fn a_pre_challenge_guess_or_a_half_close_is_quarantined_not_acknowledged() {
     }
 }
 
+/// A verb removed with the embedded operator or the network drive answers
+/// an old client with what replaced it, never the bare unknown-verb line.
+#[test]
+fn removed_verbs_are_unadvertised_stable_tombstones() {
+    for operator in ["operator", "operator-propose-bin"] {
+        let said =
+            retired_verb_error(operator).unwrap_or_else(|| panic!("{operator} has a tombstone"));
+        assert!(
+            said.starts_with(&format!("ERR verb {operator} was removed")),
+            "{said}"
+        );
+        assert!(said.contains("spawn agent=claude"), "{operator}: {said}");
+    }
+    for dial in ["dial", "dial-list", "dial-token"] {
+        let said = retired_verb_error(dial).unwrap_or_else(|| panic!("{dial} has a tombstone"));
+        assert!(
+            said.starts_with(&format!("ERR verb {dial} was removed")),
+            "{said}"
+        );
+        assert!(said.contains("aterm fleet init"), "{dial}: {said}");
+    }
+    // NEGATIVE CONTROL: a verb nothing removed has no tombstone.
+    assert_eq!(retired_verb_error("operators"), None);
+}
+
 /// The `cwd` / `cell` / `colors` / `modes` read verbs, one row per terminal state: a
 /// fresh 24×80 terminal, seed bytes, one verb call, then exact / prefix / needle
 /// checks. Two rows guard against a program forging control-protocol reply text.
@@ -2486,6 +2511,106 @@ fn owner_only_verbs_refuse_an_edge_and_a_named_session() {
     );
 }
 
+/// `task mark` is Owner-only at the dispatch gate (`escalated_op`): an edge
+/// granted ANY op on the session is refused it — a manager acts on the record,
+/// so no edge may forge one — while a read edge reads `task` and parks `await
+/// task`, and an ungranted edge does neither.
+#[test]
+fn task_mark_is_owner_only_and_task_is_a_read() {
+    let ctx = test_ctx();
+    assert!(dispatch_authorized(Scope::Owner, "task", "mark done", &ctx));
+    for op in [Op::ReadScreen, Op::WriteInput, Op::Signal, Op::ConfigWrite] {
+        let granted = edge_granted(op, &ctx);
+        assert!(
+            !dispatch_authorized(granted, "task", "mark done why=marker", &ctx),
+            "{op:?}"
+        );
+    }
+    let read = edge_granted(Op::ReadScreen, &ctx);
+    assert!(dispatch_authorized(read, "task", "", &ctx));
+    assert!(dispatch_authorized(read, "await", "task since=1", &ctx));
+    assert!(!dispatch_authorized(edge(), "task", "", &ctx));
+    assert!(!dispatch_authorized(edge(), "await", "task", &ctx));
+}
+
+/// The list form of `await task` is the dispatcher's (no session of the
+/// connection's own needed), and only a bare `await task` with an `@` word in it.
+#[test]
+fn the_await_task_list_form_is_told_from_every_other_await() {
+    assert_eq!(
+        await_task_list("task @s-a,@s-b all since=3"),
+        Some(vec!["@s-a,@s-b", "all", "since=3"])
+    );
+    for other in [
+        "task since=3",
+        "task",
+        "agent idle",
+        "inbox since=1",
+        "taskforce @s-a",
+    ] {
+        assert_eq!(await_task_list(other), None, "{other:?}");
+    }
+}
+
+/// The list form resolves every target in THIS instance: one it does not host
+/// fails the whole request (the client routes siblings), a scoped caller needs
+/// a read edge on each, and a news-bearing worker answers through the same
+/// rows `await_task` writes.
+#[test]
+fn dispatch_await_task_resolves_its_list_and_refuses_what_it_cannot() {
+    use crate::task_record::{TaskMark, TaskState, mark_session_task};
+    let store = session_store::new_store();
+    let subscribers = crate::subscribe::new_registry();
+    let active: ActiveHandle = Arc::default();
+    let a = registered_session(1, -1, b"");
+    let b = registered_session(2, -1, b"");
+    store.write().unwrap().register(a.clone());
+    store.write().unwrap().register(b.clone());
+    mark_session_task(&a.ctx, 1, &TaskMark::new(TaskState::Done), &subscribers).expect("unfenced");
+    let list = format!("@{},@2 since=0 timeout=60000", a.sid.as_str());
+    let words: Vec<&str> = list.split_whitespace().collect();
+    let reply = dispatch_await_task(&words, &active, &store, &subscribers, Scope::Owner);
+    assert!(reply.starts_with("OK 2\n"), "{reply}");
+    assert!(
+        reply.contains(&format!("@{} rev=1 state=done ", a.sid.as_str()))
+            && reply.contains(&format!("@{} rev=0 state=- ", b.sid.as_str())),
+        "{reply}"
+    );
+    // One session named twice is two targets: a row each, in request order,
+    // so a client reads row `i` as target `i`'s.
+    let twice = format!("@1,@{} since=0 timeout=60000", a.sid.as_str());
+    let words: Vec<&str> = twice.split_whitespace().collect();
+    let reply = dispatch_await_task(&words, &active, &store, &subscribers, Scope::Owner);
+    let rows: Vec<&str> = reply.lines().collect();
+    assert_eq!(rows.len(), 3, "{reply}");
+    assert_eq!(rows[0], "OK 2", "{reply}");
+    assert!(
+        rows[1].starts_with(&format!("@{} rev=1 state=done ", a.sid.as_str()))
+            && rows[1] == rows[2],
+        "{reply}"
+    );
+    let missing = dispatch_await_task(
+        &["@2,@s-0000000000000000dead"],
+        &active,
+        &store,
+        &subscribers,
+        Scope::Owner,
+    );
+    assert_eq!(missing, "ERR no such session @s-0000000000000000dead\n");
+    assert_eq!(
+        dispatch_await_task(&["@."], &active, &store, &subscribers, Scope::Owner),
+        NO_ACTIVE_TERMINAL
+    );
+    assert_eq!(
+        dispatch_await_task(&["@2"], &active, &store, &subscribers, edge()),
+        "ERR denied\n"
+    );
+    assert_eq!(
+        dispatch_await_task(&["@2", "@1"], &active, &store, &subscribers, Scope::Owner),
+        crate::task_record::AWAIT_TASK_USAGE
+    );
+}
+
 /// Which requests move to a wait lane (`control_lanes.rs`): those that park on an
 /// event or hand the connection to a relay. Every read, keystroke and `subscribe`
 /// that flips to push here is request-lane work; a `subscribe` to one session
@@ -2519,6 +2644,9 @@ fn wait_requests_are_the_ones_that_park_or_relay() {
         // Settles 60 ms and folds the whole recording (`cast drift`).
         "cast drift",
         &format!("@{local_sid} cast drift max_runs=4"),
+        // Waits, bounded, for the console host's forwarded leave.
+        "mainscreen",
+        &format!("@{local_sid} mainscreen"),
         // A paste into another session waits, bounded, for its program to read
         // it (`background_input`): never a request lane's wait. So does a
         // `paste-bin` whatever it names: flagless, it takes the same wait when
@@ -2633,7 +2761,7 @@ fn authenticated_readiness_preserves_slow_cadence() {
     });
     let mut reader = control_lanes::lane_reader(&server, Vec::new());
     assert_eq!(
-        read_authenticated_request_line(&mut reader).as_deref(),
+        read_authenticated_request_line(&mut reader, &mut std::io::sink()).as_deref(),
         Some("version"),
         "authenticated readiness must not become an undocumented EOF"
     );
@@ -2672,7 +2800,7 @@ fn authenticated_readiness_preserves_partial_line() {
     });
     let mut reader = control_lanes::lane_reader(&server, Vec::new());
     assert_eq!(
-        read_authenticated_request_line(&mut reader).as_deref(),
+        read_authenticated_request_line(&mut reader, &mut std::io::sink()).as_deref(),
         Some("version")
     );
     sender.join().expect("sender exits");
@@ -2695,9 +2823,9 @@ fn authenticated_readiness_drains_prefetched_lines_without_waiting() {
     let (tx, rx) = std::sync::mpsc::channel();
     let reader_thread = std::thread::spawn(move || {
         let mut reader = control_lanes::lane_reader(&server, Vec::new());
-        let first = read_authenticated_request_line(&mut reader);
+        let first = read_authenticated_request_line(&mut reader, &mut std::io::sink());
         let prefetched = !reader.buffer().is_empty();
-        let second = read_authenticated_request_line(&mut reader);
+        let second = read_authenticated_request_line(&mut reader, &mut std::io::sink());
         let _ = tx.send((first, prefetched, second));
     });
     let result = rx.recv_timeout(EVENTUALLY);
@@ -2728,10 +2856,10 @@ fn authenticated_readiness_reads_carried_lines_without_waiting() {
     let (tx, rx) = std::sync::mpsc::channel();
     let reader_thread = std::thread::spawn(move || {
         let mut reader = control_lanes::lane_reader(&server, b"version\nstatus\n".to_vec());
-        let first = read_authenticated_request_line(&mut reader);
-        let second = read_authenticated_request_line(&mut reader);
+        let first = read_authenticated_request_line(&mut reader, &mut std::io::sink());
+        let second = read_authenticated_request_line(&mut reader, &mut std::io::sink());
         let _ = tx.send((first, second));
-        read_authenticated_request_line(&mut reader)
+        read_authenticated_request_line(&mut reader, &mut std::io::sink())
     });
     // The carried lines MUST be answered with no socket event at all: a
     // hang detector, never a 2 s budget. A reader that waits on the socket
@@ -2762,8 +2890,8 @@ fn authenticated_readiness_drains_tail_then_observes_peer_eof() {
     let (tx, rx) = std::sync::mpsc::channel();
     let reader_thread = std::thread::spawn(move || {
         let mut reader = control_lanes::lane_reader(&server, Vec::new());
-        let tail = read_authenticated_request_line(&mut reader);
-        let eof = read_authenticated_request_line(&mut reader);
+        let tail = read_authenticated_request_line(&mut reader, &mut std::io::sink());
+        let eof = read_authenticated_request_line(&mut reader, &mut std::io::sink());
         let _ = tx.send((tail, eof));
     });
     client.write_all(b"final tail").expect("unterminated line");
@@ -3191,6 +3319,19 @@ fn screen_styled_frame_is_lossless() {
             ],
         ),
         ("shape", 3, 10, b"hi", &[]),
+        (
+            // SGR 5 blink, which `cell` reports and the resolved colours do not
+            // carry; then SGR 25 ends it, so the next cell has none.
+            "blink",
+            2,
+            10,
+            b"\x1b[5;4mB\x1b[25mN",
+            &[
+                "{\"glyph\":\"B\",\"fg\":",
+                "\"attrs\":[\"underline\",\"blink\"]",
+                "\"attrs\":[\"underline\"]",
+            ],
+        ),
         (
             "grapheme and hyperlink",
             2,
@@ -3837,7 +3978,7 @@ fn proxy_forward_plan_conforms_to_no_transitive_authority() {
     // What each scope IS (see the doc): stated here, not read from the router.
     let owner_authority = |scope: Scope| match scope {
         Scope::Owner | Scope::Bridge => true,
-        Scope::Edge(_) => false,
+        Scope::Edge(_) | Scope::Fleet { .. } => false,
     };
     let model = aterm_models_session::no_transitive_authority_model();
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
@@ -3862,6 +4003,14 @@ fn proxy_forward_plan_conforms_to_no_transitive_authority() {
             ("owner", Scope::Owner),
             ("bridge", Scope::Bridge),
             ("arrived", arrived_scope),
+            // A fleet peer is never forwarded, even past its own gate.
+            (
+                "fleet",
+                Scope::Fleet {
+                    content: true,
+                    drive: false,
+                },
+            ),
         ] {
             let owner = owner_authority(scope);
             let forwarded = proxy_forward_plan(line, scope, &store, &dir).is_some();
@@ -3899,9 +4048,9 @@ fn proxy_forward_plan_conforms_to_no_transitive_authority() {
     }
     assert_eq!(
         buggy_rejections,
-        lines.len(),
+        2 * lines.len(),
         "the owner-waiving mutant must part from the real router on exactly the \
-         arrived connection's lines"
+         non-owner connections' lines: the arrived edge's and the fleet peer's"
     );
     crate::proxy::deregister_child(&at_child.sid);
     let _ = std::fs::remove_dir_all(&dir);
@@ -4844,8 +4993,8 @@ fn paint_alt_frame(t: &mut Terminal, start: usize) {
 }
 
 /// `help --json` is the verb table as one JSON line: a row per `VerbSpec` in table
-/// order with name, op, framing, target, access and summary, the fields the text
-/// catalog renders.
+/// order with name, op, framing, target, access, fleet and summary, the fields the
+/// text catalog renders plus whether a fleet peer may run the verb.
 #[test]
 fn help_json_is_the_verb_table() {
     use aterm_types::control_verbs::VERBS;
@@ -4871,9 +5020,192 @@ fn help_json_is_the_verb_table() {
         assert_eq!(field("framing"), spec.framing.wire_name(), "{}", spec.name);
         assert_eq!(field("target"), spec.target.wire_name(), "{}", spec.name);
         assert_eq!(field("access"), spec.access.wire_name(), "{}", spec.name);
+        assert_eq!(
+            row.get("fleet").and_then(|x| x.as_bool()),
+            Some(spec.fleet),
+            "{}",
+            spec.name
+        );
         assert_eq!(field("summary"), spec.summary, "{}", spec.name);
     }
     assert!(cmd_help("--nope").starts_with("ERR usage: help"));
+}
+
+/// THE FLEET GATE: a fleet peer runs only a verb the table marks `fleet`, with
+/// no selector and no frame — whatever its verb, its level or how the line is
+/// spelled — and every refusal is counted in the audit trail's fleet gate run;
+/// every other scope passes the gate untouched (its own gates judge it). The
+/// live lane (`fleet_live_headless`) proves each refusal closes the
+/// connection.
+#[test]
+fn the_fleet_gate_admits_only_fleet_verbs_with_no_selector_or_frame() {
+    use aterm_types::control_verbs::VERBS;
+    let audited = || control_denials::FLEET_GATE_DENIALS.network_total();
+    let (before, mut refused) = (audited(), 0);
+    for content in [false, true] {
+        let fleet = Scope::Fleet {
+            content,
+            drive: false,
+        };
+        for served in VERBS.iter().filter(|spec| spec.fleet) {
+            assert_eq!(fleet_refusal(served.name, fleet), None, "{}", served.name);
+        }
+        // A stray tail is the verb's own usage error, not the gate's.
+        assert_eq!(fleet_refusal("version --json", fleet), None);
+        for line in [
+            "@1 version",
+            "@s-0123456789abcdef version",
+            "@. version",
+            "@self version",
+            "@s-0123456789abcdef text",
+            "feed-bin 5",
+            "@1 feed-bin 5",
+            "paste-bin 3",
+            "post to=@s-0123456789abcdef kind=note len=3",
+            "spawn",
+            "turn hello",
+            "settings set columns 80",
+            "hold on reason=x",
+            "dial lab version",
+            "subscribe @* events",
+            "inbox get 1",
+            "sessions",
+            "help",
+            "whoami",
+            "task mark done",
+            "",
+            " version",
+            "VERSION",
+            "version\tx",
+        ] {
+            let refusal = fleet_refusal(line, fleet).unwrap_or_else(|| panic!("{line:?} passed"));
+            assert!(
+                refusal.starts_with("ERR denied: the fleet serves ") && refusal.ends_with('\n'),
+                "{line:?}: {refusal:?}"
+            );
+            assert_eq!(refusal.matches('\n').count(), 1, "one line: {refusal:?}");
+            refused += 1;
+        }
+    }
+    // Others may count too (the run is the process's): at least these.
+    assert!(
+        audited() - before >= refused,
+        "every refusal is audited: {} of {refused}",
+        audited() - before
+    );
+    // Every other scope passes the gate.
+    for scope in [
+        Scope::Owner,
+        Scope::Bridge,
+        Scope::Edge(aterm_session::EdgeToken::generate()),
+    ] {
+        for line in ["@1 text", "spawn", "feed-bin 5", "subscribe @* events"] {
+            assert_eq!(fleet_refusal(line, scope), None, "{scope:?} {line:?}");
+        }
+    }
+}
+
+/// THE EMPTY-SELECTOR GATE: a line whose leading `@` names nothing — a bare
+/// `@` (what `@$W` is when `$W` is empty), a blank after it — is refused with
+/// the one shared line, whatever verb follows; a named selector, a line with
+/// none, and an `@` inside a verb's own arguments pass it. Read past the gate,
+/// such a token is no selector at all: the head keeps it as the verb, so it
+/// can never resolve to the active session.
+#[test]
+fn the_empty_selector_gate_refuses_an_at_that_names_nothing() {
+    let refusal = format!("{}\n", aterm_types::control_verbs::EMPTY_SELECTOR);
+    for line in [
+        "@ task",
+        "@",
+        "@  turn typed=1 hi",
+        "@\tclose",
+        "@ send hi",
+        "@ signal term",
+        "@ feed-bin 3",
+        "@ spawn agent=claude len=4",
+        "@ subscribe events",
+        " @ status",
+    ] {
+        assert_eq!(
+            empty_selector_refusal(line).as_deref(),
+            Some(refusal.as_str()),
+            "{line:?}"
+        );
+    }
+    for line in [
+        "@. task",
+        "@1 text",
+        "@s-0123456789abcdef turn hi",
+        "@* status",
+        "task",
+        "send @",
+        "subscribe @. events",
+        "await task @s-a,@.",
+        "",
+    ] {
+        assert_eq!(empty_selector_refusal(line), None, "{line:?}");
+    }
+    // Past the gate: no selector, and the `@` is the verb no handler answers.
+    let (selector, verb, rest) = request_head("@ task");
+    assert!(selector.is_none());
+    assert_eq!((verb, rest), ("@", "task"));
+    let (selector, verb, _) = request_head("@. task");
+    assert!(matches!(selector, Some(Selector::SelfTok)));
+    assert_eq!(verb, "task");
+}
+
+/// A FLEET PEER'S SURVEY: the gate admits `survey`, and it is answered at
+/// the level the peer's listener proved, never more — a peer allowed facts
+/// that asks `content` reads facts. Every other scope is left to the
+/// owner-only gate, and every other verb too.
+#[test]
+fn a_fleet_peer_reads_the_survey_at_its_level() {
+    let store = crate::session_store::new_store();
+    store
+        .write()
+        .unwrap()
+        .register(crate::session_store::test_handle(1));
+    let level = |reply: &str| {
+        reply
+            .lines()
+            .nth(1)
+            .and_then(|head| head.split(' ').find_map(|kv| kv.strip_prefix("level=")))
+            .map(str::to_owned)
+    };
+    for (content, rest, want) in [
+        (false, "", "facts"),
+        (false, "content", "facts"),
+        (true, "", "content"),
+        (true, "facts", "facts"),
+    ] {
+        let fleet = Scope::Fleet {
+            content,
+            drive: false,
+        };
+        let line = format!("survey {rest}");
+        assert_eq!(fleet_refusal(line.trim(), fleet), None, "{line:?}");
+        let reply = fleet_survey("survey", rest, fleet, &store).expect("a fleet survey");
+        assert_eq!(
+            level(&reply).as_deref(),
+            Some(want),
+            "{content} {rest:?}: {reply}"
+        );
+        let row = reply.lines().nth(2).expect("the session row");
+        assert_eq!(row.contains(" cwd="), want == "content", "{row}");
+    }
+    assert_eq!(
+        fleet_survey(
+            "sessions",
+            "",
+            Scope::Fleet {
+                content: true,
+                drive: false
+            },
+            &store
+        ),
+        None
+    );
+    assert_eq!(fleet_survey("survey", "", Scope::Owner, &store), None);
 }
 
 /// An empty `turn` is a usage error unless it also submits nothing (`submit=none`, a
@@ -5036,7 +5368,7 @@ fn cross_session_input_reaches_target_sink_not_self() {
     store.write().unwrap().register(h_target.clone());
 
     // Resolve `@2` (the target's local id) EXACTLY as `handle()` does.
-    let (term, _, _, ctx) = resolve_explicit(&store, &Selector::parse("2"))
+    let (term, _, _, ctx) = resolve_explicit(&store, &Selector::parse("2").expect("a selector"))
         .expect("@2 is not ambiguous")
         .expect("@2 resolves");
     let ctx: &SessionCtx = &ctx;
@@ -5435,14 +5767,25 @@ fn escalated_op_fences_argument_dependent_seams() {
         ("invoke", "OpenPalette", owner),
         ("invoke", "SoftwareUpdate", owner),
         ("invoke", "ApplyUpdate", owner),
-        ("invoke", "NewControlledWindow", owner),
-        ("invoke", "NewControlledTab", owner),
-        ("invoke", "NewControllerWindow", owner),
-        ("invoke", "NewControllerTab", owner),
-        ("invoke", "ConnectToSession", owner),
+        // The Overview (and the map's old name, its alias) lists every
+        // session: Owner-only, the `open overview` arm's class.
+        ("invoke", "Overview", owner),
         ("invoke", "ShowConnectionMap", owner),
-        ("invoke", "ConfigureConnection", owner),
-        ("invoke", "DisconnectSession", owner),
+        // The retired connection ids and presets name no action: nothing to
+        // classify (`invoke` answers them `ERR retired`, below).
+        ("invoke", "NewControlledWindow", None),
+        ("invoke", "NewControlledTab", None),
+        ("invoke", "NewControllerWindow", None),
+        ("invoke", "NewControllerTab", None),
+        ("invoke", "ConnectToSession", None),
+        ("invoke", "ConfigureConnection", None),
+        ("invoke", "DisconnectSession", None),
+        // The person's own acts: Owner-only at the gate (and refused to the
+        // Owner token before the hop, below).
+        ("invoke", "TakeOver", owner),
+        ("invoke", "HandBack", owner),
+        ("invoke", "HoldSession", owner),
+        ("invoke", "LiftHold", owner),
         ("invoke", "NewTab", None),
         ("invoke", "FontIncrease", None),
         ("invoke", "TotallyBogusAction", None),
@@ -5471,6 +5814,16 @@ fn escalated_op_fences_argument_dependent_seams() {
         ),
         ("spawn", "", None),
         ("spawn", "cwd=/tmp", None),
+        // A worker (`agent=`, its `model=`, its `from=` and its task frame's
+        // `len=`) starts an agent in a folder trusted for it: Owner-only in
+        // every spelling.
+        ("spawn", "agent=claude len=5", owner),
+        ("spawn", "cwd=/w agent=claude model=opus len=5", owner),
+        ("spawn", "\"agent=claude\" len=5", owner),
+        ("spawn", "agent=claude from=s-ab12 len=5", owner),
+        ("spawn", "model=opus", owner),
+        ("spawn", "from=s-ab12", owner),
+        ("spawn", "len=5", owner),
         ("spawn", "identity=worker", owner),
         ("spawn", "cwd=/tmp identity=-", owner),
         ("spawn", "\"identity=worker\" cwd=/tmp", owner),
@@ -5486,6 +5839,13 @@ fn escalated_op_fences_argument_dependent_seams() {
             owner,
         ),
         ("spawn", "\"connected=controller", owner),
+        // The Overview carries the `flows` Owner gate (its open, its readout,
+        // its capture and the `close` dismiss) under its keyword and the
+        // map's old `connections` alike.
+        ("open", "overview", owner),
+        ("controls", "overview", owner),
+        ("window", "overview", owner),
+        ("open", "overview close", owner),
         ("open", "connections", owner),
         ("controls", "connections", owner),
         ("window", "connections", owner),
@@ -5495,7 +5855,7 @@ fn escalated_op_fences_argument_dependent_seams() {
         ("window", "front shot.png", None),
         ("meta", "set title build agent", write),
         ("meta", "unset icon", write),
-        ("meta", "set role operator", write),
+        ("meta", "set role reviewer", write),
         ("meta", "unset attention", write),
         ("meta", "", None),
         ("timeline", "10 since=3", None),
@@ -5504,6 +5864,11 @@ fn escalated_op_fences_argument_dependent_seams() {
         // `brief` reads its target, and `brief all` the whole roster, Owner-only,
         // wherever `all` stands among its arguments (its parser takes it there).
         ("log", "tier=content --json", None),
+        // `log n` is the INSTANCE's node log (session log 5J-3): Owner-only like
+        // `brief all`, wherever the bare `n` stands; `n=<count>` is a count.
+        ("log", "n", owner),
+        ("log", "since=1 ep=2 n --json", owner),
+        ("log", "n=5", None),
         ("brief", "t3 budget=100", None),
         ("brief", "all", owner),
         ("brief", "budget=100 all", owner),
@@ -5543,6 +5908,31 @@ fn escalated_op_fences_argument_dependent_seams() {
     for &(verb, rest, want) in rows {
         assert_eq!(escalated_op(verb, rest), want, "{verb} {rest:?}");
     }
+    // Before any hop, `invoke` answers a retired name `ERR retired` and the
+    // person's own acts `ERR denied`, to the Owner token too. CONTROL: an
+    // Owner-only action that is not the person's goes on to the main thread.
+    for retired in [
+        "NewControlledWindow",
+        "NewControllerTab",
+        "ConnectToSession",
+        "ConfigureConnection",
+        "DisconnectSession",
+    ] {
+        assert!(
+            super::control_media::invoke_refusal(retired)
+                .is_some_and(|r| r.starts_with("ERR retired: ")),
+            "{retired}"
+        );
+    }
+    for name in ["TakeOver", "HandBack", "HoldSession", "LiftHold"] {
+        let refusal = super::control_media::invoke_refusal(name).expect("refused");
+        assert!(refusal.starts_with("ERR denied"), "{name}: {refusal}");
+    }
+    assert_eq!(super::control_media::invoke_refusal("OpenPalette"), None);
+    assert_eq!(
+        super::control_media::invoke_refusal("TotallyBogusAction"),
+        None
+    );
 }
 
 /// `theme` reads with its base class; its preview lane needs `WriteInput` and
@@ -5651,13 +6041,12 @@ fn front_drive_fence_requires_owner_for_overlays_and_config_write_for_native_set
     let owner = Scope::Owner;
 
     // Every overlay is a gateway with Owner-only bindings (About copies and opens
-    // URLs; the connection map raises and disconnects), so input verbs escalate
+    // URLs; the Overview raises and stops workers), so input verbs escalate
     // identically.
     for kind in [
         OverlayKind::Palette,
-        OverlayKind::ConnCard,
         OverlayKind::SessionPicker,
-        OverlayKind::ConnectionMap,
+        OverlayKind::Overview,
     ] {
         for verb in [
             "key", "ctrl", "mouse", "paste", "focus", "send", "feed", "turn",
@@ -5671,7 +6060,7 @@ fn front_drive_fence_requires_owner_for_overlays_and_config_write_for_native_set
     }
 
     // OWNER is ALWAYS exempt — the owner's established control path is untouched.
-    for kind in [OverlayKind::Palette, OverlayKind::ConnectionMap] {
+    for kind in [OverlayKind::Palette, OverlayKind::Overview] {
         assert_eq!(
             front_drive_escalation(owner, "key", FrontControlSurface::Overlay(kind)),
             None,
@@ -5749,10 +6138,11 @@ fn real_native_settings_front_is_explicitly_fenced_while_owner_open_still_works(
 /// two fences below are DEFENCE IN DEPTH, read at their own predicates (the main-
 /// thread hop and the dispatcher need an event loop): on the semantic `act` path and
 /// on input keyed at the front Settings surface while it shows the page, a ConfigWrite
-/// edge is denied a session's press and Owner passes. NEGATIVE CONTROLS: at the same
-/// predicates, that edge's Refresh and other Settings controls, and its input on any
-/// other route, are the ordinary ConfigWrite fence; and Owner's App verdict is the
-/// sessionless lane.
+/// edge is denied a session's press — and the `Every session` row's, which writes
+/// every session's word (design §11.5.2) — and Owner passes. NEGATIVE CONTROLS: at
+/// the same predicates, that edge's Refresh and other Settings controls, an `all`
+/// key spelled outside the session prefix, and its input on any other route, are
+/// the ordinary ConfigWrite fence; and Owner's App verdict is the sessionless lane.
 #[test]
 fn harness_session_presses_are_owner_only_on_both_paths() {
     use super::{
@@ -5801,13 +6191,33 @@ fn harness_session_presses_are_owner_only_on_both_paths() {
     // its Show (§10.3.7): Show writes nothing, but it moves the person's
     // keyboard to that session's pane, so it stays behind the prefix's one
     // Owner fence.
+    // The `Every session` row's keys (design §11.5.2), as the page mints them:
+    // one press writes every session's word, so they stay behind the same fence.
+    let every: Vec<String> = [
+        crate::harness_screen::EveryPress::Mode(aterm_agent::supervise::Autopilot::Cruise),
+        crate::harness_screen::EveryPress::Mode(aterm_agent::supervise::Autopilot::Land),
+        crate::harness_screen::EveryPress::Timer(crate::autopilot_timers::TimerChoice::In(120)),
+        crate::harness_screen::EveryPress::Timer(crate::autopilot_timers::TimerChoice::At),
+        crate::harness_screen::EveryPress::Follow,
+    ]
+    .into_iter()
+    .map(crate::harness_screen::every_action)
+    .chain([format!(
+        "{}{}/timer",
+        crate::harness_screen::SESSION_ACTION_PREFIX,
+        crate::harness_screen::EVERY_ID
+    )])
+    .collect();
     for action in [
         "harness/session/7/autopilot/cruise",
         "harness/session/7/land-in/120",
         "harness/session/7/land-at",
         "harness/session/7/land-cancel",
         "harness/session/7/show",
-    ] {
+    ]
+    .into_iter()
+    .chain(every.iter().map(String::as_str))
+    {
         let press = format!("app/v1 view 42 {action} {action}");
         assert_eq!(
             escalated_op("act", &press),
@@ -5823,9 +6233,12 @@ fn harness_session_presses_are_owner_only_on_both_paths() {
             "Owner presses {action}"
         );
     }
+    // CONTROL: an `all` key spelled outside the prefix would escape the Owner
+    // fence to the ordinary ConfigWrite one — the prefix is what holds it.
     for rest in [
         "app/v1 view 42 harness/refresh harness/refresh",
         "app/v1 view 42 settings/control/harness.enabled settings/set/harness.enabled false",
+        "app/v1 view 42 harness/all/autopilot/land harness/all/autopilot/land",
     ] {
         assert_eq!(
             escalated_op("act", rest),
@@ -6599,9 +7012,9 @@ fn registered_session(local_id: u64, master: i32, seed: &[u8]) -> SessionHandle 
         rewrap_gauge: std::sync::Arc::default(),
         human_input: Default::default(),
         launch: Default::default(),
-        generation_look: Default::default(),
         reset_lane: Default::default(),
         crash_journal: Default::default(),
+        typed: Default::default(),
         update_parked: Default::default(),
         witness: Default::default(),
         fenced_writes: Default::default(),
@@ -6667,6 +7080,7 @@ fn who_verb_reports_driver_and_watchers() {
         expires_us: crate::metrics::now_us() + 60_000_000,
         conn: None,
         hard: false,
+        here: false,
         holder_pid: None,
     });
     let line = cmd_who(&store, &subs)
@@ -7397,6 +7811,9 @@ fn topic_is_owner_class_and_names_its_session() {
         "add A",
         "add a b",
         "add a since=yesterday",
+        "add a since=head b",
+        "drop A",
+        "drop a b",
         "wat",
         "ls extra",
     ] {
@@ -9180,6 +9597,163 @@ fn binary_input_header_fences_before_payload_and_only_after_authorization() {
     );
 }
 
+/// S9's typed-by stamp at a typing verb's reply: an `OK` credits the
+/// connection's caller on the target, its lane's memo where one is lent (a
+/// connection is read once) and a fresh read off a lane; the harness's token
+/// is `aterm`; an edge is who presented its token on the session it was
+/// minted for, never that session on its own word; a refusal, the halt's
+/// included, credits nobody, and neither does an `id=` replay.
+#[test]
+#[cfg(unix)]
+fn a_typing_verb_credits_its_caller_only_when_it_wrote() {
+    use crate::typed_by::{Caller, Who};
+    use aterm_session::Op;
+    let store = session_store::new_store();
+    let (front, front_rx) = crate::control_input_ack::testing::owned_handle(1);
+    store.write().unwrap().register(front.clone());
+    let active = active_for_handle(&front);
+    let feed_bytes = |scope: Scope, payload: &[u8]| {
+        let mut out = Vec::new();
+        let mut dispatch =
+            |event,
+             target: Option<u64>,
+             completion: Option<crate::control_input_ack::InputCompletion>| {
+                let receipt = crate::app_input::tracked_egress(
+                    &front.term,
+                    &front.ctx.modes,
+                    &front.ctx.sink,
+                    &front.ctx.output_echo,
+                    &event,
+                    crate::input::EgressMode::Backpressured,
+                );
+                if let Some(completion) =
+                    completion.filter(|c| c.matches(target.unwrap_or(1), &front.ctx))
+                {
+                    completion.finish(receipt);
+                }
+                Ok(crate::app_input::receipt_outcome(receipt))
+            };
+        let mut cancel = |_session| "OK\n".to_string();
+        assert!(run_feed_bin_routed_observed(
+            &format!("@1 feed-bin {}", payload.len()),
+            "feed-bin",
+            &mut std::io::Cursor::new(payload.to_vec()),
+            FeedBinRoute {
+                active: &active,
+                store: &store,
+                scope,
+                subscribers: None,
+            },
+            &mut dispatch,
+            &mut cancel,
+            &mut out,
+        ));
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    let feed = |scope| feed_bytes(scope, b"X");
+    let by = || front.ctx.typed.last().map(|t| t.by.words());
+
+    assert_eq!(feed(Scope::Edge(EdgeToken::generate())), "ERR denied\n");
+    assert_eq!(by(), None, "a refusal credits nobody");
+
+    assert!(crate::fabric::apply_hold_for_test(
+        &front.ctx,
+        Some(crate::fabric::Hold {
+            reason: "demo".to_string(),
+            origin: "local".to_string(),
+        })
+    ));
+    assert!(feed(Scope::Owner).starts_with("ERR halted"));
+    assert_eq!(by(), None, "nor does the halt");
+    assert!(crate::fabric::apply_hold_for_test(&front.ctx, None));
+
+    assert_eq!(feed_bytes(Scope::Owner, b""), "OK 0 bytes\n");
+    assert_eq!(by(), None, "an ordinary zero-byte OK never credits typing");
+
+    // Off a lane there is no peer pid to read, and nothing to keep.
+    assert_eq!(feed(Scope::Owner), "OK 1 bytes\n");
+    assert_eq!(by().as_deref(), Some("a script"));
+
+    // A lane lends the connection's memo: read once, kept for the next verb.
+    let mut memo = Some(Caller::new(Who::Word("lab-sweep".to_string())));
+    {
+        let _lent = ServingCaller::enter(&mut memo);
+        assert_eq!(feed(Scope::Owner), "OK 1 bytes\n");
+    }
+    assert_eq!(by().as_deref(), Some("lab-sweep"));
+    assert!(memo.is_some_and(|m| m.who == Who::Word("lab-sweep".to_string())));
+    let mut fresh = None;
+    {
+        let _lent = ServingCaller::enter(&mut fresh);
+        assert_eq!(feed(Scope::Owner), "OK 1 bytes\n");
+    }
+    assert!(
+        fresh.is_some_and(|m| m.who == Who::Word("a script".to_string())),
+        "the first typing verb read the connection and the lane kept it"
+    );
+
+    // The harness's token is aterm's own.
+    {
+        let _harness = ServingPrincipal::enter(Principal::Harness);
+        assert_eq!(feed(Scope::Owner), "OK 1 bytes\n");
+    }
+    assert_eq!(by().as_deref(), Some("aterm"));
+
+    // An edge minted for M: whoever presents the token, on M's edge.
+    let manager = SessionId::new("s-0123456789abcdef");
+    let token = front.ctx.edges.lock().unwrap().grant(
+        manager.clone(),
+        front.sid.clone(),
+        Op::WriteInput,
+        front.nonce,
+    );
+    assert_eq!(feed(Scope::Edge(token)), "OK 1 bytes\n");
+    let credited = front.ctx.typed.last().expect("stamped").by;
+    assert_eq!(
+        credited.who,
+        Who::Edge {
+            src: manager,
+            client: Box::new(Who::Word("a script".to_string())),
+        },
+        "the presenter, read as an owner client is (no peer pid off a lane)"
+    );
+    assert_eq!(credited.words(), "a script on s-0123's edge");
+
+    assert_eq!(feed(Scope::Bridge), "OK 1 bytes\n");
+    assert_eq!(by().as_deref(), Some("the message bus"));
+    assert_eq!(
+        drain_pipe(&front_rx),
+        b"XXXXXX",
+        "only nonempty actual events wrote"
+    );
+
+    // What a reply says it typed: a skip typed nothing, unless its turn had.
+    assert!(typed_into("OK 3 bytes seq=9\n"));
+    assert!(typed_into("OK 2\nrow one\nrow two\n"));
+    assert!(!typed_into("OK skipped reason=changed\n"));
+    assert!(!typed_into(
+        "OK 0 turn skipped reason=changed submitted=0 seq=4 id=7\n"
+    ));
+    assert!(typed_into(
+        "OK 0 turn skipped reason=guard submitted=0 seq=4 id=7\n"
+    ));
+    assert!(typed_into(
+        "OK 0 turn skipped reason=person typed=5 pasted=0 submitted=0 seq=4 id=7\n"
+    ));
+    assert!(!typed_into(
+        "OK 0 turn skipped reason=deadline typed=0 pasted=0 submitted=0 seq=4 id=7\n"
+    ));
+    assert!(!typed_into("ERR busy turn\n"));
+    // An `id=` already written answers `dup=1` and writes nothing now.
+    assert!(!typed_into("OK dup=1\n"));
+    assert!(!typed_into("OK 0 dup=1\n"));
+    assert!(!typed_into("OK dup=1 seq=10\n"));
+    assert!(
+        typed_into("OK seq=10\n"),
+        "CONTROL: the same reply that typed"
+    );
+}
+
 /// The header fence is an early liveness boundary, not an authority cache: target
 /// and capability scope are sampled again after the payload, so a stalled `@.`
 /// frame follows the new active session and a revoked edge can no longer write. A
@@ -9703,6 +10277,82 @@ fn cross_session_input_reports_a_dead_peer_as_write_failed() {
     );
 }
 
+/// BACKGROUND INPUT ON THE ORDERED WRITER'S ROUTE ANSWERS FROM THE WRITE, NOT ITS
+/// ADMISSION (ATERM-KI-1014-6): on the route every Windows key, report and paste
+/// takes (`force_conpty_route_for_test`), a background `send`, `key`, `paste` and
+/// mouse report into a session whose peer is gone answer `ERR write failed`.
+/// Before, they were answered on the writer's acceptance: `OK`. CONTROL: into a
+/// live reader the same input answers `OK` and arrives. The lanes wait for the
+/// write's answer as long as a hang detector (`queued_input_waits_for_test`), not
+/// the 100 ms a request lane gives it, so a slow writer on a loaded host cannot
+/// pass as "queued, accepted".
+#[test]
+#[cfg(unix)]
+fn queued_background_input_into_a_dead_peer_is_a_failed_write() {
+    let _route = crate::app_input::paste_order::force_conpty_route_for_test();
+    let _wait = super::queued_input_waits_for_test(aterm_spec::wait::MUST_HAPPEN);
+    let (live, live_rx) = pipe_session(75);
+    assert_eq!(
+        cross_raw_input(&live.term, &live.ctx, send_bytes("ls")),
+        Ok(InputOutcome::Ok),
+        "CONTROL: a send into a live reader"
+    );
+    assert_eq!(
+        cross_input(&live.term, &live.ctx, parse_key("enter"), "ERR\n"),
+        "OK\n"
+    );
+    assert_eq!(
+        background_input(
+            &live.term,
+            &live.ctx,
+            &InputEvent::Paste("pasted".into(), PasteFraming::AtDrain),
+            aterm_spec::wait::MUST_HAPPEN,
+        ),
+        Ok(InputOutcome::Ok)
+    );
+    let mut arrived = Vec::new();
+    let all = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        std::time::Duration::from_millis(1),
+        || {
+            arrived.extend(drain_pipe(&live_rx));
+            arrived.ends_with(b"pasted").then_some(())
+        },
+    );
+    assert!(all.is_some(), "the input arrives: {arrived:?}");
+    assert!(arrived.starts_with(b"ls\r"), "{arrived:?}");
+
+    let (dead, dead_rx) = pipe_session(76);
+    term_lock(&dead.term).process(b"\x1b[?1000h\x1b[?1006h");
+    drop(dead_rx);
+    kill_peer_in_kernel(dead.master, "a queued background write into a dead peer");
+    assert_eq!(
+        cross_raw_input(&dead.term, &dead.ctx, send_bytes("ls")),
+        Ok(InputOutcome::WriteFailed),
+        "a queued send into a dead peer"
+    );
+    assert_eq!(
+        cross_input(&dead.term, &dead.ctx, parse_key("enter"), "ERR\n"),
+        "ERR write failed\n",
+        "a queued key into a dead peer"
+    );
+    assert_eq!(
+        background_input(
+            &dead.term,
+            &dead.ctx,
+            &InputEvent::Paste("pasted".into(), PasteFraming::AtDrain),
+            aterm_spec::wait::MUST_HAPPEN,
+        ),
+        Ok(InputOutcome::WriteFailed),
+        "a queued paste into a dead peer"
+    );
+    assert_eq!(
+        cross_mouse_apply(&dead.term, &dead.ctx, "press left 2 4"),
+        Err("ERR write failed\n".to_string()),
+        "a queued mouse report into a dead peer"
+    );
+}
+
 /// What one run of [`paste_while_the_peer_closes_mid_write`] observed.
 #[cfg(unix)]
 struct MidWriteClose {
@@ -10033,6 +10683,67 @@ fn a_wheel_cut_short_at_the_input_cap_is_not_answered_nothing_written() {
     drop(reader);
 }
 
+/// ONE ANSWER FOR A FULL INPUT QUEUE: a key into the front tab whose session is
+/// at its input cap is refused `ERR busy input-queue-full`, nothing
+/// written, the reply a background tab's lane gives for the same refusal. It
+/// was `ERR write failed` in front (in doubt, so a driver could not retry) and
+/// busy behind (retryable as is). Driven through the real App input seam
+/// ([`crate::App::input`]) on the headless App's session 0, and the background
+/// lane ([`cross_input`]) on the same session.
+#[test]
+#[cfg(unix)]
+fn a_full_input_queue_answers_busy_in_the_front_tab_as_in_a_background_one() {
+    let (rd, wr) = cloexec_pipe();
+    // SAFETY: `rd` is a fresh pipe end this test owns.
+    let reader = unsafe { std::fs::File::from_raw_fd(rd) };
+    aterm_pty::set_nonblocking(wr, true).expect("nonblocking test master");
+    let mut app = crate::App::headless_for_test_with_sink(Arc::new(SinkWriter::new(wr)));
+    let (term, ctx) = {
+        let session = &app.pool.get(0).expect("session 0");
+        (Arc::clone(&session.term), Arc::clone(&session.ctx))
+    };
+    ctx.sink.note_master_nonblocking(true);
+    loop {
+        match aterm_pty::write_some(wr, &[b'.'; 4096]) {
+            Ok(n) if n > 0 => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            other => panic!("unexpected pipe fill result: {other:?}"),
+        }
+    }
+    let key = || parse_key("enter").expect("enter parses");
+    assert_eq!(
+        app.input(crate::WindowId(0), key(), crate::input::Source::Controller),
+        InputOutcome::Ok,
+        "CONTROL: below the cap the front tab's key is accepted"
+    );
+    let below = SinkWriter::SPILL_CAP - ctx.sink.spilled_bytes();
+    let accepted = ctx
+        .sink
+        .write_frame_interactive_with_receipt(&vec![b'x'; below])
+        .expect("the frame that reaches the cap is accepted")
+        .accepted();
+    assert_eq!(accepted, below);
+    let spilled = ctx.sink.spilled_bytes();
+
+    let front = app.input(crate::WindowId(0), key(), crate::input::Source::Controller);
+    assert_eq!(front, InputOutcome::QueueFull);
+    assert_eq!(
+        control_input::input_reply_to_str(Ok(front)),
+        INPUT_QUEUE_FULL
+    );
+    assert_eq!(
+        cross_input(&term, &ctx, parse_key("enter"), "ERR\n"),
+        INPUT_QUEUE_FULL,
+        "the background lane's answer for the same refusal"
+    );
+    assert_eq!(
+        ctx.sink.spilled_bytes(),
+        spilled,
+        "a refused write accepts nothing"
+    );
+    drop(reader);
+}
+
 /// An input-write reply is stamped with the `content_seq` baseline (`seq=<n>` before
 /// the trailing newline), so a driver can `await seq <n+1>` for the output its input
 /// caused. Input verbs only, on `OK` only.
@@ -10115,6 +10826,28 @@ fn feed_bin_self_edge_denied_after_active_session_swings() {
     );
 }
 
+/// A line one byte past [`MAX_REQUEST_LINE`] is answered why before the drop
+/// (`None`), so the peer reads a reason, not a bare EOF; a line exactly at the
+/// cap is read, and owes no answer.
+#[test]
+fn an_over_long_request_line_is_answered_before_the_drop() {
+    let at_cap = "a".repeat(MAX_REQUEST_LINE);
+    let mut input = format!("{at_cap}\n").into_bytes();
+    input.extend(std::iter::repeat_n(b'b', MAX_REQUEST_LINE + 1));
+    input.extend_from_slice(b"\nversion\n");
+    let mut reader = BufReader::new(std::io::Cursor::new(input));
+    let mut refusal = Vec::new();
+    let line = read_request_line_with_policy(&mut reader, &mut refusal, false, || Ok(()));
+    assert_eq!(line.as_deref(), Some(at_cap.as_str()));
+    assert!(refusal.is_empty(), "a line at the cap is no refusal");
+    let line = read_request_line_with_policy(&mut reader, &mut refusal, false, || Ok(()));
+    assert_eq!(line, None, "the over-long line closes the connection");
+    assert_eq!(
+        String::from_utf8(refusal).unwrap(),
+        "ERR request line too long (max 65536 bytes)\n"
+    );
+}
+
 /// `read_request_line` strips the `\n` (and a CRLF `\r`), yields a final
 /// unterminated line at EOF, and drops a runaway line past the cap (None).
 #[test]
@@ -10136,7 +10869,7 @@ fn guarded_line_deadline_rearms_once_per_buffer_refill() {
     let input = b"ACK 0123456789abcdef0123456789abcdef\n".to_vec();
     let mut reader = BufReader::with_capacity(128, std::io::Cursor::new(input));
     let mut rearms = 0usize;
-    let line = read_request_line_with_policy(&mut reader, false, || {
+    let line = read_request_line_with_policy(&mut reader, &mut std::io::sink(), false, || {
         rearms += 1;
         Ok(())
     });
@@ -10594,6 +11327,7 @@ fn an_agent_s_typed_turn_lays_ribbon_and_a_pasted_turn_does_not() {
                 key: &key,
                 momentum: &momentum,
                 driver: None,
+                by: crate::turn_ledger::TurnBy::Ctl,
                 actor: aterm_slog::Actor::Ctl,
                 cause: None,
                 mark: None,
@@ -10672,6 +11406,7 @@ fn the_typed_turn_s_only_signature_is_its_even_cadence() {
             key: &key,
             momentum: &momentum,
             driver: None,
+            by: crate::turn_ledger::TurnBy::Ctl,
             actor: aterm_slog::Actor::Ctl,
             cause: None,
             mark: None,
@@ -10773,6 +11508,7 @@ fn cap_gives_a_typed_turn_room_to_press_a_long_text() {
                 key: &key,
                 momentum: &momentum,
                 driver: None,
+                by: crate::turn_ledger::TurnBy::Ctl,
                 actor: aterm_slog::Actor::Ctl,
                 cause: None,
                 mark: None,
@@ -10877,6 +11613,7 @@ fn typed_turn_with(
             key: &key,
             momentum: &momentum,
             driver: None,
+            by: crate::turn_ledger::TurnBy::Ctl,
             actor: aterm_slog::Actor::Ctl,
             cause: None,
             mark: None,
@@ -11171,6 +11908,7 @@ fn composer_turn_on(
                 key: &key,
                 momentum: &momentum,
                 driver: None,
+                by: crate::turn_ledger::TurnBy::Ctl,
                 actor: aterm_slog::Actor::Ctl,
                 cause: None,
                 mark: None,
@@ -11725,6 +12463,7 @@ fn a_yielding_turn_types_only_after_the_ribbon_exhales() {
             key: &key,
             momentum: &momentum,
             driver: None,
+            by: crate::turn_ledger::TurnBy::Ctl,
             actor: aterm_slog::Actor::Ctl,
             cause: None,
             mark: None,
@@ -11754,6 +12493,7 @@ fn a_yielding_turn_types_only_after_the_ribbon_exhales() {
             key: &key,
             momentum: &never,
             driver: None,
+            by: crate::turn_ledger::TurnBy::Ctl,
             actor: aterm_slog::Actor::Ctl,
             cause: None,
             mark: None,
@@ -11998,6 +12738,511 @@ fn turn_settle_gone_rows() {
             );
         }
     }
+}
+
+/// `turn settle=submitted` ANSWERS AT THE VERIFIED SUBMIT on a screen that
+/// never goes quiet: once the submit lands, a painter recolours one cell
+/// every few milliseconds until the turn has answered (Claude Code 2.1.301's
+/// animated logo at an idle prompt). The turn answers `submitted=1
+/// status=submitted` with the screen, its ledger record says `pressed` (no
+/// settle was awaited), and a done task opened again at the submit as ever.
+/// Its `idle=` is past any wait here, so the answer can only be the submit's.
+/// NEGATIVE CONTROL: the default settle on the same screen and options, its
+/// timeout short, does not answer at the submit (`status=timeout`) — neither
+/// outcome hangs on how often the painter gets the CPU. An unverified submit
+/// is `status=timeout` under `settle=submitted` too.
+#[test]
+fn turn_settle_submitted_answers_at_the_verified_submit_on_a_screen_that_never_rests() {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let run = |options: &str, lands: bool| {
+        let store = session_store::new_store();
+        let h = registered_session(0, -1, b"");
+        store.write().unwrap().register(h.clone());
+        let registry = subscribe::new_registry();
+        crate::task_record::mark_session_task(
+            &h.ctx,
+            0,
+            &crate::task_record::TaskMark::new(crate::task_record::TaskState::Done),
+            &registry,
+        )
+        .expect("unfenced");
+        let term = &h.term;
+        let stop = Arc::new(AtomicBool::new(false));
+        let painter: Cell<Option<std::thread::JoinHandle<()>>> = Cell::new(None);
+        let paste = |text: &str| {
+            term.lock().unwrap().process(text.as_bytes());
+            true
+        };
+        let press = |_: &str| {
+            if !lands {
+                return true;
+            }
+            term.lock().unwrap().process(b"\r\nworking\r\n");
+            let (term_t, reg_t, stop_t) = (term.clone(), registry.clone(), Arc::clone(&stop));
+            painter.set(Some(std::thread::spawn(move || {
+                let mut red = false;
+                while !stop_t.load(Ordering::SeqCst) {
+                    red = !red;
+                    let frame: &[u8] = if red {
+                        b"\x1b7\x1b[1;1H\x1b[31m*\x1b[0m\x1b8"
+                    } else {
+                        b"\x1b7\x1b[1;1H\x1b[32m*\x1b[0m\x1b8"
+                    };
+                    crate::term_lock(&term_t).process(frame);
+                    reg_t.lock().unwrap().notify(0);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            })));
+            true
+        };
+        let out = cmd_turn(
+            term,
+            &store,
+            0,
+            options,
+            &registry,
+            &h.ctx,
+            &TurnIo {
+                paste: &paste,
+                press: &press,
+                ..TurnIo::paste_only()
+            },
+        );
+        stop.store(true, Ordering::SeqCst);
+        if let Some(j) = painter.take() {
+            j.join().unwrap();
+        }
+        let ledger = h.ctx.turns.lock().unwrap();
+        let status = ledger.since(None).last().map(|r| r.status);
+        drop(ledger);
+        let task = h.ctx.timeline.lock().unwrap().task().map(|r| r.state);
+        (out, status, task)
+    };
+    let (out, status, task) = run("settle=submitted idle=60000 timeout=60000 carry on", true);
+    let verdict = out.lines().next().unwrap_or("");
+    assert!(
+        verdict.starts_with("OK 24 turn submitted=1 status=submitted seq="),
+        "{verdict}"
+    );
+    assert!(out.contains("working"), "the screen rides the reply: {out}");
+    assert_eq!(status, Some(crate::turn_ledger::STATUS_PRESSED));
+    assert_eq!(task, Some(crate::task_record::TaskState::Working));
+    // NEGATIVE CONTROL: the default settle on the same screen.
+    let (out, status, _) = run("idle=60000 timeout=1000 carry on", true);
+    let verdict = out.lines().next().unwrap_or("");
+    assert!(
+        verdict.starts_with("OK 24 turn submitted=1 status=timeout seq="),
+        "{verdict}"
+    );
+    assert_eq!(status, Some("timeout"));
+    // An unverified submit.
+    let (out, status, task) = run(
+        "settle=submitted presses=1 submit_window=50 timeout=60000 carry on",
+        false,
+    );
+    let verdict = out.lines().next().unwrap_or("");
+    assert!(
+        verdict.starts_with("OK 24 turn submitted=0 status=timeout seq="),
+        "{verdict}"
+    );
+    assert_eq!(status, Some("timeout"));
+    assert_eq!(
+        task,
+        Some(crate::task_record::TaskState::Done),
+        "not opened"
+    );
+}
+
+/// A Claude Code screen at 24x80: the logo row, the composer's caret row
+/// between its two rules, the mode row under them.
+fn claude_composer_screen() -> Vec<u8> {
+    let rule = "\u{2500}".repeat(80);
+    format!(
+        "\x1b[1;1H\u{2590}\u{259b}\u{2588}\u{2588}\u{2588}\u{259c}\u{258c}   Claude Code v2.1.301\
+         \x1b[20;1H{rule}\x1b[21;1H\u{276f} \x1b[22;1H{rule}\
+         \x1b[23;1H  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)\x1b[21;3H"
+    )
+    .into_bytes()
+}
+
+/// THE COMPOSER VERIFY (P2 of the rl review): on an identified Claude Code
+/// session whose composer shows the typed text, `turn` verifies its submit
+/// by that text LEAVING the composer, which a repaint elsewhere never does.
+/// Once the Enter is written a painter recolours the logo every few
+/// milliseconds (2.1.301's animation at an idle prompt). A program that
+/// ignores the Enter keeps the text in its composer: `submitted=0`, though
+/// the screen moved all through the window. One that takes it empties its
+/// composer and echoes the line above: `submitted=1`, each the negative
+/// control of the other. A box drawn over the composer (a slash command's
+/// menu) is a landed press too, judged at the window's close and never
+/// pressed again. Claude Code's dim placeholder back in the composer is a
+/// line taken, though its words spell the typed one (`Press up to edit
+/// queued messages` after `edit`). NEGATIVE CONTROL: the same ignoring
+/// screen, the session not read as Claude Code, keeps AUTO's `seq` — the
+/// animation verifies it, as every other program's turn is verified.
+#[test]
+fn turn_into_claude_code_verifies_its_submit_by_the_composer_not_a_repaint() {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[derive(Clone, Copy)]
+    enum App {
+        Ignores,
+        Takes,
+        Box,
+        Placeholder,
+    }
+    let run = |app: App, claude: bool, options: &str| {
+        let store = session_store::new_store();
+        let h = registered_session(0, -1, &claude_composer_screen());
+        store.write().unwrap().register(h.clone());
+        if claude {
+            h.ctx.timeline.lock().unwrap().publish_agent(
+                "idle",
+                None,
+                None,
+                Some(aterm_phase::Program::Claude),
+                crate::session_timeline::AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                    fp: 1,
+                },
+            );
+        }
+        let registry = subscribe::new_registry();
+        let term = &h.term;
+        let stop = Arc::new(AtomicBool::new(false));
+        let painter: Cell<Option<std::thread::JoinHandle<()>>> = Cell::new(None);
+        let presses = Cell::new(0u32);
+        // Claude Code echoes a typed line into its composer.
+        let paste = |text: &str| {
+            term.lock()
+                .unwrap()
+                .process(format!("\x1b[21;1H\x1b[2K\u{276f} {text}").as_bytes());
+            true
+        };
+        let press = |_: &str| {
+            presses.set(presses.get() + 1);
+            match app {
+                App::Ignores => {}
+                App::Takes => term.lock().unwrap().process(
+                    "\x1b[18;1H\u{276f} carry on\x1b[21;1H\x1b[2K\u{276f} \x1b[21;3H".as_bytes(),
+                ),
+                App::Box => term.lock().unwrap().process(
+                    "\x1b[20;1H\x1b[J Select model\r\n \u{276f} 1. Default\r\n   2. Opus"
+                        .as_bytes(),
+                ),
+                App::Placeholder => term.lock().unwrap().process(
+                    "\x1b[18;1H\u{276f} edit\x1b[21;1H\x1b[2K\u{276f} Press up to edit queued \
+                     messages\x1b[21;3H"
+                        .as_bytes(),
+                ),
+            }
+            if presses.get() == 1 {
+                let (term_t, reg_t, stop_t) = (term.clone(), registry.clone(), Arc::clone(&stop));
+                painter.set(Some(std::thread::spawn(move || {
+                    let mut red = false;
+                    while !stop_t.load(Ordering::SeqCst) {
+                        red = !red;
+                        let frame: &[u8] = if red {
+                            b"\x1b7\x1b[1;1H\x1b[31m*\x1b[0m\x1b8"
+                        } else {
+                            b"\x1b7\x1b[1;1H\x1b[32m*\x1b[0m\x1b8"
+                        };
+                        crate::term_lock(&term_t).process(frame);
+                        reg_t.lock().unwrap().notify(0);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                })));
+            }
+            true
+        };
+        let out = cmd_turn(
+            term,
+            &store,
+            0,
+            options,
+            &registry,
+            &h.ctx,
+            &TurnIo {
+                paste: &paste,
+                press: &press,
+                ..TurnIo::paste_only()
+            },
+        );
+        stop.store(true, Ordering::SeqCst);
+        if let Some(j) = painter.take() {
+            j.join().unwrap();
+        }
+        (out.lines().next().unwrap_or("").to_string(), presses.get())
+    };
+    // The window is a hang bound where the answer must come; short where it
+    // must close with nothing verified.
+    let (verdict, _) = run(
+        App::Takes,
+        true,
+        "settle=submitted presses=1 submit_window=60000 timeout=60000 carry on",
+    );
+    assert!(
+        verdict.contains("submitted=1 status=submitted"),
+        "{verdict}"
+    );
+    let (verdict, presses) = run(
+        App::Ignores,
+        true,
+        "settle=submitted presses=2 submit_window=200 timeout=60000 carry on",
+    );
+    assert!(verdict.contains("submitted=0 status=timeout"), "{verdict}");
+    assert_eq!(presses, 2, "the text still in the composer: pressed again");
+    let (verdict, presses) = run(
+        App::Box,
+        true,
+        "settle=submitted presses=3 submit_window=200 timeout=60000 /model",
+    );
+    assert!(
+        verdict.contains("submitted=1 status=submitted"),
+        "{verdict}"
+    );
+    assert_eq!(presses, 1, "never an Enter into the box");
+    let (verdict, presses) = run(
+        App::Placeholder,
+        true,
+        "settle=submitted presses=2 submit_window=60000 timeout=60000 edit",
+    );
+    assert!(
+        verdict.contains("submitted=1 status=submitted"),
+        "{verdict}"
+    );
+    assert_eq!(
+        presses, 1,
+        "the placeholder is no line left in the composer"
+    );
+    // NEGATIVE CONTROL: no Claude Code read, AUTO keeps `seq`.
+    let (verdict, _) = run(
+        App::Ignores,
+        false,
+        "settle=submitted presses=1 submit_window=60000 timeout=60000 carry on",
+    );
+    assert!(
+        verdict.contains("submitted=1 status=submitted"),
+        "{verdict}"
+    );
+}
+
+/// A WORKER'S TURN NAMES THE TASK REV ITS ENTER FOUND (`task_rev=`, P1 of
+/// the rl review): the follow-up into a done worker answers the done rev,
+/// which `await task @<sid>:<rev>` waits past — the reopened `working` is no
+/// news there and the follow-up's own done is, even one marked before the
+/// wait is armed. NEGATIVE CONTROL: a session with no task names none.
+#[test]
+fn a_turn_into_a_worker_names_the_task_rev_its_enter_found() {
+    use crate::task_record::{Combine, TaskMark, TaskState, mark_session_task};
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let registry = subscribe::new_registry();
+    let term = &h.term;
+    let paste = |text: &str| {
+        term.lock().unwrap().process(text.as_bytes());
+        true
+    };
+    let press = |_: &str| {
+        term.lock().unwrap().process(b"\r\nreply\r\n");
+        true
+    };
+    let turn = || {
+        let out = cmd_turn(
+            term,
+            &store,
+            0,
+            "settle=submitted timeout=60000 also the README",
+            &registry,
+            &h.ctx,
+            &TurnIo {
+                paste: &paste,
+                press: &press,
+                ..TurnIo::paste_only()
+            },
+        );
+        out.lines().next().unwrap_or("").to_string()
+    };
+    let verdict = turn();
+    assert!(verdict.contains("submitted=1"), "{verdict}");
+    assert!(!verdict.contains("task_rev="), "no task: {verdict}");
+    let done = TaskMark {
+        why: Some("marker"),
+        ..TaskMark::new(TaskState::Done)
+    };
+    let (found, _) = mark_session_task(&h.ctx, 0, &done, &registry).expect("unfenced");
+    let verdict = turn();
+    let named: u64 = verdict
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("task_rev="))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no task_rev=: {verdict}"));
+    assert_eq!(named, found.rev);
+    let wait = |timeout_ms| {
+        let target = [super::control_session::TaskTarget {
+            local_id: 0,
+            ctx: &h.ctx,
+            since: Some(named),
+        }];
+        super::control_session::await_task(&store, &target, Combine::Any, timeout_ms, &registry)
+    };
+    // The reopened `working` is no news past the found rev.
+    assert!(wait(0).starts_with("OK 1 status=timeout\n"), "{}", wait(0));
+    // The follow-up's own done, marked before the wait is armed, answers it.
+    mark_session_task(&h.ctx, 0, &done, &registry).expect("unfenced");
+    let rows = wait(60_000);
+    assert!(rows.starts_with("OK 1\n"), "{rows}");
+    assert!(rows.contains("state=done"), "{rows}");
+}
+
+/// A TURN INTO AN AGENT NAMES THE VERDICT REV ITS ENTER FOUND (`agent_rev=`):
+/// a `settle=submitted` turn answers as its submit lands, before the status
+/// sweep republishes the verdict, so the `idle` from before the submit still
+/// stands — and `await agent idle,… since=<agent_rev>` is no answer to it:
+/// it answers on the `idle` published after the turn's `busy`, by that
+/// verdict's rev. NEGATIVE CONTROLS: the latched wait with no `since=`
+/// answers the stale `idle` at once; a session no agent is in names no
+/// `agent_rev=`; a `since=` that is no rev is the usage line.
+#[test]
+fn a_turn_into_an_agent_names_the_verdict_rev_its_enter_found() {
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let registry = subscribe::new_registry();
+    let term = &h.term;
+    let paste = |text: &str| {
+        term.lock().unwrap().process(text.as_bytes());
+        true
+    };
+    let press = |_: &str| {
+        term.lock().unwrap().process(b"\r\nreply\r\n");
+        true
+    };
+    let turn = || {
+        let out = cmd_turn(
+            term,
+            &store,
+            0,
+            "settle=submitted submit_verify=seq timeout=60000 carry on",
+            &registry,
+            &h.ctx,
+            &TurnIo {
+                paste: &paste,
+                press: &press,
+                ..TurnIo::paste_only()
+            },
+        );
+        out.lines().next().unwrap_or("").to_string()
+    };
+    let verdict = turn();
+    assert!(verdict.contains("submitted=1"), "{verdict}");
+    assert!(!verdict.contains("agent_rev="), "no agent: {verdict}");
+    let publish = |word: &'static str, n: u64| {
+        h.ctx.timeline.lock().unwrap().publish_agent(
+            word,
+            None,
+            None,
+            Some(aterm_phase::Program::Claude),
+            crate::session_timeline::AgentStamp {
+                generation: crate::control::ScreenGen { epoch: 1, seq: n },
+                fp: n,
+            },
+        )
+    };
+    assert!(publish("idle", 1));
+    let verdict = turn();
+    let found: u64 = verdict
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("agent_rev="))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no agent_rev=: {verdict}"));
+    assert_eq!(found, h.ctx.timeline.lock().unwrap().agent().rev);
+    let wait = |tail: &str| cmd_await(term, &store, 0, &h.ctx, tail, &registry);
+    let past = format!("agent idle,prompt,question,wall since={found}");
+    // NEGATIVE CONTROL: latched, the idle from before the submit answers.
+    assert_eq!(
+        wait("agent idle,prompt,question,wall timeout=0"),
+        format!("OK agent idle rev={found}\n")
+    );
+    // Past the Enter's rev, the stale idle is no answer, nor the busy.
+    assert_eq!(wait(&format!("{past} timeout=0")), "OK timeout\n");
+    assert!(publish("busy", 2));
+    assert_eq!(wait(&format!("{past} timeout=0")), "OK timeout\n");
+    assert!(publish("idle", 3));
+    assert_eq!(
+        wait(&format!("{past} timeout=60000")),
+        format!("OK agent idle rev={}\n", found + 2)
+    );
+    // NEGATIVE CONTROL: a since= that is no rev.
+    assert!(
+        wait("agent idle since=soon timeout=0").starts_with("ERR usage"),
+        "{}",
+        wait("agent idle since=soon timeout=0")
+    );
+}
+
+/// `settle=submitted` is one word of `settle=`'s, named by the usage line;
+/// it needs a submit to answer at (`submit=none` with it is the usage line,
+/// nothing typed), and a later `settle=` takes its place. A word that is not
+/// it is the usage line.
+#[test]
+fn turn_settle_submitted_parses_and_needs_a_submit() {
+    use std::cell::Cell;
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let registry = subscribe::new_registry();
+    let term = &h.term;
+    let pasted = Cell::new(0u32);
+    let paste = |text: &str| {
+        pasted.set(pasted.get() + 1);
+        term.lock().unwrap().process(text.as_bytes());
+        true
+    };
+    let press = |_: &str| {
+        term.lock().unwrap().process(b"\r\nreply\r\n");
+        true
+    };
+    let turn = |options: &str| {
+        cmd_turn(
+            term,
+            &store,
+            0,
+            options,
+            &registry,
+            &h.ctx,
+            &TurnIo {
+                paste: &paste,
+                press: &press,
+                ..TurnIo::paste_only()
+            },
+        )
+    };
+    for bad in [
+        "settle=submitted submit=none hello",
+        "submit=none settle=submitted hello",
+        "settle=submit hello",
+        "settle=submitted: hello",
+    ] {
+        let out = turn(bad);
+        assert!(out.starts_with("ERR usage: turn"), "{bad}: {out}");
+        assert!(
+            out.contains("[settle=match:<re>|gone:<re>|submitted]"),
+            "{bad}: {out}"
+        );
+    }
+    assert_eq!(pasted.get(), 0, "nothing typed");
+    // A later `settle=` takes its place: the idle settle settles.
+    let out = turn("settle=submitted settle=match:reply idle=50 timeout=60000 hello");
+    assert!(
+        out.lines()
+            .next()
+            .unwrap_or("")
+            .contains("submitted=1 status=settled"),
+        "{out}"
+    );
 }
 
 /// `turn`'s submit verification, one row per case. Each row builds a fresh session,
@@ -12341,6 +13586,7 @@ fn a_hard_lease_holds_every_other_connection_and_its_own_types_through() {
         expires_us: crate::metrics::now_us().saturating_sub(1),
         conn: Some(7),
         hard: true,
+        here: false,
         holder_pid: None,
     });
     assert_eq!(block(Some(8)), None, "a lapsed hard lease holds nothing");
@@ -12353,12 +13599,509 @@ fn a_hard_lease_holds_every_other_connection_and_its_own_types_through() {
     SERVING_CONNECTION.with(|s| s.set(None));
 }
 
-/// A FORCED preemption of a DRIVEN turn wakes the driving session too
-/// (`DriverGeometry`'s `EveryMovedLeaseOwesAWake`): the driver's band reads
-/// the peer's lease (`▸ @<sid>`), and the wedged turn's own guard finds the
-/// slot taken or empty when it drops and posts nothing — so without the
-/// driver's wake its window's row holds on a lease mark that has moved. A
-/// refused release posts nothing, and an undriven turn wakes only itself.
+/// `here` KEEPS A LEASE TO THE CONNECTION THAT ASKS: every lane of one
+/// process takes its hand under one holder name, and a plain acquire under
+/// it moves another lane's live hand to the asker, a plain release frees it
+/// from anywhere. With `here` an acquire of the same holder's live lease
+/// held over another connection is refused as a different holder's is (the
+/// hand stays where it is), one over the asker's own is renewed, and a
+/// release frees only the asker's own. NEGATIVE CONTROLS: without `here`
+/// the same acquire moves the hand and the same release frees it; a lapsed
+/// lease is taken and released by anyone.
+#[test]
+fn a_lease_kept_here_is_never_moved_or_freed_from_another_connection() {
+    let h = registered_session(0, -1, b"");
+    let on = |conn: u64| SERVING_CONNECTION.with(|s| s.set(Some(conn)));
+    let held_over = || match h.ctx.turn_lease.lock().unwrap().as_ref() {
+        Some(crate::Lease::Drive { conn, .. }) => *conn,
+        other => panic!("a drive lease: {other:?}"),
+    };
+    on(7);
+    assert!(
+        cmd_lease(&h.ctx, "acquire holder=aterm-harness@1 ttl=60000 hard")
+            .starts_with("OK lease acquired")
+    );
+    on(8);
+    let refused = cmd_lease(&h.ctx, "acquire holder=aterm-harness@1 ttl=60000 hard here");
+    assert!(
+        refused.starts_with("ERR lease held holder=aterm-harness@1 "),
+        "{refused}"
+    );
+    assert_eq!(held_over(), Some(7), "not moved");
+    assert_eq!(
+        cmd_lease(&h.ctx, "release holder=aterm-harness@1 here"),
+        "ERR lease held by aterm-harness@1 over another connection\n"
+    );
+    assert_eq!(held_over(), Some(7), "not freed");
+    on(7);
+    assert!(
+        cmd_lease(&h.ctx, "acquire holder=aterm-harness@1 ttl=60000 hard here")
+            .starts_with("OK lease acquired"),
+        "its own connection's is renewed"
+    );
+    assert_eq!(held_over(), Some(7));
+    assert_eq!(
+        cmd_lease(&h.ctx, "release holder=aterm-harness@1 here"),
+        "OK lease released\n"
+    );
+    assert_eq!(cmd_lease(&h.ctx, "status"), "OK lease none\n");
+
+    // NEGATIVE CONTROLS: without `here`, moved and freed from anywhere.
+    assert!(
+        cmd_lease(&h.ctx, "acquire holder=aterm-harness@1 ttl=60000 hard")
+            .starts_with("OK lease acquired")
+    );
+    on(8);
+    assert!(
+        cmd_lease(&h.ctx, "acquire holder=aterm-harness@1 ttl=60000 hard")
+            .starts_with("OK lease acquired")
+    );
+    assert_eq!(held_over(), Some(8), "moved");
+    on(7);
+    assert_eq!(
+        cmd_lease(&h.ctx, "release holder=aterm-harness@1"),
+        "OK lease released\n"
+    );
+    // A lapsed one is anyone's, `here` or not.
+    *h.ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Drive {
+        holder: "aterm-harness@1".to_string(),
+        expires_us: crate::metrics::now_us().saturating_sub(1),
+        conn: Some(8),
+        hard: true,
+        here: false,
+        holder_pid: None,
+    });
+    assert!(
+        cmd_lease(&h.ctx, "acquire holder=aterm-harness@1 ttl=60000 hard here")
+            .starts_with("OK lease acquired")
+    );
+    assert_eq!(held_over(), Some(7));
+    *h.ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Drive {
+        holder: "aterm-harness@1".to_string(),
+        expires_us: crate::metrics::now_us().saturating_sub(1),
+        conn: Some(8),
+        hard: true,
+        here: false,
+        holder_pid: None,
+    });
+    assert_eq!(
+        cmd_lease(&h.ctx, "release holder=aterm-harness@1 here"),
+        "OK lease released\n"
+    );
+    SERVING_CONNECTION.with(|s| s.set(None));
+}
+
+/// A LEASE TAKEN `here` ENDS WITH ITS CONNECTION: the acquire marks the
+/// connection for the sweep its end runs (as a bound supervisor claim
+/// does), and that sweep frees the hand at once — the turn-end loop's
+/// hand when a stop hangs its connection up, which no request from another
+/// connection may free. Another connection's end frees nothing. NEGATIVE
+/// CONTROLS: the same hand taken without `here` marks nothing and outlives
+/// its connection (the upgrade's and relaunch's hand rides a reconnect); a
+/// `here` hand a plain renewal moved to another connection is that one's,
+/// unbound, and outlives both.
+#[test]
+fn a_lease_taken_here_ends_with_its_connection() {
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let subs = subscribe::new_registry();
+    let on = |conn: u64| SERVING_CONNECTION.with(|s| s.set(Some(conn)));
+    let marked = || CONNECTION_CLAIMED.with(|c| c.replace(false));
+    let acquire = |rest: &str| {
+        let reply = cmd_lease(
+            &h.ctx,
+            &format!("acquire holder=aterm-harness@1 ttl=60000 {rest}"),
+        );
+        assert!(reply.starts_with("OK lease acquired"), "{rest}: {reply}");
+    };
+    let held = || cmd_lease(&h.ctx, "status").starts_with("OK lease holder=aterm-harness@1 ");
+    on(7);
+    marked();
+    acquire("hard here");
+    assert!(marked(), "its connection's end sweeps it");
+    release_connection_claims(&store, &subs, None, 8);
+    assert!(held(), "another connection's end frees nothing");
+    release_connection_claims(&store, &subs, None, 7);
+    assert_eq!(cmd_lease(&h.ctx, "status"), "OK lease none\n", "freed");
+
+    // NEGATIVE CONTROLS.
+    acquire("hard");
+    assert!(!marked(), "nothing to sweep");
+    release_connection_claims(&store, &subs, None, 7);
+    assert!(held(), "a plain hand outlives its connection");
+    assert_eq!(
+        cmd_lease(&h.ctx, "release holder=aterm-harness@1"),
+        "OK lease released\n"
+    );
+    acquire("hard here");
+    on(8);
+    acquire("hard");
+    release_connection_claims(&store, &subs, None, 7);
+    release_connection_claims(&store, &subs, None, 8);
+    assert!(held(), "moved by a plain renewal, unbound");
+    SERVING_CONNECTION.with(|s| s.set(None));
+    CONNECTION_CLAIMED.with(|c| c.set(false));
+}
+
+/// THE CONNECTION'S END FREES A `here` HAND AS A RELEASE DOES: the text the
+/// harness typed under it and never submitted is dropped — a later Enter
+/// from the same connection, under the hand taken again, books no turn —
+/// and the presence rim is woken for the lease that moved. NEGATIVE
+/// CONTROL first: under the hand still held, that Enter books the text
+/// (`status=pressed`), and another connection's end wakes nothing.
+#[test]
+fn a_connection_end_drops_the_hands_unsubmitted_text_and_wakes_presence() {
+    use aterm_agent::harness::upgrade_drive::hand_take_here_request;
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let subs = subscribe::new_registry();
+    let on = |conn: u64| SERVING_CONNECTION.with(|s| s.set(Some(conn)));
+    let take = || {
+        let request = hand_take_here_request();
+        let reply = cmd_lease(&h.ctx, request.strip_prefix("lease ").unwrap_or(&request));
+        assert!(reply.starts_with("OK lease acquired"), "{reply}");
+    };
+    let input = |verb: &str, rest: &str| {
+        control_session::ledger_typed_input(
+            &h.term,
+            &h.ctx,
+            Scope::Owner,
+            verb,
+            rest,
+            "OK\n",
+            &subs,
+            0,
+        );
+    };
+    let turns = || control_session::cmd_history(&h.ctx, "").lines().count() - 1;
+    on(7);
+
+    take();
+    input("send", "keep going");
+    input("key", "enter");
+    assert_eq!(turns(), 1, "under the hand, the Enter books the text");
+
+    input("send", "keep going");
+    let _ = crate::presence::take_lease_wakes();
+    release_connection_claims(&store, &subs, None, 8);
+    assert!(
+        crate::presence::take_lease_wakes().is_empty(),
+        "another connection's end moved nothing"
+    );
+    release_connection_claims(&store, &subs, None, 7);
+    assert_eq!(cmd_lease(&h.ctx, "status"), "OK lease none\n", "freed");
+    assert_eq!(
+        crate::presence::take_lease_wakes(),
+        std::slice::from_ref(&h.ctx.self_id),
+        "the level follows the lease"
+    );
+    take();
+    input("key", "enter");
+    assert_eq!(turns(), 1, "the connection's end dropped the text: no turn");
+    SERVING_CONNECTION.with(|s| s.set(None));
+    CONNECTION_CLAIMED.with(|c| c.set(false));
+}
+
+/// WHO TYPED EACH TURN, on the `history` wire: `by=` names the caller the
+/// dispatch resolved ([`TurnIo::by`]), and a turn the WINDOW HARNESS types
+/// reads `by=harness` — one typed under the harness's hand, the hard drive
+/// lease its supervisor loops take a tab by, held over the turn's own
+/// connection: the wire the live upgrade's notice and release and a
+/// relaunched agent's continuation go out on, replayed here as the
+/// harness's own builders spell it (`aterm-agent`'s
+/// `upgrade_drive::hand_take_request`, a `turn`, `hand_give_back_request`).
+/// `by=` sits before `arch=`, and `text=` stays the tail every reader cuts
+/// at. NEGATIVE CONTROLS: the same connection's turn once the hand is given
+/// back is `ctl` again; under another instance's harness hand it is `ctl`;
+/// an edge caller and the bridge print their own words.
+#[test]
+fn history_names_who_typed_each_turn_and_the_harness_hand_reads_harness() {
+    use crate::turn_ledger::TurnBy;
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let paste = |_: &str| true;
+    let press = |_: &str| true;
+    let turn = |by: TurnBy, text: &str| {
+        let io = TurnIo {
+            paste: &paste,
+            press: &press,
+            by,
+            ..TurnIo::paste_only()
+        };
+        let reply = cmd_turn(
+            &h.term,
+            &store,
+            0,
+            &format!("timeout=300 idle=1 {text}"),
+            &subscribe::new_registry(),
+            &h.ctx,
+            &io,
+        );
+        assert!(reply.starts_with("OK "), "{text}: {reply}");
+    };
+    let lease = |request: &str| {
+        let rest = request.strip_prefix("lease ").unwrap_or(request);
+        let reply = cmd_lease(&h.ctx, rest);
+        assert!(reply.starts_with("OK"), "{request}: {reply}");
+    };
+    SERVING_CONNECTION.with(|s| s.set(Some(7)));
+    turn(TurnBy::Ctl, "from ctl");
+    lease(&aterm_agent::harness::upgrade_drive::hand_take_request());
+    turn(TurnBy::Ctl, "keep going");
+    lease(&aterm_agent::harness::upgrade_drive::hand_give_back_request());
+    turn(TurnBy::Ctl, "after the hand");
+    lease("acquire ttl=60000 holder=aterm-harness@1 hard");
+    turn(TurnBy::Ctl, "another harness");
+    lease("release holder=aterm-harness@1");
+    let peer = aterm_session::SessionId::generate();
+    turn(TurnBy::Sid(peer.as_str().to_string()), "from a peer");
+    turn(TurnBy::Bridge, "from the bridge");
+    SERVING_CONNECTION.with(|s| s.set(None));
+
+    let history = control_session::cmd_history(&h.ctx, "");
+    let rows: Vec<(String, String)> = history
+        .lines()
+        .skip(1)
+        .map(|row| {
+            let (meta, text) = row.split_once(" text=").expect("a text= tail");
+            let by_at = meta.find(" by=").expect("a by= field");
+            assert!(by_at < meta.find(" arch=").expect("arch="), "{row}");
+            let by = meta[by_at + 4..].split(' ').next().unwrap_or("");
+            (by.to_string(), text.to_string())
+        })
+        .collect();
+    let want: Vec<(String, String)> = [
+        ("ctl", "from%20ctl"),
+        ("harness", "keep%20going"),
+        ("ctl", "after%20the%20hand"),
+        ("ctl", "another%20harness"),
+        (peer.as_str(), "from%20a%20peer"),
+        ("bridge", "from%20the%20bridge"),
+    ]
+    .iter()
+    .map(|(by, text)| ((*by).to_string(), (*text).to_string()))
+    .collect();
+    assert_eq!(rows, want, "{history}");
+}
+
+/// THE HARNESS'S `send` AND ITS `key enter` ARE ITS TURN: the turn-end
+/// loop's fenced continuation, replayed as the loop sends it under the
+/// harness's hand (`hand_take_here_request`, the text, the Enter,
+/// `hand_give_back_here_request`) and booked as the dispatch books every input
+/// verb's reply ([`control_session::ledger_typed_input`]), reads `history …
+/// submitted=1 status=pressed … by=harness … text=keep%20going`, beside a
+/// manager's `turn`, `by=ctl`. A write another connection was refused
+/// between the two (the hand refuses them) does not part them. NEGATIVE
+/// CONTROLS, none of which records anything: the same send and Enter under
+/// no hand, under another instance's harness's hand, or from an edge; an
+/// Enter that is not the next write behind the text (another key between),
+/// one the screen skipped, one after the hand was given back and taken
+/// again, and one from another connection; a send that wrote nothing.
+#[test]
+fn the_harness_send_and_its_enter_are_its_turn_and_nobody_elses_are() {
+    use aterm_agent::harness::upgrade_drive::{
+        hand_give_back_here_request, hand_take_here_request,
+    };
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let subs = subscribe::new_registry();
+    let on = |conn: u64| SERVING_CONNECTION.with(|s| s.set(Some(conn)));
+    let lease = |request: &str| {
+        let reply = cmd_lease(&h.ctx, request.strip_prefix("lease ").unwrap_or(request));
+        assert!(reply.starts_with("OK"), "{request}: {reply}");
+    };
+    let input = |scope: Scope, verb: &str, rest: &str, reply: &str| {
+        control_session::ledger_typed_input(&h.term, &h.ctx, scope, verb, rest, reply, &subs, 0);
+    };
+    let typed = |scope: Scope, enter_on: u64, between: &[(&str, &str, &str)], reply: &str| {
+        input(scope, "send", "keep going", "OK\n");
+        for (verb, rest, reply) in between {
+            input(Scope::Owner, verb, rest, reply);
+        }
+        on(enter_on);
+        input(scope, "key", "enter", reply);
+        on(7);
+    };
+    let rows = || {
+        control_session::cmd_history(&h.ctx, "")
+            .lines()
+            .skip(1)
+            .map(str::to_string)
+            .collect::<Vec<String>>()
+    };
+    on(7);
+
+    // The harness's continuation, a refused write between its two halves.
+    lease(&hand_take_here_request());
+    on(8);
+    input(
+        Scope::Owner,
+        "send",
+        "x",
+        "ERR busy lease=aterm-harness@1\n",
+    );
+    on(7);
+    typed(Scope::Owner, 7, &[], "OK\n");
+    lease(&hand_give_back_here_request());
+    let rows_now = rows();
+    assert_eq!(rows_now.len(), 1, "{rows_now:?}");
+    let row = &rows_now[0];
+    for word in [
+        "submitted=1",
+        "status=pressed",
+        "by=harness",
+        "text=keep%20going",
+    ] {
+        assert!(row.split_whitespace().any(|w| w == word), "{word}: {row}");
+    }
+
+    // Negative controls: nothing more is recorded.
+    typed(Scope::Owner, 7, &[], "OK\n");
+    lease("lease acquire ttl=60000 holder=aterm-harness@1 hard");
+    typed(Scope::Owner, 7, &[], "OK\n");
+    lease("lease release holder=aterm-harness@1");
+    lease(&hand_take_here_request());
+    let edge = Scope::Edge(aterm_session::EdgeToken::generate());
+    typed(edge, 7, &[], "OK\n");
+    typed(Scope::Owner, 7, &[("key", "esc", "OK\n")], "OK\n");
+    typed(Scope::Owner, 7, &[], "OK skipped reason=changed\n");
+    typed(Scope::Owner, 8, &[], "OK\n");
+    input(Scope::Owner, "send", "keep going", "OK skipped\n");
+    input(Scope::Owner, "key", "enter", "OK\n");
+    input(Scope::Owner, "send", "keep going", "OK\n");
+    lease(&hand_give_back_here_request());
+    lease(&hand_take_here_request());
+    input(Scope::Owner, "key", "enter", "OK\n");
+    lease(&hand_give_back_here_request());
+    assert_eq!(
+        rows(),
+        rows_now,
+        "no other write is a turn of the harness's"
+    );
+
+    // A manager's turn beside it is its caller's: `by` as the dispatch
+    // resolves it for an owner-token connection (`turn_driver`, `turn_by`).
+    let paste = |_: &str| true;
+    let press = |_: &str| true;
+    let driver = crate::control::turn_driver(Scope::Owner, &h.ctx);
+    let io = TurnIo {
+        paste: &paste,
+        press: &press,
+        by: control_session::turn_by(Scope::Owner, driver.as_ref()),
+        ..TurnIo::paste_only()
+    };
+    let reply = cmd_turn(
+        &h.term,
+        &store,
+        0,
+        "timeout=300 idle=1 next",
+        &subs,
+        &h.ctx,
+        &io,
+    );
+    assert!(reply.starts_with("OK "), "{reply}");
+    let last = rows().pop().expect("the manager's row");
+    assert!(last.split_whitespace().any(|w| w == "by=ctl"), "{last}");
+    SERVING_CONNECTION.with(|s| s.set(None));
+}
+
+/// A TURN THAT LANDS IN A FINISHED WORKER OPENS ITS TASK AGAIN AT ONCE
+/// (`task_record::reopen_at_turn`): a `turn` from `aterm ctl` into a session
+/// whose task is `done` moves the record to `working why=turn` as its submit
+/// lands, before anything of the worker's turn ends. NEGATIVE CONTROLS: the
+/// same turn typed under the window harness's hand (`by=harness`: the live
+/// upgrade's READY notice) leaves `done` standing; and a turn whose submit
+/// never verifiably landed opens nothing.
+#[test]
+fn a_turn_into_a_done_worker_opens_its_task_unless_the_harness_typed_it() {
+    use crate::task_record::{TaskMark, TaskState, mark_session_task};
+    use crate::turn_ledger::TurnBy;
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let subscribers = subscribe::new_registry();
+    let term = &h.term;
+    let paste = |text: &str| {
+        term.lock().unwrap().process(text.as_bytes());
+        true
+    };
+    // The app takes the submit and prints its reply: the press lands.
+    let landed = |_: &str| {
+        term.lock().unwrap().process(b"\r\nreply\r\n");
+        true
+    };
+    // A press the app swallowed: nothing moves.
+    let swallowed = |_: &str| true;
+    let turn = |press: &dyn Fn(&str) -> bool, text: &str| {
+        let io = TurnIo {
+            paste: &paste,
+            press,
+            by: TurnBy::Ctl,
+            ..TurnIo::paste_only()
+        };
+        cmd_turn(
+            term,
+            &store,
+            0,
+            &format!("idle=1 timeout=300 submit_window=50 {text}"),
+            &subscribers,
+            &h.ctx,
+            &io,
+        )
+    };
+    let done = || {
+        let mark = TaskMark {
+            why: Some("marker"),
+            ..TaskMark::new(TaskState::Done)
+        };
+        mark_session_task(&h.ctx, 0, &mark, &subscribers).expect("unfenced");
+    };
+    let state = || {
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .task()
+            .map(|r| (r.state, r.why))
+    };
+    SERVING_CONNECTION.with(|s| s.set(Some(7)));
+    done();
+    // Under the harness's hand: its own turn.
+    let hand = aterm_agent::harness::upgrade_drive::hand_name();
+    assert!(cmd_lease(&h.ctx, &format!("acquire ttl=60000 holder={hand} hard")).starts_with("OK"));
+    let reply = turn(&landed, "[aterm harness] reply READY");
+    assert!(reply.contains("submitted=1"), "{reply}");
+    assert!(cmd_lease(&h.ctx, &format!("release holder={hand}")).starts_with("OK"));
+    assert_eq!(
+        state(),
+        Some((TaskState::Done, Some("marker"))),
+        "the harness's turn"
+    );
+    // A swallowed submit.
+    let reply = turn(&swallowed, "also the README");
+    assert!(reply.contains("submitted=0"), "{reply}");
+    assert_eq!(
+        state(),
+        Some((TaskState::Done, Some("marker"))),
+        "nothing landed"
+    );
+    // A manager's follow-up that lands.
+    let reply = turn(&landed, "also the README");
+    assert!(reply.contains("submitted=1"), "{reply}");
+    assert_eq!(state(), Some((TaskState::Working, Some("turn"))));
+    SERVING_CONNECTION.with(|s| s.set(None));
+}
+
+/// A FORCED preemption of a DRIVEN turn wakes the driving session too: the
+/// driver's presence facts read the peer's lease (`status hand=`), and the
+/// wedged turn's own guard finds the slot taken or empty when it drops and
+/// posts nothing — so without the driver's wake its facts keep a lease mark
+/// that has moved until something else re-reads them. A refused release
+/// posts nothing, and an undriven turn wakes only itself.
 #[test]
 fn force_preempting_a_driven_turn_wakes_its_driver_too() {
     let store = session_store::new_store();
@@ -12384,7 +14127,7 @@ fn force_preempting_a_driven_turn_wakes_its_driver_too() {
     assert_eq!(cmd_lease(&h.ctx, "release force"), "OK lease released\n");
     assert_eq!(
         crate::presence::take_lease_wakes(),
-        [(own.clone(), false), (driver, false)],
+        [own.clone(), driver],
         "the preempted turn's session AND its driving session are woken"
     );
 
@@ -12395,7 +14138,7 @@ fn force_preempting_a_driven_turn_wakes_its_driver_too() {
         typing: true,
     });
     assert_eq!(cmd_lease(&h.ctx, "release force"), "OK lease released\n");
-    assert_eq!(crate::presence::take_lease_wakes(), [(own, false)]);
+    assert_eq!(crate::presence::take_lease_wakes(), [own]);
 }
 
 /// `turn` on a dead session fails closed with `ERR exited`, and a bad submit key
@@ -12523,7 +14266,7 @@ fn fabric_attach_body() {
     assert_eq!(
         run(Scope::Owner, "fabric status"),
         format!(
-            "OK state=absent supervised=0 command=- reason=- rtt_ms=- link_age_ms=- {unattached}\n"
+            "OK state=absent supervised=0 command=- argv=- reason=- rtt_ms=- link_age_ms=- {unattached}\n"
         )
     );
     assert_eq!(post(), "ERR fabric absent id=1 no-bridge=1\n");
@@ -12587,7 +14330,7 @@ fn fabric_attach_body() {
     assert_eq!(
         run(Scope::Owner, "fabric status"),
         format!(
-            "OK state=absent supervised=0 command=- reason=- rtt_ms=- link_age_ms=- {unattached}\n"
+            "OK state=absent supervised=0 command=- argv=- reason=- rtt_ms=- link_age_ms=- {unattached}\n"
         ),
         "a refused attach records nothing"
     );
@@ -12623,7 +14366,7 @@ fn fabric_attach_body() {
     assert_eq!(
         run(Scope::Owner, "fabric status"),
         format!(
-            "OK state=absent supervised=1 command={command} reason=- rtt_ms=- link_age_ms=- {unattached}\n"
+            "OK state=absent supervised=1 command={command} argv={command} reason=- rtt_ms=- link_age_ms=- {unattached}\n"
         ),
         "the bridge connects asynchronously; the SUPERVISOR is what attached"
     );
@@ -12643,7 +14386,7 @@ fn fabric_attach_body() {
     assert_eq!(
         run(Scope::Owner, "fabric status"),
         format!(
-            "OK state=absent supervised=1 command={command} reason=- rtt_ms=- link_age_ms=- {unattached}\n"
+            "OK state=absent supervised=1 command={command} argv={command} reason=- rtt_ms=- link_age_ms=- {unattached}\n"
         )
     );
 }
@@ -12654,7 +14397,7 @@ fn fabric_attach_body() {
     assert_eq!(
         dispatch_fabric_verb("status", None, Scope::Owner, &store),
         format!(
-            "OK state=absent supervised=0 command=- reason=- rtt_ms=- link_age_ms=- build={} \
+            "OK state=absent supervised=0 command=- argv=- reason=- rtt_ms=- link_age_ms=- build={} \
              bridge_lane=- bridge_build=- lane_faults=0\n",
             aterm_types::version::build_id()
         )
@@ -12686,7 +14429,14 @@ fn the_bridge_verbs_refuse_every_scope_but_the_bridge_body() {
     let edge = Scope::Edge(EdgeToken::generate());
     let run = |scope: Scope, line: &str| {
         let (selector, verb, rest) = request_head(line);
-        dispatch_bridge_verb(verb, rest, selector.as_ref(), scope, &store)
+        dispatch_bridge_verb(
+            verb,
+            rest,
+            selector.as_ref(),
+            scope,
+            &store,
+            &subscribe::new_registry(),
+        )
     };
 
     for (scope, name) in [(Scope::Owner, "owner"), (edge, "edge")] {
@@ -12789,8 +14539,15 @@ fn a_bridges_hello_and_its_unparsed_lines_body() {
     store.write().unwrap().register(handle);
     let run = |line: &str| {
         let (selector, verb, rest) = request_head(line);
-        dispatch_bridge_verb(verb, rest, selector.as_ref(), Scope::Bridge, &store)
-            .expect("a bridge-plane verb")
+        dispatch_bridge_verb(
+            verb,
+            rest,
+            selector.as_ref(),
+            Scope::Bridge,
+            &store,
+            &subscribe::new_registry(),
+        )
+        .expect("a bridge-plane verb")
     };
     let own = aterm_types::version::build_id();
     let lane = aterm_types::control_verbs::BRIDGE_LANE;
@@ -12889,8 +14646,15 @@ fn the_mirror_off_answers_with_the_mirrors_lock_held_body() {
             "hello",
             Box::new(move |store| {
                 crate::fabric::set_lane_generation(generation);
-                dispatch_bridge_verb("hello", "lane=2 build=x", None, Scope::Bridge, store)
-                    .unwrap_or_default()
+                dispatch_bridge_verb(
+                    "hello",
+                    "lane=2 build=x",
+                    None,
+                    Scope::Bridge,
+                    store,
+                    &subscribe::new_registry(),
+                )
+                .unwrap_or_default()
             }),
         ),
         (
@@ -13004,7 +14768,13 @@ fn the_local_owner_may_hold_its_session_and_never_a_fleet_hold_body() {
     let run = |scope: Scope, line: &str| {
         let (selector, verb, rest) = request_head(line);
         assert_eq!(verb, "hold");
-        dispatch_hold_verb(rest, selector.as_ref(), scope, &store)
+        dispatch_hold_verb(
+            rest,
+            selector.as_ref(),
+            scope,
+            &store,
+            &subscribe::new_registry(),
+        )
     };
 
     // OWNER: on, halted, status/inbox say so, off, lifted.
@@ -13306,6 +15076,7 @@ fn an_aimed_app_verb_asks_the_app_lane_halt_question_body() {
             None,
             Scope::Bridge,
             &store,
+            &subscribe::new_registry(),
         ),
         "OK hold=1\n",
     );
@@ -13418,6 +15189,7 @@ fn dropping_the_bridge_guard_halts_the_governed_sessions_body() {
             None,
             Scope::Bridge,
             &store,
+            &subscribe::new_registry(),
         )
         .as_deref(),
         Some("OK 1\n")
@@ -13428,6 +15200,7 @@ fn dropping_the_bridge_guard_halts_the_governed_sessions_body() {
     crate::fabric::bridge_attached(generation);
     drop(BridgeLostGuard {
         store: store.clone(),
+        subscribers: subscribe::new_registry(),
         generation,
     });
     assert!(
@@ -13442,6 +15215,7 @@ fn dropping_the_bridge_guard_halts_the_governed_sessions_body() {
     crate::fabric::set_hold_on_bridge_lost(true);
     drop(BridgeLostGuard {
         store: store.clone(),
+        subscribers: subscribe::new_registry(),
         generation: crate::fabric::next_bridge_generation(),
     });
     assert_eq!(
@@ -13479,6 +15253,141 @@ fn the_post_frame_detector_agrees_with_the_body_rule_inbox_hold() {
         refused("post to=h-a kind=note len=abc").starts_with("ERR usage"),
         "a typo is not a size problem"
     );
+}
+
+/// A WORKER's `spawn … len=<n>` frame is detected with the handler's own
+/// tokenizer: a `len=` inside a quoted `cwd=` is no frame, a quoted one is,
+/// and a line the tokenizer refuses still frames any `len=` it holds (its
+/// bytes are consumed, never read as verbs). Past the 64 KiB cap, or not a
+/// length: answered unread, and the serve loop closes. The lanes wait for
+/// exactly that many body bytes (`announced_body`).
+#[test]
+fn the_worker_spawn_frame_detector_agrees_with_the_spawn_tokenizer() {
+    assert_eq!(spawn_frame_len("spawn agent=claude len=12"), Some(Ok(12)));
+    assert_eq!(
+        spawn_frame_len("@s-ab spawn cwd=/w agent=claude model=opus len=0"),
+        Some(Ok(0))
+    );
+    assert_eq!(
+        spawn_frame_len("spawn cwd=\"/a len=9\" agent=claude"),
+        None,
+        "a `len=` inside a quoted value is no frame"
+    );
+    assert_eq!(spawn_frame_len("spawn \"len=7\" agent=claude"), Some(Ok(7)));
+    assert_eq!(
+        spawn_frame_len("spawn cwd=\"/a agent=claude len=3"),
+        Some(Ok(3)),
+        "an unterminated quote still frames its len="
+    );
+    assert_eq!(spawn_frame_len("spawn cwd=/w"), None);
+    assert_eq!(spawn_frame_len("post to=h-a kind=note len=3"), None);
+    assert_eq!(spawn_frame_len("send len=4"), None);
+    assert_eq!(
+        spawn_frame_len("spawn agent=claude len=65537"),
+        Some(Err(
+            "ERR spawn agent=claude: the task is 65537 bytes (max 65536)\n".to_string()
+        ))
+    );
+    assert!(
+        spawn_frame_len("spawn agent=claude len=abc")
+            .is_some_and(|len| len.is_err_and(|e| e.starts_with("ERR usage: spawn")))
+    );
+    assert_eq!(announced_body("spawn agent=claude len=65536"), 65536);
+    assert_eq!(announced_body("spawn agent=claude len=65537"), 0);
+    assert_eq!(announced_body("spawn cwd=/w"), 0);
+}
+
+/// A worker's task is read only behind a `GO <n>` the client waits for: a
+/// lane reading its connection waiting answers the line first, and the task
+/// follows; a task already here (a parked connection's line had its `GO`
+/// from `frame_header`, and was served once its task was whole) is read with
+/// no second answer.
+#[cfg(unix)]
+#[test]
+fn a_workers_task_is_read_behind_its_go() {
+    use std::io::{BufRead as _, Read as _};
+    let (server, client) = std::os::unix::net::UnixStream::pair().expect("pair");
+    let task = b"line one\n$(two)\n".to_vec();
+    let peer = {
+        let task = task.clone();
+        std::thread::spawn(move || {
+            let mut r = std::io::BufReader::new(&client);
+            let mut go = String::new();
+            r.read_line(&mut go).expect("the GO");
+            (&client).write_all(&task).expect("the task");
+            go
+        })
+    };
+    let mut reader = control_lanes::lane_reader(&server, Vec::new());
+    assert_eq!(
+        read_worker_task(&server, &mut reader, task.len()).expect("read"),
+        task
+    );
+    assert_eq!(
+        peer.join().expect("peer"),
+        aterm_types::control_verbs::task_frame_go(task.len())
+    );
+
+    let (server, mut client) = std::os::unix::net::UnixStream::pair().expect("pair");
+    let mut here = task.clone();
+    here.extend_from_slice(b"next\n");
+    {
+        let mut reader = control_lanes::lane_reader(&server, here);
+        assert_eq!(
+            read_worker_task(&server, &mut reader, task.len()).expect("read"),
+            task
+        );
+        assert_eq!(
+            read_request_line(&mut reader).as_deref(),
+            Some("next"),
+            "the stream stays framed"
+        );
+    }
+    drop(server);
+    let mut said = Vec::new();
+    client
+        .read_to_end(&mut said)
+        .expect("the server's end closed");
+    assert!(said.is_empty(), "no second answer: {said:?}");
+}
+
+/// A worker's spawn frame aimed at a session this instance does not host is
+/// refused unsent where it is, never relayed: the `GO` it waits for is this
+/// instance's to say, and another instance — one that predates the frame —
+/// would serve its task as requests. Aimed here (no selector, `@.`, a
+/// local id, a hosted sid), or no frame at all, it is not refused here.
+#[test]
+fn a_worker_frame_for_another_instance_is_refused_never_relayed() {
+    let store = session_store::new_store();
+    let local = registered_session(0, -1, b"");
+    let local_sid = local.ctx.self_id.as_str().to_string();
+    store.write().unwrap().register(local);
+    let refused = worker_frame_refusal("@s-not-hosted-here spawn agent=claude len=4", &store);
+    assert!(
+        refused.as_deref().is_some_and(|r| r.starts_with(
+            "ERR spawn agent=claude: @s-not-hosted-here is not a session of this instance"
+        )),
+        "{refused:?}"
+    );
+    assert!(!is_wait_request(
+        "@s-not-hosted-here spawn agent=claude len=4",
+        Scope::Owner,
+        &store
+    ));
+    assert!(
+        is_wait_request("@s-not-hosted-here spawn cwd=/w", Scope::Owner, &store),
+        "a plain spawn is relayed as before"
+    );
+    for here in [
+        "spawn agent=claude len=4".to_string(),
+        "@. spawn agent=claude len=4".to_string(),
+        "@0 spawn agent=claude len=4".to_string(),
+        format!("@{local_sid} spawn agent=claude len=4"),
+        "@s-not-hosted-here spawn cwd=/w".to_string(),
+        "@s-not-hosted-here text".to_string(),
+    ] {
+        assert_eq!(worker_frame_refusal(&here, &store), None, "{here}");
+    }
 }
 
 // ---- A6: exactly-once at the PTY seam ---------------------------------------
@@ -13990,6 +15899,10 @@ fn guarded_pipe_session(local_id: u64) -> (crate::session_store::SessionHandle, 
 #[cfg(unix)]
 fn a_guarded_key_presses_when_a_row_matches_and_writes_nothing_when_none_does() {
     let (h, rx) = guarded_pipe_session(1);
+    // The sink borrows the test's write end; this scope owns and closes it.
+    // SAFETY: guarded_pipe_session returned this new write descriptor; the
+    // session/sink borrow it and no other owner closes it. No writer is pending.
+    let _write_end = unsafe { std::os::fd::OwnedFd::from_raw_fd(h.master) };
     let proceed = control_input::compile_guard(Some("Do.you.want.to.proceed"))
         .unwrap()
         .unwrap();
@@ -14050,6 +15963,96 @@ fn a_guarded_key_presses_when_a_row_matches_and_writes_nothing_when_none_does() 
     assert_eq!(
         control_input::cmd_send_guarded(&h.term, &h.ctx, elsewhere.as_ref(), "y\\n"),
         "OK skipped\n"
+    );
+    assert!(drain_pipe(&rx).is_empty());
+
+    // The actual worker launch admission uses this same guarded pipe. No
+    // shell/program is run, and no timed race is needed to interpose a take
+    // over or changed input between the observed prompt and final write.
+    let store = session_store::new_store();
+    store.write().unwrap().register(h.clone());
+    let observe = || {
+        crate::term_lock(&h.term).process(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        crate::task_launch::prompt_fence(&crate::term_lock(&h.term), h.ctx.human_input.seq())
+            .expect("an input-ready shell prompt")
+    };
+    let launch =
+        |prompt| crate::task_launch::type_launch_line(&store, &h.sid, h.nonce, prompt, "worker");
+    let observed = observe();
+    assert_eq!(launch(observed), Ok("written whole"));
+    assert_eq!(
+        drain_pipe(&rx),
+        b"worker\r",
+        "the unchanged prompt admits one command"
+    );
+
+    let observed = observe();
+    crate::fabric::person_hold(&*h.ctx, true, &|| {});
+    assert!(
+        launch(observed).is_err(),
+        "Take Over after the prompt refuses the command"
+    );
+    assert!(drain_pipe(&rx).is_empty());
+    crate::fabric::person_hold(&*h.ctx, false, &|| {});
+    assert_eq!(
+        launch(observed),
+        Ok("written whole"),
+        "a fresh explicit admission after hand-back"
+    );
+    assert_eq!(drain_pipe(&rx), b"worker\r");
+
+    let observed = observe();
+    h.ctx
+        .human_input
+        .note(crate::metrics::now_us(), crate::human_input::Gesture::Other);
+    assert!(
+        launch(observed).is_err(),
+        "a person's key need not have echoed yet"
+    );
+    assert!(drain_pipe(&rx).is_empty());
+
+    let observed = observe();
+    crate::term_lock(&h.term).process(b"changed");
+    assert!(launch(observed).is_err(), "output replaced the observation");
+    assert!(drain_pipe(&rx).is_empty());
+
+    let observed = observe();
+    crate::term_lock(&h.term).process(b"\x1b]133;C\x07");
+    assert!(
+        launch(observed).is_err(),
+        "a command already started on the prompt"
+    );
+    assert!(drain_pipe(&rx).is_empty());
+
+    let observed = observe();
+    h.ctx
+        .update_parked
+        .store(true, std::sync::atomic::Ordering::Release);
+    assert!(launch(observed).is_err());
+    assert!(drain_pipe(&rx).is_empty());
+    h.ctx
+        .update_parked
+        .store(false, std::sync::atomic::Ordering::Release);
+
+    assert!(
+        crate::task_launch::type_launch_line(
+            &store,
+            &h.sid,
+            LaunchNonce::generate(),
+            observed,
+            "worker"
+        )
+        .is_err(),
+        "a different launch nonce has no authority"
+    );
+    assert!(drain_pipe(&rx).is_empty());
+    store
+        .write()
+        .unwrap()
+        .set_state(h.local_id, SessionState::Exited);
+    assert!(
+        launch(observed).is_err(),
+        "a dead session remains readable but cannot launch"
     );
     assert!(drain_pipe(&rx).is_empty());
 }
@@ -14721,7 +16724,7 @@ fn keyed_attention_on_the_wire_is_per_owner_and_the_bare_form_still_works() {
     let line = read();
     assert!(line.contains(" attention=check%20the%20deploy "), "{line}");
     assert!(
-        line.contains(" attention_owner=human attention_owners=2 "),
+        line.contains(" attention_owner=human attention_owners=2 attention_kinds=-:sup,-:human "),
         "{line}"
     );
     assert_eq!(
@@ -14796,6 +16799,110 @@ fn keyed_attention_on_the_wire_is_per_owner_and_the_bare_form_still_works() {
     assert!(read().contains(" attention_owners=8 "), "{}", read());
 }
 
+/// THE ATTENTION KIND'S GRAMMAR (`meta set attention owner=<k> [kind=ask|wait]
+/// <text>`, `docs/DESIGN-owner-surfaces-2026-10-16.md` §2.4): `kind=` follows
+/// `owner=` and names one of the closed set; a bare entry is an ask and takes
+/// no `kind=`; the text after the kind is the entry's, unchanged; a kind that
+/// moves alone is a change; every refusal stores nothing.
+#[test]
+fn the_attention_kind_rides_a_keyed_entry_and_a_refusal_stores_nothing() {
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let meta = |rest: &str| cmd_meta(&h.term, &store, 0, &h.ctx, rest);
+    let field = |key: &str| {
+        let line = meta("").0;
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(&format!("{key}=")).map(str::to_string))
+    };
+    // `owner`'s entry: its text, and its kind as `attention_kinds=` says it.
+    let kinds = |owner: &str| {
+        let text = h
+            .ctx
+            .meta
+            .lock()
+            .unwrap()
+            .attention_owners
+            .get(owner)?
+            .to_string();
+        let listed = field("attention_kinds").unwrap_or_default();
+        let kind = listed
+            .split(',')
+            .filter_map(|pair| pair.split_once(':'))
+            .find(|(_, o)| *o == owner)
+            .and_then(|(kind, _)| aterm_types::needs::AttentionKind::parse(kind));
+        Some((text, kind))
+    };
+    use aterm_types::needs::AttentionKind::{self, Ask, Wait};
+    // `sup`'s entry after a request: its text and its kind.
+    type Left = Option<(&'static str, Option<AttentionKind>)>;
+    // (request, accepted, the entry left for owner `sup`)
+    let table: &[(&str, bool, Left)] = &[
+        (
+            "set attention owner=sup kind=wait limited: resets 7pm",
+            true,
+            Some(("limited: resets 7pm", Some(Wait))),
+        ),
+        // The same text, the kind moved alone: a change, and the text stays.
+        (
+            "set attention owner=sup kind=ask limited: resets 7pm",
+            true,
+            Some(("limited: resets 7pm", Some(Ask))),
+        ),
+        // No kind: the writer named none.
+        ("set attention owner=sup a box", true, Some(("a box", None))),
+        // A kind outside the closed set, or with no text, is refused.
+        (
+            "set attention owner=sup kind=control a box",
+            false,
+            Some(("a box", None)),
+        ),
+        (
+            "set attention owner=sup kind=wait",
+            false,
+            Some(("a box", None)),
+        ),
+        (
+            "set attention owner=sup kind= a box",
+            false,
+            Some(("a box", None)),
+        ),
+        ("unset attention owner=sup", true, None),
+    ];
+    for (request, accepted, left) in table {
+        let (reply, _) = meta(request);
+        assert_eq!(reply.starts_with("OK"), *accepted, "{request}: {reply}");
+        assert_eq!(
+            kinds("sup"),
+            left.map(|(text, kind)| (text.to_string(), kind)),
+            "{request}"
+        );
+    }
+    // The kind moving alone is news (the session's need moves).
+    meta("set attention owner=sup kind=wait limited: x");
+    assert_eq!(
+        meta("set attention owner=sup kind=wait limited: x"),
+        ("OK\n".to_string(), false)
+    );
+    assert_eq!(
+        meta("set attention owner=sup kind=ask limited: x"),
+        ("OK\n".to_string(), true)
+    );
+    // A bare entry is an ask, and a bare `kind=` is a usage error, not text.
+    assert!(
+        meta("set attention kind=wait limited: x")
+            .0
+            .starts_with("ERR usage")
+    );
+    assert_eq!(kinds("-"), None);
+    assert_eq!(meta("set attention lunch").0, "OK\n");
+    assert_eq!(kinds("-"), Some(("lunch".to_string(), Some(Ask))));
+    assert_eq!(field("attention_kinds").as_deref(), Some("ask:sup,ask:-"));
+    meta("unset attention");
+    meta("unset attention owner=sup");
+    assert_eq!(field("attention_kinds").as_deref(), Some("-"));
+}
+
 /// The supervisor key: Owner-writable only, shown on `meta` and every `sessions`
 /// row, exclusive between holders, and a connection-bound claim is released by its
 /// own connection's end only.
@@ -14805,14 +16912,15 @@ fn the_supervisor_key_is_owner_only_shown_in_the_roster_and_released_with_its_co
     let h = registered_session(0, -1, b"");
     store.write().unwrap().register(h.clone());
     // The row up to `supervisor=`; `autopilot=` (`-`: no agent runs here),
-    // the owner's columns (`path_evidence= copy= upgrade=`) and the harness's
-    // `land_at= task=` follow it.
+    // the owner's columns (`path_evidence= copy= upgrade=`), the harness's
+    // `land_at= task= pause=` and the task record's `task_state= task_rev=`
+    // follow it.
     let row = || {
         let body = control_session::cmd_sessions_store(&store, None);
         let line = body.lines().nth(1).expect("one row");
         let (head, owner) = line.split_once(" path_evidence=").expect("owner columns");
         assert!(
-            owner.ends_with(" copy=- upgrade=- land_at=- task=-"),
+            owner.ends_with(" copy=- upgrade=- land_at=- task=- pause=- task_state=- task_rev=0"),
             "{line}"
         );
         head.strip_suffix(" autopilot=-")
@@ -15020,6 +17128,48 @@ fn log_and_brief_answer_a_closed_session_for_the_owner() {
             Scope::Owner
         ),
         "ERR no such session\n"
+    );
+}
+
+/// `LOG N` IS THE OWNER'S (session log 5J-3): the instance's node log answers an
+/// Owner-class connection with no terminal; an edge, granted or not, is
+/// refused (`ERR denied`, audited), and so is a selector (node `n` is no
+/// session's). NEGATIVE CONTROL: the same edge's session `log` is no
+/// escalation, and `brief` is unchanged.
+#[test]
+fn log_n_is_the_owners_and_names_no_session() {
+    use super::{Scope, Selector, escalated_op, node_log_reply};
+    let ctx = test_ctx();
+    let read_edge = edge_granted(Op::ReadScreen, &ctx);
+    let owner = node_log_reply("n", None, Scope::Owner);
+    assert!(owner.starts_with("OK "), "{owner}");
+    assert!(
+        owner
+            .lines()
+            .skip(1)
+            .all(|l| l.split(' ').nth(2) == Some("n") || l.starts_with("gap ")),
+        "node n's records only: {owner}"
+    );
+    assert!(node_log_reply("n", Some(&Selector::SelfTok), Scope::Owner).starts_with("OK "));
+    for scope in [read_edge, Scope::Edge(aterm_session::EdgeToken::generate())] {
+        assert_eq!(
+            node_log_reply("n", None, scope),
+            "ERR denied: log n is owner-only\n"
+        );
+    }
+    assert_eq!(
+        node_log_reply("n", Some(&Selector::Local(3)), Scope::Owner),
+        "ERR denied: log n takes no @<sid>\n"
+    );
+    assert_eq!(
+        escalated_op("log", ""),
+        None,
+        "NEGATIVE CONTROL: a session's log"
+    );
+    assert_eq!(escalated_op("brief", ""), None, "brief is unchanged");
+    assert_eq!(
+        escalated_op("brief", "all"),
+        Some(super::Escalation::OwnerOnly)
     );
 }
 
@@ -15746,6 +17896,48 @@ fn cause_is_taken_among_the_leading_options_once() {
     );
 }
 
+/// `act=` (phase 5, ruling T1): taken among `key`'s and `send`'s leading
+/// options in any order, once, a closed word; a malformed or repeated one is
+/// a carried usage refusal (answered before a byte); `paste` and `turn` take
+/// none (their bodies keep it).
+#[test]
+fn act_is_taken_among_key_and_send_leading_options_once() {
+    use aterm_slog::ActWord;
+    let (o, tail) = control_input::take_leading_options("key", "act=approve 1");
+    assert_eq!(
+        (o.act, o.refusal.as_deref(), tail.as_str()),
+        (Some(ActWord::Approve), None, "1")
+    );
+    let (o, tail) = control_input::take_leading_options("send", "id=a:b:c act=answer cause=@5 hi");
+    assert_eq!(
+        (o.act, o.idem.as_deref(), tail.as_str()),
+        (Some(ActWord::Answer), Some("a:b:c"), "hi")
+    );
+    let (o, tail) = control_input::take_leading_options("key", "if-gen=1.2 act=deny 2");
+    assert_eq!((o.act, tail.as_str()), (Some(ActWord::Deny), "2"));
+    for bad in [
+        "act=",
+        "act=yes",
+        "act=Approve",
+        "act=unknown",
+        "act=approve act=approve",
+        "act=approve act=deny",
+    ] {
+        for verb in ["key", "send"] {
+            let (o, _) = control_input::take_leading_options(verb, &format!("{bad} 1"));
+            assert_eq!(
+                o.refusal.as_deref(),
+                Some(control_input::ACT_USAGE),
+                "{verb} {bad}"
+            );
+        }
+    }
+    for verb in ["paste", "turn"] {
+        let (o, tail) = control_input::take_leading_options(verb, "act=approve hi");
+        assert_eq!((o.act, tail.as_str()), (None, "act=approve hi"), "{verb}");
+    }
+}
+
 /// R7: `cause=` names only what THIS session holds — mail delivered to it
 /// (never another session's offset, though it lies below this one's newest),
 /// a record seq inside its current seq space and outside every hole.
@@ -16068,7 +18260,7 @@ fn a_turn_wakes_the_logs_watchers() {
 
 /// A session whose log holds an agent run (`claude`), a turn and an open
 /// approval step on a Bash box: the step's node.
-fn with_open_approval(h: &SessionHandle) -> aterm_slog::Node {
+pub(super) fn with_open_approval(h: &SessionHandle) -> aterm_slog::Node {
     let mut g = h.ctx.timeline.lock().unwrap();
     g.note_root_group(100);
     assert!(g.note_foreground_group(300));
@@ -16098,6 +18290,7 @@ fn with_open_approval(h: &SessionHandle) -> aterm_slog::Node {
 }
 
 /// An edge from a fresh minted session to `h` holding `op`.
+#[cfg(unix)]
 fn edge_to(h: &SessionHandle, op: aterm_session::Op) -> (Scope, SessionId) {
     let src = SessionId::generate();
     let tok = h
@@ -16850,6 +19043,58 @@ fn await_log_refuses_its_usage_at_once_and_says_a_reset() {
     );
 }
 
+/// 5F-1: A PREDICATE LIST IS ONE WAITER. `await log kind=bell,kind=note`
+/// parked from the head registers ONE watcher on the session, as one
+/// predicate does, and its second member's record answers it (a one-minute
+/// hang detector: a missing wake parks it to its deadline), after which the
+/// session has no watcher. A since-less list holding `need` latches as `need`
+/// alone does, whatever member comes first.
+#[test]
+fn an_await_log_list_parks_one_waiter_and_answers_on_either_member() {
+    use aterm_spec::wait::{MUST_HAPPEN, until_within};
+    let store = session_store::new_store();
+    let h = registered_session(1, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let subs = subscribe::new_registry();
+    let (ep, head) = {
+        let g = h.ctx.timeline.lock().unwrap();
+        (g.slog().log().ep(), g.slog().log().last_seq())
+    };
+    let args = format!("kind=bell,kind=note since={head} ep={ep} timeout=600000");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (h2, store2, subs2) = (h.clone(), store.clone(), subs.clone());
+    std::thread::spawn(move || {
+        let _ = tx.send(await_log(&h2, &store2, &subs2, &args));
+    });
+    until_within(MUST_HAPPEN, "the list's waiter registers", || {
+        (subs.lock().unwrap().watchers(1) > 0).then_some(())
+    });
+    assert_eq!(subs.lock().unwrap().watchers(1), 1, "one waiter for two");
+    assert!(dispatch_mark(&h.ctx, Scope::Owner, 1, "- note text=second", &subs).starts_with("OK "));
+    let reply = rx
+        .recv_timeout(MUST_HAPPEN)
+        .expect("woken by the second member's record");
+    assert!(reply.contains(" mark - note text=second "), "{reply}");
+    until_within(MUST_HAPPEN, "the answered waiter leaves", || {
+        (subs.lock().unwrap().watchers(1) == 0).then_some(())
+    });
+
+    let step = with_open_approval(&h);
+    for list in ["close=turn,need", "need,kind=bell"] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (h2, store2, subs2) = (h.clone(), store.clone(), subs.clone());
+        let args = format!("{list} timeout=600000");
+        std::thread::spawn(move || {
+            let _ = tx.send(await_log(&h2, &store2, &subs2, &args));
+        });
+        let reply = rx.recv_timeout(MUST_HAPPEN).expect("a latched need");
+        assert!(
+            reply.contains(" latched=1 ") && reply.contains(&format!(" open {step} approval ")),
+            "{list}: {reply}"
+        );
+    }
+}
+
 /// LIVE: a parked `await log` returns when another thread writes the record it
 /// waits for — a mark through the `mark` arm, a `turn`'s first byte — and a
 /// session's close delivers its close record before `ERR exited` (one-minute
@@ -17136,6 +19381,61 @@ fn since_log_needs_log_ep_and_a_single_target() {
     assert_eq!(String::from_utf8_lossy(&out), "ERR denied\n");
 }
 
+/// THE AUTOPILOT WORD'S `meta` LINES ARE ANSWERED ONCE THE JOURNAL CARRIES
+/// THEM (ATERM-KI-1016-1, `word_journaled`): `set autopilot …` and `unset
+/// autopilot` take the wait, and so does `hold`'s `OK`; past the bound the
+/// `OK` says `journaled=0` (the word stands, no image on disk carries it). A
+/// refusal is answered as it is. NEGATIVE CONTROLS: another field's `meta`
+/// line, and a reading, take no wait; an unarmed registry answers at once.
+#[cfg(unix)]
+#[test]
+fn the_autopilot_words_meta_lines_wait_on_the_journal() {
+    use super::{meta_moves_autopilot, word_journaled};
+    for line in [
+        "set autopilot land",
+        "set autopilot cruise until=+5m",
+        "unset autopilot",
+    ] {
+        assert!(meta_moves_autopilot(line), "{line}");
+    }
+    for line in ["", "set title x", "unset questions", "autopilot", "set"] {
+        assert!(!meta_moves_autopilot(line), "{line:?}");
+    }
+    let store = crate::session_store::new_store();
+    assert_eq!(
+        word_journaled(&store, "OK\n".to_string()),
+        "OK\n",
+        "unarmed: at once"
+    );
+    // Armed by a live lane whose loop never turns: the bound answers.
+    let dir = crate::crash_journal::tests::scratch("cj-meta");
+    let lane = crate::crash_journal::Lane::new(
+        Some(dir.path().to_path_buf()),
+        crate::crash_journal::tests::reaped_pid(),
+    );
+    let durable = lane.durable();
+    assert_eq!(
+        durable.settle("OK\n".to_string(), std::time::Duration::from_millis(20)),
+        "OK journaled=0\n"
+    );
+    assert_eq!(
+        durable.settle(
+            "OK hold=1\n".to_string(),
+            std::time::Duration::from_millis(20)
+        ),
+        "OK hold=1 journaled=0\n"
+    );
+    store
+        .write()
+        .unwrap_or_else(|p| p.into_inner())
+        .set_journal_durable(durable);
+    assert_eq!(
+        word_journaled(&store, "ERR denied\n".to_string()),
+        "ERR denied\n",
+        "a refusal is answered as it is"
+    );
+}
+
 /// A FULL POOL GROWS (AD-2 of the codex-alab end-to-end run, 2026-10-16:
 /// the fifth codex-alab of an instance was refused its `subscribe @self`
 /// for good, and with it its claim): past the four started lanes, each
@@ -17240,4 +19540,318 @@ fn the_push_ceiling_is_an_eighth_of_the_descriptor_limit_within_its_bounds() {
         CONTROL_SUBSCRIPTION_MAX
     );
     assert_eq!(subscriptions_cap_for(None), CONTROL_SUBSCRIPTION_WORKERS);
+}
+
+/// THE DRIVE GATE (the step-in, design §5.1) admits its allowlist and
+/// nothing else: each admitted form, with the write it makes; each refused
+/// form — another verb (settings, open, invoke, grant, the fleet's and the
+/// bus's verbs, privacy, update, a subscription), any frame but a worker's
+/// task, a selector that is no hosted sid, a close of a worker another node
+/// spawned, a spawn that is no worker's or would take the front window or
+/// another session's place, a hold that names an origin, an await that is
+/// no task list, a turn whose `timeout=` (or default) outlives the drive's
+/// connection — answered with its reason. CONTROL: the same verbs at a
+/// hosted sid pass, so each refusal is the form's.
+#[test]
+fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
+    const W: &str = "s-00000000000000aa";
+    const MINE: &str = "s-00000000000000bb";
+    let hosts = |sid: &SessionId| [W, MINE].contains(&sid.as_str());
+    let spawned = |sid: &SessionId| sid.as_str() == W;
+    let gate = |line: &str| drive_gate(line, &hosts, &spawned);
+    let wrote = |line: &str| match gate(line) {
+        Ok(DriveLine::Act { write, .. }) => write.map(|act| act.verb),
+        other => panic!("{line:?} was not admitted: {other:?}"),
+    };
+    assert_eq!(gate("survey"), Ok(DriveLine::Fleet));
+    assert_eq!(gate("version"), Ok(DriveLine::Fleet));
+    for read in [
+        format!("@{W} status"),
+        format!("@{W} text"),
+        format!("@{W} screen"),
+        format!("@{W} result"),
+        format!("@{W} result full"),
+        format!("await task @{W} since=0"),
+        format!("await task @{W}:3,@{MINE} all timeout=20000"),
+    ] {
+        assert_eq!(wrote(&read), None, "{read}");
+    }
+    for (line, verb) in [
+        (
+            format!("@{W} turn timeout=20000 typed=1 settle=submitted hi"),
+            "turn",
+        ),
+        (
+            format!("@{W} turn id=1:2:3 idle=5 timeout=22000 hi"),
+            "turn",
+        ),
+        (format!("@{W} key Enter"), "key"),
+        (format!("@{W} send hi"), "send"),
+        (format!("hold {W} on reason=build"), "hold"),
+        (format!("hold {W} off"), "hold"),
+        (format!("@{W} close"), "close"),
+        (
+            "spawn agent=claude cwd=/tmp from=s-0000000000000c03 len=5".to_owned(),
+            "spawn",
+        ),
+    ] {
+        assert_eq!(wrote(&line), Some(verb), "{line}");
+    }
+    // A hold keeps the direction it asked, for its record.
+    for (way, on) in [("on", true), ("off", false)] {
+        match gate(&format!("hold {W} {way}")) {
+            Ok(DriveLine::Act {
+                write: Some(DriveAct {
+                    hold: Some(ask), ..
+                }),
+                ..
+            }) => assert_eq!(ask.on, on, "{way}"),
+            other => panic!("{way}: {other:?}"),
+        }
+    }
+    // A worker's spawn never takes this Mac's front window.
+    match gate("spawn agent=claude model=haiku len=5") {
+        Ok(DriveLine::Act { line, .. }) => assert!(line.ends_with(" raise=false"), "{line}"),
+        other => panic!("{other:?}"),
+    }
+    match gate("spawn agent=claude raise=false len=5") {
+        Ok(DriveLine::Act { line, .. }) => assert_eq!(line, "spawn agent=claude raise=false len=5"),
+        other => panic!("{other:?}"),
+    }
+    for line in [
+        "settings set columns 80".to_owned(),
+        "open settings".to_owned(),
+        "invoke TakeOver".to_owned(),
+        format!("@{W} grant read"),
+        "fleet".to_owned(),
+        "fabric status".to_owned(),
+        "dial lab version".to_owned(),
+        "privacy".to_owned(),
+        "update check".to_owned(),
+        "sessions".to_owned(),
+        "subscribe @* events".to_owned(),
+        format!("@{W} feed-bin 5"),
+        format!("@{W} paste-bin 3"),
+        format!("post to=@{W} kind=note len=3"),
+        format!("@{W} signal INT"),
+        format!("@{W} restart"),
+        format!("@{W} meta set role x"),
+        // A selector that is no hosted sid.
+        "@. status".to_owned(),
+        "@1 status".to_owned(),
+        "@s-00000000000000cc status".to_owned(),
+        format!("@{W},@{MINE} status"),
+        "status".to_owned(),
+        "turn hi".to_owned(),
+        // A turn whose budget outlives its connection: one past the drive's
+        // longest, and one naming none (its own default is minutes).
+        format!("@{W} turn timeout=22001 hi"),
+        format!("@{W} turn id=1:2:3 typed=1 cadence=2000 timeout=600000 hi"),
+        format!("@{W} turn hi"),
+        // A close of a worker this node did not spawn.
+        format!("@{MINE} close"),
+        format!("@{W} close now"),
+        // A spawn that is no worker's, or reaches past its own.
+        "spawn".to_owned(),
+        "spawn agent=claude".to_owned(),
+        "spawn len=5".to_owned(),
+        "spawn agent=codex len=5".to_owned(),
+        "spawn agent=claude cwd=src len=5".to_owned(),
+        format!("spawn agent=claude from={MINE} len=5"),
+        "spawn agent=claude raise=true len=5".to_owned(),
+        "spawn agent=claude window=1 len=5".to_owned(),
+        "spawn agent=claude split=v len=5".to_owned(),
+        "spawn agent=claude identity=x len=5".to_owned(),
+        "spawn agent=claude theme=x len=5".to_owned(),
+        format!("spawn connected=controlled place=tab of={W}"),
+        format!("@{W} spawn agent=claude len=5"),
+        // A hold that names an origin, or a session not hosted here.
+        format!("hold {W} on origin=local"),
+        format!("hold {W} on origin=remote"),
+        "hold s-00000000000000cc on".to_owned(),
+        format!("hold {W}"),
+        // An await that is no task list.
+        "await inbox".to_owned(),
+        format!("@{W} await task"),
+        "await task @s-00000000000000cc".to_owned(),
+        "await task @1".to_owned(),
+    ] {
+        assert!(
+            gate(&line).is_err(),
+            "{line:?} was admitted: {:?}",
+            gate(&line)
+        );
+    }
+}
+
+/// A DRIVE CONNECTION IS A DRIVE SCOPE ON A THREAD THAT NAMES ITS NODE:
+/// there an admitted act goes on as an Owner line and a refused one is
+/// answered `ERR denied:`; a fleet verb keeps the fleet scope (its gate
+/// judges it). Either half alone — `drive` set with no node on the thread,
+/// or a node on the thread of a reader's connection — is a fleet peer's,
+/// whose gate refuses the act.
+#[test]
+#[cfg(unix)]
+fn only_a_drive_scope_on_a_drivers_thread_passes_the_drive_gate() {
+    let store = crate::session_store::new_store();
+    let (target, _rx) = pipe_session(91);
+    let sid = target.sid.clone();
+    store.write().unwrap().register(target);
+    let line = format!("@{} status", sid.as_str());
+    let drive = Scope::Fleet {
+        content: true,
+        drive: true,
+    };
+    let reader = Scope::Fleet {
+        content: true,
+        drive: false,
+    };
+    let driver = crate::fabric::Driver {
+        node: "03".repeat(16),
+        host: "mac-03".to_owned(),
+    };
+    // No node on the thread: the line passes untouched, to the fleet gate.
+    let (passed, scope, _) = drive_admission(line.clone(), drive, &store).unwrap();
+    assert_eq!((passed.as_str(), scope), (line.as_str(), drive));
+    assert!(
+        fleet_refusal(&passed, scope).is_some(),
+        "the fleet gate refuses it"
+    );
+    {
+        let _driving = crate::fabric::DrivingAs::enter(driver.clone());
+        let (_, scope, _) = drive_admission(line.clone(), reader, &store).unwrap();
+        assert_eq!(scope, reader, "a reader's connection is never driven");
+        let (_, scope, write) = drive_admission(line.clone(), drive, &store).unwrap();
+        assert_eq!((scope, write), (Scope::Owner, None), "an admitted read");
+        let (_, scope, _) = drive_admission("survey".to_owned(), drive, &store).unwrap();
+        assert_eq!(scope, drive, "a fleet verb keeps the fleet scope");
+        let refused = drive_admission("settings set columns 80".to_owned(), drive, &store);
+        assert!(refused.is_err_and(|why| why.starts_with("ERR denied: ")));
+        let typing = format!("@{} send hi", sid.as_str());
+        let (_, scope, write) = drive_admission(typing, drive, &store).unwrap();
+        assert_eq!(scope, Scope::Owner);
+        assert_eq!(write.map(|act| act.verb), Some("send"));
+    }
+    assert!(
+        crate::fabric::serving_driver().is_none(),
+        "the guard put it back"
+    );
+}
+
+/// THE RECORD OF A DRIVE names what moved. A hold is named by the
+/// direction it asked and recorded only when the driving node's remote slot
+/// moved that way: an `off` answered `OK hold=1` — the person's, the owner's
+/// or the bridge's slot still standing — is a hand-back, never a take; an
+/// `off` that lifted nothing of the node's, an `on` it held already, and a
+/// refusal record nothing. A typing verb that typed, and a spawn's or a
+/// close's `OK`, are records. And a spawn over a drive makes its worker the
+/// node's to close, which its close takes off — a refused close keeps it
+/// (the NEGATIVE CONTROL of the close the gate then admits).
+#[test]
+fn a_drives_record_names_what_moved() {
+    let sid = SessionId::new("s-0000000000d71e00");
+    let hold = |on, held| DriveAct {
+        verb: "hold",
+        sid: Some(sid.clone()),
+        hold: Some(HoldAsk { on, held }),
+    };
+    for (act, reply, holds_now, words) in [
+        (
+            hold(true, false),
+            "OK hold=1\n",
+            true,
+            Some("took (hold on)"),
+        ),
+        (
+            hold(false, true),
+            "OK hold=1\n",
+            false,
+            Some("handed back (hold off)"),
+        ),
+        (
+            hold(false, true),
+            "OK hold=0\n",
+            false,
+            Some("handed back (hold off)"),
+        ),
+        (hold(false, false), "OK hold=1\n", false, None),
+        (hold(true, true), "OK hold=1\n", true, None),
+        (
+            hold(true, false),
+            "ERR halted reason=taken-over origin=person\n",
+            false,
+            None,
+        ),
+    ] {
+        assert_eq!(
+            drive_record(&act, reply, holds_now),
+            words,
+            "{act:?} {reply:?} {holds_now}"
+        );
+    }
+    let act = |verb| DriveAct {
+        verb,
+        sid: Some(sid.clone()),
+        hold: None,
+    };
+    assert_eq!(drive_record(&act("send"), "OK\n", false), Some("send"));
+    assert_eq!(
+        drive_record(&act("send"), "ERR halted reason=- origin=remote\n", false),
+        None
+    );
+    assert_eq!(
+        drive_record(&act("close"), "OK closed\n", false),
+        Some("closed")
+    );
+
+    let store = crate::session_store::new_store();
+    let driver = crate::fabric::Driver {
+        node: "07".repeat(16),
+        host: "mac-07".to_owned(),
+    };
+    let worker = SessionId::new("s-0000000000d71e01");
+    let _driving = crate::fabric::DrivingAs::enter(driver.clone());
+    let spawn = DriveAct {
+        verb: "spawn",
+        sid: None,
+        hold: None,
+    };
+    let reply = format!("OK {} task_rev=1\n", worker.as_str());
+    assert_eq!(
+        drive_record(&spawn, &reply, false),
+        Some("started a worker in")
+    );
+    note_drive_act(&spawn, &reply, &store);
+    assert_eq!(drive_spawned_by(&worker), Some(driver.node.clone()));
+    let close = DriveAct {
+        verb: "close",
+        sid: Some(worker.clone()),
+        hold: None,
+    };
+    note_drive_act(&close, "ERR denied: busy\n", &store);
+    assert_eq!(
+        drive_spawned_by(&worker),
+        Some(driver.node.clone()),
+        "a refused close keeps it the node's"
+    );
+    note_drive_act(&close, "OK closed\n", &store);
+    assert_eq!(drive_spawned_by(&worker), None);
+}
+
+/// THE TYPED-BY STAMP OF A DRIVE names the host over the fleet: an admitted
+/// line runs as Owner, and its caller is the node the thread serves, never
+/// the client process the Owner arm would read.
+#[test]
+fn a_drives_typing_is_credited_to_its_host_over_the_fleet() {
+    let ctx = test_ctx();
+    let driver = crate::fabric::Driver {
+        node: "03".repeat(16),
+        host: "mac-03".to_owned(),
+    };
+    let _driving = crate::fabric::DrivingAs::enter(driver);
+    let caller = serving_caller(Scope::Owner, &ctx).expect("a caller");
+    assert_eq!(
+        caller.who,
+        crate::typed_by::Who::Word("mac-03 over the fleet".to_owned())
+    );
 }

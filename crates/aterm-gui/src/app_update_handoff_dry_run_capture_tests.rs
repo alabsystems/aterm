@@ -189,8 +189,10 @@ fn the_first_rung_is_seeded_from_the_dry_run_and_kept_for_the_next_update() {
     }
     // SAFETY: closing the two test-owned descriptors exactly once.
     unsafe {
-        libc::close(slave);
+        // The master first: a slave closed over output its master never read
+        // waits out the tty's drain (0.6 s on macOS).
         libc::close(master);
+        libc::close(slave);
     }
     app.pool
         .sessions
@@ -224,7 +226,7 @@ pub(crate) fn prelaunched(
         stand_down_ack: std::sync::mpsc::sync_channel(1).0,
         transfer,
         arbiter: crate::HandoffAttemptArbiter::new(),
-        launched_at: std::time::Instant::now(),
+        begun_at: std::time::Instant::now(),
         dialled: None,
         park_retry_at: None,
         park_misses: 0,
@@ -235,6 +237,8 @@ pub(crate) fn prelaunched(
         stood_down: false,
         teardown: crate::DeferredHandoffTeardown::None,
         revoked_by_activity: false,
+        #[cfg(target_os = "macos")]
+        booked_launch_unregistered: false,
         history_export: None,
     };
     (record, transferred)
@@ -487,6 +491,74 @@ fn a_park_refuses_a_desk_the_dialled_claim_cannot_carry_before_freezing() {
     release_pty(&mut app, pty);
 }
 
+/// WHICH DONE THE OWNER SAW RIDES THE REAL PARK (owner surfaces §5): the
+/// prelaunched lane's park stamps what the status item knew of a session
+/// whose finished task the owner looked at on its manifest record
+/// (`SessionRecord::status_seen`, `App::status_carry_rows`: the one carry of
+/// what the owner saw and was told), naming that done by when its task
+/// entered it, so the successor reads it as seen. NEGATIVE CONTROL: the same
+/// park of a done nobody looked at (its window occluded) carries none.
+#[test]
+fn the_park_carries_which_done_the_owner_saw() {
+    let carried = |looked: bool| {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let mut app = crate::App::headless_for_test();
+        let pty = quiet_pty(&mut app);
+        let wid = crate::WindowId(0);
+        {
+            let ws = app.windows.get_mut(&wid).expect("window 0");
+            ws.band_on_screen_for_test = true;
+            ws.occluded = !looked;
+        }
+        app.frontmost_window = Some(wid);
+        assert_eq!(app.focused_session_id(wid), Some(0), "PRECONDITION");
+        let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+        crate::task_record::mark_session_task(
+            &ctx,
+            0,
+            &crate::task_record::TaskMark::new(crate::task_record::TaskState::Done),
+            &app.subscribers,
+        )
+        .expect("unfenced");
+        app.on_task_changed(0);
+        let (record, transferred) = prelaunched(23, ApplyMode::Immediate, FreezeSeed::Default);
+        app.update_handoff_prelaunch = Some(record);
+        let parked = app.park_and_transfer_to_prelaunched_successor(std::time::Instant::now());
+        assert!(
+            matches!(parked, super::ParkAttempt::Parked),
+            "PRECONDITION: the park landed ({parked:?})"
+        );
+        let transfer = transferred.try_recv().expect("the park's capture");
+        let record = transfer
+            .capture
+            .manifest
+            .sessions
+            .iter()
+            .find(|record| record.local_id == 0)
+            .cloned()
+            .expect("session 0's record");
+        drop(transfer);
+        app.pending_update_handoff = None;
+        app.update_handoff_prelaunch = None;
+        release_pty(&mut app, pty);
+        let since_unix_ms = ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .task()
+            .expect("the task")
+            .since_unix_ms;
+        record
+            .status_seen
+            .as_deref()
+            .map(crate::status_item::StatusCarry::parse)
+            .and_then(|carry| carry.done)
+            .is_some_and(|done| done == since_unix_ms)
+    };
+    assert!(carried(true), "the look rode the park");
+    assert!(!carried(false), "CONTROL: nobody looked, nothing carried");
+}
+
 /// A fork has no descriptor-message limit: when the launched lane falls back at runtime
 /// (`fork_after_park`, no dialer and no grant limit) with 63 tabs, the park is not refused and
 /// the fork gets every session by inheritance. The park's deadline is the test park's
@@ -658,7 +730,7 @@ fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
         );
         now.rlim_cur
     };
-    crate::handoff_rendezvous::raise_descriptor_limit_for_park(THIS_BUILD - 1, THIS_BUILD);
+    crate::descriptor_limit::raise_descriptor_limit_for_park(THIS_BUILD - 1, THIS_BUILD);
     assert_eq!(
         soft_nofile(),
         launchd_soft,
@@ -682,7 +754,7 @@ fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
     // The same build (a same-image re-exec), and so every newer one, reads the told limit: the
     // raise is made and the duplicate has room for every master. Whether the park then lands
     // inside its 250 ms rung is the clock's question; a miss there is a re-park.
-    crate::handoff_rendezvous::raise_descriptor_limit_for_park(THIS_BUILD, THIS_BUILD);
+    crate::descriptor_limit::raise_descriptor_limit_for_park(THIS_BUILD, THIS_BUILD);
     assert!(soft_nofile() > launchd_soft, "the park's raise is made");
     let (reserved, adoption) = super::reserve_child_only_masters(&app.handoff_live_sessions())
         .expect("the raise makes room for every duplicate");
@@ -704,7 +776,7 @@ fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
         // std on purpose: the shipped hook under test installs a `pre_exec`.
         let mut successor = std::process::Command::new("/bin/sh");
         successor.args(["-c", "ulimit -n"]);
-        crate::handoff_rendezvous::start_older_image_at_its_limit(
+        crate::descriptor_limit::start_older_image_at_its_limit(
             &mut successor,
             target_build,
             THIS_BUILD,
@@ -860,7 +932,7 @@ fn a_policy_without_scrollback_withholds_the_launched_lanes_history_carry() {
             &mut capture.manifest,
             &capture.screens,
             &capture.history_heads,
-            std::mem::replace(&mut capture.history, HistoryPlan::Unexported).results(&dir),
+            std::mem::replace(&mut capture.history, HistoryPlan::Unexported).results_for_test(&dir),
             &dir,
             nonce,
         );
@@ -1011,7 +1083,7 @@ fn a_missed_park_resumes_the_history_export_for_the_repark() {
         &mut capture.manifest,
         &capture.screens,
         &capture.history_heads,
-        std::mem::replace(&mut capture.history, HistoryPlan::Unexported).results(&dir),
+        std::mem::replace(&mut capture.history, HistoryPlan::Unexported).results_for_test(&dir),
         &dir,
         nonce,
     );

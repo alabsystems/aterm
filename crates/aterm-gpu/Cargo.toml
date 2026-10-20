@@ -8,15 +8,17 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "aterm GPU renderer (Metal, OpenGL ES and WebGL2, wgpu): glyph-atlas + instanced cell quads. Renders the terminal grid on the GPU; offscreen render-to-texture readback for headless verification."
-# The integration tests are two suite binaries, split by one process-wide
-# environment write (`[[test]]` targets at the end). A `tests/*.rs` file neither
-# suite includes never compiles.
+# The integration tests separate the environment-writing parity suite and
+# the process-wide GPU timing observer from the ordinary suite (`[[test]]`
+# targets below). Unmounted `tests/*.rs` files never compile.
 autotests = false
 
 [features]
 # DEVELOPMENT SEAMS in an optimized build: this crate's `aterm_types::dev_seam!`
-# reads (the `ATERM_GPU_*` adapter/power/present seams and the
-# `ATERM_METAL_INJECT_LOSS` and `ATERM_GL_INJECT_LOSS` drills). A debug build
+# reads (the `ATERM_GPU_*` adapter/power/present seams, the pass-economy
+# ablation `ATERM_GPU_ABLATE_UNORM` with its programmatic twin
+# `GpuRenderer::set_unorm_ablation`, and the `ATERM_METAL_INJECT_LOSS` and
+# `ATERM_GL_INJECT_LOSS` drills). A debug build
 # compiles them anyway; the release cutter never enables it (aterm-gui's
 # `dev-seams` forwards here).
 dev-seams = []
@@ -149,6 +151,12 @@ path = "tests/gpu_suite.rs"
 [[test]]
 name = "gpu_fontdue"
 path = "tests/gpu_fontdue.rs"
+
+# This target owns the process-wide timing sink and its serial lookups. The
+# large parity suites must not evict a sample before the test observes it.
+[[test]]
+name = "frame_instrumentation"
+path = "tests/frame_instrumentation.rs"
 
 # ---- measurements: `targo --unverified bench -p aterm-gpu --bench <name>` ----
 

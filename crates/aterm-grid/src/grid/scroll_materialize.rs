@@ -13,7 +13,7 @@ use aterm_scrollback::{CellAttrs, HyperlinkSpan, ImageSpan, Line, UnderlineColor
 
 use super::scroll_convert::{
     RowToLineCursorState, ScrolledRowExtras, coalesce_underline_spans, is_spacer, next_combining,
-    next_complex_char, plain_ascii_byte, resolve_cell_color,
+    next_complex_char, resolve_cell_color,
 };
 use crate::CellExtra;
 use crate::CellFlags;
@@ -35,6 +35,11 @@ pub struct MaterializedRow {
     /// Soft-wrap flag from the source [`Line`], as a live `Row` reports it
     /// (`row_is_wrapped`).
     wrapped: bool,
+    /// The cells reach all but the last column, the shape an early-wrap hole
+    /// leaves (`RowFlags::EARLY_WRAP_HOLE`): a history line leaves the hole
+    /// out, and the grid paints it from the row after
+    /// ([`MaterializedRow::paint_hole`]).
+    pub(in crate::grid) hole: bool,
 }
 
 impl MaterializedRow {
@@ -60,6 +65,38 @@ impl MaterializedRow {
     #[inline]
     pub(crate) fn is_wrapped(&self) -> bool {
         self.wrapped
+    }
+
+    /// Paint the early-wrap hole as the print path did: the blank in the
+    /// background of `glyph`, the wide glyph that wrapped and opens the next
+    /// row, whose truecolour background is `bg_rgb`. A no-op unless the cells
+    /// leave a hole.
+    pub(crate) fn paint_hole(&mut self, glyph: super::Cell, bg_rgb: Option<[u8; 3]>) {
+        let Some(col) = self.cells.len().checked_sub(1).filter(|_| self.hole) else {
+            return;
+        };
+        let blank = super::Cell::bce_blank(glyph.colors());
+        self.cells[col] = blank;
+        if blank.colors().bg_is_rgb()
+            && let Some(rgb) = bg_rgb
+        {
+            self.extras
+                .entry(u16::try_from(col).unwrap_or(u16::MAX))
+                .or_default()
+                .set_bg_rgb(Some(rgb));
+        }
+    }
+
+    /// How many columns the row's text spans: [`len`](Self::len) less a
+    /// painted early-wrap hole, which is no text (`Row::written_len`).
+    #[must_use]
+    pub(crate) fn written_len(&self) -> u16 {
+        let len = self.len();
+        if self.hole {
+            len.min(u16::try_from(self.cells.len().saturating_sub(1)).unwrap_or(u16::MAX))
+        } else {
+            len
+        }
     }
 
     /// Whether this row has no occupied columns.
@@ -97,6 +134,14 @@ impl MaterializedRow {
     }
 }
 
+/// Do cells reaching `filled` columns of a `cols`-wide row leave its last cell
+/// as an early-wrap hole would? Only the row after can say whether one wrapped
+/// there; `fill_row_cells` marks a row rebuilt from a line by the same rule.
+#[inline]
+pub(crate) fn leaves_wrap_hole(filled: u16, cols: u16) -> bool {
+    u32::from(filled) + 1 == u32::from(cols)
+}
+
 /// Materialize a scrollback [`Line`] into a [`MaterializedRow`], restoring
 /// hyperlinks, non-BMP and ZWJ units (combining marks ride in their unit's
 /// complex char), truecolor fg/bg, SGR 58 underline colours and images as
@@ -107,6 +152,7 @@ pub fn materialize_from_line(line: &Line, cols: u16) -> MaterializedRow {
         cells: vec![super::Cell::default(); cols as usize],
         extras: FxHashMap::default(),
         wrapped: line.is_wrapped(),
+        hole: false,
     };
 
     let Some(text) = line.as_str() else {
@@ -127,6 +173,7 @@ pub fn materialize_from_line(line: &Line, cols: u16) -> MaterializedRow {
     // How far the line's cells reach: the bound on every link and underline
     // colour restored below (`filled_span_cols`).
     let filled = walk.col;
+    row.hole = leaves_wrap_hole(filled, cols);
 
     restore_hyperlinks(&mut row.extras, line, filled);
 
@@ -147,12 +194,11 @@ pub fn materialize_from_line(line: &Line, cols: u16) -> MaterializedRow {
 /// from column `col`, `width` (1 or 2) columns wide, each next one starting
 /// where the one before ends, `width` columns further.
 ///
-/// A history row the ring tier does not draw from its own cells is drawn by
-/// this walk, so a reader of a history row's cells takes
-/// [`Grid::ring_history_cells`](super::Grid::ring_history_cells) first and this
-/// otherwise, and reads a match or a word where the row is drawn: a VS16 base
-/// in the last column is one narrow cell, a unit wider than the room left ends
-/// the row, and text past the row's width is in no cell. `text` is the line's
+/// Every history row is drawn as this walk lays it out (the ring fast path
+/// draws the cells it would), so a reader of a history row's cells reads a
+/// match or a word where the row is drawn: cells the grid drew apart stay
+/// apart, a VS16 base in the last column is one narrow cell, a unit wider than
+/// the room left ends the row, and text past the row's width is in no cell. `text` is the line's
 /// text as the caller read it (`line.as_str()`, or a bounded or lossy read);
 /// the stored wide bits come from `line`.
 pub fn stored_line_cells<'a>(
@@ -179,38 +225,151 @@ pub fn stored_line_cells<'a>(
     })
 }
 
-/// One cell of a stored line (see [`StoredCells`]).
-struct StoredCell<'a> {
-    /// The cell's text: its grapheme unit.
-    text: &'a str,
-    /// Where `text` starts in the line.
-    byte: usize,
-    /// The unit's first character, the cell's base.
-    base: char,
-    /// Characters in the unit.
-    chars: usize,
-    /// The unit's stored attributes.
-    attrs: CellAttrs,
-    /// The cell's first column.
-    col: u16,
-    /// Drawn two columns wide.
-    wide: bool,
-}
-
-/// The layout walk over a stored line's text: each grapheme unit
-/// ([`advance_grapheme_unit_wide`]) is one cell, wide when the unit or its
-/// stored attributes say so, except a VS16 widening at the last column,
-/// which the live writer could not make. A zero-width character no unit
-/// absorbs is stored nowhere, and the row ends at its width or at a wide
-/// unit with no room left.
-struct StoredCells<'a> {
+/// The walk of a stored line's text into grapheme units, one per cell: each
+/// unit as [`advance_grapheme_unit_wide`] reads it, ended before a character
+/// the line marks [`CellAttrs::OPENS_CELL`] (cells the grid drew apart that the
+/// text alone would join), with the attributes stored on its first character
+/// (the mark cleared: it is geometry, not rendition). A zero-width character
+/// no unit absorbs is stored nowhere and skipped. Every walk of a stored line
+/// steps through this: the layout ([`StoredCells`]), the fill of a row from
+/// history and the history rewrap.
+pub(in crate::grid) struct StoredUnits<'a> {
     text: &'a str,
     attrs: aterm_scrollback::AttrRunCursor<'a>,
+    openings: CellOpenings<'a>,
     byte_idx: usize,
     char_idx: usize,
+}
+
+/// One unit of a stored line (see [`StoredUnits`]).
+pub(in crate::grid) struct StoredUnit<'a> {
+    /// The unit's text.
+    pub(in crate::grid) text: &'a str,
+    /// Where `text` starts in the line.
+    pub(in crate::grid) byte: usize,
+    /// The unit's first character, the cell's base.
+    pub(in crate::grid) base: char,
+    /// The unit as scanned: its characters and effective width.
+    pub(in crate::grid) unit: GraphemeUnit,
+    /// The unit's stored attributes, [`CellAttrs::OPENS_CELL`] cleared.
+    pub(in crate::grid) attrs: CellAttrs,
+}
+
+impl<'a> StoredUnits<'a> {
+    /// Walk `text`, `line`'s text as the caller read it (`line.as_str()`, or a
+    /// bounded or lossy read), with `line`'s stored attributes.
+    pub(in crate::grid) fn new(line: &'a Line, text: &'a str) -> Self {
+        Self {
+            text,
+            // `char_idx` only grows, so a run cursor reads the attrs in O(runs).
+            attrs: line.attr_cursor(),
+            openings: CellOpenings::new(line),
+            byte_idx: 0,
+            char_idx: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for StoredUnits<'a> {
+    type Item = StoredUnit<'a>;
+
+    fn next(&mut self) -> Option<StoredUnit<'a>> {
+        while self.byte_idx < self.text.len() {
+            // byte_idx is always at a char boundary (advanced by whole units).
+            let c = char_at(self.text, self.byte_idx);
+            // An orphan zero-width character: no cell holds it.
+            if is_zero_width(c) {
+                self.byte_idx += c.len_utf8();
+                self.char_idx += 1;
+                continue;
+            }
+            let byte = self.byte_idx;
+            let char_start = self.char_idx;
+            let limit = self.openings.limit(char_start);
+            let unit = advance_grapheme_unit_within(self.text, &mut self.byte_idx, limit);
+            self.char_idx += unit.chars;
+            let attrs = self.attrs.attr_at(char_start).with_opens_cell(false);
+            return Some(StoredUnit {
+                text: &self.text[byte..self.byte_idx],
+                byte,
+                base: c,
+                unit,
+                attrs,
+            });
+        }
+        None
+    }
+}
+
+/// Where a stored line's [`CellAttrs::OPENS_CELL`] marks cut its walk, read
+/// off the attribute runs for non-decreasing unit starts in O(runs) in all.
+struct CellOpenings<'a> {
+    runs: &'a [aterm_rle::Run<CellAttrs>],
+    /// The run the next search resumes at, and the character it starts at.
+    i: usize,
+    run_start: usize,
+    /// The first marked character at or after the last search's start
+    /// (`usize::MAX` for none): marks are rare, so most units reuse it.
+    next: usize,
+}
+
+impl<'a> CellOpenings<'a> {
+    fn new(line: &'a Line) -> Self {
+        Self {
+            runs: line.attrs().map_or(&[], aterm_rle::Rle::runs),
+            i: 0,
+            run_start: 0,
+            next: 0,
+        }
+    }
+
+    /// How many characters the unit starting at character `start` may take:
+    /// up to the next character after it that opens a cell.
+    fn limit(&mut self, start: usize) -> usize {
+        let from = start.saturating_add(1);
+        if self.next < from {
+            self.next = usize::MAX;
+            while let Some(run) = self.runs.get(self.i) {
+                let end = self.run_start.saturating_add(run.length as usize);
+                if end > from && run.value.opens_cell() {
+                    self.next = self.run_start.max(from);
+                    break;
+                }
+                self.run_start = end;
+                self.i += 1;
+            }
+        }
+        self.next - start
+    }
+}
+
+/// One cell of a stored line (see [`StoredCells`]).
+pub(in crate::grid) struct StoredCell<'a> {
+    /// The cell's text: its grapheme unit.
+    pub(in crate::grid) text: &'a str,
+    /// Where `text` starts in the line.
+    pub(in crate::grid) byte: usize,
+    /// The unit's first character, the cell's base.
+    pub(in crate::grid) base: char,
+    /// Characters in the unit.
+    pub(in crate::grid) chars: usize,
+    /// The unit's stored attributes.
+    pub(in crate::grid) attrs: CellAttrs,
+    /// The cell's first column.
+    pub(in crate::grid) col: u16,
+    /// Drawn two columns wide.
+    pub(in crate::grid) wide: bool,
+}
+
+/// The layout walk over a stored line's text: each unit ([`StoredUnits`]) is
+/// one cell, wide when the unit or its stored attributes say so, except a
+/// VS16 widening at the last column, which the live writer could not make.
+/// The row ends at its width or at a wide unit with no room left.
+pub(in crate::grid) struct StoredCells<'a> {
+    units: StoredUnits<'a>,
     /// The column after the last cell laid out: how far the line's cells
     /// reach, which bounds the spans [`materialize_from_line`] restores.
-    col: u16,
+    pub(in crate::grid) col: u16,
     cols: u16,
     /// Whether [`Self::ascii_run`] may step over a run of printable ASCII:
     /// set by a caller that wants cell geometry only, for a line whose stored
@@ -219,13 +378,9 @@ struct StoredCells<'a> {
 }
 
 impl<'a> StoredCells<'a> {
-    fn new(line: &'a Line, text: &'a str, cols: u16) -> Self {
+    pub(in crate::grid) fn new(line: &'a Line, text: &'a str, cols: u16) -> Self {
         Self {
-            text,
-            // `char_idx` only grows, so a run cursor reads the attrs in O(runs).
-            attrs: line.attr_cursor(),
-            byte_idx: 0,
-            char_idx: 0,
+            units: StoredUnits::new(line, text),
             col: 0,
             cols,
             ascii_runs: false,
@@ -242,7 +397,8 @@ impl<'a> StoredCells<'a> {
         if !self.ascii_runs {
             return None;
         }
-        let rest = self.text.as_bytes().get(self.byte_idx..)?;
+        let walk = &mut self.units;
+        let rest = walk.text.as_bytes().get(walk.byte_idx..)?;
         let span = rest.iter().take_while(|&&b| is_printable_ascii(b)).count();
         let units = if span == rest.len() {
             span
@@ -254,9 +410,9 @@ impl<'a> StoredCells<'a> {
         if count == 0 {
             return None;
         }
-        let (byte, col) = (self.byte_idx, self.col);
-        self.byte_idx = byte.saturating_add(usize::from(count));
-        self.char_idx = self.char_idx.saturating_add(usize::from(count));
+        let (byte, col) = (walk.byte_idx, self.col);
+        walk.byte_idx = byte.saturating_add(usize::from(count));
+        walk.char_idx = walk.char_idx.saturating_add(usize::from(count));
         self.col = col.saturating_add(count);
         Some((byte, col, count))
     }
@@ -266,45 +422,39 @@ impl<'a> Iterator for StoredCells<'a> {
     type Item = StoredCell<'a>;
 
     fn next(&mut self) -> Option<StoredCell<'a>> {
-        while self.byte_idx < self.text.len() && self.col < self.cols {
-            // byte_idx is always at a char boundary (advanced by whole units).
-            let c = char_at(self.text, self.byte_idx);
-            // An orphan zero-width character: no cell holds it.
-            if is_zero_width(c) {
-                self.byte_idx += c.len_utf8();
-                self.char_idx += 1;
-                continue;
-            }
-            let byte = self.byte_idx;
-            let char_start = self.char_idx;
-            let unit = advance_grapheme_unit_wide(self.text, &mut self.byte_idx);
-            self.char_idx += unit.chars;
-            let attrs = self.attrs.attr_at(char_start);
-            let col = self.col;
-            // The live writer's row-edge exception: a VS16 widening fails at
-            // the last column (no room for the spacer), so demote it there.
-            let last = col.saturating_add(1) >= self.cols;
-            let wide = stored_unit_is_wide(unit, attrs) && !(unit.vs16_widened && last);
-            if wide && last {
-                // A wide unit cannot fit at the last column: the row is full.
-                // Stop rather than scan the rest of a possibly oversized line
-                // under the lock; `col` stays where the cells end, so nothing is
-                // in the last column (`filled_span_cols`).
-                self.byte_idx = self.text.len();
-                return None;
-            }
-            self.col = col.saturating_add(if wide { 2 } else { 1 });
-            return Some(StoredCell {
-                text: &self.text[byte..self.byte_idx],
-                byte,
-                base: c,
-                chars: unit.chars,
-                attrs,
-                col,
-                wide,
-            });
+        if self.col >= self.cols {
+            return None;
         }
-        None
+        let StoredUnit {
+            text,
+            byte,
+            base,
+            unit,
+            attrs,
+        } = self.units.next()?;
+        let col = self.col;
+        // The live writer's row-edge exception: a VS16 widening fails at the
+        // last column (no room for the spacer), so demote it there.
+        let last = col.saturating_add(1) >= self.cols;
+        let wide = stored_unit_is_wide(unit, attrs) && !(unit.vs16_widened && last);
+        if wide && last {
+            // A wide unit cannot fit at the last column: the row is full. Stop
+            // rather than scan the rest of a possibly oversized line under the
+            // lock; `col` stays where the cells end, so nothing is in the last
+            // column (`filled_span_cols`).
+            self.cols = col;
+            return None;
+        }
+        self.col = col.saturating_add(if wide { 2 } else { 1 });
+        Some(StoredCell {
+            text,
+            byte,
+            base,
+            chars: unit.chars,
+            attrs,
+            col,
+            wide,
+        })
     }
 }
 
@@ -322,11 +472,10 @@ impl<'a> Iterator for StoredCells<'a> {
 /// base is zero-width, a placed width disagrees with the source layout, or a
 /// wide unit sits at the last column.
 ///
-/// Cells the text walk would join (flag halves or a skin tone and its base
+/// Cells the text alone would join (flag halves or a skin tone and its base
 /// drawn out of order, a cell ending in a ZWJ whose neighbour was drawn first)
-/// stay apart here, as on screen; [`ring_row_cells`] reads a row's cells from
-/// the same walk, and the row is drawn joined once it leaves the ring.
-/// `aterm-core`'s `tests/scrollback_ring_materialize_parity.rs` checks equality
+/// stay apart here, as on screen, and in the round trip too: the line marks
+/// each such cell's first character [`CellAttrs::OPENS_CELL`]. `aterm-core`'s `tests/scrollback_ring_materialize_parity.rs` checks equality
 /// with the round trip and that the fast path fired.
 #[must_use]
 pub(in crate::grid) fn materialize_from_row_extras(
@@ -348,6 +497,7 @@ pub(in crate::grid) fn materialize_from_row_extras(
         // Same source as the round trip's: `row_to_line_*` copies the row's flag
         // onto the Line, and `materialize_from_line` copies it back off.
         wrapped: row.is_wrapped(),
+        hole: false,
     };
     if row.is_empty() {
         // The round trip leaves a zero-length row's cells default but keeps its
@@ -380,6 +530,7 @@ pub(in crate::grid) fn materialize_from_row_extras(
     // of the copies the `Line` carried, under the round trip's bound: the
     // cells placed, which the walk's final check proved reach `col`.
     let col = walk.col;
+    out.hole = leaves_wrap_hole(col, cols);
     restore_hyperlink_spans(&mut out.extras, &extras.hyperlinks, col);
     if !extras.underline_colors.is_empty() {
         restore_underline_color_spans(
@@ -395,57 +546,6 @@ pub(in crate::grid) fn materialize_from_row_extras(
     #[cfg(any(test, debug_assertions))]
     super::count_ring_fast_materialize();
     Some(out)
-}
-
-/// Where each cell of ring-tier row `row` lies in `text` when the ring fast
-/// path draws the row from its own cells: `push(bytes, col, width, count)` in
-/// column order, shaped as [`stored_line_cells`] yields them, then `true`.
-/// `text` is the row's text as the `Line` serializer writes it and a reader
-/// read it back (`line_text_bounded`): every cell's text in column order.
-///
-/// `false` when the round trip draws the row instead, or `text` is not the
-/// cells' texts end to end (a bounded or lossy read): the cells pushed so far
-/// are then not the row's, and [`stored_line_cells`] is the walk the row is
-/// drawn by. One walk ([`RingCells`]) decides both what is drawn and what this
-/// reports, so a column read here names the cell drawn there.
-pub(in crate::grid) fn ring_row_cells(
-    row: &Row,
-    extras: Option<&ScrolledRowExtras>,
-    cols: u16,
-    text: &str,
-    mut push: impl FnMut(std::ops::Range<usize>, u16, u16, u16),
-) -> bool {
-    let no_extras = ScrolledRowExtras::default();
-    let extras = extras.unwrap_or(&no_extras);
-    let Some(mut walk) = RingCells::new(row, extras, cols) else {
-        return false;
-    };
-    walk.geometry_only = true;
-    let mut byte = 0usize;
-    loop {
-        let (col, count) = walk.ascii_run(text.as_bytes(), byte);
-        if count > 0 {
-            push(byte..byte.saturating_add(1), col, 1, count);
-            byte = byte.saturating_add(usize::from(count));
-        }
-        match walk.next_cell() {
-            Err(Declined) => return false,
-            Ok(None) => return byte == text.len(),
-            Ok(Some(cell)) => {
-                let end = byte.saturating_add(cell.text.len());
-                if text.get(byte..end) != Some(cell.text) {
-                    return false;
-                }
-                push(
-                    byte..end,
-                    cell.col,
-                    cell.end_col.saturating_sub(cell.col),
-                    1,
-                );
-                byte = end;
-            }
-        }
-    }
 }
 
 /// One cell of a ring-tier row as the ring fast path draws it (see
@@ -477,8 +577,7 @@ struct Declined;
 /// The walk over a ring-tier row's cells that the ring fast path draws: each
 /// non-spacer cell as one grapheme unit at its own column, as wide as the
 /// round trip would place it, or [`Declined`] where the round trip draws the
-/// row otherwise. [`materialize_from_row_extras`] and [`ring_row_cells`] both
-/// take it, so they cannot disagree on which rows the fast path draws or where.
+/// row otherwise.
 struct RingCells<'a> {
     /// The row's cells up to its length.
     cells: &'a [crate::Cell],
@@ -493,9 +592,6 @@ struct RingCells<'a> {
     char_buf: [u8; 4],
     /// The text of a cell that needs a cluster string; reused across cells.
     unit_buf: String,
-    /// Whether the reader wants each cell's place only: its colours are not
-    /// resolved (the yielded ones are the defaults).
-    geometry_only: bool,
 }
 
 impl<'a> RingCells<'a> {
@@ -519,40 +615,7 @@ impl<'a> RingCells<'a> {
             // One reusable buffer per row for the rare cells that need a
             // cluster string; the common cell never touches it.
             unit_buf: String::new(),
-            geometry_only: false,
         })
-    }
-
-    /// Step over the run of plain printable-ASCII cells (no marks) from the next
-    /// cell, whose bytes `text` holds from `byte`; returns the run's first
-    /// column and length (`0` for none). Each is one byte, one column and its
-    /// own unit, so the walk would decline none of it; only a geometry reader
-    /// ([`Self::geometry_only`]) steps over them, since their colours go
-    /// unresolved.
-    fn ascii_run(&mut self, text: &[u8], byte: usize) -> (u16, u16) {
-        let col = self.col;
-        if !self.geometry_only || usize::from(col) != self.physical {
-            return (col, 0);
-        }
-        let mut count: u16 = 0;
-        while let Some(cell) = self.cells.get(self.physical) {
-            let Some(b) = plain_ascii_byte(cell) else {
-                break;
-            };
-            if text.get(byte.saturating_add(usize::from(count))) != Some(&b)
-                || self
-                    .extras
-                    .combining
-                    .get(self.cursors.combining_idx())
-                    .is_some_and(|&(mark_col, _)| usize::from(mark_col) == self.physical)
-            {
-                break;
-            }
-            self.physical += 1;
-            count += 1;
-        }
-        self.col = col.saturating_add(count);
-        (col, count)
     }
 
     /// The next cell, `Ok(None)` after the last, or [`Declined`].
@@ -648,27 +711,22 @@ impl<'a> RingCells<'a> {
         }
 
         // Colours and flags, as the serializer stores them.
-        let (fg_raw, bg_raw) = if self.geometry_only {
-            (PackedColor::DEFAULT_FG.0, PackedColor::DEFAULT_BG.0)
-        } else {
-            let fg_raw = resolve_cell_color(
-                cell.fg_needs_overflow(),
-                cell.fg_color().map_or(PackedColor::DEFAULT_FG.0, |c| c.0),
-                &self.extras.rgb_fg,
-                &mut self.cursors.rgb_fg_idx,
-                col_u16,
-                PackedColor::DEFAULT_FG.0,
-            );
-            let bg_raw = resolve_cell_color(
-                cell.bg_needs_overflow(),
-                cell.bg_color().map_or(PackedColor::DEFAULT_BG.0, |c| c.0),
-                &self.extras.rgb_bg,
-                &mut self.cursors.rgb_bg_idx,
-                col_u16,
-                PackedColor::DEFAULT_BG.0,
-            );
-            (fg_raw, bg_raw)
-        };
+        let fg_raw = resolve_cell_color(
+            cell.fg_needs_overflow(),
+            cell.fg_color().map_or(PackedColor::DEFAULT_FG.0, |c| c.0),
+            &self.extras.rgb_fg,
+            &mut self.cursors.rgb_fg_idx,
+            col_u16,
+            PackedColor::DEFAULT_FG.0,
+        );
+        let bg_raw = resolve_cell_color(
+            cell.bg_needs_overflow(),
+            cell.bg_color().map_or(PackedColor::DEFAULT_BG.0, |c| c.0),
+            &self.extras.rgb_bg,
+            &mut self.cursors.rgb_bg_idx,
+            col_u16,
+            PackedColor::DEFAULT_BG.0,
+        );
         let attrs = CellAttrs::from_raw(fg_raw, bg_raw, cell.flags().bits());
         let wide =
             stored_unit_is_wide(unit, attrs) && !(unit.vs16_widened && col_u16 + 1 >= self.cols);
@@ -783,6 +841,17 @@ pub(crate) fn stored_unit_is_wide(unit: GraphemeUnit, attrs: CellAttrs) -> bool 
 /// selector to the width at that moment (`⌚` + VS15 + VS16 re-widens), and the
 /// skin-tone fold gates on it.
 pub(crate) fn advance_grapheme_unit_wide(text: &str, byte_idx: &mut usize) -> GraphemeUnit {
+    advance_grapheme_unit_within(text, byte_idx, usize::MAX)
+}
+
+/// [`advance_grapheme_unit_wide`] taking at most `max_chars` (at least 1)
+/// characters: a stored line's walk ends a unit before a character that opens
+/// a cell ([`StoredUnits`]).
+fn advance_grapheme_unit_within(
+    text: &str,
+    byte_idx: &mut usize,
+    max_chars: usize,
+) -> GraphemeUnit {
     // Printable-ASCII fast path: a printable ASCII base followed by the end or
     // another printable ASCII char is always a one-char narrow unit (every
     // joining char is non-ASCII or a zero-width control, so the next byte alone
@@ -802,7 +871,38 @@ pub(crate) fn advance_grapheme_unit_wide(text: &str, byte_idx: &mut usize) -> Gr
             force_narrow: false,
         };
     }
-    advance_grapheme_unit_scan(text, byte_idx)
+    advance_grapheme_unit_scan(text, byte_idx, max_chars)
+}
+
+/// Whether a walk of `text` from `prev`, where the cell before starts, folds
+/// the character at `at`, where the next cell starts, into that cell's unit:
+/// the writer of a stored line marks that character
+/// [`CellAttrs::OPENS_CELL`] so every walk keeps the two cells apart, as the
+/// grid drew them. Only a visible non-ASCII character opening a cell can fold
+/// (a flag half, a skin tone, a character after a ZWJ); a zero-width one is
+/// stored with the cell before or nowhere either way.
+pub(crate) fn walk_folds_across(text: &str, prev: usize, at: usize) -> bool {
+    let Some(&lead) = text.as_bytes().get(at) else {
+        return false;
+    };
+    if lead.is_ascii() {
+        return false;
+    }
+    let c = char_at(text, at);
+    let may_fold =
+        is_regional_indicator(c) || is_skin_tone_modifier(c) || text[..at].ends_with('\u{200D}');
+    if !may_fold || is_zero_width(c) {
+        return false;
+    }
+    let mut idx = prev;
+    while idx < at {
+        let before = idx;
+        advance_grapheme_unit_wide(text, &mut idx);
+        if idx == before {
+            return false;
+        }
+    }
+    idx > at
 }
 
 /// The char starting at `byte_idx`, a char boundary inside `text`. An ASCII
@@ -833,7 +933,7 @@ const fn is_printable_ascii(b: u8) -> bool {
 }
 
 /// The general grapheme-unit scan behind [`advance_grapheme_unit_wide`].
-fn advance_grapheme_unit_scan(text: &str, byte_idx: &mut usize) -> GraphemeUnit {
+fn advance_grapheme_unit_scan(text: &str, byte_idx: &mut usize, max_chars: usize) -> GraphemeUnit {
     let remaining = &text[*byte_idx..];
     let mut iter = remaining.char_indices();
     let Some((_, c)) = iter.next() else {
@@ -865,7 +965,7 @@ fn advance_grapheme_unit_scan(text: &str, byte_idx: &mut usize) -> GraphemeUnit 
         // Bound the unit: `text` can come from a crafted checkpoint or injected
         // `Line`, and an endless ZWJ/combining chain would otherwise become one
         // huge `complex_char`. The rest forms later units.
-        if end >= MAX_GRAPHEME_UNIT_BYTES {
+        if end >= MAX_GRAPHEME_UNIT_BYTES || char_count >= max_chars {
             break;
         }
         let next_width = aterm_grapheme::char_width(next_c);
@@ -1329,7 +1429,7 @@ mod ascii_fast_path_tests {
                         text.push_str(tail);
                         let (mut fast_idx, mut scan_idx) = (prefix.len(), prefix.len());
                         let fast = advance_grapheme_unit_wide(&text, &mut fast_idx);
-                        let scan = advance_grapheme_unit_scan(&text, &mut scan_idx);
+                        let scan = advance_grapheme_unit_scan(&text, &mut scan_idx, usize::MAX);
                         assert_eq!(
                             (fields(fast), fast_idx),
                             (fields(scan), scan_idx),

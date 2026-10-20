@@ -200,7 +200,7 @@ const WALL_RETURN_MARGIN: f32 = LEAD_MAX + 1.5;
 /// The wall transit: a station flip crosses the caret column, and a cat does
 /// not walk through your cursor — it hops it, one small quick arc.
 const WALL_HOP_DUR: f32 = 0.25;
-const WALL_HOP_ARC: f32 = 0.9;
+const WALL_HOP_ARC: f32 = 0.55;
 
 // ── the screen-crossing jump ────────────────────────────────────────────────
 //
@@ -223,14 +223,14 @@ const JOY_CONTENT: f32 = 0.85;
 const BIG_CROUCH_DUR: f32 = 0.28;
 const WIGGLE_HZ: f32 = 7.0;
 /// Flight time and arc, by span: `clamp(0.45 + span·0.006, 0.45, 0.85)` s
-/// under `clamp(1.2 + span·0.02, 1.2, 3.2)` cell heights, also clamped so the
+/// under `clamp(0.75 + span·0.012, 0.75, 1.65)` cell heights, also clamped so the
 /// sprite's top stays in the viewport.
 const BIG_FLIGHT_BASE: f32 = 0.45;
 const BIG_FLIGHT_PER_CELL: f32 = 0.006;
 const BIG_FLIGHT_MAX: f32 = 0.85;
-const BIG_ARC_BASE: f32 = 1.2;
-const BIG_ARC_PER_CELL: f32 = 0.02;
-const BIG_ARC_MAX: f32 = 3.2;
+const BIG_ARC_BASE: f32 = 0.75;
+const BIG_ARC_PER_CELL: f32 = 0.012;
+const BIG_ARC_MAX: f32 = 1.65;
 /// Landing recovery (s); squash scales with span
 /// (`q0 = LAND_SQUASH · (0.7 + 0.3·min(span/20, 1))`), and the flight aims short
 /// by the skid so the slide ends on the station.
@@ -439,9 +439,9 @@ const FLIGHT_MAX: f32 = 0.42;
 const FLIGHT_STALL_MAX: f32 = 0.16;
 /// Peak height of a pounce arc, in cell heights, and how far it grows with
 /// distance. A jump that stays flat reads as a slide.
-const ARC_BASE: f32 = 0.55;
-const ARC_PER_CELL: f32 = 0.030;
-const ARC_MAX: f32 = 1.5;
+const ARC_BASE: f32 = 0.38;
+const ARC_PER_CELL: f32 = 0.018;
+const ARC_MAX: f32 = 1.0;
 /// Landing hold and squash; the recovery follows the flying kitty's shape law
 /// (shorter by `q`, wider by `0.6 q`).
 const LAND_DUR: f32 = 0.26;
@@ -453,9 +453,9 @@ const LAND_ATTACK: f32 = 0.05;
 /// shorter and lower than a pounce of the same span; the arc grows with the
 /// column span, clamped to one cell height.
 const HOP_DUR: f32 = 0.20;
-const HOP_ARC: f32 = 0.42;
-const HOP_ARC_PER_CELL: f32 = 0.012;
-const HOP_ARC_MAX: f32 = 1.0;
+const HOP_ARC: f32 = 0.30;
+const HOP_ARC_PER_CELL: f32 = 0.008;
+const HOP_ARC_MAX: f32 = 0.72;
 
 // ── the airborne body ───────────────────────────────────────────────────────
 
@@ -3449,16 +3449,41 @@ impl PetBrain {
         {
             let right_base = (want + INK_PAD).floor();
             let left_base = (want + width - INK_PAD).ceil() - width;
-            for step in 1..=INK_EVICT_MAX as u16 {
-                let step = f32::from(step);
-                for candidate in [right_base + step, left_base - step] {
-                    if candidate >= 0.0
-                        && candidate <= limit
-                        && clears_caret(candidate)
-                        && (candidate - want).abs() <= INK_EVICT_MAX
-                        && self.observed_ink_overlaps(candidate, row, width) == Some(false)
-                    {
-                        return candidate;
+            for require_upper_clear in [true, false] {
+                for step in 1..=INK_EVICT_MAX as u16 {
+                    let step = f32::from(step);
+                    for candidate in [right_base + step, left_base - step] {
+                        let upper_ok = !require_upper_clear
+                            || row < 1.0
+                            || self.observed_ink_overlaps(candidate, row - 1.0, width)
+                                == Some(false);
+                        if candidate >= 0.0
+                            && candidate <= limit
+                            && clears_caret(candidate)
+                            && (candidate - want).abs() <= INK_EVICT_MAX
+                            && self.observed_ink_overlaps(candidate, row, width) == Some(false)
+                            && upper_ok
+                        {
+                            return candidate;
+                        }
+                    }
+                }
+            }
+            // In a bordered TUI box (`│ > text          │`), `ink_span` spans
+            // `0..cols` because of the outer walls, so `right` and `left` both
+            // fail and `beside` falls back to `want` (on top of the text). Scan
+            // past `INK_EVICT_MAX` for the nearest observed interior blank gap.
+            if !clears_caret(beside) || self.ink_overlaps(beside, row, width) {
+                for step in (INK_EVICT_MAX as u16 + 1)..cols {
+                    let step = f32::from(step);
+                    for candidate in [right_base + step, left_base - step] {
+                        if candidate >= 0.0
+                            && candidate <= limit
+                            && clears_caret(candidate)
+                            && self.observed_ink_overlaps(candidate, row, width) == Some(false)
+                        {
+                            return candidate;
+                        }
                     }
                 }
             }
@@ -3867,9 +3892,13 @@ impl PetBrain {
     ///
     /// The host's two lines, after the pet's own tick:
     ///
-    /// ```ignore
-    /// let offer = v2.pet_offer(geom, companion::PetOnGlass::of(&pet_frame, geom));
+    /// ```
+    /// # use aterm_effects::{cursor_glow::Geom, kitty_pet::{PetBrain, PetFrame}, rainbow_kitty::{Engine, companion}};
+    /// # use aterm_time::Instant;
+    /// # fn offer_after_tick(v2: &mut Engine, pet: &mut PetBrain, pet_frame: &PetFrame, geom: Geom, now: Instant) {
+    /// let offer = v2.pet_offer(geom, companion::PetOnGlass::of(pet_frame, geom));
     /// if let Some(star) = pet.note_v2_offer(&offer) { v2.catch_star(star, now); }
+    /// # }
     /// ```
     ///
     /// Returns the star to spend on the paw's landing frame only:

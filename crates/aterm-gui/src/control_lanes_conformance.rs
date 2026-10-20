@@ -18,7 +18,8 @@
 //! pre-2026-09-26 behaviour), and the model rejects that trace and names the
 //! refusal it causes.
 
-use std::io::{BufRead, BufReader, Write};
+use std::collections::BTreeSet;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -46,7 +47,8 @@ struct Gate {
 
 /// The stub service: `AUTH ok` authenticates; `work…` blocks on a request
 /// lane and `wait…` (a wait request) blocks wherever it is served, each until
-/// the test releases one of its kind; `claim` binds a claim to the connection;
+/// the test releases one of its kind; `claim` binds a claim to the connection,
+/// `unclaim` releases it without closing the connection;
 /// `who` answers the serving connection's serial; `quit` closes; anything else
 /// is answered at once. Releasing the claims of a connection named in
 /// `panic_release` panics instead (a defective release, for the parker tests).
@@ -55,6 +57,7 @@ struct Stub {
     gate: Mutex<Gate>,
     moved: Condvar,
     released: Mutex<Vec<u64>>,
+    claims: Mutex<BTreeSet<u64>>,
     panic_release: Mutex<Vec<u64>>,
 }
 
@@ -155,7 +158,18 @@ impl LaneService for Stub {
             "quit" => return Some(ServeDisposition::Close),
             "claim" => {
                 super::super::note_connection_claim();
+                self.claims
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(super::super::serving_connection().expect("serving a connection"));
                 "OK claim".to_string()
+            }
+            "unclaim" => {
+                self.claims
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&super::super::serving_connection().expect("serving a connection"));
+                "OK unclaim".to_string()
             }
             "who" => format!("OK {}", super::super::serving_connection().unwrap_or(0)),
             "lane" => format!("OK {}", if on_wait_lane() { "wait" } else { "rpc" }),
@@ -189,10 +203,21 @@ impl LaneService for Stub {
         if defective {
             panic!("injected: releasing connection {id}'s claims panics");
         }
+        self.claims
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id);
         self.released
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(id);
+    }
+
+    fn has_live_claim(&self, id: u64) -> bool {
+        self.claims
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&id)
     }
 }
 
@@ -281,13 +306,15 @@ impl Rig {
 }
 
 /// What the Tier-1 test knows that the lanes do not count: connections
-/// admitted so far, whether a refusal came while a lane held an idle one,
-/// whether a wait was answered busy, and whether a wait was kept on a request
-/// lane beside a free wait lane.
+/// admitted so far, whether a refusal came while a lane held an idle one or
+/// beside a parked one whose place it could have taken, whether a wait was
+/// answered busy, and whether a wait was kept on a request lane beside a free
+/// wait lane.
 #[derive(Clone, Copy, Default)]
 struct Facts {
     arrivals: i64,
     refused_idle: i64,
+    refused_parked: i64,
     busied: i64,
     bypassed: i64,
 }
@@ -312,10 +339,13 @@ fn project(census: Census, flight: (usize, usize), facts: Facts) -> State {
     state.insert("waiting", count(flight.1));
     state.insert("inline", count(census.inline));
     state.insert("parked", count(census.parked));
+    state.insert("spared", count(census.spared));
+    state.insert("placing", count(census.placing));
     state.insert("queued", 0);
     state.insert("open", count(census.open));
     state.insert("arrivals", facts.arrivals);
     state.insert("refused_idle", facts.refused_idle);
+    state.insert("refused_parked", facts.refused_parked);
     state.insert("busied", facts.busied);
     state.insert("bypassed", facts.bypassed);
     state
@@ -395,16 +425,43 @@ fn shipping_lanes_conform_to_the_lane_tenure_model() {
     facts.arrivals += 1;
     let s2 = observe(&rig, facts, "B parked", &|c, _| c.parked == 2 && c.rpc == 0);
     assert_path(&model, &s1, &["Admit", "Finish"], &s2);
-    let mut third = rig.idle().expect("C admitted");
+    let mut stale = rig.idle().expect("C admitted");
     facts.arrivals += 1;
     let s3 = observe(&rig, facts, "C parked", &|c, _| c.parked == 3 && c.rpc == 0);
     assert_path(&model, &s2, &["Admit", "Finish"], &s3);
 
-    // Every request lane is free, but the open-connection bound is reached: a
-    // fourth client is refused, and not for an idle driver.
-    assert!(rig.dial().is_none(), "the open-connection bound refuses");
-    assert!(model.successors("Admit", &s3).is_empty());
-    assert_path(&model, &s3, &["Refuse"], &s3);
+    // A and B are served again, so C has gone longest without a byte.
+    assert_eq!(a.request("ping"), "OK ping");
+    let s3a = observe(&rig, facts, "A parked", &|c, _| c.parked == 3 && c.rpc == 0);
+    assert_path(&model, &s3, &["Wake", "Pick", "Finish"], &s3a);
+    assert_eq!(b.request("ping"), "OK ping");
+    let s3b = observe(&rig, facts, "B parked", &|c, _| c.parked == 3 && c.rpc == 0);
+    assert_path(&model, &s3a, &["Wake", "Pick", "Finish"], &s3b);
+
+    // Every request lane is free and the open-connection bound is reached: a
+    // fourth client, X, is not refused but handed to the parker, which parks it
+    // in the place of the stalest parked connection, C, which reads the
+    // hang-up. The bound stands; X, spared until its handshake is made, plays
+    // C's part from here on.
+    assert!(model.successors("Admit", &s3b).is_empty());
+    assert!(
+        model.successors("Refuse", &s3b).is_empty(),
+        "the model refuses no client a parked connection can make room for"
+    );
+    let mut third = rig.dial().expect("X admitted at the cap");
+    facts.arrivals += 1;
+    // (Reading C, which is owed nothing, moves no byte, so cannot stir it.)
+    assert_eq!(stale.line(), "<EOF>", "C, the stalest, closed for X");
+    let s3c = observe(&rig, facts, "X parked in C's place", &|c, _| {
+        c.parked == 3 && c.open == 3 && c.rpc == 0 && c.placing == 0 && c.spared == 1
+    });
+    assert_path(&model, &s3b, &["Hand", "Place"], &s3c);
+    third.send("AUTH ok\nping\n");
+    assert_eq!(third.line(), "OK ping", "X, served in C's place");
+    let s3 = observe(&rig, facts, "X parked", &|c, _| {
+        c.parked == 3 && c.rpc == 0 && c.spared == 0
+    });
+    assert_path(&model, &s3c, &["Unspare", "Wake", "Pick", "Finish"], &s3);
 
     // A asks for work: woken, taken back by a request lane.
     a.send("work\n");
@@ -433,21 +490,21 @@ fn shipping_lanes_conform_to_the_lane_tenure_model() {
     });
     assert_path(&model, &s6, &["WaitFinish"], &s7);
 
-    // A binds a claim to its connection and quits: the close ends the tenure,
-    // and the claim with it.
+    // A binds a claim to its connection, so gives way to no fresh client, and
+    // quits: the close ends the tenure, and the claim with it.
     assert_eq!(a.request("claim"), "OK claim");
     let who = a.request("who");
     let a_id: u64 = who.trim_start_matches("OK ").parse().expect("a serial");
     let s8 = observe(&rig, facts, "A parked after claim", &|c, _| {
-        c.parked == 3 && c.rpc == 0
+        c.parked == 3 && c.rpc == 0 && c.spared == 1
     });
-    assert_path(&model, &s7, &["Wake", "Pick", "Finish"], &s8);
+    assert_path(&model, &s7, &["Wake", "Pick", "Finish", "Spare"], &s8);
     a.send("quit\n");
     assert_eq!(a.line(), "<EOF>");
     let s9 = observe(&rig, facts, "A closed", &|c, _| {
-        c.open == 2 && c.parked == 2
+        c.open == 2 && c.parked == 2 && c.spared == 0
     });
-    assert_path(&model, &s8, &["Wake", "Pick", "Close"], &s9);
+    assert_path(&model, &s8, &["Unspare", "Wake", "Pick", "Close"], &s9);
     assert_eq!(rig.stub.released(), vec![a_id], "A's claim ended with it");
 
     // WAITS PAST THE WAIT LANES. D's wait takes the one wait lane, with the
@@ -757,6 +814,677 @@ fn a_pool_saturated_with_work_still_refuses_promptly() {
     }
 }
 
+/// Everything `client` reads until its connection is closed: what it had been
+/// sent of an answer, then the hang-up (a minute's read is the hang detector
+/// for a connection never closed).
+fn rest_until_closed(client: &mut Client) -> Vec<u8> {
+    let mut rest = Vec::new();
+    match client.reader.read_to_end(&mut rest) {
+        Ok(_) => rest,
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => rest,
+        Err(error) => panic!(
+            "the connection was not closed: {error} after {} bytes",
+            rest.len()
+        ),
+    }
+}
+
+/// ONE PROCESS HOLDING THE CAP (ATERM-KI-1015-13, until 2026-10-19): connections up to the cap —
+/// one holding a claim, a pager owed a large answer, one about to send half a
+/// request, then idle ones — and then fresh clients. The pager and the
+/// half-sender were served before the idle ones, but stir after them: the
+/// half-sender sends the first bytes of a request, the pager takes part of its
+/// answer. Each fresh client is admitted and served in the place of the
+/// stalest parked connection: the idle ones in the order they were last
+/// served, then the half-sender, then the pager (what it had been sent of its
+/// answer, then the hang-up), then the fresh ones in turn; the one holding a
+/// claim outlasts them all, its claim kept. The cap is never passed. At the
+/// cap with nothing parked (each connection on a lane) a fresh client is still
+/// refused, with a request lane free. The negative control is the cap as it
+/// was: the same connections refuse the fresh client with every request lane
+/// free, which the model rejects (`NoRefusalBesideParked`).
+#[test]
+fn a_process_holding_the_cap_does_not_starve_a_fresh_client() {
+    const CAP: usize = 6;
+    let model = control_lane_tenure_model();
+    for shipping in [true, false] {
+        let rig = Rig::new(LaneLimits {
+            rpc: 2,
+            wait: 1,
+            inline: 1,
+            open: CAP,
+        });
+        if !shipping {
+            rig.lanes.refuse_at_the_cap();
+        }
+        let parked = |n: usize, what: &str| {
+            rig.settle(what, |c, f| {
+                c.parked == n && c.open == n && c.rpc == 0 && f == (0, 0)
+            })
+        };
+        // The claim holder is served first, so it has gone longest without a
+        // byte; its claim still keeps it to the last.
+        let mut keeper = rig.idle().expect("the claim holder admitted");
+        assert_eq!(keeper.request("claim"), "OK claim");
+        let keeper_id = keeper.request("who");
+        parked(1, "the claim holder parked");
+        let mut pager = rig.idle().expect("the pager admitted");
+        parked(2, "the pager parked");
+        pager.send("answer big\n");
+        rig.settle("the pager parked owing its answer", |c, _| {
+            c.parked == 2 && c.rpc == 0 && c.held >= BIG_ANSWER / 2
+        });
+        let mut half = rig.idle().expect("the half-sender admitted");
+        parked(3, "the half-sender parked");
+        let mut victims: Vec<(&str, Client)> = Vec::new();
+        for index in 0..3 {
+            let idle = rig.idle().expect("an idle connection admitted");
+            parked(4 + index, "an idle connection parked");
+            victims.push(("an idle connection", idle));
+        }
+        // The half-sender sends its request's first bytes and no end to the
+        // line: the parker holds them once it has read them.
+        let before = rig.lanes.census().held;
+        half.send("pin");
+        rig.settle("the half-sent bytes held", |c, _| c.held > before);
+        // Then the pager takes part of its answer: more than any socket
+        // buffer, so the parker has delivered to it.
+        let mut page = vec![0u8; 1 << 20];
+        pager
+            .reader
+            .read_exact(&mut page)
+            .expect("the pager's first page");
+        victims.push(("the half-sender", half));
+        victims.push(("the pager", pager));
+
+        if !shipping {
+            assert!(
+                rig.dial().is_none(),
+                "negative control: the cap refuses beside {CAP} parked connections"
+            );
+            let census = rig.lanes.census();
+            assert_eq!(
+                (census.rpc, census.parked),
+                (0, CAP),
+                "and every request lane is free"
+            );
+            let facts = Facts {
+                arrivals: count(CAP),
+                refused_parked: 1,
+                ..Facts::default()
+            };
+            let state = project(census, rig.stub.in_flight(), facts);
+            assert!(
+                !model.check_invariant("NoRefusalBesideParked", &state),
+                "negative control: the model rejects the refusal: {state:?}"
+            );
+            continue;
+        }
+
+        let mut fresh: Vec<Client> = Vec::new();
+        for (index, (what, mut victim)) in victims.into_iter().enumerate() {
+            let mut client = rig.dial().unwrap_or_else(|| {
+                panic!("fresh client {index} refused at the cap with every request lane free")
+            });
+            // Served only once placed, so only after its victim was closed: a
+            // victim read before then would take bytes, and be the stalest no
+            // more.
+            client.send("AUTH ok\nping\n");
+            assert_eq!(
+                client.line(),
+                "OK ping",
+                "fresh client {index}, in its place"
+            );
+            let rest = rest_until_closed(&mut victim);
+            assert!(
+                rest.len() < BIG_ANSWER && !rest.ends_with(b"\n"),
+                "{what} was closed for fresh client {index} with no whole answer: {} bytes",
+                rest.len()
+            );
+            parked(CAP, "the fresh client parked in its place");
+            fresh.push(client);
+        }
+        // The fresh ones are the stalest now, the first first.
+        let mut last = rig.dial().expect("one more fresh client admitted");
+        last.send("AUTH ok\nping\n");
+        assert_eq!(last.line(), "OK ping");
+        assert!(
+            rest_until_closed(&mut fresh[0]).is_empty(),
+            "the first fresh client, now the stalest"
+        );
+        parked(CAP, "the last fresh client parked");
+        // The claim holder is still connected and still claims.
+        assert_eq!(
+            keeper.request("who"),
+            keeper_id,
+            "the claim holder's connection kept"
+        );
+        assert!(rig.stub.released().is_empty(), "no claim released");
+        for (index, client) in fresh.iter_mut().enumerate().skip(1) {
+            assert_eq!(client.request("ping"), "OK ping", "fresh client {index}");
+        }
+    }
+
+    // At the cap with nothing parked: a wait on the wait lane and one on a
+    // request lane, and a request lane free.
+    let rig = Rig::new(LaneLimits {
+        rpc: 2,
+        wait: 1,
+        inline: 1,
+        open: 2,
+    });
+    let mut waits = Vec::new();
+    for index in 0..2 {
+        let mut wait = rig.dial().expect("a wait admitted");
+        wait.send("AUTH ok\nwait\n");
+        waits.push(wait);
+        rig.settle("placed", |c, f| {
+            f == (index, 1) && c.inline == index && c.rpc == index
+        });
+    }
+    assert!(rig.dial().is_none(), "nothing parked makes room at the cap");
+    let census = rig.lanes.census();
+    assert_eq!(
+        (census.open, census.parked, census.rpc),
+        (2, 0, 1),
+        "refused at the cap, nothing parked, a request lane free"
+    );
+    rig.stub.let_finish(true);
+    rig.stub.let_finish(false);
+    for wait in &mut waits {
+        assert_eq!(wait.line(), "OK wait");
+    }
+}
+
+/// CLIENTS ARRIVING TOGETHER AT THE CAP: three fresh clients are handed to
+/// the parker before its next pass — more than the two request lanes — and
+/// each is placed in the place of one of the three parked idle connections,
+/// stalest first, and served. The model binds each step (`Hand` three times,
+/// then `Place` three times). Until 2026-10-19 the parker was handed no more
+/// at once than there are request lanes, and the rest were turned away busy
+/// beside parked connections (on a headless instance, 40 at once beside 1024
+/// parked: 8 served, 32 busy); that bound back in place refuses the third
+/// client here.
+#[test]
+fn clients_arriving_together_at_the_cap_are_each_served() {
+    let model = control_lane_tenure_model();
+    let rig = Rig::new(model_limits());
+    let mut facts = Facts::default();
+    let observe = |facts: Facts, what: &str, want: &dyn Fn(Census) -> bool| {
+        let census = rig.settle(what, |c, f| want(c) && c.rpc == f.0 && c.waits == f.1);
+        project(census, rig.stub.in_flight(), facts)
+    };
+    let mut at = model.init_state();
+    let mut idle = Vec::new();
+    for n in 1..=3 {
+        idle.push(rig.idle().expect("an idle connection admitted"));
+        facts.arrivals += 1;
+        let next = observe(facts, "idle parked", &|c| c.parked == n && c.rpc == 0);
+        assert_path(&model, &at, &["Admit", "Finish"], &next);
+        at = next;
+    }
+    let pause = rig
+        .lanes
+        .parker_pause()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut fresh = Vec::new();
+    for index in 0..3 {
+        fresh.push(rig.dial().unwrap_or_else(|| {
+            panic!("fresh client {index} refused at the cap beside 3 parked connections")
+        }));
+        facts.arrivals += 1;
+    }
+    let census = rig.lanes.census();
+    assert_eq!(
+        (census.placing, census.parked, census.open),
+        (3, 3, 3),
+        "three handed to the parker at once, beside three parked"
+    );
+    let handed = project(census, rig.stub.in_flight(), facts);
+    assert_path(&model, &at, &["Hand", "Hand", "Hand"], &handed);
+    drop(pause);
+    let placed = observe(facts, "each placed", &|c| {
+        c.placing == 0 && c.parked == 3 && c.open == 3 && c.spared == 3
+    });
+    assert_path(&model, &handed, &["Place", "Place", "Place"], &placed);
+    for (index, victim) in idle.iter_mut().enumerate() {
+        assert!(
+            rest_until_closed(victim).is_empty(),
+            "idle connection {index}, closed for a fresh client"
+        );
+    }
+    for (index, client) in fresh.iter_mut().enumerate() {
+        client.send("AUTH ok\nping\n");
+        assert_eq!(
+            client.line(),
+            "OK ping",
+            "fresh client {index}, in its place"
+        );
+    }
+    rig.settle("each served and parked", |c, _| {
+        c.parked == 3 && c.open == 3 && c.rpc == 0 && c.spared == 0
+    });
+}
+
+/// A PLACE FREED SINCE ADMISSION: a fresh client handed to the parker at the
+/// cap, and a connection ending on its request lane before the parker's next
+/// pass. The fresh one is parked in the slots that one left, and no parked
+/// connection is closed for it. The model binds each step (`Hand`, `Close`,
+/// `PlaceFreed`).
+#[test]
+fn a_place_freed_since_admission_closes_no_one() {
+    let model = control_lane_tenure_model();
+    let rig = Rig::new(model_limits());
+    let mut facts = Facts::default();
+    let observe = |facts: Facts, what: &str, want: &dyn Fn(Census) -> bool| {
+        let census = rig.settle(what, |c, f| want(c) && c.rpc == f.0 && c.waits == f.1);
+        project(census, rig.stub.in_flight(), facts)
+    };
+    let mut at = model.init_state();
+    let mut idle = Vec::new();
+    for n in 1..=2 {
+        idle.push(rig.idle().expect("an idle connection admitted"));
+        facts.arrivals += 1;
+        let next = observe(facts, "idle parked", &|c| c.parked == n && c.rpc == 0);
+        assert_path(&model, &at, &["Admit", "Finish"], &next);
+        at = next;
+    }
+    // A worker with its `quit` pipelined behind its work: the lane closes it
+    // there once the work is done, never parking it.
+    let mut worker = rig.dial().expect("the worker admitted");
+    facts.arrivals += 1;
+    worker.send("AUTH ok\nwork\nquit\n");
+    let working = observe(facts, "the worker working", &|c| {
+        c.open == 3 && c.parked == 2 && c.rpc == 1
+    });
+    assert_path(&model, &at, &["Admit"], &working);
+    let pause = rig
+        .lanes
+        .parker_pause()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut fresh = rig.dial().expect("handed to the parker at the cap");
+    facts.arrivals += 1;
+    rig.stub.let_finish(false);
+    assert_eq!(worker.line(), "OK work");
+    assert_eq!(worker.line(), "<EOF>", "the worker closed on its lane");
+    let freed = observe(facts, "the worker's place freed", &|c| {
+        c.open == 2 && c.parked == 2 && c.placing == 1
+    });
+    assert_path(&model, &working, &["Hand", "Close"], &freed);
+    drop(pause);
+    let placed = observe(facts, "the fresh one placed", &|c| {
+        c.open == 3 && c.parked == 3 && c.placing == 0 && c.spared == 1
+    });
+    assert_path(&model, &freed, &["PlaceFreed"], &placed);
+    for (index, client) in idle.iter_mut().enumerate() {
+        assert_eq!(
+            client.request("ping"),
+            "OK ping",
+            "idle connection {index}, kept"
+        );
+    }
+    fresh.send("AUTH ok\nping\n");
+    assert_eq!(fresh.line(), "OK ping", "the fresh one, in the freed place");
+}
+
+/// WHAT DOES NOT GIVE WAY: at a cap held by connections that hold a claim
+/// and one fresh client still making its handshake, the next fresh client is
+/// answered busy — no claim released, and the one placed before it not closed
+/// for it before it was served once. Once that one has made its handshake, it
+/// gives way to the next like any other. The model binds each step.
+#[test]
+fn claim_holders_and_handshakes_in_progress_do_not_give_way() {
+    let model = control_lane_tenure_model();
+    let rig = Rig::new(model_limits());
+    let mut facts = Facts::default();
+    let observe = |facts: Facts, what: &str, want: &dyn Fn(Census) -> bool| {
+        let census = rig.settle(what, |c, f| want(c) && c.rpc == f.0 && c.waits == f.1);
+        project(census, rig.stub.in_flight(), facts)
+    };
+    let mut at = model.init_state();
+    let mut keepers = Vec::new();
+    for n in 1..=2 {
+        let mut keeper = rig.idle().expect("a claim holder admitted");
+        facts.arrivals += 1;
+        let parked = observe(facts, "parked", &|c| c.parked == n && c.spared == n - 1);
+        assert_path(&model, &at, &["Admit", "Finish"], &parked);
+        assert_eq!(keeper.request("claim"), "OK claim");
+        let id = keeper.request("who");
+        at = observe(facts, "the claim holder parked", &|c| {
+            c.parked == n && c.rpc == 0 && c.spared == n
+        });
+        // Its claim, then `who`: two requests, the claim's spared after it.
+        let claimed = [
+            "Wake", "Pick", "Finish", "Spare", "Unspare", "Wake", "Pick", "Finish", "Spare",
+        ];
+        assert_path(&model, &parked, &claimed, &at);
+        keepers.push((keeper, id));
+    }
+    let mut idle = rig.idle().expect("an idle connection admitted");
+    facts.arrivals += 1;
+    let full = observe(facts, "the cap reached", &|c| {
+        c.parked == 3 && c.spared == 2
+    });
+    assert_path(&model, &at, &["Admit", "Finish"], &full);
+
+    // The first fresh client takes the idle connection's place.
+    let mut first = rig
+        .dial()
+        .expect("the first fresh client handed to the parker");
+    facts.arrivals += 1;
+    assert!(
+        rest_until_closed(&mut idle).is_empty(),
+        "the idle one, closed"
+    );
+    let placed = observe(facts, "the first placed", &|c| {
+        c.parked == 3 && c.placing == 0 && c.spared == 3
+    });
+    assert_path(&model, &full, &["Hand", "Place"], &placed);
+    // The next is handed over too, and answered busy: nothing gives way.
+    let mut second = rig
+        .dial()
+        .expect("the second fresh client handed to the parker");
+    facts.arrivals += 1;
+    assert_eq!(second.line(), BUSY, "nothing gives way to the second");
+    assert_eq!(second.line(), "<EOF>", "and it is hung up");
+    let turned = observe(facts, "the second turned away", &|c| {
+        c.parked == 3 && c.placing == 0 && c.spared == 3
+    });
+    assert_path(&model, &placed, &["Hand", "TurnAway"], &turned);
+    assert!(rig.stub.released().is_empty(), "no claim released");
+    first.send("AUTH ok\nping\n");
+    assert_eq!(first.line(), "OK ping", "the first, served in its place");
+    let served = observe(facts, "the first served", &|c| {
+        c.parked == 3 && c.rpc == 0 && c.spared == 2
+    });
+    assert_path(
+        &model,
+        &turned,
+        &["Unspare", "Wake", "Pick", "Finish"],
+        &served,
+    );
+    for (keeper, id) in &mut keepers {
+        assert_eq!(&keeper.request("who"), id, "a claim holder, kept");
+    }
+    // Now made its handshake, the first gives way to the next.
+    let mut third = rig
+        .dial()
+        .expect("the third fresh client handed to the parker");
+    facts.arrivals += 1;
+    assert!(
+        rest_until_closed(&mut first).is_empty(),
+        "the first, closed for the third"
+    );
+    third.send("AUTH ok\nping\n");
+    assert_eq!(third.line(), "OK ping", "the third, in its place");
+    let third_id = third.request("who");
+    assert!(rig.stub.released().is_empty(), "no claim released");
+    let third_served = observe(facts, "the third served", &|c| {
+        c.parked == 3 && c.rpc == 0 && c.spared == 2
+    });
+    assert_path(
+        &model,
+        &served,
+        &[
+            "Hand", "Place", "Unspare", "Wake", "Pick", "Finish", "Wake", "Pick", "Finish",
+        ],
+        &third_served,
+    );
+
+    // A claim's cleanup flag stays set until this connection ends, but a
+    // released claim must no longer spare its idle connection at the cap.
+    assert_eq!(third.request("claim"), "OK claim");
+    let all_claimed = observe(facts, "three live claim holders parked", &|c| {
+        c.parked == 3 && c.rpc == 0 && c.spared == 3
+    });
+    assert_path(
+        &model,
+        &third_served,
+        &["Wake", "Pick", "Finish", "Spare"],
+        &all_claimed,
+    );
+    let released_id: u64 = keepers[0].1.strip_prefix("OK ").unwrap().parse().unwrap();
+    assert_eq!(keepers[0].0.request("unclaim"), "OK unclaim");
+    let unclaimed = rig.settle("the released claimant parked", |c, f| {
+        c.rpc == f.0 && c.rpc == 0 && c.parked == 3 && c.spared == 2
+    });
+    let released = project(unclaimed, rig.stub.in_flight(), facts);
+    assert_path(
+        &model,
+        &all_claimed,
+        &["Unspare", "Wake", "Pick", "Finish"],
+        &released,
+    );
+    let mut fourth = rig.dial().expect("a fresh client handed over at the cap");
+    fourth.send("AUTH ok\nping\n");
+    assert_eq!(fourth.line(), "OK ping", "the released claimant gives way");
+    assert!(rest_until_closed(&mut keepers[0].0).is_empty());
+    assert_eq!(
+        rig.stub.released(),
+        vec![released_id],
+        "Drop cleanup remains"
+    );
+    let (keeper, id) = &mut keepers[1];
+    assert_eq!(&keeper.request("who"), id, "live claim kept");
+    assert_eq!(third.request("who"), third_id, "live claim kept");
+}
+
+/// A close for the byte budget whose claim's release panics costs that
+/// connection alone: four claim holders park, each owed a large answer, then
+/// the budget shrinks, and in one pass the parker closes three of them,
+/// every release panicking, and goes on — the fourth reads its whole answer,
+/// and a parked connection is still served. Each such panic used to unwind
+/// the whole pass, and three with no pass completed between them stop the
+/// parker, closing every connection.
+#[test]
+fn a_close_for_the_budget_that_panics_costs_that_connection_alone() {
+    const HOLDERS: usize = 4;
+    let rig = Rig::new(LaneLimits {
+        rpc: 2,
+        wait: 1,
+        inline: 1,
+        open: 16,
+    });
+    rig.lanes.set_parked_bytes_max(usize::MAX);
+    let mut idle = rig.idle().expect("an idle connection admitted");
+    let mut holders = Vec::new();
+    for index in 0..HOLDERS {
+        let mut holder = rig.idle().expect("a claim holder admitted");
+        assert_eq!(holder.request("claim"), "OK claim");
+        let id: u64 = holder
+            .request("who")
+            .trim_start_matches("OK ")
+            .parse()
+            .expect("a serial");
+        rig.stub
+            .panic_release
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(id);
+        holder.send(&format!("answer {index} big\n"));
+        holders.push(holder);
+        rig.settle("the holder parked owing its answer", |c, _| {
+            c.rpc == 0 && c.parked == index + 2 && c.held >= (index + 1) * (BIG_ANSWER / 2)
+        });
+    }
+    rig.lanes.set_parked_bytes_max(BIG_ANSWER / 2);
+    // A pass: the idle connection's request wakes the parker.
+    assert_eq!(idle.request("ping"), "OK ping");
+    let census = rig.settle("three closed for the budget", |c, _| {
+        c.parked == 2 && c.open == 2 && c.rpc == 0
+    });
+    assert!(census.parking, "the parker goes on: {census:?}");
+    let whole = holders
+        .iter_mut()
+        .map(|holder| whole_or_cut(holder, BIG_ANSWER + "OK \n".len()))
+        .filter(|&whole| whole)
+        .count();
+    assert_eq!(whole, 1, "one holder kept, its whole answer read");
+    assert_eq!(
+        idle.request("ping"),
+        "OK ping",
+        "a parked connection, served"
+    );
+    assert!(rig.lanes.census().parking, "the parker still runs");
+}
+
+/// WHAT THE PARKED HOLD (ATERM-KI-1015-13, until 2026-10-19): clients that ask for a large answer
+/// and never read it each park owing it. Past the budget the parker closes the
+/// stalest of them (each reads what it had been sent, then the hang-up) until
+/// the rest fit, and the rest read their answers whole — never the last one
+/// holding any, so an answer larger than the budget alone is still delivered.
+/// Idle connections hold no byte. The negative control is no budget: every
+/// answer stays held, one per connection (the cap times one answer was the
+/// bound: about 450 MB at 1024).
+#[test]
+fn the_parked_hold_no_more_than_their_budget() {
+    const IDLE: usize = 4;
+    const READERS: usize = 5;
+    let answer = BIG_ANSWER + "OK \n".len();
+    for (budget, kept) in [
+        (2 * BIG_ANSWER + BIG_ANSWER / 2, 2),
+        (BIG_ANSWER / 2, 1),
+        (usize::MAX, READERS),
+    ] {
+        let rig = Rig::new(LaneLimits {
+            rpc: 2,
+            wait: 1,
+            inline: 1,
+            open: 16,
+        });
+        rig.lanes.set_parked_bytes_max(budget);
+        // Each parked before the next dials: a lane is busy until its request
+        // is answered AND its connection is placed.
+        let _idle: Vec<Client> = (0..IDLE)
+            .map(|index| {
+                let idle = rig.idle().expect("an idle connection admitted");
+                rig.settle("idle parked", |c, _| c.parked == index + 1 && c.rpc == 0);
+                idle
+            })
+            .collect();
+        let mut readers = Vec::new();
+        for index in 0..READERS {
+            let mut reader = rig.idle().expect("a reader admitted");
+            reader.send(&format!("answer {index} big\n"));
+            readers.push(reader);
+            let left = (index + 1).min(kept);
+            // The unsent rest of the answers left, and nothing else: the idle
+            // hold nothing. (A lane delivers what the socket takes at once,
+            // far less than a quarter of an answer, before it parks the rest.)
+            rig.settle("the answers parked within the budget", |c, _| {
+                c.parked == IDLE + left
+                    && c.open == IDLE + left
+                    && c.rpc == 0
+                    && (left * (answer - BIG_ANSWER / 4)..=left * answer).contains(&c.held)
+            });
+        }
+        let held = rig.lanes.census().held;
+        eprintln!(
+            "budget {budget}: {READERS} unread answers of {answer} bytes, {kept} kept, {held} bytes held"
+        );
+        // Which were the stalest is the parker's to judge (a peer's socket
+        // that makes room stirs it): counted, not named.
+        let whole = readers
+            .iter_mut()
+            .map(|reader| whole_or_cut(reader, answer))
+            .filter(|&whole| whole)
+            .count();
+        assert_eq!(whole, kept, "the readers kept read their whole answers");
+    }
+}
+
+/// What a reader owed a large answer (`answer` bytes, newline included) reads
+/// of it: `true` for the whole answer (it was kept), `false` for what it had
+/// been sent and then the hang-up (it was closed partway; a minute's read is
+/// the hang detector for one never closed).
+fn whole_or_cut(reader: &mut Client, answer: usize) -> bool {
+    let mut got = Vec::new();
+    match reader.reader.read_until(b'\n', &mut got) {
+        Ok(_) if got.len() == answer && got.ends_with(b"\n") => return true,
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(error) => panic!(
+            "the connection was neither answered nor closed: {error} after {} bytes",
+            got.len()
+        ),
+    }
+    assert!(
+        got.starts_with(b"OK x") && got.len() < answer && !got.ends_with(b"\n"),
+        "a reader closed partway read {} bytes",
+        got.len()
+    );
+    assert!(rest_until_closed(reader).is_empty(), "then the hang-up");
+    false
+}
+
+/// What a lane began to read of a large request before it parked leaves the
+/// heap as it parks, as the parker's own reads would have gathered it: a line
+/// not whole yet past `SPILL_FROM` moves to a mapping with room for the
+/// longest line any request may have, every byte kept; a short begun request
+/// stays on the heap. (Which share the lane reads and which the parker is the
+/// sockets' timing; this holds the lane's share to the parker's bound.)
+#[test]
+fn a_large_request_a_lane_began_leaves_the_heap_as_it_parks() {
+    let lanes = Lanes::new(LaneLimits {
+        rpc: 1,
+        wait: 1,
+        inline: 1,
+        open: 4,
+    });
+    lanes.publish(Arc::new(Stub::default()));
+    let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let begun = |bytes: &[u8]| {
+        let (server, peer) = CtlStream::pair().expect("private control pair");
+        let open = super::Slot::take(&opened, 4).expect("an open slot");
+        let mut conn = lanes.fresh_conn(server, open);
+        conn.carry.extend_from_slice(bytes);
+        conn.hold_only_what_is_owed();
+        (conn, peer)
+    };
+    let line = vec![b'y'; 40 * 1024];
+    let (large, _large_peer) = begun(&line);
+    assert_eq!(large.carry.capacity(), 0, "the heap buffer let go");
+    assert_eq!(
+        large.held_bytes(),
+        super::MAX_REQUEST_LINE + 1,
+        "a mapping with room for the longest line"
+    );
+    assert!(large.carried() == line.as_slice(), "every byte kept");
+    let (short, _short_peer) = begun(b"vers");
+    assert!(
+        short.carry_spill.is_none(),
+        "a short begun request stays on the heap"
+    );
+    assert_eq!(short.carried(), b"vers");
+
+    // The next frame's header is actionable before its body is whole. It
+    // can be buffered behind a reply and moved into mapped storage on park.
+    let request = b"feed-bin 32768\n".to_vec();
+    let (mut pipelined, mut peer) = begun(&request);
+    pipelined.scope = Some(Scope::Owner);
+    pipelined.reply.bytes.extend_from_slice(b"OK first\n");
+    pipelined.hold_only_what_is_owed();
+    assert!(pipelined.carry.is_empty());
+    assert!(pipelined.carry_spill.is_some());
+    assert_eq!(pipelined.carried(), request);
+    assert!(matches!(
+        super::held(&request, true),
+        super::Held::Header(_)
+    ));
+    let hang_detector = Some(Duration::from_secs(60));
+    pipelined.stream.set_write_timeout(hang_detector).unwrap();
+    peer.set_read_timeout(hang_detector).unwrap();
+    assert!(matches!(pipelined.deliver_parked(), super::Step::Serve));
+    let mut reply = [0u8; 9];
+    peer.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply, b"OK first\n");
+    assert_eq!(pipelined.carried(), request, "the header is still buffered");
+    pipelined.header_done = true;
+    assert!(matches!(pipelined.deliver_parked(), super::Step::Stay));
+}
+
 /// A connection keeps its serial — the binding a connection-scoped claim is
 /// made to — across every lane that carries it, and its claim is released
 /// when it ends, however it ends: here, its peer hanging up while parked.
@@ -834,7 +1562,10 @@ fn pipelined_requests_answer_in_order() {
 
 /// Read one line within `within`, or say that none came. (macOS refuses a
 /// read timeout on a socket its peer has already closed; a read there cannot
-/// block anyway, so the refusal is ignored.)
+/// block anyway, so the refusal is ignored.) A hang-up reads `<EOF>` on every
+/// platform: Linux answers a read on a socket whose peer closed it with this
+/// side's request still unread there with `ECONNRESET`, where macOS answers
+/// end-of-file (measured on the Linux lane).
 fn line_within(client: &mut Client, within: Duration) -> Option<String> {
     let _ = client.stream.set_read_timeout(Some(within));
     let mut reply = String::new();
@@ -842,6 +1573,9 @@ fn line_within(client: &mut Client, within: Duration) -> Option<String> {
     let _ = client.stream.set_read_timeout(Some(SETTLE));
     match read {
         Ok(0) => Some("<EOF>".to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+            Some("<EOF>".to_string())
+        }
         Ok(_) => Some(reply.trim_end().to_string()),
         Err(error)
             if matches!(
@@ -960,15 +1694,16 @@ fn waits_past_every_wait_lane_leave_a_request_lane_for_requests() {
 }
 
 /// A WAIT WITH A REQUEST PIPELINED BEHIND IT (the review of the budget,
-/// 2026-09-27) — a wait then `version` written back to back — moves to a wait
-/// lane like any other, carrying the requests behind it: more such
+/// 2026-09-27) — a wait with `version` and `lane` behind it in one write,
+/// one connection each — moves
+/// to a wait lane like any other, carrying the requests behind it: more such
 /// waits than the request lanes and their budget are all held, none is answered
 /// busy, a fresh client is served beside them, and each connection's pipelined
 /// requests are answered after its wait, in order, on the wait lane it moved
 /// to. The negative control is the rule before the carry (a wait with anything
 /// buffered behind it stays on its request lane): the first takes the budget's
 /// one place and every later one is answered busy with seven wait lanes free —
-/// the fifth client turned away — which the model rejects (`WaitLaneTakenFirst`).
+/// the fifth connection turned away — which the model rejects (`WaitLaneTakenFirst`).
 #[test]
 fn pipelined_waits_move_with_the_requests_behind_them() {
     const WAITS: usize = 5;

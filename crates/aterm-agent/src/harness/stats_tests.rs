@@ -11,9 +11,9 @@ use crate::supervise::policy::approval::{
 };
 use crate::supervise::policy::question::RULE_ANSWER_RECOMMENDED;
 use crate::supervise::policy::turn_end::{
-    RULE_ACCOUNT, RULE_ANSWER, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, RULE_COMPACT,
-    RULE_CONTINUE, RULE_DONE_CHECK, RULE_HOST_TURN, RULE_LIMIT_RESUME, RULE_LOGIN,
-    RULE_MODEL_FALLBACK, RULE_SUGGESTION, RULE_USAGE_PROBE,
+    LAND_ANSWER, RULE_ACCOUNT, RULE_ANSWER, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY,
+    RULE_COMPACT, RULE_CONTINUE, RULE_DONE_CHECK, RULE_HOST_TURN, RULE_LAND_ANSWER,
+    RULE_LIMIT_RESUME, RULE_LOGIN, RULE_MODEL_FALLBACK, RULE_SUGGESTION, RULE_USAGE_PROBE,
 };
 
 /// One approval ledger row as the loop writes it ([`Row::to_json`]).
@@ -59,6 +59,17 @@ fn journal(fixture: &str) -> Vec<JournalRecord> {
             JournalRecord::of_line(t.parse().expect("t"), Some(sid), line, None)
         })
         .collect()
+}
+
+/// Set the file at `path`'s mtime to `at`, through a handle opened for
+/// writing: Windows sets a time only through one that may write the file's
+/// attributes.
+fn set_modified(path: &Path, at: std::time::SystemTime) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.set_modified(at))
+        .expect("set mtime");
 }
 
 /// `lines` folded as one session ledger.
@@ -127,6 +138,11 @@ fn a_ledger_row_counts_where_the_table_says() {
             "continue-open-items@v1",
             "Your report ends with ATERM-TASK-DONE but …",
         ),
+        typed(
+            t,
+            "continue-uncommitted@v1",
+            "Your report says done but work is not committed and pushed: …",
+        ),
         // Answers to questions asked in prose, under every priority and Land.
         typed(t, RULE_ANSWER, "Decide for yourself."),
         typed(t, "prose-long-term@v1", "Decide yourself: …"),
@@ -158,8 +174,8 @@ fn a_ledger_row_counts_where_the_table_says() {
     let acc = fold_ledger(&lines, 0);
     // approved, unproven, declined, answered, continued, land prompts, resumed,
     // escalated, relaunched, upgraded.
-    assert_eq!(counts(&acc), [3, 1, 1, 4, 4, 2, 5, 0, 0, 0], "{acc:#?}");
-    assert_eq!((acc.rows, acc.bad, acc.sessions), (32, 0, 1));
+    assert_eq!(counts(&acc), [3, 1, 1, 4, 5, 2, 5, 0, 0, 0], "{acc:#?}");
+    assert_eq!((acc.rows, acc.bad, acc.sessions), (33, 0, 1));
     assert_eq!((acc.human_wait_ms, acc.limit_wait_ms), (0, 0));
     // The breakdown: every act under its full id, the dialog's keys
     // included; nothing that was no act.
@@ -170,7 +186,7 @@ fn a_ledger_row_counts_where_the_table_says() {
     assert_eq!(by(&acc, RULE_READ_ONLY), 1, "skipped, deferred: no acts");
     assert_eq!(by(&acc, "-"), 0, "an escalation is no act");
     assert_eq!(by(&acc, RULE_USAGE_PROBE), 1, "its `waiting` row is none");
-    assert_eq!(acc.by_rule.values().sum::<u64>(), 28);
+    assert_eq!(acc.by_rule.values().sum::<u64>(), 29);
     assert!(!acc.is_empty());
 }
 
@@ -506,14 +522,19 @@ fn the_folds_words_are_the_writers_consts() {
     );
     let behind = format!("{ATTENTION_SKIPPED}{ESCALATED_BEHIND} (s-9) answers this session");
     assert_eq!(escalation_of(&behind), Escalation::Withheld);
-    let retry = format!("attention=OK mail={MAIL_RETRY}, the episode of seq=60");
+    let retry = format!("attention=OK again={AGAIN_RETRY}, the episode of seq=60");
     assert_eq!(escalation_of(&retry), Escalation::Again);
-    let adopted = format!("attention=OK mail={MAIL_ADOPTED}");
+    let adopted = format!("attention=OK again={AGAIN_ADOPTED}");
     assert_eq!(escalation_of(&adopted), Escalation::Again);
     // The turn-end policy's badge an Off park took down, set again as it
     // ends: no second escalation (the review of b512d03d8).
-    let unparked = format!("attention=OK mail={MAIL_UNPARKED}");
+    let unparked = format!("attention=OK again={AGAIN_UNPARKED}");
     assert_eq!(escalation_of(&unparked), Escalation::Again);
+    // A journal an earlier build wrote, which still mailed a manager, says
+    // the same as `mail=skipped: <why>`.
+    let mailed_retry = format!("attention=OK mail=skipped: {AGAIN_RETRY}, the episode of seq=60");
+    assert_eq!(escalation_of(&mailed_retry), Escalation::Again);
+    assert_eq!(escalation_of("attention=OK"), Escalation::Asked);
     assert_eq!(
         escalation_of("attention=OK mail=OK 7 off=91"),
         Escalation::Asked
@@ -805,6 +826,7 @@ fn sweep_opts(home: &Path, harness_state: &Path) -> Opts {
         aterm_state: None,
         ask: false,
         several_logins: false,
+        usage_credits: false,
         usage_tap: None,
         instances: Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
@@ -971,11 +993,7 @@ fn a_ledger_untouched_since_the_window_is_not_read() {
     let since_ms: i64 = 1_790_000_000_000;
     let line = typed(since_ms + 1, RULE_CONTINUE, "keep going");
     std::fs::write(&path, line + "\n").expect("ledger");
-    let set_mtime = |at: std::time::SystemTime| {
-        std::fs::File::open(&path)
-            .and_then(|f| f.set_modified(at))
-            .expect("set mtime");
-    };
+    let set_mtime = |at: std::time::SystemTime| set_modified(&path, at);
     // Written a day before the window opened.
     let day_before = u64::try_from(since_ms - 86_400_000).expect("after the epoch");
     set_mtime(std::time::UNIX_EPOCH + std::time::Duration::from_millis(day_before));
@@ -1162,9 +1180,7 @@ fn one_pass_tree(today: i64, week: i64) -> (ScratchDir, PathBuf, PathBuf, Vec<Pa
         if let Some(ms) = modified {
             let at = std::time::UNIX_EPOCH
                 + std::time::Duration::from_millis(u64::try_from(ms).expect("after the epoch"));
-            std::fs::File::open(path)
-                .and_then(|f| f.set_modified(at))
-                .expect("set mtime");
+            set_modified(path, at);
         }
     };
     let hour = 3_600_000;
@@ -1296,10 +1312,12 @@ fn one_pass_tree(today: i64, week: i64) -> (ScratchDir, PathBuf, PathBuf, Vec<Pa
     (root, state, harness, files)
 }
 
-/// `acc` without its per-session shares: what [`stats_under`] builds.
+/// `acc` without its per-session shares and its decisions: what
+/// [`stats_under`] builds.
 fn without_shares(acc: &HarnessStats) -> HarnessStats {
     HarnessStats {
         by_session: None,
+        decided: None,
         ..acc.clone()
     }
 }
@@ -1391,9 +1409,23 @@ fn a_reading_reads_each_file_once() {
         .collect();
     assert_eq!(reads, expected, "each file once; s-4 not at all");
     assert_eq!(
-        (one_today, one_week),
+        (one_today.clone(), one_week),
         stats_windows(&state, &harness, today, week),
         "the seam reads what tail_lines reads"
+    );
+    // DECIDED FOR YOU (§10.4) comes out of the same reads: the recorded
+    // dialog's `CHOSE`, its prose answer, its decline and its unproven press.
+    let decided = one_today.decided.as_ref().expect("today keeps decisions");
+    let kinds: Vec<DecisionKind> = decided.rows.iter().map(|d| d.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            DecisionKind::Unproven,
+            DecisionKind::Chose,
+            DecisionKind::Answered,
+            DecisionKind::Declined
+        ],
+        "{decided:#?}"
     );
     // NEGATIVE CONTROL: a pass per window.
     let mut twice: BTreeMap<PathBuf, u32> = BTreeMap::new();
@@ -1473,4 +1505,1030 @@ fn todays_shares_sum_to_its_totals_and_a_cut_marks_its_own_session() {
     // NEGATIVE CONTROLS.
     assert!(!shares.contains_key("s-2"), "untouched today: no share");
     assert!(HarnessStats::new(today).by_session.is_none());
+}
+
+/// One session's journal and ledger files under a fresh state tree, each a
+/// list of lines; `(root, state, harness)`.
+fn decided_tree(files: &[(&str, Vec<String>)]) -> (ScratchDir, PathBuf, PathBuf) {
+    let root = ScratchDir::new("stats", "decided");
+    let state = root.join("state");
+    let harness = root.join("harness");
+    let drive = state.join("drive");
+    std::fs::create_dir_all(&drive).expect("drive");
+    for (name, lines) in files {
+        let mut body = lines.join("\n");
+        body.push('\n');
+        std::fs::write(drive.join(name), body).expect("write");
+    }
+    (root, state, harness)
+}
+
+/// A ledger row of `sid`'s at `ts` with its `box_seq`.
+fn seq_row(
+    ts: i64,
+    sid: &str,
+    rule_id: &str,
+    outcome: Outcome,
+    (command, reason): (&str, &str),
+    box_seq: u64,
+) -> String {
+    Row {
+        rule_id,
+        outcome,
+        command,
+        reason,
+        box_seq,
+    }
+    .to_json(ts, Some(sid))
+}
+
+/// `fixture`'s journal lines (`<t> <sid> <line>`) as the file holds them.
+fn journal_lines(fixture: &str) -> Vec<String> {
+    journal(fixture)
+        .iter()
+        .map(JournalRecord::to_json)
+        .collect()
+}
+
+/// A recorded session's day: a three-key question dialog (two tabs, then
+/// the review's submit, told as one `CHOSE` at the worker's next busy read,
+/// whose `seq` is that read's and no key's), a question asked in prose and
+/// answered under Land, a burst of unproven presses of one heredoc, and a
+/// decline. Returns the journal's lines and the ledger's.
+fn decided_day(t: i64) -> (Vec<String>, Vec<String>) {
+    let journal = journal_lines(&format!(
+        "{} s-1 CHOSE seq=57 rule=answer-recommended@v1 policy=recommended Which colour? \u{2192} Blue (Recommended) | Which size? \u{2192} Large
+         {} s-1 EVENT question seq=60 \u{23fa} Should I add a CLI or packaging next?
+         {} s-1 EVENT idle seq=64 - Done for now.",
+        t + 9_000,
+        t + 20_000,
+        t + 21_000,
+    ));
+    let key = |ts, command, reason, seq| {
+        seq_row(
+            ts,
+            "s-1",
+            RULE_ANSWER_RECOMMENDED,
+            Outcome::Approved,
+            (command, reason),
+            seq,
+        )
+    };
+    let heredoc = "python3 - <<PY\nprint(1)\nPY";
+    let press = |ts| {
+        seq_row(
+            ts,
+            "s-1",
+            RULE_READ_ONLY,
+            Outcome::Approved,
+            (heredoc, "unproven: not read-only: python3"),
+            70,
+        )
+    };
+    let ledger = vec![
+        key(
+            t + 1_000,
+            "Which colour? \u{2192} Blue (Recommended)",
+            "unproven: answered with its recommended option",
+            50,
+        ),
+        key(
+            t + 2_000,
+            "Which size? \u{2192} Large",
+            "unproven: no option is marked (Recommended): option 1",
+            52,
+        ),
+        key(
+            t + 3_000,
+            "submit answers (2 of 2 answered)",
+            "unproven: submitted the answers its review lists",
+            54,
+        ),
+        seq_row(
+            t + 20_500,
+            "s-1",
+            RULE_LAND_ANSWER,
+            Outcome::Typed,
+            (LAND_ANSWER, "the turn-end policy"),
+            61,
+        ),
+        press(t + 30_000),
+        press(t + 50_000),
+        press(t + 100_000),
+        seq_row(
+            t + 200_000,
+            "s-1",
+            "decline@v1",
+            Outcome::Declined,
+            ("rm -rf build", "Nothing outside the worktree is removed."),
+            80,
+        ),
+    ];
+    (journal, ledger)
+}
+
+/// A decision as a test reads it: its kind, its time after the fixture's
+/// start, what was asked, whether it was said, what was done, why, and how
+/// many presses it holds.
+type Seen<'a> = (
+    DecisionKind,
+    i64,
+    &'a str,
+    bool,
+    &'a str,
+    Option<&'a str>,
+    u32,
+);
+
+/// DECIDED FOR YOU, THE JOIN (§10.4.2, §10.4.3): over a recorded journal and
+/// ledger, one reading lists each choice the harness made in the person's
+/// name, oldest first — the three-key dialog once, worded from its `CHOSE`
+/// (both tabs' questions and choices, `(Recommended)` dropped) with the why
+/// both tabs' keys give (one took the option marked Recommended, the other
+/// the first: the lab's dialog) and the newer key's time; the prose
+/// question with the words of the newest review point at or before its
+/// answer's `box_seq` (the point is read again a seq later before the
+/// answer goes, as the lab's was: `EVENT question seq=6697`, the answer's
+/// `box_seq` 6698; the next point's `EVENT`, after it, is not taken), less
+/// the reply's `⏺` marker the screen drew, and the land answer's words; the burst of unproven presses as one row `×3`
+/// naming the switch; the decline with its reason. NEGATIVE CONTROLS: the
+/// `CHOSE`'s `seq` is no key's `box_seq` (the join the design first named
+/// finds no key, and its why falls to the policy's word); a window built by
+/// `new` keeps none.
+#[test]
+fn the_join_lists_each_choice_made_in_the_persons_name() {
+    let t = now_ms() - 3_600_000;
+    let (told, ledger) = decided_day(t);
+    let (_root, state, harness) =
+        decided_tree(&[("s-1.journal.jsonl", told), ("s-1.jsonl", ledger.clone())]);
+    let (today, week) = stats_windows(&state, &harness, t - 60_000, t - 86_400_000);
+    assert!(week.decided.is_none(), "the week keeps none");
+    let decided = today.decided.expect("today keeps decisions");
+    assert_eq!(decided.total, 4);
+    let rows: Vec<Seen<'_>> = decided
+        .rows
+        .iter()
+        .map(|d| {
+            (
+                d.kind,
+                d.t_ms - t,
+                &*d.asked,
+                d.said,
+                &*d.did,
+                d.why.as_deref(),
+                d.times,
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (
+                DecisionKind::Chose,
+                2_000,
+                "Which colour? / Which size?",
+                false,
+                "Blue; Large",
+                Some("the option marked Recommended where one was, else the first"),
+                1
+            ),
+            (
+                DecisionKind::Answered,
+                20_500,
+                "Should I add a CLI or packaging next?",
+                false,
+                "the land answer: finish cleanly soonest, start nothing new",
+                None,
+                1
+            ),
+            (
+                DecisionKind::Unproven,
+                30_000,
+                "python3 - <<PY \u{2026}",
+                false,
+                "",
+                Some("Approve permission boxes: All"),
+                3
+            ),
+            (
+                DecisionKind::Declined,
+                200_000,
+                "rm -rf build",
+                false,
+                "",
+                Some("Nothing outside the worktree is removed."),
+                1
+            ),
+        ],
+        "{:#?}",
+        decided.rows
+    );
+    assert!(decided.rows.iter().all(|d| d.sid == "s-1"));
+    // NEGATIVE CONTROL: the CHOSE's seq is the busy read's, never a key's.
+    let chose = journal(&format!(
+        "{} s-1 CHOSE seq=57 rule=answer-recommended@v1 policy=recommended x",
+        t
+    ));
+    let seqs: Vec<u64> = ledger
+        .iter()
+        .filter_map(|l| aterm_json::from_str::<Value>(l).ok())
+        .filter_map(|v| v.get("box_seq").and_then(Value::as_u64))
+        .collect();
+    assert!(
+        !seqs.contains(&chose[0].seq.expect("a seq")),
+        "CONTROL: a join by box_seq finds no key: {seqs:?}"
+    );
+    assert_eq!(
+        chose_why(&[], "recommended"),
+        "Question priority is Recommended",
+        "CONTROL: with no key, the why is the policy's word"
+    );
+    // NEGATIVE CONTROL: a window that keeps no shares keeps no decisions.
+    let mut plain = HarnessStats::new(t - 60_000);
+    for line in &ledger {
+        fold_ledger_line(&mut plain, line);
+    }
+    plain.end_reading();
+    assert!(plain.decided.is_none());
+}
+
+/// `answers` (each `<question> → <choice>`) as a `CHOSE` tells them: joined
+/// ` | `, cut at [`LINE_CHARS`] (`run.rs`'s `tell_answered`, its `clip`).
+fn chose_words(answers: &[String]) -> String {
+    answers.join(" | ").chars().take(LINE_CHARS).collect()
+}
+
+/// A LONG DIALOG IS WORDED FROM ITS KEYS (§10.4.4): the `CHOSE` line is cut
+/// at 160 characters, and each answer key holds its tab's whole `<question>
+/// → <choice>`, so every tab is worded from its key. A three-tab dialog cut
+/// at its second tab's arrow names all three — the second by the key its
+/// cut words begin, the third (wholly lost to the cut) by the key written
+/// after — with the why all three keys give and the newest's time. A
+/// two-tab dialog cut inside its second choice says the whole choice. Where
+/// the ledger lost that key, the cut tab keeps its own words, `…` after
+/// the choice. A key of a dialog a person took over before another
+/// dialog's `CHOSE`, which no tab names, is none of it (that `CHOSE`'s why
+/// is the policy's, its time its own); a key after the last `CHOSE` words
+/// none. NEGATIVE CONTROLS: the cut lines hold no whole second tab (the
+/// `CHOSE`'s words alone would drop or cut it); a line under 160 characters
+/// is not read as cut, so a key that merely begins with a whole tab's words
+/// is not that tab's.
+#[test]
+fn a_long_dialog_is_worded_from_its_keys() {
+    let t = now_ms() - 3_600_000;
+    let q1 = "Which colour should the footer of the settings page use on a dark theme?";
+    let q2 = "Which side of the footer should the session chips go on, then?";
+    let q3 = "Should the chips show the model's name as well as its effort level?";
+    let qb = "Which colour should the footer of the settings page use on a dark theme, by default?";
+    let tab = |q: &str, c: &str| format!("{q} \u{2192} {c}");
+    let three = [
+        tab(q1, "Blue (Recommended)"),
+        tab(q2, "Right side, beside the facts (Recommended)"),
+        tab(q3, "No"),
+    ];
+    let two = [
+        tab(qb, "Blue"),
+        tab(q2, "Right side, beside the facts (Recommended)"),
+    ];
+    let (cut3, cut2) = (chose_words(&three), chose_words(&two));
+    let marked = "unproven: answered with its recommended option";
+    let unmarked = "unproven: no option is marked (Recommended): option 1";
+    let key = |ts, sid: &str, command: &str, reason: &str| {
+        seq_row(
+            ts,
+            sid,
+            RULE_ANSWER_RECOMMENDED,
+            Outcome::Approved,
+            (command, reason),
+            1,
+        )
+    };
+    let told = |sid: &str, at: i64, words: &str| {
+        journal_lines(&format!(
+            "{at} {sid} CHOSE seq=900 rule=answer-recommended@v1 policy=recommended {words}"
+        ))
+    };
+    let files = [
+        ("s-a.journal.jsonl", told("s-a", t + 9_000, &cut3)),
+        (
+            "s-a.jsonl",
+            vec![
+                key(t + 1_000, "s-a", &three[0], marked),
+                key(t + 2_000, "s-a", &three[1], marked),
+                key(t + 3_000, "s-a", &three[2], unmarked),
+            ],
+        ),
+        ("s-b.journal.jsonl", told("s-b", t + 9_000, &cut2)),
+        (
+            "s-b.jsonl",
+            vec![
+                key(t + 1_000, "s-b", &two[0], unmarked),
+                key(t + 2_000, "s-b", &two[1], marked),
+            ],
+        ),
+        ("s-c.journal.jsonl", told("s-c", t + 9_000, &cut2)),
+        ("s-c.jsonl", vec![key(t + 1_000, "s-c", &two[0], unmarked)]),
+        (
+            "s-d.journal.jsonl",
+            journal_lines(&format!(
+                "{} s-d CHOSE seq=950 rule=answer-long-term@v1 policy=long-term Ship it? \u{2192} the long-term policy text
+                 {} s-d CHOSE seq=990 rule=answer-recommended@v1 policy=recommended Short? \u{2192} Yes",
+                t + 40_000,
+                t + 70_000,
+            )),
+        ),
+        (
+            "s-d.jsonl",
+            vec![
+                key(t + 30_000, "s-d", "Taken over? \u{2192} Theirs", unmarked),
+                key(t + 60_000, "s-d", "Short? \u{2192} Yes, and more", marked),
+                key(t + 80_000, "s-d", "Untold? \u{2192} Maybe", marked),
+            ],
+        ),
+    ];
+    let (_root, state, harness) = decided_tree(&files);
+    let (today, _) = stats_windows(&state, &harness, t - 60_000, t - 86_400_000);
+    let rows = today.decided.expect("decisions").rows;
+    let of = |sid: &str| -> Vec<(i64, String, String, Option<String>)> {
+        rows.iter()
+            .filter(|d| d.sid == sid)
+            .map(|d| {
+                (
+                    d.t_ms - t,
+                    d.asked.to_string(),
+                    d.did.to_string(),
+                    d.why.as_deref().map(str::to_string),
+                )
+            })
+            .collect()
+    };
+    let words = |text: &str| agent_words(text).to_string();
+    assert_eq!(
+        of("s-a"),
+        [(
+            3_000,
+            words(&format!("{q1} / {q2} / {q3}")),
+            "Blue; Right side, beside the facts; No".to_string(),
+            Some("the option marked Recommended where one was, else the first".to_string())
+        )]
+    );
+    assert_eq!(
+        of("s-b"),
+        [(
+            2_000,
+            words(&format!("{qb} / {q2}")),
+            "Blue; Right side, beside the facts".to_string(),
+            Some("the option marked Recommended where one was, else the first".to_string())
+        )]
+    );
+    assert_eq!(
+        of("s-c"),
+        [(
+            1_000,
+            words(&format!("{qb} / {q2}")),
+            "Blue; R\u{2026}".to_string(),
+            Some("no option was marked Recommended, so it took the first".to_string())
+        )]
+    );
+    assert_eq!(
+        of("s-d"),
+        [
+            (
+                40_000,
+                "Ship it?".to_string(),
+                "the long-term policy text".to_string(),
+                Some("Question priority is Long-term".to_string())
+            ),
+            (
+                70_000,
+                "Short?".to_string(),
+                "Yes".to_string(),
+                Some("Question priority is Recommended".to_string())
+            ),
+        ],
+        "a person's key and a key that only begins with a whole tab are no tab's"
+    );
+    // NEGATIVE CONTROLS: the cut lines.
+    assert_eq!(cut3.chars().count(), LINE_CHARS);
+    assert!(cut3.ends_with(&format!("{q2} \u{2192}")), "{cut3}");
+    assert!(cut2.ends_with(&format!("{q2} \u{2192} R")), "{cut2}");
+    assert!("Short? \u{2192} Yes".chars().count() < LINE_CHARS);
+}
+
+/// A RUN OF UNPROVEN PRESSES IS ONE ROW BY ITS HEAD (§10.4.1): presses of
+/// one command head in one session, each within a minute of the last, are
+/// one row `×3`; the same head 61 s after the run's last press starts a row
+/// of its own, and so does another head inside the run, and the same head in
+/// another session inside the other's run. A heredoc's head ends at its
+/// delimiter word, in the one-line form the ledger holds a box's command in
+/// (the lab's three Approve = All presses, `python3 - <<'PY' print(1) PY`)
+/// and in its own lines alike, so they are one run; a here-string opens
+/// none. The rm breaker's warned box under `safe` names that switch, not
+/// full power. NEGATIVE CONTROLS: a box pressed with a proof (no
+/// `unproven:`) and a dialog's key are no row.
+#[test]
+fn a_run_of_unproven_presses_is_one_row_by_its_head() {
+    let t = now_ms() - 3_600_000;
+    let press = |ts: i64, sid: &str, command: &str, reason: &str| {
+        seq_row(
+            ts,
+            sid,
+            RULE_READ_ONLY,
+            Outcome::Approved,
+            (command, reason),
+            1,
+        )
+    };
+    let unproven = "unproven: not read-only: touch";
+    let warned = format!(
+        "unproven: the rm circuit breaker (rm -rf x) \u{2014} {WARNED_UNDER_SAFE} ([harness] \
+         rm_breaker_ask = true hands it to a person)"
+    );
+    let s1 = vec![
+        press(t, "s-1", "touch a\nmore", unproven),
+        press(t + 30_000, "s-1", "touch a\nother", unproven),
+        press(t + 40_000, "s-1", "ls -la", unproven),
+        press(t + 89_000, "s-1", "touch a\nmore", unproven),
+        press(t + 150_000, "s-1", "touch a\nmore", unproven),
+        press(t + 160_000, "s-1", "cargo test", ""),
+        seq_row(
+            t + 170_000,
+            "s-1",
+            RULE_ANSWER_RECOMMENDED,
+            Outcome::Approved,
+            ("Q? \u{2192} A", unproven),
+            1,
+        ),
+        press(t + 180_000, "s-1", "rm -rf x", &warned),
+    ];
+    let s3 = vec![press(t + 155_000, "s-3", "touch a\nmore", unproven)];
+    let vendor = "unproven: the box carries a vendor note: This command requires approval";
+    let s4 = vec![
+        press(t + 2_000, "s-4", "python3 - <<'PY' print(1) PY", vendor),
+        press(t + 3_000, "s-4", "python3 - <<'PY' print(2) PY", vendor),
+        press(t + 4_000, "s-4", "python3 - <<'PY'\nprint(4)\nPY", vendor),
+        press(t + 5_000, "s-4", "cat <<<hi", vendor),
+    ];
+    let (_root, state, harness) =
+        decided_tree(&[("s-1.jsonl", s1), ("s-3.jsonl", s3), ("s-4.jsonl", s4)]);
+    let (today, _) = stats_windows(&state, &harness, t - 60_000, t - 86_400_000);
+    let rows: Vec<(String, i64, String, u32, Option<String>)> = today
+        .decided
+        .expect("decisions")
+        .rows
+        .iter()
+        .map(|d| {
+            (
+                d.sid.clone(),
+                d.t_ms - t,
+                d.asked.to_string(),
+                d.times,
+                d.why.as_deref().map(str::to_string),
+            )
+        })
+        .collect();
+    let all = Some("Approve permission boxes: All".to_string());
+    assert_eq!(
+        rows,
+        [
+            (
+                "s-1".to_string(),
+                0,
+                "touch a \u{2026}".to_string(),
+                3,
+                all.clone()
+            ),
+            (
+                "s-4".to_string(),
+                2_000,
+                "python3 - <<'PY' \u{2026}".to_string(),
+                3,
+                all.clone()
+            ),
+            (
+                "s-4".to_string(),
+                5_000,
+                "cat <<<hi".to_string(),
+                1,
+                all.clone()
+            ),
+            (
+                "s-1".to_string(),
+                40_000,
+                "ls -la".to_string(),
+                1,
+                all.clone()
+            ),
+            (
+                "s-1".to_string(),
+                150_000,
+                "touch a \u{2026}".to_string(),
+                1,
+                all.clone()
+            ),
+            (
+                "s-3".to_string(),
+                155_000,
+                "touch a \u{2026}".to_string(),
+                1,
+                all
+            ),
+            (
+                "s-1".to_string(),
+                180_000,
+                "rm -rf x".to_string(),
+                1,
+                Some("Approve permission boxes: Safe, with the rm warning".to_string())
+            ),
+        ],
+        "{rows:#?}"
+    );
+}
+
+/// THE CAP KEEPS THE NEWEST 64 (§10.4.2, item 1): 70 declines over three
+/// sessions, written out of time order across the files, keep the newest
+/// [`DECIDED_KEEP`], oldest first, and count all 70. NEGATIVE CONTROL: the six
+/// oldest — the first session's file holds four of them, read first — are
+/// gone.
+#[test]
+fn the_cap_keeps_the_newest_decisions() {
+    let t = now_ms() - 3_600_000;
+    let decline = |k: i64, sid: &str| {
+        seq_row(
+            t + k * 1_000,
+            sid,
+            "decline@v1",
+            Outcome::Declined,
+            (&format!("buy {k}"), "-"),
+            1,
+        )
+    };
+    // s-a: 0..4 and 40..70; s-b: 4..20; s-c: 20..40 — each file in time order.
+    let a: Vec<String> = (0..4).chain(40..70).map(|k| decline(k, "s-a")).collect();
+    let b: Vec<String> = (4..20).map(|k| decline(k, "s-b")).collect();
+    let c: Vec<String> = (20..40).map(|k| decline(k, "s-c")).collect();
+    let (_root, state, harness) =
+        decided_tree(&[("s-a.jsonl", a), ("s-b.jsonl", b), ("s-c.jsonl", c)]);
+    let (today, _) = stats_windows(&state, &harness, t - 60_000, t - 86_400_000);
+    let decided = today.decided.expect("decisions");
+    assert_eq!(decided.total, 70);
+    assert_eq!(decided.rows.len(), DECIDED_KEEP);
+    let kept: Vec<i64> = decided.rows.iter().map(|d| (d.t_ms - t) / 1_000).collect();
+    assert_eq!(kept, (6..70).collect::<Vec<i64>>());
+    assert!(
+        decided.rows.iter().all(|d| d.why.is_none()),
+        "a `-` reason is none"
+    );
+    // NEGATIVE CONTROL.
+    assert!(!kept.iter().any(|k| *k < 6));
+}
+
+/// THE AGENT'S WORDS, SANITIZED (§10.4.2, item 1; §10.8 "Agent text on a
+/// Settings page"): a line break and a tab are one space, CSI and OSC escape
+/// sequences and a bidirectional override are dropped, every other control
+/// too; a text longer than [`DECIDED_CHARS`] is cut at a char boundary (a
+/// two-byte letter's) with `…`. NEGATIVE CONTROL: `sanitize_for_tty` alone
+/// keeps the escapes' parameters and runs the lines together.
+#[test]
+fn the_agents_words_are_one_line_without_escapes_and_cut() {
+    let raw = "\u{1b}[31mred\u{1b}[0m\nline\ttwo \u{202e}evil\u{1b}]0;title\u{7} end\u{7f}";
+    assert_eq!(&*agent_words(raw), "red line two evil end");
+    let long: String = "\u{e9}".repeat(200);
+    let cut = agent_words(&long);
+    assert_eq!(cut.chars().count(), DECIDED_CHARS + 1);
+    assert!(cut.ends_with('\u{2026}'));
+    assert!(cut.chars().take(DECIDED_CHARS).all(|c| c == '\u{e9}'));
+    assert_eq!(&*agent_words("short"), "short");
+    // NEGATIVE CONTROL: the sanitizer alone.
+    let alone = atpkg::progress::sanitize_for_tty(raw, DECIDED_CHARS);
+    assert!(
+        alone.contains("[31m") && alone.contains("linetwo"),
+        "{alone}"
+    );
+}
+
+/// NO DECISION, NO ROWS: a day with only continuations and proven presses
+/// has no decision (the page then draws no card). NEGATIVE CONTROL: one
+/// decline in it is one.
+#[test]
+fn a_day_without_a_choice_has_no_decision() {
+    let t = now_ms() - 3_600_000;
+    let quiet = vec![
+        seq_row(
+            t,
+            "s-1",
+            RULE_CONTINUE,
+            Outcome::Typed,
+            ("keep going", "-"),
+            1,
+        ),
+        seq_row(
+            t + 1,
+            "s-1",
+            RULE_ALLOW_ONCE,
+            Outcome::Approved,
+            ("cargo test", ""),
+            2,
+        ),
+    ];
+    let (_root, state, harness) = decided_tree(&[("s-1.jsonl", quiet.clone())]);
+    let (today, _) = stats_windows(&state, &harness, t - 60_000, t - 86_400_000);
+    let decided = today.decided.expect("decisions");
+    assert!(decided.rows.is_empty() && decided.total == 0);
+    let mut busy = quiet;
+    busy.push(seq_row(
+        t + 2,
+        "s-1",
+        "decline@v1",
+        Outcome::Declined,
+        ("x", "no"),
+        3,
+    ));
+    let (_root, state, harness) = decided_tree(&[("s-1.jsonl", busy)]);
+    let (today, _) = stats_windows(&state, &harness, t - 60_000, t - 86_400_000);
+    assert_eq!(today.decided.expect("decisions").total, 1, "CONTROL");
+}
+
+/// A PROSE ANSWER JOINS ITS OWN RUN'S POINT (§10.4.4): the screen's `seq`
+/// begins again when a loop, a server or a program restarts (this machine's
+/// journals do so once or twice a day a session, most often at a live
+/// upgrade, with no `EXIT`), so an answer takes the newest review point
+/// journaled at or before it and read at or before its `box_seq`, in the
+/// loop run it was typed in. The answer at +10 s takes its `EVENT question`
+/// (`asked`), not the box read at the same `seq` after the loop's `EXIT`;
+/// the answer at +250 s, in the run that began when the `seq` fell from 900
+/// to 7, takes that run's `EVENT idle` (`said`: the turn's last row); the
+/// answer at +510 s, in the run that began at the box (`seq` 10 to 4),
+/// takes no point (its own was not journaled), not the ended run's
+/// question; the answer at +700 s, after an `EXIT` and before the next
+/// loop's first point, takes none either. A dialog's key between a point
+/// and its answer (`APPROVED seq=9`, then its `DIALOG` at the read before,
+/// `seq=8`) ends no run: only an `EVENT`'s `seq` is compared. The
+/// mutations that each break this test are its negative controls (no time
+/// bound, no `EXIT` or `seq` run end, every phase a point, every record's
+/// `seq` compared, the question flag always set).
+#[test]
+fn a_prose_answer_joins_the_point_of_its_own_run() {
+    let t = now_ms() - 3_600_000;
+    let s = |k: i64| t + k * 1_000;
+    let told = journal_lines(&format!(
+        "{} s-1 EVENT question seq=5 \u{23fa} Which database should I use?
+         {} s-1 EXIT stopped
+         {} s-1 EVENT prompt seq=5 kind=other classify=- command=-
+         {} s-1 EVENT idle seq=900 Old words.
+         {} s-1 EVENT idle seq=7 \u{23fa} Shall I go on with the new run?
+         {} s-1 APPROVED seq=9 Which colour? \u{2192} Blue
+         {} s-1 DIALOG seq=8 rule=answer-recommended@v1 Which colour?
+         {} s-1 EVENT question seq=10 Old question?
+         {} s-1 EVENT prompt seq=4 kind=bash classify=- command=ls
+         {} s-1 EVENT question seq=20 Before the exit?
+         {} s-1 EXIT stopped
+         {} s-1 EVENT idle seq=2 After everything.",
+        s(0),
+        s(50),
+        s(60),
+        s(100),
+        s(200),
+        s(210),
+        s(211),
+        s(400),
+        s(500),
+        s(600),
+        s(650),
+        s(800),
+    ));
+    let answer = |at: i64, seq: u64| {
+        seq_row(
+            s(at),
+            "s-1",
+            RULE_ANSWER,
+            Outcome::Typed,
+            ("Decide for yourself.", "the turn-end policy"),
+            seq,
+        )
+    };
+    let ledger = vec![
+        answer(10, 6),
+        answer(250, 7),
+        answer(510, 12),
+        answer(700, 25),
+    ];
+    let (_root, state, harness) =
+        decided_tree(&[("s-1.journal.jsonl", told), ("s-1.jsonl", ledger)]);
+    let (today, _) = stats_windows(&state, &harness, t - 60_000, t - 86_400_000);
+    let rows: Vec<(i64, String, bool)> = today
+        .decided
+        .expect("decisions")
+        .rows
+        .iter()
+        .map(|d| ((d.t_ms - t) / 1_000, d.asked.to_string(), d.said))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (10, "Which database should I use?".to_string(), false),
+            (250, "Shall I go on with the new run?".to_string(), true),
+            (510, String::new(), false),
+            (700, String::new(), false),
+        ]
+    );
+}
+
+/// AN UNPROVEN PRESS SAYS WHICH OPTION (§10.4.4): full power writes an
+/// `approved` row for every option it picks — a setup dialog's `No, keep
+/// default`, the limit dialog's `Stop and wait for limit to reset` — with
+/// the option after ` => ` in its command, so the row names that option
+/// whole however long the box's words are, and its head is the box's words
+/// alone, its drawing dropped (a title read from a border row is none). A
+/// one-shot allow's and a trust dialog's command is the box alone, so a
+/// ` => ` in it is the command's own. NEGATIVE CONTROLS: the commands as the
+/// ledger holds them end in the option, past the 96 characters a head keeps.
+#[test]
+fn an_unproven_press_names_the_option_it_chose() {
+    use crate::supervise::policy::approval::{RULE_DECLINE, RULE_NO_SPEND, RULE_TRUST_ANY};
+    let t = now_ms() - 3_600_000;
+    let border = "\u{2594}".repeat(100);
+    let long = "x".repeat(120);
+    let press = |ts: i64, rule: &str, command: &str| {
+        seq_row(
+            ts,
+            "s-1",
+            rule,
+            Outcome::Approved,
+            (command, "unproven: the safe rules do not judge this box"),
+            1,
+        )
+    };
+    let spend = format!("{border} => Stop and wait for limit to reset");
+    let not_now = format!("{long} => Not now");
+    let ledger = vec![
+        press(t, RULE_DECLINE, "Enable the new model? => No, keep default"),
+        press(t + 1_000, RULE_NO_SPEND, &spend),
+        press(t + 2_000, RULE_NO_SPEND, &spend),
+        press(t + 3_000, RULE_ALLOW_ONCE, "node -e 'f(a => b)'"),
+        press(t + 4_000, RULE_TRUST_ANY, "/Users//x/proj => y"),
+        press(t + 5_000, RULE_DECLINE, &not_now),
+    ];
+    let (_root, state, harness) = decided_tree(&[("s-1.jsonl", ledger)]);
+    let (today, _) = stats_windows(&state, &harness, t - 60_000, t - 86_400_000);
+    let rows: Vec<(String, String, u32)> = today
+        .decided
+        .expect("decisions")
+        .rows
+        .iter()
+        .map(|d| (d.asked.to_string(), d.did.to_string(), d.times))
+        .collect();
+    let cut = agent_words(&long).to_string();
+    assert_eq!(
+        rows,
+        [
+            (
+                "Enable the new model?".to_string(),
+                "No, keep default".to_string(),
+                1
+            ),
+            (
+                String::new(),
+                "Stop and wait for limit to reset".to_string(),
+                2
+            ),
+            ("node -e 'f(a => b)'".to_string(), String::new(), 1),
+            ("/Users//x/proj => y".to_string(), String::new(), 1),
+            (cut.clone(), "Not now".to_string(), 1),
+        ]
+    );
+    assert!(cut.ends_with('\u{2026}'));
+    // NEGATIVE CONTROLS: the option is past the head's cut.
+    for command in [&spend, &not_now] {
+        assert!(!agent_words(command).contains("=>"), "{command}");
+    }
+}
+
+/// A RUN IS PRESSES OF ONE COMMAND UNDER ONE SWITCH (§10.4.4): two commands
+/// whose first 96 characters are the same (one long `S=…` prefix, as this
+/// machine's agents write them) are two rows though their shown heads are
+/// one; one command pressed under All and again under the rm warning is two
+/// rows; one command pressed twice under one switch is one row `×2`.
+/// NEGATIVE CONTROL: the two commands' shown heads are the same.
+#[test]
+fn a_run_is_presses_of_one_command_under_one_switch() {
+    let t = now_ms() - 3_600_000;
+    let prefix = format!("S=/private/tmp/{}/scratchpad/probe;", "p".repeat(90));
+    let first = format!("{prefix} L=1 run");
+    let second = format!("{prefix} mkdir -p $S");
+    let all = "unproven: not read-only: run";
+    let warned =
+        format!("unproven: the rm circuit breaker (rm -rf x) \u{2014} {WARNED_UNDER_SAFE}");
+    let press = |ts: i64, command: &str, reason: &str| {
+        seq_row(
+            ts,
+            "s-1",
+            RULE_READ_ONLY,
+            Outcome::Approved,
+            (command, reason),
+            1,
+        )
+    };
+    let ledger = vec![
+        press(t, &first, all),
+        press(t + 1_000, &second, all),
+        press(t + 2_000, &first, all),
+        press(t + 3_000, "rm -rf x", all),
+        press(t + 4_000, "rm -rf x", &warned),
+    ];
+    let (_root, state, harness) = decided_tree(&[("s-1.jsonl", ledger)]);
+    let (today, _) = stats_windows(&state, &harness, t - 60_000, t - 86_400_000);
+    let rows: Vec<(i64, u32, Option<String>)> = today
+        .decided
+        .expect("decisions")
+        .rows
+        .iter()
+        .map(|d| (d.t_ms - t, d.times, d.why.as_deref().map(str::to_string)))
+        .collect();
+    let all_words = Some("Approve permission boxes: All".to_string());
+    assert_eq!(
+        rows,
+        [
+            (0, 2, all_words.clone()),
+            (1_000, 1, all_words.clone()),
+            (3_000, 1, all_words),
+            (
+                4_000,
+                1,
+                Some("Approve permission boxes: Safe, with the rm warning".to_string())
+            ),
+        ]
+    );
+    // NEGATIVE CONTROL: shown, the two heads are one.
+    assert_eq!(command_head(&first).1, command_head(&second).1);
+}
+
+/// A DECISION'S ID STAYS (§10.4.4): the page keys a row by its decision's
+/// id, which is the same at every reading while the decision's rows stand:
+/// a later reading that holds a newer decision and a dialog told late (its
+/// `CHOSE` after the newer rows, its keys before them, so it sorts among
+/// the older rows) gives each first-reading decision the same id. Two
+/// decisions alike but for their time, their session or their kind differ.
+/// NEGATIVE CONTROL: the late dialog moves the first reading's newest
+/// decision to another place among the day's.
+#[test]
+fn a_decisions_id_stays_while_newer_rows_arrive() {
+    let t = now_ms() - 3_600_000;
+    let decline =
+        |ts: i64, what: &str| seq_row(ts, "s-1", "decline@v1", Outcome::Declined, (what, "no"), 1);
+    let early = vec![decline(t, "a"), decline(t + 20_000, "b")];
+    let (_root, state, harness) = decided_tree(&[("s-1.jsonl", early.clone())]);
+    let (first, _) = stats_windows(&state, &harness, t - 60_000, t - 86_400_000);
+    let first = first.decided.expect("decisions").rows;
+    let mut later = early;
+    later.insert(
+        1,
+        seq_row(
+            t + 10_000,
+            "s-1",
+            RULE_ANSWER_RECOMMENDED,
+            Outcome::Approved,
+            (
+                "Late? \u{2192} Yes",
+                "unproven: answered with its recommended option",
+            ),
+            1,
+        ),
+    );
+    later.push(decline(t + 30_000, "c"));
+    let told = journal_lines(&format!(
+        "{} s-1 CHOSE seq=9 rule=answer-recommended@v1 policy=recommended Late? \u{2192} Yes",
+        t + 40_000
+    ));
+    let (_root, state, harness) =
+        decided_tree(&[("s-1.journal.jsonl", told), ("s-1.jsonl", later)]);
+    let (second, _) = stats_windows(&state, &harness, t - 60_000, t - 86_400_000);
+    let second = second.decided.expect("decisions").rows;
+    assert_eq!(second.len(), 4);
+    let place = |rows: &[Decision], id: &str| rows.iter().position(|d| d.id() == id);
+    for decision in &first {
+        assert!(
+            place(&second, &decision.id()).is_some(),
+            "{decision:?} keeps its id"
+        );
+    }
+    let ids: BTreeSet<String> = second.iter().map(Decision::id).collect();
+    assert_eq!(ids.len(), 4, "every id its own");
+    let one = &first[0];
+    for other in [
+        Decision {
+            t_ms: one.t_ms + 1,
+            ..one.clone()
+        },
+        Decision {
+            sid: "s-2".to_string(),
+            ..one.clone()
+        },
+        Decision {
+            kind: DecisionKind::KeptReset,
+            ..one.clone()
+        },
+    ] {
+        assert_ne!(other.id(), one.id(), "{other:?}");
+    }
+    assert_eq!(one.id().len(), 16);
+    // NEGATIVE CONTROL: the late dialog moves "b" from second to third.
+    let b = first[1].id();
+    assert_eq!((place(&first, &b), place(&second, &b)), (Some(1), Some(2)));
+}
+
+/// A KEPT RESET SAYS WHY IN WORDS, AND A CUT ANSWER CLOSES ITS QUOTE
+/// (§10.4.4): the reset policy's `declined` row (its command a title, its
+/// reason a word of its own, `check-timeout`) is a reset kept unspent, its
+/// why that word in a person's words, and none where the word is no word
+/// this build writes. An `answer_text` longer than a row keeps is cut
+/// inside its quotes, so they close. NEGATIVE CONTROL: the rows' own words
+/// are the codes and the title, and the whole answer is longer than a row.
+#[test]
+fn a_kept_reset_says_why_in_words_and_a_cut_answer_closes_its_quote() {
+    let t = now_ms() - 3_600_000;
+    let kept = |ts: i64, why: &str| {
+        seq_row(
+            ts,
+            "s-1",
+            RULE_LIMIT_RESET,
+            Outcome::Declined,
+            ("Checking for a reset", why),
+            1,
+        )
+    };
+    let text = format!(
+        "Nobody is here to answer. {}",
+        "Decide for yourself. ".repeat(8)
+    );
+    let ledger = vec![
+        kept(t, "check-timeout"),
+        kept(t + 1_000, "inexact-title"),
+        kept(t + 2_000, "frobbed"),
+        seq_row(
+            t + 3_000,
+            "s-1",
+            RULE_ANSWER,
+            Outcome::Typed,
+            (&text, "the turn-end policy"),
+            1,
+        ),
+    ];
+    let (_root, state, harness) = decided_tree(&[("s-1.jsonl", ledger)]);
+    let (today, _) = stats_windows(&state, &harness, t - 60_000, t - 86_400_000);
+    let rows = today.decided.expect("decisions").rows;
+    let kept: Vec<(DecisionKind, &str, Option<&str>)> = rows[..3]
+        .iter()
+        .map(|d| (d.kind, &*d.asked, d.why.as_deref()))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            (
+                DecisionKind::KeptReset,
+                "",
+                Some("the check for a reset took longer than it may")
+            ),
+            (
+                DecisionKind::KeptReset,
+                "",
+                Some("its confirmation did not read exactly as expected (its title)")
+            ),
+            (DecisionKind::KeptReset, "", None),
+        ]
+    );
+    let answer = &rows[3].did;
+    assert!(
+        answer.starts_with("the answer text \u{201c}Nobody is here to answer.")
+            && answer.ends_with("\u{2026}\u{201d}"),
+        "{answer}"
+    );
+    assert!(answer.chars().count() <= DECIDED_CHARS + 1, "{answer}");
+    // NEGATIVE CONTROL.
+    assert!(text.chars().count() > DECIDED_CHARS);
+}
+
+/// The public fold accepts i64 timestamps. A whole-domain gap starts a
+/// new burst while adjacent early timestamps still share their actual row.
+#[test]
+fn a_burst_stays_separate_across_the_whole_timestamp_domain() {
+    let mut acc = HarnessStats::per_session(i64::MIN);
+    for ts in [i64::MIN, i64::MIN + 1, i64::MAX] {
+        fold_ledger_line(
+            &mut acc,
+            &seq_row(
+                ts,
+                "s-1",
+                RULE_READ_ONLY,
+                Outcome::Approved,
+                ("touch a", "unproven: not read-only: touch"),
+                1,
+            ),
+        );
+    }
+    acc.end_reading();
+    let decided = acc.decided.expect("decisions");
+    let rows: Vec<(i64, u32)> = decided.rows.iter().map(|d| (d.t_ms, d.times)).collect();
+    assert_eq!(decided.total, 2);
+    assert_eq!(rows, [(i64::MIN, 2), (i64::MAX, 1)]);
 }

@@ -58,7 +58,8 @@
 //! length 0..=1024. The MAC is pinned to all seven RFC 4231 cases, and the tags,
 //! attach proof and producer ids this crate answered over `sha2` are pinned as
 //! recorded answers. No cipher is built here: encrypting the wire is
-//! `astream-aead`'s job (over the vetted RustCrypto AEAD), wired into the broker
+//! `astream-aead`'s job (ring's ChaCha20-Poly1305 under an in-crate HChaCha20
+//! subkey: XChaCha20-Poly1305), wired into the broker
 //! as `serve_tcp_sealed`; a guarded broker (`open_guarded`) composes the two.
 
 // A contracted fn is written once, through `contract_fn!`: under a Trust compiler
@@ -74,6 +75,8 @@ mod contract_fn;
 mod twins;
 
 pub mod capfile;
+#[cfg(test)]
+mod capfile_tests;
 
 use astream_digest::Sha256;
 use astream_wire::{Filter, Subject};
@@ -208,34 +211,47 @@ fn parse_grant(grant: &str) -> Result<(Grant, Filter), String> {
     }
 }
 
-fn all_ascii_digits(s: &str) -> bool {
-    if s.is_empty() {
+const fn all_ascii_digits(s: &str) -> bool {
+    let mut bytes = s.as_bytes();
+    if bytes.is_empty() {
         return false;
     }
-    for &b in s.as_bytes() {
-        if !b.is_ascii_digit() {
+    while let &[b, ref rest @ ..] = bytes {
+        if b < b'0' || b > b'9' {
             return false;
         }
+        bytes = rest;
     }
     true
 }
 
-fn parse_u64_ascii(s: &str) -> Option<u64> {
-    if s.is_empty() {
+const fn parse_u64_ascii(s: &str) -> Option<u64> {
+    let mut bytes = s.as_bytes();
+    if bytes.is_empty() {
         return None;
     }
     let mut acc = 0u64;
-    for &b in s.as_bytes() {
+    while let &[b, ref rest @ ..] = bytes {
         let digit = match b {
-            b'0'..=b'9' => u64::from(b.saturating_sub(b'0')),
+            b'0'..=b'9' => (b - b'0') as u64,
             _ => return None,
         };
-        acc = acc.checked_mul(10)?.checked_add(digit)?;
+        let Some(mul) = acc.checked_mul(10) else {
+            return None;
+        };
+        let Some(next) = mul.checked_add(digit) else {
+            return None;
+        };
+        acc = next;
+        bytes = rest;
     }
     Some(acc)
 }
 
-fn parse_grant_depth(grant: &str, depth: usize) -> Result<(Grant, Filter, Option<String>), String> {
+fn parse_single_grant(
+    grant: &str,
+    depth: usize,
+) -> Result<(Grant, Filter, Option<String>), String> {
     const MAX_MACAROON_DEPTH_LIMIT: u64 = (MAX_MACAROON_DEPTH as u64) + 1;
     if !macaroon_depth_valid(depth as u64, MAX_MACAROON_DEPTH_LIMIT) {
         return Err(format!(
@@ -342,11 +358,34 @@ fn parse_grant_depth(grant: &str, depth: usize) -> Result<(Grant, Filter, Option
         filter: filter.to_string(),
         expires_at,
     };
-    if let Some(ref parent_str) = via_parent {
-        let (pg, pf, _) = parse_grant_depth(parent_str, depth.saturating_add(1))?;
-        check_attenuation_parsed(parent_str, &pg, &pf, grant, &g, &f)?;
-    }
     Ok((g, f, via_parent))
+}
+
+fn parse_grant_depth(
+    grant: &str,
+    start_depth: usize,
+) -> Result<(Grant, Filter, Option<String>), String> {
+    let (root_g, root_f, root_via) = parse_single_grant(grant, start_depth)?;
+    let mut child_str = grant.to_string();
+    let mut child_g = root_g.clone();
+    let mut child_f = root_f.clone();
+    let mut next_via = root_via.clone();
+    let mut cur_depth = start_depth;
+    for _ in 0..=MAX_MACAROON_DEPTH {
+        let Some(parent_str) = next_via else {
+            return Ok((root_g, root_f, root_via));
+        };
+        cur_depth = cur_depth.saturating_add(1);
+        let (pg, pf, p_via) = parse_single_grant(&parent_str, cur_depth)?;
+        check_attenuation_parsed(&parent_str, &pg, &pf, &child_str, &child_g, &child_f)?;
+        child_str = parent_str;
+        child_g = pg;
+        child_f = pf;
+        next_via = p_via;
+    }
+    Err(format!(
+        "invalid grant: macaroon attenuation chain exceeds max depth {MAX_MACAROON_DEPTH}"
+    ))
 }
 
 const fn hex_digit_char(nibble: u8) -> char {
@@ -392,11 +431,26 @@ const fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
+const fn encode_hex_pair(b: u8) -> (char, char) {
+    (hex_digit_char(b >> 4), hex_digit_char(b & 0x0f))
+}
+
+const fn decode_hex_pair(hi_b: u8, lo_b: u8) -> Option<u8> {
+    let Some(hi) = hex_nibble(hi_b) else {
+        return None;
+    };
+    let Some(lo) = hex_nibble(lo_b) else {
+        return None;
+    };
+    Some(((hi & 0x0f) << 4) | (lo & 0x0f))
+}
+
 fn encode_lower_hex(bytes: &[u8]) -> String {
     let mut out = String::new();
     for &b in bytes {
-        out.push(hex_digit_char(b >> 4));
-        out.push(hex_digit_char(b & 0x0f));
+        let (hi, lo) = encode_hex_pair(b);
+        out.push(hi);
+        out.push(lo);
     }
     out
 }
@@ -411,11 +465,16 @@ fn decode_lower_hex_utf8(hex: &str) -> Option<String> {
     }
     let mut out = Vec::new();
     for &[hi_b, lo_b] in pairs {
-        let hi = hex_nibble(hi_b)?;
-        let lo = hex_nibble(lo_b)?;
-        out.push((hi << 4) | lo);
+        out.push(decode_hex_pair(hi_b, lo_b)?);
     }
-    String::from_utf8(out).ok()
+    match core::str::from_utf8(&out) {
+        Ok(s) => Some(s.to_owned()),
+        Err(_) => None,
+    }
+}
+
+const fn is_principal_body_byte(b: u8) -> bool {
+    (b >= b'a' && b <= b'z') || (b >= b'0' && b <= b'9') || b == b'-'
 }
 
 /// Whether `p` is a well-formed principal: a class prefix (`s-` session, `n-`
@@ -425,21 +484,26 @@ fn decode_lower_hex_utf8(hex: &str) -> Option<String> {
 /// is deliberately not enforced here. What this rejects is anything that could
 /// confuse the grant grammar or the subject grammar — a `:`, a `/`, a wildcard, a
 /// control byte, an over-long or empty name — not anything about who issued the id.
-fn valid_principal(p: &str) -> bool {
+const fn valid_principal(p: &str) -> bool {
     let bytes = p.as_bytes();
-    if bytes.len() < 3 || bytes.len() > PRINCIPAL_TOTAL_MAX {
+    if bytes.len() > PRINCIPAL_TOTAL_MAX {
         return false;
     }
-    if bytes[1] != b'-' {
+    let &[class, b'-', first, ref tail @ ..] = bytes else {
+        return false;
+    };
+    if !matches!(class, b's' | b'n' | b'h' | b'a') {
         return false;
     }
-    if !matches!(bytes[0], b's' | b'n' | b'h' | b'a') {
+    if !is_principal_body_byte(first) {
         return false;
     }
-    for &b in &bytes[2..] {
-        if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+    let mut rest = tail;
+    while let &[b, ref tail @ ..] = rest {
+        if !is_principal_body_byte(b) {
             return false;
         }
+        rest = tail;
     }
     true
 }
@@ -459,7 +523,7 @@ contract_fn! {
     /// Discharged in the Clean CIC kernel by definitional equality against
     /// `grant_expired_isl` (`clean-kernel-defeq`).
     #[must_use]
-    pub fn grant_expired_at(exp: u64, now_ms: u64) -> bool
+    pub const fn grant_expired_at(exp: u64, now_ms: u64) -> bool
     clauses [ensures result == (exp <= now_ms)]
     {
         exp <= now_ms
@@ -472,7 +536,7 @@ contract_fn! {
     /// Discharged in the Clean CIC kernel by definitional equality against
     /// `pid_matches_isl` (`clean-kernel-defeq`).
     #[must_use]
-    pub fn producer_id_matches(expected: u64, actual: u64) -> bool
+    pub const fn producer_id_matches(expected: u64, actual: u64) -> bool
     clauses [ensures result == (expected == actual)]
     {
         expected == actual
@@ -485,7 +549,7 @@ contract_fn! {
     /// Discharged in the Clean CIC kernel by definitional equality against
     /// `expiry_attenuates_isl` (`clean-kernel-defeq`).
     #[must_use]
-    pub fn expiry_attenuates(child_exp: u64, parent_exp: u64) -> bool
+    pub const fn expiry_attenuates(child_exp: u64, parent_exp: u64) -> bool
     clauses [ensures result == (child_exp <= parent_exp)]
     {
         child_exp <= parent_exp
@@ -498,7 +562,7 @@ contract_fn! {
     /// Discharged in the Clean CIC kernel by definitional equality against
     /// `depth_within_limit_isl` (`clean-kernel-defeq`).
     #[must_use]
-    pub fn macaroon_depth_valid(depth: u64, max_depth: u64) -> bool
+    pub const fn macaroon_depth_valid(depth: u64, max_depth: u64) -> bool
     clauses [ensures result == (depth < max_depth)]
     {
         depth < max_depth
@@ -506,10 +570,14 @@ contract_fn! {
 }
 
 /// Advance an authorization clock monotonically (`max(cur_ms, sample_ms)`),
-/// delegating directly to the Clean-origin `cap_clock_advance_monotone` transition.
+/// matching the Clean-origin `cap_clock_advance_monotone` transition.
 #[must_use]
 pub const fn advance_auth_clock_ms(cur_ms: u64, sample_ms: u64) -> u64 {
-    cap_clock_advance_monotone(cur_ms, sample_ms)
+    if cur_ms < sample_ms {
+        sample_ms
+    } else {
+        cur_ms
+    }
 }
 
 /// Compute the tightest effective expiry timestamp (`unix_ms`) across an entire
@@ -541,11 +609,20 @@ pub fn effective_expiry_ms(grant: &str) -> Option<u64> {
 /// collapses to `0` (immediately expired) if `min(parent_exp, child_exp) <= now_ms`,
 /// and otherwise returns `min(parent_exp, child_exp)`.
 ///
-/// Composes the 3-parameter Clean-origin [`live_expiry_or_zero`] and 2-parameter
-/// [`attenuate_expiry_min`] transitions (`TlaCapabilityProtocol::attenuate_bounded_expiry_le_parent`).
+/// Matches the composition of the 3-parameter Clean-origin [`live_expiry_or_zero`] and
+/// 2-parameter [`attenuate_expiry_min`] transitions (`TlaCapabilityProtocol::attenuate_bounded_expiry_le_parent`).
 #[must_use]
 pub const fn attenuate_bounded_expiry(now_ms: u64, parent_exp: u64, child_exp: u64) -> u64 {
-    live_expiry_or_zero(attenuate_expiry_min(parent_exp, child_exp), now_ms, 0)
+    let min_exp = if parent_exp < child_exp {
+        parent_exp
+    } else {
+        child_exp
+    };
+    if min_exp <= now_ms {
+        0
+    } else {
+        min_exp
+    }
 }
 
 /// Compute the live clock-bounded effective expiry (`unix_ms`) across an entire
@@ -649,6 +726,20 @@ pub fn attenuation_depth(grant: &str) -> Option<usize> {
     None
 }
 
+/// Decode the 64-bit little-endian producer id from the first 8 bytes of a
+/// 32-byte SHA-256 digest (`SHA-256("astream-pid\0" ‖ principal)[..8]`).
+#[must_use]
+pub const fn decode_producer_id_bytes(digest: &[u8; TAG]) -> u64 {
+    (digest[0] as u64)
+        | ((digest[1] as u64) << 8)
+        | ((digest[2] as u64) << 16)
+        | ((digest[3] as u64) << 24)
+        | ((digest[4] as u64) << 32)
+        | ((digest[5] as u64) << 40)
+        | ((digest[6] as u64) << 48)
+        | ((digest[7] as u64) << 56)
+}
+
 /// The producer id the **broker** derives for `principal`:
 /// `u64::from_le_bytes(SHA-256("astream-pid\0" ‖ principal)[..8])`.
 ///
@@ -657,20 +748,16 @@ pub fn attenuation_depth(grant: &str) -> Option<usize> {
 /// collision is a 2^64 second-preimage search; the broker's binding table
 /// (`pid → principal`) is the belt-and-braces on top of that, not this function.
 #[must_use]
-pub fn producer_id_of(principal: &str) -> u64 {
+pub const fn producer_id_of(principal: &str) -> u64 {
     let mut h = Sha256::new();
-    h.update(PID_DOMAIN);
-    h.update(principal.as_bytes());
-    // A fixed `[u8; 32]`, so the first 8 bytes are static, in-bounds indices.
+    h.update_slice(PID_DOMAIN);
+    h.update_slice(principal.as_bytes());
     let digest: [u8; TAG] = h.finalize();
-    let head = [
-        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
-    ];
-    u64::from_le_bytes(head)
+    decode_producer_id_bytes(&digest)
 }
 
 /// HMAC-SHA256(key, msg) per RFC 2104, over `astream-digest`'s SHA-256.
-fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; TAG] {
+const fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; TAG] {
     hmac_sha256_parts(key, &[msg])
 }
 
@@ -812,27 +899,45 @@ const fn hmac_opad(k: &[u8; BLOCK]) -> [u8; BLOCK] {
     ]
 }
 
+const fn pad_digest_key(d: [u8; TAG]) -> [u8; BLOCK] {
+    [
+        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13],
+        d[14], d[15], d[16], d[17], d[18], d[19], d[20], d[21], d[22], d[23], d[24], d[25], d[26],
+        d[27], d[28], d[29], d[30], d[31], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]
+}
+
 /// HMAC-SHA256 of the CONCATENATION of `parts`, streamed into the inner hash one
 /// part at a time — the same tag as [`hmac_sha256`] over the joined bytes, without
 /// materialising the join.
-fn hmac_sha256_parts(key: &[u8], parts: &[&[u8]]) -> [u8; TAG] {
-    let mut k = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        k[..TAG].copy_from_slice(&Sha256::digest(key));
+const fn hmac_sha256_parts(key: &[u8], parts: &[&[u8]]) -> [u8; TAG] {
+    let k = if key.len() > BLOCK {
+        pad_digest_key(Sha256::digest_slice(key))
     } else {
-        k[..key.len()].copy_from_slice(key);
-    }
+        let mut k = [0u8; BLOCK];
+        let mut i = 0usize;
+        let mut rem = key;
+        while let &[b, ref tail @ ..] = rem {
+            k[i & 63] = b;
+            i = (i & 63) + 1;
+            rem = tail;
+        }
+        k
+    };
     let ipad = hmac_ipad(&k);
     let opad = hmac_opad(&k);
     let mut inner = Sha256::new();
-    inner.update(ipad);
-    for part in parts {
-        inner.update(part);
+    inner.update_slice(&ipad);
+    let mut rem_parts = parts;
+    while let &[part, ref tail @ ..] = rem_parts {
+        inner.update_slice(part);
+        rem_parts = tail;
     }
     let ih = inner.finalize();
     let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(ih);
+    outer.update_slice(&opad);
+    outer.update_slice(&ih);
     outer.finalize()
 }
 
@@ -842,7 +947,7 @@ fn hmac_sha256_parts(key: &[u8], parts: &[&[u8]]) -> [u8; TAG] {
 /// v1 tags are intentionally refused: reissue every offline chain from its root
 /// capability. There is no legacy tag fallback, which would retain the proof
 /// substitution vulnerability. The `via=` grant and capfile syntax stay unchanged.
-fn macaroon_tag(parent_tag: &[u8; TAG], grant: &str) -> [u8; TAG] {
+const fn macaroon_tag(parent_tag: &[u8; TAG], grant: &str) -> [u8; TAG] {
     hmac_sha256_parts(
         parent_tag,
         &[&MACAROON_FRAME_PREFIX, MACAROON_DOMAIN, grant.as_bytes()],
@@ -861,22 +966,46 @@ fn expected_tag(secret: &[u8], grant: &str) -> [u8; TAG] {
     expected_tag_depth(secret, grant, 0)
 }
 
-fn expected_tag_depth(secret: &[u8], grant: &str, depth: usize) -> [u8; TAG] {
-    if !grant.starts_with('/')
-        && grant.len() <= MAX_MACAROON_GRANT_BYTES
-        && macaroon_depth_valid(depth as u64, MAX_MACAROON_DEPTH as u64)
+fn has_via_hop(grant: &str, depth: usize) -> bool {
+    if grant.starts_with('/')
+        || grant.len() > MAX_MACAROON_GRANT_BYTES
+        || !macaroon_depth_valid(depth as u64, MAX_MACAROON_DEPTH as u64)
     {
-        if let Some((pfx, _)) = grant.split_once(':') {
-            if pfx.contains(",via=") {
-                if let Ok((_, _, Some(parent_str))) = parse_grant_depth(grant, depth) {
-                    let parent_tag =
-                        expected_tag_depth(secret, &parent_str, depth.saturating_add(1));
-                    return macaroon_tag(&parent_tag, grant);
-                }
-            }
-        }
+        return false;
     }
-    hmac_sha256(secret, grant.as_bytes())
+    match grant.split_once(':') {
+        Some((pfx, _)) => pfx.contains(",via="),
+        None => false,
+    }
+}
+
+fn expected_tag_depth(secret: &[u8], grant: &str, start_depth: usize) -> [u8; TAG] {
+    if !has_via_hop(grant, start_depth) {
+        return hmac_sha256(secret, grant.as_bytes());
+    }
+    let Ok((_, _, Some(first_parent))) = parse_grant_depth(grant, start_depth) else {
+        return hmac_sha256(secret, grant.as_bytes());
+    };
+    let mut children: Vec<String> = Vec::new();
+    children.push(grant.to_string());
+    let mut cur = first_parent;
+    let mut cur_depth = start_depth.saturating_add(1);
+    for _ in 0..MAX_MACAROON_DEPTH {
+        if !has_via_hop(&cur, cur_depth) {
+            break;
+        }
+        let Ok((_, _, Some(next_parent))) = parse_grant_depth(&cur, cur_depth) else {
+            break;
+        };
+        children.push(cur);
+        cur = next_parent;
+        cur_depth = cur_depth.saturating_add(1);
+    }
+    let mut tag = hmac_sha256(secret, cur.as_bytes());
+    while let Some(child) = children.pop() {
+        tag = macaroon_tag(&tag, &child);
+    }
+    tag
 }
 
 /// The folded difference between two tags: the OR of all 32 byte-wise XORs. Zero
@@ -966,7 +1095,7 @@ pub fn verify(secret: &[u8], cap: &Capability) -> bool {
 /// captured `Attach` frame replayed on a second connection is refused) and the
 /// grant (so a proof for one grant cannot be presented for another).
 #[must_use]
-pub fn attach_proof(tag: &[u8; TAG], nonce: &[u8], grant: &str) -> [u8; TAG] {
+pub const fn attach_proof(tag: &[u8; TAG], nonce: &[u8], grant: &str) -> [u8; TAG] {
     hmac_sha256_parts(tag, &[nonce, grant.as_bytes()])
 }
 
@@ -983,12 +1112,22 @@ pub fn attach_proof(tag: &[u8; TAG], nonce: &[u8], grant: &str) -> [u8; TAG] {
 ///
 /// It exists so the no-early-exit shape can be asserted *through the function the
 /// accept path calls* rather than beside it — see `ct_diff`.
-fn verify_attach_diff(secret: &[u8], grant: &str, nonce: &[u8], proof: &[u8]) -> Option<u8> {
-    let Ok(proof) = <&[u8; TAG]>::try_from(proof) else {
+const fn proof_array(proof: &[u8]) -> Option<[u8; TAG]> {
+    let &[b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19, b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31] =
+        proof
+    else {
         return None;
     };
+    Some([
+        b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19,
+        b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31,
+    ])
+}
+
+fn verify_attach_diff(secret: &[u8], grant: &str, nonce: &[u8], proof: &[u8]) -> Option<u8> {
+    let proof = proof_array(proof)?;
     let tag = expected_tag(secret, grant);
-    let diff = ct_diff(&attach_proof(&tag, nonce, grant), proof);
+    let diff = ct_diff(&attach_proof(&tag, nonce, grant), &proof);
     if diff == 0 && Grant::parse(grant).is_err() {
         return None;
     }

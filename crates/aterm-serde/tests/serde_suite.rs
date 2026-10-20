@@ -57,5 +57,6 @@ mod enum_internally_tagged;
 mod enum_untagged;
 mod ignored_any;
 mod ser;
+mod text_keys;
 mod untrusted;
 mod value;

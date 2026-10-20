@@ -181,7 +181,7 @@ impl Failed {
     /// `errno`, cleared before the call by [`clear_errno`]).
     fn last() -> Self {
         let failed = Self::of(errno());
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         let failed = hook::as_read(failed);
         failed
     }
@@ -561,21 +561,48 @@ pub fn pshm_sizes_of(_pid: u32) -> io::Result<Vec<u64>> {
 
 #[path = "holders_paths.rs"]
 mod paths;
+#[cfg(all(debug_assertions, target_vendor = "apple"))]
+pub use paths::a_force_detached_volume_is_no_working_directory;
 pub use paths::{Exe, PathScan, PathUse, exe_of, scan_path_users, scan_path_users_of};
 
 /// Test seams: run a closure between one table's listing and the reads of its descriptors (to
-/// make a race certain), and read a dead vnode as unknown (for a negative control).
-#[cfg(all(test, target_vendor = "apple"))]
+/// make a race certain), read a dead vnode as unknown (for a negative control), and read a
+/// process's working directory as a dead vnode (a scratch folder standing in for a volume
+/// force-unmounted under it).
+#[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
 mod hook {
-    use std::cell::{Cell, RefCell};
+    use std::cell::Cell;
+    #[cfg(test)]
+    use std::cell::RefCell;
 
     use super::Failed;
 
+    #[cfg(test)]
     type Hook = Box<dyn FnOnce(i32, &[(i32, u32)])>;
 
     thread_local! {
+        #[cfg(test)]
         static AFTER_LISTING: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static DEAD_AS_UNKNOWN: Cell<bool> = const { Cell::new(false) };
+        #[cfg(test)]
+        static CWD_DEAD: Cell<Option<i32>> = const { Cell::new(None) };
+    }
+
+    /// Run `f` with this thread's reads of `pid`'s working directory answering `ENOENT`, as
+    /// a reclaimed vnode's do once its volume is force-unmounted, without mounting one:
+    /// reading inside a mounted disk image can raise macOS's removable-volume dialog.
+    #[cfg(test)]
+    pub fn reading_cwd_dead<R>(pid: i32, f: impl FnOnce() -> R) -> R {
+        CWD_DEAD.with(|d| d.set(Some(pid)));
+        let out = f();
+        CWD_DEAD.with(|d| d.set(None));
+        out
+    }
+
+    /// Whether this thread reads `pid`'s working directory as a dead vnode.
+    #[cfg(test)]
+    pub(super) fn cwd_dead(pid: i32) -> bool {
+        CWD_DEAD.with(Cell::get) == Some(pid)
     }
 
     /// Run `f` with this thread's dead-vnode `ENOENT`s read as unknown failures.
@@ -597,10 +624,12 @@ mod hook {
 
     /// Run `f` once, after the next listing this thread makes, with the pid
     /// listed and its `(fd, type)` pairs.
+    #[cfg(test)]
     pub fn after_next_listing(f: impl FnOnce(i32, &[(i32, u32)]) + 'static) {
         AFTER_LISTING.with(|h| *h.borrow_mut() = Some(Box::new(f)));
     }
 
+    #[cfg(test)]
     pub(super) fn after_listing(pid: i32, fds: &[(i32, u32)]) {
         if let Some(f) = AFTER_LISTING.with(|h| h.borrow_mut().take()) {
             f(pid, fds);

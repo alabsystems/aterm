@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-tty"
+# Integration tests are declared below, not discovered: every file is a module
+# of the one `aterm_tty_suite` binary. With autotests off a `tests/*.rs` file
+# listed nowhere never compiles.
+autotests = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Terminal I/O for a program that draws on its controlling terminal, with no editor knowledge: the input byte decoder, raw mode, signals, the capability probe, the diffing screen writer and the Windows console arm. amacs's terminal face is its first user."
+
+[dependencies]
+# The key, mouse and paste vocabulary the decoder produces, as aterm's own
+# encoders spell it.
+aterm-types = { workspace = true }
+# Cell widths for the screen writer.
+aterm-grapheme = { workspace = true }
+# termios, the window-size ioctl and the signal mask.
+libc = { workspace = true }
+
+[dev-dependencies]
+# aterm's own engine as the oracle: the paste framing and probe replies the
+# decoder reads back, and the screen the writer's output draws.
+aterm-core = { workspace = true }
+# A real terminal for the raw-mode tests.
+aterm-pty = { workspace = true }
+# The one-minute hang detector the raw-mode tests wait with.
+aterm-spec = { workspace = true }
+# The child process the panic, SIGTERM and suspend tests run.
+aterm-uds = { workspace = true }
+
+[[test]]
+name = "aterm_tty_suite"
+path = "tests/aterm_tty_suite.rs"
+
+[lints]
+workspace = true

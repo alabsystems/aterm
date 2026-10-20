@@ -743,6 +743,170 @@ pub fn escape(pattern: &str) -> String {
     out
 }
 
+impl StepLimitExceeded {
+    /// Return the step budget (in work units) that was exceeded.
+    #[must_use]
+    pub const fn limit(self) -> u64 {
+        self.limit
+    }
+
+    /// Return `true` iff `used <= self.limit`.
+    #[must_use]
+    pub const fn within_budget(self, used: u64) -> bool {
+        used <= self.limit
+    }
+
+    /// Remaining step budget after spending `used` units, saturating at `0`.
+    #[must_use]
+    pub const fn remaining_budget(self, used: u64) -> u64 {
+        self.limit.saturating_sub(used)
+    }
+}
+
+/// Return the default compiled program size ceiling (`10 MiB`).
+#[must_use]
+pub const fn default_size_limit() -> usize {
+    DEFAULT_SIZE_LIMIT
+}
+
+/// Return the default per-search step budget (`2^26` work units).
+#[must_use]
+pub const fn default_step_limit() -> u64 {
+    DEFAULT_STEP_LIMIT
+}
+
+/// Clamp a requested program `size_limit` into `[min_bytes, DEFAULT_SIZE_LIMIT]`.
+#[must_use]
+pub const fn clamp_size_limit(bytes: usize, min_bytes: usize) -> usize {
+    let hi = if bytes > DEFAULT_SIZE_LIMIT {
+        DEFAULT_SIZE_LIMIT
+    } else {
+        bytes
+    };
+    if hi < min_bytes && min_bytes <= DEFAULT_SIZE_LIMIT {
+        min_bytes
+    } else {
+        hi
+    }
+}
+
+/// Clamp a requested search `step_limit` into `[min_steps, DEFAULT_STEP_LIMIT]`.
+#[must_use]
+pub const fn clamp_step_limit(steps: u64, min_steps: u64) -> u64 {
+    let hi = if steps > DEFAULT_STEP_LIMIT {
+        DEFAULT_STEP_LIMIT
+    } else {
+        steps
+    };
+    if hi < min_steps && min_steps <= DEFAULT_STEP_LIMIT {
+        min_steps
+    } else {
+        hi
+    }
+}
+
+/// Debit `cost` work units from `remaining`, returning `Some(next_remaining)`
+/// when `cost <= remaining` or `None` when the step budget is exhausted.
+#[must_use]
+pub const fn debit_step_budget(remaining: u64, cost: u64) -> Option<u64> {
+    remaining.checked_sub(cost)
+}
+
+/// Return `true` iff `[start, end)` is a well-ordered span within `haystack_len`.
+#[must_use]
+pub const fn valid_match_span(start: usize, end: usize, haystack_len: usize) -> bool {
+    start <= end && end <= haystack_len
+}
+
+/// Length of a validated match span `[start, end)`, or `0` if inverted.
+#[must_use]
+pub const fn match_span_len(start: usize, end: usize) -> usize {
+    end.saturating_sub(start)
+}
+
+/// Return `true` iff two match spans `[a_start, a_end)` and `[b_start, b_end)`
+/// are non-overlapping and ordered (`a_start <= a_end <= b_start <= b_end`).
+#[must_use]
+pub const fn disjoint_ordered_spans(
+    a_start: usize,
+    a_end: usize,
+    b_start: usize,
+    b_end: usize,
+) -> bool {
+    a_start <= a_end && a_end <= b_start && b_start <= b_end
+}
+
+/// Return `true` iff ASCII byte `b` is a regex syntax metacharacter escaped by [`escape`].
+#[must_use]
+pub const fn is_ascii_meta_byte(b: u8) -> bool {
+    matches!(
+        b,
+        b'\\'
+            | b'.'
+            | b'+'
+            | b'*'
+            | b'?'
+            | b'('
+            | b')'
+            | b'|'
+            | b'['
+            | b']'
+            | b'{'
+            | b'}'
+            | b'^'
+            | b'$'
+            | b'#'
+            | b'&'
+            | b'-'
+            | b'~'
+    )
+}
+
+/// Encode a `(start, end)` byte-offset match span into 16 little-endian bytes.
+#[must_use]
+pub const fn encode_match_span_le(start: u64, end: u64) -> [u8; 16] {
+    [
+        (start & 0xFF) as u8,
+        ((start >> 8) & 0xFF) as u8,
+        ((start >> 16) & 0xFF) as u8,
+        ((start >> 24) & 0xFF) as u8,
+        ((start >> 32) & 0xFF) as u8,
+        ((start >> 40) & 0xFF) as u8,
+        ((start >> 48) & 0xFF) as u8,
+        ((start >> 56) & 0xFF) as u8,
+        (end & 0xFF) as u8,
+        ((end >> 8) & 0xFF) as u8,
+        ((end >> 16) & 0xFF) as u8,
+        ((end >> 24) & 0xFF) as u8,
+        ((end >> 32) & 0xFF) as u8,
+        ((end >> 40) & 0xFF) as u8,
+        ((end >> 48) & 0xFF) as u8,
+        ((end >> 56) & 0xFF) as u8,
+    ]
+}
+
+/// Decode 16 little-endian bytes into a `(start, end)` byte-offset match span.
+#[must_use]
+pub const fn decode_match_span_le(bytes: [u8; 16]) -> (u64, u64) {
+    let start = (bytes[0] as u64)
+        | ((bytes[1] as u64) << 8)
+        | ((bytes[2] as u64) << 16)
+        | ((bytes[3] as u64) << 24)
+        | ((bytes[4] as u64) << 32)
+        | ((bytes[5] as u64) << 40)
+        | ((bytes[6] as u64) << 48)
+        | ((bytes[7] as u64) << 56);
+    let end = (bytes[8] as u64)
+        | ((bytes[9] as u64) << 8)
+        | ((bytes[10] as u64) << 16)
+        | ((bytes[11] as u64) << 24)
+        | ((bytes[12] as u64) << 32)
+        | ((bytes[13] as u64) << 40)
+        | ((bytes[14] as u64) << 48)
+        | ((bytes[15] as u64) << 56);
+    (start, end)
+}
+
 #[cfg(test)]
 mod step_budget_tests {
     use super::*;
@@ -1241,5 +1405,32 @@ mod step_budget_tests {
         assert_eq!(it.next().map(|m| m.range()), Some(2..8));
         assert_eq!(it.next(), None);
         assert!(!it.step_limit_exceeded());
+    }
+
+    #[test]
+    fn step_budget_and_span_const_helpers_invariants() {
+        let err = StepLimitExceeded::new(100);
+        assert_eq!(err.limit(), 100);
+        assert!(err.within_budget(100));
+        assert!(!err.within_budget(101));
+        assert_eq!(err.remaining_budget(40), 60);
+        assert_eq!(err.remaining_budget(200), 0);
+        assert_eq!(default_size_limit(), 10 * (1 << 20));
+        assert_eq!(default_step_limit(), 1 << 26);
+        assert_eq!(clamp_size_limit(100, 1024), 1024);
+        assert_eq!(clamp_size_limit(usize::MAX, 1024), default_size_limit());
+        assert_eq!(clamp_step_limit(10, 1000), 1000);
+        assert_eq!(clamp_step_limit(u64::MAX, 1000), default_step_limit());
+        assert_eq!(debit_step_budget(50, 20), Some(30));
+        assert_eq!(debit_step_budget(50, 60), None);
+        assert!(valid_match_span(2, 8, 10));
+        assert!(!valid_match_span(8, 2, 10));
+        assert_eq!(match_span_len(2, 8), 6);
+        assert!(disjoint_ordered_spans(0, 3, 3, 7));
+        assert!(!disjoint_ordered_spans(0, 4, 3, 7));
+        assert!(is_ascii_meta_byte(b'*'));
+        assert!(!is_ascii_meta_byte(b'a'));
+        let sp = encode_match_span_le(123, 456);
+        assert_eq!(decode_match_span_le(sp), (123, 456));
     }
 }

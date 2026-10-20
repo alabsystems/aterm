@@ -67,12 +67,6 @@ pub const SAMPLE_GAP: Duration = Duration::from_micros(100);
 pub struct Timeline(Vec<(u64, u64)>);
 
 impl Timeline {
-    /// A timeline from its entries. Pure (for tests and the sampler).
-    #[must_use]
-    pub fn from_entries(entries: Vec<(u64, u64)>) -> Self {
-        Self(entries)
-    }
-
     /// When the record at offset `seq` was first seen durable: the first entry
     /// whose head is past it. `None` when the sampler never saw it land (it
     /// stopped first) — or when it had already landed before the sampler
@@ -123,12 +117,12 @@ impl Drop for StopOnDrop<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn a_record_lands_at_the_first_head_seen_past_it() {
+        use super::*;
+
         // Head 10 at the start; 12 by t=150; 13 by t=400.
-        let t = Timeline::from_entries(vec![(0, 10), (150, 12), (400, 13)]);
+        let t = Timeline(vec![(0, 10), (150, 12), (400, 13)]);
         assert_eq!(t.landed(10), Some(150), "offset 10 is the 11th record");
         assert_eq!(t.landed(11), Some(150));
         assert_eq!(t.landed(12), Some(400));
@@ -139,6 +133,8 @@ mod tests {
 
     #[test]
     fn the_sampler_keeps_changes_only_and_stops_on_its_flag() {
+        use super::*;
+
         use std::sync::atomic::AtomicU64;
         let head = AtomicU64::new(5);
         let stop = AtomicBool::new(false);

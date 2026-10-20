@@ -2,8 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! THE PROGRAM'S OWN STATE (OSC 7501, the native harness contract §6): what a
-//! `codex` in front says about itself, shown as `status program_state=` and in
-//! the presence row, and NOTHING ELSE.
+//! `codex` in front says about itself, shown as `status program_state=`, in
+//! the needs border's hover (`presence::state_line`), as one `program-state` row on the session's timeline per
+//! move the gate shows (`SessionTimeline::note_program_state`: `timeline` is
+//! then the program's turn ledger), and as the edge an `fx celebrate on=done`
+//! arm waits for (`App::note_program_done`), and NOTHING ELSE.
 //!
 //! The engine keeps each session's last report with a sequence
 //! (`aterm_core::terminal::program_state`). This gate, run by the status sweep
@@ -21,8 +24,8 @@
 //!
 //! It is a claim for display. It never reaches `agent=`, `agent_since_ms=`,
 //! `phase_authoritative`, the zone hash an act reads, nor any `await`: nothing
-//! here is read by a decision, and the verdict those carry stays the screen
-//! reader's. A report the sweep did not see (one superseded between two
+//! here is read by a decision (the timeline row and the celebration are
+//! display too), and the verdict those carry stays the screen reader's. A report the sweep did not see (one superseded between two
 //! sweeps) is simply not shown; the next one is.
 
 use std::time::Instant;
@@ -40,13 +43,16 @@ pub(crate) struct ProgramStateGate {
     /// The report shown, and since when.
     shown: Option<(ProgramState, Instant)>,
     /// How many shown `working` reports were followed by a shown `done` or
-    /// `idle`: the program's own turn ends, which the presence band tells as
-    /// a story point (`Facts::program_turn_ends`). Display only.
+    /// `idle`: the program's own turn ends, which presence tells as a story
+    /// point and, where nobody watched, as the tab's `•`
+    /// (`Facts::program_turn_ends`). Display only.
     turn_ends: u64,
     /// How many shown `working` reports began a turn ([`starts_a_turn`]):
     /// what pairs one turn's end with the ledger settle of the same turn, so
-    /// the presence band tells it once (`Facts::program_turn_starts`).
+    /// presence tells it once (`Facts::program_turn_starts`).
     turn_starts: u64,
+    /// When the gate counted the latest of those starts.
+    turn_started: Option<Instant>,
 }
 
 impl ProgramStateGate {
@@ -73,14 +79,33 @@ impl ProgramStateGate {
         if self.shown.map(|(state, _)| state) == next && (!group_moved || next.is_none()) {
             return false;
         }
-        if ends_a_turn(self.shown.map(|(state, _)| state), next) {
+        // A foreground move: what was shown was the group's that left, so the next
+        // report is judged from no report. A program already in a turn when the
+        // sweep first sees it begins one (its end then pairs with its own start,
+        // never with a ledger settle read at the count of the program that left),
+        // and nothing the program that left was doing ends one.
+        let before = if group_moved {
+            None
+        } else {
+            self.shown.map(|(state, _)| state)
+        };
+        if ends_a_turn(before, next) {
             self.turn_ends += 1;
         }
-        if starts_a_turn(self.shown.map(|(state, _)| state), next) {
+        if starts_a_turn(before, next) {
             self.turn_starts += 1;
+            self.turn_started = Some(now);
         }
         self.shown = next.map(|state| (state, now));
         true
+    }
+
+    /// When the latest turn the gate counted began ([`Self::turn_starts`]), on
+    /// the sweep's clock: what pairs a ledger settle with the program's turn only
+    /// when that turn began after the ledger turn opened
+    /// (`Facts::program_turn_began`).
+    pub(crate) fn turn_started(&self) -> Option<Instant> {
+        self.turn_started
     }
 
     /// How many turn ends this session's program has reported
@@ -156,8 +181,8 @@ pub(crate) fn wire(shown: Option<(ProgramState, Instant)>) -> String {
     shown.map_or_else(|| "-".to_string(), |(state, _)| state.wire())
 }
 
-/// The presence row's word for a shown report, when the screen's reader names
-/// no phase: `codex working`, `codex blocked`.
+/// The hover's word for a shown report (`presence::state_line`), when the
+/// screen's reader names no phase: `codex working`, `codex blocked`.
 pub(crate) fn row_word(state: ProgramState) -> &'static str {
     use aterm_core::terminal::program_state::ProgramStateWord as W;
     match state.state {
@@ -249,6 +274,44 @@ mod tests {
         assert!(!gate.observe(term.program_state(), true, false, next_start));
     }
 
+    /// A foreground move judges the next report from no report: codex A exits
+    /// mid-turn and codex B is already working when the sweep sees the move,
+    /// and B's turn begins (its end pairs with its own start); B's first report
+    /// a `done` after A was working ends nothing. NEGATIVE CONTROLS: the same
+    /// `working` → `working` with no move begins nothing, and `working` →
+    /// `done` with no move ends a turn.
+    #[test]
+    fn a_group_move_judges_the_next_report_from_none() {
+        let mut term = Terminal::new(24, 80);
+        let t0 = Instant::now();
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        let done = b"\x1b]7501;state=done:app=codex\x1b\\";
+        let mut gate = ProgramStateGate::default();
+        term.process(WORKING);
+        gate.observe(term.program_state(), true, false, t0);
+        assert_eq!((gate.turn_starts(), gate.turn_started()), (1, Some(t0)));
+        term.process(WORKING);
+        assert!(gate.observe(term.program_state(), true, true, t1));
+        assert_eq!(
+            gate.turn_starts(),
+            2,
+            "B was working when the move was seen"
+        );
+        assert_eq!(gate.turn_started(), Some(t1), "B's own start");
+        term.process(WORKING);
+        gate.observe(term.program_state(), true, false, t1);
+        assert_eq!(gate.turn_starts(), 2, "control: no move, the same turn");
+        term.process(done);
+        assert!(gate.observe(term.program_state(), true, true, t1));
+        assert_eq!(gate.turn_ends(), 0, "A's turn did not end in B's report");
+        let mut still = ProgramStateGate::default();
+        term.process(WORKING);
+        still.observe(term.program_state(), true, false, t0);
+        term.process(done);
+        still.observe(term.program_state(), true, false, t0);
+        assert_eq!(still.turn_ends(), 1, "control: no move, a turn end");
+    }
+
     /// A turn end is `working` then `done`|`idle` as the gate showed them:
     /// not a `done` with no `working` before it, not `working` → `blocked`,
     /// and not a report the gate does not honour.
@@ -301,6 +364,118 @@ mod tests {
         assert_eq!(other.turn_starts(), 0);
     }
 
+    /// THE TURN LEDGER AND THE `done` EDGE THROUGH THE REAL SWEEP
+    /// (`App::observe_session_statuses`), a real engine fed the bytes codex
+    /// writes under a published `codex`: each honoured move is one
+    /// display-only `program-state` row, in order, and the first `done`
+    /// fires an `fx celebrate on=done` arm bound to the session, once (a
+    /// later `done` finds it spent). A `clear` is the row `state=-`.
+    /// NEGATIVE CONTROL: the same bytes under `claude` write no row and leave
+    /// the arm waiting.
+    #[test]
+    fn each_honoured_move_is_a_program_state_row_and_done_fires_an_on_done_arm() {
+        use crate::session_timeline::PROGRAM_STATE;
+        use aterm_effects::kitty_sing::{CelebrateOn, song_signature};
+        const DONE: &[u8] = b"\x1b]7501;state=done:app=codex\x1b\\";
+        for codex in [true, false] {
+            let mut app = crate::App::headless_for_test();
+            app.config = aterm_toml::from_str(
+                "cursor_trail = true\ncursor_trail_style = \"rainbow kitty pet\"",
+            )
+            .expect("valid toml");
+            let sid = app.next_session_id;
+            app.push_stub_tab(crate::WindowId(0), crate::stub_session(sid));
+            let (term, timeline) = {
+                let pooled = app.pool.get(sid).expect("pooled");
+                (
+                    std::sync::Arc::clone(&pooled.term),
+                    std::sync::Arc::clone(&pooled.ctx.timeline),
+                )
+            };
+            {
+                let mut tl = timeline.lock().unwrap();
+                tl.note_foreground_group(4242);
+                tl.set_program(4242, Some(if codex { "codex" } else { "claude" }.into()));
+            }
+            let armed = app
+                .fx_control(crate::FxCtlOp::Celebrate {
+                    sig: song_signature('C'),
+                    bars: 1,
+                    on: CelebrateOn::Done,
+                })
+                .expect("admitted");
+            assert!(armed.starts_with("armed=done "), "{armed}");
+            // One arm at a time, whatever its edge.
+            assert!(
+                app.fx_control(crate::FxCtlOp::Celebrate {
+                    sig: song_signature('C'),
+                    bars: 1,
+                    on: CelebrateOn::Done,
+                })
+                .is_err(),
+                "a second arm is refused"
+            );
+            // Past every observation interval, so each sweep looks.
+            let step = std::time::Duration::from_secs(1);
+            let mut t = std::time::Instant::now();
+            // `fx status` after each sweep: which sweep spent the arm.
+            let mut after: Vec<String> = Vec::new();
+            for bytes in [
+                WORKING,
+                BLOCKED_PERMISSION,
+                WORKING,
+                DONE,
+                WORKING,
+                DONE,
+                CLEAR,
+            ] {
+                crate::term_lock(&term).process(bytes);
+                let _ = app.observe_session_statuses(t);
+                t += step;
+                after.push(app.fx_control(crate::FxCtlOp::Status).expect("reads"));
+            }
+            let waiting = |s: &String| s.starts_with("armed=done ") && s.contains(" live=false ");
+            let fired = |s: &String| s.starts_with("armed=none ") && s.contains(" live=true ");
+            let rows: Vec<String> = timeline
+                .lock()
+                .unwrap()
+                .since(None)
+                .filter(|e| e.kind == PROGRAM_STATE)
+                .map(|e| e.payload.clone())
+                .collect();
+            let status = app.fx_control(crate::FxCtlOp::Status).expect("reads");
+            if codex {
+                assert_eq!(
+                    rows,
+                    [
+                        "state=working kind=-",
+                        "state=blocked kind=permission",
+                        "state=working kind=-",
+                        "state=done kind=-",
+                        "state=working kind=-",
+                        "state=done kind=-",
+                        "state=- kind=-",
+                    ],
+                );
+                assert!(
+                    status.starts_with("armed=none ") && status.contains(" live=true "),
+                    "the first done fired the arm: {status}"
+                );
+                // The arm waits through the three sweeps before the first
+                // `done`, is spent by that sweep, and stays spent after it.
+                assert!(after[..3].iter().all(waiting), "{after:#?}");
+                assert!(after[3..].iter().all(fired), "{after:#?}");
+            } else {
+                assert!(after.iter().all(waiting), "control: {after:#?}");
+                assert!(rows.is_empty(), "control: no row under claude: {rows:?}");
+                assert!(
+                    status.starts_with("armed=done ") && status.contains(" live=false "),
+                    "control: the arm still waits: {status}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_full_reset_clears_it() {
         let mut term = Terminal::new(24, 80);
@@ -339,9 +514,9 @@ mod tests {
         assert_eq!(row_word(blocked), "codex blocked");
     }
 
-    /// THE REAL `status` RECORD AND PRESENCE ROW of a real session, its real
+    /// THE REAL `status` RECORD AND PRESENCE FACTS of a real session, its real
     /// engine fed the bytes codex writes, folded as the sweep folds them: a
-    /// shown report is `program_state=` and the row's word, beside an
+    /// shown report is `program_state=` and the hover's word, beside an
     /// `agent=` it never moves; the group moving clears both. NEGATIVE
     /// CONTROL: the same bytes under a program that is not `codex` show `-`.
     #[test]
@@ -403,7 +578,7 @@ mod tests {
                 .timeline
                 .lock()
                 .unwrap()
-                .note_harness_act("continue", "codex-alab@1");
+                .note_harness_act("continue", "codex-alab@1", aterm_slog::Actor::Ctl);
             let record = app.session_status_record(session).expect("a record");
             assert_eq!(field(&record, "last_act").as_deref(), Some("continue"));
             // The group moves (the program exits): nothing shows.

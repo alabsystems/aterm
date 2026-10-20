@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! The agent's root-owned state (design §3.3, §4.4): the serial floor per signing
-//! principal, the run lock, and the newest finished run. Each file is 0644 so `hello`,
-//! running as the admin, can report them; only root writes them.
+//! principal, the run lock, the newest finished run, and the newest request refused `busy`.
+//! Each file is 0644 so `hello`, running as the admin, can report them; only root writes them.
 
 use super::Layout;
 use crate::model::Read;
@@ -381,6 +381,21 @@ pub fn last_run(sys: &dyn System, layout: &Layout) -> Option<String> {
 /// Record `run` as the newest finished run.
 pub fn set_last_run(sys: &dyn System, layout: &Layout, run: &str) {
     let _ = sys.write_file(&layout.last_run(), format!("{run}\n").as_bytes(), 0o644);
+}
+
+/// The newest signed request refused `busy` (by the id its run would have had).
+#[must_use]
+pub fn last_busy(sys: &dyn System, layout: &Layout) -> Option<String> {
+    let bytes = sys.read_file(&layout.last_busy()).ok()?;
+    let run = String::from_utf8_lossy(&bytes).trim().to_owned();
+    super::is_run_id(&run).then_some(run)
+}
+
+/// Record `run` as the newest signed request refused `busy`: the requests of a `screen` walk
+/// are refused for as long as another command's run holds the host, and the screen watch
+/// counts each one as the walk still there (`super::watch`).
+pub fn set_last_busy(sys: &dyn System, layout: &Layout, run: &str) {
+    let _ = sys.write_file(&layout.last_busy(), format!("{run}\n").as_bytes(), 0o644);
 }
 
 /// `managed.toml`: what enrollment recorded, and what the agent has managed since.

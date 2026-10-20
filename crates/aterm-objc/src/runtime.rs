@@ -422,6 +422,16 @@ unsafe extern "C" {
         is_required_method: crate::encode::Bool,
         is_instance_method: crate::encode::Bool,
     ) -> ObjcMethodDescription;
+
+    // --- the same row's EXTENDED encoding: the class name of each object
+    // and the signature of each block (`@?<v@?@"NSError">`), which the plain
+    // description drops. libobjc exports it for NSXPCInterface and Swift. ---
+    fn _protocol_getMethodTypeEncoding(
+        proto: ProtocolPtr,
+        sel: Sel,
+        is_required_method: crate::encode::Bool,
+        is_instance_method: crate::encode::Bool,
+    ) -> *const c_char;
 }
 
 // `class_copyMethodList` and `class_copyProtocolList` return a malloc'd array
@@ -789,6 +799,45 @@ pub unsafe fn protocol_method_types(
             .to_string_lossy()
             .into_owned(),
     )
+}
+
+/// The EXTENDED type encoding a protocol declares for `name`, or `None` if it
+/// does not: [`protocol_method_types`]' row with each object's class and each
+/// block's signature, which is the one place the runtime records a block's
+/// prototype. `UNUserNotificationCenterDelegate`'s
+/// `-userNotificationCenter:willPresentNotification:withCompletionHandler:`
+/// is `v40@0:8@"UNUserNotificationCenter"16@"UNNotification"24@?<v@?Q>32`;
+/// [`crate::send::block_signatures`] reads the `v@?Q` out.
+///
+/// Searches the required table, then the optional one.
+///
+/// # Safety
+/// `proto` must be a live protocol object or nil (answers `None`).
+#[must_use]
+pub unsafe fn protocol_method_extended_types(
+    proto: ProtocolPtr,
+    name: Sel,
+    instance_method: bool,
+) -> Option<String> {
+    if proto.is_null() {
+        return None;
+    }
+    let is_instance = crate::encode::Bool::new(instance_method);
+    [crate::encode::Bool::YES, crate::encode::Bool::NO]
+        .into_iter()
+        .find_map(|required| {
+            // SAFETY: `proto` is live; `name` is interned. An undeclared
+            // selector answers NULL.
+            let types =
+                unsafe { _protocol_getMethodTypeEncoding(proto, name, required, is_instance) };
+            // SAFETY: a non-null, runtime-owned, NUL-terminated string,
+            // immortal for the life of the protocol object.
+            (!types.is_null()).then(|| {
+                unsafe { CStr::from_ptr(types) }
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        })
 }
 
 /// Resolve a selector from a checked C-string literal, e.g. `sel(c"length")`.

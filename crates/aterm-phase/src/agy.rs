@@ -49,6 +49,47 @@
 //! shortcuts` is the end ([`phase`]). `/` opens the command menu UNDER the
 //! bottom rule, its key row over the footer's `esc to cancel`.
 //!
+//! **BACKGROUND WORK** (measured in the lab on 1.4.0, 2026-10-17,
+//! [`fixtures::lab::BG_TASK`] and its siblings): a `run_command` past its
+//! `WaitMsBeforeAsync` (a daemon one too), a `schedule` timer and an
+//! `invoke_subagent` subagent go on after the turn that started them ended,
+//! and while they do agy draws a PANEL between the composer's bottom rule
+//! and the footer — one row an item, `● ` two columns in: `  ● [17:50:42]
+//! sleep 150; echo LAB-BG-DONE running` for a task or a timer, `  ● Agent(
+//! research: Lab Waiter)  Working · 1s` for a subagent — then a second full
+//! rule, then the footer, whose right side counts them (`· 1 task(s) ·
+//! /tasks`, `· 1 subagent(s)`). The panel and the count go when the work
+//! ends, and agy then takes a turn of its own on its result (each task's
+//! end, timer's firing and subagent's going idle started a model turn with
+//! nobody typing). The screen does not move while the work runs (one
+//! distinct screen over 130 samples). The composer, a draft in it, the
+//! spinner over it and the footer read over the panel as without it: busy
+//! on the spinner (a turn sent while a task runs, [`fixtures::lab::BG_BUSY`]),
+//! a draft the draft ([`fixtures::lab::BG_DRAFT`]). An ended turn under the
+//! panel is the agent's own background work ([`background_wait`]): busy as
+//! evidence, so nothing is typed into a session agy itself will wake. Every
+//! item agy draws there ends and wakes agy, so each is read as Claude Code's
+//! reader reads a shell, a workflow or a background agent it left running
+//! (`phase::worker_phase`'s HARD rule): busy over a question the turn ended
+//! on too, which agy's own turn on the work's result may answer. A limit and
+//! a wall the turn ended on stand over it (limited, idle on its wall), so
+//! the wait for a reset, the retry ladder and the sign-in's escalation run
+//! as without the panel. Before the
+//! panel was read, every screen with it read as no composer: idle NOT as
+//! evidence, a draft unseen, a running turn idle. A screen agy LEFT keeps
+//! its last frame's panel rows above its resume line
+//! ([`fixtures::lab::BG_EXITED`]) and reads nothing. agy's setting `Show
+//! active subagents and background tasks below the input box` turned off
+//! (`"hideActiveItems": true` in its `settings.json`, measured 2026-10-18)
+//! draws no panel, and the footer still counts the work (`· 1 task(s) ·
+//! /tasks`, `· 1 subagent(s)`; [`fixtures::lab::BG_PANEL_OFF_TASK`] and its
+//! siblings): the count alone is read. A subagent's row reads `Processing...`
+//! for a moment as it starts, under the spinner of the turn that spawned it,
+//! before `Working` (measured): [`background_wait`] names only the states it
+//! knows, while [`background_shown`] — what the live upgrade's quiet restart
+//! waits on — reads every row of the panel as work, whatever its words.
+//! UNMEASURED: more than two items.
+//!
 //! **AN EXIT PENDING** (`press ctrl+c again to exit`, `press ctrl+d again to
 //! exit`) leaves agy one key from gone: that key again ends it, its resume
 //! line printed under its last frame. Measured in the lab on 1.4.0
@@ -171,6 +212,7 @@ use crate::phase::{Phase, leading_spaces, plain_rule_width};
 use crate::prompt::{Cancel, CancelEffect, Opt, PromptKind, PromptV2, Role, Select};
 use crate::survey::{SurveyBlock, SurveyKind};
 use crate::text::blank;
+use crate::turn::{CardPlace, LaunchCard};
 use crate::wall::{ApiCause, Placement, Wall, WallKind};
 
 /// The spinner's frames: braille patterns (`⣾`, `⣷`, `⡿`, … measured), the
@@ -316,15 +358,51 @@ struct Frame {
     footer: Option<usize>,
     /// The `/` command menu is open under the bottom rule.
     menu: bool,
+    /// The background-work panel's first and last rows, between the bottom
+    /// rule and the rule that closes it ([`panel_under`]).
+    panel: Option<(usize, usize)>,
+}
+
+/// A row of the background-work panel (module header): one item, `● ` two
+/// columns in — `  ● [17:50:42] sleep 150 running`, `  ● Agent(research:
+/// Lab Waiter)  Working · 1s` (measured: one row an item, never wrapped).
+fn is_panel_row(row: &str) -> bool {
+    leading_spaces(row) == 2 && crate::text::trim_start(row).starts_with("● ")
+}
+
+/// The background-work panel under the bottom rule `bottom` (module header):
+/// one row of it or more ([`is_panel_row`]) right under the rule, closed by
+/// a plain rule of the frame's `width`, and under that the footer as the
+/// last row drawn (`last`) — or nothing, where nothing is drawn under the
+/// closing rule. `(its first row, its last row, the footer)`; `None` for any
+/// other shape.
+fn panel_under(
+    rows: &[String],
+    bottom: usize,
+    width: usize,
+    last: usize,
+) -> Option<(usize, usize, Option<usize>)> {
+    let first = bottom + 1;
+    let close = (first..=last).find(|&i| !is_panel_row(&rows[i]))?;
+    if close == first || plain_rule_width(&rows[close]) != Some(width) {
+        return None;
+    }
+    let footer = match last - close {
+        0 => None,
+        1 => Some(last),
+        _ => return None,
+    };
+    Some((first, close - 1, footer))
 }
 
 /// The composer ([`Frame`]): the last caret row in column 0 between two
 /// plain rules of one width (the transcript's separators are 60 columns, the
 /// composer's the pane's), the rows between them its draft — a blank line of
 /// it a blank row — and under it the footer as the last row drawn — or the
-/// command menu, its key row and then the footer. A screen agy left keeps
-/// its last frame with its resume line and the shell's prompt under it, and
-/// has none.
+/// background-work panel, the rule closing it and then the footer
+/// ([`panel_under`]), or the command menu, its key row and then the footer.
+/// A screen agy left keeps its last frame with its resume line and the
+/// shell's prompt under it, and has none.
 fn frame(rows: &[String]) -> Option<Frame> {
     (1..rows.len())
         .rev()
@@ -344,10 +422,12 @@ fn frame_at(rows: &[String], caret: usize) -> Option<Frame> {
         return None;
     }
     let last = rows.iter().rposition(|r| !blank(r))?;
-    let (footer, menu) = if last == bottom {
-        (None, false)
+    let (footer, menu, panel) = if last == bottom {
+        (None, false, None)
     } else if last == bottom + 1 {
-        (Some(last), false)
+        (Some(last), false, None)
+    } else if let Some((first, end, footer)) = panel_under(rows, bottom, width, last) {
+        (footer, false, Some((first, end)))
     } else {
         let between = &rows[bottom + 1..last];
         let menu = between.iter().any(|r| is_menu_row(r))
@@ -357,7 +437,7 @@ fn frame_at(rows: &[String], caret: usize) -> Option<Frame> {
         if !menu {
             return None;
         }
-        (Some(last), true)
+        (Some(last), true, None)
     };
     Some(Frame {
         top,
@@ -365,7 +445,125 @@ fn frame_at(rows: &[String], caret: usize) -> Option<Frame> {
         bottom,
         footer,
         menu,
+        panel,
     })
+}
+
+/// What [`background_wait`] names: a command task or a timer
+/// (`● [17:50:42] <what> running`, `· 1 task(s)`), and a subagent
+/// (`● Agent(research: …)  Working · 1s`, `· 1 subagent(s)`).
+const TASK_RUNNING: &str = "a background task running";
+const SUBAGENT_WORKING: &str = "a subagent working";
+
+/// The work one panel row says runs (module header): a task's or a
+/// timer's `● [hh:mm:ss] <what> running`, a subagent's `● Agent(<kind>:
+/// <name>)  Working · <time>`. `None` for any other row.
+fn panel_work(row: &str) -> Option<&'static str> {
+    let item = crate::text::trim(row).strip_prefix("● ")?;
+    if let Some((stamp, what)) = item
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once("] "))
+    {
+        let clock = stamp.len() == 8
+            && stamp.bytes().enumerate().all(|(i, b)| {
+                if i % 3 == 2 {
+                    b == b':'
+                } else {
+                    b.is_ascii_digit()
+                }
+            });
+        return (clock
+            && what.ends_with(const { anchor_text("agy.panel.running") })
+            && what.len() > const { anchor_text("agy.panel.running") }.len())
+        .then_some(TASK_RUNNING);
+    }
+    let (_, state) = item
+        .strip_prefix(const { anchor_text("agy.panel.agent") })?
+        .rsplit_once(')')?;
+    crate::text::trim_start(state)
+        .starts_with(const { anchor_text("agy.panel.working") })
+        .then_some(SUBAGENT_WORKING)
+}
+
+/// The work the footer counts (module header): a segment `<n> task(s)` or
+/// `<n> subagent(s)` of its right side, `<n>` a count above zero.
+fn footer_work(row: &str) -> Option<&'static str> {
+    crate::text::trim(row).split(" · ").find_map(|segment| {
+        let segment = crate::text::trim(segment);
+        let counted = |noun: &str| {
+            segment.strip_suffix(noun).is_some_and(|n| {
+                !n.is_empty()
+                    && n.bytes().all(|b| b.is_ascii_digit())
+                    && n.bytes().any(|b| b != b'0')
+            })
+        };
+        if counted(const { anchor_text("agy.footer.tasks") }) {
+            Some(TASK_RUNNING)
+        } else if counted(const { anchor_text("agy.footer.subagents") }) {
+            Some(SUBAGENT_WORKING)
+        } else {
+            None
+        }
+    })
+}
+
+/// The work frame `f` says runs in the background: a panel row's
+/// ([`panel_work`]), else the footer's count ([`footer_work`]).
+fn work(rows: &[String], f: Frame) -> Option<&'static str> {
+    f.panel
+        .and_then(|(first, last)| rows[first..=last].iter().find_map(|r| panel_work(r)))
+        .or_else(|| f.footer.and_then(|r| footer_work(&rows[r])))
+}
+
+/// THE AGENT'S OWN BACKGROUND WORK RUNS AND ITS TURN IS OVER (module header):
+/// the composer drawn with no menu open, the turn over it ended — idle (on
+/// a wall too), a question or a limit, as evidence ([`framed_phase`]) — and
+/// the panel under it (or the footer's count) says a task, a
+/// timer or a subagent runs. `Some(what runs)`; `None` for a live turn (a
+/// spinner over the panel), a box, an exit pending, a screen agy left (its
+/// last frame's panel rows under its resume line), and where nothing runs.
+#[must_use]
+pub fn background_wait(rows: &[String]) -> Option<&'static str> {
+    let f = frame(rows)?;
+    if f.menu {
+        return None;
+    }
+    let what = work(rows, f)?;
+    matches!(
+        framed_phase(rows, f),
+        (Phase::Idle | Phase::Question | Phase::Limited { .. }, true)
+    )
+    .then_some(what)
+}
+
+/// What [`background_shown`] names for a panel row whose words this grammar
+/// has not measured (a subagent's `Processing...` among them).
+const BACKGROUND_ITEM: &str = "a background item";
+
+/// THE AGENT'S OWN BACKGROUND WORK THE SCREEN SHOWS, WHATEVER ITS TURN DOES:
+/// the composer's frame found, and under its bottom rule a panel row of ANY
+/// item — a task's or a timer's `● [hh:mm:ss] … running`, a subagent's `●
+/// Agent(…)` in any state (`Working`, and `Processing...` as it starts:
+/// measured), a row this grammar never measured — else the footer's `<n>
+/// task(s)` or `<n> subagent(s)` (all that shows with the panel turned off,
+/// `hideActiveItems`: measured). The live upgrade's quiet restart reads it
+/// beside the reader's own reading ([`phase`] reads work over an ended turn
+/// busy), so that this witness never rests on the reader's phase: a reader fix
+/// that read the frame idle over the panel would not remove it. `Some(what
+/// shows)`; `None` where no frame is found (a box, a screen agy left: no idle
+/// point either) and where nothing shows.
+#[must_use]
+pub fn background_shown(rows: &[String]) -> Option<&'static str> {
+    let f = frame(rows)?;
+    if let Some((first, last)) = f.panel {
+        return Some(
+            rows[first..=last]
+                .iter()
+                .find_map(|r| panel_work(r))
+                .unwrap_or(BACKGROUND_ITEM),
+        );
+    }
+    f.footer.and_then(|r| footer_work(&rows[r]))
 }
 
 /// The composer's caret row.
@@ -476,7 +674,12 @@ fn is_banner_row(row: &str) -> bool {
 /// an overlay this grammar has not measured), and with the command menu open
 /// nothing is evidence: the menu takes the footer's place. A screen with no
 /// composer, box or wall — the survey's among them — is `idle` NOT
-/// authoritatively.
+/// authoritatively. An ended turn that would read idle or a question, with
+/// no wall, while the agent's own background work runs ([`background_wait`]:
+/// a task, a timer, a subagent, each of which ends and wakes agy) is BUSY as
+/// evidence, as Claude Code's reader reads a shell, a workflow or a
+/// background agent it left running (`phase::worker_phase`'s hard rule); a
+/// limit and a wall the turn ended on stand over it.
 #[must_use]
 pub fn phase(rows: &[String]) -> (Phase, bool) {
     let Some(f) = frame(rows) else {
@@ -485,6 +688,19 @@ pub fn phase(rows: &[String]) -> (Phase, bool) {
         }
         return (Phase::Idle, signed_out(rows).is_some());
     };
+    let read = framed_phase(rows, f);
+    if matches!(read, (Phase::Idle | Phase::Question, true))
+        && work(rows, f).is_some()
+        && failed_turn(rows, f).is_none()
+    {
+        return (Phase::Busy, true);
+    }
+    read
+}
+
+/// [`phase`] of a screen with the composer's frame `f`, its background work
+/// aside.
+fn framed_phase(rows: &[String], f: Frame) -> (Phase, bool) {
     // A subagent waiting on a person holds the turn, however long its
     // spinner runs.
     if alert(rows, f.top).is_some() {
@@ -1127,6 +1343,7 @@ fn box_prompt(rows: &[String], b: AgyBox) -> PromptV2 {
                     role: Role::Other,
                     focused,
                     row: i,
+                    kept: false,
                 });
             }
         } else if let Some((n, label, focused)) = numbered(row) {
@@ -1136,6 +1353,7 @@ fn box_prompt(rows: &[String], b: AgyBox) -> PromptV2 {
                 role: Role::Other,
                 focused,
                 row: i,
+                kept: false,
             });
         } else if let Some(o) = options.last_mut().filter(|_| !blank(row)) {
             // A wrapped label's tail, at column 0 under it.
@@ -1333,6 +1551,7 @@ fn onboarding(rows: &[String]) -> Option<PromptV2> {
                 role: Role::Other,
                 focused,
                 row: i,
+                kept: false,
             });
         };
         match leading_spaces(left) {
@@ -1384,6 +1603,230 @@ fn onboarding(rows: &[String]) -> Option<PromptV2> {
         question_dialog: None,
         reason_rows: Vec::new(),
     })
+}
+
+/// Both composer rules, `(top, bottom)`, when agy's composer frame is on the
+/// screen.
+#[must_use]
+pub fn composer_rules(rows: &[String]) -> Option<(usize, usize)> {
+    frame(rows).map(|f| (f.top, f.bottom))
+}
+
+/// Where a running turn's spinner row can be: under this session's last user
+/// message above the composer's top rule, so a spinner glyph quoted in an
+/// earlier turn never holds a wait.
+#[must_use]
+pub fn busy_zone_start(rows: &[String]) -> usize {
+    frame(rows).map_or(0, |f| last_user(rows, f.top).map_or(0, |u| u + 1))
+}
+
+/// The banner text on the first row of agy's launch card.
+const AGY_BANNER: &str = "Antigravity CLI ";
+
+fn is_mascot_block(c: char) -> bool {
+    ('\u{2580}'..='\u{259F}').contains(&c)
+}
+
+fn mascot_prefix_end(prefix: &str) -> Option<usize> {
+    if !prefix.chars().all(|c| c == ' ' || is_mascot_block(c)) {
+        return None;
+    }
+    let trimmed = crate::text::trim_end(prefix);
+    trimmed
+        .chars()
+        .any(is_mascot_block)
+        .then(|| trimmed.chars().count())
+}
+
+fn split_at_col(row: &str, col: usize) -> Option<(&str, &str)> {
+    let mut chars = row.char_indices();
+    for _ in 0..col {
+        chars.next()?;
+    }
+    let byte = chars.next().map_or(row.len(), |(i, _)| i);
+    Some((&row[..byte], &row[byte..]))
+}
+
+fn agy_banner_version(after: &str) -> Option<&str> {
+    let len = after
+        .bytes()
+        .take_while(|b| b.is_ascii_digit() || *b == b'.')
+        .count();
+    let version = &after[..len];
+    let mut parts = 0;
+    for part in version.split('.') {
+        if part.is_empty() || part.len() > 6 {
+            return None;
+        }
+        parts += 1;
+    }
+    (parts == 3 && crate::text::trim(&after[len..]).is_empty()).then_some(version)
+}
+
+fn agy_card_row(row: &str, text_col: usize) -> Option<(usize, usize)> {
+    let (before, after) = split_at_col(row, text_col)?;
+    let mascot_end = mascot_prefix_end(before)?;
+    let trimmed = crate::text::trim_end(after);
+    if trimmed.is_empty()
+        || trimmed.starts_with(char::is_whitespace)
+        || trimmed.contains('\u{2026}')
+    {
+        return None;
+    }
+    Some((mascot_end, text_col + trimmed.chars().count()))
+}
+
+fn agy_feet_row(row: &str, text_col: usize) -> Option<usize> {
+    match split_at_col(row, text_col) {
+        Some((before, after)) => {
+            if !crate::text::trim(after).is_empty() {
+                return None;
+            }
+            mascot_prefix_end(before)
+        }
+        None => mascot_prefix_end(row),
+    }
+}
+
+fn agy_card_at(rows: &[String], top: usize) -> Option<CardPlace> {
+    if top + 4 >= rows.len() {
+        return None;
+    }
+    let row0 = &rows[top];
+    let byte_at = row0.find(AGY_BANNER)?;
+    let before = &row0[..byte_at];
+    let mut mascot_end = mascot_prefix_end(before)?;
+    let text_col = before.chars().count();
+    let after = &row0[byte_at + AGY_BANNER.len()..];
+    agy_banner_version(after)?;
+    let end0 = crate::text::trim_end(row0).chars().count();
+    let (m1, end1) = agy_card_row(&rows[top + 1], text_col)?;
+    let (m2, end2) = agy_card_row(&rows[top + 2], text_col)?;
+    let (m3, end3) = agy_card_row(&rows[top + 3], text_col)?;
+    let m4 = agy_feet_row(&rows[top + 4], text_col)?;
+    mascot_end = mascot_end.max(m1).max(m2).max(m3).max(m4);
+    Some(CardPlace {
+        top,
+        rows: 4,
+        text_col,
+        mascot_end,
+        ends: [end0, end1, end2.max(end3)],
+    })
+}
+
+/// Scan `rows` for agy's 5-row launch card: `(banner_row, place)`.
+#[must_use]
+pub fn launch_card_scan(rows: &[String]) -> (Option<usize>, Option<CardPlace>) {
+    for i in (0..rows.len()).rev() {
+        let Some(byte_at) = rows[i].find(AGY_BANNER) else {
+            continue;
+        };
+        if mascot_prefix_end(&rows[i][..byte_at]).is_none() {
+            continue;
+        }
+        return (Some(i), agy_card_at(rows, i));
+    }
+    (None, None)
+}
+
+/// Whether [`launch_card_scan`] on `rows` is unchanged when only `changed`
+/// rows moved since it returned `banner`.
+#[must_use]
+pub fn launch_card_unmoved(rows: &[String], banner: Option<usize>, changed: &[usize]) -> bool {
+    let touches = |j: usize| rows.get(j).is_some_and(|r| r.contains(AGY_BANNER));
+    match banner {
+        Some(b) => {
+            b + 4 < rows.len() && changed.iter().all(|&j| j < b || (j > b + 4 && !touches(j)))
+        }
+        None => changed.iter().all(|&j| !touches(j)),
+    }
+}
+
+/// The version agy's launch card at `place` names (`1.4.0`).
+#[must_use]
+pub fn launch_card_version<'a>(rows: &'a [String], place: &CardPlace) -> Option<&'a str> {
+    let (_, after) = split_at_col(rows.get(place.top)?, place.text_col)?;
+    agy_banner_version(after.strip_prefix(AGY_BANNER)?)
+}
+
+/// The text of rows `0`, `2`, and `3` of agy's launch card at `place`.
+#[must_use]
+pub fn launch_card_words<'a>(rows: &'a [String], place: &CardPlace) -> Option<[&'a str; 3]> {
+    let word = |r: usize| {
+        let (_, after) = split_at_col(rows.get(place.top + r)?, place.text_col)?;
+        let w = crate::text::trim_end(after);
+        (!w.is_empty()).then_some(w)
+    };
+    Some([word(0)?, word(2)?, word(3)?])
+}
+
+fn parse_agy_model_row(text: &str) -> Option<(String, Option<String>)> {
+    let t = crate::text::trim(text);
+    if t.is_empty() || t.contains('\u{2026}') {
+        return None;
+    }
+    if let Some((model, effort)) = t.strip_suffix(')').and_then(|s| s.rsplit_once(" (")) {
+        let lower = effort.to_ascii_lowercase();
+        if matches!(lower.as_str(), "low" | "medium" | "high" | "xhigh" | "max") {
+            let model = crate::text::trim(model);
+            if !model.is_empty() {
+                return Some((model.to_owned(), Some(lower)));
+            }
+        }
+    }
+    Some((t.to_owned(), None))
+}
+
+fn parse_agy_footer_model(row: &str) -> Option<(String, Option<String>)> {
+    let t = crate::text::trim_end(row);
+    let (model_part, effort_part) = t.rsplit_once(" \u{00B7} ")?;
+    let effort = crate::text::trim(effort_part).to_ascii_lowercase();
+    if !matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh" | "max") {
+        return None;
+    }
+    let model = model_part
+        .rsplit("  ")
+        .next()
+        .map(crate::text::trim)
+        .filter(|m| !m.is_empty())?;
+    Some((model.to_owned(), Some(effort)))
+}
+
+/// agy's launch card and live footer model/effort for the harness footer.
+#[must_use]
+pub fn launch_card(rows: &[String]) -> Option<LaunchCard> {
+    let f = frame(rows)?;
+    let footer_model = f
+        .footer
+        .and_then(|r| rows.get(r))
+        .and_then(|r| parse_agy_footer_model(r));
+    let (_, place) = launch_card_scan(&rows[..f.top]);
+    let card_info = place.and_then(|p| {
+        let ver = launch_card_version(rows, &p)?.to_owned();
+        let (_, after) = split_at_col(rows.get(p.top + 2)?, p.text_col)?;
+        let (model, effort) = parse_agy_model_row(after)?;
+        Some((ver, model, effort))
+    });
+    match (card_info, footer_model) {
+        (Some((version, _card_model, card_effort)), Some((f_model, f_effort))) => {
+            Some(LaunchCard {
+                version,
+                model: f_model,
+                effort: f_effort.or(card_effort),
+            })
+        }
+        (Some((version, model, effort)), None) => Some(LaunchCard {
+            version,
+            model,
+            effort,
+        }),
+        (None, Some((model, effort))) => Some(LaunchCard {
+            version: String::new(),
+            model,
+            effort,
+        }),
+        (None, None) => None,
+    }
 }
 
 /// agy's screens, measured, for this crate's tests and a dependent crate's
@@ -1537,6 +1980,43 @@ pub mod fixtures {
         /// A per-day 429, RetryInfo 41397.204181s: not retried.
         pub const ERROR_429_LONG: &str =
             include_str!("fixtures/agy-1.4.0-lab-error-day429long.txt");
+        /// The turn ended with a command task running on: the panel
+        /// (`  ● [17:50:42] … running`) under the empty composer, the
+        /// footer counting `1 task(s)`.
+        pub const BG_TASK: &str = include_str!("fixtures/agy-1.4.0-lab-bg-task.txt");
+        /// A timer pending after the turn: `  ● [17:54:12] Lab timer running`.
+        pub const BG_TIMER: &str = include_str!("fixtures/agy-1.4.0-lab-bg-timer.txt");
+        /// A subagent working after the turn: `  ● Agent(research: Lab
+        /// Waiter)  Working · 1s`, the footer counting `1 subagent(s)`.
+        pub const BG_SUBAGENT: &str = include_str!("fixtures/agy-1.4.0-lab-bg-subagent.txt");
+        /// A subagent and a command task: one panel row each.
+        pub const BG_TASK_AND_SUBAGENT: &str =
+            include_str!("fixtures/agy-1.4.0-lab-bg-task-and-subagent.txt");
+        /// A daemon command task: `  ● [18:03:48] sleep 300 running`.
+        pub const BG_DAEMON: &str = include_str!("fixtures/agy-1.4.0-lab-bg-daemon.txt");
+        /// A draft held over the panel, the footer's left side blank.
+        pub const BG_DRAFT: &str = include_str!("fixtures/agy-1.4.0-lab-bg-draft.txt");
+        /// A turn running while a task runs: the spinner over the composer,
+        /// the panel under it.
+        pub const BG_BUSY: &str = include_str!("fixtures/agy-1.4.0-lab-bg-busy.txt");
+        /// [`BG_TASK`]'s task ended: no panel, no count.
+        pub const BG_TASK_ENDED: &str = include_str!("fixtures/agy-1.4.0-lab-bg-task-ended.txt");
+        /// agy ended by SIGTERM with work running: its last frame, the panel
+        /// rows in it, under them its resume line and the shell.
+        pub const BG_EXITED: &str = include_str!("fixtures/agy-1.4.0-lab-bg-exited.txt");
+        /// The panel turned off (`"hideActiveItems": true`, measured
+        /// 2026-10-18): a command task running after its turn ended, no
+        /// panel, the footer still counting `1 task(s)`.
+        pub const BG_PANEL_OFF_TASK: &str =
+            include_str!("fixtures/agy-1.4.0-lab-bg-panel-off-task.txt");
+        /// The panel turned off: a subagent working, the footer counting `1
+        /// subagent(s)`.
+        pub const BG_PANEL_OFF_SUBAGENT: &str =
+            include_str!("fixtures/agy-1.4.0-lab-bg-panel-off-subagent.txt");
+        /// The panel turned off: a daemon command task (`IsDaemon`), the
+        /// footer counting `1 task(s)`.
+        pub const BG_PANEL_OFF_DAEMON: &str =
+            include_str!("fixtures/agy-1.4.0-lab-bg-panel-off-daemon.txt");
     }
 }
 

@@ -69,7 +69,8 @@ fn a_second_bridge_on_one_state_dir_is_refused_or_stands_by_and_takes_over() {
         f.write_all(w.token.as_bytes()).expect("write the token");
     }
     let err_path = w.tmp.join("second-bridge.err");
-    let mut second = aterm_uds::spawnfd::command(harness::aterm_to_launch())
+    let mut second = aterm_uds::spawnfd::command(harness::aterm_to_launch());
+    let mut second = harness::scratch_spawnfd(&mut second, &w.tmp)
         .args(&words[1..])
         .arg("--sock")
         .arg(&w.ctl_sock)

@@ -9,6 +9,8 @@
 
 #[path = "encode_legacy.rs"]
 mod encode_legacy;
+#[path = "encode_win32_keys.rs"]
+mod encode_win32_keys;
 
 use super::{Key, KeyEventType, KeyboardMode, Modifiers, NamedKey};
 use encode_legacy::{
@@ -349,18 +351,18 @@ fn is_reset_escape_hatch_key(key: &Key) -> bool {
 /// Whether a key press/repeat needs the CSI-u form under kitty modes that keep text as text
 /// (disambiguate, and event-types-only repeats). Kitty disambiguates "Esc, alt+key, ctrl+key,
 /// ctrl+alt+key, shift+alt+key"; a bare or Shift-only text key composes text and is not
-/// ambiguous. Enter/Tab/Backspace keep their bytes only unmodified: Shift+Enter is
-/// `ESC[13;2u`.
+/// ambiguous. Enter/Tab keep their bytes only unmodified (Shift+Enter is `ESC[13;2u`,
+/// Shift+Tab is `ESC[9;2u`). For compatibility with text-preserving TUIs, aterm also
+/// keeps Backspace's legacy DEL/BS byte with Shift alone. This intentionally loses
+/// that modifier unless report-all is requested; it is not Kitty/Alacritty parity.
 #[cfg_attr(trust_verify, trust::skip)]
 fn key_event_needs_csi_u(key: &Key, modifiers: Modifiers) -> bool {
     let effective_mods = modifiers & CHORD_MODIFIERS;
     let text_mods = effective_mods.is_empty() || effective_mods == Modifiers::SHIFT;
     match key {
         Key::Character(_) => !text_mods,
-        Key::Named(NamedKey::Space) => !text_mods,
-        Key::Named(NamedKey::Enter | NamedKey::Tab | NamedKey::Backspace) => {
-            !effective_mods.is_empty()
-        }
+        Key::Named(NamedKey::Space | NamedKey::Backspace) => !text_mods,
+        Key::Named(NamedKey::Enter | NamedKey::Tab) => !effective_mods.is_empty(),
         // Everything else — Esc, arrows, nav, F-keys, dedicated numpad keys
         // (incl. NumpadEnter when the fold kept it) — has no text form.
         Key::Named(_) => true,
@@ -768,8 +770,12 @@ struct Win32KeyRecord {
 /// The win32-input-mode record for a key conhost cannot read from legacy VT, or reads as a
 /// different key, or `None` for a key it reads correctly, which keeps its legacy bytes: the
 /// Enter chords legacy VT has no byte for ([`win32_enter_chord`]), the keys whose legacy bytes
-/// conhost holds once it has read a record ([`win32_escape_record`]), and Ctrl+H, whose BS
-/// conhost reads as Ctrl+Backspace ([`win32_ctrl_character_record`]).
+/// conhost holds once it has read a record ([`win32_escape_record`]), Ctrl+H and Ctrl+J,
+/// whose BS and LF conhost reads as Ctrl+Backspace and Ctrl+Enter
+/// ([`win32_ctrl_character_record`]), and the named keys legacy
+/// loses or misnames: Ctrl+Break, the keypad, and the Space and Backspace chords, and under
+/// OpenConsole ([`KeyboardMode::OPENCONSOLE_HOST`]) KP_Begin and F13-F20
+/// ([`encode_win32_keys::win32_named_record`]).
 #[cfg_attr(trust_verify, trust::skip)]
 fn win32_key_record(
     key: &Key,
@@ -783,6 +789,7 @@ fn win32_key_record(
         .or_else(|| {
             win32_ctrl_character_record(key, modifiers, mode, base_layout_key, layout_glyph)
         })
+        .or_else(|| encode_win32_keys::win32_named_record(key, modifiers, mode))
 }
 
 /// The win32-input-mode record for an Enter chord: `Some` only for Enter (main block or
@@ -791,7 +798,9 @@ fn win32_key_record(
 /// [`conhost_holds_once_switched`]'s switch. The keypad Enter is the same VK/scan pair flagged
 /// `ENHANCED_KEY`; it is routed too because the legacy keypad arm writes the main Enter's
 /// Shift+Enter LF, which conhost reads as Ctrl+Enter. DECKPAM is not consulted: the record
-/// names the physical key, and conhost applies keypad mode itself.
+/// names the physical key. conhost does not apply keypad mode to it (measured 2026-10-17: a
+/// KP_Enter record reached a DECKPAM reader as CR), which Shift's chord never needed, as Shift
+/// cancels DECKPAM, and which costs Ctrl+KP_Enter its `SS3 M` there.
 #[cfg_attr(trust_verify, trust::skip)]
 fn win32_enter_chord(key: &Key, modifiers: Modifiers) -> Option<Win32KeyRecord> {
     let mut cs = match key {
@@ -915,10 +924,21 @@ fn win32_escape_record(
 /// BS, the legacy byte of Ctrl+H: conhost decodes a bare BS as Ctrl+Backspace.
 const LEGACY_CTRL_H: u8 = 0x08;
 
+/// LF, the legacy byte of Ctrl+J: conhost decodes a bare LF as Ctrl+Enter.
+const LEGACY_CTRL_J: u8 = 0x0a;
+
 /// The record for a Ctrl letter chord whose legacy byte conhost reads as a different key:
-/// `Some` only when the legacy bytes are a lone BS, which a letter key writes for Ctrl+H and
-/// Ctrl+Shift+H, Caps Lock or not (and Ctrl+р on a Russian layout's H key, through
-/// [`ctrl_layout_twin`]). A BS character, no letter, names no key and keeps its byte.
+/// `Some` only when the legacy bytes are a lone BS or a lone LF, which a letter key writes
+/// for Ctrl+H and Ctrl+J and their Shift chords, Caps Lock or not (and Ctrl+р on a Russian
+/// layout's H key, through [`ctrl_layout_twin`]). A BS or LF character, no letter, names no
+/// key and keeps its byte.
+///
+/// Ctrl+J, measured 2026-10-17 through ConPTY (conhost 10.0.26200): its LF reached `ReadKey`
+/// as `Enter MODS=Control CHAR=0x0A`, Ctrl+Enter, so a PowerShell prompt ran InsertLineAbove.
+/// The J key's record (`VK_J`, scan 0x24, char LF, `LEFT_CTRL_PRESSED`) is Ctrl+j to
+/// PSReadLine 2.4.5 and 2.0.0, unbound in Windows mode, where aterm's readline layer binds it
+/// to AcceptLine, readline's C-j; Git Bash reads its LF and accepts the line. Claude Code
+/// reads a record's char, so it still gets LF, its newline (not measured on the record).
 ///
 /// Measured 2026-10-16, conhost 10.0.26200: a bare BS reaches `ReadKey` as `Backspace
 /// MODS=Control CHAR=0x7F`, i.e. Ctrl+Backspace. PSReadLine (2.4.5 under pwsh 7.6.7, 2.0.0
@@ -954,17 +974,14 @@ const LEGACY_CTRL_H: u8 = 0x08;
 ///
 /// Known siblings, left on their legacy bytes because none was measured as a key: the other
 /// Ctrl chords whose lone C0 byte conhost's control-character translation turns into a
-/// different key (expected from that translation; only LF's decode was observed, from aterm's
-/// old Shift+Enter LF). A record would hand the reader the chord pressed instead:
+/// different key (expected from that translation; only LF's decode was observed, which made
+/// Ctrl+J a record above). A record would hand the reader the chord pressed instead:
 /// - Ctrl+I (HT) → Tab and Ctrl+M (CR) → Enter: readline reads C-i and C-m as Tab and Enter
 ///   too, so the misread is the Unix meaning and a record would only take it away.
-/// - Ctrl+J (LF) → Ctrl+Enter: PSReadLine's InsertLineAbove today, where readline's C-j
-///   accepts the line.
 /// - Ctrl+2 (NUL) → Ctrl+Shift+2: a record would hand a reader that binds by key the digit
-///   chord. Ctrl+Space shares the NUL but is NOT on this list: it was fed raw into a ConPTY tab
-///   on 2026-09-27 and arrived as Ctrl+Space (`win32_keys_conhost_still_reads_keep_their_bytes` in
-///   the tests); a 2026-10-16 scratch read saw Ctrl+Shift+2 instead, so re-measure before
-///   acting on either.
+///   chord. Ctrl+Space shares the NUL and is a record of the Space key
+///   ([`encode_win32_keys`]): re-measured 2026-10-17, its NUL reached `ReadKey` as
+///   `D2 MODS=Shift+Control`, as the 2026-10-16 read had seen.
 /// - Ctrl+4 (FS) → Ctrl+\, Ctrl+5 (GS) → Ctrl+], Ctrl+6 and Ctrl+~ (RS) → Ctrl+Shift+6,
 ///   Ctrl+/ and Ctrl+7 (US) → Ctrl+Shift+-, Ctrl+8 (DEL) → Backspace: each is the Windows key
 ///   for that byte, so a record would change only which key a reader that binds by key sees.
@@ -989,7 +1006,10 @@ fn win32_ctrl_character_record(
         return None;
     };
     let legacy = encode_legacy(key, modifiers, mode, layout_glyph);
-    if legacy != [LEGACY_CTRL_H] || !c.is_ascii_alphabetic() {
+    let [byte @ (LEGACY_CTRL_H | LEGACY_CTRL_J)] = legacy[..] else {
+        return None;
+    };
+    if !c.is_ascii_alphabetic() {
         return None;
     }
     let (_, sc, _) = base_layout_key
@@ -998,7 +1018,7 @@ fn win32_ctrl_character_record(
     Some(Win32KeyRecord {
         vk: u32::from(c.to_ascii_uppercase()),
         sc,
-        uc: u32::from(LEGACY_CTRL_H),
+        uc: u32::from(byte),
         cs: WIN32_LEFT_CTRL_PRESSED,
     })
 }

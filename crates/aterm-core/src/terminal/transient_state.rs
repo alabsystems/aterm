@@ -36,8 +36,9 @@ pub(super) enum Vt52CursorState {
 }
 
 /// Grouped transient terminal state. [`reset`](Self::reset) bumps `reset_generation` and
-/// `screen_replaced` and clears the rest, except the replies already owed to the PTY peer
-/// (`response_buffer`) and their rate limiter; the monotonic counts and serials, which never
+/// `screen_replaced` and clears the rest, except the replies and reports already owed to
+/// the PTY peer (`response_buffer`, `report_buffer`) and the replies' rate limiter; the
+/// monotonic counts and serials, which never
 /// rewind (`sync_end_seq`, `full_clears`, `screen_mutations`, `kitty_serial`,
 /// `print_anchor_seq`); the per-batch clocks, which each batch overwrites before any reader
 /// runs; `kitty_last_assigned_id`, where the next `I=` id's search starts; and
@@ -52,6 +53,13 @@ pub(super) struct TransientState {
     /// already generated is owed to the PTY peer, so a query's answer cannot depend on
     /// whether a later RIS arrived in the same read.
     pub(super) response_buffer: Vec<u8>,
+    /// The reports the terminal sends unasked, at a host's change rather than to
+    /// answer a sequence: DEC 2048 in-band size reports and DSR 997 colour-scheme
+    /// pushes. Kept apart from `response_buffer` so a host can send them as the
+    /// input they are ([`super::Terminal::take_reports`]); `take_response` still
+    /// hands over both. Shares that buffer's cap ([`Self::push_report`]). Not
+    /// reset, for the same reason.
+    pub(super) report_buffer: Vec<u8>,
     /// Token-bucket rate limiter gating `send_response`, so a peer spamming
     /// DSR/DA/DECRQSS cannot force unlimited responses even when the host drains the
     /// buffer in a tight loop. Not reset: an RIS would refill the bucket on demand.
@@ -93,15 +101,14 @@ pub(super) struct TransientState {
     /// exit (47/1047/1049) and full resets. A swapped or wiped screen no longer
     /// holds the rows a resize displaced. Never reset to 0.
     pub(super) screen_replaced: u64,
-    /// The engine's render debt `(shift, pushed)`: the sums of `ResizeReport::shift()`
-    /// and `net_pushed()` over the alternate-screen, non-reflowed resizes run under
-    /// `ResizePolicy::Native` since the screen was last repainted from scratch (a full
-    /// clear, a screen switch, a reset). `(0, 0)` means the rows sit where the program
-    /// painted them; `(-1, 0)` means every row is one higher. Kept beside the two counters
-    /// that zero it, so it stays exact however far the 16-entry journal is overrun.
-    /// Session-only: a checkpoint restore starts at `(0, 0)` and the host seeds it
+    /// The engine's render debt ([`RenderDebt`](super::RenderDebt)): what the
+    /// alternate-screen, non-reflowed resizes run under `ResizePolicy::Native` since the
+    /// screen was last repainted from scratch (a full clear, a screen switch, a reset)
+    /// moved or cut. Kept beside the two counters that zero it, so it stays exact however
+    /// far the 16-entry journal is overrun. Session-only: a checkpoint restore starts at
+    /// nothing owed and the host seeds it
     /// ([`Terminal::seed_render_debt`](super::Terminal::seed_render_debt)).
-    pub(super) render_debt: (i32, i32),
+    pub(super) render_debt: super::RenderDebt,
     /// Monotonic count of non-empty batches [`process_at`](super::Terminal::process_at)
     /// consumed, whatever they changed, plus every Kitty animation frame step
     /// ([`advance_kitty_animations`](super::Terminal::advance_kitty_animations)).
@@ -203,6 +210,30 @@ pub(super) struct TransientState {
     /// screen. A resync that never arrives leaves the screen up (as Windows Terminal leaves
     /// it), and later prompts on it do not ask again.
     pub(super) alt_screen_resync_screen: Option<u64>,
+    /// The alternate screen ([`Self::screen_replaced`] while it is up) a shell prompt proved
+    /// dead under the host policy, or the embedder is making its host leave
+    /// (`Terminal::expect_host_alt_screen_leave`): the `?1049l` that leaves THAT screen is
+    /// the host's forwarded switch, and it releases the modes the dead app left on as the
+    /// local leave does (`TerminalHandler::take_dead_alt_screen`). Taken by that switch;
+    /// cleared by a reset and when the policy goes off.
+    pub(super) dead_alt_screen: Option<u64>,
+    /// Where the shell's latest prompt on a dead alternate screen started: the screen
+    /// ([`Self::screen_replaced`] while it was up) and the cursor at the `A` that proved it
+    /// dead under the host policy. Read by `Terminal::dead_alt_screen_carry`, which hands
+    /// the prompt the shell drew there to the primary screen the host's leave brings back.
+    /// Stale once that screen is gone (the screen id no longer matches); cleared by a reset.
+    pub(super) dead_alt_prompt_at: Option<(u64, u16, u16)>,
+    /// DEC 2048's enable-time size report is owed but held: the enable came on the primary
+    /// screen behind a Windows console host, where the reader is as likely the shell as the
+    /// program that asked (`TerminalHandler::hold_size_report`). Sent when the alternate
+    /// screen comes up with the mode still on; dropped by `?2048l`, by a shell prompt (the
+    /// program that asked has ended) and by a reset.
+    pub(super) size_report_held: bool,
+    /// The last DECSET/DECRST 2004 arrived after the shell's `133;D` and before its next
+    /// `A`: the shell's own set-up for the prompt it is drawing, which the `A` that proves a
+    /// full-screen app dead leaves alone (`TerminalHandler::release_dead_app_paste`).
+    /// Cleared by a reset.
+    pub(super) bracketed_paste_from_prompt: bool,
     /// XTSAVE (`CSI ? Ps s`) saved DEC private mode values, restored by
     /// XTRESTORE (`CSI ? Ps r`). Cleared on reset.
     pub(super) xtsave_modes: XtsaveModesMap,
@@ -296,6 +327,7 @@ impl TransientState {
     pub(super) fn new() -> Self {
         Self {
             response_buffer: Vec::new(),
+            report_buffer: Vec::new(),
             response_rate_limiter: ResponseRateLimiter::new(),
             last_graphic_char: None,
             current_hyperlink: None,
@@ -307,7 +339,7 @@ impl TransientState {
             reset_generation: 0,
             full_clears: 0,
             screen_replaced: 0,
-            render_debt: (0, 0),
+            render_debt: super::RenderDebt::default(),
             screen_mutations: 0,
             sync_open_dirty: false,
             app_sync_open: false,
@@ -332,6 +364,10 @@ impl TransientState {
             host_resyncs_alt_screen: false,
             alt_screen_resync_requested: false,
             alt_screen_resync_screen: None,
+            dead_alt_screen: None,
+            dead_alt_prompt_at: None,
+            size_report_held: false,
+            bracketed_paste_from_prompt: false,
             xtsave_modes: XtsaveModesMap::default(),
             last_osc_bel_terminated: false,
             kitty_images: HashMap::new(),
@@ -353,6 +389,26 @@ impl TransientState {
             kitty_commands: 0,
             kitty_unscrolls: 0,
         }
+    }
+
+    /// Bytes owed to the PTY peer: the replies and the reports, which share
+    /// [`super::MAX_RESPONSE_BUFFER_SIZE`].
+    pub(super) fn owed_len(&self) -> usize {
+        self.response_buffer
+            .len()
+            .saturating_add(self.report_buffer.len())
+    }
+
+    /// Queue `report` in `report_buffer` unless it would take what is owed past
+    /// [`super::MAX_RESPONSE_BUFFER_SIZE`]: every caller writes past
+    /// `send_response`'s rate limit, so a toggle flood or a resize storm
+    /// against a host that does not drain must not grow it. Whether it went in.
+    pub(super) fn push_report(&mut self, report: &[u8]) -> bool {
+        let fits = self.owed_len().saturating_add(report.len()) <= super::MAX_RESPONSE_BUFFER_SIZE;
+        if fits {
+            self.report_buffer.extend_from_slice(report);
+        }
+        fits
     }
 
     /// Recompute the cached `has_transient_extras` flag.
@@ -379,7 +435,7 @@ impl TransientState {
         // A full reset replaces the whole screen; `full_clears` is untouched, since a
         // reader keys on either advancing.
         self.screen_replaced = self.screen_replaced.wrapping_add(1);
-        self.render_debt = (0, 0);
+        self.render_debt = super::RenderDebt::default();
         self.sync_start = None;
         self.sync_open_dirty = false;
         self.app_sync_open = false;
@@ -399,6 +455,11 @@ impl TransientState {
         // `host_resyncs_alt_screen` is host policy and stays.
         self.alt_screen_resync_requested = false;
         self.alt_screen_resync_screen = None;
+        self.dead_alt_screen = None;
+        self.dead_alt_prompt_at = None;
+        // RIS turns 2048 off: nothing is owed.
+        self.size_report_held = false;
+        self.bracketed_paste_from_prompt = false;
         self.xtsave_modes.clear();
         self.last_osc_bel_terminated = false;
         self.bell_pending = false;

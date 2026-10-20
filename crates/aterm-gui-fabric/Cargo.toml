@@ -15,7 +15,7 @@ aterm-control = { workspace = true }
 # The fence and notice waits' one timing value, and the process clock.
 aterm-gui-timing = { workspace = true }
 aterm-log = { workspace = true }
-# The presence band's mail facts, built here from the ring.
+# The presence facts' mail counts, built here from the ring.
 aterm-messages = { workspace = true }
 aterm-session = { workspace = true }
 # The fabric's word grammar and the env seams.

@@ -24,7 +24,7 @@ use crate::app_launch_successor::{LaunchError, LaunchInFlight};
 use crate::app_native::{HandoffFailureLane, PhysicalFailureShape};
 use crate::handoff_rendezvous::{
     CodeRefusal, CodeRefusedDialer, CodeRefusedEnd, DialerCode, Rendezvous, RendezvousError,
-    TRUSTD_SILENT, dial_for_test, held_for_trustd,
+    dial_for_test, held_for_trustd, trustd_silent,
 };
 use crate::native_updater_service::{ApplyAttemptTicket, ApplyMode};
 use aterm_models_update::native_update_rendezvous_admission_model;
@@ -339,7 +339,7 @@ fn through_the_gate(claim_is_right: bool, code: &DialerCode) -> (bool, usize) {
         .iter()
         .any(|dialer| matches!(dialer.refusal, CodeRefusal::TrustdSilent(_)))
     {
-        panic!("{TRUSTD_SILENT}: {turned_away:?}");
+        trustd_silent(format_args!("{turned_away:?}"));
     }
     let running = running.into_inner();
     match &accepted {
@@ -347,7 +347,7 @@ fn through_the_gate(claim_is_right: bool, code: &DialerCode) -> (bool, usize) {
             grant(peer);
             (true, received_by(running))
         }
-        Err(error) if held_for_trustd(error) => panic!("{TRUSTD_SILENT}: {error}"),
+        Err(error) if held_for_trustd(error) => trustd_silent(error),
         Err(RendezvousError::Cancelled) => {
             // The stand-in has exited: its own failure is named with its output before any
             // refusal is judged the gate's.
@@ -378,8 +378,8 @@ fn through_the_gate(claim_is_right: bool, code: &DialerCode) -> (bool, usize) {
 
 /// One stand-in holding `rendezvous`'s claim through the shipping dial wait, `code` required:
 /// the wait's end and the stand-in. If the stand-in exits first, the watcher runs `on_exit`
-/// with the wait's cancel. A dialer held for `trustd` is [`TRUSTD_SILENT`]; an accepted peer is
-/// returned ungranted.
+/// with the wait's cancel. A dialer held for `trustd` is COULD NOT RUN ([`trustd_silent`]); an
+/// accepted peer is returned ungranted.
 fn through_the_dial_wait(
     rendezvous: &Rendezvous,
     in_flight: &LaunchInFlight,
@@ -414,10 +414,10 @@ fn through_the_dial_wait(
     });
     match &ended {
         Err(LaunchedDialEnd::Rendezvous(error)) if held_for_trustd(error) => {
-            panic!("{TRUSTD_SILENT}: {}: {error}", code.describe())
+            trustd_silent(format_args!("{}: {error}", code.describe()))
         }
         Err(end @ LaunchedDialEnd::ExitedWhileHeld { .. }) => {
-            panic!("{TRUSTD_SILENT}: {}: {end:?}", code.describe())
+            trustd_silent(format_args!("{}: {end:?}", code.describe()))
         }
         _ => {}
     }
@@ -515,8 +515,8 @@ fn the_secret_alone_grants_a_stranger_and_the_model_refuses_it() {
 /// A process that is not the launched successor dials with the claim it read before
 /// LaunchServices answers, and the production tail (a fresh cached pass's requirement, the dial
 /// wait, the grant) sends it nothing; the same tail grants a dialer of the required code, so
-/// the refusal is the code's. A dialer held for an overdue `trustd` is [`TRUSTD_SILENT`],
-/// never a pass.
+/// the refusal is the code's. A dialer held for an unanswered `trustd` is COULD NOT RUN
+/// ([`trustd_silent`]), never a pass.
 #[test]
 fn a_dialer_that_is_not_the_launched_process_gets_no_descriptor() {
     let bundle = PathBuf::from("/Applications/aterm.app");
@@ -1126,81 +1126,4 @@ fn a_turned_away_dialer_answers_only_for_its_own_death() {
         ),
         "never witnessed: not concluded"
     );
-}
-
-/// The machine's actions with no shipping code of their own here, each waived by name. Bound
-/// above: `Grant` (`Rendezvous::gate_one`), `DeadlineWhileHeld`
-/// (`handoff_rendezvous::admit_code`), `FileByCause` (`code_refused_completion`) and `Commit`
-/// (`LaunchCorroboration::poll`).
-mod waivers {
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_rendezvous_admission",
-        action = "WrongSecret",
-        reason = "The environment: a dialer that does not present this attempt's claim; realized \
-                  by a stand-in process presenting another claim."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_rendezvous_admission",
-        action = "CopiedSecretOtherCode",
-        reason = "The environment: a same-uid process that copied the claim out of the \
-                  successor's launch environment (KERN_PROCARGS2) and runs other code; realized \
-                  by a stand-in process that does not meet the stated requirement."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_rendezvous_admission",
-        action = "TrustdSilent",
-        reason = "The environment: macOS's code-signing service stops answering; realized by \
-                  making the process's one trustd gate overdue (aterm_uds::deadline::TRUST), as \
-                  a silent trustd does."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_rendezvous_admission",
-        action = "TrustdAnswers",
-        reason = "The environment: the stuck check returns and the gate lets checks through \
-                  again; realized by releasing the overdue work."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_rendezvous_admission",
-        action = "LaunchServicesDisowns",
-        reason = "The environment: LaunchServices' answer naming another pid, or reporting the \
-                  launched process exited; scripted with the measured answers, since a unit test \
-                  may not launch an application (AGENTS.md)."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_rendezvous_admission",
-        action = "Refuse",
-        reason = "The refusal's own steps are NativeUpdateOverlapHandoff's: before the grant the \
-                  ungranted stand-down (retire_ungranted_successor), after it the kill-and-reap \
-                  of the reject path; both are bound by that model's Tier-1."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_rendezvous_admission",
-        action = "GrantOnSecretAlone",
-        reason = "The Buggy=1 mutant: the launched lane before 2026-10-02, the secret its one \
-                  gate; run for real at the same-uid floor by the conformance, which sees a \
-                  stranger granted and the model refuse it."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_rendezvous_admission",
-        action = "CommitOverDisowning",
-        reason = "The Buggy=1 mutant: 2026-09-29's corroboration, an exit answer read as \
-                  corroborating; no shipping code, replayed in the model by the conformance."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_rendezvous_admission",
-        action = "RefuseUnanswered",
-        reason = "The Buggy=1 mutant: the first code gate of 2026-10-02, which closed a dialer \
-                  whose check trustd did not answer; replayed in the model by the conformance."
-    )]
-    #[aterm_spec_anchor::spec_unmodeled(
-        machine = "native_update_rendezvous_admission",
-        action = "FileAsUnexplainedDeath",
-        reason = "The Buggy=1 mutant: that gate's filing of the turned-away successor as a death \
-                  before its dial; booked for real and replayed in the model by the conformance."
-    )]
-    #[expect(
-        dead_code,
-        reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it"
-    )]
-    fn rendezvous_admission_waivers() {}
 }

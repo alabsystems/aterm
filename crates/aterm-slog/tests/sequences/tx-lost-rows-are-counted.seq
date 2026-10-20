@@ -1,0 +1,14 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# S27: rows the glue lost are counted on the source mark at the batch's end,
+# never as ring loss (no gap); said once; a state that moves says the count.
+bind 0
+tx lost 2
+tx flush
+expect mark r1 source field=transcript state=on skipped=0
+expect mark r1 source field=transcript state=on dropped=2 by=aterm
+tx flush
+state partial
+tx prompt v1
+expect mark r1 source field=transcript state=partial dropped=2
+expect lost=0
+expect tx dropped=2

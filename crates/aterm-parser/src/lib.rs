@@ -104,6 +104,7 @@ mod simd;
 mod state;
 /// State transition table.
 pub mod table;
+mod tmux;
 mod utf8;
 mod utf8_simd;
 
@@ -111,6 +112,7 @@ pub use action::{Action, ActionSink, NullSink};
 pub use carry::{CarryRefusal, HOOKED_STRING_CARRY, OSC_CARRY_CAP, ParserCarry, UTF8_TAIL_MAX};
 pub use state::State;
 pub use table::{ActionType, TRANSITIONS};
+pub use tmux::TmuxPassthrough;
 
 use aterm_alloc::ArrayVec;
 
@@ -253,6 +255,9 @@ pub struct Parser {
     pub(crate) dcs_st_pending: bool,
     /// Tracks whether we're in an APC sequence (vs SOS/PM)
     pub(crate) apc_active: bool,
+    /// Where the parser stands with respect to a tmux passthrough wrapper
+    /// (`crate::tmux`): reading its head, or inside it, unwrapping.
+    pub(crate) tmux: TmuxPassthrough,
     /// UTF-8 decoding buffer for multi-byte sequences
     pub(crate) utf8_buffer: [u8; 4],
     /// Number of bytes accumulated in utf8_buffer
@@ -307,6 +312,7 @@ impl Parser {
             dcs_active: false,
             dcs_st_pending: false,
             apc_active: false,
+            tmux: TmuxPassthrough::Off,
             utf8_buffer: [0; 4],
             utf8_len: 0,
             utf8_expected: 0,
@@ -342,6 +348,7 @@ impl Parser {
         self.dcs_active = false;
         self.dcs_st_pending = false;
         self.apc_active = false;
+        self.tmux = TmuxPassthrough::Off;
         self.utf8_len = 0;
         self.utf8_expected = 0;
         self.string_utf8 = utf8::Utf8Prefix::NONE;
@@ -363,6 +370,18 @@ impl Parser {
     #[must_use]
     pub fn in_hooked_dcs(&self) -> bool {
         self.dcs_active || self.dcs_st_pending
+    }
+
+    /// Where the parser stands with respect to a tmux passthrough wrapper
+    /// (`ESC P tmux; … ESC \`, unwrapped as tmux unwraps it): an open one
+    /// leaves the parser mid-sequence whatever [`Parser::state`] its payload
+    /// is in. `CAN` then `ESC \` end one from anywhere: the CAN ends the
+    /// payload's sequence (and the head of a wrapper not yet open), the
+    /// `ESC \` the wrapper.
+    #[inline]
+    #[must_use]
+    pub fn tmux_passthrough(&self) -> TmuxPassthrough {
+        self.tmux
     }
 }
 

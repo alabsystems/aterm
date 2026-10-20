@@ -9,7 +9,7 @@
 // `run_tests.rs` (`mod autopilot_loop`), so the `Mock` and the helpers there
 // are in scope.
 
-use crate::supervise::journal::{MAIL_ADOPTED, MAIL_RETRY, MAIL_UNPARKED};
+use crate::supervise::journal::{AGAIN_ADOPTED, AGAIN_RETRY, AGAIN_UNPARKED};
 use crate::supervise::policy::turn_end::{
     DONE_CHECK, LAND, RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LAND_NUDGE, RULE_LEFT,
     RULE_OPEN_ITEMS,
@@ -30,10 +30,7 @@ fn worked(said: &str) -> Vec<String> {
 
 /// `policy` as the in-GUI host runs it.
 fn under(policy: SupervisorConfig) -> SuperviseOpts {
-    SuperviseOpts {
-        policy,
-        ..auto(30, None)
-    }
+    SuperviseOpts { policy, ..auto(30) }
 }
 
 /// The session's word `land`: the point is decided at Cruise first, the word
@@ -156,7 +153,7 @@ fn a_persons_greeting_under_land_is_left_to_them() {
     let opts = SuperviseOpts {
         policy: policy.clone(),
         journal: Some(journal.clone()),
-        ..auto(1, None)
+        ..auto(1)
     };
     let (lines, _) = watch_lines_with(&mut m, &opts, timing);
     assert_eq!(count(&m, "turn"), 0, "{lines:#?}");
@@ -179,10 +176,7 @@ fn a_persons_greeting_under_land_is_left_to_them() {
     m.autopilot = Some("land");
     m.turn_releases = Some(1);
     m.vanish_after = Some(8);
-    let opts = SuperviseOpts {
-        policy,
-        ..auto(1, None)
-    };
+    let opts = SuperviseOpts { policy, ..auto(1) };
     let (lines, _) = watch_lines_with(&mut m, &opts, timing);
     assert!(
         lines
@@ -262,8 +256,7 @@ fn a_loop_started_as_off_lifted_acts_on_the_point_it_finds() {
     let land_rows = [format!("❯ {first}"), format!("  {}", rest.trim_start())];
     let land_rows: Vec<&str> = land_rows.iter().map(String::as_str).collect();
     // The done check as Claude Code wraps it under its `❯`.
-    let (first, rest) =
-        DONE_CHECK.split_at(DONE_CHECK.find(" End your reply with").expect("the check"));
+    let (first, rest) = DONE_CHECK.split_at(DONE_CHECK.find(" Report whether").expect("the check"));
     let check_rows = [format!("❯ {first}"), format!("  {}", rest.trim_start())];
     let check_rows: Vec<&str> = check_rows.iter().map(String::as_str).collect();
     // A case: its name, its screen, the act the stopped loop typed (its rule
@@ -362,7 +355,7 @@ fn a_loop_started_as_off_lifted_acts_on_the_point_it_finds() {
 }
 
 /// THE SAME UNDER THE ENGINE'S OWN PARK (no host stops it: the table's `off`
-/// under a CLI `watch`, a word read before the host acts): the loop parks
+/// under a loop with no host, a word read before the host acts): the loop parks
 /// at a point Cruise would continue, the person says hi under Off and the
 /// agent answers at once, the word turns back — and the point read afresh,
 /// never seen busy, is acted on whether or not the person's keystroke is in
@@ -397,7 +390,7 @@ fn an_off_park_then_cruise_acts_on_the_point_it_never_saw_run() {
                 ..SupervisorConfig::default()
             },
             journal: Some(journal.clone()),
-            ..auto(1, None)
+            ..auto(1)
         };
         let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
             s.set_turn_end_timing(TurnEndTiming {
@@ -465,7 +458,7 @@ fn run_lifted(
         },
         journal: Some(journal.clone()),
         idle_host: lifted.map(|l| Arc::new(Lifted(l)) as Arc<dyn IdleHost>),
-        ..auto(1, None)
+        ..auto(1)
     };
     let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
         s.set_turn_end_timing(TurnEndTiming {
@@ -626,7 +619,7 @@ fn the_point_off_stood_on_read_again_is_continued_as_before_the_park() {
                 ..SupervisorConfig::default()
             },
             journal: Some(journal.clone()),
-            ..auto(1, None)
+            ..auto(1)
         };
         let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
             s.set_turn_end_timing(TurnEndTiming {
@@ -842,7 +835,7 @@ fn an_autopilot_off_presses_no_box() {
     let (dir, journal) = journal_file("autopilot-box");
     let opts = SuperviseOpts {
         journal: Some(journal.clone()),
-        ..auto(30, None)
+        ..auto(30)
     };
     let mut m = fenced(vec![bash_one_row(), idle_screen()]);
     m.autopilot = Some("-");
@@ -865,7 +858,7 @@ fn an_autopilot_off_presses_no_box() {
     let mut m = fenced(vec![bash_one_row(), idle_screen()]);
     m.autopilot = Some("-");
     m.vanish_after = Some(2);
-    let (lines, _) = watch_lines(&mut m, &auto(30, None));
+    let (lines, _) = watch_lines(&mut m, &auto(30));
     assert!(
         lines.iter().any(|l| l.starts_with("APPROVED seq=")),
         "{lines:#?} {:#?}",
@@ -893,7 +886,7 @@ fn an_autopilot_off_dismisses_no_card_over_a_busy_worker() {
         m.vanish_after = Some(1);
         let opts = SuperviseOpts {
             journal: Some(journal.clone()),
-            ..dismissing(None)
+            ..dismissing()
         };
         let (lines, _) = watch_lines(&mut m, &opts);
         let said = journaled(&journal);
@@ -940,7 +933,7 @@ fn a_busy_wait_reads_a_new_off_word_before_dismissing_a_card() {
         m.autopilot = Some("cruise");
         m.autopilot_on.insert(0, Some(word));
         m.vanish_after = Some(1);
-        let (lines, _) = watch_lines(&mut m, &dismissing(None));
+        let (lines, _) = watch_lines(&mut m, &dismissing());
         assert_eq!(m.autopilot, Some(word), "the owner changed the word");
         (m, lines)
     };
@@ -981,7 +974,7 @@ fn a_busy_wait_with_an_unanswered_autopilot_read_touches_no_card() {
         .insert("meta", VecDeque::from([first, err("denied: meta")]));
     m.autopilot_on.insert(0, Some("off"));
     m.vanish_after = Some(1);
-    let (lines, _) = watch_lines(&mut m, &dismissing(None));
+    let (lines, _) = watch_lines(&mut m, &dismissing());
     assert_eq!(m.autopilot, Some("off"), "the owner changed the word");
     assert!(m.presses().is_empty(), "{:#?}", m.requests);
     assert!(
@@ -1210,7 +1203,7 @@ fn a_managers_one_look_ignores_the_autopilot_word() {
     let (dir, journal) = journal_file("autopilot-one-look");
     let opts = SuperviseOpts {
         journal: Some(journal.clone()),
-        ..auto(30, None)
+        ..auto(30)
     };
     let mut m = fenced(vec![bash_one_row(), busy_screen(), write_prompt()]);
     m.autopilot = Some("off");
@@ -1233,7 +1226,7 @@ fn a_managers_one_look_ignores_the_autopilot_word() {
     let (dir, journal) = journal_file("autopilot-one-look-watch");
     let opts = SuperviseOpts {
         journal: Some(journal.clone()),
-        ..auto(30, None)
+        ..auto(30)
     };
     let mut m = fenced(vec![bash_one_row(), idle_screen()]);
     m.autopilot = Some("off");
@@ -1249,15 +1242,19 @@ fn a_managers_one_look_ignores_the_autopilot_word() {
 }
 
 /// THE USUAL LANDING ENDS ON THE WORKER'S OWN TOKEN — the land instruction
-/// asks for it, beside a summary of what is left — and that end is Land's:
-/// `DONE … rule=land@v1`, never `finished@v1`, though the summary lists work
-/// left. NEGATIVE CONTROL: the same reply after a Cruise continuation names
-/// open work beside the token, so it gets the open-items challenge and no
-/// end; the same token under a report that leaves nothing is the worker's own
-/// `finished@v1`.
+/// asks for it, beside a summary that names nothing left — and that end is
+/// Land's: `DONE … rule=land@v1`, never `finished@v1`. A token beside a
+/// summary that still lists work left ends nothing under Land either (the
+/// owner's rule of 2026-10-19): no `DONE`, its challenge waiting the back-off
+/// the short reply earned (the policy's tests read the challenge's Land
+/// words). NEGATIVE CONTROLS: under Cruise the same open reply ends nothing
+/// either, and the token under a report that leaves nothing is the worker's
+/// own `finished@v1`.
 #[test]
 fn a_token_reply_to_the_land_instruction_is_lands_done() {
-    let done_lines = |word: &'static str, tag: &str, reply: &str| {
+    // The `DONE` lines, and whether the challenge at seq 104 waited the
+    // back-off.
+    let run = |word: &'static str, tag: &str, reply: &str| {
         let mut m = Mock::new(vec![
             busy_screen(),
             worked("Fixed the parser; the suite is green."),
@@ -1273,34 +1270,41 @@ fn a_token_reply_to_the_land_instruction_is_lands_done() {
             ..under(SupervisorConfig::default())
         };
         let _ = watch_lines(&mut m, &opts);
-        let said: Vec<String> = journaled(&journal)
-            .into_iter()
-            .filter(|l| l.starts_with("DONE ") || l.starts_with("CONTINUED seq=104 "))
-            .collect();
+        let all = journaled(&journal);
         let _ = std::fs::remove_dir_all(&dir);
-        said
+        let done: Vec<String> = all
+            .iter()
+            .filter(|l| l.starts_with("DONE "))
+            .cloned()
+            .collect();
+        let waited = all
+            .iter()
+            .any(|l| l.starts_with("WAITING seq=104 ") && l.contains("back-off"))
+            || all
+                .iter()
+                .any(|l| l.starts_with(&format!("CONTINUED seq=104 rule={RULE_OPEN_ITEMS} ")));
+        (done, waited, all)
     };
-    let left = "Committed the parser. Left: the lexer.\nATERM-TASK-DONE";
-    let said = done_lines("land", "autopilot-land-token", left);
-    assert_eq!(said.len(), 1, "{said:#?}");
-    assert!(
-        said[0].starts_with(&format!("DONE seq=104 rule={RULE_LAND} ")),
-        "{said:#?}"
-    );
-    // NEGATIVE CONTROLS: Cruise challenges the open report…
-    let said = done_lines("cruise", "autopilot-cruise-token", left);
-    assert_eq!(said.len(), 1, "{said:#?}");
-    assert!(
-        said[0].starts_with(&format!("CONTINUED seq=104 rule={RULE_OPEN_ITEMS} ")),
-        "{said:#?}"
-    );
-    // …and ends on a report that leaves nothing.
     let clean = "Committed the parser and the lexer. Nothing left.\nATERM-TASK-DONE";
-    let said = done_lines("cruise", "autopilot-cruise-clean", clean);
-    assert_eq!(said.len(), 1, "{said:#?}");
+    let (done, _, all) = run("land", "autopilot-land-token", clean);
+    assert_eq!(done.len(), 1, "{all:#?}");
     assert!(
-        said[0].starts_with("DONE seq=104 rule=finished@v1 "),
-        "{said:#?}"
+        done[0].starts_with(&format!("DONE seq=104 rule={RULE_LAND} ")),
+        "{all:#?}"
+    );
+    // Work left beside the token: ended by nothing under Land…
+    let left = "Committed the parser. Left: the lexer.\nATERM-TASK-DONE";
+    let (done, waited, all) = run("land", "autopilot-land-left", left);
+    assert!(done.is_empty() && waited, "{all:#?}");
+    // NEGATIVE CONTROLS: …nor under Cruise…
+    let (done, waited, all) = run("cruise", "autopilot-cruise-token", left);
+    assert!(done.is_empty() && waited, "{all:#?}");
+    // …and Cruise ends on a report that leaves nothing.
+    let (done, _, all) = run("cruise", "autopilot-cruise-clean", clean);
+    assert_eq!(done.len(), 1, "{all:#?}");
+    assert!(
+        done[0].starts_with("DONE seq=104 rule=finished@v1 "),
+        "{all:#?}"
     );
 }
 
@@ -1315,12 +1319,7 @@ impl Review for Notes {
     fn approved(&mut self, _seq: u64, _command: &str) -> Result<(), String> {
         Ok(())
     }
-    fn review(
-        &mut self,
-        _turn: &Turn,
-        _report: Option<ReportBrief>,
-        _fold: Option<Fold>,
-    ) -> Result<bool, String> {
+    fn review(&mut self, _turn: &Turn) -> Result<bool, String> {
         Ok(true)
     }
     fn say(&mut self, line: &str) -> Result<(), String> {
@@ -1368,7 +1367,7 @@ fn an_off_park_takes_the_loops_badges_down_and_the_rejudge_raises_them_again() {
     let (dir, journal) = journal_file("autopilot-off-badges");
     let opts = SuperviseOpts {
         journal: Some(journal.clone()),
-        ..auto(30, None)
+        ..auto(30)
     };
     let mut m = Mock::new(vec![rm.clone(), rm.clone(), rm.clone()]);
     m.attention = Some(ours.clone());
@@ -1425,7 +1424,7 @@ fn an_off_park_takes_the_loops_badges_down_and_the_rejudge_raises_them_again() {
     let (dir, journal) = journal_file("autopilot-cruise-badges");
     let opts = SuperviseOpts {
         journal: Some(journal.clone()),
-        ..auto(30, None)
+        ..auto(30)
     };
     let mut m = Mock::new(vec![rm.clone(), rm.clone(), rm]);
     m.attention = Some(ours.clone());
@@ -1450,7 +1449,7 @@ fn an_off_park_takes_the_loops_badges_down_and_the_rejudge_raises_them_again() {
 /// episode opened (`CLEARED seq=<n> attention=OK <why>`). (What each leaves
 /// for the park's end — the turn-end text, the limit's episode — is
 /// `an_off_parks_end_sets_the_turn_end_badge_again_unless_the_worker_worked`'s
-/// and `a_limit_spanning_an_off_park_is_one_episode_one_mail_one_escalation`'s.)
+/// and `a_limit_spanning_an_off_park_is_one_episode_one_escalation`'s.)
 /// NEGATIVE CONTROL: a loop that holds no badge sends and
 /// says nothing.
 #[test]
@@ -1546,7 +1545,7 @@ fn the_loops_last_clear_of_the_turn_end_badge_is_journaled() {
         let mut recs = vec![JournalRecord::of_line(
             1_000,
             Some("s-1"),
-            "ESCALATED seq=7 attention=OK mail=OK",
+            "ESCALATED seq=7 attention=OK",
             None,
         )];
         recs.extend(
@@ -1639,8 +1638,8 @@ fn a_parks_retake_behind_the_same_holder_says_it_once() {
 /// — `/login`'s "finish sign-in", a switch's note, a Codex sandbox fall,
 /// each said once — so the park keeps its text as it takes it down and,
 /// with the word turned, sets it again: one `meta set attention`, journaled
-/// `ESCALATED … mail=skipped: set again after an off park` after the
-/// `UNPARKED` line, nothing posted (a manager in place), and the badge the
+/// `ESCALATED … again=set again after an off park` after the `UNPARKED`
+/// line, and the badge the
 /// loop's again, cleared as before once the worker works. NEGATIVE CONTROL:
 /// a read of the park that sees the worker working is that badge's end —
 /// nothing set again.
@@ -1658,7 +1657,6 @@ fn an_off_parks_end_sets_the_turn_end_badge_again_unless_the_worker_worked() {
         let mut notes = Notes::default();
         let badge = {
             let mut s = session(&mut m, None);
-            s.set_manager(Some("@s-9".to_string()));
             s.note_meta(&meta);
             s.attention_ours = Some(entry.to_string());
             s.turn_end_badge = true;
@@ -1688,13 +1686,12 @@ fn an_off_parks_end_sets_the_turn_end_badge_again_unless_the_worker_worked() {
         notes.noted
     );
     assert!(
-        notes.noted[raised].ends_with(&format!(" attention=OK mail={MAIL_UNPARKED}")),
+        notes.noted[raised].ends_with(&format!(" attention=OK again={AGAIN_UNPARKED}")),
         "{}",
         notes.noted[raised]
     );
     assert_eq!(m.attention.as_deref(), Some(entry));
     assert_eq!(m.attentions, 1, "set once, again: {:#?}", m.requests);
-    assert_eq!(count(&m, "post"), 0, "no second ask: {:#?}", m.requests);
     assert!(
         badge,
         "the loop's badge again, cleared once the worker works"
@@ -1717,18 +1714,72 @@ fn an_off_parks_end_sets_the_turn_end_badge_again_unless_the_worker_worked() {
     assert!(!badge);
 }
 
+/// A LIMIT'S BADGE SAYS WHETHER IT IS WAITED OUT
+/// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §2.4): under `resume_limits`,
+/// a notice naming a reset the loop read is `kind=wait` — the turn-end policy
+/// continues it — and a notice naming no reset it can read is `kind=ask`: a
+/// reset is never guessed, so nothing here ends it. One Claude Code continues
+/// by itself is `kind=wait` with the limits resumed or not: nobody acts on
+/// it. NEGATIVE CONTROL: the reset-naming notice with the limits not resumed
+/// is `kind=ask`. The text is the notice's either way, and the episode's own
+/// reading of it is unchanged.
+#[test]
+fn a_limit_badge_is_a_wait_only_where_the_loop_waits_it_out() {
+    let weekly = "You've hit your weekly limit · resets Sep 19 at 11am (America/Los_Angeles)";
+    let auto_continue =
+        "⚠ Usage limit reached · continuing automatically at 1:50pm · esc to cancel";
+    // A spend limit no reset ends: the vendor names none.
+    let spend = "You're out of extra usage · add funds to continue";
+    let reset = Some("Sep 19 at 11am (America/Los_Angeles)");
+    for (resume_limits, notice, reset, kind) in [
+        (true, weekly, reset, "kind=wait"),
+        (true, auto_continue, None, "kind=wait"),
+        (true, spend, None, "kind=ask"),
+        (false, weekly, reset, "kind=ask"),
+        // Claude Code continues by itself whatever the owner's policy says
+        // of the loop's own continuation.
+        (false, auto_continue, None, "kind=wait"),
+    ] {
+        let mut m = Mock::new(vec![limited_screen()]);
+        let mut notes = Notes::default();
+        {
+            let mut s = session(&mut m, None);
+            s.set_clock(TEST_NOW, PDT);
+            s.set_zone_lookup(test_zones);
+            s.resume_limits = resume_limits;
+            assert_eq!(
+                s.open_episode(102, notice, reset, false, &mut notes),
+                Ok(())
+            );
+            assert_eq!(
+                s.limit.as_ref().map(|ep| ep.resumes_itself),
+                Some(notice == auto_continue)
+            );
+        }
+        let entry = format!("{ATTENTION_PREFIX} {notice}");
+        assert_eq!(
+            m.attention_kind.as_deref(),
+            Some(kind),
+            "{notice}: {:?}",
+            m.requests
+        );
+        assert_eq!(m.attention.as_deref(), Some(entry.as_str()), "{notice}");
+        assert_eq!(m.attentions, 1, "{notice}: {:?}", m.requests);
+    }
+}
+
 /// A LIMIT SPANNING AN OFF PARK IS ONE EPISODE (the review of b512d03d8).
 /// The park takes the episode's badge down and keeps the episode as a
 /// retry, so the notice still up after the park opens the SAME episode —
-/// its seq kept, its badge set again with no second mail (`mail=skipped:
-/// the retry hit the wall again, the episode of seq=90`) — and the
-/// harness's stats fold one escalation, its wait leaving the park out. A
-/// limit's badge adopted from a previous loop keeps its marker across the
-/// park the same way (`mail=skipped: adopted …`). NEGATIVE CONTROL: an
-/// episode the worker's answer closed keeps no retry, and the notice met
-/// again is a new episode, mailed — two escalations.
+/// its seq kept, its badge set again with no second ask (`again=the retry
+/// hit the wall again, the episode of seq=90`) — and the harness's stats
+/// fold one escalation, its wait leaving the park out. A limit's badge
+/// adopted from a previous loop keeps its marker across the park the same
+/// way (`again=adopted …`). NEGATIVE CONTROL: an episode the worker's answer
+/// closed keeps no retry, and the notice met again is a new episode, a new
+/// ask — two escalations.
 #[test]
-fn a_limit_spanning_an_off_park_is_one_episode_one_mail_one_escalation() {
+fn a_limit_spanning_an_off_park_is_one_episode_one_escalation() {
     use crate::harness::stats::{HarnessStats, fold_journal};
     use crate::supervise::journal::JournalRecord;
     let notice = "You've hit your session limit · resets 2am";
@@ -1752,7 +1803,6 @@ fn a_limit_spanning_an_off_park_is_one_episode_one_mail_one_escalation() {
         let mut notes = Notes::default();
         let seq = {
             let mut s = session(&mut m, None);
-            s.set_manager(Some("@s-9".to_string()));
             s.attention_ours = Some(entry.clone());
             setup(&mut s);
             if park {
@@ -1774,7 +1824,7 @@ fn a_limit_spanning_an_off_park_is_one_episode_one_mail_one_escalation() {
         let mut recs = vec![JournalRecord::of_line(
             1_000,
             Some("s-1"),
-            "ESCALATED seq=90 attention=OK mail=OK",
+            "ESCALATED seq=90 attention=OK",
             None,
         )];
         recs.extend(
@@ -1799,11 +1849,11 @@ fn a_limit_spanning_an_off_park_is_one_episode_one_mail_one_escalation() {
         noted,
         [
             "CLEARED seq=100 attention=OK the session's autopilot is off".to_string(),
-            format!("ESCALATED seq=102 attention=OK mail={MAIL_RETRY}, the episode of seq=90"),
+            format!("ESCALATED seq=102 attention=OK again={AGAIN_RETRY}, the episode of seq=90"),
         ]
     );
     assert_eq!(seq, Some(90), "the same episode");
-    assert_eq!(count(&m, "post"), 0, "no second mail: {:#?}", m.requests);
+    assert_eq!(m.attentions, 1, "set again once: {:#?}", m.requests);
     assert_eq!(
         folded(&noted),
         (1, 2_000),
@@ -1811,20 +1861,22 @@ fn a_limit_spanning_an_off_park_is_one_episode_one_mail_one_escalation() {
     );
 
     // A badge adopted from a previous loop, its episode not open yet.
-    let (noted, m, _) = run(|s| s.adopted_limit = true, true);
+    let (noted, _, _) = run(|s| s.adopted_limit = true, true);
     assert_eq!(
         noted,
         [
             "CLEARED seq=100 attention=OK the session's autopilot is off".to_string(),
-            format!("ESCALATED seq=102 attention=OK mail={MAIL_ADOPTED}"),
+            format!("ESCALATED seq=102 attention=OK again={AGAIN_ADOPTED}"),
         ]
     );
-    assert_eq!(count(&m, "post"), 0, "{:#?}", m.requests);
 
     // NEGATIVE CONTROL: closed by the worker's answer — a new episode.
-    let (noted, m, seq) = run(episode, false);
+    let (noted, _, seq) = run(episode, false);
     assert_eq!(seq, Some(102), "{noted:#?}");
-    assert_eq!(count(&m, "post"), 1, "{:#?}", m.requests);
+    assert!(
+        noted.iter().any(|l| l == "ESCALATED seq=102 attention=OK"),
+        "{noted:#?}"
+    );
     assert_eq!(folded(&noted).0, 2, "{noted:#?}");
 }
 
@@ -1833,11 +1885,11 @@ fn a_limit_spanning_an_off_park_is_one_episode_one_mail_one_escalation() {
 /// marker of a limit's badge adopted from a previous loop, last only while
 /// the notice stands. A read of the park that shows the worker answered —
 /// a point that is not the notice — ends both, so the limit met after the
-/// word turns is a NEW episode: its own seq, mailed, an escalation the
+/// word turns is a NEW episode: its own seq, a new ask, an escalation the
 /// stats count. NEGATIVE CONTROL: the notice still up at the park's read
-/// keeps the episode, its badge set again with no second mail.
+/// keeps the episode, its badge set again with no second ask.
 #[test]
-fn a_limit_the_worker_answered_past_in_a_park_is_a_new_episode_mailed() {
+fn a_limit_the_worker_answered_past_in_a_park_is_a_new_episode() {
     let notice = "You've hit your session limit · resets 2am";
     let entry = format!("{ATTENTION_PREFIX} {notice}");
     let episode = |s: &mut Session<'_, Mock>| {
@@ -1862,7 +1914,6 @@ fn a_limit_the_worker_answered_past_in_a_park_is_a_new_episode_mailed() {
         let mut notes = Notes::default();
         let seq = {
             let mut s = session(&mut m, None);
-            s.set_manager(Some("@s-9".to_string()));
             s.note_meta(&meta);
             s.attention_ours = Some(entry.clone());
             setup(&mut s);
@@ -1885,22 +1936,14 @@ fn a_limit_the_worker_answered_past_in_a_park_is_a_new_episode_mailed() {
         ("a raised episode", episode as fn(&mut Session<'_, Mock>)),
         ("an adopted badge", |s| s.adopted_limit = true),
     ] {
-        // The worker answered while parked: a new episode, mailed.
-        let (noted, m, seq) = run(setup, idle_screen());
+        // The worker answered while parked: a new episode, a new ask.
+        let (noted, _, seq) = run(setup, idle_screen());
         assert_eq!(seq, Some(102), "{what}: {noted:#?}");
-        assert_eq!(count(&m, "post"), 1, "{what}: {:#?}", m.requests);
-        assert!(
-            !escalated(&noted).contains("mail=skipped"),
-            "{what}: {noted:#?}"
-        );
+        assert!(!escalated(&noted).contains(" again="), "{what}: {noted:#?}");
 
         // NEGATIVE CONTROL: the notice still up — the same episode.
-        let (noted, m, _) = run(setup, limited_screen());
-        assert_eq!(count(&m, "post"), 0, "{what}: {:#?}", m.requests);
-        assert!(
-            escalated(&noted).contains("mail=skipped"),
-            "{what}: {noted:#?}"
-        );
+        let (noted, _, _) = run(setup, limited_screen());
+        assert!(escalated(&noted).contains(" again="), "{what}: {noted:#?}");
     }
 }
 
@@ -1908,11 +1951,11 @@ fn a_limit_the_worker_answered_past_in_a_park_is_a_new_episode_mailed() {
 /// THAT IS NOT ITS NOTICE (the review of a295792e4): a loop that adopts the
 /// badge over the notice, then reads the worker answered past it, takes the
 /// badge down (`CLEARED … the worker answered past the adopted limit's
-/// notice`) and forgets the adoption, so the next limit is escalated with
-/// its own mail. NEGATIVE CONTROL: the notice still up at the first look is
-/// the adopted episode — its badge set again, nobody mailed.
+/// notice`) and forgets the adoption, so the next limit is escalated as its
+/// own ask. NEGATIVE CONTROL: the notice still up at the first look is the
+/// adopted episode — its badge set again, no new ask.
 #[test]
-fn a_limit_after_the_worker_answered_an_adopted_one_is_mailed() {
+fn a_limit_after_the_worker_answered_an_adopted_one_is_a_new_ask() {
     let notice = "You've hit your session limit · resets 7:30pm (America/Los_Angeles)";
     let run = |script: Vec<Vec<String>>, tag: &str| {
         let (dir, journal) = journal_file(tag);
@@ -1929,9 +1972,7 @@ fn a_limit_after_the_worker_answered_an_adopted_one_is_mailed() {
                 ..SupervisorConfig::default()
             })
         };
-        let _ = watch_lines_with(&mut m, &opts, |s| {
-            s.set_manager(Some("@s-9".to_string()));
-        });
+        let _ = watch_lines_with(&mut m, &opts, |_| {});
         let said = journaled(&journal);
         let _ = std::fs::remove_dir_all(&dir);
         (m, said)
@@ -1959,19 +2000,17 @@ fn a_limit_after_the_worker_answered_an_adopted_one_is_mailed() {
         said[cleared].ends_with(" the worker answered past the adopted limit's notice"),
         "{why}"
     );
-    assert!(!said[escalated].contains("mail=skipped"), "{why}");
-    assert_eq!(count(&m, "post"), 1, "{why}");
+    assert!(!said[escalated].contains(" again="), "{why}");
 
     // NEGATIVE CONTROL: the notice still up at the first look.
     let (m, said) = run(vec![limited_screen()], "adopted-limit-standing");
     let why = format!("{said:#?}\n{:#?}", m.requests);
     assert!(
-        said.iter().any(
-            |l| l.starts_with("ESCALATED seq=") && l.ends_with(&format!("mail={MAIL_ADOPTED}"))
-        ),
+        said.iter()
+            .any(|l| l.starts_with("ESCALATED seq=")
+                && l.ends_with(&format!("again={AGAIN_ADOPTED}"))),
         "{why}"
     );
-    assert_eq!(count(&m, "post"), 0, "{why}");
 }
 
 /// A LOOP BEHIND ANOTHER SUPERVISOR'S CLAIM READS THE SESSION'S WORD AT ITS

@@ -256,6 +256,12 @@ pub struct Terminal {
     /// observers (`subscribe events`); unlike the take-and-clear `bell_pending`, never
     /// resets. Not checkpointed.
     pub(super) bell_total: u64,
+    /// Monotonic count of desktop notifications the program asked for (OSC 9,
+    /// a final OSC 99 chunk, OSC 777 `notify`), counted before the
+    /// `allow_notifications` gate, so a session with notifications off still
+    /// says it asked (session log Phase 3B, `mark - notify n=`, ruling S19).
+    /// Never their text. Not checkpointed.
+    pub(super) notify_total: u64,
     /// Host-preferred default cursor style, used before any DECSCUSR and restored on
     /// RIS/DECSTR; outside `modes` so the `TerminalModes::new()` reset keeps it.
     pub(super) default_cursor_style: aterm_types::CursorStyle,
@@ -397,6 +403,9 @@ pub struct Terminal {
     /// partial scroll inserting rows before a protected footer): hosts caching absolute
     /// anchors recompute them when it changes.
     pub(super) absolute_row_revision: u64,
+    /// Which main-screen rows each drawer wrote while it held the terminal
+    /// ([`super::holder_fence`]); its anchors live in the main grid.
+    pub(super) holder_fence: super::HolderFence,
     /// Monotonic repaint-blink epoch: bumped on each DECTCEM hide (`CSI ?25l`) inside DEC
     /// 2026 synchronized output, the per-keystroke repaint of full-redraw TUIs (vim/less
     /// and ConPTY hide without sync). Read-only for hosts' cursor-effect classifiers.
@@ -566,12 +575,14 @@ impl Terminal {
         self.transient.app_sync_open && self.transient.app_sync_dirty
     }
 
-    /// Whether the VT parser is in Ground state (no pending escape sequence).
-    /// The I/O-queue fast path uses it to route reads after a chunk that ended
-    /// mid-sequence through the ordered slow path.
+    /// Whether the VT parser is in Ground state (no pending escape sequence),
+    /// outside a tmux passthrough wrapper (whose payload the parser reads
+    /// unwrapped until the wrapper's `ESC \\`). The I/O-queue fast path uses it
+    /// to route reads after a chunk that ended mid-sequence through the
+    /// ordered slow path.
     #[must_use]
     pub fn parser_is_ground(&self) -> bool {
-        self.parser.state().is_ground()
+        self.parser.state().is_ground() && !self.parser.tmux_passthrough().is_open()
     }
 
     /// Whether the alternate screen is active.

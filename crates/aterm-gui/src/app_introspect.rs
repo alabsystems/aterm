@@ -802,16 +802,19 @@ pub(crate) enum EncodeJob {
         /// that had not changed, so a static window's honest frame gaps are not
         /// read as a starved recorder, while a stalled render still is.
         pace_ticks: Vec<u64>,
-        /// TOTAL input attempts during this take that could not be put on this
-        /// recording's frame clock, and therefore CANNOT be in `inputs`: the
-        /// control-thread egresses (see [`crate::unseamed_control_inputs`])
-        /// plus `unlogged_other_window`.
+        /// TOTAL input attempts during this take that are not in `inputs`: the
+        /// control-thread egresses (see [`crate::unseamed_control_inputs`]),
+        /// plus `unlogged_other_window`, plus `unlogged_over_cap`.
         unlogged_inputs: u64,
         /// The subset of `unlogged_inputs` that reached the App input seam but
         /// belonged to a window this recording was not capturing. Kept apart so
         /// `analysis.note` can name the RIGHT cause: "drive the front tab" and
         /// "drive the window being recorded" are different corrections.
         unlogged_other_window: u64,
+        /// The subset of `unlogged_inputs` the recorded window's seam saw after
+        /// the ledger was full (`VIDEO_KEY_LOG_CAP` rows): stamped by nothing,
+        /// counted so a full `inputs[]` is not read as every key of the take.
+        unlogged_over_cap: u64,
         started_us: u64,
         // This capability owns a retained directory chain and is much larger
         // than the other job fields. Keep it indirect so every queued enum
@@ -1884,6 +1887,7 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
             pace_ticks,
             unlogged_inputs,
             unlogged_other_window,
+            unlogged_over_cap,
             started_us,
             take,
         } => {
@@ -1894,6 +1898,7 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
                 return;
             }
             let inputs_logged = inputs.len();
+            let inputs_cap = crate::VIDEO_KEY_LOG_CAP;
             // A server-named directory should be fresh, but fail closed if a
             // collision/retry left a completion marker: this job may publish only
             // the index it builds after every requested frame is durable.
@@ -2059,8 +2064,8 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
                  \"clock\": \"metrics now_us; same epoch as inputs[] — attempt->later-frame delta = frame.t_us - input.t_us\",\n    \
                  \"input_semantics\": \"pre-routing attempts (`ch` = character, `key` = named key with no character); not PTY-delivery or visible-glyph receipts\",\n    \
                  \"keys_requested\": {keys_enabled}, \"inputs_logged\": {}, \"unlogged_inputs\": {unlogged_inputs},\n    \
-                 \"unlogged_other_window\": {unlogged_other_window},\n    \
-                 \"unlogged_input_semantics\": \"input attempts during this take that this recording could not stamp on its own frame clock, from two causes. (1) The CONTROL-THREAD path: a verb aimed at a session that is NOT the tab on screen (`@<sid>` naming a background tab; `@self` when the driving session is not front). A background target has no active tab to touch, so it never enters the App input seam this ledger hooks. (2) `unlogged_other_window`: attempts that DID pass the seam but arrived on a window this take was not capturing — no frame here can answer them, so stamping them would fabricate a key->frame latency. unlogged_inputs is the TOTAL and includes unlogged_other_window. Same unit as inputs_logged (one per would-be inputs[] row); cause (1) is process-wide, delta over this take. Non-zero means attempts happened that inputs[] does NOT contain.\",\n    \
+                 \"unlogged_other_window\": {unlogged_other_window}, \"unlogged_over_cap\": {unlogged_over_cap}, \"inputs_cap\": {inputs_cap},\n    \
+                 \"unlogged_input_semantics\": \"input attempts during this take that are not in inputs[], from three causes. (1) The CONTROL-THREAD path: a verb aimed at a session that is NOT the tab on screen (`@<sid>` naming a background tab; `@self` when the driving session is not front). A background target has no active tab to touch, so it never enters the App input seam this ledger hooks. (2) `unlogged_other_window`: attempts that DID pass the seam but arrived on a window this take was not capturing — no frame here can answer them, so stamping them would fabricate a key->frame latency. (3) `unlogged_over_cap`: attempts on the recorded window after inputs[] reached inputs_cap rows — counted, not stamped. unlogged_inputs is the TOTAL and includes unlogged_other_window and unlogged_over_cap. Same unit as inputs_logged (one per would-be inputs[] row); cause (1) is process-wide, delta over this take. Non-zero means attempts happened that inputs[] does NOT contain.\",\n    \
                  \"stamp_semantics\": \"{stamp_semantics}\",\n    \
                  \"wall_start_us\": {started_us}, \"wall_stop_us\": {stop_us},\n    \
                  \"requested_ms\": {requested_ms}, \"covered_us\": {covered_us},\n    \
@@ -4389,15 +4394,33 @@ impl App {
 
     /// Present one capture frame from caller-supplied synchronous layout
     /// authority when available, otherwise resolve the ordinary redraw layout.
+    ///
+    /// The redraw's present is marked as a capture's, so a minimized Windows
+    /// window, whose ordinary presents park, still presents it
+    /// ([`aterm_gpu::WindowGpu::parks_while_minimized`]).
     fn redraw_capture_frame(
         &mut self,
         wid: crate::WindowId,
         frame_layout: Option<VisibleFrameLayoutRef<'_>>,
     ) {
+        self.mark_capture_present(wid, true);
         if let Some((plan, route)) = frame_layout {
             self.redraw_window_from_layout(wid, plan, route);
         } else {
             self.redraw_window(wid);
+        }
+        self.mark_capture_present(wid, false);
+    }
+
+    /// Mark window `wid`'s GPU presents as a capture's, or no longer
+    /// ([`aterm_gpu::WindowGpu::set_capture_present`]). A CPU target has no park.
+    fn mark_capture_present(&mut self, wid: crate::WindowId, on: bool) {
+        if let Some(crate::PresentTarget::Gpu { window_gpu, .. }) = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|window| window.present.as_mut())
+        {
+            window_gpu.set_capture_present(on);
         }
     }
 
@@ -4802,9 +4825,13 @@ impl App {
                     self.refresh_pane_headers(front, &capture_plan);
                     self.paint_pane_headers(front);
                     self.splice_tab_strip(front);
+                    self.refresh_pane_overlay_for_capture(front, &capture_plan, capture_now);
+                    self.splice_pane_overlay(front);
                     self.splice_find_bar(front);
                     self.splice_settings_panel(front);
                     self.splice_build_badge(front);
+                    self.splice_stats_deck(front);
+                    self.fold_stats_deck(front);
                     frame_plan = Some(capture_plan);
                 }
                 crate::VisibleContentRoute::Native { .. } => {
@@ -4821,6 +4848,8 @@ impl App {
                     if !self.compose_native_route_card(front) {
                         return;
                     }
+                    self.splice_stats_deck(front);
+                    self.fold_stats_deck(front);
                 }
                 crate::VisibleContentRoute::Heterogeneous => {
                     let clock = self.composed_capture_cursor_fx_clock(front, Instant::now());
@@ -4844,6 +4873,8 @@ impl App {
                     if !self.compose_native_route_card(front) {
                         return;
                     }
+                    self.splice_stats_deck(front);
+                    self.fold_stats_deck(front);
                 }
             }
             // The Claude Code footer, as on the presentation routes: `image`
@@ -4943,11 +4974,12 @@ impl App {
         // (composited below, gated on !is_gpu).
         // Modal card FIRST, else the connection wire, else the build/version badge.
         let tray_arg = ws
-            .route_card
+            .deck_fold
             .as_ref()
+            .or(ws.route_card.as_ref())
             .or(ws.settings_card.as_ref())
-            .or(ws.conn_wire_card.as_ref())
             .or(ws.badge_card.as_ref())
+            .or(ws.deck_card.as_ref())
             .and_then(|card| tray_quad_below_y(card, tray_floor_y));
         let destination_height = ws.win_px.map(|size| size.height.max(1) as usize);
         let mut frame = match backend.render_input_for_destination(
@@ -4964,11 +4996,12 @@ impl App {
         };
         if !backend.is_gpu()
             && let Some(quad) = ws
-                .route_card
+                .deck_fold
                 .as_ref()
+                .or(ws.route_card.as_ref())
                 .or(ws.settings_card.as_ref())
-                .or(ws.conn_wire_card.as_ref())
                 .or(ws.badge_card.as_ref())
+                .or(ws.deck_card.as_ref())
                 .and_then(|card| tray_quad_below_y(card, tray_floor_y))
         {
             composite_tray_quad_at(&mut frame.pixels, frame.width, frame.height, 0, 0, quad);
@@ -5218,6 +5251,8 @@ impl App {
                 let _ = reply.send(Ok(crate::control::Retained::plain((0, 0, None))));
                 return;
             }
+            self.splice_stats_deck(front);
+            self.fold_stats_deck(front);
             // Native preparation leaves the semantic surface in the tray. Paint
             // the paste question afterward, exactly like the application-present path.
             if let Some((plan, route)) = resolved_layout.as_ref() {
@@ -5275,16 +5310,18 @@ impl App {
             let crate::WindowState {
                 route_card,
                 settings_card,
-                conn_wire_card,
                 badge_card,
+                deck_card,
+                deck_fold,
                 win_px,
                 ..
             } = ws;
-            let tray_arg = route_card
+            let tray_arg = deck_fold
                 .as_ref()
+                .or(route_card.as_ref())
                 .or(settings_card.as_ref())
-                .or(conn_wire_card.as_ref())
                 .or(badge_card.as_ref())
+                .or(deck_card.as_ref())
                 .and_then(|card| tray_quad_below_y(card, tray_floor_y));
             let destination_height = win_px.map(|size| size.height.max(1) as usize);
             let mut frame = match backend.render_input_for_destination(
@@ -5675,6 +5712,9 @@ impl App {
         // hash is a difference a capture cannot report, and the cheap moment to
         // wire one is exactly when it changes no identity.
         input.history_renumber_epoch.hash(hash);
+        // The holder fence decides where a card is decorated, so two frames
+        // that differ only in it can draw differently.
+        input.holder.hash(hash);
         input.cursor_row.hash(hash);
         input.cursor_col.hash(hash);
         input.cursor_visible.hash(hash);
@@ -6234,9 +6274,14 @@ impl App {
             self.refresh_pane_headers(front, &capture_plan);
             self.paint_pane_headers(front);
             self.splice_tab_strip(front);
+            // The overlay scrollbar and hollow cursors (`crate::pane_chrome`).
+            self.refresh_pane_overlay_for_capture(front, &capture_plan, capture_now);
+            self.splice_pane_overlay(front);
             self.splice_find_bar(front);
             self.splice_settings_panel(front);
             self.splice_build_badge(front);
+            self.splice_stats_deck(front);
+            self.fold_stats_deck(front);
             self.splice_claude_footer(
                 front,
                 &capture_plan,
@@ -7849,22 +7894,17 @@ impl App {
             },
             // The Autopilot menu's live rows, by the tab menu's rule.
             AuxTarget::AutopilotMenu => self.autopilot_menu_controls(),
-            // The two connection surfaces read their INTERACTIVE state only
-            // (the tab-menu rule: the surface exists or honestly does not).
-            AuxTarget::ConnCard => match self.front().and_then(|ws| ws.conn_card()) {
-                Some(card) => card.controls_lines(),
-                None => vec!["conn-card open=false".to_string()],
-            },
+            // The picker reads its INTERACTIVE state only (the tab-menu rule:
+            // the surface exists or honestly does not).
             AuxTarget::SessionPicker => match self.front().and_then(|ws| ws.session_picker()) {
                 Some(picker) => picker.controls_lines(),
                 None => vec!["session-picker open=false".to_string()],
             },
-            // The aggregated fabric (§5.3 Owner-gated at the dispatch): the
-            // OPEN map's live rows only — the closed aggregation is already
-            // served by the `flows` verb, so no snapshot fallback here.
-            AuxTarget::Connections => match self.front().and_then(|ws| ws.connection_map()) {
-                Some(map) => map.controls_lines(),
-                None => vec!["connections open=false".to_string()],
+            // Every session of the instance (Owner-gated at the dispatch): the
+            // OPEN card's rows only.
+            AuxTarget::Overview => match self.front().and_then(|ws| ws.overview()) {
+                Some(card) => card.controls_lines(),
+                None => vec!["overview open=false".to_string()],
             },
             AuxTarget::Front => {
                 let mut lines = match self.front().and_then(|ws| ws.overlay()) {
@@ -7984,9 +8024,11 @@ mod native_settings_compatibility_controls_tests {
     }
 
     /// `controls settings` lists Settings ▸ Themes like every other page: a
-    /// `ui` record per drawn card (role button, its accessible label, its id
-    /// as the value), the chips and the filter; and in Customize the
-    /// registry rows as `field` records, beside the palette's slots.
+    /// `ui` record per drawn row (role ListBoxOption, named by the theme,
+    /// its appearance and contrast as the value), the list, the filter and
+    /// the strip; Keep and Revert only while a theme is tried (the negative
+    /// control: idle, neither is listed); and in Customize the registry rows
+    /// as `field` records, beside the palette's slots.
     #[test]
     fn controls_settings_lists_showcase_rows() {
         let mut app = App::headless_for_test();
@@ -7998,73 +8040,78 @@ mod native_settings_compatibility_controls_tests {
         }
         assert!(app.open_settings_tab(SettingsRoute::Themes));
         let lines = app.read_aux_controls(AuxTarget::Prefs);
-        let card = lines
+        let listed = |lines: &[String], key: &str| {
+            lines
+                .iter()
+                .any(|line| line.starts_with(&format!("ui key=\"{key}\" ")))
+        };
+        let row = lines
             .iter()
             .find(|line| {
                 line.starts_with("ui key=\"settings/showcase/card/")
-                    && line.contains(" role=Button ")
+                    && line.contains(" role=ListBoxOption ")
             })
-            .unwrap_or_else(|| panic!("a card record: {lines:#?}"));
-        let tokens = split_record(card);
-        assert!(tokens.iter().any(|token| token == "role=Button"), "{card}");
+            .unwrap_or_else(|| panic!("a row record: {lines:#?}"))
+            .clone();
+        let tokens = split_record(&row);
         assert!(
-            tokens.iter().any(|token| token.starts_with("label=")
-                && token.contains("text contrast")
-                && token.ends_with(":1\"")),
-            "{card}"
+            tokens.iter().any(|token| token.starts_with("value=")
+                && token.contains("contrast ")
+                && token.contains(":1")),
+            "{row}"
         );
         for key in [
+            "settings/showcase/list",
             "settings/showcase/filter",
-            "settings/showcase/chip/all",
-            "settings/showcase/chip/yours",
-            "settings/showcase/view/customize",
+            "settings/showcase/status",
+            "settings/showcase/customize",
         ] {
-            assert!(
-                lines
-                    .iter()
-                    .any(|line| line.starts_with(&format!("ui key=\"{key}\" "))),
-                "{key}"
-            );
+            assert!(listed(&lines, key), "{key}: {lines:#?}");
         }
-        let (_, instance, view, _) = app.native_settings_view_target().unwrap();
-        let _ = app.native_runtime.dispatch(
-            instance,
-            view,
-            crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
-                id: crate::native_ui::ActionId::new("settings/showcase/view/customize"),
-                value: None,
-            }),
-        );
-        let lines = app.read_aux_controls(AuxTarget::Prefs);
-        for key in [
-            crate::prefs::EDIT_FONT_FAMILY,
-            crate::prefs::EDIT_FOREGROUND,
-        ] {
-            assert!(
-                lines
-                    .iter()
-                    .any(|line| line.starts_with(&format!("field key={key} "))),
-                "{key}: {lines:#?}"
-            );
+        for key in ["settings/showcase/keep", "settings/showcase/revert"] {
+            assert!(!listed(&lines, key), "idle: {key}");
         }
-        // The palette is on a later page: the pager reaches it.
-        let mut found = false;
-        for _ in 0..12 {
-            let lines = app.read_aux_controls(AuxTarget::Prefs);
-            if lines
-                .iter()
-                .any(|line| line.starts_with("ui key=\"settings/showcase/palette/0\" "))
-            {
-                found = true;
-                break;
-            }
+        let (_, instance, view, state) = app.native_settings_view_target().unwrap();
+        let in_use = state.highlighted_slug();
+        let other = lines
+            .iter()
+            .filter_map(|line| line.strip_prefix("ui key=\"settings/showcase/card/"))
+            .filter_map(|rest| rest.split('"').next())
+            .find(|slug| !slug.contains('/') && Some(slug.to_string()) != in_use)
+            .expect("a row not in use")
+            .to_string();
+        let press = |app: &mut App, key: &str| {
             let _ = app.native_runtime.dispatch(
                 instance,
                 view,
-                crate::native_app::AppEvent::ScrollPage(1),
+                crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+                    id: crate::native_ui::ActionId::new(key),
+                    value: None,
+                }),
             );
+        };
+        press(&mut app, &format!("settings/showcase/card/{other}"));
+        let lines = app.read_aux_controls(AuxTarget::Prefs);
+        for key in ["settings/showcase/keep", "settings/showcase/revert"] {
+            assert!(listed(&lines, key), "trying: {key}");
         }
-        assert!(found, "palette slot");
+        press(&mut app, "settings/showcase/revert");
+        press(&mut app, "settings/showcase/customize");
+        let lines = app.read_aux_controls(AuxTarget::Prefs);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line
+                    .starts_with(&format!("field key={} ", crate::prefs::EDIT_FOREGROUND))),
+            "{lines:#?}"
+        );
+        assert!(listed(&lines, "settings/showcase/palette/0"), "{lines:#?}");
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains(" role=ListBoxOption ")),
+            "the list leaves while the sheet stands in its place"
+        );
     }
 
     /// The theme field's options are quoted strings: a quote-aware split
@@ -8992,7 +9039,7 @@ mod dims_snapshot_tests {
 
     use super::{App, dims_axis, dims_axis_y};
     use crate::WindowId;
-    use winit::dpi::PhysicalSize;
+    use aterm_window::dpi::PhysicalSize;
 
     #[test]
     fn dims_axis_exposes_odd_trailing_bands_and_centered_crop() {
@@ -9272,7 +9319,7 @@ mod dims_snapshot_tests {
         // Live font zoom rebuilds the backend and refreshes every window's
         // MetricsView. `dims` must immediately reflect the new cells/frame while
         // retaining the independently observed raw surface size.
-        let old_font_px = app.font_px;
+        let old_font_size = app.font_size;
         app.windows.get_mut(&wid).unwrap().present_retry.on_drop(
             crate::metrics::PresentDropReason::GpuOccluded,
             Instant::now(),
@@ -9280,7 +9327,7 @@ mod dims_snapshot_tests {
         let parked = app.dims_snapshot(0, 24, 80);
         assert_eq!(parked.present_retry_state, "parked");
         assert_eq!(parked.present_retry_in_ms, None);
-        app.set_font_px(old_font_px + 8.0);
+        app.set_font_size(old_font_size + 8.0);
         let zoomed = app.dims_snapshot(0, 24, 80);
         assert_eq!(
             zoomed.present_retry_state, "ready",
@@ -9630,7 +9677,6 @@ mod chrome_output_tests {
             start_col,
             end_col,
             close_col: None,
-            connector_col: None,
             kind: TabHit::Version {
                 rung,
                 attention: false,
@@ -9641,7 +9687,6 @@ mod chrome_output_tests {
             start_col: 0,
             end_col: 28,
             close_col: Some(26),
-            connector_col: None,
             kind: TabHit::Select(0),
             solo: false,
         };
@@ -9752,9 +9797,9 @@ mod chrome_output_tests {
         // them.
         app.windows.get_mut(&wid).expect("window").last_strip_fp = None;
         assert!(line(&app).contains("shown=yes rung=full"), "{}", line(&app));
-        // Too narrow for either rung beside a lone 28-column chip: measured, and
-        // left out.
-        app.windows.get_mut(&wid).expect("window").cols = 40;
+        // Too narrow for either rung beside a lone 27-column tab
+        // (`tab_bar::LONE_CHIP_COLS`): measured, and left out.
+        app.windows.get_mut(&wid).expect("window").cols = 32;
         app.splice_tab_strip_with(wid, 1);
         assert!(
             line(&app).contains("shown=no reason=strip-full"),
@@ -10252,6 +10297,7 @@ mod terminal_split_capture_tests {
             pace_ticks: Vec::new(),
             unseamed_at_begin: 0,
             unlogged_other_window: 0,
+            unlogged_over_cap: 0,
             mode: crate::VideoMode::OffscreenPresentReal,
             next_frame: None,
             presented: None,
@@ -11466,7 +11512,7 @@ mod encode_worker_tests {
         let wid = crate::WindowId(0);
         let (width, height) = (5120_usize, 2880_usize);
         let frame_bytes = width * height * 4;
-        app.windows.get_mut(&wid).unwrap().win_px = Some(winit::dpi::PhysicalSize::new(
+        app.windows.get_mut(&wid).unwrap().win_px = Some(aterm_window::dpi::PhysicalSize::new(
             u32::try_from(width).unwrap(),
             u32::try_from(height).unwrap(),
         ));
@@ -11871,9 +11917,12 @@ mod encode_worker_tests {
         let second_target = crate::control_auth::ConfinedImage::for_test(&root, "other.png");
         let second_path = second_target.display_path();
         let second_cancel = crate::control::CaptureCancellation::new();
-        let busy = crate::control_auth::acquire_capture_name_lease(&second_target, || {
-            second_cancel.is_cancelled()
-        })
+        // No wait: contention is the subject, not how long a capture queues.
+        let busy = crate::control_auth::acquire_capture_name_lease_with_wait(
+            &second_target,
+            || second_cancel.is_cancelled(),
+            std::time::Duration::ZERO,
+        )
         .expect_err("a differently named explicit capture still contends on the namespace");
         assert_eq!(busy.kind(), std::io::ErrorKind::WouldBlock);
         assert_eq!(
@@ -12385,6 +12434,7 @@ mod encode_worker_tests {
                 pace_ticks: Vec::new(),
                 unlogged_inputs: 0,
                 unlogged_other_window: 0,
+                unlogged_over_cap: 0,
                 started_us,
                 dir: Box::new(dir),
                 reply,
@@ -12691,8 +12741,13 @@ mod encode_worker_tests {
         };
 
         let before = capture(&mut app);
+        // Colours alone move, on the terminal theme and on the installed
+        // resolution the page palette is read from
+        // (`App::native_page_palette_theme`).
         app.theme.bg ^= 0x0008_1018;
         app.theme.fg ^= 0x0010_0804;
+        app.installed_colors
+            .tint_theme_for_test(0x0008_1018, 0x0010_0804);
         let after = capture(&mut app);
         assert_eq!(before.frame_kind, "native");
         assert_eq!(before.view, after.view);
@@ -13868,33 +13923,38 @@ mod encode_worker_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// THE GOLDEN RIM IMAGES (§7), through the SACRED `image` path: for each
-    /// presence rim — drive, wait, stop, and the doubled, washed hold — the
-    /// captured PNG is the quiet baseline with exactly the rim's
-    /// [`OverlayGlow`] applied by `apply_overlay_at` (the one CPU compositor
-    /// the present, the capture and the GPU blit's `DropOverlay` twin all
-    /// resolve to; the blit maps the same four fields verbatim).
+    /// THE NEEDS BORDER'S IMAGES (owner surfaces §5), through the SACRED
+    /// `image` path: for each border — stuck, decide, and the person's yours
+    /// outline — the captured PNG is the quiet baseline with exactly the
+    /// border's [`OverlayGlow`] applied by `apply_overlay_at` (the one CPU
+    /// compositor the present, the capture and the GPU blit's `DropOverlay`
+    /// twin all resolve to; the blit maps the same four fields verbatim).
+    /// Steady: no border washes the body, the stuck and decide borders share
+    /// the plain inset and differ in hue, and the yours outline is thinner
+    /// than both. A border gone out leaves the quiet baseline byte for byte.
+    /// Nothing moves with the clock, so the frame is the same image under
+    /// reduced motion.
     #[test]
-    fn presence_rims_reach_the_sacred_image_path() {
-        use crate::presence::Level;
+    fn needs_borders_reach_the_sacred_image_path_steady() {
+        use crate::presence::Rim;
         let mut app = App::headless_for_test();
         let wid = crate::WindowId(0);
         assert!(app.windows[&wid].os_window.is_none());
         let baseline = visual_capture_pixels(&mut app, None);
         assert_eq!(app.host_visual_state(wid, Instant::now()).overlay, None);
         let (w, h) = (baseline.width, baseline.height);
-        for (name, level) in [
-            ("drive", Level::Driven),
-            ("wait", Level::Attention),
-            ("stop", Level::Limited),
-            ("hold", Level::Hold),
+        let set_rim = |app: &mut App, rim: Rim| {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.presence.rim = rim;
+            ws.presence.seed += 1;
+        };
+        let mut shots: Vec<(&str, Frame, OverlayGlow)> = Vec::new();
+        for (name, rim) in [
+            ("stuck", Rim::Stuck),
+            ("decide", Rim::Decide),
+            ("yours", Rim::Yours),
         ] {
-            {
-                let ws = app.windows.get_mut(&wid).unwrap();
-                ws.presence.level = level;
-                ws.presence.rim = level.rim();
-                ws.presence.seed += 1;
-            }
+            set_rim(&mut app, rim);
             let overlay = app
                 .host_visual_state(wid, Instant::now())
                 .overlay
@@ -13906,9 +13966,49 @@ mod encode_worker_tests {
             assert_ne!(expected.pixels, baseline.pixels, "{name}: a rim is visible");
             assert_eq!(
                 shot.pixels, expected.pixels,
-                "{name}: the sacred path paints the rim"
+                "{name}: the sacred path paints the border"
+            );
+            assert_ne!(shot.pixels, baseline.pixels, "{name}: a border is visible");
+            assert_ne!(
+                shot.pixels[0], baseline.pixels[0],
+                "{name}: the corner is border"
+            );
+            shots.push((name, shot, overlay));
+        }
+        let glow = |n: &str| shots.iter().find(|(m, _, _)| *m == n).unwrap();
+        for name in ["stuck", "decide", "yours"] {
+            assert_eq!(glow(name).2.wash_a, 0, "{name}: no wash");
+            let mid = (h / 2) * w + w / 2;
+            assert_eq!(
+                glow(name).1.pixels[mid],
+                baseline.pixels[mid],
+                "{name}: the body is untouched"
             );
         }
+        assert_eq!(
+            glow("stuck").2.border_scale_q4,
+            glow("decide").2.border_scale_q4
+        );
+        assert!(glow("yours").2.border_scale_q4 < glow("stuck").2.border_scale_q4);
+        assert_ne!(glow("stuck").2.accent, glow("decide").2.accent);
+        assert_ne!(glow("decide").2.accent, glow("yours").2.accent);
+
+        // Quiet again: the border went out, and presence draws nothing, so
+        // the capture is the quiet baseline byte for byte.
+        set_rim(&mut app, Rim::None);
+        assert_eq!(app.host_visual_state(wid, Instant::now()).overlay, None);
+        assert_eq!(
+            visual_capture_pixels(&mut app, None).pixels,
+            baseline.pixels,
+            "quiet again: the baseline"
+        );
+
+        // Reduced motion (`motion = "reduced"`): nothing on the border moves
+        // with the clock, so the frame is the same image.
+        set_rim(&mut app, Rim::Decide);
+        app.config.motion = Some("reduced".to_string());
+        let again = visual_capture_pixels(&mut app, None);
+        assert_eq!(again.pixels, glow("decide").1.pixels, "the same image");
     }
 }
 
@@ -13994,7 +14094,6 @@ mod window_render_context_capture_tests {
         control_auth::ensure_private_dir(&dir).unwrap();
         let mut app = App::headless_for_test();
         app.render_knobs.selection_inactive = true;
-        app.font_px_explicit = false;
 
         let first = WindowId(0);
         let session = app.next_session_id;
@@ -14488,10 +14587,17 @@ mod headless_cursor_fx_tests {
                 1,
                 "no head or animated attachment under load"
             );
+            // The split's chrome (an unfocused pane's hollow cursor, the
+            // scrollbar: `crate::pane_chrome`) rides the nova stream too, and is
+            // not a decoration.
             assert!(
                 ws.input_scratch.word_decorations.is_empty()
                     && ws.input_scratch.ink.is_empty()
-                    && ws.input_scratch.nova_add.is_empty(),
+                    && ws
+                        .input_scratch
+                        .nova_add
+                        .iter()
+                        .all(|q| ws.pane_overlay.painted_quad(q)),
                 "decorations remain shed"
             );
 

@@ -11,6 +11,7 @@
 //! The parsers are separate functions over the tools' text, so the fixtures in the tests
 //! are the tools' real answers, captured in a macOS 27.0 VM and on a 27.0.1 laptop.
 
+use crate::hardware;
 use crate::model::{Form, HostFacts, Keyboard, User};
 use crate::port::{Cmd, Ran, System};
 use std::path::{Path, PathBuf};
@@ -55,12 +56,32 @@ pub fn gather_with_cache(sys: &dyn System, cache_dir: &Path) -> HostFacts {
     .filter(Ran::success)
     .map(|r| r.out())
     .unwrap_or_default();
+    let product_name = run(sys, &hardware::product_cmd())
+        .filter(Ran::success)
+        .and_then(|r| hardware::parse_product_name(&r.out()));
+    let (chip, processor_speed) = run(sys, &hardware::brand_cmd())
+        .filter(Ran::success)
+        .and_then(|r| hardware::parse_brand(&r.out()))
+        .unwrap_or_default();
+    let disk = run(sys, &hardware::disk_cmd())
+        .filter(Ran::success)
+        .and_then(|r| hardware::internal_disk(&r.out()))
+        .unwrap_or_default();
     HostFacts {
         computer_name: scutil_get(sys, "ComputerName"),
         local_host_name: scutil_get(sys, "LocalHostName"),
         uuid: ioreg_string(&platform, "IOPlatformUUID").unwrap_or_default(),
         serial: ioreg_string(&platform, "IOPlatformSerialNumber").unwrap_or_default(),
         form: form(sys, &model),
+        model_name: hardware::model_name(&model, product_name.as_deref()).unwrap_or_default(),
+        chip,
+        processor_speed,
+        memory_bytes: run(sys, &hardware::memsize_cmd())
+            .filter(Ran::success)
+            .and_then(|r| hardware::parse_memsize(&r.out()))
+            .unwrap_or(0),
+        disk_bytes: disk.bytes,
+        disk_rotational: disk.rotational,
         model,
         arch: line(sys, &Cmd::new("/usr/bin/uname").arg("-m")),
         os_version: line(sys, &Cmd::new("/usr/bin/sw_vers").arg("-productVersion")),
@@ -567,6 +588,19 @@ UserShell: /bin/zsh
             Ran::ok(VM_IOREG),
         )
         .on("/usr/sbin/sysctl -n hw.model", Ran::ok("VirtualMac2,1\n"))
+        .on(
+            &hardware::product_cmd().display(),
+            Ran::ok(crate::hardware::tests::VM_PRODUCT),
+        )
+        .on(
+            "/usr/sbin/sysctl -n machdep.cpu.brand_string",
+            Ran::ok("Apple M5 (Virtual)\n"),
+        )
+        .on("/usr/sbin/sysctl -n hw.memsize", Ran::ok("8589934592\n"))
+        .on(
+            &hardware::disk_cmd().display(),
+            Ran::ok(crate::hardware::tests::VM_DISKS),
+        )
         .on("/usr/bin/uname -m", Ran::ok("arm64\n"))
         .on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"))
         .on("/usr/bin/sw_vers -buildVersion", Ran::ok("26A428\n"))
@@ -627,6 +661,11 @@ UserShell: /bin/zsh
         assert_eq!(f.uuid, "C3396674-FCD3-52E5-A1C1-BD5B9E8F5C43");
         assert_eq!(f.serial, "ZNYVNTRJN5");
         assert_eq!(f.model, "VirtualMac2,1");
+        assert_eq!(f.model_name, "Virtual Machine");
+        assert_eq!(f.chip, "Apple M5 (Virtual)");
+        assert_eq!(f.processor_speed, "");
+        assert_eq!(f.memory_bytes, 8_589_934_592);
+        assert_eq!((f.disk_bytes, f.disk_rotational), (90_000_003_072, false));
         assert_eq!(f.arch, "arm64");
         assert_eq!(f.os_version, "27.0");
         assert_eq!(f.os_build, "26A428");
@@ -656,12 +695,48 @@ UserShell: /bin/zsh
     }
 
     #[test]
+    fn the_laptops_hardware_comes_from_sysctl_and_ioreg_never_the_slow_tools() {
+        // The MacBook Air's own answers (Mac17,4, macOS 27.0.1).
+        let sys = Fake::root();
+        sys.on("/usr/sbin/sysctl -n hw.model", Ran::ok("Mac17,4\n"))
+            .on(
+                &hardware::product_cmd().display(),
+                Ran::ok(crate::hardware::tests::AIR_PRODUCT),
+            )
+            .on(
+                "/usr/sbin/sysctl -n machdep.cpu.brand_string",
+                Ran::ok("Apple M5\n"),
+            )
+            .on("/usr/sbin/sysctl -n hw.memsize", Ran::ok("34359738368\n"))
+            .on(
+                &hardware::disk_cmd().display(),
+                Ran::ok(crate::hardware::tests::AIR_DISKS),
+            );
+        let f = gather_with_cache(&sys, Path::new("/c"));
+        assert_eq!(
+            crate::hardware::describe(&f).unwrap().spaced(),
+            "MacBook Air M5 32GB 4TB"
+        );
+        // system_profiler and diskutil take 40 to 210 ms each; the facts are read on every
+        // hello. And not df: the startup container is not the Mac's disk.
+        assert!(
+            !sys.calls().iter().any(|c| c.contains("system_profiler")
+                || c.contains("diskutil")
+                || c.contains("/bin/df")),
+            "{:?}",
+            sys.calls()
+        );
+    }
+
+    #[test]
     fn a_fact_no_tool_answered_stays_empty_rather_than_guessed() {
         // Nothing scripted: every run fails, every file is missing.
         let f = gather_with_cache(&Fake::root(), Path::new("/c"));
         assert_eq!(f.uuid, "");
         assert_eq!(f.computer_name, "");
         assert_eq!(f.form, Form::Unknown);
+        assert_eq!((f.model_name.as_str(), f.chip.as_str()), ("", ""));
+        assert_eq!((f.memory_bytes, f.disk_bytes), (0, 0));
         assert_eq!(f.filevault, None);
         assert_eq!(f.boot_time, 0);
         assert_eq!(f.idle_secs, None);

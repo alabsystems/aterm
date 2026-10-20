@@ -11,8 +11,7 @@
 //!
 //! It lives beside the CPU rasterizer because the native window (`aterm-gui`) and the web
 //! module (`aterm-wasm`) both render through it. A host keeps only what it alone has: the
-//! High Contrast latch, the Linux CSD base, the presence row, the palette read and the
-//! pointer.
+//! High Contrast latch, the Linux CSD base, the palette read and the pointer.
 //!
 //! Pure: no clock, no platform, no state. Rows reserve space above the grid; nothing here
 //! overlays a terminal cell.
@@ -187,8 +186,8 @@ pub fn rows(resolved: Vec<Resolved>) -> PaintedBand {
             .map(|k| {
                 let mut out = cell(k.ch, k.fg, k.bg, k.bold, false);
                 out.text_presentation = k.text_presentation;
-                // A wide glyph's right half (the presence row's CJK or emoji
-                // role): the renderer spans the lead cell across it.
+                // A wide glyph's right half (a CJK or emoji glyph in the
+                // band's words): the renderer spans the lead cell across it.
                 out.wide = k.continuation;
                 out
             })
@@ -219,11 +218,10 @@ pub const DIVIDER_ALPHA: f32 = 0.35;
 ///
 /// The seam belongs to the stack, not the painter's last row: the compose pads the cache
 /// with [`blank_band_row`] when the geometry has committed more rows than it holds (after a
-/// dismissal, for `SHRINK_QUIET` or while an echo runs, and through a handoff freeze),
-/// trims it when the count is below it, and a presence row may sit above with no band row
-/// after it. Sealing after composition covers every shape with one rule. No band or
-/// presence cell uses underline otherwise, so clearing it above the last row erases only a
-/// stale seam.
+/// dismissal, for `SHRINK_QUIET` or while an echo runs, and through a handoff freeze), and
+/// trims it when the count is below it. Sealing after composition covers every shape with
+/// one rule. No band cell uses underline otherwise, so clearing it above the last row erases
+/// only a stale seam.
 pub fn seal_stack(rows: &mut [Vec<RenderCell>], inks: &BandInks, forced: bool) {
     let Some((last, above)) = rows.split_last_mut() else {
         return;
@@ -459,7 +457,7 @@ pub fn band_row_edges(
     out
 }
 
-/// The chrome bleed for `bars` band rows (the presence row counted) under
+/// The chrome bleed for `bars` band rows under
 /// `strip` chrome rows with no surface of their own: the band's rows reach
 /// the window edges in the band's tone with the seam that closes it, and the
 /// strip rows keep the padding ([`ChromeBleed::first`]). `row_edges` are the
@@ -508,10 +506,10 @@ pub struct BandFrame {
 
 /// Splice the band onto the just-composed frame `dst`, above the grid
 /// ([`RenderInput::prepend_host_rows`]): the painted `rows` and `rasters` trimmed or padded
-/// to the `committed` count, under an optional row `above` (a host's presence row), each
-/// raster placed ([`on_frame`]), the stack sealed ([`seal_stack`]), the seams drawn as
-/// rails where the stack allows it ([`seam_can_rail`]), and each outlined capsule floored
-/// ([`floor_rings`]). Returns the rows prepended (`0`: `dst` untouched).
+/// to the `committed` count, each raster placed ([`on_frame`]), the stack sealed
+/// ([`seal_stack`]), the seams drawn as rails where the stack allows it
+/// ([`seam_can_rail`]), and each outlined capsule floored ([`floor_rings`]). Returns the
+/// rows prepended (`0`: `dst` untouched).
 ///
 /// Under-supply is padded with [`blank_band_row`]: the window was sized for `committed`
 /// rows, and composing fewer would show the terminal's top row under the band.
@@ -521,7 +519,6 @@ pub struct BandFrame {
 )]
 pub fn compose_band(
     dst: &mut RenderInput,
-    above: Option<&[RenderCell]>,
     rows: &[Vec<RenderCell>],
     rasters: &[Option<RowRaster>],
     committed: usize,
@@ -531,7 +528,7 @@ pub fn compose_band(
     pool: &mut Vec<Vec<RenderCell>>,
     pixels: HostRowPixels,
 ) -> usize {
-    if committed == 0 && above.is_none() {
+    if committed == 0 {
         return 0;
     }
     let padded: Vec<Vec<RenderCell>>;
@@ -548,13 +545,13 @@ pub fn compose_band(
     } else {
         rows
     };
-    let composed = usize::from(above.is_some()) + rows.len();
+    let composed = rows.len();
     // The band owns the frame's pixel-resolution chrome rows: none carry
     // over from the scratch's last use.
     dst.chrome_rasters.clear();
     dst.prepend_host_rows(
         composed,
-        above.into_iter().chain(rows.iter().map(Vec::as_slice)),
+        rows.iter().map(Vec::as_slice),
         at.cell_h,
         at.grid_top,
         pool,
@@ -562,17 +559,16 @@ pub fn compose_band(
     );
     // Each painted row's raster at its composed index; a strip prepended later shifts it
     // with every other per-row channel.
-    let above_n = usize::from(above.is_some());
     for (i, raster) in rasters.iter().take(rows.len()).enumerate() {
         if let Some(r) = raster
-            && let Ok(row) = u16::try_from(above_n + i)
+            && let Ok(row) = u16::try_from(i)
         {
             dst.chrome_rasters
                 .push(on_frame(r, row, at.lo, at.frame_w, at.cell_h));
         }
     }
-    // The seam goes on the composed stack's last row (painted, padded, or the row above
-    // alone), never the painter's last row. Rows `0..composed` are exactly this stack.
+    // The seam goes on the composed stack's last row (painted or padded), never the
+    // painter's last row. Rows `0..composed` are exactly this stack.
     seal_stack(&mut dst.cells[..composed], inks, forced);
     give_seam_to_rails(
         &mut dst.cells[..composed],
@@ -681,7 +677,6 @@ mod tests {
         assert_eq!(
             compose_band(
                 &mut f,
-                None,
                 &[row('a')],
                 &[None],
                 0,
@@ -697,7 +692,6 @@ mod tests {
         let mut f = engine();
         let n = compose_band(
             &mut f,
-            None,
             &[row('a')],
             &[None],
             3,
@@ -726,7 +720,6 @@ mod tests {
         let mut f = engine();
         let n = compose_band(
             &mut f,
-            None,
             &[row('a'), row('b'), row('c')],
             &[None, None, None],
             2,

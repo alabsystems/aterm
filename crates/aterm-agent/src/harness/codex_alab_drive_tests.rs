@@ -6,11 +6,14 @@
 //! is back at its prompt, and the relaunch that appears under it when its line is typed. Then
 //! the run's snapshot, and the prune bound to `HarnessUpgradeStateCollection`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::*;
-use crate::harness::self_claimed::{Live as ClaimedLive, Record, Resume, Witnesses, validate};
+use crate::harness::self_claimed::{
+    FirstFrame, Live as ClaimedLive, Record, Resume, Witnesses, validate,
+};
 use crate::harness::upgrade::Request;
 use crate::supervise::ScratchDir;
 
@@ -135,6 +138,9 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
                 .collect::<Vec<_>>()
                 .join("\n"),
             "line" => "OK % ".to_string(),
+            // The server's hard lease: the harness's hand on the tab.
+            "lease" if line.contains(" acquire ") => "OK lease acquired".to_string(),
+            "lease" => "OK lease released".to_string(),
             "turn" => {
                 if line.contains("'resume'") {
                     w.relaunched.store(true, Ordering::SeqCst);
@@ -148,7 +154,10 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
 
 /// The scripted kernel: [`TUI`] crashed out of [`SHELL`], whose group has the terminal back;
 /// the relaunch [`NEW`] appears under the shell, holding the thread's lock, once its line is
-/// typed. For a run's snapshot, [`TUI`]'s image and open files.
+/// typed, and is up at the `up_at`th look with the frame it names (never: `None`), or ends after
+/// `ends_at` looks; its kernel start reads `births` read by read, then [`NEW_BIRTH`]. Each look
+/// is marked in the stand-in's request log (`kernel first-frame <n> <idle|turn|->`), between the
+/// requests it falls between. For a run's snapshot, [`TUI`]'s image and open files.
 struct Crashed {
     relaunched: Arc<AtomicBool>,
     lock: PathBuf,
@@ -156,7 +165,15 @@ struct Crashed {
     tui_alive: bool,
     exe: Option<PathBuf>,
     files: Vec<PathBuf>,
+    up_at: Option<(usize, FirstFrame)>,
+    ends_at: Option<usize>,
+    births: Arc<Mutex<VecDeque<Option<String>>>>,
+    looks: Arc<AtomicUsize>,
+    marks: crate::harness::FakeInstanceLog,
 }
+
+/// [`NEW`]'s kernel start, as the record reader spells one.
+const NEW_BIRTH: &str = "Thu Oct 16 08:00:09 2026";
 
 impl Kernel for Crashed {
     fn job(&self, _: u32) -> Option<(super::super::Job, u32)> {
@@ -176,7 +193,12 @@ impl AlabKernel for Crashed {
     fn alive(&self, pid: u32) -> bool {
         match pid {
             TUI => self.tui_alive,
-            NEW => self.relaunched.load(Ordering::SeqCst),
+            NEW => {
+                self.relaunched.load(Ordering::SeqCst)
+                    && self
+                        .ends_at
+                        .is_none_or(|n| self.looks.load(Ordering::SeqCst) < n)
+            }
             _ => pid == SHELL,
         }
     }
@@ -229,6 +251,31 @@ impl AlabKernel for Crashed {
 
     fn in_tab(&self, _: &mut Client, _: u32, _: &str) -> bool {
         true
+    }
+
+    fn birth(&self, pid: u32) -> Option<String> {
+        if pid != NEW || !self.alive(NEW) {
+            return None;
+        }
+        let scripted = self.births.lock().ok().and_then(|mut b| b.pop_front());
+        scripted.unwrap_or_else(|| Some(NEW_BIRTH.to_string()))
+    }
+
+    fn first_frame(&self, _: &mut Client, pid: u32, birth: &str, _: &str) -> Option<FirstFrame> {
+        let n = self.looks.fetch_add(1, Ordering::SeqCst) + 1;
+        let up = self
+            .up_at
+            .filter(|(at, _)| pid == NEW && birth == NEW_BIRTH && n >= *at)
+            .map(|(_, frame)| frame);
+        let word = match up {
+            Some(FirstFrame::Idle) => "idle",
+            Some(FirstFrame::Turn) => "turn",
+            None => "-",
+        };
+        if let Ok(mut log) = self.marks.lock() {
+            log.push(format!("kernel first-frame {n} {word}"));
+        }
+        up
     }
 }
 
@@ -287,6 +334,7 @@ impl Rig {
             aterm_state: None,
             ask: false,
             several_logins: false,
+            usage_credits: false,
             usage_tap: None,
             instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
             timings: crate::harness::Timings::FAST,
@@ -304,6 +352,11 @@ impl Rig {
             tui_alive: false,
             exe: None,
             files: Vec::new(),
+            up_at: Some((1, FirstFrame::Idle)),
+            ends_at: None,
+            births: Arc::new(Mutex::new(VecDeque::new())),
+            looks: Arc::new(AtomicUsize::new(0)),
+            marks: asked.clone(),
         };
         Rig {
             dir,
@@ -321,6 +374,7 @@ impl Rig {
     fn snap(&self, home_env: Option<String>) -> crate::harness::relaunch::Snapshot {
         crate::harness::relaunch::Snapshot {
             stored_login: false,
+            profile: None,
             tab: TAB.to_string(),
             pid: TUI,
             start: "Thu Oct 16 08:00:00 2026".to_string(),
@@ -465,6 +519,7 @@ fn a_self_claimed_crash_relaunch_keeps_the_captured_home_environment() {
             exit: None,
             cwd: Some(snap.cwd.clone()),
             draft_empty: None,
+            frame: None,
         };
         let live = ClaimedLive {
             exec_path: launch,
@@ -531,6 +586,215 @@ fn the_crash_relaunch_types_nothing_after_the_new_tui_leads_the_tab() {
                 .all(|verb| !TYPES_OR_READS.contains(&verb.as_str())),
             "hand_back={hand_back}: asked after the line: {after:?}"
         );
+    }
+}
+
+/// Whether `asked` (the stand-in's log, the kernel's looks marked in it) shows the harness's
+/// hand given back after the relaunch line and before the relaunched process was up: the
+/// 0.106.0 give-back that codex-alab's launch probe read as `hand=-`.
+fn released_before_up(asked: &[String]) -> bool {
+    let line = asked
+        .iter()
+        .position(|l| l.contains(" turn ") && l.contains("'resume'"))
+        .expect("the line was typed");
+    let after = &asked[line..];
+    let released = after.iter().position(|l| l.contains(" lease release "));
+    let up = after
+        .iter()
+        .position(|l| l.starts_with("kernel first-frame ") && !l.ends_with(" -"));
+    match (released, up) {
+        (Some(released), Some(up)) => released < up,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+impl Rig {
+    /// The kernel's looks at the relaunched process during the hold.
+    fn looks(&self) -> usize {
+        self.asked()
+            .iter()
+            .filter(|l| l.starts_with("kernel first-frame "))
+            .count()
+    }
+
+    /// How the hold ended, as the ledger's `done:resumed` row says it after the outcome.
+    fn held(&self) -> String {
+        let ledger =
+            std::fs::read_to_string(crate::harness::upgrade_drive::ledger_path(&self.opts))
+                .unwrap_or_default();
+        ledger
+            .lines()
+            .filter_map(|l| aterm_json::from_str::<aterm_json::Value>(l).ok())
+            .filter(|row| {
+                row.get("step").and_then(aterm_json::Value::as_str) == Some("done:resumed")
+            })
+            .filter_map(|row| {
+                let detail = row.get("detail")?.as_str()?;
+                Some(
+                    detail
+                        .rsplit_once("; ")
+                        .map_or(detail, |(_, held)| held)
+                        .to_string(),
+                )
+            })
+            .next_back()
+            .unwrap_or_default()
+    }
+
+    /// The crash rule's relaunch, run to its end: `done:resumed`, the line alone typed, and
+    /// nothing typed or read after it.
+    fn relaunch_resumed(&self) {
+        let snap = self.snap(None);
+        let resume = self.resume(None);
+        let r = self_claimed_after_exit(&self.opts, &snap, &resume, ExitCause::Exit, &self.kernel);
+        let asked = self.asked();
+        assert_eq!(r.step, "done:resumed", "{r:?} {asked:#?}");
+        assert!(
+            asked.iter().any(|l| l.contains(" lease release ")),
+            "given back in the end: {asked:#?}"
+        );
+        assert_eq!(self.typed().len(), 1, "the line alone: {asked:#?}");
+        assert!(
+            self.after_the_line()
+                .iter()
+                .all(|verb| !TYPES_OR_READS.contains(&verb.as_str())),
+            "{asked:#?}"
+        );
+    }
+}
+
+/// THE RELAUNCH HAND IS HELD TO THE RELAUNCHED PROCESS'S FIRST IDLE (the contract §5,
+/// carry-on): the lease taken before the line goes back only once the relaunched codex-alab
+/// reads at its first idle (here its third look), never as its TUI first leads the tab, so
+/// its launch probe — its first `status`, read as it starts — sees
+/// `hand=lease:aterm-harness@<aterm>`, and the ledger says so; still `done:resumed`, nothing
+/// typed and no screen read meanwhile. NEGATIVE CONTROL: the hold's bound at zero — the
+/// give-back as the new TUI leads the tab, the carve's (3999d9adc6) — shows in the same log as
+/// the release before the first idle, which the check refuses.
+#[test]
+fn the_relaunch_hand_is_held_to_the_relaunched_processs_first_idle() {
+    for (bound, held) in [(None, true), (Some(Duration::ZERO), false)] {
+        let mut rig = Rig::new(
+            &format!("self-claim-first-idle-{held}"),
+            &["zsh: killed     codex"],
+        );
+        rig.kernel.up_at = Some((3, FirstFrame::Idle));
+        if let Some(bound) = bound {
+            rig.opts.timings.alab_first_idle = bound;
+        }
+        rig.relaunch_resumed();
+        let asked = rig.asked();
+        assert_eq!(
+            released_before_up(&asked),
+            !held,
+            "bound={bound:?}: {asked:#?}"
+        );
+        let said = if held {
+            HELD_TO_FIRST_IDLE
+        } else {
+            HELD_TO_THE_BOUND
+        };
+        assert_eq!(rig.held(), said, "bound={bound:?}: {asked:#?}");
+    }
+}
+
+/// A TURN ALREADY UNDER WAY ENDS THE HOLD AT ONCE: the relaunched codex-alab's claim proven
+/// (its launch probe has read) and its frame in a turn or a box — a person's turn, or a carry-on
+/// that went before a later step took the hand — is past its first idle, and codex-alab's own
+/// acts in that turn wait for this very lease (the contract §5, `hand=-` before every act), so
+/// the hand goes back at that look. NEGATIVE CONTROL: a look that finds no frame named holds
+/// on, to the bound.
+#[test]
+fn a_turn_already_under_way_ends_the_relaunch_hold_at_once() {
+    for (up, looks_once, said) in [
+        (Some((1, FirstFrame::Turn)), true, HELD_TO_A_TURN),
+        (None, false, HELD_TO_THE_BOUND),
+    ] {
+        let mut rig = Rig::new(
+            &format!("self-claim-turn-{looks_once}"),
+            &["zsh: killed     codex"],
+        );
+        rig.kernel.up_at = up;
+        rig.relaunch_resumed();
+        let asked = rig.asked();
+        assert_eq!(rig.looks() == 1, looks_once, "{asked:#?}");
+        assert_eq!(rig.held(), said, "{asked:#?}");
+    }
+}
+
+/// AN UNREAD KERNEL START IS UNKNOWN, NEVER THE RELAUNCHED PROCESS'S END: off Apple the start
+/// is a `ps`, which can fail once; read as an end, the hand went back while codex-alab still
+/// ran (or was never held at all, when the first read failed), and its launch probe could read
+/// `hand=-`. Here the first two reads fail: the hold still runs to the first idle. NEGATIVE
+/// CONTROL: another start of the same pid (the process gone, its pid another's) ends the hold
+/// at that read, looked at no more.
+#[test]
+fn an_unread_kernel_start_never_ends_the_relaunch_hold() {
+    let other = "Thu Oct 16 08:00:10 2026".to_string();
+    for (births, up, looks, said) in [
+        (
+            vec![None, None],
+            Some((1, FirstFrame::Idle)),
+            1,
+            HELD_TO_FIRST_IDLE,
+        ),
+        (
+            vec![Some(NEW_BIRTH.to_string()), Some(other.clone())],
+            None,
+            1,
+            HELD_TO_ITS_END,
+        ),
+    ] {
+        let mut rig = Rig::new(
+            &format!("self-claim-birth-{}", up.is_some()),
+            &["zsh: killed     codex"],
+        );
+        rig.kernel.up_at = up;
+        rig.kernel.births = Arc::new(Mutex::new(births.into_iter().collect()));
+        rig.relaunch_resumed();
+        let asked = rig.asked();
+        assert_eq!(rig.looks(), looks, "{asked:#?}");
+        assert_eq!(rig.held(), said, "{asked:#?}");
+        assert_eq!(released_before_up(&asked), up.is_none(), "{asked:#?}");
+    }
+}
+
+/// The hold ends with the relaunched process: one that ends before its first idle (the proof's
+/// second crash, killed as soon as its claim is proven) has the hand given back at its end,
+/// looked at no more, and the relaunch is still `done:resumed` (its own exit is its own
+/// copy's to decide, `relaunch::outcome`). NEGATIVE CONTROL: one that neither ends nor idles
+/// is looked at until the hold's bound.
+#[test]
+fn the_relaunch_hand_goes_back_when_the_relaunched_process_ends_before_its_first_idle() {
+    for ends_at in [Some(2), None] {
+        let mut rig = Rig::new(
+            &format!("self-claim-ends-{}", ends_at.is_some()),
+            &["zsh: killed     codex"],
+        );
+        rig.kernel.up_at = None;
+        rig.kernel.ends_at = ends_at;
+        rig.relaunch_resumed();
+        let asked = rig.asked();
+        let last_look = asked
+            .iter()
+            .rposition(|l| l.starts_with("kernel first-frame "))
+            .expect("looked");
+        let release = asked
+            .iter()
+            .rposition(|l| l.contains(" lease release "))
+            .expect("given back");
+        assert!(last_look < release, "{asked:#?}");
+        match ends_at {
+            Some(n) => {
+                assert_eq!(rig.looks(), n, "no look after its end: {asked:#?}");
+                assert_eq!(rig.held(), HELD_TO_ITS_END, "{asked:#?}");
+            }
+            None => {
+                assert!(rig.looks() > 2, "held to the bound: {asked:#?}");
+                assert_eq!(rig.held(), HELD_TO_THE_BOUND, "{asked:#?}");
+            }
+        }
     }
 }
 
@@ -625,6 +889,11 @@ impl Crashed {
             tui_alive: self.tui_alive,
             exe: self.exe.clone(),
             files: self.files.clone(),
+            up_at: self.up_at,
+            ends_at: self.ends_at,
+            births: Arc::clone(&self.births),
+            looks: Arc::clone(&self.looks),
+            marks: self.marks.clone(),
         }
     }
 }
@@ -645,6 +914,7 @@ fn prune_opts(dir: &Path) -> Opts {
         aterm_state: None,
         ask: false,
         several_logins: false,
+        usage_credits: false,
         usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
         timings: crate::harness::Timings::FAST,

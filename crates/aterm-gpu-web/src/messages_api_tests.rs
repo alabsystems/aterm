@@ -21,7 +21,7 @@ type Host = AtermGpuTerminal;
 /// A frame, built headless: the GPU face's frame scratch (there is no surface
 /// to present to here).
 fn draw(t: &mut Host) {
-    let _ = t.render_headless();
+    let _ = t.render_headless().expect("renderable frame");
 }
 
 /// Whether two terminals built the same picture: the GPU face's frame scratch.
@@ -47,12 +47,12 @@ fn the_band_composes_into_the_gpu_frame() {
     let (mut plain, _) = clocked(12, 60);
     let (mut t, t0) = clocked(12, 60);
     for x in [&mut plain, &mut t] {
-        x.set_chrome(6, 0);
+        x.set_chrome(6, 0).expect("admitted geometry");
         x.process(b"$ ls");
     }
     let _ = t.notice_at("post ci Build finished", t0, stamp());
-    let _ = t.render_headless();
-    let _ = plain.render_headless();
+    let _ = t.render_headless().expect("renderable frame");
+    let _ = plain.render_headless().expect("renderable frame");
     assert!(
         t.frame_scratch == plain.frame_scratch,
         "a record never reaches the frame"
@@ -65,7 +65,10 @@ fn the_band_composes_into_the_gpu_frame() {
     );
     assert!(reply.starts_with("OK message="), "{reply}");
     assert_eq!(t.band_rows(), 1);
-    assert!(!t.render_headless(), "the band's frame is built");
+    assert!(
+        !t.render_headless().expect("renderable frame"),
+        "the band's frame is built"
+    );
     assert_eq!(t.frame_scratch.rows, 13, "one band row above twelve");
     assert_eq!(t.frame_scratch.grid_top_row, 1);
     assert_eq!(t.frame_scratch.grid_bot_row, 13);
@@ -79,15 +82,18 @@ fn the_band_composes_into_the_gpu_frame() {
         t.cpu.chrome_bleed().is_some(),
         "the gutters in the band's tone"
     );
-    assert!(t.render_headless(), "a settled band gates the next frame");
+    assert!(
+        t.render_headless().expect("renderable frame"),
+        "a settled band gates the next frame"
+    );
     assert_eq!(t.messages_next_wake_ms_at(t0 + ms(1)), 5000.0);
     // The hold ends, the shrink's quiet passes, the row count follows.
     let _ = t.messages_tick_at(t0 + ms(5001));
     let bits = t.messages_tick_at(t0 + ms(5001) + aterm_messages::SHRINK_QUIET);
     assert_eq!(bits & 2, 2, "the row count moved");
     assert_eq!(t.band_rows(), 0);
-    assert!(!t.render_headless());
-    let _ = plain.render_headless();
+    assert!(!t.render_headless().expect("renderable frame"));
+    let _ = plain.render_headless().expect("renderable frame");
     assert!(
         t.frame_scratch == plain.frame_scratch,
         "the band-less frame again"
@@ -115,9 +121,9 @@ fn the_band_frame_is_one_picture_on_both_web_renderers() {
         Err(e) => aterm_spec::host::could_not_run(format!("no GPU: {e}")),
     };
     let (mut t, t0) = clocked(6, 24);
-    t.set_chrome(6, 0);
+    t.set_chrome(6, 0).expect("admitted geometry");
     t.process(b"\x1b[31mRR\x1b[0m\r\n\x1b[44m  \x1b[0m\r\n\x1b[7mXX\x1b[0m\r\nab\r\n");
-    let _ = t.render_headless();
+    let _ = t.render_headless().expect("renderable frame");
     let plain = t.cpu.render_input(&t.frame_scratch);
     for line in [
         "post ci sev=warn hold=60 Disk nearly full -- 2 GB left",
@@ -128,7 +134,10 @@ fn the_band_frame_is_one_picture_on_both_web_renderers() {
     }
     let _ = t.messages_tick_at(t0 + ms(2500));
     assert_eq!(t.band_rows(), 2, "the warning and the bar, past its grace");
-    assert!(!t.render_headless(), "the band's frame is built");
+    assert!(
+        !t.render_headless().expect("renderable frame"),
+        "the band's frame is built"
+    );
     assert!(
         !t.frame_scratch.chrome_rasters.is_empty(),
         "the bar's meter is drawn at pixel resolution"
@@ -200,12 +209,12 @@ fn the_gpu_band_has_the_twins_exports() {
         t0,
     );
     assert_eq!(t.band.inks, BandInks::forced(hc));
-    let _ = t.render_headless();
+    let _ = t.render_headless().expect("renderable frame");
     assert!(t.frame_scratch.cells[0].iter().all(|c| c.bg == hc.btn_face));
     let log = t.messages_log_since_at(0.0);
     assert!(log.starts_with("OK 1 1\nm1\tkind=posted"), "{log}");
     t.set_details_view_at(true, t0);
-    let _ = t.render_headless();
+    let _ = t.render_headless().expect("renderable frame");
     let words: String = t.frame_scratch.cells[0].iter().map(|c| c.ch).collect();
     assert!(words.contains("Details"), "{words}");
 }
@@ -226,14 +235,18 @@ fn the_gpu_band_restores_the_kept_log() {
         .map(str::to_string)
         .collect();
     let (mut t, t1) = clocked(12, 60);
-    let rows = t.surface_rows();
+    let size = t.checked_surface_size().expect("the prior physical frame");
     assert_eq!(
         t.messages_restore_at(&kept.join("\n"), t1),
         "OK records=1 skipped=0 dup=0 over=0"
     );
     let _ = t.messages_tick_at(t1 + ms(10));
     assert_eq!(t.band_rows(), 0, "a restored row is a record");
-    assert_eq!(t.surface_rows(), rows);
+    assert_eq!(
+        t.checked_surface_size()
+            .expect("the restored physical frame"),
+        size
+    );
     assert_eq!(t.messages_next_wake_ms_at(t1 + ms(10)), -1.0);
     assert!(t.messages_read_at("8", 9).contains(" state=stale "));
     assert!(t
@@ -289,7 +302,7 @@ fn page_chrome(all: usize, problems: usize, chip: Option<&str>) -> String {
     let on = u8::from(chip.is_none());
     let current = chip.unwrap_or("All");
     format!(
-        "\theading=Messages\tsubtitle=What aterm reported, newest first.\tall_words=All \u{00b7} {all}\tproblems_words=Problems \u{00b7} {problems}\tall_tags=All tags\tall_tags_on={on}\ttag_menu=Tag: {current}\ttag_menu_name=Filter by tag: {current}\tcopy_all_button=Copy All\tcopy_all_name=Copy the shown messages\tempty=Nothing yet.\ttechnical_caption=Technical details\tcopy_button=Copy"
+        "\theading=Messages\tsubtitle=What aterm reported, newest first.\tall_words=All \u{00b7} {all}\tproblems_words=Problems \u{00b7} {problems}\tall_tags=All tags\tall_tags_on={on}\ttag_menu=Tag: {current}\ttag_menu_name=Filter by tag: {current}\tcopy_all_button=Copy All\tcopy_all_name=Copy All shown messages\tempty=Nothing yet.\ttechnical_caption=Technical details\tcopy_button=Copy"
     )
 }
 

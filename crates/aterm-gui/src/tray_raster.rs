@@ -108,11 +108,14 @@ pub(crate) fn first_unresolved_slot(status: &str) -> Option<&str> {
 
 #[derive(Clone)]
 struct ResolvedCandidateFace {
-    path: String,
+    face: aterm_render::FaceRef,
     bytes: Arc<Vec<u8>>,
 }
 
-type CandidateFaceCache = HashMap<String, Result<ResolvedCandidateFace, String>>;
+/// Resolved candidate faces by (lowercased family, the style it serves): one
+/// family resolves to a different face per slot (`Menlo` and its Bold).
+type CandidateFaceCache =
+    HashMap<(String, aterm_render::FaceTarget), Result<ResolvedCandidateFace, String>>;
 
 struct SemanticPrewarmJob {
     generation: u64,
@@ -302,21 +305,21 @@ impl SemanticPrewarmWorker {
 
 fn resolve_candidate_face(
     family: &str,
+    target: aterm_render::FaceTarget,
     cache: &mut CandidateFaceCache,
 ) -> Result<ResolvedCandidateFace, String> {
-    let key = family.trim().to_ascii_lowercase();
+    let key = (family.trim().to_ascii_lowercase(), target);
     if let Some(cached) = cache.get(&key) {
         return cached.clone();
     }
-    // `read_resolved_font`, never a bare file read: a `display:` face or a
-    // bundled one (`JetBrains Mono` on non-macOS, `bundled:…`) resolves to
-    // compiled-in bytes — the same interception every other resolution path
-    // performs.
-    let resolved = aterm_render::resolve_config_font(family).and_then(|path| {
-        aterm_render::read_resolved_font(&path)
+    // `read_resolved_font`, never a bare file read: a bundled face
+    // (`JetBrains Mono` on non-macOS, `bundled:…`) resolves to compiled-in
+    // bytes — the same interception every other resolution path performs.
+    let resolved = aterm_render::resolve_config_font(family, target).and_then(|face| {
+        aterm_render::read_resolved_font(&face.path)
             .map(|bytes| ResolvedCandidateFace {
                 bytes: aterm_render::intern_font_bytes(bytes.into_owned()),
-                path,
+                face,
             })
             .map_err(|error| format!("font {family:?} could not be read ({error})"))
     });
@@ -339,27 +342,20 @@ fn build_semantic_candidate(
             SemanticFontResolution::Fallback(vec!["renderer fork".to_string()]),
         );
     };
-    // Candidate resolution is complete on this parked worker. Once the fork
-    // reaches semantic compile/paint it must be a closed immutable cascade:
-    // no missing glyph may trigger system resolver or filesystem work.
-    renderer.set_runtime_font_discovery(false);
     let mut unresolved = Vec::new();
     if let Some(family) = candidate.regular.as_deref() {
-        match resolve_candidate_face(family, faces).and_then(|face| {
-            renderer.set_primary_font_from_resolved_path(face.bytes.as_slice(), face.path)
-        }) {
-            Ok(()) => {
-                // A display-face mix draws its other faces too, as the
-                // terminal does (`native_font_catalog::prepare`).
-                if let Some(mix) = aterm_render::display_face_mix_for_family(family)
-                    && mix.len() > 1
-                    && let Err(error) = renderer.set_display_mix_faces(&mix[1..])
-                {
-                    unresolved.push(format!("regular {family:?}: {error}"));
-                }
-            }
+        match resolve_candidate_face(family, aterm_render::FaceTarget::REGULAR, faces).and_then(
+            |face| renderer.set_primary_font_from_resolved_path(face.bytes.as_slice(), face.face),
+        ) {
+            Ok(()) => {}
             Err(error) => unresolved.push(format!("regular {family:?}: {error}")),
         }
+    }
+    // The display layer the candidate draws over its font, as the terminal
+    // does (`native_font_catalog::prepare`); the fork carries the host's, so
+    // the candidate's replaces it (an empty one clears it).
+    if let Err(error) = renderer.set_display_faces(&candidate.display) {
+        unresolved.push(format!("display {:?}: {error}", candidate.display));
     }
     for (slot, label, family) in [
         (0, "bold", candidate.bold.as_deref()),
@@ -369,8 +365,8 @@ fn build_semantic_candidate(
         let Some(family) = family else {
             continue;
         };
-        match resolve_candidate_face(family, faces)
-            .and_then(|face| renderer.set_styled_font_bytes(slot, face.bytes.as_slice()))
+        match resolve_candidate_face(family, aterm_render::FaceTarget::for_slot(slot), faces)
+            .and_then(|face| renderer.set_styled_face(slot, face.bytes.as_slice(), face.face.index))
         {
             Ok(()) => {}
             Err(error) => unresolved.push(format!("{label} {family:?}: {error}")),
@@ -378,19 +374,21 @@ fn build_semantic_candidate(
     }
     let mut installed_fallback = false;
     for family in &candidate.fallback {
-        match resolve_candidate_face(family, faces).and_then(|face| {
-            if installed_fallback {
-                renderer.add_fallback_bytes(face.bytes.as_slice())
-            } else {
-                renderer.set_fallback_bytes(face.bytes.as_slice())
-            }
-        }) {
+        match resolve_candidate_face(family, aterm_render::FaceTarget::REGULAR, faces).and_then(
+            |face| {
+                if installed_fallback {
+                    renderer.add_fallback_bytes(face.bytes.as_slice())
+                } else {
+                    renderer.set_fallback_bytes(face.bytes.as_slice())
+                }
+            },
+        ) {
             Ok(()) => installed_fallback = true,
             Err(error) => unresolved.push(format!("fallback {family:?}: {error}")),
         }
     }
     if let Some(family) = candidate.symbol.as_deref() {
-        match resolve_candidate_face(family, faces)
+        match resolve_candidate_face(family, aterm_render::FaceTarget::REGULAR, faces)
             .and_then(|face| renderer.set_symbol_fallback_bytes(face.bytes.as_slice()))
         {
             Ok(()) => {}
@@ -398,7 +396,7 @@ fn build_semantic_candidate(
         }
     }
     if let Some(family) = candidate.emoji.as_deref() {
-        match resolve_candidate_face(family, faces)
+        match resolve_candidate_face(family, aterm_render::FaceTarget::REGULAR, faces)
             .and_then(|face| renderer.set_color_font_arc(Arc::clone(&face.bytes)))
         {
             Ok(()) => {}
@@ -408,6 +406,14 @@ fn build_semantic_candidate(
     renderer.set_synthetic_styles(candidate.synthetic_styles);
     let variations = candidate.variation_requests();
     let _ = renderer.set_font_variations(&variations, 0.0);
+    // Candidate resolution is complete on this parked worker. Once the fork
+    // reaches semantic compile/paint it must be a closed immutable cascade:
+    // no missing glyph may trigger system resolver or filesystem work. The
+    // seal settles the new faces here and closes pathname discovery, yet
+    // keeps the compiled-in symbol face; switching runtime discovery off
+    // instead closed that face too, so `❯` drew as nothing in any specimen
+    // set in a font of the person's choosing.
+    let _ = renderer.seal_admitted_font_sources();
     renderer.prepare_semantic_typography(
         "Regular Aa 012 · Bold Aa · Italic Aa · Bold Italic Aa · != == => -> · 你好世界 日本語 한글 🚀 😀 🐈‍⬛ e\u{301}",
     );
@@ -627,6 +633,308 @@ mod synthesized {
     }
 }
 
+/// The weight a UI-face run's East Asian text is drawn at ([`UiCjkFaces`]):
+/// the weight of the UI face the run is set in. `TextFace::UiBold` (Segoe UI
+/// Semibold, the selected tab's label, a heading) is `Semibold`; every other
+/// face is `Regular`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UiCjkWeight {
+    Regular,
+    Semibold,
+}
+
+impl UiCjkWeight {
+    fn of(face: TextFace) -> Self {
+        if face == TextFace::UiBold {
+            Self::Semibold
+        } else {
+            Self::Regular
+        }
+    }
+
+    /// The rung's slot in [`UiCjkFaces::rungs`] and `ChromeFonts::ui_cjk_held`.
+    const fn slot(self) -> usize {
+        match self {
+            Self::Regular => 0,
+            Self::Semibold => 1,
+        }
+    }
+}
+
+/// Which of the chrome's East Asian faces a char is asked of: Hangul goes to
+/// the Korean face, every other CJK char (ideographs, kana, bopomofo, CJK
+/// punctuation, the full- and halfwidth forms) to the Japanese then the
+/// Chinese face — the split Windows' own fallback for Segoe UI makes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UiCjkScript {
+    Han,
+    Hangul,
+}
+
+/// The [`UiCjkScript`] of `ch`, or `None` for a char outside the East Asian
+/// blocks: such a char keeps the terminal cascade it always had
+/// ([`ChromeFonts::face_for`]), so no symbol, arrow or other script changes face.
+fn ui_cjk_script(ch: char) -> Option<UiCjkScript> {
+    match u32::from(ch) {
+        // Hangul Jamo, Compatibility Jamo, Jamo Extended-A, syllables, Jamo
+        // Extended-B, the parenthesized and circled Hangul, halfwidth Hangul.
+        0x1100..=0x11FF
+        | 0x3130..=0x318F
+        | 0x3200..=0x321E
+        | 0x3260..=0x327E
+        | 0xA960..=0xA97F
+        | 0xAC00..=0xD7FF
+        | 0xFFA0..=0xFFDC => Some(UiCjkScript::Hangul),
+        // CJK radicals, Kangxi, description characters, CJK symbols and
+        // punctuation, kana, bopomofo, kanbun, strokes, enclosed CJK and CJK
+        // compatibility, Extension A, the unified ideographs, compatibility
+        // ideographs, vertical and compatibility forms, the full- and halfwidth
+        // forms, the kana supplements and the supplementary ideographic planes.
+        0x2E80..=0x2FFF
+        | 0x3000..=0x312F
+        | 0x3190..=0x33FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xF900..=0xFAFF
+        | 0xFE10..=0xFE1F
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF9F
+        | 0xFFE0..=0xFFEF
+        | 0x1B000..=0x1B16F
+        | 0x20000..=0x3FFFF => Some(UiCjkScript::Han),
+        _ => None,
+    }
+}
+
+/// The chrome's own East Asian faces, per weight, in the order Windows' own
+/// fallback for Segoe UI picks them: `(file under %WINDIR%\Fonts, collection
+/// index, script)`.
+///
+/// MEASURED 2026-10-18 on Windows 11 26200 through DirectWrite's system
+/// fallback (`IDWriteFactory2::GetSystemFontFallback` → `MapCharacters`, base
+/// family Segoe UI Variable, locale en-US and none): `日本語`, `中文`, kana, CJK
+/// punctuation and the fullwidth forms map to Yu Gothic UI, the simplified
+/// ideographs it lacks (`简`, `们`) to Microsoft JhengHei UI, and Hangul to
+/// Malgun Gothic; asked at weight 400 they map to Yu Gothic UI Regular (400),
+/// JhengHei UI (400) and Malgun Gothic (400), at weight 600 to Yu Gothic UI
+/// Semibold (600), JhengHei UI Bold (700) and Malgun Gothic Bold (700). The
+/// faces, read from each file's name and OS/2 tables: `YuGothM.ttc` face 1 is
+/// Yu Gothic UI Regular, `YuGothB.ttc` face 2 Yu Gothic UI Semibold,
+/// `msjh.ttc`/`msjhbd.ttc` face 1 Microsoft JhengHei UI and its Bold.
+///
+/// The terminal's chain takes Microsoft YaHei Bold and Malgun Gothic Bold
+/// instead (`aterm_render`'s weight-matched siblings, chosen beside Iosevka
+/// Term SemiBold): right for the grid, and what drew a quiet tab's `日本語`
+/// and `한국어` bolder than the Segoe UI Regular `notes` beside them (mean
+/// ink coverage 0.635 against 0.540, the 2026-10-18 judges).
+#[cfg(windows)]
+const UI_CJK_FILES: [&[(&str, u32, UiCjkScript)]; 2] = [
+    &[
+        ("YuGothM.ttc", 1, UiCjkScript::Han),
+        ("msjh.ttc", 1, UiCjkScript::Han),
+        ("malgun.ttf", 0, UiCjkScript::Hangul),
+    ],
+    &[
+        ("YuGothB.ttc", 2, UiCjkScript::Han),
+        ("msjhbd.ttc", 1, UiCjkScript::Han),
+        ("malgunbd.ttf", 0, UiCjkScript::Hangul),
+    ],
+];
+
+/// macOS draws no pixel band and Linux's chain face is already the Regular
+/// (`NotoSansCJK-Regular.ttc` beside Noto Sans Regular), so neither has a
+/// rung of its own: their East Asian text keeps the terminal cascade.
+#[cfg(not(windows))]
+const UI_CJK_FILES: [&[(&str, u32, UiCjkScript)]; 2] = [&[], &[]];
+
+/// One face of [`UiCjkFaces`]: its file, face index and script, and the
+/// parse, made on first need and shared by every holder of the store.
+struct UiCjkFace {
+    path: std::path::PathBuf,
+    index: u32,
+    script: UiCjkScript,
+    /// `None` inside: the file is absent or the parse refused it, cached.
+    font: OnceLock<Option<Arc<ChromeFont>>>,
+}
+
+impl UiCjkFace {
+    /// The parsed face, if a parse has landed. Never parses.
+    fn parsed(&self) -> Option<&Arc<ChromeFont>> {
+        self.font.get().and_then(Option::as_ref)
+    }
+
+    /// The parsed face, parsing it on this thread first if no parse has been
+    /// tried; the flag says whether THIS call's parse is the one that landed.
+    /// The parse runs outside the cell and a racer's duplicate is dropped
+    /// (`OnceLock::get_or_init` would make the UI thread wait on the startup
+    /// warm's parse, which it must never do).
+    fn materialise(&self) -> (Option<&Arc<ChromeFont>>, bool) {
+        let mut landed = false;
+        if self.font.get().is_none() {
+            let parsed = aterm_render::font_file::admit_font_file(&self.path)
+                .ok()
+                .and_then(|bytes| {
+                    ChromeFont::from_shared(
+                        bytes,
+                        aterm_render::font::FontSettings {
+                            collection_index: self.index,
+                        },
+                    )
+                    .ok()
+                })
+                .map(Arc::new);
+            let some = parsed.is_some();
+            landed = self.font.set(parsed).is_ok() && some;
+        }
+        (self.parsed(), landed)
+    }
+}
+
+/// The chrome's OWN fallback for East Asian text in a UI-face run (Segoe UI's
+/// labels: the tab strip's titles, Settings), at the run's weight: the faces
+/// Windows itself falls back to from Segoe UI ([`UI_CJK_FILES`]). A Regular
+/// label takes Yu Gothic UI and Malgun Gothic, the selected tab's Semibold
+/// label their Semibold and Bold. A face is read and parsed only when a label
+/// needs it ([`Self::materialise_for`]: the startup warm, or a band label on
+/// the frame that first draws it), and never under the font lock.
+pub(crate) struct UiCjkFaces {
+    /// Per [`UiCjkWeight::slot`], the faces in fallback order.
+    rungs: [Vec<UiCjkFace>; 2],
+}
+
+impl UiCjkFaces {
+    /// This host's store, nothing read yet; `None` where the host has no
+    /// entries ([`UI_CJK_FILES`]).
+    fn host() -> Option<Self> {
+        #[cfg(windows)]
+        let root = std::env::var_os("WINDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+            .join("Fonts");
+        #[cfg(not(windows))]
+        let root = std::path::PathBuf::new();
+        let rung = |files: &[(&str, u32, UiCjkScript)]| -> Vec<UiCjkFace> {
+            files
+                .iter()
+                .map(|&(file, index, script)| UiCjkFace {
+                    path: root.join(file),
+                    index,
+                    script,
+                    font: OnceLock::new(),
+                })
+                .collect()
+        };
+        let store = Self {
+            rungs: [rung(UI_CJK_FILES[0]), rung(UI_CJK_FILES[1])],
+        };
+        (!store.rungs.iter().all(Vec::is_empty)).then_some(store)
+    }
+
+    fn rung(&self, weight: UiCjkWeight) -> &[UiCjkFace] {
+        &self.rungs[weight.slot()]
+    }
+
+    /// For each char of `text` in an East Asian block ([`ui_cjk_script`]),
+    /// have the first face of the `weight` rung for its script that maps it
+    /// parsed: the faces before it are parsed and found not to map it, the
+    /// faces after it are left alone. Whitespace and controls are skipped.
+    /// Answers how many parses this call landed, and the chars the rung cannot
+    /// place (outside the blocks, or no face of its script maps them), which
+    /// the caller asks the terminal's chain for.
+    fn materialise_for(&self, weight: UiCjkWeight, text: &str) -> (usize, String) {
+        let mut chars: Vec<char> = text
+            .chars()
+            .filter(|ch| !ch.is_whitespace() && !ch.is_control())
+            .collect();
+        chars.sort_unstable();
+        chars.dedup();
+        let mut landed = 0;
+        let mut rest = String::new();
+        'chars: for ch in chars {
+            if let Some(script) = ui_cjk_script(ch) {
+                for face in self
+                    .rung(weight)
+                    .iter()
+                    .filter(|face| face.script == script)
+                {
+                    let (font, fresh) = face.materialise();
+                    landed += usize::from(fresh);
+                    if font.is_some_and(|font| font.lookup_glyph_index(ch) != 0) {
+                        continue 'chars;
+                    }
+                }
+            }
+            rest.push(ch);
+        }
+        (landed, rest)
+    }
+
+    /// Whether the `weight` rung has placed `ch` for good: `Some(true)` when
+    /// a parsed face of its script maps it with no unparsed face before it,
+    /// `Some(false)` when every face of its script is settled (parsed or
+    /// absent) and none maps it, `None` while a face that might map it is
+    /// still unparsed. Never parses.
+    fn settled(&self, weight: UiCjkWeight, ch: char) -> Option<bool> {
+        let Some(script) = ui_cjk_script(ch) else {
+            return Some(false);
+        };
+        for face in self
+            .rung(weight)
+            .iter()
+            .filter(|face| face.script == script)
+        {
+            match face.font.get() {
+                None => return None,
+                Some(Some(font)) if font.lookup_glyph_index(ch) != 0 => return Some(true),
+                Some(_) => {}
+            }
+        }
+        Some(false)
+    }
+
+    /// The parsed faces, as `file#index`, Regular rung first.
+    #[cfg(all(test, windows))]
+    pub(crate) fn parsed_files_for_test(&self) -> Vec<String> {
+        self.rungs
+            .iter()
+            .flatten()
+            .filter(|face| face.parsed().is_some())
+            .map(|face| {
+                let file = face.path.file_name().unwrap_or_default().to_string_lossy();
+                format!("{file}#{}", face.index)
+            })
+            .collect()
+    }
+
+    /// How many of the store's faces are parsed: the band key's witness of a
+    /// landing no install announces ([`strip_band_font_epoch`]).
+    fn parsed_count(&self) -> usize {
+        self.rungs
+            .iter()
+            .flatten()
+            .filter(|face| face.parsed().is_some())
+            .count()
+    }
+}
+
+/// The process's one East Asian fallback store: the faces are system files
+/// that no reload changes, so a reload keeps every parse ([`install_chrome_faces_locked`]).
+#[cfg(not(test))]
+fn ui_cjk_store_for_install() -> Option<Arc<UiCjkFaces>> {
+    static CJK_STORE: OnceLock<Option<Arc<UiCjkFaces>>> = OnceLock::new();
+    CJK_STORE
+        .get_or_init(|| UiCjkFaces::host().map(Arc::new))
+        .clone()
+}
+
+/// Tests: a cold store per install, as a fresh process has, so a test that
+/// counts parses or landings never sees another test's (libtest reuses
+/// threads, and a process-wide store would be shared between them).
+#[cfg(test)]
+fn ui_cjk_store_for_install() -> Option<Arc<UiCjkFaces>> {
+    UiCjkFaces::host().map(Arc::new)
+}
+
 /// The chrome font stack: the user's terminal face + its real bold sibling
 /// (both injected by [`set_chrome_fonts`]) over the embedded DejaVu coverage
 /// fallback, over the renderer's already-parsed chain faces
@@ -638,16 +946,25 @@ struct ChromeFonts {
     bold: Option<ChromeFace>,
     fallback: Option<ChromeFace>,
     /// The COVERAGE rung under the embedded DejaVu: the committed semantic
-    /// renderer's broad-chain faces that a renderer in this process has
-    /// ALREADY parsed (`Renderer::ready_fallback_faces`), in chain order —
-    /// NotoSansCJK on Linux, Yu Gothic / YaHei on Windows, once the terminal
-    /// has drawn an ideograph. A char none of the three chrome faces carry
-    /// used to fall out of the chrome entirely: advance-only in a Settings
-    /// label, and a whole tab title handed to the cell lane, drawn a half-lip
-    /// low on the cell baseline and cut by the seam rule. A memo of
-    /// `ChromeFace`s over the renderer's own shared `Arc`s, refreshed by
-    /// [`Self::sync_coverage`]; nothing is ever parsed here.
+    /// renderer's broad-chain faces that are ALREADY parsed
+    /// (`Renderer::ready_fallback_faces`), in chain order — NotoSansCJK on
+    /// Linux, YaHei and Malgun Gothic on Windows. A char none of the three
+    /// chrome faces carry used to fall out of the chrome entirely:
+    /// advance-only in a Settings label, and a whole tab title handed to the
+    /// cell lane, drawn a half-lip low on the cell baseline and cut by the
+    /// seam rule. A memo of `ChromeFace`s over the renderer's own shared
+    /// `Arc`s, refreshed by [`Self::sync_coverage`]; nothing is parsed by the
+    /// rung itself. The parses land from the terminal drawing the char, from
+    /// the startup warm ([`warm_chrome_coverage`]), or from a band label that
+    /// needs the face on the frame that draws it ([`strip_band_run_coverable`]).
     coverage: Vec<ChromeFace>,
+    /// The UI faces' own East Asian fallback ([`UiCjkFaces`]), installed with
+    /// them; `None` before the install and where the host has none.
+    ui_cjk: Option<Arc<UiCjkFaces>>,
+    /// Per weight and per entry of [`Self::ui_cjk`], a `ChromeFace` over the
+    /// entry's parse once it has landed (a memo, refreshed by
+    /// [`Self::sync_ui_cjk`]; reset whenever the store is replaced).
+    ui_cjk_held: [Vec<Option<ChromeFace>>; 2],
     /// Host-prepared proportional UI faces. These immutable parsed assets are
     /// installed by `set_chrome_fonts`; measure/compile/raster never probe a
     /// platform path or initialize a font lazily.
@@ -676,6 +993,128 @@ struct ChromeFonts {
     /// Measured wall time of the last one-time background specimen warmup.
     /// Retained for Diagnostics/tests; it is not part of paint identity.
     semantic_prewarm_ms: Option<u64>,
+    /// What words the UI faces draw whole measured, kept ([`MeasureMemo`]).
+    measures: MeasureMemo,
+}
+
+/// MEASURES OF WORDS A UI FACE DRAWS WHOLE, kept so a page laid out again
+/// measures only what it has not measured before: a Settings search that
+/// lists most of the registry re-laid every row's words on every key and
+/// redraw, glyph by glyph, the same strings at the same sizes. Only a string
+/// every char of which the face itself maps is kept: its width and its line
+/// breaks then depend on that one font, its size and the width alone, and
+/// the font is HELD with them (an install that replaces it drops them, and
+/// cannot reuse its address), while a string that reaches a fallback or
+/// coverage face — which land lazily — is measured afresh every time.
+/// Bounded: past [`MEASURE_MEMO_ENTRIES`] it starts over.
+#[derive(Default)]
+struct MeasureMemo {
+    /// Per face and size: the font measured in, and each string's width.
+    widths: HashMap<(u16, u32), HeldMeasures<f32>>,
+    /// Per size and line width: the UI font, and each text's line ranges
+    /// and its scan count.
+    wraps: HashMap<(u32, u32), HeldMeasures<WrapLines>>,
+    entries: usize,
+}
+
+/// A text's line ranges and the scans that found them
+/// ([`ui_text_wrap_ranges_impl`]).
+type WrapLines = (Vec<std::ops::Range<usize>>, usize);
+
+/// The font some measures were taken in (held), and the measures.
+type HeldMeasures<T> = (Arc<ChromeFont>, HashMap<Box<str>, T>);
+
+/// How many measures [`MeasureMemo`] keeps before it starts over.
+const MEASURE_MEMO_ENTRIES: usize = 16_384;
+
+/// A [`TextFace`] as a memo key.
+fn face_code(face: TextFace) -> u16 {
+    match face {
+        TextFace::Mono => 0,
+        TextFace::Ui => 1,
+        TextFace::UiBold => 2,
+        TextFace::Display(index) => 3 + u16::from(index),
+    }
+}
+
+impl MeasureMemo {
+    fn width(&self, face: TextFace, font: &Arc<ChromeFont>, px: f32, s: &str) -> Option<f32> {
+        let (held, widths) = self.widths.get(&(face_code(face), px.to_bits()))?;
+        Arc::ptr_eq(held, font)
+            .then(|| widths.get(s).copied())
+            .flatten()
+    }
+
+    fn keep_width(&mut self, face: TextFace, font: &Arc<ChromeFont>, px: f32, s: &str, w: f32) {
+        self.make_room();
+        let (held, widths) = self
+            .widths
+            .entry((face_code(face), px.to_bits()))
+            .or_insert_with(|| (Arc::clone(font), HashMap::new()));
+        if !Arc::ptr_eq(held, font) {
+            *held = Arc::clone(font);
+            self.entries = self.entries.saturating_sub(widths.len());
+            widths.clear();
+        }
+        if widths.insert(s.into(), w).is_none() {
+            self.entries += 1;
+        }
+    }
+
+    fn wrap(&self, font: &Arc<ChromeFont>, px: f32, width: f32, text: &str) -> Option<WrapLines> {
+        let (held, wraps) = self.wraps.get(&(px.to_bits(), width.to_bits()))?;
+        Arc::ptr_eq(held, font)
+            .then(|| wraps.get(text).cloned())
+            .flatten()
+    }
+
+    fn keep_wrap(
+        &mut self,
+        font: &Arc<ChromeFont>,
+        px: f32,
+        width: f32,
+        text: &str,
+        lines: &WrapLines,
+    ) {
+        self.make_room();
+        let (held, wraps) = self
+            .wraps
+            .entry((px.to_bits(), width.to_bits()))
+            .or_insert_with(|| (Arc::clone(font), HashMap::new()));
+        if !Arc::ptr_eq(held, font) {
+            *held = Arc::clone(font);
+            self.entries = self.entries.saturating_sub(wraps.len());
+            wraps.clear();
+        }
+        if wraps.insert(text.into(), lines.clone()).is_none() {
+            self.entries += 1;
+        }
+    }
+
+    fn make_room(&mut self) {
+        if self.entries >= MEASURE_MEMO_ENTRIES {
+            *self = Self::default();
+        }
+    }
+}
+
+// TEST-ONLY WORK CENSUS: how many strings THIS thread has measured glyph by
+// glyph (a width walk or a wrap's advance table), memoized ones not counted:
+// what a re-laid page's text work is ([`MeasureMemo`]).
+#[cfg(test)]
+thread_local! {
+    static MEASURE_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The strings this thread has measured glyph by glyph so far (test-only).
+#[cfg(test)]
+pub(crate) fn measure_walks() -> u64 {
+    MEASURE_WALKS.with(std::cell::Cell::get)
+}
+
+fn note_measure_walk() {
+    #[cfg(test)]
+    MEASURE_WALKS.with(|walks| walks.set(walks.get() + 1));
 }
 
 fn default_chrome_fonts() -> ChromeFonts {
@@ -688,6 +1127,8 @@ fn default_chrome_fonts() -> ChromeFonts {
         bold: None,
         fallback: ChromeFace::from_bytes(aterm_render::embedded_font(), 0),
         coverage: Vec::new(),
+        ui_cjk: None,
+        ui_cjk_held: [Vec::new(), Vec::new()],
         ui_regular: None,
         ui_semibold: None,
         semantic: None,
@@ -703,6 +1144,7 @@ fn default_chrome_fonts() -> ChromeFonts {
         semantic_displaced: None,
         semantic_ready_epoch: 0,
         semantic_prewarm_ms: None,
+        measures: MeasureMemo::default(),
     }
 }
 
@@ -798,23 +1240,6 @@ impl PreparedSemanticFont {
         )
     }
 
-    /// The head band a specimen frame needs above its first row so a display
-    /// face's capitals are not cut at the top of the box (pixels at `px`;
-    /// `0` for an ordinary font). Pure geometry, like
-    /// [`Self::specimen_cell_height`].
-    pub(crate) fn specimen_ink_headroom(
-        &self,
-        px: f32,
-        line_height: f32,
-        baseline_adjust: i32,
-    ) -> Option<usize> {
-        Some(
-            self.renderer
-                .as_ref()?
-                .display_ink_headroom(px, line_height, baseline_adjust),
-        )
-    }
-
     fn fork(&self, px: f32, theme: aterm_render::Theme) -> Option<Renderer> {
         self.renderer.as_ref()?.fork_semantic_surface(px, theme)
     }
@@ -888,9 +1313,11 @@ fn lock_fonts() -> std::sync::MutexGuard<'static, ChromeFonts> {
 /// Install the renderer-resolved chrome faces — `(bytes, collection index)` of
 /// the PRIMARY terminal face and its real BOLD sibling (from
 /// `Renderer::chrome_primary_face` / `chrome_bold_face`) — so the tray text
-/// renders in the user's font. Called by `App::sync_chrome_fonts` after every
-/// backend (re)build; unparseable bytes leave that slot on the fallback, and
-/// so does a bundled display face ([`chrome_face_for_slot`]).
+/// renders in the user's font. The primary is always the person's font
+/// (`font_family`, or Automatic): a display face is a layer over it, never the
+/// primary, so Settings' code text, the palette and the Manual keep that font
+/// whatever display faces are on. Called by `App::sync_chrome_fonts` after
+/// every backend (re)build; unparseable bytes leave that slot on the fallback.
 pub(crate) fn set_chrome_fonts(
     primary: Option<(std::sync::Arc<[u8]>, u32)>,
     bold: Option<(std::sync::Arc<[u8]>, u32)>,
@@ -900,22 +1327,10 @@ pub(crate) fn set_chrome_fonts(
     reload_chrome_fonts_locked(&mut lock_fonts(), p, b, semantic);
 }
 
-/// The chrome face for one terminal-face slot. A bundled DISPLAY FACE is a
-/// toy for terminal text, not the user's font: Settings' numbers and code
-/// text, the palette and the other chrome keep the embedded monospace
-/// fallback instead of turning playful with it (only the Text & Fonts
-/// specimen, drawn by the semantic renderer, shows the face).
+/// The chrome face for one terminal-face slot: the face itself, parsed.
 fn chrome_face_for_slot(slot: &Option<(std::sync::Arc<[u8]>, u32)>) -> Option<ChromeFace> {
     slot.as_ref()
-        .filter(|(bytes, _)| !is_bundled_display_face(bytes))
         .and_then(|(bytes, index)| ChromeFace::from_bytes(bytes, *index))
-}
-
-fn is_bundled_display_face(bytes: &[u8]) -> bool {
-    aterm_render::DISPLAY_FACES.iter().any(|face| {
-        aterm_render::display_face_bytes(face.id)
-            .is_some_and(|face| face.len() == bytes.len() && face == bytes)
-    })
 }
 
 /// Fully parsed chrome/semantic font generation. Constructed by the font
@@ -968,6 +1383,77 @@ fn reload_chrome_fonts_locked(
     if let Some(worker) = fonts.semantic_worker.as_ref() {
         worker.cancel_queued();
     }
+    // The UI faces' own CJK and Hangul faces and the new generation's chain
+    // faces, parsed off this thread before a title needs them
+    // ([`warm_chrome_coverage`]).
+    #[cfg(all(not(test), any(windows, target_os = "linux")))]
+    {
+        let chain = fonts.semantic.as_ref().map(Renderer::fallback_coverage);
+        let ui = fonts.ui_cjk.clone();
+        if chain.is_some() || ui.is_some() {
+            let _ = crate::qos::spawn_lane_thread(
+                "aterm-chrome-coverage-warm",
+                crate::qos::Role::Background,
+                move || warm_chrome_coverage(chain.as_ref(), ui.as_deref()),
+            );
+        }
+    }
+}
+
+/// What the startup warm asks the faces for: Han, kana and Hangul. Their
+/// faces are the costly ones to parse (MEASURED 2026-10-18, Windows 11,
+/// opt-level 2: `msyhbd.ttc` 30-35 ms, `malgunbd.ttf` ~23 ms) and the
+/// commonest titles the UI faces cannot draw. Every other script's chain face
+/// costs a few ms at most (`Nirmala.ttc` ~5 ms, `LeelawUI.ttf` under 1 ms),
+/// cheap enough for the frame that first needs it.
+#[cfg(any(windows, target_os = "linux"))]
+const CHROME_COVERAGE_WARM: &str = "日の한";
+
+/// Parse, on the calling thread, the faces a Han, kana or Hangul label draws
+/// with ([`CHROME_COVERAGE_WARM`]), so a CJK tab title is a band title on its
+/// very first frame without that frame paying for the parse: first the UI
+/// faces' own Regular faces ([`UiCjkFaces`]: every quiet tab, every Settings
+/// label), then their Semibold ones (the selected tab, a heading), then the
+/// terminal chain's (the chrome's monospace text, and every char the UI
+/// faces' own leave to it). Spawned on a `Background` thread by every production
+/// chrome-font install ([`reload_chrome_fonts_locked`]): it starts after the
+/// first frame (the install is the first-present hook's), takes no lock the
+/// UI thread holds, and a UI thread that needs a face before it lands parses
+/// it itself (neither store blocks one holder behind another). The chain's
+/// parse lands in cells the live terminal shares; the UI faces' store lives
+/// for the process, so a reload parses none of them again. Windows and Linux
+/// only, where the pixel tab band draws titles; a macOS chain face draws
+/// through CoreText and is never parsed for the grid. Answers how many faces
+/// it parsed.
+///
+/// COST, MEASURED 2026-10-18 on Windows 11 26200 (the default chain:
+/// `msyhbd.ttc`, `malgunbd.ttf`): the two chain parses take 55 ms of one
+/// background core and add 1.46 MB of private heap (the faces' cmap, advance
+/// and box tables); the mapped files' pages they read are clean, shared and
+/// reclaimable. Headless startup to the control socket and to the first
+/// rendered image did not move (the debug build without and with the warm,
+/// alternated, the four warm-cache pairs of five: socket 46-55 ms against
+/// 50-60 ms, first image 745-780 ms against 744-796 ms). The UI faces' own
+/// four, MEASURED 2026-10-18 on the same machine, opt-level 2, warm file
+/// cache, three rounds: `YuGothM.ttc` face 1 36-37 ms, `malgun.ttf` 22-24 ms,
+/// `YuGothB.ttc` face 2 39-43 ms, `malgunbd.ttf` 23-31 ms, about 125 ms of the
+/// same background core, and 1.70 MB more private commit
+/// (`K32GetProcessMemoryInfo`, before and after the warm of a cold store).
+#[cfg(any(windows, target_os = "linux"))]
+fn warm_chrome_coverage(
+    chain: Option<&aterm_render::FallbackCoverage>,
+    ui: Option<&UiCjkFaces>,
+) -> usize {
+    let mut landed = 0;
+    if let Some(ui) = ui {
+        for weight in [UiCjkWeight::Regular, UiCjkWeight::Semibold] {
+            landed += ui.materialise_for(weight, CHROME_COVERAGE_WARM).0;
+        }
+    }
+    if let Some(chain) = chain {
+        landed += chain.materialise_for(CHROME_COVERAGE_WARM);
+    }
+    landed
 }
 
 /// The locked chrome-face installation shared by [`set_chrome_fonts`] and the
@@ -984,6 +1470,7 @@ fn install_chrome_faces_locked(
     fonts.bold = bold;
     fonts.ui_regular = ui.regular.clone();
     fonts.ui_semibold = ui.semibold.clone();
+    fonts.set_ui_cjk(ui_cjk_store_for_install());
     fonts.semantic_generation = fonts.semantic_generation.wrapping_add(1);
     fonts.semantic = semantic;
     // The rung is a memo over the OLD renderer's chain; `sync_coverage` refills
@@ -1187,6 +1674,46 @@ pub(crate) fn install_chrome_fonts_with_cjk_chain_for_test() -> bool {
     true
 }
 
+/// Install, DORMANT, a semantic seed whose chain holds the host's CJK face
+/// UNPARSED — a fresh window's state before anything drew an ideograph: the
+/// window's own order (configure, seal, fork the seed) with the cell shared
+/// between the sealed generation and the seed — plus the host UI faces.
+/// Answers the sealed generation, which keeps the cells alive beside the seed;
+/// `None` when the host has no such face (the caller skips, as
+/// `with_ui_faces()` does).
+#[cfg(all(test, not(target_os = "macos")))]
+pub(crate) fn install_unparsed_cjk_chain_for_test() -> Option<Renderer> {
+    let path = cjk_chain_face_path_for_test()?;
+    let theme = aterm_render::Theme::default();
+    let mut live = Renderer::from_bytes(aterm_render::embedded_font(), 14.0, theme).ok()?;
+    live.set_runtime_font_discovery(false);
+    live.set_config_fallback_fonts(&[path.to_string()]);
+    let _ = live.seal_admitted_font_sources();
+    let seed = live.fork_semantic_surface(14.0, theme)?;
+    install_dormant_chrome_fonts_for_test(seed);
+    prepare_ui_fonts_for_direct_view_test();
+    Some(live)
+}
+
+/// Whether THIS test thread's chrome cascade draws `ch` from a face it holds
+/// parsed (the terminal stack and the coverage rung, [`ChromeFonts::face_for`]),
+/// read without parsing anything.
+#[cfg(all(test, not(target_os = "macos")))]
+pub(crate) fn chrome_cascade_reaches_for_test(ch: char) -> bool {
+    lock_fonts().face_for(TextWeight::Regular, ch).is_some()
+}
+
+/// Whether THIS test thread's chrome draws `ch` in a run set in `face` from a
+/// face it holds parsed: the UI faces' own East Asian fallback at `face`'s
+/// weight, then the terminal cascade ([`ChromeFonts::ui_miss_face`]), read
+/// without parsing anything.
+#[cfg(all(test, not(target_os = "macos")))]
+pub(crate) fn chrome_ui_reaches_for_test(face: TextFace, ch: char) -> bool {
+    lock_fonts()
+        .ui_miss_face(face, TextWeight::Regular, ch)
+        .is_some()
+}
+
 /// Test-only generation token for the current libtest worker's chrome-font
 /// context. Libtest may reuse a worker thread for multiple tests; retaining a
 /// boolean "installed" flag across that reuse is insufficient because another
@@ -1209,6 +1736,24 @@ pub(crate) fn prepare_ui_fonts_for_direct_view_test() {
     let mut fonts = lock_fonts();
     fonts.ui_regular = ui.regular.clone();
     fonts.ui_semibold = ui.semibold.clone();
+    if fonts.ui_cjk.is_none() {
+        fonts.set_ui_cjk(ui_cjk_store_for_install());
+    }
+}
+
+/// Replace THIS test thread's East Asian UI fallback ([`UiCjkFaces`]):
+/// `None` for a test whose subject is the terminal chain's rung under it (the
+/// state of a host with no such faces), or a cold store of its own.
+#[cfg(all(test, not(target_os = "macos")))]
+pub(crate) fn set_ui_cjk_faces_for_test(store: Option<Arc<UiCjkFaces>>) {
+    lock_fonts().set_ui_cjk(store);
+}
+
+/// A cold East Asian UI fallback store of this host's faces, nothing parsed;
+/// `None` where the host has none (every host but Windows).
+#[cfg(all(test, windows))]
+pub(crate) fn host_ui_cjk_faces_for_test() -> Option<Arc<UiCjkFaces>> {
+    UiCjkFaces::host().map(Arc::new)
 }
 
 /// The inverse seam: return THIS test thread's chrome stack to the cold,
@@ -1221,6 +1766,7 @@ pub(crate) fn clear_ui_fonts_for_test() {
     let mut fonts = lock_fonts();
     fonts.ui_regular = None;
     fonts.ui_semibold = None;
+    fonts.set_ui_cjk(None);
 }
 
 /// An owned, immutable semantic renderer input for deterministic direct-view
@@ -1263,28 +1809,6 @@ pub(crate) fn prepared_semantic_font_for_direct_view_test(
             pending: false,
         },
         renderer: Some(renderer),
-    }
-}
-
-/// A ready specimen font over `bytes` for a direct-view test, as the worker
-/// would hand back for a candidate whose regular face resolved to them (a
-/// bundled display face, say).
-#[cfg(test)]
-pub(crate) fn prepared_semantic_font_from_bytes_for_test(
-    candidate: &crate::widget::SemanticFontCandidate,
-    bytes: &[u8],
-) -> PreparedSemanticFont {
-    let mut renderer = Renderer::from_bytes(bytes, 14.0, aterm_render::Theme::default())
-        .expect("test specimen face parses");
-    renderer.set_runtime_font_discovery(false);
-    PreparedSemanticFont {
-        candidate: candidate.clone(),
-        snapshot: SemanticFontSnapshot {
-            status: "host-prepared test renderer ready".to_string(),
-            ready_epoch: 1,
-            pending: false,
-        },
-        renderer: Some(Rc::new(renderer)),
     }
 }
 
@@ -1356,8 +1880,9 @@ impl ChromeFonts {
     /// is consulted only once every face the gate knows has missed, so no char
     /// a chrome face covers changes face. `None` when nothing loaded covers
     /// `ch` (the pen then draws one of its own two glyphs — [`synthesized`] —
-    /// or advances without ink; the strip band hands the whole title to the
-    /// cell lane).
+    /// or advances without ink; the strip band first has the chain face that
+    /// maps it parsed, [`strip_band_run_coverable`], and hands the title to
+    /// the cell lane only when no face maps it).
     fn face_for(&mut self, weight: TextWeight, ch: char) -> Option<&mut ChromeFace> {
         let bold_run = weight == TextWeight::Bold;
         let bold_has = self.bold.as_ref().is_some_and(|f| f.has(ch));
@@ -1378,9 +1903,10 @@ impl ChromeFonts {
     /// Bring [`Self::coverage`] up to date with what the committed semantic
     /// renderer's chain has ALREADY parsed. A chain cell is shared with the
     /// live terminal renderer, which materialises it the first time a cell
-    /// draws the char — so the rung grows without any install passing through
-    /// this store, and this read (a handful of atomic loads; no parse, no I/O)
-    /// is what notices. Compared by identity, not by count: a renderer swap
+    /// draws the char, and with the startup warm's handle — so the rung grows
+    /// without any install passing through this store, and this read (a
+    /// handful of atomic loads; no parse, no I/O) is what notices. Compared by
+    /// identity, not by count: a renderer swap
     /// (a candidate landing, a cache hit) can hand back a same-length chain of
     /// different faces.
     fn sync_coverage(&mut self) {
@@ -1398,6 +1924,114 @@ impl ChromeFonts {
         }
         let faces: Vec<Arc<ChromeFont>> = semantic.ready_fallback_faces().cloned().collect();
         self.coverage = faces.into_iter().map(ChromeFace::from_font).collect();
+    }
+
+    /// Install `store` as the UI faces' East Asian fallback, dropping the
+    /// memo of the store it replaces (kept when it is the same store).
+    fn set_ui_cjk(&mut self, store: Option<Arc<UiCjkFaces>>) {
+        let same = match (&self.ui_cjk, &store) {
+            (Some(held), Some(new)) => Arc::ptr_eq(held, new),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.ui_cjk_held = [Vec::new(), Vec::new()];
+        }
+        self.ui_cjk = store;
+    }
+
+    /// Bring the `weight` memo of [`Self::ui_cjk_held`] up to date with the
+    /// parses that have landed in the store, from any thread: a few atomic
+    /// loads, no parse.
+    fn sync_ui_cjk(&mut self, weight: UiCjkWeight) {
+        let held = &mut self.ui_cjk_held[weight.slot()];
+        let Some(store) = self.ui_cjk.as_ref() else {
+            held.clear();
+            return;
+        };
+        let rung = store.rung(weight);
+        if held.len() != rung.len() {
+            *held = rung.iter().map(|_| None).collect();
+        }
+        for (slot, face) in held.iter_mut().zip(rung) {
+            if slot.is_none()
+                && let Some(font) = face.parsed()
+            {
+                *slot = Some(ChromeFace::from_font(Arc::clone(font)));
+            }
+        }
+    }
+
+    /// Where the UI faces' own East Asian fallback holds a parsed face for
+    /// `ch` at `weight`: the entry in `ui_cjk_held[weight.slot()]` of the
+    /// first face of `ch`'s script, in fallback order, that maps it. Never
+    /// the other weight's: a face that has not landed leaves the char to the
+    /// terminal cascade until it does (Yu Gothic UI's kana are proportional,
+    /// so even an advance borrowed across weights would be wrong: `の` is
+    /// 0.816 em Regular, 0.836 em Semibold). `None` for a char outside the
+    /// East Asian blocks.
+    fn ui_cjk_index(&mut self, weight: UiCjkWeight, ch: char) -> Option<usize> {
+        let script = ui_cjk_script(ch)?;
+        self.sync_ui_cjk(weight);
+        let store = self.ui_cjk.as_ref()?;
+        store
+            .rung(weight)
+            .iter()
+            .zip(&self.ui_cjk_held[weight.slot()])
+            .position(|(face, held)| {
+                face.script == script && held.as_ref().is_some_and(|held| held.has(ch))
+            })
+    }
+
+    /// The face that draws `ch` in a run set in the UI face `face` when that
+    /// face lacks it: for East Asian text the UI faces' own fallback at the
+    /// run's weight ([`UiCjkFaces`], as Windows falls back from Segoe UI),
+    /// else the terminal cascade ([`Self::face_for`] at `weight`). The ONE
+    /// routing the pen ([`Canvas::text`]), the measures
+    /// ([`ui_text_width_for`], the wrap) and the band's coverage question
+    /// ([`Self::label_misses`]) share, so what is measured is what is drawn.
+    fn ui_miss_face(
+        &mut self,
+        face: TextFace,
+        weight: TextWeight,
+        ch: char,
+    ) -> Option<&mut ChromeFace> {
+        let rung = UiCjkWeight::of(face);
+        if let Some(entry) = self.ui_cjk_index(rung, ch) {
+            return self.ui_cjk_held[rung.slot()][entry].as_mut();
+        }
+        self.face_for(weight, ch)
+    }
+
+    /// The distinct chars of the label `s`, set in `face`, that no face the
+    /// chrome holds draws as real ink, in order of first appearance: not the
+    /// UI face, not its East Asian fallback, not the terminal cascade with its
+    /// parsed chain faces ([`Self::ui_miss_face`]), not the pen's own glyphs
+    /// ([`synthesized`]). A space always counts as drawn. Exactly the per-char
+    /// routing [`Canvas::text`]'s proportional arm performs — except that an
+    /// East Asian char counts as drawn only once the rung at `face`'s OWN
+    /// weight has placed it ([`UiCjkFaces::settled`]), so the band has the
+    /// right weight's face parsed before it draws, never its sibling's.
+    fn label_misses(&mut self, face: TextFace, s: &str) -> Vec<char> {
+        let ui = self.ui_font(face).cloned();
+        let weight = UiCjkWeight::of(face);
+        let mut misses = Vec::new();
+        for ch in s.chars() {
+            let unsettled = self
+                .ui_cjk
+                .as_ref()
+                .is_some_and(|store| store.settled(weight, ch).is_none());
+            let drawn = ch == ' '
+                || ui
+                    .as_deref()
+                    .is_some_and(|font| font.lookup_glyph_index(ch) != 0)
+                || (!unsettled && self.ui_miss_face(face, TextWeight::Regular, ch).is_some())
+                || (!unsettled && synthesized::covers(ch));
+            if !drawn && !misses.contains(&ch) {
+                misses.push(ch);
+            }
+        }
+        misses
     }
 
     #[cfg_attr(
@@ -2265,19 +2899,27 @@ pub(crate) fn warm_chrome_font_assets() {}
 /// semantic-cascade landings, which merely cost one harmless band rebuild); the
 /// presence bit covers the test seam (`prepare_ui_fonts_for_direct_view_test`)
 /// which installs UI faces without bumping the epoch. The coverage count covers
-/// the landing NO install announces: the live terminal parsing a chain face
-/// (the first frame a CJK title paints on the cell lane) into the cell the
-/// chrome's semantic seed shares. That count only grows for one seed, and a
-/// seed swap moves the epoch, so the fold is a total key; the band then
-/// re-rasters once and the title moves from the cell lane into the band. The
-/// worker poll and the rung sync are a `try_recv` and a few atomic loads.
+/// the landings NO install announces: a chain face parsed into a cell the
+/// chrome's semantic seed shares — by the live terminal drawing the char, by
+/// the startup warm ([`warm_chrome_coverage`]), or by a band label that needed
+/// it ([`strip_band_run_coverable`]). The UI faces' own East Asian faces
+/// ([`UiCjkFaces`]) land the same two ways, the warm and a band label, and
+/// their parsed count is folded in beside the chain's. Both counts only grow
+/// for one seed and one store, and a seed or store swap moves the epoch, so
+/// the fold is a total key; the band then re-rasters once. The worker poll
+/// and the rung syncs are a `try_recv` and a few atomic loads.
 pub(crate) fn strip_band_font_epoch() -> u64 {
     let mut fonts = lock_fonts();
     fonts.poll_semantic_renderer();
     fonts.sync_coverage();
+    let ui_cjk = fonts
+        .ui_cjk
+        .as_ref()
+        .map_or(0, |store| store.parsed_count() as u64);
     fonts
         .semantic_ready_epoch
-        .wrapping_shl(8)
+        .wrapping_shl(12)
+        .wrapping_add(ui_cjk.min(15) << 8)
         .wrapping_add((fonts.coverage.len() as u64).min(127) << 1)
         .wrapping_add(u64::from(fonts.ui_regular.is_some()))
 }
@@ -2321,22 +2963,158 @@ pub(crate) fn strip_band_variable_semibold() -> Option<UiVariableSemibold> {
 /// per label and honestly falls back to the cell-grid painter for any segment
 /// that fails — a colour emoji title (never in the broad chain) then renders
 /// through the terminal renderer's emoji machinery (mono-quantised, but REAL),
-/// instead of vanishing from a proportional run. A CJK title takes that lane
-/// only until the terminal has parsed its chain face; it is then a band title
-/// like any other, on the cap-centred baseline rather than the cell's.
+/// instead of vanishing from a proportional run.
+///
+/// A CJK, Hangul or other fallback-script title is a band title from its FIRST
+/// frame: a char only a fallback face maps has that face parsed here, before
+/// the band measures or draws the title ([`chain_may_draw_in_a_label`] says
+/// which chars ask). East Asian text asks the UI faces' own fallback at the
+/// label's weight first ([`UiCjkFaces`]: Yu Gothic UI and Malgun Gothic for
+/// a quiet title, their Semibold and Bold for the selected one), then the
+/// terminal's chain for what that leaves. The startup warm has normally
+/// parsed the CJK and Hangul faces already ([`warm_chrome_coverage`]), and
+/// this parses only what it has not: at most the faces the label needs, the
+/// same parse the cell lane's raster used to pay on that frame, with the
+/// title on the cell baseline in the terminal's face and its separators gone.
+/// The parse runs outside the font lock. A title no face maps keeps the cell
+/// lane.
+///
+/// This asks for the Regular label ([`TextFace::Ui`]); the selected tab's
+/// label asks [`strip_band_run_coverable_in`] with its own face.
 pub(crate) fn strip_band_run_coverable(s: &str) -> bool {
-    let mut fonts = lock_fonts();
-    if fonts.ui_regular.is_none() {
-        return false;
+    strip_band_run_coverable_in(TextFace::Ui, s)
+}
+
+/// [`strip_band_run_coverable`] for a label set in `face`: the faces parsed
+/// for its East Asian text are `face`'s weight's ([`UiCjkWeight::of`]).
+pub(crate) fn strip_band_run_coverable_in(face: TextFace, s: &str) -> bool {
+    let (ui_cjk, coverage, wanted) = {
+        let mut fonts = lock_fonts();
+        if fonts.ui_regular.is_none() {
+            return false;
+        }
+        let misses = fonts.label_misses(face, s);
+        if misses.is_empty() {
+            return true;
+        }
+        if !misses.iter().copied().all(chain_may_draw_in_a_label) {
+            return false;
+        }
+        (
+            fonts.ui_cjk.clone(),
+            fonts.semantic.as_ref().map(Renderer::fallback_coverage),
+            misses.into_iter().collect::<String>(),
+        )
+    };
+    let rest = match ui_cjk {
+        Some(store) => store.materialise_for(UiCjkWeight::of(face), &wanted).1,
+        None => wanted,
+    };
+    if !rest.is_empty() {
+        let Some(coverage) = coverage else {
+            return false;
+        };
+        coverage.materialise_for(&rest);
     }
-    let ui = fonts.ui_regular.clone();
-    s.chars().all(|ch| {
-        ch == ' '
-            || ui
-                .as_deref()
-                .is_some_and(|font| font.lookup_glyph_index(ch) != 0)
-            || fonts.face_for(TextWeight::Regular, ch).is_some()
-            || synthesized::covers(ch)
+    lock_fonts().label_misses(face, s).is_empty()
+}
+
+/// Whether a char the chrome's own faces miss in a label is one the terminal's
+/// fallback chain may be asked to draw there ([`strip_band_run_coverable`]):
+/// text, in any script. Not a colour emoji, which the band draws in colour
+/// (`tab_bar::pixel_band::emoji_label`) — a chain face's monochrome glyph would
+/// take its place; not a private-use icon, which the cell lane routes through
+/// the chain's own rules for icons (scoped faces, the bundled Nerd Font); not a
+/// joiner, a variation selector or a control, which draw nothing.
+fn chain_may_draw_in_a_label(ch: char) -> bool {
+    !(ch.is_control()
+        || aterm_grapheme::is_emoji_char(ch)
+        || aterm_grapheme::is_emoji_presentation(ch)
+        || matches!(
+            ch,
+            '\u{200C}'
+                | '\u{200D}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{E0100}'..='\u{E01EF}'
+                | '\u{E000}'..='\u{F8FF}'
+                | '\u{F0000}'..='\u{FFFFD}'
+                | '\u{100000}'..='\u{10FFFD}'
+        ))
+}
+
+/// One colour emoji the chrome draws inline in a label (the tab strip's
+/// titles, `tab_bar::pixel_band`): the colour face's own straight-alpha RGBA,
+/// `width × height`, at the size it was asked for.
+#[cfg(any(windows, target_os = "linux"))]
+#[derive(Debug)]
+pub(crate) struct ChromeEmoji {
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) rgba: Vec<u8>,
+}
+
+/// The colour glyph of the emoji grapheme `cluster` at `px` device px, from
+/// the chrome stack's semantic renderer: the terminal's own font set, its
+/// colour face included, so a tab title draws the emoji the grid draws. A
+/// title holding one used to go whole to the cell lane, a monospace slab whose
+/// row sits a lip low in a real window's band (the 2026-10-18 judges'
+/// `emoji-title-tab-slab-in-new-strip`). `None` before that renderer lands and
+/// for a cluster its colour face has no glyph for. The fork at `px` and each
+/// cluster's raster are memoized per semantic generation on this thread
+/// (`Renderer` is thread-bound), so a strip rebuild pays a hash probe.
+#[cfg(any(windows, target_os = "linux"))]
+pub(crate) fn chrome_colour_emoji(cluster: &str, px: f32) -> Option<Arc<ChromeEmoji>> {
+    /// `(semantic generation, px bits, fork, rasters by cluster)`.
+    type Memo = (
+        u64,
+        u32,
+        Renderer,
+        HashMap<String, Option<Arc<ChromeEmoji>>>,
+    );
+    thread_local! {
+        static MEMO: std::cell::RefCell<Option<Memo>> = const { std::cell::RefCell::new(None) };
+    }
+    if !(px.is_finite() && px >= 1.0) || cluster.is_empty() {
+        return None;
+    }
+    let generation = lock_fonts().semantic_generation;
+    MEMO.with_borrow_mut(|memo| {
+        if memo
+            .as_ref()
+            .is_none_or(|(held, bits, _, _)| *held != generation || *bits != px.to_bits())
+        {
+            let fork = lock_fonts()
+                .semantic
+                .as_ref()?
+                .fork_semantic_surface(px, aterm_render::Theme::default())?;
+            *memo = Some((generation, px.to_bits(), fork, HashMap::new()));
+        }
+        let (_, _, renderer, rasters) = memo.as_mut()?;
+        if let Some(raster) = rasters.get(cluster) {
+            return raster.clone();
+        }
+        // The colour face alone: shaping the cluster there never reaches the
+        // fallback chain, whose first CJK face may not be parsed on this thread.
+        let raster =
+            renderer
+                .glyph_key_cluster(cluster)
+                .and_then(|key| match renderer.glyph_image(key) {
+                    aterm_render::GlyphImage::Rgba {
+                        width,
+                        height,
+                        bytes,
+                        ..
+                    } if *width > 0 && *height > 0 && bytes.len() == width * height * 4 => {
+                        Some(Arc::new(ChromeEmoji {
+                            width: *width,
+                            height: *height,
+                            rgba: bytes.clone(),
+                        }))
+                    }
+                    _ => None,
+                });
+        rasters.insert(cluster.to_string(), raster.clone());
+        raster
     })
 }
 
@@ -2363,12 +3141,38 @@ fn ui_text_wrap_ranges_impl(
     maximum_width: f32,
 ) -> (Vec<std::ops::Range<usize>>, usize) {
     let maximum_width = maximum_width.max(1.0);
+    {
+        let fonts = lock_fonts();
+        if let Some(font) = fonts.ui_font(TextFace::Ui)
+            && let Some(lines) = fonts.measures.wrap(font, px, maximum_width, text)
+        {
+            return lines;
+        }
+    }
+    let (lines, font) = ui_text_wrap_walk(text, px, maximum_width);
+    if let Some(font) = font {
+        lock_fonts()
+            .measures
+            .keep_wrap(&font, px, maximum_width, text, &lines);
+    }
+    lines
+}
+
+/// [`ui_text_wrap_ranges_impl`]'s measure, and the UI font where it mapped
+/// every char of `text` (so the breaks depend on that font alone,
+/// [`MeasureMemo`]).
+fn ui_text_wrap_walk(
+    text: &str,
+    px: f32,
+    maximum_width: f32,
+) -> (WrapLines, Option<Arc<ChromeFont>>) {
+    note_measure_walk();
     let graphemes = text
         .grapheme_indices()
         .map(|(byte, grapheme)| (byte, grapheme, grapheme.chars().all(char::is_whitespace)))
         .collect::<Vec<_>>();
     if graphemes.is_empty() {
-        return (std::iter::once(0..0).collect(), 0);
+        return ((std::iter::once(0..0).collect(), 0), None);
     }
 
     // MEASURE EACH CHAR AT THE ADVANCE THE PEN WILL DRAW IT, which for a char
@@ -2392,9 +3196,23 @@ fn ui_text_wrap_ranges_impl(
     // and a linear probe per character would make it quadratic in the number of
     // distinct characters — which is exactly the CJK paragraph this measure was
     // corrected for, where the distinct-character count IS the text length.
+    // ASCII, nearly every char of the copy, is charged from a table indexed by
+    // the char, which costs no hash: the map's lookups were a third of every
+    // Settings page's build (2026-10-18).
+    let ascii_slot = |character: char| {
+        u8::try_from(character)
+            .ok()
+            .filter(u8::is_ascii)
+            .map(usize::from)
+    };
+    let mut ascii: [Option<(f32, bool)>; 128] = [None; 128];
     let mut advances: HashMap<char, (f32, bool)> = HashMap::new();
     for character in text.chars() {
-        if advances.contains_key(&character) {
+        let known = match ascii_slot(character) {
+            Some(slot) => ascii[slot].is_some(),
+            None => advances.contains_key(&character),
+        };
+        if known {
             continue;
         }
         let (advance, ui_covers) = match font.as_ref() {
@@ -2404,21 +3222,32 @@ fn ui_text_wrap_ranges_impl(
                 true,
             ),
             Some(_) => (
-                fonts.face_for(TextWeight::Regular, character).map_or_else(
-                    || synthesized::advance(character, px).unwrap_or(px * 0.6),
-                    |cface| cface.font.metrics(character, px).advance_width,
-                ),
+                fonts
+                    .ui_miss_face(TextFace::Ui, TextWeight::Regular, character)
+                    .map_or_else(
+                        || synthesized::advance(character, px).unwrap_or(px * 0.6),
+                        |cface| cface.font.metrics(character, px).advance_width,
+                    ),
                 false,
             ),
         };
-        advances.insert(character, (advance, ui_covers));
+        match ascii_slot(character) {
+            Some(slot) => ascii[slot] = Some((advance, ui_covers)),
+            None => {
+                advances.insert(character, (advance, ui_covers));
+            }
+        }
     }
     drop(fonts);
+    let whole_font = font
+        .clone()
+        .filter(|_| advances.values().all(|(_, ui_covers)| *ui_covers));
     let charged = |character: char| -> (f32, bool) {
-        advances
-            .get(&character)
-            .copied()
-            .unwrap_or((px * 0.6, false))
+        match ascii_slot(character) {
+            Some(slot) => ascii[slot],
+            None => advances.get(&character).copied(),
+        }
+        .unwrap_or((px * 0.6, false))
     };
     let font = font.as_deref();
     let piece_width = |piece: &str, previous: Option<char>| {
@@ -2482,7 +3311,7 @@ fn ui_text_wrap_ranges_impl(
             || line_start + 1 == graphemes.len()
     );
     ranges.push(range);
-    (ranges, scans)
+    ((ranges, scans), whole_font)
 }
 
 /// Exact, whitespace-preserving UI-face line breaks. The returned ranges are
@@ -2501,8 +3330,9 @@ pub(crate) fn ui_text_wrap_ranges(
 /// installed face has different advances from regular.
 ///
 /// A char the UI face LACKS measures at the advance of the face the pen will
-/// draw it with — the chrome cascade's regular pick ([`ChromeFonts::face_for`];
-/// the strip band draws every label as a regular-weight prim, and a mono
+/// draw it with — the UI face's own East Asian fallback at `face`'s weight,
+/// else the chrome cascade's regular pick ([`ChromeFonts::ui_miss_face`]; the
+/// strip band draws every label as a regular-weight prim, and a mono
 /// primary's bold sibling shares its advances anyway) — with no kern into or
 /// out of it and no tracking, exactly as [`Canvas::text`]'s proportional arm
 /// advances. It used to charge the UI face's own `.notdef` advance (~0.6 em)
@@ -2511,40 +3341,185 @@ pub(crate) fn ui_text_wrap_ranges(
 /// under the pen, and the band's centring, which subtracts this width, was off
 /// by half the difference. A char no loaded face covers measures the pen's own
 /// glyph where it has one ([`synthesized`]), else its 0.6 em placeholder.
-/// How far the `TextFace::Mono` pen moves per character at `px`: the advance
-/// of the chrome terminal face (the user's terminal font, else the bundled
-/// DejaVu Sans Mono). [`ui_text_width_for`] measures in the UI face, which a
-/// column grid of monospace runs must not use.
-pub(crate) fn mono_advance(px: f32) -> f32 {
-    let mut fonts = lock_fonts();
-    fonts
-        .face_for(TextWeight::Regular, '0')
-        .map_or(px * 0.6, |face| face.font.metrics('0', px).advance_width)
-}
-
 pub(crate) fn ui_text_width_for(face: TextFace, s: &str, px: f32) -> f32 {
     let mut fonts = lock_fonts();
-    let Some(f) = fonts.ui_font(face).cloned() else {
-        return s.chars().count() as f32 * px * 0.6;
-    };
-    let mut w = 0.0;
-    let mut prev: Option<char> = None;
-    for ch in s.chars() {
-        if f.lookup_glyph_index(ch) != 0 {
-            if let Some(p) = prev {
-                w += f.horizontal_kern(p, ch, px).unwrap_or(0.0);
-            }
-            w += f.metrics(ch, px).advance_width + UI_TRACKING_EM * px;
-            prev = Some(ch);
-            continue;
-        }
-        prev = None;
-        w += fonts.face_for(TextWeight::Regular, ch).map_or_else(
-            || synthesized::advance(ch, px).unwrap_or(px * 0.6),
-            |cface| cface.font.metrics(ch, px).advance_width,
-        );
+    let font = fonts.ui_font(face).cloned();
+    if let Some(font) = font.as_ref()
+        && let Some(width) = fonts.measures.width(face, font, px, s)
+    {
+        return width;
     }
-    w
+    let (width, _, whole) = ui_text_width_walk(&mut fonts, face, s, px, 0.0);
+    if whole && let Some(font) = font.as_ref() {
+        fonts.measures.keep_width(face, font, px, s, width);
+    }
+    width
+}
+
+/// The installed font [`ui_text_width_for`] measures `face` in, or `None` with no
+/// UI face installed (each scalar then measures 0.6 em). A caller that keeps a
+/// measure keys it on this font's identity (`Arc::ptr_eq`), and holds it, so a
+/// later install cannot reuse its address.
+pub(crate) fn ui_font_of(face: TextFace) -> Option<Arc<ChromeFont>> {
+    lock_fonts().ui_font(face).cloned()
+}
+
+/// Whether every scalar in any substring advances at least `minimum` pixels
+/// under the same routing, tracking and kerning used by the proportional pen.
+/// A substring's first scalar loses its incoming kern. Both sides of a UI
+/// kern pair must keep the floor: prefix growth adds the right side, while
+/// shortening a suffix removes the left side.
+pub(crate) fn ui_text_advances_at_least(face: TextFace, s: &str, px: f32, minimum: f32) -> bool {
+    ui_text_width_with_floor(&mut lock_fonts(), face, s, px, minimum).1
+}
+
+/// One linear actual-font walk for width and the optional scalar floor.
+/// Width preserves the pen's arithmetic; a failed floor never changes it.
+fn ui_text_width_with_floor(
+    fonts: &mut ChromeFonts,
+    face: TextFace,
+    s: &str,
+    px: f32,
+    minimum: f32,
+) -> (f32, bool) {
+    let (width, bounded, _) = ui_text_width_walk(fonts, face, s, px, minimum);
+    (width, bounded)
+}
+
+/// [`ui_text_width_with_floor`]'s walk, and whether the face itself mapped
+/// every char (so the width depends on that font alone, [`MeasureMemo`]).
+fn ui_text_width_walk(
+    fonts: &mut ChromeFonts,
+    face: TextFace,
+    s: &str,
+    px: f32,
+    minimum: f32,
+) -> (f32, bool, bool) {
+    note_measure_walk();
+    let fits = |advance: f32, kern: f32| {
+        advance.is_finite()
+            && kern.is_finite()
+            && advance >= minimum
+            && advance + kern.min(0.0) >= minimum
+    };
+    let mut bounded = minimum.is_finite() && minimum >= 0.0;
+    let Some(f) = fonts.ui_font(face).cloned() else {
+        return (
+            s.chars().count() as f32 * px * 0.6,
+            bounded && fits(px * 0.6, 0.0),
+            false,
+        );
+    };
+    let mut pen = UiPen::default();
+    for ch in s.chars() {
+        bounded &= pen.push(fonts, &f, face, ch, px, &fits);
+    }
+    (pen.w, bounded, pen.whole)
+}
+
+/// [`ui_text_width_with_floor`]'s pen: the width so far, and the char (with
+/// its advance) a kern into the next one pairs with. The whole-string measure
+/// pushes it through every char; [`ui_text_widths_at`] copies it at each cut,
+/// so the two add the same terms in the same order and agree to the bit.
+/// `whole`: the face itself mapped every char so far ([`MeasureMemo`]).
+#[derive(Clone, Copy)]
+struct UiPen {
+    w: f32,
+    prev: Option<(char, f32)>,
+    whole: bool,
+}
+
+impl Default for UiPen {
+    fn default() -> Self {
+        Self {
+            w: 0.0,
+            prev: None,
+            whole: true,
+        }
+    }
+}
+
+impl UiPen {
+    /// Moves the pen past `ch`, and says whether every advance it charged
+    /// (each side of a kern pair included) keeps `fits`.
+    fn push(
+        &mut self,
+        fonts: &mut ChromeFonts,
+        f: &ChromeFont,
+        face: TextFace,
+        ch: char,
+        px: f32,
+        fits: &impl Fn(f32, f32) -> bool,
+    ) -> bool {
+        if f.lookup_glyph_index(ch) != 0 {
+            let advance = f.metrics(ch, px).advance_width + UI_TRACKING_EM * px;
+            let kept = if let Some((p, before)) = self.prev {
+                let kern = f.horizontal_kern(p, ch, px).unwrap_or(0.0);
+                self.w += kern;
+                fits(advance, kern) && fits(before, kern)
+            } else {
+                fits(advance, 0.0)
+            };
+            self.w += advance;
+            self.prev = Some((ch, advance));
+            return kept;
+        }
+        self.prev = None;
+        self.whole = false;
+        let advance = fonts
+            .ui_miss_face(face, TextWeight::Regular, ch)
+            .map_or_else(
+                || synthesized::advance(ch, px).unwrap_or(px * 0.6),
+                |cface| cface.font.metrics(ch, px).advance_width,
+            );
+        self.w += advance;
+        fits(advance, 0.0)
+    }
+}
+
+/// What [`ui_text_width_for`] measures `text[..cut] + tail` at, for each of
+/// `cuts` (ascending byte offsets into `text`, each on a char boundary), in
+/// ONE pass of the pen: an elider that measured each shorter candidate afresh
+/// paid a whole measure per grapheme it shed. Each width is the one the
+/// whole-string measure gives that candidate, to the bit.
+pub(crate) fn ui_text_widths_at(
+    face: TextFace,
+    text: &str,
+    cuts: &[usize],
+    tail: &str,
+    px: f32,
+) -> Vec<f32> {
+    let mut fonts = lock_fonts();
+    let Some(f) = fonts.ui_font(face).cloned() else {
+        let tail_chars = tail.chars().count();
+        return cuts
+            .iter()
+            .map(|&cut| {
+                (text.get(..cut).map_or(0, |prefix| prefix.chars().count()) + tail_chars) as f32
+                    * px
+                    * 0.6
+            })
+            .collect();
+    };
+    let any = |_: f32, _: f32| true;
+    let mut pen = UiPen::default();
+    let mut chars = text.char_indices().peekable();
+    cuts.iter()
+        .map(|&cut| {
+            while let Some(&(at, ch)) = chars.peek() {
+                if at >= cut {
+                    break;
+                }
+                pen.push(&mut fonts, &f, face, ch, px, &any);
+                chars.next();
+            }
+            let mut tailed = pen;
+            for ch in tail.chars() {
+                tailed.push(&mut fonts, &f, face, ch, px, &any);
+            }
+            tailed.w
+        })
+        .collect()
 }
 
 /// sRGB EOTF lookup: a gamma-encoded byte (0..=255) → linear-light (0..1), built
@@ -2657,6 +3632,9 @@ struct Canvas {
     /// (`NaN` = not yet computed). A run of text sits on one fill, so the pair
     /// rarely changes and each byte costs its `powf` once per raster.
     glyph_remap: (u32, u32, [f32; 256]),
+    /// Device-px fade stack, `(top, bottom, from, to)`, the innermost last
+    /// ([`DrawPrim::FadePush`]): `blend` scales coverage by it.
+    fade: Vec<(f32, f32, f32, f32)>,
 }
 
 impl Canvas {
@@ -2684,6 +3662,7 @@ impl Canvas {
             glyphs: std::collections::HashMap::new(),
             clip: Vec::new(),
             glyph_remap: (u32::MAX, u32::MAX, [f32::NAN; 256]),
+            fade: Vec::new(),
         }
     }
 
@@ -2777,6 +3756,25 @@ impl Canvas {
         self.clip.pop();
     }
 
+    /// How opaque the innermost fade leaves device row `y` (1: untouched):
+    /// eased out from `from` at the band's top to `to` at its bottom, so it
+    /// starts with no step and falls fastest where it starts.
+    fn fade_at(&self, y: i32) -> f32 {
+        let Some(&(top, bottom, from, to)) = self.fade.last() else {
+            return 1.0;
+        };
+        let at = y as f32 + 0.5;
+        if at < top {
+            return 1.0;
+        }
+        let t = if bottom > top {
+            ((at - top) / (bottom - top)).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        to + (from - to) * (1.0 - t) * (1.0 - t)
+    }
+
     fn active_clip_intersects_tile(&self) -> bool {
         let Some(&(clip_x0, clip_y0, clip_x1, clip_y1)) = self.clip.last() else {
             return true;
@@ -2800,7 +3798,8 @@ impl Canvas {
         {
             return;
         }
-        let a = (f32::from(c[3]) / 255.0) * cov.clamp(0.0, 1.0);
+        let cov = cov.clamp(0.0, 1.0) * self.fade_at(y);
+        let a = (f32::from(c[3]) / 255.0) * cov;
         if a <= 0.0 {
             return;
         }
@@ -2952,7 +3951,86 @@ fn terminal_specimen_frame_key(spec: &TerminalSpecimenSpec, scale: f32) -> u64 {
         .as_ref()
         .map(|scene| scene.fingerprint)
         .hash(&mut hash);
+    // A different picture, dim or tint draws different pixels.
+    spec.wallpaper
+        .as_ref()
+        .map(crate::widget::SpecimenWallpaper::identity)
+        .hash(&mut hash);
     hash.finish()
+}
+
+/// `input` with `wallpaper` prepared for the frame a renderer with this
+/// metrics draws it at ([`crate::wallpaper_present::prepare`], the terminal
+/// present's own preparation): the base layer under default backgrounds and,
+/// with the tint on, default-foreground glyphs tinted toward the picture.
+/// One frame's preparation is kept, so a steady preview never rescales.
+fn specimen_with_wallpaper(
+    input: &aterm_render::RenderInput,
+    wallpaper: &crate::widget::SpecimenWallpaper,
+    theme: aterm_render::Theme,
+    frame: (usize, usize),
+) -> aterm_render::RenderInput {
+    type Memo = (u64, Rc<crate::wallpaper_present::PreparedWallpaper>);
+    thread_local! {
+        static LAST_WALLPAPER: std::cell::RefCell<Option<Memo>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let mut out = input.clone();
+    let (w, h) = frame;
+    if w == 0
+        || h == 0
+        || wallpaper.w == 0
+        || wallpaper.h == 0
+        || wallpaper.rgba.len() < wallpaper.w.saturating_mul(wallpaper.h).saturating_mul(4)
+    {
+        return out;
+    }
+    let fg = if input.default_fg == aterm_core::render::COLOR_UNSET {
+        theme.fg
+    } else {
+        input.default_fg
+    };
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        wallpaper.identity().hash(&mut hash);
+        (w, h, input.rows, input.cols, theme.bg, fg).hash(&mut hash);
+        hash.finish()
+    };
+    let prepared = LAST_WALLPAPER.with_borrow_mut(|slot| match slot {
+        Some((held, prepared)) if *held == key => Rc::clone(prepared),
+        _ => {
+            let prepared = Rc::new(crate::wallpaper_present::prepare(
+                crate::wallpaper_present::WallpaperSource {
+                    rgba: &wallpaper.rgba,
+                    w: wallpaper.w,
+                    h: wallpaper.h,
+                    fp: wallpaper.fp,
+                },
+                (w, h),
+                (input.rows, input.cols),
+                wallpaper.dim,
+                (theme.bg, fg),
+            ));
+            *slot = Some((key, Rc::clone(&prepared)));
+            prepared
+        }
+    });
+    out.wallpaper = Some(std::sync::Arc::clone(&prepared.atlas));
+    if wallpaper.tint {
+        let default_fg = [(fg >> 16) as u8, (fg >> 8) as u8, fg as u8];
+        let mut scratch = Vec::new();
+        crate::wallpaper_present::merge_wallpaper_tint_ink(
+            &input.cells,
+            input.rows,
+            input.cols,
+            default_fg,
+            &prepared.tint,
+            &mut out.ink,
+            &mut scratch,
+        );
+    }
+    out
 }
 
 /// Everything the configured renderer fork is built from: the frame key less
@@ -3059,24 +4137,30 @@ fn render_specimen_frame(spec: &TerminalSpecimenSpec, scale: f32) -> Option<ater
             renderer.set_selection_fg(spec.selection_foreground);
             renderer.set_selection_inactive(spec.selection_inactive);
             renderer.activate_px(spec.font_px * scale);
-            // A display face's capitals rise past its cell: the frame carries
-            // their room above the first row (the layout reserves it too,
-            // `SettingsPreviewSpec::specimen_headroom`), so the box never cuts
-            // their tops off.
-            renderer.set_head(renderer.display_ink_headroom(
-                spec.font_px * scale,
-                spec.line_height,
-                (spec.baseline_adjust as f32 * scale).round() as i32,
-            ));
             held.insert(0, (key, Rc::downgrade(source), renderer));
             held.truncate(SPECIMEN_FRAME_CACHE_ENTRIES);
         }
         let (_, _, renderer) = held.first_mut()?;
+        let frame_size = renderer
+            .checked_frame_size(spec.input.rows, spec.input.cols)
+            .ok()?;
+        // The wallpaper is prepared for this fork's exact frame, the size the
+        // renderer admits a base layer at.
+        let walled = spec.wallpaper.as_ref().map(|wallpaper| {
+            specimen_with_wallpaper(&spec.input, wallpaper, spec.theme, frame_size)
+        });
+        let input = walled.as_ref().unwrap_or(&*spec.input);
         Some(match spec.motion.as_deref() {
             Some(scene) => {
-                renderer.render_input(&scene.decorate(&spec.input, renderer.cell_size()))
+                let input = scene.decorate(input, renderer.cell_size());
+                let mut frame = renderer.try_render_input(&input).ok()?;
+                // The live terminal's post passes, on the CPU: its bloom
+                // kernel and selected crown (`aterm_render::bloom`).
+                // A refused post pass is not retained or presented as a finished specimen.
+                scene.post_process(&mut frame, &input).ok()?;
+                frame
             }
-            None => renderer.render_input(&spec.input),
+            None => renderer.try_render_input(input).ok()?,
         })
     })
 }
@@ -3417,9 +4501,11 @@ impl Canvas {
         // Native proportional UI face with PER-CHARACTER coverage fallback.
         // Fontdue will happily rasterize glyph 0 as a visible tofu box, so a
         // run-level face choice is not sufficient: keep the real UI face for
-        // every covered character, and route only each miss through the terminal
-        // cascade. This is what keeps labels proportional while arrows/CJK/etc.
-        // remain genuine glyphs rather than `.notdef`.
+        // every covered character, and route only each miss through the UI
+        // face's own East Asian fallback at the run's weight, then the terminal
+        // cascade ([`ChromeFonts::ui_miss_face`]). This is what keeps labels
+        // proportional while arrows/CJK/etc. remain genuine glyphs rather than
+        // `.notdef`, and a Regular label's ideographs Regular.
         let ui = fonts.ui_font(face).cloned();
         let baseline_i = q_round_to_px(px_to_q(baseline)) as i32 as f32;
         let mut pen = x;
@@ -3440,7 +4526,7 @@ impl Canvas {
             }
             prev_ui = None;
 
-            let glyph = match fonts.face_for(weight, ch) {
+            let glyph = match fonts.ui_miss_face(face, weight, ch) {
                 Some(cface) => Some(self.raster_glyph(&cface.font, ch, px)),
                 None => self.raster_synthesized(ch, px),
             };
@@ -3498,23 +4584,39 @@ impl Canvas {
         );
     }
 
+    /// Place a rendered terminal frame with its top-left at device `(x, y)`.
+    /// Every frame pixel is opaque, so it REPLACES what is under it (what
+    /// `blend` does for an opaque, fully covered source): one clipped span
+    /// per row is written straight into the canvas, never a per-pixel blend.
     fn blit_terminal_frame(&mut self, frame: &aterm_render::Frame, x: i32, y: i32) {
         if frame.width == 0 {
             return;
         }
-        for (row, pixels) in frame.pixels.chunks(frame.width).enumerate() {
-            for (column, pixel) in pixels.iter().copied().enumerate() {
-                self.blend(
-                    x.saturating_add(column as i32),
-                    y.saturating_add(row as i32),
-                    [
-                        ((pixel >> 16) & 0xff) as u8,
-                        ((pixel >> 8) & 0xff) as u8,
-                        (pixel & 0xff) as u8,
-                        255,
-                    ],
-                    1.0,
-                );
+        let rows = frame.pixels.len() / frame.width;
+        let (x0, y0, x1, y1) = self.clipped_bounds(
+            x,
+            y,
+            x.saturating_add(i32::try_from(frame.width).unwrap_or(i32::MAX)),
+            y.saturating_add(i32::try_from(rows).unwrap_or(i32::MAX)),
+        );
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let stride = self.w as usize * 4;
+        let span = (x1 - x0) as usize;
+        let skip = (x0 - x) as usize;
+        let local_x = (x0 - self.origin_x) as usize;
+        for py in y0..y1 {
+            let source = &frame.pixels[(py - y) as usize * frame.width + skip..][..span];
+            let start = (py - self.origin_y) as usize * stride + local_x * 4;
+            let target = &mut self.px[start..start + span * 4];
+            for (out, pixel) in target.as_chunks_mut::<4>().0.iter_mut().zip(source) {
+                *out = [
+                    ((pixel >> 16) & 0xff) as u8,
+                    ((pixel >> 8) & 0xff) as u8,
+                    (pixel & 0xff) as u8,
+                    255,
+                ];
             }
         }
     }
@@ -3736,6 +4838,7 @@ pub(crate) fn composite_rgba_surface(
         glyphs: std::collections::HashMap::new(),
         clip: Vec::new(),
         glyph_remap: (u32::MAX, u32::MAX, [f32::NAN; 256]),
+        fade: Vec::new(),
     };
     let (source_width, source_height) = source_size;
     let source_x = source_origin.0.min(i32::MAX as u32) as i32;
@@ -3813,6 +4916,14 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
                 continue;
             }
             _ if skipped_clip_depth > 0 => continue,
+            DrawPrim::FadePush { y, h, from, to } => {
+                cv.fade.push((y * s, (y + h) * s, *from, *to));
+                continue;
+            }
+            DrawPrim::FadePop => {
+                cv.fade.pop();
+                continue;
+            }
             _ => {}
         }
         match p {
@@ -3906,7 +5017,10 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
                 icon,
                 color,
             } => cv.band_icon(x * s, y * s, size * s, *icon, *color),
-            DrawPrim::ClipPush { .. } | DrawPrim::ClipPop => unreachable!("handled above"),
+            DrawPrim::ClipPush { .. }
+            | DrawPrim::ClipPop
+            | DrawPrim::FadePush { .. }
+            | DrawPrim::FadePop => unreachable!("handled above"),
         }
     }
     cv.px
@@ -3960,6 +5074,47 @@ mod tests {
     use crate::widget::DrawPrim;
     use aterm_render::Theme;
 
+    /// A WORD THE UI FACE DRAWS WHOLE IS MEASURED ONCE ([`MeasureMemo`]):
+    /// measured again at the same size (its width) or the same width (its
+    /// line breaks) it costs no glyph walk and reads the same. Negative
+    /// controls: a string with a char the face lacks (an ideograph, drawn by
+    /// a fallback face that lands lazily) is measured every time, and a new
+    /// UI font measures afresh.
+    #[test]
+    fn a_word_the_ui_face_draws_whole_is_measured_once() {
+        prepare_ui_fonts_for_direct_view_test();
+        assert!(
+            ui_font_of(TextFace::Ui).is_some(),
+            "a UI face to measure in"
+        );
+        let (word, px) = ("Searchable scrollback lines", 13.0);
+        let first = ui_text_width_for(TextFace::Ui, word, px);
+        let walks = measure_walks();
+        assert_eq!(ui_text_width_for(TextFace::Ui, word, px), first);
+        assert_eq!(measure_walks(), walks, "kept");
+        let paragraph = "Find searches this many recent lines; 0 searches only the screen.";
+        let lines = ui_text_wrap_ranges(paragraph, px, 120.0);
+        let walks = measure_walks();
+        assert_eq!(ui_text_wrap_ranges(paragraph, px, 120.0), lines);
+        assert_eq!(measure_walks(), walks, "kept");
+        // An ideograph reaches another face: measured every time.
+        let mixed = "\u{8a2d}\u{5b9a} Settings";
+        let _ = ui_text_width_for(TextFace::Ui, mixed, px);
+        let walks = measure_walks();
+        let _ = ui_text_width_for(TextFace::Ui, mixed, px);
+        assert_eq!(measure_walks(), walks + 1, "never kept");
+        // Another UI font: measured afresh, in it.
+        let held = lock_fonts().ui_regular.clone();
+        let other = ChromeFace::from_bytes(aterm_render::embedded_font(), 0)
+            .map(|face| face.font)
+            .expect("the embedded face");
+        lock_fonts().ui_regular = Some(other);
+        let walks = measure_walks();
+        let _ = ui_text_width_for(TextFace::Ui, word, px);
+        assert_eq!(measure_walks(), walks + 1, "a new font measures afresh");
+        lock_fonts().ui_regular = held;
+    }
+
     /// The Settings preview resolves a BUNDLED family (the default — `Iosevka
     /// Term Semibold` on Windows, `JetBrains Mono` on Linux — `Cascadia Mono
     /// PL` and `JetBrains Mono` on Windows too, and `Iosevka Term` everywhere,
@@ -3998,7 +5153,9 @@ mod tests {
         }
         let mut cases = Vec::new();
         for (family, id, bold_id) in families {
-            if aterm_render::resolve_font_family(family).is_none() {
+            if aterm_render::resolve_font_family(family, aterm_render::FaceTarget::REGULAR)
+                .is_none()
+            {
                 cases.push((family.to_string(), id));
                 cases.push((format!("{family} Bold"), bold_id));
             }
@@ -4006,9 +5163,10 @@ mod tests {
         let mut cache = CandidateFaceCache::new();
         for (family, id) in cases {
             let family = family.as_str();
-            let face = resolve_candidate_face(family, &mut cache)
-                .unwrap_or_else(|error| panic!("{family}: {error}"));
-            assert_eq!(face.path, id);
+            let face =
+                resolve_candidate_face(family, aterm_render::FaceTarget::REGULAR, &mut cache)
+                    .unwrap_or_else(|error| panic!("{family}: {error}"));
+            assert_eq!(face.face.path, id);
             assert_eq!(
                 &face.bytes[..],
                 aterm_render::bundled::face_for_id(id).unwrap()
@@ -4758,6 +5916,439 @@ mod tests {
         clear_ui_fonts_for_test();
     }
 
+    /// How many chain faces THIS thread's installed seed holds parsed.
+    #[cfg(not(target_os = "macos"))]
+    fn ready_chain_faces() -> usize {
+        lock_fonts()
+            .semantic
+            .as_ref()
+            .map_or(0, |seed| seed.ready_fallback_faces().count())
+    }
+
+    /// A LABEL HAS THE CHAIN FACE IT NEEDS PARSED ON THE FRAME THAT DRAWS IT.
+    /// With the host's CJK face in the seed's chain, unparsed (a fresh
+    /// window), asking whether a CJK title is coverable parses that face —
+    /// into the cell the seed shares — and answers yes; a title no face maps
+    /// parses nothing and stays uncoverable; a Latin title needs nothing.
+    /// NEGATIVE CONTROL: before the ask, the cascade does not reach 日. The
+    /// UI faces' own East Asian fallback is taken away, the state of a host
+    /// without one: its turn is
+    /// `a_cjk_label_has_its_weights_own_ui_faces_parsed_when_the_band_asks`.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_cjk_label_has_its_chain_face_parsed_when_the_band_asks() {
+        let Some(_live) = install_unparsed_cjk_chain_for_test() else {
+            return;
+        };
+        set_ui_cjk_faces_for_test(None);
+        if !strip_band_ui_ready() {
+            clear_ui_fonts_for_test();
+            return;
+        }
+        assert!(strip_band_run_coverable("alpha"));
+        assert_eq!(ready_chain_faces(), 0, "a Latin label parses nothing");
+        assert!(
+            !chrome_cascade_reaches_for_test('日'),
+            "CONTROL: nothing has parsed the CJK face"
+        );
+        assert!(!strip_band_run_coverable("logs \u{0378}"));
+        assert_eq!(ready_chain_faces(), 0, "no face maps U+0378: none parsed");
+        assert!(
+            strip_band_run_coverable("日本語 notes"),
+            "the CJK label is coverable on its first ask"
+        );
+        assert!(ready_chain_faces() >= 1);
+        assert!(chrome_cascade_reaches_for_test('日'));
+        clear_ui_fonts_for_test();
+    }
+
+    /// THE STARTUP WARM PARSES THE CJK AND HANGUL FACES, AND ONLY THOSE. Over
+    /// a seed whose chain is unparsed, [`warm_chrome_coverage`] parses the
+    /// faces that map Han, kana and Hangul — every face it parses maps one of
+    /// them — so the cascade reaches 日 with no label having asked; a second
+    /// warm parses nothing. NEGATIVE CONTROL: before it, nothing is parsed.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_startup_warm_parses_the_cjk_and_hangul_faces_only() {
+        let Some(live) = install_unparsed_cjk_chain_for_test() else {
+            return;
+        };
+        assert_eq!(ready_chain_faces(), 0, "CONTROL: nothing parsed yet");
+        assert!(warm_chrome_coverage(Some(&live.fallback_coverage()), None) >= 1);
+        assert!(chrome_cascade_reaches_for_test('日'));
+        let parsed: Vec<Arc<ChromeFont>> = lock_fonts()
+            .semantic
+            .as_ref()
+            .map(|seed| seed.ready_fallback_faces().cloned().collect())
+            .unwrap_or_default();
+        assert!(!parsed.is_empty());
+        for face in &parsed {
+            assert!(
+                CHROME_COVERAGE_WARM
+                    .chars()
+                    .any(|ch| face.lookup_glyph_index(ch) != 0),
+                "the warm parsed a face that maps none of {CHROME_COVERAGE_WARM:?}"
+            );
+        }
+        assert_eq!(
+            warm_chrome_coverage(Some(&live.fallback_coverage()), None),
+            0,
+            "a second warm parses nothing"
+        );
+        clear_ui_fonts_for_test();
+    }
+
+    /// Which chars the UI faces' own East Asian fallback is asked for, and of
+    /// which face: Hangul of the Korean face, every other CJK char of the
+    /// Japanese then the Chinese one, anything else of nothing (it keeps the
+    /// terminal cascade, so no symbol, arrow or other script changes face).
+    #[test]
+    fn east_asian_text_splits_into_hangul_and_han_and_nothing_else_is_asked() {
+        for ch in [
+            '日', '中', '简', 'の', 'カ', 'ｶ', '、', '「', 'Ａ', '㈱', '㌀', 'ㄅ', '𠀋',
+        ] {
+            assert_eq!(ui_cjk_script(ch), Some(UiCjkScript::Han), "{ch:?}");
+        }
+        for ch in ['한', '국', 'ㄱ', 'ᄀ', '㈀', '㉠', 'ￂ'] {
+            assert_eq!(ui_cjk_script(ch), Some(UiCjkScript::Hangul), "{ch:?}");
+        }
+        for ch in [
+            'a',
+            'é',
+            'λ',
+            'Ж',
+            '→',
+            '★',
+            '※',
+            '✓',
+            'क',
+            'ก',
+            '①',
+            '\u{1F680}',
+            ' ',
+            '\u{3000}',
+        ] {
+            let asked = ui_cjk_script(ch);
+            // U+3000, the ideographic space, is CJK punctuation: the faces
+            // draw it as an em of air, as Windows does.
+            assert_eq!(asked.is_some(), ch == '\u{3000}', "{ch:?}: {asked:?}");
+        }
+    }
+
+    /// Install, SETTLED, a semantic seed whose chain holds the production
+    /// Windows chain's East Asian faces, PARSED: Microsoft YaHei Bold and
+    /// Malgun Gothic Bold, the weight-matched siblings `aterm_render` puts
+    /// beside Iosevka Term SemiBold. Plus the host UI faces and a cold store
+    /// of the UI faces' own East Asian fallback. `None` (the caller skips)
+    /// where the host lacks any of them.
+    #[cfg(windows)]
+    fn install_bold_cjk_chain_and_cold_ui_cjk_for_test() -> Option<Arc<UiCjkFaces>> {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("WINDIR").unwrap_or_else(|| r"C:\Windows".into()),
+        )
+        .join("Fonts");
+        let mut renderer = Renderer::from_bytes(
+            aterm_render::embedded_font(),
+            14.0,
+            aterm_render::Theme::default(),
+        )
+        .ok()?;
+        renderer.set_runtime_font_discovery(false);
+        for file in ["msyhbd.ttc", "malgunbd.ttf"] {
+            let bytes = std::fs::read(root.join(file)).ok()?;
+            renderer.add_fallback_bytes(&bytes).ok()?;
+        }
+        install_settled_chrome_fonts_for_test(renderer);
+        prepare_ui_fonts_for_direct_view_test();
+        let store = host_ui_cjk_faces_for_test()?;
+        set_ui_cjk_faces_for_test(Some(Arc::clone(&store)));
+        strip_band_ui_ready().then_some(store)
+    }
+
+    /// The mean ink of `s`'s lit pixels (white on black, the judges' `t` with
+    /// its 0.05 floor) and their count, drawn at `px` in `face`.
+    #[cfg(windows)]
+    fn label_ink(s: &str, px: f32, face: TextFace) -> (f32, usize) {
+        let prims = vec![DrawPrim::Text {
+            x: 4.0,
+            baseline: px * 1.4,
+            s: s.to_string(),
+            px,
+            color: [255, 255, 255, 255],
+            weight: TextWeight::Regular,
+            face,
+        }];
+        let (w, h) = ((px * 12.0) as u32, (px * 2.0) as u32);
+        let (pixels, _, _) = rasterize_tray(&prims, w, h, 1.0, [0, 0, 0, 255]);
+        let lit: Vec<f32> = pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from(c[0]) / 255.0)
+            .filter(|&t| t > 0.05)
+            .collect();
+        (lit.iter().sum::<f32>() / lit.len().max(1) as f32, lit.len())
+    }
+
+    /// A QUIET TAB'S CJK AND HANGUL INK LIKE ITS LATIN; THE SELECTED TAB'S ARE
+    /// SEMIBOLD. Over the production chain's Bold faces (the 2026-10-18
+    /// judges' `j4t-cjk-band-labels-bold`: `日本語` and `한국어` at a mean ink
+    /// of 0.635 and 0.614 beside `notes` at 0.540), a Regular label's East
+    /// Asian text draws from the UI faces' own Regular fallback — Yu Gothic UI
+    /// and Malgun Gothic, the faces Windows itself falls back to from Segoe UI
+    /// — and lands within 0.05 of the Latin's mean ink; a Semibold label's
+    /// from their Semibold and Bold, heavier than the Regular. Measured and
+    /// drawn alike: the pen's advance is the measure's. NEGATIVE CONTROL: the
+    /// same labels with the UI faces' fallback taken away draw from the
+    /// chain's Bold, as before, heavier than the Latin by more than 0.05.
+    #[cfg(windows)]
+    #[test]
+    fn a_quiet_labels_east_asian_text_inks_like_its_latin_and_the_selected_ones_is_semibold() {
+        let Some(store) = install_bold_cjk_chain_and_cold_ui_cjk_for_test() else {
+            clear_ui_fonts_for_test();
+            return;
+        };
+        let px = 26.0;
+        for (text, latin) in [("日本語", "notes"), ("한국어", "logs")] {
+            assert!(strip_band_run_coverable_in(TextFace::Ui, text));
+            assert!(strip_band_run_coverable_in(TextFace::UiBold, text));
+            let (cjk, cjk_n) = label_ink(text, px, TextFace::Ui);
+            let (semibold, semibold_n) = label_ink(text, px, TextFace::UiBold);
+            let (latin, _) = label_ink(latin, px, TextFace::Ui);
+            eprintln!(
+                "{text}: regular {cjk:.3} ({cjk_n} px), semibold {semibold:.3} ({semibold_n} px), latin {latin:.3}"
+            );
+            assert!(
+                (cjk - latin).abs() <= 0.05,
+                "{text} in a quiet label inks {cjk:.3}, its Latin {latin:.3}"
+            );
+            assert!(
+                semibold_n as f32 > cjk_n as f32 * 1.08,
+                "{text} in the selected label is heavier: {semibold_n} lit px against {cjk_n}"
+            );
+            // Drawn from the store's own faces, the Regular rung's for Ui and
+            // the Semibold rung's for UiBold, by identity.
+            let ch = text.chars().next().unwrap();
+            let mut fonts = lock_fonts();
+            for (face, weight) in [
+                (TextFace::Ui, UiCjkWeight::Regular),
+                (TextFace::UiBold, UiCjkWeight::Semibold),
+            ] {
+                let drawn = Arc::clone(
+                    &fonts
+                        .ui_miss_face(face, TextWeight::Regular, ch)
+                        .expect("a face")
+                        .font,
+                );
+                assert!(
+                    store
+                        .rung(weight)
+                        .iter()
+                        .any(|entry| entry.parsed().is_some_and(|font| Arc::ptr_eq(font, &drawn))),
+                    "{ch:?} in {face:?} draws from the {weight:?} rung"
+                );
+            }
+            drop(fonts);
+            // Measured as drawn: the band fits and centres by this width.
+            for face in [TextFace::Ui, TextFace::UiBold] {
+                let mut fonts = lock_fonts();
+                let pen: f32 = text
+                    .chars()
+                    .map(|ch| {
+                        fonts
+                            .ui_miss_face(face, TextWeight::Regular, ch)
+                            .expect("a face")
+                            .font
+                            .metrics(ch, px)
+                            .advance_width
+                    })
+                    .sum();
+                drop(fonts);
+                assert_eq!(ui_text_width_for(face, text, px), pen, "{text} in {face:?}");
+            }
+        }
+        // NEGATIVE CONTROL: the chain's Bold, as every label drew before.
+        set_ui_cjk_faces_for_test(None);
+        let (bold, _) = label_ink("日本語", px, TextFace::Ui);
+        let (latin, _) = label_ink("notes", px, TextFace::Ui);
+        eprintln!("control: chain 日本語 {bold:.3}, latin {latin:.3}");
+        assert!(
+            bold - latin > 0.05,
+            "CONTROL: the chain's Bold inks {bold:.3} against the Latin's {latin:.3}"
+        );
+        clear_ui_fonts_for_test();
+    }
+
+    /// A WEIGHT NEVER BORROWS THE OTHER'S FACE. With only the Regular rung
+    /// landed, a Semibold run's `日` is not drawn from it: it falls to the
+    /// terminal cascade (here nothing, the store being the only East Asian
+    /// face), and the band's coverage question reports it missing, so the
+    /// band has the Semibold face parsed before it draws. Yu Gothic UI's kana
+    /// are proportional, so not even an advance carries across: `の` is
+    /// 0.816 em Regular and 0.836 em Semibold. NEGATIVE CONTROL: the Regular
+    /// run reaches the Regular face.
+    #[cfg(windows)]
+    #[test]
+    fn a_semibold_run_never_borrows_the_regular_east_asian_face() {
+        let Some(store) = host_ui_cjk_faces_for_test() else {
+            return;
+        };
+        prepare_ui_fonts_for_direct_view_test();
+        set_ui_cjk_faces_for_test(Some(Arc::clone(&store)));
+        store.materialise_for(UiCjkWeight::Regular, "日の");
+        let mut fonts = lock_fonts();
+        assert!(
+            fonts
+                .ui_miss_face(TextFace::Ui, TextWeight::Regular, '日')
+                .is_some(),
+            "CONTROL: the Regular run reaches the Regular face"
+        );
+        assert!(
+            fonts
+                .ui_miss_face(TextFace::UiBold, TextWeight::Regular, '日')
+                .is_none(),
+            "the Semibold run does not borrow it"
+        );
+        assert_eq!(fonts.label_misses(TextFace::UiBold, "日"), ['日']);
+        assert!(fonts.label_misses(TextFace::Ui, "日").is_empty());
+        drop(fonts);
+        store.materialise_for(UiCjkWeight::Semibold, "の");
+        let advance = |weight: UiCjkWeight| {
+            store.rung(weight)[0]
+                .parsed()
+                .expect("Yu Gothic UI")
+                .metrics('の', 1000.0)
+                .advance_width
+                .round()
+        };
+        assert_eq!(
+            (
+                advance(UiCjkWeight::Regular),
+                advance(UiCjkWeight::Semibold)
+            ),
+            (816.0, 836.0)
+        );
+        clear_ui_fonts_for_test();
+    }
+
+    /// A LABEL HAS ITS OWN WEIGHT'S EAST ASIAN FACES PARSED WHEN THE BAND
+    /// ASKS, and only those. Over a cold store: a Latin label parses nothing;
+    /// a quiet `日本語 notes` parses the Regular rung's Han face, which maps
+    /// it, and nothing of the Semibold rung or the Hangul faces; the selected
+    /// `한국어` parses the Semibold rung's Hangul face and not the Regular's.
+    /// The chain, unparsed, is not asked: the UI faces place every char. The
+    /// band key witnesses each landing. NEGATIVE CONTROL: before the ask the
+    /// store holds nothing and the UI routing does not reach 日.
+    #[cfg(windows)]
+    #[test]
+    fn a_cjk_label_has_its_weights_own_ui_faces_parsed_when_the_band_asks() {
+        let Some(_live) = install_unparsed_cjk_chain_for_test() else {
+            return;
+        };
+        let Some(store) = host_ui_cjk_faces_for_test() else {
+            clear_ui_fonts_for_test();
+            return;
+        };
+        set_ui_cjk_faces_for_test(Some(Arc::clone(&store)));
+        if !strip_band_ui_ready() {
+            clear_ui_fonts_for_test();
+            return;
+        }
+        let parsed = |weight: UiCjkWeight, script: UiCjkScript| {
+            store
+                .rung(weight)
+                .iter()
+                .filter(|face| face.script == script && face.parsed().is_some())
+                .count()
+        };
+        assert_eq!(store.parsed_count(), 0, "CONTROL: a cold store");
+        assert!(
+            lock_fonts()
+                .ui_miss_face(TextFace::Ui, TextWeight::Regular, '日')
+                .is_none(),
+            "CONTROL: nothing reaches 日"
+        );
+        assert!(strip_band_run_coverable("alpha"));
+        assert_eq!(store.parsed_count(), 0, "a Latin label parses nothing");
+        let before = strip_band_font_epoch();
+        assert!(strip_band_run_coverable_in(TextFace::Ui, "日本語 notes"));
+        assert_eq!(parsed(UiCjkWeight::Regular, UiCjkScript::Han), 1);
+        assert_eq!(
+            store.parsed_count(),
+            1,
+            "one face: the one that maps 日本語"
+        );
+        let quiet = strip_band_font_epoch();
+        assert_ne!(quiet, before, "the band key witnesses the landing");
+        assert!(strip_band_run_coverable_in(TextFace::UiBold, "한국어"));
+        assert_eq!(parsed(UiCjkWeight::Semibold, UiCjkScript::Hangul), 1);
+        assert_eq!(parsed(UiCjkWeight::Regular, UiCjkScript::Hangul), 0);
+        assert_eq!(store.parsed_count(), 2);
+        assert_ne!(strip_band_font_epoch(), quiet);
+        assert_eq!(ready_chain_faces(), 0, "the chain is not asked");
+        clear_ui_fonts_for_test();
+    }
+
+    /// THE STARTUP WARM PARSES THE UI FACES' OWN CJK AND HANGUL FACES, both
+    /// weights, and no other: the Regular rung's and the Semibold rung's
+    /// first Han face (they map 日 and の) and their Hangul face, four in all;
+    /// the Chinese face, which only a char the Japanese face lacks asks for,
+    /// stays unread. A second warm parses nothing. NEGATIVE CONTROL: a cold
+    /// store.
+    #[cfg(windows)]
+    #[test]
+    fn the_startup_warm_parses_the_ui_faces_east_asian_faces_at_both_weights() {
+        let Some(store) = host_ui_cjk_faces_for_test() else {
+            return;
+        };
+        assert_eq!(store.parsed_count(), 0, "CONTROL: a cold store");
+        assert_eq!(warm_chrome_coverage(None, Some(&store)), 4);
+        for weight in [UiCjkWeight::Regular, UiCjkWeight::Semibold] {
+            let rung = store.rung(weight);
+            let han: Vec<bool> = rung
+                .iter()
+                .filter(|face| face.script == UiCjkScript::Han)
+                .map(|face| face.parsed().is_some())
+                .collect();
+            assert_eq!(
+                han,
+                [true, false],
+                "{weight:?}: the Japanese face, not the Chinese"
+            );
+            assert!(
+                rung.iter()
+                    .filter(|face| face.script == UiCjkScript::Hangul)
+                    .all(|face| face.parsed().is_some()),
+                "{weight:?}: the Hangul face"
+            );
+        }
+        assert_eq!(warm_chrome_coverage(None, Some(&store)), 0);
+    }
+
+    /// Which chars a label may ask the terminal's chain for: text in any
+    /// script, never a colour emoji (the band draws those in colour), a
+    /// private-use icon (the cell lane's rules), a joiner, a selector or a
+    /// control.
+    #[test]
+    fn a_label_asks_the_chain_for_text_only() {
+        for ch in ['日', 'の', '한', 'क', 'ก', 'é', '\u{3000}', '∑'] {
+            assert!(chain_may_draw_in_a_label(ch), "{ch:?} is text");
+        }
+        for ch in [
+            '\u{1F680}',
+            '\u{2600}',
+            '\u{2764}',
+            '\u{FE0F}',
+            '\u{200D}',
+            '\u{E0A0}',
+            '\u{F0001}',
+            '\u{10FFFD}',
+            '\u{7}',
+        ] {
+            assert!(!chain_may_draw_in_a_label(ch), "{ch:?} is not asked");
+        }
+    }
+
     /// [`set_chrome_fonts`] robustness: unparseable bytes leave the slot on the
     /// DejaVu fallback (text still renders), and clearing restores the default
     /// stack. Serialized with the other font-injecting assertions by running in
@@ -4781,22 +6372,24 @@ mod tests {
         set_chrome_fonts(None, None, None);
     }
 
-    /// A display face on the terminal never becomes the chrome's face:
-    /// Settings' numbers and code text keep the embedded monospace face,
-    /// while the user's own font still takes the slot.
+    /// The chrome keeps the person's font under a display layer: the terminal
+    /// draws Engraved over DejaVu, and the chrome's face is DejaVu — the face
+    /// that draws with every display face off — never the display face, and
+    /// never the embedded fallback standing in for a refused display face
+    /// (which is what the Manual editor drew while the face was the primary).
     #[test]
-    fn a_display_face_is_never_the_chrome_face() {
-        for face in aterm_render::DISPLAY_FACES {
-            let bytes: std::sync::Arc<[u8]> =
-                std::sync::Arc::from(aterm_render::display_face_bytes(face.id).unwrap());
-            assert!(
-                chrome_face_for_slot(&Some((bytes, 0))).is_none(),
-                "{} stays out of the chrome",
-                face.id
-            );
-        }
-        let own: std::sync::Arc<[u8]> = std::sync::Arc::from(aterm_render::embedded_font());
-        assert!(chrome_face_for_slot(&Some((own, 0))).is_some());
+    fn the_chrome_keeps_the_persons_font_under_a_display_layer() {
+        let own = aterm_render::embedded_font();
+        let mut renderer = Renderer::from_bytes(own, 14.0, aterm_render::Theme::default()).unwrap();
+        renderer.set_display_faces(&["engraved"]).unwrap();
+        let primary = renderer.chrome_primary_face();
+        assert_eq!(
+            primary
+                .as_ref()
+                .map(|(bytes, index)| (bytes.as_ref(), *index)),
+            Some((own, 0))
+        );
+        assert!(chrome_face_for_slot(&primary).is_some());
     }
 
     /// One real engine frame for the shipping specimen path: `source` runs
@@ -4850,6 +6443,7 @@ mod tests {
             minimum_contrast: 1.0,
             selection_foreground: None,
             selection_inactive: false,
+            wallpaper: None,
         }
     }
 
@@ -5411,13 +7005,18 @@ mod tests {
         let fixture = include_bytes!("../../aterm-render/tests/fixtures/jetbrains-mono.ttf");
         let family = "aterm deterministic JetBrains fixture";
         let mut faces = CandidateFaceCache::new();
-        faces.insert(
-            family.to_ascii_lowercase(),
-            Ok(ResolvedCandidateFace {
-                path: "jetbrains-mono.ttf".to_string(),
-                bytes: Arc::new(fixture.to_vec()),
-            }),
-        );
+        for slot in 0..4 {
+            faces.insert(
+                (
+                    family.to_ascii_lowercase(),
+                    aterm_render::FaceTarget::for_slot(slot),
+                ),
+                Ok(ResolvedCandidateFace {
+                    face: aterm_render::FaceRef::new("jetbrains-mono.ttf", 0),
+                    bytes: Arc::new(fixture.to_vec()),
+                }),
+            );
+        }
         let candidate = crate::widget::SemanticFontCandidate {
             regular: Some(family.to_string()),
             bold: Some(family.to_string()),
@@ -5428,6 +7027,7 @@ mod tests {
             emoji: None,
             variations: Vec::new(),
             synthetic_styles: true,
+            display: Vec::new(),
         };
         let mut base = Renderer::from_bytes(
             aterm_render::embedded_font(),
@@ -5493,6 +7093,58 @@ mod tests {
         );
     }
 
+    /// A candidate forked from a sealed generation still reaches the
+    /// compiled-in symbol face: a code point only that face covers resolves
+    /// to it, not to the primary's `.notdef`.
+    #[test]
+    fn a_font_candidate_keeps_the_compiled_in_symbol_face() {
+        // Only the bundled Symbols Nerd Font covers this icon (nf-fa-github), and
+        // `from_bytes` lists no system face, so sealing reads no file.
+        const ONLY_BUNDLED: char = '\u{F09B}';
+        let fixture = include_bytes!("../../aterm-render/tests/fixtures/jetbrains-mono.ttf");
+        let family = "aterm deterministic JetBrains fixture";
+        let mut faces = CandidateFaceCache::new();
+        faces.insert(
+            (
+                family.to_ascii_lowercase(),
+                aterm_render::FaceTarget::REGULAR,
+            ),
+            Ok(ResolvedCandidateFace {
+                face: aterm_render::FaceRef::new("jetbrains-mono.ttf", 0),
+                bytes: Arc::new(fixture.to_vec()),
+            }),
+        );
+        let candidate = crate::widget::SemanticFontCandidate {
+            regular: Some(family.to_string()),
+            ..crate::widget::SemanticFontCandidate::default()
+        };
+        let mut base = Renderer::from_bytes(
+            aterm_render::embedded_font(),
+            14.0,
+            aterm_render::Theme::default(),
+        )
+        .expect("embedded renderer");
+        let _ = base.seal_admitted_font_sources();
+        let (renderer, resolution) = build_semantic_candidate(&base, &candidate, &mut faces);
+        assert_eq!(resolution, SemanticFontResolution::Ready);
+        let mut renderer = renderer.expect("candidate renderer");
+        assert!(renderer.admitted_font_sources_sealed());
+        assert_ne!(
+            renderer.glyph_key(ONLY_BUNDLED).source,
+            aterm_render::FaceId::Primary,
+            "the candidate drew the symbol as .notdef"
+        );
+        // Negative control: with the runtime tier switched off, the same
+        // candidate has nothing that covers it.
+        let (closed, _) = build_semantic_candidate(&base, &candidate, &mut faces);
+        let mut closed = closed.expect("candidate renderer");
+        closed.set_runtime_font_discovery(false);
+        assert_eq!(
+            closed.glyph_key(ONLY_BUNDLED).source,
+            aterm_render::FaceId::Primary
+        );
+    }
+
     #[test]
     fn invalid_candidate_falls_back_honestly_without_losing_the_renderer() {
         let mut base = Renderer::from_bytes(
@@ -5522,9 +7174,9 @@ mod tests {
     }
 
     /// `ui_text_width` is a usable layout metric with OR WITHOUT the system face:
-    /// positive for nonempty text, empty == 0, and MONOTONIC — appending a
-    /// character never shrinks the measure (the tracking is a fraction of any
-    /// glyph advance). Runs identically on the mono fallback (headless CI that
+    /// positive for ordinary Latin text, empty == 0, and monotonic across
+    /// that Latin run. Other queries can have narrow or zero advances, so a
+    /// bounded scalar scan must establish its own floor. Runs on the mono fallback (headless CI that
     /// sandboxes /System reads), so the fallback path is covered by construction.
     #[test]
     fn ui_text_width_is_monotonic_and_falls_back_cleanly() {
@@ -5539,6 +7191,54 @@ mod tests {
         }
         // The metric scales with px (a size ramp can never invert widths).
         assert!(ui_text_width("Cursor", 20.0) > ui_text_width("Cursor", 10.0));
+
+        // A committed font, in a local store: neither host typography nor
+        // another libtest worker can decide whether a scalar floor holds.
+        let (_, narrow) = aterm_render::shared_parsed_face(
+            include_bytes!("../../aterm-render/assets/bundled/NotoSansMath-Regular.ttf"),
+            0,
+        )
+        .expect("the committed math face parses");
+        let mut fonts = default_chrome_fonts();
+        fonts.ui_regular = Some(narrow);
+        let px = 10.0;
+        let floor = 0.2 * px;
+        let measure = |fonts: &mut ChromeFonts, query: &str| {
+            ui_text_width_with_floor(fonts, TextFace::Ui, query, px, floor)
+        };
+        assert!(measure(&mut fonts, "Appearance Wavy 17").1);
+        let thin = "\u{200a}".repeat(100);
+        assert!(fonts.label_misses(TextFace::Ui, &thin).is_empty());
+        let (width, bounded) = measure(&mut fonts, &thin);
+        assert!(width > 0.0 && width < thin.chars().count() as f32 * floor);
+        assert!(!bounded, "coverage alone cannot bound the scalar count");
+        assert!(fonts.label_misses(TextFace::Ui, "\u{200b}").is_empty());
+        assert!(
+            !measure(&mut fonts, "\u{200b}").1,
+            "zero advance refuses too"
+        );
+        fonts.ui_regular = None;
+        assert!(measure(&mut fonts, "ordinary fallback").1);
+
+        let (_, kerned) = aterm_render::shared_parsed_face(
+            include_bytes!("../../aterm-render/assets/game/Chewy-Regular.ttf"),
+            0,
+        )
+        .expect("the committed kerned face parses");
+        let left = kerned.metrics('A', px).advance_width + UI_TRACKING_EM * px;
+        let right = kerned.metrics('U', px).advance_width + UI_TRACKING_EM * px;
+        let kern = kerned
+            .horizontal_kern('A', 'U', px)
+            .expect("the pair is kerned");
+        let pair_floor = (left + (left + kern)) * 0.5;
+        assert!(kern < 0.0 && left >= pair_floor && right + kern >= pair_floor);
+        fonts.ui_regular = Some(kerned);
+        assert!(ui_text_width_with_floor(&mut fonts, TextFace::Ui, "A", px, pair_floor).1);
+        assert!(ui_text_width_with_floor(&mut fonts, TextFace::Ui, "U", px, pair_floor).1);
+        assert!(
+            !ui_text_width_with_floor(&mut fonts, TextFace::Ui, "AU", px, pair_floor).1,
+            "removing the left scalar must not reverse the width ordering"
+        );
     }
 
     #[test]
@@ -5650,6 +7350,58 @@ mod tests {
             bold > ui,
             "UiBold strikes more coverage than Ui: {bold} vs {ui}"
         );
+    }
+
+    /// A terminal frame is placed by row spans, and lands byte for byte where
+    /// an opaque full-coverage blend of each pixel lands: on a regional tile
+    /// whose origin is not the surface's, under a clip, and hanging off the
+    /// tile's edges. Negative control: the frame did change the tile.
+    #[test]
+    fn a_terminal_frame_blits_as_an_opaque_blend_would() {
+        let frame = aterm_render::Frame {
+            width: 9,
+            height: 7,
+            pixels: (0..63_u32)
+                .map(|i| 0x0010_2030 ^ (i * 0x0003_0507))
+                .collect(),
+        };
+        let backdrop = [40, 50, 60, 255];
+        let reference = |clip: Option<(f32, f32, f32, f32)>, at: (i32, i32)| {
+            let mut canvas = Canvas::with_origin(4, 3, 12, 10, backdrop);
+            if let Some((x, y, w, h)) = clip {
+                canvas.push_clip(x, y, w, h);
+            }
+            for (row, pixels) in frame.pixels.chunks(frame.width).enumerate() {
+                for (column, pixel) in pixels.iter().enumerate() {
+                    canvas.blend(
+                        at.0 + column as i32,
+                        at.1 + row as i32,
+                        [(pixel >> 16) as u8, (pixel >> 8) as u8, *pixel as u8, 255],
+                        1.0,
+                    );
+                }
+            }
+            canvas.px
+        };
+        let blitted = |clip: Option<(f32, f32, f32, f32)>, at: (i32, i32)| {
+            let mut canvas = Canvas::with_origin(4, 3, 12, 10, backdrop);
+            if let Some((x, y, w, h)) = clip {
+                canvas.push_clip(x, y, w, h);
+            }
+            canvas.blit_terminal_frame(&frame, at.0, at.1);
+            canvas.px
+        };
+        for clip in [
+            None,
+            Some((6.0, 5.0, 5.0, 4.0)),
+            Some((30.0, 30.0, 2.0, 2.0)),
+        ] {
+            for at in [(4, 3), (0, 0), (10, 8), (13, 9), (-20, -20)] {
+                assert_eq!(blitted(clip, at), reference(clip, at), "{clip:?} at {at:?}");
+            }
+        }
+        let untouched = Canvas::with_origin(4, 3, 12, 10, backdrop).px;
+        assert_ne!(blitted(None, (4, 3)), untouched);
     }
 
     #[test]
@@ -5923,6 +7675,46 @@ mod tests {
         assert_eq!(rgb(5, 5), [0, 255, 0], "inside the clip is painted");
         assert_eq!(rgb(1, 1), [0, 0, 0], "outside the clip stays backdrop");
         assert_eq!(rgb(12, 12), [0, 0, 0], "outside the clip stays backdrop");
+    }
+
+    /// A fade leaves what is drawn above its band untouched and, inside it,
+    /// eases the drawing out from its top with no step there to nothing at
+    /// its bottom, falling fastest where it starts: a scrolling list's peek
+    /// in the strip under its room. CONTROL: what is drawn after its pop is
+    /// whole again.
+    #[test]
+    fn a_fade_eases_what_it_holds_out_over_its_band() {
+        let panel = |x: f32| DrawPrim::Panel {
+            x,
+            y: 0.0,
+            w: 4.0,
+            h: 40.0,
+            radius: 0.0,
+            fill: [0, 255, 0, 255],
+        };
+        let prims = vec![
+            DrawPrim::FadePush {
+                y: 10.0,
+                h: 20.0,
+                from: 1.0,
+                to: 0.0,
+            },
+            panel(0.0),
+            DrawPrim::FadePop,
+            panel(8.0),
+        ];
+        let (px, pw, _ph) = rasterize_tray(&prims, 12, 40, 1.0, [0, 0, 0, 255]);
+        let green = |x: u32, y: u32| px[((y * pw + x) * 4 + 1) as usize];
+        assert_eq!(green(1, 5), 255, "above the band, untouched");
+        assert!(green(1, 10) >= 240, "no step where the band starts");
+        let quarter = green(1, 15);
+        let half = green(1, 20);
+        assert!(
+            quarter < 230 && half + 20 < quarter && half > 40,
+            "eased out: {quarter} at a quarter, {half} at half"
+        );
+        assert!(green(1, 31) <= 2, "nothing at and past the band's end");
+        assert_eq!(green(9, 31), 255, "what follows the pop is whole");
     }
 
     /// The HsvDisk raster: the centre (saturation 0) is the grey axis at

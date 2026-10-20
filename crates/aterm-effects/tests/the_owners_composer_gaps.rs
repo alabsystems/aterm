@@ -41,6 +41,7 @@ use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
 use aterm_effects::rainbow_kitty::TypedClass;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
 
 const WROWS: usize = aterm_effects::cursor_glow::CURSOR_WITNESS_ROWS;
@@ -247,9 +248,27 @@ impl Composer {
 /// A Backspace in a key schedule.
 const BACKSPACE: char = '\u{8}';
 
+/// A fixture surface owns the production family. Existing light assertions read
+/// that family's one glow engine; shipping presents use its canonical step.
+#[derive(Default)]
+pub(crate) struct PresentedGlow(aterm_effects::pipeline::EffectsPipeline);
+
+impl Deref for PresentedGlow {
+    type Target = CursorGlow;
+    fn deref(&self) -> &CursorGlow {
+        &self.0.cursor().glow
+    }
+}
+
+impl DerefMut for PresentedGlow {
+    fn deref_mut(&mut self) -> &mut CursorGlow {
+        &mut self.0.cursor_mut().glow
+    }
+}
+
 pub struct Sim {
     term: Terminal,
-    glow: CursorGlow,
+    glow: PresentedGlow,
     cfg: GlowConfig,
     g: Geom,
     t0: Instant,
@@ -258,6 +277,7 @@ pub struct Sim {
     out: Vec<GlowQuad>,
     buf: Vec<char>,
     blink_seen: u64,
+    last_blink: Option<Instant>,
     comp: Composer,
     /// keys pressed, not yet rendered
     pending: Vec<char>,
@@ -299,7 +319,7 @@ impl Sim {
         let now = Instant::now();
         let mut s = Self {
             term,
-            glow: CursorGlow::default(),
+            glow: PresentedGlow::default(),
             cfg: cfg(),
             g,
             t0: now,
@@ -308,6 +328,7 @@ impl Sim {
             out: Vec::new(),
             buf: Vec::new(),
             blink_seen: 0,
+            last_blink: None,
             comp: Composer::new(label),
             pending: Vec::new(),
             log: Vec::new(),
@@ -333,6 +354,7 @@ impl Sim {
         let epoch = self.term.repaint_blink_epoch();
         if epoch != self.blink_seen {
             self.blink_seen = epoch;
+            self.last_blink = Some(self.now);
             self.glow.note_repaint_blink(self.now);
         }
         self.glow.note_context(self.term.is_alternate_screen());
@@ -1207,3 +1229,7 @@ fn a_glyph_replaced_after_its_erase_echoed_claims_no_key() {
         "a replacement after the erase's echo claimed the Space"
     );
 }
+
+/// The shipping single-pane present as a harness, its live takes, and the
+/// open families' reports.
+pub(crate) mod shipping_present;

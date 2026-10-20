@@ -1,0 +1,31 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0 fe4ac0e0d7) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab), the harness off · the same session once that shell ended (~100 s): Muse Code drew `◆ Finished · Q3 background wait · ✓ · ctrl+o`, took a turn of its own on the output and drew `◆ Worked for 1m 42s`; the panel gone from under the bottom rule (8-11 s after the finish) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  Muse Code 1.4.10
+
+❯ toolstart
+
+◆ Ran command · Q2 tool shell · ✓ · 14s · ctrl+o
+
+◆ Tool call done. Result: { "chunk_id": "exec-1-1", "exit_code": 0, "terminal_status": "completed", "output": "q2-tool-ran\n",
+  "original_output_bytes": 12, "original_output_tokens": 3, "truncated": false }
+
+❯ toolstart
+
+◆ Backgrounded · Q3 background wait · 2.2s · ctrl+o
+
+◆ Tool call done. Result: { "chunk_id": "exec-2-1", "execution_state": "background_running", "session_id": 2, "work_id":
+  "work.v2.managed_bash.sha256.65232663014469ba98739dcde0ce49f304a9b9af51f5cc1aa217e2c09d18829c", ~
+
+  (↓ to view terminals)
+
+◆ Finished · Q3 background wait · ✓ · ctrl+o
+
+◆ Tool call done. Result: { "chunk_id": "exec-2-1", "execution_state": "background_running", "session_id": 2, "work_id":
+  "work.v2.managed_bash.sha256.65232663014469ba98739dcde0ce49f304a9b9af51f5cc1aa217e2c09d18829c", ~
+
+◆ Worked for 1m 42s · 5:54 PM · 17/Oct
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

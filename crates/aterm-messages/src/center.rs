@@ -312,6 +312,9 @@ pub struct Live {
     pub started_at: Instant,
     /// Bumped by every restate.
     pub revision: u32,
+    /// The current action list's version. Exhaustion refuses versioned actions
+    /// for this live row instead of reusing an earlier authorization.
+    action_revision: Option<u64>,
     /// Duplicate posts folded in.
     pub repeats: u32,
     /// `None` while queued; the hold anchors when this is set.
@@ -397,6 +400,7 @@ impl Live {
             posted_at: now,
             started_at: now,
             revision: 0,
+            action_revision: Some(0),
             repeats: 1,
             on_glass_since: None,
             fold_at: None,
@@ -419,6 +423,14 @@ impl Live {
             logged_mark: (msg.severity, msg.glyph),
             msg,
         }
+    }
+
+    /// The action-list revision to capture with this row's id before queuing
+    /// an action. `None` after revision exhaustion; plain presentation updates
+    /// keep it, but even changing the actions back retires the previous version.
+    #[must_use]
+    pub const fn action_revision(&self) -> Option<u64> {
+        self.action_revision
     }
 
     /// `true` while not on glass.
@@ -1104,6 +1116,14 @@ impl MessageCenter {
     /// Problems stops counting it. Returns how many. Only this process's
     /// records: a previous launch's warnings are what that launch saw.
     pub fn fix_closed(&mut self, prefix: &str, now: Instant) -> usize {
+        self.fix_closed_as(prefix, None, now)
+    }
+
+    /// [`Self::fix_closed`] in `words` when given: the fix words a reporter
+    /// decided when it saw HOW the problem ended (the setting taken out, or now
+    /// taking), in place of the ones it declared when it posted the warning,
+    /// before anyone knew.
+    pub fn fix_closed_as(&mut self, prefix: &str, words: Option<&str>, now: Instant) -> usize {
         let (fix, keep): (Vec<Unfixed>, Vec<Unfixed>) = std::mem::take(&mut self.unfixed)
             .into_iter()
             .partition(|u| u.key.starts_with(prefix));
@@ -1117,27 +1137,11 @@ impl MessageCenter {
                 continue;
             };
             let since = u64::try_from(now.saturating_duration_since(at).as_millis()).unwrap_or(0);
-            let detail: Vec<String> = std::iter::once(rec.title.clone())
-                .chain(rec.detail.iter().cloned())
-                .take(crate::DETAIL_LINES_CAP)
-                .collect();
-            let repeats = rec.repeats;
-            let ok = (
-                Severity::Success,
-                Glyph::or_fallback(severity_icon(Severity::Success)),
-            );
-            let mark = ((rec.severity, rec.glyph) != ok).then_some(ok);
-            self.log.record_retired(
+            self.close_fixed(
                 u.id,
-                Retired::Resolved(Outcome::Ok),
+                words.unwrap_or(&u.fixed),
                 unix.saturating_add(since),
                 now,
-                FinalWords {
-                    title: &u.fixed,
-                    detail: &detail,
-                    repeats,
-                    mark,
-                },
             );
             fixed += 1;
         }
@@ -1145,6 +1149,84 @@ impl MessageCenter {
             self.revision += 1;
         }
         fixed
+    }
+
+    /// Close one record that already left the glass as fixed by name: its
+    /// reporter saw its cause settled after the row went (a tab's lost login
+    /// back after its notice was read, or after the point it stood for moved
+    /// on). The record takes `fixed` (the fix words its reporter declares)
+    /// under `✓` Success at `wall`, never before it first retired, its old
+    /// title the first detail line, as [`Self::fix_closed`] closes a problem
+    /// by its key; one more `retired` line (`resolved-ok`) goes to the log,
+    /// and its standing quiet ([`Self::quiet_standing`]) ends with it.
+    /// `revision + 1`.
+    ///
+    /// `false` and nothing written for a live row (its reporter resolves it),
+    /// an open exception, no such record, empty words, and a record whose
+    /// story already ended otherwise: replaced, carried, answered by the owner
+    /// or resolved.
+    pub fn fix_record(
+        &mut self,
+        id: MessageId,
+        fixed: &str,
+        wall: WallStamp,
+        now: Instant,
+    ) -> bool {
+        let fixed = clip(fixed, crate::TITLE_CAP);
+        if fixed.is_empty() || self.index(id).is_some() || self.digest.find_id(id).is_some() {
+            return false;
+        }
+        let Some(rec) = self.log.get(id) else {
+            return false;
+        };
+        let (Some(how), Some(retired)) = (rec.retired(), rec.retired_unix_ms) else {
+            return false;
+        };
+        if matches!(
+            how,
+            Retired::Superseded { .. }
+                | Retired::Carried
+                | Retired::Answered { .. }
+                | Retired::Resolved(_)
+        ) {
+            return false;
+        }
+        self.close_fixed(id, &fixed, wall.unix_ms.max(retired), now);
+        self.unfixed.retain(|u| u.id != id);
+        self.revision += 1;
+        true
+    }
+
+    /// Record `id` retired again `Resolved(Ok)` at wall `unix_ms` in `fixed`
+    /// under `✓` Success, its old title the first detail line. `false` for no
+    /// such record.
+    fn close_fixed(&mut self, id: MessageId, fixed: &str, unix_ms: u64, now: Instant) -> bool {
+        let Some(rec) = self.log.get(id) else {
+            return false;
+        };
+        let detail: Vec<String> = std::iter::once(rec.title.clone())
+            .chain(rec.detail.iter().cloned())
+            .take(crate::DETAIL_LINES_CAP)
+            .collect();
+        let repeats = rec.repeats;
+        let ok = (
+            Severity::Success,
+            Glyph::or_fallback(severity_icon(Severity::Success)),
+        );
+        let mark = ((rec.severity, rec.glyph) != ok).then_some(ok);
+        self.log.record_retired(
+            id,
+            Retired::Resolved(Outcome::Ok),
+            unix_ms,
+            now,
+            FinalWords {
+                title: fixed,
+                detail: &detail,
+                repeats,
+                mark,
+            },
+        );
+        true
     }
 
     /// Re-word a record ([`Retired::Recorded`]) in place: it takes `msg`'s
@@ -1173,25 +1255,46 @@ impl MessageCenter {
         changed
     }
 
-    /// Replace a record by the row `by` that tells its story on: the record
-    /// retires [`Retired::Superseded`] by it, as a keyed supersede does
-    /// (Settings ▸ Messages says `replaced`), keeping its words and instant;
+    /// Replace a row or a record by the later row `by` that tells its story on
+    /// — one fact told under another key (a tab's notice moving to its next
+    /// state), or again after its row left the glass: it retires
+    /// [`Retired::Superseded`] by it, as a keyed supersede does, so Settings ▸
+    /// Messages lists the story once, as `by` ([`crate::page`]). A live row
+    /// leaves the glass now; a retired record keeps its words and instant, and
     /// one more `retired` line goes to the log, so a relaunch replays it
-    /// replaced. `revision + 1`. `false` and nothing written for anything but a
-    /// record ([`Retired::Recorded`]), and for `by == id`.
-    pub fn supersede_record(&mut self, id: MessageId, by: MessageId) -> bool {
-        if id == by
-            || self.index(id).is_some()
-            || self
-                .log
-                .get(id)
-                .is_none_or(|rec| rec.retired() != Some(&Retired::Recorded))
-        {
+    /// replaced. `revision + 1`.
+    ///
+    /// `false` and nothing written where `by` is no record posted after `id`
+    /// (a story is told on, never back), for an open exception (the digest
+    /// supersedes by its key), and for a record whose story already ended
+    /// elsewhere: replaced already, carried to a successor, answered by the
+    /// owner or resolved by its reporter (a new row is a new story).
+    pub fn supersede_record(&mut self, id: MessageId, by: MessageId, now: Instant) -> bool {
+        if by <= id || self.log.get(by).is_none() || self.digest.find_id(id).is_some() {
             return false;
         }
-        if !self
+        if let Some(i) = self.index(id) {
+            self.retire_at(i, Retired::Superseded { by }, now);
+            self.rebalance(now);
+            return true;
+        }
+        let tells_on = self
             .log
-            .record_retired_again(id, Retired::Superseded { by })
+            .get(id)
+            .and_then(LogRecord::retired)
+            .is_some_and(|how| {
+                !matches!(
+                    how,
+                    Retired::Superseded { .. }
+                        | Retired::Carried
+                        | Retired::Answered { .. }
+                        | Retired::Resolved(_)
+                )
+            });
+        if !tells_on
+            || !self
+                .log
+                .record_retired_again(id, Retired::Superseded { by })
         {
             return false;
         }
@@ -1334,6 +1437,9 @@ impl MessageCenter {
         // revision, so no repaint and no Settings publish. An estimate that
         // moved counts as a change, since no motion deadline is armed for it.
         let eta_moved = row.track.eta(now) != eta_before;
+        if row.msg.actions != before.actions {
+            row.action_revision = row.action_revision.and_then(|rev| rev.checked_add(1));
+        }
         let changed = row.msg != before || was_carried || eta_moved;
         if changed {
             row.revision = row.revision.wrapping_add(1);
@@ -1498,6 +1604,21 @@ impl MessageCenter {
         true
     }
 
+    /// A queued row nobody could have seen waits on: its patience starts again
+    /// from `now`, as when it is released from the glass ([`Self::demote`]), so
+    /// it never retires `Unseen` while the host knows no band is on screen (a
+    /// host's row owed to the first window that can show it). A row on the glass
+    /// has no patience running and is left as it is. `false` when `id` is no
+    /// queued live row.
+    pub fn restart_patience(&mut self, id: MessageId, now: Instant) -> bool {
+        let Some(row) = self.live.iter_mut().find(|l| l.id == id && l.is_queued()) else {
+            return false;
+        };
+        row.patience_from = now;
+        row.patience_at = at(now, row.hold_span().max(OVERFLOW_PATIENCE_MIN));
+        true
+    }
+
     /// A capsule press: logs `Acted { label }` and returns the intent for the
     /// host to perform. The row retires only when [`Intent::closes_row`]
     /// (`NotNow` → `Answered`); every other intent leaves it for a supersede
@@ -1526,6 +1647,21 @@ impl MessageCenter {
             self.rebalance(now);
         }
         Some(intent)
+    }
+
+    /// Perform an action only while the id and action-list revision captured
+    /// by its publisher still stand. Refusal writes no acted/seen record.
+    pub fn act_at_revision(
+        &mut self,
+        id: MessageId,
+        revision: u64,
+        action: ActionIndex,
+        now: Instant,
+    ) -> Option<Intent> {
+        if self.live(id)?.action_revision() != Some(revision) {
+            return None;
+        }
+        self.act(id, action, now)
     }
 
     // ---- settle ------------------------------------------------------
@@ -2114,6 +2250,16 @@ impl MessageCenter {
     #[cfg(test)]
     pub(crate) fn queued(&self) -> usize {
         self.eligible().saturating_sub(self.glass.len())
+    }
+
+    /// Whether a new live row can be added without exceeding the live-row
+    /// cap. This is a conservative admission snapshot, not a priority test:
+    /// a full center may still accept a post by evicting another row. Hosts
+    /// retaining an owed row can wait for capacity rather than repeatedly
+    /// minting a newcomer that a protected queue immediately evicts.
+    #[must_use]
+    pub fn has_live_capacity(&self) -> bool {
+        self.live.len() < MAX_LIVE
     }
 
     /// Every unretired row, post order (unrevealed rows included: the host
@@ -2937,8 +3083,14 @@ impl MessageCenter {
             let e = self.digest.get_mut(i);
             // Words that move every look (a holder count, an age) restate an
             // entry at most once per RESTATE_QUIET; a new severity or capsule
-            // is news at once.
-            let words_only = e.msg.severity == msg.severity && e.msg.actions == msg.actions;
+            // is news at once, and so is a new step (the one thing to do: an
+            // entry never tells the owner to do what no longer helps), and
+            // words that move only with their fact
+            // (`LaterAsk::restated_at_once`).
+            let words_only = e.msg.severity == msg.severity
+                && e.msg.actions == msg.actions
+                && e.ask.then().words() == ask.then().words()
+                && !ask.restates_at_once();
             if words_only && now.saturating_duration_since(e.restated_at) < RESTATE_QUIET {
                 e.repeats = e.repeats.saturating_add(1);
                 e.ask.take_action_of(&ask);
@@ -4119,6 +4271,25 @@ mod tests {
             ["x", "g held", "g live", "late 4"],
             "only asks and standing rows are left: the newcomer itself goes"
         );
+        assert!(!c.has_live_capacity(), "the protected queue has no vacancy");
+        let retired = c.live_rows().next().expect("a protected row").id;
+        assert!(c.withdraw(retired, now + ms(1000)));
+        assert!(
+            c.has_live_capacity(),
+            "an actual retirement opens admission"
+        );
+        let next = c
+            .post(
+                info("owed row after a vacancy"),
+                stamp(1001),
+                now + ms(1001),
+            )
+            .id;
+        assert!(
+            c.live(next).is_some(),
+            "the admitted new row survives the cap"
+        );
+        assert!(!c.has_live_capacity(), "the vacancy has been consumed");
     }
 
     /// Within the queue a held row goes before a `Live` one, whatever their
@@ -4839,6 +5010,46 @@ mod tests {
         );
     }
 
+    /// A queued row whose patience the host restarts while no band is on
+    /// screen never folds `Unseen`; one it stops restarting folds at its
+    /// patience from the last restart. A row on the glass has no patience to
+    /// restart. Negative control: without the restart it folds as ever.
+    #[test]
+    fn a_restarted_patience_keeps_a_queued_row_waiting() {
+        let now = t0();
+        let mut c = fresh(now);
+        let on_glass = c.post(standing("a"), stamp(1), now).id;
+        c.post(standing("b"), stamp(2), now);
+        c.commit_rows(now, 2);
+        let s = c
+            .post(
+                Message::new(tags::PACKAGES, Severity::Success, "installed"),
+                stamp(3),
+                now,
+            )
+            .id;
+        c.commit_rows(now, 2);
+        assert!(c.live(s).unwrap().is_queued(), "PRECONDITION: queued");
+        assert!(
+            !c.restart_patience(on_glass, now),
+            "a row on the glass has none"
+        );
+        let mut t = now;
+        for _ in 0..10 {
+            t += OVERFLOW_PATIENCE_MIN - ms(1);
+            assert!(c.restart_patience(s, t));
+            assert!(c.settle(t, true).retired.is_empty(), "it waits on");
+        }
+        assert_eq!(c.live(s).unwrap().patience_at, t + OVERFLOW_PATIENCE_MIN);
+        let settled = c.settle(t + OVERFLOW_PATIENCE_MIN, true);
+        assert_eq!(
+            settled.retired,
+            vec![(s, Retired::Unseen)],
+            "left alone, it folds"
+        );
+        assert!(!c.restart_patience(s, t), "no live row any more");
+    }
+
     /// Invariant 21: Ask row: `act(Open Settings)` → `Some(intent)`, row
     /// stays, `Acted` logged; an action it lacks is `None`. The implicit
     /// Details capsule marks seen: a held row folds, an ask stays.
@@ -4874,6 +5085,89 @@ mod tests {
             LogState::Retired(Retired::Folded)
         );
         assert!(c.live(id).unwrap().seen);
+
+        // A delayed press keeps both the row id and the action list it heard.
+        let original = c.live(id).unwrap().action_revision().unwrap();
+        let changed = Intent::OpenSettings {
+            route: "/packages".into(),
+        };
+        assert!(c.restate(
+            id,
+            Restatement {
+                actions: Some(vec![changed.clone()]),
+                ..Restatement::default()
+            },
+            now + ms(5)
+        ));
+        let replacement = c.live(id).unwrap().action_revision().unwrap();
+        assert_ne!(replacement, original);
+        let before = c.log().pending_lines().count();
+        assert_eq!(
+            c.act_at_revision(id, original, ActionIndex(0), now + ms(6)),
+            None
+        );
+        assert_eq!(
+            c.log().pending_lines().count(),
+            before,
+            "refusal writes nothing"
+        );
+        assert_eq!(
+            c.act_at_revision(id, replacement, ActionIndex(0), now + ms(7)),
+            Some(changed)
+        );
+        // Returning to the old intent does not revive its previous authorization.
+        assert!(c.restate(
+            id,
+            Restatement {
+                actions: Some(vec![Intent::OpenSystemPane {
+                    pane: "full-disk-access".into()
+                }]),
+                ..Restatement::default()
+            },
+            now + ms(8)
+        ));
+        assert_eq!(
+            c.act_at_revision(id, original, ActionIndex(0), now + ms(9)),
+            None
+        );
+        let current = c.live(id).unwrap().action_revision().unwrap();
+        assert_eq!(
+            c.act_at_revision(held, current, ActionIndex(0), now),
+            None,
+            "retired id"
+        );
+        // Presentation-only changes leave the same actions authorized.
+        assert!(c.restate(
+            id,
+            Restatement {
+                title: Some("File access still needs attention".into()),
+                ..Restatement::default()
+            },
+            now + ms(10)
+        ));
+        assert_eq!(c.live(id).unwrap().action_revision(), Some(current));
+        assert!(
+            c.act_at_revision(id, current, ActionIndex(0), now + ms(11))
+                .is_some()
+        );
+        // Exhaustion never wraps to an old action version, even if the list returns.
+        c.live
+            .iter_mut()
+            .find(|l| l.id == id)
+            .unwrap()
+            .action_revision = Some(u64::MAX);
+        assert!(c.restate(
+            id,
+            Restatement {
+                actions: Some(vec![Intent::NewWindow]),
+                ..Restatement::default()
+            },
+            now + ms(12)
+        ));
+        assert_eq!(c.live(id).unwrap().action_revision(), None);
+        let before = c.log().pending_lines().count();
+        assert_eq!(c.act_at_revision(id, u64::MAX, ActionIndex(0), now), None);
+        assert_eq!(c.log().pending_lines().count(), before);
     }
 
     /// A busy flow row, as the update lane posts one.
@@ -5451,8 +5745,9 @@ mod tests {
     /// A record replaced by its row says so, and a relaunch reads it so: the
     /// record retires `Superseded { by }` (words, instant and retirement
     /// instant kept, one more log line, the replay superseded too). Negative
-    /// controls: a live row, a withdrawn row, an unknown id, a record by itself
-    /// and a record already replaced write nothing.
+    /// controls: a live row and a withdrawn row by an earlier record (a story
+    /// is told on, never back), an unknown id, a record by itself and a record
+    /// already replaced write nothing.
     #[test]
     fn a_record_replaced_by_its_row_says_so_and_replays_so() {
         let now = t0();
@@ -5479,7 +5774,7 @@ mod tests {
             )
             .id;
         let revision = c.revision();
-        assert!(c.supersede_record(record, row));
+        assert!(c.supersede_record(record, row, now));
         assert_ne!(c.revision(), revision);
         let rec = c.log().get(record).unwrap();
         assert_eq!(
@@ -5490,16 +5785,22 @@ mod tests {
         assert_eq!(rec.retired_unix_ms, before.retired_unix_ms);
         assert_eq!(rec.retired_at, before.retired_at, "nothing finished again");
         let lines = c.log().pending_len();
-        assert!(!c.supersede_record(record, row), "replaced already");
-        assert!(!c.supersede_record(row, record), "a live row");
-        assert!(!c.supersede_record(record, record));
+        assert!(!c.supersede_record(record, row, now), "replaced already");
         assert!(
-            !c.supersede_record(c.log().next_id(), row),
+            !c.supersede_record(row, record, now),
+            "a live row, by an earlier record: never told back"
+        );
+        assert!(!c.supersede_record(record, record, now));
+        assert!(
+            !c.supersede_record(c.log().next_id(), row, now),
             "no such record"
         );
         c.commit_rows(now, 3);
         assert!(c.withdraw(row, now + ms(1)));
-        assert!(!c.supersede_record(row, record), "a row withdrawn");
+        assert!(
+            !c.supersede_record(row, record, now),
+            "a row withdrawn, by an earlier record"
+        );
         assert_eq!(c.log().pending_len(), lines + 1, "only the withdraw's line");
 
         let lines = c.log.drain_pending();
@@ -5514,6 +5815,155 @@ mod tests {
             LogState::Retired(Retired::Superseded { by: row })
         );
         assert_eq!(rec.detail, before.detail);
+    }
+
+    /// ONE STORY, TOLD ON UNDER ANOTHER KEY: a tab's notice that moves to its
+    /// next state is a row of another key, and the row it replaces — live, or
+    /// one the owner read (a standing row folds on its read) — retires
+    /// `Superseded` by it, so the story is one row on the page. NEGATIVE
+    /// CONTROLS: a story that ended elsewhere (resolved by its reporter,
+    /// answered by the owner) or an open exception is never folded into a new
+    /// row; a successor no record names writes nothing.
+    #[test]
+    fn a_row_or_a_read_record_is_told_on_under_another_key_and_an_ended_story_is_not() {
+        let now = t0();
+        let mut c = fresh(now);
+        let warn = |title: &str, key: &str| {
+            Message::new(tags::HARNESS, Severity::Warn, title)
+                .key(key)
+                .hold(Hold::STANDING)
+        };
+        let si = c.post(warn("Login expired", "n.s-1.si"), stamp(1), now).id;
+        c.commit_rows(now, 3);
+        let ca = c
+            .post(warn("Sign-in cancelled", "n.s-1.ca"), stamp(2), now)
+            .id;
+        assert!(c.supersede_record(si, ca, now + ms(1)), "a live row");
+        assert!(c.live(si).is_none(), "it left the glass");
+        assert_eq!(
+            c.log().get(si).unwrap().retired(),
+            Some(&Retired::Superseded { by: ca })
+        );
+        assert!(c.live(ca).is_some());
+        // The owner reads the cancelled notice; the story moves on.
+        assert!(c.mark_seen(ca, now + ms(2)));
+        assert_eq!(c.log().get(ca).unwrap().retired(), Some(&Retired::Folded));
+        let nr = c.post(warn("Login expired", "n.s-1.nr"), stamp(3), now).id;
+        assert!(c.supersede_record(ca, nr, now + ms(3)), "a read record");
+        assert_eq!(
+            c.log().get(ca).unwrap().retired(),
+            Some(&Retired::Superseded { by: nr })
+        );
+        // NEGATIVE CONTROLS.
+        assert!(c.resolve(nr, Outcome::Ok, now + ms(4)));
+        let next = c.post(warn("Login expired", "n.s-1.si"), stamp(4), now).id;
+        assert!(
+            !c.supersede_record(nr, next, now),
+            "a story its reporter resolved"
+        );
+        let asked = c.post(ask("Allow access?"), stamp(5), now).id;
+        assert!(c.answer(asked, "Not now", now + ms(5)));
+        assert!(!c.supersede_record(asked, next, now), "the owner's answer");
+        let entry = c
+            .post(
+                info("A fact for later").later(crate::need::LaterAsk::person(
+                    crate::need::Why::OnlyYou(crate::need::Reason::new("only you can")),
+                    crate::need::Then::step("Do the thing"),
+                    crate::need::Fingerprint::new("n", "", "later"),
+                    crate::need::Resurface::WAIT,
+                )),
+                stamp(6),
+                now,
+            )
+            .id;
+        let after = c.post(info("Later still"), stamp(7), now).id;
+        assert!(!c.supersede_record(entry, after, now), "an open exception");
+        assert!(
+            !c.supersede_record(next, c.log().next_id(), now),
+            "no such successor"
+        );
+        assert!(c.live(next).is_some(), "nothing moved");
+    }
+
+    /// A RECORD FIXED BY NAME: a standing warning whose row left the glass —
+    /// withdrawn as its point moved on, or read — and whose cause its
+    /// reporter then saw settled reads fixed: `Resolved(Ok)` in the fix words
+    /// under `✓`, its old title the first detail line, one more log line that
+    /// replays so, and the read's standing quiet over (the next occurrence is
+    /// news). NEGATIVE CONTROLS: before the fix the read keeps a repost quiet;
+    /// a live row, a replaced record, a resolved one, empty words and an
+    /// unknown id write nothing.
+    #[test]
+    fn a_record_fixed_by_name_reads_fixed_and_ends_its_quiet() {
+        let now = t0();
+        let mut c = fresh(now);
+        let warn = |key: &str| {
+            use crate::need::{Ask, Reason, StandingWhy, Then};
+            Message::new(tags::HARNESS, Severity::Warn, "Login expired")
+                .now(Ask::standing(
+                    StandingWhy::OnlyYou(Reason::new("Claude Code's login expired")),
+                    Then::step("Type /login in the tab"),
+                ))
+                .key(key)
+        };
+        let gone = c.post(warn("n.s-1.nr"), stamp(1_000), now).id;
+        assert!(c.withdraw(gone, now + ms(1)));
+        assert!(c.fix_record(gone, "Login back", stamp(9_000), now + ms(2)));
+        let rec = c.log().get(gone).unwrap();
+        assert_eq!(rec.retired(), Some(&Retired::Resolved(Outcome::Ok)));
+        assert_eq!(rec.title, "Login back");
+        assert_eq!(
+            rec.detail,
+            [
+                "Login expired",
+                "Claude Code's login expired",
+                "Type /login in the tab"
+            ]
+        );
+        assert_eq!(rec.severity, Severity::Success);
+        assert_eq!(rec.retired_unix_ms, Some(9_000));
+        assert!(
+            !c.fix_record(gone, "Login back", stamp(9_500), now),
+            "resolved"
+        );
+        // A read keeps the key quiet until the fix ends it.
+        let read = c.post(warn("n.s-1.si"), stamp(10_000), now).id;
+        c.commit_rows(now, 3);
+        assert!(c.mark_seen(read, now + ms(3)));
+        assert_eq!(
+            c.post(warn("n.s-1.si"), stamp(11_000), now).outcome,
+            PostOutcome::Suppressed,
+            "NEGATIVE CONTROL: the read keeps it quiet"
+        );
+        assert!(c.fix_record(read, "Login back", stamp(12_000), now + ms(4)));
+        assert_eq!(
+            c.post(warn("n.s-1.si"), stamp(13_000), now).outcome,
+            PostOutcome::New,
+            "the next loss is news"
+        );
+        // NEGATIVE CONTROLS.
+        let live = c.live_by_key("n.s-1.si").unwrap().id;
+        assert!(
+            !c.fix_record(live, "Login back", stamp(14_000), now),
+            "live"
+        );
+        let told = c.post(warn("n.s-1.ca"), stamp(15_000), now).id;
+        assert!(c.supersede_record(live, told, now));
+        assert!(
+            !c.fix_record(live, "Login back", stamp(16_000), now),
+            "replaced"
+        );
+        assert!(c.withdraw(told, now + ms(5)));
+        assert!(!c.fix_record(told, "", stamp(17_000), now), "no words");
+        assert!(!c.fix_record(c.log().next_id(), "Login back", stamp(17_000), now));
+        // The fix replays.
+        let lines = c.log.drain_pending();
+        let mut replayed = MessageLog::empty();
+        replayed.replay_all(lines.iter().map(|l| LogLine::decode(&l.encode()).unwrap()));
+        let rec = replayed.get(gone).expect("the record");
+        assert_eq!(rec.state, LogState::Retired(Retired::Resolved(Outcome::Ok)));
+        assert_eq!(rec.title, "Login back");
+        assert_eq!(rec.severity, Severity::Success);
     }
 
     /// A live row becomes its own record in place: it leaves the glass and

@@ -1362,7 +1362,12 @@ impl Engine {
             Some((sw, at_move))
         });
         // The revive the seam named ([`Engine::note_revive`]): its `Sweep`,
-        // matched by its span.
+        // matched by its span. Replayed before the frame's `Typed` events so
+        // the revived prefix stands as one contiguous cohort on `rv.origin`
+        // before the new key's `Typed` lay joins its right edge; laying the
+        // new key first would mint a separate cohort at `rv.col1` and split
+        // the revived run's last column (`rv.col1 - 1`) into that second
+        // cohort via `Ribbon::join_cohort`.
         let revive = self.revive.take().and_then(|rv| {
             let at_sweep = self.events.iter().position(|(e, _)| {
                 matches!(*e, Event::Sweep { row, col0, col1 }
@@ -1370,6 +1375,10 @@ impl Engine {
             })?;
             Some((rv, at_sweep))
         });
+        if let Some((rv, at_sweep)) = revive {
+            let (ev, at) = self.events[at_sweep];
+            self.ribbon.revive_sweep(&ev, at, ctx, rv);
+        }
         let mut held_cells: u16 = 0;
         let mut soft_held: u16 = 0;
         for (index, &(ev, at)) in self.events.iter().enumerate() {
@@ -1384,9 +1393,7 @@ impl Engine {
                     (_, _, Some((sw, at_move)), _) if at_move == index => {
                         self.ribbon.reflow_move(&ev, at, ctx, sw);
                     }
-                    (_, _, _, Some((rv, at_sweep))) if at_sweep == index => {
-                        self.ribbon.revive_sweep(&ev, at, ctx, rv);
-                    }
+                    (_, _, _, Some((_, at_sweep))) if at_sweep == index => {}
                     _ => self.ribbon.on_event(&ev, at, ctx),
                 }
                 if matches!(ev, Event::Sweep { .. })
@@ -1820,7 +1827,7 @@ impl Engine {
                 self.withheld_n += 1;
             }
         }
-        self.note_rewrap_starts(rows);
+        self.note_rewrap_starts(rows, park);
         // Along the row first: the caret is the one the last tick observed,
         // the column the hand edited at before this frame's echo moved it.
         let caret = self.caret_known.then_some(self.caret);
@@ -2027,26 +2034,62 @@ impl Engine {
         self.ribbon.prove_short_reanchor(from, to, at);
     }
 
-    /// For the frame's buffered same-row typed re-anchor (a composer's wrap
-    /// landing left of its origin), tell the ribbon where the landing row's
-    /// sample holds its first text: the first column at or past the pane's
-    /// left edge that is neither blank nor a wide glyph's continuation, left
-    /// of the landing ([`ribbon::Ribbon::note_rewrap_start`]). A row the host
-    /// did not sample says nothing.
-    fn note_rewrap_starts(&mut self, rows: &[RowSample<'_>]) {
+    /// Bind the seam's exact content-and-key proof to this cross-row rewrap.
+    /// The existing one-shot start relocates only the old word; its new keys
+    /// arrive through the separately paid sweep before the same move.
+    pub(crate) fn prove_typed_rewrap(
+        &mut self,
+        from: (u16, u16),
+        to: (u16, u16),
+        start: u16,
+        width: u16,
+        space: Option<u16>,
+    ) {
+        self.ribbon
+            .note_rewrap_start(from, to, start, Some(width), space);
+    }
+
+    /// For the frame's buffered or parked same-row typed re-anchor (a
+    /// composer's wrap landing left of its origin), tell the ribbon where the
+    /// landing row's sample holds its first text: the first column at or past
+    /// the pane's left edge that is neither blank nor a wide glyph's
+    /// continuation, left of the landing ([`ribbon::Ribbon::note_rewrap_start`]),
+    /// when the vacated tail `to.1..from.1` is blank. A row the host did not
+    /// sample says nothing.
+    fn note_rewrap_starts(
+        &mut self,
+        rows: &[RowSample<'_>],
+        park: Option<((u16, u16), (u16, u16))>,
+    ) {
         let pane_col0 = self.pane.map_or(0, |(c0, _)| c0);
-        let found = self.events.iter().rev().find_map(|(ev, _)| match *ev {
-            Event::Move {
-                from, to, licence, ..
-            } if licence == Licence::Typed && from.0 == to.0 && to.1 < from.1 => Some((from, to)),
-            _ => None,
-        });
+        let found = self
+            .events
+            .iter()
+            .rev()
+            .find_map(|(ev, _)| match *ev {
+                Event::Move {
+                    from, to, licence, ..
+                } if licence == Licence::Typed && from.0 == to.0 && to.1 < from.1 => {
+                    Some((from, to))
+                }
+                _ => None,
+            })
+            .or_else(|| park.filter(|&(from, to)| from.0 == to.0 && to.1 < from.1));
         let Some((from, to)) = found else {
             return;
         };
         let Some(sample) = rows.iter().find(|r| r.row == to.0) else {
             return;
         };
+        let tail_vacated = (to.1..from.1).all(|c| {
+            sample
+                .cols
+                .get(usize::from(c))
+                .is_none_or(|&ch| ch == ' ' || ch == '\0')
+        });
+        if !tail_vacated {
+            return;
+        }
         let start = (pane_col0..to.1).find(|&c| {
             sample
                 .cols
@@ -2054,7 +2097,7 @@ impl Engine {
                 .is_some_and(|&ch| ch != ' ' && ch != '\0')
         });
         if let Some(start) = start {
-            self.ribbon.note_rewrap_start(from, to, start);
+            self.ribbon.note_rewrap_start(from, to, start, None, None);
         }
     }
 
@@ -2653,9 +2696,13 @@ impl Engine {
     /// reach, and the ribbon's colour under the cat, as one value. The host
     /// reads it after its own pet tick:
     ///
-    /// ```ignore
-    /// let offer = v2.pet_offer(geom, companion::PetOnGlass::of(&pet_frame, geom));
+    /// ```
+    /// # use aterm_effects::{cursor_glow::Geom, kitty_pet::{PetBrain, PetFrame}, rainbow_kitty::{Engine, companion}};
+    /// # use aterm_time::Instant;
+    /// # fn offer_after_tick(v2: &mut Engine, pet: &mut PetBrain, pet_frame: &PetFrame, geom: Geom, now: Instant) {
+    /// let offer = v2.pet_offer(geom, companion::PetOnGlass::of(pet_frame, geom));
     /// if let Some(star) = pet.note_v2_offer(&offer) { v2.catch_star(star, now); }
+    /// # }
     /// ```
     ///
     /// A pure read: an idle engine offers `PetOffer::default()` (T6); one scan

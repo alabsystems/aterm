@@ -41,11 +41,6 @@ pub fn pid_alive(pid: u32) -> bool {
     const ERROR_ACCESS_DENIED: u32 = 5;
     const WAIT_TIMEOUT: u32 = 258;
     const STILL_ACTIVE: u32 = 259;
-    // The one kernel32 import this predicate needs beyond `win::ffi`.
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn WaitForSingleObject(hHandle: ffi::RawHandle, dwMilliseconds: u32) -> u32;
-    }
     if pid == 0 {
         return false;
     }
@@ -59,7 +54,7 @@ pub fn pid_alive(pid: u32) -> bool {
     // alone is not enough, since a process can exit with code 259. Windows reuses pids
     // quickly, so "alive" is advisory; aterm-gui's `socket_is_live` is the authoritative probe.
     let mut code: u32 = 0;
-    let alive = unsafe { WaitForSingleObject(handle, 0) } == WAIT_TIMEOUT
+    let alive = unsafe { ffi::WaitForSingleObject(handle, 0) } == WAIT_TIMEOUT
         && unsafe { ffi::GetExitCodeProcess(handle, &mut code) } != 0
         && code == STILL_ACTIVE;
     let _ = unsafe { ffi::CloseHandle(handle) };
@@ -83,9 +78,9 @@ pub struct ProcessBirth {
 /// a process of another uid, or the kernel naming a different pid than asked.
 /// `pid <= 1` is always `None`.
 ///
-/// macOS: `proc_pidinfo(PROC_PIDTBSDINFO)`, exact-size read. Elsewhere `None`:
-/// Linux keeps no wall-clock start record; its boot-clock record is
-/// [`read_process_start`].
+/// macOS: `proc_pidinfo(PROC_PIDTBSDINFO)`, exact-size read. Windows: its
+/// twin, `GetProcessTimes`. Elsewhere `None`: Linux keeps no wall-clock start
+/// record; its boot-clock record is [`read_process_start`].
 #[cfg(target_vendor = "apple")]
 #[must_use]
 pub fn read_process_birth(pid: i32) -> Option<ProcessBirth> {
@@ -250,8 +245,61 @@ fn read_bsdinfo(pid: i32) -> Option<BsdInfo> {
     })
 }
 
+/// See the Apple twin. Windows: the creation time `GetProcessTimes` reports for
+/// a process this account may open (`OpenProcess` with
+/// `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE`) while it has not exited
+/// (its handle unsignalled: an exited process whose object another handle keeps
+/// is this platform's zombie). The account is the system's to check, not this
+/// read's: another account's process refuses the open, though an elevated
+/// reader may be let in. Exact to the microsecond (the record counts 100 ns).
+#[cfg(windows)]
+#[must_use]
+// Skip: bottoms out at the `OpenProcess`/`GetProcessTimes` FFI calls.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn read_process_birth(pid: i32) -> Option<ProcessBirth> {
+    use crate::win::ffi;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_TIMEOUT: u32 = 258;
+    if pid <= 1 {
+        return None;
+    }
+    let pid = u32::try_from(pid).ok()?;
+    // SAFETY: a plain open by pid; a handle it returns is closed below.
+    let handle =
+        unsafe { ffi::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+    if handle == 0 {
+        return None;
+    }
+    let mut times = [ffi::FileTime::default(); 4];
+    let [created, exited, kernel, user] = &mut times;
+    // SAFETY: `handle` is the live process handle opened above, and the four
+    // out-params are distinct writable `FILETIME`s that outlive the call.
+    let read = unsafe { ffi::WaitForSingleObject(handle, 0) } == WAIT_TIMEOUT
+        && unsafe { ffi::GetProcessTimes(handle, created, exited, kernel, user) } != 0;
+    // SAFETY: closes the one handle this function opened.
+    let _ = unsafe { ffi::CloseHandle(handle) };
+    if !read {
+        return None;
+    }
+    birth_of_filetime(times[0].ticks())
+}
+
+/// A Windows `FILETIME` (100 ns ticks since 1601-01-01 UTC) as a
+/// [`ProcessBirth`]; `None` before the Unix epoch. Pure, so any host tests it.
+#[cfg(any(windows, test))]
+fn birth_of_filetime(ticks: u64) -> Option<ProcessBirth> {
+    /// The ticks from 1601-01-01 to 1970-01-01.
+    const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+    let since = ticks.checked_sub(UNIX_EPOCH_TICKS)?;
+    Some(ProcessBirth {
+        seconds: since / 10_000_000,
+        microseconds: since % 10_000_000 / 10,
+    })
+}
+
 /// See the Apple twin: no birth-record primitive is wired here.
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", windows)))]
 #[must_use]
 pub fn read_process_birth(_pid: i32) -> Option<ProcessBirth> {
     None
@@ -336,6 +384,41 @@ pub fn translation() -> Translation {
     Translation::Native
 }
 
+/// The binary translator this process runs under, named, when one does on
+/// Linux: its code is built for one architecture and the kernel is another's.
+/// Linux names its own in `/proc/sys/kernel/arch`, which the translator leaves
+/// alone while it rewrites `uname` and `/proc/cpuinfo` (Rosetta answers
+/// `x86_64` and `VirtualApple` there, measured 2026-10-17). `None` natively, on
+/// a kernel that names no architecture, and off Linux (Darwin's `posix_spawn`
+/// is a single system call, and no `binfmt_misc` names an interpreter as a
+/// process's executable; [`translation`] reads a Mac's Rosetta). For a test
+/// that cannot decide something under a translator: it decides what it still
+/// can and prints `NOT RUN under <translator>: <test>: <why>`, the line the
+/// Linux lane's proof reads (`docs/LINUX-RUNTIME-LANE.md`, "Rosetta").
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn translator() -> Option<String> {
+    let kernel = std::fs::read_to_string("/proc/sys/kernel/arch").ok()?;
+    let (kernel, code) = (kernel.trim(), std::env::consts::ARCH);
+    if kernel.is_empty() || kernel == code {
+        return None;
+    }
+    let rosetta =
+        std::fs::read_to_string("/proc/cpuinfo").is_ok_and(|info| info.contains("VirtualApple"));
+    Some(if rosetta {
+        "Rosetta".to_string()
+    } else {
+        format!("a translator ({code} code on an {kernel} kernel)")
+    })
+}
+
+/// See the Linux twin: no test depends on a translator here.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn translator() -> Option<String> {
+    None
+}
+
 /// The Apple boot clock for a process whose [`Translation`] is `translation`,
 /// read by `ticks` (`mach_absolute_time`). `None` when translated: the reading
 /// is in nanoseconds, not the kernel's ticks, so callers order start records on
@@ -413,6 +496,258 @@ pub fn boot_clock_now() -> Option<BootClock> {
 )))]
 #[must_use]
 pub fn boot_clock_now() -> Option<BootClock> {
+    None
+}
+
+/// Milliseconds on a clock that COUNTS THROUGH SLEEP and never steps with the
+/// wall clock, from an origin fixed for this boot. `Instant` reads Apple's
+/// uptime clock, which pauses while the machine sleeps, so an age taken on it
+/// across a closed lid is only the time awake; an AGE THAT IS REPORTED (the
+/// survey's `agent_ms=`, `human_ms=`) is taken on this one instead. Timers
+/// and latency stay on `Instant`.
+///
+/// * Apple: `mach_continuous_time`, scaled by `mach_timebase_info` (under
+///   Rosetta both speak nanoseconds, so the scale is one).
+/// * Linux: `CLOCK_BOOTTIME` ([`boot_clock_now`]).
+///
+/// `None` where none is wired (Windows, the BSDs, 32-bit Linux): the caller's
+/// own clock stands in.
+#[cfg(target_vendor = "apple")]
+#[must_use]
+// Skip: bottoms out at the `mach_continuous_time` FFI call.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn continuous_ms() -> Option<u64> {
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+    unsafe extern "C" {
+        fn mach_continuous_time() -> u64;
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
+    }
+    let mut base = Timebase { numer: 0, denom: 0 };
+    // SAFETY: one writable `mach_timebase_info_data_t` that outlives the call.
+    if unsafe { mach_timebase_info(&raw mut base) } != 0 || base.denom == 0 {
+        return None;
+    }
+    // SAFETY: a side-effect-free getter with no arguments.
+    let ticks = unsafe { mach_continuous_time() };
+    let ns = u128::from(ticks) * u128::from(base.numer) / u128::from(base.denom);
+    u64::try_from(ns / 1_000_000).ok()
+}
+
+/// See the Apple twin.
+#[cfg(not(target_vendor = "apple"))]
+#[must_use]
+pub fn continuous_ms() -> Option<u64> {
+    boot_clock_now().map(|BootClock(ns)| ns / 1_000_000)
+}
+
+/// HOW LONG THIS MACHINE HAS SLEPT SINCE IT BOOTED: the clock that counts
+/// through a sleep less the one a sleep stops (Rust's `Instant`), read one
+/// after the other — no process started, nothing typed, any process at any
+/// time. Two readings set against each other say how much of the time between
+/// them the machine slept, which a span timed on the wall clock counts and the
+/// awake clock does not.
+///
+/// * Apple: `mach_continuous_time` less `mach_absolute_time`, scaled by
+///   `mach_timebase_info` (under Rosetta both read nanoseconds and the scale
+///   is one).
+/// * Linux: `CLOCK_BOOTTIME` less `CLOCK_MONOTONIC`.
+///
+/// `None` where no such pair is wired (Windows, the BSDs, 32-bit Linux): the
+/// caller has no measure of a sleep but its own clocks'.
+#[cfg(target_vendor = "apple")]
+#[must_use]
+// Skip: bottoms out at the `mach_*_time` FFI calls.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn asleep_since_boot() -> Option<std::time::Duration> {
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+    unsafe extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_continuous_time() -> u64;
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
+    }
+    let mut base = Timebase { numer: 0, denom: 0 };
+    // SAFETY: one writable `mach_timebase_info_data_t` that outlives the call.
+    if unsafe { mach_timebase_info(&raw mut base) } != 0 || base.denom == 0 {
+        return None;
+    }
+    // The awake clock first: the boot clock, read after it, never reads less.
+    // SAFETY: side-effect-free getters with no arguments.
+    let awake = unsafe { mach_absolute_time() };
+    // SAFETY: as above.
+    let boot = unsafe { mach_continuous_time() };
+    let ns =
+        u128::from(boot.saturating_sub(awake)) * u128::from(base.numer) / u128::from(base.denom);
+    u64::try_from(ns).ok().map(std::time::Duration::from_nanos)
+}
+
+/// See the Apple twin.
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    target_pointer_width = "64"
+))]
+#[must_use]
+pub fn asleep_since_boot() -> Option<std::time::Duration> {
+    const CLOCK_MONOTONIC: i32 = 1;
+    const CLOCK_BOOTTIME: i32 = 7;
+    let awake = linux_clock_ns(CLOCK_MONOTONIC)?;
+    let boot = linux_clock_ns(CLOCK_BOOTTIME)?;
+    Some(std::time::Duration::from_nanos(boot.saturating_sub(awake)))
+}
+
+/// One `clock_gettime` reading of `clock`, in nanoseconds.
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    target_pointer_width = "64"
+))]
+// Skip: bottoms out at the `clock_gettime` FFI call.
+#[cfg_attr(trust_verify, trust::skip)]
+fn linux_clock_ns(clock: i32) -> Option<u64> {
+    #[repr(C)]
+    struct Timespec {
+        tv_sec: core::ffi::c_long,
+        tv_nsec: core::ffi::c_long,
+    }
+    unsafe extern "C" {
+        fn clock_gettime(clock: i32, tp: *mut Timespec) -> i32;
+    }
+    let mut now = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is one writable timespec that outlives the call.
+    if unsafe { clock_gettime(clock, &mut now) } != 0 {
+        return None;
+    }
+    u64::try_from(now.tv_sec)
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(now.tv_nsec).ok()?)
+}
+
+/// See the Apple twin: no sleep is counted here.
+#[cfg(not(any(
+    target_vendor = "apple",
+    all(
+        any(target_os = "linux", target_os = "android"),
+        target_pointer_width = "64"
+    )
+)))]
+#[must_use]
+pub fn asleep_since_boot() -> Option<std::time::Duration> {
+    None
+}
+
+/// THE BOOT THIS MACHINE IS IN, as the kernel names it: two readings of
+/// [`asleep_since_boot`] compare only under the same name (the count starts
+/// over at a boot).
+///
+/// * Apple: `kern.bootsessionuuid` (`sysctlbyname`).
+/// * Linux: `/proc/sys/kernel/random/boot_id`.
+///
+/// `None` where the kernel names none, or none is wired.
+#[cfg(target_vendor = "apple")]
+#[must_use]
+// Skip: bottoms out at the `sysctlbyname` FFI call.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn boot_session() -> Option<String> {
+    let mut buf = [0u8; 64];
+    let mut len = buf.len();
+    // SAFETY: a NUL-terminated name, a writable buffer and its length, all
+    // live for the call; nothing is written to the kernel (`newp` null).
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &raw mut len,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let name = buf.get(..len)?;
+    let name = name.split(|&b| b == 0).next().unwrap_or_default();
+    let name = std::str::from_utf8(name).ok()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// See the Apple twin.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[must_use]
+pub fn boot_session() -> Option<String> {
+    let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// See the Apple twin: no boot is named here.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+#[must_use]
+pub fn boot_session() -> Option<String> {
+    None
+}
+
+/// THE MACHINE'S LAST SLEEP on the wall clock, as the kernel recorded it:
+/// when it went to sleep and when it woke, unix milliseconds — the one sleep
+/// whose place a process that was not watching can still read.
+///
+/// * Apple: `kern.sleeptime` and `kern.waketime` (`sysctlbyname`).
+///
+/// `None` with no sleep since boot (both read zero), a record out of order,
+/// and where none is kept (Linux, Windows).
+#[cfg(target_vendor = "apple")]
+#[must_use]
+pub fn last_sleep_ms() -> Option<(i64, i64)> {
+    let slept = sysctl_timeval_ms(c"kern.sleeptime")?;
+    let woke = sysctl_timeval_ms(c"kern.waketime")?;
+    (slept > 0 && slept < woke).then_some((slept, woke))
+}
+
+/// One `struct timeval` sysctl by name, unix milliseconds; `None` if the
+/// kernel refuses it or answers with another width.
+#[cfg(target_vendor = "apple")]
+// Skip: bottoms out at the `sysctlbyname` FFI call.
+#[cfg_attr(trust_verify, trust::skip)]
+fn sysctl_timeval_ms(name: &core::ffi::CStr) -> Option<i64> {
+    let mut tv = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut len = core::mem::size_of::<libc::timeval>();
+    // SAFETY: `name` is NUL-terminated and outlives the call; `tv` and `len`
+    // are live locals, `len` the buffer's real size; nothing is written to the
+    // kernel (`newp` null).
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&raw mut tv).cast(),
+            &raw mut len,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len != core::mem::size_of::<libc::timeval>() {
+        return None;
+    }
+    // `time_t` is 64 bits on every Apple target aterm builds for.
+    tv.tv_sec
+        .checked_mul(1000)?
+        .checked_add(i64::from(tv.tv_usec) / 1000)
+}
+
+/// See the Apple twin: no sleep is recorded here.
+#[cfg(not(target_vendor = "apple"))]
+#[must_use]
+pub fn last_sleep_ms() -> Option<(i64, i64)> {
     None
 }
 
@@ -830,6 +1165,338 @@ pub fn kill_self_now() -> ! {
     std::process::abort()
 }
 
+/// This machine's host name as configured (`m7.local`): the ONE answer every
+/// reader that names the machine gives — the survey's `instance host=`, the
+/// fabric presence row's `host=`, the `user@host:` a tab title drops (the
+/// name a shell's `\h` prints). The name its LAN reaches it by, which a fleet
+/// member registers with and an issuer's join code carries, is
+/// [`lan_host_name`]. `$HOSTNAME` first (an operator who sets it is describing this
+/// machine), then the OS: `gethostname(2)` on Unix (what `uname -n` and
+/// `hostname` print), the DNS host name on Windows. No spawn and no file read
+/// anywhere. `None` when neither names one.
+#[must_use]
+pub fn host_name() -> Option<String> {
+    host_name_over(std::env::var_os("HOSTNAME"))
+}
+
+/// [`host_name`] with `$HOSTNAME` passed in: no test may set it.
+fn host_name_over(env: Option<std::ffi::OsString>) -> Option<String> {
+    env_host_name(env).or_else(os_host_name)
+}
+
+/// The OS's own name for this machine now, NEVER `$HOSTNAME`: on Unix
+/// `gethostname(2)` (zsh's `$HOST`, the name a local shell reports whatever
+/// this process's environment says), on Windows the DNS host name. A tab
+/// title's local-identity check reads it again on every ask, as the network
+/// can rename the machine under a running process.
+#[must_use]
+pub fn kernel_host_name() -> Option<String> {
+    os_host_name()
+}
+
+/// A `$HOSTNAME` a person set, trimmed; `None` for none or a blank one.
+fn env_host_name(env: Option<std::ffi::OsString>) -> Option<String> {
+    let name = env?;
+    let name = name.to_str()?.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// The name the other machines of this one's LAN reach it by: the host a
+/// fleet's join code names for its issuer and the one a member registers
+/// with (`aterm fleet init|join`). `$HOSTNAME` first, as [`host_name`]; then,
+/// on macOS, the HostName an administrator set (`scutil --set HostName`, an
+/// MDM profile), which the site's DNS answers on every subnet of a lab that
+/// spans several; with none set — the usual case — the Bonjour name
+/// `<LocalHostName>.local` (System Settings › General › Sharing › Local
+/// hostname), which stays the machine's whatever network it joins, where
+/// `gethostname(2)` is then whatever DHCP or the current address's reverse
+/// DNS gave it (`Andrews-MBP.localdomain`, `dhcp-10-1-2-3.corp…`): a name
+/// that follows the address, not the machine, and that a LAN whose router
+/// publishes no names never resolves. Elsewhere, and when macOS names
+/// neither, [`host_name`]'s answer. No spawn and no file read: the macOS
+/// names are the configuration daemon's.
+#[must_use]
+pub fn lan_host_name() -> Option<String> {
+    lan_host_name_over(std::env::var_os("HOSTNAME"))
+}
+
+/// [`lan_host_name`] with `$HOSTNAME` passed in: no test may set it.
+fn lan_host_name_over(env: Option<std::ffi::OsString>) -> Option<String> {
+    env_host_name(env)
+        .or_else(configured_host_name)
+        .or_else(|| bonjour_host_name().map(|name| format!("{name}.local")))
+        .or_else(os_host_name)
+}
+
+/// The CoreFoundation and SystemConfiguration calls the macOS names take.
+#[cfg(target_os = "macos")]
+mod sc {
+    use core::ffi::{c_char, c_ulong, c_void};
+
+    pub(super) type CFTypeRef = *const c_void;
+
+    /// `kCFStringEncodingUTF8` (CFString.h).
+    const UTF8: u32 = 0x0800_0100;
+
+    #[link(name = "SystemConfiguration", kind = "framework")]
+    unsafe extern "C" {
+        pub(super) static kSCPropSystemHostName: CFTypeRef;
+        #[cfg(test)]
+        pub(super) static kSCPropSystemComputerName: CFTypeRef;
+        pub(super) fn SCDynamicStoreCopyLocalHostName(store: CFTypeRef) -> CFTypeRef;
+        pub(super) fn SCDynamicStoreKeyCreateComputerName(allocator: CFTypeRef) -> CFTypeRef;
+        pub(super) fn SCDynamicStoreCopyValue(store: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringGetCString(string: CFTypeRef, buf: *mut c_char, len: isize, enc: u32) -> u8;
+        pub(super) fn CFRelease(cf: CFTypeRef);
+        pub(super) fn CFGetTypeID(cf: CFTypeRef) -> c_ulong;
+        pub(super) fn CFDictionaryGetTypeID() -> c_ulong;
+        pub(super) fn CFStringGetTypeID() -> c_ulong;
+        pub(super) fn CFDictionaryGetValue(dict: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
+    }
+
+    /// A host name `string` holds, trimmed; `None` for a blank one or one
+    /// that is no UTF-8.
+    ///
+    /// # Safety
+    /// `string` is a live CFString.
+    // Skip: bottoms out at CoreFoundation FFI.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub(super) unsafe fn text(string: CFTypeRef) -> Option<String> {
+        // A host name is at most 253 bytes, a Bonjour name 63; this holds any.
+        let mut buf = [0u8; 256];
+        // SAFETY: `string` is a live CFString (the caller's promise); `buf`
+        // is `buf.len()` writable bytes, which the call fills with the name
+        // and its NUL, or leaves unread.
+        let ok = unsafe {
+            CFStringGetCString(string, buf.as_mut_ptr().cast(), buf.len() as isize, UTF8)
+        };
+        if ok == 0 {
+            return None;
+        }
+        let len = buf.iter().position(|b| *b == 0)?;
+        let name = std::str::from_utf8(buf.get(..len)?).ok()?.trim();
+        (!name.is_empty()).then(|| name.to_owned())
+    }
+}
+
+/// The HostName an administrator set for this Mac (`scutil --get
+/// HostName`): `HostName` in the configuration daemon's `Setup:/System`,
+/// which `gethostname(2)` then gives too. `None` when none is set, or the
+/// daemon does not answer (a sandbox that refuses it).
+#[cfg(target_os = "macos")]
+fn configured_host_name() -> Option<String> {
+    // SAFETY: a CFString constant SystemConfiguration exports.
+    setup_system(unsafe { sc::kSCPropSystemHostName })
+}
+
+/// The string `key` names in the configuration daemon's `Setup:/System`
+/// (the machine's names): `None` when it holds none there, or the daemon
+/// does not answer.
+#[cfg(target_os = "macos")]
+// Skip: bottoms out at SystemConfiguration and CoreFoundation FFI.
+#[cfg_attr(trust_verify, trust::skip)]
+fn setup_system(key_name: sc::CFTypeRef) -> Option<String> {
+    // SAFETY: the default allocator; the result is a new CFString this frame
+    // owns, or NULL.
+    let key = unsafe { sc::SCDynamicStoreKeyCreateComputerName(std::ptr::null()) };
+    if key.is_null() {
+        return None;
+    }
+    // SAFETY: a NULL store asks with a temporary session; `key` is live. The
+    // result is a new reference this frame owns, or NULL.
+    let setup = unsafe { sc::SCDynamicStoreCopyValue(std::ptr::null(), key) };
+    // SAFETY: this frame owns exactly the one reference the create returned.
+    unsafe { sc::CFRelease(key) };
+    if setup.is_null() {
+        return None;
+    }
+    // SAFETY: `setup` is live until it is released below; a type id is a
+    // plain query, and the value is read only once it is known to be a
+    // CFString, borrowed from the dictionary (the Get rule) while it lives.
+    let name = unsafe {
+        if sc::CFGetTypeID(setup) == sc::CFDictionaryGetTypeID() {
+            let value = sc::CFDictionaryGetValue(setup, key_name);
+            if !value.is_null() && sc::CFGetTypeID(value) == sc::CFStringGetTypeID() {
+                sc::text(value)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    // SAFETY: this frame owns exactly the one reference the copy returned.
+    unsafe { sc::CFRelease(setup) };
+    name
+}
+
+/// No configured name apart from the kernel's off macOS: [`os_host_name`]
+/// answers.
+#[cfg(not(target_os = "macos"))]
+fn configured_host_name() -> Option<String> {
+    None
+}
+
+/// macOS's Bonjour name, `LocalHostName` without its `.local`
+/// (`SCDynamicStoreCopyLocalHostName`): `None` when none is set or the
+/// configuration daemon does not answer (a sandbox that refuses it).
+#[cfg(target_os = "macos")]
+// Skip: bottoms out at SystemConfiguration and CoreFoundation FFI.
+#[cfg_attr(trust_verify, trust::skip)]
+fn bonjour_host_name() -> Option<String> {
+    // SAFETY: a NULL store asks with a temporary session; the result is a new
+    // CFString reference this frame owns, or NULL.
+    let name = unsafe { sc::SCDynamicStoreCopyLocalHostName(std::ptr::null()) };
+    if name.is_null() {
+        return None;
+    }
+    // SAFETY: `name` is a live CFString.
+    let text = unsafe { sc::text(name) };
+    // SAFETY: this frame owns exactly the one reference the copy returned.
+    unsafe { sc::CFRelease(name) };
+    text
+}
+
+/// No Bonjour name off macOS: [`lan_host_name`] is [`host_name`]'s answer.
+#[cfg(not(target_os = "macos"))]
+fn bonjour_host_name() -> Option<String> {
+    None
+}
+
+/// `gethostname(2)`: the kernel's node name, NUL-terminated in a buffer that
+/// holds any host name (POSIX caps it at `HOST_NAME_MAX`, 255 on Linux, 255 on
+/// Darwin's `MAXHOSTNAMELEN`).
+#[cfg(unix)]
+// Skip: bottoms out at the `gethostname(2)` FFI call.
+#[cfg_attr(trust_verify, trust::skip)]
+fn os_host_name() -> Option<String> {
+    unsafe extern "C" {
+        fn gethostname(name: *mut core::ffi::c_char, len: usize) -> i32;
+    }
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is `buf.len()` writable bytes that outlive the call; the
+    // call writes at most that many and a NUL within them on success.
+    let rc = unsafe { gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let len = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(buf.get(..len)?).trim().to_owned();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Windows: the DNS host name, as `hostname.exe` prints it
+/// (`GetComputerNameExW(ComputerNameDnsHostname)`), else `%COMPUTERNAME%` (the
+/// NetBIOS name: upper-cased, at most 15 characters, so a longer name would not
+/// match). NEVER a spawn: the window process has no console, and running
+/// `hostname.exe` from it opened a visible console window (measured
+/// 2026-09-30). Measured on that machine: `hostname` printed the name in its
+/// own case, `%COMPUTERNAME%` the same name upper-cased.
+#[cfg(windows)]
+fn os_host_name() -> Option<String> {
+    /// `COMPUTER_NAME_FORMAT::ComputerNameDnsHostname` (sysinfoapi.h).
+    const COMPUTER_NAME_DNS_HOSTNAME: u32 = 1;
+    /// A DNS host label is at most 63 characters; this holds any name.
+    const CAPACITY: usize = 256;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetComputerNameExW(name_type: u32, buffer: *mut u16, size: *mut u32) -> i32;
+    }
+    let mut buf = [0u16; CAPACITY];
+    let mut len = CAPACITY as u32;
+    // SAFETY: `buf` is `len` writable UTF-16 units and outlives the call. On
+    // success the API writes the name and its NUL inside them and sets `len` to
+    // the name's length without the NUL; on failure nothing written is read.
+    let ok = unsafe { GetComputerNameExW(COMPUTER_NAME_DNS_HOSTNAME, buf.as_mut_ptr(), &mut len) };
+    let dns = (ok != 0)
+        .then(|| buf.get(..len as usize).map(String::from_utf16_lossy))
+        .flatten()
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty());
+    dns.or_else(|| {
+        std::env::var("COMPUTERNAME")
+            .ok()
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+    })
+}
+
+/// No OS answer wired here (the wasm32 hosts): `$HOSTNAME` alone.
+#[cfg(not(any(unix, windows)))]
+fn os_host_name() -> Option<String> {
+    None
+}
+
+#[cfg(all(test, unix))]
+mod host_name_tests {
+    /// A `$HOSTNAME` a person set names the machine, trimmed; a blank one
+    /// names nothing and the OS answers.
+    #[test]
+    fn the_hostname_override_wins_and_a_blank_one_falls_to_the_os() {
+        assert_eq!(
+            super::host_name_over(Some(" my-override.local ".into())).as_deref(),
+            Some("my-override.local")
+        );
+        assert_eq!(
+            super::host_name_over(Some("  ".into())),
+            super::os_host_name()
+        );
+        assert_eq!(super::host_name_over(None), super::os_host_name());
+        assert_eq!(
+            super::lan_host_name_over(Some(" my-override.local ".into())).as_deref(),
+            Some("my-override.local"),
+            "the override names the machine to its LAN too"
+        );
+    }
+
+    /// On macOS the LAN's name for this machine is the HostName an
+    /// administrator set, the one `scutil --get HostName` prints; with none,
+    /// its Bonjour name, the one `scutil --get LocalHostName` prints, with
+    /// `.local`: never the name DHCP or reverse DNS gave the kernel. With
+    /// neither set, the kernel's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_lan_name_is_the_configured_name_else_the_bonjour_name() {
+        let scutil = |key: &str| {
+            let out = crate::spawnfd::command("/usr/sbin/scutil")
+                .args(["--get", key])
+                .output()
+                .expect("run scutil");
+            let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            (out.status.success() && !name.is_empty()).then_some(name)
+        };
+        let configured = scutil("HostName");
+        assert_eq!(super::configured_host_name(), configured);
+        // NEGATIVE CONTROL: the same read of a name every Mac has set gives
+        // it, so a `None` above is no HostName, not a read that never works.
+        // SAFETY: a CFString constant SystemConfiguration exports.
+        let computer = super::setup_system(unsafe { super::sc::kSCPropSystemComputerName });
+        assert!(computer.is_some(), "the read gives the ComputerName");
+        assert_eq!(computer, scutil("ComputerName"));
+        let want = configured
+            .or_else(|| scutil("LocalHostName").map(|local| format!("{local}.local")))
+            .or_else(super::os_host_name);
+        assert_eq!(super::lan_host_name_over(None), want);
+    }
+
+    /// The kernel's answer is the one `uname -n` prints: the same node name,
+    /// read without a spawn.
+    #[test]
+    fn the_host_name_is_the_kernels_node_name() {
+        let ours = super::os_host_name().expect("gethostname names this machine");
+        let uname = crate::spawnfd::command("/usr/bin/uname")
+            .arg("-n")
+            .output()
+            .or_else(|_| crate::spawnfd::command("/bin/uname").arg("-n").output())
+            .expect("run uname -n");
+        assert_eq!(ours, String::from_utf8_lossy(&uname.stdout).trim());
+    }
+}
+
 /// `sigset_t`: a 32-bit mask on Darwin, 1024 bits on Linux.
 #[cfg(target_vendor = "apple")]
 type SigSet = u32;
@@ -903,6 +1570,28 @@ pub fn take_stop_signals(name: &str, on_stop: impl FnOnce(i32) + Send + 'static)
 #[cfg(test)]
 mod start_tests {
     use super::{BootClock, procfs};
+
+    /// A Windows `FILETIME` counts 100 ns ticks from 1601: the Unix epoch is its
+    /// 116444736000000000th, a part of a microsecond is dropped, and a tick
+    /// before the epoch is no birth.
+    #[test]
+    fn a_filetime_is_a_birth_counted_from_the_unix_epoch() {
+        use super::{ProcessBirth, birth_of_filetime};
+        const EPOCH: u64 = 116_444_736_000_000_000;
+        let at = |seconds, microseconds| {
+            Some(ProcessBirth {
+                seconds,
+                microseconds,
+            })
+        };
+        assert_eq!(birth_of_filetime(EPOCH), at(0, 0));
+        assert_eq!(birth_of_filetime(EPOCH + 9), at(0, 0));
+        assert_eq!(
+            birth_of_filetime(EPOCH + 17_900_000_000_000_000 + 1_234_567),
+            at(1_790_000_000, 123_456)
+        );
+        assert_eq!(birth_of_filetime(EPOCH - 1), None);
+    }
 
     /// Real `/proc` text (`USER_HZ` 100): a command name holding a space and both parentheses,
     /// running and as a zombie, and a `cat` read at uptime 518318.71 s.
@@ -1117,6 +1806,47 @@ mod tests {
         );
         drop(child);
     }
+
+    /// The birth record (`GetProcessTimes`): a child started after a wall-clock
+    /// reading was born after it and no later than a reading taken once it runs,
+    /// and this process before it. Once the child has exited its pid still names
+    /// its object (the open `Child` keeps it) and reads no birth; nor do pids 0
+    /// and 1. The 50 ms gap outlasts the kernel clock's tick (15.6 ms at most),
+    /// to which a creation time is truncated.
+    #[test]
+    fn a_child_born_after_a_wall_reading_reads_later_and_none_once_exited() {
+        use crate::spawnfd::Stdio;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        let on_wall = |birth: super::ProcessBirth| {
+            UNIX_EPOCH
+                + Duration::from_secs(birth.seconds)
+                + Duration::from_micros(birth.microseconds)
+        };
+        let moment = SystemTime::now();
+        std::thread::sleep(Duration::from_millis(50));
+        // `cmd` with no command reads its stdin, which only this test holds.
+        let mut child = crate::spawnfd::command("cmd")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cmd");
+        let pid = i32::try_from(child.id()).expect("a pid");
+        let born = super::read_process_birth(pid);
+        let after = SystemTime::now();
+        let _ = child.kill();
+        let _ = child.wait();
+        let born = on_wall(born.expect("a live child's birth"));
+        assert!(born > moment, "{born:?} after {moment:?}");
+        assert!(born <= after, "{born:?} by {after:?}");
+        let own = i32::try_from(std::process::id()).expect("a pid");
+        let mine = on_wall(super::read_process_birth(own).expect("this process's birth"));
+        assert!(mine < moment, "{mine:?} before {moment:?}");
+        assert_eq!(super::read_process_birth(pid), None, "an exited process");
+        assert_eq!(super::read_process_birth(1), None, "never pid 1");
+        assert_eq!(super::read_process_birth(0), None, "never pid 0");
+        drop(child);
+    }
 }
 
 #[cfg(all(test, any(target_vendor = "apple", target_os = "linux")))]
@@ -1318,6 +2048,60 @@ mod argv_tests {
             assert_eq!(
                 argv_of_same_process(pid, |_| panic!("invalid pid"), |_| panic!("invalid pid")),
                 None
+            );
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_vendor = "apple",
+        all(target_os = "linux", target_pointer_width = "64")
+    )
+))]
+mod sleep_probe_tests {
+    use super::{asleep_since_boot, boot_session, continuous_ms, last_sleep_ms};
+    use std::time::Duration;
+
+    /// The machine's sleep since boot reads where it is wired, never runs
+    /// back between two reads (the reads' own gap aside, a nanosecond's
+    /// order), and is no more than the clock that counts it has run since
+    /// boot.
+    #[test]
+    fn the_sleep_since_boot_reads_and_never_runs_back() {
+        let first = asleep_since_boot().expect("wired on this platform");
+        let next = asleep_since_boot().expect("wired on this platform");
+        assert!(
+            next + Duration::from_millis(1) >= first,
+            "{first:?} {next:?}"
+        );
+        let since_boot = Duration::from_millis(continuous_ms().expect("the boot clock"));
+        assert!(
+            next <= since_boot + Duration::from_millis(1),
+            "{next:?} {since_boot:?}"
+        );
+    }
+
+    /// The boot is named, and the same name twice in one boot.
+    #[test]
+    fn the_boot_is_named_and_stays_named() {
+        let name = boot_session().expect("named on this platform");
+        assert!(!name.is_empty());
+        assert_eq!(boot_session(), Some(name));
+    }
+
+    /// The last sleep, where the kernel keeps one, went to sleep before it
+    /// woke, and woke no later than now.
+    #[test]
+    fn the_last_sleep_is_in_order() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+        if let Some((slept, woke)) = last_sleep_ms() {
+            assert!(
+                0 < slept && slept < woke && woke <= now_ms + 1000,
+                "{slept} {woke} {now_ms}"
             );
         }
     }

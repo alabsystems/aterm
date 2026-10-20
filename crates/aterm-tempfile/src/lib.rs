@@ -5,7 +5,9 @@
 //!
 //! A drop-in for the parts of the `tempfile` crate aterm uses: `TempDir`,
 //! `Builder`, and the free function `tempdir()`. Tests that run a stand-in
-//! script also get `stand_in` (test and debug builds).
+//! script also get `stand_in`: in test and debug builds, and in any build with
+//! the `test-support` feature, which dependents enable from their
+//! dev-dependencies so their optimized test targets build.
 
 // Register the `trust` tool namespace so the FFI/CSPRNG wrappers below can
 // carry `#[cfg_attr(trust_verify, trust::skip)]`; inert off-Trust.
@@ -58,7 +60,8 @@ fn unique_name(prefix: &str) -> String {
 ///
 /// The `_` arm is unreachable for masked inputs; it exists so the function
 /// is total (no panic path) under verification.
-fn hex_digit(nibble: u64) -> char {
+#[must_use]
+pub const fn hex_digit(nibble: u64) -> char {
     match nibble {
         0 => '0',
         1 => '1',
@@ -79,13 +82,65 @@ fn hex_digit(nibble: u64) -> char {
     }
 }
 
+/// Encode a temporary directory seed (`rand_u64`, `pid`, `counter`) into 16 LE bytes.
+#[must_use]
+pub const fn encode_temp_seed_le(rand_u64: u64, pid: u32, counter: u32) -> [u8; 16] {
+    [
+        rand_u64 as u8,
+        (rand_u64 >> 8) as u8,
+        (rand_u64 >> 16) as u8,
+        (rand_u64 >> 24) as u8,
+        (rand_u64 >> 32) as u8,
+        (rand_u64 >> 40) as u8,
+        (rand_u64 >> 48) as u8,
+        (rand_u64 >> 56) as u8,
+        pid as u8,
+        (pid >> 8) as u8,
+        (pid >> 16) as u8,
+        (pid >> 24) as u8,
+        counter as u8,
+        (counter >> 8) as u8,
+        (counter >> 16) as u8,
+        (counter >> 24) as u8,
+    ]
+}
+
+/// Decode 16 LE bytes into a temporary directory seed (`rand_u64`, `pid`, `counter`).
+#[must_use]
+pub const fn decode_temp_seed_le(bytes: [u8; 16]) -> (u64, u32, u32) {
+    let rand_u64 = (bytes[0] as u64)
+        | ((bytes[1] as u64) << 8)
+        | ((bytes[2] as u64) << 16)
+        | ((bytes[3] as u64) << 24)
+        | ((bytes[4] as u64) << 32)
+        | ((bytes[5] as u64) << 40)
+        | ((bytes[6] as u64) << 48)
+        | ((bytes[7] as u64) << 56);
+    let pid = (bytes[8] as u32)
+        | ((bytes[9] as u32) << 8)
+        | ((bytes[10] as u32) << 16)
+        | ((bytes[11] as u32) << 24);
+    let counter = (bytes[12] as u32)
+        | ((bytes[13] as u32) << 8)
+        | ((bytes[14] as u32) << 16)
+        | ((bytes[15] as u32) << 24);
+    (rand_u64, pid, counter)
+}
+
 /// Read 8 bytes of randomness from the OS.
 ///
 /// Falls back to [`no_csprng_fallback`] if the OS source is unavailable.
 fn os_random_u64() -> u64 {
     let mut buf = [0u8; 8];
     if read_os_random(&mut buf) {
-        u64::from_ne_bytes(buf)
+        (buf[0] as u64)
+            | ((buf[1] as u64) << 8)
+            | ((buf[2] as u64) << 16)
+            | ((buf[3] as u64) << 24)
+            | ((buf[4] as u64) << 32)
+            | ((buf[5] as u64) << 40)
+            | ((buf[6] as u64) << 48)
+            | ((buf[7] as u64) << 56)
     } else {
         no_csprng_fallback()
     }
@@ -96,17 +151,16 @@ fn os_random_u64() -> u64 {
 /// this only breaks ties between processes started in the same nanosecond.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn no_csprng_fallback() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         // Equals `d.as_nanos() as u64` (the truncating cast is mod 2^64, as is
         // the wrapping arithmetic); the verifier does not support 128-bit
         // truncating casts.
-        .map(|d| {
-            d.as_secs()
-                .wrapping_mul(1_000_000_000)
-                .wrapping_add(u64::from(d.subsec_nanos()))
-        })
-        .unwrap_or(0)
+        Ok(d) => d
+            .as_secs()
+            .wrapping_mul(1_000_000_000)
+            .wrapping_add(d.subsec_nanos() as u64),
+        Err(_) => 0,
+    }
 }
 
 /// `wasm32-unknown-unknown` arm of [`no_csprng_fallback`], the one target
@@ -414,7 +468,7 @@ pub fn tempdir() -> io::Result<TempDir> {
 ///
 /// Returns an error if `path` has no file name or the stand-in cannot be written
 /// or moved into place.
-#[cfg(all(unix, any(test, debug_assertions)))]
+#[cfg(all(unix, any(test, debug_assertions, feature = "test-support")))]
 pub fn stand_in(path: &Path, body: &str) -> io::Result<()> {
     if path.file_name().is_none() {
         return Err(io::Error::new(
@@ -431,8 +485,8 @@ pub fn stand_in(path: &Path, body: &str) -> io::Result<()> {
     let shared = link_shared(&tmp, dir, body.as_bytes()).is_ok();
     #[cfg(not(target_os = "macos"))]
     let shared = false;
-    if !shared {
-        write_read_only(&tmp, body.as_bytes())?;
+    if !shared && let Err(e) = write_read_only(&tmp, body.as_bytes()) {
+        return Err(e);
     }
     // Renaming one link of an inode over another link of it does nothing and
     // succeeds, so laying a body again where it already lies leaves `tmp`.
@@ -445,23 +499,35 @@ pub fn stand_in(path: &Path, body: &str) -> io::Result<()> {
 /// absent or not `body`. A link is kept only when [`is_stand_in`] holds for it.
 /// A link that fails, or a copy not owned by `dir`'s owner, is an error that
 /// leaves the shared copy (already assessed) as it was.
-#[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+#[cfg(all(
+    target_os = "macos",
+    any(test, debug_assertions, feature = "test-support")
+))]
+#[allow(clippy::question_mark)]
 fn link_shared(tmp: &Path, dir: &Path, body: &[u8]) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
     let cache = call0(std::env::temp_dir).join("aterm-stand-ins");
-    fs::DirBuilder::new()
+    if let Err(e) = fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(&cache)?;
+        .create(&cache)
+    {
+        return Err(e);
+    }
     let entry = cache.join(format!("{:016x}", fnv1a(body)));
     if !is_stand_in(&entry, &cache, body) {
         let fresh = cache.join(unique_name(".new."));
-        write_read_only(&fresh, body)?;
-        fs::rename(&fresh, &entry).inspect_err(|_| {
+        if let Err(e) = write_read_only(&fresh, body) {
+            return Err(e);
+        }
+        if let Err(e) = fs::rename(&fresh, &entry) {
             let _ = fs::remove_file(&fresh);
-        })?;
+            return Err(e);
+        }
     }
-    fs::hard_link(&entry, tmp)?;
+    if let Err(e) = fs::hard_link(&entry, tmp) {
+        return Err(e);
+    }
     if is_stand_in(tmp, dir, body) {
         Ok(())
     } else {
@@ -475,44 +541,64 @@ fn link_shared(tmp: &Path, dir: &Path, body: &[u8]) -> io::Result<()> {
 /// Whether `file` is a regular file holding exactly `body`, mode 0555, owned by
 /// whoever owns `dir`: what was checked is the inode itself, which only its
 /// owner can change.
-#[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+#[cfg(all(
+    target_os = "macos",
+    any(test, debug_assertions, feature = "test-support")
+))]
 fn is_stand_in(file: &Path, dir: &Path, body: &[u8]) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     let (Ok(meta), Ok(owner)) = (fs::symlink_metadata(file), fs::metadata(dir)) else {
         return false;
     };
-    meta.is_file()
-        && meta.uid() == owner.uid()
-        && meta.mode() & 0o7777 == 0o555
-        && fs::read(file).is_ok_and(|read| read == body)
+    if !meta.is_file() || meta.uid() != owner.uid() || meta.mode() & 0o7777 != 0o555 {
+        return false;
+    }
+    match fs::read(file) {
+        Ok(read) => read == body,
+        Err(_) => false,
+    }
 }
 
 /// Create `path` (it must not exist) holding `body`, then make it mode 0555.
-#[cfg(all(unix, any(test, debug_assertions)))]
+#[cfg(all(unix, any(test, debug_assertions, feature = "test-support")))]
+#[allow(clippy::question_mark)]
 fn write_read_only(path: &Path, body: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-    let mut file = fs::OpenOptions::new()
+    let mut file = match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o700)
-        .open(path)?;
-    let written = file
-        .write_all(body)
-        .and_then(|()| file.set_permissions(fs::Permissions::from_mode(0o555)));
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) => return Err(e),
+    };
+    let written = match file.write_all(body) {
+        Ok(()) => file.set_permissions(fs::Permissions::from_mode(0o555)),
+        Err(e) => Err(e),
+    };
     drop(file);
-    written.inspect_err(|_| {
+    if written.is_err() {
         let _ = fs::remove_file(path);
-    })
+    }
+    written
 }
 
 /// 64-bit FNV-1a: names the shared copy. A collision costs a rewrite, never a
 /// wrong stand-in: [`is_stand_in`] compares the bytes.
-#[cfg(all(target_os = "macos", any(test, debug_assertions)))]
-fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-    })
+#[cfg(all(
+    target_os = "macos",
+    any(test, debug_assertions, feature = "test-support")
+))]
+const fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash = (hash ^ (bytes[i] as u64)).wrapping_mul(0x0100_0000_01b3);
+        i += 1;
+    }
+    hash
 }
 
 #[cfg(test)]

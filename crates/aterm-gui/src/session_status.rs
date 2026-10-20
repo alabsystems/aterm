@@ -183,11 +183,16 @@ pub(crate) type AgentPublish = (
 pub(crate) struct AgentStep {
     /// The published reading changed (presence must re-fold it).
     pub(crate) reading_changed: bool,
+    /// What the screen said of the turn, for the session log (phase 3B).
+    pub(crate) turn: crate::presence::TurnFacts,
     /// The verdict to publish on the session's timeline (`word`, raw
     /// `detail`, a prompt's host-side subject, and the agent its reader
     /// read — by name or by screen), when the zone was classified this
     /// observation.
     pub(crate) publish: Option<AgentPublish>,
+    /// What the same screen counts, published with the verdict for the
+    /// survey (`SessionTimeline::set_gauges`).
+    pub(crate) gauges: crate::session_timeline::AgentGauges,
 }
 
 /// Current activity of a session. This is deliberately NOT where success or
@@ -1049,6 +1054,14 @@ pub(crate) const BLOCK_READ_MAX: usize = 32;
 /// the `sessions` roster both read it under a `try_lock`, so a busy engine
 /// answers `-` rather than parking a poller behind the PTY reader.
 pub(crate) fn executing_detail(term: &aterm_core::terminal::Terminal) -> Option<String> {
+    command_detail(&executing_command_line(term)?)
+}
+
+/// The WHOLE command line of `term`'s current shell-integration block while
+/// it is `Executing` — what [`executing_detail`] reduces to a word, and what
+/// the survey quotes for a shell (`cmd=`, redacted and capped there). `None`
+/// unless a block is `Executing` and names a command.
+pub(crate) fn executing_command_line(term: &aterm_core::terminal::Terminal) -> Option<String> {
     let block = term.current_block()?;
     if block.state != aterm_types::BlockState::Executing {
         return None;
@@ -1067,9 +1080,9 @@ fn block_detail(
         .as_deref()
         .map(str::trim)
         .filter(|text| !text.is_empty());
-    let text: String = match explicit {
+    match explicit {
         // OSC 633;E: the shell said the command line itself.
-        Some(explicit) => return command_detail(explicit),
+        Some(explicit) => Some(explicit.to_owned()),
         // The screen scrape reads WHOLE rows, so the command's first row still
         // carries the prompt in front of it (`$ sleep 30`); cut at the column
         // the shell marked the command start (OSC 133;B) — by display column,
@@ -1079,10 +1092,9 @@ fn block_detail(
             let scraped = term.block_command(block)?;
             let skip = usize::from(block.command_start_col.unwrap_or(0));
             let from = aterm_grapheme::column_to_char_index(&scraped, skip);
-            scraped.chars().skip(from).collect()
+            Some(scraped.chars().skip(from).collect())
         }
-    };
-    command_detail(&text)
+    }
 }
 
 /// Wrappers unwrapped ONE level: the interesting program is the next word.
@@ -1862,6 +1874,19 @@ const CONVENTIONAL_TARGETS: &[&str] = &[
     "update",
 ];
 
+/// STATUS_CONTROL_C_EXIT (`0xC000013A`) as a signed exit code: what a Windows console
+/// program stopped by Ctrl+C exits with (`ping -t` in pwsh or cmd), and what the pwsh
+/// integration reports for a line Ctrl+C stopped. No Unix shell reports it.
+pub(crate) const WINDOWS_CONTROL_C_EXIT: i32 = -1_073_741_510;
+
+/// Whether a command's exit code says Ctrl+C stopped it, for chrome's words: the
+/// Windows code anywhere, and on Windows also 130 (128 + SIGINT), what Git Bash reports
+/// for the same Ctrl+C, so pwsh, cmd and Git Bash tabs read alike. The wire keeps the
+/// code (`status exit_code=`, `blocks`). macOS and Linux show 130 as before.
+pub(crate) const fn interrupted_exit(exit_code: i32) -> bool {
+    exit_code == WINDOWS_CONTROL_C_EXIT || (cfg!(windows) && exit_code == 130)
+}
+
 /// Short, human display text for chrome. `None` for phases not worth showing —
 /// an honest blank beats a confident "unknown".
 pub(crate) fn summary_text(status: &Status) -> Option<String> {
@@ -1884,10 +1909,16 @@ pub(crate) fn summary_text(status: &Status) -> Option<String> {
             _ => "running".to_string(),
         },
         (Phase::Quiet, _) => "no output lately".to_string(),
+        (Phase::Idle, Outcome::Failure { exit_code }) if interrupted_exit(exit_code) => {
+            "interrupted".to_string()
+        }
         (Phase::Idle, Outcome::Failure { exit_code }) => format!("failed (exit {exit_code})"),
         (Phase::Idle, Outcome::Signal { signal }) => format!("killed (signal {signal})"),
         (Phase::Idle, Outcome::Success) => "done".to_string(),
         (Phase::Idle, Outcome::None) => "ready".to_string(),
+        (Phase::Exited, Outcome::Failure { exit_code }) if interrupted_exit(exit_code) => {
+            "exited (interrupted)".to_string()
+        }
         (Phase::Exited, Outcome::Failure { exit_code }) => format!("exited (exit {exit_code})"),
         (Phase::Exited, Outcome::Signal { signal }) => format!("exited (signal {signal})"),
         (Phase::Exited, _) => "exited".to_string(),
@@ -1970,6 +2001,29 @@ pub(crate) fn status_event_payload(status: &Status) -> String {
         status.last_outcome.as_str(),
         status.confidence.as_str(),
     )
+}
+
+/// A published status transition as the session log's typed `status` mark
+/// takes it (phase 3B, plan §3.2): the same facts as
+/// [`status_event_payload`], never parsed back from it.
+pub(crate) fn status_facts(status: &Status) -> crate::session_log::observed::StatusFacts {
+    let out = match status.last_outcome {
+        Outcome::None => None,
+        Outcome::Success => Some(("ok", None)),
+        Outcome::Failure { exit_code } => Some(("fail", Some(i64::from(exit_code)))),
+        Outcome::Signal { signal } => Some(("signal", Some(i64::from(signal)))),
+    };
+    let conf = match status.confidence {
+        Confidence::Unknown => aterm_slog::Conf::Unknown,
+        Confidence::Heuristic => aterm_slog::Conf::Heuristic,
+        Confidence::Strong => aterm_slog::Conf::Strong,
+        Confidence::Exact => aterm_slog::Conf::Exact,
+    };
+    crate::session_log::observed::StatusFacts {
+        phase: status.phase.as_str(),
+        out,
+        conf,
+    }
 }
 
 /// Owns one [`StatusFsm`] per live session and enforces the observation budget:
@@ -2072,7 +2126,7 @@ struct SessionSlot {
     /// Whether the user has SEEN the failure this session's tab is marked for.
     failure: FailureMark,
     /// The `(phase, outcome)` the last `status-change` timeline event carried
-    /// ([`StatusObserver::take_status_event`]); `None` before the first.
+    /// ([`StatusObserver::take_status_transition`]); `None` before the first.
     evented: Option<(Phase, Outcome)>,
 }
 
@@ -2184,6 +2238,7 @@ impl StatusObserver {
         program: Option<&str>,
         pgid: i32,
         now: Instant,
+        wake: &crate::claude_footer::LogWake,
     ) {
         if !crate::claude_footer::drawn_for(program) || pgid <= 0 {
             // A held pane can outlive Claude with no valid foreground group;
@@ -2250,7 +2305,7 @@ impl StatusObserver {
                     stopped: false,
                 },
             );
-            crate::claude_footer::request_footer(session, timeline, pgid);
+            crate::claude_footer::request_footer(session, timeline, pgid, wake);
         }
     }
 
@@ -2562,7 +2617,7 @@ impl StatusObserver {
     /// already SEEN ([`FailureMark`]): what an update carries for a held pane
     /// (`session_store::HeldPaneCarry::failure_seen`), whose successor shows
     /// the same exit again (round eight of the update audit, U34).
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     pub(crate) fn failure_seen(&self, session: u64) -> bool {
         self.sessions
             .get(&session)
@@ -2575,7 +2630,19 @@ impl StatusObserver {
     /// not events: they change without dwell (`content_activity` ↔
     /// `output_activity` under one `Running`), and carrying them would flood the
     /// bounded timeline the dwell exists to protect. Consumes the change.
+    #[cfg(test)]
     pub(crate) fn take_status_event(&mut self, session: u64) -> Option<String> {
+        self.take_status_transition(session)
+            .map(|(payload, _)| payload)
+    }
+
+    /// The `status-change` payload (the tests' `take_status_event`) with the
+    /// same transition's typed facts, for the session log's `status` mark
+    /// (one take, so the two never disagree).
+    pub(crate) fn take_status_transition(
+        &mut self,
+        session: u64,
+    ) -> Option<(String, crate::session_log::observed::StatusFacts)> {
         let slot = self.sessions.get_mut(&session)?;
         let status = slot.fsm.status();
         let key = (status.phase, status.last_outcome);
@@ -2583,7 +2650,7 @@ impl StatusObserver {
             return None;
         }
         slot.evented = Some(key);
-        Some(status_event_payload(status))
+        Some((status_event_payload(status), status_facts(status)))
     }
 
     /// The published agent reading presence folds: its sequence number and
@@ -2878,9 +2945,29 @@ impl StatusObserver {
         // The box's command or path, for the menu row and the notification
         // only: read by the same reader, from the same zone, as the verdict.
         let subject = verdict.subject().map(str::to_string);
+        // What the screen counts, for the survey: the context left the
+        // reading carries and, for Claude Code, its background shells.
+        let gauges = crate::session_timeline::AgentGauges {
+            ctx_pct: w.reading.as_ref().and_then(|r| r.context_pct),
+            shells: match verdict.program() {
+                Some(aterm_phase::Program::Claude) => aterm_phase::shells_running(&rows),
+                // Only Claude Code's footer is read for its shells; the
+                // other agents' screens draw no count measured yet.
+                Some(
+                    aterm_phase::Program::Codex
+                    | aterm_phase::Program::Agy
+                    | aterm_phase::Program::Muse
+                    | aterm_phase::Program::Gemini
+                    | aterm_phase::Program::Generic,
+                )
+                | None => None,
+            },
+        };
         AgentStep {
             reading_changed,
+            turn: verdict.turn(),
             publish: Some((verdict.word(), verdict.detail(), subject, verdict.program())),
+            gauges,
         }
     }
 
@@ -2947,10 +3034,16 @@ impl StatusObserver {
         pgid: i32,
         shell: i32,
         now: Instant,
-        proxy: Option<&winit::event_loop::EventLoopProxy<crate::Wake>>,
+        proxy: Option<&aterm_window::event_loop::EventLoopProxy<crate::Wake>>,
     ) {
         self.note_program_request(session, pgid, now);
         self.programs.request(session, timeline, pgid, shell, proxy);
+    }
+
+    /// The session log's wake the resolver's footer reads end with
+    /// ([`crate::claude_footer::LogWake`]): set once a sweep, before it asks.
+    pub(crate) fn set_log_wake(&mut self, wake: &crate::claude_footer::LogWake) {
+        self.programs.set_log_wake(wake);
     }
 
     pub(crate) fn revision(&self, session: u64) -> u64 {
@@ -2994,7 +3087,7 @@ impl StatusObserver {
     }
 
     /// The program's own state report `session` shows, and since when
-    /// (`status program_state=`, the presence row).
+    /// (`status program_state=`, the needs border's hover).
     pub(crate) fn program_state(
         &self,
         session: u64,
@@ -3005,8 +3098,8 @@ impl StatusObserver {
     }
 
     /// How many turn ends the program in front of `session` has reported
-    /// (OSC 7501 `working` → `done`|`idle`, as shown): the presence band's
-    /// story point for it. Display only.
+    /// (OSC 7501 `working` → `done`|`idle`, as shown): presence's story point
+    /// for it, and the tab's `•` where nobody watched. Display only.
     pub(crate) fn program_turn_ends(&self, session: u64) -> u64 {
         self.program_states
             .get(&session)
@@ -3020,6 +3113,15 @@ impl StatusObserver {
         self.program_states
             .get(&session)
             .map_or(0, crate::program_state::ProgramStateGate::turn_starts)
+    }
+
+    /// When the program in front of `session` began its latest counted turn (as
+    /// shown), `None` before any: a ledger settle pairs with that turn only when
+    /// it began no earlier than the ledger turn opened. Display only.
+    pub(crate) fn program_turn_began(&self, session: u64) -> Option<Instant> {
+        self.program_states
+            .get(&session)
+            .and_then(crate::program_state::ProgramStateGate::turn_started)
     }
 
     /// Drop a retired session's state. Without this the map would grow for the
@@ -3144,7 +3246,14 @@ impl crate::App {
         let pool_epoch = self.pool.insert_epoch();
         let retry_only = pool_epoch == self.session_status.swept_pool_epoch()
             && !self.session_status.any_due(now);
-        if retry_only && !self.session_status.has_unclassified() {
+        // THE EDGED INBOX (card engine §3.5): the sessions whose PTY reader
+        // published a holder image since the last sweep, taken first and
+        // visited ahead of everything else, each whether or not it is due, so
+        // a drawer's program is named on the wake after its edge rather than
+        // at its next observation. A visit the PTY reader's hold refuses goes
+        // back in the inbox for the next wake, with no interval charged.
+        let edged = self.session_factory.edge_inbox.take();
+        if retry_only && !self.session_status.has_unclassified() && edged.is_empty() {
             return Vec::new();
         }
         let retry = if retry_only {
@@ -3153,24 +3262,45 @@ impl crate::App {
             Vec::new()
         };
         let pool = &self.pool;
-        // `retry` is empty unless `retry_only`, so the chain is either the
-        // retry ids' live sessions or the whole pool, in the same order.
-        let sessions = retry
+        // `retry` is empty unless `retry_only`, so after the edged sessions
+        // the chain is either the retry ids' live sessions or the whole pool,
+        // in the same order. Each is paired with whether it is an edged visit.
+        let sessions = edged
             .iter()
             .filter_map(|id| pool.get(*id))
-            .chain((!retry_only).then(|| pool.iter()).into_iter().flatten());
+            .map(|session| (session, true))
+            .chain(
+                retry
+                    .iter()
+                    .filter_map(|id| pool.get(*id))
+                    .chain((!retry_only).then(|| pool.iter()).into_iter().flatten())
+                    .map(|session| (session, false)),
+            );
         let mut changed = Vec::new();
         // The proven claims this sweep cleared: their chrome and subscribers
         // are told once the pool is no longer borrowed (below).
         let mut claims_cleared = Vec::new();
+        // The sessions whose citation hovers a new naming of the front owes a
+        // re-ask (`App::reask_renamed_hovers`), after the loop.
+        let mut hovers_renamed = Vec::new();
+        let mut clauses_moved: Vec<u64> = Vec::new();
+        // The sessions whose program this sweep newly showed `done` (OSC
+        // 7501): an `fx celebrate on=done` arm bound to one fires after the
+        // loop (`App::note_program_done`).
+        let mut program_done = Vec::new();
+        // What a footer read the sweep starts wakes when it moves a session's
+        // log (session log Phase 3B, `claude_footer::LogWake`).
+        let footer_wake = self.footer_log_wake();
+        self.session_status.set_log_wake(&footer_wake);
         // The sweep never changes pool membership: borrow each due session
         // directly instead of collecting ids, looking them up again, and
         // cloning its terminal Arc on every observation interval.
-        for session in sessions {
+        for (session, edged_visit) in sessions {
             #[cfg(test)]
             crate::work_counts::status_probe();
             let id = session.id;
-            if !self.session_status.due(id, now) {
+            // An edged session is visited once, first, due or not.
+            if !edged_visit && (edged.contains(&id) || !self.session_status.due(id, now)) {
                 continue;
             }
             let (master, pid) = (session.master, session.pid);
@@ -3193,7 +3323,11 @@ impl crate::App {
             // path, and `next_wake`'s structural clamp — which floors every
             // armed instant at `next_due` — has nothing to floor against.
             let Ok(guard) = session.term.try_lock() else {
-                self.session_status.note_skipped(id, now);
+                if edged_visit {
+                    self.session_factory.edge_inbox.push(id);
+                } else {
+                    self.session_status.note_skipped(id, now);
+                }
                 continue;
             };
             // Two field reads and a block peek, then the lock is released:
@@ -3206,9 +3340,12 @@ impl crate::App {
             let shell = shell_evidence(&guard);
             let reports_commands = crate::quit_safety::shell_reports_commands(&guard);
             // `status integration=degraded`, from the SAME guard: the lost
-            // key the tab's notice speaks for (`integration_notice`).
-            let integration_degraded = guard.shell_integration_posture()
-                == aterm_core::terminal::ShellIntegrationPosture::Degraded;
+            // key the tab's notice speaks for (`integration_notice`). Read
+            // once, with the engine's other session-log facts (phase 3B:
+            // notifications, bells, progress), written once it is released.
+            let engine = crate::session_log::observed::EngineRead::of(&guard);
+            let integration_degraded =
+                engine.integration == aterm_core::terminal::ShellIntegrationPosture::Degraded;
             let completed_block = completed_block(&guard);
             let alt_screen = guard.is_alternate_screen();
             let content_seq = guard.content_seq();
@@ -3217,8 +3354,16 @@ impl crate::App {
             let resize_probe = crate::resize_ledger::EngineProbe::sample(&guard);
             let detail = executing_detail(&guard);
             // The cwd report the engine holds, witnessed below under the group
-            // this sweep finds in front (`SessionTimeline::witness_cwd_report`).
+            // this sweep finds in front (`SessionTimeline::witness_cwd_report`),
+            // with the group in front read under this SAME hold: one `tcgetpgrp`
+            // ioctl, the reader's wait no longer than it. A front that moved
+            // between this read and the sweep's own one below names no group.
             let cwd_report = guard.reported_cwd_seq();
+            let cwd_group = if master >= 0 {
+                (self.session_factory.fg_probe)(master)
+            } else {
+                -1
+            };
             // THE PROGRAM'S OWN STATE (OSC 7501): one copy under this guard,
             // gated below once the foreground move is known.
             let program_report = guard.program_state();
@@ -3365,15 +3510,18 @@ impl crate::App {
             // outcome moved, which dwell already bounds, so the bounded ring
             // is not flooded by a spinner.
             let status_event = status_changed
-                .then(|| self.session_status.take_status_event(id))
+                .then(|| self.session_status.take_status_transition(id))
                 .flatten();
-            if let Some(payload) = status_event.as_ref() {
-                session
+            if let Some((payload, facts)) = status_event.as_ref() {
+                let mut timeline = session
                     .ctx
                     .timeline
                     .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .record(STATUS_CHANGE, payload.clone());
+                    .unwrap_or_else(|p| p.into_inner());
+                timeline.record(STATUS_CHANGE, payload.clone());
+                // THE SESSION LOG's typed `status` mark, in the same hold.
+                let at = timeline.slog().now();
+                timeline.slog_mut().observe_status(*facts, at);
             }
             // PROGRAM IDENTITY + AGENT VERDICT. The foreground group is one
             // `tcgetpgrp` (the job probe above asked the same question); only
@@ -3404,11 +3552,13 @@ impl crate::App {
                     .timeline
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
-                timeline.witness_cwd_report(cwd_report, pgid);
-                (
-                    timeline.sweep_slog(&blocks, seen, pid, pgid),
-                    timeline.slog_wake(),
-                )
+                timeline.witness_cwd_report(cwd_report, pgid, cwd_group);
+                let previous = timeline.sweep_slog(&blocks, seen, pid, pgid);
+                // The engine's marks (phase 3B), on what is open once the
+                // blocks and the foreground move were written.
+                let at = timeline.slog().now();
+                timeline.slog_mut().observe_engine(&engine, at);
+                (previous, timeline.slog_wake())
             };
             self.session_status.slog_wakes.note(id, wake);
             let group_changed = previous_group.is_some();
@@ -3442,9 +3592,28 @@ impl crate::App {
             // The disk tick's roster reads it on the host's thread: a vendor
             // `codex` under `node` is named by its report alone.
             if program_state_moved {
+                let shown = self
+                    .session_status
+                    .program_state(id)
+                    .map(|(state, _)| state);
+                // THE PROGRAM'S TURN LEDGER: every honoured move is one
+                // display-only `program-state` row on the session's timeline
+                // (`SessionTimeline::note_program_state`). A leaf lock; nothing
+                // reads the row for a decision.
+                session
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .note_program_state(shown);
+                if shown.is_some_and(|state| {
+                    state.state == aterm_core::terminal::program_state::ProgramStateWord::Done
+                }) {
+                    program_done.push(id);
+                }
                 crate::harness_host::note_codex_report(
                     session.ctx.self_id.as_str(),
-                    self.session_status.program_state(id).is_some(),
+                    shown.is_some(),
                 );
             }
             if let Some(previous) = previous_group {
@@ -3454,10 +3623,12 @@ impl crate::App {
                 // wakes nothing else it would capture on.
                 self.crash_journal.note_activity();
             }
+            // An edged visit owes a naming as a moved group does: its edge may
+            // be an `exec` in place, which moves no group (card engine §3.5).
             let resolve = pgid > 0
                 && self.session_status.program_due(
                     id,
-                    group_changed,
+                    group_changed || edged_visit,
                     program.as_deref(),
                     generation,
                     now,
@@ -3505,6 +3676,7 @@ impl crate::App {
                 },
                 pgid,
                 now,
+                &footer_wake,
             );
             // THE LOST INTEGRATION (`integration_notice`): while the posture
             // is degraded, what gives it back — the tab's re-key channel, the
@@ -3538,6 +3710,9 @@ impl crate::App {
             if blocks.more {
                 self.session_status.owe_look(id);
             }
+            // The grid the read was taken at, under its guard: a re-grid's
+            // text is no move of the program's (`AgentPublication::text_moves`).
+            let grid = (resize_probe.lifetime, resize_probe.ordinal);
             let moved = match (step.publish, stamp) {
                 (Some((word, detail, subject, reader)), Some(stamp)) => {
                     let (moved, wake) = {
@@ -3546,7 +3721,22 @@ impl crate::App {
                             .timeline
                             .lock()
                             .unwrap_or_else(|p| p.into_inner());
+                        // THE SESSION LOG (phase 3B): a turn a person
+                        // stopped closes `out=interrupted` (told before
+                        // the verdict that settles it); the context left
+                        // and the goal are marked on the run it published.
+                        if step.turn.interrupted {
+                            timeline.slog_mut().agent_interrupted();
+                        }
+                        timeline.set_gauges(step.gauges);
+                        timeline.note_grid(grid, now);
                         let moved = timeline.publish_agent(word, detail, subject, reader, stamp);
+                        let at = timeline.slog().now();
+                        timeline.slog_mut().observe_screen_facts(
+                            step.turn.ctx_pct,
+                            step.turn.goal,
+                            at,
+                        );
                         (moved, timeline.slog_wake())
                     };
                     // The session log's settle wake, owed by the loop
@@ -3557,12 +3747,13 @@ impl crate::App {
                 // Read, and the zone was unchanged: the verdict stands on this
                 // newer screen.
                 (None, Some(stamp)) => {
-                    session
+                    let mut timeline = session
                         .ctx
                         .timeline
                         .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .note_agent_stamp(stamp);
+                        .unwrap_or_else(|p| p.into_inner());
+                    timeline.note_grid(grid, now);
+                    timeline.note_agent_stamp(stamp);
                     false
                 }
                 _ => false,
@@ -3572,7 +3763,8 @@ impl crate::App {
             // At the word's own instant: no clock is read here.
             if moved {
                 let arm = self.harness_ab_arm(id);
-                self.harness_screen.note_phase(id, &session.ctx, arm);
+                let glass = self.harness_ab_glass(id);
+                self.harness_screen.note_phase(id, &session.ctx, arm, glass);
             }
             // THE RESIZE LEDGER, evaluated on this sweep so a `render` verdict
             // transition lands on the timeline (and wakes the digest) without
@@ -3606,14 +3798,25 @@ impl crate::App {
             } else {
                 None
             };
-            let backfilled = journal.is_some_and(|copy| {
-                session
+            // A render mark the backfill writes comes after the wake was
+            // taken above: it takes its own (addendum A22).
+            let (backfilled, backfill_logged) = journal.map_or((false, false), |copy| {
+                let mut timeline = session
                     .ctx
                     .timeline
                     .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .ingest_resizes(&copy, None, now_ms)
+                    .unwrap_or_else(|p| p.into_inner());
+                (
+                    timeline.ingest_resizes(&copy, None, now_ms),
+                    timeline.slog_take_wake(),
+                )
             });
+            let log_moved = log_moved || backfill_logged;
+            // The sweep's moves reach the tab's clause (phase 3B; addendum
+            // A12 item 4), refreshed below once the pool is let go.
+            if log_moved && self.clause_moved(id) {
+                clauses_moved.push(id);
+            }
             if (moved || render_moved || backfilled || status_event.is_some() || log_moved)
                 && self.subscribers.any()
             {
@@ -3630,6 +3833,41 @@ impl crate::App {
             {
                 changed.push(id);
             }
+            // A CITATION'S HOVER answered under another naming of the group in
+            // front (`HoverMemo::renamed`): re-asked once the pool is let go
+            // (below). Only a window hovering this session's citation pays the
+            // leaf lock.
+            if self.windows.values().any(|ws| {
+                ws.hover_memo
+                    .as_ref()
+                    .is_some_and(|memo| memo.answered_citation_of(id))
+            }) {
+                let timeline = session
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let named = (
+                    timeline.agent().program_pgid,
+                    timeline.agent().program.as_deref(),
+                );
+                if self.windows.values().any(|ws| {
+                    ws.hover_memo
+                        .as_ref()
+                        .is_some_and(|memo| memo.renamed(id, named))
+                }) {
+                    hovers_renamed.push(id);
+                }
+            }
+        }
+        for id in hovers_renamed {
+            self.reask_renamed_hovers(id);
+        }
+        for id in clauses_moved {
+            self.refresh_session_status_chrome(id);
+        }
+        for id in program_done {
+            self.note_program_done(id, now);
         }
         // A cleared proven claim moves what a released one moves (the
         // `Wake::MetaChanged` arm) and is pushed as `EVENT meta`.
@@ -3776,14 +4014,19 @@ impl crate::App {
         // A carried exit's event is taken and dropped: consumed, so no later
         // sweep records it either.
         let event = moved
-            .then(|| self.session_status.take_status_event(session))
+            .then(|| self.session_status.take_status_transition(session))
             .flatten()
             .filter(|_| carried.is_none());
-        if let Some(payload) = event {
-            timeline
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .record(STATUS_CHANGE, payload);
+        if let Some((payload, facts)) = event {
+            {
+                let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
+                timeline.record(STATUS_CHANGE, payload);
+                // THE SESSION LOG's typed `status` mark, in the same hold;
+                // the notify below wakes its watchers too.
+                let at = timeline.slog().now();
+                timeline.slog_mut().observe_status(facts, at);
+                let _ = timeline.slog_take_wake();
+            }
             if self.subscribers.any() {
                 self.subscribers
                     .lock()
@@ -4025,11 +4268,12 @@ impl crate::App {
     /// from the session fabric leaf, `detail` from one non-blocking terminal
     /// read or the last observed status, and `revision=0` until classified.
     ///
-    /// And one the record does not carry, `hold_origin=<fleet|local|fleet,local|->`,
-    /// from the same read of the same leaf: whose holds stand — both, when the
-    /// fleet halted a session the owner had held. The bridge converges the
-    /// FLEET slot with the bus and must never lift the owner's LOCAL one, which
-    /// `hold=` alone cannot tell apart from it. (A bridge from before the token,
+    /// And one the record does not carry, `hold_origin=` (`person`, `fleet`,
+    /// `local`, comma-joined in that order, or `-`), from the same read of the
+    /// same leaf: whose holds stand — several, when the fleet halted a session
+    /// the owner had held or the person took over. The bridge converges the
+    /// FLEET slot with the bus and must never lift the owner's LOCAL one or the
+    /// PERSON'S, which `hold=` alone cannot tell apart from it. (A bridge from before the token,
     /// or from before two slots meeting `fleet,local`, reads the row as
     /// malformed and retries that session's `status`.)
     fn fabric_status_fields(&self, session: u64) -> Option<String> {
@@ -4117,6 +4361,9 @@ impl crate::App {
             .map_or_else(|| "-".to_string(), |h| h.reason);
         let fabric = crate::fabric::fabric_state();
         let fabric_tail = crate::fabric::fabric_status_tail();
+        // `fleet=` (2026-10-15), after the fabric's tail: the INSTANCE's fleet
+        // listener (`crate::fleet_listen`), one leaf-mutex read.
+        let fleet = crate::fleet_listen::fleet_status_word();
         // IDENTITY (session identities, 2026-09-17), additive and LAST: the
         // agent identity the session was spawned under — the same word the
         // `sessions` roster carries, from the same spawn-time field — `-` for
@@ -4302,6 +4549,15 @@ impl crate::App {
             self.session_status.input_stall(session),
             self.session_status.input_armed(session),
         );
+        // `disk= disk_free_mb= disk_room_mb= disk_age_ms=` (2026-10-17), right
+        // after the input fields: the volume holding this session's working
+        // directory, as the disk watch last measured it — from the disk
+        // board under its leaf lock, no I/O ([`crate::disk_board`]). Facts
+        // about the machine: the presence `level=` does not move for them.
+        let input = format!(
+            "{input} {}",
+            crate::disk_board::status_fields(session, reported_cwd.as_deref())
+        );
         // THE PROGRAM AND THE AGENT VERDICT (`program= agent= agent_detail=
         // agent_rev= agent_since_ms=`): the sweep's publication, read from the
         // session timeline — the same store the `sessions` row, `await agent`
@@ -4322,7 +4578,15 @@ impl crate::App {
         // before the stamp: the reader's head and epoch (a `since=` every read
         // takes), the open path, and the most urgent observed need
         // ([`crate::session_log::SessionLog::status_fields`]).
-        let (agent, resize, (supervised_agent, group), last_act, face, slog) = {
+        //
+        // `task_state=<working|done|exited|stalled|-> task_rev=<n>` (2026-10-15),
+        // from the same leaf lock and printed after `pause=`: the session's
+        // task record ([`crate::task_record`]) — what a manager polls a worker
+        // for, `-`/`0` for a session with no task. Named apart from `task=`
+        // (below), the task's face under Land, which is another fact: the
+        // record is the task a worker was spawned with and how it ended; the
+        // face is how its loop's landing stands for this window's host.
+        let (agent, resize, task_record, (supervised_agent, group), last_act, face, pause, slog) = {
             let mut timeline = pooled
                 .ctx
                 .timeline
@@ -4333,12 +4597,14 @@ impl crate::App {
             (
                 timeline.agent().wire_fields(),
                 timeline.resize_status_fields(resize_probe, crate::turn_ledger::now_ms()),
+                crate::task_record::status_tokens(timeline.task()),
                 (
                     crate::harness_host::agent_of(timeline.agent()),
                     timeline.agent().program_pgid,
                 ),
                 timeline.last_act().unwrap_or("-").to_string(),
                 timeline.task_face().map(|(face, _)| face),
+                timeline.pause(),
                 slog,
             )
         };
@@ -4368,6 +4634,10 @@ impl crate::App {
         let land_at =
             crate::autopilot::land_at_field(land_at.filter(|_| supervised_agent.is_some()));
         let task = crate::autopilot::task_field(face, claimed_here, supervised_agent);
+        // `pause=<unix s|->` (2026-10-17, design §10.5.1), right after
+        // `task=` and under its rule: the unix second the loop's pause after
+        // short turns ends, as it last told this window's host.
+        let pause = crate::autopilot::pause_field(pause, claimed_here, supervised_agent);
         // `human_ms=<ms|->`, just after `supervisor=`: how long ago a PERSON
         // last had a hand on this session through a window
         // ([`crate::human_input`]; control verbs never stamp it), `-` for
@@ -4395,6 +4665,26 @@ impl crate::App {
         // — plain field reads, no lock, no classifier — so the poll pays nothing
         // it did not already pay.
         let presence = self.presence_status_tail(session);
+        // `needs=<word|-> hold_by=<person|local|bridge|->` (2026-10-16; the
+        // person's is Take Over, design §4), after the
+        // presence tail: the published need verdict (`crate::needs`), what the
+        // menu bar, the survey and every reader read — one leaf-lock read, no
+        // classifier. `hold=` keeps its `0|1` (the harness's halt loop reads it).
+        let (needs, hold_by) = {
+            let timeline = pooled
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let need = timeline.need();
+            (need.needs_word(), need.hold_word())
+        };
+        // `typed_by=<pct|-> typed_ms=<ms|->` (S9), right after `hold_by=`: who
+        // last typed into it over the socket, named here, and how long ago.
+        let typed = crate::typed_by::wire(
+            self.typed_by(&pooled.ctx).as_ref(),
+            aterm_time::unix_millis().unwrap_or(0),
+        );
         // `path=<frozen|live>` (2026-09-22), after `story=` and BEFORE the
         // `seq=`/`hash=` stamp, which stays last by contract: whether this
         // session's shell fronts aterm's managed `agents/` on PATH. `frozen` is
@@ -4468,12 +4758,12 @@ impl crate::App {
                  phase=unknown since_ms=- outcome=none exit_code=- signal=- detail={} \
                  confidence=unknown reasons=- attribution={} fs_consent={} conflict=false \
                  revision=0 enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
-                 fabric={fabric} {fabric_tail} \
-                 identity={identity} {presence} path={path} {agent} program_state={program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
+                 fabric={fabric} {fabric_tail} fleet={fleet} \
+                 identity={identity} {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} program_state={program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
                  {input} supervisor={supervisor} autopilot={autopilot} human_ms={human_ms} \
                  human_seq={human_seq} {launch} {owner} \
                  history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \
-                 land_at={land_at} task={task} {slog} gen={generation} seq={seq} hash={hash}",
+                 land_at={land_at} task={task} pause={pause} {task_record} {slog} gen={generation} seq={seq} hash={hash}",
                 opt(subject.as_deref()),
                 opt(detail.as_deref()),
                 consent.attribution.as_str(),
@@ -4507,12 +4797,12 @@ impl crate::App {
              phase={} since_ms={since_ms} outcome={} exit_code={exit_code} signal={signal} \
              detail={} confidence={} reasons={reasons} attribution={} fs_consent={} \
              conflict={} revision={} enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
-             fabric={fabric} {fabric_tail} \
-             identity={identity} {presence} path={path} {agent} program_state={program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
+             fabric={fabric} {fabric_tail} fleet={fleet} \
+             identity={identity} {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} program_state={program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
              {input} supervisor={supervisor} autopilot={autopilot} human_ms={human_ms} \
              human_seq={human_seq} {launch} {owner} \
              history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \
-             land_at={land_at} task={task} {slog} gen={generation} seq={seq} hash={hash}",
+             land_at={land_at} task={task} pause={pause} {task_record} {slog} gen={generation} seq={seq} hash={hash}",
             opt(subject.as_deref()),
             status.phase.as_str(),
             status.last_outcome.as_str(),
@@ -4649,6 +4939,13 @@ mod idle_cost_tests {
 #[cfg(test)]
 #[path = "session_status_tests.rs"]
 mod tests;
+
+/// THE EDGED INBOX (card engine §3.5), driven through the real sweep: an
+/// edged session is named on the next wake, due or not, and a contended
+/// visit is retried with no interval charged.
+#[cfg(test)]
+#[path = "session_status_edge_inbox_tests.rs"]
+mod edge_inbox_tests;
 
 /// THE SERVER-PUBLISHED AGENT VERDICT and PROGRAM IDENTITY, driven through the
 /// real sweep (`App::observe_session_statuses`) on a headless App.

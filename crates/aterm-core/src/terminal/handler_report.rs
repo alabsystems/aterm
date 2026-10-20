@@ -502,6 +502,19 @@ mod color_scheme_tests {
         term.set_color_scheme(Appearance::Dark);
         assert!(term.take_response().is_none(), "unchanged scheme = no push");
     }
+
+    // The 2031 push is a report sent unasked, so a host takes it apart from the
+    // replies (`take_reports`); the answer to the 996 query stays a reply.
+    #[test]
+    fn the_2031_push_is_a_report_and_the_996_answer_a_reply() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?2031h");
+        term.set_color_scheme(Appearance::Light);
+        term.process(b"\x1b[?996n");
+        assert_eq!(term.take_reports().unwrap_or_default(), b"\x1b[?997;2n");
+        assert_eq!(drain(&mut term), b"\x1b[?997;2n", "the answer");
+        assert!(term.take_reports().is_none());
+    }
 }
 
 #[cfg(test)]

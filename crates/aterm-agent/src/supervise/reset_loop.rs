@@ -570,6 +570,7 @@ impl<C: Ctl> Session<'_, C> {
             left: row.left,
             day_start: self.reset_day_start(&row.day),
             day: row.day,
+            kind: row.kind,
         };
         if self.halted {
             self.park_on_hold("the session is held: no reset is claimed", seq, review)?;
@@ -623,10 +624,15 @@ impl<C: Ctl> Session<'_, C> {
     /// no title, and is Escaped. A box the policy was handed stays the
     /// policy's while the reads go on showing a box, so one box never
     /// changes hands. NEVER a box that offers an answer kept for good, read by
-    /// its role or its label as the press gate reads it ([`kept_for_good`]: a
-    /// frame whose roles the reader withheld, two cursors mid-move, still
-    /// offers one), nor a box whose head is off the screen and that reads no
-    /// Esc, a frame still being drawn: it reads as one ([`Shows::Unread`]),
+    /// its role, its label or its rows as the press gate reads it
+    /// ([`kept_for_good`]: a frame whose roles the reader withheld, two
+    /// cursors mid-move, still offers one, and so does a narrow pane's whose
+    /// wrap joined the focused label onto the next option, `❯ Use this and
+    /// all future MCP servers in this project` over `Continue without using
+    /// this MCP server`; its rows are read again as defence in depth, the
+    /// reader's role already [`aterm_phase::prompt::Role::Persist`] where it
+    /// reads roles), nor a box whose head is off the screen and that reads
+    /// no Esc, a frame still being drawn: it reads as one ([`Shows::Unread`]),
     /// never keyed. Claude Code's MCP server dialogs save their Esc as a
     /// refusal for good (2.1.301). Read as one, its kind is
     /// `McpServer`, never [`PromptKind::Other`]; retitled or cut, the
@@ -680,7 +686,7 @@ impl<C: Ctl> Session<'_, C> {
             None if self.reset_owed().is_some_and(|owed| !owed.entered)
                 && rows
                     .iter()
-                    .any(|row| row.trim() == aterm_phase::anchor("reset.confirm.title")) =>
+                    .any(|row| aterm_phase::is_confirm_title(row.trim())) =>
             {
                 Shows::Confirm(ConfirmRead::Inexact("options"), None)
             }
@@ -997,8 +1003,15 @@ impl<C: Ctl> Session<'_, C> {
     ) -> Result<Flow, Fail> {
         let waits = self.setup.reset_waits;
         let (seq, rows) = (screen.seq, &screen.rows);
-        let title = aterm_phase::anchor("reset.confirm.title");
-        let bound_to = rows.iter().position(|row| row.trim() == title).or_else(|| {
+        // The title as drawn (`Use your reset?`, 2.1.304's `Use a <kind>?`),
+        // the declined row's word in the ledger.
+        let titled = rows
+            .iter()
+            .position(|row| aterm_phase::is_confirm_title(row.trim()));
+        let title = titled.map_or(aterm_phase::anchor("reset.confirm.title"), |row| {
+            rows[row].trim()
+        });
+        let bound_to = titled.or_else(|| {
             let prompt = prompt?;
             let yes = prompt
                 .options
@@ -1149,6 +1162,8 @@ impl<C: Ctl> Session<'_, C> {
         if std::mem::replace(&mut owed.yes_said, true) {
             return;
         }
+        // The ledger's one word for a yes taken, whatever build drew it
+        // (2.1.304's names its kind): what `approvals::reset_owed` reads back.
         let yes = aterm_phase::anchor("reset.yes");
         let approved = approvals::Outcome::Approved;
         self.ledger_row(RULE_LIMIT_RESET, approved, yes, head, seq);
@@ -1204,6 +1219,7 @@ impl<C: Ctl> Session<'_, C> {
             left: go.left,
             day_start: self.reset_day_start(&go.day),
             day: go.day.clone(),
+            kind: go.kind,
         };
         let word = match opts.idle_host.as_ref() {
             Some(host) if in_time => host.reset_take(&ask),

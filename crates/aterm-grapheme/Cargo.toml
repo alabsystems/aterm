@@ -8,6 +8,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Unicode grapheme cluster segmentation and width calculation for terminal text"
+# Integration tests are declared below, not discovered. With autotests off a
+# `tests/*.rs` file listed nowhere never compiles.
+autotests = false
 
 [dependencies]
 # TextShapingConfig used in production (width.rs) and in tests
@@ -20,3 +23,7 @@ aterm-models-core = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "grapheme_suite"
+path = "tests/grapheme_suite.rs"

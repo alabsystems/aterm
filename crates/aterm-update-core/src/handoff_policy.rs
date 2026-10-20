@@ -1853,8 +1853,11 @@ mod tests {
         let directory = scratch_bundle("directory", |path| {
             std::fs::create_dir_all(path).expect("mkdir")
         });
+        // Ignored on both: unix opens it and refuses what it opened, Windows refuses
+        // to open a directory as a file at all (access denied).
+        let why_directory = if cfg!(unix) { "regular" } else { "unreadable" };
         assert!(
-            matches!(read_from_bundle(&directory), PolicyRead::Ignored(why) if why.contains("regular"))
+            matches!(read_from_bundle(&directory), PolicyRead::Ignored(why) if why.contains(why_directory))
         );
 
         #[cfg(unix)]

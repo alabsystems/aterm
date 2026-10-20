@@ -89,7 +89,10 @@
 //! Passing a block to a framework method needs no encoding, so
 //! `RcBlock::as_ptr`'s `*mut c_void` suffices. A block crossing a boundary this
 //! crate declares (a method registered through `class_addMethod`, or another
-//! block's arguments) needs `"@?"`, not `"^v"`: that is [`BlockPtr`].
+//! block's arguments) needs `"@?"`, not `"^v"`: that is [`BlockPtr`]. A block a
+//! framework hands a declared method (a delegate's completion handler) is
+//! called through its header's `invoke` slot ([`BlockPtr::call0`],
+//! [`BlockPtr::call1`]).
 //!
 //! # Not provided
 //!
@@ -174,6 +177,65 @@ impl BlockPtr {
     #[must_use]
     pub const fn from_ptr(ptr: *mut c_void) -> Self {
         Self(ptr)
+    }
+
+    /// Call a `void (^)(void)` block a framework handed a declared method — a
+    /// delegate's completion handler — through the `invoke` slot of its fixed
+    /// ABI header, as clang's call site does. A nil block is not called.
+    ///
+    /// # Safety
+    ///
+    /// `self` must be nil or a live block whose prototype is exactly
+    /// `void (^)(void)`. The block ABI carries no checkable signature.
+    pub unsafe fn call0(self) {
+        // SAFETY: forwarded; the prototype is the caller's.
+        unsafe {
+            if let Some(invoke) = self.invoke::<unsafe extern "C-unwind" fn(*mut c_void)>() {
+                invoke(self.0);
+            }
+        }
+    }
+
+    /// Call a `void (^)(A)` block a framework handed a declared method (a
+    /// completion handler taking one scalar, e.g. an options bitmask). A nil
+    /// block is not called.
+    ///
+    /// # Safety
+    ///
+    /// `self` must be nil or a live block whose prototype is exactly
+    /// `void (^)(A)`.
+    pub unsafe fn call1<A: crate::Encode>(self, a: A) {
+        // SAFETY: forwarded; the prototype is the caller's.
+        unsafe {
+            if let Some(invoke) = self.invoke::<unsafe extern "C-unwind" fn(*mut c_void, A)>() {
+                invoke(self.0, a);
+            }
+        }
+    }
+
+    /// The block's `invoke` slot as `F`, or `None` for a nil block. `"C-unwind"`
+    /// for the reason every send is: a raise inside the framework's block
+    /// unwinds through this frame to the caller's containment.
+    ///
+    /// # Safety
+    ///
+    /// `self` must be nil or a live block, and `F` the exact function type of
+    /// its `invoke`.
+    unsafe fn invoke<F: Copy>(self) -> Option<F> {
+        if self.0.is_null() {
+            return None;
+        }
+        const {
+            assert!(size_of::<F>() == size_of::<*const c_void>());
+        };
+        // SAFETY: every block begins with the fixed ABI header ([`BlockHeader`],
+        // the layout `_Block_copy` and clang agree on); `invoke` is its fourth
+        // field and is never null in a live block. `F` is a function pointer
+        // of the same width (asserted above), which the caller names exactly.
+        unsafe {
+            let invoke = (*self.0.cast::<BlockHeader>()).invoke;
+            (!invoke.is_null()).then(|| std::mem::transmute_copy::<*const c_void, F>(&invoke))
+        }
     }
 }
 
@@ -388,4 +450,139 @@ block_ctor! {
 block_ctor! {
     /// A two-argument block, e.g. a LaunchServices completion handler.
     new2, invoke2, a0: A0, a1: A1
+}
+
+/// A BLOCK'S C PROTOTYPE, NAMED: the `fn` type its `invoke` takes after the
+/// block itself, so `fn(Id)` is `void (^)(id)` and `fn(Bool, Id)` is
+/// `void (^)(BOOL, NSError *)`.
+///
+/// The block ABI carries no signature, so a wrong prototype is caught only
+/// where something else records one: a protocol's extended encoding
+/// (`@?<v@?@"NSError">`). A call site that names its block's prototype as an
+/// alias builds the block with [`RcBlock::of`], or calls a framework's with
+/// [`BlockPtr::call`], both held to the alias by type, and a test holds the
+/// alias to that record ([`crate::send::block_check`]).
+///
+/// Implemented for `fn() -> R`, `fn(A0) -> R` and `fn(A0, A1) -> R`, the
+/// arities [`RcBlock`] builds.
+pub trait BlockFn: Copy {
+    /// The arguments, as a tuple.
+    type Args;
+    /// The return type.
+    type Ret;
+
+    /// The block's signature as an extended encoding spells it, offsets
+    /// aside: the return, `@?` for the block itself, then each argument
+    /// (`v@?@` for `fn(Id)`).
+    fn types() -> String;
+
+    /// Call `block`'s `invoke` with `args`.
+    ///
+    /// # Safety
+    /// `block` must be a live, non-nil block whose prototype is exactly this.
+    #[doc(hidden)]
+    unsafe fn call_block(block: BlockPtr, args: Self::Args) -> Self::Ret;
+}
+
+/// A closure [`RcBlock::of`] makes a block of prototype `P` from: an `Fn`
+/// taking exactly `P`'s arguments and returning its return, so a closure
+/// whose parameters disagree with the alias does not compile.
+pub trait IntoBlock<P: BlockFn> {
+    /// The heap block.
+    ///
+    /// # Safety
+    /// As [`RcBlock::new1`]: `P` must be exactly what the framework calls the
+    /// block with.
+    #[doc(hidden)]
+    unsafe fn into_block(self) -> Option<RcBlock>;
+}
+
+/// One [`BlockFn`] and [`IntoBlock`] pair per arity.
+macro_rules! block_fn {
+    ($ctor:ident $(, $a:ident : $A:ident)*) => {
+        impl<R: crate::Encode, $($A: crate::Encode),*> BlockFn for fn($($A),*) -> R {
+            type Args = ($($A,)*);
+            type Ret = R;
+
+            fn types() -> String {
+                let mut types = String::from(R::ENCODING);
+                types.push_str("@?");
+                $(types.push_str($A::ENCODING);)*
+                types
+            }
+
+            unsafe fn call_block(block: BlockPtr, ($($a,)*): Self::Args) -> R {
+                // SAFETY: the caller pins `block` as live, non-nil and of
+                // exactly this prototype, so `invoke` is this function type.
+                unsafe {
+                    let invoke = block
+                        .invoke::<unsafe extern "C-unwind" fn(*mut c_void $(, $A)*) -> R>()
+                        .expect("BlockFn::call_block on a nil block");
+                    invoke(block.0 $(, $a)*)
+                }
+            }
+        }
+
+        impl<R, $($A,)* F> IntoBlock<fn($($A),*) -> R> for F
+        where
+            F: Fn($($A),*) -> R + 'static,
+            R: crate::Encode + crate::InertZero,
+            $($A: crate::Encode,)*
+        {
+            unsafe fn into_block(self) -> Option<RcBlock> {
+                // SAFETY: forwarded; the prototype is the caller's.
+                unsafe { RcBlock::$ctor(self) }
+            }
+        }
+    };
+}
+block_fn!(new0);
+block_fn!(new1, a0: A0);
+block_fn!(new2, a0: A0, a1: A1);
+
+impl RcBlock {
+    /// A block of prototype `P` (a [`BlockFn`] alias) from `closure`, which
+    /// must take exactly `P`'s arguments: the constructor that keeps a call
+    /// site's block and the alias a test checks the same type.
+    ///
+    /// ```
+    /// # use aterm_objc::{Id, RcBlock};
+    /// /// `void (^)(NSError *)`.
+    /// type Done = fn(Id);
+    /// // SAFETY: never invoked.
+    /// let block = unsafe { RcBlock::of::<Done, _>(|_error: Id| {}) };
+    /// assert!(block.is_some());
+    /// ```
+    ///
+    /// ```compile_fail
+    /// # use aterm_objc::{Id, RcBlock};
+    /// type Done = fn(Id);
+    /// // A closure that disagrees with its alias is refused.
+    /// let _ = unsafe { RcBlock::of::<Done, _>(|_status: isize| {}) };
+    /// ```
+    ///
+    /// # Safety
+    /// As [`RcBlock::new1`]: `P` must be exactly what the framework calls the
+    /// block with.
+    #[must_use]
+    pub unsafe fn of<P: BlockFn, F: IntoBlock<P>>(closure: F) -> Option<Self> {
+        // SAFETY: forwarded; the prototype is the caller's.
+        unsafe { closure.into_block() }
+    }
+}
+
+impl BlockPtr {
+    /// Call a framework's block as prototype `P` (a [`BlockFn`] alias), as
+    /// [`Self::call0`] and [`Self::call1`] do for theirs: the call that keeps
+    /// a delegate's call site and the alias a test checks the same type. A nil
+    /// block is not called.
+    ///
+    /// # Safety
+    /// `self` must be nil or a live block whose prototype is exactly `P`.
+    pub unsafe fn call<P: BlockFn<Ret = ()>>(self, args: P::Args) {
+        if !self.0.is_null() {
+            // SAFETY: non-nil, and the caller pins it live and of `P`.
+            unsafe { P::call_block(self, args) }
+        }
+    }
 }

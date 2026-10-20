@@ -54,6 +54,68 @@ pub const INVALID: u32 = 0xffff_ffff;
 /// `XKB_KEY_NoSymbol`.
 pub const NO_SYMBOL: Keysym = 0;
 
+/// Return `true` when `idx != INVALID`.
+#[must_use]
+pub const fn is_valid_xkb_index(idx: u32) -> bool {
+    idx != INVALID
+}
+
+/// Return `true` when `sym != NO_SYMBOL`.
+#[must_use]
+pub const fn is_valid_keysym(sym: Keysym) -> bool {
+    sym != NO_SYMBOL
+}
+
+/// Encode an XKB key event snapshot (`keycode`, `keysym`, `mods`, `layout`) into 16 LE bytes.
+#[must_use]
+pub const fn encode_xkb_key_event_le(
+    keycode: Keycode,
+    keysym: Keysym,
+    mods: ModMask,
+    layout: LayoutIndex,
+) -> [u8; 16] {
+    [
+        keycode as u8,
+        (keycode >> 8) as u8,
+        (keycode >> 16) as u8,
+        (keycode >> 24) as u8,
+        keysym as u8,
+        (keysym >> 8) as u8,
+        (keysym >> 16) as u8,
+        (keysym >> 24) as u8,
+        mods as u8,
+        (mods >> 8) as u8,
+        (mods >> 16) as u8,
+        (mods >> 24) as u8,
+        layout as u8,
+        (layout >> 8) as u8,
+        (layout >> 16) as u8,
+        (layout >> 24) as u8,
+    ]
+}
+
+/// Decode 16 LE bytes into an XKB key event snapshot (`keycode`, `keysym`, `mods`, `layout`).
+#[must_use]
+pub const fn decode_xkb_key_event_le(bytes: [u8; 16]) -> (Keycode, Keysym, ModMask, LayoutIndex) {
+    let kc = (bytes[0] as u32)
+        | ((bytes[1] as u32) << 8)
+        | ((bytes[2] as u32) << 16)
+        | ((bytes[3] as u32) << 24);
+    let ks = (bytes[4] as u32)
+        | ((bytes[5] as u32) << 8)
+        | ((bytes[6] as u32) << 16)
+        | ((bytes[7] as u32) << 24);
+    let mods = (bytes[8] as u32)
+        | ((bytes[9] as u32) << 8)
+        | ((bytes[10] as u32) << 16)
+        | ((bytes[11] as u32) << 24);
+    let layout = (bytes[12] as u32)
+        | ((bytes[13] as u32) << 8)
+        | ((bytes[14] as u32) << 16)
+        | ((bytes[15] as u32) << 24);
+    (kc, ks, mods, layout)
+}
+
 /// The modifier names (`XKB_MOD_NAME_*`).
 pub mod mod_name {
     use std::ffi::CStr;

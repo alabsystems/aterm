@@ -1,0 +1,17 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a UserPromptSubmit hook answering {"continue": false, "stopReason": "<108 characters> Usage limit reached · resets 3pm"}: Claude Code's `⏺ Operation stopped by hook: …` row WRAPS, its continuation row at column 2 opening with the hook's `Usage limit reached · resets 3pm`
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ hello there
+
+⏺ Operation stopped by hook: the nightly pipeline finished its integration suite and the deploy gate reported back to the build bot that
+  Usage limit reached · resets 3pm
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts                                                                                                  0 tokens

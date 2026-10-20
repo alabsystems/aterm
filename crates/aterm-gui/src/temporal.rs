@@ -437,6 +437,13 @@ pub(crate) struct TemporalRecorder {
     /// reveal history that the recorded conhost repaint then paints over: the
     /// replayed engine would lose lines the live one kept.
     resize_policy: ResizePolicy,
+    /// Whether the session's console host leaves a dead app's alternate screen
+    /// itself (OpenConsole, `crate::alt_screen_resync`), which every replay
+    /// folds under: the live engine leaves such a screen only at the host's
+    /// forwarded `?1049l`, recorded later in the spine, so a replay that left
+    /// it locally at the prompt would draw that prompt where the live one never
+    /// had it. A fact of the session's host, held once like `resize_policy`.
+    host_resyncs_alt_screen: bool,
     /// Set on an ADOPTED session's recorder (round five, item 17): the spine
     /// starts at a seamless update — its t0 keyframe is the screen the update
     /// restored, and nothing before it was recorded here. Reported by
@@ -470,6 +477,7 @@ impl TemporalRecorder {
             bytes_since_keyframe: 0,
             epoch: Instant::now(), // recorder timeline epoch, not engine state
             resize_policy: ResizePolicy::Native,
+            host_resyncs_alt_screen: false,
             handoff: None,
         }
     }
@@ -494,6 +502,13 @@ impl TemporalRecorder {
     /// resizes with. Set by the reader attach from the session's PTY backend.
     pub(crate) fn set_resize_policy(&mut self, policy: ResizePolicy) {
         self.resize_policy = policy;
+    }
+
+    /// Replay under the live engine's alternate-screen recovery: `on` for a
+    /// session whose console host leaves a dead app's screen itself
+    /// (`crate::alt_screen_resync::host_resyncs`). Set by the reader attach.
+    pub(crate) fn set_host_resyncs_alt_screen(&mut self, on: bool) {
+        self.host_resyncs_alt_screen = on;
     }
 
     /// The current tick on this recorder's timeline (micros since the epoch).
@@ -832,7 +847,8 @@ impl TemporalRecorder {
     /// fresh headless [`Terminal`] from the nearest retained keyframe with
     /// `ts <= at`, then folds the recorded `RawIn`/`Resize` events forward in seq
     /// order through `process`/`resize_with_policy` (under the session's seam
-    /// policy, [`Self::set_resize_policy`]); `Reply` is NOT re-emitted (the design's
+    /// policy, [`Self::set_resize_policy`], and its host's alternate-screen
+    /// recovery, [`Self::set_host_resyncs_alt_screen`]); `Reply` is NOT re-emitted (the design's
     /// contract) and intermediate keyframes are skipped (already seeded from base).
     ///
     /// Returns `None` when the target is unreachable under bounded retention: the
@@ -850,6 +866,7 @@ impl TemporalRecorder {
         // why the two pick the same entry.
         let base = self.base_keyframe(at)?;
         let mut term = Terminal::from_checkpoint(&base.checkpoint);
+        term.set_host_resyncs_alt_screen(self.host_resyncs_alt_screen);
         // Fold every live event AFTER the seed with ts <= at, in seq order.
         //
         // TWO SCANS DELETED. The seek (`live_after`) starts at the base instead
@@ -1252,6 +1269,51 @@ mod tests {
         r.set_resize_policy(ResizePolicy::Native);
         let native = r.replay_at(None).expect("replay");
         assert_eq!(native.grid().scrollback_lines(), 3);
+    }
+
+    /// An OpenConsole session's killed pager replays under ITS recovery: the
+    /// live engine stays on the dead screen at the prompt and leaves at the
+    /// host's forwarded `?1049l`, so the replay must too, or it draws the
+    /// prompt on the primary screen the live one never put it on.
+    #[test]
+    fn replay_leaves_a_dead_alt_screen_under_the_sessions_host_recovery() {
+        let mut live = Terminal::new(6, 20);
+        live.set_host_resyncs_alt_screen(true);
+        let mut r = TemporalRecorder::new();
+        r.set_host_resyncs_alt_screen(true);
+        r.record_keyframe(live.checkpoint());
+        let mut feed = |live: &mut Terminal, bytes: &[u8]| {
+            live.process(bytes);
+            r.record_raw_in(bytes);
+        };
+        feed(
+            &mut live,
+            b"C:\\> less\r\n\x1b[?1049h\x1b[H\x1b[2Jpager 1\r\n:",
+        );
+        // The pager is killed; the shell prompts on the host's dead screen.
+        feed(
+            &mut live,
+            b"\r\n\x1b]133;A\x07C:\\Users\\me> \x1b]133;B\x07",
+        );
+        assert!(live.take_alt_screen_resync_request(), "precondition");
+        assert!(live.is_alternate_screen(), "precondition");
+        // The host's leave, forwarded, then the next command.
+        feed(&mut live, b"\x1b[?1049l");
+        feed(&mut live, b"dir\r\nx\r\n\x1b]133;A\x07C:\\Users\\me> ");
+        assert!(!live.is_alternate_screen(), "precondition");
+
+        let replayed = r.replay_at(None).expect("replay");
+        assert_eq!(screen_of(&replayed), screen_of(&live));
+        assert_eq!(
+            (replayed.cursor().row, replayed.cursor().col),
+            (live.cursor().row, live.cursor().col)
+        );
+
+        // Teeth: the same spine replayed with the local leave is not the
+        // live engine.
+        r.set_host_resyncs_alt_screen(false);
+        let local = r.replay_at(None).expect("replay");
+        assert_ne!(screen_of(&local), screen_of(&live));
     }
 
     #[test]

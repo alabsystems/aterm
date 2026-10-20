@@ -6,12 +6,12 @@
 //! ([`Shape::Package`], codex-alab) is never read here: a person packs and pins it.
 //!
 //! Per run, over the verified channel head (a head or pin below what this lane last saw
-//! refuses the run): a pure [`decide`] per program row (plain → tracked, bundle → human
-//! lane; a vendor-direct program has no row, so the lane never reads it); the packs,
-//! aarch64 first and every other Apple target merged onto a copy; the row gate (a
-//! half-packed release is never pinned); the coherence hold ([`super::hold`]); and one
-//! index whose delta is the ready builds. For trust, the gap to main is reported
-//! ([`super::gap`]).
+//! refuses the run): a pure [`decide`] per program row (plain → tracked, bundle → the bundle
+//! lane, which the agent cutting it runs on a release-credential machine; a vendor-direct
+//! program has no row, so the lane never reads it); the packs, aarch64 first and every
+//! other Apple target merged onto a copy; the row gate (a half-packed release is never
+//! pinned); the coherence hold ([`super::hold`]); and one index whose delta is the ready
+//! builds. For trust, the gap to main is reported ([`super::gap`]).
 //!
 //! What is built is what was signed: the lane builds beside the machine key, so it builds
 //! only the dev commit the publication engine's ledger maps to the public commit a
@@ -174,7 +174,7 @@ pub enum Decision {
     /// Staging already holds the build with every required row: the index remains.
     Index,
     /// A sysroot bundle: its pack command is printed, never run.
-    HumanLane {
+    BundleLane {
         /// The rows its pack must carry.
         required: BTreeSet<Triple>,
         /// What a staging release of it lacks.
@@ -211,7 +211,7 @@ impl Decision {
             Self::Unresolved(_) => "UNRESOLVED",
             Self::Ok | Self::Ahead => "OK",
             Self::Index => "INDEX",
-            Self::HumanLane { .. } => "HUMAN-LANE",
+            Self::BundleLane { .. } => "BUNDLE-LANE",
             Self::Blocked { .. } => "BLOCKED",
             Self::Pack { .. } => "PACK",
         }
@@ -253,7 +253,7 @@ pub fn decide(f: &Facts) -> Decision {
         return Decision::Index;
     }
     if matches!(f.program.shape, Shape::Bundle(_)) {
-        return Decision::HumanLane { required, missing };
+        return Decision::BundleLane { required, missing };
     }
     if f.latched {
         return Decision::Blocked { missing };
@@ -324,8 +324,8 @@ impl Row {
                  index is what remains",
                 upload::tag(self.program.name, build)
             ),
-            Decision::HumanLane { missing, .. } => format!(
-                "HUMAN-LANE: {tag} (build {build}) > pin {} — a sysroot bundle; its pack \
+            Decision::BundleLane { missing, .. } => format!(
+                "BUNDLE-LANE: {tag} (build {build}) > pin {} — a sysroot bundle; its pack \
                  command is below, never run here{}",
                 self.pin.unwrap_or(0),
                 lacks(missing, "the staging release lacks:")
@@ -573,13 +573,13 @@ fn locked(
             tx.say(g.line());
         }
     }
-    let human: Vec<&Row> = rows
+    let bundles: Vec<&Row> = rows
         .iter()
-        .filter(|r| matches!(r.decision, Decision::HumanLane { .. }))
+        .filter(|r| matches!(r.decision, Decision::BundleLane { .. }))
         .collect();
-    for r in &human {
+    for r in &bundles {
         tx.say(format!(
-            "HUMAN-LANE {} — on a rostered machine:",
+            "BUNDLE-LANE {} — the agent cutting it runs, on a release-credential machine (m2, m3):",
             r.program.name
         ));
         for line in bundle_command(r) {
@@ -619,12 +619,12 @@ fn locked(
         );
         tx.say(format!(
             "DRY_RUN — would pack: {}; would publish index {} pinning: {}; packed but HELD: {}; \
-             human lane: {}; no clone/build/sign/upload/state change",
+             bundle lane: {}; no clone/build/sign/upload/state change",
             list(candidates.iter().map(|r| r.program.name)),
             n + 1,
             list(pin_now.iter().copied()),
             list(held.iter().copied()),
-            list(human.iter().map(|r| r.program.name)),
+            list(bundles.iter().map(|r| r.program.name)),
         ));
         outcome.rows = rows.clone();
         return Ok(outcome);
@@ -632,22 +632,22 @@ fn locked(
 
     if candidates.is_empty() && pending.is_empty() {
         state.record(n, TARGETS, &pins)?;
-        write_sync(ctx, state, None, &[], &human, &gaps, horizon.as_deref())?;
+        write_sync(ctx, state, None, &[], &bundles, &gaps, horizon.as_deref())?;
         notify_gaps(ctx, opts, deps, state, &gaps);
-        if !human.is_empty() {
+        if !bundles.is_empty() {
             notice(
                 ctx,
                 opts,
                 deps,
                 state,
                 &format!(
-                    "human lane: {} have newer signed releases than their pins (see ALAB-SYNC.md)",
-                    list(human.iter().map(|r| r.program.name))
+                    "bundle lane: {} have newer signed releases than their pins (see ALAB-SYNC.md)",
+                    list(bundles.iter().map(|r| r.program.name))
                 ),
             );
         }
         tx.say(format!(
-            "every tracked program is at its newest signed release (or waits on the human lane) \
+            "every tracked program is at its newest signed release (or waits on the bundle lane) \
              — clean no-op{}",
             owed_note(&gaps)
         ));
@@ -696,7 +696,7 @@ fn locked(
     outcome.held = held.iter().map(|p| (*p).to_string()).collect();
     if pin_now.is_empty() {
         state.record(n, TARGETS, &pins)?;
-        write_sync(ctx, state, None, &[], &human, &gaps, horizon.as_deref())?;
+        write_sync(ctx, state, None, &[], &bundles, &gaps, horizon.as_deref())?;
         notify_gaps(ctx, opts, deps, state, &gaps);
         if !held.is_empty() {
             notice(
@@ -705,10 +705,10 @@ fn locked(
                 deps,
                 state,
                 &format!(
-                    "packed but HELD by a coherence group: {} — the human lane ({}) unblocks them \
+                    "packed but HELD by a coherence group: {} — the bundle lane ({}) unblocks them \
                      (see ALAB-SYNC.md)",
                     list(held.iter().copied()),
-                    list(human.iter().map(|r| r.program.name))
+                    list(bundles.iter().map(|r| r.program.name))
                 ),
             );
         }
@@ -723,10 +723,10 @@ fn locked(
             "done — packed this run: {}; held: {}; no index published (the group waits on: {})",
             list(outcome.packed.iter().map(String::as_str)),
             list(held.iter().copied()),
-            if human.is_empty() {
+            if bundles.is_empty() {
                 "the blocked members".to_string()
             } else {
-                list(human.iter().map(|r| r.program.name))
+                list(bundles.iter().map(|r| r.program.name))
             }
         ));
         return Ok(outcome);
@@ -747,10 +747,10 @@ fn locked(
     }
     if !not_ready.is_empty() || !held.is_empty() {
         tx.warn(format!(
-            "publishing with pins this run knowingly carries unmoved: held={} human-lane={} \
+            "publishing with pins this run knowingly carries unmoved: held={} bundle-lane={} \
              not-ready={}",
             list(held.iter().copied()),
-            list(human.iter().map(|r| r.program.name)),
+            list(bundles.iter().map(|r| r.program.name)),
             list(not_ready.iter().copied())
         ));
     }
@@ -791,7 +791,7 @@ fn locked(
         state,
         Some(published.index_build),
         &pinned,
-        &human,
+        &bundles,
         &gaps,
         horizon.as_deref(),
     )?;
@@ -807,10 +807,10 @@ fn locked(
     tx.say(&summary);
     notice(ctx, opts, deps, state, &summary);
     tx.say(format!(
-        "done — packed this run: {}; held: {}; human lane: {}; index {} live on {slug}",
+        "done — packed this run: {}; held: {}; bundle lane: {}; index {} live on {slug}",
         list(outcome.packed.iter().map(String::as_str)),
         list(held.iter().copied()),
-        list(human.iter().map(|r| r.program.name)),
+        list(bundles.iter().map(|r| r.program.name)),
         published.index_build
     ));
     outcome.pinned = pin_now.iter().map(|p| (*p).to_string()).collect();
@@ -1490,7 +1490,8 @@ fn notify_gaps(ctx: &Ctx, opts: &Options, deps: &Deps<'_>, state: &LaneState, ga
     }
 }
 
-/// The human lane's pack of a bundle, as a person runs it on a rostered machine: the
+/// The bundle lane's pack of a bundle, as the agent cutting it runs it on a release-credential
+/// machine (m2, m3; Trust DECISION_QUEUE D27, amended 2026-10-16: agents perform it): the
 /// `rustc` group's bundle is the group publish from one seal; any other bundle one
 /// `pack-bundle` leg per required target, aarch64 first and every other leg merged onto a
 /// copy of it, so the release it leaves is never half-packed.
@@ -1522,7 +1523,7 @@ pub fn bundle_command(row: &Row) -> Vec<String> {
         ));
     } else {
         let required = match &row.decision {
-            Decision::HumanLane { required, .. } => required.iter().copied().collect(),
+            Decision::BundleLane { required, .. } => required.iter().copied().collect(),
             _ => b.darwin.to_vec(),
         };
         let dir = format!("<out dir>/pack-{name}-{build}");
@@ -1566,7 +1567,7 @@ fn write_sync(
     state: &LaneState,
     published: Option<u64>,
     pinned: &[(&str, String, Build)],
-    human: &[&Row],
+    bundles: &[&Row],
     gaps: &[MainGap],
     horizon: Option<&str>,
 ) -> Result<()> {
@@ -1583,12 +1584,13 @@ fn write_sync(
                 .collect::<String>()
         ));
     }
-    if !human.is_empty() {
+    if !bundles.is_empty() {
         s.push_str(
-            "\nHUMAN LANE — sysroot bundles this lane never builds (the group they anchor is \
-             HELD until they land):\n",
+            "\nBUNDLE LANE — sysroot bundles this lane never builds: the agent cutting each runs \
+             its commands below on a release-credential machine (m2, m3), and the group they \
+             anchor is HELD until they land:\n",
         );
-        for r in human {
+        for r in bundles {
             if let Ok(rel) = &r.release {
                 s.push_str(&format!(
                     "\n## {}: {} = build {} (pin {})\n\n```sh\n",
@@ -1621,10 +1623,8 @@ fn write_sync(
         ));
         if g.program == "trust" {
             s.push_str(
-                "\nThe cut, as trust's docs/CUTTING-A-TOOLCHAIN.md §3.9 runs it; the candidate \
-                 gate (D27) refuses a compiler that proves any library less than the published \
-                 seal, or gives one no result in its wall budget, and then NOTHING below it \
-                 runs:\n\n```sh\n",
+                "\nThe cut, as trust's docs/CUTTING-A-TOOLCHAIN.md §3.9 runs it; a step that \
+                 fails stops the cut, and NOTHING below it runs:\n\n```sh\n",
             );
             for line in gap::trust_cut_commands(sha) {
                 s.push_str(&line);

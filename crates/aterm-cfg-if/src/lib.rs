@@ -15,8 +15,11 @@
 //! apps/ --include='*.rs'` returns zero. Every consumer is third-party, which
 //! is precisely why the patch table is the only lever — rewriting our own call
 //! sites would have rewritten nothing. Measured with
-//! `cargo tree --workspace --target <cell> -e normal,build -i cfg-if --depth 1`
-//! on all four cells:
+//! `targo tree --workspace --target <cell> -e normal,build -i cfg-if --depth 1`
+//! on all four cells (re-measured 2026-10-16: since the census before it,
+//! `getrandom 0.2` became first-party and asks for no `cfg-if` on any cell,
+//! `ahash` and `getrandom 0.3` left linux, and on mac the GPU stack — `wgpu`,
+//! `wgpu-hal`, `naga`, `half` — and `parking_lot_core` left too):
 //!
 //! * **mac-arm**, 1 — `ring 0.17.14`.
 //! * **win-msvc**, 6 — `half 2.7.1`, `naga 29.0.3`, `parking_lot_core 0.9.12`,
@@ -33,7 +36,7 @@
 //!   `-p aterm-wasm` in place of `--workspace`), neither reaches it: the CPU
 //!   module left at WP.7, the GPU module at WP.8.
 //!
-//! A patch also redirects DEV and BUILD edges, so `cargo test` compiles more
+//! A patch also redirects DEV and BUILD edges, so a test build compiles more
 //! `cfg_if!` call sites than the census above (`-e normal,build,dev` lists
 //! them).
 //!

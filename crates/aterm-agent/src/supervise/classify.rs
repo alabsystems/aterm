@@ -2730,9 +2730,12 @@ fn head_from<S: AsRef<str>>(seg: &[String], j: usize, python_allow: &[S]) -> Opt
 }
 
 /// `aterm ctl` verbs that only read (screen, session state and history, the
-/// roster), by verb and form: `meta set attention …` and `inbox seen` write,
-/// so `meta` and `inbox` are judged separately. `image`, `window`, `video` and
-/// `cast` write a file and are left out.
+/// roster, a worker's result, the survey), by verb and form: `meta set
+/// attention …`, `inbox seen` and `task mark` write, so `meta`, `inbox` and
+/// `task` are judged separately. `await` covers `await task`, the wait a manager
+/// runs on its workers. `image`, `window`, `video` and `cast` write a file and
+/// are left out; so is `spawn`, which opens a session (`spawn agent=claude`
+/// starts a worker on a task).
 const ATERM_CTL_READ: &[&str] = &[
     "status",
     "text",
@@ -2756,6 +2759,8 @@ const ATERM_CTL_READ: &[&str] = &[
     "brief",
     "resizes",
     "history",
+    "result",
+    "survey",
     "panes",
     "ready",
     "await",
@@ -2772,26 +2777,18 @@ const ATERM_CTL_READ: &[&str] = &[
     "whoami",
 ];
 
-/// `aterm pkg` and `aterm drive` verbs that only read.
+/// `aterm pkg` and `aterm drive` verbs that only read. `drive ledger` reads
+/// too, unless `--out` names a file it writes ([`aterm_drive_read`]).
 const ATERM_PKG_READ: &[&str] = &["list", "which", "doctor"];
-const ATERM_DRIVE_READ: &[&str] = &["phase", "classify", "help"];
+const ATERM_DRIVE_READ: &[&str] = &["phase", "classify", "help", "-h", "--help"];
 
 /// `aterm …` (or `aterm-ctl` / `aterm-drive`): `None` when the form only reads:
 /// `--version`, `help`, the [`ATERM_CTL_READ`] verbs, bare `meta`, bare `inbox`
-/// and `inbox get <id>`, and the read verbs of `pkg` and `drive`.
+/// and `inbox get <id>`, bare `task`, and the read verbs of `pkg` and `drive`.
 fn aterm_read(head: &str, rest: &[String]) -> Option<String> {
     let args: &[String] = match head {
         "aterm-ctl" => return aterm_ctl_read(rest),
-        "aterm-drive" => {
-            return match rest.first().map(String::as_str) {
-                Some(v) if ATERM_DRIVE_READ.contains(&v) => None,
-                v => Some(
-                    format!("aterm-drive {}", v.unwrap_or(""))
-                        .trim()
-                        .to_string(),
-                ),
-            };
-        }
+        "aterm-drive" => return aterm_drive_read("aterm-drive", rest),
         _ => rest,
     };
     let sub = args.first().map(String::as_str);
@@ -2800,13 +2797,38 @@ fn aterm_read(head: &str, rest: &[String]) -> Option<String> {
         Some("--version" | "-V" | "version" | "help" | "--help" | "-h") => None,
         Some("ctl") => aterm_ctl_read(&args[1..]),
         Some("pkg") if verb.is_some_and(|v| ATERM_PKG_READ.contains(&v)) => None,
-        Some("drive") if verb.is_some_and(|v| ATERM_DRIVE_READ.contains(&v)) => None,
+        Some("drive") => aterm_drive_read("aterm drive", &args[1..]),
         Some(s) => Some(
             format!("aterm {s} {}", verb.unwrap_or(""))
                 .trim()
                 .to_string(),
         ),
         None => Some("aterm (opens a session)".to_string()),
+    }
+}
+
+/// The arguments of `aterm drive`: its one option (`--socket P`), then the
+/// command. `ledger` only reads (the turn ledger, a journal, `inbox --peek`)
+/// unless `--out` names the file it writes; `answer` types into a session.
+fn aterm_drive_read(head: &str, args: &[String]) -> Option<String> {
+    let mut k = 0;
+    while let Some(t) = args.get(k).map(String::as_str) {
+        match t {
+            "--socket" | "--sock" => k += 2,
+            _ => break,
+        }
+    }
+    let verb = args.get(k).map(String::as_str);
+    let writes_out = || {
+        args[k..]
+            .iter()
+            .any(|t| t == "--out" || t.starts_with("--out="))
+    };
+    match verb {
+        Some(v) if ATERM_DRIVE_READ.contains(&v) => None,
+        Some("ledger") if !writes_out() => None,
+        Some("ledger") => Some(format!("{head} ledger --out (writes a file)")),
+        v => Some(format!("{head} {}", v.unwrap_or("")).trim().to_string()),
     }
 }
 
@@ -2833,7 +2855,7 @@ fn aterm_ctl_read(args: &[String]) -> Option<String> {
         Some(v) if ATERM_CTL_READ.contains(&v) => true,
         // `<verb> --help` describes the verb and never runs it.
         Some(_) if tail.iter().all(|t| t == "--help" || t == "-h") && !tail.is_empty() => true,
-        Some("meta") => tail.is_empty(),
+        Some("meta" | "task") => tail.is_empty(),
         Some("inbox") => first.is_none() || (first == Some("get") && tail.len() == 2),
         _ => false,
     };

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::super::Job;
+use super::super::{Job, parse_exit_status};
 use super::*;
 use crate::harness::relaunch::{AgentRun, ExitCause, ExitRecord, MuseRun, Snapshot, exit_record};
 use crate::supervise::ScratchDir;
@@ -438,6 +438,7 @@ impl Rig {
             aterm_state: None,
             ask: true,
             several_logins: false,
+            usage_credits: false,
             usage_tap: None,
             instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
             agents_off: Vec::new(),
@@ -473,6 +474,7 @@ impl Rig {
     fn snap(&self, session: Option<&str>) -> Snapshot {
         Snapshot {
             stored_login: false,
+            profile: None,
             tab: TAB.to_string(),
             pid: TUI,
             start: "Sat Oct 17 06:40:00 2026".to_string(),
@@ -723,6 +725,40 @@ fn no_witness_no_relaunch() {
     let r = gone.attempt(&gone.snap(Some(S1)), &ExitRecord::Crashed, ExitCause::Exit);
     assert_eq!(r.step, "ended:no-session");
     let control = Rig::new("witnessed", 137, true, false, Log::Crash, true);
+    let r = control.attempt(
+        &control.snap(Some(S1)),
+        &ExitRecord::Crashed,
+        ExitCause::Exit,
+    );
+    assert_eq!(r.step, "continued");
+}
+
+/// A TAB'S OWN MUSE CODE (`aterm -e muse`, `exec muse`: shell
+/// [`crate::harness::relaunch::NO_SHELL`]) that crashed is relaunched by
+/// nothing: no shell is left in its tab to type the line into, and its plan
+/// is refused for good, never waited on. NEGATIVE CONTROL: the same crash
+/// with a shell is relaunched.
+#[test]
+fn a_tabs_own_muse_is_relaunched_by_nothing() {
+    use crate::harness::relaunch::NO_SHELL;
+    let rig = Rig::new("tab-program", 137, true, false, Log::Crash, true);
+    let snap = Snapshot {
+        shell: NO_SHELL,
+        dialect: None,
+        ..rig.snap(Some(S1))
+    };
+    let r = rig.attempt(&snap, &ExitRecord::Crashed, ExitCause::Exit);
+    assert_eq!(r.step, "refused:not-a-shell-job", "{r:?}");
+    assert!(rig.typed().is_empty());
+    let st = St {
+        shell: NO_SHELL,
+        ..St::default()
+    };
+    assert!(matches!(
+        plan(&rig.opts, &st, &rig.kernel),
+        Err(NoPlan::Refused { why, .. }) if why == "not-a-shell-job"
+    ));
+    let control = Rig::new("tab-program-control", 137, true, false, Log::Crash, true);
     let r = control.attempt(
         &control.snap(Some(S1)),
         &ExitRecord::Crashed,
@@ -1426,17 +1462,18 @@ fn the_explicit_restart_is_not_carried_for_a_muse() {
     assert_eq!(r.step, "continued", "{r:?}");
 }
 
-/// Each agent's foreground process goes to its own lane's reader: agy and
-/// Gemini CLI to none ([`NO_LANE`]) — never to the Muse Code lane's, nor
-/// read as Claude Code. NEGATIVE CONTROLS: a Muse Code's store build and its
-/// twin go to its lane; a vendor Codex to none (the Codex screen lane's
-/// retirement: only an ALab image is codex-alab's); an unnamed program to
-/// Claude Code's records.
+/// Each agent's foreground process goes to its own lane's reader: agy to the
+/// agy lane's and an image itself named `gemini` to none ([`NO_LANE`]: Gemini
+/// CLI runs as `node`, read by its argv) — never to the Muse Code lane's, nor
+/// read as Claude Code. NEGATIVE CONTROLS: a Muse Code's store
+/// build and its twin go to its lane; a vendor Codex to none (the Codex
+/// screen lane's retirement: only an ALab image is codex-alab's); an unnamed
+/// program to Claude Code's records.
 #[test]
 fn each_image_goes_to_its_own_lanes_reader() {
     use crate::harness::relaunch::{SnapshotLane, snapshot_lane};
     for (image, lane) in [
-        ("/p/store/agy/1/bin/agy", SnapshotLane::None),
+        ("/p/store/agy/1/bin/agy", SnapshotLane::Agy),
         ("/opt/homebrew/bin/gemini", SnapshotLane::None),
         (
             "/p/store/muse/2001004010006427002/bin/muse",
@@ -1446,9 +1483,9 @@ fn each_image_goes_to_its_own_lanes_reader() {
         ("/usr/local/bin/codex", SnapshotLane::None),
         ("/Users//u/.local/bin/claude", SnapshotLane::Claude),
     ] {
-        assert_eq!(snapshot_lane(Some(Path::new(image))), lane, "{image}");
+        assert_eq!(snapshot_lane(Some(Path::new(image)), &[]), lane, "{image}");
     }
-    assert_eq!(snapshot_lane(None), SnapshotLane::Claude);
+    assert_eq!(snapshot_lane(None, &[]), SnapshotLane::Claude);
 }
 
 /// Tier-1 of `HarnessMuseExitWitness` (aterm-models-harness
@@ -1580,3 +1617,7 @@ fn tier1_the_real_muse_exit_read_conforms_to_the_model() {
         );
     }
 }
+
+// The live upgrade's quiet flow, over the same stand-in tab and kernel shapes.
+#[path = "upgrade_muse_live_drive_tests.rs"]
+mod live_tests;

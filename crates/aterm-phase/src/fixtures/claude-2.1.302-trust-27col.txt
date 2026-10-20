@@ -1,0 +1,28 @@
+# claude-code 2.1.302 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (27x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab), the harness held off by a person-sim lease · the folder-trust dialog of a fresh start at 144x50, the pane then resized (`ctl resize 50 27`): its Select one column in, the cursor at column 1 and the labels at column 3, the columns 2.1.302's render code gives the held message's Select (nCe, not measured); `Yes, I trust this folder` (24 cells) whole on its row to the pane's edge, in the pane's width less 3, where the body's text wraps a cell short of the edge (`/private/tmp/at.6AMk/proj` fills 25 cells from column 1)
+
+───────────────────────────
+ Accessing workspace:
+
+ /private/tmp/at.6AMk/proj
+
+ Quick safety check: Is
+ this a project you
+ created or one you trust?
+ (Like your own code, a
+ well-known open source
+ project, or work from
+ your team). If not, take
+ a moment to review what's
+ in this folder first.
+
+ Claude Code'll be able to
+ read, edit, and execute
+ files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to
+ cancel

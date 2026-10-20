@@ -280,7 +280,27 @@ fn staged_status_and_reuse_obey_new_minimum_revocations_and_exact_current_bytes(
         &manifest,
         native().unwrap()
     ));
-    f.state.min_build = 0;
+    // At the stage's own build (11) the minimum admits it; the high water and a
+    // rejection of that build do not.
+    for (min_build, high_water, rejected_build, admitted) in
+        [(11, 10, 0, true), (0, 11, 0, false), (0, 10, 11, false)]
+    {
+        (
+            f.state.min_build,
+            f.state.high_water,
+            f.state.rejected_build,
+        ) = (min_build, high_water, rejected_build);
+        assert_eq!(
+            reusable_stage(&f.context, &f.state, &manifest, native().unwrap()),
+            admitted,
+            "min_build {min_build}, high_water {high_water}, rejected {rejected_build}"
+        );
+    }
+    (
+        f.state.min_build,
+        f.state.high_water,
+        f.state.rejected_build,
+    ) = (0, 10, 0);
     f.state.staged.as_mut().unwrap().machine_id = Some("revoked".into());
     f.state.revoked_machines.push("revoked".into());
     assert!(linux_status(&f.context, &f.state).staged_build.is_none());
@@ -413,6 +433,7 @@ impl Fixture {
             rejected_build: 0,
             rejected_unstarted: false,
             kept_unproven: None,
+            unsaid_trial_ends: Vec::new(),
             outcome: String::new(),
             updated_at: String::new(),
             failing_checks: 0,
@@ -1708,10 +1729,10 @@ fn a_trial_no_rollback_can_be_taken_from_ends_and_the_copy_updates_again() {
             "{way}: the record keeps why it stays"
         );
         assert!(
-            status_in(Ok(&f.context), 11)
-                .linux
-                .is_some_and(|linux| linux.kept_unproven),
-            "{way}: and the status says so"
+            matches!(state.unsaid_trial_ends.as_slice(), [words]
+                if words.contains("0.11.0") && words.contains("stays")),
+            "{way}: and keeps the words a window is told: {:?}",
+            state.unsaid_trial_ends
         );
         assert!(
             awaiting_start(&state).is_none(),
@@ -1726,12 +1747,6 @@ fn a_trial_no_rollback_can_be_taken_from_ends_and_the_copy_updates_again() {
         f.apply()
             .unwrap_or_else(|error| panic!("{way}: a newer release installs: {error}"));
         assert_eq!(f.state.installed.build, 12);
-        assert!(
-            status_in(Ok(&f.context), 11)
-                .linux
-                .is_some_and(|linux| !linux.kept_unproven),
-            "{way}: the newer build is no kept one"
-        );
         let eleven = trial_on_disk(&f).old;
         assert_eq!(eleven.build, 11);
         assert_eq!(
@@ -2470,6 +2485,15 @@ fn a_revoked_machines_minimum_build_floor_is_withdrawn() {
     authorize(&f.context, &mut f.state, &f.proof, pins).expect("the thief is still rostered");
     assert_eq!(f.state.min_build, 9_999_999_999);
 
+    // The revoking roster withdraws it when admitted, durably, though the thief's own
+    // release beside it is refused.
+    let mut thiefs = f.proof.clone();
+    (thiefs.roster, thiefs.roster_signature) =
+        roster_with(2, &[("fixture", &machine()), ("thief", &thief)], &["thief"]);
+    authorize(&f.context, &mut f.state, &thiefs, pins).expect_err("the thief is revoked");
+    assert_eq!(f.state.min_build, 0);
+    assert_eq!(f.context.read_state().unwrap().unwrap().min_build, 0);
+
     // The revocation, carried by the owner's next release.
     let mut next = genuine;
     (next.roster, next.roster_signature) = roster_with(2, &[("fixture", &machine())], &["thief"]);
@@ -2481,6 +2505,78 @@ fn a_revoked_machines_minimum_build_floor_is_withdrawn() {
     let durable = f.context.read_state().unwrap().unwrap();
     assert_eq!(durable.min_build, 0);
     assert!(durable.revoked_machines.contains(&"thief".to_string()));
+}
+
+/// `f`'s release beside a latest-policy head: its own appcast with `build` for its build
+/// number, signed by the fixture's machine, or by nobody.
+fn with_head(f: &mut Fixture, build: &str, signed: bool) {
+    let head = String::from_utf8(f.proof.appcast.clone())
+        .unwrap()
+        .replace("build_number = 11", build)
+        .into_bytes();
+    let signature = if signed {
+        machine().sign(&head).as_ref().to_vec()
+    } else {
+        vec![0; 64]
+    };
+    f.proof.policy = Some((head, signature));
+}
+
+/// Every refusal of the chain refuses the Linux release where `authorize` meets it: a
+/// roster below the durable floor, an appcast whose own attribution names another
+/// machine than the key that signed it or outruns its roster, and a latest-policy head
+/// that does not verify or is older than the release. Negative controls: the fixture as
+/// made, and a head at the release's own build, are authorized.
+#[test]
+fn every_refusal_of_the_chain_refuses_the_linux_release() {
+    let anchor = public(&master());
+    let pins = Pins {
+        masters: &[&anchor],
+    };
+    // (name, the fixture's edit, authorized)
+    type Row = (&'static str, fn(&mut Fixture), bool);
+    let rows: [Row; 7] = [
+        ("as made", |_| {}, true),
+        (
+            "a roster below the durable floor",
+            |f| f.state.roster_floor = 2,
+            false,
+        ),
+        (
+            "attributed to another machine",
+            |f| f.alter_manifest("machine_id = \"fixture\"", "machine_id = \"other\""),
+            false,
+        ),
+        (
+            "ahead of its roster",
+            |f| f.alter_manifest("roster_seq = 1", "roster_seq = 2"),
+            false,
+        ),
+        (
+            "a head at its build",
+            |f| with_head(f, "build_number = 11", true),
+            true,
+        ),
+        (
+            "a head older than it",
+            |f| with_head(f, "build_number = 10", true),
+            false,
+        ),
+        (
+            "a forged head",
+            |f| with_head(f, "build_number = 11", false),
+            false,
+        ),
+    ];
+    for (name, edit, authorized) in rows {
+        let mut f = Fixture::new();
+        edit(&mut f);
+        assert_eq!(
+            authorize(&f.context, &mut f.state, &f.proof, pins).is_ok(),
+            authorized,
+            "{name}"
+        );
+    }
 }
 
 /// A held stage stays applicable after the roster moves, whatever becomes of the head: a
@@ -2875,6 +2971,48 @@ fn a_due_pass_that_waits_on_the_trial_records_no_check() {
     assert_eq!(state.check_build, 0, "nor the build that made one");
 }
 
+/// WHY CHECKS WAIT WHILE A BUILD IS ON TRIAL (`aterm help update`'s LINUX rule, and
+/// [`check_locked`]'s gate). The starts that judge the build are counted, and confirmed,
+/// under the copy's update lock, which they wait for at most half a second so that no
+/// start stalls on an update; a check that reads the channel holds that lock through its
+/// download and its probe of the new build. A start made while it does counts nothing —
+/// a window's, a session's, and a session's confirmation — so a check during the trial
+/// would leave the trial's own starts uncounted: a crash loop rolled back later, a
+/// healthy start's proof lost. Negative control: with the lock free the same start
+/// counts.
+#[test]
+fn a_trial_start_made_while_a_check_holds_the_lock_counts_nothing() {
+    let mut f = Fixture::new();
+    f.apply().unwrap();
+    let inode = fs::metadata(&f.context.target).unwrap();
+    let actual = || Ok((inode.dev(), inode.ino()));
+    let commit = "b".repeat(40);
+    let busy = |result: Result<bool, String>| result.is_err_and(|error| error == LOCK_BUSY);
+    let check = another_aterm_holds_the_lock(&f);
+    assert!(
+        busy(boot_in(&f.context, 11, &commit, actual, reads(minute(0)))),
+        "a window's start"
+    );
+    assert!(
+        busy(session_started_in(
+            &f.context,
+            11,
+            &commit,
+            actual,
+            reads(minute(0))
+        )),
+        "a session's start"
+    );
+    assert!(
+        confirm_session_in(&f.context, 11, &commit, actual).is_err_and(|error| error == LOCK_BUSY),
+        "a session's confirmation"
+    );
+    assert_eq!(trial_on_disk(&f).starts, 0, "none of them counted");
+    drop(check);
+    assert!(session_start(&f, minute(1)), "with the lock free it counts");
+    assert_eq!(trial_on_disk(&f).starts, 1);
+}
+
 /// A pass that failed before reaching the lock (unreadable settings) is handed over as lost,
 /// never as one that took the lock, so it cannot answer the lock's notice (`linux_notice`'s
 /// `a_pass_that_failed_before_the_lock_neither_answers_nor_restarts_its_notice`); the busy
@@ -3036,13 +3174,14 @@ fn a_release_whose_probe_failed_is_not_downloaded_again() {
     assert_eq!(f.state.installed.build, 11);
 }
 
-/// What the loop's reporter told the window over `passes`, each one the pass the loop
-/// builds from a status ([`crate::linux_notice::Reporter::report`]'s `notify`).
+/// What the loop's reporter told the window over `passes` of the copy `f`, each one the
+/// loop's own pass ([`report_pass`]) of a status, taking the crash loops' ends off the
+/// record ([`crate::linux_notice::Reporter::report`]'s `notify`).
 fn notices_over<'a>(
     reporter: &mut crate::linux_notice::Reporter,
+    f: &Fixture,
     passes: impl IntoIterator<Item = &'a crate::UpdateStatus>,
 ) -> Vec<(String, String)> {
-    use crate::linux_notice::{Pass, Record};
     use std::sync::{Arc, Mutex};
     let said = Arc::new(Mutex::new(Vec::new()));
     let notify: crate::HealthNotify = Box::new({
@@ -3050,15 +3189,22 @@ fn notices_over<'a>(
         move |title, body| said.lock().unwrap().push((title, body))
     });
     for status in passes {
-        reporter.report(Pass::of(status, Record::Kept, true), None, Some(&notify));
+        report_pass(
+            reporter,
+            Ok(&f.context),
+            (status.clone(), crate::linux_notice::Record::Kept, true),
+            None,
+            Some(&notify),
+        );
     }
     said.lock().unwrap().clone()
 }
 
-/// Whether the window reads `title` as the install half's failure — the class the macOS
-/// lane says an overdue or reverted update under.
+/// Whether the window says `title` as the install half's failure, as the macOS lane says
+/// an overdue or reverted update: a crash loop's end ([`crate::INSTALL_CRASH_LOOP_TITLE`]),
+/// or the install half's failing title.
 fn install_half(title: &str) -> bool {
-    crate::health_failing_class(title) == Some("apply")
+    title == crate::INSTALL_CRASH_LOOP_TITLE || crate::health_failing_class(title) == Some("apply")
 }
 
 /// A CRASH-LOOP ROLLBACK THIS LOOP SEES HAPPEN IS SAID (U21). The person keeps the old
@@ -3071,7 +3217,7 @@ fn a_crash_loop_rollback_the_loop_sees_is_said() {
     f.apply().unwrap();
     let waiting = status_in(Ok(&f.context), 10);
     let mut reporter = crate::linux_notice::Reporter::new("2026-09-28T10:00:00Z".into());
-    assert!(notices_over(&mut reporter, [&waiting]).is_empty());
+    assert!(notices_over(&mut reporter, &f, [&waiting]).is_empty());
     let t0 = minute(0);
     let rolled = (1..=60_i64).any(|start| !window_start(&f, t0 + start * 5));
     assert!(rolled, "PRECONDITION: the crash loop is rolled back");
@@ -3082,7 +3228,7 @@ fn a_crash_loop_rollback_the_loop_sees_is_said() {
             .as_ref()
             .is_some_and(|linux| linux.refused_newer)
     );
-    let said = notices_over(&mut reporter, [&rolled_back]);
+    let said = notices_over(&mut reporter, &f, [&rolled_back]);
     assert!(
         said.iter()
             .any(|(title, body)| install_half(title) && body.contains("0.10.0 is back")),
@@ -3104,7 +3250,7 @@ fn a_start_wait_past_its_hour_is_said_as_no_failure() {
     f.apply().unwrap();
     let (waiting, _, _) = check_recording_in(Ok(&f.context), 10, &settings_provider(false), false);
     let mut reporter = crate::linux_notice::Reporter::new("2026-09-28T10:00:00Z".into());
-    let said = notices_over(&mut reporter, std::iter::repeat_n(&waiting, 24 * 60));
+    let said = notices_over(&mut reporter, &f, std::iter::repeat_n(&waiting, 24 * 60));
     assert!(
         said.iter().any(|(_, body)| body.contains("0.11.0")),
         "a day of waiting for a start is told: {said:?}"
@@ -3129,7 +3275,7 @@ fn a_rollback_after_a_said_wait_is_said_as_the_install_failure() {
     f.apply().unwrap();
     let waiting = status_in(Ok(&f.context), 10);
     let mut reporter = crate::linux_notice::Reporter::new("2026-09-28T10:00:00Z".into());
-    let wait = notices_over(&mut reporter, std::iter::repeat_n(&waiting, 2 * 60));
+    let wait = notices_over(&mut reporter, &f, std::iter::repeat_n(&waiting, 2 * 60));
     assert!(
         wait.iter().any(|(_, body)| body.contains("0.11.0")),
         "PRECONDITION: the wait was said: {wait:?}"
@@ -3138,7 +3284,7 @@ fn a_rollback_after_a_said_wait_is_said_as_the_install_failure() {
     let rolled = (1..=60_i64).any(|start| !window_start(&f, t0 + start * 5));
     assert!(rolled, "PRECONDITION: the crash loop is rolled back");
     let rolled_back = status_in(Ok(&f.context), 10);
-    let said = notices_over(&mut reporter, [&rolled_back]);
+    let said = notices_over(&mut reporter, &f, [&rolled_back]);
     assert!(
         said.iter()
             .any(|(title, body)| install_half(title) && body.contains("is back")),
@@ -3158,7 +3304,7 @@ fn a_rollback_a_person_asked_for_is_said_as_no_install_failure() {
     assert!(window_confirm(&f), "and its window confirms it");
     let healthy = status_in(Ok(&f.context), 10);
     let mut reporter = crate::linux_notice::Reporter::new("2026-09-28T10:00:00Z".into());
-    assert!(notices_over(&mut reporter, [&healthy]).is_empty());
+    assert!(notices_over(&mut reporter, &f, [&healthy]).is_empty());
     let mut state = f.context.read_state().unwrap().unwrap();
     rollback_locked(&f.context, &mut state).expect("aterm update rollback");
     let rolled = status_in(Ok(&f.context), 10);
@@ -3169,7 +3315,7 @@ fn a_rollback_a_person_asked_for_is_said_as_no_install_failure() {
             .is_some_and(|linux| linux.refused_newer),
         "PRECONDITION: the copy refuses the build it rolled back"
     );
-    let said = notices_over(&mut reporter, [&rolled]);
+    let said = notices_over(&mut reporter, &f, [&rolled]);
     assert!(
         !said.iter().any(|(title, _)| install_half(title)),
         "a person's own rollback is no install failure: {said:?}"
@@ -3194,7 +3340,7 @@ fn a_wait_over_a_start_that_never_finished_does_not_say_none_began() {
         "PRECONDITION: one start, unfinished"
     );
     let mut reporter = crate::linux_notice::Reporter::new("2026-09-28T10:00:00Z".into());
-    let said = notices_over(&mut reporter, std::iter::repeat_n(&waiting, 2 * 60));
+    let said = notices_over(&mut reporter, &f, std::iter::repeat_n(&waiting, 2 * 60));
     let wait: Vec<_> = said
         .iter()
         .filter(|(_, body)| body.contains("0.11.0"))
@@ -3223,7 +3369,7 @@ fn a_rollback_seen_on_a_checks_pass_is_said_in_its_own_words() {
     f.apply().unwrap();
     let waiting = status_in(Ok(&f.context), 10);
     let mut reporter = crate::linux_notice::Reporter::new("2026-09-28T10:00:00Z".into());
-    assert!(notices_over(&mut reporter, [&waiting]).is_empty());
+    assert!(notices_over(&mut reporter, &f, [&waiting]).is_empty());
     let t0 = minute(0);
     let rolled = (1..=60_i64).any(|start| !window_start(&f, t0 + start * 5));
     assert!(rolled, "PRECONDITION: the crash loop is rolled back");
@@ -3231,7 +3377,7 @@ fn a_rollback_seen_on_a_checks_pass_is_said_in_its_own_words() {
     checked.outcome = "Up to date \u{2014} the newest release is aterm 0.10.0".into();
     checked.updated_at = "2026-09-28T15:00:00Z".into();
     f.context.save(&checked).unwrap();
-    let said = notices_over(&mut reporter, [&status_in(Ok(&f.context), 10)]);
+    let said = notices_over(&mut reporter, &f, [&status_in(Ok(&f.context), 10)]);
     let rollback: Vec<_> = said
         .iter()
         .filter(|(title, _)| install_half(title))
@@ -3266,7 +3412,7 @@ fn a_crash_loop_no_rollback_could_answer_is_said() {
         let waiting = status_in(Ok(&f.context), 10);
         let mut reporter = crate::linux_notice::Reporter::new("2026-09-28T10:00:00Z".into());
         let passes = if wait_said { 2 * 60 } else { 1 };
-        let wait = notices_over(&mut reporter, std::iter::repeat_n(&waiting, passes));
+        let wait = notices_over(&mut reporter, &f, std::iter::repeat_n(&waiting, passes));
         assert_eq!(
             wait.iter().any(|(_, body)| body.contains("0.11.0")),
             wait_said,
@@ -3281,7 +3427,7 @@ fn a_crash_loop_no_rollback_could_answer_is_said() {
             kept.trial.is_none() && kept.installed.build == 11 && kept.rejected_build == 0,
             "PRECONDITION: the trial ended and the build stays"
         );
-        let said = notices_over(&mut reporter, [&status_in(Ok(&f.context), 10)]);
+        let said = notices_over(&mut reporter, &f, [&status_in(Ok(&f.context), 10)]);
         assert!(
             said.iter().any(|(title, body)| install_half(title)
                 && body.contains("0.11.0")
@@ -3290,4 +3436,148 @@ fn a_crash_loop_no_rollback_could_answer_is_said() {
              {said:?}"
         );
     }
+}
+
+/// A CRASH LOOP'S END FOUND AT LAUNCH IS SAID, ONCE FOR THE COPY (ATERM-KI-1015-2, U21).
+/// The rollback is taken at a start (the start past the budget restores the build before
+/// it), so the aterm that comes up after it is a process started after the record moved.
+/// Its loop took the record as its first pass, which only starts the looking, and the
+/// rollback was told to nobody. The first loop to look says it; no later launch says it
+/// again.
+#[test]
+fn a_crash_loops_end_found_at_launch_is_said_once() {
+    let mut f = Fixture::new();
+    f.apply().unwrap();
+    let t0 = minute(0);
+    let rolled = (1..=60_i64).any(|start| !window_start(&f, t0 + start * 5));
+    assert!(rolled, "PRECONDITION: the crash loop is rolled back");
+    let mut launched = crate::linux_notice::Reporter::new("2026-09-28T10:00:00Z".into());
+    let said = notices_over(&mut launched, &f, [&status_in(Ok(&f.context), 10)]);
+    assert!(
+        said.iter()
+            .any(|(title, body)| install_half(title) && body.contains("0.10.0 is back")),
+        "the rollback found at launch was never said: {said:?}"
+    );
+    let mut later = crate::linux_notice::Reporter::new("2026-09-28T11:00:00Z".into());
+    let again = notices_over(&mut later, &f, [&status_in(Ok(&f.context), 10)]);
+    assert!(
+        !again.iter().any(|(title, _)| install_half(title)),
+        "a later launch does not say it again: {again:?}"
+    );
+}
+
+/// A CRASH LOOP'S END WAITS FOR A LOOP WITH A WINDOW TO TELL (ATERM-KI-1015-2, U21's
+/// review). The start that rolls the build back may be a terminal session's, whose loop
+/// starts at once with no window (`notify` is `None`): it took the end off the record and
+/// said it to nobody, so the window already open, and every window after it, said
+/// nothing. A windowless pass leaves the words; two crash loops before a window looks are
+/// both kept, and the window's next pass says each, oldest first, once. Negative control:
+/// past [`UNSAID_TRIAL_ENDS_KEPT`] ends the oldest go, so the record stays bounded.
+#[test]
+fn a_crash_loops_end_waits_for_a_loop_with_a_window_to_tell() {
+    let mut f = Fixture::new();
+    f.apply().unwrap();
+    let t0 = minute(0);
+    assert!(
+        (1..=60_i64).any(|start| !session_start(&f, t0 + start * 5)),
+        "PRECONDITION: build 11's crash loop is rolled back at a session's start"
+    );
+    let mut session = crate::linux_notice::Reporter::new("2026-09-28T10:00:00Z".into());
+    report_pass(
+        &mut session,
+        Ok(&f.context),
+        (
+            status_in(Ok(&f.context), 10),
+            crate::linux_notice::Record::Kept,
+            true,
+        ),
+        None,
+        None,
+    );
+    assert_eq!(
+        f.context
+            .read_state()
+            .unwrap()
+            .unwrap()
+            .unsaid_trial_ends
+            .len(),
+        1,
+        "the session's windowless loop leaves the end on the record"
+    );
+    stage_release(&mut f, 12, 3, 'c');
+    f.apply().unwrap();
+    let t1 = minute(60);
+    assert!(
+        (1..=60_i64).any(|start| !window_start_as(&f, 12, 'c', t1 + start * 5)),
+        "PRECONDITION: build 12's crash loop is rolled back too"
+    );
+    let mut window = crate::linux_notice::Reporter::new("2026-09-28T09:00:00Z".into());
+    let said = notices_over(&mut window, &f, [&status_in(Ok(&f.context), 10)]);
+    let ends: Vec<&str> = said
+        .iter()
+        .filter(|(title, _)| install_half(title))
+        .map(|(_, body)| body.as_str())
+        .collect();
+    assert!(
+        matches!(ends.as_slice(), [first, second]
+            if first.contains("0.11.0") && second.contains("0.12.0")),
+        "the window says each crash loop, oldest first: {said:?}"
+    );
+    let again = notices_over(&mut window, &f, [&status_in(Ok(&f.context), 10)]);
+    assert!(
+        !again.iter().any(|(title, _)| install_half(title)),
+        "once: {again:?}"
+    );
+
+    let mut state = f.context.read_state().unwrap().unwrap();
+    for n in 0..=UNSAID_TRIAL_ENDS_KEPT {
+        keep_unsaid_trial_end(&mut state, format!("end {n}"));
+    }
+    assert_eq!(
+        state.unsaid_trial_ends.first().map(String::as_str),
+        Some("end 1"),
+        "past the bound the oldest goes"
+    );
+    assert_eq!(state.unsaid_trial_ends.len(), UNSAID_TRIAL_ENDS_KEPT);
+}
+
+/// A SECOND CRASH LOOP BEFORE THE FIRST WAS ANSWERED IS SAID AS ITS OWN (ATERM-KI-1015-2,
+/// U21). Build 11 crash-looped and was rolled back; build 12 was installed over the
+/// rollback and crash-looped too before any start of it finished. The second rollback
+/// reached the window as a restatement, a log line, and the words said for the first
+/// named the build restored and no refused one. Each crash loop is said under the install
+/// half's title, naming the build that failed.
+#[test]
+fn a_second_crash_loop_is_said_as_its_own() {
+    let mut f = Fixture::new();
+    f.apply().unwrap();
+    let mut reporter = crate::linux_notice::Reporter::new("2026-09-28T10:00:00Z".into());
+    assert!(notices_over(&mut reporter, &f, [&status_in(Ok(&f.context), 10)]).is_empty());
+    let t0 = minute(0);
+    assert!(
+        (1..=60_i64).any(|start| !window_start(&f, t0 + start * 5)),
+        "PRECONDITION: build 11's crash loop is rolled back"
+    );
+    let first = notices_over(&mut reporter, &f, [&status_in(Ok(&f.context), 10)]);
+    assert!(
+        first
+            .iter()
+            .any(|(title, body)| install_half(title) && body.contains("0.11.0")),
+        "the first crash loop names the build that failed: {first:?}"
+    );
+    stage_release(&mut f, 12, 3, 'c');
+    f.apply().unwrap();
+    assert!(notices_over(&mut reporter, &f, [&status_in(Ok(&f.context), 10)]).is_empty());
+    let t1 = minute(60);
+    assert!(
+        (1..=60_i64).any(|start| !window_start_as(&f, 12, 'c', t1 + start * 5)),
+        "PRECONDITION: build 12's crash loop is rolled back"
+    );
+    let second = notices_over(&mut reporter, &f, [&status_in(Ok(&f.context), 10)]);
+    assert!(
+        second
+            .iter()
+            .any(|(title, body)| install_half(title) && body.contains("0.12.0")),
+        "the second crash loop is said as its own: {second:?}"
+    );
 }

@@ -12,18 +12,26 @@
 //! [`crate::cursor_glow::CursorGlow::tick`]; on a dark ground every quad is
 //! window-absolute additive light (`alpha: 0`).
 //!
-//! Additive light cannot show on a light ground, so a light theme takes the
-//! beam family's light arm instead: the comet becomes darkened source-over
-//! veils hugging the row's lower edge ([`ClassicWake::halos`]), the crown is
-//! skipped, and the landing ring is a veil ring.
+//! Additive light cannot show on a light ground, so a light theme draws the
+//! same three marks in ink (`cursor_glow::light_body`): the thin tapered
+//! comet as a crisp ink tracer under the letters along the row's lower part
+//! (a dark line through the middle of what was typed would read as struck
+//! through), the box-stack crown as nested square-ended ink blocks under the
+//! letters inside the caret's row, both solved against the theme's text
+//! ([`ClassicWake::under`]), and the landing ring as the same expanding
+//! square outline in conservative ink over the text.
 
 use std::time::Duration;
 
 use aterm_time::Instant;
 
-use aterm_render::{CometSample, GlowQuad, RainHalo, comet_glow_quads, premul_rgb};
+use aterm_render::{
+    BeamVertex, CometSample, GlowQuad, RainHalo, comet_beam, comet_glow_quads, premul_rgb,
+};
 
-use crate::cursor_glow::{Geom, GlowConfig, hsv2rgb, push_halo_over};
+use crate::cursor_glow::{
+    Geom, GlowConfig, InkRole, LIGHT_INK_ALPHA_CAP, LightGround, hsv2rgb, reink_quads,
+};
 use crate::effect_util::{lerp_rgb, push_fx_rect as push_rect};
 use crate::trail_sweep::line_cells_tail;
 
@@ -92,6 +100,10 @@ pub struct ClassicWake {
     /// This frame's light-theme veils (source-over [`RainHalo`]s), empty on a
     /// dark ground. The host splices them beside the glow quads.
     halos: Vec<RainHalo>,
+    /// This frame's light-theme ink under the letters (the tracer and the
+    /// crown), empty on a dark ground. The host splices it into the
+    /// under-ink stream.
+    under: Vec<GlowQuad>,
     /// The move this frame's tick spawned on, `(from, to)`, for the host's
     /// diagnosis ring ([`Self::take_spawn`]). `None` on a frame that spawned
     /// nothing.
@@ -151,6 +163,13 @@ impl ClassicWake {
         &self.halos
     }
 
+    /// This frame's light-theme ink under the letters, for
+    /// `RenderInput.glow_under`.
+    #[must_use]
+    pub fn under(&self) -> &[GlowQuad] {
+        &self.under
+    }
+
     /// Drop all in-flight light and forget the last cursor position, used when
     /// the cursor's coordinate space changes, so no comet spawns from a stale
     /// cross-space position.
@@ -183,6 +202,7 @@ impl ClassicWake {
         // (its tests, a bench, an embedder).
         out.clear();
         self.halos.clear();
+        self.under.clear();
         self.spawned = None;
         if !cfg.enabled || cfg.intensity <= 0.0 || geom.cw == 0 || geom.ch == 0 {
             self.sparks.clear();
@@ -251,17 +271,19 @@ impl ClassicWake {
         }
         out.truncate(Self::MAX_QUADS);
         self.halos.truncate(Self::MAX_QUADS);
+        self.under.truncate(Self::MAX_QUADS);
 
         // Fingerprint the emitted light (deterministic given the live state).
         let mut fp: u64 = 0;
-        for q in out.iter() {
+        for q in out.iter().chain(&self.under) {
             fp = fp.wrapping_mul(1_000_003).wrapping_add(
                 ((q.row as u64) << 40)
                     ^ ((q.x as u64) << 28)
                     ^ ((q.y as u64) << 16)
                     ^ ((q.w as u64) << 8)
                     ^ (q.h as u64)
-                    ^ ((q.color as u64) << 20),
+                    ^ ((q.color as u64) << 20)
+                    ^ (u64::from(q.alpha) << 56),
             );
         }
         for h in &self.halos {
@@ -470,27 +492,7 @@ impl ClassicWake {
 
         let chf = geom.ch as f32;
         if !cfg.dark_theme {
-            // Light ground: a darkened veil per swept sample along the row's
-            // lower edge, merging into one tracer that leaves the glyph band
-            // clear (the beam family's light law, one rail for this thin look).
-            let cwf = geom.cw as f32;
-            let hue = self.hue;
-            for run in &self.comet_runs[..live] {
-                for s in run {
-                    let peak = (f32::from(s.cov) * 1.9).min(230.0) as u8;
-                    let ink = lerp_rgb(comet_color_at(hue, cfg, s.pos), 0x0000_0000, 0.38);
-                    push_halo_over(
-                        &mut self.halos,
-                        geom,
-                        s.x,
-                        s.y + chf * 0.5,
-                        cwf * 1.55,
-                        chf * 0.34,
-                        ink,
-                        peak,
-                    );
-                }
-            }
+            self.emit_comet_light(cfg, geom, live);
             return;
         }
         let core_thick = (chf * 0.13).max(2.0); // crisp thin core
@@ -523,8 +525,73 @@ impl ClassicWake {
         }
     }
 
+    /// The comet on a LIGHT GROUND: the same thin tapered tracer, its
+    /// coverage the dark comet's, rasterized along the swept path in white
+    /// and re-inked under the letters in its own colour at each point (the
+    /// rolling spectrum, or the tinted two-tone), solved against the theme's
+    /// text. It runs along the row's lower part, below the glyphs' middle,
+    /// so it reads as Classic's tracer and never as a line struck through
+    /// what was typed.
+    fn emit_comet_light(&mut self, cfg: &GlowConfig, geom: Geom, live: usize) {
+        let chf = geom.ch as f32;
+        let ground = LightGround::of(cfg);
+        let thick = (chf * 0.13).max(2.0);
+        // Below the glyph band's middle, inside the row.
+        let drop = (chf * 0.5 - thick).min(chf * 0.30).max(0.0);
+        let straighten = (geom.cw as f32).max(chf) * 0.8;
+        let cap = crate::cursor_glow::LIGHT_BODY_ALPHA_CAP;
+        let hue = self.hue;
+        for run in &self.comet_runs[..live] {
+            let mut verts = Vec::with_capacity(run.len().max(2));
+            if let [lone] = run.as_slice() {
+                for dx in [-0.45, 0.45] {
+                    verts.push(BeamVertex {
+                        x: lone.x + geom.cw as f32 * dx,
+                        y: lone.y + drop,
+                        color: 0x00FF_FFFF,
+                        cov: lone.cov,
+                    });
+                }
+            } else {
+                verts.extend(run.iter().map(|s| BeamVertex {
+                    x: s.x,
+                    y: s.y + drop,
+                    color: 0x00FF_FFFF,
+                    // The dark comet's coverage, onto the body ceiling.
+                    cov: (f32::from(s.cov) * 1.4).min(cap) as u8,
+                }));
+            }
+            let from = self.under.len();
+            comet_beam(
+                &mut self.under,
+                geom.beam_clip(),
+                &verts,
+                thick,
+                1,
+                straighten,
+            );
+            // Each quad takes the colour of the path point nearest it.
+            let ink_at = |q: &GlowQuad| {
+                let (qx, qy) = (
+                    f32::from(q.x) + f32::from(q.w) * 0.5,
+                    f32::from(q.y) + f32::from(q.h) * 0.5,
+                );
+                let pos = run
+                    .iter()
+                    .min_by(|a, b| {
+                        let da = (a.x - qx).powi(2) + (a.y + drop - qy).powi(2);
+                        let db = (b.x - qx).powi(2) + (b.y + drop - qy).powi(2);
+                        da.total_cmp(&db)
+                    })
+                    .map_or(1.0, |s| s.pos);
+                ground.body_ink(comet_color_at(hue, cfg, pos))
+            };
+            reink_quads(&mut self.under[from..], cap as u8, ink_at);
+        }
+    }
+
     fn emit_crown(
-        &self,
+        &mut self,
         now: Instant,
         cfg: &GlowConfig,
         geom: Geom,
@@ -536,11 +603,6 @@ impl ClassicWake {
         }
         let Some((cr, cc)) = cur else { return };
         if cr as usize >= geom.rows || cc as usize >= geom.cols {
-            return;
-        }
-        // Pure additive light: invisible on a light ground, and it would lift
-        // fresh ink toward it. Skipped there, as the modern styles skip theirs.
-        if !cfg.dark_theme {
             return;
         }
         let Some(t0) = self.last_move else { return };
@@ -569,6 +631,34 @@ impl ClassicWake {
         // The crown follows typing heat: barely visible at rest, full only under
         // sustained fast typing, so a steady-state glow is not distracting.
         let boost = self.typing_boost();
+        if !cfg.dark_theme {
+            // A LIGHT GROUND: the same three nested boxes as ink under the
+            // letters, held inside the caret's row (square-ended blocks
+            // stepping out from the caret, never Lumen's round glow), their
+            // compound darkness under the body ceiling and their ink solved
+            // against the theme's text.
+            let ink = LightGround::of(cfg).body_ink(color);
+            let strength = (fade * cfg.intensity * boost).min(1.2);
+            for layer in 0..k {
+                let grow = r * (k - layer) / k;
+                let a = (70.0 * (layer as f32 + 1.0) / k as f32 * strength) as u8;
+                if a == 0 {
+                    continue;
+                }
+                let from = self.under.len();
+                push_rect(
+                    &mut self.under,
+                    geom,
+                    cx - grow,
+                    cy,
+                    cw + 2 * grow,
+                    ch,
+                    premul_rgb(0x00FF_FFFF, a),
+                );
+                reink_quads(&mut self.under[from..], 255, |_| ink);
+            }
+            return;
+        }
         for layer in 0..k {
             if out.len() >= Self::MAX_QUADS {
                 return;
@@ -601,25 +691,16 @@ impl ClassicWake {
         if cov == 0 {
             return;
         }
-        if !cfg.dark_theme {
-            // Light ground: an expanding darkened veil ring, its centre alpha
-            // capped so it never buries text (the modern ring's light arm).
-            let grow = (0.6 + 1.0 * t) * chf_of(geom);
-            let veil = lerp_rgb(cfg.accent, 0x0000_0000, 0.28);
-            let cap = (u32::from(cov) / 2).clamp(1, 120);
-            push_halo_over(
-                &mut self.halos,
-                geom,
-                ring.cx,
-                ring.cy,
-                grow,
-                grow * 0.85,
-                (veil & 0x00FF_FFFF) | (cap << 24),
-                255,
-            );
-            return;
-        }
-        let premul = premul_rgb(cfg.accent, cov);
+        // A LIGHT GROUND: the same expanding square outline, in the accent's
+        // conservative ink over the text (it crosses letters), at the
+        // over-text ceiling.
+        let light = !cfg.dark_theme;
+        let premul = if light {
+            premul_rgb(0x00FF_FFFF, cov)
+        } else {
+            premul_rgb(cfg.accent, cov)
+        };
+        let from = out.len();
         // Expanding square outline: half-size grows ~0.6 → ~1.6 cells, emitted
         // as top/bottom and left/right bars (push_rect splits the verticals into
         // per-row slabs), ~2 px thick.
@@ -631,6 +712,10 @@ impl ClassicWake {
         push_rect(out, geom, cx - s, cy + s - th, 2 * s, th, premul);
         push_rect(out, geom, cx - s, cy - s, th, 2 * s, premul);
         push_rect(out, geom, cx + s - th, cy - s, th, 2 * s, premul);
+        if light {
+            let ink = InkRole::OverText.ink(cfg.accent);
+            reink_quads(&mut out[from..], LIGHT_INK_ALPHA_CAP as u8, |_| ink);
+        }
     }
 
     /// The comet colour at path position `pos` (0 tail .. 1 head): a rolling
@@ -906,16 +991,20 @@ mod tests {
         );
     }
 
-    /// Additive light vanishes on white, so a light ground lays the wake as
-    /// source-over veils instead: a typing run and a jump both leave veils and
-    /// no glow quads, in both faces, and the frame still fingerprints.
+    /// Additive light vanishes on white, so a light ground draws Classic's
+    /// own three marks in ink: a thin tracer and the square crown under the
+    /// letters (source-over, inside the row they mark), and the square ring
+    /// over the text on a jump, in both colour faces, with no additive light;
+    /// the frame still fingerprints. The tracer is thin and the crown is the
+    /// row's full height with square ends, so the look is no veil smudge.
     #[test]
-    fn a_light_ground_lays_source_over_veils_instead_of_light() {
+    fn a_light_ground_draws_classic_in_ink() {
         let g = geom();
         let mut c = cfg();
         c.dark_theme = false;
         c.theme_fg = 0x0024_292F;
         c.theme_bg = 0x00FF_FFFF;
+        let row = 2 * g.ch as u16..3 * g.ch as u16;
         for mono in [false, true] {
             c.classic_mono = mono;
             let mut w = ClassicWake::default();
@@ -932,17 +1021,32 @@ mod tests {
                 );
             }
             assert!(out.is_empty(), "no additive light on a light ground");
+            let under = w.under();
+            assert!(!under.is_empty(), "a typing run inks (mono={mono})");
             assert!(
-                !w.halos().is_empty(),
-                "a typing run leaves a veil (mono={mono})"
-            );
-            assert!(
-                w.halos()
+                under
                     .iter()
-                    .all(|h| h.mode == aterm_render::HaloMode::Over),
-                "every light-ground mark is source-over"
+                    .all(|q| q.alpha > 0 && row.contains(&q.y) && q.y + q.h <= row.end),
+                "the ink is source-over, inside its row (mono={mono})"
             );
-            assert_ne!(fp, 0, "a veiled frame fingerprints non-zero");
+            let height_at = |col: u16| -> u16 {
+                let x = col * g.cw as u16 + g.cw as u16 / 2;
+                under
+                    .iter()
+                    .filter(|q| (q.x..q.x + q.w).contains(&x))
+                    .map(|q| q.h)
+                    .sum()
+            };
+            assert!(
+                height_at(12) >= g.ch as u16,
+                "the crown fills the caret's row (mono={mono})"
+            );
+            let tail = height_at(9);
+            assert!(
+                tail > 0 && f32::from(tail) < g.ch as f32 * 0.3,
+                "the tracer behind the crown is thin: {tail}px (mono={mono})"
+            );
+            assert_ne!(fp, 0, "an inked frame fingerprints non-zero");
             w.tick(
                 Some((4, 34)),
                 t0 + Duration::from_millis(640),
@@ -950,8 +1054,10 @@ mod tests {
                 g,
                 &mut out,
             );
-            assert!(out.is_empty());
-            assert!(!w.halos().is_empty(), "a jump leaves its veil and ring");
+            assert!(
+                !out.is_empty() && out.iter().all(|q| q.alpha > 0),
+                "a jump lands an ink ring"
+            );
         }
         // Negative control: the same run on a dark ground is additive light.
         let dark = cfg();
@@ -966,7 +1072,7 @@ mod tests {
             g,
             &mut out,
         );
-        assert!(!out.is_empty() && w.halos().is_empty());
+        assert!(!out.is_empty() && w.halos().is_empty() && w.under().is_empty());
     }
 
     /// After a coordinate-space change the next tick draws no comet from the old space.

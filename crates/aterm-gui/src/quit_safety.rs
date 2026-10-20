@@ -629,15 +629,23 @@ pub(crate) fn pid_bsdinfo(pid: libc::pid_t) -> Option<libc::proc_bsdinfo> {
 
 #[cfg(target_os = "macos")]
 fn platform_session_root(pid: i32) -> Option<SessionRoot> {
-    let info = pid_bsdinfo(pid)?;
-    let comm: String = info
-        .pbi_comm
-        .iter()
-        .take_while(|c| **c != 0)
-        .map(|c| char::from(c.to_ne_bytes()[0]))
-        .collect();
+    let comm = process_name(pid)?;
     let children = child_pids(pid)?;
     Some(SessionRoot { comm, children })
+}
+
+/// `pid`'s process name (its `comm`, at most 16 bytes), or `None` (gone,
+/// another user's, a platform without the read).
+#[cfg(target_os = "macos")]
+pub(crate) fn process_name(pid: i32) -> Option<String> {
+    let info = pid_bsdinfo(pid)?;
+    Some(
+        info.pbi_comm
+            .iter()
+            .take_while(|c| **c != 0)
+            .map(|c| char::from(c.to_ne_bytes()[0]))
+            .collect(),
+    )
 }
 
 /// `pid`'s live children, at most [`ROOT_CHILDREN_MAX`], from libproc, or
@@ -653,12 +661,107 @@ pub(crate) fn child_pids(pid: libc::pid_t) -> Option<Vec<libc::pid_t>> {
     Some(pids[..found].iter().copied().filter(|p| *p > 0).collect())
 }
 
+/// Whether the shell `shell_pid` runs a program it started at or after
+/// `since_ms` (unix epoch ms) that the terminal's foreground process group
+/// cannot show (`SessionFactory::program_probe`, `Terminal::set_program_probe`):
+/// on unix a live child in the shell's own process group (PowerShell runs
+/// every program there, so one a PSReadLine key handler starts holds no
+/// foreground of its own; a shell with job control gives each program a group
+/// of its own, which the foreground word sees), on windows any child the job
+/// walk vets ([`ChildLinks::has_job`]; ConPTY has no foreground group). A
+/// zombie has exited and is no such program. `false` when the table cannot
+/// answer.
+pub(crate) fn shell_runs_program_since(shell_pid: i32, since_ms: u64) -> bool {
+    if shell_pid <= 0 {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        capture_child_links().has_job(shell_pid.unsigned_abs(), Some(since_ms), process_facts)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Some(shell) = pid_bsdinfo(shell_pid) else {
+            return false;
+        };
+        child_pids(shell_pid).is_some_and(|children| {
+            children.into_iter().any(|child| {
+                pid_bsdinfo(child).is_some_and(|info| {
+                    let started_ms = info
+                        .pbi_start_tvsec
+                        .saturating_mul(1000)
+                        .saturating_add(info.pbi_start_tvusec / 1000);
+                    info.pbi_status != libc::SZOMB
+                        && info.pbi_pgid == shell.pbi_pgid
+                        && started_ms >= since_ms
+                })
+            })
+        })
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some((shell_group, _)) = linux_group_and_start_ms(shell_pid) else {
+            return false;
+        };
+        crate::foreground_handback::linux_children(shell_pid).is_some_and(|children| {
+            children.into_iter().any(|child| {
+                linux_group_and_start_ms(child).is_some_and(|(group, started_ms)| {
+                    group == shell_group && started_ms >= since_ms
+                })
+            })
+        })
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        let _ = since_ms;
+        false
+    }
+}
+
+/// Linux: `pid`'s process group and start time (unix epoch ms) from
+/// `/proc/<pid>/stat` (`pgrp`, and `starttime` in clock ticks since boot, set
+/// against the boot instant `CLOCK_BOOTTIME` gives,
+/// [`aterm_uds::process::boot_clock_now`]). `None` for a zombie (it has
+/// exited) or an unreadable record.
+#[cfg(target_os = "linux")]
+fn linux_group_and_start_ms(pid: i32) -> Option<(i32, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The fields after the parenthesized command, which may hold anything.
+    let mut fields = stat.get(stat.rfind(')')? + 1..)?.split_ascii_whitespace();
+    if fields.next()? == "Z" {
+        return None;
+    }
+    let group = fields.nth(1)?.parse::<i32>().ok()?;
+    let ticks = fields.nth(16)?.parse::<u64>().ok()?;
+    // SAFETY: sysconf reads a constant.
+    let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let per_second = u64::try_from(per_second).ok().filter(|t| *t > 0)?;
+    let aterm_uds::process::BootClock(since_boot_ns) = aterm_uds::process::boot_clock_now()?;
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis(),
+    )
+    .ok()?;
+    let since_boot_ms = since_boot_ns / 1_000_000;
+    let booted_ms = now_ms.checked_sub(since_boot_ms)?;
+    Some((group, booted_ms + ticks.saturating_mul(1000) / per_second))
+}
+
+/// See the macOS [`process_name`].
+#[cfg(target_os = "linux")]
+pub(crate) fn process_name(pid: i32) -> Option<String> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    Some(comm.trim_end().to_string())
+}
+
 #[cfg(target_os = "linux")]
 fn platform_session_root(pid: i32) -> Option<SessionRoot> {
-    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let comm = process_name(pid)?;
     let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).ok()?;
     Some(SessionRoot {
-        comm: comm.trim_end().to_string(),
+        comm,
         children: children
             .split_whitespace()
             .filter_map(|p| p.parse().ok())
@@ -669,6 +772,12 @@ fn platform_session_root(pid: i32) -> Option<SessionRoot> {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn platform_session_root(_pid: i32) -> Option<SessionRoot> {
+    None
+}
+
+/// See the macOS [`process_name`]: no read here.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn process_name(_pid: i32) -> Option<String> {
     None
 }
 
@@ -1557,5 +1666,91 @@ mod tests {
         assert!(!busy, "an unknown shell pid is idle, and buys nothing");
         assert_eq!(captures, 0);
         assert_eq!(probe.capture_count(), 0);
+    }
+
+    /// The program probe on real processes: a stand-in shell (`sh -c`, which
+    /// runs its programs in its own group, as PowerShell does) running a
+    /// program it started since an instant is seen; the same program before
+    /// the instant is not; and one the shell put in a group of its own (`set
+    /// -m`, as zsh, bash and fish do) is the foreground word's, never the
+    /// probe's.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_probe_sees_a_program_the_shell_runs_in_its_own_group() {
+        let now_ms = || {
+            u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("after the epoch")
+                    .as_millis(),
+            )
+            .expect("fits")
+        };
+        // Linux reads a start time to the clock tick: the instant is taken a
+        // little early so a program started right after it is after it.
+        let since = now_ms().saturating_sub(100);
+        let shell = |script: &str| {
+            aterm_uds::spawnfd::command("/bin/sh")
+                .args(["-c", script])
+                .stdin(aterm_uds::spawnfd::Stdio::null())
+                .stdout(aterm_uds::spawnfd::Stdio::null())
+                .stderr(aterm_uds::spawnfd::Stdio::null())
+                .spawn()
+                .expect("spawn sh")
+        };
+        // A hang detector: the shell forks its program.
+        let mut programs = Vec::new();
+        let mut with_child = |child: &aterm_uds::spawnfd::Child| {
+            let pid = i32::try_from(child.id()).expect("pid fits");
+            let forked = aterm_spec::wait::within(
+                aterm_spec::wait::MUST_HAPPEN,
+                std::time::Duration::from_millis(5),
+                || session_root(pid).filter(|root| !root.children.is_empty()),
+            );
+            programs.extend(forked.expect("sh forked its program").children);
+            pid
+        };
+        let mut own_group = shell("sleep 120; :");
+        let pid = with_child(&own_group);
+        assert!(shell_runs_program_since(pid, since), "started since");
+        assert!(
+            !shell_runs_program_since(pid, now_ms() + 3_600_000),
+            "started before the instant"
+        );
+        let mut job_control = shell("set -m; sleep 120 & wait");
+        let pid = with_child(&job_control);
+        // A hang detector: the shell moves its program to a group of its own
+        // just AFTER the fork (`setpgid`), and until then the program is in
+        // the shell's group, where the probe rightly counts it.
+        aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            std::time::Duration::from_millis(5),
+            || {
+                session_root(pid)
+                    .filter(|root| {
+                        !root.children.is_empty()
+                            && root.children.iter().all(|&program| {
+                                // SAFETY: getpgid reads a process's group.
+                                let group = unsafe { libc::getpgid(program) };
+                                group == program
+                            })
+                    })
+                    .map(drop)
+            },
+        )
+        .expect("sh moved its program to a group of its own");
+        assert!(
+            !shell_runs_program_since(pid, since),
+            "a program in a group of its own"
+        );
+        assert!(!shell_runs_program_since(-1, since), "no shell");
+        for program in programs {
+            // SAFETY: SIGKILL to a `sleep` this test's shell forked.
+            unsafe { libc::kill(program, libc::SIGKILL) };
+        }
+        for child in [&mut own_group, &mut job_control] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }

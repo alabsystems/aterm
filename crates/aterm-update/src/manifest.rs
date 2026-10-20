@@ -248,30 +248,43 @@ impl Ready {
     /// stamp, spawning no helper; full signature/policy verification stays at apply time.
     /// The floor must still admit it: a build since yanked, or signed by a machine since
     /// revoked ([`Floor::withdraws`]), is no update even before anything retires the stage.
+    /// A floor or quarantine record this read could not get through admits nothing this
+    /// pass ([`Floor::read_for_gate`], [`artifact_quarantined_for_gate`]), and nothing
+    /// retires a stage on this answer.
     pub(crate) fn is_publishable(&self, staging: &crate::paths::Staging) -> bool {
         self.is_published_bundle(staging)
-            && Floor::read(&staging.floor())
-                .withdraws(self.build_number, self.machine_id.as_deref())
-                .is_none()
+            && Floor::read_for_gate(&staging.floor()).is_ok_and(|floor| {
+                floor
+                    .withdraws(self.build_number, self.machine_id.as_deref())
+                    .is_none()
+            })
     }
 
     /// [`Self::is_publishable`] without the floor: the marker names a real published,
     /// non-quarantined bundle that rebinds to it. What a lane that retires a withdrawn
     /// stage looks for.
+    ///
+    /// A quarantined artifact is never an update: a stager that decided before a
+    /// crash-loop revert (or an older build's, which never asks) can publish it after the
+    /// revert, and every reader must see nothing staged. A quarantine record this read
+    /// could not get through is no word that it is not quarantined: `false` this pass
+    /// ([`artifact_quarantined_for_gate`]), so a lane that RETIRES on `false` judges the
+    /// records itself and asks [`Self::names_published_bundle`].
     pub(crate) fn is_published_bundle(&self, staging: &crate::paths::Staging) -> bool {
-        if !self.has_canonical_identity()
-            || !std::fs::symlink_metadata(&staging.staged_app)
+        self.names_published_bundle(staging)
+            && artifact_quarantined_for_gate(staging, self.build_number, &self.dmg_sha256)
+                == Ok(false)
+    }
+
+    /// [`Self::is_published_bundle`] without the records: the marker carries a canonical
+    /// identity, and the stage is a real directory (never a symlink) whose `Info.plist`
+    /// rebinds to it. No ledger is read, so the answer is the same however a read of
+    /// the floor or the quarantine would have gone.
+    pub(crate) fn names_published_bundle(&self, staging: &crate::paths::Staging) -> bool {
+        self.has_canonical_identity()
+            && std::fs::symlink_metadata(&staging.staged_app)
                 .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-        {
-            return false;
-        }
-        // A quarantined artifact is never an update: a stager that decided before a
-        // crash-loop revert (or an older build's, which never asks) can publish it after
-        // the revert, and every reader must see nothing staged.
-        if artifact_quarantined(staging, self.build_number, &self.dmg_sha256) {
-            return false;
-        }
-        cheap_staged_identity_matches(self, &staging.staged_app) == Some(true)
+            && cheap_staged_identity_matches(self, &staging.staged_app) == Some(true)
     }
 
     /// Read only a marker that passes [`Self::is_publishable`]. This is the one
@@ -543,10 +556,28 @@ pub struct FloorObservation<'a> {
     pub revoked: &'a [String],
 }
 
+/// The refusal of a gate that could not get through one of the update records it
+/// judges by (`error`: the floor, the quarantine ledger or `failed.toml` this read could
+/// not open or read just then): passing ([`crate::PASSING_REFUSAL_KEY`]), never the
+/// permissive default the record's display read falls back to. The words carry the
+/// remedy, since a record that stays unreadable (root-owned after `sudo`, a broken ACL,
+/// a failing disk) refuses every gate and check until someone fixes it.
+fn records_unreadable(error: String) -> String {
+    crate::verify::mark_passing(format!(
+        "aterm can't read its update records ({error}), so no update installs until it \
+         can — if this lasts, make that file readable again (it should be yours) or \
+         remove it"
+    ))
+}
+
 impl Floor {
-    /// Read the floor, defaulting to all-zero (no floor) when absent or unparseable: a
-    /// corrupt floor must not permanently wedge updates, and zero is the permissive value
-    /// of a lower bound.
+    /// Read the floor FOR DISPLAY, defaulting to all-zero (no floor) when absent,
+    /// unparseable or unreadable just then: a corrupt floor must not permanently wedge
+    /// updates, and zero is the permissive value of a lower bound. So it is never evidence
+    /// a build is admitted; anything that admits, announces or publishes one reads with
+    /// [`Self::read_for_gate`]. The callers left only describe or tighten: why a refused
+    /// publish was held, a roster re-read that takes a max, a pending build's clock, a
+    /// revert's floor-breach note.
     pub fn read(path: &Path) -> Self {
         crate::read_ledger_text(path)
             .and_then(|t| aterm_toml::from_str(&t).ok())
@@ -575,13 +606,7 @@ impl Floor {
     /// floor that stays unreadable (root-owned after `sudo`, a broken ACL, a failing disk)
     /// refuses every gate and check, and `commit_observation` can never rewrite it.
     pub(crate) fn read_for_gate(path: &Path) -> Result<Self, String> {
-        Self::read_for_replace(path).map_err(|error| {
-            crate::verify::mark_passing(format!(
-                "aterm can't read its update records ({error}), so no update installs until \
-                 it can — if this lasts, make that file readable again (it should be yours) \
-                 or remove it"
-            ))
-        })
+        Self::read_for_replace(path).map_err(records_unreadable)
     }
 
     /// Whether `machine` has been revoked by a roster this client admitted. An unnamed
@@ -1228,6 +1253,11 @@ pub fn quarantine_artifact(
 /// Whether `(build_number, sha256)` is quarantined on this machine: in the
 /// quarantine ledger, or in a `failed.toml` verdict (written by this build's revert
 /// beside the ledger, or by an older build's alone).
+///
+/// FOR DISPLAY AND THROTTLES: a record this read could not get through reads as "not
+/// quarantined". A gate that admits, publishes or swaps a stage reads
+/// [`artifact_quarantined_for_gate`]; the callers left say why a stage was held, or
+/// skip a download the publish would refuse anyway.
 #[must_use]
 pub fn artifact_quarantined(
     staging: &crate::paths::Staging,
@@ -1237,6 +1267,30 @@ pub fn artifact_quarantined(
     Quarantine::read(&staging.quarantine()).holds(build_number, sha256)
         || FailedMark::read(&staging.failed())
             .is_some_and(|mark| mark.is_quarantine() && mark.matches(build_number, sha256))
+}
+
+/// [`artifact_quarantined`] for a gate that admits a build (the publish, the swap, both
+/// pre-park checks, every reader of a published stage): a present ledger this read
+/// could not get through (`EMFILE`, `EIO`, a mode this uid cannot open) is a passing
+/// refusal ([`records_unreadable`]), never "not quarantined", which would let a
+/// crash-looped build back in on that read. An absent or unparseable file reads as
+/// holding nothing, as the writers read it ([`Quarantine::record`],
+/// [`FailedMark::clear_backoff`]). A ledger that holds the artifact answers without
+/// `failed.toml` being read.
+pub(crate) fn artifact_quarantined_for_gate(
+    staging: &crate::paths::Staging,
+    build_number: u64,
+    sha256: &str,
+) -> Result<bool, String> {
+    if Quarantine::read_for_replace(&staging.quarantine())
+        .map_err(records_unreadable)?
+        .holds(build_number, sha256)
+    {
+        return Ok(true);
+    }
+    Ok(FailedMark::read_for_replace(&staging.failed())
+        .map_err(records_unreadable)?
+        .is_some_and(|mark| mark.is_quarantine() && mark.matches(build_number, sha256)))
 }
 
 /// One bounded machine state as both spec tiers exchange it — variable name to
@@ -2082,6 +2136,58 @@ changelog = '''
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A floor this read could not get through publishes nothing: a stage signed by a
+    /// machine the floor revokes is not "verified and ready" while that floor cannot be
+    /// read (mode 000 stands in for `EMFILE`/`EIO`). NEGATIVE CONTROL: the same stage
+    /// under a readable floor that revokes nothing is publishable.
+    #[test]
+    fn an_unreadable_floor_publishes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let staging = crate::paths::Staging::scratch("publishable-floor-unreadable");
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let ready = Ready {
+            build_number: 54,
+            version: "0.54.0".into(),
+            commit: Some(commit.into()),
+            dmg_sha256: "ab".repeat(32),
+            team_id: "T".into(),
+            staged_at: String::new(),
+            changelog: None,
+            machine_id: Some("m11".into()),
+            roster_seq: None,
+            roster_confirmed_at: Some(crate::install::now_rfc3339()),
+        };
+        std::fs::write(&staging.ready, ready.to_toml().unwrap()).unwrap();
+        let contents = staging.staged_app.join("Contents");
+        std::fs::create_dir_all(&contents).unwrap();
+        std::fs::write(
+            contents.join("Info.plist"),
+            format!(
+                "<plist><dict><key>CFBundleVersion</key><string>54</string>\
+                 <key>ATermGitCommit</key><string>{commit}</string></dict></plist>"
+            ),
+        )
+        .unwrap();
+        std::fs::write(staging.floor(), "roster_seq = 3\n").unwrap();
+        assert!(Ready::read_publishable(&staging).is_some(), "PRECONDITION");
+        std::fs::write(
+            staging.floor(),
+            "roster_seq = 4\nrevoked_machines = [\"m11\"]\n",
+        )
+        .unwrap();
+        assert!(Ready::read_publishable(&staging).is_none(), "revoked");
+
+        let mode =
+            |bits| std::fs::set_permissions(staging.floor(), std::fs::Permissions::from_mode(bits));
+        mode(0o000).unwrap();
+        if std::fs::File::open(staging.floor()).is_ok() {
+            return; // root reads through any mode: nothing to stand in with
+        }
+        let read = Ready::read_publishable(&staging);
+        mode(0o600).unwrap();
+        assert!(read.is_none(), "an unreadable floor admitted {read:?}");
+    }
+
     /// The live parser (delegating to the shared aterm-update-core validator) refuses a
     /// `min_build` above its own build.
     #[test]
@@ -2223,6 +2329,13 @@ changelog = '''
             Some(true)
         );
         assert_eq!(floor.withdraws(5, Some("m3")), None);
+        // The yank is strict: a floor at a build admits it, one above withdraws it.
+        let yank = Floor {
+            min_build: 5,
+            ..Floor::default()
+        };
+        assert_eq!(yank.withdraws(5, None), None);
+        assert!(yank.withdraws(4, None).is_some());
         let _ = std::fs::remove_dir_all(root);
     }
 

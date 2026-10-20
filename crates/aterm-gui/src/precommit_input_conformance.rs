@@ -30,8 +30,8 @@ use aterm_models_update::native_update_precommit_input_model;
 use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 use aterm_spec::verify::validate_transition_tiered;
-use winit::event::WindowEvent;
-use winit::keyboard::ModifiersState;
+use aterm_window::event::WindowEvent;
+use aterm_window::keyboard::ModifiersState;
 
 use crate::WindowId;
 use crate::conformance_support::schedules;
@@ -47,7 +47,7 @@ struct Settled {
 /// One replay: the App, and what the user and the platform did to it.
 struct Rig {
     app: crate::App,
-    winit: winit::window::WindowId,
+    winit: aterm_window::window::WindowId,
     window: WindowId,
     /// TRUTH: input for the window was queued.
     typed: bool,
@@ -59,7 +59,7 @@ struct Rig {
 impl Rig {
     fn new() -> Self {
         let mut app = crate::App::headless_for_test();
-        let winit = winit::window::WindowId::from(0u64);
+        let winit = aterm_window::window::WindowId::from(0u64);
         let window = WindowId(0);
         app.winit_to_window.insert(winit, window);
         // The successor, revealed and waiting for Commit.

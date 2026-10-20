@@ -162,7 +162,8 @@ fn below_the_floor_with_every_profile_recent_the_oldest_goes_first_and_the_pass_
             target,
             short: target - GIB,
             released: expect,
-            left: 2
+            left: 2,
+            tier: Some(4),
         })
     );
     assert!(!b.join("debug/incremental").exists());
@@ -295,8 +296,10 @@ fn a_locked_profile_is_never_taken_under_pressure_even_when_it_is_the_oldest() {
     }
 }
 
-/// At or above the floor no recent profile is taken: no pressure row, no plan, no re-measure,
-/// and the owner's verb with `disk.apply` on takes nothing either.
+/// At or above the floor no recent profile is taken: no pressure row and no re-measure — at
+/// the floor (`low`) the pass plans the tiers `low` admits, none of which holds a recent
+/// profile, and above the warning it plans nothing — and the owner's verb with `disk.apply` on
+/// takes nothing either.
 #[test]
 fn above_the_floor_no_recent_profile_is_taken() {
     let tmp = Tmp::new("pressure-above");
@@ -304,7 +307,7 @@ fn above_the_floor_no_recent_profile_is_taken() {
     for free in [DEFAULT_AUTO_FREE_GIB * GIB, 500 * GIB] {
         let (survey, rep) = surveyed(&tmp, &[a.clone(), b.clone()], now, free);
         assert!(pressure_order(&rep).is_empty(), "{rep:?}");
-        assert_eq!(auto_plan(&rep), None);
+        assert!(auto_plan(&rep).unwrap_or_default().is_empty(), "{free}");
         let done = apply_auto(
             &rep,
             survey.transcripts_root.as_deref(),
@@ -312,7 +315,7 @@ fn above_the_floor_no_recent_profile_is_taken() {
             &mut no_pressure,
             &mut |_| true,
         );
-        assert_eq!(done, None);
+        assert!(done.unwrap_or_default().removed.is_empty());
         let rep = report(&survey, applying());
         let done = apply(
             &rep,
@@ -354,7 +357,8 @@ fn a_profile_built_within_the_last_minutes_is_kept_under_pressure() {
     );
 }
 
-/// Idle profiles go first and whole, with no re-measure; only then does the pressure pass
+/// Idle profiles go first (tier 2, measured again and stopped at the warning — below the
+/// floor, never short of where tier 4 stops); only then does the pressure pass (tier 4)
 /// measure and stop. Here the idle profile alone is enough.
 #[test]
 fn idle_profiles_go_first_and_whole_before_any_recent_one() {
@@ -386,7 +390,10 @@ fn idle_profiles_go_first_and_whole_before_any_recent_one() {
         &mut |_| true,
     )
     .expect("below the floor");
-    assert_eq!(reads, 1, "the idle row needs no measurement");
+    assert_eq!(
+        reads, 2,
+        "measured before the idle row and before the first recent one"
+    );
     assert_eq!(done.removed.len(), 1, "{done:?}");
     assert_eq!(done.removed[0].1.units, vec![a.join("release/incremental")]);
     assert_eq!(done.stopped.as_ref().map(|s| s.left), Some(2));
@@ -491,6 +498,7 @@ fn a_re_measure_that_never_rises_stops_once_the_counted_bytes_cover_the_shortfal
             short: first,
             released: first,
             left: 2,
+            tier: Some(4),
         })
     );
     assert!(a.join("debug/incremental").exists(), "more recent: kept");
@@ -533,7 +541,7 @@ fn with_a_zero_day_window_a_profile_built_minutes_ago_is_still_never_taken() {
             threshold_days: 0,
             device: None,
         }),
-        &mut no_pressure,
+        &mut || Some(GIB),
         &mut |_| true,
     )
     .expect("below the floor");

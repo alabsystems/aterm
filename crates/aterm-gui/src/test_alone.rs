@@ -388,6 +388,7 @@ pub(crate) struct Running {
 
 impl Running {
     /// Its process id.
+    #[cfg(unix)]
     pub(crate) fn id(&self) -> u32 {
         self.child.id()
     }
@@ -465,6 +466,7 @@ impl Running {
 
     /// Leave it running past this handle: a stand-in that must outlive the
     /// process that spawned it (its parent's death is the subject).
+    #[cfg(unix)]
     pub(crate) fn detach(mut self) {
         self.detached = true;
     }

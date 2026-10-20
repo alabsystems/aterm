@@ -85,8 +85,9 @@ pub fn waivers() -> impl Iterator<Item = &'static Waiver> {
 // `ratio=1.000 bound=11 waived=0 [ACTIVE]`.
 //
 // THE MECHANISM. In `cfg(any(test, debug_assertions))` builds — the cfg the anchor
-// ATTRIBUTE is under — the macro ALSO injects, as the first statement of the
-// annotated fn's body, a call to [`note_entered`] with the anchor's
+// ATTRIBUTE is under — the attribute (the `macro_rules!` one on a Trust compiler, the
+// aterm-spec-macros proc macro elsewhere: the crate docs) ALSO injects, as the first
+// statement of the annotated fn's body, a call to [`note_entered`] with the anchor's
 // [`RefinementAnchor::entry_id`].
 //
 // WHAT THAT CFG GATES, AND WHAT IT DOES NOT. The cfg gates the ATTRIBUTE, hence the

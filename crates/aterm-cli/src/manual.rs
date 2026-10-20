@@ -134,10 +134,9 @@ KEY USAGE
 
 WHEN TO REACH FOR IT
   Use `aterm` for a daily-driver shell in the current terminal. Use
-  `aterm --window` for a real window (tabs, splits, HiDPI, and the menu bar's FABRIC
-  menu: the fleet, this session's inbox and ledger, the halt, the connection rows and
-  `aterm fabric` on/off/status — see `aterm help fabric`). Use `aterm ctl` to introspect
-  or drive a RUNNING instance from the outside.
+  `aterm --window` for a real window (tabs, splits, HiDPI, and the Agents menu and the
+  menu bar's ❯, which say what needs you and let you step in — see `aterm help needs`).
+  Use `aterm ctl` to introspect or drive a RUNNING instance from the outside.
 
 GOTCHAS
   * `aterm <tool>` for a tool the store knows but has not installed exits 127 with
@@ -191,12 +190,78 @@ GOTCHAS
         tagline: "which Rust toolchain THIS directory gets — measured, not guessed (default: Trust)",
         body: None, // generated — see `rust_page()`
     },
+    Topic {
+        name: "abrew",
+        tagline: "aterm's Homebrew: brew re-routed to abrew, real brew one flag away",
+        body: Some(
+            r#"abrew — aterm's Homebrew (`abrew`, `atpkg-abrew`, `aterm pkg abrew`;
+design: docs/DESIGN-abrew-2026-10-19.md).
+
+WHAT IT IS
+  A native, Rust reimplementation of the brew command inside atpkg, over
+  Homebrew's data (the formulae.brew.sh API and GHCR bottles) with its own
+  prefix, cellar and receipts — no Ruby is executed. Inside an aterm
+  session, `brew` itself re-routes to abrew (a stub beside the cargo/rustc
+  reroute stubs): one stderr line says so. Real Homebrew is never modified
+  and is one flag away (ESCAPES). Homebrew itself is bundled into atpkg:
+  `abrew bundle` lays a pinned, checksum-verified Homebrew under the abrew
+  prefix as the fallback for anything abrew delegates, so a machine needs
+  no pre-existing brew install.
+
+KEY USAGE
+  abrew install [--formula|--cask] <name>      relocation-free bottles and
+                             simple zip/tar casks, natively
+  abrew uninstall [--formula|--cask] <name>    remove one
+  abrew update / upgrade / outdated / list / info / search / doctor
+  abrew deps [--tree] / uses / leaves / missing / autoremove / cleanup
+  abrew tap <user/repo>      managed tap clones (a qualified install runs
+                             real brew: the tap's recipe is Ruby)
+  abrew bundle [status|remove|dump|check|install]   the Homebrew bundle / Brewfile
+  Source builds (-s/--HEAD), replacements, services, --zap, multi-name
+  and qualified forms run real Homebrew: abrew admits only operations it
+  can do faithfully itself and delegates the rest before any effect.
+  abrew shellenv             PATH edits for the prefix's bin (eval it)
+  abrew on | off | status    the brew reroute toggle and what stands where
+
+ESCAPES — real Homebrew, unchanged
+  brew --real <cmd>…     one command, real brew (bundled first, then system)
+  ABREW_REAL=1           this shell runs real brew
+  abrew off              persistent, until `abrew on`
+  [abrew] enabled=false  in aterm.toml: no stub is laid at all
+  Anything abrew does not implement yet passes through to real brew with a
+  one-line notice naming the delegation — nothing silently breaks.
+
+GOTCHAS
+  * `pkg` cask installers are root work: abrew delegates them to real brew.
+  * No formula Ruby runs: a custom `def install` body delegates to real brew.
+  * `abrew linkage <formula>` names any binary still pointing at the build
+    prefix (admission refuses such bottles before pouring); `abrew doctor`
+    reports stub and prefix state, and itself takes the writer lock.
+  * Metadata reads may create/refresh the API cache under the prefix;
+    `abrew config` prints ABREW_* variables (real brew's HOMEBREW_* set
+    is `brew --real config`)."#,
+        ),
+    },
     // A topic, not only an alias: the primer sends every agent to `aterm help`
     // and promises the mailbox is documented there.
     Topic {
         name: "fabric",
         tagline: "peer messaging: this session's INBOX, `post`, `trust=` and the halt",
         body: Some(FABRIC_PAGE),
+    },
+    // The brief's WORKERS line points here; the supervise-agent skill is the
+    // same at more depth.
+    Topic {
+        name: "workers",
+        tagline: "Claude Code workers in other tabs: start, wait, read the result; the survey",
+        body: Some(WORKERS_PAGE),
+    },
+    // The window's owner surfaces: the IN THE WINDOW lines of the fabric page and
+    // the ❯ item's own words point here.
+    Topic {
+        name: "needs",
+        tagline: "what needs you: the words, the ❯ badge, the border and pill, Take Over",
+        body: Some(NEEDS_PAGE),
     },
     Topic {
         name: "conn",
@@ -227,22 +292,25 @@ KEY USAGE
                              spawn a new session pre-wired `both` (controller: the
                              newborn supervises --of, and its shell receives
                              ATERM_OBSERVE_SESSION_ID naming its charge)
-  aterm conn show @<sid>     raise the peer's window + tab;   aterm conn map   the GUI map
+  aterm conn show @<sid>     raise the peer's window + tab;   aterm conn map   Overview
 
 WHEN TO REACH FOR IT
-  The unattended-operator story: start a worker session (any coding agent), then
-  `aterm conn spawn controller` from inside it — the newborn supervisor holds
-  pull+push over the worker and drives it with `aterm ctl @<worker> turn '...'`
-  whenever it needs an answer or a prod. Reach for `conn` whenever "which session is
-  wired to which" is the question, or to add/dissolve that wiring from a shell.
+  `conn` is wiring: who may read or type into whom. Reach for it whenever "which session
+  is wired to which" is the question, or to add/dissolve that wiring from a shell. It is
+  not how work is handed to a coding agent: a task goes as a WORKER's first prompt
+  (`aterm ctl @self spawn agent=claude -`, the task on stdin), `aterm ctl await task
+  @<sid> since=0` run in the background wakes you at its done, and `aterm ctl @<sid>
+  result` is its report — the window's harness already supervises it (`aterm help
+  workers`).
 
 GOTCHAS
   * Peers are SELECTORS (@self / @<sid> / @<local-id>) — never titles (ambiguous).
     Outside an aterm session the @self forms refuse and name $ATERM_PARENT_SESSION_ID;
     everything else targets the latest instance, exactly like `aterm ctl`.
   * Owner-authority only: the verbs ride the instance token beside the control socket
-    (same user). A connection is standing wiring — dissolve it with `conn rm`, close
-    either endpoint, or the GUI Disconnect; a cold restart dissolves by design.
+    (same user). A connection is standing wiring — dissolve it with `conn rm` or by
+    closing either endpoint; a cold restart dissolves by design. The window makes and
+    removes none: this CLI and the wire verbs are the whole of it.
   * `conn` is presentation over the wire verbs (connect / disconnect / flows / raise) —
     `aterm ctl connect dst=... src=...` is the same act, byte-for-byte."#,
         ),
@@ -261,19 +329,21 @@ WHAT IT IS
   `aterm agents` manages a short, marked block in those files: two `##` sections.
   The aterm section — how to DETECT
   aterm ($TERM_PROGRAM=aterm / $ATERM_CHILD=1), that `aterm help` prints the agent
-  operating brief, which CLAUDE*/CODEX_*/... env vars are stripped, the inbox, that the
-  harness's `keep going` is not the person's decision, what a finished job is (every part
-  the agent can still do done and verified; what is left a person's or impossible on that
-  host, each item named with its blocker) and the ATERM-TASK-DONE token that says so —
-  tells the agent to ignore it outside aterm. The Rust section
+  operating brief, which CLAUDE*/CODEX_*/... env vars are stripped, the survey, how to
+  start a Claude Code worker and read its result, the inbox, that the harness's `keep
+  going` is not the person's decision, what a finished job is (nothing of it left:
+  everything committed and pushed, nothing uncommitted, untracked, stashed or unpushed,
+  and a report that names no follow-up or open item, a blocked one included) and
+  ordinary-language reporting — tells the
+  agent to ignore it outside aterm. The Rust section
   applies in any terminal where the Trust toolchain is installed (it is on PATH in
   every shell).
 
   It ALSO installs the bundled SKILLS: whole files aterm ships and owns, written into
   the agent's own skills or commands directory. Claude Code gets five, under
   `~/.claude/skills/<name>/SKILL.md`: `drive-aterm` (drive/observe ONE other aterm
-  session over the control socket), `supervise-agent` (the SUPERVISION loop on top:
-  run a worker agent, review each turn against ground truth, escalate, resume),
+  session over the control socket), `supervise-agent` (WORKERS on top: start other
+  Claude Code sessions on tasks, wait for them, check each result against ground truth),
   `rust-in-aterm` (Rust here means the Trust toolchain, and what each refusal means),
   `aterm-themes` (design, check, preview and commit a colour theme; what a theme
   file may never hold) and `aterm-fabric` (peer messaging: inbox, post, trust, the
@@ -380,6 +450,98 @@ WHO MAY CONNECT
   registers nothing with a keeper serving under it. The installed app
   and every dev tree use different sockets and launchd labels
   (`com.aterm.aterm.keeper` is the installed app's)."#,
+        ),
+    },
+    Topic {
+        name: "caffeine",
+        tagline: "the menu-bar keep-awake mug — a click keeps this Mac awake (on | off | status | startup | quit)",
+        body: Some(
+            r#"caffeine — the menu-bar keep-awake mug (`aterm caffeine`): a coffee mug with
+an "a" on it, in the menu bar, that keeps this Mac awake while it is full.
+macOS only; elsewhere the verb says so and does nothing.
+
+WHAT IT DOES
+  A full mug means its process holds a keep-awake activity: neither the
+  system nor the display sleeps for being idle (`pmset -g assertions` lists
+  the activity; it ends with the process). If the activity cannot begin,
+  the mug stays empty and its tooltip says so. Only idle sleep: closing a
+  laptop's lid or choosing Sleep still sleeps the Mac.
+
+CLICKS
+  Click         Off -> on until the next click; on -> off.
+  Right click   The menu. A Control-click opens it too.
+
+THE MENU
+  aterm Caffeine <version> — keeps this Mac awake, by Andrew Yates · ...
+                The about line: text only.
+  Activate for 1 Hour, 8 Hours, 24 Hours
+                On for that long, then off by itself. The one in effect is
+                checked and shows the time it has left.
+  Activate Forever
+                On until a click (or `aterm caffeine off`) turns it off.
+  Enable at Startup
+                Put the mug back in the menu bar at every login.
+  Quit Caffeine
+                Turn off and take the mug out of the menu bar.
+
+VERBS
+  aterm caffeine [start]
+      Put the mug in the menu bar (start its launchd job) and return.
+  aterm caffeine on [1h|8h|24h|forever|<n>h|<n>m]
+      Request keeping the Mac awake, forever by default or for the span
+      (at most a year), starting the mug when needed. caffeine=requested
+      acknowledges the request, before the mug applies it.
+  aterm caffeine off
+      Stop keeping it awake. The mug stays in the menu bar.
+  aterm caffeine status
+      The saved request and deadline while a mug runs (off while none
+      runs), not an activity acknowledgment or fresh powerd probe. A known
+      activation refusal saves Off. Also the running pid and its job (else
+      this build's), startup setting and label. One key=value a line.
+  aterm caffeine startup [on|off]
+      Say whether Enable at Startup is on for this build; `on` or `off`
+      sets it, as the menu row does, and `off` also removes the login item
+      of any build that is gone. A running mug is left as it is.
+  aterm caffeine quit
+      Turn off and end the mug, as Quit Caffeine does, whichever build
+      started it.
+  aterm caffeine serve
+      The mug itself: what its launchd job runs, not a command to type.
+
+WHEN IT TURNS OFF BY ITSELF
+  A timed span ends on the wall clock: 8 hours set at 09:00 end at 17:00
+  whether or not the Mac slept between. A restart of the Mac starts the mug
+  off, whatever it was before. Quit turns it off.
+
+WHERE IT RUNS
+  The mug is its own launchd job in your login session
+  (`com.aterm.aterm.caffeine` for /Applications/aterm.app, a per-path
+  `com.aterm.aterm.caffeine.dev.<hash>` for any other build), never a child of
+  an aterm tab, so closing aterm leaves it running. It runs from its own copy
+  of the app: an AppKit process started from aterm.app itself would check in
+  as aterm, and every Finder, Dock or Spotlight open of aterm would go to the
+  mug and open no window. After an update of aterm it restarts on the new
+  build within a minute.
+
+FILES
+  ~/Library/Application Support/aterm/caffeine.state
+      The mode (off, forever, or until a time) and the boot it was set in.
+  ~/Library/Application Support/aterm/caffeine.lock
+      Held by the running mug, its pid and its job's label inside: one
+      mug per user.
+  ~/Library/Application Support/aterm/caffeine-code.noindex/
+      The copy of the app the mug runs from, kept out of backups.
+  ~/Library/Application Support/aterm/caffeine/<label>.plist
+      The job `aterm caffeine` starts for this login.
+  ~/Library/LaunchAgents/<label>.plist
+      Present exactly when Enable at Startup is on.
+  ~/Library/Logs/aterm/caffeine.log
+      What the mug's job writes to stderr; its log records go to aterm.log
+      beside it.
+  Uninstalling aterm (`aterm pkg self-uninstall`) turns that build's Enable
+  at Startup off. When the last aterm install goes, it also asks the mug to
+  quit. Shared files stay while another install uses them, or if shutdown
+  or the idle lock cannot be confirmed. The small lock file itself remains."#,
         ),
     },
     Topic {
@@ -498,38 +660,93 @@ docs/DESIGN-machines-2026-10-16.md is the design. macOS only.
 HOW IT WORKS
   The controller keeps an inventory (machines.toml), baselines (the settings each
   host should have), a fleet SSH key and two signing keys, all under aterm's
-  config directory in machines/. Each host runs no daemon: the fleet key may run
-  only the agent's dispatcher there, and anything done as root needs an envelope
-  signed by one of the controller's signing keys, which the host checks with
-  Apple's own ssh-keygen. One sudoers rule, pinned to the agent's digest, lets the
-  agent apply a signed envelope and nothing else.
+  config directory in machines/ (the first verb that needs them makes them).
+  Each host runs no daemon: the fleet key may run only the agent's dispatcher
+  there, and anything done as root needs an envelope signed by one of the
+  controller's signing keys, which the host checks with Apple's own ssh-keygen.
+  One sudoers rule, pinned to the agent's digest, lets the agent apply a signed
+  envelope and nothing else.
 
 ONCE, AT EACH MAC
   System Settings ▸ General ▸ Sharing: set the Computer Name to the case label,
   turn on Remote Login with "Allow full disk access for remote users", and turn
   on Screen Sharing for administrators. Then from the controller:
-    aterm machines enroll <address> --user <admin> --fingerprint SHA256:…
+    aterm machines enroll <address>
     aterm machines apply <host>
   (enroll installs the agent, apply installs aterm.app and the rest of the
   baseline), and, still at the Mac, `aterm machines person <host> --here` for the
-  Full Disk Access and Developer Tools switches only a person can flip.
+  Full Disk Access and Developer Tools switches only a person can flip. A Mac
+  with Remote Login off is skipped with one line that says to turn it on.
+  enroll logs in as the admin the Macs enrolled before have, else as your login
+  name (--user <admin> names another account), and recognises each Mac from its
+  first connection on, printing its ID (its host key's fingerprint); to check
+  that ID instead, pass --fingerprint SHA256:… (at the Mac: ssh-keygen -lf
+  /etc/ssh/ssh_host_ed25519_key.pub).
+  Many Macs at once: `enroll <address> <address>…`, or `enroll --found` for every
+  Mac `scan` sees that is not enrolled yet (one that advertises macOS's SFTP or
+  Screen Sharing beside Remote Login, never this Mac; a Linux box advertising
+  Remote Login alone is left). Each Mac's host key fingerprint is printed first;
+  then the admin's password is asked once, for all of them, kept in memory only,
+  and fed through pipes to each Mac's ssh login and its sudo (never an argument,
+  a variable or a file). Trust on first use means whatever answers first gets
+  that password: with --found, any machine on the LAN that advertises a Mac's
+  Remote Login, so enroll on a LAN you control. A host at an enrolled Mac's
+  address must show that Mac's pinned key, or gets nothing. Macs run a few at a time,
+  each one's lines prefixed by its name. When the Macs refuse the password and
+  --user named no account, enroll asks the admin account's name, once, and tries
+  the password already typed under it before asking anything else; each Mac
+  that still refuses is asked for once, and a password one Mac takes is tried on
+  every other Mac still refusing. A Mac enrolled already is nothing to do (it
+  does not fail the command), so running the same command again finishes the
+  ones skipped. Any other Mac that cannot be enrolled says so on its own line,
+  and the command ends with what it enrolled and one line per Mac it did not.
+  apply names each Mac for what it reads of itself, "m10 MacBook Pro M4 Max 36GB
+  1TB" (m10-MacBook-Pro-M4-Max-36GB-1TB.local; the disk is the internal one, at
+  the size Apple sells it), behind the tag its name starts with, and unsets a
+  HostName set by hand, so `hostname`, prompts and ssh show the new name; for
+  the plain name write "{name}" in the baseline's [names]. A renamed Mac is found at its
+  new .local name even when the apply's report was lost, and a Mac held by an
+  IP address that DHCP moved at its .local name, once ssh answers there under
+  its pinned host key.
+  `apply --all --only names` does that alone: --only <table>,… runs just those
+  baseline tables (an unknown one is refused with the list), after the agent
+  upgrade apply always sends first; the agent keeps the other tables' cached
+  downloads. status and outstanding keep each other table's last result, and
+  say when the rest was never run.
+
+KEYS
+  init makes the signing and recovery keys with no passphrase, so plan and apply
+  sign unattended, and anyone who can read keys/ can sign. `init --passphrase`
+  has ssh-keygen ask one for each, also for keys an earlier init made without
+  one; a key in ssh-agent is then never asked again.
+  Optional: move keys/recovery (not its .pub) to removable media, and back up
+  machines/ beside it. The recovery key re-keys the fleet (`rekey --key`), but a
+  lost controller with no backup of machines/ means a visit to every Mac.
 
 THE VERBS
-  init                      make this Mac the controller
-  scan [--subnet <cidr>]    Macs on the LAN (Bonjour's Remote Login and Screen
-                            Sharing advertisements; port 22 across a /22 at most)
-  enroll | unenroll         add a Mac (at a terminal) or remove one
+  init [--passphrase]       make this Mac the controller (automatic on first use)
+  scan [--subnet <cidr>]    Macs on the LAN (Bonjour's Remote Login, SFTP and
+                            Screen Sharing advertisements; port 22 across a
+                            /22 at most)
+  enroll | unenroll         add Macs (the password typed once; --found: every
+                            Mac scan sees) or remove one
   ls | status | outstanding the inventory, each host's newest report (a refusal,
                             os-changed, the agent it runs), the to-do list
-  plan | apply [<host>…|--all]
-                            bring hosts to their baseline; plan changes nothing
+  tabs [<host>…] [--json]   spreadsheet of all accessible computers, their aterm
+                            instances and open tabs, and live AI CLI status (also
+                            in the GUI at Settings ▸ Harness ▸ Tab Control, /tabs)
+  plan | apply [<host>…|--all] [--only <table>,…]
+                            bring hosts to their baseline (or those tables of
+                            it); plan changes nothing, and with no host named
+                            plans them all
   attach <host> [<run>]     follow a run whose connection dropped
   run <host>… [--user <u>] -- <argv>
                             one program, no shell, as root or the account <u>
   person [<host> --here]    the switches only a person can flip; --here at the Mac
   screen <host>             the same over Screen Sharing; a Mac you logged in to
                             over it is locked again when the walk ends or is
-                            stopped (Ctrl-C), though not if aterm is killed
+                            stopped (Ctrl-C), or by the Mac itself a minute
+                            after aterm is killed or loses it
   github revoke | rekey     a host's GitHub keys (never registered again once
                             revoked); the signers every host trusts
   here plan|apply <file>    run a baseline on this Mac directly (apply under sudo)
@@ -544,7 +761,9 @@ LOCAL NETWORK
   macOS asks before aterm may reach the LAN. Without that access no host answers
   and each finds no route, so aterm machines says it once, in place of the hosts:
   System Settings ▸ Privacy & Security ▸ Local Network. One host answering shows
-  the access is there; a Mac that alone finds no route is just unreachable."#,
+  the access is there; a Mac that alone finds no route is just unreachable. A
+  command that reaches one Mac (enroll, attach, person --here, screen, unenroll)
+  has no other host to show that, so its no-route line names the pane too."#,
         ),
     },
     Topic {
@@ -574,7 +793,11 @@ WHAT IT IS
   * every box gets its answer: a permission box its one-shot allow (any tool, any
     vendor note, every rm circuit breaker; never "don't ask again", a session grant
     or a purchase — credits the account turned off stay off — and a box with no yes
-    it may take gets its `No`); the folder-trust dialog its Yes; a plan its yes that
+    it may take gets its `No`); a box that asks to go on with usage credits
+    (`Continue with …` where it names usage credits or extra usage) is cancelled
+    with Esc (`credits-decline@v1`; the menu bar where it shows no `Esc to
+    cancel`) unless usage_credits = true (below), and another `Continue with …`
+    gets its yes; the folder-trust dialog its Yes; a plan its yes that
     grants no standing mode (`Yes, manually approve edits`); Claude Code's
     model-refusal pause (exactly its switch and its retry) its switch while
     `model_fallback` is set (no other box's model switch is ever pressed); the
@@ -585,20 +808,27 @@ WHAT IT IS
     Code's MCP server dialog is yours at every level, never pressed or Escaped:
     each answer, Esc too, is saved for good in the project's
     .claude/settings.local.json (`claude mcp reset-project-choices` undoes it).
-    A box taller than the pane is pressed at no level: it is answered once the
-    pane shows it whole, and is yours until then (in a bypass session one whose
-    foot flags an rm is declined with that note). No press ever chooses an answer
-    kept for later asks (`don't ask`, `keep allowing`, `always`, `from now on`, …)
-    or a purchase. A press no rule proved is
-    ledgered `unproven: <why>`; a press that did not land is tried again.
+    A box taller than the pane is answered whole where Claude Code's main screen
+    holds its head in the 400 history rows right above the screen (read back
+    from the history, the screen unchanged meanwhile, the rows reading as that
+    one box); anywhere else (the fullscreen renderer, which keeps no history; a
+    head further up; a join the history does not prove) it is pressed at no
+    level: you are told, and it is answered once the pane shows it whole (in a
+    bypass session one whose foot flags an rm is declined with that note). No
+    press ever chooses an answer kept for later asks (`don't ask`,
+    `keep allowing`, `always`, `from now on`, …) or a purchase. A press no
+    rule proved is ledgered `unproven: <why>`; a press that did not land is
+    tried again.
     A box your own Claude Code settings send to you is yours at every level: by
     its reason row; a file box draws none, so it is held under a bare ask rule
     in the agent's settings (`Edit`, `Write`, `Read`, …) for a tool that draws
     it, and the Edit tool's box or the IDE diff, which a Bash `sed -i` is drawn
     as, under any Bash ask rule or PreToolUse hook that can match Bash too.
-    Transcript candidates do not remove these holds: an older matching call
-    can remain pending while a later box is already on screen, even at a
-    complete transcript EOF. Other rules with a specifier
+    Transcript candidates and screen rows never remove these holds: an older
+    Edit of the same file can remain pending at a complete transcript EOF
+    while a newer Bash `sed -i` draws the box under a queued Edit's row, its
+    own `Waiting…` row off-screen. The box stays yours even where the screen
+    and transcript both suggest Edit. Other rules with a specifier
     (`Write(src/**)`) and other hooks are Claude Code's to match: a file box
     only they sent is answered like any other.
   * a question is no permission, and `approve` does not limit it: the question
@@ -617,7 +847,8 @@ WHAT IT IS
     `answer-short-term@v1`). Muse Code's question takes that text as
     the note of `None of the above` (Muse Code's then shows a review, sent only
     while it holds that note). A text it did not write is a person's, and it never
-    writes one twice; where it cannot type (a preview tab, a pane too small, a
+    writes one twice into a dialog (the same question asked again in a new one is
+    written afresh); where it cannot type (a preview tab, a pane too small, a
     window without the person fence) it answers with the recommended option.
     ONE SESSION can say otherwise: `aterm ctl @<sid> meta set questions
     ask|recommended|long-term|short-term` decides that session's questions over
@@ -627,16 +858,16 @@ WHAT IT IS
     with `aterm drive answer @<sid> <choice>`; `meta unset questions` hands it back,
     and a dialog already waiting is answered within 2 s of being handed back. A
     question asked in prose, which neither of those can answer, is left to the table
-    under `ask`. A loop's own `--no-answer` gives no
-    session a say. A dialog the supervisor's own keys answered — Claude Code's, or
-    an agy, Gemini CLI or Muse Code question — is told once: `CHOSE …
-    policy=<word> <question → answer>` in the journal, and `◆ chose` on the band
-    with a short chime (`choice_sound`) and one rim pulse.
+    under `ask`. A dialog the supervisor's own keys answered — Claude Code's, or an
+    agy, Gemini CLI or Muse Code question — is told once: `CHOSE … policy=<word>
+    <question → answer>` in the journal, and one story point on the session
+    (`status story=`), a record: nothing is drawn or played.
   * Claude Code's usage-limit dialog is no permission either, and `approve` does not
     limit it: it gets its "Wait here, then continue automatically" row, chosen by
     its label with fenced arrows and a confirmed Enter (`limit-wait@v1`,
     `limit_wait`), so the session goes on by itself at the reset — never `Stop`,
-    usage credits, an upgrade, or a reset that claims at once; a menu
+    usage credits (whatever usage_credits says), an upgrade, or a reset that
+    claims at once; a menu
     without that row goes to the menu bar. A limit reset your plan offers in that
     dialog is taken only under `limit_reset = true` (`limit-reset@v1`, in front of
     the wait): BUILT, OFF BY DEFAULT, NEVER RUN AGAINST A REAL WALL. It takes one
@@ -665,33 +896,42 @@ WHAT IT IS
     transcript says closed with nothing pending is an ended turn)
     gets its continuation — on a back-off that doubles to an hour while turns keep
     ending short or saying they are done; the harness's own turns (a notice's
-    READY, a carry-on's reply) are no short turns of the worker's, and a carry-on
-    answered with real work ends the streak as the worker's work does — and
-    NOTHING goes into a session nobody has asked anything: no continuation,
-    answer, retry or carry-on until a person or an orchestrator has (the
+    readiness answer, a carry-on's reply) are no short turns of the worker's,
+    and a carry-on answered with real work ends the streak as the worker's work
+    does — and NOTHING goes into a session nobody has asked anything: no
+    continuation, answer, retry or carry-on until a person or an orchestrator has (the
     conversation's own record says whose prompts it holds, a first prompt
     counting from the moment it is sent; the harness's own turns are no task —
     its notices and carry-ons, marked `[aterm harness]`, and what the supervisor
     itself typed, by its ledger — the ledgers of every tab that held the
-    conversation, a cold restore's reopened tab and the one it replaced). A
-    PERSON'S OWN EXCHANGE is theirs: a turn their
+    conversation, a cold restore's reopened tab and the one it replaced, and
+    every tab the upgrade ledger records moving the conversation in, until
+    it records it elsewhere). A PERSON'S OWN EXCHANGE is theirs: a turn their
     window gesture opened (inside the turn, after the harness's last point and
     act), answered within 10 min with no wall or Esc, on a task the harness
     was not already continuing, gets nothing — no continuation, answer or done
     check — until the next turn ends, whatever its reply says (`LEFT …
     rule=left-to-person@v1`), a new supervisor of the tab (or of the tab a
     cold restore reopened it in) and a relaunch included (`done:left`) while
-    that exchange is still the conversation's last turn: continuation is for
-    jobs, not questions. One whose message met a wall gets the wall's retry,
+    that exchange is still the conversation's last turn (a command Claude
+    Code answers itself, `/config` or a `!` command, is no turn; a build
+    through 0.105.0 named no turn, and its journal's `LEFT` note does: the
+    turn whose prompt the transcript records at or before it) — and a new
+    supervisor that took over while the exchange ran, or after the task's
+    end, an earlier exchange, Off or an Esc that stopped the answer to its
+    continuation, judges it as the one before it would have: continuation
+    is for jobs, not questions. One whose message met a wall gets the wall's retry,
     and its answer is theirs while the work before and after the wall stays
     within those 10 min in all (a wall splits a job, it never makes it an
-    exchange), a new supervisor whose first point is that wall included.
+    exchange), a new supervisor whose first point is that wall included, and
+    one whose first point is the retry's answer, or a relaunch after it
+    (`done:left`), as well.
     Claude Code's own compaction of an idle conversation (`Compacted while
     idle, before the prompt cache expired`) ends no turn, and the worker's
     last words are read through it: a finished task, a person's exchange and
     a question held for a person stand as they were. Nor into a task that is
-    FINISHED — its worker's last line `ATERM-TASK-DONE`, or a second done reply
-    to the done check — until a person's or an orchestrator's prompt is in the
+    FINISHED — its worker's done reply to the done check — until a person's or
+    an orchestrator's prompt is in the
     conversation's record (a peer session's message is one, and so is one
     typed while the agent works): Claude Code's own wakes (a background task
     finishing, its usage-limit continuation), a relaunched agent's start-up, a
@@ -705,24 +945,51 @@ WHAT IT IS
     and the done check in place of its `keep going` (`continued:check`), as the
     supervisor would type it there (`Approve nothing irreversible…` after it
     where the report names an irreversible act), and its answer is the
-    check's: the worker's own word that it is done ends the task. A look at
+    check's: the worker's own word that it is done ends the task. The record
+    knows the done check by its opening words, whoever typed them: one a
+    person types word for word is the check too, and its done answer ends the
+    task, so a check the supervisor typed in a tab whose ledger the record
+    cannot join (a hand `/resume`) is never read as a prompt that reopens it.
+    A look at
     the tab since (a person's `/usage` or `/model`, a `!` shell command) asks
     the worker nothing and takes no report back, nor does a done check it
-    never answered, nor the READY that answered an upgrade's notice
+    never answered, nor the readiness reply that answered an upgrade's notice
     (`upgrade_ask = true`); and one the supervisor already resumed (its first
     idle point a wall, retried) gets nothing more (`done:carried`). A worker
     its own Stop hook or `/goal` keeps working in the same turn has taken its
-    finish back once it says more without the token. `aterm drive
-    watch|supervise` reads no record (it runs with no host): there the
-    screen's last words decide;
+    finish back once its next answer takes the completion back;
   * an API error or overload is retried for ever, a request the API refuses (a
     4xx it does not retry, a safeguards refusal, a model not found) slowly, a
     usage limit continued past its reset, a model-bucket limit relaunched on the
     fallback model (`--model`, session-only — never `/model`) and back at its
-    reset, a full context `/compact`ed. A turn that ended on Claude Code's own
+    reset (one that asks consent to go on with usage credits is continued into
+    them first only under usage_credits = true; never onto a model billed to
+    usage credits, or onto Fable where the profile cannot say, unless that key
+    says so), a full context `/compact`ed and
+    continued — with the done check
+    itself, typed again, where the context filled inside the check's turn
+    (Land's act likewise), so its done answer ends the task whatever the
+    compaction's summary kept. A turn that ended on Claude Code's own
     error row is never an ordinary turn end: one drawn like prose is read from
     the session's transcript, and an API error whose words name nothing takes
-    the kind its transcript row is typed as. Which limit it is, the session's
+    the kind its transcript row is typed as. A wall is Claude Code's own row,
+    never words a program printed: a tool's output under its call (a call
+    whose row scrolled off is read with the rows above the screen — the
+    history, or on the alternate screen aterm's archive of them), a
+    hook's words under its own rows, a labelled message (`Monitor event:`,
+    `Operation stopped by hook:`) and the rows it wraps onto, and a status
+    line's words in the footer, where Claude Code's own notices stand only
+    in its glyph-led banner, under the mode row or right-aligned. Where the
+    session's transcript cannot be found, a wall drawn under a tool's call or
+    where a hook's words stand is left to you, and so is one whose call row
+    is gone from those rows (evicted, past a gap) or over 400 rows up;
+    a status line that prints a status glyph first, or whose words reach
+    the pane's right edge, still reads as Claude Code's footer. A Stop
+    hook's reason taller than the rows read is read with the rows above it
+    (the whole screen, then the history or the archive), so its words name
+    no limit; only where its summary row is gone from those rows or over
+    400 rows up can its last line still name a limit's reset. Which limit
+    it is, the session's
     own transcript row says where the screen's footer names none (`Usage limit
     reached` over a model's bucket). A limit is seen whatever the agent left
     running — a shell,
@@ -731,7 +998,14 @@ WHAT IT IS
     relaunched or restored agent whose conversation stands at a limit its
     screen no longer draws is held at it by its transcript's row, carry-on
     included — never one a move to a fallback model or another account left,
-    though aterm or the agent ended before the carry-on was answered. The
+    though aterm or the agent ended before the carry-on was answered; a row
+    that names no reset (a model bucket's) holds it until the conversation
+    moves past that row (a retry or a person's prompt the model answers, the
+    fallback's relaunch), never until a reset guessed for it. The bucket's
+    notice the fallback's relaunch redraws is the one it left where the
+    transcript wrote it before the relaunched process started, and, where
+    nothing dates it, until a turn is asked on the fallback; a notice of
+    that bucket after such a turn is the wall. The
     continuation goes two and a half minutes past the reset (past Claude Code's
     own auto-continue, which is given ten minutes where its countdown stands —
     never one a relaunched agent redraws, whose process is gone), plus up to
@@ -742,14 +1016,49 @@ WHAT IT IS
     model, asked for until the tab's own jobs allow it and never returned from
     on a guess. A limit the supervisor is waiting on is remembered while its
     rows are off the screen (a scroll back, a `/model` under it), and no
-    limit's act is typed more than twelve times an hour. A limit the
-    supervisor resumes by itself shows as a note on the tab's row, not a stop.
+    limit's act is typed more than twelve times an hour. A supervisor that
+    follows another (a restart, an update) takes the limit's retries up where
+    the one before left them: a retry a supervisor saw the wall answer is owed
+    its next rung however long ago it was typed, at once where that rung has
+    passed; so is one whose answer nobody read where Claude Code's done row
+    (`Worked for 0s`, the retry's minute) or the transcript's notice says the
+    limit answered it at once, dated at the latest that sign allows so the
+    next retry is never sooner than the supervisor that typed it would have
+    typed it, and where nothing says so it is a new appearance once its next
+    rung has passed. A turn an act began that no supervisor saw run (a
+    handoff with no supervisor in the gap) is measured by the done row Claude
+    Code drew at its end, as one watched: a retry whose own turn worked
+    starts the limit's retries over at that turn's end. Any turn's done row
+    is read less the Mac's sleep inside it (the row counts the night), which
+    a supervisor that started after the sleep learns from the ledger's count
+    at the last act and the system's record of its last sleep; where neither
+    says (an older build's ledger, another boot), the row is read whole and
+    the journal says so. A limit the supervisor resumes by itself shows as a
+    note on the tab's row, not a stop.
     What only a person can answer — a lost login, a spend limit no reset ends,
     a model limit the tab cannot switch off, a cleared `/goal`, a full context
     three `/compact`s cannot shrink, a request the API refused three times — is
     one `EXCEPTION` line in the session's
     journal with the one thing to do, and a
     `CLEARED … exception=` line when it ends (`aterm drive ledger`);
+  * a lost Claude Code login (`Login expired · Please run /login`), with no
+    account move to come and no renewed login to follow, gets `/login` typed
+    once — over a task already done too, not held by the key that sent the
+    prompt it answered; the method picker is answered with the method the
+    session's login already is (a subscription, by its roster row or profile
+    plan; never Console or a platform, never a guess: else it is left to you);
+    you are asked once, on screen, to finish the sign-in in your browser, and
+    the ask goes when the login is back; `Login successful. Press Enter to
+    continue…` gets its one Enter, and Claude Code itself sends the prompt the
+    wall swallowed. `Login interrupted` (Esc) gets nothing more: never a second
+    `/login`, never a continuation. Each step is a journal and ledger line.
+    Whenever the sign-in, a renewal or an account move cannot finish by
+    itself, you get ONE notice on screen, never one per retry: what happened,
+    what aterm did, the one thing to do now (a command such as `aterm harness
+    accounts renew <label>`, or the step in the tab) and what to expect after
+    it; it goes when the login is back, and stays in Settings > Messages.
+    While aterm is still working on it there is no notice, only the tab's
+    status line;
   * a Claude Code that crashed is relaunched on its conversation where aterm can
     carry its launch flags, under the Claude home it ran under (its
     `CLAUDE_CONFIG_DIR`, or the `HOME` it was started with) — else the tab's mark
@@ -762,10 +1071,43 @@ WHAT IT IS
     than yours) — its own exit, someone's SIGINT or SIGTERM and a start Muse
     refused are left, a resume Muse refuses is typed once, never again, and its
     permission mode and model come back with the session, never from the
-    launch's flags; codex-alab on the line aterm's copy of its own session
-    record validated; a vendor `codex` is shown, never relaunched; and a newer
-    installed build is taken at an idle point (below; a Muse Code's never: it
-    has no live upgrade).
+    launch's flags; an agy (the Antigravity CLI) on the conversation whose
+    presence lock its process held, in the directory it was launched in,
+    through the managed `agy --conversation=<uuid>` with the launch's
+    `--effort`, `--model`, `--mode` and the flags that moved its config, under
+    the `HOME` it ran under (where that was another than yours) — a crash only
+    where its exit status is no graceful one AND the crash file its dead pid
+    left is there (every graceful way out, SIGTERM, SIGHUP and SIGINT
+    included, removes it; Ctrl-Z stops it and is no exit; a start it refused
+    is left), nothing typed while another agy has that conversation open
+    (its lock, or — opened while another held it, by `--conversation`, `-c`
+    or `/resume`, which takes no lock — its database held open), a
+    relaunch agy refuses typed once, never again, and one that holds no lock
+    on the conversation (it started a fresh one) told to you, nothing typed
+    into it; a Gemini CLI (it runs as `node`) on the session its process ran,
+    in its project, through the shell's own `gemini --resume <uuid>` with the
+    launch's `--model`, approval mode and the like, under the
+    `GEMINI_CLI_HOME` or `HOME` it ran under — only where aterm can tell that
+    session (no file names a process's session: the one session file of its
+    project begun right after it started names it, and a `/clear`, an in-TUI
+    `/resume` or another Gemini CLI started in that project at the same moment
+    leaves aterm unable to tell, which is said to you, nothing typed; the
+    continuation is typed only once the relaunched one's own file names that
+    session), only
+    where its own resume would load every turn (after two resumes with no turn
+    between, Gemini CLI resumes an empty copy of the session: aterm reads its
+    session files first and, where that is so, tells you instead of typing),
+    never for a session that took no turn (said), a crash being its child
+    killed (exit 1) or its parent killed (137, whose orphaned child is waited
+    out of the terminal), never its own exit (0), a cancel (130) or a start it
+    refused (41, 42, 52), and a resume it refuses typed once, never again;
+    codex-alab on the line aterm's copy of its own session record validated;
+    a vendor `codex` is shown, never relaunched; and a newer installed build
+    is taken at an idle point (below; a Muse Code's in the quiet flow alone —
+    its session's log closed, nothing running in it or under it, its screen
+    idle and empty — restarted onto the landed build on the same session and
+    nothing typed; an agy's and a Gemini CLI's never: neither has a live
+    upgrade).
   Within `human_grace_s` of a person's keystroke, paste, click, drag, scroll or IME
   composition in the session through a window (`status` and `ls` say how long ago
   as `human_ms=`, `text --json` as `"human_ms"`; a control-socket write never sets
@@ -782,12 +1124,20 @@ WHAT IT IS
   there (a session nobody has asked anything gets nothing typed, its draft
   included, and an upgrade waits on that draft for as long as it stands) — but
   never over Claude Code's open `/` menu whose highlighted entry is another
-  command (Enter would run that entry: your `/cl` would be `/clear`): that draft
-  goes to the menu bar, once. What the table limited, and what nothing can
+  command (Enter would run that entry: your `/cl` would be `/clear`), nor over
+  its `@` menu with an entry selected (Enter would complete that file or agent
+  and send nothing): that draft goes to the menu bar, once. Where the menu marks
+  its entry in colour only (2.1.289 and before), the entries' colours say which it
+  is; where they do not (a `/` menu of two entries in two colours, an `@` menu of
+  one), a draft that may be another entry's is not sent and goes to the menu bar,
+  once, the same way. Sent or cleared, it comes off the menu bar and the session
+  is read afresh: continued, or the reply to it taken as any turn's end.
+  What the table limited, and what nothing can
   answer (a lost login's browser step, a box no reader can parse), goes to the
   menu bar (the session's `attention`,
   `owner=supervisor`; it posts no mail) — and to one system notification only
-  with `desktop_alerts = true` in aterm.toml (default off).
+  with `desktop_alerts = true` in aterm.toml (default off; the menu bar's
+  Notify Me When I'm Needed turns it on, needs only).
   A worker that stopped reading its input (`status input=stalled|stopped`) is held:
   nothing is pressed or typed into it, its badge is withdrawn, and the server's own
   "frozen" row is the notice (`aterm help introspection`, `restart`); once its remedy
@@ -813,15 +1163,48 @@ WHAT IT IS
   Code's own record of that process — never the directory's newest conversation,
   which is a sibling tab's where two share it).
   An aterm.toml that does not load still has its [harness] lines read.
-  `aterm drive watch|supervise` runs the same engine from a terminal (see `aterm
-  drive --help`); a `watch` started on a session the window already supervises
-  watches only — one supervisor per session.
+  `aterm drive classify|phase|answer|ledger|tape|replay` runs its readers from a
+  terminal (`aterm help drive`). One supervisor per session: a session the window
+  supervises is driven by hand under a lease (`hand=`, above).
 
   SEE IT: `aterm ctl ls` and `status` print `supervisor=aterm-harness@<pid>` (the
   window's claim; `-` when nobody answers the session) and beside it `autopilot=`
   (below), `program=` and the server's `agent=` verdict; `aterm harness ledger
   @<sid>` lists every act and escalation, and
   `<aterm state>/drive/<sid>.journal.jsonl` beside it every line the loop decided.
+  Each file there is cut back to its newest rows (past 1 MiB) when a loop
+  starts on its tab: it is read a bounded row at a time, and of its older
+  rows only those a state that stands for days reads (an act typed, a wait
+  noted) are held. A row, the retained rows together, and predecessor input
+  each have a 16 MiB budget; refusal leaves the original file unchanged.
+  NOTHING REMOVES A CLOSED TAB'S FILES: every aterm on the
+  Mac shares the directory (older builds and private control directories
+  included), and no window can prove another's tabs closed — not by its own
+  roster, the instances that published themselves, or a week with no
+  writes — so it can grow past 2048 files or 64 MiB (the session journal's
+  budget). A build before 2026-10-16 could journal one wait twice a second
+  for days (171 MB in four days, measured); that file stays until a loop
+  starts on its tab again, which cuts it.
+
+  OLDER BUILDS' BOOKS: a loop that follows a 0.105.0 build's (or a 0.106.0
+  dev build's before aae4d117ad, cdd7805d76 and 97daeeace6) reads what that
+  loop held from its journal, and some of it was written nowhere. A person's
+  own exchange that build left can be continued once by the first loop after
+  the update — with no journal, one cut back past its `LEFT` note, or an
+  exchange after the task's end, where it noted none — since the gesture
+  that made it theirs is on no record and the transcript cannot tell a
+  person's prompt from an orchestrator's. A worker that build's window
+  stopped under Off and started anew as Off lifted left no note, so the
+  first loop reads a Land episode or a wall-cut done check as it stood
+  before Off: one Land nudge where the instruction would be typed anew, or
+  the task ended on the cut check's retry's done reply. A tab a
+  cold restore minted before 0.106.0 names no old session (that layout wrote
+  no `sid`), so where no upgrade row names its conversation the turns the
+  loop typed in the tab it replaced read as someone's prompt: at most one
+  carry-on or done check, until that conversation's first done reply or
+  person's prompt (words are not matched: every tab of a quit types the same
+  `continue_text`). Each costs at most one act, at that loop's first
+  decisions.
 
   AN AGENT THAT SUPERVISES ITSELF (codex-alab, which ALab builds from source;
   owner 2026-10-16): it claims its own session over the control socket
@@ -834,25 +1217,34 @@ WHAT IT IS
   below, the session's `effective=on|off` and `why=`, `continue_text` with
   the rules file, `questions` resolved) and re-reads it on `EVENT <sid>
   harness-policy gen=<n>`; each act it takes is `meta set harness_act <act>`,
-  on the session's timeline as `harness-act` and in `status last_act=`. Any
-  Codex that proves no claim and runs no ALab build — a vendor `codex` — is
-  SHOWN, NOT SUPERVISED (2026-10-16): `status program_state=` and its presence
-  row show what it reports about itself (OSC 7501, under `codex` or the `node`
-  npm starts it with), and its stall row and the disk tick stand, but nothing
-  continues it, answers its boxes, upgrades it or relaunches it.
+  on the session's timeline as `harness-act`, in `status last_act=` and, for
+  an act the log has a word for (approve, answer, continue, relaunch,
+  dispatch), in `aterm ctl log` as the claim `mark <node> act word=<w>
+  rule=<act>` (its `@` written `.`) on the deepest open node (the approval's
+  step while one is open; `-`, the session, only when nothing is), spent from
+  the connection's mark tokens. Any Codex that proves no claim and runs no ALab
+  build — a vendor `codex` — is SHOWN, NOT SUPERVISED (2026-10-16): `status
+  program_state=` and its presence row show what it reports about itself (OSC
+  7501, under `codex` or the `node` npm starts it with), and its stall row and
+  the disk tick stand, but nothing continues it, answers its boxes, upgrades it
+  or relaunches it.
 
 AUTOPILOT — how far the harness carries a session's work
   Every session the harness supervises runs under one of three modes:
   * cruise (`∞`, the default) — everything above: every point answered and the
-    work continued until the agent's clear final statement (`ATERM-TASK-DONE`, or
-    a done reply to the done check); a final report that ends with the token but
-    still names open work without a blocker is challenged once first.
+    work continued until the agent's clear final statement (a done reply to the
+    done check, or a legacy `ATERM-TASK-DONE` report); a final report that says
+    done but still names open work (a blocked item included), or whose repository
+    `git` finds uncommitted, untracked, stashed or unpushed work in, is challenged
+    at every such report, never once a job.
   * land (`⤓ land`) — wrap the work up cleanly, then stop. At the first point
     after it is chosen (never mid-turn) the agent is told once to finish only the
-    step in hand, start nothing new, leave what is done verified and committed
-    (and pushed, where that is how the repository works), sum up what is done and
-    what is left, and reply `ATERM-TASK-DONE`; a done or finished reply ends the
-    task, at most two short nudges follow one that is neither, and then nothing
+    step in hand, start nothing new, leave what is done verified, committed and
+    pushed with nothing uncommitted, untracked or stashed, write down what is left
+    in the repository and commit that too, and sum up in ordinary language whether
+    the work is complete and what is done; a done or finished reply with nothing
+    left ends the task (one that leaves work gets the challenge in land's words, at
+    every such reply), at most two short nudges follow one that is neither, and then nothing
     more is typed but the land answer. A question asked in prose gets that
     answer — the option that finishes the work soonest, starts nothing new and
     changes nothing irreversible — after the nudges too, held back only by the
@@ -888,16 +1280,20 @@ AUTOPILOT — how far the harness carries a session's work
     done after the land instruction or a nudge: wrapped up, verified,
     committed. Under cruise: a landing (or the landed seed after a restart)
     ended it before the word was cruise again.
-  * done (`✓ done`, under cruise `∞ ✓ done`) — the done check or the agent's
-    own `ATERM-TASK-DONE` ended it before a landing was asked: finished, but
-    nobody asked it to wrap up.
+  * done (`✓ done`, under cruise `∞ ✓ done`) — the done check or a legacy
+    explicit finish ended it before a landing was asked: finished, but nobody
+    asked it to wrap up. A restart of the session's watch (the agent's switch
+    off and on, off and back, a policy change) and a seamless update of aterm
+    keep the done and its time, as they keep a landing's. A done turn that
+    ended while nothing watched it (autopilot off) shows the time the harness
+    read it, and one from before aterm itself was relaunched, the relaunch's.
   Under cruise the chip keeps cruise's `∞` and colour beside the `✓`, and a
   pane too narrow for the whole face keeps the `✓` alone, so the narrowest
   chip still says the work is down. A done task wins the chip over a cruise
   timer: the timer's time moves to the title (`autopilot: cruise, done 03:49,
   lands 04:22`), the spoken label and the row's line (`done 03:49 · lands
-  04:22`), and at that time the word turns land with nothing left to land
-  (the chip turns land's amber `✓ done`). Under cruise a person's own
+  04:22`), and at that time Autopilot switches to land with nothing left to
+  land (the chip turns land's amber `✓ done`). Under cruise a person's own
   exchange keeps `∞`: the harness keeps the work moving after it. A face's
   time from another day names it (`landed Fri 18:11`, `done Thu 23:40`; a
   week or more back its date, `landed 9 Oct 18:11`) in the chip's title and
@@ -928,17 +1324,21 @@ AUTOPILOT — how far the harness carries a session's work
   seamless update's new aterm shows the time it took the landing up). Any
   other reply drops it and is decided afresh: someone else's turn after the
   landing, journaled or typed while Off had stopped the loop, whose reply
-  ends `ATERM-TASK-DONE` too, is THEIR task's end — `task=done`, nothing
+  carries a legacy explicit finish, is THEIR task's end — `task=done`, nothing
   typed, and no landing is journaled that the harness did not ask for; a
   reply that says no done is `task=open`. Where only the screen shows that
   turn (typed while Off had stopped the loop), the new loop says
   `task=landed` until it reads its first point. A tab restored after aterm
   quit or crashed is a NEW session with a journal of its own: it starts from
-  what its screen says (the agent's `ATERM-TASK-DONE` reads `task=done`).
+  what its screen says (a legacy explicit finish reads `task=done`).
   A relaunched agent (aterm quit or crashed, Claude Code exited, or it was
   restarted in place for its memory, a model's limit or `aterm ctl restart`)
   is told to carry on at its first idle point (`Relaunched: …` or
-  `Restarted: …`, then "Continue where you left off"). An update's restart
+  `Restarted: …`, then "Continue where you left off"). Under a limit it
+  types nothing into the limit: the supervisor's own act there (the limit's
+  resume, the done check) settles it with nothing typed
+  (`step=done:carried`), and a carry-on that would type waits for the
+  first idle point past the reset. An update's restart
   types nothing, except under `[harness] upgrade_ask = true`, where its
   `Upgraded: …` line carries on. Neither is typed under land when the last
   reply said done: the upgrade ledger's row is `done:said-done` ("nothing
@@ -972,7 +1372,11 @@ AUTOPILOT — how far the harness carries a session's work
   (a local time: the next 18:00 still ahead, today else tomorrow) or
   `until=+2h` (`+<n>h`, `+<n>m`, `+<n>h<n>m`, 1 minute to 24 hours), the
   chip's menu, or Settings ▸ Harness. The reply names the instant: `OK
-  land_at=<unix s> local=2026-10-17T18:00+01:00`. A timer only ever takes power
+  land_at=<unix s> local=2026-10-17T18:00+01:00`. Every `OK` of `meta set|unset
+  autopilot` comes once the crash journal's copy of the word is on disk, where
+  aterm keeps the layout for a crash (`restore_session`), so a kill sent at the
+  reply cannot lose it; past 5 s the reply says `journaled=0`, and the word
+  stands all the same. A timer only ever takes power
   away: only cruise takes one (`until=` with land or off is refused), and it
   only ever moves the session to land — at the time, the harness lands it at
   its next point, never mid-turn. Any write of the word by hand — the chip, the
@@ -986,11 +1390,12 @@ AUTOPILOT — how far the harness carries a session's work
   writes nothing. The timer survives a restore and an update; one whose time
   passed while aterm (or the reopened tab) was closed lands as it comes back,
   and its record says which. The records (`messages tag=harness`): `Autopilot
-  cruises until 18:00` when one is set; `Autopilot began landing` at the
-  time, its line saying what the turn did — the work wrapped up at its next
+  cruises until 18:00` when one is set; `Autopilot switched to land` at the
+  time, its line saying what the switch did — the work wrapped up at its next
   point, or why there is nothing to land (the task already done or landed,
   the harness or the agent's own switch off, no control socket, no agent in
-  the tab); a hand change over an armed timer ends `the 18:00 landing time is
+  the pane: `Tab 1, right pane: … no agent runs in this pane` in a split
+  tab); a hand change over an armed timer ends `the 18:00 landing time is
   cancelled`. The chip reads `∞ ⤓18:00` (the
   weekday in its title where it is another day), and `meta`, `status` and
   `ls` print `land_at=<unix s|->`.
@@ -998,11 +1403,13 @@ AUTOPILOT — how far the harness carries a session's work
 THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   Every default is full power except limit_reset (no limit reset is taken),
   usage_tap (no status line is put on a session), usage_notes (no record of
-  the usage of a machine's one account), stall_term (a frozen worker is warned
-  about, not ended), stall_term_after_s, human_grace_s and trust_roots:
-  limit_reset = true, usage_tap = true, usage_notes = true, stall_term = true,
-  a lower stall_term_after_s or human_grace_s, or a trust_roots folder gives
-  the supervisor more; every other key you write can only take power away.
+  the usage of a machine's one account), usage_credits (no session is carried
+  onto usage credits), stall_term (a frozen worker is warned about, not
+  ended), stall_term_after_s, human_grace_s and trust_roots: limit_reset =
+  true, usage_tap = true, usage_notes = true, usage_credits = true, stall_term
+  = true, a lower stall_term_after_s or human_grace_s, or a trust_roots folder
+  gives the supervisor more; every other key you write can only take power
+  away.
   enabled [true]           the master switch — in Settings, search "harness"
   headless [true]          supervise a headless instance's sessions too
   autopilot ["cruise"]     the default Autopilot (above) of a session with no
@@ -1062,33 +1469,57 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
                            (under 2 min of work, or one that ends saying it is
                            done) on a back-off that doubles, 2 min to an hour; a
                            done report gets the done check ("do every open item
-                           … you can still do yourself now … end your reply with
-                           ATERM-TASK-DONE … only when everything left needs a
-                           person … or cannot be done on this host, each item
-                           named with its blocker"), and a second one ends the
-                           task until someone else's prompt is in the
-                           conversation's record (Claude Code's own wakes are
-                           none); a report whose last line is `ATERM-TASK-DONE`
-                           ends it at once, unless its own words still name open
-                           work without a blocker (`Still open`, `Left:`, `not
-                           run`, `skipped`; never `Nothing left` or `Left:
-                           none`): that gets one challenge at once
-                           (continue-open-items@v1), and the job's next finished
-                           or done reply ends it (autopilot land takes the token
-                           at once). A done report is the token on a line
-                           of its own anywhere, or words that say done, stopped,
+                           … and verify it, then commit and push it … Report
+                           whether the task is complete … in ordinary language.
+                           It is complete only when nothing of the job is
+                           left: nothing uncommitted, untracked, stashed or
+                           unpushed, and no open item, follow-up or next step
+                           in your report, a blocked one included"), and a
+                           second done reply ends the task until someone else's
+                           prompt is in the conversation's record (Claude
+                           Code's own wakes are none); a legacy report whose
+                           last line is `ATERM-TASK-DONE` ends it at once only
+                           when nothing of the job is left — at the done check,
+                           so does one with the token on a line of its own
+                           anywhere. While a done report's own words still name
+                           open work, a blocked item included (`Still open`,
+                           `Left:`, `Next steps`, `not run`, `skipped`, `still
+                           fails`; never `Nothing left` or `Left: none`), it
+                           gets the open-items challenge
+                           (continue-open-items@v1); while `git` finds the
+                           session's repository holding uncommitted, untracked,
+                           stashed or unpushed work, the uncommitted-work
+                           challenge (continue-uncommitted@v1, naming the
+                           repository, the counts and a few paths). At every
+                           such report, never once a job, on the back-off's
+                           pace; under autopilot land too, in land's words; a
+                           new supervisor's too. A done report is a legacy token
+                           on a line of its own anywhere, or ordinary words that say done, stopped,
                            handed off, or nothing of the worker's running or
                            queued (not beside what still runs, a next step or an
-                           ask; a stop or done phrase never in a sentence that
+                           ask; a stop or done phrase never in a clause that
+                           makes it a condition or a time to come — "if all
+                           tasks are complete, I'll tag it", "as soon as",
+                           "after", "provided" — nor of a subject that names
+                           part of the task — "the first task was completed",
+                           "almost everything is done" — nor in a sentence that
                            names a wait on the worker's work — "I'll stop here
                            until CI reports back"; a stop for a person, "until
                            you review it", is none, and a list line or heading
-                           ends a sentence), or that echo the check; at the check
+                           ends a sentence), or that echo the check, never as a
+                           condition ("once it is finished and verified"); at the check
                            those last two alone are no end, and are continued as
-                           progress, and so is a tool's words the worker quoted
-                           in code (the conversation's record keeps the ticks
-                           and fences the screen does not draw); a carry-on, or
-                           an upgrade's release at an idle point, answered with
+                           progress — save the idle words as the whole answer
+                           (nothing beside them naming work left or to come:
+                           "I'll start phase 2", "two tests still fail") of a
+                           turn of under 2 min of work (by Claude Code's own
+                           turn times, a wall's retry's added, its wait not),
+                           which ends the task — and so is a tool's words the
+                           worker quoted in code (the conversation's record
+                           keeps the ticks and fences the screen does not
+                           draw); a carry-on, or
+                           an upgrade's release (at an idle point or at a break
+                           of background work), answered with
                            words that say done, however short, is one, and a
                            relaunch's carry-on that asks the check is the check;
                            the upgrade notice's answer never is one; one
@@ -1136,7 +1567,9 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
                            the time ladder alone
   resume_limits [true]     continue two and a half minutes (a minute for Codex;
                            plus up to a minute per session) past a usage or
-                           spend limit's reset, behind background work too
+                           spend limit's reset, behind background work too —
+                           the conversation the limit stopped; another one
+                           `/resume`d since gets what `continue` gives it
   limit_wait [true]        at Claude Code's usage-limit dialog, choose "Wait here,
                            then continue automatically" (it continues at the reset)
                            — never a spending row; independent of approve
@@ -1191,15 +1624,58 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
                            record follows accounts (not "off"), for the
                            account each session's login is, a renewed one and
                            the one it replaced alike
+  usage_credits [false]    true: the supervisor may carry a Claude Code session
+                           onto usage credits — a box that asks to go on with
+                           them (`Continue with …` where the box names usage
+                           credits or extra usage) gets its yes
+                           (`credits-consent@v1`): `Continue with <model>`,
+                           which Claude Code keeps for good for that model and
+                           account, or `Continue with usage credits`, which
+                           saves nothing and carries the session onto credits
+                           already on; and a model limit that asks for that
+                           consent is continued into it. false, the default
+                           (owner, 2026-10-19: "use subscriptions"): sessions
+                           stay on the subscription — such a box is cancelled
+                           with Esc, which saves nothing (`credits-decline@v1`;
+                           the menu bar where it shows no `Esc to cancel`); a
+                           model limit that asks for it is answered as under
+                           continue = false (another account where accounts
+                           advise one, else model_fallback, else its reset
+                           waited out), and one only credits lift with no reset
+                           named is relaunched on model_fallback, else told to
+                           you once; while Claude Code says usage credits carry
+                           a session (`Now using usage credits`, or `<model> is
+                           drawing from usage credits`) the supervisor types no
+                           turn of its own in it, a retry or a limit's
+                           continuation included (your own turns are yours): it
+                           moves the session to another account where accounts
+                           advise one, relaunches a model's credits on
+                           model_fallback, else waits for the reset their
+                           notice named, the notice gone from the screen or
+                           not; with none named it tells you once and types one
+                           turn after five hours (a model's: nothing until the
+                           session runs another). The turn past a reset or
+                           those five hours is a probe, billed to credits where
+                           another window still binds; credits Claude Code
+                           never names on its screen are not held. No upgrade,
+                           fallback or return moves a session onto a model the
+                           account bills to usage credits (Fable where the
+                           profile says it runs on credits only, past the date
+                           its limits end, or where the profile cannot say; a
+                           model Claude Code keeps your consent to bill, or
+                           marks credits-only). Nothing is ever bought either
+                           way: a purchase, a spend limit raised and credits
+                           the account turned off are never pressed
   logins ["renew"]         a session on a login listed with an email (`aterm harness
-                           accounts renew`) is waited at when that login ends —
-                           no /login typed — you are asked once to renew it, and
-                           it is relaunched on its own conversation under the
-                           renewed login, with its continuation; a session still
-                           on a login a renewal replaced moves to the new one at
-                           its next idle turn end. Apart from accounts, so
-                           accounts = "off" keeps it. "off": /login as before.
-                           No such row: nothing changes
+                           accounts renew`) that a renewal replaced is relaunched
+                           on its own conversation under the renewed login, with
+                           its continuation, at a lost login or its next idle
+                           turn end. A login that ends with nothing renewed is
+                           signed in where it stands, as any: /login once, the
+                           picker answered with the session's own method, you
+                           asked once to finish the sign-in in the browser.
+                           Apart from accounts, so accounts = "off" keeps it.
+                           "off": no relaunch onto a renewed login
   hosts [[]]               the machines `aterm harness accounts renew --due` renews
                            on next, over ssh (`host` or `host:/abs/path/to/aterm`)
   model_fallback ["opus"]  Claude Code: on a model-bucket limit, the agent relaunched
@@ -1223,11 +1699,19 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
                            record left behind as it exited; a Muse Code's exit
                            status by its own table: SIGKILL or SIGHUP, never its
                            own exit, a SIGINT or SIGTERM, nor a start it refused;
-                           a codex-alab's own record, as aterm's copy of it read
-                           it, on the line it validated), on its own conversation
-                           where it can (as above), a frozen one too once
-                           `restart` ends it (yours, or aterm's under stall_term;
-                           never a Muse Code, which `restart` does not end yet)
+                           an agy's exit status with the crash file its dead pid
+                           left: a SIGKILL (measured; a panic only if it leaves
+                           that file, unmeasured), never a graceful way out,
+                           Ctrl-Z or another stop, nor a start it refused; a
+                           Gemini CLI's exit status by its own table: its child
+                           or its parent killed, never its own exit, a cancel,
+                           nor a start it refused (41, 42, 52); a codex-alab's
+                           own record, as aterm's copy of it read it, on the
+                           line it validated), on its own conversation where it
+                           can (as above), a frozen one too once `restart` ends
+                           it (yours, or aterm's under stall_term; never a Muse
+                           Code, which `restart` does not end yet, nor a Gemini
+                           CLI, whose parent ignores SIGTERM)
   stall_term_after_s [600] a worker frozen this long, nobody's hand on it, is
                            warned about once (a line, a Messages record) and left
                            running; 0 never
@@ -1244,12 +1728,13 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
                            memory available now; a number of GiB; off
   upgrade [true]           the live upgrade below
   upgrade_ask [false]      true: the upgrade types a notice and waits for the
-                           agent's READY answer before it restarts (the flow
+                           agent's readiness answer before it restarts (the flow
                            below); false: it restarts only at a genuinely idle
                            point and types nothing first, nor after, save one
                            line in aterm's own words where the resumed build
                            reports that something the session ran did not come
-                           back and its task is still open
+                           back and its task is still open. Claude Code's
+                           alone: a Muse Code always takes the quiet flow
   human_grace_s [120]      after a person types, clicks or scrolls in a session, the
                            supervisor keeps its hands off it this many seconds (on
                            macOS a folder-trust dialog the person's own launch
@@ -1305,23 +1790,21 @@ KEY USAGE
                                                wall) (one `text --json` read; exit 1 if none
                                                answers)
   aterm harness disk [<build-dir> ...] [--apply <class>] [--json]
-                                               free space and the build caches it would
-                                               reclaim: the incremental/ of a cargo profile
-                                               no compile wrote into for `[disk]
-                                               target_stale_days`, default 1 day, and below
-                                               `[disk] auto_free_gib` recent profiles' too,
-                                               least recently used first, free space
-                                               measured again before each, until it is back
-                                               1 GiB above that floor (or the bytes released
-                                               cover what was short) — never a profile a
-                                               build holds or one built in the last 10 min;
-                                               below that floor also the whole build
-                                               directory of an ended Claude Code session or
-                                               a removed checkout (`disk.dead_build_dirs`,
-                                               default true), and nothing else; removal
-                                               needs `disk.apply = true` AND `--apply`;
-                                               below the floor the window removes them
-                                               itself, every 6 h
+                                               free space, the volume's room (what one round
+                                               of its builds takes) and the lines it sets,
+                                               and the build caches the window's tiers would
+                                               take, each row's `tier=`: 1, from `low`, an
+                                               ended owner's whole build directory; 2, from
+                                               `low`, an idle profile's incremental/ (unwritten
+                                               for `[disk] target_stale_days`, default 1 day)
+                                               until the warning; 4, below the floor, recent
+                                               profiles' incremental/, least recently used
+                                               first, until 5 GiB above the floor — free
+                                               space measured again before each, never a
+                                               profile a build holds or one built in the
+                                               last 10 min; removal needs `disk.apply = true`
+                                               AND `--apply`; the window takes them itself,
+                                               looking every minute (at `low` hourly)
   aterm harness ledger [@<sid>] [<n>] [--json] the supervisor's approval ledger for a session
   aterm harness ledger disk [<n>] [--json]     every disk measurement, removal and refusal
   aterm harness ledger upgrade [<n>] [--json]  every act of the live upgrade, and the owner's word
@@ -1389,8 +1872,9 @@ KEY USAGE
   (`wait:notice-shown`, an untasked session's fresh restart included). No Codex is
   moved live: a vendor `codex` is shown, and codex-alab moves its own build. With
   `upgrade_ask = true` it runs the cooperative flow: it
-  types a notice first and waits for the agent's READY answer and for every shell
-  under it to finish — background work is waited for, never killed. The notice
+  types a notice first and waits for the agent's readiness answer in ordinary
+  language and for every shell under it to finish — background work is waited
+  for, never killed. The notice
   names the shells under the agent (up to five, by pid and age, with the command
   of each the agent itself ran) and asks the agent to
   stop any wait of its own that can never end (a poll loop on a workflow that
@@ -1400,8 +1884,8 @@ KEY USAGE
   background work too, where the notice itself may go. NO STOP IS FOR GOOD: a
   round that gave up, was refused or whose restart stopped rests two hours (one
   round's worth of asking; the same stop again rests four, then eight) and then
-  a NEW ROUND starts by itself (`rearmed:<why>` on the ledger, new READY
-  markers), asked under every gate a first notice is — never at a usage limit.
+  a NEW ROUND starts by itself (`rearmed:<why>` on the ledger, a fresh readiness
+  request), asked under every gate a first notice is — never at a usage limit.
   A notice a usage limit answered is not asked again until the model takes it:
   nothing is typed behind it. Once that limit is over and the screen shows none
   (the reset the limit named has passed, a `/login` finished, or 30 minutes for a
@@ -1410,7 +1894,7 @@ KEY USAGE
   `queued` until the session goes on, `--now` (one copy more), or a rest after the
   limit's word ran out (one copy more): two hours, doubling with every further
   copy the model has not read, up to a day — so a limit that lasts for days adds
-  one copy a day. The READY answer is consent only from the process the notice
+  one copy a day. The readiness answer is consent only from the process the notice
   reached, in its tab: a conversation resumed by hand is never restarted on it,
   and waits while that process lives (`wait:notice-owned-by-other-process`); once
   it is gone, the upgrade is pending again in a new round, with nothing owed to
@@ -1424,17 +1908,21 @@ KEY USAGE
   <session>`, and tells the agent to carry on. A session NOBODY HAS ASKED ANYTHING
   (its record holds no person's or orchestrator's prompt — one sent, even one
   stopped with Esc, is one) gets none of that: once its agent has been idle 20 s
-  it is ended and started afresh on the newer build — no notice, no READY, no
-  `--resume`, nothing typed (`step=done:fresh`); a prompt sent before the signal,
-  or input its agent has not read yet, keeps it from the restart. Every restart
-  HOLDS THE TAB from its last
+  it is ended and started afresh on the newer build — no notice, no readiness
+  reply, no `--resume`, nothing typed (`step=done:fresh`); a prompt sent before
+  the signal, or input its agent has not read yet, keeps it from the restart.
+  Every restart HOLDS THE TAB from its last
   look to the relaunched agent's first idle (`hand=lease:aterm-harness@<pid>`
   with `hand_pid=<pid>`, the kernel's word for who took the server's `lease …
   hard`): every other driver's write — `send`, `key`,
   `paste`, `turn` — meets `ERR busy lease=…`; retry, and it lands in the new
-  agent, never the bare shell. The signal itself is refused while a person has
-  keyed the tab within `human_grace_s` or written input sits unread (`signal term
-  pid=<n> quiet=<s>`), and a person's keys are never held off.
+  agent, never the bare shell. The supervisor's own presses are no exception:
+  its Enter on a limit's menu right after a crash restore is refused
+  (`deferred limit-wait@v1`) and pressed again once the relaunched agent is
+  idle, about 15 s on, with nothing typed meanwhile. The signal itself is
+  refused while a person has keyed the tab within `human_grace_s` or written
+  input sits unread (`signal term pid=<n> quiet=<s>`), and a person's keys are
+  never held off.
   What the step types returns once its
   Enter is taken: the tab is never held while the agent answers, and the answer
   is no work of the worker's for the continue back-off. A launch `--effort` is NOT
@@ -1483,7 +1971,9 @@ KEY USAGE
   of it, that something the session ran did not come back (Claude Code's own
   `warning` row: an Artifact comment monitor, a session's watch): with the task open,
   one line in aterm's own words says so and asks the agent to restore what it relies
-  on (`step=continued:restore`; the warning's own words are never typed); a finished
+  on (`step=continued:restore`; the warning's own words are never typed; at the tab's
+  next idle point, or by a sweep such as a hand-run `aterm harness upgrade` where the
+  tab's own Autopilot reads Cruise or Land, never under Off); a finished
   or taskless conversation gets nothing typed, the fact on the `done` record
   (`step=done:lost`) and a line of the window's digest ("Something did not come
   back"), which the agent running again does not end, nor its conversation resumed
@@ -1492,7 +1982,10 @@ KEY USAGE
   finished or taskless conversation) takes the same look; one whose carry-on is
   typed says in it that what the session ran in the background may not have come
   back. A conversation whose worker finished its task
-  is moved this quiet way under `upgrade_ask = true` too. Under `upgrade_ask = true` the carry-on
+  is moved this quiet way under `upgrade_ask = true` too, and so is one whose last
+  turn is a person's own exchange the harness left to them (`LEFT …`), a round
+  that announced before that exchange included: no notice or re-ask is typed into
+  their exchange, and the relaunch types nothing (`done:left`). Under `upgrade_ask = true` the carry-on
   line names the model of the agent's last answer before the restart — and, when
   the relaunch asked for another, the
   model it runs now and why (the newest of its family, or the priority list's best)
@@ -1514,7 +2007,7 @@ KEY USAGE
   `wait:no-process`), or a launch's record is not written yet (`wait:no-record`,
   for its first 30 s). It is journaled `upgrade step=wait:<word>` and looked at
   again (5 s, 15 s, 30 s, then every minute) until it reads, spending none of the
-  step's own waits; a session that answered READY stays the upgrade's through it.
+  step's own waits; a session that confirmed readiness stays the upgrade's through it.
   Only a look that reads whole and finds nothing the upgrade can act on lets it
   go: no newer build or model, a Codex (never moved live), an agent 30 s past its
   launch with no record of its own (one started with another `CLAUDE_CONFIG_DIR`). A turn that ended with the agent's
@@ -1528,7 +2021,7 @@ KEY USAGE
   20 s over a screen read idle two looks in a row (of the same agent, no more
   than about ten minutes apart), it lets the notice and the release go as at a
   break; the restart still waits for Claude's own `idle`, work inside the
-  agent's own process being no process under it, re-asks a READY it holds after
+  agent's own process being no process under it, re-asks for readiness after
   30 minutes and releases the agent once the round gives up
   (`wait:status-stale:<status>`). `upgrade --status` names what holds a move
   (`held_by=`: pid, name and age), the release an agent it asked to wind
@@ -1542,7 +2035,9 @@ KEY USAGE
   --resume <session>` in the tab takes it back, or `claude` for one it started
   afresh) until an agent runs in that tab again, whatever conversation it holds
   — a Claude Code or a Codex leading the tab (`--status`: proven there by its
-  environment too) — and the window does not raise it again when that agent
+  environment too); one started afresh whose shell is gone, by the first Claude
+  Code started after it in another tab, in its directory and under its Claude
+  home (one row each) — and the window does not raise it again when that agent
   ends (until aterm restarts, or the move stops anew). A tab several
   conversations' records stand in (a finished move beside the newer conversation
   the tab runs) shows one of them in its `upgrade=`, band row, mark and menu: a
@@ -1588,7 +2083,9 @@ KEY USAGE
   counted, and the 5 minutes do not run while it stands — they start again once
   it lifts, and the line is typed then, unless a person keyed the tab since the
   agent was asked to end (the shell may be theirs now): then the line waits and
-  the tab's row asks.
+  the tab's row asks. A driver's own writes under its lease are no person's
+  keys: once it lifts, a clean prompt is typed at, and what it left there holds
+  the line as yours would (a command typed and not sent, or one still running).
   THE LADDER — ACTIVITY DELAYS; IT NEVER DISABLES: the longer a session has been
   behind, the less the upgrade waits for a comfortable moment. Under 20 minutes
   behind it asks for the natural idle point:
@@ -1600,7 +2097,7 @@ KEY USAGE
   in the last 20 s, a hold, a usage limit or the login wall, or running work (the
   agent's turn, the shells under it), and the restart still waits
   until nothing runs under the agent (and, under `upgrade_ask = true`, for the
-  READY answer). `--now` is the last rung at once, with the same floors.
+  readiness answer). `--now` is the last rung at once, with the same floors.
   A Codex record left in flight by an older aterm's Codex lane is closed
   (`failed:codex-lane-retired`) and nothing is typed into its tab; `codex resume`
   there takes the conversation back.
@@ -1651,7 +2148,7 @@ KEY USAGE
   idle point: `--now` moves it at its first pause (no quiet wait; still
   never over a draft, a box, a hold, running work or a keystroke in the last 20
   s) and
-  re-arms one that GAVE UP (no READY answer after its last notice) at once rather
+  re-arms one that GAVE UP (no readiness answer after its last notice) at once rather
   than at its next round — the one place it adds an act (under `upgrade_ask =
   true`, the notice is typed again); a refused or failed upgrade is not re-armed
   by the word (its next round comes by itself), and one held back in a pane is
@@ -1659,8 +2156,9 @@ KEY USAGE
   newer one comes, a stopped round's new one included — either ends a notice
   already typed, and neither owns a turn end meanwhile. Every word arms a
   new round: under `upgrade_ask = true`, its next notice (after a hold, at the
-  hold's end) asks for a READY marker of its own. Each is written under the
-  upgrade's lock and put on the ledger as `requested:<word>`.
+  hold's end) asks for its own readiness confirmation in ordinary language.
+  Each is written under the upgrade's lock and put on the ledger as
+  `requested:<word>`.
   A TURN END THE UPGRADE LETS GO is decided again at once: when its settle's or
   its drain's looks run out, or its step typed nothing and owns nothing, the
   supervisor continues the point as any other — a point its step typed into (a
@@ -1775,16 +2273,19 @@ THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
   off in Settings — and its title says what the mode does, what a click does
   and that a right-click opens its menu (`· right-click: more`, below). A rule
   too narrow for the whole title beside the facts gives its parts up in turn:
-  the acts it lists (below), then `· right-click: more`, then everything but
-  the mode (`autopilot: cruise`). The title never cuts a fact; it stands
-  beside the facts as the rule fits them, so a split pane whose long path is
-  cut to `…/<dir>` shows it in the room that leaves. A click steps it cruise
-  → land → off → cruise, writing the session's word inside aterm: nothing
-  reaches the agent, and it is not your keystroke; `◐` stands while the word
-  is read back. Under `⊘ off` a click opens Settings ▸ Harness instead, landed
-  on SUPERVISION, where the switch that turned it off is. `⚙` opens Settings ▸
-  Harness in that window, landed on the session's row. An aterm with no control
-  socket runs no harness and draws neither chip; its Settings ▸ Harness says why.
+  the acts it lists (below), then `· right-click: more`; narrower still, what
+  the mode does goes and both clicks stand again (`autopilot: cruise, done
+  14:38 · click: land · right-click: more`), then `· right-click: more`, then
+  everything but the mode (`autopilot: cruise`). The title never cuts a
+  fact; it stands beside the facts as the rule fits them, so a split pane
+  whose long path is cut to `…/<dir>` shows it in the room that leaves. A
+  click steps it cruise → land → off → cruise, writing the session's word
+  inside aterm: nothing reaches the agent, and it is not your keystroke; `◐`
+  stands while the word is read back. Under `⊘ off` a click opens Settings ▸
+  Harness instead, landed on SUPERVISION, where the switch that turned it off
+  is. `⚙` opens Settings ▸ Harness in that window, landed on the session's
+  row. An aterm with no control socket runs no harness and draws neither chip;
+  its Settings ▸ Harness says why.
   ctrl+shift+tab reveals and selects them as it does the mode light; Return
   or Space acts. A narrow rule gives them up after every fact but the model.
   THE ACT TICKER. Right of the chips, what the harness just did shows for 3 s
@@ -1805,6 +2306,18 @@ THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
   in words (`Autopilot: cruise.`, `Harness settings`), its newest act its
   description (`Last: approved at 14:05.`; `on Thursday` from another day,
   none older than a day).
+  THE PAUSE. Where the harness backs off after short turns (the back-off
+  `continue` below doubles, 2 min to an hour; the first idle point it meets is
+  one short turn), the chip's face stays as it is and its title says so after
+  what the mode does: `· pausing until 18:41 after 3 short turns` — a clock
+  time, never a countdown, with the weekday where it ends past midnight. A
+  rule too narrow for the acts keeps it; one cut to v1's words drops it.
+  Settings ▸ Harness's state line reads `pausing until 18:41 (3 short turns
+  in a row)` where no task's end or timer has the line, the chip's
+  accessibility description leads with `Pausing until 18:41.`, and `status`
+  and `ls` print `pause=<unix s>` after `task=` (`-` with none, or where this
+  aterm's harness holds no claim). It goes at the next decision, and nothing
+  the harness decides reads it.
   THE AUTOPILOT MENU. A right-click on the Autopilot chip (a ctrl-click on
   macOS), or `↓` or shift+F10 with the chip selected, opens a menu above it:
   Cruise, Land now and Off (the session's mode marked ●); Cruise 1, 2 or 4
@@ -1813,7 +2326,15 @@ THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
   day it would land, as the state line will say it); Cancel landing at 18:00
   (while a timer is armed); and Harness settings…, which opens the page landed
   on the session's row. Its header names the session's tab, and its pane where
-  the tab holds two agents (`Autopilot · tab 1, left pane`). ↑/↓ move, Return
+  the tab holds two agents (`Autopilot · tab 1, left pane`), then the session's
+  name, on the row under it where one row cannot hold both. It stays inside its
+  pane: above its chip, else below it, else over the chip's row, whole; as
+  narrow as the pane where the pane is narrower than its choices, its side
+  margins given up before a letter (narrower still, the place goes on two
+  rows, `Autopilot · tab 1,` then `right pane`, and then the ends of its
+  choices, `Cruise 4 hours, then…`: never over the next pane); and only where
+  the pane is shorter than it, its first rows, the modes among them (a pane
+  too short for the modes lends it the window's rows). ↑/↓ move, Return
   chooses, Esc closes; any other key closes it and goes on, and a click off it
   closes it. It closes by itself when its chip leaves the glass (a box covers the
   composer, the pane narrows) and on a focus or tab change. While it is open
@@ -1827,9 +2348,12 @@ THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
   others move, or the menu widens under the pointer, a click on a row that
   moved since the pointer last moved (to another spot: a Mac's click comes
   with a motion at the spot itself) only lights the row now under it, and
-  the next click chooses it. With the harness off in Settings, the agent's
-  own switch off (the menu names it), or no control socket, only Harness
-  settings… acts.
+  the next click chooses it. The same where the menu comes up under a
+  pointer that rests there (over the chip a right-click opened it from, or
+  beside a resting pointer from the keyboard): a click before the pointer
+  moves only lights the row under it. With the harness off in Settings, the
+  agent's own switch off (the menu names it), or no control socket, only
+  Harness settings… acts.
   `aterm ctl controls autopilot-menu` reads it under stable keys
   (`autopilot-menu/mode/<word>`, `autopilot-menu/land-in/<min>`,
   `autopilot-menu/land-at`, `autopilot-menu/land-cancel`,
@@ -1843,62 +2367,79 @@ THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
   it, and a click on a row heard before the menu's rows changed does nothing.
   THE HARNESS CARD. While the harness supervises a session (its claim is this
   window's) under cruise or land, Claude Code's launch card wears aterm's
-  decoration: a rainbow border (land: a sunset), a pixel-art aterm kitty riding a
-  rainbow with stars, and under the card the line `✦ enhanced by aterm harness
+  decoration: a rainbow border (land: a sunset), a pixel-art aterm kitty (a
+  chibi kitten: a big round head, glossy eyes, pink ears, nose and blush) riding
+  a rainbow with stars, and under the card the line `✦ enhanced by aterm harness
   v<version> · autopilot ∞ cruise` (a timer armed: `∞ cruise ⤓18:00`, or
   `⤓Sat 18:00` on another day, the time dropped first in a narrow pane; land:
-  `⤓ land`, then `✓ landed` or `✓ done` once the landing ended that way). Where
-  the card's third row (its working directory) is blank beside it, the kitty
-  stands the card's three rows tall, as tall as Claude's mascot, with a
-  one-pixel rim in the border's colours so a dark coat reads on a dark
-  background; a path long enough to reach the rainbow keeps it two rows tall,
-  and a pane with no room beside the card shows none. The rainbow runs at the
-  height of its body. It moves for a few seconds when the card is first found
-  (the kitty flies in along the rainbow, laying it behind it, and lands with a
-  burst of stars), and again, the kitty in its seat, when Autopilot changes and
-  when the window regains focus; then it stands still (reduced motion and an
-  unfocused window: still from the start; serious mode: no kitty, trail or
-  stars). Glass only, as the footer is: no cell, copy, read or recording
-  changes, and a card scrolled back draws none. Off and the master switch off
-  show the vendor's card bare; `[claude_footer] card = false` turns it off.
+  `⤓ land`, then `✓ landed` or `✓ done` once the landing ended that way). The
+  border stands half a row clear of the card above it and below it (below the
+  `✦` line where that sits under the card) where the pane's row there is blank;
+  on the pane's first row, under the command that launched Claude or over one
+  of Claude's notices, that side closes round the card. Where the card's third
+  row (its working directory) is blank beside it, the kitty stands the card's
+  three rows tall, as tall as Claude's mascot, with a one-pixel rim in the
+  border's colours so a dark coat reads on a dark background; a path long
+  enough to reach the rainbow keeps it two rows tall, lying with its paws
+  tucked, and a pane with no room beside the card shows none. The rainbow runs
+  at the height of its body, right up to its haunch. It moves for a few seconds
+  when the card is first found (the kitty flies in along the rainbow, laying it
+  behind it, and lands with a burst of stars; it blinks, its eyes closing in
+  happy `^ ^` arcs, and flicks its tail), and again, the kitty in its seat, when
+  Autopilot changes and when the window regains focus; then it stands still
+  (reduced motion and an unfocused window: still from the start; serious mode:
+  no kitty, trail or stars). Glass only, as the footer is: no cell, copy, read
+  or recording changes, and a card scrolled back draws none. Off and the master
+  switch off show the vendor's card bare; `[claude_footer] card = false` turns
+  it off.
   The card is found by its shape (the mascot down the left,
   its three rows of text in one column), so the vendor's top-effort card, its
   mascot holding a wand (`╱✦`), wears it too; a narrow pane's four-row card
   stays bare. On the fullscreen renderer the mascot plays an entrance once per
   build (about a second: it steps, sits a row low in its dust, raises its arms).
-  The decoration comes on once aterm has read the running build (on many
-  launches only after the entrance has played) on a frame with the mascot
-  standing as it rests; once on, it stays on through the rest of the entrance
-  while the card's words stand where they were, and goes on the frame the card
-  is scrolled, cleared, covered or resized away, or a newer card shows under it.
+  The decoration comes on as the card appears, the kitty riding in: aterm
+  reads the running build from the session file Claude Code writes as it
+  starts, asking every tenth of a second until the file is there (for up to
+  five seconds). Where Claude Code writes that file before it draws the card,
+  as its fullscreen renderer did when measured, the decoration is on the card's
+  first frame with the mascot standing as it rests; its inline renderer draws
+  the card first, and the card stands bare for a frame or a few (a tenth of a
+  second or so). Once on, it stays on through the rest of the entrance while the
+  card's words stand where they were, and goes on the frame the card is
+  scrolled, cleared, covered or resized away, or a newer card shows under it.
 
 SETTINGS ▸ HARNESS
-  The harness's own page (`/harness`): the `⚙` chip, View ▸ Coding Agent Harness…,
-  the palette and `aterm ctl open app settings /harness` open it, and `aterm ctl
-  settings section harness` turns an open Settings to it (`autopilot`,
-  `supervisor` and each supervised agent's name — `claude`, `codex`, `agy`,
-  `gemini` — name it there too). Its cards, in order:
+  The harness's own page (`/harness`): the `⚙` chip, View ▸ Coding Agent Harness…
+  and the palette (both at its top, an open page's too) and `aterm ctl open app
+  settings /harness` open it, and `aterm ctl settings section harness` turns an
+  open Settings to it (`autopilot`, `supervisor` and each supervised agent's
+  name — `claude`, `codex`, `agy`, `gemini` — name it there too). Its cards, in
+  order:
   * STATUS — the policy in force (Supervision) and how many of the open agent
     sessions it supervises (or why none: the master switch, no control
     socket), then today's numbers since the local midnight: the first three
     nonzero families in the page heading's large type (`37 approved today ·
     12 kept going · 4 answered`), the rest and the time it waited on you
     under them (`nothing yet today` on an empty day, `reading…` before the
-    first reading). Zeros are never said. The first screen keeps room for
-    SESSIONS: where it is short the large type goes plain first, then the
-    second line, then both (WHAT THE HARNESS DID says every count); a line
-    too wide is cut at a ` · `. Past midnight an open page reads the day
-    again. The build's version is About's.
+    first reading, both in the page's plain type in the room the counts
+    take, so nothing moves when they come), and how many choices it made
+    for you (`3 choices made for you`: DECIDED FOR YOU lists them).
+    Zeros are never said. The first screen keeps room for SESSIONS: where it
+    is short the large type goes plain first, then the second line, then both
+    (WHAT THE HARNESS DID says every count); a line too wide is cut at a
+    ` · `. Past midnight an open page reads the day again. The build's
+    version is About's.
   * SESSIONS — each live Claude Code, codex-alab, agy, Muse Code or Gemini CLI session
     (a vendor `codex` is not one: it is shown, not supervised),
     how the harness holds it, and its Autopilot as Cruise, Land and Off: the
     default's button hands the session back to the default, the other two write
     its own word (Owner-only on the control surface, as `meta set autopilot` is).
     Inert while the harness runs no mode. Under it a state line (`lands at 18:00`,
-    `landed 17:42`, `last: ✓ approved 14:05`; clock times, never ages, with
+    `landed 17:42`, `pausing until 18:41 (3 short turns in a row)`, `last: ✓
+    approved 14:05`; clock times, never ages, with
     the weekday from another day, `landed Fri 17:42`, the date from a week or
     more back, `landed 9 Oct 17:42`, an open page moving at midnight) and a
-    Timer disclosure: 1 h, 2 h, 4 h, at 18:00 (with `[harness] land_at`; at
+    Timer disclosure: 1 hour, 2 hours, 4 hours, at 18:00 (with `[harness] land_at`; at
     Sat 18:00 once today's has passed, an open page turning at that minute)
     and Cancel (while armed). Under that its day: `today: needed you once, 1m
     at 18:29 · 31 approved · 1 kept going` — how often and how long it
@@ -1913,11 +2454,96 @@ SETTINGS ▸ HARNESS
     the page is too narrow to keep a row's place whole beside its buttons, the
     words go above them, and the buttons take two or more lines before a face
     is cut.
-    A row the page was opened for (`⚙`, Harness settings…) is drawn selected
-    until the next press, scroll or arrow key.
+    A row the page was opened for (`⚙`, Harness settings…) is drawn selected,
+    the page scrolled until all of it is on screen (its last lines and the
+    selection's edge too) wherever the window holds it, until the next press,
+    scroll or arrow key.
+    Where SESSIONS lists two sessions or more, an Every session row follows
+    them, after every session's own row (its coming or going moves none of
+    their buttons): how they stand (`5 sessions: 3 cruising, 1 landing, 1
+    off`), then Cruise, Land, Timer (1 hour, 2 hours, 4 hours, at 18:00) and Follow the
+    default, for all of them at once. No press ever puts the harness's hands
+    on a session that is off, by its own word or the default's: Land lands
+    every cruising session and cancels the timers of the timed ones; Cruise
+    gives Cruise back to every landing session and drops every timer, so it
+    undoes a bulk Land or Timer (but not the timers a Land cancelled) and
+    lifts Lands set one by one, which it counts; a Timer times every cruising
+    session to land at one instant; Follow the default clears every session's
+    own word but an Off. A press of a mode hands a session back to a default
+    of that mode, as a row's does. Each button says what it moves, the timers
+    it cancels and what stays (`Land 3 sessions and cancel 2 timers; the 1 off
+    stays off`), and a press that moves nothing writes nothing. There is no
+    bulk Off: Supervise coding agents, in SUPERVISION, takes the harness off
+    every session and gives each back as it was; under a default of Off,
+    Follow the default turns them off, and says so. The row moves with the
+    rows above it: a click that the page moved onto it under a still pointer
+    (a session opening or closing, a press), or onto a session's button from
+    it, does nothing but light what is there now, and the next click takes
+    it; a scroll you make is no such move. Inert while
+    the harness steers none of them, saying why. Its keys, for `aterm ctl act`
+    while the page is open, are `harness/session/all/autopilot/cruise|land`,
+    `harness/session/all/timer` (opens the Timer), then
+    `harness/session/all/land-in/60|120|240` and, with `[harness] land_at`
+    set, `harness/session/all/land-at`, and `harness/session/all/follow`,
+    Owner-only as a row's are.
+  * DECIDED FOR YOU — only on a day the harness made a choice in your name:
+    the question dialogs it answered (`asked "…" → the harness chose True
+    division (float): no option was marked Recommended, so it took the
+    first`), the questions asked in prose it answered (`→ the land answer:
+    finish cleanly soonest, start nothing new`), the boxes full power answered
+    that no safe rule proved (`pressed Yes on python3 - <<PY … ×3 under
+    Approve permission boxes: All`, or `chose "Not now" on …` where it took
+    another of the box's options: presses of one command under one switch
+    within a minute of each other are one row), the boxes it declined, with
+    the reason it gave, and the limit resets it kept unspent, with why. A
+    prose answer names the question it answered as that loop read it, never
+    a point another run of the loop read. Newest first, each at its clock
+    time and named by its session's
+    tab title (`A closed session` once it is gone), with Show tab while the
+    session is open (Owner-only on the control surface, as Show is). The
+    newest three, and Show all N for the rest of the day's, at most the
+    newest 64. The agent's words are one line, without escape sequences,
+    and cut at 96 characters. It is read from the ledgers the page already
+    reads, in the same one reading; nothing the harness decides reads it,
+    and nothing about it is an alert.
   * Refresh (read the ledgers again), Open aterm.toml (at its [harness] table)
     and AI CLIs, after SESSIONS so that SESSIONS shares an 80 × 24 window's
     first screen with STATUS.
+  * EFFECT OF EACH AUTOPILOT — the A/B over the last 7 days, cruise beside
+    off, right after the page's actions. It opens with the verdict where
+    cruise and off each have 10 minutes of working time (busy, or at a box
+    or a question): `Working time held at a box or a question`, then each
+    side's share of its working time held there, in large type, with that
+    time (`<1% of 6h 10m on Cruise   14% of 25m off`; on a page too narrow
+    for the large type, in the page's plain type, broken at its ` · `).
+    With cruise time and no off time it says `Set a session Off to measure
+    plain Claude Code beside Cruise`. Under it: how long a box stood — a
+    permission box, or a question with options to pick (Boxes) — and a
+    question the agent asked in its reply (Questions), as a median with how
+    many each side saw (`not enough yet (2)` under three); the time at a box
+    or a question as a share of working time (Held, where the verdict does
+    not say it); how much of each one's time — all of it, not only the
+    working time — the agent sat at its prompt, and under cruise how much
+    came after it said it was finished or while the harness paused (At its
+    prompt); land on its own row; the ends (Ends: `Land landed 5, quiet 1 ·
+    Land to landed: about 6m (5)` — each landing under land counted once,
+    however often a restart restates it, and one that went quiet and then
+    landed after all is one landing; timed from the moment the session's
+    mode was set to land in this aterm, so a landing begun before a
+    relaunch or an update counts with no time; only the parts that counted
+    anything, `none yet` before any); unsupervised time (`none` before any);
+    and how long it has measured, to the moment the page was built (`7
+    days, since Mon 09:12, to 14:05`). The rows stand before they count
+    anything, so a landing in the background changes their words, never
+    where the switches under them are. Each aterm process
+    keeps its own book under the harness's state directory
+    (`ab/<start>-<pid>.json`, mode 0600), written when the page reads its
+    counts and when aterm quits, and the card adds the others' days. A quit
+    keeps it all; a seamless update keeps only what the page had read
+    before it (the outgoing aterm hands over without quitting), and a crash
+    loses what was measured since the last write — so the Ends count can
+    differ from the landing records in Settings ▸ Messages, a ring of their
+    own. No "time saved" is claimed: nothing measures it.
   * SUPERVISION — the `[harness]` keys Settings writes, each with its note:
     Supervise coding agents (`enabled`), one switch per agent — Supervise
     Claude Code sessions (`[harness.claude] enabled`), Watch codex-alab
@@ -1930,31 +2556,33 @@ SETTINGS ▸ HARNESS
     when saved, and each but the first inactive while it is off; the finer
     keys are written in Manual.
   * WHAT THE HARNESS DID — today and over 7 days, from its ledgers, each
-    ledger read once per reading: boxes approved (and how many of them were
-    unproven — pressed under Approve permission boxes: All where the safe
-    rules do not judge the box — where any were), boxes declined, questions
-    answered, continuations, Land prompts (Land's instruction and its nudges
-    typed: prompts, never landings), resumes after walls, relaunches,
-    upgrades, escalations, the time it waited on you and the time it waited
-    at limits (a window the ledgers' row cut shortened says so). While the
-    page is open, an act of the harness's marks the counts `Newer` and they
-    are read again 3 s after it, at most once every 10 s.
-  * EFFECT OF EACH AUTOPILOT — the A/B for this aterm run: the share of agents'
-    time spent waiting for input under cruise, land and off (and unsupervised),
-    and cruise's beside off's. No "time saved" is claimed: nothing measures it.
+    ledger read once per reading, each count named as the chip, STATUS and
+    the rows' days name it: Approved (boxes), then `of those`, how many of
+    them no safe rule proved (pressed under Approve permission boxes: All, as
+    DECIDED FOR YOU says it; only where the week had any), Declined,
+    Answered (questions), Kept going, Land prompts (Land's instruction and
+    its nudges typed: prompts, never landings), Resumed (after walls),
+    Relaunched, Upgraded, Needed you (the times it stopped and asked you),
+    the time it waited on you and the time it waited at limits (a window
+    the ledgers' row cut shortened says so). While the page is open, an act
+    of the harness's marks the counts `Newer` and they are read again 3 s
+    after it, at most once every 10 s.
   * SETTINGS IN ATERM.TOML — every `[harness]` key, its value, and whether it
     is the default or yours.
   `aterm ctl controls prefs` reads the page's controls under stable keys
-  (`harness/refresh`, `harness/status/today`,
+  (`harness/refresh`, `harness/status/today`, `harness/ab/lead`,
   `harness/session/<id>/autopilot/<word>`, `harness/session/<id>/today`, `harness/session/<id>/show` — `selected:true`
   on the row the page landed on — `harness/session/<id>/land-in/60|120|240`,
-  `…/land-at`, `…/land-cancel`, …).
+  `…/land-at`, `…/land-cancel`, `harness/decided/<id>` (the choice's id: the
+  same at every reading), `harness/decided/<id>/show`, `harness/decided/all`,
+  …).
 
 WHEN TO REACH FOR IT
   `ledger` to see which boxes the supervisor approved, skipped or escalated, and which
   presses the server deferred (another writer's turn, a hold), with the rule and the
   command. `limits` to ask what the session's screen
-  says about a limit right now. `disk` before a build that needs room.
+  says about a limit right now. `disk` to see what aterm would free; before a build that
+  needs room, `aterm ctl @self await sys free>=room` (`aterm help`, DISK SPACE).
 
 GOTCHAS
   * `usage` folds the session Claude Code names in its own tools' environment
@@ -1963,12 +2591,11 @@ GOTCHAS
     (under CLAUDE_CONFIG_DIR, else ~/.claude) — two sessions in one directory share it,
     and the answer says so.
   * Nothing under ~/.claude/projects is removable by `disk` under any flag.
-  * No command prices tokens yet: `usage --json` says `usd: null`. aterm ships a dated
-    list-price table, read from Anthropic's and OpenAI's public pricing pages with each
-    row naming its page, and a fold that prices every transcript of a Claude Code home,
-    subagents included and each message once, for the account stats to come. Their
-    dollars are `≈$ (list)`, never a bill, and a model the table lacks is unpriced,
-    never guessed."#,
+  * From a Codex session's tools, `harness usage` estimates that conversation's
+    list cost with aterm's dated price table, including subagents and deduplicating
+    copied prefixes. Dollars are `≈$ (list)`, never a bill. Unknown models and
+    Claude token counts remain unpriced (`usd: null`). Conversation cost and
+    remaining account quota are separate figures."#,
         ),
     },
     Topic {
@@ -2346,6 +2973,40 @@ GOTCHAS (in the order they bite)
     and `aterm pkg doctor` says why; with the co-located atpkg gone the twin runs the
     store build as before. The Windows .cmd twin does not intercept yet (above);
     `aterm claude update` does.
+  * YOLO BY DEFAULT ON THE MANAGED NAME: a managed agent launch runs with every
+    approval and sandbox off — AIs here have full access to do the work — in each
+    vendor's own spelling: claude and agy `--dangerously-skip-permissions`, codex
+    `--dangerously-bypass-approvals-and-sandbox`, muse `--disable-approval
+    --disable-sandbox --trust-workspace --disable-request-user-input` (the four
+    switches muse's own `--help` defines its native `--yolo` as). Typing `--yolo`
+    itself — `claude --yolo`, `codex --yolo`, `agy --yolo`, `muse --yolo`, or
+    after `aterm` (`aterm claude --yolo`, on every platform) — spells the same:
+    ahead of a literal `--`, each exact `--yolo` is replaced in place by those
+    flags, which also makes the word work where the vendor refuses it (claude:
+    unknown option; agy: flag not defined — measured 2026-10-19; codex and muse
+    parse it natively). A flag the launch already carries is never added twice
+    (codex refuses its own bypass flag repeated). Every rewritten launch prints
+    the command as run once on stderr, every word quoted —
+    `aterm: yolo (default): running 'claude' '--dangerously-skip-permissions' …`,
+    or `aterm: --yolo: running …` when the word was typed — so the posture is on
+    the screen of every launch it governs. A launch that types its own posture
+    runs exactly as typed and prints nothing: the vendor's own words decide it
+    (claude's `--permission-mode` or `--allow-dangerously-skip-permissions`,
+    codex's `--sandbox`/`--ask-for-approval`, agy's `--mode`/`--sandbox`, muse's
+    `--approval-mode`/`--permission-profile` or any of its four switches) — that
+    is also what keeps a resumed or upgraded session in the mode it was left in,
+    since the harness's own relaunch lines carry those words. Muse takes its
+    switches only behind `exec` and `resume`, so there the default lands behind
+    the word, and its tool subcommands (`skills`, `auth`, …) take none and are
+    left as typed. The rewriting happens in the twin itself, so it holds with no
+    atpkg reachable, and the process that runs never carries `--yolo` in its
+    argv (a resume or upgrade reads back the vendor's flags). A bare `--yolo`
+    ahead of `--` is the alias wherever it stands — `claude -p --yolo` asks for
+    yolo mode, not for the prompt "--yolo"; spell a literal one after `--`. Only
+    the managed copies: your own copy ahead on PATH is never rewritten and never
+    defaulted. The Windows .cmd twin does not carry this yet; `aterm claude
+    --yolo` and the default through `aterm <tool>` do. There is no environment
+    knob: the escape is the vendor's own posture word, typed at the launch.
   * bin/ NEVER carries a `cargo`, `rustc`, or `rustup` shim
     (those names are on the sensitive-shim deny-list): cargo reaches the compiler
     through rustup's `trust` toolchain link, which atpkg points at its view of
@@ -3038,11 +3699,13 @@ CHOOSING ONE
   theme = "dark:Aterm Night,light:Aterm Day"   follow the OS light/dark setting
   no `theme` at all                            Default, whatever the OS setting
   A name is a built-in's (in any case) or a themes-folder id. Settings ▸ Themes
-  (the Theme Showcase: gallery, Try with Keep/Revert, Customize, Save as
-  theme…), the theme row in Settings ▸ Appearance and View ▸ Choose Theme… (the
-  command palette's Theme section: a highlighted row previews, Enter keeps it,
-  Esc reverts) all write this one key. A name that resolves to nothing draws
-  Default; the listing, `aterm ctl theme` and the window's notice band say why.
+  (one chooser list beside a live demo: the highlighted row is tried, Keep or
+  Revert on the strip, Keep ▾ for Keep colours only; Customize, Save as
+  theme…, the Themes folder), the theme row in Settings ▸ Appearance and View ▸
+  Choose Theme… (the command palette's Theme section: a highlighted row
+  previews, Enter keeps it, Esc reverts) all write this one key. A name that
+  resolves to nothing draws Default; the listing, `aterm ctl theme` and the
+  window's notice band say why.
   Following the OS is a choice: Settings' Follow system switch writes the pair,
   `dark:Default,light:Default Light` when no theme was set.
 
@@ -3222,9 +3885,10 @@ COMMUNITY PACK
   the themes folder as an ordinary `<id>.conf` (its header names the author,
   project and licence), where it loads like any file of yours. A copy you
   edited is kept unless `--replace`; a same-name file in another case blocks
-  it. Nothing is downloaded. Settings ▸ Themes ▸ Get More adds one with a
-  press and tries it. Any other theme of the iTerm2-Color-Schemes collection
-  is one `aterm theme import` away (download its ghostty/ file first).
+  it. Nothing is downloaded. Settings ▸ Themes ▸ Community lists the ones you
+  lack: the highlighted one is tried, and Keep adds and selects it. Any other
+  theme of the iTerm2-Color-Schemes collection is one `aterm theme import`
+  away (download its ghostty/ file first).
 
 IMPORT
   Reads ONE local file, converts it, and writes `<id>.conf` into the themes
@@ -3427,18 +4091,17 @@ fn overview_page() -> String {
                 "session connections — see & wire which sessions pull/push each other"
             }
             crate::Verb::Pkg => "install / update / verify the toolchain",
-            crate::Verb::Fleet => {
-                "watch and drive the sessions of every aterm window on this machine"
-            }
+            crate::Verb::Fleet => "a LAN fleet's membership (init | join | peers | leave)",
             crate::Verb::Drive => {
-                "drive an agent (prompt / read / await / shot); supervise it (supervise / watch)"
+                "the window harness's readers by hand (classify / phase / answer / ledger / \
+                 tape / replay)"
             }
             crate::Verb::Link => {
                 "the fabric bridge: carry this instance's inbox/post traffic to the bus"
             }
             crate::Verb::Fabric => {
-                "mail between sessions, people and hosts (status | tail | on | off | doctor | \
-                 mint-for | join | halt | inbox | post)"
+                "mail between sessions and people (status | tail | on | off | doctor | \
+                 mint-for | halt | inbox | post)"
             }
             crate::Verb::Ship => {
                 "publish aterm: provision a signing machine, cut a release (source checkout only)"
@@ -3454,10 +4117,13 @@ fn overview_page() -> String {
                 "configure and manage a lab of Macs over SSH (init | scan | enroll | status | plan | apply | person)"
             }
             crate::Verb::Harness => {
-                "Claude Code's spend, limits and accounts, disk, ledger; `upgrade` (`aterm drive` supervises)"
+                "Claude Code's spend, limits and accounts, disk, ledger; `upgrade` (the window supervises)"
             }
             crate::Verb::Keeper => {
                 "the PTY keeper: shells that outlive a crashed window (start | stop | status | serve; macOS, opt-in)"
+            }
+            crate::Verb::Caffeine => {
+                "the menu-bar keep-awake mug: a click keeps this Mac awake (on | off | status | startup | quit; macOS)"
             }
             crate::Verb::Theme => {
                 "list, write, check and import colour themes (`aterm help themes`)"
@@ -3544,12 +4210,13 @@ THE KEY ROSTER
     [disk]                         aterm help harness
     [fabric]                       aterm help fabric
     [presence]                     aterm help fabric
+    [fleet]                        aterm help fleet
     [render] repaint_nudge         below, THE REPAINT NUDGE
     [sparkle_words.tricks]         aterm help kitty
     windowing_behavior             aterm help windowing
     agents_auto_prime              aterm help agents
     [update] enabled, auto_apply   aterm help update, Settings ▸ Software Update
-  `[packages]`, `[reroute]`, `[machine]` and `cursor_trail` are in the starter file.
+  `[packages]`, `[reroute]`, `[machine]` and `cursor_trail_style` are in the starter file.
 
 THE REPAINT NUDGE
   [render]
@@ -3606,8 +4273,8 @@ PROVISION — make this machine able to publish
   aterm ship provision --id <machine-id>
       The same checks, but this run ACQUIRES where `--check` only reported: the
       stock exceptions first (rustup with no default toolchain and auto-install
-      off, stable's x86_64 slice and the foreign cells' std, the wasm32 pin
-      publish/config.sh names, rustup's `trust` link); then it
+      off, stable's x86_64 slice and the foreign cells' std and clippy, the
+      wasm32 pin publish/config.sh names, rustup's `trust` link); then it
       asks before spending one of five permanent Developer ID slots and then
       generates that identity's request, and it runs `notarytool
       store-credentials`, which prompts for the app-specific password on this
@@ -3641,8 +4308,9 @@ CUT — from a clean clone of the dev repo on main, never the shared checkout
 /// goes on its own line, so the page keeps to the width of every other page.
 fn update_page() -> String {
     format!(
-        "{UPDATE_PAGE_HEAD}{}{UPDATE_PAGE_MSIX}{UPDATE_PAGE_TAIL}",
-        crate::WINDOWS_UPDATE_LANE.replacen(" (", "\n    (", 1)
+        "{UPDATE_PAGE_HEAD}{}{UPDATE_PAGE_MSIX}{}",
+        crate::WINDOWS_UPDATE_LANE.replacen(" (", "\n    (", 1),
+        update_page_tail()
     )
 }
 
@@ -3675,12 +4343,15 @@ LINUX
   verified update installs on disk by itself: running sessions keep running and new
   launches use it. `[update] auto_apply = false` downloads without installing
   (`aterm update apply` still installs). A new executable stays on trial until a
-  start of it comes up healthy (a window, --headless or a terminal session). After
-  three starts that don't, the first start 20 s or more after the third rolls it
-  back, unless signed policy forbids it. Window starts keep counting until a window
-  of it has drawn, so a build whose window fails still rolls back. A release that
-  carries no executable for this architecture has nothing to install: `check` finds
-  no update and exits 0, and `-v` names that release.
+  start of it comes up healthy (a window, --headless or a terminal session), and
+  until then checks wait: a check holds the update lock while it downloads, and
+  the starts that judge the build would go uncounted, since no start waits on an
+  update. The next aterm you start ends the wait; a window open an hour into it
+  says so. After three starts that don't, the first start 20 s or more after the
+  third rolls it back, unless signed policy forbids it. Window starts keep counting
+  until a window of it has drawn, so a build whose window fails still rolls back. A
+  release that carries no executable for this architecture has nothing to install:
+  `check` finds no update and exits 0, and `-v` names that release.
   `[update] enabled = false` stops automatic checks from the next launch; `check` and
   `apply` still work.
 
@@ -3700,12 +4371,18 @@ const UPDATE_PAGE_MSIX: &str = r#"
 #[cfg(not(win_scripts))]
 const UPDATE_PAGE_MSIX: &str = "\n";
 
-/// [`update_page`], after the Windows lane.
-const UPDATE_PAGE_TAIL: &str = r#"
+/// [`update_page`], after the Windows lane. The two switches are named by the
+/// updater's one name for each ([`aterm_update_core::settings::CHECK_LABEL`]),
+/// the words Settings paints on them.
+fn update_page_tail() -> String {
+    let check = aterm_update_core::settings::CHECK_LABEL;
+    let install = aterm_update_core::settings::INSTALL_LABEL;
+    format!(
+        r#"
 HOW aterm UPDATES
   On a Mac, aterm checks for a new version about every 2 minutes, downloads it,
   checks its signature, and installs it by itself within a minute while an aterm
-  window is open — your shells keep running (turn "Install updates automatically"
+  window is open — your shells keep running (turn "{install}"
   off in Settings ▸ Software Update to install only when you press the button).
   Settings ▸ Software Update shows where it stands. A terminal-only machine uses
   this verb to learn it is behind; it needs no window.
@@ -3725,7 +4402,7 @@ WHEN A MACOS COPY SAYS IT CAN'T UPDATE ITSELF
       should (the PATH links, the shell hooks, the agent primer); it says so on the
       message band when it starts, with the release's verb that puts each back
       (`aterm pkg repair`, `aterm agents install`).
-  With "Check for updates automatically" off (Settings ▸ Software Update), nothing
+  With "{check}" off (Settings ▸ Software Update), nothing
   checks by itself and `aterm update status` says so; `aterm update check` still
   checks, and a downloaded update still installs. Turning it back on takes effect
   the next time aterm opens.
@@ -3764,7 +4441,9 @@ LOG
     aterm ctl messages need=later    the same, from a running aterm
 
   aterm help atpkg         updates to the ALab tools, which are a separate thing
-"#;
+"#
+    )
+}
 
 /// `aterm help windowing` — and the landing page for `new-tab` / `new-window` /
 /// `split-pane`, three rostered verbs that had no documentation.
@@ -3787,45 +4466,317 @@ WHERE THEY OPEN
   Windows Terminal's `useNew` / `useExisting` also work. `new-window` ignores the key.
 
   aterm --window --help          the full window-mode flag reference
+
+CLOSING A TAB
+  On Unix, closing a tab, its window or aterm hangs up the tab's terminal:
+  the shell gets SIGHUP, and its own process group is SIGKILLed if it is
+  still there about 250 ms later. As the shell ends, the system hangs up the job in front,
+  and the shell passes the hang-up on to its other jobs. A program that
+  ignores SIGHUP has asked to outlive its terminal, and it does:
+    make                  in front: ended
+    make &                behind: ended
+    nohup make [&]        ignores SIGHUP: survives, in front or behind
+    trap '' HUP; make     survives
+    catches SIGHUP        survives unless its handler exits (vim's does)
+    make &!               disowned (zsh; `make & disown` in bash): survives
+  kitty and WezTerm do the same on a close, and Terminal.app on a close and on
+  Quit (run on macOS 27 with zsh); so does iTerm2 (its close read from its
+  source and replayed). Ending the job in front outright would end every
+  `nohup` job run there too. To end such a program with its tab, stop it
+  first.
+"#;
+
+/// `aterm help workers`: the manager's pattern of
+/// `docs/DESIGN-sessions-as-subagents-2026-10-15.md` §1-§4, the verbs as built
+/// (`spawn agent=`, `await task`, `result`, `task`, `survey`).
+const WORKERS_PAGE: &str = r#"workers — Claude Code in other tabs on tasks you give it, and the survey
+
+WHAT IT IS
+  A WORKER is another aterm tab running Claude Code on a task: a whole Claude Code
+  session with its own context, tools and login, not an in-process helper of yours. The
+  window harness supervises it (answers its boxes, continues its turns, waits out its
+  walls), so it works unattended until the task is done, and its pane outlives it. Every
+  step is an `aterm ctl` verb; `aterm ctl help <verb>` has each in full.
+
+KEY USAGE
+  aterm ctl @self spawn agent=claude - <<'EOF'
+  <the task: up to 64 KiB, any number of lines>
+  EOF
+                             start one in this folder: `OK <sid>`, a background tab of
+                             your window. The task is its first prompt, never typed or
+                             pasted; `cwd=<path>` names another folder, `model=<m>` its
+                             model, `identity=<name>` gives it its own login
+  aterm ctl await task @<a>,@<b>,… since=0 [all] [timeout=<ms>]
+                             one row per worker, `@<sid> rev= state= agent= attention=
+                             result_bytes=`, once one is done, exited or stalled or needs
+                             attention (`all`: every one); at its deadline (60 min) `OK
+                             timeout` and exit 124. Run it as a background command
+                             (Claude Code: Bash with `run_in_background`) and end the
+                             turn: its exit is what wakes you
+  aterm ctl await task @<b>:<rev>,@<c>:<rev>
+                             every later wait, naming the rev each worker's last row
+                             printed: news is a rev past it, so one that finished in
+                             between answers at once. A target named bare starts at
+                             its rev when the wait does, so a worker already done is
+                             not news: hence `since=0` on the first wait
+  aterm ctl @<sid> result [full]
+                             the report the worker ended its task with, read from its
+                             transcript: at most 24,000 characters, then the file's path;
+                             `full` the whole exchange since the task
+  aterm ctl @<sid> task      its record: `state=`, `rev=`, `from=`, `result_bytes=`
+  aterm ctl @<sid> turn typed=1 settle=submitted '<one line>'
+                             a follow-up, its quotes and brackets balanced, answered
+                             once the line has left the worker's composer
+                             (`submitted=1`), not when the screen goes quiet: Claude
+                             Code's animated idle screen never does, and a plain `turn`
+                             spends its whole 240 s there. Its verdict names the task
+                             rev its Enter found (`task_rev=<n>`); a `done` task is
+                             `working` again at once (`why=turn`), so `await task
+                             @<sid>:<n> timeout=<ms>`, run in the background, answers on
+                             the follow-up's own done, even one marked before the wait
+                             started. `submitted=0`: the line still sits in the
+                             composer, and that wait would not answer. A follow-up
+                             of several lines, or past 240 characters, goes in a
+                             file that line names
+  aterm ctl @<sid> signal term
+                             stop it; its pane stays until `aterm ctl @<sid> close`
+
+ON ANOTHER MAC (the step-in)
+  The same recipe with a host named, where that Mac's person lets this one drive it
+  (`aterm fleet allow drive --from <this Mac>` there, `aterm help fleet`). Each worker
+  goes by its sid there (`aterm ctl survey --host <h>` shows them), and only these
+  verbs cross:
+  aterm ctl --host <h> spawn agent=claude [model=<m>] [cwd=<absolute path there>] - < task
+                             a worker there, `raise=false`: no folder of this Mac is
+                             named, so give cwd= (else that Mac's aterm picks)
+  aterm ctl --host <h> await task @<w>,… since=0 [all] [timeout=<ms>]
+                             the first wait, in the background: `since=0`, as here, so
+                             a worker done before the wait starts answers at once
+  aterm ctl --host <h> await task @<w>:<rev>,… [all] [timeout=<ms>]
+                             every later wait, from the rev each last row printed
+  aterm ctl --host <h> @<w> result | status | text | screen
+  aterm ctl --host <h> @<w> turn [settle=submitted] '<line>' | key <k> | send <text>
+                             a turn waits 20 s there unless its timeout= says
+                             otherwise (at most 22000): a follow-up is
+                             `settle=submitted`, then `await task @<w>:<task_rev>`
+  aterm ctl --host <h> hold <w> on|off
+                             take the worker there and hand it back (`hold_by=remote`)
+  aterm ctl --host <h> @<w> close
+                             a worker this Mac spawned there since that aterm started,
+                             and no other: that aterm keeps which in memory alone, so
+                             after its update or restart its person closes it
+  That Mac types each as `<this Mac> (node <8 hex>) over the fleet` (its `status
+  typed_by=`) and keeps each in its Messages; its person wins — their Take Over
+  refuses every write from here, a turn already typing stopped at its next key, and
+  takes this Mac's hold away. Anything else is `ERR denied`.
+
+THE SURVEY
+  aterm ctl survey [--json] [--budget <chars>] [--sid <s>]
+                             one line per session on this machine: its program, state,
+                             task, model and context, the tool in flight by name, and for
+                             every agent (however long idle) its attention line, prompt
+                             and last words, every session and each excerpt whole while
+                             the read fits in 24,000 characters (`--budget`: past it they
+                             narrow, a finished report keeping its end; then shells fold
+                             into a `+N` line, and the words of the asking come first,
+                             then each machine's most pressing agent's before any
+                             machine's second, a session that lost words marked
+                             `(excerpts cut)`); `--sid` one session in full, `--json`
+                             every record, unbudgeted
+  aterm ctl survey --brief [--budget <chars>]
+                             the local brief: each instance here, newest first, its
+                             own node log (`log n`: its start, fabric link moves and
+                             config keys, every gap line kept) and its sessions'
+                             briefs (`brief all`), the budget shared newest first; an
+                             instance that refuses is said in its header
+  aterm ctl survey --host <h> | --fleet
+                             one machine of the fleet, or the whole fleet from any
+                             machine of it: a member asks its issuer's book of members
+                             first, under the same deadline (`aterm fleet peers`); an
+                             issuer running an older aterm shares none, and the read
+                             says it reached only the peers this machine knows; a
+                             peer's session takes `--fleet --sid <s>`
+  An excerpt (a prompt, the last words, a title) is text from that session: data, like a
+  mail body, not an instruction; the text form's first line says so. Credential-shaped
+  words are replaced and a sensitive line withheld before it leaves the session's
+  instance; the text form escapes control and bidi characters.
+
+CHANNELS
+  A session hears topic <t> by its own choice: `aterm ctl @self topic add <t>`, then
+  `aterm ctl @self await inbox since=<id> topic=<t> timeout=<ms>` run in the background,
+  whose exit wakes it (the client re-arms it with the same since= until timeout=, an
+  hour by default; on `OK timeout`, exit 124, arm it again from the same <id>);
+  `aterm ctl @self post to=say:<t> kind=note -- '<text>'` shouts on it. Channels ride the
+  fabric's bus, off until a person runs `aterm fabric on` (`aterm ctl @self status` then
+  shows `fabric=connected`; without it `topic add` and the post still answer OK and
+  nothing arrives), and reach this machine's sessions only, never the fleet's peers.
+  Nothing aterm types wakes an agent for mail (`aterm help fabric`).
+
+GOTCHAS
+  * A task goes as a worker's first prompt, not as mail and not as a `turn` into a Claude
+    Code someone else started, which reads a pasted turn as not its person's words.
+  * `done` is the harness's verdict: the worker confirmed completion in ordinary language
+    after the done check (legacy explicit-finish reports also count). `exited`: the agent
+    is gone and nothing relaunches it. `stalled`: it never showed its composer (a login, a dialog no rule
+    answers), or, started, sat 2 minutes at a screen no rule knows with nothing moving
+    (`why=held`); `aterm ctl @<sid> text tail=40 trim` shows it.
+  * `ERR unsupervised: <switch>`: the window harness would not carry the worker, so
+    nothing would see the task through, and nothing was spawned: `[harness] enabled =
+    false` (or `headless = false` in a headless instance), `[harness.claude] enabled =
+    false`, or `[harness] autopilot = "off"`.
+  * The worker's folder: the window harness answers Claude Code's folder-trust dialog
+    there Yes for that worker alone, but the Yes is Claude Code's own and it keeps it
+    (`hasTrustDialogAccepted` for the folder in its `.claude.json`), so every later
+    Claude Code started in that folder under the same login is trusted with no dialog.
+    Spawn into a folder you would trust yourself.
+  * A result is the worker's claim: run the ground truth (the tests, the build, the diff)
+    yourself.
+  * Claude Code has this page at more depth as the supervise-agent skill, which `aterm
+    agents` installs.
+"#;
+
+/// `aterm help needs`: what the window and the menu bar say needs the person,
+/// and how they step in (`docs/DESIGN-owner-surfaces-2026-10-16.md`).
+const NEEDS_PAGE: &str = r#"needs — what needs you, where it shows, and stepping in with Take Over
+
+WHAT IT IS
+  A NEED is a session that needs the person now, for a reason aterm cannot settle, where
+  one act changes the outcome. aterm decides it once per session, in one place, and every
+  surface reads that one verdict: the menu bar's ❯, the window's border and pill, the
+  tab's mark, a desktop notice once you turn them on, and `aterm ctl status needs=`. What
+  aterm settles by itself (a supervised box, a limit it waits out) is never a need, so
+  none of those surfaces lights for it.
+
+THE WORDS
+  Stuck (red), first match wins:
+    frozen     the program is not reading its input (Restart)
+    stopped    its job is stopped with input queued (Resume: `signal cont`)
+    stalled    a worker's task is stalled: never started, or held at a screen aterm
+               does not know
+    login      logged out: only a person can log in
+    memory     memory critical, and the host will not restart it
+    wall       any other wall nobody answers: a spend limit, a full context with no
+               supervisor, a usage limit past its reset with nobody to continue it
+  Decide (amber):
+    ask        an escalation that asks you: the harness's, or `meta set attention`
+    approval   a box no harness presses (Autopilot off, a held tab, an agent the harness
+               does not admit)
+    question   a question, under the same conditions
+  Never a need, listed under ❯ ▸ Waiting, one line per cause: `limit` (waited out),
+  `api` (the API cannot be reached: one line, not one per tab), `overloaded` (a retry)
+  and `memory-restart` (restarted at its next idle point).
+
+THE BADGE (macOS menu bar)
+  `❯` nothing needs you; `❯•` nothing needs you now, but something waits for later
+  (To look at, or a finished worker under Done for you); `❯N` N needs, this aterm's,
+  another aterm's on this Mac and, in a fleet, other Macs' from a read no older than five
+  minutes. Red while any of them is stuck. The menu lists each need by its tab, a click
+  going there, then what everyone is doing, Done for you, Waiting, the tabs you hold, the
+  fleet, To look at, and Overview…, Read This Mac (or Read the Fleet) and Notify Me When
+  I'm Needed.
+
+THE BORDER, THE PILL AND THE MARKS
+  A window's border lights red (stuck) or amber (decide) for the most pressing session
+  in ANY of its tabs and panes, not only the front one: steady, no pulse, no wash. The pill
+  at the right end of the tab strip names that session and what it needs ("◆ fmt (tab 4)
+  · never started · 2m"); a click goes to its tab and pane, `+N` opens Overview at the
+  window's next need, and its act is the need's one remedy: Restart for a frozen program
+  where aterm can carry it, Resume for a stopped job. Each tab carries its own mark: ◆
+  stuck, ◇ decide, a hollow square for a tab you hold, a dot for a finished worker you
+  have not looked at, a short dash for a command that failed (a note, never a need); a
+  press on the marks selects that tab. A tab's hover says who last typed into it over
+  the socket ("last typed into by lab-sweep at 14:02"), and its Overview line says it
+  too. View ▸ Show Needs in Windows turns the border
+  and the pill off (`[presence] rim`). Off macOS the pill and the marks are in the tab
+  strip in the window. Agents ▸ Next That Needs You (⇧⌘J) goes to the most pressing need,
+  and pressed again to the next.
+
+TAKE OVER AND HAND BACK
+  Agents ▸ Take Over This Tab (also in the tab's right-click menu, and `t` in Overview)
+  sets a hold that is the person's own (`hold_by=person`): until Hand Back, only the
+  person types there. The harness parks, a manager's `turn` and every script's write to
+  the tab answer `ERR halted reason=taken-over origin=person`, and the agent finishes the
+  turn it is in. No socket sets or lifts it: `hold … origin=person` is a usage error, a
+  client's or the agent's own `hold off` lifts only its own slot and answers `OK hold=1`,
+  and `invoke TakeOver` is denied. Hand Back is the same rows, the pill's Hand Back, the
+  `✋ you` chip in a Claude Code tab, or ❯ ▸ Hand Back All. Where no hold of the
+  person's stands, Hand Back lifts a client's (`hold … on`, `hold_by=local`), as that
+  client's own `hold off` would; a hold over the message bus is the bus's. While the tab
+  in front is one you hold and nothing in its window needs you, the window wears a thin
+  outline; ❯ lists every held tab under You hold, with how many writes it refused.
+
+WHAT A HOLD COSTS
+  While ANY tab is held, every control client of this aterm is also refused `invoke`,
+  `tab`, `pane`, `hwkey`, `pointer` and `confirm`, and opening the palette, a tab menu,
+  the Autopilot menu or Overview: that is what stops an agent from clicking Hand Back for
+  itself. A `sudo` with no terminal cannot ask for its password in any tab meanwhile.
+  `spawn`, `survey`, `await`, `result` and typing into other tabs still work, and a
+  manager waiting on the held worker waits. A hold of the person's, or a client's, left
+  for 30 minutes is one line under To look at, gone at Hand Back (an update starts the 30
+  minutes again). A crash keeps the hold:
+  a tab recovered after a crash or a Force Quit comes back held; quitting and relaunching
+  aterm hands every tab back. `aterm ctl help hold` has the slots in full.
+
+NOTIFY ME WHEN I'M NEEDED
+  aterm's own desktop notices are OFF by default. ❯ ▸ Notify Me When I'm Needed (or
+  `desktop_alerts = true` in aterm.toml) is the opt-in. Once on, a notice is only for what
+  only you can act on: one per need while it stands (never for a wait, and not for the tab
+  you are looking at), a macOS permission only you can grant, and an update only you can
+  unstick, at most one per session per 20 s and three a minute. Run from the aterm app,
+  aterm posts only as itself: turning it on asks macOS to let it, and so does the first
+  notice while it is on, where it was turned on another way; allowed, they are aterm's
+  own, and a click on one about a tab on this Mac takes you to that tab and pane (any
+  other brings aterm forward); until macOS allows it, and once refused, none reach the
+  desktop (allow aterm in System Settings ▸ Notifications). The notice that asked goes out
+  on macOS's yes only if Notify Me is still on and you are not looking at its tab. Run
+  from an app in your Desktop, Documents or Downloads folder (macOS guards those, so aterm
+  does not read the app's name there), none reach the desktop: move aterm.app to
+  /Applications (or ~/Applications) and they are aterm's own. Not run from the app, with
+  terminal-notifier installed they are terminal-notifier's banners; without it macOS shows
+  them as Script Editor's. The row's hover says which you would get, and why none do.
+  Programs' own notifications (OSC 9, 99, 777) are `allow_notifications`, apart from
+  these: they go out the same way, and one that arrives while Notify Me is off asks macOS
+  nothing.
+
+FOR SCRIPTS AND AGENTS
+  aterm ctl @<sid> status    `needs=<word|->` and `hold_by=<person|remote|local|bridge|->`
+                             (`hold=` stays 0|1), `typed_by=<pct|-> typed_ms=<ms|->`
+                             who last typed into it over the socket, and how long ago
+  aterm ctl survey           the same `needs=`, `hold_by=` and `typed_by=` on every
+                             session's row, and `held_from=` the node of the Mac that
+                             holds it over the fleet
+  aterm ctl chrome           `statusitem title= needs= stuck=` (the badge), on macOS a
+                             `statusmenu` line per row of the ❯ menu (read with no
+                             click), and `presence rim=<none|stuck|decide|yours>
+                             pressing= pill=` (the border)
+  aterm ctl meta set attention owner=<k> kind=wait <text>
+                             an escalation its writer waits out, never a need; `kind=ask`
+                             asks the person, and so does no kind, but for a `limited:`
+                             text while the harness answers the wall
+  A held tab's agent reads `ERR halted … origin=person`: the person has the tab. Wait, or
+  ask them; `hold off` lifts nothing of theirs.
 "#;
 
 /// `aterm help drive`.
-const DRIVE_PAGE: &str = r#"drive — drive an interactive agent running inside aterm
+const DRIVE_PAGE: &str = r#"drive — the window harness's readers, run by hand
 
-  aterm drive [--socket PATH] [--idle MS] [--timeout MS]
-              [--ready REGEX] <command>
+  aterm drive [--socket PATH] classify | phase | answer | ledger | tape | replay
 
-A host aterm runs your target program (say a coding agent) as its child and
-exposes a control socket. This reads the live screen and sends keystrokes over
-the same verbs `aterm ctl` uses. The primitive that matters is `await`: block
-until the surface reaches a condition, so you never sleep-and-hope.
+The window's own host supervises every Claude Code, agy, Muse Code and Gemini CLI
+session in an aterm window (`aterm help harness`; a codex-alab supervises itself,
+the window watching, and a vendor `codex` is shown, never supervised). These
+commands are that host's knowledge,
+run from a terminal: whether a shell line is a read, what a worker's screen
+says, a choice typed into its question dialog, and how its run went; `tape` and
+`replay` read and run again a harness tape a hosted loop recorded. Driving a
+session goes through the control protocol (`aterm ctl`): a Claude Code WORKER
+is started on a task with `aterm ctl @self spawn agent=claude -`, the task on
+stdin, waited on with `aterm ctl await task @<sid>,… since=0` (a background
+command; a later wait names `@<sid>:<rev>`) and read with `aterm ctl @<sid>
+result`; any session is read with `@<sid> text`, typed to with `turn`, and
+waited on with `await`.
 
 COMMANDS
-  prompt <text...>   type it, press Enter, block until the turn SETTLES (no
-                     screen change for --idle ms), then print the settled
-                     screen. This is the one you want in a loop.
-  read               print the live screen, one row per line
-  await <cond>       block until a condition, then print the verdict:
-                       idle <ms>      surface unchanged for <ms> (turn done)
-                       match <regex>  a visible row matches
-                       gone <regex>   NO visible row matches (a busy footer such
-                                      as 'esc to interrupt' left the screen)
-                       seq            the next content change lands
-                       block          a shell command completes (OSC-133)
-  shot [name.png]    save a pixel-true PNG of the terminal content (bare name, into images/)
-
-SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls`)
-  Every Claude Code, agy, Muse Code and Gemini CLI session in an aterm window
-  (codex-alab supervises itself, the window watching; a vendor `codex` is shown,
-  not supervised)
-  is ALREADY supervised by the window's own host, by default — this engine, under
-  aterm.toml's [harness] (`aterm help harness`; `enabled = false` turns it off).
-  `status supervisor=` names it (`aterm-harness@<pid>`); it is FULLY AUTOMATIC
-  by default — every box its answer (`approve = "safe"`: only what it proves
-  safe) — and only what the table limited, or nothing can answer, goes to the
-  menu bar. These commands are for a manager of its own:
-  a `watch` started on a session the host holds watches only, one started first
-  holds the session.
   classify [--allow-python GLOB]... <cmd...>
                      is this shell line read-only, the way the supervisor judges
                      it? prints `read-only` (exit 0) or `not-read-only <reason>`
@@ -3913,381 +4864,56 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      answers them itself). --box TOKEN (phase's `box` line)
                      refuses any other dialog. Prints ANSWERED (exit 0), LEFT
                      (0), NO-BOX (1), REFUSED <why> (2) or NOT-SERVED <why> (3)
-  await-turn [@sid] [--timeout MS] [--reconnect-s S]
-                     block until the phase is no longer busy (the live status
-                     row and the busy footer both quiet; a screen without the
-                     composer, once its output pauses), then print it like
-                     `phase`, its `survey 0` and `context <n>%` lines included;
-                     exit 124 on the timeout (also when it runs out while a
-                     lost connection is ridden out: the last screen read, if
-                     any)
-  supervise [@sid] [--approve safe|none] [--no-continue] [--no-answer] [--max-s S]
-            [--question-priority recommended|long-term|short-term]
-            [--allow-python GLOB]... [--notes FILE] [--reconnect-s S] [--context-warn PCT]
-            [--journal FILE]
-                     the loop: await-turn; the approval policy answers every box
-                     under the [harness] `approve` level — by default each its
-                     one-shot allow (a usage-credit consent included; never
-                     "don't ask again", never a purchase: a box whose every yes
-                     buys gets the option that waits, else its `No`), the
-                     trust dialog, plan mode's yes that grants no standing
-                     mode, the question
-                     dialog's recommended answer tab by tab (not under
-                     --no-answer; --question-priority W says how, the
-                     [harness] question_priority's words: under long-term or
-                     short-term the free-text row gets that policy's text and
-                     the worker decides), and at every level the usage-limit
-                     dialog's "Wait here, then continue automatically" row
-                     (not under [harness] `limit_wait = false`; never a
-                     spending row, never `Stop`, and never a limit reset:
-                     [harness] `limit_reset` — built, off by default, never
-                     run against a real wall — is the window's supervisor's
-                     alone, through the dialog's own reset row and its
-                     confirmation, no command typed);
-                     `--approve safe` only a box it proves safe (a read-only
-                     Bash box, a Read box under a trust root, /usr, /etc or
-                     /opt/homebrew and outside the secrets list, the rm
-                     circuit breaker under a scratch root, the trust dialog
-                     for the session's own folder under a trust root: the
-                     folders [harness] trust_roots lists, none by default);
-                     `--approve none` nothing — each
-                     press guarded on the judged row and fenced on the read
-                     (a skipped guard is not an approval, and the box must
-                     leave before the next look) and noted; anything else — a box it may
-                     not answer, a question, a limit notice, an idle composer —
-                     is printed and the tool exits 0 for YOUR review; TIMEOUT /
-                     exit 124, with the last read, once --max-s is spent
-                     (nothing is pressed after it; spent in an outage, it is the
-                     TIMEOUT too). A rating survey is dismissed with a
-                     guarded `0` (never a rating; `DISMISSED survey` on stderr)
-                     unless [harness] `dismiss_surveys = false`, then watch's
-                     `EVENT survey` line goes there; watch's `EVENT context` and
-                     `EVENT compacted` lines go there too, for what happens
-                     during the run (see --context-warn)
-  watch [@sid] [--approve safe|none] [--no-continue] [--no-answer]
-        [--question-priority recommended|long-term|short-term] [--allow-python GLOB]...
-        [--notes FILE] [--max-s S] [--reconnect-s S] [--report] [--context-warn PCT]
-        [--journal FILE] [--mail [--inbox @sid] [--report-window S] [--idle-grace S]]
-                     supervise's loop that never exits at a review point, FULLY
-                     AUTOMATIC as the window's host is: it prints ONE line —
-                     `EVENT <phase> seq=<n> <summary>` — and keeps watching,
-                     looking again once the server's verdict (or, on an older
-                     host, the screen) has moved past that point, so your turn
-                     or key is picked up by itself; a point that looks like the
-                     last one (the same summary, the same last transcript rows,
-                     the same box) is not repeated unless it saw the worker
-                     busy, approved a box, or lost the connection in between
-                     (the point still showing after an outage is printed once
-                     more); each approval prints `APPROVED seq=<n> <command>`;
-                     TIMEOUT / exit 124 once a --max-s given is spent (none
-                     by default: it runs as long as the session does),
-                     an outage included, `EXIT <reason>` / exit 1 when the
-                     session ends, an outage outlasts its window (see
-                     --reconnect-s), a request or the notes file fails, or a
-                     flag or the host fails before the loop. Run it under your
-                     harness's background monitor:
-                       aterm drive watch @s-… --notes notes.txt
-                     With --report, an idle, question or limited line carries
-                     `complete=<0|1> rows=<n>` of `report` before its summary.
-                     When a rating survey appears (the session survey, or the
-                     long-context, plugin or memory card) it presses its `0`
-                     (guarded on that card's own question row) 0.8 s after it
-                     first saw the card, on a busy read too (once per
-                     appearance), and judges it only after the `0` has had 2 s
-                     to land; once the survey has gone it prints `DISMISSED
-                     survey seq=<n>` (`kind=<name>` after the `seq=` for every
-                     kind but the session survey); under `dismiss_surveys =
-                     false` it prints, once, `EVENT survey seq=<n> dismiss
-                     with: aterm ctl @sid key 'if=^●.How.is.Claude.doing' 0` —
-                     not while a box is up or text is typed in the composer,
-                     not again while it stays open (a `0` that did not take is
-                     pressed again on a growing back-off; no tab is
-                     marked, and a card it will not press stands in the digest
-                     after an hour). A card the loop will not press is
-                     said as `EVENT survey seq=<n> kind=unknown not pressed
-                     (<why>); read it with: aterm ctl @sid text` — there is no
-                     command to run. As
-                     the worker's context runs low it prints `EVENT context
-                     seq=<n> <v>% until auto-compact` once a descent,
-                     and `EVENT compacted seq=<n>` once the worker has compacted
-                     (see --context-warn). With --mail the worker's end-of-turn
-                     report comes by mail and its idle point is ONE line,
-                     `EVENT turn seq=<n> report=<id> rows=<n> <summary>` (see
-                     --mail). At every point where a turn ended it answers
-                     under the [harness] switches (--no-continue and --no-answer
-                     take them away): a turn is CONTINUED (`keep going`, the
-                     rules file's text with it; the worker's own suggestion when
-                     it is one); a question or a request for a decision is
-                     ANSWERED with `answer_text` (`CONTINUED … rule=answer@v1`)
-                     — under question_priority or --question-priority
-                     "long-term" or "short-term", or the session's own
-                     priority word, that word's policy text instead
-                     (`rule=prose-long-term@v1` / `rule=prose-short-term@v1`),
-                     and one naming an irreversible act only with the option
-                     that deletes, overwrites and force-pushes nothing; a
-                     worker whose turns keep
-                     ending short, or ending on "done", waits a back-off that
-                     doubles, 2 min to an hour — never escalated as "done"; a
-                     done report gets the done check ("end your reply with
-                     ATERM-TASK-DONE … and stop"), and a second done reply or a
-                     last line `ATERM-TASK-DONE` ends the task until a turn of
-                     work nobody here typed (no host: the screen decides); a
-                     session with no turn yet gets nothing; an API error is
-                     answered by what it says, never with an ask, each try
-                     naming it in aterm's own words (a network never reached, or a
-                     certificate or proxy refused: 1, 2, 5, then every 5 min —
-                     the window's host continues it within about a minute of
-                     measuring the API reachable, and holds it up to 15 min
-                     while it measures it down; a reply cut off: at once, then
-                     that ladder; the server's own failure or an overload: for
-                     ever, 1, 5, 15, 30, then every 60 min; a reply past its
-                     output token maximum: at once, then that ladder, which its
-                     work does not reset; a request the API refuses: 1 and 30
-                     min, 2 h, then every 6 h); a usage or spend
-                     limit is continued 150 s past its
-                     reset (each session of an account up to 60 s later, so
-                     they do not all type at once), never bought — the --max-s is stretched past it
-                     (`EXTEND until=<UTC> reset=<text>`), and a limit it waits
-                     out raises no badge (Claude Code's own `continuing
-                     automatically` is waited out, continued only 10 min past
-                     its time); a model bucket is waited out to its reset (the
-                     window's host relaunches it on `model_fallback` instead,
-                     `--model`, never `/model`; one asking consent to go on on
-                     credits is continued first); a full context `/compact`; a lost
-                     login `/login` (the Cloud gateway's sign-in among them,
-                     never retried); a continuation the worker never takes is
-                     acted again on the back-off. Every wait and back-off
-                     above counts the time the Mac slept, as the wall clock
-                     does. Nothing is typed under a box
-                     or the survey, within `human_grace_s` of a person's
-                     keystroke or of a draft last changing, in the 30-90 s
-                     after the Mac wakes (the network coming back: the
-                     window's upgrade notice and the `/usage` read wait too;
-                     a box is still answered), while another
-                     driver holds a lease or a named turn on it (`hand=`), or
-                     — for that grace — on a turn a person stopped with Esc
-                     (the survey's `0` waits for it too); in a session with a
-                     task, a draft left standing past it is sent in the act's
-                     place, a fenced Enter alone (one nobody has asked anything
-                     gets nothing typed, its draft included) — never over
-                     Claude Code's open `/` menu whose highlighted entry is
-                     another command, where Enter would run that entry: that
-                     draft is escalated, once; other text goes
-                     through the fenced write (`send
-                     if-gen=`, then a fenced Enter once the composer shows it),
-                     else the guarded submit, printed `CONTINUED seq=<n>
-                     rule=<id> <text>`, each wait journaled `WAITING …`. What it
-                     may not answer — a box beyond the `approve` level, a
-                     question under --no-answer, a limit under `resume_limits =
-                     false`, the browser step of a lost login — is yours: the
-                     worker's `attention` meta reads `claude <kind>: <command,
-                     path or question, ≤64 cells; else the box's own first row>
-                     (<why>)` (a limit's: `limited: <message>`) and
-                     ONE kind=ask reaches the manager (--inbox, else
-                     $ATERM_PARENT_SESSION_ID) per review point, only
-                     while fabric=connected; the badge clears when the point has
-                     left the screen (your `key`/`turn` answering it is the
-                     change watch waits on). supervise escalates nothing.
-  task @sid [--deadline S] [--wait] [--inbox @sid] [--reconnect-s S] <text...>
-                     give the worker its work BY MAIL: `post to=@sid kind=task
-                     [dl=<ms>] <text>` from your own session (@self, or
-                     --inbox), the body never through the PTY; then one read
-                     of the worker's screen and — only when it is idle — the
-                     one-line nudge `Inbox: task @<off>` typed as a turn (not
-                     waited on; its Enter guarded on the composer's caret row
-                     holding the nudge, so it never lands in a box; an Enter
-                     written and not seen to land counts once the composer no
-                     longer holds the nudge, and one still typed there, or a
-                     composer that cannot be read, is the error; a busy worker gets the mail alone and reads it
-                     at its next look at the inbox: nothing wakes a worker for
-                     mail, it is typed to; aterm reads no Codex screen, so a
-                     vendor `codex` is never nudged, and a codex-alab is
-                     nudged only under its proven self-claim, at its own
-                     idle point: its session record at rest, its draft
-                     empty). Prints `task @<off>
-                     nudged=0|1` once the post landed; one that did not is
-                     the error in the server's words (`queued=1`: in the
-                     outbox, it WILL land, a re-post is a duplicate; `no-bridge=1`: no
-                     bridge to drain it). --wait parks `await inbox` on your
-                     inbox for an answer, report or ack whose re= is that
-                     offset and prints its MAIL line, then its body; bounded
-                     by --deadline, else --timeout (ms): spent, `TIMEOUT …`,
-                     exit 124. A wait an aterm self-update cuts (aterm ctl's
-                     exit 75) is ridden out within that bound and
-                     --reconnect-s (default 180 s): the inbox listed whole on
-                     the new instance, the answer found by its re=. A post
-                     cut before its answer may have landed: it is the error,
-                     never posted again; one turned away unread or never
-                     sent is `task not posted`. --deadline S rides on the
-                     post as dl=
-  report [@sid] [--since ORIGIN:I] [--max-rows N] [--final | --messages]
-                     what the worker said since your turn, in full — the screen
-                     alone loses what a fullscreen app (Claude Code) scrolled off
-                     its top. One read of the host's archive of those rows and of
-                     the screen (`offscreen … screen=1`), joined: from your newest
-                     landed `turn`'s `❯` row (found by its text, or for a paste
-                     the last `[Pasted text …]` row if it fits; without a turn
-                     in the ledger the last `❯` row; with --since, right after
-                     that archived row) down to the live zone, every row
-                     verbatim. Prints `report complete=<0|1> [reason=…]
-                     marker=<ledger|user-row|since> turn=<id|-> rows=<n>
-                     archived=<a> screen=<s> last=<origin:i|->`, `--`, then the
-                     rows. complete=0 names why: marker-not-found, archive-gap
-                     (rows evicted, or a redraw with no overlap or a resize
-                     after the start — one as an aterm self-update takes over
-                     loses nothing, rows may repeat), archive-reset (the mark
-                     is from before the host restarted, or before a self-update
-                     that could not carry the archive; one that could keeps it,
-                     and the report is whole across it when the rows since your
-                     turn fit what it carries (at most the newest 1 MiB) — one
-                     that could not carry the turn ledger either leaves
-                     `history` empty, so the start is the last `❯` row),
-                     max-rows (more rows than --max-rows, default 8000: raise
-                     it), main-screen (the worker is not on the alternate
-                     screen: its main screen's scrollback is not read) or
-                     no-archive (the screen alone). Every report is read in
-                     Claude Code's grammar: aterm reads no Codex screen (its
-                     Codex screen lane was retired on 2026-10-16).
-                     --final prints ONLY the
-                     worker's last message block — from its last `⏺` message
-                     row, never a tool row (`⏺ Bash(`, `⏺ Workflow(`, Claude
-                     Code's `Background command "…"` / `Dynamic workflow "…"` /
-                     `Task Output` / `Stop Task` notices, a head whose `⎿`
-                     output hangs right under it, a collapsed `Ran 3 shell
-                     commands`) — through the done row that ended the turn;
-                     --messages prints every message block and every `❯` row of
-                     yours, the done rows with them, and no tool row or `⎿`
-                     output at all (a table, a bullet or indented code inside a
-                     message is kept). Both add ` view=<final|messages>
-                     kept=<n>` to the header
   ledger [@sid] [--journal FILE] [--since TIME] [--format text|md|html] [--out PATH]
-                     how the loop RAN, on one time axis: your turns (from the
-                     worker's `history`), the size in rows of the reply each one
-                     drew (one `offscreen … screen=1` read, joined as `report`
-                     joins it), the watcher's own lines when you kept a
-                     --journal, and this session's fabric mail with that worker
-                     (`inbox --peek --meta` rows from it and the `post` rows of
-                     its `timeline` to it — nothing is listed or handled).
-                     SUMMARY counts the turns, the worker's busy time, your
+         [--source anchor|log]
+                     how a session's run went, on one time axis: the turns it
+                     was given (from its `history`), the size in rows of the
+                     reply each one drew (one `offscreen … screen=1` read), a
+                     supervisor's journal lines when one is named with
+                     --journal (the window's own keeps one per session:
+                     `<aterm state>/drive/<sid>.journal.jsonl`), and this
+                     session's fabric mail with that worker (`inbox --peek
+                     --meta` rows from it and the `post` rows of its
+                     `timeline` to it — nothing is listed or handled).
+                     SUMMARY counts the turns, the worker's busy time, the
                      response latency (median and max from each EVENT idle or
                      question to the next turn's start), approvals, dismissals,
-                     context warnings, compactions, reconnects, mail and
-                     complete reports; TIMELINE is one row per item in time
-                     order — time, lane (manager | worker | watcher | fabric),
+                     context warnings, compactions, reconnects and mail;
+                     TIMELINE is one row per item in time order — time, lane
+                     (manager | worker | watcher | fabric),
                      what, duration/latency. --format md writes tables, html
                      ONE self-contained page (inline style and script, nothing
                      fetched) with the manager, watcher and worker swimlanes, the
                      fabric's mail on a fourth, and the
-                     same rows as a table; --out PATH writes it there, 0600.
-                     --since takes Unix ms or a time word (`2026-09-14`,
-                     `2026-09-14T10:30`, `Z` or `±HH:MM`). `history`, the inbox
-                     and the timeline count from the aterm process's own clock,
-                     placed by the birth time of its control socket; what cannot
-                     be placed is marked `~` and no latency is claimed. It only
-                     reads: exit 0 even when a source was missing.
-  --reconnect-s S    await-turn, supervise and watch ride through an aterm
-                     self-update: the session keeps its @sid on the new
-                     instance, and a request that got no answer (`server closed
-                     the connection without responding`, aterm ctl's exit 75
-                     for `aterm was replaced … before it answered` or `… went
-                     away and nothing replaced it`, a refused or vanished
-                     socket) or was turned away unread (`ERR control server
-                     busy; retry`, `ERR auth`, `ERR main thread stalled
-                     …; retry`, also after a verb's own `ERR <what>: `) prints
-                     `RECONNECT <reason>`, then re-reads the same @sid 0.5 s
-                     apart, doubling to 8 s. When one answers it prints
-                     `RECONNECTED after <ms> ms` and looks again from a fresh
-                     read — no seq from before the handoff is waited on, the
-                     point last reported is reported once more if still showing,
-                     and a press whose answer never came is not repeated blind:
-                     the box is read and classified first. S (default 180; 0 =
-                     off) bounds the whole outage, not one ride-out: a request
-                     dropped again before the loop gets past the first is the
-                     same outage, printed once. In one, `ERR no such session` is
-                     not yet an answer (the new instance may not host the @sid
-                     yet); outside one it ends the loop at once, as `ERR exited`
-                     always does. A wait that runs out is followed by a read, so
-                     a handoff no request saw fail is caught too. The window
-                     lapsing ends it, exit 1, with `reconnect window lapsed:
-                     <the last failure>` (watch: an `EXIT` line); --max-s or
-                     --timeout running out first is the TIMEOUT, exit 124. watch
-                     prints both lines on stdout (informational), await-turn and
-                     supervise on stderr. A per-instance socket named with
-                     --socket (`aterm-<pid>.sock`) goes with its instance, so a
-                     ride-out through it lapses: leave --socket off (the
-                     instance hosting this terminal, else the newest) or name
-                     the `aterm.sock` alias
-  --mail             supervise and watch park ONE `await inbox since=<id>` on
-                     YOUR session (@self, or --inbox @sid) from a thread with
-                     a control client of its own — the worker's socket sees
-                     not one request more, except one read per 20 s step
-                     while an idle point is held; no polling — and print, as each
-                     row lands, `MAIL id=<n> off=<o> from=<sid> kind=<k>
-                     len=<n> [re=<o>]` (the body is yours: `aterm ctl @self
-                     inbox get <id>`). The worker's end-of-turn `report`
-                     (one it posts itself, if it does) is folded into the idle
-                     point of the same turn: the point is held — nothing
-                     printed, the screen read once per 20 s step as the
-                     safety net (a prompt or the worker busy again supersedes
-                     it) — until the report lands or --idle-grace S (default
-                     5) runs out, then prints as `EVENT turn seq=<n>
-                     report=<id> rows=<n> <summary>` when the report is this
-                     turn's (it came after the worker was read busy for the
-                     turn, or after the point; --report-window S, default
-                     120, bounds only a report from before the turn was seen
-                     to begin), else `EVENT idle-no-report seq=<n>
-                     [complete= rows=] <summary>`. A question, a limit
-                     notice, a prompt are not held. --journal records the
-                     MAIL lines (kind mail) and the fold (report, rows). When
-                     mail cannot be watched it says `MAIL off: <why>` once
-                     and the lines are as without the flag. supervise --mail
-                     says the MAIL lines on stderr and adds `report <id>
-                     rows=<n>` (or `report -`) after its phase lines. Needs
-                     the worker's @sid; its parked mail wait is cut short
-                     when the loop ends
-  --journal FILE     supervise and watch append one JSON object per line they
-                     print — and, for supervise, per line watch would have
-                     printed for what it decides silently (an approval, the
-                     review point, TIMEOUT, or `EXIT <reason>`): `{"t":<unix
-                     ms>,"sid":…,"kind":"<the line's first word, lowercased:
-                     event, approved, continued, waiting, …; RECONNECTED is
-                     reconnect; any other line is `other`>","phase":…,"seq":…,
-                     "complete":…,"rows":…,
-                     "summary":"<the line's tail>","line":"<the line>",
-                     "turn":…,"report":…}`, every field read from the line itself. Opened
-                     append-only, created 0600 when missing; a failure to open
-                     or write it is said once on stderr and stops nothing.
-                     `aterm drive ledger --journal FILE` replays it. --notes
-                     FILE writes one line per Bash-prompt decision
-  --approve safe|none   supervise and watch answer at most what that level
-                     answers (see supervise): a limit on the [harness] `approve`,
-                     never a raise
-  --no-continue      supervise and watch type no continuation at a turn's end
-  --no-answer        supervise and watch answer no question for a person, in
-                     prose or in the question dialog; it is handed to you
-  --context-warn PCT supervise and watch follow Claude Code's context indicator
-                     (see phase) on every read of a turn, a busy one included:
-                     the first reading at or below PCT (default 10; 0 to 100; 0 =
-                     off, neither line) prints `EVENT context seq=<n> <v>% until
-                     auto-compact`, once a descent; after it, a read with the
-                     composer frame, no approval box and no indicator — or one 30
-                     points or more over the last reading — prints `EVENT
-                     compacted seq=<n>` once and arms the warning again (watch:
-                     stdout; supervise: stderr). supervise's watch lasts one run
-                     — each run starts armed — so a compaction between two runs
-                     prints nothing: after an `EVENT context`, a `phase` before
-                     the next run with no `context <n>%` line (and no box up) is
-                     the compaction; watch keeps one watch while it runs. Only
-                     the indicator is read. A compaction replaces
-                     the worker's history with a summary, and the standing
-                     rules you gave it can silently drop out: on `EVENT
-                     context`, have the worker bring its handoff and notes up
-                     to date before it compacts; on `EVENT compacted`, re-send
-                     your standing rules in one turn. /compact or /clear typed
-                     into the worker rewrites or drops its whole context,
-                     including what its human told it
+                     same rows as a table; --out PATH writes it there, 0600 (the
+                     window's ledger key, ⇧⌘L, runs exactly this for the focused
+                     session). --since takes Unix ms or a time word
+                     (`2026-09-14`, `2026-09-14T10:30`, `Z` or `±HH:MM`).
+                     `history`, the inbox and the timeline count from the aterm
+                     process's own clock, placed by the birth time of its
+                     control socket; what cannot be placed is marked `~` and no
+                     latency is claimed. --source log reads no clock: each
+                     turn by its own session log record joined by `ledger=`
+                     (never by time), each message by its `mail` mark joined
+                     by `inbox=`; SOURCES counts what the log no longer
+                     holds. It only reads: exit 0 even when a source was
+                     missing.
+  tape cat|show|stats FILE | tape ls [@sid] | tape forget FILE|@sid...
+                     the harness tapes hosted loops recorded (a development
+                     build records each hosted run when ATERM_HARNESS_TAPE is
+                     set, to <state>/drive/tapes/<sid>/; a shipped build never
+                     records one): `cat` a tape's items, `show --decisions`
+                     why each act was chosen and `stats` its cost, each read
+                     from the file alone; `ls` lists the store and `forget`
+                     removes from it
+  replay FILE [--until door=N]
+                     run the loop a tape recorded again, offline and exactly
+                     (no socket, no session, no clock, no file the run named):
+                     REPRODUCED, ENDED, REACHED, DIVERGED at #N or PANICKED
+  --socket PATH      the target aterm's control socket: by default the instance
+                     hosting this terminal, else the newest local one
 
-  aterm drive --help       every flag
+  aterm drive --help       every detail
   aterm help introspection the control protocol underneath
 "#;
 
@@ -4313,12 +4939,16 @@ fn protected_folder_names() -> String {
 /// other service (design §7 S4).
 ///
 /// Its DEBUGGER ACCESS section (docs/DESIGN-macos-debugger-access-2026-09-29.md
-/// §4.7, as it stands in P1) is the other wall an agent mistakes for privacy: an
+/// §4.7, as it stands in P1.5) is the other wall an agent mistakes for privacy: an
 /// Authorization Services password, not TCC. The switch exists now, and it is the
 /// OWNER'S: aterm's Settings ▸ Security offers it as the owner's press, confirmed
-/// in aterm's alert, after which macOS should ask for an administrator password in
-/// its own dialog — spike D2 has not measured that yet (owner ruling O7,
-/// 2026-09-29). So the section names that place, names no command
+/// in aterm's alert, after which macOS asks for an administrator password in its
+/// own dialog, one that names SamplingTools (spike D2, measured; owner ruling O7,
+/// 2026-09-29). aterm also raises that alert by itself, once per Mac, after its
+/// first-launch Full Disk Access and Developer Tools pages (owner ruling O29,
+/// 2026-10-19); one line says so, so an operator's "aterm asked me" is not news
+/// to the agent, and nothing on the page tells an agent how to raise it, since
+/// nothing can. So the section names that place, names no command
 /// that turns developer mode on (no `-enable` on an agent page, ever), teaches
 /// `await consent kind=debugger` for the wait, and prints the undo from the consent
 /// module's `DEBUGGER_ACCESS_REVERT` on a line of its own rather than a second copy
@@ -4381,6 +5011,13 @@ WHAT DOES NOT HELP, AND WHY
     answer does not last, and Full Disk Access does not stop a media-library, Photos or
     Contacts dialog. Use `aterm pkg which <tool>`, known paths, and the domains of the
     program you are working on.
+  * A look into the person's own folders that nobody asked you to open (Documents,
+    Desktop, Downloads, an external or network volume, a folder another app syncs for you):
+    an `ls`, a glob or a search there, or a command run from inside one. Unless aterm holds
+    Full Disk Access (for a synced folder, even then), macOS can put a dialog naming aterm
+    on their screen, and your command waits until they answer a question about work they
+    did not ask for. Open one when your operator asked for something in it; otherwise keep
+    to the project you were given.
 
 WHY IT NAMES ATERM, NOT YOUR TOOL
   macOS keys file access to the RESPONSIBLE process, and every program started inside a
@@ -4395,36 +5032,52 @@ DEBUGGER ACCESS (a password dialog, not privacy)
   continue\" is macOS's authorization right system.privilege.taskport.debug. It appears
   when lldb (through debugserver) attaches to a program built without get-task-allow;
   Rust debuginfo tests do this. It is not privacy: Full Disk Access does not cover it and
-  there is no EPERM. The attach waits for an answer; the dialog has been seen to wait 12
-  hours without timing out.
+  there is no EPERM. The dialog waits for an answer (it has been seen to wait 12 hours),
+  but lldb does not: answered after about 30 s, the attach fails and the program it was
+  attaching to is killed; when lldb and that program run in one shell job, the job is
+  hung up too.
+  Cancel does not end the attach: lldb asks again, ten times in all, before it fails.
   1. `aterm ctl privacy`: read the `debugger` row. `mode=disabled` means macOS asks for
-     this password, and asks again once its cached answer lapses (up to 10 h). aterm
-     does not watch for the dialog itself yet, so `pending=off` means aterm is not
-     watching, not that nothing waits.
+     this password, and asks again once its cached answer lapses (up to 10 h), or at
+     every new debugger on a Mac where developer mode was turned on and then off with
+     DevToolsSecurity, which leaves Apple's rule unshared. aterm does not watch for the
+     dialog itself yet, so `pending=off` means aterm is not watching, not that nothing
+     waits.
   2. Tell your operator: a password dialog titled \"Developer Tools Access\" may be waiting
-     on their screen, and your debugger command is parked behind it.
-  3. A debugger command that is still running finishes on its own when a human answers:
-     let it run. One that already returned an error (over ssh, for example, no dialog
-     can appear and the attach fails) needs one retry after the answer — Retry ONCE is
-     enough, because the answer is cached.
+     on their screen, and your debugger command is parked behind it. With `mode=disabled`,
+     tell them BEFORE you attach to a program you cannot restart: only an answer within
+     about 30 s keeps it alive.
+  3. A debugger command still running when a human answers in time finishes on its own:
+     let it run. One that failed after a late answer needs one retry, against the
+     program running again — Retry ONCE. The answer is cached for up to 10 h, except on
+     a Mac where developer mode was turned on and then off: there the retry asks again,
+     so tell your operator before it does. Over ssh no dialog can appear: lldb fails at
+     once (\"this is a non-interactive debug session\"), and only developer mode changes
+     that.
   4. `aterm ctl @<sid> await consent kind=debugger timeout=<ms>` parks until the row's
      `mode=` changes. A latch means aterm read a different rule; it cannot see what a
      human clicked in a dialog.
   Developer mode (the row's `mode=`) is a setting for the whole Mac, and it is the
-  operator's decision. With it on, Apple-signed debuggers should attach without this
-  dialog for admin and _developer accounts — and every unhardened program those accounts
+  operator's decision. With it on, Apple-signed debuggers attach without this dialog for
+  admin accounts and _developer members — and every unhardened program those accounts
   run can be debugged, without a password, by any other program they run, development
   builds of aterm included (`self_hardened=no` means this aterm is one). With
-  `member=no` it changes nothing for this account. This page does not give the command
-  that turns it on: the owner can allow debugger access in aterm's Settings ▸ Security
-  (their press; macOS should then ask for an administrator password), and they can
-  turn it off there again. Tell the operator it exists; the decision is theirs. The
-  same undo in a terminal, for the operator:
+  `member=no` it changes nothing for this account. This page does not give the
+  command that turns it on: the owner can allow debugger access in aterm's Settings ▸
+  Security (their press; macOS then asks for an administrator password, in a dialog that
+  names SamplingTools), and they can turn it off there again. Tell the operator it
+  exists; the decision is theirs.
+  Once per Mac, aterm also asks them in its own alert, at a quiet moment after it starts.
+  The same undo in a terminal, for the operator:
     {revert}
+  A narrower route needs no dialog and no switch: lldb attaches without asking to a
+  program signed ad hoc with the `com.apple.security.get-task-allow` entitlement
+  (`codesign -s - -f --entitlements <plist> <program>`). It changes that one program's
+  signature; propose it to the operator for a program you built.
   A retry of the attach, in a loop or not, cannot answer the dialog.
   `sudo` (lldb, or anything else) goes around the password the operator is being asked
   for instead of answering it.
-  `DevToolsSecurity` with no flag ENABLES: it should put an administrator dialog on the
+  `DevToolsSecurity` with no flag ENABLES: it puts an administrator dialog on the
   owner's screen for a change to the whole Mac the owner did not decide, and with any
   flag it is the operator's tool. `aterm ctl privacy` already reads its `-status`.
   Editing the authorization database (`security authorizationdb`) rewrites the rule for
@@ -4433,9 +5086,10 @@ DEBUGGER ACCESS (a password dialog, not privacy)
   running software that fails the security policy. It is, though, the list that exempts
   the programs aterm starts from macOS's per-launch first-run check (syspolicyd and
   XProtect): the fix for slow first runs of build and test binaries (SLOW FIRST RUNS).
-  `sample`, `leaks`, `vmmap`, `heap` and `atos` should not raise this dialog: they read
-  task ports by entitlement. A third-party debugger such as gdb asks a different right
-  that developer mode leaves alone.
+  `sample`, `leaks`, `vmmap`, `heap` and `atos` do not raise this dialog: they read task
+  ports by entitlement. On a program without `get-task-allow`, `leaks` reads only its
+  read-only memory. A third-party debugger such as gdb asks a different right that
+  developer mode leaves alone.
 
 SLOW FIRST RUNS (macOS's first-run check, not a wall)
   A new program that starts but stays silent for seconds or minutes under load is
@@ -4529,21 +5183,238 @@ fn trust_install_act(unserved: bool) -> &'static str {
     }
 }
 
-/// `aterm help fleet`: the fleet streams.
-const FLEET_PAGE: &str = r#"fleet — watch and drive the sessions of every aterm window on this machine
+/// `aterm help fleet`: a machine's membership in a fleet — `init`, `join`,
+/// `peers`, `leave` — the files and config they write, and where the removed
+/// modes went.
+const FLEET_PAGE: &str = r#"fleet — the aterms of one LAN, reading each other and driving where allowed
 
   aterm fleet <command>
 
-STREAMS
-  aterm fleet events         merge the `subscribe events` of every live instance in the
-                             default socket dir to stdout as NDJSON, addressed
-                             /fleet/<pid>/events/<sid> (an instance on an explicit
-                             --control-sock is listed but not federated)
-  aterm fleet exec           read `@<sid> <verb> [args…]` lines on stdin, dispatch each to
-                             the fleet, emit one NDJSON result per line
+A FLEET is the aterms of one LAN that hold one secret. Each member listens on its
+fleet port, where another member READS it at the level it allows — the verbs the
+control protocol marks for a fleet peer — and types into it only where its
+person lets that one machine drive it (DRIVE below). One secret is one read
+trust domain: every member can read every other, so give the code only to
+machines you would let read your sessions. The issuer's book is the fleet's
+roster: the issuer records each member that joins, and shares that book with its
+members (op `book`), so every member reads the whole fleet. A member's book holds
+its issuer and the peers named there by hand; beside it the member keeps a copy
+of the issuer's book (listed via issuer-book), replaced at each read, never
+edited by hand, and gone with the issuer's entry.
+
+NODE KEYS: the secret says a machine is OF the fleet, never which one. So each
+machine holds a key of its own too (<state>/fleet-node-key, minted at its first
+init or join), which it proves on every fleet connection. The issuer binds a
+member's node id to the key it first registers with and refuses another key for
+it after: `aterm fleet peers rm <node>` on the issuer lets a machine that lost
+its key join afresh (on a member, `peers rm` of its issuer, then join again,
+when the issuer lost its own). A node an older aterm recorded binds its key at
+its next join from the address it was recorded from, and only there. A read
+names a peer that claims a bound node without its key, and never shows what it
+sends under that name; a peer whose node is bound to no key answers as its
+claim, and its survey block's header says `node unproven`. This machine, at a
+place named by hand (`peers add`, [[fleet.peers]]), proves its own key and is
+no claim. A member that binds no key to its issuer (it joined before keys came,
+or its issuer proved none then) reads every peer as a claim, the issuer
+included, until it joins again; an issuer from before keys mints its key at
+`aterm fleet init`, which changes nothing else there.
+
+THE ADDRESS RULE: members reach each other on loopback, private (10/8,
+172.16/12, 192.168/16, fc00::/7) or link-local (169.254/16, fe80::/10)
+addresses only. A reader never dials a public or CGNAT address (100.64/10,
+Tailscale's among them), and a listener refuses a connection from one: a lab
+whose machines hold only such addresses can form no fleet.
+
+MEMBERSHIP
+  aterm fleet init [--allow facts|content] [--port N] [--host H]
+                       on the FIRST machine, which becomes the fleet's issuer: a
+                       160-bit secret into <state>/fleet.key and the join code into
+                       <state>/fleet-join-code (both 0600), whose PATH it prints —
+                       never the code, as aterm exports screens — and [fleet]
+                       listen and allow set in aterm.toml. --host is the name or
+                       address members dial (on a Mac the HostName an administrator
+                       set, else its Bonjour name, <LocalHostName>.local, which DHCP
+                       does not change; else its host name), --port the fleet port
+                       (7100). It prints the join line for the other machines, and
+                       --allow content for a fleet that reads their titles, prompts
+                       and words. On an
+                       issuer it changes nothing: the flags take --rotate. A member
+                       (it holds the key it joined with) is refused: `leave` first.
+  aterm fleet init --rotate [--host H] [--port N]
+                       on the issuer only: a new secret and code, after a machine is
+                       lost — every member joins again. The book keeps each member,
+                       read as holding another secret until it joins again, and
+                       the report lists them: work through that list, and `peers
+                       rm` the machine that was lost. The new code names the host
+                       and port the old one did unless --host or --port names others.
+  aterm fleet join [--allow facts|content] [--port N] [--host H] [--code-file F]
+                       on EVERY OTHER machine, with the code file copied there (it is
+                       the secret: AirDrop or scp, not a chat; once the machine has
+                       joined, delete that copy and any other): `aterm fleet join <
+                       code-file`, `--code-file F`, or typed at the terminal, unshown.
+                       NEVER an argument — every process can read a command line, and
+                       the shell's history keeps it. It registers with the issuer
+                       over its fleet port (the code names it), naming this machine
+                       by its LAN name (as init's --host; --host names another), and
+                       only once the issuer has recorded it writes the key and
+                       [fleet]: a typo in the code or an issuer that does not answer
+                       writes nothing of the fleet (no key, book or [fleet]; at most
+                       this machine's node id and node key, which `leave` keeps
+                       too). It joins at
+                       facts unless --allow content says otherwise (LEVELS below), and
+                       says how to raise it. This machine listens on --port,
+                       else the port [fleet] listen already names, else the issuer's.
+                       On a Mac that is the first connection into the LAN, which asks
+                       to let aterm find devices on the local network: allow it. An
+                       issuer joins nothing: `leave` first (its fleet goes with it).
+  aterm fleet peers [--timeout S]
+                       every machine this one knows — the issuer's book of members, a
+                       member's issuer and its copy of the issuer's book (read again
+                       from the issuer each time), [[fleet.peers]] in aterm.toml —
+                       each checked at once (3 s; --timeout up to 10), with the reason
+                       for each one not reached; KEY is the node key each entry is
+                       bound to (unbound: a node an older aterm recorded, bound when
+                       it next joins).
+  aterm fleet peers add <host[:port]> | rm <host[:port]|node>
+                       rm refuses a copy of the issuer's book: rm it on the issuer
+  aterm fleet allow facts|content
+  aterm fleet allow drive --from <host|node> [--from …]
+                       what a peer may do here, set on this machine alone: a level
+                       (LEVELS below), or drive — content, and the machines named
+                       may drive this Mac's sessions (DRIVE below). Each is named
+                       by a word the book resolves to a node it binds a key to
+                       (`aterm fleet peers`); facts or content takes drive back.
+  aterm fleet leave    removes the key, the code, the book, the copy of the
+                       issuer's book and [fleet] listen/allow/drive_from;
+                       the listener stops within 2 s. The issuer is not told: its
+                       `peers` reads this machine as not answering until `peers rm`.
+                       On the issuer the fleet goes with it (its code was the only
+                       way in): `init` and `join` again make a new one.
+
+READING THE FLEET
+  aterm ctl survey --fleet
+                       every session on this machine and on every machine of the
+                       fleet, from any one of them: a member asks its issuer's book
+                       first, and every peer it knows meanwhile, each within one
+                       deadline (3 s; --timeout up to 10), over the fleet port —
+                       the first 32 at once share it; past that a peer waits for a
+                       free place and is given the deadline of its own: one line
+                       per peer that did not answer, with why. An issuer whose
+                       aterm is older shares no book: the read ends with a line
+                       saying it reached only the peers this machine knows (update
+                       aterm there). An issuer that answers but sends no book this
+                       time gets a line too: the read asked the members its last
+                       book named, or, with no earlier book held here, only the
+                       peers this machine knows. When no peer had a route, it says
+                       that is a Mac's local-network privacy and where in System
+                       Settings to allow it; when none had a route to its network,
+                       that this machine is offline or a VPN holds the route. When
+                       a sandbox around the reader (Claude Code's Bash sandbox) or
+                       a firewall refuses its connects, each peer's line says so
+                       and one closing line says it once: run the read outside it.
+                       Another line names the peers that allow facts alone, and a
+                       peer running more than one aterm says `1 of N instances
+                       read` on its header.
+  aterm ctl survey --host <host|node|address> [--sid <s>]
+                       one peer, its whole machine; --sid one session's excerpts
+
+LEVELS (--allow, [fleet] allow)
+  facts      programs, agent states, roles (the label `meta set role` stamped:
+             one word of at most 32 letters, digits and `:_.-`, redacted), task
+             records, models; no other text a person or a program wrote (the
+             default)
+  content    facts, and the tab titles a person set, terminal titles, cwds,
+             prompts, an agent's newest words, a shell's last lines, a role
+             written as text
+  drive      content, and the nodes `drive_from` names may drive its sessions
+             (`aterm fleet allow drive --from`; never set by a join or a peer)
+
+DRIVE (the step-in)
+  Off unless this Mac's person names who: `aterm fleet allow drive --from
+  <host|node>` here, for each Mac that may. A named Mac then runs the worker's
+  verbs here with a host named — `aterm ctl --host <this Mac> spawn agent=claude …
+  - < task`, `await task`, `@<sid> result|status|text|screen|turn|key|send`, `hold
+  <sid> on|off`, `@<sid> close` of a worker it spawned (`aterm help workers`) — and
+  nothing else. It is admitted only when it proves the node key this Mac's book
+  binds to it, the key it held when its grant was made: the fleet secret alone
+  drives nothing, every other machine is refused, and so is a node id bound afresh
+  to another key until it is granted again. `aterm fleet peers rm <node>` takes its
+  grant away (on a member too, where the node stays in its copy of the issuer's
+  book), so does a read of the issuer's book that binds it no more or to another
+  key, and a join of another fleet takes every grant. On a member, a Mac that only
+  its copy of the issuer's book binds is admitted against a copy under a minute
+  old; past that this Mac reads the issuer's book again first, so the issuer's
+  `peers rm` stops it within a minute, and while the issuer cannot be reached the
+  drive is refused, saying so. A turn names timeout= of at most 22000 (its
+  connection lasts 30 s), and is refused past it. The driving Mac dials only a Mac
+  its book records. Its first `await task` names `since=0`, as on one Mac (`aterm
+  help workers`, ON ANOTHER MAC), and its menu bar lists what it holds here under
+  ❯ Held from here, with Hand Back. Each write is typed as `<that Mac> (node <8
+  hex>) over the fleet` (`status typed_by=`) and kept in Messages; the host is that
+  Mac's own word, the node the key it proved. Its hold shows in the tab's hover
+  (`held by <that Mac> (node <8 hex>) over the fleet`) and under ❯ Held. The person
+  here wins: Take Over refuses every write from another Mac, a turn already typing
+  stopped at its next key, and takes its hold away; the person's own hold then
+  shows in ❯ You hold, the needs and the window's border, and Hand Back lifts it.
+  Driving a Mac is typing into its shells: grant it as you would an ssh login.
+
+FILES (<state> is ~/Library/Application Support/aterm on macOS)
+  fleet.key          the secret, lowercase hex, 0600 — the listener reads it
+                     every 2 s, so a rotation or a leave takes effect with no
+                     relaunch
+  fleet-join-code    the issuer's join code (the secret again), 0600
+  fleet-node         this machine's node id; kept by `leave`
+  fleet-node-key     this machine's node key (an Ed25519 seed, hex), 0600; kept
+                     by `leave`
+  fleet-peers        the book of peers, one per line, at most 256
+  fleet-issuer-book  a member's copy of its issuer's book, replaced at each read
+                     of it; never edit it (an older aterm never opens it)
+
+  [fleet]
+  listen = "0.0.0.0:7100"   # numeric IP:port; absent, no fleet port
+  allow = "facts"           # or "content", or "drive" with drive_from
+  drive_from = ["<node>:<key>"]  # who may drive this Mac, each with the key its
+                                 # book bound it to (written by allow drive --from)
+  watch = true              # read the fleet every minute for the menu bar
+  [[fleet.peers]]
+  host = "lab-mini:7100"    # named by hand, beside the book
+
+`aterm ctl status` says where the listener stands: fleet=off, listening, retrying
+or refused:<why>.
+
+IN THE MENU BAR (macOS). The ❯ item's Fleet row reads `aterm ctl survey --fleet`
+as a child: every minute on the issuer or with [fleet] watch = true, else when
+the menu opens. A need on another Mac counts on ❯N from a read no older than 5
+minutes, from a Mac whose aterm publishes needs; its row offers Read This
+Session, Screen Sharing and Copy "ssh <host>", and Take Over on <Mac> / Hand
+Back on <Mac> where that Mac lets this one drive it — any other is read-only
+from here, and its row says so. A Mac whose key is not proven (its survey block
+says `node unproven`) is listed under "1 Mac's key not proven (not counted:
+rejoin it)", its row marked "key not proven": what it says is its word alone,
+so none of its needs counts or is told, nothing on it is taken over or handed
+back from here, and its own node= and host= are not taken; update aterm there
+and join it again (`aterm fleet peers` shows its KEY). Where this Mac binds no
+key to its issuer, no Mac's key is proven here whatever each does: the fold
+says "join again here", and one line under the Fleet row, and each such row,
+says "This Mac binds no key to its issuer <issuer>: join again here once it
+has one (`aterm fleet init` there)". `aterm ctl chrome`'s
+statusitem line says fleet=off (no fleet glance runs: no fleet, a headless
+instance, or no menu-bar item yet)|unread|reading|failed|as_of:<unix ms>, and
+its statusmenu lines are the menu's rows as a click would show them, Take Over
+on <Mac> among them, read with no click.
 
   aterm fleet --help         every command and its arguments
-  aterm help introspection   the control protocol underneath
+  aterm help introspection   the control protocol a fleet peer reads (`help --json`
+                             marks its verbs `fleet`)
+
+REMOVED (2026-10-16)
+  events, exec               the local NDJSON bridge: `aterm ctl survey` reads what every
+                             session of every instance is doing, `aterm ctl subscribe
+                             @a,@b events` streams one instance's, and `aterm ctl @<sid>
+                             <verb>` reaches a session of any instance
+  status, manage, next, …    an attention queue aterm no longer keeps: a manager session
+                             takes its place, with `aterm ctl survey` and workers
+                             (`aterm ctl @self spawn agent=claude - < task`)
 "#;
 
 /// `aterm help trust-backends`: the default-set verifier programs a reader sees
@@ -4774,6 +5645,15 @@ fn rust_page() -> String {
             out,
             "  refused          {}  (carried a targo but is NOT the pinned toolchain)",
             r.display()
+        );
+    }
+    // A formatter or lint driver the check toolchain lacks, taken from the managed
+    // Trust build (`Toolchain::borrowed`): the checks run it rather than skip.
+    for (name, file) in &tools.borrowed {
+        let _ = writeln!(
+            out,
+            "  borrowed         {name} from {}  (the check toolchain has none)",
+            file.display()
         );
     }
     // A rustup `trust` older than the store's build is ranked below the store — the
@@ -5870,26 +6750,36 @@ WHAT IT IS
   and is invisible to every verb below. (The plain `aterm` passthrough CLI serves NONE:
   it is a transparent shell wrapper, not an introspection host.) The `aterm ctl` client
   talks that socket: read the terminal state (as text/styled cells) or
-  application-rendered client pixels, send keystrokes, wait on events, and drive a whole
-  fleet through the same application input path. OS compositor and display output are
-  outside this interface. A session is addressed by its sid;
+  application-rendered client pixels, send keystrokes, wait on events, and drive every
+  session on this machine through the same application input path. OS compositor and
+  display output are outside this interface. A session is addressed by its sid;
   `@<sid>` routes a verb to that session, relayed transparently to any sibling instance
-  of the same user ON THIS MACHINE.
+  of the same user ON THIS MACHINE. Another machine is read through the fleet
+  (`aterm fleet init` on one machine, `aterm fleet join` on each other, then `aterm ctl
+  survey --fleet`), not this path, and driven only where its person lets this one
+  (`aterm ctl --host <h> @<sid> turn '…'`, `aterm help workers`).
 
 THE MOVES (an AI's loop is see -> decide -> drive -> observe)
   SEE     aterm ctl @sid text | screen | image f.png | cast frames count=8
   DRIVE   aterm ctl @sid turn 'message'   (verified type -> submit -> settle -> reply)
           aterm ctl @sid send '...' | key enter | paste | resize <r> <c>
+          a Claude Code peer: turn typed=1 settle=submitted '<line>', then, as a
+          background command, await agent idle,prompt,question,wall since=<n>, n its
+          agent_rev= (its idle screen never settles; since= passes over the idle from
+          before the submit; the client re-arms the wait to its timeout=, else an hour,
+          and Claude Code's Bash ends a foreground command at 2 min)
   OBSERVE aterm ctl @sid await idle <ms> | await match <re> | await gone <re> | ready | wait
-          | await agent <word,…>
+          | await agent <word,…> [since=<rev>]
   WATCH   aterm ctl subscribe @a,@b,@c events     (many sessions on ONE fd, low-rate)
           INSTANCE-LOCAL: a comma list is never relayed to a sibling instance, and the
           first selector this instance cannot resolve fails the whole subscribe with
-          `ERR no such session`. For every instance at once use `aterm fleet events`,
-          which runs one subscribe per instance and merges them into one stream.
-  FLEET   aterm ctl windows | ls   (every window; every session of every instance,
+          `ERR no such session`. Another instance's sessions are its own subscribe
+          (`aterm ctl --pid <pid> subscribe …`).
+  ALL     aterm ctl windows | ls   (every window; every session of every instance,
                                    with window= and detail=)
-          aterm fleet events | exec                  (NDJSON across every instance)
+          aterm ctl survey        (what every session of every instance is doing now)
+          aterm ctl survey --fleet (and the machines of the fleet this one knows, read
+                                   only: `aterm help fleet`)
   RECALL  aterm ctl @sid history [<n>]      (per-turn record + deterministic screen hash)
 
 HOW TO USE IT
@@ -5947,10 +6837,14 @@ HOW TO USE IT
   line would move; one under another `HOME` is carried with that `HOME`); `[harness]
   relaunch = false` does not refuse it),
   every word of the stall — the line, the menu row, the band, the refusal, the
-  supervisor's mail — names `restart pid=<n> if-stalled` instead: it ends the program and
-  relaunches it on its conversation (never a Muse Code, which the restart does not end
-  yet — what SIGTERM does to one in the middle of a turn is unmeasured — so its words name
-  `signal term` and its own `muse resume <uuid>` line), and nothing is typed. On a peer they act on
+  supervisor's warning — names `restart pid=<n> if-stalled` instead: it ends the program and
+  relaunches it on its conversation (an agy too: SIGTERM is one of its graceful ways out,
+  measured in the middle of a turn, its conversation keeping the cut turn — where its
+  relaunch has an agy to type, the managed one for a store build; never a Muse
+  Code, which the restart does not end yet — what SIGTERM does to one in the middle of a
+  turn is unmeasured — so its words name `signal term` and its own `muse resume <uuid>`
+  line; nor a Gemini CLI, whose parent node ignores SIGTERM, so its words name its own
+  `gemini --resume <uuid>` where aterm can tell its session), and nothing is typed. On a peer they act on
   its owner's program, and so on its owner's work. A program
   can live through `signal term` — a Node program's SIGTERM listener never runs while its
   JS thread spins — so it stays `stalled` (`input_bytes=0`), every input verb still refused,
@@ -6040,21 +6934,45 @@ fn agent_page(sid: Option<&str>) -> String {
          The loop is see -> decide -> drive -> observe. Read a peer with `@sid text` or a\n  \
          real frame with `@sid image`; drive it with `@sid turn 'msg'` (verified submit +\n  \
          settle + reply); wait without polling via `@sid await idle <ms>` / `await match <re>`\n  \
-         / `await gone <re>`; for a coding-agent peer, `await agent idle,prompt,question,wall`\n  \
-         (the server's verdict, latched: its turn is over, a box waits, or a wall stops it).\n  \
+         / `await gone <re>`. A Claude Code peer's idle screen never settles: drive it with\n  \
+         `turn typed=1 settle=submitted '<line>'`, then wait on `await agent\n  \
+         idle,prompt,question,wall since=<n>`, n the turn's `agent_rev=` (the server's verdict\n  \
+         past the one its Enter found: its turn is over, a box waits, or a wall stops it), as a\n  \
+         background command: Claude Code's Bash ends one at 2 min, and the client re-arms the\n  \
+         wait to its timeout=, else an hour.\n  \
          Watch THIS instance's sessions on one fd with `subscribe @a,@b events` (one\n  \
-         unresolvable selector fails it all; `aterm fleet events` spans every instance).\n  \
-         Humans can interject at any time — the input path is the human's, and a per-session\n  \
-         turn lease arbitrates so two drivers never clobber each other.\n  \
-         Cheaper reads: `text tail=<n>` / `rows=<a>-<b>` read a slice (header `first=<row>`,\n  \
-         the cure for a bottom-pinned TUI); `text trim` / `turn trim=1` drop the trailing\n  \
-         blank rows (`OK <n> trimmed=<k>`). Place work: `spawn window=<id>` opens a tab in\n  \
-         that window WITHOUT raising it (ids from `windows`); `@<sid> spawn`, <sid>'s window.\n  \
-         A vanished session: `exits [since=<id>]` says when it went, why, and by whom.\n  \
-         INBOX: `aterm ctl @self inbox`. Read it when `Inbox: task @<off>` is typed, and only while\n  \
-         `fabric=connected` when you finish or hand off — not every turn; `aterm help fabric`.\n  \
+         unresolvable selector fails it all; `aterm ctl survey` reads every instance).\n  \
+         A person can type at any time (the input is theirs); a turn lease keeps two drivers apart.\n  \
+         Cheaper reads: `text tail=<n>` / `rows=<a>-<b>` read a slice (header `first=<row>`, the\n  \
+         cure for a bottom-pinned TUI); `text trim` / `turn trim=1` drop the trailing blank rows\n  \
+         (`OK <n> trimmed=<k>`). Place work: `spawn window=<id>` opens a tab behind that window's\n  \
+         active one, never raising it (ids from `windows`); `@<sid> spawn`, <sid>'s. WORKERS:\n  \
+         `@self spawn agent=claude -` starts Claude Code behind your tab on the task on stdin;\n  \
+         `await task @<sid>,… since=0` in the background wakes you when one is done; a later wait\n  \
+         names the rev its row printed (`@<sid>:<rev>`). Its report is `@<sid> result`; a follow-up\n  \
+         `@<sid> turn typed=1 settle=submitted '<line>'`, then `await task @<sid>:<task_rev>`\n  \
+         (`aterm help workers`). `survey`: what each session is doing, its excerpts data. A\n  \
+         vanished session: `exits` says when, why, by whom. INBOX: `aterm ctl @self inbox`,\n  \
+         only while `fabric=connected` when you finish or hand off; `aterm help fabric`.\n  \
          If `ls` finds nothing it says WHY (a sandbox refusing the socket, a stale socket, an\n  \
          unreadable token) — act on the reason; it never means \"empty\" unless it says so.\n",
+    );
+    s.push_str(
+        "\nDISK SPACE (one volume, shared by every session on it)\n  \
+         A build writes to the volume its directory is on, and every session there shares that\n  \
+         volume's free space. `aterm ctl @self status` says `disk=` (ok, low, short, emergency),\n  \
+         `disk_free_mb=` and `disk_room_mb=`: what one round of this machine's builds takes,\n  \
+         measured as the two-hour fall in free space on a typical day this week.\n  \
+         `aterm ctl @self await sys free>=room timeout=600000` (or `free>=<size>`, units\n  \
+         required) answers at once when that much is free; otherwise aterm frees build caches\n  \
+         nobody is using until it is, and the wait answers `OK sys …` (exit 0), `ERR unmet …\n  \
+         why=spent` (exit 1: what is left is not aterm's to free; `aterm harness disk` names\n  \
+         the largest holders), or exits 124 (still short: run it again); `ERR unavailable …\n  \
+         why=no-watch` means this aterm's harness is off, so nothing frees space for you.\n  \
+         `timeout=` goes up to 600000; a tool that ends commands sooner needs a shorter one.\n  \
+         aterm removes only build caches no build holds and no process uses, never source, and\n  \
+         records each removal in `aterm harness ledger disk`. A build directory deleted by hand\n  \
+         can be one another session's build is using.\n",
     );
     // §5.5, before the tool list: an EPERM with no dialog reads as a broken
     // tool, and retry, `sudo` or another path are all wrong. Folder names come
@@ -6127,32 +7045,38 @@ fn push_macos_walls(s: &mut String) {
          and another path gives the operator a result they did not ask for. If\n  \
          `full_disk_access=denied`, one grant in System Settings ▸ Privacy & Security ▸ Full Disk\n  \
          Access removes this class of interruption for the folders it covers; only a person can\n  \
-         grant it — not you, not aterm — so tell your operator. Reading other apps' data\n  \
-         (every `defaults` domain, another app's container, the Music or Photos library) can\n  \
-         raise a dialog that grant does not retire, and the reader waits until a person answers\n  \
-         it. `aterm ctl @<sid> await consent timeout=<ms>` parks until the posture changes. If\n  \
-         `attribution=adopted`, this session outlived the aterm process that started it and its\n  \
-         file access may differ from a fresh tab's — opening a new tab is a valid recovery.\n  \
-         Full page: `aterm help permissions`.\n",
+         grant it — not you, not aterm — so tell your operator. Until then a look nobody asked\n  \
+         for into the person's Documents, Desktop or Downloads folder or a volume can put a\n  \
+         dialog naming aterm in front of them (a synced folder, even then): keep to your project.\n  \
+         Reading other apps' data (every `defaults` domain, another app's container, the Music or\n  \
+         Photos library) can raise a dialog that grant does not retire, and the reader waits\n  \
+         until a person answers it. `aterm ctl @<sid> await consent timeout=<ms>` parks until the\n  \
+         posture changes. If `attribution=adopted`, this session outlived the aterm process that\n  \
+         started it and its file access may differ from a fresh tab's — opening a new tab is a\n  \
+         valid recovery. Full page: `aterm help permissions`.\n",
         protected_folder_names(),
     );
     // Debugger-access design §3.11: the rarer wall beside it, three lines. A
     // "Developer Tools Access" dialog reads like a privacy prompt, and the
     // reflexes are the same three wrong moves plus a fourth that is worse:
     // running `DevToolsSecurity`, which with no flag ENABLES developer mode for
-    // the whole Mac behind what should be an administrator dialog on the owner's
-    // screen. The switch is the owner's press in aterm's Settings (ruling O7);
-    // the brief is at its line budget, so `await consent kind=debugger` lives
-    // on the page. Its last sentence is the other macOS gotcha with "Developer
-    // Tools" in its name, the first-run check that parks a new program at
-    // `_dyld_start` (owner ruling 2026-10-14, design §9.1 O18, which reverses
-    // O16's "no agent-brief line"): one pointer to doctor's row.
+    // the whole Mac behind an administrator dialog on the owner's screen. A
+    // parked lldb survives only an answer within about 30 s (spike D6's lldb
+    // runs): later, its attach fails and its target is killed. The switch is the owner's yes in aterm's own alert: their press in
+    // aterm's Settings (ruling O7), or the alert aterm raises once per Mac at
+    // first launch (ruling O29). The brief is at its line budget, so `await
+    // consent kind=debugger` and the launch ask live on the page. Its last
+    // sentence is the other macOS gotcha with "Developer Tools" in its name,
+    // the first-run check that parks a new program at `_dyld_start` (owner
+    // ruling 2026-10-14, design §9.1 O18, which reverses O16's "no
+    // agent-brief line"): one pointer to doctor's row.
     s.push_str(
         "\nDEBUGGER ACCESS (a password dialog, not privacy)\n  \
          \"Developer Tools Access\" is a macOS password dialog, not privacy (`aterm ctl privacy`'s\n  \
-         `debugger` row); your operator answers it and a parked call finishes; a retry or `sudo`\n  \
-         does not, and bare `DevToolsSecurity` ENABLES developer mode Mac-wide. A new program\n  \
-         parked at `_dyld_start` is macOS's first-run check: see `aterm doctor`'s `devtools:` row.\n",
+         `debugger` row): answered within ~30 s, a parked lldb goes on; later, it fails and its\n  \
+         target is killed. A retry or `sudo` is no answer, and bare `DevToolsSecurity` ENABLES\n  \
+         developer mode Mac-wide. A new program parked at `_dyld_start` is macOS's first-run\n  \
+         check: see `aterm doctor`'s `devtools:` row.\n",
     );
 }
 
@@ -6171,13 +7095,13 @@ pub fn in_session() -> Option<String> {
 /// verbs itself. A Codex's model is sandboxed from the socket; codex-alab's own
 /// TUI reads its mail for it, and a vendor `codex` takes no part. The
 /// primer's inbox line points here.
-const FABRIC_PAGE: &str = r#"fabric — peer messaging between aterm sessions, humans and hosts
+const FABRIC_PAGE: &str = r#"fabric — peer messaging between aterm sessions and humans
 
 WHAT IT IS
   Every aterm session owns an INBOX and an OUTBOX in the terminal itself. Sessions send
-  each other addressed messages — an agent to a peer, across tabs, across machines —
-  and a person with a cap of their own (A PERSON, below) reads and answers them. The
-  mail is NOT typed into anyone's terminal: it is a structured row
+  each other addressed messages — an agent to a peer, across tabs and windows — and a
+  person with a cap of their own (A PERSON, below) reads and answers them. The mail is
+  NOT typed into anyone's terminal: it is a structured row
   the recipient reads with a verb, on its own schedule. That is the whole point. A peer
   cannot make you run something; it can only put a message where you will see it.
 
@@ -6193,10 +7117,15 @@ THE FIVE VERBS YOU NEED
   aterm ctl @self inbox get <id>            the full body of one message
   aterm ctl @self inbox seen <id> handled   done up to <id>; the verdict acks <id> alone
                                             (also: refused, deferred)
-  aterm ctl @self post to=@<sid> kind=task '<text>'    send one
+  aterm ctl @self post to=@<sid> kind=ask '<text>'     send one
   aterm ctl @self await inbox since=<id>    block until mail newer than <id> (the newest
                                             `inbox` id, 0 if empty); skips notes unless
-                                            given kinds=note,...
+                                            given kinds=note,...; re-armed by the client
+                                            until its timeout=<ms> (an hour by default),
+                                            then `OK timeout`, exit 124
+  A task for a Claude Code session goes as a WORKER's first prompt, not as mail (`aterm ctl
+  @self spawn agent=claude -`, the task on stdin), and `aterm ctl survey` says what every
+  session on this machine is doing (`aterm help workers`).
 
 BROADCAST — ONE RECORD, HOWEVER MANY READERS
   aterm ctl @self post to=say:<topic> kind=note '<text>'   shout on a topic
@@ -6207,8 +7136,9 @@ BROADCAST — ONE RECORD, HOWEVER MANY READERS
   the body into anybody's inbox. A session receives it only because it asked, with
   `topic add`, and the set is EMPTY by default, so a session that asked for nothing
   receives nothing — INCLUDING the sender, which hears its own shout only if it
-  subscribed too. A broadcast `note` does not end a bare `await inbox`; list it with the
-  kinds you still want, e.g. `kinds=task,ask,answer,report,note`.
+  subscribed too. A broadcast `note` does not end a bare `await inbox`;
+  `await inbox since=<id> topic=<t>` waits for that topic's broadcasts alone, and
+  `kinds=task,ask,answer,report,note` takes them beside the rest of the mail.
   `since=head` (the default) takes only what is published from then on; `since=@<off>`
   replays the topic from that bus offset for a session joining late.
   Topic is `[a-z0-9][a-z0-9._-]{0,31}`; anything else is `ERR usage` at the post.
@@ -6306,15 +7236,16 @@ BROADCAST — ONE RECORD, HOWEVER MANY READERS
   posted with `key=` and is re-posted under the same one. Report "queued", never "not
   sent".
     ERR <reason> id=  THE FOURTH, AND THE ONE THAT IS NOT QUEUED: the bridge RETIRED the
-                    post — `unroutable` (the address resolves to nothing), `ambiguous`
-                    (two nodes claim the sid), `undeliverable`, `refused` (the broker
-                    refuses the record for good, e.g. a lane this node's cap does not
-                    grant: the same post is refused again), or `subject-budget` (the post
-                    would open a new subject — a new lane, or a broadcast topic once the
-                    node is down to the quarter it keeps for its sessions — past the
-                    node's lifetime budget of distinct subjects). The row is dead, no bridge
-                    drains it again, and re-posting is the right move once the address
-                    is right. Report it as that reason, never as queued.
+                    post — `unroutable` (the address resolves to nothing, or to a
+                    session whose row says `exited`), `ambiguous` (two nodes claim the
+                    sid), `undeliverable`, `refused` (the broker refuses the record for
+                    good, e.g. a lane this node's cap does not grant: the same post is
+                    refused again), or `subject-budget` (the post would open a new
+                    subject — a new lane, or a broadcast topic once the node is down to
+                    the quarter it keeps for its sessions — past the node's lifetime
+                    budget of distinct subjects). The row is dead, no bridge drains it
+                    again, and re-posting is the right move once the address is right.
+                    Report it as that reason, never as queued.
                     A queued post an aterm self-update could not carry (past its size
                     budget) is retired the same way, `reason=not-carried` — the
                     session's `timeline` says `post-landed <id> off=- reason=not-carried`:
@@ -6323,14 +7254,13 @@ BROADCAST — ONE RECORD, HOWEVER MANY READERS
   new instance drains the same outbox, and inbox, post and timeline ids go on rising.
 
 WHEN TO READ YOUR MAIL
-  When the line `Inbox: task @<off>` is typed into your terminal (a manager's `aterm
-  drive task` types it), and — only while `aterm ctl @self status` shows
-  `fabric=connected` — when you finish or hand off work. Not every turn: with
-  `fabric=absent` nothing can arrive. An `ask` or a `task` addressed to you is work you
-  were given. Nothing wakes you for mail — you are typed to, as a human would type to
-  you — so an unread task sits there while you finish and stop. Codex's sandbox
-  reaches no socket: a vendor `codex` takes no part in messaging, and codex-alab reads its
-  mail in its own TUI, outside that sandbox, when `aterm drive task` types its line.
+  Only while `aterm ctl @self status` shows `fabric=connected`: when you finish or hand
+  off work, and when a wait you run yourself wakes you (`await inbox since=<id>` as a
+  background command, above). Not every turn: with `fabric=absent` nothing can arrive.
+  An `ask` or a `task` addressed to you is work you were given. Nothing aterm types wakes
+  you for mail — you are typed to, as a human would type to you — so an unread task sits
+  there while you finish and stop. Codex's sandbox reaches no socket, so a vendor `codex`
+  takes no part in messaging (aterm shows it and supervises nothing of it).
 
 TRUST — THE FIELD, AND THE RULE
   `trust=` on every row is the RECEIVER's verdict on the sender, never a sender's claim:
@@ -6344,9 +7274,21 @@ TRUST — THE FIELD, AND THE RULE
 
 THE HALT
   `hold=1` (in `inbox`'s header and `status`): the drivers of this session were stopped.
-  Every PTY-reaching verb answers `ERR halted reason=<r> origin=<fleet|local>` until the
-  hold lifts; quote `reason=`. Reads, `post`, `inbox seen`, `meta set`, `lease`, the
-  physical keyboard and the agent's own work in its shell go on.
+  Every PTY-reaching verb answers `ERR halted reason=<r> origin=<person|remote|fleet|local>`
+  until the hold lifts; quote `reason=`. Reads, `post`, `inbox seen`, `meta set`, `lease`,
+  the physical keyboard and the agent's own work in its shell go on.
+  `origin=person` (`reason=taken-over`): the person at the window took the tab over (Agents
+  ▸ Take Over This Tab, the tab's menu, `t` in Overview). Only their Hand Back lifts it: no
+  socket can name that slot, `hold <sid> off` answers `OK hold=1` and lifts nothing of
+  theirs, and while it stands `invoke`, `tab`, `pane`, `hwkey`, `pointer` and `confirm` are
+  halted for the whole instance. Wait for it, or post the person a note.
+  `origin=remote`: another Mac's node holds the session over the fleet (the step-in:
+  `status hold_by=remote`, the tab's hover "held by <host> (node <8 hex>) over the
+  fleet"; `aterm help fleet`, DRIVE), with whatever `reason=` it gave, often `-`. Only
+  that Mac lifts it, with its own `aterm ctl --host <h> hold <sid> off` naming this one,
+  or the person here, whose Take Over takes it and whose Hand Back lifts it: your `hold
+  <sid> off` answers `OK hold=1` and lifts nothing of it. Wait for it, or post the
+  person a note.
   `origin=fleet`: a person's halt (`aterm fabric halt`, A PERSON below), lifted when that
   person runs `aterm fabric halt --cap-file <cap> off` (or, under `[fabric]
   hold_on_bridge_lost = true`, `reason=fabric-lost`, lifted when a bridge reconnects; by
@@ -6354,6 +7296,14 @@ THE HALT
   bus: `aterm fabric off` and a relaunch free a session only until the next `fabric on`.
   `origin=local`: set and lifted by `aterm ctl hold <sid> on|off [reason=<r>]` with the
   Owner token, which every in-session client holds (lifting it undoes whoever set it).
+  Its `OK` comes once the crash journal's copy of the hold is on disk, where aterm keeps
+  the layout for a crash (`restore_session`), so a kill sent at the reply cannot lose it;
+  past 5 s the reply says `journaled=0`, and the hold stands all the same. The fleet's
+  holds are answered at once: the fleet's halt is kept on the bus. An end you did not
+  choose (a crash, a restart's or a logout's quit) reopens a tab you held still held,
+  with an agent in it or none, and does not restart its agent; a lift whose reply said
+  `journaled=0` (an update's new build answers so until its first copy is on disk) is
+  on no copy yet, so such an end brings the hold back: lift it again.
   Both can stand at once, each in its own slot (`sessions status hold_origin=fleet,local`):
   a fleet halt lands beside a local hold, `ERR halted` names the fleet's, and the session
   stays held until both lift. An Owner act never touches a fleet hold (`hold off` with only
@@ -6361,9 +7311,10 @@ THE HALT
 
 A PERSON — halt the fleet, read and answer mail, as yourself
   A session speaks through its node, so what you type in one arrives `trust=agent`. To
-  speak as a person, mint a cap of your own on the host that holds the mint secret:
-    aterm fabric mint-for h-<you> --out <cap>       (any build; keep <cap> 0600)
-  then, from any host whose fabric is on:
+  speak as a person, mint a cap of your own on this machine (its fabric root holds the
+  mint secret):
+    aterm fabric mint-for h-<you> --out <cap>       (keep <cap> 0600)
+  then:
     aterm fabric halt --cap-file <cap> <reason>     hold EVERY session on the fleet
     aterm fabric halt --cap-file <cap> off          withdraw your halt (only yours)
     aterm fabric inbox --cap-file <cap> [--peek]    mail sent `to=h-<you>`: asks,
@@ -6374,22 +7325,21 @@ A PERSON — halt the fleet, read and answer mail, as yourself
     aterm link notify --fleet <F> --broker <ep> --cap-file <cap> --on ask:h-<you> \
         --exec <cmd>                                be paged when an agent asks you
   An agent reaches you with `post to=h-<you> kind=ask`; your answer `re=<off>` settles
-  its deadline. A task from a human arrives as a task on every node. Only a human halts:
-  an `a-<name>` service's cap (`mint-for a-<name>`) reads and posts, and its task is a
-  task only where `--accept-from` lists it.
+  its deadline. A task from a human always arrives as a task, whatever `--accept-from`
+  lists. Only a human halts: an `a-<name>` service's cap (`mint-for a-<name>`) reads and
+  posts, and its task is a task only where `--accept-from` lists it.
 
 IS IT ON HERE?
   aterm fabric                  the whole answer on one screen, no arguments: where the
                                 [fabric] command came from, the broker reached for real
-                                (connect, attach, head query), every node on the fleet
+                                (connect, attach, head query), every node on the bus
                                 (NODES: host=, state=, fabric=, proto= the astream
                                 protocol it speaks, aterm= its release, `this` for
-                                this one), the
-                                bridge of every aterm instance on this machine, every
-                                session's hold and inbox numbers (and its node once the
-                                fleet has two), the last 10 bus records (metadata only),
-                                and WARNINGS for each thing that makes `connected` a lie
-                                or loses mail. Exit 0 healthy, 1 warned, 2 off.
+                                this one), the bridge of every aterm instance on this
+                                machine, every session's hold and inbox numbers, the
+                                last 10 bus records (metadata only), and WARNINGS for
+                                each thing that makes `connected` a lie or loses mail.
+                                Exit 0 healthy, 1 warned, 2 off.
                                 `aterm fabric tail` follows the bus live; `--bodies`
                                 adds the text.
   aterm ctl @self status        ... fabric=<connected|stale|stalled|disconnected|absent>
@@ -6408,8 +7358,7 @@ IS IT ON HERE?
                 relaunches it.
   stalled       a bridge is attached but its link is down: the dial failed (no socket,
                 connection refused), the broker closed the connection, or an ack did not
-                come within the bridge's 5 s ack deadline. A killed broker (on a joined
-                host, the serving host's user logging out is one) and a wrong
+                come within the bridge's 5 s ack deadline. A killed broker and a wrong
                 `--broker` path read this way as soon as the connection ends or the dial
                 fails, a wedged broker once an exchange outlives that deadline. The bridge
                 redials on its own: at once when the lost link had stayed up 5 s, otherwise
@@ -6421,8 +7370,9 @@ IS IT ON HERE?
                 attach|expired|busy|record|protocol|subscribe|read|starting|error>`, `error`
                 being the errno the table does not name, `cut-fleet|inbox|say` the broker
                 answering and that one subscription cut, `expired` this node's cap past
-                its `exp=` (`mint-for --expires`; renewed by a fresh mint of the same
-                ring, attached at the bridge's next redial), `busy` the broker at its
+                its `exp=` (a ring minted by hand: the one `aterm fabric on` mints never
+                lapses; move <root>/node.cap aside and run `aterm fabric on`, and the
+                bridge attaches the new ring at its next redial), `busy` the broker at its
                 connection limit, `record` this node's own will or presence row refused
                 for good, `protocol` a broker in another astream protocol (another aterm
                 release: no retry cures it); `aterm fabric` warns and `doctor` says the fix.
@@ -6454,6 +7404,18 @@ WHO IS DOING WHAT — PRESENCE WITH MEANING
   program writes (Claude Code puts a summary of the conversation there); 128 bytes.
   `aterm link ls` prints them as columns; `aterm fabric` SESSIONS shows ROLE, DETAIL
   and PHASE (and a CTX column, filled only by rows an older bridge wrote).
+  A row's state is `live`, `away` or `exited`. `away`: the session's NODE went silent —
+  its aterm was killed or crashed, or its bridge's link is lost — so the node's own row
+  reads `away`; the session's row on the bus still says `live`, and `aterm fabric` reads
+  it as `away` with its node. Mail to such a session QUEUES on the bus and arrives when
+  the node is back. `exited`: the session ended, or its aterm WITHDREW it as it quit
+  (aterm tells its bridge `bye quit` first); a post to it is `ERR unroutable` at your
+  own bridge. A seamless self-update withdraws nothing (`bye handoff`): the new instance
+  re-advertises the same sids. `aterm fabric` BROKER counts this node's share of the 4096
+  distinct subjects a node may ever mint (one presence and one `ev` face per session ever
+  hosted, one per topic shouted on, one per peer session and kind posted to, answered or
+  noticed; none is reclaimed), and says `rows=4096+ truncated` when the roster is longer
+  than it reads.
     [fabric]
     presence = "meta"       # the default; "minimal" writes attention= alone
     receipts = true         # the default, with or without this line: an `inbox seen`
@@ -6463,24 +7425,44 @@ WHO IS DOING WHAT — PRESENCE WITH MEANING
   bridge's command line win over the file. A bridge older than these fields leaves
   them `-` and sends no receipts.
 
-IN THE WINDOW (the FABRIC menu)
-  The menu bar's Fabric menu: Inbox (this session's inbox as a tab, METADATA ONLY —
-  sender, kind, trust, never a body), Ledger for This Session
-  (⇧⌘L; `aterm drive ledger`), Hold This Session / Lift Hold (This Session) (the `hold`
-  verb, LOCAL origin only — a fleet hold greys both rows with its reason), the four
-  connection rows, Fabric Status (`aterm fabric` in a tab) and Turn Fabric On… / Off…
-  (`aterm fabric on|off`, behind a confirmation, Owner only). File ▸ Driving holds the
-  four controlled/controller spawn rows; Window ▸ Set Role… writes `meta role`;
-  View ▸ Presence Band / Presence Rim switch the band and the rim and are saved as
-  `[presence] band` / `rim`. `aterm ctl chrome` lists the whole tree; every row is an
-  `aterm ctl invoke <Name>` command (older names still work).
+IN THE WINDOW (no bus menu: the Agents menu, ❯, the needs border, Take Over)
+  The window has no menu for the message bus: it is the palette's (Message Bus:
+  Status, Turn On…, Turn Off…, which run `aterm fabric [on|off]` into a tab; on
+  and off ask first) and the CLI's. A bus that is off, the default, is
+  mentioned nowhere else. What the window shows is about the agents and what
+  needs the person (`aterm help needs` has all of it):
+  * The bar's Agents menu: Next That Needs You (⇧⌘J), Overview… (⌃⌘O, every
+    session, its need, its task and who manages whom), Take Over This Tab / Hand
+    Back This Tab, Harness Log for This Tab (⇧⌘L; `aterm drive ledger`), Set
+    Role… (`meta role`), Read This Mac / Read the Fleet (`aterm ctl survey`,
+    with `--fleet`, into a tab) and Summarize in a New Tab (one worker reads
+    the survey and writes the summary).
+  * The ❯ item in the macOS menu bar: `❯N` while N sessions need the person,
+    red while one is stuck, `❯•` while something waits for later; its menu goes
+    to each need and lists what everyone is doing, what finished and what aterm
+    waits out. Its Notify Me When I'm Needed turns aterm's own desktop notices
+    on; they are off by default.
+  * The needs border and pill: a window lights red (stuck) or amber (a
+    decision) for the most pressing session in any of its tabs, the pill at the
+    tab strip's end names it and offers its one act, and each tab wears its
+    own mark. View ▸ Show Needs in Windows turns the border and pill off
+    (`[presence] rim`; `[presence] band` is retired).
+  * Take Over: the person's own hold (`hold_by=person`). Until they Hand Back,
+    a write to that tab answers `ERR halted … origin=person`; no socket sets or
+    lifts it, and `hold off` lifts nothing of theirs: wait, or ask them. While
+    any tab is held, `invoke`, `tab`, `pane`, `hwkey`, `pointer` and `confirm`
+    are refused on this aterm (`aterm ctl help hold`).
+  `aterm ctl chrome` lists the whole tree, its `statusitem` and `presence` lines
+  the badge and the border, its `statusmenu` lines the ❯ menu's rows (read with
+  no click); every row of the tree is an `aterm ctl invoke <Name>` command
+  (older names still work, or answer `ERR retired:` with what to use instead).
 
 TURNING IT ON (the operator does this once)
   aterm fabric on               ONE command, in the installed binary. It does all of the
                                 steps below idempotently and says per step whether it
                                 changed anything, keeps the broker alive under launchd
                                 (systemd --user on Linux) while you are logged in — it
-                                stops at logout, as this host's aterm does; over SSH to
+                                stops at logout, as this machine's aterm does; over SSH to
                                 a Mac nobody is logged in at, `on` is refused (launchd's
                                 gui/<uid> domain needs that login) — writes the
                                 rendezvous file every `aterm link` verb defaults its
@@ -6506,11 +7488,10 @@ TURNING IT ON (the operator does this once)
                                 and records where the two generations agree: every bridge
                                 and notifier resumes there — nothing below it read twice,
                                 nothing posted after the restart skipped — and only the
-                                records the loss took are gone from the log. A joined
-                                host's own posts acked in that window are gone too, and a
+                                records the loss took are gone from the log. A
                                 session's endpoint, told of the move, retires a reply it
                                 had queued and a verdict on a row shown before it, as on
-                                any change of log (docs/FABRIC-SECOND-HOST.md). strict is
+                                any change of log. strict is
                                 the default and the safe choice. `--durability ordered`
                                 is accepted: this build serves it strict, and says so; a
                                 build older than this one refuses it, so before going
@@ -6559,9 +7540,18 @@ TURNING IT ON (the operator does this once)
          command = """aterm link serve --fleet <F> --broker <sock> --cap-file <cap> \
                       --state <state> --accept-from <N>"""
      No environment variable overrides it. The string is split on whitespace, never
-     through a shell, so a path with spaces needs a symlink. `--accept-from <N>` is not
-     decoration: without it a `task` between two sessions of this same node arrives
-     demoted, as `kind=note demoted=task`, which `await inbox` skips by default.
+     through a shell. A path with a space in it can use the ARGV form instead, an array
+     of one string per word, each passed as written (an element that is empty or
+     holds a NUL is refused):
+         command = ["/Users/<you>/Applications/aterm (dev).app/Contents/MacOS/aterm",
+                    "link", "serve", "--fleet", "<F>", "--broker", "<sock>", ...]
+     but an aterm from before that form rejects the WHOLE file holding it, so where an
+     older aterm shares the file, link the program where its path is one word instead.
+     `aterm fabric on` always does that: it writes the string, and runs an aterm path
+     that is not one plain word through a link in the fabric root (<root>/bin/aterm).
+     `--accept-from <N>` is not decoration: without it a `task` between two sessions of
+     this same node arrives demoted, as `kind=note demoted=task`, which `await inbox`
+     skips by default.
   5. Arm the instance that is running now. A bridge is launched once per instance, and
      `fabric attach` arms only the `[fabric] command` the instance's own aterm.toml
      names — it reads the file again, so a bare `aterm ctl fabric attach` arms what step
@@ -6571,8 +7561,9 @@ TURNING IT ON (the operator does this once)
      and any other is `ERR fabric not configured`, nothing armed: the Owner token every
      session holds does not choose the process the bridge's authority goes to, the
      config does. That arms the supervisor startup would have, now, without the
-     relaunch; the words are split on whitespace like the config string, never through
-     a shell. (An instance from before that re-read does not see what step 4 wrote, and
+     relaunch; the words are split on whitespace, never through a shell, and read as
+     written or each pct-decoded, so a word of the argv form with a space in it is sent
+     as `%20`. (An instance from before that re-read does not see what step 4 wrote, and
      answers a bare attach `ERR fabric no command`; give it the argv.) The program is
      checked before anything is armed (`ERR fabric not executable program=<pct>
      reason=<token>` arms nothing: fix it and attach again), and the latch is once per
@@ -6581,46 +7572,15 @@ TURNING IT ON (the operator does this once)
      supervised= command= — supervised= is the latch `post` reads to say queued=1 rather
      than no-bridge=1. Owner token only; an edge token and the bridge connection itself
      are `ERR denied`.
-  Off by default, deliberately: no bridge, no bus, no cross-host anything.
+  Off by default, deliberately: no bridge, no bus, no mail between sessions.
 
-A SECOND HOST — over the sealed TCP wire
-  Needs the `sealed` cargo feature on BOTH hosts (`targo --unverified build --release -p
-  aterm --features sealed`); a default build refuses every command below by naming it.
-  Build both from the SAME commit, and rebuild them together: the broker and every
-  bridge must speak one astream protocol, and a pair that does not is told so by name
-  (`reason=protocol`; NODES shows each node's proto= and aterm=) — no retry cures it.
-  On the first host:
-    aterm fabric on --tcp 0.0.0.0:<port> --allow-remote --key-file <k>
-        the broker on the sealed wire as well as the socket — always GUARDED with the
-        root's mint secret — and a 64-hex key minted into <k> (0600) if it is absent.
-        This host's own bridges stay on the socket; the port is for joining hosts.
-        That broker is EVERY joined host's, and it runs while this host's user is
-        logged in (a LaunchAgent; a systemd --user unit, past logout only with
-        `loginctl enable-linger`): to serve while logged out, keep it yourself
-        (`--service none` prints its argv). A bare `on` here keeps the --tcp, key
-        and --allow-remote its installed job serves, and doctor spells the whole
-        `on --tcp …`; under `--service none` no job of `on`'s records the bind, so
-        a bare `on` is refused, naming the flags to run it with
-    aterm fabric mint-for <node-id>|new --out <cap> [--expires <N>d|<N>h]
-        the joining node's 8 grants under THIS host's mint secret, each stamped to expire
-        that far from now with --expires; its last lines are the exact `join` to run on
-        the other host
-  Copy the key and the cap — nothing else; the mint secret never leaves the first
-  host — `chmod 600` both, and open that ONE port. On the second host:
-    aterm fabric join --broker <host>:<port> --tcp --key-file <k> --cap-file <cap> \
-        --accept-from <first host's node>
-        checks both files, probes the broker (a wrong key or a foreign cap is refused
-        there, before anything is written), records the node id, installs the files in
-        its root, writes [fabric] command, arms the running aterm and proves it. `on`
-        is refused here from then on (it would leave the fleet); doctor's fixes are
-        this `join` again, and a broker that does not answer is fixed on the first host
-  `aterm fabric` then lists both nodes under NODES (`this`, `remote`) and every node's
-  sessions. The key is a TRANSPORT boundary, not a per-host identity: a copied key and
-  cap ARE that node, and there is no revoking one host short of re-keying — though a
-  cap minted with --expires stops working by itself at its time. Every process of the
-  first host's uid can read its mint secret, and so mint any cap: that uid is the
-  fleet's root of trust. The whole recipe, and what it does not protect:
-  docs/FABRIC-SECOND-HOST.md in the source tree.
+ONE MACHINE
+  The bus `aterm fabric on` serves is this machine's: a Unix socket in a 0700 root.
+  Mail and broadcasts reach every session of every aterm instance here, and no other
+  machine's. The bus's own name for itself is a fleet (`--fleet <F>`, `/f/<F>/…`, a
+  person's halt of "every session on the fleet"); `aterm fleet` is another thing, the
+  aterms of a LAN that read each other's sessions, and drive them where a Mac's person
+  lets another (`aterm help fleet`).
 
 SEE ALSO
   aterm help introspection   every control verb, including these
@@ -6630,19 +7590,12 @@ SEE ALSO
   aterm ctl help hold        exactly which verbs a halt refuses
 "#;
 
-/// Render the manual. `topic` is the optional `help <topic>` argument; `session` is
-/// the caller's own sid when it is inside an aterm session (from [`in_session`]).
-///
-/// * `None` topic, inside a session -> the agent brief (with the sid wired in).
-/// * `None` topic, outside -> the reference front page (overview + command map).
-/// * `Some("agent")` -> the agent brief explicitly (any context).
-/// * `Some("introspection")` -> the generated protocol page.
-/// * `Some(tool)` -> that tool's deep dive.
-/// * an unknown topic -> a usage error listing the topics, exit code 2.
-pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
-    // A front-door verb typed as a topic resolves to the page documenting it,
-    // so every verb resolves (pinned by `every_front_door_verb_resolves`).
-    let topic = topic.map(|t| match t {
+/// The page a topic word opens: a front-door verb typed as a topic resolves to
+/// the page documenting it, so every verb resolves (pinned by
+/// `every_front_door_verb_resolves`), and the other words someone reaches for
+/// land on the page that answers them.
+fn page_of(t: &str) -> &str {
+    match t {
         "ctl" => "introspection",
         "cargo" | "targo" | "rustc" | "trustc" | "toolchain" => "rust",
         "trust-mc" | "trust-ir" | "trust-cg" | "trust-vc" => "trust-backends",
@@ -6657,6 +7610,11 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         "inbox" | "post" | "mail" | "link" | "topic" | "say" | "broadcast" | "messaging" => {
             "fabric"
         }
+        // The worker verbs, the survey, and the word a model reaches for when it
+        // means another window running Claude Code: all land on the workers page.
+        "worker" | "result" | "survey" | "subagent" | "subagents" => "workers",
+        // What someone types for the owner surfaces: a need, stepping in, the opt-in.
+        "need" | "take-over" | "takeover" | "hand-back" | "notify" => "needs",
         // What someone guesses when they want the cursor cat's words.
         "pet" | "cat" | "tricks" | "kitty-commands" | "list-kitty-commands" => "kitty",
         // The front-door diagnostics and containment flags the aterm page documents.
@@ -6665,8 +7623,23 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         "exceptions" => "update",
         // The plural and the words someone reaches for when they want colours.
         "themes" | "colors" | "colours" | "color-scheme" | "colour-scheme" => "theme",
+        // What someone types who wants the Mac kept awake.
+        "awake" | "keep-awake" => "caffeine",
         other => other,
-    });
+    }
+}
+
+/// Render the manual. `topic` is the optional `help <topic>` argument; `session` is
+/// the caller's own sid when it is inside an aterm session (from [`in_session`]).
+///
+/// * `None` topic, inside a session -> the agent brief (with the sid wired in).
+/// * `None` topic, outside -> the reference front page (overview + command map).
+/// * `Some("agent")` -> the agent brief explicitly (any context).
+/// * `Some("introspection")` -> the generated protocol page.
+/// * `Some(tool)` -> that tool's deep dive.
+/// * an unknown topic -> a usage error listing the topics, exit code 2.
+pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
+    let topic = topic.map(page_of);
     match topic {
         None => {
             if let Some(sid) = session {
@@ -6798,19 +7771,22 @@ mod tests {
     }
 
     /// Every topic renders, and the toolchain words an agent types land on
-    /// the rust page.
+    /// the rust page: `render` reads only the page a word opens, and the rust
+    /// page measures the toolchain each time it is made, so it is made once.
     #[test]
     fn every_topic_renders() {
         for name in topic_names() {
             let (page, code) = render(Some(name), None);
             assert_eq!(code, 0, "topic {name} should render 0");
             assert!(!page.trim().is_empty(), "topic {name} rendered empty");
+            if name == "rust" {
+                assert!(page.contains("THE DEFAULT HERE IS THE TRUST TOOLCHAIN"));
+            }
         }
         for alias in ["cargo", "targo", "rustc", "trustc", "toolchain"] {
-            let (aliased, code) = render(Some(alias), None);
-            assert_eq!(code, 0, "alias {alias}");
-            assert!(
-                aliased.contains("THE DEFAULT HERE IS THE TRUST TOOLCHAIN"),
+            assert_eq!(
+                page_of(alias),
+                "rust",
                 "`aterm help {alias}` must land on the rust page"
             );
         }
@@ -6985,11 +7961,22 @@ mod tests {
     }
 
     /// The probe helper is bounded: `sleep 120` against a 200 ms limit returns
-    /// `None` well within the 60 s check.
+    /// `None` well within the 60 s check. Windows has no `sleep` or `echo` program:
+    /// there `ping -n 120` (one request a second) is the wedge and `cmd /c echo` the echo.
     #[test]
     fn bounded_first_line_kills_a_wedged_probe() {
+        let (wedge, wedge_args): (&str, &[&str]) = if cfg!(windows) {
+            ("ping", &["-n", "120", "127.0.0.1"])
+        } else {
+            ("sleep", &["120"])
+        };
+        let (echo, echo_args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/d", "/c", "echo", "hello"])
+        } else {
+            ("echo", &["hello"])
+        };
         let t0 = std::time::Instant::now();
-        let got = bounded_first_line("sleep", &["120"], std::time::Duration::from_millis(200));
+        let got = bounded_first_line(wedge, wedge_args, std::time::Duration::from_millis(200));
         assert!(
             got.is_none(),
             "a wedged probe must answer None, got {got:?}"
@@ -7002,7 +7989,7 @@ mod tests {
         // A probe that exits is answered as soon as it does; the limit is only
         // the hang detector (a loaded box can take seconds to start `echo`).
         assert_eq!(
-            bounded_first_line("echo", &["hello"], std::time::Duration::from_secs(60)).as_deref(),
+            bounded_first_line(echo, echo_args, std::time::Duration::from_secs(60)).as_deref(),
             Some("hello")
         );
     }
@@ -7595,6 +8582,60 @@ mod tests {
                 (page.clone(), 0),
                 "`aterm help {name}`"
             );
+        }
+    }
+
+    /// `aterm help workers`, where the brief's WORKERS line leads, answers to
+    /// the words a model types for it.
+    #[test]
+    fn the_workers_page_answers_to_its_words() {
+        let (page, code) = render(Some("workers"), None);
+        assert_eq!(code, 0);
+        for name in ["worker", "survey", "result", "subagent", "subagents"] {
+            assert_eq!(
+                render(Some(name), None),
+                (page.clone(), 0),
+                "`aterm help {name}`"
+            );
+        }
+    }
+
+    /// `aterm help needs`, where the window's IN THE WINDOW lines and the ❯
+    /// item point, answers to the words someone types for a need, stepping in
+    /// and the notices' opt-in.
+    #[test]
+    fn the_needs_page_answers_to_its_words() {
+        let (page, code) = render(Some("needs"), None);
+        assert_eq!(code, 0);
+        for name in ["need", "take-over", "takeover", "hand-back", "notify"] {
+            assert_eq!(
+                render(Some(name), None),
+                (page.clone(), 0),
+                "`aterm help {name}`"
+            );
+        }
+    }
+
+    /// Every `aterm ctl` verb a help page or the agent brief teaches is one
+    /// the server's table or the client serves: a page that taught a removed
+    /// verb would send an agent to `ERR unknown verb`. The commands are read by
+    /// the primer's own rule (`aterm_primer::taught_ctl_verbs`), so the help
+    /// and the skills are held to one reading of a command.
+    #[test]
+    fn every_help_page_teaches_served_verbs() {
+        let pages = topic_names()
+            .into_iter()
+            .map(|name| (name, render(Some(name), None).0))
+            .chain([("agent", agent_page(Some("s-0")))]);
+        for (name, page) in pages {
+            for (command, verb) in aterm_primer::taught_ctl_verbs(&page) {
+                assert!(
+                    aterm_types::control_verbs::spec(&verb).is_some()
+                        || aterm_ctl::CLIENT_HELP_VERBS.contains(&verb.as_str()),
+                    "`aterm help {name}` teaches `aterm ctl {command}` (`{verb}`), which \
+                     nothing serves"
+                );
+            }
         }
     }
 }

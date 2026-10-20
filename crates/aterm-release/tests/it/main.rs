@@ -101,12 +101,6 @@ mod tap;
 #[path = "../../src/transforms.rs"]
 #[allow(dead_code)]
 mod transforms;
-#[path = "../../src/trust_candidate.rs"]
-#[allow(dead_code)]
-mod trust_candidate;
-#[path = "../../src/trust_compare.rs"]
-#[allow(dead_code)]
-mod trust_compare;
 #[path = "../../src/trust_facts.rs"]
 #[allow(dead_code)]
 mod trust_facts;
@@ -122,12 +116,10 @@ mod verify;
 
 mod apple_tier;
 mod build_once;
-mod candidate_replay;
 mod changelog_golden;
 mod channel_floor_model;
 mod channel_latest;
 mod claim_landing_model;
-mod d27_refute;
 mod durable_post_intent_model;
 mod export_policy;
 mod handoff_policy_bundle;

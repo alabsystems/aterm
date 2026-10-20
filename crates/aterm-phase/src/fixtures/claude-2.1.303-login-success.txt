@@ -1,0 +1,19 @@
+# claude-code 2.1.303 · HAND-BUILT 2026-10-19 · the measured hand-off frame (claude-2.1.303-login-handoff.txt) with the dialog's body replaced by its `success` state as the 2.1.303 bundle draws it (READ: a dim `Logged in as <email>`, then `Login successful. Press Enter to continue…`; the credentials are saved before this state, and Enter only closes the dialog) · no lab can sign in, so no capture holds it
+ ▐▛███▛█   Claude Code v2.1.303
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.26bb/proj
+
+
+❯ hi
+  ⎿  Not logged in · Please run /login
+
+✻ Worked for 1s · done 10:24 AM
+
+❯ /login
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Login
+
+  Logged in as lab@example.com
+
+  Login successful. Press Enter to continue…

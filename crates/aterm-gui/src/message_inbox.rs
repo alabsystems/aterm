@@ -33,7 +33,8 @@
 //! * the fabric-lost advisory — the bridge-loss sweep, on the fabric thread
 //!   (`fabric::bridge_lost`);
 //! * the restored agents that did not come back — the harness host's resume
-//!   attempts (`harness_host::say_restored`).
+//!   attempts (`harness_host::say_restored`), queued with the row they make
+//!   ([`queue_restored_row`]) for the window to word (`App::post_restored_row`).
 //!
 //! A `Mutex<Vec<_>>` behind an `AtomicBool`, so the drain — which runs on
 //! EVERY park — is one atomic load (`Acquire`, pairing with the producer's
@@ -61,67 +62,227 @@ pub(crate) struct InboxMessage {
     pub(crate) message: Message,
     /// The wall clock at queue time — the message's ingress stamp (D4).
     pub(crate) stamp: WallStamp,
+    /// The restored agents' row `message` words as the host said it
+    /// ([`queue_restored_row`]): the window words it again from this
+    /// (`App::post_restored_row`). `None` for every other message.
+    pub(crate) restored: Option<crate::harness_host::RestoredRow>,
 }
 
 static INBOX_PENDING: AtomicBool = AtomicBool::new(false);
-static INBOX: Mutex<Vec<InboxMessage>> = Mutex::new(Vec::new());
+/// Each message with its LANE: always `0` in a build that is not a unit test
+/// ([`current_lane`]), where the inbox is one queue. A unit test that owns a
+/// lane ([`own_lane_for_test`]) sees only its own, so the tests whose rows
+/// come through here run side by side instead of in turn.
+static INBOX: Mutex<Vec<(u64, InboxMessage)>> = Mutex::new(Vec::new());
+
+/// The inbox lane of the calling thread: `0` in every build but a unit test,
+/// and there `0` too unless the test took one ([`own_lane_for_test`]). A
+/// producer on a thread of its own queues into the lane of whoever started it
+/// ([`queue_message_in`]; the harness host keeps its creator's).
+pub(crate) fn current_lane() -> u64 {
+    #[cfg(test)]
+    {
+        LANE.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        0
+    }
+}
 
 /// Queue one message for the next event-loop park. Safe from ANY thread and
 /// from before `App` exists. Callers still write the same words to stderr
 /// where they always did — a console launch keeps its diagnostic, and this
 /// adds the surface a windowed launch has.
 pub(crate) fn queue_message(message: Message) {
+    queue_message_in(current_lane(), message);
+}
+
+/// [`queue_message`] into `lane` ([`current_lane`] of the thread that owns the
+/// producer): what a producer on a thread of its own queues through.
+pub(crate) fn queue_message_in(lane: u64, message: Message) {
     let message = message.normalized();
     let Ok(mut q) = INBOX.lock() else {
         return; // a poisoned inbox must never take the app down
     };
-    let duplicate = q.iter().any(|m| {
-        m.message.tag == message.tag
+    let mut held = 0;
+    let mut duplicate = false;
+    for (at, m) in q.iter() {
+        if *at != lane {
+            continue;
+        }
+        held += 1;
+        duplicate |= m.message.tag == message.tag
             && m.message.title == message.title
-            && m.message.detail.first() == message.detail.first()
-    });
-    if q.len() < INBOX_CAP && !duplicate {
-        q.push(InboxMessage {
-            message,
-            stamp: crate::messages_host::wall_stamp_now(),
-        });
+            && m.message.detail.first() == message.detail.first();
+    }
+    if held < INBOX_CAP && !duplicate {
+        q.push((
+            lane,
+            InboxMessage {
+                message,
+                stamp: crate::messages_host::wall_stamp_now(),
+                restored: None,
+            },
+        ));
         INBOX_PENDING.store(true, Ordering::Release);
     }
 }
 
-/// Take everything queued (empty when nothing is). The `Acquire` load pairs
-/// with [`queue_message`]'s `Release` store, so a message queued on the
-/// backend build thread is visible to the event loop that observes the flag.
+/// Queue the restored agents' row the harness host said (`harness_host::say_restored`)
+/// for the next park, in the host's lane ([`queue_message_in`]): its message in
+/// the words it was said with, and the row itself, which the window words
+/// again (`App::post_restored_row`). Never folded as a duplicate: a later row
+/// can carry the same title and first line as an earlier one and name other
+/// tabs, and the window keeps the later of the two.
+pub(crate) fn queue_restored_row(lane: u64, row: crate::harness_host::RestoredRow) {
+    let message = row.message().normalized();
+    let Ok(mut q) = INBOX.lock() else {
+        return; // a poisoned inbox must never take the app down
+    };
+    let held = q.iter().filter(|(at, _)| *at == lane).count();
+    if held < INBOX_CAP {
+        q.push((
+            lane,
+            InboxMessage {
+                message,
+                stamp: crate::messages_host::wall_stamp_now(),
+                restored: Some(row),
+            },
+        ));
+        INBOX_PENDING.store(true, Ordering::Release);
+    }
+}
+
+/// Take everything queued in the calling thread's lane (empty when nothing
+/// is; the whole inbox in every build but a unit test). The `Acquire` load
+/// pairs with [`queue_message_in`]'s `Release` store, so a message queued on
+/// the backend build thread is visible to the event loop that observes the
+/// flag; the flag falls only once nothing is left in any lane.
 pub(crate) fn take_queued() -> Vec<InboxMessage> {
     if !INBOX_PENDING.load(Ordering::Acquire) {
         return Vec::new();
     }
-    INBOX_PENDING.store(false, Ordering::Relaxed);
-    INBOX
-        .lock()
-        .map(|mut q| std::mem::take(&mut *q))
-        .unwrap_or_default()
+    let lane = current_lane();
+    let Ok(mut q) = INBOX.lock() else {
+        // A poisoned inbox drains empty with its flag down: what it holds
+        // waits for the next queue to raise it.
+        INBOX_PENDING.store(false, Ordering::Relaxed);
+        return Vec::new();
+    };
+    let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut *q)
+        .into_iter()
+        .partition(|(at, _)| *at == lane);
+    *q = others;
+    if q.is_empty() {
+        INBOX_PENDING.store(false, Ordering::Relaxed);
+    }
+    mine.into_iter().map(|(_, m)| m).collect()
 }
 
 /// THE INBOX ITSELF, HELD (tests only): a thread that queues a message
 /// meanwhile waits in [`queue_message`] until the guard drops — how a test
 /// holds a row's sayer in the middle of its say. Taken after
-/// [`lane_test_guard`], and dropped before anything that may panic.
+/// [`lane_test_guard`] or [`own_lane_for_test`], and dropped before anything
+/// that may panic.
 #[cfg(test)]
-pub(crate) fn hold_for_test() -> std::sync::MutexGuard<'static, Vec<InboxMessage>> {
+pub(crate) fn hold_for_test() -> std::sync::MutexGuard<'static, Vec<(u64, InboxMessage)>> {
     INBOX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// SERIALIZE the lane across tests. The inbox is process-global by design (its
-/// whole point is being reachable from threads that have no `App`), so two
-/// tests exercising it in the same binary would steal each other's messages.
-/// Every test that queues or drains takes this first.
 #[cfg(test)]
-pub(crate) fn lane_test_guard() -> std::sync::MutexGuard<'static, ()> {
+thread_local! {
+    static LANE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Every test that uses the inbox holds this shared ([`own_lane_for_test`],
+/// [`lane_test_guard`]); the one that poisons the inbox holds it alone
+/// ([`whole_inbox_for_test`]).
+#[cfg(test)]
+static INBOX_TESTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// A LANE OF THE TEST'S OWN: the calling test thread queues and drains lane
+/// `n`, a number no other test has, until the guard drops (what is left in it
+/// is dropped, and the thread is back in lane `0`). For a test whose rows are
+/// queued on its own thread or by a producer that keeps its creator's lane
+/// (the harness host); a test whose rows come from a thread that does not (a
+/// panic hook, a backend build thread) takes [`lane_test_guard`] instead and
+/// works in lane `0`.
+#[cfg(test)]
+pub(crate) fn own_lane_for_test() -> OwnLane {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let shared = INBOX_TESTS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let lane = NEXT.fetch_add(1, Ordering::Relaxed);
+    LANE.with(|at| at.set(lane));
+    OwnLane {
+        lane,
+        _shared: shared,
+    }
+}
+
+/// [`own_lane_for_test`]'s guard.
+#[cfg(test)]
+pub(crate) struct OwnLane {
+    lane: u64,
+    _shared: std::sync::RwLockReadGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for OwnLane {
+    fn drop(&mut self) {
+        if let Ok(mut q) = INBOX.lock() {
+            q.retain(|(at, _)| *at != self.lane);
+            if q.is_empty() {
+                INBOX_PENDING.store(false, Ordering::Relaxed);
+            }
+        }
+        LANE.with(|at| at.set(0));
+    }
+}
+
+/// THE WHOLE INBOX, every lane, for a test that breaks it for everyone (a
+/// poisoned lock refuses every lane's queue): no other inbox test runs while
+/// it is held, and it starts from an empty inbox.
+#[cfg(test)]
+pub(crate) fn whole_inbox_for_test() -> std::sync::RwLockWriteGuard<'static, ()> {
+    let whole = INBOX_TESTS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut q = INBOX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    q.clear();
+    INBOX_PENDING.store(false, Ordering::Relaxed);
+    drop(q);
+    whole
+}
+
+/// SERIALIZE lane `0` across tests. The inbox is process-global by design (its
+/// whole point is being reachable from threads that have no `App`), so two
+/// tests exercising lane `0` in the same binary would steal each other's
+/// messages. Every test that queues or drains in lane `0` takes this first; a
+/// test whose producers keep its lane takes [`own_lane_for_test`] instead.
+#[cfg(test)]
+pub(crate) fn lane_test_guard() -> LaneZero {
     static LANE_TEST: Mutex<()> = Mutex::new(());
-    LANE_TEST.lock().unwrap_or_else(|p| p.into_inner())
+    let shared = INBOX_TESTS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    LaneZero {
+        _alone: LANE_TEST.lock().unwrap_or_else(|p| p.into_inner()),
+        _shared: shared,
+    }
+}
+
+/// [`lane_test_guard`]'s guard: lane `0` to this test alone.
+#[cfg(test)]
+pub(crate) struct LaneZero {
+    _alone: std::sync::MutexGuard<'static, ()>,
+    _shared: std::sync::RwLockReadGuard<'static, ()>,
 }
 
 #[cfg(test)]
@@ -140,8 +301,7 @@ mod tests {
     /// takes the app down with a second panic.
     #[test]
     fn the_pre_app_inbox_is_poison_tolerant_and_bounded() {
-        let _lane = lane_test_guard();
-        let _ = take_queued();
+        let _whole = whole_inbox_for_test();
         assert!(!INBOX_PENDING.load(Ordering::Acquire));
         for i in 0..(INBOX_CAP + 8) {
             queue_message(msg(&format!("warning {i}")));

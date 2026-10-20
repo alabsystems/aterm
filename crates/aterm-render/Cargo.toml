@@ -111,16 +111,16 @@ libc = { workspace = true }
 # from skrifa 0.46.2 (TF.4 of docs/AUDIT-third-party-2026-10-15.md; never the
 # font's own bytecode since TF.2b), hands back a grid-fitted outline that the
 # SAME coverage fill (as the FONT-2 variation path) turns into crisp masks.
-# Target-gated so the macOS (CoreText) build and the wasm consumer — which
-# trims its closure deliberately — compile not one byte of it (a `--workspace`
-# build unifies aterm-font's default `hint` in everywhere; `src/hinted.rs`
-# stays target-gated either way).
+# Target-gated so the macOS (CoreText) release build and the wasm consumer —
+# which trims its closure deliberately — compile not one byte of it. A build
+# with debug assertions compiles the hinter whatever the feature, so the macOS
+# unit tests exercise the portable rasters with embedded fonts without a dev
+# row asking for `hint` (such a row forked every crate from aterm-font up
+# between a `--workspace` test build and a `-p` one, P4); `src/hinted.rs` stays
+# target-gated either way.
 aterm-font = { workspace = true, features = ["hint"] }
 
 [dev-dependencies]
-# Exercise the native portable rasters with embedded fonts on the macOS test
-# host too; normal macOS and wasm builds retain the target-gated hint feature.
-aterm-font = { workspace = true, features = ["hint"] }
 # Base64 encoder for the inline-image (OSC 1337) integration tests.
 aterm-codec = { workspace = true }
 # The rain_render test drives the shared aterm-effects engines. The dev-dep cycle (effects depends on
@@ -159,6 +159,13 @@ path = "tests/snapshot_alloc.rs"
 # Its renderer is built on the embedded face.
 required-features = ["embedded-font"]
 
+# Alone: installs a counting #[global_allocator] (the fx layers' CPU path).
+[[test]]
+name = "fx_alloc"
+path = "tests/fx_alloc.rs"
+# Its renderer is built on the embedded face.
+required-features = ["embedded-font"]
+
 # Alone: (Windows) installs the heap-attribution #[global_allocator]; its gate
 # and measurements read the whole process's heap.
 [[test]]
@@ -170,6 +177,15 @@ path = "tests/win_heap_attribution.rs"
 name = "sparkle_words"
 path = "benches/sparkle_words.rs"
 harness = false
+
+# A measurement, not a gate: what the fx layers cost on the CPU (run lists
+# against rects, settled layers at rest, the shared glow loop); the numbers
+# land in docs/DESIGN-card-engine-2026-10-19.md §4.2.
+[[bench]]
+name = "fx_raster"
+path = "benches/fx_raster.rs"
+harness = false
+required-features = ["embedded-font"]
 
 # A measurement, not a gate: where the Windows heap goes across the whole font
 # stack (one heapprof report per process, so its own binary). Windows only.

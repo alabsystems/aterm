@@ -251,8 +251,9 @@ Run aterm's checks in place, offline, alone or in any combination.
                                   a wasm module's JS glue (`--record-toy`: the
                                   wasm-glue check's goldens; `--record-replay`:
                                   wasm-smoke's CPU replay answers)
-  verify fetch-browser            the pinned chrome-headless-shell the browser
-                                  check drives, into this machine's cache
+  verify fetch-browser            the pinned chrome-headless-shell and Firefox
+                                  the browser check drives, into this
+                                  machine's cache
 
 Sets:
   dev      fmt census lint test doc (the default)

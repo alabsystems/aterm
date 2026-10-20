@@ -301,6 +301,10 @@ pub enum WorkspacePolicy {
     /// The installed targo refuses a policy key it does not know: the workspace needs a
     /// newer Trust build than atpkg has published.
     UnknownField { field: String },
+    /// The installed targo refuses a policy key it has retired, naming the setting that
+    /// replaced it (`replacement`, targo's words after "was"): the workspace is older than
+    /// the installed Trust build, and the cure is the workspace's, not this machine's.
+    RetiredKey { key: String, replacement: String },
     /// The probe could not run (no targo in the store, spawn failure); reported, never
     /// counted as a problem.
     ProbeFailed { why: String },
@@ -888,6 +892,11 @@ fn probe_claude_settings(home: &Path) -> Option<Result<Vec<(&'static str, Defaul
     Some(states)
 }
 
+/// What replaced the network drive's `ATERM_NET_*` variables: the fleet, which a person
+/// starts on one machine and joins from each other with its code.
+const FLEET_SETUP: &str = "the fleet: `aterm fleet init` on one machine, `aterm fleet join` \
+                           with its join code on each other";
+
 /// Retired environment opt-outs a person may still export, each with the setting or launch
 /// flag that replaced it. An inert opt-out silently stops opting out
 /// (`ATERM_NO_AUTO_UPDATE=1` holds no update), so the doctor names it.
@@ -1007,9 +1016,32 @@ pub const RETIRED_OPT_OUTS: &[(&str, &str)] = &[
         "the default (the registry PATH is always merged)",
     ),
     ("ATERM_NO_SHELL_INTEGRATION", "aterm --no-shell-integration"),
+    // The embedded operator was removed (2026-10-15); a manager session takes
+    // its place.
+    (
+        "ATERM_OPERATOR",
+        "a manager session: `aterm ctl survey` and `spawn agent=claude`",
+    ),
+    (
+        "ATERM_NO_OPERATOR",
+        "the default (the embedded operator is removed)",
+    ),
+    (
+        "ATERM_OPERATOR_PROFILE",
+        "the default (the embedded operator is removed)",
+    ),
+    // The network drive these configured went too (2026-10-15): the fleet
+    // replaced it.
+    ("ATERM_NET_LISTEN", FLEET_SETUP),
+    ("ATERM_NET_CERT", FLEET_SETUP),
+    ("ATERM_NET_KEY", FLEET_SETUP),
     ("ATERM_VERBOSE", "aterm --verbose"),
-    // `aterm drive`'s prompt-ready pattern.
-    ("ATERM_DRIVE_READY", "aterm drive --ready <regex>"),
+    // `aterm drive`'s prompt-ready pattern: `--ready` left with the commands
+    // that waited on it, and a server-side wait replaced them.
+    (
+        "ATERM_DRIVE_READY",
+        "aterm ctl @<sid> await match <regex> (aterm drive has no --ready now)",
+    ),
 ];
 
 /// Which [`RETIRED_OPT_OUTS`] are exported to this process, whatever the value: an exported
@@ -1054,6 +1086,22 @@ fn unknown_field_in(stderr: &str) -> Option<String> {
     (!field.is_empty()).then(|| field.to_string())
 }
 
+/// The key and the setting that replaced it, out of targo's refusal of a retired `[trust]`
+/// key, in both spellings Trust writes it: the manifest reader's
+/// (``error: `[trust]` key `compiler_timeout_secs` was retired on 2026-10-11: …``,
+/// cargo-util-schemas' `TomlTrustRetiredKeys`) and `targo-trust`'s own loader's
+/// (``failed to validate <path>: [trust] `compiler_timeout_secs` was retired on …``,
+/// `RETIRED_CONFIG_KEYS`). The replacement is the rest of that line.
+fn retired_key_in(stderr: &str) -> Option<(String, String)> {
+    ["`[trust]` key `", "[trust] `"].iter().find_map(|marker| {
+        let start = stderr.find(marker)? + marker.len();
+        let (key, rest) = stderr[start..].split_once('`')?;
+        let replacement = rest.strip_prefix(" was ")?.lines().next()?.trim();
+        (!key.is_empty() && !replacement.is_empty())
+            .then(|| (key.to_string(), replacement.to_string()))
+    })
+}
+
 /// Ask the installed targo whether it accepts the workspace's `[trust]` policy.
 /// `locate-project --workspace` parses the manifest and compiles nothing.
 fn probe_workspace_policy(layout: &Layout, cwd: &Path) -> Option<WorkspacePolicyProbe> {
@@ -1082,12 +1130,16 @@ fn probe_workspace_policy(layout: &Layout, cwd: &Path) -> Option<WorkspacePolicy
     let policy = match probe {
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            match unknown_field_in(&stderr) {
-                Some(field) => WorkspacePolicy::UnknownField { field },
-                None if out.status.success() => WorkspacePolicy::Accepted,
-                None => WorkspacePolicy::ProbeFailed {
+            if let Some((key, replacement)) = retired_key_in(&stderr) {
+                WorkspacePolicy::RetiredKey { key, replacement }
+            } else if let Some(field) = unknown_field_in(&stderr) {
+                WorkspacePolicy::UnknownField { field }
+            } else if out.status.success() {
+                WorkspacePolicy::Accepted
+            } else {
+                WorkspacePolicy::ProbeFailed {
                     why: stderr.lines().next().unwrap_or("targo failed").to_string(),
-                },
+                }
             }
         }
         Err(e) => WorkspacePolicy::ProbeFailed { why: e.to_string() },
@@ -1604,6 +1656,11 @@ pub fn run_with(
             }
         }
     }
+    // abrew's `brew` stub rides the same directory under its own marker
+    // (docs/DESIGN-abrew-2026-10-19.md §6): one row beside the reroute rows.
+    if !cfg!(windows) {
+        let _ = writeln!(out, "{p}: {}", crate::abrew::stub::doctor_line(layout));
+    }
     let path_entries: Vec<std::path::PathBuf> = path_var
         .map(|p| std::env::split_paths(p).collect())
         .unwrap_or_default();
@@ -1840,7 +1897,9 @@ pub fn run_with(
     // toolchain current with what is published; it cannot stop a repository depending on a
     // Trust build never published, whose symptom is targo refusing the workspace with an
     // "unknown field" error that looks like a manifest typo. The installed targo decides,
-    // and the line names what is behind: the publisher's toolchain, not this machine.
+    // and the line names what is behind: the publisher's toolchain, not this machine. The
+    // other way round, a workspace still naming a key the installed Trust retired is
+    // refused with the setting that replaced it, and the workspace is what is behind.
     let mut next_publish = false;
     if let Some(ws) = &probes.workspace {
         let trust_build = active
@@ -1868,6 +1927,18 @@ pub fn run_with(
                      workspace does not open with targo on any atpkg-managed machine. Cure \
                      (a rostered publisher, on the machine holding that seal): \
                      {PUBLISH_RUSTC_GROUP}; then here: aterm pkg update trust",
+                    ws.workspace.display()
+                );
+            }
+            WorkspacePolicy::RetiredKey { key, replacement } => {
+                fails += 1;
+                let _ = writeln!(
+                    err,
+                    "{p}: FAIL — workspace {} declares a [trust] policy key the installed \
+                     trust build {trust_build} has retired: `{key}` was {replacement}. The \
+                     workspace is older than this toolchain, so targo refuses it here. Cure \
+                     (in the workspace's Cargo.toml, not on this machine): edit its [trust] \
+                     table as that says",
                     ws.workspace.display()
                 );
             }

@@ -802,6 +802,26 @@ pub trait SerializeMap {
         self.serialize_value(value)
     }
 
+    /// Serialize a struct's field that reaches the map as an entry. aterm's
+    /// own; upstream serde has no counterpart.
+    ///
+    /// A struct with a `#[serde(flatten)]` field is written as a map, and a
+    /// flattened struct writes its fields into the enclosing one, so a field
+    /// arrives here rather than at [`SerializeStruct::serialize_field`]. A
+    /// format that writes a field and a map entry alike needs nothing more: the
+    /// default delegates to [`serialize_entry`]. A format that cannot write
+    /// every value tells the two apart here. TOML has no null, so it leaves a
+    /// `None` field out (an absent field reads back as `None`) but refuses a
+    /// `None` map value, which an absent key would lose.
+    ///
+    /// [`serialize_entry`]: Self::serialize_entry
+    fn serialize_field_entry<T>(&mut self, key: &'static str, value: &T) -> Result<(), Self::Error>
+    where
+        T: ?Sized + Serialize,
+    {
+        self.serialize_entry(key, value)
+    }
+
     /// Finish serializing a map.
     fn end(self) -> Result<Self::Ok, Self::Error>;
 }

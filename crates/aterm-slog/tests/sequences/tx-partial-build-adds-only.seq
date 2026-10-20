@@ -1,0 +1,19 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# S9: under state=partial the transcript adds (at strong) and never
+# overrules: the turn end only amends; the screen's idle closes the turn.
+state partial
+bind 0
+expect mark r1 source field=transcript state=partial skipped=0
+see busy
+tx prompt v1
+expect amend t1 turn vref=v1 conf=strong
+tx tool c1
+tx result c1
+expect open p1 tool conf=strong
+expect close p1 tool out=ok conf=strong
+tx end
+expect amend t1 turn vdur_ms=4200 conf=strong
+expect turn=open
+see idle
+wait 1000
+expect close t1 turn out=done steps=1 tools=shell:1 src=screen

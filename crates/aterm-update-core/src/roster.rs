@@ -639,6 +639,11 @@ mod tests {
             r.authorize_appcast(APPCAST, &sign(&kp(&THIEF_SEED), APPCAST), NOW),
             Err(RosterReject::Verify)
         );
+        // A wrong-length signature is BadSig once, before any machine is tried.
+        assert_eq!(
+            r.authorize_appcast(APPCAST, &[0u8; 63], NOW),
+            Err(RosterReject::BadSig)
+        );
     }
 
     /// An unpinned master anchor authorizes nothing, not even a genuinely signed roster.
@@ -654,9 +659,11 @@ mod tests {
         );
         // The single-key primitive agrees, before any crypto.
         assert_eq!(verify_under("", &raw, &sig), Err(RosterReject::Disabled));
-        // A keyset of nothing but garbage is BadKey, not a bad signature.
+        // A keyset of nothing but garbage is BadKey, not a bad signature: a key
+        // that is not base64, or that is not 32 bytes.
+        let short = aterm_codec::base64::encode(&[1u8; 31]).expect("31 bytes");
         assert_eq!(
-            verify_roster(&["", "!!not base64!!"], raw, &sig),
+            verify_roster(&["", "!!not base64!!", &short], raw, &sig),
             Err(RosterReject::BadKey)
         );
     }
@@ -684,6 +691,13 @@ mod tests {
         assert!(
             r.authorize_appcast(APPCAST, &sign(&kp(&M3_SEED), APPCAST), NOW)
                 .is_ok()
+        );
+        // With every machine revoked, nothing is tried: no machine authorizes.
+        let mut none = r.clone();
+        none.revoked.push("m3".into());
+        assert_eq!(
+            none.authorize_appcast(APPCAST, &sign(&kp(&M3_SEED), APPCAST), NOW),
+            Err(RosterReject::UnknownMachine)
         );
     }
 
@@ -745,9 +759,10 @@ mod tests {
             r.authorize_appcast(APPCAST, &sign(&kp(&M3_SEED), APPCAST), NOW),
             Err(RosterReject::Verify)
         );
-        // Before the deadline it is live.
+        // Before the deadline it is live; at its very second it is not.
         let before = rfc3339_to_unix("2025-12-31T23:59:59Z").unwrap();
         assert!(r.machine("m3", before).is_ok());
+        assert_eq!(r.machine("m3", before + 1), Err(RosterReject::Expired));
     }
 
     /// An old roster cannot be paired with a newer release, a newer roster with an older
@@ -871,6 +886,10 @@ mod tests {
         empty_id.machines[0].id = String::new();
         assert_eq!(empty_id.validate(), Err(RosterReject::Malformed));
 
+        let mut empty_key = roster();
+        empty_key.machines[1].pubkey = String::new();
+        assert_eq!(empty_key.validate(), Err(RosterReject::Malformed));
+
         let mut empty_revoked = roster();
         empty_revoked.revoked = vec![String::new()];
         assert_eq!(empty_revoked.validate(), Err(RosterReject::Malformed));
@@ -886,6 +905,17 @@ mod tests {
             })
             .collect();
         assert_eq!(huge.validate(), Err(RosterReject::Malformed));
+
+        // On parse: each, master-signed as written (past the emitter's check), is
+        // refused by the client.
+        let master = kp(&MASTER_SEED);
+        let anchor = pk(&master);
+        for bad in [&dup, &empty_id, &empty_key, &empty_revoked, &huge] {
+            let raw = aterm_toml::to_string(bad).unwrap().into_bytes();
+            let sig = sign(&master, &raw);
+            let verified = verify_roster(&[&anchor], raw, &sig).expect("master-signed");
+            assert_eq!(Roster::parse(&verified), Err(RosterReject::Malformed));
+        }
 
         // Negative control.
         assert_eq!(roster().validate(), Ok(()));
@@ -976,29 +1006,14 @@ mod tests {
         assert_eq!(r.admit(0, NOW), Err(RosterReject::Stale));
     }
 
-    /// The date arithmetic the freshness gate rests on, against hand-checked values.
+    /// The roster reads only the shape `roster_ops` emits: a fractional-seconds stamp is
+    /// lapsed, never truncated to its whole second (the strict `parse_utc`, not
+    /// `parse_utc_fractional`).
     #[test]
-    fn rfc3339_parses_the_shapes_the_roster_uses() {
-        assert_eq!(rfc3339_to_unix("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(rfc3339_to_unix("2026-08-04T00:00:00Z"), Some(NOW));
-        assert_eq!(rfc3339_to_unix("2026-08-04T00:00:01Z"), Some(NOW + 1));
-        for bad in [
-            "",
-            "2026-08-04",
-            "2026-08-04 00:00:00Z",
-            "2026-13-04T00:00:00Z",
-            "2026-08-04T24:00:00Z",
-            "20xx-08-04T00:00:00Z",
-            // The zone is part of the shape: none of these is the UTC instant its digits
-            // claim.
-            "2026-08-04T00:00:00+05:30", // an offset denotes an EARLIER instant
-            "2026-08-04T00:00:00-08:00", // ...and this one a later instant
-            "2026-08-04T00:00:00",       // bare, no zone at all
-            "2026-08-04T00:00:00.500Z",  // fractional seconds
-            "2026-08-04T00:00:00Z ",     // trailing byte
-            "2026-08-04T00:00:00Zjunk",
-        ] {
-            assert_eq!(rfc3339_to_unix(bad), None, "{bad:?} must not parse");
-        }
+    fn a_fractional_stamp_is_lapsed_not_truncated() {
+        let mut r = roster();
+        assert_eq!(r.admit(0, NOW), Ok(()));
+        r.valid_until = "2027-02-01T00:00:00.500Z".into();
+        assert_eq!(r.admit(0, NOW), Err(RosterReject::Stale));
     }
 }

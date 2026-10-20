@@ -25,7 +25,7 @@ impl Grid {
         const CEILING: u64 = u64::MAX >> 16;
         let floor =
             u64::from(self.storage.visible_rows).saturating_add(self.scrollback_lines() as u64);
-        self.storage.absolute_row_counter = counter.min(CEILING).max(floor);
+        self.renumber_rows(counter.min(CEILING).max(floor));
     }
 
     /// Raise the counter to the retained total (`visible_rows + scrollback_lines()`)
@@ -45,7 +45,7 @@ impl Grid {
         let retained =
             u64::from(self.storage.visible_rows).saturating_add(self.scrollback_lines() as u64);
         if self.storage.absolute_row_counter < retained {
-            self.storage.absolute_row_counter = retained;
+            self.renumber_rows(retained);
             self.storage.history_renumber_epoch =
                 self.storage.history_renumber_epoch.saturating_add(1);
             self.invalidate_host_coordinates();

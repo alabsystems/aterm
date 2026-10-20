@@ -8,22 +8,6 @@ use super::super::super::reflow::ReflowMode;
 use super::super::super::*;
 
 #[test]
-fn reflow_shrink_wraps_long_line() {
-    let mut grid = Grid::new(5, 10);
-    for c in "ABCDEFGHIJ".chars() {
-        grid.write_char(c);
-    }
-    assert_eq!(grid.row(0).unwrap().to_string(), "ABCDEFGHIJ");
-
-    grid.resize(5, 5);
-
-    assert_eq!(grid.row(0).unwrap().to_string(), "ABCDE");
-    assert_eq!(grid.row(1).unwrap().to_string(), "FGHIJ");
-
-    assert!(grid.row(1).unwrap().is_wrapped());
-}
-
-#[test]
 fn reflow_shrink_preserves_cursor_position() {
     let mut grid = Grid::new(5, 20);
     for c in "ABCDEFGHIJ".chars() {
@@ -109,6 +93,8 @@ fn reflow_cursor_at_wrapped_line_end() {
     assert_eq!(grid.cursor_col(), 4);
 }
 
+/// A shrink wraps the long line onto a continuation row, and the grow back
+/// joins it again.
 #[test]
 fn reflow_round_trip() {
     let mut grid = Grid::new(5, 10);
@@ -119,6 +105,7 @@ fn reflow_round_trip() {
     grid.resize(5, 5);
     assert_eq!(grid.row(0).unwrap().to_string(), "ABCDE");
     assert_eq!(grid.row(1).unwrap().to_string(), "FGHIJ");
+    assert!(grid.row(1).unwrap().is_wrapped());
 
     grid.resize(5, 10);
     assert_eq!(grid.row(0).unwrap().to_string(), "ABCDEFGHIJ");

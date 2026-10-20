@@ -172,12 +172,13 @@ Each one is a setting you can also make in `aterm.toml`, under the same name.
   default face. It never keeps whatever face was loaded before, so switching to a theme gives the
   same result every time. `aterm theme check` notes such a font (`font_not_installed`, a note:
   `--strict` still passes), and the window says so once in the message band.
-- **Try is colours only.** Settings ▸ Themes' Try, the palette and `aterm ctl theme preview`
-  never change the face; the trial bar lists what the theme's type settings would change.
-  Keeping the theme (Keep, `theme commit`, `theme = ` in `aterm.toml`) applies the face, live.
-  **Keep colours only** keeps the theme's colours and pins your current type settings in
-  `aterm.toml`, so the face does not change. It is not offered for a theme that sets
-  `font_weight`: no `aterm.toml` value keeps a font's own weight apart from the theme.
+- **A trial is colours only.** The row highlighted in Settings ▸ Themes, the palette and
+  `aterm ctl theme preview` never change the window's face; Settings' live demo draws the face
+  Keep would give. Keeping the theme (Keep on the strip, `theme commit`, `theme = ` in
+  `aterm.toml`) applies the face, live. **Keep colours only** (Keep ▾) keeps the theme's colours
+  and pins your current type settings in `aterm.toml`, so the face does not change. It is not
+  offered for a theme that sets `font_weight`: no `aterm.toml` value keeps a font's own weight
+  apart from the theme.
 - **Editing the file applies live**, face included, and so does a light/dark flip when the two
   sides of `dark:…,light:…` name different type settings.
 - **`schema`** says which theme format version a file was written for. A file whose `schema` is
@@ -290,8 +291,8 @@ appearance is swapped for its built-in pair, and refused when it has none.
 | start | `aterm theme new <name> [--from <theme>] [--appearance light]`, or `aterm theme export <theme> --out <file>` to copy any theme, built-ins included |
 | check | `aterm theme check <file> --strict` (`--format json` for scripts and agents: status, diagnostics with line and key, every contrast row) |
 | see it | `aterm ctl theme preview <id> [ttl=<secs>]` draws any theme without touching `aterm.toml` (120 s by default) and stays up while you save, so each save redraws it; `aterm ctl theme revert`, deleting the file or an `aterm.toml` reload ends it |
-| compare | Settings ▸ Themes (the Theme Showcase: gallery, Try with Keep/Revert, Customize, Save as theme…), or View ▸ Choose Theme… in the command palette |
-| keep it | `aterm ctl theme commit`, Keep in the showcase, or `theme = "<id>"` in `aterm.toml` |
+| compare | Settings ▸ Themes (one chooser list beside a live demo: the highlighted row is tried, Keep or Revert on the strip, Keep ▾ for Keep colours only, Customize, Save as theme…, the Themes folder), or View ▸ Choose Theme… in the command palette |
+| keep it | `aterm ctl theme commit`, Keep on Settings ▸ Themes' strip, or `theme = "<id>"` in `aterm.toml` |
 | inspect | `aterm ctl theme` names the theme on screen, its source and file, the side a split drew, what programs are told (DSR 996 / mode 2031), why a name misses, the palette, and the typography it applies (`typography=`, `typography_keys=`, and `typography_shadowed=` for keys your config or `--font` beat); per session, `aterm ctl status` shows `reported_scheme=` and `scheme_from=` (a program's own background outranks the theme) |
 
 Colour keys in `aterm.toml` (`foreground`, `background`, `cursor_color`, `selection_color`,

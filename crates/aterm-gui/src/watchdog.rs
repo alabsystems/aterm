@@ -1412,6 +1412,72 @@ pub(crate) fn turn_census_fields_json() -> String {
     )
 }
 
+/// Whether the main thread is at a park point now: in its OS event wait (or
+/// not yet in its loop), not inside a turn.
+pub(crate) fn main_parked() -> bool {
+    Breadcrumb::from_u8(BREADCRUMB.load(Ordering::Acquire)).is_park_point()
+}
+
+/// How often [`wait_for_main_park`] looks again.
+const PARK_POLL: Duration = Duration::from_micros(50);
+
+/// Wait at most `bound` for the main thread to park ([`main_parked`]): what a
+/// worker asks before it forks this process. A fork holds every malloc zone's
+/// lock (`_malloc_fork_prepare`) and the VM map for its whole length, so an
+/// event-loop turn that allocates or faults meanwhile waits it out, wall time
+/// with no CPU: one session's step of the status sweep stretched to 2-3 ms at
+/// 40 tabs under load once kits let a tab's fork start right after its booking
+/// turn (2026-10-17). `true` once it saw the park; past `bound` the caller
+/// forks anyway.
+pub(crate) fn wait_for_main_park(bound: Duration) -> bool {
+    let until = std::time::Instant::now() + bound;
+    loop {
+        if main_parked() {
+            return true;
+        }
+        if std::time::Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(PARK_POLL);
+    }
+}
+
+thread_local! {
+    /// How long this thread's forks wait for the park ([`forks_wait_for_park`]);
+    /// zero, no wait, outside one.
+    static FORK_PARK_BOUND: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+/// Run `spawn` with each fork this thread makes inside it waiting at most
+/// `bound` for the main thread to park, at the fork itself
+/// ([`park_before_fork`], just before the PTY spawn): the tab spawner's and the
+/// spare thread's spawns. Waited before the spawn's own work (its provision,
+/// the folder check, the shell's environment), the park came after the booking
+/// turn's `about_to_wait` in series with that work, which then started only
+/// once the loop slept: at the fork the loop has parked by then, so the wait
+/// costs nothing (2026-10-18, headless, paired: a cold `spawn`'s reply 0.13 ms
+/// sooner of 2.5 at one tab and 0.18 of 3.2 at 40, and 1.0 ms of 12.2 at 40
+/// when the host runs slow). The bound is put back as `spawn` ends or unwinds.
+pub(crate) fn forks_wait_for_park<R>(bound: Duration, spawn: impl FnOnce() -> R) -> R {
+    struct Restore(Duration);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORK_PARK_BOUND.set(self.0);
+        }
+    }
+    let _restore = Restore(FORK_PARK_BOUND.replace(bound));
+    spawn()
+}
+
+/// At a fork: wait for the main thread to park within this thread's
+/// [`forks_wait_for_park`] bound. Nothing outside one: the main thread's own
+/// spawns (the boot session, a restore, a window), which no park can precede.
+/// `true` once it saw the park.
+pub(crate) fn park_before_fork() -> bool {
+    let bound = FORK_PARK_BOUND.get();
+    !bound.is_zero() && wait_for_main_park(bound)
+}
+
 /// The breadcrumb the main thread last stamped.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn current() -> Breadcrumb {
@@ -2419,6 +2485,74 @@ mod tests {
         assert_eq!(c.busy_ms_per_s(0), 0.0, "an empty window is idle");
         ledger.reset();
         assert_eq!(ledger.snapshot().busy_ns, 0, "a window stat clears");
+    }
+
+    /// A worker about to fork waits for the park, never past its bound: inside
+    /// a turn the main thread is not parked and a zero bound gives up at once;
+    /// at the park after `about_to_wait`, before the loop, and in a modal it is,
+    /// and the wait answers at once. NEGATIVE CONTROL: every work root.
+    #[test]
+    fn a_fork_waits_for_the_main_thread_to_park() {
+        let _serial = beat_serial();
+        for root in [
+            Breadcrumb::UserEvent,
+            Breadcrumb::WindowEvent,
+            Breadcrumb::NewEvents,
+            Breadcrumb::AboutToWaitWork,
+        ] {
+            beat(root);
+            assert!(!main_parked(), "{root:?} is a turn");
+            assert!(!wait_for_main_park(Duration::ZERO), "{root:?}");
+        }
+        for park in [
+            Breadcrumb::AboutToWait,
+            Breadcrumb::Startup,
+            Breadcrumb::Modal,
+        ] {
+            beat(park);
+            assert!(main_parked(), "{park:?} is a park point");
+            assert!(wait_for_main_park(Duration::from_secs(60)), "{park:?}");
+        }
+    }
+
+    /// A fork waits for the park only inside `forks_wait_for_park`, for its
+    /// bound, and the bound goes as the spawn ends, unwound or not: a turn
+    /// holds a fork inside one for the whole bound, outside one there is no
+    /// bound to wait, and a park lets it go. NEGATIVE CONTROL: a bound never
+    /// set, or left behind by a spawn that returned or panicked.
+    #[test]
+    fn a_fork_waits_for_the_park_only_inside_a_spawn_that_asks() {
+        let _serial = beat_serial();
+        let bound = Duration::from_millis(30);
+        let ambient = || FORK_PARK_BOUND.get();
+        beat(Breadcrumb::UserEvent);
+        assert_eq!(ambient(), Duration::ZERO, "no spawn asked: no wait");
+        assert!(!park_before_fork());
+        let inside = forks_wait_for_park(bound, || {
+            let t0 = std::time::Instant::now();
+            (ambient(), park_before_fork(), t0.elapsed() >= bound)
+        });
+        assert_eq!(
+            inside,
+            (bound, false, true),
+            "a turn holds the fork for its bound"
+        );
+        assert_eq!(ambient(), Duration::ZERO, "the bound went with the spawn");
+        let unwound = std::panic::catch_unwind(|| {
+            forks_wait_for_park(bound, || panic!("the spawn panicked"))
+        });
+        assert!(unwound.is_err());
+        assert_eq!(
+            ambient(),
+            Duration::ZERO,
+            "the bound went with the unwound spawn"
+        );
+        beat(Breadcrumb::AboutToWait);
+        // A hang detector: a park missed would hold it the whole minute.
+        assert!(forks_wait_for_park(
+            Duration::from_secs(60),
+            park_before_fork
+        ));
     }
 
     /// The guard `about_to_wait` holds stamps its body as the work root, and

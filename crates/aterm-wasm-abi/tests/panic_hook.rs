@@ -42,7 +42,8 @@ fn a_panic_reaches_the_injected_console_once_in_upstreams_format() {
     assert_eq!(logged.len(), 1, "{logged:?}");
     let msg = &logged[0];
     assert!(msg.starts_with("panicked at "), "{msg:?}");
-    assert!(msg.contains("tests/panic_hook.rs:"), "{msg:?}");
+    // This file, as the platform spells its path (`tests\panic_hook.rs` on Windows).
+    assert!(msg.contains(&format!("{}:", file!())), "{msg:?}");
     assert!(
         msg.ends_with(
             ":\naterm smoke panic 1234\n\nStack:\n\nError\n    at smoke (wasm://wasm/0:1)\n\n"

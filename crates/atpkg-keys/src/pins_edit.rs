@@ -855,6 +855,12 @@ mod tests {
         );
         let err = read_anchor(&twice, FIXTURE).unwrap_err();
         assert!(err.contains("2 declarations"), "{err}");
+        // ...but an INDENTED one (a nested module's) is not a top-level item at all.
+        let nested = fixture() + "mod nested {\n    pub const FIXTURE_KEYS: &[&str] = &[];\n}\n";
+        assert_eq!(
+            read_anchor(&nested, FIXTURE).unwrap().members,
+            [K1.to_string(), K2.to_string()]
+        );
 
         // A spelling this writer does not know: a fixed-size array.
         let arrayed = fixture().replace(
@@ -880,6 +886,21 @@ mod tests {
             "    \"bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNdc=\"",
         );
         assert!(read_anchor(&no_comma, FIXTURE).is_err());
+
+        // A literal the compiler would read differently from its bytes (an escape), two
+        // literals on one line, and an INDENTED `];` (not this item's terminator): each is
+        // a line this writer refuses rather than misreads.
+        for line in [
+            "    \"bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNd\\x41\",",
+            "    \"bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNdc=\", \"x\",",
+            "    ];\n    \"bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNdc=\",",
+        ] {
+            let odd = fixture().replace(
+                "    \"bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNdc=\",",
+                line,
+            );
+            assert!(read_anchor(&odd, FIXTURE).is_err(), "{line}");
+        }
 
         // A stray ITEM inside the block — the terminator went missing and the next
         // top-level declaration was swallowed. Caught as an unrecognised line, which is
@@ -985,6 +1006,10 @@ mod tests {
         // The file was truncated to nothing readable.
         let err = verify_members("// gone\n", FIXTURE, &members).unwrap_err();
         assert!(err.contains("could not be read back"), "{err}");
+
+        // A PLAN that would not read back is refused before it is offered: a provenance
+        // comment carrying a newline puts a bare line in the block.
+        assert!(append_member(&src, FIXTURE, NEW, &["two\nlines"], FIXTURE_MAX).is_err());
     }
 
     /// The REAL `pins.rs` — not a fixture — is a shape this writer understands, and the
@@ -997,7 +1022,11 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../aterm-update-core/src/pins.rs"
         );
-        let src = std::fs::read_to_string(path).expect("the anchor file is in the tree");
+        // Through the tool's own bounded reader: `setup` and `join` must be able to read it.
+        let src = String::from_utf8(
+            crate::fsio::read_bytes(path).expect("the anchor file is in the tree"),
+        )
+        .unwrap();
         let master = read_anchor(&src, MASTER_ANCHOR).expect("the master anchor is readable");
         assert_eq!(
             master.members,

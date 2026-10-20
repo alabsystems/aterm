@@ -32,7 +32,7 @@ contract_fn! {
     /// Verified check that an indexed exchange `pos` lies at or before `at_or_before`,
     /// linked via `clean-kernel-defeq` to `keyed_hit_within_cutoff_isl`.
     #[must_use]
-    pub fn keyed_hit_within_cutoff(pos: usize, at_or_before: usize) -> bool
+    pub const fn keyed_hit_within_cutoff(pos: usize, at_or_before: usize) -> bool
     clauses [ensures result == (pos <= at_or_before)]
     {
         pos <= at_or_before
@@ -68,12 +68,13 @@ impl<'a> KeyedView<'a> {
     pub fn new(records: &'a [EffectRecord]) -> KeyedView<'a> {
         let mut index: BTreeMap<(&'a str, &'a [u8]), Vec<KeyedReply<'a>>> = BTreeMap::new();
         let mut position = 0usize;
-        while position < records.len() {
+        let mut rest = records;
+        while let [rec, tail @ ..] = rest {
             if let EffectRecord::Exchange {
                 door,
                 request,
                 reply,
-            } = &records[position]
+            } = rec
             {
                 index
                     .entry((door.as_str(), request.as_slice()))
@@ -84,6 +85,7 @@ impl<'a> KeyedView<'a> {
                     });
             }
             position = position.saturating_add(1);
+            rest = tail;
         }
         KeyedView { index }
     }
@@ -119,8 +121,23 @@ impl<'a> KeyedView<'a> {
             Some(v) => v.as_slice(),
             None => &[],
         };
-        let upto = hits.partition_point(|hit| keyed_hit_within_cutoff(hit.position, at_or_before));
-        let found = upto.checked_sub(1).and_then(|last| hits.get(last)).copied();
+        // The index is sorted by tape position. Find the last admitted hit
+        // without scanning every earlier reply for a frequently used door.
+        let mut found = None;
+        let mut low = 0usize;
+        let mut high = hits.len();
+        while low < high {
+            let mid = low.saturating_add(high.saturating_sub(low) / 2);
+            let Some(hit) = hits.get(mid) else {
+                break;
+            };
+            if keyed_hit_within_cutoff(hit.position, at_or_before) {
+                found = Some(*hit);
+                low = mid.saturating_add(1);
+            } else {
+                high = mid;
+            }
+        }
         match found {
             Some(hit) => Ok(hit),
             None => Err(ReplayDivergence::Unrecorded {

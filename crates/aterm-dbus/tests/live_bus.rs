@@ -5,11 +5,11 @@
 //! socket, two [`Connection`]s, a call from one to the other and back, and a
 //! signal one emits that the other's `AddMatch` routes to it.
 //!
-//! It runs only where `dbus-daemon` is on PATH (Linux desktops; `brew install
-//! dbus` on macOS) and otherwise skips, saying so. The daemon is this test's
-//! own, never the session's bus.
+//! Linux only: D-Bus is a Linux desktop's bus (a Mac has none by default), and
+//! there a missing `dbus-daemon` on PATH ends the test COULD NOT RUN. The daemon
+//! is this test's own, never the session's bus.
 
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
@@ -42,11 +42,10 @@ fn config(socket: &Path) -> String {
 #[test]
 fn a_call_and_a_signal_cross_a_private_dbus_daemon() {
     let Some(daemon) = dbus_daemon() else {
-        eprintln!(
-            "skip: no dbus-daemon on PATH, so no live bus round trip here; \
-             install dbus (`brew install dbus`, or a Linux desktop's dbus-daemon) to run it"
+        aterm_spec::host::could_not_run(
+            "no dbus-daemon on PATH, so no live bus round trip here; install the \
+             distribution's dbus (dbus-daemon) to run it",
         );
-        return;
     };
     let scratch = aterm_tempfile::tempdir().unwrap();
     let socket = scratch.path().join("bus");

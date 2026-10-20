@@ -352,6 +352,26 @@ fn every_value_reads_back_from_its_bytes() {
     );
     assert_eq!(<()>::from_tape(&().to_tape()), Ok(()));
     assert!(<()>::from_tape(b"x").is_err());
+    // The machine's count of its sleep, and its record of its last sleep.
+    use crate::supervise::policy::sleeps::SleepStamp;
+    for v in [
+        None,
+        Some(SleepStamp {
+            asleep: Duration::from_millis(1_800_003),
+            boot: Some("4F1C2A9E-boot".to_string()),
+        }),
+        Some(SleepStamp {
+            asleep: Duration::ZERO,
+            boot: None,
+        }),
+    ] {
+        assert_eq!(Option::<SleepStamp>::from_tape(&v.to_tape()), Ok(v));
+    }
+    for v in [None, Some((WALL_MS, WALL_MS + 1_800_000))] {
+        assert_eq!(Option::<(i64, i64)>::from_tape(&v.to_tape()), Ok(v));
+    }
+    assert!(Option::<SleepStamp>::from_tape(b"soon").is_err());
+    assert!(Option::<(i64, i64)>::from_tape(b"1").is_err());
     for mark in [
         DecideMark {
             screen: Some(12),
@@ -359,7 +379,7 @@ fn every_value_reads_back_from_its_bytes() {
             generation: Some("3.41".to_string()),
             rule: Some("safe-read@v1".to_string()),
             outcome: "Approve { subject: \"ls -la\\n=-\" }\nsecond line".to_string(),
-            facts: None,
+            facts: Some("{\"cwd\":\"@home/src\",\"box_call\":\"a\\nb=c\"}".to_string()),
         },
         DecideMark {
             screen: None,
@@ -370,7 +390,10 @@ fn every_value_reads_back_from_its_bytes() {
             facts: None,
         },
     ] {
-        assert_eq!(DecideMark::decode(&mark.encode()), Some(mark));
+        assert_eq!(DecideMark::decode(&mark.encode()), Some(mark.clone()));
+        // A key a later build writes is skipped: the mark reads as it was.
+        let later = format!("{}later=1\n", mark.encode());
+        assert_eq!(DecideMark::decode(&later), Some(mark));
     }
     assert_eq!(
         DecideMark::decode("screen=1\n"),

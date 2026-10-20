@@ -190,7 +190,7 @@ fn a_dry_run_sees_every_served_target_and_plans_the_missing_rows() {
         ),
         "{clean}"
     );
-    // The bundle is a human lane, and its group holds trust-ir on both targets.
+    // The bundle is the bundle lane's, and its group holds trust-ir on both targets.
     assert_eq!(*decision(&o, "trust"), Decision::ManualBundle);
     assert!(table_row(&tx, "trust-ir").contains("BUILD+HOLD(group rustc: x86_64,aarch64)"));
     assert!(w.fx.packer.legs().is_empty() && w.fx.calls("clone ").is_empty());

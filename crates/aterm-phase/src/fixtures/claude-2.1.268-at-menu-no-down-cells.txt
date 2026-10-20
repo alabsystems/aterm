@@ -1,0 +1,5 @@
+# claude-code 2.1.268 · MEASURED 2026-10-17 · `aterm ctl cell <row> <col>` of the first glyph of each entry of the `@` menu on claude-2.1.268-at-menu-no.txt, one per line: the row, the column, the reply (after one `down`: `novel.txt` selected)
+8 2 OK + b1b9f9 111318 none
+9 2 OK + 999999 111318 none
+10 2 OK + 999999 111318 none
+11 2 OK + 999999 111318 none

@@ -18,17 +18,6 @@ authors.workspace = true
 publish = false
 
 [features]
-# The sealed cross-host transport (`--tcp --key-file`), off by default so a
-# shipped binary carries no cipher tree: `aead` pulls chacha20poly1305 +
-# getrandom and, further up, the curves — 22 third-party packages, and this
-# repository counts packages. chacha20poly1305 + getrandom still appear in
-# `Cargo.lock` (a lockfile records reachable optional deps; the curves do not,
-# as nothing here can enable them); `targo tree -p aterm-link -e normal` shows a
-# default build compiles none. `crates/aterm`'s `two_nodes_sealed` turns it on.
-# The Trust lane verifies this crate's `sealed` arms in a row of their own,
-# `aterm-link+sealed` (this library with `--features sealed`, beside the
-# default row; trust/floors.tsv).
-sealed = ["astream-broker/aead"]
 # Development seams (`aterm_types::dev_seam!`) in an optimized build: `ATERM_BIN`,
 # the bridge's and notifier's fault switches, the bridge's broker-wait tally (the
 # fabric bench's ping-pong arm), `fabric on`'s effect trace and mint fault, and the
@@ -40,10 +29,16 @@ dev-seams = []
 # Exclusively owned notifier carry stages, removed on error/drop.
 aterm-tempfile = { workspace = true }
 # The bus: `cap` for the bound grant every fabric principal attaches with. Its
-# SHA-256 is astream's own astream-digest, so a default build takes no
-# third-party crate from astream; with `sealed`, the crate's whole third-party
-# crypto surface is chacha20poly1305 and getrandom.
-astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["cap"] }
+# SHA-256 is astream's own astream-digest, so this crate takes no third-party
+# crate from astream. astream's `aead` (the sealed record layer) is not enabled:
+# the sealed transport was removed on 2026-10-15, before it shipped.
+# `retention` compiles `Broker::retain_before`, which nothing shipped calls
+# (the unit tests drop a retained record and its dedup entry with it); it is
+# on here, not only in a dev row, so the broker the tests run is the broker
+# that ships and a `-p aterm` build shares every unit a `--workspace` test
+# build compiled (P4). Its one effect on a log aterm writes: an open also
+# looks for the `.base` and `.state` sidecars, which nothing in aterm creates.
+astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["cap", "retention"] }
 astream-cap = { path = "../../vendor/astream/crates/astream-cap" }
 # The kernel's boot session (`boot_session`), aterm-link's ONE reading of this
 # boot (`durability::this_boot`): the boot the broker opens its log in and judges
@@ -58,7 +53,7 @@ aterm-types = { workspace = true }
 # The body's informational `t=` (`now_ms`).
 aterm-time = { workspace = true }
 aterm-uds = { workspace = true }
-# The one hex codec (key file, roster nonce) and the control wire's percent
+# The one hex codec (the roster nonce) and the control wire's percent
 # escape (`pct`, shared by the fabric body).
 aterm-codec = { workspace = true }
 # The one FNV-1a/64 (the `gen=` fingerprint, the say-cursor shard): the same
@@ -84,8 +79,6 @@ aterm-toml = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
-# The unit tests drop the broker's retained record and dedup entry together.
-astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["cap", "retention"] }
 # The unit tests' derived models and hang detectors.
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).

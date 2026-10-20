@@ -3,7 +3,7 @@
 
 use super::find_field_key_tests::{character, named, type_str};
 use crate::{App, WindowId};
-use winit::keyboard::{ModifiersState, NamedKey};
+use aterm_window::keyboard::{ModifiersState, NamedKey};
 
 /// An app with the in-grid strip on and an editor open over its active tab.
 fn app_editing() -> (App, WindowId) {

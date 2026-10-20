@@ -11,7 +11,8 @@
 //!    codex-alab that crashed comes back on the line aterm's own copy of its session record
 //!    validated while it ran ([`super::super::self_claimed`]): the shell back at its marked
 //!    prompt leading the foreground group, no live writer lock on the thread's rollout, the
-//!    line typed once per witness, and the new TUI found leading the tab. No exit hint is read
+//!    line typed once per witness, the new TUI found leading the tab, and the harness's hand
+//!    held to its first idle (its launch probe reads it there). No exit hint is read
 //!    off the screen (the copy named the thread) and no continuation is typed after it:
 //!    codex-alab's own carry-on continues a thread its crash relaunch resumed (§5).
 //! 2. **The relaunch left in flight** ([`carry_in_flight`]): an exit whose line waited, or
@@ -32,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::super::codex_alab as ca;
-use super::super::relaunch::{ExitCause, WAIT_HAND_LIFTS, exit_clock, hand_waits_out};
+use super::super::relaunch::{ExitCause, NO_SHELL, WAIT_HAND_LIFTS, exit_clock, hand_waits_out};
 #[cfg(all(test, unix))]
 use super::registry_vouches_for_state;
 use super::upgrade::{Agent, Dialect, Phase};
@@ -71,6 +72,24 @@ pub(super) trait AlabKernel: Kernel {
     /// Whether `pid` is still the foreground group of `tab` by the host's own
     /// roster ([`process_in_tab`]): asked right before every typed act.
     fn in_tab(&self, c: &mut Client, pid: u32, tab: &str) -> bool;
+    /// `pid`'s kernel start as the record reader spells it
+    /// ([`super::super::restart_stamp::kernel_start`]), `None` where it
+    /// cannot be read (off Apple a `ps` that failed: unknown, never an end):
+    /// the identity [`Self::first_frame`] reads under.
+    fn birth(&self, pid: u32) -> Option<String>;
+    /// THE RELAUNCHED CODEX-ALAB UP, as aterm reads it ([`hold_to_first_idle`]):
+    /// `tab`'s `status` names `pid` as its proven self-claim
+    /// ([`super::super::self_claimed::proven_pid`]), made only after its launch
+    /// probe read the tab, and that process, born `birth`, names its TUI's frame
+    /// in its own record read live ([`super::super::self_claimed::read_first_frame`]):
+    /// at rest (its first idle) or a turn under way. `None` until both stand.
+    fn first_frame(
+        &self,
+        c: &mut Client,
+        pid: u32,
+        birth: &str,
+        tab: &str,
+    ) -> Option<super::super::self_claimed::FirstFrame>;
 }
 
 impl AlabKernel for Live {
@@ -112,6 +131,24 @@ impl AlabKernel for Live {
 
     fn in_tab(&self, c: &mut Client, pid: u32, tab: &str) -> bool {
         process_in_tab(c, pid, tab, None, None)
+    }
+
+    fn birth(&self, pid: u32) -> Option<String> {
+        super::super::restart_stamp::kernel_start(pid)
+    }
+
+    fn first_frame(
+        &self,
+        c: &mut Client,
+        pid: u32,
+        birth: &str,
+        tab: &str,
+    ) -> Option<super::super::self_claimed::FirstFrame> {
+        use super::super::self_claimed::{proven_pid, read_first_frame};
+        c.request_line(&format!("@{tab} status"))
+            .is_ok_and(|status| proven_pid(&status) == Some(pid))
+            .then(|| read_first_frame(pid, birth))
+            .flatten()
     }
 }
 
@@ -280,8 +317,8 @@ pub(super) fn self_claimed_plan(
 /// ledger ([`super::super::self_claimed::Witnesses`]) — through [`relaunch`]: the shell back at
 /// its marked prompt leading the foreground group, no live writer lock on the thread's rollout
 /// ([`type_relaunch_line_with`]'s `owner_clear`), the line typed, the new TUI found leading the
-/// tab, and nothing typed after it. A tab whose agent was its spawn command (no shell) is
-/// refused, said once by the caller.
+/// tab, the hand held to its first idle ([`hold_to_first_idle`]), and nothing typed after it. A
+/// tab whose agent was its spawn command (no shell) is refused, said once by the caller.
 pub(super) fn self_claimed_after_exit(
     opts: &Opts,
     snap: &super::super::relaunch::Snapshot,
@@ -412,7 +449,8 @@ fn relaunch(opts: &Opts, r: Report, st: &mut St, c: &mut Client, k: &dyn AlabKer
 }
 
 /// [`relaunch`] with the harness's `hand` on the tab ([`Hand`]) through every wait, the typed
-/// line, and until the new TUI leads the tab ([`await_held`]). The thread is the record's
+/// line, and until the new TUI leads the tab and reaches its first idle ([`await_held`],
+/// [`hold_to_first_idle`]). The thread is the record's
 /// ([`St::thread`], the copy's validated `sessionId`): nothing is read off the screen, so an
 /// exit hint naming another thread is no word here. Its rollout must exist and its writer lock
 /// be free (codex-alab holds it itself), checked again right before the line.
@@ -535,10 +573,11 @@ fn await_new(opts: &Opts, r: Report, st: &mut St, c: &mut Client, k: &dyn AlabKe
 }
 
 /// [`await_new`] with the harness's `hand` on the tab, kept through the wait; its caller gives
-/// it back. Done once the new TUI leads the tab by the host's own roster: nothing is typed into
-/// it, no box is answered and no composer waited on, whoever asked (a window's worker under
-/// [`Opts::hand_back`] included, which adopts nothing). codex-alab's own carry-on continues the
-/// thread its crash relaunch resumed (the contract §5).
+/// it back. Done once the new TUI leads the tab by the host's own roster, the hand held on to
+/// its first idle ([`hold_to_first_idle`]): nothing is typed into it, no box is answered and no
+/// composer waited on, whoever asked (a window's worker under [`Opts::hand_back`] included,
+/// which adopts nothing). codex-alab's own carry-on continues the thread its crash relaunch
+/// resumed (the contract §5), once its launch probe saw this hand.
 fn await_held(
     opts: &Opts,
     mut r: Report,
@@ -580,6 +619,7 @@ fn await_held(
     }) {
         return said(r, "wait:resume");
     }
+    let held = hold_to_first_idle(opts, c, hand, k, new, &tab);
     st.phase = Phase::Done;
     st.resumed_pid = new;
     st.resumed_on.clone_from(&st.to);
@@ -589,8 +629,87 @@ fn await_held(
         st.to
     );
     let r = said(r, "done:resumed");
-    ledger(opts, &r, &st.outcome);
+    ledger(opts, &r, &format!("{}; {held}", st.outcome));
     r
+}
+
+/// How [`hold_to_first_idle`] ended, as the ledger's `done:resumed` row says it.
+const HELD_TO_FIRST_IDLE: &str = "the hand held to its first idle";
+/// The hold ended at a turn already under way
+/// ([`super::super::self_claimed::FirstFrame::Turn`]).
+const HELD_TO_A_TURN: &str = "the hand held until it was up, a turn already under way";
+/// The relaunched process ended, or its pid is another process's now.
+const HELD_TO_ITS_END: &str = "the hand given back: it ended before its first idle";
+/// The hold ran to [`super::super::Timings::alab_first_idle`].
+const HELD_TO_THE_BOUND: &str = "the hand given back at its bound, before its first idle";
+/// Another driver's lease stands on the tab now.
+const HELD_TO_A_LAPSE: &str = "the hand lapsed to another driver before its first idle";
+
+/// THE HAND IS HELD TO THE RELAUNCHED PROCESS'S FIRST IDLE (the contract §5,
+/// carry-on): aterm's relaunch lease (`hand=lease:aterm-harness@<pid>`),
+/// taken before the line is typed, stands until the new codex-alab is up as
+/// aterm reads it ([`AlabKernel::first_frame`]: its proven self-claim, which
+/// codex-alab makes only after its launch probe read the tab, and its own
+/// record naming its TUI's frame — at rest, its first idle, or a turn already
+/// under way, whose own acts wait for this lease), the process gone, or
+/// [`super::super::Timings::alab_first_idle`] (the launch probe's window),
+/// whichever comes first; its caller then gives it back. codex-alab's launch
+/// probe (its client's FIRST `@self status`, read as the process starts) must
+/// see that lease to carry the resumed thread on: given back as soon as the
+/// new TUI led the tab (the carve, 3999d9adc6, in 0.106.0), the probe read
+/// `hand=-` 5 ms later and the resumed conversation waited at its prompt.
+/// Every relaunch of a codex-alab comes here (the crash rule's, a stall or
+/// memory remedy's, an asked restart's, a restore's, and each carried in
+/// flight: [`await_held`]); a later step that finds one already up ends at
+/// its first look. Nothing is typed meanwhile and no screen is read. A kernel
+/// start that cannot be read is unknown, never the process's end (off Apple
+/// it is a `ps`, which can fail once): only a process gone or another start
+/// of its pid ends the hold early. With no hand held (another driver's, or a
+/// server without hard leases) there is nothing to hold. Says how it ended,
+/// for the ledger.
+fn hold_to_first_idle(
+    opts: &Opts,
+    c: &mut Client,
+    hand: &mut Hand,
+    k: &dyn AlabKernel,
+    new: u32,
+    tab: &str,
+) -> &'static str {
+    use super::super::self_claimed::FirstFrame;
+    if !hand.held {
+        return "no hand held";
+    }
+    let mut birth: Option<String> = None;
+    let mut ended = HELD_TO_THE_BOUND;
+    wait_until(opts.timings.alab_first_idle, || {
+        hand.keep(c);
+        if !hand.held {
+            ended = HELD_TO_A_LAPSE;
+            return true;
+        }
+        if !k.alive(new) {
+            ended = HELD_TO_ITS_END;
+            return true;
+        }
+        match (k.birth(new), &birth) {
+            (Some(now), Some(first)) if now != *first => {
+                ended = HELD_TO_ITS_END;
+                return true;
+            }
+            (Some(now), None) => birth = Some(now),
+            _ => {}
+        }
+        let Some(born) = birth.as_deref() else {
+            return false;
+        };
+        match k.first_frame(c, new, born, tab) {
+            Some(FirstFrame::Idle) => ended = HELD_TO_FIRST_IDLE,
+            Some(FirstFrame::Turn) => ended = HELD_TO_A_TURN,
+            None => return false,
+        }
+        true
+    });
+    ended
 }
 
 /// Record a Codex restart that stops here, with one ledger line.
@@ -908,13 +1027,17 @@ pub(super) fn snapshot(
         }),
         // From the kernel's exec path alone ([`shell_dialect`]): a shell no line is written for
         // waits for ever at exit, so the explicit restart is not carried there
-        // ([`super::super::relaunch::carries_restart`]).
-        dialect: shell_dialect(shell, k, Vec::new),
+        // ([`super::super::relaunch::carries_restart`]). None for a tab's own codex-alab
+        // ([`NO_SHELL`]): no shell holds it, and nothing relaunches it in its tab.
+        dialect: (shell != NO_SHELL)
+            .then(|| shell_dialect(shell, k, Vec::new))
+            .flatten(),
         // Claude Code's variables: a Codex has no such login or home, and no usage tap.
         login: None,
         home: None,
         claude_dir: None,
         stored_login: false,
+        profile: None,
     })
 }
 

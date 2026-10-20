@@ -159,8 +159,18 @@ fn an_older_twin_under_a_standing_marker_runs_the_tool_at_once() {
     let argv = [OsString::from("--probe")];
     let out = fx.run(&twin, &argv);
     assert_eq!(out.status.code(), Some(7), "{out:?}");
-    assert_eq!(text(&out.stdout), "fake: --probe\n");
-    assert_eq!(text(&out.stderr), "", "nothing printed");
+    // The forward execs today's `bin/claude`, whose yolo-by-default block leads
+    // the argv and says so (`crate::yolo` in atpkg's lib); the passthrough
+    // itself — at once, no wait, no other word — is what this pins.
+    assert_eq!(
+        text(&out.stdout),
+        "fake: --dangerously-skip-permissions --probe\n"
+    );
+    assert_eq!(
+        text(&out.stderr),
+        "aterm: yolo (default): running 'claude' '--dangerously-skip-permissions' \
+         '--probe'\n"
+    );
 }
 
 /// Every pass sweeps `landing/`: a mutating verb takes the store lock and removes the

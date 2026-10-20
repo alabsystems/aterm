@@ -1,0 +1,24 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# S4, S2: the vendor turn's end with a box, then a wall, under its turn only
+# amends: neither screen step is closed by it; a later prompt with no screen
+# step supersedes the turn.
+bind 0
+see busy
+tx prompt v1
+see prompt bash:not-read-only
+tx end
+expect open p1 approval
+expect amend t1 turn vref=v1
+expect amend t1 turn vdur_ms=4200
+expect turn=open
+see busy
+expect close p1 approval out=passed
+tx prompt v2
+expect close t1 turn out=superseded steps=1 appr=1
+expect open t1 turn src=screen
+expect open t2 turn vref=v2
+see wall:usage-session
+tx end
+expect open p2 wall par=t2
+expect amend t2 turn vdur_ms=4200
+expect need=wall:usage-session

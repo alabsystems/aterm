@@ -136,6 +136,9 @@ define_terminal_handler! {
     // doc): the DEC and CSI dispatchers set a bit on each parsed setter.
     evidence_asserted: u16 => evidence_asserted,
     absolute_row_revision: u64 => absolute_row_revision,
+    // The holder fence (see the `Terminal` field doc): a 1049 set and a full
+    // clear mark it; the host's cuts move it.
+    holder_fence: super::HolderFence => holder_fence,
     // OSC / escape-sequence policy: the installed engine plus its compiled gate
     // verdicts, replaced via `Terminal::apply_policy_engine`, which recompiles
     // the table in the same step. With no engine, `send_response` and the OSC
@@ -156,6 +159,7 @@ define_terminal_handler! {
     kitty_file_resolver: Option<Box<dyn Fn(crate::terminal::kitty_graphics::KittyMedium, &str) -> Option<Vec<u8>> + Send>> => kitty_file_resolver,
     last_bell_time: Option<aterm_time::Instant> => last_bell_time,
     bell_total: u64 => bell_total,
+    notify_total: u64 => notify_total,
     default_cursor_style: aterm_types::CursorStyle => default_cursor_style,
     host_alternate_scroll: bool => host_alternate_scroll,
     notifications: super::NotificationState => notifications,
@@ -349,13 +353,10 @@ impl TerminalHandler<'_> {
         self.transient.response_buffer.extend_from_slice(response);
     }
 
-    /// Returns whether appending `additional_len` would stay within the cap.
+    /// Returns whether appending `additional_len` would stay within the cap,
+    /// which the replies share with the unsolicited reports.
     pub(super) fn can_append_response_bytes(&self, additional_len: usize) -> bool {
-        self.transient
-            .response_buffer
-            .len()
-            .saturating_add(additional_len)
-            <= MAX_RESPONSE_BUFFER_SIZE
+        self.transient.owed_len().saturating_add(additional_len) <= MAX_RESPONSE_BUFFER_SIZE
     }
 
     /// Queue an OSC app-event `(code, payload)` for the host to poll via

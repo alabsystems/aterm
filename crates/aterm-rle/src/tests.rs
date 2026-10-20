@@ -289,3 +289,39 @@ mod performance;
 
 #[path = "tests_saturation.rs"]
 mod saturation;
+
+#[test]
+fn rle_const_helpers_invariants() {
+    use crate::{
+        RleCapacityError, Run, checked_rle_extend_total, clamp_rle_extend_count, clamp_rle_range,
+        decode_rle_span_triple_le, decode_run_pair_le, encode_rle_span_triple_le,
+        encode_run_pair_le, multi_run_edge_lengths, point_split_lengths, remaining_rle_capacity,
+        single_run_split_lengths,
+    };
+
+    let run = Run::new(7u8, 10);
+    assert!(!run.is_empty() && run.contains_offset(9) && !run.contains_offset(10));
+
+    let err = RleCapacityError {
+        requested: 100,
+        available: 40,
+    };
+    assert_eq!(err.overflow_amount(), 60);
+    assert!(!err.is_full());
+
+    assert_eq!(remaining_rle_capacity(100), u32::MAX - 100);
+    assert_eq!(clamp_rle_extend_count(u32::MAX - 5, 20), 5);
+    assert_eq!(checked_rle_extend_total(10, 5), Ok(15));
+    assert!(checked_rle_extend_total(u32::MAX - 2, 5).is_err());
+
+    assert_eq!(clamp_rle_range(2, 12, 10), Some((2, 10)));
+    assert_eq!(clamp_rle_range(10, 12, 10), None);
+    assert_eq!(single_run_split_lengths(10, 2, 7), Some((2, 5, 3)));
+    assert_eq!(point_split_lengths(10, 3), Some((3, 1, 6)));
+    assert_eq!(multi_run_edge_lengths(5, 2, 6, 4), Some((2, 2)));
+
+    let enc = encode_run_pair_le(0x1122_3344, 0x5566_7788);
+    assert_eq!(decode_run_pair_le(enc), (0x1122_3344, 0x5566_7788));
+    let tri = encode_rle_span_triple_le(10, 20, 30);
+    assert_eq!(decode_rle_span_triple_le(tri), (10, 20, 30));
+}

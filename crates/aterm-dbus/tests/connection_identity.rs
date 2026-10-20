@@ -78,7 +78,11 @@ fn address_child(test: &str, mode: &str) {
         .env("HOME", scratch.path())
         .env("XDG_RUNTIME_DIR", scratch.path())
         .env(CHILD, mode)
-        .args(["--exact", test, "--nocapture"]);
+        .args([
+            "--exact",
+            &format!("connection_identity::{test}"),
+            "--nocapture",
+        ]);
     if mode == "invalid" {
         command.env(
             "DBUS_SESSION_BUS_ADDRESS",
@@ -93,8 +97,10 @@ fn address_child(test: &str, mode: &str) {
     .pop()
     .unwrap()
     .unwrap();
+    // `1 passed`: a name that matched no test would pass with nothing checked.
     assert!(
-        output.status.success(),
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
         "owned {mode} child: {}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)

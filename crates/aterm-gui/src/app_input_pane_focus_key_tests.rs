@@ -8,8 +8,8 @@
 
 use super::typed_kitty_summon_tests::{app_with_private_pty, drain};
 use crate::{App, WindowId, pane};
-use winit::event::{ElementState, KeyEvent};
-use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey};
+use aterm_window::event::{ElementState, KeyEvent};
+use aterm_window::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey};
 
 /// A press and release of an arrow key, Alt held.
 fn alt_arrow(app: &mut App, wid: WindowId, key: NamedKey, code: KeyCode) {

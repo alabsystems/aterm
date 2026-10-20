@@ -1,0 +1,12 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# A prompt row dated at the closed turn's open, read while the next turn is
+# open, names the closed turn: it is nearer.
+bind 0
+see busy
+see idle
+wait 1000
+see busy
+tx prompt v1 dated=0
+expect amend t1 turn vref=v1 by=vendor
+expect tx mapped=t1
+expect turn=t2

@@ -50,7 +50,7 @@ contract_fn! {
     /// Kernel-certified deadline-elapsed check (`dl_ms <= bt_ms`), backed by the
     /// Clean-origin [`monotone_clock_tick`] (`max(bt_ms, dl_ms) == bt_ms`).
     #[must_use]
-    pub fn deadline_elapsed(dl_ms: u64, bt_ms: u64) -> bool
+    pub const fn deadline_elapsed(dl_ms: u64, bt_ms: u64) -> bool
     clauses [ensures result == (dl_ms <= bt_ms)]
     {
         dl_ms <= bt_ms
@@ -79,14 +79,19 @@ impl ReceiptVerdict {
         }
     }
 
-    /// Parse a canonical verdict token.
-    pub fn parse(s: &str) -> Result<Self, ReceiptError> {
+    /// Parse a canonical verdict byte slice (`handled`, `refused`, `deferred`).
+    pub const fn parse_bytes(s: &[u8]) -> Result<Self, ReceiptError> {
         match s {
-            "handled" => Ok(Self::Handled),
-            "refused" => Ok(Self::Refused),
-            "deferred" => Ok(Self::Deferred),
+            b"handled" => Ok(Self::Handled),
+            b"refused" => Ok(Self::Refused),
+            b"deferred" => Ok(Self::Deferred),
             _ => Err(ReceiptError::InvalidVerdict),
         }
+    }
+
+    /// Parse a canonical verdict token.
+    pub const fn parse(s: &str) -> Result<Self, ReceiptError> {
+        Self::parse_bytes(s.as_bytes())
     }
 }
 
@@ -195,18 +200,48 @@ impl PartialEq for FabricReceipt {
     }
 }
 
-fn parse_u64_ascii(val: &str, field: &'static str) -> Result<u64, ReceiptError> {
-    let bytes = val.as_bytes();
-    if bytes.is_empty() {
-        return Err(ReceiptError::InvalidNumber(field));
+const fn decode_decimal_digit(b: u8) -> Option<u64> {
+    if b >= b'0' && b <= b'9' {
+        Some((b - b'0') as u64)
+    } else {
+        None
     }
-    let mut acc = 0u64;
-    for &b in bytes {
-        if !b.is_ascii_digit() {
-            return Err(ReceiptError::InvalidNumber(field));
+}
+
+const fn is_all_crlf(bytes: &[u8]) -> bool {
+    let mut rest = bytes;
+    while let &[b, ref tail @ ..] = rest {
+        if b != b'\r' && b != b'\n' {
+            return false;
         }
-        // For ASCII `'0'..='9'` (`0x30..=0x39`), the low nibble `b & 15` equals `b - b'0'`.
-        let digit = (b & 15) as u64;
+        rest = tail;
+    }
+    true
+}
+
+const fn parse_u64_space_token<'a>(
+    bytes: &'a [u8],
+    field: &'static str,
+) -> Result<(u64, Option<&'a [u8]>), ReceiptError> {
+    let mut rest = bytes;
+    let mut acc = 0u64;
+    let mut has_digit = false;
+    while let &[b, ref tail @ ..] = rest {
+        if b == b' ' {
+            if !has_digit {
+                return Err(ReceiptError::InvalidNumber(field));
+            }
+            return Ok((acc, Some(tail)));
+        }
+        if b == b'\r' || b == b'\n' {
+            if !has_digit || !is_all_crlf(tail) {
+                return Err(ReceiptError::InvalidNumber(field));
+            }
+            return Ok((acc, None));
+        }
+        let Some(digit) = decode_decimal_digit(b) else {
+            return Err(ReceiptError::InvalidNumber(field));
+        };
         let Some(mul) = acc.checked_mul(10) else {
             return Err(ReceiptError::InvalidNumber(field));
         };
@@ -214,8 +249,125 @@ fn parse_u64_ascii(val: &str, field: &'static str) -> Result<u64, ReceiptError> 
             return Err(ReceiptError::InvalidNumber(field));
         };
         acc = next;
+        has_digit = true;
+        rest = tail;
     }
-    Ok(acc)
+    if !has_digit {
+        return Err(ReceiptError::InvalidNumber(field));
+    }
+    Ok((acc, None))
+}
+
+const fn parse_verdict_space_token(
+    bytes: &[u8],
+) -> Result<(ReceiptVerdict, Option<&[u8]>), ReceiptError> {
+    match bytes {
+        b"handled" => Ok((ReceiptVerdict::Handled, None)),
+        &[b'h', b'a', b'n', b'd', b'l', b'e', b'd', b' ', ref tail @ ..] => {
+            Ok((ReceiptVerdict::Handled, Some(tail)))
+        }
+        &[b'h', b'a', b'n', b'd', b'l', b'e', b'd', b'\r' | b'\n', ref tail @ ..]
+            if is_all_crlf(tail) =>
+        {
+            Ok((ReceiptVerdict::Handled, None))
+        }
+        b"refused" => Ok((ReceiptVerdict::Refused, None)),
+        &[b'r', b'e', b'f', b'u', b's', b'e', b'd', b' ', ref tail @ ..] => {
+            Ok((ReceiptVerdict::Refused, Some(tail)))
+        }
+        &[b'r', b'e', b'f', b'u', b's', b'e', b'd', b'\r' | b'\n', ref tail @ ..]
+            if is_all_crlf(tail) =>
+        {
+            Ok((ReceiptVerdict::Refused, None))
+        }
+        b"deferred" => Ok((ReceiptVerdict::Deferred, None)),
+        &[b'd', b'e', b'f', b'e', b'r', b'r', b'e', b'd', b' ', ref tail @ ..] => {
+            Ok((ReceiptVerdict::Deferred, Some(tail)))
+        }
+        &[b'd', b'e', b'f', b'e', b'r', b'r', b'e', b'd', b'\r' | b'\n', ref tail @ ..]
+            if is_all_crlf(tail) =>
+        {
+            Ok((ReceiptVerdict::Deferred, None))
+        }
+        _ => Err(ReceiptError::InvalidVerdict),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReceiptHeaderKind {
+    Ack,
+    Expired,
+    LegacyV1,
+}
+
+#[derive(Clone, Copy)]
+enum AckField<'a> {
+    Re(u64, Option<&'a [u8]>),
+    Verdict(ReceiptVerdict, Option<&'a [u8]>),
+    Bt(u64, Option<&'a [u8]>),
+}
+
+const fn parse_ack_field(rem: &[u8]) -> Result<AckField<'_>, ReceiptError> {
+    match *rem {
+        [b'r', b'e', b'=', ref v @ ..] => match parse_u64_space_token(v, "re") {
+            Ok((val, next)) => Ok(AckField::Re(val, next)),
+            Err(e) => Err(e),
+        },
+        [b'v', b'e', b'r', b'd', b'i', b'c', b't', b'=', ref v @ ..] => {
+            match parse_verdict_space_token(v) {
+                Ok((val, next)) => Ok(AckField::Verdict(val, next)),
+                Err(e) => Err(e),
+            }
+        }
+        [b'b', b't', b'=', ref v @ ..] => match parse_u64_space_token(v, "bt") {
+            Ok((val, next)) => Ok(AckField::Bt(val, next)),
+            Err(e) => Err(e),
+        },
+        _ => Err(ReceiptError::UnknownField),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ExpiredField<'a> {
+    Re(u64, Option<&'a [u8]>),
+    Dl(u64, Option<&'a [u8]>),
+    Bt(u64, Option<&'a [u8]>),
+}
+
+const fn parse_expired_field(rem: &[u8]) -> Result<ExpiredField<'_>, ReceiptError> {
+    match *rem {
+        [b'r', b'e', b'=', ref v @ ..] => match parse_u64_space_token(v, "re") {
+            Ok((val, next)) => Ok(ExpiredField::Re(val, next)),
+            Err(e) => Err(e),
+        },
+        [b'd', b'l', b'=', ref v @ ..] => match parse_u64_space_token(v, "dl") {
+            Ok((val, next)) => Ok(ExpiredField::Dl(val, next)),
+            Err(e) => Err(e),
+        },
+        [b'b', b't', b'=', ref v @ ..] => match parse_u64_space_token(v, "bt") {
+            Ok((val, next)) => Ok(ExpiredField::Bt(val, next)),
+            Err(e) => Err(e),
+        },
+        _ => Err(ReceiptError::UnknownField),
+    }
+}
+
+const fn parse_legacy_v1_field(rem: &[u8]) -> Result<AckField<'_>, ReceiptError> {
+    match *rem {
+        [b'r', b'e', b'=', ref v @ ..] => match parse_u64_space_token(v, "re") {
+            Ok((val, next)) => Ok(AckField::Re(val, next)),
+            Err(e) => Err(e),
+        },
+        [b's', b't', b'a', b't', b'e', b'=', ref v @ ..] => match parse_verdict_space_token(v) {
+            Ok((val, next)) => Ok(AckField::Verdict(val, next)),
+            Err(e) => Err(e),
+        },
+        [b't', b'=', ref v @ ..] => match parse_u64_space_token(v, "bt") {
+            Ok((val, next)) => Ok(AckField::Bt(val, next)),
+            Err(e) => Err(e),
+        },
+        _ => Err(ReceiptError::UnknownField),
+    }
 }
 
 impl FabricReceipt {
@@ -224,13 +376,17 @@ impl FabricReceipt {
     /// [`monotone_clock_tick`] function used in `TlaFabricReceipts.TickClock`.
     #[must_use]
     pub const fn tick_clock(now_ms: u64, sample_ms: u64) -> u64 {
-        monotone_clock_tick(now_ms, sample_ms)
+        if now_ms < sample_ms {
+            sample_ms
+        } else {
+            now_ms
+        }
     }
 
     /// Construct a validated `expired` receipt, checking that `bt_ms >= dl_ms`
     /// ([`deadline_elapsed`]).
-    pub fn new_expired(re: Offset, dl_ms: u64, bt_ms: u64) -> Result<Self, ReceiptError> {
-        if !deadline_elapsed(dl_ms, bt_ms) {
+    pub const fn new_expired(re: Offset, dl_ms: u64, bt_ms: u64) -> Result<Self, ReceiptError> {
+        if dl_ms > bt_ms {
             return Err(ReceiptError::DeadlineNotElapsed { dl_ms, bt_ms });
         }
         Ok(Self::Expired { re, dl_ms, bt_ms })
@@ -266,105 +422,150 @@ impl FabricReceipt {
     }
 
     /// Decode a canonical R8 receipt (`ack re=...` or `expired re=...`) or legacy
-    /// `asb ack` body (`v=1 t=... re=... state=...`).
-    pub fn decode(input: &str) -> Result<Self, ReceiptError> {
-        let line = input.trim_end_matches(['\r', '\n']);
-        let mut tokens = line.split(' ');
-        let Some(first) = tokens.next() else {
-            return Err(ReceiptError::UnknownKind);
+    /// `asb ack` body (`v=1 t=... re=... state=...`) from a byte slice.
+    pub const fn decode_bytes(input: &[u8]) -> Result<Self, ReceiptError> {
+        let (kind, mut rest_opt) = match input {
+            b"ack" => (ReceiptHeaderKind::Ack, None),
+            &[b'a', b'c', b'k', b' ', ref tail @ ..] => (ReceiptHeaderKind::Ack, Some(tail)),
+            b"expired" => (ReceiptHeaderKind::Expired, None),
+            &[b'e', b'x', b'p', b'i', b'r', b'e', b'd', b' ', ref tail @ ..] => {
+                (ReceiptHeaderKind::Expired, Some(tail))
+            }
+            b"v=1" => (ReceiptHeaderKind::LegacyV1, None),
+            &[b'v', b'=', b'1', b' ', ref tail @ ..] => (ReceiptHeaderKind::LegacyV1, Some(tail)),
+            _ => return Err(ReceiptError::UnknownKind),
         };
-        match first {
-            "ack" => {
+        match kind {
+            ReceiptHeaderKind::Ack => {
                 let mut re: Option<Offset> = None;
                 let mut verdict: Option<ReceiptVerdict> = None;
                 let mut bt_ms: Option<u64> = None;
-                for tok in tokens {
-                    if let Some(v) = tok.strip_prefix("re=") {
-                        if re.is_some() {
-                            return Err(ReceiptError::MissingOrDuplicateField("re"));
+                while let Some(rem) = rest_opt {
+                    match parse_ack_field(rem) {
+                        Ok(AckField::Re(val, next_rest)) => {
+                            if re.is_some() {
+                                return Err(ReceiptError::MissingOrDuplicateField("re"));
+                            }
+                            re = Some(Offset(val));
+                            rest_opt = next_rest;
                         }
-                        re = Some(Offset(parse_u64_ascii(v, "re")?));
-                    } else if let Some(v) = tok.strip_prefix("verdict=") {
-                        if verdict.is_some() {
-                            return Err(ReceiptError::MissingOrDuplicateField("verdict"));
+                        Ok(AckField::Verdict(val, next_rest)) => {
+                            if verdict.is_some() {
+                                return Err(ReceiptError::MissingOrDuplicateField("verdict"));
+                            }
+                            verdict = Some(val);
+                            rest_opt = next_rest;
                         }
-                        verdict = Some(ReceiptVerdict::parse(v)?);
-                    } else if let Some(v) = tok.strip_prefix("bt=") {
-                        if bt_ms.is_some() {
-                            return Err(ReceiptError::MissingOrDuplicateField("bt"));
+                        Ok(AckField::Bt(val, next_rest)) => {
+                            if bt_ms.is_some() {
+                                return Err(ReceiptError::MissingOrDuplicateField("bt"));
+                            }
+                            bt_ms = Some(val);
+                            rest_opt = next_rest;
                         }
-                        bt_ms = Some(parse_u64_ascii(v, "bt")?);
-                    } else {
-                        return Err(ReceiptError::UnknownField);
+                        Err(e) => return Err(e),
                     }
                 }
-                Ok(Self::Ack {
-                    re: re.ok_or(ReceiptError::MissingOrDuplicateField("re"))?,
-                    verdict: verdict.ok_or(ReceiptError::MissingOrDuplicateField("verdict"))?,
-                    bt_ms: bt_ms.ok_or(ReceiptError::MissingOrDuplicateField("bt"))?,
-                })
+                let Some(re) = re else {
+                    return Err(ReceiptError::MissingOrDuplicateField("re"));
+                };
+                let Some(verdict) = verdict else {
+                    return Err(ReceiptError::MissingOrDuplicateField("verdict"));
+                };
+                let Some(bt_ms) = bt_ms else {
+                    return Err(ReceiptError::MissingOrDuplicateField("bt"));
+                };
+                Ok(Self::Ack { re, verdict, bt_ms })
             }
-            "expired" => {
+            ReceiptHeaderKind::Expired => {
                 let mut re: Option<Offset> = None;
                 let mut dl_ms: Option<u64> = None;
                 let mut bt_ms: Option<u64> = None;
-                for tok in tokens {
-                    if let Some(v) = tok.strip_prefix("re=") {
-                        if re.is_some() {
-                            return Err(ReceiptError::MissingOrDuplicateField("re"));
+                while let Some(rem) = rest_opt {
+                    match parse_expired_field(rem) {
+                        Ok(ExpiredField::Re(val, next_rest)) => {
+                            if re.is_some() {
+                                return Err(ReceiptError::MissingOrDuplicateField("re"));
+                            }
+                            re = Some(Offset(val));
+                            rest_opt = next_rest;
                         }
-                        re = Some(Offset(parse_u64_ascii(v, "re")?));
-                    } else if let Some(v) = tok.strip_prefix("dl=") {
-                        if dl_ms.is_some() {
-                            return Err(ReceiptError::MissingOrDuplicateField("dl"));
+                        Ok(ExpiredField::Dl(val, next_rest)) => {
+                            if dl_ms.is_some() {
+                                return Err(ReceiptError::MissingOrDuplicateField("dl"));
+                            }
+                            dl_ms = Some(val);
+                            rest_opt = next_rest;
                         }
-                        dl_ms = Some(parse_u64_ascii(v, "dl")?);
-                    } else if let Some(v) = tok.strip_prefix("bt=") {
-                        if bt_ms.is_some() {
-                            return Err(ReceiptError::MissingOrDuplicateField("bt"));
+                        Ok(ExpiredField::Bt(val, next_rest)) => {
+                            if bt_ms.is_some() {
+                                return Err(ReceiptError::MissingOrDuplicateField("bt"));
+                            }
+                            bt_ms = Some(val);
+                            rest_opt = next_rest;
                         }
-                        bt_ms = Some(parse_u64_ascii(v, "bt")?);
-                    } else {
-                        return Err(ReceiptError::UnknownField);
+                        Err(e) => return Err(e),
                     }
                 }
-                let re = re.ok_or(ReceiptError::MissingOrDuplicateField("re"))?;
-                let dl_ms = dl_ms.ok_or(ReceiptError::MissingOrDuplicateField("dl"))?;
-                let bt_ms = bt_ms.ok_or(ReceiptError::MissingOrDuplicateField("bt"))?;
+                let Some(re) = re else {
+                    return Err(ReceiptError::MissingOrDuplicateField("re"));
+                };
+                let Some(dl_ms) = dl_ms else {
+                    return Err(ReceiptError::MissingOrDuplicateField("dl"));
+                };
+                let Some(bt_ms) = bt_ms else {
+                    return Err(ReceiptError::MissingOrDuplicateField("bt"));
+                };
                 Self::new_expired(re, dl_ms, bt_ms)
             }
-            "v=1" => {
+            ReceiptHeaderKind::LegacyV1 => {
                 let mut re: Option<Offset> = None;
                 let mut verdict: Option<ReceiptVerdict> = None;
                 let mut bt_ms: Option<u64> = None;
-                for tok in tokens {
-                    if let Some(v) = tok.strip_prefix("re=") {
-                        if re.is_some() {
-                            return Err(ReceiptError::MissingOrDuplicateField("re"));
+                while let Some(rem) = rest_opt {
+                    match parse_legacy_v1_field(rem) {
+                        Ok(AckField::Re(val, next_rest)) => {
+                            if re.is_some() {
+                                return Err(ReceiptError::MissingOrDuplicateField("re"));
+                            }
+                            re = Some(Offset(val));
+                            rest_opt = next_rest;
                         }
-                        re = Some(Offset(parse_u64_ascii(v, "re")?));
-                    } else if let Some(v) = tok.strip_prefix("state=") {
-                        if verdict.is_some() {
-                            return Err(ReceiptError::MissingOrDuplicateField("verdict"));
+                        Ok(AckField::Verdict(val, next_rest)) => {
+                            if verdict.is_some() {
+                                return Err(ReceiptError::MissingOrDuplicateField("verdict"));
+                            }
+                            verdict = Some(val);
+                            rest_opt = next_rest;
                         }
-                        verdict = Some(ReceiptVerdict::parse(v)?);
-                    } else if let Some(v) = tok.strip_prefix("t=") {
-                        if bt_ms.is_some() {
-                            return Err(ReceiptError::MissingOrDuplicateField("bt"));
+                        Ok(AckField::Bt(val, next_rest)) => {
+                            if bt_ms.is_some() {
+                                return Err(ReceiptError::MissingOrDuplicateField("bt"));
+                            }
+                            bt_ms = Some(val);
+                            rest_opt = next_rest;
                         }
-                        bt_ms = Some(parse_u64_ascii(v, "bt")?);
-                    } else {
-                        return Err(ReceiptError::UnknownField);
+                        Err(e) => return Err(e),
                     }
                 }
-                Ok(Self::Ack {
-                    re: re.ok_or(ReceiptError::MissingOrDuplicateField("re"))?,
-                    verdict: verdict.ok_or(ReceiptError::MissingOrDuplicateField("verdict"))?,
-                    bt_ms: bt_ms.ok_or(ReceiptError::MissingOrDuplicateField("bt"))?,
-                })
+                let Some(re) = re else {
+                    return Err(ReceiptError::MissingOrDuplicateField("re"));
+                };
+                let Some(verdict) = verdict else {
+                    return Err(ReceiptError::MissingOrDuplicateField("verdict"));
+                };
+                let Some(bt_ms) = bt_ms else {
+                    return Err(ReceiptError::MissingOrDuplicateField("bt"));
+                };
+                Ok(Self::Ack { re, verdict, bt_ms })
             }
-            _ => Err(ReceiptError::UnknownKind),
         }
+    }
+
+    /// Decode a canonical R8 receipt (`ack re=...` or `expired re=...`) or legacy
+    /// `asb ack` body (`v=1 t=... re=... state=...`).
+    pub const fn decode(input: &str) -> Result<Self, ReceiptError> {
+        Self::decode_bytes(input.as_bytes())
     }
 }
 
@@ -435,6 +636,23 @@ mod tests {
 
     #[test]
     fn rejects_malformed_receipts() {
+        // Ordinary canonical/legacy records and CR/LF endings remain valid.
+        let valid = [
+            "ack re=1 verdict=handled bt=10",
+            "expired bt=10 re=1 dl=9",
+            "v=1 t=10 re=1 state=deferred",
+        ];
+        for wire in valid {
+            let expected = FabricReceipt::decode(wire).unwrap();
+            for ending in ["", "\n", "\r\n", "\r\n\r"] {
+                let line = format!("{wire}{ending}");
+                assert_eq!(FabricReceipt::decode(&line), Ok(expected.clone()));
+                assert_eq!(
+                    FabricReceipt::decode_bytes(line.as_bytes()),
+                    Ok(expected.clone())
+                );
+            }
+        }
         assert_eq!(
             FabricReceipt::decode("unknown re=1"),
             Err(ReceiptError::UnknownKind)
@@ -451,6 +669,21 @@ mod tests {
             FabricReceipt::decode("ack re=+1 verdict=handled bt=10"),
             Err(ReceiptError::InvalidNumber("re"))
         );
+        // A field separator promises another token; it is not a line ending.
+        for wire in valid {
+            for ending in [" ", " \r\n"] {
+                let malformed = format!("{wire}{ending}");
+                assert_eq!(
+                    FabricReceipt::decode(&malformed),
+                    Err(ReceiptError::UnknownField),
+                    "RECEIPT_SPACE_IS_NOT_A_LINE_END: {malformed:?}"
+                );
+                assert_eq!(
+                    FabricReceipt::decode_bytes(malformed.as_bytes()),
+                    Err(ReceiptError::UnknownField)
+                );
+            }
+        }
     }
 
     #[test]

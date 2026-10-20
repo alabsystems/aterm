@@ -11,15 +11,17 @@ use std::time::Instant;
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_types::mouse::WheelDir;
-use winit::event::{ElementState, MouseButton as WinitMouseButton, MouseScrollDelta, TouchPhase};
-use winit::window::CursorIcon;
+use aterm_window::event::{
+    ElementState, MouseButton as WinitMouseButton, MouseScrollDelta, TouchPhase,
+};
+use aterm_window::window::CursorIcon;
 
 use aterm_core::terminal::{CustodyTransition, Terminal};
 
 use crate::app_render::{pixel_to_term_cell, strip_col_for_pixel};
 use crate::input::{InputEvent, Source};
 use crate::{
-    App, GestureOrigin, MULTI_CLICK_MS, WindowId, control, is_safe_url, pane, plain_url_at,
+    App, GestureOrigin, WindowId, control, is_safe_url, multi_click_ms, pane, plain_url_at,
     term_lock,
 };
 
@@ -295,6 +297,13 @@ pub(crate) struct HoverMemo {
     /// (`crate::path_link::Looks`). An unsettled memo answers nothing, so the
     /// next pointer event or frame asks again and finds the look's answer.
     settled: bool,
+    /// The status sweep's naming of the group in front (`program_pgid`,
+    /// `program`) a citation under the cell was answered under, `None` when
+    /// none was asked. A citation's answer turns on it ([`App::resolve_citation`])
+    /// while nothing on screen moves (a build exits, the shell's name lands a
+    /// sweep later), so the sweep re-asks a memo whose naming it has moved
+    /// ([`App::reask_renamed_hovers`]).
+    named: Option<(i32, Option<String>)>,
 }
 
 /// The engine fill a window's frame stands on: the hover memo's epoch. Read from the
@@ -388,6 +397,23 @@ impl HoverMemo {
             .map(|target| target.path.as_path())
     }
 
+    /// Whether this memo answered a citation for `session` under a naming of the
+    /// group in front other than `named` (`program_pgid`, `program`): the
+    /// status sweep's cue to re-ask it ([`App::reask_renamed_hovers`]).
+    pub(crate) fn renamed(&self, session: u64, named: (i32, Option<&str>)) -> bool {
+        self.answered_citation_of(session)
+            && self
+                .named
+                .as_ref()
+                .is_some_and(|(group, program)| (*group, program.as_deref()) != named)
+    }
+
+    /// Whether this memo answered a citation for `session` (it holds the naming it
+    /// was answered under).
+    pub(crate) fn answered_citation_of(&self, session: u64) -> bool {
+        self.session == session && self.named.is_some()
+    }
+
     /// Whether this memo answers for the pointer as the frame finds it: the front
     /// `session`, the window cell the pointer last rested on, its modifier, and the engine
     /// fill the frame just landed. The frame-time refresh's gate
@@ -437,6 +463,25 @@ pub(crate) fn commit_presented_caption(
     }
 }
 
+/// A URL a press reads under the pointer ([`App::open_link_under_pointer`]), by
+/// where it came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PressedUrl<'a> {
+    /// The cell's OSC 8 hyperlink: its visible text need not be its URL, so
+    /// only a drawn caption discloses where it goes.
+    Osc8(&'a str),
+    /// A plain-text URL run, drawn in full: its own disclosure.
+    Plain(&'a str),
+}
+
+impl<'a> PressedUrl<'a> {
+    fn url(self) -> &'a str {
+        match self {
+            Self::Osc8(url) | Self::Plain(url) => url,
+        }
+    }
+}
+
 /// Whether a press that reads `url` (a URL under the pointer) or `citation`
 /// (a resolved file citation, with no URL there) may open it, given the
 /// caption drawn for the pressed cell (`shown`, `None` when none was).
@@ -444,18 +489,21 @@ pub(crate) fn commit_presented_caption(
 /// and column: never unseen (no caption drawn yet, a look that came back
 /// after the frame), never under a URL's caption, never once the target
 /// moved under a still pointer. A URL under a caption opens only when it is
-/// the URL the caption named; with no caption drawn it opens as before (a
-/// plain URL drawn in full is its own disclosure). Nothing to open admits
-/// the press, which then opens nothing.
+/// the URL the caption named. With no caption drawn, only a plain-text URL
+/// opens (drawn in full, it is its own disclosure); an OSC 8 link, whose
+/// text need not be its URL, does not (a window too narrow for the band, no
+/// free row for it). Nothing to open admits the press, which then opens
+/// nothing.
 pub(crate) fn caption_admits(
     shown: Option<&CaptionNames>,
-    url: Option<&str>,
+    url: Option<PressedUrl<'_>>,
     citation: Option<&crate::path_link::PathTarget>,
 ) -> bool {
     match (shown, url, citation) {
-        (Some(CaptionNames::Url(named)), Some(url), _) => **named == *url,
+        (Some(CaptionNames::Url(named)), Some(url), _) => **named == *url.url(),
         (Some(CaptionNames::Citation { .. }), Some(_), _) => false,
-        (None, Some(_), _) => true,
+        (None, Some(PressedUrl::Plain(_)), _) => true,
+        (None, Some(PressedUrl::Osc8(_)), _) => false,
         (Some(CaptionNames::Citation { path, line, col }), None, Some(target)) => {
             target.path == *path && target.line == *line && target.col == *col
         }
@@ -521,6 +569,9 @@ pub(crate) struct CitationProbe {
     /// The command the shell says it is running (`status detail=`), `None`
     /// at its prompt or with no shell integration.
     running: Option<String>,
+    /// The shell's integration says a command runs (`quit_safety::shell_executing`:
+    /// a block it opened is executing), whether or not it names the command.
+    executing: bool,
     /// Where no foreground group can be read (a ConPTY): whether the shell's
     /// own integration says it runs nothing but itself or an agent here
     /// ([`shell_reads_local`]).
@@ -531,7 +582,10 @@ impl CitationProbe {
     fn new(t: &Terminal, span: crate::path_link::PathSpan) -> Self {
         use crate::cwd_native::ReportedCwd as _;
         let running = crate::session_status::executing_detail(t);
-        let shell_reads_local = shell_reads_local(t.current_block().is_some(), running.as_deref());
+        let shell_reads_local = shell_reads_local(
+            t.current_block().is_some() && crate::quit_safety::shell_reports_commands(t),
+            running.as_deref(),
+        );
         Self {
             span,
             osc7: t
@@ -540,6 +594,7 @@ impl CitationProbe {
             osc7_host: t.reported_cwd_host().map(String::from),
             osc7_seq: t.reported_cwd_seq(),
             running,
+            executing: crate::quit_safety::shell_executing(t),
             shell_reads_local,
         }
     }
@@ -547,21 +602,26 @@ impl CitationProbe {
 
 /// Where no foreground group can be read (a ConPTY has no `tcgetpgrp`), the
 /// shell's own integration is the only reading of what runs: an integrated
-/// shell (`integrated`: it opened a block) at its prompt, or running a shell
-/// or an agent aterm names by its command's word (`running`, `status
-/// detail=`). No integration, or any other command, is no reading (fail
-/// closed).
+/// shell that reports its commands (`integrated`: it opened a block, and a
+/// command it began has ended, `quit_safety::shell_reports_commands`) at its
+/// prompt, or running an agent aterm names by its command's word, or a bare
+/// shell (`running`, `status detail=`). An integration that marks only its
+/// prompts (pwsh without PSReadLine, cmd.exe's prompt tier) never says a
+/// command runs, so its prompt is no reading; nor is a shell given a command
+/// (`bash -c 'ssh h'`, `pwsh -c ssh h`), or any other command (fail closed).
 pub(crate) fn shell_reads_local(integrated: bool, running: Option<&str>) -> bool {
     match running {
         None => integrated,
         Some(command) => {
-            let word = command.split_whitespace().next().unwrap_or("");
+            let mut words = command.split_whitespace();
+            let word = words.next().unwrap_or("");
             let word = word.rsplit(['/', '\\']).next().unwrap_or(word);
             let word = word
                 .strip_suffix(".exe")
                 .or_else(|| word.strip_suffix(".EXE"))
                 .unwrap_or(word);
-            crate::quit_safety::is_shell_name(word) || aterm_phase::program_of(word).is_some()
+            (crate::quit_safety::is_shell_name(word) && words.next().is_none())
+                || aterm_phase::program_of(word).is_some()
         }
     }
 }
@@ -570,7 +630,7 @@ pub(crate) fn shell_reads_local(integrated: bool, running: Option<&str>) -> bool
 /// convention — and Ctrl on every other platform, because Linux/X11 desktops grab
 /// the Super (Windows) key, so a Super-click would never reach aterm. Mirrors the
 /// keybinding accelerator choice (Ctrl/Ctrl+Shift on Linux).
-pub(crate) fn link_modifier_held(mods: winit::keyboard::ModifiersState) -> bool {
+pub(crate) fn link_modifier_held(mods: aterm_window::keyboard::ModifiersState) -> bool {
     #[cfg(target_os = "macos")]
     {
         mods.super_key()
@@ -599,7 +659,7 @@ pub(crate) fn press_starts_selection(tracking: bool, bypass_held: bool) -> bool 
 /// follows here, and the only one left where the window manager takes Alt+drag
 /// (Xfce, Cinnamon, MATE, KDE). macOS keeps Shift-click for the program, as
 /// Terminal.app and iTerm2 do.
-pub(crate) fn tracking_bypass_held(mods: winit::keyboard::ModifiersState) -> bool {
+pub(crate) fn tracking_bypass_held(mods: aterm_window::keyboard::ModifiersState) -> bool {
     mods.alt_key() || (cfg!(not(target_os = "macos")) && mods.shift_key())
 }
 
@@ -777,6 +837,80 @@ struct PointerGeometry {
     head: usize,
 }
 
+/// WHERE THE POINTER CAME TO REST over a window's native views, and what it saw
+/// there: the control under it ([`crate::native_ui::HitRegion`]) in the frame
+/// painted when it moved to `px`, or nothing. A motion event at the same pixel is
+/// no motion — macOS queues one ahead of every press, release and wheel event —
+/// so it keeps what the pointer saw when it last really moved, whatever the
+/// layout did since; a scroll the person asked for forgets it, since they
+/// watched the page move ([`App::dispatch_native_event`]). Where a control that
+/// asks for a look ([`crate::native_ui::Control::look_first`]) is either end —
+/// the one pressed, or the one the pointer came to rest on — the press lands
+/// only where the pointer saw that very control, as the Autopilot menu's press
+/// does (`AutopilotMenu::press_lands`): a bulk button never takes a press meant
+/// for a row's, nor a row's button a press meant for a bulk one. Field reads and
+/// one key clone per real move.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct NativePointerRest {
+    px: (f64, f64),
+    seen: Option<(crate::tab_model::ViewId, crate::native_ui::UiKey)>,
+    /// Whether what it saw asks for a look.
+    asks: bool,
+}
+
+impl NativePointerRest {
+    /// The rest after a motion to `px` that sees `seen` (and whether that asks
+    /// for a look): a new one where the pointer moved (or rested nowhere yet),
+    /// else `rest` as it was.
+    fn after_motion(
+        rest: Option<Self>,
+        px: (f64, f64),
+        seen: Option<(crate::tab_model::ViewId, &crate::native_ui::UiKey, bool)>,
+    ) -> Option<Self> {
+        match rest {
+            Some(rest) if rest.px == px => Some(rest),
+            _ => Some(Self {
+                px,
+                asks: seen.is_some_and(|(_, _, asks)| asks),
+                seen: seen.map(|(view, key, _)| (view, key.clone())),
+            }),
+        }
+    }
+
+    /// Whether a press at `px` on `view`'s control `key` (which `asks` for a
+    /// look or not) goes where the pointer looked: no rest known (a scroll
+    /// forgot it), the pointer moved since (another pixel), neither the
+    /// control nor what the pointer saw asks for a look, or it saw this very
+    /// control when it came to rest.
+    fn looked_at(
+        rest: Option<&Self>,
+        px: (f64, f64),
+        (view, key, asks): (crate::tab_model::ViewId, &crate::native_ui::UiKey, bool),
+    ) -> bool {
+        rest.is_none_or(|rest| {
+            rest.px != px
+                || !(asks || rest.asks)
+                || rest
+                    .seen
+                    .as_ref()
+                    .is_some_and(|(seen_view, seen)| *seen_view == view && seen == key)
+        })
+    }
+
+    /// The rest on `view`'s control `key`, at `px`, after a press it refused:
+    /// the next press there takes it.
+    fn on(
+        px: (f64, f64),
+        (view, key, asks): (crate::tab_model::ViewId, &crate::native_ui::UiKey, bool),
+    ) -> Self {
+        Self {
+            px,
+            seen: Some((view, key.clone())),
+            asks,
+        }
+    }
+}
+
 /// Every input of the pixel → pane-local cell mapping other than the pixel, plus the
 /// session the cell is reported to. The same-pixel early return in
 /// [`App::route_cursor_moved`] may stand on the last routing only while this is unchanged:
@@ -810,17 +944,50 @@ struct MouseCellMapping {
     pane_rect: (u16, u16, u16, u16),
 }
 
-/// The `pointer` verb's answer: the cell the front window's pointer resolved to
-/// ([`App::pointer_cmd`]) and its window pixel ([`App::pointer_px`]), or why not.
-pub(crate) type PointerReply = Result<(Option<(i32, u16)>, Option<(i32, i32)>), String>;
+/// The `pointer` verb's answer: where the front window's pointer resolved to, read
+/// back after the real path ran ([`App::pointer_reply`]), or why not.
+pub(crate) type PointerReply = Result<PointerAt, String>;
+
+/// Where the front window's pointer IS, as the `pointer` verb says it (cs-25): no
+/// position; a window cell (a terminal front, a negative row a chrome row) with its
+/// window pixel; or over a native view, the view, the point in its own logical
+/// coordinates, the control under it and the window pixel. A native front never
+/// answers a grid cell its pointer did not resolve to (it said `at=0,0`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PointerAt {
+    Absent,
+    Grid {
+        cell: (i32, u16),
+        px: Option<(i32, i32)>,
+    },
+    Native {
+        view: u64,
+        x: f32,
+        y: f32,
+        key: Option<String>,
+        px: Option<(i32, i32)>,
+    },
+}
+
+/// What a `pointer move` on a native view aims at: a control by its UI key
+/// (its rect's centre in the presented tree), or a point in the view's own
+/// logical coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum NativePointerTarget {
+    Key(String),
+    Point(f32, f32),
+}
 
 /// What the `pointer` verb asks of the front window's pointer. Each variant is the
 /// winit event it stands in for, so [`App::pointer_cmd`] has one call to make per
 /// arm and no pointer behaviour of its own to keep in step.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PointerAction {
     /// `WindowEvent::CursorMoved` onto the centre of terminal cell `(row, col)`.
     Move { row: u16, col: u16 },
+    /// `WindowEvent::CursorMoved` onto a native view's control or point, in the
+    /// presented tree ([`NativePointerTarget`]).
+    MoveNative(NativePointerTarget),
     /// `WindowEvent::CursorMoved` onto the centre of column `col` of the chrome row `up`
     /// rows above the grid's first row (`1` the row right above it, the message band's last
     /// row when one is up): the rows `move -<up> <col>` names.
@@ -835,12 +1002,12 @@ pub(crate) enum PointerAction {
     Status,
     /// `WindowEvent::ModifiersChanged`: the modifier keys the window holds from now on,
     /// so a scripted hover or click sees the hand a held Cmd (Ctrl elsewhere) offers.
-    Mods(winit::keyboard::ModifiersState),
+    Mods(aterm_window::keyboard::ModifiersState),
 }
 
 impl App {
-    // ---- The overlay card plumbing (palette, session picker, connection map,
-    // connection card): one body each, parameterised only by what names the card.
+    // ---- The overlay CARD plumbing (palette, session picker, Overview): one
+    // body each, parameterised only by what names the card.
 
     /// Put `overlay` in `wid`'s one overlay slot (structural mutual exclusion)
     /// and arm the pointer as every overlay card opens: the wheel residual is
@@ -895,7 +1062,28 @@ impl App {
             closed = true;
         }
         self.overlay_a11y_update();
-        if closed && let Some((x, y)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) {
+        if closed {
+            self.replay_held_pointer(wid);
+        }
+    }
+
+    /// Re-resolve the cursor where the pointer last moved, after the surface
+    /// under it changed (an overlay card or the palette closed), ONLY while the
+    /// window still holds the pointer ([`crate::WindowState`]'s
+    /// `pointer_position_known`). A pointer that left the window, or never
+    /// entered it (a keyboard-only session, a headless window), has no position
+    /// to replay: the memo then holds where it left, or `(0, 0)`, and the motion
+    /// path would claim the pointer again and light whatever sits there. Closing
+    /// the palette by keyboard lit the strip's first tab, its hover wash and its
+    /// `✕`, with no pointer in the window (the 2026-10-18 judges'
+    /// `strip-phantom-hover-after-overlay`).
+    pub(crate) fn replay_held_pointer(&mut self, wid: WindowId) {
+        if let Some((x, y)) = self
+            .windows
+            .get(&wid)
+            .filter(|ws| ws.pointer_position_known)
+            .map(|ws| ws.last_cursor_px)
+        {
             self.on_cursor_moved(wid, x, y);
         }
     }
@@ -1717,6 +1905,7 @@ impl App {
     /// `divider_drag`/`selecting` stay wedged and every motion keeps resizing or selecting
     /// under the modal.
     pub(crate) fn settle_pointer_drags(&mut self, wid: WindowId) {
+        self.scrollbar_release(wid);
         if self.finish_divider_drag(wid)
             && let Some(ws) = self.windows.get_mut(&wid)
         {
@@ -1997,7 +2186,21 @@ impl App {
         let Some(wid) = self.frontmost_window else {
             return Err("no window".into());
         };
+        // A native front in a window with no glass (headless, no video take) has
+        // never presented a frame for the glass-commit guard to stand on; it
+        // commits the one a capture of it shows first, so a pointer reaches the
+        // same tree `image` renders (cs-25).
+        if matches!(
+            action,
+            PointerAction::Move { .. } | PointerAction::MoveNative(_) | PointerAction::Click
+        ) {
+            let _ = self.commit_glassless_native_frame(wid);
+        }
         match action {
+            PointerAction::MoveNative(target) => {
+                let (x, y) = self.native_pointer_target_px(wid, &target)?;
+                self.on_cursor_moved(wid, x, y);
+            }
             PointerAction::Move { row, col } => {
                 let (x, y) = self
                     .cell_centre_px(wid, row, col)
@@ -2070,6 +2273,121 @@ impl App {
         Ok(self.pointer_readback(wid))
     }
 
+    /// The `pointer` verb's answer after [`Self::pointer_cmd`] ran: over a native
+    /// view of the front window, the view, the logical point and the control there
+    /// ([`PointerAt::Native`]); over a terminal, the window cell; `ERR` where a
+    /// native front has no presented frame under the pointer, never a cell the
+    /// pointer did not resolve to.
+    pub(crate) fn pointer_reply(&self, cell: Option<(i32, u16)>) -> PointerReply {
+        let px = self.pointer_px();
+        let Some(cell) = cell else {
+            return Ok(PointerAt::Absent);
+        };
+        let Some(wid) = self.frontmost_window else {
+            return Err("no window".into());
+        };
+        if let Some((x, y)) = self
+            .windows
+            .get(&wid)
+            .filter(|ws| ws.pointer_position_known)
+            .map(|ws| ws.last_cursor_px)
+            && let Some((artifact, local_x, local_y)) =
+                self.retained_native_leaf_at_pointer(wid, x, y)
+        {
+            let key = artifact
+                .compiled
+                .hit_test(local_x, local_y)
+                .map(|hit| hit.key.as_str().to_string());
+            return Ok(PointerAt::Native {
+                view: artifact.view.get(),
+                x: local_x,
+                y: local_y,
+                key,
+                px,
+            });
+        }
+        if self.active_native_view(wid).is_some()
+            && !self.active_tab_has_multiple_visible_panes(wid)
+        {
+            return Err("no presented native frame under the pointer".into());
+        }
+        Ok(PointerAt::Grid { cell, px })
+    }
+
+    /// Commit the frame a capture of `wid` shows as the presented one, where the
+    /// window has no glass to present on — no OS window and no video take
+    /// (`PresentTarget::Virtual`) — and a native view is in front: the shipping
+    /// twin of the tests' `prepare_presented_native`. The glass-commit rule
+    /// (input lands only on what was shown) is kept: a glassless window has no
+    /// other observer frame, and the staged tree is exactly what `image`
+    /// renders. `false` with glass, or with nothing native to commit.
+    pub(crate) fn commit_glassless_native_frame(&mut self, wid: WindowId) -> bool {
+        if !self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.os_window.is_none() && ws.present.is_none())
+        {
+            return false;
+        }
+        let Some((_, view)) = self.active_native_view(wid) else {
+            return false;
+        };
+        if !self.prepare_native_input_scratch(wid) {
+            return false;
+        }
+        let Some(raster) = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.leaf_render_cache.get_mut(&view))
+            .and_then(|cache| cache.native.as_mut())
+        else {
+            return false;
+        };
+        raster.presented = true;
+        true
+    }
+
+    /// The window pixel a `pointer move` on a native view aims at: a control's
+    /// rect centre in the presented tree, or a logical point of the view, mapped
+    /// through the presented leaf's destination and scale.
+    fn native_pointer_target_px(
+        &self,
+        wid: WindowId,
+        target: &NativePointerTarget,
+    ) -> Result<(f64, f64), String> {
+        let (_, view) = self
+            .active_native_view(wid)
+            .ok_or("the front tab is not a native view")?;
+        let plan = self
+            .active_visible_leaf_plan(wid)
+            .ok_or("no presented native frame to aim at")?;
+        let artifact = self
+            .retained_native_leaf_artifact_from_plan(wid, view, true, &plan)
+            .ok_or("no presented native frame to aim at")?;
+        let (x, y) = match target {
+            NativePointerTarget::Key(key) => {
+                let rect = artifact
+                    .compiled
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == key)
+                    .map(|node| node.clip)
+                    .filter(|clip| clip.width > 0.0 && clip.height > 0.0)
+                    .ok_or_else(|| format!("{key} is not on the presented page"))?;
+                (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
+            }
+            NativePointerTarget::Point(x, y) => (*x, *y),
+        };
+        let px = artifact.device_x as f64 + f64::from(x) * artifact.scale;
+        let py = artifact.device_y as f64 + f64::from(y) * artifact.scale;
+        if !(0.0..f64::from(artifact.width)).contains(&(px - artifact.device_x as f64))
+            || !(0.0..f64::from(artifact.height)).contains(&(py - artifact.device_y as f64))
+        {
+            return Err("the point is outside the native view".into());
+        }
+        Ok((px, py))
+    }
+
     /// The front window's pointer as a window pixel (rounded), or `None` when it
     /// holds no position: the `pointer` verb's `px=`.
     pub(crate) fn pointer_px(&self) -> Option<(i32, i32)> {
@@ -2083,6 +2401,50 @@ impl App {
             reason = "a window pixel, rounded; the saturating cast clamps any nonsense"
         )]
         Some((x.round() as i32, y.round() as i32))
+    }
+
+    /// THE ONE OWNER OF NATIVE HOVER: set `hit`'s control as hovered in its view
+    /// and none in every other visible native view of `wid`'s active tab (hover
+    /// is view-owned even in a native/native split), dirtying only the views
+    /// whose hovered control changed. The motion path and the pointer's leaving
+    /// the window (`None`) both go through it.
+    fn apply_native_hover(
+        &mut self,
+        wid: WindowId,
+        hit: Option<(crate::tab_model::ViewId, crate::native_ui::UiKey)>,
+    ) {
+        let visible_native_views = self
+            .active_visible_leaf_plan(wid)
+            .map(|plan| {
+                plan.leaves
+                    .into_iter()
+                    .filter_map(|leaf| {
+                        matches!(
+                            self.view_store.get(leaf.view),
+                            Some(crate::tab_model::View::Native(_))
+                        )
+                        .then_some(leaf.view)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut hover_changed = Vec::new();
+        for target in visible_native_views {
+            let desired = hit
+                .as_ref()
+                .filter(|(hit_view, _)| *hit_view == target)
+                .map(|(_, key)| key.clone());
+            if let Some(state) = self.native_runtime.view_state_mut(target)
+                && state.common().hovered != desired
+            {
+                state.common_mut().hovered = desired;
+                hover_changed.push(target);
+            }
+        }
+        for target in hover_changed {
+            self.invalidate_native_view_cache(wid, target, crate::native_app::DamageRegion::All);
+            self.request_redraw_all_windows();
+        }
     }
 
     /// Where window `wid`'s pointer is, read back from the pixel the last
@@ -2460,11 +2822,7 @@ impl App {
             crate::tab_bar::hit_test(segs, col)
         });
         let hovered = match hit {
-            // The connector (status-mark cell) is part of its chip, so hovering it keeps the
-            // chip's hover.
-            Some(
-                crate::tab_bar::TabHit::Select(index) | crate::tab_bar::TabHit::Connector(index),
-            ) => Some(index),
+            Some(crate::tab_bar::TabHit::Select(index)) => Some(index),
             // The `+` and the `↻` are not tabs; the pointer is in the strip but
             // on no tab, so nothing reveals a `✕`.
             _ => None,
@@ -2538,8 +2896,7 @@ impl App {
         let gesture = ws.selecting
             || ws.held_mouse_button.is_some()
             || ws.divider_drag.is_some()
-            || ws.strip_drag.is_some()
-            || self.conn_drag.is_some();
+            || ws.strip_drag.is_some();
         let edge = if frame.edges && !gesture {
             ws.win_px.and_then(|size| {
                 crate::client_frame::edge_at(
@@ -2598,7 +2955,7 @@ impl App {
     fn frame_margins(
         &self,
         wid: WindowId,
-        size: winit::dpi::PhysicalSize<u32>,
+        size: aterm_window::dpi::PhysicalSize<u32>,
     ) -> crate::client_frame::FrameMargins {
         let geom = self.pointer_geometry(wid);
         let (ox, oy) = self.frame_origin_with(wid, geom);
@@ -2626,12 +2983,24 @@ impl App {
     /// lit (a `+` wash, a `✕` on a chip nobody points at). Change-gated like the tracker; the
     /// redraw re-runs `splice_tab_strip_with`, whose cache key carries the flags.
     pub(crate) fn on_cursor_left(&mut self, wid: WindowId) {
+        // A native view's hovered control is the same shape of stale claim: its
+        // wash, and a Settings cursor-style row's preview, would go on showing
+        // what the pointer is no longer over (cs-25). One owner clears it, the
+        // one the motion path sets it through.
+        self.apply_native_hover(wid, None);
+        let native_front = self.active_native_view(wid).is_some();
+        if native_front && let Some(ws) = self.windows.get_mut(&wid) {
+            ws.hover_pointer = false;
+            ws.native_text_cursor = false;
+        }
         // The link caption is the same shape of stale claim: it names what a
         // click on the cell the pointer was over would open, and there is no
         // pointer over that cell any more.
         self.retire_link_target(wid);
         // So is a hovered Claude Code chip's title (`crate::claude_lights`).
         self.clear_claude_light_hover(wid);
+        // …and a widened scrollbar (`crate::pane_chrome`).
+        self.scrollbar_pointer_left(wid);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -2767,13 +3136,31 @@ impl App {
         None
     }
 
+    /// [`Self::find_bar_click_at`] by cell alone: the well maps cell to character.
+    #[cfg(test)]
+    pub(crate) fn find_bar_click(&mut self, wid: WindowId, row: u16, col: u16) -> bool {
+        self.find_bar_click_at(wid, row, col, None)
+    }
+
     /// A left click on the Cmd-F find panel. On the `Aa` (case) / `.*` (regex) indicators it
     /// fires the same toggle as ⌥⌘C / ⌥⌘R; inside the query well it moves the caret to the
     /// character under the pointer (past the text ⇒ the end). `row`/`col` are terminal cell
     /// coordinates (`pixel_to_cell`), matching what `splice_find_bar` recorded in
     /// [`crate::FindBarHit`]. `false` when not searching or off the panel; a click elsewhere
     /// on the panel's band is consumed, since a drag there would select the panel's own text.
-    pub(crate) fn find_bar_click(&mut self, wid: WindowId, row: u16, col: u16) -> bool {
+    ///
+    /// `x` is the press's window pixel, which the query box of the bar's Fluent face
+    /// (`find_bar::fluent_bar`) maps through: its query is set in the UI face, so a character
+    /// is not a cell, and the click lands on the character boundary nearest the pointer
+    /// (`find_bar::well_click`), anywhere in the box. Without a pixel, or where the bar is its
+    /// cells, the well maps cell to character.
+    pub(crate) fn find_bar_click_at(
+        &mut self,
+        wid: WindowId,
+        row: u16,
+        col: u16,
+        x: Option<f64>,
+    ) -> bool {
         let Some(hit) = self
             .windows
             .get(&wid)
@@ -2781,18 +3168,28 @@ impl App {
         else {
             return false;
         };
-        let row = row as usize;
-        if !hit.band.contains(&row) {
+        let (row, col) = (row as usize, col as usize);
+        // In a split the panel covers the focused pane's columns only.
+        if !hit.band.contains(&row) || !hit.cols.contains(&col) {
             return false;
         }
         if row != hit.row {
             return true; // the panel's pad / hints rows: inert chrome, but consumed
         }
-        let col = col as usize;
-        if hit.case_cols.is_some_and(|r| r.contains(&col)) {
+        let on =
+            |span: &Option<std::ops::Range<usize>>| span.as_ref().is_some_and(|r| r.contains(&col));
+        if on(&hit.case_cols) {
             self.search_toggle_case();
-        } else if hit.regex_cols.is_some_and(|r| r.contains(&col)) {
+        } else if on(&hit.regex_cols) {
             self.search_toggle_regex();
+        } else if on(&hit.prev_cols) || on(&hit.next_cols) {
+            // The toolbar's arrows are Shift+F3 / F3 (`find_bar::FIND_TOOLBAR`).
+            self.search_repeat_in(wid, on(&hit.next_cols));
+        } else if on(&hit.close_cols) {
+            // `✕` is Esc: cancel, the viewport back where find began.
+            self.search_cancel_in(wid);
+        } else if let Some(slot) = x.and_then(|x| self.find_box_slot(wid, &hit, x)) {
+            self.search_click_caret_in(wid, slot);
         } else if hit.field_cols.contains(&col) {
             // The well's first cell shows character `field_scroll`, so the click's
             // distance into it is the character index — the same mapping the paint used.
@@ -2801,19 +3198,40 @@ impl App {
         true
     }
 
-    /// Pixel gate for [`Self::find_bar_click`]: `true` only when window pixel `(x, y)` is
+    /// The caret slot a press at window pixel `x` asks for in the query box of the find bar's
+    /// Fluent face (`find_bar::well_click`), from the scroll the paint recorded; `None` off
+    /// the box, or where the bar is its cells (`find_bar::fluent_ready`).
+    fn find_box_slot(&self, wid: WindowId, hit: &crate::FindBarHit, x: f64) -> Option<usize> {
+        let ws = self.windows.get(&wid)?;
+        let query = ws.search.as_ref()?.query.as_str();
+        let (cell_w, cell_h) = self.win_cell_size(wid);
+        let (ox, _) = self.frame_origin(wid);
+        let col0 = hit.cols.start;
+        let panel_x = x - ox as f64 - (self.win_pad(wid) + col0 * cell_w) as f64;
+        let field =
+            hit.field_cols.start.saturating_sub(col0)..hit.field_cols.end.saturating_sub(col0);
+        let geom = crate::find_bar::FluentGeom {
+            cell_w,
+            cell_h,
+            scale: ws.scale as f32,
+        };
+        crate::find_bar::well_click(query, hit.field_scroll, &field, geom, panel_x as f32)
+    }
+
+    /// Pixel gate for [`Self::find_bar_click_at`]: `true` only when window pixel `(x, y)` is
     /// inside the find bar's cell band, not merely on the row [`Self::pixel_to_cell`] clamps
     /// it to (a click in the top `pad_top` border snaps to row 0, the bar's usual row; one in
     /// the bottom `pad` to the last row). On the frame's y-axis the band starts at
     /// `pad_top + head + frame_row * ch` and spans `rows * ch`, with
     /// `frame_row = chrome_rows + hit.band.start` as `splice_find_bar` placed it; the x-check
-    /// rejects clicks past the grid's right edge. No bar ⇒ `false`.
+    /// admits the panel's own columns only (`hit.cols`: the grid, or a split's focused pane),
+    /// so clicks past the grid's right edge or on a sibling pane miss. No bar ⇒ `false`.
     pub(crate) fn find_bar_pixel_hit(&self, wid: WindowId, x: f64, y: f64) -> bool {
-        let Some(band) = self
+        let Some((band, cols)) = self
             .windows
             .get(&wid)
             .and_then(|ws| ws.find_bar_hit.as_ref())
-            .map(|h| h.band.clone())
+            .map(|h| (h.band.clone(), h.cols.clone()))
         else {
             return false;
         };
@@ -2821,7 +3239,6 @@ impl App {
         let (cw, ch) = (cw.max(1), ch.max(1));
         let pad = self.win_pad(wid);
         let pad_top = self.win_pad_top(wid);
-        let cols = self.windows.get(&wid).map_or(0, |ws| ws.cols) as usize;
         // Unclamped frame coordinates: `window_to_frame` clamps at 0, which would land a
         // click above the frame (the top pad over a top-anchored bar) in the row-0 band.
         let (ox, oy) = self.frame_origin(wid);
@@ -2833,9 +3250,10 @@ impl App {
             return false;
         }
         // Reject clicks past the right edge — `pixel_to_cell` would clamp their column
-        // onto the last grid cell, which can land on an indicator span.
+        // onto the last grid cell, which can land on an indicator span — and, in a
+        // split, clicks on the sibling beside the panel's pane.
         let gx = (fx as usize).saturating_sub(pad);
-        (gx / cw) < cols
+        cols.contains(&(gx / cw))
     }
 
     /// Resolve the OS cursor for the pointer's current location. Called on every
@@ -2993,13 +3411,6 @@ impl App {
         {
             return Resolved(None);
         }
-        // A connector drag owns the pointer for the gesture's lifetime
-        // (`conn_drag_motion` set the grab cursor once at its start and the
-        // motion ladder returns at its arm): re-resolving mid-drag would swap
-        // the grab for an I-beam and caption a link the drop cannot reach.
-        if self.conn_drag.is_some() {
-            return Resolved(None);
-        }
         // A native view owns its cursor through the motion path's native branch (I-beam over
         // text bodies, hand over controls); a modifier tap must not stomp it.
         if self.active_native_view(wid).is_some() {
@@ -3132,6 +3543,10 @@ impl App {
             // A citation is resolved here, with the terminal let go (the frame's own hold
             // aside). The filesystem is looked at off this thread, waited on for a moment
             // at most (`path_link::Looks`): a look not back by then is no link yet.
+            // The naming is read BEFORE the answer: one that moves in between leaves
+            // the memo with the older naming, which the sweep re-asks (never the
+            // newer, which would hide an answer given under the older one).
+            let named = citation.as_ref().and_then(|_| self.front_naming(session));
             let looked = citation.map(|probe| self.resolve_citation(session, probe));
             let settled = !matches!(looked, Some(None));
             let target = looked.flatten().flatten();
@@ -3156,6 +3571,7 @@ impl App {
                 path_link,
                 citation,
                 settled,
+                named,
             });
         }
         let Some(ws) = self.windows.get_mut(&wid) else {
@@ -3287,12 +3703,9 @@ impl App {
         if view != expected_view {
             return false;
         }
-        let Some(document) = self.native_runtime.document_id(instance) else {
+        if self.native_runtime.document_id(instance).is_none() {
             return false;
-        };
-        let Some(snapshot) = self.document_store.snapshot(document) else {
-            return false;
-        };
+        }
         let Some(crate::native_app::AppViewState::Editor(state)) =
             self.native_runtime.view_state_mut(view)
         else {
@@ -3301,7 +3714,20 @@ impl App {
         let Some(buffer) = state.buffer.as_mut() else {
             return false;
         };
-        let changed = buffer.pointer_select(&snapshot.text, byte, extend, visible_lines);
+        // The pointer reaches the buffer through amacs's input reducer, the
+        // one path the keys take too.
+        let changed = self
+            .editor_workspace
+            .handle_input(
+                &mut self.document_store,
+                buffer,
+                amacs::input::EditorInput::Pointer {
+                    byte,
+                    extend,
+                    visible_lines,
+                },
+            )
+            .is_ok_and(|reduction| reduction.follow != amacs::input::Follow::Ignored);
         if changed {
             state.common.presentation_revision =
                 state.common.presentation_revision.saturating_add(1);
@@ -3339,11 +3765,7 @@ impl App {
                 || ws.held_mouse_button.is_some()
                 || ws.divider_drag.is_some()
                 || ws.strip_drag.is_some()
-        }) || self
-            .conn_drag
-            .as_ref()
-            .is_some_and(|drag| !drag.native && drag.src_window == wid)
-        {
+        }) {
             self.clear_move_license(wid);
         }
         // The same pixel again: macOS synthesises a `CursorMoved` before every wheel event
@@ -3354,11 +3776,10 @@ impl App {
         //
         // Only while nothing has changed the answer: the last decision reached the grid
         // (`hover_grid_owned`) and no modal, tab menu or native view has taken the pointer
-        // since; no held button, selection, divider or connector drag; the pointer has not left
+        // since; no held button, selection or divider drag; the pointer has not left
         // (`pointer_position_known`); and the mapping is unchanged (`hover_mapping`, which the
         // keyboard can move without a pointer event). Cheap terms first.
-        if self.conn_drag.is_none()
-            && self.active_native_view(wid).is_none()
+        if self.active_native_view(wid).is_none()
             && self.windows.get(&wid).is_some_and(|ws| {
                 ws.pointer_position_known
                     && ws.hover_grid_owned
@@ -3390,18 +3811,6 @@ impl App {
             // grid arm: every earlier return hands the pointer to another owner, for which
             // the frame-time refresh must not resolve (`hover_grid_owned`).
             ws.hover_grid_owned = false;
-        }
-        // While a connector drag is armed or dragging from this window, motion is its own
-        // (threshold, target tracking, the wire), ahead of every other layer: the strip
-        // already swallowed the press that armed it. Native-origin drags track through
-        // `Wake::ConnDragTo`.
-        if self
-            .conn_drag
-            .as_ref()
-            .is_some_and(|d| !d.native && d.src_window == wid)
-        {
-            self.conn_drag_motion(wid, x, y);
-            return;
         }
         // This window's own frame (`crate::client_frame`): a bare-band press becoming a
         // move, and the resize handles at the window's edges, ahead of every surface
@@ -3443,18 +3852,13 @@ impl App {
             self.autopilot_menu_motion(wid, x, y);
             return;
         }
-        // The connection confirm/configure card and the session picker: the
-        // same one-slot modal boundary.
-        if self.conn_card_claims_pointer(wid) {
-            self.conn_card_pointer_motion(wid, x, y);
-            return;
-        }
+        // The session picker: the same one-slot modal boundary.
         if self.session_picker_claims_pointer(wid) {
             self.session_picker_pointer_motion(wid, x, y);
             return;
         }
-        if self.connection_map_claims_pointer(wid) {
-            self.connection_map_pointer_motion(wid, x, y);
+        if self.overview_claims_pointer(wid) {
+            self.overview_pointer_motion(wid, x, y);
             return;
         }
         let over_pane_header = self.pane_header_at_with(wid, geom, x, y).is_some();
@@ -3488,47 +3892,37 @@ impl App {
                         let is_text = artifact.compiled.semantic(&hit.key).is_some_and(|node| {
                             node.role == crate::native_ui::SemanticRole::TextField
                         });
-                        Some((artifact.view, artifact.generation, hit.key, is_text))
+                        Some((
+                            artifact.view,
+                            artifact.generation,
+                            hit.key,
+                            is_text,
+                            hit.look_first,
+                        ))
                     },
                 )
             };
-            let native_hover = native_hover.filter(|(target, generation, _, _)| {
+            let native_hover = native_hover.filter(|(target, generation, ..)| {
                 self.native_runtime.view_generation(*target) == Some(*generation)
             });
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.native_rest = NativePointerRest::after_motion(
+                    ws.native_rest.take(),
+                    (x, y),
+                    native_hover
+                        .as_ref()
+                        .map(|(view, _, key, _, asks)| (*view, key, *asks)),
+                );
+            }
             let text_field_hovered = native_hover
                 .as_ref()
-                .is_some_and(|(_, _, _, is_text)| *is_text);
-            // Hover is view-owned even in a native/native split. Clear every
-            // formerly hovered sibling that is no longer under the pointer and
-            // dirty only the views whose visual state actually changed.
-            let visible_native_views = self
-                .active_visible_leaf_plan(wid)
-                .map(|plan| {
-                    plan.leaves
-                        .into_iter()
-                        .filter_map(|leaf| {
-                            matches!(
-                                self.view_store.get(leaf.view),
-                                Some(crate::tab_model::View::Native(_))
-                            )
-                            .then_some(leaf.view)
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let mut hover_changed = Vec::new();
-            for target in visible_native_views {
-                let desired = native_hover
+                .is_some_and(|(_, _, _, is_text, _)| *is_text);
+            self.apply_native_hover(
+                wid,
+                native_hover
                     .as_ref()
-                    .filter(|(hit_view, _, _, _)| *hit_view == target)
-                    .map(|(_, _, key, _)| key.clone());
-                if let Some(state) = self.native_runtime.view_state_mut(target)
-                    && state.common().hovered != desired
-                {
-                    state.common_mut().hovered = desired;
-                    hover_changed.push(target);
-                }
-            }
+                    .map(|(view, _, key, ..)| (*view, key.clone())),
+            );
             // Over a native front the band is a hand where a press acts, as over a terminal
             // (`press_band_at` in the native press path); `track_band_hover` lit its chip.
             let band_acts = self
@@ -3541,7 +3935,7 @@ impl App {
                 || (!text_field_hovered
                     && native_hover
                         .as_ref()
-                        .is_some_and(|(_, _, key, _)| key.as_str() != "editor/buffer"));
+                        .is_some_and(|(_, _, key, ..)| key.as_str() != "editor/buffer"));
             if let Some(ws) = self.windows.get_mut(&wid)
                 && (ws.hover_pointer != pointer || ws.native_text_cursor != text_cursor)
             {
@@ -3556,14 +3950,6 @@ impl App {
                         CursorIcon::Default
                     });
                 }
-            }
-            for target in hover_changed {
-                self.invalidate_native_view_cache(
-                    wid,
-                    target,
-                    crate::native_app::DamageRegion::All,
-                );
-                self.request_redraw_all_windows();
             }
             // Over a terminal pane beside the page (or during a gesture its press went
             // to), the motion is that terminal's report: on to the grid ladder, whose
@@ -3623,6 +4009,18 @@ impl App {
                 ws.last_mouse_px_off = px_off;
             }
             self.drag_divider(wid);
+            return;
+        }
+        // The overlay scrollbar (`crate::pane_chrome`): a thumb drag in flight
+        // scrolls its pane, and a bar under the pointer widens. Neither is the
+        // grid's: no hover resolution, selection drag or motion report.
+        if !self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.selecting || ws.held_mouse_button.is_some())
+            && self.scrollbar_pointer_motion(wid, x, y)
+        {
+            self.set_hover_cursor(wid, CursorIcon::Default, false, false);
             return;
         }
         // A gesture begun in content retains its capture while crossing the
@@ -4044,7 +4442,7 @@ impl App {
         }
     }
 
-    /// Advance the `MULTI_CLICK_MS` streak and return the resulting click count (1, 2, 3; a
+    /// Advance the `multi_click_ms` streak and return the resulting click count (1, 2, 3; a
     /// fourth rapid click wraps to 1). The human handler owns this state (`last_press`,
     /// `click_count`); a controller passes an authoritative count without touching it. The
     /// dispatch on the count lives in the seam (`seam_left_press`), shared by both sources.
@@ -4068,7 +4466,7 @@ impl App {
         ws.click_count = match ws.last_press {
             Some((t, cell))
                 if cell == (sel_row, col)
-                    && now.duration_since(t).as_millis() <= MULTI_CLICK_MS =>
+                    && now.duration_since(t).as_millis() <= multi_click_ms() =>
             {
                 ws.click_count % 3 + 1
             }
@@ -4346,7 +4744,14 @@ impl App {
     /// The URL a press at the pointer would open, if any: an (authorized) OSC 8
     /// hyperlink on the cell wins; else a plain-text `http(s)://` URL detected
     /// in the row. `None` wherever a press does not reach the grid at all.
+    #[cfg(test)]
     pub(crate) fn link_under_pointer(&self, wid: WindowId) -> Option<String> {
+        self.sourced_link_under_pointer(wid).map(|(url, _)| url)
+    }
+
+    /// The URL a press at the pointer would open, and whether it is the cell's OSC 8 hyperlink
+    /// (`true`) rather than a plain-text URL run ([`PressedUrl`]).
+    fn sourced_link_under_pointer(&self, wid: WindowId) -> Option<(String, bool)> {
         let ws = self.windows.get(&wid)?;
         let (row, col) = ws.last_mouse_cell;
         let window_row = usize::from(ws.last_mouse_window_cell.0);
@@ -4361,18 +4766,18 @@ impl App {
         // a screen-keyed OSC 8 lookup would name a scrolled-back row's neighbour while the
         // plain-text arm names the row under the pointer.
         term.hyperlink_at_visible(row, col)
-            .map(|url| url.to_string())
+            .map(|url| (url.to_string(), true))
             .or_else(|| {
                 let cells = term.render_row(row as usize);
                 plain_url_at(&cells, col as usize, self.render_knobs.minimum_contrast)
-                    .map(|plain| plain.url)
+                    .map(|plain| (plain.url, false))
             })
     }
 
     /// The file citation a press at the pointer would open (`crate::path_link`): the
     /// plain-text `path[:line[:col]]` or `path#L12` in the row under the pointer,
     /// resolved against the session's own directories to an existing regular file.
-    /// The same gates as [`Self::link_under_pointer`]; the row and the OSC 7 directory
+    /// The same gates as [`Self::sourced_link_under_pointer`]; the row and the OSC 7 directory
     /// are read under one hold, and the filesystem only after it is let go.
     pub(crate) fn path_link_under_pointer(
         &self,
@@ -4396,6 +4801,50 @@ impl App {
         self.resolve_citation(session, probe).flatten()
     }
 
+    /// The status sweep's naming of `session`'s group in front, as its timeline
+    /// holds it now: `(program_pgid, program)`.
+    fn front_naming(&self, session: u64) -> Option<(i32, Option<String>)> {
+        let pooled = self.pool.get(session)?;
+        let timeline = pooled
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let agent = timeline.agent();
+        Some((agent.program_pgid, agent.program.clone()))
+    }
+
+    /// Re-ask every standing hover over `session` whose citation was answered under
+    /// another naming of the group in front ([`HoverMemo::renamed`]): the status
+    /// sweep calls it once it has named the group anew, so a caption refused while a
+    /// build held the front (or while the shell's name was not resolved yet) comes
+    /// back under a still pointer on an idle screen, and the first press under it
+    /// opens. The re-ask is the motion path's (`update_hover_cursor`), so a moved
+    /// answer repaints.
+    pub(crate) fn reask_renamed_hovers(&mut self, session: u64) {
+        let Some(named) = self.front_naming(session) else {
+            return;
+        };
+        let stale: Vec<WindowId> =
+            self.windows
+                .iter()
+                .filter(|(_, ws)| {
+                    ws.pointer_position_known
+                        && ws.hover_grid_owned
+                        && ws.hover_memo.as_ref().is_some_and(|memo| {
+                            memo.renamed(session, (named.0, named.1.as_deref()))
+                        })
+                })
+                .map(|(wid, _)| *wid)
+                .collect();
+        for wid in stale {
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.hover_memo = None;
+            }
+            self.update_hover_cursor(wid);
+        }
+    }
+
     /// Resolve a citation read off `session`'s grid against that session's own
     /// directories, in order: the foreground program's OS working directory (its
     /// `agent_cwd`, the directory an agent shortened its citation against), then the
@@ -4408,12 +4857,12 @@ impl App {
     /// is read afresh (`tcgetpgrp`, through the factory's probe), and the status
     /// sweep's name for it is believed only for that very group and only when it
     /// names a program that runs on this machine ([`crate::path_link::runs_here`]): a
-    /// group it has not named yet, an `ssh`, a `tmux`, a `sudo` is no citation. The
-    /// shell's running command must not be a remote shell (the moment an `exec ssh`
-    /// has not been named yet), and the shell's OSC 7, while it stands
-    /// ([`crate::path_link::report_stands`]), must name this machine. Where no group
-    /// can be read at all (a ConPTY), the shell's own integration stands in
-    /// ([`shell_reads_local`]).
+    /// group it has not named yet, an `ssh`, a `tmux`, a `sudo`, a shell that shares
+    /// its group with what it runs (`SessionFactory::lone_leader`, asked now) is no
+    /// citation. The shell's running command must not be a remote shell, and the
+    /// shell's OSC 7, while it stands ([`crate::path_link::report_stands`]), must name
+    /// this machine. Where no group can be read at all (a ConPTY), the shell's own
+    /// integration stands in ([`shell_reads_local`]).
     pub(crate) fn resolve_citation(
         &self,
         session: u64,
@@ -4427,19 +4876,37 @@ impl App {
         } else {
             -1
         };
-        let (here, witness) = {
+        // The timeline's naming, copied out under its leaf lock; the kernel is
+        // asked of the group's leader only after it is let go.
+        let (named, witness) = {
             let timeline = pooled
                 .ctx
                 .timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             let agent = timeline.agent();
-            let here = if front > 0 {
-                agent.program_pgid == front && crate::path_link::runs_here(agent)
-            } else {
-                cfg!(windows) && probe.shell_reads_local
-            };
-            (here, timeline.cwd_witness())
+            let named = (front > 0 && agent.program_pgid == front).then(|| {
+                (
+                    agent.program.clone(),
+                    crate::harness_host::identified_agent(agent),
+                )
+            });
+            (named, timeline.cwd_witness())
+        };
+        let here = if front > 0 {
+            named.is_some_and(|(program, agent)| {
+                crate::path_link::runs_here(
+                    &crate::path_link::Front {
+                        program: program.as_deref(),
+                        agent,
+                        root: front == pooled.pid,
+                        running: probe.executing || probe.running.is_some(),
+                    },
+                    || (self.session_factory.lone_leader)(front),
+                )
+            })
+        } else {
+            cfg!(windows) && probe.shell_reads_local
         };
         if !here
             || probe
@@ -4466,7 +4933,10 @@ impl App {
             .into_iter()
             .chain(probe.osc7.filter(|_| stands))
             .collect();
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        // The person's home folder, `USERPROFILE` on Windows, which sets no
+        // `HOME`: there `~/…` citations resolved nothing and no caption was
+        // shortened to `~`.
+        let home = aterm_types::dirs::home_dir();
         self.citation_looks
             .target(&probe.span, &bases, home.as_deref())
             .map(Result::ok)
@@ -4486,11 +4956,21 @@ impl App {
     /// only what [`caption_admits`] lets it, against the caption of the last
     /// accepted application present for the cell (`WindowState::shown_caption`),
     /// never a capture or a frame whose present was pending or refused. A citation
-    /// opens only under a caption that named
-    /// that very file, line and column. Otherwise nothing opens and the caption is
-    /// asked again, so the band names what the next press would open.
+    /// opens only under a caption that named that very file, line and column, and
+    /// an OSC 8 link only under one that named its URL (its text need not be its
+    /// URL); a plain-text URL, drawn in full, also with none. Otherwise nothing
+    /// opens and the caption is asked again, so the band names what the next press
+    /// would open.
     pub(crate) fn open_link_under_pointer(&mut self, wid: WindowId) -> bool {
-        let url = self.link_under_pointer(wid);
+        let sourced = self.sourced_link_under_pointer(wid);
+        let pressed = sourced.as_ref().map(|(url, osc8)| {
+            if *osc8 {
+                PressedUrl::Osc8(url)
+            } else {
+                PressedUrl::Plain(url)
+            }
+        });
+        let url = sourced.as_ref().map(|(url, _)| url.clone());
         let path = if url.is_none() {
             self.path_link_under_pointer(wid)
         } else {
@@ -4503,7 +4983,7 @@ impl App {
                 .filter(|shown| shown.session == front && shown.cell == ws.last_mouse_cell)
                 .map(|shown| shown.names.clone())
         });
-        if !caption_admits(shown.as_ref(), url.as_deref(), path.as_ref()) {
+        if !caption_admits(shown.as_ref(), pressed, path.as_ref()) {
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.hover_memo = None;
                 if let Some(w) = &ws.os_window {
@@ -4622,6 +5102,33 @@ impl App {
         );
     }
 
+    /// The innermost node of the native view under window `wid`'s pointer —
+    /// the target of a wheel there ([`crate::native_app::AppEvent::ScrollAt`]).
+    /// `None` where the pointer's place is unknown or over no native view.
+    fn native_scroll_target(&self, wid: WindowId) -> Option<crate::native_ui::UiKey> {
+        let ws = self
+            .windows
+            .get(&wid)
+            .filter(|ws| ws.pointer_position_known)?;
+        let (x, y) = ws.last_cursor_px;
+        let (artifact, local_x, local_y) = self.retained_native_leaf_at_pointer(wid, x, y)?;
+        artifact
+            .compiled
+            .semantics
+            .iter()
+            .filter(|node| {
+                !node.offscreen
+                    && local_x >= node.rect.x
+                    && local_y >= node.rect.y
+                    && local_x < node.rect.right()
+                    && local_y < node.rect.bottom()
+            })
+            .min_by(|a, b| {
+                (a.rect.width * a.rect.height).total_cmp(&(b.rect.width * b.rect.height))
+            })
+            .map(|node| node.key.clone())
+    }
+
     /// Whether a motion or wheel event in a tab a native page fronts belongs to a terminal
     /// pane beside the page: the pane under the pointer, or the pane a held button's press
     /// went to (`pointer_route`), as between two terminals. Everything else over the page is
@@ -4645,7 +5152,7 @@ impl App {
     /// terminal's selection and report paths.
     fn route_mouse_input(&mut self, wid: WindowId, state: ElementState, button: WinitMouseButton) {
         self.clear_move_license(wid);
-        // The GUI-only prefix (link open, shift-extend, the `MULTI_CLICK_MS` streak that
+        // The GUI-only prefix (link open, shift-extend, the `multi_click_ms` streak that
         // yields `click_count`) stays in this handler; the seam takes `click_count` and
         // `side` as data.
         let pressed = state == ElementState::Pressed;
@@ -4689,18 +5196,10 @@ impl App {
         {
             ws.strip_drag = None;
         }
-        // A live winit-origin connector drag owns the left button: the release is its commit
-        // (in place ⇒ menu, past the threshold ⇒ drop or cancel), checked before every modal
-        // or native boundary below. A left press while one is still armed means the release
-        // was lost (a focus steal mid-gesture): dissolve it and let the press proceed.
-        // Native-origin drags settle via their own wakes.
-        if button == WinitMouseButton::Left && self.conn_drag.as_ref().is_some_and(|d| !d.native) {
-            if pressed {
-                self.conn_drag_abort();
-            } else {
-                self.conn_drag_release();
-                return;
-            }
+        // …and ends a scrollbar thumb drag, which owns its release wherever the
+        // pointer has gone (`crate::pane_chrome`).
+        if !pressed && button == WinitMouseButton::Left && self.scrollbar_release(wid) {
+            return;
         }
         if self.palette_claims_pointer(wid) {
             let (x, y) = self
@@ -4768,25 +5267,6 @@ impl App {
             }
             return;
         }
-        // Connection confirm/configure card: the same modal boundary. Left press/release
-        // drive the chips and Confirm/Cancel; every other gesture is swallowed.
-        if self.conn_card_claims_pointer(wid) {
-            let (x, y) = self
-                .windows
-                .get(&wid)
-                .map_or((0.0, 0.0), |window| window.last_cursor_px);
-            if button == WinitMouseButton::Left {
-                if pressed {
-                    self.conn_card_pointer_press(wid, x, y);
-                } else {
-                    self.conn_card_pointer_release(wid, x, y);
-                }
-            }
-            if !pressed {
-                self.settle_pointer_drags(wid);
-            }
-            return;
-        }
         // Session picker: same boundary; left press/release choose a row.
         if self.session_picker_claims_pointer(wid) {
             let (x, y) = self
@@ -4805,18 +5285,19 @@ impl App {
             }
             return;
         }
-        // Connection map: same boundary; left press/release activate a chip
-        // (raise) or a flow row (the inline disconnect confirm two-step).
-        if self.connection_map_claims_pointer(wid) {
+        // OVERVIEW: same boundary; a left press and release on the same row
+        // activate it as ⏎ does — a chip goes to its tab, a manages line to
+        // the manager.
+        if self.overview_claims_pointer(wid) {
             let (x, y) = self
                 .windows
                 .get(&wid)
                 .map_or((0.0, 0.0), |window| window.last_cursor_px);
             if button == WinitMouseButton::Left {
                 if pressed {
-                    self.connection_map_pointer_press(wid, x, y);
+                    self.overview_pointer_press(wid, x, y);
                 } else {
-                    self.connection_map_pointer_release(wid, x, y);
+                    self.overview_pointer_release(wid, x, y);
                 }
             }
             if !pressed {
@@ -4855,6 +5336,14 @@ impl App {
                 }
                 return;
             }
+        }
+        // The Deck (`crate::stats_deck`) is chrome above the grid: a press on it
+        // goes nowhere, where the grid's clamp would make it a press on row 0.
+        if pressed
+            && self.windows.get(&wid).is_some_and(|ws| !ws.overlay_open())
+            && self.pointer_is_over_stats_deck(wid)
+        {
+            return;
         }
         // Mixed tabs use the canonical tree before either content-specific
         // boundary. A divider consumes the press; otherwise a press in a sibling
@@ -4955,13 +5444,15 @@ impl App {
                                     .map(crate::native_app::SemanticInput::Number)
                             })
                             .or_else(|| {
-                                // The Tab Color wheel: a release inside the disk
-                                // carries the picked color as reducer-ready hex.
-                                artifact.compiled.color_wheel_color_at(&hit.key, x, y).map(
-                                    |[r, g, b]| {
-                                        crate::native_app::SemanticInput::Text(format!(
-                                            "#{r:02X}{g:02X}{b:02X}"
-                                        ))
+                                // A colour wheel: a release inside the disk
+                                // carries the hue and saturation under it; the
+                                // picker keeps its own brightness.
+                                artifact.compiled.color_wheel_pick_at(&hit.key, x, y).map(
+                                    |(hue, saturation)| {
+                                        crate::native_app::SemanticInput::ColorPick {
+                                            hue,
+                                            saturation,
+                                        }
                                     },
                                 )
                             });
@@ -5024,10 +5515,45 @@ impl App {
                             hit.key.clone(),
                             hit.action.clone(),
                             artifact.compiled.text_field_byte_at(&hit.key, x),
+                            hit.look_first,
                         ))
                     },
                 );
-                if let Some((target_view, generation, key, action, text_position)) = press {
+                // THE PRESS GOES WHERE THE POINTER LOOKED: a control the layout
+                // moved under a still pointer since it came to rest (a session
+                // opened or closed above it, a press moved its row) is not
+                // pressed where it, or what the pointer saw, asks for a look. It
+                // is lit, and the pointer now rests on it, so the next press
+                // takes it.
+                if let Some((target_view, generation, key, _, _, asks)) = &press
+                    && !NativePointerRest::looked_at(
+                        self.windows
+                            .get(&wid)
+                            .and_then(|ws| ws.native_rest.as_ref()),
+                        (px, py),
+                        (*target_view, key, *asks),
+                    )
+                {
+                    if let Some(ws) = self.windows.get_mut(&wid) {
+                        ws.native_rest =
+                            Some(NativePointerRest::on((px, py), (*target_view, key, *asks)));
+                    }
+                    if self.native_runtime.view_generation(*target_view) == Some(*generation)
+                        && let Some(state) = self.native_runtime.view_state_mut(*target_view)
+                    {
+                        let common = state.common_mut();
+                        common.hovered = Some(key.clone());
+                        common.pressed = None;
+                    }
+                    self.invalidate_native_view_cache(
+                        wid,
+                        *target_view,
+                        crate::native_app::DamageRegion::All,
+                    );
+                    self.request_redraw_all_windows();
+                    return;
+                }
+                if let Some((target_view, generation, key, action, text_position, _)) = press {
                     if self.native_runtime.view_generation(target_view) == Some(generation)
                         && let Some(state) = self.native_runtime.view_state_mut(target_view)
                     {
@@ -5291,7 +5817,9 @@ impl App {
                                         .is_some_and(|frame| frame.header && frame.window_menu)
                                     && let Some(w) = &ws.os_window
                                 {
-                                    w.show_window_menu(winit::dpi::PhysicalPosition::new(px, py));
+                                    w.show_window_menu(aterm_window::dpi::PhysicalPosition::new(
+                                        px, py,
+                                    ));
                                 }
                             }
                         }
@@ -5356,7 +5884,7 @@ impl App {
                 .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
             if self.find_bar_pixel_hit(wid, px, py) {
                 let (row, col) = self.pixel_to_cell(wid, px, py);
-                if self.find_bar_click(wid, row, col) {
+                if self.find_bar_click_at(wid, row, col, Some(px)) {
                     return;
                 }
             }
@@ -5365,6 +5893,12 @@ impl App {
         // Below the modals, the strip and the find bar, which cover the pet; above the
         // divider, pane-focus, selection and report layers, which its body occludes.
         if pressed && button == WinitMouseButton::Left && self.pet_press_at(wid) {
+            return;
+        }
+        // A left press on an overlay scrollbar's thumb grabs it; one on the track beside the
+        // window edge pages toward the pointer (`crate::pane_chrome`). Before the divider:
+        // an inner pane's thumb sits in the left half of the divider's gap.
+        if pressed && button == WinitMouseButton::Left && self.scrollbar_press(wid) {
             return;
         }
         // A left press on a split divider grabs it (no focus change, no selection); release
@@ -5688,18 +6222,15 @@ impl App {
         // without reaching native or terminal scroll consumers, and so do horizontal ones
         // over the palette or a native view: only the terminal seam answers that axis.
         let palette = self.palette_claims_pointer(wid);
-        let conn_card = self.conn_card_claims_pointer(wid);
         let session_picker = self.session_picker_claims_pointer(wid);
-        let connection_map = self.connection_map_claims_pointer(wid);
+        let overview = self.overview_claims_pointer(wid);
         // A native page scrolls by the wheel only while the pointer is its: over a terminal
         // pane beside it the notch is that terminal's (`pointer_route`, below).
         let native_page =
             self.active_native_view(wid).is_some() && !self.pointer_routes_to_a_terminal_pane(wid);
         // Do not bank fractional wheel deltas from chrome: otherwise a later
         // scroll in content would inherit motion that began over its title.
-        if !(palette || conn_card || session_picker || connection_map)
-            && self.pointer_is_over_pane_header(wid)
-        {
+        if !(palette || session_picker || overview) && self.pointer_is_over_pane_header(wid) {
             return;
         }
         // The vertical pixel delta, taken before `wheel_notches` banks it: banking keeps
@@ -5726,12 +6257,7 @@ impl App {
                 .get(&wid)
                 .is_none_or(|ws| ws.tab_menu.is_some() || ws.overlay_open());
             if let Some(dy_px) = track_px
-                && !(seam_owned
-                    || palette
-                    || conn_card
-                    || session_picker
-                    || connection_map
-                    || native_page)
+                && !(seam_owned || palette || session_picker || overview || native_page)
             {
                 // The band belongs to the pane under the pointer, as the whole
                 // rows below do (`pointer_route`).
@@ -5752,9 +6278,7 @@ impl App {
         // also trips `note_update_handoff_activity`, the `is_present_recovery_stimulus`
         // rearm and `note_alt_scroll`.
         let vertical_up = dir.vertical_up();
-        if vertical_up.is_none()
-            && (palette || conn_card || session_picker || connection_map || native_page)
-        {
+        if vertical_up.is_none() && (palette || session_picker || overview || native_page) {
             return;
         }
         if let Some(up) = vertical_up {
@@ -5767,23 +6291,23 @@ impl App {
                 self.palette_pointer_wheel(wid, signed);
                 return;
             }
-            // The confirm/configure card has no scroll model: the modal still
-            // swallows the wheel (never a scroll-through layer).
-            if conn_card {
-                return;
-            }
             if session_picker {
                 self.session_picker_pointer_wheel(wid, signed);
                 return;
             }
-            if connection_map {
-                self.connection_map_pointer_wheel(wid, signed);
+            if overview {
+                self.overview_pointer_wheel(wid, signed);
                 return;
             }
             if native_page {
                 let signed = if up { -lines } else { lines };
-                let _ = self
-                    .dispatch_native_event(wid, crate::native_app::AppEvent::ScrollLines(signed));
+                // Aimed at what the pointer is over, so a page with a second
+                // scrolling region (Settings' sidebar) scrolls that one.
+                let event = match self.native_scroll_target(wid) {
+                    Some(key) => crate::native_app::AppEvent::ScrollAt { lines: signed, key },
+                    None => crate::native_app::AppEvent::ScrollLines(signed),
+                };
+                let _ = self.dispatch_native_event(wid, event);
                 return;
             }
         }
@@ -6431,6 +6955,131 @@ mod tests {
     use super::{PointerAction, WheelDir, press_selection_kind};
     use aterm_core::selection::{SelectionSide, SelectionType};
 
+    /// THE PRESS GOES WHERE THE POINTER LOOKED: a motion at the pixel the
+    /// pointer rests on is no motion and keeps what it saw there; a motion
+    /// to another pixel sees afresh. Where the control pressed asks for a
+    /// look, or the one the pointer saw does, the press lands where the
+    /// pointer saw that very control, where it has moved since, or where no
+    /// rest is known (a scroll forgot it), and not where it rests still on
+    /// what it saw before the layout moved — another control, the same key in
+    /// another view, or nothing. Where neither asks, the press lands as it
+    /// always has. CONTROL: the same press after the pointer moves lands.
+    #[test]
+    fn a_still_pointer_keeps_what_it_saw_and_a_press_goes_where_it_looked() {
+        use super::NativePointerRest as Rest;
+        use crate::native_ui::UiKey;
+        use crate::tab_model::ViewId;
+        let (view, other) = (ViewId::from_stored(1), ViewId::from_stored(2));
+        let row = UiKey::new("harness/session/9/autopilot/land");
+        let next = UiKey::new("harness/session/10/autopilot/land");
+        let bulk = UiKey::new("harness/session/all/autopilot/land");
+        let at = (10.0, 20.0);
+        // A bulk button moved under a pointer resting on a row's.
+        let rest = Rest::after_motion(None, at, Some((view, &row, false)));
+        let still = Rest::after_motion(rest.clone(), at, Some((view, &bulk, true)));
+        assert_eq!(still, rest, "the same pixel again is no motion");
+        assert!(!Rest::looked_at(still.as_ref(), at, (view, &bulk, true)));
+        assert!(Rest::looked_at(still.as_ref(), at, (view, &row, false)));
+        assert!(
+            Rest::looked_at(still.as_ref(), at, (view, &next, false)),
+            "rows as before"
+        );
+        let lit = Rest::on(at, (view, &bulk, true));
+        assert!(
+            Rest::looked_at(Some(&lit), at, (view, &bulk, true)),
+            "the next press takes it"
+        );
+        // A row's button moved under a pointer resting on a bulk one.
+        let on_bulk = Rest::after_motion(None, at, Some((view, &bulk, true)));
+        assert!(!Rest::looked_at(on_bulk.as_ref(), at, (view, &row, false)));
+        assert!(!Rest::looked_at(on_bulk.as_ref(), at, (other, &bulk, true)));
+        assert!(Rest::looked_at(on_bulk.as_ref(), at, (view, &bulk, true)));
+        let lit = Rest::on(at, (view, &row, false));
+        assert!(
+            Rest::looked_at(Some(&lit), at, (view, &row, false)),
+            "the next press takes it"
+        );
+        let nothing = Rest::after_motion(None, at, None);
+        assert!(!Rest::looked_at(nothing.as_ref(), at, (view, &bulk, true)));
+        assert!(Rest::looked_at(nothing.as_ref(), at, (view, &row, false)));
+        assert!(
+            Rest::looked_at(None, at, (view, &bulk, true)),
+            "a scroll forgot it"
+        );
+        // CONTROL: once the pointer moves, it sees what is there now.
+        let moved = Rest::after_motion(still, (11.0, 20.0), Some((view, &bulk, true)));
+        assert!(Rest::looked_at(
+            moved.as_ref(),
+            (11.0, 20.0),
+            (view, &bulk, true)
+        ));
+        assert!(Rest::looked_at(
+            moved.as_ref(),
+            (12.0, 20.0),
+            (view, &row, false)
+        ));
+    }
+
+    /// A HEADLESS POINTER REACHES A NATIVE VIEW, SAYS WHERE, AND LEAVING CLEARS ITS
+    /// HOVER (cs-25): a window with no glass never presented a native frame, so the
+    /// glass-commit guard refused every pointer pixel and `pointer move` hovered
+    /// nothing while answering `at=0,0` (a grid memo the native path never writes);
+    /// and `pointer leave` cleared the strip's hover but left a Settings row hovered,
+    /// its cursor-style preview showing what the pointer had left. Now the move
+    /// commits the frame a capture shows, aims at a control by its key, the reply
+    /// names the view, the point and the control, and leaving clears the hover.
+    /// NEGATIVE CONTROL: a terminal front answers its window cell as before.
+    #[test]
+    fn a_glassless_native_pointer_hovers_says_where_and_leaving_clears_it() {
+        use super::{NativePointerTarget, PointerAt};
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        // NEGATIVE CONTROL first: the terminal front reads back its cell.
+        let cell = app
+            .pointer_cmd(PointerAction::Move { row: 2, col: 3 })
+            .expect("a terminal move");
+        assert!(matches!(
+            app.pointer_reply(cell),
+            Ok(PointerAt::Grid { cell: (2, 3), .. })
+        ));
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::CursorStyles));
+        let (_, view) = app.active_native_view(wid).expect("Settings in front");
+        let compiled = app.compiled_native_ui(wid).expect("the page compiles");
+        let row = compiled
+            .focus_order
+            .iter()
+            .find(|key| key.as_str().starts_with("settings/cursor-style/"))
+            .cloned()
+            .expect("a style row");
+        let hovered = |app: &crate::App| {
+            app.native_runtime
+                .view_state(view)
+                .and_then(|state| state.common().hovered.clone())
+        };
+        let cell = app
+            .pointer_cmd(PointerAction::MoveNative(NativePointerTarget::Key(
+                row.as_str().to_string(),
+            )))
+            .expect("the move aims at the row");
+        assert_eq!(hovered(&app), Some(row.clone()), "the row is hovered");
+        match app.pointer_reply(cell) {
+            Ok(PointerAt::Native {
+                view: at,
+                key: Some(key),
+                ..
+            }) => {
+                assert_eq!(at, view.get());
+                assert_eq!(key, row.as_str());
+            }
+            other => panic!("a native answer, never a grid cell: {other:?}"),
+        }
+        let cell = app
+            .pointer_cmd(PointerAction::Leave)
+            .expect("the pointer leaves");
+        assert_eq!(hovered(&app), None, "leaving clears the hover");
+        assert_eq!(app.pointer_reply(cell), Ok(PointerAt::Absent));
+    }
+
     /// A file URI built as the shipping path builds it; a hand-rolled `file://` is malformed
     /// on Windows.
     fn file_uri(path: &std::path::Path) -> String {
@@ -6525,7 +7174,7 @@ mod tests {
     /// still applies on that event.
     #[test]
     fn divider_wobble_across_a_cell_edge_never_regrids_the_siblings() {
-        use winit::event::{ElementState, MouseButton};
+        use aterm_window::event::{ElementState, MouseButton};
 
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
@@ -6611,7 +7260,7 @@ mod tests {
     /// throttle stamp is set and backdated by hand, so the test never sleeps.
     #[test]
     fn divider_drag_flushes_a_coalesced_step_on_a_move_inside_the_band() {
-        use winit::event::{ElementState, MouseButton};
+        use aterm_window::event::{ElementState, MouseButton};
 
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
@@ -6696,7 +7345,7 @@ mod tests {
 
     #[test]
     fn pane_header_click_focuses_without_selecting_or_reporting_any_button() {
-        use winit::event::{ElementState, MouseButton};
+        use aterm_window::event::{ElementState, MouseButton};
 
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
@@ -6743,7 +7392,7 @@ mod tests {
 
     #[test]
     fn pane_header_hover_and_wheel_never_reach_terminal_input() {
-        use winit::event::MouseScrollDelta;
+        use aterm_window::event::MouseScrollDelta;
 
         let (mut app, wid, _, _) = stacked_autoscroll_fixture();
         let term = app.front_terminal(wid).unwrap().term.clone();
@@ -6761,7 +7410,7 @@ mod tests {
             app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(0.5, 0.0));
             app.on_mouse_wheel(
                 wid,
-                MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, 0.5)),
+                MouseScrollDelta::PixelDelta(aterm_window::dpi::PhysicalPosition::new(0.0, 0.5)),
             );
             assert_eq!(
                 crate::term_lock_acquisitions_on_this_thread(),
@@ -6791,7 +7440,7 @@ mod tests {
 
     #[test]
     fn pane_header_crossing_preserves_selection_and_reported_button_releases() {
-        use winit::event::{ElementState, MouseButton};
+        use aterm_window::event::{ElementState, MouseButton};
 
         let (mut app, wid, _, bottom) = stacked_autoscroll_fixture();
         let (row, col, _, _) = app.focused_pane_rect(wid);
@@ -6820,7 +7469,7 @@ mod tests {
     #[test]
     fn pane_header_focuses_native_leaf_and_does_not_scroll_its_content() {
         use crate::native_app::AppViewState;
-        use winit::event::{ElementState, MouseButton, MouseScrollDelta};
+        use aterm_window::event::{ElementState, MouseButton, MouseScrollDelta};
 
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
@@ -7028,7 +7677,7 @@ mod tests {
     fn palette_over_native_tab_swallows_pointer_before_underlying_hit_test() {
         use crate::native_app::AppViewState;
         use crate::{App, WindowId};
-        use winit::event::{ElementState, MouseButton};
+        use aterm_window::event::{ElementState, MouseButton};
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -7119,8 +7768,8 @@ mod tests {
         use crate::native_text_input::TextInputState;
         use crate::native_ui::UiKey;
         use crate::{App, WindowId};
-        use winit::event::{ElementState, MouseButton};
-        use winit::keyboard::ModifiersState;
+        use aterm_window::event::{ElementState, MouseButton};
+        use aterm_window::keyboard::ModifiersState;
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -7204,7 +7853,7 @@ mod tests {
         use crate::native_text_input::TextInputState;
         use crate::native_ui::UiKey;
         use crate::{App, WindowId};
-        use winit::event::{ElementState, MouseButton};
+        use aterm_window::event::{ElementState, MouseButton};
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -7297,7 +7946,7 @@ mod tests {
         use crate::native_text_input::TextInputState;
         use crate::native_ui::UiKey;
         use crate::{App, WindowId};
-        use winit::event::{ElementState, MouseButton};
+        use aterm_window::event::{ElementState, MouseButton};
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -7336,7 +7985,7 @@ mod tests {
         use crate::native_app::{AppKind, AppViewState};
         use crate::native_ui::{UiContent, UiKey};
         use crate::{App, WindowId};
-        use winit::event::{ElementState, MouseButton};
+        use aterm_window::event::{ElementState, MouseButton};
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -7410,16 +8059,32 @@ mod tests {
         settings.search_input =
             crate::native_text_input::TextInputState::new("font size".to_string());
         settings.set_search("font size".to_string());
-        // Short compact search results disclose their live preview first; the
-        // numeric control is on the next bounded, user-reachable slice.
-        settings.page_scroll = 1;
+        // Short compact search results disclose their live preview first, and
+        // the numeric control is on the first bounded, user-reachable slice
+        // that has room for it: the next under macOS's cell, the first where
+        // the host's cell (and so the headless window's page) is larger
+        // (Windows' 17 px face on its 1.1 line).
         let slider_key = UiKey::new(format!("settings/control/{}", crate::prefs::EDIT_FONT_PX));
-        let compiled = presented_native_ui(&mut app, wid);
-        let slider = compiled
-            .paint
-            .iter()
-            .find(|node| node.key == slider_key)
-            .expect("painted font slider");
+        let mut found = None;
+        for scroll in 0..8 {
+            let Some(AppViewState::Settings(settings)) =
+                app.native_runtime.view_state_mut(settings_view)
+            else {
+                unreachable!();
+            };
+            settings.page_scroll = scroll;
+            let compiled = presented_native_ui(&mut app, wid);
+            if let Some(index) = compiled
+                .paint
+                .iter()
+                .position(|node| node.key == slider_key)
+            {
+                found = Some((compiled, index));
+                break;
+            }
+        }
+        let (compiled, index) = found.expect("painted font slider");
+        let slider = &compiled.paint[index];
         assert!(matches!(slider.content, UiContent::Slider(_)));
         let geometry = crate::native_ui::slider_geometry(slider.rect);
         let slider_x = geometry.track_x + (geometry.track_right - geometry.track_x) * 0.75;
@@ -7496,7 +8161,7 @@ mod tests {
     fn wheel_scrolled_native_palette_hit_activates_the_newly_painted_row() {
         use crate::native_app::AppViewState;
         use crate::{App, WindowId};
-        use winit::event::{ElementState, MouseButton, MouseScrollDelta};
+        use aterm_window::event::{ElementState, MouseButton, MouseScrollDelta};
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -7571,7 +8236,7 @@ mod tests {
     fn pointer_release_rejects_a_native_command_after_its_view_generation_dies() {
         use crate::native_app::AppViewState;
         use crate::{App, WindowId};
-        use winit::event::{ElementState, MouseButton};
+        use aterm_window::event::{ElementState, MouseButton};
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -7614,7 +8279,7 @@ mod tests {
     #[test]
     fn terminal_palette_pointer_strips_frame_remainder_and_top_origin_once() {
         use crate::{App, WindowId};
-        use winit::dpi::PhysicalSize;
+        use aterm_window::dpi::PhysicalSize;
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -7710,7 +8375,7 @@ mod tests {
     #[test]
     fn click_below_terminal_palette_is_swallowed_without_starting_selection() {
         use crate::{App, WindowId};
-        use winit::event::{ElementState, MouseButton};
+        use aterm_window::event::{ElementState, MouseButton};
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -7752,7 +8417,7 @@ mod tests {
     #[test]
     fn palette_wheel_never_reaches_terminal_scrollback() {
         use crate::{App, WindowId};
-        use winit::event::MouseScrollDelta;
+        use aterm_window::event::MouseScrollDelta;
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -7847,16 +8512,16 @@ mod tests {
     fn enum_chip_click_opens_the_choice_picker_and_commits_nothing() {
         use crate::native_ui::UiContent;
         use crate::{App, WindowId};
-        use winit::event::{ElementState, MouseButton};
+        use aterm_window::event::{ElementState, MouseButton};
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        // Window appearance opens a previewing picker; the shorter choices are
+        // Background material's four choices open a picker; two or three are
         // segments in their row and open none.
-        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
         let key = crate::native_ui::UiKey::new(format!(
             "settings/control/{}",
-            crate::prefs::EDIT_WINDOW_THEME
+            crate::prefs::EDIT_BACKGROUND_MATERIAL
         ));
         // The page window is virtualized: scroll until the enum chip paints.
         let mut compiled = presented_native_ui(&mut app, wid);
@@ -7902,7 +8567,10 @@ mod tests {
         assert!(
             open.paint.iter().any(|node| {
                 node.key.as_str()
-                    == format!("settings/choice-picker/{}", crate::prefs::EDIT_WINDOW_THEME)
+                    == format!(
+                        "settings/choice-picker/{}",
+                        crate::prefs::EDIT_BACKGROUND_MATERIAL
+                    )
             }),
             "a click on a popup-chip enum row opens the ChoicePicker"
         );
@@ -7947,7 +8615,7 @@ mod tests {
         use crate::native_app::{AppKind, AppViewState};
         use crate::native_ui::UiContent;
         use crate::{App, WindowId};
-        use winit::event::{ElementState, MouseButton};
+        use aterm_window::event::{ElementState, MouseButton};
 
         let dir = std::env::temp_dir().join(format!(
             "aterm-markdown-pointer-{}-{:?}",
@@ -8023,7 +8691,7 @@ mod tests {
     #[test]
     fn the_two_wheel_axes_bank_into_separate_window_fields() {
         use crate::{App, WindowId};
-        use winit::event::MouseScrollDelta;
+        use aterm_window::event::MouseScrollDelta;
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -8082,8 +8750,8 @@ mod tests {
     /// Backwards would invert every horizontal scroll in Neovim and tmux.
     #[test]
     fn horizontal_flicks_report_both_xterm_buttons_in_the_right_direction() {
-        use winit::dpi::PhysicalPosition;
-        use winit::event::MouseScrollDelta;
+        use aterm_window::dpi::PhysicalPosition;
+        use aterm_window::event::MouseScrollDelta;
 
         use crate::{App, WindowId};
 
@@ -8132,7 +8800,7 @@ mod tests {
     /// reach the PTY.
     #[test]
     fn horizontal_flicks_move_no_local_viewport_anywhere() {
-        use winit::event::MouseScrollDelta;
+        use aterm_window::event::MouseScrollDelta;
 
         use crate::native_app::AppViewState;
         use crate::{App, WindowId};
@@ -8213,7 +8881,7 @@ mod tests {
     #[test]
     fn shift_is_the_tracking_bypass_off_macos() {
         use super::tracking_bypass_held;
-        use winit::keyboard::ModifiersState as M;
+        use aterm_window::keyboard::ModifiersState as M;
         assert!(tracking_bypass_held(M::ALT));
         assert!(tracking_bypass_held(M::ALT | M::SHIFT));
         assert_eq!(
@@ -8298,7 +8966,7 @@ mod tests {
     #[test]
     fn pointer_geometry_tracks_the_band_offset() {
         use crate::{App, WindowId};
-        use winit::dpi::PhysicalSize;
+        use aterm_window::dpi::PhysicalSize;
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -8386,8 +9054,8 @@ mod tests {
     #[test]
     fn release_settles_local_selection_after_tracking_flips_off_mid_drag() {
         use crate::{App, WindowId, term_lock};
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
-        use winit::keyboard::ModifiersState;
+        use aterm_window::event::{ElementState, MouseButton as WinitMouseButton};
+        use aterm_window::keyboard::ModifiersState;
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -8430,7 +9098,7 @@ mod tests {
     #[test]
     fn a_thumb_press_never_clears_a_live_drags_reported_bit() {
         use aterm_types::mouse::MouseButton;
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+        use aterm_window::event::{ElementState, MouseButton as WinitMouseButton};
 
         use crate::{App, WindowId, term_lock};
 
@@ -8535,7 +9203,7 @@ mod tests {
     #[test]
     fn a_click_on_the_pet_pets_and_never_starts_a_selection() {
         use crate::{App, WindowId};
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+        use aterm_window::event::{ElementState, MouseButton as WinitMouseButton};
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -8610,7 +9278,7 @@ mod tests {
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn a_right_press_on_a_chip_pops_the_menu_and_never_reaches_the_grid() {
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+        use aterm_window::event::{ElementState, MouseButton as WinitMouseButton};
 
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
@@ -8689,7 +9357,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_bare_band_system_menu_arms_on_press_and_fires_on_release() {
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+        use aterm_window::event::{ElementState, MouseButton as WinitMouseButton};
 
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
@@ -8848,6 +9516,78 @@ mod tests {
             bg_of(&app, button_col),
             resting,
             "…and the clear reaches the painted row"
+        );
+    }
+
+    /// Closing the palette or an overlay card re-resolves the cursor only where the
+    /// window still holds the pointer ([`App::replay_held_pointer`]). The remembered
+    /// position sits on the strip's first tab, as a pointer that left over the strip
+    /// leaves it (and as a headless window's `(0, 0)` hit-tests). NEGATIVE CONTROL:
+    /// the close replayed that memo through the motion path whatever the pointer
+    /// did, which claimed the pointer again and lit the tab, its hover wash and its
+    /// `✕`, with no pointer in the window (the 2026-10-18 judges'
+    /// `strip-phantom-hover-after-overlay`). CONTROL: a held pointer is still
+    /// re-resolved on close.
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn closing_an_overlay_replays_no_pointer_the_window_has_lost() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.tab_strip_rows = 1;
+        let (cw, ch) = app.win_cell_size(wid);
+        let pad = app.win_pad(wid) as f64;
+        let top = (app.win_pad_top(wid) + app.win_head(wid)) as f64;
+        app.splice_tab_strip_with(wid, 1);
+        let chip = app.windows[&wid]
+            .tab_segments
+            .iter()
+            .find_map(|seg| match seg.kind {
+                crate::tab_bar::TabHit::Select(0) => Some(seg.start_col + 2),
+                _ => None,
+            })
+            .expect("the lone tab has a chip");
+        let on_tab = (
+            pad + f64::from(chip) * cw as f64 + cw as f64 * 0.5,
+            top + ch as f64 * 0.5,
+        );
+        // The pointer crossed the tab and left the window.
+        app.on_cursor_moved(wid, on_tab.0, on_tab.1);
+        assert_eq!(
+            app.windows[&wid].strip_hover,
+            Some(0),
+            "CONTROL: the tab lit"
+        );
+        app.on_cursor_left(wid);
+        assert_eq!(app.windows[&wid].strip_hover, None, "leaving cleared it");
+
+        type Close = fn(&mut crate::App, crate::WindowId);
+        let closes: [(&str, Close); 2] = [
+            ("the palette", |app, _| app.palette_exit()),
+            ("an overlay card", |app, wid| {
+                app.close_overlay_card(wid, |ws| ws.palette().is_some());
+            }),
+        ];
+        for (what, close) in closes {
+            app.palette_enter();
+            assert!(app.windows[&wid].palette().is_some(), "{what}: opened");
+            close(&mut app, wid);
+            assert!(app.windows[&wid].palette().is_none(), "{what}: closed");
+            let ws = &app.windows[&wid];
+            assert!(
+                !ws.pointer_position_known,
+                "{what}: the close claimed a pointer the window does not hold"
+            );
+            assert_eq!(ws.strip_hover, None, "{what}: a phantom hover lit tab 0");
+        }
+
+        // CONTROL: a pointer the window holds is re-resolved when the palette goes.
+        app.on_cursor_moved(wid, on_tab.0, on_tab.1);
+        app.palette_enter();
+        app.palette_exit();
+        assert_eq!(
+            app.windows[&wid].strip_hover,
+            Some(0),
+            "a held pointer is still replayed on close"
         );
     }
 
@@ -9096,7 +9836,7 @@ mod tests {
                 (false, false),
                 "a link-modifier tap over the strip paints chrome's arrow, not an I-beam"
             );
-            app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::empty());
+            app.on_modifiers_changed(wid, aterm_window::keyboard::ModifiersState::empty());
         }
         app.tab_strip_rows = 0;
 
@@ -9107,20 +9847,20 @@ mod tests {
             ws.last_cursor_px = grid;
             ws.last_mouse_window_cell = (5, 10);
         }
-        app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::SHIFT);
+        app.on_modifiers_changed(wid, aterm_window::keyboard::ModifiersState::SHIFT);
         assert_eq!(
             state(&app),
             (false, false),
             "a Shift edge must not re-resolve the hover (no lock, no probe)"
         );
-        app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::empty());
+        app.on_modifiers_changed(wid, aterm_window::keyboard::ModifiersState::empty());
         app.on_modifiers_changed(wid, link_modifier());
         assert_eq!(
             state(&app),
             (false, true),
             "a link-modifier edge resolves the grid"
         );
-        app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::empty());
+        app.on_modifiers_changed(wid, aterm_window::keyboard::ModifiersState::empty());
 
         // The grid probe never parks behind the reader. The split above moved focus to a
         // new pane session: probe that terminal.
@@ -9170,14 +9910,14 @@ mod tests {
     }
 
     /// The platform's "open link" modifier, as `link_modifier_held` reads it.
-    fn link_modifier() -> winit::keyboard::ModifiersState {
+    fn link_modifier() -> aterm_window::keyboard::ModifiersState {
         #[cfg(target_os = "macos")]
         {
-            winit::keyboard::ModifiersState::SUPER
+            aterm_window::keyboard::ModifiersState::SUPER
         }
         #[cfg(not(target_os = "macos"))]
         {
-            winit::keyboard::ModifiersState::CONTROL
+            aterm_window::keyboard::ModifiersState::CONTROL
         }
     }
 
@@ -9241,7 +9981,7 @@ mod tests {
     /// motion that crosses two midpoints takes two steps, not one.
     #[test]
     fn a_sweep_across_two_chips_walks_the_tab_two_places() {
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+        use aterm_window::event::{ElementState, MouseButton as WinitMouseButton};
 
         let (mut app, wid, before) = app_with_three_chips();
         let grab = strip_point(&app, wid, chip_span(&app, wid, 2).0 + 1);
@@ -9265,7 +10005,7 @@ mod tests {
     /// neighbour's midpoint lies beyond the held segment's far edge.
     #[test]
     fn a_press_that_never_crosses_a_midpoint_never_reorders() {
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+        use aterm_window::event::{ElementState, MouseButton as WinitMouseButton};
 
         let (mut app, wid, before) = app_with_three_chips();
         let (start, end) = chip_span(&app, wid, 0);
@@ -9303,7 +10043,7 @@ mod tests {
     /// Either way, motion past a neighbour's midpoint reorders nothing.
     #[test]
     fn an_interruption_mid_drag_stops_the_held_chip() {
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+        use aterm_window::event::{ElementState, MouseButton as WinitMouseButton};
 
         for interruption in ["focus loss", "context menu", "palette"] {
             let (mut app, wid, before) = app_with_three_chips();
@@ -9365,7 +10105,7 @@ mod tests {
     /// moves no tab.
     #[test]
     fn a_press_that_is_no_grab_arms_no_reorder() {
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+        use aterm_window::event::{ElementState, MouseButton as WinitMouseButton};
 
         for renaming in [false, true] {
             let (mut app, wid, before) = app_with_three_chips();
@@ -9419,7 +10159,7 @@ mod tests {
     /// One tab, dragged the length of its own chip, is a no-op: no panic, no phantom move.
     #[test]
     fn a_lone_chip_has_nowhere_to_go() {
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+        use aterm_window::event::{ElementState, MouseButton as WinitMouseButton};
 
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
@@ -9453,7 +10193,7 @@ mod tests {
     /// chip marches to the back, turning the page where its neighbour has no chip.
     #[test]
     fn under_pressure_the_wide_active_chip_marches_across_the_strip() {
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+        use aterm_window::event::{ElementState, MouseButton as WinitMouseButton};
 
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
@@ -10324,7 +11064,7 @@ mod tests {
     /// Settings ▸ Messages at the entry, no capsule press.
     #[test]
     fn a_press_on_a_band_capsule_performs_its_intent_and_stops_there() {
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+        use aterm_window::event::{ElementState, MouseButton as WinitMouseButton};
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
         let id = app.post_message(toolchain_row());
@@ -10478,7 +11218,7 @@ mod tests {
     /// Settings-fronted tab is the band's, not the native view's.
     #[test]
     fn band_capsules_work_on_a_window_fronting_settings() {
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+        use aterm_window::event::{ElementState, MouseButton as WinitMouseButton};
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
         assert!(app.open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Home));
@@ -11164,6 +11904,10 @@ mod tests {
 #[cfg(all(test, unix))]
 #[path = "app_mouse_pointer_route_tests.rs"]
 mod pointer_route_tests;
+
+#[cfg(all(test, windows))]
+#[path = "app_mouse_right_click_win_tests.rs"]
+mod right_click_win_tests;
 
 #[cfg(test)]
 #[path = "app_mouse_bidi_tests.rs"]

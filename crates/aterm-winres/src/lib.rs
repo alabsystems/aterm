@@ -41,7 +41,6 @@
     reason = "never linked into the shipped binary: a build-script step"
 )]
 
-use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -64,8 +63,15 @@ pub enum Outcome {
 
 impl Outcome {
     /// `true` only when the resources are actually in the binary.
-    pub fn is_linked(&self) -> bool {
+    #[must_use]
+    pub const fn is_linked(&self) -> bool {
         matches!(self, Outcome::Linked(_))
+    }
+
+    /// `true` when resource compilation failed or no compiler was found.
+    #[must_use]
+    pub const fn is_failure(&self) -> bool {
+        matches!(self, Outcome::NoCompiler(_) | Outcome::Failed(_))
     }
 }
 
@@ -93,12 +99,57 @@ enum Dialect {
 
 impl Dialect {
     /// The artifact extension the dialect produces.
-    fn artifact_extension(self) -> &'static str {
+    const fn artifact_extension(self) -> &'static str {
         match self {
             Dialect::Rc | Dialect::LlvmRc => "res",
             Dialect::Windres => "o",
         }
     }
+}
+
+/// Encode a Win32 `VS_FIXEDFILEINFO` four-part version (`major`, `minor`, `patch`, `build`) into 16 LE bytes.
+#[must_use]
+pub const fn encode_winres_version_le(major: u32, minor: u32, patch: u32, build: u32) -> [u8; 16] {
+    [
+        major as u8,
+        (major >> 8) as u8,
+        (major >> 16) as u8,
+        (major >> 24) as u8,
+        minor as u8,
+        (minor >> 8) as u8,
+        (minor >> 16) as u8,
+        (minor >> 24) as u8,
+        patch as u8,
+        (patch >> 8) as u8,
+        (patch >> 16) as u8,
+        (patch >> 24) as u8,
+        build as u8,
+        (build >> 8) as u8,
+        (build >> 16) as u8,
+        (build >> 24) as u8,
+    ]
+}
+
+/// Decode 16 LE bytes into a Win32 `VS_FIXEDFILEINFO` four-part version (`major`, `minor`, `patch`, `build`).
+#[must_use]
+pub const fn decode_winres_version_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
+    let major = (bytes[0] as u32)
+        | ((bytes[1] as u32) << 8)
+        | ((bytes[2] as u32) << 16)
+        | ((bytes[3] as u32) << 24);
+    let minor = (bytes[4] as u32)
+        | ((bytes[5] as u32) << 8)
+        | ((bytes[6] as u32) << 16)
+        | ((bytes[7] as u32) << 24);
+    let patch = (bytes[8] as u32)
+        | ((bytes[9] as u32) << 8)
+        | ((bytes[10] as u32) << 16)
+        | ((bytes[11] as u32) << 24);
+    let build = (bytes[12] as u32)
+        | ((bytes[13] as u32) << 8)
+        | ((bytes[14] as u32) << 16)
+        | ((bytes[15] as u32) << 24);
+    (major, minor, patch, build)
 }
 
 /// Compile `rc` for the TARGET and link the result into this package's bins.
@@ -119,9 +170,10 @@ pub fn compile(rc: &Path) -> Outcome {
     }
     println!("cargo:rerun-if-env-changed=ATERM_RC");
 
-    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let manifest_dir = match std::env::var_os("CARGO_MANIFEST_DIR") {
+        Some(d) => PathBuf::from(d),
+        None => PathBuf::new(),
+    };
     let rc = if rc.is_absolute() {
         rc.to_path_buf()
     } else {
@@ -153,9 +205,19 @@ pub fn compile(rc: &Path) -> Outcome {
         Some(d) => PathBuf::from(d),
         None => return Outcome::Failed("OUT_DIR is not set (not running under cargo?)".into()),
     };
-    let stem = rc.file_stem().and_then(OsStr::to_str).unwrap_or("resource");
+    #[allow(clippy::manual_unwrap_or)]
+    let stem = match rc.file_stem() {
+        Some(s) => match s.to_str() {
+            Some(s) => s,
+            None => "resource",
+        },
+        None => "resource",
+    };
     let artifact = out_dir.join(format!("{stem}.{}", dialect.artifact_extension()));
-    let include_dir = rc.parent().map(Path::to_path_buf).unwrap_or_default();
+    let include_dir = match rc.parent() {
+        Some(p) => p.to_path_buf(),
+        None => PathBuf::new(),
+    };
 
     let mut cmd = Command::new(&compiler);
     cmd.args(arguments(dialect, &include_dir, &rc, &artifact));
@@ -216,11 +278,13 @@ fn arguments(dialect: Dialect, include_dir: &Path, rc: &Path, artifact: &Path) -
 
 /// Which dialect a compiler speaks, from its file name.
 fn dialect_of(program: &Path) -> Dialect {
-    let name = program
-        .file_name()
-        .and_then(OsStr::to_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let name = match program.file_name() {
+        Some(f) => match f.to_str() {
+            Some(s) => s.to_ascii_lowercase(),
+            None => String::new(),
+        },
+        None => String::new(),
+    };
     if name.contains("windres") {
         Dialect::Windres
     } else if name.contains("llvm-rc") {
@@ -305,14 +369,21 @@ fn locate_compiler(target_env: &str, target_arch: &str) -> Result<(PathBuf, Dial
                 .join("Windows Kits")
                 .join("10")
                 .join("bin");
-            let names = std::fs::read_dir(&bin)
-                .map(|rd| {
-                    rd.filter_map(Result::ok)
-                        .filter_map(|e| e.file_name().into_string().ok())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let versions = sdk_versions_newest_first(names.iter().map(String::as_str));
+            let mut names = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&bin) {
+                for entry in rd {
+                    if let Ok(e) = entry
+                        && let Ok(s) = e.file_name().into_string()
+                    {
+                        names.push(s);
+                    }
+                }
+            }
+            let mut name_refs = Vec::with_capacity(names.len());
+            for name in &names {
+                name_refs.push(name.as_str());
+            }
+            let versions = sdk_versions_newest_first(name_refs);
             if versions.is_empty() {
                 looked.push(format!("{}\\<10.x.y.z>", bin.display()));
             }
@@ -353,29 +424,53 @@ fn host_sdk_arch() -> &'static str {
 /// `10.0.26100.0` outranks `10.0.9600.0` — a lexical sort gets that wrong.
 /// Anything that is not four numeric components starting with 10 is dropped.
 fn sdk_versions_newest_first<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
-    let mut versions: Vec<(Vec<u64>, &str)> = names
-        .into_iter()
-        .filter_map(|n| {
-            let parts: Vec<u64> = n
-                .split('.')
-                .map(str::parse)
-                .collect::<Result<_, _>>()
-                .ok()?;
-            (parts.len() == 4 && parts[0] == 10).then_some((parts, n))
-        })
-        .collect();
-    versions.sort_by(|a, b| b.0.cmp(&a.0));
-    versions.into_iter().map(|(_, n)| n).collect()
+    let mut versions: Vec<([u64; 4], &str)> = Vec::new();
+    for n in names {
+        let mut split = n.split('.');
+        let (Some(p0), Some(p1), Some(p2), Some(p3), None) = (
+            split.next(),
+            split.next(),
+            split.next(),
+            split.next(),
+            split.next(),
+        ) else {
+            continue;
+        };
+        let (Ok(v0), Ok(v1), Ok(v2), Ok(v3)) = (
+            p0.parse::<u64>(),
+            p1.parse::<u64>(),
+            p2.parse::<u64>(),
+            p3.parse::<u64>(),
+        ) else {
+            continue;
+        };
+        if v0 == 10 {
+            versions.push(([!v0, !v1, !v2, !v3], n));
+        }
+    }
+    versions.sort_unstable();
+    let mut out = Vec::with_capacity(versions.len());
+    for (_, n) in versions {
+        out.push(n);
+    }
+    out
 }
 
 /// Resolve a bare program name against `PATH`, trying the Windows executable
 /// extensions when the name has none. A name with a directory component is
 /// returned as-is when it exists.
+#[allow(clippy::question_mark)]
 fn find_on_path(program: &Path) -> Option<PathBuf> {
     if program.components().count() > 1 {
-        return program.is_file().then(|| program.to_path_buf());
+        return if program.is_file() {
+            Some(program.to_path_buf())
+        } else {
+            None
+        };
     }
-    let paths = std::env::var_os("PATH")?;
+    let Some(paths) = std::env::var_os("PATH") else {
+        return None;
+    };
     let exts: &[&str] = if cfg!(windows) {
         &["exe", "cmd", "bat"]
     } else {

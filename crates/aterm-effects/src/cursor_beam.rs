@@ -14,6 +14,13 @@
 //!
 //! All light is additive [`GlowQuad`]s with per-quad coverage capped at `COV_CAP`.
 //! A pure function of an injected `now`; inactive once the blaze dies.
+//!
+//! On a LIGHT GROUND (additive light cannot show on white) the rod has a
+//! light mode of its own, ink UNDER the letters inside the cursor's row,
+//! solved against the theme's text (`cursor_glow::light_body_ink`): the bar
+//! becomes a narrow sleeve of the style's ink around a deeper core, the
+//! emitter block's aura the same slabs hugging the cell in ink; the block
+//! fill deepens toward its ink as it charges instead of whitening.
 
 use aterm_time::Instant;
 
@@ -63,6 +70,13 @@ pub struct BeamRodConfig {
     pub bar: bool,
     /// Sparkle's twinkle: faster, deeper breathing so the emitter glitters.
     pub shimmer: bool,
+    /// The ground is dark (the rod is light) or light (the rod is ink under
+    /// the letters).
+    pub dark_theme: bool,
+    /// The theme's text and paper, which a light ground's ink is solved
+    /// against.
+    pub theme_fg: u32,
+    pub theme_bg: u32,
 }
 
 /// What a tick produced: the emitter block fill (`None` for the bar, whose body
@@ -96,7 +110,13 @@ impl CursorBeamRod {
 
     /// Advance one frame: `blaze` is [`crate::cursor_glow::CursorGlow::blaze`]
     /// read after the aurora tick, `cur` the cursor cell (`None` ⇒ hidden). Appends
-    /// the additive rod/aura to `out`; returns the emitter fill and a fingerprint.
+    /// the additive rod/aura to `out` on a dark ground, its ink to `under` (the
+    /// under-ink stream) on a light one; returns the emitter fill and a
+    /// fingerprint.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "cursor cell + clock + blaze + geometry + config + the two streams it draws into"
+    )]
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -105,6 +125,7 @@ impl CursorBeamRod {
         geom: Geom,
         cfg: &BeamRodConfig,
         out: &mut Vec<GlowQuad>,
+        under: &mut Vec<GlowQuad>,
     ) -> BeamRodFrame {
         let e = (blaze.clamp(0.0, 1.0) * cfg.intensity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
         // Inert (identical to the plain themed cursor) when off, when the
@@ -135,6 +156,11 @@ impl CursorBeamRod {
         // floors it against the cell background.
         let fill = (!cfg.bar).then(|| {
             let k = 0.10 + 0.35 * e;
+            if !cfg.dark_theme {
+                // Paper: the block deepens toward its ink as it charges.
+                let deep = crate::cursor_glow::InkRole::OverText.ink(cfg.color);
+                return crate::effect_util::lerp_rgb(cfg.color, deep, k);
+            }
             let mix = |sh: u32| {
                 let c = ((cfg.color >> sh) & 0xff) as f32;
                 (c + (255.0 - c) * k).min(255.0) as u32
@@ -142,15 +168,17 @@ impl CursorBeamRod {
             (mix(16) << 16) | (mix(8) << 8) | mix(0)
         });
 
-        // The additive rod/aura, drawn only over a visible in-grid cursor cell.
+        // The rod/aura, drawn only over a visible in-grid cursor cell: light
+        // on a dark ground, ink under the letters on a light one.
         if let Some((cr, cc)) = cur
             && (cr as usize) < geom.rows
             && (cc as usize) < geom.cols
         {
-            if cfg.bar {
-                self.emit_rod(cr, cc, e, breathe, geom, cfg, out);
-            } else {
-                self.emit_aura(cr, cc, e, breathe, geom, cfg, out);
+            match (cfg.dark_theme, cfg.bar) {
+                (true, true) => self.emit_rod(cr, cc, e, breathe, geom, cfg, out),
+                (true, false) => self.emit_aura(cr, cc, e, breathe, geom, cfg, out),
+                (false, true) => Self::emit_rod_light(cr, cc, e, breathe, geom, cfg, under),
+                (false, false) => Self::emit_aura_light(cr, cc, e, breathe, geom, cfg, under),
             }
         }
 
@@ -244,6 +272,102 @@ impl CursorBeamRod {
         }
     }
 
+    /// The bar on a LIGHT GROUND: a narrow sleeve of the style's ink around a
+    /// deeper core on the bar's own x, under the letters and held inside the
+    /// cursor's row, charging with the blaze and breathing as the light rod
+    /// does. Bounded: two rects.
+    fn emit_rod_light(
+        cr: u16,
+        cc: u16,
+        e: f32,
+        breathe: f32,
+        geom: Geom,
+        cfg: &BeamRodConfig,
+        under: &mut Vec<GlowQuad>,
+    ) {
+        use crate::cursor_glow::{LIGHT_BODY_ALPHA_CAP, light_body_ink, reink_quads};
+        let cw = geom.cw as f32;
+        let ax = f32::from(geom.origin_x) + (cc as f32) * cw + cw * 0.10;
+        let y = i32::from(geom.origin_y) + cr as i32 * geom.ch as i32;
+        let strength = (COV_IDLE + (COV_MAX - COV_IDLE) * e) / COV_MAX
+            * cfg.intensity.clamp(0.0, 1.0)
+            * (0.90 + 0.10 * breathe);
+        let ink = light_body_ink(
+            cfg.color,
+            cfg.theme_fg,
+            cfg.theme_bg,
+            LIGHT_BODY_ALPHA_CAP as u8,
+        );
+        // (half-width in cell-widths, share of the body ceiling), sleeve first
+        // so the core composites over it.
+        for (hw, share) in [(0.30, 0.45), (0.11, 1.0)] {
+            let a = (LIGHT_BODY_ALPHA_CAP * share * strength) as u8;
+            if a == 0 {
+                continue;
+            }
+            let w = ((cw * hw * 2.0) as i32).max(1);
+            let from = under.len();
+            push_rect(
+                under,
+                geom,
+                (ax - cw * hw) as i32,
+                y,
+                w,
+                geom.ch as i32,
+                premul_rgb(0x00FF_FFFF, a),
+            );
+            reink_quads(&mut under[from..], LIGHT_BODY_ALPHA_CAP as u8, |_| ink);
+        }
+    }
+
+    /// The emitter block on a LIGHT GROUND: its aura as the dark one's
+    /// concentric slabs hugging the cell, in the style's ink under the
+    /// letters and held inside the cursor's row (so it reaches out sideways,
+    /// a square glow around the block, never Lumen's or the comet's round
+    /// one), swelling with the blaze; the slabs' compound darkness is the
+    /// ink's to bound (`light_body_ink`, solved opaque).
+    fn emit_aura_light(
+        cr: u16,
+        cc: u16,
+        e: f32,
+        breathe: f32,
+        geom: Geom,
+        cfg: &BeamRodConfig,
+        under: &mut Vec<GlowQuad>,
+    ) {
+        use crate::cursor_glow::{LIGHT_BODY_ALPHA_CAP, light_body_ink, reink_quads};
+        let (cw, ch) = (geom.cw as i32, geom.ch as i32);
+        let x = i32::from(geom.origin_x) + cc as i32 * cw;
+        let y = i32::from(geom.origin_y) + cr as i32 * ch;
+        let reach = ((0.16 + 0.29 * e) * (0.85 + 0.15 * breathe) * geom.ch as f32) as i32;
+        let strength = (0.30 + 0.45 * e) * cfg.intensity.clamp(0.0, 1.0);
+        let ink = light_body_ink(
+            cfg.color,
+            cfg.theme_fg,
+            cfg.theme_bg,
+            LIGHT_BODY_ALPHA_CAP as u8,
+        );
+        // (reach ×, share of the body ceiling), outermost first, as on dark.
+        for (rx, share) in [(1.0, 0.25), (0.62, 0.35), (0.30, 0.45)] {
+            let g = (reach as f32 * rx) as i32;
+            let a = (LIGHT_BODY_ALPHA_CAP * share * strength) as u8;
+            if g < 1 || a == 0 {
+                continue;
+            }
+            let from = under.len();
+            push_rect(
+                under,
+                geom,
+                x - g,
+                y,
+                cw + 2 * g,
+                ch,
+                premul_rgb(0x00FF_FFFF, a),
+            );
+            reink_quads(&mut under[from..], LIGHT_BODY_ALPHA_CAP as u8, |_| ink);
+        }
+    }
+
     /// The block treatment: a soft aura of concentric rounded slabs hugging
     /// the emitter cell, reaching at most ~0.45 cell-heights.
     #[allow(
@@ -327,6 +451,9 @@ mod tests {
             haze: aterm_render::BEAM_SPACE_HAZE,
             bar,
             shimmer: false,
+            dark_theme: true,
+            theme_fg: 0x00C8_C8D2,
+            theme_bg: 0x0010_1016,
         }
     }
 
@@ -338,12 +465,12 @@ mod tests {
         let t0 = Instant::now();
         let mut c = cfg(true);
         c.enabled = false;
-        let f = rod.tick(Some((2, 3)), t0, 1.0, geom(), &c, &mut out);
+        let f = rod.tick(Some((2, 3)), t0, 1.0, geom(), &c, &mut out, &mut Vec::new());
         assert!(out.is_empty() && f.fill.is_none() && f.fp == 0);
         assert!(!rod.is_active());
         let mut c = cfg(true);
         c.intensity = 0.0;
-        let f = rod.tick(Some((2, 3)), t0, 1.0, geom(), &c, &mut out);
+        let f = rod.tick(Some((2, 3)), t0, 1.0, geom(), &c, &mut out, &mut Vec::new());
         assert!(out.is_empty() && f.fill.is_none() && f.fp == 0);
         assert!(!rod.is_active());
     }
@@ -355,7 +482,15 @@ mod tests {
         let mut rod = CursorBeamRod::default();
         let mut out = Vec::new();
         let g = geom();
-        let f = rod.tick(Some((2, 3)), Instant::now(), 1.0, g, &cfg(true), &mut out);
+        let f = rod.tick(
+            Some((2, 3)),
+            Instant::now(),
+            1.0,
+            g,
+            &cfg(true),
+            &mut out,
+            &mut Vec::new(),
+        );
         assert!(f.fill.is_none(), "bars have no fill-override channel");
         assert!(f.fp != 0, "a charged rod is drawable");
         assert!(rod.is_active(), "full blaze ⇒ still animating");
@@ -388,7 +523,15 @@ mod tests {
             g.origin_y = 120;
             g.win_w = 460;
             g.win_h = 440;
-            let f = rod.tick(Some((2, 3)), Instant::now(), 1.0, g, &cfg(bar), &mut out);
+            let f = rod.tick(
+                Some((2, 3)),
+                Instant::now(),
+                1.0,
+                g,
+                &cfg(bar),
+                &mut out,
+                &mut Vec::new(),
+            );
             assert!(f.fp != 0 && !out.is_empty(), "charged light must draw");
             for q in &out {
                 assert!(
@@ -411,9 +554,25 @@ mod tests {
         let mut rod = CursorBeamRod::default();
         let mut out = Vec::new();
         let t0 = Instant::now();
-        rod.tick(Some((2, 3)), t0, 1.0, geom(), &cfg(true), &mut out);
+        rod.tick(
+            Some((2, 3)),
+            t0,
+            1.0,
+            geom(),
+            &cfg(true),
+            &mut out,
+            &mut Vec::new(),
+        );
         assert!(rod.is_active());
-        rod.tick(Some((2, 3)), t0, 0.0, geom(), &cfg(true), &mut out);
+        rod.tick(
+            Some((2, 3)),
+            t0,
+            0.0,
+            geom(),
+            &cfg(true),
+            &mut out,
+            &mut Vec::new(),
+        );
         assert!(!rod.is_active(), "a dead blaze settles the animator");
     }
 }

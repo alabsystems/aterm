@@ -30,8 +30,8 @@ use std::collections::HashMap;
 use aterm_dbus::{Message, Type, Value};
 
 use super::semantics::{
-    CoordType, Error as SemanticError, Granularity, Interface, InterfaceSet, NodeId, PlatformNode,
-    PlatformRoot, ScrollType,
+    CoordType, Error as SemanticError, Granularity, Interface, InterfaceSet, NodeIdentity,
+    PlatformNode, PlatformRoot, ScrollType,
 };
 use super::wire::{self, CACHE_PATH, CacheText, ObjectId, ROOT_PATH};
 
@@ -657,7 +657,7 @@ fn node_method(
 ) -> Dispatch {
     let bus = objects.bus_name();
     let adapter = node.adapter_id();
-    let id = |n: NodeId| ObjectId::Node { adapter, node: n };
+    let id = |n: NodeIdentity| ObjectId::Node { adapter, node: n };
     let err = |e| semantic(path, e);
     let out = match (interface, member) {
         (ACCESSIBLE, "GetChildAtIndex") => {

@@ -1,0 +1,16 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# S3: Esc's row: the open turn was interrupted and the vendor turn ended
+# (no turn end follows): the screen's idle closes the turn interrupted, and
+# a later busy opens a turn that vendor turn never continues.
+bind 0
+see busy
+tx prompt v1
+tx interrupt
+expect tx ended=1
+see idle
+wait 1000
+expect close t1 turn out=interrupted src=screen
+see busy
+expect open t1 turn
+expect open t2 turn at=1000
+expect amend t1 turn vref=v1

@@ -191,8 +191,9 @@ mod tests {
         assert!(err.contains("mint under a new id"), "{err}");
         // The original key is untouched: no partial edit happened.
         assert_eq!(r.machines[0].pubkey, M3_KEY);
-        // An empty id is refused too — attribution with no name is not attribution.
-        assert!(add(r, "", M3_KEY, NOW).is_err());
+        // An empty id is refused too — attribution with no name is not attribution —
+        // under a key no other rule refuses.
+        assert!(add(r, "", M11_KEY, NOW).is_err());
     }
 
     /// REUSING A KEY UNDER A SECOND ID IS REFUSED, and this is the stronger of the two
@@ -240,6 +241,11 @@ mod tests {
         // m3 is untouched: revocation is targeted, not a channel-wide brick.
         assert!(r.machines.iter().any(|m| m.id == "m3"));
         assert!(r.validate().is_ok());
+
+        // Revoking it AGAIN (a re-run after an interrupted publish) converges: accepted,
+        // and the deny-list still names it once.
+        let r = revoke(r, "m11", NOW).expect("an id already revoked is still known");
+        assert_eq!(r.revoked, ["m11"]);
     }
 
     /// A revoked id NEVER returns, so a re-mint under it cannot resurrect the machine.

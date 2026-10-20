@@ -45,10 +45,24 @@ pub fn in_own_process(module: &str, test: &str) -> bool {
         );
         return false;
     }
-    if stderr.contains(aterm_spec::host::COULD_NOT_RUN)
-        || stdout.contains(aterm_spec::host::COULD_NOT_RUN)
-    {
-        aterm_spec::host::could_not_run(format!("{path}, alone in its own process:\n{stderr}"));
+    // The child's why (what the host lacks, and its fix) is the rest of its
+    // sentinel's line. It leads the re-raise, trimmed as aterm-verify's
+    // `refusal_reasons` trims, so this sentinel's line reads as the child's:
+    // the COULD NOT RUN row shows that why once, not this wrapper's context.
+    let child_why = |text: &str| {
+        text.lines().find_map(|line| {
+            let (_, rest) = line.split_once(aterm_spec::host::COULD_NOT_RUN)?;
+            Some(
+                rest.trim_start_matches(|c: char| c == ':' || c == '—' || c.is_whitespace())
+                    .trim_end()
+                    .to_owned(),
+            )
+        })
+    };
+    if let Some(why) = child_why(&stderr).or_else(|| child_why(&stdout)) {
+        aterm_spec::host::could_not_run(format!(
+            "{why}\n({path}, alone in its own process)\n{stderr}"
+        ));
     }
     panic!("{path} failed alone in its own process\nstdout: {stdout}\nstderr: {stderr}");
 }

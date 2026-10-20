@@ -76,6 +76,23 @@ fn full() -> ApprovalCtx {
     )
 }
 
+/// `c` for a box the git rule reads (`git status`): on Windows the session
+/// stands in this host's temp directory, outside any repository as
+/// `/private/tmp/claude-502/scratch/work1` is on a Unix host. The git rule
+/// reads Claude Code's settings chain from the session's directory, and a
+/// `/`-rooted one names no drive on Windows (a directory not known, which
+/// escalates). On Unix `c` itself.
+fn git_host(c: ApprovalCtx) -> ApprovalCtx {
+    if cfg!(windows) {
+        ApprovalCtx {
+            cwd: std::env::temp_dir(),
+            ..c
+        }
+    } else {
+        c
+    }
+}
+
 /// `ctx` under `approve = "none"`.
 fn none(ctx: ApprovalCtx) -> ApprovalCtx {
     ApprovalCtx {
@@ -310,7 +327,7 @@ fn the_2_1_281_breaker_with_its_auto_deny_countdown_is_the_rm_rules() {
             read.insert(q + k, row.clone());
         }
         assert_eq!(
-            approved(&on_screen(&read, &ctx())),
+            approved(&on_screen(&read, &git_host(ctx()))),
             Some(RULE_READ_ONLY),
             "{wrapped}"
         );
@@ -376,7 +393,7 @@ fn a_shell_startup_the_models_do_not_assume_proves_no_rm_and_reads_nothing() {
         Some(RULE_RM_BREAKER)
     );
     assert_eq!(
-        approved(&on_screen(&read, &with(&clean, ctx()))),
+        approved(&on_screen(&read, &with(&clean, git_host(ctx())))),
         Some(RULE_READ_ONLY)
     );
 
@@ -404,7 +421,7 @@ fn a_shell_startup_the_models_do_not_assume_proves_no_rm_and_reads_nothing() {
     let d = on_screen(&rm, &with(&rm_fn, bypass()));
     assert!(reason(&d).contains("`rm` is a function"), "{d:?}");
     assert_eq!(
-        approved(&on_screen(&read, &with(&rm_fn, ctx()))),
+        approved(&on_screen(&read, &with(&rm_fn, git_host(ctx())))),
         Some(RULE_READ_ONLY)
     );
     let git_fn = zsh_startup("git () {\n\tcommand git \"$@\"\n}\n", "");
@@ -459,7 +476,7 @@ fn under_zsh_only_a_plain_line_is_a_proven_read() {
     let with = |shell: &Result<ShellStartup, String>, approve: Approve| ApprovalCtx {
         shell: shell.clone(),
         approve,
-        ..ctx()
+        ..git_host(ctx())
     };
     for line in [
         "ls -la \"$TMPDIR\"",
@@ -669,6 +686,7 @@ fn an_rm_breaker_through_a_link_out_of_scratch_escalates() {
 
 #[test]
 fn a_read_only_box_is_approved_outside_bypass_and_never_in_it() {
+    let ctx = || git_host(self::ctx());
     let rows = bash_box(
         &["git status --short"],
         Some("Show the working tree status"),
@@ -710,6 +728,7 @@ fn a_read_only_box_is_approved_outside_bypass_and_never_in_it() {
 /// judged as one wrapped line.
 #[test]
 fn a_write_on_a_second_row_is_not_laundered_by_the_space_join() {
+    let ctx = || git_host(self::ctx());
     let barred = bash_box(&["│ git status", "│ touch x"], None);
     let p = aterm_phase::parse_prompt(&barred).expect("a box");
     assert_eq!(p.command, "git status touch x");
@@ -924,6 +943,7 @@ fn a_barred_row_shown_as_the_description_is_still_judged() {
 /// vouching for its phase decides nothing at full power either.
 #[test]
 fn only_a_claude_sessions_box_is_judged() {
+    let ctx = || git_host(self::ctx());
     let rows = bash_box(&["git status --short"], None);
     assert_eq!(approved(&on_screen(&rows, &ctx())), Some(RULE_READ_ONLY));
     for shell in ["zsh", "-zsh", "less", "cat"] {
@@ -963,7 +983,9 @@ fn only_a_claude_sessions_box_is_judged() {
 
 /// The Read rule is an allow-list: the trust roots and system roots, and no
 /// secret under them. Here a person's roots are named; by default there is
-/// none ([`with_no_trust_root_only_the_system_roots_are_read`]).
+/// none ([`with_no_trust_root_only_the_system_roots_are_read`]). Unix only: the
+/// Read rule proves a path on the disk, and these are a Unix host's.
+#[cfg(unix)]
 #[test]
 fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() {
     let ctx = || {
@@ -1162,6 +1184,35 @@ fn a_trust_dialog_escalates_off_the_sessions_folder_or_its_roots() {
     rootless.set_trust_roots(&["~/proj*".to_string()], 502);
     assert!(reason(&on_screen(&rows, &rootless)).contains("no trust root"));
     assert!(reason(&on_screen(&rows, &none(rooted(ctx())))).contains("approve = \"none\""));
+}
+
+/// THE ONE FOLDER A WORKER'S STARTER TRUSTED (`spawn agent=claude cwd=…`,
+/// `ApprovalCtx::trusted_cwd`): under no trust root, the dialog for exactly
+/// that folder is answered by the same rule, and the global roots stay as
+/// they were. NEGATIVE CONTROLS: a trusted folder ABOVE the dialog's (a
+/// parent is not the folder), one beside it, and none at all escalate.
+#[test]
+fn a_trust_dialog_for_the_folder_its_starter_trusted_is_answered_under_no_root() {
+    let rows = lines(CAP_TRUST);
+    let mut worker = ctx();
+    worker.set_trust_roots(&["~/aterm*".to_string()], 502);
+    worker.trusted_cwd = Some(PathBuf::from("/private/tmp/claude-502/scratch/work1"));
+    assert_eq!(
+        approved(&on_screen(&rows, &worker)),
+        Some(RULE_TRUST_DIALOG)
+    );
+    assert_eq!(worker.trust_roots.len(), 1, "no root was added");
+    for other in [
+        Some("/private/tmp/claude-502/scratch"),
+        Some("/private/tmp/claude-502/scratch/work2"),
+        None,
+    ] {
+        worker.trusted_cwd = other.map(PathBuf::from);
+        assert!(
+            reason(&on_screen(&rows, &worker)).contains("no trust root"),
+            "{other:?}"
+        );
+    }
 }
 
 // --- the usage-limit dialog ------------------------------------------------
@@ -1639,6 +1690,255 @@ fn the_grant_row_is_taken_by_its_own_rule_and_only_with_its_key_on() {
     assert!(d.as_ref().is_none_or(|d| approved(d).is_none()), "{d:?}");
 }
 
+/// CLAUDE CODE 2.1.304'S ROW IS TAKEN ONLY WHERE IT IS THE ONE RESET ON
+/// OFFER, AND NEVER A FABLE RESET: the reader's composed dialog with one full
+/// reset is answered by [`RULE_LIMIT_RESET`] on that row, by its whole label,
+/// key on; so is a lone 5-hour or weekly reset. NEGATIVE CONTROLS: key off,
+/// the same screen is the wait row's; the composed dialog with three kinds on
+/// offer (which one to spend is the owner's choice), a lone Fable reset, a
+/// kind with nought left, a kind beside the weekly session reset's row and a
+/// kind this build does not name are the wait row's, key on.
+#[test]
+fn claude_code_2_1_304s_lone_reset_is_taken_and_several_are_not() {
+    let composed = |name: &str| {
+        let (_, text) = aterm_phase::reset::fixtures::ALL
+            .iter()
+            .find(|(n, _)| *n == name)
+            .expect("the composed screen");
+        phase_fixtures::screen(text)
+    };
+    let full_row = "Use a full reset (2 left, until Oct 5)";
+    let rows = composed("dialog-kinds-full");
+    let guard = crate::supervise::policy::row_guard("   What do you want to do?");
+    let reset = |steps: i32, label: &str| Decision::Approve {
+        rule_id: RULE_LIMIT_RESET,
+        choice: Choice::Focus {
+            steps,
+            label: label.to_string(),
+        },
+        guard: guard.clone(),
+        subject: label.to_string(),
+        unproven: None,
+    };
+    let wait = |steps: i32| Decision::Approve {
+        rule_id: RULE_LIMIT_WAIT,
+        choice: Choice::Focus {
+            steps,
+            label: WAIT_OCT_9.to_string(),
+        },
+        guard: guard.clone(),
+        subject: WAIT_OCT_9.to_string(),
+        unproven: None,
+    };
+    for c in [ctx(), full(), none(full())] {
+        assert_eq!(on_screen(&rows, &c), wait(2), "{:?}", c.approve);
+        let on = resetting(c);
+        assert_eq!(
+            on_screen(&rows, &on),
+            reset(1, full_row),
+            "{:?}",
+            on.approve
+        );
+    }
+    let on = resetting(full());
+    for lone in [
+        "Use a 5-hour reset (1 left, until Oct 25)",
+        "Use a weekly reset (1 left, until Oct 7)",
+        full_row,
+    ] {
+        let screen = phase_fixtures::limit_options_panel(&[STOP, lone, WAIT_OCT_9], 0, true);
+        assert_eq!(on_screen(&screen, &on), reset(1, lone), "{lone}");
+        assert_eq!(on_screen(&screen, &full()), wait(2), "{lone}, key off");
+    }
+    assert_eq!(on_screen(&composed("dialog-kinds-several"), &on), wait(4));
+    for labels in [
+        vec![
+            STOP,
+            "Use a Fable reset (1 left, until Oct 6) · frees up only what Fable used this week",
+            WAIT_OCT_9,
+        ],
+        vec![STOP, "Use a Fable reset (1 left, until Oct 6)", WAIT_OCT_9],
+        vec![STOP, "Use a full reset (0 left, until Oct 5)", WAIT_OCT_9],
+        vec![
+            STOP,
+            "Use a monthly reset (1 left, until Oct 5)",
+            WAIT_OCT_9,
+        ],
+        vec![
+            STOP,
+            "Use a full reset (2 left, until Oct 5)",
+            GRANT,
+            WAIT_OCT_9,
+        ],
+    ] {
+        let wait_at = labels.iter().position(|l| *l == WAIT_OCT_9).expect("wait");
+        let screen = phase_fixtures::limit_options_panel(&labels, 0, true);
+        assert_eq!(
+            on_screen(&screen, &on),
+            wait(i32::try_from(wait_at).expect("small")),
+            "{labels:?}"
+        );
+    }
+    let beside =
+        phase_fixtures::limit_options_panel(&[STOP, WEEKLY_RESET, full_row, WAIT_OCT_9], 0, true);
+    assert_eq!(on_screen(&beside, &on), wait(3));
+    // MEASURED on 2.1.304 (the lab): its dialog with no reset on offer is the
+    // wait row's, key on.
+    let measured = phase_fixtures::screen(phase_fixtures::LIMIT_DIALOG_NO_RESET_ROWS_2_1_304);
+    match on_screen(&measured, &on) {
+        Decision::Approve {
+            rule_id, subject, ..
+        } => assert_eq!(
+            (rule_id, subject.as_str()),
+            (
+                RULE_LIMIT_WAIT,
+                "Wait here, then continue automatically at 4:47pm"
+            )
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Claude Code 2.1.304 offers several kinds of limit reset in one dialog and
+/// no longer says `your reset`: the wall's row and each row of the chooser
+/// read `Use a {kind} ({left} left, until {date})`, the confirmation's yes
+/// `Yes, use my {kind}` (READ in the 2.1.304 bundle; composed here). Each one
+/// still spends, so no rule but the reset's own may choose it — and so does
+/// any `use` whose head names a reset. NEGATIVE CONTROLS: options that say
+/// `use` with no reset in their head (the words before the first `(`, `·`,
+/// `?` or comma, or a later clause, `aterm_phase::spends_reset`) spend
+/// nothing; before this every 2.1.304
+/// spelling read as no spend.
+#[test]
+fn claude_code_2_1_304s_reset_kinds_still_spend() {
+    use aterm_phase::prompt::{Opt, Role};
+    let opt = |label: &str| Opt {
+        n: Some(1),
+        label: label.to_string(),
+        role: Role::Other,
+        focused: true,
+        row: 0,
+        kept: false,
+    };
+    for label in [
+        "Use a 5-hour reset (1 left, until Oct 25)",
+        "Use a Fable reset (2 left, until Nov 1) · frees up only what Fable used this week",
+        "Use a full reset (1 left, until Oct 25)",
+        "Use a weekly reset",
+        "Yes, use my 5-hour reset",
+        "Yes, use my weekly reset",
+        "Yes, use my Fable reset",
+        "Yes, use my full reset",
+        "Use an hourly reset (1 left)",
+    ] {
+        assert!(spends(label), "{label}");
+        assert!(buys(&opt(label)), "{label}");
+    }
+    for label in [
+        "Use a different model",
+        "Yes, use my settings",
+        "Use an existing worktree",
+        "Yes, use the reset branch for this commit",
+        // `reset` past the head's end (aterm-phase reads the head up to its
+        // first `(`, `·`, `?` or comma, or a later clause's `and`/`or`/`then`/
+        // `but`/`to`, since 6ae0fc861c).
+        "Use a fresh session (reset nothing later)",
+        "Use a fresh session and reset nothing later",
+        // The same 2.1.304 bundle's other `Yes, use my …` yeses (the Chrome
+        // auto-enable dialog's, the cloud plugins offer's), a one-shot label
+        // that merely says `use`, and a plain yes.
+        "Yes, use my browser",
+        "Yes, use my enabled plugins in cloud sessions",
+        "Use a tool",
+        "Yes",
+    ] {
+        assert!(!spends(label), "{label}");
+        assert!(!buys(&opt(label)), "{label}");
+    }
+}
+
+/// Claude Code 2.1.304's new purchases (READ in its bundle; never captured on
+/// a screen): the spend-limit nudge, drawn in the usage-limit menu's place
+/// when the account's own monthly cap is hit, opens on `Adjust monthly spend
+/// limit: $N` (`…` while loading, `Unlimited` with no cap), whose Enter on a
+/// changed value raises the account's spend limit for good and carries the
+/// session on on credits; its other rows are `Wait for limit to reset` and
+/// `Upgrade to Max for higher session limits every month`. The promotional
+/// buy screen's rows read `Pay $X · Get $Y`. Each is a purchase, whatever
+/// `[harness] usage_credits` says, and the nudge whole is answered with its
+/// wait row (`no-spend@v1`), the key on or off: that row saves nothing (the
+/// bundle). NEGATIVE CONTROLS: the nudge's wait row waits and buys nothing,
+/// nor do a plain `Yes`, a label opening with a word that only begins `pay`,
+/// and a label that names a spend limit further in; the nudge with no wait
+/// row is a person's.
+#[test]
+fn claude_code_2_1_304s_spend_limit_nudge_and_buy_screen_are_purchases() {
+    use aterm_phase::prompt::{Opt, Role};
+    let opt = |label: &str| Opt {
+        n: None,
+        label: label.to_string(),
+        role: Role::Other,
+        focused: true,
+        row: 0,
+        kept: false,
+    };
+    for label in [
+        "Adjust monthly spend limit: $50",
+        "Adjust monthly spend limit: Unlimited",
+        "Adjust monthly spend limit: …",
+        "Adjust monthly limit",
+        "Upgrade to Max for higher session limits every month",
+        "Upgrade to Max 20x for higher session limits every month",
+        "Pay $10 · Get $12",
+    ] {
+        assert!(buys(&opt(label)), "{label}");
+    }
+    for label in [
+        "Wait for limit to reset",
+        "Yes",
+        "Payload preview",
+        "Yes, allow edits to adjust monthly spend limit docs",
+    ] {
+        assert!(!buys(&opt(label)), "{label}");
+    }
+    assert!(waits(&opt("Wait for limit to reset")));
+    // The nudge whole, COMPOSED from the bundle in the Dialog frame (its rows
+    // unnumbered, each hint beside its label, the focus on the adjust row).
+    let nudge = dialog(&[
+        "   What do you want to do?",
+        "",
+        "   ❯ Adjust monthly spend limit: $50   ← or → to set a limit",
+        "     Wait for limit to reset           Resets 4pm",
+        "     Upgrade to Max for higher session limits every month",
+        "",
+        "   Enter to confirm · Esc to cancel",
+    ]);
+    let credits = ApprovalCtx {
+        usage_credits: true,
+        ..full()
+    };
+    let wait = Choice::Focus {
+        steps: 1,
+        label: "Wait for limit to reset".to_string(),
+    };
+    for ctx in [full(), credits.clone()] {
+        assert_eq!(
+            pressed(&on_screen(&nudge, &ctx)),
+            (RULE_NO_SPEND, wait.clone())
+        );
+    }
+    // With no wait row nothing it offers may be pressed: a person's.
+    let unwaited: Vec<String> = nudge
+        .iter()
+        .filter(|r| !r.contains("Wait for limit"))
+        .cloned()
+        .collect();
+    for ctx in [full(), credits] {
+        let d = on_screen(&unwaited, &ctx);
+        assert!(approved(&d).is_none(), "{d:?}");
+    }
+}
+
 /// NO RULE EVER SPENDS A LIMIT RESET. Claude Code's usage-limit dialog can
 /// offer `Use your reset now (…)` or `Reset your session limit now`, and the
 /// first opens a confirmation whose yes is `Yes, use my reset` (READ in the
@@ -1665,6 +1965,7 @@ fn no_rule_ever_spends_a_limit_reset() {
         role,
         focused,
         row: 0,
+        kept: false,
     };
     for label in [
         "Yes, use my reset",
@@ -2282,6 +2583,8 @@ fn a_read_box_with_no_folder_grant_is_the_owners_review() {
         read_call_box_2_1_284("/etc/hosts"),
         read_box("/etc/hosts"),
     ] {
+        // The Read rule's system roots (`/etc`) are a Unix host's.
+        #[cfg(unix)]
         assert_eq!(
             approved(&on_screen(&rows, &ctx())),
             Some(RULE_READ_OUTSIDE_CWD)
@@ -2317,8 +2620,12 @@ fn the_claude_tmp_root_is_the_uids_own() {
     c.set_trust_roots(&["/private/tmp/claude-*".to_string()], 502);
     let d = on_screen(&read_box("/private/tmp/claude-503/scratch/x.log"), &c);
     assert!(reason(&d).contains("allowed root"), "{d:?}");
-    let d = on_screen(&read_box("/private/tmp/claude-502/scratch/x.log"), &c);
-    assert_eq!(approved(&d), Some(RULE_READ_OUTSIDE_CWD), "{d:?}");
+    // Proven on the disk: a Unix host's `/private/tmp`.
+    #[cfg(unix)]
+    {
+        let d = on_screen(&read_box("/private/tmp/claude-502/scratch/x.log"), &c);
+        assert_eq!(approved(&d), Some(RULE_READ_OUTSIDE_CWD), "{d:?}");
+    }
 }
 
 /// The trust dialog's rows for `folder` in place of the captured one's.
@@ -2384,7 +2691,9 @@ fn the_default_trusts_no_folder() {
 /// With no trust root a Read is answered under the system roots alone: a
 /// file in a checkout, or in Claude Code's temp root, goes to a person (on a
 /// shared `/tmp` another local user could have made that root first).
-/// Control: the same paths are read once a root names them.
+/// Control: the same paths are read once a root names them. Unix only: the
+/// system roots, and every path here, are a Unix host's.
+#[cfg(unix)]
 #[test]
 fn with_no_trust_root_only_the_system_roots_are_read() {
     let c = ctx();
@@ -2498,7 +2807,7 @@ fn full_power_answers_every_permission_box_with_its_one_shot_allow() {
     );
     // A read the safe rule proves is ledgered under it, not as allow-once,
     // and is no unproven press.
-    let d = on_screen(&phase_fixtures::bash_one_row(), &full());
+    let d = on_screen(&phase_fixtures::bash_one_row(), &git_host(full()));
     assert_eq!(
         approved(&d),
         Some(RULE_READ_ONLY),
@@ -2570,14 +2879,21 @@ fn full_power_never_takes_a_standing_grant() {
     assert!(reason(&d).contains("no one-shot allow"), "{d:?} {rows:#?}");
 }
 
-/// A consent to go on with usage credits already on (`Continue with …`) is
-/// accepted as the one-shot allow. A purchase never is: a box whose every yes
+/// A consent to go on with usage credits already on (`Continue with usage
+/// credits`) is accepted only under `[harness] usage_credits`
+/// (`credits-consent@v1`); off, the default, its box is cancelled with Esc
+/// (`credits-decline@v1`), its `No` not pressed either (owner, 2026-10-19). A purchase never is, whatever the key: a box whose every yes
 /// buys gets the option that waits, or its `No`, and one with neither
 /// escalates; re-enabling credits the account holder turned off is a purchase.
 /// Only a label's opening words count, so a path in a label is not a purchase.
-/// Labels come from the vendor binaries, not screen captures.
+/// Labels come from the vendor binaries, not screen captures. NEGATIVE
+/// CONTROL: the same consent box with the key on is taken.
 #[test]
 fn full_power_accepts_a_consent_and_never_buys() {
+    let credits = ApprovalCtx {
+        usage_credits: true,
+        ..full()
+    };
     let box_of = |opts: &[&str]| {
         let mut r = vec![
             "⏺ Working.".to_string(),
@@ -2591,38 +2907,52 @@ fn full_power_accepts_a_consent_and_never_buys() {
         r.push(" Esc to cancel".to_string());
         r
     };
-    let reenable = on_screen(
-        &box_of(&[
-            "❯ 1. Yes, re-enable and continue",
-            "2. Yes, buy usage credits",
-            "3. No, keep my current model",
-        ]),
-        &full(),
+    for ctx in [full(), credits.clone()] {
+        let reenable = on_screen(
+            &box_of(&[
+                "❯ 1. Yes, re-enable and continue",
+                "2. Yes, buy usage credits",
+                "3. No, keep my current model",
+            ]),
+            &ctx,
+        );
+        assert_eq!(pressed(&reenable), (RULE_NO_SPEND, Choice::Digit(3)));
+        let d = on_screen(
+            &box_of(&[
+                "❯ 1. Yes, buy usage credits",
+                "2. Stop and wait for limit to reset",
+            ]),
+            &ctx,
+        );
+        assert_eq!(pressed(&d), (RULE_NO_SPEND, Choice::Digit(2)), "{d:?}");
+        let d = on_screen(&box_of(&["❯ 1. Yes, buy usage credits", "2. No"]), &ctx);
+        assert_eq!(pressed(&d), (RULE_DECLINE, Choice::Digit(2)), "{d:?}");
+        let d = on_screen(
+            &box_of(&["❯ 1. Yes, buy usage credits", "2. Upgrade your plan"]),
+            &ctx,
+        );
+        assert!(reason(&d).contains("nothing that waits"), "{d:?}");
+    }
+    let consent = box_of(&[
+        "❯ 1. Continue with usage credits",
+        "2. No, keep my current model",
+    ]);
+    // The default: cancelled, its `No` not pressed either.
+    assert_eq!(
+        pressed(&on_screen(&consent, &full())),
+        (
+            RULE_CREDITS_DECLINE,
+            Choice::FocusKey {
+                steps: 0,
+                label: "Continue with usage credits".to_string(),
+                key: "esc",
+            }
+        )
     );
-    assert_eq!(pressed(&reenable), (RULE_NO_SPEND, Choice::Digit(3)));
-    let consent = on_screen(
-        &box_of(&[
-            "❯ 1. Continue with usage credits",
-            "2. No, keep my current model",
-        ]),
-        &full(),
+    assert_eq!(
+        pressed(&on_screen(&consent, &credits)),
+        (RULE_CREDITS_CONSENT, Choice::Digit(1))
     );
-    assert_eq!(pressed(&consent), (RULE_ALLOW_ONCE, Choice::Digit(1)));
-    let d = on_screen(
-        &box_of(&[
-            "❯ 1. Yes, buy usage credits",
-            "2. Stop and wait for limit to reset",
-        ]),
-        &full(),
-    );
-    assert_eq!(pressed(&d), (RULE_NO_SPEND, Choice::Digit(2)), "{d:?}");
-    let d = on_screen(&box_of(&["❯ 1. Yes, buy usage credits", "2. No"]), &full());
-    assert_eq!(pressed(&d), (RULE_DECLINE, Choice::Digit(2)), "{d:?}");
-    let d = on_screen(
-        &box_of(&["❯ 1. Yes, buy usage credits", "2. Upgrade your plan"]),
-        &full(),
-    );
-    assert!(reason(&d).contains("nothing that waits"), "{d:?}");
     // Negative control: a plain `Yes` on a dialog of no kind is no consent (a
     // setup dialog's yes may settle something for good), so it is declined; on
     // a permission box it is the answer.
@@ -2638,6 +2968,7 @@ fn full_power_accepts_a_consent_and_never_buys() {
         role: aterm_phase::prompt::Role::Once,
         focused: true,
         row: 0,
+        kept: false,
     };
     for (l, buy) in [
         ("Yes, buy usage credits", true),
@@ -2659,6 +2990,191 @@ fn full_power_accepts_a_consent_and_never_buys() {
     ] {
         assert_eq!(buys(&label(l)), buy, "{l}");
     }
+}
+
+/// Claude Code's Dialog frame (the composed reset confirmation's first three
+/// rows: the turn above, a blank, the rule), `body` under it.
+fn dialog(body: &[&str]) -> Vec<String> {
+    let mut rows: Vec<String> =
+        phase_fixtures::screen(aterm_phase::reset::fixtures::CONFIRM)[..3].to_vec();
+    rows.extend(body.iter().map(|row| (*row).to_string()));
+    rows
+}
+
+/// CONTINUING ON USAGE CREDITS IS `[harness] usage_credits`'s (owner,
+/// 2026-10-19: *"for continuing on credits, that's an optional additional
+/// feature that's off by default. use subscriptions."*). Claude Code
+/// 2.1.304's credit consents, COMPOSED from its bundle (no such box has been
+/// captured on a screen) in its Dialog frame: the model consent dialog
+/// mid-session at the Fable limit (its body names the credits) and for a
+/// model that now uses them (its title does), each unnumbered, its switch row
+/// focused; and the Usage credits dialog's numbered `Continue with usage
+/// credits` (its label does). Off, the default: each is cancelled with Esc
+/// where its footer reads `Esc to cancel` (`credits-decline@v1`, the focus
+/// left where it is), its `Switch to <model> and continue` and `Not now`
+/// pressed no more than its consent (either may save the person's default
+/// model). NEGATIVE CONTROLS: the same box with no `Esc to cancel` in its
+/// footer (`Esc to go back`) goes to a person, the reason worded by its kind — a model's consent kept for
+/// good per model and account, the Usage credits dialog's saving nothing;
+/// the key on takes each consent (`credits-consent@v1`, logged apart from a
+/// one-shot allow); a consent that names no credits (`Continue with a
+/// refill`) is taken with the key off (`allow-once@v1`); and
+/// [`credits_consent`] reads the label, the title and the body each alone —
+/// the body wrapped inside a framed box — and none on a box that names no
+/// credits.
+#[test]
+fn a_credits_consent_is_taken_only_under_usage_credits() {
+    let credits = ApprovalCtx {
+        usage_credits: true,
+        ..full()
+    };
+    let fable = dialog(&[
+        "   You've reached your Fable limit",
+        "",
+        "   You've used your included Fable usage for this week. Continuing on Fable 5.1 uses",
+        "   usage credits — you have $12.00 in credits.",
+        "   https://support.claude.com/en/articles/12429409-extra-usage-for-paid-claude-plans",
+        "",
+        "   ❯ Switch to Opus 5.5 and continue",
+        "     Continue with Fable 5.1",
+        "",
+        "   Enter to confirm · Esc to cancel",
+    ]);
+    let nimbus = dialog(&[
+        "   Nimbus 2 now uses usage credits",
+        "",
+        "   Nimbus 2 runs on usage credits — you have $12.00 in credits.",
+        "   https://support.claude.com/en/articles/12429409-extra-usage-for-paid-claude-plans",
+        "",
+        "   ❯ Not now",
+        "     Continue with Nimbus 2",
+        "",
+        "   Enter to confirm · Esc to cancel",
+    ]);
+    let enabled = dialog(&[
+        "   Usage credits",
+        "",
+        "   $3.10 spent · 16% used",
+        "   Resets Nov 1 · $20.00 monthly limit",
+        "",
+        "   ❯ 1. $12.00 balance · auto-reload off",
+        "     2. Buy more",
+        "     3. Continue with usage credits",
+        "     4. Adjust monthly limit",
+        "     5. Manage on claude.ai",
+        "",
+        "   Enter to confirm · Esc to cancel",
+    ]);
+    let model_kept = "Claude Code keeps that consent for good for that model and account";
+    for (rows, label, choice, focused, kind) in [
+        (
+            &fable,
+            "Continue with Fable 5.1",
+            Choice::Focus {
+                steps: 1,
+                label: "Continue with Fable 5.1".to_string(),
+            },
+            "Switch to Opus 5.5 and continue",
+            model_kept,
+        ),
+        (
+            &nimbus,
+            "Continue with Nimbus 2",
+            Choice::Focus {
+                steps: 1,
+                label: "Continue with Nimbus 2".to_string(),
+            },
+            "Not now",
+            model_kept,
+        ),
+        (
+            &enabled,
+            "Continue with usage credits",
+            Choice::Digit(3),
+            "$12.00 balance · auto-reload off",
+            "credits already on at the account (it saves nothing)",
+        ),
+    ] {
+        assert_eq!(
+            pressed(&on_screen(rows, &full())),
+            (
+                RULE_CREDITS_DECLINE,
+                Choice::FocusKey {
+                    steps: 0,
+                    label: focused.to_string(),
+                    key: "esc",
+                }
+            ),
+            "{label}"
+        );
+        // No Esc read: a person's, the reason by the consent's kind.
+        let mut no_esc = rows.clone();
+        *no_esc.last_mut().expect("the footer") =
+            "   Enter to confirm · Esc to go back".to_string();
+        let d = on_screen(&no_esc, &full());
+        assert!(approved(&d).is_none(), "{label}: {d:?}");
+        assert!(
+            reason(&d).starts_with(&format!(
+                "continuing on usage credits is off (`[harness] usage_credits`): `{label}`"
+            )) && reason(&d).contains(kind),
+            "{label}: {d:?}"
+        );
+        assert_eq!(
+            pressed(&on_screen(rows, &credits)),
+            (RULE_CREDITS_CONSENT, choice),
+            "{label}"
+        );
+    }
+    // A consent that names no credits: outside the key, taken as before.
+    let refill = dialog(&[
+        "   Limit refill",
+        "",
+        "   This takes effect at once",
+        "",
+        "   ❯ Continue with a refill",
+        "     Not now",
+        "",
+        "   Enter to confirm · Esc to cancel",
+    ]);
+    let take = Choice::Focus {
+        steps: 0,
+        label: "Continue with a refill".to_string(),
+    };
+    for ctx in [full(), credits.clone()] {
+        assert_eq!(
+            pressed(&on_screen(&refill, &ctx)),
+            (RULE_ALLOW_ONCE, take.clone())
+        );
+    }
+    // The predicate, part by part: the label alone, the title alone, the
+    // body alone (wrapped between `usage` and `credits` inside `│` bars),
+    // and none of them.
+    let read = |rows: &[String]| {
+        aterm_phase::read(Some("claude"), rows, None)
+            .prompt
+            .expect("a box")
+    };
+    let p = read(&refill);
+    let consent = p.options[0].clone();
+    assert!(consents(&consent) && !credits_consent(&p, &refill, &consent));
+    let mut labelled = consent.clone();
+    labelled.label = "Continue with extra usage".to_string();
+    assert!(credits_consent(&p, &refill, &labelled));
+    let mut titled = p.clone();
+    titled.title = "Fable now uses usage credits".to_string();
+    assert!(credits_consent(&titled, &refill, &consent));
+    let mut framed = refill.clone();
+    let body = framed
+        .iter()
+        .position(|r| r.contains("This takes effect at once"))
+        .expect("the body row");
+    framed[body] = "   │ Continuing on Fable 5.1 uses usage │".to_string();
+    framed.insert(
+        body + 1,
+        "   │ Credits, purchased separately. │".to_string(),
+    );
+    let p = read(&framed);
+    assert!(credits_consent(&p, &framed, &consent), "{p:#?}");
 }
 
 /// Full power answers agy's boxes (measured on 1.4.0) with the digit agy
@@ -3538,7 +4054,10 @@ fn an_unproven_rm_breaker_under_safe_is_approved_with_a_warning() {
 #[test]
 fn full_power_presses_bash_under_every_header_form() {
     let read = bash_box(&["git status --short"], None);
-    assert_eq!(approved(&on_screen(&read, &ctx())), Some(RULE_READ_ONLY));
+    assert_eq!(
+        approved(&on_screen(&read, &git_host(ctx()))),
+        Some(RULE_READ_ONLY)
+    );
     for title in [" Bash command · from somewhere else", " Bash commandeer"] {
         let rows = with_row(&read, " Bash command", title);
         let d = decide_screen(Some("claude"), &rows, &ctx());
@@ -3936,6 +4455,354 @@ fn a_dialog_ink_wrapped_is_answered_by_its_own_rule() {
     );
 }
 
+/// A HELD MESSAGE HALF DRAWN IN A NARROW PANE NEVER FOCUSES A PIECE OF ITS
+/// DENY LABEL. Re-wrapped by Ink's wrap ([`phase_fixtures::rewrap_box_ink`])
+/// at 22 columns (2.1.287, labels at column 3) and 23 (2.1.282, at column
+/// 4), its Deny label `Deny — drop it and`, full, over `tell the sender`
+/// over `it was declined` is one option, the row under a full row a cell
+/// shorter (aterm-phase's `a_label_row_under_a_full_row_has_a_cell_less`,
+/// with its negative control): full power and bypass deliver the whole
+/// message, as they do at every width from 18 to 72 columns it is
+/// re-wrapped at by Ink's wrap or the greedy one
+/// ([`phase_fixtures::rewrap_box`], which draws no frame at 18), `Deliver
+/// this message to` over `Claude` included, a capital that is a name
+/// ([`a_dialog_whose_label_wraps_at_a_name_or_inside_a_word_gets_the_whole_answer`]).
+/// And every frame of it half drawn (its rows down
+/// to one, the rest blank) is the delivery's one-shot allow on the first
+/// words of its label, or no press. Before, `it was declined` was an option
+/// of its own: the whole frames were escalated, and with the delivery not
+/// yet drawn, full power focused `it was declined` (`allow-once@v1`), and
+/// the reset step, reading it so, pressed Down again and again. The same
+/// frames under rules a cell longer, the labels two cells short of the edge
+/// (neither measured nor modelled), where `it was declined` is read alone
+/// and no option reads a role: nothing is pressed whole, and half drawn
+/// nothing but the delivery's first words either. CONTROL: the whole frames
+/// at their width are pressed, so the half-drawn ones are not merely frames
+/// that press nothing.
+#[test]
+fn a_held_message_half_drawn_in_a_narrow_pane_never_focuses_a_piece_of_its_deny() {
+    use phase_fixtures::{HELD_MESSAGE, HELD_MESSAGE_2_1_287, rewrap_box_ink};
+    let deliver = "Deliver this message to Claude";
+    let levels = [
+        full(),
+        ApprovalCtx {
+            bypass_mode: true,
+            ..full()
+        },
+    ];
+    for (fixture, width) in [(HELD_MESSAGE_2_1_287, 22), (HELD_MESSAGE, 23)] {
+        let rows = rewrap_box_ink(fixture, width);
+        assert!(rows.iter().any(|r| r.trim() == "it was declined"));
+        for c in &levels {
+            assert_eq!(
+                pressed(&on_screen(&rows, c)),
+                (
+                    RULE_ALLOW_ONCE,
+                    Choice::Focus {
+                        steps: 1,
+                        label: deliver.to_string()
+                    }
+                ),
+                "{width} columns"
+            );
+        }
+        let wider: Vec<String> = rows
+            .iter()
+            .map(|r| match r.chars().last() {
+                Some(c @ ('─' | '╌')) => format!("{r}{c}"),
+                _ => r.clone(),
+            })
+            .collect();
+        for c in &levels {
+            assert!(
+                decide_screen(Some("claude"), &wider, c)
+                    .is_none_or(|d| matches!(d, Decision::Escalate { .. })),
+                "{width} columns under wider rules"
+            );
+        }
+        for (frame, j) in (1..rows.len())
+            .map(|j| (&rows, j))
+            .chain((1..wider.len()).map(|j| (&wider, j)))
+        {
+            let half: Vec<String> = frame
+                .iter()
+                .enumerate()
+                .map(|(i, r)| if i < j { r.clone() } else { String::new() })
+                .collect();
+            for c in &levels {
+                match decide_screen(Some("claude"), &half, c) {
+                    None | Some(Decision::Escalate { .. }) => {}
+                    Some(Decision::Approve {
+                        rule_id,
+                        choice: Choice::Focus { label, .. },
+                        ..
+                    }) if rule_id == RULE_ALLOW_ONCE
+                        && (deliver == label
+                            || deliver
+                                .strip_prefix(label.as_str())
+                                .is_some_and(|r| r.starts_with(' '))) => {}
+                    d => panic!("{width} columns, half drawn to {j}: {d:?}"),
+                }
+            }
+        }
+    }
+}
+
+/// ATERM-KI-1016-1, "Dialogs in narrow panes": a dialog whose label Ink wraps
+/// at a name (the held message's `Deliver this message to` over `Claude`
+/// under 34 columns, Computer Use's `Deny, and tell` over `Claude what to do
+/// differently (esc)` at 18-24) or inside a word (the usage-limit dialog's
+/// `automaticall` over `y at 12:23pm` at 16-21) gets, at every width from 16
+/// to 120 and at every level, what the whole dialog gets: the held message
+/// was escalated (its delivery no longer its one other option) and so was the
+/// usage-limit dialog (no wait row), and Computer Use's refusal was pressed
+/// under a label cut at `Deny, and tell`.
+#[test]
+fn a_dialog_whose_label_wraps_at_a_name_or_inside_a_word_gets_the_whole_answer() {
+    use phase_fixtures::{
+        COMPUTER_USE, HELD_MESSAGE, HELD_MESSAGE_2_1_287, LIMIT_OPTIONS_DIALOG,
+        LIMIT_OPTIONS_WEEKLY, rewrap_box, screen,
+    };
+    // What is pressed (the rule and the choice) or that it is escalated.
+    let answer = |d: Decision| match d {
+        Decision::Approve {
+            rule_id, choice, ..
+        } => format!("{rule_id} {choice:?}"),
+        Decision::Decline {
+            rule_id, refusal, ..
+        } => format!("{rule_id} {refusal}"),
+        Decision::Escalate { reason } => format!("escalate: {reason}"),
+    };
+    for (name, fixture) in [
+        ("held message", HELD_MESSAGE_2_1_287),
+        ("held message 2.1.282", HELD_MESSAGE),
+        ("computer use", COMPUTER_USE),
+        ("limit", LIMIT_OPTIONS_DIALOG),
+        ("weekly limit", LIMIT_OPTIONS_WEEKLY),
+    ] {
+        // The dialog's rows, from its rule down: the banner over it is no
+        // row `rewrap_box` re-wraps.
+        let all = screen(fixture);
+        let top = all
+            .iter()
+            .rposition(|r| r.chars().count() > 40 && r.chars().all(|c| c == '─'))
+            .expect("the dialog's rule");
+        let body = all[top..].join("\n");
+        for (level, ctx) in [("full", full()), ("safe", ctx()), ("none", none(full()))] {
+            let whole = answer(on_screen(&screen(&body), &ctx));
+            assert!(
+                !whole.starts_with("escalate") || level != "full",
+                "{name}: {whole}"
+            );
+            for width in 16..=120 {
+                let rows = rewrap_box(&body, width);
+                assert_eq!(
+                    answer(on_screen(&rows, &ctx)),
+                    whole,
+                    "{name}, {level}, {width} columns: {rows:#?}"
+                );
+            }
+        }
+    }
+}
+
+/// The safety check's box (SYNTHETIC: no vendor label is known to read
+/// `Continue with …, always`), its first option labelled `label`, over a
+/// rest that opens with no capital: ` Setting up Claude in Chrome`, `❯
+/// <label>` over `Keep waiting for` over `now`. The reset step's tests read
+/// it too.
+pub(crate) fn always_under_a_lowercase_rest(label: &str) -> Vec<String> {
+    [
+        "⏺ Working on it.",
+        "",
+        "────────────────────────────────────────",
+        " Setting up Claude in Chrome",
+        "",
+        "  ✔ Install the extension",
+        "  ✔ Connect to Chrome",
+        "",
+        &format!("  ❯ {label}"),
+        "    Keep waiting for",
+        "    now",
+        "",
+        "  Enter to confirm · Esc to cancel",
+    ]
+    .iter()
+    .map(|r| r.to_string())
+    .collect()
+}
+
+/// AN ANSWER KEPT FOR GOOD BY ITS LABEL IS NEVER TAKEN UNDER A REST THAT
+/// OPENS WITH NO CAPITAL ([`always_under_a_lowercase_rest`]). The rest
+/// `now` blanks the roles a press is chosen by, and `Continue with tools,
+/// always on` still reads [`Role::Persist`] by its `always` (aterm-phase's
+/// `an_option_opening_with_no_capital_under_another_reads_no_role`), so the
+/// press gate ([`kept_for_good`]) stops it: escalated at every level, full
+/// power with `limit_reset` too, as before that rule. With the rule reading
+/// it Other, full power took it as a consent (`allow-once@v1`). NEGATIVE
+/// CONTROL: without `always` the option is no answer kept for good, which
+/// the gate would not stop.
+#[test]
+fn an_answer_kept_for_good_by_its_label_is_never_taken_under_a_lowercase_rest() {
+    let rows = always_under_a_lowercase_rest("Continue with tools, always on");
+    let levels = [
+        none(full()),
+        ctx(),
+        safe_warn(),
+        full(),
+        bypass(),
+        ApprovalCtx {
+            bypass_mode: true,
+            ..full()
+        },
+        ApprovalCtx {
+            limit_reset: true,
+            ..full()
+        },
+    ];
+    for c in &levels {
+        let d = on_screen(&rows, c);
+        assert!(matches!(d, Decision::Escalate { .. }), "{d:?}");
+    }
+    let first = |rows: &[String]| {
+        aterm_phase::read(Some("claude"), rows, None)
+            .prompt
+            .expect("the box")
+            .options
+            .remove(0)
+    };
+    assert!(kept_for_good(&first(&rows)));
+
+    // NEGATIVE CONTROL.
+    let o = first(&always_under_a_lowercase_rest("Continue with tools, on"));
+    assert!(!kept_for_good(&o), "{o:?}");
+}
+
+/// The safety check's Tool box (SYNTHETIC: Claude Code draws a permission
+/// box unnumbered only where it defaults to No, and then with no answer kept
+/// for good), its options unnumbered, `opts` top down, the cursor on the
+/// first.
+fn unnumbered_tool_box(opts: [&str; 3]) -> Vec<String> {
+    let mut rows: Vec<String> = [
+        "⏺ Working on it.",
+        "  ⎿  (tool output)",
+        "",
+        &"─".repeat(60),
+        " Tool use",
+        "",
+        "  Slack - send_message Tool: (MCP)",
+        "",
+        " Do you want to proceed?",
+    ]
+    .iter()
+    .map(|r| r.to_string())
+    .collect();
+    rows.push(format!(" ❯ {}", opts[0]));
+    rows.extend(opts[1..].iter().map(|o| format!("   {o}")));
+    rows.extend(["".to_string(), " Esc to cancel · Tab to amend".to_string()]);
+    rows
+}
+
+/// A YES IS NEVER TAKEN BY ITS LABEL UNDER A REST THAT OPENS WITH NO
+/// CAPITAL ([`unnumbered_tool_box`]). The rest `no` blanks the roles a press
+/// is chosen by and keeps the standing ones (aterm-phase's
+/// `an_option_opening_with_no_capital_under_another_reads_no_role`), so
+/// full power takes no yes of the box: not `Yes, during this session` over
+/// `Yes, and don't ask again for ls commands in`, not `Yes, allow all edits
+/// during this session (shift+tab)` under `Yes, and always allow access to
+/// src/ from this project`, and not a plain `Yes` beside a session grant
+/// or beside an answer kept for good — escalated at every level. With the
+/// session and mode-switch roles read Other beside a kept Persist
+/// (3aabaf52f3), full power took the first two (`allow-once@v1`), where
+/// origin/main declines the first and escalates the second, and took the
+/// fourth's `Yes` by its label (origin/main takes it by its role,
+/// [`Role::Once`]). A yes taken by its label wherever any role is read
+/// would take the third's and the fourth's `Yes`. NEGATIVE CONTROL: the
+/// rest made to open with a capital, `No`, the roles are read, and full
+/// power declines the first with its `No` and takes the third's `Yes`, its
+/// one [`Role::Once`].
+#[test]
+fn a_yes_is_never_taken_by_its_label_under_a_rest_that_opens_with_no_capital() {
+    let session = "Yes, during this session";
+    let kept = "Yes, and don't ask again for ls commands in";
+    let src = "Yes, and always allow access to src/ from this project";
+    let mode = "Yes, allow all edits during this session (shift+tab)";
+    let levels = [
+        none(full()),
+        ctx(),
+        safe_warn(),
+        full(),
+        bypass(),
+        ApprovalCtx {
+            bypass_mode: true,
+            ..full()
+        },
+        ApprovalCtx {
+            limit_reset: true,
+            ..full()
+        },
+    ];
+    for opts in [
+        [session, kept, "no"],
+        [src, mode, "no"],
+        [session, "Yes", "no"],
+        [kept, "Yes", "no"],
+    ] {
+        let rows = unnumbered_tool_box(opts);
+        for c in &levels {
+            let d = on_screen(&rows, c);
+            assert!(matches!(d, Decision::Escalate { .. }), "{opts:?}: {d:?}");
+        }
+    }
+
+    // NEGATIVE CONTROL.
+    let d = on_screen(&unnumbered_tool_box([session, kept, "No"]), &full());
+    assert_eq!(approved(&d), Some(RULE_DECLINE), "{d:?}");
+    let d = on_screen(&unnumbered_tool_box([session, "Yes", "No"]), &full());
+    assert_eq!(approved(&d), Some(RULE_ALLOW_ONCE), "{d:?}");
+}
+
+/// ATERM-KI-1016-1 (Dialogs in narrow panes): a box whose head is off the screen stays a box of
+/// no kind and is escalated at every level, by rule (the manual, `manual.rs` "A box taller than
+/// the pane": pressed at no level until the pane shows it whole, unless the loop reads its head
+/// back from the main screen's history, `box_head_tests.rs`; `approval.rs`'s module doc, the
+/// 2026-10-02 incident). Why no answer from its
+/// tail can be right: two MEASURED boxes whose last five rows are the same, ` Do you want to
+/// proceed?` / `❯ 1. Yes` / `2. No` / blank / `Esc to cancel · Tab to amend` — the rm
+/// breaker (2.1.287), which full power answers `1` once, and a Read the owner's own ask rule
+/// sends to them (2.1.292 accept-edits), which no level presses. Any decider of the tail alone
+/// gives both one answer: pressing `1` presses the owner's Read, and holding one holds both.
+/// The transcript cannot name the box either (the manual, beside that line: "an older matching
+/// call can remain pending while a later box is already on screen"). So the cut is held at
+/// every level, and the whole of each gets its own answer.
+#[test]
+fn a_box_whose_head_is_off_the_screen_is_held_because_its_tail_names_no_box() {
+    let breaker = phase_fixtures::screen(phase_fixtures::BOX_RM_BREAKER_2_1_287);
+    let read = phase_fixtures::screen(phase_fixtures::BOX_READ_FORCED_ACCEPT_EDITS_2_1_292);
+    let full_breaker = on_screen(&breaker, &full());
+    assert_eq!(pressed(&full_breaker), (RULE_ALLOW_ONCE, Choice::Digit(1)));
+    assert!(
+        reason(&on_screen(&read, &full())).contains("a Read box with no folder grant"),
+        "the owner's Read is held whole"
+    );
+    let tail = |rows: &[String]| rows[rows.len() - 5..].to_vec();
+    assert_eq!(
+        tail(&breaker),
+        tail(&read),
+        "PRECONDITION: the same five rows"
+    );
+    let cut = tail(&breaker);
+    let p = aterm_phase::parse_prompt_v2(&cut).expect("a box");
+    assert!(p.head_off_screen, "{p:?}");
+    for (level, c) in [("full", full()), ("safe", ctx()), ("none", none(full()))] {
+        let d = on_screen(&cut, &c);
+        assert!(
+            matches!(d, Decision::Escalate { .. }),
+            "{level}: the cut is pressed: {d:?}"
+        );
+    }
+}
+
 #[test]
 fn full_power_declines_a_grant_only_box_and_leaves_an_unsound_one() {
     let with = |opts: [&str; 2]| {
@@ -4100,16 +4967,22 @@ fn a_footerless_setup_dialog_is_declined_or_escalated_never_idle() {
     }
 }
 
-/// Claude Code's MCP server dialogs (MEASURED on 2.1.301) are a person's at
-/// EVERY level — `none`, safe (with and without its rm warning), full power,
-/// bypass under either — escalated, nothing pressed (what the escalation
-/// says is the loop's badge test's,
-/// `the_mcp_server_dialogs_badge_says_every_answer_is_kept_at_every_level`).
-/// Before, full power pressed the one-server dialog's `Continue without using
-/// this MCP server` under `allow-once@v1`, which disabled the server for
-/// good. Negative controls: a RETITLED one-server dialog (no MCP kind)
-/// presses nothing either, every answer of it kept by its label; Codex's
-/// reader names no such dialog.
+/// Claude Code's MCP server dialogs (MEASURED on 2.1.301, and on 2.1.302 in
+/// narrow panes: [`phase_fixtures::MCP_SERVER_NARROW`], labels wrapped, the
+/// head cut, the Select scrolled, the cursor's label over an unmarked option
+/// a row's fill alone reads as its rest; and DERIVED,
+/// [`phase_fixtures::MCP_SERVER_DERIVED`]) are a person's at EVERY level — `none`,
+/// safe (with and without its rm warning), full power, bypass under either —
+/// escalated, nothing pressed (what the escalation says is the loop's badge
+/// test's, `the_mcp_server_dialogs_badge_says_every_answer_is_kept_at_every_level`);
+/// a frame that shows no box (30x5) is no decision at all. Before, full power
+/// pressed the one-server dialog's `Continue without using this MCP server`
+/// under `allow-once@v1`, which disabled the server for good. Negative
+/// controls: a RETITLED one-server dialog (no MCP kind) presses nothing
+/// either, every answer of it kept by its label, at 144 columns and wrapped
+/// at 40 and 30 (where, read a row at a time, full power pressed
+/// `decline@v1` on `Continue without using this MCP` at 40 and `Continue
+/// without using` at 30); Codex's reader names no such dialog.
 #[test]
 fn the_mcp_server_dialog_is_a_persons_at_every_level() {
     let every_bypass = ApprovalCtx {
@@ -4126,6 +4999,21 @@ fn the_mcp_server_dialog_is_a_persons_at_every_level() {
         ("bypass-safe", bypass()),
         ("bypass-all", every_bypass),
     ];
+    for (k, text) in phase_fixtures::MCP_SERVER_NARROW
+        .iter()
+        .chain(&phase_fixtures::MCP_SERVER_DERIVED)
+        .enumerate()
+    {
+        let rows = phase_fixtures::screen(text);
+        for (level, c) in &levels {
+            let d = decide_screen(Some("claude"), &rows, c);
+            assert!(
+                d.as_ref()
+                    .is_none_or(|d| matches!(d, Decision::Escalate { .. })),
+                "narrow {k} {level}: {d:?}"
+            );
+        }
+    }
     for (name, rows) in [("one", &one), ("two", &two)] {
         for (level, c) in &levels {
             let d = on_screen(rows, c);
@@ -4149,22 +5037,36 @@ fn the_mcp_server_dialog_is_a_persons_at_every_level() {
             );
         }
     }
-    let retitled: Vec<String> = one
-        .iter()
-        .map(|r| r.replace("New MCP server found in this project:", "New tool found:"))
-        .collect();
-    for c in [
-        full(),
-        ApprovalCtx {
-            bypass_mode: true,
-            ..full()
-        },
+    // At 40 and 30 columns the title wraps: `New MCP server found in this`
+    // over `project: lab-probe` at 40, `New MCP server found in` over `this
+    // project: lab-probe` at 30.
+    let retitle = |rows: &[String]| -> Vec<String> {
+        rows.iter()
+            .map(|r| {
+                r.replace("New MCP server found in this project:", "New tool found:")
+                    .replace("New MCP server found in", "New tool found in")
+            })
+            .collect()
+    };
+    for rows in [
+        one.clone(),
+        phase_fixtures::screen(phase_fixtures::MCP_SERVER_NARROW[0]),
+        phase_fixtures::screen(phase_fixtures::MCP_SERVER_NARROW[1]),
     ] {
-        let d = on_screen(&retitled, &c);
-        assert!(
-            reason(&d).contains("persist:Continue without using this MCP server"),
-            "{d:?}"
-        );
+        let retitled = retitle(&rows);
+        for c in [
+            full(),
+            ApprovalCtx {
+                bypass_mode: true,
+                ..full()
+            },
+        ] {
+            let d = on_screen(&retitled, &c);
+            assert!(
+                reason(&d).contains("persist:Continue without using this MCP server"),
+                "{retitled:#?}: {d:?}"
+            );
+        }
     }
 }
 
@@ -4238,14 +5140,20 @@ fn the_press_gate_refuses_each_kept_mcp_answer_under_any_title() {
     );
 }
 
-/// THE PRESS GATE reads a kept answer by its role and by its label alike
-/// ([`kept_for_good`]): a label kept by the word `always` alone, no KEPT
-/// phrase in it, by the role the reader gives it ([`Role::Persist`]), and
-/// `Yes, and don't ask again …` read mid-move (two cursors: every role
-/// withheld) by its words. NEGATIVE CONTROL: the box's one-shot `Yes`
-/// passes.
+/// THE PRESS GATE reads a kept answer by its role, by its label and by its
+/// rows alike ([`kept_for_good`], which the reset step's Esc reads as
+/// well): a label kept by the word `always` alone, no KEPT phrase in it, by
+/// the role the reader gives it ([`Role::Persist`]), and `Yes, and don't ask
+/// again …` read mid-move (two cursors: every role withheld) by its words.
+/// And an option, its role withheld, whose label a narrow pane's wrap left
+/// joined onto the next option's (the rows MEASURED on 2.1.302 at 60x11:
+/// `❯ Use this and all future MCP servers in this project` over `Continue
+/// without using this MCP server`) or cut in two (`Continue without using
+/// this MCP` over `server` at 40), by its rows when they spell a kept answer
+/// ([`aterm_phase::prompt::Opt::kept`]). NEGATIVE CONTROLS: the box's
+/// one-shot `Yes` passes, and so do those labels whose rows spell none.
 #[test]
-fn the_press_gate_reads_a_kept_answer_by_its_role_or_its_label() {
+fn the_press_gate_reads_a_kept_answer_by_its_role_its_label_or_its_rows() {
     let pick = |n: u8| Decision::Approve {
         rule_id: RULE_ALLOW_ONCE,
         choice: Choice::Digit(n),
@@ -4274,23 +5182,51 @@ fn the_press_gate_reads_a_kept_answer_by_its_role_or_its_label() {
         assert!(kept_or_bought(p, &pick(2)).is_some(), "{name}");
         assert_eq!(kept_or_bought(p, &pick(1)), None, "{name}");
     }
+    let opt = |label: &str, kept: bool| Opt {
+        n: None,
+        label: label.to_string(),
+        role: Role::Other,
+        focused: true,
+        row: 0,
+        kept,
+    };
+    for label in [
+        "Use this and all future MCP servers in this project Continue without using this MCP server",
+        "Continue without using this MCP",
+        "server",
+    ] {
+        assert!(kept_for_good(&opt(label, true)), "{label}");
+        assert!(!kept_for_good(&opt(label, false)), "{label}");
+    }
 }
 
 /// `Continue without …` is a refusal that goes on, never a consent, and an
 /// answer kept for good is no consent either: 2.1.301's Settings Error
 /// (MEASURED) is DECLINED under full power with `Continue without these
 /// settings` (`decline@v1`, where its `Continue with` prefix had made it
-/// `allow-once@v1`); the safe rules escalate it. Negative controls: a limit's
+/// `allow-once@v1`); the safe rules escalate it. A consent kept by its words
+/// (`…, and don't ask again`) or by the role the reader gives it (`…,
+/// always`: [`Role::Persist`]) is none, so its box is DECLINED with its
+/// `No`: taken for a consent, it would be chosen and then refused by the
+/// press gate, and the box escalated. Negative controls: a limit's
 /// consents, `Continue with usage credits` with credits on and `Continue with
-/// <model>`, are still accepted.
+/// <model>` under the body Claude Code draws over it (`Continuing on <model>
+/// uses usage credits`), are still accepted under `[harness] usage_credits`
+/// (`credits-consent@v1`) — and cancelled with Esc without it, the default
+/// (`credits-decline@v1`; owner, 2026-10-19).
 #[test]
 fn continue_without_is_a_refusal_never_a_consent() {
+    let credits = ApprovalCtx {
+        usage_credits: true,
+        ..full()
+    };
     let opt = |l: &str| aterm_phase::prompt::Opt {
         n: Some(1),
         label: l.to_string(),
         role: aterm_phase::prompt::Role::Other,
         focused: true,
         row: 0,
+        kept: false,
     };
     for (label, consent) in [
         ("Continue with usage credits", true),
@@ -4316,11 +5252,19 @@ fn continue_without_is_a_refusal_never_a_consent() {
         "{d:?}"
     );
     for label in ["Continue with usage credits", "Continue with Opus 5.5"] {
+        let model = label.strip_prefix("Continue with ").unwrap_or_default();
         let mut consent = vec![
             "⏺ Working.".to_string(),
             String::new(),
             "─".repeat(80),
             " You've reached your Fable limit".to_string(),
+            String::new(),
+            // The body the vendor draws under that title (2.1.304 bundle,
+            // the model consent dialog).
+            format!(
+                " You've used your included Fable usage for this week. Continuing on {model} uses"
+            ),
+            " usage credits — you have $12.00 in credits.".to_string(),
             String::new(),
         ];
         consent.extend(
@@ -4333,128 +5277,209 @@ fn continue_without_is_a_refusal_never_a_consent() {
         );
         consent.extend([String::new(), " Esc to cancel".to_string()]);
         assert_eq!(
-            pressed(&on_screen(&consent, &full())),
-            (RULE_ALLOW_ONCE, Choice::Digit(1)),
+            pressed(&on_screen(&consent, &credits)),
+            (RULE_CREDITS_CONSENT, Choice::Digit(1)),
             "{label}"
         );
+        assert_eq!(
+            pressed(&on_screen(&consent, &full())).0,
+            RULE_CREDITS_DECLINE,
+            "{label}"
+        );
+        for kept in [
+            format!("{label}, and don't ask again"),
+            format!("{label}, always"),
+        ] {
+            let rows: Vec<String> = consent
+                .iter()
+                .map(|r| r.replace(&format!("❯ 1. {label}"), &format!("❯ 1. {kept}")))
+                .collect();
+            for ctx in [full(), credits.clone()] {
+                assert_eq!(
+                    pressed(&on_screen(&rows, &ctx)),
+                    (RULE_DECLINE, Choice::Digit(2)),
+                    "{kept}"
+                );
+            }
+        }
     }
 }
 
-/// Claude Code's Chrome setup panel in `phase`, HAND-BUILT from est() in the
-/// 2.1.301 bundle (no live capture): the `_a` frame the Chrome upsell is
-/// drawn in (title ` Setting up Claude in Chrome` at column one under the
-/// full-width rule, footerless), its body rows as the bundle writes them for
-/// that phase, and its `Ye` select with `hideIndexes` (unnumbered, the
-/// cursor on the first option: no `defaultFocusValue`); the options'
-/// descriptions are left out, their layout not measured. `connecting`
-/// offers `Continue without browser tools` alone (so does every phase but
-/// these two), `stalled` `Keep waiting` before it, `connected` `Continue
-/// with browser tools` before it.
-fn chrome_setup(phase: &str) -> Vec<String> {
-    let mut rows = vec![
-        "⏺ Working on it.".to_string(),
-        String::new(),
-        "─".repeat(120),
-        " Setting up Claude in Chrome".to_string(),
-        String::new(),
-    ];
-    let (body, options): (&[&str], &[&str]) = match phase {
-        "connecting" => (
-            &[
-                "Finish setup in Chrome. This screen follows along and updates on its own as \
-                 each step completes.",
-                "",
-                "✔ Install the extension",
-                "… Connect to Chrome",
-            ],
-            &["Continue without browser tools"],
-        ),
-        "stalled" => (
-            &[
-                "Finish setup in Chrome. This screen follows along and updates on its own as \
-                 each step completes.",
-                "",
-                "✔ Install the extension",
-                "… Connect to Chrome",
-                "   Taking longer than expected. Check that the extension is added and that \
-                 you're signed in to it in Chrome.",
-            ],
-            &["Keep waiting", "Continue without browser tools"],
-        ),
-        "connected" => (
-            &[
-                "✔ Install the extension",
-                "✔ Connect to Chrome",
-                "   Browser tools are ready. Continuing keeps them enabled for future sessions \
-                 too — manage anytime with /chrome.",
-            ],
-            &[
-                "Continue with browser tools",
-                "Continue without browser tools",
-            ],
-        ),
-        other => panic!("no such phase drawn here: {other}"),
-    };
-    rows.extend(body.iter().map(|r| {
-        if r.is_empty() {
-            String::new()
-        } else {
-            format!("  {r}")
-        }
-    }));
-    rows.push(String::new());
-    rows.extend(options.iter().enumerate().map(|(i, o)| {
-        if i == 0 {
-            format!("  ❯ {o}")
-        } else {
-            format!("    {o}")
-        }
-    }));
-    rows.extend([String::new(), String::new()]);
-    rows
-}
-
-/// THE CHROME SETUP PANEL IS DECLINED IN EVERY PHASE ([`chrome_setup`]) under
-/// full power and bypass, with `Continue without browser tools`, which saves
-/// nothing (2.1.301 bundle: the setup driver's skip reports and returns a
-/// message, and its cleanup touches only the session). In the connected
-/// phase `Continue with browser tools` turns the browser tools on for every
-/// later session (`claudeInChromeDefaultEnabled` in the global config, the
-/// panel's own `Continuing keeps them enabled for future sessions too`): it
-/// reads as kept for good, and is no consent the harness takes, where it was
-/// pressed under `allow-once@v1`. The safe rules escalate each phase.
+/// THE CHROME SETUP PANEL IS DECLINED IN EVERY PHASE under full power and
+/// bypass, with `Continue without browser tools`, which saves nothing (2.1.301
+/// bundle: the setup driver's skip reports and returns a message, and its
+/// cleanup touches only the session) — or, in a pane too narrow for its
+/// labels, handed to a person. HAND-BUILT from est() in the 2.1.302 render
+/// code ([`phase_fixtures::CHROME_SETUP`]): each option's description beside
+/// its label, in the Select's two columns as MEASURED on 2.1.302's model
+/// picker. In the connected phase `Continue with browser tools` turns the
+/// browser tools on for every later session (`claudeInChromeDefaultEnabled`
+/// in the global config, the panel's own `Continuing keeps them enabled for
+/// future sessions too`): it reads as kept for good, and is no consent the
+/// harness takes. Read with its description as its label's tail, it was one,
+/// pressed under `allow-once@v1` at any width. At 40 columns the labels are
+/// cut short in their column (`Continue with browser…`, `Continue without
+/// brow…`): neither is pressed, nor taken for a consent (before, the cut
+/// consent was pressed, and in the stalled phase, its descriptions' rows read
+/// as options, the refusal was chosen five rows down a list of two). The safe
+/// rules escalate every phase.
 #[test]
 fn the_chrome_setup_panel_is_declined_in_every_phase() {
     let every_bypass = ApprovalCtx {
         bypass_mode: true,
         ..full()
     };
-    for (phase, steps) in [("connecting", 0), ("stalled", 1), ("connected", 1)] {
-        let rows = chrome_setup(phase);
+    for (phase, text) in phase_fixtures::CHROME_SETUP {
+        let rows = phase_fixtures::screen(text);
         let reading = aterm_phase::read(Some("claude"), &rows, None);
         assert_eq!(
             reading.prompt.as_ref().map(|p| p.kind),
             Some(PromptKind::Other),
             "{phase}: {rows:#?}"
         );
+        let steps = match phase {
+            "connecting" => Some(0),
+            "stalled" | "connected" => Some(1),
+            _ => None,
+        };
         for c in [full(), every_bypass.clone()] {
             let d = on_screen(&rows, &c);
-            assert_eq!(
-                pressed(&d),
-                (
-                    RULE_DECLINE,
-                    Choice::Focus {
-                        steps,
-                        label: "Continue without browser tools".to_string()
-                    }
+            match steps {
+                Some(steps) => assert_eq!(
+                    pressed(&d),
+                    (
+                        RULE_DECLINE,
+                        Choice::Focus {
+                            steps,
+                            label: "Continue without browser tools".to_string()
+                        }
+                    ),
+                    "{phase}: {d:?}"
                 ),
-                "{phase}: {d:?}"
-            );
+                None => assert!(matches!(d, Decision::Escalate { .. }), "{phase}: {d:?}"),
+            }
         }
         assert!(
             matches!(on_screen(&rows, &ctx()), Decision::Escalate { .. }),
             "{phase}"
         );
+    }
+}
+
+/// THE CHROME INSTALL OFFER IS DECLINED WITH `Not now` AND NOTHING ELSE under
+/// full power, in and out of bypass, wherever its cursor is: 2.1.302's
+/// ` Claude wants to use your browser` (sCe), HAND-BUILT from its render code
+/// ([`phase_fixtures::SETUP_CHROME_UPSELL_302`]: each option's description
+/// beside its label, at 120 columns and at 40). In the 2.1.302 bundle
+/// `not_now` saves nothing (it reports `declined`, and the offer is not made
+/// again that session), `install` opens the install page and the setup, and
+/// `dont_ask_again` writes `chromeInstallUpsellDismissed`, turning the offer
+/// off for good: `Install extension` reads no role and `Don't ask again`
+/// [`Role::Persist`], and neither is pressed. Read with each description as
+/// its label's tail (`Not now            Continue without browser tools`),
+/// as before, `Not now` was no refusal and the offer escalated. The safe
+/// rules escalate it. NEGATIVE CONTROL: the same offer with no `Not now` row
+/// has no refusal that settles nothing, and escalates with the cursor on
+/// either option left.
+#[test]
+fn the_chrome_install_offer_is_declined_with_not_now_and_nothing_else() {
+    let every_bypass = ApprovalCtx {
+        bypass_mode: true,
+        ..full()
+    };
+    let labels = ["Install extension", "Not now", "Don't ask again"];
+    // The rows with the cursor moved onto the option `label` opens.
+    let cursor_on = |rows: &[String], label: &str| -> Vec<String> {
+        rows.iter()
+            .map(
+                |r| match r.strip_prefix("    ").or_else(|| r.strip_prefix("  ❯ ")) {
+                    Some(t) if labels.iter().any(|l| t.starts_with(l)) => {
+                        format!("  {} {t}", if t.starts_with(label) { '❯' } else { ' ' })
+                    }
+                    _ => r.clone(),
+                },
+            )
+            .collect()
+    };
+    for text in phase_fixtures::SETUP_CHROME_UPSELL_302 {
+        let drawn = phase_fixtures::screen(text);
+        let name = text.lines().next().unwrap_or_default();
+        for (at, label) in labels.iter().enumerate() {
+            let rows = cursor_on(&drawn, label);
+            let reading = aterm_phase::read(Some("claude"), &rows, None);
+            let p = reading.prompt.as_ref().expect("the offer");
+            assert_eq!(p.kind, PromptKind::Other, "{name}");
+            let read: Vec<(&str, Role, bool)> = p
+                .options
+                .iter()
+                .map(|o| (o.label.as_str(), o.role, o.focused))
+                .collect();
+            assert_eq!(
+                read,
+                [
+                    (labels[0], Role::Other, at == 0),
+                    (labels[1], Role::Deny, at == 1),
+                    (labels[2], Role::Persist, at == 2),
+                ],
+                "{name}"
+            );
+            for c in [full(), every_bypass.clone()] {
+                let d = on_screen(&rows, &c);
+                assert_eq!(
+                    pressed(&d),
+                    (
+                        RULE_DECLINE,
+                        Choice::Focus {
+                            steps: 1 - i32::try_from(at).expect("an index"),
+                            label: "Not now".to_string()
+                        }
+                    ),
+                    "{name}, the cursor on {label}: {d:?}"
+                );
+            }
+            for c in [ctx(), bypass()] {
+                let d = on_screen(&rows, &c);
+                assert!(reason(&d).contains("no rule approves this kind"), "{d:?}");
+            }
+        }
+        // The offer with its `Not now` row, and its description's rows under
+        // it, left out.
+        let mut refused = Vec::new();
+        let mut skip = false;
+        for r in &drawn {
+            skip = r.contains("Not now") || (skip && r.starts_with("     "));
+            if !skip {
+                refused.push(r.clone());
+            }
+        }
+        assert!(
+            refused
+                .iter()
+                .all(|r| !r.contains("without") && !r.contains("tools")),
+            "{refused:#?}"
+        );
+        for label in [labels[0], labels[2]] {
+            let rows = cursor_on(&refused, label);
+            let reading = aterm_phase::read(Some("claude"), &rows, None);
+            let read: Vec<(&str, Role)> = reading
+                .prompt
+                .iter()
+                .flat_map(|p| &p.options)
+                .map(|o| (o.label.as_str(), o.role))
+                .collect();
+            assert_eq!(
+                read,
+                [(labels[0], Role::Other), (labels[2], Role::Persist)],
+                "{name}"
+            );
+            for c in [full(), every_bypass.clone()] {
+                let d = on_screen(&rows, &c);
+                assert!(
+                    matches!(d, Decision::Escalate { .. }),
+                    "{name}, no `Not now`, the cursor on {label}: {d:?}"
+                );
+            }
+        }
     }
 }
 
@@ -4466,6 +5491,8 @@ fn the_chrome_setup_panel_is_declined_in_every_phase() {
 fn a_box_that_runs_on_another_machine_is_not_proven_by_local_checks() {
     let path = "/etc/hosts";
     let local = read_box(path);
+    // Proven locally where `/etc` is a system root: a Unix host.
+    #[cfg(unix)]
     assert_eq!(
         approved(&on_screen(&local, &ctx())),
         Some(RULE_READ_OUTSIDE_CWD)
@@ -5261,9 +6288,20 @@ fn scratch_repo(tag: &str) -> PathBuf {
     let dir = crate::supervise::test_scratch_path("approval-git", tag);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch");
-    let dir = std::fs::canonicalize(&dir).expect("canonical");
+    let dir = crate::supervise::test_canonical(&dir);
     scratch_git(&dir, &["init", "-q", "."]);
     dir
+}
+
+/// `dir` as a word of a Bash line: on Windows the Bash tool's shell takes a `\`
+/// for an escape, and a drive path is spelled with `/` there.
+fn shell_word(dir: &Path) -> String {
+    let word = dir.display().to_string();
+    if cfg!(windows) {
+        word.replace('\\', "/")
+    } else {
+        word
+    }
 }
 
 fn scratch_git(dir: &Path, args: &[&str]) {
@@ -5315,9 +6353,9 @@ fn a_git_read_is_approved_only_where_its_config_runs_nothing() {
     // A directory the line names is judged too.
     let other = scratch_repo("other");
     scratch_git(&other, &["config", "core.fsmonitor", "./evil.sh"]);
-    let named = bash_box(&[&format!("git -C {} status", other.display())], None);
+    let named = bash_box(&[&format!("git -C {} status", shell_word(&other))], None);
     assert!(reason(&on_screen(&named, &c)).contains("core.fsmonitor"));
-    let cd = bash_box(&[&format!("cd {} && git log -1", other.display())], None);
+    let cd = bash_box(&[&format!("cd {} && git log -1", shell_word(&other))], None);
     assert!(reason(&on_screen(&cd, &c)).contains("core.fsmonitor"));
     // A read that contacts a remote (credential helpers, ssh) escalates in a
     // clean repository.
@@ -5824,7 +6862,7 @@ fn a_file_box_the_agents_bare_ask_rule_sends_is_held_at_every_level() {
             ASK_READ_OUTSIDE,
             "Read",
             "Write",
-            RULE_READ_OUTSIDE_CWD,
+            READ_ETC_HOSTS,
         ),
         (
             "notebook",
@@ -5860,6 +6898,15 @@ fn a_file_box_the_agents_bare_ask_rule_sends_is_held_at_every_level() {
     }
 }
 
+/// The rule full power presses the captured Read of `/etc/hosts` under, with no
+/// ask rule holding it: the Read rule's own where `/etc` is a system root (a
+/// Unix host), else its one-shot allow.
+const READ_ETC_HOSTS: &str = if cfg!(unix) {
+    RULE_READ_OUTSIDE_CWD
+} else {
+    RULE_ALLOW_ONCE
+};
+
 /// Claude Code 2.1.295 MEASURED (the real-Claude lab, 2026-10-09, the review
 /// of the sweep's fix): under `ask: ["Bash"]` in manual mode, a Bash `sed -i`
 /// of an in-project file is drawn as an `Edit file` box with NO reason — row
@@ -5894,14 +6941,14 @@ fn a_box_more_than_one_tool_draws_is_held_under_a_bare_rule_for_any_of_them() {
             ASK_READ_OUTSIDE,
             "Grep",
             "Bash",
-            RULE_READ_OUTSIDE_CWD,
+            READ_ETC_HOSTS,
         ),
         (
             "read outside",
             ASK_READ_OUTSIDE,
             "Glob",
             "Edit",
-            RULE_READ_OUTSIDE_CWD,
+            READ_ETC_HOSTS,
         ),
         ("ide diff", ide, "Bash", "Read", RULE_ALLOW_ONCE),
     ] {
@@ -6359,32 +7406,115 @@ fn a_muse_note_open_under_the_recommended_word_is_a_persons() {
     }
 }
 
-/// A transcript candidate has no identity in an ambiguous on-screen box.
-/// Even a complete older EOF may still name an Edit while Bash's current
-/// call has not been appended. The ordinary allowed controls come first;
-/// every possible-tool hold must then survive all candidate tail shapes.
-#[test]
-fn a_transcript_candidate_cannot_remove_a_possible_tools_owner_hold() {
-    use super::super::box_call::{drew, pending_calls};
+/// The Edit tool's own `Edit file` box (2.1.295 under a bare `Edit` rule;
+/// 2.1.303 under a PreToolUse hook on `*`), MEASURED in the real-Claude lab.
+const EDIT_STAR_HOOK_303: &str = include_str!("fixtures/claude-2.1.303-box-edit-star-hook.txt");
+/// A Bash `sed -i` drawn as that box under the same hook (2.1.303).
+const SED_STAR_HOOK_303: &str = include_str!("fixtures/claude-2.1.303-box-bash-sed-star-hook.txt");
+/// One message calling a `sed -i` then an Edit of the same file (2.1.303):
+/// the sed's box under the QUEUED Edit's childless row.
+const SED_THEN_EDIT_303: &str =
+    include_str!("fixtures/claude-2.1.303-box-bash-sed-then-edit-parallel.txt");
+/// The same two calls the other way round: the Edit's box under the queued
+/// sed's `Waiting…` row.
+const EDIT_THEN_SED_303: &str =
+    include_str!("fixtures/claude-2.1.303-box-edit-then-bash-sed-parallel.txt");
 
-    let rule = |text: &str| {
-        let (tool, bare) = super::super::claude_settings::rule_tool(text).expect("a rule");
-        OwnerAsk {
-            kind: AskKind::Rule {
-                tool: tool.to_string(),
-                bare,
-            },
-            text: text.to_string(),
-            source: "the synthetic settings document".to_string(),
-        }
-    };
-    let hook = |matcher: &str| OwnerAsk {
+/// An owner's ask rule as the settings chain reads it.
+fn ask_rule(text: &str) -> OwnerAsk {
+    let (tool, bare) = super::super::claude_settings::rule_tool(text).expect("a rule");
+    OwnerAsk {
+        kind: AskKind::Rule {
+            tool: tool.to_string(),
+            bare,
+        },
+        text: text.to_string(),
+        source: "the synthetic settings document".to_string(),
+    }
+}
+
+/// An owner's PreToolUse hook on `matcher`.
+fn ask_hook(matcher: &str) -> OwnerAsk {
+    OwnerAsk {
         kind: AskKind::Hook {
             matcher: Some(matcher.to_string()),
         },
         text: matcher.to_string(),
         source: "the synthetic settings document".to_string(),
+    }
+}
+
+/// `rows` with `row` put in at `at`.
+fn put_row(rows: &[String], at: usize, row: &str) -> Vec<String> {
+    let mut r = rows.to_vec();
+    r.insert(at, row.to_string());
+    r
+}
+
+/// The index of the box's call row on `rows`: the last `⏺ Update(` row.
+fn call_row_of(rows: &[String]) -> usize {
+    rows.iter()
+        .rposition(|r| r.starts_with("⏺ Update("))
+        .expect("the call's row")
+}
+
+/// Screen and transcript candidates do not bind a file box's current
+/// mount. Even an Edit-shaped box keeps every possible tool's owner hold;
+/// ordinary unruled Edits remain the levels' to answer.
+#[test]
+fn an_edit_shaped_box_keeps_every_possible_tools_owner_hold() {
+    let at = |asks: Vec<OwnerAsk>, candidate: Option<&str>, c: ApprovalCtx| ApprovalCtx {
+        owner_asks: Ok(asks),
+        box_call: candidate.map(str::to_string),
+        ..c
     };
+    for (name, fixture) in [("2.1.295", ASK_EDIT), ("2.1.303", EDIT_STAR_HOOK_303)] {
+        let rows = phase_fixtures::screen(fixture);
+        let p = aterm_phase::prompt::parse_prompt_v2(&rows).expect("the captured box");
+        assert!(
+            super::super::box_call::screen_shows_edit_call(&p, &rows),
+            "{name}: the Edit's own row"
+        );
+        let unruled = on_screen(&rows, &at(Vec::new(), None, full()));
+        assert_eq!(approved(&unruled), Some(RULE_ALLOW_ONCE), "{name}");
+        for ask in [
+            ask_rule("Bash(sed:*)"),
+            ask_rule("Bash"),
+            ask_hook("Bash"),
+            ask_hook("*"),
+        ] {
+            let held = on_screen(&rows, &at(vec![ask.clone()], None, full()));
+            assert!(
+                reason(&held).contains("Claude Code draws a Bash `sed -i` as this box")
+                    || reason(&held).contains("(an ask rule)"),
+                "{name}, {}: held with no call named: {held:?}",
+                ask.text
+            );
+            let named = on_screen(&rows, &at(vec![ask.clone()], Some("Edit"), full()));
+            assert_eq!(named, held, "{name}, {}: no mount identity", ask.text);
+            for c in [ctx(), none(full())] {
+                let d = on_screen(&rows, &at(vec![ask.clone()], Some("Edit"), c));
+                assert!(matches!(d, Decision::Escalate { .. }), "{name}: {d:?}");
+            }
+        }
+        let own = on_screen(&rows, &at(vec![ask_rule("Edit")], Some("Edit"), full()));
+        assert!(
+            reason(&own).contains("`Edit` in"),
+            "{name}: the Edit's own rule holds it: {own:?}"
+        );
+    }
+}
+
+/// A complete older EOF may name an Edit while Bash's current call has
+/// not been appended. Every possible tool's hold survives the actual
+/// parser, stale candidate and decider, including a screen heuristic that
+/// agrees with the stale Edit. Ordinary unruled controls come first.
+#[test]
+fn a_transcript_candidate_cannot_remove_a_possible_tools_owner_hold() {
+    use super::super::box_call::{drew, pending_calls};
+
+    let rule = ask_rule;
+    let hook = ask_hook;
     let at = |asks: Vec<OwnerAsk>, candidate: Option<&str>| ApprovalCtx {
         owner_asks: Ok(asks),
         box_call: candidate.map(str::to_string),
@@ -6424,24 +7554,89 @@ fn a_transcript_candidate_cannot_remove_a_possible_tools_owner_hold() {
             format!("{OLD_EDIT}{{\"type\":\"user\"\n{{\"type\":\"attachment\"}}\n"),
         ),
     ];
+    let edit = phase_fixtures::screen(ASK_EDIT);
+    let own = call_row_of(&edit);
+    let cut = edit[own + 6..].to_vec();
+    // The current sed's Waiting row is off-screen. Three-column text
+    // between it and the queued Edit looks like a finished separator to the
+    // screen heuristic, while a complete older EOF still names an Edit.
+    let sed = phase_fixtures::screen(SED_THEN_EDIT_303);
+    let queued = call_row_of(&sed);
+    let hidden_sed = put_row(&sed[queued..], 0, "   the same change by hand");
+    let hidden_prompt = aterm_phase::prompt::parse_prompt_v2(&hidden_sed).expect("the sed box");
+    assert!(
+        super::super::box_call::screen_shows_edit_call(&hidden_prompt, &hidden_sed),
+        "the diagnostic agrees without current-mount identity"
+    );
+    let shapes: Vec<(&str, Vec<String>)> = vec![
+        ("off-screen sed over three-column text", hidden_sed),
+        (
+            "Bash sed shape",
+            phase_fixtures::screen(ASK_BASH_SED_SPECIFIER_300),
+        ),
+        (
+            "the sed's box, 2.1.303",
+            phase_fixtures::screen(SED_STAR_HOOK_303),
+        ),
+        (
+            "a sed then an Edit, one message",
+            phase_fixtures::screen(SED_THEN_EDIT_303),
+        ),
+        (
+            "an Edit then a sed, one message",
+            phase_fixtures::screen(EDIT_THEN_SED_303),
+        ),
+        (
+            "a Bash call waiting further up",
+            put_row(
+                &put_row(&edit, own - 2, "  ⎿  Waiting…"),
+                own - 2,
+                "⏺ Bash(ls)",
+            ),
+        ),
+        (
+            "its row naming another file",
+            put_row(&edit, own + 1, "⏺ Update(other.txt)")
+                .into_iter()
+                .enumerate()
+                .filter(|(k, _)| *k != own)
+                .map(|(_, r)| r)
+                .collect(),
+        ),
+        (
+            "a child row under its row",
+            put_row(&edit, own + 1, "  ⎿  Running PreToolUse hook…"),
+        ),
+        (
+            "another file's pending row over its row",
+            put_row(&edit, own, "⏺ Update(other.txt)"),
+        ),
+        (
+            "another call's progress row over its row",
+            put_row(
+                &put_row(&edit, own, "  ⎿  Running PreToolUse hook…"),
+                own,
+                "⏺ Update(notes.txt)",
+            ),
+        ),
+        ("its row the screen's first", edit[own..].to_vec()),
+    ];
     let mut lost = Vec::new();
     for (name, tail) in tails {
-        for (shape, fixture) in [
-            ("Edit shape", ASK_EDIT),
-            ("Bash sed shape", ASK_BASH_SED_SPECIFIER_300),
-        ] {
-            let rows = phase_fixtures::screen(fixture);
-            let p = aterm_phase::prompt::parse_prompt_v2(&rows).expect("the captured box");
+        for (shape, rows) in &shapes {
+            let p = aterm_phase::prompt::parse_prompt_v2(rows).expect("the captured box");
+            // The diagnostic may agree; every possible tool's hold still
+            // survives the actual parser, stale candidate and decider.
             let candidate =
                 drew(&p, &pending_calls(&tail), &[], None).expect("the older Edit candidate");
             assert_eq!(candidate.tool, "Edit", "{name}, {shape}");
             for ask in [rule("Bash(sed:*)"), rule("Bash"), hook("Bash"), hook("*")] {
-                let expected = on_screen(&rows, &at(vec![ask.clone()], None));
+                let expected = on_screen(rows, &at(vec![ask.clone()], None));
                 assert!(
                     matches!(expected, Decision::Escalate { .. }),
                     "the unqualified hold: {expected:?}"
                 );
-                let got = on_screen(&rows, &at(vec![ask.clone()], Some(&candidate.tool)));
+                let got = on_screen(rows, &at(vec![ask.clone()], Some(&candidate.tool)));
                 if got != expected {
                     lost.push(format!("{name}, {shape}, {}: {got:?}", ask.text));
                 }
@@ -6449,6 +7644,175 @@ fn a_transcript_candidate_cannot_remove_a_possible_tools_owner_hold() {
         }
     }
     assert!(lost.is_empty(), "BOX-CALL-OWNER-HOLD: {lost:#?}");
+    // The cut box: its head off the screen, it is no candidate's at all, and
+    // held whatever is named.
+    let p = aterm_phase::prompt::parse_prompt_v2(&cut).expect("the cut box");
+    assert!(p.head_off_screen, "PRECONDITION: {p:?}");
+    let d = on_screen(&cut, &at(vec![hook("*")], Some("Edit")));
+    assert!(matches!(d, Decision::Escalate { .. }), "the cut: {d:?}");
+}
+
+/// A box under a `*` hook with a transcript Edit candidate: the screen
+/// diagnostic and the actual decision that retains the owner's hold.
+fn edit_named(rows: &[String]) -> (bool, Decision) {
+    let p = aterm_phase::prompt::parse_prompt_v2(rows).expect("the box");
+    let d = on_screen(
+        rows,
+        &ApprovalCtx {
+            owner_asks: Ok(vec![ask_hook("*")]),
+            box_call: Some("Edit".to_string()),
+            ..full()
+        },
+    );
+    (super::super::box_call::screen_shows_edit_call(&p, rows), d)
+}
+
+/// Queued Edit rows remain diagnostically Edit-shaped while every possible
+/// tool's owner hold survives. A different top file or a queued Waiting row
+/// also refuses the diagnostic.
+#[test]
+fn queued_edit_rows_do_not_remove_a_possible_tools_owner_hold() {
+    let edit = phase_fixtures::screen(EDIT_STAR_HOOK_303);
+    let own = call_row_of(&edit);
+    let queued = |row: &str| put_row(&put_row(&edit, own + 1, row), own + 1, "");
+    let second = {
+        let mut rows = edit.clone();
+        for (k, r) in [
+            "  ⎿  Added 1 line, removed 1 line",
+            "      1 -seed",
+            "      1 +sprout",
+            "",
+        ]
+        .iter()
+        .enumerate()
+        {
+            rows.insert(own + 1 + k, (*r).to_string());
+        }
+        put_row(&rows, own + 5, "⏺ Update(notes.txt)")
+    };
+    for (name, rows) in [
+        ("an Edit of other.txt queued", queued("⏺ Update(other.txt)")),
+        (
+            "a second Edit of notes.txt queued",
+            queued("⏺ Update(notes.txt)"),
+        ),
+        ("the second of two Edits of notes.txt", second),
+    ] {
+        let (shows, d) = edit_named(&rows);
+        assert!(shows, "{name}: {rows:#?}");
+        assert!(matches!(d, Decision::Escalate { .. }), "{name}: {d:?}");
+    }
+    for (name, rows) in [
+        (
+            "the run's top another file's",
+            put_row(&edit, own, "⏺ Update(other.txt)"),
+        ),
+        (
+            "another tool's childless row over its row",
+            put_row(&edit, own, "⏺ Write(new.txt)"),
+        ),
+        (
+            "a queued sed in the run",
+            put_row(&queued("⏺ Update(notes.txt)"), own + 3, "  ⎿  Waiting…"),
+        ),
+    ] {
+        let (shows, d) = edit_named(&rows);
+        assert!(!shows, "{name}");
+        assert!(matches!(d, Decision::Escalate { .. }), "{name}: {d:?}");
+    }
+}
+
+/// Finished cut output leaves the screen diagnostic Edit-shaped; progress
+/// output does not. Neither removes a possible tool's owner hold.
+#[test]
+fn an_edit_after_a_cut_output_keeps_a_possible_tools_owner_hold() {
+    let edit = phase_fixtures::screen(EDIT_STAR_HOOK_303);
+    let own = call_row_of(&edit);
+    let after = |tail: &str| {
+        let mut rows = edit.clone();
+        for (k, r) in [
+            "⏺ Task Output b59udxsuy",
+            "  ⎿  build start 23:24:13 at 0b69c5b76, free 35 GiB",
+            tail,
+            "",
+        ]
+        .iter()
+        .enumerate()
+        {
+            rows.insert(own + k, (*r).to_string());
+        }
+        rows
+    };
+    for tail in [
+        "     ok",
+        "     … +5 lines",
+        "     … +1 line (ctrl+o to expand)",
+    ] {
+        let (shows, d) = edit_named(&after(tail));
+        assert!(shows, "{tail}");
+        assert!(matches!(d, Decision::Escalate { .. }), "{tail}: {d:?}");
+    }
+    for tail in ["     … working", "     Running… +5 lines"] {
+        let (shows, d) = edit_named(&after(tail));
+        assert!(!shows, "{tail}");
+        assert!(matches!(d, Decision::Escalate { .. }), "{tail}: {d:?}");
+    }
+    // A finished call's `⎿` result right over the Edit's row is no text and
+    // no progress: the Edit's. A read in progress there is held, as before.
+    let ran = put_row(&put_row(&edit, own, "  ⎿  (No output)"), own, "⏺ Bash(ls)");
+    let (shows, d) = edit_named(&ran);
+    assert!(shows, "after a finished call");
+    assert!(matches!(d, Decision::Escalate { .. }), "{d:?}");
+    let reading = put_row(&edit, own, "  Reading 1 file… (ctrl+o to expand)");
+    let (shows, d) = edit_named(&reading);
+    assert!(!shows, "under a read in progress");
+    assert!(matches!(d, Decision::Escalate { .. }), "{d:?}");
+}
+
+/// Off-screen and on-screen Waiting rows both keep the owner's hold.
+/// Screen diagnostics for an Edit-shaped control do not grant authority.
+#[test]
+fn a_box_whose_calls_message_reaches_off_the_screen_is_held() {
+    let text = "⏺ Now the same change by hand.";
+    let sed = phase_fixtures::screen(SED_THEN_EDIT_303);
+    let q = call_row_of(&sed);
+    let sed = put_row(&put_row(&sed, q, ""), q, text);
+    let at = |asks: Vec<OwnerAsk>| ApprovalCtx {
+        owner_asks: Ok(asks),
+        box_call: Some("Edit".to_string()),
+        ..full()
+    };
+    for (name, rows) in [
+        ("its Waiting… row on the screen", sed.clone()),
+        ("its Waiting… row off the screen", sed[q..].to_vec()),
+        (
+            "two rows of text, its Waiting… row off the screen",
+            put_row(&sed[q..], 1, "  and once more."),
+        ),
+    ] {
+        let p = aterm_phase::prompt::parse_prompt_v2(&rows).expect("the sed's box");
+        assert!(
+            !super::super::box_call::screen_shows_edit_call(&p, &rows),
+            "{name}: the sed's box read as the Edit's"
+        );
+        for ask in [ask_rule("Bash(sed:*)"), ask_hook("*")] {
+            let d = on_screen(&rows, &at(vec![ask.clone()]));
+            assert!(
+                matches!(d, Decision::Escalate { .. }),
+                "{name}, {}: {d:?}",
+                ask.text
+            );
+        }
+    }
+    let edit = phase_fixtures::screen(EDIT_STAR_HOOK_303);
+    let own = call_row_of(&edit);
+    let edit = put_row(&put_row(&edit, own, ""), own, text);
+    let (shows, d) = edit_named(&edit);
+    assert!(shows, "CONTROL: the row over the text on the screen");
+    assert!(matches!(d, Decision::Escalate { .. }), "{d:?}");
+    let (shows, d) = edit_named(&edit[own..]);
+    assert!(!shows, "the text the screen's first row");
+    assert!(matches!(d, Decision::Escalate { .. }), "{d:?}");
 }
 
 /// `rows` read as Claude Code's and decided with a trace kept: the
@@ -6471,6 +7835,8 @@ fn traced(rows: &[String], ctx: &ApprovalCtx) -> (Decision, Vec<super::super::tr
 #[test]
 fn a_trace_names_the_rule_that_decided() {
     use super::super::trace::{Outcome, deciding};
+    // The git rule reads the settings chain from the session's directory.
+    let ctx = || git_host(self::ctx());
     let read = bash_box(
         &["git status --short"],
         Some("Show the working tree status"),

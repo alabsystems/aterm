@@ -18,9 +18,11 @@ fn record(argv: &[&str], env: &[(&str, &str)]) -> Record {
         exit: None,
         cwd: Some("/work".to_string()),
         draft_empty: None,
+        frame: None,
     }
 }
 
+#[cfg(unix)]
 fn live() -> Live {
     Live {
         exec_path: "/store/codex-alab/bin/codex".to_string(),
@@ -46,9 +48,11 @@ fn live() -> Live {
 }
 
 /// The live process's root flags, as a record carries them.
+#[cfg(unix)]
 const ROOT: [&str; 5] = ["--search", "-m", "gpt-5", "-s", "read-only"];
 
 /// A record's line: `launch`, then `flags`, then `resume <UUID>`.
+#[cfg(unix)]
 fn line<'a>(launch: &'a str, flags: &[&'a str]) -> Vec<&'a str> {
     std::iter::once(launch)
         .chain(flags.iter().copied())
@@ -107,6 +111,7 @@ fn a_uuid_is_its_one_textual_form() {
 /// conversation last, under its own `CODEX_HOME`, in its own directory — is
 /// taken, and each way a planted record differs is refused (the negative
 /// controls).
+#[cfg(unix)]
 #[test]
 fn a_resume_line_validates_only_as_the_live_process_ran() {
     let home = [("CODEX_HOME", "/Users//u/.codex")];
@@ -349,6 +354,7 @@ fn a_record_never_written_is_never_read_as_removed() {
 /// crash rule typed, for the process that runs exactly it. NEGATIVE
 /// CONTROLS: no typed line; a process that resumes another conversation or
 /// none; a line whose launch path or flags the live process did not run.
+#[cfg(unix)]
 #[test]
 fn a_never_written_record_inherits_only_the_line_its_relaunch_typed() {
     let mut relaunched = live();
@@ -480,13 +486,7 @@ fn the_record_is_read_only_while_its_process_runs() {
     // A platform binary's environment is hidden from `KERN_PROCARGS2`: a
     // copy, signed ad hoc, shows its own.
     let sleep = home.join("sleep");
-    std::fs::copy("/bin/sleep", &sleep).expect("copy sleep");
-    let signed = aterm_uds::spawnfd::command("codesign")
-        .args(["--force", "--sign", "-"])
-        .arg(&sleep)
-        .output()
-        .expect("codesign");
-    assert!(signed.status.success(), "{signed:?}");
+    aterm_uds::deadline::ad_hoc_copy(std::path::Path::new("/bin/sleep"), &sleep);
     let sleep_s = sleep.to_string_lossy().into_owned();
     let mut child = aterm_uds::spawnfd::command(&sleep)
         .arg("60")
@@ -593,13 +593,7 @@ fn the_idle_point_is_read_live_from_the_record_of_a_running_process() {
     // A platform binary's environment is hidden from `KERN_PROCARGS2`: a
     // copy, signed ad hoc, shows its own.
     let sleep = home.join("sleep");
-    std::fs::copy("/bin/sleep", &sleep).expect("copy sleep");
-    let signed = aterm_uds::spawnfd::command("codesign")
-        .args(["--force", "--sign", "-"])
-        .arg(&sleep)
-        .output()
-        .expect("codesign");
-    assert!(signed.status.success(), "{signed:?}");
+    aterm_uds::deadline::ad_hoc_copy(std::path::Path::new("/bin/sleep"), &sleep);
     let sleep_s = sleep.to_string_lossy().into_owned();
     let mut child = aterm_uds::spawnfd::command(&sleep)
         .arg("60")
@@ -646,10 +640,143 @@ fn the_idle_point_is_read_live_from_the_record_of_a_running_process() {
         "another identity of the same pid"
     );
     assert!(read_idle(pid, &start), "positive control, again");
+    // The relaunch's first frame, read the same way ([`read_first_frame`]):
+    // the frame at rest while the record says `busy` (a carry-on owed), which
+    // is no idle point; a turn; not another pid's, not another identity's.
+    let plant_frame = |pid: u32, status: &str, state: &str| {
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"v":1,"pid":{pid},"sessionId":"{UUID}","status":"{status}","state":"{state}","draftEmpty":true,"exit":null}}"#
+            ),
+        )
+        .expect("the record");
+    };
+    plant_frame(pid, "busy", "idle");
+    assert_eq!(
+        read_first_frame(pid, &start),
+        Some(FirstFrame::Idle),
+        "its frame at rest, a carry-on owed"
+    );
+    assert!(!read_idle(pid, &start), "which is no idle point");
+    plant_frame(pid, "busy", "working");
+    assert_eq!(
+        read_first_frame(pid, &start),
+        Some(FirstFrame::Turn),
+        "a turn"
+    );
+    plant_frame(pid, "busy", "starting");
+    assert_eq!(read_first_frame(pid, &start), None, "no frame this reads");
+    plant_frame(pid + 1, "busy", "idle");
+    assert_eq!(read_first_frame(pid, &start), None, "another pid's record");
+    plant_frame(pid, "busy", "idle");
+    assert_eq!(
+        read_first_frame(pid, "Thu Jan  1 00:00:00 1970"),
+        None,
+        "another identity of the same pid"
+    );
+    assert_eq!(
+        read_first_frame(pid, &start),
+        Some(FirstFrame::Idle),
+        "positive control, again"
+    );
     let _ = child.kill();
     let _ = child.wait();
     assert!(
         !read_idle(pid, &start),
         "gone: a dead identity rests nowhere"
     );
+    assert_eq!(
+        read_first_frame(pid, &start),
+        None,
+        "gone: no first frame either"
+    );
+}
+
+/// A RELAUNCH'S FIRST FRAME ([`first_frame`]): its TUI's frame at rest —
+/// `state` `idle`, `done` or `error` — even while its record says `busy`
+/// because the carry-on the relaunch lease holds back is owed (no idle point
+/// then: the hold must not wait for one), or the record's own rest, is its
+/// first idle; a turn (`working`) or a box (`blocked`) is a turn under way
+/// (the hold must not wait for its end either: codex-alab's own acts in it
+/// wait for the same lease). NEGATIVE CONTROLS: no frame named, one that is
+/// no string or no word this reads, and a record that names its end.
+#[test]
+fn a_relaunchs_first_frame_is_its_rest_or_a_turn_even_while_a_carry_on_is_owed() {
+    let parsed = |status: &str, state: &str, exit: &str| {
+        parse(&format!(
+            r#"{{"v":1,"pid":4242,"status":{status},"state":{state},"draftEmpty":true,"exit":{exit}}}"#
+        ))
+        .expect("a v1 record")
+    };
+    let owed = parsed(r#""busy""#, r#""idle""#, "null");
+    assert!(!idle_point(&owed), "a carry-on owed: no idle point");
+    assert_eq!(
+        first_frame(&owed),
+        Some(FirstFrame::Idle),
+        "but its first idle"
+    );
+    for state in [r#""done""#, r#""error""#] {
+        assert_eq!(
+            first_frame(&parsed(r#""busy""#, state, "null")),
+            Some(FirstFrame::Idle),
+            "{state}"
+        );
+    }
+    assert_eq!(
+        first_frame(&parsed(r#""idle""#, "null", "null")),
+        Some(FirstFrame::Idle),
+        "the record's own rest"
+    );
+    for (status, state) in [
+        (r#""busy""#, r#""working""#),
+        (r#""waiting""#, r#""blocked""#),
+    ] {
+        assert_eq!(
+            first_frame(&parsed(status, state, "null")),
+            Some(FirstFrame::Turn),
+            "{status} {state}"
+        );
+    }
+    for (status, state, exit) in [
+        (r#""busy""#, "null", "null"),
+        (r#""busy""#, "1", "null"),
+        (r#""busy""#, r#""starting""#, "null"),
+        (r#""busy""#, r#""idle""#, r#""signal:9""#),
+        (r#""busy""#, r#""working""#, r#""signal:9""#),
+        (r#""idle""#, r#""idle""#, r#""signal:15""#),
+    ] {
+        let record = parsed(status, state, exit);
+        assert_eq!(
+            first_frame(&record),
+            None,
+            "{status} {state} {exit}: {record:?}"
+        );
+    }
+}
+
+/// The codex-alab a `status` reply names as its PROVEN self-claim
+/// ([`proven_pid`]), its holder percent-encoded or not. NEGATIVE CONTROLS: an
+/// unproven claim, a proof with no holder, another holder, a holder whose
+/// pid is no number, and a reply that is not `OK`.
+#[test]
+fn a_proven_claim_names_its_codex_alab_only_when_proven() {
+    assert_eq!(
+        proven_pid("OK schema=1 hold=0 supervisor=codex-alab%404242 supervisor_proven=1 hand=-"),
+        Some(4242)
+    );
+    assert_eq!(
+        proven_pid("OK supervisor=codex-alab@4242 supervisor_proven=1"),
+        Some(4242)
+    );
+    for status in [
+        "OK supervisor=codex-alab@4242 supervisor_proven=0",
+        "OK supervisor=codex-alab@4242",
+        "OK supervisor=- supervisor_proven=1",
+        "OK supervisor=aterm-harness%401 supervisor_proven=1",
+        "OK supervisor=codex-alab@x supervisor_proven=1",
+        "ERR no such session supervisor=codex-alab@4242 supervisor_proven=1",
+    ] {
+        assert_eq!(proven_pid(status), None, "{status}");
+    }
 }

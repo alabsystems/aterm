@@ -1,6 +1,31 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
+/// `ditto` names files the bundle chose, so a line naming one after the passing key
+/// leaves an unpack failure the refusal it is, still reading the name. CONTROL: a
+/// plain line is quoted as it was.
+#[test]
+fn a_ditto_failure_quoting_a_refusal_key_is_still_a_refusal() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let status = std::process::ExitStatus::from_raw(1 << 8);
+    let unpack = |stderr: &str| {
+        super::unpack_failure(
+            std::path::Path::new("/tmp"),
+            "ditto extract failed",
+            status,
+            stderr,
+        )
+    };
+    let refusal = unpack(&format!(
+        "ditto: /mnt/A.app/./Contents/Resources/q: {}: Permission denied\n",
+        crate::PASSING_REFUSAL_KEY
+    ));
+    assert!(!crate::is_passing_refusal(&refusal), "{refusal}");
+    assert!(refusal.contains("Resources/q: "), "{refusal}");
+    let plain = unpack("ditto: /mnt/A.app/./Contents/MacOS/A: Permission denied\n");
+    assert!(plain.ends_with("MacOS/A: Permission denied"), "{plain}");
+}
+
 /// An installed bundle replaced by a hand-built, ad-hoc-signed one cannot be the
 /// rollback source, so the successor's boot apply would refuse to swap, stay the
 /// old build and refuse its target (read by the parent as `ChildDied`). The
@@ -586,7 +611,7 @@ fn a_cold_launch_waits_for_a_check_to_confirm_a_stale_roster_authorization() {
     );
     for confirmed in [Some(now - 2 * day), None] {
         let ready = publish_confirmed_stage(&s, 20, "m11", confirmed);
-        match stage_admission_gates(&s, 10, &ready, now) {
+        match stage_admission_gates(&s, 10, &ready, None, now) {
             Some(ApplyOutcome::Deferred(why)) => {
                 assert!(crate::is_passing_refusal(&why), "{why}");
                 assert!(
@@ -617,7 +642,7 @@ fn a_cold_launch_waits_for_a_check_to_confirm_a_stale_roster_authorization() {
         },
     );
     assert_eq!(
-        stage_admission_gates(&s, 10, &stale, now),
+        stage_admission_gates(&s, 10, &stale, None, now),
         Some(ApplyOutcome::NoUpdate)
     );
     assert!(!s.ready.exists(), "the revoked stage is retired");
@@ -654,7 +679,8 @@ fn a_launch_waiting_for_its_roster_confirmation_restarts_the_overdue_clock() {
         "another refusal is the lane's own, and its clock runs on"
     );
     seen_long_ago();
-    let Some(ApplyOutcome::Deferred(wait)) = stage_admission_gates(&s, 10, &stale, now) else {
+    let Some(ApplyOutcome::Deferred(wait)) = stage_admission_gates(&s, 10, &stale, None, now)
+    else {
         panic!("PRECONDITION: the launch waits");
     };
     record_boot_apply_refusal(&s, 10, &wait);
@@ -952,6 +978,22 @@ fn a_floor_that_could_not_be_read_admits_no_stage() {
         Some(ApplyOutcome::NoUpdate)
     ));
     assert!(!s.ready.exists(), "the readable floor retires the stage");
+
+    // Gate 4b, the yank, alone: a floor above the stage retires it; one at its build
+    // admits it.
+    for (min_build, withdrawn) in [(21, true), (20, false)] {
+        std::fs::write(&s.ready, ready.to_toml().unwrap()).unwrap();
+        std::fs::write(s.floor(), format!("min_build = {min_build}\n")).unwrap();
+        assert_eq!(
+            matches!(
+                floor_withdrawal_gate(&s, 10, &ready),
+                Some(ApplyOutcome::NoUpdate)
+            ),
+            withdrawn,
+            "min_build {min_build}"
+        );
+        assert_eq!(s.ready.exists(), !withdrawn, "min_build {min_build}");
+    }
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1058,10 +1100,11 @@ fn read_ready_classifies_all_states() {
 /// mid-attempt replaces it; a read the kernel refused for a moment (`EMFILE`
 /// in a Dock-launched window) reads as an unreadable marker. Each of those
 /// refusals must read as passing, or the GUI files it STRUCTURAL against a
-/// healthy build and two of them converge it for a day.
+/// healthy build and two of them converge it for a day. So does a marker whose
+/// bundle is gone, as the cached-pass check files it.
 ///
 /// And only those: the stage's VERDICTS — quarantine, the operator floor, a
-/// bundle that does not verify — keep their verdict (negative controls).
+/// bundle path that is not a bundle — keep their verdict (negative controls).
 #[test]
 fn a_stage_state_refusal_is_passing_and_a_verdict_is_not() {
     let (s, root) = temp_staging();
@@ -1105,11 +1148,31 @@ fn a_stage_state_refusal_is_passing_and_a_verdict_is_not() {
         }
     }
 
-    // NEGATIVE CONTROLS: verdicts keep their verdict.
-    let unverifiable =
+    // The marker is there but its bundle is gone (a swap-prepare cut moved it to the
+    // fixed path): the moment the cached-pass check files it as.
+    let bundle_gone =
         preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, NEVER_READ)
             .unwrap_err();
-    assert!(!crate::is_passing_refusal(&unverifiable), "{unverifiable}");
+    assert!(
+        bundle_gone.contains("no longer the published stage")
+            && crate::is_passing_refusal(&bundle_gone),
+        "{bundle_gone}"
+    );
+
+    // NEGATIVE CONTROLS: verdicts keep their verdict. Something that is not a bundle
+    // wearing the stage's name (a file, a symlink) is refused by its shape.
+    std::fs::write(&s.staged_app, b"not a bundle").unwrap();
+    let a_file =
+        preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, NEVER_READ)
+            .unwrap_err();
+    assert!(!crate::is_passing_refusal(&a_file), "{a_file}");
+    std::fs::remove_file(&s.staged_app).unwrap();
+    std::os::unix::fs::symlink(&root, &s.staged_app).unwrap();
+    let symlinked =
+        preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, NEVER_READ)
+            .unwrap_err();
+    assert!(!crate::is_passing_refusal(&symlinked), "{symlinked}");
+    std::fs::remove_file(&s.staged_app).unwrap();
     std::fs::write(s.floor(), "min_build = 21\n").unwrap();
     let yanked =
         preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, NEVER_READ)
@@ -1211,8 +1274,8 @@ fn a_timeout_verifying_the_installed_bundle_is_not_a_person_refusal() {
 
 /// A CODESIGN RUN THAT ENDED WITHOUT A VERDICT IS NOT ONE,
 /// driven through the REAL reader and the real `codesign`: an installed bundle
-/// whose main executable codesign cannot read just then exits 1 with "Permission
-/// denied" — a fact about this machine (`CodesignError::judged_nothing`), never
+/// whose main executable codesign cannot read just then exits 1 with "<bundle>:
+/// Permission denied" — a fact about this machine (`CodesignError::judged_nothing_at`), never
 /// the installed-source refusal that tells a person to reinstall a healthy app.
 ///
 /// CONTROL: the same bundle, readable again, is refused as the VERDICT it is
@@ -1626,9 +1689,155 @@ fn expected_handoff_authority_is_exact_build_commit_and_digest() {
     let mut wrong_commit = exact.clone();
     wrong_commit.commit = "fedcba9876543210fedcba9876543210fedcba98".into();
     assert!(!ready_matches_expected(&ready, &wrong_commit));
-    let mut wrong_build = exact;
+    let mut wrong_build = exact.clone();
     wrong_build.build = 55;
     assert!(!ready_matches_expected(&ready, &wrong_build));
+
+    // The successor files the shared stage's state as both pre-park checks do: another
+    // BUILD in the stage (a sibling published over it) is a moment; the same build with
+    // other bytes stays a verdict.
+    assert_eq!(expected_artifact_refusal(&ready, &exact), None);
+    let replaced = expected_artifact_refusal(&ready, &wrong_build).unwrap();
+    assert!(crate::is_passing_refusal(&replaced), "{replaced}");
+    for other_bytes in [&wrong_commit, &wrong_digest] {
+        let refusal = expected_artifact_refusal(&ready, other_bytes).unwrap();
+        assert!(!crate::is_passing_refusal(&refusal), "{refusal}");
+    }
+
+    // And the successor's swap gates, handed that authority, file the stage so: another
+    // build waits (passing), other bytes of the build are refused as a verdict, neither
+    // retires the stage, and the exact artifact goes on through the other gates.
+    let (s, root) = temp_staging();
+    let staged = publish_confirmed_stage(&s, 54, "m3", Some(unix_now_secs()));
+    let gates = |expected| stage_admission_gates(&s, 10, &staged, Some(expected), unix_now_secs());
+    assert!(
+        matches!(gates(&wrong_build), Some(ApplyOutcome::Deferred(why)) if crate::is_passing_refusal(&why)),
+        "another build in the stage is a moment"
+    );
+    for other_bytes in [&wrong_commit, &wrong_digest] {
+        assert!(
+            matches!(gates(other_bytes), Some(ApplyOutcome::Deferred(why)) if !crate::is_passing_refusal(&why)),
+            "{other_bytes:?}: other bytes of the build are a verdict"
+        );
+    }
+    assert!(
+        Ready::read_publishable(&s).is_some(),
+        "a refused authority retires nothing"
+    );
+    assert_eq!(gates(&exact), None);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A QUARANTINE RECORD THAT COULD NOT BE READ ADMITS NOTHING. Build 20 crash-looped
+/// here and was quarantined; another build's stage failure then replaced
+/// `failed.toml`, so `quarantine.toml` alone names it. A moment's `EMFILE`/`EIO` on
+/// that ledger — a mode this uid cannot open stands in — must not read as "not
+/// quarantined": no reader sees the stage, and the swap's gates, both pre-park checks
+/// and the publish each refuse as a PASSING condition, retiring nothing. The same when
+/// `failed.toml` alone holds the verdict (an older build's revert wrote it).
+///
+/// NEGATIVE CONTROL: the same records, readable, refuse the build by name as a
+/// verdict, and the swap retires the stage.
+#[test]
+fn a_quarantine_record_that_could_not_be_read_admits_no_stage() {
+    use std::os::unix::fs::PermissionsExt;
+    let (s, root) = temp_staging();
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let digest = "ab".repeat(32);
+    let mode = |path: &Path, bits| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap();
+    };
+    for alone in [s.quarantine(), s.failed()] {
+        let _ = std::fs::remove_file(s.quarantine());
+        let _ = std::fs::remove_file(s.failed());
+        let now = unix_now_secs();
+        let ready = publish_confirmed_stage(&s, 20, "m3", Some(now));
+        if alone == s.quarantine() {
+            crate::manifest::quarantine_artifact(&s, 20, &digest, aterm_durable::Flush::Durable);
+            crate::manifest::FailedMark::record_stage_failure(
+                &s.failed(),
+                21,
+                &"cd".repeat(32),
+                now,
+            );
+            assert!(
+                crate::manifest::FailedMark::read(&s.failed()).is_some_and(|m| !m.is_quarantine()),
+                "PRECONDITION: failed.toml no longer names the quarantine"
+            );
+        } else {
+            crate::manifest::FailedMark::record_quarantine(
+                &s.failed(),
+                20,
+                &digest,
+                aterm_durable::Flush::Durable,
+            );
+            assert!(!s.quarantine().exists(), "PRECONDITION: failed.toml alone");
+        }
+        let at = alone.display().to_string();
+        assert!(Ready::read_publishable(&s).is_none(), "{at}: PRECONDITION");
+        let incoming = incoming_stage(&s, 20, commit);
+
+        mode(&alone, 0o000);
+        if std::fs::File::open(&alone).is_ok() {
+            mode(&alone, 0o600);
+            break; // root reads through any mode: nothing to stand in with
+        }
+        let publishable = Ready::read_publishable(&s);
+        let swap = stage_admission_gates(&s, 10, &ready, None, now);
+        let cached = handoff_cached_pass_refusal_at(&s, 20, commit);
+        let full =
+            preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, NEVER_READ);
+        let publish = publish_verified_stage(&s, &incoming, &ready);
+        mode(&alone, 0o600);
+
+        let moment = |why: &str| crate::is_passing_refusal(why) && why.contains("update records");
+        assert!(publishable.is_none(), "{at}: {publishable:?}");
+        assert!(
+            matches!(&swap, Some(ApplyOutcome::Deferred(why)) if moment(why)),
+            "{at}: {swap:?}"
+        );
+        assert!(
+            s.ready.exists() && s.staged_app.exists(),
+            "{at}: a record it could not read retires nothing"
+        );
+        assert!(cached.as_deref().is_some_and(moment), "{at}: {cached:?}");
+        assert!(
+            full.as_ref().is_err_and(|why| moment(why)),
+            "{at}: {full:?}"
+        );
+        assert!(
+            publish.as_ref().is_err_and(|why| moment(why)),
+            "{at}: {publish:?}"
+        );
+        assert!(incoming.exists(), "{at}: nothing published");
+
+        // NEGATIVE CONTROL: readable, the quarantine is the verdict it names.
+        let verdict = |why: &str| why.contains("quarantined") && !crate::is_passing_refusal(why);
+        let cached = handoff_cached_pass_refusal_at(&s, 20, commit);
+        assert!(cached.as_deref().is_some_and(verdict), "{at}: {cached:?}");
+        let full =
+            preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, NEVER_READ);
+        assert!(
+            full.as_ref().is_err_and(|why| verdict(why)),
+            "{at}: {full:?}"
+        );
+        let publish = publish_verified_stage(&s, &incoming, &ready);
+        assert!(
+            publish.as_ref().is_err_and(|why| verdict(why)),
+            "{at}: {publish:?}"
+        );
+        assert_eq!(
+            stage_admission_gates(&s, 10, &ready, None, now),
+            Some(ApplyOutcome::NoUpdate),
+            "{at}"
+        );
+        assert!(
+            !s.ready.exists(),
+            "{at}: the swap retires a quarantined stage"
+        );
+        let _ = std::fs::remove_dir_all(&incoming);
+    }
+    let _ = std::fs::remove_dir_all(root);
 }
 
 /// Rollback authority is the receipt of the exact sealed OLD build and commit, and a
@@ -2990,6 +3199,7 @@ fn only_a_deferred_boot_apply_is_recorded_as_a_refusal() {
         ApplyOutcome::NotApplicable,
         ApplyOutcome::NoUpdate,
         ApplyOutcome::ReExecFailed("exec: ENOMEM".to_string()),
+        ApplyOutcome::Reverted("build 1000 crash-looped; build 999 restored".to_string()),
     ] {
         assert_eq!(
             boot_apply_refusal_reason(&quiet),
@@ -3219,6 +3429,99 @@ fn native_update_disk_transaction_model_conforms_to_real_swap_recovery_and_healt
     drop(_apply);
     let _ = std::fs::remove_dir_all(root);
 
+    // THE LAUNCHED LANE'S PARENT SWAPS BEFORE IT LAUNCHES (2026-10-19), so the process
+    // LaunchServices starts is NEW and never replaces its own image. The real
+    // `swap_staged_for_launch_at` runs the whole transaction, lock to receipt, and
+    // takes the model's same steps from ready; it returns with the apply lock and the verification budget
+    // let go and no re-exec stamp written. Only the sealed-identity readers and the
+    // start probe are injected: the fixtures are unsealed.
+    let running = build - 1;
+    let launch_desk = || {
+        let (s, root) = temp_staging();
+        write_ready(&s, build);
+        make_app(&s.staged_app, "NEW");
+        std::fs::create_dir_all(s.staged_app.join("Contents")).unwrap();
+        std::fs::write(
+            s.staged_app.join("Contents/Info.plist"),
+            format!(
+                "<plist><dict><key>CFBundleVersion</key><string>{build}</string>\
+                 <key>ATermGitCommit</key><string>{commit}</string></dict></plist>"
+            ),
+        )
+        .unwrap();
+        let installed = root.join("Applications/aterm.app");
+        make_app(&installed, "OLD");
+        (s, root, installed)
+    };
+    let launch_swap = |s: &Staging, installed: &Path, expected: &ExpectedArtifact| {
+        let read = |path: &Path| -> Result<(u64, String), String> {
+            if path == installed {
+                Ok((running, other_commit.to_string()))
+            } else {
+                Ok((build, commit.to_string()))
+            }
+        };
+        let read_both = |[a, b]: [&Path; 2]| [read(a), read(b)];
+        let starts = |_: &Path, _: u64| -> Result<(), String> { Ok(()) };
+        swap_staged_for_launch_at(
+            s,
+            installed,
+            running,
+            Some(other_commit),
+            expected,
+            &SwapSeams {
+                one: &read,
+                both: &read_both,
+                probe: &starts,
+            },
+        )
+    };
+    let (s, root, installed) = launch_desk();
+    let mut state = disk_model_ready(&model);
+    assert_real_disk_projection(&state, &s, &installed, build, commit, &digest);
+    let authorized = ExpectedArtifact::from_parts(build, commit, &digest).unwrap();
+    assert_eq!(launch_swap(&s, &installed, &authorized), Ok(build));
+    for action in [
+        "RemovePreviousReceipt",
+        "PrepareFixedNew",
+        "ArmExactTrial",
+        "AtomicSwap",
+        "RecordExactReceipt",
+    ] {
+        disk_model_step(&model, &mut state, action);
+    }
+    assert_real_disk_projection(&state, &s, &installed, build, commit, &digest);
+    assert!(
+        FileLock::acquire_within(&s.apply_lock, std::time::Duration::ZERO).is_ok(),
+        "the parent lets the apply lock go before it launches: the successor's boot \
+         apply takes it to count its launch"
+    );
+    assert_eq!(crate::verify::current_budget_deadline(), None);
+    assert!(
+        !s.reexec_stamp().exists(),
+        "no re-exec stamp: nothing execs on this lane"
+    );
+    let _ = std::fs::remove_dir_all(root);
+
+    // Negative control: a stage that is not the artifact the attempt authorizes is
+    // refused before anything moves. The disk stays at the ready state: OLD installed,
+    // nothing at the fixed path, no trial armed, no receipt.
+    let (s, root, installed) = launch_desk();
+    let other_artifact = ExpectedArtifact::from_parts(build, commit, &"cd".repeat(32)).unwrap();
+    assert!(matches!(
+        launch_swap(&s, &installed, &other_artifact),
+        Err(ApplyOutcome::Deferred(_))
+    ));
+    assert_real_disk_projection(
+        &disk_model_ready(&model),
+        &s,
+        &installed,
+        build,
+        commit,
+        &digest,
+    );
+    let _ = std::fs::remove_dir_all(root);
+
     // A PREDECESSOR THE RUNNING BUILD'S VERIFIER REFUSES (2026-10-16): the same exact
     // OLD bytes, judged by the trial build's own verifier. The real classifier answers
     // the model's two steps — a verified strict predecessor is `VerifyExactRollback`,
@@ -3288,8 +3591,7 @@ fn native_update_disk_transaction_model_conforms_to_real_swap_recovery_and_healt
         check_boot_health_with_proof(
             s,
             build,
-            &[],
-            &[],
+            RollbackHandoff::NONE,
             false,
             crate::TrialWitness::Window,
             std::time::Duration::from_millis(100),
@@ -4368,5 +4670,362 @@ fn the_old_bundle_recheck_follows_the_operation_that_prepared_new() {
     assert!(
         copied_is_rechecked && copied_is_recovered && moved_keeps_proof,
         "OLD_RECHECK_MUST_FOLLOW_THE_PREPARED_OPERATION"
+    );
+}
+
+/// A WINDOW LAUNCH LEAVES THE STAGE FOR ITS WINDOW, AND EXECS ONLY TO REVERT OR ESCAPE
+/// (Tier-1 of `NativeUpdateBootImage`, 2026-10-19). An `execve` after a LaunchServices
+/// launch leaves LaunchServices answering pid -1 for the app for the process's life, so a
+/// macOS window no parent handed off to keeps its image: its boot admits the stage under
+/// the apply lock and leaves it for the window's in-session lane.
+///
+/// The real `boot_image_lane` and `revert_lane`, over every class, crash loop, stage,
+/// count of ended launches that left the stage, `[update] auto_apply` setting and record
+/// that can or cannot count this launch, each take the one model step they name. Then the
+/// real boot router (`boot_lane_under_apply_lock`, the one `apply_staged_if_ready_inner`
+/// takes) over a scratch staging root: with nothing staged the admission answers
+/// `NoUpdate` before any lane; a replaceable launch hands the stage on to the swap and
+/// records nothing; a window leaves it (ready kept, install untouched, lock and budget
+/// let go, this launch on the record), leaves it again beside one ended launch and beside
+/// a record of another stage, leaves it for a press beside two ended launches without
+/// recording itself, escapes to the swap when the record cannot take it, and escapes once
+/// two recorded launches have ended, a swap that removes the record.
+///
+/// Negative controls: `Buggy=1`'s boot swap of a kept image breaks
+/// `WindowExecsOnlyToRevertOrEscape`, `Buggy=2`'s re-exec of a launched successor's
+/// restored build breaks `LaunchedSuccessorNeverExecs`, and `Buggy=4`'s escape of a stage
+/// that waits for a press breaks `PressOnlyWindowExecsOnlyToRevert`. The healthy model
+/// admits none of them, and the real lanes take none.
+#[test]
+fn a_window_launch_leaves_the_stage_for_its_window_and_execs_only_to_revert_or_escape() {
+    use crate::ImageReplacement::{LaunchedSuccessor, Replaceable, WindowKeepsImage};
+    use aterm_spec::interp::{State, admits, with_buggy};
+    // `spawnfd`'s: the stand-in holds its stdio and nothing else of this process.
+    use aterm_uds::spawnfd::Command;
+    let model = aterm_models_update::native_update_boot_image_model();
+    let step = |state: &State, action: &str| -> State {
+        let next = model.successors(action, state);
+        assert_eq!(next.len(), 1, "{action} from {state:?}");
+        next[0].clone()
+    };
+    // The facts the boot meets: (class, crash loop, stage, ended launches that left it,
+    // auto_apply off, a record that cannot count this launch).
+    let before = |(image, crash_loop, stage, ended, press_only, unusable): (
+        crate::ImageReplacement,
+        bool,
+        bool,
+        usize,
+        bool,
+        bool,
+    )| {
+        let mut state = model.init_state();
+        if stage {
+            state = step(&state, "Stage");
+            for _ in 0..ended {
+                state = step(&state, "PriorLeftLaunchEnded");
+            }
+            if unusable {
+                state = step(&state, "RecordUnusable");
+            }
+        }
+        if press_only {
+            state = step(&state, "PressOnly");
+        }
+        if crash_loop {
+            state = step(&state, "CrashLoop");
+        }
+        step(
+            &state,
+            match image {
+                Replaceable => "ClassifyReplaceable",
+                WindowKeepsImage => "ClassifyWindow",
+                LaunchedSuccessor => "ClassifySuccessor",
+            },
+        )
+    };
+    let settings = [(false, false), (false, true), (true, false), (true, true)];
+    for image in [Replaceable, WindowKeepsImage, LaunchedSuccessor] {
+        for crash_loop in [false, true] {
+            for stage in [false, true] {
+                for ended in 0..=crate::LEFT_STAGE_ESCAPE {
+                    for (press_only, unusable) in settings {
+                        if !stage && (ended > 0 || unusable) {
+                            continue;
+                        }
+                        let facts = (image, crash_loop, stage, ended, press_only, unusable);
+                        let from = before(facts);
+                        let mut to = from.clone();
+                        let action = if crash_loop {
+                            to.insert("crash_loop", 0);
+                            to.insert("reverted", 1);
+                            if stage {
+                                to.insert("stage", 2);
+                            }
+                            match revert_lane(image) {
+                                RevertLane::ReExec => {
+                                    to.insert("execs", 1);
+                                    "RevertExec"
+                                }
+                                RevertLane::ExitInstead => {
+                                    to.insert("phase", 2);
+                                    "RevertExit"
+                                }
+                            }
+                        } else if !stage {
+                            // Nothing staged: the pre-lock peek answers `NoUpdate` for every
+                            // class (driven for real below).
+                            to.insert("phase", 1);
+                            "BootNothing"
+                        } else {
+                            to.insert("phase", 1);
+                            let record = if unusable {
+                                LeftRecord::Unusable
+                            } else {
+                                LeftRecord::Ended(ended)
+                            };
+                            match boot_image_lane(image, !press_only, record) {
+                                BootImageLane::NeverSwap => "BootNothing",
+                                BootImageLane::LeaveForSession => {
+                                    to.insert("left", 1);
+                                    "BootLeave"
+                                }
+                                BootImageLane::LeaveForPress => "BootLeaveForPress",
+                                BootImageLane::SwapAndExec => {
+                                    to.insert("swaps", 1);
+                                    to.insert("execs", 1);
+                                    to.insert("stage", 2);
+                                    to.insert("ended_left", 0);
+                                    if image == WindowKeepsImage {
+                                        to.insert("escaped", 1);
+                                        if unusable {
+                                            "BootRecordUnusableSwapExec"
+                                        } else {
+                                            "BootEscapeSwapExec"
+                                        }
+                                    } else {
+                                        "BootSwapExec"
+                                    }
+                                }
+                            }
+                        };
+                        assert_eq!(
+                            model.successors(action, &from).as_slice(),
+                            std::slice::from_ref(&to),
+                            "{facts:?} (class, crash loop, stage, ended, press-only, unusable \
+                             record) must take {action}"
+                        );
+                        assert_eq!(admits(&model, &from, &to), Some(action));
+                        for invariant in &model.invariants {
+                            assert!(
+                                model.check_invariant(invariant.name, &to),
+                                "{facts:?} breaks {}: {to:?}",
+                                invariant.name
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Negative controls: the boot swap this change removed, the launched successor's
+    // revert re-exec the change before it removed, and an escape of a stage that waits
+    // for a press.
+    let kept = before((WindowKeepsImage, false, true, 0, false, false));
+    assert_eq!(
+        boot_image_lane(WindowKeepsImage, true, LeftRecord::Ended(0)),
+        BootImageLane::LeaveForSession
+    );
+    let buggy = with_buggy(&model, 1);
+    let swapped = buggy.successors("BootSwapExecKeptImage", &kept)[0].clone();
+    assert_eq!(admits(&model, &kept, &swapped), None);
+    assert!(!buggy.check_invariant("WindowExecsOnlyToRevertOrEscape", &swapped));
+    let reverting = before((LaunchedSuccessor, true, false, 0, false, false));
+    assert_eq!(revert_lane(LaunchedSuccessor), RevertLane::ExitInstead);
+    let buggy = with_buggy(&model, 2);
+    let reexec = buggy.successors("RevertExecSuccessor", &reverting)[0].clone();
+    assert_eq!(admits(&model, &reverting, &reexec), None);
+    assert!(!buggy.check_invariant("LaunchedSuccessorNeverExecs", &reexec));
+    let waiting = before((
+        WindowKeepsImage,
+        false,
+        true,
+        crate::LEFT_STAGE_ESCAPE,
+        true,
+        false,
+    ));
+    assert_eq!(
+        boot_image_lane(
+            WindowKeepsImage,
+            false,
+            LeftRecord::Ended(crate::LEFT_STAGE_ESCAPE)
+        ),
+        BootImageLane::LeaveForPress
+    );
+    let buggy = with_buggy(&model, 4);
+    let unpressed = buggy.successors("BootEscapeSwapExecPressOnly", &waiting)[0].clone();
+    assert_eq!(admits(&model, &waiting, &unpressed), None);
+    assert!(!buggy.check_invariant("PressOnlyWindowExecsOnlyToRevert", &unpressed));
+
+    // The real router over a scratch staging root: build 10 runs, build 11 is staged.
+    let (running, build, commit, other_commit) = (
+        10,
+        11,
+        "0123456789abcdef0123456789abcdef01234567",
+        "fedcba9876543210fedcba9876543210fedcba98",
+    );
+    let (s, root) = temp_staging();
+    let installed = root.join("Applications/aterm.app");
+    // Nothing staged: the admission answers `NoUpdate` before the lock or any lane
+    // (`BootNothing` above).
+    assert!(matches!(
+        admit_stage_under_apply_lock(&s, &installed, running, Some(other_commit), None),
+        Err(ApplyOutcome::NoUpdate)
+    ));
+    write_ready(&s, build);
+    make_app(&s.staged_app, "NEW");
+    std::fs::create_dir_all(s.staged_app.join("Contents")).unwrap();
+    std::fs::write(
+        s.staged_app.join("Contents/Info.plist"),
+        format!(
+            "<plist><dict><key>CFBundleVersion</key><string>{build}</string>\
+             <key>ATermGitCommit</key><string>{commit}</string></dict></plist>"
+        ),
+    )
+    .unwrap();
+    make_app(&installed, "OLD");
+    let ready = Ready::read(&s.ready).expect("the stage");
+    let boot = |image: crate::ImageReplacement, auto_apply: bool| {
+        let admitted =
+            admit_stage_under_apply_lock(&s, &installed, running, Some(other_commit), None)
+                .unwrap_or_else(|refused| panic!("the stage is admitted: {refused:?}"));
+        boot_lane_under_apply_lock(&s, image, auto_apply, admitted)
+    };
+    let assert_left = |what: &str, auto_apply: bool| {
+        match boot(WindowKeepsImage, auto_apply) {
+            Err(outcome) => assert_eq!(
+                outcome,
+                ApplyOutcome::LeftForSession {
+                    build,
+                    dmg_sha256: "ab".repeat(32)
+                },
+                "{what}"
+            ),
+            Ok(_) => panic!("{what}: the boot took the stage"),
+        }
+        assert!(
+            matches!(read_ready(&s, running), ReadyState::Newer(_)),
+            "{what}: the stage stays published"
+        );
+        assert_eq!(
+            read_id(&installed),
+            "OLD",
+            "{what}: the install is untouched"
+        );
+        assert!(
+            FileLock::acquire_within(&s.apply_lock, std::time::Duration::ZERO).is_ok(),
+            "{what}: the apply lock is let go before the window"
+        );
+        assert_eq!(crate::verify::current_budget_deadline(), None, "{what}");
+        assert!(!s.reexec_stamp().exists(), "{what}: nothing execs");
+    };
+    assert!(
+        boot(Replaceable, true).is_ok(),
+        "a replaceable launch hands the stage on to the boot's swap"
+    );
+    assert!(
+        !left_stage_path(&s).exists(),
+        "a replaceable launch is never on the record"
+    );
+    let me = TrialLauncher::this_process().expect("this process");
+    assert_left("a window launch", true);
+    assert_eq!(read_left_launchers(&s, &ready).unwrap(), [me]);
+    assert_left("the same launch, again", true);
+    assert_eq!(read_left_launchers(&s, &ready).unwrap(), [me]);
+    // Own the stand-in before its process query can fail: Child's Drop alone
+    // reaps later and does not stop a child that is still running.
+    struct StandInLaunch(aterm_uds::spawnfd::Child);
+    impl Drop for StandInLaunch {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    // Two launches that left it, both reaped: the record names exactly these processes.
+    let ended: Vec<TrialLauncher> = (0..2)
+        .map(|_| {
+            let mut child = StandInLaunch(
+                Command::new("/bin/sleep")
+                    .arg("30")
+                    .spawn()
+                    .expect("start a stand-in launch"),
+            );
+            let launcher = TrialLauncher::of(child.0.id()).expect("a running child");
+            // A stand-in that must die dies by SIGKILL (AGENTS.md).
+            child.0.kill().unwrap();
+            child.0.wait().unwrap();
+            launcher
+        })
+        .collect();
+    write_left_launchers(&s, &ready, &[ended[0], me]).unwrap();
+    assert_left("beside one ended launch", true);
+    let other_stage = Ready {
+        dmg_sha256: "cd".repeat(32),
+        ..ready.clone()
+    };
+    write_left_launchers(&s, &other_stage, &[ended[0], ended[1]]).unwrap();
+    assert_left("beside two ended launches of another stage", true);
+    assert_eq!(read_left_launchers(&s, &ready).unwrap(), [me]);
+    // `[update] auto_apply = false`: the stage waits for a press, however many launches
+    // left it, and this launch is not counted.
+    write_left_launchers(&s, &ready, &[ended[0], ended[1]]).unwrap();
+    assert_left("a press-only window beside two ended launches", false);
+    assert_eq!(
+        read_left_launchers(&s, &ready).unwrap(),
+        [ended[0], ended[1]],
+        "a launch that left the stage for a press is never recorded"
+    );
+    // A record that cannot take this launch (a directory where the file goes) escapes to
+    // the boot's swap with the automatic lane on, and still waits for a press with it off.
+    std::fs::remove_file(left_stage_path(&s)).unwrap();
+    std::fs::create_dir(left_stage_path(&s)).unwrap();
+    assert!(
+        boot(WindowKeepsImage, true).is_ok(),
+        "a record that cannot count this launch must escape to the boot's swap"
+    );
+    assert_left("a press-only window beside a record it cannot write", false);
+    std::fs::remove_dir(left_stage_path(&s)).unwrap();
+    // The escape: two ended launches left this stage, so this boot swaps and execs.
+    write_left_launchers(&s, &ready, &[ended[0], ended[1], me]).unwrap();
+    let Ok(escaped) = boot(WindowKeepsImage, true) else {
+        panic!("two ended launches that left the stage must escape to the boot's swap");
+    };
+    let read = |path: &Path| -> Result<(u64, String), String> {
+        if path == installed.as_path() {
+            Ok((running, other_commit.to_string()))
+        } else {
+            Ok((build, commit.to_string()))
+        }
+    };
+    let read_both = |[a, b]: [&Path; 2]| [read(a), read(b)];
+    let starts = |_: &Path, _: u64| -> Result<(), String> { Ok(()) };
+    let swapped = swap_admitted_stage(
+        &s,
+        &installed,
+        running,
+        Some(other_commit),
+        escaped,
+        &SwapSeams {
+            one: &read,
+            both: &read_both,
+            probe: &starts,
+        },
+    );
+    assert!(swapped.is_ok(), "the escape swaps the stage in");
+    drop(swapped);
+    assert_eq!(read_id(&installed), "NEW");
+    assert!(!s.ready.exists(), "the swapped stage is retired");
+    assert!(
+        !left_stage_path(&s).exists(),
+        "a swap of the stage removes the record of the launches that left it"
     );
 }

@@ -519,24 +519,24 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    fn tally(pid: u32, committed: u64) -> String {
-        Tally {
-            pid,
-            requests: 4,
-            request_ns: 9_000_000,
-            commits: 2,
-            commit_ns: 7_000_000,
-            acks: 2,
-            ack_ns: 1_000_000,
-            committed,
-        }
-        .render()
-    }
-
     #[test]
     fn a_tally_is_taken_only_once_it_is_this_bridges_and_past_the_message() {
+        use super::*;
+
+        fn tally(pid: u32, committed: u64) -> String {
+            Tally {
+                pid,
+                requests: 4,
+                request_ns: 9_000_000,
+                commits: 2,
+                commit_ns: 7_000_000,
+                acks: 2,
+                ack_ns: 1_000_000,
+                committed,
+            }
+            .render()
+        }
+
         let line = tally(77, 120);
         let t = covering(Some(&line), 77, 120).expect("through 120");
         assert_eq!((t.pid, t.committed, t.requests), (77, 120, 4));
@@ -556,6 +556,8 @@ mod tests {
 
     #[test]
     fn a_replys_wait_for_the_commit_is_the_gap_or_nothing() {
+        use super::*;
+
         // The reply queued at 10.000 ms, the commit durable at 13.500 ms.
         assert_eq!(behind_commit(10_000, 13_500), 3.5);
         // NEGATIVE CONTROL: a commit that landed before the reply was posted
@@ -566,6 +568,8 @@ mod tests {
 
     #[test]
     fn the_waits_table_reads_per_round_trip_and_the_share_needs_a_window() {
+        use super::*;
+
         let d = Tally {
             pid: 1,
             requests: 400,

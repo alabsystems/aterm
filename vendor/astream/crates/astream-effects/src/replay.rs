@@ -28,7 +28,7 @@ contract_fn! {
     /// Pure cursor-bounds predicate linked to the Clean island's `replay_cursor_in_bounds_isl`
     /// and discharged via `clean-kernel-defeq`.
     #[must_use]
-    pub fn replay_cursor_in_bounds(cursor: u64, tape_len: u64) -> bool
+    pub const fn replay_cursor_in_bounds(cursor: u64, tape_len: u64) -> bool
     clauses [ensures result == (cursor < tape_len)]
     {
         cursor < tape_len
@@ -46,7 +46,7 @@ contract_fn! {
 /// the first byte where they differ, so the message shows the difference
 /// rather than the head they share. The values themselves are whole: match on
 /// the variant to read them.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Eq)]
 pub enum ReplayDivergence {
     /// The program asked for more effects than were recorded.
     Exhausted {
@@ -109,6 +109,79 @@ pub enum ReplayDivergence {
     },
 }
 
+impl PartialEq for ReplayDivergence {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Exhausted { expected: a }, Self::Exhausted { expected: b }) => a == b,
+            (
+                Self::KindMismatch {
+                    expected: ea,
+                    found: fa,
+                },
+                Self::KindMismatch {
+                    expected: eb,
+                    found: fb,
+                },
+            ) => ea == eb && fa == fb,
+            (
+                Self::PathDiverged {
+                    recorded: ra,
+                    asked: aa,
+                },
+                Self::PathDiverged {
+                    recorded: rb,
+                    asked: ab,
+                },
+            ) => ra == rb && aa == ab,
+            (
+                Self::DoorDiverged {
+                    recorded: ra,
+                    asked: aa,
+                },
+                Self::DoorDiverged {
+                    recorded: rb,
+                    asked: ab,
+                },
+            ) => ra == rb && aa == ab,
+            (
+                Self::RequestDiverged {
+                    door: da,
+                    recorded: ra,
+                    asked: aa,
+                },
+                Self::RequestDiverged {
+                    door: db,
+                    recorded: rb,
+                    asked: ab,
+                },
+            ) => da == db && ra == rb && aa == ab,
+            (
+                Self::OutputDiverged {
+                    door: da,
+                    recorded: ra,
+                    emitted: ea,
+                },
+                Self::OutputDiverged {
+                    door: db,
+                    recorded: rb,
+                    emitted: eb,
+                },
+            ) => da == db && ra == rb && ea == eb,
+            (
+                Self::Unrecorded {
+                    door: da,
+                    request: rqa,
+                },
+                Self::Unrecorded {
+                    door: db,
+                    request: rqb,
+                },
+            ) => da == db && rqa == rqb,
+            _ => false,
+        }
+    }
+}
+
 /// Bytes in a divergence message: a window of at most [`WIDTH`](Shown::WIDTH)
 /// of them, ASCII-escaped, with `…` on each side that was cut and the full
 /// length whenever anything was.
@@ -134,13 +207,13 @@ impl<'a> Shown<'a> {
     const LEAD: usize = 16;
 
     /// The window at the start of `bytes`.
-    fn head(bytes: &'a [u8]) -> Shown<'a> {
+    const fn head(bytes: &'a [u8]) -> Shown<'a> {
         Shown { bytes, from: 0 }
     }
 
     /// The window over `bytes` that holds byte `at` and the
     /// [`LEAD`](Shown::LEAD) bytes before it.
-    fn around(bytes: &'a [u8], at: usize) -> Shown<'a> {
+    const fn around(bytes: &'a [u8], at: usize) -> Shown<'a> {
         Shown {
             bytes,
             from: at.saturating_sub(Shown::LEAD),
@@ -184,16 +257,22 @@ impl fmt::Debug for Shown<'_> {
 
 /// The index of the first byte where `a` and `b` differ: the shorter one's
 /// length when it is a prefix of the other (the longer one goes on).
-fn first_difference(a: &[u8], b: &[u8]) -> usize {
-    let limit = if a.len() < b.len() { a.len() } else { b.len() };
+const fn first_difference(a: &[u8], b: &[u8]) -> usize {
+    let mut ra = a;
+    let mut rb = b;
     let mut i = 0usize;
-    while i < limit && i < a.len() && i < b.len() {
-        if a[i] != b[i] {
+    while let &[ba, ref ta @ ..] = ra {
+        let &[bb, ref tb @ ..] = rb else {
+            break;
+        };
+        if ba != bb {
             return i;
         }
         i = i.saturating_add(1);
+        ra = ta;
+        rb = tb;
     }
-    limit
+    i
 }
 
 /// A record inside a divergence message: its variant and fields as the derived
@@ -385,7 +464,7 @@ fn mismatch(expected: &'static str, found: &EffectRecord) -> ReplayDivergence {
 /// type stops an implementation from calling it. This one never does: both
 /// methods bind the closure to `_`, so calling it takes an edit to the
 /// signature a reviewer sees, and every replay test runs with closures that
-/// panic if called (`tests/exchange_replay.rs`, which also catches a replay
+/// panic if called (`tests/suite/exchange_replay.rs`, which also catches a replay
 /// that falls back to the live world when the tape ends). So for the doors
 /// that reach the outside world, "replay never calls `live`" is a property
 /// this implementation keeps and its tests hold it to — inspected, not
@@ -452,11 +531,7 @@ impl<I: Iterator<Item = EffectRecord>> ReplaySeam<I> {
     /// from its record's would refuse every record of its own kind, which
     /// every replay test would see. Each `read`'s catch-all arm is the same
     /// refusal, reachable only through such a drift.
-    fn take<T>(
-        &mut self,
-        expected: &'static str,
-        read: impl FnOnce(&EffectRecord) -> Result<T, ReplayDivergence>,
-    ) -> Result<T, ReplayDivergence> {
+    fn peek_expected(&mut self, expected: &'static str) -> Result<&EffectRecord, ReplayDivergence> {
         let record = self
             .tape
             .peek()
@@ -464,9 +539,7 @@ impl<I: Iterator<Item = EffectRecord>> ReplaySeam<I> {
         if record.kind() != expected {
             return Err(mismatch(expected, record));
         }
-        let value = read(record)?;
-        self.advance();
-        Ok(value)
+        Ok(record)
     }
 
     /// Step past the record [`peek`](ReplaySeam::peek) shows.
@@ -474,8 +547,7 @@ impl<I: Iterator<Item = EffectRecord>> ReplaySeam<I> {
         if self.tape.next().is_some() {
             // Bounded by the tape's length, which is a `usize` of records the
             // iterator produced; saturation only removes an add that could wrap.
-            let cur = self.consumed as u64;
-            self.consumed = replay_cursor_monotone(cur, cur.saturating_add(1)) as usize;
+            self.consumed = self.consumed.saturating_add(1);
             self.latches.record_boundary();
         }
     }
@@ -485,22 +557,28 @@ impl<I: Iterator<Item = EffectRecord>> EffectSeam for ReplaySeam<I> {
     type Error = ReplayDivergence;
 
     fn now_nanos(&mut self) -> Result<u64, ReplayDivergence> {
-        self.take("Clock", |r| match r {
-            EffectRecord::Clock(v) => Ok(*v),
-            found => Err(mismatch("Clock", found)),
-        })
+        let v = match self.peek_expected("Clock")? {
+            EffectRecord::Clock(v) => *v,
+            found => return Err(mismatch("Clock", found)),
+        };
+        self.advance();
+        Ok(v)
     }
     fn mono_nanos(&mut self) -> Result<u64, ReplayDivergence> {
-        self.take("Mono", |r| match r {
-            EffectRecord::Mono(v) => Ok(*v),
-            found => Err(mismatch("Mono", found)),
-        })
+        let v = match self.peek_expected("Mono")? {
+            EffectRecord::Mono(v) => *v,
+            found => return Err(mismatch("Mono", found)),
+        };
+        self.advance();
+        Ok(v)
     }
     fn next_rand(&mut self) -> Result<u64, ReplayDivergence> {
-        self.take("Rand", |r| match r {
-            EffectRecord::Rand(v) => Ok(*v),
-            found => Err(mismatch("Rand", found)),
-        })
+        let v = match self.peek_expected("Rand")? {
+            EffectRecord::Rand(v) => *v,
+            found => return Err(mismatch("Rand", found)),
+        };
+        self.advance();
+        Ok(v)
     }
     /// Mirrors the recording seam's lossy door: a taped `FileErr` replays as the
     /// empty bytes the recorded program saw, so the output stays byte-identical.
@@ -515,31 +593,35 @@ impl<I: Iterator<Item = EffectRecord>> EffectSeam for ReplaySeam<I> {
         // path means the replay is not reproducing the recorded execution, so
         // refuse rather than hand back stale bytes (or a stale failure) for the
         // wrong file (the same fail-closed posture as a wrong-kind tape).
-        let diverged = |recorded: &str| ReplayDivergence::PathDiverged {
-            recorded: recorded.to_string(),
-            asked: path.to_string(),
-        };
-        self.take("File", |r| match r {
+        let value = match self.peek_expected("File")? {
             EffectRecord::File {
                 path: recorded,
                 bytes,
             } => {
                 if recorded != path {
-                    return Err(diverged(recorded));
+                    return Err(ReplayDivergence::PathDiverged {
+                        recorded: recorded.clone(),
+                        asked: path.to_string(),
+                    });
                 }
-                Ok(Ok(bytes.clone()))
+                Ok(bytes.clone())
             }
             EffectRecord::FileErr {
                 path: recorded,
                 kind,
             } => {
                 if recorded != path {
-                    return Err(diverged(recorded));
+                    return Err(ReplayDivergence::PathDiverged {
+                        recorded: recorded.clone(),
+                        asked: path.to_string(),
+                    });
                 }
-                Ok(Err(std::io::Error::from(*kind)))
+                Err(std::io::Error::from(*kind))
             }
-            found => Err(mismatch("File", found)),
-        })
+            found => return Err(mismatch("File", found)),
+        };
+        self.advance();
+        Ok(value)
     }
     /// The taped reply, never `live`'s: the closure is not called, so a replay
     /// can run where the socket, host or filesystem it stands for is gone.
@@ -549,7 +631,7 @@ impl<I: Iterator<Item = EffectRecord>> EffectSeam for ReplaySeam<I> {
         request: &[u8],
         _: &mut dyn FnMut(&[u8]) -> Vec<u8>,
     ) -> Result<Vec<u8>, ReplayDivergence> {
-        self.take("Exchange", |r| match r {
+        let value = match self.peek_expected("Exchange")? {
             EffectRecord::Exchange {
                 door: recorded,
                 request: asked_then,
@@ -568,13 +650,15 @@ impl<I: Iterator<Item = EffectRecord>> EffectSeam for ReplaySeam<I> {
                         asked: request.to_vec(),
                     });
                 }
-                Ok(reply.clone())
+                reply.clone()
             }
-            found => Err(mismatch("Exchange", found)),
-        })
+            found => return Err(mismatch("Exchange", found)),
+        };
+        self.advance();
+        Ok(value)
     }
     fn emit(&mut self, door: &str, bytes: &[u8]) -> Result<(), ReplayDivergence> {
-        self.take("Emit", |r| match r {
+        match self.peek_expected("Emit")? {
             EffectRecord::Emit {
                 door: recorded,
                 bytes: said,
@@ -592,10 +676,11 @@ impl<I: Iterator<Item = EffectRecord>> EffectSeam for ReplaySeam<I> {
                         emitted: bytes.to_vec(),
                     });
                 }
-                Ok(())
             }
-            found => Err(mismatch("Emit", found)),
-        })
+            found => return Err(mismatch("Emit", found)),
+        }
+        self.advance();
+        Ok(())
     }
     /// Never refuses: a flag read that finds no `Raised` record for it — the
     /// next record is something else, the count says a later read, or the tape

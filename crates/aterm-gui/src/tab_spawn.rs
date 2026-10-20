@@ -21,9 +21,10 @@
 //! its reader and installs the tab or pane as Cmd-T and Cmd-D always did
 //! ([`App::land_tab_spawn`]). Whoever waits is answered then
 //! ([`TabSpawnThen`]): the wire `spawn` replies `OK <sid>` only once the sid
-//! is registered, `tab new` counts the tab once it is in the window, the
-//! operator row stamps the newborn it started, and a connected preset's tab is
-//! connected to its origin. A spawn that fails says so
+//! is registered, `tab new` counts the tab once it is in the window, a
+//! worker's spawn (`spawn agent=claude`, the menu bar's worker launch) is
+//! made a worker once its newborn is registered, and a connected preset's tab
+//! is connected to its origin. A spawn that fails says so
 //! through the same `new_tab_failed` or `split_failed` row; a window that
 //! closed meanwhile drops the session, whose teardown hangs the shell up and
 //! reaps it. A split is refused at landing as at asking (the focused pane is
@@ -36,6 +37,24 @@
 //! ([`App::defer_tab_spawn_input`]) and replay in order once the tab lands. If
 //! it never does, the keys are dropped and counted, never typed into the tab
 //! the person left; the modifier changes still replay, so no chord is stranded.
+//! The pointer waits with them for a tab or split landing in the window it
+//! points at, so a click after Cmd-T lands after the tab, not before it. A hold
+//! is bounded ([`INPUT_HOLD`]): what is held past it is dropped as for a spawn
+//! that never landed, the moment the window's next input arrives or the spawn
+//! settles, so later keys never reach the old tab while earlier ones replay
+//! into the new one ([`App::expire_tab_spawn_input`]). Each event waits for the
+//! spawn that was newest when it was typed, and replays when that one lands,
+//! held again only for what the replay itself books
+//! ([`App::settle_landed_spawn_input`], [`App::replay_settled_input`]): Cmd-T,
+//! `ls`, Cmd-T runs `ls` in the first new tab even when the second Cmd-T came
+//! through the menu, whose wake no hold delays.
+//!
+//! A menu command reaches the loop a turn late: the native menu's key
+//! equivalent (Cmd-T, Cmd-N), the toolbar's `+` and the palette post a
+//! [`Wake::MenuAction`] that winit delivers only once AppKit has dispatched
+//! every key already queued behind it. Each post is marked ([`MenuMarks`]), so
+//! what is typed before its dispatch waits for it, then for the spawn it booked
+//! ([`App::claim_menu_held_input`]), or goes on as typed if it booked none.
 //!
 //! A new window (Cmd-N, the menu, the identity picker's window rows, a
 //! connected preset's `place=window`) is built around its first session, so it
@@ -57,6 +76,11 @@
 //! session it names (both are ignored for a session the registry does not know).
 //! Off unix the main thread attaches the reader there instead.
 //!
+//! The filesystem work a spawn needs before its fork (the PTY pair, the
+//! exec-status channel, the child's edge-token file) is done ahead by
+//! [`crate::spawn_prep`], which the spawn takes from when it holds one, so the
+//! spawner's own share of a new tab is the fork and the exec verdict.
+//!
 //! Jobs run one at a time, in order, so tabs land in the order they were asked
 //! for. A spawn stalled on a dead volume holds the ones behind it, as the main
 //! thread did, but nothing else waits for it.
@@ -72,11 +96,11 @@ use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use winit::application::ApplicationHandler as _;
-use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
-use winit::keyboard::ModifiersState;
-use winit::window::WindowId as WinitWindowId;
+use aterm_window::application::ApplicationHandler as _;
+use aterm_window::event::WindowEvent;
+use aterm_window::event_loop::{ActiveEventLoop, EventLoopProxy};
+use aterm_window::keyboard::ModifiersState;
+use aterm_window::window::WindowId as WinitWindowId;
 
 use crate::platform::AppRt as _;
 use crate::{App, Session, Wake, WindowId};
@@ -87,9 +111,24 @@ use crate::{App, Session, Wake, WindowId};
 /// went nowhere for longer would read as frozen.
 const INPUT_HOLD: Duration = Duration::from_secs(15);
 
+/// How long a spawn's fork waits for the event loop to park
+/// ([`crate::watchdog::forks_wait_for_park`]): longer than the booking turn and
+/// a status sweep of every tab, shorter than anything a person would notice.
+const FORK_PARK_WAIT: Duration = Duration::from_millis(3);
+
+/// How long the event loop holds its status sweep after it books a spawn
+/// ([`TabSpawns::status_sweep_held_until`]), so the fork, which waits for the
+/// loop to park, does not first wait out a sweep of every tab (about 2 ms at 40
+/// tabs on this host's slow cores, 2026-10-17). The sweep after the landing
+/// classifies every session due by then; one that lands later than this gets
+/// its sweep at the end of the hold.
+const SWEEP_HOLD: Duration = Duration::from_millis(15);
+
 /// How many input events a window holds for a tab in flight; past it the newest
 /// is dropped and counted, as the pre-Commit queue does
-/// ([`crate::MAX_DEFERRED_HANDOFF_INPUT`]).
+/// ([`crate::MAX_DEFERRED_HANDOFF_INPUT`]). Pointer motion and a scroll in
+/// progress fold into the event before them ([`coalesce`]), so moving the
+/// pointer cannot fill it.
 const MAX_HELD_INPUT: usize = crate::MAX_DEFERRED_HANDOFF_INPUT;
 
 /// What a waiter for a window that never opened hears: the words the window
@@ -113,9 +152,9 @@ pub(crate) enum TabSpawnThen {
     /// The wire `tab new`: `OK <active> <count>` of the window once the tab is
     /// in it; `ERR <why>` when it never lands.
     Counts(Sender<Result<(usize, usize), String>>),
-    /// A main-thread row that acts on the newborn at once (the operator's
-    /// Start, a connected preset): run with its sid once it is registered, or
-    /// with why not.
+    /// A main-thread row that acts on the newborn at once (a worker's spawn,
+    /// the menu bar's worker launch, a connected preset): run with its sid
+    /// once it is registered, or with why not.
     Run(SpawnDone),
 }
 
@@ -242,6 +281,8 @@ pub(crate) struct TabSpawnJob {
     identity_prep: IdentityPrep,
     /// The session a controller-as-tab preset observes.
     observe: Option<aterm_session::SessionId>,
+    /// A worker's task file, written by `spawn_session` once the sid is known.
+    task: Option<crate::task_launch::TaskSeed>,
     completion: Arc<TabSpawnCompletion>,
     /// An adopted warm spare (`crate::spare`): handed over as it is when its
     /// check passes, else dropped and the cold spawn above runs under `id`.
@@ -256,6 +297,9 @@ pub(crate) struct AdoptSpare {
     pub(crate) check: crate::spare::AdoptCheck,
     /// Where the spawner says why it was not handed over.
     pub(crate) miss: Arc<OnceLock<&'static str>>,
+    /// Where the spawner names the folder a parked spare `cd`s to at its
+    /// release ([`crate::spare::AdoptCheck::verdict`]).
+    pub(crate) retarget: Arc<OnceLock<String>>,
 }
 
 /// Admission facts captured when a spawn is booked on the main thread.
@@ -267,8 +311,10 @@ pub(crate) enum SpawnAdmission {
         origin: aterm_session::SessionId,
         local: u64,
     },
-    #[cfg(target_os = "macos")]
-    Operator,
+    /// Summarize in a New Tab's worker (`App::summarize_in_new_tab`):
+    /// single-flight while it books ([`TabSpawns::summary_pending`]); it lands
+    /// as a plain tab does.
+    Summary,
 }
 
 /// What a spawn off the loop is asked for, beyond its place.
@@ -289,14 +335,25 @@ pub(crate) struct SpawnAsk {
     /// The session a controller-as-tab preset observes
     /// (`ATERM_OBSERVE_SESSION_ID`).
     pub(crate) observe: Option<aterm_session::SessionId>,
+    /// A WORKER's task file (`spawn agent=claude`, `task_launch`): written by
+    /// `spawn::spawn_session` once the newborn's sid is known, and named to its
+    /// shell as `ATERM_TASK_FILE`. The main thread keeps a clone, which
+    /// removes the file when the worker does not start.
+    pub(crate) task: Option<crate::task_launch::TaskSeed>,
+    /// Keep the window's active tab (a wire `spawn` that does not raise): the
+    /// newborn TAB lands behind it, the `tab_strip` model's NewTab then
+    /// SelectTab, so the person's view stays put. A split focuses its new pane
+    /// whatever this says.
+    pub(crate) background: bool,
     /// The newborn's own theme (`spawn theme=`), validated when asked; a
     /// split with none inherits the divided pane's ([`App::install_spawned`]).
     pub(crate) theme: Option<crate::session_theme::SessionTheme>,
 }
 
 /// What the spawner does with a spawn's agent identity before it forks, where
-/// the identities folder's metadata (it can sit on a slow volume) and a
-/// primer's synced writes hold no window.
+/// the identities folder's metadata (it can sit on a slow volume) holds no
+/// window, and only once the main thread admitted the spawn, so a spawn
+/// refused there (its window, its `of=`) makes no identity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum IdentityPrep {
     /// Only the spawn's own check that it exists (a picker row naming one from
@@ -304,13 +361,15 @@ pub(crate) enum IdentityPrep {
     #[default]
     Exists,
     /// Admit it as a request's spawn does
-    /// ([`crate::agent_identity::check_for_spawn`]): it exists, its folders are
-    /// private, and an `inherited` one is re-primed off this thread. Refused,
-    /// the waiter hears why in the words the request's turn refused it with,
-    /// and no failure row is posted ([`Refusal`]).
+    /// ([`crate::agent_identity::check_for_spawn`]): an `inherited` one must
+    /// exist; one the request named is made first, the verb's only create
+    /// path. Its folders are private before the fork, and its primer writes
+    /// off this thread. Refused, the waiter hears why in the words the
+    /// request's turn refused it with, and no failure row is posted
+    /// ([`Refusal`]).
     Admit { inherited: bool },
-    /// Make it first, if it does not exist (the picker's new-identity row): its
-    /// primer syncs every file it writes.
+    /// Make it first, if it does not exist (the picker's new-identity row), and
+    /// admit it as a named one: a failure is the tab's failure row.
     Create,
 }
 
@@ -473,6 +532,8 @@ struct InFlight {
     grid: SpawnGrid,
     then: TabSpawnThen,
     admission: SpawnAdmission,
+    /// [`SpawnAsk::background`]: a tab lands behind the window's active one.
+    background: bool,
     completion: Arc<TabSpawnCompletion>,
     /// The newborn's own theme, as asked ([`SpawnAsk::theme`]).
     theme: Option<crate::session_theme::SessionTheme>,
@@ -482,20 +543,197 @@ struct InFlight {
 /// them ([`App::spawn_cell_px`]).
 type SpawnGrid = (u16, u16, Option<(u16, u16)>);
 
+/// One input event a window holds for a spawn in flight.
+#[derive(Debug)]
+struct Held {
+    /// The OS window it was typed into.
+    typed_into: WinitWindowId,
+    /// The window it is for: its own, or the new window asked from it.
+    target: WindowId,
+    /// The spawn it waits for (its in-flight id): the newest that took the
+    /// focus of the window it was typed into when it was typed. `None` while
+    /// it waits for a menu command's dispatch instead ([`Self::menu`]).
+    spawn: Option<u64>,
+    event: WindowEvent,
+    /// When its hold ends: [`INPUT_HOLD`] after the spawn it waits for was
+    /// asked for (or its menu command posted). Settled later, it is dropped as
+    /// for a spawn that never landed, never replayed late.
+    until: Instant,
+    /// The menu command it waits for, typed after that command was posted and
+    /// before the loop dispatched it ([`MenuMarks`]): held under the window it
+    /// was typed into until the dispatch says for what. [`MenuMark::NONE`]
+    /// once that is known.
+    menu: MenuMark,
+    /// A modifier change held for a new window that also reached the window
+    /// it was typed into as typed ([`App::defer_tab_spawn_input`]).
+    applied: bool,
+}
+
+/// Pointer input: held only for a tab or split landing in the window it points
+/// at ([`App::defer_tab_spawn_input`]), and replayed there. A file dragged in
+/// is not held: its drop is its own gesture, at the window it lands on.
+fn is_pointer(event: &WindowEvent) -> bool {
+    matches!(
+        event,
+        WindowEvent::CursorMoved { .. }
+            | WindowEvent::CursorEntered { .. }
+            | WindowEvent::CursorLeft { .. }
+            | WindowEvent::MouseInput { .. }
+            | WindowEvent::MouseWheel { .. }
+    )
+}
+
+/// A key press or an IME commit: what the "Keystrokes dropped" row counts.
+fn is_keystroke(event: &WindowEvent) -> bool {
+    matches!(event, WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed())
+        || matches!(event, WindowEvent::Ime(aterm_window::event::Ime::Commit(_)))
+}
+
+/// Fold `next` into `last` when it only carries on what `last` did: the pointer
+/// moving on, or a scroll in progress by the same kind of step. A click lands
+/// where the last move left the pointer, so the moves between are no input of
+/// their own, and a scroll's steps add up to the same scroll.
+fn coalesce(last: &mut WindowEvent, next: &WindowEvent) -> bool {
+    use aterm_window::event::{MouseScrollDelta, TouchPhase};
+    match (last, next) {
+        (
+            WindowEvent::CursorMoved {
+                device_id: was,
+                position: at,
+            },
+            WindowEvent::CursorMoved {
+                device_id,
+                position,
+            },
+        ) if was == device_id => {
+            *at = *position;
+            true
+        }
+        (
+            WindowEvent::MouseWheel {
+                device_id: was,
+                delta: sum,
+                phase: TouchPhase::Moved,
+            },
+            WindowEvent::MouseWheel {
+                device_id,
+                delta,
+                phase: TouchPhase::Moved,
+            },
+        ) if was == device_id => match (sum, delta) {
+            (MouseScrollDelta::LineDelta(x, y), MouseScrollDelta::LineDelta(dx, dy)) => {
+                *x += dx;
+                *y += dy;
+                true
+            }
+            (MouseScrollDelta::PixelDelta(at), MouseScrollDelta::PixelDelta(by)) => {
+                at.x += by.x;
+                at.y += by.y;
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// What settling `held` (one target's, in order) hands back to replay, and how
+/// many keystrokes it drops. An event still within its hold whose spawn
+/// `landed` replays: keys, modifiers and IME through `through` (the target's
+/// own OS window; a new window's input was typed into the one it was asked
+/// from), the pointer where it was typed. Any other (its spawn never landed,
+/// or it waited past its hold) keeps only what leaves the window it was typed
+/// into coherent: its modifier changes (unless they already reached it as
+/// typed, [`Held::applied`]), the pointer's position, entering and leaving, and the
+/// release of a button pressed before the hold. Keystrokes are dropped and
+/// counted; clicks and scrolls are dropped, a click's release with its press.
+fn sift_held(
+    held: Vec<Held>,
+    landed: bool,
+    through: Option<WinitWindowId>,
+    now: Instant,
+) -> (Vec<(WinitWindowId, WindowEvent)>, u32) {
+    let mut replay = Vec::with_capacity(held.len());
+    let mut dropped = 0u32;
+    // The buttons whose press was dropped here: their releases go with them.
+    let mut pressed = Vec::new();
+    for h in held {
+        if landed && now < h.until {
+            let via = if is_pointer(&h.event) {
+                h.typed_into
+            } else {
+                through.unwrap_or(h.typed_into)
+            };
+            replay.push((via, h.event));
+            continue;
+        }
+        let keep = match &h.event {
+            WindowEvent::ModifiersChanged(_) => !h.applied,
+            WindowEvent::CursorMoved { .. }
+            | WindowEvent::CursorEntered { .. }
+            | WindowEvent::CursorLeft { .. } => true,
+            WindowEvent::MouseInput { state, button, .. } if state.is_pressed() => {
+                pressed.push(*button);
+                false
+            }
+            WindowEvent::MouseInput { button, .. } => {
+                match pressed.iter().position(|was| was == button) {
+                    Some(at) => {
+                        pressed.remove(at);
+                        false
+                    }
+                    None => true,
+                }
+            }
+            event => {
+                if is_keystroke(event) {
+                    dropped = dropped.saturating_add(1);
+                }
+                false
+            }
+        };
+        if keep {
+            replay.push((h.typed_into, h.event));
+        }
+    }
+    (replay, dropped)
+}
+
 /// The App's side of the tabs in flight, and what was typed while they were.
 #[derive(Default)]
 pub(crate) struct TabSpawns {
     in_flight: Vec<InFlight>,
-    /// Input typed into a window with a spawn in flight that takes its focus,
-    /// in arrival order, under the window it is for: its own, or the new
-    /// window asked from it.
-    held: Vec<(WinitWindowId, WindowId, WindowEvent)>,
-    /// Events refused past [`MAX_HELD_INPUT`], per window.
+    /// Input typed into a window with a spawn in flight that takes its focus
+    /// (or a menu command not yet dispatched that may book one), in arrival
+    /// order.
+    held: Vec<Held>,
+    /// Keystrokes refused past [`MAX_HELD_INPUT`], per window.
     dropped: Vec<(WindowId, u32)>,
     /// Windows whose held input is no longer a coherent key stream: a drop broke
     /// a press/release pair, or a focus loss cleared the modifiers it was typed
     /// under. Their modifier snapshot is cleared after the replay.
     incoherent: Vec<WindowId>,
+    /// The menu commands posted and not yet dispatched ([`MenuMarks`]).
+    pub(crate) menu: Arc<MenuMarks>,
+    /// Held input is being replayed: what was booked or posted before the
+    /// replay began came after it was typed, so it waits for none of that.
+    floor: Option<ReplayFloor>,
+}
+
+/// What input being replayed was typed before ([`TabSpawns::floor`]), so a
+/// replayed event is held again only for what the replay itself books or
+/// posts: a replayed Cmd-T's tab takes the keys typed after it, but a spawn
+/// or menu command already pending when the replay began does not take keys
+/// typed before it.
+#[derive(Clone, Copy, Debug)]
+struct ReplayFloor {
+    /// The last menu mark minted when the replay began: every mark up to it.
+    marks: u64,
+    /// The first fresh booking id of the replay: every earlier reservation
+    /// is passed over, even when two clock readings are equal. `None` for
+    /// input a menu command's dispatch handed back, which may still be for
+    /// a spawn booked before that command was posted.
+    spawns: Option<u64>,
 }
 
 impl TabSpawns {
@@ -505,28 +743,75 @@ impl TabSpawns {
         self.in_flight.is_empty()
     }
 
-    /// The in-flight entry is the Start reservation: every error, cancellation
-    /// and successful landing removes it before delivering the result.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn operator_pending(&self) -> bool {
+    /// The in-flight entry is Summarize's reservation: every error,
+    /// cancellation and successful landing removes it before delivering the
+    /// result.
+    pub(crate) fn summary_pending(&self) -> bool {
         self.in_flight
             .iter()
-            .any(|t| matches!(t.admission, SpawnAdmission::Operator))
+            .any(|t| matches!(t.admission, SpawnAdmission::Summary))
     }
 
-    /// The window input typed into `window` at `now` is for, if it waits: the
-    /// one the newest spawn asked for within [`INPUT_HOLD`] that takes
-    /// `window`'s focus lands in. A tab or split lands in `window` itself; a
-    /// new window asked from `window` became the one it typed into.
-    fn hold_target(&self, window: WindowId, now: Instant) -> Option<WindowId> {
+    /// While a spawn booked less than [`SWEEP_HOLD`] ago is in flight, the
+    /// instant the event loop's status sweep may run again: it waits for the
+    /// fork rather than the fork for it. `None` when nothing holds it.
+    pub(crate) fn status_sweep_held_until(&self, now: Instant) -> Option<Instant> {
+        self.in_flight
+            .iter()
+            .map(|t| t.asked + SWEEP_HOLD)
+            .max()
+            .filter(|at| *at > now)
+    }
+
+    /// The window input typed into `window` at `now` is for, if it waits, when
+    /// that wait ends, and the spawn it waits for: the one the newest spawn
+    /// asked for within [`INPUT_HOLD`] that takes `window`'s focus lands in. A
+    /// tab or split lands in `window` itself; a new window asked from `window`
+    /// became the one it typed into. Replayed input waits for no spawn asked
+    /// before the replay's first booking id ([`ReplayFloor::spawns`]).
+    fn hold_target(&self, window: WindowId, now: Instant) -> Option<(WindowId, Instant, u64)> {
+        let after = self.floor.and_then(|floor| floor.spawns);
         self.in_flight
             .iter()
             .rev()
             .find(|t| {
                 t.place.asked_from(t.window) == Some(window)
                     && now.saturating_duration_since(t.asked) < INPUT_HOLD
+                    // An adopted spare's id predates this booking; its
+                    // fallback is the fresh reservation made for this ask.
+                    && after.is_none_or(|first| t.alt_id.unwrap_or(t.id) >= first)
             })
-            .map(|t| t.window)
+            .map(|t| (t.window, t.asked + INPUT_HOLD, t.id))
+    }
+
+    /// Hold `held`, folded into the event before it when it only carries that
+    /// on ([`coalesce`]). Past [`MAX_HELD_INPUT`] it is refused: a keystroke is
+    /// counted, and the target's stream is marked for a modifier repair, since
+    /// the refused event may be a chord's release.
+    fn hold(&mut self, held: Held) {
+        if let Some(last) = self.held.last_mut()
+            && last.typed_into == held.typed_into
+            && last.target == held.target
+            && last.spawn == held.spawn
+            && last.menu == held.menu
+            && coalesce(&mut last.event, &held.event)
+        {
+            last.until = last.until.max(held.until);
+            return;
+        }
+        if self.held.len() < MAX_HELD_INPUT {
+            self.held.push(held);
+            return;
+        }
+        if is_keystroke(&held.event) {
+            match self.dropped.iter_mut().find(|(w, _)| *w == held.target) {
+                Some((_, n)) => *n = n.saturating_add(1),
+                None => self.dropped.push((held.target, 1)),
+            }
+        }
+        if !self.incoherent.contains(&held.target) {
+            self.incoherent.push(held.target);
+        }
     }
 
     /// `window` lost focus: input held from it was typed under modifiers the
@@ -542,12 +827,121 @@ impl TabSpawns {
             )
             .collect();
         for target in targets {
-            if self.held.iter().any(|(_, w, _)| *w == target) && !self.incoherent.contains(&target)
-            {
+            if self.held.iter().any(|h| h.target == target) && !self.incoherent.contains(&target) {
                 self.incoherent.push(target);
             }
         }
     }
+}
+
+/// Which post of a menu command a [`Wake::MenuAction`] is ([`MenuMarks`]):
+/// [`Self::NONE`] for one posted unmarked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MenuMark(u64);
+
+impl MenuMark {
+    /// No mark: nothing waits for its dispatch.
+    pub(crate) const NONE: Self = Self(0);
+}
+
+/// MENU COMMANDS POSTED AND NOT YET DISPATCHED (sweep #32). Input typed while
+/// one is pending waits for its dispatch ([`App::defer_tab_spawn_input`]),
+/// then for the spawn it booked ([`App::claim_menu_held_input`]). The App
+/// keeps one, shared with the native menu and toolbar
+/// ([`serve_native_menu_marks`]), whose callbacks post without the App.
+#[derive(Debug, Default)]
+pub(crate) struct MenuMarks(Mutex<MarksState>);
+
+#[derive(Debug, Default)]
+struct MarksState {
+    /// The last mark given out; marks count from one.
+    minted: u64,
+    /// The marks posted and not yet dispatched, oldest first, with when each
+    /// was posted.
+    pending: Vec<(MenuMark, Instant)>,
+}
+
+impl MenuMarks {
+    /// Mark a post at `now`. Marks older than [`INPUT_HOLD`] go: nothing waits
+    /// for them any more.
+    fn mint(&self, now: Instant) -> MenuMark {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .pending
+            .retain(|(_, at)| now.saturating_duration_since(*at) < INPUT_HOLD);
+        state.minted += 1;
+        let mark = MenuMark(state.minted);
+        state.pending.push((mark, now));
+        mark
+    }
+
+    /// `mark` was dispatched (or its post refused): `true` when it was still
+    /// pending, so input may be waiting for it.
+    pub(crate) fn settle(&self, mark: MenuMark) -> bool {
+        if mark == MenuMark::NONE {
+            return false;
+        }
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        match state.pending.iter().position(|(m, _)| *m == mark) {
+            Some(at) => {
+                state.pending.remove(at);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The newest mark posted within [`INPUT_HOLD`] of `now` and not yet
+    /// dispatched, and when it was posted; only one minted after the mark
+    /// `after` counts (replayed input was typed before every mark up to it).
+    fn pending(&self, now: Instant, after: u64) -> Option<(MenuMark, Instant)> {
+        let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .pending
+            .last()
+            .copied()
+            .filter(|(mark, at)| mark.0 > after && now.saturating_duration_since(*at) < INPUT_HOLD)
+    }
+
+    /// The last mark given out (0 before the first).
+    fn minted(&self) -> u64 {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).minted
+    }
+}
+
+/// The App's marks, for the posts its native menu and toolbar make
+/// ([`post_native_menu_action`]). Served once, by the windowed App that
+/// installs them; unset (headless, every test) those posts go unmarked.
+static NATIVE_MENU_MARKS: OnceLock<Arc<MenuMarks>> = OnceLock::new();
+
+/// Serve `marks` to the native menu and toolbar's posts.
+pub(crate) fn serve_native_menu_marks(marks: &Arc<MenuMarks>) {
+    let _ = NATIVE_MENU_MARKS.set(Arc::clone(marks));
+}
+
+/// Post `action` as a [`Wake::MenuAction`] marked in `marks`, so input typed
+/// before the loop dispatches it waits for it. `false` when the loop is gone.
+pub(crate) fn post_menu_action(
+    proxy: &EventLoopProxy<Wake>,
+    marks: Option<&MenuMarks>,
+    action: crate::menu::MenuAction,
+) -> bool {
+    let mark = marks.map_or(MenuMark::NONE, |marks| marks.mint(Instant::now()));
+    let sent = proxy.send_event(Wake::MenuAction { action, mark }).is_ok();
+    if !sent && let Some(marks) = marks {
+        marks.settle(mark);
+    }
+    sent
+}
+
+/// [`post_menu_action`] for a native menu item or toolbar button, marked in
+/// the marks the App served ([`serve_native_menu_marks`]).
+#[cfg(target_os = "macos")]
+pub(crate) fn post_native_menu_action(
+    proxy: &EventLoopProxy<Wake>,
+    action: crate::menu::MenuAction,
+) -> bool {
+    post_menu_action(proxy, NATIVE_MENU_MARKS.get().map(Arc::as_ref), action)
 }
 
 /// Hand `job` to the spawner thread, starting it on first use. The job comes
@@ -571,7 +965,7 @@ fn send_to_spawner(job: TabSpawnJob) -> Option<TabSpawnJob> {
                 if worker_stopping.load(Ordering::Acquire) {
                     job.completion.cancel();
                 } else {
-                    run(job);
+                    run(job, FORK_PARK_WAIT);
                 }
             }
         })
@@ -614,7 +1008,23 @@ fn stop_spawner() -> Option<std::thread::JoinHandle<()>> {
 
 /// Spawn one tab's session and post it back. A panic is a failed spawn, never a
 /// missing answer: the window's input waits for this one.
-fn run(job: TabSpawnJob) {
+/// The status observer's own wake `next` while [`TabSpawns::status_sweep_held_until`]
+/// holds the sweep until `held`: never before the hold's end, where the held
+/// sweep runs. The sweep it skipped left its slots' observation instants as they
+/// were, so `next` can already be past, and armed as it is every turn of the
+/// hold would wake the loop at once, again and again, and the fork waiting for
+/// the loop to park would wait out its whole bound.
+pub(crate) fn held_status_wake(next: Option<Instant>, held: Option<Instant>) -> Option<Instant> {
+    match (next, held) {
+        (Some(wake), Some(at)) => Some(wake.max(at)),
+        (wake, _) => wake,
+    }
+}
+
+/// Run one spawn job; `park_wait` bounds how long its fork waits for the event
+/// loop to park ([`FORK_PARK_WAIT`] on the spawner thread; zero when the job runs
+/// inline in the loop's own turn, where no park can come until it returns).
+fn run(job: TabSpawnJob, park_wait: Duration) {
     let TabSpawnJob {
         id,
         window,
@@ -628,6 +1038,7 @@ fn run(job: TabSpawnJob) {
         identity,
         identity_prep,
         observe,
+        task,
         completion,
         adopt,
     } = job;
@@ -635,18 +1046,29 @@ fn run(job: TabSpawnJob) {
         return;
     }
     // An adopted spare (design §8 step 2): its rc generation and folder are
-    // checked here, off the main thread; valid, it is handed over at once, its
-    // reader already running. Otherwise it goes (a warm one with its whole
-    // session) and this spawn runs cold under the fallback id.
+    // checked here, off the main thread, against the folder this spawn would
+    // start in cold (a held pane's is checked here too); valid, it is handed
+    // over at once, its reader already running, a parked one told the folder
+    // it `cd`s to when it is elsewhere. Otherwise it goes (a warm one with its
+    // whole session) and this spawn runs cold under the fallback id, in the
+    // folder already resolved.
+    let mut resolved = None;
     if let Some(adopt) = adopt {
         let AdoptSpare {
             id: spare_id,
             session,
             check,
             miss,
+            retarget,
         } = *adopt;
-        match check.miss(&session) {
-            None => {
+        let want = cwd
+            .clone()
+            .or_else(|| crate::spawn_folder::PaneFolder::first_taken(pane_folders.iter().cloned()));
+        match check.verdict(&session, want.as_deref(), factory.cwd.as_deref()) {
+            Ok(dir) => {
+                if let Some(dir) = dir {
+                    let _ = retarget.set(dir);
+                }
                 publish_completion(
                     &completion,
                     TabSpawned {
@@ -659,12 +1081,13 @@ fn run(job: TabSpawnJob) {
                 );
                 return;
             }
-            Some(reason) => {
+            Err(reason) => {
                 let _ = miss.set(reason);
                 if check.kill {
                     crate::spare::kill_session(session.pid);
                 }
                 drop(session);
+                resolved = Some(want);
             }
         }
     }
@@ -676,22 +1099,32 @@ fn run(job: TabSpawnJob) {
     // the tab in flight forever, and its window's held input with it.
     let (session, reader_gate) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // A held pane's folder is checked here, where a hung volume holds only
-        // this thread, for at most the check's budget per pane.
-        let cwd = cwd.or_else(|| crate::spawn_folder::PaneFolder::first_taken(pane_folders));
+        // this thread, for at most the check's budget per pane (once: a spare
+        // that missed already resolved it).
+        let cwd = resolved.unwrap_or_else(|| {
+            cwd.or_else(|| crate::spawn_folder::PaneFolder::first_taken(pane_folders))
+        });
         let session = provision(identity.as_deref(), identity_prep).and_then(|()| {
-            crate::spawn::spawn_session(
-                id,
-                window,
-                rows,
-                cols,
-                cell_px,
-                &factory,
-                &proxy,
-                cwd.as_deref(),
-                observe.as_ref(),
-                identity.as_deref(),
-                None,
-            )
+            // Forked once the event loop parks, bounded, waited at the fork
+            // itself (`watchdog::forks_wait_for_park`): the turn that booked
+            // this tab and the sweep after it would otherwise wait out the
+            // fork's malloc locks.
+            crate::watchdog::forks_wait_for_park(park_wait, || {
+                crate::spawn::spawn_session(
+                    id,
+                    window,
+                    rows,
+                    cols,
+                    cell_px,
+                    &factory,
+                    &proxy,
+                    cwd.as_deref(),
+                    observe.as_ref(),
+                    identity.as_deref(),
+                    task.as_ref(),
+                    None,
+                )
+            })
         });
         park_reader(session, window, &proxy, &factory)
     }))
@@ -712,19 +1145,33 @@ fn run(job: TabSpawnJob) {
 /// make it first. With [`IdentityPrep::Exists`] the spawn's own check that it
 /// exists is all.
 fn provision(identity: Option<&str>, prep: IdentityPrep) -> std::io::Result<()> {
+    provision_with(identity, prep, crate::agent_identity::check_for_spawn)
+}
+
+/// [`provision`] through `admit` ([`crate::agent_identity::check_for_spawn`]
+/// in a run; a test's own root and primer handoff).
+fn provision_with(
+    identity: Option<&str>,
+    prep: IdentityPrep,
+    admit: impl FnOnce(&str, crate::agent_identity::SpawnAdmit) -> std::io::Result<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    use crate::agent_identity::SpawnAdmit;
     let Some(name) = identity else {
         return Ok(());
     };
     match prep {
         IdentityPrep::Exists => Ok(()),
         IdentityPrep::Admit { inherited } => {
-            crate::agent_identity::check_for_spawn(name, inherited)
-                .map(drop)
-                .map_err(|e| {
-                    std::io::Error::new(e.kind(), Refusal(format!("identity {name}: {e}")))
-                })
+            let how = if inherited {
+                SpawnAdmit::Inherited
+            } else {
+                SpawnAdmit::Named
+            };
+            admit(name, how).map(drop).map_err(|e| {
+                std::io::Error::new(e.kind(), Refusal(format!("identity {name}: {e}")))
+            })
         }
-        IdentityPrep::Create => crate::agent_identity::ensure(name, true)
+        IdentityPrep::Create => admit(name, SpawnAdmit::Named)
             .map(drop)
             .map_err(|e| std::io::Error::new(e.kind(), format!("identity {name}: {e}"))),
     }
@@ -950,10 +1397,15 @@ impl App {
         // A split of a pane with its own theme inherits it (`split_theme`),
         // decided here once: a spare's already-running reader would miss it,
         // so such a split takes no spare, and the landing applies exactly what
-        // was decided now, whatever the focus is by then.
+        // was decided now, whatever the focus is by then. A worker's spawn
+        // (`spawn agent=claude`) takes none either: its task file is written
+        // once its own sid is known and named to its shell as
+        // `ATERM_TASK_FILE`, which a spare's shell, already running, never saw.
         let inherited = self.inherited_theme(window, place, ask.theme.as_ref());
         let tried = if inherited.is_some() {
             Err("theme")
+        } else if ask.task.is_some() {
+            Err("ask")
         } else {
             self.try_adopt_spare(window, place.asked_from(window), grid, &ask)
         };
@@ -972,6 +1424,8 @@ impl App {
             identity,
             identity_prep,
             observe,
+            task,
+            background,
             theme,
         } = ask;
         let theme = theme.or(inherited);
@@ -988,6 +1442,7 @@ impl App {
                 // the landing catches it up as for any tab in flight.
                 colors = slot.colors;
                 let miss = Arc::new(OnceLock::new());
+                let retarget = Arc::new(OnceLock::new());
                 let warm = slot.state.warm();
                 let now = Instant::now();
                 self.spares.transit.push(crate::spare::Transit {
@@ -1010,6 +1465,7 @@ impl App {
                         .map(|d| d.as_millis() as u64),
                     inputs: slot.inputs.clone(),
                     miss: Arc::clone(&miss),
+                    retarget: Arc::clone(&retarget),
                 });
                 let adopt = AdoptSpare {
                     id: slot.id,
@@ -1019,8 +1475,11 @@ impl App {
                         generation: warm.then(|| (slot.inputs.clone(), slot.generation)),
                         link: Arc::clone(&slot.link),
                         kill: warm && slot.state != crate::spare::SlotState::Ready,
+                        retarget: slot.state == crate::spare::SlotState::Parked
+                            && self.spare_retargets(slot.inputs.shell),
                     },
                     miss,
+                    retarget,
                 };
                 self.publish_spare();
                 (slot.id, Some(id), Some(Box::new(adopt)))
@@ -1045,6 +1504,15 @@ impl App {
         };
         let mut factory = self.session_factory.clone();
         factory.reader_after_install = true;
+        // The shell's `COLORFGBG` names the side of the theme this session will
+        // draw, which lands only after the shell has started.
+        #[cfg(windows)]
+        {
+            factory.shell_appearance = self.spawn_shell_appearance(
+                theme.as_ref().map(|theme| theme.selector.as_str()),
+                identity.as_deref(),
+            );
+        }
         let completion = Arc::new(TabSpawnCompletion::default());
         self.tab_spawns.in_flight.push(InFlight {
             id: inflight_id,
@@ -1057,6 +1525,7 @@ impl App {
             grid,
             then,
             admission,
+            background,
             completion: Arc::clone(&completion),
             theme,
         });
@@ -1073,12 +1542,14 @@ impl App {
             identity,
             identity_prep,
             observe,
+            task,
             completion,
             adopt,
         };
         if let Some(job) = send_to_spawner(job) {
-            // No spawner thread: spawn in this turn, as before, and land it as usual.
-            run(job);
+            // No spawner thread: spawn in this turn, as before, and land it as
+            // usual; the fork waits for no park, which this turn is holding off.
+            run(job, Duration::ZERO);
         }
     }
 
@@ -1093,14 +1564,202 @@ impl App {
             return;
         };
         let window = done.window;
+        // The in-flight id held input waits under: an adopted spare's fallback
+        // lands under its alternate id.
+        let spawn = self
+            .tab_spawns
+            .in_flight
+            .iter()
+            .find(|t| t.id == done.id || t.alt_id == Some(done.id))
+            .map(|t| t.id);
         let landed = self.install_spawned(done, el);
-        let (replay, repair) = self.settle_tab_spawn_input(window, landed);
-        for (winit_id, event) in replay {
-            self.window_event(el, winit_id, event);
+        let (replay, repair) = self.settle_landed_spawn_input(window, spawn, landed);
+        self.replay_settled_input(el, replay, repair);
+    }
+
+    /// [`Self::settle_tab_spawn_input`] for the spawn `spawn` that just landed
+    /// (or failed) in `window`. While another spawn is still in flight to that
+    /// window, what was typed while this one was the newest (and so is for it)
+    /// settles now, into the tab that just took the window's focus, and what
+    /// waits for the later one waits on: a Cmd-T, `ls`, Cmd-T runs `ls` in the
+    /// first new tab, as it does when nothing is in flight. The window's
+    /// refused keystrokes and modifier repair settle with its last spawn.
+    pub(crate) fn settle_landed_spawn_input(
+        &mut self,
+        window: WindowId,
+        spawn: Option<u64>,
+        landed: bool,
+    ) -> (Vec<(WinitWindowId, WindowEvent)>, Option<WindowId>) {
+        let spawns = &mut self.tab_spawns;
+        let Some(spawn) = spawn.filter(|_| spawns.in_flight.iter().any(|t| t.window == window))
+        else {
+            return self.settle_tab_spawn_input(window, landed);
+        };
+        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut spawns.held)
+            .into_iter()
+            .partition(|h| h.target == window && h.spawn == Some(spawn));
+        spawns.held = rest;
+        let through = self
+            .winit_to_window
+            .iter()
+            .find(|(_, w)| **w == window)
+            .map(|(id, _)| *id)
+            .filter(|_| landed);
+        let mine = if landed {
+            self.without_strip_presses(mine)
+        } else {
+            mine
+        };
+        let (replay, dropped) = sift_held(mine, landed, through, Instant::now());
+        if dropped > 0 {
+            aterm_log::warn!(
+                "{dropped} key(s) typed while a new tab was starting were dropped ({})",
+                if landed {
+                    "it started past the hold"
+                } else {
+                    "it never started"
+                }
+            );
+            self.post_message(crate::message_reporters::keystrokes_dropped(dropped));
         }
+        (replay, None)
+    }
+
+    /// Replay what settled for a spawn ([`Self::settle_tab_spawn_input`],
+    /// [`Self::expire_tab_spawn_input`]) through the event path, in order, then
+    /// clear the modifier snapshot of the window `repair` names. It was typed
+    /// before every spawn and menu command still pending, so it waits for none
+    /// of them again ([`ReplayFloor`]): only for what it books itself.
+    pub(crate) fn replay_settled_input(
+        &mut self,
+        el: &ActiveEventLoop,
+        replay: Vec<(WinitWindowId, WindowEvent)>,
+        repair: Option<WindowId>,
+    ) {
+        self.replaying(true, |app| {
+            for (winit_id, event) in replay {
+                app.window_event(el, winit_id, event);
+            }
+        });
         if let Some(ws) = repair.and_then(|at| self.windows.get_mut(&at)) {
             ws.mods = ModifiersState::empty();
         }
+    }
+
+    /// Run `replay` with held input held again only for what is booked or
+    /// posted from now on: every menu mark minted so far and (`spawns`) every
+    /// booking before the next session id passed over ([`ReplayFloor`]). The
+    /// floor before it is put back after, so a replay inside a replay keeps its own.
+    fn replaying<R>(&mut self, spawns: bool, replay: impl FnOnce(&mut Self) -> R) -> R {
+        let floor = ReplayFloor {
+            marks: self.tab_spawns.menu.minted(),
+            spawns: spawns.then_some(self.next_session_id),
+        };
+        let was = self.tab_spawns.floor.replace(floor);
+        let out = replay(self);
+        self.tab_spawns.floor = was;
+        out
+    }
+
+    /// Post `action` as this App's marked [`Wake::MenuAction`]
+    /// ([`post_menu_action`]): the palette's, the tab strip's and the key
+    /// path's own posts. `false` with no loop to post to.
+    pub(crate) fn post_menu_action(&self, action: crate::menu::MenuAction) -> bool {
+        self.proxy
+            .as_ref()
+            .is_some_and(|proxy| post_menu_action(proxy, Some(&self.tab_spawns.menu), action))
+    }
+
+    /// [`Wake::MenuAction`]: dispatch `action`, then settle the input that
+    /// waited for its post `mark` ([`Self::claim_menu_held_input`]) and replay
+    /// what goes on as typed.
+    pub(crate) fn dispatch_marked_menu_action(
+        &mut self,
+        el: &ActiveEventLoop,
+        action: crate::menu::MenuAction,
+        mark: MenuMark,
+    ) {
+        let booked = self.tab_spawns.in_flight.len();
+        self.dispatch_menu_action(el, action);
+        if self.tab_spawns.menu.settle(mark) {
+            let release = self.claim_menu_held_input(mark, booked);
+            // Typed before any mark still pending, and after every spawn
+            // booked before this command was posted, which it may be for.
+            self.replaying(false, |app| {
+                for (winit_id, event) in release {
+                    app.window_event(el, winit_id, event);
+                }
+            });
+        }
+    }
+
+    /// The input that waited for menu post `mark`, once it is dispatched. Where
+    /// the dispatch booked a spawn (in flight past index `booked`) taking the
+    /// focus of the window the input was typed into, the input waits for that
+    /// spawn as if typed after its booking: a tab's or split's all of it, a new
+    /// window's its keys and modifiers (which also reach the window typed into
+    /// now, as [`Self::defer_tab_spawn_input`] hands them over), while pointer
+    /// input goes on to the window it points at. The rest goes on as typed:
+    /// returned, in order, to be handled now.
+    pub(crate) fn claim_menu_held_input(
+        &mut self,
+        mark: MenuMark,
+        booked: usize,
+    ) -> Vec<(WinitWindowId, WindowEvent)> {
+        let spawns = &mut self.tab_spawns;
+        if !spawns.held.iter().any(|h| h.menu == mark) {
+            return Vec::new();
+        }
+        // Each spawn the dispatch booked: the window it was asked from, the
+        // window it lands in and when input held for it stops waiting.
+        let fresh: Vec<(Option<WindowId>, WindowId, Instant, u64)> = spawns
+            .in_flight
+            .get(booked..)
+            .unwrap_or_default()
+            .iter()
+            .map(|t| {
+                (
+                    t.place.asked_from(t.window),
+                    t.window,
+                    t.asked + INPUT_HOLD,
+                    t.id,
+                )
+            })
+            .collect();
+        let mut release = Vec::new();
+        let mut kept = Vec::with_capacity(spawns.held.len());
+        for mut h in std::mem::take(&mut spawns.held) {
+            if h.menu != mark {
+                kept.push(h);
+                continue;
+            }
+            let typed = self.winit_to_window.get(&h.typed_into).copied();
+            let spawn = fresh
+                .iter()
+                .rev()
+                .find(|(from, ..)| typed.is_some() && *from == typed);
+            let Some(&(_, target, until, id)) = spawn else {
+                release.push((h.typed_into, h.event));
+                continue;
+            };
+            if Some(target) != typed {
+                if is_pointer(&h.event) {
+                    release.push((h.typed_into, h.event));
+                    continue;
+                }
+                if matches!(h.event, WindowEvent::ModifiersChanged(_)) {
+                    release.push((h.typed_into, h.event.clone()));
+                    h.applied = true;
+                }
+            }
+            h.target = target;
+            h.spawn = Some(id);
+            h.until = until;
+            h.menu = MenuMark::NONE;
+            kept.push(h);
+        }
+        spawns.held = kept;
+        release
     }
 
     /// [`Self::install_spawned`] with the inert OS arm: a window lands logical,
@@ -1149,7 +1808,7 @@ impl App {
             .find(|t| t.id == id)
             .map(|t| t.grid);
         let adopted_spare = spare_grid.is_some();
-        let (place, parent, colors, grid, then, admission, theme) = match self
+        let (place, parent, colors, grid, then, admission, theme, background) = match self
             .tab_spawns
             .in_flight
             .iter()
@@ -1165,6 +1824,7 @@ impl App {
                     t.then,
                     t.admission,
                     t.theme,
+                    t.background,
                 )
             }
             None => (
@@ -1175,6 +1835,7 @@ impl App {
                 TabSpawnThen::Nothing,
                 SpawnAdmission::Plain,
                 None,
+                false,
             ),
         };
         let new_window = matches!(place, SpawnPlace::Window { .. });
@@ -1230,6 +1891,11 @@ impl App {
                         let sid = session.ctx.self_id.as_str().to_string();
                         let installed = match place {
                             SpawnPlace::Tab => {
+                                // A background tab lands behind the tab active
+                                // NOW, which is selected again once it is in.
+                                let kept = background
+                                    .then(|| self.windows.get(&window)?.tab_set.active_index())
+                                    .flatten();
                                 self.install_tab_session(window, session, parent);
                                 // The window re-gridded (a resize, a font zoom)
                                 // while the tab was in flight: those passes sized
@@ -1237,6 +1903,9 @@ impl App {
                                 // now, before its reader reads.
                                 if grid.is_some_and(|grid| grid != self.spawn_grid(window)) {
                                     self.resize_panes(window);
+                                }
+                                if let Some(index) = kept {
+                                    self.switch_tab_in(window, index);
                                 }
                                 Ok(())
                             }
@@ -1411,44 +2080,174 @@ impl App {
 
     /// Hold `event`, typed into `wid`, for the spawn in flight that takes `wid`'s
     /// focus, if one does (asked for within [`INPUT_HOLD`]): a tab or split in
-    /// `wid`, or a new window asked from it. Keys, modifiers and IME only, the
-    /// pre-Commit queue's set. `Some(event)` hands it back to be handled now.
+    /// `wid`, or a new window asked from it. Keys, modifiers and IME, the
+    /// pre-Commit queue's set, and the pointer ([`is_pointer`]) for a tab or
+    /// split, which lands under it; a new window leaves the pointer to the
+    /// window it points at, and a modifier change held for it reaches that
+    /// window now as well, so a click there is not read under a chord already
+    /// released. While a menu command posted earlier is not yet dispatched
+    /// ([`MenuMarks`]), the event waits for it instead, under `wid`
+    /// ([`Self::claim_menu_held_input`]). `Some(event)` hands it back to be
+    /// handled now.
     pub(crate) fn defer_tab_spawn_input(
         &mut self,
         wid: WindowId,
         id: WinitWindowId,
         event: WindowEvent,
     ) -> Option<WindowEvent> {
-        if !crate::handoff_deferrable_input(&event) {
+        let pointer = is_pointer(&event);
+        if !pointer && !crate::handoff_deferrable_input(&event) {
             return Some(event);
         }
-        let Some(target) = self.tab_spawns.hold_target(wid, Instant::now()) else {
-            return Some(event);
-        };
+        let now = Instant::now();
         let spawns = &mut self.tab_spawns;
-        if spawns.held.len() < MAX_HELD_INPUT {
-            spawns.held.push((id, target, event));
-        } else {
-            match spawns.dropped.iter_mut().find(|(w, _)| *w == target) {
-                Some((_, n)) => *n = n.saturating_add(1),
-                None => spawns.dropped.push((target, 1)),
-            }
-            if !spawns.incoherent.contains(&target) {
-                spawns.incoherent.push(target);
-            }
+        let after = spawns.floor.map_or(0, |floor| floor.marks);
+        let (target, until, menu, spawn) = match spawns.menu.pending(now, after) {
+            Some((mark, posted)) => (wid, posted + INPUT_HOLD, mark, None),
+            None => match spawns.hold_target(wid, now) {
+                Some((target, until, spawn)) => (target, until, MenuMark::NONE, Some(spawn)),
+                None => return Some(event),
+            },
+        };
+        if pointer && target != wid {
+            return Some(event);
         }
-        None
+        let now_too = (target != wid && matches!(event, WindowEvent::ModifiersChanged(_)))
+            .then(|| event.clone());
+        spawns.hold(Held {
+            typed_into: id,
+            target,
+            spawn,
+            event,
+            until,
+            menu,
+            applied: now_too.is_some(),
+        });
+        now_too
     }
 
-    /// What the input held for `wid` becomes once nothing is in flight to it:
-    /// every event, in order, when the last spawn `landed`, through `wid`'s own
-    /// OS window (a new window's input was typed into the one it was asked
-    /// from); only the modifier changes, where they were typed, when it did not.
-    /// Keys dropped either way are said in one row. Returns the events to replay
-    /// and the window whose modifiers need a repair after them, if any: the one
-    /// the replay goes through, so a new window that never opened repairs the
-    /// window its modifier changes replay back into. Nothing while another
-    /// spawn is still in flight to `wid`.
+    /// Input typed into `typed_into` whose hold ended by `now`
+    /// ([`Held::until`]): settled before the window's next input is handled,
+    /// as for a spawn that never landed ([`sift_held`]), so nothing typed later
+    /// reaches the tab the window shows while earlier keys still wait for one
+    /// that may land. A target left holding nothing settles its refused
+    /// keystrokes and modifier repair with it. Returns the events to replay
+    /// and the window to repair after them, as
+    /// [`Self::settle_tab_spawn_input`] does; nothing (one scan) when nothing
+    /// expired.
+    pub(crate) fn expire_tab_spawn_input(
+        &mut self,
+        typed_into: WinitWindowId,
+        now: Instant,
+    ) -> (Vec<(WinitWindowId, WindowEvent)>, Option<WindowId>) {
+        let spawns = &mut self.tab_spawns;
+        let expired = |h: &Held| h.typed_into == typed_into && h.until <= now;
+        if !spawns.held.iter().any(expired) {
+            return (Vec::new(), None);
+        }
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut spawns.held)
+            .into_iter()
+            .partition(expired);
+        spawns.held = kept;
+        let typed = self.winit_to_window.get(&typed_into).copied();
+        let mut dropped = 0u32;
+        let mut repair = None;
+        let mut targets: Vec<WindowId> = Vec::new();
+        for h in &gone {
+            if !targets.contains(&h.target) {
+                targets.push(h.target);
+            }
+        }
+        for target in targets {
+            if spawns.held.iter().any(|h| h.target == target) {
+                continue;
+            }
+            if let Some(at) = spawns.dropped.iter().position(|(w, _)| *w == target) {
+                dropped = dropped.saturating_add(spawns.dropped.remove(at).1);
+            }
+            if let Some(at) = spawns.incoherent.iter().position(|w| *w == target) {
+                spawns.incoherent.remove(at);
+                repair = typed;
+            }
+        }
+        let (replay, keys) = sift_held(gone, false, None, now);
+        let dropped = dropped.saturating_add(keys);
+        if dropped > 0 {
+            aterm_log::warn!(
+                "{dropped} key(s) typed while a new tab or window was starting were dropped \
+                 (it had not started {} s after it was asked for)",
+                INPUT_HOLD.as_secs()
+            );
+            self.post_message(crate::message_reporters::keystrokes_dropped(dropped));
+        }
+        (replay, repair)
+    }
+
+    /// `held`, bound for a spawn that landed, without the presses made on its
+    /// window's in-grid tab strip and their releases. The landing gave the
+    /// strip a chip, and its tabs share the band equally, so every chip moved:
+    /// replayed, such a press would hit whatever is under it now, a `✕` the
+    /// person never aimed at among them. Dropped, the click is simply not made
+    /// (as on macOS, whose strip is native and never held, it was for what the
+    /// strip showed). Where each press was is where the moves held before it
+    /// left the pointer, else where the window last saw it.
+    fn without_strip_presses(&self, held: Vec<Held>) -> Vec<Held> {
+        if !self.tab_strip_enabled() {
+            return held;
+        }
+        let mut at: Vec<(WinitWindowId, (f64, f64))> = Vec::new();
+        let mut pressed: Vec<(WinitWindowId, aterm_window::event::MouseButton)> = Vec::new();
+        held.into_iter()
+            .filter(|h| match &h.event {
+                WindowEvent::CursorMoved { position, .. } => {
+                    match at.iter_mut().find(|(id, _)| *id == h.typed_into) {
+                        Some((_, xy)) => *xy = (position.x, position.y),
+                        None => at.push((h.typed_into, (position.x, position.y))),
+                    }
+                    true
+                }
+                WindowEvent::MouseInput { state, button, .. } if state.is_pressed() => {
+                    let Some(wid) = self.winit_to_window.get(&h.typed_into).copied() else {
+                        return true;
+                    };
+                    let (x, y) = at
+                        .iter()
+                        .find(|(id, _)| *id == h.typed_into)
+                        .map(|(_, xy)| *xy)
+                        .or_else(|| self.windows.get(&wid).map(|ws| ws.last_cursor_px))
+                        .unwrap_or_default();
+                    let on_strip = self.strip_col_at(wid, x, y).is_some();
+                    if on_strip {
+                        pressed.push((h.typed_into, *button));
+                    }
+                    !on_strip
+                }
+                WindowEvent::MouseInput { button, .. } => {
+                    match pressed.iter().position(|p| *p == (h.typed_into, *button)) {
+                        Some(i) => {
+                            pressed.remove(i);
+                            false
+                        }
+                        None => true,
+                    }
+                }
+                _ => true,
+            })
+            .collect()
+    }
+
+    /// What the input held for `wid` becomes once nothing is in flight to it
+    /// ([`sift_held`]): every event, in order, when the last spawn `landed`
+    /// within its hold, through `wid`'s own OS window (a new window's input
+    /// was typed into the one it was asked from), the pointer where it was
+    /// typed; else only what keeps the window it was typed into coherent (its
+    /// modifier changes, the pointer's position). Keys dropped either way are
+    /// said in one row.
+    /// Returns the events to replay and the window whose modifiers need a
+    /// repair after them, if any: the one the replay goes through, so a new
+    /// window that never opened repairs the window its modifier changes replay
+    /// back into. Nothing while another spawn is still in flight to `wid`, and
+    /// input still waiting for a menu command's dispatch waits on.
     pub(crate) fn settle_tab_spawn_input(
         &mut self,
         wid: WindowId,
@@ -1466,9 +2265,9 @@ impl App {
         }
         let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut spawns.held)
             .into_iter()
-            .partition(|(_, w, _)| *w == wid);
+            .partition(|h| h.target == wid && h.menu == MenuMark::NONE);
         spawns.held = rest;
-        let mut dropped = spawns
+        let dropped = spawns
             .dropped
             .iter()
             .position(|(w, _)| *w == wid)
@@ -1479,31 +2278,35 @@ impl App {
                 // Every event held for `wid` was typed into one window: `wid`
                 // itself, or the window a new one was asked from.
                 match mine.first() {
-                    Some((typed_into, _, _)) if !landed => {
-                        Some(self.winit_to_window.get(typed_into).copied().unwrap_or(wid))
-                    }
+                    Some(h) if !landed => Some(
+                        self.winit_to_window
+                            .get(&h.typed_into)
+                            .copied()
+                            .unwrap_or(wid),
+                    ),
                     _ => Some(wid),
                 }
             }
             None => None,
         };
-        let mut replay = Vec::with_capacity(mine.len());
-        for (winit_id, _, event) in mine {
-            if landed || matches!(event, WindowEvent::ModifiersChanged(_)) {
-                replay.push((through.unwrap_or(winit_id), event));
-            } else if matches!(&event, WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed())
-                || matches!(event, WindowEvent::Ime(winit::event::Ime::Commit(_)))
-            {
-                dropped = dropped.saturating_add(1);
-            }
-        }
+        let mine = if landed {
+            self.without_strip_presses(mine)
+        } else {
+            mine
+        };
+        let now = Instant::now();
+        let late = landed && mine.iter().any(|h| h.until <= now);
+        let (replay, keys) = sift_held(mine, landed, through, now);
+        let dropped = dropped.saturating_add(keys);
         if dropped > 0 {
             aterm_log::warn!(
                 "{dropped} key(s) typed while a new tab or window was starting were dropped ({})",
-                if landed {
-                    "past what the window holds"
-                } else {
+                if !landed {
                     "it never started"
+                } else if late {
+                    "it started past the hold"
+                } else {
+                    "past what the window holds"
                 }
             );
             self.post_message(crate::message_reporters::keystrokes_dropped(dropped));
@@ -1519,6 +2322,7 @@ pub(crate) mod test_support {
 
     /// Book a tab in flight to `wid` the way [`App::open_tab_off_loop`] does,
     /// without a spawner: the test plays the spawner's part.
+    #[cfg(unix)]
     pub(crate) fn book(app: &mut App, wid: WindowId, then: TabSpawnThen) -> u64 {
         let id = app.next_session_id;
         app.next_session_id += 1;
@@ -1536,6 +2340,7 @@ pub(crate) mod test_support {
             grid,
             then,
             admission: SpawnAdmission::Plain,
+            background: false,
             completion: Arc::new(TabSpawnCompletion::default()),
             theme: None,
         });
@@ -1566,6 +2371,7 @@ pub(crate) mod test_support {
             grid,
             then,
             admission,
+            background: false,
             completion: Arc::new(TabSpawnCompletion::default()),
             theme: None,
         });
@@ -1603,8 +2409,8 @@ pub(crate) mod tests {
     use super::test_support::book;
     use super::*;
     use crate::SinkWriter;
+    use aterm_window::event::Ime;
     use std::sync::Arc;
-    use winit::event::Ime;
 
     /// A pipe whose write end backs a stub session's sink, so a test reads what
     /// reached that session's PTY.
@@ -1650,27 +2456,26 @@ pub(crate) mod tests {
         id
     }
 
-    /// Start is reserved for the whole lifetime of a pending operator spawn,
+    /// Summarize is reserved for the whole lifetime of its pending spawn,
     /// including a late settlement; failed/closed jobs release that reservation.
-    #[cfg(target_os = "macos")]
     #[test]
-    fn operator_start_waits_for_pending_spawn_settlement() {
+    fn summarize_waits_for_pending_spawn_settlement() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        assert!(app.operator_start_available());
+        assert!(!app.tab_spawns.summary_pending());
         let (tx, rx) = channel();
         let id = book_admitted(
             &mut app,
             wid,
-            SpawnAdmission::Operator,
+            SpawnAdmission::Summary,
             TabSpawnThen::Reply {
                 reply: tx,
                 raise: false,
             },
         );
         assert!(
-            !app.operator_start_available(),
-            "a second Start must not book another operator"
+            app.tab_spawns.summary_pending(),
+            "a second Summarize must not book another worker"
         );
         assert!(!app.install_spawned_tab(TabSpawned {
             id,
@@ -1680,17 +2485,17 @@ pub(crate) mod tests {
         }));
         assert_eq!(rx.try_recv(), Ok(Err("exec refused".to_string())));
         assert!(
-            app.operator_start_available(),
+            !app.tab_spawns.summary_pending(),
             "failure releases the reservation"
         );
         let gone = WindowId(77);
         let id = book_admitted(
             &mut app,
             gone,
-            SpawnAdmission::Operator,
+            SpawnAdmission::Summary,
             TabSpawnThen::Nothing,
         );
-        assert!(!app.operator_start_available());
+        assert!(app.tab_spawns.summary_pending());
         assert!(!app.install_spawned_tab(TabSpawned {
             id,
             window: gone,
@@ -1698,56 +2503,9 @@ pub(crate) mod tests {
             reader_gate: None
         }));
         assert!(
-            app.operator_start_available(),
+            !app.tab_spawns.summary_pending(),
             "closed host cancels the reservation"
         );
-    }
-
-    /// A different operator can become live while the worker is spawning.
-    /// Refuse before registering or invoking a successful launch callback.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn operator_landing_refuses_a_newly_live_operator() {
-        for occupied in [true, false] {
-            let mut app = App::headless_for_test();
-            let wid = WindowId(0);
-            let (tx, rx) = channel();
-            let id = book_admitted(
-                &mut app,
-                wid,
-                SpawnAdmission::Operator,
-                TabSpawnThen::Run(Box::new(move |_, result| {
-                    tx.send(result).unwrap();
-                })),
-            );
-            if occupied {
-                app.operator_local_id = Some(0);
-            }
-            let session = crate::stub_session(id);
-            let sid = session.ctx.self_id.clone();
-            assert_eq!(
-                app.install_spawned_tab(TabSpawned {
-                    id,
-                    window: wid,
-                    session: Ok(session),
-                    reader_gate: None
-                }),
-                !occupied
-            );
-            let answer = rx.try_recv().unwrap();
-            if occupied {
-                assert!(answer.is_err());
-                assert!(app.pool.get(id).is_none());
-                assert!(app.store.read().unwrap().by_sid(&sid).is_none());
-            } else {
-                assert_eq!(answer, Ok(sid.as_str().to_string()));
-                assert!(app.pool.get(id).is_some());
-                assert!(
-                    app.operator_start_available(),
-                    "settlement released the pending marker"
-                );
-            }
-        }
     }
 
     /// [`book`] for a split of `wid`'s focused pane in `dir`.
@@ -2084,7 +2842,7 @@ pub(crate) mod tests {
                 raise: false,
             },
         );
-        let mods = WindowEvent::ModifiersChanged(winit::event::Modifiers::default());
+        let mods = WindowEvent::ModifiersChanged(aterm_window::event::Modifiers::default());
         assert!(
             app.defer_tab_spawn_input(wid, winit_id, typed("rm"))
                 .is_none()
@@ -2203,6 +2961,7 @@ pub(crate) mod tests {
                 raise: false,
             },
             admission: SpawnAdmission::Plain,
+            background: false,
             completion: Arc::new(TabSpawnCompletion::default()),
             theme: None,
         });
@@ -2672,8 +3431,8 @@ pub(crate) mod tests {
         assert_eq!(app.windows[&wid].tab_set.len(), tabs + 1, "no tab added");
     }
 
-    /// A row that acts on the newborn at once (the operator's Start) runs as the
-    /// tab lands, with a sid the registry already resolves; a spawn that fails
+    /// A row that acts on the newborn at once (a worker's spawn, the menu bar's worker launch)
+    /// runs as the tab lands, with a sid the registry already resolves; a spawn that fails
     /// hands it the reason instead.
     #[test]
     fn a_row_acting_on_the_newborn_runs_with_its_registered_sid() {
@@ -2718,32 +3477,132 @@ pub(crate) mod tests {
         );
     }
 
-    /// The spawner makes the identity a new-identity row names before the shell
-    /// that wears it, so the picker's create costs the window nothing; a row
-    /// for an existing identity makes nothing, and the spawn checks it. A name
-    /// the grammar refuses fails the spawn, saying which identity. Under a
-    /// scratch state root (`ATERM_STATE_HOME`, under the env module's lock).
+    /// A booked spawn holds the event loop's status sweep for [`SWEEP_HOLD`]
+    /// from its booking, the newest booking's hold winning, so its fork does not
+    /// wait out a sweep of every tab; a landing ends the hold. NEGATIVE CONTROL:
+    /// nothing in flight holds nothing.
     #[test]
-    fn the_spawner_makes_a_new_identity_before_its_shell() {
+    fn a_booked_spawn_holds_the_status_sweep_until_it_lands_or_the_hold_ends() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let now = Instant::now();
+        assert_eq!(app.tab_spawns.status_sweep_held_until(now), None);
+        let id = book(&mut app, wid, TabSpawnThen::Nothing);
+        let asked = app.tab_spawns.in_flight[0].asked;
+        assert_eq!(
+            app.tab_spawns.status_sweep_held_until(asked),
+            Some(asked + SWEEP_HOLD)
+        );
+        assert_eq!(
+            app.tab_spawns.status_sweep_held_until(asked + SWEEP_HOLD),
+            None,
+            "the hold ends"
+        );
+        app.tab_spawns.in_flight[0].asked = asked - SWEEP_HOLD;
+        let newer = book(&mut app, wid, TabSpawnThen::Nothing);
+        let newest = app.tab_spawns.in_flight[1].asked;
+        assert_eq!(
+            app.tab_spawns.status_sweep_held_until(newest),
+            Some(newest + SWEEP_HOLD),
+            "the newest booking's hold"
+        );
+        for landed in [id, newer] {
+            let (session, _pty) = piped_session(landed);
+            assert!(app.install_spawned_tab(TabSpawned {
+                id: landed,
+                window: wid,
+                session: Ok(session),
+                reader_gate: None
+            }));
+        }
+        assert_eq!(
+            app.tab_spawns.status_sweep_held_until(newest),
+            None,
+            "landed, nothing holds it"
+        );
+    }
+
+    /// While the sweep is held, the status observer's wake waits for the hold's
+    /// end: one the skipped sweep left already past would otherwise be armed in
+    /// the past on every turn of the hold, a spin that keeps the loop from the
+    /// park its spawn's fork waits for. A later wake and no wake are its own,
+    /// and an unheld wake is untouched. NEGATIVE CONTROL: unheld, a past wake
+    /// stays past.
+    #[test]
+    fn a_held_sweep_arms_no_status_wake_before_the_hold_ends() {
+        let mut app = App::headless_for_test();
+        book(&mut app, WindowId(0), TabSpawnThen::Nothing);
+        let asked = app.tab_spawns.in_flight[0].asked;
+        let now = asked + Duration::from_millis(1);
+        let held = app.tab_spawns.status_sweep_held_until(now);
+        assert_eq!(held, Some(asked + SWEEP_HOLD));
+        let past = asked;
+        let later = asked + SWEEP_HOLD + Duration::from_millis(5);
+        assert_eq!(
+            held_status_wake(Some(past), held),
+            held,
+            "past: the hold's end"
+        );
+        assert_eq!(held_status_wake(Some(later), held), Some(later));
+        assert_eq!(held_status_wake(None, held), None);
+        assert_eq!(held_status_wake(Some(past), None), Some(past));
+    }
+
+    /// The spawner makes the identity a request names (`spawn identity=<name>`,
+    /// `Admit` with nothing inherited) or a new-identity row names (`Create`)
+    /// before the shell that wears it, so nothing is made for a spawn the main
+    /// thread refused before booking it, and the primer is handed off rather
+    /// than waited for. An inherited one and a roster row's make nothing. A
+    /// request's refusal is its own words ([`Refusal`]); the row's is a failure.
+    /// NEGATIVE CONTROL: the inherited admission of a missing name is refused.
+    #[test]
+    fn the_spawner_makes_a_named_identity_before_its_shell() {
+        use crate::agent_identity::{SpawnAdmit, check_for_spawn_in};
         let state = aterm_tempfile::tempdir().expect("scratch state root");
-        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
-            let root = state.path().join("identities");
-            assert!(provision(Some("gamma"), IdentityPrep::Create).is_ok());
-            assert!(
-                root.join("gamma").is_dir(),
-                "made under the identities root"
-            );
-            assert_eq!(crate::agent_identity::roster(), ["gamma"]);
-            assert!(provision(Some("delta"), IdentityPrep::Exists).is_ok());
-            assert!(!root.join("delta").exists(), "only a create row makes one");
-            assert!(provision(None, IdentityPrep::Create).is_ok());
-            let refused = provision(Some("Bad Name"), IdentityPrep::Create)
-                .expect_err("the grammar refuses it");
-            assert!(
-                refused.to_string().starts_with("identity Bad Name: "),
-                "{refused}"
-            );
-        });
+        let root = state.path().join("identities");
+        let primed = std::cell::RefCell::new(Vec::new());
+        let admit = |name: &str, how: SpawnAdmit| {
+            check_for_spawn_in(&root, name, how, |dir, _| {
+                primed.borrow_mut().push(dir.to_path_buf());
+            })
+        };
+        let inherited = provision_with(
+            Some("worker"),
+            IdentityPrep::Admit { inherited: true },
+            admit,
+        )
+        .expect_err("an inherited identity nobody made is refused");
+        assert_eq!(
+            refusal(&inherited).as_deref(),
+            Some("identity worker: no such identity worker")
+        );
+        assert!(!root.exists(), "and none is made");
+        assert!(
+            provision_with(
+                Some("worker"),
+                IdentityPrep::Admit { inherited: false },
+                admit
+            )
+            .is_ok()
+        );
+        assert!(root.join("worker/.claude").is_dir(), "a request's is made");
+        assert!(provision_with(Some("gamma"), IdentityPrep::Create, admit).is_ok());
+        assert!(root.join("gamma").is_dir(), "a new-identity row's is made");
+        assert_eq!(
+            *primed.borrow(),
+            [root.join("worker"), root.join("gamma")],
+            "each primer handed off, none written in the admission"
+        );
+        assert!(provision_with(Some("delta"), IdentityPrep::Exists, admit).is_ok());
+        assert!(!root.join("delta").exists(), "a roster row makes none");
+        assert!(provision_with(None, IdentityPrep::Create, admit).is_ok());
+        let refused = provision_with(Some("Bad Name"), IdentityPrep::Create, admit)
+            .expect_err("the grammar refuses it");
+        assert!(
+            refused.to_string().starts_with("identity Bad Name: "),
+            "{refused}"
+        );
+        assert!(refusal(&refused).is_none(), "a row's failure is no refusal");
     }
 
     /// [`piped_session`] with its pipe standing in for the PTY master, so the
@@ -2900,8 +3759,8 @@ pub(crate) mod tests {
             .tab_spawns
             .held
             .iter()
-            .map(|(_, w, e)| match e {
-                WindowEvent::Ime(Ime::Commit(t)) => (*w, t.clone()),
+            .map(|h| match &h.event {
+                WindowEvent::Ime(Ime::Commit(t)) => (h.target, t.clone()),
                 other => panic!("only commits were typed: {other:?}"),
             })
             .collect();
@@ -2929,9 +3788,9 @@ pub(crate) mod tests {
     /// A new window whose spawn fails is never made: the failure is said in the
     /// same row the window built in the turn posted, the waiter hears it, and
     /// what was typed for the window is dropped and counted. Its modifier changes
-    /// replay where they were typed, so no chord strands, and when that window
-    /// lost focus meanwhile its modifiers are repaired after them, not the
-    /// window that never opened.
+    /// reached the window they were typed into as they were typed, so no chord
+    /// strands there and none replays twice, and when that window lost focus
+    /// meanwhile its modifiers are repaired, not the window that never opened.
     #[test]
     fn a_window_whose_spawn_failed_is_never_made() {
         let mut app = App::headless_for_test();
@@ -2951,12 +3810,16 @@ pub(crate) mod tests {
                 raise: false,
             },
         );
-        let mods = WindowEvent::ModifiersChanged(winit::event::Modifiers::default());
+        let mods = WindowEvent::ModifiersChanged(aterm_window::event::Modifiers::default());
         assert!(
             app.defer_tab_spawn_input(from, from_winit, typed("rm"))
                 .is_none()
         );
-        assert!(app.defer_tab_spawn_input(from, from_winit, mods).is_none());
+        assert_eq!(
+            app.defer_tab_spawn_input(from, from_winit, mods.clone()),
+            Some(mods),
+            "held for the new window, and handed to the one typed into now"
+        );
         app.tab_spawns.note_focus_loss(from);
 
         assert!(!app.install_spawned_tab(TabSpawned {
@@ -2972,15 +3835,14 @@ pub(crate) mod tests {
         assert!(said_no_window(&app, "the pty could not be opened"));
 
         let (events, repair) = app.settle_tab_spawn_input(wid, false);
-        assert_eq!(events.len(), 1);
         assert!(
-            matches!(events[0], (through, WindowEvent::ModifiersChanged(_)) if through == from_winit),
-            "only the modifier change replays, where it was typed: {events:?}"
+            events.is_empty(),
+            "the modifier change already reached where it was typed: {events:?}"
         );
         assert_eq!(
             repair,
             Some(from),
-            "the repair follows the modifier changes back to where they were typed"
+            "the repair goes back to where the modifier changes were typed"
         );
         replay(&mut app, from, events);
         assert!(
@@ -3126,16 +3988,586 @@ pub(crate) mod tests {
             }
             app.on_key(
                 wid,
-                winit::event::KeyEvent::synthetic_for_test(
-                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyN),
-                    winit::keyboard::Key::Character("n".into()),
+                aterm_window::event::KeyEvent::synthetic_for_test(
+                    aterm_window::keyboard::PhysicalKey::Code(
+                        aterm_window::keyboard::KeyCode::KeyN,
+                    ),
+                    aterm_window::keyboard::Key::Character("n".into()),
                     Some("n".into()),
-                    winit::keyboard::KeyLocation::Standard,
-                    winit::event::ElementState::Pressed,
+                    aterm_window::keyboard::KeyLocation::Standard,
+                    aterm_window::event::ElementState::Pressed,
                     false,
                 ),
             );
             assert_eq!(app.next_window_id, next + 2, "Cmd-N minted its window");
         }
+    }
+
+    fn moved(x: f64) -> WindowEvent {
+        WindowEvent::CursorMoved {
+            device_id: aterm_window::event::DeviceId::dummy(),
+            position: aterm_window::dpi::PhysicalPosition::new(x, 1.0),
+        }
+    }
+
+    fn click(state: aterm_window::event::ElementState) -> WindowEvent {
+        WindowEvent::MouseInput {
+            device_id: aterm_window::event::DeviceId::dummy(),
+            state,
+            button: aterm_window::event::MouseButton::Left,
+        }
+    }
+
+    fn wheel(lines: f32) -> WindowEvent {
+        WindowEvent::MouseWheel {
+            device_id: aterm_window::event::DeviceId::dummy(),
+            delta: aterm_window::event::MouseScrollDelta::LineDelta(0.0, lines),
+            phase: aterm_window::event::TouchPhase::Moved,
+        }
+    }
+
+    fn mods() -> WindowEvent {
+        WindowEvent::ModifiersChanged(aterm_window::event::Modifiers::default())
+    }
+
+    /// What `events` are, in order, as short names: a commit's text, `mods`,
+    /// `move <x>`, `press`, `release`, `wheel <lines>`.
+    fn named(events: &[(WinitWindowId, WindowEvent)]) -> Vec<String> {
+        events
+            .iter()
+            .map(|(_, event)| match event {
+                WindowEvent::Ime(Ime::Commit(t)) => t.clone(),
+                WindowEvent::ModifiersChanged(_) => "mods".to_string(),
+                WindowEvent::CursorMoved { position, .. } => format!("move {}", position.x),
+                WindowEvent::MouseInput { state, .. } if state.is_pressed() => "press".into(),
+                WindowEvent::MouseInput { .. } => "release".to_string(),
+                WindowEvent::MouseWheel {
+                    delta: aterm_window::event::MouseScrollDelta::LineDelta(_, y),
+                    ..
+                } => format!("wheel {y}"),
+                other => panic!("not a test event: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// THE POINTER WAITS WITH THE KEYS FOR A TAB LANDING UNDER IT (sweep #31):
+    /// a click after Cmd-T is held and replays after the tab lands, in order
+    /// with the keys around it, through the window it was typed into. The
+    /// pointer's motion and a scroll in progress fold into one event each, so
+    /// moving the mouse cannot fill the hold. Another window's pointer, and a
+    /// pointer over the window a new window was asked from, are handled now; a
+    /// modifier change held for a new window reaches the window typed into now
+    /// as well. NEGATIVE CONTROL: with nothing in flight the pointer is
+    /// handled now.
+    #[test]
+    fn the_pointer_waits_with_the_keys_for_a_tab_landing_under_it() {
+        use aterm_window::event::ElementState::{Pressed, Released};
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let winit_id = WinitWindowId::from(0u64);
+        app.winit_to_window.insert(winit_id, wid);
+        assert!(
+            app.defer_tab_spawn_input(wid, winit_id, click(Pressed))
+                .is_some(),
+            "nothing in flight"
+        );
+        let id = book(&mut app, wid, TabSpawnThen::Nothing);
+        for event in [
+            typed("a"),
+            moved(1.0),
+            moved(2.0),
+            moved(3.0),
+            click(Pressed),
+            click(Released),
+            wheel(1.0),
+            wheel(2.0),
+            typed("b"),
+        ] {
+            assert!(app.defer_tab_spawn_input(wid, winit_id, event).is_none());
+        }
+        assert!(
+            app.defer_tab_spawn_input(WindowId(9), winit_id, click(Pressed))
+                .is_some(),
+            "another window's pointer is its own"
+        );
+        app.tab_spawns.in_flight.retain(|t| t.id != id);
+        let (events, repair) = app.settle_tab_spawn_input(wid, true);
+        assert_eq!(repair, None);
+        assert_eq!(
+            named(&events),
+            ["a", "move 3", "press", "release", "wheel 3", "b"]
+        );
+        assert!(events.iter().all(|(via, _)| *via == winit_id));
+
+        // A new window asked from `wid`: the pointer over `wid` is `wid`'s, and
+        // a modifier change is held for the new window and handed back too.
+        let (_, window) =
+            test_support::book_window(&mut app, None, SpawnAdmission::Plain, TabSpawnThen::Nothing);
+        assert!(
+            app.defer_tab_spawn_input(wid, winit_id, click(Pressed))
+                .is_some()
+        );
+        assert_eq!(
+            app.defer_tab_spawn_input(wid, winit_id, mods()),
+            Some(mods())
+        );
+        assert!(
+            app.tab_spawns
+                .held
+                .iter()
+                .all(|h| h.target == window && h.applied)
+        );
+    }
+
+    /// A CLICK HELD ON THE IN-GRID TAB STRIP IS NOT REPLAYED ONTO THE STRIP
+    /// THE LANDING RE-LAID: the new tab's chip moved every chip, so the press
+    /// (and its release) is dropped, while a click in the grid replays after
+    /// the tab as typed, and so does a press whose pointer moved off the strip
+    /// before it. NEGATIVE CONTROL: with no strip, the same press replays.
+    #[test]
+    fn a_click_held_on_the_tab_strip_is_dropped_not_replayed_onto_a_moved_chip() {
+        use aterm_window::event::ElementState::{Pressed, Released};
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let winit_id = WinitWindowId::from(0u64);
+        app.winit_to_window.insert(winit_id, wid);
+        let (cw, ch) = app.win_cell_size(wid);
+        let (cw, ch, pad) = (cw as f64, ch as f64, app.win_pad(wid) as f64);
+        let on_strip = (pad + cw * 2.5, pad + ch * 0.5);
+        let in_grid = (pad + cw * 10.5, pad + ch * 6.5);
+        let at = |(x, y): (f64, f64)| WindowEvent::CursorMoved {
+            device_id: aterm_window::event::DeviceId::dummy(),
+            position: aterm_window::dpi::PhysicalPosition::new(x, y),
+        };
+        let clicks = |app: &mut App, strip: bool| {
+            app.tab_strip_rows = u16::from(strip);
+            if let Some(ws) = app.windows.get_mut(&wid) {
+                ws.last_cursor_px = on_strip;
+            }
+            let id = book(app, wid, TabSpawnThen::Nothing);
+            for event in [
+                click(Pressed),
+                click(Released),
+                at(in_grid),
+                click(Pressed),
+                click(Released),
+                at(on_strip),
+                at(in_grid),
+                click(Pressed),
+                click(Released),
+            ] {
+                assert!(app.defer_tab_spawn_input(wid, winit_id, event).is_none());
+            }
+            app.tab_spawns.in_flight.retain(|t| t.id != id);
+            app.settle_tab_spawn_input(wid, true).0
+        };
+        let strip = clicks(&mut app, true);
+        assert!(app.strip_col_at(wid, on_strip.0, on_strip.1).is_some());
+        assert!(app.strip_col_at(wid, in_grid.0, in_grid.1).is_none());
+        let grid_x = format!("move {}", in_grid.0);
+        assert_eq!(
+            named(&strip),
+            [
+                grid_x.as_str(),
+                "press",
+                "release",
+                grid_x.as_str(),
+                "press",
+                "release"
+            ]
+        );
+        assert_eq!(
+            named(&clicks(&mut app, false)),
+            [
+                "press",
+                "release",
+                grid_x.as_str(),
+                "press",
+                "release",
+                grid_x.as_str(),
+                "press",
+                "release"
+            ],
+            "no strip: all of it (the two moves in a row fold into one)"
+        );
+    }
+
+    /// WHAT IS HELD PAST THE HOLD IS DROPPED, NEVER REPLAYED LATE (sweep
+    /// #31): the window's next input past it settles what it held first, as
+    /// for a spawn that never landed (the key dropped and said, the modifier
+    /// change and the pointer's position kept, the click dropped with its
+    /// release), so the later key goes to the tab the window shows and the
+    /// earlier one is not typed into the tab that lands after. A spawn that
+    /// lands past the hold drops what waited for it the same way. NEGATIVE
+    /// CONTROL: input settled inside the hold replays.
+    #[test]
+    fn input_held_past_the_hold_is_dropped_never_replayed_late() {
+        use aterm_window::event::ElementState::{Pressed, Released};
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let winit_id = WinitWindowId::from(0u64);
+        app.winit_to_window.insert(winit_id, wid);
+        let (new, new_pty) = piped_session(app.next_session_id);
+        let id = book(&mut app, wid, TabSpawnThen::Nothing);
+        for event in [
+            typed("a"),
+            mods(),
+            moved(4.0),
+            click(Pressed),
+            click(Released),
+        ] {
+            assert!(app.defer_tab_spawn_input(wid, winit_id, event).is_none());
+        }
+        let inside = app.expire_tab_spawn_input(winit_id, Instant::now());
+        assert!(inside.0.is_empty(), "inside the hold nothing settles");
+        assert_eq!(app.tab_spawns.held.len(), 5);
+
+        let past = Instant::now() + INPUT_HOLD;
+        let (events, repair) = app.expire_tab_spawn_input(winit_id, past);
+        assert_eq!(named(&events), ["mods", "move 4"]);
+        assert_eq!(repair, None);
+        assert!(app.tab_spawns.held.is_empty());
+        assert!(said_dropped(&app, "retype the last key"));
+
+        // The spawn lands after: nothing typed before the hold ended reaches it.
+        assert!(app.install_spawned_tab(TabSpawned {
+            id,
+            window: wid,
+            session: Ok(new),
+            reader_gate: None,
+        }));
+        let (events, _) = app.settle_tab_spawn_input(wid, true);
+        assert!(events.is_empty(), "{events:?}");
+        assert!(
+            drain(&new_pty).is_empty(),
+            "never replayed into the late tab"
+        );
+
+        // A spawn landing past the hold drops what waited for it.
+        let late = book(&mut app, wid, TabSpawnThen::Nothing);
+        assert!(
+            app.defer_tab_spawn_input(wid, winit_id, typed("c"))
+                .is_none()
+        );
+        let ended = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("a monotonic clock past its first millisecond");
+        app.tab_spawns.held.iter_mut().for_each(|h| h.until = ended);
+        app.tab_spawns.in_flight.retain(|t| t.id != late);
+        let (events, _) = app.settle_tab_spawn_input(wid, true);
+        assert!(
+            events.is_empty(),
+            "a late landing replays nothing: {events:?}"
+        );
+    }
+
+    /// A REFUSED EVENT PAST THE CAP IS COUNTED ONLY WHEN IT IS A KEYSTROKE: a
+    /// click refused past [`MAX_HELD_INPUT`] is no key to retype, but it still
+    /// breaks the stream, so the window's modifiers are repaired.
+    #[test]
+    fn only_a_keystroke_refused_past_the_cap_is_counted() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let winit_id = WinitWindowId::from(0u64);
+        let id = book(&mut app, wid, TabSpawnThen::Nothing);
+        for n in 0..MAX_HELD_INPUT {
+            assert!(
+                app.defer_tab_spawn_input(wid, winit_id, typed(&format!("{n}")))
+                    .is_none()
+            );
+        }
+        let pressed = click(aterm_window::event::ElementState::Pressed);
+        assert!(app.defer_tab_spawn_input(wid, winit_id, pressed).is_none());
+        app.tab_spawns.in_flight.retain(|t| t.id != id);
+        let (events, repair) = app.settle_tab_spawn_input(wid, true);
+        assert_eq!(events.len(), MAX_HELD_INPUT);
+        assert_eq!(repair, Some(wid));
+        assert!(
+            !app.messages
+                .live_rows()
+                .any(|l| l.msg.title == "Keystrokes dropped"),
+            "a click is no keystroke"
+        );
+    }
+
+    /// INPUT TYPED BEFORE A MENU COMMAND IS DISPATCHED WAITS FOR IT (sweep
+    /// #32): Cmd-T through the native menu's key equivalent posts a marked
+    /// wake, and `ls` typed before the loop dispatches it is held under the
+    /// window, then for the tab the dispatch booked, and replays into it once
+    /// it lands. A command that books nothing hands what waited back in order;
+    /// one that books a new window takes the keys and modifiers for it, and
+    /// leaves the pointer to the window it points at. Two commands posted
+    /// before either is dispatched each take what was typed after their own
+    /// post. A mark older than the hold holds nothing, and input a dispatch
+    /// hands back waits for no later mark. NEGATIVE CONTROL: with no mark,
+    /// what is typed with nothing in flight is handled now.
+    #[test]
+    fn input_typed_before_a_menu_command_is_dispatched_waits_for_it() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let winit_id = WinitWindowId::from(0u64);
+        app.winit_to_window.insert(winit_id, wid);
+        let marks = Arc::clone(&app.tab_spawns.menu);
+        assert!(
+            app.defer_tab_spawn_input(wid, winit_id, typed("x"))
+                .is_some(),
+            "no mark, nothing in flight"
+        );
+
+        // Cmd-T: the dispatch books a tab, which takes what waited.
+        let mark = marks.mint(Instant::now());
+        for text in ["l", "s"] {
+            assert!(
+                app.defer_tab_spawn_input(wid, winit_id, typed(text))
+                    .is_none()
+            );
+        }
+        let (new, new_pty) = piped_session(app.next_session_id);
+        let booked = app.tab_spawns.in_flight.len();
+        let id = book(&mut app, wid, TabSpawnThen::Nothing);
+        assert!(marks.settle(mark));
+        assert!(app.claim_menu_held_input(mark, booked).is_empty());
+        assert!(app.tab_spawns.held.iter().all(|h| h.menu == MenuMark::NONE));
+        assert!(app.install_spawned_tab(TabSpawned {
+            id,
+            window: wid,
+            session: Ok(new),
+            reader_gate: None,
+        }));
+        let (events, _) = app.settle_tab_spawn_input(wid, true);
+        replay(&mut app, wid, events);
+        assert_eq!(drain(&new_pty), b"ls", "into the tab the menu opened");
+
+        // A command that books nothing hands what waited back, in order.
+        let mark = marks.mint(Instant::now());
+        for text in ["q", "r"] {
+            assert!(
+                app.defer_tab_spawn_input(wid, winit_id, typed(text))
+                    .is_none()
+            );
+        }
+        let booked = app.tab_spawns.in_flight.len();
+        assert!(marks.settle(mark));
+        let back = app.claim_menu_held_input(mark, booked);
+        assert_eq!(named(&back), ["q", "r"]);
+        assert!(app.tab_spawns.held.is_empty());
+
+        // Two posts before either dispatch: each takes what followed it, and
+        // a new window leaves the pointer and a copy of the modifiers behind.
+        let first = marks.mint(Instant::now());
+        assert!(
+            app.defer_tab_spawn_input(wid, winit_id, typed("a"))
+                .is_none()
+        );
+        let second = marks.mint(Instant::now());
+        for event in [typed("b"), mods(), moved(5.0)] {
+            assert!(app.defer_tab_spawn_input(wid, winit_id, event).is_none());
+        }
+        let booked = app.tab_spawns.in_flight.len();
+        let (_, one) =
+            test_support::book_window(&mut app, None, SpawnAdmission::Plain, TabSpawnThen::Nothing);
+        assert!(marks.settle(first));
+        assert!(app.claim_menu_held_input(first, booked).is_empty());
+        let booked = app.tab_spawns.in_flight.len();
+        let (_, two) =
+            test_support::book_window(&mut app, None, SpawnAdmission::Plain, TabSpawnThen::Nothing);
+        assert!(marks.settle(second));
+        let back = app.claim_menu_held_input(second, booked);
+        assert_eq!(named(&back), ["mods", "move 5"]);
+        let held: Vec<(WindowId, String)> = app
+            .tab_spawns
+            .held
+            .iter()
+            .map(|h| {
+                (
+                    h.target,
+                    named(&[(h.typed_into, h.event.clone())]).remove(0),
+                )
+            })
+            .collect();
+        assert_eq!(
+            held,
+            [
+                (one, "a".to_string()),
+                (two, "b".to_string()),
+                (two, "mods".to_string())
+            ]
+        );
+        app.tab_spawns.held.clear();
+        app.tab_spawns.in_flight.clear();
+
+        // A mark past the hold holds nothing; handed-back input waits for none.
+        let stale = Instant::now()
+            .checked_sub(INPUT_HOLD + Duration::from_secs(1))
+            .expect("a monotonic clock past the hold");
+        let _ = marks.mint(stale);
+        assert!(
+            app.defer_tab_spawn_input(wid, winit_id, typed("y"))
+                .is_some()
+        );
+        let _ = marks.mint(Instant::now());
+        let handed_back = app.replaying(false, |app| {
+            app.defer_tab_spawn_input(wid, winit_id, typed("z"))
+        });
+        assert!(handed_back.is_some(), "typed before the pending mark");
+    }
+
+    /// What [`App::replay_settled_input`] does with `events` past the event
+    /// loop: each goes through the hold again under the replay's floor, and
+    /// a commit not held again reaches the window's active tab.
+    fn redeliver(app: &mut App, wid: WindowId, events: Vec<(WinitWindowId, WindowEvent)>) {
+        app.replaying(true, |app| {
+            for (via, event) in events {
+                if let Some(WindowEvent::Ime(Ime::Commit(text))) =
+                    app.defer_tab_spawn_input(wid, via, event)
+                {
+                    app.on_ime_commit(wid, text);
+                }
+            }
+        });
+    }
+
+    /// INPUT GOES TO THE SPAWN THAT WAS NEWEST WHEN IT WAS TYPED, whatever
+    /// is booked after it: Cmd-T, `ls`, Cmd-T (the second through the native
+    /// menu, whose wake no hold delays) runs `ls` in the first new tab and
+    /// what follows in the second, each as its tab lands; and Cmd-T, `ls`,
+    /// Cmd-N runs `ls` in the new tab, not in the new window booked after it
+    /// was typed, while what is typed after Cmd-N still waits for the window.
+    /// NEGATIVE CONTROL: replayed input still waits for a spawn it books
+    /// itself (the replay's own Cmd-T).
+    #[test]
+    fn replayed_input_goes_to_the_spawn_that_was_newest_when_it_was_typed() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let winit_id = WinitWindowId::from(0u64);
+        app.winit_to_window.insert(winit_id, wid);
+        let (old, old_pty) = piped_session(app.next_session_id);
+        app.push_stub_tab(wid, old);
+
+        // Cmd-T, `ls`, Cmd-T, `pwd`: two tabs in flight to one window.
+        let (first, first_pty) = piped_session(app.next_session_id);
+        let a = book(&mut app, wid, TabSpawnThen::Nothing);
+        for text in ["l", "s"] {
+            assert!(
+                app.defer_tab_spawn_input(wid, winit_id, typed(text))
+                    .is_none()
+            );
+        }
+        let (second, second_pty) = piped_session(app.next_session_id);
+        let b = book(&mut app, wid, TabSpawnThen::Nothing);
+        assert!(
+            app.defer_tab_spawn_input(wid, winit_id, typed("pwd"))
+                .is_none()
+        );
+        assert!(app.install_spawned_tab(TabSpawned {
+            id: a,
+            window: wid,
+            session: Ok(first),
+            reader_gate: None,
+        }));
+        let (events, _) = app.settle_landed_spawn_input(wid, Some(a), true);
+        redeliver(&mut app, wid, events);
+        assert_eq!(drain(&first_pty), b"ls", "the first tab's own keys, now");
+        assert!(app.install_spawned_tab(TabSpawned {
+            id: b,
+            window: wid,
+            session: Ok(second),
+            reader_gate: None,
+        }));
+        let (events, _) = app.settle_landed_spawn_input(wid, Some(b), true);
+        redeliver(&mut app, wid, events);
+        assert_eq!(drain(&second_pty), b"pwd");
+        assert!(drain(&old_pty).is_empty(), "the tab left gets none");
+
+        // Cmd-T, `ls`, Cmd-N, `top`: the new window was booked after `ls`.
+        let (third, third_pty) = piped_session(app.next_session_id);
+        let c = book(&mut app, wid, TabSpawnThen::Nothing);
+        assert!(
+            app.defer_tab_spawn_input(wid, winit_id, typed("ls"))
+                .is_none()
+        );
+        let (_, window) =
+            test_support::book_window(&mut app, None, SpawnAdmission::Plain, TabSpawnThen::Nothing);
+        assert!(
+            app.defer_tab_spawn_input(wid, winit_id, typed("top"))
+                .is_none()
+        );
+        assert!(app.install_spawned_tab(TabSpawned {
+            id: c,
+            window: wid,
+            session: Ok(third),
+            reader_gate: None,
+        }));
+        let (events, _) = app.settle_landed_spawn_input(wid, Some(c), true);
+        redeliver(&mut app, wid, events);
+        assert_eq!(drain(&third_pty), b"ls", "never the window booked after it");
+        let waiting: Vec<_> = app.tab_spawns.held.iter().map(|h| h.target).collect();
+        assert_eq!(waiting, [window], "`top` still waits for the window");
+        app.tab_spawns.held.clear();
+        app.tab_spawns.in_flight.clear();
+
+        // A spawn the replay books takes what is replayed after it.
+        let d = app.replaying(true, |app| {
+            let d = book(app, wid, TabSpawnThen::Nothing);
+            assert!(
+                app.defer_tab_spawn_input(wid, winit_id, typed("x"))
+                    .is_none()
+            );
+            d
+        });
+        assert_eq!(
+            app.tab_spawns
+                .held
+                .iter()
+                .map(|h| h.spawn)
+                .collect::<Vec<_>>(),
+            [Some(d)]
+        );
+
+        // Captured equal clock readings cannot decide which booking came
+        // after replay began. Only the booking identity changes here.
+        app.tab_spawns.held.clear();
+        app.tab_spawns.in_flight.clear();
+        let same_tick = Instant::now();
+        let spare = app.next_session_id;
+        app.next_session_id += 1; // an older spare's already-reserved id
+        let before = book(&mut app, wid, TabSpawnThen::Nothing);
+        app.tab_spawns.in_flight.last_mut().unwrap().asked = same_tick;
+        app.replaying(true, |app| {
+            assert_eq!(
+                app.tab_spawns.hold_target(wid, same_tick),
+                None,
+                "older booking"
+            );
+            let fresh = book(app, wid, TabSpawnThen::Nothing);
+            app.tab_spawns.in_flight.last_mut().unwrap().asked = same_tick;
+            assert_eq!(
+                app.tab_spawns.hold_target(wid, same_tick),
+                Some((wid, same_tick + INPUT_HOLD, fresh)),
+                "first booking made by this replay, despite the equal clock"
+            );
+            // The next ask adopts that older spare. Its fallback names the
+            // fresh booking; the old spare id remains the held-input owner.
+            let fallback = book(app, wid, TabSpawnThen::Nothing);
+            let adopted = app.tab_spawns.in_flight.last_mut().unwrap();
+            adopted.asked = same_tick;
+            adopted.id = spare;
+            adopted.alt_id = Some(fallback);
+            assert_eq!(
+                app.tab_spawns.hold_target(wid, same_tick),
+                Some((wid, same_tick + INPUT_HOLD, spare)),
+                "an adopted spare uses the new reservation for admission"
+            );
+        });
+        // The menu's handed-back input deliberately keeps access to a
+        // booking that preceded the menu post; that separate policy stays.
+        app.tab_spawns.in_flight.retain(|t| t.id == before);
+        app.replaying(false, |app| {
+            assert_eq!(
+                app.tab_spawns.hold_target(wid, same_tick),
+                Some((wid, same_tick + INPUT_HOLD, before))
+            );
+        });
+        app.tab_spawns.in_flight.clear();
     }
 }

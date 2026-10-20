@@ -31,6 +31,11 @@ pub(super) struct Live {
     /// The accepting thread; it answers the first failure it met, if any.
     accepter: Option<JoinHandle<Option<String>>>,
     runs: Arc<Mutex<Vec<Child>>>,
+    /// The listener, which only the accepting thread owns: gone once that thread has ended,
+    /// so a test sees the close end it without asking the machine-wide port space, where
+    /// another process may take the freed port at once.
+    #[cfg(test)]
+    listener: std::sync::Weak<TcpListener>,
 }
 
 /// Listen on a free loopback port and carry each connection over a run of `cmd`, in the
@@ -45,6 +50,9 @@ pub(super) fn listen(cmd: &Cmd, env: Vec<(String, String)>) -> Result<Live, RunF
     let failed = |e: io::Error| RunFailed::Spawn(format!("relay: 127.0.0.1: {e}"));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(failed)?;
     let port = listener.local_addr().map_err(failed)?.port();
+    let listener = Arc::new(listener);
+    #[cfg(test)]
+    let watch = Arc::downgrade(&listener);
     let stop = Arc::new(AtomicBool::new(false));
     let runs = Arc::new(Mutex::new(Vec::new()));
     let accepter = {
@@ -59,6 +67,8 @@ pub(super) fn listen(cmd: &Cmd, env: Vec<(String, String)>) -> Result<Live, RunF
         stop,
         accepter: Some(accepter),
         runs,
+        #[cfg(test)]
+        listener: watch,
     })
 }
 
@@ -175,7 +185,9 @@ mod tests {
     #[test]
     fn each_connection_is_its_own_run_and_close_ends_every_run() {
         let port = Port::new();
-        let mut relay = port.relay(&Cmd::new("/bin/cat")).unwrap();
+        let cat = Cmd::new("/bin/cat");
+        // `listen`, as `relay` calls it, for the relay itself and so its listener.
+        let mut relay = listen(&cat, port.child_env(&cat)).unwrap();
         let mut one = connect(relay.port());
         let mut two = connect(relay.port());
         one.write_all(b"one\x00\xff").unwrap();
@@ -189,9 +201,8 @@ mod tests {
             let mut rest = Vec::new();
             assert_eq!(s.read_to_end(&mut rest).unwrap(), 0);
         }
-        let port_after = relay.port();
         assert!(
-            TcpStream::connect((Ipv4Addr::LOCALHOST, port_after)).is_err(),
+            relay.listener.upgrade().is_none(),
             "nothing listens after the close"
         );
         relay.close().unwrap();

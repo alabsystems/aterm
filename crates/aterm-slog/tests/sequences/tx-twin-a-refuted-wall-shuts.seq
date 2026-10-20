@@ -1,0 +1,62 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_refuted_wall_shuts_and_the_turn_closes_at_the_next_word (S2).
+bind 0
+see busy
+see wall:usage-session
+tx wall usage-session refute
+expect close p1 wall out=retracted by=vendor conf=exact
+expect need=none
+expect wake=none
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+wait 500
+see wall:usage-session
+expect turn=open
+see idle
+wait 100
+wait 100
+wait 100
+wait 100
+wait 100
+wait 100
+wait 100
+wait 100
+wait 100
+wait 100
+expect close t1 turn out=done

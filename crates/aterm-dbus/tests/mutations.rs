@@ -15,12 +15,10 @@
 //! The cargo-fuzz target under `fuzz/` holds the same properties without the
 //! seed (a STOCK EXCEPTION lane; see its header).
 
-mod support;
-
+use crate::support::*;
 use aterm_dbus::message::{self, Message};
 use aterm_dbus::{Endian, Type, wire};
 use aterm_spec::rng::XorShift;
-use support::*;
 
 const SEED: u64 = 0x0A11_7DB0;
 

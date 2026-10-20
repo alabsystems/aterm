@@ -507,6 +507,62 @@ impl AuthoritativeFetch {
         self.manifest_rejected = true;
         self.rejection_reason = Some(reason);
     }
+
+    /// Refuse the selected release, after the chain verified it and before anything is
+    /// staged, when its signed manifest does not bind it to the pointer's tag or its
+    /// signer is in `floor`'s durable revocation set.
+    fn refuse_unbound_or_revoked(
+        &mut self,
+        source: &Source,
+        floor: &crate::manifest::Floor,
+        web_tag: &str,
+    ) {
+        // THE URL CROSS-CHECK, after every signature has been verified and the version
+        // bound, and before anything is staged: the signed manifest must name the very
+        // container URL this client derived under the pointer's tag.
+        if let Some((manifest, release, _)) = self.selected.as_ref()
+            && let Err(error) = web_container_url_agrees(source, &release.tag_name, manifest)
+        {
+            let reason = format!("{error}; refusing authoritative {}", release.tag_name);
+            self.selected = None;
+            self.refuse(reason);
+        }
+        // THE DURABLE REVOCATION SET: a machine a roster this client
+        // admitted once revoked is not trusted again, whatever a later roster lists — the
+        // rule the Linux lane keeps (`revoked_machines`). Without it the floor would
+        // ignore the machine's word while the check staged its build, and every surface
+        // (which reads the same set) would then hide that stage and re-download it forever.
+        if self.selected.is_some()
+            && let Some(who) = &self.attribution
+            && floor.revokes(Some(&who.machine_id))
+        {
+            let reason = format!(
+                "authoritative {} was signed by machine {}, which a machine roster this client \
+                 admitted has revoked; refusing it",
+                web_tag, who.machine_id
+            );
+            self.selected = None;
+            self.refuse(reason);
+        }
+    }
+
+    /// What this fetch tells the durable floor, whether or not it selected a release:
+    /// the admitted roster's generation and revocations, and the selected release's
+    /// `min_build` with WHO asked for it, the machine the roster chain attributed the
+    /// release to, so a revocation of that machine takes it back.
+    fn floor_observation(&self) -> crate::manifest::FloorObservation<'_> {
+        crate::manifest::FloorObservation {
+            min_build: self
+                .selected
+                .as_ref()
+                .and_then(|(manifest, _, _)| manifest.min_build)
+                .unwrap_or(0),
+            high_water: 0,
+            roster_seq: self.observed_roster_seq.unwrap_or(0),
+            machine: self.attribution.as_ref().map(|who| who.machine_id.as_str()),
+            revoked: &self.observed_revocations,
+        }
+    }
 }
 
 /// The length of a detached Ed25519 signature, the only shape the roster and appcast
@@ -561,7 +617,8 @@ enum RosterFailure {
 /// authorization that follows. The caller ratchets it into the durable floor even when
 /// this function then refuses the release, because a roster that revokes the release's
 /// signer is exactly the generation the floor must remember (see
-/// [`AuthoritativeFetch::observed_roster_seq`]).
+/// [`AuthoritativeFetch::observed_roster_seq`]). A malformed appcast signature is
+/// judged after it too, so it cannot hide the observation.
 fn authorize_by_roster(
     candidate: &AuthoritativeRelease,
     appcast: &[u8],
@@ -613,18 +670,21 @@ fn authorize_by_roster(
     // and a retry or another network can clear it. Booked as `Refused` it read as a
     // stale trust anchor and told the person to reinstall, which changes nothing behind
     // the same proxy. A 64-byte signature that does not verify stays a verdict.
-    for (asset, sig) in [
-        (ROSTER_SIG_ASSET, &roster_sig),
-        ("appcast signature", &appcast_sig),
-    ] {
-        if sig.len() != ED25519_SIGNATURE_LEN {
-            return Err(Transport(format!(
+    // Each is judged where it is used: the roster's here, before the roster is verified;
+    // the appcast's only once the roster's observation below has landed, so a malformed
+    // appcast signature cannot suppress the floor ratchet or the revocations.
+    let signature_shaped = |asset: &str, sig: &[u8]| {
+        if sig.len() == ED25519_SIGNATURE_LEN {
+            Ok(())
+        } else {
+            Err(Transport(format!(
                 "fetch {asset}: the download is {} bytes, not a {ED25519_SIGNATURE_LEN}-byte \
                  signature (something other than the release host answered)",
                 sig.len()
-            )));
+            )))
         }
-    }
+    };
+    signature_shaped(ROSTER_SIG_ASSET, &roster_sig)?;
 
     // (3)(4) Verify under the paper master, then parse — in that order, by construction.
     let verified =
@@ -673,7 +733,8 @@ fn authorize_by_roster(
     // tells the caller whom it withdrew.
     observed_revocations.clone_from(&roster.revoked);
 
-    // (6) Deny-list before crypto, then the artifact signature.
+    // (6) Deny-list before crypto, then the artifact signature, once it is one.
+    signature_shaped("appcast signature", &appcast_sig)?;
     roster
         .authorize_appcast(appcast, &appcast_sig, policy.now_unix)
         .map_err(|e| {
@@ -2461,33 +2522,7 @@ fn check_and_stage_inner(
         record_source_only_head(&staging, current_build, source, &web_tag);
         return Ok(None);
     }
-    // THE URL CROSS-CHECK, after every signature has been verified and the version
-    // bound, and before anything is staged: the signed manifest must name the very
-    // container URL this client derived under the pointer's tag.
-    if let Some((manifest, release, _)) = fetched.selected.as_ref()
-        && let Err(error) = web_container_url_agrees(source, &release.tag_name, manifest)
-    {
-        let reason = format!("{error}; refusing authoritative {}", release.tag_name);
-        fetched.selected = None;
-        fetched.refuse(reason);
-    }
-    // THE DURABLE REVOCATION SET: a machine a roster this client
-    // admitted once revoked is not trusted again, whatever a later roster lists — the
-    // rule the Linux lane keeps (`revoked_machines`). Without it the floor would
-    // ignore the machine's word while the check staged its build, and every surface
-    // (which reads the same set) would then hide that stage and re-download it forever.
-    if fetched.selected.is_some()
-        && let Some(who) = &fetched.attribution
-        && floor.revokes(Some(&who.machine_id))
-    {
-        let reason = format!(
-            "authoritative {} was signed by machine {}, which a machine roster this client \
-             admitted has revoked; refusing it",
-            web_tag, who.machine_id
-        );
-        fetched.selected = None;
-        fetched.refuse(reason);
-    }
+    fetched.refuse_unbound_or_revoked(source, &floor, &web_tag);
     // ATTRIBUTION, recorded where a human will find it later: the updater's own status
     // file, beside the release it describes. The owner's requirement is "I can track
     // which computer does what", and for the client half this is the record. It is
@@ -2505,32 +2540,18 @@ fn check_and_stage_inner(
     let manifest_rejected = fetched.manifest_rejected;
     let rejection_reason = fetched.rejection_reason.take();
     let observed_roster_seq = fetched.observed_roster_seq;
-    let observed_revocations = std::mem::take(&mut fetched.observed_revocations);
+    let floor = observe_floor_and_withdraw_at(
+        &staging,
+        current_build,
+        floor,
+        &fetched.floor_observation(),
+        &roster_read_at,
+    )?;
     let best = fetched.selected;
     let seen_min_build = best
         .as_ref()
         .and_then(|(manifest, _, _)| manifest.min_build)
         .unwrap_or(0);
-    // WHO asked for that floor: the machine the roster chain attributed the release
-    // to. Recorded with it, so a revocation of that machine takes it back.
-    let seen_by = fetched
-        .attribution
-        .as_ref()
-        .map(|who| who.machine_id.clone());
-
-    let floor = observe_floor_and_withdraw_at(
-        &staging,
-        current_build,
-        floor,
-        &crate::manifest::FloorObservation {
-            min_build: seen_min_build,
-            high_water: 0,
-            roster_seq: observed_roster_seq.unwrap_or(0),
-            machine: seen_by.as_deref(),
-            revoked: &observed_revocations,
-        },
-        &roster_read_at,
-    )?;
     let effective_min_build = floor.min_build.max(seen_min_build);
 
     let Some((manifest, release, artifact)) = best else {

@@ -312,19 +312,53 @@ impl<'a> Parser<'a> {
             doc.bom = true;
         }
         let mut trivia_start = self.pos;
+        let mut after_a_line = false;
         loop {
             self.eat_trivia()?;
+            let at_header = self.peek() == Some(b'[');
+            // The comment lines directly under a table's last line, before a
+            // header or the end of the file, are that table's: they describe
+            // what is above them. Filed on the next header (or the document's
+            // end) they went with it — a reset that pruned the table left them
+            // under whatever printed before the header, and a table added
+            // between took them over.
+            if after_a_line && (at_header || self.eof()) {
+                let split = self.trailing_comment_end(trivia_start, self.pos);
+                if split > trivia_start {
+                    current_table(doc.as_item_mut(), &path).trailing =
+                        RawString::from(self.src[trivia_start..split].to_owned());
+                    trivia_start = split;
+                }
+            }
             if self.eof() {
                 doc.trailing = RawString::from(self.src[trivia_start..self.pos].to_owned());
                 return Ok(doc);
             }
-            if self.peek() == Some(b'[') {
+            if at_header {
                 path = self.table_header(&mut doc, trivia_start)?;
             } else {
                 self.keyval(&mut doc, &path, trivia_start)?;
             }
+            after_a_line = true;
             trivia_start = self.pos;
         }
+    }
+
+    /// Where the comment lines that touch the line before `start` end in the
+    /// trivia run `start..end` (whole lines of comments and blanks): at the
+    /// first blank line. A run with no blank line touches both neighbours; a
+    /// comment directly above a header is that header's, so the run stays
+    /// with it, while at the end of the file it is the last table's.
+    fn trailing_comment_end(&self, start: usize, end: usize) -> usize {
+        let run = &self.src[start..end];
+        let mut at = start;
+        for line in run.split_inclusive('\n') {
+            if line.trim().is_empty() {
+                return at;
+            }
+            at += line.len();
+        }
+        if end == self.src.len() { end } else { start }
     }
 
     fn table_header(&mut self, doc: &mut DocumentMut, trivia_start: usize) -> Result<Vec<usize>> {

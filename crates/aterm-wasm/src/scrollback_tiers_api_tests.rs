@@ -66,7 +66,7 @@ fn ingest_stages_and_render_promotes() {
     );
     // Frames drain bounded batches until the backlog settles.
     for _ in 0..16 {
-        t.render();
+        t.render().expect("renderable frame");
     }
     assert_eq!(
         t.scrollback_backlog_lines(),
@@ -164,7 +164,7 @@ fn global_budget_caps_the_effective_share() {
         t.scrollback_budget_effective() <= 8_192,
         "global cap bounds the effective share"
     );
-    t.render(); // applies the share on the frame path without panicking
+    t.render().expect("renderable frame"); // applies the share on the frame path without panicking
     AtermTerminal::set_scrollback_global_budget(0);
     assert_eq!(
         t.scrollback_budget_effective() as usize,

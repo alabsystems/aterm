@@ -360,6 +360,7 @@ fn video_recording_pins_motion_focus() {
         pace_ticks: Vec::new(),
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
+        unlogged_over_cap: 0,
         mode: crate::VideoMode::SwapchainTap,
         next_frame: None,
         presented: None,

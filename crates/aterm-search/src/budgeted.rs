@@ -11,8 +11,9 @@
 //! survive.
 //!
 //! Driving a `BudgetedSearch` to completion yields the same [`SearchResults`] as
-//! [`SearchIndex::search_results_opts`] over the same rows, however the rows were
-//! sliced: each per-row verifier is the batch path's own (the forward iterator's
+//! [`SearchIndex::search_results_opts`] over the same rows, wherever the caller
+//! stops and resumes (it feeds one row per call): each per-row verifier is the
+//! batch path's own (the forward iterator's
 //! scan, [`CaseInsensitiveMatcher`], the same capped regex and [`scan_line`]), rows
 //! arrive in the batch build's order, and [`MAX_SEARCH_MATCHES`] applies to the
 //! final retained suffix. Rows the deterministic eviction schedule would drop are
@@ -334,26 +335,26 @@ mod tests {
             .expect("oracle search must succeed")
     }
 
-    /// Drive a budgeted search to completion in `slice`-row steps.
+    /// Feed `rows` to `search` one row per call until it completes. A caller's
+    /// budget only decides between which calls it stops, so this is every slicing.
+    fn drive(mut search: BudgetedSearch, rows: &[&str]) -> SearchResults {
+        while !search.is_complete() {
+            search.feed_row(rows[search.rows_fed()]);
+        }
+        search.results()
+    }
+
+    /// Drive a budgeted search over `rows` at `base` to completion.
     fn budgeted(
         rows: &[&str],
         base: usize,
         query: &str,
         case_sensitive: bool,
         is_regex: bool,
-        slice: usize,
     ) -> SearchResults {
-        let mut search = BudgetedSearch::new(query, case_sensitive, is_regex, base, rows.len())
+        let search = BudgetedSearch::new(query, case_sensitive, is_regex, base, rows.len())
             .expect("budgeted construction must succeed");
-        while !search.is_complete() {
-            for _ in 0..slice.max(1) {
-                if search.is_complete() {
-                    break;
-                }
-                search.feed_row(rows[search.rows_fed()]);
-            }
-        }
-        search.results()
+        drive(search, rows)
     }
 
     fn sample_rows() -> Vec<&'static str> {
@@ -427,10 +428,10 @@ mod tests {
         }
     }
 
-    /// Any slicing of the row feed equals the one-shot search, in every mode, at a
-    /// non-zero base row.
+    /// The row feed equals the one-shot search, in every mode, at a non-zero base
+    /// row.
     #[test]
-    fn any_slicing_equals_one_shot_across_all_modes() {
+    fn the_row_feed_equals_one_shot_across_all_modes() {
         let rows = sample_rows();
         let cases: &[(&str, bool, bool)] = &[
             ("needle", true, false),  // case-sensitive literal
@@ -447,13 +448,11 @@ mod tests {
         ];
         for &(query, case_sensitive, is_regex) in cases {
             let oracle = one_shot(&rows, 37, query, case_sensitive, is_regex);
-            for slice in [1, 2, 3, 7, rows.len()] {
-                let got = budgeted(&rows, 37, query, case_sensitive, is_regex, slice);
-                assert_eq!(
-                    got, oracle,
-                    "slice={slice} query={query:?} cs={case_sensitive} rx={is_regex}"
-                );
-            }
+            let got = budgeted(&rows, 37, query, case_sensitive, is_regex);
+            assert_eq!(
+                got, oracle,
+                "query={query:?} cs={case_sensitive} rx={is_regex}"
+            );
         }
     }
 
@@ -466,7 +465,7 @@ mod tests {
         let oracle = one_shot(&rows, 0, "a", true, false);
         assert!(oracle.incomplete, "cap must be reported as incomplete");
         assert_eq!(oracle.matches.len(), MAX_SEARCH_MATCHES);
-        let got = budgeted(&rows, 0, "a", true, false, 512);
+        let got = budgeted(&rows, 0, "a", true, false);
         assert_eq!(got, oracle);
     }
 
@@ -486,20 +485,10 @@ mod tests {
             .expect("oracle search");
         assert!(oracle.incomplete, "eviction must be reported");
 
-        for slice in [1, 7, 100] {
-            let mut search =
-                BudgetedSearch::with_max_cached_lines("needle", true, false, 0, row_refs.len(), 10)
-                    .expect("budgeted construction");
-            while !search.is_complete() {
-                for _ in 0..slice {
-                    if search.is_complete() {
-                        break;
-                    }
-                    search.feed_row(row_refs[search.rows_fed()]);
-                }
-            }
-            assert_eq!(search.results(), oracle, "slice={slice}");
-        }
+        let search =
+            BudgetedSearch::with_max_cached_lines("needle", true, false, 0, row_refs.len(), 10)
+                .expect("budgeted construction");
+        assert_eq!(drive(search, &row_refs), oracle);
     }
 
     /// Hitting the match cap in rows that are later evicted must not starve the
@@ -530,20 +519,10 @@ mod tests {
             "oracle only returns the retained suffix"
         );
 
-        for slice in [1, 3, ROWS] {
-            let mut search =
-                BudgetedSearch::with_max_cached_lines("a", true, false, 0, rows.len(), CACHE_LINES)
-                    .expect("budgeted construction");
-            while !search.is_complete() {
-                for _ in 0..slice {
-                    if search.is_complete() {
-                        break;
-                    }
-                    search.feed_row(rows[search.rows_fed()]);
-                }
-            }
-            assert_eq!(search.results(), oracle, "slice={slice}");
-        }
+        let search =
+            BudgetedSearch::with_max_cached_lines("a", true, false, 0, rows.len(), CACHE_LINES)
+                .expect("budgeted construction");
+        assert_eq!(drive(search, &rows), oracle);
     }
 
     #[test]

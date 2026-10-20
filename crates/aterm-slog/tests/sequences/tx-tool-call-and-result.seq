@@ -1,0 +1,18 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# §2.4 source 2: tool_use and tool_result open and close tool steps under the
+# turn the vendor turn maps; the turn's close counts them.
+bind 0
+see busy
+tx prompt v1
+tx tool c1
+expect open p1 tool par=t1 cls=shell tool=Bash vref=c1 by=vendor src=transcript conf=exact
+tx result c1
+expect close p1 tool out=ok
+tx tool c2
+expect open p2 tool par=t1 vref=c2
+tx result c2 error
+expect close p2 tool out=error
+tx end
+expect open t1 turn
+expect close t1 turn out=done steps=2 errs=1 tools=shell:2 by=vendor
+expect tx mapped=t1 ended=1

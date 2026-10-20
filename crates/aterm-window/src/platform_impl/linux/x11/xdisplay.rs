@@ -17,7 +17,7 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt as _;
 use std::path::PathBuf;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::{fmt, ptr};
 
@@ -195,15 +195,21 @@ impl XConnection {
         Some(xsettings_screen)
     }
 
-    /// Whether this connection to the X server is broken (the server died,
-    /// was killed or reset it): `Some` with the errno Xlib saw when it found
-    /// that (`0` when it saw none, or when xcb found it first, through a
-    /// request of ours), `None` while the connection holds.
-    pub fn connection_lost(&self) -> Option<i32> {
-        if IO_ERROR.load(Ordering::SeqCst) {
-            return Some(IO_ERROR_ERRNO.load(Ordering::SeqCst));
-        }
-        self.xcb.as_ref().and_then(|xcb| xcb.status().err()).map(|_| 0)
+    /// Whether this connection to the X server is broken: Xlib found it so (its IO error
+    /// handlers ran, [`install_io_error_exit_handler`]) or libxcb has an error. Two loads, so
+    /// the event loop asks before each event it hands on.
+    pub fn is_broken(&self) -> bool {
+        IO_ERROR.load(Ordering::SeqCst)
+            || self.xcb.as_ref().is_some_and(|xcb| xcb.status().is_err())
+    }
+
+    /// How this connection ended ([`ConnectionEnd`]), `None` while it holds and the event
+    /// loop's poll saw its socket neither hang up nor fail (`hung_up`).
+    pub fn connection_end(&self, hung_up: bool) -> Option<ConnectionEnd> {
+        let status = self.xcb.as_ref().map_or(Ok(()), aterm_x11::Connection::status);
+        ConnectionEnd::of(status, IO_ERROR.load(Ordering::SeqCst), hung_up, |seen| {
+            socket_end(self.xcb_connection().file_descriptor(), seen)
+        })
     }
 
     /// Checks whether an error has been triggered by the previous function calls.
@@ -357,10 +363,89 @@ pub(crate) fn hostname() -> OsString {
     OsString::from_vec(name.to_bytes().to_vec())
 }
 
-/// Set once Xlib has found this process's X connection broken
-/// ([`note_io_error`]), with the errno it saw then.
+/// How a connection to the X server ended ([`XConnection::connection_end`]).
+#[derive(Debug)]
+pub enum ConnectionEnd {
+    /// Its transport failed: libxcb's `XCB_CONN_ERROR` (a read found end of file, or a read or
+    /// write on the socket failed), Xlib's IO error, or the event loop's poll saw the socket
+    /// hang up or fail. The server died, was killed or restarted; the error is what the socket
+    /// says of its end ([`socket_end`]).
+    Transport(std::io::Error),
+    /// libxcb closed the connection for a reason of its own, the server still there (a request
+    /// longer than the server takes, memory, an answer that did not parse): its error.
+    Closed(aterm_x11::Error),
+}
+
+impl ConnectionEnd {
+    /// The end of a connection whose libxcb `status` is this, whose Xlib has (`xlib_io_error`)
+    /// or has not found it broken, and whose socket the loop's poll saw hang up or fail
+    /// (`hung_up`); `None` while it holds. libxcb's word comes first: it is the one that read
+    /// and wrote the socket. A failed transport's error is `transport`'s, what the socket says,
+    /// told which of the three found it failed.
+    pub(crate) fn of(
+        status: Result<(), aterm_x11::Error>,
+        xlib_io_error: bool,
+        hung_up: bool,
+        transport: impl FnOnce(&'static str) -> std::io::Error,
+    ) -> Option<ConnectionEnd> {
+        let seen = match status {
+            Err(error) if !error.is_transport_failure() => {
+                return Some(ConnectionEnd::Closed(error))
+            },
+            Err(_) => "a read or write on the X server's socket failed (XCB_CONN_ERROR)",
+            Ok(()) if xlib_io_error => "Xlib found the X server's connection broken (its IO error)",
+            Ok(()) if hung_up => "the X server's socket hung up or failed (the event loop's poll)",
+            Ok(()) => return None,
+        };
+        Some(ConnectionEnd::Transport(transport(seen)))
+    }
+}
+
+/// What the X server's socket says of its end, once its transport failed: a pending socket
+/// error (`SO_ERROR`; `ECONNRESET` when the server died with requests of ours unread and
+/// nothing has read the socket since), else what a peek finds: nothing at all is end of file,
+/// the server's side closed, and an error is that error. When the socket still holds unread
+/// bytes, or says nothing, the word of whichever found the transport failed (`seen`) stands.
+/// Xlib's `errno` is not used: it is whatever the last call left (with Xvfb killed under
+/// aterm-gui it named no connection's end in any lane run, 2026-10-17), and end of file sets
+/// none.
+pub(crate) fn socket_end(fd: std::os::raw::c_int, seen: &'static str) -> std::io::Error {
+    let mut pending: std::os::raw::c_int = 0;
+    let mut len = std::mem::size_of::<std::os::raw::c_int>() as libc::socklen_t;
+    // SAFETY: `pending` and `len` are live locals of the sizes `getsockopt` is told.
+    let read = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            (&mut pending as *mut std::os::raw::c_int).cast(),
+            &mut len,
+        )
+    };
+    if read == 0 && pending != 0 {
+        return std::io::Error::from_raw_os_error(pending);
+    }
+    let mut byte = 0u8;
+    // SAFETY: one byte into a live local; a peek that does not block takes nothing off the
+    // socket.
+    let peeked = unsafe {
+        libc::recv(fd, (&mut byte as *mut u8).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT)
+    };
+    let error = std::io::Error::last_os_error();
+    if peeked == 0 {
+        return std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "end of file: the X server closed the connection",
+        );
+    }
+    if peeked < 0 && error.kind() != std::io::ErrorKind::WouldBlock {
+        return error;
+    }
+    std::io::Error::other(seen)
+}
+
+/// Set once Xlib has found this process's X connection broken ([`note_io_error`]).
 static IO_ERROR: AtomicBool = AtomicBool::new(false);
-static IO_ERROR_ERRNO: AtomicI32 = AtomicI32::new(0);
 
 /// Make a broken connection end the event loop instead of the process.
 ///
@@ -376,8 +461,8 @@ static IO_ERROR_ERRNO: AtomicI32 = AtomicI32::new(0);
 /// it exists, both handlers become ones that
 /// note the loss and return (as Mutter installs them for its Xwayland); Xlib
 /// then marks the display broken (`XlibDisplayIOError`), every later call on it
-/// returns at once, and the event loop ends with the errno Xlib saw
-/// ([`XConnection::connection_lost`], `EventLoop::end_if_connection_lost`). A
+/// returns at once, and the event loop ends with the connection's end
+/// ([`XConnection::connection_end`], `EventLoop::end_if_connection_lost`). A
 /// libX11 older than 1.7 has no exit handler: its defaults stay, and so does
 /// its `exit(1)`, for a returning IO error handler would end in it anyway.
 ///
@@ -403,16 +488,14 @@ unsafe extern "C" fn io_error(_display: *mut ffi::Display) -> std::os::raw::c_in
     0
 }
 
-/// The IO error exit handler: notes the loss (again; the first errno is kept)
-/// and returns, where Xlib's default would `exit(1)`.
+/// The IO error exit handler: notes the loss (again) and returns, where Xlib's
+/// default would `exit(1)`.
 unsafe extern "C" fn io_error_exit(_display: *mut ffi::Display, _data: *mut std::ffi::c_void) {
     note_io_error();
 }
 
-/// Note that Xlib found the connection broken, keeping the first errno.
+/// Note that Xlib found the connection broken.
 fn note_io_error() {
-    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    let _ = IO_ERROR_ERRNO.compare_exchange(0, errno, Ordering::SeqCst, Ordering::SeqCst);
     IO_ERROR.store(true, Ordering::SeqCst);
 }
 
@@ -489,5 +572,78 @@ impl Error for XNotSupported {
 impl fmt::Display for XNotSupported {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         formatter.write_str(self.description())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{ErrorKind, Write as _};
+    use std::os::unix::io::AsRawFd as _;
+    use std::os::unix::net::UnixStream;
+
+    use super::{socket_end, ConnectionEnd};
+
+    /// A socket with nothing to say: the witness's word stands.
+    fn witness(seen: &'static str) -> std::io::Error {
+        std::io::Error::other(seen)
+    }
+
+    fn said(end: Option<ConnectionEnd>) -> String {
+        match end {
+            Some(ConnectionEnd::Transport(why)) => why.to_string(),
+            other => panic!("not a failed transport: {other:?}"),
+        }
+    }
+
+    /// Only a failed transport is the display's loss: libxcb's stream error,
+    /// Xlib's IO error, or a socket the poll saw hang up. libxcb's own close
+    /// is its error, and a connection nothing found broken has not ended.
+    #[test]
+    fn only_a_failed_transport_is_the_end_of_the_server() {
+        let transport = aterm_x11::Error::Connection(1);
+        let too_long = aterm_x11::Error::Connection(4);
+        let ended = |status, xlib, hung_up| ConnectionEnd::of(status, xlib, hung_up, witness);
+        for (xlib, hung_up) in [(false, false), (true, false), (false, true)] {
+            assert!(matches!(
+                ended(Err(transport.clone()), xlib, hung_up),
+                Some(ConnectionEnd::Transport(_))
+            ));
+            assert!(matches!(
+                ended(Err(too_long.clone()), xlib, hung_up),
+                Some(ConnectionEnd::Closed(aterm_x11::Error::Connection(4)))
+            ));
+        }
+        // Each witness is named: libxcb's first, then Xlib's, then the poll's.
+        assert!(said(ended(Err(transport.clone()), true, true)).contains("XCB_CONN_ERROR"));
+        assert!(said(ended(Ok(()), true, true)).contains("Xlib"));
+        assert!(said(ended(Ok(()), false, true)).contains("poll"));
+        assert!(ended(Ok(()), false, false).is_none());
+    }
+
+    /// What the socket says of a dead server: end of file once it closed,
+    /// `ECONNRESET` when it closed on requests of ours it never read. A live
+    /// socket, or one still holding the server's last bytes, says nothing of
+    /// its own (the control: no end of file is made up).
+    #[test]
+    fn the_socket_says_how_the_server_went() {
+        let (ours, server) = UnixStream::pair().expect("socketpair");
+        let quiet = socket_end(ours.as_raw_fd(), "the witness");
+        assert_eq!(quiet.kind(), ErrorKind::Other, "{quiet}");
+        assert_eq!(quiet.to_string(), "the witness");
+        drop(server);
+        let closed = socket_end(ours.as_raw_fd(), "the witness");
+        assert_eq!(closed.kind(), ErrorKind::UnexpectedEof, "{closed}");
+
+        let (mut ours, server) = UnixStream::pair().expect("socketpair");
+        ours.write_all(b"a request").expect("write");
+        drop(server);
+        let reset = socket_end(ours.as_raw_fd(), "the witness");
+        assert_eq!(reset.raw_os_error(), Some(libc::ECONNRESET), "{reset}");
+
+        let (ours, mut server) = UnixStream::pair().expect("socketpair");
+        server.write_all(b"an event").expect("write");
+        drop(server);
+        let unread = socket_end(ours.as_raw_fd(), "the witness");
+        assert_eq!(unread.to_string(), "the witness");
     }
 }

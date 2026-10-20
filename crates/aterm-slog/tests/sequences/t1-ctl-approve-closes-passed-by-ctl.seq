@@ -1,0 +1,11 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# T1: `aterm ctl key act=approve` from a control client: the box closes by
+# the client, but `passed`: only a proven author's act decides it.
+see busy
+half
+see prompt bash:not-read-only
+expect open p1 approval par=t1 box=bash:not-read-only at=500
+admit ctl act=approve
+accept
+see busy
+expect close p1 approval out=passed by=ctl

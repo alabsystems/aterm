@@ -1118,6 +1118,9 @@ pub(crate) enum FrameEncoder<'s> {
     Wgpu {
         enc: wgpu::CommandEncoder,
         queue: &'s wgpu::Queue,
+        /// The `gpu_time` clock: each pass asks it for timestamp writes, which
+        /// it hands out only while a present is being timed.
+        timer: Option<&'s crate::wgpu_timer::WgpuGpuTimer>,
     },
     #[cfg(target_os = "macos")]
     Metal(MtlCommandBuffer<'s>),
@@ -1135,11 +1138,17 @@ impl<'s> FrameEncoder<'s> {
     /// The live production arm: a wgpu command encoder with the exact
     /// descriptor the pre-seam `encode_frame` created ("aterm-gpu frame").
     #[cfg(wgpu_arm)]
-    pub(crate) fn wgpu(device: &wgpu::Device, queue: &'s wgpu::Queue, label: &'static str) -> Self {
+    pub(crate) fn wgpu(
+        device: &wgpu::Device,
+        queue: &'s wgpu::Queue,
+        timer: Option<&'s crate::wgpu_timer::WgpuGpuTimer>,
+        label: &'static str,
+    ) -> Self {
         Self::Wgpu {
             enc: device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) }),
             queue,
+            timer,
         }
     }
 
@@ -1162,7 +1171,7 @@ impl<'s> FrameEncoder<'s> {
     ) -> Result<FramePass<'e, 's>, String> {
         match self {
             #[cfg(wgpu_arm)]
-            Self::Wgpu { enc, .. } => {
+            Self::Wgpu { enc, timer, .. } => {
                 let (view, uniform_bg) = match (view, uniforms) {
                     (FrameView::Wgpu(view), FrameUniforms::Wgpu(uniform_bg)) => (view, uniform_bg),
                     #[cfg(multi_arm)]
@@ -1184,7 +1193,7 @@ impl<'s> FrameEncoder<'s> {
                         },
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: timer.and_then(crate::wgpu_timer::WgpuGpuTimer::pass_writes),
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
@@ -1342,7 +1351,7 @@ impl<'s> FrameEncoder<'s> {
     pub(crate) fn submit(self) -> SubmittedFrame {
         match self {
             #[cfg(wgpu_arm)]
-            Self::Wgpu { enc, queue } => {
+            Self::Wgpu { enc, queue, .. } => {
                 queue.submit([enc.finish()]);
                 SubmittedFrame::Wgpu
             }

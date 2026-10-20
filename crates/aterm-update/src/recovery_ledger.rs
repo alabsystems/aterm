@@ -1220,12 +1220,15 @@ mod tests {
         let dir = scratch("trim");
         let path = ledger_path(&dir);
         let mut n: u32 = 0;
-        // Append until the file crosses TRIM_AT_BYTES and the append trims it.
+        let mut grown = 0;
+        // Append until the file crosses TRIM_AT_BYTES and the append trims it: the
+        // one append after which the file is shorter than before.
         loop {
             n += 1;
             append_row(&path, &row(u64::from(n) + 10, n, prev(EndClass::Clean))).expect("append");
-            let rows = read_rows(&path);
-            if rows.len() < n as usize {
+            let len = std::fs::metadata(&path).expect("meta").len();
+            if len < grown {
+                let rows = read_rows(&path);
                 assert_eq!(
                     rows.len(),
                     KEEP_ROWS,
@@ -1239,6 +1242,7 @@ mod tests {
                 assert_eq!(rows.first().map(|r| r.pid), Some(n + 1 - KEEP_ROWS as u32));
                 break;
             }
+            grown = len;
             assert!(n < 10_000, "the ledger never trimmed");
         }
         assert!(std::fs::metadata(&path).expect("meta").len() <= TRIM_AT_BYTES);

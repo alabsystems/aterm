@@ -48,6 +48,13 @@ impl XkbState {
         Some(Self::new_inner(state))
     }
 
+    /// A fresh state over a keymap a test compiled.
+    #[cfg(test)]
+    pub fn new_for_test(keymap: &XkbKeymap) -> Option<Self> {
+        let state = NonNull::new(unsafe { (xkbh().state_new)(keymap.as_ptr()) })?;
+        Some(Self::new_inner(state))
+    }
+
     fn new_inner(state: NonNull<xkb_state>) -> Self {
         let modifiers = ModifiersState::default();
         let mut this = Self { state, modifiers };
@@ -57,6 +64,48 @@ impl XkbState {
 
     pub fn get_one_sym_raw(&mut self, keycode: xkb_keycode_t) -> xkb_keysym_t {
         unsafe { (xkbh().state_key_get_one_sym)(self.state.as_ptr(), keycode) }
+    }
+
+    /// The keysym `keycode` types under every modifier and layout this state holds but
+    /// `lock` (`keymap`'s Caps Lock mask): read on a scratch state of `keymap`, this state's
+    /// own, since xkb resolves Shift and Lock together and an alphabetic key's type cancels
+    /// one against the other. This state's own keysym when the lock is not on.
+    pub fn get_one_sym_without(
+        &mut self,
+        keymap: &XkbKeymap,
+        lock: xkb::ModMask,
+        keycode: xkb_keycode_t,
+    ) -> xkb_keysym_t {
+        let state = self.state.as_ptr();
+        let mods = |component| unsafe { (xkbh().state_serialize_mods)(state, component) };
+        let (depressed, latched, locked) = (
+            mods(state_component::MODS_DEPRESSED),
+            mods(state_component::MODS_LATCHED),
+            mods(state_component::MODS_LOCKED),
+        );
+        if (depressed | latched | locked) & lock == 0 {
+            return self.get_one_sym_raw(keycode);
+        }
+        let layout = |component| unsafe { (xkbh().state_serialize_layout)(state, component) };
+        // SAFETY: the scratch state is made from this state's own keymap, used for the two
+        // calls, and unreffed once.
+        unsafe {
+            let Some(scratch) = NonNull::new((xkbh().state_new)(keymap.as_ptr())) else {
+                return self.get_one_sym_raw(keycode);
+            };
+            (xkbh().state_update_mask)(
+                scratch.as_ptr(),
+                depressed & !lock,
+                latched & !lock,
+                locked & !lock,
+                layout(state_component::LAYOUT_DEPRESSED),
+                layout(state_component::LAYOUT_LATCHED),
+                layout(state_component::LAYOUT_LOCKED),
+            );
+            let keysym = (xkbh().state_key_get_one_sym)(scratch.as_ptr(), keycode);
+            (xkbh().state_unref)(scratch.as_ptr());
+            keysym
+        }
     }
 
     pub fn layout(&mut self, key: xkb_keycode_t) -> xkb_layout_index_t {

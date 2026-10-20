@@ -2042,7 +2042,7 @@ mod writer_tests {
         promise_pass(&l, me, SEED_PROMISE_SECS);
         let written: PassPromise =
             aterm_json::from_str(&std::fs::read_to_string(l.pass_owed_file()).unwrap()).unwrap();
-        if cfg!(any(target_os = "macos", target_os = "linux")) {
+        if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
             assert_eq!(written.born, crate::platform::process_birth(me).at());
             assert!(written.born.is_some(), "{written:?}");
         }
@@ -2081,6 +2081,45 @@ mod writer_tests {
         for now in [Birth::At(8), Birth::Gone, Birth::Unreadable] {
             assert!(same_owner(None, now), "no start time recorded: {now:?}");
         }
+    }
+
+    /// The platform's start-time reader as [`same_owner`] judges it, on every platform that
+    /// has one: this process, read twice, is the owner it recorded; a child that has exited
+    /// is no owner — reaped on Unix (`ESRCH`; no `/proc/<pid>`), and on Windows still held by
+    /// its `Child`'s handle, so the pid names that exited process and no other
+    /// (`GetExitCodeProcess` no longer `STILL_ACTIVE`). Negative control: a reader that says
+    /// nothing (the Windows stub's `Unreadable`) fails the first assertion.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn the_platform_reader_tells_a_live_owner_from_one_that_exited() {
+        use crate::platform::{Birth, process_birth};
+        let me = std::process::id();
+        let born = process_birth(me);
+        assert!(
+            matches!(born, Birth::At(_)),
+            "this process's start time: {born:?}"
+        );
+        assert!(
+            same_owner(born.at(), process_birth(me)),
+            "read again: the same owner"
+        );
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn /usr/bin/true");
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .expect("spawn cmd /C exit 0");
+        let exited = child.id();
+        child.wait().expect("it exits");
+        assert_eq!(
+            process_birth(exited),
+            Birth::Gone,
+            "an exited child is no owner"
+        );
+        drop(child);
     }
 
     /// An update ending retires only a promise its own process or its spawner holds: a

@@ -36,7 +36,7 @@ fn an_offline_check_says_offline() {
 }
 
 /// The machine apply worker sorts the child's stdout: the `machine-settings:`
-/// row becomes the pull-down/card event, the last `atpkg machine: …` line is
+/// row becomes the pull-down/status event, the last `atpkg machine: …` line is
 /// the verdict, and a `machine settings not applied — …` line is the refusal
 /// reported as the failure (by its reason).
 #[test]
@@ -45,7 +45,7 @@ fn machine_apply_stdout_is_sorted_into_events_verdict_and_refusal() {
     // A verdict line after atpkg's own prefix; the worker passes its words on as-is.
     let nothing_changed = format!("{MACHINE_VERDICT_PREFIX}nothing changed — already applied");
     // The apply prints its own `machine-state:` record after the change line;
-    // the worker hands it on as the card's newest state, so the completion
+    // the worker hands it on as the status's newest state, so the completion
     // has nothing to confirm by a read.
     let applied = machine_apply_stdout(&format!(
         "atpkg: Universal Control disabled for this host (revert: …)\n\

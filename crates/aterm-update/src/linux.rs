@@ -248,19 +248,30 @@ struct State {
     rejected_build: u64,
     /// Whether [`Self::rejected_build`] was rolled back after its starts spent the trial's
     /// budget ([`rolls_back_unstarted`]), and not by `aterm update rollback` of a build
-    /// that ran: the check loop tells the window of a crash loop's rollback, never of a
-    /// person's own (`crate::linux_notice::InstallWatch`). Absent in an older build's
-    /// record, which reads as a person's.
+    /// that ran. This build says a crash loop's end from [`Self::unsaid_trial_ends`]; the
+    /// field is written for the build a rollback restores, which may be one (v0.106.0)
+    /// whose check loop reads it to tell a crash loop's rollback from a person's. Absent
+    /// in an older build's record, which reads as a person's.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     rejected_unstarted: bool,
     /// The build whose trial ended at a crash loop no rollback could answer
     /// ([`rollback_refusal`], at the start past the budget in [`count_start_locked`]): it
-    /// stays installed though no start of it finished. Only while it is still the installed
-    /// build does the status say so (`crate::LinuxUpdateStatus::kept_unproven`), and the
-    /// check loop tells the window when it sees the trial end so
-    /// (`crate::linux_notice::InstallWatch`). Absent in an older build's record.
+    /// stays installed though no start of it finished. Written, like
+    /// [`Self::rejected_unstarted`], for an older build that reads it (v0.106.0's status
+    /// says a kept build from it); this build says it from [`Self::unsaid_trial_ends`].
+    /// Absent in an older build's record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kept_unproven: Option<u64>,
+    /// What each crash loop's end says — a rollback or a build kept — until a check loop
+    /// with a window to tell takes them ([`take_unsaid_trial_ends`]; ATERM-KI-1015-2,
+    /// U21). The trial ends at a start, so the aterm that comes up after it is a process
+    /// started after the record moved, which no change between two of its own passes could
+    /// show, and a terminal session's loop has no window to tell: the ends wait here until
+    /// one is said, each once for the copy, oldest first. At most
+    /// [`UNSAID_TRIAL_ENDS_KEPT`], the newest, so a copy no window ever opens on keeps a
+    /// bounded record. Absent in an older build's record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unsaid_trial_ends: Vec<String>,
     outcome: String,
     updated_at: String,
     failing_checks: u32,
@@ -832,6 +843,7 @@ fn initial_state(context: &Context, installed: Identity) -> State {
         rejected_build: 0,
         rejected_unstarted: false,
         kept_unproven: None,
+        unsaid_trial_ends: Vec::new(),
         outcome: String::new(),
         updated_at: String::new(),
         failing_checks: 0,
@@ -1195,6 +1207,7 @@ pub fn enable(current_build: u64, proof_dir: Option<&Path>) -> Result<String, St
         rejected_build: 0,
         rejected_unstarted: false,
         kept_unproven: None,
+        unsaid_trial_ends: Vec::new(),
         outcome: String::new(),
         updated_at: String::new(),
         failing_checks: 0,
@@ -1276,9 +1289,9 @@ fn recover(context: &Context, state: &mut State) -> Result<(), String> {
             context.save(state)
         }
         Phase::RollbackPrepared if digest == trial.old.sha256 => {
-            state.installed = trial.old.clone();
-            state.rejected_build = state.rejected_build.max(trial.new.build);
-            state.rejected_unstarted = rolls_back_unstarted(trial);
+            let trial = trial.clone();
+            record_rollback(state, &trial);
+            state.installed = trial.old;
             state.trial = None;
             context.save(state)
         }
@@ -1506,13 +1519,42 @@ fn rollback_with_checkpoint(
         restored_name(&trial.old),
         trial.new.version
     );
-    state.rejected_unstarted = rolls_back_unstarted(&trial);
+    record_rollback(state, &trial);
     state.installed = trial.old;
-    state.rejected_build = state.rejected_build.max(trial.new.build);
     state.trial = None;
     context.save(state)?;
     prune_backups(context, state);
     Ok(())
+}
+
+/// The record of `trial` rolled back: the build refused from now on, whether it was a
+/// crash loop's rollback ([`rolls_back_unstarted`]), and, for one, the words the first
+/// check loop with a window to tell says ([`State::unsaid_trial_ends`]).
+fn record_rollback(state: &mut State, trial: &Trial) {
+    state.rejected_build = state.rejected_build.max(trial.new.build);
+    state.rejected_unstarted = rolls_back_unstarted(trial);
+    if state.rejected_unstarted {
+        keep_unsaid_trial_end(
+            state,
+            crate::linux_notice::rollback_body(&trial.new.version, &restored_name(&trial.old)),
+        );
+    }
+}
+
+/// How many crash loops' ends the record keeps unsaid ([`State::unsaid_trial_ends`]): a
+/// release a copy cannot start ends one trial, so more than this many unsaid means no
+/// window has opened on the copy across several releases, and the oldest go.
+const UNSAID_TRIAL_ENDS_KEPT: usize = 4;
+
+/// Keep `words`, one crash loop's end, on the record until a window is told
+/// ([`State::unsaid_trial_ends`]), after any end still unsaid.
+fn keep_unsaid_trial_end(state: &mut State, words: String) {
+    state.unsaid_trial_ends.push(words);
+    let over = state
+        .unsaid_trial_ends
+        .len()
+        .saturating_sub(UNSAID_TRIAL_ENDS_KEPT);
+    state.unsaid_trial_ends.drain(..over);
 }
 
 /// Whether rolling `trial` back ends a crash loop: its starts spent the budget without
@@ -2056,6 +2098,7 @@ fn count_start_locked(
         // checks and applies go on so a newer release can replace it.
         state.trial = None;
         state.kept_unproven = Some(trial.new.build);
+        keep_unsaid_trial_end(state, crate::linux_notice::kept_body(new));
         state.outcome = format!(
             "aterm {new} didn\u{2019}t start properly in {MAX_TRIAL_STARTS} launches, but \
              {restored} can\u{2019}t come back ({refusal}), so aterm {new} stays until a newer \
@@ -2346,8 +2389,14 @@ fn check_locked(
         .as_ref()
         .is_some_and(|trial| trial.phase == Phase::Installed && !trial.healthy)
     {
-        // No check: the channel is not read while a trial is pending. A failure
-        // streak still on record keeps its reason, which is still the last check's.
+        // No check: the channel is not read while a trial is pending. A check holds
+        // the update lock through its download and its probe of the new build, and the
+        // starts that judge the trial wait for that lock at most half a second (no
+        // start stalls on an update), so a check now would leave them uncounted: a
+        // crash loop rolled back later, a healthy start's confirmation lost
+        // (`a_trial_start_made_while_a_check_holds_the_lock_counts_nothing`). A
+        // failure streak still on record keeps its reason, which is still the last
+        // check's.
         if state.failing_checks == 0 {
             state.outcome = format!(
                 "aterm {} is installed \u{2014} the next aterm you start finishes it; update \
@@ -2542,13 +2591,17 @@ fn clear_stage(context: &Context, state: &mut State) -> Result<(), String> {
     Ok(())
 }
 
-/// Why [`automatic_apply_allowed`] holds a stage, read from the same provider.
-fn apply_held_reason(source: &Source, provider: &crate::CheckSettingsProvider) -> &'static str {
+/// Why [`automatic_apply_allowed`] holds a stage, read from the same provider. The
+/// install switch is named as Settings paints it
+/// ([`aterm_update_core::settings::install_switch_off`]), never by its key.
+fn apply_held_reason(source: &Source, provider: &crate::CheckSettingsProvider) -> String {
     match provider() {
-        None => "the update settings couldn\u{2019}t be confirmed",
-        Some(current) if current.source != *source => "the update channel changed during the check",
-        Some(current) if !current.auto_apply => "`[update] auto_apply` is off",
-        Some(_) => "the update settings changed during the check",
+        None => "the update settings couldn\u{2019}t be confirmed".to_string(),
+        Some(current) if current.source != *source => {
+            "the update channel changed during the check".to_string()
+        }
+        Some(current) if !current.auto_apply => aterm_update_core::settings::install_switch_off(),
+        Some(_) => "the update settings changed during the check".to_string(),
     }
 }
 
@@ -2595,7 +2648,7 @@ fn finish_candidate(
     state.staged = Some(identity);
     context.save(state)?;
     if !automatic_apply_allowed(source, provider) {
-        return held_stage(context, state, apply_held_reason(source, provider));
+        return held_stage(context, state, &apply_held_reason(source, provider));
     }
     let mut held = false;
     let result = apply_with_checkpoints(context, state, proof, pins, &mut probe, |at| {
@@ -2611,7 +2664,7 @@ fn finish_candidate(
         // installed. Ordinary recovery abandons that intent without dropping
         // any policy floor or authenticated candidate.
         recover(context, state)?;
-        return held_stage(context, state, apply_held_reason(source, provider));
+        return held_stage(context, state, &apply_held_reason(source, provider));
     }
     result
 }
@@ -2827,9 +2880,51 @@ fn linux_status(context: &Context, state: &State) -> crate::LinuxUpdateStatus {
         trial_starts: state.trial.as_ref().map_or(0, |trial| trial.starts),
         trial_healthy: state.trial.as_ref().is_some_and(|trial| trial.healthy),
         refused_newer: state.rejected_build > state.installed.build,
-        refused_unstarted: state.rejected_build > state.installed.build && state.rejected_unstarted,
-        kept_unproven: state.kept_unproven == Some(state.installed.build),
     }
+}
+
+/// The crash loops' ends no window has been told of yet ([`State::unsaid_trial_ends`]),
+/// oldest first, taken under the update lock so that one check loop says each for the
+/// copy. Empty when there is none, or when the record or the lock cannot be had this
+/// pass: the next pass takes them then. One small unlocked read when there is nothing to
+/// take.
+fn take_unsaid_trial_ends(context: Result<&Context, String>) -> Vec<String> {
+    (|| {
+        let context = context.ok()?;
+        if context.read_state().ok()??.unsaid_trial_ends.is_empty() {
+            return None;
+        }
+        let _lock = context.lock().ok()?;
+        let mut state = context.read_state().ok()??;
+        let said = std::mem::take(&mut state.unsaid_trial_ends);
+        context.save(&state).ok()?;
+        Some(said)
+    })()
+    .unwrap_or_default()
+}
+
+/// Tell the window what one pass of the loop saw ([`crate::linux_notice::Reporter`]):
+/// the check's `status`, `record` and `took_lock`, and the crash loops' ends the copy's
+/// record keeps unsaid. Only a loop with a window to tell (`notify`) takes those: a
+/// terminal session's loop has none, and words it took would be said to nobody and gone
+/// from the record, so it leaves them for the next window's loop.
+fn report_pass(
+    reporter: &mut crate::linux_notice::Reporter,
+    context: Result<&Context, String>,
+    (status, record, took_lock): (crate::UpdateStatus, crate::linux_notice::Record, bool),
+    on_checked: Option<&crate::CheckedNotify>,
+    notify: Option<&crate::HealthNotify>,
+) {
+    let trial_ends = if notify.is_some() {
+        take_unsaid_trial_ends(context)
+    } else {
+        Vec::new()
+    };
+    reporter.report(
+        crate::linux_notice::Pass::of(&status, record, took_lock, &trial_ends),
+        on_checked,
+        notify,
+    );
 }
 
 fn stage_present(context: &Context, state: &State, stage: &Identity) -> bool {
@@ -2891,9 +2986,10 @@ pub(crate) fn spawn_background_check_with_settings(
             );
             let mut reporter = crate::linux_notice::Reporter::new(started);
             loop {
-                let (status, record, took_lock) = check_recording(current_build, &provider, false);
-                reporter.report(
-                    crate::linux_notice::Pass::of(&status, record, took_lock),
+                report_pass(
+                    &mut reporter,
+                    context(),
+                    check_recording(current_build, &provider, false),
                     on_checked.as_ref(),
                     notify.as_ref(),
                 );

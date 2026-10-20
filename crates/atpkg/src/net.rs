@@ -369,6 +369,77 @@ pub fn newest_index(
     }
 }
 
+/// The environment variable a release build compiles [`compiled_index_hint`] from: the
+/// shipped channel's published run as the release cut found it ([`published_index_run`]),
+/// spelled as [`IndexHint`] displays it. `ship release` sets it (aterm-release's build
+/// plan); a development build has none.
+pub const INDEX_HINT_ENV: &str = "ATPKG_INDEX_HINT";
+
+/// What the discovery rounds may GUESS the channel publishes ([`ahead_of_walk`]): the newest
+/// build something saw published, and where the run the walk from no floor finds starts, when
+/// that is known. Never an answer: the walk asks every build it reads, and a hint the channel
+/// has moved past, or one that names no build it publishes, costs HEADs and a round, never a
+/// different index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexHint {
+    /// The first build [`newest_index`] from no floor found published — the run's first
+    /// power of two (8 on the public channel, whose first index is 6), when known.
+    pub low: Option<u64>,
+    /// The newest build seen published.
+    pub newest: u64,
+}
+
+impl IndexHint {
+    /// `<low>..<newest>`, or a bare `<newest>` ([`std::fmt::Display`]'s spellings). `None`
+    /// for anything else, a zero, or a `low` above `newest`.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let number = |digits: &str| digits.parse::<u64>().ok().filter(|&n| n > 0);
+        let (low, newest) = match text.trim().split_once("..") {
+            Some((low, newest)) => (Some(number(low)?), number(newest)?),
+            None => (None, number(text.trim())?),
+        };
+        low.is_none_or(|low| low <= newest)
+            .then_some(Self { low, newest })
+    }
+}
+
+impl std::fmt::Display for IndexHint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.low {
+            Some(low) => write!(f, "{low}..{}", self.newest),
+            None => write!(f, "{}", self.newest),
+        }
+    }
+}
+
+/// The published run this binary's release cut compiled in ([`INDEX_HINT_ENV`]); `None` in
+/// a development build, or for a value [`IndexHint::parse`] refuses.
+#[must_use]
+pub fn compiled_index_hint() -> Option<IndexHint> {
+    option_env!("ATPKG_INDEX_HINT").and_then(IndexHint::parse)
+}
+
+/// The shipped channel's published run, found as a store that has verified nothing finds it:
+/// [`newest_index`] from no floor over HEADs of the download host, each read as discovery
+/// reads it — what a release cut compiles in ([`INDEX_HINT_ENV`]). A HEAD at a time: a cut
+/// asks once.
+///
+/// # Errors
+/// The first HEAD that said neither, or `no atpkg-index release is published`.
+pub fn published_index_run() -> Result<IndexHint, String> {
+    let mut slug = String::from(aterm_update_core::ATPKG_INDEX_OWNER);
+    slug.push('/');
+    slug.push_str(crate::manifest::INDEX_REPO);
+    let (newest, low) = newest_index(0, &mut |build| {
+        head_verdict(&slug, build, &Wire).map_err(|(msg, _)| msg)
+    })?;
+    Ok(IndexHint {
+        low: Some(low),
+        newest,
+    })
+}
+
 /// The four DERIVED download URLs of one index release: the index, its machine signature,
 /// and the master-signed roster and its signature beside them.
 #[derive(Debug)]
@@ -663,29 +734,51 @@ fn probe_round(slug: &str, round: &[u64], head: &HeadFn<'_>) -> Vec<HeadVerdict>
 /// — and FORKS where they do not, both answers explored breadth first. So a fresh store's
 /// seventeen HEADs in turn are three rounds.
 ///
-/// `hint` is the highest build this store's §14 cache holds ([`GithubFetcher::with_index_hint`]):
-/// published when it was downloaded, so once a published build at or below it is seen, every
-/// build between the two is guessed published (the run is contiguous), and past it, with no
-/// answer there yet, "absent" — the steady state's guess, where the walk otherwise forks. A
-/// fresh store holding a cache then walks in two rounds; a hint the channel has since moved
-/// past costs HEADs, never a different answer.
+/// `hint` ([`GithubFetcher::with_index_hint`]) names a build something saw published — the
+/// highest this store's §14 cache holds, the one the release cut compiled in, the one the
+/// window's probe woke this pass for — so once a published build at or below it is seen,
+/// every build between the two is guessed published (the run is contiguous), and past it,
+/// with no answer there yet, "absent" — the steady state's guess, where the walk otherwise
+/// forks. And with nothing seen yet it guesses the whole first round where it knows where
+/// the run starts: the store's floor, or the run's first power of two the cut compiled in
+/// ([`IndexHint::low`]). From there to the hint is published, past it absent, so a fresh
+/// store meets a channel that has not moved since its release cut, and a floor one index
+/// behind, in one round.
+///
+/// A hint is usually some builds behind the channel by the time it is asked — a release
+/// cut's, days later at a first install — so the room such a guessed round leaves goes to
+/// the HEADs the walk would ask next were the channel 1, 2, 4, … builds past the hint, its
+/// own gallop, while room lasts. Their answers bracket where the channel went, and the round
+/// after them finishes the walk: a fresh store whose cut saw atpkg-index-71 meets any channel
+/// from 72 to 103 in two rounds, where the guess alone took three. A hint the channel has
+/// since moved past costs HEADs, never a different answer.
 fn ahead_of_walk(
     floor: u64,
     need: u64,
     known: &std::collections::BTreeMap<u64, HeadVerdict>,
     room: usize,
-    hint: Option<u64>,
+    hint: Option<IndexHint>,
 ) -> Vec<u64> {
+    // A hint at or below the floor names nothing the floor does not — the window's probe
+    // build a pass verified since it woke this one — and guessing from it would fill the
+    // steady state's round of two HEADs to `room`.
+    let hint = hint.filter(|h| floor == 0 || h.newest > floor);
     let top = known
         .iter()
         .filter(|(_, v)| matches!(v, Ok(true)))
         .map(|(b, _)| *b)
         .max();
+    // Where the published run starts, when known: the walk asks only above a floor, and from
+    // none it searches the powers of two for the first published one.
+    let run = hint.and_then(|h| {
+        let low = if floor > 0 { Some(floor) } else { h.low };
+        low.map(|low| low..=h.newest)
+    });
     let guess = |build: u64| -> Option<bool> {
         let Some(top) = top else {
-            return Some(false);
+            return Some(run.as_ref().is_some_and(|run| run.contains(&build)));
         };
-        let hinted = hint.filter(|&h| h >= top);
+        let hinted = hint.map(|h| h.newest).filter(|&h| h >= top);
         if build <= hinted.unwrap_or(top) {
             return Some(true);
         }
@@ -734,6 +827,38 @@ fn ahead_of_walk(
             }
         }
     }
+    // The guesses above followed the hint: the room they left goes to the channel having
+    // moved 1, 2, 4, … builds past it, from where the run starts (`low`, or wherever the
+    // answers already say once something published is seen).
+    let moved_from = match (hint, top) {
+        (Some(h), None) => run.as_ref().map(|run| (*run.start(), h.newest)),
+        (Some(h), Some(top)) if h.newest >= top => Some((0, h.newest)),
+        _ => None,
+    };
+    if let Some((low, newest)) = moved_from {
+        let mut moved = 1u64;
+        while want.len() < room && moved <= FIRST_INDEX_SEARCH_LIMIT {
+            let past = newest.saturating_add(moved);
+            let mut asked = 0u32;
+            let _ = newest_index(floor, &mut |build| {
+                asked += 1;
+                if asked > WALK_HEAD_BUDGET {
+                    return Err(String::new());
+                }
+                if let Some(verdict) = known.get(&build) {
+                    return verdict.clone().map_err(|_| String::new());
+                }
+                if !want.contains(&build) {
+                    if want.len() >= room {
+                        return Err(String::new());
+                    }
+                    want.push(build);
+                }
+                Ok((low..=past).contains(&build))
+            });
+            moved = moved.saturating_mul(2);
+        }
+    }
     want.truncate(room.max(1));
     want
 }
@@ -770,9 +895,9 @@ pub struct GithubFetcher {
     /// [`crate::index_probe::verified_floor`]) — where the discovery walk counts from. `0`
     /// (the default) is none: the walk then looks for the first build the channel publishes.
     index_floor: u64,
-    /// The highest index build this store's §14 cache holds, when it holds one above the
-    /// floor ([`Self::with_index_hint`]): a guess the discovery rounds follow, never an answer.
-    index_hint: Option<u64>,
+    /// A build something saw published, and where the run starts when that is known
+    /// ([`Self::with_index_hint`]): a guess the discovery rounds follow, never an answer.
+    index_hint: Option<IndexHint>,
     /// Whether the last discovery's HEAD failed on the LINK (curl reached no host) — what
     /// [`crate::flow::Fetcher::index_link_down`] reads.
     link_down: std::sync::atomic::AtomicBool,
@@ -823,10 +948,10 @@ impl GithubFetcher {
         self
     }
 
-    /// Attach the highest index build this store's §14 cache holds: the discovery rounds
-    /// guess from it ([`ahead_of_walk`]); the walk's answer never rests on it.
+    /// Attach what this store may guess the channel publishes ([`IndexHint`]): the discovery
+    /// rounds guess from it ([`ahead_of_walk`]); the walk's answer never rests on it.
     #[must_use]
-    pub fn with_index_hint(mut self, hint: Option<u64>) -> Self {
+    pub fn with_index_hint(mut self, hint: Option<IndexHint>) -> Self {
         self.index_hint = hint;
         self
     }
@@ -1934,10 +2059,10 @@ mod tests {
         walk_with(floor, None, answer, missing)
     }
 
-    /// [`walk`] by a fetcher whose cache holds `hint` ([`GithubFetcher::with_index_hint`]).
+    /// [`walk`] by a fetcher that guesses from `hint` ([`GithubFetcher::with_index_hint`]).
     fn walk_with(
         floor: u64,
-        hint: Option<u64>,
+        hint: Option<IndexHint>,
         answer: &(
              dyn Fn(u64) -> Result<aterm_update_core::HeadAnswer, aterm_update_core::HttpError>
                  + Sync
@@ -2637,21 +2762,59 @@ mod tests {
                 first + next(last - first + 1)
             );
             let up = move |b: u64| (first..=last).contains(&b) && !holes.contains(&b);
-            // The cache's highest build, when the store holds one: in the run, at its top,
-            // behind it, or above it — a guess the rounds follow, never the answer.
-            let hint = match next(5) {
+            // A build seen published, when there is one: in the run, at its top, behind it,
+            // or above it — and where the run starts, right, wrong, or unknown. A guess the
+            // rounds follow, never the answer.
+            let newest = match next(5) {
                 0 => None,
                 1 => Some(first + next(last - first + 1)),
                 2 => Some(last),
                 3 => Some(first.saturating_sub(next(3))),
                 _ => Some(last + 1 + next(50)),
             };
+            let low = match next(3) {
+                0 => None,
+                1 => Some(first.next_power_of_two()),
+                _ => Some(1 + next(last + 10)),
+            };
+            let hint = newest.map(|newest| IndexHint { low, newest });
             walk_with(
                 floor,
                 hint,
                 &move |b| if up(b) { published() } else { absent() },
                 &[missing.as_str()],
             );
+        }
+    }
+
+    /// The run a release cut compiles in (`ATPKG_INDEX_HINT`) reads back as that run; a value
+    /// that names no run reads as no hint, and the binary walks as a development build does.
+    #[test]
+    fn a_compiled_index_hint_reads_back_or_is_no_hint() {
+        let run = IndexHint {
+            low: Some(8),
+            newest: 72,
+        };
+        assert_eq!(IndexHint::parse(&run.to_string()), Some(run));
+        assert_eq!(
+            IndexHint::parse(" 72\n"),
+            Some(IndexHint {
+                low: None,
+                newest: 72
+            })
+        );
+        for refused in [
+            "",
+            "0",
+            "x",
+            "9..8",
+            "0..8",
+            "8..",
+            "..8",
+            "-1..8",
+            "8..72..80",
+        ] {
+            assert_eq!(IndexHint::parse(refused), None, "{refused:?}");
         }
     }
 
@@ -2664,8 +2827,8 @@ mod tests {
     #[test]
     fn discovery_takes_a_few_rounds_where_the_walk_takes_many_heads() {
         /// Rounds and HEADs from `floor` to a channel publishing 6 to `newest`, guessing from
-        /// a cache holding `hint`.
-        fn hinted_rounds(floor: u64, newest: u64, hint: Option<u64>) -> (usize, usize) {
+        /// `hint`.
+        fn hinted_rounds(floor: u64, newest: u64, hint: Option<IndexHint>) -> (usize, usize) {
             let mut known = std::collections::BTreeMap::<u64, HeadVerdict>::new();
             let mut rounds = 0;
             loop {
@@ -2717,18 +2880,63 @@ mod tests {
         // landed nothing) guesses from the cache's highest build: one round fewer when the
         // channel has not moved since, the same answer and no more than the walk's bound of
         // rounds when it has, or when the hint is no build the channel publishes.
+        let seen = |newest| Some(IndexHint { low: None, newest });
         assert_eq!(
-            hinted_rounds(0, 71, Some(71)).0,
+            hinted_rounds(0, 71, seen(71)).0,
             2,
             "first contact, cache current"
         );
-        assert_eq!(walk_with(0, Some(71), &channel(6, 71), &[]).rounds, 2);
+        assert_eq!(walk_with(0, seen(71), &channel(6, 71), &[]).rounds, 2);
         for (newest, hint) in [(72, 71), (75, 71), (140, 71), (71, 90), (71, 3), (300, 299)] {
             assert!(
-                hinted_rounds(0, newest, Some(hint)).0 <= 5,
+                hinted_rounds(0, newest, seen(hint)).0 <= 5,
                 "{newest} hinted {hint}"
             );
         }
+        // A fresh install whose release cut compiled in the run it saw (atpkg-index-8 to 71,
+        // `ship release`'s ATPKG_INDEX_HINT) guesses its whole first round: one round while the
+        // channel has not moved since, two while it moved up to 32 builds on; and a floor one
+        // index behind that the window's probe woke for the next one walks in one round, not two.
+        let run = |newest| {
+            Some(IndexHint {
+                low: Some(8),
+                newest,
+            })
+        };
+        assert_eq!(
+            hinted_rounds(0, 71, run(71)),
+            (1, 20),
+            "first contact, release-cut run current"
+        );
+        assert_eq!(walk_with(0, run(71), &channel(6, 71), &[]).rounds, 1);
+        for newest in 72..=103 {
+            assert_eq!(hinted_rounds(0, newest, run(71)).0, 2, "moved to {newest}");
+        }
+        // The cache's hint buys the same once the channel moved past it: two rounds to 76,
+        // three past it, where its guess alone took four from 73 on.
+        for newest in 71..=103 {
+            let want = if newest <= 76 { 2 } else { 3 };
+            assert_eq!(
+                hinted_rounds(0, newest, seen(71)).0,
+                want,
+                "cache, {newest}"
+            );
+        }
+        assert_eq!(hinted_rounds(70, 71, seen(71)).0, 1, "one behind, woken");
+        assert_eq!(walk_with(70, seen(71), &channel(6, 71), &[]).rounds, 1);
+        // A probe build at or below the floor (a pass verified it since the probe woke this
+        // one) is no hint: the steady state's one round of two HEADs.
+        for hint in [71, 70, 3] {
+            assert_eq!(
+                hinted_rounds(71, 71, seen(hint)),
+                (1, 2),
+                "floor 71, hint {hint}"
+            );
+        }
+        assert_eq!(
+            walk_with(71, seen(71), &channel(6, 71), &[]).headed,
+            [72, 73]
+        );
     }
 
     /// HEADs whose first attempts are scripted apart from the rest ([`Heads`]), each call
@@ -2872,6 +3080,119 @@ mod tests {
             );
             assert_eq!(heads.downs.load(std::sync::atomic::Ordering::Relaxed), 0);
         }
+    }
+
+    /// The scratch directory [`probe_a_first_round_over_counted_curl`] runs in, set only for
+    /// the child [`a_first_rounds_curls_are_one_per_head_offline_and_whole_online`] starts.
+    #[cfg(unix)]
+    const LINK_PROBE_ENV: &str = "ATPKG_TEST_LINK_PROBE_DIR";
+    /// That probe's name, as `--exact` wants it.
+    #[cfg(unix)]
+    const LINK_PROBE: &str = "net::tests::probe_a_first_round_over_counted_curl";
+
+    /// The child's half: a first round of three HEADs over the PRODUCTION transport ([`Wire`],
+    /// [`aterm_update_core::head_no_redirect_first`]), its curl the counting wrapper the
+    /// parent laid ([`aterm_update_core::CURL_SEAM`]), then one whole HEAD of a fourth build —
+    /// what the round's link verdict leaves a request after it. Nothing without the parent's
+    /// directory.
+    #[cfg(unix)]
+    #[test]
+    fn probe_a_first_round_over_counted_curl() {
+        let Some(dir) = std::env::var_os(LINK_PROBE_ENV) else {
+            return;
+        };
+        let slug = "alabsystems/aterm";
+        let round = probe_round(slug, &[1, 2, 4], &Wire);
+        let after = aterm_update_core::head_no_redirect(&index_head_url(slug, 8).unwrap());
+        let said = |verdict: &HeadVerdict| match verdict {
+            Ok(published) => format!("ok {published}"),
+            Err((_, link_down)) => format!("err link_down={link_down}"),
+        };
+        let mut out: Vec<String> = round.iter().map(said).collect();
+        out.push(match after {
+            Ok(answer) => format!("after {}", answer.code),
+            // The class, not curl's words: a link held down fails as a transport error.
+            Err(aterm_update_core::HttpError::Transport(_)) => "after err transport".into(),
+            Err(e) => format!("after err {e:?}"),
+        });
+        std::fs::write(PathBuf::from(dir).join("verdicts"), out.join("\n")).unwrap();
+    }
+
+    /// PKG-4'S LINK PROBE, COUNTED IN PROCESSES. The first round runs in a child of this test
+    /// binary ([`probe_a_first_round_over_counted_curl`]) whose every curl is a wrapper that
+    /// logs its URL and answers as the scenario says. On a dead link (every attempt exits 7,
+    /// no host) the round spends exactly ONE curl per HEAD, and the link it then holds down
+    /// answers the next request in one more. On a live one (two HEADs answer 404, the third
+    /// reaches no host) that third HEAD still gets attempts two and three — the round's
+    /// answers say the link is up — and the others one each.
+    #[cfg(unix)]
+    #[test]
+    fn a_first_rounds_curls_are_one_per_head_offline_and_whole_online() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let run = |scenario: &str| -> (std::collections::BTreeMap<u64, usize>, Vec<String>) {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let wrapper = dir.path().join("curl");
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nfor a; do url=$a; done\necho \"$url\" >> '{log}'\n\
+                     case {scenario}:$url in\n\
+                     offline:*|online:*/atpkg-index-4/*) echo 'curl: (7) Failed to connect' >&2; exit 7 ;;\n\
+                     esac\nprintf 'HTTP/2 404\\r\\n\\r\\n\\n404 0.042'\n",
+                    log = dir.path().join("calls").display(),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let out = aterm_uds::spawnfd::command(std::env::current_exe().unwrap())
+                .args(["--exact", "--nocapture", LINK_PROBE])
+                .env(LINK_PROBE_ENV, dir.path())
+                .env(aterm_update_core::CURL_SEAM, &wrapper)
+                .stdin(aterm_uds::spawnfd::Stdio::null())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "{scenario}: {}\n{stdout}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let mut curls = std::collections::BTreeMap::new();
+            for url in std::fs::read_to_string(dir.path().join("calls"))
+                .unwrap()
+                .lines()
+            {
+                *curls.entry(walked_build(url)).or_insert(0) += 1;
+            }
+            let verdicts = std::fs::read_to_string(dir.path().join("verdicts")).unwrap();
+            (curls, verdicts.lines().map(str::to_string).collect())
+        };
+        let (curls, verdicts) = run("offline");
+        assert_eq!(
+            curls,
+            [(1, 1), (2, 1), (4, 1), (8, 1)].into(),
+            "offline: one curl per HEAD, then the link is held down"
+        );
+        assert_eq!(
+            verdicts,
+            [
+                "err link_down=true",
+                "err link_down=true",
+                "err link_down=true",
+                "after err transport",
+            ]
+        );
+        let (curls, verdicts) = run("online");
+        assert_eq!(
+            curls,
+            [(1, 1), (2, 1), (4, 3), (8, 1)].into(),
+            "online: the unreached HEAD keeps attempts two and three"
+        );
+        assert_eq!(
+            verdicts,
+            ["ok false", "ok false", "err link_down=true", "after 404"]
+        );
     }
 
     /// THE MANIFEST PREFETCH: both halves of every pinned pair asked at once, each under its

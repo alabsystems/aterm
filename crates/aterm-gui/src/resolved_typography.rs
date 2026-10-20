@@ -53,7 +53,7 @@ pub(crate) struct TypeShadow {
     /// Who beat it.
     pub(crate) origin: TypeOrigin,
     /// What beat it, as a person would look for it: the aterm.toml key
-    /// (`font_family`, `display_font`) or the flag (`--font`).
+    /// (`font_family`) or the flag (`--font`).
     pub(crate) by: &'static str,
 }
 
@@ -142,9 +142,6 @@ impl Config {
                 Some((TypeOrigin::Flag, "--font"))
             } else if config_sets(self, spec.key) {
                 Some((TypeOrigin::Config, spec.name))
-            } else if spec.key == ThemeKey::FontFamily && self.font_family_request().is_some() {
-                // `display_font` outranks any family (font_family_request).
-                Some((TypeOrigin::Config, "display_font"))
             } else {
                 None
             };
@@ -394,8 +391,8 @@ mod tests {
     }
 
     /// `--font` beats a theme's family (reported as a flag shadow), and a
-    /// config `display_font` keeps the family request while the theme's
-    /// family is shadowed by it.
+    /// config `display_font` draws its layer over the theme's family, which
+    /// stays the font.
     #[test]
     fn flag_and_display_font_beat_a_theme_family() {
         let themes = catalog("font_family = Berkeley Mono");
@@ -415,13 +412,14 @@ mod tests {
             crate::effective_font_family_with(Some("Menlo"), view.font_family_request().as_deref()),
             Some("Menlo".to_string())
         );
+        // A display face is a layer over the font, never the font: the
+        // theme's family is still the font under `display_font`.
         let display = cfg("theme = \"Studio\"\ndisplay_font = \"pixel\"\n");
         let typo = display.resolved_typography_with_flag(Appearance::Dark, &themes, None);
-        assert_eq!(typo.shadowed[0].by, "display_font");
-        assert_eq!(
-            typo.overlay(&display).font_family_request().as_deref(),
-            Some("display:pixel")
-        );
+        assert!(typo.shadowed.is_empty());
+        let view = typo.overlay(&display);
+        assert_eq!(view.font_family_request().as_deref(), Some("Berkeley Mono"));
+        assert_eq!(view.display_faces_request(), ["pixel"]);
         // Negative control: with neither, the theme's family is requested.
         let typo = config.resolved_typography_with_flag(Appearance::Dark, &themes, None);
         assert_eq!(

@@ -22,8 +22,8 @@ fn key(character: char, mods: Modifiers) -> InputEvent {
 
 #[test]
 fn native_text_key_skips_the_terminal_lock_state_rpc() {
-    use winit::event::{ElementState, KeyEvent};
-    use winit::keyboard::{Key as WinitKey, KeyCode, KeyLocation, PhysicalKey, SmolStr};
+    use aterm_window::event::{ElementState, KeyEvent};
+    use aterm_window::keyboard::{Key as WinitKey, KeyCode, KeyLocation, PhysicalKey, SmolStr};
 
     static RPC: AtomicUsize = AtomicUsize::new(0);
     fn counting_lock_modifiers() -> Modifiers {
@@ -186,7 +186,7 @@ fn editor_cmd_s_and_cmd_z_reduce_before_the_terminal_boundary() {
 
 #[test]
 fn native_repeat_replays_exact_press_view_and_never_the_replacement_tab() {
-    use winit::keyboard::{KeyCode, PhysicalKey};
+    use aterm_window::keyboard::{KeyCode, PhysicalKey};
 
     let dir = std::env::temp_dir().join(format!(
         "aterm-native-repeat-{}-{:?}",

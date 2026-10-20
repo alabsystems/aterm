@@ -8,11 +8,15 @@
 # `getrandom` to take ring's `getrandom = "0.2.10"` edge; the directory keeps
 # the `aterm-` prefix so nobody mistakes this for a vendored upstream.
 name = "getrandom"
-# NOT `version.workspace = true`: a SEMVER CONTRACT with the consumers. ring
-# 0.17.14 asks `^0.2.10` and astream-aead (aterm's `sealed` feature) `^0.2`;
-# 0.2.17 is what the lock held before the swap and upstream's latest 0.2. It
-# must stay >= every other `0.2.x` in the graph, or cargo resolves the registry
-# copy and the patch row replaces nothing with no warning
+# Integration tests are declared below, not discovered: the files are modules of
+# one suite binary where they can share a process. With autotests off a
+# `tests/*.rs` file listed nowhere never compiles.
+autotests = false
+# NOT `version.workspace = true`: a SEMVER CONTRACT with the consumer. ring
+# 0.17.14 asks `^0.2.10`; 0.2.17 is what the lock held before the swap and
+# upstream's latest 0.2. It must stay >= every other `0.2.x` in the graph, or
+# cargo resolves the registry copy and the patch row replaces nothing with no
+# warning
 # (`targo --unverified forge check` [OB-12] says so). getrandom 0.3 and 0.4 are
 # other majors and stay registry packages; neither is in a shipped cell.
 version = "0.2.17"
@@ -64,6 +68,10 @@ aterm-uds = { workspace = true }
 # not patched, and a registry getrandom cannot be a dev-dependency here (the
 # patch would capture it; `forge check` [OB-15]).
 ring = { workspace = true }
+
+[[test]]
+name = "getrandom_suite"
+path = "tests/getrandom_suite.rs"
 
 [lints]
 workspace = true

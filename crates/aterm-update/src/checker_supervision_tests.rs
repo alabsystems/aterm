@@ -38,13 +38,15 @@ fn args(provider: crate::SourceProvider) -> CheckerArgs {
         staged_hook: std::sync::Mutex::new(None),
         settings_retry: Duration::ZERO,
         staging: Arc::new(|| None),
-        checker_lock_wait: Duration::from_millis(200),
+        checker_lock_wait: Duration::from_millis(20),
         checker_ungated_after: crate::checker_watch::CHECKER_UNGATED_AFTER,
         // Never the network: a check that finds nothing to do.
         check: Arc::new(|_, _| Ok(None)),
         pause: Some(Duration::ZERO),
         // Nothing here posts to it; the wake test brings its own.
         wake: &UNPOSTED,
+        // A wake's settle is a pause no assertion here can see.
+        wake_settle: Duration::from_millis(10),
     }
 }
 
@@ -54,7 +56,7 @@ static UNPOSTED: crate::cadence::WakeSignal = crate::cadence::WakeSignal::new();
 /// A POSTED WAKE ENDS THE LOOP'S WAIT, AND THE CHECK AFTER IT KNOWS. The window posts
 /// `NSWorkspaceDidWakeNotification` to the loop's signal; the loop's wait — here a
 /// ten-minute pause no check outlives within this test's one-minute hang detector —
-/// ends at once, the loop settles (`cadence::WAKE_SETTLE`) and checks again, and that
+/// ends at once, the loop settles (`wake_settle`) and checks again, and that
 /// check runs inside the wake's grace (`check_follows_wake`, which books a failed
 /// asset GET as `network`). The post lands during the first check, as a lid closed
 /// mid-check posts it, and still ends the wait after it. Negative controls: the check
@@ -108,6 +110,85 @@ fn a_posted_wake_ends_the_wait_and_the_next_check_follows_it() {
         "only the check after the wake follows it"
     );
     assert!(!crate::check_follows_wake(), "no scope, no wake");
+}
+
+/// A CHECK THAT FAILS INSIDE A WAKE'S GRACE IS A NETWORK STILL COMING UP, whatever it
+/// failed on: the loop dates the wake its wait ended on and books that failure offline
+/// (`cadence::after_wake` into `cadence::note_failure`) — the quick rung, said at INFO —
+/// where the same kind of failure with no wake behind it lengthens the backoff and is
+/// warned. Driven through the real loop: the first check fails before any wake while the
+/// lid closes and opens (a post), the loop's wait ends on that post and settles, and the
+/// second check fails inside the grace. The loop's own lines are read on its thread
+/// (`log_capture` is per thread), from the settings hook of the cycle after. Negative
+/// controls: a loop that books the failure by the channel alone, or that never dates the
+/// wake it settled, warns the second failure too.
+#[test]
+fn a_check_that_fails_inside_a_wakes_grace_is_booked_offline() {
+    const BEFORE: &str = "curl: (35) TLS connect error before the lid closed";
+    const AFTER: &str = "curl: (35) TLS connect error after the lid opened";
+    let _turn = LANE_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    static WATCH: CheckerWatch = CheckerWatch::new();
+    static WAKE: crate::cadence::WakeSignal = crate::cadence::WakeSignal::new();
+    let generation = WATCH.register(1_000);
+    let lines: Arc<Mutex<Vec<(aterm_log::Level, String)>>> = Arc::default();
+    let mut loop_args = args({
+        let (lines, asked) = (Arc::clone(&lines), Arc::new(AtomicU64::new(0)));
+        Arc::new(move || {
+            if asked.fetch_add(1, Ordering::SeqCst) == 2 {
+                *lines.lock().unwrap() = crate::log_capture::take();
+                WATCH.supersede(generation);
+            }
+            Some(source())
+        })
+    });
+    // Short: the wait after the second check ends on its own. The first ends on the post.
+    loop_args.pause = Some(Duration::from_millis(10));
+    loop_args.wake = &WAKE;
+    loop_args.check = {
+        let checks = Arc::new(AtomicU64::new(0));
+        Arc::new(move |_, _| {
+            if checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                // The lid closes and opens while this check runs.
+                WAKE.post();
+                Err(BEFORE.to_string())
+            } else {
+                Err(AFTER.to_string())
+            }
+        })
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(crate::run_checker(&WATCH, generation, &loop_args));
+    });
+    // A hang detector, not a latency budget: the second check is the settle away.
+    let exit = rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    let lines = lines.lock().unwrap().clone();
+    assert_eq!(
+        exit.ok(),
+        Some(CheckerExit::Superseded {
+            phase: CheckerPhase::Settings
+        }),
+        "the loop must reach a third cycle: {lines:?}"
+    );
+    let said = |level: aterm_log::Level, message: &str| {
+        lines
+            .iter()
+            .any(|(at, line)| *at == level && line == &format!("update check failed: {message}"))
+    };
+    assert!(
+        said(aterm_log::Level::Warn, BEFORE),
+        "a failure with no wake behind it is warned: {lines:?}"
+    );
+    assert!(
+        said(aterm_log::Level::Info, AFTER),
+        "a failure inside the wake's grace is said at INFO: {lines:?}"
+    );
+    assert!(
+        !said(aterm_log::Level::Warn, AFTER),
+        "and is not warned: {lines:?}"
+    );
 }
 
 /// A WAKE THAT ENDS THE WAIT AFTER A PANICKED CYCLE IS SETTLED AND ANSWERED, as at
@@ -212,7 +293,7 @@ fn the_loop_defers_each_cycle_a_sibling_holds_the_checker_lock_and_resumes_when_
                 // The sibling finishes its check: it lets go of the lock and leaves
                 // its receipt, so the next cycle gets the lock and skips the
                 // network as the machine's check is already done. The next cycle
-                // waits only `checker_lock_wait` (200 ms) for it, less than one
+                // waits only `checker_lock_wait` (20 ms) for it, less than one
                 // spawn under load can hold a copied descriptor, so this relies on
                 // the release being deterministic: `FileLock`'s drop is `LOCK_UN`.
                 drop(sibling.lock().unwrap().take());

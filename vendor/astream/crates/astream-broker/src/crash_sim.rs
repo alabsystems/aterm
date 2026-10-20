@@ -77,7 +77,10 @@
 //! OLDER BUILD's records appended above the floor after a revert (P2, P3, P4, and never
 //! a refusal the rules before the floor would not make), record frames PLANTED inside
 //! record bodies (the sweep's properties, P1 above all), a restored copy (P7), and an
-//! open that dies between phase 1 and its cut.
+//! open that cuts on what the next open cannot re-derive — the inputs the sweep's opens
+//! never take: a `Lossy` state, an embedder's prepare, a repair (of a FORMAT 1 log too),
+//! a tier other than the last run's, rot in the newest batch in the run's own boot — and
+//! dies at any point of its cut.
 //!
 //! # Negative controls
 //!
@@ -829,13 +832,25 @@ fn opts(tier: Durability, boot: [u8; 16], c: &Controls) -> OpenOptions {
 }
 
 fn open(sim: &Sim, tier: Durability, boot: [u8; 16], c: &Controls) -> std::io::Result<BrokerLog> {
+    open_as(sim, tier, boot, c, false, None)
+}
+
+/// [`open`], as a `repair`, or with the embedder's `prepared` unclean verdict.
+fn open_as(
+    sim: &Sim,
+    tier: Durability,
+    boot: [u8; 16],
+    c: &Controls,
+    repair: bool,
+    prepared: Option<&str>,
+) -> std::io::Result<BrokerLog> {
     let (mut log, _) = BrokerLog::open_core(
         Storage::Sim(sim.clone()),
         &opts(tier, boot, c),
-        false,
+        repair,
         None,
         AntiRollbackMode::Off,
-        || Ok(Prepared::Nothing),
+        || Ok(prepared.map_or(Prepared::Nothing, |why| Prepared::Unclean(why.to_string()))),
     )?;
     log.unsealed_writer = c.unsealed_writer;
     Ok(log)
@@ -1344,6 +1359,45 @@ impl Report {
         }
     }
 
+    /// Add a [`sweep_part`]'s report to this one: every tally summed, and its examples
+    /// kept while this report holds fewer than three of that property's.
+    fn absorb(&mut self, other: Report) {
+        let Report {
+            recoveries,
+            refusals,
+            lost,
+            lost_ordered,
+            moved,
+            with_lineage,
+            points_every,
+            points_sampled,
+            short_writes,
+            held,
+            counts,
+            examples,
+        } = other;
+        self.recoveries += recoveries;
+        self.refusals += refusals;
+        self.lost += lost;
+        self.lost_ordered += lost_ordered;
+        self.moved += moved;
+        self.with_lineage += with_lineage;
+        self.points_every += points_every;
+        self.points_sampled += points_sampled;
+        self.short_writes += short_writes;
+        self.held += held;
+        for (property, n) in counts {
+            *self.counts.entry(property).or_insert(0) += n;
+        }
+        let property = |e: &str| e.split(' ').next().unwrap_or_default().to_string();
+        for e in examples {
+            let p = property(&e);
+            if self.examples.iter().filter(|x| property(x) == p).count() < 3 {
+                self.examples.push(e);
+            }
+        }
+    }
+
     fn count_points(&mut self, every: bool) {
         if every {
             self.points_every += 1;
@@ -1438,8 +1492,46 @@ fn start(w: &Workload, c: &Controls) -> (Sim, Vec<Generation>) {
 /// `budget` images; process crash: the state itself), recover, check; and for one in
 /// `second_every` recoveries, write two more batches on the recovered log and crash
 /// THAT run at every state too, checking across both crashes.
+///
+/// The workloads are dealt round-robin to [`PARTS`] threads, each a [`sweep_part`] of
+/// its own share in order under its own fixed seed, and the reports summed: every
+/// workload is still crashed at every state and every power-loss subset is still
+/// taken wherever the budget allows. Only the images a crash point beyond the budget
+/// samples, and which recoveries are crashed a second time, come from the part's
+/// seed rather than from one seed threaded through every workload.
 fn sweep(
     workloads: &[Workload],
+    budget: usize,
+    second_every: usize,
+    c: &Controls,
+    seed: u64,
+) -> Report {
+    std::thread::scope(|s| {
+        let parts: Vec<_> = (0..PARTS)
+            .map(|p| {
+                let mine: Vec<&Workload> = workloads.iter().skip(p).step_by(PARTS).collect();
+                let seed = seed ^ (p as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                s.spawn(move || sweep_part(&mine, budget, second_every, c, seed))
+            })
+            .collect();
+        let mut report = Report::default();
+        for part in parts {
+            report.absorb(
+                part.join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            );
+        }
+        report
+    })
+}
+
+/// How many threads a [`sweep`] deals its workloads to. Fixed, never the machine's
+/// core count, so what a sweep samples does not depend on where it runs.
+const PARTS: usize = 8;
+
+/// One part of a [`sweep`]: its workloads in order, one seed threaded through them.
+fn sweep_part(
+    workloads: &[&Workload],
     budget: usize,
     second_every: usize,
     c: &Controls,
@@ -2138,65 +2230,181 @@ fn a_record_frame_inside_a_body_never_refuses_a_torn_batch() {
     assert!(report.recoveries > 0, "{report}");
 }
 
-/// An open that holds the unclean verdict for a reason the boot rule cannot re-derive —
-/// the run's `Lossy` state — writes phase 1 and dies before its cut. The next open, in
-/// the same boot, must make the SAME cut under the same identity: phase 1 remembers the
-/// verdict. Forgetting it, that open resyncs the hole the first one cut at, finds the
-/// later batch behind it, and refuses the log.
+/// An open that cuts on a verdict the next open cannot re-derive from the device and the
+/// boot, and dies (a process crash: the same boot) at ANY point after it first touched
+/// the device: the next plain open makes the SAME cut under the identity and lineage the
+/// first one settled. Phase 1 is what remembers what the dead open decided by — the
+/// run's `Lossy` state (which phase 1 replaces), the embedder's one-shot prepare, the
+/// tier the LAST run served where this open asks another, the floor it cut to on a log
+/// whose sidecar recorded none, and the absence of any verdict — and the move a repair's
+/// cut made. Forgetting the verdict, the next open resyncs the hole the first one cut
+/// at, finds the later batch behind it and refuses the log; forgetting the move, it
+/// finds the log already cut and serves it under the identity it had; reading this
+/// open's tier as the last run's, it cuts a torn Strict batch at its first damage
+/// instead of its start, keeping records no client was acked, and moves the generation
+/// twice; holding a verdict the first open did not, it keeps the torn batch's intact
+/// records the first one cut; with no floor at the cut, it judges the damage by the
+/// batch seals from offset 0 and cuts below the repair's cut.
 #[test]
 fn a_cut_that_died_after_phase_1_is_made_again_under_the_same_verdict() {
     let c = Controls::default();
-    let tier = Durability::Relaxed;
+    let (relaxed, strict) = (Durability::Relaxed, Durability::Strict);
     let mut g = Gen::new(0);
-    let batches = vec![g.batch(1, false), g.batch(2, false), g.batch(1, false)];
-    let w = Workload {
-        tier,
-        block: 16,
-        prefix: false,
-        batches: batches.clone(),
-        after: Vec::new(),
-        close: false,
+    let batches = [g.batch(1, false), g.batch(2, false), g.batch(1, false)];
+    // How the run's sidecar is left: as it wrote it; `Lossy`, a full durability flush
+    // failed while it served; or in FORMAT 1 (the release before), which has no floor.
+    #[derive(Clone, Copy)]
+    enum Side {
+        Recorded,
+        Lossy,
+        Format1,
+    }
+    // A run of `tier` in BOOT_A, then every byte it wrote landed but four: inside
+    // record 1 (batch 1..=2) with batch 3 intact behind, or, `torn`, the last four of
+    // batch 2 with batch 3 never written.
+    let damaged = |tier: Durability, torn: bool, side: Side| {
+        let batches = &batches[..if torn { 2 } else { 3 }];
+        let w = Workload {
+            tier,
+            block: 16,
+            prefix: false,
+            batches: batches.to_vec(),
+            after: Vec::new(),
+            close: false,
+        };
+        let (sim, _) = start(&w, &c);
+        let written = run(&sim, tier, BOOT_A, batches, &[], false, &c).written;
+        let dir = Dir::Sim(sim.clone());
+        let Ok(Prior::Recorded(s)) = logid::read(&dir) else {
+            panic!("the run recorded its sidecar")
+        };
+        if let Side::Lossy = side {
+            logid::write(&dir, &s.lossy()).expect("the sidecar is replaced");
+        }
+        let dev = sim.device();
+        let mut img = dev.image(dev.epochs.len(), &dev.dirty, true, 0);
+        if let Side::Format1 = side {
+            let head = written.len() as u64;
+            img.id = Some(logid::format1_for_test(s.identity, 0, head, &img.logical));
+        }
+        let h = &img.logical[..HEADER_SIZE];
+        let second = HEADER_SIZE + u32::from_le_bytes([h[4], h[5], h[6], h[7]]) as usize;
+        let at = if torn {
+            img.logical.len() - 4
+        } else {
+            second + 20
+        };
+        img.logical[at..at + 4].fill(0);
+        img.durable = img.logical.clone();
+        (img, s.identity)
     };
-    let (sim, _) = start(&w, &c);
-    let first = run(&sim, tier, BOOT_A, &batches, &[], false, &c);
-    assert_eq!(first.written.len(), 4);
-    // A full durability flush failed while it served: the sidecar says Lossy.
-    let dir = Dir::Sim(sim.clone());
-    let Ok(Prior::Recorded(s)) = logid::read(&dir) else {
-        panic!("the run recorded its sidecar")
+    // What open #1 decides by, how it opens and the records it keeps; open #2 is a
+    // plain open in its boot.
+    struct Arm {
+        why: &'static str,
+        run_tier: Durability,
+        torn: bool,
+        side: Side,
+        boot: [u8; 16],
+        tier: Durability,
+        repair: bool,
+        prepared: Option<&'static str>,
+        kept: usize,
+    }
+    let plain = Arm {
+        why: "",
+        run_tier: relaxed,
+        torn: false,
+        side: Side::Recorded,
+        boot: BOOT_A,
+        tier: relaxed,
+        repair: false,
+        prepared: None,
+        kept: 1,
     };
-    logid::write(&dir, &s.lossy()).expect("the sidecar is replaced");
-    // Every byte landed but four inside record 1 (batch 1..=2), batch 3 intact behind.
-    let dev = sim.device();
-    let mut img = dev.image(dev.epochs.len(), &dev.dirty, true, 0);
-    let h = &img.logical[..HEADER_SIZE];
-    let second = HEADER_SIZE + u32::from_le_bytes([h[4], h[5], h[6], h[7]]) as usize;
-    img.logical[second + 20..second + 24].fill(0);
-    img.durable = img.logical.clone();
-    // Open #1, traced: the verdict cuts at the hole, phase 1 first.
-    let one = Sim::with(img.clone());
-    one.trace_on();
-    let opened = open(&one, tier, BOOT_A, &c).expect("open #1 cuts at the hole");
-    let cut = (opened.read_from(Offset::ZERO).len(), opened.identity());
-    drop(opened);
-    assert_eq!(cut.0, 1, "open #1 kept the record before the hole");
-    let died = one
-        .take_trace()
-        .into_iter()
-        .find(|d| d.id != img.id)
-        .expect("open #1 wrote phase 1");
-    assert_eq!(
-        died.logical, img.logical,
-        "phase 1 is written before the cut"
-    );
-    // Open #2, the same boot, after a process crash right after phase 1.
-    let again =
-        open(&Sim::with(died), tier, BOOT_A, &c).expect("open #2 makes the cut, not a refusal");
-    assert_eq!(
-        (again.read_from(Offset::ZERO).len(), again.identity()),
-        cut,
-        "the same cut, under the identity open #1 announced"
-    );
+    let arms = [
+        Arm {
+            why: "the Lossy state",
+            side: Side::Lossy,
+            ..plain
+        },
+        Arm {
+            why: "the embedder's prepare",
+            prepared: Some("mark"),
+            ..plain
+        },
+        Arm {
+            why: "a repair",
+            repair: true,
+            ..plain
+        },
+        Arm {
+            why: "the last run's tier",
+            run_tier: strict,
+            torn: true,
+            boot: BOOT_B,
+            ..plain
+        },
+        // The run's own boot, so no verdict: the damaged frame is whole-sized (rot, which
+        // the recovery cannot tell from a tear), and its batch is cut whole, at its start.
+        Arm {
+            why: "no verdict",
+            torn: true,
+            ..plain
+        },
+        // No floor to judge by: the repair cuts at the damage, inside the torn batch.
+        Arm {
+            why: "a repair of a FORMAT 1 log",
+            torn: true,
+            side: Side::Format1,
+            repair: true,
+            kept: 2,
+            ..plain
+        },
+    ];
+    for a in arms {
+        let (arm, tier, boot) = (a.why, a.tier, a.boot);
+        let (img, before) = damaged(a.run_tier, a.torn, a.side);
+        let one = Sim::with(img.clone());
+        one.trace_on();
+        let opened = open_as(&one, tier, boot, &c, a.repair, a.prepared)
+            .unwrap_or_else(|e| panic!("{arm}: open #1 cuts at the hole: {e}"));
+        let cut = (
+            opened.read_from(Offset::ZERO).len(),
+            opened.identity(),
+            opened.lineage().clone(),
+        );
+        drop(opened);
+        assert_eq!(
+            (cut.0, cut.1.generation),
+            (a.kept, before.generation + 1),
+            "{arm}: open #1 kept the records before the cut and moved the generation"
+        );
+        let mut crashed = 0;
+        for (i, died) in one.take_trace().into_iter().enumerate() {
+            let untouched = died.logical == img.logical;
+            if untouched && died.id == img.id {
+                continue;
+            }
+            crashed += 1;
+            match open(&Sim::with(died), tier, boot, &c) {
+                // A repair is the operator's, not a verdict the log keeps: until its
+                // cut lands, a plain open may refuse the hole as it did before.
+                Err(_) if a.repair && untouched => {}
+                Err(e) => panic!("{arm}, a crash at state {i}: open #2 refused: {e}"),
+                Ok(again) => assert_eq!(
+                    (
+                        again.read_from(Offset::ZERO).len(),
+                        again.identity(),
+                        again.lineage().clone()
+                    ),
+                    cut,
+                    "{arm}, a crash at state {i}: the same cut, under what open #1 settled"
+                ),
+            }
+        }
+        assert!(crashed > 1, "{arm}: open #1 wrote phase 1, then cut");
+    }
 }
 
 /// The baseline the floor rules improve on: the rules that predate the floor (the

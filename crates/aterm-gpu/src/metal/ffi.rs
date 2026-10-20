@@ -47,7 +47,7 @@
 //! error. An unknown selector raises "unrecognized selector" on send, which
 //! aborts; the tests in `super` cover every selector sent here.
 
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{CStr, c_void};
 use std::ptr;
 
 /// The runtime's pointer-shaped types and the checked send, `aterm_objc`'s:
@@ -198,28 +198,28 @@ pub(crate) fn ns_string(s: &str) -> Option<Obj> {
     }
 }
 
-/// Read an `NSError`'s `localizedDescription` into an owned Rust `String`.
+/// Copy an `NSString` (or a toll-free bridged `CFString`) into an owned Rust
+/// `String` by its counted UTF-16 code units: aterm-objc's
+/// [`aterm_objc::ns_string_to_rust`], the one reader every NSString read in
+/// aterm goes through. Never `-UTF8String`, which stops at the first U+0000
+/// and answers NULL for a string holding an unpaired surrogate (that one
+/// becomes U+FFFD here; everything else is exact).
+///
+/// # Safety
+/// `s` must be a live `NSString`, or nil (an empty string).
+pub(crate) unsafe fn ns_string_text(s: Id) -> String {
+    // SAFETY: the caller's contract is the shared reader's.
+    unsafe { aterm_objc::ns_string_to_rust(s) }
+}
+
+/// Read an `NSError`'s `localizedDescription` into an owned Rust `String`
+/// by its counted UTF-16 units ([`aterm_objc::ns_error_string`]);
+/// `"(nil NSError)"` for nil.
 pub(crate) fn ns_error_string(err: Id) -> String {
-    if err.is_null() {
-        return "(nil NSError)".to_owned();
-    }
-    let _pool = AutoreleasePool::new();
-    // SAFETY: `err` is a live `NSError`. `localizedDescription` and
-    // `UTF8String` return pointers valid until the pool pops; the bytes are
-    // copied into an owned `String` first.
-    unsafe {
-        let desc: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
-        let d = desc(err, sel(c"localizedDescription"));
-        if d.is_null() {
-            return "(no localizedDescription)".to_owned();
-        }
-        let utf8: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_char = checked_msg();
-        let p = utf8(d, sel(c"UTF8String"));
-        if p.is_null() {
-            return "(no UTF8String)".to_owned();
-        }
-        CStr::from_ptr(p).to_string_lossy().into_owned()
-    }
+    // SAFETY: every `err` handed here is a live `NSError` (a Metal send's
+    // out-param or a command buffer's `-error`, alive in the caller's pool)
+    // or nil, which the reader reports as `"(nil NSError)"`.
+    unsafe { aterm_objc::ns_error_string(err) }
 }
 
 // ---------------------------------------------------------------------------
@@ -700,20 +700,11 @@ impl Device {
     /// The GPU's marketing name, for diagnostics.
     pub(crate) fn name(&self) -> String {
         let _pool = AutoreleasePool::new();
-        // SAFETY: `-name` returns an autoreleased `NSString` owned by the pool
-        // above; its UTF-8 bytes are copied before the pool pops.
+        // SAFETY: `-name` returns an autoreleased `NSString` (or nil) owned by
+        // the pool above; it is copied out before the pool pops.
         unsafe {
             let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
-            let s = get(self.id(), sel(c"name"));
-            if s.is_null() {
-                return String::new();
-            }
-            let utf8: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_char = checked_msg();
-            let p = utf8(s, sel(c"UTF8String"));
-            if p.is_null() {
-                return String::new();
-            }
-            CStr::from_ptr(p).to_string_lossy().into_owned()
+            ns_string_text(get(self.id(), sel(c"name")))
         }
     }
 
@@ -1809,6 +1800,7 @@ pub(crate) unsafe fn buffer_bytes(buf: &Obj, len: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metal::test_support::{C_STRING_HOLES, ns_string_of_units};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// How many times this process has called
@@ -1936,5 +1928,70 @@ mod tests {
             "choose_listed moved:\n{}",
             wrong.join("\n")
         );
+    }
+
+    /// An NSError's description is read by its counted UTF-16 units, so
+    /// neither of the strings a C-string read gets wrong truncates or blanks a
+    /// Metal compile or pipeline diagnostic. Headless: Foundation objects only.
+    #[test]
+    fn an_error_description_is_read_whole() {
+        let _pool = AutoreleasePool::new();
+        let key = ns_string("NSLocalizedDescription").expect("key");
+        let domain = ns_string("aterm.test").expect("domain");
+        let read = C_STRING_HOLES.map(|(units, _)| {
+            let description = ns_string_of_units(units);
+            // SAFETY: `+dictionaryWithObject:forKey:` (`@32@0:8@16@24`) and
+            // `+errorWithDomain:code:userInfo:` (`@40@0:8@16q24@32`) return
+            // autoreleased objects the pool above owns; every argument is a
+            // live object for the call, and the dictionary retains its value.
+            let error = unsafe {
+                let dict: unsafe extern "C-unwind" fn(ClassPtr, Sel, Id, Id) -> Id = checked_msg();
+                let info = dict(
+                    class(c"NSDictionary"),
+                    sel(c"dictionaryWithObject:forKey:"),
+                    description.id(),
+                    key.id(),
+                );
+                let make: unsafe extern "C-unwind" fn(ClassPtr, Sel, Id, isize, Id) -> Id =
+                    checked_msg();
+                make(
+                    class(c"NSError"),
+                    sel(c"errorWithDomain:code:userInfo:"),
+                    domain.id(),
+                    1,
+                    info,
+                )
+            };
+            assert!(!error.is_null(), "NSError for {units:04X?}");
+            ns_error_string(error)
+        });
+        assert_eq!(read, C_STRING_HOLES.map(|(_, want)| want));
+    }
+
+    /// [`Device::name`] reads `-name` by its counted UTF-16 units. The OS names
+    /// a real `MTLDevice`, so an `NSNotification`, which answers `-name` with
+    /// the `NSString` it was made with, stands in for one.
+    #[test]
+    fn a_device_name_is_read_whole() {
+        let _pool = AutoreleasePool::new();
+        let read = C_STRING_HOLES.map(|(units, _)| {
+            let name = ns_string_of_units(units);
+            // SAFETY: `+notificationWithName:object:` (`@32@0:8@16@24`) returns
+            // an autoreleased NSNotification the pool above owns; `Obj::retain`
+            // takes it to +1, which the stand-in `Device` releases on drop.
+            let stand_in = unsafe {
+                let f: unsafe extern "C-unwind" fn(ClassPtr, Sel, Id, Id) -> Id = checked_msg();
+                Obj::retain(f(
+                    class(c"NSNotification"),
+                    sel(c"notificationWithName:object:"),
+                    name.id(),
+                    Id::NIL,
+                ))
+            }
+            .map(Device)
+            .expect("NSNotification");
+            stand_in.name()
+        });
+        assert_eq!(read, C_STRING_HOLES.map(|(_, want)| want));
     }
 }

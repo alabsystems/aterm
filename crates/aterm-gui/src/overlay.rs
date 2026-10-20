@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The single modal-overlay slot for the in-grid surfaces: the command Palette, the
-//! connection card, the session picker and the connection map share one card slot, one
+//! identity picker and the Overview share one card slot, one
 //! rasterize/composite call, and one `RepaintKey::settings_fp` term. Rather than parallel `Option` fields on
 //! `WindowState` (whose mutual exclusion had to be enforced by hand, and whose on_key gate
 //! ordering was a latent "hidden overlay swallows keys" bug), they collapse into one
@@ -18,8 +18,7 @@
 
 use crate::chrome_band::ChromePalette;
 
-use crate::conn_card::ConnCardState;
-use crate::connection_map::ConnectionMapState;
+use crate::overview::OverviewState;
 use crate::palette::PaletteState;
 use crate::session_picker::SessionPickerState;
 use crate::settings::SettingsGeom;
@@ -45,6 +44,13 @@ pub(crate) trait OverlayModel {
     /// ([`crate::app_render::ChromeSurface::OverGrid`], or `NativePage` for a modal
     /// over a native page).
     fn tray(&self, geom: &SettingsGeom, palette: ChromePalette) -> TrayInput;
+
+    /// The smoke layer the surface lays over the whole window behind its card, if any
+    /// (the palette's on Windows, [`crate::palette::palette_scrim`]). The shared splice
+    /// paints it under the card's prims across the frame. `None`: the card alone.
+    fn scrim(&self) -> Option<crate::widget::Rgba> {
+        None
+    }
 
     /// The `controls front` truncation signal: `(scroll, total, visible)` — rows scrolled
     /// past the top, the full model row count, and rows actually shown on the card. Read
@@ -72,6 +78,14 @@ impl OverlayModel for PaletteState {
     fn tray(&self, geom: &SettingsGeom, palette: ChromePalette) -> TrayInput {
         crate::palette::palette_tray(self, geom, palette)
     }
+    /// None while the palette picks a theme (Choose Theme… and Choose Tab Theme…
+    /// open scoped to it, and a highlighted Theme row anywhere previews on the
+    /// terminal): the preview is the colours the window will draw, so it is
+    /// shown undimmed. The scope and the highlight both feed the fingerprint.
+    fn scrim(&self) -> Option<crate::widget::Rgba> {
+        let previewing = self.is_themes_only() || self.highlighted_theme().is_some();
+        crate::palette::palette_scrim().filter(|_| !previewing)
+    }
     fn scroll_extent(&self) -> (usize, usize, usize) {
         PaletteState::scroll_extent(self)
     }
@@ -81,44 +95,24 @@ impl OverlayModel for PaletteState {
     }
 }
 
-impl OverlayModel for ConnCardState {
+impl OverlayModel for OverviewState {
     fn fingerprint(&self) -> u64 {
-        ConnCardState::fingerprint(self)
-    }
-    fn wanted_rows(&self, avail: usize) -> usize {
-        // Anchored like the tab menu — `conn_card_layout` sizes the card.
-        ConnCardState::wanted_rows(self, avail)
-    }
-    fn tray(&self, geom: &SettingsGeom, palette: ChromePalette) -> TrayInput {
-        crate::conn_card::conn_card_tray(self, geom, palette)
-    }
-    fn scroll_extent(&self) -> (usize, usize, usize) {
-        ConnCardState::scroll_extent(self)
-    }
-    #[cfg(a11y_tree)]
-    fn a11y(&self) -> aterm_a11y::model::TreeUpdate {
-        crate::conn_card::conn_card_a11y(self)
-    }
-}
-
-impl OverlayModel for ConnectionMapState {
-    fn fingerprint(&self) -> u64 {
-        ConnectionMapState::fingerprint(self)
+        OverviewState::fingerprint(self)
     }
     fn wanted_rows(&self, avail: usize) -> usize {
         // Floats centred like the palette: the tray spans the whole viewport
-        // and `map_layout` content-sizes the card within it.
+        // and `overview_layout` content-sizes the card within it.
         avail
     }
     fn tray(&self, geom: &SettingsGeom, palette: ChromePalette) -> TrayInput {
-        crate::connection_map::map_tray(self, geom, palette)
+        crate::overview::overview_tray(self, geom, palette)
     }
     fn scroll_extent(&self) -> (usize, usize, usize) {
-        ConnectionMapState::scroll_extent(self)
+        OverviewState::scroll_extent(self)
     }
     #[cfg(a11y_tree)]
     fn a11y(&self) -> aterm_a11y::model::TreeUpdate {
-        crate::connection_map::map_a11y(self)
+        crate::overview::overview_a11y(self)
     }
 }
 
@@ -148,14 +142,11 @@ impl OverlayModel for SessionPickerState {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum OverlayKind {
     Palette,
-    /// The anchored connection confirm/configure card (design §3.3 + §2.5).
-    ConnCard,
-    /// The session picker (design §2.3/§2.5 — the connect/configure/disconnect
-    /// choose-a-session surface).
+    /// The identity picker (File ▸ New Window / New Tab With Identity…).
     SessionPicker,
-    /// The connection map (design §5.2 — the whole instance's aggregated
-    /// fabric, Owner-gated per §5.3).
-    ConnectionMap,
+    /// The Overview (`docs/DESIGN-owner-surfaces-2026-10-16.md` §6): every
+    /// session of this aterm, Owner-gated on the wire like the map it replaced.
+    Overview,
 }
 
 impl OverlayKind {
@@ -165,11 +156,27 @@ impl OverlayKind {
     pub(crate) fn keyword(self) -> &'static str {
         match self {
             OverlayKind::Palette => "menu",
-            OverlayKind::ConnCard => "conn-card",
             OverlayKind::SessionPicker => "session-picker",
-            OverlayKind::ConnectionMap => "connections",
+            OverlayKind::Overview => "overview",
         }
     }
+
+    /// The variant tag [`Overlay::fingerprint`] seals the inner hash with. Distinct per
+    /// kind.
+    fn tag(self) -> u64 {
+        match self {
+            OverlayKind::Palette => 3,
+            OverlayKind::SessionPicker => 6,
+            OverlayKind::Overview => 7,
+        }
+    }
+}
+
+/// Fold a variant tag into a surface's inner fingerprint: rotated into the top byte so
+/// two kinds with equal inner hashes still differ, and `| 1` so the result is never the
+/// closed sentinel `0`.
+fn seal(tag: u64, inner: u64) -> u64 {
+    (tag.rotate_left(56) ^ inner) | 1
 }
 
 /// The single modal-overlay slot on a window. Exactly one variant is live at a time;
@@ -177,18 +184,13 @@ impl OverlayKind {
 /// hand-maintained "clear the other two" dance.
 pub(crate) enum Overlay {
     Palette(PaletteState),
-    /// The connection confirm/configure card (design §3.3 + §2.5) — ONE shared
-    /// component behind the drop popover and the Configure… sheet, anchored
-    /// like the tab menu. Native macOS hosts this same card in the content
-    /// view; there is no separate AppKit sheet.
-    ConnCard(ConnCardState),
-    /// The session picker (design §2.3/§2.5) — palette-style filter over the
-    /// live registry; its selection opens the ConnCard (or disconnects).
+    /// The identity picker — palette-style filter over the identity roster;
+    /// its selection opens a window or tab under the identity.
     SessionPicker(SessionPickerState),
-    /// The connection map (design §5.2) — sessions as chips grouped by
-    /// window, one labeled arrow per flow direction, the layered push
-    /// projection; every read of it is Owner-gated on the wire (§5.3).
-    ConnectionMap(ConnectionMapState),
+    /// The Overview (design §6) — every session grouped by window with its
+    /// need, phase, task and driver words, then who manages whom; every read
+    /// of it is Owner-gated on the wire.
+    Overview(OverviewState),
 }
 
 impl Overlay {
@@ -199,14 +201,7 @@ impl Overlay {
     pub(crate) fn fingerprint(&self) -> u64 {
         // The INNER hash comes from the same `OverlayModel` that paints the tray; the
         // wrapper folds in the variant tag + forces non-zero.
-        let inner = self.model().fingerprint();
-        let tag: u64 = match self {
-            Overlay::Palette(_) => 3,
-            Overlay::ConnCard(_) => 5,
-            Overlay::SessionPicker(_) => 6,
-            Overlay::ConnectionMap(_) => 7,
-        };
-        (tag.rotate_left(56) ^ inner) | 1
+        seal(self.kind().tag(), self.model().fingerprint())
     }
 
     /// The active surface's model as a trait object — the single point the shared splice
@@ -214,9 +209,8 @@ impl Overlay {
     pub(crate) fn model(&self) -> &dyn OverlayModel {
         match self {
             Overlay::Palette(p) => p,
-            Overlay::ConnCard(c) => c,
             Overlay::SessionPicker(p) => p,
-            Overlay::ConnectionMap(m) => m,
+            Overlay::Overview(m) => m,
         }
     }
 
@@ -224,9 +218,8 @@ impl Overlay {
     pub(crate) fn kind(&self) -> OverlayKind {
         match self {
             Overlay::Palette(_) => OverlayKind::Palette,
-            Overlay::ConnCard(_) => OverlayKind::ConnCard,
             Overlay::SessionPicker(_) => OverlayKind::SessionPicker,
-            Overlay::ConnectionMap(_) => OverlayKind::ConnectionMap,
+            Overlay::Overview(_) => OverlayKind::Overview,
         }
     }
 
@@ -260,25 +253,12 @@ mod tests {
     fn status_line_reports_open_kind_fp_and_extent() {
         let cases = [
             Overlay::Palette(PaletteState::new()),
-            Overlay::ConnCard(ConnCardState::new(
-                crate::WindowId(0),
-                aterm_session::SessionId::new("s-a"),
-                "a".to_string(),
-                aterm_session::SessionId::new("s-b"),
-                "b".to_string(),
-                crate::conn_card::PairKinds::default(),
-                "menu",
-                0,
-                1,
-            )),
             Overlay::SessionPicker(SessionPickerState::new(
                 crate::WindowId(0),
-                Some(aterm_session::SessionId::new("s-a")),
-                "a".to_string(),
-                crate::session_picker::PickerIntent::Connect,
+                crate::session_picker::PickerIntent::NewTabWithIdentity,
                 Vec::new(),
             )),
-            Overlay::ConnectionMap(ConnectionMapState::new(
+            Overlay::Overview(OverviewState::new(
                 crate::WindowId(0),
                 Vec::new(),
                 Vec::new(),

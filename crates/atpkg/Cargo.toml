@@ -25,6 +25,13 @@ path = "src/main.rs"
 # harness ran 0 tests); the integration tests still get the built binary.
 test = false
 
+# abrew (docs/DESIGN-abrew-2026-10-19.md): same dev-only shim shape as
+# `atpkg` above; the shipped name is an argv0 symlink onto `aterm`.
+[[bin]]
+name = "atpkg-abrew"
+path = "src/abrew_main.rs"
+test = false
+
 [features]
 # Development seams in an optimized build (`aterm_types::dev_seam!`: ATPKG_REGISTRY,
 # ATPKG_STAGE_DISK_REVERIFY; `config::DEV_SEAMS`: `[packages]`
@@ -133,7 +140,13 @@ aterm-uds = { workspace = true }
 # A small first-party leaf (aterm-log, aterm-uds, libc) already in the one binary's graph.
 aterm-containment = { workspace = true }
 
+# Private per-operation download and extraction staging, removed on drop.
+aterm-tempfile = { workspace = true }
+
 [dev-dependencies]
+# The counting seam (`aterm_durable::seam`) its tests reach, in an optimized test
+# build too.
+aterm-durable = { workspace = true, features = ["test-support"] }
 # Tier-1 conformance drives the real index-probe stamp/lock against the derived
 # bounded model; this edge exists only while compiling tests, never in atpkg.
 aterm-spec = { workspace = true }
@@ -145,10 +158,6 @@ aterm-models-atpkg = { workspace = true }
 # TEST build only (feature unification across normal+dev within this leaf package); the
 # normal build keeps the minimal edge above.
 ring = { workspace = true, features = ["default"] }
-# Test scratch directories removed on drop. First-party with zero dependencies of its
-# own, and already in the shipped graph (aterm-grid's): the edge adds nothing to the
-# supply chain.
-aterm-tempfile = { workspace = true }
 # The tty test's pseudo-terminal, both ends close-on-exec from birth
 # (`open_pty_pair`): an `openpty(3)` pair is inheritable, and the child spawned onto
 # it kept a copy of its own master. First-party, and in the one shipped binary that
@@ -172,17 +181,13 @@ path = "tests/atpkg_suite.rs"
 name = "packages_log_lanes"
 path = "tests/packages_log_lanes.rs"
 
-# Alone: races real `atpkg` children for the cross-process store lock.
-[[test]]
-name = "selfupdate_intercept"
-path = "tests/selfupdate_intercept.rs"
-
-# Alone: times real `atpkg` children waiting on the cross-process store lock.
-[[test]]
-name = "store_lock_wait"
-path = "tests/store_lock_wait.rs"
-
 # Alone: opens a pty (`ptsname(3)` answers from a static buffer) and times a child waiting on a held lock.
 [[test]]
 name = "typed_lock_wait_tty"
 path = "tests/typed_lock_wait_tty.rs"
+
+# Explicit mounted-volume acceptance; not an ordinary test or a release dependency.
+[[bench]]
+name = "dmg_acceptance"
+harness = false
+test = false

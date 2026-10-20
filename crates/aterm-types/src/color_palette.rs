@@ -46,19 +46,107 @@ impl Default for ColorPalette {
 }
 
 impl ColorPalette {
+    /// Slot 4, blue: `#3B8EEA` (5.5:1 on the dark bg; xterm's `#0000EE` is
+    /// near-invisible there).
+    #[cfg(not(windows))]
+    const BLUE: Rgb = Rgb::new(59, 142, 234);
+    /// Slot 4 on Windows, `#2973D0`, where blue is a background as often as
+    /// ink: pwsh draws every directory name as the default foreground on it
+    /// (`$PSStyle.FileInfo.Directory` is `ESC[44;1m`), and `Write-Host
+    /// -BackgroundColor DarkBlue` writes white on it. `#3B8EEA` gave those
+    /// 2.2:1 and 3.4:1; this one keeps the hue and gives 3.05:1 and 4.7:1.
+    /// As text on the dark background it is 3.9:1, which the engine's
+    /// theme-pair floor (on by default on Windows) lifts to `#3E81D5`, 4.7:1:
+    /// the floor holds this palette's own colours to 4.5:1 as text on the page
+    /// (`aterm_core::terminal::color_resolve::DEFAULT_PALETTE_TEXT_FLOOR`).
+    #[cfg(windows)]
+    const BLUE: Rgb = Rgb::new(0x29, 0x73, 0xD0);
+    /// Slot 2, green: xterm's `#00CD00`.
+    #[cfg(not(windows))]
+    const GREEN: Rgb = Rgb::new(0, 205, 0);
+    /// Slot 2 on Windows, One Dark's `#98C379` (9.2:1 on the dark
+    /// background), the family slots 1 and 5 already come from. xterm's
+    /// `#00CD00` is a 100%-saturated primary beside red `#E06C75` (52%), so a
+    /// diff's additions shouted while its deletions were soft.
+    #[cfg(windows)]
+    const GREEN: Rgb = Rgb::new(0x98, 0xC3, 0x79);
+    /// Slot 3, yellow: xterm's `#CDCD00`.
+    #[cfg(not(windows))]
+    const YELLOW: Rgb = Rgb::new(205, 205, 0);
+    /// Slot 3 on Windows, One Dark's `#E5C07B` (10.8:1): git's hashes,
+    /// `Write-Host -ForegroundColor DarkYellow`, Git Bash's path.
+    #[cfg(windows)]
+    const YELLOW: Rgb = Rgb::new(0xE5, 0xC0, 0x7B);
+    /// Slot 6, cyan: xterm's `#00CDCD`.
+    #[cfg(not(windows))]
+    const CYAN: Rgb = Rgb::new(0, 205, 205);
+    /// Slot 6 on Windows, One Dark's `#56B6C2` (7.8:1): git's hunk headers,
+    /// PSReadLine's strings, Git Bash's branch.
+    #[cfg(windows)]
+    const CYAN: Rgb = Rgb::new(0x56, 0xB6, 0xC2);
+    /// Slot 12, bright blue: xterm's `#5C5CFF`.
+    #[cfg(not(windows))]
+    const BRIGHT_BLUE: Rgb = Rgb::new(92, 92, 255);
+    /// Slot 12 on Windows, `#6EA8FE`: slot 4's hue, lighter than it, 7.7:1
+    /// on the dark background. `#5C5CFF` is darker and more violet than
+    /// either blue (3.9:1), so bold-as-bright dimmed Git Bash's directories
+    /// and pwsh's `Write-Host -ForegroundColor Blue`.
+    #[cfg(windows)]
+    const BRIGHT_BLUE: Rgb = Rgb::new(0x6E, 0xA8, 0xFE);
+    /// Slot 10, bright green: Dracula's `#50FA7B`.
+    #[cfg(not(windows))]
+    const BRIGHT_GREEN: Rgb = Rgb::new(80, 250, 123);
+    /// Slot 10 on Windows, `#BBEC98`: slot 2's One Dark green, lighter
+    /// (13.8:1). One Dark has no brights of its own: Windows Terminal's One
+    /// Half Dark repeats the normals, so bold-as-bright would not show; this
+    /// keeps the normal's `OkLCh` hue and steps lightness +0.12 (chroma ×1.1
+    /// where sRGB allows; yellow turns its hue instead, see slot 11), so a
+    /// bright stands 1.5:1 off its normal. One Dark
+    /// Pro's +0.08 left 1.3:1, and `Yellow` beside `DarkYellow` read as one
+    /// amber. Dracula's `#50FA7B` is twice
+    /// slot 2's chroma and 15° yellower, so PSReadLine's variables and
+    /// git's branch names glowed neon beside soft One Dark text.
+    #[cfg(windows)]
+    const BRIGHT_GREEN: Rgb = Rgb::new(0xBB, 0xEC, 0x98);
+    /// Slot 11, bright yellow: Dracula's `#F1FA8C`.
+    #[cfg(not(windows))]
+    const BRIGHT_YELLOW: Rgb = Rgb::new(241, 250, 140);
+    /// Slot 11 on Windows, `#FFEE99`: slot 3's amber, lighter (15.9:1), at
+    /// chroma ×1.1 like the others, its hue turned 16° toward yellow's sRGB
+    /// cusp, no further than that chroma needs. On amber's own hue, sRGB holds
+    /// only chroma 0.05 that light: a cream (`#FFEAC6`) 1.07:1 from Gray text,
+    /// so PSReadLine's command names merged with their arguments. Dracula's
+    /// lemon `#F1FA8C` sat 30° away, so command names were lemon while
+    /// `DarkYellow` output and git's hashes were amber.
+    #[cfg(windows)]
+    const BRIGHT_YELLOW: Rgb = Rgb::new(0xFF, 0xEE, 0x99);
+    /// Slot 13, bright magenta: Dracula's pink `#FF79C6`.
+    #[cfg(not(windows))]
+    const BRIGHT_MAGENTA: Rgb = Rgb::new(255, 121, 198);
+    /// Slot 13 on Windows, `#E9A3FF`: slot 5's violet, lighter (9.9:1), where
+    /// Dracula's `#FF79C6` turned it pink (29° away).
+    #[cfg(windows)]
+    const BRIGHT_MAGENTA: Rgb = Rgb::new(0xE9, 0xA3, 0xFF);
+    /// Slot 14, bright cyan: Dracula's `#8BE9FD`.
+    #[cfg(not(windows))]
+    const BRIGHT_CYAN: Rgb = Rgb::new(139, 233, 253);
+    /// Slot 14 on Windows, `#73DEEC`: slot 6's teal, lighter (11.9:1).
+    /// Dracula's `#8BE9FD` steps +0.16 and 6° off the teal, a pale sky.
+    #[cfg(windows)]
+    const BRIGHT_CYAN: Rgb = Rgb::new(0x73, 0xDE, 0xEC);
+
     /// Standard ANSI colors (indices 0-7).
     #[rustfmt::skip]
     const ANSI_COLORS: [Rgb; 8] = [
         Rgb { r:   0, g:   0, b:   0 }, // 0: Black
         Rgb { r: 224, g: 108, b: 117 }, // 1: Red (#E06C75, ~4.5:1 on the dark bg;
                                         //    xterm's #CD0000 is ~3.2:1)
-        Rgb { r:   0, g: 205, b:   0 }, // 2: Green
-        Rgb { r: 205, g: 205, b:   0 }, // 3: Yellow
-        Rgb { r:  59, g: 142, b: 234 }, // 4: Blue (#3B8EEA; xterm's #0000EE is
-                                        //    near-invisible on a dark bg)
+        Self::GREEN,                    // 2: Green
+        Self::YELLOW,                   // 3: Yellow
+        Self::BLUE,                     // 4: Blue
         Rgb { r: 198, g: 120, b: 221 }, // 5: Magenta (#C678DD ~5:1; xterm's
                                         //    #CD00CD is ~3.96:1)
-        Rgb { r:   0, g: 205, b: 205 }, // 6: Cyan
+        Self::CYAN,                     // 6: Cyan
         Rgb { r: 229, g: 229, b: 229 }, // 7: White
     ];
 
@@ -69,11 +157,11 @@ impl ColorPalette {
         Rgb { r: 138, g: 143, b: 153 }, // 8:  Bright Black (#8A8F99, ~6:1: muted
                                         //     text that stays readable)
         Rgb { r: 255, g: 110, b: 103 }, // 9:  Bright Red     (#FF6E67)
-        Rgb { r:  80, g: 250, b: 123 }, // 10: Bright Green   (#50FA7B)
-        Rgb { r: 241, g: 250, b: 140 }, // 11: Bright Yellow  (#F1FA8C)
-        Rgb { r:  92, g:  92, b: 255 }, // 12: Bright Blue    (already non-neon)
-        Rgb { r: 255, g: 121, b: 198 }, // 13: Bright Magenta (#FF79C6)
-        Rgb { r: 139, g: 233, b: 253 }, // 14: Bright Cyan    (#8BE9FD)
+        Self::BRIGHT_GREEN,             // 10: Bright Green
+        Self::BRIGHT_YELLOW,            // 11: Bright Yellow
+        Self::BRIGHT_BLUE,              // 12: Bright Blue
+        Self::BRIGHT_MAGENTA,           // 13: Bright Magenta
+        Self::BRIGHT_CYAN,              // 14: Bright Cyan
         Rgb { r: 255, g: 255, b: 255 }, // 15: Bright White
     ];
 
@@ -355,6 +443,165 @@ mod tests {
         ] {
             assert_eq!(ColorPalette::default_color(index), rgb, "index {index}");
         }
+    }
+
+    /// On Windows blue is ink and a background alike, and bright blue is its
+    /// lighter sibling: blue clears 3.5:1 as ink on Default's background, the
+    /// default foreground clears 3:1 and white 4.5:1 on it, and bright blue is
+    /// lighter than blue at 7:1 or more. Negative control: the historical
+    /// `#3B8EEA` / `#5C5CFF` pair, which every other platform keeps, misses.
+    #[test]
+    fn windows_blues_read_as_ink_and_as_a_background() {
+        let page = Rgb::new(0x11, 0x13, 0x18);
+        let ink = Rgb::new(0xD0, 0xD0, 0xD0);
+        let (black, white) = (Rgb::new(0, 0, 0), Rgb::new(255, 255, 255));
+        let serves = |blue: Rgb, bright: Rgb| {
+            blue.contrast(page) >= 3.5
+                && ink.contrast(blue) >= 3.0
+                && white.contrast(blue) >= 4.5
+                && bright.contrast(black) > blue.contrast(black)
+                && bright.contrast(page) >= 7.0
+        };
+        let historical = (Rgb::new(59, 142, 234), Rgb::new(92, 92, 255));
+        assert!(!serves(historical.0, historical.1));
+        let shipped = (
+            ColorPalette::default_color(4),
+            ColorPalette::default_color(12),
+        );
+        assert_eq!(serves(shipped.0, shipped.1), cfg!(windows), "{shipped:?}");
+        assert_eq!(shipped == historical, !cfg!(windows));
+    }
+
+    /// On Windows the normal chromatic tones other than blue (which is tuned
+    /// as a background) are one family: green, yellow and cyan are One
+    /// Dark's, like red and magenta, so a diff's additions (green) carry the
+    /// weight its deletions (red) do. Each is at most 70% saturated and 5:1
+    /// or more on Default's background. Negative control: xterm's `#00CD00`
+    /// / `#CDCD00` / `#00CDCD`, which every other platform keeps, are raw
+    /// primaries (100%).
+    #[test]
+    fn windows_normal_tones_are_one_family() {
+        let page = Rgb::new(0x11, 0x13, 0x18);
+        let saturation = |c: Rgb| {
+            let max = c.r.max(c.g).max(c.b);
+            let min = c.r.min(c.g).min(c.b);
+            f32::from(max - min) / f32::from(max.max(1))
+        };
+        let family = |slots: [Rgb; 5]| {
+            slots
+                .iter()
+                .all(|&c| saturation(c) <= 0.7 && c.contrast(page) >= 5.0)
+        };
+        let [red, magenta] = [1, 5].map(ColorPalette::default_color);
+        let xterm = [
+            red,
+            Rgb::new(0, 205, 0),
+            Rgb::new(205, 205, 0),
+            magenta,
+            Rgb::new(0, 205, 205),
+        ];
+        assert!(!family(xterm), "control: xterm's primaries");
+        let shipped = [1, 2, 3, 5, 6].map(ColorPalette::default_color);
+        assert_eq!(family(shipped), cfg!(windows), "{shipped:?}");
+        assert_eq!(shipped == xterm, !cfg!(windows));
+    }
+
+    /// On Windows each chromatic bright is its normal, lighter, so bold-as-bright
+    /// text changes brightness and not hue: the same `OkLCh` hue within 10°
+    /// (red, blue and the One Dark four), and for green, yellow, magenta and
+    /// cyan a lightness step of +0.10 to +0.14 that stands the pair apart
+    /// (`OkLab` 0.11 or more and 1.45:1, where the others need 0.05) and keeps
+    /// at least 0.85 of the normal's chroma. Yellow alone may turn its hue up
+    /// to 20° toward yellow's sRGB cusp (never away), as that is where sRGB
+    /// holds its chroma at that lightness. Each bright reads at 4.5:1 or more
+    /// on Default's background, above its normal, and stands 0.09 `OkLab` or
+    /// more from ordinary text (Gray, White and Default's foreground), so a
+    /// bright command name parts from its arguments. Negative controls:
+    /// Dracula's `#50FA7B` / `#F1FA8C` / `#FF79C6` / `#8BE9FD`, which every
+    /// other platform keeps, beside One Dark's normals (green 15° yellower,
+    /// yellow 30°, magenta 29° pinker, cyan +0.16 lighter); One Dark Pro's
+    /// +0.08 step (`#AEDE8B` / `#FFDA97` / `#E48CFE` / `#65D1DF`), whose
+    /// pairs sat 1.3:1 apart, `Yellow` and `DarkYellow` one amber; and
+    /// `#FFEAC6`, amber's own hue at +0.12, a cream with half the chroma,
+    /// 0.057 from Gray.
+    #[test]
+    fn windows_brights_are_their_normals_lighter() {
+        use crate::scheme_signature::{chroma_hue, oklab, oklab_distance};
+        let page = Rgb::new(0x11, 0x13, 0x18);
+        let text = [
+            ColorPalette::default_color(7),
+            ColorPalette::default_color(15),
+            crate::ColorScheme::default().foreground,
+        ];
+        let pair_serves = |slot: u8, normal: Rgb, bright: Rgb| {
+            let ((c_normal, h_normal), (c_bright, h_bright)) =
+                (chroma_hue(normal), chroma_hue(bright));
+            let turn = (h_bright - h_normal + 180.0).rem_euclid(360.0) - 180.0;
+            let hue_held = if slot == 3 {
+                (0.0..=20.0).contains(&turn)
+            } else {
+                turn.abs() <= 10.0
+            };
+            let step = oklab(bright).0 - oklab(normal).0;
+            let one_dark = matches!(slot, 2 | 3 | 5 | 6);
+            let stepped = !one_dark
+                || ((0.10..=0.14).contains(&step)
+                    && bright.contrast(normal) >= 1.45
+                    && c_bright >= 0.85 * c_normal);
+            let apart = if one_dark { 0.11 } else { 0.05 };
+            hue_held
+                && stepped
+                && oklab_distance(normal, bright) >= apart
+                && text.iter().all(|&t| oklab_distance(t, bright) >= 0.09)
+                && bright.contrast(page) >= 4.5
+                && bright.contrast(page) > normal.contrast(page)
+        };
+        let serves = |brights: [Rgb; 6]| {
+            (1..=6u8)
+                .zip(brights)
+                .all(|(slot, bright)| pair_serves(slot, ColorPalette::default_color(slot), bright))
+        };
+        let shipped = [9, 10, 11, 12, 13, 14].map(ColorPalette::default_color);
+        let dracula = [
+            shipped[0],
+            Rgb::new(0x50, 0xFA, 0x7B),
+            Rgb::new(0xF1, 0xFA, 0x8C),
+            shipped[3],
+            Rgb::new(0xFF, 0x79, 0xC6),
+            Rgb::new(0x8B, 0xE9, 0xFD),
+        ];
+        if cfg!(windows) {
+            let one_dark_pro = [
+                Rgb::new(0xAE, 0xDE, 0x8B),
+                Rgb::new(0xFF, 0xDA, 0x97),
+                Rgb::new(0xE4, 0x8C, 0xFE),
+                Rgb::new(0x65, 0xD1, 0xDF),
+            ];
+            for (slot, (bright, close)) in [2u8, 3, 5, 6].into_iter().zip(
+                [dracula[1], dracula[2], dracula[4], dracula[5]]
+                    .into_iter()
+                    .zip(one_dark_pro),
+            ) {
+                let normal = ColorPalette::default_color(slot);
+                assert!(
+                    !pair_serves(slot, normal, bright),
+                    "control: Dracula's slot {}",
+                    slot + 8
+                );
+                assert!(
+                    !pair_serves(slot, normal, close),
+                    "control: One Dark Pro's slot {}",
+                    slot + 8
+                );
+            }
+            let cream = Rgb::new(0xFF, 0xEA, 0xC6);
+            assert!(
+                !pair_serves(3, ColorPalette::default_color(3), cream),
+                "control: amber's own hue at +0.12, a cream"
+            );
+        }
+        assert_eq!(serves(shipped), cfg!(windows), "{shipped:?}");
+        assert_eq!(shipped == dracula, !cfg!(windows));
     }
 
     #[test]

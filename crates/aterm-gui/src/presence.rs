@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Presence (a window shows who is driving it): this host's sensing half.
+//! Presence (a window tells its owner what in it needs them): this host's
+//! sensing half.
 //!
-//! The row's pure core (facts, the per-session slot and its story, levels, rim,
-//! chip, words and their width law, tones, painted cells and the per-window
-//! view) lives in the engine (`aterm_messages::presence`) so it stays
-//! cross-platform. It is re-exported here under the names call sites use, with
-//! the generic types pinned to this host's [`Native`] seam ([`Slot`], [`Facts`],
-//! [`AgentPhase`], [`AgentReading`]).
+//! The pure core (facts, the per-session slot and its story, the wire's
+//! level, the border, the pill's words and geometry, the tab marks, tones and
+//! the per-window view) lives in the engine (`aterm_messages::presence`) so
+//! it stays cross-platform. It is re-exported here under the names call sites
+//! use, with the generic types pinned to this host's [`Native`] seam
+//! ([`Slot`], [`Facts`], [`AgentPhase`], [`AgentReading`]).
 //!
 //! What stays here is what only a host can do: the wakes that carry a change
 //! from the control and bridge threads to the main thread ([`install_proxy`]);
@@ -16,33 +17,33 @@
 //! with the terminal's cursor ([`agent_verdict`], run by the status sweep in
 //! `session_status.rs` at most 4 Hz per session, never per frame; the test-only
 //! [`classifier_calls`] counter proves the gate); the words for an API error's
-//! cause and a wall's wire word; the reset clock ([`countdown_to_reset`]); and
-//! [`Native`], the seam through which the engine reads a wall, an input stall,
-//! this process's harness and the wire's percent codec. The App's side
-//! (`app_presence.rs`) gathers each session's facts, hosts the engine's
-//! presence driver (`aterm_messages::presence::drive`) and paints the row. The
-//! row's pure tests are the engine's (`presence_tests.rs`); the tests here
-//! cover this host's sensing and its seam.
+//! cause and a wall's wire word; the reset clock ([`countdown_to_reset`]); the
+//! published need read into the engine's terms ([`need_fact`]); and
+//! [`Native`], the seam through which the engine reads a wall, this process's
+//! harness, the wire's percent codec and the grid's cells. The App's side
+//! (`app_presence.rs`) publishes each session's need, gathers its facts and
+//! hosts the engine's presence driver (`aterm_messages::presence::drive`).
+//! The core's pure tests are the engine's (`presence_tests.rs`); the tests
+//! here cover this host's sensing and its seam.
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use aterm_agent::supervise::limit;
 use aterm_session::SessionId;
-use winit::event_loop::EventLoopProxy;
+use aterm_window::event_loop::EventLoopProxy;
 
 use crate::Wake;
 
 // The engine's presence core under the names call sites use.
 pub(crate) use aterm_messages::presence::{
-    ChipLevel, Hand, HoldFact, LeaseMark, Link, StoryVerb, TOLD_TEXT_MAX_BYTES, TurnFact,
-    WallAnswer, Words, fmt_dur, prompt_band_word, prompt_kind_words, short_sid,
+    ChipLevel, Hand, HoldFact, Link, NeedFact, NeedSeverity, PillAct, PillHit, PillKind, PillWords,
+    StopCause, StoryVerb, TOLD_TEXT_MAX_BYTES, TurnFact, WallAnswer, fmt_dur, pill_words,
+    prompt_band_word, prompt_kind_words, short_sid, state_line,
 };
-// …and the ones only the tests name (the fabric builds the mail facts).
+// …and the ones only the tests name (`aterm-gui-fabric` builds the mail facts).
 #[cfg(test)]
-pub(crate) use aterm_messages::presence::{
-    Level, MailFacts, MailLast, RIPPLE, StopCause, TOLD_FLASH, words, words_step,
-};
+pub(crate) use aterm_messages::presence::{Level, Rim};
 
 /// The engine's presence slot, pinned to this host's seam.
 pub(crate) type Slot = aterm_messages::presence::Slot<Native>;
@@ -52,9 +53,30 @@ pub(crate) type Facts = aterm_messages::presence::Facts<Native>;
 pub(crate) type AgentPhase = aterm_messages::presence::AgentPhase<Native>;
 /// One screen's agent reading, pinned to this host's seam.
 pub(crate) type AgentReading = aterm_messages::presence::AgentReading<Native>;
-/// One window's presence view (the engine's; the painted-row cache beside it
-/// is the window state's own, `WindowState::presence_row`).
+/// One window's presence view (the engine's: the border, the session it is
+/// lit for, the pill, the story watermarks).
 pub(crate) type WindowView = aterm_messages::presence::View;
+
+/// The published need ([`crate::needs::Need`], the session's one verdict) in
+/// the engine's terms: its word's severity, the cause a stuck need's remedy
+/// turns on, its key (the word and the transition's identity, so another
+/// word or episode starts its own age) and its words.
+pub(crate) fn need_fact(need: &crate::needs::Need) -> NeedFact {
+    use aterm_types::needs::{NeedWord, Severity};
+    NeedFact {
+        severity: match need.word.severity() {
+            Severity::Stuck => NeedSeverity::Stuck,
+            Severity::Decide => NeedSeverity::Decide,
+        },
+        cause: match need.word {
+            NeedWord::Frozen => StopCause::Frozen,
+            NeedWord::Stopped => StopCause::Suspended,
+            _ => StopCause::Wall,
+        },
+        key: (need.word as u8, need.key),
+        what: need.what.clone(),
+    }
+}
 
 /// This host's presence seam (`aterm_messages::presence::Host`): an
 /// uninhabited marker, because the orphan rule forbids implementing the
@@ -77,6 +99,18 @@ pub(crate) fn attested_aterms_holder(holder: &str, pid: Option<u32>, own: &str, 
     holder == own && pid == Some(me)
 }
 
+impl Native {
+    /// Whether the harness retries this wall on its own clock (an API error,
+    /// an overload, the API's own 429): the time beside it is the next try,
+    /// never a reset ([`with_retry_plan`] lays a plan only on such a wall).
+    pub(crate) fn wall_retries(kind: aterm_phase::WallKind) -> bool {
+        matches!(
+            kind,
+            aterm_phase::WallKind::ApiError { .. } | aterm_phase::WallKind::Overloaded
+        )
+    }
+}
+
 impl aterm_messages::presence::Host for Native {
     type Wall = aterm_phase::WallKind;
     type Stall = crate::input_stall::InputStallFact;
@@ -95,37 +129,6 @@ impl aterm_messages::presence::Host for Native {
             return "limited";
         }
         api_cause_words(kind).unwrap_or_else(|| crate::status_item::wall_words(kind.name()))
-    }
-
-    /// An API error or overload the harness retries on its own clock, including
-    /// the API's own rate limit (a 429 `API Error`), whose wait is told to the
-    /// tab: the row says `limited → 14:05 · 5m00s` and speaks `limited, next try
-    /// 14:05`. A usage window (`UsageSession` and the like) names and keeps its
-    /// own reset, as does a screen that names a time of its own
-    /// (`with_retry_plan` lays a plan only where there is none).
-    fn wall_retries(kind: aterm_phase::WallKind) -> bool {
-        matches!(
-            kind,
-            aterm_phase::WallKind::ApiError { .. } | aterm_phase::WallKind::Overloaded
-        )
-    }
-
-    fn stall_since(stall: &crate::input_stall::InputStallFact) -> aterm_messages::Instant {
-        stall.since
-    }
-
-    fn stall_stopped(stall: &crate::input_stall::InputStallFact) -> bool {
-        stall.stopped
-    }
-
-    fn stall_survived(stall: &crate::input_stall::InputStallFact) -> bool {
-        stall.restart.survived
-    }
-
-    /// The publication's explicit restart ([`crate::input_stall::InputStallFact::act`]):
-    /// what the attention entry and the menu row name too.
-    fn stall_restart(stall: &crate::input_stall::InputStallFact) -> Option<&str> {
-        stall.act.as_ref().map(|act| act.cmd.as_str())
     }
 
     fn is_aterms_holder(holder: &str, pid: Option<u32>) -> bool {
@@ -154,47 +157,18 @@ impl aterm_messages::presence::Host for Native {
     }
 }
 
-/// A free-text value as the presence row prints it (the engine's
-/// `sanitize_token`, capped in this host's grid cells, each holding at most
-/// what a grid cell holds).
+/// A free-text value as presence prints it (the engine's `sanitize_token`,
+/// capped in this host's grid cells, each holding at most what a grid cell
+/// holds).
 pub(crate) fn sanitize_token(s: &str, cap: usize) -> String {
     aterm_messages::presence::sanitize_token::<Native>(s, cap)
 }
 
 /// A hold's reason as every human-facing surface prints and speaks it (the
-/// engine's `hold_reason_words` over the wire's decode). The band's hand slot,
-/// its spoken sentence and the greyed menu row (`crate::menu::hold_row_reason`)
-/// all read from here, so they cannot disagree.
+/// engine's `hold_reason_words` over the wire's decode): the long hold's
+/// digest entry (`App::hand_long_holds`) reads from here.
 pub(crate) fn hold_reason_words(reason: &str) -> String {
     aterm_messages::presence::hold_reason_words::<Native>(reason)
-}
-
-/// When a control client was last handed a session's screen generation by a
-/// read an `if-gen=` fence names (`status gen=`, `text --json`):
-/// [`crate::metrics::now_us`] plus one (`0` means never). Lives on
-/// [`crate::SessionCtx`]; the App's `Desk::looked_at` reads it, and a pending
-/// fold of the presence row waits its quiet past it (bounded by
-/// `FOLD_LOOK_CAP`), so the fold's re-grid cannot land between a driver's read
-/// and its fenced act. Posts no wake: the loop recomputes the presence
-/// deadline every pass. Lock-free, one relaxed `fetch_max` per read.
-#[derive(Debug, Default)]
-pub(crate) struct GenerationLook(std::sync::atomic::AtomicU64);
-
-impl GenerationLook {
-    /// A generation of the session's screen was handed out at `now_us`.
-    pub(crate) fn note(&self, now_us: u64) {
-        self.0.fetch_max(
-            now_us.saturating_add(1),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-
-    /// When one last was ([`crate::metrics::now_us`]); `None`: never.
-    pub(crate) fn last_us(&self) -> Option<u64> {
-        self.0
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .checked_sub(1)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -213,44 +187,106 @@ pub(crate) fn install_proxy(proxy: EventLoopProxy<Wake>) {
 }
 
 /// A session's drive lease changed hands (a `turn` began or settled, a
-/// cooperative `lease` was acquired or released). `submitted` marks the moment
-/// a turn's submit keypress verifiably landed, the one edge the rim ripples on.
-pub(crate) fn post_lease_changed(session: &SessionId, submitted: bool) {
+/// cooperative `lease` was acquired or released): `status hand=` and the
+/// level are read again on the main thread.
+pub(crate) fn post_lease_changed(session: &SessionId) {
     #[cfg(test)]
-    LEASE_WAKES.with(|w| w.borrow_mut().push((session.clone(), submitted)));
+    LEASE_WAKES.with(|w| w.borrow_mut().push(session.clone()));
     if let Some(proxy) = PROXY.get() {
         let _ = proxy.send_event(Wake::LeaseChanged {
             session: session.clone(),
-            submitted,
         });
     }
 }
 
 #[cfg(test)]
 thread_local! {
-    static LEASE_WAKES: std::cell::RefCell<Vec<(SessionId, bool)>> =
+    static LEASE_WAKES: std::cell::RefCell<Vec<SessionId>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Every lease-changed wake posted on this thread since the last take, in
-/// order: `(session, submitted)`. A headless test App installs no proxy, so
-/// this records what a control verb run on the test's thread asked the event
-/// loop to deliver. Thread-local because tests run in parallel.
+/// order. A headless test App installs no proxy, so this records what a
+/// control verb run on the test's thread asked the event loop to deliver.
+/// Thread-local because tests run in parallel.
 #[cfg(test)]
-pub(crate) fn take_lease_wakes() -> Vec<(SessionId, bool)> {
+pub(crate) fn take_lease_wakes() -> Vec<SessionId> {
     LEASE_WAKES.with(|w| std::mem::take(&mut *w.borrow_mut()))
 }
 
 /// A session's fabric endpoint changed (a delivery, a hold transition, a post
 /// landing, `inbox seen`, a link report). Posted beside every
-/// `changed.notify_all()` in `fabric.rs`, so the band moves exactly when a
-/// parked `await inbox` would.
+/// `changed.notify_all()` in `fabric.rs`, so the need and the level move
+/// exactly when a parked `await inbox` would.
 pub(crate) fn post_fabric_changed(session: &SessionId) {
     if let Some(proxy) = PROXY.get() {
         let _ = proxy.send_event(Wake::FabricChanged {
             session: session.clone(),
         });
     }
+}
+
+/// A control client typed into session `session` and its hover's words
+/// moved ([`crate::typed_by::stamp`]): the typist is named and the tab's
+/// chrome pushed again on the main thread (`Wake::Typed`).
+pub(crate) fn post_typed(session: &SessionId) {
+    if let Some(proxy) = PROXY.get() {
+        let _ = proxy.send_event(Wake::Typed {
+            session: session.clone(),
+        });
+    }
+}
+
+/// Another Mac's node acted on session `session` over the fleet's drive op
+/// (`control::note_drive_act`): `act` in words, `host` the name this Mac's
+/// book gives the node. The main thread writes it to the Messages log as a
+/// record naming the tab (`Wake::Driven`).
+#[cfg(any(unix, test))]
+pub(crate) fn post_driven(session: &SessionId, host: &str, act: &str) {
+    if let Some(proxy) = PROXY.get() {
+        let _ = proxy.send_event(Wake::Driven {
+            session: session.clone(),
+            host: host.to_owned(),
+            act: act.to_owned(),
+        });
+    }
+}
+
+/// Session `local`'s metadata moved off a control connection — the window
+/// host's deadlines raising or taking down the supervisor's attention inside
+/// a task mark (`harness_host::startup_mark_with`): the tab's label and the
+/// menu bar are refreshed as for a `meta set` (`Wake::MetaChanged`).
+pub(crate) fn post_meta_changed(local: u64) {
+    if let Some(proxy) = PROXY.get() {
+        let _ = proxy.send_event(Wake::MetaChanged { session: local });
+    }
+}
+
+/// Session `local`'s TASK RECORD moved, or the supervisor's attention a mark
+/// carried did (`task_record::mark_session_task_with`): its need verdict
+/// (a `stalled` task is a need) and every surface reading the record are
+/// refreshed on the main thread (`Wake::TaskChanged`). Posted beside the
+/// mark's own wake of its parked waiters, never for a no-op or a fenced mark.
+pub(crate) fn post_task_changed(local: u64) {
+    #[cfg(test)]
+    TASK_WAKES.with(|w| w.borrow_mut().push(local));
+    if let Some(proxy) = PROXY.get() {
+        let _ = proxy.send_event(Wake::TaskChanged { session: local });
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TASK_WAKES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Every task-changed wake posted on this thread since the last take, in
+/// order. A headless test App installs no proxy, so this records what a mark
+/// made on the test's thread asked the event loop to deliver. Thread-local
+/// because tests run in parallel.
+#[cfg(test)]
+pub(crate) fn take_task_wakes() -> Vec<u64> {
+    TASK_WAKES.with(|w| std::mem::take(&mut *w.borrow_mut()))
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +450,7 @@ pub(crate) fn with_retry_plan(
     else {
         return Some(agent);
     };
-    if ahead <= 0 || !<Native as aterm_messages::presence::Host>::wall_retries(*kind) {
+    if ahead <= 0 || !Native::wall_retries(*kind) {
         return Some(agent);
     }
     *until = now.checked_add(Duration::from_secs(ahead.unsigned_abs()));
@@ -445,7 +481,41 @@ pub(crate) enum AgentVerdict {
         subject: Option<String>,
         /// Which program's reader read it — by name or by its screen.
         program: aterm_phase::Program,
+        /// What the screen says of the turn, for the session log.
+        turn: TurnFacts,
     },
+}
+
+/// What one reading says of the agent's turn for the session log (phase 3B,
+/// addendum A22): Claude Code's context left, its goal and whether a person
+/// stopped the last turn. Only Claude Code's reader is read for them (Codex
+/// is Phase 5): every other reader's is none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TurnFacts {
+    /// The context left, in percent, when the screen shows it.
+    pub(crate) ctx_pct: Option<u8>,
+    /// The goal's state (`None`: not read).
+    pub(crate) goal: Option<bool>,
+    /// A person stopped the last turn (Esc).
+    pub(crate) interrupted: bool,
+}
+
+impl TurnFacts {
+    /// What `r`, read by `program`'s reader, says of the turn.
+    pub(crate) fn of(program: aterm_phase::Program, r: &aterm_phase::Reading) -> TurnFacts {
+        match program {
+            aterm_phase::Program::Claude => TurnFacts {
+                ctx_pct: r.context_left,
+                goal: Some(r.goal_active),
+                interrupted: r.interrupted,
+            },
+            aterm_phase::Program::Codex
+            | aterm_phase::Program::Agy
+            | aterm_phase::Program::Muse
+            | aterm_phase::Program::Gemini
+            | aterm_phase::Program::Generic => TurnFacts::default(),
+        }
+    }
 }
 
 impl AgentVerdict {
@@ -483,6 +553,14 @@ impl AgentVerdict {
         match self {
             Self::Agent { reading, .. } => Some(reading),
             Self::NotAgent => None,
+        }
+    }
+
+    /// What the screen says of the turn ([`TurnFacts`]); none for no agent.
+    pub(crate) fn turn(&self) -> TurnFacts {
+        match self {
+            Self::Agent { turn, .. } => *turn,
+            Self::NotAgent => TurnFacts::default(),
         }
     }
 
@@ -559,12 +637,13 @@ pub(crate) fn agent_verdict(
         } else {
             (rows, cursor.on_rows_from(whole.len() - rows.len()))
         };
-    let (reading, subject) = classify(reader, rows, cursor, now);
+    let (reading, subject, turn) = classify(reader, rows, cursor, now);
     AgentVerdict::Agent {
         reading,
         by_frame,
         subject,
         program: reader.program(),
+        turn,
     }
 }
 
@@ -645,6 +724,7 @@ fn unreadable_verdict(
         by_frame: false,
         subject: None,
         program,
+        turn: TurnFacts::default(),
     }
 }
 
@@ -666,7 +746,7 @@ pub(crate) fn classify(
     rows: &[String],
     cursor: Cursor,
     now: Instant,
-) -> (AgentReading, Option<String>) {
+) -> (AgentReading, Option<String>, TurnFacts) {
     #[cfg(test)]
     CLASSIFIER_CALLS.with(|c| c.set(c.get() + 1));
     let r = match cursor {
@@ -674,6 +754,7 @@ pub(crate) fn classify(
         #[cfg(test)]
         Cursor::Unknown => reader.read(rows, None),
     };
+    let turn = TurnFacts::of(reader.program(), &r);
     let wall = |kind: aterm_phase::WallKind, reset: Option<String>| {
         let until = reset
             .as_deref()
@@ -724,6 +805,7 @@ pub(crate) fn classify(
             context_pct: r.context_left,
         },
         subject,
+        turn,
     )
 }
 
@@ -789,6 +871,29 @@ fn countdown_in(
     offset_at: &dyn Fn(i64) -> Option<i64>,
     local_zone: Option<&str>,
 ) -> Option<Duration> {
+    let at = place_in(reset, now, offset_at, local_zone)?;
+    u64::try_from(at - now)
+        .ok()
+        .filter(|&s| s > 0)
+        .map(Duration::from_secs)
+}
+
+/// Where `reset` falls on this machine's clock (unix seconds), placed as of
+/// `printed` — when the notice was read (a span counts from it, a bare clock
+/// time is that day's or the next) — past or not; `None` when the words
+/// cannot be read or name another zone. What the need classifier judges an
+/// unsupervised limit's reset by (`App::need_facts`).
+pub(crate) fn place_reset(reset: &str, printed: i64) -> Option<i64> {
+    place_in(reset, printed, &local_offset_at, local_zone().as_deref())
+}
+
+/// [`place_reset`] with the offset and the local zone passed in.
+fn place_in(
+    reset: &str,
+    now: i64,
+    offset_at: &dyn Fn(i64) -> Option<i64>,
+    local_zone: Option<&str>,
+) -> Option<i64> {
     let spec = limit::parse_reset(reset)?;
     if let limit::ResetSpec::At {
         zone: Some(named), ..
@@ -797,11 +902,7 @@ fn countdown_in(
     {
         return None;
     }
-    let at = limit::reset_in_zone(&spec, now, limit::SESSION_AHEAD_MAX, offset_at)?;
-    u64::try_from(at - now)
-        .ok()
-        .filter(|&s| s > 0)
-        .map(Duration::from_secs)
+    limit::reset_in_zone(&spec, now, limit::SESSION_AHEAD_MAX, offset_at)
 }
 
 /// This machine's IANA zone name, when it can be read (`TZ`, else the
@@ -827,12 +928,14 @@ fn local_zone_at(path: &std::path::Path) -> Option<String> {
     Some(s[i + "zoneinfo/".len()..].to_string())
 }
 
-/// The local clock's offset from UTC in seconds, read once per process
-/// ([`local_offset_at`]); `None` where it cannot be read (then no figure is
-/// printed). Settings ▸ Packages reads its clock per instant instead.
+/// The local clock's offset from UTC in seconds now ([`local_offset_at`]);
+/// `None` where it cannot be read (then no figure is printed). Read at each
+/// call, a few microseconds in-process: it was read once per process, so a
+/// clock time said after a daylight-saving switch, or after the system zone
+/// was replaced under a running aterm, was an hour or a zone off until a
+/// restart.
 pub(crate) fn local_offset_s() -> Option<i64> {
-    static OFFSET: OnceLock<Option<i64>> = OnceLock::new();
-    *OFFSET.get_or_init(|| local_offset_at(limit::unix_now()))
+    local_offset_at(limit::unix_now())
 }
 
 /// `struct tm` (`<time.h>`), the same on Darwin and glibc: nine `int`s, then
@@ -909,7 +1012,81 @@ fn native_local_offset_at(unix: i64) -> Option<i64> {
     Some(unsafe { tm.assume_init() }.tm_gmtoff)
 }
 
-#[cfg(not(unix))]
+/// `FILETIME` and `SYSTEMTIME` (`minwinbase.h`), with the three kernel32
+/// conversions [`local_offset_at`] takes on Windows.
+#[cfg(windows)]
+mod win_time {
+    #[repr(C)]
+    #[derive(Default)]
+    pub(super) struct FileTime {
+        pub(super) low: u32,
+        pub(super) high: u32,
+    }
+
+    /// Year, month, weekday, day, hour, minute, second, millisecond: only
+    /// ever handed from one conversion to the next, never read here.
+    #[repr(C)]
+    #[derive(Default)]
+    pub(super) struct SystemTime {
+        _fields: [u16; 8],
+    }
+
+    unsafe extern "system" {
+        pub(super) fn FileTimeToSystemTime(file: *const FileTime, system: *mut SystemTime) -> i32;
+        pub(super) fn SystemTimeToTzSpecificLocalTime(
+            zone: *const std::ffi::c_void,
+            utc: *const SystemTime,
+            local: *mut SystemTime,
+        ) -> i32;
+        pub(super) fn SystemTimeToFileTime(system: *const SystemTime, file: *mut FileTime) -> i32;
+    }
+}
+
+/// Windows: the offset the system zone's rules give the instant `unix`, in
+/// seconds. The instant as a UTC `SYSTEMTIME`, converted to the active zone's
+/// local time (`SystemTimeToTzSpecificLocalTime` with no zone named, which
+/// applies daylight saving as it stood at that instant), both read back as
+/// 100 ns ticks; the offset is their difference. Until this the Windows arm
+/// said `None` for every instant, so every local clock time and day aterm
+/// shows (the Autopilot glass's `done 17:42`, a timed cruise's `at 18:00`,
+/// the presence clock) went unread on Windows. `None` where a conversion
+/// fails (an instant before 1601).
+#[cfg(windows)]
+pub(crate) fn local_offset_at(unix: i64) -> Option<i64> {
+    use win_time::{
+        FileTime, FileTimeToSystemTime, SystemTime, SystemTimeToFileTime,
+        SystemTimeToTzSpecificLocalTime,
+    };
+    /// 100 ns ticks from 1601-01-01 (the `FILETIME` epoch) to 1970-01-01.
+    const UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+    const TICKS_PER_SECOND: i64 = 10_000_000;
+    let ticks = unix
+        .checked_mul(TICKS_PER_SECOND)?
+        .checked_add(UNIX_EPOCH_TICKS)?;
+    let raw = u64::try_from(ticks).ok()?;
+    let utc_file = FileTime {
+        low: raw as u32,
+        high: (raw >> 32) as u32,
+    };
+    let (mut utc, mut local) = (SystemTime::default(), SystemTime::default());
+    let mut local_file = FileTime::default();
+    // SAFETY: every pointer addresses a live, correctly laid out `repr(C)`
+    // value of the type the call documents; a null zone names the active one.
+    // Each call writes only its out parameter.
+    let converted = unsafe {
+        FileTimeToSystemTime(&utc_file, &mut utc) != 0
+            && SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) != 0
+            && SystemTimeToFileTime(&local, &mut local_file) != 0
+    };
+    if !converted {
+        return None;
+    }
+    let local_ticks =
+        i64::try_from((u64::from(local_file.high) << 32) | u64::from(local_file.low)).ok()?;
+    Some((local_ticks - ticks).div_euclid(TICKS_PER_SECOND))
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn local_offset_at(_unix: i64) -> Option<i64> {
     None
 }
@@ -923,10 +1100,10 @@ mod tests {
     }
 
     /// A turn aterm's own harness typed (relaunching an agent after a kill)
-    /// shows no rim or chip while it types and leaves no story after:
-    /// `status level=` keeps the hand. Controls: the same exchange under a
-    /// manager's hand is Driven and then a story, and a story from before
-    /// aterm's hand stays news, counted without aterm's turn.
+    /// leaves no story after: `status level=` keeps the hand while it types
+    /// and quiets after, the point counted (`story=`) but no news. Controls:
+    /// the same exchange under a manager's hand is a story, and a story from
+    /// before aterm's hand stays news, counted without aterm's turn.
     #[test]
     fn aterms_own_hand_is_no_row_and_its_turn_is_no_story() {
         let now = t0();
@@ -936,6 +1113,8 @@ mod tests {
                 settled: true,
                 dur_ms: 10,
                 carried: false,
+                aterm: false,
+                opened: None,
             })
         };
         // `inside`: the settled turn is first read while the turn's own lease
@@ -953,7 +1132,6 @@ mod tests {
                 holder,
                 pid: Some(std::process::id()),
             };
-            let mut shown = Vec::new();
             let mut at = now;
             // The lease, the turn typed inside it, the settle as it is handed
             // back, and the lease given back — each a refresh of its own.
@@ -978,25 +1156,19 @@ mod tests {
                     },
                     at,
                 );
-                shown.push(s.shown_level(0));
             }
-            (s, shown, at)
+            s
         };
         let own = crate::harness_host::holder();
         for inside in [false, true] {
-            let (s, shown, _) = run(own.clone(), None, inside);
-            assert_eq!(
-                shown,
-                [Level::Quiet; 4],
-                "aterm's hand raised a row ({inside})"
-            );
+            let s = run(own.clone(), None, inside);
             assert_eq!(
                 s.level(0),
                 Level::Quiet,
                 "aterm's turn read as news ({inside})"
             );
             assert_eq!(s.story_seq, 1, "the point is still kept (`story=`)");
-            assert_eq!(s.chip(0), ChipLevel::Off, "no story dot on the tab");
+            assert_eq!(s.chip(), ChipLevel::Off, "no mark on the tab");
         }
         let mut held = Slot::new(now);
         held.absorb(
@@ -1014,32 +1186,65 @@ mod tests {
             Level::Driven,
             "`status level=` keeps the hand"
         );
-        assert_eq!(held.shown_level(0), Level::Quiet);
 
-        // Control: somebody else's hand is shown, and its turn is a story.
-        let (_, shown, _) = run("manager".into(), None, true);
-        assert_eq!(shown[..3], [Level::Driven; 3], "a manager's hand is shown");
-        assert_eq!(shown[3], Level::Story, "a manager's turn is news");
+        // Control: somebody else's turn is news.
+        let s = run("manager".into(), None, true);
+        assert_eq!(s.level(0), Level::Story, "a manager's turn is news");
         // Control: another instance's harness is somebody else's hand.
-        let (_, shown, _) = run("aterm-harness@1".into(), None, false);
-        assert_eq!(shown[0], Level::Driven);
+        let s = run("aterm-harness@1".into(), None, false);
+        assert_eq!(s.level(0), Level::Story);
 
         // A story from before aterm's hand stays news, without aterm's turn.
-        let (s, shown, at) = run(own, turn(1), false);
-        assert_eq!(shown[3], Level::Story, "the earlier turn is still news");
-        let w = words(&s, at, 0);
-        assert!(w.since.iter().any(|c| c == "1 turn"), "{w:?}");
-        assert!(!w.since.iter().any(|c| c == "2 turns"), "{w:?}");
+        let s = run(own, turn(1), false);
+        assert_eq!(s.level(0), Level::Story, "the earlier turn is still news");
+        assert_eq!(s.story_since(0).count(), 1, "the earlier turn alone");
+    }
+
+    /// A turn the ledger says aterm's own harness typed (`by=harness`, the
+    /// turn-end loop's `keep going`) is no story even when no refresh saw the
+    /// hand it was typed under: it is taken and given back between two of
+    /// them. Control: the same turn by anyone else, under no hand, is news.
+    #[test]
+    fn a_turn_the_harness_typed_is_no_story_without_a_refresh_inside_its_hand() {
+        let now = t0();
+        let level = |aterm: bool| {
+            let mut s = Slot::new(now);
+            s.absorb(Facts::default(), now);
+            s.absorb(
+                Facts {
+                    turn: Some(TurnFact {
+                        id: 3,
+                        settled: false,
+                        dur_ms: 600,
+                        carried: false,
+                        aterm,
+                        opened: None,
+                    }),
+                    ..Facts::default()
+                },
+                now + Duration::from_secs(1),
+            );
+            (s.level(0), s.story_seq)
+        };
+        assert_eq!(
+            level(true),
+            (Level::Quiet, 1),
+            "the harness's turn is kept, not news"
+        );
+        assert_eq!(
+            level(false),
+            (Level::Story, 1),
+            "anyone else's turn is news"
+        );
     }
 
     /// The classifier is `aterm-phase`'s Claude reader, word for word; a reading
     /// that is not evidence ([`aterm_phase::Reading::phase_authoritative`]:
-    /// Claude Code's idle with no composer drawn) is `unknown`, and the count
-    /// moves once per call. The screens are judged by `aterm_phase` itself, so
-    /// this pins the mapping, not the composer geometry.
+    /// Claude Code's idle with no composer drawn) is `unknown`. The screens are
+    /// judged by `aterm_phase` itself, so this pins the mapping, not the
+    /// composer geometry.
     #[test]
-    fn classify_is_aterm_phases_verdict_and_counts_once_per_call() {
-        let before = classifier_calls();
+    fn classify_is_aterm_phases_verdict() {
         let rows = |body: &[&str]| body.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut done_at_composer = rows(&["\u{23fa} Done.", ""]);
         done_at_composer.extend(aterm_phase::prompt::fixtures::composer("  ? for shortcuts"));
@@ -1057,7 +1262,7 @@ mod tests {
         let mut words = Vec::new();
         for screen in &screens {
             let verdict = aterm_phase::read(Some("claude"), screen, None);
-            let (ours, _) = classify(
+            let (ours, _, _) = classify(
                 &aterm_phase::ClaudeReader,
                 screen,
                 Cursor::Unknown,
@@ -1077,10 +1282,9 @@ mod tests {
             ["question", "unknown", "idle", "busy", "unknown"],
             "both halves of the mapping are exercised"
         );
-        assert_eq!(classifier_calls() - before, screens.len() as u64);
         // The never-shown law at the classifier's own edge: a limit notice
         // keeps only its kind and its reset, never its message.
-        let (limited, _) = classify(
+        let (limited, _, _) = classify(
             &aterm_phase::ClaudeReader,
             &rows(&[
                 "\u{23fa} You've hit your weekly limit \u{00b7} resets Sep 19 at 11am (America/Los_Angeles)",
@@ -1730,20 +1934,11 @@ mod tests {
         };
         assert!(rate.reads_limited(), "a 429 reads `limited`");
         let got = lay(wall(rate, None), Some(NOW_UNIX + 300), Some(PDT)).unwrap();
-        let mut slot = Slot::new(now);
-        slot.agent = Some(got);
-        let said = words(&slot, now, 0);
-        assert_eq!(said.phase, "limited");
-        assert_eq!(
-            said.since,
-            vec!["\u{2192} 09:00".to_string(), "5m00s".to_string()],
-            "{said:?}"
-        );
-        assert!(
-            said.sentence.contains("next try 09:00"),
-            "{}",
-            said.sentence
-        );
+        let AgentPhase::Wall { reset, until, .. } = got.phase else {
+            panic!("still a wall");
+        };
+        assert_eq!(reset.as_deref(), Some("09:00"));
+        assert_eq!(until, now.checked_add(Duration::from_secs(300)));
         // CONTROLS: the reading is returned as it was.
         for (name, agent, at) in [
             ("past", wall(unreachable, None), Some(NOW_UNIX - 5)),
@@ -1776,27 +1971,6 @@ mod tests {
             assert_eq!(lay(agent.clone(), at, Some(PDT)), agent, "{name}");
         }
         assert_eq!(lay(None, Some(NOW_UNIX + 60), Some(PDT)), None);
-
-        // What the row prints and speaks (the shared words engine).
-        let mut slot = Slot::new(now);
-        slot.agent = lay(wall(unreachable, None), Some(NOW_UNIX + 180), Some(PDT));
-        let said = words(&slot, now, 0);
-        assert_eq!(said.phase, "can't reach the API");
-        assert_eq!(
-            said.since,
-            vec!["\u{2192} 08:58".to_string(), "3m00s".to_string()],
-            "{said:?}"
-        );
-        assert!(
-            said.sentence.contains("next try 08:58"),
-            "{}",
-            said.sentence
-        );
-        assert!(!said.sentence.contains("resets"), "{}", said.sentence);
-        // CONTROL: a usage limit still speaks `resets`.
-        slot.agent = wall(WallKind::UsageSession, Some("7:30pm"));
-        let said = words(&slot, now, 0);
-        assert!(said.sentence.contains("resets 7:30pm"), "{}", said.sentence);
     }
 
     /// A tall pane with a short transcript (an API error on row 8, the composer
@@ -1992,6 +2166,47 @@ mod tests {
         assert!(compared > 0, "`date` answered for no instant");
     }
 
+    /// Windows: the offset now is the one the zone record says is in force
+    /// now (`GetTimeZoneInformation`: its bias, plus the daylight or standard
+    /// bias it reports active), a second reading by another API. CONTROL: a
+    /// whole number of quarter hours inside UTC-12..UTC+14, and an instant
+    /// before the `FILETIME` epoch reads nothing.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_offset_now_is_the_zone_records() {
+        #[repr(C)]
+        struct TimeZoneInformation {
+            bias: i32,
+            _standard_name: [u16; 32],
+            _standard_date: [u16; 8],
+            standard_bias: i32,
+            _daylight_name: [u16; 32],
+            _daylight_date: [u16; 8],
+            daylight_bias: i32,
+        }
+        unsafe extern "system" {
+            fn GetTimeZoneInformation(info: *mut TimeZoneInformation) -> u32;
+        }
+        const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+        let mut info = std::mem::MaybeUninit::<TimeZoneInformation>::zeroed();
+        // SAFETY: `info` is writable storage for one TIME_ZONE_INFORMATION.
+        let id = unsafe { GetTimeZoneInformation(info.as_mut_ptr()) };
+        assert_ne!(id, u32::MAX, "the zone record reads");
+        // SAFETY: the call above filled the structure.
+        let info = unsafe { info.assume_init() };
+        let active = if id == TIME_ZONE_ID_DAYLIGHT {
+            info.daylight_bias
+        } else {
+            info.standard_bias
+        };
+        let now = limit::unix_now();
+        let offset = local_offset_at(now).expect("the zone reads");
+        assert_eq!(offset, -i64::from(info.bias + active) * 60);
+        assert_eq!(offset % (15 * 60), 0, "{offset}");
+        assert!((-12 * 3600..=14 * 3600).contains(&offset), "{offset}");
+        assert_eq!(local_offset_at(-11_644_473_601), None, "before 1601");
+    }
+
     /// A system timezone replacement changes the zone identity as well as
     /// its offsets. A notice naming the former zone must not be interpreted
     /// with the new zone's clock. Every filesystem operation is scratch-only.
@@ -2051,31 +2266,12 @@ mod tests {
         );
     }
 
-    /// The band, its spoken sentence and the greyed menu row all read a hold
-    /// reason through [`hold_reason_words`]: decoded (never `main%20broken`),
-    /// then sanitized like any free text, so a `%e2%80%ae` in a bridge-supplied
-    /// reason cannot reverse the row.
+    /// The greyed menu row reads a hold reason through [`hold_reason_words`]:
+    /// decoded (never `main%20broken`), then sanitized like any free text, so a
+    /// `%e2%80%ae` in a bridge-supplied reason cannot reverse the row.
     #[test]
     fn the_hold_reason_is_decoded_and_sanitized_on_every_surface() {
-        let now = Instant::now();
-        let mut s = Slot::new(now);
-        s.absorb(
-            Facts {
-                hold: Some(HoldFact {
-                    reason: "main%20broken".into(),
-                    fleet: true,
-                }),
-                ..Facts::default()
-            },
-            now,
-        );
-        let w = words(&s, now, 0);
-        assert!(
-            w.sentence.contains("main broken"),
-            "spoken: {:?}",
-            w.sentence
-        );
-        assert!(w.hand.contains("main broken"), "{:?}", w.hand);
+        assert_eq!(hold_reason_words("main%20broken"), "main broken");
         assert_eq!(
             hold_reason_words("main%e2%80%aebroken%0a%1b[31m"),
             "mainbroken [31m"
@@ -2085,109 +2281,6 @@ mod tests {
             hold_reason_words("hold=x%20%e2%8a%98%20review"),
             "hold=x review"
         );
-        // The menu row's own pin (`menu::hold_row_reason`, the same words) lives
-        // beside that row in `menu.rs`.
-    }
-
-    /// This host's stall seam: `Native`'s four accessors over the server's real
-    /// [`crate::input_stall::InputStallFact`]: `since` reads the fact's instant,
-    /// `stopped` its `stopped` field (not the word), `survived` its restart
-    /// record and `restart` the publication's explicit restart (`act`). Each
-    /// case differs in exactly the field its accessor reads, so a crossed or
-    /// constant accessor fails one of them.
-    #[test]
-    fn the_native_stall_seam_reads_since_stopped_survived_and_the_act_off_the_fact() {
-        use crate::input_stall::{InputStallFact, Restart};
-        use aterm_session::input_backlog::InputWord;
-        let now = t0();
-        let since = now - Duration::from_secs(123);
-        let frozen = InputStallFact {
-            word: InputWord::Stalled,
-            since,
-            bytes: 1,
-            stopped: false,
-            rss_mb: None,
-            restart: Restart::default(),
-            act: None,
-        };
-        let read = |fact: InputStallFact| {
-            let mut s = Slot::new(now);
-            assert!(s.absorb(
-                Facts {
-                    input_stall: Some(fact),
-                    ..Facts::default()
-                },
-                now
-            ));
-            (s.level(0), s.chip(0), words(&s, now, 0))
-        };
-        // Frozen: the duration counts from the fact's `since`.
-        let (level, chip, w) = read(frozen.clone());
-        assert_eq!(level, Level::Limited);
-        assert_eq!(chip, ChipLevel::Stop(StopCause::Frozen));
-        assert_eq!(
-            (w.phase.as_str(), w.since.as_slice()),
-            (
-                "frozen",
-                &["2m03s".to_string(), "not reading input".to_string()][..]
-            )
-        );
-        assert!(
-            w.sentence
-                .contains("not reading input for 2m03s; restart it"),
-            "{}",
-            w.sentence
-        );
-        // Stopped is the `stopped` field: the word left at `Stalled`.
-        let (level, chip, w) = read(InputStallFact {
-            stopped: true,
-            ..frozen.clone()
-        });
-        assert_eq!(level, Level::Limited);
-        assert_eq!(chip, ChipLevel::Stop(StopCause::Suspended));
-        assert_eq!(w.phase, "stopped");
-        assert!(
-            w.sentence
-                .contains("stopped with input queued for 2m03s; resume it"),
-            "{}",
-            w.sentence
-        );
-        // Survived is the restart record's.
-        let survived = InputStallFact {
-            restart: Restart {
-                survived: true,
-                ..Restart::default()
-            },
-            ..frozen.clone()
-        };
-        let (_, chip, w) = read(survived.clone());
-        assert_eq!(chip, ChipLevel::Stop(StopCause::Frozen));
-        assert_eq!(
-            w.since,
-            vec!["2m03s".to_string(), "survived its restart".to_string()]
-        );
-        assert!(
-            w.sentence.contains("end it with signal kill"),
-            "{}",
-            w.sentence
-        );
-        // The act is the publication's: named by both frozen remedies.
-        let act = "aterm ctl @s-1 restart pid=4242 if-stalled";
-        for fact in [frozen, survived] {
-            let (_, _, w) = read(InputStallFact {
-                act: Some(crate::input_stall::StallAct {
-                    cmd: act.to_string(),
-                    promised: true,
-                }),
-                ..fact
-            });
-            assert!(
-                w.sentence.contains(&format!("; restart it with {act}"))
-                    && !w.sentence.contains("signal kill"),
-                "{}",
-                w.sentence
-            );
-        }
     }
 
     /// A Bash box in Claude Code's layout: header, the block of command (and
@@ -2416,3 +2509,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "presence_corpus_tests.rs"]
+mod corpus_tests;

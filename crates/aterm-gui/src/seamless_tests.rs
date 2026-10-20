@@ -243,6 +243,7 @@ impl Drop for ScratchEnv {
 /// several children run side by side. A child's output is said only when it
 /// failed: its own `test result:` line in the parent's would read, to
 /// `verify test`'s reading of the log, as a binary of its own.
+#[cfg(unix)]
 pub(crate) fn run_in_children(marker: &str, children: usize) -> Vec<String> {
     let spawned: Vec<crate::test_alone::Running> = {
         let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
@@ -316,6 +317,7 @@ fn a_target_refused_after_a_passing_deferral_exits_75() {
             "re-verify: bundle policy: codesign --verify (structural) failed".to_string(),
         ),
         ApplyOutcome::ReExecFailed(aterm_update::PASSING_REFUSAL_KEY.to_string()),
+        ApplyOutcome::Reverted(aterm_update::PASSING_REFUSAL_KEY.to_string()),
     ] {
         assert_eq!(
             passing_refusal_exit(&outcome, false, false, true),
@@ -898,6 +900,7 @@ fn zsh_record(local_id: u64, sid: &str) -> SessionRecord {
         attention_owners: Vec::new(),
         viewport_from_bottom: None,
         render_debt: None,
+        render_debt_cut: 0,
         questions: None,
         autopilot: None,
         land_at: None,
@@ -906,6 +909,8 @@ fn zsh_record(local_id: u64, sid: &str) -> SessionRecord {
         log_ids: None,
         log_seq: 0,
         journal_key: None,
+        task: None,
+        status_seen: None,
     }
 }
 
@@ -922,8 +927,10 @@ fn bare_manifest(sessions: Vec<SessionRecord>) -> SessionHandoff {
         held: Vec::new(),
         roster_seq: None,
         fabric_attached: Vec::new(),
+        fleet_told: Vec::new(),
         mirror_dropped: Vec::new(),
         mirror_served: false,
+        machine_names: Vec::new(),
     }
 }
 
@@ -1019,6 +1026,7 @@ fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
                     theme: None,
                     agent: None,
                     supervised: None,
+                    lost: None,
                     held: false,
                     holds: Vec::new(),
                 })),
@@ -1266,6 +1274,57 @@ fn modern_wide_narrow_checkpoint_preserves_full_tab_vector_and_rejects_bad_lengt
     assert!(
         !checkpoint_meta_is_bounded(&oversized),
         "oversize vector is rejected before restore/allocation growth"
+    );
+}
+
+/// The holder fence (`aterm-core`'s `holder_fence`) crosses the meta wire
+/// exactly; a value that does not read costs only the fence (the screen
+/// adopts, every card bare until its drawer is seeded); and a session no
+/// drawer ran in writes no key, so its meta bytes are what they were.
+#[test]
+fn the_holder_fence_crosses_the_meta_wire_and_a_bad_one_costs_only_the_fence() {
+    use aterm_core::terminal::{CutKind, HolderCut};
+    let mut t = aterm_core::terminal::Terminal::new(6, 40);
+    t.process(b"$ claude\r\n");
+    t.note_holder_cut(HolderCut {
+        to: Some(7),
+        kind: CutKind::Group,
+        from_alive: true,
+    });
+    t.process(b"\x1b[48;5;170mAAAA\x1b[0m\r\n");
+    let checkpoint = t.checkpoint_visible().expect("Ground");
+    let meta = CheckpointMeta::from_checkpoint(&checkpoint);
+    assert!(!meta.holder.is_empty());
+    let carry = |meta: String| ScreenCarry {
+        schema: ScreenCarry::SCHEMA,
+        meta,
+        grid_file: "unused-in-parser-test".to_string(),
+        alt_grid_file: None,
+        repaint: false,
+    };
+    let wire = aterm_json::to_string(&meta).unwrap();
+    let parsed = parse_checkpoint_meta(&carry(wire.clone())).expect("modern strict meta");
+    assert_eq!(parsed.holder, checkpoint.holder);
+    let restored = aterm_core::terminal::Terminal::from_checkpoint(
+        &parsed.into_checkpoint(checkpoint.grid.clone(), None),
+    );
+    assert_eq!(restored.holder_view(), t.holder_view());
+
+    let mut value: aterm_json::Value = aterm_json::from_str(&wire).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("holder".to_string(), aterm_json::Value::from("garbage"));
+    let parsed = parse_checkpoint_meta(&carry(aterm_json::to_string(&value).unwrap()))
+        .expect("a bad holder never costs the screen");
+    assert!(parsed.holder.is_empty());
+    assert_eq!(parsed.rows, 6);
+
+    let quiet = aterm_core::terminal::Terminal::new(6, 40);
+    let quiet = CheckpointMeta::from_checkpoint(&quiet.checkpoint_visible().expect("Ground"));
+    assert!(
+        !aterm_json::to_string(&quiet).unwrap().contains("holder"),
+        "no drawer, no key"
     );
 }
 
@@ -2246,6 +2305,23 @@ fn connections_that_cannot_cover_the_excess_measured_are_kept() {
         outgoing.connections_left_out, rows,
         "for the Commit to audit"
     );
+}
+
+/// The `ATERM_SEAMLESS_FDS` wire another build reads: the encoder's exact
+/// form round-trips through the receiver's parser, and one unparseable entry
+/// refuses the whole wire, so a corrupt value fabricates no session.
+#[test]
+fn the_fds_wire_round_trips_and_one_bad_entry_refuses_it_whole() {
+    let fds = HandoffFds {
+        entries: vec![(0, 6, 12345), (1, 7, 12346), (2, 9, 12347)],
+    };
+    let wire = fds.encode();
+    assert_eq!(wire, "0=6:12345,1=7:12346,2=9:12347");
+    assert_eq!(decode_fds_bounded(&wire), Some(fds));
+    assert_eq!(decode_fds_bounded(""), Some(HandoffFds::default()));
+    for bad in ["0=6:100,junk", "1=7", "2=x:y", "0=6:100,", ",0=6:100"] {
+        assert_eq!(decode_fds_bounded(bad), None, "{bad}");
+    }
 }
 
 #[test]
@@ -3586,7 +3662,7 @@ pub(super) struct StageCarry {
     pub(super) fg_holders: Vec<(u64, i32)>,
     /// Each session's render debt, as the park capture stamps it on the
     /// manifest record (`SessionRecord::render_debt`, R08).
-    pub(super) render_debts: Vec<(u64, (i32, i32))>,
+    pub(super) render_debts: Vec<(u64, aterm_core::terminal::RenderDebt)>,
 }
 
 #[cfg(unix)]
@@ -3615,6 +3691,7 @@ pub(super) fn stage_carry_handoff(label: &str, carry: &StageCarry) -> StagedHand
 
 /// The HISTORY CARRY's stamp, as the handoff worker runs it just before
 /// the manifest is written: the manifest, the control dir, the nonce.
+#[cfg(unix)]
 pub(super) type HistoryStamp<'a> = &'a dyn Fn(&mut SessionHandoff, &std::path::Path, &str);
 
 /// As [`stage_carry_handoff`], with the HISTORY CARRY stamped onto the
@@ -3714,7 +3791,7 @@ fn stage_outgoing_handoff_full(
             .unwrap_or_else(|e| panic!("open a close-on-exec pty pair {index}: {e}"));
         slaves.push(slave);
         let local_id = index as u64;
-        records.push(SessionRecord {
+        let mut record = SessionRecord {
             // What the park capture stamps (`stamp_fg_holders`).
             fg_holder: carry.and_then(|c| {
                 c.fg_holders
@@ -3722,17 +3799,16 @@ fn stage_outgoing_handoff_full(
                     .find(|(id, _)| *id == local_id)
                     .map(|(_, holder)| *holder)
             }),
-            // What the park capture stamps (`stamp_render_debts`).
-            render_debt: carry.and_then(|c| {
-                c.render_debts
-                    .iter()
-                    .find(|(id, _)| *id == local_id)
-                    .map(|(_, (shift, pushed))| {
-                        crate::session_store::render_debt_row(*shift, *pushed)
-                    })
-            }),
             ..zsh_record(local_id, &format!("s-e2e-{index}"))
-        });
+        };
+        // What the park capture stamps (`stamp_render_debts`).
+        record.carry_render_debt(carry.and_then(|c| {
+            c.render_debts
+                .iter()
+                .find(|(id, _)| *id == local_id)
+                .map(|(_, debt)| *debt)
+        }));
+        records.push(record);
         live.push((local_id, master, 4000 + index as i32));
         if let Some(carry) = carry {
             screens.push((local_id, carry.screens[index].clone()));
@@ -3760,6 +3836,8 @@ fn stage_outgoing_handoff_full(
             next_message_id: 0,
             font_px_milli: None,
             font_reset_px_milli: None,
+            font_size_milli: None,
+            font_reset_size_milli: None,
             update_health_said: Vec::new(),
             messages_captured_unix_ms: None,
         }),
@@ -4437,6 +4515,71 @@ fn a_hold_and_the_titles_cross_the_real_wire() {
     staged.teardown();
 }
 
+/// A WORKER'S TASK RECORD CROSSES THE REAL WIRE (the worker pillar,
+/// 2026-10-15): the record's row rides the manifest beside the screen, outside
+/// both digests; the successor's take puts it on the adopted session
+/// (`Adopted::task`), and the seed `spawn_session` runs puts the same rev,
+/// state and facts on that session's timeline. A session with no task
+/// crosses with none.
+///
+/// FAILS WITHOUT THE FIX: the adopted worker reads `OK task -`, and a
+/// manager re-armed past its rev on the successor takes it for never tasked.
+#[test]
+#[cfg(unix)]
+fn a_workers_task_record_crosses_the_real_wire() {
+    use crate::task_record::TaskState;
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _restore = restore_env();
+    let staged = stage_outgoing_handoff("taskwire", 2, None);
+    // The park draws the record onto its session's manifest row
+    // (`SessionHandoff::from_store`), outside both digests: the expectation
+    // fixed above is not recomputed, and the proof below still matching it is
+    // what shows the row is outside.
+    let body = std::fs::read_to_string(&staged.manifest_path).expect("read manifest");
+    let (file_nonce, toml) = body.split_once('\n').expect("nonce header");
+    let mut published = SessionHandoff::from_toml(toml).expect("parse the manifest");
+    let row = "rev=3 state=done from=ctl since=1000 result_bytes=12 attention=0 why=marker";
+    published.sessions[0].task = Some(row.to_string());
+    std::fs::write(
+        &staged.manifest_path,
+        format!("{file_nonce}\n{}", published.to_toml().expect("toml")),
+    )
+    .expect("republish");
+
+    let (ready_read, ready_write) = pipe_pair("ready");
+    let (commit_read, commit_write) = pipe_pair("commit");
+    staged.publish_env(
+        ready_write,
+        commit_read,
+        Some(encode_target_identity(
+            crate::build_info::build_number()
+                .parse::<u64>()
+                .unwrap_or(0),
+            crate::build_info::git_commit(),
+        )),
+    );
+    let incoming = take_incoming_as(ReceiverShape::Current);
+    let ((proof, ready, _), adopted) =
+        child_proof_from(incoming).expect("the child adopts and proves");
+    assert_eq!(proof, staged.expected, "the task row is in no digest");
+    let rows: Vec<Option<&str>> = adopted.iter().map(|a| a.task.as_deref()).collect();
+    assert_eq!(rows, [Some(row), None], "the record rides its own session");
+    let worker = crate::session_store::test_handle(adopted[0].local_id);
+    crate::task_record::seed_carried(&worker.ctx, adopted[0].task.as_deref());
+    let seeded = worker.ctx.timeline.lock().unwrap().task().cloned();
+    let seeded = seeded.expect("the record crossed");
+    assert_eq!(
+        (seeded.rev, seeded.state, seeded.why, seeded.result_bytes),
+        (3, TaskState::Done, Some("marker"), 12)
+    );
+
+    drop(ready);
+    for fd in [ready_read, commit_read, commit_write] {
+        aterm_pty::close_fd(fd);
+    }
+    staged.teardown();
+}
+
 /// AN OLDER PRODUCER'S BACKGROUND TAB TAKES THE TITLE ITS ENGINE HAD AT THE
 /// PARK, NOT THE RECORD'S STALE COPY (round eight of the update audit,
 /// U47). A producer before the title carry (v0.98.0 and older) writes no
@@ -4605,6 +4748,7 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
                 theme: None,
                 agent: None,
                 supervised: None,
+                lost: None,
                 held: false,
                 holds: Vec::new(),
             },
@@ -5419,6 +5563,38 @@ fn a_repaint_checkpoint_is_admitted_by_this_builds_own_predicates() {
         "with the aggregate spent there is no screen to carry — the pane builds its own"
     );
     assert!(repaint_checkpoint(None, &mut 0).is_none());
+}
+
+/// The repaint rung's screen is blank, so the rows a carried screen's resizes
+/// owed back (`GridCursorRepr::handback_rows`, `handback_above`) are owed on
+/// neither grid of its carry: a successor's grow must not append blanks or a
+/// shrink demote rows for a screen that is not there.
+#[test]
+fn a_repaint_checkpoint_owes_no_rows_back() {
+    let mut owing = CheckpointMeta::from_checkpoint(&{
+        let mut t = aterm_core::terminal::Terminal::new(8, 20);
+        for i in 0..20 {
+            t.process(format!("h{i}\r\n").as_bytes());
+        }
+        t.process(b"\x1b[H\x1b[2Jtop\r\n\x1b[?1049h");
+        t.checkpoint_carry(0).expect("Ground")
+    });
+    owing.cursor.handback_rows = 6;
+    owing.cursor.handback_above = 1;
+    let alt = owing.alt_cursor.as_mut().expect("a saved primary");
+    alt.handback_rows = -2;
+    alt.handback_above = 3;
+    let checkpoint = repaint_checkpoint(Some(&owing), &mut 0).expect("a repaint carry");
+    let alt = checkpoint.alt_cursor.as_ref().expect("the saved primary");
+    assert_eq!(
+        (
+            checkpoint.cursor.handback_rows,
+            checkpoint.cursor.handback_above,
+            alt.handback_rows,
+            alt.handback_above,
+        ),
+        (0, 0, 0, 0)
+    );
 }
 
 /// FAIL CLOSED #1 — a WRONG BUILD cannot claim the PTYs. The parent

@@ -102,19 +102,18 @@ fn parser_c1(c1: bool) -> Parser {
 /// `carry_unhooking` carries a hooked DCS string as one to IGNORE: the
 /// successor swallows the rest of its payload to the terminator — never
 /// printing it, never hooking a handler it did not start — and then reads
-/// what follows exactly as the live parser does. That includes a tmux
-/// passthrough wrapper's doubled ESC, which breaks out of the string into the
-/// inner sequence in both, UTF-8 in the payload (a tmux control-mode line, a
-/// kitty command's JSON) and an 8-bit ST, in either C1 mode. Everywhere else it is `carry` itself.
+/// what follows exactly as the live parser does. That includes UTF-8 in the
+/// payload (a tmux control-mode line, a kitty command's JSON) and an 8-bit ST,
+/// in either C1 mode. Everywhere else it is `carry` itself. (A tmux
+/// passthrough wrapper hooks no string: `tests::tmux` carries it.)
 ///
 /// RED with the first carried form, `DcsIgnore`: the tmux control-mode tail
 /// printed `\u{fffd} \u{276f} ls` and `%end` before `after`, the kitty tail
 /// `\u{fffd}llo"}`, and the sixel ended by `0x9C` swallowed `after`.
 #[test]
 fn a_hooked_dcs_carried_unhooking_is_swallowed_to_its_terminator() {
-    let cases: [(&[u8], &[u8]); 6] = [
+    let cases: [(&[u8], &[u8]); 5] = [
         (b"\x1bPq#0;2;0;0;0", b"#0!10~-\x1b\\after"),
-        (b"\x1bPtmu", b"x;\x1b\x1b]2;inner\x07\x1b\\after"),
         // tmux control mode (`DCS 1000 p`): UTF-8 in its lines.
         (
             b"\x1bP1000p%begin 1 1 0\n",
@@ -170,7 +169,7 @@ fn a_hooked_dcs_carried_unhooking_is_swallowed_to_its_terminator() {
             assert!(sink.apc_starts == 0 && sink.apc_data.is_empty() && sink.apc_ends == 0);
         }
     }
-    // The tmux tail's whole text is swallowed, the 8-bit-ST sixel's too: only
+    // The control-mode tail's whole text is swallowed, the 8-bit-ST sixel's too: only
     // `after` prints (the live parser's answer, which the loop compares).
     let mut successor = Parser::new();
     successor
@@ -200,7 +199,11 @@ fn a_hooked_dcs_carried_unhooking_is_swallowed_to_its_terminator() {
 #[test]
 fn a_dcs_at_the_escape_that_may_begin_its_st_is_still_hooked() {
     for c1 in [false, true] {
-        for head in [&b"\x1bP$qm\x1b"[..], b"\x1bPq#0~\x1b", b"\x1bPtmux;\x1b"] {
+        for head in [
+            &b"\x1bP$qm\x1b"[..],
+            b"\x1bPq#0~\x1b",
+            b"\x1bP1000p%end\x1b",
+        ] {
             let mut outgoing = parser_c1(c1);
             let mut sink = RecordingSink::default();
             outgoing.advance_fast(head, &mut sink);

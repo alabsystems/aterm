@@ -253,7 +253,8 @@ pub fn row_state(published: bool, staged: bool, latched: bool, buildable: bool) 
 pub enum Class {
     /// Built here.
     Plain,
-    /// A sysroot bundle: a human lane.
+    /// A sysroot bundle: the bundle lane's, which the agent cutting it runs on a
+    /// release-credential machine; never packed here.
     Bundle,
     /// Vendor-direct (`atpkg::vendor_direct::is_vendor`): a head pin of it is carried until
     /// retired; no lane packs it.
@@ -329,7 +330,8 @@ pub enum Decision {
     Error(String),
     /// Every served row is published.
     Ok,
-    /// A sysroot bundle: a human lane.
+    /// A sysroot bundle: the bundle lane's, which the agent cutting it runs on a
+    /// release-credential machine; never packed here.
     ManualBundle,
     /// Vendor-direct: nothing to do.
     Vendor,

@@ -17,11 +17,14 @@
 //! busy screen the host must be seen to read, held as long as the test needs
 //! and not for a count of seconds; at most [`UNTIL_MAX_TENTHS`], so it never
 //! waits on what waits on it), one named `*.gate` the same with no bound of
-//! its own (the test's hang detector is its bound), and one named `*.late` is
-//! not drawn at all: the fake waits [`LATE_S`] first, an agent still
-//! starting. A `*.hold`'s and a `*.late`'s seconds start once
-//! `<key log>.go` exists: at once ([`run_fake`]), or once the host has
-//! attached to the run ([`run_fake_attached`]). A screen
+//! its own (the test's hang detector is its bound), one named `*.look` is
+//! shown and reads nothing until the host has LOOKED at it (its journal's
+//! review point, [`let_go_once_looked`]: the test then creates `<key
+//! log>.next`, which the fake takes), and one named `*.late` is not drawn at
+//! all until the host has looked at the blank screen it leaves, an agent
+//! still starting. A `*.hold`'s seconds start once `<key log>.go` exists: at
+//! once ([`run_fake`]), or once the host has attached to the run
+//! ([`run_fake_attached`]). A screen
 //! named `*.type` is shown and then ONE bounded read
 //! (`dd bs=4096 count=1`) takes whatever was written to it — a policy text,
 //! one `send`, arrives whole in that one read — logged as `text:<bytes>`. The
@@ -59,15 +62,21 @@
 //!   never takes the text (the field still `Type something.` after it) gets
 //!   that ONE text, no Enter and no second text, and is handed over — so the
 //!   Enter above is the read-back's, not the script's.
-//! * WHAT THE SAFE RULES PROVE KEEPS ITS RULE: a read-only Bash box gets `1`;
-//!   the session survey `0`; the rm circuit breaker in a bypass session over
-//!   a scratch path `1`.
-//! * UNDER `approve = "safe"` WITH `rm_breaker_ask = true`, WHAT THEY CANNOT
-//!   PROVE IS HANDED TO THE HUMAN (by default an unproven rm breaker is
-//!   approved with a WARN line instead, 4be9d668d): the same breaker over
-//!   `S=/usr` and a `touch x` box leave the attention set, naming the
-//!   command, and nothing typed; switching `[harness] enabled` off in the file
-//!   stops the supervisor (its claim and its badge go) and still types nothing.
+//! * A READ-ONLY BASH BOX GETS `1` AND THE SESSION SURVEY `0`, the host's
+//!   attach and claim on the session's timeline. No Bash box's safe proof
+//!   holds in this rig — the fake's process names no session
+//!   (`ATERM_PARENT_SESSION_ID` unset), so the Bash tool's shell is unknown
+//!   (the ledger's `the worker's environment is unknown`) and the box gets
+//!   full power's one-shot allow (`allow-once@v1`), as an rm circuit breaker
+//!   over a scratch path does in a bypass session; the proofs themselves are
+//!   `aterm-agent`'s unit tests.
+//! * UNDER `approve = "safe"` WITH `rm_breaker_ask = true`, WHAT THE SAFE
+//!   RULES CANNOT PROVE IS HANDED TO THE HUMAN (by default an unproven rm
+//!   breaker is approved with a WARN line instead, 4be9d668d): the same
+//!   breaker over `S=/usr` and a `touch x` box leave the attention set,
+//!   naming the command, and nothing typed; switching `[harness] enabled` off
+//!   in the file stops the supervisor (its claim and its badge go) and still
+//!   types nothing.
 //! * ONE SUPERVISOR PER SESSION: another holder's live claim keeps the host
 //!   off the session; it attaches once that claim lapses.
 //! * NEGATIVE CONTROL: the same headless instance under `headless = false`
@@ -96,6 +105,11 @@
 //!   exits when its screens are done, under the full-power default
 //!   (`relaunch` and `upgrade` on) — never having registered a conversation,
 //!   its exit is journaled and neither relaunched nor said.
+//!
+//! * A HOSTED RUN IS TAPED AND REPLAYS OFFLINE: under the tape seam the
+//!   host's loop over a box is recorded, its acts the fake's key log, and the
+//!   tape runs again with no socket, REPRODUCED, in this world and in one that
+//!   shares nothing with it.
 //!
 //! ISOLATION: scratch HOME/XDG roots, a private control socket, a config with
 //! every automatic lane off but the supervisor under test (its `[harness]`
@@ -131,27 +145,22 @@ use crate::{headless_boot, launch_isolation};
 use headless_boot::ctl;
 use headless_boot::{ctl_ok, field, log_tail};
 
-/// How long a `*.hold` screen stays up: long enough for the supervisor to
-/// read it settled (its footer is what says bypass). Counted from the
-/// host's attach where the hold is what the host must read
-/// ([`run_fake_attached`]): counted from the fake's start it raced the attach
-/// itself — 2.5-13.3 s at load 130-200 (2026-09-27/28) — and a host that
-/// attached after the bypass frame had gone handed the box over as `outside a
-/// bypass session`.
+/// How long a `*.hold` screen stays up: a busy frame the host has no record of
+/// reading (a busy screen is no review point, so nothing is journaled at it),
+/// counted from the host's attach ([`run_fake_attached`]): long enough for its
+/// first look's settle. A frame whose READ is the precondition and leaves a
+/// record — the bypass footer, the blank of an agent still starting, an
+/// after-turn point — is a `*.look` or a `*.late` instead, held until the host
+/// has journaled its look at it ([`let_go_once_looked`]): held for a count of
+/// seconds it raced the host's look (5 s of every such run, and a host that
+/// looked after the bypass frame had gone handed the box over as `outside a
+/// bypass session`).
 const HOLD_S: u32 = 5;
 /// The most a `*.until` screen stays up when nothing releases it, in tenths of a
 /// second: long enough that the host reads it however late it looks, short enough
 /// that a host which tells its answer only at the worked edge (busy to idle) still
 /// gets one well inside a [`HANG`] - the screen must never wait on what waits on it.
 const UNTIL_MAX_TENTHS: u32 = 200;
-/// How long a `*.late` scene keeps the screen blank: longer than the
-/// supervisor's idle window (`aterm_agent::supervise`'s `IDLE_MS`, 2 s), so
-/// its first look settles on the blank screen as an idle point — as it does
-/// on a real Claude Code whose first frame comes seconds after its exec (its
-/// own start-up, a loaded machine). Counted from the attach
-/// ([`run_fake_attached`]): counted from the fake's start, a host that
-/// attached late never saw the blank screen, and the scene tested nothing.
-const LATE_S: u32 = 3;
 /// How long a wait for something that MUST happen — a key the host types, the
 /// fake's exit, an attention, a journal or log line, a launch, a claim's
 /// release — may take before it is read as a hang (AGENTS.md: a hang detector
@@ -229,7 +238,7 @@ fn boot_upgrade(tag: &str, harness: &str, settle_s: Option<u64>) -> Instance {
 /// that proves the shipped bounds end at their events.
 #[cfg(target_os = "macos")]
 fn boot_upgrade_on_the_shipped_clock(tag: &str, harness: &str, settle_s: Option<u64>) -> Instance {
-    boot_on(tag, harness, 40, settle_s, false)
+    boot_on(tag, harness, 40, settle_s, false, |_| Vec::new())
 }
 
 /// Boot one headless instance with `harness` appended to its config and the
@@ -244,12 +253,21 @@ fn boot_upgrade_on_the_shipped_clock(tag: &str, harness: &str, settle_s: Option<
 /// taken twice, and two tests failed in every whole-file run and passed
 /// alone). A reused tag fails here, before it can boot.
 fn boot_sized(tag: &str, harness: &str, lines: u16, settle_s: Option<u64>) -> Instance {
-    boot_on(tag, harness, lines, settle_s, true)
+    boot_on(tag, harness, lines, settle_s, true, |_| Vec::new())
 }
 
 /// [`boot_sized`], on the test clock when `fast` (the fast-timers seam
-/// `headless_boot` sets), else on the shipped one.
-fn boot_on(tag: &str, harness: &str, lines: u16, settle_s: Option<u64>, fast: bool) -> Instance {
+/// `headless_boot` sets), else on the shipped one, with what `seams` names
+/// for the scratch root (development seams: this is a debug build) set on
+/// the instance.
+fn boot_on(
+    tag: &str,
+    harness: &str,
+    lines: u16,
+    settle_s: Option<u64>,
+    fast: bool,
+    seams: impl FnOnce(&Path) -> Vec<(&'static str, String)>,
+) -> Instance {
     static TAKEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     {
         let mut taken = TAKEN
@@ -286,6 +304,9 @@ fn boot_on(tag: &str, harness: &str, lines: u16, settle_s: Option<u64>, fast: bo
             }
             if !fast {
                 cmd.env_remove(aterm_agent::harness::timings::FAST_SEAM);
+            }
+            for (key, value) in seams(tmp) {
+                cmd.env(key, value);
             }
         },
         |_| true,
@@ -749,9 +770,10 @@ fn write_world(tmp: &Path) {
          # each into the key log ($1) -- one byte, or ESC and the two after it --\n\
          # as `od -c` spells it; a *.hold screen is shown and nothing read, a\n\
          # *.until one the same until $log.release exists (or for a bound), a\n\
-         # *.gate one until it exists, a *.late one is a wait with nothing\n\
-         # drawn, and after a *.type screen ONE bounded read takes what was\n\
-         # written, logged text:. A *.hold's and a *.late's seconds start once\n\
+         # *.gate one until it exists, a *.look one until $log.next exists\n\
+         # (taken: the test makes one per look), a *.late one is that wait\n\
+         # with nothing drawn, and after a *.type screen ONE bounded read takes\n\
+         # what was written, logged text:. A *.hold's seconds start once\n\
          # $log.go exists (the test says when: the host has attached).\n\
          # It first writes a cell and erases it in place, as a real Claude\n\
          # Code moves the screen as it starts (start_fake says why).\n\
@@ -760,7 +782,7 @@ fn write_world(tmp: &Path) {
          old=$(stty -g)\n\
          stty -icanon -echo min 1\n\
          for scene in \"$@\"; do\n\
-         \x20 case \"$scene\" in *.late) while [ ! -e \"$log.go\" ]; do sleep 0.1; done; sleep {LATE_S}; continue ;; esac\n\
+         \x20 case \"$scene\" in *.late) while [ ! -e \"$log.next\" ]; do sleep 0.1; done; rm -f \"$log.next\"; continue ;; esac\n\
          \x20 printf '\\033[2J\\033[H'\n\
          \x20 cat \"$scene\"\n\
          \x20 r=$(grep -n '^❯' \"$scene\" | tail -n 1 | cut -d: -f1); [ -n \"$r\" ] && printf '\\033[%s;3H' \"$r\"\n\
@@ -768,6 +790,7 @@ fn write_world(tmp: &Path) {
          \x20 *.hold) while [ ! -e \"$log.go\" ]; do sleep 0.1; done; sleep {HOLD_S}; continue ;;\n\
          \x20 *.until) n=0; while [ ! -e \"$log.release\" ] && [ $n -lt {UNTIL_MAX_TENTHS} ]; do sleep 0.1; n=$((n+1)); done; continue ;;\n\
          \x20 *.gate) while [ ! -e \"$log.release\" ]; do sleep 0.1; done; continue ;;\n\
+         \x20 *.look) while [ ! -e \"$log.next\" ]; do sleep 0.1; done; rm -f \"$log.next\"; continue ;;\n\
          \x20 *.type) t=$(dd bs=4096 count=1 2>/dev/null); printf 'text:%s\\n' \"$t\" >> \"$log\"; continue ;;\n\
          \x20 esac\n\
          \x20 k=$(dd bs=1 count=1 2>/dev/null | od -An -c | tr -d ' ')\n\
@@ -814,8 +837,7 @@ fn write_world(tmp: &Path) {
             "wall.hold",
             body(WALL_SHELL).replace("resets 4pm (America/Los_Angeles)", "resets in 1h"),
         ),
-        ("bypass.hold", bypass_start()),
-        ("rm-scratch.txt", rm_box("S=/tmp/athh-scratch; rm -rf $S/a")),
+        ("bypass.look", bypass_start()),
         ("rm-usr.txt", rm_box("S=/usr; rm -rf $S/a")),
         ("owners-box.txt", body(OWNERS_BOX)),
         ("tall.txt", tall_box(33)),
@@ -894,7 +916,7 @@ fn write_world(tmp: &Path) {
         ("c2-person.type", screen(QUESTION_283_TYPED_PERSON)),
         ("worked.hold", screen(BUSY_283)),
         ("worked.until", screen(BUSY_283)),
-        ("done.hold", screen(AFTER_TURN_283)),
+        ("done.look", screen(AFTER_TURN_283)),
     ];
     for (name, rows) in screens_283 {
         std::fs::write(sc.join(name), drawn(&rows)).expect("write a screen");
@@ -902,32 +924,23 @@ fn write_world(tmp: &Path) {
 }
 
 /// Start the fake on `screens` in the boot session, from `work/` with the
-/// cwd reported as shell integration reports it (OSC 7). Its `*.hold` and
-/// `*.late` scenes count their seconds from its start (`<keys>.go` is there
-/// before it runs).
+/// cwd reported as shell integration reports it (OSC 7). Its `*.hold` scenes
+/// count their seconds from its start (`<keys>.go` is there before it runs).
 fn run_fake(inst: &Instance, keys: &str, screens: &[&str]) {
     std::fs::write(inst.tmp.join(format!("{keys}.go")), b"").expect("start the fake's clock");
     start_fake(inst, keys, screens);
 }
 
-/// [`run_fake`] for scenes whose seconds are what the HOST must see (a
-/// `*.hold` frame it must read, a `*.late` blank it must settle on): the fake
-/// starts, and once the host has attached to THIS run — its claim
-/// (`meta-change field=supervisor value=aterm-harness…`) on the session's
-/// timeline after the start, an earlier run's claim having been released
-/// first — the scenes' seconds begin (`<keys>.go`). Each is timed from the
-/// attach, never from a start the machine may take seconds to follow with
-/// the attach ([`HOLD_S`], [`LATE_S`]); how long the attach took is printed,
-/// never judged. The earlier claim's end is only this precondition, never the
-/// property, so it is waited for under [`HANG`]: a lapsed lease ends it as
-/// well as a release does (a lapse cannot come inside [`HANG`]).
+/// [`run_fake`] for a `*.hold` frame the HOST must see and leaves no record
+/// of reading (a busy frame: [`HOLD_S`]): the fake starts, and once the host
+/// has attached to THIS run — its claim (`meta-change field=supervisor
+/// value=aterm-harness…`) on the session's timeline after the start, an
+/// earlier run's claim having been released first ([`no_earlier_claim`]) —
+/// the hold's seconds begin (`<keys>.go`), timed from the attach, never from a
+/// start the machine may take seconds to follow with the attach; how long the
+/// attach took is printed, never judged.
 fn run_fake_attached(inst: &Instance, keys: &str, screens: &[&str]) {
-    until(
-        HANG,
-        "the host released any earlier run's claim (or its lease lapsed)",
-        || status(inst),
-        |s| field(s, "supervisor") == Some("-"),
-    );
+    no_earlier_claim(inst);
     let go = inst.tmp.join(format!("{keys}.go"));
     let _ = std::fs::remove_file(&go);
     let mark = timeline_since(inst, 0).last().map_or(0, |e| e.0);
@@ -956,8 +969,79 @@ fn run_fake_attached(inst: &Instance, keys: &str, screens: &[&str]) {
     std::fs::write(&go, b"").expect("start the fake's clock");
 }
 
-/// [`run_fake`] without the clock: the fake's `*.hold` and `*.late` scenes
-/// wait for `<keys>.go`.
+/// The host has released any earlier run's claim (or its lease lapsed): its
+/// loop over that run has ended, so whatever it records from here is a later
+/// run's. Only a precondition, never the property, so it is waited for under
+/// [`HANG`]: a lapsed lease ends it as well as a release does (a lapse cannot
+/// come inside [`HANG`]).
+fn no_earlier_claim(inst: &Instance) {
+    until(
+        HANG,
+        "the host released any earlier run's claim (or its lease lapsed)",
+        || status(inst),
+        |s| field(s, "supervisor") == Some("-"),
+    );
+}
+
+/// The session's loop journal, one record per line ([`journal`]).
+fn journal_records(inst: &Instance) -> Vec<aterm_agent::supervise::journal::JournalRecord> {
+    journal(inst)
+        .lines()
+        .filter_map(|l| aterm_agent::supervise::journal::JournalRecord::from_json(l).ok())
+        .collect()
+}
+
+/// [`run_fake`] for scenes the HOST must have read before they go: each
+/// leading `*.late` blank and `*.look` frame is let go once the host has
+/// journaled its look at it ([`let_go_once_looked`]), in order, after any
+/// earlier run's loop has ended ([`no_earlier_claim`]). Returns the journal's
+/// record count at the last of those looks.
+fn run_fake_looked(inst: &Instance, keys: &str, screens: &[&str]) -> usize {
+    no_earlier_claim(inst);
+    let mut mark = journal_records(inst).len();
+    start_fake(inst, keys, screens);
+    for scene in screens
+        .iter()
+        .take_while(|s| s.ends_with(".late") || s.ends_with(".look"))
+    {
+        mark = let_go_once_looked(inst, keys, mark, scene.ends_with(".late"));
+    }
+    mark
+}
+
+/// Let the fake whose key log is `keys` go on past the `*.look` frame or
+/// `*.late` blank it holds (`<keys>.next`, which the fake takes) once the host
+/// has LOOKED at it: a review point (`EVENT …`) in the loop's journal past its
+/// first `mark` records, read on the blank screen (the point's said summary
+/// `-`) for a `*.late` (`blank`), on a drawn one for a `*.look`. An event, not
+/// a count of seconds: the bypass footer is read at that look, and the blank
+/// is that look's idle point. Returns the journal's record count at the look.
+fn let_go_once_looked(inst: &Instance, keys: &str, mark: usize, blank: bool) -> usize {
+    let deadline = Instant::now() + HANG;
+    loop {
+        let records = journal_records(inst);
+        if let Some(at) = records
+            .iter()
+            .skip(mark)
+            .position(|r| r.kind == "event" && (r.summary == "-") == blank)
+        {
+            std::fs::write(inst.tmp.join(format!("{keys}.next")), b"").expect("let the fake go on");
+            return mark + at + 1;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the host's look at {keys}'s {} scene: not within {HANG:?} (a hang); journal:\n{}\n\
+             harness log:\n{}",
+            if blank { "blank" } else { "drawn" },
+            journal(inst),
+            harness_lines(inst)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// [`run_fake`] without the clock: the fake's `*.hold` scenes wait for
+/// `<keys>.go`, its `*.look` and `*.late` ones for `<keys>.next`.
 ///
 /// WHAT THE FAKE WRITES AT START (`x`, backspace, space, backspace: a cell
 /// written and erased in place, so the rows end as they were), for the reason
@@ -966,10 +1050,10 @@ fn run_fake_attached(inst: &Instance, keys: &str, screens: &[&str]) {
 /// 500 ms later (`PROGRAM_NAME_CONFIRM`), then only when the screen moves. A
 /// name read while the shell's child was still between fork and exec (a
 /// loaded machine stretches that past 500 ms) stands at `sh` until something
-/// moves. A run whose first scene is a `*.late` blank under
-/// [`run_fake_attached`] moves nothing until `<keys>.go`, and `<keys>.go`
-/// waits for the host's attach, which waits for `program=claude`: without
-/// the cell, that read held the run at its hang detector.
+/// moves. A run whose first scene is a `*.late` blank moves nothing until
+/// the host has looked at it ([`run_fake_looked`]), and the host attaches
+/// only once it reads `program=claude`: without the cell, that read held the
+/// run at its hang detector.
 fn start_fake(inst: &Instance, keys: &str, screens: &[&str]) {
     let tmp = inst.tmp.display();
     let scenes: Vec<String> = screens.iter().map(|s| format!("{tmp}/sc/{s}")).collect();
@@ -1175,7 +1259,7 @@ fn escalated_after(
 
 /// THE OWNER'S DEFAULT (2026-09-24, and 2026-09-25 for questions): with no
 /// `[harness]` key written, the host answers every box — the rm circuit
-/// breaker over `S=/usr` in a bypass session, which the safe rules hand over
+/// breaker over `S=/usr`, which the safe rules hand over when asked to
 /// ([`the_host_hands_over_what_it_cannot_prove_and_types_nothing`]), and the
 /// measured `touch x` box as captured, its garbled `3. Nooject` and all, get
 /// their one-shot `Yes` — answers a live-geometry question (S1-01) with Enter
@@ -1186,7 +1270,10 @@ fn escalated_after(
 #[test]
 fn the_host_answers_every_box_by_default() {
     let inst = boot("d", "");
-    run_fake_attached(&inst, "k1", &["bypass.hold", "rm-usr.txt"]);
+    // No bypass frame first: the session's mode is no part of this answer (an
+    // unproven breaker gets its one-shot allow in any mode); the host's read
+    // of a bypass footer is the hand-over test's.
+    run_fake(&inst, "k1", &["rm-usr.txt"]);
     keys_until(&inst, "k1", &["1"], HANG);
     program_is(&inst, "sh", HANG);
 
@@ -1207,9 +1294,10 @@ fn the_host_answers_every_box_by_default() {
 /// carrying a misspelled key, a key a newer aterm might add, and `approve` and
 /// `enabled` values no reading makes sense of — the last two of which were
 /// read as their limits before the ruling, `approve = none` and the harness
-/// off — still gets `1` on the rm circuit breaker over `S=/usr` in a bypass
-/// session. NEGATIVE CONTROL: the same box under an explicit off spelled
-/// `approve = "no"` is handed over with nothing typed.
+/// off — still gets `1` on the rm circuit breaker over `S=/usr` (in any
+/// permission mode: [`the_host_answers_every_box_by_default`]). NEGATIVE
+/// CONTROL: the same box under an explicit off spelled `approve = "no"` is
+/// handed over with nothing typed.
 ///
 /// The two instances share nothing (each its own scratch world, socket and
 /// fake), so they run side by side: one after the other they were 18-21 s of
@@ -1221,13 +1309,13 @@ fn a_typo_in_the_harness_table_never_stops_the_answers() {
             let noisy = "approve = \"maybe\"\nenabled = \"sometimes\"\nrm_breakr = false\n\
                          some_future_key = true\n";
             let inst = boot("t", noisy);
-            run_fake(&inst, "k1", &["bypass.hold", "rm-usr.txt"]);
+            run_fake(&inst, "k1", &["rm-usr.txt"]);
             keys_until(&inst, "k1", &["1"], HANG);
             program_is(&inst, "sh", HANG);
         });
         let off = scope.spawn(|| {
             let inst = boot("u", "approve = \"no\"\n");
-            run_fake(&inst, "k1", &["bypass.hold", "rm-usr.txt"]);
+            run_fake(&inst, "k1", &["rm-usr.txt"]);
             escalated_and_quiet(&inst, "k1", "S=/usr; rm -rf $S/a");
         });
         typo.join().expect("the typo's run");
@@ -1360,13 +1448,20 @@ fn release_fake(inst: &Instance, log: &str) {
 }
 
 /// The dialog is answered, told and gone: `CHOSE` names `rule` and `word`;
-/// the fake exits (every scene read); the ledger holds `approvals` approvals
-/// under `rule`; nothing is badged.
+/// the fake exits (every scene read) once the host has looked at the turn's
+/// end after it (`done.look`); the ledger holds `approvals` approvals under
+/// `rule`; nothing is badged.
 fn told_by_the_worker(inst: &Instance, rule: &str, word: &str, approvals: usize) {
     let line = chose(inst, HANG);
     // The fake held its busy screen ([`write_world`]'s `worked.until`) so the
-    // host read it busy however late it looked; now it may finish.
+    // host read it busy however late it looked; now it may finish, and its
+    // last point stands until the host has looked at it.
+    let told = journal_records(inst)
+        .iter()
+        .position(|r| r.kind == "chose")
+        .expect("the CHOSE record just read");
     release_fake(inst, "k1");
+    let_go_once_looked(inst, "k1", told + 1, false);
     assert!(
         line.contains(&format!("rule={rule} policy={word} ")),
         "{line}"
@@ -1401,7 +1496,7 @@ fn under_long_term_the_worker_decides_a_single_select_question() {
             "c1-field.type",
             "c1-long.txt",
             "worked.until",
-            "done.hold",
+            "done.look",
         ],
     );
     let text = text_read(QuestionPriority::LongTerm);
@@ -1430,7 +1525,7 @@ fn under_long_term_the_worker_decides_a_multi_select_question() {
             "c3-long-button.txt",
             "c3-review.txt",
             "worked.until",
-            "done.hold",
+            "done.look",
         ],
     );
     let text = text_read(QuestionPriority::LongTerm);
@@ -1472,7 +1567,7 @@ fn a_session_s_short_term_word_decides_over_the_global_recommended() {
             "c8-field.type",
             "c8-short.txt",
             "worked.until",
-            "done.hold",
+            "done.look",
         ],
     );
     let text = text_read(QuestionPriority::ShortTerm);
@@ -1562,11 +1657,6 @@ fn the_host_answers_what_the_policy_proves_safe() {
     keys_until(&inst, "k2", &["0"], HANG);
     program_is(&inst, "sh", HANG);
 
-    // The rm circuit breaker in a bypass session, every operand under a
-    // scratch root: `1`.
-    run_fake_attached(&inst, "k3", &["bypass.hold", "rm-scratch.txt"]);
-    keys_until(&inst, "k3", &["1"], HANG);
-    program_is(&inst, "sh", HANG);
     // The host detached with the program: its claim went with it.
     until(
         HANG,
@@ -1649,7 +1739,8 @@ fn the_host_dismisses_every_kind_of_rating_card_and_reads_a_busy_worker_busy_und
 /// Under the owner's `approve = "safe"` (full power, the default, answers
 /// these boxes: aterm's `supervise_turn_end_live_headless.rs`).
 ///
-/// THE FAKE STARTS LATE ([`LATE_S`]), so the supervisor's first idle point is
+/// THE FAKE STARTS LATE (`start.late`, drawn only once the host has looked at
+/// the blank: [`run_fake_looked`]), so the supervisor's first idle point is
 /// the blank screen before its first frame, and that frame — the footer that
 /// says bypass — moves no verdict (idle to idle). The bypass proof below
 /// holds only because a point read before any footer is waited on by its
@@ -1665,7 +1756,7 @@ fn the_host_hands_over_what_it_cannot_prove_and_types_nothing() {
     // restores the hand-over this test is about.
     let inst = boot("e", "approve = \"safe\"\nrm_breaker_ask = true\n");
     // The same breaker over /usr: escalated, naming the command.
-    run_fake_attached(&inst, "k1", &["start.late", "bypass.hold", "rm-usr.txt"]);
+    run_fake_looked(&inst, "k1", &["start.late", "bypass.look", "rm-usr.txt"]);
     let text = escalated_and_quiet(&inst, "k1", "S=/usr; rm -rf $S/a");
     // Refused on WHERE it points, not on the session's mode: the regression
     // above handed the same box over as `outside a bypass session`.
@@ -1921,6 +2012,18 @@ const CONVERSATION: &str = "0badf00d-1111-2222-3333-444455556666";
 /// shell prompt — and dies
 /// by SIGKILL once `die` exists (a crash: its record stays behind). It
 /// answers `--version` as the managed twin is asked.
+///
+/// IT TAKES WHAT IS TYPED INTO IT as Claude Code's composer does: a burst of
+/// text is drawn as the long paste it is (`[Pasted text #1]` on the caret
+/// row), and an Enter empties the composer (the idle frame again). The
+/// harness types its continuation as a checked `turn` — the echo waited for,
+/// then an Enter verified by the screen moving — and a fake that read
+/// nothing left both unseen: the echo's cap (5 s) and the submit's window
+/// ran out in full before the step said `continued`, 7 s of every run.
+/// Every read is bounded (`stty min 0 time 2`), so `die` is looked for each
+/// 0.2 s as before; an escape sequence (a focus report) is no typing. What it
+/// reads is appended, raw, to `typed-<its pid>.log`: the ground truth of what
+/// each launch was given.
 fn write_relaunch_fake(inst: &Instance) {
     std::fs::write(inst.tmp.join("sc/idle.txt"), bypass_start()).expect("idle screen");
     let fake = format!(
@@ -1928,7 +2031,7 @@ fn write_relaunch_fake(inst: &Instance) {
          case \"$1\" in --version) echo '2.1.281 (Claude Code)'; exit 0 ;; esac\n\
          tmp=${{HOME%/home}}\n\
          echo \"$$ $*\" >> \"$tmp/launches.log\"\n\
-         stty -icanon -echo min 1 2>/dev/null\n\
+         stty -icanon -echo min 0 time 2 2>/dev/null\n\
          sid={CONVERSATION}; prev=\n\
          for a in \"$@\"; do [ \"$prev\" = --resume ] && sid=$a; prev=$a; done\n\
          start=$(LC_ALL=C TZ=UTC ps -o lstart= -p $$ | awk '{{$1=$1; print}}')\n\
@@ -1942,9 +2045,17 @@ fn write_relaunch_fake(inst: &Instance) {
          printf '\\033[?1049h\\033[?1004h\\033[2J\\033[H'\n\
          cat \"$tmp/sc/idle.txt\"\n\
          r=$(grep -n '^❯' \"$tmp/sc/idle.txt\" | tail -n 1 | cut -d: -f1); [ -n \"$r\" ] && printf '\\033[%s;3H' \"$r\"\n\
+         cr=$(printf '\\r'); nl=$(printf '\\n.'); nl=${{nl%.}}; esc=$(printf '\\033')\n\
          while :; do\n\
          \x20 if [ -e \"$tmp/die\" ]; then rm -f \"$tmp/die\"; kill -KILL $$; fi\n\
-         \x20 sleep 0.2\n\
+         \x20 got=$(dd bs=4096 count=1 2>/dev/null; echo .); got=${{got%.}}\n\
+         \x20 [ -n \"$got\" ] && printf '%s' \"$got\" >> \"$tmp/typed-$$.log\"\n\
+         \x20 case \"$got\" in\n\
+         \x20 '') ;;\n\
+         \x20 *\"$cr\"*|*\"$nl\"*) printf '\\033[2J\\033[H'; cat \"$tmp/sc/idle.txt\"; printf '\\033[%s;3H' \"$r\" ;;\n\
+         \x20 \"$esc\"*) ;;\n\
+         \x20 *) printf '\\033[%s;3H\\033[K[Pasted text #1]' \"$r\" ;;\n\
+         \x20 esac\n\
          done\n"
     );
     place_fake(&fake_path(&inst.tmp), &fake);
@@ -1960,6 +2071,12 @@ fn launches(inst: &Instance) -> Vec<(u32, String)> {
 #[cfg(target_os = "macos")] // only the macOS-only upgrade tests use it
 fn probes(inst: &Instance) -> Vec<(u32, String)> {
     exec_log(inst, "probes.log")
+}
+
+/// The arguments of each start probe the host ran ([`probes`]), in order.
+#[cfg(target_os = "macos")]
+fn probe_args(inst: &Instance) -> Vec<String> {
+    probes(inst).into_iter().map(|(_, args)| args).collect()
 }
 
 /// The `<pid> <args>` lines a fake logged to `name`, as `(pid, args)`.
@@ -2094,6 +2211,21 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
         |r| r.contains(r#""phase":"done""#) && !r.contains(r#""resumed_pid":0"#),
     );
     assert!(record.contains(r#""cause":"exit""#), "{record}");
+    // …and what the relaunched process READ (its own log, focus reports
+    // aside): the continuation for an unasked exit, then its Enter. The record
+    // alone is no proof: a carry-on that typed nothing is `done` too, the
+    // resumed process named all the same.
+    let read = std::fs::read_to_string(inst.tmp.join(format!("typed-{new}.log")))
+        .unwrap_or_default()
+        .replace("\x1b[I", "")
+        .replace("\x1b[O", "");
+    let want = aterm_agent::harness::relaunch::resumed_prompt("2.1.281", "exit");
+    assert_eq!(
+        read.strip_suffix(['\r', '\n']),
+        Some(want.as_str()),
+        "the continuation typed into the relaunched agent; record: {record}\nharness log:\n{}",
+        harness_lines(&inst)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2150,9 +2282,11 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
 /// composer only once the test removes it: an agent still booting, as long
 /// as the test needs (a build the test does not name is never held).
 /// The host's start probe of a build (`<build> --help`, run with no terminal
-/// before a crashed agent's relaunch onto a build no probe proved, and before
-/// a move onto one with a failure noted, never before the upgrade's own first
-/// move: `aterm_agent::harness::upgrade_build_start`, ATERM-KI-1015-1 LC-5) is
+/// before a crashed agent's relaunch onto a build no probe proved, before a
+/// move onto one with a failure noted, and once before the upgrade's own
+/// first move onto a build never run here:
+/// `aterm_agent::harness::upgrade_build_start`, LC-5 of ATERM-KI-1015-1 and
+/// ATERM-KI-1016-1) is
 /// answered as Claude Code answers it — a usage printed and exit 0, nothing
 /// registered, no transcript touched — and logged to `probes.log`
 /// ([`probes`]), never to `launches.log`: it starts no agent.
@@ -2464,14 +2598,14 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
         format!("2.1.282 --model opus --resume {CONVERSATION}"),
         "the new build, its flags kept, its conversation resumed"
     );
-    // ATERM-KI-1015-1 LC-5, live, as main's review of the r20 relaunch lane
-    // settled it (`7901960f1`): the upgrade's own first move onto a build
-    // never run here is how a build is tried, and runs no start probe — only
-    // a crash's relaunch waits on a probe's proof.
+    // ATERM-KI-1016-1 LC-5, live: the upgrade's own first move onto a build
+    // never run here probes it once (`<build> --help`), right before the
+    // move, so a build that fails at its first start ends no working agent
+    // (`upgrade_build_start`; the handoff's "A build that failed to start").
     assert_eq!(
-        probes(&inst),
-        [],
-        "the upgrade's own first move runs no probe"
+        probe_args(&inst),
+        ["2.1.282 --help"],
+        "the upgrade's own first move probes the new build once"
     );
     until(
         HANG,
@@ -2568,11 +2702,11 @@ fn a_session_nobody_asked_anything_is_restarted_afresh_with_nothing_typed() {
         "the new build, its flags kept, nothing resumed"
     );
     // LC-5, live: the fresh restart's own first move onto the new build
-    // runs no start probe either.
+    // probes it once too.
     assert_eq!(
-        probes(&inst),
-        [],
-        "the upgrade's own first move runs no probe"
+        probe_args(&inst),
+        ["2.1.282 --help"],
+        "the upgrade's own first move probes the new build once"
     );
     let log = until(
         HANG,
@@ -2840,5 +2974,258 @@ fn wall_level(tag: &str, harness: &str, stop: bool) {
         stop,
         "{tag}: {st}\n{}",
         harness_lines(&inst)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The harness tape of a hosted run.
+// ---------------------------------------------------------------------------
+
+/// Every file under `dir` with its bytes, and every directory (named with a
+/// trailing `/`, no bytes), sorted by path. Links are not followed.
+fn contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                out.push((format!("{}/", path.display()), Vec::new()));
+                stack.push(path);
+            } else {
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                out.push((path.display().to_string(), bytes));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The control-check of [`contents`]: a directory with nothing in it is
+/// seen, so "the replay made nothing" sees one too.
+#[test]
+fn contents_sees_an_empty_directory() {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-contents-")
+        .tempdir()
+        .expect("a dir");
+    assert!(contents(dir.path()).is_empty());
+    std::fs::create_dir_all(dir.path().join("a").join("b")).expect("made");
+    let seen: Vec<String> = contents(dir.path()).into_iter().map(|(p, _)| p).collect();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert!(seen.iter().all(|p| p.ends_with('/')), "{seen:?}");
+}
+
+/// The keys a REPRODUCED replay's loop pressed — each request on its lane the
+/// tape holds, in order, checked against it one by one — the last word of
+/// each `key` act.
+fn pressed(report: &aterm_agent::supervise::tape::report::Report) -> Vec<String> {
+    report
+        .requests
+        .iter()
+        .filter(|words| {
+            words
+                .iter()
+                .find(|w| !w.starts_with('@'))
+                .is_some_and(|v| v == "key")
+        })
+        .filter_map(|words| words.last().cloned())
+        .collect()
+}
+
+/// The state root a taped instance runs under: its scratch world's `state/`
+/// with no link on its path. The hosted store opens each ancestor without
+/// following a link (`aterm_agent::supervise::tape::store`'s custody), and a
+/// macOS scratch world under `$TMPDIR` or `/tmp` sits under one (`/var`,
+/// `/tmp` → `/private/…`), where it would record nothing.
+fn tape_state(tmp: &Path) -> String {
+    std::fs::canonicalize(tmp.join("state"))
+        .expect("the scratch state root")
+        .to_str()
+        .expect("a UTF-8 scratch path")
+        .to_string()
+}
+
+/// The session's hosted tapes as `aterm drive tape ls @<sid>` lists them in
+/// the instance's own scratch world: each line's path, newest first.
+fn listed_tapes(inst: &Instance) -> Vec<PathBuf> {
+    let sel = format!("@{}", inst.sid);
+    let state = tape_state(&inst.tmp);
+    let out = headless_boot::drive_in(
+        &inst.tmp,
+        &["tape", "ls", &sel],
+        &[("ATERM_STATE_HOME", &state)],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", headless_boot::said(&out));
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once(" ago  ").map(|(_, rest)| rest))
+        .map(|rest| PathBuf::from(rest.trim_end_matches("  kept")))
+        .collect()
+}
+
+/// Whether the tape at `path` carries its run's end (its loop ended): a tape
+/// still being written replays only as ENDED.
+fn tape_ended(path: &Path) -> bool {
+    use aterm_agent::supervise::tape::codec::Item;
+    std::fs::read(path)
+        .ok()
+        .and_then(|raw| aterm_agent::supervise::tape::show::open(&raw, false).ok())
+        .is_some_and(|tape| tape.items.iter().any(|i| matches!(i, Item::End(_))))
+}
+
+/// A HOSTED RUN IS TAPED AND REPLAYS OFFLINE, IN A CHANGED WORLD (the replay
+/// plan's T6 and T7), on a real headless instance whose window host records
+/// its loops (`aterm_agent::supervise::tape::store::HOSTED_SEAM`, the
+/// development seam a debug build reads and a shipped one never compiles):
+///
+/// * THE RECORDING: the host answers the fake's measured `touch x` box with
+///   its `1` (full power, the owner's default), and the fake ends; the loop
+///   ends with it, its claim given back, and its tape — listed by `aterm
+///   drive tape ls @<sid>` under `<state>/drive/tapes/<sid>/`, `0600` —
+///   carries its end. The tape's ACTS are the fake's key log: every key the
+///   tape says the loop pressed reached the fake, and nothing else did.
+/// * THE REPLAY, OFFLINE: in this process the report is REPRODUCED, every
+///   effect consumed; `aterm drive replay FILE` in the same scratch world, no
+///   socket named, says REPRODUCED and exits 0.
+/// * IN A CHANGED WORLD: the same child in a world that shares nothing with
+///   the recording's — `HOME=/nonexistent`, another `$TMPDIR` and other XDG
+///   roots, the zone `Pacific/Kiritimati` (UTC+14), another working
+///   directory, no control socket anywhere it could look — is REPRODUCED
+///   too, and makes nothing in its temp dir; the recording's own journal,
+///   ledger and tapes are byte for byte what they were before either replay.
+///
+/// How long the in-process replay took is printed, never judged.
+#[test]
+fn a_hosted_run_is_taped_and_replays_offline_in_a_changed_world() {
+    use aterm_agent::supervise::tape::replay::{Options, replay};
+    use aterm_agent::supervise::tape::report::Verdict;
+    use aterm_agent::supervise::tape::store::HOSTED_SEAM;
+
+    let inst = boot_on("tape", "", 40, None, true, |tmp| {
+        vec![
+            (HOSTED_SEAM, "1".to_string()),
+            ("ATERM_STATE_HOME", tape_state(tmp)),
+        ]
+    });
+    run_fake(&inst, "kt", &["touch.txt"]);
+    keys_until(&inst, "kt", &["1"], HANG);
+    program_is(&inst, "sh", HANG);
+    // The loop ends with its agent: the claim given back, the tape's end
+    // written.
+    until(
+        HANG,
+        "the host's loop gave its claim back",
+        || status(&inst),
+        |s| field(s, "supervisor") == Some("-"),
+    );
+    let deadline = Instant::now() + HANG;
+    let tape = loop {
+        let tapes = listed_tapes(&inst);
+        if let [tape] = tapes.as_slice()
+            && tape_ended(tape)
+        {
+            break tape.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "one ended tape of the run: not within {HANG:?}; listed {tapes:?}\nharness log:\n{}",
+            harness_lines(&inst)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let session_dir = tape.parent().expect("the session's directory");
+    assert_eq!(
+        session_dir.file_name().and_then(|n| n.to_str()),
+        Some(inst.sid.as_str()),
+        "{}",
+        tape.display()
+    );
+    let tapes_dir = session_dir.parent().expect("the store");
+    assert!(tapes_dir.ends_with("drive/tapes"), "{}", tape.display());
+    let drive = tapes_dir.parent().expect("<state>/drive").to_path_buf();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&tape)
+            .expect("the tape")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the tape is private: {mode:o}");
+    }
+    let before = contents(&drive);
+    assert!(
+        before.iter().any(|(p, _)| p.ends_with(".journal.jsonl")),
+        "the run journaled beside its tape: {:?}",
+        before.iter().map(|(p, _)| p).collect::<Vec<_>>()
+    );
+    let bytes = std::fs::read(&tape).expect("the tape");
+
+    // In this process: REPRODUCED, its acts the fake's key log.
+    let started = Instant::now();
+    let report = replay(&bytes, &Options::default()).expect("the tape replays");
+    let took = started.elapsed();
+    assert_eq!(report.verdict, Verdict::Reproduced, "{}", report.render());
+    assert_eq!(report.consumed, report.effects, "{}", report.render());
+    assert_eq!(
+        pressed(&report),
+        keys(&inst, "kt"),
+        "the tape's acts are what reached the fake: {}",
+        report.render()
+    );
+    eprintln!(
+        "measured, not judged: {} effects of a `{}` tape replayed in {took:?} in-process",
+        report.effects, report.entry
+    );
+
+    // A child, the same scratch world, no socket named.
+    let tape_s = tape.to_str().expect("a UTF-8 scratch path");
+    let same = headless_boot::drive_in(&inst.tmp, &["replay", tape_s], &[], None);
+    assert_eq!(
+        same.status.code(),
+        Some(0),
+        "{}",
+        headless_boot::said(&same)
+    );
+    assert!(
+        String::from_utf8_lossy(&same.stdout).starts_with("REPRODUCED"),
+        "{}",
+        headless_boot::said(&same)
+    );
+
+    // A child in a world that shares nothing with the recording's.
+    let elsewhere = aterm_tempfile::Builder::new()
+        .prefix("aterm-elsewhere-")
+        .tempdir()
+        .expect("another world");
+    let root = elsewhere.path();
+    std::fs::create_dir_all(root.join("tmp")).expect("its temp dir");
+    let changed = headless_boot::drive_in(
+        root,
+        &["replay", tape_s],
+        &[("HOME", "/nonexistent"), ("TZ", "Pacific/Kiritimati")],
+        Some(root),
+    );
+    assert_eq!(
+        changed.status.code(),
+        Some(0),
+        "{}",
+        headless_boot::said(&changed)
+    );
+    assert!(
+        String::from_utf8_lossy(&changed.stdout).starts_with("REPRODUCED"),
+        "{}",
+        headless_boot::said(&changed)
+    );
+    let made = contents(&root.join("tmp"));
+    assert!(
+        made.is_empty(),
+        "the replay made nothing in its temp dir: {:?}",
+        made.iter().map(|(p, _)| p).collect::<Vec<_>>()
+    );
+    assert!(
+        before == contents(&drive),
+        "the replays touched none of the recording's files"
     );
 }

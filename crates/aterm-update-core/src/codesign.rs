@@ -99,8 +99,10 @@ impl std::error::Error for CodesignError {}
 /// verdicts. The bundle-level lines (a changed, added or removed sealed resource, a stray file
 /// in the bundle root, `bundle format unrecognized…` for an `.app` with no or an empty
 /// `Info.plist`) are what `--deep --strict` prints for an ad hoc signed `.app`, so tampering
-/// with the app updater's staged bundle stays a verdict.
-const SIGNATURE_FAULTS: [&str; 11] = [
+/// with the app updater's staged bundle stays a verdict. `invalid destination for symbolic
+/// link in bundle` was measured (2026-10-01) on a bundle signed with a symlink pointing out
+/// of it: where the bundle's own bytes lead does not change on a retry.
+const SIGNATURE_FAULTS: [&str; 12] = [
     "code object is not signed at all",
     "invalid signature (code or signature have been modified)",
     "invalid or unsupported format for signature",
@@ -112,13 +114,17 @@ const SIGNATURE_FAULTS: [&str; 11] = [
     "invalid Info.plist (plist or signature have been modified)",
     "invalid resource directory (directory or signature have been modified)",
     "bundle format unrecognized, invalid, or unsuitable",
+    "invalid destination for symbolic link in bundle",
 ];
 
-/// codesign's words, on a line of an exit-1 refusal, for a failure to read or run: facts
-/// about this machine, never about the bytes ([`CodesignError::judged_nothing`]).
-const MACHINE_FAULTS: [&str; 8] = [
+/// codesign's words for a failure to read or run, as the `<path>: <fault>` first line of an
+/// exit-1 refusal: facts about this machine, never about the bytes
+/// ([`CodesignError::judged_nothing_at`]). `No such file or directory` is not one (measured
+/// 2026-10-01): it is codesign's whole word for a dangling symlink added to a sealed
+/// bundle, a verdict; a bundle path that is not there at all fails closed with it at no
+/// cost.
+const MACHINE_FAULTS: [&str; 7] = [
     "Permission denied",
-    "No such file or directory",
     "internal error in Code Signing subsystem",
     "the code cannot be read by the verifier (file system permissions etc.)",
     "Resource temporarily unavailable",
@@ -147,26 +153,36 @@ impl CodesignError {
         }
     }
 
-    /// Whether codesign ran and knowably judged nothing: a signal ended it, or exit 1 names
-    /// only a failure to read or run ([`MACHINE_FAULTS`]) and no signature fault. Narrower
-    /// than `!is_verdict()` on purpose: a refusal in words neither list holds stays a refusal
-    /// of the bytes, so a caller that discards or asks a person on a refusal keeps doing so
-    /// for tampering it has not been taught.
+    /// Whether codesign, run on `verified`, ran and knowably judged nothing: a signal ended
+    /// it, or exit 1 whose first non-empty line is exactly `<verified>: <fault>` for a
+    /// failure to read or run ([`MACHINE_FAULTS`]), naming no signature fault. Narrower
+    /// than `!is_verdict()` on purpose: a refusal in words neither list holds stays a
+    /// refusal of the bytes, so a caller that discards or asks a person on a refusal keeps
+    /// doing so for tampering it has not been taught.
+    ///
+    /// Anchored on the caller's path, not on a line's shape: every other line codesign
+    /// writes names a path the bundle chose. Its `--verbose` progress lines
+    /// (`--prepared:<nested>`) come before its verdict, a later line names a file, and a
+    /// nested name may hold a newline that splits its own line (measured 2026-10-01: a
+    /// helper named `h: Permission denied`, or `h\nX: Permission denied`, made a tampered
+    /// bundle's refusal read as a machine fault). A stderr long enough to have been cut to
+    /// its tail ([`STDERR_KEEP`], and more in a caller that keeps more) starts with a
+    /// fragment the bundle chose, so it judged something; a real fault is one line.
     #[must_use]
-    pub fn judged_nothing(&self) -> bool {
+    pub fn judged_nothing_at(&self, verified: &Path) -> bool {
         match self {
             Self::Refused { code: None, .. } => true,
             Self::Refused {
                 code: Some(1),
                 stderr,
             } => {
-                let named = |faults: &[&str]| {
-                    stderr.lines().any(|line| {
-                        let line = line.trim_end();
-                        faults.iter().any(|fault| line.ends_with(fault))
-                    })
-                };
-                !self.is_verdict() && named(&MACHINE_FAULTS)
+                let prefix = format!("{}: ", verified.display());
+                let first = stderr.lines().map(str::trim).find(|l| !l.is_empty());
+                stderr.len() < STDERR_KEEP
+                    && !self.is_verdict()
+                    && first
+                        .and_then(|first| first.strip_prefix(prefix.as_str()))
+                        .is_some_and(|fault| MACHINE_FAULTS.contains(&fault))
             }
             _ => false,
         }
@@ -322,9 +338,15 @@ mod tests {
             "A.app: invalid resource directory (directory or signature have been modified)\n\
              In subcomponent: /A.app/Contents/Helpers/h\n",
             "aterm.app: bundle format unrecognized, invalid, or unsuitable\n",
+            "A.app: invalid destination for symbolic link in bundle\n\
+             file modified: /A.app/Contents/Resources/h: Permission denied\n",
         ] {
             assert!(refused(Some(1), stderr).is_verdict(), "{stderr:?}");
-            assert!(!refused(Some(1), stderr).judged_nothing(), "{stderr:?}");
+            let verified = Path::new(stderr.split(": ").next().unwrap_or_default());
+            assert!(
+                !refused(Some(1), stderr).judged_nothing_at(verified),
+                "{stderr:?}"
+            );
         }
         assert!(
             refused(
@@ -349,42 +371,102 @@ mod tests {
         assert!(!CodesignError::InvalidTeam(String::new()).is_verdict());
     }
 
-    /// A signal, and exit 1 naming only a failure to read or run, judged nothing. Negative
-    /// controls: unlisted words, a machine fault beside a signature fault, and exit 2 or 3.
+    /// A signal, and exit 1 whose first line names only a failure to read or run on the
+    /// verified path, judged nothing. Negative controls: unlisted words, a machine fault
+    /// beside a signature fault, one on a later line or another path (a name the bundle
+    /// chose), `No such file or directory` (a dangling symlink in a sealed bundle), a
+    /// stderr cut to its tail, and exit 2 or 3.
     #[test]
     fn only_a_known_machine_fault_or_a_signal_judged_nothing() {
         let refused = |code: Option<i32>, stderr: &str| CodesignError::Refused {
             code,
             stderr: stderr.to_string(),
         };
-        assert!(refused(None, "").judged_nothing());
+        assert!(refused(None, "").judged_nothing_at(Path::new("bin/claude")));
         for stderr in [
             "bin/claude: Permission denied\n",
-            "bin/claude: No such file or directory\n",
+            "\n  bin/claude: Permission denied  \n",
             "bin/claude: internal error in Code Signing subsystem\n",
             "bin/claude: the code cannot be read by the verifier (file system permissions etc.)",
         ] {
-            assert!(refused(Some(1), stderr).judged_nothing(), "{stderr:?}");
+            assert!(
+                refused(Some(1), stderr).judged_nothing_at(Path::new("bin/claude")),
+                "{stderr:?}"
+            );
         }
-        for (code, stderr) in [
-            (Some(1), "A.app: nested code is modified or invalid\n"),
-            (Some(1), ""),
+        // Measured: `--verbose=2` progress lines naming nested helpers the bundle called
+        // `h: Permission denied` and `h\nX: Permission denied`, before the verdict.
+        let progress = [
+            (
+                "/x/N1.app",
+                "--prepared:/x/N1.app/Contents/Helpers/h\nX: Permission denied\n\
+                 --validated:/x/N1.app/Contents/Helpers/h\nX: Permission denied\n\
+                 /x/N1.app: nested code is modified or invalid\n"
+                    .to_string(),
+            ),
+            (
+                "/x/C.app",
+                "--prepared:/x/C.app/Contents/Helpers/h: Permission denied\n\
+                 --validated:/x/C.app/Contents/Helpers/h: Permission denied\n\
+                 /x/C.app: nested code is modified or invalid\n"
+                    .to_string(),
+            ),
+            // A tail cut where a helper's name put the verified path's fault line.
+            (
+                "/x/A.app",
+                format!(
+                    "/x/A.app: Permission denied\n{}/x/A.app: nested code is modified or \
+                     invalid\n",
+                    "--prepared:/x/A.app/Contents/Helpers/h\n".repeat(STDERR_KEEP / 32)
+                ),
+            ),
+        ];
+        for (verified, stderr) in &progress {
+            assert!(
+                !refused(Some(1), stderr).judged_nothing_at(Path::new(verified)),
+                "{stderr:.300}"
+            );
+        }
+        for (code, verified, stderr) in [
             (
                 Some(1),
+                "A.app",
+                "A.app: nested code is modified or invalid\n",
+            ),
+            (Some(1), "A.app", ""),
+            (Some(1), "/x/A.app", "/x/Other.app: Permission denied\n"),
+            (Some(1), "A.app", "A.app: No such file or directory\n"),
+            (
+                Some(1),
+                "A.app",
+                "A.app: invalid destination for symbolic link in bundle\n\
+                 file modified: /A.app/Contents/Resources/h: Permission denied\n",
+            ),
+            (
+                Some(1),
+                "A.app",
+                "A.app: a verdict nobody has measured yet\n\
+                 In subcomponent: /A.app/Contents/Helpers/h: Permission denied\n",
+            ),
+            (Some(1), "A.app", "A.app: unPermission denied\n"),
+            (
+                Some(1),
+                "A.app",
                 "A.app: Permission denied\nA.app: code object is not signed at all\n",
             ),
-            (Some(2), "bin/claude: Permission denied\n"),
+            (Some(2), "bin/claude", "bin/claude: Permission denied\n"),
             (
                 Some(3),
+                "A.app",
                 "code failed to satisfy specified code requirement(s)\n",
             ),
         ] {
             assert!(
-                !refused(code, stderr).judged_nothing(),
+                !refused(code, stderr).judged_nothing_at(Path::new(verified)),
                 "{code:?} {stderr:?}"
             );
         }
-        assert!(!CodesignError::TimedOut.judged_nothing());
+        assert!(!CodesignError::TimedOut.judged_nothing_at(Path::new("A.app")));
     }
 
     /// Exit 1 for a file codesign cannot read is not a verdict (the bytes verify once
@@ -413,9 +495,9 @@ mod tests {
                 "{unreadable:?}"
             );
             assert!(!unreadable.is_verdict(), "{unreadable}");
-            assert!(unreadable.judged_nothing(), "{unreadable}");
+            assert!(unreadable.judged_nothing_at(&file), "{unreadable}");
         }
-        assert!(!unsigned.judged_nothing(), "{unsigned}");
+        assert!(!unsigned.judged_nothing_at(&file), "{unsigned}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -451,9 +533,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_validly_signed_binary_of_another_signer_is_refused() {
-        if aterm_uds::deadline::trust_service_silent() {
-            return;
-        }
+        aterm_uds::deadline::require_trust_service();
         match verify_developer_id(Path::new("/bin/ls"), "Q6L2SF6YDW", false) {
             Err(CodesignError::Refused { code, .. }) => {
                 assert!(matches!(code, Some(1 | 3)), "{code:?}");

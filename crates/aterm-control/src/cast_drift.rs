@@ -51,7 +51,7 @@
 
 /// The resize seam policy the replays apply, re-exported so a caller that
 /// links only this crate (the one binary's client path) can name it.
-pub use aterm_core::grid::ResizePolicy;
+pub use aterm_core::grid::{ResizeLaw, ResizePolicy};
 use aterm_core::terminal::Terminal;
 
 use crate::wire::{pct_encode, visible_row};
@@ -135,6 +135,32 @@ pub struct CastHeader {
     /// never second-guesses it), so an undo regression in the recording engine
     /// still reads `unfaithful`.
     pub resize_undo: Option<bool>,
+    /// The resize laws the recording's engine may have laid its rows out
+    /// under, the newest first ([`CastHeader::laws_named`] of its
+    /// `aterm_resize_undo`): each replay runs under one, the next only when
+    /// the ones before it do not reproduce the live screen. 3 names the
+    /// current law (a width change lays the rows out where the rows hand-back
+    /// puts them); 2 the rows hand-back, as two aterms wrote it (before and
+    /// after the pushed rows were owed back); 1 and a recording that does not
+    /// say, the law before it (what is owed forgotten before each resize).
+    pub resize_laws: &'static [ResizeLaw],
+}
+
+impl CastHeader {
+    /// The laws a recording whose header carries `aterm_resize_undo: value`
+    /// (`None`: no key) was made under, the newest first: the law before the
+    /// rows hand-back for no key and 0, and the newest law this aterm knows for
+    /// a value only a newer one writes.
+    #[must_use]
+    pub fn laws_named(value: Option<u64>) -> &'static [ResizeLaw] {
+        match value {
+            None | Some(0) => &[ResizeLaw::Undo],
+            Some(value) => match ResizeLaw::from_header(value) {
+                [] => &[ResizeLaw::Rewrap],
+                laws => laws,
+            },
+        }
+    }
 }
 
 /// A parsed asciicast v2 recording.
@@ -427,6 +453,10 @@ pub struct DriftReport {
     pub seed_ambiguous: bool,
     /// Why they did.
     pub seed_basis: SeedBasis,
+    /// With no screen, the replays under the resize laws the header names
+    /// ([`CastHeader::resize_laws`]) disagreed: the verdict is `unknown` and
+    /// the header says ` law=ambiguous`.
+    pub law_ambiguous: bool,
     /// The faithful replay's final geometry, `(cols, rows)`.
     pub geom: (u16, u16),
     /// The header's eviction count.
@@ -483,7 +513,8 @@ impl DriftReport {
     /// The wire form: `OK <n> <header k=v…>` then `n` lines: the candidate
     /// `run` lines (oldest first), the `row` lines (ascending, at most `rows=`)
     /// and one `cursor` line when there is a finding. `ms` is the caller's
-    /// timing (this module has no clock); ` undo=off` follows when the replays
+    /// timing (this module has no clock); ` law=ambiguous` follows when the
+    /// replays under the header's resize laws disagreed, ` undo=off` when they
     /// dropped the undo, and `computed` names where it ran when not the server
     /// (`computed=client`).
     #[must_use]
@@ -569,6 +600,9 @@ impl DriftReport {
             self.cut.map_or("-", Cut::word),
             self.folds,
         );
+        if self.law_ambiguous {
+            head.push_str(" law=ambiguous");
+        }
         if self.undo_dropped {
             head.push_str(" undo=off");
         }
@@ -821,12 +855,40 @@ fn apply_mask<D>(events: &[CastEvent<D>], collapse: &[&Run]) -> Vec<bool> {
     mask
 }
 
-/// How every fold of one audit applies resizes: the seam policy, and whether
-/// the engine keeps its resize undo ([`Undo`]).
+/// The console-host posture of the live engine a recording came from, which
+/// every replay of it takes: the resize seam `policy` (`ConPty` behind a
+/// Windows pseudoconsole, else `Native`), and whether a dead app's alternate
+/// screen is left by the HOST (OpenConsole: `Terminal::set_host_resyncs_alt_screen`)
+/// rather than locally at the shell's next prompt. A bare [`ResizePolicy`] is
+/// the posture with the local leave, every host's but OpenConsole's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Posture {
+    /// The resize seam policy the session resizes under.
+    pub policy: ResizePolicy,
+    /// The session's host leaves a dead app's alternate screen itself, and the
+    /// recording carries the `?1049l` it forwarded.
+    pub host_resyncs_alt_screen: bool,
+}
+
+impl From<ResizePolicy> for Posture {
+    fn from(policy: ResizePolicy) -> Self {
+        Self {
+            policy,
+            host_resyncs_alt_screen: false,
+        }
+    }
+}
+
+/// How every fold of one audit applies resizes: the session's posture, and
+/// whether the engine keeps its resize undo ([`Undo`]).
 #[derive(Clone, Copy)]
 struct Engine {
     policy: ResizePolicy,
+    host_resyncs: bool,
     keep_undo: bool,
+    /// The resize law the replay lays its rows out under, one of the
+    /// recording's ([`CastHeader::resize_laws`], `Terminal::set_resize_law`).
+    law: ResizeLaw,
 }
 
 /// Fold the recording through one fresh engine; `journal` also collects the
@@ -835,7 +897,8 @@ struct Engine {
 /// The engine's alt-screen archive is off: it only keeps scrollback text of
 /// committed alt frames (most of a fold's time on a Claude recording) and never
 /// touches the grid being read. Without the undo (`engine.keep_undo` false)
-/// the active grid's undo is dropped before every resize.
+/// the active grid's undo is dropped before every resize; the rows are laid
+/// out under `engine.law`.
 fn fold<D: AsRef<[u8]>>(
     header: &CastHeader,
     events: &[CastEvent<D>],
@@ -845,11 +908,14 @@ fn fold<D: AsRef<[u8]>>(
     journal: bool,
 ) -> Replay {
     let mut term = Terminal::new(header.height.max(1), header.width.max(1));
+    term.set_resize_law(engine.law);
     term.set_alt_archive_enabled(false);
     // The live engine's console-host posture, from the policy it resizes
     // under: a ConPTY session honors conhost's `?9001h`, which decides how an
-    // orphaned alternate screen is left.
+    // orphaned alternate screen is left, and under OpenConsole the screen is
+    // left by the `?1049l` the host forwarded, not at the prompt.
     term.set_console_host_posture(engine.policy);
+    term.set_host_resyncs_alt_screen(engine.host_resyncs);
     if seed_alt {
         term.process(b"\x1b[?1049h");
     }
@@ -920,18 +986,26 @@ fn same_on(a: &[String], b: &[String], rows: &[usize]) -> bool {
 }
 
 /// Run the audit. `live` is the screen to hold the recording against (`None`
-/// offline: faithful stands in and fidelity reads `-`). `policy` is the
-/// session's resize seam policy (`ConPty` behind a Windows pseudoconsole, else
-/// `Native`). Record the cut afterwards with [`DriftReport::settle_cut`].
+/// offline: faithful stands in and fidelity reads `-`). `posture` is the
+/// session's ([`Posture`]; a bare [`ResizePolicy`] is its resize seam policy,
+/// `ConPty` behind a Windows pseudoconsole, else `Native`). Record the cut
+/// afterwards with [`DriftReport::settle_cut`].
 #[must_use]
 pub fn analyze<D: AsRef<[u8]>>(
     header: &CastHeader,
     events: &[CastEvent<D>],
     live: Option<&LiveScreen>,
     args: &DriftArgs,
-    policy: ResizePolicy,
+    posture: impl Into<Posture>,
 ) -> DriftReport {
-    analyze_inner(header, events, live, live.and_then(|l| l.alt), args, policy)
+    analyze_inner(
+        header,
+        events,
+        live,
+        live.and_then(|l| l.alt),
+        args,
+        posture.into(),
+    )
 }
 
 /// The audit of the replays against each other (faithful vs stable,
@@ -945,9 +1019,9 @@ pub fn analyze_replay<D: AsRef<[u8]>>(
     events: &[CastEvent<D>],
     alt: Option<bool>,
     args: &DriftArgs,
-    policy: ResizePolicy,
+    posture: impl Into<Posture>,
 ) -> DriftReport {
-    analyze_inner(header, events, None, alt, args, policy)
+    analyze_inner(header, events, None, alt, args, posture.into())
 }
 
 fn analyze_inner<D: AsRef<[u8]>>(
@@ -956,12 +1030,57 @@ fn analyze_inner<D: AsRef<[u8]>>(
     live: Option<&LiveScreen>,
     alt_hint: Option<bool>,
     args: &DriftArgs,
-    policy: ResizePolicy,
+    posture: Posture,
 ) -> DriftReport {
     let marks = scan_marks(events);
-    let seeded = |keep_undo: bool| {
-        let engine = Engine { policy, keep_undo };
+    let under = |keep_undo: bool, law: ResizeLaw| {
+        let engine = Engine {
+            policy: posture.policy,
+            host_resyncs: posture.host_resyncs_alt_screen,
+            keep_undo,
+            law,
+        };
         analyze_seeded(header, events, &marks, live, alt_hint, args, engine)
+    };
+    // Under the recording's resize law: the newest it names, and an older one
+    // only when the newer do not reproduce the live screen (two aterms wrote
+    // `aterm_resize_undo: 2`). A replay under a law the recording's engine did
+    // not keep reads every row the laws place differently as drift. With no
+    // screen to choose by, every law it names is folded, and when their
+    // answers differ the answer is `unknown`, `law=ambiguous`, as two seeds'
+    // are (`analyze_seeded`).
+    let seeded = |keep_undo: bool| {
+        let mut laws = header.resize_laws.iter().copied();
+        let mut report = under(keep_undo, laws.next().unwrap_or_default());
+        if live.is_none() {
+            for law in laws {
+                let other = under(keep_undo, law);
+                report.folds += other.folds;
+                report.law_ambiguous |= (other.verdict, other.culprit_word(), &other.drift)
+                    != (report.verdict, report.culprit_word(), &report.drift);
+            }
+            if report.law_ambiguous {
+                report.verdict = Verdict::Unknown;
+                report.drift.clear();
+                report.cursor_other = None;
+                for run in &mut report.candidates {
+                    run.culprit = false;
+                }
+            }
+            return report;
+        }
+        for law in laws {
+            if report.fidelity != Some(false) {
+                break;
+            }
+            let mut older = under(keep_undo, law);
+            if older.fidelity == Some(true) {
+                older.folds += report.folds;
+                return older;
+            }
+            report.folds += older.folds;
+        }
+        report
     };
     match args.undo {
         Undo::Keep => seeded(true),
@@ -1062,6 +1181,7 @@ fn audit<D: AsRef<[u8]>>(
         seed_alt,
         seed_ambiguous: false,
         seed_basis,
+        law_ambiguous: false,
         geom: (header.width, header.height),
         evicted: header.evicted,
         dropped: header.dropped,
@@ -1306,15 +1426,14 @@ fn parse_header(line: &str) -> Result<CastHeader, String> {
         bursts: d.get("bursts").and_then(Json::as_u64).unwrap_or(0),
         bytes: d.get("bytes").and_then(Json::as_u64).unwrap_or(0),
     });
-    let resize_undo = get("aterm_resize_undo")
-        .and_then(Json::as_u64)
-        .map(|v| v != 0);
+    let law = get("aterm_resize_undo").and_then(Json::as_u64);
     Ok(CastHeader {
         width: dim("width")?,
         height: dim("height")?,
         evicted,
         dropped,
-        resize_undo,
+        resize_undo: law.map(|v| v != 0),
+        resize_laws: CastHeader::laws_named(law),
     })
 }
 
@@ -1624,6 +1743,9 @@ mod tests {
                     evicted: 0,
                     dropped: Some(CastDrops::default()),
                     resize_undo: None,
+                    // The live engine below lays its rows out under the
+                    // current law.
+                    resize_laws: CastHeader::laws_named(Some(ResizeLaw::default().header_value())),
                 },
                 events: Vec::new(),
                 live,
@@ -1741,6 +1863,52 @@ mod tests {
             cursors[0], cursors[1],
             "the recording must reach the conhost layout"
         );
+    }
+
+    /// Under OpenConsole the live engine leaves a killed pager's screen on the
+    /// `?1049l` the host forwards, not at the prompt
+    /// (`Terminal::set_host_resyncs_alt_screen`). A replay folded under that
+    /// posture reproduces the live screen; the same recording under the bare
+    /// policy (the prompt's local leave) reads `unfaithful`, the control.
+    #[test]
+    fn an_audit_replays_a_host_resync_under_the_sessions_posture() {
+        let (cols, rows) = (40u16, 10u16);
+        let mut rec = Rec::new(cols, rows, false);
+        rec.live.set_console_host_posture(ResizePolicy::ConPty);
+        rec.live.set_host_resyncs_alt_screen(true);
+        rec.out(0.01, b"\x1b[?9001h\x1b[?1004h");
+        rec.out(
+            0.01,
+            b"history 1\r\nC:\\>less file\r\n\x1b[?1049h\x1b[H\x1b[2J",
+        );
+        for i in 1..rows {
+            rec.out(0.01, format!("pager {i}\r\n").as_bytes());
+        }
+        rec.out(0.01, b"\x1b]133;D;-1\x07\x1b]133;A\x07C:\\>");
+        assert!(
+            rec.live.take_alt_screen_resync_request(),
+            "the host is asked"
+        );
+        // The resync client's switch, forwarded, then the shell's next line.
+        rec.out(0.01, b"\x1b[?1049l");
+        rec.out(0.01, b"echo x\r\nx\r\n\x1b]133;D;0\x07\x1b]133;A\x07C:\\>");
+        assert!(!rec.live.is_alternate_screen());
+        let screen = rec.screen();
+        let args = DriftArgs::default();
+        let posture = Posture {
+            policy: ResizePolicy::ConPty,
+            host_resyncs_alt_screen: true,
+        };
+        let report = analyze(&rec.header, &rec.events, Some(&screen), &args, posture);
+        assert_eq!(report.fidelity, Some(true), "{report:?}");
+        let local = analyze(
+            &rec.header,
+            &rec.events,
+            Some(&screen),
+            &args,
+            ResizePolicy::ConPty,
+        );
+        assert_eq!(local.fidelity, Some(false), "the control: {local:?}");
     }
 
     /// A Claude-shaped 8-row full repaint: synchronized, `ESC[2J`, every row by
@@ -2054,9 +2222,12 @@ mod tests {
         assert!(report.undo_dropped);
     }
 
-    /// The header key: `1` reads `Some(true)`, `0` `Some(false)`, absent `None`
-    /// (a file from an aterm before the undo), and the rest of the header is read
-    /// as ever.
+    /// The header key: `3` reads the undo and the current law, `2` the undo and
+    /// the two laws aterms wrote it under (the newest first), `1` the undo
+    /// only, `0` `Some(false)`, absent `None` (a file from an aterm before the
+    /// undo), the last three under the law before the rows hand-back, a value
+    /// only a newer aterm writes under the newest law this one knows, and the
+    /// rest of the header is read as ever.
     #[test]
     fn the_resize_law_key_is_read_from_the_header() {
         let read = |header: &str| {
@@ -2064,14 +2235,275 @@ mod tests {
                 .expect("parses")
                 .header
         };
-        let keyed =
-            read("{\"version\": 2, \"width\": 80, \"height\": 24, \"aterm_resize_undo\": 1}");
-        assert_eq!(keyed.resize_undo, Some(true));
-        assert_eq!((keyed.width, keyed.height), (80, 24));
-        let off = read("{\"version\": 2, \"width\": 80, \"height\": 24, \"aterm_resize_undo\": 0}");
-        assert_eq!(off.resize_undo, Some(false));
+        let keyed = |value: u64| {
+            read(&format!(
+                "{{\"version\": 2, \"width\": 80, \"height\": 24, \"aterm_resize_undo\": {value}}}"
+            ))
+        };
+        let current = keyed(3);
+        assert_eq!(
+            (current.resize_undo, current.resize_laws),
+            (Some(true), &[ResizeLaw::Rewrap][..])
+        );
+        assert_eq!(current.resize_laws, &[ResizeLaw::default()]);
+        let handback = keyed(2);
+        assert_eq!(
+            (handback.resize_undo, handback.resize_laws),
+            (
+                Some(true),
+                &[ResizeLaw::PushedRows, ResizeLaw::HandBack][..]
+            )
+        );
+        let undo = keyed(1);
+        assert_eq!(
+            (undo.resize_undo, undo.resize_laws),
+            (Some(true), &[ResizeLaw::Undo][..])
+        );
+        assert_eq!((undo.width, undo.height), (80, 24));
+        let off = keyed(0);
+        assert_eq!(
+            (off.resize_undo, off.resize_laws),
+            (Some(false), &[ResizeLaw::Undo][..])
+        );
         let plain = read("{\"version\": 2, \"width\": 80, \"height\": 24}");
-        assert_eq!(plain.resize_undo, None);
+        assert_eq!(
+            (plain.resize_undo, plain.resize_laws),
+            (None, &[ResizeLaw::Undo][..])
+        );
+        let newer = keyed(9);
+        assert_eq!(newer.resize_laws, &[ResizeLaw::Rewrap]);
+    }
+
+    /// S2R-F4's flap in a recording: a primary screen with history and a blank
+    /// row under the cursor, flapped a row with nothing between. This engine
+    /// hands the trimmed blank back, so its recording (law 2) replays faithfully
+    /// and nothing moved: `clean`. A recording from an aterm before the
+    /// hand-back (law 1) shifted every row down one; replayed under its own law
+    /// (the trims forgotten) it is faithful, and the flap is named.
+    #[test]
+    fn a_primary_trim_flap_replays_under_the_law_its_recording_names() {
+        let record = |older: bool| {
+            let mut rec = Rec::new(20, 8, false);
+            rec.header.resize_undo = Some(true);
+            if older {
+                rec.header.resize_laws = &[ResizeLaw::Undo];
+                rec.live.set_resize_law(ResizeLaw::Undo);
+            }
+            for i in 0..20 {
+                rec.out(0.01, format!("h{i}\r\n").as_bytes());
+            }
+            rec.out(0.1, b"\x1b[H\x1b[2Jtop\r\n");
+            let mut flap = 0.0;
+            for (dt, rows) in [(1.0, 7), (0.0007, 8)] {
+                let t = rec.resize(dt, 20, rows);
+                if rows == 7 {
+                    flap = t;
+                }
+            }
+            (rec, flap)
+        };
+        let (new, _) = record(false);
+        assert_eq!(new.screen().rows[0], "top", "the blank came back");
+        let report = new.audit(&DriftArgs::default());
+        assert_eq!(report.fidelity, Some(true), "{report:?}");
+        assert_eq!(report.verdict, Verdict::Clean, "{report:?}");
+
+        let (old, flap) = record(true);
+        assert_eq!(old.screen().rows[1], "top", "the older law moved every row");
+        let report = old.audit(&DriftArgs::default());
+        assert_eq!(report.fidelity, Some(true), "{report:?}");
+        assert_eq!(report.verdict, Verdict::Desync, "{report:?}");
+        assert_eq!(report.culprit_word(), fmt_t(flap));
+    }
+
+    /// ATERM-KI-1015-1: a recording replays under the resize law its aterm laid
+    /// the rows out under, which its header names (`aterm_resize_undo`), so the
+    /// rows a law moved are attributed to the flap that moved them, never to
+    /// the replay. A full screen with the cursor homed flapped a row (the
+    /// bottom-push corner), and a zoom in then out over a line that wraps at
+    /// the narrower width (the rewrap corner): the aterm that wrote 2 until
+    /// 2026-10-17 rotated the pushed row to the top, both that wrote 2 moved
+    /// the rows the rewrap moved, and the current law (3) moves neither. Each
+    /// recording, with the header its aterm wrote, replays faithfully, 2 under
+    /// whichever of its two laws reproduces the screen, and a flap that moved
+    /// rows is named. Replayed under the current law instead, as every
+    /// recording was while 2 named it too, the older ones read `unfaithful`.
+    #[test]
+    fn a_recording_replays_under_the_resize_law_its_header_names() {
+        /// A corner's name, what paints it, and the flap's sizes (cols, rows).
+        type Corner = (&'static str, &'static [u8], &'static [(u16, u16)]);
+        let corners: [Corner; 2] = [
+            (
+                "bottom push",
+                b"\x1b[H\x1b[2JP0\r\nP1\r\nP2\r\nP3\r\nP4\r\nP5\r\nP6\r\nP7\x1b[H",
+                &[(20, 7), (20, 8)],
+            ),
+            (
+                "rewrap",
+                b"\x1b[H\x1b[2Jtop\r\nLLLLLLLLLLLLLLLLLLL1\r\nend\r\n",
+                &[(19, 7), (20, 8)],
+            ),
+        ];
+        for (corner, paint, path) in corners {
+            for law in [
+                ResizeLaw::HandBack,
+                ResizeLaw::PushedRows,
+                ResizeLaw::Rewrap,
+            ] {
+                let mut rec = Rec::new(20, 8, false);
+                rec.live.set_resize_law(law);
+                rec.header.resize_undo = Some(true);
+                rec.header.resize_laws = CastHeader::laws_named(Some(law.header_value()));
+                for i in 0..20 {
+                    rec.out(0.01, format!("h{i}\r\n").as_bytes());
+                }
+                rec.out(0.1, paint);
+                let before = rec.screen();
+                let mut flap = None;
+                let mut dt = 1.0;
+                for &(cols, rows) in path {
+                    flap.get_or_insert(rec.resize(dt, cols, rows));
+                    dt = 0.0007;
+                }
+                let moved = rec.screen() != before;
+                let older = match law {
+                    ResizeLaw::HandBack => true,
+                    ResizeLaw::PushedRows => corner == "rewrap",
+                    _ => false,
+                };
+                assert_eq!(moved, older, "{corner}, {law:?}");
+                let report = rec.audit(&DriftArgs::default());
+                assert_eq!(report.fidelity, Some(true), "{corner}, {law:?}: {report:?}");
+                if moved {
+                    assert_eq!(report.verdict, Verdict::Desync, "{corner}, {law:?}");
+                    assert_eq!(report.culprit_word(), fmt_t(flap.unwrap_or_default()));
+                } else {
+                    assert_eq!(report.verdict, Verdict::Clean, "{corner}, {law:?}");
+                }
+                rec.header.resize_laws = &[ResizeLaw::Rewrap];
+                let current = rec.audit(&DriftArgs::default());
+                if older {
+                    assert_eq!(current.fidelity, Some(false), "{corner}, {law:?}");
+                    assert_eq!(current.verdict, Verdict::Unfaithful, "{corner}, {law:?}");
+                }
+            }
+        }
+    }
+
+    /// With no screen, a recording whose header names two laws
+    /// (`aterm_resize_undo: 2`) is replayed under both, as one with no toggle
+    /// is on both seeds: the bottom-push flap an aterm of the older one
+    /// recorded moved its rows under that law and none under the newer, so
+    /// the answer is `unknown`, `law=ambiguous`, where the newer law alone
+    /// (all an offline replay read) called it clean. The screen settles it,
+    /// and a recording whose header names one law is answered by it.
+    #[test]
+    fn with_no_screen_two_laws_that_disagree_answer_unknown() {
+        let primary = DriftArgs {
+            seed: Seed::Primary,
+            ..DriftArgs::default()
+        };
+        let record = |law: ResizeLaw| {
+            let mut rec = Rec::new(20, 8, false);
+            rec.live.set_resize_law(law);
+            rec.header.resize_undo = Some(true);
+            rec.header.resize_laws = CastHeader::laws_named(Some(law.header_value()));
+            for i in 0..20 {
+                rec.out(0.01, format!("h{i}\r\n").as_bytes());
+            }
+            rec.out(
+                0.1,
+                b"\x1b[H\x1b[2JP0\r\nP1\r\nP2\r\nP3\r\nP4\r\nP5\r\nP6\r\nP7\x1b[H",
+            );
+            let flap = rec.resize(1.0, 20, 7);
+            rec.resize(0.0007, 20, 8);
+            (rec, flap)
+        };
+        let offline = |header: &CastHeader, rec: &Rec| {
+            analyze(header, &rec.events, None, &primary, ResizePolicy::Native)
+        };
+        let (rec, flap) = record(ResizeLaw::HandBack);
+        let blind = offline(&rec.header, &rec);
+        assert_eq!(blind.verdict, Verdict::Unknown, "{blind:?}");
+        assert!(blind.law_ambiguous && blind.drift.is_empty(), "{blind:?}");
+        assert_eq!(blind.culprit_word(), "-");
+        assert!(blind.render(0, None).contains(" ms=0 law=ambiguous\n"));
+        for (law, verdict) in [
+            (ResizeLaw::PushedRows, Verdict::Clean),
+            (ResizeLaw::HandBack, Verdict::Desync),
+        ] {
+            let mut alone = rec.header.clone();
+            alone.resize_laws = std::slice::from_ref(match law {
+                ResizeLaw::PushedRows => &ResizeLaw::PushedRows,
+                _ => &ResizeLaw::HandBack,
+            });
+            let report = offline(&alone, &rec);
+            assert_eq!(report.verdict, verdict, "{law:?}: {report:?}");
+            assert!(!report.law_ambiguous);
+        }
+        let seen = rec.audit(&primary);
+        assert_eq!(seen.verdict, Verdict::Desync, "{seen:?}");
+        assert_eq!(seen.culprit_word(), fmt_t(flap));
+        assert!(!seen.law_ambiguous);
+        let (rec, _) = record(ResizeLaw::Rewrap);
+        let blind = offline(&rec.header, &rec);
+        assert_eq!(blind.verdict, Verdict::Clean, "{blind:?}");
+        assert!(!blind.law_ambiguous);
+    }
+
+    /// The same screen flapped by a drag that grows first (9 then 8 rows) or
+    /// overshoots on the way back (7, 9, 8): the grow reveals history and the
+    /// shrink back demotes it again, so this engine's recording replays
+    /// faithfully and nothing moved.
+    #[test]
+    fn a_primary_flap_that_grows_first_replays_clean() {
+        for heights in [&[9u16, 8][..], &[7, 9, 8]] {
+            let mut rec = Rec::new(20, 8, false);
+            rec.header.resize_undo = Some(true);
+            for i in 0..20 {
+                rec.out(0.01, format!("h{i}\r\n").as_bytes());
+            }
+            rec.out(0.1, b"\x1b[H\x1b[2Jtop\r\n");
+            let mut dt = 1.0;
+            for &rows in heights {
+                rec.resize(dt, 20, rows);
+                dt = 0.0007;
+            }
+            assert_eq!(rec.screen().rows[0], "top", "{heights:?}: nothing moved");
+            let report = rec.audit(&DriftArgs::default());
+            assert_eq!(report.fidelity, Some(true), "{heights:?}: {report:?}");
+            assert_eq!(report.verdict, Verdict::Clean, "{heights:?}: {report:?}");
+        }
+    }
+
+    /// The same screen flapped by a font zoom in then out, a zoom out then in, and
+    /// a corner drag brought back: the rows and the columns move together. This
+    /// engine's recording replays faithfully and nothing moved; the width change
+    /// once trimmed then revealed, every row a row lower, and only the replay saw it.
+    #[test]
+    fn a_primary_zoom_flap_replays_clean() {
+        let paths: [&[(u16, u16)]; 3] = [
+            &[(19, 7), (20, 8)],
+            &[(21, 9), (20, 8)],
+            &[(20, 7), (19, 7), (19, 8), (20, 8)],
+        ];
+        for path in paths {
+            let mut rec = Rec::new(20, 8, false);
+            rec.header.resize_undo = Some(true);
+            for i in 0..20 {
+                rec.out(0.01, format!("h{i}\r\n").as_bytes());
+            }
+            rec.out(0.1, b"\x1b[H\x1b[2Jtop\r\n");
+            let mut dt = 1.0;
+            for &(cols, rows) in path {
+                rec.resize(dt, cols, rows);
+                dt = 0.0007;
+            }
+            assert_eq!(rec.screen().rows[0], "top", "{path:?}: nothing moved");
+            let report = rec.audit(&DriftArgs::default());
+            assert_eq!(report.fidelity, Some(true), "{path:?}: {report:?}");
+            assert_eq!(report.verdict, Verdict::Clean, "{path:?}: {report:?}");
+        }
     }
 
     /// Claude's healthy case (82 of 83 measured flaps): the app DID see the
@@ -2322,13 +2754,15 @@ mod tests {
         );
     }
 
-    /// With no lossy alt-screen resize (the primary screen, where a shrink
-    /// with the cursor on row 0 pushes the bottom row into history and the grow
-    /// reveals it on top), attribution falls back to ONLY(r) folds over the
-    /// newest `max_runs`.
+    /// With no lossy alt-screen resize (the primary screen of an aterm before
+    /// the rows hand-back, law 1, where a shrink with the cursor on row 0
+    /// pushes the bottom row into history and the grow reveals it on top),
+    /// attribution falls back to ONLY(r) folds over the newest `max_runs`.
     #[test]
     fn a_primary_rotation_is_attributed_by_the_only_folds() {
         let mut rec = Rec::new(20, 8, false);
+        rec.header.resize_laws = &[ResizeLaw::Undo];
+        rec.live.set_resize_law(ResizeLaw::Undo);
         let mut paint = String::new();
         for r in 0..8 {
             paint.push_str(&format!("\x1b[{};1HP{r}", r + 1));
@@ -2439,6 +2873,7 @@ mod tests {
             evicted: 0,
             dropped: None,
             resize_undo: None,
+            resize_laws: &[ResizeLaw::Undo],
         };
         let events: Vec<CastEvent<Vec<u8>>> = Vec::new();
         let report = analyze(
@@ -2518,6 +2953,7 @@ mod tests {
                 evicted: 0,
                 dropped: None,
                 resize_undo: None,
+                resize_laws: &[ResizeLaw::Undo],
             }
         );
         assert_eq!(cast.events.len(), 5, "the `i` event is skipped");

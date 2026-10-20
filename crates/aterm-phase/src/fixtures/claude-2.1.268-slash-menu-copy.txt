@@ -1,0 +1,51 @@
+# claude-code 2.1.268 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the composer holding `/copy`, the slash menu's two entries `/copy` and `/fork` at column 2, no pointer drawn · the same text with `/copy` selected (as the menu opened) and with `/fork` selected after `down` (Enter then ran `/fork`: `⎿  Nothing to fork yet.`, MEASURED in the review's lab, krold-20261017-090018): the cells say which (claude-2.1.268-slash-menu-copy-cells.txt, claude-2.1.268-slash-menu-copy-down-cells.txt)
+ ▐▛███▛█   Claude Code v2.1.268
+▝▜██████▀  Opus 5 (1M context) · API Usage Billing
+  ▝▝ ▝▝    /private/tmp/at.fjWS/proj
+
+
+❯ /update-config
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Cogitated for 0s · done 9:18 AM
+
+❯ /config
+  ⎿  Config dialog dismissed
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /copy
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  /copy                         Copy Claude's last response to clipboard (or /copy N for the Nth-latest)
+  /fork                         Copy this conversation into a new background session and keep working here
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

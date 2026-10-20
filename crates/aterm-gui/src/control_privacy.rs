@@ -24,7 +24,7 @@
 //! (the census guard `protected-folder`).
 //!
 //! Grant scope and service coverage (spikes S1, S4) are not claimed
-//! (`SpikeEvidence::UNMEASURED`): a completed grant establishes
+//! (`SpikeEvidence::MEASURED` leaves both off): a completed grant establishes
 //! `fda_scope=this_process` and Apple's documented `app-data` coverage for that
 //! host, but not inherited-session or per-folder access, so `prompt_possible`
 //! stays `yes` and no folder is reported covered. S4 is measured; why its flag
@@ -44,7 +44,7 @@ use aterm_containment::consent::{
     ResponsibleError, SelfHardening, SpikeEvidence, TrashOffer, plist_string, read_plist_text,
 };
 use aterm_control::wire::{json_ok, json_str_field, pct_encode};
-use winit::event_loop::EventLoopProxy;
+use aterm_window::event_loop::EventLoopProxy;
 
 use crate::control::control_media::MainHopError;
 use crate::control::{Scope, cross_session_authorized};
@@ -471,8 +471,12 @@ struct DebuggerEntry {
 
 /// How long a debugger answer is served before a read refreshes it. The rule
 /// changes only when an administrator changes it, and focus gain retires the
-/// answer sooner ([`ConsentState::invalidate_debugger`]). Only the `privacy`
-/// verb's full report and the Security page dispatch it.
+/// answer sooner ([`ConsentState::invalidate_debugger`]). What dispatches it:
+/// the `privacy` verb's full report, the Security page, the change lane's
+/// re-probe after a change exits (`App::tick_debugger_access`), and the
+/// debugger-access launch ask (`App::look_for_debugger_moment`), which reads
+/// it only while no answer is cached and once more, retiring the old one, at
+/// the moment it would raise its alert.
 const DEBUGGER_TTL: Duration = Duration::from_secs(60);
 
 /// How long a Developer Tools answer is served before a read refreshes it.
@@ -610,6 +614,17 @@ impl DebuggerRow {
         }
     }
 
+    /// The probe is out (or not yet dispatched): the rule is unread, but
+    /// aterm's own hardening is fixed at exec, so a re-probe does not unlearn
+    /// it. `self_hardened` is what a worker already read, `Unknown` before any.
+    const fn awaiting(self_hardened: SelfHardening) -> Self {
+        Self {
+            probe: DebuggerProbe::pending(),
+            self_hardened,
+            probe_age_ms: None,
+        }
+    }
+
     /// A published answer, with its age only when a probe actually completed.
     fn from_entry(entry: DebuggerEntry, age: Duration) -> Self {
         Self {
@@ -632,6 +647,13 @@ impl DebuggerRow {
     /// aterm's own hardening, as this row reports it.
     pub(crate) const fn self_hardened(&self) -> SelfHardening {
         self.self_hardened
+    }
+
+    /// How long ago the probe completed: `None` while pending or refused, and
+    /// for an instance's syscall-free arm, which answers at every read.
+    pub(crate) fn probe_age(&self) -> Option<Duration> {
+        self.probe_age_ms
+            .map(|ms| Duration::from_millis(u64::try_from(ms).unwrap_or(u64::MAX)))
     }
 }
 
@@ -857,6 +879,15 @@ impl ConsentState {
             .debugger
             .lock_or_recover()
             .serve(Instant::now(), DEBUGGER_TTL);
+        // What a pending row says of aterm's own hardening: what a worker
+        // already read, never read here, and taken before this call's own
+        // worker can read it, so a cold row is `unknown` every time.
+        let known = self
+            .shared
+            .hardening
+            .get()
+            .copied()
+            .unwrap_or(SelfHardening::Unknown);
         if let Some(generation) = dispatch {
             let shared = Arc::clone(&self.shared);
             let probe = self.probes.debugger;
@@ -871,10 +902,9 @@ impl ConsentState {
                 shared.complete_debugger(generation, answer, self_hardened, Instant::now());
             });
         }
-        answer.map_or(
-            DebuggerRow::refused(DebuggerProbeLabel::Pending),
-            |(entry, age)| DebuggerRow::from_entry(entry, age),
-        )
+        answer.map_or(DebuggerRow::awaiting(known), |(entry, age)| {
+            DebuggerRow::from_entry(entry, age)
+        })
     }
 
     /// The debugger row's cached answer WITHOUT dispatching anything: `None`
@@ -1034,6 +1064,62 @@ impl ConsentState {
     pub(crate) fn devtools_slot_idle_for_test(&self) -> bool {
         let slot = self.shared.devtools.lock_or_recover();
         !slot.in_flight && slot.entry.is_none()
+    }
+
+    /// A completed debugger answer, published as its worker would publish it,
+    /// for host tests: the arms are flagged live so the slot serves it (until
+    /// [`DEBUGGER_TTL`] or a retirement) and a read dispatches nothing. The arms
+    /// stay as they were, so a later refresh cannot reach the OS from an inert
+    /// state.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn publish_debugger_for_test(
+        &mut self,
+        probe: DebuggerProbe,
+        self_hardened: SelfHardening,
+    ) {
+        self.publish_debugger_aged_for_test(probe, self_hardened, Duration::ZERO);
+    }
+
+    /// [`Self::publish_debugger_for_test`], as if the worker had published it
+    /// `age` ago.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn publish_debugger_aged_for_test(
+        &mut self,
+        probe: DebuggerProbe,
+        self_hardened: SelfHardening,
+        age: Duration,
+    ) {
+        self.probes.live = true;
+        // The worker reads the hardening once and keeps it, as here.
+        let _ = self.shared.hardening.set(self_hardened);
+        let now = Instant::now();
+        let at = now
+            .checked_sub(age)
+            .expect("a monotonic clock that far back");
+        let mut slot = self.shared.debugger.lock_or_recover();
+        let generation = slot.begin(now);
+        slot.complete(
+            generation,
+            DebuggerEntry {
+                probe,
+                self_hardened,
+            },
+            at,
+        );
+        slot.retry_after = None;
+    }
+
+    /// No debugger worker out and no answer held: nothing read the rule.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn debugger_slot_idle_for_test(&self) -> bool {
+        let slot = self.shared.debugger.lock_or_recover();
+        !slot.in_flight && slot.entry.is_none()
+    }
+
+    /// A debugger worker is out.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn debugger_in_flight_for_test(&self) -> bool {
+        self.shared.debugger.lock_or_recover().in_flight
     }
 
     /// A future-only deadline for an active observer. Completion normally
@@ -1221,6 +1307,9 @@ impl std::fmt::Debug for ConsentState {
 pub(crate) struct SigningIdentity {
     /// `CFBundleIdentifier` of the running bundle, when there is one.
     bundle_id: Option<String>,
+    /// The same id as the one subject a `tccutil reset` may name, read from
+    /// the running bundle's `Info.plist` ([`consent::ResetSubject::read`]).
+    reset_subject: Option<consent::ResetSubject>,
     /// `CFBundleDisplayName` / `CFBundleName`, else the executable basename.
     display_name: Option<String>,
     /// `developer-id` | `adhoc` | `unsigned` | `unknown`.
@@ -1244,6 +1333,7 @@ impl SigningIdentity {
         static UNKNOWN: OnceLock<SigningIdentity> = OnceLock::new();
         UNKNOWN.get_or_init(|| Self {
             bundle_id: None,
+            reset_subject: None,
             display_name: None,
             signing: "unknown",
             team: None,
@@ -1343,6 +1433,7 @@ fn read_signing_identity() -> SigningIdentity {
         .and_then(|t| plist_string(t, "CFBundleDisplayName").or(plist_string(t, "CFBundleName")))
         .map(str::to_owned);
     SigningIdentity {
+        reset_subject: consent::ResetSubject::read(&root, &protected),
         bundle_id: identity.bundle_id,
         display_name,
         signing: identity.signing,
@@ -1675,8 +1766,8 @@ const TASKPORT_WATCH: &str = "off";
 /// d034733c6 removed `reset=` for handing in-session agents a command). It is
 /// the place the design names (§4.1): aterm's own Settings ▸ Security, whose
 /// debugger row carries the owner's "Allow debugger access…" press — confirmed
-/// in aterm's alert, after which macOS should ask for an administrator in its
-/// own dialog (spike D2 has not measured it); an agent can answer neither. An enable token here would be the hazard `reset=` was.
+/// in aterm's alert, after which macOS asks for an administrator in its own
+/// dialog (spike D2, measured); an agent can answer neither. An enable token here would be the hazard `reset=` was.
 const DEBUGGER_REMEDIATE: &str = "aterm-settings:security";
 
 /// `remediate devtools=`: a PLACE, never a command. The Developer Tools list
@@ -2420,7 +2511,7 @@ impl App {
                 // No production site observes a per-session EPERM yet (the
                 // warm-up §3.5 and aterm's own file work §3.6 will).
                 observed_eperm: false,
-                evidence: SpikeEvidence::UNMEASURED,
+                evidence: SpikeEvidence::MEASURED,
             });
             sessions.push(SessionRow {
                 sid: session.ctx.self_id.as_str().to_string(),
@@ -2463,7 +2554,7 @@ impl App {
         // The folder row's state. `rows()` does not drain (a pass the Security
         // panel has not folded yet must not be consumed). `covers` comes from
         // the same split `lines()` renders.
-        let evidence = SpikeEvidence::UNMEASURED;
+        let evidence = SpikeEvidence::MEASURED;
         let split = covers_split(probe.state, evidence);
         let warmup_rows = self.consent_warmup.rows();
         let folders: Vec<(&'static str, &'static str)> = folder_names()
@@ -2561,6 +2652,7 @@ impl App {
             probe: probe.label,
             dr: identity.dr,
             bundle_id: identity.bundle_id.clone(),
+            reset_subject: identity.reset_subject.clone(),
             install,
             running: running.clone(),
             sessions_total,
@@ -2614,6 +2706,8 @@ pub(crate) struct ConsentPanelFacts {
     /// The RUNNING bundle's id, never a literal and never the release
     /// channel's when this build is not it.
     pub(crate) bundle_id: Option<String>,
+    /// The same id as the reset's subject, for the panel's repair plan.
+    pub(crate) reset_subject: Option<consent::ResetSubject>,
     /// The install posture token the doctor would classify (`installed`,
     /// `mounted-image`, `translocated`, `not-a-bundle`, `unknown`).
     pub(crate) install: &'static str,
@@ -2722,7 +2816,7 @@ impl App {
             // See `read_privacy`: no production site observes a per-session
             // EPERM yet, and the join is table-tested on both values.
             observed_eperm: false,
-            evidence: SpikeEvidence::UNMEASURED,
+            evidence: SpikeEvidence::MEASURED,
         });
         SessionConsent {
             attribution: posture.attribution,
@@ -3320,6 +3414,7 @@ mod tests {
             os: Some("26.6.2".to_string()),
             identity: SigningIdentity {
                 bundle_id: Some("com.aterm.aterm".to_string()),
+                reset_subject: None,
                 display_name: Some("aterm".to_string()),
                 signing: "developer-id",
                 team: Some("A66A9P66Z7".to_string()),
@@ -4019,7 +4114,7 @@ mod tests {
         };
 
         let cold = state.debugger(ProbeGate::on());
-        assert_eq!(cold, DebuggerRow::refused(DebuggerProbeLabel::Pending));
+        assert_eq!(cold, DebuggerRow::awaiting(SelfHardening::Unknown));
         assert!(cold.pending(), "the reading thread never waits");
         wait();
         let warm = state.debugger(ProbeGate::on());
@@ -4049,6 +4144,73 @@ mod tests {
             HARDENING_READS.load(Ordering::Acquire),
             1,
             "the hardening bits are fixed at exec: read once"
+        );
+    }
+
+    /// A retired debugger answer forgets the rule, not aterm's own hardening:
+    /// once a worker has read it, the pending row a re-probe serves carries it,
+    /// so the change lane's log line, the Security row's hedge and
+    /// `self_hardened=` do not fall back to `unknown` on a hardened aterm. A
+    /// cold row, read before any worker looked, and a closed gate's row (aterm
+    /// did not look) still say `unknown`.
+    #[test]
+    fn a_pending_debugger_row_keeps_the_hardening_already_read() {
+        use std::sync::atomic::AtomicUsize;
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        fn counting(_gate: ProbeGate) -> DebuggerProbe {
+            fake_debugger(&RUNS)
+        }
+        fn hardened() -> SelfHardening {
+            SelfHardening::Hardened
+        }
+        let mut state = ConsentState::inert();
+        state.probes.live = true;
+        state.probes.debugger = counting;
+        state.probes.hardening = hardened;
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.set_debugger_wake(Arc::new(move || {
+            let _ = tx.send(());
+        }));
+        let wait = || {
+            rx.recv_timeout(Duration::from_secs(60))
+                .expect("the worker publishes")
+        };
+
+        let cold = state.debugger(ProbeGate::on());
+        assert!(cold.pending());
+        assert_eq!(
+            cold.self_hardened(),
+            SelfHardening::Unknown,
+            "nothing read it"
+        );
+        wait();
+        assert_eq!(
+            state.debugger(ProbeGate::on()).self_hardened(),
+            SelfHardening::Hardened
+        );
+
+        state.invalidate_debugger();
+        // Step past the retry floor so this read dispatches the re-probe.
+        state
+            .shared
+            .debugger
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retry_after = None;
+        let retired = state.debugger(ProbeGate::on());
+        assert_eq!(retired, DebuggerRow::awaiting(SelfHardening::Hardened));
+        assert!(retired.pending(), "the rule itself is read again");
+        wait();
+        assert_eq!(RUNS.load(Ordering::Acquire), 2);
+
+        let closed = ProbeGate {
+            enabled: false,
+            check: true,
+        };
+        assert_eq!(
+            state.debugger(closed).self_hardened(),
+            SelfHardening::Unknown,
+            "a closed gate reports nothing, the hardening included"
         );
     }
 
@@ -4840,7 +5002,7 @@ mod tests {
         assert_eq!(json["devtools"]["answer_age_ms"].as_u64(), Some(4100));
 
         let mut unobserved = observed.clone();
-        unobserved.debugger = DebuggerRow::refused(DebuggerProbeLabel::Pending);
+        unobserved.debugger = DebuggerRow::awaiting(SelfHardening::Unknown);
         unobserved.devtools = DevToolsRow::refused(DevToolProbeLabel::Pending, None);
         let pending = parse(&unobserved);
         for row in ["debugger", "devtools"] {

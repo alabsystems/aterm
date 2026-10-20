@@ -3,6 +3,10 @@
 
 [package]
 name = "aterm-ctl"
+# Integration tests are declared below, not discovered: the files are modules of
+# the one `ctl_suite` binary. With autotests off a `tests/*.rs` file listed
+# nowhere never compiles.
+autotests = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -41,6 +45,10 @@ aterm-time = { workspace = true }
 # pty fixture does. Workspace crate, already in the workspace graph.
 [target.'cfg(unix)'.dev-dependencies]
 aterm-pty = { workspace = true }
+
+[[test]]
+name = "ctl_suite"
+path = "tests/ctl_suite.rs"
 
 [lints]
 workspace = true

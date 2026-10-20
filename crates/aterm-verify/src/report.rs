@@ -67,12 +67,24 @@ pub fn judge(
     let (detail, findings) = match worst {
         Outcome::Ok => (scope.to_string(), Vec::new()),
         Outcome::Fail(Severity::GateFailed) => {
-            let findings: Vec<Finding> = reports.iter().flat_map(|r| r.findings()).collect();
+            let mut findings: Vec<Finding> = reports.iter().flat_map(|r| r.findings()).collect();
             let detail = match findings.iter().filter(|f| f.rerun.is_some()).count() {
                 0 => labels.first().copied().unwrap_or_default().to_string(),
                 1 => "1 test failed".to_string(),
                 n => format!("{n} tests failed"),
             };
+            // What could not run beside the failures follows them under its own
+            // word, counted in none of them: a host with no fish is no failure.
+            let unrun = Outcome::Fail(Severity::CouldNotRun);
+            findings.extend(
+                rows.iter()
+                    .filter(|(o, _)| *o == unrun)
+                    .map(|(_, l)| Finding {
+                        id: format!("{} {l}", word(unrun)),
+                        rerun: None,
+                        message: Vec::new(),
+                    }),
+            );
             (detail, findings)
         }
         _ => {
@@ -253,7 +265,13 @@ mod tests {
         test.cannot_run("no disk");
         let r = judge(Check::Test, &[&test], 0.0, "", "rerun".into());
         assert_eq!(r.outcome, Outcome::Fail(Severity::GateFailed));
-        assert_eq!(r.findings.len(), 1);
+        let ids: Vec<&str> = r.findings.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["a row", "NOT RUN no disk"],
+            "the failure, then what could not run beside it under its own word"
+        );
+        assert_eq!(r.detail, "a row");
     }
 
     #[test]

@@ -2,28 +2,17 @@
 // Copyright 2026 Andrew Yates
 
 //! The presence facts a host gathers, the per-session [`Slot`] that folds
-//! them (with its story: what happened since the human last looked), and the
-//! severity ([`Level`]) the rim ([`Rim`]) and the tab chip ([`ChipLevel`])
-//! derive from.
+//! them (with its story: what happened since the human last looked, which
+//! `status level=` and `story=` count), the wire severity ([`Level`]), and
+//! the two marks the window draws from the host's PUBLISHED need verdict:
+//! the border ([`Rim`]) and the tab chip ([`ChipLevel`]). Nothing here
+//! classifies a need: [`Facts::need`] is the host's one verdict, read.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
 
-use super::{Host, SETTLED_GLOW, STORY_CAP, TOLD_FLASH};
+use super::{Host, STORY_CAP};
 use crate::Instant;
-
-/// The colour mood of the row — information, a good end, or something the
-/// user should look at. The phase slot is painted in it ([`super::paint_row`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Tone {
-    /// Information.
-    #[default]
-    Info,
-    /// A good end: the two seconds after a settled turn.
-    Success,
-    /// A human should look.
-    Warn,
-}
 
 /// What the classifier read off one screen: the worker's phase and the
 /// context indicator.
@@ -35,8 +24,8 @@ pub struct AgentReading<V: Host> {
     pub context_pct: Option<u8>,
 }
 
-/// The worker's phase as the row spells it. `Wall` keeps only the wall's kind
-/// and the reset time the notice named, never the notice text.
+/// The worker's phase as the wire spells it. `Wall` keeps only the wall's
+/// kind and the reset time the notice named, never the notice text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentPhase<V: Host> {
     /// Working.
@@ -59,8 +48,7 @@ pub enum AgentPhase<V: Host> {
         /// The reset time the notice named, sanitized.
         reset: Option<String>,
         /// When the reset falls, if the notice's time could be placed on the
-        /// host's clock: the row counts down to it. `None` prints the reset
-        /// time alone, never a figure that is not the countdown.
+        /// host's clock.
         until: Option<Instant>,
     },
     /// Waiting at its composer.
@@ -88,9 +76,10 @@ impl<V: Host> AgentPhase<V> {
         }
     }
 
-    /// The word the row prints: [`Self::word`], except that a wall is the
-    /// host's word for it ([`Host::wall_band`]) and a parked survey is `idle`,
-    /// since the worker waits at its composer either way.
+    /// The word a person reads ([`super::state_line`]): [`Self::word`],
+    /// except that a wall is the host's word for it ([`Host::wall_band`]) and
+    /// a parked survey is `idle`, since the worker waits at its composer
+    /// either way.
     #[must_use]
     pub fn band_word(&self) -> &'static str {
         match self {
@@ -100,8 +89,8 @@ impl<V: Host> AgentPhase<V> {
         }
     }
 
-    /// What the row's age counts from: its phase word, a box by the kind the
-    /// row names ([`super::prompt_band_word`]), so a box that follows another
+    /// What the phase's age counts from: its phase word, a box by the kind it
+    /// names ([`super::prompt_band_word`]), so a box that follows another
     /// starts its own age.
     pub(super) fn age_key(&self) -> Cow<'static, str> {
         match self {
@@ -109,25 +98,6 @@ impl<V: Host> AgentPhase<V> {
             other => other.band_word().into(),
         }
     }
-}
-
-/// The lease a refresh read, reduced to what the row's geometry hangs on. The
-/// host reads it into [`Facts::lease`] from the same read that forms the
-/// hand, and again, live, for [`super::drive::Desk::lease_mark`]: words formed
-/// under one mark are never committed to geometry under another
-/// (`commit_rows`), and every lease change posts a wake that re-derives them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum LeaseMark {
-    /// No live lease on the session, and it drives no peer.
-    #[default]
-    Free,
-    /// A driver may type into it: a `turn` before its end of input, or a
-    /// live drive lease.
-    Typing,
-    /// A `turn` past its end of input, settling.
-    Settling,
-    /// It drives a peer's `turn` (its band reads `▸ @<sid>`).
-    Driving,
 }
 
 /// Whose hand is on this session's keyboard.
@@ -196,19 +166,19 @@ impl Hand {
 /// holder name its supervisor loops claim sessions by, TAKEN BY this process
 /// as the kernel attests it ([`Host::is_aterms_holder`]). Another instance's
 /// harness, a manager session, an `aterm drive`, or a client that spelled
-/// aterm's holder name itself is somebody else's hand, a fact the window
-/// shows.
+/// aterm's holder name itself is somebody else's hand.
 #[must_use]
 pub(crate) fn is_aterms_hand<V: Host>(hand: &Hand) -> bool {
     matches!(hand, Hand::DrivenLease { holder, pid } if V::is_aterms_holder(holder, *pid))
 }
 
-/// The standing halt, as the row prints it.
+/// The standing halt, as the wire reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HoldFact {
     /// The wire's (percent-encoded) reason.
     pub reason: String,
-    /// `origin=fleet`: cannot be lifted from this window.
+    /// `origin=fleet` (the bridge's): the host's menus say it cannot be
+    /// lifted from this window. Presence reads only that a hold stands.
     pub fleet: bool,
 }
 
@@ -224,7 +194,7 @@ pub struct MailLast {
     pub trust: String,
 }
 
-/// The mail counts the row prints.
+/// The mail counts `status level=` weighs.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct MailFacts {
     /// Unread rows.
@@ -252,9 +222,7 @@ pub enum Link {
         rtt_ms: Option<u64>,
     },
     /// A bridge is attached but its broker link is down — for `age_ms`, when
-    /// the stall has a date. `None` for a bridge still dialing since it
-    /// attached: there is no stall to date, and the slot prints `~` with no
-    /// figure rather than `~ 0s`.
+    /// the stall has a date.
     Stalled {
         /// How long the link has been down.
         age_ms: Option<u64>,
@@ -274,16 +242,26 @@ pub struct TurnFact {
     pub dur_ms: u64,
     /// The record came from an earlier process across a self-update handoff:
     /// the ledger's baseline, never news, so the slot adopts it without a
-    /// story point or the Success glow.
+    /// story point.
     pub carried: bool,
+    /// THIS PROCESS'S harness typed it (the ledger's `by=harness`): aterm's
+    /// own turn, whose story point is aterm's (ruling 313) whether or not a
+    /// refresh saw the hand it was typed under — the turn-end loop's
+    /// continuation holds the hand only from its text to its Enter.
+    pub aterm: bool,
+    /// When the turn opened (the ledger's own `started_ms`, on the host's
+    /// clock, never later than it), `None` where the host cannot say (a
+    /// carried record's clock was another process's). What a program's turn
+    /// must have begun no earlier than to be this turn
+    /// ([`Facts::program_turn_began`]); unknown, it is read as the settle less
+    /// its `dur_ms`.
+    pub opened: Option<Instant>,
 }
 
-/// Who answers the wall the agent is at ([`Facts::wall_answer`]): a host
-/// fact (aterm's own harness holds the session and has a plan for the wall)
-/// the screen cannot show. A wall the harness resumes by itself (a limit
-/// waited out to its reset, a 529 retried, a full context compacted) is a
-/// record the row dates, not a stop: no red rim and no "can't continue" for
-/// hours nobody needs to act in. A wall nobody answers keeps the stop.
+/// Who answers the wall the agent is at: a host fact (aterm's own harness
+/// holds the session and has a plan for the wall) the screen cannot show. A
+/// wall the harness resumes by itself is a record (`level=note`), not a stop.
+/// The need classifier reads it too (`aterm-gui`'s `needs::NeedFacts`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WallAnswer {
     /// Nobody: no supervisor, the owner's switch off, a lost login, a
@@ -296,29 +274,56 @@ pub enum WallAnswer {
     /// The harness resumes it slowly and a person can lift it faster: a
     /// reset-less model bucket, a spend limit no reset ends. The payload is
     /// the one thing to do, a static phrase (`/model to switch`, `add
-    /// credits`), which the row says calmly.
+    /// credits`).
     HarnessAsks(&'static str),
+}
+
+/// How a need presses: the two severities of the host's need words
+/// (`aterm_types::needs::Severity`, which this wasm-clean crate does not
+/// link; the host maps its word onto these).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NeedSeverity {
+    /// Nothing moves until the person acts: the stop tone.
+    Stuck,
+    /// The person decides: the wait tone.
+    Decide,
+}
+
+/// THE PUBLISHED NEED, as the presence engine reads it: what the host's one
+/// classifier (`aterm-gui`'s `needs::of`, published on the session's
+/// timeline) says the session needs of its owner now. The engine never
+/// re-classifies: the border, the pill and the tab mark draw this value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NeedFact {
+    /// The need word's severity: it picks the border and the mark.
+    pub severity: NeedSeverity,
+    /// What a stuck need's remedy turns on (the host maps `frozen` to
+    /// [`StopCause::Frozen`], `stopped` to [`StopCause::Suspended`], every
+    /// other word to [`StopCause::Wall`]); [`StopCause::Wall`] for a decide
+    /// need.
+    pub cause: StopCause,
+    /// The word and the transition's identity within it, as one key: a need
+    /// whose key stands is the same need, its age unmoved
+    /// ([`Slot::need_since`]).
+    pub key: (u8, u64),
+    /// Its words, one clipped line, without the tab's label.
+    pub what: String,
 }
 
 /// Everything one refresh reads. Built by the host from the session's own
 /// state; pure data so the model is testable without a store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Facts<V: Host> {
-    /// `meta role`.
-    pub role: Option<String>,
-    /// `meta attention` (a typed escalation).
+    /// `meta attention` (a typed escalation): `status level=` and `why=`.
     pub attention: Option<String>,
-    /// `attention` is told elsewhere, in full: the level, `status why=` and
-    /// the tab chip still read it, but the window's own chrome (the rim and
-    /// the row, [`Slot::shown_level`]) does not repeat it.
-    pub attention_told_elsewhere: bool,
     /// The shell status word (`running`, `idle`, `quiet`, …) and when it was
-    /// published — the phase the row shows when no agent reading exists.
+    /// published — the state the hover line names when no agent reading
+    /// exists.
     pub shell: Option<(&'static str, Instant)>,
     /// The program's own state report (OSC 7501) the host honours now, as
-    /// the row's word (`codex working`), and since when: shown when no agent
-    /// reading names a phase, ahead of the shell's word. A claim for display
-    /// only; nothing decides on it.
+    /// the hover's state line names it (`codex working`), and since when:
+    /// named when no agent reading names a phase, ahead of the shell's word.
+    /// A claim for display only; nothing decides on it.
     pub program: Option<(&'static str, Instant)>,
     /// The sequence number of the host's agent reading: `agent` is folded in
     /// only when this is newer than the one the slot last absorbed; `0` =
@@ -333,18 +338,7 @@ pub struct Facts<V: Host> {
     /// lapse, so the host arms this as a deadline and re-reads the hand when
     /// it passes. `None` without such a lease.
     pub lease_until: Option<Instant>,
-    /// A driver may still type into the session (a `turn` before its settle
-    /// phase, or a live drive lease). Every window showing the session holds
-    /// its row count meanwhile ([`super::drive::Desk::driver_may_type`] reads
-    /// the live lease); as a fact here, the wake that lifts it counts as a
-    /// change so the held row catches up, and words formed under it are never
-    /// committed after the lease is gone (`commit_rows`).
-    pub typing: bool,
-    /// The lease as this read saw it — the same read as [`Self::hand`] and
-    /// [`Self::typing`], never a second lock of it. The row's commit holds
-    /// while the host's live mark differs.
-    pub lease: LeaseMark,
-    /// The standing hold.
+    /// The standing hold (`status level=hold`).
     pub hold: Option<HoldFact>,
     /// The mail counts.
     pub mail: MailFacts,
@@ -353,23 +347,27 @@ pub struct Facts<V: Host> {
     /// The last completed turn.
     pub turn: Option<TurnFact>,
     /// The host's published input stall: the program has stopped reading its
-    /// input. Ranks [`Level::Limited`] and takes the phase slot as `frozen`
-    /// (or `stopped`) — ahead of typed attention.
+    /// input (`status level=limited`).
     pub input_stall: Option<V::Stall>,
     /// Who answers the agent's wall, if it is at one ([`WallAnswer`]).
-    /// Read every refresh: a claim that arrives or lapses moves it without a
-    /// new agent reading.
     pub wall_answer: WallAnswer,
+    /// THE PUBLISHED NEED ([`NeedFact`]): what the border, the pill and the
+    /// tab mark draw. `None`: the session needs nothing of its owner.
+    pub need: Option<NeedFact>,
+    /// The person's own hold stands on the session (the published
+    /// `hold_by=person`): the "yours" outline and mark. A hold another origin
+    /// set (the Owner token's, the bridge's) is no mark of yours.
+    pub held_by_person: bool,
     /// How many times the program in front has reported its own turn ending
     /// (OSC 7501 `working` → `done`|`idle`, the host's gate counting what it
     /// honoured). Each new one is a story point ([`StoryVerb::ProgramDone`]):
-    /// the tab's dot says a background codex finished. Display only; nothing
-    /// decides on it.
+    /// `status story=` and `level=story` say a background codex finished,
+    /// and one that is news counts in [`Slot::turn_end_news`], which the
+    /// host's `•` reads. Display only; nothing decides on it.
     pub program_turn_ends: u64,
     /// The session is in front of a window the person has focused, so a turn
     /// end it reports ([`Self::program_turn_ends`]) happens in plain sight: it
-    /// joins the story without being news. Raising the row for it would
-    /// re-grid the program as its turn ends and again at the next key.
+    /// joins the story without being news.
     pub program_turn_watched: bool,
     /// How many turns the program in front has begun by its own report (OSC
     /// 7501 `working` after no turn in progress, as the host's gate showed
@@ -377,31 +375,37 @@ pub struct Facts<V: Host> {
     /// [`Self::program_turn_ends`] and a ledger settle ([`Self::turn`]) read
     /// at the same count are the same turn, whichever refresh reads which.
     pub program_turn_starts: u64,
+    /// When the host's gate counted the program's latest turn start
+    /// ([`Self::program_turn_starts`]), `None` before any. A program turn end
+    /// and a ledger settle are one turn only when that turn began no earlier
+    /// than the ledger turn opened ([`TurnFact::opened`]): the person's own
+    /// turn, begun before a driven one was typed, is not the driven turn,
+    /// whichever end is read first and whether or not one refresh reads both.
+    pub program_turn_began: Option<Instant>,
 }
 
 impl<V: Host> Default for Facts<V> {
     fn default() -> Self {
         Self {
-            role: None,
             attention: None,
-            attention_told_elsewhere: false,
             shell: None,
             program: None,
             agent_seq: 0,
             agent: None,
             hand: Hand::None,
             lease_until: None,
-            typing: false,
-            lease: LeaseMark::Free,
             hold: None,
             mail: MailFacts::default(),
             link: Link::Absent,
             turn: None,
             input_stall: None,
             wall_answer: WallAnswer::Nobody,
+            need: None,
+            held_by_person: false,
             program_turn_ends: 0,
             program_turn_watched: false,
             program_turn_starts: 0,
+            program_turn_began: None,
         }
     }
 }
@@ -422,12 +426,25 @@ struct ToldEnd {
     /// The program's turn-start count it was read at
     /// ([`Facts::program_turn_starts`]).
     starts: u64,
-    /// When it was told: a program end told before the ledger turn it would
-    /// pair with had opened is an earlier turn's, never this one's.
-    at: Instant,
+    /// When its turn began: a settle's, when the ledger turn opened
+    /// ([`TurnFact::opened`]); a program end's, when the program's turn began
+    /// ([`Facts::program_turn_began`], else the end itself, the latest it can
+    /// have begun). The two pair only when the program's began no earlier
+    /// than the ledger's ([`began_in`]).
+    began: Option<Instant>,
     /// The story point it was told as, and whether that point was news.
     seq: u64,
     news: bool,
+}
+
+/// Whether a program turn that began at `program` is the ledger turn that
+/// opened at `ledger`: it began no earlier ([`ToldEnd::began`]). Either
+/// unknown pairs by the turn-start count alone.
+fn began_in(program: Option<Instant>, ledger: Option<Instant>) -> bool {
+    match (program, ledger) {
+        (Some(program), Some(ledger)) => program >= ledger,
+        _ => true,
+    }
 }
 
 /// What a story point says happened.
@@ -440,9 +457,7 @@ pub enum StoryVerb {
     /// ledger settle of the same turn, whichever refresh reads which first
     /// ([`Facts::program_turn_starts`]).
     ProgramDone,
-    /// A turn whose settle deadline passed (`status=timeout` on the ledger):
-    /// counted with the turns, and said — a busy worker with a timed-out turn
-    /// never reads `◇ quiet`.
+    /// A turn whose settle deadline passed (`status=timeout` on the ledger).
     TurnTimedOut,
     /// Mail arrived.
     Mail,
@@ -452,111 +467,28 @@ pub enum StoryVerb {
     Limited,
     /// The agent asked.
     Question,
-    /// The watcher approved a read (`ctl story approved`).
-    Approval,
     /// A stop (hold / limited) ended.
     Resumed,
-    // The rest of the closed set `aterm ctl story <verb>` accepts: what the
-    // watcher decided or saw, which reaches the window no other way.
-    /// `ctl story dismissed` — the session survey was dismissed for the human.
-    Dismissed,
-    /// `ctl story reconnected` — the watcher rode out an outage and is back.
-    Reconnected,
-    /// `ctl story timeout` — the watcher's budget ran out.
-    Timeout,
-    /// `ctl story exit` — the watcher's loop ended.
-    Exit,
-    /// `ctl story compacted` — the worker compacted its context.
-    Compacted,
-    /// `ctl story warned` — the watcher warned (context running low).
-    Warned,
     /// `ctl story chose <policy>`: the supervisor answered the agent's
-    /// question dialog by policy, the text naming the policy word. The one
-    /// told verb whose teller is the harness, and the one the window answers
-    /// with a chime and a pulse, so the human notices a question was answered
-    /// without them.
+    /// question dialog by policy. The one told verb a process sends (the
+    /// harness's approval loop): a record (`status story=`), never a sound
+    /// or a flash.
     Chose,
 }
 
 impl StoryVerb {
-    /// The closed set of words `aterm ctl story <verb>` accepts, in the order
-    /// the usage line prints them. A word outside it is a usage error, never a
-    /// free-text story point.
-    pub const TOLD_WORDS: [&'static str; 8] = [
-        "approved",
-        "dismissed",
-        "reconnected",
-        "timeout",
-        "exit",
-        "compacted",
-        "warned",
-        "chose",
-    ];
+    /// The closed set of words `aterm ctl story <verb>` accepts. A word
+    /// outside it is a usage error, never a free-text story point. The seven
+    /// words no process sent went with the presence row that showed them
+    /// (owner surfaces, 2026-10-16 §7).
+    pub const TOLD_WORDS: [&'static str; 1] = ["chose"];
 
     /// The verb a `ctl story <word>` names, `None` outside the closed set.
     #[must_use]
     pub fn parse_told(word: &str) -> Option<Self> {
-        Some(match word {
-            "approved" => Self::Approval,
-            "dismissed" => Self::Dismissed,
-            "reconnected" => Self::Reconnected,
-            "timeout" => Self::Timeout,
-            "exit" => Self::Exit,
-            "compacted" => Self::Compacted,
-            "warned" => Self::Warned,
-            "chose" => Self::Chose,
-            _ => return None,
-        })
-    }
-
-    /// The glyph and wire word the row prints for a told verb (`✓ approved`).
-    #[must_use]
-    pub(crate) const fn told_words(self) -> Option<(char, &'static str)> {
-        Some(match self {
-            Self::Approval => ('\u{2713}', "approved"),
-            Self::Dismissed => ('\u{2713}', "dismissed"),
-            Self::Reconnected => ('\u{27df}', "reconnected"),
-            Self::Timeout => ('\u{2715}', "timeout"),
-            Self::Exit => ('\u{2715}', "exit"),
-            Self::Compacted => ('\u{25c7}', "compacted"),
-            Self::Warned => ('\u{26a0}', "warned"),
-            // A filled diamond: distinct from an approval's check, and the
-            // solid twin of the quiet summary's `◇`.
-            Self::Chose => ('\u{25c6}', "chose"),
-            Self::Turn
-            | Self::ProgramDone
-            | Self::TurnTimedOut
-            | Self::Mail
-            | Self::Hold
-            | Self::Limited
-            | Self::Question
-            | Self::Resumed => return None,
-        })
-    }
-
-    /// Who acted on a told point, for the spoken sentence (`approved by
-    /// watcher`, `chose by harness`, `compacted by worker`): the harness for
-    /// [`Self::Chose`], the worker for [`Self::Compacted`] (the watcher only
-    /// saw it happen), a watcher for every other told word.
-    #[must_use]
-    pub const fn teller(self) -> &'static str {
-        match self {
-            Self::Chose => "harness",
-            Self::Compacted => "worker",
-            Self::Approval
-            | Self::Dismissed
-            | Self::Reconnected
-            | Self::Timeout
-            | Self::Exit
-            | Self::Warned
-            | Self::Turn
-            | Self::ProgramDone
-            | Self::TurnTimedOut
-            | Self::Mail
-            | Self::Hold
-            | Self::Limited
-            | Self::Question
-            | Self::Resumed => "watcher",
+        match word {
+            "chose" => Some(Self::Chose),
+            _ => None,
         }
     }
 }
@@ -571,8 +503,7 @@ pub struct StoryPoint {
     /// What happened.
     pub verb: StoryVerb,
     /// The point happened under aterm's own harness's hand: kept in the story
-    /// and counted by `story=`, never news, since the row and the log already
-    /// tell what aterm did there.
+    /// and counted by `story=`, never news.
     pub aterm: bool,
 }
 
@@ -580,36 +511,28 @@ pub struct StoryPoint {
 #[derive(Clone, Debug)]
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "each bool is an independent fact the fold keeps (told elsewhere, baselined, aterm's hand, noting it); no two of them are one state"
+    reason = "four independent facts of one slot: its baseline, aterm's hand now and at either end of an absorb, and the person's hold; no two are states of one thing"
 )]
 pub struct Slot<V: Host> {
     /// The agent-reading sequence last absorbed ([`Facts::agent_seq`]); `None`
     /// before the first. This only keeps a refresh from re-folding a reading
     /// it already has.
     pub agent_seq_seen: Option<u64>,
-    /// [`Facts::role`].
-    pub role: Option<String>,
     /// [`Facts::attention`].
     pub attention: Option<String>,
-    /// [`Facts::attention_told_elsewhere`].
-    pub attention_told_elsewhere: bool,
     /// [`Facts::shell`].
     pub shell: Option<(&'static str, Instant)>,
     /// [`Facts::program`].
     pub program: Option<(&'static str, Instant)>,
     /// [`Facts::agent`].
     pub agent: Option<AgentReading<V>>,
-    /// When the agent phase word last changed: the row's `since` for it.
+    /// When the agent phase word last changed: the hover line's age for it.
     pub agent_since: Instant,
     /// [`Facts::hand`].
     pub hand: Hand,
     /// When the cooperative lease behind `hand` lapses (see
     /// [`Facts::lease_until`]); the host's timer re-reads the hand then.
     pub lease_until: Option<Instant>,
-    /// [`Facts::typing`].
-    pub typing: bool,
-    /// [`Facts::lease`].
-    pub lease: LeaseMark,
     /// [`Facts::hold`].
     pub hold: Option<HoldFact>,
     /// [`Facts::mail`].
@@ -622,21 +545,30 @@ pub struct Slot<V: Host> {
     pub input_stall: Option<V::Stall>,
     /// [`Facts::wall_answer`].
     pub wall_answer: WallAnswer,
+    /// [`Facts::need`].
+    pub need: Option<NeedFact>,
+    /// When the standing need began: the absorb that first saw its word and
+    /// key. A need re-read with the same word and key keeps it; another
+    /// episode starts its own. What the pill's age counts from.
+    pub need_since: Instant,
+    /// [`Facts::held_by_person`].
+    pub held_by_person: bool,
     /// [`Facts::program_turn_ends`], as the last refresh read it.
     pub program_turn_ends: u64,
+    /// How many of the program's own turn ends were NEWS: reported while
+    /// nobody watched the session ([`Facts::program_turn_watched`]) and not
+    /// under aterm's own hand, a driven turn's end told once with its ledger
+    /// settle. Only ever grows, from 0 at the mint (the count standing at the
+    /// baseline is no news). The host's tab `•` reads it against the count
+    /// its looking rule last saw, as it reads a finished task's done rev: a
+    /// background codex that finished its turn is what finished.
+    pub turn_end_news: u64,
     /// The one turn end told and not yet paired: a ledger settle told as
     /// [`StoryVerb::Turn`] (`Settle`) or a program turn end told as
     /// [`StoryVerb::ProgramDone`] (`Done`), with the program's turn-start
     /// count it was read at ([`Facts::program_turn_starts`]). The other end of
     /// the same turn, read at the same count, is that turn already told.
     told_end: Option<ToldEnd>,
-    /// When the last turn settled (the start of the Success tone's glow).
-    pub settled_at: Option<Instant>,
-    /// When a stop (hold or limit) began, for the story's stop duration.
-    /// `None` under a hold the slot first saw at its own mint: nothing in a
-    /// hold says when it began, so the row prints no figure for it rather
-    /// than dating it from the mint.
-    stop_began: Option<(StoryVerb, Instant)>,
     /// Whether a refresh has been absorbed yet. The first absorb is the
     /// baseline: a fact already standing when the slot was minted (a hold) is
     /// adopted as state, not narrated as news.
@@ -649,19 +581,16 @@ pub struct Slot<V: Host> {
     news_seq: u64,
     /// aterm's own harness has its hand on the session: a drive lease this
     /// process's harness holds (`is_aterms_hand`), or a `turn` typed inside
-    /// one (an Owner-token turn whose lease hands back to it). Not a presence
-    /// fact: the window does not show it, and its story points are not news.
+    /// one (an Owner-token turn whose lease hands back to it). Its story
+    /// points are not news.
     pub(super) aterm_hand: bool,
     /// Set for the length of one [`Self::absorb`] in which aterm's hand was on
     /// the session at either end: every point it notes is aterm's.
     noting_aterm: bool,
     /// The story up to this seq is closed: the agent it was about left the
-    /// session, so it is no news to hold the row for. Every window's
-    /// watermark is read as at least this.
+    /// session, so it is no news. Every window's watermark is read as at
+    /// least this.
     story_closed: u64,
-    /// The last told point (`ctl story`), with its text: the phase slot reads
-    /// it for [`TOLD_FLASH`] after its instant, then returns to the phase.
-    told: Option<(StoryVerb, String, Instant)>,
 }
 
 impl<V: Host> Slot<V> {
@@ -670,27 +599,25 @@ impl<V: Host> Slot<V> {
     pub fn new(now: Instant) -> Self {
         Self {
             agent_seq_seen: None,
-            role: None,
             attention: None,
-            attention_told_elsewhere: false,
             shell: None,
             program: None,
             agent: None,
             agent_since: now,
             hand: Hand::None,
             lease_until: None,
-            typing: false,
-            lease: LeaseMark::Free,
             hold: None,
             mail: MailFacts::default(),
             link: Link::Absent,
             turn: None,
             input_stall: None,
             wall_answer: WallAnswer::Nobody,
+            need: None,
+            need_since: now,
+            held_by_person: false,
             program_turn_ends: 0,
+            turn_end_news: 0,
             told_end: None,
-            settled_at: None,
-            stop_began: None,
             baselined: false,
             story: VecDeque::new(),
             story_seq: 0,
@@ -698,36 +625,15 @@ impl<V: Host> Slot<V> {
             aterm_hand: false,
             noting_aterm: false,
             story_closed: 0,
-            told: None,
         }
     }
 
-    /// `aterm ctl story <verb> [<text>]` landed: one story point, and the
-    /// phase slot reads the verb for [`TOLD_FLASH`]. `text` is the wire text
-    /// (already bounded); it is sanitized for cells here like every other
-    /// free-text value. Returns the point's seq.
-    pub fn tell(&mut self, verb: StoryVerb, text: &str, now: Instant) -> u64 {
+    /// `aterm ctl story <verb> [<text>]` landed: one story point (`status
+    /// story=`). The text is the wire's and reaches no surface. Returns the
+    /// point's seq.
+    pub fn tell(&mut self, verb: StoryVerb, now: Instant) -> u64 {
         self.note(verb, now);
-        self.told = Some((verb, super::sanitize_token::<V>(text, 48), now));
         self.story_seq
-    }
-
-    /// The told point still standing in the phase slot at `now`.
-    pub(super) fn told_now(&self, now: Instant) -> Option<(StoryVerb, &str)> {
-        self.told
-            .as_ref()
-            .filter(|(_, _, at)| now.saturating_duration_since(*at) < TOLD_FLASH)
-            .map(|(v, t, _)| (*v, t.as_str()))
-    }
-
-    /// When the phase slot returns from a told point to the phase — the one
-    /// deadline a story post adds (there is no other clock).
-    #[must_use]
-    pub fn told_deadline(&self, now: Instant) -> Option<Instant> {
-        self.told
-            .as_ref()
-            .map(|(_, _, at)| *at + TOLD_FLASH)
-            .filter(|end| *end > now)
     }
 
     fn note(&mut self, verb: StoryVerb, now: Instant) {
@@ -761,7 +667,8 @@ impl<V: Host> Slot<V> {
     /// either end would have been, whichever was read first. A point already
     /// news stays it; a retained non-owned point told quietly becomes news at its
     /// own place. An owned point stays omitted, and a retired point cannot carry news.
-    fn pair_end(&mut self, told: ToldEnd, news: bool) {
+    /// Returns whether the turn is news now.
+    fn pair_end(&mut self, told: ToldEnd, news: bool) -> bool {
         self.told_end = None;
         let aterm = self.noting_aterm || self.aterm_hand;
         if news
@@ -773,10 +680,12 @@ impl<V: Host> Slot<V> {
                 .any(|point| point.seq == told.seq && !point.aterm)
         {
             self.news_seq = self.news_seq.max(told.seq);
+            return true;
         }
+        told.news
     }
 
-    /// Fold one refresh's facts in. Returns whether anything the view reads
+    /// Fold one refresh's facts in. Returns whether anything a reader reads
     /// moved.
     #[allow(
         clippy::too_many_lines,
@@ -795,16 +704,8 @@ impl<V: Host> Slot<V> {
             self.aterm_hand = now_aterm;
             changed = true;
         }
-        if self.role != facts.role {
-            self.role = facts.role;
-            changed = true;
-        }
         if self.attention != facts.attention {
             self.attention = facts.attention;
-            changed = true;
-        }
-        if self.attention_told_elsewhere != facts.attention_told_elsewhere {
-            self.attention_told_elsewhere = facts.attention_told_elsewhere;
             changed = true;
         }
         if self.wall_answer != facts.wall_answer {
@@ -832,10 +733,7 @@ impl<V: Host> Slot<V> {
             if word_moved {
                 match agent.as_ref().map(|a| &a.phase) {
                     Some(AgentPhase::Question) => self.note(StoryVerb::Question, now),
-                    Some(AgentPhase::Wall { .. }) => {
-                        self.note(StoryVerb::Limited, now);
-                        self.stop_began = Some((StoryVerb::Limited, now));
-                    }
+                    Some(AgentPhase::Wall { .. }) => self.note(StoryVerb::Limited, now),
                     _ => {}
                 }
                 if matches!(
@@ -863,24 +761,11 @@ impl<V: Host> Slot<V> {
             self.hand = facts.hand;
             changed = true;
         }
-        if self.typing != facts.typing {
-            self.typing = facts.typing;
-            changed = true;
-        }
-        if self.lease != facts.lease {
-            self.lease = facts.lease;
-            changed = true;
-        }
         // A renewed lease moves its deadline without moving a word.
         self.lease_until = facts.lease_until;
         if self.hold != facts.hold {
             match (&self.hold, &facts.hold) {
-                (None, Some(_)) if self.baselined => {
-                    self.note(StoryVerb::Hold, now);
-                    self.stop_began = Some((StoryVerb::Hold, now));
-                }
-                // Standing at the mint: the hold is state, its age unknown.
-                (None, Some(_)) => self.stop_began = None,
+                (None, Some(_)) if self.baselined => self.note(StoryVerb::Hold, now),
                 (Some(_), None) => self.note(StoryVerb::Resumed, now),
                 _ => {}
             }
@@ -906,14 +791,15 @@ impl<V: Host> Slot<V> {
         // ledger's settle (`turn`) and the program's own report (OSC 7501
         // `working` → `done`, `program_turn_ends`), read by different sweeps in
         // either order. The two pair when no turn of the program's began
-        // between them (the same `program_turn_starts`) and, read program end
-        // first, when that end was told no earlier than the ledger turn opened
-        // (its settle less its `dur_ms`): an end left from the person's own
-        // turn is not a driven turn's that the program never worked on. The
-        // second is that turn already told, and makes it news if it would have
-        // been (`pair_end`), so the order of the reads changes neither the
-        // count nor the level. Only a SETTLE pairs: a timed-out or hung-up
-        // turn is its own story. Each end pairs at most once.
+        // between them (the same `program_turn_starts`) and the program's turn
+        // began no earlier than the ledger turn opened (`began_in`, in both
+        // orders): an end of the person's own turn, begun before the driven
+        // one was typed, is not the driven turn's, whether it is read before
+        // the settle, after it, or in the same refresh. The second is that
+        // turn already told, and makes it news if it would have been
+        // (`pair_end`), so the order of the reads changes neither the count
+        // nor the level. Only a SETTLE pairs: a timed-out or hung-up turn is
+        // its own story. Each end pairs at most once.
         let starts = facts.program_turn_starts;
         if self.turn != facts.turn {
             // A carried record settled in a previous process: the baseline,
@@ -922,24 +808,28 @@ impl<V: Host> Slot<V> {
                 && !t.carried
                 && self.turn.is_none_or(|old| old.id < t.id)
             {
+                let noting = self.noting_aterm;
+                self.noting_aterm |= t.aterm;
                 if t.settled {
-                    self.settled_at = Some(now);
-                    let opened = now.checked_sub(std::time::Duration::from_millis(t.dur_ms));
+                    let opened = t
+                        .opened
+                        .or_else(|| now.checked_sub(std::time::Duration::from_millis(t.dur_ms)));
                     match self.told_end {
                         Some(told)
                             if told.end == TurnEnd::Done
                                 && told.starts == starts
-                                && opened.is_none_or(|opened| told.at >= opened) =>
+                                && began_in(told.began, opened) =>
                         {
-                            // The program's own end already told this turn.
-                            self.pair_end(told, true);
+                            // The program's own end already told this turn
+                            // (and counted it where it was news).
+                            let _ = self.pair_end(told, true);
                         }
                         _ => {
                             let news = self.note_as(StoryVerb::Turn, now, true);
                             self.told_end = Some(ToldEnd {
                                 end: TurnEnd::Settle,
                                 starts,
-                                at: now,
+                                began: opened,
                                 seq: self.story_seq,
                                 news,
                             });
@@ -948,34 +838,60 @@ impl<V: Host> Slot<V> {
                 } else {
                     self.note(StoryVerb::TurnTimedOut, now);
                 }
+                self.noting_aterm = noting;
             }
             self.turn = facts.turn;
             changed = true;
         }
-        // The program's own turn end (OSC 7501): a story point, so a tab the
-        // person is not looking at gets its dot. Adopted silently at the
-        // baseline, and not told beside the ledger settle of the same turn.
+        // The program's own turn end (OSC 7501): a story point (`status
+        // story=`), adopted silently at the baseline, and not told beside the
+        // ledger settle of the same turn.
         if facts.program_turn_ends != self.program_turn_ends {
             if facts.program_turn_ends > self.program_turn_ends && self.baselined {
                 let news = !facts.program_turn_watched;
-                match self.told_end {
-                    Some(told) if told.end == TurnEnd::Settle && told.starts == starts => {
-                        // The ledger's settle already told this turn.
-                        self.pair_end(told, news);
+                // Unknown, the turn began no later than its end, read now.
+                let began = Some(facts.program_turn_began.unwrap_or(now));
+                let news = match self.told_end {
+                    Some(told)
+                        if told.end == TurnEnd::Settle
+                            && told.starts == starts
+                            && began_in(began, told.began) =>
+                    {
+                        // The ledger's settle already told this turn: the
+                        // program's end is news where nobody watched it and
+                        // the turn is news (not aterm's own).
+                        let turn_news = self.pair_end(told, news);
+                        news && turn_news
                     }
                     _ => {
                         let news = self.note_as(StoryVerb::ProgramDone, now, news);
                         self.told_end = Some(ToldEnd {
                             end: TurnEnd::Done,
                             starts,
-                            at: now,
+                            began,
                             seq: self.story_seq,
                             news,
                         });
+                        news
                     }
-                }
+                };
+                self.turn_end_news += u64::from(news);
             }
             self.program_turn_ends = facts.program_turn_ends;
+            changed = true;
+        }
+        // The need: a new word or key is a new episode, its age from now; the
+        // same need re-read keeps its age whatever its words now say.
+        let episode = |n: &Option<NeedFact>| n.as_ref().map(|n| n.key);
+        if episode(&self.need) != episode(&facts.need) {
+            self.need_since = now;
+        }
+        if self.need != facts.need {
+            self.need = facts.need;
+            changed = true;
+        }
+        if self.held_by_person != facts.held_by_person {
+            self.held_by_person = facts.held_by_person;
             changed = true;
         }
         self.baselined = true;
@@ -983,43 +899,34 @@ impl<V: Host> Slot<V> {
         changed
     }
 
-    /// The tab chip's mark: a hollow diamond to wait, a filled one at a stop
-    /// (with why it stopped, which the hover names), a dot for a story.
+    /// The need's severity, `None` with no need.
     #[must_use]
-    pub fn chip(&self, watermark: u64) -> ChipLevel {
-        match self.level(watermark) {
-            Level::Quiet | Level::Note | Level::Driving | Level::Driven => ChipLevel::Off,
-            Level::Story => ChipLevel::Story,
-            Level::Attention => ChipLevel::Wait,
-            Level::Hold => ChipLevel::Stop(StopCause::Hold),
-            // `level` ranks a stall ahead of a wall, and so does this.
-            Level::Limited => ChipLevel::Stop(match &self.input_stall {
-                Some(stall) if V::stall_stopped(stall) => StopCause::Suspended,
-                Some(_) => StopCause::Frozen,
-                None => StopCause::Wall,
-            }),
+    pub fn severity(&self) -> Option<NeedSeverity> {
+        self.need.as_ref().map(|n| n.severity)
+    }
+
+    /// The tab chip's mark from the published need and the person's hold: a
+    /// filled diamond for a stuck need, a hollow one for a decide need, the
+    /// hand for the person's own hold, else none. A supervised box is no
+    /// need, so it makes no mark. The finished dot — a task's done rev, or a
+    /// program's own turn end ([`Self::turn_end_news`]), not yet looked at —
+    /// is the host's ([`ChipLevel::Done`]), folded under these.
+    #[must_use]
+    pub fn chip(&self) -> ChipLevel {
+        match &self.need {
+            Some(need) => match need.severity {
+                NeedSeverity::Stuck => ChipLevel::Stop(need.cause),
+                NeedSeverity::Decide => ChipLevel::Wait,
+            },
+            None if self.held_by_person => ChipLevel::Yours,
+            None => ChipLevel::Off,
         }
     }
 
-    /// The severity this slot stands at (`status level=`, `why=` and the
-    /// tab chip follow it).
+    /// The severity this slot stands at (`status level=` and `why=`): a
+    /// record, unchanged by the owner surfaces. The border reads the need.
     #[must_use]
     pub fn level(&self, watermark: u64) -> Level {
-        self.level_counting(watermark, true, true)
-    }
-
-    /// The level the window's own chrome (the rim and the row's existence)
-    /// shows: [`Self::level`] without an attention told elsewhere
-    /// ([`Facts::attention_told_elsewhere`]) or aterm's own hand. Those facts
-    /// stay in `status level=` and the tab's wait mark.
-    #[must_use]
-    pub fn shown_level(&self, watermark: u64) -> Level {
-        self.level_counting(watermark, !self.attention_told_elsewhere, !self.aterm_hand)
-    }
-
-    /// `attention`: an escalation counts; `hand`: a hand counts even when it
-    /// is aterm's own.
-    fn level_counting(&self, watermark: u64, attention: bool, hand: bool) -> Level {
         if self.hold.is_some() {
             return Level::Hold;
         }
@@ -1028,22 +935,16 @@ impl<V: Host> Slot<V> {
         if self.input_stall.is_some() {
             return Level::Limited;
         }
-        // A wall the harness answers is a record, not a stop (`WallAnswer`):
-        // it stands at `Note`, with its reset and countdown but no rim, below
-        // whatever else ranks higher.
-        let handled_wall = matches!(
+        // A wall the harness answers is a record, not a stop (`WallAnswer`).
+        let at_wall = matches!(
             self.agent.as_ref().map(|a| &a.phase),
             Some(AgentPhase::Wall { .. })
-        ) && self.wall_answer != WallAnswer::Nobody;
-        if !handled_wall
-            && matches!(
-                self.agent.as_ref().map(|a| &a.phase),
-                Some(AgentPhase::Wall { .. })
-            )
-        {
+        );
+        let handled_wall = at_wall && self.wall_answer != WallAnswer::Nobody;
+        if at_wall && !handled_wall {
             return Level::Limited;
         }
-        if (attention && self.attention.is_some())
+        if self.attention.is_some()
             || matches!(
                 self.agent.as_ref().map(|a| &a.phase),
                 Some(AgentPhase::Prompt { .. } | AgentPhase::Question)
@@ -1052,18 +953,15 @@ impl<V: Host> Slot<V> {
             return Level::Attention;
         }
         match &self.hand {
-            Hand::DrivenTurn { .. } | Hand::DrivenLease { .. } if hand => return Level::Driven,
+            Hand::DrivenTurn { .. } | Hand::DrivenLease { .. } => return Level::Driven,
             Hand::Driving { .. } => return Level::Driving,
-            _ => {}
+            Hand::None => {}
         }
         // An unread task or ask is a wait state only while no hand is on the
-        // session: a driven worker with mail waiting stays teal, and the mail
-        // slot says the rest.
+        // session.
         if self.unread_wants_a_human() {
             return Level::Attention;
         }
-        // A story outranks waiting mail: "something happened since you
-        // looked" is the glance fact, and the mail slot prints the mail.
         if self.news_seq > watermark.max(self.story_closed) {
             return Level::Story;
         }
@@ -1120,7 +1018,7 @@ impl<V: Host> Slot<V> {
     }
 
     /// Calm: nothing is happening that the human's next keystroke should not
-    /// fold away (the fold law's second conjunct).
+    /// read away (the story read's guard, [`super::drive::human_acted_on`]).
     #[must_use]
     pub fn calm(&self) -> bool {
         self.hold.is_none()
@@ -1134,50 +1032,24 @@ impl<V: Host> Slot<V> {
             && !self.unread_wants_a_human()
     }
 
-    /// The tone the row paints in: Warn while a human should look, Success for
-    /// `SETTLED_GLOW` after a settled turn, else Info. It follows the level the
-    /// row is shown at ([`Self::shown_level`]).
-    #[must_use]
-    pub fn tone(&self, now: Instant, watermark: u64) -> Tone {
-        if self.shown_level(watermark) >= Level::Attention {
-            return Tone::Warn;
-        }
-        if self
-            .settled_at
-            .is_some_and(|t| now.saturating_duration_since(t) < SETTLED_GLOW)
-        {
-            return Tone::Success;
-        }
-        Tone::Info
-    }
-
     /// The story points after `watermark` (and after a closed story), oldest
     /// first.
     pub fn story_since(&self, watermark: u64) -> impl Iterator<Item = &StoryPoint> {
         let seen = watermark.max(self.story_closed);
         self.story.iter().filter(move |p| p.seq > seen && !p.aterm)
     }
-
-    /// The current stop (hold / limit) in progress, for the story's summary.
-    pub(super) fn stop_in_progress(&self) -> Option<(StoryVerb, Instant)> {
-        self.stop_began.filter(|(verb, _)| match verb {
-            StoryVerb::Hold => self.hold.is_some(),
-            _ => matches!(
-                self.agent.as_ref().map(|a| &a.phase),
-                Some(AgentPhase::Wall { .. })
-            ),
-        })
-    }
 }
 
 /// Severity, ascending: `hold > limited > attention > driven > story >
-/// quiet`, with the rim-less states between: mail waiting (`Note`) sits under
-/// a story, and driving another session under being driven.
+/// quiet`, with the quieter states between: mail waiting (`Note`) sits under
+/// a story, and driving another session under being driven. The wire's word
+/// (`status level=`), a record: the border reads the published need.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
-    /// Nothing to show.
+    /// Nothing to say.
     Quiet,
-    /// Mail waiting, a queued post, a stalled bridge: information, no rim.
+    /// Mail waiting, a queued post, a stalled bridge, a wall the harness
+    /// answers.
     Note,
     /// Something happened since the human last looked; the session is calm.
     Story,
@@ -1185,7 +1057,7 @@ pub enum Level {
     Driving,
     /// A peer's hand is on this keyboard.
     Driven,
-    /// A human should look: prompt, question, escalation, an unread task.
+    /// A prompt, a question, an escalation, an unread task.
     Attention,
     /// At a wall, or not reading its input.
     Limited,
@@ -1194,28 +1066,8 @@ pub enum Level {
 }
 
 impl Level {
-    /// The rim this level paints — colour only, and only for the levels whose
-    /// row sentence says why.
-    #[must_use]
-    pub const fn rim(self) -> Rim {
-        match self {
-            Self::Quiet | Self::Story | Self::Note | Self::Driving => Rim::None,
-            Self::Driven => Rim::Drive,
-            Self::Attention => Rim::Wait,
-            Self::Limited => Rim::Stop { hold: false },
-            Self::Hold => Rim::Stop { hold: true },
-        }
-    }
-
-    /// Whether the row exists for this level (the fold law's first half:
-    /// state ≠ quiet). `Story` counts: it is the row the summary lives in.
-    #[must_use]
-    pub const fn shows_row(self) -> bool {
-        !matches!(self, Self::Quiet)
-    }
-
-    /// The wire word `status level=` and `chrome` print: the variant's name in
-    /// lower case, a closed set a reader can match on.
+    /// The wire word `status level=` prints: the variant's name in lower
+    /// case, a closed set a reader can match on.
     #[must_use]
     pub const fn wire(self) -> &'static str {
         match self {
@@ -1231,65 +1083,81 @@ impl Level {
     }
 }
 
-/// The rim's colour state. `Stop { hold }` doubles the thickness and adds the
-/// wash under a hold.
+/// THE WINDOW'S BORDER (§5): what the window's most pressing session needs
+/// of its owner, or the person's own hold on its front session. Steady:
+/// nothing pulses, nothing washes the glass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Rim {
-    /// No rim.
+    /// No border.
     #[default]
     None,
-    /// A peer's hand (teal).
-    Drive,
-    /// A human should look (amber).
-    Wait,
-    /// Stopped (red); doubled with a wash under a hold.
-    Stop {
-        /// Under a hold.
-        hold: bool,
-    },
+    /// A stuck need: the stop tone.
+    Stuck,
+    /// A decide need and no stuck one: the wait tone.
+    Decide,
+    /// The front session has the person's hold and nothing in the window
+    /// needs them: a 1 px outline in the theme's dim ink.
+    Yours,
 }
 
 impl Rim {
-    /// The wire word `chrome` prints for the rim.
+    /// The wire word `chrome presence rim=` prints.
     #[must_use]
     pub const fn wire(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::Drive => "drive",
-            Self::Wait => "wait",
-            Self::Stop { hold: false } => "stop",
-            Self::Stop { hold: true } => "stop-hold",
+            Self::Stuck => "stuck",
+            Self::Decide => "decide",
+            Self::Yours => "yours",
+        }
+    }
+
+    /// The border a need of `severity` lights.
+    #[must_use]
+    pub const fn of(severity: NeedSeverity) -> Self {
+        match severity {
+            NeedSeverity::Stuck => Self::Stuck,
+            NeedSeverity::Decide => Self::Decide,
         }
     }
 }
 
-/// The tab chip's attention mark as a level.
+/// The tab chip's mark, ascending, so a tab's `max` over its panes keeps the
+/// most pressing: none, the tab's own news (a failed command, a notice), a
+/// finished task not yet looked at (`•`), the person's own hold (`✋`), a
+/// decide need (`◇`), a stuck need (`◆`). Only the last two are need marks,
+/// and only the published verdict makes them ([`Slot::chip`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub enum ChipLevel {
     /// No mark.
     #[default]
     Off,
-    /// A dot: something happened while the human was away.
-    Story,
-    /// A hollow diamond: a human should look.
+    /// A short dash in the label's ink: the tab's own indicator (its last
+    /// command failed and that was not yet seen, or a native leaf's notice).
+    /// A record, never a need: no presence tone, no border, no pill.
+    Note,
+    /// A dot: a task finished and its result was not yet looked at.
+    Done,
+    /// The hand: the person has this tab.
+    Yours,
+    /// A hollow diamond: a decide need.
     Wait,
-    /// A filled diamond: stopped, and why.
+    /// A filled diamond: a stuck need, and which kind (the hover's remedy).
     Stop(StopCause),
 }
 
-/// Why a chip stands at a stop: what decides the remedy (lift a hold, restart
-/// or resume the program, see the agent's wall). Ascending as
-/// [`Slot::level`] ranks them, so a tab's `max` over its panes keeps a hold.
+/// Why a chip stands at a stop: what decides its remedy (restart or resume
+/// the program, see what holds it). The host reads it off the need's word
+/// ([`NeedFact::cause`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum StopCause {
-    /// An agent at a wall ([`AgentPhase::Wall`]).
+    /// Any other stuck need: a wall, a login, a memory banner, a stalled
+    /// task.
     Wall,
     /// The program has stopped reading its input.
     Frozen,
     /// The foreground job is stopped with input queued.
     Suspended,
-    /// A hold.
-    Hold,
 }
 
 impl ChipLevel {
@@ -1298,7 +1166,9 @@ impl ChipLevel {
     pub const fn chrome_states(self) -> &'static [&'static str] {
         match self {
             Self::Off => &[],
-            Self::Story => &["story"],
+            Self::Note => &["note"],
+            Self::Done => &["done"],
+            Self::Yours => &["yours"],
             Self::Wait => &["attention"],
             Self::Stop(_) => &["attention", "stop"],
         }
@@ -1309,12 +1179,13 @@ impl ChipLevel {
     pub const fn help(self) -> Option<&'static str> {
         match self {
             Self::Off => None,
-            Self::Story => Some("Something happened while you were away"),
+            Self::Note => Some("Something to look at: a failed command or a notice"),
+            Self::Done => Some("Finished; not yet looked at"),
+            Self::Yours => Some("You have this tab"),
             Self::Wait => Some("Needs attention"),
-            Self::Stop(StopCause::Hold) => Some("Held"),
             Self::Stop(StopCause::Frozen) => Some("Frozen, not reading input"),
             Self::Stop(StopCause::Suspended) => Some("Stopped with input queued"),
-            Self::Stop(StopCause::Wall) => Some("Agent can't continue"),
+            Self::Stop(StopCause::Wall) => Some("Stuck: needs you"),
         }
     }
 }

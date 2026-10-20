@@ -24,7 +24,7 @@ use super::fixture::{self, Fx, Release, git};
 /// The shell suite's world: index 5 pins ay 2, nn 2, trust-ir 1, trust 5, trust-mc 4 and
 /// carries a claude pin. ay's newest SIGNED release is v0.2.0 (build 3) beside a prerelease
 /// v0.3.0 and an unsigned v0.4.0; nn and trust-mc sit at their releases; trust's v0.9.0 is
-/// build 7 (a bundle: the human lane); trust-ir's v0.3.0 is build 2 (packed, then held by
+/// build 7 (a bundle: the bundle lane); trust-ir's v0.3.0 is build 2 (packed, then held by
 /// the rustc group while trust waits).
 struct World {
     fx: Fx,
@@ -202,7 +202,7 @@ fn the_first_run_packs_both_apple_targets_and_holds_the_rustc_group() {
     assert_eq!(rendered(&o, "nn"), "OK: pin 2 is v0.1.0");
     assert_eq!(rendered(&o, "trust-mc"), "OK: pin 4 is v0.6.0");
     assert!(
-        rendered(&o, "trust").starts_with("HUMAN-LANE: v0.9.0 (build 7) > pin 5"),
+        rendered(&o, "trust").starts_with("BUNDLE-LANE: v0.9.0 (build 7) > pin 5"),
         "{}",
         rendered(&o, "trust")
     );
@@ -874,13 +874,13 @@ fn a_compilers_version_names_the_pins_commit_and_date() {
     assert_eq!(alab::parse_vv("commit-hash: unknown\n"), None);
 }
 
-/// The human lane's commands, over typed rows: trust is the group publish from one seal;
+/// The bundle lane's commands, over typed rows: trust is the group publish from one seal;
 /// trust-mc is one `pack-bundle` leg per Apple row its pin carries, aarch64 first and the
 /// x86_64 leg merged onto a copy of it, each naming the Trust sysroot its hello compiles
 /// against, never `--no-hello`.
 #[test]
-fn the_human_lane_prints_the_bundle_packs_never_runs_them() {
-    let w = World::new("alab-human");
+fn the_bundle_lane_prints_the_bundle_packs_never_runs_them() {
+    let w = World::new("alab-bundle");
     let mc = w.dev("trust-mc");
     fixture::commit(&mc, "v0.7.0", None);
     w.fx.release(
@@ -893,7 +893,7 @@ fn the_human_lane_prints_the_bundle_packs_never_runs_them() {
     w.fx.stage("trust-mc", 4, &[ARM, X86]);
     let (o, _) = ok(w.run(false));
     let mc_row = row(&o, "trust-mc");
-    assert!(matches!(mc_row.decision, Decision::HumanLane { .. }));
+    assert!(matches!(mc_row.decision, Decision::BundleLane { .. }));
     let cmd = alab::bundle_command(mc_row);
     let legs: Vec<&String> = cmd
         .iter()

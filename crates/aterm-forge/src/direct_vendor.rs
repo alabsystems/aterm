@@ -58,8 +58,9 @@ const ROLLBACK_TRAILER: &str = "astream-pin-rollback:";
 /// then astream-effects for aterm-agent's harness tape, which ships), and a
 /// crate missing from it was never checked for resolving from the pin, for
 /// its licence or for staying outside this workspace. [`metadata`] asks for
-/// every feature (astream-aead resolves only under aterm-link's `sealed`) and
-/// carries every member's dev edges (astream-term is a dev-dependency).
+/// every feature (a crate only an optional feature reaches is resolved, and
+/// judged, too) and carries every member's dev edges (astream-term is a
+/// dev-dependency).
 const CRATE_PREFIX: &str = "astream-";
 const CONSUMER: &str = "crates/aterm-link/Cargo.toml";
 /// aterm-link's direct path dependencies into the submodule.
@@ -430,11 +431,29 @@ fn exclude(root: &Path) -> Result<Vec<String>, String> {
         .unwrap_or_default())
 }
 
+/// The words that open [`metadata`]'s refusal when this machine's Cargo cache
+/// lacks a crate the shipped lock names: an offline run cannot resolve it, which
+/// says nothing about the tree ([`machine_refusal`]).
+pub(crate) const CACHE_LACKS_A_LOCKED_CRATE: &str =
+    "this machine's Cargo cache lacks a crate the lock names";
+
+/// Whether `why` is [`CACHE_LACKS_A_LOCKED_CRATE`]'s refusal: the obligation could
+/// not be judged here, so it ends COULD NOT RUN rather than FAIL (OF-30).
+pub(crate) fn machine_refusal(why: &str) -> bool {
+    why.starts_with(CACHE_LACKS_A_LOCKED_CRATE)
+}
+
+/// Whether Cargo's `stderr` is an offline run's refusal for a crate the local cache
+/// does not hold (the download it would need, or a resolution offline mode cut short).
+fn offline_cache_miss(stderr: &str) -> bool {
+    stderr.contains("--offline was specified") || stderr.contains("you're using offline mode")
+}
+
 /// The full resolution, not `--no-deps` (which lists members only; the astream
-/// crates are excluded from the workspace). `--all-features` because
-/// `astream-aead` is reachable only through aterm-link's off-by-default
-/// `sealed` feature. `--locked --offline`: reads the shipped lock, fetches
-/// nothing.
+/// crates are excluded from the workspace). `--all-features`, so an astream
+/// crate only an off-by-default feature reaches is resolved and judged too.
+/// `--locked --offline`: reads the shipped lock, fetches nothing, so a crate
+/// the cache lacks is [`CACHE_LACKS_A_LOCKED_CRATE`].
 fn metadata(cargo: &crate::resolve::Cargo, root: &Path) -> Result<Value, String> {
     // `metadata` takes no lane flag.
     let out = cargo
@@ -451,10 +470,15 @@ fn metadata(cargo: &crate::resolve::Cargo, root: &Path) -> Result<Value, String>
         .output_owned()
         .map_err(|e| format!("cannot read Cargo metadata: {e}"))?;
     if !out.status.success() {
-        return Err(format!(
-            "Cargo metadata refused: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if offline_cache_miss(&stderr) {
+            return Err(format!(
+                "{CACHE_LACKS_A_LOCKED_CRATE}, so the offline Cargo metadata cannot resolve the \
+                 graph (one networked `targo fetch` fills the cache): {}",
+                stderr.trim()
+            ));
+        }
+        return Err(format!("Cargo metadata refused: {}", stderr.trim()));
     }
     aterm_json::from_slice(&out.stdout).map_err(|e| format!("invalid Cargo metadata: {e}"))
 }
@@ -798,10 +822,38 @@ mod tests {
     use super::*;
     use aterm_json::json;
 
+    /// An offline run's refusal for a crate the cache lacks is the machine's
+    /// (COULD NOT RUN), in both of Cargo's spellings; any other refusal is not.
+    #[test]
+    fn an_offline_cache_miss_is_the_machines_refusal() {
+        for stderr in [
+            "error: failed to download `wgpu-core-deps-emscripten v29.0.3`\n\nCaused by:\n  \
+             attempting to make an HTTP request, but --offline was specified",
+            "error: no matching package named `x` found\nAs a reminder, you're using offline \
+             mode (--offline) which can sometimes cause surprising resolution failures",
+        ] {
+            assert!(offline_cache_miss(stderr), "{stderr}");
+        }
+        assert!(!offline_cache_miss(
+            "error: failed to parse manifest at `Cargo.toml`"
+        ));
+        assert!(machine_refusal(&format!(
+            "{CACHE_LACKS_A_LOCKED_CRATE}, so …"
+        )));
+        assert!(!machine_refusal(
+            "Cargo metadata refused: failed to parse manifest"
+        ));
+        // The refusal reaches the caller as itself, past every check that held, so
+        // attest can tell it from a defect.
+        let (root, mut facts) = valid();
+        facts.metadata = Err(format!("{CACHE_LACKS_A_LOCKED_CRATE}, so …"));
+        let why = validate(&root, &facts).expect_err("no graph, no pin");
+        assert!(machine_refusal(&why), "{why}");
+    }
+
     /// The astream crates the built tree below resolves: aterm's graph as this was
     /// written. A fixture, not a roster — `validate` reads the crates from the metadata.
-    const FIXTURE: [&str; 7] = [
-        "astream-aead",
+    const FIXTURE: [&str; 6] = [
         "astream-broker",
         "astream-cap",
         "astream-digest",
@@ -1022,7 +1074,7 @@ mod tests {
             (
                 "an astream crate under another license".into(),
                 Box::new(|f: &mut Facts| {
-                    package(f, "astream-aead")
+                    package(f, "astream-digest")
                         .insert("license".into(), Value::String("MIT".into()));
                 }),
             ),

@@ -68,12 +68,12 @@ mod macos {
     use aterm_objc::{
         Bool, Id, Obj, Sel, WeakObj, WeakSlot, autoreleasepool, checked_msg, class, ns_string, sel,
     };
-    use winit::application::ApplicationHandler;
-    use winit::event::WindowEvent;
-    use winit::event_loop::ActiveEventLoop;
-    use winit::platform::macos::MonitorHandleExtMacOS;
-    use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
-    use winit::window::{Theme, Window, WindowId};
+    use aterm_window::application::ApplicationHandler;
+    use aterm_window::event::WindowEvent;
+    use aterm_window::event_loop::ActiveEventLoop;
+    use aterm_window::platform::macos::MonitorHandleExtMacOS;
+    use aterm_window::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
+    use aterm_window::window::{Theme, Window, WindowId};
 
     use super::{FAIL, NOT_RUN, PASS};
 
@@ -542,7 +542,7 @@ mod macos {
             }
             let attrs = Window::default_attributes()
                 .with_title("objc-window-drive")
-                .with_inner_size(winit::dpi::LogicalSize::new(480.0, 320.0))
+                .with_inner_size(aterm_window::dpi::LogicalSize::new(480.0, 320.0))
                 .with_visible(false);
             match el.create_window(attrs) {
                 Ok(w) => self.window = Some(w),
@@ -567,7 +567,7 @@ mod macos {
                 // held, so a release arriving here is the swizzled `-sendEvent:`'s
                 // forwarding.
                 WindowEvent::KeyboardInput { event, .. }
-                    if event.state == winit::event::ElementState::Released =>
+                    if event.state == aterm_window::event::ElementState::Released =>
                 {
                     self.key_ups += 1;
                 }
@@ -656,7 +656,7 @@ mod macos {
         /// `-setFrameOrigin:`, `-frame`, `-contentRectForFrameRect:` and
         /// `-setContentSize:`: the struct-passing sends an ABI mistake corrupts silently.
         fn stage_geometry(&mut self) {
-            use winit::dpi::{PhysicalPosition, PhysicalSize};
+            use aterm_window::dpi::{PhysicalPosition, PhysicalSize};
             println!("\n[3] geometry — position and size round trips");
 
             let before = self.w().outer_position().ok();
@@ -696,7 +696,7 @@ mod macos {
         /// `-setContentMinSize:` and the clamp that follows: the send whose effect is a
         /// resize the caller did not ask for.
         fn stage_size_limits(&mut self) {
-            use winit::dpi::PhysicalSize;
+            use aterm_window::dpi::PhysicalSize;
             println!("\n[4] size limits — min clamps the current size");
 
             self.w()
@@ -844,7 +844,7 @@ mod macos {
         /// The fullscreen state machine, entering; the exit is a pump later (see
         /// [`Self::stage_fullscreen_exit`]).
         fn stage_fullscreen_enter(&mut self) {
-            use winit::window::Fullscreen;
+            use aterm_window::window::Fullscreen;
             println!("\n[9] fullscreen — entering");
             self.report
                 .check(self.w().fullscreen().is_none(), "starts windowed");

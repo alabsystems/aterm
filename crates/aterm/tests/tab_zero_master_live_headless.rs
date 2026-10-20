@@ -18,11 +18,20 @@
 //! `pty_masters=` vs `pty_sessions=`) and, where the platform can say it, the
 //! PTY masters the process actually has open.
 //!
+//! The process also holds masters no session owns yet: the spawn kits its
+//! prep thread opens ahead for the next spawns (`pty_kits=`, since
+//! 2026-10-17), and a warm spare's (`spare_ptys=`, none here). The census
+//! names them, so the OS witness is that the open `/dev/ptmx` descriptors
+//! number `pty_masters + pty_kits + spare_ptys`, all read in one poll: the
+//! prep thread fills on its own clock, so a poll that straddles a fill reads
+//! apart and the next one reads again.
+//!
 //! NEGATIVE CONTROL: before the close both counts read two — the census and
 //! the descriptor count see a live master — so a one afterwards is the close,
 //! not a count that never counted. Measured without the fix: `pty_masters=2
 //! pty_sessions=1`, and two `/dev/ptmx` descriptors, for as long as the
-//! instance ran.
+//! instance ran. A master tab 0 left open outside its sink reads one more
+//! descriptor than the census accounts for, and fails the witness the same way.
 //!
 //! ISOLATION: scratch HOME/XDG roots, a private control socket, every automatic
 //! lane off, `--no-reroute`, `SHELL=/bin/sh`, and a lifeline
@@ -47,15 +56,41 @@ use headless_boot::{Instance, ctl_ok, field};
 /// closes once its reader has wound down, normally well under a second.
 const HANG: Duration = Duration::from_secs(60);
 
-/// `(pty_masters, pty_sessions)` from the instance's `metrics` summary.
-fn census(inst: &Instance) -> (usize, usize) {
+/// One poll of the instance's PTY census and, right after it, the OS's count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Reading {
+    /// `pty_masters=`: the masters the sessions' sinks hold open.
+    masters: usize,
+    /// `pty_sessions=`: the live sessions that own one.
+    sessions: usize,
+    /// `pty_kits=` + `spare_ptys=`: masters opened ahead, owned by no session.
+    ahead: usize,
+    /// The `/dev/ptmx` descriptors the process has open ([`open_masters`]).
+    open: Option<usize>,
+}
+
+impl Reading {
+    /// `n` sessions, each with its master, and — where the platform can say it
+    /// (`witnessed`) — every open master accounted for by the census.
+    fn holds(&self, n: usize, witnessed: bool) -> bool {
+        self.masters == n && self.sessions == n && self.open == witnessed.then_some(n + self.ahead)
+    }
+}
+
+/// Read the instance's `metrics` summary, then the OS's count for `pid`.
+fn reading(inst: &Instance, pid: u32) -> Reading {
     let reply = ctl_ok(inst, &["metrics"]);
-    let read = |key: &str| {
+    let read = |key: &str| -> usize {
         field(&reply, key)
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(|| panic!("metrics names no {key}=: {reply}"))
     };
-    (read("pty_masters"), read("pty_sessions"))
+    Reading {
+        masters: read("pty_masters"),
+        sessions: read("pty_sessions"),
+        ahead: read("pty_kits") + read("spare_ptys"),
+        open: open_masters(pid),
+    }
 }
 
 /// The PTY masters `pid` has open, counted from the OS (`/dev/ptmx`
@@ -95,17 +130,19 @@ fn open_masters(pid: u32) -> Option<usize> {
     }
 }
 
-/// Poll `probe` until it answers `want`, or panic with `what` after [`HANG`].
-fn settle<T: PartialEq + std::fmt::Debug>(what: &str, want: T, mut probe: impl FnMut() -> T) {
+/// Poll [`reading`] until it [`Reading::holds`] for `n`, or panic with `what`
+/// after [`HANG`].
+fn settle(what: &str, inst: &Instance, pid: u32, n: usize, witnessed: bool) {
     let deadline = Instant::now() + HANG;
     loop {
-        let got = probe();
-        if got == want {
+        let got = reading(inst, pid);
+        if got.holds(n, witnessed) {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "{what}: still {got:?}, wanted {want:?} after {HANG:?}"
+            "{what}: still {got:?}, wanted {n} sessions holding {n} masters \
+             (witnessed: {witnessed}) after {HANG:?}"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -126,21 +163,17 @@ fn closing_the_boot_session_closes_its_pty_master() {
     let spawned = ctl_ok(&inst, &["spawn"]);
     assert!(spawned.starts_with("OK s-"), "spawn: {spawned}");
 
+    // Whether this platform can count the process's descriptors at all; where
+    // it can, every reading below must.
+    let witnessed = open_masters(pid).is_some();
+
     // NEGATIVE CONTROL: both masters are live and both witnesses see them.
-    settle("census with two tabs", (2, 2), || census(&inst));
-    if let Some(masters) = open_masters(pid) {
-        assert_eq!(masters, 2, "two tabs hold two PTY masters");
-    }
+    settle("two tabs hold two PTY masters", &inst, pid, 2, witnessed);
 
     let closed = ctl_ok(&inst, &[&format!("@{boot_sid}"), "close"]);
     assert!(closed.starts_with("OK closed"), "close: {closed}");
 
     // The session is gone at once; its master closes once its reader has
     // wound down — and must, however long the instance runs.
-    settle("census after closing tab 0", (1, 1), || census(&inst));
-    if open_masters(pid).is_some() {
-        settle("open PTY masters after closing tab 0", Some(1), || {
-            open_masters(pid)
-        });
-    }
+    settle("after closing tab 0", &inst, pid, 1, witnessed);
 }

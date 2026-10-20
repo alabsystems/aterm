@@ -74,11 +74,6 @@ aterm-codec = { workspace = true }
 # This edge unifies ring's default features (RNG) into THIS binary's graph —
 # deliberate: the cutter is owner-only; shipped clients keep their own graphs.
 atpkg-keys = { workspace = true }
-# The candidate gate's ADMISSION rule (`channel::candidate`: the receipt, which one
-# governs, and every reason it admits nothing) is the producer's, answered there
-# in-process for the `rustc` group's publish; `ship trust candidate` writes the receipt
-# it reads and asks the same rule under `--admits`. Std-only on that side.
-atpkg-publish = { workspace = true }
 # `ship site` builds alab.systems' `/terminal` engine itself (site/engine.rs): the
 # CPU module's JS glue comes from `verify glue`'s generator in process, the shipping
 # wasm-opt flags are the ones the wasm perf lane runs, and the wasm32 pin's rustup is

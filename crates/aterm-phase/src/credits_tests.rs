@@ -31,6 +31,7 @@ fn the_measured_credits_notices_read_as_credits_in_use() {
             window: Some(Window::Session),
             reset: Some(reset.to_string()),
         }),
+        model: None,
     };
     assert_eq!(
         in_use(&screen(CREDITS_STARTED_2_1_300)),
@@ -57,9 +58,139 @@ fn the_measured_credits_notices_read_as_credits_in_use() {
     ] {
         assert_eq!(
             in_use(&screen(lasting)),
-            Some(Credits { started: None }),
+            Some(Credits {
+                started: None,
+                model: None
+            }),
             "{lasting}"
         );
+    }
+}
+
+/// The notice's PER-MODEL form (READ in the 2.1.304 bundle, `wbo`: `Now using
+/// usage credits for ${model} · Your ${model} limit resets ${reset}`, drawn
+/// where the window is a model's) is the one credits started on, its reset
+/// the model's, and names the model, in place of the measured started
+/// notice's row; its head naming no reset names the model and no start.
+/// NEGATIVE CONTROL: the bare lasting notice names neither.
+#[test]
+fn the_per_model_notice_names_its_model_and_its_reset() {
+    let rows = screen(CREDITS_STARTED_2_1_300);
+    let at = row_of(&rows, "You're now using usage credits");
+    let notice = |text: &str| with_row(rows.clone(), at, &format!("{text:>108}"));
+    assert_eq!(
+        in_use(&notice(
+            "Now using usage credits for Opus · Your Opus limit resets 4pm"
+        )),
+        Some(Credits {
+            started: Some(Started {
+                window: None,
+                reset: Some("4pm".to_string()),
+            }),
+            model: Some("Opus".to_string()),
+        })
+    );
+    assert_eq!(
+        in_use(&notice("Now using usage credits for Opus")),
+        Some(Credits {
+            started: None,
+            model: Some("Opus".to_string()),
+        })
+    );
+    assert_eq!(
+        in_use(&notice("Now using usage credits")),
+        Some(Credits {
+            started: None,
+            model: None,
+        })
+    );
+}
+
+/// THE NOTICES OF A MODEL BILLED PER REQUEST WITH NO DIALOG (READ in the
+/// 2.1.301 to 2.1.304 bundles, the `fable-usage-credits` notification: a
+/// credits-only model whose consent Claude Code stored, or on a tier an admin
+/// bills, goes onto usage credits with no box, the footer's item never
+/// drawn), and lower-priority mode's end as credits take over, each in place
+/// of the measured lasting notice on its mode row: credits in use, the
+/// model's named. Probe P1 of the review of 2026-10-19: these read as no
+/// credits before, so nothing held. NEGATIVE CONTROLS: the measured notice
+/// (the account's window, no model); the same words short of the edge, in
+/// the model's reply, or under no model's name; the row with no notice.
+#[test]
+fn a_model_billed_to_credits_with_no_dialog_reads_as_credits_in_use() {
+    let rows = screen(CREDITS_IN_USE_2_1_300);
+    let mode = row_of(&rows, "auto mode on");
+    let width = 110;
+    // On the mode row's right where it fits, else on a row of its own.
+    let on_mode = |notice: &str| {
+        let lead = "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
+        let room = width - 2 - lead.chars().count();
+        let row = if notice.chars().count() + 2 <= room {
+            format!("{lead}{notice:>room$}")
+        } else {
+            format!("{notice:>w$}", w = width - 2)
+        };
+        with_row(rows.clone(), mode, &row)
+    };
+    assert_eq!(
+        in_use(&rows),
+        Some(Credits {
+            started: None,
+            model: None,
+        }),
+        "the measured notice"
+    );
+    for (notice, model) in [
+        ("Fable 5.1 is drawing from usage credits", Some("Fable 5.1")),
+        (
+            "Fable 5.1 is now using usage credits instead of your plan limits",
+            Some("Fable 5.1"),
+        ),
+        (
+            "Extra usage is now covering your requests · lower-priority mode ended",
+            None,
+        ),
+    ] {
+        assert_eq!(
+            in_use(&on_mode(notice)),
+            Some(Credits {
+                started: None,
+                model: model.map(str::to_string),
+            }),
+            "{notice}"
+        );
+    }
+    let bare = with_row(
+        rows.clone(),
+        mode,
+        "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+    );
+    assert_eq!(in_use(&bare), None, "the row with no notice");
+    let reply = row_of(&rows, "Hi! I am the local lab stub");
+    for (at, row) in [
+        (
+            mode,
+            "  Fable 5.1 is drawing from usage credits".to_string(),
+        ),
+        (
+            reply,
+            format!(
+                "⏺ {:>w$}",
+                "Fable 5.1 is drawing from usage credits",
+                w = width - 4
+            ),
+        ),
+        (
+            mode,
+            format!("{:>w$}", " is drawing from usage credits", w = width - 2),
+        ),
+    ] {
+        let base = if at == mode {
+            rows.clone()
+        } else {
+            bare.clone()
+        };
+        assert_eq!(in_use(&with_row(base, at, &row)), None, "{row}");
     }
 }
 

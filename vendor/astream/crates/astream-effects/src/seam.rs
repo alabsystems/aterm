@@ -108,7 +108,7 @@ pub trait EffectSeam {
 }
 
 /// One recorded effect, tagged by kind so replay can detect a kind mismatch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub enum EffectRecord {
     /// A wall-clock read (nanoseconds).
     Clock(u64),
@@ -172,6 +172,62 @@ pub enum EffectRecord {
     },
 }
 
+impl PartialEq for EffectRecord {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Clock(a), Self::Clock(b)) => a == b,
+            (Self::Rand(a), Self::Rand(b)) => a == b,
+            (
+                Self::File {
+                    path: pa,
+                    bytes: ba,
+                },
+                Self::File {
+                    path: pb,
+                    bytes: bb,
+                },
+            ) => pa == pb && ba == bb,
+            (Self::FileErr { path: pa, kind: ka }, Self::FileErr { path: pb, kind: kb }) => {
+                pa == pb && ka == kb
+            }
+            (Self::Mono(a), Self::Mono(b)) => a == b,
+            (
+                Self::Exchange {
+                    door: da,
+                    request: rqa,
+                    reply: rpa,
+                },
+                Self::Exchange {
+                    door: db,
+                    request: rqb,
+                    reply: rpb,
+                },
+            ) => da == db && rqa == rqb && rpa == rpb,
+            (
+                Self::Emit {
+                    door: da,
+                    bytes: ba,
+                },
+                Self::Emit {
+                    door: db,
+                    bytes: bb,
+                },
+            ) => da == db && ba == bb,
+            (
+                Self::Raised {
+                    door: da,
+                    false_reads: fa,
+                },
+                Self::Raised {
+                    door: db,
+                    false_reads: fb,
+                },
+            ) => da == db && fa == fb,
+            _ => false,
+        }
+    }
+}
+
 impl EffectRecord {
     /// The record's kind: the name a [`ReplaySeam`](crate::ReplaySeam) door
     /// asks for, and so the `expected` of a
@@ -182,7 +238,7 @@ impl EffectRecord {
     /// Both file outcomes are `"File"`, because one door reads either. A
     /// `Raised` record is taken only by the flag door, which never refuses
     /// (see [`EffectSeam::raised`]), so `"Raised"` is only ever a found kind.
-    pub fn kind(&self) -> &'static str {
+    pub const fn kind(&self) -> &'static str {
         match self {
             EffectRecord::Clock(_) => "Clock",
             EffectRecord::Rand(_) => "Rand",
@@ -193,6 +249,51 @@ impl EffectRecord {
             EffectRecord::Raised { .. } => "Raised",
         }
     }
+
+    /// Numeric discriminator tag for this effect record variant (`1..=8`).
+    #[must_use]
+    pub const fn tag_byte(&self) -> u8 {
+        match self {
+            EffectRecord::Clock(_) => 1,
+            EffectRecord::Rand(_) => 2,
+            EffectRecord::File { .. } => 3,
+            EffectRecord::FileErr { .. } => 4,
+            EffectRecord::Mono(_) => 5,
+            EffectRecord::Exchange { .. } => 6,
+            EffectRecord::Emit { .. } => 7,
+            EffectRecord::Raised { .. } => 8,
+        }
+    }
+}
+
+/// Encode a 9-byte scalar effect frame `(tag: u8, val: u64 LE)`.
+#[must_use]
+pub const fn encode_scalar_effect(tag: u8, val: u64) -> [u8; 9] {
+    [
+        tag,
+        val as u8,
+        (val >> 8) as u8,
+        (val >> 16) as u8,
+        (val >> 24) as u8,
+        (val >> 32) as u8,
+        (val >> 40) as u8,
+        (val >> 48) as u8,
+        (val >> 56) as u8,
+    ]
+}
+
+/// Decode a 9-byte scalar effect frame into `(tag: u8, val: u64)`.
+#[must_use]
+pub const fn decode_scalar_effect(raw: &[u8; 9]) -> (u8, u64) {
+    let val = (raw[1] as u64)
+        | ((raw[2] as u64) << 8)
+        | ((raw[3] as u64) << 16)
+        | ((raw[4] as u64) << 24)
+        | ((raw[5] as u64) << 32)
+        | ((raw[6] as u64) << 40)
+        | ((raw[7] as u64) << 48)
+        | ((raw[8] as u64) << 56);
+    (raw[0], val)
 }
 
 /// An ordered tape of the effects a program consumed.
@@ -213,7 +314,7 @@ contract_fn! {
     /// Verified check that a taped `Raised` record's `false_reads` matches the replay's
     /// `counted` false reads, linked via `clean-kernel-defeq` to `seam_false_reads_matches_isl`.
     #[must_use]
-    pub fn seam_false_reads_matches(recorded: u64, counted: u64) -> bool
+    pub const fn seam_false_reads_matches(recorded: u64, counted: u64) -> bool
     clauses [ensures result == (recorded == counted)]
     {
         recorded == counted
@@ -232,14 +333,20 @@ pub(crate) struct Latches {
 }
 
 impl Latches {
+    /// An empty latch table with no allocations and no call terminator.
+    pub(crate) const EMPTY: Self = Self {
+        raised: Vec::new(),
+        quiet: Vec::new(),
+    };
+
     /// Whether `door` has already answered true.
     pub(crate) fn is_raised(&self, door: &str) -> bool {
-        let mut i = 0usize;
-        while i < self.raised.len() {
-            if self.raised[i] == door {
+        let mut rest = self.raised.as_slice();
+        while let [d, tail @ ..] = rest {
+            if d == door {
                 return true;
             }
-            i = i.saturating_add(1);
+            rest = tail;
         }
         false
     }
@@ -253,13 +360,12 @@ impl Latches {
 
     /// The reads of `door` that answered false since the last record.
     pub(crate) fn false_reads(&self, door: &str) -> u64 {
-        let mut i = 0usize;
-        while i < self.quiet.len() {
-            let (ref d, n) = self.quiet[i];
+        let mut rest = self.quiet.as_slice();
+        while let [(d, n), tail @ ..] = rest {
             if d == door {
-                return n;
+                return *n;
             }
-            i = i.saturating_add(1);
+            rest = tail;
         }
         0
     }
@@ -268,13 +374,17 @@ impl Latches {
     /// than `u64::MAX` times between two records is not a tape anyone holds.
     pub(crate) fn note_false_read(&mut self, door: &str) {
         let mut i = 0usize;
-        while i < self.quiet.len() {
-            let (ref d, n) = self.quiet[i];
+        let mut rest = self.quiet.as_slice();
+        while let [(d, n), tail @ ..] = rest {
             if d == door {
-                self.quiet[i].1 = seam_false_reads_advance(n, n.saturating_add(1));
+                let next = seam_false_reads_advance(*n, n.saturating_add(1));
+                if let Some(slot) = self.quiet.get_mut(i) {
+                    slot.1 = next;
+                }
                 return;
             }
             i = i.saturating_add(1);
+            rest = tail;
         }
         self.quiet.push((door.to_string(), 1));
     }

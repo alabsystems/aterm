@@ -1075,6 +1075,7 @@ fn read_box(rows: &[String]) -> Option<PromptV2> {
                 role: Role::Other,
                 focused,
                 row: i,
+                kept: false,
             });
         }
     }

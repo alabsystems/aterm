@@ -2025,6 +2025,27 @@ shape	Monocraft	bfece49853885e3c#0	-	liga=1,calt=1,zero=1,ss01=1,cv01=2	lig.thin
 shape	Monocraft	bfece49853885e3c#0	-	liga=1,calt=1,zero=1,ss01=1,cv01=2	lig.www	www	LTR Latn | 90:0:720 90:1:720 90:2:720
 shape	Monocraft	bfece49853885e3c#0	-	liga=1,calt=1,zero=1,ss01=1,cv01=2	lig.zero	0	LTR Zzzz | 19:0:720
 shape	Monocraft	bfece49853885e3c#0	-	liga=1,calt=1,zero=1,ss01=1,cv01=2	lig.zero-oh	0O0	LTR Latn | 19:0:720 50:1:720 19:2:720
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.ascii	A	LTR Latn | 0:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.couple-tones	\u{1f469}\u{1f3fe}\u{200d}\u{1f91d}\u{200d}\u{1f468}\u{1f3fb}	LTR Zzzz | 2588:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.family	\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}	LTR Zzzz | 2113:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.flag-england	\u{1f3f4}\u{e0067}\u{e0062}\u{e0065}\u{e006e}\u{e0067}\u{e007f}	LTR Zzzz | 1919:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.flag-invalid	\u{1f1e6}\u{1f1e6}	LTR Zzzz | 1474:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.flag-jp	\u{1f1ef}\u{1f1f5}	LTR Zzzz | 1647:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.flag-us	\u{1f1fa}\u{1f1f8}	LTR Zzzz | 1765:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.grin	\u{1f600}	LTR Zzzz | 883:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.heart-fire	\u{2764}\u{fe0f}\u{200d}\u{1f525}	LTR Zzzz | 1530:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.heart-vs16	\u{2764}\u{fe0f}	LTR Zzzz | 168:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.holding-hands	\u{1f9d1}\u{200d}\u{1f91d}\u{200d}\u{1f9d1}	LTR Zzzz | 3499:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.keycap-1	1\u{fe0f}\u{20e3}	LTR Zzzz | 1478:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.keycap-bare	*\u{20e3}	LTR Zzzz | 1476:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.keycap-hash	#\u{fe0f}\u{20e3}	LTR Zzzz | 1475:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.melting	\u{1fae0}	LTR Zzzz | 1418:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.rainbow-flag	\u{1f3f3}\u{fe0f}\u{200d}\u{1f308}	LTR Zzzz | 1904:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.red-hair-light	\u{1f9d1}\u{1f3fb}\u{200d}\u{1f9b0}	LTR Zzzz | 3548:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.smile-vs15	\u{263a}\u{fe0e}	LTR Zzzz | 79:0:2550 3:0:0
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.technologist	\u{1f469}\u{200d}\u{1f4bb}	LTR Zzzz | 2366:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.thumbs-medium	\u{1f44d}\u{1f3fd}	LTR Zzzz | 2059:0:2550
+shape	NotoColorEmoji	30ead35d90ff0371#0	-	-	emoji.wave-dark	\u{1f44b}\u{1f3ff}	LTR Zzzz | 2051:0:2550
 shape	SFNSMono	c11a9e80e64611c6#0	-	liga=0,calt=0,c2sc=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 487:0:1266 1088:1:1266 608:2:1266 1090:3:1266 1026:4:1266 608:5:1266 1115:6:1266 565:7:1266 1111:8:1266 1100:9:1266 1056:10:1266
 shape	SFNSMono	c11a9e80e64611c6#0	-	liga=0,calt=0,c2sc=1	feat.caps	HelloWorld	LTR Latn | 1025:0:1266 536:1:1266 608:2:1266 608:3:1266 632:4:1266 1040:5:1266 632:6:1266 673:7:1266 608:8:1266 528:9:1266
 shape	SFNSMono	c11a9e80e64611c6#0	-	liga=0,calt=0,c2sc=1	feat.case	(A)-[B]{C}	LTR Latn | 1105:0:1266 1018:1:1266 1106:2:1266 1119:3:1266 1107:4:1266 1019:5:1266 1108:6:1266 1109:7:1266 1020:8:1266 1110:9:1266

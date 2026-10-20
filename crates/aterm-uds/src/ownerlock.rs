@@ -91,7 +91,7 @@ pub fn probe(_path: &Path) -> Owner {
 // by the exact spelling `#[cfg(test)]`, and this module spawns a thread.
 #[cfg(test)]
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{Read as _, Write as _};
 
@@ -116,7 +116,7 @@ mod tests {
     ///
     /// [`Parked::release`] lets it go and returns its exit status; `Drop` lets it go on every
     /// other path. The child always ends by exec'ing `/bin/sh -c 'exit 0'`.
-    struct Parked {
+    pub(crate) struct Parked {
         ours: std::os::unix::net::UnixStream,
         spawner: Option<std::thread::JoinHandle<std::io::Result<std::process::ExitStatus>>>,
     }
@@ -125,7 +125,7 @@ mod tests {
         /// Fork a child and return once it is parked. The child writes one byte, then waits
         /// for one, under a 10 s timeout on the shared socket, so even a dead parent cannot
         /// strand it in `pre_exec`.
-        fn park() -> Self {
+        pub(crate) fn park() -> Self {
             use std::os::fd::AsRawFd as _;
             use std::os::unix::process::CommandExt as _;
             let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("pair");
@@ -168,7 +168,7 @@ mod tests {
         }
 
         /// Let the child exec and exit, and return how it exited.
-        fn release(mut self) -> std::process::ExitStatus {
+        pub(crate) fn release(mut self) -> std::process::ExitStatus {
             self.let_go();
             let spawner = self.spawner.take().expect("released once");
             match spawner.join().expect("the spawner thread") {
@@ -198,7 +198,8 @@ mod tests {
     }
 
     /// Held through another open is `Live`, released is `Dead` (while a forked child holds a
-    /// copy of the holder's descriptor), missing or a symlink is `Unknown`.
+    /// copy of the holder's descriptor), missing or a symlink is `Unknown`, and a FIFO is
+    /// answered without waiting for a writer (`Unknown` on Darwin, whose `flock` refuses one).
     #[test]
     fn the_probe_reads_the_owner_lock() {
         let dir = std::env::temp_dir().join(format!("ownerlock-{}", std::process::id()));
@@ -224,6 +225,16 @@ mod tests {
         let link = dir.join("link.log");
         std::os::unix::fs::symlink(&path, &link).expect("symlink");
         assert_eq!(probe(&link), Owner::Unknown, "a symlink is never followed");
+        let fifo = dir.join("fifo.log");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("path");
+        // SAFETY: a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+        let answer = probe(&fifo);
+        if cfg!(target_vendor = "apple") {
+            assert_eq!(answer, Owner::Unknown, "Darwin's flock refuses a FIFO");
+        } else {
+            assert_ne!(answer, Owner::Live, "nobody holds a FIFO's lock");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

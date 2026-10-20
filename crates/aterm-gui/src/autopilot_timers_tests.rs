@@ -722,7 +722,7 @@ fn the_fire_lands_only_the_stored_pair_and_the_hand_always_wins() {
     // Under the glass title rule (§10.2.1): the time is the line's.
     assert_eq!(
         record.as_deref(),
-        Some("Autopilot began landing"),
+        Some("Autopilot switched to land"),
         "{record:?}"
     );
 
@@ -766,7 +766,13 @@ fn the_fire_lands_only_the_stored_pair_and_the_hand_always_wins() {
     // finds the new instant and indexes it.
     let later = land_at + 600_000;
     assert!(
-        crate::session_timeline::apply_autopilot(&ctx, Some("cruise".into()), Some(later)).moved
+        crate::session_timeline::apply_autopilot(
+            &ctx,
+            Some("cruise".into()),
+            Some(later),
+            aterm_slog::Actor::Ctl
+        )
+        .moved
     );
     set_fake_clocks(Some((due + Duration::from_secs(30), land_at)));
     app.expire_autopilot_timers();
@@ -838,8 +844,8 @@ fn run_claude(app: &App) {
 
 /// THE FIRE SAYS WHAT IT FOUND (§10.2.3 item 8; the lifecycle hunt: main's
 /// line said "the harness wraps the work up at its next point" over every
-/// session): `Autopilot began landing`, and at 18:00-style time the word
-/// turned land, then — over open work — that the harness wraps it up; over
+/// session): `Autopilot switched to land`, and at 18:00-style time Autopilot
+/// switched to land, then — over open work — that the harness wraps it up; over
 /// a done task, `nothing to land, the task was done at HH:MM`; over a landed
 /// one, that it landed; with the harness switched off, or Claude Code's own
 /// switch off, that nothing is landed; in a tab with no agent, that there is
@@ -888,7 +894,7 @@ fn the_fire_says_what_it_found() {
     let face_at = crate::harness_glass::Stamp::at((wall - 60_000) / 1000)
         .expect("the zone reads")
         .clock;
-    let turned = format!("at {} the word turned land; ", clock.as_str());
+    let turned = format!("at {} Autopilot switched to land; ", clock.as_str());
     for (agent, face, after, then) in [
         (
             true,
@@ -935,7 +941,7 @@ fn the_fire_says_what_it_found() {
     ] {
         let (title, detail) = fire(agent, face, after);
         let what = format!("{agent} {face:?} {after:?}");
-        assert_eq!(title, "Autopilot began landing", "{what}");
+        assert_eq!(title, "Autopilot switched to land", "{what}");
         assert_eq!(detail.len(), 1, "{what}: {detail:?}");
         assert!(
             detail[0].ends_with(&format!("{turned}{then}")),
@@ -947,6 +953,80 @@ fn the_fire_says_what_it_found() {
             "NEGATIVE CONTROL {what}: only open work is wrapped up"
         );
     }
+}
+
+/// A FIRE OVER A PANE NO AGENT RUNS IN SAYS SO OF THE PANE (behaviour-4 of
+/// the post-landing check of Autopilot v3 wave 1, Claude Code 2.1.302): in
+/// a tab split Claude Code | shell, a timer set on the shell's pane — or on
+/// Claude Code's before it exited there — fires with its place naming that
+/// pane, `Tab 1, right pane: …`, and says `no agent runs in this pane`,
+/// never `in the tab`, where Claude Code still runs in the left pane. Main
+/// read `Tab 1: … no agent runs in the tab`: the place named panes only
+/// among agents, and one agent beside a shell names none. NEGATIVE
+/// CONTROLS: a shell alone in its tab still reads `Tab 1: … no agent runs
+/// in the tab`, with no pane; and Claude Code's own record beside that
+/// shell still names no pane (one agent in the tab, §10.3.5).
+#[test]
+fn a_fire_over_a_pane_with_no_agent_says_so_of_the_pane() {
+    let wall = FRI_19Z * 1000;
+    let land_at = wall + 120_000;
+    let record_of = |app: &App, session: u64| {
+        let key = format!(
+            "harness.autopilot.{}",
+            app.pool.get(session).unwrap().ctx.self_id.as_str()
+        );
+        app.messages
+            .log()
+            .records()
+            .rfind(|r| r.key.as_deref() == Some(key.as_str()))
+            .map(|r| (r.title.clone(), r.detail.clone()))
+            .expect("a record")
+    };
+    let fire = |app: &mut App, session: u64| {
+        let mono = Instant::now();
+        set_fake_clocks(Some((mono, wall)));
+        assert!(app.set_session_autopilot_timed(session, Some(Autopilot::Cruise), Some(land_at)));
+        set_fake_clocks(Some((mono + Duration::from_secs(120), land_at)));
+        app.expire_autopilot_timers();
+        set_fake_clocks(None);
+        record_of(app, session)
+    };
+    let clock = glass_of(land_at, wall, &local_offset_at)
+        .expect("the zone reads")
+        .clock;
+    let turned = format!("at {} Autopilot switched to land; ", clock.as_str());
+
+    // Claude Code | shell: the timer on the shell's pane.
+    let (mut app, host) = hosted();
+    let shell = app.split_active_stub_tab(crate::WindowId(0));
+    run_claude(&app);
+    let (title, detail) = fire(&mut app, shell);
+    assert_eq!(title, "Autopilot switched to land");
+    assert_eq!(
+        detail,
+        [format!(
+            "Tab 1, right pane: {turned}no agent runs in this pane, so there is nothing to land"
+        )],
+        "the pane named, and the pane's own words"
+    );
+    // CONTROL: Claude Code's own record beside the shell names no pane.
+    let (_, claude) = fire(&mut app, 0);
+    assert!(
+        claude[0].starts_with("Tab 1: ") && !claude[0].contains("pane"),
+        "{claude:?}"
+    );
+    host.shutdown_and_join();
+
+    // CONTROL: a shell alone in its tab is the tab.
+    let (mut app, host) = hosted();
+    let (_, alone) = fire(&mut app, 0);
+    assert_eq!(
+        alone,
+        [format!(
+            "Tab 1: {turned}no agent runs in the tab, so there is nothing to land"
+        )]
+    );
+    host.shutdown_and_join();
 }
 
 /// A HAND CHANGE NAMES THE TIMER IT DROPPED (§10.2.3 item 8): a timed Cruise
@@ -1124,8 +1204,13 @@ fn a_successor_fires_nothing_before_its_commit_and_rebuilds_at_it() {
     app.incoming_handoff_pending = true;
     let ctx = app.pool.get(0).unwrap().ctx.clone();
     assert!(
-        crate::session_timeline::apply_autopilot(&ctx, Some("cruise".into()), Some(wall + 60_000))
-            .moved
+        crate::session_timeline::apply_autopilot(
+            &ctx,
+            Some("cruise".into()),
+            Some(wall + 60_000),
+            aterm_slog::Actor::Ctl
+        )
+        .moved
     );
     // Its wake is dropped before the Commit.
     assert!(
@@ -1168,7 +1253,12 @@ fn a_successor_fires_nothing_before_its_commit_and_rebuilds_at_it() {
     let (mut app, host2) = hosted();
     app.handoff_successor = true;
     let ctx = app.pool.get(0).unwrap().ctx.clone();
-    crate::session_timeline::apply_autopilot(&ctx, Some("cruise".into()), Some(wall + 60_000));
+    crate::session_timeline::apply_autopilot(
+        &ctx,
+        Some("cruise".into()),
+        Some(wall + 60_000),
+        aterm_slog::Actor::Ctl,
+    );
     assert!(app.autopilot_timers.is_empty(), "stored, never indexed");
     app.expire_autopilot_timers();
     assert_eq!(

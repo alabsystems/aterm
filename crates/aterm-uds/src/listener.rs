@@ -63,3 +63,42 @@ fn socket_file(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
 fn socket_file(_: &std::fs::Metadata) -> Option<(u64, u64)> {
     None
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A path names the socket bound there, through a link too, and nothing else; it still
+    /// names it until another bind, and a reading that is missing on either side leaves the
+    /// pid to decide.
+    #[test]
+    fn a_path_names_its_socket_until_another_bind() {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-uds-listener.")
+            .tempdir()
+            .expect("scratch");
+        let dir = scratch.path();
+        let sock = dir.join("s.sock");
+        let plain = dir.join("plain");
+        std::fs::write(&plain, "").expect("file");
+        assert_eq!(listener_at(&plain), None, "not a socket");
+        assert_eq!(listener_at(dir.join("absent")), None);
+
+        let first = crate::CtlListener::bind(&sock).expect("bind");
+        let then = listener_at(&sock).expect("a socket");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&sock, &link).expect("symlink");
+        assert_eq!(listener_at(&link), Some(then), "a link is followed");
+        assert!(still_names(&sock, Some(then)));
+        assert!(still_names(&sock, None), "no earlier reading");
+
+        drop(first);
+        std::fs::remove_file(&sock).expect("unlink");
+        assert!(still_names(&sock, Some(then)), "nothing there now");
+        let _second = crate::CtlListener::bind(&sock).expect("rebind");
+        assert!(
+            !still_names(&sock, Some(then)),
+            "another bind, another listener"
+        );
+    }
+}

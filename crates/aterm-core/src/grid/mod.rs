@@ -69,6 +69,9 @@ pub use aterm_grid::{PendingScrollbackReflow, ReflowStep, ReflowedScrollback};
 // The host-repaint policy `Terminal::resize_with_policy` takes; the GUI picks it
 // per session from the PTY backend (ConPTY on Windows).
 pub use aterm_grid::grid::reflow::ResizePolicy;
+// The resize law a recording names (`aterm_resize_undo`), which `cast drift`
+// replays it under (`Terminal::set_resize_law`).
+pub use aterm_grid::ResizeLaw;
 
 // The seamless update's history carry (`Terminal::history_fence` and the
 // import). The fence and the built history cross threads and crates in the

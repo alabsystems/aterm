@@ -87,6 +87,7 @@ pub mod value;
 
 mod ignored_any;
 mod impls;
+mod text_key;
 
 pub use self::ignored_any::IgnoredAny;
 #[doc(no_inline)]

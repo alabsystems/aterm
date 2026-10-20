@@ -96,9 +96,9 @@ regex-compile	contract	index::SearchIndex::compile_regex, budgeted::BudgetedSear
 index-point-find	contract	TerminalSearch::find_direction_opts, index::SearchIndex::{find_next_case_insensitive_from,find_prev_case_insensitive_from,find_regex_direction,find_compiled_regex_from,point_answer}, TerminalSearch::{find_next,find_prev,find_next_opts,find_prev_opts} (cfg(test))	Let All be the UNCAPPED match list of the mode (All_cs, All_ci or regex) and ≺ the lexicographic order on (line, start_col). find_direction_opts(q,cs,rx,{anchor a, dir, inclusive, wrap}): Forward returns the ≺-first m ∈ All with (m.line,m.start_col) ≻ a (⪰ if inclusive); Backward returns the ≺-last m with (m.line,m.start_col) ≺ a (⪯ if inclusive). If there is none and wrap is set, Forward returns the ≺-first m ∈ All and Backward the ≺-last; otherwise None. Regex mode first propagates compile errors, and returns Err(ScanCutShort) iff the answer is None and some line the walk(s) scanned had Cut(n). Results never depend on MAX. An empty query (or empty fold) gives Ok(None).	src/tests.rs::terminal_search_find_next_prev, src/tests.rs::find_next_prev_same_line_column_boundary, src/tests.rs::find_prev_usize_max_does_not_overflow, src/tests.rs::find_next_past_last_line, src/tests.rs::terminal_search_option_navigation_is_ordered_and_case_insensitive	0,1,2,4,5,7,12	closures over iterators, saturating anchor arithmetic, Result
 literal-candidate-bound	contract	index::SearchIndex::literal_candidate_bound	Let e = cs ? q : Fold(q). literal_candidate_bound(q,cs) = None if |e| < 3; Some(0) if Rows = ∅ or some trigram of e has no posting list (a bloom rejection implies this); otherwise Some(min over trigrams w of e of |{n ∈ Rows | w ∈ T(Rows[n].text)}|). This bound is ≥ the number of candidate lines the engine's own walk visits for e.	src/tests.rs::literal_candidate_bound_reports_the_engines_own_candidate_count	0,1,3,5,7	Option, iterator min over posting lengths
 narrowed-search	contract	index::SearchIndex::search_literal_narrowed, index::CaseInsensitiveMatcher::has_occurrence, types::LineFrame::{with_base,push_offset,lines,contains,len,is_empty}	For q ≠ "": search_literal_narrowed(q,cs,None).results = Batch(All_mode,Forward), and its occurrence_lines is None if the walk was capped, else Some(F) with lines(F) = the ascending {n ∈ dom Rows | Contains(Rows[n].text,q)}, as absolute lines (base+offset) unaffected by later re-keying. search_literal_narrowed(q,cs,Some(F)).results.matches = take(MAX, LM_mode(n) concatenated over n ∈ lines(F) ∩ dom Rows ascending), with incomplete/lowest as in Batch; its occurrence_lines = (capped ? None : Some({n ∈ lines(F) ∩ dom Rows | Contains(Rows[n].text,q)})); no posting list or bloom probe is touched. Hence, if F is the occurrence frame of any char-prefix q' of q (q' = q included) on an index with the same Rows, results = Batch(All_mode,Forward), because every match line of q contains q' (Fold(q'++r) = Fold(q')++Fold(r)). q = "" gives (SearchResults::new([], incomplete, lowest), None).	src/tests.rs::narrowed_typing_equals_batch_for_every_prefix_step, src/tests.rs::occurrence_frame_keeps_zero_width_only_lines_narrable, src/tests.rs::frame_reverifies_its_own_query_after_backspace, src/tests.rs::capped_narrowed_walk_matches_forward_batch_and_yields_no_frame, src/tests.rs::narrowed_walk_carries_eviction_honesty_like_batch, src/index_key_window_tests.rs::a_frame_survives_the_index_rekeying_under_it	0,1,2,4,5,7,11	generic enum over iterators, labelled break, u32 offsets
-index-candidate-cost	other (cost)	index::SearchIndex::{literal_candidates_forward,literal_candidates_backward,posting_lists,search_from_line,search_before_line,find_next_case_insensitive_from,find_prev_case_insensitive_from}, index::CaseInsensitiveMatcher::visit_matches, iterators::CandidateSource	For a literal walk with folded query fq from line f: if |fq| < 3 the candidate sequence is the numeric range [max(f, first_cached_line), line_count) (descending for backward walks). It is empty when Rows = ∅, the bloom rejects, or a trigram has no posting. Otherwise it is the ascending intersection of the DISTINCT posting lists of fq's trigrams, restricted to ≥ f; posting_lists deduplicates identical lists, so LAST_UNIQUE = the number of distinct trigrams. Walks visit candidates lazily in order, once per candidate line, and stop at the line holding the first qualifying match. The case-insensitive verifier lowers a line into its buffer iff ¬(text ASCII ∧ fq ASCII ∧ |fq| ≤ 2), exactly once per visited line.	src/tests.rs::find_next_range_query_skips_prefix_matches, src/tests.rs::case_sensitive_point_navigation_builds_no_owned_intersection, src/tests.rs::case_insensitive_100k_ascii_short_query_work_is_bounded, src/tests.rs::case_insensitive_short_query_skips_sparse_empty_prefix, src/tests.rs::case_sensitive_reverse_short_query_skips_sparse_empty_prefix, src/tests.rs::case_insensitive_navigation_visits_only_trigram_candidates, src/tests.rs::case_insensitive_repeated_prefix_uses_linear_matcher_path	0,1,2,5,7	cost counters, lazy iterators, pointer-identity dedup
+index-candidate-cost	other (cost)	index::SearchIndex::{literal_candidates_forward,literal_candidates_backward,posting_lists,search_from_line,search_before_line,find_next_case_insensitive_from,find_prev_case_insensitive_from}, index::CaseInsensitiveMatcher::visit_matches, iterators::CandidateSource	For a literal walk with folded query fq from line f: if |fq| < 3 the candidate sequence is the numeric range [max(f, first_cached_line), line_count) (descending for backward walks). It is empty when Rows = ∅, the bloom rejects, or a trigram has no posting. Otherwise it is the ascending intersection of the DISTINCT posting lists of fq's trigrams, restricted to ≥ f; posting_lists deduplicates identical lists, so LAST_UNIQUE = the number of distinct trigrams. Walks visit candidates lazily in order, once per candidate line, and stop at the line holding the first qualifying match. The case-insensitive verifier lowers a line into its buffer iff ¬(text ASCII ∧ fq ASCII ∧ |fq| ≤ 2), exactly once per visited line.	src/tests.rs::find_next_range_query_skips_prefix_matches, src/tests.rs::case_sensitive_point_navigation_stops_at_the_neighbouring_match, src/tests.rs::case_insensitive_100k_ascii_short_query_work_is_bounded, src/tests.rs::case_insensitive_short_query_skips_sparse_empty_prefix, src/tests.rs::case_sensitive_reverse_short_query_skips_sparse_empty_prefix, src/tests.rs::case_insensitive_navigation_visits_only_trigram_candidates, src/tests.rs::case_insensitive_repeated_prefix_uses_linear_matcher_path	0,1,2,5,7	cost counters, lazy iterators, pointer-identity dedup
 index-observational-equivalence	equivalence	SearchIndex (all observers), TerminalSearch::{index_numbered_content_owned,index_visible_content}, SearchIndex::{reindex_changed_row_postings,rebuild_bloom,rekey}	A corollary of index-model plus the query specs. ∀ reachable idx1, idx2 with Abs(idx1) = Abs(idx2), every observer returns equal values: search_with_positions, search_from_line, search_before_line, search_results_opts[_direction], find_*, search_literal_narrowed, literal_candidate_bound (as defined by Abs), len, lowest_retained_line, results_may_be_incomplete. In particular an arbitrary edit script equals a fresh build over the final texts; A→B→A equals no edit; rebuild_bloom and re-keying are invisible; owned and borrowed indexing are indistinguishable.	src/tests.rs::changed_row_reindex_matches_from_scratch_rebuild, src/tests.rs::changed_row_reindex_round_trip_is_identity, src/tests.rs::lowercase_fast_path_keeps_insert_remove_symmetric, src/tests.rs::owned_numbered_content_matches_borrowed_indexing, src/index_bloom_tests.rs::replacing_last_posting_and_reintroducing_it_preserves_all_search_modes	0,1,2,4,5,7	relational (two-state) reasoning over HashMap-backed state
-budgeted-refines-one-shot	equivalence	budgeted::BudgetedSearch::{new,with_max_cached_lines,with_ambiguous_width,feed_row,feed_row_owned,feed_row_cells,feed_row_cow,verify_row,results}, index::final_evicted_prefix	∀ rows r_0..r_{N−1} (text with optional LineCells), base, q, cs, rx, cap, amb: if BudgetedSearch::with_max_cached_lines(q,cs,rx,base,N,cap) = Ok(b), with with_ambiguous_width(amb) applied, and each r_i is fed in order by feed_row_owned or feed_row_cells (feed_row is the cfg(test) borrowed twin), then after the N-th feed b.results() equals the one-shot search: a SearchIndex with max_cached_lines = cap and ambiguous_width = amb, built by index_line_cow(base+i, r_i.text, r_i.cells) for i < N, then search_results_opts(q,cs,rx).unwrap(). The equality covers matches, incomplete, lowest_retained_line and cut_short_lines. Construction fails exactly when that batch call would (regex-compile).	src/budgeted.rs::owned_feed_matches_borrowed_and_batch_unicode_coordinates, src/budgeted.rs::any_slicing_equals_one_shot_across_all_modes, src/budgeted.rs::match_cap_matches_one_shot_and_reports_incomplete, src/budgeted.rs::eviction_matches_one_shot_capped_index, src/budgeted.rs::combined_match_cap_and_eviction_equals_one_shot, src/budgeted.rs::a_row_the_regex_scan_cannot_finish_is_reported_like_the_one_shot	0,1,2,4,5,7,12	Cow, enum matcher with captured closures, cross-crate regex, relational equality with the index model
+budgeted-refines-one-shot	equivalence	budgeted::BudgetedSearch::{new,with_max_cached_lines,with_ambiguous_width,feed_row,feed_row_owned,feed_row_cells,feed_row_cow,verify_row,results}, index::final_evicted_prefix	∀ rows r_0..r_{N−1} (text with optional LineCells), base, q, cs, rx, cap, amb: if BudgetedSearch::with_max_cached_lines(q,cs,rx,base,N,cap) = Ok(b), with with_ambiguous_width(amb) applied, and each r_i is fed in order by feed_row_owned or feed_row_cells (feed_row is the cfg(test) borrowed twin), then after the N-th feed b.results() equals the one-shot search: a SearchIndex with max_cached_lines = cap and ambiguous_width = amb, built by index_line_cow(base+i, r_i.text, r_i.cells) for i < N, then search_results_opts(q,cs,rx).unwrap(). The equality covers matches, incomplete, lowest_retained_line and cut_short_lines. Construction fails exactly when that batch call would (regex-compile).	src/budgeted.rs::owned_feed_matches_borrowed_and_batch_unicode_coordinates, src/budgeted.rs::the_row_feed_equals_one_shot_across_all_modes, src/budgeted.rs::match_cap_matches_one_shot_and_reports_incomplete, src/budgeted.rs::eviction_matches_one_shot_capped_index, src/budgeted.rs::combined_match_cap_and_eviction_equals_one_shot, src/budgeted.rs::a_row_the_regex_scan_cannot_finish_is_reported_like_the_one_shot	0,1,2,4,5,7,12	Cow, enum matcher with captured closures, cross-crate regex, relational equality with the index model
 budgeted-progressive	contract	budgeted::BudgetedSearch::{feed_row_cow,rows_fed,total_rows,is_complete,results,results_range,result_count}	rows_fed grows by exactly 1 per feed while rows_fed < total_rows; a feed when rows_fed ≥ total_rows changes nothing. is_complete() ⇔ rows_fed ≥ total_rows. results().lowest_retained_line is the final watermark fixed at construction (base + final_evicted_prefix(total,cap), or 0), and no emitted match lies below it. results().matches after k feeds is a prefix of results().matches after k+1 feeds. results_range(s,l) = results() with matches[min(s,n) .. min(s+l,n)] (n = result_count()) and the same incomplete/lowest/cut_short_lines.	src/budgeted.rs::partial_results_are_a_prefix_and_overfeed_is_a_noop, src/budgeted.rs::result_ranges_are_bounded_and_stable_across_eviction	0,1,2,3,5	Vec slice/clone, saturating min arithmetic
 ```
 
@@ -121,7 +121,7 @@ src/bloom_tests.rs	bloom_no_false_negatives	bloom-no-false-negatives
 src/bloom_tests.rs	bloom_with_size_max_no_overflow	bloom-layout	
 src/bloom_tests.rs	bloom_with_size_rounding	bloom-layout	
 src/budgeted.rs	a_row_the_regex_scan_cannot_finish_is_reported_like_the_one_shot	budgeted-refines-one-shot	
-src/budgeted.rs	any_slicing_equals_one_shot_across_all_modes	budgeted-refines-one-shot	
+src/budgeted.rs	the_row_feed_equals_one_shot_across_all_modes	budgeted-refines-one-shot	
 src/budgeted.rs	combined_match_cap_and_eviction_equals_one_shot	budgeted-refines-one-shot	
 src/budgeted.rs	eviction_matches_one_shot_capped_index	budgeted-refines-one-shot	
 src/budgeted.rs	final_evicted_prefix_matches_real_index_schedule	eviction-schedule	
@@ -147,7 +147,6 @@ src/cells.rs	appended_cells_are_shifted_and_merged	line-cells-model
 src/cells.rs	cells_read_back_as_pushed_in_runs_of_one_shape	line-cells-model	
 src/cells.rs	empty_and_overlapping_cells_are_not_recorded	line-cells-model	
 src/grapheme.rs	a_line_of_one_shape_is_one_run	column-map-runs-compact	
-src/grapheme.rs	a_map_is_no_larger_than_before	-	delete
 src/grapheme.rs	cells_of_a_line_written_in_one_go_answer_as_the_walk	column-map-with-cells	
 src/grapheme.rs	cells_the_grid_kept_apart_are_where_matches_are_drawn	column-map-with-cells	
 src/grapheme.rs	graphemes_inside_a_cell_and_bytes_outside_every_cell	column-map-with-cells	
@@ -177,7 +176,7 @@ src/tests.rs	case_insensitive_greek_final_sigma_unified	index-literal-ci
 src/tests.rs	case_insensitive_navigation_visits_only_trigram_candidates	index-candidate-cost	
 src/tests.rs	case_insensitive_repeated_prefix_uses_linear_matcher_path	index-candidate-cost	
 src/tests.rs	case_insensitive_short_query_skips_sparse_empty_prefix	index-candidate-cost	
-src/tests.rs	case_sensitive_point_navigation_builds_no_owned_intersection	index-candidate-cost	
+src/tests.rs	case_sensitive_point_navigation_stops_at_the_neighbouring_match	index-candidate-cost	
 src/tests.rs	case_sensitive_reverse_short_query_skips_sparse_empty_prefix	index-candidate-cost	
 src/tests.rs	changed_row_reindex_matches_from_scratch_rebuild	index-observational-equivalence	
 src/tests.rs	changed_row_reindex_round_trip_is_identity	index-observational-equivalence	
@@ -192,7 +191,6 @@ src/tests.rs	find_next_prev_same_line_column_boundary	index-point-find
 src/tests.rs	find_next_range_query_skips_prefix_matches	index-candidate-cost	
 src/tests.rs	find_prev_usize_max_does_not_overflow	index-point-find	
 src/tests.rs	frame_reverifies_its_own_query_after_backspace	narrowed-search	
-src/tests.rs	generation_stable_across_read_operations	-	becomes-spec-after-fix
 src/tests.rs	len_is_a_high_water_mark	index-model	
 src/tests.rs	literal_candidate_bound_reports_the_engines_own_candidate_count	literal-candidate-bound	
 src/tests.rs	lowercase_fast_path_keeps_insert_remove_symmetric	index-observational-equivalence	
@@ -252,7 +250,10 @@ tests/search_vs_bruteforce.rs	verified_search_matches_bruteforce	index-literal-c
 > `#[cfg(test)]`-only `SparseBitmap::remove_range`, `range_before` and `range` they alone used;
 > the last of them went with the streaming engine. One **delete** row was not confirmed and
 > remains: `src/grapheme.rs::a_map_is_no_larger_than_before`.
-> Rows marked `move-to-bench` or `becomes-spec-after-fix` remain.
+> Status 2026-10-17: that test is a `const _` assertion beside `ColumnMap` now, and the
+> generation counter (§5.2) is deleted with `generation_stable_across_read_operations` and
+> `generation_bumps_once_per_mutation`; their rows are gone.
+> Rows marked `move-to-bench` remain.
 
 `delete` means the test samples no spec (usually it tests `#[cfg(test)]`-only code with no
 production caller); delete it now, together with that code. `move-to-bench` means it asserts a
@@ -263,8 +264,6 @@ code (expose the accessor, or remove the field) and it becomes a spec or goes aw
 | test | why | action |
 |---|---|---|
 | src/bloom_tests.rs::bloom_false_positive_rate | A statistical false-positive ratio over a hash. A Bloom filter permits any false positive, so there is no universal property. | **move-to-bench** |
-| src/grapheme.rs::a_map_is_no_larger_than_before | `size_of::<ColumnMap>() ≤ 32` is a compile-time fact. Replace it with a const assertion. | **delete** |
-| src/tests.rs::generation_stable_across_read_operations | The `#[cfg(test)]` generation counter (§5.2), through the `#[cfg(test)]` `find_next`/`find_prev`/`might_contain`. | **becomes-spec-after-fix** |
 | src/index.rs::ordinary_patterns_over_a_long_joined_line_find_their_matches | Capacity check that aterm-regex step costs for chosen patterns over 100 KB–4.3 MB lines stay under the budget: a performance property of another crate. | **move-to-bench** |
 | tests/index_column_map_memory.rs::an_index_of_non_ascii_rows_holds_a_small_multiple_of_their_text | Net-heap ratio bounds under a counting global allocator (CJK ≤ 4× text, etc.): a memory budget. The run-encoding property is `column-map-runs-compact`. | **move-to-bench** |
 | tests/index_release_memory.rs::release_reclaims_real_heap_that_clear_retains_without_disturbing_siblings | Net/gross heap ratios under a counting allocator (release frees > 80%, clear retains 2× what release does, refresh growth < 16 KiB): memory budgets. The observable reset is `index-model`; eviction cost is `bitmap-eviction-cost`. | **move-to-bench** |
@@ -275,26 +274,22 @@ read is an instance of one of the §1 specs.
 ## 5. Implied specs that look wrong, or disagree with the code
 
 1. **Vacuous assertions.**
-   - `src/tests.rs::case_sensitive_point_navigation_builds_no_owned_intersection`:
-     `assert_eq!(take_owned_intersection_builds(), 0)` can never fail. The only increment is in the
-     `#[cfg(test)]` `intersect_posting_lists`, reachable only from the `#[cfg(test)]`
-     `SearchIndex::search`, so no production path (`find_direction_opts` included) can increment it.
-     The `take_last_unique_posting_lists` and candidate-count assertions in the same test are real
-     (`index-candidate-cost`).
+   - (Fixed 2026-10-17.) `case_sensitive_point_navigation_builds_no_owned_intersection` asserted
+     `take_owned_intersection_builds() == 0`, which no production path could increment; the
+     counter is deleted and the test, now `case_sensitive_point_navigation_stops_at_the_neighbouring_match`,
+     keeps its real candidate-count assertions (`index-candidate-cost`).
    - `src/tests.rs::changed_row_reindex_matches_from_scratch_rebuild`: the block labelled "Negative
      control" compares match counts with the fresh build, which the full `SearchResults` equality
      just above already implies. It never shows that the oracle can fail, so it is not a negative
      control.
-   - `src/budgeted.rs` module doc ("however the rows were sliced") and
-     `any_slicing_equals_one_shot_across_all_modes`:
-     `BudgetedSearch` has no batched feed API, so every slice size issues the same per-row
-     `feed_row` sequence and the slicing quantifier is vacuous. The test really checks equality
-     across query modes (`budgeted-refines-one-shot`).
-2. **The generation counter cannot be observed in production.** `TerminalSearch::generation()` is
-   `#[cfg(test)]`, so production bumps a field nothing can read. `generation_bumps_once_per_mutation`
-   pins it, and so does `generation_stable_across_read_operations` (§4, `becomes-spec-after-fix`).
-   Either expose the accessor and spec it (every mutator bumps once, reads never bump), or delete the
-   field and the tests.
+   - (Fixed 2026-10-17.) `BudgetedSearch` has no batched feed API, so the slice-size loops of
+     `the_row_feed_equals_one_shot_across_all_modes` (was `any_slicing_…`) and the two eviction
+     tests issued the same `feed_row` sequence at every size; they feed once now, and the module
+     doc no longer claims slicings.
+2. **(Fixed 2026-10-17.) The generation counter could not be observed in production.**
+   `TerminalSearch::generation()` was `#[cfg(test)]`, so production bumped a field nothing read.
+   The field, its bumps, the `#[cfg(test)]` `invalidate` and the two tests that pinned it are
+   deleted.
 3. **The tests of `index-point-find` do not run the shipped code.** `TerminalSearch::find_next` and
    `find_prev` (`#[cfg(test)]`) re-implement the case-sensitive closure of `find_direction_opts`
    instead of calling it; `find_next_opts`/`find_prev_opts` do call it. So

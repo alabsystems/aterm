@@ -5,15 +5,14 @@
 //! never judged.
 //!
 //! The measurement itself is Trust code in the package it measures:
-//! `crates/aterm/tests/fabric_bench`, a test target that mounts the fabric
+//! `crates/aterm/benches/fabric_bench.rs`, an explicit bench that mounts the fabric
 //! worlds' harness and boots the real stack — astream's broker opened guarded
 //! (Strict, as aterm opens it) in the bench process, the headless `aterm` and
-//! the `aterm link serve` bridge that `aterm` supervises. Its measuring entry
-//! is `#[ignore]`d and inert unless `FABRIC_BENCH` names a run; this lane is
-//! what names one:
+//! the `aterm link serve` bridge that `aterm` supervises. Its entry requires a
+//! `FABRIC_BENCH` specification; this lane supplies one:
 //!
 //! ```text
-//! targo --unverified test -q -p aterm --test fabric_bench -- --exact measure --ignored --nocapture
+//! targo --unverified bench -q --profile test -p aterm --bench fabric_bench
 //! ```
 //!
 //! with `FABRIC_BENCH="out=<scratch> samples=… burst=… pingpong=… attach=…
@@ -38,13 +37,14 @@
 //! on a faster one. A before/after claim is two runs of this lane on one
 //! machine, compared; the ledger keeps them.
 //!
-//! TWO ARMS, `--profile dev|opt`, BOTH TEST BUILDS. The harness reaches the
+//! TWO ARMS, `--profile dev|opt`, BOTH WITH DEBUG ASSERTIONS. The harness reaches the
 //! `aterm` binary through `CARGO_BIN_EXE_aterm` and the bridge through the
 //! `ATERM_FABRIC_COMMAND` development seam, which a build without debug
 //! assertions compiles out, and a `--release` test build of a crate that calls
 //! other crates' debug-only test seams does not compile (AGENTS.md). So `dev`
-//! (the default, and every entry before the opt arm) is `targo test`'s own
-//! profile, where most crates on the path — aterm-link, astream-broker,
+//! (the default) explicitly selects the `test` profile, preserving the original
+//! measurement's build rather than the bench default's release profile. Most
+//! crates on this path — aterm-link, astream-broker,
 //! aterm-gui — are opt-level 0 and its numbers overstate the CPU part of every
 //! cost; and `opt` is the root manifest's `[profile.opt-test]`: release code
 //! generation with debug assertions on (the arm's table, and why it does not
@@ -221,16 +221,18 @@ impl Args {
     }
 
     /// The cargo arguments that name this arm's build of the bench: the arm's
-    /// profile, the package, the test target. The plan and the run both take
+    /// profile, the package, the bench target. The plan and the run both take
     /// them, so the build the lane checks is the build it runs. Pure
     /// (unit-tested).
     pub(crate) fn build_args(&self) -> Vec<&'static str> {
-        let mut args = Vec::new();
-        if let Some(profile) = self.profile.cargo_profile() {
-            args.extend(["--profile", profile]);
-        }
-        args.extend(["-p", "aterm", "--test", "fabric_bench"]);
-        args
+        vec![
+            "--profile",
+            self.profile.cargo_profile(),
+            "-p",
+            "aterm",
+            "--bench",
+            "fabric_bench",
+        ]
     }
 }
 
@@ -311,23 +313,22 @@ fn measure(args: &Args) -> Result<String, Halt> {
         .tempdir()
         .map_err(|e| format!("could not make a scratch directory: {e}"))?;
     let words = args.bench_words(scratch.path());
-    let mut test_args = vec!["-q"];
-    test_args.extend(args.build_args());
-    test_args.extend(["--", "--exact", "measure", "--ignored", "--nocapture"]);
+    let mut bench_args = vec!["-q"];
+    bench_args.extend(args.build_args());
     eprintln!(
         "  $ {BENCH_ENV}=\"{words}\" {}",
-        targo.display("test", &test_args)
+        targo.display("bench", &bench_args)
     );
     let mut child = targo
-        .command("test")
-        .args(test_args)
+        .command("bench")
+        .args(bench_args)
         .env(BENCH_ENV, &words)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("could not run targo: {e}"))?;
-    // stdout carries libtest's lines and the tables the bench also writes to
-    // its report file: read on a thread so neither pipe can fill and stall the
+    // stdout carries the tables the bench also writes to its report file:
+    // read on a thread so neither pipe can fill and stall the
     // other, and kept only for a failure message.
     let stdout = child.stdout.take().map(|out| {
         std::thread::spawn(move || {
@@ -518,7 +519,7 @@ impl<'a> Targo<'a> {
 fn plan(targo: &Targo<'_>, args: &Args) -> Result<units::Audit, Halt> {
     let mut plan_args = args.build_args();
     plan_args.extend(["--unit-graph", "-Z", "unstable-options"]);
-    let graph = targo.output("test", &plan_args, "the build plan")?;
+    let graph = targo.output("bench", &plan_args, "the build plan")?;
     units::Audit::of(&graph)
         .map_err(|why| Halt::Fail(format!("the build plan does not read: {why}")))
 }
@@ -556,8 +557,8 @@ fn build_bench(targo: &Targo<'_>, args: &Args) -> Result<PathBuf, Halt> {
     let mut build_args = vec!["-q"];
     build_args.extend(args.build_args());
     build_args.extend(["--no-run", "--message-format", "json-render-diagnostics"]);
-    eprintln!("  $ {}", targo.display("test", &build_args));
-    let messages = targo.output("test", &build_args, "the bench's build")?;
+    eprintln!("  $ {}", targo.display("bench", &build_args));
+    let messages = targo.output("bench", &build_args, "the bench's build")?;
     built_binary(&messages, "aterm").map_err(|why| Halt::Fail(format!("the bench's build: {why}")))
 }
 
@@ -818,7 +819,17 @@ mod tests {
         // before the opt arm was.
         let dev = Args::from_options(&BTreeMap::new()).expect("parses");
         assert_eq!(dev.profile, Profile::Dev);
-        assert_eq!(dev.build_args(), ["-p", "aterm", "--test", "fabric_bench"]);
+        assert_eq!(
+            dev.build_args(),
+            [
+                "--profile",
+                "test",
+                "-p",
+                "aterm",
+                "--bench",
+                "fabric_bench"
+            ]
+        );
         assert_eq!(dev.command_line(), "targo --unverified verify perf fabric");
         let mut o = BTreeMap::new();
         o.insert("--profile", "dev".to_string());
@@ -836,7 +847,7 @@ mod tests {
                 "opt-test",
                 "-p",
                 "aterm",
-                "--test",
+                "--bench",
                 "fabric_bench"
             ]
         );
@@ -864,7 +875,7 @@ mod tests {
         let messages = [
             r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"aterm"},"executable":null,"fresh":true}"#,
             r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"aterm"},"filenames":["/w/target/opt-test/aterm"],"executable":"/w/target/opt-test/aterm","fresh":false}"#,
-            r#"{"reason":"compiler-artifact","target":{"kind":["test"],"name":"fabric_bench"},"executable":"/c/.cargo-build/opt-test/deps/fabric_bench-7b2c","fresh":false}"#,
+            r#"{"reason":"compiler-artifact","target":{"kind":["bench"],"name":"fabric_bench"},"executable":"/c/.cargo-build/opt-test/deps/fabric_bench-7b2c","fresh":false}"#,
             r#"{"reason":"build-finished","success":true}"#,
             "not json: a stray line",
         ]

@@ -42,11 +42,18 @@
 //! probe after. A release build returns the bare cast: no trampoline, no
 //! check, no cost.
 //!
+//! A send no test can reach (one that runs only in an app bundle, against a
+//! framework a test must not drive) is checked ahead of time instead: its
+//! call site casts to a named prototype alias, and a test holds the alias to
+//! the runtime's encoding with [`prototype_check`], the same comparison
+//! without the send. [`block_check`] does it for a block's prototype
+//! ([`crate::BlockFn`]), against the signature an extended type encoding
+//! records for it ([`block_signatures`]).
+//!
 //! [`crate::msg`], the unchecked cast, is for this crate's own runtime tests;
 //! everywhere else the workspace's `clippy.toml` refuses it (`use
 //! checked_msg`).
 
-#[cfg(any(debug_assertions, test))]
 use std::ffi::CStr;
 
 use crate::{Bool, CGPoint, CGRect, CGSize, ClassPtr, Encode, Id, MsgFn, Sel};
@@ -90,6 +97,12 @@ pub unsafe trait CheckedFn: MsgFn {
     /// `objc_msgSend` cast in a release build.
     #[doc(hidden)]
     fn get() -> Self;
+
+    /// The `(self, _cmd, …)` method type this prototype sends, offsets aside
+    /// (`v@:@?` for `fn(Id, Sel, BlockPtr)`): what the prototype check
+    /// compares with the runtime's.
+    #[doc(hidden)]
+    fn types() -> String;
 }
 
 /// [`crate::msg`], checked in a debug build at every call against the
@@ -121,7 +134,6 @@ pub unsafe fn checked_msg<F: CheckedFn>() -> F {
 
 /// The `(self, _cmd, …)` method type a prototype should match, offsets aside:
 /// what [`check`] compares with the runtime's.
-#[cfg(debug_assertions)]
 fn types_of(ret: &str, args: &[&str]) -> String {
     let mut t = String::with_capacity(8 + args.len() * 4);
     t.push_str(ret);
@@ -139,6 +151,10 @@ macro_rules! impl_checked_fn {
         unsafe impl<Recv: Receiver, Ret: Encode, $($arg: Encode),*> CheckedFn
             for unsafe extern "C-unwind" fn(Recv, Sel, $($arg),*) -> Ret
         {
+            fn types() -> String {
+                types_of(Ret::ENCODING, &[$(<$arg as Encode>::ENCODING),*])
+            }
+
             #[inline]
             fn get() -> Self {
                 #[cfg(debug_assertions)]
@@ -155,9 +171,12 @@ macro_rules! impl_checked_fn {
                         // SAFETY: the caller of `checked_msg` asserted that
                         // `recv` is live or nil.
                         unsafe {
-                            check(recv.receiver_id(), sel, this as usize, || {
-                                types_of(Ret::ENCODING, &[$(<$arg as Encode>::ENCODING),*])
-                            });
+                            check(
+                                recv.receiver_id(),
+                                sel,
+                                this as usize,
+                                <unsafe extern "C-unwind" fn(Recv, Sel, $($arg),*) -> Ret as CheckedFn>::types,
+                            );
                         }
                         #[expect(
                             clippy::disallowed_methods,
@@ -258,7 +277,7 @@ impl std::hash::Hasher for AddrHasher {
 /// # Safety
 /// `recv` must be live or nil.
 #[cfg(debug_assertions)]
-unsafe fn check(recv: Id, sel: Sel, proto: usize, expected: impl FnOnce() -> String) {
+unsafe fn check(recv: Id, sel: Sel, proto: usize, expected: fn() -> String) {
     if recv.is_null() {
         return;
     }
@@ -275,19 +294,141 @@ unsafe fn check(recv: Id, sel: Sel, proto: usize, expected: impl FnOnce() -> Str
         return;
     };
     let runtime = crate::strip_method_offsets(&runtime);
-    let ours = expected();
-    if abi_shape(&runtime) != abi_shape(&ours) {
-        // SAFETY: `cls` is a live class.
-        let name: &CStr = unsafe { crate::class_name(cls) };
-        if swift_override_of_the_same_width(&name.to_string_lossy(), &runtime, &ours) {
-            return;
-        }
-        panic!(
-            "-[{} {sel:?}] is `{runtime}` in the runtime, but this send casts it to `{ours}`",
-            name.to_string_lossy()
-        );
+    // SAFETY: `cls` is a live class.
+    if let Some(why) = unsafe { mismatch(cls, sel, &runtime, &expected()) } {
+        panic!("{why}");
     }
     let _ = PASSED.try_with(|p| p.borrow_mut().insert(key));
+}
+
+/// Why a send typed `ours` cannot call the method `cls` runs for `sel`, typed
+/// `runtime` (both offset-free), or `None` where the call ABI cannot tell the
+/// two apart ([`abi_shape`], and a Swift override's
+/// [`swift_override_of_the_same_width`]).
+///
+/// # Safety
+/// `cls` must be a live class.
+unsafe fn mismatch(cls: ClassPtr, sel: Sel, runtime: &str, ours: &str) -> Option<String> {
+    if abi_shape(runtime) == abi_shape(ours) {
+        return None;
+    }
+    // SAFETY: `cls` is a live class.
+    let name: &CStr = unsafe { crate::class_name(cls) };
+    let name = name.to_string_lossy();
+    if swift_override_of_the_same_width(&name, runtime, ours) {
+        return None;
+    }
+    Some(format!(
+        "-[{name} {sel:?}] is `{runtime}` in the runtime, but this send casts it to `{ours}`"
+    ))
+}
+
+/// THE PROTOTYPE CHECK, AHEAD OF TIME: whether a send cast to `F` can call the
+/// method `cls` runs for `sel`, compared exactly as [`checked_msg`]'s debug
+/// check compares it at the call, but without sending. For a send no test can
+/// reach: its call site casts to a named alias of `F`, and a test hands the
+/// same alias here. `cls` is the class whose instances receive the send; a
+/// class method's receiver class is the metaclass (`class_of(cls.as_id())`).
+///
+/// # Errors
+/// The mismatch, worded as the debug check's panic words it, or that `cls`
+/// runs no method for `sel` (a send that would only be forwarded has no
+/// encoding to hold a prototype to).
+///
+/// # Safety
+/// `cls` must be a live class object.
+pub unsafe fn prototype_check<F: CheckedFn>(cls: ClassPtr, sel: Sel) -> Result<(), String> {
+    // SAFETY: `cls` is live; an unimplemented selector yields `None`.
+    let Some(runtime) = (unsafe { crate::method_types(cls, sel) }) else {
+        return Err(format!(
+            "{} runs no method for {sel:?}",
+            // SAFETY: `cls` is a live class.
+            unsafe { crate::class_name(cls) }.to_string_lossy()
+        ));
+    };
+    let runtime = crate::strip_method_offsets(&runtime);
+    // SAFETY: `cls` is a live class.
+    match unsafe { mismatch(cls, sel, &runtime, &F::types()) } {
+        Some(why) => Err(why),
+        None => Ok(()),
+    }
+}
+
+/// The signatures an extended method type encoding records for its block
+/// arguments, in order, each the text between `@?<` and its `>`:
+/// `v40@0:8@"NSString"16@?<v@?@"UNNotificationSettings">24` gives
+/// `v@?@"UNNotificationSettings"`. Only an extended encoding (a protocol's,
+/// through [`crate::protocol_method_extended_types`]) records them;
+/// `method_getTypeEncoding` spells every block `@?` alone.
+#[must_use]
+pub fn block_signatures(extended: &str) -> Vec<String> {
+    let b = extended.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i = b[i + 1..]
+                    .iter()
+                    .position(|&c| c == b'"')
+                    .map_or(b.len(), |q| i + q + 2);
+            }
+            b'@' if b.get(i + 1) == Some(&b'?') && b.get(i + 2) == Some(&b'<') => {
+                let end = angle_end(b, i + 2);
+                // `end` is just past the closing `>`; one that never closes
+                // runs to the end of the string.
+                let close = if b.get(end.wrapping_sub(1)) == Some(&b'>') {
+                    end - 1
+                } else {
+                    end
+                };
+                out.push(extended[i + 3..close].to_string());
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// Whether a block of prototype `P` is the block `signature` describes (one of
+/// [`block_signatures`]), in every way the call ABI can feel: the
+/// [`prototype_check`] comparison for a block, whose first argument is the
+/// block itself (`@?`).
+///
+/// # Errors
+/// Both signatures, when the call ABI can tell them apart.
+pub fn block_check<P: crate::BlockFn>(signature: &str) -> Result<(), String> {
+    let theirs = crate::strip_method_offsets(signature);
+    let ours = P::types();
+    if abi_shape(&theirs) == abi_shape(&ours) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the block is `{theirs}` in the runtime, but this prototype is `{ours}`"
+        ))
+    }
+}
+
+/// The index just past the `>` closing the `<` at `b[open]`, quotes and nested
+/// blocks aside; the end of `b` when it never closes.
+fn angle_end(b: &[u8], open: usize) -> usize {
+    let (mut depth, mut j, mut quoted) = (0_usize, open, false);
+    while j < b.len() {
+        match b[j] {
+            b'"' => quoted = !quoted,
+            b'<' if !quoted => depth += 1,
+            b'>' if !quoted => {
+                depth -= 1;
+                if depth == 0 {
+                    return j + 1;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    b.len()
 }
 
 /// A Swift class that overrides a Foundation method encodes Swift's types
@@ -296,10 +437,11 @@ unsafe fn check(recv: Id, sel: Sel, proto: usize, expected: impl FnOnce() -> Str
 /// `-[NSArray count]` is `Q@:`, and a native Swift string bridged as an
 /// `NSString` is a `Swift.__StringStorage`, whose `length` is `q@:` and whose
 /// `getCharacters:range:` takes an anonymous `{?=qq}` for `NSRange`'s
-/// `{_NSRange=QQ}`. The send follows the declaration, so for such a class only
-/// the layout is compared ([`sign_blind`]). A Swift class's runtime name is
-/// mangled (`_Tt…`) or `Module.Name`; an Objective-C class's never holds a dot.
-#[cfg(any(debug_assertions, test))]
+/// `{_NSRange=QQ}`, and whose `isEqualToString:` answers `c@:@` where arm64's
+/// `BOOL` is `B@:@`. The send follows the declaration, so for such a class only
+/// the layout is compared ([`sign_blind`]). A mangled (`_Tt…`) or dotted
+/// (`Module.Name`) runtime name is the heuristic for this exception; it does not
+/// establish the implementation language of an arbitrary registered class.
 fn swift_override_of_the_same_width(class: &str, runtime: &str, ours: &str) -> bool {
     let blind =
         |types: &str| -> Vec<String> { abi_shape(types).iter().map(|t| sign_blind(t)).collect() };
@@ -309,9 +451,11 @@ fn swift_override_of_the_same_width(class: &str, runtime: &str, ours: &str) -> b
 
 /// One [`abi_shape`] entry as a Swift override may differ from its declaration
 /// and keep its ABI: every struct and union tag (and quoted field name) dropped,
-/// every 32- or 64-bit integer signed, and Swift's `Bool` (`B`) read as the
-/// Intel `BOOL` (`c`) it is passed as, at any depth.
-#[cfg(any(debug_assertions, test))]
+/// every 32- or 64-bit integer signed, and a one-byte boolean spelt `c` (a
+/// macOS 27 Swift override's, and Intel's `BOOL`) or `B` (arm64's `BOOL`), at
+/// any depth. Of the 386 methods 163 Swift classes in libswiftCore and
+/// Foundation override on macOS 27, none differs from its Objective-C
+/// declaration by more.
 fn sign_blind(t: &str) -> String {
     let b = t.as_bytes();
     let mut out = String::with_capacity(t.len());
@@ -355,7 +499,6 @@ fn sign_blind(t: &str) -> String {
 /// `p`, since each travels in a general register; integers keep width and
 /// sign, floats their width, structs and unions their layout. Qualifiers
 /// (`r` const, `V` oneway, the `n`/`o`/`N`/`O`/`R` DO markers) go.
-#[cfg(any(debug_assertions, test))]
 fn abi_shape(types: &str) -> Vec<String> {
     let b = types.as_bytes();
     let mut out = Vec::new();
@@ -376,14 +519,15 @@ fn abi_shape(types: &str) -> Vec<String> {
 }
 
 /// The index just past the one type starting at `b[i]`.
-#[cfg(any(debug_assertions, test))]
 fn type_end(b: &[u8], i: usize) -> usize {
     match b.get(i) {
         None => i,
         Some(b'^') => type_end(b, i + 1),
         Some(q) if b"rnNoORV".contains(q) => type_end(b, i + 1),
-        // `@?` is a block; `@"Name"` an object of a named class.
+        // `@?` is a block, `@?<…>` one with the signature an extended
+        // encoding records; `@"Name"` an object of a named class.
         Some(b'@') => match b.get(i + 1) {
+            Some(b'?') if b.get(i + 2) == Some(&b'<') => angle_end(b, i + 2),
             Some(b'?') => i + 2,
             Some(b'"') => b[i + 2..]
                 .iter()
@@ -567,6 +711,20 @@ pub unsafe fn send_id_f64(recv: Id, sel: Sel, a: f64) -> Id {
     unsafe {
         let f: unsafe extern "C-unwind" fn(Id, Sel, f64) -> Id = checked_msg();
         f(recv, sel, a)
+    }
+}
+
+/// `-(id)sel:(CGFloat)a b:(CGFloat)b` —
+/// `+[NSFont monospacedDigitSystemFontOfSize:weight:]`.
+///
+/// # Safety
+/// See the module note, including the ownership paragraph.
+#[must_use]
+pub unsafe fn send_id_f64_f64(recv: Id, sel: Sel, a: f64, b: f64) -> Id {
+    // SAFETY: the caller pins the prototype; this is the cast for it.
+    unsafe {
+        let f: unsafe extern "C-unwind" fn(Id, Sel, f64, f64) -> Id = checked_msg();
+        f(recv, sel, a, b)
     }
 }
 
@@ -1823,7 +1981,11 @@ mod tests {
             "v@:^S{?=qq}",
             "v@:^S{_NSRange=QQ}"
         ));
-        assert!(swift_override_of_the_same_width(swift, "B@:@", "c@:@"));
+        assert!(swift_override_of_the_same_width(
+            "Swift.__StringStorage",
+            "c@:*qQ",
+            "B@:*QQ"
+        ));
         // a struct of another layout is never the same send
         assert!(!swift_override_of_the_same_width(
             "Swift.__StringStorage",
@@ -1841,6 +2003,95 @@ mod tests {
         ));
         assert!(!swift_override_of_the_same_width(swift, "v@:s", "v@:S"));
         assert!(!swift_override_of_the_same_width(swift, "q@:", "I@:"));
+    }
+
+    /// The check ahead of time, on Foundation's own classes: the right
+    /// prototype passes, the wrong sign and a class method held to the class
+    /// (not its metaclass) are refused, naming both encodings, and a selector
+    /// the class does not run is refused rather than passed. Nothing is sent.
+    #[test]
+    fn a_prototype_is_checked_without_a_send() {
+        let string = crate::class(c"NSString");
+        // SAFETY: live classes; nothing below sends a message.
+        unsafe {
+            prototype_check::<unsafe extern "C-unwind" fn(Id, Sel) -> usize>(
+                string,
+                crate::sel!(length),
+            )
+            .expect("-[NSString length] is NSUInteger");
+            let wrong = prototype_check::<unsafe extern "C-unwind" fn(Id, Sel) -> isize>(
+                string,
+                crate::sel!(length),
+            )
+            .expect_err("a signed -length");
+            assert!(
+                wrong.contains("`Q@:`") && wrong.contains("`q@:`"),
+                "{wrong}"
+            );
+            let meta = crate::class_of(string.as_id());
+            prototype_check::<unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id>(
+                meta,
+                crate::sel!(string),
+            )
+            .expect("+[NSString string] is on the metaclass");
+            assert!(
+                prototype_check::<unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id>(
+                    string,
+                    crate::sel!(string),
+                )
+                .is_err(),
+                "+string is no instance method"
+            );
+            assert!(
+                prototype_check::<unsafe extern "C-unwind" fn(Id, Sel)>(
+                    string,
+                    crate::sel!(atermNoSuchSelector),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    /// An extended encoding's block signatures, read out in order (a nested
+    /// block and a quoted class name aside), and a block prototype held to
+    /// one: width, sign and arity count; a class name does not.
+    #[test]
+    fn a_block_prototype_is_checked_against_its_recorded_signature() {
+        assert_eq!(
+            block_signatures(
+                "v40@0:8@\"UNUserNotificationCenter\"16@\"UNNotification\"24@?<v@?Q>32"
+            ),
+            ["v@?Q"]
+        );
+        assert_eq!(
+            block_signatures("v32@0:8@?<v@?@\"NSError\">16@?<v@?@?<v@?B>>24"),
+            ["v@?@\"NSError\"", "v@?@?<v@?B>"]
+        );
+        assert!(
+            block_signatures("v24@0:8@?16").is_empty(),
+            "a bare block records none"
+        );
+        assert!(
+            same("v@:@?<v@?Q>@", "v@:@?@"),
+            "a recorded signature is one pointer"
+        );
+        block_check::<fn(usize)>("v@?Q").expect("NSUInteger options");
+        block_check::<fn()>("v@?").expect("no arguments");
+        block_check::<fn(Bool, Id)>(&format!("v@?{}@\"NSError\"", Bool::ENCODING))
+            .expect("BOOL granted, NSError *error");
+        block_check::<fn(Id)>("v@?@\"UNNotificationSettings\"").expect("one object");
+        for (case, result) in [
+            ("a signed options word", block_check::<fn(isize)>("v@?Q")),
+            ("an argument too many", block_check::<fn(Id)>("v@?")),
+            ("an argument too few", block_check::<fn()>("v@?@")),
+            (
+                "a scalar for an object's place",
+                block_check::<fn(i32)>("v@?@"),
+            ),
+            ("a return", block_check::<fn() -> usize>("v@?")),
+        ] {
+            assert!(result.is_err(), "{case}");
+        }
     }
 
     /// A live send: the right prototype passes, the wrong sign panics before

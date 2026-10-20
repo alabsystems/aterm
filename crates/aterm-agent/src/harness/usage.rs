@@ -272,12 +272,12 @@ pub enum Fold {
 /// The bounded set of ids already counted, each with the largest usage seen
 /// for it so far, count by count.
 #[derive(Debug, Clone, Default)]
-struct SeenIds {
+pub(crate) struct SeenIds {
     order: VecDeque<String>,
     largest: BTreeMap<String, TokenUsage>,
 }
 
-enum Seen {
+pub(crate) enum Seen {
     New,
     Same,
     /// A differing repeat: how much each count grew past the largest held.
@@ -285,7 +285,7 @@ enum Seen {
 }
 
 impl SeenIds {
-    fn remember(&mut self, id: &str, usage: TokenUsage) -> Seen {
+    pub(crate) fn remember(&mut self, id: &str, usage: TokenUsage) -> Seen {
         if let Some(held) = self.largest.get_mut(id) {
             if *held == usage {
                 return Seen::Same;
@@ -302,7 +302,7 @@ impl SeenIds {
     }
 
     /// Forget all but the newest `keep` ids.
-    fn shed(&mut self, keep: usize) {
+    pub(crate) fn shed(&mut self, keep: usize) {
         while self.order.len() > keep {
             if let Some(old) = self.order.pop_front() {
                 self.largest.remove(&old);

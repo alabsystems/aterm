@@ -11,7 +11,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use aterm_types::native_window::{HasNativeWindow, NativeWindow};
-use winit::window::Window;
+use aterm_window::window::Window;
 
 use super::wayland::{WaylandFrame, WaylandPresentError, WaylandPresenter};
 use super::x11::{X11Frame, X11PresentError, X11Presenter};

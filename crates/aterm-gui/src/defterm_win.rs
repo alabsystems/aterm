@@ -463,12 +463,14 @@ mod tests {
     }
 
     /// A scratch key under our own name, so the removal path runs end to end without
-    /// writing the live console settings. Deleted on drop, including on panic.
+    /// writing the live console settings. Deleted on drop, including on panic. Each
+    /// is its own key directly under `Software`: a shared parent one test's drop
+    /// deletes can vanish between the steps of a parallel test's `RegCreateKeyExW`.
     struct ScratchKey(String);
 
     impl ScratchKey {
         fn new(name: &str) -> Self {
-            let path = format!("Software\\aterm-defterm-selftest\\{name}");
+            let path = format!("Software\\aterm-defterm-selftest-{name}");
             let k = Self(path);
             k.delete(); // any leftover from an interrupted run
             let sub = wide(&k.0);
@@ -515,11 +517,6 @@ mod tests {
             let sub = wide(&self.0);
             // SAFETY: valid NUL-terminated wide subkey under HKCU.
             unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, sub.as_ptr()) };
-            // Take the parent too, but only with `RegDeleteKeyW`, which fails while
-            // the key has subkeys, so a parallel test's scratch key is never swept up.
-            let parent = wide("Software\\aterm-defterm-selftest");
-            // SAFETY: valid NUL-terminated wide subkey under HKCU.
-            unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, parent.as_ptr()) };
         }
     }
 
@@ -532,7 +529,6 @@ mod tests {
     #[link(name = "advapi32")]
     unsafe extern "system" {
         fn RegDeleteTreeW(hkey: Hkey, subkey: *const u16) -> i32;
-        fn RegDeleteKeyW(hkey: Hkey, subkey: *const u16) -> i32;
     }
 
     /// Against a scratch key: a foreign pair survives unset byte for byte, and only

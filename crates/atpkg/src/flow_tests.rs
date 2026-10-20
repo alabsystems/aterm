@@ -64,6 +64,13 @@ fn scratch(label: &str) -> crate::testdir::Dir {
     crate::testdir::dir(&format!("atpkg-flow-{label}-"))
 }
 
+/// The archive member a build's `bin/<name>` executable is: `bin/<name>` on Unix,
+/// `bin/<name>.exe` on Windows ([`tool_bin`]'s file). Spelled with the suffix, not
+/// [`ToolName::exe_file`], so a refused name (`git`) can be laid too.
+fn bin_entry(name: &str) -> String {
+    format!("bin/{name}{}", crate::platform::EXE_SUFFIX)
+}
+
 /// A raw USTAR + zstd archive with `bin/ay` (+ a sensitive `bin/git` to prove the shim
 /// gate). Returns the path.
 fn make_archive(dir: &Path) -> PathBuf {
@@ -95,9 +102,9 @@ fn make_archive_with(dir: &Path, ay_content: &[u8], ay_mode: &[u8; 8]) -> PathBu
         out
     }
     let mut tar = Vec::new();
-    tar.extend(entry("bin/ay", ay_content, ay_mode));
+    tar.extend(entry(&bin_entry("ay"), ay_content, ay_mode));
     tar.extend(entry(
-        "bin/git",
+        &bin_entry("git"),
         b"#!/bin/true\nnot-really-git",
         b"0000755\0",
     )); // sensitive → refused shim
@@ -399,6 +406,75 @@ fn ay_installs_end_to_end_from_a_signed_release() {
         layout.build_dir("ay", 18)
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE ANTI-REPLAY BIND (§4.2) at every manifest read: a GENUINELY signed manifest served
+/// for a request it does not name — another build of the program, older or newer, or
+/// another program at that build — is refused by the singleton install, the group stage
+/// and the root recovery alike, and nothing is staged.
+#[test]
+fn a_signed_manifest_served_for_another_request_is_refused_at_every_read() {
+    let control = scratch("pkg-bind-control");
+    let honest = fixture(&control);
+    let index = resolve_verified_index(&honest, &layout(&control), &anchor(), fl(0), 0).unwrap();
+    assert!(
+        signed_root_for_installed(&honest, &index, "ay", 18, TRIPLE).is_some(),
+        "control: the honest manifest recovers its root"
+    );
+    let _ = std::fs::remove_dir_all(&control);
+    for (from, to) in [
+        ("build_number = 18", "build_number = 17"),
+        ("build_number = 18", "build_number = 19"),
+        ("program = \"ay\"", "program = \"ny\""),
+    ] {
+        let dir = scratch("pkg-bind");
+        let (one, many) = (dir.join("one"), dir.join("group"));
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&many).unwrap();
+        let (mut single, mut group) = (fixture(&one), group_fixture(&many));
+        for fake in [&mut single, &mut group] {
+            let key = ("ay".to_string(), 18u64);
+            let body = String::from_utf8(fake.pkg[&key].0.clone()).unwrap();
+            let body = body.replace(from, to);
+            let sig = sign(&RELEASE_SEED, body.as_bytes());
+            fake.pkg.insert(key, (body.into_bytes(), sig));
+        }
+        let layout = layout(&dir);
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple: TRIPLE,
+            installed: None,
+        };
+        let err = install(&single, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
+        assert!(matches!(err, FlowError::Mismatch), "{to}: {err:?}");
+        let index = resolve_verified_index(&single, &layout, &anchor(), fl(0), 0).unwrap();
+        assert_eq!(
+            signed_root_for_installed(&single, &index, "ay", 18, TRIPLE),
+            None,
+            "{to}"
+        );
+        let installed = std::collections::BTreeMap::from([("ay".to_string(), 17u64)]);
+        let report = apply_channel(
+            &group,
+            &layout,
+            &anchor(),
+            "stable",
+            TRIPLE,
+            &installed,
+            &[],
+            fl(0),
+            0,
+        )
+        .unwrap();
+        assert!(
+            matches!(&report.groups[0].1, TxnOutcome::Aborted { failed, .. } if failed == "ay"),
+            "{to}: {:?}",
+            report.groups[0].1
+        );
+        assert!(!layout.build_dir("ay", 18).exists(), "{to}: nothing staged");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// The env that turns [`probe_an_install_under_an_open_umask`] on: the scratch directory
@@ -1139,11 +1215,12 @@ fn install_never_unlinks_outside_staging_for_a_release_row() {
         let base = fixture(&dir);
         let sha = "a".repeat(64);
         let root = "b".repeat(64);
+        // A TOML literal string: a Windows path's `\` is no escape there.
         let pkg_body = format!(
             "schema = 2\nprogram = \"ay\"\nversion = \"0.1\"\nbuild_number = 18\n\
              exposes = [\"ay\"]\n\
              [[artifact]]\ntarget = \"{TRIPLE}\"\nkind = \"binary\"\n\
-             protocol = \"github-release\"\nasset = \"{asset}\"\n\
+             protocol = \"github-release\"\nasset = '{asset}'\n\
              sha256 = \"{sha}\"\ntree_root = \"{root}\"\nsize = 1\n\
              [artifact.cost]\ndisk_installed = 1\n"
         );
@@ -1972,7 +2049,7 @@ fn prog_archive(dir: &Path, program: &str, build: u64) -> PathBuf {
     }
     let mut tar = Vec::new();
     tar.extend(entry(
-        &format!("bin/{program}"),
+        &bin_entry(program),
         format!("#!/bin/true\n{program}").as_bytes(),
     ));
     tar.resize(tar.len() + 1024, 0);
@@ -1990,6 +2067,12 @@ fn group_fixture(dir: &Path) -> Fake {
 /// [`group_fixture`] with each program in `unserved` published only for a foreign
 /// triple — how the release looks from a host the publisher does not build it for.
 fn group_fixture_with(dir: &Path, unserved: &[&str]) -> Fake {
+    group_fixture_of(dir, unserved, &[])
+}
+
+/// [`group_fixture_with`] with each program in `bundles` shipped as a `sysroot-bundle`
+/// (the `self-contained` default), as the trust toolchain is.
+fn group_fixture_of(dir: &Path, unserved: &[&str], bundles: &[&str]) -> Fake {
     let mut pkg = HashMap::new();
     let mut archives = HashMap::new();
     for (program, build) in [("trust", 4821u64), ("ay", 18u64)] {
@@ -2002,10 +2085,15 @@ fn group_fixture_with(dir: &Path, unserved: &[&str]) -> Fake {
         let sha = crate::tree::file_sha256(&archive).unwrap();
         let root = signed_root_of(&archive, &dir.join(format!("probe-{program}")));
         let asset = format!("{program}-{build}.tar.zst");
+        let kind = if bundles.contains(&program) {
+            "sysroot-bundle"
+        } else {
+            "binary"
+        };
         let pkg_body = format!(
             "schema = 2\nprogram = \"{program}\"\nversion = \"0.1\"\nbuild_number = {build}\n\
              exposes = [\"{program}\"]\n\
-             [[artifact]]\ntarget = \"{target}\"\nkind = \"binary\"\nasset = \"{asset}\"\n\
+             [[artifact]]\ntarget = \"{target}\"\nkind = \"{kind}\"\nasset = \"{asset}\"\n\
              sha256 = \"{sha}\"\ntree_root = \"{root}\"\nsize = 100\n\
              [artifact.cost]\ndisk_installed = 1048576\n"
         );
@@ -4962,7 +5050,7 @@ fn a_failed_flip_points_the_witness_back_at_the_prior_build() {
         aliases: Aliases::Off,
         tree_root: String::new(),
     };
-    let flipped = flip_member_with(&l, "ay", &staged, |layout, _| {
+    let flipped = flip_member_with(&l, "ay", &staged, None, |layout, _| {
         crate::platform::remove_link(&layout.program_current("ay"));
         Err(std::io::Error::other(
             "mklink failed after the junction was removed",
@@ -4997,7 +5085,7 @@ fn a_failed_fresh_install_flip_removes_the_witness_link() {
         aliases: Aliases::Off,
         tree_root: String::new(),
     };
-    let flipped = flip_member_with(&l, "ay", &staged, |layout, build_dir| {
+    let flipped = flip_member_with(&l, "ay", &staged, None, |layout, build_dir| {
         activate_build(layout, build_dir)?;
         Err(std::io::Error::other(
             "the junction was made, then the write reported failure",
@@ -5007,6 +5095,150 @@ fn a_failed_fresh_install_flip_removes_the_witness_link() {
     assert!(
         std::fs::symlink_metadata(l.program_current("ay")).is_err(),
         "no witness link survives a failed fresh install"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PKG-6 #11 — A BUNDLE'S RESOLVE CHECK RUNS FROM ITS STAGE, AND THE FLIP TAKES ITS VERDICT.
+/// The check starts on its own thread when the member is staged, before anything asks for
+/// it: the first exec of a toolchain's compilers (2.4 s for the trust toolchain's driver)
+/// runs beside the stages that follow instead of inside the flip. The flip then takes that
+/// verdict rather than checking again: a bundle whose check failed ahead is rolled back,
+/// whatever its tree would answer now. A plain member, or a policy with wiring the flip
+/// applies first, starts nothing.
+#[test]
+fn a_bundle_resolve_check_runs_from_its_stage_and_the_flip_takes_its_verdict() {
+    let dir = scratch("resolve-ahead");
+    let l = layout(&dir);
+    let b18 = bare_build(&l, "ay", 18, &["ay"]);
+    let b19 = bare_build(&l, "ay", 19, &["ay"]);
+    activate_build(&l, &b18).unwrap();
+    install_tools(&l, &b18, &[tool("ay")], Aliases::Off).unwrap();
+    let bundle = |reloc: &str| Staged {
+        build: 19,
+        build_dir: b19.clone(),
+        exposes: vec![tool("ay")],
+        prior_build: Some(18),
+        was_live: false,
+        reloc: Some(reloc.to_string()),
+        aliases: Aliases::Off,
+        tree_root: String::new(),
+    };
+    // It runs ahead: started, nobody waiting on it, it has begun (a wait for something
+    // that must happen — a lazy check would never start here).
+    let (began, started) = std::sync::mpsc::channel();
+    let (release, go) = std::sync::mpsc::channel::<()>();
+    let check = ResolveAhead::start_with(&bundle("self-contained"), move |build_dir, exposes| {
+        // Neither wait outlives a test that already failed: a dropped check is joined.
+        let _ = began.send((build_dir.to_path_buf(), exposes.to_vec()));
+        let _ = go.recv_timeout(std::time::Duration::from_secs(60));
+        Err(FlowError::Activate(
+            "resolve check: ahead of the flip".into(),
+        ))
+    })
+    .expect("a self-contained bundle starts its check at the stage");
+    let (checked_dir, checked_tools) = started
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the check began before the flip asked for it");
+    assert_eq!(
+        (checked_dir, checked_tools),
+        (b19.clone(), vec![tool("ay")])
+    );
+    release.send(()).unwrap();
+    // The bin here is a script, so a check run at the flip would pass: the flip refusing
+    // is the verdict taken ahead.
+    assert!(bundle_resolve_check(&b19, &[tool("ay")]).is_ok());
+    assert!(
+        !flip_member(&l, "ay", &bundle("self-contained"), Some(check)),
+        "the failed verdict from the stage refuses the flip"
+    );
+    assert_eq!(
+        crate::ops::which(&l, "ay").unwrap(),
+        tool_bin(&b18, "ay"),
+        "rolled back to the prior build"
+    );
+    // A healthy verdict flips.
+    let ok = ResolveAhead::start_with(&bundle("self-contained"), |_, _| Ok(())).unwrap();
+    assert!(flip_member(&l, "ay", &bundle("self-contained"), Some(ok)));
+    assert_eq!(crate::ops::which(&l, "ay").unwrap(), tool_bin(&b19, "ay"));
+    // Nothing starts for a plain member, nor ahead of wiring the flip would apply first.
+    let mut plain = bundle("self-contained");
+    plain.reloc = None;
+    assert!(ResolveAhead::start_with(&plain, |_, _| Ok(())).is_none());
+    assert!(ResolveAhead::start_with(&bundle("rpath-fixup"), |_, _| Ok(())).is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PKG-6 #11 — A GROUP STARTS A BUNDLE'S RESOLVE CHECK AT ITS STAGE, BEFORE THE NEXT
+/// MEMBER STAGES. Over a live tuple, `ay` (a self-contained bundle here) stages first;
+/// trust's download, the
+/// start of the next member's stage, waits for `ay`'s check to begin (a hang detector: a
+/// check left to the flip, or never started ahead, begins only after it). The flip takes
+/// that verdict and the tuple lands.
+#[test]
+fn a_group_starts_a_bundles_resolve_check_before_the_next_member_stages() {
+    type Began = Result<PathBuf, std::sync::mpsc::RecvTimeoutError>;
+    struct AwaitsCheck {
+        inner: Fake,
+        began: std::sync::mpsc::Receiver<PathBuf>,
+        before_trust: std::cell::RefCell<Option<Began>>,
+    }
+    impl Fetcher for AwaitsCheck {
+        fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
+            self.inner.index_candidates()
+        }
+        fn pkg_manifest(&self, r: &str, p: &str, b: u64) -> Result<(Vec<u8>, Vec<u8>), String> {
+            self.inner.pkg_manifest(r, p, b)
+        }
+        fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
+            if asset == "trust-4821.tar.zst" {
+                let began = self.began.recv_timeout(std::time::Duration::from_secs(60));
+                *self.before_trust.borrow_mut() = Some(began);
+            }
+            self.inner.download(repo, asset, dest)
+        }
+    }
+    let dir = scratch("resolve-ahead-group");
+    let (tell, began) = std::sync::mpsc::channel();
+    let fake = AwaitsCheck {
+        inner: group_fixture_of(&dir, &[], &["ay"]),
+        began,
+        before_trust: std::cell::RefCell::new(None),
+    };
+    let layout = layout(&dir);
+    let installed = live_toolchain(&layout);
+    let report = with_resolve_check(
+        std::sync::Arc::new(move |build_dir: &Path, _: &[ToolName]| {
+            let _ = tell.send(build_dir.to_path_buf());
+            Ok(())
+        }),
+        || {
+            apply_channel(
+                &fake,
+                &layout,
+                &anchor(),
+                "stable",
+                TRIPLE,
+                &installed,
+                &[],
+                fl(0),
+                0,
+            )
+            .unwrap()
+        },
+    );
+    assert_eq!(
+        fake.before_trust.into_inner(),
+        Some(Ok(layout.build_dir("ay", 18))),
+        "ay's resolve check began before trust staged"
+    );
+    assert_eq!(
+        report.groups[0].1,
+        TxnOutcome::Applied(vec!["ay".into(), "trust".into()])
+    );
+    assert_eq!(
+        crate::ops::active_builds(&layout).get("ay").copied(),
+        Some(18)
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -5035,7 +5267,7 @@ fn an_atomic_link_write_failure_leaves_the_witness_on_the_prior_build() {
         aliases: Aliases::Off,
         tree_root: String::new(),
     };
-    let flipped = flip_member(&l, "ay", &staged);
+    let flipped = flip_member(&l, "ay", &staged, None);
     set_mode(&store_ay, 0o755);
     assert!(!flipped, "the flip must report failure");
     assert_eq!(std::fs::read_link(l.program_current("ay")).unwrap(), b18);
@@ -6214,7 +6446,10 @@ fn a_tuple_lands_whole_from_the_archives_the_lane_fetched() {
 // FAULT. The third member's archive does not arrive, the lane's download nor the pass's own
 // after it: nothing is flipped, the staged siblings' trees are discarded (their archives
 // kept for the next pass), and the pass's own fault tally — the offline verdict's input —
-// counts the one fetch of its own that failed.
+// counts the one fetch of its own that failed. The archive was asked for twice, the lane's
+// download first, and the pass took the lane's answer for every member — the failure among
+// them — before fetching that one itself. Negative control: a pass that never asks the
+// lane fails the same way inline, and leaves the lane's archives untaken.
 #[test]
 fn a_tuple_whose_third_archive_the_lane_lost_aborts_with_nothing_flipped() {
     let dir = scratch("ahead-tuple-lost");
@@ -6229,7 +6464,7 @@ fn a_tuple_whose_third_archive_the_lane_lost_aborts_with_nothing_flipped() {
     let layout = layout(&dir);
     let mut resolved = BTreeMap::new();
     let faults = fetch_faults();
-    let (outcome, _) = bootstrap_through_lane(&rec, &layout, &mut resolved);
+    let (outcome, lane) = bootstrap_through_lane(&rec, &layout, &mut resolved);
     assert!(
         matches!(
             &outcome,
@@ -6255,6 +6490,23 @@ fn a_tuple_whose_third_archive_the_lane_lost_aborts_with_nothing_flipped() {
         );
     }
     assert!(!archive_at(&layout, "tc", 3).exists());
+    let tc: Vec<String> = rec
+        .starts()
+        .into_iter()
+        .filter(|(asset, _)| asset == "tc-3.tar.zst")
+        .map(|(_, thread)| thread)
+        .collect();
+    assert_eq!(tc.len(), 2, "the lane's download, then the pass's: {tc:?}");
+    assert_eq!(tc[0], LANE_THREAD, "the lane lost it first");
+    assert_ne!(
+        tc[1], LANE_THREAD,
+        "the pass fetched it itself after the lane's loss"
+    );
+    assert!(
+        lane.untaken().is_empty(),
+        "the pass took every archive the lane fetched or lost: {:?}",
+        lane.untaken()
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -6471,20 +6723,17 @@ fn every_resolve_check_runs_and_a_signal_death_in_any_refuses() {
     let names = ["t1", "t2", "t3", "t4", "t5"];
     for name in names {
         // MH_MAGIC_64, little-endian: a native object to the sniff.
-        std::fs::write(
-            build.join("bin").join(name),
-            [0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0],
-        )
-        .unwrap();
+        std::fs::write(tool_bin(&build, name), [0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]).unwrap();
     }
-    std::fs::write(build.join("bin/wrap"), b"#!/bin/sh\nexec t1 \"$@\"\n").unwrap();
+    std::fs::write(tool_bin(&build, "wrap"), b"#!/bin/sh\nexec t1 \"$@\"\n").unwrap();
     let mut exposed: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
     exposed.push("wrap".into());
     let exposes = crate::store::split_exposed(&exposed).0;
     let verdict = |killed: &[&str]| {
         let checked = std::sync::Mutex::new(Vec::new());
         let result = bundle_resolve_check_with(&build, &exposes, &|bin: &Path| {
-            let name = bin.file_name().unwrap().to_string_lossy().into_owned();
+            // The tool's name: the file less the host's executable suffix.
+            let name = bin.file_stem().unwrap().to_string_lossy().into_owned();
             checked.lock().unwrap().push(name.clone());
             if killed.contains(&name.as_str()) {
                 Err(format!("resolve check: {name} was killed by a signal"))

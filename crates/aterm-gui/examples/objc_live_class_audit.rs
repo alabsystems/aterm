@@ -116,11 +116,11 @@ mod macos {
         Bool, Id, Sel, checked_msg, class, class_methods, class_name, class_of, class_protocols,
         method_types, protocol, protocol_method_types, sel, strip_method_offsets, superclass_of,
     };
-    use winit::application::ApplicationHandler;
-    use winit::event::WindowEvent;
-    use winit::event_loop::ActiveEventLoop;
-    use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
-    use winit::window::{Window, WindowId};
+    use aterm_window::application::ApplicationHandler;
+    use aterm_window::event::WindowEvent;
+    use aterm_window::event_loop::ActiveEventLoop;
+    use aterm_window::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
+    use aterm_window::window::{Window, WindowId};
 
     use super::{FAIL, FORK_DECLARED, NOT_RUN, PASS};
 
@@ -2371,7 +2371,7 @@ mod macos {
             }
             let attrs = Window::default_attributes()
                 .with_title("objc-live-class-audit")
-                .with_inner_size(winit::dpi::LogicalSize::new(320.0, 200.0))
+                .with_inner_size(aterm_window::dpi::LogicalSize::new(320.0, 200.0))
                 .with_visible(false);
             match el.create_window(attrs) {
                 Ok(w) => self.window = Some(w),

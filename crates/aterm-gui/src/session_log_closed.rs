@@ -35,10 +35,10 @@
 //! only to link it in; a read or a revoke clones an `Arc` under the store's
 //! read lock and locks the grants, or renders, after it. The index counts against the
 //! instance-wide cap ([`crate::App::sweep_session_log_memory`]) by the
-//! entries' estimated heap. It is this process's alone: a seamless update
-//! does not carry it, and a restore's `prev=` from an earlier process
-//! answers `ERR no such session` (the journal, design D3, is where that will
-//! live).
+//! entries' estimated heap. The index is process-local and is not carried
+//! through a seamless update. Reads of an earlier process's sid may instead
+//! use the optional journal fallback in `control::journal_session_reply_with`:
+//! Owner-class only, and unavailable while journaling is off.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

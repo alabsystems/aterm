@@ -44,7 +44,7 @@ aterm-spec-anchor = { workspace = true }
 aterm-uds = { workspace = true }
 
 [dev-dependencies]
-# Tier-0 lives in aterm-models-session; Tier-1 (`src/conformance_region_tests.rs`) binds
+# Tier-0 lives in aterm-models-session; Tier-1 (`src/conformance_region.rs`) binds
 # the writer and `recover` to `CrashRestoreJournal` through `#[refines]` anchors.
 aterm-spec = { workspace = true }
 aterm-models-session = { workspace = true }

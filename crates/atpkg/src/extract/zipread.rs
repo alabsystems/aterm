@@ -19,7 +19,7 @@
 //!
 //! This reader only PARSES. Every member is handed to the same [`super::Layer`] as the
 //! tar lanes with `(raw path, kind, mode, body)`, so the slip vet, `strip_components`,
-//! the byte and entry caps, the mode sanitizing, the in-root symlink rule and the
+//! the byte and entry caps, the mode sanitizing, the selected symlink policy and the
 //! `tree_root` fold are inherited by construction. Inflate is first-party
 //! (`aterm_codec::inflate::stream`), the streaming driver over the same engine the
 //! terminal's Kitty `o=z` path uses.
@@ -486,7 +486,7 @@ pub(super) fn extract(
                 }
             }
             EntryKind::Symlink => {
-                if !opts.in_root_symlinks {
+                if opts.symlinks == super::SymlinkPolicy::Refuse {
                     return Err(ExtractError::Rejected(ExtractReject::DisallowedKind, raw));
                 }
                 if rec.uncomp_size > MAX_LINK_TARGET {

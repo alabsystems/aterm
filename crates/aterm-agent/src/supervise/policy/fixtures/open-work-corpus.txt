@@ -1,0 +1,902 @@
+# OPEN-WORK CORPUS: what the open-work reader (`open_work` in
+# supervise/policy/turn_end.rs) must make of real done reports.
+#
+# Excerpts of the reports this repository's own agents ended with
+# ATERM-TASK-DONE in three rounds of work (2026-10-15 to 2026-10-17): each
+# implementer's summary, skipped items and open risks, and each reviewer's,
+# integrator's and measurer's notes. Trimmed to the excerpts that leave work
+# open or hold one of the reader's words; paths outside the repository read
+# <scratch>, <worktrees>, <build-cache> and <checkout>.
+#
+# Labels follow the owner's rule for a finished job (2026-10-19: the token
+# NEVER ends a job while ANY follow-up is left). An excerpt is OPEN when it
+# leaves something undone (a check not run, a gap still open, something
+# unmeasured, unexplained or left to follow up), WHATEVER BLOCKS IT: one that
+# names its blocker (a person's credential or decision, what this host
+# lacks), a decision not to do it, or the later step it is left to, is open
+# all the same. It is CLEAR when it leaves nothing: nothing undone, or a
+# reason why there is nothing to do (no contract was added, main already has
+# it, the brief forbids it).
+#
+#   === <report>                a report: its excerpts, joined, are one report
+#   --- open  /  --- clear      an excerpt and its label
+#   --- open, missed: <why>     the reader finds no open work in it
+#   --- clear, flagged: <why>   the reader finds open work in it
+#
+# A report reads as open exactly when one of its excerpts does.
+
+=== round 1, TC-2 implementer
+--- clear
+Changes, function by function:
+- crates/atpkg/src/adoption.rs (new): `adoption()` returns Consented, Declined, IgnoredPrefix, AutoInstallOff or ManagerDisabled, checked in the seed's existing order. `adoption_consented(layout, cfg) -> bool` is the yes/no form. lib.rs re-exports `atpkg::adoption_consented` and `atpkg::Adoption` for TC-3 and TC-5.
+- cli.rs `cmd_seed`: matches on `adoption()` and prints the same lines as before. It then calls `refresh_shell_hooks(&layout)` right after the pending and reroute stubs, after every consent return. The end-of-pass call is kept. `hooks::refresh` still applies all its own rules: deleted rc block stays deleted, dev bundles write nothing, protected folders are never opened, 0700 dirs, and bin/ is appended, never prepended.
+- stub.rs:
+  - `commands_of(program)` takes a program's commands from `reroute::TABLE`: `trust` gives targo, trustc, tippy, trustfmt, trustdoc. `pub program_of(name)` maps a command back to its program.
+  - `lay_adoption_stubs` and `reconcile` also lay command stubs. `reconcile` keeps them while the program is wanted and not installed, and sweeps them once it is installed or no longer wanted.
+  - `remove_stub` removes the program's command stubs too.
+  - All three use `write_regenerable`.
+  - The ToolName gate and the marker rule are unchanged, so a file the stub did not lay is never overwritten or swept.
+- cli.rs `pending_state`: a command reports its program's progress row, status row, bump and install name (`atpkg: targo comes with trust: …`).
+- cli.rs `run_pending` / `wait_then_run`: a caller with no terminal now waits too, through `WaitShow::Lines`, while a live pass's progress.json has the program in flight.
+  - Its lines go to stderr, plus `atpkg: targo is being installed (trust NN%)` every 10 s.
+  - It runs the command once the real shim is renamed in.
+  - It gives up after 15 minutes with exit 127 and says so.
+  - Terminal users keep the meter.
+  - `pending_wait_step` and the pass-then-shim read order tied to the AtpkgPendingWait model are unchanged.
+  - Exit codes stay literal, as the exit-code scan in `lock.rs` requires.
+- lay.rs: new `write_regenerable()` does the same temp file, 0755 and rename, but flushes with a plain fsync instead of F_FULLFSYNC. It is used only for pending stubs, their agents/ copies, reroute stubs and the reroute marker. Real shims, installed agent copies, compat re-renders and tombstones keep `sync_durable`.
+- toolchain.rs (not in the brief, needed because of it): the PATH walk now skips an atpkg pending stub. Without this, a `targo` stub on PATH would be picked by an unpinned walk. A pinned walk would run the stub's `trustc --print sysroot` with no time limit and block until the install finished. The check reads the file's first 256 bytes lossily, the same marker check aterm-spec's discovery uses.
+--- clear
+Tests added:
+- stub: command stubs are kept, swept, removed and laid again; they never take a foreign file; no upstream names (cargo, rustc, …) appear in bin/.
+- seed_disabled.rs:
+  - declined config and declined-marker seeds write no ~/.aterm and no rc block;
+  - a consenting seed writes the hooks, the hook appends bin/ and `targo` resolves there;
+  - a deleted rc block is not re-added;
+  - an unattended `targo` waits for a fake pass and then runs.
+--- open
+- Command stubs taken from the signed manifests' `exposes` lists (brief item 3, after the index resolves): skipped. The first reconcile in `install_default_set_inner` runs before any manifest is fetched. Using manifests would mean moving the reconcile behind the network prescan or adding fetches. The table from `reroute::TABLE` covers exactly the names the agent primer tells agents to type (targo, trustc, tippy, trustfmt, trustdoc). Other exposed names such as clean-lsp, ay-maxsat, targo-tippy and cargo-trust-vc get no pending stub.
+--- open
+- Ignored-prefix and disabled-manager cases at the real process level: skipped. Debug test builds compile the dev seams, so a configured prefix is honoured, not ignored. The manager key is compiled in. Both cases are covered by the unit table in adoption.rs.
+--- open
+- After the second merge of origin/main, lint and fmt were not re-run. Free disk dropped to 22 GB, under the 25 GB stop line, so I stopped building. The full atpkg test suite did run after that merge and passed.
+--- open
+- GUI side (bin/ appended in env_add): not done here; that is TC-3 per the plan.
+
+=== round 1, TC-2 review
+--- open
+Still open from the implementer, and still true:
+- Before the update pass first announces, progress.json does not exist, so an unattended targo says 'nothing is installing' and exits 127. TC-5's early row should close that gap.
+- Command stubs come only from reroute::TABLE (targo, trustc, tippy, trustfmt, trustdoc). Names exposed in manifests get none.
+
+=== round 1, TC-3/TC-5 implementer
+--- open
+- TC-5 part (4), a dev-seams switch to run the package lane in a headless instance: skipped. It is optional in the brief. A new seam name has to be registered in aterm-types env_sanitize and in aterm-update-core's env_reads test, and it needs a separate dev-seams build. Without it the lane start time (+55 ms before) and the first visible row time (+7.9 s at HEAD before) were NOT measured end to end. The behaviour is proven by tests only.
+--- open
+- `targo --unverified verify trust` for atpkg and aterm-gui was not run. TC-2 found atpkg narrowed by memory on this 36 GiB host. aterm-gui has 34,938 obligations. Free disk on ~ swung between 21 and 31 GB during the step. aterm-cli was verified: 136/747, floor 75.
+--- clear
+- `contract-probe` was not run: no requires/ensures contract was added.
+--- open
+- The atpkg-side gap TC-2 flagged is not closed. progress.json does not exist before the update announces, so an unattended `targo` in that window still exits 127. The early row is GUI-only.
+
+=== round 1, TC-3/TC-5 review
+--- clear
+Disk: twice I deleted this worktree's own stale debug build cache (<build-cache>/.../aterm-perf-tcseed/.cargo-build/debug, 10 to 13 GB each time). The merges changed aterm-types, so nearly everything was going to rebuild anyway. This kept free space above 25 GB. The next step's first build in this worktree starts from a cold debug cache; the profiling dir was kept.
+--- open
+Open, for TC-8 or the owner:
+1. Nobody has timed the early 'Installing ALab tools' row or the earlier lane start in a real window. A real first launch should log 'atpkg first run: the toolset install row opens ahead of the seed' within milliseconds of start.
+2. TC-2's gap is still open: progress.json does not exist before the update announces, so an unattended `targo` in the first ~8 s still exits 127.
+3. Truthfulness rules for the early row as landed:
+   - A Busy update, or an Offline update that never announced, has its exit carried; the following park withdraws the row with no outcome.
+   - A clean update that never announced withdraws the row with no Complete.
+   - An unclean update that never announced still gives a Fault echo.
+   - An announced update behaves as before.
+4. The login probe now runs once per launch, on its own Background-QoS thread started after the handoff-candidate wait. Only update children wait for it. The seed and machine apply run with the process PATH, and I checked that neither reads PATH.
+
+=== round 1, TC-8 implementer
+--- clear
+- `run_update_pass`, empty-store arm:
+  - The match now also returns the `seed-unusable:` body for `Unserved` and `Narrowed`.
+  - After its stderr sentence it calls `emit_marker_line(&seed_unusable_line(&why))`, so the GUI's `read_seed_markers`/`parse_seed_line` render the same card.
+  - The line is skipped when stdout is a person's terminal, because the stderr sentence already says it.
+  - Exit 2 and the `*toolset*` row are unchanged.
+--- open
+- TC-0 (cutting a release that contains 6b845bd6b): not done. It needs the owner's release credential (`ship release`).
+--- open
+- The edge measured with a real `defaults` apply: not done, for the same reason. I held `machine.lock` from a second process for 300 ms instead of adding a code seam. This is the real first-launch shape now that the window's `machine apply` and the edge share the queue.
+--- open
+- `targo --unverified verify trust -p atpkg`: ran, and was skipped with "NARROWED BY MEMORY". This host cannot verify atpkg; TC-2 hit the same. aterm-cli was not trust-verified; its only change is manual prose.
+--- clear
+- `contract-probe`: not run, because no requires/ensures contract was added.
+--- open
+- No dev-seams `update` measurement: the profiling build compiles out `ATPKG_REGISTRY`, and a real update would download about 1.4 GB. Pass-start for an update was not measured; the seed measurements show the mechanism.
+--- open
+- Not done, possible follow-up: releasing the `machine.lock` queue before `build_cache::reclaim_home` in `cmd_machine apply`, so an edge queued behind the daily apply does not also wait for the cache walk.
+
+=== round 1, TC-8 review
+--- open
+Still open:
+- TC-0 (a release that contains 6b845bd6b) needs the owner's release credential and was not done.
+- In the residual config (Intel, or every vendor program excluded), the window's seed no longer refreshes the card or the `*toolset*` row on a launch where no update is due. The row from the last update stays.
+- On first launch, the seed's exit still waits for the window's `defaults` apply itself, but no longer for the cache walk.
+- Lock waiters now poll 10 times as often (every 50 ms). Each poll is still an lstat, an open and a try_lock, with no writes.
+- The new process test relies on /usr/bin/curl honouring https_proxy. If a call site ever adds --noproxy, the typed half of that test would make a real request.
+
+=== round 1, TC-4 implementer
+--- open
+- The trust floor check for atpkg could not run on this host: REFUSED(memory), "needs more than 16.0 GiB, this host gives 4.5 GiB; 128 GiB of RAM verifies it".
+--- clear
+- contract-probe was not run because no requires/ensures contract was added.
+
+=== round 1, TC-4 review
+--- open
+For TC-6 and TC-7:
+- Case B still spends about 2 s on serial vendor plans before the announcement. That is TC-6's job.
+- The discovery hint and the one-attempt walk HEAD on a connect failure were skipped on purpose (reasons are in the implementer's report).
+--- open
+Open items:
+- atpkg's trust floor is still unverified on this host (memory).
+- Each discovery's index-resolved line takes a Settings Activity tail slot.
+- Disk was at about 24.4 GiB free (about 26 GB) when I finished, close to the 25 GB stop line.
+
+=== round 1, TC-6 implementer
+--- clear, flagged: `Deferred = Skipped`, an enum's names in prose
+crates/atpkg/src/cli.rs:
+- **`vendor_pass`** is now a thin wrapper: `vendor_plan`, then `land_fresh_alone`, then `warm_landed`. Its signature is unchanged, so its existing tests are untouched.
+- **`vendor_plan` (new)** plans every vendor program side by side (`net::fan_out` over `lane::plan_one`) when `fetcher.shared()` allows it.
+  - Installed programs still land one after another, as their vendors moved them, with rows reported on the pass thread.
+  - Fresh programs come back unlanded, as `FreshVendors`.
+- **`land_fresh` (new)** lands each program in turn and notes it on the live progress pass. It writes no status row, and keeps the Deferred = Skipped handling.
+- **`land_fresh_alone` (new)** is the old behaviour: its own `net-starting:`, its own progress pass, rows reported as each program lands, and `fresh_landing_terminal`.
+- **`run_update_pass`**:
+  - Calls `vendor_plan`. It builds a rider only when `complete_the_set` holds, the store is empty, the resolve returned Ok, and there are fresh landings. Otherwise it lands them alone first, as before.
+  - Passes `SetCompanions { vendor, toolchain_flipped }` to the new `install_default_set_beside`. `toolchain_flipped` runs the rustup seam and `reconcile_exec_roots`.
+  - Computes the arrived list before any lone landing, so agents landed alone are not counted twice.
+  - Reports the rider's outcomes on the pass thread: rows, failures delta, resolved assets, and warm (minus what was already warmed). If the set completion never carried the rider, it lands the agents alone.
+  - When nothing arrived, answers with `fresh_landing_terminal(&[], deferred, announced_count)`, so "every announced agent deferred" gives `seed-done`, not `net-failed`.
+- **`install_default_set_with_path`** keeps its signature and wraps `install_default_set_beside` with no companions.
+- **`install_default_set_inner`** now takes `SetCompanions`:
+  - The disk refusal reserves the rider's peak; on refusal the rider is dropped and the agents land alone.
+  - One announcement names the agents first, then the set, with sizes combined (`SignedSizes::and`).
+  - The progress plan includes the agents.
+  - The loop runs inside `std::thread::scope` with an "atpkg-vendor-lane" thread. That thread adopts the lent progress sink and waits on an mpsc gate. The gate opens once no coherence tuple is left in `remaining`, when the pass thread drops it, or on unwind.
+  - The lane thread returns its outcomes and fetch-fault count, joined before the second stub reconcile. If the fetcher is not shared or the spawn fails, the agents land inline after the loop.
+  - The agent-rows block and the first stub reconcile still run before the thread starts.
+--- open, missed: no status word; the item says what doing it would need
+- **Opening the gate when the tuple's archives are in**, not when the tuple has flipped: this needs a hook inside flow's group transaction, which TC-7 (download-ahead) restructures. It would bring the agents (and the pass end) about 10 s earlier.
+--- open, missed: no status word; the item says what doing it would mean
+- **Vendor head reads overlapping the index resolve**: plan decisions need the fresh index's yanks, so this would mean splitting `lane::plan_one`. The plans are now parallel, but still after the resolve.
+--- open
+- **The agents landing two at a time among themselves after the gate**: could shorten the pass end, but it is not done.
+--- open, missed: `still lands`, a gap said with `still` and a verb
+- **The rider for `install_toolset`** (the explicit `install --default-set` verb): it still lands vendors first. Only the update pass, which is the first-run path, changed.
+--- clear
+- **`targo --unverified verify contract-probe`**: not run, because no requires/ensures contract was added.
+
+=== round 1, TC-6 review
+--- open, missed: a hand-over list (`For TC-7`), no head, and `is still vendor-first`
+For TC-7 (download-ahead, next in this chain):
+1. The vendor rider's gate opens in install_default_set_inner's loop once no coherence tuple is left in `remaining`, which is after the tuple FLIPS. Opening it when the tuple's archives are in needs the hook inside flow's group transaction that TC-7 restructures (about 10 s for claude and the pass end).
+2. After the gate the agents land one at a time on the atpkg-vendor-lane thread (rider_land). That tail now sets the first-run pass end, which is about neutral against before (45.9 vs 47.9 s median), and shell hooks are still written only at the pass end. Parallel agent lanes would shorten it but compete with the ALab singletons (GitHub) for bandwidth.
+3. rider_land polls the bump file every 100 ms only while gated; it returns at once when the gate's sender drops.
+4. Two threads now mutate the store under one lock. These paths are serialized or unique: AGENTS_TURN (reconcile_agents and sweep_agents_dir), lay.rs temp names with a per-process sequence, durable stamp writes. status.toml is written only by the pass thread.
+5. `install_toolset` (the explicit `install --default-set` verb) is still vendor-first.
+
+=== round 1, TC-7 implementer
+--- open
+- **Segmented range downloads.** Not done: the audit measured 8 GitHub streams as slower, and the reviewer said to drop them.
+--- open
+- **Moving the resolve checks into `stage_fetched`.** Not done, per the reviewer's correction: the flip-time rollback tests depend on where they abort. The checks are parallel at the flip instead.
+--- open
+- **Pre-warming the trust driver dylib before the flip.** Not done. About 3.5 s of the remaining 2.4 s flip is still trustc's first load of its 380 MB dylib; pre-warming would mean running staged binaries before the flip, which the brief did not ask for.
+--- open
+- **TC-6 follow-ups, out of scope:** opening the vendor gate when the tuple's archives are in, and landing the agents side by side. Their one-at-a-time tail now sets the pass end.
+--- open
+- **A progress phase for "downloaded, waiting for the pass".** Not done. It needs a schema change in both atpkg and aterm-gui.
+--- open
+- **Trust floor for atpkg:** `targo --unverified verify trust -p atpkg` was skipped for memory ("NARROWED BY MEMORY"), as in TC-4 and TC-6.
+--- clear
+- **contract-probe:** not run, because no requires/ensures contract was added.
+
+=== round 1, TC-7 review
+--- open
+Still open, not part of this step:
+1. origin/main fails `verify guards` with [shared-application] in crates/aterm-gui/src/os_appearance.rs:599/:707. It is pre-existing and not from this chain.
+2. The pass end is now set by the agents landing one at a time after the vendor gate (TC-6 follow-ups).
+3. About 2.1 s of trust flip remains, mostly trustc's first load of its 380 MB driver dylib.
+4. The atpkg trust floor was not verified on this host.
+5. A single failed download stops the lane, and the rest of the set then falls back to the old one-at-a-time path. This is correct but loses the speed-up on a flaky link.
+
+=== round 1, TC-1 implementer
+--- open, missed: `did not route`, a choice not to do it, said with a verb no table holds
+- TC-1 is complete. I deliberately did not route lineage.rs::scan_stream's hash (the compiler-admission digests of trustc/targo/librustc_driver) through BulkSha256. It runs only on the relocate/lineage dev lanes, not on install, and it is outside the brief's files. It would be a one-line change later if wanted.
+--- open
+- tc-9's hash-while-downloading was not done. The reviewer's fix_correction says the hardware SHA makes it not worth it: the archive's second read is now about 0.3 s per 744 MB.
+--- open, missed: `could not prove`, `was not re-proved`: no status word holds them
+- `targo --unverified verify trust -p atpkg` could not prove atpkg on this host. It reports REFUSED(memory): atpkg needs more than 16 GiB per library, this 36 GiB host gives 4.5 GiB, and the tool says 128 GiB of RAM is needed. So atpkg's floor (360) was not re-proved here; that needs a 128 GiB host. aterm-digest proved 47/90 against its floor of 46.
+--- clear
+- contract-probe was not run because no requires/ensures contract was added.
+
+=== round 1, TC-1 review
+--- open
+For the next steps (AU-3, AU-2, AU-1):
+- aterm-update-core's sha256_file still uses a `shasum` subprocess on macOS and aterm_digest on Linux. It is the auto-update hash and was not touched here. It is a candidate for the same hardware path if AU hashes large artifacts.
+- atpkg's Trust floor (360) is unconfirmed because it needs a 128 GiB host.
+- I passed a one-off `-c core.hooksPath=/dev/null` on one commit. It did not persist and no config was changed. I did not use it again.
+
+=== round 1, AU-3 implementer
+--- clear
+- contract-probe was not run, because no requires/ensures contract was added.
+
+=== round 1, AU-3 review
+--- open
+For the chain:
+- Free disk is at the 25 GiB limit (25Gi free) because of concurrent chains. AU-2 should check `df -h ~` before building and may need to stop.
+- atpkg's Trust floor (360) is still unconfirmed on this host; it needs a 128 GiB machine.
+- The open risks are listed in review_findings. The main one: session-lane first-run installs now run at utility, the same as the window lane. If the owner's "install IMMEDIATELY" later justifies lifting tc-10's clamp for first-run provisioning, lift it in both lanes.
+
+=== round 1, AU-2 implementer
+--- clear
+crates/aterm-update/src/cadence.rs:
+- Cadence::deferred doc mentions the deferral floor.
+--- clear
+crates/aterm-update/src/github.rs: the FAILING vs "deferred" wording follows `persistent_class()` instead of a raw count. cadence_note doc now says 2 min.
+--- open
+- The live 30-minute headless run with aterm.log gap counts and a PlistBuddy `log stream`/ps count was not done. The checker thread starts only from a non-dev installed .app: spawn_background_check_with_source returns at `bundle::resolve().is_none()`, so a target/ dev or profiling binary never checks. Running it from a scratch .app means real checks against github.com. A dev binary's own build number would make the checker download and stage a real release, and the window's automatic apply lane could then try a handoff that launches a successor through LaunchServices, which risks a window on the owner's desktop. Instead the same quantities were measured through the real code: Cadence::delay_at over all 256 jitter bytes, and the real PlistBuddy reader through the new cache. Both were run from a temporary probe test that was never committed; it is saved at <scratch>/au2/au2_probe.rs, with output in <scratch>/au2/probe1.txt.
+--- open, missed: `is still booked`, a gap said with `still` and a verb
+- A post-wake failure that github.rs books as `pipeline` (the HEAD succeeded, then an asset GET failed) is still booked as pipeline. Reclassifying it would mean threading the wake state into github.rs's booking. The steady-state check is one HEAD, whose failures already book `network`; asset GETs happen only when the head moved; and a single pipeline booking can no longer escalate without the 30-minute span.
+--- open
+- Not done (optional in the brief): posting the GUI's NSWorkspace did-wake, and shortening the 15 s wake-detection slice.
+--- clear
+- contract-probe was not run because no requires/ensures contract was added.
+--- clear, flagged: `aterm-gui is not modified`, a reason nothing needs doing that the reader cannot tell
+- aterm-gui's tests were not run. aterm-gui is not modified; it uses STALE_CHECK_AFTER, PERSISTENT_AFTER and max_interval through fixtures or count-only apply paths.
+
+=== round 1, AU-2 review
+--- clear
+- For AU-1, the next step in this chain:
+  - INTERVAL_SECS is now 120 and WAKE_SETTLE is 3 s. A new WAKE_GRACE (2 min) makes any failed check inside it take the OFFLINE_RETRY rungs, logged at INFO.
+  - Persistence for pipeline/manifest/stage now needs PERSISTENT_AFTER failures AND a PERSISTENT_SPAN (30 min) between the streak's start and the new Health::last_diagnosis_at. apply is still counted only.
+  - A 429 deferral holds the machine off for at least DEFERRED_WINDOW_FLOOR (20 min, which is a 14 min fresh window).
+  - LONGEST_WAIT is 18 min 3 s and STALE_CHECK_AFTER is floored at 4 h.
+  - The per-cycle installed-build reads go through installed_build_observed, a stat-keyed PlistBuddy cache. It is observation only; trust decisions still call verify::bundle_build_number.
+
+=== round 1, AU-1 implementer
+--- open, missed: no status word; the item says what it needs
+- **The launch→dial measurement from aterm.log of a real automatic apply.** It needs a real release to apply plus a windowed successor, which cannot run headless or without a window.
+--- clear
+- **contract-probe.** Not run, because no requires/ensures contract was added.
+--- open
+- **au-4 (launching the successor at arm time).** Not done; its review verdict rejected it.
+--- open
+- **A Windows build.** Not built here. The non-Unix arms were read by eye but not compiled: ExitWait ticks, outputs_until runs children one by one, and the probe/taskpolicy code is macOS-only.
+
+=== round 1, AU-1 review
+--- open
+For the owner and later steps:
+1. main currently fails `verify guards` on aterm-gui os_appearance.rs:707 (+[NSApplication sharedApplication] in `observe`), from 23796fefa. It is not from this chain; the theme chain should fix it.
+2. Still open from AU-1:
+   - Both bundles' helpers are not yet run at once in the boot apply (au-8, second half). The implementer skipped it because reordering prepare would delete a predecessor still waiting on window confirmation.
+   - au-4 was rejected by design.
+   - Windows and Linux arms of ExitWait/outputs_until are uncompiled or unrun here.
+3. Disk dipped to 25.1 GiB free during the merge build, then recovered to about 41 GiB.
+
+=== round 1, CS-1 implementer
+--- open
+- **Real-window numbers, method (b), not measured.** That means `startup_attach_surface_create_ms` and `rust_main_to_first_present_ms`. Opening a window needs the owner's go-ahead, and the alternative is reading the owner's next first launch of a shipped build.
+--- open
+- **`log show` of MTLCompilerService, method (c), not done.** It is only meaningful with a real window.
+--- open, missed: `cannot be confirmed`, no status word
+- **The warm covers exactly the brief's rows.** I did not add CursorBlend, GlowAdd/Bloom or the crown PSOs. The audit's first launch built 7 PSOs and 4 libraries, but which rows the first frame binds cannot be confirmed without a window.
+--- clear
+- **contract-probe not run.** No requires/ensures contract was added.
+
+=== round 1, CS-2 implementer
+--- open
+- **Brief part (3), the windowed GPU drill-down, is not done.** That means making `startup_gpu` valid on the windowed path and bracketing `create_window_surface`.
+  - On the shipped macOS build wgpu is compiled out (the `wgpu_arm` cfg is false). `startup_gpu_*` names wgpu legs (instance, adapter, device, pipelines) that the Metal arm never runs, so `startup_gpu_valid=0` is the correct answer there, not a bug.
+  - A Metal-arm schema plus a bracket inside `create_window_surface` (arm mint vs layer vs callback) can only be checked on a real window, and opening one is forbidden. That is CS-3's territory.
+  - The first-launch surface-create cost was the arm mint, which CS-1 moved to a warm thread. The existing `startup_attach_surface_create_ms` total on the owner's next real launch already shows whether the mint left the attach.
+  - The "first acquire" the brief lists runs on the async acquire worker, so it is not part of the attach at all.
+--- open
+- **The optional microsecond birth field in the recovery ledger is not done.** It needs a compatible Row version bump.
+--- open
+- **No release or profiling build, so all numbers are from debug builds.** Disk ran at 22-30 GB free, against the 25 GB stop rule, and a fat-LTO profiling build needs several GB. The brief's expected ~2-5 ms birth→main for a release exec is therefore unconfirmed. Debug read 8.26 ms on a 205 MB binary.
+--- open
+- **The trust floor check did not verify aterm-gui.** `targo --unverified verify trust -p aterm-gui` returned "skip … NARROWED BY MEMORY — this host cannot verify every selected library". No requires/ensures contract was added, so contract-probe was not run.
+
+=== round 1, CS-2 review
+--- open
+Not done (by design or by rule):
+- Brief part (3), the windowed GPU / create_window_surface drill-down, is CS-3's job, which is deferred and needs a real window.
+- Brief part (4): the outgoing process cannot publish park_to_proof or proof_to_commit, because it _exits at Commit. Instead, the successor's handoff_claim_stamps now carry `commit`, and commit − proof is proof→commit on the surviving clock. No live handoff has exercised this yet.
+- No ledger microsecond birth field (it would need a Row version bump).
+- No release-build numbers. All figures are from debug builds; the brief's ~2-5 ms birth→main for a release exec is unconfirmed (debug reads ~7.4 ms on a 200 MB binary).
+
+=== round 1, NT-1/NT-2 implementer
+--- clear
+NT-1, crates/aterm-gui/src/spawn_folder.rs plus the arms it forces elsewhere:
+- `within` now returns `Option<Option<Fault>>`: the outer `None` means no answer in time, cap full, or no thread could start.
+- New `start_fault` / `start_fault_in`, used by `start_folder`. When a check gives no answer (or the cap is full), it asks `remote_volume(dir)`. A folder on a volume without MNT_LOCAL is Unresponsive; a local folder stands, as before.
+- `mount_table()` on macOS calls `getfsstat(MNT_NOWAIT)`, which asks no file system. It is declared locally (link_name `getfsstat$INODE64` on x86_64), like quit_safety's local extern. Off macOS it returns an empty table, so behaviour there is unchanged.
+- `start_folder_in`: if a folder did not answer and no usable home exists, cwd is None (the PTY default). That folder is never handed to chdir.
+- `StartFolder::say` logs "did not answer". `RowFolders` gains an unresponsive list.
+- message_reporters: KEY_FOLDER_NOT_ANSWERING = "spawn.folder-not-answering" and the verb "reach", giving the row "Couldn't reach the folder / opened in your home folder instead of X".
+--- open
+NT-2, aterm-shell-integration scripts:
+- (1) In zsh and bash, `__aterm_urlencode` and `__aterm_encode_cmd` now assign REPLY instead of printing. Their callers (`__aterm_report_cwd` on every prompt; zsh `__aterm_preexec` and bash `__aterm_preexec_run` on every command, for 633;E) declare `local REPLY` and drop the `$(...)` fork. A user's REPLY is left alone.
+- fish needed no change: its command substitutions of functions and builtins already run in-process (not checked live: fish is not installed here).
+- The brief's `sched +0` was not used: a pty check showed zsh runs sched +0 events after precmd but before the prompt is drawn, so it defers nothing.
+--- clear, flagged: `the unfixed folder`, an adjective
+Tests:
+- New live pty test an_integrated_zsh_whose_rc_broke_the_tty_runs_its_first_command_sane, which uses the unfixed folder as a negative control. Two mutants (repair outside the thaw; no preexec repair) both fail it.
+--- open
+- NT-2 (3), the optional zcompile (.zwc): not done. It would spawn the user's zsh from the spawn path, add files to the content-addressed folder, and depend on zsh's .zwc name and version fallback, which I have not verified. Expected gain is about 1.1 ms per tab, after a build's first tab. Better as its own package.
+--- open
+- NT-1 real-mount smoke run: no SMB/NFS/sshfs mount was available, and creating one (a local WebDAV or SMB server, then kill -STOP) could put a macOS "server connections interrupted" alert on the owner's desktop. So the 10 s + 2 s stall is taken from the constants and was not reproduced.
+--- open
+- The trust lane for aterm-gui did not run: `verify trust -p aterm-gui` was skipped by the tool ("NARROWED BY MEMORY — this host cannot verify every selected library").
+--- clear
+- contract-probe: not run, because no requires/ensures contracts were added.
+
+=== round 1, NT-1/NT-2 review
+--- clear
+- Disk: free space on ~ fell to 23 GB right after the final test run (below the 25 GB rule; it ranged 20-37 GB during the session because of other chains). No build ran after that. The next step should check df before building.
+--- open
+- The fish twin is unchanged and untested here (fish is not installed).
+
+=== round 1, NT-3 implementer
+--- clear
+- (5) Headless event loop at interactive QoS: not done, because main already has it. Commit 5b346bddb calls `qos::set_self(Role::Interactive)` before `run_app` in every instance, headless included. I also found that the PRI 31 the audit saw is not caused by code. A C probe (scratchpad/nt3/qos/q.c) shows that in this launch environment a fresh process's main thread already reports QOS_CLASS_USER_INTERACTIVE (0x21) at pth_priority 31, both before and after pthread_set_qos_class_self_np. So the launch context clamps priority. The brief's pthread_get_qos_class_np test would pass without the call, so I did not add it.
+--- open, missed: `still provisions`, a gap said with `still` and a verb
+- The session picker's "new identity" row (app_session_picker::spawn_with_identity, create=true) still provisions on the UI thread. It is a menu path outside the wire verb named in the brief.
+--- open
+- The trust lane did not verify anything: `targo --unverified verify trust -p aterm-gui` was skipped by the tool ("NARROWED BY MEMORY").
+--- clear
+- contract-probe was not run because no requires/ensures contracts were added.
+--- open
+- The windowed Cmd-T path was not measured, since opening a window is not allowed.
+--- open
+- The verdict mentions a second, unattributed O(N) per-spawn cost (~17 us per tab). I did not look for it.
+
+=== round 1, NT-3 review
+--- open
+Landed as 1d0ee1c08 on origin/main. The worktree <worktrees>/aterm-perf-tab is clean and detached at that commit. Branch perf/tab-nt-3 is deleted; it never existed on the remote.
+For NT-4/NT-5:
+(a) The session picker's 'new identity' row (app_session_picker.rs spawn_with_identity, create=true) still primes on the UI thread, about 40 ms once per new identity. Moving it needs a worker plus a wake back to the loop.
+(b) The audit's second unexplained O(N)-per-tab spawn cost (about 17 us per tab) is still not found.
+(c) The edge sweeper (proxy::start_edge_sweeper) is started from main_entry beside watchdog::start. The script warm is the first thing warm_prologue does when integration is on.
+(d) cmd_spawn now does real work on the control thread before call_main, so the reply latency of `spawn identity=<new>` is still about 37 ms by design; only the event-loop turn shrank.
+Disk on ~ moved between 23 and 30 GB during this step because other chains are building too. The worktree's target/ is about 11 GB.
+
+=== round 1, NT-4 implementer
+--- clear
+New file crates/aterm-gui/src/tab_spawn.rs:
+- `App::open_tab_off_loop`: does only the bookkeeping in the turn. It reserves next_session_id, reads cwd, cell_px and the parent, clones the SessionFactory with `reader_after_install=true`, records an InFlight entry (id, window, when asked, parent, color generation, who waits), and sends the job to one `aterm-spawner` thread (Interactive QoS, FIFO, started on first use). If no thread can start, the job runs in the turn as before.
+- Spawner `run()`: calls spawn::spawn_session unchanged inside catch_unwind (a panic becomes a failed spawn). It then starts the reader and helper threads parked on a closed DeferredReaderGate, using the handoff's own `prepare_deferred_reader`, and posts `Wake::TabSpawned`.
+- `land_tab_spawn` / `install_spawned_tab`, on the main thread:
+  - on success, catches the engine up to colors installed while the tab was in flight, calls install_tab_session (registers it), and only then releases the gate. So the reader's Ready or Exit can never reach the loop before its session is registered;
+  - on failure, posts the existing new_tab_failed row;
+  - if the window closed meanwhile, drops the session; Session::drop stops the parked reader and hangs up and reaps the shell;
+  - then answers whoever waits.
+- `defer_tab_spawn_input` / `settle_tab_spawn_input`: keys, modifiers and IME typed into a window with a tab in flight are held (the pre-Commit queue's set, capped at 512, at most 15 s). They replay in order through window_event once the last tab in flight to that window lands. If no tab lands, only the modifier changes replay; keys are dropped and counted through keystrokes_dropped, never sent to the old tab. A drop or a focus loss clears the window's mods after the replay.
+--- clear
+Other files:
+- lib.rs: `mod tab_spawn`, the `Wake::TabSpawned(Box<..>)` variant and its arm, the `App.tab_spawns` field (2 initialisers), a 3-line hold hook in window_event after the window id is resolved, and a 1-line focus-loss note in window_focus_event.
+- spawn.rs: SessionFactory derives Clone and gains `reader_after_install`, which skips the inline attach_reader. DeferredReaderGate::release is no longer unix/test-only.
+- control_media.rs: spawn_session_aimed takes the reply Sender. A tab goes off the loop with TabSpawnThen::Reply, so the control thread waits and gets OK <sid> once the sid is registered, with raise applied at landing. Splits keep spawn_tab_session. Identity and window resolution moved into resolve_spawn.
+- message_reporters.rs: keystrokes_dropped is no longer cfg-gated, and its doc names this case.
+--- open, missed: `Still spawned in the turn`, a gap said with `still` and a verb
+- Still spawned in the turn: splits, new windows, `tab new` (its reply counts the new tab), session 0 (as the brief says), restore and adoption, the connected presets, and the operator and identity-picker rows that use the sid at once (spawn_tab_session).
+--- open, missed: `still runs`, a gap said with `still` and a verb
+- The inherited-folder check for a held pane (focused_pane_cwd -> spawn_folder::inherited, up to 250 ms, only when another program holds the pane) still runs in the request turn.
+--- open
+- The posix_spawn arm is NT-5's and was not done.
+--- open
+- The stalled-mount case was not reproduced: no SMB/NFS mount is available, and making one could show a desktop alert. The before figure (up to 10 s + 2 s in the turn) comes from the constants; the after side was measured with the hold seam.
+--- open
+- The windowed Cmd-T path was not measured, since opening a window is not allowed. Headless `spawn` goes through the same open_tab_off_loop.
+--- open
+- The Windows build was not compiled: no Windows std is installed here. It needs Session: Send, and its fields look Send but this is unchecked.
+--- open
+- `verify trust -p aterm-gui` was skipped by the tool ("NARROWED BY MEMORY"). contract-probe was not run because no requires/ensures contracts were added.
+
+=== round 1, NT-4 review
+--- open
+Open items, all out of scope:
+- The inherited-folder check (focused_pane_cwd, up to 250 ms for a held pane) still runs in the request turn.
+- Keys typed into a window whose tab spawn is stalled are held for up to 15 s, by design, so they never reach the wrong tab.
+- Mouse events are not held.
+- The Windows build is unchecked.
+- The guards red on main that the implementer reported is now fixed on main (793c1fd7d).
+
+=== round 1, NT-5 implementer
+--- clear
+I did not build the NT-5 posix_spawn arm. On this Mac (Darwin 27) it cannot give the shell a controlling terminal, so every tab would lose job control and Ctrl-C. The branch carries one commit that changes comments only and writes this measurement where the code explains why the PTY child forks.
+--- clear
+What I found, checked with my own C probes before touching any code (scratchpad <scratch>/nt5/: probe.c, probe2.c, probe3.c, probe4.c, probe6.c, ctrlc.c, syms.c):
+- The brief's recipe was POSIX_SPAWN_SETSID|CLOEXEC_DEFAULT|SETSIGDEF(all)|SETSIGMASK(empty), with the slave opened by addopen(0, pts, O_RDWR) and no O_NOCTTY, then dup2 0->1,2. The child does become a session leader (getsid==pid), but it has no controlling terminal. tcgetsid(master) fails with ENOTTY and tcgetpgrp(master) is 0, checked at 0, 50 and 500 ms after the spawn.
+- An interactive zsh started that way: Ctrl-C did not stop `sleep 30` in 3 of 3 runs. The same zsh started by fork + login_tty: tcgetsid and tcgetpgrp both answer its pid, and Ctrl-C works in 3 of 3.
+- python3 and /bin/sleep never get a terminal. /bin/sh (bash) gets one only because bash opens its own tty and takes it. That is why the auditor's check (`/bin/sh -c 'exec 3</dev/tty'`, CTTY_OK) passed: it was a false positive.
+- The parent is not affected: a session-leader parent with no controlling terminal (the Finder shape) still gets ENXIO from /dev/tty in every variant (with or without SETSID, with or without O_NOCTTY).
+- dlsym finds no libSystem posix_spawn hook that could set a controlling terminal (no addtcsetpgrp, addctty or setsessionid).
+- Side facts for anyone who tries again: the parent must keep its slave open across the spawn, or termios and winsize reset to 9600 and 0x0 when the child opens the slave. A failing addchdir_np fails the whole spawn (ENOENT), where the fork path's failed chdir is not fatal.
+--- clear, flagged: `Not run:` whose reasons stand in brackets inside the item
+The whole posix_spawn arm: the decision function, the spawner-thread-only route and the arm in aterm-pty. Reason: posix_spawn on Darwin 27 cannot give the child a controlling terminal (see summary), and nothing in the public SDK or libSystem can. I designed the parts before the ctty probe showed the blocker, and they are not built: a thread-scoped "may block in the kernel" declaration for the aterm-spawner thread, a local-volume gate (getfsstat MNT_NOWAIT) on the chdir target and the exec target so a stalled share cannot hang the spawner without bound, a retry without addchdir_np to keep chdir failures non-fatal, and the parent keeping its slave open across the spawn to keep termios and winsize.
+The brief's tests were not written: tcgetsid/tcgetpgrp==pid, signal defaults, no fds above 2, exec failure gives Err, and the routing test. The first one fails against the proposed arm.
+The brief's spawnfd.rs doc update ("the PTY child is the one forked spawn") stays true. I added the measured reason to it instead.
+Not run: verify trust -p aterm-pty/aterm-uds (comments only, no proof can move) and contract-probe (no contracts added).
+No headless-aterm before/after: no product behaviour changed.
+
+=== round 1, NT-5 review
+--- clear
+What landed is comments only, no behaviour change: the implementer's 6f662fe15, my reword ad7b0f361, and the merges, ending at eee94d0e0 on origin/main. NT-5's posix_spawn arm was not built and must not be: on Darwin 27, posix_spawn's file actions run before POSIX_SPAWN_SETSID is applied, so the shell gets no controlling terminal and loses job control and Ctrl-C. Verified independently. Do not re-propose posix_spawn for the PTY child; the mechanism is now written at crates/aterm-pty/src/unix.rs step (0c) and in crates/aterm-uds/src/spawnfd.rs. The open hazards from NT-4's review are unchanged: splits, new windows, `tab new`, restore and session 0 still fork on the event loop.
+Cleanup:
+
+=== round 1, ST-1/ST-3 implementer
+--- open
+- I did not measure the bounded flush on a live instance. There is no seam to wedge the real writer in a headless aterm, so the paused-writer and wedged-writer tests stand in for it.
+--- open
+- `targo --unverified verify trust -p aterm-gui` ran but skipped aterm-gui: "NARROWED BY MEMORY — this host cannot verify every selected library". The floor is unchecked.
+--- open
+- After the merge, the tests were not re-run. Free disk fell to 24.63 GiB, under the 25 GB stop line, so I stopped building. The merged tree passes `targo --unverified check -p aterm-gui --tests`, and trustfmt --check is clean on the touched files. The full suite and lint passed before the merge.
+--- open
+- Deliberately not done: stall-1's output-latch rework (deferred by the plan) and making `driver_may_type` O(1) (the review said leave it).
+
+=== round 1, ST-1/ST-3 review
+--- open
+FOR THE NEXT STEP (ST-2) AND THE OWNER:
+1. A pre-existing flaky test on main, unrelated to this change: harness_host::tests::exit_watch::a_restored_landing_no_read_reaches_that_crashes_is_relaunched_again fails with "not within 60 s: the restored landing's crash stepped again" in about 1 of 3 full aterm-gui lib runs under load. It passes 5/5 when run alone.
+   - I reproduced the same failure with the tab chain's test binary built from main at 623c96ac3, which has none of this branch (1 of 3 full runs).
+   - It probably comes from main's harness_host changes (accounts-v2-s7, b83be062c, 732e786c9), but I did not confirm the cause.
+   - It may be a lost wake in production code, so I did not delete it. It needs an owner.
+2. Behaviour change, stated in the commit: about_to_wait's body is now booked as the work root `about_to_wait`. So long_turns, max_turn_owner, the strain FREEZE mailbox (400 ms) and the stall watchdog (500 ms debug / 5 s release) now see it. A slow cold restore pass will show up as a freeze. `turns` grows by one per loop iteration. The new main_busy_ms_per_s field is in `metrics`, `metrics percentiles` and `aterm ctl help metrics`.
+3. ST-2 context: per-wake cost at 42 tabs is now about 12 us. During a hidden flood the Output wake count roughly tripled (the reader/main-thread ping-pong), so total main-thread CPU per flood fell only about 10-25%. main_busy_ms_per_s reads 183-402 during such a flood, and that is the number ST-2's latch work should bring down.
+4. On Linux, glibc's localtime_r reads /etc/localtime once per process, so the offset does not follow a system zone change until restart. On macOS the C library reloads the zone when the system announces a change; this was not tested.
+5. Measurement logs are in <scratch>/stall-review/ (scale.txt, plus the full-test*.log and verify*.log files).
+
+=== round 1, ST-2 implementer
+--- open
+- **Windowed measurement:** not run. Headless cannot show window-creation cost, so the multi-window part (cs-miss-restore-pass-stall: about 23 ms per extra window, which is now one window per slice) is untested on real glass, and present/input latency is unmeasured. The code path is there, and the unit test covers the per-window ordering with logical windows.
+--- open, missed: the status is quoted tool output, and `Neither floor is checked` negates
+- **Trust floors:** `targo --unverified verify trust -p aterm-spec -p aterm-gui` ran 52 minutes, all of it still in trustc on aterm-spec. I stopped my own run (trustc and targo, not a trustd), and it reports "NOT RUN … interrupted". Neither floor is checked.
+  - My aterm-spec change is inside a `#[cfg_attr(trust_verify, trust::skip)]` model function.
+  - aterm-gui is unverified, as in the previous step.
+
+=== round 1, ST-2 review
+--- open
+Open items for whoever validates on glass (CS-3-style):
+- Each slice requests a redraw. winit's macOS `cleared` delivers pending redraws before AboutToWait, so expect a present between slices. That stretches total drain time on glass but keeps each turn short.
+- Each extra window's create+attach is still a single slice of about 20 ms or more.
+- The carried window stack is applied after the last slice.
+- A quit inside the drain can reorder the filling window's owed tabs (rare; not fixed).
+--- open
+Not run: the Trust floors for aterm-spec and aterm-gui. The aterm-spec model change sits inside a trust::skip model function, and aterm-gui is unverified.
+
+=== round 1, integration notes
+--- clear, flagged: `I did not run a deinit`, an act avoided, not a check owed
+Cleanup:
+- The worktree <worktrees>/aterm-perf-integrate is removed with --force (it held the vendor/astream submodule). I checked first that it and astream were clean and astream's HEAD was on origin/main. I did not run a deinit, so the shared submodule config is intact.
+- No perf/* branches remain locally or on the remote, and there are no other <worktrees>/aterm-perf-* worktrees or build dirs. Nothing unlanded was found.
+- The shared checkout <checkout> is clean (still at 459bc26ad; untouched apart from fetches). Free disk is 114 GiB.
+--- open
+For the owner:
+1. b04931170/ae19ee5c5 raised floors from a 128 GiB host's facts on a tree from before the chains: atpkg 412, aterm-gui 361, aterm-update 482, aterm-spec 181. On a 36 GiB host, aterm-update reaches 479 even at the facts' own tree. That floor, and the atpkg, aterm-gui and aterm-spec floors, need checking on the 128 GiB host against main.
+2. Still open: an unattended targo exits 127 until the first update writes progress.json (about 1 to 3 s after launch); TC-0 (release, needs the credential); CS-3 (windowed validation).
+3. Also from the step reports, untouched here: claude arrives later on a first run unless someone bumps it (TC-6); splits, new windows and restore still fork on the event loop (NT-4/NT-5).
+
+=== round 1, integration measurements
+--- open
+I took no new latency measurements in this step. Separately, I ran trust proof counts on this 36 GiB host (dev host, light load during the runs): main proved aterm-uds 148/941, aterm-update-core 199/805, aterm-update 479/2689, aterm-gpu 462/3212, aterm-types 468/1709, aterm-shell-integration 34/119, aterm-pty 71/422, aterm-cli 171/885, aterm-digest 47/90. aterm-update at 71ee812a3 proved 479/2625 on the same host. The chains' own before/after numbers were not re-measured.
+
+=== round 2, PKG-1 implementer
+--- open
+- Writing the promise from the window lane in aterm-gui before it spawns the seed: not done. The seed knows everything the lane knows. It holds the store lock and runs within ~20 ms of the spawn, and it writes the promise before laying any stub. This keeps the hot aterm-gui lib.rs untouched.
+--- open
+- Folding aterm-gui's first_run_ahead into atpkg::adoption::first_install_ahead: not done (hot file, a costly GUI test run). The two predicates are identical today. If they drift, the 60 s seed deadline bounds the damage.
+--- open
+- `verify trust`: not run for atpkg or aterm-spec (memory/time on this 36 GiB host, as the brief directs).
+--- clear
+- contract-probe: not run; no requires/ensures contract was added.
+--- open
+- The replay spawns the update right after the seed, so the real window's login-shell PATH probe gap between seed and update was not measured end to end. The window's actual lane was not exercised: no window, by rule.
+--- open
+- I did not check whether the `ty` tier ran inside prove_and_catch_scalar; at least the interpreter tier did.
+
+=== round 2, PKG-1 review
+--- open
+Residual risks, all unfixed and minor:
+- PromiseEnds retires a promise it did not write.
+- Owner liveness is kill(pid,0) only, so pid reuse is bounded only by the 10-minute update promise.
+- aterm-gui's first_run_ahead and atpkg's first_install_ahead are still two copies of one predicate (aterm-gui is not touched).
+- The window's real lane gap (the login-shell PATH probe, up to 5 s) was not measured with a real window; that is by rule.
+
+=== round 2, PKG-2 implementer
+--- clear, flagged: `one was skipped`, an API's description
+- New `Ahead::all_fetched(units)`: true when every archive the lane holds was fetched by it, and it holds archives of each given unit. It is never true if the pass fetched an archive itself, or one was skipped, dropped or failed; only the pass knows when those are in.
+--- open
+- **Waiting for "verified" before opening the gate:** not done on purpose. The gate only schedules bandwidth; verification stays at each archive's stage on the pass thread.
+--- open
+- **`targo --unverified verify trust -p atpkg`:** not run (memory/time), as the brief directs. No other library with a floor was touched.
+--- clear
+- **`verify contract-probe`:** not run; no requires/ensures contract was added.
+--- clear
+- **Agents during the flip.** The agents now land while trust's flip and the singleton stages run: downloads, extract, codesign, and the detached warm, which is the agent's first exec. At this host's load, trust's flip and extract spans did not move (flip span 2.50 → 2.56 s median, extract 6.15 → 6.07 s). On a slower disk or a busier machine the overlap could cost the flip something.
+--- open
+- **Lane count is tuned to this link.** Two lanes were chosen on an ~80-90 MB/s link. On a slow link the two agent downloads split it, so claude alone would arrive sooner. Not measured here.
+--- open
+- **Vendor DNS stalls (pre-existing).** A vendor host whose DNS stalls (lookaside.facebook.com seen unresolvable for ~93 s) caused two outliers:
+  - one run held the whole first run's announcement ~93 s, in vendor_plan's head reads before the announcement; this branch does not touch that code;
+  - one run held the pass end to 107 s, with muse failed.
+  Worth a follow-up to bound vendor head/DNS time on a first run.
+--- open, missed: `could be flaky`, a suspicion with no status word
+- **Flaky aterm-gui test.** `proxy::tests::a_child_that_half_closed_reads_eof_when_the_relay_ends_though_a_copy_survives` failed once (60 s WouldBlock) in the full-cone verify at load ~20. It passed alone 3 of 3 and in a full aterm-gui rerun. It is not touched by this change, but could be flaky under load.
+--- open
+- **atpkg trust floor** not verified on this host.
+
+=== round 2, PKG-2 review
+--- clear
+Cleanup:
+- Removed the worktree <worktrees>/aterm-perf2-pkg with `worktree remove --force`, after confirming the tree and vendor/astream were clean. No submodule deinit was run, and submodule.vendor/astream.url is intact.
+- No other pkg-chain perf2 branch was left. perf2/lag-lag-2 belongs to the lag chain and is still in use, so I left it.
+- I did not touch the shared checkout <checkout>. It is still on main at 459bc26ad, behind origin, which is not this step's concern.
+--- open
+Follow-ups for the owner:
+1. On a slow, link-bound connection the two vendor lanes split the bandwidth, so claude could finish later than with one lane. This is unmeasured. Holding lane 2's download behind lane 1's is the likely fix.
+2. The implementer saw vendor DNS stalls (lookaside.facebook.com unresolvable for about 93 s) delay a first run's announcement, or the pass end, in code this change does not touch. Bounding vendor head/DNS time on a first run is a separate item.
+3. The aterm-gui test proxy::tests::a_child_that_half_closed_reads_eof_when_the_relay_ends_though_a_copy_survives failed once under load around 20 in the implementer's full verify, and passed when rerun. It may be flaky under load.
+
+=== round 2, TAB-1 implementer
+--- open
+- The held-pane 250 ms case was not reproduced: it needs a network mount that stops answering, which is not available here (same as NT-1 and NT-4). On a local folder the check is sub-ms.
+--- open
+- verify trust -p aterm-gui: not run (memory/time on this 36 GiB host). contract-probe: not run, because no requires/ensures contracts were added.
+--- open
+- Windowed Cmd-T and Cmd-D were not measured (no windows allowed). The headless wire paths run the same code.
+--- open
+- Windows build not compiled.
+--- open, missed: `was left to avoid`, no status word
+- crates/aterm-spec models_gui.rs still names install_split_pane in a doc comment. The function still exists as the test wrapper, so the comment was left to avoid touching aterm-spec.
+--- open, missed: `still creates`, a gap said with `still` and a verb
+- Picker new-identity tab row: the identity is now made on the spawner. A creation failure still posts new_tab_failed("identity <name>: ..."). The window row still creates the identity on the UI thread.
+--- clear, flagged: `are in skipped`, the report's own section
+- New windows (including connected place=window), session 0 and restore still fork in the turn; reasons and numbers are in skipped.
+--- open
+- The held-pane 250 ms case (a dead network mount) was not reproduced; only local folders were measured.
+--- open
+- Windowed Cmd-T and Cmd-D were not measured.
+--- open
+- Windows build unchecked. Only PaneFolder (String + bool) and an Option<SessionId> newly cross to the spawner; the Run closures stay on the main thread.
+
+=== round 2, LAG-1 implementer
+--- clear
+- `DocumentHostRuntime::new()` (the test App) still opens synchronously. New `DocumentHostRuntime::opening()` is for the running App. Both go through the new `with_journals`.
+--- clear
+- **Pre-main:** nothing aterm owns explains birth→main, and nothing differs between launches.
+  - What remains specific to aterm is about 2.4 ms with the launcher busy: aterm at 6.2 ms against a trivial binary linking the same frameworks at 3.8 ms.
+  - That is the 51 MB unstripped profiling binary's load and its old-style LC_DYLD_INFO lazy binding. It is not representative of the stripped release, so I did not pursue it.
+--- clear
+- **zsh (compinit, zcompdump, history):** with the launcher state equalized, warm and cold zsh-to-prompt are the same. With an empty .zshrc, compinit never runs.
+  - The headless first prompt is set by session0's spawn plus zsh startup, both before the phases changed here, so the prompt did not move: 28.75→28.45 cold, 27.29→27.37 warm.
+--- open
+- **NSWorkspace accessibility read (`install_preferences` in the app phase):** now about 3–4 ms on the UI thread. It used to cost 1.3 ms, hidden behind the join. Not fixed.
+  - It is not the tricks worker: delaying that worker 30 ms, or running it at Responsive or Housekeeping, leaves the wait unchanged at about 3.2–4.4 ms.
+  - Moving it off the UI thread or after ready touches AppKit threading and needs windowed validation, which is not allowed here. Left as a lead.
+--- open
+- **No windowed (CS-3-style) numbers:** windows are not allowed. The improvement shows in ready-for-winit, which gates the window, but the windowed launch was not observed.
+--- open
+- **Headless only.** The windowed ready-for-winit to first present was not observed. The NSWorkspace wait may behave differently on a windowed launch, where NSApplication has already started.
+--- open
+- **Warm app phase grew by about 3 ms.** The UI thread's NSWorkspace accessibility read now waits until about 10 ms after GUI entry. It used to sit behind the join at about 13 ms. The overall total still improved; the cause is unidentified.
+
+=== round 2, LAG-1 review
+--- open, missed: a hand-over list (`For LAG-2`), and `No … numbers were taken` reads as a negation
+For LAG-2 and later steps:
+1. Use <scratch>/r2/lag-lag-1/tools/cold_eq.py for cold/warm comparisons. The original cold.py mixes the warm launch up with the launcher's 1.5 s idle settle.
+2. Open lead: the NSWorkspace accessibility read in install_preferences (app phase) now waits about 3-4 ms on the UI thread in warm launches. It needs a fix that is validated in a window.
+3. Pet commands typed in roughly the first 10-30 ms after launch classify as nothing until the vocabulary lands. This is by design, and nothing out of process types one that early.
+4. No windowed (CS-3-style) numbers were taken.
+
+=== round 2, LAG-2 implementer
+--- clear
+- That gap is in the event loop's drain, inside `mpsc::Receiver::try_recv`. When a sender has reserved a slot but not finished writing it, the receiver spins briefly and then calls `thread::yield_now`.
+--- open, missed: `not removed`, `out of scope`: no status word
+- **Residual 4–8 ms turns, not removed.** A /usr/bin/sample shows them inside handler bodies, off-CPU, with no blocking frame: the main thread being preempted.
+  - In this measuring environment the QoS ceiling is DEFAULT. `ps -M` shows every aterm thread at 31T, the main thread included, after it sets USER_INTERACTIVE. A python child of the same shell does the same.
+  - So the main thread competes with the PTY readers and `seq` at equal priority. Fixing that means changing thread roles: out of scope and risky.
+  - About 6 ms in 9 s was the main thread waiting on CoreFoundation's own run-loop lock (taken by senders in `CFRunLoopSourceSignal` / `CFRunLoopWakeUp`). Coalescing those signals would break the guarantee that a held lock is always followed by a wake, so I left it.
+--- open
+- **Windowed (AppKit) loop:** no window was opened, so it was not validated on glass.
+--- clear, flagged: `unchanged`, `untouched`, a reason nothing needs doing that the reader cannot tell
+- **Trust for aterm-gui and aterm-spec:** not run (memory/time). aterm-gui library code is unchanged (only a test file and SPECS.md); aterm-spec is untouched.
+--- open
+- **623c96ac3 with the test fix applied:** not run under the lib loop. The forced-straddle experiment is the deterministic evidence instead.
+--- open
+- **Push / merge to main:** not done, per the brief.
+--- open
+- **Windowed AppKit drain was not validated on glass.**
+  - It now stops when a sender holds the lock, and relies on that sender's CFRunLoopWakeUp, which comes after its push.
+  - The drain runs in the BeforeWaiting observer, where CoreFoundation has unset its ignore-wakeups flag. My reading of CF is that the wake is honoured, but no window was opened to observe it.
+  - The headless loop uses a shared version-0 source whose signal persists. It is covered by the passing headless_event_loop integration test and the stall runs.
+--- open
+- **The measuring environment clamps QoS to DEFAULT.** Every aterm thread runs at priority 31, the main thread included.
+  - So the remaining 4–8 ms spikes (equal-priority preemption) are probably worse here than in a LaunchServices-launched window. I did not check whether such a window is clamped too.
+  - The yield/depression mechanism I removed affects a window just the same, but its size there was not measured.
+--- open
+- **Worktree** is left for the reviewer: clean, branch not pushed.
+
+=== round 2, LAG-2 review
+--- open
+AppKit loop:
+- The windowed drain was not validated on a real window (no windows were opened).
+--- open
+Still open, for whoever measures next:
+- The 4-8 ms equal-priority preemption spikes the implementer found remain. In this environment QoS is clamped, so every aterm thread runs at priority 31.
+- CoreFoundation run-loop lock waits of about 6 ms per 9 s flood also remain on the main thread.
+
+=== round 2, integration notes
+--- clear
+Nothing needed fixing forward, so this step made no commit and no push. The verified tree is 0027ef2a6. During the review origin/main moved to 8ae999227: 36 commits from other sessions (document-save fixes in app_documents.rs, a sudo relay in lib.rs, devendor/fonts). None touches chain code: the JournalSlot, tab_spawn, the promise and the rider are unchanged. They were not re-tested here.
+--- clear, flagged: `landed … follow-ups`, follow-ups done
+Other sessions landed source-only follow-ups on chain code, built and tested for the first time by this run, all green:
+--- open
+Open, unchanged from the chain reports:
+- the windowed AppKit drain and windowed Cmd-T/Cmd-D are not validated on glass;
+- the NSWorkspace read is about 3-4 ms in the warm app phase;
+- the two vendor lanes may split a slow link;
+- vendor DNS stalls on a first run;
+- new windows, session 0 and restore still fork in the turn.
+
+=== round 3, DONE-1 implementer
+--- clear, flagged: a description of the done check, listing its words
+- `DONE_CHECK` (the typed done check) is now an exacting instruction. It tells the agent to do every open item, skipped check, follow-up and next step it can still do itself, and verify it (build, test, measure, commit and land). It replies  on a line by itself only when everything left needs a person (a credential, a decision, physical access) or cannot be done on this host, each item named with its blocker. A slow check is not a blocker.
+--- clear, flagged: a description of this detector, listing its words
+- New `open_work(tail)`: a conservative detector over the report tail. It finds:
+  - a head at the start of a sentence (Still open, Left:, Remaining, Next steps, TODO, Follow-ups, Not done, Open items, …) with an item that is neither negated (none, nothing, no, n/a, 0) nor blocked (owner, credential, blocked, this host, decision, trade-off, …);
+  - or a status word (not run, skipped, not tested, …) that is not negated in its clause and is not a description (`do not run`, `is skipped`).
+  - It also joins rows Claude Code wrapped, ignores code in backticks, and lets a bracketed qualifier that names a blocker clear the head.
+--- clear
+- Primer v20 (v18 before this change). It defines a finished job: every part the agent can still do is done and verified (built, tested, measured where numbers were asked for, committed and landed); what remains needs a person or cannot be done on this host, each item named with its blocker; a slow check is not blocked; a deliberate trade-off is a decision stated with its numbers. It says a report that lists open work the agent could still do is not finished, and describes the one challenge.
+--- clear
+- Concurrent commit d92d817dc on main had shipped a different primer v19. Its text said a report naming "a question for someone, a next step" carries no token, so a job whose last item is the owner's could never end.
+--- open
+- **Push and land:** not done; the brief says an adversarial reviewer lands this branch. The worktree is left in place for them.
+--- open
+- **Release-build cost of the detector:** not measured, because the aterm-agent lib test target does not build with `--release` (`aterm_tempfile::stand_in` is missing there, E0425). The debug-build number is reported as an upper bound. This was an extra measurement; the brief asked for behaviour, not latency.
+--- clear
+Not changed, as decisions:
+- **The challenge names the matched phrases from aterm's own table (for example "still open"), not the screen's lines.** The brief asked to quote the matched lines. I did not, because of the module's 2026-10-08 ruling that no act types screen text: worker text typed back would carry the person's authority.
+- **The challenge goes at the point, ahead of the back-off:** 0 s instead of the 2 min the done check waits after real work. It is bounded to one per job, so there is no run of nudges for the back-off to slow.
+- **`docs/DESIGN-harness-autopilot-2026-10-15.md` still quotes the old done-check text.** It is a dated design record, not a page that teaches agents.
+--- clear
+- **The detector is a heuristic.**
+  - It can miss open work worded outside its tables (for example "The lexer is still open." mid-sentence). The cost of a miss is the old behaviour: the token ends the task.
+  - It can also flag a report whose remaining item names no blocker word it knows (for example "Next steps: cut the release when you're ready"). The cost of a false find is one challenge per job, never a loop.
+  - No blocker, owner decision or hardware stands behind this; it is the stated trade-off.
+
+=== round 3, DONE-1 review
+--- clear
+Decisions left as they are, with their reasons:
+- `challenged` lasts until the task ends, so a person's turn in the middle of an unfinished, already-challenged job does not re-arm the challenge. The model has the same rule. A miss here costs only the old behaviour.
+--- open, missed: `only with the next release`, `was not touched`: no status word
+What the owner holds:
+- Primer v20 reaches this machine and the public tier only with the next release, which needs the owner's release credential and direction.
+- ~/.claude was not touched.
+
+=== round 3, PKG-3 implementer
+--- clear
+- **Deviation from the brief:** I did not retire at the NoChannel return when agents land alone next. A waiting claude stub would then read a live pass with no row and no promise, and be told "no longer part of the default set" (or "nothing is installing") just before claude is planned.
+  - Instead `land_fresh_alone` takes a new `promised` flag. Only the call site where the set completion stopped before carrying the agents passes true, and there their plan retires the promise. The empty-store/index-failed call site and `vendor_pass` keep a plain plan.
+--- open
+- **`verify trust -p atpkg`:** ran, and the lane skipped it with "NARROWED BY MEMORY" on this 36 GiB host. Blocker: hardware (the log names the RAM that can run it).
+--- open
+- **`verify trust -p aterm-spec`:** not run. The brief assigns it to the integration step (about 52 min).
+--- clear
+- **contract-probe:** not run, because no requires/ensures contract was added.
+
+=== round 3, WIN-1 implementer
+--- clear
+- `install_spawned(done, os)` replaces `install_spawned_tab` in production; `install_spawned_tab` is now a cfg(test) wrapper with the inert arm. Changes:
+  - New rule: once the loop is exiting, nothing lands, tab or window. The session drops and the waiter hears QUITTING. Without this, a window landing during exit would also have overwritten the quit's layout capture.
+  - A Window place skips the "window still open" check.
+  - Admission is checked with host None for windows.
+--- open
+- Glass timing for a new window (first present, and the cost of the OS window and GPU surface attach, which still runs in the landing turn on the main thread as AppKit requires) was not measured. Blocker: it needs a real window, and the owner's rule forbids opening one on this desktop. Headless keeps the window logical, so the A/B isolates the spawn the brief targets.
+--- open
+- The Cmd-N key hold was not exercised with real OS key events through a real window. Blocker: the same no-windows rule, and headless delivers no winit key events. It is covered by unit tests through the production defer/settle code and the winit-id mapping, each with a negative control.
+--- open
+- Windows build: not compiled. Blocker: `verify cells` skips cell win (x86_64-pc-windows-msvc) and win-arm because no rustup toolchain on this host has their std. The fix it names, `rustup target add`, modifies ~/.rustup, which this brief forbids touching.
+--- open
+- Trust: `verify trust -p aterm-gui` ran and reported NARROWED BY MEMORY. aterm-gui needs more than 17.3 GiB of verifier memory; this 36 GiB host gives 4.5 GiB; 128 GiB of RAM verifies it. aterm-spec trust was not run (about 52 min; per the brief the integration step runs it). The aterm-spec change is one comment line, and its full test suite passed.
+--- clear
+- contract-probe: not run, because no requires/ensures contract was added.
+--- open
+- The window_routing gate printed "Tier-1 conformances discharged by the in-process interpreter"; whether the external `ty` binary tier also ran was not checked separately.
+--- open
+- The surface-failure rollback and the replay into a just-attached window were only exercised through the inert OS arm. A real attach_os_window failure, or real AppKit focus ordering for the replayed keys, was not exercised. Blocker: the owner's no-windows rule. Replay into a just-attached window does not depend on OS focus; dispatch_hw_key has no focus gate, as NT-4's tab replay relies on too.
+--- open
+- Windows build unchecked. Blocker: no x86_64/aarch64-pc-windows-msvc std on this host, and `rustup target add` would modify ~/.rustup, which this brief forbids. Only plain data (WindowId, Option<WindowId>, String, bool) newly crosses to the spawner, and the reader attach off unix uses the same path as tabs.
+
+=== round 3, WIN-1 review
+--- open
+Residuals, each with its specific blocker:
+1. Glass timing (first present, and the cost of the OS window and GPU surface attach in the landing turn) is not measured, and real OS key events and AppKit focus ordering through a real window are not exercised. Blocker: the owner's no-windows rule.
+2. The Windows build is not compiled. Blocker: `verify cells` skips win and win-arm because this host has no x86_64- or aarch64-pc-windows-msvc std, and `rustup target add` would modify ~/.rustup, which the brief forbids.
+3. aterm-gui is not Trust-verified. My run reported NARROWED BY MEMORY; the implementer's run named a 128 GiB host. Trust for aterm-spec is assigned to the integration step by this brief; its only change is one comment line in derive/models_gui.rs.
+4. contract-probe does not apply: no requires/ensures contract was added.
+5. The ExitIffEmpty decision is in review_findings, with its numbers.
+--- open, missed: a gap stated as pre-existing behaviour (`is not held`)
+Pre-existing, unchanged, and shared with Cmd-T: on macOS the native menu's key equivalent reaches the app as Wake::MenuAction. The menu callback has no App access, so it posts a wake, and a key typed before that wake is processed is not held.
+--- open
+Not re-run here: restore, adoption and session 0 still spawn in the turn, as round 2 decided with measurements. That is outside WIN-1.
+
+=== round 3, SPARE-1 implementer
+--- clear, flagged: `L6 with AdoptCheck skipped`, a negative control's description
+Negative controls, each failing as expected:
+- L6 with AdoptCheck skipped;
+--- open
+Decisions, not blocked:
+- The first-launch (fl2.py) measurement was not run. No atpkg or first-launch code changed, and a headless instance with no person never spawns a spare. Cold start was measured twice instead (n=10 each).
+- The U7 QoS band test and the QoS lift were removed. exec resets priority: pri 31 whether the fork came from a utility thread or a user-interactive one.
+- contract-probe was not run because the diff adds no requires/ensures.
+- Moving proxy::publish_session's disk write off the loop was not done. It is main's code on every spawn path, outside this step; the numbers are in the design doc.
+--- open, missed: no status word; the gap is said with its numbers and a `Blocker:`
+- Adoption landing turn: in run 2 its p50 is 1.35-1.46 ms against 0.88-0.94 ms for a cold landing. That is within the 1.5 ms bound, and in run 1 the two were equal (0.28-0.35). Probes put 1.00-1.06 ms of it, and 0.66 ms of a cold landing, in proxy::publish_session: the discovery graph entry written to disk on the main loop for every tab. Blocker: that write is main's shared code on every spawn path, outside this workflow step; the numbers are in the design doc for whoever moves it off the loop.
+--- open
+- Trust: aterm-core, aterm-gui and aterm-spec are not verified against their floors. Blocker: this host has 36 GiB of RAM, and the tool needs 37, 128 and 62 GiB.
+--- open
+- Windowed present latency is not measured. Blocker: the rule never to open a window on the owner's desktop.
+
+=== round 3, SPARE-1 review
+--- clear
+Decisions, not open items:
+--- open
+Blockers carried from the implementer (still true):
+- fish has no spare: fish is not installed on this host, and installing system software is outside the scratch-only rules.
+- Linux and Windows have no spare: no such host here.
+- Windowed present latency is not measured: the rule is never to open a window on the owner's desktop.
+
+=== round 3, LAG-3 implementer
+--- clear, flagged: `the brief said fish only if installed`, a reason nothing needs doing that the reader cannot tell
+- **fish:** not measured or changed, because fish is not installed on this host. The brief said fish only if installed. Its script is written as before.
+--- open
+- **The 9 ms reply on a quiet host was not observed directly.** Blocker: the host never went quiet.
+  - An automatic waiter watched for 2 h for 20 s of load under 1.8 with no compiler running. It never fired: other chains' trust runs kept 2–6 cores busy.
+  - The mechanism was shown instead by forcing the instance onto the E-cores (8.4 ms).
+--- open
+- **Windowed checks were not run:** the first frame, the attach-time read, and whether a LaunchServices-launched aterm escapes this harness's QoS cap. Blocker: no windows on the owner's desktop.
+--- open
+- **Windowed launch not observed.** The attach-time read, the first present, and whether a Dock-launched aterm escapes the default-QoS cap seen in this harness are unchecked. Blocker: no windows on the owner's desktop.
+
+=== round 3, LAG-3 review
+--- open
+**What each skipped item is blocked by**
+--- open
+- **Windowed and LaunchServices launch:** not run, because of the rule against windows on the owner's desktop. This covers the first frame, the read at window attach, and whether a Dock-launched aterm escapes the QoS cap.
+--- open
+- **aterm-spec trust:** not run here, because LAG-3 did not touch that crate; its ~52 min run belongs to the integration step.
+
+=== round 3, LAG-4 implementer
+--- open
+- **aterm-gui trust:** `verify trust -p aterm-gui` ran and was skipped as NARROWED BY MEMORY. It needs more than 17.3 GiB of verifier; this host gives 4.5 GiB.
+--- clear
+- **contract-probe:** not run, because no requires/ensures contracts were added.
+--- open
+- **I left trustd's crash state marked dirty, then recovered it.** I stopped my own first winit trust run partway through (TaskStop), and the next run refused with COULD NOT RUN.
+  - `pgrep -alx 'trustc|rustc|ay|trust-wp.*|targo.*'` exited 1, meaning no solver process was alive on the host.
+  - I then ran the recovery command the tool printed (`trustd --recover-after-crash --confirm-no-solvers`), and later trust runs passed.
+  - Another chain's trust run started between about 13:47 and 13:53 would have seen COULD NOT RUN and needs a re-run.
+--- open
+- **(b) is diagnosed only under this harness's cap.** The fix is the normal launch's thread ordering (main 47, session threads 37). It is unobserved for lack of a window.
+
+=== round 3, LAG-4 review
+--- open
+The brief, item by item:
+- (b) Diagnosed, not aterm's code. The slow round trips are spent with the main thread runnable but off the CPU. Under this harness every aterm thread is capped at priority 31, and the busy main thread decays below the session threads while the host is overloaded (load above 14 on 14 cores). Whether a normal Dock launch (main thread at 47) is free of the spike is still unobserved. The blocker is the rule against opening windows on the owner's desktop: a launchd job, the only no-window substitute, was itself capped at 20.
+- (c) Done. The identity check now runs on the spawner before the fork, for both connected spawns and the wire `@<sid> spawn`. The real gain is on a network volume that stops answering, which can't be reproduced here because this host has no network mount. On local disk the moved check costs 4.5-5.6 us.
+- (d) Done. The double operator Start is closed on main by 6b64b8976. The floors.tsv note was dropped on a floor raise, which needs no reason, and git keeps the history.
+
+=== round 3, integration notes
+--- open, missed: a bare head; its items are the excerpts after it
+**Left open, each with its blocker:**
+--- open
+- aterm-spec Trust: memory fits (peak 2.1 GiB), but the lane's verdict is COULD NOT RUN (clock), with 120 proved against a floor of 181 and 148 obligations timing out. The counts are identical at load ~1 and ~20, so it is not load. Per obligation the toolchain gives 5000 ms (the pinned seal 321aaeda7), and no lane option changes that. Floors are not a gate under the owner's 2026-10-16 ruling.
+--- clear, flagged: `the brief forbids touching ~/.claude`, a reason nothing may be done that the reader cannot tell
+- This machine's ~/.claude/CLAUDE.md still carries primer v16 (`aterm agents status`: stale), while 0.105.0 ships v21 with DONE-1's exacting definition of a finished job. I did not run `aterm agents install`, because the brief forbids touching ~/.claude. The aterm window rewrites the block at its next session spawn, and that command does it at once.
+
+=== round 3, integration measurements
+--- open
+- **Chains' own numbers.** I re-measured none of them except where their reports' claims crossed chains:
+  - LAG-3's headless app-phase gain no longer applies in headless: 6d3b0293f (another agent) gates the accessibility warm to windowed launches, and headless never reads AppKit (probe_preferences &= !headless). So that gain is now a windowed-only effect, and windowed timing is unmeasured because of the no-windows rule.
+
+=== round 1, measurement report
+--- clear
+- The package lane, which does not run headless.
+--- open
+These figures exclude the time the check itself takes. Wake behaviour was not measured across a real system sleep.
+--- open
+## What did not improve
+- **10-tab stall ceiling:** `max_turn_ms` is still about 10 ms in both arms, owner `user_event`. I did not track down which turn it is; it may be one of the harness's own `ctl send/key/await` requests.
+- **Opening 10 tabs back to back:** about 2 ms slower to all prompts (55.8 → 57.8 ms).
+- **`spawn` reply latency:** unchanged. It still waits for the session to be registered.
+- **Warm relaunch:**
+  - Socket and watchdog times are unchanged.
+  - AFTER's warm launch is slower than its own cold launch: prompt 43.4 vs 38.4 ms, and birth-to-main 14.5 vs 10.3 ms. I did not find the cause.
+- **claude** finishes about 1.3 s later on a first run (22.9 → 24.1 s, ranges overlap). That is TC-6's deliberate trade-off.
+- **Background stage:** about 500 ms longer on the background thread, which nobody waits on.
+- **Early `targo`:** before the update announces itself, an unattended `targo` still exits 127. In the replay that window is the first 1.6–2.5 s.
+--- open
+## Not measured, and why
+- **Present percentiles, first present, CS-1's shader warm:** headless never presents (`n_present`=0), and opening a window on the owner's desktop is not allowed.
+- **The window's time before the lane starts and its early "Installing ALab tools" row:** these happen in the GUI. The replay starts at the seed's spawn. In the code, main opens that row before it spawns the seed, and 0.104.0 ran the login-shell PATH probe before its seed; neither was timed here.
+- **A full successor handoff to a real new release, and wake across a real sleep:** these need a published build and a windowed session. Only the AU-1 pieces above were measured.
+- **A truly cold page cache:** needs `sudo purge`.
+- **`--published-index-hint`:** not passed in the replay.
+
+=== round 2, measurement report
+--- clear
+Round 2 brought three clear gains:
+- **Early `targo`:** a script that runs `targo` in the first second now gets the real `targo` (exit 0) instead of 127.
+- **Main thread:** the turn that blocked it on every split, `tab new`, connected tab and 10-tab flood dropped from about 9–10 ms to about 1 ms.
+- **Cold start:** cold "ready for winit" fell 41% (30.0 → 17.6 ms). The first prompt did not move.
+--- clear
+These did not move:
+--- open
+## What did not improve
+- **Trust flip and `targo` usable:** about −0.8 s at n=3, but the ranges overlap; pooled n=6 it is −0.26 s and −0.33 s. I claim no change.
+- **claude done:** −1.3 s, ranges overlap. One round-2 run took 26.3 s, because claude's own download took 10.7 s in that run.
+- **Cold and warm first prompt:** unchanged in both methods (zsh sets it after session0).
+- **Unchanged times:**
+  - the control socket;
+  - birth to main;
+  - spawn → prompt (about 37 ms);
+  - `spawn` reply (about 9 ms at low load, about 3.3 ms under load);
+  - opening 10 tabs (55.6 → 55.75 ms);
+  - flood wall time.
+- **Warm app phase:** +3 ms (the NSWorkspace read moved there, as LAG-1 reported). Warm ready is still better on net.
+- **Round-1 method's warm launch:** birth to main is still 14 ms warm against 9.4 ms cold. With the launcher equalized both are 6.4–6.7 ms, so this is the harness, not aterm.
+- **One round-2 stall run:** a single status-probe spike of 22.4 ms at load 18, while that run's `max_turn_ms` was only 4.74. Observed, not explained.
+--- open
+## Not measured, and why
+- **New window:** refused headless, and windowed runs are not allowed. Windowed Cmd-T/Cmd-D, the AppKit drain, first present, present percentiles and shader warm-up are also out, because headless never presents.
+- **The GUI's time before the seed and its "Installing ALab tools" row:** these happen in the window. The replay starts at the seed's spawn. `--published-index-hint` was not passed.
+- **Auto-update:** not in this round's list, and no round-2 chain touched it. Not re-measured.
+- **A truly cold page cache:** needs `sudo purge`.
+- **Integration finding 1 (a target with no channel, such as an Intel Mac):** not reproducible on this arm64 host.
+- **No code changed, no commits, and no tests or `verify` checks were run** in this step.
+- **Sample sizes:** first launch is n=3 per arm (6 pooled) and network-bound. Treat differences smaller than about 1 s there as noise.
+
+=== round 3, measurement report
+--- open
+The measurement step is finished, but I'm not marking the job done. I found one new main-thread block on first launch and handed it back unfixed.
+--- open
+The block is a 3–5 ms turn that round 3's main has and round 2 didn't. I traced it to its cause but didn't fix it, because a fix is a code change and this step only measures. Everything I measured and the cleanup are complete.
+--- open
+The headless app-phase gain (5.0 → 0.5 ms) is not LAG-3's accessibility warm. It comes from 6d3b0293f, which keeps headless startup off AppKit and is not in c533f0968. LAG-3's warm now only acts on windowed launches, which are unmeasured.
+--- clear
+## What did not improve, and why
+- **codex done is 1.35 s later** (20618 → 21969 ms, ranges disjoint). This is PKG-3's decision (f): claude gets the whole link, and codex's bytes wait behind it.
+- **Script-driven `claude --version` returns 11 s later** (8.9 → 20.1 s). This is PKG-3's decision (a): an unattended caller waits for the toolchain rather than delaying it by 8 s.
+- **Within noise:** trust flip (−0.39 s), `targo` usable (−0.39 s), update exit (−0.18 s), last ALab (−0.44 s). The ranges overlap.
+- **Unchanged:** unattended early `targo` (exit 0 at the moment the shim lands, about 15.2 s), the control socket, birth to main, connected, cwd and held spawns (all cold by design; only the shell-start gain shows), and stalls.
+- **Small rises:** config_join is +0.3–0.4 ms (the warm overlaps the config worker, as LAG-3 measured), and the `arm` phase is +0.2 ms.
+--- open
+## Regression: a 3–5 ms main-thread block on a fresh install's first launch
+- **What happens:** round 3 has a 2.68–4.76 ms `user_event` turn on a fresh root, about 14–18 ms after start. It shows in 7/8, 9/10 and 10/10 idle-launcher runs and in 4/12 equalized ones. Round 2 has none (0.33–0.40 ms), and warm launches have none.
+- **Cause, proven by A/B on the round-3 binary:**
+  - On a fresh root, the document journal's open thread (`aterm-journal-open`) mints its key with `sync_all`, which is `F_FULLFSYNC` on macOS. `crates/aterm-gui/src/durable.rs` itself says this stalls the whole volume.
+  - Round 3's main thread writes log lines (the new AI "not installed" entries from 1b2685414d) inside that window. Every synchronous write it makes then waits until the flush finishes.
+  - Round 2 minted the same key but wrote nothing on the main thread in that window.
+- **Evidence:**
+  - `[ai] enabled = false`: 0.36–0.47 ms (8/8 runs).
+  - Journal key copied in beforehand, so nothing is minted: 0.35–0.47 ms (10/10).
+  - Default: 3.06–4.76 ms.
+  - A temporary probe build (never committed, reverted) showed the blocked wake using 46–102 µs of thread CPU over 3.5–4.6 ms of wall time. A 1 ms sample caught the main thread inside `write(2)`, with `aterm-journal-open` in `sync_all` at the same moment.
+- **Impact:** once per install, before session0's prompt. The cold prompt is still 3 ms faster than round 2. The underlying hazard is wider: any synchronous `aterm.log` write on the main thread waits out any `F_FULLFSYNC` on the volume, whether aterm's own or another process's.
+- **Not fixed here:** this step is measurement only. The fix is a change to the logger design: main-thread log writes going through a writer thread, the pattern `messages_store` already uses. This needs to be scheduled as its own piece of work.
+--- open
+## Not measured, and the blocker
+- **Windowed effects:** first present, present percentiles, the real Cmd-T drain and LAG-3's windowed accessibility warm. Blocker: the rule against opening windows on your desktop. Headless never presents (`n_present=0`).
+- **Auto-update speed:** the updater only checks or applies from an installed, signed copy; dev and disk-image copies refuse at once. The only installed copy is your live `/Applications/aterm.app` (0.105.0), and measuring there would change your install. Blocker: your install, and your decision to use it.
+- **A truly cold page cache:** needs `sudo purge`. Blocker: your credentials.
+- **DONE-1:** it is not a speed change, and this step's list does not include it.

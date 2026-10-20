@@ -1,0 +1,11 @@
+# claude-code 2.1.268 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the same after `down`: no pointer drawn · `README.md` now highlighted in colour only, the text unchanged; Enter after `down` completed the entry instead of sending (MEASURED on `read @no` → `❯ read @notes.txt`)
+ ▐▛███▛█   Claude Code v2.1.268
+▝▜██████▀  Opus 5 (1M context) · API Usage Billing
+  ▝▝ ▝▝    /private/tmp/at.XoY0/proj
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ and @RE
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  + README.md
+  * Explore (agent) – Fast read-only search agent for locating code. Use it to fi…

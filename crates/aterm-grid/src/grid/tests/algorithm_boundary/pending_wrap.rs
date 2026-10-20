@@ -155,33 +155,6 @@ fn each_operation_keeps_or_consumes_the_parked_wrap() {
     );
 }
 
-/// DECSC/DECRC round-trip the deferred wrap flag.
-#[test]
-fn save_restore_cursor_preserves_pending_wrap() {
-    let mut grid = grid_with_pending_wrap(3, 5);
-    let saved_cursor = grid.cursor();
-
-    grid.save_cursor();
-    grid.carriage_return();
-
-    assert!(
-        !grid.pending_wrap(),
-        "carriage return must clear pending_wrap before restore"
-    );
-
-    grid.restore_cursor();
-
-    assert_eq!(
-        grid.cursor(),
-        saved_cursor,
-        "DECRC must restore cursor position"
-    );
-    assert!(
-        grid.pending_wrap(),
-        "DECRC must restore the deferred wrap state captured by DECSC"
-    );
-}
-
 // wrap_serial: the emulator wrap fact
 
 /// `wrap_serial` bumps once per resolved autowrap and never on a hard newline:

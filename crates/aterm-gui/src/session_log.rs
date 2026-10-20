@@ -408,7 +408,7 @@ struct PendingName {
 }
 
 /// What reached the session that a turn tracker attributes a turn to (a
-/// person's input, [`SessionLog::human_input`]; control input,
+/// person's input, [`SessionLog::person_input`]; control input,
 /// [`SessionLog::ctl_input`]; a `ctl turn`, [`SessionLog::ctl_turn`]): the
 /// latest of each, with when it came in the order of
 /// [`SessionLog::arrivals`]. A name waits for a block read
@@ -567,6 +567,40 @@ pub(crate) struct SessionLog {
     /// log generation this log last synced under ([`Self::mirror_log`]).
     mirror_shared: Option<std::sync::Arc<crate::session_log_mirror::Shared>>,
     mirror_seen: u64,
+    /// What the remaining §4.1 marks last wrote (phase 3B,
+    /// `session_log_observed`): one mark per value.
+    observed: observed::Observed,
+    /// THE PERSON'S COUNT (ruling T2): the session's lock-free gesture count
+    /// (`HumanInputStamp::seq`, the `if-human=` fence), bound when the store
+    /// registers the session, and what this log last delivered of it
+    /// (`HumanInputStamp::counts`): the count, and the number of the last
+    /// gesture that reached the program. A key whose delivery found the
+    /// timeline held is delivered by the next entry that reaches the tracker
+    /// or writes mail ([`Self::reconcile_person`]), and each count is
+    /// delivered ONCE, whichever entry gets there first
+    /// ([`Self::person_input`]); `marked_through` is the count the last
+    /// `human` mark covered, so a burst a reconcile already marked is not
+    /// marked again.
+    person: Option<std::sync::Arc<crate::human_input::HumanInputStamp>>,
+    person_seen: u64,
+    reached_seen: u64,
+    marked_through: u64,
+    /// THE MAIL LATCH (session log phase 5, ruling T39): a `mail dir=in`
+    /// mark was written since the last `human` mark of an input that reached
+    /// the program, so the person's next such input writes one whatever its
+    /// burst ([`Self::person_input`]) and the fold can read "no person
+    /// between the mail and the turn" from records.
+    mail_since_human: bool,
+}
+
+/// A person's gesture as [`SessionLog::person_input`] takes it from the
+/// seam (`crate::app_input::note_person_reaching`): the number of the
+/// gesture when it opened a burst (`HumanInputStamp::note_reaching`), and
+/// whether it reached the program ([`crate::human_input::reaches_program`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PersonGesture {
+    pub(crate) burst: Option<u64>,
+    pub(crate) reaches: bool,
 }
 
 /// A session ring's bounds: [`Limits::SESSION`], or, in a development build
@@ -614,6 +648,12 @@ impl Default for SessionLog {
             journal_start: None,
             mirror_shared: None,
             mirror_seen: 0,
+            observed: observed::Observed::default(),
+            person: None,
+            person_seen: 0,
+            reached_seen: 0,
+            marked_through: 0,
+            mail_since_human: false,
         }
     }
 }
@@ -729,6 +769,34 @@ impl SessionLog {
         self.mirror_seen = 0;
     }
 
+    /// THE PERSON'S COUNT, bound when the store registers the session
+    /// (ruling T2): every gesture counted so far has been delivered (each
+    /// reached [`Self::person_input`], or found no session to attribute).
+    pub(crate) fn bind_person(
+        &mut self,
+        count: std::sync::Arc<crate::human_input::HumanInputStamp>,
+    ) {
+        let c = count.counts();
+        self.person_seen = c.seq;
+        self.reached_seen = c.reached;
+        self.marked_through = c.seq;
+        self.person = Some(count);
+    }
+
+    /// RECONCILE THE PERSON (ruling T2): when the count moved past what this
+    /// log last delivered, a person's key found the timeline held
+    /// (`note_person`'s `try_lock`): it is delivered now, before the entry
+    /// that called this reaches the tracker or writes mail, so it binds the
+    /// step open now (T1) and stands between mail and the turn after it.
+    pub(crate) fn reconcile_person(&mut self, at: Stamp) {
+        if self.person.as_ref().is_some_and(|p| {
+            let c = p.counts();
+            c.seq > self.person_seen || c.reached > self.reached_seen
+        }) {
+            self.person_input(None, at);
+        }
+    }
+
     /// [`crate::session_log_mirror::sync`], when the store bound its state.
     fn sync_mirror(&mut self) {
         if let Some(shared) = self.mirror_shared.as_deref() {
@@ -754,6 +822,43 @@ impl SessionLog {
     /// The time now, on this log's clock.
     pub(crate) fn now(&self) -> Stamp {
         self.clock.now()
+    }
+
+    /// THE CHROME'S CLAUSE (phase 3B, plan §5; addendum A12, rulings S10 and
+    /// S11) at `now_ms` on [`crate::turn_ledger::now_ms`]'s clock: the
+    /// clause a person's tooltip may show ([`aterm_slog::clause_of_proven`]:
+    /// a `ctl` label neither shows nor hides the row beneath it) over the
+    /// state a reader is shown, as the cache's key and the line it composes.
+    /// The line's instants are put on the process clock (the clause's start,
+    /// and a shown label's `until`).
+    pub(crate) fn chrome_clause(
+        &self,
+        now_ms: u64,
+    ) -> Option<(
+        crate::session_chrome::ClauseKey,
+        crate::session_chrome::ClauseLine,
+    )> {
+        let now_wall = self.now().wall_ms;
+        let st = self.log.reader_state();
+        let clause = aterm_slog::clause_of_proven(st, now_wall)?;
+        let until_ms = (clause.row == aterm_slog::ClauseRow::Label)
+            .then(|| aterm_slog::shown_proven_label(st, now_wall).and_then(|l| l.until))
+            .flatten()
+            .map(|until| now_ms.saturating_add(until.saturating_sub(now_wall)));
+        let head = clause.head.as_str().to_string();
+        let key = crate::session_chrome::ClauseKey {
+            row: clause.row,
+            head: head.clone(),
+            tone: clause.tone,
+            by: clause.by,
+            since_wall: now_wall.saturating_sub(clause.age_ms),
+        };
+        let line = crate::session_chrome::ClauseLine {
+            head,
+            since_ms: now_ms.saturating_sub(clause.age_ms),
+            until_ms,
+        };
+        Some((key, line))
     }
 
     /// Replace the clock (tests).
@@ -1108,13 +1213,18 @@ impl SessionLog {
     /// blocks from the cursor on still held that reached C. A clear at an
     /// idle prompt (Cmd-K, RIS) took no C; a `clear`, `reset` or any command
     /// run and cleared between two sweeps took its own; the open `cmd` run's
-    /// block was read (it closes `out=unknown`), however its D fared. With no
-    /// count from the read before at this cursor (the first read, or a read
-    /// built by hand), every dropped id but the open run's counts.
+    /// block was read (it closes `out=unknown`), however its D fared. A count
+    /// taken at an open run's block holds that run's C, so it holds too once
+    /// the run went without a read (a front run's close took it and a
+    /// person's key dropped it, or its carry line did not read) and the
+    /// cursor moved one past that block. With no count from the read before
+    /// at this cursor (the first read, or a read built by hand), every
+    /// dropped id but the open run's counts.
     fn lost_unread(&self, read: &BlockRead) -> u64 {
         let own = self.cmd.is_some_and(|c| read.from == Some(c.blk));
+        let at_gone_run = |snap: CSnap| self.cmd.is_none() && snap.cursor == self.last_blk;
         match (self.c_snap, read.started) {
-            (Some(snap), Some(now)) if snap.cursor == read.from => {
+            (Some(snap), Some(now)) if snap.cursor == read.from || at_gone_run(snap) => {
                 let held = read
                     .started_held
                     .saturating_sub(u64::from(own && read.started_at_from));
@@ -1671,6 +1781,7 @@ impl SessionLog {
     /// program name did opens its `agent` run first. Returns the tracker's
     /// wake ([`Self::wake`]).
     pub(crate) fn agent_moved(&mut self, m: AgentMove<'_>, at: Stamp) -> Option<u64> {
+        self.reconcile_person(at);
         self.resync();
         // The sweep publishes after its block read, which opened every name
         // but past a cut; one still waiting (a publish off the sweep, or
@@ -1756,23 +1867,105 @@ impl SessionLog {
 
     /// A person's hands were on the session: the tracker attributes a turn
     /// that opens within 5 s to them (a run a waiting name opens later too,
-    /// [`Typed`]), and the first input of a burst writes `mark - human
-    /// by=human` on the session (the bytes are never recorded).
+    /// [`Typed`]); a gesture that reached the program
+    /// ([`crate::human_input::reaches_program`]) makes the approval or
+    /// question step open now the person's to dismiss (ruling T1); and the
+    /// first input of a burst writes `mark - human by=human` on the session
+    /// (the bytes are never recorded), as does the first program-bound one
+    /// after a `mail dir=in` mark, whatever its burst (ruling T39,
+    /// [`Self::mail_since_human`]). A burst's mark that no program-bound
+    /// input is delivered with says so, `reached=0` (a view scroll, a
+    /// selection, a composition): the fold reads it as no answer to waiting
+    /// mail, and the latch stays for the input that does reach the program.
+    /// `own` is the calling gesture's ([`PersonGesture`]), `None` for
+    /// [`Self::reconcile_person`]'s.
+    ///
+    /// ONCE PER COUNT (ruling T2): on a log bound to the person's count, what
+    /// the counts moved past since the last delivery is delivered, whoever
+    /// calls first — a key whose own call waited on the timeline while a
+    /// reconciling entry delivered it does nothing twice — and a burst's mark
+    /// is written unless a mark already covers its number. The counts are
+    /// one reading (`HumanInputStamp::counts`), so a delivery that sees a
+    /// gesture's class covers its number however a note interleaved. A log
+    /// no store bound has no count: its gesture is delivered whole.
+    pub(crate) fn person_input(&mut self, own: Option<PersonGesture>, at: Stamp) {
+        let own_reaches = own.is_some_and(|g| g.reaches);
+        let Some(p) = self.person.as_ref() else {
+            if let Some(g) = own {
+                self.deliver_person(true, g.reaches, g.burst.is_some(), own_reaches, 0, at);
+            }
+            return;
+        };
+        let c = p.counts();
+        let fresh = c.seq > self.person_seen;
+        let reached = c.reached > self.reached_seen;
+        let burst = own
+            .and_then(|g| g.burst)
+            .is_some_and(|n| n > self.marked_through);
+        self.person_seen = self.person_seen.max(c.seq);
+        self.reached_seen = self.reached_seen.max(c.reached);
+        self.deliver_person(fresh, reached, burst, own_reaches, c.seq, at);
+    }
+
+    /// [`Self::person_input`] for a gesture no count names (a test's, or a
+    /// log no store bound): delivered whole, as one that reached the
+    /// program, `burst` its own.
+    #[cfg(test)]
     pub(crate) fn human_input(&mut self, burst: bool, at: Stamp) {
+        let c = self.person.as_ref().map(|p| p.counts()).unwrap_or_default();
+        self.person_seen = self.person_seen.max(c.seq);
+        self.reached_seen = self.reached_seen.max(c.reached);
+        self.deliver_person(true, true, burst, true, c.seq, at);
+    }
+
+    /// The delivery itself: the tracker and the arrivals for a `fresh`
+    /// count, the step's binding and the mail latch for a `reached` one,
+    /// and the `human` mark for a `burst` or the latch, covering `seq`;
+    /// `reached=0` on a mark that neither `reached` nor the calling gesture
+    /// (`own_reaches`) brings a program-bound input to.
+    fn deliver_person(
+        &mut self,
+        fresh: bool,
+        reached: bool,
+        burst: bool,
+        own_reaches: bool,
+        seq: u64,
+        at: Stamp,
+    ) {
+        if !fresh && !reached && !burst {
+            return;
+        }
         self.resync();
-        self.arrivals += 1;
-        self.typed.input = Some((self.arrivals, Actor::Human, None, at));
-        if let Some(a) = self.agent.as_mut() {
-            a.tracker.note_input(Actor::Human, at);
+        if fresh {
+            self.arrivals += 1;
+            self.typed.input = Some((self.arrivals, Actor::Human, None, at));
         }
-        if burst {
-            let _ = self.log.mark(
-                Mark::new(Kind::Human, Src::Input, Conf::Strong)
-                    .at(Node::SESSION)
-                    .by(Actor::Human),
-                at,
-            );
+        let Self { log, agent, .. } = self;
+        if let Some(a) = agent.as_mut() {
+            if fresh {
+                a.tracker.note_input(Actor::Human, at);
+            }
+            if reached {
+                let _ = a.tracker.person(log, at);
+            }
         }
+        let after_mail = reached && std::mem::take(&mut self.mail_since_human);
+        if burst || after_mail {
+            let mut mark = Mark::new(Kind::Human, Src::Input, Conf::Strong)
+                .at(Node::SESSION)
+                .by(Actor::Human);
+            if !(reached || own_reaches) {
+                mark = mark.fields(Fields::new().u(Key::Reached, 0).unwrap_or_default());
+            }
+            let _ = self.log.mark(mark, at);
+            self.marked_through = self.marked_through.max(seq);
+        }
+    }
+
+    /// A `mail dir=in` mark was written (ruling T39): the person's next
+    /// input is marked.
+    pub(crate) fn note_mail_in(&mut self) {
+        self.mail_since_human = true;
     }
 
     /// A `ctl turn` exchange from `by`, ledger id `ledger`, handed its input to
@@ -1791,6 +1984,7 @@ impl SessionLog {
         cause: Option<ShortId>,
         at: Stamp,
     ) -> Option<u64> {
+        self.reconcile_person(at);
         self.resync();
         self.arrivals += 1;
         self.typed.ctl = Some((self.arrivals, by, ledger, cause, at));
@@ -1803,6 +1997,7 @@ impl SessionLog {
     /// The host's settle wake: a resting word that has held closes its turn.
     /// Returns the next wake.
     pub(crate) fn tick(&mut self, at: Stamp) -> Option<u64> {
+        self.reconcile_person(at);
         self.resync();
         let Self { log, agent, .. } = self;
         agent.as_mut().and_then(|a| a.tracker.tick(log, at))
@@ -2169,6 +2364,66 @@ impl crate::App {
             .lift_commit_fence();
     }
 
+    /// What a footer read wakes when it moves a session's log (phase 3B,
+    /// `claude_footer::LogWake`): this instance's subscribers, and the
+    /// `[session_log] clause` switch.
+    pub(crate) fn footer_log_wake(&self) -> crate::claude_footer::LogWake {
+        crate::claude_footer::LogWake::new(&self.subscribers, self.config.session_log_clause())
+    }
+
+    /// Whether session `id`'s clause moved past what its tab's chrome was
+    /// composed with (phase 3B; addendum A12 item 4): `[session_log] clause`
+    /// on, a composition cached for the tab, and the clause's key
+    /// ([`crate::session_chrome::ClauseKey`]) another now. The timeline under
+    /// a `try_lock` (contended: no move said; the next producer's wake asks
+    /// again). Off, nothing is read.
+    pub(crate) fn clause_moved(&self, id: u64) -> bool {
+        if !self.config.session_log_clause() {
+            return false;
+        }
+        let (Some(cached), Some(s)) = (self.session_chrome.get(&id), self.pool.get(id)) else {
+            return false;
+        };
+        let Ok(g) = s.ctx.timeline.try_lock() else {
+            return false;
+        };
+        let now = g
+            .slog()
+            .chrome_clause(crate::turn_ledger::now_ms())
+            .map(|(key, _)| key);
+        now != cached.clause
+    }
+
+    /// Refresh session `id`'s tab chrome when its clause moved
+    /// ([`Self::clause_moved`]): one compose per key change, never per record
+    /// and never on a clock.
+    pub(crate) fn follow_clause(&mut self, id: u64) {
+        if self.clause_moved(id) {
+            self.refresh_session_status_chrome(id);
+        }
+    }
+
+    /// `Wake::SessionLogMoved`: the footer thread moved session `id`'s log
+    /// (phase 3B) and already woke its watchers, or the render path moved
+    /// it and they are owed a wake now (`notify`); the loop notes the turn
+    /// tracker's settle wake, which only its tick keeps.
+    pub(crate) fn on_session_log_moved(&mut self, id: u64, notify: bool) {
+        self.wake_log_watchers(id, notify);
+        let Some(s) = self.pool.get(id) else {
+            return;
+        };
+        let wake = s
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .slog_wake();
+        self.session_status.slog_wakes.note(id, wake);
+        // An off-loop producer's move (the footer's transcript steps) reaches
+        // the tab's clause here, with the switch on.
+        self.follow_clause(id);
+    }
+
     /// Wake session `id`'s subscribers when its log's readers are `owed` a
     /// wake ([`SessionLog::take_log_wake`], taken under the timeline lock the
     /// caller has released): the content-less notify the sweep sends.
@@ -2203,6 +2458,10 @@ impl crate::App {
             self.session_status
                 .slog_wakes
                 .note(id, wake.filter(|w| *w > now));
+            // A settle closes a turn: the clause moves off it.
+            if owed {
+                self.follow_clause(id);
+            }
         }
     }
 
@@ -2221,6 +2480,9 @@ impl crate::App {
 
 /// The `log` verb's usage line.
 pub(crate) const LOG_USAGE: &str = "ERR usage: log [<node>] [lvl=session|run|turn|step] [since=<seq> ep=<epoch>] [n=<count>] [kinds=<k>[,...]] [class=turn] [tier=content] [--json]\n";
+/// `log n`'s usage line (the instance's node log, session log 5J-3).
+pub(crate) const NODE_LOG_USAGE: &str =
+    "ERR usage: log n [since=<seq> ep=<epoch>] [n=<count>] [kinds=<k>[,...]] [--json]\n";
 /// The `brief` verb's usage line.
 pub(crate) const BRIEF_USAGE: &str =
     "ERR usage: brief [<node>|all] [budget=<tokens>] [since=<seq> ep=<epoch>]\n";
@@ -2515,6 +2777,29 @@ impl LogCopy {
         }
     }
 
+    /// The node log's records `q` asks for (`log n`, session log 5J-3): the
+    /// same header, `oldest=` the oldest live seq (the ring is a FIFO, whole
+    /// from there). Only `since=`/`ep=`, `n=` and `kinds=` select; every
+    /// record is node `n`'s.
+    pub(crate) fn copied_from_node(log: &aterm_slog::NodeLog, q: &LogQuery) -> LogCopy {
+        let read = log.read(q.cursor.unwrap_or(Cursor::new(log.ep(), 0)), usize::MAX);
+        let matching: Vec<&Rec> = read
+            .recs
+            .into_iter()
+            .filter(|r| q.kinds.is_empty() || q.kinds.contains(&r.k))
+            .collect();
+        let more = q.n.map_or(0, |n| matching.len().saturating_sub(n));
+        LogCopy {
+            recs: matching[more..].iter().map(|r| (*r).clone()).collect(),
+            gap: read.gap,
+            more,
+            as_of: log.last_seq(),
+            ep: log.ep(),
+            oldest: log.oldest_seq(),
+            lost: log.lost(),
+        }
+    }
+
     /// The copy with its header handing out `c` (`as_of=` its seq, `ep=` its
     /// epoch) in place of the log's head: a journal reply's
     /// (`aterm_slog::journal::View::reply_cursor`), which names none of the
@@ -2751,14 +3036,14 @@ mod mark;
 
 #[path = "session_log_carry.rs"]
 mod carry;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use carry::JOURNAL_HOST_LINE;
 #[cfg(any(unix, test))]
 pub(crate) use carry::{PreparedSlogCarry, SlogCarrySource};
 #[cfg(test)]
 pub(crate) use mark::{AWAIT_LOG_USAGE, MARK_USAGE, MarkReq};
 pub(crate) use mark::{
-    CAUSE_USAGE, CauseRef, InputVerb, LogAwait, LogAwaitStep, cmd_mark, validate_cause,
+    CAUSE_USAGE, CauseRef, InputAct, InputVerb, LogAwait, LogAwaitStep, cmd_mark, validate_cause,
 };
 
 #[path = "session_log_closed.rs"]
@@ -2769,6 +3054,12 @@ pub(crate) use closed::ClosedSource;
 pub(crate) use closed::{CLOSED_INDEX_CAP, CLOSED_SKELETONS, SKELETONS_BUILT};
 pub(crate) use closed::{ClosedKeep, ClosedLog, ClosedLogs};
 
+#[path = "session_log_transcript.rs"]
+pub(crate) mod transcript;
+
+#[path = "session_log_observed.rs"]
+pub(crate) mod observed;
+
 #[cfg(test)]
 #[path = "session_log_tests.rs"]
 mod tests;
@@ -2776,3 +3067,13 @@ mod tests;
 #[cfg(test)]
 #[path = "session_log_mark_tests.rs"]
 mod mark_tests;
+
+// Unix only, as the pipe-backed handles of `control_input_ack::testing` it
+// drives are.
+#[cfg(all(test, unix))]
+#[path = "session_log_attribution_tests.rs"]
+mod attribution_tests;
+
+#[cfg(test)]
+#[path = "session_log_clause_tests.rs"]
+pub(crate) mod clause_tests;

@@ -1,0 +1,24 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · under `claude --verbose`, two Stop hooks: a prompt-type hook ('Check that the work is done.', the stub's reply no JSON) and a command hook printing {"continue": false, "stopReason": "Not logged in · Please run /login"}: the summary `⏺ Ran 2 stop hooks`, one row per hook (the command's path, the prompt's words, no label), the stopReason, then `Stop hook error: JSON validation failed`
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ hello there
+
+⏺ Hi! I am the local lab stub, not a model. (reply 26)
+
+⏺ Ran 2 stop hooks
+  ⎿  /tmp/at.0000/proj/sr.sh
+  ⎿  Check that the work is done.
+  ⎿  Not logged in · Please run /login
+  ⎿  Stop hook error: JSON validation failed
+
+✻ Brewed for 0s · done 5:46 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts                                                                                              12604 tokens

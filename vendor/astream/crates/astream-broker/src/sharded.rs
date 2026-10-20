@@ -33,7 +33,6 @@
 use crate::client::SubscriptionCloser;
 use crate::{Broker, BrokerHandle, Client, Durability};
 use astream_wire::{assign_partition, Filter, PartitionKey};
-use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
@@ -64,20 +63,29 @@ pub const SHARDS_FILE: &str = "shards";
 
 /// The shard a subject routes to: the canonical partitioner over the subject bytes, so
 /// producer and any consumer independently agree with zero coordination.
-pub fn shard_of(subject: &str, shards: u32) -> usize {
+pub const fn shard_of(subject: &str, shards: u32) -> usize {
     assign_partition(PartitionKey::Keyed(subject.as_bytes()), shards) as usize
 }
 
 /// The count recorded in `dir`'s sidecar, `None` if there is none.
 fn read_shards_file(dir: &Path) -> io::Result<Option<u32>> {
     let path = dir.join(SHARDS_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(s) => s.trim().parse::<u32>().map(Some).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{}: unreadable shard count {s:?}", path.display()),
-            )
-        }),
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let Ok(s) = core::str::from_utf8(&bytes) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: unreadable shard count <non-utf8>", path.display()),
+                ));
+            };
+            let Ok(n) = s.trim().parse::<u32>() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: unreadable shard count {s:?}", path.display()),
+                ));
+            };
+            Ok(Some(n))
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
@@ -89,29 +97,15 @@ fn read_shards_file(dir: &Path) -> io::Result<Option<u32>> {
 /// later open then refuses as an unreadable count; and a reader racing a rewrite
 /// could see it half-written.
 fn write_shards_file(dir: &Path, shards: u32) -> io::Result<()> {
+    let target = dir.join(SHARDS_FILE);
     let tmp = dir.join(format!("{SHARDS_FILE}.tmp"));
     {
-        let mut f = File::create(&tmp)?;
+        let mut f = crate::store::create_fresh(&tmp, &mut std::fs::OpenOptions::new())?;
         f.write_all(format!("{shards}\n").as_bytes())?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, dir.join(SHARDS_FILE))?;
-    match File::open(dir).and_then(|d| d.sync_all()) {
-        // A filesystem that cannot fsync a directory handle, or a directory this
-        // process may write but not open: the file's own bytes are durable, and there
-        // is nothing more to do about the entry.
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::Unsupported
-                    | io::ErrorKind::InvalidInput
-                    | io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            Ok(())
-        }
-        r => r,
-    }
+    crate::store::rename_path(&tmp, &target)?;
+    crate::store::sync_parent_dir(&target)
 }
 
 fn mismatch(dir: &Path, have: u32, asked: u32) -> io::Error {
@@ -127,10 +121,11 @@ fn mismatch(dir: &Path, have: u32, asked: u32) -> io::Error {
 
 /// The index of a `shard-<i>.log` file name, if it is one.
 fn shard_log_index(name: &str) -> Option<u32> {
-    name.strip_prefix("shard-")?
-        .strip_suffix(".log")?
-        .parse()
-        .ok()
+    let digits = name.strip_prefix("shard-")?.strip_suffix(".log")?;
+    let Ok(idx) = digits.parse() else {
+        return None;
+    };
+    Some(idx)
 }
 
 /// Validate `dir`'s recorded shard count against `shards`, recording it on first
@@ -145,8 +140,16 @@ fn check_or_record_log_shards(dir: &Path, shards: u32) -> io::Result<()> {
             let mut max_index: Option<u32> = None;
             for entry in std::fs::read_dir(dir)? {
                 let entry = entry?;
-                if let Some(i) = entry.file_name().to_str().and_then(shard_log_index) {
-                    max_index = Some(max_index.map_or(i, |m| m.max(i)));
+                let ep = entry.path();
+                if let Some(os_name) = ep.file_name() {
+                    if let Some(name) = os_name.to_str() {
+                        if let Some(i) = shard_log_index(name) {
+                            max_index = Some(match max_index {
+                                Some(m) => m.max(i),
+                                None => i,
+                            });
+                        }
+                    }
                 }
             }
             if let Some(m) = max_index {
@@ -233,7 +236,7 @@ impl ShardedBroker {
     }
 
     /// The shard count.
-    pub fn shards(&self) -> u32 {
+    pub const fn shards(&self) -> u32 {
         self.shards
     }
 }
@@ -253,7 +256,7 @@ impl ShardedHandle {
     }
 
     /// The shard count.
-    pub fn shards(&self) -> u32 {
+    pub const fn shards(&self) -> u32 {
         self.shards
     }
 }
@@ -281,7 +284,7 @@ impl ShardedClient {
     }
 
     /// The shard a subject routes to (producer and broker agree via the same function).
-    pub fn shard_of(&self, subject: &str) -> usize {
+    pub const fn shard_of(&self, subject: &str) -> usize {
         shard_of(subject, self.shards)
     }
 
@@ -300,7 +303,7 @@ impl ShardedClient {
     }
 
     /// The shard count.
-    pub fn shards(&self) -> u32 {
+    pub const fn shards(&self) -> u32 {
         self.shards
     }
 }
@@ -408,7 +411,7 @@ impl Drop for ShardedSubscription {
         for c in &self.closers {
             c.close();
         }
-        for h in self.forwarders.drain(..) {
+        for h in std::mem::take(&mut self.forwarders) {
             let _ = h.join();
         }
     }

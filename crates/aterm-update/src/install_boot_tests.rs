@@ -35,78 +35,94 @@ fn read_id(dir: &Path) -> String {
 /// status`, the pull-down row and the persistent-failure notice can see it.
 ///
 /// Drives the real revert: armed sentinel at `MAX_BOOT_ATTEMPTS`, OLD at the
-/// fixed rollback path, NEW installed, under the apply lock. The fixture has no
-/// executable, so the trailing re-exec fails and the function returns
-/// `ReExecFailed` instead of replacing this process.
+/// fixed rollback path, NEW installed, under the apply lock, once for each way the
+/// image may be replaced. A replaceable launch's revert, and a window's that keeps its
+/// image, re-exec the restored build: the fixture has no executable, so that exec fails
+/// and the function returns `ReExecFailed` instead of replacing this process. A
+/// LaunchServices-launched successor's revert attempts no exec at all and returns
+/// `Reverted` for its caller to exit. Either way the disk ends the same.
 #[test]
 fn a_crash_loop_revert_is_booked_in_the_failure_ledger() {
-    let s = scratch("boot-revert-ledger");
-    let installed = s.root.join("Applications").join("aterm.app");
-    make_app(&installed, "NEW");
-    let rb = rollback_path(&installed);
-    make_app(&rb, "OLD");
-    let trialed = 2000_u64;
-    let sentinel = boot_sentinel(&s);
-    sentinel.arm(trialed).unwrap();
-    for _ in 0..MAX_BOOT_ATTEMPTS {
-        sentinel.observe_launch(trialed).unwrap();
+    use crate::ImageReplacement::{LaunchedSuccessor, Replaceable, WindowKeepsImage};
+    for image in [Replaceable, WindowKeepsImage, LaunchedSuccessor] {
+        let s = scratch("boot-revert-ledger");
+        let installed = s.root.join("Applications").join("aterm.app");
+        make_app(&installed, "NEW");
+        let rb = rollback_path(&installed);
+        make_app(&rb, "OLD");
+        let trialed = 2000_u64;
+        let sentinel = boot_sentinel(&s);
+        sentinel.arm(trialed).unwrap();
+        for _ in 0..MAX_BOOT_ATTEMPTS {
+            sentinel.observe_launch(trialed).unwrap();
+        }
+        assert!(sentinel.should_revert(trialed, MAX_BOOT_ATTEMPTS));
+        FailedMark::record(&s.trial(), trialed, &"ab".repeat(32));
+        let bundle = bundle::Bundle {
+            app_root: installed.clone(),
+            exe: installed.join("Contents/MacOS/aterm"),
+        };
+        let lock = FileLock::acquire(&s.apply_lock).unwrap();
+
+        // The operator floor sits ABOVE the restored build (a yanked predecessor): the
+        // revert still happens — a crash loop is strictly worse than a yank.
+        crate::manifest::Floor::bump_and_write(&s.floor(), 1500, 0, 0);
+        assert_eq!(crate::manifest::Floor::read(&s.floor()).min_build, 1500);
+        let restored = VerifiedRollback {
+            path: rb.clone(),
+            build: 1000,
+        };
+
+        let outcome = revert_to_rollback(
+            &bundle,
+            &s,
+            &sentinel,
+            trialed,
+            restored,
+            RollbackHandoff {
+                image,
+                ..RollbackHandoff::NONE
+            },
+            lock,
+        );
+
+        if image == LaunchedSuccessor {
+            assert!(
+                matches!(outcome, ApplyOutcome::Reverted(_)),
+                "a launched successor never execs the restored build: {outcome:?}"
+            );
+        } else {
+            assert!(
+                matches!(outcome, ApplyOutcome::ReExecFailed(_)),
+                "the fixture has no executable, so the revert must return: {outcome:?}"
+            );
+        }
+        assert_eq!(
+            read_id(&installed),
+            "OLD",
+            "the previous build is back at the install"
+        );
+        assert!(sentinel.read_state().is_none(), "the trial is disarmed");
+        assert!(
+            FailedMark::read(&s.failed()).is_some(),
+            "the crash-looping build is quarantined"
+        );
+
+        // The revert reached the failure ledger.
+        let health = Health::read(&s.health());
+        assert!(
+            health.apply_failures >= 1,
+            "a crash-loop revert is an apply that failed end to end and must advance the \
+             apply streak so `update status`, the pull-down row and the persistent notice \
+             can see it; health.toml has apply_failures={} kind={:?} last_apply_error={:?}",
+            health.apply_failures,
+            health.kind,
+            health.last_apply_error
+        );
+        assert_eq!(health.kind, "apply");
+        assert_eq!(health.last_apply_failure_build, trialed);
+        let _ = std::fs::remove_dir_all(&s.root);
     }
-    assert!(sentinel.should_revert(trialed, MAX_BOOT_ATTEMPTS));
-    FailedMark::record(&s.trial(), trialed, &"ab".repeat(32));
-    let bundle = bundle::Bundle {
-        app_root: installed.clone(),
-        exe: installed.join("Contents/MacOS/aterm"),
-    };
-    let lock = FileLock::acquire(&s.apply_lock).unwrap();
-
-    // The operator floor sits ABOVE the restored build (a yanked predecessor): the
-    // revert still happens — a crash loop is strictly worse than a yank.
-    crate::manifest::Floor::bump_and_write(&s.floor(), 1500, 0, 0);
-    assert_eq!(crate::manifest::Floor::read(&s.floor()).min_build, 1500);
-    let restored = VerifiedRollback {
-        path: rb.clone(),
-        build: 1000,
-    };
-
-    let outcome = revert_to_rollback(
-        &bundle,
-        &s,
-        &sentinel,
-        trialed,
-        restored,
-        RollbackHandoff { fds: &[], env: &[] },
-        lock,
-    );
-
-    assert!(
-        matches!(outcome, ApplyOutcome::ReExecFailed(_)),
-        "the fixture has no executable, so the revert must return: {outcome:?}"
-    );
-    assert_eq!(
-        read_id(&installed),
-        "OLD",
-        "the previous build is back at the install"
-    );
-    assert!(sentinel.read_state().is_none(), "the trial is disarmed");
-    assert!(
-        FailedMark::read(&s.failed()).is_some(),
-        "the crash-looping build is quarantined"
-    );
-
-    // The revert reached the failure ledger.
-    let health = Health::read(&s.health());
-    assert!(
-        health.apply_failures >= 1,
-        "a crash-loop revert is an apply that failed end to end and must advance the \
-         apply streak so `update status`, the pull-down row and the persistent notice \
-         can see it; health.toml has apply_failures={} kind={:?} last_apply_error={:?}",
-        health.apply_failures,
-        health.kind,
-        health.last_apply_error
-    );
-    assert_eq!(health.kind, "apply");
-    assert_eq!(health.last_apply_failure_build, trialed);
-    let _ = std::fs::remove_dir_all(&s.root);
 }
 
 /// A crash-loop revert's inverse swap and the quarantine it records before the
@@ -145,7 +161,7 @@ fn a_crash_loop_reverts_swap_and_quarantine_take_the_install_tier() {
             &sentinel,
             trialed,
             restored,
-            RollbackHandoff { fds: &[], env: &[] },
+            RollbackHandoff::NONE,
             lock,
         );
         let flushes = recording.take();
@@ -214,8 +230,7 @@ fn an_armed_boot_health_check_times_out_without_counting_a_launch() {
             &worker_staging,
             42,
             None,
-            &[],
-            &[],
+            RollbackHandoff::NONE,
             false,
             crate::TrialWitness::Window,
             Duration::ZERO,
@@ -1255,8 +1270,7 @@ fn a_headless_launch_that_comes_first_leaves_the_predecessor_for_the_windows() {
             &s,
             11,
             None,
-            &[],
-            &[],
+            RollbackHandoff::NONE,
             false,
             Headless,
             Duration::from_millis(100),
@@ -1272,8 +1286,7 @@ fn a_headless_launch_that_comes_first_leaves_the_predecessor_for_the_windows() {
         &s,
         11,
         None,
-        &[],
-        &[],
+        RollbackHandoff::NONE,
         true,
         Window,
         Duration::from_millis(100),
@@ -1405,8 +1418,7 @@ fn a_window_re_trial_is_bounded() {
             &s,
             11,
             None,
-            &[],
-            &[],
+            RollbackHandoff::NONE,
             true,
             Window,
             Duration::ZERO,
@@ -1850,8 +1862,7 @@ fn a_predecessor_this_build_cannot_verify_does_not_hold_its_trial() {
         check_boot_health_with_proof(
             &s,
             11,
-            &[],
-            &[],
+            RollbackHandoff::NONE,
             false,
             Window,
             wait,
@@ -2011,8 +2022,7 @@ fn an_unreadable_sentinel_counts_no_launch_toward_a_revert() {
         let outcome = check_boot_health_with_proof(
             &s,
             11,
-            &[],
-            &[],
+            RollbackHandoff::NONE,
             false,
             Window,
             std::time::Duration::from_millis(100),

@@ -349,11 +349,13 @@ pub struct Table {
     /// here, and ignores it when the path merely walks through.
     pub(crate) closed: bool,
     /// Comment and blank lines printed after this table's key-value lines: the
-    /// ones a removed LAST line was written under (see
-    /// [`super::DocumentMut::remove_path`]). The parser never fills it — in
-    /// parsed text that run belongs to the next header or the document's end —
-    /// and keeping it here, not on whichever header prints next, holds it under
-    /// this table even when the same edit adds a table that prints between.
+    /// comment lines the parser read directly under its last line (up to the
+    /// first blank line before the next header or the end of the file, which
+    /// describe what is above them), and the ones a removed LAST line was
+    /// written under (see [`super::DocumentMut::remove_path`]). Keeping them
+    /// here, not on whichever header prints next, holds them under this table
+    /// when a reset prunes it, and when an edit adds a table that prints
+    /// between.
     pub(crate) trailing: super::RawString,
 }
 

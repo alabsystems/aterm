@@ -1,0 +1,12 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# T1: the harness approved, then a person keyed the same box: the person's
+# input is the box's latest, so the close is theirs, `passed`.
+see busy
+half
+see prompt edit
+expect open p1 approval par=t1 box=edit at=500
+admit harness act=approve
+accept
+at 600 person
+at 700 see busy
+expect close p1 approval out=passed by=human at=700

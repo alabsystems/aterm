@@ -9,13 +9,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::app_edit::Placement;
 use crate::document_store::{DocumentId, DocumentViewId};
 use crate::native_app::{
     AppEvent, AppKind, AppViewState, EditorApp, EventResult, MarkdownApp, MarkdownViewState,
     NativeApp, TextInputEvent,
 };
 use crate::native_document_host::{
-    AdmittedDocument, DEFAULT_DOCUMENT_LIMIT, DocumentGrant, DocumentGrantStore,
+    AdmittedDocument, DEFAULT_DOCUMENT_LIMIT, DocumentGrant, DocumentGrantStore, DocumentHostError,
     DocumentPersistenceStore, GrantAccess,
 };
 use crate::native_document_journal::{
@@ -26,6 +27,7 @@ use crate::native_document_journal::{
 };
 use crate::native_editor::{EditorCommand, EditorEffect, Selection};
 use crate::{App, WindowId};
+use amacs::input::{EditorInput, Follow, Reduction};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigEditorRevealDecision {
@@ -64,23 +66,36 @@ pub(crate) fn config_editor_reveal_decision(
     ))
 }
 
-/// How an absent key was added: so that adding it changes nothing.
+/// How an absent key was added.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AbsentKeyAdded {
-    /// At its default value.
+    /// At the value that resolves exactly as its absence does, so the file
+    /// means what it meant.
     AtDefault,
-    /// No single literal default to write (a list, a path with none): an
-    /// example value, commented out.
-    Commented,
+    /// With no value yet, the caret where it goes: no value resolves as the
+    /// key's absence does (a shell, a font family, a list, a path), and its
+    /// unset words describe a behaviour rather than spell a value. The line
+    /// does not parse until a value is typed, so Save waits for one; `record`
+    /// names the `[[table]]` record the line was added in.
+    NeedsValue { record: Option<&'static str> },
+    /// A table or map key (`keybindings`, `harness`) as its empty `[key]`
+    /// table, the caret on the line under it where its entries go: an empty
+    /// table reads as an absent one.
+    Table,
 }
 
 /// The edit that adds `key`, absent from `source`, where TOML reads it — a
-/// top-level key among the root keys, a dotted key in its table — so that
-/// the file means what it meant: at the value Settings shows as its default,
-/// else the schema's documented default, else the schema's example as a
-/// COMMENT (an example value is a choice, and Save would make it). Formatting
-/// elsewhere is kept: the edit is the smallest span the two texts differ in.
-/// `None` for a key with no value to offer.
+/// top-level key among the root keys, a dotted key in its table, a member of
+/// a list of records in a new `[[record]]` — at the value that resolves as
+/// the key's absence does ([`crate::prefs::unset_literal`] for a Settings
+/// row, the schema's documented default otherwise), checked to change
+/// nothing; else with no value, the caret where it goes. Never the words a
+/// Settings row shows for an unset value ("platform default", "Built-in
+/// sprite"), never an example someone did not choose. Formatting elsewhere
+/// is kept: the edit is the smallest span the two texts differ in. A table
+/// or a map comes in as its empty `[key]` table. `None` for a list of
+/// records itself and for a member of one the file already has (which
+/// record is the person's call).
 fn absent_key_edit(
     source: &str,
     key: &str,
@@ -88,33 +103,161 @@ fn absent_key_edit(
     crate::native_config_language::ConfigCompletionEdit,
     AbsentKeyAdded,
 )> {
-    let (item, added_as) = match crate::native_settings::settings_default_raw(key) {
-        // A Settings row: its default, or nothing where that is words.
-        Some(raw) => (
-            crate::prefs::typed_toml_item(key, &raw?).ok()?,
-            AbsentKeyAdded::AtDefault,
-        ),
-        // A key only aterm.toml holds: its documented default, else the value
-        // completion would offer, commented out.
-        None => {
-            let (literal, added_as) =
-                match crate::native_config_language::config_key_default_literal(key) {
-                    Some(literal) => (literal, AbsentKeyAdded::AtDefault),
-                    None => (
-                        crate::native_config_language::config_key_example_literal(key)?,
-                        AbsentKeyAdded::Commented,
-                    ),
-                };
-            let value = literal.parse::<aterm_toml::edit::Value>().ok()?;
-            (aterm_toml::edit::Item::Value(value), added_as)
-        }
-    };
-    let mut added = crate::prefs::with_toml_item(source, key, item).ok()?;
-    if added_as == AbsentKeyAdded::Commented {
-        let value = crate::native_config_language::config_key_source_range(&added, key)?;
-        let line_start = added[..value.start].rfind('\n').map_or(0, |at| at + 1);
-        added.insert_str(line_start, "# ");
+    if let Some(root) = crate::native_config_language::config_key_record_root(key) {
+        return absent_record_member_edit(source, root, key);
     }
+    let at_default = absent_key_default_item(source, key)
+        .and_then(|item| crate::prefs::with_toml_item(source, key, item).ok())
+        .filter(|added| adding_changes_nothing(source, added));
+    if let Some(added) = at_default {
+        let (edit, _) = smallest_edit(source, &added, key, None)?;
+        return Some((edit, AbsentKeyAdded::AtDefault));
+    }
+    if let Some(table) = absent_table_edit(source, key) {
+        return Some(table);
+    }
+    // No value means "unset": the line without one, `key = `. A list of
+    // records takes no line (it has no example value either).
+    crate::native_config_language::config_key_example_literal(key)?;
+    let placeholder = aterm_toml::edit::Item::Value(aterm_toml::edit::Value::from(""));
+    let mut added = crate::prefs::with_toml_item(source, key, placeholder).ok()?;
+    let value = crate::native_config_language::config_key_source_range(&added, key)?;
+    added.replace_range(value.clone(), "");
+    let (edit, _) = smallest_edit(source, &added, key, Some(value.start))?;
+    Some((edit, AbsentKeyAdded::NeedsValue { record: None }))
+}
+
+/// The value `key` resolves to when it is absent from `source`, as an item to
+/// write: a Settings row's [`crate::prefs::unset_literal`] (read with the
+/// document as it stands, so a default that follows another setting is that
+/// setting's), else the schema's documented default for a key only aterm.toml
+/// holds. `None` where no value resolves as absence does.
+fn absent_key_default_item(source: &str, key: &str) -> Option<aterm_toml::edit::Item> {
+    let config = crate::app_config::Config::parse(source).unwrap_or_default();
+    let fields = crate::prefs::editable_fields(&config);
+    if let Some(field) = fields.iter().find(|field| field.key == key) {
+        let literal = crate::prefs::unset_literal(field)?;
+        return crate::prefs::typed_toml_item(key, &literal).ok();
+    }
+    let literal = crate::native_config_language::config_key_default_literal(key)?;
+    let value = literal.parse::<aterm_toml::edit::Value>().ok()?;
+    Some(aterm_toml::edit::Item::Value(value))
+}
+
+/// Whether `added` (`source` with a key added at its default) means what
+/// `source` meant, as far as aterm can tell: it loads, and Manual finds
+/// nothing in it that it did not find in `source`. A default the reader
+/// refuses, or one that draws a warning, is not added as one.
+fn adding_changes_nothing(source: &str, added: &str) -> bool {
+    if crate::app_config::Config::parse(added).is_err() {
+        return false;
+    }
+    let findings = |text: &str| {
+        let mut findings = crate::native_config_language::analyze(text)
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| (diagnostic.severity, diagnostic.message))
+            .collect::<Vec<_>>();
+        findings.sort_by(|a, b| a.1.cmp(&b.1));
+        findings
+    };
+    let before = findings(source);
+    let mut after = findings(added);
+    after.retain(|finding| !before.contains(finding));
+    after.is_empty()
+}
+
+/// A table or map key (`keybindings`, `harness`) absent from `source`: its
+/// empty `[key]` table at the end of the file, the caret on the line under
+/// it, where its entries go. Never "a line of its own" left wherever the
+/// caret was — at the end of a file that is inside its last table, and a
+/// line typed there would be that table's (`machine.keybindings`). An empty
+/// table reads as an absent one, checked to change nothing; `None` for any
+/// other key, or where the header would change something.
+fn absent_table_edit(
+    source: &str,
+    key: &str,
+) -> Option<(
+    crate::native_config_language::ConfigCompletionEdit,
+    AbsentKeyAdded,
+)> {
+    use crate::native_config_language::ConfigSchemaKind;
+    let entry = crate::native_config_language::config_schema_entry(key)?;
+    if !matches!(
+        entry.kind,
+        ConfigSchemaKind::Table | ConfigSchemaKind::DynamicStringMap
+    ) {
+        return None;
+    }
+    let mut added = source.to_string();
+    if !added.is_empty() && !added.ends_with('\n') {
+        added.push('\n');
+    }
+    if !added.is_empty() {
+        added.push('\n');
+    }
+    added.push_str(&format!("[{key}]\n"));
+    let caret = added.len();
+    if !adding_changes_nothing(source, &added) {
+        return None;
+    }
+    let (edit, _) = smallest_edit(source, &added, key, Some(caret))?;
+    Some((edit, AbsentKeyAdded::Table))
+}
+
+/// A member of a list of records (`sparkle_words.custom`)
+/// absent from `source`: a new `[[root]]` record at the end of the file with
+/// the member's line and no value, the caret where it goes. A record is a
+/// list element, never a plain table — `[sparkle_words.custom.graphic]` is a
+/// map where the reader wants a list, and the file stops loading. `None`
+/// where `source` already has records: which one to add it to is the
+/// person's call.
+fn absent_record_member_edit(
+    source: &str,
+    root: &'static str,
+    key: &str,
+) -> Option<(
+    crate::native_config_language::ConfigCompletionEdit,
+    AbsentKeyAdded,
+)> {
+    let document = source.parse::<aterm_toml::edit::DocumentMut>().ok()?;
+    let mut node = document.as_item();
+    let mut present = true;
+    for part in root.split('.') {
+        match node.as_table_like().and_then(|table| table.get(part)) {
+            Some(child) => node = child,
+            None => {
+                present = false;
+                break;
+            }
+        }
+    }
+    if present {
+        return None;
+    }
+    let local = key.strip_prefix(root)?.strip_prefix('.')?;
+    let mut added = source.to_string();
+    if !added.is_empty() && !added.ends_with('\n') {
+        added.push('\n');
+    }
+    if !added.is_empty() {
+        added.push('\n');
+    }
+    added.push_str(&format!("[[{root}]]\n{local} = "));
+    let caret = added.len();
+    added.push('\n');
+    let (edit, _) = smallest_edit(source, &added, key, Some(caret))?;
+    Some((edit, AbsentKeyAdded::NeedsValue { record: Some(root) }))
+}
+
+/// The smallest edit that turns `source` into `added`, the caret after it,
+/// or at byte `caret` of `added` when given.
+fn smallest_edit(
+    source: &str,
+    added: &str,
+    key: &str,
+    caret: Option<usize>,
+) -> Option<(crate::native_config_language::ConfigCompletionEdit, ())> {
     let prefix = source
         .bytes()
         .zip(added.bytes())
@@ -139,20 +282,24 @@ fn absent_key_edit(
     }
     let replacement = prefix..source.len() - suffix;
     let insertion = added[prefix..added.len() - suffix].to_string();
-    (!insertion.is_empty()).then(|| {
-        let caret = insertion.len();
-        (
-            crate::native_config_language::ConfigCompletionEdit {
-                expected: source[replacement.clone()].to_string(),
-                replacement,
-                insertion,
-                post_insert_selection: caret..caret,
-                display: key.to_string(),
-                help: String::new(),
-            },
-            added_as,
-        )
-    })
+    if insertion.is_empty() {
+        return None;
+    }
+    let caret = caret
+        .and_then(|caret| caret.checked_sub(prefix))
+        .filter(|caret| *caret <= insertion.len() && insertion.is_char_boundary(*caret))
+        .unwrap_or(insertion.len());
+    Some((
+        crate::native_config_language::ConfigCompletionEdit {
+            expected: source[replacement.clone()].to_string(),
+            replacement,
+            insertion,
+            post_insert_selection: caret..caret,
+            display: key.to_string(),
+            help: String::new(),
+        },
+        (),
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -196,31 +343,31 @@ enum NativeDocumentJob {
         grant: DocumentGrant,
         plan: crate::native_document_io::SavePlan,
         config_themes: Option<std::sync::Arc<crate::app_config::ThemeCatalog>>,
-        proxy: winit::event_loop::EventLoopProxy<crate::Wake>,
+        proxy: aterm_window::event_loop::EventLoopProxy<crate::Wake>,
     },
     JournalAppend {
         document: DocumentId,
         path: std::path::PathBuf,
         key: crate::native_document_io::JournalDocumentKey,
         plan: crate::native_document_io::JournalAppendPlan,
-        proxy: winit::event_loop::EventLoopProxy<crate::Wake>,
+        proxy: aterm_window::event_loop::EventLoopProxy<crate::Wake>,
     },
     JournalRewrite {
         document: DocumentId,
         path: std::path::PathBuf,
         plan: JournalRewritePlan,
-        proxy: winit::event_loop::EventLoopProxy<crate::Wake>,
+        proxy: aterm_window::event_loop::EventLoopProxy<crate::Wake>,
     },
     JournalReseat {
         document: DocumentId,
         path: std::path::PathBuf,
         plan: JournalReseatPlan,
-        proxy: winit::event_loop::EventLoopProxy<crate::Wake>,
+        proxy: aterm_window::event_loop::EventLoopProxy<crate::Wake>,
     },
 }
 
 impl NativeDocumentJob {
-    fn proxy(&self) -> &winit::event_loop::EventLoopProxy<crate::Wake> {
+    fn proxy(&self) -> &aterm_window::event_loop::EventLoopProxy<crate::Wake> {
         match self {
             Self::Save { proxy, .. }
             | Self::JournalAppend { proxy, .. }
@@ -274,8 +421,9 @@ impl JournalRetrySet {
 }
 
 /// An append the headless test seam held back from inline execution
-/// ([`DocumentHostRuntime::held_journal_appends`]).
-#[cfg(test)]
+/// ([`DocumentHostRuntime::held_journal_appends`]). Unix, as the draft-carry
+/// tests that drive it (`editor_carry_conformance`) and every journal seam here.
+#[cfg(all(test, unix))]
 #[derive(Debug)]
 pub(crate) struct HeldJournalAppend {
     pub(crate) document: DocumentId,
@@ -286,7 +434,7 @@ pub(crate) struct HeldJournalAppend {
 
 /// A re-seat the headless test seam held back from inline execution
 /// ([`DocumentHostRuntime::held_journal_reseats`]).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[derive(Debug)]
 pub(crate) struct HeldJournalReseat {
     pub(crate) document: DocumentId,
@@ -637,6 +785,19 @@ impl JournalSlot {
     }
 }
 
+/// Why a document's disk generation no longer matches its saver baseline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DiskConflictCause {
+    /// The file changed on disk under a dirty buffer, or a save found it
+    /// changed.
+    Version,
+    /// A save could not be confirmed: the disk may or may not hold it.
+    SaveUnconfirmed,
+    /// aterm.toml's file binding (its target or logical path) changed; the
+    /// document must be reopened, whatever the buffer holds.
+    Binding,
+}
+
 pub(crate) struct DocumentHostRuntime {
     pub(crate) grants: DocumentGrantStore,
     pub(crate) persistence: DocumentPersistenceStore,
@@ -656,21 +817,23 @@ pub(crate) struct DocumentHostRuntime {
     /// run inline. When `Some`, appends are held here for a test to run later as
     /// the worker would (`App::run_held_journal_append_for_test`), putting an
     /// append in flight across a park.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     held_journal_appends: Option<Vec<HeldJournalAppend>>,
     /// Test seam: [`Self::held_journal_appends`] for re-seats
     /// (`App::run_held_journal_reseat_for_test`).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     held_journal_reseats: Option<Vec<HeldJournalReseat>>,
     /// Test seam: a headless successor restores no document tab
     /// ([`App::successor_restores_document_tabs`]). Set, the App answers as a
     /// windowed one, so a test can carry drafts.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     carry_as_windowed_for_test: bool,
-    /// Documents whose on-disk generation no longer matches the saver baseline.
-    /// This host-owned latch blocks every save entry point until an explicit
-    /// reload/reconciliation installs a fresh stable observation.
-    disk_conflicts: BTreeSet<DocumentId>,
+    /// Documents whose on-disk generation no longer matches the saver baseline,
+    /// and why. This host-owned latch blocks every save entry point until an
+    /// explicit reload/reconciliation installs a fresh stable observation — or
+    /// the buffer returns to the version aterm admitted, which holds no local
+    /// edits ([`App::adopt_disk_when_buffer_is_base`]).
+    disk_conflicts: BTreeMap<DocumentId, DiskConflictCause>,
     inflight: BTreeSet<DocumentId>,
     pending_saves: BTreeMap<DocumentId, PendingDocumentSaveIntent>,
     pending_closes: BTreeMap<DocumentId, Vec<PendingDocumentClose>>,
@@ -694,6 +857,16 @@ pub(crate) struct DocumentHostRuntime {
     /// [`Self::admissions`], the latest request's line winning, and taken by
     /// the install (or dropped with a failed one).
     reveals: BTreeMap<(WindowId, DocumentAdmissionKey), LineReveal>,
+    /// The `edit` verb's tickets ([`crate::app_edit`]).
+    pub(crate) edits: crate::app_edit::EditTickets,
+    /// A document view closed, or a Suspended document's save or journal write
+    /// landed, since the last [`App::release_unheld_documents`]: the next park
+    /// looks for documents nothing holds any more.
+    pub(crate) release_due: bool,
+    /// When the last recently-closed record that alone kept a document expires
+    /// (`App::lat_epoch` milliseconds): the first park at or past it looks
+    /// again ([`App::release_documents_at_park`]).
+    pub(crate) release_deadline_ms: Option<u64>,
 }
 
 /// Where a document open lands its caret: a 1-based line and, optionally, a
@@ -729,13 +902,13 @@ impl DocumentHostRuntime {
             recovery_status: BTreeMap::new(),
             journal_retries: JournalRetrySet::default(),
             journal_landed_while_parked: false,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             held_journal_appends: None,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             held_journal_reseats: None,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             carry_as_windowed_for_test: false,
-            disk_conflicts: BTreeSet::new(),
+            disk_conflicts: BTreeMap::new(),
             inflight: BTreeSet::new(),
             pending_saves: BTreeMap::new(),
             pending_closes: BTreeMap::new(),
@@ -744,6 +917,9 @@ impl DocumentHostRuntime {
             admissions: BTreeMap::new(),
             next_admission: 1,
             reveals: BTreeMap::new(),
+            edits: crate::app_edit::EditTickets::default(),
+            release_due: false,
+            release_deadline_ms: None,
         }
     }
 }
@@ -757,6 +933,11 @@ impl DocumentHostRuntime {
 pub(crate) struct DocumentAdmissionKey {
     pub(crate) uri: String,
     pub(crate) kind: AppKind,
+    /// The `edit` ticket this admission opens a fresh view for
+    /// ([`crate::app_edit`]); `None` for every gesture. Part of the key, so an
+    /// edit never coalesces with a gesture's open of the same file, or with
+    /// another edit.
+    pub(crate) edit: Option<crate::app_edit::EditTicketId>,
 }
 
 /// One in-flight admission (see [`DocumentHostRuntime::admissions`]).
@@ -780,14 +961,55 @@ pub(crate) struct DocumentAdmissionTicket(u64);
 const DOCUMENT_ADMISSION_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// What the worker hands back through `Wake::DocumentAdmitted`: the request it
-/// was given, verbatim, plus the admitted file or the error text. Plain owned
-/// data; it crosses from the worker to the main thread by move.
+/// was given, verbatim, plus the admitted file or why the read refused. Plain
+/// owned data; it crosses from the worker to the main thread by move.
 #[derive(Debug)]
 pub(crate) struct DocumentAdmissionOutcome {
     pub(crate) ticket: DocumentAdmissionTicket,
     pub(crate) wid: WindowId,
     pub(crate) key: DocumentAdmissionKey,
-    pub(crate) result: Result<Box<AdmittedDocument>, String>,
+    pub(crate) result: Result<Box<AdmittedDocument>, DocumentOpenFailure>,
+}
+
+/// Why an admission's read refused: the host's error, kept typed so an `edit`
+/// ticket can name it on the wire (`ERR refused <word>`,
+/// [`DocumentHostError::refusal_word`]). Its text is what a gesture shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DocumentOpenFailure(pub(crate) DocumentHostError);
+
+impl std::fmt::Display for DocumentOpenFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "document open failed: {}", self.0)
+    }
+}
+
+impl From<DocumentOpenFailure> for String {
+    fn from(failure: DocumentOpenFailure) -> Self {
+        failure.to_string()
+    }
+}
+
+/// The tab an open landed in: the canonical document, the view showing it and
+/// that view's tab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InstalledDocument {
+    pub(crate) kind: AppKind,
+    pub(crate) canonical_uri: String,
+    pub(crate) document: DocumentId,
+    pub(crate) tab: crate::tab_model::TabId,
+    pub(crate) view: crate::tab_model::ViewId,
+}
+
+impl InstalledDocument {
+    /// The `app <kind> <uri> view=<n>` status line every opener reports.
+    pub(crate) fn line(&self) -> String {
+        format!(
+            "app {} {} view={}",
+            self.kind.as_str(),
+            self.canonical_uri,
+            self.view.get()
+        )
+    }
 }
 
 /// How a two-phase open request was disposed of on the calling thread.
@@ -847,6 +1069,15 @@ impl App {
         wid: WindowId,
     ) -> Result<String, String> {
         self.ensure_and_open_config_editor_at_in_window(wid, None)
+    }
+
+    /// The App menu's "Open aterm.toml": the native editor on the one config
+    /// file, in the frontmost window — the file itself, not a Settings page.
+    pub(crate) fn open_config_editor_in_front(&mut self) -> Result<String, String> {
+        let wid = self
+            .frontmost_window
+            .ok_or_else(|| "there is no window to open aterm.toml in".to_string())?;
+        self.ensure_and_open_config_editor_in_window(wid)
     }
 
     pub(crate) fn ensure_and_open_config_editor_at_in_window(
@@ -981,12 +1212,23 @@ impl App {
             ConfigEditorRevealDecision::AddAbsent { requested } => {
                 buffer.minibuffer = crate::native_editor::Minibuffer::Inactive;
                 let Some((edit, added_as)) = absent_key_edit(&snapshot.text, &requested) else {
-                    // No value to offer (a table, a map): say how, on a
+                    // No line to add (a list of records), or a member of a
+                    // list of records the file already has: say how, on a
                     // footer nothing else covers.
-                    let note = format!(
-                        "{requested} is not in aterm.toml yet. Add it on a line of its own; \
-                         completion offers its values."
-                    );
+                    let note = match crate::native_config_language::config_key_record_root(
+                        &requested,
+                    ) {
+                        Some(root) => format!(
+                            "{requested} is not in aterm.toml yet. Add it inside a [[{root}]] \
+                             record; completion offers its values."
+                        ),
+                        // A list of records itself is written record by
+                        // record, never as one line.
+                        None => format!(
+                            "{requested} is not in aterm.toml yet. Add a [[{requested}]] record \
+                             at the end of the file; completion offers its fields."
+                        ),
+                    };
                     state.status = Some(note.clone());
                     state.reveal_status = Some(note);
                     return Ok(());
@@ -1009,8 +1251,13 @@ impl App {
                     return Err("native config editor view disappeared during reveal".to_string());
                 };
                 if let Some(buffer) = state.buffer.as_mut() {
-                    if let Some(range) =
-                        crate::native_config_language::config_key_source_range(&text, &requested)
+                    // A value added at its default is selected, to type over;
+                    // a line added without one keeps the caret where the
+                    // value goes.
+                    if added_as == AbsentKeyAdded::AtDefault
+                        && let Some(range) = crate::native_config_language::config_key_source_range(
+                            &text, &requested,
+                        )
                     {
                         buffer.selections = vec![crate::native_editor::Selection {
                             anchor: range.start,
@@ -1026,11 +1273,18 @@ impl App {
                     AbsentKeyAdded::AtDefault => format!(
                         "Added {requested} at its default, which changes nothing. Undo removes it."
                     ),
-                    // A comment changes nothing; its example value is a
-                    // placeholder to replace, not a default.
-                    AbsentKeyAdded::Commented => format!(
-                        "Added {requested} as a comment, which changes nothing. Set it, then \
-                         remove the #."
+                    // No value spells "unset": the caret waits where one
+                    // goes, and the line does not parse until it is there.
+                    AbsentKeyAdded::NeedsValue { record: None } => format!(
+                        "Type a value for {requested}. Save waits for one; Undo removes the line."
+                    ),
+                    AbsentKeyAdded::NeedsValue { record: Some(root) } => format!(
+                        "Added a [[{root}]] record: type a value for {requested}. Save waits for \
+                         one; Undo removes it."
+                    ),
+                    AbsentKeyAdded::Table => format!(
+                        "Added [{requested}], which changes nothing. Its entries go under it; \
+                         Undo removes it."
                     ),
                 };
                 state.status = Some(note.clone());
@@ -1069,7 +1323,7 @@ impl App {
             let message =
                 "aterm.toml's file binding changed; Save is blocked until Manual is reopened"
                     .to_string();
-            self.set_document_disk_conflict(document, true);
+            self.set_document_disk_conflict(document, Some(DiskConflictCause::Binding));
             self.set_document_recovery_status(document, Some(message.clone()));
             return Err(message);
         }
@@ -1163,8 +1417,17 @@ impl App {
         let editor_event = match event {
             #[cfg(any(a11y_tree, test))]
             AppEvent::InsertText(_) | AppEvent::EditorSetSelection { .. } => true,
-            AppEvent::TextInput(_)
-            | AppEvent::EditorChord(_)
+            // Keys reach an editor as `EditorInput`, which amacs's input
+            // reducer reads. Of the native pages' text-field events an editor
+            // takes only what no key spells: an input method's commit and
+            // preedit, the menu's Select All, and a cancel.
+            AppEvent::TextInput(
+                TextInputEvent::Commit(_)
+                | TextInputEvent::Preedit { .. }
+                | TextInputEvent::SelectAll
+                | TextInputEvent::Cancel,
+            )
+            | AppEvent::EditorInput(_)
             | AppEvent::EditorCommand(_)
             | AppEvent::EditorCompletion(_)
             | AppEvent::EditorConfigCompletion(_)
@@ -1211,25 +1474,48 @@ impl App {
             let Some(buffer) = state.buffer.as_mut() else {
                 return Err("editor buffer is not attached".to_string());
             };
-            state.preedit.clear();
-            state.preedit_caret = None;
-            if !matches!(
+            // A scroll, a viewport change or a preedit leaves the caret where
+            // it is, and every other host event reveals it; an input's own
+            // reduction says which it was, or that the reducer ignored it.
+            let host_scroll = matches!(
                 event,
                 AppEvent::ScrollLines(_)
                     | AppEvent::EditorViewportChanged { .. }
                     | AppEvent::TextInput(TextInputEvent::Preedit { .. })
-            ) {
-                state.config_completion_selected = 0;
-                state.config_completion_interaction = None;
-                // An edit or caret move: the reveal's note has been read.
-                state.reveal_status = None;
-            }
-            let reduced = match event {
-                #[cfg(any(a11y_tree, test))]
-                AppEvent::InsertText(text) => workspace.insert_text(store, buffer, text),
-                AppEvent::TextInput(TextInputEvent::Commit(text)) => {
-                    workspace.insert_text(store, buffer, text)
+            );
+            let mut follow = if host_scroll {
+                Follow::Scrolled
+            } else {
+                Follow::Reveal
+            };
+            // An input resets the host state below once it is reduced, and
+            // only when the reducer took it.
+            let reduced_by_input = matches!(event, AppEvent::EditorInput(_));
+            if !reduced_by_input {
+                state.preedit.clear();
+                state.preedit_caret = None;
+                if !host_scroll {
+                    state.config_completion_selected = 0;
+                    state.config_completion_interaction = None;
+                    // An edit or caret move: the reveal's note has been read.
+                    state.reveal_status = None;
                 }
+            }
+            let mut followed = |reduction: Reduction| {
+                follow = reduction.follow;
+                reduction.effects
+            };
+            let reduced = match event {
+                AppEvent::EditorInput(input) => workspace
+                    .handle_input(store, buffer, input.clone())
+                    .map(&mut followed),
+                #[cfg(any(a11y_tree, test))]
+                AppEvent::InsertText(text) => workspace
+                    .handle_input(store, buffer, EditorInput::Text(text.clone()))
+                    .map(&mut followed),
+                AppEvent::TextInput(TextInputEvent::Commit(text)) => workspace
+                    .handle_input(store, buffer, EditorInput::Text(text.clone()))
+                    .map(&mut followed),
                 AppEvent::TextInput(TextInputEvent::Preedit { text, selection }) => {
                     state.preedit.clone_from(text);
                     state.preedit_caret = crate::native_text_input::normalize_preedit_selection(
@@ -1239,77 +1525,11 @@ impl App {
                     .map(|selection| selection.end);
                     Ok(Vec::new())
                 }
-                AppEvent::TextInput(TextInputEvent::Backspace) => {
-                    if buffer.minibuffer_active() {
-                        workspace.minibuffer_backspace(store, buffer)
-                    } else {
-                        workspace.execute(store, buffer, EditorCommand::DeleteBackward)
-                    }
-                }
-                AppEvent::TextInput(
-                    input @ (TextInputEvent::Delete
-                    | TextInputEvent::Left { .. }
-                    | TextInputEvent::Right { .. }
-                    | TextInputEvent::Undo
-                    | TextInputEvent::Redo),
-                ) => {
-                    if let Some(effects) = workspace.minibuffer_blocks_document_input(buffer) {
-                        Ok(effects)
-                    } else {
-                        let (command, extend) = match input {
-                            TextInputEvent::Left { extend } => {
-                                (EditorCommand::MoveBackward, *extend)
-                            }
-                            TextInputEvent::Right { extend } => {
-                                (EditorCommand::MoveForward, *extend)
-                            }
-                            TextInputEvent::Undo => (EditorCommand::Undo, false),
-                            TextInputEvent::Redo => (EditorCommand::Redo, false),
-                            // `Delete`, the one input of this arm left.
-                            _ => (EditorCommand::DeleteForward, false),
-                        };
-                        // A shift-extended move keeps every selection's anchor.
-                        let anchors = if extend {
-                            buffer.selections.iter().map(|s| s.anchor).collect()
-                        } else {
-                            Vec::new()
-                        };
-                        let result = workspace.execute(store, buffer, command);
-                        for (selection, anchor) in buffer.selections.iter_mut().zip(anchors) {
-                            selection.anchor = anchor;
-                        }
-                        result
-                    }
-                }
                 AppEvent::TextInput(TextInputEvent::SelectAll) => {
-                    if let Some(effects) = workspace.minibuffer_blocks_document_input(buffer) {
-                        Ok(effects)
-                    } else {
-                        let len = store
-                            .snapshot(document)
-                            .ok_or_else(|| "editor document disappeared".to_string())?
-                            .text
-                            .len();
-                        buffer.selections = vec![Selection {
-                            anchor: 0,
-                            head: len,
-                        }];
-                        buffer.primary = 0;
-                        Ok(Vec::new())
-                    }
-                }
-                AppEvent::TextInput(TextInputEvent::Submit) => {
-                    if buffer.minibuffer_active() {
-                        workspace.submit_minibuffer(store, buffer)
-                    } else {
-                        workspace.insert_text(store, buffer, "\n")
-                    }
+                    workspace.select_whole_document(store, buffer)
                 }
                 AppEvent::TextInput(TextInputEvent::Cancel) => {
                     workspace.execute(store, buffer, EditorCommand::Abort)
-                }
-                AppEvent::EditorChord(chord) => {
-                    workspace.handle_chord(store, buffer, chord.clone())
                 }
                 AppEvent::EditorCommand(command) => workspace.execute(store, buffer, *command),
                 AppEvent::EditorCompletion(action) => {
@@ -1425,12 +1645,23 @@ impl App {
                 }
                 _ => unreachable!("editor event filter above is exhaustive"),
             };
-            if !matches!(
-                event,
-                AppEvent::ScrollLines(_)
-                    | AppEvent::EditorViewportChanged { .. }
-                    | AppEvent::TextInput(TextInputEvent::Preedit { .. })
-            ) && let Some(snapshot) = store.snapshot(document)
+            // An input the reducer declined changed nothing, and goes back
+            // to the face, which may give the key a meaning of its own.
+            if follow == Follow::Ignored {
+                return Ok(Some(EventResult::Bubble));
+            }
+            if reduced_by_input {
+                state.preedit.clear();
+                state.preedit_caret = None;
+                if follow == Follow::Reveal {
+                    state.config_completion_selected = 0;
+                    state.config_completion_interaction = None;
+                    // An edit or caret move: the reveal's note has been read.
+                    state.reveal_status = None;
+                }
+            }
+            if follow == Follow::Reveal
+                && let Some(snapshot) = store.snapshot(document)
             {
                 let visible_lines = buffer.viewport_lines();
                 buffer.ensure_primary_visible(&snapshot.text, visible_lines);
@@ -1475,6 +1706,14 @@ impl App {
             machine = "NativeUpdateEditorCarry",
             action = "Type",
             project = "aterm_gui::editor_carry_conformance::Rig::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AmacsEditTicket",
+            action = "Edit",
+            project = "aterm_gui::app_edit::edit_ticket_conformance::Rig::project"
         )
     )]
     fn publish_editor_commit(
@@ -1536,6 +1775,11 @@ impl App {
             self.refresh_native_presentation(wid, instance, view);
             self.request_native_redraw(wid);
         }
+        // After the commit is published: a reload installs newer text, which
+        // must not be followed by this commit's stale one.
+        if let Err(message) = self.adopt_disk_when_buffer_is_base(document) {
+            self.set_document_recovery_status(document, Some(message));
+        }
     }
 
     /// A COMMIT THAT PUTS BACK THE BYTES ON DISK IS CLEAN: an Undo (or any
@@ -1552,27 +1796,79 @@ impl App {
     ) -> Result<(), String> {
         let document = snapshot.id;
         if self.document_store.dirty(document) != Some(true)
-            || self.native_documents.persistence.save_in_flight(document)
-            || self.native_documents.inflight.contains(&document)
-            || self.native_documents.pending_saves.contains_key(&document)
-            || self.native_documents.disk_conflicts.contains(&document)
+            || self.document_save_owed(document)
+            || self.native_documents.disk_conflicts.contains_key(&document)
+            || !self.buffer_is_admitted_baseline(snapshot)
         {
             return Ok(());
         }
-        let Some(observed) = self.native_documents.persistence.observed(document) else {
+        self.mark_buffer_the_admitted_file(snapshot)
+    }
+
+    /// [`Self::checkpoint_commit_back_on_disk`] for `document`'s current text,
+    /// outside an edit: a buffer that is clean now says so to its views (the
+    /// tab's mark, Save) as an edit's publication would.
+    fn checkpoint_current_back_on_disk(&mut self, document: DocumentId) -> Result<(), String> {
+        let Some(snapshot) = self.document_store.snapshot(document) else {
             return Ok(());
         };
+        if self.document_store.dirty(document) != Some(true) {
+            return Ok(());
+        }
+        self.checkpoint_commit_back_on_disk(&snapshot)?;
+        if self.document_store.dirty(document) == Some(false) {
+            let revision = self.document_store.revision(document).unwrap_or(0);
+            self.native_runtime
+                .publish_document(document, snapshot.text.as_ref(), revision, false);
+            for (wid, instance, view) in self.document_native_views(document) {
+                let _ = self.native_runtime.dispatch(
+                    instance,
+                    view,
+                    AppEvent::DocumentChanged { document, revision },
+                );
+                self.refresh_native_presentation(wid, instance, view);
+                self.request_native_redraw(wid);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a save of `document` is in flight or owed: an older save still
+    /// landing could put other bytes on disk after the buffer read clean.
+    fn document_save_owed(&self, document: DocumentId) -> bool {
+        self.native_documents.persistence.save_in_flight(document)
+            || self.native_documents.inflight.contains(&document)
+            || self.native_documents.pending_saves.contains_key(&document)
+    }
+
+    /// Whether `snapshot`'s text is exactly the version of the file aterm
+    /// admitted (loaded, saved, or accepted from disk): a buffer that is
+    /// holds no local edits, conflict or not.
+    fn buffer_is_admitted_baseline(
+        &self,
+        snapshot: &crate::document_store::DocumentSnapshot,
+    ) -> bool {
+        let document = snapshot.id;
+        let Some(observed) = self.native_documents.persistence.observed(document) else {
+            return false;
+        };
         let bytes = snapshot.text.as_bytes();
-        if !observed.exists
-            || observed.len != bytes.len() as u64
-            || observed.content != crate::native_document_io::ContentFingerprint::of(bytes)
-            || !self
+        observed.exists
+            && observed.len == bytes.len() as u64
+            && observed.content == crate::native_document_io::ContentFingerprint::of(bytes)
+            && self
                 .native_documents
                 .persistence
                 .observed_text_matches(document, snapshot.text.as_ref())
-        {
-            return Ok(());
-        }
+    }
+
+    /// Move `snapshot`'s document checkpoint to it: its text is the admitted
+    /// file ([`Self::buffer_is_admitted_baseline`]), so it is clean.
+    fn mark_buffer_the_admitted_file(
+        &mut self,
+        snapshot: &crate::document_store::DocumentSnapshot,
+    ) -> Result<(), String> {
+        let document = snapshot.id;
         self.document_store
             .checkpoint_ack(document, snapshot.seq)
             .map_err(|error| format!("could not mark the unchanged file durable: {error:?}"))?;
@@ -1592,6 +1888,33 @@ impl App {
             )?;
         }
         Ok(())
+    }
+
+    /// A BUFFER BACK AT THE VERSION ATERM ADMITTED HAS NOTHING TO LOSE: when
+    /// an edit (an Undo, most often) returns a document whose file changed on
+    /// disk to the text aterm loaded or last saved, it has no local edits, so
+    /// the disk's current version is taken as a clean document's is — the
+    /// same fresh read Discard Changes and Reload from Disk makes — and the
+    /// conflict, its "copy any local edits" guidance and the dirty mark go.
+    /// Not while a save is in flight or owed (it owns what lands next), and
+    /// not for a changed file binding, which only a reopen settles.
+    fn adopt_disk_when_buffer_is_base(&mut self, document: DocumentId) -> Result<(), String> {
+        let Some(cause) = self.native_documents.disk_conflicts.get(&document).copied() else {
+            return Ok(());
+        };
+        if cause == DiskConflictCause::Binding || self.document_save_owed(document) {
+            return Ok(());
+        }
+        let Some(snapshot) = self.document_store.snapshot(document) else {
+            return Ok(());
+        };
+        if !self.buffer_is_admitted_baseline(&snapshot) {
+            return Ok(());
+        }
+        if self.document_store.dirty(document) == Some(true) {
+            self.mark_buffer_the_admitted_file(&snapshot)?;
+        }
+        self.refresh_native_document(document).map(|_| ())
     }
 
     fn drive_document_journal(&mut self, document: DocumentId) -> Result<(), String> {
@@ -1647,7 +1970,7 @@ impl App {
                             &mut native_documents.journal_retries,
                         );
                     }
-                    #[cfg(test)]
+                    #[cfg(all(test, unix))]
                     if let Some(held) = self.native_documents.held_journal_appends.as_mut() {
                         held.push(HeldJournalAppend {
                             document,
@@ -1729,7 +2052,7 @@ impl App {
                             &mut native_documents.journal_retries,
                         );
                     }
-                    #[cfg(test)]
+                    #[cfg(all(test, unix))]
                     if let Some(held) = self.native_documents.held_journal_reseats.as_mut() {
                         held.push(HeldJournalReseat {
                             document,
@@ -1777,6 +2100,7 @@ impl App {
         generation: crate::native_document_io::JournalGeneration,
         result: crate::native_document_io::JournalAppendResult,
     ) {
+        self.note_document_settling(document);
         let completion = self
             .native_documents
             .journals
@@ -1826,6 +2150,7 @@ impl App {
         generation: JournalRewriteGeneration,
         result: JournalReseatResult,
     ) {
+        self.note_document_settling(document);
         let preserved = matches!(
             &result,
             JournalReseatResult::Republished {
@@ -1898,7 +2223,7 @@ impl App {
                     .unwrap_or("document recovery is unavailable")
             ));
         };
-        if self.native_documents.disk_conflicts.contains(&document) {
+        if self.native_documents.disk_conflicts.contains_key(&document) {
             return DraftCarry::Refused(
                 "its file changed on disk after the draft began".to_string(),
             );
@@ -1962,7 +2287,7 @@ impl App {
     /// replaces the app cold (spawn, then exit; `apply_staged_update_now`) and
     /// reopens nothing.
     pub(crate) fn successor_restores_document_tabs(&self) -> bool {
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         if self.native_documents.carry_as_windowed_for_test {
             return true;
         }
@@ -1970,7 +2295,7 @@ impl App {
     }
 
     /// Answer [`Self::successor_restores_document_tabs`] as a windowed App.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn carry_drafts_as_windowed_for_test(&mut self) {
         self.native_documents.carry_as_windowed_for_test = true;
     }
@@ -2072,13 +2397,13 @@ impl App {
     /// Point this App's draft journals at `root` — how a test gives an
     /// outgoing App and its successor the one journal directory two processes
     /// of one user share.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn use_document_journal_root_for_test(&mut self, root: std::path::PathBuf) {
         self.native_documents.journals = JournalSlot::for_test(root);
     }
 
     /// The journal identity this App's store gives `document`'s URI.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn document_journal_key_for_test(
         &self,
         document: DocumentId,
@@ -2087,7 +2412,7 @@ impl App {
         Some(self.native_documents.journals.as_ref()?.key_for(uri))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn document_journal_path_for_test(
         &self,
         document: DocumentId,
@@ -2099,7 +2424,7 @@ impl App {
     }
 
     /// The journal image this App last published for `document`.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn document_journal_image_for_test(
         &self,
         document: DocumentId,
@@ -2110,7 +2435,7 @@ impl App {
             .durable_image(document)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn document_journal_durable_seq_for_test(
         &self,
         document: DocumentId,
@@ -2121,7 +2446,7 @@ impl App {
             .durable_seq(document)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn document_journal_reseat_owed_for_test(&self, document: DocumentId) -> bool {
         self.native_documents
             .journals
@@ -2131,12 +2456,12 @@ impl App {
 
     /// Hold every journal append from now on instead of running it inline
     /// ([`DocumentHostRuntime::held_journal_appends`]).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn hold_journal_appends_for_test(&mut self) {
         self.native_documents.held_journal_appends = Some(Vec::new());
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn held_journal_appends_for_test(&self) -> &[HeldJournalAppend] {
         self.native_documents
             .held_journal_appends
@@ -2147,7 +2472,7 @@ impl App {
     /// Run the oldest held append exactly as the document worker does — the
     /// worker's executor and patience, then the completion the worker's wake
     /// delivers (`finish_native_document_journal`).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn run_held_journal_append_for_test(&mut self) -> bool {
         let Some(held) = self
             .native_documents
@@ -2170,12 +2495,12 @@ impl App {
 
     /// Hold every journal re-seat from now on instead of running it inline
     /// ([`DocumentHostRuntime::held_journal_reseats`]).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn hold_journal_reseats_for_test(&mut self) {
         self.native_documents.held_journal_reseats = Some(Vec::new());
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn held_journal_reseats_for_test(&self) -> &[HeldJournalReseat] {
         self.native_documents
             .held_journal_reseats
@@ -2186,7 +2511,7 @@ impl App {
     /// Run the oldest held re-seat exactly as the document worker does — the
     /// worker's executor and patience, then the completion its wake delivers
     /// (`finish_native_document_journal_reseat`).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn run_held_journal_reseat_for_test(&mut self) -> bool {
         let Some(held) = self
             .native_documents
@@ -2202,12 +2527,62 @@ impl App {
         true
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn document_recovery_status_for_test(&self, document: DocumentId) -> Option<&str> {
         self.native_documents
             .recovery_status
             .get(&document)
             .map(String::as_str)
+    }
+
+    /// Test seam: start a save of `document`'s head as the event loop's worker
+    /// would, and hold it in flight; [`Self::land_held_document_save_for_test`]
+    /// runs it. Puts a checkpoint between a close and its detach.
+    #[cfg(test)]
+    pub(crate) fn hold_document_save_for_test(
+        &mut self,
+        document: DocumentId,
+    ) -> crate::native_document_host::PendingDocumentSave {
+        let snapshot = self.document_store.snapshot(document).expect("document");
+        let pending = self
+            .native_documents
+            .persistence
+            .begin(&snapshot)
+            .expect("a save begins");
+        assert!(self.native_documents.inflight.insert(document));
+        self.native_runtime.set_document_saving(document, true);
+        pending
+    }
+
+    /// Test seam: run a save [`Self::hold_document_save_for_test`] held and
+    /// reduce its completion as `Wake` delivery does.
+    #[cfg(test)]
+    pub(crate) fn land_held_document_save_for_test(
+        &mut self,
+        document: DocumentId,
+        source_view: crate::tab_model::ViewId,
+        pending: crate::native_document_host::PendingDocumentSave,
+    ) -> Result<(), String> {
+        let grant = self
+            .native_documents
+            .grants
+            .cloned_grant(pending.grant)
+            .expect("the save's grant");
+        let result = crate::native_document_host::execute_granted_save(&grant, &pending.plan);
+        self.finish_native_document_save(
+            document,
+            source_view,
+            pending.plan.generation,
+            pending.plan.bytes,
+            result,
+            None,
+        )
+    }
+
+    /// Test seam: whether a close of `document` waits for its checkpoint.
+    #[cfg(test)]
+    pub(crate) fn document_close_pending_for_test(&self, document: DocumentId) -> bool {
+        self.native_documents.pending_closes.contains_key(&document)
     }
 
     pub(crate) fn finish_native_document_journal_rewrite(
@@ -2216,6 +2591,7 @@ impl App {
         generation: JournalRewriteGeneration,
         result: JournalRewriteResult,
     ) {
+        self.note_document_settling(document);
         let completion = self
             .native_documents
             .journals
@@ -2258,14 +2634,18 @@ impl App {
         }
     }
 
-    fn set_document_disk_conflict(&mut self, document: DocumentId, conflicted: bool) {
-        if conflicted {
-            self.native_documents.disk_conflicts.insert(document);
+    fn set_document_disk_conflict(
+        &mut self,
+        document: DocumentId,
+        conflict: Option<DiskConflictCause>,
+    ) {
+        if let Some(cause) = conflict {
+            self.native_documents.disk_conflicts.insert(document, cause);
         } else {
             self.native_documents.disk_conflicts.remove(&document);
         }
         self.native_runtime
-            .set_document_disk_conflict(document, conflicted);
+            .set_document_disk_conflict(document, conflict.is_some());
         for (window, _, _) in self.document_native_views(document) {
             self.request_native_redraw(window);
         }
@@ -2489,7 +2869,7 @@ impl App {
         };
         match reduction {
             crate::native_document_io::FileWatchReduction::Unchanged => {
-                let cleared_conflict = self.native_documents.disk_conflicts.contains(&document);
+                let cleared_conflict = self.native_documents.disk_conflicts.contains_key(&document);
                 if cleared_conflict
                     || !self
                         .native_documents
@@ -2507,13 +2887,18 @@ impl App {
                         })?;
                 }
                 if cleared_conflict {
-                    self.set_document_disk_conflict(document, false);
+                    self.set_document_disk_conflict(document, None);
                     self.set_document_recovery_status(document, None);
+                    // A buffer that is the file again is clean, not "local
+                    // edits" waiting for a Save.
+                    self.checkpoint_current_back_on_disk(document)?;
+                    let status = if self.document_store.dirty(document).unwrap_or(false) {
+                        "Disk conflict cleared · Save is available"
+                    } else {
+                        "Disk conflict cleared · content is unchanged"
+                    };
                     for (_, _, view) in self.document_native_views(document) {
-                        self.set_editor_view_status(
-                            view,
-                            "Disk conflict cleared · Save is available",
-                        );
+                        self.set_editor_view_status(view, status);
                     }
                 }
             }
@@ -2524,11 +2909,14 @@ impl App {
                     .map_err(|error| {
                         format!("could not refresh equivalent disk baseline: {error:?}")
                     })?;
-                let cleared_conflict = self.native_documents.disk_conflicts.contains(&document);
-                self.set_document_disk_conflict(document, false);
+                let cleared_conflict = self.native_documents.disk_conflicts.contains_key(&document);
+                self.set_document_disk_conflict(document, None);
                 if cleared_conflict {
                     self.set_document_recovery_status(document, None);
                 }
+                // The refreshed baseline may be the buffer's own text: then
+                // there are no local edits to preserve.
+                self.checkpoint_current_back_on_disk(document)?;
                 let status = if self.document_store.dirty(document).unwrap_or(false) {
                     "Disk version refreshed · local edits preserved · Save is available"
                 } else {
@@ -2547,7 +2935,7 @@ impl App {
                 )?;
             }
             crate::native_document_io::FileWatchReduction::ConflictDirty { change } => {
-                self.set_document_disk_conflict(document, true);
+                self.set_document_disk_conflict(document, Some(DiskConflictCause::Version));
                 // The same words as the save refusal for the same conflict.
                 let line = match change {
                     crate::native_document_io::VersionConflict::Existence => {
@@ -2687,7 +3075,7 @@ impl App {
             self.refresh_native_presentation(window, instance, view);
             self.request_native_redraw(window);
         }
-        self.set_document_disk_conflict(document, false);
+        self.set_document_disk_conflict(document, None);
         self.set_document_recovery_status(document, None);
         self.drive_document_journal(document)?;
         Ok(())
@@ -2698,7 +3086,7 @@ impl App {
         document: DocumentId,
         source_view: crate::tab_model::ViewId,
     ) -> Result<(), String> {
-        if self.native_documents.disk_conflicts.contains(&document) {
+        if self.native_documents.disk_conflicts.contains_key(&document) {
             let message = "Save blocked · file changed on disk; copy any local edits you need to keep, then choose ‘Discard Changes and Reload from Disk’".to_string();
             self.set_editor_view_status(source_view, &message);
             return Err(message);
@@ -2802,6 +3190,14 @@ impl App {
         )
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AmacsEditTicket",
+            action = "SaveAck",
+            project = "aterm_gui::app_edit::edit_ticket_conformance::Rig::project"
+        )
+    )]
     pub(crate) fn finish_native_document_save(
         &mut self,
         document: DocumentId,
@@ -2813,6 +3209,7 @@ impl App {
             Result<crate::native_config_service::PreparedConfigObservation, String>,
         >,
     ) -> Result<(), String> {
+        self.note_document_settling(document);
         self.native_documents.inflight.remove(&document);
         let reduction = match self
             .native_documents
@@ -2864,8 +3261,8 @@ impl App {
             }
             crate::native_document_io::SaveReduction::ReboundEquivalent(_) => {
                 let _ = self.document_store.checkpoint_fail(document);
-                let cleared_conflict = self.native_documents.disk_conflicts.contains(&document);
-                self.set_document_disk_conflict(document, false);
+                let cleared_conflict = self.native_documents.disk_conflicts.contains_key(&document);
+                self.set_document_disk_conflict(document, None);
                 if cleared_conflict {
                     self.set_document_recovery_status(document, None);
                 }
@@ -2876,7 +3273,7 @@ impl App {
             }
             crate::native_document_io::SaveReduction::Conflict(conflict) => {
                 let _ = self.document_store.checkpoint_fail(document);
-                self.set_document_disk_conflict(document, true);
+                self.set_document_disk_conflict(document, Some(DiskConflictCause::Version));
                 aterm_log::warn!("document save refused: file changed on disk ({conflict:?})");
                 let message = match conflict {
                     crate::native_document_io::VersionConflict::Existence => {
@@ -2900,7 +3297,7 @@ impl App {
                 ..
             } => {
                 let _ = self.document_store.checkpoint_fail(document);
-                self.set_document_disk_conflict(document, true);
+                self.set_document_disk_conflict(document, Some(DiskConflictCause::SaveUnconfirmed));
                 aterm_log::warn!(
                     "document save indeterminate at {stage:?}: {message} (observed: {observed:?})"
                 );
@@ -2985,6 +3382,14 @@ impl App {
     /// Whole-tab multi-document barrier. Every document leaf is prepared first; only a
     /// single successful batch verdict removes reference edges, so a later blocked leaf
     /// can never leave an earlier sibling half-detached.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AmacsEditTicket",
+            action = "RequestClose",
+            project = "aterm_gui::app_edit::edit_ticket_conformance::Rig::project"
+        )
+    )]
     pub(crate) fn prepare_document_tab_close_batch(
         &mut self,
         wid: WindowId,
@@ -3177,6 +3582,11 @@ impl App {
                         self.remove_view_link(view);
                     }
                 }
+                // As `close_focused_mixed_leaf` does for an immediate close: a
+                // split left with terminals only gets its terminal projection
+                // back, or the window's tabs and layouts disagree.
+                self.refresh_aggregate_tab_presentation(close.window, close.tab);
+                self.promote_terminal_projection_if_needed(close.window, close.tab);
                 self.resize_panes(close.window);
                 self.resync_active_or_window(close.window);
                 self.request_native_redraw(close.window);
@@ -3526,7 +3936,7 @@ impl App {
     }
 
     fn mark_document_save_success(&mut self, document: DocumentId) {
-        self.set_document_disk_conflict(document, false);
+        self.set_document_disk_conflict(document, None);
         self.set_document_recovery_status(document, None);
         let dirty = self.document_store.dirty(document).unwrap_or(false);
         for (window, _, view) in self.document_native_views(document) {
@@ -3537,6 +3947,9 @@ impl App {
                     "Saved".to_string()
                 });
             }
+            // A save lifts a failure's mark, never an `edit` view's: the
+            // program that asked still waits on it (`app_edit`).
+            let edit_mark = self.edit_attention_in_tab_of(window, view);
             if let Some(tab) = self.windows.get_mut(&window).and_then(|state| {
                 let index = state
                     .tab_set
@@ -3545,7 +3958,7 @@ impl App {
                     .position(|tab| tab.root.leaves().contains(&view))?;
                 state.tab_set.tab_at_mut(index)
             }) {
-                tab.presentation.indicators.attention = false;
+                tab.presentation.indicators.attention = edit_mark;
             }
             self.request_native_redraw(window);
         }
@@ -3592,6 +4005,118 @@ impl App {
             .collect()
     }
 
+    /// At a park: let go of the documents nothing holds any more when a look
+    /// is due — a document view closed or a Suspended document's write landed
+    /// since the last one, or the recently-closed record that alone kept a
+    /// document has expired. A `bool` and an `Option` test on every other park.
+    pub(crate) fn release_documents_at_park(&mut self) {
+        let host = &self.native_documents;
+        if host.release_due || host.release_deadline_ms.is_some() {
+            let now_ms = self.lat_epoch.elapsed().as_millis() as u64;
+            self.release_documents_due(now_ms);
+        }
+    }
+
+    /// [`Self::release_unheld_documents`] when a look is due at `now_ms`
+    /// ([`Self::release_documents_at_park`]). Returns how many it let go.
+    fn release_documents_due(&mut self, now_ms: u64) -> usize {
+        let host = &self.native_documents;
+        if host.release_due
+            || host
+                .release_deadline_ms
+                .is_some_and(|deadline| now_ms >= deadline)
+        {
+            self.release_unheld_documents(now_ms)
+        } else {
+            0
+        }
+    }
+
+    /// Let go of every document nothing holds any more (§5.10): no view and no
+    /// app controller, its text the file's, no save or journal write in
+    /// flight, owed or queued, no close or Quit plan in progress, and no
+    /// recently-closed record a reopen could bring it back for — the first
+    /// park after the last such record expires looks again. Each leaves with
+    /// its saver, grant, journal entry and editor history, and this process
+    /// lets go of its journal image (`DocumentJournalStore::forget`); opening
+    /// the file again starts a new document from disk. Every Suspended
+    /// document is clean (closing a dirty one's last view saves it first), so
+    /// this drops no edit. Returns how many it let go.
+    pub(crate) fn release_unheld_documents(&mut self, now_ms: u64) -> usize {
+        if self.native_documents.pending_quit.is_some()
+            || !self.native_documents.pending_window_closes.is_empty()
+        {
+            // The plan names its documents: look again once it is settled.
+            return 0;
+        }
+        let reopenable = self.closed_recovery.document_uris(now_ms);
+        let mut deadline: Option<u64> = None;
+        let mut released = Vec::new();
+        for document in self.document_store.document_ids() {
+            if !self.document_unheld(document) {
+                continue;
+            }
+            let uri = self.document_store.canonical_uri(document);
+            // Records name a document by its canonical URI, which never changes.
+            let kept_until = reopenable
+                .iter()
+                .filter(|(named, _)| Some(*named) == uri)
+                .map(|(_, expires_ms)| *expires_ms)
+                .max();
+            match kept_until {
+                Some(expires_ms) => {
+                    deadline = Some(deadline.map_or(expires_ms, |soonest| soonest.min(expires_ms)));
+                }
+                None => released.push(document),
+            }
+        }
+        self.native_documents.release_due = false;
+        self.native_documents.release_deadline_ms = deadline;
+        released.retain(|document| self.document_store.release(*document).is_ok());
+        let host = &mut self.native_documents;
+        for document in &released {
+            if let Some(grant) = host.persistence.forget(*document) {
+                host.grants.forget(grant);
+            }
+            host.recovery_status.remove(document);
+            host.disk_conflicts.remove(document);
+            host.journal_retries.remove(*document);
+            self.editor_workspace.forget(*document);
+        }
+        if let Some(journals) = host.journals.as_mut() {
+            journals.forget(&released);
+        }
+        released.len()
+    }
+
+    /// Nothing but a recently-closed record could still hold `document`
+    /// ([`Self::release_unheld_documents`]).
+    fn document_unheld(&self, document: DocumentId) -> bool {
+        let host = &self.native_documents;
+        self.document_store.phase(document) == Some(crate::document_store::DocumentPhase::Suspended)
+            && self.document_store.dirty(document) == Some(false)
+            && !self.native_runtime.holds_document(document)
+            && !host.persistence.save_in_flight(document)
+            && !host.inflight.contains(&document)
+            && !host.pending_saves.contains_key(&document)
+            && !host.pending_closes.contains_key(&document)
+            && host
+                .journals
+                .as_ref()
+                .is_none_or(|journals| journals.settled(document))
+    }
+
+    /// Arm [`Self::release_unheld_documents`] for the next park when
+    /// `document` has no view left: a write that landed may have been all
+    /// that still held it.
+    fn note_document_settling(&mut self, document: DocumentId) {
+        if self.document_store.phase(document)
+            == Some(crate::document_store::DocumentPhase::Suspended)
+        {
+            self.native_documents.release_due = true;
+        }
+    }
+
     /// Recompute duplicate-basename labels and publish every affected tab,
     /// including inactive tabs and views in other windows. Canonical document
     /// identity remains in the runtime/store; this only refreshes presentation.
@@ -3633,6 +4158,7 @@ impl App {
             DocumentAdmissionKey {
                 uri: uri.to_string(),
                 kind,
+                edit: None,
             },
         );
         match line {
@@ -3668,9 +4194,24 @@ impl App {
         wid: WindowId,
         reveal: LineReveal,
     ) -> Result<(), String> {
-        let (instance, view) = self
+        let (_, view) = self
             .active_native_view(wid)
             .ok_or_else(|| "the opened document is not focused".to_string())?;
+        self.reveal_document_line_in_view(view, reveal)
+    }
+
+    /// [`Self::reveal_document_line`] for one exact view, focused or not: an
+    /// `edit` ticket's view, which may open behind the tab the person is on.
+    pub(crate) fn reveal_document_line_in_view(
+        &mut self,
+        view: crate::tab_model::ViewId,
+        reveal: LineReveal,
+    ) -> Result<(), String> {
+        let Some(crate::tab_model::View::Native(native)) = self.view_store.get(view).copied()
+        else {
+            return Err("the opened document's view is gone".to_string());
+        };
+        let instance = native.instance;
         let document = self
             .native_runtime
             .document_id(instance)
@@ -3741,6 +4282,30 @@ impl App {
             DocumentAdmissionKey {
                 uri: uri.to_string(),
                 kind,
+                edit: None,
+            },
+        )
+    }
+
+    /// The two-phase open of an `edit` ticket's file in window `wid`
+    /// ([`crate::app_edit`]): the gesture path, under a key no gesture shares,
+    /// so the read is never coalesced and the install always makes a fresh view.
+    pub(crate) fn request_edit_admission(
+        &mut self,
+        wid: WindowId,
+        uri: &str,
+        ticket: crate::app_edit::EditTicketId,
+    ) -> Result<DocumentAdmission, String> {
+        Self::validate_document_request(AppKind::Editor, false)?;
+        if !self.windows.contains_key(&wid) {
+            return Err("requesting window disappeared".to_string());
+        }
+        self.begin_document_admission(
+            wid,
+            DocumentAdmissionKey {
+                uri: uri.to_string(),
+                kind: AppKind::Editor,
+                edit: Some(ticket),
             },
         )
     }
@@ -3791,7 +4356,8 @@ impl App {
             return Err("requesting window disappeared".to_string());
         }
         let admitted = Self::admit_document_now(uri, allow_config_symlinks)?;
-        self.install_admitted_document(wid, kind, uri, admitted)
+        self.install_admitted_document(wid, kind, uri, admitted, Placement::FocusOrNewTab)
+            .map(|installed| installed.line())
     }
 
     fn validate_document_request(kind: AppKind, allow_config_symlinks: bool) -> Result<(), String> {
@@ -3809,13 +4375,13 @@ impl App {
     fn admit_document_now(
         uri: &str,
         allow_config_symlinks: bool,
-    ) -> Result<AdmittedDocument, String> {
+    ) -> Result<AdmittedDocument, DocumentOpenFailure> {
         crate::native_document_host::admit_local_file(
             uri,
             DEFAULT_DOCUMENT_LIMIT,
             allow_config_symlinks,
         )
-        .map_err(|error| format!("document open failed: {error}"))
+        .map_err(DocumentOpenFailure)
     }
 
     /// Phase one of the two-phase open. The caller has validated `wid` and the
@@ -3837,10 +4403,20 @@ impl App {
             // No event loop to report back to (headless tests): admit inline so
             // tests that read the tab straight back stay synchronous;
             // `complete_document_admission` has its own tests.
-            let admitted = Self::admit_document_now(&key.uri, false)?;
+            let admitted = Self::admit_document_now(&key.uri, false);
+            if key.edit.is_some() {
+                let reply = self.finish_edit_admission(wid, key, admitted.map(Box::new));
+                return Ok(DocumentAdmission::Opened(reply.unwrap_or_else(|why| why)));
+            }
             return self
-                .install_admitted_document(wid, key.kind, &key.uri, admitted)
-                .map(DocumentAdmission::Opened);
+                .install_admitted_document(
+                    wid,
+                    key.kind,
+                    &key.uri,
+                    admitted?,
+                    Placement::FocusOrNewTab,
+                )
+                .map(|installed| DocumentAdmission::Opened(installed.line()));
         };
         let ticket = self.mint_document_admission(wid, key.clone());
         let worker_key = key.clone();
@@ -3881,7 +4457,7 @@ impl App {
     /// Record one admission as pending and mint its ticket. Split from
     /// [`Self::begin_document_admission`] so the completion state machine can be
     /// tested without a worker thread or an event loop.
-    fn mint_document_admission(
+    pub(crate) fn mint_document_admission(
         &mut self,
         wid: WindowId,
         key: DocumentAdmissionKey,
@@ -3931,6 +4507,13 @@ impl App {
         self.native_documents.admissions.remove(&slot);
         let reveal = self.native_documents.reveals.remove(&slot);
         let (wid, key) = slot;
+        // An `edit` ticket's admission answers its control client, whatever
+        // became of the ticket or the window (`app_edit`), and is never shown.
+        if key.edit.is_some() {
+            return self
+                .finish_edit_admission(wid, key, result)
+                .map_err(DocumentAdmissionRejected::Dropped);
+        }
         // A window that closed while the worker read drops the result: nothing
         // is minted or registered.
         if !self.windows.contains_key(&wid) {
@@ -3939,21 +4522,22 @@ impl App {
                 key.uri
             )));
         }
-        let admitted = *result.map_err(DocumentAdmissionRejected::Failed)?;
+        let admitted =
+            *result.map_err(|failure| DocumentAdmissionRejected::Failed(failure.to_string()))?;
         let installed = self
-            .install_admitted_document(wid, key.kind, &key.uri, admitted)
+            .install_admitted_document(wid, key.kind, &key.uri, admitted, Placement::FocusOrNewTab)
             .map_err(DocumentAdmissionRejected::Failed)?;
         if let Some(reveal) = reveal {
             self.reveal_document_line(wid, reveal)
                 .map_err(DocumentAdmissionRejected::Failed)?;
         }
-        Ok(installed)
+        Ok(installed.line())
     }
 
     /// Whether an admission for exactly this request is still pending (test /
     /// diagnostic seam).
     #[cfg(test)]
-    fn document_admission_pending(
+    pub(crate) fn document_admission_pending(
         &self,
         wid: WindowId,
         key: &DocumentAdmissionKey,
@@ -3984,13 +4568,22 @@ impl App {
             project = "aterm_gui::editor_carry_conformance::Rig::project"
         )
     )]
-    fn install_admitted_document(
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AmacsEditTicket",
+            action = "PersonOpens",
+            project = "aterm_gui::app_edit::edit_ticket_conformance::Rig::project"
+        )
+    )]
+    pub(crate) fn install_admitted_document(
         &mut self,
         wid: WindowId,
         kind: AppKind,
         uri: &str,
         admitted: AdmittedDocument,
-    ) -> Result<String, String> {
+        placement: Placement,
+    ) -> Result<InstalledDocument, String> {
         let access = if kind == AppKind::Editor {
             GrantAccess::ReadWrite
         } else {
@@ -4073,20 +4666,29 @@ impl App {
             let _ = self.refresh_native_document(document)?;
         }
 
-        if let Some((tab, view)) = self.document_view_in_window(wid, kind, document) {
+        // A gesture focuses the view already open; an `edit` ticket always owns
+        // a fresh view of its own (`app_edit`), so a view the person opened is
+        // never reused or focused.
+        if placement == Placement::FocusOrNewTab
+            && let Some((tab, view)) = self.document_view_in_window(wid, kind, document)
+        {
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.tab_set.switch_to(tab);
                 ws.last_present = None;
             }
             self.resync_active_or_window(wid);
             self.request_native_redraw(wid);
-            return Ok(format!(
-                "app {} {} view={}",
-                kind.as_str(),
-                granted.grant.canonical_uri,
-                view.get()
-            ));
+            return Ok(InstalledDocument {
+                kind,
+                canonical_uri: granted.grant.canonical_uri.clone(),
+                document,
+                tab,
+                view,
+            });
         }
+        // The tab active before the install, which a background placement
+        // re-selects (`App::place_admitted_view`).
+        let previously_active = self.windows.get(&wid).and_then(|ws| ws.tab_set.active_id());
 
         let title = granted
             .grant
@@ -4174,18 +4776,22 @@ impl App {
         }
         self.native_runtime.set_document_disk_conflict(
             document,
-            self.native_documents.disk_conflicts.contains(&document),
+            self.native_documents.disk_conflicts.contains_key(&document),
         );
         self.refresh_disambiguated_document_titles();
         self.refresh_native_presentation(wid, instance, view);
         self.resync_active_or_window(wid);
         self.request_native_redraw(wid);
-        Ok(format!(
-            "app {} {} view={}",
-            kind.as_str(),
-            granted.grant.canonical_uri,
-            view.get()
-        ))
+        if let Placement::NewTabAfter { ticket } = placement {
+            self.place_admitted_view(wid, tab, ticket, previously_active);
+        }
+        Ok(InstalledDocument {
+            kind,
+            canonical_uri: granted.grant.canonical_uri.clone(),
+            document,
+            tab,
+            view,
+        })
     }
 
     fn document_view_in_window(
@@ -4254,7 +4860,7 @@ impl App {
         self.resync_active_or_window(wid);
     }
 
-    fn request_native_redraw(&mut self, wid: WindowId) {
+    pub(crate) fn request_native_redraw(&mut self, wid: WindowId) {
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.last_present = None;
         }
@@ -4610,13 +5216,17 @@ mod tests {
     }
 
     fn enter_settings_draft(app: &mut App, wid: WindowId, view: crate::tab_model::ViewId) {
+        // The font row's text entry (what "Other…" opens), then a name.
         app.dispatch_native_view_event(
             wid,
             view,
-            AppEvent::FocusChanged(Some(crate::native_ui::UiKey::new(format!(
-                "settings/control/{}",
-                crate::prefs::EDIT_FONT_FAMILY
-            )))),
+            AppEvent::Action(crate::native_app::ActionInvocation {
+                id: crate::native_ui::ActionId::new(format!(
+                    "settings/set/{}",
+                    crate::prefs::EDIT_FONT_FAMILY
+                )),
+                value: None,
+            }),
         )
         .unwrap();
         app.dispatch_native_view_event(wid, view, AppEvent::TextInput(TextInputEvent::SelectAll))
@@ -4665,6 +5275,7 @@ mod tests {
         DocumentAdmissionKey {
             uri: uri.to_string(),
             kind,
+            edit: None,
         }
     }
 
@@ -4868,7 +5479,12 @@ mod tests {
             ticket: fresh,
             wid,
             key: key.clone(),
-            result: Err("document open failed: dropped.md is evicted from iCloud Drive and must be downloaded in Finder first".to_string()),
+            result: Err(DocumentOpenFailure(DocumentHostError::Io {
+                stage: crate::native_document_io::AtomicSaveStage::Preflight,
+                message:
+                    "dropped.md is evicted from iCloud Drive and must be downloaded in Finder first"
+                        .to_string(),
+            })),
         };
         let error = app.complete_document_admission(failed).unwrap_err();
         assert!(
@@ -5590,7 +6206,7 @@ mod tests {
             app.native_documents.persistence.observed(document),
             Some(watch_observation.baseline.observed)
         );
-        assert!(!app.native_documents.disk_conflicts.contains(&document));
+        assert!(!app.native_documents.disk_conflicts.contains_key(&document));
 
         // Race the next watcher cycle: Save's host preflight receives another
         // same-byte generation directly and must make the same safe decision.
@@ -5626,7 +6242,7 @@ mod tests {
             Some(save_observation.baseline.observed),
             "the save baseline advances to the byte-equivalent disk generation"
         );
-        assert!(!app.native_documents.disk_conflicts.contains(&document));
+        assert!(!app.native_documents.disk_conflicts.contains_key(&document));
         let Some(NativeApp::Editor(editor)) = app.native_runtime.app(instance) else {
             panic!("Manual editor remains installed");
         };
@@ -5681,7 +6297,7 @@ mod tests {
             draft.text
         );
         assert_eq!(app.document_store.dirty(document), Some(true));
-        assert!(app.native_documents.disk_conflicts.contains(&document));
+        assert!(app.native_documents.disk_conflicts.contains_key(&document));
         let Some(NativeApp::Editor(editor)) = app.native_runtime.app(instance) else {
             panic!("Manual editor remains installed");
         };
@@ -5809,12 +6425,12 @@ mod tests {
 
         app.on_key(
             wid,
-            winit::event::KeyEvent::synthetic_for_test(
-                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Numpad1),
-                winit::keyboard::Key::Named(winit::keyboard::NamedKey::End),
+            aterm_window::event::KeyEvent::synthetic_for_test(
+                aterm_window::keyboard::PhysicalKey::Code(aterm_window::keyboard::KeyCode::Numpad1),
+                aterm_window::keyboard::Key::Named(aterm_window::keyboard::NamedKey::End),
                 None,
-                winit::keyboard::KeyLocation::Numpad,
-                winit::event::ElementState::Pressed,
+                aterm_window::keyboard::KeyLocation::Numpad,
+                aterm_window::event::ElementState::Pressed,
                 false,
             ),
         );
@@ -5962,6 +6578,29 @@ mod tests {
 
         let after = app.document_store.snapshot(document).unwrap();
         assert_eq!((after.seq, &after.text), (before.seq, &before.text));
+        assert_eq!(editor_buffer(&app, view).primary_selection().head, caret);
+        let AppViewState::Editor(state) = app.native_runtime.view_state(view).unwrap() else {
+            panic!("config editor view");
+        };
+        assert_eq!(state.config_completion_interaction, Some(context));
+        assert_eq!(state.config_completion_selected, 0);
+
+        // Tab held down: its auto-repeats neither page the list on nor
+        // indent the buffer behind it.
+        for _ in 0..3 {
+            drive_native(
+                &mut app,
+                InputEvent::Key {
+                    key: Key::Named(NamedKey::Tab),
+                    mods: Modifiers::empty(),
+                    base_layout: None,
+                    layout_text: None,
+                    event_type: KeyEventType::Repeat,
+                },
+            );
+        }
+        let held = app.document_store.snapshot(document).unwrap();
+        assert_eq!((held.seq, &held.text), (before.seq, &before.text));
         assert_eq!(editor_buffer(&app, view).primary_selection().head, caret);
         let AppViewState::Editor(state) = app.native_runtime.view_state(view).unwrap() else {
             panic!("config editor view");
@@ -6322,6 +6961,78 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// Settings' "Open aterm.toml at" a key with no value that means unset
+    /// (the shell) adds its line with no value, the caret where the value
+    /// goes, and says to type one — never "at its default"; Save waits for
+    /// the value, and Undo takes the line back out. A member of a list of
+    /// records comes in inside a new `[[record]]` the same way.
+    #[test]
+    fn opening_a_key_with_no_default_awaits_its_value() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-config-editor-needs-value-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("aterm.toml");
+        let source = "agents_auto_prime = false\n";
+        fs::write(&path, source).unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        for (key, line) in [
+            ("shell", "shell = "),
+            (
+                "sparkle_words.custom.graphic.collection",
+                "[[sparkle_words.custom]]\ngraphic.collection = ",
+            ),
+        ] {
+            app.ensure_and_open_config_editor_path_at_in_window(
+                wid,
+                &path,
+                Some(&crate::native_app::ConfigEditorTarget::Key(key.to_string())),
+            )
+            .unwrap();
+            let (instance, view) = app.active_native_view(wid).unwrap();
+            let document = app.native_runtime.document_id(instance).unwrap();
+            let text = app.document_store.snapshot(document).unwrap().text;
+            let at = text.find(line).unwrap_or_else(|| panic!("{key}: {text:?}"));
+            let AppViewState::Editor(state) = app.native_runtime.view_state(view).unwrap() else {
+                panic!("config editor view")
+            };
+            let buffer = state.buffer.as_ref().unwrap();
+            assert_eq!(
+                buffer.primary_selection().range(),
+                at + line.len()..at + line.len(),
+                "{key}: the caret waits at the value"
+            );
+            let status = state.status.clone().unwrap();
+            assert!(
+                status.contains(&format!("type a value for {key}"))
+                    || status.contains(&format!("Type a value for {key}")),
+                "{status}"
+            );
+            assert!(!status.contains("default"), "{status}");
+            assert!(
+                app.native_runtime
+                    .config_editor_save_error(document)
+                    .is_some(),
+                "{key}: Save waits for a value"
+            );
+            app.dispatch_editor_event(
+                instance,
+                view,
+                &AppEvent::EditorCommand(crate::native_editor::EditorCommand::Undo),
+            )
+            .unwrap();
+            assert_eq!(
+                &*app.document_store.snapshot(document).unwrap().text,
+                source,
+                "{key}: Undo takes the line back out"
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// The edit that adds an absent key puts it where TOML reads it: a
     /// top-level key ahead of the first table, a dotted key in its table.
     #[test]
@@ -6349,25 +7060,92 @@ mod tests {
         let parsed: aterm_toml::Value = aterm_toml::from_str(&text).unwrap();
         assert!(parsed["update"]["auto_apply"].as_bool().is_some(), "{text}");
         assert_eq!(parsed["update"]["enabled"].as_bool(), Some(false));
-        // A table has no value to add.
-        assert!(absent_key_edit(source, "harness").is_none());
+        // A table or a map comes in as its empty table, the caret under its
+        // header where its entries go: at the end of the file, never inside
+        // the table the file ends with ([update] here, [machine] in a lab's).
+        for key in ["harness", "keybindings"] {
+            let (edit, added_as) = absent_key_edit(source, key).expect("an edit");
+            assert_eq!(added_as, AbsentKeyAdded::Table, "{key}");
+            let mut text = source.to_string();
+            text.replace_range(edit.replacement.clone(), &edit.insertion);
+            let caret = edit.replacement.start + edit.post_insert_selection.start;
+            assert!(
+                text[..caret].ends_with(&format!("\n[{key}]\n")),
+                "{key}: the caret is under the header: {text:?}"
+            );
+            // What is typed there is the table's, not [update]'s.
+            let mut typed = text.clone();
+            let entry = if key == "harness" {
+                "enabled = false\n"
+            } else {
+                "\"ctrl+t\" = \"new_tab\"\n"
+            };
+            typed.insert_str(caret, entry);
+            let parsed: aterm_toml::Value = aterm_toml::from_str(&typed).unwrap();
+            assert!(
+                parsed[key].as_table().is_some_and(|t| t.len() == 1),
+                "{typed}"
+            );
+            assert_eq!(
+                parsed["update"].as_table().map(|t| t.len()),
+                Some(1),
+                "{typed}"
+            );
+            assert!(
+                crate::app_config::Config::parse(&text).is_ok(),
+                "{key}: an empty table loads: {text}"
+            );
+        }
+        // A list of records itself is the person's to write, record by record.
+        assert!(absent_key_edit(source, "sparkle_words.custom").is_none());
     }
 
-    /// Opening a key only aterm.toml holds never changes what the file means:
-    /// the key comes in at its DOCUMENTED default (disk.auto_free_gib is 10,
-    /// "0: off"; disk.apply is false, never the consent to remove files), and
-    /// a key with no single default comes in as a comment. CONTROL: a key with
-    /// a Settings row still gets the row's default.
+    /// A NUMBER COMES IN AT ITS DEFAULT AS SETTINGS WRITES IT
+    /// (`prefs::written_number`): a whole default carries no `.0`, whether
+    /// the key has a Settings row (`window_padding`) or only Manual edits it
+    /// (`output_streak.idle_secs`, which came in as `10.0`), and a fraction
+    /// keeps its digits.
     #[test]
-    fn an_absent_key_is_added_at_its_default_or_commented_out() {
+    fn an_absent_number_comes_in_at_its_default_as_settings_writes_it() {
+        let source = "agents_auto_prime = false\n";
+        for (key, line) in [
+            (crate::prefs::EDIT_WINDOW_PADDING, "window_padding = 12"),
+            (crate::prefs::EDIT_LINE_HEIGHT, "line_height = 1"),
+            ("output_streak.idle_secs", "idle_secs = 10"),
+            ("output_streak.intensity", "intensity = 1"),
+            (crate::prefs::EDIT_WALLPAPER_DIM, "wallpaper_dim = 0.3"),
+        ] {
+            let (edit, added_as) = absent_key_edit(source, key).expect("an edit");
+            let mut text = source.to_string();
+            text.replace_range(edit.replacement.clone(), &edit.insertion);
+            assert_eq!(added_as, AbsentKeyAdded::AtDefault, "{key}: {text}");
+            assert!(text.lines().any(|at| at == line), "{key}: {text}");
+            crate::app_config::Config::parse(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
+        }
+    }
+
+    /// OPENING AN ABSENT KEY NEVER WRITES WORDS AS A VALUE. Over every key
+    /// the schema knows: an edit at the default loads, draws no finding the
+    /// file did not have, and writes the value that resolves as the key's
+    /// absence does (a Settings row's unset value, else the documented
+    /// default: disk.auto_free_gib is 10, disk.apply false, never the consent
+    /// to remove files); otherwise the key's line comes in with no value and
+    /// the caret where it goes. Negative controls from the lab: the shell,
+    /// its arguments, the sprite, the font keys, the lexicon, the wallpaper
+    /// and the theme have no such value and never come in "at their default";
+    /// a member of a list of records comes in inside a `[[record]]`, never
+    /// under plain tables.
+    #[test]
+    fn an_absent_key_is_added_at_its_default_or_awaits_a_value() {
         let source = "agents_auto_prime = false\n[update]\nenabled = false\n";
         let apply = |key: &str| {
             let (edit, added_as) = absent_key_edit(source, key).expect("an edit");
             let mut text = source.to_string();
             text.replace_range(edit.replacement.clone(), &edit.insertion);
-            (text, added_as)
+            let caret = edit.replacement.start + edit.post_insert_selection.start;
+            (text, added_as, caret)
         };
-        let (text, added_as) = apply("disk.auto_free_gib");
+        let (text, added_as, _) = apply("disk.auto_free_gib");
         assert_eq!(added_as, AbsentKeyAdded::AtDefault, "{text}");
         let parsed: aterm_toml::Value = aterm_toml::from_str(&text).unwrap();
         assert_eq!(
@@ -6375,13 +7153,13 @@ mod tests {
             i64::try_from(aterm_agent::harness::disk::Config::default().auto_free_gib).ok(),
             "{text}"
         );
-        let (text, added_as) = apply("disk.apply");
+        let (text, added_as, _) = apply("disk.apply");
         assert_eq!(added_as, AbsentKeyAdded::AtDefault, "{text}");
         let parsed: aterm_toml::Value = aterm_toml::from_str(&text).unwrap();
         assert_eq!(parsed["disk"]["apply"].as_bool(), Some(false), "{text}");
         // A text's default is its text, never the empty example the harness
         // refuses ("expected a non-empty text").
-        let (text, added_as) = apply("harness.continue_text");
+        let (text, added_as, _) = apply("harness.continue_text");
         assert_eq!(added_as, AbsentKeyAdded::AtDefault, "{text}");
         let parsed: aterm_toml::Value = aterm_toml::from_str(&text).unwrap();
         assert_eq!(
@@ -6393,48 +7171,118 @@ mod tests {
             ),
             "{text}"
         );
-        let (text, added_as) = apply(crate::prefs::EDIT_GPU);
-        assert_eq!(added_as, AbsentKeyAdded::AtDefault, "{text}");
-        let parsed: aterm_toml::Value = aterm_toml::from_str(&text).unwrap();
-        assert_eq!(
-            parsed[crate::prefs::EDIT_GPU].as_bool(),
-            Some(true),
-            "{text}"
-        );
-        // Every key only aterm.toml holds: at its documented default, or
-        // commented out; the file still parses either way.
-        for entry in crate::native_config_language::config_schema() {
-            if crate::native_settings::settings_default_raw(entry.key).is_some() {
-                continue;
+        for key in [
+            crate::prefs::EDIT_GPU,
+            crate::prefs::EDIT_SCROLLBACK,
+            "matrix_rain.hue",
+        ] {
+            let (text, added_as, _) = apply(key);
+            assert_eq!(added_as, AbsentKeyAdded::AtDefault, "{key}: {text}");
+        }
+        for key in [
+            "shell",
+            "shell_args",
+            crate::prefs::EDIT_CURSOR_NYAN_SPRITE,
+            crate::prefs::EDIT_FONT_FAMILY,
+            crate::prefs::EDIT_FONT_PX,
+            "font_features",
+            crate::prefs::EDIT_FALLBACK_FONTS,
+            "font_variation",
+            "sparkle_words.lexicon",
+            crate::prefs::EDIT_WALLPAPER,
+            crate::prefs::EDIT_THEME,
+        ] {
+            let (text, added_as, caret) = apply(key);
+            assert_eq!(
+                added_as,
+                AbsentKeyAdded::NeedsValue { record: None },
+                "{key}: {text}"
+            );
+            let line_start = text[..caret].rfind('\n').map_or(0, |at| at + 1);
+            let line_end = text[caret..].find('\n').map_or(text.len(), |at| caret + at);
+            assert!(
+                text[line_start..caret].ends_with("= ") && caret == line_end,
+                "{key}: the caret waits at the value: {text:?}"
+            );
+            assert!(
+                crate::native_config_language::analyze(&text).has_errors(),
+                "{key}: the line does not parse until a value is typed, so Save waits"
+            );
+        }
+        for key in [
+            "sparkle_words.custom.graphic.collection",
+            "sparkle_words.custom.burst.chance",
+            "sparkle_words.custom.words",
+        ] {
+            let root = crate::native_config_language::config_key_record_root(key).unwrap();
+            let (text, added_as, caret) = apply(key);
+            assert_eq!(
+                added_as,
+                AbsentKeyAdded::NeedsValue { record: Some(root) },
+                "{key}: {text}"
+            );
+            assert!(text.contains(&format!("[[{root}]]\n")), "{key}: {text}");
+            assert!(text[..caret].ends_with(" = "), "{key}: {text:?}");
+            // With a value typed it is a record of the list the reader wants.
+            let mut typed = text.clone();
+            typed.insert_str(caret, "\"x\"");
+            let parsed: aterm_toml::Value = aterm_toml::from_str(&typed).unwrap();
+            let mut node = &parsed;
+            for part in root.split('.') {
+                node = &node[part];
             }
+            assert!(
+                node.as_array().is_some_and(|records| records.len() == 1),
+                "{key}: {typed}"
+            );
+        }
+        // A file that already has records: which one is the person's call.
+        assert!(
+            absent_key_edit(
+                "[[sparkle_words.custom]]\nwords = [\"ship\"]\n",
+                "sparkle_words.custom.graphic.collection"
+            )
+            .is_none()
+        );
+        // Every key: an edit at the default loads and draws no new finding;
+        // any other added line is a value-less line, never a value.
+        let findings = |text: &str| {
+            crate::native_config_language::analyze(text)
+                .diagnostics
+                .len()
+        };
+        for entry in crate::native_config_language::config_schema() {
             let Some((edit, added_as)) = absent_key_edit(source, entry.key) else {
                 continue;
             };
             let mut text = source.to_string();
             text.replace_range(edit.replacement.clone(), &edit.insertion);
-            if let Err(error) = aterm_toml::from_str::<aterm_toml::Value>(&text) {
-                panic!("{}: {error}\n{text}", entry.key);
-            }
             match added_as {
-                AbsentKeyAdded::Commented => assert!(
-                    crate::native_config_language::config_key_source_range(&text, entry.key)
-                        .is_none(),
-                    "{}: commented out\n{text}",
-                    entry.key
-                ),
-                // The value written is the documented default, as TOML
-                // reads it back.
                 AbsentKeyAdded::AtDefault => {
-                    let literal =
-                        crate::native_config_language::config_key_default_literal(entry.key)
-                            .unwrap_or_else(|| panic!("{}: a documented default", entry.key));
-                    let written =
-                        crate::native_config_language::config_key_source_range(&text, entry.key)
-                            .map(|range| text[range].to_string());
-                    assert_eq!(
-                        written.as_deref(),
-                        Some(literal.as_str()),
-                        "{}\n{text}",
+                    assert!(
+                        crate::app_config::Config::parse(&text).is_ok(),
+                        "{}: loads\n{text}",
+                        entry.key
+                    );
+                    assert!(
+                        findings(&text) <= findings(source),
+                        "{}: no new finding\n{text}",
+                        entry.key
+                    );
+                }
+                AbsentKeyAdded::NeedsValue { .. } => {
+                    let caret = edit.replacement.start + edit.post_insert_selection.start;
+                    assert!(
+                        text[..caret].ends_with("= "),
+                        "{}: no value written\n{text}",
+                        entry.key
+                    );
+                }
+                AbsentKeyAdded::Table => {
+                    assert!(
+                        crate::app_config::Config::parse(&text).is_ok()
+                            && findings(&text) <= findings(source),
+                        "{}: an empty table changes nothing\n{text}",
                         entry.key
                     );
                 }
@@ -7019,7 +7867,7 @@ mod tests {
                     app.document_store.snapshot(document).unwrap().text.as_ref(),
                     "private draft"
                 );
-                assert!(app.native_documents.disk_conflicts.contains(&document));
+                assert!(app.native_documents.disk_conflicts.contains_key(&document));
             } else {
                 assert!(
                     matches!(
@@ -7084,7 +7932,7 @@ mod tests {
         fs::rename(&replacement, &path).unwrap();
         let save = app.save_document_checkpoint(document, view).unwrap_err();
         assert!(save.contains("Disk version refreshed"), "{save}");
-        assert!(!app.native_documents.disk_conflicts.contains(&document));
+        assert!(!app.native_documents.disk_conflicts.contains_key(&document));
 
         fs::write(&path, COLLISION).unwrap();
         let reduction = app.refresh_native_document(document).unwrap();
@@ -7092,7 +7940,7 @@ mod tests {
             reduction,
             crate::native_document_io::FileWatchReduction::ConflictDirty { .. }
         ));
-        assert!(app.native_documents.disk_conflicts.contains(&document));
+        assert!(app.native_documents.disk_conflicts.contains_key(&document));
         assert_eq!(app.document_store.dirty(document), Some(true));
         assert_eq!(
             app.document_store.snapshot(document).unwrap().text.as_ref(),
@@ -7833,6 +8681,192 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    fn undo(app: &mut App, wid: WindowId) {
+        app.dispatch_native_event(
+            wid,
+            AppEvent::Action(crate::native_app::ActionInvocation {
+                id: crate::native_ui::ActionId::new("editor/undo"),
+                value: None,
+            }),
+        )
+        .unwrap();
+    }
+
+    /// The document is clean, conflict-free and saying nothing about local
+    /// edits, its tab and its Save quiet, and holds `text`.
+    fn assert_clean_at(
+        app: &App,
+        (instance, view): (crate::tab_model::AppInstanceId, crate::tab_model::ViewId),
+        text: &str,
+        context: &str,
+    ) {
+        let document = app.native_runtime.document_id(instance).unwrap();
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            text,
+            "{context}"
+        );
+        assert_eq!(app.document_store.dirty(document), Some(false), "{context}");
+        assert!(
+            !app.native_documents.disk_conflicts.contains_key(&document),
+            "{context}"
+        );
+        assert!(
+            !app.native_documents.recovery_status.contains_key(&document),
+            "{context}"
+        );
+        let Some(NativeApp::Editor(editor)) = app.native_runtime.app(instance) else {
+            panic!("{context}: the editor stays installed");
+        };
+        assert!(!editor.disk_conflict, "{context}");
+        assert!(!editor.dirty, "{context}");
+        assert_eq!(editor.recovery_status, None, "{context}");
+        let save = app
+            .native_runtime
+            .commands(instance, view)
+            .unwrap()
+            .into_iter()
+            .find(|command| command.id.as_str() == "editor/save")
+            .expect("Save command");
+        assert!(!save.enabled, "{context}: nothing to save");
+    }
+
+    /// AN UNDO BACK TO THE BASE UNDER A DISK CONFLICT ADOPTS THE DISK TEXT:
+    /// once the buffer holds exactly the version aterm loaded, it has no local
+    /// edits, so the file's newer version comes in as it would for a clean
+    /// document and the "copy any local edits" guidance goes — in Manual and
+    /// in a plain Editor tab. (It used to stay dirty, conflicted and blocked
+    /// until Discard was pressed by hand.)
+    #[test]
+    fn an_undo_back_to_the_base_under_a_disk_conflict_adopts_the_disk_text() {
+        let wid = WindowId(0);
+        let base = "font_px = 12.0\n";
+        let external = "cursor_blink = true\nfont_px = 12.0\n";
+        let (dir, path, mut app, views) = open_config("aterm-undo-to-base-under-conflict", base);
+        let document = app.native_runtime.document_id(views.0).unwrap();
+        commit(&mut app, wid, "gpu");
+        fs::write(&path, external).unwrap();
+        let observation =
+            crate::native_config_service::VersionedConfigService::observe_path(&path, false)
+                .unwrap();
+        app.refresh_open_config_editor_observation(&observation)
+            .unwrap();
+        assert_eq!(
+            app.native_documents.disk_conflicts.get(&document),
+            Some(&DiskConflictCause::Version)
+        );
+        assert_eq!(
+            app.native_documents
+                .recovery_status
+                .get(&document)
+                .map(String::as_str),
+            Some(crate::native_app::DISK_CONFLICT_RECOVERY)
+        );
+        undo(&mut app, wid);
+        assert_clean_at(&app, views, external, "Manual");
+        let _ = fs::remove_dir_all(dir);
+
+        let dir = fresh_dir("aterm-undo-to-base-under-conflict-editor");
+        let path = dir.join("notes.md");
+        fs::write(&path, "disk one\n").unwrap();
+        let mut app = App::headless_for_test();
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let views = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(views.0).unwrap();
+        commit(&mut app, wid, "local ");
+        fs::write(&path, "disk two\n").unwrap();
+        assert!(matches!(
+            app.refresh_native_document(document).unwrap(),
+            crate::native_document_io::FileWatchReduction::ConflictDirty { .. }
+        ));
+        undo(&mut app, wid);
+        assert_clean_at(&app, views, "disk two\n", "Editor");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// NEGATIVE CONTROLS for the undo-to-base adoption: an Undo that leaves a
+    /// local edit keeps the conflict, its guidance and the edit; a save in
+    /// flight owns what lands next, so an Undo to the base waits for it (and
+    /// the file's own return to the base then clears the conflict and finds
+    /// the buffer clean); and a changed file binding is settled only by a
+    /// reopen.
+    #[test]
+    fn undo_to_base_keeps_local_edits_saves_in_flight_and_binding_conflicts() {
+        let wid = WindowId(0);
+        let base = "font_px = 12.0\n";
+        let external = "cursor_blink = true\nfont_px = 12.0\n";
+        let conflicted = |name: &str| {
+            let (dir, path, mut app, views) = open_config(name, base);
+            commit(&mut app, wid, "gpu");
+            commit(&mut app, wid, " = true");
+            fs::write(&path, external).unwrap();
+            let observation =
+                crate::native_config_service::VersionedConfigService::observe_path(&path, false)
+                    .unwrap();
+            app.refresh_open_config_editor_observation(&observation)
+                .unwrap();
+            let document = app.native_runtime.document_id(views.0).unwrap();
+            assert!(app.native_documents.disk_conflicts.contains_key(&document));
+            (dir, path, app, views, document)
+        };
+
+        // One of two edits undone: "gpu" is still a local edit.
+        let (dir, _, mut app, _, document) = conflicted("aterm-undo-to-base-partial");
+        undo(&mut app, wid);
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            "gpufont_px = 12.0\n"
+        );
+        assert_eq!(app.document_store.dirty(document), Some(true));
+        assert!(app.native_documents.disk_conflicts.contains_key(&document));
+        assert_eq!(
+            app.native_documents
+                .recovery_status
+                .get(&document)
+                .map(String::as_str),
+            Some(crate::native_app::DISK_CONFLICT_RECOVERY)
+        );
+        let _ = fs::remove_dir_all(dir);
+
+        // A save in flight: the Undo to the base adopts nothing yet.
+        let (dir, path, mut app, views, document) = conflicted("aterm-undo-to-base-saving");
+        app.native_documents.inflight.insert(document);
+        undo(&mut app, wid);
+        undo(&mut app, wid);
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            base
+        );
+        assert!(app.native_documents.disk_conflicts.contains_key(&document));
+        app.native_documents.inflight.remove(&document);
+        // The file goes back to the version aterm admitted: the conflict
+        // clears and the buffer, which is that version, is clean.
+        fs::write(&path, base).unwrap();
+        assert!(matches!(
+            app.refresh_native_document(document).unwrap(),
+            crate::native_document_io::FileWatchReduction::Unchanged
+                | crate::native_document_io::FileWatchReduction::RebindEquivalent { .. }
+        ));
+        assert_clean_at(&app, views, base, "the file back at the base");
+        let _ = fs::remove_dir_all(dir);
+
+        // A changed binding: a reopen, whatever the buffer holds.
+        let (dir, _, mut app, _, document) = conflicted("aterm-undo-to-base-binding");
+        app.set_document_disk_conflict(document, Some(DiskConflictCause::Binding));
+        undo(&mut app, wid);
+        undo(&mut app, wid);
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            base
+        );
+        assert_eq!(
+            app.native_documents.disk_conflicts.get(&document),
+            Some(&DiskConflictCause::Binding)
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn file_refresh_reloads_clean_conflicts_dirty_and_explicit_discard_is_atomic() {
         let dir = fresh_dir("aterm-app-refresh-discard");
@@ -7868,7 +8902,7 @@ mod tests {
         assert_eq!(preserved.seq, local.seq);
         assert_eq!(preserved.text, local.text);
         assert_eq!(app.document_store.dirty(document), Some(true));
-        assert!(app.native_documents.disk_conflicts.contains(&document));
+        assert!(app.native_documents.disk_conflicts.contains_key(&document));
         let Some(NativeApp::Editor(editor)) = app.native_runtime.app(instance) else {
             panic!("conflicted document remains an Editor");
         };
@@ -7905,7 +8939,7 @@ mod tests {
             "disk three\n"
         );
         assert_eq!(app.document_store.dirty(document), Some(false));
-        assert!(!app.native_documents.disk_conflicts.contains(&document));
+        assert!(!app.native_documents.disk_conflicts.contains_key(&document));
         let Some(NativeApp::Editor(editor)) = app.native_runtime.app(instance) else {
             unreachable!();
         };
@@ -7993,7 +9027,12 @@ mod tests {
         );
 
         drive_native(&mut app, key(Key::Character('x'), Modifiers::ALT));
-        drive_native(&mut app, InputEvent::Text("not-a-command".to_string()));
+        // A query no command name contains, even as a subsequence
+        // (`not-a-command` became one: indent-for-tab-command).
+        drive_native(
+            &mut app,
+            InputEvent::Text("definitely-not-a-command".to_string()),
+        );
         drive_native(
             &mut app,
             key(Key::Named(NamedKey::Enter), Modifiers::empty()),
@@ -8003,7 +9042,7 @@ mod tests {
         };
         assert!(matches!(
             state.buffer.as_ref().map(|buffer| &buffer.minibuffer),
-            Some(Minibuffer::Command { query, .. }) if query == "not-a-command"
+            Some(Minibuffer::Command { query, .. }) if query == "definitely-not-a-command"
         ));
         assert_eq!(
             app.document_store.snapshot(document).unwrap().seq,
@@ -8265,6 +9304,164 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// ATERM-KI-1015-12: a document whose last view closed stays in memory
+    /// while a reopen could bring it back — the reopen finds the very document,
+    /// its undo history with it — and leaves with every trace once nothing
+    /// can: the store's entry, its saver and grant, its journal entry and the
+    /// clean journal image no other process holds, its editor history.
+    /// Opening the file again then reads it afresh.
+    #[test]
+    fn a_closed_document_leaves_memory_once_no_reopen_can_bring_it_back() {
+        let dir = fresh_dir("aterm-app-release");
+        let path = dir.join("released.md");
+        fs::write(&path, "before\n").unwrap();
+        let uri = file_uri(&path);
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Editor, &uri).unwrap();
+        let (instance, _) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let canonical = app
+            .document_store
+            .canonical_uri(document)
+            .unwrap()
+            .to_string();
+        commit(&mut app, wid, "edited ");
+        assert!(app.editor_workspace.can_undo(document));
+        let journal = app
+            .native_documents
+            .journals
+            .as_ref()
+            .unwrap()
+            .path_for_uri(&canonical);
+        assert!(journal.exists());
+        assert_eq!(
+            app.release_unheld_documents(0),
+            0,
+            "a viewed document stays"
+        );
+
+        app.close_active_native_tab(wid).unwrap();
+        assert_eq!(app.document_store.view_count(document), Some(0));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "edited before\n");
+        assert!(
+            app.native_documents.release_due,
+            "a closed view arms the look"
+        );
+        assert_eq!(
+            app.release_unheld_documents(0),
+            0,
+            "the closed-tab record can still reopen it"
+        );
+        assert!(!app.native_documents.release_due);
+        app.reopen_last_closed_tab().unwrap();
+        let (instance, _) = app.active_native_view(wid).unwrap();
+        assert_eq!(app.native_runtime.document_id(instance), Some(document));
+        assert!(app.editor_workspace.can_undo(document), "undo survived");
+
+        app.close_active_native_tab(wid).unwrap();
+        assert_eq!(
+            app.release_unheld_documents(u64::MAX),
+            1,
+            "past the record's age nothing can bring it back"
+        );
+        assert_eq!(app.document_store.id_for_uri(&canonical), None);
+        assert_eq!(app.native_documents.persistence.grant(document), None);
+        assert_eq!(app.native_documents.grants.id_for_uri(&canonical), None);
+        assert_eq!(
+            app.native_documents
+                .journals
+                .as_ref()
+                .unwrap()
+                .durable_seq(document),
+            None
+        );
+        assert!(!app.editor_workspace.can_undo(document));
+        assert!(!app.editor_workspace.buffers.contains(&document));
+        assert!(
+            !journal.exists(),
+            "its clean journal, which no other process holds, went with it"
+        );
+
+        fs::write(&path, "changed on disk\n").unwrap();
+        app.open_document_tab(AppKind::Editor, &uri).unwrap();
+        let (instance, _) = app.active_native_view(wid).unwrap();
+        let reopened = app.native_runtime.document_id(instance).unwrap();
+        assert_ne!(reopened, document);
+        assert_eq!(
+            app.document_store.snapshot(reopened).unwrap().text.as_ref(),
+            "changed on disk\n"
+        );
+        assert!(app.structural_invariants_ok());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A document kept only by a recently-closed record leaves at the first
+    /// park once that record has expired, with no other close or write to
+    /// prompt the look.
+    #[test]
+    fn a_closed_document_leaves_at_the_first_park_past_its_records_expiry() {
+        let dir = fresh_dir("aterm-app-release-expiry");
+        let path = dir.join("expiring.md");
+        fs::write(&path, "before\n").unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let (instance, _) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        app.close_active_native_tab(wid).unwrap();
+        let closed_ms = app.lat_epoch.elapsed().as_millis() as u64;
+        assert_eq!(
+            app.release_documents_due(closed_ms),
+            0,
+            "its record is live"
+        );
+        assert!(!app.native_documents.release_due);
+        let deadline = app
+            .native_documents
+            .release_deadline_ms
+            .expect("the record's expiry is the next look");
+        assert!(deadline > closed_ms);
+        assert_eq!(app.release_documents_due(deadline - 1), 0);
+        assert!(app.document_store.phase(document).is_some(), "not yet");
+        assert_eq!(app.release_documents_due(deadline), 1);
+        assert_eq!(app.document_store.phase(document), None);
+        assert_eq!(app.native_documents.release_deadline_ms, None);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A Suspended document whose journal still has work in flight stays, and
+    /// the landing of that work arms the next look, which lets it go.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_document_with_a_journal_write_in_flight_waits_for_its_landing() {
+        let dir = fresh_dir("aterm-app-release-inflight");
+        let path = dir.join("inflight.md");
+        fs::write(&path, "before\n").unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let (instance, _) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        app.close_active_native_tab(wid).unwrap();
+        app.hold_journal_reseats_for_test();
+        app.reseat_document_journals_after_rollback();
+        assert_eq!(app.held_journal_reseats_for_test().len(), 1);
+
+        assert_eq!(app.release_unheld_documents(u64::MAX), 0);
+        assert!(app.document_store.phase(document).is_some(), "it stays");
+        assert!(app.run_held_journal_reseat_for_test());
+        assert!(
+            app.native_documents.release_due,
+            "the landing arms the look"
+        );
+        assert_eq!(app.release_unheld_documents(u64::MAX), 1);
+        assert_eq!(app.document_store.phase(document), None);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn window_close_waits_for_every_document_before_atomic_detach() {
         let dir = fresh_dir("aterm-app-window-batch");
@@ -8484,3 +9681,28 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 }
+
+/// `NativeUpdateEditorCarry`'s two handoff steps, each waived where its Tier-1
+/// (`editor_carry_conformance`) binds it.
+#[cfg(all(any(test, debug_assertions), unix))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "NativeUpdateEditorCarry",
+    action = "Park",
+    reason = "The handoff's own step: the park installs the attempt record, which this machine \
+              reads only through the fences and the late fact. Tier-1 installs the real record \
+              (`PendingUpdateHandoff`) the park installs; the park itself is \
+              `NativeUpdateSeamlessHandoffOwnership`'s `ParkOutgoingReaders`."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "NativeUpdateEditorCarry",
+    action = "StandDown",
+    reason = "The handoff's own step: a launched successor stood down before the park leaves \
+              nothing restored and nothing owed. Tier-1 retires a real prelaunch record through \
+              the real completion reducer (`reduce_returned_handoff_completion`)."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn editor_carry_waivers() {}

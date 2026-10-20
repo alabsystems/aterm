@@ -115,8 +115,11 @@ pub struct Config {
     pub update_ratchet: bool,
     /// Verify what this host would refuse for memory up front.
     pub try_refused: bool,
-    /// Reduce each check's proof report to its per-obligation record (the candidate
-    /// gate's comparison reads it).
+    /// Reduce each check's proof report to its per-obligation record, kept beside its
+    /// log ([`crate::trust_oblig`]). The report needs `--report-dir`, whose proof artifact
+    /// store a prover without trust a40ddc8e9c (the published seal 321aaeda75) caps at
+    /// 512 MiB by ending the check with exit 2 before its Summary, as aterm-agent's: such
+    /// a library's record needs a prover ([`Config::prover`]) that holds that commit.
     pub obligations: bool,
     /// Stop before any check when this host refuses a library for memory.
     pub stop_if_narrowed: bool,
@@ -126,21 +129,6 @@ pub struct Config {
     /// `<git common dir>/aterm-release`.
     pub state: Option<PathBuf>,
     pub trustd_wait: Duration,
-    /// End a check that crosses one of these bounds (a toolchain with no verifier
-    /// memory ceiling can take the machine down).
-    pub guard: Option<Guard>,
-}
-
-/// The memory guard ([`guard`]): a check is ended when its process tree's memory, the swap
-/// in use, the memory pressure level or the free space under the target root crosses its
-/// bound. A check it ends dies by a signal, so its library has no result.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Guard {
-    pub tree_bytes: u64,
-    pub swap_bytes: u64,
-    /// The `kern.memorystatus_level` under which a check is ended (macOS; 0 never).
-    pub level_min: u32,
-    pub free_bytes: u64,
 }
 
 impl Config {
@@ -160,7 +148,6 @@ impl Config {
             prover: None,
             state: None,
             trustd_wait: TRUSTD_WAIT,
-            guard: None,
         }
     }
 }
@@ -191,16 +178,6 @@ impl Outcome {
             Outcome::Fail(_) => 1,
             Outcome::Undecided(_) | Outcome::CouldNotRun(_) => 2,
             Outcome::Narrowed(_) => 4,
-        }
-    }
-
-    /// The lines that say why.
-    #[must_use]
-    pub fn detail(&self) -> Vec<String> {
-        match self {
-            Outcome::Pass => Vec::new(),
-            Outcome::Fail(v) | Outcome::Undecided(v) | Outcome::Narrowed(v) => v.clone(),
-            Outcome::CouldNotRun(why) => vec![why.clone()],
         }
     }
 
@@ -432,7 +409,7 @@ pub struct Lib {
 }
 
 /// What joins a member to its feature in a fork-feature row's name and spec
-/// (`aterm-link+sealed`). A package name holds only alphanumerics, `-` and `_`, so
+/// (`<member>+<feature>`). A package name holds only alphanumerics, `-` and `_`, so
 /// a name with it is always such a row, and the part before it is the package.
 pub const FEATURE_ROW: char = '+';
 
@@ -866,13 +843,36 @@ const SEED_HEADER: &str = "# The trust lane's cost-history SEED: the fallback a 
 /// history winning. Either may be absent.
 #[must_use]
 pub fn read_costs(history: Option<&Path>, seed: &Path) -> BTreeMap<String, Cost> {
-    let read = |p: &Path| {
-        fs::read_to_string(p)
-            .map(|t| parse_costs(&t))
-            .unwrap_or_default()
-    };
-    let mut all = read(seed);
-    all.extend(history.map(read).unwrap_or_default());
+    let mut all = cost_file(seed);
+    all.extend(history.map(cost_file).unwrap_or_default());
+    all
+}
+
+/// The rows of a cost file; one that cannot be read has none.
+fn cost_file(path: &Path) -> BTreeMap<String, Cost> {
+    fs::read_to_string(path)
+        .map(|t| parse_costs(&t))
+        .unwrap_or_default()
+}
+
+/// What `--update-ratchet` writes back to the committed seed, before this run's own
+/// measurements go over it: for each library the graph still holds, the LATER of its
+/// committed row and this clone's history row (another host's newer measurement is not
+/// undone by an older one here; a row that names no time is the oldest), and no row for
+/// a library that left the graph (a deleted crate is not carried back in from a history).
+#[must_use]
+pub fn seed_rows(
+    committed: BTreeMap<String, Cost>,
+    history: BTreeMap<String, Cost>,
+    libraries: &BTreeSet<String>,
+) -> BTreeMap<String, Cost> {
+    let mut all = committed;
+    for (name, row) in history {
+        if all.get(&name).is_none_or(|c| row.when >= c.when) {
+            all.insert(name, row);
+        }
+    }
+    all.retain(|name, _| libraries.contains(name));
     all
 }
 
@@ -987,9 +987,6 @@ pub trait Checks {
     /// What the socket holds now (`<none|ours|foreign|silent>\t<what>`), for a check
     /// targo would not start.
     fn probe_trustd(&mut self) -> String;
-    /// Why `job`'s check must end now though it is inside its budget (the memory
-    /// guard), if it must.
-    fn guard(&mut self, job: &Job) -> Option<String>;
     /// The run was interrupted.
     fn interrupted(&self) -> bool;
     /// Time since the slots started.
@@ -1006,8 +1003,6 @@ pub struct Finished {
     pub wall: Duration,
     /// The budget ended it.
     pub over_budget: bool,
-    /// The memory guard ended it, and why.
-    pub guarded: Option<String>,
 }
 
 /// Why the slots stopped before their queue was done.
@@ -1084,14 +1079,12 @@ pub fn run_slots(
             let now = checks.now();
             let over = now.saturating_sub(running[i].since) >= budget;
             let ended = match running[i].check.poll() {
-                Ok(Some(e)) => Some((e, false, None)),
-                Ok(None) if over => Some((running[i].check.end(), true, None)),
-                Ok(None) => checks
-                    .guard(&running[i].job)
-                    .map(|why| (running[i].check.end(), false, Some(why))),
-                Err(_) => Some((running[i].check.end(), false, None)),
+                Ok(Some(e)) => Some((e, false)),
+                Ok(None) if over => Some((running[i].check.end(), true)),
+                Ok(None) => None,
+                Err(_) => Some((running[i].check.end(), false)),
             };
-            if let Some((ended, over_budget, guarded)) = ended {
+            if let Some((ended, over_budget)) = ended {
                 let r = running.swap_remove(i);
                 free.push(r.job.slot);
                 done(
@@ -1100,7 +1093,6 @@ pub fn run_slots(
                         job: r.job,
                         ended,
                         over_budget,
-                        guarded,
                     },
                     checks,
                 );
@@ -1200,11 +1192,10 @@ impl Bench for Machine {
     fn metadata(&mut self, driver: &Driver, repo: &Path) -> Result<Vec<u8>, String> {
         // From the pinned driver: another toolchain's resolve could gate members this targo
         // resolves otherwise. With every feature: a path package reachable only through an
-        // off-by-default feature (astream-aead, under aterm's `sealed`) is still forked code
-        // this tree builds, so it is decided like any fork and verified with the feature
-        // union a full build can turn on. Members are gated with their default features,
-        // plus a row per feature that turns on fork code (`fork_features`). aterm-forge's
-        // direct_vendor reads the same graph.
+        // off-by-default feature is still forked code this tree builds, so it is decided
+        // like any fork and verified with the feature union a full build can turn on.
+        // Members are gated with their default features, plus a row per feature that turns
+        // on fork code (`fork_features`). aterm-forge's direct_vendor reads the same graph.
         let o = command(&driver.targo)
             .args(["metadata", "--format-version", "1", "--all-features"])
             .env_clear()
@@ -1268,8 +1259,6 @@ impl Bench for Machine {
             want: &want,
             t0: Instant::now(),
             locks: BTreeMap::new(),
-            guard: cfg.guard,
-            pids: BTreeMap::new(),
         };
         let ran = run_slots(
             jobs,
@@ -1316,6 +1305,9 @@ struct Prepared {
     mem: u64,
     cores: usize,
     costs_path: Option<PathBuf>,
+    /// Every library the graph holds, by its row name: the committed cost seed keeps
+    /// rows for these alone ([`seed_rows`]).
+    libraries: BTreeSet<String>,
     _lock: RunLock,
 }
 
@@ -1388,22 +1380,38 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
     }
     let logdir = root.join("logs");
     owner_dirs(&logdir).map_err(|e| format!("{}: {e}", logdir.display()))?;
+    if mine.as_ref() == Some(&root) {
+        prepare_cache_lock(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+    }
     let lock = RunLock::take(
         &root.join(".run.lock"),
         "give this one its own --target-root",
     )?;
     if let Some(mine) = &mine {
-        let record = checkout_record(&canonical_repo(cfg));
         if *mine == root {
-            // A root outside the checkout names it, so a later run can tell it from an
-            // orphan. Writable by its owner alone whatever the umask: whoever can rewrite
-            // it can have a later run remove this root.
-            use std::os::unix::fs::PermissionsExt as _;
-            let at = root.join(CHECKOUT_RECORD);
-            fs::write(&at, record)
-                .and_then(|()| fs::set_permissions(&at, fs::Permissions::from_mode(0o644)))
-                .map_err(|e| format!("{}: {e}", at.display()))?;
-        } else if fs::read(mine.join(CHECKOUT_RECORD)).is_ok_and(|b| b == record) && retire(mine) {
+            // This selected fallback root names its checkout without following an
+            // unknown marker into another file. Only the directory entry is replaced.
+            write_checkout_record(&root, &canonical_repo(cfg))
+                .map_err(|e| format!("{}: {e}", root.join(CHECKOUT_RECORD).display()))?;
+            // The later reaper acts on this selected fallback too. Recheck every
+            // authority file and the held lock before handing the root to the bench.
+            use std::os::unix::fs::MetadataExt as _;
+            let stable_lock = lock
+                .0
+                .metadata()
+                .ok()
+                .zip(owned_cache_file(&root.join(".run.lock")))
+                .is_some_and(|(held, named)| {
+                    (held.dev(), held.ino()) == (named.dev(), named.ino())
+                });
+            if !stable_lock
+                || cleanup_checkout(&root).as_deref() != Some(canonical_repo(cfg).as_path())
+            {
+                return Err(format!("{}: fallback cache custody changed", root.display()).into());
+            }
+        } else if cleanup_checkout(mine).as_deref() == Some(canonical_repo(cfg).as_path())
+            && retire(mine)
+        {
             // The checkout's own root is admitted again (a `chmod go-w` the fallback's
             // note gave): what a killed fallback run left would otherwise stay for good.
             let _ = writeln!(
@@ -1527,8 +1535,6 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
         ),
         ("try-refused", flag(cfg.try_refused).into()),
         ("remeasure", flag(remeasure).into()),
-        ("crate-budget", cfg.budget.as_secs().to_string()),
-        ("obligations", flag(cfg.obligations).into()),
         ("host-mem", mem.to_string()),
         (
             "host-mem-os",
@@ -1592,6 +1598,7 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
         mem,
         cores,
         costs_path: state.as_ref().map(|s| s.join("trust-costs.tsv")),
+        libraries: libs.iter().map(|l| l.name.clone()).collect(),
         root,
         _lock: lock,
     })
@@ -1659,14 +1666,7 @@ fn check_and_conclude(
         );
         let reducer = cfg.obligations.then(|| Reducer::start(cfg.repo.clone()));
         let budget = cfg.budget;
-        let mut ended_by_guard: Vec<String> = Vec::new();
         let mut done = |f: Finished, checks: &mut dyn Checks| {
-            if let Some(why) = &f.guarded {
-                ended_by_guard.push(format!(
-                    "trust: the memory guard ended {}: {why}",
-                    f.job.name
-                ));
-            }
             let mut probe = || checks.probe_trustd();
             let _ = record(&f, budget, &mut probe);
             if let Some(r) = &reducer {
@@ -1677,9 +1677,6 @@ fn check_and_conclude(
             }
         };
         let ran = bench.checks(cfg, prep, jobs, slots, &mut done, out);
-        for l in &ended_by_guard {
-            let _ = writeln!(out, "{l}");
-        }
         // Every record is written before the judge reads one; a run that decided
         // nothing reduces no more.
         if let Some(r) = reducer {
@@ -1744,9 +1741,15 @@ fn check_and_conclude(
     let done = trust_facts::conclude(&git, &cfg.repo, &mut parsed, update)
         .map_err(|e| format!("the judge could not conclude: {e}"))?;
     if cfg.update_ratchet && !new_costs.is_empty() {
-        // The seed follows the floors, written after the filing as they are: every
-        // row this clone knows, this run's measurements over them.
-        let mut all = costs;
+        // The seed follows the floors, written after the filing as they are: the later
+        // of the seed's and this clone's row for every library still in the graph,
+        // this run's measurements over them.
+        let history = prep
+            .costs_path
+            .as_deref()
+            .map(cost_file)
+            .unwrap_or_default();
+        let mut all = seed_rows(cost_file(&seed), history, &prep.libraries);
         all.extend(new_costs);
         write_cost_file(
             &seed,
@@ -1769,8 +1772,8 @@ fn check_and_conclude(
 }
 
 /// `--obligations`: each check's proof report reduced on a thread of its own, so a
-/// report of gigabytes never holds the slots (no check polled, held to its budget or
-/// guarded meanwhile).
+/// report of gigabytes never holds the slots (no check polled or held to its budget
+/// meanwhile).
 struct Reducer {
     tx: Option<std::sync::mpsc::Sender<Job>>,
     skip: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1885,8 +1888,8 @@ fn write_cost_file(path: &Path, header: &str, all: &BTreeMap<String, Cost>, out:
     }
 }
 
-/// `--obligations`: the check's proof report reduced to its per-obligation record
-/// beside its log, or why not; then the report goes (it is large).
+/// `--obligations`: reduce the check's proof report beside its log. Retire
+/// the raw directory only after success; a refusal keeps its input for diagnosis.
 fn reduce_report(job: &Job, repo: &Path) {
     let Some(report) = &job.report else {
         return;
@@ -1906,8 +1909,12 @@ fn reduce_report(job: &Job, repo: &Path) {
     if let Err(why) = crate::trust_oblig::write_record(&args) {
         let _ = fs::write(
             format!("{}.oblig.err", job.log.display()),
-            format!("{why}\n"),
+            format!(
+                "{why}\nraw report cleanup skipped for {}\n",
+                report.display()
+            ),
         );
+        return;
     }
     let _ = fs::remove_dir_all(report);
 }
@@ -2022,8 +2029,12 @@ const GO_W: Option<&str> = Some("go-w");
 impl Refused {
     /// The command that clears it, when the caller owns it and only its mode keeps it out.
     fn chmod_command(&self) -> Option<String> {
-        self.chmod
-            .map(|mode| format!("chmod {mode} {}", self.dir.display()))
+        self.chmod.map(|mode| {
+            format!(
+                "chmod {mode} {}",
+                crate::release::shell_word(&self.dir.to_string_lossy())
+            )
+        })
     }
 
     /// What to do: run [`Refused::chmod`] on an object of the caller's that only its mode
@@ -2201,45 +2212,195 @@ fn checkout_record(repo: &Path) -> Vec<u8> {
     b
 }
 
-/// End what a killed run left running under the target root `dir` ([`reap_stale_checks`])
-/// and remove it, only while holding its run lock: whether it is gone (not while a run
-/// holds it).
-fn retire(dir: &Path) -> bool {
-    let Ok(lock) = RunLock::take(&dir.join(".run.lock"), "a run holds it") else {
+/// A real caller-owned cache directory under the existing target-root admission.
+/// Unknown metadata and another principal's writable path never admit automatic cleanup.
+fn owned_cache_dir(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let me = proc_tree::euid();
+    let Ok(md) = fs::symlink_metadata(path) else {
         return false;
     };
+    if !md.is_dir() || md.uid() != me || md.mode() & 0o022 != 0 {
+        return false;
+    }
+    // The existing component rule, but a cleanup cannot skip an unreadable chain.
+    for logical in path.ancestors() {
+        let Ok(physical) = fs::canonicalize(logical) else {
+            return false;
+        };
+        for dir in physical.ancestors() {
+            let Ok(md) = fs::metadata(dir) else {
+                return false;
+            };
+            if !md.is_dir()
+                || component_refusal(md.uid(), md.mode(), me, || proc_tree::writable(dir)).is_some()
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// A non-symlink, singly linked authority file writable by its caller owner alone.
+fn owned_cache_file(path: &Path) -> Option<fs::Metadata> {
+    use std::os::unix::fs::MetadataExt as _;
+    let md = fs::symlink_metadata(path).ok()?;
+    (md.is_file() && md.uid() == proc_tree::euid() && md.mode() & 0o022 == 0 && md.nlink() == 1)
+        .then_some(md)
+}
+
+/// Admit an existing fallback lock without following links, or make a new owner-only
+/// one exclusively. The automatic root must not reach RunLock's writer on an unknown file.
+fn prepare_cache_lock(root: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let path = root.join(".run.lock");
+    let refused = || {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "unknown fallback cache root, run lock or check record",
+        )
+    };
+    if !root.parent().is_some_and(owned_cache_dir) || !owned_cache_dir(root) {
+        return Err(refused());
+    }
+    // The selected automatic root is reaped after preparation. Refuse unknown
+    // stale-check entries before RunLock can write or any PID record is read.
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with(".check.")
+            && owned_cache_file(&entry.path()).is_none()
+        {
+            return Err(refused());
+        }
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(_) if owned_cache_file(&path).is_some() => Ok(()),
+        Ok(_) => Err(refused()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            drop(
+                fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(path)?,
+            );
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Replace the selected fallback root's checkout marker through exclusive scratch,
+/// never by truncating/chmoding the target of an existing symlink or hard link.
+fn write_checkout_record(root: &Path, repo: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let marker = root.join(CHECKOUT_RECORD);
+    let refused = || {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "unknown checkout marker or fallback root",
+        )
+    };
+    if !root.parent().is_some_and(owned_cache_dir)
+        || !owned_cache_dir(root)
+        || root.file_name() != Some(std::ffi::OsStr::new(&checkout_key(repo)))
+    {
+        return Err(refused());
+    }
+    match fs::symlink_metadata(&marker) {
+        Ok(md) if md.is_file() && md.uid() == proc_tree::euid() && md.nlink() == 1 => {}
+        Ok(_) => return Err(refused()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    // An existing caller-owned regular marker may have a weak old umask. Replace
+    // it with a fresh 0644 file; its old contents never authorize this selected run.
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix(".checkout-")
+        .tempdir_in(root)?;
+    let at = scratch.path().join("record");
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&at)?;
+    file.set_permissions(fs::Permissions::from_mode(0o644))?;
+    file.write_all(&checkout_record(repo))?;
+    drop(file);
+    fs::rename(at, marker)
+}
+
+/// The checkout an automatic cleanup may act for. All authority files and the
+/// cache/child directory are admitted before a run lock can be opened or a PID read.
+fn cleanup_checkout(dir: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    if !owned_cache_dir(dir.parent()?) || !owned_cache_dir(dir) {
+        return None;
+    }
+    owned_cache_file(&dir.join(CHECKOUT_RECORD))?;
+    // A real run made this lock. A missing, weak, linked or unknown lock is retained.
+    owned_cache_file(&dir.join(".run.lock"))?;
+    for entry in fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        if entry.file_name().to_string_lossy().starts_with(".check.") {
+            owned_cache_file(&entry.path())?;
+        }
+    }
+    let bytes = fs::read(dir.join(CHECKOUT_RECORD)).ok()?;
+    let path = bytes.strip_suffix(b"\n")?;
+    let checkout = PathBuf::from(std::ffi::OsStr::from_bytes(path));
+    (checkout.is_absolute()
+        && dir.file_name() == Some(std::ffi::OsStr::new(&checkout_key(&checkout))))
+    .then_some(checkout)
+}
+
+/// Retire an admitted fallback root under its own existing run lock. The selected
+/// explicit run-root cleanup remains separate. Unknown cache state is left alone.
+fn retire(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let Some(checkout) = cleanup_checkout(dir) else {
+        return false;
+    };
+    let lock_path = dir.join(".run.lock");
+    let Ok(lock) = RunLock::take(&lock_path, "a run holds it") else {
+        return false;
+    };
+    let (Ok(held), Some(named)) = (lock.0.metadata(), owned_cache_file(&lock_path)) else {
+        return false;
+    };
+    if (held.dev(), held.ino()) != (named.dev(), named.ino())
+        || cleanup_checkout(dir).as_ref() != Some(&checkout)
+    {
+        return false;
+    }
     reap_stale_checks(dir);
     let gone = fs::remove_dir_all(dir).is_ok();
     drop(lock);
     gone
 }
 
-/// Retire ([`retire`]) each fallback root in `cache` but `own` whose recorded checkout is
-/// gone (a deleted worktree's): one a run holds, one with no record and one whose checkout
-/// is there (or cannot be looked at) stay. What it removed, with the checkout each
-/// recorded.
+/// Retire only admitted cache children whose matching recorded checkout is known
+/// missing. Read/metadata failures, unknown entries and unadmitted caches are preserved.
 fn prune_orphans(cache: &Path, own: &Path) -> Vec<(PathBuf, PathBuf)> {
-    use std::os::unix::ffi::OsStrExt as _;
     let mut gone = Vec::new();
-    for e in fs::read_dir(cache).into_iter().flatten().flatten() {
-        let dir = e.path();
-        if dir == own || !e.file_type().is_ok_and(|t| t.is_dir()) {
+    if !owned_cache_dir(cache) {
+        return gone;
+    }
+    let Ok(entries) = fs::read_dir(cache) else {
+        return gone;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let dir = entry.path();
+        if dir == own {
             continue;
         }
-        let Ok(bytes) = fs::read(dir.join(CHECKOUT_RECORD)) else {
+        let Some(checkout) = cleanup_checkout(&dir) else {
             continue;
         };
-        let Some(path) = bytes.strip_suffix(b"\n") else {
-            continue;
-        };
-        let checkout = PathBuf::from(std::ffi::OsStr::from_bytes(path));
-        if !checkout.is_absolute()
-            || !fs::symlink_metadata(&checkout)
-                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        if fs::symlink_metadata(&checkout).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            && retire(&dir)
         {
-            continue;
-        }
-        if retire(&dir) {
             gone.push((dir, checkout));
         }
     }
@@ -2527,9 +2688,6 @@ struct RealChecks<'a> {
     /// Each fork lockfile a check used, and whether this run created it: what
     /// [`record`] did not remove (a check an interrupt ended) goes after the slots.
     locks: BTreeMap<PathBuf, bool>,
-    guard: Option<Guard>,
-    /// Each slot's running check, and when the guard last measured it.
-    pids: BTreeMap<usize, (u32, Instant)>,
 }
 
 impl Checks for RealChecks<'_> {
@@ -2559,7 +2717,6 @@ impl Checks for RealChecks<'_> {
         proc_tree::new_session(&mut cmd);
         let child = cmd.spawn()?;
         let pid = child.id();
-        self.pids.insert(job.slot, (pid, Instant::now()));
         let record = self.root.join(format!(".check.{}", job.slot));
         let _ = fs::write(
             &record,
@@ -2575,16 +2732,6 @@ impl Checks for RealChecks<'_> {
 
     fn trustd_held(&self) -> bool {
         self.keeper.held()
-    }
-
-    fn guard(&mut self, job: &Job) -> Option<String> {
-        let g = self.guard?;
-        let (pid, last) = self.pids.get_mut(&job.slot)?;
-        if last.elapsed() < guard::EVERY {
-            return None;
-        }
-        *last = Instant::now();
-        guard::crossed(&g, *pid, self.root)
     }
 
     fn probe_trustd(&mut self) -> String {
@@ -2837,199 +2984,6 @@ pub mod proc_tree {
             all.retain(|pid| *pid != root);
         }
         send(&all, SIGKILL);
-    }
-}
-
-pub mod guard {
-    //! The memory guard's measurements: a check's process tree's memory (macOS's physical
-    //! footprint, which counts the compressed and swapped pages a resident set leaves out
-    //! exactly under pressure; Linux's resident set), the swap in use, macOS's memory
-    //! pressure level, and the free space under the target root.
-
-    use std::path::Path;
-    use std::time::Duration;
-
-    use super::Guard;
-
-    /// How often a running check is measured.
-    pub const EVERY: Duration = Duration::from_secs(2);
-
-    /// What crossed `g` for the check at `pid`, if anything did.
-    #[must_use]
-    pub fn crossed(g: &Guard, pid: u32, root: &Path) -> Option<String> {
-        let tree = i32::try_from(pid).ok().and_then(tree_bytes);
-        verdict(
-            g,
-            Reading {
-                tree,
-                swap: swap_used(),
-                level: pressure_level(),
-                free: free_bytes(root),
-            },
-        )
-    }
-
-    /// One measurement; `None` where it could not be read.
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub struct Reading {
-        pub tree: Option<u64>,
-        pub swap: Option<u64>,
-        /// `kern.memorystatus_level`: the percentage of memory the kernel counts free.
-        pub level: Option<u32>,
-        pub free: Option<u64>,
-    }
-
-    /// The bound a reading crossed, said; a measurement that could not be read
-    /// crosses nothing.
-    #[must_use]
-    pub fn verdict(g: &Guard, r: Reading) -> Option<String> {
-        let gib = |b: u64| b >> 30;
-        if let Some(t) = r.tree.filter(|t| *t > g.tree_bytes) {
-            return Some(format!(
-                "its process tree held {} GiB, past {} GiB",
-                gib(t),
-                gib(g.tree_bytes)
-            ));
-        }
-        if let Some(s) = r.swap.filter(|s| *s > g.swap_bytes) {
-            return Some(format!(
-                "{} GiB of swap in use, past {} GiB",
-                gib(s),
-                gib(g.swap_bytes)
-            ));
-        }
-        if let Some(l) = r.level.filter(|l| *l < g.level_min) {
-            return Some(format!("memorystatus_level {l}, under {}", g.level_min));
-        }
-        r.free.filter(|f| *f < g.free_bytes).map(|f| {
-            format!(
-                "{} GiB free under the target root, under {} GiB",
-                gib(f),
-                gib(g.free_bytes)
-            )
-        })
-    }
-
-    fn run(program: &str, args: &[&str]) -> Option<String> {
-        aterm_uds::spawnfd::command(program)
-            .args(args)
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .stderr(aterm_uds::spawnfd::Stdio::null())
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-    }
-
-    /// The memory of `root`'s whole tree (trustd's left out), bytes.
-    fn tree_bytes(root: i32) -> Option<u64> {
-        let listing = run("/bin/ps", &["-A", "-o", "pid=,ppid=,comm="])?;
-        Some(
-            super::proc_tree::descendants(&listing, root)
-                .into_iter()
-                .filter_map(process_bytes)
-                .sum(),
-        )
-    }
-
-    /// A process's physical footprint (`proc_pid_rusage`'s `ri_phys_footprint`).
-    #[cfg(target_os = "macos")]
-    fn process_bytes(pid: i32) -> Option<u64> {
-        /// `RUSAGE_INFO_V4`.
-        const FLAVOR: i32 = 4;
-        /// `ri_phys_footprint`'s place in `struct rusage_info_v4`, in u64s: after the
-        /// 16-byte uuid and seven counters.
-        const PHYS_FOOTPRINT: usize = 9;
-        unsafe extern "C" {
-            fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
-        }
-        // Larger than `struct rusage_info_v4`.
-        let mut buf = [0u64; 64];
-        // SAFETY: `buf` is live, writable and larger than the struct the flavor names.
-        let rc = unsafe { proc_pid_rusage(pid, FLAVOR, buf.as_mut_ptr()) };
-        (rc == 0).then(|| buf[PHYS_FOOTPRINT])
-    }
-
-    /// A process's resident set (`VmRSS`).
-    #[cfg(not(target_os = "macos"))]
-    fn process_bytes(pid: i32) -> Option<u64> {
-        let t = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-        let kib: u64 = t
-            .lines()
-            .find_map(|l| l.strip_prefix("VmRSS:"))?
-            .split_whitespace()
-            .next()?
-            .parse()
-            .ok()?;
-        Some(kib * 1024)
-    }
-
-    /// macOS's `kern.memorystatus_level`; `None` elsewhere.
-    fn pressure_level() -> Option<u32> {
-        run("/usr/sbin/sysctl", &["-n", "kern.memorystatus_level"])?
-            .trim()
-            .parse()
-            .ok()
-    }
-
-    /// Swap in use, bytes: macOS's `vm.swapusage`, else Linux's meminfo.
-    fn swap_used() -> Option<u64> {
-        if let Some(t) = run("/usr/sbin/sysctl", &["-n", "vm.swapusage"]) {
-            return parse_swapusage(&t);
-        }
-        let t = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let kib = |key: &str| {
-            t.lines()
-                .find_map(|l| l.strip_prefix(key))
-                .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
-        };
-        Some(kib("SwapTotal:")?.saturating_sub(kib("SwapFree:")?) * 1024)
-    }
-
-    /// `total = 2048.00M  used = 1035.25M  free = 1012.75M  (encrypted)` -> the used
-    /// bytes (to the hundredth of the unit).
-    #[must_use]
-    pub fn parse_swapusage(text: &str) -> Option<u64> {
-        let used = text.split("used = ").nth(1)?.split_whitespace().next()?;
-        let (n, unit) = used.split_at(used.find(|c: char| c.is_ascii_alphabetic())?);
-        let unit: u64 = match unit {
-            "K" => 1 << 10,
-            "M" => 1 << 20,
-            "G" => 1 << 30,
-            _ => return None,
-        };
-        let (whole, frac) = n.split_once('.').unwrap_or((n, ""));
-        let frac = format!("{frac:0<2}");
-        let hundredths = whole.parse::<u64>().ok()? * 100 + frac.get(..2)?.parse::<u64>().ok()?;
-        Some(hundredths * unit / 100)
-    }
-
-    /// Free bytes on the volume holding `dir` (`df -Pk`).
-    #[must_use]
-    pub fn free_bytes(dir: &Path) -> Option<u64> {
-        parse_df(&run("/bin/df", &["-Pk", &dir.display().to_string()])?)
-    }
-
-    /// The available KiB of `df -Pk`'s one row, as bytes.
-    #[must_use]
-    pub fn parse_df(text: &str) -> Option<u64> {
-        let kib: u64 = text
-            .lines()
-            .nth(1)?
-            .split_whitespace()
-            .nth(3)?
-            .parse()
-            .ok()?;
-        Some(kib * 1024)
-    }
-
-    /// This process's own footprint: a measurement of a process that is surely there.
-    #[cfg(test)]
-    #[must_use]
-    pub fn own_bytes() -> Option<u64> {
-        i32::try_from(std::process::id())
-            .ok()
-            .and_then(process_bytes)
     }
 }
 
@@ -3895,7 +3849,6 @@ mod tests {
         held_after: usize,
         interrupt_at: Option<Duration>,
         unstartable: Option<String>,
-        guard_ends: String,
     }
 
     struct FakeCheck {
@@ -3963,10 +3916,6 @@ mod tests {
         fn probe_trustd(&mut self) -> String {
             "ours\tthis build's".into()
         }
-        fn guard(&mut self, job: &Job) -> Option<String> {
-            (self.w.borrow().now >= Duration::from_secs(4) && self.guard_ends == job.name)
-                .then(|| "its tree held 99 GiB".to_string())
-        }
         fn interrupted(&self) -> bool {
             self.interrupt_at.is_some_and(|t| self.w.borrow().now >= t)
         }
@@ -4029,6 +3978,8 @@ mod tests {
             let mut check = job(row, false);
             check.log = slot.join(format!("{row}@1.0.0.log"));
             check.report = Some(report.clone());
+            let raw_path = report.join("report.ndjson");
+            let raw = fs::read(&raw_path).unwrap();
             reduce_report(&check, dir.path());
 
             let record = PathBuf::from(format!(
@@ -4044,11 +3995,24 @@ mod tests {
                         fs::read_to_string(&error)
                     )
                 });
-                let rec = crate::trust_oblig::Record::parse(&text).unwrap();
-                assert_eq!(rec.package, "alpha");
-                assert_eq!(rec.unit, unit);
-                assert_eq!((rec.functions, rec.total(), rec.proved()), (1, 1, 1));
+                let head: Vec<&str> = text.lines().take(6).collect();
+                let unit_line = format!("unit\t{unit}");
+                assert_eq!(
+                    head,
+                    [
+                        crate::trust_oblig::RECORD_MAGIC,
+                        "package\talpha",
+                        unit_line.as_str(),
+                        "functions\t1",
+                        "total\t1",
+                        "proved\t1",
+                    ]
+                );
                 assert!(!error.exists());
+                assert!(
+                    !report.exists(),
+                    "the successfully reduced report is retired"
+                );
             } else {
                 assert!(!record.exists());
                 assert!(
@@ -4056,8 +4020,8 @@ mod tests {
                         .unwrap()
                         .contains("package foreign, not alpha")
                 );
+                assert_eq!(fs::read(&raw_path).unwrap(), raw);
             }
-            assert!(!report.exists(), "the reduced report is retired");
         }
     }
 
@@ -4071,7 +4035,6 @@ mod tests {
             held_after: 0,
             interrupt_at: None,
             unstartable: None,
-            guard_ends: String::new(),
         }
     }
 
@@ -4175,21 +4138,6 @@ mod tests {
         assert_eq!(g.w.borrow().peak, 3);
     }
 
-    /// The memory guard ends a check inside its budget and says why; the others run on.
-    #[test]
-    fn the_memory_guard_ends_a_check_and_says_why() {
-        let mut f = fake(&[("small", 6)]);
-        f.guard_ends = "huge".into();
-        let jobs = vec![job("huge", false), job("small", false)];
-        let (r, done) = slots(&mut f, jobs, 2, 2, 100);
-        assert_eq!(r, Ok(()));
-        let huge = done.iter().find(|d| d.job.name == "huge").unwrap();
-        assert_eq!(huge.guarded.as_deref(), Some("its tree held 99 GiB"));
-        assert!(!huge.over_budget);
-        let small = done.iter().find(|d| d.job.name == "small").unwrap();
-        assert_eq!((small.guarded.as_deref(), small.ended.code), (None, 0));
-    }
-
     /// An interrupt ends every running check, starts no more, and decides nothing.
     #[test]
     fn an_interrupt_ends_every_running_check() {
@@ -4234,7 +4182,6 @@ mod tests {
             },
             wall: Duration::from_secs(5),
             over_budget: over,
-            guarded: None,
         }
     }
 
@@ -4288,10 +4235,9 @@ mod tests {
     const UMASK_PROBE: &str = "trust_lane::tests::probe_the_lanes_directories_under_umask_002";
 
     /// The child half of [`the_lanes_directories_are_admitted_under_umask_002`]: under umask
-    /// `002`, the slot the lane makes and the candidate gate's runs and side directories
-    /// are ones `targo trust` admits. Outside that child (the env unset) it does nothing:
-    /// the umask is the whole process's, so it is set only in a process running this one
-    /// test.
+    /// `002`, the slot the lane makes is one `targo trust` admits. Outside that child (the
+    /// env unset) it does nothing: the umask is the whole process's, so it is set only in a
+    /// process running this one test.
     #[test]
     fn probe_the_lanes_directories_under_umask_002() {
         let Some(dir) = std::env::var_os(UMASK_PROBE_ENV) else {
@@ -4300,28 +4246,15 @@ mod tests {
         // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this
         // process runs this one test (`--exact`), so no other create sees the mask.
         unsafe { umask(0o002) };
-        let base = PathBuf::from(dir);
-        let slot = base.join("target-trust/j0");
+        let slot = PathBuf::from(dir).join("target-trust/j0");
         owner_dirs(&slot).unwrap();
-        // The gate's layout: the receipts root beside its lock, the default --out in it.
-        let state = base.join("state");
-        let gate_root = atpkg_publish::channel::candidate::receipts_dir(&state);
-        let out = gate_root.join("run");
-        let lock =
-            crate::trust_candidate::gate_dirs(&gate_root, &state.join("candidate-gate.lock"), &out)
-                .unwrap();
-        crate::trust_candidate::side_dirs(&out, "base").unwrap();
-        drop(lock);
-        for dir in [slot, out.join("base/target"), out.join("base/state")] {
-            assert_eq!(refused_component(&dir), None, "{}", dir.display());
-        }
+        assert_eq!(refused_component(&slot), None, "{}", slot.display());
     }
 
-    /// The target root and slots the lane makes, and the candidate gate's runs directory
-    /// and each side's, are ones `targo trust` admits under a login's umask `002`
-    /// (Ubuntu's), where a plain `create_dir_all` makes them `0775`. The umask is the whole
-    /// process's, so they are made in a child of this test binary that runs only
-    /// [`probe_the_lanes_directories_under_umask_002`].
+    /// The target root and slots the lane makes are ones `targo trust` admits under a
+    /// login's umask `002` (Ubuntu's), where a plain `create_dir_all` makes them `0775`. The
+    /// umask is the whole process's, so they are made in a child of this test binary that
+    /// runs only [`probe_the_lanes_directories_under_umask_002`].
     #[test]
     fn the_lanes_directories_are_admitted_under_umask_002() {
         let base = aterm_tempfile::Builder::new()
@@ -4422,9 +4355,6 @@ mod tests {
         }
         fn probe_trustd(&mut self) -> String {
             "ours\tthis build's".into()
-        }
-        fn guard(&mut self, _: &Job) -> Option<String> {
-            None
         }
         fn interrupted(&self) -> bool {
             self.interrupt
@@ -4675,7 +4605,9 @@ mod tests {
 
     /// `--update-ratchet` REWRITES THE COMMITTED COST SEED beside the floors: the row it
     /// measured takes this run's cost, a row it did not measure keeps its own, with the
-    /// time it was measured; a run without it leaves the seed alone.
+    /// time it was measured — an older row of this clone's history does not undo it, and
+    /// a library that left the graph is not carried back in from that history; a run
+    /// without it leaves the seed alone.
     #[test]
     fn an_update_ratchet_run_rewrites_the_cost_seed() {
         let committed = format!(
@@ -4683,10 +4615,20 @@ mod tests {
             20_u64 << 30
         );
         let seeded = |update_ratchet: bool| {
-            let mut s = site(Scope::WholeTree);
+            let mut s = site(Scope::Packages(vec!["alpha".into()]));
+            s.libraries = vec!["alpha", "zeta"];
             fs::write(s.repo.join(trust_facts::COSTS), &committed).unwrap();
             git_in(&s.repo, &["add", "."]);
             git_in(&s.repo, &["commit", "-q", "-m", "the seed"]);
+            let state = s.cfg.state.clone().unwrap();
+            fs::create_dir_all(&state).unwrap();
+            fs::write(
+                state.join("trust-costs.tsv"),
+                format!(
+                    "{COSTS_HEADER}\nzeta\t9\t9\t9\t2026-09-01T00:00:00Z\ngone\t5\t5\t5\t2026-10-05T00:00:00Z\n"
+                ),
+            )
+            .unwrap();
             s.cfg.update_ratchet = update_ratchet;
             s
         };
@@ -4716,7 +4658,61 @@ mod tests {
                 maxrss: 70,
                 when: "2026-10-02T00:00:00Z".into(),
             },
-            "a row it did not measure keeps its own"
+            "a row it did not measure keeps its own, over an older row of the history"
+        );
+        assert!(
+            !costs.contains_key("gone"),
+            "a library outside the graph is not written back: {costs:?}"
+        );
+    }
+
+    /// THE SEED'S MERGE: the later row of each library still in the graph, whichever
+    /// file holds it; a row with no time is the oldest; a library the graph lost goes.
+    #[test]
+    fn the_seed_keeps_the_later_row_of_each_library_still_in_the_graph() {
+        let row = |cpu: u64, when: &str| Cost {
+            cpu,
+            wall: cpu,
+            maxrss: cpu,
+            when: when.into(),
+        };
+        let committed = BTreeMap::from([
+            ("newer-here".to_string(), row(1, "2026-10-01T00:00:00Z")),
+            ("newer-there".to_string(), row(2, "2026-10-09T00:00:00Z")),
+            ("untimed-here".to_string(), row(3, "2026-10-01T00:00:00Z")),
+            ("only-there".to_string(), row(4, "2026-10-01T00:00:00Z")),
+            ("gone".to_string(), row(5, "2026-10-01T00:00:00Z")),
+        ]);
+        let history = BTreeMap::from([
+            ("newer-here".to_string(), row(11, "2026-10-05T00:00:00Z")),
+            ("newer-there".to_string(), row(12, "2026-10-05T00:00:00Z")),
+            ("untimed-here".to_string(), row(13, "")),
+            ("only-here".to_string(), row(14, "2026-10-05T00:00:00Z")),
+            ("gone-too".to_string(), row(15, "2026-10-05T00:00:00Z")),
+        ]);
+        let graph: BTreeSet<String> = [
+            "newer-here",
+            "newer-there",
+            "untimed-here",
+            "only-there",
+            "only-here",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let cpu: BTreeMap<String, u64> = seed_rows(committed, history, &graph)
+            .into_iter()
+            .map(|(n, c)| (n, c.cpu))
+            .collect();
+        assert_eq!(
+            cpu,
+            BTreeMap::from([
+                ("newer-here".to_string(), 11),
+                ("newer-there".to_string(), 2),
+                ("untimed-here".to_string(), 3),
+                ("only-there".to_string(), 4),
+                ("only-here".to_string(), 14),
+            ])
         );
     }
 
@@ -4959,13 +4955,14 @@ mod tests {
         let root = s.cache.join(checkout_key(&checkout));
         let cache = s.cache.clone();
         let orphan = |name: &str| {
-            let dir = cache.join(name);
+            let checkout = cache.join(name);
+            let dir = cache.join(checkout_key(&checkout));
             owner_dirs(&dir).unwrap();
-            fs::write(
-                dir.join(CHECKOUT_RECORD),
-                checkout_record(&cache.join("no-such-checkout")),
-            )
-            .unwrap();
+            fs::write(dir.join(CHECKOUT_RECORD), checkout_record(&checkout)).unwrap();
+            fs::set_permissions(dir.join(CHECKOUT_RECORD), fs::Permissions::from_mode(0o600))
+                .unwrap();
+            fs::write(dir.join(".run.lock"), "").unwrap();
+            fs::set_permissions(dir.join(".run.lock"), fs::Permissions::from_mode(0o600)).unwrap();
             dir
         };
         let first_orphan = orphan("deleted-0123456789ab");
@@ -5020,6 +5017,7 @@ mod tests {
         // What a SIGKILLed fallback run leaves: a slot, and a record of its check.
         fs::create_dir_all(root.join("j0/debug")).unwrap();
         fs::write(root.join(".check.0"), "4194304999 never\n").unwrap();
+        fs::set_permissions(root.join(".check.0"), fs::Permissions::from_mode(0o600)).unwrap();
         let second_orphan = orphan("deleted-ba9876543210");
         fs::set_permissions(&s.repo, fs::Permissions::from_mode(0o755)).unwrap();
         let (outcome, said, _) = run_site(&mut s);
@@ -5241,6 +5239,10 @@ mod tests {
             "run: chmod a-st /w"
         );
         assert_eq!(refusal("/w", None).fix("elsewhere"), "elsewhere");
+        assert_eq!(
+            refusal("/w/a b'c", GO_W).fix("elsewhere"),
+            r"run: chmod go-w '/w/a b'\''c'"
+        );
         let base = aterm_tempfile::Builder::new()
             .prefix("trust-lane-fix")
             .tempdir_in(slots_base())
@@ -5289,14 +5291,22 @@ mod tests {
     /// own stay.
     #[test]
     fn a_fallback_root_whose_checkout_is_gone_is_pruned() {
-        let d = tmp("trust-lane-orphans");
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = aterm_tempfile::Builder::new()
+            .prefix("trust-lane-orphans")
+            .tempdir_in(slots_base())
+            .unwrap();
         let cache = d.path().join("cache");
         let make = |name: &str, record: Option<&Path>| {
-            let dir = cache.join(name);
-            fs::create_dir_all(dir.join("logs")).unwrap();
+            let dir = cache.join(record.map(checkout_key).unwrap_or_else(|| name.into()));
+            owner_dirs(&dir.join("logs")).unwrap();
             if let Some(r) = record {
                 fs::write(dir.join(CHECKOUT_RECORD), checkout_record(r)).unwrap();
+                fs::set_permissions(dir.join(CHECKOUT_RECORD), fs::Permissions::from_mode(0o600))
+                    .unwrap();
             }
+            fs::write(dir.join(".run.lock"), "").unwrap();
+            fs::set_permissions(dir.join(".run.lock"), fs::Permissions::from_mode(0o600)).unwrap();
             dir
         };
         let present = d.path().join("present");
@@ -5308,6 +5318,42 @@ mod tests {
         let relative = make("relative", Some(Path::new("relative/gone")));
         let held = make("held", Some(&d.path().join("also-gone")));
         let lock = RunLock::take(&held.join(".run.lock"), "a test holds it").unwrap();
+        let wrong = make("wrong", Some(&d.path().join("wrong-gone")));
+        let wrong_key = cache.join("not-the-recorded-checkout");
+        fs::rename(wrong, &wrong_key).unwrap();
+        let linked = make("linked", Some(&d.path().join("linked-gone")));
+        let outside = d.path().join("outside-record");
+        fs::write(&outside, checkout_record(&d.path().join("linked-gone"))).unwrap();
+        let outside_before = fs::read(&outside).unwrap();
+        fs::remove_file(linked.join(CHECKOUT_RECORD)).unwrap();
+        std::os::unix::fs::symlink(&outside, linked.join(CHECKOUT_RECORD)).unwrap();
+        assert!(write_checkout_record(&linked, &d.path().join("linked-gone")).is_err());
+        assert_eq!(
+            fs::read(&outside).unwrap(),
+            outside_before,
+            "no marker symlink is followed"
+        );
+        let missing_lock = make("no-lock", Some(&d.path().join("no-lock-gone")));
+        fs::remove_file(missing_lock.join(".run.lock")).unwrap();
+        let linked_lock = make("linked-lock", Some(&d.path().join("linked-lock-gone")));
+        fs::remove_file(linked_lock.join(".run.lock")).unwrap();
+        std::os::unix::fs::symlink(&outside, linked_lock.join(".run.lock")).unwrap();
+        assert!(prepare_cache_lock(&linked_lock).is_err());
+        assert_eq!(
+            fs::read(&outside).unwrap(),
+            outside_before,
+            "no run-lock symlink is opened"
+        );
+        let linked_check = make("linked-check", Some(&d.path().join("linked-check-gone")));
+        std::os::unix::fs::symlink(orphan.join(".check.0"), linked_check.join(".check.0")).unwrap();
+        assert!(prepare_cache_lock(&linked_check).is_err());
+        let weak = make("weak", Some(&d.path().join("weak-gone")));
+        fs::set_permissions(&weak, fs::Permissions::from_mode(0o775)).unwrap();
+        // A shared cache is never scanned for authority, even with an admitted own root.
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(prune_orphans(&cache, &own).is_empty());
+        assert!(orphan.exists());
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
         // A check the orphan's killed run left running is ended with it.
         let mut check = command("/bin/sleep")
             .arg("600")
@@ -5317,6 +5363,7 @@ mod tests {
         let pid = check.id();
         let started = proc_tree::started(pid).unwrap();
         fs::write(orphan.join(".check.0"), format!("{pid} {started}\n")).unwrap();
+        fs::set_permissions(orphan.join(".check.0"), fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
             prune_orphans(&cache, &own),
             [(orphan.clone(), d.path().join("gone"))]
@@ -5335,7 +5382,19 @@ mod tests {
             std::thread::yield_now();
         };
         assert!(ended.is_some(), "the orphan's check outlived its root");
-        for kept in [&own, &live, &unrecorded, &relative, &held] {
+        for kept in [
+            &own,
+            &live,
+            &unrecorded,
+            &relative,
+            &held,
+            &wrong_key,
+            &linked,
+            &missing_lock,
+            &linked_lock,
+            &linked_check,
+            &weak,
+        ] {
             assert!(kept.join("logs").is_dir(), "{}", kept.display());
         }
         drop(lock);
@@ -5506,84 +5565,6 @@ mod tests {
         assert_eq!(Outcome::Undecided(vec!["a".into()]).exit(), 2);
         assert_eq!(Outcome::CouldNotRun("x".into()).exit(), 2);
         assert_eq!(Outcome::Narrowed(vec!["a".into()]).exit(), 4);
-    }
-
-    /// The guard crosses a bound only on a measurement it read, and says which.
-    #[test]
-    fn the_guard_says_which_bound_was_crossed() {
-        use guard::Reading;
-        let g = Guard {
-            tree_bytes: 10 << 30,
-            swap_bytes: 8 << 30,
-            level_min: 10,
-            free_bytes: 28 << 30,
-        };
-        let calm = Reading {
-            tree: Some(1 << 30),
-            swap: Some(0),
-            level: Some(40),
-            free: Some(100 << 30),
-        };
-        assert_eq!(guard::verdict(&g, calm), None);
-        assert_eq!(
-            guard::verdict(&g, Reading::default()),
-            None,
-            "unread is no crossing"
-        );
-        let crossed = |r: Reading, said: &str| {
-            assert!(
-                guard::verdict(&g, r).is_some_and(|w| w.contains(said)),
-                "{r:?}"
-            );
-        };
-        crossed(
-            Reading {
-                tree: Some(11 << 30),
-                ..calm
-            },
-            "process tree",
-        );
-        crossed(
-            Reading {
-                swap: Some(9 << 30),
-                ..calm
-            },
-            "swap",
-        );
-        crossed(
-            Reading {
-                level: Some(9),
-                ..calm
-            },
-            "memorystatus_level 9",
-        );
-        crossed(
-            Reading {
-                free: Some(1 << 30),
-                ..calm
-            },
-            "free",
-        );
-        assert_eq!(
-            guard::parse_swapusage(
-                "total = 2048.00M  used = 1024.00M  free = 1024.00M  (encrypted)"
-            ),
-            Some(1 << 30)
-        );
-        assert_eq!(
-            guard::parse_swapusage("used = 1035.25M"),
-            Some(1_085_538_304)
-        );
-        assert_eq!(guard::parse_swapusage("used = 2.00G"), Some(2 << 30));
-        assert_eq!(guard::parse_swapusage("used = 3G"), Some(3 << 30));
-        assert_eq!(guard::parse_swapusage("nothing"), None);
-        assert_eq!(
-            guard::parse_df(
-                "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk3s5 100 50 1024 50% /\n"
-            ),
-            Some(1 << 20)
-        );
-        assert!(guard::own_bytes().is_some_and(|b| b > 0));
     }
 
     // -- process trees --------------------------------------------------------

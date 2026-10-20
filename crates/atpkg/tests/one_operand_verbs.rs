@@ -71,6 +71,24 @@ impl Fixture {
         atpkg::store::mark_build_ready(&dir).unwrap();
     }
 
+    /// Record the root of `program`'s build in `status.toml` as its signed one.
+    fn record_root(&self, program: &str) {
+        let root = atpkg::tree::tree_root(&self.layout.build_dir(program, BUILD)).unwrap();
+        let mut status = atpkg::status::Status {
+            schema: 1,
+            ..Default::default()
+        };
+        status.programs.insert(
+            program.to_string(),
+            atpkg::status::ProgramStatus {
+                installed_build: Some(BUILD),
+                state: "active".into(),
+                tree_root: root,
+            },
+        );
+        atpkg::status::write(&self.layout, &status).unwrap();
+    }
+
     /// Whether `program` is still on this machine: its store tree AND its shim.
     fn installed(&self, program: &str) -> bool {
         let shim = self
@@ -148,6 +166,9 @@ fn uninstall_of_two_names_refuses_both_and_removes_neither() {
 #[test]
 fn every_one_name_verb_refuses_a_second_name_at_the_usage_exit() {
     let f = Fixture::new("verbs");
+    // An empty store gives the audit (see the CONTROL below) nothing to fail.
+    let out = f.atpkg(&["verify"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     f.install("ta");
     for verb in [
         "which",
@@ -165,6 +186,18 @@ fn every_one_name_verb_refuses_a_second_name_at_the_usage_exit() {
         assert_eq!(out.status.code(), Some(2), "`{verb} ta tb`:\n{all}");
     }
     assert!(f.installed("ta"), "no verb above may have acted on `ta`");
+
+    // CONTROL: `verify ta` alone runs the audit, whose exit is its verdict — 1 while no
+    // signed root is recorded (fail closed), 0 once the recorded root matches — and a bare
+    // `verify` fails when any one program it audits does.
+    let out = f.atpkg(&["verify", "ta"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    f.record_root("ta");
+    let out = f.atpkg(&["verify", "ta"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    f.install("tb");
+    let out = f.atpkg(&["verify"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
 }
 
 /// A verb that takes no argument refuses a stray one at the usage exit, before the store
@@ -189,10 +222,26 @@ fn a_no_argument_verb_refuses_a_stray_one_and_touches_nothing() {
             .contains("unknown argument \"--dry-run\" \u{2014} this verb takes none"),
         "the refusal names the stray argument:\n{all}"
     );
-    let after = std::fs::read_dir(&f.home)
+    let mut after = std::fs::read_dir(&f.home)
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect::<std::collections::BTreeSet<_>>();
+    // Rosetta writes its translation cache to `$HOME/.cache/rosetta` in every process it
+    // runs, whatever `XDG_CACHE_HOME` says (measured 2026-10-19): under a translator that
+    // folder is its own, and whether atpkg laid `.cache` is not decided here.
+    if let Some(translator) = aterm_uds::process::translator() {
+        let cache = std::ffi::OsString::from(".cache");
+        let held = std::fs::read_dir(f.home.join(&cache))
+            .map(|dir| dir.map(|e| e.unwrap().file_name()).collect::<Vec<_>>());
+        if !before.contains(&cache) && held.is_ok_and(|held| held == ["rosetta"]) {
+            after.remove(&cache);
+            eprintln!(
+                "NOT RUN under {translator}: one_operand_verbs::a_no_argument_verb_refuses_a_\
+                 stray_one_and_touches_nothing: whether atpkg lays `.cache` in HOME, where the \
+                 translator writes its own cache"
+            );
+        }
+    }
     assert_eq!(before, after, "nothing may be laid in HOME:\n{all}");
     assert!(!lock.exists(), "the store lock is never taken:\n{all}");
 }

@@ -9,11 +9,11 @@
 //! owns only the primitive.
 //!
 //! Zero dependencies and no `unsafe`, SIMD or assembly: astream hashes grants,
-//! nonces and test output, not bulk traffic. Input is consumed in 64-byte blocks
-//! straight from the caller's slice, with one partial-block buffer.
+//! nonces and test output, not bulk traffic. The const slice updater copies bytes
+//! into one 64-byte buffer and compresses it whenever it fills.
 //!
-//! Ported from aterm's `crates/aterm-digest/src/sha256.rs` (the same author), with
-//! its tests. Checked against the FIPS 180-4 vectors below, and against the
+//! Ported from aterm's `aterm-digest` (the same author; it now re-exports this one),
+//! with its tests. Checked against the FIPS 180-4 vectors below, and against the
 //! `sha2` crate it replaced: every length 0..=1024, whole and under random update
 //! splits, matched sha2 byte for byte when it landed, and
 //! `tests/lengths_and_splits.rs` pins the answers sha2 gave.
@@ -102,19 +102,22 @@ const K: [u32; 64] = [
 /// `Astream.Digest.TlaStreamingSha256.sha256_next_buf_len_isl`.
 #[must_use]
 pub const fn sha256_next_buf_len(cur_buf_len: u64, data_len: u64, tail_len: u64) -> u64 {
+    let clamped_tail = if tail_len < 63 { tail_len } else { 63 };
     if cur_buf_len == 0 {
-        sha256_clamp_partial_len(tail_len, 63)
+        clamped_tail
     } else {
-        let clamped_cur = sha256_clamp_partial_len(cur_buf_len, 63) & 63;
+        let raw_cur = if cur_buf_len < 63 { cur_buf_len } else { 63 };
+        let clamped_cur = raw_cur & 63;
         // For `clamped_cur` in `0..=63`, `63 - clamped_cur == (clamped_cur ^ 63) & 63`,
         // so `64 - clamped_cur == ((clamped_cur ^ 63) & 63) + 1`.
         let avail = ((clamped_cur ^ 63) & 63) + 1;
-        let take = sha256_partial_take(avail, data_len) & 127;
+        let raw_take = if data_len < avail { data_len } else { avail };
+        let take = raw_take & 127;
         let filled = clamped_cur + take;
         if filled < 64 {
             filled
         } else {
-            sha256_clamp_partial_len(tail_len, 63)
+            clamped_tail
         }
     }
 }
@@ -123,7 +126,7 @@ contract_fn! {
     /// Pure partial-block invariant check (`buf_len < block_len`), verified by
     /// `clean-kernel-defeq` against `buf_len_is_partial_isl` in the Clean TLA+ island.
     #[must_use]
-    pub fn buf_len_is_partial(buf_len: u64, block_len: u64) -> bool
+    pub const fn buf_len_is_partial(buf_len: u64, block_len: u64) -> bool
     clauses [ensures result == (buf_len < block_len)]
     {
         buf_len < block_len
@@ -164,7 +167,7 @@ pub struct Sha256 {
 impl Sha256 {
     /// Creates a hasher over the empty message.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             state: H_INIT,
             buf: [0u8; BLOCK_LEN],
@@ -173,70 +176,39 @@ impl Sha256 {
         }
     }
 
+    /// Feeds a byte slice into the hash without generic `AsRef` dispatch.
+    pub const fn update_slice(&mut self, mut data: &[u8]) {
+        let data_len = data.len() as u64;
+        self.len = self.len.wrapping_add(data_len);
+        let mut cur = if buf_len_is_partial(self.buf_len as u64, BLOCK_LEN as u64) {
+            self.buf_len & MAX_PARTIAL_LEN
+        } else {
+            0
+        };
+        while let &[b, ref rest @ ..] = data {
+            self.buf[cur & MAX_PARTIAL_LEN] = b;
+            cur = (cur & MAX_PARTIAL_LEN) + 1;
+            if cur == BLOCK_LEN {
+                let block = self.buf;
+                compress(&mut self.state, &block);
+                cur = 0;
+            }
+            data = rest;
+        }
+        self.buf_len = cur;
+    }
+
     /// Feeds more bytes into the hash.
     ///
     /// Splitting the same message across `update` calls in any pattern yields
     /// the same digest as one call with the whole message.
     pub fn update(&mut self, bytes: impl AsRef<[u8]>) {
-        let mut data = bytes.as_ref();
-        self.len = self.len.wrapping_add(data.len() as u64);
-
-        // Top up a partial block left by a previous call, and compress it the
-        // moment it is full -- keeping the `buf_len < BLOCK_LEN` invariant.
-        if self.buf_len > 0 && buf_len_is_partial(self.buf_len as u64, BLOCK_LEN as u64) {
-            let cur = self.buf_len;
-            if let Some((_, dst_rem)) = self.buf.as_mut_slice().split_at_mut_checked(cur) {
-                let avail = dst_rem.len();
-                let take_cand = sha256_partial_take(avail as u64, data.len() as u64) as usize;
-                let take = if take_cand < avail { take_cand } else { avail };
-                let take = if take < data.len() { take } else { data.len() };
-                if let (Some((dst, _)), Some((src, rem))) = (
-                    dst_rem.split_at_mut_checked(take),
-                    data.split_at_checked(take),
-                ) {
-                    dst.copy_from_slice(src);
-                    self.buf_len = cur.saturating_add(take);
-                    data = rem;
-                }
-            }
-            if self.buf_len < BLOCK_LEN {
-                // `take` consumed all of `data` without filling the block.
-                // Returning is required: the tail copy below would reset
-                // `buf_len` to 0 and discard the buffered bytes.
-                debug_assert!(data.is_empty());
-                return;
-            }
-            let block = self.buf;
-            compress(&mut self.state, &block);
-            self.buf_len = 0;
-        }
-
-        // Whole blocks compress straight from the caller's slice, uncopied.
-        let (blocks, rest) = data.as_chunks::<BLOCK_LEN>();
-        for block in blocks {
-            compress(&mut self.state, block);
-        }
-
-        // The tail (0..63 bytes) waits for the next call or for padding.
-        let tail_cand =
-            sha256_clamp_partial_len(rest.len() as u64, MAX_PARTIAL_LEN as u64) as usize;
-        let tail_len = if tail_cand < rest.len() {
-            tail_cand
-        } else {
-            rest.len()
-        };
-        if let (Some((dst, _)), Some((src, _))) = (
-            self.buf.as_mut_slice().split_at_mut_checked(tail_len),
-            rest.split_at_checked(tail_len),
-        ) {
-            dst.copy_from_slice(src);
-            self.buf_len = tail_len;
-        }
+        self.update_slice(bytes.as_ref());
     }
 
     /// Finishes the hash and returns the 32-byte digest.
     #[must_use]
-    pub fn finalize(mut self) -> [u8; OUTPUT_LEN] {
+    pub const fn finalize(mut self) -> [u8; OUTPUT_LEN] {
         // FIPS 180-4 sec. 5.1.1 padding: a `1` bit, then `0` bits, then the
         // message length in bits as a big-endian u64, landing on a block
         // boundary.
@@ -244,9 +216,7 @@ impl Sha256 {
 
         // `buf_len < BLOCK_LEN` on entry (see the field docs), so this index is
         // always in range.
-        let clamped =
-            sha256_clamp_partial_len(self.buf_len as u64, MAX_PARTIAL_LEN as u64) as usize;
-        let mut pos = clamped & MAX_PARTIAL_LEN;
+        let mut pos = self.buf_len & MAX_PARTIAL_LEN;
         self.buf[pos] = 0x80;
         pos += 1;
 
@@ -254,54 +224,39 @@ impl Sha256 {
         // into a second block: zero-fill and compress this one, then lay the
         // length into a fresh zero block (messages of 56..=63 bytes mod 64).
         if pos > PAD_LEN_OFFSET {
-            if let Some((_, dst)) = self.buf.as_mut_slice().split_at_mut_checked(pos) {
-                dst.fill(0);
+            while pos < BLOCK_LEN {
+                self.buf[pos & MAX_PARTIAL_LEN] = 0;
+                pos += 1;
             }
             let block = self.buf;
             compress(&mut self.state, &block);
             pos = 0;
         }
 
-        if let Some((before_len, _)) = self.buf.as_mut_slice().split_at_mut_checked(PAD_LEN_OFFSET)
-        {
-            if let Some((_, zero_pad)) = before_len.split_at_mut_checked(pos) {
-                zero_pad.fill(0);
-            }
+        while pos < PAD_LEN_OFFSET {
+            self.buf[pos & MAX_PARTIAL_LEN] = 0;
+            pos += 1;
         }
-        let [l0, l1, l2, l3, l4, l5, l6, l7] = bit_len.to_be_bytes();
-        self.buf[56] = l0;
-        self.buf[57] = l1;
-        self.buf[58] = l2;
-        self.buf[59] = l3;
-        self.buf[60] = l4;
-        self.buf[61] = l5;
-        self.buf[62] = l6;
-        self.buf[63] = l7;
+        write_pad_len_be(&mut self.buf, bit_len);
         self.buf_len = 0;
         let block = self.buf;
         compress(&mut self.state, &block);
 
-        let [s0, s1, s2, s3, s4, s5, s6, s7] = self.state;
-        let [b00, b01, b02, b03] = s0.to_be_bytes();
-        let [b04, b05, b06, b07] = s1.to_be_bytes();
-        let [b08, b09, b10, b11] = s2.to_be_bytes();
-        let [b12, b13, b14, b15] = s3.to_be_bytes();
-        let [b16, b17, b18, b19] = s4.to_be_bytes();
-        let [b20, b21, b22, b23] = s5.to_be_bytes();
-        let [b24, b25, b26, b27] = s6.to_be_bytes();
-        let [b28, b29, b30, b31] = s7.to_be_bytes();
-        [
-            b00, b01, b02, b03, b04, b05, b06, b07, b08, b09, b10, b11, b12, b13, b14, b15, b16,
-            b17, b18, b19, b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31,
-        ]
+        encode_state_be(&self.state)
+    }
+
+    /// One-shot SHA-256 digest of a byte slice without generic `AsRef` dispatch.
+    #[must_use]
+    pub const fn digest_slice(bytes: &[u8]) -> [u8; OUTPUT_LEN] {
+        let mut h = Self::new();
+        h.update_slice(bytes);
+        h.finalize()
     }
 
     /// One-shot convenience: the SHA-256 digest of `bytes`.
     #[must_use]
     pub fn digest(bytes: impl AsRef<[u8]>) -> [u8; OUTPUT_LEN] {
-        let mut h = Self::new();
-        h.update(bytes);
-        h.finalize()
+        Self::digest_slice(bytes.as_ref())
     }
 }
 
@@ -319,28 +274,124 @@ impl std::fmt::Debug for Sha256 {
     }
 }
 
+const fn write_pad_len_be(buf: &mut [u8; BLOCK_LEN], bit_len: u64) {
+    buf[56] = ((bit_len >> 56) & 0xff) as u8;
+    buf[57] = ((bit_len >> 48) & 0xff) as u8;
+    buf[58] = ((bit_len >> 40) & 0xff) as u8;
+    buf[59] = ((bit_len >> 32) & 0xff) as u8;
+    buf[60] = ((bit_len >> 24) & 0xff) as u8;
+    buf[61] = ((bit_len >> 16) & 0xff) as u8;
+    buf[62] = ((bit_len >> 8) & 0xff) as u8;
+    buf[63] = (bit_len & 0xff) as u8;
+}
+
+const fn encode_state_be(state: &[u32; 8]) -> [u8; OUTPUT_LEN] {
+    let s0 = state[0];
+    let s1 = state[1];
+    let s2 = state[2];
+    let s3 = state[3];
+    let s4 = state[4];
+    let s5 = state[5];
+    let s6 = state[6];
+    let s7 = state[7];
+    [
+        ((s0 >> 24) & 0xff) as u8,
+        ((s0 >> 16) & 0xff) as u8,
+        ((s0 >> 8) & 0xff) as u8,
+        (s0 & 0xff) as u8,
+        ((s1 >> 24) & 0xff) as u8,
+        ((s1 >> 16) & 0xff) as u8,
+        ((s1 >> 8) & 0xff) as u8,
+        (s1 & 0xff) as u8,
+        ((s2 >> 24) & 0xff) as u8,
+        ((s2 >> 16) & 0xff) as u8,
+        ((s2 >> 8) & 0xff) as u8,
+        (s2 & 0xff) as u8,
+        ((s3 >> 24) & 0xff) as u8,
+        ((s3 >> 16) & 0xff) as u8,
+        ((s3 >> 8) & 0xff) as u8,
+        (s3 & 0xff) as u8,
+        ((s4 >> 24) & 0xff) as u8,
+        ((s4 >> 16) & 0xff) as u8,
+        ((s4 >> 8) & 0xff) as u8,
+        (s4 & 0xff) as u8,
+        ((s5 >> 24) & 0xff) as u8,
+        ((s5 >> 16) & 0xff) as u8,
+        ((s5 >> 8) & 0xff) as u8,
+        (s5 & 0xff) as u8,
+        ((s6 >> 24) & 0xff) as u8,
+        ((s6 >> 16) & 0xff) as u8,
+        ((s6 >> 8) & 0xff) as u8,
+        (s6 & 0xff) as u8,
+        ((s7 >> 24) & 0xff) as u8,
+        ((s7 >> 16) & 0xff) as u8,
+        ((s7 >> 8) & 0xff) as u8,
+        (s7 & 0xff) as u8,
+    ]
+}
+
+const fn sha256_sigma0_small(x: u32) -> u32 {
+    x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3)
+}
+
+const fn sha256_sigma1_small(x: u32) -> u32 {
+    x.rotate_right(17) ^ x.rotate_right(19) ^ (x >> 10)
+}
+
+const fn sha256_schedule_word(w16: u32, w15: u32, w7: u32, w2: u32) -> u32 {
+    w16.wrapping_add(sha256_sigma0_small(w15))
+        .wrapping_add(w7)
+        .wrapping_add(sha256_sigma1_small(w2))
+}
+
+const fn sha256_ch(e: u32, f: u32, g: u32) -> u32 {
+    (e & f) ^ (!e & g)
+}
+
+const fn sha256_maj(a: u32, b: u32, c: u32) -> u32 {
+    (a & b) ^ (a & c) ^ (b & c)
+}
+
+const fn add_state_words(state: &mut [u32; 8], work: &[u32; 8]) {
+    state[0] = state[0].wrapping_add(work[0]);
+    state[1] = state[1].wrapping_add(work[1]);
+    state[2] = state[2].wrapping_add(work[2]);
+    state[3] = state[3].wrapping_add(work[3]);
+    state[4] = state[4].wrapping_add(work[4]);
+    state[5] = state[5].wrapping_add(work[5]);
+    state[6] = state[6].wrapping_add(work[6]);
+    state[7] = state[7].wrapping_add(work[7]);
+}
+
+const fn load_be_u32(bytes: &[u8; 4]) -> u32 {
+    ((bytes[0] as u32) << 24)
+        | ((bytes[1] as u32) << 16)
+        | ((bytes[2] as u32) << 8)
+        | (bytes[3] as u32)
+}
+
 /// The SHA-256 compression function -- FIPS 180-4 sec. 6.2.2.
 ///
 /// Absorbs one 512-bit block into the eight-word state.
-fn compress(state: &mut [u32; 8], block: &[u8; BLOCK_LEN]) {
+const fn compress(state: &mut [u32; 8], block: &[u8; BLOCK_LEN]) {
     // 1. Prepare the message schedule W.
     let mut w = [0u32; 64];
-    w[0] = u32::from_be_bytes([block[0], block[1], block[2], block[3]]);
-    w[1] = u32::from_be_bytes([block[4], block[5], block[6], block[7]]);
-    w[2] = u32::from_be_bytes([block[8], block[9], block[10], block[11]]);
-    w[3] = u32::from_be_bytes([block[12], block[13], block[14], block[15]]);
-    w[4] = u32::from_be_bytes([block[16], block[17], block[18], block[19]]);
-    w[5] = u32::from_be_bytes([block[20], block[21], block[22], block[23]]);
-    w[6] = u32::from_be_bytes([block[24], block[25], block[26], block[27]]);
-    w[7] = u32::from_be_bytes([block[28], block[29], block[30], block[31]]);
-    w[8] = u32::from_be_bytes([block[32], block[33], block[34], block[35]]);
-    w[9] = u32::from_be_bytes([block[36], block[37], block[38], block[39]]);
-    w[10] = u32::from_be_bytes([block[40], block[41], block[42], block[43]]);
-    w[11] = u32::from_be_bytes([block[44], block[45], block[46], block[47]]);
-    w[12] = u32::from_be_bytes([block[48], block[49], block[50], block[51]]);
-    w[13] = u32::from_be_bytes([block[52], block[53], block[54], block[55]]);
-    w[14] = u32::from_be_bytes([block[56], block[57], block[58], block[59]]);
-    w[15] = u32::from_be_bytes([block[60], block[61], block[62], block[63]]);
+    w[0] = load_be_u32(&[block[0], block[1], block[2], block[3]]);
+    w[1] = load_be_u32(&[block[4], block[5], block[6], block[7]]);
+    w[2] = load_be_u32(&[block[8], block[9], block[10], block[11]]);
+    w[3] = load_be_u32(&[block[12], block[13], block[14], block[15]]);
+    w[4] = load_be_u32(&[block[16], block[17], block[18], block[19]]);
+    w[5] = load_be_u32(&[block[20], block[21], block[22], block[23]]);
+    w[6] = load_be_u32(&[block[24], block[25], block[26], block[27]]);
+    w[7] = load_be_u32(&[block[28], block[29], block[30], block[31]]);
+    w[8] = load_be_u32(&[block[32], block[33], block[34], block[35]]);
+    w[9] = load_be_u32(&[block[36], block[37], block[38], block[39]]);
+    w[10] = load_be_u32(&[block[40], block[41], block[42], block[43]]);
+    w[11] = load_be_u32(&[block[44], block[45], block[46], block[47]]);
+    w[12] = load_be_u32(&[block[48], block[49], block[50], block[51]]);
+    w[13] = load_be_u32(&[block[52], block[53], block[54], block[55]]);
+    w[14] = load_be_u32(&[block[56], block[57], block[58], block[59]]);
+    w[15] = load_be_u32(&[block[60], block[61], block[62], block[63]]);
     let mut i = 16usize;
     while i < 64 {
         if i >= 16 {
@@ -348,9 +399,7 @@ fn compress(state: &mut [u32; 8], block: &[u8; BLOCK_LEN]) {
             let w2 = w[(i - 2) & 63];
             let w16 = w[(i - 16) & 63];
             let w7 = w[(i - 7) & 63];
-            let s0 = w15.rotate_right(7) ^ w15.rotate_right(18) ^ (w15 >> 3);
-            let s1 = w2.rotate_right(17) ^ w2.rotate_right(19) ^ (w2 >> 10);
-            w[i & 63] = w16.wrapping_add(s0).wrapping_add(w7).wrapping_add(s1);
+            w[i & 63] = sha256_schedule_word(w16, w15, w7, w2);
         }
         i += 1;
     }
@@ -359,16 +408,22 @@ fn compress(state: &mut [u32; 8], block: &[u8; BLOCK_LEN]) {
     let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
 
     // 3. Sixty-four rounds.
-    for (&kt, &wt) in K.iter().zip(w.iter()) {
+    let mut round = 0usize;
+    while round < 64 {
+        let kt = K[round & 63];
+        let wt = w[round & 63];
+        // Sigma_1(e), Ch(e, f, g) -- eqs. (4.7), (4.2)
         let big_s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-        let ch = (e & f) ^ (!e & g);
+        let ch = sha256_ch(e, f, g);
         let t1 = h
             .wrapping_add(big_s1)
             .wrapping_add(ch)
             .wrapping_add(kt)
             .wrapping_add(wt);
+
+        // Sigma_0(a), Maj(a, b, c) -- eqs. (4.6), (4.3)
         let big_s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let maj = sha256_maj(a, b, c);
         let t2 = big_s0.wrapping_add(maj);
 
         h = g;
@@ -379,17 +434,11 @@ fn compress(state: &mut [u32; 8], block: &[u8; BLOCK_LEN]) {
         c = b;
         b = a;
         a = t1.wrapping_add(t2);
+        round += 1;
     }
 
     // 4. Compute the next hash value.
-    state[0] = state[0].wrapping_add(a);
-    state[1] = state[1].wrapping_add(b);
-    state[2] = state[2].wrapping_add(c);
-    state[3] = state[3].wrapping_add(d);
-    state[4] = state[4].wrapping_add(e);
-    state[5] = state[5].wrapping_add(f);
-    state[6] = state[6].wrapping_add(g);
-    state[7] = state[7].wrapping_add(h);
+    add_state_words(state, &[a, b, c, d, e, f, g, h]);
 }
 
 #[cfg(test)]

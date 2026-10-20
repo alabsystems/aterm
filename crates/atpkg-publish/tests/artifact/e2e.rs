@@ -7,8 +7,9 @@
 //! — `bin/rustc` and `bin/trustc` the same program under two ad-hoc signatures — must ship
 //! as one inode, one signature, a compiler that runs.
 //!
-//! macOS only (it needs `cc`, `codesign` and Mach-O): elsewhere it is reported as ignored,
-//! never as a pass.
+//! macOS only: it needs `cc`, `codesign`, `otool` and Mach-O.
+
+#![cfg(target_os = "macos")]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -49,23 +50,11 @@ fn identifier(file: &Path) -> String {
 }
 
 fn ino(p: &Path) -> u64 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        std::fs::metadata(p).expect("stat").ino()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = p;
-        0
-    }
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(p).expect("stat").ino()
 }
 
 #[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "macOS only: needs cc, codesign, otool and Mach-O — not run on this platform"
-)]
 fn a_cc_built_sysroot_ships_one_compiler_under_one_signature() {
     let tmp = scratch("e2e-bundle");
     let root = std::fs::canonicalize(tmp.path()).expect("root");

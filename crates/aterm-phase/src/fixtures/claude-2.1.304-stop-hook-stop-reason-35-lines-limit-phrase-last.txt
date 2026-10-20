@@ -1,0 +1,50 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Stop hook (command ./sl.sh) printing {"continue": false} with a 35-line stopReason (34 note lines, then 'Usage limit reached · resets 3pm'), after an ordinary reply: the summary `⏺ Ran 1 stop hook` on row 6 of 50, its first line on the column-2 ⎿ row under it, the rest at column 2 with no ⎿, the limit phrase on row 41 — the loop's 40-row tail (rows 10-49) holds the rest and not the summary
+
+
+❯ say nothing
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+⏺ Ran 1 stop hook (ctrl+o to expand)
+  ⎿  note line 1 from the nightly hook
+  note line 2 from the nightly hook
+  note line 3 from the nightly hook
+  note line 4 from the nightly hook
+  note line 5 from the nightly hook
+  note line 6 from the nightly hook
+  note line 7 from the nightly hook
+  note line 8 from the nightly hook
+  note line 9 from the nightly hook
+  note line 10 from the nightly hook
+  note line 11 from the nightly hook
+  note line 12 from the nightly hook
+  note line 13 from the nightly hook
+  note line 14 from the nightly hook
+  note line 15 from the nightly hook
+  note line 16 from the nightly hook
+  note line 17 from the nightly hook
+  note line 18 from the nightly hook
+  note line 19 from the nightly hook
+  note line 20 from the nightly hook
+  note line 21 from the nightly hook
+  note line 22 from the nightly hook
+  note line 23 from the nightly hook
+  note line 24 from the nightly hook
+  note line 25 from the nightly hook
+  note line 26 from the nightly hook
+  note line 27 from the nightly hook
+  note line 28 from the nightly hook
+  note line 29 from the nightly hook
+  note line 30 from the nightly hook
+  note line 31 from the nightly hook
+  note line 32 from the nightly hook
+  note line 33 from the nightly hook
+  note line 34 from the nightly hook
+  Usage limit reached · resets 3pm
+
+✻ Sautéed for 0s · done 7:46 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

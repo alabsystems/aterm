@@ -1,0 +1,28 @@
+seq v=1 rig=transcript program=claude build=2.1.294
+# REAL ROWS (5B-2): the rows a real Claude Code 2.1.294 wrote for a turn
+# that called one MCP tool and ended on its context-limit notice
+# (aterm-agent's fixture, lines 2-6, folded whole there): each row at the
+# offset and time the real reader hands it on (dated= relative, the prompt
+# at 0), read the instant it was written, Partial (S9: 2.1.294 is no
+# measured build), so the screen opens and closes the turn. The screen
+# lines are this test's own (no fixture).
+state partial
+bind 0
+see busy
+expect open t1 turn par=r1 src=screen conf=strong
+tx prompt v1 dated=0 off=1056 slice=claude-2.1.294-transcript-mcp-output-then-context:2-6
+expect amend t1 turn vref=v1 by=vendor src=transcript conf=strong
+at 23 tx model model=claude-opus-5-5 effort=medium ver=2.1.294 dated=23 off=2236 slice=claude-2.1.294-transcript-mcp-output-then-context:2-6
+expect amend r1 agent model=claude-opus-5-5 effort=medium ver=2.1.294 by=vendor
+at 23 tx tool c1 tool=mcp__github__get_one cls=mcp dated=23 off=2237 slice=claude-2.1.294-transcript-mcp-output-then-context:2-6
+expect open p1 tool par=t1 cls=mcp tool=mcp__github__get_one vref=c1 by=vendor conf=strong
+at 3034 tx result c1 dated=3034 off=3100 slice=claude-2.1.294-transcript-mcp-output-then-context:2-6
+expect close p1 tool out=ok by=vendor
+at 3070 tx end vdur=3077 in=21368 out=30 dated=3070 off=4921 slice=claude-2.1.294-transcript-mcp-output-then-context:2-6
+expect amend t1 turn vdur_ms=3077 tok_in=21368 tok_out=30 by=vendor conf=strong
+at 3070 tx endwall context dated=3070 off=4922 slice=claude-2.1.294-transcript-mcp-output-then-context:2-6
+# Under Partial the context wall's row names no wall (no `out=` amend:
+# the turn's amends are exactly the two above).
+at 3200 see idle
+wait 1000
+expect close t1 turn out=done steps=1 tools=mcp:1 src=screen

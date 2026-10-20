@@ -25,6 +25,10 @@ workspace = true
 
 [dev-dependencies]
 aterm-tempfile = { workspace = true }
+# The explicit vendor_drift bench resolves managed builds through
+# `aterm pkg which` using the workspace's child builder. The library remains
+# dependency-free; ordinary fixtures do not resolve host-installed builds.
+aterm-uds = { workspace = true }
 
 [[test]]
 name = "phase_suite"
@@ -34,3 +38,9 @@ path = "tests/phase_suite.rs"
 [[test]]
 name = "panic_sweep"
 path = "tests/panic_sweep.rs"
+
+[[bench]]
+name = "vendor_drift"
+path = "benches/vendor_drift.rs"
+harness = false
+test = false

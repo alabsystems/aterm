@@ -238,7 +238,10 @@ mod tests {
     /// Each replace names its flush (aterm-durable's counting seam): the durable one's
     /// directory flush is durable (its temp takes a plain `fsync(2)`, which the seam does
     /// not see); the ordered one orders the temp and the directory, and the vendor stamp
-    /// takes it.
+    /// takes it. Windows opens no directory to flush (`store::sync_dir` is best-effort), and
+    /// its temp's own flush is `aterm_durable::durable_data`, which the seam does see: the
+    /// durable replace's one durable flush is the temp's there, and the ordered one orders
+    /// the temp alone.
     #[test]
     fn each_replace_names_its_flush() {
         use aterm_durable::{Flush, seam::Recording};
@@ -248,7 +251,12 @@ mod tests {
         write_durable(&dest, b"a = 1\n").unwrap();
         assert_eq!(recording.take(), [Flush::Durable]);
         write_ordered(&dest, b"a = 2\n").unwrap();
-        assert_eq!(recording.take(), [Flush::Ordered, Flush::Ordered]);
+        let ordered: &[Flush] = if cfg!(windows) {
+            &[Flush::Ordered]
+        } else {
+            &[Flush::Ordered, Flush::Ordered]
+        };
+        assert_eq!(recording.take(), ordered);
         assert_eq!(std::fs::read(&dest).unwrap(), b"a = 2\n");
     }
 

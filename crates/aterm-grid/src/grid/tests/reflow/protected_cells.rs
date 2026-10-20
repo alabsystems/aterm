@@ -91,26 +91,32 @@ fn resize_to_one_column_preserves_protected_cell_after_wide_char() {
     grid.resize(2, 1);
     grid.assert_invariants();
 
-    // The wide char cannot fit one column and is blanked; 'P' reflows to row 1.
-    let row0_cell = grid.row(0).unwrap().get(0).unwrap();
+    // The wide char cannot fit one column and is blanked; 'P' reflows to the
+    // next row. The line takes three rows at one column: the rewrap keeps its
+    // end on the screen, the cursor's row ('P') on top, and its blanked head
+    // goes to history.
+    let head = grid
+        .get_history_line(grid.scrollback_lines() - 1)
+        .expect("the line's head is the newest history line");
     assert!(
-        row0_cell.is_empty(),
+        head.to_string().trim().is_empty(),
         "wide char should be replaced with empty cell"
     );
 
-    let row1 = grid.row(1).unwrap();
+    let row0 = grid.row(0).unwrap();
     assert!(
-        row1.is_wrapped(),
-        "row 1 should be marked as wrapped continuation"
+        row0.is_wrapped(),
+        "row 0 should be marked as wrapped continuation"
     );
-    let row1_cell = row1.get(0).unwrap();
+    let row0_cell = row0.get(0).unwrap();
     assert_eq!(
-        row1_cell.char_data(),
+        row0_cell.char_data(),
         'P' as u16,
-        "protected cell should reflow to row 1"
+        "protected cell should reflow to the row after the wide char"
     );
     assert!(
-        row1_cell.flags().contains(CellFlags::PROTECTED),
+        row0_cell.flags().contains(CellFlags::PROTECTED),
         "protected flag should survive reflow after wide char"
     );
+    assert_eq!(grid.row(1).unwrap().get(0).unwrap().char_data(), 'X' as u16);
 }

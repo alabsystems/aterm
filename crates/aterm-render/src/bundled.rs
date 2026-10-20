@@ -56,9 +56,15 @@
 //! What it gives up, on purpose. Its 23 px row is two pixels taller than
 //! Cascadia Mono PL's 21 at 16 px, so a window of the same height holds about
 //! 9% fewer rows (the same columns: both cells are 9 px wide). The face
-//! carries most of what the chain used to supply: Claude Code's `⏺ ✻ ⏵`,
+//! carries most of what the chain used to supply: Claude Code's `⏺`,
 //! `✗ ⚠ ⇒ ★`, the media and math arrows are Iosevka's own one-cell forms
-//! now, narrower than the Noto and DejaVu glyphs Cascadia left them to.
+//! now, narrower than the Noto and DejaVu glyphs Cascadia left them to. Not
+//! the spinner and footer dingbats `✢`..`✽` and `⏴`..`⏷`: its own are
+//! x-height marks the size of an ASCII `*`, so it leaves them to the chain
+//! ([`yields_small_dingbats`]), which draws Cascadia's-era glyphs again. And
+//! not its raised default `*`: it draws Iosevka's own hex-low asterisk, on the
+//! operator line like Cascadia Mono's, so the spinner's `*` frame stays level
+//! ([`lowered_asterisk`]).
 //!
 //! What it does NOT draw: the 38 characters it maps that the grid gives TWO
 //! columns — the emoji-by-default `✅ ❌ ⭐ ⚡ ⏳ ⌚ ⬛ ⬜ …`, `〈 〉`, the trigrams
@@ -66,8 +72,9 @@
 //! stood at the left of its slot at half its width (a reviewer's live render,
 //! 2026-10-16). It leaves them to the chain ([`yields_wide_characters`]),
 //! which draws them fitted and centred across both columns from the faces
-//! they came from under Cascadia: Segoe UI Symbol's monochrome glyphs for
-//! the emoji, as before (none of them is drawn in colour, VS16 or not).
+//! they came from under Cascadia — the emoji among them in colour, from
+//! Segoe UI Emoji, since the symbol tier yields an emoji-presentation scalar
+//! to the colour face (2026-10-17).
 //!
 //! Its private-use glyphs are its own, not yielded ([`yields_private_use`]):
 //! of the Powerline points it maps (U+E0A0..E0A3, U+E0AE, U+E0AF and
@@ -754,8 +761,9 @@ pub fn fits_two_cell_glyphs(bytes: &[u8]) -> bool {
 /// left of their slot at half its width, the right column blank. The engine
 /// marks none of the emoji for colour, VS16 or not (`emoji_presentation` is
 /// set only for a text-default emoji), so under Cascadia they came from the
-/// chain in monochrome — Segoe UI Symbol for the emoji, the brackets and
-/// `☰`, Noto Sans Symbols 2 and DejaVu Sans Mono for the rest — and so they
+/// chain — Segoe UI Symbol for the brackets and `☰`, Noto Sans Symbols 2
+/// for the rest, and since 2026-10-17 Segoe UI Emoji, in colour, for the
+/// emoji, which every text tier now leaves to the colour face — and so they
 /// do again: the same faces, measured. Only `◽ ◾ ⬛ ⬜`, the four Cascadia
 /// maps itself (as narrow), now come from the chain too. Iosevka Term
 /// (Regular), the opt-in set, maps the same 38 and still draws them itself.
@@ -765,6 +773,199 @@ pub fn fits_two_cell_glyphs(bytes: &[u8]) -> bool {
 #[must_use]
 pub fn yields_wide_characters(bytes: &[u8]) -> bool {
     is_iosevka_semibold(bytes)
+}
+
+/// The I CHING LINE SYMBOLS: the trigrams `☰`..`☷` (U+2630..2637) and the
+/// monograms and digrams `⚊`..`⚏` (U+268A..268F) — one family of stacked
+/// solid and broken bars, which a BUNDLED broad face leaves to the symbol
+/// tier (`Renderer::fallback_has`).
+///
+/// MEASURED 2026-10-17: the embedded DejaVu Sans Mono maps only the two
+/// monograms `⚊ ⚋`, and draws them as a bar ON THE BASELINE (ink 7..150 of
+/// a 2048 em), where every face that maps the family draws its bars about
+/// the middle of the line — Noto Sans Symbols 2's `⚊` at 295..406 of 1000,
+/// Segoe UI Symbol's at 597..837 of 2048, Iosevka Term's at 301..379. Ahead
+/// of the symbol tier it drew `⚊` as a low underscore beside the mid-line
+/// bars of a `☰`; left to that tier, every one sits at mid-line.
+#[must_use]
+pub fn is_yijing_line_symbol(ch: char) -> bool {
+    matches!(ch, '\u{2630}'..='\u{2637}' | '\u{268A}'..='\u{268F}')
+}
+
+/// The SPINNER AND FOOTER DINGBATS: the teardrop, star and asterisk dingbats
+/// `✢`..`✽` (U+2722..273D) and the media triangles `⏴ ⏵ ⏶ ⏷`
+/// (U+23F4..23F7) — Claude Code's spinner (`· ✢ ✳ ✶ ✻ ✽`) and its
+/// `⏵⏵ bypass permissions on` footer, the glyphs an agent session shows all
+/// day. See [`yields_small_dingbats`].
+#[must_use]
+pub fn is_small_dingbat(ch: char) -> bool {
+    matches!(ch, '\u{2722}'..='\u{273D}' | '\u{23F4}'..='\u{23F7}')
+}
+
+/// Whether `bytes` are a bundled face that leaves the [`is_small_dingbat`]
+/// set to the fallback chain instead of drawing it itself. True for the four
+/// Iosevka Term Semibold faces (compiled in on Windows only, so `false`
+/// everywhere else). The renderer reads it once per loaded primary and
+/// applies it per code point (`Renderer::primary_unicode_gid`), like
+/// [`yields_wide_characters`].
+///
+/// MEASURED 2026-10-17 at the Windows default (17 px, 9x23 cell): the face
+/// draws these as x-height marks — `✻` 8x8 px with 30 ink texels, `✶` 25,
+/// the size of its ASCII `*` (33) — and `⏵` as a 4x8 triangle, so the spinner
+/// cycle reads as one small asterisk changing nothing, where the owner's
+/// 0.101 drew a spoked star twice that ink. The chain draws them from the
+/// faces they came from under Cascadia Mono PL, fitted into the cell: the
+/// asterisks from the embedded DejaVu Sans Mono (`✻` 9x11 with 52 texels at
+/// 16 px), the triangles from Noto Sans Symbols 2. Shrinking a glyph is the
+/// fit's job; enlarging Iosevka's own would only blur it. The five spinner
+/// frames `✢ ✳ ✶ ✻ ✽` go one step further: DejaVu's fitted `✳` and `✶` were
+/// soft (8.5% and 14% of their ink solid, about half `✽`'s ink, measured
+/// 2026-10-18), so below [`SPINNER_STARS_CRISP_PX`] the renderer draws those
+/// from the cell, ahead of every face (`procedural::is_spinner_star`).
+#[must_use]
+pub fn yields_small_dingbats(bytes: &[u8]) -> bool {
+    is_iosevka_semibold(bytes)
+}
+
+/// The text size, in device pixels, from which the chain draws Claude Code's
+/// spinner frames `✢ ✳ ✶ ✻ ✽` crisp, so a primary that yields them
+/// ([`yields_small_dingbats`]) leaves them to the chain's own glyphs; below
+/// it the renderer draws them from the cell (`Renderer::spinner_star_preempts`).
+///
+/// MEASURED 2026-10-18 on the sealed Windows default chain, the embedded
+/// DejaVu Sans Mono fitted into the cell, at the sizes Windows' display
+/// scales give the default 17 px: the share of each frame's inked texels at
+/// 90% coverage or more, for `✢ ✶ ✻ ✽` (Claude Code's cycle), is 0-12% at
+/// 17 px (100%, where `✢` never reaches full ink), 5-13% at 21 px (125%),
+/// 16-32% at 26 px (150%), 18-39% at 30 px (175%), 22-32% at 32 px and 22-35%
+/// at 34 px (200%). Up to 175% the face's slender `✶` is the soft one (16%
+/// and 18%, grey tips); from 32 px every frame is at least a fifth solid —
+/// a thin cross, a slender star and whole teardrops, the face's designs,
+/// which read better there than the cell-drawn ones, drawn solid for the
+/// small sizes. Their weights are evened across the cycle
+/// ([`SPINNER_FRAME_SPREAD`]).
+pub const SPINNER_STARS_CRISP_PX: f32 = 32.0;
+
+/// The most one of Claude Code's spinner frames may outweigh another where a
+/// face draws them ([`SPINNER_STARS_CRISP_PX`] up): the ratio of the heaviest
+/// frame's ink to the lightest's. The faces' dingbats are not one weight
+/// family — the embedded DejaVu Sans Mono's fitted `✢ ✳ ✶ ✻ ✽` carried 70,
+/// 64, 71, 119 and 158 texels of ink at 200% (34 px), 2.5x end to end and
+/// 3.0x at 300%, so the spinner pulsed thin to heavy each cycle (the
+/// 2026-10-18 judge's `j3t-2x-spinner-weight-pulse`) where the cell-drawn
+/// frames below that size stay within 1.35x. The renderer moves each frame's
+/// outline in or out by a fraction of a pixel (`Renderer::even_spinner_frame`)
+/// so the cycle's inks span this ratio about `✻`'s, the frame Claude Code
+/// rests on and prints beside every finished turn, which keeps its raster:
+/// `✢ ✳ ✶` gain 38-48% at 200% and `✽` gives up 16%, and each frame keeps
+/// its rank and its design. Under 1.5x, so Claude Code's Windows cycle
+/// `✢ * ✶ ✻ ✽`, whose `*` is the primary's own, spans 1.41x at 200%.
+pub const SPINNER_FRAME_SPREAD: f32 = 1.4;
+
+/// How far Iosevka's own HEX-LOW asterisk sits below its default hex-high
+/// one, per em: 266 units of its 1000 in all four Semibold source faces.
+pub const HEX_LOW_DROP: f32 = 0.266;
+
+/// How far the hex-low asterisk of an Iosevka ITALIC also moves left, per em:
+/// 44 units, the 266-unit drop along its slant.
+pub const HEX_LOW_ITALIC_LEFT: f32 = 0.044;
+
+/// THE ASTERISK SITS ON THE OPERATOR LINE: where a face's `*` is drawn
+/// lowered to Iosevka's own HEX-LOW asterisk ([`lowered_asterisk`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LoweredAsterisk {
+    /// The face's glyph for U+002A.
+    pub gid: u16,
+    /// That glyph's left edge and its box's vertical centre, per em.
+    x_min: f32,
+    y_mid: f32,
+    /// The move to hex-low, per em, y up: down, and left on an italic.
+    dx: f32,
+    dy: f32,
+}
+
+impl LoweredAsterisk {
+    /// The move at `px`, in whole device pixels `(x, y)`, y up, of a raster
+    /// of the glyph whose inked rows are centred `inked_mid` px above the
+    /// baseline: down so that centre lands nearest the hex-low outline's, and
+    /// on an italic left by the glyph's left edge rounded where it lands
+    /// before and after. Measured on the raster because the hinter places
+    /// the raised glyph's rows, not its outline's box.
+    #[must_use]
+    pub fn shift_px(&self, px: f32, inked_mid: f32) -> (i32, i32) {
+        let x = ((self.x_min + self.dx) * px).round() as i32 - (self.x_min * px).round() as i32;
+        let y = ((self.y_mid + self.dy) * px - inked_mid).round() as i32;
+        (x, y)
+    }
+}
+
+/// Whether `bytes` are a bundled face that draws its `*` as Iosevka's own
+/// HEX-LOW asterisk, centred on the operator line like its `+`, instead of
+/// its default raised one, and where: `Some` for the four Iosevka Term
+/// Semibold faces (compiled in on Windows only, so `None` everywhere else).
+/// The renderer reads it once per loaded face and applies it per glyph
+/// (`Renderer::lower_asterisk`).
+///
+/// Iosevka Term raises its `*` like a superscript: centred at 0.613 em in the
+/// SemiBold, where its `+ - = ·` sit at 0.340 em. Outside Ghostty, Claude Code
+/// animates `· ✢ * ✶ ✻ ✽` and that `*` is the primary's own, so at 17 px the
+/// spinner hopped 5 px up on it twice a cycle (the 2026-10-18 judge's
+/// `claude-spinner-ascii-star-frame-odd`). Windows Terminal's Cascadia Mono
+/// centres its `*` at 0.350 em, JetBrains Mono at 0.361.
+///
+/// MEASURED 2026-10-18 in the official 34.9.0 release faces the subsets are
+/// cut from (`publish/DECISIONS.md`): Iosevka offers its twelve asterisks as
+/// the alternates of a `VSAB` feature, no `cvNN` — hex, turned hex, penta and
+/// turned penta, each high, mid and low — and its stylistic sets `ss05`,
+/// `ss08`, `ss09`, `ss14` (its JetBrains Mono style) and `ss15` pick hex-low,
+/// `VSAB=3`, centred at 0.347 em. The subsets keep neither feature, so that
+/// glyph is not in the bundled bytes. But hex-low IS the default asterisk
+/// moved: the same outline, point for point, [`HEX_LOW_DROP`] lower in all
+/// four faces and [`HEX_LOW_ITALIC_LEFT`] to the left on the two italics.
+/// So the renderer moves the face's own hinted raster there, by whole
+/// pixels so it stays crisp ([`LoweredAsterisk::shift_px`]). Against the
+/// font's own hex-low, hinted by aterm from the release faces at every size
+/// from 8 to 60 px, its inked rows are centred within a pixel of the
+/// hex-low's in all four faces, and within half a pixel at 43 to 49 of the
+/// 53 sizes, face by face. At the default 17 px, drawn live through aterm
+/// with `font_features = ["VSAB=3"]`, the upright faces' hex-low is this
+/// raster within 2 of 255 coverage levels, its ink rows the `+`'s. The
+/// hinter fits the moved outline anew, so the two rasters can differ by a
+/// fringe, and the italics' by more.
+///
+/// JUDGED ON RENDERS the same day (`a * b`, `/* */`, `**kwargs`,
+/// `src/**/*.rs`, a markdown `* item`, `git log --graph`, a prompt's `*.rs`,
+/// Claude Code's spinner rows) against the raised asterisk, Iosevka's hex-mid
+/// (0.480 em, which still hops), Cascadia Mono PL and JetBrains Mono: hex-low
+/// reads as the operator in `a * b` and `x *= 3`, opens `/*` at the slash's
+/// middle, sits ON `git log --graph`'s rails as a node where the raised one
+/// perched above them, centres a markdown bullet as Cascadia's does, and
+/// leaves the spinner level.
+///
+/// Only these four faces: the opt-in Iosevka Term (Regular) set, an
+/// installed Iosevka and every other face keep their own asterisk. BY THE
+/// BYTES, like [`yields_private_use`]: a face can arrive without its
+/// identity (`Renderer::set_primary_font` takes bytes).
+#[must_use]
+pub fn lowered_asterisk(bytes: &[u8]) -> Option<LoweredAsterisk> {
+    if !is_iosevka_semibold(bytes) {
+        return None;
+    }
+    let face = aterm_font::Face::parse(bytes, 0).ok()?;
+    let gid = face.glyph_index('*')?;
+    let b = face.glyph_bounding_box(gid)?;
+    let upem = f32::from(face.units_per_em());
+    Some(LoweredAsterisk {
+        gid: gid.0,
+        x_min: f32::from(b.x_min) / upem,
+        y_mid: (f32::from(b.y_min) + f32::from(b.y_max)) / 2.0 / upem,
+        dx: if face.is_italic() {
+            -HEX_LOW_ITALIC_LEFT
+        } else {
+            0.0
+        },
+        dy: -HEX_LOW_DROP,
+    })
 }
 
 /// Whether `bytes` are one of the four bundled Iosevka Term Semibold faces,
@@ -1120,7 +1321,7 @@ mod tests {
         for id in IOSEVKA_SEMIBOLD_FACES {
             if let Some(bytes) = face_for_id(id) {
                 assert!(
-                    !crate::ligature_shaping::font_has_ligature_features(bytes),
+                    !crate::ligature_shaping::font_has_ligature_features(bytes, 0),
                     "{id}: the Windows default must carry no ligature feature"
                 );
             }
@@ -1238,7 +1439,7 @@ mod tests {
         bold_id: &str,
         cell: (usize, usize),
     ) {
-        if crate::resolve_font_family(family).is_some() {
+        if crate::resolve_font_family(family, crate::FaceTarget::REGULAR).is_some() {
             aterm_spec::host::could_not_run(format!(
                 "{family} is installed on this host, and an installed copy wins the name"
             ));
@@ -1247,10 +1448,17 @@ mod tests {
             let r =
                 Renderer::from_system_with_family(Some(spelling), 18.0, Theme::default()).unwrap();
             assert_eq!(r.primary_source_path(), Some(id), "{spelling}");
-            assert_eq!(crate::resolve_config_font(spelling).as_deref(), Ok(id));
+            assert_eq!(
+                crate::resolve_config_font(spelling, crate::FaceTarget::REGULAR)
+                    .map(|face| face.path)
+                    .as_deref(),
+                Ok(id)
+            );
         }
-        let batch =
-            crate::font_catalog::resolve_and_admit(&[family.to_string(), format!("{family} Bold")]);
+        let batch = crate::font_catalog::resolve_and_admit(&[
+            (family.to_string(), crate::FaceTarget::REGULAR),
+            (format!("{family} Bold"), crate::FaceTarget::BOLD),
+        ]);
         let admitted: Vec<_> = batch
             .entries
             .iter()
@@ -1331,14 +1539,16 @@ mod tests {
     #[test]
     #[cfg(feature = "embedded-font")]
     fn iosevka_term_resolves_by_name_on_every_platform() {
-        if crate::resolve_font_family(IOSEVKA_FAMILY).is_some() {
+        if crate::resolve_font_family(IOSEVKA_FAMILY, crate::FaceTarget::REGULAR).is_some() {
             aterm_spec::host::could_not_run(format!(
                 "{IOSEVKA_FAMILY} is installed on this host, and an installed copy wins the name"
             ));
         }
         for spelling in [IOSEVKA_FAMILY, IOSEVKA_ID] {
             assert_eq!(
-                crate::resolve_config_font(spelling).as_deref(),
+                crate::resolve_config_font(spelling, crate::FaceTarget::REGULAR)
+                    .map(|face| face.path)
+                    .as_deref(),
                 Ok(IOSEVKA_ID)
             );
             let mut r =
@@ -1352,8 +1562,11 @@ mod tests {
             }
         }
         let batch = crate::font_catalog::resolve_and_admit(&[
-            IOSEVKA_FAMILY.to_string(),
-            format!("{IOSEVKA_FAMILY} Bold Italic"),
+            (IOSEVKA_FAMILY.to_string(), crate::FaceTarget::REGULAR),
+            (
+                format!("{IOSEVKA_FAMILY} Bold Italic"),
+                crate::FaceTarget::BOLD_ITALIC,
+            ),
         ]);
         let admitted: Vec<_> = batch
             .entries
@@ -1628,7 +1841,10 @@ mod tests {
         // WINDOWS, measured from the cmaps (2026-10-16): Iosevka Term
         // Semibold carries the whole set but `ℒ` — the arrows, the checks and
         // crosses, `⚠ ✻`, the media controls Claude Code draws (`⏺ ⏵`) and the
-        // math operators — so the chain answers only what it lacks. The tiers'
+        // math operators — so the chain answers only what it lacks, and the
+        // spinner and footer dingbats it leaves (`yields_small_dingbats`): `✻`
+        // drawn from the cell ahead of every face (`is_spinner_star`),
+        // `⏴ ⏵ ⏶ ⏷` from Noto Sans Symbols 2. The tiers'
         // order is held by points measured to reach each: DejaVu Sans Mono's
         // `☎ ✂ ♔`, Noto Sans Symbols 2's `⮜ ⮞ ⛏`, Noto Sans Math's `ℒ ⏐ ⨍`.
         // (Cascadia Mono PL, the default before it, carried only ◐ of
@@ -1657,11 +1873,11 @@ mod tests {
             ('↵', &primary),
             ('★', &primary),
             ('⚙', &primary),
-            ('✻', &primary),
-            ('⏴', &primary),
-            ('⏵', &primary),
-            ('⏶', &primary),
-            ('⏷', &primary),
+            ('✻', "Procedural"),
+            ('⏴', &sym2),
+            ('⏵', &sym2),
+            ('⏶', &sym2),
+            ('⏷', &sym2),
             ('⏺', &primary),
             ('⏸', &primary),
             ('⊨', &primary),
@@ -2300,7 +2516,7 @@ mod tests {
     #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
     fn a_resolved_bundled_identity_reads_as_its_compiled_in_bytes() {
         let mut cases = Vec::new();
-        if crate::resolve_font_family(JETBRAINS_FAMILY).is_none() {
+        if crate::resolve_font_family(JETBRAINS_FAMILY, crate::FaceTarget::REGULAR).is_none() {
             cases.extend([
                 ("JetBrains Mono", JETBRAINS_ID),
                 ("JetBrains Mono Bold", JETBRAINS_BOLD_ID),
@@ -2308,7 +2524,9 @@ mod tests {
                 ("JetBrains Mono Bold Italic", JETBRAINS_BOLD_ITALIC_ID),
             ]);
         }
-        if CASCADIA_ACTIVE && crate::resolve_font_family(CASCADIA_FAMILY).is_none() {
+        if CASCADIA_ACTIVE
+            && crate::resolve_font_family(CASCADIA_FAMILY, crate::FaceTarget::REGULAR).is_none()
+        {
             cases.extend([
                 ("Cascadia Mono PL", CASCADIA_ID),
                 ("Cascadia Mono PL Bold", CASCADIA_BOLD_ID),
@@ -2316,7 +2534,9 @@ mod tests {
                 ("Cascadia Mono PL Bold Italic", CASCADIA_BOLD_ITALIC_ID),
             ]);
         }
-        if IOSEVKA_SEMIBOLD_ACTIVE && crate::resolve_font_family(IOSEVKA_SEMIBOLD_FAMILY).is_none()
+        if IOSEVKA_SEMIBOLD_ACTIVE
+            && crate::resolve_font_family(IOSEVKA_SEMIBOLD_FAMILY, crate::FaceTarget::REGULAR)
+                .is_none()
         {
             cases.extend([
                 ("Iosevka Term Semibold", IOSEVKA_SEMIBOLD_ID),
@@ -2329,7 +2549,9 @@ mod tests {
             ]);
         }
         for (name, id) in cases {
-            let resolved = crate::resolve_config_font(name).expect(name);
+            let resolved = crate::resolve_config_font(name, crate::FaceTarget::REGULAR)
+                .expect(name)
+                .path;
             assert_eq!(resolved, id);
             let bytes = crate::read_resolved_font(&resolved).expect(name);
             assert_eq!(&bytes[..], face_for_id(id).unwrap(), "{name}");
@@ -2652,6 +2874,442 @@ mod tests {
             "CONTROL: Iosevka Term (Regular)'s own ✅ ({left}..{right}) leaves its left column, \
              so this test cannot see the half-width glyph it guards against"
         );
+    }
+
+    /// `ch`'s raster in a sealed window at the default size: its ink texels
+    /// (coverage above 40) and the inked rows' count.
+    #[cfg(all(windows, feature = "embedded-font"))]
+    fn ink_of(r: &mut Renderer, ch: char) -> (usize, usize) {
+        let key = r.glyph_key(ch);
+        let img = r.glyph_image(key);
+        let w = img.width();
+        let inked = |y: usize| img.bytes()[y * w..(y + 1) * w].iter().any(|&b| b > 40);
+        let rows = (0..img.height()).filter(|&y| inked(y)).count();
+        (img.bytes().iter().filter(|&&b| b > 40).count(), rows)
+    }
+
+    /// The Windows default, as a window draws it: 17 px on the 1.1 line,
+    /// sealed.
+    #[cfg(all(windows, feature = "embedded-font"))]
+    fn windows_default_sealed() -> Renderer {
+        let mut r = Renderer::from_system(WINDOWS_DEFAULT_PX, Theme::default()).unwrap();
+        r.set_line_height(WINDOWS_DEFAULT_LINE_HEIGHT);
+        r.seal_admitted_font_sources();
+        assert_eq!(r.primary_source_path(), Some(IOSEVKA_SEMIBOLD_ID));
+        r
+    }
+
+    /// CLAUDE CODE'S SPINNER READS AS A STAR AGAIN. The Windows default
+    /// leaves `✢ ✳ ✶ ✻ ✽` and `⏴ ⏵ ⏶ ⏷` to the chain
+    /// ([`yields_small_dingbats`]), which draws each inside its cell with
+    /// more ink than the face's own ASCII `*` — the face's own `✢ ✶ ✻` had
+    /// less — `✻`, the spinner's resting frame, at least half again as much,
+    /// and `⏵` at least 9 rows tall, where the face's own was 7. The spinner
+    /// frames are drawn from the cell (`procedural::is_spinner_star`), each
+    /// at full ink with at least 30% of it solid, and their ink within 1.5x
+    /// of each other, so no frame dims the cycle: DejaVu Sans Mono's fitted
+    /// `✳` and `✶` were 8.5% and 14% solid at about half `✽`'s ink.
+    #[test]
+    #[cfg(all(windows, feature = "embedded-font"))]
+    fn the_windows_defaults_spinner_and_footer_glyphs_outweigh_its_asterisk() {
+        let mut r = windows_default_sealed();
+        let (cw, chh) = r.cell_size();
+        let (star, _) = ink_of(&mut r, '*');
+        let mut sums = Vec::new();
+        for ch in ['✢', '✳', '✶', '✻', '✽'] {
+            let key = r.glyph_key(ch);
+            assert_eq!(key.source, FaceId::Procedural, "{ch}: drawn from the cell");
+            let crate::GlyphImage::Mono { bytes, .. } = r.glyph_image(key).clone() else {
+                panic!("{ch}: a coverage mask");
+            };
+            let inked = bytes.iter().filter(|&&c| c > 0).count();
+            let solid = bytes.iter().filter(|&&c| c >= 230).count();
+            assert_eq!(bytes.iter().max(), Some(&255), "{ch}: full ink");
+            assert!(10 * solid >= 3 * inked, "{ch}: {solid} of {inked} solid");
+            sums.push(bytes.iter().map(|&c| u32::from(c)).sum::<u32>());
+        }
+        let (lo, hi) = (sums.iter().min(), sums.iter().max());
+        assert!(
+            hi.zip(lo).is_some_and(|(hi, lo)| 2 * hi <= 3 * lo),
+            "frame ink {sums:?}"
+        );
+        for ch in ['✢', '✳', '✶', '✻', '✽', '⏴', '⏵', '⏶', '⏷'] {
+            let key = r.glyph_key(ch);
+            assert_ne!(key.source, FaceId::Primary, "{ch}: drawn by the primary");
+            let img = r.glyph_image(key).clone();
+            let top = r.baseline() - img.height() as i32 - img.ymin();
+            assert!(
+                img.xmin() >= 0
+                    && img.xmin() as usize + img.width() <= cw
+                    && top >= 0
+                    && top as usize + img.height() <= chh,
+                "{ch}: leaves its {cw}x{chh} cell"
+            );
+        }
+        for ch in ['✢', '✳', '✶', '✻', '✽'] {
+            let (ink, _) = ink_of(&mut r, ch);
+            assert!(ink > star, "{ch}: {ink} ink texels, the face's `*` {star}");
+        }
+        let (spinner, _) = ink_of(&mut r, '✻');
+        assert!(
+            2 * spinner >= 3 * star,
+            "✻: {spinner} ink texels, not half again the `*`'s {star}"
+        );
+        let (_, rows) = ink_of(&mut r, '⏵');
+        assert!(rows >= 9, "⏵ is {rows} rows tall");
+    }
+
+    /// AT 200% THE SPINNER KEEPS ITS FACE'S DESIGNS. The Windows default
+    /// draws `✢ ✳ ✶ ✻ ✽` from the cell only while its chain draws them soft
+    /// ([`SPINNER_STARS_CRISP_PX`]): at the 100%, 125%, 150% and 175% display
+    /// scales (17, 21, 26 and 30 px) each is the procedural tier's; at 32 px,
+    /// 200% (34 px) and 250% (42.5 px) each is the embedded DejaVu Sans
+    /// Mono's own glyph, inside its cell, and each of `✢ ✶ ✻ ✽`, as the face
+    /// draws it fitted into the cell, has at least a fifth of its inked
+    /// texels solid: a thin cross, a slender star and whole teardrops. (The
+    /// frames drawn are those, their weights evened:
+    /// `the_windows_default_evens_its_faces_spinner_frames`.) The judges
+    /// measured the cell-drawn `✶` at 200% as a near-hexagon, 80% solid with
+    /// twice the face's ink, in place of the face's slender star.
+    #[test]
+    #[cfg(all(windows, feature = "embedded-font"))]
+    fn the_windows_default_keeps_its_faces_spinner_frames_where_they_are_crisp() {
+        let dejavu = format!("fallback:{DEJAVU_ID}");
+        for px in [17.0, 21.0, 26.0, 30.0, 32.0, 34.0, 42.5] {
+            let mut r = Renderer::from_system(px, Theme::default()).unwrap();
+            r.set_line_height(WINDOWS_DEFAULT_LINE_HEIGHT);
+            r.seal_admitted_font_sources();
+            let (cw, chh) = r.cell_size();
+            let crisp = px >= SPINNER_STARS_CRISP_PX;
+            for ch in ['✢', '✳', '✶', '✻', '✽'] {
+                let face = resolved_face(&mut r, ch);
+                if !crisp {
+                    assert_eq!(face, "Procedural", "{ch} at {px} px: drawn from the cell");
+                    continue;
+                }
+                assert_eq!(face, dejavu, "{ch} at {px} px: the face's own glyph");
+                let key = r.glyph_key(ch);
+                let img = r.glyph_image(key).clone();
+                let top = r.baseline() - img.height() as i32 - img.ymin();
+                assert!(
+                    img.xmin() >= 0
+                        && img.xmin() as usize + img.width() <= cw
+                        && top >= 0
+                        && top as usize + img.height() <= chh,
+                    "{ch} at {px} px: leaves its {cw}x{chh} cell"
+                );
+                // The face's `✳` is eight hairline spokes, never solid (4-6%
+                // at these sizes), and not in Claude Code's cycle.
+                if ch != '✳' {
+                    let own = r.fitted_fallback_regular(key, ch).5;
+                    let inked = own.iter().filter(|&&c| c > 0).count();
+                    let solid = own.iter().filter(|&&c| c >= 230).count();
+                    assert!(
+                        5 * solid >= inked,
+                        "{ch} at {px} px: {solid} of {inked} inked texels solid"
+                    );
+                }
+            }
+        }
+    }
+
+    /// AT 200% CLAUDE CODE'S SPINNER IS ONE WEIGHT. From
+    /// [`SPINNER_STARS_CRISP_PX`] the Windows default draws `✢ ✳ ✶ ✻ ✽` from
+    /// the embedded DejaVu Sans Mono, whose fitted frames are not one weight
+    /// family (70, 64, 71, 119 and 158 texels of ink at 34 px), so the
+    /// spinner pulsed thin to heavy each cycle (the 2026-10-18 judge's
+    /// `j3t-2x-spinner-weight-pulse`). Each frame is evened
+    /// ([`SPINNER_FRAME_SPREAD`]): at 32, 34 (200%), 42.5 (250%) and 51 px
+    /// (300%) the frames are still the face's, inside their cells, at full
+    /// ink and with solid strokes, their inks span at most that ratio, and
+    /// `✻`, the frame Claude Code rests on, is the face's raster byte for
+    /// byte. At 200% Claude Code's Windows cycle `✢ * ✶ ✻ ✽`, the primary's
+    /// own `*` among them, spans at most 1.5x. Control: the face's own
+    /// fitted frames span more than twice.
+    #[test]
+    #[cfg(all(windows, feature = "embedded-font"))]
+    fn the_windows_default_evens_its_faces_spinner_frames() {
+        use crate::procedural::{SPINNER_REST, SPINNER_STARS};
+        let ink = |b: &[u8]| b.iter().map(|&c| f32::from(c)).sum::<f32>() / 255.0;
+        let spread = |inks: &[f32]| {
+            let (lo, hi) = inks
+                .iter()
+                .fold((f32::MAX, 0.0f32), |(lo, hi), &i| (lo.min(i), hi.max(i)));
+            hi / lo
+        };
+        for px in [32.0, 34.0, 42.5, 51.0] {
+            let mut r = Renderer::from_system(px, Theme::default()).unwrap();
+            r.set_line_height(WINDOWS_DEFAULT_LINE_HEIGHT);
+            r.seal_admitted_font_sources();
+            let (cw, chh) = r.cell_size();
+            let (mut drawn, mut face) = (Vec::new(), Vec::new());
+            for ch in SPINNER_STARS {
+                let key = r.glyph_key(ch);
+                assert_ne!(key.source, FaceId::Procedural, "{ch} at {px} px");
+                let own = r.fitted_fallback_regular(key, ch).5;
+                let img = r.glyph_image(key).clone();
+                let top = r.baseline() - img.height() as i32 - img.ymin();
+                assert!(
+                    img.xmin() >= 0
+                        && img.xmin() as usize + img.width() <= cw
+                        && top >= 0
+                        && top as usize + img.height() <= chh,
+                    "{ch} at {px} px: leaves its {cw}x{chh} cell"
+                );
+                assert_eq!(img.bytes().iter().max(), Some(&255), "{ch} at {px} px");
+                // Thinned or thickened, a frame keeps solid strokes: at least
+                // a seventh of its inked texels (✽ at 32 px is the least, 16%,
+                // 21% at 200%; the hairline ✳ is never solid).
+                if ch != '✳' {
+                    let inked = img.bytes().iter().filter(|&&c| c > 0).count();
+                    let solid = img.bytes().iter().filter(|&&c| c >= 230).count();
+                    assert!(
+                        7 * solid >= inked,
+                        "{ch} at {px} px: {solid} of {inked} solid"
+                    );
+                }
+                if ch == SPINNER_REST {
+                    assert_eq!(img.bytes(), own, "{ch} at {px} px: the face's own");
+                }
+                drawn.push(ink(img.bytes()));
+                face.push(ink(&own));
+            }
+            assert!(
+                spread(&drawn) <= SPINNER_FRAME_SPREAD + 0.01,
+                "{px} px: frame inks {drawn:?}"
+            );
+            assert!(spread(&face) >= 2.0, "control at {px} px: {face:?}");
+            if px == 34.0 {
+                let key = r.glyph_key('*');
+                let star = ink(r.glyph_image(key).bytes());
+                // ✢ * ✶ ✻ ✽: the frames at 0, 2, 3 and 4.
+                let cycle = [drawn[0], star, drawn[2], drawn[3], drawn[4]];
+                assert!(spread(&cycle) <= 1.5, "Claude Code's cycle {cycle:?}");
+            }
+        }
+    }
+
+    /// The VISIBLE ink rows `[top, bottom)` of `ch` in `style` in its cell (a
+    /// row whose strongest pixel reaches 1/8 coverage), and their centre.
+    #[cfg(all(windows, feature = "embedded-font"))]
+    fn ink_band(r: &mut Renderer, ch: char, style: crate::StyleBits) -> (i32, i32, f32) {
+        let baseline = r.baseline();
+        let key = r.glyph_key_styled(ch, style);
+        let img = r.glyph_image(key).clone();
+        let (w, h) = (img.width(), img.height());
+        let seen = |y: &usize| img.bytes()[y * w..(y + 1) * w].iter().any(|&a| a >= 32);
+        let first = (0..h).find(seen).expect("ink");
+        let last = (0..h).rev().find(seen).expect("ink");
+        let top = baseline - (img.ymin() + i32::try_from(h).unwrap());
+        let (a, b) = (
+            top + i32::try_from(first).unwrap(),
+            top + i32::try_from(last).unwrap() + 1,
+        );
+        (a, b, (a + b) as f32 / 2.0)
+    }
+
+    /// CLAUDE CODE'S SPINNER STAYS LEVEL. The Windows default draws its `*`
+    /// as Iosevka's own hex-low asterisk ([`lowered_asterisk`]), on the
+    /// operator line, so `· ✢ * ✶ ✻ ✽` no longer hops up on its `*` frame:
+    /// at 17 px the `*` is centred within half a pixel of `·`, `+` and `✻`,
+    /// Claude Code's resting frame, where it sat 5 px above them. At every
+    /// size from 8 to 51 px its ink is centred within a pixel of the same
+    /// style's `+` in the upright faces, and within a pixel and a half in the
+    /// italics. Control: Iosevka Term (Regular), the opt-in set, keeps its
+    /// raised `*`, at least 4 px above its `+` at 17 px.
+    #[test]
+    #[cfg(all(windows, feature = "embedded-font"))]
+    fn the_windows_defaults_asterisk_sits_level_with_the_spinner_frames() {
+        use crate::StyleBits;
+        let mut r = windows_default_sealed();
+        let (_, _, star) = ink_band(&mut r, '*', StyleBits::REGULAR);
+        for ch in ['·', '+', '✻'] {
+            let (_, _, level) = ink_band(&mut r, ch, StyleBits::REGULAR);
+            assert!(
+                (star - level).abs() <= 0.5,
+                "17 px: `*` centred on row {star}, `{ch}` on {level}"
+            );
+        }
+        let mut off = Vec::new();
+        for px in (8..=51u8).map(f32::from) {
+            let mut r = Renderer::from_system(px, Theme::default()).unwrap();
+            r.set_line_height(WINDOWS_DEFAULT_LINE_HEIGHT);
+            r.seal_admitted_font_sources();
+            for style in STYLES {
+                let (a, b, star) = ink_band(&mut r, '*', style);
+                let (c, d, plus) = ink_band(&mut r, '+', style);
+                let bound = if style.contains(StyleBits::ITALIC) {
+                    1.5
+                } else {
+                    1.0
+                };
+                if (star - plus).abs() > bound {
+                    off.push(format!("{px} px {style:?}: `*` {a}..{b}, `+` {c}..{d}"));
+                }
+            }
+        }
+        assert!(off.is_empty(), "{off:#?}");
+        let mut control = Renderer::from_bytes(
+            face_for_id(IOSEVKA_ID).unwrap(),
+            WINDOWS_DEFAULT_PX,
+            Theme::default(),
+        )
+        .unwrap();
+        control.set_line_height(WINDOWS_DEFAULT_LINE_HEIGHT);
+        control.seal_admitted_font_sources();
+        let (_, _, star) = ink_band(&mut control, '*', StyleBits::REGULAR);
+        let (_, _, plus) = ink_band(&mut control, '+', StyleBits::REGULAR);
+        assert!(
+            plus - star >= 4.0,
+            "CONTROL: Iosevka Term (Regular)'s `*` (row {star}) is not raised above its `+` \
+             ({plus}), so this test cannot see the hop it guards against"
+        );
+    }
+
+    /// The four styles, in the order of [`IOSEVKA_SEMIBOLD_FACES`]' slots.
+    #[cfg(all(windows, feature = "embedded-font"))]
+    const STYLES: [crate::StyleBits; 4] = [
+        crate::StyleBits::REGULAR,
+        crate::StyleBits::BOLD,
+        crate::StyleBits::ITALIC,
+        crate::StyleBits(crate::StyleBits::BOLD.0 | crate::StyleBits::ITALIC.0),
+    ];
+
+    /// THE FACE'S OWN ASTERISK, MOVED. Only the four Iosevka Term Semibold
+    /// faces lower their `*` ([`lowered_asterisk`]), by contents, a copy
+    /// too; the opt-in Iosevka Term (Regular) set, Cascadia Mono PL,
+    /// JetBrains Mono and DejaVu Sans Mono keep theirs. At 17 px the `*` of
+    /// each style is that face's own hinted raster, byte for byte, 5 rows
+    /// lower: where the font's own hex-low (`VSAB=3` of the release faces,
+    /// hinted through aterm on 2026-10-18) is centred, to half a pixel on the
+    /// italics. An upright face never moves it sideways; an italic moves it
+    /// left, along its slant, by at most a pixel.
+    #[test]
+    #[cfg(all(windows, feature = "embedded-font"))]
+    fn only_the_semibold_faces_lower_their_own_asterisk() {
+        use crate::hinted::{HintBank, HintMode, hinted_glyph_raster};
+        let mut r = windows_default_sealed();
+        for (id, style) in IOSEVKA_SEMIBOLD_FACES.into_iter().zip(STYLES) {
+            let bytes = face_for_id(id).unwrap();
+            let lowered = lowered_asterisk(bytes).unwrap_or_else(|| panic!("{id}"));
+            let copy = bytes.to_vec();
+            assert_eq!(lowered_asterisk(&copy), Some(lowered), "{id}: a copy");
+            let face = aterm_font::Face::parse(bytes, 0).unwrap();
+            assert_eq!(
+                face.glyph_index('*').map(|g| g.0),
+                Some(lowered.gid),
+                "{id}"
+            );
+            let inst = HintBank::default()
+                .instance(1, bytes, 0, WINDOWS_DEFAULT_PX, HintMode::Full, &[], 0)
+                .unwrap();
+            let (w, h, xmin, ymin, _, own) =
+                hinted_glyph_raster(bytes, 0, lowered.gid, WINDOWS_DEFAULT_PX, &inst, &[]).unwrap();
+            let key = r.glyph_key_styled('*', style);
+            let img = r.glyph_image(key).clone();
+            assert_eq!(
+                (img.width(), img.height(), img.bytes()),
+                (w, h, own.as_slice()),
+                "{id}: the face's own raster"
+            );
+            assert_eq!(img.ymin(), ymin - 5, "{id}: 5 rows lower");
+            let left = xmin - img.xmin();
+            let reach = if face.is_italic() { 0..=1 } else { 0..=0 };
+            assert!(reach.contains(&left), "{id}: moved {left} px left");
+        }
+        for id in IOSEVKA_FACES
+            .iter()
+            .chain(&CASCADIA_FACES)
+            .chain(&JETBRAINS_FACES)
+            .chain(&[DEJAVU_ID])
+        {
+            let bytes = face_for_id(id).unwrap();
+            assert_eq!(lowered_asterisk(bytes), None, "{id}");
+        }
+    }
+    /// CJK BESIDE THE SEMIBOLD LATIN IS BOLD. The Windows default (Iosevka
+    /// Term Semibold, weight 600) draws Han and kana from Microsoft YaHei
+    /// Bold and Hangul from Malgun Gothic Bold, the cuts nearest its weight
+    /// (`weight_matched_fallback_paths`), so `確認` is set in strokes as solid
+    /// as the Latin beside it; a Regular primary (Cascadia Mono PL, by name)
+    /// keeps the Regular cuts. Measured: the Regular YaHei drew `一` two rows
+    /// thick and the Bold three, and `中` 110 ink texels against 166.
+    #[test]
+    #[cfg(all(windows, feature = "embedded-font"))]
+    fn the_windows_defaults_cjk_comes_in_the_cut_nearest_its_weight() {
+        let fonts = std::path::Path::new("C:\\Windows\\Fonts");
+        let needed = ["msyh.ttc", "msyhbd.ttc", "malgun.ttf", "malgunbd.ttf"];
+        if let Some(absent) = needed.iter().find(|f| !fonts.join(f).is_file()) {
+            aterm_spec::host::could_not_run(format!("{absent} is not installed here"));
+        }
+        let mut r = windows_default_sealed();
+        let mut regular = cascadia_sealed(WINDOWS_DEFAULT_PX);
+        regular.set_line_height(WINDOWS_DEFAULT_LINE_HEIGHT);
+        for (ch, bold, plain) in [
+            ('中', "msyhbd.ttc", "msyh.ttc"),
+            ('確', "msyhbd.ttc", "msyh.ttc"),
+            ('つ', "msyhbd.ttc", "msyh.ttc"),
+            ('한', "malgunbd.ttf", "malgun.ttf"),
+        ] {
+            let got = r.debug_fallback_pick_path(ch).unwrap_or_default();
+            assert!(got.ends_with(bold), "{ch}: drawn from {got}, not {bold}");
+            let got = regular.debug_fallback_pick_path(ch).unwrap_or_default();
+            assert!(
+                got.ends_with(plain),
+                "{ch} (Regular primary): drawn from {got}"
+            );
+            // Malgun Gothic's Bold is the nearer of its pair (150 texels for
+            // 한 against 135); YaHei's at least a fifth heavier.
+            let ((heavy, _), (light, _)) = (ink_of(&mut r, ch), ink_of(&mut regular, ch));
+            let gain = if bold.starts_with("msyh") { 6 } else { 5 };
+            assert!(
+                5 * heavy > gain * light,
+                "{ch}: the Bold cut inks {heavy} texels, the Regular {light}"
+            );
+        }
+    }
+
+    /// THE I CHING LINE SYMBOLS SIT AT MID-LINE. The embedded DejaVu Sans
+    /// Mono maps only the monograms `⚊ ⚋`, as a bar on the baseline, so the
+    /// bundled broad tier leaves the whole set to the symbol tier
+    /// ([`is_yijing_line_symbol`]): no line symbol is drawn by it, and on
+    /// Windows `⚊` (Noto Sans Symbols 2's) draws its bar about the middle of
+    /// `☰`'s three (Segoe UI Symbol's) — not under them, where it drew a low
+    /// underscore (measured 2026-10-17).
+    #[test]
+    #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
+    fn the_i_ching_line_symbols_skip_the_baseline_bar_and_sit_at_mid_line() {
+        let mut r = default_sealed();
+        let dejavu = format!("fallback:{DEJAVU_ID}");
+        for ch in ('\u{2630}'..='\u{2637}').chain('\u{268A}'..='\u{268F}') {
+            let got = resolved_face(&mut r, ch);
+            assert_ne!(got, dejavu, "{ch} U+{:04X}", ch as u32);
+            assert_ne!(got, "NOTDEF", "{ch} U+{:04X}", ch as u32);
+        }
+        #[cfg(windows)]
+        {
+            // Baseline-relative ink rows (y up) of each.
+            let rows = |r: &mut Renderer, ch: char| {
+                let key = r.glyph_key(ch);
+                let img = r.glyph_image(key);
+                let (w, h) = (img.width(), img.height());
+                let inked: Vec<i32> = (0..h)
+                    .filter(|&y| img.bytes()[y * w..(y + 1) * w].iter().any(|&b| b > 40))
+                    .map(|y| img.ymin() + (h - 1 - y) as i32)
+                    .collect();
+                (
+                    inked[0].min(inked[inked.len() - 1]),
+                    inked[0].max(inked[inked.len() - 1]),
+                )
+            };
+            let (bar_lo, bar_hi) = rows(&mut r, '⚊');
+            let (tri_lo, tri_hi) = rows(&mut r, '☰');
+            let (bar, tri) = (bar_lo + bar_hi, tri_lo + tri_hi);
+            assert!(
+                (bar - tri).abs() <= 4,
+                "⚊ rows {bar_lo}..={bar_hi} are not about the middle of ☰'s {tri_lo}..={tri_hi}"
+            );
+        }
     }
 
     /// THE OWNER'S ORDER puts the embedded Symbols Nerd Font AHEAD of Noto Sans

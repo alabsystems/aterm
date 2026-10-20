@@ -1,0 +1,94 @@
+# serde corpus `steps`: one case per line, `<id> TAB ok|err TAB <answer>`.
+# ok: the value written back out; err: the error's Display. \n \t \r \\ and
+# \u{..} escape control characters; an ok longer than 4096 bytes is its
+# FNV-1a digest and length. docs/AUDIT-third-party-2026-10-15.md, SP.3.
+claude/assistant/steps	ok	{"effort":"high","isSidechain":false,"message":{"content":[{"type":"text"},{"id":"t","name":"Bash","type":"tool_use"}],"id":"msg_1","model":"claude-opus-5-5","usage":{"cache_creation_input_tokens":2048,"cache_read_input_tokens":40960,"input_tokens":3,"output_tokens":120}},"parentUuid":"p-1","timestamp":"2026-10-15T20:36:32.123Z","type":"assistant","uuid":"u-2","version":"2.1.301"}
+claude/assistant/steps-bare	ok	{"effort":"high","isSidechain":false,"message":{"id":"msg_1","model":"claude-opus-5-5","usage":{"cache_creation_input_tokens":2048,"cache_read_input_tokens":40960,"input_tokens":3,"output_tokens":120}},"parentUuid":"p-1","timestamp":"2026-10-15T20:36:32.123Z","type":"assistant","uuid":"u-2","version":"2.1.301"}
+claude/user-prompt/steps	ok	{"isMeta":false,"isSidechain":false,"message":{"content":null},"parentUuid":null,"promptId":"x","timestamp":"2026-10-15T20:36:30Z","type":"user","uuid":"u-1","version":"2.1.301"}
+claude/user-prompt/steps-bare	ok	{"isMeta":false,"isSidechain":false,"message":{},"parentUuid":null,"promptId":"x","timestamp":"2026-10-15T20:36:30Z","type":"user","uuid":"u-1","version":"2.1.301"}
+claude/user-tool-result/steps	ok	{"message":{"content":[{"tool_use_id":"t","type":"tool_result"},{"type":"text"}]},"parentUuid":"u-2","timestamp":"2026-10-15T20:36:40Z","type":"user","uuid":"u-3"}
+claude/user-tool-result/steps-bare	ok	{"message":{},"parentUuid":"u-2","timestamp":"2026-10-15T20:36:40Z","type":"user","uuid":"u-3"}
+claude/turn-duration/steps	ok	{"durationMs":5123,"isMeta":true,"isSidechain":false,"parentUuid":"u-3","subtype":"turn_duration","timestamp":"2026-10-15T20:36:41Z","type":"system","uuid":"u-4"}
+claude/turn-duration/steps-bare	ok	{"durationMs":5123,"isMeta":true,"isSidechain":false,"parentUuid":"u-3","subtype":"turn_duration","timestamp":"2026-10-15T20:36:41Z","type":"system","uuid":"u-4"}
+claude/limit/steps	ok	{"isApiErrorMessage":true,"subtype":"api_error","timestamp":"2026-10-15T20:37:00Z","type":"system","uuid":"u-5"}
+claude/limit/steps-bare	ok	{"isApiErrorMessage":true,"subtype":"api_error","timestamp":"2026-10-15T20:37:00Z","type":"system","uuid":"u-5"}
+claude/compact-boundary/steps	ok	{"isCompactSummary":true,"isMeta":false,"parentUuid":null,"subtype":"compact_boundary","timestamp":"2026-10-15T20:40:00Z","type":"system","uuid":"u-6"}
+claude/compact-boundary/steps-bare	ok	{"isCompactSummary":true,"isMeta":false,"parentUuid":null,"subtype":"compact_boundary","timestamp":"2026-10-15T20:40:00Z","type":"system","uuid":"u-6"}
+claude/bookkeeping/steps	ok	{"type":"cost-state"}
+claude/bookkeeping/steps-bare	ok	{"type":"cost-state"}
+codex/session-meta/steps	ok	{"timestamp":"2026-10-15T20:00:00.000Z","type":"session_meta"}
+codex/session-meta/steps-bare	ok	{"timestamp":"2026-10-15T20:00:00.000Z","type":"session_meta"}
+codex/turn-context/steps	ok	{"timestamp":"2026-10-15T20:00:01.000Z","type":"turn_context"}
+codex/turn-context/steps-bare	ok	{"timestamp":"2026-10-15T20:00:01.000Z","type":"turn_context"}
+codex/response-item/steps	ok	{"timestamp":"2026-10-15T20:00:02.000Z","type":"response_item"}
+codex/response-item/steps-bare	ok	{"timestamp":"2026-10-15T20:00:02.000Z","type":"response_item"}
+drift/usage-strings/steps	ok	{"message":{"model":null,"usage":{"cache_read_input_tokens":null,"input_tokens":"3","output_tokens":null}},"type":"assistant"}
+drift/usage-strings/steps-bare	ok	{"message":{"model":null,"usage":{"cache_read_input_tokens":null,"input_tokens":"3","output_tokens":null}},"type":"assistant"}
+drift/message-array/steps	ok	{"message":null,"timestamp":7,"type":"assistant"}
+drift/message-array/steps-bare	ok	{"message":null,"timestamp":7,"type":"assistant"}
+drift/content-scalars/steps	ok	{"message":{"content":[null,null,null,null,{"type":"text"},{}]},"type":"user"}
+drift/content-scalars/steps-bare	ok	{"message":{},"type":"user"}
+drift/quota-shapes/steps	ok	{"type":"system"}
+drift/quota-shapes/steps-bare	ok	{"type":"system"}
+duplicate/last-wins/steps	ok	{"message":{"model":"b"},"type":"system"}
+duplicate/last-wins/steps-bare	ok	{"message":{"model":"b"},"type":"system"}
+duplicate/escaped-spelling/steps	ok	{"message":{"model":"b"},"type":"user"}
+duplicate/escaped-spelling/steps-bare	ok	{"message":{"model":"b"},"type":"user"}
+number/u64-max/steps	ok	{"message":{"usage":{"input_tokens":18446744073709551615}},"type":"assistant"}
+number/u64-max/steps-bare	ok	{"message":{"usage":{"input_tokens":18446744073709551615}},"type":"assistant"}
+number/u64-overflow/steps	ok	{"message":{"usage":{"input_tokens":1.8446744073709552e+19}},"type":"assistant"}
+number/u64-overflow/steps-bare	ok	{"message":{"usage":{"input_tokens":1.8446744073709552e+19}},"type":"assistant"}
+number/i64-min/steps	ok	{"message":{"usage":{"input_tokens":-9223372036854775808}},"type":"assistant"}
+number/i64-min/steps-bare	ok	{"message":{"usage":{"input_tokens":-9223372036854775808}},"type":"assistant"}
+number/negative-zero/steps	ok	{"durationMs":-0.0,"message":{"usage":{"input_tokens":-0.0}},"type":"assistant"}
+number/negative-zero/steps-bare	ok	{"durationMs":-0.0,"message":{"usage":{"input_tokens":-0.0}},"type":"assistant"}
+number/exponent/steps	ok	{"durationMs":1000.0,"type":"system"}
+number/exponent/steps-bare	ok	{"durationMs":1000.0,"type":"system"}
+number/infinite/steps	err	number out of range at line 1 column 37
+number/infinite/steps-bare	err	number out of range at line 1 column 37
+number/nan-literal/steps	err	expected a JSON value at line 1 column 31
+number/nan-literal/steps-bare	err	expected a JSON value at line 1 column 31
+number/infinity-literal/steps	err	expected a JSON value at line 1 column 31
+number/infinity-literal/steps-bare	err	expected a JSON value at line 1 column 31
+number/leading-zero/steps	err	number has a leading zero at line 1 column 32
+number/leading-zero/steps-bare	err	number has a leading zero at line 1 column 32
+shape/array/steps	ok	null
+shape/array/steps-bare	ok	null
+shape/string/steps	ok	"assistant"
+shape/string/steps-bare	ok	"assistant"
+shape/null/steps	ok	null
+shape/null/steps-bare	ok	null
+shape/empty-object/steps	ok	{}
+shape/empty-object/steps-bare	ok	{}
+shape/empty/steps	err	unexpected end of JSON input at line 1 column 1
+shape/empty/steps-bare	err	unexpected end of JSON input at line 1 column 1
+shape/trailing/steps	err	trailing characters after JSON value at line 1 column 17
+shape/trailing/steps-bare	err	trailing characters after JSON value at line 1 column 17
+shape/trailing-comma/steps	err	trailing comma in object at line 1 column 16
+shape/trailing-comma/steps-bare	err	trailing comma in object at line 1 column 16
+shape/unterminated/steps	err	unexpected end of JSON input at line 1 column 39
+shape/unterminated/steps-bare	err	unexpected end of JSON input at line 1 column 39
+shape/lone-surrogate/steps	err	unpaired high surrogate in \\u escape at line 1 column 44
+shape/lone-surrogate/steps-bare	err	unpaired high surrogate in \\u escape at line 1 column 44
+shape/bad-escape-discarded/steps	err	invalid escape sequence at line 1 column 29
+shape/bad-escape-discarded/steps-bare	err	invalid escape sequence at line 1 column 29
+shape/control-char/steps	err	control character in string at line 1 column 12
+shape/control-char/steps-bare	err	control character in string at line 1 column 12
+shape/whitespace/steps	ok	{"type":"user"}
+shape/whitespace/steps-bare	ok	{"type":"user"}
+claude/begins/loop-wake/steps	ok	{"isMeta":true,"isSidechain":false,"message":{"content":null},"parentUuid":"a-1","promptId":"p-2","scheduledTaskId":"00000001","timestamp":"2026-10-15T20:40:00.000Z","turnOrigin":"scheduled","type":"user","uuid":"w-1","version":"2.1.302"}
+claude/begins/loop-wake/steps-bare	ok	{"isMeta":true,"isSidechain":false,"message":{},"parentUuid":"a-1","promptId":"p-2","scheduledTaskId":"00000001","timestamp":"2026-10-15T20:40:00.000Z","turnOrigin":"scheduled","type":"user","uuid":"w-1","version":"2.1.302"}
+claude/begins/loop-wake-unnumbered/steps	ok	{"isMeta":true,"isSidechain":false,"message":{"content":null},"parentUuid":"a-1","scheduledTaskId":"00000001","timestamp":"2026-10-15T20:40:00.000Z","type":"user","uuid":"w-2","version":"2.1.267"}
+claude/begins/loop-wake-unnumbered/steps-bare	ok	{"isMeta":true,"isSidechain":false,"message":{},"parentUuid":"a-1","scheduledTaskId":"00000001","timestamp":"2026-10-15T20:40:00.000Z","type":"user","uuid":"w-2","version":"2.1.267"}
+claude/begins/turn-origin-unnumbered/steps	ok	{"isMeta":true,"isSidechain":false,"message":{"content":null},"parentUuid":"a-1","timestamp":"2026-10-15T20:40:00.000Z","turnOrigin":"scheduled","type":"user","uuid":"w-3","version":"2.1.302"}
+claude/begins/turn-origin-unnumbered/steps-bare	ok	{"isMeta":true,"isSidechain":false,"message":{},"parentUuid":"a-1","timestamp":"2026-10-15T20:40:00.000Z","turnOrigin":"scheduled","type":"user","uuid":"w-3","version":"2.1.302"}
+claude/begins/missed-task-notice/steps	ok	{"isMeta":true,"isSidechain":false,"message":{"content":null},"parentUuid":"a-1","timestamp":"2026-10-15T20:40:00.000Z","type":"user","uuid":"w-4","version":"2.1.302"}
+claude/begins/missed-task-notice/steps-bare	ok	{"isMeta":true,"isSidechain":false,"message":{},"parentUuid":"a-1","timestamp":"2026-10-15T20:40:00.000Z","type":"user","uuid":"w-4","version":"2.1.302"}
+claude/goes-on/stop-hook/steps	ok	{"isMeta":true,"isSidechain":false,"message":{"content":null},"parentUuid":"a-1","promptId":"v1","timestamp":"2026-10-15T20:40:00.000Z","type":"user","uuid":"h-1","version":"2.1.302"}
+claude/goes-on/stop-hook/steps-bare	ok	{"isMeta":true,"isSidechain":false,"message":{},"parentUuid":"a-1","promptId":"v1","timestamp":"2026-10-15T20:40:00.000Z","type":"user","uuid":"h-1","version":"2.1.302"}
+claude/goes-on/goal-check-in/steps	ok	{"isMeta":true,"isSidechain":false,"message":{"content":null},"parentUuid":"a-1","promptId":"v1","timestamp":"2026-10-15T20:40:00.000Z","type":"user","uuid":"h-2","version":"2.1.302"}
+claude/goes-on/goal-check-in/steps-bare	ok	{"isMeta":true,"isSidechain":false,"message":{},"parentUuid":"a-1","promptId":"v1","timestamp":"2026-10-15T20:40:00.000Z","type":"user","uuid":"h-2","version":"2.1.302"}
+claude/goes-on/stop-hook-unnumbered/steps	ok	{"isMeta":true,"isSidechain":false,"message":{"content":null},"parentUuid":"a-1","timestamp":"2026-10-15T20:40:00.000Z","type":"user","uuid":"h-3","version":"2.1.267"}
+claude/goes-on/stop-hook-unnumbered/steps-bare	ok	{"isMeta":true,"isSidechain":false,"message":{},"parentUuid":"a-1","timestamp":"2026-10-15T20:40:00.000Z","type":"user","uuid":"h-3","version":"2.1.267"}
+shape/deep-discarded/steps	err	recursion limit exceeded at line 1 column 138
+shape/deep-discarded/steps-bare	err	recursion limit exceeded at line 1 column 138

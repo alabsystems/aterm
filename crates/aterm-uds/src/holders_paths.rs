@@ -362,6 +362,10 @@ mod mac {
     /// `Err(Failed::Dead)` when it is a dead vnode ([`uses`] reads that as no
     /// working directory; the module docs say why).
     pub(super) fn cwd(pid: i32) -> Result<Option<PathBuf>, Failed> {
+        #[cfg(test)]
+        if super::super::hook::cwd_dead(pid) {
+            return Err(super::super::hook::as_read(Failed::Dead));
+        }
         let mut buf = [0u8; ffi::VNODEPATHINFO_SIZE];
         let size = i32::try_from(buf.len()).map_err(|_| Failed::Other)?;
         clear_errno();
@@ -590,8 +594,201 @@ pub fn scan_path_users_of(_pids: &[u32], _dirs: &[PathBuf], _skip: &[u32]) -> io
     ))
 }
 
+/// A child's pid once the kernel shows it running `exe`.
+#[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
+fn running(child: &crate::spawnfd::Child, exe: &str) -> u32 {
+    let pid = child.id();
+    let start = std::time::Instant::now();
+    while executable(pid).as_deref() != Some(std::path::Path::new(exe)) {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(60),
+            "the child never ran {exe}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    pid
+}
+
+#[cfg(all(debug_assertions, target_vendor = "apple"))]
+mod dmg_acceptance {
+    use super::*;
+    #[cfg(target_vendor = "apple")]
+    const HDIUTIL: &str = "/usr/bin/hdiutil";
+
+    /// `hdiutil detach -force <dev>`, waited for.
+    #[cfg(target_vendor = "apple")]
+    fn detach(dev: &str) -> io::Result<std::process::Output> {
+        crate::spawnfd::command(HDIUTIL)
+            .args(["detach", "-force", dev])
+            .stdin(crate::spawnfd::Stdio::null())
+            .output()
+    }
+
+    /// A fresh disk image attached at a mount point (no privilege needed, hidden from the
+    /// Finder), detached by force when dropped still attached.
+    #[cfg(target_vendor = "apple")]
+    struct Volume {
+        /// Its device (`/dev/diskN`); empty once detached.
+        dev: String,
+    }
+
+    #[cfg(target_vendor = "apple")]
+    impl Volume {
+        /// A 2 MB HFS+ image created at `image` and attached at `mnt`; setup
+        /// unavailability is an error, never a successful acceptance row. Not `-quiet`: that would hide
+        /// the `Operation timed out` the judgment reads.
+        fn attach(image: &std::path::Path, mnt: &std::path::Path) -> std::io::Result<Self> {
+            use crate::spawnfd::Stdio;
+            let created = crate::spawnfd::command(HDIUTIL)
+                .args(["create", "-size", "2m", "-fs", "HFS+"])
+                .args(["-layout", "NONE", "-volname", "aterm-uds-test"])
+                .arg(image)
+                .stdin(Stdio::null())
+                .output()?;
+            if !created.status.success() {
+                return Err(std::io::Error::other(format!(
+                    "hdiutil create: {created:?}"
+                )));
+            }
+            let attached = crate::spawnfd::command(HDIUTIL)
+                .args(["attach", "-nobrowse", "-noverify", "-noautoopen"])
+                .arg("-mountpoint")
+                .arg(mnt)
+                .arg(image)
+                .stdin(Stdio::null())
+                .output()?;
+            if !attached.status.success() {
+                return Err(std::io::Error::other(format!(
+                    "hdiutil attach: {attached:?}"
+                )));
+            }
+            let out = String::from_utf8_lossy(&attached.stdout);
+            let dev = out
+                .split_whitespace()
+                .find(|w| w.starts_with("/dev/disk"))
+                .unwrap_or_else(|| panic!("no device in {out:?}"));
+            Ok(Self {
+                dev: dev.to_owned(),
+            })
+        }
+
+        /// Detach it by force: every vnode on it is reclaimed under whatever still holds one.
+        fn detach_by_force(&mut self) -> std::process::Output {
+            let out = detach(&self.dev).expect("hdiutil detach after a successful attach");
+            if out.status.success() {
+                self.dev.clear();
+            }
+            out
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    impl Drop for Volume {
+        fn drop(&mut self) {
+            if !self.dev.is_empty() {
+                let _ = detach(&self.dev);
+            }
+        }
+    }
+
+    /// A child works at the root of a disk image's volume and holds a file elsewhere open;
+    /// `hdiutil detach -force` reclaims its working directory's vnode (`ENOENT` from then on).
+    /// Scanned for the mount point it is then no user and not unreadable; scanned for the held
+    /// file's directory it is a user through that descriptor. Negative control: with dead
+    /// vnodes read as unknown, it is unreadable. Run explicitly with the
+    /// `dmg_acceptance` bench: mounted-volume access may request macOS consent.
+    /// The ordinary injected dead-cwd test retains the deterministic control.
+    ///
+    /// # Errors
+    /// Returns the setup failure when the disk image cannot be created or attached.
+    pub fn a_force_detached_volume_is_no_working_directory(base: &Path) -> std::io::Result<()> {
+        use crate::spawnfd::Stdio;
+        use std::os::unix::fs::MetadataExt as _;
+        let me = std::process::id();
+        let base = base.to_path_buf();
+        let (image, mnt, held) = (base.join("v.dmg"), base.join("mnt"), base.join("held"));
+        std::fs::create_dir_all(&mnt).expect("the mount point");
+        std::fs::create_dir_all(&held).expect("the held file's directory");
+        let file = held.join("open.rlib");
+        std::fs::write(&file, b"x").expect("a file to hold");
+        let device = |p: &std::path::Path| std::fs::metadata(p).expect("stat").dev();
+        let mut volume = Volume::attach(&image, &mnt)?;
+        let mounted = device(&mnt) != device(&base);
+        // At the volume's root, the file on descriptor 3; `cat` ends when this test's end of
+        // its stdin closes, unwinding included.
+        let mut child = crate::spawnfd::command("/bin/sh")
+            .arg("-c")
+            .arg("exec 3<\"$1\"; exec /bin/cat")
+            .arg("sh")
+            .arg(&file)
+            .current_dir(&mnt)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("a child working on the volume");
+        let pid = running(&child, "/bin/cat");
+        let scan = |dir: &PathBuf| {
+            scan_path_users_of(&[pid], std::slice::from_ref(dir), &[me]).expect("scan")
+        };
+        let before = scan(&mnt);
+        let detached = volume.detach_by_force();
+        let unmounted = device(&mnt) == device(&base);
+        let read = mac::cwd(pid as i32);
+        let after = scan(&mnt);
+        let through_fd = scan(&held);
+        let old = super::super::hook::reading_dead_as_unknown(|| scan(&mnt));
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(volume);
+
+        assert!(mounted, "the image is mounted at {mnt:?}");
+        assert_eq!(
+            before.users,
+            [PathUse {
+                pid,
+                how: "cwd",
+                path: mnt.clone()
+            }],
+            "before the detach, a user through its working directory"
+        );
+        assert!(detached.status.success(), "detach -force: {detached:?}");
+        assert!(unmounted, "the volume is gone from {mnt:?}");
+        assert_eq!(
+            read,
+            Err(super::super::Failed::Dead),
+            "its working directory reads ENOENT"
+        );
+        assert_eq!(
+            (after.scanned, after.users, after.unreadable),
+            (1, Vec::new(), Vec::new()),
+            "read, and no user"
+        );
+        assert_eq!(
+            through_fd.users,
+            [PathUse {
+                pid,
+                how: "fd",
+                path: file.clone()
+            }],
+            "read on, through its descriptors"
+        );
+        assert_eq!(
+            old.unreadable.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            [pid],
+            "the old reading: unreadable"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(all(debug_assertions, target_vendor = "apple"))]
+pub use dmg_acceptance::a_force_detached_volume_is_no_working_directory;
+
 #[cfg(all(test, any(target_vendor = "apple", target_os = "linux")))]
 mod tests {
+    #[cfg(target_vendor = "apple")]
+    use super::running;
     use super::{PathBuf, scan_path_users, under};
     use std::time::{Duration, Instant};
 
@@ -677,15 +874,10 @@ mod tests {
     #[test]
     fn a_process_whose_executable_was_deleted_is_read_through_its_working_directory() {
         use std::io::{BufRead as _, Write as _};
-        // Re-signing a copy of an Apple binary waits on trustd.
-        if crate::deadline::trust_service_silent() {
-            return;
-        }
         let dir = fresh("unlinked");
         let (bin, work) = (dir.join("catter"), dir.join("work"));
         std::fs::create_dir_all(&work).expect("work");
-        std::fs::copy("/bin/cat", &bin).expect("copy cat");
-        crate::deadline::sign_ad_hoc(&bin);
+        crate::deadline::ad_hoc_copy(std::path::Path::new("/bin/cat"), &bin);
         let mut catter = crate::spawnfd::command(&bin)
             .current_dir(&work)
             .stdin(crate::spawnfd::Stdio::piped())
@@ -860,18 +1052,6 @@ mod tests {
         running(child, "/bin/sleep")
     }
 
-    /// A child's pid once the kernel shows it running `exe` (see
-    /// [`exec_done`]).
-    #[cfg(target_vendor = "apple")]
-    fn running(child: &crate::spawnfd::Child, exe: &str) -> u32 {
-        let pid = child.id();
-        let start = Instant::now();
-        while super::executable(pid).as_deref() != Some(std::path::Path::new(exe)) {
-            assert!(start.elapsed() < HANG, "the child never ran {exe}");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        pid
-    }
     /// A child with no descriptor at all, working in `cwd`, stopped, and its pid once the stop
     /// is reported: a shell spawned with only its stdio (`spawnfd::command`) that closes those
     /// three and stops itself. SIGKILL and reap it with [`reap`].
@@ -1028,110 +1208,27 @@ mod tests {
         assert_eq!(old.1, None, "the old reading: unknown");
     }
 
-    #[cfg(target_vendor = "apple")]
-    const HDIUTIL: &str = "/usr/bin/hdiutil";
-
-    /// `hdiutil detach -force <dev>`, waited for.
-    #[cfg(target_vendor = "apple")]
-    fn detach(dev: &str) -> std::process::Output {
-        std::process::Command::new(HDIUTIL)
-            .args(["detach", "-force", dev])
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("hdiutil detach")
-    }
-
-    /// A fresh disk image attached at a mount point (no privilege needed, hidden from the
-    /// Finder), detached by force when dropped still attached.
-    #[cfg(target_vendor = "apple")]
-    struct Volume {
-        /// Its device (`/dev/diskN`); empty once detached.
-        dev: String,
-    }
-
-    #[cfg(target_vendor = "apple")]
-    impl Volume {
-        /// A 2 MB HFS+ image created at `image` and attached at `mnt`; `None`, after one line on
-        /// stderr, when macOS's disk-image service did not answer. Not `-quiet`: that would hide
-        /// the `Operation timed out` the judgment reads.
-        fn attach(image: &std::path::Path, mnt: &std::path::Path) -> Option<Self> {
-            use std::process::Stdio;
-            let created = std::process::Command::new(HDIUTIL)
-                .args(["create", "-size", "2m", "-fs", "HFS+"])
-                .args(["-layout", "NONE", "-volname", "aterm-uds-test"])
-                .arg(image)
-                .stdin(Stdio::null())
-                .output()
-                .expect("hdiutil create");
-            if crate::deadline::disk_image_service_silent(&created) {
-                return None;
-            }
-            assert!(created.status.success(), "hdiutil create: {created:?}");
-            let attached = std::process::Command::new(HDIUTIL)
-                .args(["attach", "-nobrowse", "-noverify", "-noautoopen"])
-                .arg("-mountpoint")
-                .arg(mnt)
-                .arg(image)
-                .stdin(Stdio::null())
-                .output()
-                .expect("hdiutil attach");
-            if crate::deadline::disk_image_service_silent(&attached) {
-                return None;
-            }
-            assert!(attached.status.success(), "hdiutil attach: {attached:?}");
-            let out = String::from_utf8_lossy(&attached.stdout);
-            let dev = out
-                .split_whitespace()
-                .find(|w| w.starts_with("/dev/disk"))
-                .unwrap_or_else(|| panic!("no device in {out:?}"));
-            Some(Self {
-                dev: dev.to_owned(),
-            })
-        }
-
-        /// Detach it by force: every vnode on it is reclaimed under whatever still holds one.
-        fn detach_by_force(&mut self) -> std::process::Output {
-            let out = detach(&self.dev);
-            if out.status.success() {
-                self.dev.clear();
-            }
-            out
-        }
-    }
-
-    #[cfg(target_vendor = "apple")]
-    impl Drop for Volume {
-        fn drop(&mut self) {
-            if !self.dev.is_empty() {
-                let _ = detach(&self.dev);
-            }
-        }
-    }
-
-    /// A child works at the root of a disk image's volume and holds a file elsewhere open;
-    /// `hdiutil detach -force` reclaims its working directory's vnode (`ENOENT` from then on).
-    /// Scanned for the mount point it is then no user and not unreadable; scanned for the held
-    /// file's directory it is a user through that descriptor. Negative control: with dead
-    /// vnodes read as unknown, it is unreadable.
+    /// A child works in a folder and holds a file elsewhere open; its working directory then
+    /// reads `ENOENT`, as a reclaimed vnode's does once its volume is force-unmounted (the
+    /// folder stands in for that volume: `hook::reading_cwd_dead`). Scanned for the folder it
+    /// is then no user and not unreadable; scanned for the held file's directory it is a user
+    /// through that descriptor. Negative control: with dead vnodes read as unknown, it is
+    /// unreadable. The kernel's own answer under a real forced detach is
+    /// [`a_force_detached_volume_is_no_working_directory`] (explicit acceptance bench).
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_dead_working_directory_is_no_working_directory() {
+        use super::super::hook::{reading_cwd_dead, reading_dead_as_unknown};
         use crate::spawnfd::Stdio;
-        use std::os::unix::fs::MetadataExt as _;
         let me = std::process::id();
         let base = fresh("deadcwd");
-        let (image, mnt, held) = (base.join("v.dmg"), base.join("mnt"), base.join("held"));
-        std::fs::create_dir_all(&mnt).expect("the mount point");
+        let (mnt, held) = (base.join("mnt"), base.join("held"));
+        std::fs::create_dir_all(&mnt).expect("the folder standing in for the volume");
         std::fs::create_dir_all(&held).expect("the held file's directory");
         let file = held.join("open.rlib");
         std::fs::write(&file, b"x").expect("a file to hold");
-        let device = |p: &std::path::Path| std::fs::metadata(p).expect("stat").dev();
-        let Some(mut volume) = Volume::attach(&image, &mnt) else {
-            return;
-        };
-        let mounted = device(&mnt) != device(&base);
-        // At the volume's root, the file on descriptor 3; `cat` ends when this test's end of
-        // its stdin closes, unwinding included.
+        // In the folder, the file on descriptor 3; `cat` ends when this test's end of its
+        // stdin closes, unwinding included.
         let mut child = crate::spawnfd::command("/bin/sh")
             .arg("-c")
             .arg("exec 3<\"$1\"; exec /bin/cat")
@@ -1142,23 +1239,20 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("a child working on the volume");
+            .expect("a child working in the folder");
         let pid = running(&child, "/bin/cat");
         let scan = |dir: &PathBuf| {
             super::scan_path_users_of(&[pid], std::slice::from_ref(dir), &[me]).expect("scan")
         };
+        let n = pid as i32;
         let before = scan(&mnt);
-        let detached = volume.detach_by_force();
-        let unmounted = device(&mnt) == device(&base);
-        let read = super::mac::cwd(pid as i32);
-        let after = scan(&mnt);
-        let through_fd = scan(&held);
-        let old = super::super::hook::reading_dead_as_unknown(|| scan(&mnt));
+        let read = reading_cwd_dead(n, || super::mac::cwd(n));
+        let after = reading_cwd_dead(n, || scan(&mnt));
+        let through_fd = reading_cwd_dead(n, || scan(&held));
+        let old = reading_dead_as_unknown(|| reading_cwd_dead(n, || scan(&mnt)));
         let _ = child.kill();
         let _ = child.wait();
-        drop(volume);
 
-        assert!(mounted, "the image is mounted at {mnt:?}");
         assert_eq!(
             before.users,
             [super::PathUse {
@@ -1166,10 +1260,8 @@ mod tests {
                 how: "cwd",
                 path: mnt.clone()
             }],
-            "before the detach, a user through its working directory"
+            "a user through its working directory while it reads"
         );
-        assert!(detached.status.success(), "detach -force: {detached:?}");
-        assert!(unmounted, "the volume is gone from {mnt:?}");
         assert_eq!(
             read,
             Err(super::super::Failed::Dead),

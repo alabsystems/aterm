@@ -9,15 +9,22 @@
 //! [`aterm_census::scan_set::classify_patch_target`]:
 //!
 //! * a `vendor/` path is a fork and owes every obligation;
-//! * a `crates/` path that keeps an upstream license and a NOTICE line is absorbed (winit →
-//!   `crates/aterm-window`): upstream source aterm owns as a member. The license obligations
-//!   follow the code, so it owes `[OB-5]`, `[OB-6]`, `[OB-7]` and `[OB-9]` besides `[OB-1]` and
-//!   `[OB-2]`; the fork-upkeep ones (`[OB-3]`, `[OB-4]`, `[OB-8]`, `[OB-10]`) do not apply;
+//! * a `crates/` path that keeps an upstream license and a NOTICE line is absorbed: upstream
+//!   source aterm owns as a member. The license obligations follow the code, so it owes
+//!   `[OB-5]`, `[OB-6]`, `[OB-7]` and `[OB-9]` besides `[OB-1]` and `[OB-2]`; the fork-upkeep
+//!   ones (`[OB-3]`, `[OB-4]`, `[OB-8]`, `[OB-10]`) do not apply;
 //! * a `crates/` path with neither record is a first-party member (e.g. `tracing` →
 //!   `crates/aterm-tracing`) and owes only `[OB-1]` and `[OB-2]`.
 //!
 //! Any other location, or a `crates/` path with only one of the two records, is an `[OB-1]`
-//! failure. Every obligation is fail-closed and tagged `[OB-n]` in the log, which is returned,
+//! failure.
+//!
+//! An absorbed crate renamed off its upstream name leaves the patch table (winit →
+//! `crates/aterm-window`, the package `aterm-window` since winit-core step 7). NOTICE still
+//! lists it, under the upstream name and version, and that line is what finds it: a NOTICE
+//! entry under `crates/` that no patch row targets is an ABSORBED MEMBER, which owes the same
+//! license obligations and `[OB-1]` (it must be a crate with sources), but not `[OB-2]`, which
+//! asks whether a patch took. Every obligation is fail-closed and tagged `[OB-n]` in the log, which is returned,
 //! not printed, so `check` can splice it into the gate report.
 //!
 //! # The obligations
@@ -85,8 +92,31 @@ pub fn run(root: &Path) -> Result<Outcome, String> {
             root.display()
         ));
     }
-    let (ok, log) = report(root);
-    Ok(Outcome { ok, log })
+    let attested = report(root);
+    match attested.could_not_run {
+        // The reason first (`main` prefixes "could not run:"), then the transcript.
+        Some(why) => Err(format!(
+            "{why}\n\nthe transcript up to that point:\n{}",
+            attested.log
+        )),
+        None => Ok(Outcome {
+            ok: attested.ok,
+            log: attested.log,
+        }),
+    }
+}
+
+/// What [`report_with`] found: green or not, its transcript, and — when an
+/// obligation could not be judged on this machine (its Cargo cache lacks a
+/// crate the lock names, [`crate::direct_vendor::machine_refusal`]) — why: the
+/// run is then COULD NOT RUN, never FAIL (OF-30).
+pub struct Attestation {
+    /// Every obligation held.
+    pub ok: bool,
+    /// The transcript, complete on its own.
+    pub log: String,
+    /// Why an obligation could not be judged here, if one could not.
+    pub could_not_run: Option<String>,
 }
 
 // --- facts -----------------------------------------------------------------
@@ -206,6 +236,25 @@ fn partition_patches(patch: &[PatchRow], root: &Path) -> Partition {
             _ => out.vendored.push(entry),
         }
     }
+    out
+}
+
+/// The absorbed crates renamed off their upstream name: each `NOTICE` list entry under
+/// `crates/` that no patch row targets, as a row naming the upstream package (the NOTICE name,
+/// which the pristine copy and `[OB-6]` key on) at that directory. An unreadable NOTICE yields
+/// none here; `[OB-6]` reports it.
+fn absorbed_members(root: &Path, patch: &[PatchRow]) -> PatchTable {
+    let text = std::fs::read_to_string(root.join("NOTICE")).unwrap_or_default();
+    let mut out: PatchTable = parse_notice(&text)
+        .into_iter()
+        .filter(|e| e.dir.starts_with("crates/") && !patch.iter().any(|row| row.rel == e.dir))
+        .map(|e| PatchRow {
+            name: e.name,
+            rel: e.dir,
+            renamed: false,
+        })
+        .collect();
+    out.sort_by_key(PatchRow::pair);
     out
 }
 
@@ -682,16 +731,17 @@ fn vendor_paths(root: &Path, dir: &Path, skip: &BTreeSet<String>, out: &mut Vec<
 
 // --- the report ------------------------------------------------------------
 
-/// Run every obligation. Returns `(ok, log)`; the log is complete on its own
-/// and ends with [`crate::PRECISION_NOTE`] whenever anything failed.
-pub fn report(root: &Path) -> (bool, String) {
+/// Run every obligation ([`Attestation`]); the log is complete on its own and
+/// ends with [`crate::PRECISION_NOTE`] whenever anything failed.
+pub fn report(root: &Path) -> Attestation {
     report_with(&crate::resolve::Cargo::from_env(), root)
 }
 
 /// [`report`], asking `cargo` for the vendored submodule's metadata.
-pub fn report_with(cargo: &crate::resolve::Cargo, root: &Path) -> (bool, String) {
+pub fn report_with(cargo: &crate::resolve::Cargo, root: &Path) -> Attestation {
     let mut log = String::new();
     let mut fails = 0usize;
+    let mut could_not_run = None;
     let _ = writeln!(
         log,
         "=== cargo forge attest (vendor/ provenance + license notary) ==="
@@ -712,16 +762,26 @@ pub fn report_with(cargo: &crate::resolve::Cargo, root: &Path) -> (bool, String)
             );
             log.push_str(PRECISION_NOTE);
             log.push('\n');
-            return (false, log);
+            return Attestation {
+                ok: false,
+                log,
+                could_not_run,
+            };
         }
     };
     let partition = partition_patches(&patch, root);
     let forks = survey_forks(root, &partition.vendored);
     let first_party_forks = survey_forks(root, &partition.first_party);
     let absorbed = survey_forks(root, &partition.absorbed);
+    let members = survey_forks(root, &absorbed_members(root, &patch));
     // Forks and absorbed crates are both redistributed on someone else's terms, so both owe the
     // license obligations.
-    let mut redistributed: Vec<VendoredFork> = forks.iter().chain(&absorbed).cloned().collect();
+    let mut redistributed: Vec<VendoredFork> = forks
+        .iter()
+        .chain(&absorbed)
+        .chain(&members)
+        .cloned()
+        .collect();
     redistributed.sort_by(|a, b| a.name.cmp(&b.name));
     let dirs = vendor_dirs(root);
     let _ = writeln!(
@@ -729,26 +789,32 @@ pub fn report_with(cargo: &crate::resolve::Cargo, root: &Path) -> (bool, String)
         "    forks: {} vendored from [patch.crates-io]; {} director(y/ies) under vendor/, of \
          which {} are FIRST-PARTY vendored path dependencies; {} FIRST-PARTY patch target(s) \
          under crates/ (aterm's own code — provenance obligations do not apply, and \
-         [OB-1]/[OB-2] say so by name); {} ABSORBED patch target(s) under crates/ (upstream \
-         source aterm owns — the license obligations [OB-5]/[OB-6]/[OB-7]/[OB-9] follow it)",
+         [OB-1]/[OB-2] say so by name); {} ABSORBED patch target(s) and {} renamed ABSORBED \
+         member(s) under crates/ (upstream source aterm owns — the license obligations \
+         [OB-5]/[OB-6]/[OB-7]/[OB-9] follow it)",
         forks.len(),
         dirs.len(),
         crate::provenance::roster_len(root),
         first_party_forks.len(),
-        absorbed.len()
+        absorbed.len(),
+        members.len()
     );
 
-    fails += ob1_patch_vendor_agreement(
+    let (ob1_fails, ob1_refused) = ob1_patch_vendor_agreement(
         cargo,
         root,
         &forks,
         &first_party_forks,
-        &absorbed,
+        (&absorbed, &members),
         &dirs,
         &mut log,
     );
+    fails += ob1_fails;
+    could_not_run = ob1_refused;
+    // [OB-2] asks whether a patch took: a renamed member is in no patch row.
     let mut ob2_all: Vec<VendoredFork> = Vec::new();
-    ob2_all.extend(redistributed.iter().cloned());
+    ob2_all.extend(forks.iter().cloned());
+    ob2_all.extend(absorbed.iter().cloned());
     ob2_all.extend(first_party_forks.iter().cloned());
     ob2_all.sort_by(|a, b| a.name.cmp(&b.name));
     fails += ob2_version_equality(root, &ob2_all, &mut log);
@@ -765,13 +831,19 @@ pub fn report_with(cargo: &crate::resolve::Cargo, root: &Path) -> (bool, String)
         let _ = writeln!(
             log,
             "cargo forge attest: PASS — 10 obligations held over {} vendored fork(s) \
-             (+ [OB-1]/[OB-2]/[OB-5]/[OB-6]/[OB-7]/[OB-9] over {} absorbed crate(s), \
+             (+ [OB-1]/[OB-2]/[OB-5]/[OB-6]/[OB-7]/[OB-9] over {} absorbed patch target(s), \
+             [OB-1]/[OB-5]/[OB-6]/[OB-7]/[OB-9] over {} renamed absorbed member(s), \
              [OB-1]/[OB-2] over {} first-party patch target(s)).",
             forks.len(),
             absorbed.len(),
+            members.len(),
             first_party_forks.len()
         );
-        return (true, log);
+        return Attestation {
+            ok: could_not_run.is_none(),
+            log,
+            could_not_run,
+        };
     }
     let _ = writeln!(
         log,
@@ -779,7 +851,11 @@ pub fn report_with(cargo: &crate::resolve::Cargo, root: &Path) -> (bool, String)
     );
     log.push_str(PRECISION_NOTE);
     log.push('\n');
-    (false, log)
+    Attestation {
+        ok: false,
+        log,
+        could_not_run,
+    }
 }
 
 /// `[OB-1]` Every vendored patch key resolves to a real `vendor/<dir>` with
@@ -793,16 +869,20 @@ pub fn report_with(cargo: &crate::resolve::Cargo, root: &Path) -> (bool, String)
 /// log. They are excluded from the review cross-check in both directions,
 /// since a review block for a workspace member would be a false provenance
 /// claim.
+///
+/// Returns the violations and, when the astream review could not be judged on
+/// this machine ([`crate::direct_vendor::machine_refusal`]), why.
 fn ob1_patch_vendor_agreement(
     cargo: &crate::resolve::Cargo,
     root: &Path,
     forks: &[VendoredFork],
     first_party: &[VendoredFork],
-    absorbed: &[VendoredFork],
+    (absorbed, members): (&[VendoredFork], &[VendoredFork]),
     dirs: &[String],
     log: &mut String,
-) -> usize {
+) -> (usize, Option<String>) {
     let mut fails = 0;
+    let mut could_not_run = None;
     let submodule = match crate::direct_vendor::review(cargo, root) {
         Ok(Some(pin)) => {
             let _ = writeln!(
@@ -826,6 +906,14 @@ fn ob1_patch_vendor_agreement(
             Some(pin)
         }
         Ok(None) => None,
+        Err(why) if crate::direct_vendor::machine_refusal(&why) => {
+            let _ = writeln!(
+                log,
+                "  ? COULD NOT RUN [OB-1] astream submodule (vendor/astream): {why}"
+            );
+            could_not_run = Some(format!("[OB-1] {why}"));
+            None
+        }
         Err(why) => {
             let _ = writeln!(
                 log,
@@ -889,6 +977,28 @@ fn ob1_patch_vendor_agreement(
              [OB-2]; the fork-upkeep ones ([OB-3]/[OB-4]/[OB-8]/[OB-10]) ended with its \
              vendoring.",
             crate_.name, crate_.rel
+        );
+    }
+    for crate_ in members {
+        if !crate_.dir.join("Cargo.toml").is_file() || !crate_.dir.join("src").is_dir() {
+            let _ = writeln!(
+                log,
+                "  ✗ FAIL [OB-1] NOTICE lists `{}` at `{}/`, which no patch row targets and \
+                 which is not a crate with sources there — the redistribution record names \
+                 nothing this tree ships. Restore the crate or correct the NOTICE line.",
+                crate_.name, crate_.rel
+            );
+            fails += 1;
+            continue;
+        }
+        let _ = writeln!(
+            log,
+            "    [OB-1] `{}` is a renamed ABSORBED member: upstream `{}` source aterm owns \
+             under its own package name, reached by path and in no patch row; NOTICE lists it \
+             under the upstream name. It owes the license obligations \
+             [OB-5]/[OB-6]/[OB-7]/[OB-9]; [OB-2] asks whether a patch took, which a member \
+             is not.",
+            crate_.rel, crate_.name
         );
     }
     for fork in forks {
@@ -1090,12 +1200,12 @@ fn ob1_patch_vendor_agreement(
             }
         }
         // The census scans an absorbed crate by its ABSORBED_CRATES row (namespace and platform
-        // slices), so the row and the patch target must agree both ways.
+        // slices), so the rows and the absorbed crates, patched or renamed, must agree both ways.
         let rows = aterm_census::scan_set::ABSORBED_CRATES;
-        for crate_ in absorbed {
+        for crate_ in absorbed.iter().chain(members) {
             if !rows
                 .iter()
-                .any(|r| r.package == crate_.name && r.path == crate_.rel)
+                .any(|r| r.upstream == crate_.name && r.path == crate_.rel)
             {
                 let _ = writeln!(
                     log,
@@ -1108,12 +1218,17 @@ fn ob1_patch_vendor_agreement(
             }
         }
         for row in rows {
-            if !absorbed.iter().any(|c| c.name == row.package) {
+            if !absorbed
+                .iter()
+                .chain(members)
+                .any(|c| c.name == row.upstream && c.rel == row.path)
+            {
                 let _ = writeln!(
                     log,
-                    "  ✗ FAIL [OB-1] ABSORBED_CRATES registers `{}` at `{}` but no absorbed \
-                     [patch.crates-io] target names it — the row is stale.",
-                    row.package, row.path
+                    "  ✗ FAIL [OB-1] ABSORBED_CRATES registers `{}` at `{}` but neither an \
+                     absorbed [patch.crates-io] target nor a NOTICE-listed absorbed member \
+                     names it — the row is stale.",
+                    row.upstream, row.path
                 );
                 fails += 1;
             }
@@ -1148,7 +1263,7 @@ fn ob1_patch_vendor_agreement(
             crate::provenance::roster_len(root)
         );
     }
-    fails
+    (fails, could_not_run)
 }
 
 /// `[OB-2]` The patched crate's version must satisfy every requirement the workspace states, and
@@ -1988,7 +2103,7 @@ mod tests {
     /// come from the plant, and it must be the planted obligation that fails.
     #[test]
     fn every_planted_fork_defect_reds_its_own_obligation() {
-        let (ok, log) = report(good_fixture("green").0.path());
+        let Attestation { ok, log, .. } = report(good_fixture("green").0.path());
         assert!(
             ok,
             "the baseline must attest clean or the plants prove nothing:\n{log}"
@@ -2029,7 +2144,7 @@ mod tests {
         for (name, rel, body, tag) in cases {
             let fixture = good_fixture(&name.replace(' ', "-"));
             std::fs::write(fixture.0.path().join(rel), body).unwrap();
-            let (ok, log) = report(fixture.0.path());
+            let Attestation { ok, log, .. } = report(fixture.0.path());
             assert!(!ok && log.contains(tag), "{name} must fail {tag}:\n{log}");
         }
     }
@@ -2052,13 +2167,13 @@ mod tests {
         // A modelled requirement on another version line is outside the renamed row, so the
         // report stays green.
         require("2");
-        let (ok, log) = report(root);
+        let Attestation { ok, log, .. } = report(root);
         assert!(ok, "a valid other-major requirement stays excluded:\n{log}");
 
         let mut accepted = Vec::new();
         for req in ["*", ">=0, <3", ">2", "0.*", "~2"] {
             require(req);
-            let (ok, log) = report(root);
+            let Attestation { ok, log, .. } = report(root);
             if ok || !log.contains("requirement form attest does not model") {
                 accepted.push((req, log));
             }
@@ -2071,8 +2186,9 @@ mod tests {
 
     /// [`good_fixture`] plus one absorbed crate: an Apache-2.0 member under `crates/` with its
     /// upstream LICENSE, a NOTICE line and a pristine copy to diff against, every modified or
-    /// added file carrying its notice.
-    fn absorbed_fixture(tag: &str) -> Fixture {
+    /// added file carrying its notice. Patched in under its upstream name, or with `renamed`
+    /// renamed off it (its own package name, in no patch row).
+    fn absorbed_fixture(tag: &str, renamed: bool) -> Fixture {
         let fixture = good_fixture(tag);
         let root = fixture.0.path().to_path_buf();
         let w = |rel: &str, body: &str| {
@@ -2086,14 +2202,16 @@ mod tests {
             body.push_str(extra);
             std::fs::write(path, body).unwrap();
         };
-        append(
-            "Cargo.toml",
-            "absorbed = { path = \"crates/aterm-absorbed\" }\n",
-        );
-        append(
-            "Cargo.lock",
-            "\n[[package]]\nname = \"absorbed\"\nversion = \"2.0.0\"\n",
-        );
+        if !renamed {
+            append(
+                "Cargo.toml",
+                "absorbed = { path = \"crates/aterm-absorbed\" }\n",
+            );
+            append(
+                "Cargo.lock",
+                "\n[[package]]\nname = \"absorbed\"\nversion = \"2.0.0\"\n",
+            );
+        }
         append(
             "NOTICE",
             "- absorbed 2.0.0, Apache-2.0 (`crates/aterm-absorbed/`)\n",
@@ -2110,7 +2228,15 @@ mod tests {
             "vendor/.forge/absorbed/pristine/src/lib.rs",
             "pub fn upstream() {}\n",
         );
-        w("crates/aterm-absorbed/Cargo.toml", manifest);
+        if renamed {
+            w(
+                "crates/aterm-absorbed/Cargo.toml",
+                "# Modified by the aterm project: renamed.\n[package]\nname = \"aterm-absorbed\"\n\
+                 version = \"2.0.0\"\nlicense = \"Apache-2.0\"\n",
+            );
+        } else {
+            w("crates/aterm-absorbed/Cargo.toml", manifest);
+        }
         w("crates/aterm-absorbed/LICENSE", "Apache\n");
         w(
             "crates/aterm-absorbed/src/lib.rs",
@@ -2129,29 +2255,67 @@ mod tests {
     /// red.
     #[test]
     fn an_absorbed_crate_owes_the_license_obligations() {
-        let fixture = absorbed_fixture("absorbed-green");
-        let (ok, log) = report(fixture.0.path());
+        let fixture = absorbed_fixture("absorbed-green", false);
+        let Attestation { ok, log, .. } = report(fixture.0.path());
         assert!(ok, "a complete absorbed crate must attest clean:\n{log}");
 
-        let fixture = absorbed_fixture("absorbed-no-notice");
+        let fixture = absorbed_fixture("absorbed-no-notice", false);
         std::fs::write(
             fixture.0.path().join("crates/aterm-absorbed/src/lib.rs"),
             "pub fn upstream() { /* edited */ }\n",
         )
         .unwrap();
-        let (ok, log) = report(fixture.0.path());
+        let Attestation { ok, log, .. } = report(fixture.0.path());
         assert!(!ok && log.contains("FAIL [OB-7]"), "{log}");
 
         // Without its NOTICE line the crate is no longer a recorded absorption:
         // it reads as a half-recorded redistribution, refused outright.
-        let fixture = absorbed_fixture("absorbed-no-notice-line");
+        let fixture = absorbed_fixture("absorbed-no-notice-line", false);
         let notice = fixture.0.path().join("NOTICE");
         let text = std::fs::read_to_string(&notice).unwrap().replace(
             "- absorbed 2.0.0, Apache-2.0 (`crates/aterm-absorbed/`)\n",
             "",
         );
         std::fs::write(&notice, text).unwrap();
-        let (ok, log) = report(fixture.0.path());
+        let Attestation { ok, log, .. } = report(fixture.0.path());
+        assert!(!ok && log.contains("FAIL [OB-1]"), "{log}");
+    }
+
+    /// An absorbed crate renamed off its upstream name is in no patch row; its NOTICE line finds
+    /// it, and it owes the license obligations as before. Each control below is a defect the
+    /// patched form is held to: an edit without its notice, a dropped upstream LICENSE, and a
+    /// NOTICE line left naming a crate that is gone.
+    #[test]
+    fn a_renamed_absorbed_member_owes_the_license_obligations() {
+        let fixture = absorbed_fixture("member-green", true);
+        let Attestation { ok, log, .. } = report(fixture.0.path());
+        assert!(
+            ok,
+            "a complete renamed absorbed member must attest clean:\n{log}"
+        );
+        assert!(
+            log.contains("renamed ABSORBED member")
+                && log.contains("[OB-7] `crates/aterm-absorbed`"),
+            "the member must be attested, not skipped:\n{log}"
+        );
+
+        let fixture = absorbed_fixture("member-no-notice", true);
+        std::fs::write(
+            fixture.0.path().join("crates/aterm-absorbed/src/lib.rs"),
+            "pub fn upstream() { /* edited */ }\n",
+        )
+        .unwrap();
+        let Attestation { ok, log, .. } = report(fixture.0.path());
+        assert!(!ok && log.contains("FAIL [OB-7]"), "{log}");
+
+        let fixture = absorbed_fixture("member-no-license", true);
+        std::fs::remove_file(fixture.0.path().join("crates/aterm-absorbed/LICENSE")).unwrap();
+        let Attestation { ok, log, .. } = report(fixture.0.path());
+        assert!(!ok && log.contains("FAIL [OB-5]"), "{log}");
+
+        let fixture = absorbed_fixture("member-gone", true);
+        std::fs::remove_dir_all(fixture.0.path().join("crates/aterm-absorbed")).unwrap();
+        let Attestation { ok, log, .. } = report(fixture.0.path());
         assert!(!ok && log.contains("FAIL [OB-1]"), "{log}");
     }
 
@@ -2162,12 +2326,12 @@ mod tests {
         let fixture = good_fixture("unreviewed-bundle");
         let root = fixture.0.path();
         std::fs::create_dir_all(root.join("vendor/another-bus/src")).unwrap();
-        let (ok, log) = report(root);
+        let Attestation { ok, log, .. } = report(root);
         assert!(!ok && log.contains("vendor/another-bus"), "{log}");
         std::fs::remove_dir_all(root.join("vendor/another-bus")).unwrap();
         git(root, &["init", "-q"]);
         std::fs::create_dir_all(root.join("vendor/astream/src")).unwrap();
-        let (ok, log) = report(root);
+        let Attestation { ok, log, .. } = report(root);
         assert!(!ok && log.contains("FAIL [OB-1]"), "{log}");
     }
 
@@ -2279,7 +2443,7 @@ mod tests {
             )
             .unwrap();
         }
-        let (ok, log) = report(root);
+        let Attestation { ok, log, .. } = report(root);
         assert!(!ok && log.contains("FAIL [OB-7]"), "{log}");
 
         std::fs::write(
@@ -2287,7 +2451,7 @@ mod tests {
             "// Modified by aterm: bounds proof discharged here.\n// aterm-trust: ok\n",
         )
         .unwrap();
-        let (ok, log) = report(root);
+        let Attestation { ok, log, .. } = report(root);
         assert!(ok, "a header notice must discharge §4(b):\n{log}");
     }
 }

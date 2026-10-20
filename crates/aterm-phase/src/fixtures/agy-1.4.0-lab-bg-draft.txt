@@ -1,0 +1,45 @@
+# agy 1.4.0 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Antigravity CLI, launched by path with a scratch `HOME` whose settings name the Gemini API provider, its Google hosts black-holed, a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · a draft typed and held (`busy while a task runs`) while a background command task runs: the draft over the panel, the footer's left side blank · cursor=39,24
+  Tool call done.
+
+  Tool call done.
+
+────────────────────────────────────────────────────────────
+> toolstart
+
+● Ran (sleep 400; echo LAB-BG2-DONE)
+● Spawned 1 subagent (ctrl+o to expand)
+
+  Tool call done.
+
+────────────────────────────────────────────────────────────
+> after resume
+
+  Hi! I am the local lab stub, not a model. (reply 15)
+
+────────────────────────────────────────────────────────────
+> busy check: slow turn
+
+▸ Thought for 16s
+  tick 15
+  tick 16 tick 17 tick 18 tick 19 tick 20 tick 21 tick 22 tick 23 tick 24 tick 25 tick 26 tick 27 tick 28 tick 29 tick 30
+
+────────────────────────────────────────────────────────────
+> toolstart
+
+● Ran (sleep 300) (ctrl+o to expand)
+
+  Tool call done.
+
+────────────────────────────────────────────────────────────
+> toolstart
+
+○ Running (sleep 120; echo LAB-BG3-DONE) (ctrl+o to expand)
+
+  Tool call done.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> busy while a task runs
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ● [18:04:58] sleep 120; echo LAB-BG3-DONE running
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                       Gemini 3.1 Pro · low · 1 task(s) · /tasks

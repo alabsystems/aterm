@@ -11,6 +11,14 @@
 //! floor, and coma and glints are additive [`GlowQuad`] light with capped
 //! coverage. Pure in the injected `now`; it settles to inactive when the blaze
 //! dies, then rides the blink cadence.
+//!
+//! On a LIGHT GROUND (additive light cannot show on white) the comet has a
+//! light mode of its own: the coma is a round head of ink UNDER the letters,
+//! inside the caret's row, its ink solved against the theme's text
+//! (`cursor_glow::light_body_ink`): always there, dim at rest and swelling as
+//! you type. The glints, dust over the letters, are not drawn there, and the
+//! fill deepens toward its ink under the keys instead of frosting toward
+//! white, so the head gains contrast as the dark one gains light.
 
 use aterm_time::Instant;
 
@@ -61,6 +69,13 @@ pub struct CometConfig {
     pub color: u32,
     /// The trail's accent hue (`GlowConfig::accent`): the coma's outer fringe.
     pub accent: u32,
+    /// The ground is dark (the coma is light) or light (the coma is ink
+    /// under the letters).
+    pub dark_theme: bool,
+    /// The theme's text and paper, which a light ground's coma solves its ink
+    /// against.
+    pub theme_fg: u32,
+    pub theme_bg: u32,
 }
 
 /// What a tick produced: the frosted block fill for the renderer (which floors
@@ -95,8 +110,13 @@ impl CursorComet {
 
     /// Advance one frame at `now` with the aurora's `blaze` (`0..1`, read after
     /// the aurora tick), the block cursor cell `cur` (`None`: hidden), grid
-    /// `geom` and `cfg`. Appends the additive coma to `out`; returns the frosted
-    /// fill and a fingerprint.
+    /// `geom` and `cfg`. Appends the additive coma to `out` on a dark ground,
+    /// the ink coma to `under` (the under-ink stream) on a light one; returns
+    /// the fill and a fingerprint.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "cursor cell + clock + blaze + geometry + config + the two streams it draws into"
+    )]
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -105,6 +125,7 @@ impl CursorComet {
         geom: Geom,
         cfg: &CometConfig,
         out: &mut Vec<GlowQuad>,
+        under: &mut Vec<GlowQuad>,
     ) -> CometFrame {
         let e = (blaze.clamp(0.0, 1.0) * cfg.intensity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
         // Inert (the plain themed cursor) when off, with degenerate geometry,
@@ -131,15 +152,25 @@ impl CursorComet {
 
         // Frosted fill: a cool tint of the trail hue frosting toward white with
         // the blaze, kept below the coma core's near-white. The renderer floors
-        // it against the cell bg, so the glyph stays sharp.
-        let fill = ice_ramp(cfg.color, 0.34 + 0.40 * e + 0.05 * (breathe - 0.5));
+        // it against the cell bg, so the glyph stays sharp. On a light ground
+        // the head deepens toward its ink instead: white sinks into the paper.
+        let fill = if cfg.dark_theme {
+            ice_ramp(cfg.color, 0.34 + 0.40 * e + 0.05 * (breathe - 0.5))
+        } else {
+            ink_ramp(cfg.color, 0.25 + 0.60 * e + 0.05 * (breathe - 0.5))
+        };
 
-        // The additive coma, drawn only over a visible in-grid cursor cell.
+        // The coma, drawn only over a visible in-grid cursor cell: light on a
+        // dark ground, ink under the letters on a light one.
         if let Some((cr, cc)) = cur
             && (cr as usize) < geom.rows
             && (cc as usize) < geom.cols
         {
-            self.emit_coma(cr, cc, e, breathe, phase, geom, cfg, out);
+            if cfg.dark_theme {
+                self.emit_coma(cr, cc, e, breathe, phase, geom, cfg, out);
+            } else {
+                Self::emit_coma_light(cr, cc, e, breathe, geom, cfg, under);
+            }
         }
 
         // Fingerprint: quantized phase + blaze + fill, so a settled nucleus
@@ -154,6 +185,48 @@ impl CursorComet {
             fill: Some(fill),
             fp,
         }
+    }
+
+    /// The coma on a LIGHT GROUND: a round head of ink under the letters,
+    /// centred on the caret and held inside its row, a cell either side at
+    /// rest and swelling with the blaze, its ink solved against the theme's
+    /// text; it breathes with the shimmer as the dark coma does. No glints:
+    /// dust inked over the letters is noise there (8570e153e).
+    fn emit_coma_light(
+        cr: u16,
+        cc: u16,
+        e: f32,
+        breathe: f32,
+        geom: Geom,
+        cfg: &CometConfig,
+        under: &mut Vec<GlowQuad>,
+    ) {
+        use crate::cursor_glow::{LIGHT_BODY_ALPHA_CAP, light_body_ink, push_ink_ellipse};
+        let (cw, ch) = (geom.cw as f32, geom.ch as f32);
+        let centre = geom.cell_center(cr, cc);
+        let ink = light_body_ink(
+            cfg.color,
+            cfg.theme_fg,
+            cfg.theme_bg,
+            LIGHT_BODY_ALPHA_CAP as u8,
+        );
+        let peak = LIGHT_BODY_ALPHA_CAP
+            * (0.35 + 0.65 * e)
+            * (0.86 + 0.14 * breathe)
+            * cfg.intensity.clamp(0.0, 1.0);
+        let budget = under
+            .len()
+            .saturating_add(crate::cursor_glow::LIGHT_MARK_QUADS);
+        push_ink_ellipse(
+            under,
+            geom,
+            centre,
+            cw * (0.9 + 0.3 * e),
+            ch * 0.46,
+            ink,
+            peak,
+            budget,
+        );
     }
 
     /// Emit the coma + rim glints as premultiplied additive quads. Bounded by
@@ -251,6 +324,16 @@ impl CursorComet {
     }
 }
 
+/// The light ground's twin of [`ice_ramp`]: the trail hue at `t` 0 deepening
+/// toward its conservative ink ([`crate::cursor_glow::InkRole::OverText`],
+/// never paler than the hue) at 1, so the block gains contrast on the paper
+/// under the keys. An explicit `cursor_trail_color` re-tints it as it does
+/// the tail.
+fn ink_ramp(color: u32, t: f32) -> u32 {
+    let deep = crate::cursor_glow::InkRole::OverText.ink(color);
+    lerp_rgb(color, deep, t.clamp(0.0, 1.0))
+}
+
 /// The ice ramp off the trail's base hue, `t` 0 (cold, dim) to 1 (sunlit,
 /// near-white): dimmed hue, pure hue, whitened hue, [`ICE_WHITE`]. Derived from
 /// the config colour, so an explicit `cursor_trail_color` re-tints the nucleus
@@ -295,6 +378,9 @@ mod tests {
             intensity: 1.0,
             color: 0x009E_D6FF, // the default glacial blue: r ≤ g ≤ b
             accent: 0x00C8_EAFF,
+            dark_theme: true,
+            theme_fg: 0x00C8_C8D2,
+            theme_bg: 0x0010_1016,
         }
     }
 
@@ -319,7 +405,15 @@ mod tests {
         ] {
             let mut nc = CursorComet::default();
             let mut out = Vec::new();
-            let f = nc.tick(Some((1, 1)), Instant::now(), 1.0, geom(), &config, &mut out);
+            let f = nc.tick(
+                Some((1, 1)),
+                Instant::now(),
+                1.0,
+                geom(),
+                &config,
+                &mut out,
+                &mut Vec::new(),
+            );
             assert!(f.fill.is_none(), "{why}: keeps the plain cursor");
             assert_eq!(f.fp, 0, "{why}");
             assert!(out.is_empty(), "{why}: no additive light");
@@ -332,7 +426,15 @@ mod tests {
     fn hidden_cursor_draws_no_coma() {
         let mut nc = CursorComet::default();
         let mut out = Vec::new();
-        let f = nc.tick(None, Instant::now(), 0.5, geom(), &cfg(), &mut out);
+        let f = nc.tick(
+            None,
+            Instant::now(),
+            0.5,
+            geom(),
+            &cfg(),
+            &mut out,
+            &mut Vec::new(),
+        );
         assert!(out.is_empty(), "no additive light without a cursor cell");
         assert!(f.fill.is_some());
     }
@@ -346,7 +448,7 @@ mod tests {
         let run = |blaze: f32| -> (u64, i32, i32) {
             let mut nc = CursorComet::default();
             let mut out = Vec::new();
-            nc.tick(Some((3, 20)), t, blaze, g, &c, &mut out);
+            nc.tick(Some((3, 20)), t, blaze, g, &c, &mut out, &mut Vec::new());
             out.clear();
             nc.tick(
                 Some((3, 20)),
@@ -355,6 +457,7 @@ mod tests {
                 g,
                 &c,
                 &mut out,
+                &mut Vec::new(),
             );
             let x0 = out.iter().map(|q| q.x as i32).min().unwrap_or(0);
             let x1 = out.iter().map(|q| (q.x + q.w) as i32).max().unwrap_or(0);
@@ -375,6 +478,115 @@ mod tests {
         );
     }
 
+    /// A light config: GitHub Light's text and paper, its cursor blue.
+    fn light_cfg() -> CometConfig {
+        CometConfig {
+            color: 0x0009_69DA,
+            accent: 0x0040_90F0,
+            dark_theme: false,
+            theme_fg: 0x001F_2328,
+            theme_bg: 0x00FF_FFFF,
+            ..cfg()
+        }
+    }
+
+    fn contrast(a: u32, b: u32) -> f32 {
+        let (x, y) = (
+            crate::color_math::relative_luminance(a),
+            crate::color_math::relative_luminance(b),
+        );
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// ON PAPER THE NUCLEUS INKS A ROUND HEAD UNDER THE LETTERS: at rest and
+    /// hot, the additive stream stays empty, the coma is source-over ink in
+    /// the under-ink stream, inside the caret's row, reaching past both edges
+    /// of the caret's cell, and wider hot than at rest. Negative control: a
+    /// dark ground draws the additive coma and no ink.
+    #[test]
+    fn light_nucleus_inks_a_round_head_under_the_letters() {
+        let g = geom();
+        let (row, col) = (3u16, 20u16);
+        let width = |blaze: f32| {
+            let mut nc = CursorComet::default();
+            let (mut out, mut under) = (Vec::new(), Vec::new());
+            nc.tick(
+                Some((row, col)),
+                Instant::now(),
+                blaze,
+                g,
+                &light_cfg(),
+                &mut out,
+                &mut under,
+            );
+            assert!(out.is_empty(), "no additive light on paper");
+            assert!(!under.is_empty(), "the head is inked (blaze {blaze})");
+            let top = row * g.ch as u16;
+            assert!(
+                under
+                    .iter()
+                    .all(|q| q.alpha > 0 && q.y >= top && q.y + q.h <= top + g.ch as u16),
+                "source-over, inside its row"
+            );
+            let x0 = under.iter().map(|q| q.x).min().unwrap_or(0);
+            let x1 = under.iter().map(|q| q.x + q.w).max().unwrap_or(0);
+            let (left, right) = (col * g.cw as u16, (col + 1) * g.cw as u16);
+            assert!(
+                x0 + g.cw as u16 / 4 <= left && x1 >= right + g.cw as u16 / 4,
+                "past both edges of the caret's cell: {x0}..{x1}"
+            );
+            x1 - x0
+        };
+        assert!(width(1.0) > width(0.1), "the head swells as it heats");
+        let mut nc = CursorComet::default();
+        let (mut out, mut under) = (Vec::new(), Vec::new());
+        nc.tick(
+            Some((row, col)),
+            Instant::now(),
+            0.5,
+            g,
+            &cfg(),
+            &mut out,
+            &mut under,
+        );
+        assert!(
+            !out.is_empty() && under.is_empty(),
+            "dark: the additive coma"
+        );
+    }
+
+    /// ON PAPER THE NUCLEUS DEEPENS UNDER THE KEYS: hot, the block fill holds
+    /// at least the contrast against the paper it has at rest, and at least
+    /// the trail colour's own (white sinks into the page, so it never frosts
+    /// there). Negative control: on a dark ground the hot fill is lighter.
+    #[test]
+    fn light_ground_nucleus_deepens_under_the_keys() {
+        let g = geom();
+        let fill = |c: &CometConfig, blaze: f32| {
+            let mut nc = CursorComet::default();
+            nc.tick(
+                Some((1, 1)),
+                Instant::now(),
+                blaze,
+                g,
+                c,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .fill
+            .expect("a fill")
+        };
+        let c = light_cfg();
+        let (cold, hot) = (fill(&c, 0.0), fill(&c, 1.0));
+        let paper = c.theme_bg;
+        assert!(contrast(hot, paper) >= contrast(cold, paper));
+        assert!(contrast(hot, paper) >= contrast(c.color, paper));
+        let luma = crate::color_math::relative_luminance;
+        let d = cfg();
+        assert!(luma(fill(&d, 1.0)) > luma(fill(&d, 0.0)), "dark: it frosts");
+    }
+
     /// Every emitted quad is single-row, grid-interior, and ice-hued with capped
     /// coverage (the renderer row-gate / parity / legibility invariants).
     #[test]
@@ -385,7 +597,7 @@ mod tests {
         let mut out = Vec::new();
         let t = Instant::now();
         // A corner cell so clamping is exercised.
-        nc.tick(Some((0, 0)), t, 1.0, g, &c, &mut out);
+        nc.tick(Some((0, 0)), t, 1.0, g, &c, &mut out, &mut Vec::new());
         nc.tick(
             Some((0, 0)),
             t + Duration::from_millis(16),
@@ -393,6 +605,7 @@ mod tests {
             g,
             &c,
             &mut out,
+            &mut Vec::new(),
         );
         assert!(!out.is_empty());
         let gw = (g.cols * g.cw) as u32;
@@ -433,7 +646,7 @@ mod tests {
         let mut nc = CursorComet::default();
         let mut out = Vec::new();
         let t = Instant::now();
-        nc.tick(Some((1, 1)), t, 0.8, g, &c, &mut out);
+        nc.tick(Some((1, 1)), t, 0.8, g, &c, &mut out, &mut Vec::new());
         assert!(nc.is_active(), "a charged nucleus keeps the tick armed");
         nc.tick(
             Some((1, 1)),
@@ -442,6 +655,7 @@ mod tests {
             g,
             &c,
             &mut out,
+            &mut Vec::new(),
         );
         assert!(
             !nc.is_active(),
@@ -459,7 +673,10 @@ mod tests {
         let mut nc = CursorComet::default();
         let mut c = cfg();
         c.color = 0x00FF_4020; // a red comet, if that's what the user pins
-        let f = nc.tick(Some((1, 1)), t, 0.2, g, &c, &mut out).fill.unwrap();
+        let f = nc
+            .tick(Some((1, 1)), t, 0.2, g, &c, &mut out, &mut Vec::new())
+            .fill
+            .unwrap();
         let (r, gg, b) = ((f >> 16) & 0xff, (f >> 8) & 0xff, f & 0xff);
         assert!(
             r > b && r > gg,
@@ -486,7 +703,15 @@ mod tests {
         let (cr, cc) = (12u16, 47u16);
         let mut e = CursorComet::default();
         let mut out = Vec::new();
-        e.tick(Some((cr, cc)), t0, 1.0, real, &cfg(), &mut out);
+        e.tick(
+            Some((cr, cc)),
+            t0,
+            1.0,
+            real,
+            &cfg(),
+            &mut out,
+            &mut Vec::new(),
+        );
         assert!(!out.is_empty(), "the emitter drew nothing to place");
         // The caret cell in window px, from the one anchor every emitter shares.
         let (x0c, y0c) = (
@@ -527,7 +752,15 @@ mod tests {
         // the other tests here are unaffected.
         let mut at_origin = Vec::new();
         let mut f = CursorComet::default();
-        f.tick(Some((3, 10)), t0, 1.0, geom(), &cfg(), &mut at_origin);
+        f.tick(
+            Some((3, 10)),
+            t0,
+            1.0,
+            geom(),
+            &cfg(),
+            &mut at_origin,
+            &mut Vec::new(),
+        );
         let mut shifted = Vec::new();
         let mut g = CursorComet::default();
         let mut o = geom();
@@ -536,7 +769,15 @@ mod tests {
         o.win_w += 48;
         o.win_h += 84;
         o.head = 84;
-        g.tick(Some((3, 10)), t0, 1.0, o, &cfg(), &mut shifted);
+        g.tick(
+            Some((3, 10)),
+            t0,
+            1.0,
+            o,
+            &cfg(),
+            &mut shifted,
+            &mut Vec::new(),
+        );
         assert_eq!(
             at_origin.len(),
             shifted.len(),

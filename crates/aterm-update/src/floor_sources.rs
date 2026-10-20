@@ -123,7 +123,10 @@ mod tests {
         let (v, s) = s.step(v, &revoked(&["m11"]), 10_000_000_000, Some("m11"));
         assert_eq!(v, 900);
         // A trusted machine still raises it.
-        let (v, _) = s.step(v, &revoked(&["m11"]), 1_000, Some("m3"));
+        let (v, s) = s.step(v, &revoked(&["m11"]), 1_000, Some("m3"));
+        assert_eq!(v, 1_000);
+        // Its later, lower ask lowers nothing: a machine's part is the most it asked.
+        let (v, _) = s.step(v, &revoked(&["m11"]), 10, Some("m3"));
         assert_eq!(v, 1_000);
     }
 
@@ -144,6 +147,16 @@ mod tests {
         assert_eq!(v, 100);
         let (v, _) = attributed.step(100, &revoked(&["m11"]), 0, None);
         assert_eq!(v, 0, "the capped part was m11's alone");
+        // An unattributed part above the record is capped at it too.
+        let based = FloorSources {
+            base: 9_000,
+            ..FloorSources::default()
+        };
+        assert_eq!(based.step(100, &[], 0, None).0, 100);
+        // A zero ask names no machine: the record stays the number alone.
+        let (v, s) = FloorSources::default().step(100, &[], 0, Some("m3"));
+        assert_eq!(v, 100);
+        assert!(s.is_empty(), "{s:?}");
         // NEGATIVE CONTROL: explained exactly, the same revocation takes it all back.
         let (v, _) = attributed.step(9_000, &revoked(&["m11"]), 0, None);
         assert_eq!(v, 0);

@@ -1,0 +1,10 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# §2.4: question (the agent asked in prose) closes the turn asked at
+# conf=heuristic once it holds.
+see busy
+see question fixture=claude-2.1.302-lab-reply-wrapped-50col
+half
+expect turn=open
+half
+expect open t1 turn
+expect close t1 turn out=asked conf=heuristic

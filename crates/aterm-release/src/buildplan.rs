@@ -95,6 +95,10 @@ pub struct BuildPlan {
     /// build's slices peaked at would not fit beside each other
     /// (`artifact::slices_fit`).
     pub one_slice_at_a_time: bool,
+    /// The shipped channel's published index run the build compiles in as
+    /// [`atpkg::net::INDEX_HINT_ENV`] ([`index_hint_now`]): what a fresh install's first
+    /// discovery round guesses from. `None` builds without one, as a development build is.
+    pub index_hint: Option<String>,
 }
 
 /// What [`run`] produced: the unsigned universal bundle around the stripped,
@@ -1071,6 +1075,8 @@ struct ReleaseEnv<'a> {
     target_dir: PathBuf,
     /// The compat slice's rustup home; `None` on the native (Trust) slice.
     rustup_home: Option<OsString>,
+    /// [`BuildPlan::index_hint`].
+    index_hint: Option<&'a str>,
 }
 
 /// THE RELEASE BUILD'S WHOLE ENVIRONMENT: the command starts empty and gets exactly
@@ -1091,6 +1097,9 @@ struct ReleaseEnv<'a> {
 ///   ([`release_profile_debug`]);
 /// * the release marker ([`RELEASE_BUILD_MARKER`]), and no version: the binary
 ///   reports `[workspace.package] version` as written;
+/// * the shipped channel's published index run, when the plan carries one
+///   ([`atpkg::net::INDEX_HINT_ENV`], [`index_hint_now`]): a guess a fresh install's first
+///   discovery round follows, never an input to what verifies;
 /// * on the compat slice only, `RUSTUP_HOME` and `RUSTUP_TOOLCHAIN=stable` (a
 ///   deliberate stock lane; the native slice adds nothing beyond its driver);
 /// * on Linux, `CARGO_BUILD_JOBS=4`: native Linux workers run beside the developer's
@@ -1121,6 +1130,9 @@ fn release_env(e: &ReleaseEnv<'_>) -> Vec<(&'static str, OsString)> {
         ),
         (RELEASE_BUILD_MARKER, "1".into()),
     ];
+    if let Some(hint) = e.index_hint {
+        env.push((atpkg::net::INDEX_HINT_ENV, hint.into()));
+    }
     if let Some(rustup_home) = &e.rustup_home {
         env.push(("RUSTUP_HOME", rustup_home.clone()));
         env.push(("RUSTUP_TOOLCHAIN", "stable".into()));
@@ -1142,6 +1154,26 @@ const fn release_profile_debug() -> (&'static str, &'static str) {
         ("0", "debuginfo")
     } else {
         ("1", "false")
+    }
+}
+
+/// The shipped channel's published index run now, as a store that has verified nothing
+/// finds it ([`atpkg::net::published_index_run`]), for a release build to compile in
+/// ([`BuildPlan::index_hint`]) — said either way. `None` when the walk fails: the build goes
+/// on without one, since a guess gates nothing, and its fresh installs walk from none.
+pub(crate) fn index_hint_now() -> Option<String> {
+    match atpkg::net::published_index_run() {
+        Ok(run) => {
+            println!(
+                "==> index hint {run}: the shipped channel's published run, compiled in for a \
+                 fresh install's first discovery round"
+            );
+            Some(run.to_string())
+        }
+        Err(why) => {
+            println!("==> no index hint ({why}): a fresh install of this build walks from none");
+            None
+        }
     }
 }
 
@@ -1238,6 +1270,7 @@ fn build_one(
             commit: &take.snapshot.commit,
             target_dir: take.slice_target(target),
             rustup_home,
+            index_hint: plan.index_hint.as_deref(),
         },
     );
     let lane = if target.is_some() {
@@ -2929,8 +2962,12 @@ mod tests {
         }
         // The build's whole environment is its command's, and that is release_env's
         // (the command starts empty): nothing in it steers what compiles, on either
-        // slice.
-        for rustup_home in [None, Some(OsString::from("/h/.rustup"))] {
+        // slice. The plan's index hint reaches both slices' compiles, and nothing else does.
+        for (rustup_home, index_hint) in [
+            (None, None),
+            (None, Some("8..72")),
+            (Some(OsString::from("/h/.rustup")), Some("8..72")),
+        ] {
             let compat = rustup_home.is_some();
             let e = ReleaseEnv {
                 path: "/t/bin:/usr/bin".into(),
@@ -2942,6 +2979,7 @@ mod tests {
                 commit: "0123456789abcdef0123456789abcdef01234567",
                 target_dir: "/private/take/target".into(),
                 rustup_home,
+                index_hint,
             };
             let cmd = release_build_command(
                 std::path::Path::new("/t/bin/targo"),
@@ -2993,6 +3031,7 @@ mod tests {
             assert_eq!(get("CARGO_PROFILE_RELEASE_DEBUG").as_deref(), Some(debug));
             assert_eq!(get("CARGO_PROFILE_RELEASE_STRIP").as_deref(), Some(strip));
             assert_eq!(get(RELEASE_BUILD_MARKER).as_deref(), Some("1"));
+            assert_eq!(get(atpkg::net::INDEX_HINT_ENV).as_deref(), index_hint);
             assert_eq!(
                 get("RUSTUP_TOOLCHAIN").as_deref(),
                 compat.then_some("stable"),

@@ -4,14 +4,15 @@
 //! `brief` (§7.4): its shape, its budget and its shedding order.
 
 use aterm_slog::{
-    Actor, BoxWord, Conf, Fields, Key, Kind, Limits, Log, Mark, ShortId, Src, TurnTracker, Verdict,
-    WallKind, tokens,
+    Actor, Amend, BoxWord, Close, Conf, Fields, Key, Kind, Limits, Log, Mark, Node, Open, Out,
+    RunOut, ShortId, Src, StepOut, TurnTracker, Verdict, WallKind, tokens,
 };
 
 use crate::support::{WALL0, agent_session, at};
 
-/// A session of `turns` turns, each with an approval box, a bell mark on
-/// every third, the last turn left open on a box; the OSC title set once.
+/// A session of `turns` turns, each with an approval box, a person's input
+/// mark on every third, the last turn left open on a box; the OSC title set
+/// once.
 fn session(turns: u64) -> (Log, u64) {
     let mut log = Log::new(2);
     let run = agent_session(&mut log, 0);
@@ -35,9 +36,14 @@ fn session(turns: u64) -> (Log, u64) {
             ms += 50;
             tr.observe(&mut log, v, None, at(ms));
         }
+        // A mark worth a line (a person's hands; a bell gives none since
+        // phase 3B, ruling S15).
         if i % 3 == 0 {
-            log.mark(Mark::new(Kind::Bell, Src::Engine, Conf::Exact), at(ms))
-                .expect("bell");
+            log.mark(
+                Mark::new(Kind::Human, Src::Input, Conf::Strong).by(Actor::Human),
+                at(ms),
+            )
+            .expect("human");
         }
         if i + 1 < turns {
             ms += 50;
@@ -368,4 +374,608 @@ fn an_unobserved_phase_claims_nothing() {
         "{}",
         b.text
     );
+}
+
+/// Phase 3B's bookkeeping kinds give no brief line: a `source` mark (a run's
+/// view of its transcript) and a `mail-landed` mark leave the brief exactly
+/// as it was, while a mark that is worth a line (a person's input,
+/// `Kind::Human`) still gets one.
+#[test]
+fn a_source_or_landing_mark_gives_no_brief_line() {
+    let (mut log, now) = session(3);
+    let before = log.brief("s-7bd6", 2000, now).text;
+    let run = log.state().run().expect("the run").node;
+    for (k, f) in [
+        (
+            Kind::Source,
+            Fields::new()
+                .tok(Key::Field, "transcript")
+                .and_then(|f| f.word(Key::State, "partial"))
+                .and_then(|f| f.u(Key::Skipped, 9)),
+        ),
+        (
+            Kind::MailLanded,
+            Fields::new()
+                .u(Key::Inbox, 4)
+                .and_then(|f| f.u(Key::Off, 88)),
+        ),
+    ] {
+        log.mark(
+            Mark::new(k, Src::Aterm, Conf::Strong)
+                .at(run)
+                .fields(f.expect("fields")),
+            at(9_000),
+        )
+        .expect("a mark");
+    }
+    let after = log.brief("s-7bd6", 2000, now).text;
+    let body = |t: &str| t.lines().skip(1).map(str::to_string).collect::<Vec<_>>();
+    assert_eq!(body(&after), body(&before), "{after}");
+    // Negative control: a person's input is worth a line.
+    log.mark(
+        Mark::new(Kind::Human, Src::Input, Conf::Strong).by(Actor::Human),
+        at(9_001),
+    )
+    .expect("human");
+    let rung = log.brief("s-7bd6", 2000, now).text;
+    assert!(body(&rung).len() > body(&before).len(), "{rung}");
+}
+
+/// PHASE 3B (A5): `brief` reads a node's outcome, tools and steps from its
+/// close or an amend that refines it, by the fold's own rules: an exact
+/// `out=` amend is the turn's outcome and a strong one never is; a step's
+/// exact refinement is its line's outcome; a late rollup amend's `tools=`
+/// and `steps=` are the turn's.
+#[test]
+fn brief_reads_an_exact_refinement_and_never_a_strong_one() {
+    use aterm_slog::{Amend, Close, Open, Out, TurnOut};
+    let mut log = Log::new(2);
+    let run = agent_session(&mut log, 0);
+    let turn = log
+        .open(
+            Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
+            at(1),
+        )
+        .expect("turn");
+    let tool = log
+        .open(
+            Open::new(Kind::Tool, Src::Transcript, Conf::Strong)
+                .under(turn)
+                .fields(Fields::new().word(Key::Cls, "shell").expect("cls")),
+            at(2),
+        )
+        .expect("tool");
+    log.close(
+        turn,
+        Close::new(Out::Turn(TurnOut::Done), Src::Screen, Conf::Strong),
+        at(5),
+    )
+    .expect("closes");
+    let amend = |log: &mut Log, node, kind, conf, f: Fields, ms| {
+        log.amend(node, Amend::new(kind, Src::Transcript, conf, f), at(ms))
+            .expect("amends");
+    };
+    let line = |log: &Log, lead: &str| {
+        let b = log.brief("s-7bd6", 4000, WALL0 + 10_000);
+        b.text
+            .lines()
+            .find(|l| l.starts_with(lead))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("no {lead} line:\n{}", b.text))
+    };
+    let t = format!("t{} ", turn.n);
+    let p = format!("p{} ", tool.n);
+    assert!(line(&log, &t).starts_with(&format!("t{} done ", turn.n)));
+    assert!(line(&log, &p).contains(" gone "), "{}", line(&log, &p));
+    // Strong refinements are records, never the outcome.
+    amend(
+        &mut log,
+        turn,
+        Kind::Turn,
+        Conf::Strong,
+        Fields::new().word(Key::Out, "wall:context").expect("o"),
+        6,
+    );
+    amend(
+        &mut log,
+        tool,
+        Kind::Tool,
+        Conf::Strong,
+        Fields::new().word(Key::Out, "ok").expect("o"),
+        6,
+    );
+    assert!(
+        line(&log, &t).starts_with(&format!("t{} done ", turn.n)),
+        "{}",
+        line(&log, &t)
+    );
+    assert!(line(&log, &p).contains(" gone "), "{}", line(&log, &p));
+    // Exact ones refine them.
+    amend(
+        &mut log,
+        turn,
+        Kind::Turn,
+        Conf::Exact,
+        Fields::new().word(Key::Out, "wall:context").expect("o"),
+        7,
+    );
+    amend(
+        &mut log,
+        tool,
+        Kind::Tool,
+        Conf::Exact,
+        Fields::new().word(Key::Out, "error").expect("o"),
+        7,
+    );
+    assert!(
+        line(&log, &t).starts_with(&format!("t{} wall:context ", turn.n)),
+        "{}",
+        line(&log, &t)
+    );
+    assert!(line(&log, &p).contains(" error "), "{}", line(&log, &p));
+    // A late rollup (tools the transcript saw after the screen's close).
+    amend(
+        &mut log,
+        turn,
+        Kind::Turn,
+        Conf::Strong,
+        Fields::new()
+            .u(Key::Steps, 3)
+            .and_then(|f| f.tok(Key::Tools, "shell:2,edit:1"))
+            .expect("rollup"),
+        8,
+    );
+    let tl = line(&log, &t);
+    assert!(tl.contains(" · 3 steps shell 2 edit 1"), "{tl}");
+}
+
+/// PHASE 3B's MARKS LEAVE THE BRIEF AS IT WAS (ruling S15, addendum A23): a
+/// busy agent session's brief, every 3B mark written on every turn, holds
+/// every line it holds without them, at every budget; mail is the `mail in ·
+/// out` line and `act` and `story` one count line, both the first lines shed.
+/// NEGATIVE CONTROL: the count lines are there when they fit, and a pre-3B
+/// mark (a person's input) still is a line.
+#[test]
+fn the_3b_marks_leave_the_brief_as_it_was() {
+    let (mut base, now) = session(12);
+    let (mut with, _) = session(12);
+    let run = with.state().run().expect("the run").node;
+    let words = |k: Kind| -> Fields {
+        let f = Fields::new();
+        match k {
+            Kind::Integration | Kind::Render | Kind::Progress | Kind::Goal | Kind::Hold => {
+                f.word(Key::State, "on")
+            }
+            Kind::Ctx => f.u(Key::Pct, 40),
+            Kind::Notify | Kind::Bell => f.u(Key::N, 2),
+            Kind::InDoubt => f.word(Key::Verb, "send"),
+            Kind::Usage => f.u(Key::H5, 30).and_then(|f| f.u(Key::D7, 9)),
+            Kind::Status => f.word(Key::Phase, "running"),
+            Kind::Meta => f
+                .tok(Key::Field, "attention")
+                .and_then(|f| f.text(Key::Value, "supervisor")),
+            Kind::Mail => f
+                .word(Key::Dir, "in")
+                .and_then(|f| f.word(Key::MailKind, "task"))
+                .and_then(|f| f.u(Key::Inbox, 3)),
+            Kind::MailSeen => f
+                .u(Key::Inbox, 3)
+                .and_then(|f| f.word(Key::Word, "handled")),
+            Kind::MailLanded => f.u(Key::Inbox, 4).and_then(|f| f.u(Key::Off, 88)),
+            Kind::Task => f
+                .u(Key::Rev, 2)
+                .and_then(|f| f.word(Key::State, "done"))
+                .and_then(|f| f.u(Key::Attention, 0))
+                .and_then(|f| f.word(Key::Why, "marker")),
+            Kind::Act => f.word(Key::Word, "approve"),
+            Kind::Story => f.word(Key::Word, "approved"),
+            Kind::Cwd => f.text(Key::Cwd, "/w/repo"),
+            _ => Ok(f),
+        }
+        .expect("fields")
+    };
+    let kinds = [
+        Kind::Integration,
+        Kind::Status,
+        Kind::Ctx,
+        Kind::Goal,
+        Kind::Notify,
+        Kind::Progress,
+        Kind::Bell,
+        Kind::Render,
+        Kind::Modes,
+        Kind::InDoubt,
+        Kind::Usage,
+        Kind::Cwd,
+        Kind::Meta,
+        Kind::Mail,
+        Kind::MailSeen,
+        Kind::MailLanded,
+        Kind::Task,
+        Kind::Hold,
+        Kind::Act,
+        Kind::Story,
+    ];
+    for i in 0..12u64 {
+        for k in kinds {
+            with.mark(
+                Mark::new(k, Src::Aterm, Conf::Strong)
+                    .at(run)
+                    .fields(words(k)),
+                at(20_000 + i),
+            )
+            .expect("a 3B mark");
+            // The base takes as many records a brief never showed (an
+            // agent mark), so both headers name the same `as_of`.
+            base.mark(
+                Mark::new(Kind::Agent, Src::Screen, Conf::Strong).at(run),
+                at(20_000 + i),
+            )
+            .expect("an agent mark");
+        }
+    }
+    let body = |t: &str| t.lines().skip(1).map(str::to_string).collect::<Vec<_>>();
+    let counts = ["mail in 12 · out 0", "acts 12 · stories 12"];
+    let full = base.brief("s-1", 100_000, now);
+    let mut counted = 0;
+    for budget in (0..=full.used + 40).rev() {
+        let b = body(&base.brief("s-1", budget, now).text);
+        let w = body(&with.brief("s-1", budget, now).text);
+        let shown = counts.iter().filter(|c| w.iter().any(|l| l == *c)).count();
+        assert!(shown == 0 || shown == 2, "both or neither: {w:?}");
+        if shown == 2 {
+            counted += 1;
+            let without: Vec<String> = w
+                .iter()
+                .filter(|l| !counts.contains(&l.as_str()))
+                .cloned()
+                .collect();
+            assert_eq!(without, b, "budget {budget}");
+        } else {
+            assert_eq!(w, b, "budget {budget}: the count lines go first");
+        }
+    }
+    assert!(counted > 0, "the count lines show when they fit");
+    assert!(
+        body(&full.text).iter().any(|l| l.contains(" human ")),
+        "a pre-3B mark still is a line: {}",
+        full.text
+    );
+}
+
+/// A CODEX-ALAB SESSION'S ACTS ARE THE ONE COUNT LINE (plan 5C-2, ruling
+/// T28): a self-supervised agent's acts (`meta set harness_act`, written as
+/// `act` marks by the connection's actor, `src=mark conf=claim`) leave the
+/// brief with every line it had without them, plus `acts N · stories 0`,
+/// which is shed first. NEGATIVE CONTROL: the count line is there when it
+/// fits.
+#[test]
+fn a_codex_alab_sessions_acts_are_one_count_line_shed_first() {
+    let (mut base, now) = session(6);
+    let (mut with, _) = session(6);
+    let run = with.state().run().expect("the run").node;
+    let acts = [
+        ("approve", "approve-all.v1"),
+        ("answer", "answer-recommended.v1"),
+        ("continue", "continue.v1"),
+        ("continue", "usage-resume.v1"),
+        ("relaunch", "upgrade.v1"),
+        ("dispatch", "harness-turn.v1"),
+    ];
+    for (i, (word, rule)) in acts.iter().enumerate() {
+        let ms = 30_000 + i as u64;
+        with.mark(
+            Mark::new(Kind::Act, Src::Mark, Conf::Claim)
+                .by(Actor::Ctl)
+                .fields(
+                    Fields::new()
+                        .word(Key::Word, word)
+                        .and_then(|f| f.id(Key::Rule, rule))
+                        .expect("an act"),
+                ),
+            at(ms),
+        )
+        .expect("an act mark");
+        // As many records a brief never shows, so both name one `as_of`.
+        base.mark(
+            Mark::new(Kind::Agent, Src::Screen, Conf::Strong).at(run),
+            at(ms),
+        )
+        .expect("an agent mark");
+    }
+    let body = |t: &str| t.lines().skip(1).map(str::to_string).collect::<Vec<_>>();
+    let count = "acts 6 · stories 0";
+    let full = with.brief("s-1", 100_000, now);
+    assert!(body(&full.text).iter().any(|l| l == count), "{}", full.text);
+    let mut counted = 0;
+    for budget in (0..=full.used + 40).rev() {
+        let b = body(&base.brief("s-1", budget, now).text);
+        let w = body(&with.brief("s-1", budget, now).text);
+        if w.iter().any(|l| l == count) {
+            counted += 1;
+            let without: Vec<String> = w.iter().filter(|l| *l != count).cloned().collect();
+            assert_eq!(without, b, "budget {budget}");
+        } else {
+            assert_eq!(w, b, "budget {budget}: the count line goes first");
+        }
+    }
+    assert!(counted > 0, "the count line shows when it fits");
+}
+
+/// A RELAUNCHED SESSION (plan 5F-2's case of [`a_relaunched_sessions_acts_are_one_count_line_shed_first`]):
+/// [`session`]'s run, the agent exiting on its open box, then a relaunched
+/// agent's run with two turns. With `acts`, the hosted lanes' marks between
+/// the two runs (`act word=relaunch rule=<row> by=harness src=aterm
+/// conf=strong`: the relaunch, then the carry-on it typed); without, as
+/// many records a brief never shows, so both name one `as_of`.
+fn relaunched(acts: bool) -> (Log, u64) {
+    let (mut log, _) = session(6);
+    let run = log.state().run().expect("the run").node;
+    let mut ms = 20_000;
+    log.close(
+        run,
+        Close::new(Out::Run(RunOut::Signal), Src::Shell, Conf::Exact),
+        at(ms),
+    )
+    .expect("the agent exits");
+    for row in ["relaunch", "carry-on"] {
+        ms += 10;
+        let m = if acts {
+            Mark::new(Kind::Act, Src::Aterm, Conf::Strong)
+                .at(Node::SESSION)
+                .by(Actor::Harness)
+                .fields(
+                    Fields::new()
+                        .word(Key::Word, "relaunch")
+                        .and_then(|f| f.id(Key::Rule, row))
+                        .expect("an act"),
+                )
+        } else {
+            Mark::new(Kind::Agent, Src::Screen, Conf::Strong).at(Node::SESSION)
+        };
+        log.mark(m, at(ms)).expect("a mark");
+    }
+    let f = Fields::new().tok(Key::Agent, "claude").expect("an agent");
+    let again = log
+        .open(
+            Open::new(Kind::Agent, Src::Status, Conf::Strong).fields(f),
+            at(ms + 10),
+        )
+        .expect("the relaunched run");
+    let mut tr = TurnTracker::new(again);
+    for _ in 0..2 {
+        for v in [Verdict::Busy, Verdict::Idle] {
+            ms += 100;
+            tr.observe(&mut log, v, None, at(ms));
+        }
+        ms += 1000;
+        tr.tick(&mut log, at(ms));
+    }
+    (log, WALL0 + ms + 40_000)
+}
+
+/// A RELAUNCHED SESSION'S ACTS ARE THE ONE COUNT LINE (plan 5F-2, rulings
+/// T25 and T28): the hosted lanes' `act word=relaunch` marks (`by=harness
+/// src=aterm conf=strong`) leave the brief with every line it had without
+/// them — both runs, their turns and the exit — plus `acts 2 · stories 0`,
+/// which is shed first. NEGATIVE CONTROL: the count line is there when it
+/// fits.
+#[test]
+fn a_relaunched_sessions_acts_are_one_count_line_shed_first() {
+    let (base, now) = relaunched(false);
+    let (with, _) = relaunched(true);
+    let body = |t: &str| t.lines().skip(1).map(str::to_string).collect::<Vec<_>>();
+    let count = "acts 2 · stories 0";
+    let full = with.brief("s-1", 100_000, now);
+    assert!(body(&full.text).iter().any(|l| l == count), "{}", full.text);
+    let as_of = |t: &str| {
+        t.split(' ')
+            .find(|w| w.starts_with("as_of="))
+            .map(str::to_string)
+    };
+    assert_eq!(
+        as_of(&full.text),
+        as_of(&base.brief("s-1", 100_000, now).text),
+        "one as_of"
+    );
+    let mut counted = 0;
+    for budget in (0..=full.used + 40).rev() {
+        let b = body(&base.brief("s-1", budget, now).text);
+        let w = body(&with.brief("s-1", budget, now).text);
+        if w.iter().any(|l| l == count) {
+            counted += 1;
+            let without: Vec<String> = w.iter().filter(|l| *l != count).cloned().collect();
+            assert_eq!(without, b, "budget {budget}");
+        } else {
+            assert_eq!(w, b, "budget {budget}: the count line goes first");
+        }
+    }
+    assert!(counted > 0, "the count line shows when it fits");
+}
+
+/// One of [`tx_session`]'s steps: a Claude Code tool call the transcript
+/// opened under the open turn (`tx`), or, for the base, a step under the
+/// run (a brief shows none) so the ids agree.
+fn tx_step(log: &mut Log, run: Node, tx: bool, ms: u64, close: bool) -> Node {
+    let open = if tx {
+        let turn = log.state().turn().expect("an open turn").node;
+        let f = Fields::new()
+            .word(Key::Cls, "shell")
+            .and_then(|f| f.text(Key::Tool, "Bash"))
+            .and_then(|f| f.id(Key::Vref, "tu1"))
+            .expect("fields");
+        Open::new(Kind::Tool, Src::Transcript, Conf::Strong)
+            .under(turn)
+            .by(Actor::Vendor)
+            .fields(f)
+    } else {
+        Open::new(Kind::Tool, Src::Screen, Conf::Strong).under(run)
+    };
+    let p = log.open(open, at(ms)).expect("a step");
+    if close {
+        let c = if tx {
+            Close::new(Out::Step(StepOut::Ok), Src::Transcript, Conf::Strong)
+                .by(Actor::Vendor)
+                .dur_wall(5)
+        } else {
+            Close::new(Out::Step(StepOut::Ok), Src::Screen, Conf::Strong)
+        };
+        log.close(p, c, at(ms + 5)).expect("a close");
+    }
+    p
+}
+
+/// A refinement the transcript wrote (`tx`), or, for the base, an agent
+/// mark (a brief shows none) so the seqs agree.
+fn tx_amend(log: &mut Log, run: Node, tx: Option<(Node, Kind, Fields)>, ms: u64) {
+    match tx {
+        Some((node, kind, f)) => {
+            log.amend(
+                node,
+                Amend::new(kind, Src::Transcript, Conf::Exact, f).by(Actor::Vendor),
+                at(ms),
+            )
+            .expect("an amend");
+        }
+        None => {
+            log.mark(
+                Mark::new(Kind::Agent, Src::Screen, Conf::Strong).at(run),
+                at(ms),
+            )
+            .expect("an agent mark");
+        }
+    }
+}
+
+/// [`session`] with what a Claude Code transcript adds (`tx`): two tool
+/// steps in each turn, one of them amended `out=error`, each closed turn
+/// amended with its vendor duration and tokens, and three tool steps open
+/// in the open turn. The base takes as many records a brief never shows,
+/// so both name the same ids.
+fn tx_session(turns: u64, tx: bool) -> (Log, u64) {
+    let mut log = Log::new(2);
+    let run = agent_session(&mut log, 0);
+    log.mark(
+        Mark::new(Kind::Title, Src::Engine, Conf::Exact).fields(
+            Fields::new()
+                .text(Key::Title, "SECRET TITLE")
+                .expect("title"),
+        ),
+        at(1),
+    )
+    .expect("title");
+    let mut tr = TurnTracker::new(run);
+    let mut ms = 10;
+    for i in 0..turns {
+        for v in [
+            Verdict::Busy,
+            Verdict::Prompt(BoxWord::from_detail("bash:not-read-only")),
+            Verdict::Busy,
+        ] {
+            ms += 50;
+            tr.observe(&mut log, v, None, at(ms));
+        }
+        ms += 10;
+        tx_step(&mut log, run, tx, ms, true);
+        ms += 10;
+        let p = tx_step(&mut log, run, tx, ms, true);
+        ms += 10;
+        let out = tx.then(|| {
+            let f = Fields::new().word(Key::Out, "error").expect("out");
+            (p, Kind::Tool, f)
+        });
+        tx_amend(&mut log, run, out, ms);
+        if i % 3 == 0 {
+            log.mark(
+                Mark::new(Kind::Human, Src::Input, Conf::Strong).by(Actor::Human),
+                at(ms),
+            )
+            .expect("human");
+        }
+        if i + 1 < turns {
+            let turn = log.state().turn().expect("the turn").node;
+            ms += 50;
+            tr.observe(&mut log, Verdict::Idle, None, at(ms));
+            ms += 1000;
+            tr.tick(&mut log, at(ms));
+            let numbers = tx.then(|| {
+                let f = Fields::new()
+                    .u(Key::VdurMs, 900)
+                    .and_then(|f| f.u(Key::TokIn, 1200 + i))
+                    .and_then(|f| f.u(Key::TokOut, 300))
+                    .expect("numbers");
+                (turn, Kind::Turn, f)
+            });
+            tx_amend(&mut log, run, numbers, ms);
+        }
+    }
+    ms += 50;
+    tr.observe(
+        &mut log,
+        Verdict::Prompt(BoxWord::from_detail("edit")),
+        None,
+        at(ms),
+    );
+    for _ in 0..3 {
+        ms += 10;
+        tx_step(&mut log, run, tx, ms, false);
+    }
+    (log, WALL0 + ms + 40_000)
+}
+
+/// Ruling S15: what a transcript adds is shed before any line the brief
+/// held without it — its closed steps' lines and the open turn's open
+/// steps to the newest and a count first, then all of it — and with all
+/// of it shed the brief reads as it did without the transcript.
+#[test]
+fn the_transcript_sheds_before_what_the_brief_held_without_it() {
+    let (base, now) = tx_session(12, false);
+    let (with, _) = tx_session(12, true);
+    let body = |t: &str| t.lines().skip(1).map(str::to_string).collect::<Vec<_>>();
+    let id = |l: &str| l.split(' ').next().unwrap_or("").to_string();
+    let full = with.brief("s-1", 100_000, now);
+    let (mut collapsed, mut same, mut shed) = (0, 0, 0);
+    for budget in (0..=full.used + 40).rev() {
+        let b = base.brief("s-1", budget, now);
+        let w = with.brief("s-1", budget, now);
+        let (bl, wl) = (body(&b.text), body(&w.text));
+        if bl == wl {
+            same += 1;
+            if b.level > 0 {
+                shed += 1;
+            }
+            continue;
+        }
+        // Not as it read without the transcript: then it holds every line
+        // that did (a line by its id; a turn's carries the transcript's
+        // numbers), and something of the transcript's.
+        let ids: Vec<String> = wl.iter().map(|l| id(l)).collect();
+        for l in &bl {
+            assert!(
+                ids.contains(&id(l)),
+                "budget {budget}: {l:?} shed before the transcript's lines\nbase:\n{}\nwith:\n{}",
+                b.text,
+                w.text
+            );
+        }
+        assert!(
+            w.text.contains("tool shell") || w.text.contains("tok ↑"),
+            "budget {budget}: it differs by the transcript's lines: {}",
+            w.text
+        );
+        if w.text.contains(" · +2 open") {
+            collapsed += 1;
+        }
+    }
+    assert!(
+        full.text.contains("tok ↑") && full.text.contains("p3 tool shell error"),
+        "the transcript's lines show when they fit: {}",
+        full.text
+    );
+    assert!(
+        collapsed > 0,
+        "the open steps collapse to the newest and a count"
+    );
+    assert!(shed > 0, "past the transcript, the brief sheds as it did");
+    assert!(same > shed, "and reads as it did");
 }

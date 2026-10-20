@@ -46,7 +46,8 @@ use crate::store::is_hidden_subject;
 
 /// One escalation rule — see the module docs.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(clippy::derived_hash_with_manual_eq)]
+#[derive(Debug, Clone, Eq, Hash)]
 pub enum Escalate {
     /// Records whose subject matches this filter (hidden subjects excepted).
     Subject(String),
@@ -56,6 +57,19 @@ pub enum Escalate {
     PrincipalPrefix(String),
     /// Records carrying a consumer-group commit whose group matches this filter.
     Group(String),
+}
+
+impl PartialEq for Escalate {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Escalate::Subject(a), Escalate::Subject(b)) => a.as_str() == b.as_str(),
+            (Escalate::PrincipalPrefix(a), Escalate::PrincipalPrefix(b)) => {
+                a.as_str() == b.as_str()
+            }
+            (Escalate::Group(a), Escalate::Group(b)) => a.as_str() == b.as_str(),
+            _ => false,
+        }
+    }
 }
 
 /// An escalation table: the rules a log is opened with ([`OpenOptions`]), checked when
@@ -71,9 +85,11 @@ pub struct Escalation {
 impl Escalation {
     /// A table of `rules`.
     pub fn new(rules: impl IntoIterator<Item = Escalate>) -> Escalation {
-        Escalation {
-            rules: rules.into_iter().collect(),
+        let mut out = Vec::new();
+        for r in rules {
+            out.push(r);
         }
+        Escalation { rules: out }
     }
 
     /// The rules, in the order given.
@@ -90,19 +106,27 @@ impl Escalation {
 
     /// Parse every rule, refusing the first that is not one (`InvalidInput`, naming it).
     pub(crate) fn compile(&self) -> io::Result<Rules> {
-        let filter = |what: &str, raw: &str| {
-            Filter::new(raw).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("escalation rule {what}({raw:?}) is not a filter: {e:?}"),
-                )
-            })
-        };
         let mut rules = Rules::default();
         for rule in &self.rules {
             match rule {
-                Escalate::Subject(raw) => rules.subjects.push(filter("Subject", raw)?),
-                Escalate::Group(raw) => rules.groups.push(filter("Group", raw)?),
+                Escalate::Subject(raw) => match Filter::new(raw) {
+                    Ok(f) => rules.subjects.push(f),
+                    Err(e) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("escalation rule Subject({raw:?}) is not a filter: {e:?}"),
+                        ))
+                    }
+                },
+                Escalate::Group(raw) => match Filter::new(raw) {
+                    Ok(f) => rules.groups.push(f),
+                    Err(e) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("escalation rule Group({raw:?}) is not a filter: {e:?}"),
+                        ))
+                    }
+                },
                 Escalate::PrincipalPrefix(prefix) if prefix.is_empty() => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -130,7 +154,7 @@ pub(crate) struct Rules {
 
 impl Rules {
     /// How many rules the table holds.
-    pub(crate) fn count(&self) -> u16 {
+    pub(crate) const fn count(&self) -> u16 {
         self.count
     }
 
@@ -143,15 +167,32 @@ impl Rules {
         group: Option<&str>,
     ) -> bool {
         let visible = !is_hidden_subject(subject);
-        (visible && self.subjects.iter().any(|f| f.matches_str(subject)))
-            || (visible
-                && principal
-                    .is_some_and(|p| self.prefixes.iter().any(|x| p.starts_with(x.as_str()))))
-            || group.is_some_and(|g| self.groups.iter().any(|f| f.matches_str(g)))
+        if visible {
+            for f in &self.subjects {
+                if f.matches_str(subject) {
+                    return true;
+                }
+            }
+            if let Some(p) = principal {
+                for x in &self.prefixes {
+                    if p.starts_with(x.as_str()) {
+                        return true;
+                    }
+                }
+            }
+        }
+        if let Some(g) = group {
+            for f in &self.groups {
+                if f.matches_str(g) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Whether the table is empty (nothing to match, so staging skips the lookups).
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.count == 0
     }
 }

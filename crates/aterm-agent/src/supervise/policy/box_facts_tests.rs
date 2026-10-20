@@ -24,6 +24,7 @@ fn every_fact() -> BoxFacts {
     BoxFacts {
         program: Some("claude".to_string()),
         cwd: Some(PathBuf::from("/Users//owner/src/app")),
+        trusted_cwd: Some(PathBuf::from("/Users//owner/src/app")),
         bypass: true,
         limit_reset_passed: true,
         worker: Some(Ok(WorkerEnv::from_env(vec![
@@ -53,6 +54,8 @@ fn every_fact() -> BoxFacts {
             fell_back: true,
         }),
         box_call: Some("Bash".to_string()),
+        login_carry: true,
+        login_method: Some(aterm_phase::LoginMethod::Subscription),
     }
 }
 
@@ -80,6 +83,7 @@ fn facts_read_back_as_written() {
     assert!(needs.is_empty(), "{needs:?}");
     assert_eq!(written(&back), text);
     assert_eq!(back.cwd, facts.cwd);
+    assert_eq!(back.trusted_cwd, facts.trusted_cwd);
     assert_eq!(back.shell_cwds, facts.shell_cwds);
     let worker = back.worker.expect("read").expect("ok");
     assert_eq!(worker.pid(), Some(4242));
@@ -172,8 +176,20 @@ fn the_context_is_built_from_the_facts_and_the_policy() {
         Arc::new(LiveProbe),
     );
     assert!(!ctx.cwd_known);
+    assert_eq!(ctx.trusted_cwd, None);
     assert!(ctx.limit_reset);
     assert!(!ctx.answer_questions);
+    // `[harness] usage_credits` reaches the context as written, off by
+    // default and on where the policy says so; no fact moves it.
+    assert!(!ctx.usage_credits, "the subscription by default");
+    let credits = SupervisorConfig {
+        usage_credits: true,
+        ..config.clone()
+    };
+    for facts in [BoxFacts::default(), every_fact()] {
+        let on = ApprovalCtx::from(&credits, &env, &[], &facts, Arc::new(LiveProbe));
+        assert!(on.usage_credits, "{facts:?}");
+    }
     let facts = every_fact();
     let ctx = ApprovalCtx::from(
         &config,
@@ -184,8 +200,10 @@ fn the_context_is_built_from_the_facts_and_the_policy() {
     );
     assert!(ctx.cwd_known);
     assert_eq!(ctx.cwd, PathBuf::from("/Users//owner/src/app"));
+    assert_eq!(ctx.trusted_cwd, facts.trusted_cwd, "the starter's folder");
     assert!(ctx.bypass_mode);
     assert!(!ctx.limit_reset, "passed over at this mount");
+    assert!(!ctx.usage_credits, "no fact turns it on");
     assert!(ctx.answer_questions, "the session's word answers");
     assert_eq!(ctx.question_priority, QuestionPriority::LongTerm);
     assert_eq!(ctx.question_own, Some(QuestionPriority::ShortTerm));

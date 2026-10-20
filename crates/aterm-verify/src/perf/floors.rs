@@ -395,6 +395,87 @@ pub(crate) const ZSTD_LANE: FloorLane = FloorLane {
     cli: "zstd",
 };
 
+/// EFFECTS (docs/DESIGN-card-engine-2026-10-19.md, lane B0): what a frame of the rectangle
+/// effects costs on scripted scenes (the harness card's episode, the settled card under typing,
+/// the cursor glow under a typist, inline streaming that scrolls the card), through the real
+/// emitters, the CPU rasterizer and the GPU presenter. The keys mirror
+/// `aterm-bench/examples/effects_harness.rs`, which also reports every figure the gated lanes
+/// B5 and B6 are judged on (the pass-economy ablation's `pass_cost_pct`, `build_stage_pct`).
+///
+/// The floors are on the figures a shared desk's load does not move: the GPU time of each
+/// scene CALIBRATED against a reference full-repaint frame drawn in the same seconds (`_gpu_rel`,
+/// within 1.11x across invocations at loads of 17 to 93 on 14 cores, while the absolute GPU
+/// time is bimodal with the GPU's clock), and the CPU WORK per frame of the producer, the CPU
+/// raster and the GPU encode as instructions retired (`_per_ginsn`, frames per 10^9
+/// instructions, within 1.05x run to run). Time on the CPU, even the thread's own CPU time
+/// against the same reference, swung 1.55-1.75x between invocations at loads of 17 to 36 (the
+/// reference's 14.6 MB repaint follows the memory contention, the scenes' small kernels do
+/// not), which broke the same-box trend's 0.70; it is reported, not gated.
+pub(crate) const EFFECTS_LANE: FloorLane = FloorLane {
+    lane: "effects",
+    example: "effects_harness",
+    keys: &[
+        "episode_gpu_rel",
+        "settled_gpu_rel",
+        "typing_gpu_rel",
+        "scroll_gpu_rel",
+        "episode_emit_per_ginsn",
+        "episode_raster_per_ginsn",
+        "episode_encode_per_ginsn",
+        "settled_raster_per_ginsn",
+        "settled_encode_per_ginsn",
+        "typing_emit_per_ginsn",
+        "typing_raster_per_ginsn",
+        "typing_encode_per_ginsn",
+        "scroll_emit_per_ginsn",
+        "scroll_raster_per_ginsn",
+        "scroll_encode_per_ginsn",
+    ],
+    baseline_file: "perf-baseline-effects.json",
+    comment: "aterm EFFECTS baseline (docs/DESIGN-card-engine-2026-10-19.md lane B0): per scene \
+              (episode, settled, typing, scroll), the GPU time as a reference full-repaint \
+              frame's p50 over the scene's (_gpu_rel), and the CPU work of the producer, the \
+              CPU raster and the GPU encode as frames per 10^9 instructions retired \
+              (_per_ginsn). BIGGER-IS-BETTER. The absolute figures and the pass-economy \
+              ablation are in docs/measured/effects-baseline-2026-10-19.md. Re-record with \
+              targo --unverified verify perf --record effects.",
+    cli: "effects",
+};
+
+/// [`EFFECTS_LANE`]'s GPU keys alone: an arm with a GPU clock on a host with no instruction
+/// counter the harness reads (wgpu with timestamp queries off macOS).
+const EFFECTS_GPU_LANE: FloorLane = FloorLane {
+    keys: &[
+        "episode_gpu_rel",
+        "settled_gpu_rel",
+        "typing_gpu_rel",
+        "scroll_gpu_rel",
+    ],
+    ..EFFECTS_LANE
+};
+
+/// [`EFFECTS_LANE`]'s CPU work keys alone: an arm with no GPU clock (a device without
+/// timestamp queries) on a host that counts instructions.
+const EFFECTS_CPU_LANE: FloorLane = FloorLane {
+    keys: &[
+        "episode_emit_per_ginsn",
+        "episode_raster_per_ginsn",
+        "episode_encode_per_ginsn",
+        "settled_raster_per_ginsn",
+        "settled_encode_per_ginsn",
+        "typing_emit_per_ginsn",
+        "typing_raster_per_ginsn",
+        "typing_encode_per_ginsn",
+        "scroll_emit_per_ginsn",
+        "scroll_raster_per_ginsn",
+        "scroll_encode_per_ginsn",
+    ],
+    ..EFFECTS_LANE
+};
+
+/// The features the effects harness is built with: its pass-economy ablation is a dev seam.
+const EFFECTS_FEATURES: &[&str] = &["dev-seams"];
+
 /// The 42s-freeze-class ABSOLUTE fences. Unlike the ratio floors these hold on
 /// a fresh checkout with no baseline: a synchronous O(history) rewrap costs
 /// seconds, far past either cap, while the measured worsts (73 ms ring, 18.6 ms
@@ -470,8 +551,18 @@ fn write_baseline(path: &Path, text: &str) -> LaneRun {
 /// Run an `aterm-bench` example in release and return its JSON report (the
 /// last stdout line that starts with `{`).
 pub(crate) fn measure_example(example: &str) -> Result<Value, String> {
+    measure_example_with(example, &[])
+}
+
+/// [`measure_example`] with `aterm-bench` features on (a harness that needs a dev seam).
+fn measure_example_with(example: &str, features: &[&str]) -> Result<Value, String> {
     let driver = super::driver::cargo_driver()?;
-    let args = ["--release", "-q", "-p", "aterm-bench", "--example", example];
+    let features = features.join(",");
+    let mut args = vec!["--release", "-q", "-p", "aterm-bench"];
+    if !features.is_empty() {
+        args.extend(["--features", features.as_str()]);
+    }
+    args.extend(["--example", example]);
     eprintln!("  $ {}", driver.display("run", &args));
     let out = driver
         .command("run")
@@ -649,6 +740,86 @@ fn judge_crash_restore(json: &Value, record: bool) -> LaneRun {
     run
 }
 
+/// EFFECTS: the calibrated floors, judged on the keys the harness's GPU clock allows, after a
+/// host with no GPU skips. Every other key is the record.
+pub(crate) fn gate_effects(record: bool) -> LaneRun {
+    match measure_example_with(EFFECTS_LANE.example, EFFECTS_FEATURES) {
+        Ok(json) => judge_effects(&json, record),
+        Err(e) => LaneRun::fail(format!("could not measure: {e}")),
+    }
+}
+
+fn judge_effects(json: &Value, record: bool) -> LaneRun {
+    let (lane, missing) = match effects_lane(json, record) {
+        Ok(lane) => lane,
+        Err(run) => return run,
+    };
+    let mut run = judge_keyed(lane, json, record);
+    run.unjudged.extend(missing.map(str::to_string));
+    let reported = json.as_object().map_or(0, |o| o.len());
+    eprintln!(
+        "    UNGATED — {} more keys reported, not judged (the record: absolute costs, spreads, \
+         time against the reference, the ablation)",
+        reported.saturating_sub(lane.keys.len())
+    );
+    run
+}
+
+/// The lane that judges an effects report, and what this host could not measure for it; or the
+/// run that ends it before any baseline is read. The harness names its GPU clock (`metal`,
+/// `wgpu`, `none`) and its CPU counter (`instructions`, `none`): a host with no GPU skips, as
+/// does one with neither, a report that names either one not is refused, and only a host with
+/// both may record (half the keys would overwrite the committed floors of the other half and
+/// retire them).
+fn effects_lane(
+    json: &Value,
+    record: bool,
+) -> Result<(&'static FloorLane, Option<&'static str>), LaneRun> {
+    if let Some(why) = json.get("skip").and_then(Value::as_str) {
+        return Err(LaneRun::skip(
+            format!("the effects harness could not draw here: {why}"),
+            "run it on a host with a GPU",
+        ));
+    }
+    let named = |key: &str| json.get(key).and_then(Value::as_str);
+    let (Some(clock), Some(counter)) = (named("gpu_clock"), named("cpu_counter")) else {
+        return Err(LaneRun::fail(
+            "the harness report does not name its gpu_clock and cpu_counter; refusing to judge it",
+        ));
+    };
+    if !matches!(clock, "metal" | "wgpu" | "none") || !matches!(counter, "instructions" | "none") {
+        return Err(LaneRun::fail(format!(
+            "the harness report names an unsupported clock or counter ({clock}, {counter}); \
+             refusing to judge it"
+        )));
+    }
+    let (lane, missing) = match (clock != "none", counter != "none") {
+        (true, true) => (&EFFECTS_LANE, None),
+        (true, false) => (
+            &EFFECTS_GPU_LANE,
+            Some("effects CPU work (no instruction counter on this host)"),
+        ),
+        (false, true) => (
+            &EFFECTS_CPU_LANE,
+            Some("effects GPU time (this arm has no GPU clock)"),
+        ),
+        (false, false) => {
+            return Err(LaneRun::skip(
+                "this host has neither a GPU clock nor an instruction counter the effects \
+                 harness reads, so nothing it measured can be judged",
+                "run it on macOS (Metal's command-buffer clock and the cores' instruction counter)",
+            ));
+        }
+    };
+    if let Some(what) = missing.filter(|_| record) {
+        return Err(LaneRun::fail(format!(
+            "REFUSING to record — the baseline would lose the floors this host cannot judge \
+             ({what}); record on a host that has both (macOS)"
+        )));
+    }
+    Ok((lane, missing))
+}
+
 /// The tail tap's fence: a missing ratio is a breach (an unmeasured cost is not a small
 /// one).
 pub(crate) fn tail_tap_fence(json: &Value) -> Result<(), String> {
@@ -820,7 +991,7 @@ mod tests {
         assert!(compare_against_baseline(&path, &report(1234.5)).failed());
     }
 
-    const KEYED_LANES: [&FloorLane; 7] = [
+    const KEYED_LANES: [&FloorLane; 10] = [
         &PATHOLOGICAL_LANE,
         &SCROLL_LANE,
         &SEARCH_LANE,
@@ -828,6 +999,9 @@ mod tests {
         &RESIZE_LANE,
         &ZSTD_LANE,
         &CRASH_RESTORE_LANE,
+        &EFFECTS_LANE,
+        &EFFECTS_GPU_LANE,
+        &EFFECTS_CPU_LANE,
     ];
 
     fn keyed_line(lane: &FloorLane, scale: f64) -> Value {
@@ -1032,5 +1206,164 @@ mod tests {
             inverted,
             vec!["resize_ring_worst_ms", "resize_tiered_sync_worst_ms"]
         );
+    }
+
+    /// A synthetic value comfortably above the committed effects floors, so these
+    /// lane-selection checks do not depend on the measured costs of a frame.
+    const HEALTHY: f64 = 1e12;
+
+    /// An effects report: every key of `keys` at `value`, the clock and counter the harness
+    /// named, and a few of the ungated keys it reports beside them.
+    fn effects_report(
+        clock: Option<&str>,
+        counter: Option<&str>,
+        keys: &[&str],
+        value: f64,
+    ) -> Value {
+        let mut s = String::from("{");
+        if let Some(clock) = clock {
+            s.push_str(&format!("\"gpu_clock\":\"{clock}\","));
+        }
+        if let Some(counter) = counter {
+            s.push_str(&format!("\"cpu_counter\":\"{counter}\","));
+        }
+        for key in keys {
+            s.push_str(&format!("\"{key}\":{value:.3},"));
+        }
+        s.push_str("\"typing_encode_p50_us\":412.0,\"typing_pass_cost_pct\":6.1,\"runs\":5}");
+        json(&s)
+    }
+
+    /// The lane choice's verdict, as the lane's CLI name or the run's status.
+    fn chosen(json: &Value, record: bool) -> Result<(&'static str, Option<&'static str>), Status> {
+        effects_lane(json, record)
+            .map(|(lane, missing)| (lane.keys[0], missing))
+            .map_err(|run| run.status)
+    }
+
+    #[test]
+    fn an_effects_host_without_a_gpu_skips_and_names_why() {
+        let run = judge_effects(&json("{\"skip\":\"no Metal device\"}"), false);
+        match run.status {
+            Status::Skip { why, .. } => assert!(why.contains("no Metal device"), "{why}"),
+            other => panic!("a host without a GPU skips, got {other:?}"),
+        }
+    }
+
+    /// The partial lanes split the full one: every gated key is a GPU key or a CPU work key,
+    /// once.
+    #[test]
+    fn the_effects_partial_lanes_partition_the_full_one() {
+        let mut parts: Vec<&str> = EFFECTS_GPU_LANE
+            .keys
+            .iter()
+            .chain(EFFECTS_CPU_LANE.keys)
+            .copied()
+            .collect();
+        parts.sort_unstable();
+        let mut full = EFFECTS_LANE.keys.to_vec();
+        full.sort_unstable();
+        assert_eq!(parts, full);
+        assert!(
+            EFFECTS_GPU_LANE
+                .keys
+                .iter()
+                .all(|k| k.ends_with("_gpu_rel"))
+        );
+        assert!(
+            EFFECTS_CPU_LANE
+                .keys
+                .iter()
+                .all(|k| k.ends_with("_per_ginsn"))
+        );
+    }
+
+    /// A host judges what it can measure and names the rest unjudged: no GPU clock, the CPU
+    /// work keys; no instruction counter, the GPU keys; neither, a skip. Only a host with both
+    /// may record (asked of the lane choice, which reads and writes no baseline).
+    #[test]
+    fn an_effects_host_is_judged_on_what_it_measures_and_records_only_with_both() {
+        let full = effects_report(
+            Some("metal"),
+            Some("instructions"),
+            EFFECTS_LANE.keys,
+            HEALTHY,
+        );
+        assert_eq!(chosen(&full, false), Ok((EFFECTS_LANE.keys[0], None)));
+        assert_eq!(chosen(&full, true), Ok((EFFECTS_LANE.keys[0], None)));
+        assert!(!judge_effects(&full, false).failed());
+
+        let clockless = effects_report(
+            Some("none"),
+            Some("instructions"),
+            EFFECTS_CPU_LANE.keys,
+            HEALTHY,
+        );
+        let run = judge_effects(&clockless, false);
+        assert!(!run.failed(), "{run:?}");
+        assert!(
+            run.unjudged.iter().any(|u| u.contains("no GPU clock")),
+            "{run:?}"
+        );
+        assert!(
+            run.samples.iter().all(|t| t.metric.ends_with("_per_ginsn")),
+            "{run:?}"
+        );
+
+        let uncounted = effects_report(Some("wgpu"), Some("none"), EFFECTS_GPU_LANE.keys, HEALTHY);
+        let run = judge_effects(&uncounted, false);
+        assert!(!run.failed(), "{run:?}");
+        assert!(
+            run.unjudged
+                .iter()
+                .any(|u| u.contains("no instruction counter")),
+            "{run:?}"
+        );
+        assert!(
+            run.samples.iter().all(|t| t.metric.ends_with("_gpu_rel")),
+            "{run:?}"
+        );
+
+        for partial in [&clockless, &uncounted] {
+            match chosen(partial, true) {
+                Err(Status::Fail(f)) => assert!(f[0].starts_with("REFUSING to record"), "{f:?}"),
+                other => panic!("a partial host must not record, got {other:?}"),
+            }
+        }
+        let neither = effects_report(Some("none"), Some("none"), &[], HEALTHY);
+        assert!(matches!(chosen(&neither, false), Err(Status::Skip { .. })));
+    }
+
+    /// A full report is judged on every gated key: one missing, or a report that does not say
+    /// which clock or counter it read, is refused rather than judged on what is left.
+    #[test]
+    fn an_effects_report_names_its_clock_and_counter_and_carries_every_key() {
+        let full = effects_report(
+            Some("metal"),
+            Some("instructions"),
+            EFFECTS_LANE.keys,
+            HEALTHY,
+        );
+        for key in ["typing_gpu_rel", "scroll_encode_per_ginsn"] {
+            let mut partial = full.clone();
+            if let Some(o) = partial.as_object_mut() {
+                o.remove(key);
+            }
+            assert!(judge_effects(&partial, false).failed(), "{key}");
+        }
+        let no_clock = effects_report(None, Some("instructions"), EFFECTS_LANE.keys, HEALTHY);
+        assert!(judge_effects(&no_clock, false).failed());
+        let no_counter = effects_report(Some("metal"), None, EFFECTS_LANE.keys, HEALTHY);
+        assert!(judge_effects(&no_counter, false).failed());
+        for (clock, counter) in [
+            ("", "instructions"),
+            ("metla", "instructions"),
+            ("metal", ""),
+            ("metal", "cycles"),
+        ] {
+            let unknown = effects_report(Some(clock), Some(counter), EFFECTS_LANE.keys, HEALTHY);
+            assert!(judge_effects(&unknown, false).failed());
+            assert!(matches!(chosen(&unknown, true), Err(Status::Fail(_))));
+        }
     }
 }

@@ -30,17 +30,28 @@
 //! * A citation resolves only while the session is known to run HERE
 //!   (`App::resolve_citation`), read when it is asked. The program in front
 //!   must be one aterm has named for the group in front right now and knows
-//!   runs on this machine ([`runs_here`]: a shell, or an agent it identifies);
-//!   anything else in front (`ssh`, `mosh`, `tmux`, `sudo`, `docker exec`, a
-//!   pager, a name not resolved yet) offers no citation, so a remote or
-//!   multiplexed session needs no list of remote programs to be refused. The
-//!   shell's running command (`status detail=`) may not be a remote shell
-//!   either ([`is_remote_shell`]: the moment between a typed `exec ssh` and
-//!   the sweep's next naming). And the shell's OSC 7 report, while it stands
-//!   ([`report_stands`]: under the group in front when aterm first saw it),
-//!   must not name another host (`tab_label::names_this_machine`). What stays
-//!   open: text an earlier remote session left on the screen, read once a
-//!   local shell is back in front, resolves against this machine.
+//!   runs on this machine ([`runs_here`]: a shell alone in the group it leads
+//!   and still a shell by the kernel's name, or an agent it identifies);
+//!   anything else in front (`ssh`,
+//!   `mosh`, `tmux`, `sudo`, `docker exec`, a pager, a script whose shell
+//!   runs `ssh` in its own group, a name not resolved yet) offers no
+//!   citation, so a remote or multiplexed session needs no list of remote
+//!   programs to be refused. The session's root shell in front while its
+//!   integration says a command runs (an `exec`) is refused, and the shell's
+//!   running command (`status detail=`) may not be a remote shell either
+//!   ([`is_remote_shell`]). And the shell's OSC 7 report, while it stands
+//!   ([`report_stands`]: under the group in front when aterm first saw it,
+//!   in a sweep that saw that group in front before it too), must not name
+//!   another host (`tab_label::names_this_machine`, the whole name).
+//! * What stays open: text an earlier remote session left on the screen,
+//!   read once a local shell is back in front, resolves against this
+//!   machine. So does what an identified agent prints of a remote tool it
+//!   runs (Claude Code running `ssh prod cat …`), and a runtime (`node`,
+//!   `bun`) aterm identifies by its screen may be a
+//!   wrapper around a remote one: the agent is local, its output's paths
+//!   need not be. A displayed OSC 7501 report does not identify its writer
+//!   and grants no local citation. On Linux the kernel reader here cannot
+//!   establish a complete group census, so a shell offers no citation.
 //! * Text carrying a control, format or default-ignorable character never
 //!   resolves ([`hides_text`]), nor does a file whose real (symlink resolved)
 //!   name carries one or is not UTF-8: the caption could not show what it
@@ -58,8 +69,11 @@
 //!   `opens in aterm: <path>:<line>` (`link_target::path_caption_row`), the
 //!   resolved path, so a symlink's real target is what the band names. It is
 //!   named where it really is, `~/…` under home or else in full
-//!   ([`display`]), never relative to a directory the band does not show: two
-//!   captions that read alike name the same file.
+//!   ([`display`]), never relative to a directory the band does not show. A
+//!   name too long for the band is cut at its head (`…/src/main.rs:12`), so
+//!   two captions can read alike and name two projects' files; the press
+//!   compares the whole path the drawn caption named, so it opens only that
+//!   one.
 //! * The filesystem is never looked at on the UI thread ([`Looks`]): a look
 //!   runs on its own thread, the UI waits a moment for it, and an answer not
 //!   back by then is no link yet. A hung or slow mount, an automount or a
@@ -147,12 +161,14 @@ fn split_suffix(token: &str) -> (&str, Option<u32>, Option<u32>) {
 
 /// Whether `path` reads as a file path at all: it has a separator or an
 /// extension, and a letter or digit somewhere. Keeps ordinary words from
-/// costing a filesystem look on every hover.
+/// costing a filesystem look on every hover. On Windows a backslash is a
+/// separator too (`C:\proj\Makefile`, `src\main.rs`), as Windows programs
+/// print it.
 fn looks_like_path(path: &str) -> bool {
     if path.is_empty() || !path.chars().any(char::is_alphanumeric) {
         return false;
     }
-    if path.contains('/') {
+    if path.contains('/') || (cfg!(windows) && path.contains('\\')) {
         return true;
     }
     path.rsplit_once('.')
@@ -298,19 +314,68 @@ pub(crate) fn hides_text(text: &str) -> bool {
     false
 }
 
-/// Whether the program in front of a session, as the status sweep published
-/// it, is known to run on THIS machine, so the paths it prints name this
-/// machine's files: a shell (`quit_safety::is_shell_name`), or an agent aterm
-/// identifies (`harness_host::identified_agent`: by its own name, or a
-/// runtime like `node` by its screen). An allow-list by construction:
-/// anything else (a remote shell, a multiplexer whose panes may be remote, a
-/// wrapper that opens its own terminal, a program not named yet) is not
-/// known to, and offers no citation (`App::resolve_citation`).
-pub(crate) fn runs_here(front: &crate::session_timeline::AgentPublication) -> bool {
-    front.program.as_deref().is_some_and(|program| {
-        crate::quit_safety::is_shell_name(program)
-            || crate::harness_host::identified_agent(front).is_some()
-    })
+/// What [`runs_here`] reads of the program in front of a session, each fact
+/// read when the citation is asked (`App::resolve_citation`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Front<'a> {
+    /// The status sweep's published name for the group in front (`status
+    /// program=`, its leader's `argv[0]` word), believed only for that group.
+    pub(crate) program: Option<&'a str>,
+    /// The agent aterm identifies in front (`harness_host::identified_agent`:
+    /// by its own name, or a runtime like `node` by its screen).
+    pub(crate) agent: Option<aterm_phase::Program>,
+    /// The group in front is the session's own root shell's (its pid leads it).
+    pub(crate) root: bool,
+    /// The shell's integration says it is running a command (a block it opened
+    /// is executing, `quit_safety::shell_executing`, or `status detail=` names
+    /// one).
+    pub(crate) running: bool,
+}
+
+/// Whether the program in front of a session is known to run on THIS
+/// machine, so the paths it prints name this machine's files. An allow-list
+/// by construction: anything else (a remote shell, a multiplexer whose panes
+/// may be remote, a wrapper that opens its own terminal, a program not named
+/// yet) is not known to, and offers no citation (`App::resolve_citation`).
+///
+/// * A SHELL (`quit_safety::is_shell_name`) only when it is what the person
+///   types into: alone in the group it leads, and still a shell now
+///   (`lone_leader`, the kernel's name for the group's leader when no other
+///   process is in its group: `aterm_sysprobe::lone_group_leader`). A
+///   non-interactive shell (a script, `sh -c`) keeps every child it starts in
+///   its own group, so `./prod.sh` running `ssh prod` leads a group the ssh
+///   is in, and is refused; an interactive shell gives each job a group of
+///   its own, so at its prompt it is alone. The kernel's name moves the
+///   moment an `exec` replaces the shell (`exec tmux`, `exec docker exec …`),
+///   before the sweep names the new program. And the session's own root
+///   shell, in front while its integration says it runs a command (an
+///   `exec`, which no prompt follows), is refused.
+/// * An agent aterm identifies (`harness_host::identified_agent`).
+///
+/// A displayed OSC 7501 report identifies no writer: an unseen old report
+/// may cross a foreground move, so it grants no local citation to an
+/// otherwise unidentified runtime.
+///
+/// `lone_leader` is asked only of a shell.
+pub(crate) fn runs_here(front: &Front<'_>, lone_leader: impl FnOnce() -> Option<String>) -> bool {
+    let Some(program) = front.program else {
+        return false;
+    };
+    if crate::quit_safety::is_shell_name(program) {
+        return !(front.root && front.running)
+            && lone_leader().is_some_and(|name| crate::quit_safety::is_shell_name(&name));
+    }
+    front.agent.is_some()
+}
+
+/// [`runs_here`]'s shipping `lone_leader` (`SessionFactory::lone_leader`):
+/// the kernel's name for group `pgid`'s leader while it is alone in it
+/// (`aterm_sysprobe::lone_group_leader`), `None` for no group.
+pub(crate) fn lone_leader(pgid: i32) -> Option<String> {
+    u32::try_from(pgid)
+        .ok()
+        .filter(|pgid| *pgid > 0)
+        .and_then(aterm_sysprobe::lone_group_leader)
 }
 
 /// Whether the engine's cwd report `seq` (`Terminal::reported_cwd_seq`)
@@ -322,9 +387,12 @@ pub(crate) fn runs_here(front: &crate::session_timeline::AgentPublication) -> bo
 /// its directory is read. A report newer than the sweep's last look stands
 /// (it may be the remote's own: its host is read). A cwd a checkpoint
 /// carried (`None`) was made under a group this process never saw, and
-/// does not stand.
+/// does not stand, nor does one the sweep first saw as the front moved (held
+/// to no group, `0`: `SessionTimeline::witness_cwd_report`).
 pub(crate) fn report_stands(seq: Option<u64>, witness: Option<(u64, i32)>, front: i32) -> bool {
-    seq.is_some_and(|seq| witness.is_none_or(|(seen, group)| seen != seq || group == front))
+    seq.is_some_and(|seq| {
+        witness.is_none_or(|(seen, group)| seen != seq || (group > 0 && group == front))
+    })
 }
 
 /// The remote shells: a program in front by one of these names runs its
@@ -397,9 +465,11 @@ pub(crate) fn resolve(
     if hides_text(raw) {
         return Err(PathRefusal::Control);
     }
-    let candidates: Vec<PathBuf> = if raw == "~" || raw.starts_with("~/") {
+    // `~\…` is the same citation where a backslash separates (Windows).
+    let home_relative = raw.starts_with("~/") || (cfg!(windows) && raw.starts_with("~\\"));
+    let candidates: Vec<PathBuf> = if raw == "~" || home_relative {
         let home = home.ok_or(PathRefusal::Missing)?;
-        vec![home.join(raw.trim_start_matches('~').trim_start_matches('/'))]
+        vec![home.join(raw[1..].trim_start_matches(|c| c == '/' || (cfg!(windows) && c == '\\')))]
     } else if raw.starts_with('~') {
         return Err(PathRefusal::Missing);
     } else if Path::new(raw).is_absolute() {
@@ -649,7 +719,8 @@ impl Looks {
 
 /// The caption's name for a resolved file: relative to `base` when it lies
 /// under it (canonically, so `/tmp` and `/private/tmp` agree), else `~/…` under
-/// `home`, else absolute; then `:line[:col]`.
+/// `home` (`~\…` on Windows, in the separator the rest is written in), else
+/// absolute ([`plain_text`]); then `:line[:col]`.
 pub(crate) fn display(
     path: &Path,
     line: Option<u32>,
@@ -666,9 +737,32 @@ pub(crate) fn display(
     };
     let text = base
         .and_then(under)
-        .or_else(|| home.and_then(under).map(|rel| format!("~/{rel}")))
-        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        .or_else(|| {
+            home.and_then(under)
+                .map(|rel| format!("~{}{rel}", std::path::MAIN_SEPARATOR))
+        })
+        .unwrap_or_else(|| plain_text(path));
     with_line(text, line, col)
+}
+
+/// `path` as a person reads it. On Windows without the `\\?\` prefix
+/// `std::fs::canonicalize` puts on every path it resolves (`\\?\C:\x` reads
+/// `C:\x`, `\\?\UNC\host\share` reads `\\host\share`): no shell prints it,
+/// and the caption named every citation's file with it. Elsewhere the path
+/// as it is.
+fn plain_text(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) {
+        if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{share}");
+        }
+        if let Some(disk) = text.strip_prefix(r"\\?\")
+            && disk.as_bytes().get(1) == Some(&b':')
+        {
+            return disk.to_string();
+        }
+    }
+    text.into_owned()
 }
 
 /// `text` with `:line[:col]` after it.

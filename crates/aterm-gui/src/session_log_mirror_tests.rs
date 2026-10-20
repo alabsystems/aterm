@@ -1574,3 +1574,79 @@ fn the_gui_half_conformance_rejects_each_mutant_through_its_broken_handler() {
         assert_eq!(real.land(), "fenced");
     });
 }
+
+/// A request admitted on the old lane cannot land its old bus cursor after
+/// another incarnation replaces that bus. The replacement is placed exactly
+/// between admission and mutation, without a timing race or another thread.
+#[test]
+fn an_old_lanes_landing_cannot_advance_a_replacement_bus_log() {
+    crate::fabric::with_link_reset(|| {
+        let generation = mirroring();
+        let store = crate::session_store::new_store();
+        store.read().unwrap().mirror().set_served(true);
+        let h = session(&store, 1);
+        let first_log = format!("log {}.1", "0".repeat(32));
+        assert_eq!(
+            crate::fabric::cmd_link(&store, &first_log, Some(generation)),
+            "OK\n"
+        );
+        let (first, _) = slots(&cmd_log_take(&store, "", Some(generation)));
+        assert_eq!(
+            cmd_log_landed(&store, &landings(&first), Some(generation)),
+            "OK ok\n",
+            "CONTROL: the current lane lands normally"
+        );
+        commands(&h, 1);
+        let (owed, _) = slots(&cmd_log_take(&store, "", Some(generation)));
+        assert!(!owed.is_empty(), "an actual unlanded cursor");
+        let pair = landings(&owed);
+        let next = crate::fabric::next_bridge_generation();
+        let replacing = store.clone();
+        store.read().unwrap().mirror().arm_before_mutation(move || {
+            assert!(
+                crate::fabric::lane_owns(Some(generation)),
+                "old admission still held"
+            );
+            crate::fabric::bridge_attached(next);
+            let hello = crate::fabric::cmd_hello("lane=2 build=x log=turns", Some(next));
+            assert!(hello.trim_end().ends_with("log=turns"));
+            let other_log = format!("log {}.1", "1".repeat(32));
+            let reply = crate::fabric::cmd_link(&replacing, &other_log, Some(next));
+            assert!(
+                reply.contains(" forgot=1"),
+                "the actual bus log changed: {reply}"
+            );
+            forget_landed(&replacing);
+        });
+        let reply = cmd_log_landed(&store, &pair, Some(generation));
+        assert_eq!(
+            reply, "OK stale=1\n",
+            "OLD_LANE_MUST_NOT_LAND_ON_THE_REPLACEMENT_LOG"
+        );
+        let landed = h
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .slog_mut()
+            .mirror_log()
+            .mirror_landed();
+        assert_eq!(
+            landed.map(|at| at.ms),
+            Some(0),
+            "none of the new log was published"
+        );
+        let (fresh, _) = slots(&cmd_log_take(&store, "", Some(next)));
+        assert!(
+            fresh
+                .iter()
+                .any(|(_, at, body)| at.ms == 1 && !body.contains(" op=snap ")),
+            "the new log still receives the first record: {fresh:?}"
+        );
+        assert_eq!(
+            cmd_log_landed(&store, &landings(&fresh), Some(next)),
+            "OK ok\n",
+            "CONTROL: the new owning lane can then land it"
+        );
+    });
+}

@@ -34,8 +34,11 @@ test = false
 # `unsync` and `race` are always built. The implications are upstream's.
 # `critical-section`, `atomic-polyfill`, `parking_lot` and `portable-atomic` are
 # NOT declared: each changes upstream's implementation, so a consumer that asks
-# for one fails to resolve instead of silently getting this one.
-default = ["std"]
+# for one fails to resolve instead of silently getting this one. No `default`
+# key (upstream's is `std`): an inert default still forked the build, since a
+# `--workspace` build selects this member with it and the shipped graph's
+# consumers (rustls) turn defaults off, so the two compiled two once_cells and
+# everything above them (P4).
 std = ["alloc"]
 alloc = ["race"]
 race = []

@@ -223,6 +223,7 @@ mod tests {
         probes: std::sync::Mutex<Vec<Probe>>,
         applies: Arc<AtomicU32>,
         apply_result: Result<(), String>,
+        family: &'static str,
     }
 
     impl Scripted {
@@ -231,6 +232,7 @@ mod tests {
                 probes: std::sync::Mutex::new(probes),
                 applies: Arc::new(AtomicU32::new(0)),
                 apply_result,
+                family: "test",
             }
         }
     }
@@ -240,7 +242,7 @@ mod tests {
             "test.scripted".into()
         }
         fn family(&self) -> &'static str {
-            "test"
+            self.family
         }
         fn title(&self) -> String {
             "scripted".into()
@@ -344,6 +346,30 @@ mod tests {
         assert_eq!(row.outcome, Outcome::Unknown);
         assert_eq!(applies, 0);
         assert!(row.outcome.is_failure());
+    }
+
+    #[test]
+    fn a_reading_a_user_could_not_make_stays_unknown_with_its_own_reason() {
+        // `here plan` as a user: `socketfilterfw --get…` answers root or not (firewall.rs),
+        // so a garbled read is reported as it is, never as a missing privilege.
+        let mut user = Fake::root();
+        user.euid = 501;
+        let item = Scripted {
+            family: "firewall",
+            ..Scripted::new(
+                vec![Probe::Unusable {
+                    why: "socketfilterfw printed nothing".into(),
+                }],
+                Ok(()),
+            )
+        };
+        let items: Vec<Box<dyn Item>> = vec![Box::new(item)];
+        let rows = run(&items, Mode::Plan, &user, &ctx(), &mut NoJournal);
+        assert_eq!(rows[0].outcome, Outcome::Unknown);
+        assert_eq!(
+            rows[0].why.as_deref(),
+            Some("socketfilterfw printed nothing")
+        );
     }
 
     /// An item with a fixed id, outcome-by-probe, and prerequisites.

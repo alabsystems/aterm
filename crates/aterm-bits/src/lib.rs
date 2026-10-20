@@ -309,6 +309,177 @@ pub fn bytes_of<T: Pod>(value: &T) -> &[u8] {
 }
 
 // ---------------------------------------------------------------------------
+// Verified const fn POD layout & cast wire codecs
+// ---------------------------------------------------------------------------
+
+/// Wire size in bytes of an encoded POD layout descriptor (`"PODL"`).
+pub const POD_LAYOUT_WIRE_BYTES: usize = 16;
+
+/// Wire size in bytes of an encoded POD cast outcome descriptor (`"PODC"`).
+pub const POD_CAST_WIRE_BYTES: usize = 16;
+
+/// Pure `const fn` validation of a slice cast's size and alignment parameters.
+///
+/// Returns `Ok(out_len)` when a source slice of `src_byte_len` bytes at
+/// address `src_addr` with element size `a_size` can be soundly cast to a
+/// slice of elements with size `b_size` and alignment `b_align` (a non-zero
+/// power of two).
+///
+/// # Errors
+///
+/// Returns [`PodCastError`] under the exact same conditions as [`try_cast_slice`].
+#[inline]
+pub const fn validate_pod_cast_params(
+    src_byte_len: usize,
+    src_addr: usize,
+    a_size: usize,
+    b_size: usize,
+    b_align: usize,
+) -> Result<usize, PodCastError> {
+    if a_size == 0 || b_size == 0 {
+        if a_size == b_size {
+            return Ok(0);
+        }
+        return Err(PodCastError::SizeMismatch);
+    }
+    if b_align == 0 || !src_addr.is_multiple_of(b_align) {
+        return Err(PodCastError::TargetAlignmentGreaterAndInputNotAligned);
+    }
+    if !src_byte_len.is_multiple_of(b_size) {
+        return Err(PodCastError::OutputSliceWouldHaveSlop);
+    }
+    Ok(src_byte_len / b_size)
+}
+
+/// Encode a 16-byte POD layout wire descriptor (`"PODL"` + `elem_size`,
+/// `elem_align`, `elem_count` in little-endian `u32`).
+#[inline]
+#[must_use]
+pub const fn encode_pod_layout_wire(
+    elem_size: u32,
+    elem_align: u32,
+    elem_count: u32,
+) -> [u8; POD_LAYOUT_WIRE_BYTES] {
+    [
+        b'P',
+        b'O',
+        b'D',
+        b'L',
+        elem_size as u8,
+        (elem_size >> 8) as u8,
+        (elem_size >> 16) as u8,
+        (elem_size >> 24) as u8,
+        elem_align as u8,
+        (elem_align >> 8) as u8,
+        (elem_align >> 16) as u8,
+        (elem_align >> 24) as u8,
+        elem_count as u8,
+        (elem_count >> 8) as u8,
+        (elem_count >> 16) as u8,
+        (elem_count >> 24) as u8,
+    ]
+}
+
+/// Decode a 16-byte POD layout wire descriptor produced by
+/// [`encode_pod_layout_wire`].
+///
+/// Rejects descriptors whose alignment is zero or not a power of two.
+#[inline]
+#[must_use]
+pub const fn decode_pod_layout_wire(bytes: &[u8]) -> Option<(u32, u32, u32)> {
+    if bytes.len() < POD_LAYOUT_WIRE_BYTES {
+        return None;
+    }
+    if bytes[0] != b'P' || bytes[1] != b'O' || bytes[2] != b'D' || bytes[3] != b'L' {
+        return None;
+    }
+    let elem_size = (bytes[4] as u32)
+        | ((bytes[5] as u32) << 8)
+        | ((bytes[6] as u32) << 16)
+        | ((bytes[7] as u32) << 24);
+    let elem_align = (bytes[8] as u32)
+        | ((bytes[9] as u32) << 8)
+        | ((bytes[10] as u32) << 16)
+        | ((bytes[11] as u32) << 24);
+    let elem_count = (bytes[12] as u32)
+        | ((bytes[13] as u32) << 8)
+        | ((bytes[14] as u32) << 16)
+        | ((bytes[15] as u32) << 24);
+    if elem_align == 0 || (elem_align & (elem_align - 1)) != 0 {
+        return None;
+    }
+    Some((elem_size, elem_align, elem_count))
+}
+
+/// Encode a 16-byte POD cast outcome wire descriptor (`"PODC"`).
+#[inline]
+#[must_use]
+pub const fn encode_pod_cast_wire(
+    src_byte_len: u32,
+    dst_elem_size: u32,
+    dst_align: u16,
+    err: Option<PodCastError>,
+) -> [u8; POD_CAST_WIRE_BYTES] {
+    let code = match err {
+        None => 0u8,
+        Some(PodCastError::TargetAlignmentGreaterAndInputNotAligned) => 1u8,
+        Some(PodCastError::OutputSliceWouldHaveSlop) => 2u8,
+        Some(PodCastError::SizeMismatch) => 3u8,
+    };
+    [
+        b'P',
+        b'O',
+        b'D',
+        b'C',
+        src_byte_len as u8,
+        (src_byte_len >> 8) as u8,
+        (src_byte_len >> 16) as u8,
+        (src_byte_len >> 24) as u8,
+        dst_elem_size as u8,
+        (dst_elem_size >> 8) as u8,
+        (dst_elem_size >> 16) as u8,
+        (dst_elem_size >> 24) as u8,
+        dst_align as u8,
+        (dst_align >> 8) as u8,
+        code,
+        0,
+    ]
+}
+
+/// Decode a 16-byte POD cast outcome wire descriptor produced by
+/// [`encode_pod_cast_wire`].
+#[inline]
+#[must_use]
+pub const fn decode_pod_cast_wire(bytes: &[u8]) -> Option<(u32, u32, u16, Option<PodCastError>)> {
+    if bytes.len() < POD_CAST_WIRE_BYTES {
+        return None;
+    }
+    if bytes[0] != b'P' || bytes[1] != b'O' || bytes[2] != b'D' || bytes[3] != b'C' {
+        return None;
+    }
+    if bytes[15] != 0 {
+        return None;
+    }
+    let err = match bytes[14] {
+        0 => None,
+        1 => Some(PodCastError::TargetAlignmentGreaterAndInputNotAligned),
+        2 => Some(PodCastError::OutputSliceWouldHaveSlop),
+        3 => Some(PodCastError::SizeMismatch),
+        _ => return None,
+    };
+    let src_byte_len = (bytes[4] as u32)
+        | ((bytes[5] as u32) << 8)
+        | ((bytes[6] as u32) << 16)
+        | ((bytes[7] as u32) << 24);
+    let dst_elem_size = (bytes[8] as u32)
+        | ((bytes[9] as u32) << 8)
+        | ((bytes[10] as u32) << 16)
+        | ((bytes[11] as u32) << 24);
+    let dst_align = (bytes[12] as u16) | ((bytes[13] as u16) << 8);
+    Some((src_byte_len, dst_elem_size, dst_align, err))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -414,7 +585,39 @@ mod tests {
         let src: [u32; 0] = [];
         let bytes: &[u8] = cast_slice(&src);
         assert!(bytes.is_empty());
-        let back: &[u32] = try_cast_slice(bytes).expect("empty slice");
+        let back: &[f32] = try_cast_slice(bytes).expect("empty slice");
         assert!(back.is_empty());
+    }
+
+    #[test]
+    fn pod_layout_and_cast_wire_roundtrip() {
+        assert_eq!(validate_pod_cast_params(16, 0x1000, 1, 4, 4), Ok(4));
+        assert_eq!(
+            validate_pod_cast_params(14, 0x1000, 1, 4, 4),
+            Err(PodCastError::OutputSliceWouldHaveSlop)
+        );
+        assert_eq!(
+            validate_pod_cast_params(16, 0x1002, 1, 4, 4),
+            Err(PodCastError::TargetAlignmentGreaterAndInputNotAligned)
+        );
+        assert_eq!(
+            validate_pod_cast_params(0, 0x1000, 0, 4, 4),
+            Err(PodCastError::SizeMismatch)
+        );
+
+        let lw = encode_pod_layout_wire(16, 8, 1024);
+        assert_eq!(decode_pod_layout_wire(&lw), Some((16, 8, 1024)));
+        let bad_align = encode_pod_layout_wire(16, 3, 1024);
+        assert!(decode_pod_layout_wire(&bad_align).is_none());
+
+        for err in [
+            None,
+            Some(PodCastError::TargetAlignmentGreaterAndInputNotAligned),
+            Some(PodCastError::OutputSliceWouldHaveSlop),
+            Some(PodCastError::SizeMismatch),
+        ] {
+            let cw = encode_pod_cast_wire(64, 8, 8, err);
+            assert_eq!(decode_pod_cast_wire(&cw), Some((64, 8, 8, err)));
+        }
     }
 }

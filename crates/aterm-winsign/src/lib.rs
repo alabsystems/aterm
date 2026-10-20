@@ -91,6 +91,14 @@ pub enum Tier {
     },
 }
 
+impl Tier {
+    /// Return `true` when Tier WINDOWS is active (`Tier::Active { .. }`).
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        matches!(self, Self::Active { .. })
+    }
+}
+
 /// The tier the committed anchor selects.
 #[must_use]
 pub fn tier() -> Tier {
@@ -126,6 +134,70 @@ pub struct Ran {
     pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+}
+
+impl Ran {
+    /// Return `true` when the command exited with code `0`.
+    #[must_use]
+    pub const fn succeeded(&self) -> bool {
+        matches!(self.code, Some(0))
+    }
+}
+
+/// Return `true` when `len` is the expected 40-hex-character SHA-1 certificate thumbprint length.
+#[must_use]
+pub const fn is_valid_sha1_thumbprint_len(len: usize) -> bool {
+    len == 40
+}
+
+/// Encode an Authenticode verification summary (`publisher_hash`, `exit_code`, `flags`) into 16 LE bytes.
+#[must_use]
+pub const fn encode_winsign_summary_le(
+    publisher_hash: u64,
+    exit_code: i32,
+    flags: u32,
+) -> [u8; 16] {
+    let code = exit_code as u32;
+    [
+        publisher_hash as u8,
+        (publisher_hash >> 8) as u8,
+        (publisher_hash >> 16) as u8,
+        (publisher_hash >> 24) as u8,
+        (publisher_hash >> 32) as u8,
+        (publisher_hash >> 40) as u8,
+        (publisher_hash >> 48) as u8,
+        (publisher_hash >> 56) as u8,
+        code as u8,
+        (code >> 8) as u8,
+        (code >> 16) as u8,
+        (code >> 24) as u8,
+        flags as u8,
+        (flags >> 8) as u8,
+        (flags >> 16) as u8,
+        (flags >> 24) as u8,
+    ]
+}
+
+/// Decode 16 LE bytes into an Authenticode verification summary (`publisher_hash`, `exit_code`, `flags`).
+#[must_use]
+pub const fn decode_winsign_summary_le(bytes: [u8; 16]) -> (u64, i32, u32) {
+    let publisher_hash = (bytes[0] as u64)
+        | ((bytes[1] as u64) << 8)
+        | ((bytes[2] as u64) << 16)
+        | ((bytes[3] as u64) << 24)
+        | ((bytes[4] as u64) << 32)
+        | ((bytes[5] as u64) << 40)
+        | ((bytes[6] as u64) << 48)
+        | ((bytes[7] as u64) << 56);
+    let code = (bytes[8] as u32)
+        | ((bytes[9] as u32) << 8)
+        | ((bytes[10] as u32) << 16)
+        | ((bytes[11] as u32) << 24);
+    let flags = (bytes[12] as u32)
+        | ((bytes[13] as u32) << 8)
+        | ((bytes[14] as u32) << 16)
+        | ((bytes[15] as u32) << 24);
+    (publisher_hash, code as i32, flags)
 }
 
 /// Everything this tool needs from the machine, behind one trait so every

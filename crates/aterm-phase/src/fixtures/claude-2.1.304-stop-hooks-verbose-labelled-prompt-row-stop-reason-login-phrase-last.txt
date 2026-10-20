@@ -1,0 +1,23 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · under `claude --verbose`, two Stop hooks: a prompt-type hook whose prompt opens with a label ('Review: check that the work is done.', the stub answering every request {"ok": true}) and a command hook printing {"continue": false, "stopReason": "Not logged in · Please run /login"}: the stopReason the last thing said, right under the prompt's row `⎿  Review: …`
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ hello there
+
+⏺ {"ok": true}
+
+⏺ Ran 2 stop hooks
+  ⎿  /tmp/at.0000/proj/sr.sh
+  ⎿  Review: check that the work is done.
+  ⎿  Not logged in · Please run /login
+
+✻ Sautéed for 0s · done 5:47 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts                                                                                              12594 tokens

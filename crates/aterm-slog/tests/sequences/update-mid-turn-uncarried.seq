@@ -1,0 +1,20 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# §5.2: an update that carried nothing: the successor's log starts after a
+# gap why=handoff, its ids going on (the next run r2, the next turn t2); the
+# old turn is never closed by it, and its need is gone.
+see busy
+see prompt bash:not-read-only
+handoff uncarried
+expect gap - gap why=handoff epoch=1
+expect open - spawn
+expect open - adopt by=aterm
+expect open r1 agent agent=claude
+expect open r2 agent agent=claude
+expect turn=none
+expect need=none
+see busy
+expect open t1 turn
+expect open t2 turn par=r2
+see idle
+wait 1000
+expect close t2 turn out=done

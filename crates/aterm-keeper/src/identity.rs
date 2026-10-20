@@ -62,16 +62,19 @@ pub const CODE_CHECK_HANG: Duration = Duration::from_secs(60);
 /// honest slow check is never cut into a refused dial. It is also the check's suspect age, no
 /// shorter than a TLS evaluation's (`aterm-http`'s five seconds), so a slow peer check never
 /// makes the process's certificate checks refuse. Not a minute, because the keeper's accept loop
-/// and the window's boot dial wait on it in line.
+/// and the window's boot dial wait on it in line; a caller that does not
+/// ([`Identity::start_check_named`]) waits for the check's answer as long as it chooses.
 pub const PEER_CHECK_HANG: Duration = Duration::from_secs(10);
 
 /// The words for a check `trustd` did not answer — at its deadline, or at once
 /// because an earlier check (of any kind, sharing the gate) is overdue — so
 /// they claim no wait.
-#[cfg(target_vendor = "apple")]
 fn unanswered(what: &str) -> String {
     format!("macOS's code-signing service (trustd) is not answering; {what} was not checked")
 }
+
+/// What the peer check names when it has no answer of its own.
+const THE_PEERS_CODE: &str = "the peer's code";
 
 /// Why [`through_trust_gate`] has no answer, in words that name the cause.
 #[cfg(target_vendor = "apple")]
@@ -102,15 +105,92 @@ fn through_trust_gate<T: Send + 'static>(
     what: &str,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, GateRefusal> {
-    use aterm_uds::deadline::{Refused, TRUST};
-    TRUST
+    aterm_uds::deadline::TRUST
         .run(suspect, deadline, work)
-        .map_err(|refused| match refused {
-            Refused::Unanswered => GateRefusal::Unanswered(unanswered(what)),
-            Refused::Failed(why) => {
-                GateRefusal::Failed(format!("the check of {what} could not run: {why}"))
+        .map_err(|refused| gate_refusal(refused, what))
+}
+
+/// The gate's `refused`, for a check of `what`, in words that name the cause.
+#[cfg(target_vendor = "apple")]
+fn gate_refusal(refused: aterm_uds::deadline::Refused, what: &str) -> GateRefusal {
+    use aterm_uds::deadline::Refused;
+    match refused {
+        Refused::Unanswered => GateRefusal::Unanswered(unanswered(what)),
+        Refused::Failed(why) => {
+            GateRefusal::Failed(format!("the check of {what} could not run: {why}"))
+        }
+    }
+}
+
+/// The gate's `refused` of a peer check, as the check's error.
+#[cfg(target_vendor = "apple")]
+fn peer_refusal(refused: aterm_uds::deadline::Refused) -> CheckError {
+    match gate_refusal(refused, THE_PEERS_CODE) {
+        GateRefusal::Unanswered(why) => CheckError::Unanswered(why),
+        GateRefusal::Failed(why) => CheckError::Unchecked(why),
+    }
+}
+
+/// A peer check [`Identity::start_check_named`] began, its wait on `trustd` left to the caller:
+/// for one that watches other things while `trustd` takes its time, and keeps waiting for this
+/// check rather than abandoning it and asking again (the update handoff's rendezvous, which
+/// holds its dialer meanwhile).
+#[derive(Debug)]
+pub struct PeerCheck(PeerCheckState);
+
+#[derive(Debug)]
+enum PeerCheckState {
+    /// Settled without waiting on `trustd`: the uid floor, a peer the kernel did not name, a
+    /// gate that refused at once, or no code requirement in force.
+    Settled(Result<(), CheckError>),
+    /// Waiting on `trustd`.
+    #[cfg(target_vendor = "apple")]
+    Waiting(aterm_uds::deadline::Pending<Result<(), CheckError>>),
+}
+
+impl PeerCheck {
+    fn settled(answer: Result<(), CheckError>) -> Self {
+        Self(PeerCheckState::Settled(answer))
+    }
+
+    /// `work`, a peer check, started through the process's `trustd` gate with `suspect` as its
+    /// suspect age: [`Identity::start_check_named`]'s, and a test's stand-in for `trustd` in
+    /// its place. Unanswered at once while an earlier check through the gate is overdue.
+    #[cfg(target_vendor = "apple")]
+    pub fn start(
+        suspect: Duration,
+        work: impl FnOnce() -> Result<(), CheckError> + Send + 'static,
+    ) -> Self {
+        match aterm_uds::deadline::TRUST.start(suspect, work) {
+            Ok(pending) => Self(PeerCheckState::Waiting(pending)),
+            Err(refused) => Self::settled(Err(peer_refusal(refused))),
+        }
+    }
+
+    /// The check's answer, if it comes within `within`.
+    ///
+    /// # Errors
+    /// The check itself, still waiting, while `trustd` has not answered it.
+    pub fn wait(self, within: Duration) -> Result<Result<(), CheckError>, Self> {
+        match self.0 {
+            PeerCheckState::Settled(answer) => {
+                let _ = within;
+                Ok(answer)
             }
-        })
+            #[cfg(target_vendor = "apple")]
+            PeerCheckState::Waiting(pending) => match pending.wait(within) {
+                Ok(answer) => Ok(answer.unwrap_or_else(|refused| Err(peer_refusal(refused)))),
+                Err(still) => Err(Self(PeerCheckState::Waiting(still))),
+            },
+        }
+    }
+
+    /// What this check says while `trustd` has not answered it: [`CheckError::Unanswered`]'s
+    /// words.
+    #[must_use]
+    pub fn unanswered(&self) -> String {
+        unanswered(THE_PEERS_CODE)
+    }
 }
 
 /// Which identity a peer must prove.
@@ -304,46 +384,72 @@ impl Identity {
         token: Option<aterm_uds::peer::AuditToken>,
         within: Duration,
     ) -> Result<(), CheckError> {
+        let hang = within.max(PEER_CHECK_HANG);
+        self.begin_check(stream, token, hang)
+            .wait(hang)
+            .unwrap_or_else(|check| Err(CheckError::Unanswered(check.unanswered())))
+    }
+
+    /// [`Self::check_named`] started, its wait on `trustd` left to the caller
+    /// ([`PeerCheck::wait`]); its suspect age in the process's `trustd` gate is
+    /// [`PEER_CHECK_HANG`], so a check that outlives it refuses the gate's other calls
+    /// meanwhile, as one of `check_named` does.
+    #[must_use]
+    pub fn start_check_named(
+        &self,
+        stream: &CtlStream,
+        token: Option<aterm_uds::peer::AuditToken>,
+    ) -> PeerCheck {
+        self.begin_check(stream, token, PEER_CHECK_HANG)
+    }
+
+    /// The peer check, its code check (if one is in force) started through the process's
+    /// `trustd` gate with `suspect` as its suspect age.
+    fn begin_check(
+        &self,
+        stream: &CtlStream,
+        token: Option<aterm_uds::peer::AuditToken>,
+        suspect: Duration,
+    ) -> PeerCheck {
         #[cfg(unix)]
         {
             let ours = aterm_uds::peer::our_uid();
             match aterm_uds::peer::peer_uid(stream) {
                 Some(uid) if uid == ours => {}
                 Some(uid) => {
-                    return Err(CheckError::Refused(format!("peer uid {uid} is not ours")));
+                    return PeerCheck::settled(Err(CheckError::Refused(format!(
+                        "peer uid {uid} is not ours"
+                    ))));
                 }
                 None => {
-                    return Err(CheckError::Unchecked(
+                    return PeerCheck::settled(Err(CheckError::Unchecked(
                         "the kernel did not name the peer's uid".to_string(),
-                    ));
+                    )));
                 }
             }
         }
         #[cfg(not(unix))]
         {
-            let _ = (stream, token, within);
-            return Err(CheckError::Unchecked("the keeper is Unix-only".to_string()));
+            let _ = (stream, token, suspect);
+            return PeerCheck::settled(Err(CheckError::Unchecked(
+                "the keeper is Unix-only".to_string(),
+            )));
         }
         #[cfg(target_vendor = "apple")]
         if let Some(req) = &self.requirement {
-            let token = token.ok_or_else(|| {
-                CheckError::Unchecked("the kernel did not give the peer's audit token".to_string())
-            })?;
+            let Some(token) = token else {
+                return PeerCheck::settled(Err(CheckError::Unchecked(
+                    "the kernel did not give the peer's audit token".to_string(),
+                )));
+            };
             let req = Arc::clone(req);
-            let hang = within.max(PEER_CHECK_HANG);
-            through_trust_gate(hang, hang, "the peer's code", move || {
-                sec::check_guest(&token, &req)
-            })
-            .map_err(|refused| match refused {
-                GateRefusal::Unanswered(why) => CheckError::Unanswered(why),
-                GateRefusal::Failed(why) => CheckError::Unchecked(why),
-            })??;
+            return PeerCheck::start(suspect, move || sec::check_guest(&token, &req));
         }
-        // Off Apple nothing judges the code, so neither the deadline nor the token is read.
+        // Off Apple nothing judges the code, so neither the suspect age nor the token is read.
         #[cfg(all(unix, not(target_vendor = "apple")))]
-        let _ = (within, token);
+        let _ = (suspect, token);
         #[allow(unreachable_code)]
-        Ok(())
+        PeerCheck::settled(Ok(()))
     }
 }
 
@@ -691,7 +797,7 @@ mod tests {
     #[test]
     fn a_process_satisfies_its_own_requirement() {
         // An ad-hoc build's check needs no `trustd`, but every check shares the gate.
-        crate::require_trust_service();
+        aterm_uds::deadline::require_trust_service();
         let id = Identity::for_self(IdentityPolicy::Designated).expect("own requirement");
         assert!(
             id.describe().starts_with("designated requirement: "),
@@ -711,7 +817,7 @@ mod tests {
     /// same pid) and no token at all are `Unchecked`, never a pass, under a requirement.
     #[test]
     fn a_held_token_is_checked_as_the_process_it_named() {
-        crate::require_trust_service();
+        aterm_uds::deadline::require_trust_service();
         let id = Identity::for_self(IdentityPolicy::Designated).expect("own requirement");
         let (a, _b) = CtlStream::pair().expect("pair");
         let token = aterm_uds::peer::peer_audit_token(&a).expect("the kernel names the peer");
@@ -740,7 +846,7 @@ mod tests {
     /// one byte changed do not; the same-uid floor admits any.
     #[test]
     fn code_on_disk_is_checked_against_the_requirement() {
-        crate::require_trust_service();
+        aterm_uds::deadline::require_trust_service();
         let id = Identity::for_self(IdentityPolicy::Designated).expect("own requirement");
         let exe = std::env::current_exe().expect("test binary");
         answered(id.admits_code_at(&exe)).expect("this binary meets its own requirement");
@@ -768,7 +874,7 @@ mod tests {
     /// unchecked, and text that is no requirement is refused when compiled.
     #[test]
     fn a_stated_requirement_refuses_code_that_does_not_meet_it() {
-        crate::require_trust_service();
+        aterm_uds::deadline::require_trust_service();
         let id = Identity::for_requirement(
             "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and \
              certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate \
@@ -795,7 +901,7 @@ mod tests {
     /// same process against `/usr/bin/true`'s code is refused. Unsigned code has no requirement.
     #[test]
     fn the_code_at_a_path_admits_exactly_its_own_processes() {
-        crate::require_trust_service();
+        aterm_uds::deadline::require_trust_service();
         let exe = std::env::current_exe().expect("test binary");
         let own = Identity::for_code_at(&exe).expect("this binary's requirement");
         assert!(
@@ -826,7 +932,7 @@ mod tests {
     /// check and passes the floor.
     #[test]
     fn another_program_fails_the_designated_check() {
-        crate::require_trust_service();
+        aterm_uds::deadline::require_trust_service();
         let dir = std::env::temp_dir().join(format!("akid-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("s");

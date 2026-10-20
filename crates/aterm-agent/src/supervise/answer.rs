@@ -656,7 +656,12 @@ impl<C: Ctl> Session<'_, C> {
         // digit path requires both stamps from this judged read and never
         // retries by dropping either one.
         let why = match self
-            .press_one_guarded(&digit.guard, &digit.n.to_string(), screen)
+            .press_one_guarded(
+                &digit.guard,
+                &digit.n.to_string(),
+                screen,
+                super::super::policy::KeyAct::Answer,
+            )
             .map_err(fail_text)?
         {
             Pressing::Done(Press::Pressed { seq }) => {
@@ -759,6 +764,7 @@ impl<C: Ctl> Session<'_, C> {
                     &focus.guard,
                     &screen,
                     Some(person),
+                    Some(super::super::policy::KeyAct::Answer),
                 )
                 .map_err(fail_text)?
             {

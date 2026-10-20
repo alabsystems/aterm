@@ -81,7 +81,7 @@ impl AdmissionRecord {
     /// another row and the caret came to rest on or left of the lay with no
     /// key behind the move (`CursorGlow`'s torn lay).
     pub const LICENCE_RECALL: &'static str = "recall";
-    /// Ring token: a move the classic wake (Classic, Classic mono) lit. That
+    /// Ring token: a move the classic wake (Classic, either colour face) lit. That
     /// engine spawns on every observed cursor move with no key behind it, so
     /// its rows are never declined.
     pub const LICENCE_MOTION: &'static str = "motion";
@@ -160,6 +160,29 @@ impl AdmissionLog {
                 self.tally.declined += 1;
                 self.tally.last_decline_reason = Some(record.reason);
             }
+        }
+        if record.phase == AdmissionPhase::Declined
+            && record.reason == CursorGlow::DECLINE_NO_FRESH_HINT
+            && self.records[self.head].as_ref().is_some_and(|old| {
+                old.phase == AdmissionPhase::Licensed
+                    || old.reason != CursorGlow::DECLINE_NO_FRESH_HINT
+            })
+            && let Some(offset) = (1..ADMISSION_LOG_CAP).find(|&off| {
+                let idx = (self.head + off) % ADMISSION_LOG_CAP;
+                self.records[idx].as_ref().is_some_and(|r| {
+                    r.phase == AdmissionPhase::Declined
+                        && r.reason == CursorGlow::DECLINE_NO_FRESH_HINT
+                })
+            })
+        {
+            for step in offset..(ADMISSION_LOG_CAP - 1) {
+                let dst = (self.head + step) % ADMISSION_LOG_CAP;
+                let src = (self.head + step + 1) % ADMISSION_LOG_CAP;
+                self.records[dst] = self.records[src];
+            }
+            let newest = (self.head + ADMISSION_LOG_CAP - 1) % ADMISSION_LOG_CAP;
+            self.records[newest] = Some(record);
+            return;
         }
         self.records[self.head] = Some(record);
         self.head = (self.head + 1) % ADMISSION_LOG_CAP;
@@ -326,7 +349,7 @@ pub struct TrailStatus<'a> {
     pub style_raw: &'a str,
     /// What that string resolved to.
     pub style: GlowStyle,
-    /// `cursor_trail` master knob.
+    /// A trail is drawn: the configured style is not Off.
     pub config_enabled: bool,
     /// The resolved `GlowConfig::enabled` this frame — config AND serious mode.
     pub effective: bool,
@@ -836,6 +859,15 @@ impl CursorGlow {
         &self.under_out
     }
 
+    /// The under-ink stream the caret's bodies draw their light-ground ink
+    /// into after this frame's tick (`CursorFx::tick`: the comet's coma, the
+    /// light rod, the typing glow), so every host's `glow_under` carries them
+    /// with no host change. Each body bounds its own few quads; their
+    /// fingerprints move the frame's.
+    pub(crate) fn under_sink(&mut self) -> &mut Vec<GlowQuad> {
+        &mut self.under_out
+    }
+
     /// This frame's per-pixel fire (see `patch_out`), for
     /// `RenderInput.fire_patch`.
     pub fn patches(&self) -> &[FirePatch] {
@@ -891,7 +923,7 @@ impl CursorGlow {
 
     /// The colour of a seated caret stop (`v2_stop`), spelled as
     /// `rk::ribbon::Ribbon::head_rgb` spells the live one: the authored stop at
-    /// the reflected walk on dark, the body's leading ink on that stop on light.
+    /// the reflected walk on dark, that stop's caret ink on the page on light.
     /// The two agree to the byte on every seat frame
     /// (`the_caret_settles_on_its_own_stop_without_a_pop`).
     pub(super) fn v2_caret_stop_rgb(t: f32, cfg: &rk::Config) -> u32 {
@@ -899,7 +931,7 @@ impl CursorGlow {
         if cfg.dark_theme {
             arc
         } else {
-            rk::ribbon::light_role(cfg).ink(arc)
+            rk::ribbon::paper_caret_ink(arc, cfg.theme_bg)
         }
     }
 
@@ -908,8 +940,8 @@ impl CursorGlow {
     /// inherit to meet the laid ribbon without a palette seam.
     ///
     /// All presentations and both theme arms resolve [`Self::rainbow_field`]
-    /// once. Dark themes return the authored spectrum colour; light themes apply
-    /// the leading-ink recipe to that same field position. A non-rainbow config,
+    /// once. Dark themes return the authored spectrum colour; light themes the
+    /// caret's ink on the page at that same field position. A non-rainbow config,
     /// or an engine that has not observed a cursor yet, returns `None`.
     #[must_use]
     pub fn rainbow_head_rgb(&self, cfg: &GlowConfig) -> Option<u32> {
@@ -931,7 +963,10 @@ impl CursorGlow {
         self.last?;
         let field = self.rainbow_field();
         if !cfg.dark_theme {
-            return Some(InkRole::Leading.ink(rainbow_thing_of(field)));
+            return Some(rk::ribbon::paper_caret_ink(
+                rainbow_thing_of(field),
+                cfg.theme_bg,
+            ));
         }
         Some(rainbow_thing_of(field))
     }

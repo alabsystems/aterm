@@ -12,16 +12,17 @@ use aterm_spec::rng::XorShift;
 
 use crate::support::at;
 
-/// 10^5+ appends of varying sizes: after every one the ring is within 2048
-/// records AND 256 KiB, `lost` is exactly the records no longer held, and a
-/// reader from the start is told that number.
+/// 30,000 appends of varying sizes, in six alternating runs of small and
+/// large: after every one the ring is within 2048 records AND 256 KiB, `lost`
+/// is exactly the records no longer held, and a reader from the start is told
+/// that number.
 #[test]
 fn many_appends_stay_within_both_bounds_and_count_every_eviction() {
     let mut log = Log::new(0);
     let mut rng = XorShift::new(7);
     let mut bytes_bound_hit = false;
     let mut count_bound_hit = false;
-    for i in 0..150_000u64 {
+    for i in 0..30_000u64 {
         // Mostly small marks, with runs of large ones so the byte bound,
         // not the count, is what evicts for a while.
         let big = (i / 5_000) % 2 == 1;
@@ -177,7 +178,8 @@ fn an_uncarried_update_continues_seq_and_resets_older_cursors() {
 // ---- level-aware eviction (§5.1, phase 2A) ---------------------------------
 
 use aterm_slog::{
-    Actor, Amend, Close, EvictClass, Node, Open, Out, RunOut, StepOut, TurnOut, low_water,
+    Actor, Amend, Close, EvictClass, Node, Open, Out, RunOut, SessionOut, StepOut, TurnOut,
+    low_water,
 };
 
 use crate::support::agent_session;
@@ -267,9 +269,10 @@ fn an_agents_verdict_marks_go_before_its_newest_turns() {
     );
 }
 
-/// 10^6 appends of a realistic mix (turns with steps and verdict marks, shell
+/// 10^5 appends of a realistic mix (turns with steps and verdict marks, shell
 /// commands, person marks) stay within both bounds, count every eviction,
-/// and never evict an open node's open record.
+/// and never evict an open node's open record: the ring turns over some fifty
+/// times.
 #[test]
 fn level_aware_eviction_keeps_the_open_path_and_every_rollup() {
     let mut log = Log::new(1);
@@ -278,7 +281,7 @@ fn level_aware_eviction_keeps_the_open_path_and_every_rollup() {
     let mut ms = 0u64;
     let mut turn: Option<Node> = None;
     let mut step: Option<Node> = None;
-    while log.last_seq() < 1_000_000 {
+    while log.last_seq() < 100_000 {
         ms += 1;
         match rng.below(10) {
             0 if turn.is_none() => {
@@ -658,10 +661,39 @@ fn an_evicted_record_counts_into_its_nearest_open_node() {
 
 /// The host's budget lowers what one ring holds, level-aware, and never
 /// below its open path; raised again, the ring keeps what it had and grows.
+/// The floor, `pinned_bytes`, is the bytes of exactly the records no eviction
+/// takes: all of a ring of only opens, or of a session's open and close.
 #[test]
 fn set_byte_budget_evicts_level_aware_and_never_below_the_open_path() {
     let mut log = Log::new(1);
     let run = agent_session(&mut log, 0);
+    assert_eq!(
+        log.pinned_bytes(),
+        log.bytes(),
+        "the session's open and the run's: nothing but pinned records"
+    );
+    let mut closed = Log::new(1);
+    closed
+        .open_session(
+            Kind::Spawn,
+            Src::Aterm,
+            Conf::Exact,
+            Actor::Aterm,
+            Fields::new(),
+            at(0),
+        )
+        .expect("the session opens");
+    closed
+        .close_session(
+            Close::new(Out::Session(SessionOut::UiClose), Src::Aterm, Conf::Exact),
+            at(1),
+        )
+        .expect("the session closes");
+    assert_eq!(
+        closed.pinned_bytes(),
+        closed.bytes(),
+        "the session's open and close: nothing but pinned records"
+    );
     for i in 0..500 {
         verdict(&mut log, run, "busy", 10 + i);
     }

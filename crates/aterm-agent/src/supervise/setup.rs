@@ -3,9 +3,10 @@
 
 //! THE SESSION'S SETUP ([`SessionSetup`]): everything a [`Session`] is
 //! given before its loop runs — the target, the holder its claim is taken
-//! under, a self-claim it watches beside, the manager, the approval ledger,
-//! the approval policy's process inputs, and every timing a setter (or a
-//! test) shortens — kept apart from everything the loop learns as it runs.
+//! under, a self-claim it watches beside, whether it types under its own
+//! hand, the approval ledger, the approval policy's process inputs, and every
+//! timing a setter (or a test) shortens — kept apart from everything the loop
+//! learns as it runs.
 //!
 //! Apart, so that it can be written down whole and read back: a tape's
 //! header ([`super::super::tape::header`]) holds it, and a replay builds its
@@ -103,9 +104,9 @@ pub struct SessionSetup {
     /// policy): the badges this loop raised are left standing for that one
     /// to adopt ([`Session::reconcile`]), never cleared and raised again.
     pub(super) handover: Handover,
-    /// The manager's session, `@sid`, for the escalation mail
-    /// ([`Session::set_manager`]); `None` posts none.
-    pub(super) manager: Option<String>,
+    /// The loop types its texts under this process's hand
+    /// ([`Session::type_under_hand`]): the window's host's loop.
+    pub(super) types_under_hand: bool,
     /// Where the approval ledger goes ([`Session::set_approval_ledger`]);
     /// `None` keeps none — until a hosted loop takes its options' own
     /// ([`Session::run_hosted`]).
@@ -133,10 +134,6 @@ pub struct SessionSetup {
     /// The turn-end policy's timings ([`Session::set_turn_end_timing`]),
     /// which its memory of the session starts from.
     pub(super) turn_end_timing: TurnEndTiming,
-    /// How long the mail lane parks one `await inbox` before re-arming it.
-    pub(super) mail_step: Duration,
-    /// How long a held idle point waits between looks at the screen.
-    pub(super) hold_step: Duration,
     /// How long presses that miss are tried before the session is badged
     /// ([`approval_loop::PRESS_BADGE_AFTER`]; a test shortens it).
     pub(super) press_badge_after: Duration,
@@ -190,7 +187,7 @@ pub struct SessionSetup {
 
 impl SessionSetup {
     /// The setup [`Session::new`] runs under for `sid`: every timing at its
-    /// shipped value, no ledger, no manager, the holder
+    /// shipped value, no ledger, typing under no hand, the holder
     /// `aterm-supervise:<pid>`, and the approval policy's inputs read from
     /// this process ([`ApprovalEnv::of_process`]).
     #[must_use]
@@ -200,7 +197,7 @@ impl SessionSetup {
             holder: claim::default_holder(),
             beside: None,
             handover: Handover::default(),
-            manager: None,
+            types_under_hand: false,
             ledger_path: None,
             approval_env: ApprovalEnv::of_process(),
             reconnect: DEFAULT_RECONNECT,
@@ -210,8 +207,6 @@ impl SessionSetup {
             claim_ttl_ms: claim::ttl_ms(&crate::harness::Timings::for_build()),
             redecide_after_skip: crate::harness::Timings::for_build().redecide_after_skip,
             turn_end_timing: TurnEndTiming::default(),
-            mail_step: WAIT_STEP,
-            hold_step: WAIT_STEP,
             press_badge_after: approval_loop::PRESS_BADGE_AFTER,
             survey_retry: SURVEY_RETRY,
             survey_settle: SURVEY_SETTLE,
@@ -287,7 +282,7 @@ impl SessionSetup {
             holder,
             beside,
             handover,
-            manager,
+            types_under_hand,
             ledger_path,
             approval_env,
             reconnect,
@@ -297,8 +292,6 @@ impl SessionSetup {
             claim_ttl_ms,
             redecide_after_skip,
             turn_end_timing,
-            mail_step,
-            hold_step,
             press_badge_after,
             survey_retry,
             survey_settle,
@@ -318,7 +311,7 @@ impl SessionSetup {
         w.text("holder", holder);
         w.opt_text("beside", beside.as_deref());
         w.shown("handover", handover.0.is_some());
-        w.opt_text("manager", manager.as_deref());
+        w.shown("types_under_hand", types_under_hand);
         w.opt_path("ledger", ledger_path.as_deref(), roots);
         w.duration("reconnect", *reconnect);
         w.duration("pause", *pause);
@@ -326,8 +319,6 @@ impl SessionSetup {
         w.duration("claim_renew", *claim_renew);
         w.shown("claim_ttl_ms", claim_ttl_ms);
         w.duration("redecide_after_skip", *redecide_after_skip);
-        w.duration("mail_step", *mail_step);
-        w.duration("hold_step", *hold_step);
         w.duration("press_badge_after", *press_badge_after);
         w.durations("survey_retry", survey_retry);
         w.duration("survey_settle", *survey_settle);
@@ -384,6 +375,7 @@ impl SessionSetup {
             window,
             take_within,
             restart_backoff,
+            credits_bound,
         } = turn_end_timing;
         w.duration("turn_end.min_work", *min_work);
         w.duration("turn_end.short_backoff", *short_backoff);
@@ -401,6 +393,7 @@ impl SessionSetup {
         w.duration("turn_end.window", *window);
         w.duration("turn_end.take_within", *take_within);
         w.durations("turn_end.restart_backoff", restart_backoff);
+        w.duration("turn_end.credits_bound", *credits_bound);
         w.opt_duration("person_hold_wait", *person_hold_wait);
         w.duration("beside_idle_min", *beside_idle_min);
         let ApprovalEnv {
@@ -439,6 +432,11 @@ impl SessionSetup {
         r.retired_duration("turn_end.unknown_hold")?;
         r.retired_duration("turn_end.limits_every")?;
         r.retired_duration("turn_end.restore_pick")?;
+        // Retired with the manager's mail and the mail lane: a tape from
+        // before reads, its values dropped.
+        r.retired_text("manager")?;
+        r.retired_duration("mail_step")?;
+        r.retired_duration("hold_step")?;
         let sid = r.opt_text("sid")?;
         let holder = r.text("holder")?;
         let beside = r.opt_text("beside")?;
@@ -446,7 +444,9 @@ impl SessionSetup {
             r.parsed::<bool>("handover")?
                 .then(|| Arc::new(AtomicBool::new(false))),
         );
-        let manager = r.opt_text("manager")?;
+        // Arrived after the format did: a tape from before typed under no
+        // hand of its own.
+        let types_under_hand = r.or_shipped("types_under_hand", false, Reader::parsed::<bool>)?;
         let ledger_path = r.opt_io_path("ledger", roots)?;
         let reconnect = r.duration("reconnect")?;
         let pause = r.duration("pause")?;
@@ -454,8 +454,6 @@ impl SessionSetup {
         let claim_renew = r.duration("claim_renew")?;
         let claim_ttl_ms = r.parsed("claim_ttl_ms")?;
         let redecide_after_skip = r.duration("redecide_after_skip")?;
-        let mail_step = r.duration("mail_step")?;
-        let hold_step = r.duration("hold_step")?;
         let press_badge_after = r.duration("press_badge_after")?;
         let survey_retry: [Duration; SURVEY_TRIES] =
             r.durations("survey_retry")?.try_into().map_err(|_| {
@@ -514,6 +512,13 @@ impl SessionSetup {
             window: r.duration("turn_end.window")?,
             take_within: r.duration("turn_end.take_within")?,
             restart_backoff: r.durations("turn_end.restart_backoff")?,
+            // Arrived after the format did: a tape from before it is read
+            // with the shipped bound.
+            credits_bound: r.or_shipped(
+                "turn_end.credits_bound",
+                TurnEndTiming::default().credits_bound,
+                Reader::duration,
+            )?,
         };
         // Both arrived after the format did: until then, only a test build
         // wrote them, and a tape the shipped binary wrote ran with these
@@ -532,7 +537,7 @@ impl SessionSetup {
             holder,
             beside,
             handover,
-            manager,
+            types_under_hand,
             ledger_path,
             approval_env,
             reconnect,
@@ -542,8 +547,6 @@ impl SessionSetup {
             claim_ttl_ms,
             redecide_after_skip,
             turn_end_timing,
-            mail_step,
-            hold_step,
             press_badge_after,
             survey_retry,
             survey_settle,

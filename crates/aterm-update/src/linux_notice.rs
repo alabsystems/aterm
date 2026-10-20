@@ -28,10 +28,12 @@
 //! copy's record rather than a streak. An installed build still waiting for the next
 //! aterm a person starts past [`START_WAIT_ANNOUNCED_AFTER`] passes (update checks wait
 //! with it) is said as a notice of its own ([`crate::INSTALL_AWAITS_START_TITLE`]), never
-//! a failure: on Linux that wait is how every automatic install ends. A crash loop this
-//! loop sees end — rolled back, or kept because no rollback could be taken — is the install
-//! half's failure, as the macOS lane says a reverted update; a newer build installed over
-//! it and started answers it, once the check half has nothing unanswered.
+//! a failure: on Linux that wait is how every automatic install ends. A crash loop's end —
+//! rolled back, or kept because no rollback could be taken — is kept on the record until
+//! a loop with a window to tell takes it ([`Pass::trial_ends`]), and said
+//! ([`crate::INSTALL_CRASH_LOOP_TITLE`]) as the install half's failure, as the macOS lane
+//! says a reverted update; a newer build installed over it and started answers it, once
+//! the check half has nothing unanswered.
 
 /// The class a Linux check failure is announced under: the check half.
 const CLASS: &str = "manifest";
@@ -49,8 +51,8 @@ pub(crate) const PASS_SECS: u64 = 60;
 /// that is not running ([`crate::PENDING_UPDATE_OVERDUE_SECS`]), at one pass a minute.
 const START_WAIT_ANNOUNCED_AFTER: u64 = crate::PENDING_UPDATE_OVERDUE_SECS / PASS_SECS;
 
-/// The class a crash loop's rollback is said under: the install half, whose title the
-/// window reads as "Couldn't install updates".
+/// The install half's class, which its recovery names: the window says a crash loop's end
+/// under its title, "Couldn't install updates" ([`crate::INSTALL_CRASH_LOOP_TITLE`]).
 const INSTALL_CLASS: &str = "apply";
 
 /// What one pass of the Linux check loop saw ([`Announcer::tick`]).
@@ -71,11 +73,24 @@ pub(crate) struct Pass<'a> {
     /// What the copy's record says of its installed build ([`InstallWatch`]); `None` when
     /// the record could not be read, which judges nothing.
     pub(crate) install: Option<Install<'a>>,
+    /// The words of each crash loop's end no window was told of yet, oldest first, which
+    /// this pass took off the copy's record (`crate::linux`'s `take_unsaid_trial_ends`):
+    /// once for the copy, whenever this process started, and only by a loop with a window
+    /// to tell.
+    pub(crate) trial_ends: &'a [String],
 }
 
 impl<'a> Pass<'a> {
-    /// The pass the loop makes of a check's `status`, `record` and `took_lock`.
-    pub(crate) fn of(status: &'a crate::UpdateStatus, record: Record, took_lock: bool) -> Self {
+    /// The pass the loop makes of a check's `status`, `record` and `took_lock`, and the
+    /// crash loops' ends it took (`trial_ends`): built wherever `crate::linux` is, its one
+    /// caller.
+    #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+    pub(crate) fn of(
+        status: &'a crate::UpdateStatus,
+        record: Record,
+        took_lock: bool,
+        trial_ends: &'a [String],
+    ) -> Self {
         Self {
             outcome: &status.outcome,
             failing_checks: status.failing_checks,
@@ -83,6 +98,7 @@ impl<'a> Pass<'a> {
             record,
             took_lock,
             install: status.linux.as_ref().map(Install::of),
+            trial_ends,
         }
     }
 }
@@ -101,15 +117,10 @@ pub(crate) struct Install<'a> {
     pub(crate) started: bool,
     /// Whether the copy refuses a newer build it rolled back from.
     pub(crate) rolled_back: bool,
-    /// Whether that rollback was a crash loop's: the refused build's starts spent their
-    /// budget without proving it, rather than a person rolling back a build that ran.
-    pub(crate) rolled_back_unstarted: bool,
-    /// Whether the installed build is one a crash loop could not roll back: its starts
-    /// spent their budget, the build before it could not come back, and it stays.
-    pub(crate) kept_unproven: bool,
 }
 
 impl<'a> Install<'a> {
+    #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
     fn of(linux: &'a crate::LinuxUpdateStatus) -> Self {
         let trial_installed = linux.trial_phase.as_deref() == Some("Installed");
         Self {
@@ -118,8 +129,6 @@ impl<'a> Install<'a> {
             starts: linux.trial_starts,
             started: linux.trial_phase.is_some() && linux.trial_healthy,
             rolled_back: linux.refused_newer,
-            rolled_back_unstarted: linux.refused_newer && linux.refused_unstarted,
-            kept_unproven: linux.kept_unproven,
         }
     }
 }
@@ -275,19 +284,21 @@ impl Announcer {
 ///   kept open past the hour, and a day later a digest line). However the wait ends —
 ///   the start, a rollback, a trial kept with no start — the window is told it is over
 ///   ([`crate::INSTALL_WAIT_OVER_TITLE`]), so its words never outlive it.
-/// * A CRASH LOOP'S ROLLBACK is the install half's failure, said when this loop SEES it
-///   happen: the copy starts refusing the newer build between two of its passes (the
-///   first pass is only where it starts looking), and the record says its starts spent
-///   their budget ([`Install::rolled_back_unstarted`]). A person's own `aterm update
-///   rollback` of a build that ran is no failure and is said by the command. A second
-///   crash loop before the first was answered is restated, the window's log line.
-/// * A CRASH LOOP NO ROLLBACK COULD ANSWER is the install half's failure too, said when
-///   this loop sees the installed build become one ([`Install::kept_unproven`]): the build
-///   before it could not come back, so the build whose starts never finished stays. Told
-///   only that the wait was over, nobody learned the build they run failed its trial.
-/// * Both are said in the facts' own words ([`rollback_body`], [`kept_body`]), never the
-///   record's outcome: a due check on the pass that first sees them has already replaced
-///   that sentence with its own ("Up to date — …").
+/// * A CRASH LOOP'S END is the install half's failure: the rollback of a build whose
+///   starts spent their budget, or a build kept because the one before it could not come
+///   back, so the build whose starts never finished stays (told only that the wait was
+///   over, nobody learned the build they run failed its trial). The trial ends at a
+///   start, so the aterm that comes up after it is a process started after the record
+///   moved, and no change between two of its passes could show it: the record keeps the
+///   end's words until a loop with a window to tell takes them ([`Pass::trial_ends`]; a
+///   terminal session's loop leaves them), and that loop says them, once for the copy. A
+///   person's own `aterm update rollback` of a build that ran is no failure and is said
+///   by the command.
+/// * EACH CRASH LOOP IS SAID AS ITS OWN ([`crate::INSTALL_CRASH_LOOP_TITLE`]), a second
+///   before the first was answered too, and two that waited for one window each, in the
+///   words that name the build that failed ([`rollback_body`], [`kept_body`]), never the
+///   record's outcome: a due check on the pass that takes them has already replaced that
+///   sentence with its own ("Up to date — …").
 /// * A newer build installed over the failure and started answers it — with the
 ///   recovery the window reads as installing working, which answers a check or download
 ///   warning too, so it waits while the check half has a failure said and unanswered
@@ -299,15 +310,9 @@ pub(crate) struct InstallWatch {
     waiting: u64,
     /// The wait was said ([`crate::INSTALL_AWAITS_START_TITLE`]) and is not yet over.
     wait_said: bool,
-    /// A crash loop's end (a rollback, or a build kept) was said under the install half's
-    /// failing title, and no started newer build has answered it yet.
+    /// A crash loop's end (a rollback, or a build kept) was said, and no started newer
+    /// build has answered it yet.
     failure_said: bool,
-    /// Whether the copy refused a newer build at the last pass that read it; `None`
-    /// before the first.
-    rolled_back: Option<bool>,
-    /// Whether the installed build was one a crash loop kept ([`Install::kept_unproven`])
-    /// at the last pass that read it; `None` before the first.
-    kept: Option<bool>,
 }
 
 impl InstallWatch {
@@ -316,46 +321,40 @@ impl InstallWatch {
     /// ([`Announcer::quiet`]) after this pass.
     pub(crate) fn tick(&mut self, pass: Pass<'_>, quiet: bool) -> Vec<(String, String)> {
         let mut owed = Vec::new();
-        let Some(install) = pass.install else {
-            return owed;
-        };
-        let was_rolled_back = self.rolled_back.replace(install.rolled_back);
-        let was_kept = self.kept.replace(install.kept_unproven);
-        if self.wait_said && !install.awaiting_start {
-            self.wait_said = false;
-            owed.push((
-                crate::INSTALL_WAIT_OVER_TITLE.to_string(),
-                install.version.to_string(),
-            ));
-        }
-        if install.awaiting_start {
-            self.waiting = self.waiting.saturating_add(1);
-            if self.waiting >= START_WAIT_ANNOUNCED_AFTER && !self.wait_said {
-                self.wait_said = true;
+        if let Some(install) = pass.install {
+            if self.wait_said && !install.awaiting_start {
+                self.wait_said = false;
                 owed.push((
-                    crate::INSTALL_AWAITS_START_TITLE.to_string(),
-                    start_wait_body(install.version, install.starts),
+                    crate::INSTALL_WAIT_OVER_TITLE.to_string(),
+                    install.version.to_string(),
                 ));
             }
-        } else {
-            self.waiting = 0;
-        }
-        // A person's rollback to a kept build is no new crash loop.
-        let failure = if install.rolled_back_unstarted && was_rolled_back == Some(false) {
-            Some(rollback_body(install.version))
-        } else if install.kept_unproven && !install.rolled_back && was_kept == Some(false) {
-            Some(kept_body(install.version))
-        } else {
-            None
-        };
-        if let Some(body) = failure {
-            let title = if std::mem::replace(&mut self.failure_said, true) {
-                crate::HEALTH_RESTATED_TITLE
+            if install.awaiting_start {
+                self.waiting = self.waiting.saturating_add(1);
+                if self.waiting >= START_WAIT_ANNOUNCED_AFTER && !self.wait_said {
+                    self.wait_said = true;
+                    owed.push((
+                        crate::INSTALL_AWAITS_START_TITLE.to_string(),
+                        start_wait_body(install.version, install.starts),
+                    ));
+                }
             } else {
-                crate::health_failing_title(INSTALL_CLASS)
-            };
-            owed.push((title.to_string(), body));
-        } else if self.failure_said && quiet && install.started && !install.rolled_back {
+                self.waiting = 0;
+            }
+        }
+        if !pass.trial_ends.is_empty() {
+            self.failure_said = true;
+            owed.extend(
+                pass.trial_ends
+                    .iter()
+                    .map(|body| (crate::INSTALL_CRASH_LOOP_TITLE.to_string(), body.clone())),
+            );
+        } else if self.failure_said
+            && quiet
+            && pass
+                .install
+                .is_some_and(|install| install.started && !install.rolled_back)
+        {
             self.failure_said = false;
             owed.push((
                 crate::HEALTH_RECOVERED_TITLE.to_string(),
@@ -380,20 +379,22 @@ fn start_wait_body(version: &str, starts: u32) -> String {
     )
 }
 
-/// What a crash loop's rollback this loop saw says, from the facts alone: the build the
-/// copy restored. Never the pass's outcome: the record's own sentence is replaced by a due
-/// check's on the very pass that first sees the rollback, by a failure's reason, or by the
-/// lock's.
-fn rollback_body(restored: &str) -> String {
+/// What a crash loop's rollback says ([`InstallWatch`]), from the facts alone: the build
+/// that failed (`failed`, its version) and the one the copy restored (`restored`, as
+/// `crate::linux` names it: `aterm 0.10.0`, or `the previous copy`). Written onto the
+/// record at the rollback, never read from the pass's outcome: the record's own sentence
+/// is replaced by a due check's on the very pass that takes the words, by a failure's
+/// reason, or by the lock's.
+pub(crate) fn rollback_body(failed: &str, restored: &str) -> String {
     format!(
-        "An update didn\u{2019}t start properly, so aterm {restored} is back and that update \
-         won\u{2019}t install again."
+        "aterm {failed} didn\u{2019}t start properly, so {restored} is back and aterm \
+         {failed} won\u{2019}t install again."
     )
 }
 
 /// What a crash loop no rollback could answer says, from the facts alone: the build that
 /// stays.
-fn kept_body(kept: &str) -> String {
+pub(crate) fn kept_body(kept: &str) -> String {
     format!(
         "aterm {kept} didn\u{2019}t start properly, and the build before it can\u{2019}t come \
          back, so aterm {kept} stays until a newer release installs over it."
@@ -480,6 +481,7 @@ fn failing_body(failing_checks: Option<u32>, outcome: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::slice::from_ref;
 
     /// A healthy pass that changes the outcome owes no notice but still cues the window,
     /// through the loop's own step ([`Reporter::report`]); the same outcome again does not.
@@ -540,12 +542,13 @@ mod tests {
             record: Record::Kept,
             took_lock: true,
             install: None,
+            trial_ends: &[],
         }
     }
 
     /// A pass over a copy whose installed `version` waits for a start (`awaiting`), was
-    /// started (`started`), or refuses a newer build a crash loop rolled back
-    /// (`rolled_back`), with no start counted.
+    /// started (`started`), or refuses a newer build it rolled back (`rolled_back`), with
+    /// no start counted.
     fn over<'a>(
         outcome: &'a str,
         version: &'a str,
@@ -558,20 +561,17 @@ mod tests {
                 starts: 0,
                 started,
                 rolled_back,
-                rolled_back_unstarted: rolled_back,
-                kept_unproven: false,
             }),
             ..pass(outcome, 0, START)
         }
     }
 
-    /// [`over`] with the rollback a person asked for: refused, no crash loop's.
-    fn over_asked<'a>(outcome: &'a str, version: &'a str) -> Pass<'a> {
-        let mut pass = over(outcome, version, ROLLED_BACK);
-        if let Some(install) = pass.install.as_mut() {
-            install.rolled_back_unstarted = false;
+    /// `pass` taking crash loops' ends off the record, in the words `words`.
+    fn ending<'a>(pass: Pass<'a>, words: &'a [String]) -> Pass<'a> {
+        Pass {
+            trial_ends: words,
+            ..pass
         }
-        pass
     }
 
     /// The notices `watch` owes for `pass` while the check half is quiet.
@@ -642,36 +642,36 @@ mod tests {
         );
     }
 
-    /// A CRASH LOOP'S ROLLBACK IS SAID WHEN THIS LOOP SEES IT HAPPEN (U21 and its reviews),
-    /// under the install half's failing title, in the facts' words whatever the pass's
-    /// outcome says (the lock held, or a due check's own sentence). The first pass
-    /// only starts the looking. After a said wait, the wait's end comes first and then
-    /// the failure. A newer build installed over it and started answers it. A second crash
-    /// loop before that is restated. Negative control: a rollback a person asked for is no
-    /// failure (and ends a said wait all the same).
+    /// A CRASH LOOP'S END IS SAID FROM THE RECORD, AND A NEWER STARTED INSTALL ANSWERS IT
+    /// (U21 and its reviews). The pass that takes the end off the record says it under
+    /// [`crate::INSTALL_CRASH_LOOP_TITLE`], which the window shows as the install half's
+    /// warning, in the record's words whatever the pass's outcome says (the lock held, or a
+    /// due check's own sentence) — the first pass of a process started after the end too
+    /// (ATERM-KI-1015-2, U21: it only started the looking, so an end found at launch was
+    /// told to nobody). After a said wait, the wait's end comes first. A newer build
+    /// installed over it and started answers it. A second crash loop before that is said as
+    /// its own (U21: it was restated, a log line). Negative controls: a pass that takes
+    /// nothing says nothing of the refusal it reads, and a rollback a person asked for
+    /// (no end on the record) ends a said wait all the same.
     #[test]
-    fn a_rollback_this_loop_sees_is_said_and_a_newer_started_install_answers_it() {
+    fn a_crash_loops_end_is_said_from_the_record_and_a_newer_started_install_answers_it() {
         let rolled = "aterm 0.11.0 didn\u{2019}t start properly in 3 launches, so aterm 0.10.0 \
                       is back and aterm 0.11.0 won\u{2019}t install again";
-        let failing = crate::health_failing_title(INSTALL_CLASS);
-        let words = rollback_body("0.10.0");
-        let mut first = InstallWatch::default();
-        assert_eq!(
-            quiet(&mut first, over(rolled, "0.10.0", ROLLED_BACK)),
-            [],
-            "a rollback already on record at the first pass is not news"
-        );
-
+        let crash = crate::INSTALL_CRASH_LOOP_TITLE;
+        let words = rollback_body("0.11.0", "aterm 0.10.0");
         let mut watch = InstallWatch::default();
-        assert_eq!(quiet(&mut watch, over("Up to date", "0.10.0", NOTHING)), []);
         assert_eq!(
-            quiet(&mut watch, over(rolled, "0.10.0", ROLLED_BACK)),
-            [notice(failing, &words)]
+            quiet(
+                &mut watch,
+                ending(over(rolled, "0.10.0", ROLLED_BACK), from_ref(&words))
+            ),
+            [notice(crash, &words)],
+            "an end found at the first pass is said"
         );
         assert_eq!(
             quiet(&mut watch, over(rolled, "0.10.0", ROLLED_BACK)),
             [],
-            "once"
+            "once: the record no longer holds it"
         );
         assert_eq!(
             quiet(
@@ -690,17 +690,15 @@ mod tests {
         );
 
         let mut busy_pass = InstallWatch::default();
-        quiet(&mut busy_pass, over("Up to date", "0.10.0", NOTHING));
         let held = Pass {
             record: Record::Busy,
             failing_checks: 1,
             ..over("Another aterm is updating this copy", "0.10.0", ROLLED_BACK)
         };
-        let said = quiet(&mut busy_pass, held);
-        assert!(
-            matches!(said.as_slice(), [(_, body)] if body.contains("aterm 0.10.0 is back")
-                && !body.contains("Another aterm")),
-            "the facts' words, never the lock's: {said:?}"
+        assert_eq!(
+            quiet(&mut busy_pass, ending(held, from_ref(&words))),
+            [notice(crash, &words)],
+            "the record's words, never the lock's"
         );
 
         let mut after_wait = InstallWatch::default();
@@ -711,10 +709,13 @@ mod tests {
             );
         }
         assert_eq!(
-            quiet(&mut after_wait, over(rolled, "0.10.0", ROLLED_BACK)),
+            quiet(
+                &mut after_wait,
+                ending(over(rolled, "0.10.0", ROLLED_BACK), from_ref(&words))
+            ),
             [
                 notice(crate::INSTALL_WAIT_OVER_TITLE, "0.10.0"),
-                notice(failing, &words),
+                notice(crash, &words),
             ],
             "the wait is over, and the rollback is the install half's failure"
         );
@@ -722,10 +723,26 @@ mod tests {
             &mut after_wait,
             over("aterm 0.12.0 is installed", "0.12.0", WAITING),
         );
+        let again = rollback_body("0.12.0", "aterm 0.10.0");
         assert_eq!(
-            quiet(&mut after_wait, over(rolled, "0.10.0", ROLLED_BACK)),
-            [notice(crate::HEALTH_RESTATED_TITLE, &words)],
-            "a second crash loop before an answer is restated"
+            quiet(
+                &mut after_wait,
+                ending(over(rolled, "0.10.0", ROLLED_BACK), from_ref(&again))
+            ),
+            [notice(crash, &again)],
+            "a second crash loop before an answer is said as its own"
+        );
+        let both = [
+            rollback_body("0.13.0", "aterm 0.10.0"),
+            rollback_body("0.14.0", "aterm 0.10.0"),
+        ];
+        assert_eq!(
+            quiet(
+                &mut after_wait,
+                ending(over(rolled, "0.10.0", ROLLED_BACK), &both)
+            ),
+            [notice(crash, &both[0]), notice(crash, &both[1])],
+            "two ends that waited for a window are each said, oldest first"
         );
 
         let mut asked = InstallWatch::default();
@@ -736,7 +753,10 @@ mod tests {
             );
         }
         assert_eq!(
-            quiet(&mut asked, over_asked("aterm 0.10.0 is back", "0.10.0")),
+            quiet(
+                &mut asked,
+                over("aterm 0.10.0 is back", "0.10.0", ROLLED_BACK)
+            ),
             [notice(crate::INSTALL_WAIT_OVER_TITLE, "0.10.0")],
             "a person's rollback ends the wait and is no failure"
         );
@@ -1144,6 +1164,7 @@ mod tests {
     fn the_install_halfs_recovery_waits_for_the_check_half() {
         let rolled = "aterm 0.11.0 didn\u{2019}t start properly in 3 launches, so aterm 0.10.0 \
                       is back and aterm 0.11.0 won\u{2019}t install again";
+        let words = rollback_body("0.11.0", "aterm 0.10.0");
         let failed_at = "2026-09-28T11:00:00Z";
         let checked_at = "2026-09-28T12:00:00Z";
         let mut reporter = Reporter::new(START.into());
@@ -1151,7 +1172,7 @@ mod tests {
             &mut reporter,
             [
                 over("Up to date", "0.10.0", NOTHING),
-                over(rolled, "0.10.0", ROLLED_BACK),
+                ending(over(rolled, "0.10.0", ROLLED_BACK), from_ref(&words)),
                 Pass {
                     failing_checks: crate::PERSISTENT_AFTER,
                     updated_at: failed_at,
@@ -1161,7 +1182,7 @@ mod tests {
         );
         assert!(
             said.iter()
-                .any(|(title, _)| crate::health_failing_class(title) == Some(INSTALL_CLASS)),
+                .any(|(title, _)| title == crate::INSTALL_CRASH_LOOP_TITLE),
             "PRECONDITION: the rollback was said: {said:?}"
         );
         assert!(
@@ -1213,7 +1234,14 @@ mod tests {
             ),
         );
         assert_eq!(wait.len(), 1, "PRECONDITION: the wait was said: {wait:?}");
-        let ended = reported(&mut reporter, [kept("aterm 0.11.0 stays", "0.11.0")]);
+        let words = kept_body("0.11.0");
+        let ended = reported(
+            &mut reporter,
+            [ending(
+                over("aterm 0.11.0 stays", "0.11.0", NOTHING),
+                from_ref(&words),
+            )],
+        );
         assert!(
             matches!(
                 ended.first(),
@@ -1226,100 +1254,8 @@ mod tests {
         );
         assert_eq!(
             ended.get(1..),
-            Some(
-                &[notice(
-                    crate::health_failing_title(INSTALL_CLASS),
-                    &kept_body("0.11.0")
-                )][..]
-            ),
+            Some(&[notice(crate::INSTALL_CRASH_LOOP_TITLE, &words)][..]),
             "and then that the build failed its trial and stays: {ended:?}"
-        );
-    }
-
-    /// A pass over a copy whose installed `version` is one a crash loop could not roll back
-    /// ([`Install::kept_unproven`]): no trial, nothing refused.
-    fn kept<'a>(outcome: &'a str, version: &'a str) -> Pass<'a> {
-        let mut pass = over(outcome, version, NOTHING);
-        if let Some(install) = pass.install.as_mut() {
-            install.kept_unproven = true;
-        }
-        pass
-    }
-
-    /// A CRASH LOOP NO ROLLBACK COULD ANSWER IS SAID WHEN THIS LOOP SEES IT (the second
-    /// review of U21): under the install half's failing title, in the facts' words, never
-    /// the pass's outcome; once. The first pass only starts the looking. A newer build
-    /// installed over it and started answers it. Negative controls: a person's rollback to
-    /// a kept build is no failure, and a newer build's crash loop rolled back to a kept
-    /// build is said once, as the rollback.
-    #[test]
-    fn a_crash_loop_kept_is_said_and_a_newer_started_install_answers_it() {
-        let failing = crate::health_failing_title(INSTALL_CLASS);
-        let mut first = InstallWatch::default();
-        assert_eq!(
-            quiet(&mut first, kept("aterm 0.11.0 stays", "0.11.0")),
-            [],
-            "a build kept already at the first pass is not news"
-        );
-
-        let mut watch = InstallWatch::default();
-        assert_eq!(
-            quiet(
-                &mut watch,
-                over("aterm 0.11.0 is installed", "0.11.0", WAITING)
-            ),
-            []
-        );
-        assert_eq!(
-            quiet(&mut watch, kept("Up to date", "0.11.0")),
-            [notice(failing, &kept_body("0.11.0"))],
-            "the facts' words, never the check's"
-        );
-        assert_eq!(quiet(&mut watch, kept("Up to date", "0.11.0")), [], "once");
-        assert_eq!(
-            quiet(
-                &mut watch,
-                over("aterm 0.12.0 is installed", "0.12.0", WAITING)
-            ),
-            [],
-            "a newer install waiting for its start answers nothing yet"
-        );
-        assert_eq!(
-            quiet(
-                &mut watch,
-                over("aterm 0.12.0 is installed", "0.12.0", STARTED)
-            ),
-            [notice(crate::HEALTH_RECOVERED_TITLE, INSTALL_CLASS)]
-        );
-
-        let mut asked = InstallWatch::default();
-        quiet(
-            &mut asked,
-            over("aterm 0.12.0 is installed", "0.12.0", STARTED),
-        );
-        let mut back = over_asked("aterm 0.11.0 is back", "0.11.0");
-        if let Some(install) = back.install.as_mut() {
-            install.kept_unproven = true;
-        }
-        assert_eq!(
-            quiet(&mut asked, back),
-            [],
-            "a person's rollback to a kept build is no failure"
-        );
-
-        let mut looped = InstallWatch::default();
-        quiet(
-            &mut looped,
-            over("aterm 0.12.0 is installed", "0.12.0", WAITING),
-        );
-        let mut rolled = over("aterm 0.11.0 is back", "0.11.0", ROLLED_BACK);
-        if let Some(install) = rolled.install.as_mut() {
-            install.kept_unproven = true;
-        }
-        assert_eq!(
-            quiet(&mut looped, rolled),
-            [notice(failing, &rollback_body("0.11.0"))],
-            "a crash loop rolled back to a kept build is said once, as the rollback"
         );
     }
 }

@@ -12,9 +12,10 @@ use aterm_scrollback::Line;
 
 use super::Grid;
 use super::ScrolledRowExtras;
+use super::row_u16;
 use super::scroll_materialize::filled_span_cols;
 use crate::Row;
-use crate::{CellCoord, CellExtras};
+use crate::{Cell, CellCoord, CellExtras};
 
 /// Fill a detached [`Row`] from a scrollback [`Line`] and return its extras in
 /// the [`ScrolledRowExtras`] form ring rows store: scrollback reflow rebuilds
@@ -94,7 +95,51 @@ pub(crate) fn fill_row_into(row: &mut Row, line: &Line, cols: u16) -> ScrolledRo
     extras
 }
 
+/// The wide glyph that opens `row` when it continues the row before: the glyph
+/// whose early wrap left a hole at the end of that row.
+pub(super) fn wrap_opening(row: &Row) -> Option<Cell> {
+    row.get(0)
+        .filter(|glyph| row.is_wrapped() && glyph.is_wide())
+        .copied()
+}
+
 impl Grid {
+    /// Paint the early-wrap holes closing visible rows `rows` as the print path
+    /// painted them: the blank in the background of the wide glyph that wrapped,
+    /// which opens the row below (`blank_wide_wrap_tail`). A history line leaves
+    /// its hole out, as it is no text, so a row that comes back from history
+    /// would show it unpainted. Call once the row below each is in place.
+    pub(super) fn paint_wrap_holes(&mut self, rows: core::ops::Range<u16>) {
+        for row in rows {
+            let Some(glyph) = self
+                .storage
+                .row_at_screen(row.saturating_add(1))
+                .and_then(wrap_opening)
+            else {
+                continue;
+            };
+            let mut blank = Cell::bce_blank(glyph.colors());
+            let bg_rgb = if blank.colors().bg_is_rgb() {
+                self.storage.extras.bg_rgb_for(row.saturating_add(1), 0)
+            } else {
+                None
+            };
+            blank.set_has_extras(bg_rgb.is_some());
+            let Some(r) = self.row_mut(row).filter(|r| r.has_early_wrap_hole()) else {
+                continue;
+            };
+            let col = row_u16(r.cells_len().saturating_sub(1));
+            r.set(col, blank);
+            r.set_early_wrap_hole(true);
+            if let Some(rgb) = bg_rgb {
+                self.storage
+                    .extras
+                    .get_or_create(CellCoord::new(row, col))
+                    .set_bg_rgb(Some(rgb));
+            }
+        }
+    }
+
     /// Fill visible row `row_idx` from a scrollback [`Line`]: the cells first,
     /// then, with the row borrow released, the grid's `CellExtras`.
     pub(crate) fn fill_row_from_line(&mut self, row_idx: u16, line: &Line, cols: u16) {
@@ -353,65 +398,35 @@ enum DeferredExtra {
 /// A BMP unit is a plain cell, a BMP base with combining marks defers the
 /// marks, and a non-BMP or ZWJ unit becomes a complex cell.
 fn fill_row_cells(row: &mut Row, text: &str, line: &Line, cols: u16) -> (Vec<DeferredExtra>, u16) {
-    use super::scroll_materialize::advance_grapheme_unit_wide;
     use crate::{CellFlags, PackedColor};
 
     let mut deferred = Vec::new();
-    // `unit_char_start` is monotone, so a run cursor reads the RLE attrs in
-    // O(runs) total instead of rescanning per cell.
-    let mut attr_cursor = line.attr_cursor();
-    let mut byte_idx: usize = 0;
-    let mut char_idx: usize = 0;
     let mut col: u16 = 0;
-
-    while byte_idx < text.len() && col < cols {
-        let c = super::scroll_materialize::char_at(text, byte_idx);
-        if super::scroll_materialize::is_zero_width(c) {
-            byte_idx += c.len_utf8();
-            char_idx += 1;
-            continue;
-        }
-
-        let unit_byte_start = byte_idx;
-        let unit_char_start = char_idx;
-        // Effective width, replaying the live VS16/VS15 transitions (see
-        // `advance_grapheme_unit_wide`) so a restored `❤️` keeps two columns,
-        // with the live writer's row-edge exception (a VS16 widening fails at
-        // the last column, so demote there).
-        let unit = advance_grapheme_unit_wide(text, &mut byte_idx);
-        let chars_consumed = unit.chars;
-        let attrs = attr_cursor.attr_at(unit_char_start);
-        let is_wide = super::scroll_materialize::stored_unit_is_wide(unit, attrs)
-            && !(unit.vs16_widened && col + 1 >= cols);
-        char_idx += chars_consumed;
-        let unit_str = &text[unit_byte_start..byte_idx];
+    // The cells the line is drawn in, as materialize lays them out: VS16/VS15
+    // replayed so a restored `❤️` keeps two columns, with the live writer's
+    // row-edge exception, and cells the grid drew apart kept apart.
+    for cell in super::scroll_materialize::StoredCells::new(line, text, cols) {
         let style = LineCellStyle {
-            fg: PackedColor(attrs.fg),
-            bg: PackedColor(attrs.bg),
-            flags: CellFlags::from_bits(attrs.flags),
+            fg: PackedColor(cell.attrs.fg),
+            bg: PackedColor(cell.attrs.bg),
+            flags: CellFlags::from_bits(cell.attrs.flags),
         };
 
-        let (new_col, extra) =
-            place_line_cell(row, col, cols, unit_str, chars_consumed, &style, is_wide);
-        // No progress: a wide char did not fit at the last column, so the row is
-        // full. Stop rather than scan the rest of a possibly oversized line under
-        // the lock; `extra` is `None` on the can't-fit branches.
-        if new_col == col {
-            break;
-        }
+        let (new_col, extra) = place_line_cell(
+            row, cell.col, cols, cell.text, cell.chars, &style, cell.wide,
+        );
+        debug_assert!(new_col > cell.col, "the walk lays out only cells that fit");
         if let Some(e) = extra {
             deferred.push(e);
         }
         // RGB colours go to the extras, deferred.
-        if new_col > col {
-            if style.fg.is_rgb() {
-                let (r, g, b) = style.fg.rgb_components();
-                deferred.push(DeferredExtra::RgbFg(col, [r, g, b]));
-            }
-            if style.bg.is_rgb() {
-                let (r, g, b) = style.bg.rgb_components();
-                deferred.push(DeferredExtra::RgbBg(col, [r, g, b]));
-            }
+        if style.fg.is_rgb() {
+            let (r, g, b) = style.fg.rgb_components();
+            deferred.push(DeferredExtra::RgbFg(cell.col, [r, g, b]));
+        }
+        if style.bg.is_rgb() {
+            let (r, g, b) = style.bg.rgb_components();
+            deferred.push(DeferredExtra::RgbBg(cell.col, [r, g, b]));
         }
         col = new_col;
     }
@@ -426,7 +441,12 @@ fn fill_row_cells(row: &mut Row, text: &str, line: &Line, cols: u16) -> (Vec<Def
     // On an uncontinued row the mark is harmless: the rejoining readers consult
     // it only for a continued row, and history staging
     // (`DeferredLine::new_boxed`) cuts a last cell this line never filled.
-    row.set_early_wrap_hole(usize::from(col) + 1 == row.cells_len());
+    // The line left the hole out, so it is painted once the row below is in
+    // place (`Grid::paint_wrap_holes`).
+    row.set_early_wrap_hole(super::scroll_materialize::leaves_wrap_hole(col, cols));
+    // A line that ends two or more cells short goes on at its length if the
+    // next row continues it, as it does in the store (`RowFlags::ENDS_AT_LEN`).
+    row.set_ends_at_len(u32::from(col) + 1 < u32::from(cols));
     (deferred, col)
 }
 
@@ -448,8 +468,6 @@ fn place_line_cell(
     style: &LineCellStyle,
     is_wide: bool,
 ) -> (u16, Option<DeferredExtra>) {
-    use crate::Cell;
-
     let c = super::scroll_materialize::char_at(unit_str, 0);
     let base_is_bmp = (c as u32) <= Cell::MAX_DIRECT_CODEPOINT;
 
@@ -478,7 +496,7 @@ fn place_line_cell(
 
 /// Set a normal (non-complex) cell, handling wide chars.
 fn set_cell(row: &mut Row, col: u16, cols: u16, c: char, s: &LineCellStyle, is_wide: bool) -> u16 {
-    use crate::{Cell, CellFlags};
+    use crate::CellFlags;
     let flags = if is_wide {
         s.flags.union(CellFlags::WIDE)
     } else {
@@ -510,7 +528,7 @@ fn set_complex_cell(
     s: &LineCellStyle,
     is_wide: bool,
 ) -> (u16, Option<DeferredExtra>) {
-    use crate::{Cell, CellFlags};
+    use crate::CellFlags;
     let flags = if is_wide {
         s.flags.union(CellFlags::WIDE)
     } else {

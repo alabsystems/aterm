@@ -1,0 +1,14 @@
+# claude-code 2.1.302 · HAND-BUILT 2026-10-17 from the 2.1.302 render code, not measured (Claude Code makes this offer only where it finds a Chromium-family browser — the lab's machine has none — under the `tengu_chrome_install_upsell` flag, and never while the session auto-allows tool calls): sCe() in the permission frame `ka` (the title ` Claude wants to use your browser` at column one under the full-width rule, the body two columns in, `marginTop 1` above the body and above the Select, no footer), its Select with `hideIndexes` and `defaultFocusValue "not_now"` (the cursor on `Not now`), each of its three options (Bst: `Install extension` / `Opens the install page in Chrome`, `Not now` / `Continue without browser tools`, `Don't ask again` / `Revisit anytime with /chrome`) with its description; the Select lays described options out in two columns as MEASURED on 2.1.302's model picker (`claude-2.1.302-model-picker-40col.txt`): the labels in a column as wide as the longest label and its pointer, at most 60% of the pane, then two blanks and the description, wrapped at its own column · the Chrome install upsell at 120 columns
+⏺ Working on it.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Claude wants to use your browser
+
+  This task could use your Chrome browser. The Claude in Chrome extension lets Claude navigate sites, click buttons,
+  and fill forms in your existing session.
+
+    Install extension  Opens the install page in Chrome
+  ❯ Not now            Continue without browser tools
+    Don't ask again    Revisit anytime with /chrome
+
+

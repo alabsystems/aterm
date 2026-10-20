@@ -214,16 +214,17 @@ Run an installed toolchain program from the managed store, never
 adds one.
 .TP
 .B aterm fleet \fIargs\fR
-Watch and drive the sessions of every aterm window on this machine.
+This machine's place in a fleet, the machines that
+.B aterm ctl survey \-\-fleet
+reads
+.RI ( init " | " join " | " peers " | " leave ).
 .TP
 .B aterm drive \fIargs\fR
-Drive an agent
-.RI ( prompt " | " read " | " await " | " shot )
-and supervise it
-.RI ( supervise " | " watch " | " task " | " report " | " ledger ).
+The window harness's readers by hand
+.RI ( classify " | " phase " | " answer " | " ledger ).
 .TP
 .BR "aterm link" ", " "aterm fabric"
-Mail between sessions and hosts.
+Mail between this machine's sessions and people (the fabric bus).
 .TP
 .B aterm fabric brief \fR[\fB@\fIsid\fR[\fB@\fInode\fR]] [\fB\-\-window\fR \fIrecords\fR] [\fB\-\-budget\fR \fItokens\fR]
 The fleet's session logs folded from the bus alone (no control socket): each
@@ -294,6 +295,19 @@ moves a live Claude Code onto a newer build.
 .B aterm keeper \fIcmd\fR
 The PTY keeper (macOS, opt\-in with
 .BR "[keeper] enabled = true" ).
+.TP
+.B aterm caffeine \fR[\fIcmd\fR]
+The menu\-bar keep\-awake mug (macOS): a click keeps this Mac awake, a right
+click picks 1, 8 or 24 hours or forever, Enable at Startup, or Quit.
+Commands:
+.BR start ,
+.BR on " [\fIspan\fR],"
+.BR off ,
+.BR status ,
+.BR startup " [\fBon\fR|\fBoff\fR],"
+.BR quit ;
+see
+.BR "aterm help caffeine" .
 .TP
 .BR "aterm new\-tab" ", " "aterm new\-window" ", " "aterm split\-pane"
 Open a tab, window or split
@@ -366,6 +380,16 @@ connections
 .RB ( connect ", " disconnect ", " flows )
 and discovery
 .RB ( ls ", " instances ", " windows ", " mux ).
+.PP
+With
+.B "[session_log] clause = true"
+(off by default), a terminal tab's tooltip and context menu add one
+.B now:
+line saying what its session log says the session is doing
+.RB ( "now: running shell" ", " "now: approval \(pc bash" ,
+or a label the harness or you set; never a label another program set with
+.BR mark ).
+Off, they are as before.
 .PP
 .B aterm ctl
 exits 0 on
@@ -440,8 +464,10 @@ segments, 0600 in a 0700 folder, at most 64 MiB and 2048 files, the oldest
 deleted first, so
 .B aterm ctl log @<sid>
 answers for a session from an earlier run. It keeps each command's first word
-as typed (so a secret typed at a prompt and run is kept too), never its
-arguments. Off, nothing is created there.
+as typed (so a secret typed at a prompt and run is kept too), the session's
+folder, its meta values (an attention text only as a fingerprint) and mail's
+senders and recipients; never a command's arguments, an OSC title, a mail's
+body or an agent's transcript text. Off, nothing is created there.
 .SH EXAMPLES
 .nf
 aterm                                  # an interactive shell

@@ -352,6 +352,81 @@ fn a_wrapped_user_block_on_the_screen_is_the_start() {
     assert!(report.rows[6].starts_with("  Report after each site"));
 }
 
+/// THE WINDOW HARNESS'S OWN TURNS NEVER HIDE THE ONE A REPORT STARTS FROM.
+/// Each `keep going`, done check and `/usage` it types is a ledger row
+/// (`by=harness`), so more of them since the manager's turn than the first
+/// read holds (`history 8`) leave that read with no turn to start from: the
+/// report then reads the whole ledger (`history`) and starts at the
+/// manager's turn (`marker=ledger turn=9`), never at the newest `❯` row,
+/// the harness's own. NEGATIVE CONTROL: with the manager's turn among the
+/// newest eight, one read.
+#[test]
+fn a_report_reads_past_the_harness_turns_to_the_managers() {
+    let screen = fixture(super::super::prompt::fixtures::WAIT_BG2);
+    let text = "Go on the amended lever, with one correction: the ghost-key site comment \
+                says that entry is not safe to replay.";
+    let ledger = |harness: std::ops::Range<u64>| {
+        let mut body = history(&[(9, true, "7730:0", text)]).stdout;
+        for id in harness {
+            body.push_str(&format!(
+                "turn {id} submitted=1 status=pressed started_ms=1 dur_ms=2 seq=3 \
+                 hash=0000000000000000 by=harness arch=7730:0 text=keep%20going\n"
+            ));
+        }
+        body
+    };
+    let newest = |body: &str, n: usize| {
+        let rows: Vec<&str> = body.lines().collect();
+        ok(&rows[rows.len().saturating_sub(n)..]
+            .iter()
+            .map(|r| format!("{r}\n"))
+            .collect::<String>())
+    };
+    let whole = ledger(10..20);
+    let mut host = Host::default()
+        .on("history", newest(&whole, 8))
+        .on("history", ok(&whole))
+        .on("offscreen", Read::new(1, &[], screen.clone()).ctl());
+    let report = run(&mut host, ReportOpts::default());
+    assert_eq!(
+        host.requests,
+        [
+            "@s-1 history 8",
+            "@s-1 history",
+            "@s-1 offscreen since=7730:0 max=8000 screen=1"
+        ]
+    );
+    assert!(
+        report
+            .header()
+            .starts_with("report complete=1 marker=ledger turn=9 "),
+        "{}",
+        report.header()
+    );
+
+    // NEGATIVE CONTROL: the manager's turn within the first read (it and
+    // seven of the harness's).
+    let near = ledger(10..17);
+    let mut host = Host::default()
+        .on("history", newest(&near, 8))
+        .on("offscreen", Read::new(1, &[], screen).ctl());
+    let report = run(&mut host, ReportOpts::default());
+    assert_eq!(
+        host.requests,
+        [
+            "@s-1 history 8",
+            "@s-1 offscreen since=7730:0 max=8000 screen=1"
+        ]
+    );
+    assert!(
+        report
+            .header()
+            .starts_with("report complete=1 marker=ledger turn=9 "),
+        "{}",
+        report.header()
+    );
+}
+
 /// Without a ledger turn (`drive prompt` keeps none) the report opens at the
 /// last `❯` row of the transcript — never at a message queued under the
 /// status row, which is the live zone. And a ledger turn whose text is only
@@ -742,9 +817,11 @@ fn the_readers_match_the_wire() {
         assert_eq!(Mark::parse(bad), None, "{bad:?}");
     }
     let turns = parse_history(
-        "OK 2\nturn 4 submitted=1 status=settled started_ms=1 dur_ms=2 seq=3 \
-         hash=00000000000000ff arch=77:9 text=a%20b%0Ac%25%E2%9D%AF%2\n\
-         turn 5 submitted=0 status=timeout text=\n",
+        "OK 3\nturn 4 submitted=1 status=settled started_ms=1 dur_ms=2 seq=3 \
+         hash=00000000000000ff by=ctl arch=77:9 text=a%20b%0Ac%25%E2%9D%AF%2\n\
+         turn 5 submitted=0 status=timeout text=\n\
+         turn 6 submitted=1 status=pressed started_ms=4 dur_ms=5 seq=6 \
+         hash=0000000000000001 by=harness arch=77:9 text=keep%20going\n",
     );
     assert_eq!(
         turns,
@@ -752,6 +829,7 @@ fn the_readers_match_the_wire() {
             LedgerTurn {
                 id: 4,
                 submitted: true,
+                by: "ctl".to_string(),
                 arch: Some(Mark {
                     origin: Some(77),
                     index: 9
@@ -761,13 +839,32 @@ fn the_readers_match_the_wire() {
             LedgerTurn {
                 id: 5,
                 submitted: false,
+                by: "-".to_string(),
                 arch: None,
                 text: String::new(),
             },
+            LedgerTurn {
+                id: 6,
+                submitted: true,
+                by: "harness".to_string(),
+                arch: Some(Mark {
+                    origin: Some(77),
+                    index: 9
+                }),
+                text: "keep going".to_string(),
+            },
         ]
     );
+    // The harness's own turn is never the report's start, newer and
+    // submitted as it is; without it the newest submitted turn is.
     assert_eq!(newest_turn(turns.clone()).map(|t| t.id), Some(4));
-    assert_eq!(newest_turn(turns[1..].to_vec()).map(|t| t.id), Some(5));
+    assert_eq!(newest_turn(turns[..2].to_vec()).map(|t| t.id), Some(4));
+    assert_eq!(newest_turn(turns[1..2].to_vec()).map(|t| t.id), Some(5));
+    assert_eq!(
+        newest_turn(turns[2..].to_vec()),
+        None,
+        "the harness's alone"
+    );
     assert_eq!(newest_turn(vec![]), None);
 
     // An empty archive and screen: `aterm ctl` prints the header with its

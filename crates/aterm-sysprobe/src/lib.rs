@@ -2,16 +2,27 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm-sysprobe` — in-process readers of another process and of the
-//! machine's memory.
+//! machine.
 //!
 //! * [`process_cwd`], [`process_path`] — another process's working directory
 //!   and executable, without forking `lsof` (the harness, the Claude Code
 //!   footer, `aterm ctl` session queries).
 //! * [`group_memory`] — one process group's physical footprint (the agent
 //!   memory ceiling, `aterm_agent::supervise::memory`).
+//! * [`lone_group_leader`] — the name of a process that leads a group no
+//!   other process is in (a file citation's shell in front).
 //! * [`physical_memory_mib`], [`machine_memory`], [`memory_pressure`],
 //!   [`swapped_kib`] and the [`SwapMeter`] — the machine's memory, the
 //!   kernel's pressure level and the swap rate the ceiling moves with.
+//! * [`volumes`] — the mount table, a fresh reading of one volume's free
+//!   space, and the pure lookups between a path and its mount (the disk
+//!   watch, `aterm harness disk`, `status disk=` and `await sys`).
+//! * The system-awareness stats' readers: [`Probe::core_ticks`] (every
+//!   logical core's ticks), [`cpu_layout`] (the clusters the OS names),
+//!   [`memory_detail`] (memory by page class, swap, pressure), [`gpu`] (the
+//!   GPU's device-wide use) and [`volume`] (the volume a path lives on).
+//! * [`processes`] — one sweep of the process table: each process's parent,
+//!   CPU time, footprint and name (the stats' aterm and tab scopes).
 //!
 //! # No timer
 //!
@@ -20,17 +31,21 @@
 //!
 //! # Every platform `cfg` lives here
 //!
-//! The macOS arm (the private `macos` module) reads libproc, `sysctlbyname`
-//! and Mach host statistics. The Linux arm reads `/proc` through std alone
-//! ([`linux`]'s parsers are pure functions over `&str`, compiled and tested
-//! on every platform). Every other platform answers `None`.
+//! The macOS arm (the private `macos` module) reads libproc, `sysctlbyname`,
+//! Mach host and processor statistics and the IORegistry (the private
+//! `iokit` module's declarations, held to the SDK by `tests/iokit_sdk.rs`).
+//! The Linux arm reads `/proc` and `/sys` through std alone ([`linux`]'s
+//! parsers are pure functions over `&str`, compiled and tested on every
+//! platform). Every other platform answers `None`.
 //!
 //! # Bounded
 //!
 //! A path is read into a [`PATH_CAP`]-byte buffer. A file read (the Linux
 //! arm's `/proc`) goes through [`read_bounded`], one [`READ_CAP`]-byte stack
 //! buffer, never to EOF: a device path that never ends would take the
-//! machine down.
+//! machine down. `/proc/stat`, whose per-core lines outgrow 4 KiB on a big
+//! machine, is read the same way into a [`linux::STAT_CAP`]-byte buffer the
+//! [`Probe`] keeps.
 
 #![warn(missing_docs)]
 #![cfg_attr(
@@ -45,9 +60,21 @@ use std::io::Read as _;
 use std::path::Path;
 use std::time::Instant;
 
+#[cfg(target_os = "macos")]
+mod iokit;
 pub mod linux;
+mod machine;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod procs;
+pub mod volumes;
+
+pub use procs::{ProcessReading, Sweep, processes};
+
+pub use machine::{
+    Cluster, CoreTicks, CpuLayout, GpuReading, MemoryDetail, Probe, VolumeReading, cpu_layout, gpu,
+    memory_detail, volume,
+};
 
 /// A path buffer (`PROC_PIDPATHINFO_MAXSIZE`).
 pub const PATH_CAP: usize = 4096;
@@ -63,6 +90,30 @@ pub enum MemoryLevel {
     Warn,
     /// The kernel is about to kill processes.
     Critical,
+}
+
+impl MemoryLevel {
+    /// Return the canonical lowercase name (`"normal"`, `"warn"`, `"critical"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Warn => "warn",
+            Self::Critical => "critical",
+        }
+    }
+
+    /// Return `true` when memory pressure is above `Normal` (`Warn` or `Critical`).
+    #[must_use]
+    pub const fn is_elevated(self) -> bool {
+        !matches!(self, Self::Normal)
+    }
+
+    /// Return `true` when memory pressure is `Critical`.
+    #[must_use]
+    pub const fn is_critical(self) -> bool {
+        matches!(self, Self::Critical)
+    }
 }
 
 /// The working directory of process `pid`, read from the OS: `None` where it
@@ -113,6 +164,35 @@ pub fn process_path(pid: u32) -> Option<std::path::PathBuf> {
     }
 }
 
+/// The kernel's name for process `pid` when it LEADS a process group no
+/// other process is in, else `None`: the executable's name as the kernel
+/// keeps it (`p_comm` on macOS: `zsh` for a
+/// login shell whose `argv[0]` is `-zsh`, the new image's name the moment
+/// an `exec` replaces it), read now. A citation asks it of a shell in front
+/// (`aterm-gui`'s `path_link::runs_here`): a non-interactive shell keeps the
+/// children it starts in its own group, so a script whose body is `ssh prod`
+/// leads a group the ssh is in, and its name alone says nothing of where its
+/// output comes from.
+///
+/// macOS lists the group (`PROC_PIDT_SHORTBSDINFO`, then
+/// `proc_listpids(PROC_PGRP_ONLY)`) and requires a complete, positive listing
+/// of the leader alone. Linux has no complete group reader here: a leader's
+/// own children miss orphaned grandchildren, so it answers `None`, as do
+/// other unsupported platforms. Unreadable or possibly truncated answers
+/// also return `None`. This is a snapshot, not a process-lifetime guarantee.
+#[must_use]
+pub fn lone_group_leader(pid: u32) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::lone_group_leader(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// At most this many members of one process group are measured
 /// ([`group_memory`]): a 1 KiB pid buffer. An agent's group is its own
 /// process and the few helpers it forks without a group of their own.
@@ -136,6 +216,57 @@ pub struct GroupMemory {
     pub footprint_mib: u64,
     /// How many members were measured (another user's are skipped).
     pub measured: u32,
+}
+
+impl GroupMemory {
+    /// Encode this `GroupMemory` reading into 16 little-endian bytes (`pgid`, `measured`, `footprint_mib`).
+    #[must_use]
+    pub const fn encode_le(self) -> [u8; 16] {
+        [
+            self.pgid as u8,
+            (self.pgid >> 8) as u8,
+            (self.pgid >> 16) as u8,
+            (self.pgid >> 24) as u8,
+            self.measured as u8,
+            (self.measured >> 8) as u8,
+            (self.measured >> 16) as u8,
+            (self.measured >> 24) as u8,
+            self.footprint_mib as u8,
+            (self.footprint_mib >> 8) as u8,
+            (self.footprint_mib >> 16) as u8,
+            (self.footprint_mib >> 24) as u8,
+            (self.footprint_mib >> 32) as u8,
+            (self.footprint_mib >> 40) as u8,
+            (self.footprint_mib >> 48) as u8,
+            (self.footprint_mib >> 56) as u8,
+        ]
+    }
+
+    /// Decode 16 little-endian bytes into a `GroupMemory` reading.
+    #[must_use]
+    pub const fn decode_le(bytes: [u8; 16]) -> Self {
+        let pgid = (bytes[0] as u32)
+            | ((bytes[1] as u32) << 8)
+            | ((bytes[2] as u32) << 16)
+            | ((bytes[3] as u32) << 24);
+        let measured = (bytes[4] as u32)
+            | ((bytes[5] as u32) << 8)
+            | ((bytes[6] as u32) << 16)
+            | ((bytes[7] as u32) << 24);
+        let footprint_mib = (bytes[8] as u64)
+            | ((bytes[9] as u64) << 8)
+            | ((bytes[10] as u64) << 16)
+            | ((bytes[11] as u64) << 24)
+            | ((bytes[12] as u64) << 32)
+            | ((bytes[13] as u64) << 40)
+            | ((bytes[14] as u64) << 48)
+            | ((bytes[15] as u64) << 56);
+        Self {
+            pgid,
+            footprint_mib,
+            measured,
+        }
+    }
 }
 
 /// The memory of `pid`'s whole PROCESS GROUP ([`GroupMemory`]): a Claude
@@ -193,6 +324,62 @@ pub struct MachineMemory {
     pub used_mib: u64,
 }
 
+impl MachineMemory {
+    /// Return `available_mib.saturating_add(used_mib)`.
+    #[must_use]
+    pub const fn total_estimated_mib(self) -> u64 {
+        self.available_mib.saturating_add(self.used_mib)
+    }
+
+    /// Encode this `MachineMemory` reading into 16 little-endian bytes (`available_mib`, `used_mib`).
+    #[must_use]
+    pub const fn encode_le(self) -> [u8; 16] {
+        [
+            self.available_mib as u8,
+            (self.available_mib >> 8) as u8,
+            (self.available_mib >> 16) as u8,
+            (self.available_mib >> 24) as u8,
+            (self.available_mib >> 32) as u8,
+            (self.available_mib >> 40) as u8,
+            (self.available_mib >> 48) as u8,
+            (self.available_mib >> 56) as u8,
+            self.used_mib as u8,
+            (self.used_mib >> 8) as u8,
+            (self.used_mib >> 16) as u8,
+            (self.used_mib >> 24) as u8,
+            (self.used_mib >> 32) as u8,
+            (self.used_mib >> 40) as u8,
+            (self.used_mib >> 48) as u8,
+            (self.used_mib >> 56) as u8,
+        ]
+    }
+
+    /// Decode 16 little-endian bytes into a `MachineMemory` reading.
+    #[must_use]
+    pub const fn decode_le(bytes: [u8; 16]) -> Self {
+        let available_mib = (bytes[0] as u64)
+            | ((bytes[1] as u64) << 8)
+            | ((bytes[2] as u64) << 16)
+            | ((bytes[3] as u64) << 24)
+            | ((bytes[4] as u64) << 32)
+            | ((bytes[5] as u64) << 40)
+            | ((bytes[6] as u64) << 48)
+            | ((bytes[7] as u64) << 56);
+        let used_mib = (bytes[8] as u64)
+            | ((bytes[9] as u64) << 8)
+            | ((bytes[10] as u64) << 16)
+            | ((bytes[11] as u64) << 24)
+            | ((bytes[12] as u64) << 32)
+            | ((bytes[13] as u64) << 40)
+            | ((bytes[14] as u64) << 48)
+            | ((bytes[15] as u64) << 56);
+        Self {
+            available_mib,
+            used_mib,
+        }
+    }
+}
+
 /// The machine's memory available and in use now (`HOST_VM_INFO64` on macOS,
 /// `/proc/meminfo` on Linux), `None` where unknown. What the memory ceiling
 /// moves with (`aterm_agent::supervise::memory`).
@@ -226,7 +413,7 @@ pub fn machine_memory() -> Option<MachineMemory> {
 /// is known: a purgeable page may also sit on the inactive queue, so the sum
 /// can count one twice. `None` for a zero page size.
 #[must_use]
-pub fn available_mib_of(
+pub const fn available_mib_of(
     free: u64,
     inactive: u64,
     purgeable: u64,
@@ -238,7 +425,11 @@ pub fn available_mib_of(
     }
     let pages = free.saturating_add(inactive).saturating_add(purgeable);
     let mib = pages.saturating_mul(page_bytes) >> 20;
-    Some(physical_mib.map_or(mib, |p| mib.min(p)))
+    let clamped = match physical_mib {
+        Some(p) if p < mib => p,
+        _ => mib,
+    };
+    Some(clamped)
 }
 
 /// The kernel's memory pressure level now
@@ -382,6 +573,49 @@ pub(crate) fn read_bounded_bytes(path: &Path) -> Result<Vec<u8>, std::io::ErrorK
     Ok(buf[..n].to_vec())
 }
 
+/// Read `path` into `buf`, at most `buf.len()` bytes, never to EOF: how many
+/// bytes were read, and whether the file holds more than the buffer (one
+/// byte past it is asked for). No heap: the caller owns the buffer.
+pub(crate) fn read_into(path: &Path, buf: &mut [u8]) -> Result<(usize, bool), std::io::ErrorKind> {
+    let mut f = std::fs::File::open(path).map_err(|e| e.kind())?;
+    let mut n = 0;
+    while n < buf.len() {
+        match f.read(&mut buf[n..]) {
+            Ok(0) => return Ok((n, false)),
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.kind()),
+        }
+    }
+    let mut one = [0u8; 1];
+    loop {
+        match f.read(&mut one) {
+            Ok(k) => return Ok((n, k > 0)),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.kind()),
+        }
+    }
+}
+
+/// `f` over the text of at most [`READ_CAP`] bytes of `path`, read into one
+/// stack buffer ([`read_bounded`] without its heap copy); `None` when the
+/// file cannot be read. Bytes that are not UTF-8 end the text where they
+/// start.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn with_bounded<T>(path: &Path, f: impl FnOnce(&str) -> T) -> Option<T> {
+    let mut buf = [0u8; READ_CAP];
+    let (n, _) = read_into(path, &mut buf).ok()?;
+    Some(f(utf8_prefix(&buf[..n])))
+}
+
+/// The longest UTF-8 prefix of `bytes`.
+pub(crate) fn utf8_prefix(bytes: &[u8]) -> &str {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or_default(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pure pieces the platform arms share (compiled everywhere, tested here).
 // ---------------------------------------------------------------------------
@@ -390,8 +624,7 @@ pub(crate) fn read_bounded_bytes(path: &Path) -> Result<Vec<u8>, std::io::ErrorK
 /// memory (internal pages less purgeable ones) plus wired plus the pages the
 /// compressor occupies, from `HOST_VM_INFO64`. `None` for a zero page size.
 #[must_use]
-#[cfg(any(target_os = "macos", test))]
-pub fn used_mib_of(
+pub const fn used_mib_of(
     internal: u64,
     purgeable: u64,
     wired: u64,
@@ -401,15 +634,22 @@ pub fn used_mib_of(
     if page_bytes == 0 {
         return None;
     }
-    let pages = internal.saturating_sub(purgeable) + wired + compressor;
-    u32::try_from(pages.saturating_mul(page_bytes) >> 20).ok()
+    let pages = internal
+        .saturating_sub(purgeable)
+        .saturating_add(wired)
+        .saturating_add(compressor);
+    let mib = pages.saturating_mul(page_bytes) >> 20;
+    if mib <= (u32::MAX as u64) {
+        Some(mib as u32)
+    } else {
+        None
+    }
 }
 
 /// `kern.memorystatus_vm_pressure_level` as a level: 1 normal, 2 warn,
 /// 4 critical; anything else unknown.
 #[must_use]
-#[cfg(any(target_os = "macos", test))]
-pub fn pressure_of(level: i64) -> Option<MemoryLevel> {
+pub const fn pressure_of(level: i64) -> Option<MemoryLevel> {
     match level {
         1 => Some(MemoryLevel::Normal),
         2 => Some(MemoryLevel::Warn),

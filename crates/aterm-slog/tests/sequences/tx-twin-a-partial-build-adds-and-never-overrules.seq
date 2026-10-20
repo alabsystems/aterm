@@ -1,0 +1,25 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_partial_build_adds_and_never_overrules (S9).
+state partial
+bind 0
+see busy
+tx prompt v1
+tx tool c1
+tx result c1
+tx end
+tx model model=claude-opus-4-1 effort=high ver=2.1.3
+see wall:usage-session
+tx wall usage-session confirm
+tx wall usage-session refute
+see busy
+see idle
+wait 1000
+tx endwall usage-session
+tx prompt v2
+state on
+see busy
+tx prompt v3
+tx end
+expect close t1 turn out=done src=screen
+expect close t2 turn out=superseded by=vendor src=transcript
+expect close t3 turn out=done by=vendor src=transcript

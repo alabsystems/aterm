@@ -83,7 +83,8 @@ fn read_of(items: &[(&str, &str, Vec<String>)]) -> Read {
     for (node, sid, bodies) in items {
         for b in bodies {
             off += 1;
-            r.ingest(FLEET, None, off, &face(node, sid), b.as_bytes());
+            r.ingest(FLEET, None, off, &face(node, sid), b.as_bytes())
+                .expect("within the read's session bound");
         }
     }
     r
@@ -341,4 +342,91 @@ fn many_sessions_are_held_to_the_budget() {
     assert_eq!(shown + more, 60, "{text}");
     assert!(shown > 0);
     assert!(text.contains("@s-59@n-1"), "the newest first: {text}");
+}
+
+/// The real roster and fold share a bounded read. Existing entries still
+/// accept updated presence and records when full; another session or node
+/// refuses the read rather than silently rendering a complete-looking subset.
+#[test]
+fn a_brief_refuses_a_roster_or_fold_past_its_session_bound() {
+    let body = b"v=2 t=1 ep=1 seq=1 ms=1 op=open node=- k=spawn src=aterm conf=exact";
+    let mut r = Read::default();
+    r.presence("n-1", "s-0000", b"state=live inc=1").unwrap();
+    r.ingest(FLEET, None, 1, &face("n-1", "s-0000"), body)
+        .unwrap();
+    assert_eq!(r.sessions.len(), 1);
+    assert_eq!(
+        r.sessions[&("n-1".to_string(), "s-0000".to_string())]
+            .spaces
+            .len(),
+        1
+    );
+    for i in 1..SESSIONS_MAX {
+        r.presence("n-1", &format!("s-{i:04}"), b"state=live inc=1")
+            .unwrap();
+    }
+    assert_eq!(r.sessions.len(), SESSIONS_MAX);
+    r.presence("n-1", "s-0000", b"state=exited inc=2").unwrap();
+    r.ingest(FLEET, None, 2, &face("n-1", "s-0000"), body)
+        .unwrap();
+    let s = &r.sessions[&("n-1".to_string(), "s-0000".to_string())];
+    assert_eq!(
+        (s.presence.as_deref(), s.presence_inc, s.newest_off),
+        (Some("exited"), Some(2), 2)
+    );
+    let roster_refused = r
+        .presence("n-1", "s-overflow", b"state=live inc=1")
+        .is_err();
+    let fold_refused = r
+        .ingest(FLEET, None, 3, &face("n-1", "s-overflow"), body)
+        .is_err();
+
+    // An event-only session has the same admission boundary as a roster row.
+    let mut records = Read::default();
+    for i in 0..SESSIONS_MAX {
+        records
+            .ingest(
+                FLEET,
+                None,
+                i as u64,
+                &face("n-1", &format!("s-{i:04}")),
+                body,
+            )
+            .unwrap();
+    }
+    records
+        .ingest(
+            FLEET,
+            None,
+            SESSIONS_MAX as u64,
+            &face("n-1", "s-0000"),
+            body,
+        )
+        .unwrap();
+    let records_refused = records
+        .ingest(FLEET, None, 9, &face("n-1", "s-overflow"), body)
+        .is_err();
+
+    let mut nodes = Read::default();
+    for i in 0..SESSIONS_MAX {
+        nodes
+            .presence(&format!("n-{i:04}"), "node", b"state=live inc=1")
+            .unwrap();
+    }
+    nodes.presence("n-0000", "node", b"state=gone").unwrap();
+    nodes
+        .presence("n-0000", "node", b"state=live inc=2")
+        .unwrap();
+    assert_eq!(nodes.node_inc.get("n-0000"), Some(&2));
+    let nodes_refused = nodes.presence("n-overflow", "node", b"state=gone").is_err();
+    assert!(
+        roster_refused
+            && fold_refused
+            && records_refused
+            && nodes_refused
+            && r.sessions.len() == SESSIONS_MAX
+            && records.sessions.len() == SESSIONS_MAX
+            && nodes.node_inc.len() + nodes.nodes_gone.len() == SESSIONS_MAX,
+        "BRIEF_ROSTER_AND_FOLD_MUST_SHARE_THE_BOUND"
+    );
 }

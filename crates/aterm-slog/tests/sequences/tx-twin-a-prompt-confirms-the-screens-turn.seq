@@ -1,0 +1,10 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of transcript_replays::a_prompt_confirms_the_screens_turn_in_its_window
+# (§2.5 row 1, §2.6 row 1): the screen's turn, opened within 5 s before
+# the prompt, is confirmed by an exact vref= amend.
+bind 0
+see busy
+pass 5000
+tx prompt v1
+expect amend t1 turn vref=v1 by=vendor src=transcript conf=exact
+expect tx mapped=t1

@@ -12,6 +12,7 @@ fn words(list: &[&str]) -> Vec<String> {
 /// `argv[1]`; a binary is the kernel's image. Negative controls: a wrapper running Claude as a
 /// child (`caffeinate claude`), a relative `argv[1]`, and an image neither named claude, native
 /// nor registered.
+#[cfg(unix)]
 #[test]
 fn the_program_is_the_script_or_the_image_that_is_claude() {
     let native = Path::new("/h/.local/share/claude/versions");
@@ -222,6 +223,11 @@ fn a_step_is_relaunched_left_not_yet_or_never() {
     );
     assert_eq!(outcome("done:fresh"), Outcome::Relaunched);
     assert_eq!(
+        outcome("done:resumed"),
+        Outcome::Relaunched,
+        "the crash rule's relaunch of a self-claimed codex-alab landed: its TUI leads the tab"
+    );
+    assert_eq!(
         outcome("done:no-continue"),
         Outcome::NotYet("done:no-continue".to_string()),
         "a carry-on that typed nothing is no relaunch"
@@ -400,6 +406,7 @@ fn an_exit_is_relaunched_only_where_the_relaunch_would_plan_it() {
     const ID: &str = "0badf00d-1111-2222-3333-444455556666";
     let snap = |argv: &[&str]| Snapshot {
         stored_login: false,
+        profile: None,
         tab: "s-1".to_string(),
         pid: 4242,
         start: "Thu Sep 24 01:02:03 2026".to_string(),
@@ -498,6 +505,7 @@ fn a_snapshot_follows_its_own_process_and_nothing_else() {
     let start = "Thu Sep 24 01:02:03 2026";
     let snap = Snapshot {
         stored_login: false,
+        profile: None,
         tab: "s-1".to_string(),
         pid: 4242,
         start: start.to_string(),
@@ -1470,14 +1478,13 @@ fn the_resumed_prompt_is_one_line_and_keeps_going() {
     }
 }
 
-/// AN EXIT NO LOOK DECIDES IS READ BY NOTHING: an agent with no lane (agy, Gemini CLI) has no
-/// snapshot taken (`AgentRun` has no variant for them), and a Codex's end is aterm's copy of
-/// codex-alab's own record's to decide (the Codex screen lane's retirement, 2026-10-16). A look
-/// handed in for one decides nothing at once ([`ExitRecord::Unread`]) — never Claude Code's
-/// record-gone reading (`Removed`) nor its survivor (`Survived`), and never a shell's word.
-/// NEGATIVE CONTROL: the same look as Claude Code's, its record gone, is `Removed`; and as Muse
-/// Code's, by its own table: a crash `Crashed`, a refused start `Refused` (never a crash), a
-/// clean end `Removed`, and no word within the wait `Unread`.
+/// AN EXIT NO LOOK DECIDES IS READ BY NOTHING: a Codex's end is aterm's copy of codex-alab's
+/// own record's to decide (the Codex screen lane's retirement, 2026-10-16). A look handed in
+/// for one decides nothing at once ([`ExitRecord::Unread`]) — never Claude Code's record-gone
+/// reading (`Removed`) nor its survivor (`Survived`), and never a shell's word. NEGATIVE
+/// CONTROL: the same look as Claude Code's, its record gone, is `Removed`; and as Muse Code's,
+/// agy's or Gemini CLI's, by each one's own table: a crash `Crashed`, a refused start
+/// `Refused` (never a crash), a clean end `Removed`, and no verdict within the wait `Unread`.
 #[test]
 fn an_exit_of_an_agent_with_no_lane_is_read_by_nothing() {
     let look = |agent| ExitLook {
@@ -1487,11 +1494,8 @@ fn an_exit_of_an_agent_with_no_lane_is_read_by_nothing() {
         crashed: Some(true),
         refused: false,
     };
-    for agent in [
-        upgrade::Agent::Agy,
-        upgrade::Agent::Gemini,
-        upgrade::Agent::Codex,
-    ] {
+    {
+        let agent = upgrade::Agent::Codex;
         let mut looks = 0;
         let left = exit_record(
             || {
@@ -1506,28 +1510,38 @@ fn an_exit_of_an_agent_with_no_lane_is_read_by_nothing() {
         exit_record(|| Some(look(upgrade::Agent::Claude)), |_| true),
         ExitRecord::Removed
     );
-    let muse = |crashed: Option<bool>, refused: bool| ExitLook {
-        crashed,
-        refused,
-        ..look(upgrade::Agent::Muse)
-    };
-    for (crashed, refused, want) in [
-        (Some(true), false, ExitRecord::Crashed),
-        (Some(false), true, ExitRecord::Refused),
-        (Some(false), false, ExitRecord::Removed),
+    for lane in [
+        upgrade::Agent::Muse,
+        upgrade::Agent::Agy,
+        upgrade::Agent::Gemini,
     ] {
-        assert_eq!(exit_record(|| Some(muse(crashed, refused)), |_| true), want);
+        let shell = |crashed: Option<bool>, refused: bool| ExitLook {
+            crashed,
+            refused,
+            ..look(lane)
+        };
+        for (crashed, refused, want) in [
+            (Some(true), false, ExitRecord::Crashed),
+            (Some(false), true, ExitRecord::Refused),
+            (Some(false), false, ExitRecord::Removed),
+        ] {
+            assert_eq!(
+                exit_record(|| Some(shell(crashed, refused)), |_| true),
+                want,
+                "{lane:?}"
+            );
+        }
+        let mut looks = 0;
+        let left = exit_record(
+            || {
+                looks += 1;
+                Some(shell(None, false))
+            },
+            |_| true,
+        );
+        assert_eq!(left, ExitRecord::Unread, "{lane:?}");
+        assert!(looks > 1, "{lane:?}: waited for the shell's word: {looks}");
     }
-    let mut looks = 0;
-    let left = exit_record(
-        || {
-            looks += 1;
-            Some(muse(None, false))
-        },
-        |_| true,
-    );
-    assert_eq!(left, ExitRecord::Unread);
-    assert!(looks > 1, "waited for the shell's word: {looks}");
     assert!(
         !ExitRecord::Refused.crashed(),
         "a refused start is no crash"
@@ -1995,6 +2009,7 @@ fn the_relaunch_line_carries_the_login_in_every_shells_form() {
 /// `CLAUDE_CONFIG_DIR` is relaunched with exactly that value, ahead of the login and the survey
 /// switch, in every shell's form. A home no line can hold refuses the line, and no relaunch is
 /// promised for it. Negative control: no home, the line is byte for byte what it was.
+#[cfg(unix)]
 #[test]
 fn the_relaunch_line_carries_the_claude_home_its_agent_ran_under() {
     const HOME: &str = "/tmp/lab home/.claude";
@@ -2080,6 +2095,7 @@ fn the_relaunch_line_carries_the_claude_home_its_agent_ran_under() {
     // Whether an exit is promised a relaunch asks the same line, home and all.
     let snap = |home: Option<String>| Snapshot {
         stored_login: false,
+        profile: None,
         tab: "s-1".to_string(),
         pid: 4242,
         start: "Thu Sep 24 01:02:03 2026".to_string(),
@@ -2123,6 +2139,7 @@ fn the_relaunch_line_carries_the_claude_home_its_agent_ran_under() {
 fn an_exit_is_promised_a_relaunch_only_where_the_line_can_hold_its_login() {
     let snap = |login: Option<String>| Snapshot {
         stored_login: false,
+        profile: None,
         tab: "s-1".to_string(),
         pid: 4242,
         start: "Thu Sep 24 01:02:03 2026".to_string(),
@@ -2159,6 +2176,7 @@ fn an_exit_is_promised_a_relaunch_only_where_the_line_can_hold_its_login() {
 /// that row, byte for byte; unset and empty are both the row with no directory. Negative controls:
 /// another row's directory, a directory with a trailing slash (another login to the vendor), and a
 /// roster with no such row.
+#[cfg(unix)]
 #[test]
 fn a_label_is_a_login_only_through_the_roster() {
     let roster = accounts::Roster::parse(&format!(
@@ -2172,6 +2190,7 @@ fn a_label_is_a_login_only_through_the_roster() {
     assert_eq!(account_login(&accounts::Roster::default(), "main"), None);
     let on = |login: Option<&str>| Snapshot {
         stored_login: false,
+        profile: None,
         tab: "s-1".to_string(),
         pid: 4242,
         start: String::new(),
@@ -2442,6 +2461,7 @@ fn an_account_move_over_another_restart_in_flight_is_not_tried() {
 /// controls, each adding nothing: no roster; one account listed; two listed and one enrolled; no
 /// `active`; an `active` not proven; one the roster no longer lists, or not enrolled here; one
 /// known signed out; and a leaf whose Claude home is not the default.
+#[cfg(unix)]
 #[test]
 fn a_cold_relaunch_carries_the_proven_active_account_and_nothing_else() {
     use std::collections::BTreeSet;
@@ -2532,6 +2552,73 @@ fn a_cold_relaunch_carries_the_proven_active_account_and_nothing_else() {
     );
 }
 
+/// A RELAUNCH LINE TYPED IS ON ITS RECORD BEFORE ANYTHING AFTER IT RUNS
+/// (ATERM-KI-1016-1 host-5): a step that panics after the line is typed —
+/// in the ledger's line, or anything later — leaves the record `Relaunched`
+/// with the line's block and no adopted process, so the next step awaits
+/// that line's agent and never types it again. NEGATIVE CONTROL: what runs
+/// after it reads the record as saved.
+#[cfg(unix)]
+#[test]
+fn a_typed_relaunch_line_is_recorded_before_anything_after_it() {
+    const ID: &str = "0badf00d-1111-2222-3333-77778888aaaa";
+    let dir = crate::supervise::ScratchDir::new("relaunch", "typed-recorded");
+    let o = Opts {
+        home: dir.join("home"),
+        state: dir.join("state"),
+        sock: None,
+        only_sid: None,
+        dry_run: false,
+        human_grace_s: 0,
+        hand_back: true,
+        background: false,
+        aterm_state: None,
+        ask: false,
+        several_logins: false,
+        usage_credits: false,
+        instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
+        usage_tap: None,
+        agents_off: Vec::new(),
+        land: false,
+        timings: crate::harness::Timings::FAST,
+    };
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let mut st = St {
+        phase: upgrade::Phase::Exiting {
+            at_s: 1_791_477_331,
+        },
+        cause: CAUSE_HOST.to_string(),
+        tab: "s-restored".to_string(),
+        line: "claude --resume 0badf00d".to_string(),
+        relaunched_pid: 4242,
+        ..St::default()
+    };
+    save(&o, ID, &st);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        typed_recorded(&o, &mut st, ID, Some(7), |seen| {
+            let saved = load(&o, ID).expect("the record");
+            assert_eq!(saved.phase, seen.phase, "saved before what runs after it");
+            panic!("the ledger's line panics (a test's)");
+        });
+    }));
+    assert!(panicked.is_err());
+    let saved = load(&o, ID).expect("the record");
+    assert!(
+        matches!(saved.phase, upgrade::Phase::Relaunched { .. }),
+        "{:?}",
+        saved.phase
+    );
+    assert_eq!(saved.line_block, Some(7));
+    assert_eq!(
+        saved.relaunched_pid, 0,
+        "no process of the new line adopted"
+    );
+    assert!(
+        in_flight_here(&o, "s-restored", ID),
+        "the next step reads it in flight: awaited, never typed"
+    );
+}
+
 /// WHETHER THE AGENT A RELAUNCH ADOPTED IS GONE, by the conversation's
 /// record (the residual review's R5): in flight, with the adopted process
 /// on it, `Some(true)` for one that is no process now (a reaped child),
@@ -2559,6 +2646,7 @@ fn whether_the_adopted_agent_is_gone_is_the_records_to_say() {
         aterm_state: None,
         ask: false,
         several_logins: false,
+        usage_credits: false,
         instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
         usage_tap: None,
         agents_off: Vec::new(),
@@ -2588,6 +2676,26 @@ fn whether_the_adopted_agent_is_gone_is_the_records_to_say() {
         adopted_gone(&o, "s-restored", ID)
     };
     let gone = |phase: upgrade::Phase, pid: u32| gone_in("s-restored", phase, pid);
+    // IN FLIGHT HERE, ADOPTED OR NOT (ATERM-KI-1016-1 host-5): a relaunch's
+    // record is in flight before its line is typed, none adopted yet; another
+    // tab's and one not in flight are not.
+    let here_in = |tab: &str, phase: upgrade::Phase| {
+        let _ = gone_in(tab, phase, 0);
+        in_flight_here(&o, "s-restored", ID)
+    };
+    assert!(here_in(
+        "s-restored",
+        upgrade::Phase::Exiting {
+            at_s: 1_791_477_331
+        }
+    ));
+    assert!(!here_in(
+        "s-before-aterm-ended",
+        upgrade::Phase::Exiting {
+            at_s: 1_791_477_331
+        }
+    ));
+    assert!(!here_in("s-restored", upgrade::Phase::Done));
     let flight = || upgrade::Phase::Relaunched {
         at_s: 1_791_477_331,
     };
@@ -2613,16 +2721,19 @@ fn whether_the_adopted_agent_is_gone_is_the_records_to_say() {
 
 /// A RELAUNCH-ONLY LANE'S WORKER CARRIES ITS OWN AGENT'S RECORD ALONE
 /// ([`owed_of`], [`resume_as`]'s `only`; the review of the Muse Code lane's
-/// rehome, 2026-10-17): a codex-alab's relaunch left owed in the tab is the
-/// sweep's (`lanes::sweep_carries_relaunch`), so a Muse Code worker's host
-/// neither parks for it nor carries it — `current`, the record still owed as
-/// it lies. NEGATIVE CONTROLS: asked for any agent's (Claude Code's worker,
-/// as on main) or for Codex's, it is owed; a Muse Code record in the same tab
-/// is the Muse worker's; another tab owes nothing.
+/// rehome, 2026-10-17; agy's lane, the same): a codex-alab's relaunch left
+/// owed in the tab is the sweep's (`lanes::sweep_carries_relaunch`), so
+/// neither a Muse Code worker's host nor an agy worker's parks for it or
+/// carries it — `current`, the record still owed as it lies — and one
+/// relaunch-only lane's record is never the other's worker's. NEGATIVE
+/// CONTROLS: asked for any agent's (Claude Code's worker, as on main) or for
+/// Codex's, it is owed; a Muse Code record in the same tab is the Muse
+/// worker's, an agy record the agy worker's; another tab owes nothing.
 #[test]
 fn a_relaunch_only_lanes_worker_is_owed_its_own_agents_record_alone() {
     const CODEX: &str = "019a0c3e-7d1f-7b52-9e41-5a6b7c8d9e0f";
     const MUSE: &str = "01a148f8-9301-7752-96db-fef456f88074";
+    const AGY: &str = "eaeec4fb-4e43-47da-b46f-8a10c0fee186";
     let dir = crate::supervise::ScratchDir::new("relaunch", "owed-of");
     let o = Opts {
         home: dir.join("home"),
@@ -2636,6 +2747,7 @@ fn a_relaunch_only_lanes_worker_is_owed_its_own_agents_record_alone() {
         aterm_state: None,
         ask: false,
         several_logins: false,
+        usage_credits: false,
         instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
         usage_tap: None,
         agents_off: Vec::new(),
@@ -2650,20 +2762,22 @@ fn a_relaunch_only_lanes_worker_is_owed_its_own_agents_record_alone() {
         ..St::default()
     };
     save(&o, CODEX, &codex);
-    assert!(
-        !owed_of(&o, Some(upgrade::Agent::Muse)),
-        "the sweep's: not the Muse worker's"
-    );
-    assert_eq!(
-        resume_as(&o, false, Some(upgrade::Agent::Muse)).step,
-        "current",
-        "nothing carried for the Muse worker"
-    );
-    assert_eq!(
-        load(&o, CODEX).map(|st| st.phase),
-        Some(codex.phase.clone()),
-        "its record as it lies"
-    );
+    for lane in [upgrade::Agent::Muse, upgrade::Agent::Agy] {
+        assert!(
+            !owed_of(&o, Some(lane)),
+            "the sweep's: not the {lane:?} worker's"
+        );
+        assert_eq!(
+            resume_as(&o, false, Some(lane)).step,
+            "current",
+            "nothing carried for the {lane:?} worker"
+        );
+        assert_eq!(
+            load(&o, CODEX).map(|st| st.phase),
+            Some(codex.phase.clone()),
+            "its record as it lies"
+        );
+    }
     // NEGATIVE CONTROLS.
     assert!(owed_of(&o, None), "any agent's: owed");
     assert!(owed(&o), "any agent's: owed");
@@ -2674,6 +2788,45 @@ fn a_relaunch_only_lanes_worker_is_owed_its_own_agents_record_alone() {
     };
     save(&o, MUSE, &muse);
     assert!(owed_of(&o, Some(upgrade::Agent::Muse)), "its own agent's");
+    // The Muse Code's record is not the agy worker's either.
+    assert!(
+        !owed_of(&o, Some(upgrade::Agent::Agy)),
+        "a Muse Code's: not the agy worker's"
+    );
+    assert_eq!(
+        resume_as(&o, false, Some(upgrade::Agent::Agy)).step,
+        "current",
+        "nothing carried for the agy worker"
+    );
+    assert_eq!(
+        load(&o, MUSE).map(|st| st.phase),
+        Some(muse.phase.clone()),
+        "the Muse Code's record as it lies"
+    );
+    let agy = St {
+        agent: upgrade::Agent::Agy,
+        ..codex.clone()
+    };
+    save(&o, AGY, &agy);
+    assert!(owed_of(&o, Some(upgrade::Agent::Agy)), "its own agent's");
+    // An agy record alone in a tab is no Muse Code worker's.
+    let agy_tab = Opts {
+        only_sid: Some("s-agy".to_string()),
+        ..o.clone()
+    };
+    save(
+        &agy_tab,
+        "5c1a7e2b-3d4f-4a6b-8c9d-0e1f2a3b4c5d",
+        &St {
+            tab: "s-agy".to_string(),
+            ..agy.clone()
+        },
+    );
+    assert!(owed_of(&agy_tab, Some(upgrade::Agent::Agy)), "its own");
+    assert!(
+        !owed_of(&agy_tab, Some(upgrade::Agent::Muse)),
+        "an agy's: not the Muse worker's"
+    );
     let other = Opts {
         only_sid: Some("s-other".to_string()),
         ..o.clone()
@@ -2732,6 +2885,7 @@ fn a_limit_row_a_move_left_is_no_standing_limit() {
         aterm_state: None,
         ask: false,
         several_logins: false,
+        usage_credits: false,
         usage_tap: None,
         instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
@@ -2756,6 +2910,7 @@ fn a_limit_row_a_move_left_is_no_standing_limit() {
         home: None,
         claude_dir: None,
         stored_login: false,
+        profile: None,
     };
     let standing = |cause: Option<&str>, relaunched_at: u64, tail: &str| {
         let _ = std::fs::remove_file(state_dir(&o).join(format!("{ID}.json")));
@@ -2957,6 +3112,7 @@ fn a_move_to_the_default_login_is_met_by_an_unset_variable_under_the_default_hom
         aterm_state: None,
         ask: false,
         several_logins: false,
+        usage_credits: false,
         usage_tap: None,
         instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
@@ -2980,6 +3136,7 @@ fn a_move_to_the_default_login_is_met_by_an_unset_variable_under_the_default_hom
         home: home.map(str::to_owned),
         claude_dir: None,
         stored_login: false,
+        profile: None,
     };
     // Whether the weekly row stands for `live` after a move to `target`.
     let stands = |target: &str, live: &Snapshot| {
@@ -3019,6 +3176,15 @@ fn a_move_to_the_default_login_is_met_by_an_unset_variable_under_the_default_hom
         "the default named under another home"
     );
     assert!(!stands("/accts/work-2", &live(Some("/accts/work-2"), None)));
+    // Unset under another home is the login that home's directory names
+    // (the vendor hashes `CLAUDE_CONFIG_DIR` verbatim for the keychain item
+    // then, the accounts design §1): a move to that login is met by it
+    // (ATERM-KI-1016-1's unset login variable). Read as no login, the old
+    // account's row held the loop until that account reset.
+    assert!(
+        !stands("/alt", &live(None, Some("/alt"))),
+        "unset under the home the move's login names"
+    );
     // NEGATIVE CONTROLS: the limit stands.
     assert!(
         stands("", &live(None, Some("/alt"))),
@@ -3036,6 +3202,14 @@ fn a_move_to_the_default_login_is_met_by_an_unset_variable_under_the_default_hom
         stands("/accts/work-2", &live(Some(""), None)),
         "CONTROL: the default against another account's login"
     );
+    assert!(
+        stands("/alt", &live(Some(""), Some("/alt"))),
+        "CONTROL: the default named under that home is not its login"
+    );
+    assert!(
+        stands("/alt/", &live(None, Some("/alt"))),
+        "CONTROL: the string is hashed as given, a trailing slash another login"
+    );
 }
 
 /// THE COMMAND A PERSON IS TOLD CARRIES THE HOME ITS RELAUNCH CARRIES
@@ -3047,6 +3221,7 @@ fn a_move_to_the_default_login_is_met_by_an_unset_variable_under_the_default_hom
 /// move gets no command at all. CONTROL: an agent under the user's own home
 /// is told exactly the line it always was ([`super::super::resume::command`]),
 /// and a login is never on it.
+#[cfg(unix)]
 #[test]
 fn the_command_a_person_is_told_carries_the_home_its_relaunch_carries() {
     let user = Path::new("/u/me");
@@ -3066,6 +3241,7 @@ fn the_command_a_person_is_told_carries_the_home_its_relaunch_carries() {
         home: home.map(str::to_string),
         claude_dir: claude_dir.map(PathBuf::from),
         stored_login: false,
+        profile: None,
     };
     let bare = format!("claude --verbose --resume {LOGIN_ID}");
     assert_eq!(
@@ -3111,6 +3287,7 @@ fn the_command_a_person_is_told_carries_the_home_its_relaunch_carries() {
 // ------------------------------------------------------------------------
 
 /// The tap's value for the installed app's path.
+#[cfg(unix)]
 fn tap_value() -> String {
     super::super::tap::settings_value(Path::new("/Applications/aterm.app/Contents/MacOS/aterm"))
         .expect("an admissible path")
@@ -3119,6 +3296,7 @@ fn tap_value() -> String {
 /// The tap rides before `--resume`, quoted as each shell needs it, and last on a fresh start; with
 /// none, [`line_tapped`]'s and [`line_for`]'s line is each shell's golden line, byte for byte.
 /// Negative control: [`with_tap`] never adds a second `--resume`.
+#[cfg(unix)]
 #[test]
 fn the_tap_rides_before_the_resume_in_every_shells_form() {
     let value = tap_value();
@@ -3185,6 +3363,7 @@ fn the_tap_rides_before_the_resume_in_every_shells_form() {
 /// the tap is relaunched without it, the login still first on the line; one that fits only without
 /// the tap and the survey switch keeps the login alone. Negative controls: a roomy line carries the
 /// tap and the switch, and one that cannot hold even what is required is still refused.
+#[cfg(unix)]
 #[test]
 fn the_tap_is_dropped_before_the_required_login() {
     let value = tap_value();
@@ -3263,6 +3442,7 @@ fn the_tap_is_dropped_before_the_required_login() {
 /// (`would-relaunch`, a dry run). NEGATIVE CONTROL: the same snapshot with no
 /// line is nobody's (`ended:no-lane`), whatever ended it: no Codex lane plans
 /// a relaunch any more (the Codex screen lane's retirement, 2026-10-16).
+#[cfg(unix)]
 #[test]
 fn a_relaunch_after_aterm_ended_is_made_on_the_carried_line_as_the_crash_rule_makes_it() {
     const UUID: &str = "0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77";
@@ -3287,6 +3467,7 @@ fn a_relaunch_after_aterm_ended_is_made_on_the_carried_line_as_the_crash_rule_ma
         aterm_state: None,
         ask: false,
         several_logins: false,
+        usage_credits: false,
         usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
@@ -3308,6 +3489,7 @@ fn a_relaunch_after_aterm_ended_is_made_on_the_carried_line_as_the_crash_rule_ma
     };
     let snap = |self_claimed: Option<super::super::self_claimed::Resume>| Snapshot {
         stored_login: false,
+        profile: None,
         tab: "s-1".to_string(),
         pid: dead,
         start: "Thu Oct 16 08:00:00 2026".to_string(),
@@ -3446,6 +3628,222 @@ fn an_adoption_promises_what_its_first_idle_point_does() {
     }
 }
 
+/// A WORKER'S FIRST LINE HANDS ITS TASK OVER AS ONE ARGUMENT, BYTE FOR BYTE
+/// (`spawn agent=claude`, [`task_launch_line`]): each shell runs the line it
+/// is written for, and the program it starts — a stand-in that writes its argv
+/// NUL-separated — gets `--model <m>`, `--`, then the task file's text with
+/// its trailing newlines trimmed, whatever the text holds: lines, both
+/// quotes, a `$(…)` and backticks the shell must not run, a leading `-`.
+/// The Claude home the line carries reaches the program's environment, and
+/// a `cat` alias of the person's (the line is typed at their prompt, where
+/// aliases expand inside `$(…)`) changes nothing.
+/// NEGATIVE CONTROLS: the same file EVALUATED does run its `$(…)` (so the
+/// check that nothing ran can see a run); a bare `cat` under that alias does
+/// hand over the alias's output (so the check that the alias changed nothing
+/// can see a change); and the task as a word of the line instead of the
+/// operand is refused by the line's bound at 60 KiB.
+#[cfg(unix)]
+#[test]
+fn a_workers_first_line_hands_the_task_over_as_one_argument() {
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("aterm-task-line")
+        .tempdir()
+        .expect("scratch dir");
+    let exe = tmp.path().join("claude");
+    std::fs::write(
+        &exe,
+        "#!/bin/sh\n{ for a in \"$@\"; do printf '%s\\000' \"$a\"; done; \
+         printf 'HOME_ENV=%s\\000' \"$CLAUDE_CONFIG_DIR\"; } > \"$ARGV_OUT\"\n",
+    )
+    .expect("write the stand-in");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let ran = tmp.path().join("ran");
+    let task = format!(
+        "-leading dash\nline two with 'single' and \"double\" quotes\n\
+         $(touch {ran}) and `touch {ran}` stay text\n\n\n",
+        ran = ran.display()
+    );
+    let file = tmp.path().join("task.txt");
+    std::fs::write(&file, &task).expect("write the task");
+    let mut shells = vec![(Dialect::Zsh, "/bin/zsh"), (Dialect::Bash, "/bin/bash")];
+    if !cfg!(target_os = "macos") {
+        shells.retain(|(_, sh)| Path::new(sh).exists());
+    }
+    // The stand-in's argv when `shell` runs `line` after `prelude`, on a line
+    // of its own (an alias takes effect from the next line on).
+    let run = |dialect: Dialect, shell: &str, prelude: &str, line: &str| {
+        let out = tmp.path().join(format!("argv-{}", dialect.hook_ext()));
+        let _ = std::fs::remove_file(&out);
+        let status = aterm_uds::spawnfd::command(shell)
+            .args(["-f", "-c", &format!("{prelude}\n{line}")])
+            .env("ATERM_TASK_FILE", &file)
+            .env("ARGV_OUT", &out)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .status()
+            .expect("run the shell");
+        assert!(status.success(), "{shell}: {line}");
+        std::fs::read(&out).expect("the stand-in ran")
+    };
+    for (dialect, shell) in shells {
+        let line = task_launch_line(
+            dialect,
+            &exe,
+            Some("opus-4.1"),
+            Some("/homes/w"),
+            None,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{shell}: {e}"));
+        assert!(line.ends_with(upgrade::TASK_OPERAND), "{line}");
+        let aliased = match dialect {
+            Dialect::Bash => "shopt -s expand_aliases; alias cat='echo ALIASED'",
+            _ => "alias cat='echo ALIASED'",
+        };
+        for prelude in [":", aliased] {
+            let argv = run(dialect, shell, prelude, &line);
+            let argv: Vec<&[u8]> = argv.split(|b| *b == 0).collect();
+            assert_eq!(
+                argv,
+                [
+                    b"--model".as_slice(),
+                    b"opus-4.1",
+                    b"--",
+                    task.trim_end_matches('\n').as_bytes(),
+                    b"HOME_ENV=/homes/w",
+                    b"",
+                ],
+                "{shell} after {prelude:?}: {line}"
+            );
+        }
+        assert!(!ran.exists(), "{shell} ran the task's text");
+        let bare = line.replace("command cat -- ", "cat ");
+        assert_ne!(bare, line);
+        let argv = run(dialect, shell, aliased, &bare);
+        assert!(
+            argv.split(|b| *b == 0).any(|a| a.starts_with(b"ALIASED ")),
+            "{shell}: the control's alias took the bare cat"
+        );
+    }
+    let evaluated = aterm_uds::spawnfd::command("/bin/sh")
+        .args([
+            "-c",
+            r#"eval "$(sed -n 3p "$ATERM_TASK_FILE")" 2>/dev/null; true"#,
+        ])
+        .env("ATERM_TASK_FILE", &file)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .status()
+        .expect("run sh");
+    assert!(
+        evaluated.success() && ran.exists(),
+        "the control ran the text"
+    );
+    // The task on the line instead: past the bound, refused.
+    let big = "x".repeat(60 * 1024);
+    assert!(
+        upgrade::relaunch_line_env(Dialect::Zsh, None, None, &[], &exe, &[big]).is_err(),
+        "a task as a word of the line"
+    );
+}
+
+/// The worker's line under fish is `env NAME=VALUE …` (fish has no prefix
+/// assignment), its operand the same fixed text; a value the line cannot
+/// carry refuses the line rather than starting the worker under the wrong
+/// home.
+#[test]
+fn a_workers_first_line_is_written_per_dialect_and_refuses_what_it_cannot_carry() {
+    let exe = Path::new("/opt/claude");
+    let fish = task_launch_line(Dialect::Fish, exe, None, Some("/h w"), None, Some(""))
+        .expect("a fish line");
+    assert!(
+        fish.starts_with(" env CLAUDE_CONFIG_DIR='/h w' CLAUDE_SECURESTORAGE_CONFIG_DIR='' "),
+        "{fish}"
+    );
+    assert!(
+        fish.ends_with(&format!("'/opt/claude' {}", upgrade::TASK_OPERAND)),
+        "{fish}"
+    );
+    let bare = task_launch_line(Dialect::Zsh, exe, None, None, None, None).expect("a bare line");
+    assert_eq!(
+        bare,
+        format!(
+            " CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 '/opt/claude' {}",
+            upgrade::TASK_OPERAND
+        )
+    );
+    assert!(task_launch_line(Dialect::Bash, exe, None, Some("/a\nb"), None, None).is_err());
+    // Past the host kernel's line bound (1000 on macOS, 4000 on Linux).
+    let long = format!("/{}", "h".repeat(upgrade::MAX_LINE));
+    assert!(task_launch_line(Dialect::Bash, exe, None, Some(&long), None, None).is_err());
+    // A manager's own `HOME` rides where its records are under it; a relative
+    // Claude home (one whose directory was not read) refuses the line, as it
+    // would name another directory under the worker's `cwd=`.
+    let homed = task_launch_line(Dialect::Zsh, exe, None, None, Some("/homes/u"), None)
+        .expect("a line carrying HOME");
+    assert!(homed.starts_with(" HOME="), "{homed}");
+    assert!(homed.contains("/homes/u"), "{homed}");
+    assert!(task_launch_line(Dialect::Zsh, exe, None, Some("other/.claude"), None, None).is_err());
+    assert!(task_launch_line(Dialect::Zsh, exe, None, Some(""), None, None).is_err());
+}
+
+/// WHAT A WORKER CARRIES OF ITS MANAGER'S CLAUDE HOME ([`worker_homes`]):
+/// an absolute `CLAUDE_CONFIG_DIR` as it is; a relative one (empty
+/// included) as the absolute directory it named for the manager, raw only
+/// where that was not read (which the line refuses); with none, the
+/// manager's own `HOME` where its records are under it and it is not the
+/// user's. NEGATIVE CONTROL: a manager under the user's own `HOME` (or none
+/// read) carries no `HOME`, so the carried one is the other `HOME`'s doing.
+#[cfg(unix)]
+#[test]
+fn a_worker_carries_its_managers_claude_home_resolved_where_the_manager_runs() {
+    use super::super::upgrade_drive::HomeVars;
+    let user = Path::new("/Users//u");
+    let vars = |config, home| HomeVars { config, home };
+    assert_eq!(
+        worker_homes(user, vars(Some("/h/abs"), None), Some(Path::new("/h/abs"))),
+        (Some("/h/abs".to_string()), None)
+    );
+    assert_eq!(
+        worker_homes(
+            user,
+            vars(Some("other/.claude"), None),
+            Some(Path::new("/work/m/other/.claude"))
+        ),
+        (Some("/work/m/other/.claude".to_string()), None),
+        "a relative home is placed where the manager runs"
+    );
+    assert_eq!(
+        worker_homes(user, vars(Some(""), None), Some(Path::new("/work/m"))),
+        (Some("/work/m".to_string()), None),
+        "an empty home is the manager's own directory"
+    );
+    assert_eq!(
+        worker_homes(user, vars(Some("rel"), None), None),
+        (Some("rel".to_string()), None),
+        "unread: left raw, for the line to refuse"
+    );
+    assert_eq!(
+        worker_homes(user, vars(None, Some("/x")), Some(Path::new("/x/.claude"))),
+        (None, Some("/x".to_string())),
+        "a manager under another HOME has it carried"
+    );
+    assert_eq!(
+        worker_homes(
+            user,
+            vars(None, Some("/Users//u")),
+            Some(Path::new("/Users//u/.claude"))
+        ),
+        (None, None),
+        "the user's own HOME: nothing carried"
+    );
+    assert_eq!(
+        worker_homes(user, vars(None, None), Some(Path::new("/Users//u/.claude"))),
+        (None, None)
+    );
+}
+
 /// A model-shaped option value or payload does not change the model the
 /// launch selected, so it cannot prove that a limit's model was left.
 #[test]
@@ -3466,6 +3864,7 @@ fn a_model_move_reads_the_launchs_model_and_never_another_flags_value() {
         home: None,
         claude_dir: None,
         stored_login: false,
+        profile: None,
     };
     // Ordinary selections, the existing empty fallback, last-wins, and a
     // required flag value that is literally `--` all keep their meaning.
@@ -3576,4 +3975,324 @@ fn a_model_move_reads_the_launchs_model_and_never_another_flags_value() {
         changed.is_empty(),
         "model selection must respect option values and -- boundaries: {changed:?}"
     );
+}
+
+/// A MODEL SWITCH ONTO A MODEL BILLED TO USAGE CREDITS (the owner,
+/// 2026-10-19: *"for continuing on credits, that's an optional additional
+/// feature that's off by default. use subscriptions."*): the fallback and the
+/// return whose line asks for a model of a family the profile bills to
+/// credits are refused (`refused:model-on-credits`), by id or by Claude
+/// Code's alias. NEGATIVE CONTROLS: nothing billed (the key on, or a plan
+/// that includes Fable), a model of another family, and a restart for any
+/// other reason, whose model rides, move as before.
+#[test]
+fn a_model_switch_onto_a_model_billed_to_usage_credits_is_refused() {
+    let billed = ["fable".to_string()];
+    let fallback = |to: &str| Restart::Model { to: to.to_string() };
+    let back = Restart::ModelBack {
+        to: Some("fable".to_string()),
+    };
+    assert!(moves_onto_credits(
+        &fallback("fable"),
+        Some("fable"),
+        Some(&billed)
+    ));
+    assert!(moves_onto_credits(
+        &fallback("claude-fable-5-1[1m]"),
+        Some("claude-fable-5-1[1m]"),
+        Some(&billed)
+    ));
+    assert!(moves_onto_credits(&back, Some("fable"), Some(&billed)));
+    // Unknown billing grants no model-family move, including a non-Fable
+    // target. A known empty result is distinct (Included or explicit opt-in).
+    assert!(moves_onto_credits(&fallback("opus"), Some("opus"), None));
+    assert!(moves_onto_credits(&back, Some("fable"), None));
+    assert!(!moves_onto_credits(&back, None, None));
+    // NEGATIVE CONTROLS.
+    assert!(!moves_onto_credits(&back, Some("fable"), Some(&[])));
+    assert!(!moves_onto_credits(
+        &fallback("opus"),
+        Some("opus"),
+        Some(&billed)
+    ));
+    assert!(!moves_onto_credits(&back, None, Some(&billed)));
+    let account = Restart::Account {
+        to: "work-2".to_string(),
+        at: crate::supervise::policy::turn_end::AccountAt::Wall,
+    };
+    for rides in [Restart::Memory, account] {
+        assert!(!moves_onto_credits(&rides, Some("opus"), None));
+        assert!(!moves_onto_credits(
+            &rides,
+            Some("claude-fable-5-1"),
+            Some(&billed)
+        ));
+    }
+
+    // The planner constructs the target environment explicitly. A shell's
+    // exec environment is not its current inheritance, so it is never an
+    // input to this decision. These are captured words/paths only.
+    use super::super::profile::Context;
+    let home = Path::new("/captured/home");
+    let records = home.join(".claude");
+    let standard = vec!["HOME=/captured/home".to_string()];
+    let mut custom = standard.clone();
+    custom.push("CLAUDE_CODE_CUSTOM_OAUTH_URL=https://auth.example.invalid".to_string());
+    let standard_context = Context::of_exec_env(home, &records, &standard).expect("standard");
+    let custom_context = Context::of_exec_env(home, &records, &custom).expect("custom");
+    let target = standard_context
+        .for_launch(home, "/captured/work", &required_env(None, None, None))
+        .expect("explicit Standard target");
+    assert_eq!(target.context, standard_context);
+    assert_eq!(target.unset, [accounts::HOME_ENV, accounts::LOGIN_ENV]);
+    assert_eq!(
+        target.values,
+        [
+            ("HOME", "/captured/home".to_string()),
+            ("CLAUDE_CODE_CUSTOM_OAUTH_URL", String::new()),
+        ]
+    );
+    assert!(billing_allows_launch(
+        false,
+        ModelBilling::Move(Some(&standard_context)),
+        Some("opus"),
+        Some(&target.context)
+    ));
+    // A shell may now have the Custom URL (or have removed it). The same
+    // explicit empty selector still reaches Standard. Reverse moves cannot
+    // reconstruct the Custom URL and refuse under billing off.
+    assert!(
+        custom_context
+            .for_launch(home, "/captured/work", &[])
+            .is_none()
+    );
+    assert!(!billing_allows_launch(
+        false,
+        ModelBilling::Move(Some(&standard_context)),
+        Some("opus"),
+        Some(&custom_context)
+    ));
+    assert!(!billing_allows_launch(
+        false,
+        ModelBilling::Move(Some(&custom_context)),
+        Some("opus"),
+        Some(&target.context)
+    ));
+    assert!(!billing_allows_launch(
+        false,
+        ModelBilling::Move(Some(&custom_context)),
+        Some("opus"),
+        Some(&custom_context)
+    ));
+    assert!(billing_allows_launch(
+        true,
+        ModelBilling::Move(Some(&custom_context)),
+        Some("opus"),
+        None
+    ));
+    assert!(billing_allows_launch(
+        true,
+        ModelBilling::Move(None),
+        None,
+        None
+    ));
+    assert!(!billing_allows_launch(
+        false,
+        ModelBilling::Move(None),
+        Some("opus"),
+        Some(&target.context)
+    ));
+    assert!(!billing_allows_launch(
+        false,
+        ModelBilling::Move(Some(&standard_context)),
+        Some("opus"),
+        None
+    ));
+    for model in [None, Some("")] {
+        assert!(!billing_allows_launch(
+            false,
+            ModelBilling::Move(Some(&standard_context)),
+            model,
+            Some(&target.context)
+        ));
+    }
+    assert!(billing_allows_launch(false, ModelBilling::Keep, None, None));
+    assert!(Context::of_exec_env(home, &records, &[]).is_none());
+    // Known absent HOME/config/login remain absent, rather than picking up
+    // later shell exports. Set-empty is a different context.
+    let absent = Context::of_exec_env(home, &records, &["PATH=/captured/bin".to_string()])
+        .expect("known absent profile variables");
+    let absent_target = absent
+        .for_launch(home, "/captured/work", &[])
+        .expect("unset carrier");
+    assert_eq!(absent_target.context, absent);
+    assert_eq!(
+        absent_target.unset,
+        ["HOME", accounts::HOME_ENV, accounts::LOGIN_ENV]
+    );
+    let empty = Context::of_exec_env(
+        home,
+        Path::new("/captured/work"),
+        &[
+            "HOME=".to_string(),
+            format!("{}=", accounts::HOME_ENV),
+            format!("{}=", accounts::LOGIN_ENV),
+        ],
+    )
+    .expect("set-empty context");
+    let empty_target = empty
+        .for_launch(home, "/captured/work", &[])
+        .expect("empty carrier");
+    assert!(empty_target.unset.is_empty());
+    assert_eq!(empty_target.context, empty);
+    assert_ne!(empty, absent);
+    assert!(
+        empty.for_launch(home, "", &[]).is_none(),
+        "relative config needs known cwd"
+    );
+    // The existing required overlay is applied before resolving the target.
+    // It may preserve the known context, but never authorize another account.
+    let overlay = required_env(
+        Some("/captured/config"),
+        Some("/captured/other"),
+        Some("named"),
+    );
+    let moved = vec![
+        "HOME=/captured/other".to_string(),
+        "CLAUDE_CONFIG_DIR=/captured/config".to_string(),
+        format!("{}=named", accounts::LOGIN_ENV),
+    ];
+    let captured = Context::of_exec_env(home, Path::new("/captured/config"), &moved)
+        .expect("captured overrides");
+    let overlaid = captured
+        .for_launch(home, "/captured/work", &overlay)
+        .expect("matching required overlay");
+    assert_eq!(captured, overlaid.context);
+    assert!(billing_allows_launch(
+        false,
+        ModelBilling::Move(Some(&captured)),
+        Some("opus"),
+        Some(&overlaid.context)
+    ));
+    let changed = standard_context
+        .for_launch(home, "/captured/work", &overlay)
+        .expect("different required target");
+    assert!(!billing_allows_launch(
+        false,
+        ModelBilling::Move(Some(&standard_context)),
+        Some("opus"),
+        Some(&changed.context)
+    ));
+    assert!(
+        standard_context
+            .for_launch(home, "/captured/work", &[("OTHER", "1")])
+            .is_none()
+    );
+
+    // The actual quoted builder carries removals and whole values in each
+    // supported dialect; it never edits the parent shell's variables. Spaces,
+    // apostrophes and backslashes are arguments, not shell substitutions.
+    for dialect in [Dialect::Zsh, Dialect::Bash, Dialect::Fish] {
+        let line = upgrade::relaunch_line_env_clear(
+            dialect,
+            None,
+            None,
+            &[
+                ("HOME", r"/captured/it's\home"),
+                ("CLAUDE_CODE_CUSTOM_OAUTH_URL", ""),
+            ],
+            &[accounts::HOME_ENV, accounts::LOGIN_ENV],
+            Path::new("/captured/claude"),
+            &["--model".to_string(), "opus".to_string()],
+        )
+        .expect("quoted exact environment");
+        let expected = match dialect {
+            Dialect::Fish => concat!(
+                " '/usr/bin/env' -u 'CLAUDE_CONFIG_DIR' -u 'CLAUDE_SECURESTORAGE_CONFIG_DIR'",
+                " 'HOME=/captured/it\\'s\\\\home' 'CLAUDE_CODE_CUSTOM_OAUTH_URL='",
+                " '/captured/claude' '--model' 'opus'"
+            ),
+            Dialect::Zsh | Dialect::Bash => concat!(
+                " '/usr/bin/env' -u 'CLAUDE_CONFIG_DIR' -u 'CLAUDE_SECURESTORAGE_CONFIG_DIR'",
+                " 'HOME=/captured/it'\\''s\\home' 'CLAUDE_CODE_CUSTOM_OAUTH_URL='",
+                " '/captured/claude' '--model' 'opus'"
+            ),
+        };
+        assert_eq!(line, expected, "{dialect:?}");
+        assert!(
+            upgrade::relaunch_line_env_clear(
+                dialect,
+                None,
+                None,
+                &[],
+                &["BAD;NAME"],
+                Path::new("/captured/claude"),
+                &[]
+            )
+            .is_err()
+        );
+        assert!(
+            upgrade::relaunch_line_env_clear(
+                dialect,
+                None,
+                None,
+                &[("HOME", "value")],
+                &["HOME"],
+                Path::new("/captured/claude"),
+                &[]
+            )
+            .is_err()
+        );
+        assert!(
+            upgrade::relaunch_line_env_clear(
+                dialect,
+                None,
+                None,
+                &[("HOME", "a\nb")],
+                &[],
+                Path::new("/captured/claude"),
+                &[]
+            )
+            .is_err()
+        );
+        let values: Vec<_> = target
+            .values
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        let carried = line_tapped_clear(
+            dialect,
+            None,
+            None,
+            Path::new("/captured/claude"),
+            &words(&["/captured/claude"]),
+            None,
+            Some("opus"),
+            None,
+            &values,
+            Some(&target.unset),
+            Some("{}"),
+        )
+        .unwrap_or_else(|_| panic!("required context on tapped line"));
+        assert!(carried.contains("-u 'CLAUDE_CONFIG_DIR' -u 'CLAUDE_SECURESTORAGE_CONFIG_DIR'"));
+        assert!(carried.contains("'CLAUDE_CODE_CUSTOM_OAUTH_URL='"));
+        let too_long = "x".repeat(16_384);
+        assert!(
+            line_tapped_clear(
+                dialect,
+                None,
+                None,
+                Path::new("/captured/claude"),
+                &words(&["/captured/claude"]),
+                None,
+                Some("opus"),
+                None,
+                &[("HOME", &too_long)],
+                Some(&target.unset),
+                Some("{}")
+            )
+            .is_err(),
+            "no fallback drops required words"
+        );
+    }
 }

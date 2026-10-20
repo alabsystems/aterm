@@ -8,6 +8,7 @@
 //! `autotests = false`: a `tests/*.rs` file that is not a `mod` line here NEVER COMPILES. Run one
 //! file's tests with `targo --unverified test -p aterm-models-core --test suite -- <file>::`.
 
+mod derived_holder_fence;
 mod derived_isolation;
 mod derived_keeper;
 mod derived_kernels;

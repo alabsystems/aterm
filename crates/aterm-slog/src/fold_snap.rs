@@ -16,9 +16,9 @@
 //! ```text
 //! fold v=1 as_of=<seq> ep=<e> rev=<n> last_t=<ms> mail_open=<n>
 //! fold phase word=<w> src=<s> conf=<c> t=<ms>        (and `fold shell …`)
-//! fold totals turns=<n> done=<n> … appr_by=<a,b,c,d> tools=<10 counts> …
-//! fold open <node> <kind> [par=<node>] by=<a> src=<s> conf=<c> t=<ms>
-//! fold last <slot> <node> <kind> out=<w> dur_ms=<n> [opened_t=<ms>] t=<ms> by=<a> opened_by=<a> src=<s> conf=<c>
+//! fold totals turns=<n> done=<n> … appr_by=<a,b,c,d> tools=<10 counts> … [mail_amb=<n>]
+//! fold open <node> <kind> [par=<node>] by=<a> src=<s> conf=<c> t=<ms> [mloff=<off> mlconf=<c>]
+//! fold last <slot> <node> <kind> out=<w> dur_ms=<n> [opened_t=<ms>] t=<ms> by=<a> opened_by=<a> src=<s> conf=<c> [mloff=<off> mlconf=<c>]
 //! fold closed <node> <kind> out=<w> …                (the session's own close)
 //! fold f <owner> <key> <conf> <seq> <value>          (owner: t<i>, l<slot>, c)
 //! fold need <word> <node> kind=<k> since=<seq> t=<ms> src=<s> conf=<c> by=<a> [detail=<pct>]
@@ -36,6 +36,13 @@
 //! tokens when it is not the trusted one; none means it is the trusted one
 //! when that author is proven, and none otherwise.
 //!
+//! A turn's heuristic mail link (phase 5, ruling T10a: `super::mail`) rides
+//! its own `fold open` or `fold last` line as `ml`-prefixed tokens, and the
+//! turns that found mail ambiguous ride the totals line as `mail_amb=`
+//! (T10c), both only when there is one: a reader that does not know them
+//! skips them (the R13 rule), and a snapshot without them reads with no link
+//! and no ambiguity. The waiting mails do not cross.
+//!
 //! Reading back is bounded and fail-closed: a line this build does not read,
 //! a value of the wrong shape, more needs, open nodes or fields than a fold
 //! holds, refuses the whole snapshot ([`SnapError`]).
@@ -45,8 +52,8 @@ use std::fmt::Write as _;
 use aterm_codec::pct;
 
 use super::{
-    Claim, ClosedNode, Fold, Held, MAX_NEEDS, MAX_TRACKED, Need, NodeFields, OpenNode, Phase,
-    SessionState, Totals,
+    Claim, ClosedNode, Fold, Held, MAX_NEEDS, MAX_TRACKED, MailLink, Need, NodeFields, OpenNode,
+    Phase, SessionState, Totals,
 };
 use crate::field::{Key, MAX_FIELDS, Tier};
 use crate::line::{decode_val, push_val};
@@ -139,6 +146,31 @@ fn read_phase(line: &str) -> Result<Phase, SnapError> {
         conf: Conf::from_word(get(line, 2, "conf").ok_or(SnapError::Line)?),
         t: num(line, 2, "t")?,
     })
+}
+
+/// ` mloff=<off> mlconf=<c>`: a turn's heuristic mail link, if it has one.
+fn push_link(s: &mut String, link: Option<MailLink>) {
+    if let Some(l) = link {
+        let _ = write!(s, " mloff={} mlconf={}", l.off, l.conf.word());
+    }
+}
+
+/// A turn's mail link from its line's `ml` tokens (after `skip` words), if
+/// it carries them. A link is heuristic and nothing else (ruling T10,
+/// `HeuristicStaysHeuristic`): this build's writer says `mlconf=heuristic`,
+/// so any other confidence is no line it wrote and refuses the snapshot,
+/// as every malformed token does; a carried link never reads back certain.
+fn read_link(line: &str, skip: usize) -> Result<Option<MailLink>, SnapError> {
+    match opt_num::<u64>(line, skip, "mloff")? {
+        None => Ok(None),
+        Some(off) => {
+            let conf = Conf::from_word(get(line, skip, "mlconf").ok_or(SnapError::Line)?);
+            if conf != Conf::Heuristic {
+                return Err(SnapError::Line);
+            }
+            Ok(Some(MailLink { off, conf }))
+        }
+    }
 }
 
 fn counts(v: &[u32]) -> String {
@@ -362,6 +394,11 @@ impl Fold {
             t.human,
             t.lost
         ));
+        if t.mail_amb > 0
+            && let Some(line) = out.last_mut()
+        {
+            let _ = write!(line, " mail_amb={}", t.mail_amb);
+        }
         for (i, o) in self.tracked.iter().enumerate() {
             let mut s = format!("fold open {} {}", o.node, o.kind.word());
             if let Some(p) = o.par {
@@ -375,12 +412,15 @@ impl Fold {
                 o.conf.word(),
                 o.t
             );
+            push_link(&mut s, self.mail_link(o.node));
             out.push(s);
             field_lines(&mut out, &format!("t{i}"), &o.f);
         }
         for (slot, c) in st.last.iter().enumerate() {
             if let Some(c) = c {
-                out.push(closed_line(&format!("fold last {slot}"), c));
+                let mut line = closed_line(&format!("fold last {slot}"), c);
+                push_link(&mut line, self.mail_link(c.node));
+                out.push(line);
                 field_lines(&mut out, &format!("l{slot}"), &c.f);
             }
         }
@@ -470,11 +510,15 @@ impl Fold {
                         mail_out: g("mail_out")?,
                         human: g("human")?,
                         lost: num(line, 2, "lost")?,
+                        mail_amb: opt_num(line, 2, "mail_amb")?.unwrap_or(0),
                     };
                 }
                 "open" => {
                     if fold.tracked.len() >= MAX_TRACKED {
                         return Err(SnapError::Bound);
+                    }
+                    if let Some(link) = read_link(line, 4)? {
+                        fold.links.push((node_at(line, 2)?, link));
                     }
                     fold.tracked.push(OpenNode {
                         node: node_at(line, 2)?,
@@ -492,10 +536,14 @@ impl Fold {
                 }
                 "last" => {
                     let slot: usize = tok_at(line, 2)?.parse().map_err(|_| SnapError::Line)?;
-                    if slot >= fold.st.last.len() {
+                    if slot >= fold.st.last.len() || fold.st.last[slot].is_some() {
                         return Err(SnapError::Bound);
                     }
-                    fold.st.last[slot] = Some(read_closed(line, 3)?);
+                    let closed = read_closed(line, 3)?;
+                    if let Some(link) = read_link(line, 5)? {
+                        fold.links.push((closed.node, link));
+                    }
+                    fold.st.last[slot] = Some(closed);
                 }
                 "closed" => fold.st.closed = Some(read_closed(line, 2)?),
                 "f" => {
@@ -570,6 +618,9 @@ impl Fold {
         for (slot, n) in fold.st.needs.iter_mut().zip(needs) {
             *slot = Some(n);
         }
+        // In the order the turns opened, as the fold made them.
+        fold.links.sort_by_key(|(n, _)| *n);
+        fold.links.dedup_by_key(|(n, _)| *n);
         fold.reproject();
         Ok(fold)
     }

@@ -270,6 +270,7 @@ fn opts(journal: Option<std::path::PathBuf>) -> LedgerOpts {
         worker: format!("@{WORKER}"),
         journal,
         since_ms: None,
+        source: LedgerSource::Anchor,
     }
 }
 
@@ -364,7 +365,6 @@ fn the_ledger_joins_the_four_sources() {
     assert_eq!((s.approvals, s.dismissals), (1, 1));
     assert_eq!((s.context, s.compacted, s.reconnects), (1, 1, 1));
     assert_eq!((s.mail_in, s.mail_out), (1, 2));
-    assert_eq!((s.complete, s.incomplete), (1, 1));
     assert_eq!((s.timeouts_seen, s.exits), (1, 0));
     // Every item is in time order, one lane each.
     let items = l.items();
@@ -702,7 +702,8 @@ fn since_takes_ms_or_a_time_word() {
 fn a_history_record_is_read_whole() {
     let body = "OK 2\n\
         turn 7 submitted=0 status=timeout started_ms=1197729 dur_ms=1761 seq=32979 \
-        hash=d06718987e6891ec arch=1789083498272557936:185 carried=1 text=Manager%20here.%20Go\n\
+        hash=d06718987e6891ec by=ctl arch=1789083498272557936:185 carried=1 \
+        text=Manager%20here.%20Go\n\
         turn 8 submitted=1 status=settled started_ms=2 dur_ms=3 seq=4 hash=0 arch=7730:9 \
         text=next\n";
     let turns = parse_history_records(body);
@@ -713,6 +714,7 @@ fn a_history_record_is_read_whole() {
                 id: 7,
                 submitted: false,
                 status: "timeout".to_string(),
+                by: "ctl".to_string(),
                 started_ms: 1_197_729,
                 dur_ms: 1_761,
                 arch: Some(Mark {
@@ -726,6 +728,7 @@ fn a_history_record_is_read_whole() {
                 id: 8,
                 submitted: true,
                 status: "settled".to_string(),
+                by: "-".to_string(),
                 started_ms: 2,
                 dur_ms: 3,
                 arch: Some(Mark {
@@ -743,6 +746,57 @@ fn a_history_record_is_read_whole() {
     let l = read(&mut host, &opts(None), &mut anchors);
     assert_eq!(l.turns[0].t, None, "a carried turn is on another clock");
     assert!(l.turns[1].t.is_some());
+}
+
+/// THE WINDOW HARNESS'S OWN TURNS ARE NOT THE MANAGER'S (`by=harness`: its
+/// `keep going`, its done check, its `/usage`): left out of the timeline's
+/// turns, its counts and its latencies, and out of the reply-size join — a
+/// turn's reply runs on through the continuations the harness typed into
+/// it — with SOURCES saying how many. NEGATIVE CONTROL: the same row typed
+/// by an owner-token client (`by=ctl`) is a turn, and the reply join counts
+/// it (its `❯` row not found, it is inside the turn before it).
+#[test]
+fn the_harness_turns_are_not_the_managers() {
+    let with = |by: &str| {
+        let mut body = history().stdout;
+        body.push_str(&format!(
+            "turn 4 submitted=1 status=pressed started_ms=250000 dur_ms=0 seq=9 \
+             hash=0000000000000000 by={by} arch=7730:105 text=keep%20going\n"
+        ));
+        let mut host = whole_host();
+        host.replies
+            .insert("history".to_string(), VecDeque::from(vec![ok(&body)]));
+        read(&mut host, &opts(None), &mut anchors)
+    };
+    let ids = |l: &Ledger| l.turns.iter().map(|t| t.id).collect::<Vec<u64>>();
+    let history_detail = |l: &Ledger| {
+        l.sources
+            .iter()
+            .find(|s| s.name == "history")
+            .expect("row")
+            .detail
+            .clone()
+    };
+    let l = with("harness");
+    assert_eq!(ids(&l), [1, 2, 3]);
+    assert!(
+        l.turns.iter().all(|t| t.swallowed.is_empty()),
+        "{:#?}",
+        l.turns
+    );
+    assert_eq!(l.summary().turns, 3);
+    let detail = history_detail(&l);
+    assert!(
+        detail.starts_with("3 turn(s) from @s-work")
+            && detail.contains("1 more typed by aterm's window harness (by=harness)"),
+        "{detail}"
+    );
+
+    let l = with("ctl");
+    assert_eq!(ids(&l), [1, 2, 3, 4]);
+    assert_eq!(l.turns[2].swallowed, [4]);
+    assert_eq!(l.summary().turns, 4);
+    assert!(!history_detail(&l).contains("harness"), "{l:#?}");
 }
 
 /// `View::All` renders as `render`; another view adds `view=` and `kept=` to the same header.
@@ -829,4 +883,284 @@ fn a_turn_whose_row_is_missing_is_named_in_the_span_that_holds_it() {
     let l = read(&mut host, &opts(None), &mut anchors);
     assert_eq!(l.turns[0].swallowed, [2, 3]);
     assert!(l.turns[1].rows.is_err() && l.turns[2].rows.is_err());
+}
+
+// ---- `--source log` (session log plan 5F-4, ruling T12) -------------------
+
+/// How far the log's wall times may sit from the anchor's: the anchor is the
+/// control socket's birth, a guess at the clock's zero.
+const ANCHOR_ERROR_MS: i64 = 1_000;
+/// Where this fixture's log times sit from the anchor's.
+const SKEW: i64 = 40;
+
+/// The worker's `log class=turn`, as `aterm ctl` prints its body: the ring
+/// evicted the turn ledger's first turn's OPEN (its close, which restates
+/// `ledger=` (5F-4a), and every later record kept) and a closed person's
+/// turn's open (eviction takes closed turns' opens first: its close, which
+/// names no `ledger=` because it never had one, is kept), then turns 2 and
+/// 3 whole and an open person's turn with no `ledger=`. With `restated`
+/// false the close of turn 1 is an older aterm's, naming no `ledger=`.
+fn log_turns_reply(restated: bool) -> CtlReply {
+    let t = |ms: i64| EPOCH + ms + SKEW;
+    let ledger1 = if restated { " ledger=1" } else { "" };
+    ok(&format!(
+        "gap why=evicted lost=9 resync_to=20\n\
+         1 open - spawn by=aterm src=aterm conf=exact t={}\n\
+         2 open r1 agent agent=claude by=- src=status conf=strong t={}\n\
+         24 close t1 turn out=done dur_ms=1800{ledger1} by=ctl src=screen conf=strong t={}\n\
+         27 close t2 turn out=done dur_ms=900 by=human src=screen conf=strong t={}\n\
+         30 open t3 turn par=r1 ledger=2 by=ctl src=screen conf=strong t={}\n\
+         41 close t3 turn out=done dur_ms=6005 ledger=2 by=ctl src=screen conf=strong t={}\n\
+         50 open t4 turn par=r1 ledger=3 by=ctl src=screen conf=strong t={}\n\
+         52 close t4 turn out=done dur_ms=1750 ledger=3 by=ctl src=screen conf=strong t={}\n\
+         60 open t5 turn par=r1 by=human src=screen conf=strong t={}\n",
+        t(0),
+        t(1),
+        t(10_000 + 1_800),
+        t(50_000),
+        t(100_000),
+        t(106_005),
+        t(200_000),
+        t(201_750),
+        t(250_000),
+    ))
+}
+
+/// This session's `log kinds=mail`: the posts and the messages the
+/// anchor path reads from `timeline` and `inbox`, at the same moments.
+fn log_mail_reply() -> CtlReply {
+    let t = |ms: i64| EPOCH + ms + SKEW;
+    ok(&format!(
+        "7 mark - mail dir=out kind=task to=@{WORKER} inbox=8 by=- src=fabric conf=exact t={}\n\
+         8 mark - mail dir=in kind=report from={WORKER}@n-1 off=4 inbox=1 by=bridge src=fabric \
+         conf=exact t={}\n\
+         9 mark - mail dir=in kind=note from=s-other@n-1 off=5 inbox=2 by=bridge src=fabric \
+         conf=exact t={}\n\
+         10 mark - mail dir=out kind=task to=@{WORKER} inbox=9 by=- src=fabric conf=exact t={}\n\
+         11 mark - mail dir=out kind=note to=@s-other inbox=10 by=- src=fabric conf=exact t={}\n",
+        t(5_000),
+        t(205_000),
+        t(206_000),
+        t(209_000),
+        t(209_500),
+    ))
+}
+
+/// A host for `--source log`: every source the anchor path reads, the two
+/// log reads in the order asked (the worker's, then this session's).
+fn log_host(restated: bool) -> Host {
+    whole_host()
+        .on("log", log_turns_reply(restated))
+        .on("log", log_mail_reply())
+}
+
+fn log_opts() -> LedgerOpts {
+    LedgerOpts {
+        source: LedgerSource::Log,
+        ..opts(None)
+    }
+}
+
+/// `--source log`, never asking for a clock anchor.
+fn read_log(host: &mut Host) -> Ledger {
+    read(host, &log_opts(), &mut |sid| {
+        panic!("--source log asked for @{sid}'s clock anchor")
+    })
+}
+
+/// Whether two placed times agree within the anchor's error.
+fn near(a: Option<i64>, b: Option<i64>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => (a - b).abs() <= ANCHOR_ERROR_MS,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// A turn row without its time.
+type Untimed = (
+    u64,
+    String,
+    bool,
+    u64,
+    bool,
+    String,
+    Result<usize, String>,
+    Vec<u64>,
+);
+
+fn untimed(l: &Ledger) -> Vec<Untimed> {
+    l.turns
+        .iter()
+        .map(|t| {
+            (
+                t.id,
+                t.status.clone(),
+                t.submitted,
+                t.dur_ms,
+                t.carried,
+                t.text.clone(),
+                t.rows.clone(),
+                t.swallowed.clone(),
+            )
+        })
+        .collect()
+}
+
+/// THE LOG PATH AND THE ANCHOR PATH AGREE (plan 5F-4, ruling T12): over the
+/// same recorded replies, `--source log` gives the same turns — ids,
+/// kinds, texts, statuses and reply sizes — and the same mail, with every
+/// time within the anchor's error of the anchor path's, and it never asks
+/// for an anchor or the timeline. The turn whose OPEN the ring evicted is
+/// placed by its close, which restates `ledger=`, and SOURCES says how many
+/// were; the person's turns, which name no `ledger=`, join nothing, and the
+/// closed one whose open was evicted is said as a turn no exchange opened,
+/// never as a lost `ledger=`. Each log-placed row says the turn BEGAN (the
+/// screen's sight of it, after the press), where the anchor path's says the
+/// exchange SENT it.
+#[test]
+fn log_and_anchor_paths_agree_modulo_times() {
+    let anchor = read(&mut whole_host(), &opts(None), &mut anchors);
+    let mut host = log_host(true);
+    let log = read_log(&mut host);
+    assert_eq!(
+        host.requests,
+        [
+            "whoami",
+            "@s-work history",
+            "@s-work log class=turn",
+            "@s-work offscreen tail=20000 max=20000 screen=1",
+            "@self inbox --peek --meta",
+            "@self log kinds=mail",
+        ]
+    );
+    assert!(log.aligned && anchor.aligned);
+    assert_eq!(untimed(&log), untimed(&anchor));
+    for (l, a) in log.turns.iter().zip(&anchor.turns) {
+        assert!(
+            l.t.is_some() && near(l.t, a.t),
+            "turn {}: {:?} {:?}",
+            l.id,
+            l.t,
+            a.t
+        );
+    }
+    assert_eq!(log.mail.len(), anchor.mail.len());
+    for (l, a) in log.mail.iter().zip(&anchor.mail) {
+        assert!(near(l.t, a.t), "{l:?} {a:?}");
+        assert_eq!(
+            (l.dir, &l.kind, l.len, &l.trust, l.pending),
+            (a.dir, &a.kind, a.len, &a.trust, a.pending)
+        );
+    }
+    let src = |l: &Ledger, name: &str| {
+        l.sources
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| (s.ok, s.detail.clone()))
+    };
+    let (ok, detail) = src(&log, "log").expect("a log source");
+    assert!(ok, "{detail}");
+    assert!(
+        detail.starts_with(
+            "@s-work log class=turn: 3 of 3 turn(s) placed by ledger= (1 by its close: the \
+             open was evicted)"
+        ) && detail.contains("the ring evicted 9 record(s)"),
+        "{detail}"
+    );
+    // The person's closed turn is no lost join: every history turn is placed.
+    assert!(
+        detail.contains(
+            "; 1 closed turn(s) whose open was evicted name no ledger= (no `turn` exchange \
+             opened them, or an older aterm closed them): joined to nothing"
+        ) && !detail.contains("ledger= is gone")
+            && !detail.contains("no longer holds"),
+        "{detail}"
+    );
+    let what = |l: &Ledger, id: u64| {
+        l.items()
+            .into_iter()
+            .find(|i| i.what.starts_with(&format!("turn {id} ")))
+            .map(|i| i.what)
+    };
+    for id in 1..=3 {
+        let (l, a) = (what(&log, id), what(&anchor, id));
+        assert!(
+            l.as_deref()
+                .is_some_and(|w| w.starts_with(&format!("turn {id} began: ")))
+                && a.as_deref()
+                    .is_some_and(|w| w.starts_with(&format!("turn {id} sent: "))),
+            "{l:?} {a:?}"
+        );
+    }
+    assert!(src(&anchor, "log").is_none(), "the old path reads no log");
+    let (ok, clock) = src(&log, "clock").expect("a clock source");
+    assert!(ok && clock.contains("no clock anchor"), "{clock}");
+    // The summary reads the same.
+    let (s, a) = (log.summary(), anchor.summary());
+    assert_eq!(
+        (s.turns, s.settled, s.timeouts, s.mail_in, s.mail_out),
+        (a.turns, a.settled, a.timeouts, a.mail_in, a.mail_out)
+    );
+}
+
+/// NEGATIVE CONTROL (ruling T12): a close WITHOUT the restated `ledger=` (an
+/// older aterm's) loses the join — the evicted-open turn has no time, even
+/// though its close's time less its duration is exactly the anchor path's
+/// start (nothing is ever joined by time) — and SOURCES counts it twice:
+/// a history turn the log no longer places, and, beside the person's, a
+/// closed log turn that names no `ledger=`.
+#[test]
+fn a_close_without_its_ledger_loses_the_join() {
+    let anchor = read(&mut whole_host(), &opts(None), &mut anchors);
+    let log = read_log(&mut log_host(false));
+    assert_eq!(untimed(&log), untimed(&anchor), "the rows still read");
+    assert_eq!(log.turns[0].t, None, "turn 1 is not joined by time");
+    assert!(anchor.turns[0].t.is_some());
+    assert!(near(log.turns[1].t, anchor.turns[1].t));
+    let detail = &log
+        .sources
+        .iter()
+        .find(|s| s.name == "log")
+        .expect("a log source")
+        .detail;
+    assert!(
+        detail.starts_with("@s-work log class=turn: 2 of 3 turn(s) placed by ledger=;")
+            && detail.contains("; 1 the log no longer holds: no time")
+            && detail.contains("; 2 closed turn(s) whose open was evicted name no ledger="),
+        "{detail}"
+    );
+}
+
+/// A log the host cannot read places nothing and says so; the rows still
+/// print. A message whose `mail` mark the log no longer holds keeps no time,
+/// counted in the mail source.
+#[test]
+fn a_log_that_cannot_be_read_places_nothing_and_says_so() {
+    let mut host = whole_host()
+        .on("log", err("unknown verb (try: help)"))
+        .on("log", ok(""));
+    let l = read_log(&mut host);
+    assert!(!l.aligned);
+    assert_eq!(l.turns.len(), 3);
+    assert!(l.turns.iter().all(|t| t.t.is_none()));
+    let log = l
+        .sources
+        .iter()
+        .find(|s| s.name == "log")
+        .expect("a log source");
+    assert!(
+        !log.ok && log.detail.contains("no turn is placed"),
+        "{}",
+        log.detail
+    );
+    let mail = l.sources.iter().find(|s| s.name == "mail").expect("mail");
+    assert!(
+        mail.detail.contains("1 the log no longer holds: no time")
+            && mail.detail.contains("0 post(s) to it in the log"),
+        "{}",
+        mail.detail
+    );
+    assert_eq!(l.mail.len(), 1);
+    assert_eq!(l.mail[0].t, None);
 }

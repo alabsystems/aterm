@@ -1,0 +1,26 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# T1, T2: a harness approve accepted with no box open waits on the lead; a
+# person's key before the box shows is the later input and takes the lead,
+# so the box it leads to closes the person's, `passed`, never the act's.
+# A control client's input accepted after the person's takes the lead back;
+# a person's lead the box opens past binds nothing.
+see busy
+admit harness act=approve
+accept
+at 100 person
+at 300 see prompt edit
+expect open p1 approval par=t1 box=edit at=300
+at 400 see busy
+expect close p1 approval out=passed by=human at=400
+at 1000 person
+at 1100 admit ctl act=approve
+accept
+at 1200 see prompt edit
+expect open p2 approval par=t1 box=edit at=1200
+at 1300 see busy
+expect close p2 approval out=passed by=ctl at=1300
+at 2000 person
+at 2700 see prompt edit
+expect open p3 approval par=t1 box=edit at=2700
+see busy
+expect close p3 approval out=passed by=- at=2700

@@ -18,8 +18,20 @@ description = "aterm — the coding-agent primer installer: the marked, self-gat
 aterm-durable = { workspace = true }
 
 [dev-dependencies]
+# The counting seam (`aterm_durable::seam`) its tests reach, in an optimized test
+# build too.
+aterm-durable = { workspace = true, features = ["test-support"] }
 # Scratch home directories for the installer tests.
 aterm-tempfile = { workspace = true }
+# The served-verb check: every `aterm ctl` verb the primer and the skills teach is
+# in the server's table (aterm-types) or among the client's own (`CLIENT_HELP_VERBS`).
+# aterm-ctl is std-only; it brings aterm-uds and aterm-codec, both dependency-free.
+aterm-types = { workspace = true }
+aterm-ctl = { path = "../aterm-ctl" }
+# The log-word check: every key, `out=` word and kind a skill shows in a session
+# log or brief example is one the log's own vocabulary holds (`aterm_slog`'s
+# `Key`, `Kind`, `OUT_WORDS`). An engine crate: std, aterm-codec, aterm-messages.
+aterm-slog = { workspace = true }
 
 [lints]
 workspace = true

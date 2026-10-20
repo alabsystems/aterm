@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Unix: the `poll(2)` under [`super::ExitWait`], and several children run at
-//! once on one thread ([`super::outputs_until`]), which watches every child's
-//! streams and exit with one `poll(2)` and so starts no thread.
+//! once on one thread ([`super::outputs_until`], and one held child resumed,
+//! [`super::Held`]), which watches every child's streams and exit with one
+//! `poll(2)` and so starts no thread.
 
 use std::fs::File;
 use std::io::{self, Read as _};
@@ -28,7 +29,7 @@ struct PollFd {
 const POLLIN: i16 = 0x1;
 
 /// `poll(2)` over `fds` for at most `timeout` (rounded UP to a millisecond,
-/// so a wait never returns early and spins), retrying `EINTR` on what is left.
+/// so a wait never returns early and spins), retrying `EINTR` while time remains.
 /// `Ok(false)` when the timeout ran out with nothing ready.
 // Skip: a blocking `poll(2)` wait (FFI, unverifiable body).
 #[cfg_attr(trust_verify, trust::skip)]
@@ -56,6 +57,9 @@ fn poll(fds: &mut [PollFd], timeout: Duration) -> io::Result<bool> {
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
+        }
+        if Instant::now() >= until {
+            return Ok(false);
         }
     }
 }
@@ -132,14 +136,23 @@ struct Run {
     failed: Option<RunError>,
 }
 
+/// `cmd` set up as every child here runs: leading a new process group, stdin
+/// `/dev/null`, stdout and stderr piped.
+pub(super) fn prepare(cmd: &mut Command) -> &mut Command {
+    cmd.process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+}
+
 impl Run {
     fn start(cmd: &mut Command) -> Self {
-        cmd.process_group(0);
-        let spawned = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+        Self::of(prepare(cmd).spawn())
+    }
+
+    /// A child [`prepare`]d and started (or why it was not), from here on run
+    /// like the others.
+    fn of(spawned: io::Result<Child>) -> Self {
         match spawned {
             Ok(mut child) => {
                 let exit = Some(ExitWait::new(&child));
@@ -231,7 +244,31 @@ pub(super) fn outputs_until(
     deadline: Instant,
     reap: Duration,
 ) -> Vec<Result<Output, RunError>> {
-    let mut runs: Vec<Run> = cmds.iter_mut().map(|cmd| Run::start(cmd)).collect();
+    run_until(
+        cmds.iter_mut().map(|cmd| Run::start(cmd)).collect(),
+        deadline,
+        reap,
+    )
+}
+
+/// One child already started from a [`prepare`]d command — a held one, just
+/// resumed ([`super::Held::output_until`]) — run as [`outputs_until`] runs each.
+pub(super) fn output_of_until(
+    child: Child,
+    deadline: Instant,
+    reap: Duration,
+) -> Result<Output, RunError> {
+    run_until(vec![Run::of(Ok(child))], deadline, reap)
+        .pop()
+        .unwrap_or(Err(RunError::TimedOut))
+}
+
+/// The runs to their ends, or to `deadline` and the `reap` reserve after it.
+fn run_until(
+    mut runs: Vec<Run>,
+    deadline: Instant,
+    reap: Duration,
+) -> Vec<Result<Output, RunError>> {
     // The fallback tick, for a child with no exit descriptor.
     let mut tick = POLL_MIN;
     loop {

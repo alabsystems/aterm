@@ -369,18 +369,18 @@ fn fabric_brief_folds_what_the_bus_holds() {
         "{local_text}"
     );
     let fabric = std::fs::read_to_string(w.tmp.join("fabric.cmd")).expect("the command");
-    #[expect(
-        clippy::disallowed_types,
-        reason = "the harness's output_within bounds a std Command's wait (the hang detector)"
-    )]
-    let mut cmd = std::process::Command::new(super::harness::aterm_to_launch());
+    let mut cmd = aterm_uds::spawnfd::command(super::harness::aterm_to_launch());
     cmd.args(["link", "fabric", "brief", &format!("@{a}")])
         .env("ATERM_FABRIC_COMMAND", &fabric)
         .env("HOME", w.tmp.join("home"))
         .env("XDG_CONFIG_HOME", w.tmp.join("cfg"))
         .env("XDG_RUNTIME_DIR", w.tmp.join("run"))
-        .stdin(std::process::Stdio::null());
-    let out = super::harness::output_within(&mut cmd, "aterm fabric brief");
+        .stdin(aterm_uds::spawnfd::Stdio::null());
+    let out = aterm_uds::deadline::output_until_complete_stdout(
+        &mut cmd,
+        std::time::Instant::now() + super::harness::DEADLINE,
+    )
+    .expect("aterm fabric brief exits with complete stdout before the hang detector");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
         out.status.success(),

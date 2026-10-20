@@ -12,13 +12,6 @@
 //! connection away) does not end the loop: the outage is ridden out
 //! ([`Session::ride_out`]) and the loop looks again from a fresh read.
 //!
-//! With `--mail` ([`SuperviseOpts::mail`]) a second [`Ctl`], the mail lane
-//! ([`super::mail::Lane`]), parks `await inbox` on the manager's own session
-//! from its own thread, prints `MAIL …` per delivery through the loop's sink,
-//! and hands the worker's `report`s to the loop, which folds each into the idle
-//! point of the same turn (`Session::hold_for_report`). The worker's socket
-//! sees no extra request, and without the flag every line is byte-identical.
-//!
 //! A usage limit is a decision point `watch` handles alone: one weekly limit
 //! can stop the manager and the worker at once, leaving nobody to act. On
 //! `EVENT limited` the watcher never exits on a limit — a budget that would
@@ -27,8 +20,7 @@
 //! 150 s past the reset, a session's share of a minute later (the rules
 //! file's text with it), as at any other turn end it acts on (below); a
 //! limit the policy does not wait out (`resume_limits = false`)
-//! sets the worker's `attention` meta and, while the fabric is connected,
-//! posts `kind=control` mail to the manager ([`Session::escalate`], once an
+//! sets the worker's `attention` meta ([`Session::escalate`], once an
 //! episode). The episode is
 //! [`Episode`]; `supervise` — one look, the manager right there — does none
 //! of it ([`Review::unattended`]). An episode ends when the worker
@@ -45,10 +37,9 @@
 //! hits the wall again, and the notice again is the same episode). The
 //! same holds after the busy read: the wall again before the worker has
 //! answered is the retry that hit it, the SAME episode opened again
-//! ([`Retry`], [`Session::open_episode`]) — the attention set again, the
-//! manager mailed once, not once a retry. So does the notice still up after
-//! an Autopilot Off park, which took the episode's badge down
-//! ([`Session::lower_badges`]).
+//! ([`Retry`], [`Session::open_episode`]), its attention set again — one
+//! ask, not one a retry. So does the notice still up after an Autopilot Off
+//! park, which took the episode's badge down ([`Session::lower_badges`]).
 //!
 //! **The approval policy, the wake, the lifecycle.** Every press on an approval
 //! box is decided by [`super::policy::approval::decide`] and pressed under the
@@ -60,10 +51,9 @@
 //! hold lifts, `ERR busy …`/`ERR rate` back it off; neither ends it. A watch
 //! starts by reconciling an attention a previous watcher left and ends by
 //! clearing its own (`lifecycle.rs`). A box or question no rule answers is
-//! escalated as `<program> <kind>: <subject> (<reason>)`, mailed only while the
-//! fabric is connected (`escalate.rs`). [`Session::run_hosted`] is the in-GUI
-//! host's entry: the same loop under [`SuperviseOpts::hosted`], ended by a stop
-//! flag.
+//! escalated as `<program> <kind>: <subject> (<reason>)` (`escalate.rs`).
+//! [`Session::run_hosted`] is the in-GUI host's entry: the same loop under
+//! [`SuperviseOpts::hosted`], ended by a stop flag.
 //!
 //! **The turn-end policy.** Every point where a worker's turn ended (idle, a
 //! question, a wall) is decided by the pure
@@ -77,7 +67,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -88,22 +77,23 @@ use super::config::{Autopilot, SupervisorConfig};
 use super::fx::Fx;
 use super::journal::{CLEARED_MEMORY, CLEARED_TURN_END, Journal};
 use super::limit::{self, ResetSpec};
-use super::mail::{self, Delivery, MailOpts};
 use super::phase::{Phase, busy_signal, last_said_index, last_said_row, status_row};
 use super::policy::approval::{Decision, footer_mode};
 use super::policy::exception::Exception;
 use super::policy::reset::{
     KeepWhy, ResetAsk, ResetEnd, ResetGo, ResetNo, ResetOutcome, ResetWord,
 };
+use super::policy::sleeps::{FirstLook, SleepBook, SleepStamp};
 use super::policy::turn_end::{
-    AccountAdvice, AccountBad, AccountPoint, FirstRead, ModelSwitch, ProbeGate, RULE_LIMIT_RESUME,
-    RULE_OPEN_ITEMS, Reach, TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming, said_mark,
+    AccountAdvice, AccountBad, AccountPoint, FirstRead, ModelSwitch, ProbeGate, RULE_API_BACK,
+    RULE_API_CUTOFF, RULE_API_RETRY, RULE_FINISHED, RULE_LIMIT_RESUME, Reach, TurnEndAction,
+    TurnEndReading, TurnEndState, TurnEndTiming, WaitKind, is_continue_rule, said_mark,
 };
 use super::prompt::{
     CancelEffect, Prompt, PromptKind, PromptV2, parse_prompt, prompt_box_first_row, prompt_box_span,
 };
-use super::report::ReportOpts;
 use super::screen::{HumanInput, Screen, parse_text_json};
+use crate::harness::acts::TaskFace;
 use aterm_phase::{Program, ScreenReader};
 
 /// One `aterm-ctl` exchange: the exit code, stdout and stderr.
@@ -205,7 +195,8 @@ impl CtlReply {
     /// retry blindly (the verb's own words). A screen that never holds still
     /// keeps the echo settle open to the turn's deadline, so the Enter is
     /// written with no time left to see it (Claude Code 2.1.301, measured
-    /// 2026-10-16: every nudge `drive task` typed landed so).
+    /// 2026-10-16 on the nudges of the since-removed `drive task`: every one
+    /// landed so).
     pub fn pressed_unverified(&self) -> bool {
         self.turn_verdict().is_some_and(|v| {
             let words = || v.split_whitespace();
@@ -244,9 +235,8 @@ impl CtlReply {
     /// so on a request an update's Commit cut and does not ask again —
     /// an `await seq <n>` or `await inbox since=` whose anchor names the old
     /// process, an armed wait, a `turn`, a `post` — or that no successor
-    /// answered at all. Read as an answer, `aterm drive await-turn
-    /// --reconnect-s` and the `--mail` lane would die at an update instead of
-    /// riding it out. Nothing else exits 75, and a request that may have
+    /// answered at all. Read as an answer, a supervising loop (the window
+    /// host's) would die at an update instead of riding it out. Nothing else exits 75, and a request that may have
     /// landed (a `turn`, a `post`) is ridden out as one that may have: the
     /// next look reads the screen before it types again, and a lost `post` is
     /// never retried.
@@ -303,8 +293,7 @@ impl CtlReply {
     /// request it forwards to the instance it replaces falls through to `ERR
     /// no such session` once that one is gone. Outside an outage `no such
     /// session` is the session gone, and final. The one rule for every
-    /// client that rides an outage out: the loop (`Session::unserved`),
-    /// the `--mail` lane and `aterm drive task --wait`.
+    /// client that rides an outage out: the loop (`Session::unserved`).
     pub fn unserved(&self, in_outage: bool) -> bool {
         self.lost() || (in_outage && self.is_err("no such session"))
     }
@@ -404,11 +393,10 @@ pub trait Ctl {
     fn call(&mut self, args: &[&str]) -> Result<CtlReply, String>;
 
     /// A handle that cuts the request in flight short — and every one after
-    /// it — from another thread: what ends the mail lane's parked `await
-    /// inbox` (20 s a step) the moment the loop has its result, so
-    /// `supervise --mail` hands its point back at once and `watch --mail`'s
-    /// process ends with its last line ([`Session::run_loop`]). `None` for a
-    /// client that cannot: the loop then ends within one step.
+    /// it — from another thread: what the window's host calls to stop a tab's
+    /// loop at once (it hangs the loop's connection up, [`super::RelayCtl`]).
+    /// `None` for a client that cannot (`aterm-ctl` per request): the loop
+    /// then ends within one step.
     fn interrupter(&self) -> Option<Interrupter> {
         None
     }
@@ -417,13 +405,51 @@ pub trait Ctl {
 /// [`Ctl::interrupter`]'s handle.
 pub type Interrupter = Box<dyn Fn() + Send + Sync>;
 
+/// One `aterm-ctl` per request: no handle cuts one short ([`Ctl::interrupter`]
+/// answers `None`).
 impl Ctl for crate::CtlClient {
     fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
         self.run_raw(args)
     }
-    fn interrupter(&self) -> Option<Interrupter> {
-        self.cutter()
+}
+
+/// THE SESSION LOG'S `act` MARKS a loop owes (session log phase 3B; addendum
+/// A17, ruling S28): each one `ledger_row` queued, as the words after
+/// `mark -` ([`crate::harness::acts::log_mark`]), sent by
+/// [`Session::send_act_marks`]. Best effort, never retried: a server that
+/// refuses the verb or a mark's fields latches the producer off for the
+/// loop.
+#[derive(Debug, Default)]
+pub(super) struct ActMarks {
+    /// Oldest first, at most [`ACT_MARKS_MAX`]: a loop that cannot send them
+    /// drops the oldest.
+    pending: Vec<String>,
+    /// Latched off ([`act_mark_latches`]).
+    off: bool,
+}
+
+/// The most `act` marks a loop holds unsent.
+pub(super) const ACT_MARKS_MAX: usize = 32;
+
+impl ActMarks {
+    /// Queue one mark's words; nothing once latched off.
+    pub(super) fn queue(&mut self, mark: String) {
+        if self.off {
+            return;
+        }
+        if self.pending.len() >= ACT_MARKS_MAX {
+            self.pending.remove(0);
+        }
+        self.pending.push(mark);
     }
+}
+
+/// Whether a `mark` reply latches the act marks off for the loop (ruling
+/// S28): an older server's `ERR unknown verb`, and a refusal of the mark
+/// itself (`ERR usage: mark …`, `ERR mark: …`). `ERR busy` and anything
+/// else drop the one mark.
+pub(super) fn act_mark_latches(reply: &CtlReply) -> bool {
+    reply.is_err("unknown verb") || reply.is_err("usage: mark") || reply.is_err("mark:")
 }
 
 /// Server features probed once per process (`None` = not yet asked).
@@ -433,6 +459,11 @@ pub struct Caps {
     /// generation is still the judged read's (probed from `help key`, before
     /// the first approval).
     pub gen_fence: Option<bool>,
+    /// `key act=approve|deny|answer …` — the press says what it means for
+    /// the box it dismisses (session log phase 5, ruling T1), so the box's
+    /// close reads `out=approved|declined|answered by=harness`. Read off the
+    /// same `help key` reply as [`Caps::gen_fence`]; unknown is not sent.
+    pub act_word: Option<bool>,
     /// `turn submit=guarded:<re>` — Enter only while the cursor's row still
     /// matches (learned from the first turn the turn-end policy types).
     pub guarded_submit: Option<bool>,
@@ -512,7 +543,8 @@ pub struct IdlePoint {
 /// agent's own background work ([`Session::host_steps_in_background`]), in
 /// order; `NotIdle`, `NotAuthoritative`, `Prompt`, `ActInFlight` and again
 /// `Wall` and `LimitEpisode` are those of an idle point
-/// ([`Session::host_steps_here`]); `WakeSettle` is both's, asked last. Reporting only.
+/// ([`Session::host_steps_here`]); `WakeSettle` and `Credits` are both's,
+/// asked last. Reporting only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Guard {
     /// A break is offered only on a busy read.
@@ -547,11 +579,17 @@ pub enum Guard {
     /// turn the host types now — the upgrade's notice, a carry-on — would
     /// meet an API it cannot reach. Offered once the settle has passed.
     WakeSettle,
+    /// USAGE CREDITS CARRY THE SESSION under `[harness] usage_credits =
+    /// false` (the credits hold,
+    /// [`super::policy::turn_end::TurnEndState::credits_hold_stands`]): a
+    /// turn the host types would be billed to them. Offered once the window
+    /// they carry past resets, or the screen no longer says so.
+    Credits,
 }
 
 impl Guard {
     /// Every guard, in the order [`Self::code`] numbers them.
-    pub const ALL: [Guard; 12] = [
+    pub const ALL: [Guard; 13] = [
         Guard::NotBusy,
         Guard::NoBackgroundWait,
         Guard::Wall,
@@ -564,6 +602,7 @@ impl Guard {
         Guard::NotAuthoritative,
         Guard::Prompt,
         Guard::WakeSettle,
+        Guard::Credits,
     ];
 
     /// The word the upgrade's record and `--status` carry (`guard=`).
@@ -582,10 +621,11 @@ impl Guard {
             Guard::NotAuthoritative => "not-authoritative",
             Guard::Prompt => "prompt",
             Guard::WakeSettle => "wake-settle",
+            Guard::Credits => "credits",
         }
     }
 
-    /// A small number for an atomic (`1..=12`; `0` is left for none), and
+    /// A small number for an atomic (`1..=13`; `0` is left for none), and
     /// back ([`Self::from_code`]).
     #[must_use]
     pub fn code(self) -> u8 {
@@ -604,24 +644,39 @@ impl Guard {
     }
 }
 
-/// The loop's next try ([`IdleHost::waiting`]): when its wait ends, as a unix
-/// second, and the policy's reason (`api-error retry 1`). Only an API wall's
-/// retry wait is a next try ([`TurnEndAction::WaitUntil`]'s `retry`); other
-/// waits are not told to the host.
+/// The loop's wait as told to the host ([`IdleHost::waiting`]): when it ends,
+/// as a unix second, the policy's reason (`api-error retry 1`), and its kind
+/// ([`TurnEndAction::WaitUntil`]'s `wait`): an API wall's retry wait (the
+/// next try) or the short streak's back-off (a pause,
+/// `docs/DESIGN-harness-autopilot-2026-10-15.md` §10.5.3). No other wait is
+/// told to the host, so `kind` is never [`WaitKind::Other`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WaitPlan {
     /// Unix seconds at which the loop decides the point again.
     pub at_unix: i64,
     /// The policy's words for the wait.
     pub why: String,
+    /// What kind of wait it is: [`WaitKind::Retry`] or
+    /// [`WaitKind::BackOff`].
+    pub kind: WaitKind,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's NEGATIVE CONTROL of [`Session::tell_wait`]'s "on change
+    /// only": set, what was told is forgotten at every step, so every step
+    /// tells.
+    pub(super) static TELL_EVERY_STEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A wait as it was last told to the host ([`Session::tell_wait`]): the
-/// deadline on the loop's own clock, and the unix second it was told as.
+/// deadline on the loop's own clock, the unix second it was told as, and
+/// its kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ToldWait {
     at: Instant,
     unix: i64,
+    kind: WaitKind,
 }
 
 /// When the turn-end policy decides again at the point still showing, and
@@ -645,9 +700,10 @@ pub(super) struct Due {
     pub(super) unix_ms: i64,
     /// Why: the policy's words.
     pub(super) why: String,
-    /// A wall's next try ([`TurnEndAction::WaitUntil`]'s `retry`), the only
-    /// wait told to the host ([`Session::tell_wait`]).
-    pub(super) retry: bool,
+    /// What kind of wait it is ([`TurnEndAction::WaitUntil`]'s `wait`): a
+    /// wall's next try and the short streak's back-off are told to the host
+    /// ([`Session::tell_wait`]), no other.
+    pub(super) wait: WaitKind,
 }
 
 /// The least time between two of the accounts' news that end a LATCHED
@@ -680,6 +736,30 @@ impl UsageSeen {
     pub fn says(&self) -> bool {
         self.credits.is_some() || self.warning.is_some()
     }
+}
+
+/// WHAT THE LOOP KEEPS OF THE NOTICES THAT SAY USAGE CREDITS CARRY THE
+/// SESSION ([`Session::credits_kept`]), from every read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CreditsKept {
+    /// The reset the notice they started on named; `None`: none read.
+    pub(super) reset: Option<CreditsReset>,
+    /// The first read of a notice, on the loop's clock.
+    pub(super) since: Instant,
+    /// The model a per-model notice named, as a word of its family
+    /// ([`super::policy::turn_end::credits_model`]); `None`: the account's.
+    pub(super) model: Option<String>,
+}
+
+/// The reset the notice usage credits started on named
+/// ([`CreditsKept::reset`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CreditsReset {
+    /// As printed (`9:43am (America/Los_Angeles)`): the same text is the same
+    /// reset, never placed again (a span counts from its print).
+    pub(super) text: String,
+    /// Placed, in epoch seconds; `None`: it would not place.
+    pub(super) unix: Option<i64>,
 }
 
 /// WHY A CLAIMED `/usage` PROBE RECORDED NO SAMPLE
@@ -822,48 +902,49 @@ pub enum StuckSurvey {
     Unclosed,
 }
 
-/// `supervise`'s knobs (and `watch`'s: the same loop).
+/// What the stall canary's second rung stood on ([`IdleHost::stall_unread`]),
+/// and for how many minutes: the witness decides the words a host may say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StallSeen {
+    /// A screen no reader names while Claude Code's own title rests on `✳`:
+    /// busy on background work alone (90 minutes), or a dialog whose words
+    /// have not changed (30). A fault of aterm's own reading.
+    Unread { minutes: u64 },
+    /// agy's or Muse Code's own background work, which their reader names
+    /// (a task, a timer, a subagent, a backgrounded shell, a monitor), under
+    /// a turn that ended, run for `minutes` under words that stood still
+    /// (90). No title was read and the screen is read: work that has not
+    /// ended, no fault of aterm's reading.
+    OwnWork { minutes: u64 },
+}
+
+/// The loop's knobs ([`Session::run_hosted`]).
 ///
 /// Every policy switch is [`Self::policy`], the `[harness]` table
-/// ([`SupervisorConfig`]): the host sets it whole ([`Self::hosted_with`]), and
-/// the CLI's flags may only take power away from it.
+/// ([`SupervisorConfig`]): the host sets it whole ([`Self::hosted_with`]).
 #[derive(Debug, Clone, Default)]
 pub struct SuperviseOpts {
     /// The wall-clock budget.
     pub max: Duration,
     /// `python3 <script>` globs that count as reads (empty = the default list).
     pub python_allow: Vec<String>,
-    /// A notes file to append one line per action to.
-    pub notes: Option<PathBuf>,
-    /// `watch --report`: an idle, question or limited point's EVENT line
-    /// carries `complete=<0|1> rows=<n>` of `report` before its summary.
-    pub report: bool,
-    /// `--context-warn`: the percentage of context left
-    /// ([`super::phase::context_left`]) at or below which the loop says `EVENT
-    /// context seq=<n> <v>% until auto-compact`, once a descent; afterwards
-    /// the indicator gone from a framed screen with no box (or rising by
-    /// [`COMPACTED_RISE`]) is `EVENT compacted seq=<n>`. `0` disables both
-    /// (the default here; the CLI's is 10). Armed per loop: a compaction
-    /// between two `supervise` runs is not seen.
+    /// The percentage of context left ([`super::phase::context_left`]) at or
+    /// below which the loop says `EVENT context seq=<n> <v>% until
+    /// auto-compact`, once a descent; afterwards the indicator gone from a
+    /// framed screen with no box (or rising by [`COMPACTED_RISE`]) is `EVENT
+    /// compacted seq=<n>`. `0` disables both (the default here; the hosted
+    /// loop's is [`DEFAULT_CONTEXT_WARN`]). Armed per loop: a compaction
+    /// between two loops is not seen.
     pub context_warn: u8,
-    /// `--journal`: a file to append one JSON object to for every line the
-    /// loop prints — and, for `supervise`, for every line `watch` would have
-    /// printed for what it decides silently ([`super::journal`]).
+    /// A file to append one JSON object to for every line the loop prints,
+    /// and for the journal-only lines it decides silently
+    /// ([`super::journal`]).
     pub journal: Option<PathBuf>,
     /// The approval ledger a hosted loop keeps ([`Session::run_hosted`]),
     /// named by its host (`<state>/drive/<sid>.jsonl`). `None`: no ledger
     /// unless [`Session::set_approval_ledger`] gave one; the loop never falls
     /// back to the process's state directory.
     pub ledger: Option<PathBuf>,
-    /// `--mail`: park the mail lane ([`super::mail::Lane`]) on the manager's
-    /// inbox beside the loop. Every delivery prints `MAIL id=<n> off=<o>
-    /// from=<sid> kind=<k> len=<n> [re=<o>]`; an idle point is held
-    /// (`Session::hold_for_report`, `idle_grace` at most) for the worker's
-    /// `report` of the same turn and printed as one line, `EVENT turn seq=<n>
-    /// report=<id> rows=<n> <summary>` when it came
-    /// ([`MailIn::is_this_turns`]), else `EVENT idle-no-report seq=<n>
-    /// <summary>`. `None` leaves every line as it was.
-    pub mail: Option<MailOpts>,
     /// The owner's policy ([`SupervisorConfig`], full power by default):
     /// what a box may be answered with (`approve`), the trust roots, the
     /// rating surveys (`dismiss_surveys`: press `0` on the session survey, or the
@@ -876,21 +957,26 @@ pub struct SuperviseOpts {
     /// Behind another holder's supervisor claim, end the loop (`Err` starting
     /// with [`CLAIM_HELD`], naming the holder) instead of watching behind it.
     /// The in-GUI host sets it ([`Self::hosted`]) and restarts a loop when the
-    /// claim is released or lapses; `watch` leaves it off (`WATCHING …`). The
-    /// loop's own claim is the only one either way.
+    /// claim is released or lapses; off, the loop watches behind it
+    /// (`WATCHING …`). The loop's own claim is the only one either way.
     pub yield_when_held: bool,
     /// The host's part at idle points ([`IdleHost`]): takes the live
     /// upgrade's step and a relaunched agent's continuation in place, and says
-    /// when the upgrade owns turn ends. `None` for `watch` and `supervise`.
+    /// when the upgrade owns turn ends. `None` for a loop with no host (the
+    /// engine's tests).
     pub idle_host: Option<Arc<dyn IdleHost>>,
+    /// Where a tasked session's result is snapshotted at the done edge
+    /// (`<state>/tasks/`, named by its host; `supervise::task_mark`). `None`: none is
+    /// written, and a done task is marked with no result.
+    pub tasks: Option<PathBuf>,
 }
 
 impl SuperviseOpts {
     /// The in-GUI host's loop: no time budget, the approval policy at full
     /// power, the survey dismissed, every turn end decided by the turn-end
-    /// policy, the context indicator watched. Outages are ridden out, an
-    /// unanswerable point is escalated to the worker's attention, and mail
-    /// goes to a manager only while the fabric is connected. No `--mail` lane.
+    /// policy, the context indicator watched. Outages are ridden out, and an
+    /// unanswerable point is escalated to the worker's attention, the one
+    /// hand-over (`await task` wakes on it).
     pub fn hosted() -> Self {
         Self::hosted_with(&SupervisorConfig::default())
     }
@@ -925,18 +1011,37 @@ const STOPPED_WAIT: &str = "the supervisor was stopped: no wait begins after the
 
 /// A budget that never runs out (`--max-s 0`, [`SuperviseOpts::hosted`]).
 pub const UNBOUNDED: Duration = Duration::MAX;
-/// The hosted loop's `context_warn` (the CLI's default).
+/// The hosted loop's `context_warn`.
 const DEFAULT_CONTEXT_WARN: u8 = 10;
 /// How many rows a screen read asks for when the server can tail — the
 /// server's own agent-verdict cut (aterm-gui's `presence::CLASSIFY_ROWS`).
 const TAIL_ROWS: usize = 40;
+
+/// A screen as [`Session::limit_words_read_above`] keeps its verdict for: its
+/// `seq`, its `first` and its rows.
+type ScreenKey = (u64, usize, Vec<String>);
+
+/// [`Session::read_once`]'s read of the screen ([`Session::read_shaped`]): the
+/// screen, the reader a tail that stands chose (`None` for a whole read), and
+/// the grid's rows above the screen where the read was whole (`None` for a
+/// tail).
+struct Shaped {
+    screen: Screen,
+    read_by: Option<&'static dyn ScreenReader>,
+    above: Option<Vec<String>>,
+}
 
 /// Whether a `tail=` read cannot stand for the screen and is taken again whole.
 /// The grid must be taller than the tail (`first > 0`), and then either:
 ///
 /// * the box `reader` (the session program's) finds has its title row off the
 ///   rows read ([`aterm_phase::prompt::PromptV2::head_off_screen`]), so a box
-///   the pane shows entire is decided by its title; or
+///   the pane shows entire is decided by its title;
+/// * that box is one whose decision reads every row above it to the screen's
+///   top, an `Edit file` box
+///   ([`super::policy::box_call::reads_the_screen_above`]): its
+///   call's own row can lie above the tail, as on a fresh pane, where the
+///   REPL is drawn from the top; or
 /// * the tail does not hold the live rows at all: the cursor's row is above
 ///   it, or every row of it is blank (a dialog drawn wholly above the tail in
 ///   a tall pane). This test reads the reply alone, no grammar.
@@ -950,9 +1055,9 @@ fn tail_misses_the_live_rows(reader: &dyn ScreenReader, screen: &Screen) -> bool
     screen.first > 0
         && (screen.cursor_row < screen.first
             || screen.rows.iter().all(|r| r.trim().is_empty())
-            || reader
-                .prompt(&screen.rows)
-                .is_some_and(|p| p.head_off_screen))
+            || reader.prompt(&screen.rows).is_some_and(|p| {
+                p.head_off_screen || super::policy::box_call::reads_the_screen_above(&p)
+            }))
 }
 
 /// Whether a `tail=` read that ends on a BLANK row cannot stand for the
@@ -1124,10 +1229,12 @@ const BUSY_SINK_BACKOFF: Duration = Duration::from_millis(250);
 /// has no cap (`approval_loop`'s module header).
 const MAX_APPROVALS_OF_ONE_COMMAND: usize = 2;
 /// How many rows the compact result prints when there is no box.
+#[cfg(test)]
 const RESULT_ROWS: usize = 28;
-/// How many characters of a command, a said row or a notice one `watch` line
-/// carries.
-const LINE_CHARS: usize = 160;
+/// How many characters of a command, a said row or a notice one loop line
+/// carries (a `CHOSE` line's answers too: `crate::harness::stats` reads a
+/// line this long as cut).
+pub(crate) const LINE_CHARS: usize = 160;
 /// How many non-blank rows of the transcript, up to the last thing said,
 /// make a review point's words ([`point_key`]) — and, above a box the reader
 /// could not read whole (its head off the screen, a question named by its
@@ -1143,8 +1250,8 @@ const KEY_ROWS: usize = 8;
 /// change.
 const ABOVE_LETTERS: usize = 64;
 
-/// The exit code `supervise`, `watch` and `await-turn` end with on a spent
-/// budget.
+/// The exit code a loop ([`Session::supervise`], [`Session::await_turn`])
+/// ends with on a spent budget.
 pub const EXIT_TIMEOUT: u8 = 124;
 
 /// How far past a reset the notice named the budget is stretched
@@ -1272,9 +1379,13 @@ enum Next {
 /// The anchored guard of an open box's first row under its header — its
 /// command, path or question — for `await gone`: the box leaving the screen,
 /// and no other change, ends the wait on it. The box as `reader` reads it.
+/// None for a box with no row under its header: a frame half drawn reads
+/// as a box of one row (`❯ Continue without using this MCP` alone, the rows
+/// under it not yet drawn), whose wait is then on the content moving.
 fn box_anchor(reader: &dyn ScreenReader, rows: &[String]) -> Option<String> {
     let (header, esc) = reader.prompt(rows)?.span;
-    let row = rows[header + 1..esc]
+    let row = rows
+        .get(header + 1..esc)?
         .iter()
         .find(|r| !r.trim().is_empty())?;
     Some(super::policy::row_guard(row))
@@ -1389,13 +1500,26 @@ struct Outage {
     pause: Duration,
 }
 
-/// How the shared loop ended.
+/// How the shared loop ended. The turn a stop or a timeout carries is the
+/// engine tests' `supervise`'s to render ([`Session::supervise`]); the hosted
+/// loop says only how it ended ([`watch_end_line`]).
 enum End {
-    /// The review stopped the loop at this point (`supervise`), with how
-    /// `--mail` settled it when it was an idle one.
-    Stopped(Turn, Option<Fold>),
+    /// The review stopped the loop at this point (a stop-at-review seam).
+    Stopped(
+        #[cfg_attr(
+            not(test),
+            expect(dead_code, reason = "rendered by the tests' supervise")
+        )]
+        Turn,
+    ),
     /// The budget ran out; the last screen read.
-    Timeout(Turn),
+    Timeout(
+        #[cfg_attr(
+            not(test),
+            expect(dead_code, reason = "rendered by the tests' supervise")
+        )]
+        Turn,
+    ),
     /// The hosted loop's stop flag was set ([`Session::run_hosted`]).
     Quit,
 }
@@ -1406,11 +1530,12 @@ fn session_gone(end: &Result<End, String>) -> bool {
     matches!(end, Err(e) if e.contains("ERR exited") || e.contains("no such session"))
 }
 
-/// `watch`'s last line and exit code for how its loop ended.
+/// The hosted loop's (and the tests' `watch`'s) last line and exit code for
+/// how its loop ended.
 fn watch_end_line(end: Result<End, String>) -> (String, u8) {
     match end {
         Ok(End::Timeout(_)) => ("TIMEOUT".to_string(), EXIT_TIMEOUT),
-        // `Lines` never stops at a review point; kept for the match.
+        // `Lines` never stops at a review point.
         Ok(End::Stopped(..)) => ("EXIT stopped at a review point".to_string(), 1),
         Ok(End::Quit) => ("EXIT stopped".to_string(), 0),
         Err(e) => (format!("EXIT {}", exit_reason(&e)), 1),
@@ -1426,7 +1551,7 @@ fn watch_end_line(end: Result<End, String>) -> (String, u8) {
 /// moment it attaches — the continuation's own row or an act typed in its
 /// place, at the limit the row names, and never one typed into an account
 /// the session has since LEFT; a try a loop read met again since is no try
-/// whose work is yet to come ([`TurnEndState::seed_try_met`]), its track's
+/// whose work is yet to come ([`TurnEndState::seed_met_attempt`]), its track's
 /// appearance where the loop that read it judged it met — the wall's row
 /// ([`approvals::UsageAttempt::met_ms`]), or the end of the take window that
 /// row opened where it was the try's first read; the last act, a try still
@@ -1441,6 +1566,7 @@ fn seed_usage_act_in(
     state: &mut TurnEndState,
     body: &str,
     sid: Option<&str>,
+    older: &OlderReads,
     now_ms: i64,
     now: Instant,
 ) {
@@ -1458,9 +1584,23 @@ fn seed_usage_act_in(
             _ if t.unread => FirstRead::Unread,
             _ => FirstRead::Unknown,
         };
-        state.seed_awaited(RULE_LIMIT_RESUME, ago(t.at_ms), read, true, t.met, now);
+        let awaited = state.seed_awaited(RULE_LIMIT_RESUME, ago(t.at_ms), read, true, t.met, now);
+        // Past its window and TAKEN — its own turn read running, the wall's
+        // end its first read or a take after it, no wall read since and no
+        // point judged (nor one an older build's journal says it judged,
+        // [`OlderReads::judged_ms`]): that turn's end is this loop's first
+        // point ([`TurnEndState::seed_try_taken`]).
+        if !awaited && t.ended && !t.met && older.judged_ms.is_none_or(|j| j < t.at_ms) {
+            state.seed_try_taken();
+        }
     }
-    let Some(at) = approvals::usage_attempt_in(body, sid) else {
+    let taken = |at: i64, end: i64| {
+        older
+            .takes
+            .iter()
+            .any(|&(act, judged)| act.abs_diff(at) <= 5_000 && end <= judged)
+    };
+    let Some(at) = approvals::usage_attempt_taken_in(body, sid, &taken) else {
         return;
     };
     // The track's appearance: the try, or where the loop that typed it
@@ -1475,9 +1615,15 @@ fn seed_usage_act_in(
         Some(m) => m,
         None => at.at_ms,
     };
-    state.seed_usage_attempt(ago(appearance), at.limit, now);
+    // A try a loop read met again is taken up however old it is, its rung
+    // due in the gap owed ([`TurnEndState::seed_met_attempt`]); so is one
+    // nobody read whose answer this loop's first read dates
+    // ([`TurnEndState::date_unread_try`]), and where nothing dates it, it is
+    // cut at its rung ([`TurnEndState::seed_usage_attempt`]).
     if at.met_ms.is_some() {
-        state.seed_try_met();
+        state.seed_met_attempt(ago(appearance), at.limit, now);
+    } else {
+        state.seed_usage_attempt(ago(appearance), at.limit, now);
     }
     state.seed_account_resumed(at.at_ms.div_euclid(1000));
 }
@@ -1493,7 +1639,7 @@ fn seed_usage_act(
     now: Instant,
 ) {
     let body = std::fs::read_to_string(path).unwrap_or_default();
-    seed_usage_act_in(state, &body, sid, now_ms, now);
+    seed_usage_act_in(state, &body, sid, &OlderReads::default(), now_ms, now);
 }
 
 /// THE DONE CHECK A LOOP BEFORE THIS ONE ASKED, owed its answer
@@ -1502,64 +1648,91 @@ fn seed_usage_act(
 /// clock): its answer's done report is the check's
 /// ([`TurnEndState::seed_done_check`]) — the check itself still inside its
 /// take window awaited as by the loop that typed it
-/// ([`TurnEndState::seed_awaited`]), its wall row then its window's answer.
-/// So too the open-items challenge, the check's kin, under its own rule, and
-/// the job it was typed in is challenged ([`TurnEndState::seed_challenged`];
-/// the merge review's MG7-A3: a done reply to it read as a first done
-/// report, and the follower typed the check where the first loop ended the
-/// task).
+/// ([`TurnEndState::seed_awaited`]), its wall row then its window's answer —
+/// one typed in a limit's place that nothing has read yet first read by this
+/// loop's look, as the limit's continuation is ([`seed_usage_act_in`]).
+/// So too a challenge, the check's kin, under its own rule (the merge
+/// review's MG7-A3: a done reply to it read as a first done report, and the
+/// follower typed the check where the first loop ended the task). No job is
+/// seeded as challenged: a challenge ends no job with work left, however
+/// often it was typed (the owner's rule of 2026-10-19).
 fn seed_done_check(
     state: &mut TurnEndState,
     body: &str,
     sid: Option<&str>,
+    older: &OlderReads,
     now_ms: i64,
     now: Instant,
 ) {
-    let Some(owed) = approvals::done_check_owed_in(body, sid) else {
+    let Some(mut owed) = approvals::done_check_owed_in(body, sid) else {
         return;
     };
+    // AN OLDER BUILD'S BOOKS: the points its journal says it judged after the
+    // check, no wall cutting it, as [`approvals::done_check_owed_in`] counts
+    // the records of a newer one — the first the check's answer (the task
+    // ended there, or not), a second a later turn's, after which the check
+    // is nobody's to answer; judged and not ended, a done report after it
+    // is a first one. Owed still, a successor read a later done report as
+    // the check's answer and typed nothing where the loop that asked it
+    // asked the check again (ATERM-KI-1016-1, follow-5).
+    if let Some((at_ms, _)) = owed.check.filter(|_| !owed.cut) {
+        let after: Vec<bool> = older
+            .points
+            .iter()
+            .filter(|(t, _)| *t > at_ms)
+            .map(|(_, done)| *done)
+            .collect();
+        if !after.is_empty() {
+            owed.answered |= after.iter().any(|done| *done);
+            owed.check = None;
+            owed.read_ms = None;
+            if after.len() > 1 || !owed.answered {
+                return;
+            }
+        }
+    }
     let ago = |ms: i64| Duration::from_millis(u64::try_from(now_ms - ms).unwrap_or(0));
     let awaited = owed.check.is_some_and(|(at_ms, in_place)| {
         now_ms >= at_ms
             && state.seed_awaited(
                 owed.rule,
                 ago(at_ms),
-                owed.read_ms
-                    .map_or(FirstRead::Unknown, |ms| FirstRead::Read(ago(ms))),
+                owed.read_ms.map_or(
+                    if owed.unread {
+                        FirstRead::Unread
+                    } else {
+                        FirstRead::Unknown
+                    },
+                    |ms| FirstRead::Read(ago(ms)),
+                ),
                 in_place,
                 owed.cut,
                 now,
             )
     });
-    state.seed_done_check(owed.cut && !awaited, owed.answered);
-    // The job had its challenge — unless the task ended at its answer
-    // (`answered`, `task-done@v1`): that ended the job, and the loop that
-    // typed it forgot the challenge there, so the next job is challenged
-    // afresh. Seeded as challenged, a follower read a new job's FINISHED
-    // that names open work as the challenged job's and ended it unchallenged.
-    if owed.rule == RULE_OPEN_ITEMS && !owed.answered {
-        state.seed_challenged();
-    }
+    state.seed_done_check(owed.rule, owed.cut && !awaited, owed.answered);
 }
 
-/// THE LANDING A LOOP BEFORE THIS ONE LANDED, as the files beside the
-/// session say it (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.4.5,
-/// §9.4.8, [`TurnEndState::seed_landed`]): the last note of a task's end in
-/// `sid`'s journal (`journal`, the one beside its ledger,
+/// THE END A LOOP BEFORE THIS ONE READ — A LANDING OR A DONE — as the files
+/// beside the session say it (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §9.4.5, §9.4.8, §10.2.1; [`TurnEndState::seed_landed`],
+/// [`TurnEndState::seed_done`]): the last note of a task's end in `sid`'s
+/// journal (`journal`, the one beside its ledger,
 /// [`approvals::journal_beside`]) — `DONE …`, or a person's own exchange's
-/// `LEFT …` — is `DONE … rule=land@v1`; nothing its ledger says came after
+/// `LEFT …` — is a `DONE`: `rule=land@v1` a landing ([`TaskFace::Landed`]),
+/// any other a done ([`TaskFace::Done`]: the worker's `FINISHED`, the done
+/// check's, the open-items challenge's); nothing its ledger says came after
 /// it (`last_ms`, unix ms): no `typed` row (the ledger's last, as
 /// [`approvals::typed_at`] reads them) and no later point judged
-/// ([`approvals::RULE_POINT`], the landing's own written before its note) —
+/// ([`approvals::RULE_POINT`], the end's own written before its note) —
 /// `i64::MAX` for a turn read running since ([`approvals::RULE_TURN_RAN`]);
-/// and THE LANDING IS STILL THE LAST THING THE JOURNAL SAYS OF THE SCREEN:
+/// and THE END IS STILL THE LAST THING THE JOURNAL SAYS OF THE SCREEN:
 /// every point the journal holds after the note ([`said_a_point`]) is the
-/// landing's own, by the mark of the worker's last words there
-/// ([`said_mark`], kept with each point's line) — never by its `seq=`, which
-/// a footer tick moves and a seamless update's successor starts over, so the
-/// landing's point handed over again after an outage (`RECONNECTED`) or a
-/// resize is still the landing. No box comes after it: a box is drawn only
-/// inside a turn.
+/// end's own, by the mark of the worker's last words there ([`said_mark`],
+/// kept with each point's line) — never by its `seq=`, which a footer tick
+/// moves and a seamless update's successor starts over, so the end's point
+/// handed over again after an outage (`RECONNECTED`) or a resize is still
+/// the end. No box comes after it: a box is drawn only inside a turn.
 ///
 /// A person's or an orchestrator's turn after a landing types nothing the
 /// ledger counts as an act, and the policy notes no new end while its task
@@ -1572,23 +1745,32 @@ fn seed_done_check(
 /// journal, and they drop the seed: the new loop decides its first point as
 /// any first point is (the token reads done, words alone a first done
 /// report, anything else open). A turn NO loop watched is in neither file;
-/// the landing's mark goes with the seed, and the first point's last words
-/// must still be the landing's ([`TurnEndState::seed_landed`]).
+/// the end's mark goes with the seed, and the first point's last words must
+/// still be the end's ([`TurnEndState::seed_landed`],
+/// [`TurnEndState::seed_done`]).
 ///
-/// `Some` holds the landing's mark, `None` within it where the landing's
-/// point carries none (a journal a build before the mark wrote): its later
-/// points are then the landing's own only on the note's `seq=`, and no words
-/// are compared at the first point. `journal` is the journal's text, read by
-/// the caller through its door; one that holds no such note seeds nothing.
-/// Read from the end, and only the lines that name a task's end, a point or a
-/// box are parsed.
-fn landed_before(journal: &str, sid: Option<&str>, last_ms: Option<i64>) -> Option<Option<u64>> {
+/// `Some` holds the end, its mark — `None` within it where the end's point
+/// carries none (a journal a build before the mark wrote): its later points
+/// are then the end's own only on the note's `seq=`, and no words are
+/// compared at the first point — and the wall time (unix ms) the note was
+/// journaled at, which the start face carries to the window
+/// ([`TurnEndState::seed_noted_at`]). `journal` is the journal's text, read
+/// by the caller through its door; one that holds no such note seeds
+/// nothing. Read from the end, and only the lines that name a task's end, a
+/// point or a box are parsed.
+fn ended_before(
+    journal: &str,
+    sid: Option<&str>,
+    last_ms: Option<i64>,
+) -> Option<(TaskFace, Option<u64>, i64)> {
     let sid = sid.map(|s| s.trim_start_matches('@'));
     let land = format!("rule={}", super::policy::turn_end::RULE_LAND);
     // The points and boxes said after the last task end, newest first.
     let mut later: Vec<super::journal::JournalRecord> = Vec::new();
-    // The landing's note, once read: its `seq=`.
+    // The end's note, once read: its `seq=`, and the end it says and when.
     let mut note: Option<Option<u64>> = None;
+    let mut ended = TaskFace::Done;
+    let mut noted_ms = 0;
     let records = journal.lines().rev().filter_map(|text| {
         let end = text.contains("\"line\":\"DONE ") || text.contains("\"line\":\"LEFT ");
         if !end && !text.contains("\"kind\":\"event\"") && !text.contains("\"kind\":\"approved\"") {
@@ -1615,9 +1797,15 @@ fn landed_before(journal: &str, sid: Option<&str>, last_ms: Option<i64>) -> Opti
                 .and_then(|w| w.strip_prefix("seq="))
                 .and_then(|v| v.parse::<u64>().ok());
             let rule = words.next().unwrap_or_default();
-            if word != "DONE" || rule != land || last_ms.is_some_and(|t| t > rec.t) {
+            if word != "DONE" || last_ms.is_some_and(|t| t > rec.t) {
                 return None;
             }
+            if rule == land {
+                ended = TaskFace::Landed;
+            }
+            // The end's own time: the first note of it, where this one
+            // restates it ([`JournalRecord::ended`]), never after this one.
+            noted_ms = rec.ended.map_or(rec.t, |first| first.min(rec.t));
             note = Some(seq);
             continue;
         };
@@ -1634,14 +1822,23 @@ fn landed_before(journal: &str, sid: Option<&str>, last_ms: Option<i64>) -> Opti
             Some(_) => !is_box(p) && p.mark == landing,
             None => !is_box(p) && p.seq.is_some() && p.seq == seq,
         };
-        return later.iter().all(own).then_some(landing);
+        return later.iter().all(own).then_some((ended, landing, noted_ms));
     }
-    // A note with no point before it to read the landing's words by.
+    // A note with no point before it to read the end's words by.
     let seq = note?;
     later
         .iter()
         .all(|p| !is_box(p) && p.seq.is_some() && p.seq == seq)
-        .then_some(None)
+        .then_some((ended, None, noted_ms))
+}
+
+/// THE LANDING A LOOP BEFORE THIS ONE LANDED ([`ended_before`]'s landing):
+/// its mark, `None` within where its point carries none.
+#[cfg(test)]
+fn landed_before(journal: &str, sid: Option<&str>, last_ms: Option<i64>) -> Option<Option<u64>> {
+    ended_before(journal, sid, last_ms)
+        .filter(|(face, _, _)| *face == TaskFace::Landed)
+        .map(|(_, words, _)| words)
 }
 
 /// A journal line of A BOX ([`said_a_point`]): handed over (`EVENT prompt`)
@@ -1650,9 +1847,429 @@ fn is_box(rec: &super::journal::JournalRecord) -> bool {
     rec.kind == "approved" || rec.phase == "prompt"
 }
 
+/// THE LAST POINT A LOOP OF AN OLDER BUILD JOURNALED, where nothing it said
+/// of the screen came after it ([`journaled_hold`]): a wait it held there, a
+/// task's end, or the point of a continuation it typed with no back-off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Hold {
+    /// Why it waited: the words [`decide_turn_end`] gives the wait (empty
+    /// where it held none).
+    why: String,
+    /// The wait's end its line names (unix ms, to the nearest second; the
+    /// point's own time where it held none).
+    until_ms: i64,
+    /// The act the wait ended in followed it, the ledger's last act, and no
+    /// point was read since: the act's yield is still to come.
+    acted: bool,
+    /// The words of the last act journaled before the wait, or of the act
+    /// it ended in ([`Self::acted`]): at an API error's wall, the retry
+    /// before, whose words tell its cause ([`retry_held`]).
+    said: Option<String>,
+    /// When its line was written (unix ms): the point it was held at.
+    at_ms: i64,
+    /// THE SHORT STREAK AT THAT POINT: a short back-off's own (`<k> short
+    /// turn(s) in a row`, [`short_held`]), or, at any other wait (a limit's,
+    /// a wall's), the streak the last such back-off held, lengthened by the
+    /// continuation typed after it ([`is_continue_rule`]), whose yield this
+    /// point was: its work the journal does not give, read short — never
+    /// a back-off shorter than that loop's (the policy's own
+    /// [`TurnEndState::observe`] keeps it through a limit's try, ends it
+    /// with a continuation's real work). `None`: no back-off was journaled
+    /// before it, or an act typed with none.
+    short: Option<u32>,
+}
+
+/// WHAT A LOOP OF AN OLDER BUILD HELD AT ITS LAST POINT, read from its
+/// journal (`journal`, the one beside `sid`'s ledger,
+/// [`approvals::journal_beside`]; ATERM-KI-1016-1, follow-5). A ledger no
+/// point record is in ([`approvals::RULE_POINT`]: every release through
+/// 0.106.0 wrote none, and marked no act with the short streak or an API
+/// error's rung) says nothing of either, and a loop that followed such a
+/// loop counted its back-off from its own attach on the ladder's first rung
+/// — up to the ladder's top sooner than the loop before it. That loop
+/// journaled each wait it held at a point, in the words every build writes
+/// ([`decide_turn_end`], [`wall_action`]'s): `WAITING seq=<n> until=<t>
+/// <why>`; each task's end (`DONE …`); and each act, a continuation typed
+/// with no wait before it typed at a point no short streak held. The last
+/// such point with nothing that loop said of the screen after it — no point
+/// handed over ([`said_a_point`]), no exchange left to a person, no other
+/// point — is the point it held at, where it came after the ledger's last
+/// act (`last_ms`, unix ms); followed by an act and nothing else (its take
+/// window's wait is the act's), the act that point ended in, the ledger's
+/// last (the act's line written as its row is: [`Hold::acted`]).
+fn journaled_hold(journal: &str, sid: Option<&str>, last_ms: Option<i64>) -> Option<Hold> {
+    let sid = sid.map(|s| s.trim_start_matches('@'));
+    // The wait last journaled (its line's time), and the act it ended in
+    // (that act's line's time).
+    let mut hold: Option<(i64, Hold)> = None;
+    let mut act: Option<i64> = None;
+    let mut said: Option<String> = None;
+    // The streak at the last point journaled ([`Hold::short`]), and the
+    // acts since it: whether one was a continuation, and how many (an act
+    // after another with no wait between was typed at a point no back-off
+    // held: its streak none — that loop backs off every short streak).
+    let mut streak: Option<u32> = None;
+    let mut continued = false;
+    let mut acts = 0_u32;
+    for rec in journal
+        .lines()
+        .filter_map(|text| super::journal::JournalRecord::from_json(text).ok())
+        .filter(|rec| rec.sid.as_deref() == sid)
+    {
+        match rec.kind.as_str() {
+            // The act's take window: the act is still the wait's.
+            "waiting" if rec.summary.contains(" the worker to take the ") => {}
+            "waiting" => {
+                act = None;
+                let why = rec.summary.split_once(' ').map_or("", |(_, why)| why);
+                streak = match short_held(why) {
+                    Some((k, _)) => Some(k),
+                    None => streak.map(|k| k.saturating_add(u32::from(continued))),
+                };
+                continued = false;
+                acts = 0;
+                hold = rec
+                    .summary
+                    .strip_prefix("until=")
+                    .and_then(|s| s.split_once(' '))
+                    .filter(|_| rec.phase == "-")
+                    .and_then(|(until, why)| {
+                        let until = crate::harness::upgrade_models::parse_utc(until)?;
+                        let until_ms = i64::try_from(until).ok()?.checked_mul(1000)?;
+                        Some((
+                            rec.t,
+                            Hold {
+                                why: why.to_string(),
+                                until_ms,
+                                acted: false,
+                                said: said.clone(),
+                                at_ms: rec.t,
+                                short: streak,
+                            },
+                        ))
+                    });
+            }
+            "continued" | "typed" => {
+                let continues = is_continue_rule(&rec.phase);
+                // A continuation no wait came before was typed at a point no
+                // back-off held: its streak none (that loop backs off every
+                // short streak), the point unjournaled.
+                if continues && (acts > 0 || hold.is_none()) {
+                    streak = Some(0);
+                    continued = false;
+                    hold = Some((
+                        rec.t,
+                        Hold {
+                            why: String::new(),
+                            until_ms: rec.t,
+                            acted: false,
+                            said: said.clone(),
+                            at_ms: rec.t,
+                            short: streak,
+                        },
+                    ));
+                }
+                act = hold.is_some().then_some(rec.t);
+                if let Some((_, h)) = hold.as_mut() {
+                    h.said = Some(rec.summary.clone());
+                }
+                said = Some(rec.summary);
+                continued |= continues;
+                acts += 1;
+            }
+            // THE TASK'S END a continuation's done reply made (`DONE …`): a
+            // point that lengthens the streak whatever its work, and holds
+            // no wait.
+            _ if rec.line.starts_with("DONE ") => {
+                act = None;
+                streak = Some(streak.unwrap_or(0).saturating_add(u32::from(continued)));
+                continued = false;
+                acts = 0;
+                hold = Some((
+                    rec.t,
+                    Hold {
+                        why: String::new(),
+                        until_ms: rec.t,
+                        acted: false,
+                        said: said.clone(),
+                        at_ms: rec.t,
+                        short: streak,
+                    },
+                ));
+            }
+            "restarted" | "escalated" | "skipped" => {
+                hold = None;
+                act = None;
+                streak = None;
+            }
+            _ if said_a_point(&rec) || rec.line.starts_with("LEFT ") => {
+                hold = None;
+                act = None;
+                streak = None;
+            }
+            _ => {}
+        }
+    }
+    let (t, hold) = hold?;
+    match act {
+        // The act's line and its row are written in the same step.
+        Some(at) => last_ms
+            .is_some_and(|a| a.abs_diff(at) <= 5_000)
+            .then_some(Hold {
+                acted: true,
+                ..hold
+            }),
+        None => last_ms.is_none_or(|a| a < t).then_some(hold),
+    }
+}
+
+/// A PERSON'S OWN EXCHANGE A LOOP OF AN OLDER BUILD LEFT TO THEM, as it
+/// journaled it (`journal`, the one beside `sid`'s ledger; ATERM-KI-1016-1,
+/// done-5): its last `LEFT …` note with no act after it (`CONTINUED`,
+/// `TYPED`: an act closes the exchange, as its row does,
+/// [`approvals::open_left_in`]) and no task's end since (`DONE …`), keyed by
+/// the note's time ([`approvals::left_before_key`]): the conversation's last
+/// turn then is its last turn still while no turn has opened since
+/// (`crate::harness::upgrade::LastTurn::names`). A build through 0.105.0
+/// notes the exchange left and writes no row naming its turn: unseeded, the
+/// first loop after the update read the person's exchange as a turn of the
+/// task's and typed the done check or `keep going` into it once.
+fn journaled_left(journal: &str, sid: Option<&str>) -> Option<String> {
+    let sid = sid.map(|s| s.trim_start_matches('@'));
+    let mut left = None;
+    for rec in journal
+        .lines()
+        .filter_map(|text| super::journal::JournalRecord::from_json(text).ok())
+        .filter(|rec| rec.sid.as_deref() == sid)
+    {
+        match rec.kind.as_str() {
+            "continued" | "typed" => left = None,
+            _ if rec.line.starts_with("LEFT ") => left = Some(rec.t),
+            _ if rec.line.starts_with("DONE ") => left = None,
+            _ => {}
+        }
+    }
+    left.map(approvals::left_before_key)
+}
+
+/// THE BOOKS `body` (`sid`'s ledger text) WITH OFF STANDING AT EVERY PARK
+/// ITS JOURNAL SAYS (`journal`, the one beside the ledger; ATERM-KI-1016-1,
+/// done-6): a record of [`approvals::RULE_OFF_STOOD`] at each of the loop's
+/// `PARKED seq=<n> autopilot=off` notes ([`lifecycle::parked_off_note`]),
+/// before the first row stamped at or after it. A build through 0.105.0
+/// parks under Off (`Session::park_while_off`) and notes the park, but
+/// writes no record of it: a loop that followed one read the Land episode
+/// the park ended as still in hand ([`approvals::land_episode_in`]) and a
+/// done check a wall cut before it as still owed its retry
+/// ([`approvals::done_check_owed_in`]), where the loop that parked had
+/// dropped both ([`TurnEndState::park_off`]). A newer build writes the
+/// record beside its note, and the one spliced here says the same again:
+/// each reader reads a second record of Off standing as the first. `body`
+/// as it is where the journal says no park.
+fn with_parks_journaled<'b>(
+    body: &'b str,
+    journal: Option<&str>,
+    sid: Option<&str>,
+) -> std::borrow::Cow<'b, str> {
+    let bare = sid.map(|s| s.trim_start_matches('@'));
+    let parks: Vec<(i64, u64)> = journal
+        .unwrap_or_default()
+        .lines()
+        .filter(|text| text.contains("PARKED seq="))
+        .filter_map(|text| super::journal::JournalRecord::from_json(text).ok())
+        .filter(|rec| rec.sid.as_deref() == bare && lifecycle::is_parked_off(&rec.line))
+        .map(|rec| (rec.t, rec.seq.unwrap_or(0)))
+        .collect();
+    if parks.is_empty() {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let record = |&(t, seq): &(i64, u64)| {
+        approvals::Row {
+            rule_id: approvals::RULE_OFF_STOOD,
+            outcome: approvals::Outcome::Waiting,
+            command: "",
+            reason: approvals::OFF_STOOD,
+            box_seq: seq,
+        }
+        .to_json(t, sid)
+    };
+    let mut parks = parks.iter().peekable();
+    let mut out = String::with_capacity(body.len() + 256);
+    for line in body.lines() {
+        let ts = line.strip_prefix("{\"ts\":").and_then(|rest| {
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            rest[..digits].parse::<i64>().ok()
+        });
+        while let Some(park) = parks.next_if(|(t, _)| ts.is_some_and(|ts| ts >= *t)) {
+            out.push_str(&record(park));
+            out.push('\n');
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    for park in parks {
+        out.push_str(&record(park));
+        out.push('\n');
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// WHAT A LOOP OF AN OLDER BUILD JOURNALED of the limit's tries and its
+/// points, which its ledger does not say (ATERM-KI-1016-1, follow-5): read
+/// by [`seed_usage_act_in`] where the ledger holds no point record.
+#[derive(Debug, Default)]
+struct OlderReads {
+    /// The acts it saw taken ([`journaled_takes`]).
+    takes: Vec<(i64, i64)>,
+    /// The points it journaled judging (unix ms), and whether the task ended
+    /// there: each wait it held at one (`WAITING …`, no act's take window's)
+    /// and each task's end (`DONE …`) — where its rows hold none
+    /// ([`approvals::RULE_POINT`], [`approvals::RULE_TASK_DONE`] are newer).
+    points: Vec<(i64, bool)>,
+    /// The last point it judged after its last act (unix ms): the wait it
+    /// held there ([`journaled_hold`]). A try taken before it is no try whose
+    /// turn's end is still to come ([`TurnEndState::seed_try_taken`]): that
+    /// loop judged it, and its back-off from there is this loop's.
+    judged_ms: Option<i64>,
+}
+
+/// THE ACTS A LOOP OF AN OLDER BUILD SAW TAKEN, read from its journal
+/// (`journal`, the one beside `sid`'s ledger; ATERM-KI-1016-1, follow-5):
+/// each act whose first wait after it was its take window's (`the worker to
+/// take the <rule> act`, [`decide_turn_end`]'s words) — the screen read
+/// after it the one it was typed at — with the time of the first other wait
+/// after that (unix ms; `i64::MAX`: none), where that loop judged the screen
+/// again. An end of the wall between the two was the act's take: its turn
+/// began ([`approvals::usage_attempt_taken_in`]).
+fn journaled_takes(journal: &str, sid: Option<&str>) -> Vec<(i64, i64)> {
+    let sid = sid.map(|s| s.trim_start_matches('@'));
+    let mut takes = Vec::new();
+    // The last act's line, and whether its take window's wait followed it.
+    let mut act: Option<(i64, bool)> = None;
+    for rec in journal
+        .lines()
+        .filter_map(|text| super::journal::JournalRecord::from_json(text).ok())
+        .filter(|rec| rec.sid.as_deref() == sid)
+    {
+        match rec.kind.as_str() {
+            "continued" | "typed" => {
+                if let Some((t, true)) = act {
+                    takes.push((t, i64::MAX));
+                }
+                act = Some((rec.t, false));
+            }
+            "waiting" if rec.summary.contains(" the worker to take the ") => {
+                if let Some((_, window)) = act.as_mut() {
+                    *window = true;
+                }
+            }
+            "waiting" => {
+                if let Some((t, true)) = act.take() {
+                    takes.push((t, rec.t));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((t, true)) = act {
+        takes.push((t, i64::MAX));
+    }
+    takes
+}
+
+/// The points a loop of an older build journaled judging ([`OlderReads::points`]).
+fn journaled_points(journal: &str, sid: Option<&str>) -> Vec<(i64, bool)> {
+    let sid = sid.map(|s| s.trim_start_matches('@'));
+    journal
+        .lines()
+        .filter_map(|text| super::journal::JournalRecord::from_json(text).ok())
+        .filter(|rec| rec.sid.as_deref() == sid)
+        .filter_map(|rec| match rec.kind.as_str() {
+            "waiting" if !rec.summary.contains(" the worker to take the ") => Some((rec.t, false)),
+            _ if rec.line.starts_with("DONE ") => Some((rec.t, true)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The SHORT STREAK a journaled wait held ([`journaled_hold`]): `<k> short
+/// turn(s) in a row: <w> s back-off` (or `min`) — `k`, and the back-off `w`
+/// (ms).
+fn short_held(why: &str) -> Option<(u32, i64)> {
+    let (k, rest) = why.split_once(" short turn(s) in a row: ")?;
+    let (w, unit) = rest.strip_suffix(" back-off")?.split_once(' ')?;
+    let w: i64 = w.parse().ok()?;
+    let ms = match unit {
+        "s" => w.checked_mul(1000)?,
+        "min" => w.checked_mul(60_000)?,
+        _ => return None,
+    };
+    Some((k.parse().ok()?, ms))
+}
+
+/// The API ERROR'S RUNG a journaled wait held ([`journaled_hold`]), as
+/// [`wall_action`] words it — `<the wall> retry <n>` — and the ladder of
+/// `timing` it was on: the wall's kind as far as the words say it (the
+/// screen's reading replaces it, [`TurnEndState::observe`]), the retries
+/// typed before that wait's end (after it, where the act it ended in
+/// followed: [`Hold::acted`]), and the appearance the rung counts from
+/// (unix ms, half a second late: never sooner than that loop's due). The
+/// server's failure and an unreachable API are both `api-error retry <n>`
+/// (0.106.0 words them alike, on different ladders): the retry before the
+/// wait tells them apart ([`wall_retry_text`]'s `; trying again.` is the
+/// network's), and with none to read (the first retry, whose rung both
+/// ladders share, or its words lost) the network's shorter ladder is taken
+/// — never sooner than that loop. The wait on a measured return (`back but
+/// met again`) counts its own acts, which the words do not tell apart from
+/// the rest, and is none.
+fn retry_held(hold: &Hold, timing: &TurnEndTiming) -> Option<approvals::RetryMark> {
+    use aterm_phase::{ApiCause, WallKind};
+    let (wall, n) = hold.why.rsplit_once(" retry ")?;
+    let n: usize = n.parse().ok().filter(|n| *n > 0)?;
+    let api = |cause: ApiCause| WallKind::ApiError {
+        code: None,
+        retryable: cause != ApiCause::Request,
+        cause,
+    };
+    // The kind, its ladder, and whether the first retry is typed at once
+    // (the ladder's rungs then counted from the second).
+    let (kind, ladder, at_once) = match wall {
+        "overloaded" => (WallKind::Overloaded, &timing.retry_backoff, false),
+        "api-error"
+            if hold.said.as_deref().is_some_and(|said| {
+                said.contains("reported an API error")
+                    && !said.contains("(overloaded)")
+                    && !said.contains("; trying again.")
+            }) =>
+        {
+            (api(ApiCause::Server), &timing.retry_backoff, false)
+        }
+        "api-error" => (api(ApiCause::Unreachable), &timing.net_backoff, false),
+        "api-error refused:" => (api(ApiCause::Request), &timing.refused_backoff, false),
+        "api-error cut off:" => (api(ApiCause::CutOff), &timing.net_backoff, true),
+        "api-error overlong:" => (api(ApiCause::Overlong), &timing.retry_backoff, true),
+        _ => return None,
+    };
+    let rung = if at_once {
+        n.checked_sub(2)
+    } else {
+        n.checked_sub(1)
+    };
+    let wait = rung.map_or(Some(Duration::ZERO), |r| {
+        crate::supervise::ladder::Ladder(ladder).at(r)
+    })?;
+    let wait_ms = i64::try_from(wait.as_millis()).ok()?;
+    Some(approvals::RetryMark {
+        kind,
+        attempts: if hold.acted { n } else { n - 1 },
+        ups: 0,
+        since_ms: hold.until_ms + 500 - wait_ms,
+    })
+}
+
 /// A journal line that says the screen reached A POINT OR A BOX of its own
-/// ([`landed_before`]): a turn's end handed over (`EVENT idle`, its `--mail`
-/// folds `turn` and `idle-no-report`, `question`, `limited`), a box handed
+/// ([`ended_before`]): a turn's end handed over (`EVENT idle`, an older
+/// build's `--mail` folds `turn` and `idle-no-report`, `question`, `limited`), a box handed
 /// over (`EVENT prompt`) or approved under the safe rules (`APPROVED`). A box
 /// is drawn only inside a turn, and a point is said again only where the
 /// screen's point changed or a turn ran ([`Looking::handed`]). Not the
@@ -1676,140 +2293,55 @@ fn deadline_after(now: Instant, max: Duration) -> Instant {
         .unwrap_or(now)
 }
 
-/// How `--mail` settled an idle point (`Session::hold_for_report`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fold {
-    /// The worker's `report` of this turn came within the window: the point
-    /// prints as `EVENT turn seq=<n> report=<id> rows=<n> <summary>`.
-    Report { id: u64, rows: usize },
-    /// None came within the grace: `EVENT idle-no-report seq=<n> <summary>`.
-    NoReport,
-}
-
-/// The loop's side of the mail lane ([`SuperviseOpts::mail`]).
-struct MailIn {
-    /// The worker's `report`s, as the lane hands them over.
-    rx: Receiver<Delivery>,
-    /// Reports that came before an idle point, kept until the point.
-    pending: Vec<Delivery>,
-    window: Duration,
-    grace: Duration,
-    /// The lane ended (its `MAIL off` line said why): no report can
-    /// come, so an idle point prints as without `--mail`.
-    gone: bool,
-    /// Where the turn in progress begins, at the latest: the moment the last
-    /// point a turn ended on (idle, a question, a limit notice) was handed
-    /// over — the loop's start before any. A report from before it is that
-    /// turn's, or an older one's, never this turn's.
-    floor: Instant,
-    /// The first read that saw the worker busy after `floor`: the turn had
-    /// begun by then, so a report from after it is this turn's however long
-    /// ago it came (a report posted mid-turn by a re-fired Stop, the worker
-    /// working on past the window). `None` until such a read.
-    busy_at: Option<Instant>,
-    /// Whether `floor` is a handed-over point's, not the loop's start.
-    handed: bool,
-}
-
-impl MailIn {
-    /// Whether a delivery is the report of the turn ending at the held point
-    /// (`now`): after the turn was seen to begin (`busy_at`), any delivery is;
-    /// between a handed-over point and that read, it is the previous turn's
-    /// late report; before the turn was seen to begin, only one within the
-    /// window is.
-    fn is_this_turns(&self, d: &Delivery, now: Instant) -> bool {
-        if d.at < self.floor {
-            return false;
-        }
-        match self.busy_at {
-            Some(busy) if d.at >= busy => true,
-            Some(_) if self.handed => false,
-            _ => now.duration_since(d.at) <= self.window,
-        }
-    }
-}
-
-/// How `Session::hold_for_report` settled an idle point: the fold, and the
-/// screen it read past the point when the point was superseded under the
-/// hold (a prompt, the worker busy again) — the next look's turn.
-struct Held {
-    fold: Option<Fold>,
-    carried: Option<Screen>,
-}
-
-/// A client for the loops that run without a mail lane: never called.
-pub struct NoLane;
-
-impl Ctl for NoLane {
-    fn call(&mut self, _args: &[&str]) -> Result<CtlReply, String> {
-        Err("no mail lane".to_string())
-    }
-}
-
 /// Where every line of a loop goes (`watch`'s stdout, `supervise`'s stderr),
-/// each recorded in the journal first. One per loop, shared with the mail
-/// lane's thread under a lock so lines never interleave and the journal order
-/// is the printed order. The lock is held for one line, taken even when
-/// poisoned, and nothing else is locked under it.
+/// each recorded in the journal first. One per loop, under a lock its reviews
+/// share, so the journal order is the printed order. The lock is held for one
+/// line, taken even when poisoned, and nothing else is locked under it.
 struct Sink<'w> {
     out: &'w mut (dyn Write + Send + 'w),
     journal: Journal,
-    /// Where the journal's one warning goes (`watch`: stderr); `None` sends
-    /// it to `out` (`supervise`, whose lines are stderr already).
+    /// Where the journal's one warning goes (the hosted loop: stderr);
+    /// `None` sends it to `out` (the tests' `supervise`, whose lines are
+    /// stderr already).
     warn: Option<&'w mut (dyn Write + Send + 'w)>,
-    /// `watch`'s story lane: the worker's window is told what the loop
-    /// decided, one `ctl story` per journaled line that carries a decision
-    /// ([`story_of`]). `None` (`supervise`, and a `watch` without one) tells
-    /// nothing.
-    teller: Option<Teller<'w>>,
     /// The loop's clocks ([`Session::fx`]): every journaled line is stamped
-    /// by the door's [`Fx::stamp_ms`], the mail lane's lines included, so the
-    /// journal's `t`s are read where the loop reads its other clocks.
+    /// by the door's [`Fx::stamp_ms`], so the journal's `t`s are read where
+    /// the loop reads its other clocks.
     fx: Fx,
 }
 
-/// The client `watch` tells the worker's window its story through: a second
-/// connection, like the mail lane's, so the loop's own client keeps its outage
-/// books to itself; and the session the story is about.
-struct Teller<'w> {
-    ctl: &'w mut (dyn Ctl + Send + 'w),
-    sid: Option<String>,
-}
-
 impl Sink<'_> {
-    /// Record `line` in the journal (its warning to `warn`, else to `out`) and
-    /// tell the window the story it carries, if any. The post is best-effort: a
-    /// host without the `story` verb or a lost connection changes no printed
-    /// line.
-    fn record(&mut self, line: &str, turn: Option<u64>) {
-        self.record_marked(line, turn, None);
+    /// Record `line` in the journal, its warning to `warn`, else to `out`.
+    fn record(&mut self, line: &str) {
+        self.record_marked(line, None);
     }
 
     /// [`Self::record`] of a review point's line, with the mark of the
     /// worker's last words there ([`JournalRecord::mark`](super::journal::JournalRecord::mark)).
-    fn record_marked(&mut self, line: &str, turn: Option<u64>, mark: Option<u64>) {
+    fn record_marked(&mut self, line: &str, mark: Option<u64>) {
         let t_ms = self.fx.stamp_ms();
         let row = match self.warn.as_deref_mut() {
-            Some(w) => self.journal.record_marked(t_ms, line, turn, mark, w),
-            None => self.journal.record_marked(t_ms, line, turn, mark, self.out),
+            Some(w) => self.journal.record_marked(t_ms, line, mark, w),
+            None => self.journal.record_marked(t_ms, line, mark, self.out),
         };
         if let Some(row) = row {
             self.fx
                 .emit(super::tape::doors::JOURNAL, || row.into_bytes());
         }
-        if let Some(teller) = &mut self.teller
-            && let Some((verb, text)) = story_of(line)
-        {
-            let mut args: Vec<&str> = Vec::with_capacity(4);
-            if let Some(sid) = &teller.sid {
-                args.push(sid.as_str());
-            }
-            args.push("story");
-            args.push(verb);
-            if !text.is_empty() {
-                args.push(&text);
-            }
-            let _ = teller.ctl.call(&args);
+    }
+
+    /// [`Self::record`] of a task end's note that restates an end a loop
+    /// before this one noted, with the time that end was first noted
+    /// ([`JournalRecord::ended`](super::journal::JournalRecord::ended)).
+    fn record_ended(&mut self, line: &str, ended: Option<i64>) {
+        let t_ms = self.fx.stamp_ms();
+        let row = match self.warn.as_deref_mut() {
+            Some(w) => self.journal.record_ended(t_ms, line, ended, w),
+            None => self.journal.record_ended(t_ms, line, ended, self.out),
+        };
+        if let Some(row) = row {
+            self.fx
+                .emit(super::tape::doors::JOURNAL, || row.into_bytes());
         }
     }
 
@@ -1817,19 +2349,14 @@ impl Sink<'_> {
     /// ([`super::tape::doors::OUT`]), the line out and the write's outcome
     /// back — a line the loop could not print ends it, so the outcome is a
     /// value the loop observes.
-    fn line(&mut self, line: &str, turn: Option<u64>) -> Result<(), String> {
-        self.line_marked(line, turn, None)
+    fn line(&mut self, line: &str) -> Result<(), String> {
+        self.line_marked(line, None)
     }
 
     /// [`Self::line`] of a review point's line, its mark journaled with it
     /// ([`Self::record_marked`]); the printed line and its door are the same.
-    fn line_marked(
-        &mut self,
-        line: &str,
-        turn: Option<u64>,
-        mark: Option<u64>,
-    ) -> Result<(), String> {
-        self.record_marked(line, turn, mark);
+    fn line_marked(&mut self, line: &str, mark: Option<u64>) -> Result<(), String> {
+        self.record_marked(line, mark);
         let out = &mut *self.out;
         self.fx.exchange(
             super::tape::doors::OUT,
@@ -1837,62 +2364,6 @@ impl Sink<'_> {
             || emit(out, line),
         )
     }
-}
-
-/// The `aterm ctl story <verb> [<text>]` a printed line is told to the
-/// worker's window as, `None` for a line that carries no decision (`EVENT
-/// idle`, `MAIL`, a `RECONNECT` still being ridden out). The verbs are the
-/// GUI's closed set (`approved dismissed reconnected timeout exit compacted
-/// warned chose`); the text is the human-facing part, never the command or
-/// the question (`APPROVED seq=<n> <command>` is bare `approved`; `CHOSE …
-/// policy=<word> …` is `chose <word>`). The text is cut to the wire's 96 bytes
-/// at a character boundary.
-pub fn story_of(line: &str) -> Option<(&'static str, String)> {
-    const MAX: usize = 96;
-    let cut = |s: &str| -> String {
-        if s.len() <= MAX {
-            return s.to_string();
-        }
-        let mut end = MAX;
-        while !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        s[..end].to_string()
-    };
-    let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
-    Some(match word {
-        "APPROVED" => ("approved", String::new()),
-        "CHOSE" => (
-            "chose",
-            cut(rest
-                .split_whitespace()
-                .find_map(|w| w.strip_prefix("policy="))
-                .unwrap_or("")),
-        ),
-        "DISMISSED" => (
-            "dismissed",
-            cut(rest.split_once(" seq=").map_or(rest, |(w, _)| w)),
-        ),
-        "RECONNECTED" => ("reconnected", cut(rest)),
-        "TIMEOUT" => ("timeout", String::new()),
-        "EXIT" => ("exit", cut(rest)),
-        "EVENT" => {
-            let (phase, tail) = rest.split_once(' ').unwrap_or((rest, ""));
-            match phase {
-                "compacted" => ("compacted", String::new()),
-                // `EVENT context seq=<n> <v>% until auto-compact`: the reading.
-                "context" => (
-                    "warned",
-                    cut(&format!(
-                        "context {}",
-                        tail.split_once(' ').map_or(tail, |(_, v)| v)
-                    )),
-                ),
-                _ => return None,
-            }
-        }
-        _ => return None,
-    })
 }
 
 /// What the shared loop ([`Session::drive`]) carries from one look to the
@@ -1916,10 +2387,6 @@ struct Looking {
     moved: Saw,
     /// Where the session survey stood at the last look ([`Session::survey`]).
     survey: Survey,
-    /// A screen the last look read past its point (the hold's safety net,
-    /// [`Session::hold_for_report`]): the next look's turn, if it still shows
-    /// a point.
-    carried: Option<Screen>,
     /// The screen the last look's press read and handed on ([`Step::Decide`]):
     /// the next look's turn, as read.
     read_back: Option<Screen>,
@@ -2212,7 +2679,8 @@ enum ResetShown {
     Unread,
 }
 
-/// Where `--context-warn`'s watch on the context indicator stands
+/// Where the loop's watch on the context indicator
+/// ([`SuperviseOpts::context_warn`]) stands
 /// ([`Session::watch_context`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Context {
@@ -2283,33 +2751,22 @@ enum Step {
     Decide(Screen),
 }
 
-/// The half of the loop that differs between `supervise` and `watch`.
+/// The half of the loop that differs between the hosted loop (and the
+/// engine tests' `watch`, [`Lines`]) and the engine tests' stop-at-review
+/// seams.
 trait Review {
     /// A read-only prompt was approved; the press landed at `seq`.
     fn approved(&mut self, seq: u64, command: &str) -> Result<(), String>;
-    /// A new review point, with its report counted when `--report` asked for
-    /// one, and how `--mail` settled it when it was an idle one. `false`
-    /// stops the loop with it (`supervise`); `true` means it was reported and
-    /// the loop keeps watching (`watch`).
-    fn review(
-        &mut self,
-        turn: &Turn,
-        report: Option<ReportBrief>,
-        fold: Option<Fold>,
-    ) -> Result<bool, String>;
+    /// A new review point. `false` stops the loop with it (the tests'
+    /// `supervise`); `true` means it was reported and the loop keeps watching.
+    fn review(&mut self, turn: &Turn) -> Result<bool, String>;
     /// [`Self::review`] of a point whose worker's last words mark `mark`
     /// ([`said_mark`]): a half that journals its points keeps the mark with
     /// the point's line, which the next loop compares a landing with
-    /// ([`landed_before`]). One that journals none reviews it as any point.
-    fn review_marked(
-        &mut self,
-        turn: &Turn,
-        report: Option<ReportBrief>,
-        fold: Option<Fold>,
-        mark: Option<u64>,
-    ) -> Result<bool, String> {
+    /// ([`ended_before`]). One that journals none reviews it as any point.
+    fn review_marked(&mut self, turn: &Turn, mark: Option<u64>) -> Result<bool, String> {
         let _ = mark;
-        self.review(turn, report, fold)
+        self.review(turn)
     }
     /// An informational line (`RECONNECT …`, `RECONNECTED …`), said as it
     /// happens.
@@ -2318,26 +2775,33 @@ trait Review {
     /// recorded, never printed, so the lines a harness reads are the same
     /// with and without a limit.
     fn note(&mut self, line: &str);
-    /// Whether this half runs unattended (`watch`): a limit is then the
-    /// loop's to handle ([`Session::turn_end_at_point`]). `supervise` stops at
-    /// the limited point with the manager right there, and does none of it.
+    /// [`Self::note`] of a task end's note (`DONE …`), with the time the end
+    /// it restates was first noted where it restates one a loop before this
+    /// one noted ([`TurnEndState::restated_noted_ms`]): a half that journals
+    /// its notes keeps it with the note's line, which the next loop restates
+    /// the end with ([`ended_before`]). One that journals none notes it as
+    /// any line.
+    fn note_ended(&mut self, line: &str, ended: Option<i64>) {
+        let _ = ended;
+        self.note(line);
+    }
+    /// Whether this half runs unattended (the hosted loop): a limit is then
+    /// the loop's to handle ([`Session::turn_end_at_point`]). A stop-at-review
+    /// seam stops at the limited point and does none of it.
     fn unattended(&self) -> bool;
 }
 
-/// `await-turn` ([`Session::await_turn`]): no loop around the wait — nothing
-/// is said, noted or handled; a limit is the caller's.
+/// The engine tests' bare wait ([`Session::await_turn`]): no loop around it —
+/// nothing is said, noted or handled; a limit is the caller's.
+#[cfg(test)]
 struct Alone;
 
+#[cfg(test)]
 impl Review for Alone {
     fn approved(&mut self, _seq: u64, _command: &str) -> Result<(), String> {
         Ok(())
     }
-    fn review(
-        &mut self,
-        _turn: &Turn,
-        _report: Option<ReportBrief>,
-        _fold: Option<Fold>,
-    ) -> Result<bool, String> {
+    fn review(&mut self, _turn: &Turn) -> Result<bool, String> {
         Ok(false)
     }
     fn say(&mut self, _line: &str) -> Result<(), String> {
@@ -2349,47 +2813,39 @@ impl Review for Alone {
     }
 }
 
-/// `supervise`: the first review point ends the loop, and is its result; an
-/// informational line goes to the sink (stderr), never into the result. The
-/// journal gets every line said, and the line `watch` would print for an
-/// approval and for the review point.
+/// The engine tests' `supervise` ([`Session::supervise`]): the first review
+/// point ends the loop, and is its result; an informational line goes to the
+/// sink (stderr), never into the result. The journal gets every line said,
+/// and the line [`Lines`] would print for an approval and for the review
+/// point.
+#[cfg(test)]
 struct StopAtReview<'l, 'w> {
     sink: &'l Mutex<Sink<'w>>,
     allow: &'l [String],
 }
 
+#[cfg(test)]
 impl Review for StopAtReview<'_, '_> {
     fn approved(&mut self, seq: u64, command: &str) -> Result<(), String> {
         self.sink
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .record(&approved_line(seq, command), None);
+            .record(&approved_line(seq, command));
         Ok(())
     }
-    fn review(
-        &mut self,
-        turn: &Turn,
-        report: Option<ReportBrief>,
-        fold: Option<Fold>,
-    ) -> Result<bool, String> {
-        self.review_marked(turn, report, fold, None)
+    fn review(&mut self, turn: &Turn) -> Result<bool, String> {
+        self.review_marked(turn, None)
     }
-    fn review_marked(
-        &mut self,
-        turn: &Turn,
-        _report: Option<ReportBrief>,
-        fold: Option<Fold>,
-        mark: Option<u64>,
-    ) -> Result<bool, String> {
+    fn review_marked(&mut self, turn: &Turn, mark: Option<u64>) -> Result<bool, String> {
         self.sink
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .record_marked(&folded_event_line(turn, self.allow, None, fold), None, mark);
+            .record_marked(&event_line(turn, self.allow), mark);
         Ok(false)
     }
     fn say(&mut self, line: &str) -> Result<(), String> {
         let mut sink = self.sink.lock().unwrap_or_else(PoisonError::into_inner);
-        sink.record(line, None);
+        sink.record(line);
         log_line(sink.out, line);
         Ok(())
     }
@@ -2397,15 +2853,21 @@ impl Review for StopAtReview<'_, '_> {
         self.sink
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .record(line, None);
+            .record(line);
+    }
+    fn note_ended(&mut self, line: &str, ended: Option<i64>) {
+        self.sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record_ended(line, ended);
     }
     fn unattended(&self) -> bool {
         false
     }
 }
 
-/// `watch`: one flushed line per approval and per review point, each
-/// journaled before it is printed.
+/// The hosted loop's (and the engine tests' `watch`): one flushed line per
+/// approval and per review point, each journaled before it is printed.
 struct Lines<'w, 's> {
     sink: &'w Mutex<Sink<'s>>,
     allow: &'w [String],
@@ -2416,70 +2878,43 @@ impl Review for Lines<'_, '_> {
         self.sink
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .line(&approved_line(seq, command), None)
+            .line(&approved_line(seq, command))
     }
-    fn review(
-        &mut self,
-        turn: &Turn,
-        report: Option<ReportBrief>,
-        fold: Option<Fold>,
-    ) -> Result<bool, String> {
-        self.review_marked(turn, report, fold, None)
+    fn review(&mut self, turn: &Turn) -> Result<bool, String> {
+        self.review_marked(turn, None)
     }
-    fn review_marked(
-        &mut self,
-        turn: &Turn,
-        report: Option<ReportBrief>,
-        fold: Option<Fold>,
-        mark: Option<u64>,
-    ) -> Result<bool, String> {
-        let line = folded_event_line(turn, self.allow, report, fold);
+    fn review_marked(&mut self, turn: &Turn, mark: Option<u64>) -> Result<bool, String> {
+        let line = event_line(turn, self.allow);
         self.sink
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .line_marked(&line, report.and_then(|b| b.turn), mark)?;
+            .line_marked(&line, mark)?;
         Ok(true)
     }
     fn say(&mut self, line: &str) -> Result<(), String> {
         self.sink
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .line(line, None)
+            .line(line)
     }
     fn note(&mut self, line: &str) {
         self.sink
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .record(line, None);
+            .record(line);
+    }
+    fn note_ended(&mut self, line: &str, ended: Option<i64>) {
+        self.sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record_ended(line, ended);
     }
     fn unattended(&self) -> bool {
         true
     }
 }
 
-/// The EVENT line of a review point, as `--report` and `--mail` shape it:
-/// [`reported_event_line`]'s with a brief, [`event_line`]'s without. An idle
-/// point `--mail` folded a report into is `EVENT turn seq=<n> report=<id>
-/// rows=<n> <summary>` (no brief, which would repeat the report), and one no
-/// report came for is `EVENT idle-no-report …` with the brief if any.
-fn folded_event_line(
-    turn: &Turn,
-    allow: &[String],
-    report: Option<ReportBrief>,
-    fold: Option<Fold>,
-) -> String {
-    match fold {
-        Some(Fold::Report { id, rows }) => format!(
-            "EVENT turn seq={} report={id} rows={rows} {}",
-            turn.screen.seq,
-            event_summary(turn, allow)
-        ),
-        Some(Fold::NoReport) => event_line_as("idle-no-report", turn, allow, report),
-        None => event_line_as(turn.phase.name(), turn, allow, report),
-    }
-}
-
-/// The line `watch` prints for an approval: `APPROVED seq=<n> <command>`.
+/// The line the loop prints for an approval: `APPROVED seq=<n> <command>`.
 fn approved_line(seq: u64, command: &str) -> String {
     format!("APPROVED seq={seq} {}", clip(command))
 }
@@ -2598,14 +3033,12 @@ pub struct Session<'a, C: Ctl> {
     /// way to a turn included, so a survey that leaves and comes back while
     /// the worker is busy is a new appearance.
     survey_gone: bool,
-    /// `--context-warn`'s threshold for the loop in progress
+    /// The context indicator's threshold for the loop in progress
     /// ([`Self::watch_context`]), set by [`Self::drive`] from its options:
-    /// `0` — off — until then, so `await-turn` says nothing about it.
+    /// `0` — off — until then, so a bare wait says nothing about it.
     context_warn: u8,
     /// Where the watch on the context indicator stands.
     context: Context,
-    /// `--mail`'s side of the lane while a loop runs with one.
-    mail: Option<MailIn>,
     /// The limit episode in progress, if any.
     limit: Option<Episode>,
     /// The episode a busy read or an Off park closed, until the worker
@@ -2644,6 +3077,32 @@ pub struct Session<'a, C: Ctl> {
     /// at each step of a wait, whatever point shows: a repaint at the wake (a
     /// new seq) or an edge that decides first sees the sleep all the same.
     clock_marks: Option<(Instant, i64)>,
+    /// THE SLEEPS OF THE MACHINE THIS LOOP KNOWS OF, on the wall clock
+    /// ([`SleepBook`]): every one its watch measured ([`Self::watch_sleep`]),
+    /// and what the system's record and the ledger said at its first look of
+    /// the sleep before it ([`Self::sleep_count`]). Any turn's done row is
+    /// read less the sleep inside the turn's span ([`Self::turn_asleep`]).
+    sleeps: SleepBook,
+    /// The machine's count of its sleep as this loop last read it
+    /// ([`super::fx::Fx::asleep`]): at the loop's first look, and again
+    /// where the watch suspects a sleep ([`Self::recount_sleep`]). `None` on
+    /// a machine that keeps no count, whose sleep the watch reads by its
+    /// clocks alone, and before the first look.
+    sleep_count: Option<SleepStamp>,
+    /// THE LOOP'S FIRST LOOK AT THE MACHINE'S SLEEP ([`Self::look_at_sleep`]):
+    /// when (unix ms), the count then, and the system's record of its last
+    /// sleep — what the seed sets the ledger's last act against
+    /// ([`Self::seed_sleep`]). `None` before it.
+    sleep_look: Option<FirstLook>,
+    /// WHY THE BOOKS COULD NOT SAY how long the machine slept since their
+    /// last act ([`Self::seed_sleep`], `SinceAct::unknown`): kept until a
+    /// turn's done row reaching back past this loop's first look is read
+    /// ([`Self::turn_asleep`]), which reads it as before the count, whole of
+    /// that sleep but for the system's record of its last; then owed to the
+    /// journal, once ([`Self::sleep_unsaid`]).
+    sleep_unknown: Option<&'static str>,
+    /// ...owed, and said with the point's execution ([`Self::say_sleep_unknown`]).
+    sleep_unsaid: Option<&'static str>,
     /// A sleep the watch measured whose wake [`Self::woke`] has not yet
     /// looked at for a due the sleep carried past ([`Self::check_slept`]): the
     /// wall clock when it was measured, unix seconds.
@@ -2719,6 +3178,10 @@ pub struct Session<'a, C: Ctl> {
     /// first seen. The ladder's other fields are shared with the busy flavour,
     /// which never stands together with it.
     stuck_dialog: Option<(String, Instant)>,
+    /// The busy flavour's words on agy's or Muse Code's screen
+    /// ([`wall_memory`]'s `Witness::Words`): what stood still over their own
+    /// background work, and since when.
+    stuck_still: Option<(String, Instant)>,
     /// How many reprints of the same words had a far jump of the reset held
     /// back ([`turn_end_loop::REPRINT_JUMPS_MAX`]).
     reprint_jumps: u32,
@@ -2762,9 +3225,17 @@ pub struct Session<'a, C: Ctl> {
     /// A LIMIT ONLY THE TRANSCRIPT SHOWS: the process the host was last asked
     /// about and the row it named ([`Self::read_standing_limit`]).
     standing_read: wall_confirm::StandingRead,
+    /// The last screen whose limit's words were read with the rows above
+    /// ([`Self::limit_words_read_above`]) — its `seq`, `first` and rows —
+    /// and the row of it the cut went through, `None` for no cut: the same
+    /// screen read again takes the verdict with no request.
+    limit_cut: Option<(ScreenKey, Option<usize>)>,
     /// The session's working directory as its `meta` last said it (`None`
     /// for `cwd=-` or unread; read fresh for every box that needs it).
     cwd: Option<PathBuf>,
+    /// The one folder the session's starter trusted for it, as the same
+    /// `meta` read said it (`trusted_cwd=`, `ApprovalCtx::trusted_cwd`).
+    trusted_cwd: Option<PathBuf>,
     /// The permission mode the worker's footer last showed: a box replaces the
     /// footer, so the box's own read cannot say whether the session bypasses
     /// permissions.
@@ -2787,6 +3258,16 @@ pub struct Session<'a, C: Ctl> {
     /// ([`Self::ledger_row`]); while one names the conversation's last turn
     /// the reading says so ([`TurnEndReading::left_record`]).
     pub(super) left_keys: Vec<String>,
+    /// THE LAST ANSWER OF THE SESSION'S REPOSITORY (`IdleHost::repo_work`):
+    /// the mark of the done words it was asked at ([`said_mark`]), when it
+    /// was asked, and what it found. The same words read again within
+    /// [`REPO_REPROBE`], no turn run since, keep it
+    /// (`Session::repo_read`): a point re-read at each wake asks `git` once.
+    pub(super) repo_seen: Option<(
+        Option<u64>,
+        Instant,
+        Option<crate::harness::repo_work::RepoWork>,
+    )>,
     /// The screen a person's own exchange at a wall was last keyed at
     /// (`Session::ledger_left_at_wall`, RR4-TE-2): a wall the loop waits out
     /// re-decides the same screen at each wake, and its row is keyed (a
@@ -2805,12 +3286,6 @@ pub struct Session<'a, C: Ctl> {
     /// The last `status` named another driver's hand on the session (a drive
     /// lease, a named driver's turn): it holds the loop as a person does.
     driver: bool,
-    /// The pid of the codex-alab whose PROVEN self-claim the last `status`
-    /// named (`supervisor_proven=1`, `supervisor=codex-alab@<pid>`): the one
-    /// Codex aterm types its mail's line into, at codex-alab's own idle point
-    /// (`mail::task`). `None` for any other session, a vendor `codex` among
-    /// them.
-    pub(super) proven_alab: Option<u32>,
     /// What the loop remembers of the question dialog it is answering
     /// ([`approval_loop::QuestionMemory`]): its first-key wait, its last key
     /// not yet seen taking effect. Cleared when the worker works again.
@@ -2827,8 +3302,7 @@ pub struct Session<'a, C: Ctl> {
     /// a fresh decision, not the point already handed over.
     question_handed_back: bool,
     /// This loop tells the window its own story lines on its own connection
-    /// (`story chose …`): the hosted loop, which has no teller of its own
-    /// ([`Self::run_hosted`]). A `watch` with a teller tells through it.
+    /// (`story chose …`): the hosted loop ([`Self::run_hosted`]).
     tell_own: bool,
     /// The policy text's exact read-back ([`Self::press_question_text`])
     /// and how long the screen had held still right before it (its settle
@@ -2848,11 +3322,13 @@ pub struct Session<'a, C: Ctl> {
     /// Set by the hosted loop's owner: the loop ends at its next look.
     stop: Option<Arc<AtomicBool>>,
     /// A `limited:` attention a previous watcher left over the notice still
-    /// showing, adopted at the start: the episode it opens posts no mail —
-    /// after an Off park that took the badge down too
-    /// ([`Session::lower_badges`] keeps the marker). Over once the worker
-    /// answers on a point that is not the notice, at a look or a read of a
-    /// park ([`Session::adopted_limit_over`]): a limit after that is mailed.
+    /// showing, adopted at the start: the episode it opens is the same ask
+    /// set again (`again=adopted …`, [`Session::escalate`]) — after an Off
+    /// park that took the badge down too ([`Session::lower_badges`] keeps the
+    /// marker). Over once the worker answers on a point that is not the
+    /// notice, at a look or a read of a park ([`Session::adopted_limit_over`]):
+    /// a limit after that is a new ask, and the adopted badge, if still up,
+    /// goes with it.
     adopted_limit: bool,
     /// A box point's attention a previous watcher left, still showing,
     /// adopted at the start ([`Self::reconcile`]): that point's first review
@@ -2929,7 +3405,10 @@ pub struct Session<'a, C: Ctl> {
     /// a word between them still pass the point over at the count — at most
     /// `2 * (HOST_FOLLOW_UPS + 1)` steps between two steps of the wait;
     /// reset on that word, they went back to the host at once to its cap.
-    host_follows: Option<(String, u8)>,
+    /// The third field: the last step there moved the session — a move
+    /// after it at the same point spends one (ATERM-KI-1016-1: a word that
+    /// only ever moves, said at a point the screen never left).
+    host_follows: Option<(String, u8, bool)>,
     /// The box on the screen (its review key) and when a read first showed
     /// it: judged only once it has shown the setup's box settle ([`BOX_SETTLE`]).
     box_first_seen: Option<(String, Instant)>,
@@ -2948,6 +3427,15 @@ pub struct Session<'a, C: Ctl> {
     /// verdict and the loop's reading disagree there, and it is waited on by
     /// its content instead.
     agent_woke: Option<String>,
+    /// The composer that holds the point last decided where nothing is due
+    /// ([`Self::draft_look`]): aterm's own words or a draft over a completion
+    /// menu (escalated for itself, not for a question or the cap), or a draft
+    /// whose cells were not read (nothing done). A person's send or clear
+    /// there moves no agent verdict — a turn shorter
+    /// than the server's sweep is never read busy — so while it is set the
+    /// content is waited on ([`Self::agent_wake`]), and the point is decided
+    /// again once its composer reads otherwise.
+    draft_held: Option<super::policy::turn_end::Composer>,
     /// Where the loop stands on the session's supervisor claim
     /// ([`claim::Claim`]).
     claim: claim::Claim,
@@ -2977,6 +3465,23 @@ pub struct Session<'a, C: Ctl> {
     /// ([`super::policy::turn_end::TurnEndState::task_done`]): `DONE …` is
     /// journaled once as the task ends, not at every point after.
     task_done_said: bool,
+    /// The task's end said at the point's fold ([`Self::task_edge_at_fold`])
+    /// and owed to the journal: written once the point's own line is, so a
+    /// loop that follows reads the point before its note (`ended_before`),
+    /// with the time the end it restates was first noted, where it restates
+    /// one ([`TurnEndState::restated_noted_ms`]).
+    task_note: Option<(String, Option<i64>)>,
+    /// The point ([`TurnEndState::point_number`]) whose `done` this loop
+    /// last published to the session's task record, or found published
+    /// (`task_mark`): once a point.
+    task_point: Option<u64>,
+    /// The point at which the policy's done check was held back from a
+    /// worker whose task is marked `done` (`task_mark`'s
+    /// `check_into_done_task`): said and read once a point.
+    check_held_at: Option<u64>,
+    /// The session's task record was read at this loop's first fold
+    /// (`task_mark`'s `task_seed`): read once a loop.
+    task_seeded: bool,
     /// The host's measure of the API's reach at the point on screen when that
     /// point is a network wall (never reached the API, cut off, refused a
     /// certificate or proxy; [`Self::turn_end_reading`]); `None` otherwise.
@@ -3159,9 +3664,21 @@ pub struct Session<'a, C: Ctl> {
     /// and of what each read says of the account's usage
     /// ([`IdleHost::usage_seen`]): the loop's own, set as it starts.
     stall_host: Option<Arc<dyn IdleHost>>,
+    /// The session log's `act` marks this loop owes ([`ActMarks`]).
+    pub(super) act_marks: ActMarks,
     /// What the host was last told of the account's usage, and when
     /// ([`Self::note_usage`]).
     usage_told: Option<(UsageSeen, Instant)>,
+    /// WHAT THE NOTICES THAT SAY USAGE CREDITS CARRY THE SESSION SAID
+    /// ([`Self::note_credits`]): the reset the notice they started on named
+    /// (`You're now using usage credits · Your session limit resets 9:43am
+    /// (…)`), as printed and placed (epoch seconds; `None`: it would not
+    /// place) — drawn some ten seconds as they begin, mostly under the running
+    /// turn — the model a per-model notice named (`Fable 5.1 is drawing from
+    /// usage credits`, drawn once a process), and the first read of either:
+    /// what the turn-end reading's [`super::policy::turn_end::CreditsCarry`]
+    /// is at a point the notice has left.
+    pub(super) credits_kept: Option<CreditsKept>,
     /// The guard last said to the host ([`IdleHost::withheld`]), so each is
     /// said once while it stands: `None` once a point was offered, or while
     /// the host asked for none.
@@ -3182,6 +3699,9 @@ pub struct Session<'a, C: Ctl> {
     /// `[harness] stall_term_after_s`, the remedy's bound (`0`: never): the
     /// loop's policy, set as it starts.
     stall_term_after_s: u32,
+    /// `[harness] resume_limits`: the turn-end policy continues a limit at its
+    /// reset ([`Self::waits_out`]). The loop's policy, set as it starts.
+    resume_limits: bool,
     /// `[harness] stall_term`: the remedy at the bound is the explicit
     /// restart, `restart pid=<leader> if-stalled quiet=<grace>` (`true`; an
     /// older server that does not know the verb, `signal term`), or by
@@ -3267,7 +3787,6 @@ impl<'a, C: Ctl> Session<'a, C> {
             survey_gone: false,
             context_warn: 0,
             context: Context::Armed,
-            mail: None,
             limit: None,
             retry: None,
             box_ask: None,
@@ -3277,6 +3796,11 @@ impl<'a, C: Ctl> Session<'a, C> {
             zone_offset: limit::zone_offset_at,
             turn_end_due: None,
             clock_marks: None,
+            sleeps: SleepBook::default(),
+            sleep_count: None,
+            sleep_look: None,
+            sleep_unknown: None,
+            sleep_unsaid: None,
             slept_at: None,
             wake_settle: None,
             restart_waits: 0,
@@ -3296,6 +3820,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             stuck_rung: wall_memory::StuckRung::Quiet,
             stuck_raised: None,
             stuck_dialog: None,
+            stuck_still: None,
             wall_memory: None,
             wall_verdict: None,
             wall_refused_said: None,
@@ -3304,18 +3829,20 @@ impl<'a, C: Ctl> Session<'a, C> {
             transcript_wait_seq: None,
             transcript_over_seq: None,
             standing_read: wall_confirm::StandingRead::default(),
+            limit_cut: None,
             cwd: None,
+            trusted_cwd: None,
             footer: None,
             busy_read: false,
             ledger: Ledger::off(),
             turn_end_seeded: false,
             left_keys: Vec::new(),
+            repo_seen: None,
             left_at_wall_seq: None,
             box_reason: None,
             changed_streak: 0,
             press_retry: None,
             driver: false,
-            proven_alab: None,
             question: approval_loop::QuestionMemory::default(),
             decline: approval_loop::DeclineMemory::default(),
             question_held: false,
@@ -3339,6 +3866,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             host_passed: None,
             host_follows: None,
             agent_woke: None,
+            draft_held: None,
             box_first_seen: None,
             stepper: approval_loop::StepperTrack::default(),
             box_proved: None,
@@ -3351,6 +3879,10 @@ impl<'a, C: Ctl> Session<'a, C> {
             exception_now: None,
             exception_open: None,
             task_done_said: false,
+            task_note: None,
+            task_point: None,
+            check_held_at: None,
+            task_seeded: false,
             reach_seen: None,
             account_seen: None,
             login_notice_told: None,
@@ -3385,21 +3917,38 @@ impl<'a, C: Ctl> Session<'a, C> {
             unreplayable: None,
             stalled: None,
             stall_host: None,
+            act_marks: ActMarks::default(),
             usage_told: None,
+            credits_kept: None,
             withheld: None,
             stall_suspect: false,
             stall_termed: false,
             stall_grace_s: SupervisorConfig::default().human_grace_s,
             stall_term_after_s: SupervisorConfig::default().stall_term_after_s,
             stall_term: SupervisorConfig::default().stall_term,
+            resume_limits: SupervisorConfig::default().resume_limits,
         }
     }
 
     /// The holder an unattended loop claims the session under (`meta set
     /// supervisor <holder>`); unset, `aterm-supervise:<pid>`. The in-GUI
-    /// host names itself so a CLI `watch` on the same session is second.
+    /// host names itself, so another holder's live claim on the same session
+    /// is told from its own.
     pub fn set_supervisor_name(&mut self, name: Option<String>) {
         self.setup.holder = name.unwrap_or_else(claim::default_holder);
+    }
+
+    /// Whether the loop types its texts — a continuation, the done check, an
+    /// answer, the worker's own suggestion (its words, never the accept
+    /// key), the accounts probe's `/usage` — under this process's hand
+    /// (`crate::harness::upgrade_drive::hand_take_here_request`): the
+    /// window's host, whose one connection holds the lease from the text to
+    /// its Enter, so no other connection types between them and the ledger
+    /// reads the turn as the harness's (`history … by=harness`). Off for a
+    /// loop whose client may open a connection per request. The setup's
+    /// ([`SessionSetup`]), so a tape's replay types as the run did.
+    pub fn type_under_hand(&mut self, on: bool) {
+        self.setup.types_under_hand = on;
     }
 
     /// WATCH BESIDE A PROVEN SELF-CLAIM (the codex-alab self-claim contract,
@@ -3455,14 +4004,6 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.setup.approval_env = env;
     }
 
-    /// The manager's session (`--inbox @sid`, else `@$ATERM_PARENT_SESSION_ID`):
-    /// where `watch` posts its `kind=control` mail on a limit
-    /// ([`Self::escalate`]). With none, the mail is skipped and the journal
-    /// says so.
-    pub fn set_manager(&mut self, manager: Option<String>) {
-        self.setup.manager = manager;
-    }
-
     /// Tests: a fixed clock (Unix seconds) and local zone offset, so a
     /// notice's reset lands where the test says.
     #[cfg(test)]
@@ -3495,6 +4036,60 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.test_clock().set_jump(jump);
     }
 
+    /// Tests: the machine counts its sleep from now, the count at `total`
+    /// ([`super::fx::ScriptedClock::count_sleeps`]): a sleep the fixed clock
+    /// stages is counted, and a step of it is time awake.
+    #[cfg(test)]
+    pub(crate) fn count_sleeps(&mut self, total: Duration) {
+        self.test_clock().count_sleeps(total);
+    }
+
+    /// Tests: the machine slept `secs` up to now, the fixed clock already
+    /// past it ([`super::fx::ScriptedClock::count_slept`]).
+    #[cfg(test)]
+    pub(crate) fn count_slept(&mut self, secs: i64) {
+        self.test_clock().count_slept(secs);
+    }
+
+    /// Tests: the boot the machine's count is on
+    /// ([`super::fx::ScriptedClock::set_boot`]).
+    #[cfg(test)]
+    pub(crate) fn set_boot(&mut self, boot: &str) {
+        self.test_clock().set_boot(boot);
+    }
+
+    /// Tests: the machine's record of its last sleep
+    /// ([`super::fx::ScriptedClock::set_last_sleep`]).
+    #[cfg(test)]
+    pub(crate) fn set_last_sleep(&mut self, last: Option<(i64, i64)>) {
+        self.test_clock().set_last_sleep(last);
+    }
+
+    /// Tests: the fixed clock stepped `jump` seconds ahead after its next
+    /// read, no sleep ([`super::fx::ScriptedClock::set_step`]).
+    #[cfg(test)]
+    pub(crate) fn set_clock_step(&mut self, jump: i64) {
+        self.test_clock().set_step(jump);
+    }
+
+    /// Tests: the sleeps this loop knows of ([`Self::sleeps`]).
+    #[cfg(test)]
+    pub(crate) fn sleep_book(&self) -> &SleepBook {
+        &self.sleeps
+    }
+
+    /// Tests: a hand on the fixed clock for a stand-in host, to jump it
+    /// forward from inside the loop's run ([`ClockJump::slept`]: a sleep
+    /// staged at a step of the host's).
+    #[cfg(test)]
+    pub(crate) fn clock_jump_handle(&mut self) -> ClockJump {
+        ClockJump(
+            self.fx
+                .scripted_handle()
+                .expect("a fixed clock: the session's door reads no virtual clock"),
+        )
+    }
+
     /// Tests: the fixed clock RUNS from now, as the system's does. A loop
     /// that waits in real `Instant`s for a reset a few seconds off converts
     /// the reset from unix time at every reading
@@ -3503,6 +4098,14 @@ impl<'a, C: Ctl> Session<'a, C> {
     #[cfg(test)]
     pub(crate) fn set_clock_running(&mut self) {
         self.test_clock().set_running();
+    }
+
+    /// Tests: the monotonic clock STANDS from now beside the fixed wall
+    /// clock ([`super::fx::ScriptedClock::stand_mono`]), for a test that ages
+    /// the policy's instants itself at each step.
+    #[cfg(test)]
+    pub(crate) fn set_mono_standing(&mut self) {
+        self.test_clock().stand_mono();
     }
 
     /// Tests: the fixed clock the setters above stage ([`super::fx::ScriptedClock`]),
@@ -3584,23 +4187,6 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// (`--reconnect-s`; 180 s unless set; zero: not at all).
     pub fn set_reconnect(&mut self, window: Duration) {
         self.setup.reconnect = window;
-    }
-
-    /// How long the mail lane parks one `await inbox` before it re-arms (the
-    /// loop's 20 s step unless set; a test shrinks it). The loop's process
-    /// ends within one such step after its last line where the lane's client
-    /// has no [`Ctl::interrupter`]; with one, the parked wait is cut short.
-    #[cfg(test)]
-    pub(crate) fn set_mail_step(&mut self, step: Duration) {
-        self.setup.mail_step = step;
-    }
-
-    /// How long a held idle point (`--mail`) waits for the worker's report
-    /// between looks at the screen (the loop's 20 s step unless set; a test
-    /// shrinks it) — the safety net under the hold.
-    #[cfg(test)]
-    pub(crate) fn set_hold_step(&mut self, step: Duration) {
-        self.setup.hold_step = step;
     }
 
     /// How long presses that miss are tried before the badge, shortened for
@@ -3793,19 +4379,21 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// One read of the worker as `aterm drive phase` prints it: the turn
     /// ([`Self::turn_of`]) and the reader its phase and every detail line go
     /// by — the session's program's ([`Self::program_reader`]), as the loops
-    /// read every turn, so a Codex worker is read as Codex.
+    /// read every turn, so an agy, Muse Code or Gemini CLI worker is read by
+    /// its own grammar.
     pub fn phase_now(&mut self) -> Result<(Turn, &'static dyn ScreenReader), String> {
         let screen = self.read_screen()?;
         let reader = self.program_reader(&screen.rows)?;
         Ok((self.turn_of(screen), reader))
     }
 
-    /// [`Self::await_turn`] as `aterm drive await-turn` prints it: the
-    /// session's program named first ([`Self::program_reader`]), so the wait
-    /// and the detail lines go by its reader. A `status` that does not answer
-    /// leaves the reader to the screen ([`Self::reader`]), as before the
-    /// program is named: the wait itself rides a lost connection out.
-    pub fn await_phase(
+    /// The engine tests' bare wait ([`Self::await_turn`]) with the session's
+    /// program named first ([`Self::program_reader`]), so the wait and the
+    /// detail lines go by its reader. A `status` that does not answer leaves
+    /// the reader to the screen ([`Self::reader`]): the wait itself rides a
+    /// lost connection out.
+    #[cfg(test)]
+    pub(crate) fn await_phase(
         &mut self,
         timeout: Duration,
     ) -> Result<(Turn, &'static dyn ScreenReader), String> {
@@ -3817,8 +4405,8 @@ impl<'a, C: Ctl> Session<'a, C> {
 
     /// The reader for the session's foreground program as `status` names it
     /// now, else for what `rows` show ([`Self::reader`]): the grammar a
-    /// caller outside the loops judges one screen of the session by (`drive
-    /// task`'s nudge), so a Codex worker is read as Codex.
+    /// caller outside the loops judges one screen of the session by
+    /// ([`Self::phase_now`]).
     pub(crate) fn program_reader(
         &mut self,
         rows: &[String],
@@ -4009,7 +4597,9 @@ impl<'a, C: Ctl> Session<'a, C> {
         } else if self.footer.is_none() && !self.busy_read {
             self.busy_read = reader.phase(&screen.rows) == Phase::Busy;
         }
-        self.note_usage(reader, &screen.rows);
+        let credits = reader.credits(&screen.rows);
+        self.note_credits(reader, credits.as_ref(), &screen.rows);
+        self.note_usage(reader, credits, &screen.rows);
         // Every read clocks the draft: one that changed is a person typing.
         let draft = reader
             .composer(&screen.rows)
@@ -4037,12 +4627,17 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// when it says something and that telling is
     /// [`crate::harness::accounts::CREDITS_RETELL_S`] old. A loop with no host
     /// reads nothing for it.
-    fn note_usage(&mut self, reader: &dyn ScreenReader, rows: &[String]) {
+    fn note_usage(
+        &mut self,
+        reader: &dyn ScreenReader,
+        credits: Option<aterm_phase::credits::Credits>,
+        rows: &[String],
+    ) {
         let Some(host) = self.stall_host.clone() else {
             return;
         };
         let seen = UsageSeen {
-            credits: reader.credits(rows),
+            credits,
             warning: reader.usage_warning(rows),
         };
         let now = self.fx.mono();
@@ -4059,9 +4654,197 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
     }
 
+    /// WHAT THE NOTICES SAY OF USAGE CREDITS, kept from every read
+    /// ([`Self::credits_kept`]), read whatever the loop does at the point,
+    /// since the notices stand some seconds, mostly under the running turn:
+    ///
+    /// * a notice opens what is kept, at this read; the one they started on,
+    ///   with a reset, places it once for its text (the session window's as a
+    ///   usage window's is, [`Self::reset_unix_for`]); a per-model one keeps
+    ///   its model;
+    /// * a read with the composer and no notice keeps it until its placed
+    ///   reset, or the credits hold's bound where none could be placed
+    ///   ([`TurnEndTiming::credits_bound`]); absence alone says nothing of
+    ///   subscription restoration. A model's stands while its process does
+    ///   (its notice is drawn once a process); a read with no composer,
+    ///   which cannot draw a notice, keeps it;
+    /// * a model's is the process's: a process the host says started since
+    ///   it was first read keeps none (`IdleHost::agent_started`).
+    fn note_credits(
+        &mut self,
+        reader: &dyn ScreenReader,
+        credits: Option<&aterm_phase::credits::Credits>,
+        rows: &[String],
+    ) {
+        let started = self
+            .stall_host
+            .as_ref()
+            .and_then(|h| h.agent_started())
+            .map(|unix| self.instant_of(unix));
+        if self
+            .credits_kept
+            .as_ref()
+            .is_some_and(|kept| kept.model.is_some() && started.is_some_and(|at| at > kept.since))
+        {
+            self.credits_kept = None;
+        }
+        let Some(credits) = credits else {
+            let now = self.now_unix();
+            let mono = self.fx.mono();
+            let stands = self.credits_kept.as_ref().is_some_and(|kept| {
+                kept.model.is_some()
+                    || match kept.reset.as_ref().and_then(|r| r.unix) {
+                        Some(unix) => unix > now,
+                        None => {
+                            mono.saturating_duration_since(kept.since)
+                                < self.turn_end.timing.credits_bound
+                        }
+                    }
+            });
+            if reader.composer(rows).is_some() && !stands {
+                self.credits_kept = None;
+            }
+            return;
+        };
+        let now = self.fx.mono();
+        let kept = self.credits_kept.get_or_insert(CreditsKept {
+            reset: None,
+            since: now,
+            model: None,
+        });
+        if let Some(model) = credits
+            .model
+            .as_deref()
+            .and_then(super::policy::turn_end::credits_model)
+        {
+            kept.model = Some(model);
+        }
+        let Some(begun) = &credits.started else {
+            return;
+        };
+        let Some(text) = begun.reset.as_deref() else {
+            return;
+        };
+        if kept.reset.as_ref().is_some_and(|r| r.text == text) {
+            return;
+        }
+        let session = begun.window == Some(aterm_phase::credits::Window::Session);
+        let unix = self.reset_unix_for(Some(text), session, true, false, rows);
+        if let Some(kept) = &mut self.credits_kept {
+            kept.reset = Some(CreditsReset {
+                text: text.to_string(),
+                unix,
+            });
+        }
+    }
+
     /// One read, and the reader it was read by when a tail that stands chose
-    /// one ([`Self::reader`] of its rows; `None` for a whole read).
+    /// one ([`Self::reader`] of its rows; `None` for a whole read), its
+    /// limit's words read with the rows above where the screen cannot tell
+    /// whose they are ([`Self::limit_words_read_above`]).
     fn read_once(&mut self) -> Result<(Screen, Option<&'static dyn ScreenReader>), Fail> {
+        let read = self.read_shaped()?;
+        self.limit_words_read_above(read.screen, read.read_by, read.above)
+    }
+
+    /// THE ROWS ABOVE A LIMIT'S WORDS, read where the screen cannot tell
+    /// whose words they are (ATERM-KI-1015-14): on Claude Code's screen, the
+    /// row [`aterm_phase::limit_words_above`] names — the newest limit
+    /// notice, its `/goal` echo, or the vendor's word on its auto-continue,
+    /// whose owner walk reached the first row read undecided — is read
+    /// again with the whole grid over a tail, and with the rows right above
+    /// the grid ([`Self::rows_up_to_owner`]: the history, or on the
+    /// alternate screen aterm's archive) where the grid's first row is
+    /// reached too. Where they make it a program's words
+    /// ([`aterm_phase::phase::words_of`]), the screen is cut under its line:
+    /// the rows cut are words whose owner is off the screen read, and no
+    /// reader sees them, as no reader sees a tail's rows above it. Measured
+    /// on 2.1.304: a Stop hook's 35-line `stopReason` ending `Usage limit
+    /// reached · resets 3pm` read, from the loop's 40-row tail, as a session
+    /// limit's notice with no turn served under it (`since_limit`), its
+    /// summary row above the tail; one of 60 lines draws the summary in the
+    /// history. Rows that cannot all be read — the grid no longer the
+    /// screen's, an evicted row, no owner within
+    /// [`super::wall_confirm::OWNER_ROWS`] rows, the screen moved under the
+    /// reads — leave the screen as read, the row Claude Code's, as before. A
+    /// read of the same rows at the same `seq` takes the last verdict again
+    /// with no request. `above`: the grid's rows above `screen` where the
+    /// read was whole ([`Self::read_shaped`]), so the grid is not read again.
+    pub(super) fn limit_words_read_above(
+        &mut self,
+        mut screen: Screen,
+        read_by: Option<&'static dyn ScreenReader>,
+        above: Option<Vec<String>>,
+    ) -> Result<(Screen, Option<&'static dyn ScreenReader>), Fail> {
+        let claude = match self.reader(&screen.rows).program() {
+            Program::Claude => true,
+            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
+                false
+            }
+        };
+        let Some(words) = claude
+            .then(|| aterm_phase::limit_words_above(&screen.rows))
+            .flatten()
+        else {
+            return Ok((screen, read_by));
+        };
+        let key = (screen.seq, screen.first, screen.rows.clone());
+        let cut = match self.limit_cut.take() {
+            Some((seen, cut)) if seen == key => cut,
+            _ => self.programs_words_above(&screen, words, above)?,
+        };
+        self.limit_cut = Some((key, cut));
+        let Some(end) = cut else {
+            return Ok((screen, read_by));
+        };
+        screen.rows.drain(..=end);
+        screen.first += end + 1;
+        Ok((screen, None))
+    }
+
+    /// Whether the row `words` names on `screen` is A PROGRAM'S WORDS read
+    /// with the rows above the screen ([`Self::limit_words_read_above`]):
+    /// the last row of its line, which the screen is cut under, or `None`.
+    fn programs_words_above(
+        &mut self,
+        screen: &Screen,
+        words: aterm_phase::WordsAbove,
+        above: Option<Vec<String>>,
+    ) -> Result<Option<usize>, Fail> {
+        use aterm_phase::phase::{WordsOf, words_of};
+        let grid = if let Some(mut grid) = above.filter(|a| a.len() == screen.first) {
+            grid.extend(screen.rows.iter().cloned());
+            grid
+        } else {
+            let whole = self.grid()?;
+            let same = whole
+                .rows
+                .get(screen.first..)
+                .is_some_and(|rows| wall_confirm::same_rows(rows, &screen.rows));
+            if !same {
+                return Ok(None);
+            }
+            whole.rows
+        };
+        let at = screen.first + words.row;
+        let judged = match words_of(&grid, at) {
+            WordsOf::Above => {
+                let Some(mut joined) = self.rows_up_to_owner(&grid)? else {
+                    return Ok(None);
+                };
+                let above = joined.len();
+                joined.extend(grid);
+                words_of(&joined, above + at)
+            }
+            judged => judged,
+        };
+        Ok((judged == WordsOf::Program).then_some(words.end))
+    }
+
+    /// [`Self::read_once`]'s read of the screen: a tail that stands for it,
+    /// or the whole grid (cut to its live zone where that stands for it) and
+    /// the grid's rows above what it keeps.
+    fn read_shaped(&mut self) -> Result<Shaped, Fail> {
         let tail = format!("tail={TAIL_ROWS}");
         let r = self.call(&["text", "--json", &tail])?;
         if !r.ok() {
@@ -4075,7 +4858,11 @@ impl<'a, C: Ctl> Session<'a, C> {
         let gap = gap_above_tail(&screen);
         if !tail_misses_the_live_rows(reader, &screen) && !drawn_above_tail(reader, &screen) && !gap
         {
-            return Ok((screen, Some(reader)));
+            return Ok(Shaped {
+                screen,
+                read_by: Some(reader),
+                above: None,
+            });
         }
         // The tail cut a box's head off, holds none of the live rows, ends on
         // a blank row under drawn rows and decides nothing or an idle
@@ -4089,7 +4876,16 @@ impl<'a, C: Ctl> Session<'a, C> {
             return Err(self.fault(&r, format!("text --json failed: {}", r.stderr.trim())));
         }
         let whole = parse_text_json(&r.stdout).map_err(Fail::Hard)?;
-        Ok((if zone { self.live_zone(whole) } else { whole }, None))
+        let (screen, above) = if zone {
+            self.live_zone(whole)
+        } else {
+            (whole, Vec::new())
+        };
+        Ok(Shaped {
+            screen,
+            read_by: None,
+            above: Some(above),
+        })
     }
 
     /// A whole read cut to the screen's live zone — its last [`TAIL_ROWS`]
@@ -4098,7 +4894,8 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// reads — or left whole where that cut would miss the live rows as a
     /// tail can ([`tail_misses_the_live_rows`]): it takes a box's head off
     /// (the server reads that box whole too), or the cursor's row is above it.
-    fn live_zone(&self, mut whole: Screen) -> Screen {
+    /// The rows it cut off, too.
+    fn live_zone(&self, mut whole: Screen) -> (Screen, Vec<String>) {
         let first = aterm_phase::live_zone_start(&whole.rows, TAIL_ROWS);
         // Cut in place; a cut that misses puts the rows above back.
         let mut above: Vec<String> = whole.rows.drain(..first).collect();
@@ -4107,8 +4904,9 @@ impl<'a, C: Ctl> Session<'a, C> {
             above.append(&mut whole.rows);
             whole.rows = above;
             whole.first = whole_first;
+            return (whole, Vec::new());
         }
-        whole
+        (whole, above)
     }
 
     /// ONE WHOLE READ OF THE GRID (`text --json`, no `tail=`) WITH NONE OF
@@ -4214,7 +5012,9 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
     }
 
-    /// Block until the worker's phase is no longer busy, or `timeout` passes.
+    /// THE ENGINE TESTS' BARE WAIT over the live loop's ([`Self::await_turn_from`],
+    /// which the hosted loop runs between its looks): block until the
+    /// worker's phase is no longer busy, or `timeout` passes.
     ///
     /// The loop: wait; read; done unless busy; else wait again. Where the
     /// server knows `await gone`, the wait after a busy read showing the busy
@@ -4232,19 +5032,21 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// arriving and counts as busy. An outage is ridden out ([`Self::ride_out`],
     /// lines on stderr) and the wait restarts from a fresh read; a timeout spent
     /// in one is the timed-out turn on the last screen read (`spent_turn`).
-    pub fn await_turn(&mut self, timeout: Duration) -> Result<Turn, String> {
+    #[cfg(test)]
+    pub(crate) fn await_turn(&mut self, timeout: Duration) -> Result<Turn, String> {
         self.await_turn_to(timeout, &mut std::io::stderr())
     }
 
     /// [`Self::await_turn`], its `RECONNECT …` lines said to `log`.
+    #[cfg(test)]
     fn await_turn_to(&mut self, timeout: Duration, log: &mut dyn Write) -> Result<Turn, String> {
         let deadline = self.fx.mono() + timeout;
         let mut gone_first = true;
         let mut moved = Saw::default();
         loop {
             let remaining = deadline.saturating_duration_since(self.fx.mono());
-            // `--context-warn` is the loops' (`drive` arms it): `await-turn`
-            // has no context line to say.
+            // No loop around it, so no context line to say (the hosted
+            // loop's context watch is armed by its `opts`).
             match self.await_turn_from(remaining, gone_first, &mut moved, None, None, &mut Alone) {
                 Ok(turn) => return Ok(turn),
                 Err(Fail::Lost(why)) => {
@@ -4266,7 +5068,8 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
     }
 
-    /// [`Self::await_turn`], with the `await gone` first wait optional: right
+    /// The live loop's wait for the turn's end, with the `await gone` first
+    /// wait optional: right
     /// after an approval the busy footer is not up YET, so its leaving is no
     /// signal — the settle wait is the first one. Marks `saw` when a read on
     /// the way was busy (the worker moved since the last look: [`Saw::busy`])
@@ -4456,25 +5259,62 @@ impl<'a, C: Ctl> Session<'a, C> {
             // THE AGENT'S LIVE TURN — its spinner or busy footer, never a
             // break of its own background work: the loop's act awaited, if
             // any, was taken ([`TurnEndState::act_untaken`]), so a break it
-            // leads to is the agent's own and may be offered to the host.
+            // leads to is the agent's own and may be offered to the host. One
+            // Claude Code's own wake opened after a done its worker's marker
+            // made over a shell it left is part of that task
+            // ([`TurnEndState::live_turn`]): said once, nothing typed or
+            // published for it, and the task's face stays as it was.
             if !writing && !carried && reader.background_wait(&screen.rows).is_none() {
-                self.took(screen.seq);
-                // A live turn no act of the policy's started is someone
-                // else's: the task's face is open again from this read
-                // (`✓ landed` would stand through a person's new task for as
-                // long as it ran), told once — the same turn read again is no
-                // move ([`Self::tell_face`]).
-                self.tell_face();
+                let opened = match reader.program() {
+                    aterm_phase::Program::Claude => aterm_phase::opened_by_own_wake(&screen.rows),
+                    aterm_phase::Program::Codex
+                    | aterm_phase::Program::Agy
+                    | aterm_phase::Program::Muse
+                    | aterm_phase::Program::Gemini
+                    | aterm_phase::Program::Generic => None,
+                };
+                if self.turn_end.own_wake(opened) {
+                    if self.turn_end.live_turn(opened) {
+                        review.note(&format!(
+                            "WOKE seq={} rule={RULE_FINISHED} the worker went on by itself at the \
+                             end of the work it left running: its task stays done, and nothing is \
+                             typed or published for this turn",
+                            screen.seq
+                        ));
+                    }
+                } else {
+                    self.took(screen.seq);
+                    // A live turn no act of the policy's started is someone
+                    // else's: the task's face is open again from this read
+                    // (`✓ landed` would stand through a person's new task for
+                    // as long as it ran), told once — the same turn read again
+                    // is no move ([`Self::tell_face`]).
+                    self.tell_face();
+                }
                 // A refused wall's episode is over: met again at a later
                 // point, it is said again ([`Self::say_wall_refused`]).
                 self.wall_refusal_over();
+            }
+            // THE WORKER'S FINISHED OVER ITS OWN BACKGROUND WORK ends its
+            // task at this read, published before the host's step below may
+            // type at the same break ([`Self::finish_over_background`]).
+            if !writing
+                && review.unattended()
+                && let Some(opts) = opts
+            {
+                self.finish_over_background(&screen, opts, review)?;
             }
             // A break of the agent's own background work is offered to the
             // host; whatever it types there, the wait below is for the screen
             // to move on from this read.
             if !writing {
                 if !off {
-                    self.host_steps_in_background(&screen, &mut background_since, review);
+                    self.host_steps_in_background(
+                        &screen,
+                        &mut background_since,
+                        opts.map(|o| &o.policy),
+                        review,
+                    );
                 }
                 self.stuck_busy_note(&screen, background_since, review);
             }
@@ -4489,12 +5329,6 @@ impl<'a, C: Ctl> Session<'a, C> {
                 }
                 // The turn's work, as the turn-end policy measures it.
                 self.running.busy(self.fx.mono());
-                // `--mail`: the turn has begun by now (`MailIn::busy_at`).
-                if let Some(m) = &mut self.mail
-                    && m.busy_at.is_none()
-                {
-                    m.busy_at = Some(self.fx.mono());
-                }
                 // Unattended: the worker works, so a self-resuming limit notice
                 // is over, and so is the point this loop escalated (a person
                 // answered and the worker took it). Its badge goes now, at the
@@ -4506,25 +5340,25 @@ impl<'a, C: Ctl> Session<'a, C> {
                     // over — unless the loop is still waiting on a wall whose
                     // rows are out of view, which is no answer to it, or the
                     // spinner is its own `/compact`'s run: the point a
-                    // compaction that fails leaves is the same one.
-                    if self.wall_memory.is_none() && !self.turn_end.compacting() {
+                    // compaction that fails leaves is the same one; or the
+                    // busy read is `/login`'s own dialog short of its success
+                    // ([`super::policy::login::dialog_stands`]): the sign-in
+                    // the owner's notice stands for is still theirs.
+                    let signing_in = super::policy::login::dialog_stands(&screen.rows);
+                    if self.wall_memory.is_none() && !self.turn_end.compacting() && !signing_in {
                         self.exception_ended(screen.seq, Some("the agent working"), review);
                     }
                     if self.box_ask.is_some() && !writing {
                         self.close_box(screen.seq, review)?;
                     }
                     // Likewise the told choice: a dialog the loop answered is
-                    // done and is told now (`CHOSE`, its chime and rim pulse),
+                    // done and is told now (`CHOSE`, a record: `status story=`),
                     // naming this read, since the turn may run for hours and a
                     // loop stopped in it would never tell it. The look's own
                     // edge is the fallback for a turn read busy only as
                     // `writing`.
                     if !writing && !self.question.answered.is_empty() {
-                        self.question_done(
-                            screen.seq,
-                            opts.and_then(|o| o.notes.as_deref()),
-                            review,
-                        )?;
+                        self.question_done(screen.seq, review)?;
                     }
                     // A limit reset's step still owed: the worker works, so
                     // its dialog is gone, and the host is told now — the turn
@@ -4632,7 +5466,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
     }
 
-    /// `--context-warn` at one read: the context indicator
+    /// `context_warn` at one read: the context indicator
     /// ([`super::phase::context_left`]) against the threshold. The first
     /// reading at or below it says `EVENT context seq=<n> <v>% until
     /// auto-compact` (the manager's moment to have the worker update its
@@ -4687,61 +5521,33 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
     }
 
-    /// The loop. Returns the text to print and the exit code: `0` with the
-    /// compact result when the worker needs the manager (a non-read prompt, a
-    /// question, a limit notice, an idle composer); [`EXIT_TIMEOUT`] with
-    /// `TIMEOUT` and the last read's compact result when the budget is spent —
-    /// a turn read at or after the deadline is the TIMEOUT, never pressed, and
-    /// so is a budget spent while an outage is ridden out. An outage is ridden
-    /// out ([`Self::ride_out`]), its lines on stderr, never in the result; so
-    /// are the survey's and the context indicator's `EVENT` lines.
-    pub fn supervise(&mut self, opts: &SuperviseOpts) -> Result<(String, u8), String> {
+    /// THE ENGINE TESTS' STOP-AT-REVIEW SEAM over the hosted loop's engine
+    /// ([`Self::drive`]): the loop until its first review point. Returns the
+    /// text and the exit code: `0` with the compact result when the worker
+    /// needs the manager (a non-read prompt, a question, a limit notice, an
+    /// idle composer); [`EXIT_TIMEOUT`] with `TIMEOUT` and the last read's
+    /// compact result when the budget is spent — a turn read at or after the
+    /// deadline is the TIMEOUT, never pressed, and so is a budget spent while
+    /// an outage is ridden out. An outage is ridden out ([`Self::ride_out`]),
+    /// its lines on stderr, never in the result; so are the survey's and the
+    /// context indicator's `EVENT` lines.
+    #[cfg(test)]
+    pub(crate) fn supervise(&mut self, opts: &SuperviseOpts) -> Result<(String, u8), String> {
         self.supervise_to(opts, &mut std::io::stderr())
     }
 
-    /// [`Self::supervise`] with `--mail`'s lane (`lane`: the second client
-    /// the lane parks on the manager's inbox; `None` runs without one, as
-    /// [`Self::supervise`] does). Every `MAIL` line goes to stderr with the
-    /// `RECONNECT` lines; an idle review point is held for the worker's
-    /// report (`Session::hold_for_report`) and the result's phase lines end
-    /// with `report <id> rows=<n>`, or `report -` when none came in the
-    /// grace ([`render_result_mail`]); the journal gets the `EVENT turn` or
-    /// `EVENT idle-no-report` line `watch --mail` would print.
-    pub fn supervise_mail<L: Ctl + Send>(
-        &mut self,
-        opts: &SuperviseOpts,
-        lane: Option<&mut L>,
-    ) -> Result<(String, u8), String> {
-        self.supervise_with(opts, lane, &mut std::io::stderr())
-    }
-
     /// [`Self::supervise`], its `RECONNECT …` lines said to `log`. With
-    /// `--journal`, the file gets every line said on `log`, an `APPROVED`
-    /// line per approval and the `EVENT` line `watch` would print for the
+    /// `opts.journal`, the file gets every line said on `log`, an `APPROVED`
+    /// line per approval and the `EVENT` line [`Lines`] would print for the
     /// review point, then `TIMEOUT`, or `EXIT <reason>` for the error the
     /// loop ends on; a journal that fails is said once on `log`.
+    #[cfg(test)]
     fn supervise_to(
         &mut self,
         opts: &SuperviseOpts,
         log: &mut (dyn Write + Send),
     ) -> Result<(String, u8), String> {
-        self.supervise_with(opts, None::<&mut NoLane>, log)
-    }
-
-    /// [`Self::supervise_to`] with the mail lane.
-    fn supervise_with<L: Ctl + Send>(
-        &mut self,
-        opts: &SuperviseOpts,
-        lane: Option<&mut L>,
-        log: &mut (dyn Write + Send),
-    ) -> Result<(String, u8), String> {
         let allow = opts.allow();
-        // `report` counts into `watch`'s one line; `supervise` prints the rows
-        // themselves, so it reads none.
-        let opts = &SuperviseOpts {
-            report: false,
-            ..opts.clone()
-        };
         let journal = self
             .fx
             .open_journal(opts.journal.as_deref(), self.setup.sid.as_deref(), log);
@@ -4749,29 +5555,24 @@ impl<'a, C: Ctl> Session<'a, C> {
             out: log,
             journal,
             warn: None,
-            // `supervise` returns to a manager who decides; only `watch`, the
-            // loop that decides by itself, tells the window.
-            teller: None,
             fx: self.fx.clone(),
         });
-        let end = self.run_loop(
+        let end = self.drive(
             opts,
-            &sink,
-            lane,
             &mut StopAtReview {
                 sink: &sink,
                 allow: &allow,
             },
         );
         match end {
-            Ok(End::Stopped(turn, fold)) => {
+            Ok(End::Stopped(turn)) => {
                 let reader = self.reader(&turn.screen.rows);
-                Ok((render_result_mail(&turn, reader, &allow, fold), 0))
+                Ok((render_result(&turn, reader, &allow), 0))
             }
             Ok(End::Timeout(turn)) => {
                 sink.lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .record("TIMEOUT", None);
+                    .record("TIMEOUT");
                 let reader = self.reader(&turn.screen.rows);
                 Ok((
                     format!("TIMEOUT\n{}", render_result(&turn, reader, &allow)),
@@ -4782,78 +5583,14 @@ impl<'a, C: Ctl> Session<'a, C> {
             Err(e) => {
                 sink.lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .record(&format!("EXIT {}", exit_reason(&e)), None);
+                    .record(&format!("EXIT {}", exit_reason(&e)));
                 Err(e)
             }
         }
     }
 
-    /// [`Self::drive`], with the mail lane running beside it when `opts.mail`
-    /// asks for one and `lane` is a client for it: the lane's thread parks
-    /// `await inbox` on the manager's session ([`mail::Lane::run`]), prints
-    /// through `sink`, and hands the watched worker's reports to
-    /// `Session::hold_for_report`. The lane is told to stop when the loop
-    /// ends, its parked wait cut short where its client can be interrupted
-    /// ([`Ctl::interrupter`]: `aterm-ctl` is signalled), and joined — at
-    /// once, or within one parked wait (`mail_step`) where it cannot.
-    fn run_loop<L: Ctl + Send>(
-        &mut self,
-        opts: &SuperviseOpts,
-        sink: &Mutex<Sink<'_>>,
-        lane: Option<&mut L>,
-        review: &mut dyn Review,
-    ) -> Result<End, String> {
-        let Some((mopts, lane)) = opts.mail.as_ref().zip(lane) else {
-            self.mail = None;
-            return self.drive(opts, review);
-        };
-        let (tx, rx) = mpsc::channel();
-        self.mail = Some(MailIn {
-            rx,
-            pending: Vec::new(),
-            window: mopts.report_window,
-            grace: mopts.idle_grace,
-            gone: false,
-            floor: self.fx.mono(),
-            busy_at: None,
-            handed: false,
-        });
-        let worker = self.setup.sid.clone();
-        // Taken before the lane's thread owns the client: what cuts its
-        // parked wait short once the loop has ended.
-        let cut = lane.interrupter();
-        let lane = mail::Lane {
-            ctl: lane,
-            inbox: mopts
-                .inbox
-                .clone()
-                .unwrap_or_else(|| mail::SELF.to_string()),
-            step: self.setup.mail_step,
-            reconnect: self.setup.reconnect,
-            pause: self.setup.pause,
-            pause_max: self.setup.pause_max,
-        };
-        let stop = AtomicBool::new(false);
-        let say = |line: &str| {
-            sink.lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .line(line, None)
-        };
-        let end = std::thread::scope(|s| {
-            s.spawn(|| lane.run(worker.as_deref(), &say, tx, &stop));
-            let end = self.drive(opts, review);
-            stop.store(true, Ordering::Relaxed);
-            if let Some(cut) = &cut {
-                cut();
-            }
-            end
-        });
-        self.mail = None;
-        end
-    }
-
-    /// `supervise`'s loop for a harness that wakes its agent once per stdout
-    /// line (a background monitor, a supervisor process). A review point prints
+    /// THE ENGINE TESTS' WATCHING SEAM: the hosted loop's lines
+    /// ([`Self::run_hosted`]) with no host and no stop flag. A review point prints
     /// ONE line, [`event_line`], and the loop keeps watching: it waits for the
     /// screen to move past that point (`await seq`) before it looks again, so a
     /// manager's turn or key is picked up without a relaunch. A point that
@@ -4876,12 +5613,8 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// and no EVENT comes after the deadline, and a budget spent in an outage
     /// is the TIMEOUT too — or `EXIT <reason>` (returns 1) when the session
     /// goes, the outage outlasts its reconnect window (`EXIT reconnect window
-    /// lapsed: <the last failure>`) or the loop fails (a request, the notes
-    /// file). Every line is flushed as it is written. With
-    /// [`SuperviseOpts::report`], an idle, question or limited point's line
-    /// carries `complete=<0|1> rows=<n>` of the report read at that point
-    /// ([`reported_event_line`]); without it the line is [`event_line`]'s. With
-    /// [`SuperviseOpts::context_warn`] above 0, Claude Code's context indicator
+    /// lapsed: <the last failure>`) or the loop fails (a request). Every line
+    /// is flushed as it is written. With [`SuperviseOpts::context_warn`] above 0, Claude Code's context indicator
     /// is watched on every read of a turn, a busy one included: `EVENT context
     /// seq=<n> <v>% until auto-compact` when it first reads at or below the
     /// threshold, once a descent, then `EVENT compacted seq=<n>` once it has
@@ -4890,40 +5623,6 @@ impl<'a, C: Ctl> Session<'a, C> {
     #[cfg(test)]
     pub(crate) fn watch(&mut self, opts: &SuperviseOpts, out: &mut (dyn Write + Send)) -> u8 {
         self.watch_to(opts, out, &mut std::io::stderr())
-    }
-
-    /// `Self::watch` with `--mail`'s lane (`lane`: the second client parked on
-    /// the manager's inbox; `None` runs without one). The lane prints `MAIL
-    /// id=<n> off=<o> from=<sid> kind=<k> len=<n> [re=<o>]` per delivery on
-    /// stdout; an idle point is held for the worker's report
-    /// (`Session::hold_for_report`) and printed as `EVENT turn seq=<n>
-    /// report=<id> rows=<n> <summary>`, or `EVENT idle-no-report seq=<n>
-    /// <summary>` once the grace is spent. When mail cannot be watched it says
-    /// `MAIL off: <why> (the loop goes on without mail)` once.
-    #[cfg(test)]
-    pub(crate) fn watch_mail<L: Ctl + Send>(
-        &mut self,
-        opts: &SuperviseOpts,
-        lane: Option<&mut L>,
-        out: &mut (dyn Write + Send),
-    ) -> u8 {
-        self.watch_with(opts, lane, None::<&mut NoLane>, out, &mut std::io::stderr())
-    }
-
-    /// `Self::watch_mail` with the STORY lane (`teller`: a second client
-    /// the loop tells the worker's window its decisions through — `aterm ctl
-    /// @<sid> story <verb> [<text>]` for every journaled line that carries
-    /// one, in the journal's order, never the command; see [`story_of`]).
-    /// The printed lines are byte-identical with or without it: a story is a
-    /// side channel, and a host that lacks the verb changes nothing here.
-    pub fn watch_telling<L: Ctl + Send, S: Ctl + Send>(
-        &mut self,
-        opts: &SuperviseOpts,
-        lane: Option<&mut L>,
-        teller: Option<&mut S>,
-        out: &mut (dyn Write + Send),
-    ) -> u8 {
-        self.watch_with(opts, lane, teller, out, &mut std::io::stderr())
     }
 
     /// `Self::watch`, a journal's one warning said to `warn`. With
@@ -4936,38 +5635,21 @@ impl<'a, C: Ctl> Session<'a, C> {
         out: &mut (dyn Write + Send),
         warn: &mut (dyn Write + Send),
     ) -> u8 {
-        self.watch_with(opts, None::<&mut NoLane>, None::<&mut NoLane>, out, warn)
-    }
-
-    /// [`Self::watch_to`] with the mail lane and the story lane.
-    fn watch_with<L: Ctl + Send, S: Ctl + Send>(
-        &mut self,
-        opts: &SuperviseOpts,
-        lane: Option<&mut L>,
-        teller: Option<&mut S>,
-        out: &mut (dyn Write + Send),
-        warn: &mut (dyn Write + Send),
-    ) -> u8 {
         let allow = opts.allow();
         let journal =
             self.fx
                 .open_journal(opts.journal.as_deref(), self.setup.sid.as_deref(), warn);
-        let sid = self.setup.sid.clone();
         let sink = Mutex::new(Sink {
             out,
             journal,
             warn: Some(warn),
-            teller: teller.map(|ctl| Teller {
-                ctl: ctl as &mut (dyn Ctl + Send),
-                sid,
-            }),
             fx: self.fx.clone(),
         });
         let mut review = Lines {
             sink: &sink,
             allow: &allow,
         };
-        let end = self.run_loop(opts, &sink, lane, &mut review);
+        let end = self.drive(opts, &mut review);
         // The badge this watcher raised goes with it: nobody is left to
         // clear it when its point leaves the screen.
         if !session_gone(&end) {
@@ -4978,7 +5660,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         let _ = sink
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .line(&line, None);
+            .line(&line);
         code
     }
 
@@ -4988,8 +5670,7 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// in this order: the acts within the typing budget's window, the
     /// exchanges left to a person, the usage act at a wall
     /// ([`seed_usage_act`]), the done check owed its answer
-    /// ([`seed_done_check`]), the job's open-items challenge
-    /// ([`approvals::StreakSeed::challenged`]), the Land episode in hand
+    /// ([`seed_done_check`]), the Land episode in hand
     /// ([`TurnEndState::seed_land`]), Off just lifted (`lifted_off`: the host
     /// started this loop as the session's Off lifted), the model switch
     /// ([`Self::seed_model_switch`]) and
@@ -5023,6 +5704,70 @@ impl<'a, C: Ctl> Session<'a, C> {
         now_ms: i64,
         lifted_off: bool,
     ) -> Option<approvals::OpenWall> {
+        // A TAB A COLD RESTORE REOPENED (ATERM-KI-1016-1, follow-7): the
+        // restore minted it another session id, so its loop's ledger is new,
+        // and the books of the loop that ran the conversation before aterm
+        // ended are those of the tabs the restore noted it was reopened from
+        // (`upgrade_drive::note_earlier_tab`). Taken up once, the take-up's
+        // row first in this ledger ([`approvals::RULE_EARLIER_BOOKS`]); while
+        // it stands, every seed below reads the earlier tabs' rows and then
+        // this ledger's, and their journals so, as one continuous ledger
+        // ([`approvals::books_through`]). Read from this ledger alone, the
+        // loop backed off its first point from its attach, started a limit's
+        // ladder over, and typed Land's instruction anew where the loop
+        // before had nudged or spent the landing.
+        let fx = self.fx.clone();
+        let read = |p: &Path| fx.read_text(p);
+        let sid = self.setup.sid.clone();
+        let earlier =
+            crate::harness::upgrade_drive::earlier_ledgers_in(path, sid.as_deref(), &read);
+        let ledgers: Vec<(String, String)> = earlier
+            .iter()
+            .filter_map(|(t, p)| Some((t.clone(), read(p)?)))
+            .collect();
+        let own_journal = self.fx.read_text(&approvals::journal_beside(path));
+        // A person's own exchange an earlier loop left to them, on this tab
+        // or one a cold restore reopened it from: still theirs while it is
+        // the conversation's last turn (RR3-TE-2).
+        let mut left_keys = crate::harness::upgrade_drive::lefts_of(body, sid.as_deref(), &ledgers);
+        let carried = sid.as_deref().filter(|s| {
+            approvals::takes_up_earlier(body, Some(s))
+                && ledgers.iter().any(|(t, b)| approvals::holds_rows_of(b, t))
+        });
+        let (books, journal) = match carried {
+            None => (None, own_journal),
+            Some(sid) => {
+                let own = if approvals::took_up_earlier(body, sid) {
+                    body.to_string()
+                } else {
+                    self.ledger_row(
+                        approvals::RULE_EARLIER_BOOKS,
+                        approvals::Outcome::Waiting,
+                        "",
+                        approvals::EARLIER_BOOKS,
+                        0,
+                    );
+                    read(path).unwrap_or_else(|| body.to_string())
+                };
+                let journals: Vec<(String, String)> = earlier
+                    .iter()
+                    .filter_map(|(t, p)| Some((t.clone(), read(&approvals::journal_beside(p))?)))
+                    .collect();
+                let journal = approvals::books_through(
+                    own_journal.as_deref().unwrap_or_default(),
+                    Some(sid),
+                    &journals,
+                );
+                (
+                    Some(approvals::books_through(&own, Some(sid), &ledgers)),
+                    Some(journal),
+                )
+            }
+        };
+        let body = books.as_deref().unwrap_or(body);
+        // The machine's sleep since the last act, which this loop never
+        // measured: any turn's done row is read less what lies inside it.
+        self.seed_sleep(body, now_ms);
         // (A made account move's row is `typed` and no typed act:
         // [`approvals::typed_at`] leaves it out.)
         let typed = approvals::typed_at_in(body, self.setup.sid.as_deref());
@@ -5032,6 +5777,12 @@ impl<'a, C: Ctl> Session<'a, C> {
             .map(Duration::from_millis)
             .collect();
         self.turn_end.seed_acts(&ages, self.fx.mono());
+        // …and no task they carried where the loop that typed them stopped
+        // carrying it since: the task's end, a person's exchange left to
+        // them, Off after the act's answer ([`approvals::carry_ended_in`]).
+        if approvals::carry_ended_in(body, self.setup.sid.as_deref()) {
+            self.turn_end.seed_carry_over();
+        }
         // The short streak the ledger last says, however old: the last act's
         // mark, or the record of the point a loop judged after it — that
         // point's streak and its time ([`TurnEndState::seed_short`],
@@ -5045,7 +5796,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         // running: the record of the last point a loop judged (the
         // landing's own is written before its note) and, a turn read
         // running after it, a turn no note can come before
-        // ([`landed_before`]). Read from the journal alone, a successor
+        // ([`ended_before`]). Read from the journal alone, a successor
         // seeded the landing over the records that a later point and a
         // later turn made since, and ended a new task's first short done
         // report as landed where the first loop typed the nudge (the merge
@@ -5058,18 +5809,26 @@ impl<'a, C: Ctl> Session<'a, C> {
             .as_ref()
             .filter(|s| s.recorded && s.point)
             .map(|s| if s.ran { i64::MAX } else { s.at_ms });
-        if let Some(words) = self
-            .fx
-            .read_text(&approvals::journal_beside(path))
-            .and_then(|journal| {
-                landed_before(
-                    &journal,
-                    self.setup.sid.as_deref(),
-                    typed.last().copied().max(since),
-                )
-            })
-        {
-            self.turn_end.seed_landed(words);
+        //
+        // A DONE of any other kind, and nothing since, by the same rules: the
+        // start face restates it ([`TurnEndState::seed_done`]), so the window
+        // keeps the time the work finished, not the restart's. Either end's
+        // note's own time goes with the start face
+        // ([`TurnEndState::seed_noted_at`]): a window that held no face (a
+        // seamless update's new one) shows it too.
+        if let Some((face, words, noted_ms)) = journal.as_deref().and_then(|journal| {
+            ended_before(
+                journal,
+                self.setup.sid.as_deref(),
+                typed.last().copied().max(since),
+            )
+        }) {
+            if face == TaskFace::Landed {
+                self.turn_end.seed_landed(words);
+            } else {
+                self.turn_end.seed_done(words);
+            }
+            self.turn_end.seed_noted_at(noted_ms);
         }
         if let Some(seed) = &streak {
             self.turn_end.seed_short(seed.short);
@@ -5087,42 +5846,135 @@ impl<'a, C: Ctl> Session<'a, C> {
                 self.turn_end.seed_yield(&seed.rule);
             }
         }
-        // A person's own exchange an earlier loop left to them, on this
-        // tab or one a cold restore reopened it from: still theirs
-        // while it is the conversation's last turn (RR3-TE-2).
-        let fx = self.fx.clone();
-        self.left_keys = crate::harness::upgrade_drive::lefts_beside_in(
-            path,
-            body,
-            self.setup.sid.as_deref(),
-            &|p| fx.read_text(p),
-        );
+        // A LEDGER AN OLDER BUILD WROTE (no point record in it): the streak
+        // and the point it was held at, or the API error's rung, and the
+        // limit's tries it saw taken, as that build's loop journaled them
+        // ([`journaled_hold`], [`journaled_takes`]).
+        let older = journal
+            .as_deref()
+            .filter(|_| !streak.as_ref().is_some_and(|s| s.recorded));
+        let hold = older.and_then(|journal| {
+            journaled_hold(journal, self.setup.sid.as_deref(), typed.last().copied())
+        });
+        let older_reads = older.map_or_else(OlderReads::default, |journal| OlderReads {
+            takes: journaled_takes(journal, self.setup.sid.as_deref()),
+            points: journaled_points(journal, self.setup.sid.as_deref()),
+            judged_ms: hold.as_ref().filter(|h| !h.acted).map(|h| h.at_ms),
+        });
+        if let Some(hold) = &hold
+            && let Some(short) = hold.short
+        {
+            self.turn_end.seed_short(short);
+            if hold.acted {
+                if let Some(seed) = &streak {
+                    self.turn_end.seed_yield(&seed.rule);
+                }
+            } else {
+                // A back-off's point is its wait's start; another wait's
+                // its line.
+                let point_ms = short_held(&hold.why)
+                    .map_or(hold.at_ms, |(_, wait_ms)| hold.until_ms + 500 - wait_ms);
+                let ago = Duration::from_millis(u64::try_from(now_ms - point_ms).unwrap_or(0));
+                self.turn_end.seed_point(ago, self.fx.mono());
+            }
+        }
+        // THE RETRY LADDER OF AN API ERROR'S WALL the loop before waited at,
+        // as its last row marks it ([`approvals::RetryMark`]), or an older
+        // build's journal says it ([`retry_held`]): worked from its rung and
+        // its appearance ([`TurnEndState::seed_retry`]). That row the retry
+        // itself, the retry is owed its answer: awaited while its take window
+        // is open, as by the loop that typed it, else the wall's first
+        // reading here.
+        // The journal's wait is a point (the wall met again) unless the act
+        // it ended in is the ledger's last.
+        let marked = match streak.as_ref().and_then(|s| s.retry) {
+            Some(mark) => Some((mark, streak.as_ref().filter(|s| !s.point))),
+            None => hold.as_ref().and_then(|h| {
+                let mark = retry_held(h, &self.turn_end.timing)?;
+                Some((mark, streak.as_ref().filter(|_| h.acted)))
+            }),
+        };
+        if let Some((mark, last)) = marked {
+            let ago = |ms: i64| {
+                Duration::from_millis(u64::try_from(now_ms.saturating_sub(ms)).unwrap_or(0))
+            };
+            let retry = [RULE_API_RETRY, RULE_API_BACK, RULE_API_CUTOFF]
+                .into_iter()
+                .find(|r| last.is_some_and(|s| *r == s.rule));
+            let awaited = retry.is_some_and(|rule| {
+                last.is_some_and(|s| {
+                    now_ms >= s.at_ms
+                        && self.turn_end.seed_awaited(
+                            rule,
+                            ago(s.at_ms),
+                            FirstRead::Unknown,
+                            true,
+                            false,
+                            self.fx.mono(),
+                        )
+                })
+            });
+            self.turn_end.seed_retry(
+                mark.kind,
+                mark.attempts,
+                mark.ups,
+                ago(mark.since_ms),
+                retry.is_some() && !awaited,
+                self.fx.mono(),
+            );
+        }
+        // …and one a loop of an older build left, as its journal says it:
+        // its rows name no turn ([`journaled_left`]).
+        if let Some(key) = older.and_then(|j| journaled_left(j, self.setup.sid.as_deref()))
+            && !left_keys.contains(&key)
+        {
+            left_keys.push(key);
+        }
+        self.left_keys = left_keys;
         // The usage act a previous loop made at the wall this one
         // attaches to (a new window, a seamless update, a fault).
         seed_usage_act_in(
             &mut self.turn_end,
             body,
             self.setup.sid.as_deref(),
+            &older_reads,
             now_ms,
             self.fx.mono(),
         );
-        // The done check a previous loop asked, owed its answer.
+        // The done check a previous loop asked, owed its answer, and the
+        // Land episode it had in hand, read where every park its journal
+        // says stood Off ([`with_parks_journaled`]): a build through 0.105.0
+        // notes its park and records none.
+        let parked = with_parks_journaled(body, journal.as_deref(), self.setup.sid.as_deref());
         seed_done_check(
             &mut self.turn_end,
-            body,
+            &parked,
             self.setup.sid.as_deref(),
+            &older_reads,
             now_ms,
             self.fx.mono(),
         );
-        // The job's challenge, as the last row the loop before wrote marks
-        // it: past the challenge's answer (judged no done report, an act
-        // after it, an Off that lifted over it cut), no check owed says it
-        // ([`approvals::Carried::challenged`]).
-        if streak.as_ref().is_some_and(|s| s.challenged) {
-            self.turn_end.seed_challenged();
-        }
         // The Land episode a previous loop had in hand.
-        if let Some(land) = approvals::land_episode_in(body, self.setup.sid.as_deref()) {
+        if let Some(mut land) = approvals::land_episode_in(&parked, self.setup.sid.as_deref()) {
+            // An older build's books: the points its journal says it judged
+            // after Land's last act, as [`approvals::land_episode_in`] reads
+            // a newer one's records ([`OlderReads::points`]).
+            if let Some(last) = typed.last().filter(|_| land.landing && !land.cut) {
+                let after: Vec<bool> = older_reads
+                    .points
+                    .iter()
+                    .filter(|(t, _)| t > last)
+                    .map(|(_, done)| *done)
+                    .collect();
+                // The first its answer — quiet where the nudges are spent and
+                // it said no done — a second a later turn's; judged and the
+                // task not ended there, no landing is in hand.
+                if let Some(&first) = after.first() {
+                    land.quiet = !first && land.nudges >= super::policy::turn_end::LAND_NUDGES;
+                    land.answered |= after.contains(&true);
+                    land.landing = first && after.len() == 1;
+                }
+            }
             self.turn_end.seed_land(
                 land.nudges,
                 land.landing,
@@ -5133,8 +5985,15 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
         // A turn read running since the point recorded last: a later turn
         // than the one the check's or the land act's answer was judged at.
-        if streak.is_some_and(|s| s.point && s.ran) {
+        if let Some(seed) = streak.as_ref().filter(|s| s.point && s.ran) {
             self.turn_end.seed_ran();
+            // …and when, for this loop's first point: that turn's end
+            // ([`TurnEndState::seed_ran_turn`]).
+            if let Some(ran_ms) = seed.ran_ms {
+                let ago = |ms: i64| Duration::from_millis(u64::try_from(now_ms - ms).unwrap_or(0));
+                self.turn_end
+                    .seed_ran_turn(ago(ran_ms), ago(seed.at_ms), self.fx.mono());
+            }
         }
         // A LOOP THE HOST STARTED AS THE SESSION'S OFF LIFTED: the person
         // drove the session since those acts, so they carry no task — but
@@ -5164,7 +6023,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         let open_wall = approvals::open_wall_in(body, self.setup.sid.as_deref());
         // A model switch an earlier loop made is switched back at its
         // reset by this one.
-        self.seed_model_switch_in(body);
+        self.seed_model_switch_in(body, older);
         // The account moves an earlier loop made count toward this
         // one's bound (240 relaunches in five days is what a bound that
         // starts over with each loop allows); a move it could not make
@@ -5229,7 +6088,31 @@ impl<'a, C: Ctl> Session<'a, C> {
         // filed it retires it, and the journal says how long it stood.
         self.stuck_over(0, "the loop ended", review);
         self.exception_ended(0, Some("the loop ended"), review);
+        // An act written outside a look (a step the loop's own start or end
+        // took) is sent here, last.
+        self.send_act_marks();
         end
+    }
+
+    /// Send the session log's queued `act` marks ([`ActMarks`]), oldest
+    /// first, each as `mark - act word=<w> [rule=<id>]` through
+    /// [`Self::call`] (so a tape records it as it records every request).
+    /// One a server refuses latches the rest off ([`act_mark_latches`]);
+    /// `ERR busy` (and any other refusal) drops that mark, never retried; a
+    /// transport failure drops what is queued.
+    pub(super) fn send_act_marks(&mut self) {
+        for mark in std::mem::take(&mut self.act_marks.pending) {
+            if self.act_marks.off {
+                break;
+            }
+            let mut args = vec!["mark", "-"];
+            args.extend(mark.split(' '));
+            match self.call(&args) {
+                Ok(reply) if act_mark_latches(&reply) => self.act_marks.off = true,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
     }
 
     /// [`Self::drive`]'s body.
@@ -5242,6 +6125,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.stall_grace_s = opts.policy.human_grace_s;
         self.stall_term_after_s = opts.policy.stall_term_after_s;
         self.stall_term = opts.policy.stall_term;
+        self.resume_limits = opts.policy.resume_limits;
         // Every read of this loop's turns is shown to the context watch
         // (`await_turn_from`), armed from the start.
         self.context_warn = opts.context_warn;
@@ -5310,12 +6194,17 @@ impl<'a, C: Ctl> Session<'a, C> {
         // policy's memory fresh, or LANDED where a landing a loop before this
         // one landed is seeded above — the landing restated, never announced
         // again (the window records a landing only on a move from a face it
-        // knew). The host told the window "unknown" when the loop before this
-        // one ended; the first point takes the seed up (no move) or drops it
-        // (open) — design §9.4.2.
+        // knew) — or DONE where a done is, its first time kept. The host told
+        // the window "unknown" when the loop before this one ended; the first
+        // point takes the seed up (no move) or drops it (open) — design
+        // §9.4.2. A seed's face goes with the time its end was noted
+        // ([`TurnEndState::face_start_noted`]).
         let face = self.turn_end.face_start();
         if let Some(host) = &self.stall_host {
-            host.task_face(face);
+            match self.turn_end.face_start_noted() {
+                Some(noted_ms) => host.task_face_noted(face, noted_ms),
+                None => host.task_face(face),
+            }
         }
         self.seed_wall_memory(open_wall);
         let mut state = Looking {
@@ -5325,7 +6214,6 @@ impl<'a, C: Ctl> Session<'a, C> {
             handed_seq: None,
             moved: Saw::default(),
             survey: Survey::Closed,
-            carried: None,
             read_back: None,
         };
         // An attention a previous watcher left is settled before the first
@@ -5352,7 +6240,13 @@ impl<'a, C: Ctl> Session<'a, C> {
             if let Some(held) = self.yield_to_holder(opts) {
                 return Err(held);
             }
-            match self.look(opts, &allow, &mut state, &mut deadline, review) {
+            let looked = self.look(opts, &allow, &mut state, &mut deadline, review);
+            // The act marks the look queued go once it returns: one fixed
+            // point a tape replays in place, off every decision.
+            if looked.is_ok() {
+                self.send_act_marks();
+            }
+            match looked {
                 Ok(Some(end)) => return Ok(end),
                 Ok(None) => self.outage = None,
                 Err(Fail::Lost(why)) => {
@@ -5412,15 +6306,8 @@ impl<'a, C: Ctl> Session<'a, C> {
         review: &mut dyn Review,
     ) -> Result<Option<End>, Fail> {
         let remaining = deadline.saturating_duration_since(self.fx.mono());
-        // A screen the hold read past its point still showing a point is
-        // this look's turn; one busy again is awaited as any turn is.
-        let carried = state.carried.take().filter(|s| {
-            let reader = self.reader(&s.rows);
-            reader.phase(&s.rows) != Phase::Busy && reader.composer(&s.rows).is_some()
-        });
         // A press's read handed on is this look's turn as read.
-        let read_back = state.read_back.take();
-        let turn = match carried.or(read_back) {
+        let turn = match state.read_back.take() {
             Some(screen) => self.turn_of(screen),
             None => {
                 // The rating card is also dealt with on the BUSY reads of the wait: a
@@ -5547,7 +6434,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             // told once (unless already told at the turn's first busy read,
             // [`Self::await_turn_from`]).
             self.decline = approval_loop::DeclineMemory::default();
-            self.question_done(turn.screen.seq, opts.notes.as_deref(), review)?;
+            self.question_done(turn.screen.seq, review)?;
         } else if !matches!(turn.phase, Phase::Prompt | Phase::Busy)
             && self
                 .reader(&turn.screen.rows)
@@ -5569,7 +6456,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             // keeps the memory, whose worst is a hand-over; forgotten there,
             // the loop's text in a dialog still up would read as a person's,
             // and their act or a key in flight would be lost.
-            self.question_done(turn.screen.seq, opts.notes.as_deref(), review)?;
+            self.question_done(turn.screen.seq, review)?;
         }
         if worked {
             // A badge the turn-end policy raised with no point to carry it
@@ -5653,6 +6540,12 @@ impl<'a, C: Ctl> Session<'a, C> {
             if let Some(old) = state.handed_seq.replace(turn.screen.seq) {
                 self.carry_point(old, turn.screen.seq);
             }
+            // …save its composer: a draft that held it, sent or cleared,
+            // decides it again ([`Self::draft_look`]).
+            if review.unattended() && self.draft_look(&turn, opts, allow, review)? {
+                state.gone_first = false;
+                return Ok(None);
+            }
             turn
         } else {
             let mut point =
@@ -5681,10 +6574,33 @@ impl<'a, C: Ctl> Session<'a, C> {
             // [`RunningTurn::point`]); a latched person's hand is spent.
             let busy_for = self.running.point(self.fx.mono());
             let turn_end = if review.unattended() {
-                self.turn_end_at_point(&point, busy_for, opts)?
+                let action = self.turn_end_at_point(&point, busy_for, opts)?;
+                // The task's edge is this point's, published as it is folded
+                // in: the host's step and the probe below may take the point
+                // and type into it, moving the transcript a done's result is
+                // read from ([`Self::task_edge_at_fold`]). Its note waits for
+                // the point's own line.
+                self.task_edge_at_fold(&point.screen, opts, review)?;
+                action
             } else {
                 TurnEndAction::Nothing
             };
+            // A LIMIT THE POLICY READ OVER AT THIS POINT ends its episode as a
+            // busy read does ([`Self::close_episode`]): its retry taken with no
+            // wall since, a turn served under its notice or after its row in
+            // the transcript, the vendor's own continuation of it
+            // ([`TurnEndState::limit_ended`], folded in just now). A reply too
+            // quick for any read (the lab's stub answers in 0 s) left the
+            // episode open, the host's steps withheld to the reset plus an
+            // hour — for good where no reset is named — and the `limited:`
+            // badge up as long (ATERM-KI-1016-1).
+            if review.unattended()
+                && self.limit.is_some()
+                && self.turn_end.limit_ended()
+                && !matches!(point.phase, Phase::Limited { .. })
+            {
+                self.close_episode(point.screen.seq, "answered since the limit", review)?;
+            }
             // AUTOPILOT OFF, read for this point's decision (which then
             // decided nothing): the point is neither reported, escalated nor
             // acted on — a limit's episode, the host's step and the probe
@@ -5699,29 +6615,10 @@ impl<'a, C: Ctl> Session<'a, C> {
             // a limit a cancel left that answered a turn is a limit point
             // ([`Self::point_as_decided`]): its episode, its escalation.
             self.point_as_decided(&mut point);
-            // `--mail`: an idle point waits for the worker's report of this
-            // turn first; a folded one reads no report from the screen (the
-            // mail IS what was said).
-            let Held { fold, carried } = if point.phase == Phase::Idle {
-                self.hold_for_report(&point, *deadline)?
-            } else {
-                Held {
-                    fold: None,
-                    carried: None,
-                }
-            };
-            let report = if opts.report
-                && reported(&point.phase)
-                && !matches!(fold, Some(Fold::Report { .. }))
-            {
-                Some(self.brief_report(opts)?)
-            } else {
-                None
-            };
             // A box the loop did not approve, a question the turn-end policy
             // does not take as an offer, and a point the policy escalates are
-            // the manager's: escalated once ([`Self::escalate_point`];
-            // `supervise` does none of it). A limit's escalation is its
+            // the manager's: escalated once ([`Self::escalate_point`]; a
+            // stop-at-review seam does none of it). A limit's escalation is its
             // episode's ([`Self::limit_after`]); the memory wall read at a
             // limit notice escalates as the point's ([`Self::escalates_here`]).
             let point_escalated = review.unattended()
@@ -5744,7 +6641,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                 }
             }
             // The mark of the worker's last words at the point, journaled with
-            // it: what a later loop reads a landing's point by ([`landed_before`]).
+            // it: what a later loop reads a landing's point by ([`ended_before`]).
             // A box says none.
             let mark = (point.phase != Phase::Prompt)
                 .then(|| {
@@ -5752,8 +6649,8 @@ impl<'a, C: Ctl> Session<'a, C> {
                     said_mark(self.reader(rows).said_tail(rows).as_deref())
                 })
                 .flatten();
-            if !review.review_marked(&point, report, fold, mark)? {
-                return Ok(Some(End::Stopped(point, fold)));
+            if !review.review_marked(&point, mark)? {
+                return Ok(Some(End::Stopped(point)));
             }
             // The manager has the worker now, as after a fresh `supervise`.
             state.approved.clear();
@@ -5770,21 +6667,6 @@ impl<'a, C: Ctl> Session<'a, C> {
                         TurnEndAction::Nothing | TurnEndAction::Escalate { .. }
                     );
                 self.limit_after(&point, deadline, handled, review)?;
-            }
-            // `--mail`: a turn ended here; the next begins after it.
-            if let Some(m) = &mut self.mail
-                && reported(&point.phase)
-            {
-                m.floor = self.fx.mono();
-                m.busy_at = None;
-                m.handed = true;
-            }
-            if carried.is_some() {
-                // The screen has moved past the point already, and was read:
-                // what the policy decided on it is not done on another.
-                state.carried = carried;
-                state.gone_first = false;
-                return Ok(None);
             }
             // The host's step goes first at an idle point it asked for (the
             // live upgrade, a relaunched agent's continuation): the point's
@@ -5832,19 +6714,19 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// Under `dismiss_surveys` the loop presses that `0` itself
     /// ([`Self::dismiss_survey`]) and `true` has it look again from a fresh
     /// read, where the `0` is judged ([`Survey::Tried`]): the survey gone,
-    /// the loop says `DISMISSED survey seq=<n>` (the press's stamp; noted in
-    /// `--notes` too), or nothing when the press was skipped; the survey
+    /// the loop says `DISMISSED survey seq=<n>` (the press's stamp), or
+    /// nothing when the press was skipped; the survey
     /// still open — the `0` did not take, or the guard matched no row of it —
     /// is TRIED AGAIN on a growing back-off ([`SURVEY_RETRY`],
     /// [`Self::retry_survey`]): the `EVENT survey` line said at the first
     /// failure, the host told from the [`SURVEY_BADGE_AT`]-th (a record; it ends
     /// with the survey), the tries going on; a `0`
-    /// that landed in the composer instead is backspaced and noted, nothing
-    /// is said dismissed, and a survey still open then is tried again the
+    /// that landed in the composer instead is backspaced, nothing is said
+    /// dismissed, and a survey still open then is tried again the
     /// same way. The survey gone over text a person typed that BEGINS with the
     /// `0` (`0hello`, `00`: their key landed in the ~0.44 s the card takes to
     /// take the digit, which abandons the card) was not dismissed: the journal
-    /// says `ABANDONED seq=<n> …` and `--notes` the same, and the text is theirs
+    /// says `ABANDONED seq=<n> …`, and the text is theirs
     /// — the `0` is not taken out of it. A person who keyed between the read
     /// and the press skips the `0` altogether (`if-human=`, [`Dismiss::Yielded`]):
     /// no try is spent, and their grace holds the card at the next look.
@@ -5929,18 +6811,6 @@ impl<'a, C: Ctl> Session<'a, C> {
                 }
             }
             self.survey_zero = None;
-            let why = if open {
-                "the survey, still open, did not take it"
-            } else {
-                "it had left first"
-            };
-            self.append_note(
-                opts.notes.as_deref(),
-                &format!(
-                    "backspaced a 0 left in the composer by the press for the session survey \
-                     ({why}; nothing was dismissed)"
-                ),
-            )?;
             if let Survey::Tried { tries, .. } = *survey {
                 *survey = Survey::Closed;
                 if open {
@@ -5978,21 +6848,12 @@ impl<'a, C: Ctl> Session<'a, C> {
                     // (`0hello`, `00`). Said as it is; their text is theirs, and the `0`
                     // stays in it.
                     Some(seq) if draft == Some(true) && heads_with_zero(composer.as_ref()) => {
-                        self.append_note(
-                            opts.notes.as_deref(),
-                            "the session survey left under text typed in the composer (the 0 \
-                             pressed for it may head that text; nothing was dismissed)",
-                        )?;
                         review.note(&format!(
                             "ABANDONED seq={seq} the session survey left under typed text; a 0 of \
                              ours may head it"
                         ));
                     }
                     Some(seq) => {
-                        self.append_note(
-                            opts.notes.as_deref(),
-                            "dismissed the session survey (pressed 0; a rating is the human's)",
-                        )?;
                         review.say(&survey_dismissed_line(seq, kind))?;
                     }
                     None => {}
@@ -6003,16 +6864,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             // Still open under a box or a draft: judged at the first look
             // without them.
             Survey::Tried { .. } if waits => return Ok(false),
-            Survey::Tried { pressed, tries } => {
-                let why = if pressed.is_some() {
-                    "still open after its guarded 0"
-                } else {
-                    "its guarded 0 matched no row, and it is still open"
-                };
-                self.append_note(
-                    opts.notes.as_deref(),
-                    &format!("the session survey was not dismissed ({why}); tried again"),
-                )?;
+            Survey::Tried { tries, .. } => {
                 self.retry_survey(turn, &ctx, survey, review, tries)?;
                 return Ok(false);
             }
@@ -6342,136 +7194,6 @@ impl<'a, C: Ctl> Session<'a, C> {
         Ok(())
     }
 
-    /// `watch --report`'s count of the report at a point. An unserved request
-    /// is ridden out; any other report failure does not end the loop: the point
-    /// is reported `complete=0 rows=0` and the failure noted.
-    fn brief_report(&mut self, opts: &SuperviseOpts) -> Result<ReportBrief, Fail> {
-        match self.gather_report(&ReportOpts::default()) {
-            Ok(r) => Ok(ReportBrief {
-                complete: r.complete(),
-                rows: r.rows.len(),
-                turn: r.turn,
-            }),
-            Err(Fail::Lost(why)) => Err(Fail::Lost(why)),
-            Err(Fail::Hard(why)) => {
-                self.append_note(
-                    opts.notes.as_deref(),
-                    &format!("report failed: {}", one_line(&why)),
-                )?;
-                Ok(ReportBrief {
-                    complete: false,
-                    rows: 0,
-                    turn: None,
-                })
-            }
-        }
-    }
-
-    /// `--mail` at an idle point: how it is settled ([`Fold`]), or no fold
-    /// when there is no lane. The newest pending `report` that is this turn's
-    /// ([`MailIn::is_this_turns`]) folds at once (older ones are dropped); with
-    /// none pending the point is held until one lands or the grace runs out
-    /// ([`Fold::NoReport`]), bounded by the budget like every wait.
-    ///
-    /// THE SCREEN IS THE SAFETY NET UNDER THE HOLD: once a `hold_step` (20 s)
-    /// of it has passed with no report, the screen is read once — a footer that
-    /// ticked is the same point ([`Self::review_key`]) and the hold goes on; a
-    /// prompt, a question or the worker busy again has superseded the point,
-    /// which is said as `idle-no-report` (the turn did end, and no report came
-    /// before the worker moved on) with the screen read carried to the next
-    /// look ([`Held::carried`]). Without it a prompt right after an idle — a
-    /// queued message, a wake — waited the whole grace unseen.
-    fn hold_for_report(&mut self, point: &Turn, deadline: Instant) -> Result<Held, Fail> {
-        let none = Held {
-            fold: None,
-            carried: None,
-        };
-        let Some(m) = self.mail.as_mut() else {
-            return Ok(none);
-        };
-        loop {
-            match self.fx.try_recv_mail(&m.rx) {
-                Ok(d) => m.pending.push(d),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    m.gone = true;
-                    break;
-                }
-            }
-        }
-        let now = self.fx.mono();
-        let recent = m
-            .pending
-            .iter()
-            .filter(|d| m.is_this_turns(d, now))
-            .max_by_key(|d| d.id)
-            .map(|d| Fold::Report {
-                id: d.id,
-                rows: d.rows,
-            });
-        m.pending.clear();
-        if let Some(fold) = recent {
-            return Ok(Held {
-                fold: Some(fold),
-                carried: None,
-            });
-        }
-        if m.gone {
-            return Ok(none);
-        }
-        let until = now
-            .checked_add(m.grace)
-            .map_or(deadline, |t| t.min(deadline));
-        let key = self.review_key(point);
-        loop {
-            let left = until.saturating_duration_since(self.fx.mono());
-            if left.is_zero() {
-                return Ok(Held {
-                    fold: Some(Fold::NoReport),
-                    carried: None,
-                });
-            }
-            let slice = left.min(self.setup.hold_step);
-            let got = match self.mail.as_mut() {
-                Some(m) => self.fx.recv_mail_timeout(&m.rx, slice),
-                None => return Ok(none),
-            };
-            match got {
-                Ok(d) => {
-                    return Ok(Held {
-                        fold: Some(Fold::Report {
-                            id: d.id,
-                            rows: d.rows,
-                        }),
-                        carried: None,
-                    });
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    if let Some(m) = self.mail.as_mut() {
-                        m.gone = true;
-                    }
-                    return Ok(none);
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    if slice == left {
-                        // The grace ran out with this slice: nothing to look
-                        // at that the next look will not read anyway.
-                        continue;
-                    }
-                    let screen = self.screen()?;
-                    let now_turn = self.point_of(screen);
-                    if self.review_key(&now_turn) == key {
-                        continue;
-                    }
-                    return Ok(Held {
-                        fold: Some(Fold::NoReport),
-                        carried: Some(now_turn.screen),
-                    });
-                }
-            }
-        }
-    }
-
     /// Ride out an outage: a request the server did not serve
     /// ([`Self::unserved`]), as when a self-update hands every session to a new
     /// instance under the same `@sid`. Reads the screen of the same selector
@@ -6596,6 +7318,21 @@ impl<'a, C: Ctl> Session<'a, C> {
                 "await seq is not known to this host".to_string(),
             )),
         }
+    }
+}
+
+/// Tests: a hand on a session's fixed clock ([`Session::clock_jump_handle`]).
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct ClockJump(Arc<super::fx::ScriptedClock>);
+
+#[cfg(test)]
+impl ClockJump {
+    /// The Mac slept `secs` NOW: the fixed clock's next read and every one
+    /// after it is that much later, the monotonic clock standing still
+    /// ([`super::fx::ScriptedClock::slept`]).
+    pub(crate) fn slept(&self, secs: i64) {
+        self.0.slept(secs);
     }
 }
 
@@ -6779,17 +7516,6 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// `--mail`: a turn the watcher sent (a continuation, a command) begins
-    /// a turn as a handed-over point does — its report is not the last
-    /// point's.
-    fn mail_turn_boundary(&mut self) {
-        if let Some(m) = &mut self.mail {
-            m.floor = self.fx.mono();
-            m.busy_at = None;
-            m.handed = true;
-        }
-    }
-
     /// After a point was reported. A limited point opens the episode
     /// ([`Self::open_episode`]; none when the turn-end policy acts on the wall
     /// at once, `handled`), or with the episode open refreshes its reset
@@ -6810,8 +7536,19 @@ impl<C: Ctl> Session<'_, C> {
                 // on it now (the wall again after the act): escalated now.
                 if !handled && !raised {
                     // The notice names its own reset; the journal keeps it apart.
+                    // Whether this loop waits it out is said before the
+                    // badge goes up (`kind=`), by the reset the episode
+                    // holds now.
                     let text = format!("{ATTENTION_PREFIX} {}", one_line(message));
-                    self.escalate(point.screen.seq, &text, None, "control", review)?;
+                    let reset_unix = self.limit.as_ref().and_then(|ep| ep.reset_unix);
+                    let waits = self.waits_out(message, reset_unix);
+                    self.escalate(
+                        point.screen.seq,
+                        &text,
+                        None,
+                        escalate::Escalation::Limit { waits },
+                        review,
+                    )?;
                     if let Some(ep) = self.limit.as_mut() {
                         ep.raised = true;
                     }
@@ -6829,8 +7566,8 @@ impl<C: Ctl> Session<'_, C> {
     /// wall at once (`handled`: a model switch), journaled `LIMITED seq=<n>
     /// handled: <message>`. One a busy read (or an Off park) closed and the
     /// worker has not answered since ([`Retry`]) is the same episode
-    /// reopened: attention set again, no second mail, its seq carried, the
-    /// reset the notice names now.
+    /// reopened: attention set again, no second ask (`again=the retry …`),
+    /// its seq carried, the reset the notice names now.
     fn open_episode(
         &mut self,
         seq: u64,
@@ -6842,15 +7579,24 @@ impl<C: Ctl> Session<'_, C> {
         let reset_text = reset.map_or_else(|| "-".to_string(), str::to_string);
         let reset_unix = self.reset_unix(reset);
         let retry = self.retry.take();
+        // Read BEFORE the badge goes up, which says it (`kind=`).
+        let resumes_itself = limit::resumes_by_itself(message);
         if handled {
             review.note(&format!("LIMITED seq={seq} handled: {}", clip(message)));
         } else {
             let text = format!("{ATTENTION_PREFIX} {}", one_line(message));
-            self.escalate(seq, &text, retry.as_ref().map(|r| r.seq), "control", review)?;
+            let waits = self.waits_out(message, reset_unix);
+            self.escalate(
+                seq,
+                &text,
+                retry.as_ref().map(|r| r.seq),
+                escalate::Escalation::Limit { waits },
+                review,
+            )?;
         }
         self.limit = Some(Episode {
             seq: retry.map_or(seq, |r| r.seq),
-            resumes_itself: limit::resumes_by_itself(message),
+            resumes_itself,
             reset_unix,
             reset_text,
             extended: false,
@@ -6860,6 +7606,22 @@ impl<C: Ctl> Session<'_, C> {
             host.limited(true);
         }
         Ok(())
+    }
+
+    /// Whether the limit a notice of `message` names is waited out with no
+    /// one's act, so its badge is a wait (`kind=wait`), not an ask: Claude
+    /// Code goes on by itself ([`limit::resumes_by_itself`]) — whatever the
+    /// owner's policy, since the loop closes that episode on the busy read
+    /// ([`Self::limit_on_busy`]) and types nothing — or the owner's policy
+    /// resumes limits (`[harness] resume_limits`) and the notice names a
+    /// reset this loop read (`reset_unix`), no further off than
+    /// [`RESET_HORIZON`] (one further is misread), which the turn-end policy
+    /// continues after. A limit naming no reset it can read is waited out by
+    /// nobody here — a reset is never guessed — and is an ask.
+    pub(super) fn waits_out(&self, message: &str, reset_unix: Option<i64>) -> bool {
+        let horizon = i64::try_from(RESET_HORIZON.as_secs()).unwrap_or(i64::MAX);
+        limit::resumes_by_itself(message)
+            || (self.resume_limits && reset_unix.is_some_and(|at| at - self.now_unix() <= horizon))
     }
 
     /// A busy read inside the wait for a turn ([`Self::await_turn_from`]) with
@@ -6946,7 +7708,8 @@ impl<C: Ctl> Session<'_, C> {
     /// parked request, pushed by the server, no screen read — a footer's clock
     /// or a person's draft wakes nothing) — save while the agent is STARTING
     /// (no mode and no busy frame read yet), when the frame that draws its
-    /// footer must be read and the content is waited on; anything else, the
+    /// footer must be read and the content is waited on, and while a draft
+    /// holds the point ([`Self::draft_held`]); anything else, the
     /// content moving (`await seq`).
     fn wait_for_next(
         &mut self,
@@ -7156,18 +7919,27 @@ impl<C: Ctl> Session<'_, C> {
     /// `Instant` set again at a wall second more than [`WAIT_SKEW_S`] from the
     /// one told is told again.
     fn tell_wait(&mut self, opts: &SuperviseOpts) {
-        // Only a wall's retry wait is a next try ([`Due::retry`]): the check
-        // that the worker took the try just typed is told as no plan.
-        let due = self.turn_end_due.as_ref().filter(|d| d.retry);
+        #[cfg(test)]
+        if TELL_EVERY_STEP.with(std::cell::Cell::get) {
+            self.wait_told = None;
+        }
+        // Only a wall's retry wait (the next try) and the short streak's
+        // back-off (a pause) are told ([`Due::wait`], [`WaitKind::told`]):
+        // the check that the worker took the try just typed is told as no
+        // plan.
+        let due = self.turn_end_due.as_ref().filter(|d| d.wait.told());
         let unix = |d: &Due| turn_end_loop::nearest_s(d.unix_ms, 0);
         let told = match (self.wait_told, due) {
             (Some(None), None) => return,
-            (Some(Some(t)), Some(d)) if t.at == d.at && unix(d).abs_diff(t.unix) <= WAIT_SKEW_S => {
+            (Some(Some(t)), Some(d))
+                if t.at == d.at && t.kind == d.wait && unix(d).abs_diff(t.unix) <= WAIT_SKEW_S =>
+            {
                 return;
             }
             _ => due.map(|d| ToldWait {
                 at: d.at,
                 unix: unix(d),
+                kind: d.wait,
             }),
         };
         let Some(host) = opts.idle_host.as_ref() else {
@@ -7176,6 +7948,7 @@ impl<C: Ctl> Session<'_, C> {
         let plan = due.zip(told).map(|(d, t)| WaitPlan {
             at_unix: t.unix,
             why: d.why.clone(),
+            kind: t.kind,
         });
         self.wait_told = Some(told);
         host.waiting(plan);
@@ -7184,20 +7957,28 @@ impl<C: Ctl> Session<'_, C> {
     /// THE SESSION'S SLEEP WATCH: the two clocks read against the marks the
     /// last read left ([`Self::clock_marks`]). When the wall clock has run
     /// ahead of the monotonic one by more than a minute ([`slept_through`])
-    /// the Mac slept that long, and the sleep is the session's AT ONCE: the
-    /// policy's pauses and kept resets move by it ([`TurnEndState::slept`])
-    /// before anything is stamped on the wake's side of it, and the wake's
-    /// settle is placed from THIS read ([`Self::settle_wake`]) — whatever
-    /// reaches the loop first after it, nothing typed into the agent goes
-    /// before the settle falls ([`Self::settling`]). A due the sleep carried
-    /// past is moved to the settle at the next place that can say so
-    /// ([`Self::check_slept`]). Read after every request ([`Self::call`]: a
-    /// sleep spans one, whatever answers it — a busy turn's reads among
-    /// them), at each step of a wait, and where a decision takes its `now`.
-    /// The marks move to now either way. A clock stepped BACK is no sleep.
+    /// the Mac may have slept, and the machine's own count of its sleep
+    /// ([`Self::recount_sleep`]) says how long, where it keeps one (a wall
+    /// clock stepped forward is no sleep; with no count the clocks' lead is
+    /// the sleep, as before the count was read). A sleep past a minute is the
+    /// session's AT ONCE: written in its book between the two reads
+    /// ([`Self::sleeps`], which any turn's done row is read against:
+    /// [`Self::turn_asleep`]), the policy's pauses and kept resets moved by
+    /// it ([`TurnEndState::slept`]) before anything is stamped on the wake's
+    /// side of it, and the wake's settle placed from THIS read
+    /// ([`Self::settle_wake`]) — whatever reaches the loop first after it,
+    /// nothing typed into the agent goes before the settle falls
+    /// ([`Self::settling`]). A due the sleep carried past is moved to the
+    /// settle at the next place that can say so ([`Self::check_slept`]). Read
+    /// after every request ([`Self::call`]: a sleep spans one, whatever
+    /// answers it — a busy turn's reads among them), at each step of a wait,
+    /// and where a decision takes its `now`. The marks move to now either
+    /// way. A clock stepped BACK is no sleep. The first read is the loop's
+    /// first look at the machine's sleep ([`Self::look_at_sleep`]).
     fn watch_sleep(&mut self) {
         let (mono_now, wall_now) = (self.fx.mono(), self.now_unix_ms());
         let Some((mono_then, wall_then)) = self.clock_marks.replace((mono_now, wall_now)) else {
+            self.look_at_sleep(wall_now);
             return;
         };
         let mono_ms =
@@ -7206,11 +7987,114 @@ impl<C: Ctl> Session<'_, C> {
         if !slept_through(wall_ms.div_euclid(1000), mono_ms.div_euclid(1000)) {
             return;
         }
-        let by = u64::try_from(wall_ms.saturating_sub(mono_ms)).unwrap_or(0);
-        self.turn_end.slept(Duration::from_millis(by));
+        let ahead =
+            Duration::from_millis(u64::try_from(wall_ms.saturating_sub(mono_ms)).unwrap_or(0));
+        let by = self
+            .recount_sleep()
+            .map_or(ahead, |counted| counted.min(ahead));
+        let secs = i64::try_from(by.as_secs()).unwrap_or(i64::MAX);
+        if !slept_through(secs, 0) {
+            return;
+        }
+        self.sleeps.add(by, wall_then, wall_now);
+        self.turn_end.slept(by);
         let woke_at = wall_now.div_euclid(1000);
         self.settle_wake(woke_at, mono_now);
         self.slept_at = Some(woke_at);
+    }
+
+    /// THE MACHINE'S COUNT OF ITS SLEEP read again: how long it slept since
+    /// the loop last read the count ([`Self::sleep_count`]); `None` where it
+    /// keeps none (then, or now). The count read is the one the next is set
+    /// against.
+    fn recount_sleep(&mut self) -> Option<Duration> {
+        let now = self.fx.asleep();
+        let counted = self
+            .sleep_count
+            .as_ref()
+            .zip(now.as_ref())
+            .map(|(then, now)| now.asleep.saturating_sub(then.asleep));
+        self.sleep_count = now;
+        counted
+    }
+
+    /// THE LOOP'S FIRST LOOK AT THE MACHINE'S SLEEP, at `now_ms`, once: its
+    /// count, which its watch sets a later count against
+    /// ([`Self::recount_sleep`]), and the system's record of its last sleep,
+    /// written in the book where it ended before this look — a sleep no read
+    /// of this loop's measured ([`SleepBook::place_last`]) — and its wake's
+    /// settle placed from the wake it records ([`Self::settle_wake`]), as
+    /// the loop that measured it placed it: one that falls after this look
+    /// holds what this loop types until then, as it held that loop's. The
+    /// ledger's part, the sleep since the last act ([`Self::seed_sleep`]),
+    /// comes with the seed, set against this look.
+    fn look_at_sleep(&mut self, now_ms: i64) {
+        if self.sleep_look.is_some() {
+            return;
+        }
+        let count = self.fx.asleep();
+        let last = self.fx.last_sleep();
+        // A wake further back than any settle reaches holds nothing.
+        let reach = turn_end_loop::WAKE_SETTLE + turn_end_loop::WAKE_SPREAD;
+        if self.sleeps.place_last(now_ms, last)
+            && let Some((_, woke_ms)) = last
+            && Duration::from_millis(u64::try_from(now_ms - woke_ms).unwrap_or(0)) < reach
+        {
+            let woke = self.instant_of_ms(woke_ms);
+            self.settle_wake(woke_ms.div_euclid(1000), woke);
+            // One that fell before this look is let go.
+            let _ = self.settling();
+        }
+        self.sleep_count.clone_from(&count);
+        self.sleep_look = Some(FirstLook {
+            at_ms: now_ms,
+            count,
+            last,
+        });
+    }
+
+    /// THE SLEEP SINCE THE LAST ACT ON THE BOOKS, which no read of this loop's
+    /// measured (`body`, the ledger text the seed read, at `now_ms`): the
+    /// machine slept the difference between the count the act's row records
+    /// and this loop's own at its first look, on the same boot — the
+    /// system's last sleep where it fell since the act, and the rest between
+    /// the act and that sleep ([`SleepBook::count_since_act`]). Where the row
+    /// holds no count (an older build wrote it), or the count is another
+    /// boot's, nothing is written: the act's turn's done row reads as
+    /// before, but for what the system's record places (data that does not
+    /// exist; it ages out with those books), and the journal says so where it
+    /// matters ([`Self::sleep_unknown`]).
+    fn seed_sleep(&mut self, body: &str, now_ms: i64) {
+        self.look_at_sleep(now_ms);
+        let Some(FirstLook {
+            at_ms: at,
+            count,
+            last,
+        }) = self.sleep_look.clone()
+        else {
+            return;
+        };
+        let act = approvals::last_act_count_in(body, self.setup.sid.as_deref());
+        let since = self.sleeps.count_since_act(
+            at,
+            count.as_ref(),
+            act.as_ref().map(|(ts, c)| (*ts, c.as_ref())),
+            last,
+        );
+        self.sleep_unknown = since.unknown();
+    }
+
+    /// THE SLEEP THE BOOKS COULD NOT COUNT, journaled once
+    /// ([`Self::sleep_unsaid`]): a turn's done row reaching back past this
+    /// loop's first look was read as before the count, whole of any sleep
+    /// before that look but the system's record of its last.
+    fn say_sleep_unknown(&mut self, seq: u64, review: &mut dyn Review) {
+        if let Some(why) = self.sleep_unsaid.take() {
+            review.note(&format!(
+                "SLEEP seq={seq} not counted before this loop's first look ({why}): the turn's \
+                 done row is read whole of it, but for the system's record of its last sleep"
+            ));
+        }
     }
 
     /// The turn-end policy's `now` for a decision: read after the watch
@@ -7556,7 +8440,11 @@ impl<C: Ctl> Session<'_, C> {
     /// countdown) — its deadline is the reset, hours or days off, and the
     /// verdict is a sweep's, which a turn shorter than the sweep never moves
     /// (a person's turn the stub answered at once, measured on 2.1.299: no
-    /// point read until the reset); the point the last such wait woke from,
+    /// point read until the reset); a point a draft holds with nothing due
+    /// ([`Self::draft_held`]), where the person's send or clear is the wake
+    /// (measured on 2.1.289: a `MENU_DIVERTS` badge standing ten minutes after
+    /// the draft was cleared, and after it was sent and answered at once);
+    /// the point the last such wait woke from,
     /// read again unchanged (the verdict and the reading disagree); a point
     /// the loop's reader does not vouch for
     /// ([`aterm_phase::Reading::phase_authoritative`]), e.g. read before the
@@ -7582,6 +8470,7 @@ impl<C: Ctl> Session<'_, C> {
         if self.caps.await_agent != Some(true)
             || self.turn_end.act_in_flight()
             || self.turn_end.waits_on_named_reset()
+            || self.draft_held.is_some()
         {
             return None;
         }
@@ -7619,7 +8508,8 @@ impl<C: Ctl> Session<'_, C> {
     /// since `since` showed only that work
     /// ([`aterm_phase::ScreenReader::background_wait`]) for
     /// [`background_settle`], with no wall, limit episode, held stall, act the
-    /// agent has not taken ([`TurnEndState::act_untaken`]), and only while the
+    /// agent has not taken ([`TurnEndState::act_untaken`]), or credits hold
+    /// ([`Guard::Credits`]; under `cfg`, the policy), and only while the
     /// host [`IdleHost::wants`] a
     /// point; the host's act is journaled (`HOST seq=<n> background <word>`).
     /// Any other read restarts the settle.
@@ -7637,6 +8527,7 @@ impl<C: Ctl> Session<'_, C> {
         &mut self,
         screen: &Screen,
         since: &mut Option<Instant>,
+        cfg: Option<&SupervisorConfig>,
         review: &mut dyn Review,
     ) {
         let reader = self.reader(&screen.rows);
@@ -7693,6 +8584,9 @@ impl<C: Ctl> Session<'_, C> {
             // Nor into the wake's settle: a busy read's request is what sees
             // the sleep there ([`Self::call`]).
             Some(Guard::WakeSettle)
+        } else if cfg.is_some_and(|cfg| self.credits_hold_here(cfg, &screen.rows)) {
+            // Nor onto usage credits the key keeps the session off.
+            Some(Guard::Credits)
         } else {
             None
         };
@@ -7702,14 +8596,16 @@ impl<C: Ctl> Session<'_, C> {
         }
         // Offered: the next guard, whatever it is, is said afresh.
         self.withheld = None;
-        if let Some(line) = host.at_background() {
+        if let Some((line, kind)) = host.at_background() {
             review.note(&format!("HOST seq={} background {line}", screen.seq));
-            // The notice is a turn the host typed: its answer is the
-            // harness's, never the worker's work. A line typed at a break is
-            // the notice or the release that takes it back, and comes with
-            // no kind ([`IdleHost::at_background`]): taken as the notice, so
-            // a release's answer here is continued as before kinds existed.
-            self.host_turn(super::policy::turn_end::HostTurn::Notice, screen.seq);
+            // A turn the host typed: its answer is the harness's, never the
+            // worker's work, and read as the turn it was
+            // ([`IdleHost::at_background`]'s kind): the notice's answer is
+            // never a done report; the release's, the worker's work resumed,
+            // that says done is one, as at an idle point (before, every line
+            // typed here was taken as the notice, and a long answer to a
+            // release that said done was continued).
+            self.host_turn(kind, screen.seq);
             *since = None;
         }
     }
@@ -7720,7 +8616,8 @@ impl<C: Ctl> Session<'_, C> {
     /// generic read of a bare composer is no evidence), read with the
     /// terminal's cursor ([`aterm_phase::read_at`]: Claude Code's `idle` only
     /// at the prompt box holding it), with no box, wall, open limit episode or
-    /// act of the loop's own in flight — nor a limit only the agent's
+    /// act of the loop's own in flight, nor usage credits the key keeps the
+    /// session off ([`Guard::Credits`]) — nor a limit only the agent's
     /// transcript shows ([`Self::standing_holds`], asked last). `true` when
     /// taken (the loop then reads again). The loop asks nothing of the server
     /// while the step runs.
@@ -7815,6 +8712,10 @@ impl<C: Ctl> Session<'_, C> {
             // API the network may not reach yet. The wait offers the point
             // again when the settle falls ([`Self::wait_for_next`]).
             Some(Guard::WakeSettle)
+        } else if self.credits_hold_here(&opts.policy, &point.screen.rows) {
+            // Usage credits carry the session, and the key keeps it on its
+            // subscription: the step's turn would be billed to them.
+            Some(Guard::Credits)
         } else if self.limit.is_none() && !limit_wall && self.standing_holds(host.as_ref()) {
             // A LIMIT ONLY THE TRANSCRIPT SHOWS, asked last, of a step about
             // to be taken: the host's step goes before the decision that
@@ -7887,21 +8788,30 @@ impl<C: Ctl> Session<'_, C> {
             // once: it spends none of the point's count, and keeps it
             // (F1-R9-L1) — only a turn the host typed (awaited, the point
             // over), a step of the wait or another point starts it again.
+            // A MOVE THAT REPEATS A MOVE at the same point spends one, as a
+            // step that moved nothing does (ATERM-KI-1016-1): the point is
+            // the one the last move was said at, so neither moved the
+            // screen, and a word that only ever moves (`adopted` again) was
+            // offered it again at once to the host's own cap.
             let key = host.wants().then(|| self.review_key(point));
-            let had = self
+            let (had, moved_before) = self
                 .host_follows
                 .as_ref()
-                .filter(|(at, _)| key.as_ref() == Some(at))
-                .map_or(0, |(_, n)| *n);
+                .filter(|(at, ..)| key.as_ref() == Some(at))
+                .map_or((0, false), |(_, n, moved)| (*n, *moved));
             let typed = step.as_ref().is_some_and(|s| s.typed.is_some());
             self.host_follows = if stood {
                 key.clone()
                     .filter(|_| step.is_some() && !host.owns_turn_end() && had < HOST_FOLLOW_UPS)
-                    .map(|key| (key, had + 1))
+                    .map(|key| (key, had + 1, false))
+            } else if moved_before {
+                key.clone()
+                    .filter(|_| !typed && had < HOST_FOLLOW_UPS)
+                    .map(|key| (key, had + 1, true))
             } else {
-                key.clone().filter(|_| !typed).map(|key| (key, had))
+                key.clone().filter(|_| !typed).map(|key| (key, had, true))
             };
-            self.host_passed = key.filter(|_| stood && self.host_follows.is_none());
+            self.host_passed = key.filter(|_| (stood || !typed) && self.host_follows.is_none());
         }
         Ok(idle)
     }
@@ -8002,38 +8912,6 @@ fn cut_cells(text: &str, cap: usize) -> (String, bool) {
         out.push(c);
     }
     (out, false)
-}
-
-/// The journal's word for an escalation's post: the reply's own
-/// ([`reply_word`]), except the two answers that mean queued. The server
-/// records a post before it waits, so `ERR timeout id=<n>` (an `ask` under
-/// `--wait=0`) and `ERR fabric <state> id=<n> …` (no bridge up) are
-/// `queued id=<n> (…)`, not refusals.
-fn post_word(r: &CtlReply) -> String {
-    if !r.ok() {
-        let err = r.err_text();
-        let queued = if let Some(rest) = err.strip_prefix("ERR timeout ") {
-            Some((rest, "not landed yet".to_string()))
-        } else if let Some(rest) = err.strip_prefix("ERR fabric ") {
-            let (state, rest) = rest.split_once(' ').unwrap_or((rest, ""));
-            Some((rest, format!("fabric {state}")))
-        } else {
-            None
-        };
-        if let Some((rest, why)) = queued {
-            let mut words = rest.split_whitespace();
-            if let Some(id) = words.next().filter(|w| w.starts_with("id=")) {
-                let more: Vec<&str> = words.collect();
-                let why = if more.is_empty() {
-                    why
-                } else {
-                    format!("{why}, {}", more.join(" "))
-                };
-                return clip(&one_line(&format!("queued {id} ({why})")));
-            }
-        }
-    }
-    reply_word(r)
 }
 
 /// The first `n` bytes of `s` on a character boundary.
@@ -8202,7 +9080,7 @@ pub fn render_phase_and_survey(
     out
 }
 
-/// The lines `phase` / `await-turn` print, read by `reader` (the worker's own
+/// The lines `aterm drive phase` prints, read by `reader` (the worker's own
 /// program's; a caller with no session to ask takes [`aterm_phase::identify`]'s
 /// for the screen): the phase word, then for a prompt its parsed kind,
 /// command, description, one `note <text>` per note row (a Bash box's warning
@@ -8304,8 +9182,11 @@ fn esc_line(effect: Option<CancelEffect>) -> Option<&'static str> {
 /// Which busy rule fired on `rows`, read by `reader`, as `<where>: <rule>`:
 /// Claude Code's [`busy_signal`] (its rules are the only ones a screen with
 /// no reader's grammar is scanned by); another agent's own reader's: its
-/// status row ([`ScreenReader::busy_guard`]), else its reading of the screen.
-/// A Codex's reader reads nothing (aterm reads no Codex screen), so none.
+/// status row ([`ScreenReader::busy_guard`]), else the agent's own
+/// background work its reader names ([`ScreenReader::background_wait`]:
+/// agy's tasks, timers and subagents, Muse Code's backgrounded shells and
+/// monitors), else its reading of the screen. A Codex's reader reads
+/// nothing (aterm reads no Codex screen), so none.
 fn busy_rule(reader: &dyn ScreenReader, rows: &[String]) -> Option<String> {
     match reader.program() {
         Program::Claude | Program::Generic => busy_signal(rows).map(|b| b.to_string()),
@@ -8317,7 +9198,13 @@ fn busy_rule(reader: &dyn ScreenReader, rows: &[String]) -> Option<String> {
             if status_row {
                 return Some("status row: esc to interrupt".to_string());
             }
-            (reader.phase(rows) == Phase::Busy).then(|| "its reader reads it busy".to_string())
+            if reader.phase(rows) != Phase::Busy {
+                return None;
+            }
+            Some(match reader.background_wait(rows) {
+                Some(work) => format!("its own background work: {work}"),
+                None => "its reader reads it busy".to_string(),
+            })
         }
     }
 }
@@ -8329,55 +9216,12 @@ fn busy_rule(reader: &dyn ScreenReader, rows: &[String]) -> Option<String> {
 /// notice, `message=<text> reset=<text|->`; otherwise the last row the worker
 /// said. Each field is cut at 160 characters.
 pub fn event_line(turn: &Turn, python_allow: &[String]) -> String {
-    event_line_as(turn.phase.name(), turn, python_allow, None)
-}
-
-/// `EVENT <word> seq=<n> [complete=<0|1> rows=<n>] <summary>`: the line of
-/// a review point under the phase word given (`idle-no-report` for an idle
-/// point `--mail` waited on in vain), with the brief `--report` read, if any.
-fn event_line_as(
-    word: &str,
-    turn: &Turn,
-    python_allow: &[String],
-    report: Option<ReportBrief>,
-) -> String {
-    match report {
-        Some(brief) => format!(
-            "EVENT {word} seq={} complete={} rows={} {}",
-            turn.screen.seq,
-            u8::from(brief.complete),
-            brief.rows,
-            event_summary(turn, python_allow)
-        ),
-        None => format!(
-            "EVENT {word} seq={} {}",
-            turn.screen.seq,
-            event_summary(turn, python_allow)
-        ),
-    }
-}
-
-/// What `watch --report` adds to an EVENT line: whether `report` found
-/// nothing lost since the manager's turn, and how many rows it holds — and,
-/// for the journal, the ledger turn it counted from (`None` when it started
-/// at no turn, or failed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReportBrief {
-    pub complete: bool,
-    pub rows: usize,
-    pub turn: Option<u64>,
-}
-
-/// The review points `watch --report` counts a report for: the turn ended on
-/// words — idle, a question, a limit notice — not on a box or still busy.
-fn reported(phase: &Phase) -> bool {
-    matches!(phase, Phase::Idle | Phase::Question | Phase::Limited { .. })
-}
-
-/// [`event_line`] with `complete=<0|1> rows=<n>` between the seq and the
-/// summary (`watch --report`); the summary stays the free-text tail.
-pub fn reported_event_line(turn: &Turn, python_allow: &[String], report: ReportBrief) -> String {
-    event_line_as(turn.phase.name(), turn, python_allow, Some(report))
+    format!(
+        "EVENT {} seq={} {}",
+        turn.phase.name(),
+        turn.screen.seq,
+        event_summary(turn, python_allow)
+    )
 }
 
 /// What a point's line says of it, read by the reader the SCREEN names
@@ -8797,13 +9641,15 @@ fn one_line(s: &str) -> String {
         .collect()
 }
 
-/// An informational line on a diagnostic stream (`supervise`'s and
-/// `await-turn`'s stderr): flushed, and a failed write is not the loop's end.
+/// An informational line on a diagnostic stream (the engine tests'
+/// `supervise` and `await_turn`): flushed, and a failed write is not the
+/// loop's end.
+#[cfg(test)]
 fn log_line(log: &mut dyn Write, line: &str) {
     let _ = emit(log, line);
 }
 
-/// Write one line and flush it: the harness reading `watch` wakes per line.
+/// Write one line and flush it: a reader of the loop's lines wakes per line.
 fn emit(out: &mut dyn Write, line: &str) -> Result<(), String> {
     writeln!(out, "{line}")
         .and_then(|()| out.flush())
@@ -8844,36 +9690,22 @@ fn render_prompt(p: &Prompt, esc: Option<&str>, python_allow: &[String]) -> Stri
     out
 }
 
-/// [`render_result`] as `supervise --mail` prints it: after the phase lines,
-/// `report <id> rows=<n>` for an idle point a report was folded into, `report
-/// -` for one no report came for; without a fold, [`render_result`] unchanged.
-pub fn render_result_mail(
+/// The compact result the engine tests' `supervise` ([`Session::supervise`])
+/// answers: the phase lines (read by `reader`, [`render_phase`]), then the
+/// prompt box verbatim, or the last 28 non-blank rows.
+#[cfg(test)]
+pub(crate) fn render_result(
     turn: &Turn,
     reader: &dyn ScreenReader,
     python_allow: &[String],
-    fold: Option<Fold>,
 ) -> String {
-    let mail = match fold {
-        Some(Fold::Report { id, rows }) => format!("report {id} rows={rows}\n"),
-        Some(Fold::NoReport) => "report -\n".to_string(),
-        None => String::new(),
-    };
-    let mut out = render_phase(turn, reader, python_allow);
-    out.push_str(&mail);
-    out.push_str(&render_result_rows(turn));
-    out
-}
-
-/// The compact result `supervise` prints: the phase lines (read by `reader`,
-/// [`render_phase`]), then the prompt box verbatim, or the last 28 non-blank
-/// rows.
-pub fn render_result(turn: &Turn, reader: &dyn ScreenReader, python_allow: &[String]) -> String {
     let mut out = render_phase(turn, reader, python_allow);
     out.push_str(&render_result_rows(turn));
     out
 }
 
 /// The `--` line and the rows under it ([`render_result`]).
+#[cfg(test)]
 fn render_result_rows(turn: &Turn) -> String {
     let mut out = String::from("--\n");
     let rows = &turn.screen.rows;
@@ -8899,42 +9731,6 @@ fn render_result_rows(turn: &Turn) -> String {
     out
 }
 
-impl<C: Ctl> Session<'_, C> {
-    /// Append `<utc stamp> <line>` to the notes file, if one was given: the
-    /// stamp from the door's [`Fx::stamp_ms`], as the journal's. The write is a
-    /// round trip through the door ([`super::tape::doors::NOTES`]): the line
-    /// out, the outcome back — a notes file that cannot be written ends the
-    /// loop, so the outcome is a value it observes.
-    fn append_note(&self, path: Option<&Path>, line: &str) -> Result<(), String> {
-        let stamp_ms = self.fx.stamp_ms();
-        if path.is_none() {
-            return Ok(());
-        }
-        self.fx.exchange(
-            super::tape::doors::NOTES,
-            || line.as_bytes().to_vec(),
-            || append_note_at(path, stamp_ms, line),
-        )
-    }
-}
-
-/// Append `<utc stamp> <line>` to the notes file, if one was given, stamped
-/// `stamp_ms` (Unix milliseconds; a clock before 1970 stamps the epoch).
-fn append_note_at(path: Option<&Path>, stamp_ms: i64, line: &str) -> Result<(), String> {
-    let Some(path) = path else {
-        return Ok(());
-    };
-    use std::io::Write as _;
-    let secs = u64::try_from(stamp_ms.div_euclid(1000)).unwrap_or(0);
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| format!("cannot open notes file {}: {e}", path.display()))?;
-    writeln!(f, "{} {line}", utc_stamp(secs))
-        .map_err(|e| format!("cannot append to notes file {}: {e}", path.display()))
-}
-
 /// `YYYY-MM-DDTHH:MM:SSZ` for a Unix time — `aterm_types::rfc3339`'s
 /// formatter, the workspace's one copy of the calendar.
 #[must_use]
@@ -8951,6 +9747,8 @@ pub use answer::{
 mod approval_loop;
 #[path = "beside.rs"]
 mod beside;
+#[path = "box_head.rs"]
+mod box_head;
 #[path = "claim.rs"]
 mod claim;
 /// The requests a watching-only loop may not send, which a harness tape's
@@ -8973,17 +9771,20 @@ mod setup;
 pub use setup::SessionSetup;
 #[path = "stall.rs"]
 mod stall;
+#[path = "task_mark.rs"]
+mod task_mark;
+pub use task_mark::{HELD_HEAD, STARTUP_HEAD, deadline_attention, mark_task_exited};
 #[path = "turn_end_loop.rs"]
 mod turn_end_loop;
 #[path = "wall_confirm.rs"]
-mod wall_confirm;
+pub(crate) mod wall_confirm;
 /// A ledger's wall's words read back ([`approvals::UsageAttempt::met_ms`]).
 pub(super) use wall_confirm::words_kind;
 #[path = "wall_memory.rs"]
 mod wall_memory;
 pub use turn_end_loop::standing_rules;
-/// The composer's cursor-row guard, for `aterm drive task`'s nudge too, and
-/// the live upgrade's pressed notice (`harness::upgrade_drive`).
+/// The composer's cursor-row guard, for the live upgrade's pressed notice too
+/// (`harness::upgrade_drive`).
 pub(crate) use turn_end_loop::{composer_guard, composer_guard_at};
 
 #[cfg(test)]

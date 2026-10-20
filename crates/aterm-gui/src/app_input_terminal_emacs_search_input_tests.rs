@@ -4,9 +4,9 @@
 use super::terminal_emacs_search_direction;
 #[cfg(unix)]
 use crate::{App, PhysicalPressOwner, SearchRepeatAction, WindowId, term_lock};
-use winit::keyboard::{Key, ModifiersState};
+use aterm_window::keyboard::{Key, ModifiersState};
 #[cfg(unix)]
-use winit::keyboard::{KeyCode, PhysicalKey};
+use aterm_window::keyboard::{KeyCode, PhysicalKey};
 
 fn character(value: &str) -> Key {
     Key::Character(value.into())
@@ -14,9 +14,7 @@ fn character(value: &str) -> Key {
 
 /// Exhaust all 16 modifier subsets for both navigation keys (plus case and
 /// a non-navigation negative control). Only the exact bare-Super subset
-/// qualifies, and only where the hardcoded Cmd suite is live: on Linux
-/// (`HARDCODED_SUPER_CHORDS` off) Super belongs to the desktop and every
-/// subset falls through to the PTY.
+/// (where `HARDCODED_SUPER_CHORDS` is on) or bare-Control subset qualifies.
 #[test]
 fn bare_super_s_r_classifier_is_exhaustive_over_modifier_power_set() {
     let flags = [
@@ -32,7 +30,8 @@ fn bare_super_s_r_classifier_is_exhaustive_over_modifier_power_set() {
                 mods |= flag;
             }
         }
-        let expected = super::HARDCODED_SUPER_CHORDS && mods == ModifiersState::SUPER;
+        let expected = (super::HARDCODED_SUPER_CHORDS && mods == ModifiersState::SUPER)
+            || mods == ModifiersState::CONTROL;
         assert_eq!(
             terminal_emacs_search_direction(&character("s"), mods),
             expected.then_some(true),
@@ -222,4 +221,65 @@ fn claude_classic_and_alt_cmd_r_route_active_grid_and_emit_zero_kitty_bytes() {
     app.route_physical_repeat(wid, alt_key);
     app.release_physical_press(wid, alt_key);
     assert_pty_silent_and_close(pipe);
+}
+
+#[cfg(unix)]
+#[test]
+fn accepting_a_live_composer_match_does_not_write_to_its_program() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::sync::Arc;
+
+    let _serial = crate::control::search_cap_test_guard();
+    let mut pipe = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    // Own both descriptors before any later assertion can unwind. The sink
+    // borrows the write end and never closes it.
+    let _reader = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+    let _writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(pipe[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.windows
+        .get_mut(&wid)
+        .unwrap()
+        .active_terminal
+        .as_mut()
+        .unwrap()
+        .sink = Arc::new(aterm_session::sink::SinkWriter::new(pipe[1]));
+    let term = app.front_terminal(wid).expect("terminal").term.clone();
+    term_lock(&term).process(
+        "────────────────────\r\n> alpha beta\r\n  gamma delta\r\n────────────────────\x1b[3;14H"
+            .as_bytes(),
+    );
+    let cursor = term_lock(&term).cursor();
+    assert_eq!((cursor.row, cursor.col), (2, 13));
+    let ctrl_r = PhysicalKey::Code(KeyCode::KeyR);
+    app.terminal_emacs_search_pressed(wid, ctrl_r, false);
+    app.apply_search_repeat_action(
+        wid,
+        SearchRepeatAction::Edit(crate::app_search::SearchEdit::Insert("beta".into())),
+    );
+    app.release_physical_press(wid, ctrl_r);
+    assert_eq!(app.windows[&wid].search.as_ref().unwrap().matches.len(), 1);
+    app.find_cmd(crate::app_search::FindAction::Accept);
+    assert!(app.windows[&wid].search.is_none());
+    let terminal = term_lock(&term);
+    assert!(terminal.text_selection().has_selection());
+    assert_eq!(
+        (terminal.cursor().row, terminal.cursor().col),
+        (cursor.row, cursor.col)
+    );
+    drop(terminal);
+    let mut byte = [0u8; 1];
+    let read = unsafe { libc::read(pipe[0], byte.as_mut_ptr().cast(), byte.len()) };
+    assert_eq!(read, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }

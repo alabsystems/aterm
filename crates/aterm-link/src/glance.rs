@@ -72,6 +72,21 @@ pub const RESERVED: [&str; 4] = ["subject", "offset", "node", "owner"];
 /// The value a missing token reads as — the same dash `ls` prints.
 pub const ABSENT: &str = "-";
 
+/// The `state=` a NODE's will writes on its presence row: the broker fires it
+/// when the bridge's connection ends without the next incarnation fencing it —
+/// a crash, a `kill -9`, a lost link, an exit. The node is AWAY, not over: its
+/// sessions' rows stay as they were (each reads `away` with it), mail to them
+/// queues on the bus, and a bridge that comes back as the node publishes
+/// `live` above it. A session that is over says so on its own row, `exited`.
+pub const AWAY: &str = "away";
+
+/// Whether a node row's `state=` is its WILL: [`AWAY`], or `gone` as a bridge
+/// before 2026-10-15 wrote the same will.
+#[must_use]
+pub fn is_will(state: &str) -> bool {
+    state == AWAY || state == "gone"
+}
+
 /// One presence row, as read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {

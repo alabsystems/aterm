@@ -11,10 +11,10 @@
 //! row outranks the profile's own `package."*"`. So "this arm is optimized" is
 //! checked here, crate by crate, before the lane spends minutes measuring it.
 //!
-//! THE SOURCE is `targo --unverified test <arm> -p aterm --test fabric_bench
+//! THE SOURCE is `targo --unverified bench <arm> -p aterm --bench fabric_bench
 //! --unit-graph -Z unstable-options`: every unit cargo would compile, with its
 //! resolved profile and its dependency edges, and nothing compiled. The
-//! measured path is what the bench's processes execute: the `fabric_bench` test
+//! measured path is what the bench's processes execute: the `fabric_bench` bench
 //! unit (which holds the in-process broker), the `aterm` binary it launches as
 //! the window and the bridge, and every library either links. A build script
 //! and a proc macro run inside the compiler, not in a measured process, so the
@@ -47,8 +47,8 @@ pub(crate) struct Audit {
 
 /// A package's name out of a cargo package id: `…/crates/aterm-core#0.106.0`
 /// is `aterm-core`, `registry+…#shlex@2.0.1` is `shlex`, and
-/// `…/crates/aterm-window#winit@0.30.13` (a path whose package is named
-/// otherwise) is `winit`. Pure (unit-tested).
+/// `…/crates/aterm-log-shim#log@0.4.32` (a path whose package is named
+/// otherwise) is `log`. Pure (unit-tested).
 fn package_name(pkg_id: &str) -> &str {
     match pkg_id.rsplit_once('#') {
         Some((_, fragment)) if fragment.contains('@') => {
@@ -254,7 +254,7 @@ mod tests {
                 "registry+https://github.com/rust-lang/crates.io-index#shlex@2.0.1",
                 "shlex",
             ),
-            ("path+file:///w/crates/aterm-window#winit@0.30.13", "winit"),
+            ("path+file:///w/crates/aterm-log-shim#log@0.4.32", "log"),
             ("bare", "bare"),
         ] {
             assert_eq!(package_name(id), name, "{id}");
@@ -287,14 +287,14 @@ mod tests {
     fn plan(lib_opt: &str) -> String {
         graph(
             &[
-                unit("aterm", "test", "test", "3", &[1, 2, 5]),    // 0
+                unit("aterm", "bench", "bench", "3", &[1, 2, 5]), // 0
                 unit("aterm-core", "build", "lib", lib_opt, &[3]), // 1
-                unit("aterm", "build", "bin", "3", &[1]),          // 2
+                unit("aterm", "build", "bin", "3", &[1]),         // 2
                 unit("aterm-core", "run-custom-build", "custom-build", "3", &[4]), // 3
                 unit("aterm-core", "build", "custom-build", "0", &[6]), // 4
                 unit("aterm-serde-derive", "build", "proc-macro", "0", &[7]), // 5
-                unit("cc", "build", "lib", "0", &[]),              // 6
-                unit("syn", "build", "lib", "0", &[]),             // 7
+                unit("cc", "build", "lib", "0", &[]),             // 6
+                unit("syn", "build", "lib", "0", &[]),            // 7
             ],
             &[0],
         )
@@ -305,7 +305,11 @@ mod tests {
         let audit = Audit::of(&plan("3")).expect("parses");
         let packages: BTreeSet<&str> = audit.units.iter().map(|u| u.package.as_str()).collect();
         assert_eq!(packages, BTreeSet::from(["aterm", "aterm-core"]));
-        assert_eq!(audit.units.len(), 3, "the test, the binary and the library");
+        assert_eq!(
+            audit.units.len(),
+            3,
+            "the bench, the binary and the library"
+        );
         // cc and syn are at 0 and say nothing: opt is satisfied.
         assert_eq!(audit.refusal(Some("3")), None);
         assert_eq!(

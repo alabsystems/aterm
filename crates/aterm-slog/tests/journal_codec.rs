@@ -189,6 +189,27 @@ fn the_decoder_refuses_what_is_not_a_line() {
     // A record with an unknown key keeps the rest.
     let rec = format!("s1\ts-9f3c0a\t{} future=1\tend=", lines(&sample())[1]);
     assert!(matches!(decode_line(rec.as_bytes()), Ok(Frame::Rec { .. })));
+    // A record of a FUTURE kind is a record of kind `unknown` with its known
+    // fields kept (phase 3B: what a 2B reader makes of `source` and
+    // `mail-landed`, and what this one makes of whatever comes next).
+    let future = "s1\ts-9f3c0a\t9 mark r1 zzz-kind-of-phase-9 state=on skipped=3 src=aterm conf=strong t=5\tend=";
+    match decode_line(future.as_bytes()) {
+        Ok(Frame::Rec { rec, .. }) => {
+            assert_eq!(rec.k, Kind::Unknown);
+            assert_eq!(rec.f.get_word(Key::State), Some("on"));
+            assert_eq!(rec.f.get_u(Key::Skipped), Some(3));
+        }
+        other => panic!("a future kind is still a record: {other:?}"),
+    }
+    // Negative control: this build knows 3B's kinds and phase 5's `task`, so
+    // the same line names them.
+    for k in [Kind::Source, Kind::MailLanded, Kind::Task] {
+        let line = future.replace("zzz-kind-of-phase-9", k.word());
+        match decode_line(line.as_bytes()) {
+            Ok(Frame::Rec { rec, .. }) => assert_eq!(rec.k, k),
+            other => panic!("{k:?}: {other:?}"),
+        }
+    }
     // A complete line is one with its LF.
     let bytes = format!("{good}\n{good}");
     assert_eq!(complete_lines(bytes.as_bytes()).count(), 1);

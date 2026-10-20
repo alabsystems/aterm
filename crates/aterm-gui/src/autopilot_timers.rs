@@ -791,8 +791,12 @@ impl App {
     /// gained focus: every armed timer is derived again from the wall — its
     /// due, its face's time and weekday — with one wall read, and none at
     /// all while nothing is armed. A due already passed fires at the next
-    /// park.
+    /// park. The A/B book's next midnight is read again as well, where the
+    /// book was ever fed (`App::harness_ab_wall_moved`).
     pub(crate) fn on_wall_moved(&mut self) {
+        // The A/B book's calendar too, where the book was ever fed: the
+        // next local midnight on the ledger clock, which a sleep stopped.
+        self.harness_ab_wall_moved();
         // An open menu's or page's offer turn is derived again from the wall
         // too (a sleep left its monotonic due late), and where the wall is
         // past it, the offer is built again now.
@@ -908,9 +912,14 @@ impl App {
             .map(|s| s.ctx.self_id.as_str().to_string());
         if let Some(sid) = sid {
             // The record's line leads with its place, the pane named where
-            // the tab holds two agents; its title names none (§10.3.3, item 9).
-            let place = self.session_place(&sid);
-            let over = self.autopilot_fire_over(local_id);
+            // the tab holds two agents; its title names none (§10.3.3, item
+            // 9). A fire over a pane no agent runs in is about that pane:
+            // named wherever its tab holds another (behaviour-4).
+            let over = self.autopilot_fire_over(local_id, &sid);
+            let place = match over {
+                crate::message_reporters::FireOver::NoAgent { .. } => self.pane_place(&sid).0,
+                _ => self.session_place(&sid),
+            };
             self.record_message(crate::message_reporters::autopilot_timer_ended(
                 &sid,
                 &place,
@@ -922,12 +931,15 @@ impl App {
         }
     }
 
-    /// WHAT THE FIRE FOUND on session `local_id` (§10.2.3 item 8), for its
-    /// record: the window's harness off (no host, the master switch), no
-    /// agent in the tab, the agent's own switch off, a task already done or
-    /// landed (with its stamp), else work the harness wraps up. In that
-    /// order: a switch that supervises nothing outranks what the tab runs.
-    fn autopilot_fire_over(&self, local_id: u64) -> crate::message_reporters::FireOver {
+    /// WHAT THE FIRE FOUND on session `local_id` (`sid`, §10.2.3 item 8),
+    /// for its record: the window's harness off (no host, the master
+    /// switch), no agent in the pane (and whether its tab holds other
+    /// panes, [`Self::pane_place`]: the line then says `this pane`, since
+    /// another may run an agent), the agent's own switch off, a task already
+    /// done or landed (with its stamp), else work the harness wraps up. In
+    /// that order: a switch that supervises nothing outranks what the pane
+    /// runs.
+    fn autopilot_fire_over(&self, local_id: u64, sid: &str) -> crate::message_reporters::FireOver {
         use crate::autopilot::HarnessPosture;
         use crate::message_reporters::FireOver;
         use aterm_agent::harness::acts::TaskFace;
@@ -940,7 +952,9 @@ impl App {
             | HarnessPosture::AgentOff(_) => {}
         }
         let Some(agent) = self.session_agent(local_id) else {
-            return FireOver::NoAgent;
+            return FireOver::NoAgent {
+                split: self.pane_place(sid).1,
+            };
         };
         if let HarnessPosture::AgentOff(agent) = posture.for_agent(Some(agent)) {
             return FireOver::AgentOff(agent);
@@ -964,6 +978,8 @@ impl App {
             TimerChoice::In(minutes) => When::In(minutes),
             TimerChoice::At => When::Clock(self.harness_policy.get().policy.land_at?.minute()),
         };
+        #[cfg(test)]
+        crate::work_counts::timer_resolved();
         resolve(when, wall_ms(), &local_offset_at)
             .ok()
             .map(|resolved| resolved.at_ms)

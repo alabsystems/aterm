@@ -16,6 +16,16 @@
 //! tests drive these models dev-depend on this one, so editing a model here rebuilds this crate
 //! and those tests, never a library.
 
+mod models_engine_corpus;
 mod models_native;
 
+pub use models_engine_corpus::*;
 pub use models_native::*;
+
+// amacs's models (docs/DESIGN-amacs-2026-10-19.md §4.9), one public module
+// each, so the slices that write them never collide here: a test names one as
+// `aterm_models_native::models_amacs_ticket::…`.
+pub mod models_amacs_anchor;
+pub mod models_amacs_proposal;
+pub mod models_amacs_ticket;
+pub mod models_amacs_undo;

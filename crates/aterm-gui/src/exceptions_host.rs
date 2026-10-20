@@ -28,8 +28,8 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use aterm_agent::supervise::StuckSurvey;
 use aterm_agent::supervise::policy::exception::Urgency;
+use aterm_agent::supervise::{StallSeen, StuckSurvey};
 use aterm_core::terminal::repaint_nudge::GiveUp;
 use aterm_messages::exceptions::{Entry, Family, Mode};
 use aterm_messages::need::Horizon;
@@ -74,7 +74,7 @@ const SUPERVISOR_STEADY: Duration = Duration::from_secs(30 * 60);
 /// is handed its whole answer once, whatever the loops have told: the lines an
 /// earlier process left open end with it if no loop of this one names them. Ten
 /// minutes is long past the first point every loop reaches.
-const RESUME_SETTLE: Duration = Duration::from_secs(10 * 60);
+pub(crate) const RESUME_SETTLE: Duration = Duration::from_secs(10 * 60);
 
 /// The `host_noted` marks that THIS process recorded a short volume, one for
 /// each form of its line: the passes' ([`HostNote::DiskLow`]) and the one
@@ -110,6 +110,57 @@ pub(crate) struct SupervisorFail {
     pub(crate) why: String,
     /// The digest line is up.
     pub(crate) raised: bool,
+}
+
+/// A tab's login notices as ONE story (`App::raise_resume_ask`): the row or
+/// record the story is told in now, which the loss's next notice replaces and
+/// the login back closes fixed (`App::close_notice_story`), and the words it
+/// is closed in (its notice's declared fix words; `None` for an ask that
+/// declared none).
+#[derive(Debug)]
+pub(crate) struct NoticeStory {
+    head: aterm_messages::MessageId,
+    back: Option<String>,
+    /// The wall clock (unix ms) of the story's last word: its latest notice
+    /// told, or its ask's end. A story whose row has left the glass goes on
+    /// for [`NOTICE_STORY_SPAN`] from here ([`Self::goes_on`]).
+    pub(crate) last: u64,
+    /// The notices of this story the owner read (folded or dismissed) whose
+    /// rows a later notice replaced, by key, at the wall clock of the read.
+    /// The replaced record no longer keeps its key quiet in the center
+    /// ([`aterm_messages::MessageCenter::supersede_record`] retires it
+    /// `Superseded`), so the story does: a notice the owner read is not raised
+    /// again while its story stands, inside the standing quiet of its read.
+    read: std::collections::BTreeMap<String, u64>,
+}
+
+/// How long a tab's login story waits for its next notice once its row has
+/// left the glass and no login back was told: the standing quiet of a notice
+/// the owner read ([`aterm_messages::need::STANDING_QUIET`]). A loss whose end
+/// no loop told (its loop ended, its tab moved between them) is over by then,
+/// and the next notice is a loss of its own: its own row, never one that
+/// swallows the last.
+pub(crate) const NOTICE_STORY_SPAN: Duration = aterm_messages::need::STANDING_QUIET;
+
+impl NoticeStory {
+    /// Whether the story goes on at wall `unix_ms`: its row still on the
+    /// glass (`live`), or its last word inside [`NOTICE_STORY_SPAN`].
+    fn goes_on(&self, live: bool, unix_ms: u64) -> bool {
+        live || unix_ms < self.last.saturating_add(span_ms(NOTICE_STORY_SPAN))
+    }
+
+    /// Whether `key` is a notice the owner read in this story, still quiet at
+    /// wall `unix_ms` ([`aterm_messages::need::STANDING_QUIET`] from its read).
+    fn keeps_quiet(&self, key: &str, unix_ms: u64) -> bool {
+        self.read.get(key).is_some_and(|&read| {
+            unix_ms < read.saturating_add(span_ms(aterm_messages::need::STANDING_QUIET))
+        })
+    }
+}
+
+/// `span` in whole milliseconds, saturating.
+fn span_ms(span: Duration) -> u64 {
+    u64::try_from(span.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl SupervisorFail {
@@ -198,13 +249,28 @@ impl App {
         // change: lines an earlier process left open, which no loop of this one
         // tells of, end with the first whole answer after they have had time to.
         if !self.resume_swept {
+            // The API outage is a level family too, stated only as tabs
+            // enter and leave the wait: an entry an earlier process left open
+            // would stand for the 14-day expiry where no tab here ever waits.
+            // Its whole answer is given at the first look, and again at the
+            // settle (a seamless successor adopts its predecessor's entries at
+            // Commit, which can come after the first look).
+            if self.resume_looked.is_none() {
+                self.hand_api_outage();
+            }
             let first = *self.resume_looked.get_or_insert(now);
             if now >= first + RESUME_SETTLE {
                 self.resume_swept = true;
                 self.hand_resume_exceptions();
                 self.sweep_resume_asks();
+                self.hand_api_outage();
+                self.restate_long_holds();
             }
         }
+        // The person's long holds: a level answer, stated at the first look
+        // and the settle like the outage's, else only where it moved
+        // (`App::hand_long_holds`).
+        self.hand_long_holds();
         if self.ripening.iter().all(|claim| claim.due > now) {
             return;
         }
@@ -229,6 +295,7 @@ impl App {
             .iter()
             .map(|claim| claim.due)
             .chain(supervisors)
+            .chain(self.long_hold_deadline())
             .min()
     }
 
@@ -307,6 +374,36 @@ impl App {
             // has now ended, so the next time it returns it is news.
             aterm_log::info!("exceptions: {key} filed earlier; its cause has ended");
             self.flush_messages_log_within(crate::messages_host::MESSAGES_FLUSH_UI_WAIT);
+        }
+    }
+
+    /// A config load's word on the settings removed features left behind
+    /// ([`crate::message_reporters::REMOVED_FEATURES`]): each feature `text`
+    /// still configures is an entry naming what replaced it and what the
+    /// feature left on this machine, read off its table, its navigation
+    /// opening the file where the feature's table begins, and one it no longer
+    /// configures ends. The launch and every reload call it; a `text` that does
+    /// not parse changes nothing (its parse error is told on its own).
+    pub(crate) fn note_removed_settings(&mut self, text: &str) {
+        use crate::message_reporters::{
+            REMOVED_FEATURES, removed_setting_entry, removed_setting_key,
+        };
+        let Ok(document) = text.parse::<aterm_toml::edit::DocumentMut>() else {
+            return;
+        };
+        let values = aterm_toml::from_str::<aterm_toml::Value>(text).ok();
+        for feature in REMOVED_FEATURES {
+            if document.get(feature.table).is_some() {
+                let line = table_line(text, feature.table);
+                let left = feature
+                    .left
+                    .zip(values.as_ref().and_then(|v| v.get(feature.table)))
+                    .map(|(left, table)| left(table))
+                    .unwrap_or_default();
+                self.except(&removed_setting_entry(feature, line, &left));
+            } else {
+                self.except_clear(&removed_setting_key(feature));
+            }
         }
     }
 
@@ -532,33 +629,28 @@ impl App {
                     dir.as_deref(),
                 ));
             }
-            HostNote::ResumeException { sid, standing } => {
-                // A `Now` that no escalation of the loop's carries (a lost
-                // login waited at with no account left) is the owner's ask on
-                // the glass while it stands; one the loop escalated (the old
-                // lost login's `/login` and its badge) is that escalation's,
-                // so nothing is said twice. A RENEWABLE login's (its step
-                // `accounts renew <label>`) is no tab's ask: every such tab
-                // is in the machine's one ([`Self::raise_renew_ask`]).
-                let unescalated = standing
+            HostNote::ResumeException {
+                sid,
+                agent,
+                standing,
+            } => {
+                // A `Now` that no escalation of the loop's carries (Claude
+                // Code's lost login carried to the owner's step: the owner's
+                // four-part notice) is the owner's ask on the glass while it
+                // stands; one the loop escalated is that escalation's, so
+                // nothing is said twice.
+                match standing
                     .as_ref()
-                    .filter(|exception| exception.when == Urgency::Now && !exception.escalated);
-                match unescalated.map(|exception| (renew_label(exception), exception)) {
-                    Some((Some(label), _)) => {
-                        self.end_resume_ask(&sid);
-                        self.raise_renew_ask(&sid, &label);
-                    }
-                    Some((None, exception)) => {
-                        self.end_renew_ask(&sid);
-                        self.raise_resume_ask(&sid, exception);
-                    }
-                    None => {
-                        self.end_resume_ask(&sid);
-                        self.end_renew_ask(&sid);
-                    }
+                    .filter(|exception| exception.when == Urgency::Now && !exception.escalated)
+                {
+                    Some(exception) => self.raise_resume_ask(&sid, exception),
+                    None => self.end_resume_ask(&sid),
                 }
                 match standing {
-                    // Only what can wait for the owner's next look is a line.
+                    // What can wait for the owner's next look is a line. A
+                    // notice on the glass is its ask alone: the digest says
+                    // nothing of it beside the ask (Settings > Messages
+                    // lists the ask once).
                     Some(exception) if exception.when == Urgency::Later => {
                         aterm_log::info!(
                             "harness @{sid}: needs a person ({}): {} => {}",
@@ -566,7 +658,7 @@ impl App {
                             exception.why,
                             exception.action
                         );
-                        self.resume_standing.insert(sid, exception);
+                        self.resume_standing.insert(sid, (exception, agent));
                     }
                     Some(_) | None => {
                         self.resume_standing.remove(&sid);
@@ -574,24 +666,42 @@ impl App {
                 }
                 self.hand_resume_exceptions();
             }
-            HostNote::ResumeUnread { sid, minutes } => match minutes {
-                Some(minutes) => {
+            HostNote::LoginBack { sid } => self.close_notice_story(&sid),
+            HostNote::ResumeUnread { sid, agent, stall } => match stall {
+                Some(stall) => {
                     // The second rung of the stall canary (90 minutes of
-                    // background work, 30 of a dialog): aterm's own step is
-                    // stuck on a screen it does not read. A record, once per
-                    // episode, and one error line; the digest waits for the
-                    // third (3 h; an hour).
+                    // background work, 30 of a dialog). A record, once per
+                    // episode, and one log line, in the witness's words; the
+                    // digest waits for the third (3 h; an hour).
                     if self.host_noted.insert(format!("stalled:{sid}")) {
                         let spot = self.upgrade_spot(&sid);
-                        aterm_log::error!(
-                            "harness @{sid}: Claude's own title has said idle for {minutes} min \
-                             over a screen this build does not recognise"
-                        );
-                        self.record_message(message_reporters::stall_unread_record(
-                            &sid,
-                            &spot.place,
-                            minutes,
-                        ));
+                        let record = match stall {
+                            // aterm's own step is stuck on a screen it does
+                            // not read, Claude's own title the witness.
+                            StallSeen::Unread { minutes } => {
+                                aterm_log::error!(
+                                    "harness @{sid}: Claude's own title has said idle for \
+                                     {minutes} min over a screen this build does not recognise"
+                                );
+                                message_reporters::stall_unread_record(&sid, &spot.place, minutes)
+                            }
+                            // The agent's own work, which its reader names,
+                            // has not ended: no fault of aterm's reading.
+                            StallSeen::OwnWork { minutes } => {
+                                aterm_log::warn!(
+                                    "harness @{sid}: {}'s own background work has run {minutes} \
+                                     min under words that stood still",
+                                    agent.product()
+                                );
+                                message_reporters::stall_on_work_record(
+                                    &sid,
+                                    &spot.place,
+                                    agent,
+                                    minutes,
+                                )
+                            }
+                        };
+                        self.record_message(record);
                     }
                 }
                 None => {
@@ -642,7 +752,10 @@ impl App {
                     ),
                     (
                         message_reporters::ACCOUNTS_WINDOW_FULL_KEY,
-                        message_reporters::accounts_window_full_entry(&full),
+                        message_reporters::accounts_window_full_entry(
+                            &full,
+                            self.harness_policy.get().policy.usage_credits,
+                        ),
                     ),
                 ];
                 for (key, entry) in lines {
@@ -728,8 +841,25 @@ impl App {
             }
             // What a layout carries of the tab's agent moved (an in-app
             // `/clear` followed on a quiet desk, LC-1): the crash journal
-            // captures again. Its wake already says so; this says why.
-            HostNote::AgentPublished { .. } => self.crash_journal.note_activity(),
+            // captures again, at once, whatever its write interval says.
+            HostNote::AgentPublished { .. } => self.crash_journal.owe_agent_capture(),
+            // The records' folder the owner's view cannot list: the upgrades
+            // shown stay at its last whole look. Its end is unconditional, so
+            // a line an earlier process left ends at the first listed look.
+            HostNote::UpgradeRecords { unlisted } => match unlisted {
+                Some(dir) => self.except(&message_reporters::upgrade_records_unlisted_entry(&dir)),
+                None => self.except_clear(message_reporters::UPGRADE_RECORDS_UNLISTED_KEY),
+            },
+            // The records the owner's view cannot read that keep a tab as it
+            // stands: what the window shows of those tabs stays as it is. Its
+            // end is unconditional too.
+            HostNote::UpgradeRecordsUnreadable { files } => {
+                if files.is_empty() {
+                    self.except_clear(message_reporters::UPGRADE_RECORDS_UNREADABLE_KEY);
+                } else {
+                    self.except(&message_reporters::upgrade_records_unreadable_entry(&files));
+                }
+            }
             HostNote::UpgradeRuns { sid } => {
                 self.host_noted.remove(&format!("upgrade:{sid}"));
                 // Another tab's upgrade that cannot run keeps the one line.
@@ -816,6 +946,8 @@ impl App {
                 command,
                 marked,
                 lost: known,
+                new_tab,
+                then,
             } => {
                 self.except_clear(&blocked);
                 self.record_message(message_reporters::relaunch_record(
@@ -839,10 +971,11 @@ impl App {
                             &reason,
                             restarted,
                             command.as_deref(),
+                            then,
                         ));
                     } else {
                         self.except(&message_reporters::relaunch_gone_entry(
-                            sid, &spot, &reason, restarted,
+                            sid, &spot, &reason, restarted, new_tab, then,
                         ));
                     }
                 }
@@ -859,6 +992,7 @@ impl App {
                     &reason,
                     restarted,
                     command.as_deref(),
+                    None,
                 ));
             }
             RelaunchSay::Back => self.except_clear(&lost),
@@ -873,7 +1007,14 @@ impl App {
         let standing: Vec<_> = self
             .resume_standing
             .iter()
-            .map(|(sid, exception)| (sid.clone(), exception.clone(), self.upgrade_spot(sid)))
+            .map(|(sid, (exception, agent))| {
+                (
+                    sid.clone(),
+                    exception.clone(),
+                    *agent,
+                    self.upgrade_spot(sid),
+                )
+            })
             .collect();
         self.except_replace(
             Family::Resume,
@@ -885,93 +1026,181 @@ impl App {
     /// so ([`message_reporters::resume_ask`]): its standing ask is posted —
     /// the same words are a duplicate, new ones restate it in place — and
     /// this process marks the tab as one it holds an ask for.
+    ///
+    /// A NOTICE IS SAID ONCE: its key is the tab's and the notice's
+    /// ([`message_reporters::notice_ask_key`]), so the same notice at every
+    /// point the loop tells it is the one row, and one the owner read stays
+    /// quiet while it stands; another notice of the tab's is raised as news.
+    ///
+    /// ONE LOSS, ONE ROW IN SETTINGS ▸ MESSAGES (the owner, 2026-10-19: the
+    /// same lost login listed three times): a tab's notices are one story
+    /// ([`NoticeStory`]). The row a new notice is posted in replaces the
+    /// story's row or record until now — on the glass, withdrawn as its point
+    /// moved on, or read — so the page lists the story once, in its latest
+    /// words ([`aterm_messages::MessageCenter::supersede_record`]); the login
+    /// back closes it fixed ([`Self::close_notice_story`]). A notice the owner
+    /// read stays quiet while its story stands, its row replaced or not
+    /// ([`NoticeStory::keeps_quiet`]). A story whose row left the glass and
+    /// that had no word for [`NOTICE_STORY_SPAN`] is over: the next notice is
+    /// a loss of its own, its own row.
     fn raise_resume_ask(
         &mut self,
         sid: &str,
         exception: &aterm_agent::supervise::policy::exception::Exception,
     ) {
+        let notice = exception.notice.as_ref();
         if self.host_noted.insert(resume_asked_key(sid)) {
             aterm_log::warn!(
-                "harness @{sid}: needs a person now ({}): {} => {}",
+                "harness @{sid}: needs a person now ({}{}): {} => {}",
                 exception.kind.word(),
+                notice.map_or_else(String::new, |n| format!(", notice {}", n.id)),
                 exception.why,
                 exception.action
             );
         }
-        let spot = self.upgrade_spot(sid);
-        self.post_message(message_reporters::resume_ask(sid, &spot, exception));
-    }
-
-    /// THE MACHINE'S ONE RENEW ASK ([`message_reporters::renew_ask`]): tab
-    /// `sid` stands stopped on the ended login `label`. Raised, or restated
-    /// with every tab so stopped and every label to renew, from the marks
-    /// [`RENEW_ASKED`] keeps one per tab. Said once in the log per tab.
-    fn raise_renew_ask(&mut self, sid: &str, label: &str) {
-        let mark = renew_asked_key(sid, label);
-        if !self.host_noted.contains(&mark) {
-            self.host_noted.retain(|m| {
-                m.strip_prefix(RENEW_ASKED)
-                    .is_none_or(|rest| !rest.starts_with(&format!("{sid}\u{1f}")))
-            });
-            self.host_noted.insert(mark);
-            aterm_log::warn!(
-                "harness @{sid}: needs a person now (login): its login {label} ended; renew it"
-            );
+        let key = message_reporters::notice_ask_key(sid, notice.map(|n| n.code));
+        let wall = wall_stamp_now().unix_ms;
+        // A story whose row left the glass and that has had no word for its
+        // span is over (a loss whose end no loop told): this notice is a loss
+        // of its own, and the last keeps its own row.
+        if self
+            .resume_stories
+            .get(sid)
+            .is_some_and(|story| !story.goes_on(self.messages.live(story.head).is_some(), wall))
+        {
+            self.resume_stories.remove(sid);
         }
-        self.post_renew_ask();
-    }
-
-    /// Tab `sid` no longer stands stopped on an ended login: it leaves the
-    /// machine's ask, which is withdrawn, claiming no outcome, once no tab
-    /// is left in it.
-    fn end_renew_ask(&mut self, sid: &str) {
-        let before = self.host_noted.len();
-        self.host_noted.retain(|m| {
-            m.strip_prefix(RENEW_ASKED)
-                .is_none_or(|rest| !rest.starts_with(&format!("{sid}\u{1f}")))
-        });
-        if self.host_noted.len() != before {
-            self.post_renew_ask();
-        }
-    }
-
-    /// The machine's renew ask as the marks now have it: posted (restated in
-    /// place, its key one per machine), or withdrawn with no tab left.
-    fn post_renew_ask(&mut self) {
-        let held: Vec<(String, String)> = self
-            .host_noted
-            .iter()
-            .filter_map(|mark| mark.strip_prefix(RENEW_ASKED)?.split_once('\u{1f}'))
-            .map(|(sid, label)| (sid.to_string(), label.to_string()))
-            .collect();
-        if held.is_empty() {
-            if let Some(id) = self
-                .messages
-                .live_by_key(message_reporters::RENEW_ASK_KEY)
-                .map(|row| row.id)
-            {
-                let _ = self.withdraw_message(id);
-            }
+        // A notice the owner read in this story, its row replaced since, is
+        // not raised again while the story stands (the center's own quiet for
+        // it ended with the replacement): nothing posted, and the tab's other
+        // ask withdrawn, as the center's quiet return does.
+        if let Some(story) = self.resume_stories.get_mut(sid)
+            && story.keeps_quiet(&key, wall)
+            && self.messages.live_by_key(&key).is_none()
+        {
+            story.last = wall;
+            self.withdraw_resume_asks(sid, Some(&key));
             return;
         }
-        let mut labels: Vec<String> = held.iter().map(|(_, label)| label.clone()).collect();
-        labels.sort();
-        labels.dedup();
-        let places: Vec<String> = held
-            .iter()
-            .map(|(sid, _)| self.upgrade_spot(sid).place)
+        let spot = self.upgrade_spot(sid);
+        let msg = message_reporters::resume_ask(sid, &spot, exception);
+        let back = msg.finished.clone();
+        let head = self.notice_story_head(sid);
+        // The head's read, taken before a replacement retires it again.
+        let head_read = head.and_then(|head| {
+            let rec = self.messages.log().get(head)?;
+            matches!(
+                rec.retired(),
+                Some(aterm_messages::Retired::Folded | aterm_messages::Retired::Dismissed)
+            )
+            .then_some((rec.key.clone()?, rec.retired_unix_ms?))
+        });
+        let id = self.post_message(msg);
+        // A later row tells the story on (a duplicate is the head itself, and
+        // a notice the owner read in this story, kept quiet, comes back as
+        // its earlier record: neither replaces anything).
+        if head.is_none_or(|head| head < id) {
+            let mut read = self
+                .resume_stories
+                .remove(sid)
+                .map(|story| story.read)
+                .unwrap_or_default();
+            if let Some(head) = head
+                && self.supersede_record(head, id)
+                && let Some((key, at)) = head_read
+            {
+                read.insert(key, at);
+            }
+            self.resume_stories.insert(
+                sid.to_string(),
+                NoticeStory {
+                    head: id,
+                    back,
+                    last: wall,
+                    read,
+                },
+            );
+        } else if let Some(story) = self.resume_stories.get_mut(sid) {
+            story.last = wall;
+        }
+        self.withdraw_resume_asks(sid, Some(&key));
+    }
+
+    /// The row or record tab `sid`'s notices are told in now: the story this
+    /// process holds, else the newest ask of the tab an earlier process
+    /// carried here.
+    fn notice_story_head(&self, sid: &str) -> Option<aterm_messages::MessageId> {
+        if let Some(story) = self.resume_stories.get(sid) {
+            return Some(story.head);
+        }
+        let base = message_reporters::resume_ask_key(sid);
+        self.messages
+            .live_rows()
+            .filter(|row| {
+                row.msg
+                    .key
+                    .as_deref()
+                    .is_some_and(|key| is_tab_ask_key(key, &base))
+            })
+            .map(|row| row.id)
+            .max()
+    }
+
+    /// TAB `sid`'S LOST LOGIN IS BACK ([`HostNote::LoginBack`]): the story its
+    /// notices told ends FIXED, as one row — a row still on the glass resolves
+    /// `Ok` in its declared fix words, a record whose row already left
+    /// (withdrawn as the agent went back to work, or read) is closed fixed in
+    /// them ([`aterm_messages::MessageCenter::fix_record`]) — and the next
+    /// loss is a story of its own, news even where the owner read this one.
+    /// A tab with no story moves nothing.
+    fn close_notice_story(&mut self, sid: &str) {
+        let Some(story) = self.resume_stories.remove(sid) else {
+            return;
+        };
+        self.host_noted.remove(&resume_asked_key(sid));
+        if self.messages.live(story.head).is_some() {
+            let _ = self.resolve_message(story.head, aterm_messages::Outcome::Ok);
+        } else if let Some(back) = story.back
+            && self
+                .messages
+                .fix_record(story.head, &back, wall_stamp_now(), Instant::now())
+        {
+            self.sync_messages();
+        }
+        aterm_log::info!("harness @{sid}: the login is back; its notice reads fixed");
+    }
+
+    /// Withdraws tab `sid`'s live asks ([`message_reporters::notice_ask_key`]
+    /// under its [`message_reporters::resume_ask_key`]) but the one keyed
+    /// `keep`, claiming no outcome.
+    fn withdraw_resume_asks(&mut self, sid: &str, keep: Option<&str>) {
+        let base = message_reporters::resume_ask_key(sid);
+        let left: Vec<aterm_messages::MessageId> = self
+            .messages
+            .live_rows()
+            .filter(|row| {
+                row.msg
+                    .key
+                    .as_deref()
+                    .is_some_and(|key| is_tab_ask_key(key, &base) && Some(key) != keep)
+            })
+            .map(|row| row.id)
             .collect();
-        self.post_message(message_reporters::renew_ask(&labels, &places));
+        for id in left {
+            let _ = self.withdraw_message(id);
+        }
     }
 
     /// The tab's ask is over (the loop's point no longer holds it, or the loop
     /// ended): its row is withdrawn, claiming no outcome — the loop says the
-    /// point moved on, not that the owner's step was taken.
+    /// point moved on, not that the owner's step was taken. Its story stands
+    /// ([`NOTICE_STORY_SPAN`] from this last word): the loss's next notice
+    /// tells it on, and the login back closes it fixed.
     fn end_resume_ask(&mut self, sid: &str) {
         self.host_noted.remove(&resume_asked_key(sid));
-        let key = message_reporters::resume_ask_key(sid);
-        if let Some(id) = self.messages.live_by_key(&key).map(|row| row.id) {
-            let _ = self.withdraw_message(id);
+        self.withdraw_resume_asks(sid, None);
+        if let Some(story) = self.resume_stories.get_mut(sid) {
+            story.last = wall_stamp_now().unix_ms;
         }
     }
 
@@ -979,7 +1208,7 @@ impl App {
     /// tells of: withdrawn at the resume family's settle, once every loop has
     /// had its first point ([`RESUME_SETTLE`]), as the digest's lines end then.
     fn sweep_resume_asks(&mut self) {
-        let held: std::collections::BTreeSet<String> = self
+        let held: Vec<String> = self
             .host_noted
             .iter()
             .filter_map(|mark| mark.strip_prefix(RESUME_ASKED))
@@ -990,23 +1219,21 @@ impl App {
             .messages
             .live_rows()
             .filter(|row| {
-                row.msg
-                    .key
-                    .as_deref()
-                    .is_some_and(|key| key.starts_with(&prefix) && !held.contains(key))
+                row.msg.key.as_deref().is_some_and(|key| {
+                    key.starts_with(&prefix) && !held.iter().any(|base| is_tab_ask_key(key, base))
+                })
             })
             .map(|row| row.id)
             .collect();
         for id in left {
             let _ = self.withdraw_message(id);
         }
-        // The machine's renew ask an earlier process left, with no tab of
-        // this one's in it.
-        if !self.host_noted.iter().any(|m| m.starts_with(RENEW_ASKED))
-            && let Some(id) = self
-                .messages
-                .live_by_key(message_reporters::RENEW_ASK_KEY)
-                .map(|row| row.id)
+        // The machine's renew ask an earlier build left: no build raises it
+        // any more (a lost login is its tab's notice).
+        if let Some(id) = self
+            .messages
+            .live_by_key(message_reporters::RENEW_ASK_KEY)
+            .map(|row| row.id)
         {
             let _ = self.withdraw_message(id);
         }
@@ -1305,7 +1532,7 @@ impl App {
         #[cfg(test)]
         DIGEST_MOVES.with(|c| c.set(c.get() + 1));
         self.publish_native_messages_state_if_due(Instant::now());
-        self.refresh_operator_status_item();
+        self.mark_status_dirty();
         self.note_message_rule();
     }
 
@@ -1366,6 +1593,26 @@ impl App {
     }
 }
 
+/// The 1-based line of `text` where `table` begins, for the editor the entry
+/// opens: its first header (`[table]`, `[table.sub]`, `[[table.sub]]`), or,
+/// above every header, its first key (`table.key = …`, `table = { … }`).
+fn table_line(text: &str, table: &str) -> Option<u32> {
+    let names = |rest: &str, ends: &[char]| {
+        rest.strip_prefix(table)
+            .is_some_and(|after| after.trim_start().starts_with(ends))
+    };
+    let mut above_headers = true;
+    let at = text.lines().position(|line| {
+        let line = line.trim_start();
+        if let Some(header) = line.strip_prefix('[') {
+            above_headers = false;
+            return names(header.trim_start_matches('[').trim_start(), &[']', '.']);
+        }
+        above_headers && names(line, &['.', '='])
+    })?;
+    u32::try_from(at + 1).ok()
+}
+
 /// The `host_noted` key that says THIS process told of a tab's relaunch line.
 fn relaunch_told_key(sid: &str) -> String {
     format!("relaunch:{sid}")
@@ -1380,29 +1627,12 @@ fn resume_asked_key(sid: &str) -> String {
     format!("{RESUME_ASKED}{sid}")
 }
 
-/// The stem of a tab's mark in the machine's renew ask (`host_noted`).
-const RENEW_ASKED: &str = "renew-ask:";
-
-/// Tab `sid`'s mark in the machine's renew ask, stopped on `label`'s ended
-/// login: the two split by a unit separator, which neither holds.
-fn renew_asked_key(sid: &str, label: &str) -> String {
-    format!("{RENEW_ASKED}{sid}\u{1f}{label}")
-}
-
-/// The label a renewable login's exception asks to renew: its step is
-/// `aterm_agent::supervise::policy::exception::RENEW_STEP` and a label.
-/// `None` for any other exception's step.
-fn renew_label(exception: &aterm_agent::supervise::policy::exception::Exception) -> Option<String> {
-    use aterm_agent::supervise::policy::outlook::ExceptionKind;
-    if exception.kind != ExceptionKind::Login {
-        return None;
-    }
-    exception
-        .action
-        .strip_prefix(aterm_agent::supervise::policy::exception::RENEW_STEP)?
-        .strip_suffix('.')
-        .filter(|label| aterm_agent::harness::accounts::admissible_label(label))
-        .map(str::to_string)
+/// Whether `key` is one of a tab's asks, whose own key is `base`
+/// ([`message_reporters::resume_ask_key`]): that key, or a notice's under it
+/// ([`message_reporters::notice_ask_key`]).
+fn is_tab_ask_key(key: &str, base: &str) -> bool {
+    key.strip_prefix(base)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
 /// Whether `key` is a `harness.supervisor.<subject>.not-back|gone|lost|
@@ -1421,7 +1651,6 @@ mod tests {
     use aterm_messages::need::{Reason, Then, Why};
 
     use crate::App;
-    use crate::app_presence::presence_regrids;
     use crate::messages_host::message_regrids;
 
     fn tab_one() -> Entry {
@@ -1444,31 +1673,57 @@ mod tests {
     /// LC-1 (ATERM-KI-1015-1): THE HOST'S WORD THAT WHAT A RESTORE CARRIES OF
     /// A TAB'S AGENT MOVED OWES THE CRASH JOURNAL A CAPTURE — its conversation
     /// followed on a desk that draws nothing more, the image a crash leaves
-    /// names it — and says nothing. NEGATIVE CONTROL: another note owes none.
+    /// names it — and says nothing. AT ONCE, inside the write interval
+    /// (ATERM-KI-1016-1): held to it, a crash within 2 s of a `/clear` the
+    /// host had followed left the image naming the conversation the agent had
+    /// left, and the next launch resumed that one and typed its carry-on into
+    /// it. NEGATIVE CONTROL: another note owes none, and plain activity waits
+    /// for the interval.
+    #[cfg(unix)]
     #[test]
     fn an_agent_publication_owes_the_crash_journal_a_capture() {
         let mut app = App::headless_for_test();
-        let _ = app.crash_journal.take_dirty();
+        let dir = crate::crash_journal::tests::scratch("cj-published");
+        app.crash_journal = crate::crash_journal::Lane::new(
+            Some(dir.path().to_path_buf()),
+            crate::crash_journal::tests::reaped_pid(),
+        );
+        let t0 = std::time::Instant::now();
+        assert!(app.crash_journal.offer(
+            crate::crash_journal::fixtures::layout(&[("/a", "claude")]),
+            Vec::new(),
+            t0
+        ));
+        let inside = t0 + std::time::Duration::from_millis(300);
         app.note_harness_host(crate::harness_host::HostNote::SupervisorSteady {
             sid: "s-x".to_string(),
         });
         assert!(!app.crash_journal.take_dirty(), "another note owes none");
+        app.crash_journal.note_activity();
+        assert!(
+            !app.crash_journal.capture_due(inside),
+            "plain activity waits for the interval"
+        );
         let said = app.messages.digest().len();
         app.note_harness_host(crate::harness_host::HostNote::AgentPublished {
             sid: "s-x".to_string(),
         });
-        assert!(app.crash_journal.take_dirty(), "a capture owed");
+        assert!(
+            app.crash_journal.capture_due(inside),
+            "a capture owed now, inside the interval"
+        );
         assert_eq!(app.messages.digest().len(), said, "nothing said");
+        app.crash_journal = crate::crash_journal::Lane::inert();
     }
 
     /// THE DIGEST COSTS THE TERMINAL NOTHING (the Row Law, clause 1): post,
     /// restate, family pass, clear, dismiss — the band's re-grid counter, the
-    /// presence row's, the committed row count and the window's chrome rows do
-    /// not move once, in a real `App`.
+    /// committed row count and the window's chrome rows do not move once, in a
+    /// real `App` (presence owns no row to re-grid).
     #[test]
     fn a_digest_costs_no_regrid() {
         let mut app = App::headless_for_test();
-        let (message, presence) = (message_regrids(), presence_regrids());
+        let message = message_regrids();
         let rows = app.message_band_rows;
         // The upgrade's rows are a LEVEL family (a pass, never an event); the
         // privacy card's is an EVENT family.
@@ -1491,7 +1746,6 @@ mod tests {
         app.sync_messages();
         assert!(app.messages.digest().is_empty());
         assert_eq!(message_regrids(), message, "no band re-grid");
-        assert_eq!(presence_regrids(), presence, "no presence re-grid");
         assert_eq!(
             app.message_band_rows, rows,
             "the pane's chrome rows never moved"
@@ -1764,7 +2018,7 @@ mod tests {
         );
         assert_eq!(
             app.status_item_chrome_line(),
-            "statusitem title=\u{276f}\u{2022} exceptions=1 warnings=0",
+            "statusitem title=\u{276f}\u{2022} needs=0 stuck=0 exceptions=1 fleet=off",
             "the menu-bar cue an agent can read"
         );
     }

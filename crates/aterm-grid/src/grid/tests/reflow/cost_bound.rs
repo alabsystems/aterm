@@ -7,10 +7,11 @@
 //! lock, O(session history); on the GUI main thread that freezes the UI. These tests count the
 //! history lines a resize rewraps synchronously (`count_scrollback_reflow_sync_lines`, at the
 //! synchronous site in `grid/reflow.rs`) rather than timing it:
-//! `Grid::resize_offloading_scrollback` rewraps none.
+//! `Grid::resize_offloading_scrollback` rewraps only the ring's newest lines it holds back, at most
+//! `HOLD_BACK_SCREENS` screens of cells.
 
 use super::super::super::*;
-use crate::test_counters::take_scrollback_reflow_sync_lines;
+use crate::test_counters::{take_handback_history_reads, take_scrollback_reflow_sync_lines};
 use aterm_scrollback::{Scrollback, ScrollbackStorage};
 
 /// A `rows`×`cols` grid over a tiered store with a `ring`-line ring.
@@ -38,6 +39,23 @@ fn tiered_grid_with_short_history(rows: u16, cols: u16, ring: usize, n: usize) -
     grid
 }
 
+/// [`tiered_grid_with_short_history`] with an 8-line ring, whose newest
+/// history line is longer than the ring and the screen together and starts
+/// further up than a width change walks to bring a line's head onto the
+/// screen (`Grid::head_walk`, four screens): the ring holds only its
+/// continuation rows, so a width change's detach holds no line back, reveals
+/// none, and the whole history is away with the job while it runs.
+fn tiered_grid_with_history_away(rows: u16, cols: u16, n: usize) -> Grid {
+    let mut grid = tiered_grid_with_short_history(rows, cols, 8, n);
+    grid.set_cursor(rows - 1, 0);
+    for _ in 0..usize::from(cols) * (5 * usize::from(rows) + 8 + 6) {
+        grid.write_char_wrap('y');
+    }
+    grid.line_feed();
+    grid.carriage_return();
+    grid
+}
+
 /// A grid whose bulk history is in the tiered store: its 8-line ring spills most scroll-off there.
 fn tiered_grid_with_deep_history(rows: u16, cols: u16, n: u16) -> Grid {
     let mut grid = tiered_grid(rows, cols, 8);
@@ -56,40 +74,69 @@ fn tiered_grid_with_deep_history(rows: u16, cols: u16, n: u16) -> Grid {
     grid
 }
 
-/// The offloaded resize rewraps zero history lines synchronously: the tiered store detaches and
-/// the ring history rides the job as `Line`s.
+/// The offloaded resize rewraps synchronously only the ring's newest lines it holds back, at most
+/// `HOLD_BACK_SCREENS` screens of cells at the larger size: the tiered store detaches and the rest
+/// of the ring history rides the job as `Line`s.
 #[test]
-fn offloaded_resize_synchronous_rewrap_is_zero() {
+fn offloaded_resize_rewraps_only_the_lines_it_holds_back() {
+    // Normalize the public inputs before deciding whether there is a width
+    // change or budgeting the job. Skinny grids exercise both full u16 input
+    // domains while retaining only 4096 cells, not a 4096-square allocation.
+    for (rows, cols, requested_rows, requested_cols) in [
+        (1, crate::MAX_GRID_COLS, 0, u16::MAX),
+        (crate::MAX_GRID_ROWS, 1, u16::MAX, 0),
+    ] {
+        let mut bounded = tiered_grid(rows, cols, 1);
+        bounded.write_char('x');
+        assert!(
+            bounded
+                .resize_offloading_scrollback(requested_rows, requested_cols)
+                .is_none(),
+            "the normalized size is unchanged, so no stale-width job is made"
+        );
+        assert_eq!((bounded.rows(), bounded.cols()), (rows, cols));
+        assert_eq!(
+            bounded.row(0).and_then(|r| r.get(0)).map(|c| c.char()),
+            Some('x')
+        );
+        bounded.assert_invariants();
+    }
+
     let (rows, cols) = (24u16, 80u16);
-    let mut grid = tiered_grid_with_deep_history(rows, cols, 2000);
+    let mut grid = tiered_grid(rows, cols, 1000);
+    for i in 0..3000 {
+        short_line(&mut grid, rows, &format!("L{i}-{}", "x".repeat(70)));
+    }
     let ring_before = grid.ring_buffer_scrollback();
-    assert!(
-        ring_before > 0,
-        "precondition: ring scrollback exists (got {ring_before}) — otherwise \
-         the zero below would be vacuous for the ring half of the claim"
+    assert_eq!(
+        ring_before, 1000,
+        "precondition: the ring is full, far past what the detach holds back"
     );
+    let history_before = grid.scrollback_lines();
 
     let _ = take_scrollback_reflow_sync_lines(); // reset
     let pending = grid
         .resize_offloading_scrollback(rows, cols / 2)
         .expect("a width change with a tiered store yields an offload job");
     let sync = take_scrollback_reflow_sync_lines();
+    // `HOLD_BACK_SCREENS` screens of 24 x 80 cells, one-row lines at 80 columns.
+    let held = crate::grid::scrollback_offload::HOLD_BACK_SCREENS * usize::from(rows);
     assert_eq!(
-        sync, 0,
-        "the offloaded resize must rewrap NO history lines synchronously — the \
-         ring history rides the job (RFL-1), the tiered store is detached"
+        sync, held,
+        "the offloaded resize rewraps the lines it holds back and no other history \
+         line synchronously: the rest of the ring rides the job (RFL-1), the tiered \
+         store is detached"
     );
-    assert!(
-        pending.line_count() > 1000 + ring_before,
-        "the job carries BOTH tiers: deep tiered history plus the {ring_before} \
-         ring lines (line_count = {})",
-        pending.line_count()
+    assert_eq!(
+        pending.line_count(),
+        history_before - held,
+        "the job carries the store's history and the ring's lines past the held ones"
     );
 
     grid.reattach_reflowed_scrollback(pending.reflow());
     assert!(
         grid.scrollback_lines() > 1000,
-        "history preserved after the zero-synchronous round trip"
+        "history preserved after the round trip"
     );
     grid.assert_invariants();
 }
@@ -474,7 +521,7 @@ fn abort_reclamps_the_viewport_when_the_staged_window_output_is_discarded() {
 #[test]
 fn offload_window_reader_who_moved_then_returned_to_live_chose_it() {
     let (rows, cols) = (10u16, 80u16);
-    let mut grid = tiered_grid_with_short_history(rows, cols, 8, 500);
+    let mut grid = tiered_grid_with_history_away(rows, cols, 500);
     grid.scroll_display(150);
 
     let pending = grid
@@ -506,11 +553,12 @@ fn offload_window_reader_who_moved_then_returned_to_live_chose_it() {
     grid.assert_invariants();
 }
 
-/// `n` short history lines, the reader at `offset`, then detached for a width change: nothing is
-/// attached above the viewport (short lines rewrap into nothing, and the detach lifts the ring).
+/// `n` short history lines and a long one, the reader at `offset`, then detached for a width
+/// change: nothing is attached above the viewport (the detach holds no line back and lifts the
+/// ring, see [`tiered_grid_with_history_away`]).
 fn detached_with_reader_at(offset: i32, n: usize) -> (Grid, PendingScrollbackReflow) {
     let rows = 10u16;
-    let mut grid = tiered_grid_with_short_history(rows, 80, 8, n);
+    let mut grid = tiered_grid_with_history_away(rows, 80, n);
     grid.scroll_display(offset);
     let pending = grid
         .resize_offloading_scrollback(rows, 60)
@@ -915,4 +963,56 @@ fn a_reflow_windows_cap_is_logged_at_its_first_drop_and_its_close() {
         capped[1]
     );
     grid.assert_invariants();
+}
+
+/// The synchronous half of an offloaded width change reads history to lay
+/// the screen's rows out where the rows hand-back puts them
+/// (`Grid::prepare_rewrap`): the head of the line the screen's top row
+/// continues, brought onto the screen, up to four screens up. Past that the
+/// line is laid out from the screen's top, so what it reads is bounded by the
+/// screen, never by the line: a line 5000 rows long reads what one 500 rows
+/// long does. Walking to the head of any line, the caller's thread spent
+/// 35 ms on a 15000-row line (one `cat` of a minified file) against 0.05 ms
+/// before the walk.
+#[test]
+fn offloaded_width_change_reads_history_bounded_by_the_screen() {
+    let (rows, cols) = (24u16, 80u16);
+    let reads = |line_rows: usize| {
+        let mut grid = tiered_grid_with_short_history(rows, cols, 8, 200);
+        grid.set_cursor(rows - 1, 0);
+        let letters = b"abcdefghijklmnopqrstuvwxyz";
+        for i in 0..line_rows * usize::from(cols) {
+            grid.write_char_wrap(char::from(letters[i % letters.len()]));
+        }
+        grid.carriage_return();
+        grid.line_feed();
+        for c in "$ ".chars() {
+            grid.write_char(c);
+        }
+        assert!(
+            grid.row(0).is_some_and(|row| row.is_wrapped()),
+            "precondition: the screen's top row continues the line"
+        );
+        let _ = take_handback_history_reads();
+        let mut job = grid.resize_offloading_scrollback(rows, cols - 1);
+        let read = take_handback_history_reads();
+        while let Some(pending) = job {
+            job = grid.reattach_reflowed_scrollback_or_redetach(pending.reflow());
+        }
+        grid.assert_invariants();
+        read
+    };
+    let walk = 4 * usize::from(rows);
+    let near = reads(40);
+    assert!(
+        near > 0 && near <= walk,
+        "a head 17 rows up is read and brought onto the screen: {near}"
+    );
+    let far = reads(500);
+    assert!(far <= walk + usize::from(rows), "{far}");
+    assert_eq!(
+        reads(5000),
+        far,
+        "what it reads does not grow with the line"
+    );
 }

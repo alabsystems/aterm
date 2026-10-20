@@ -1,0 +1,13 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# A settled turn is dated when it came to rest (dur_ms=1000), however late
+# the wake.
+see busy
+half
+half
+see idle
+elapse
+elapse
+elapse
+wake
+expect open t1 turn
+expect close t1 turn out=done dur_ms=1000 at=1000

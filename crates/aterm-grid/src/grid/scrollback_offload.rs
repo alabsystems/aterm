@@ -8,8 +8,10 @@
 //! synchronously, O(session history) under the session's `term` mutex.
 //! [`Grid::resize_offloading_scrollback`] instead detaches the tiered
 //! [`ScrollbackStorage`] in O(1) and lifts the ring's scrollback rows into the
-//! job as [`Line`]s, so the synchronous reflow touches only the viewport. The
-//! returned `Send` [`PendingScrollbackReflow`] is rewrapped off the lock
+//! job as [`Line`]s, all but the newest whole lines within
+//! [`HOLD_BACK_SCREENS`] screens of cells, so the synchronous reflow touches
+//! only the viewport and those held-back lines. The returned `Send`
+//! [`PendingScrollbackReflow`] is rewrapped off the lock
 //! ([`PendingScrollbackReflow::reflow`], or budgeted
 //! [`PendingScrollbackReflow::reflow_step`] increments where there is no worker
 //! thread, as in wasm) and re-attached under a brief lock with
@@ -19,24 +21,69 @@
 //! truncated as consumed, and completed logical runs are re-compressed onto its
 //! back, so a step holds O(step budget + one logical run) uncompressed.
 //!
-//! While a reflow is in flight the grid has no tiered store and no ring
-//! scrollback, so new scroll-off fills the empty ring and then the lazy buffer
-//! (`scrollback_detached_for_reflow`), flushed on re-attach. Re-attach restores
-//! [old history | old ring history | window output | live ring] (see
-//! [`Grid::reattach_ring_history`]). One detach is in flight at a time: a
-//! racing resize detaches nothing and rewraps only the ring. An erase during
-//! the window (`scrollback_clear_gen`) drops the stale store; the reader's
-//! scroll position rides `prev_offset`, restored unless `detach_live_bottom_gen`
-//! shows they went to the live bottom meanwhile. A control-socket reader
-//! (`search`/`text`/`lines`) sees only the ring during the window; the
-//! `content_gen` bump on re-attach invalidates its cache.
+//! While a reflow is in flight the grid has no tiered store; its ring holds
+//! the held-back lines, and new scroll-off fills the ring behind them and then
+//! the lazy buffer (`scrollback_detached_for_reflow`), flushed on re-attach.
+//! Re-attach restores [old history | old ring history | held-back lines and
+//! window output | live ring] (see [`Grid::reattach_ring_history`]). One detach
+//! is in flight at a time: a racing resize detaches nothing and rewraps only
+//! the ring. An erase during the window (`scrollback_clear_gen`) drops the
+//! stale store; the reader's scroll position rides `prev_offset`, restored
+//! unless `detach_live_bottom_gen` shows they went to the live bottom
+//! meanwhile. A control-socket reader (`search`/`text`/`lines`) sees only the
+//! ring during the window; the `content_gen` bump on re-attach invalidates its
+//! cache.
+//!
+//! A resize inside the window reveals, pulls down and refills from the history
+//! the grid holds (the held-back lines, the window's output) as the
+//! synchronous resize does. What is proven: over a ring that holds more than
+//! the window holds back (the shipped ring is 1000 rows), a drag that owes the
+//! re-attach nothing ends with the history, the screen and the reader's place
+//! of the plain resize, with output, a prompt redrawn at the cursor or from
+//! rows above (CUU, CR, ED 0), an addressed write or a cleared screen after
+//! every step (`random_offloaded_drags_over_a_full_ring_end_where_the_plain_resize_does`,
+//! `a_prompt_redrawn_from_rows_above_finds_the_rows_the_resize_pulled_down`),
+//! and fewer than one drag in fifty owes anything.
+//!
+//! Fallback: when the held-back lines run out (a ring that holds less than
+//! the drag reveals, so the rest sits in the detached store; a newest line
+//! longer than the budget; a drag that grows past [`HOLD_BACK_SCREENS`]
+//! screens), the rows a resize wanted from the job's
+//! history are owed ([`FillDebt`]): blank under the screen until the
+//! re-attach pulls them down over those blanks, where the synchronous resize
+//! put them. Output, ED 0, DL, IL and a move that follows the content (DECRC,
+//! the 1049 restore, VT52 cursor up and down, the reverse wrap) leave the debt
+//! standing, and a later width change lays the rows out with the owed rows
+//! above its window, not among its blank rows (`Grid::prepare_rewrap`); ED 2,
+//! DECSED 2, a scroll (SU), absolute cursor positioning to another row and a
+//! width change that pushes rows off the bottom drop it, as the screen then
+//! holds what the program drew, and an erased screen keeps the owed rows in
+//! history where the synchronous resize revealed and erased them. Product rule for the fallback:
+//! the synchronous resize's later moves depend on the owed rows' text (how
+//! many rows they take at another width, whether they fit a narrower one,
+//! whether the cursor sits among them), which the window does not hold, so a
+//! drag through further sizes before the re-attach can end with other history
+//! rows above the screen, and a program that moves up into rows the window
+//! left blank draws over blanks where the synchronous screen had the owed
+//! text. Every line is kept, once and in order
+//! (`random_offloaded_drags_end_where_the_plain_resize_does`).
 
 use aterm_scrollback::{Line, ScrollbackStorage};
 
 use super::Grid;
-use super::reflow::ResizePolicy;
-use super::state::{DetachedReaderAim, PendingScrollbackSettings};
+use super::reflow::{ReflowMode, ResizePolicy};
+use super::resize_handback::ResizeLaw;
+use super::state::{DetachedReaderAim, FillDebt, PendingScrollbackSettings};
 use crate::Damage;
+
+/// How many screens of cells, at the larger of a width change's two sizes, an
+/// offloaded resize holds back from its job: the ring's newest whole lines up
+/// to that many cells stay in the grid for the window's steps to reveal and
+/// fill from, as the synchronous resize does (the module doc's rule). The
+/// synchronous phase rewraps them at every step, so it stays bounded by the
+/// viewport; four screens cover a drag that grows the screen fourfold inside
+/// one window.
+pub(super) const HOLD_BACK_SCREENS: usize = 4;
 
 /// One reader-facing viewport gesture, as the detach window records it
 /// (see [`Grid::note_detached_reader_motion`]).
@@ -560,7 +607,8 @@ impl Grid {
     ///
     /// On a width change with a tiered store attached, detach the store (O(1))
     /// and lift the ring's scrollback rows into the job (O(ring)) before
-    /// resizing, so the synchronous reflow costs O(viewport), and return the
+    /// resizing, all but its newest lines within `HOLD_BACK_SCREENS` screens
+    /// of cells, so the synchronous reflow costs O(viewport), and return the
     /// detached history as a [`PendingScrollbackReflow`]. The caller must rewrap
     /// it off-thread and [`reattach`](Grid::reattach_reflowed_scrollback) the
     /// result, or history is lost.
@@ -587,12 +635,42 @@ impl Grid {
         new_cols: u16,
         policy: ResizePolicy,
     ) -> Option<PendingScrollbackReflow> {
+        // Match resize's public dimension domain before planning or budgeting
+        // the detach; the job's width must be the width the grid will have.
+        let new_rows = new_rows.clamp(1, crate::MAX_GRID_ROWS);
+        let new_cols = new_cols.clamp(1, crate::MAX_GRID_COLS);
         let old_cols = self.storage.cols;
         // Only a width change rewraps scrollback, and only a tiered grid has
         // unbounded off-screen history worth offloading.
         if new_cols == old_cols || self.storage.scrollback.is_none() {
             self.resize_with_policy(new_rows, new_cols, policy);
             return None;
+        }
+        // What is owed for a push goes back under the screen now, and under an
+        // older law a resize that moves the rows too runs its rows half now,
+        // both with the history still attached so a grow reveals from all of
+        // it; the rest of this is the width change at the new height
+        // (`split_rows_step`).
+        let handed = self.hand_back_before_resize(new_cols, ReflowMode::Enabled, policy);
+        // The screen the held-back history must cover: the larger of the two
+        // sizes, measured before the rows step below moves the height.
+        let screen_cells = usize::from(self.storage.visible_rows.max(new_rows))
+            * usize::from(old_cols.max(new_cols));
+        let rows_step = self.split_rows_step(new_rows, new_cols, ReflowMode::Enabled, policy);
+        // Under the current law the pass lays the rows out from a plan that
+        // reads the newest history, so it is made now, before the history goes
+        // to the job, with the head of a line the screen's top row continues
+        // brought onto the screen (`Grid::prepare_rewrap`, which reads history
+        // in proportion to the screen); one that cannot be made forgets what
+        // is owed.
+        if policy == ResizePolicy::Native
+            && self.storage.resize_law == ResizeLaw::Rewrap
+            && !self.handback_one_pass()
+        {
+            match self.prepare_rewrap(new_cols) {
+                Some(plan) => self.offer_plan(plan),
+                None => self.forget_handback(),
+            }
         }
 
         // Extract the history without (de)compressing on this thread: the lazy
@@ -622,35 +700,51 @@ impl Grid {
             .take()
             .expect("scrollback.is_none() early-returned above");
         // Open the window before the resize below: the rows it pushes into
-        // history land in the empty ring, and only inside a window are those
-        // past the ring cap staged for re-attach
+        // history land in the ring behind the lines held back, and only inside
+        // a window are those past the ring cap staged for re-attach
         // (`prepend_ring_scrollback_lines`) rather than dropped. Until
         // re-attach, scroll-off is staged to the lazy buffer too.
         self.close_reflow_window_cap_run();
         self.storage.scrollback_detached_for_reflow = true;
+        self.storage.staged_width_stale = false;
         self.storage.pending_scrollback_settings = Some(pending_settings);
-        // The window opens with no reader aim.
+        // The window opens with no reader aim and owing nothing.
         self.storage.detached_reader_aim = None;
-        // Lift the ring history into the job too, leaving the ring empty so the
-        // resize rewraps nothing off-screen. The deficit fill cannot run inside
-        // the resize (the history is with the worker), so re-attach runs it
-        // against the pre-resize trailing-blank count captured here.
-        let pending_fill_target = self.trailing_blank_rows_below_cursor();
-        let mut ring_lines = self.take_ring_scrollback_lines();
-        // Lift the viewport's leading soft-wrap continuation rows too: their head
-        // is the newest ring history line, so the line rewraps as one unit and
-        // the re-attach deficit fill pulls its tail back into view. Not under
-        // ConPTY: the fill would land after conhost's row-0-anchored repaint and
-        // duplicate the line, and without the fill the tail would strand in
-        // history; there the resize severs the fragment from its head instead
-        // (`sever_top_row_continuation`).
-        if policy == ResizePolicy::Native {
-            ring_lines.extend(self.take_boundary_continuation_lines());
-            self.storage.pending_fill_target = Some(pending_fill_target);
+        self.storage.fill_debt = FillDebt::default();
+        // Lift the ring history into the job too, but for its newest whole
+        // lines within `HOLD_BACK_SCREENS` screens of cells
+        // (`ring_rows_to_hold_back`): the resize below and every step inside
+        // the window rewrap those with the screen, as the synchronous resize
+        // does, and the deficit fill and a reveal draw on them, so a window's
+        // screen holds the history rows the synchronous one shows. What they
+        // cannot fill is owed to the re-attach (`FillDebt`).
+        let held = self.ring_rows_to_hold_back(HOLD_BACK_SCREENS * screen_cells);
+        let mut ring_lines = self.take_older_ring_scrollback_lines(held);
+        // With no line held back, lift the viewport's leading soft-wrap
+        // continuation rows too: their head is the newest line the job took, so
+        // the line rewraps as one unit and the re-attach deficit fill pulls its
+        // tail back into view (a held-back head rewraps with them in the resize
+        // below). Not under ConPTY: the fill would land after conhost's
+        // row-0-anchored repaint and duplicate the line, and without the fill
+        // the tail would strand in history; there the resize severs the fragment
+        // from its head instead (`sever_top_row_continuation`).
+        if policy == ResizePolicy::Native && held == 0 {
+            let lifted = self.take_boundary_continuation_lines();
+            // The resize below counts these rows in the height it starts from,
+            // as the synchronous resize lifts them inside its own pass.
+            self.note_rows_lifted(lifted.len());
+            ring_lines.extend(lifted);
         }
 
-        // All history is in the job, so this costs the visible-grid reflow only.
+        // The rest of the history is in the job, so this costs the visible-grid
+        // reflow and the held-back rows only.
         self.resize_with_policy(new_rows, new_cols, policy);
+        if let Some(handed) = handed {
+            self.merge_handback_step(handed);
+        }
+        if let Some(rows_step) = rows_step {
+            self.merge_rows_step(rows_step);
+        }
         // This window's reader-descent baseline, sampled after the resize so its
         // own `display_offset` clamp is inside it (machine motion never advances
         // the generation). See the guard in `reattach_reflowed_scrollback`.
@@ -701,7 +795,7 @@ impl Grid {
             // don't clobber it. The reflowed store drops; the job-carried ring
             // history re-enters the ring (capped). The reset also supersedes the
             // deficit-fill debt.
-            self.storage.pending_fill_target = None;
+            self.drop_fill_debt();
             self.reconcile_pending_scrollback_settings();
             self.reattach_ring_history(reflowed.ring_out, reflowed.new_cols);
             return;
@@ -716,7 +810,8 @@ impl Grid {
             let _ = store.clear();
             self.storage.scrollback = Some(store);
             // After an erase the blanks are genuine: never fill them from history.
-            self.storage.pending_fill_target = None;
+            self.drop_fill_debt();
+            self.settle_fill(0);
             self.reconcile_pending_scrollback_settings();
             self.drain_lazy_buffer(); // post-erase window output (erase cleared the pre-erase lazy)
             self.storage.display_offset = 0; // an erase resets the scroll position
@@ -734,13 +829,14 @@ impl Grid {
         // Then flush the window's staged output after it.
         self.drain_lazy_buffer();
         // Bottom-anchor the viewport: the width grow that opened this window
-        // unwrapped content into fewer rows, and the resize could not pull
+        // unwrapped content into fewer rows, and the resizes could not pull
         // history back (it was with this job). A stale-width job re-detaches
-        // instead and fills on its own re-attach, so the target survives.
-        if reflowed.new_cols == self.storage.cols
-            && let Some(target) = self.storage.pending_fill_target.take()
-        {
-            self.fill_viewport_deficit_from_history(target);
+        // instead and pays on its own re-attach, so the debt survives. What the
+        // width change owes is where the fill leaves the window
+        // (`Grid::settle_fill`).
+        if reflowed.new_cols == self.storage.cols {
+            let pulled = self.pay_fill_debt();
+            self.settle_fill(pulled);
         }
         let sb = self.storage.scrollback_lines();
         // Restore the reader's pre-detach offset, clamped to the regrown history,
@@ -775,8 +871,10 @@ impl Grid {
 
     /// Re-attach, then converge: if the width changed while the reflow ran (a
     /// superseding drag step, which detached nothing), the reflowed history is
-    /// wrapped at the job's stale width, so re-detach it at once for one more
-    /// off-thread rewrap at the current width and return that job.
+    /// wrapped at the job's stale width, or the output the window staged
+    /// before that step is (`staged_width_stale`, also when the drag came back
+    /// to the job's width), so re-detach it at once for one more off-thread
+    /// rewrap at the current width and return that job.
     ///
     /// Each job carries the width seen at its detach, so once the width settles
     /// at most one extra pass runs. The erase-during-window and
@@ -797,7 +895,19 @@ impl Grid {
         let was_erased = reflowed.clear_gen != self.storage.scrollback_clear_gen;
         let had_replacement = self.storage.scrollback.is_some();
         let stale_cols = reflowed.new_cols;
-        if was_erased || had_replacement || stale_cols == self.storage.cols {
+        // Output the window staged at a width it has since left would drain into
+        // a store that keeps lines as it is; a re-attach into the ring rewraps
+        // it itself (`reattach_history_into_ring`). A limit changed meanwhile
+        // counts as keeping: one pass too many costs a rewrap, not history.
+        let staged_stale = self.storage.staged_width_stale
+            && (reflowed.store.line_limit() != Some(0)
+                || self
+                    .storage
+                    .pending_scrollback_settings
+                    .as_ref()
+                    .is_some_and(|pending| pending.line_limit_changed));
+        let current = stale_cols == self.storage.cols && !staged_stale;
+        if was_erased || had_replacement || current {
             self.reattach_reflowed_scrollback(reflowed);
             return None;
         }
@@ -856,7 +966,7 @@ impl Grid {
         self.storage.content_gen += 1;
         let retained = u64::from(self.storage.visible_rows).saturating_add(sb as u64);
         if self.storage.absolute_row_counter < retained {
-            self.storage.absolute_row_counter = retained;
+            self.renumber_rows(retained);
             self.storage.history_renumber_epoch =
                 self.storage.history_renumber_epoch.saturating_add(1);
             self.invalidate_host_coordinates();
@@ -891,6 +1001,7 @@ impl Grid {
         let detach_live_bottom_gen = self.storage.reader_live_bottom_gen;
         self.close_reflow_window_cap_run();
         self.storage.scrollback_detached_for_reflow = true;
+        self.storage.staged_width_stale = false;
         self.storage.pending_scrollback_settings = Some(pending_settings);
         self.storage.detached_reader_aim = None;
         let phase = ReflowPhase::start(&store);
@@ -1153,7 +1264,7 @@ impl Grid {
         self.close_reflow_window_cap_run();
         // The job (and the history a deficit fill would have pulled) is lost:
         // drop the fill debt and the reader's aim with it.
-        self.storage.pending_fill_target = None;
+        self.drop_fill_debt();
         self.storage.detached_reader_aim = None;
         if self.storage.scrollback.is_some() {
             // A reset or recovery path installed a replacement store before the
@@ -1217,10 +1328,22 @@ mod tests {
     }
 
     /// Write one logical line (autowrapping into soft-wrapped continuation rows
-    /// when longer than the width), then terminate it with a hard newline.
+    /// when longer than the width, a wide glyph early-wrapping as output does),
+    /// then terminate it with a hard newline.
     fn logical_line(grid: &mut Grid, text: &str) {
+        use crate::{CellFlags, PackedColor};
         for c in text.chars() {
-            grid.write_char_wrap(c); // deferred autowrap: long text soft-wraps
+            // Deferred autowrap: long text soft-wraps.
+            if aterm_grapheme::char_width(c) == 2 {
+                grid.write_wide_char_wrap_styled(
+                    c,
+                    PackedColor::DEFAULT_FG,
+                    PackedColor::DEFAULT_BG,
+                    CellFlags::empty(),
+                );
+            } else {
+                grid.write_char_wrap(c);
+            }
         }
         grid.line_feed();
         grid.carriage_return();
@@ -1911,58 +2034,30 @@ mod tests {
         g.assert_invariants();
     }
 
-    /// Single-row logical lines only (blanks, short/medium ASCII, wide CJK under
-    /// one row): a multi-row run straddling a detach window's seam still
-    /// re-splits there, so this corpus isolates placement and order.
-    fn feed_single_row_history(grid: &mut Grid, seed: u64, logical_lines: usize, cols: u16) {
-        let mut rng = Rng(seed);
-        for i in 0..logical_lines {
-            match rng.below(4) {
-                0 => logical_line(grid, ""),
-                1 => logical_line(grid, &format!("S{i}")),
-                2 => {
-                    // Wide chars, capped to fit one row at both toggle widths.
-                    let n = 1 + rng.below(u64::from(cols) / 4) as usize;
-                    let mut s = format!("W{i}-");
-                    for _ in 0..n {
-                        s.push(if rng.below(2) == 0 { '世' } else { '界' });
-                    }
-                    logical_line(grid, &s);
-                }
-                _ => {
-                    let pad = "x".repeat(rng.below(u64::from(cols) / 2) as usize);
-                    logical_line(grid, &format!("M{i}-{pad}"));
-                }
-            }
-        }
-    }
-
     /// One width change for the offloaded-vs-plain differential below: the
     /// grid's shape and ring, then the drag of `(rows, cols)` steps. The first
     /// step detaches; the rest land while the job is out, as plain resizes
     /// inside the detach window (the GUI's superseding drag steps), each after
-    /// `output` more lines. `fit` caps the corpus so every line is one row at
-    /// every width, unless the drag is `wrapping` (`feed_wrapping_history`, one
-    /// step only).
+    /// `output` more logical lines. History and output take
+    /// [`feed_mixed_history`]'s shapes, so lines wrap into multi-row runs (wide
+    /// glyphs included) and straddle every seam: the store/ring one at detach,
+    /// and inside the window the one between its staged output and its ring.
     ///
     /// A drag with output keeps the reader at the live bottom: a reader scrolled
     /// back over window output is restored by offset (`reattach_reflowed_scrollback`),
     /// which the plain path's per-batch repin does not share.
     struct Drag {
         label: &'static str,
-        wrapping: bool,
         policy: ResizePolicy,
         ring: usize,
         rows: u16,
         cols: u16,
         steps: &'static [(u16, u16)],
         output: usize,
-        fit: u16,
     }
 
-    const DRAGS: [Drag; 8] = [
+    const DRAGS: [Drag; 13] = [
         Drag {
-            wrapping: false,
             label: "one narrowing step, the ring holds its overflow",
             policy: ResizePolicy::Native,
             ring: 32,
@@ -1970,12 +2065,30 @@ mod tests {
             cols: 40,
             steps: &[(10, 23)],
             output: 0,
-            fit: 40,
+        },
+        // A ring past the four screens the detach holds back: the rest of it
+        // rides the job, and the window's steps draw on what it held.
+        Drag {
+            label: "a ring larger than the window holds back",
+            policy: ResizePolicy::Native,
+            ring: 64,
+            rows: 4,
+            cols: 40,
+            steps: &[(4, 23), (6, 30), (5, 26)],
+            output: 0,
+        },
+        Drag {
+            label: "one widening step",
+            policy: ResizePolicy::Native,
+            ring: 8,
+            rows: 10,
+            cols: 23,
+            steps: &[(10, 40)],
+            output: 0,
         },
         // The window's steps push the screen's top rows off while the ring
         // holds the first step's: the history must read them in that order.
         Drag {
-            wrapping: false,
             label: "a drag whose later steps land inside the window",
             policy: ResizePolicy::Native,
             ring: 8,
@@ -1983,11 +2096,10 @@ mod tests {
             cols: 40,
             steps: &[(10, 35), (4, 30), (3, 28)],
             output: 0,
-            fit: 20,
         },
-        // ... and behind the output the window staged meanwhile.
+        // ... and behind the output the window staged meanwhile, whose lines
+        // straddle the seam between what the window staged and its ring.
         Drag {
-            wrapping: false,
             label: "a drag with output streaming between its steps",
             policy: ResizePolicy::Native,
             ring: 8,
@@ -1995,12 +2107,52 @@ mod tests {
             cols: 40,
             steps: &[(10, 35), (4, 30), (3, 28)],
             output: 12,
-            fit: 20,
+        },
+        // A drag that ends at the width its job rewraps to: the output the
+        // window staged at the other width is rewrapped all the same.
+        Drag {
+            label: "a drag back to the job's width with output staged between",
+            policy: ResizePolicy::Native,
+            ring: 4,
+            rows: 8,
+            cols: 40,
+            steps: &[(8, 31), (8, 26), (8, 31)],
+            output: 12,
+        },
+        // A step that grows the screen inside the window, or unwraps it
+        // shorter, after output has filled it: the rows the window cannot
+        // reveal or fill (their history is with the job) are owed to the
+        // re-attach, as the plain resize reveals and fills them.
+        Drag {
+            label: "a grow inside the window after output filled the screen",
+            policy: ResizePolicy::Native,
+            ring: 2,
+            rows: 10,
+            cols: 17,
+            steps: &[(6, 15), (15, 16)],
+            output: 8,
+        },
+        Drag {
+            label: "a widening inside the window after output filled the screen",
+            policy: ResizePolicy::Native,
+            ring: 2,
+            rows: 10,
+            cols: 17,
+            steps: &[(10, 15), (10, 30)],
+            output: 8,
+        },
+        Drag {
+            label: "a rows-only grow inside the window after output",
+            policy: ResizePolicy::Native,
+            ring: 2,
+            rows: 10,
+            cols: 17,
+            steps: &[(6, 15), (15, 15)],
+            output: 8,
         },
         // One step pushing more rows off the screen than the ring holds: the
         // rows past the ring are history too.
         Drag {
-            wrapping: false,
             label: "one step pushing more rows than the ring holds",
             policy: ResizePolicy::Native,
             ring: 8,
@@ -2008,10 +2160,8 @@ mod tests {
             cols: 40,
             steps: &[(3, 23)],
             output: 0,
-            fit: 20,
         },
         Drag {
-            wrapping: false,
             label: "the same push under ConPTY",
             policy: ResizePolicy::ConPty,
             ring: 8,
@@ -2019,57 +2169,45 @@ mod tests {
             cols: 40,
             steps: &[(3, 23)],
             output: 0,
-            fit: 20,
-        },
-        // Lines that wrap: a run straddling the store/ring seam rewraps whole,
-        // as the plain resize rewraps it.
-        Drag {
-            wrapping: true,
-            label: "one narrowing step over lines that wrap",
-            policy: ResizePolicy::Native,
-            ring: 8,
-            rows: 10,
-            cols: 40,
-            steps: &[(10, 23)],
-            output: 0,
-            fit: 40,
         },
         Drag {
-            wrapping: true,
-            label: "the same over lines that wrap, under ConPTY",
+            label: "one narrowing step under ConPTY",
             policy: ResizePolicy::ConPty,
             ring: 8,
             rows: 10,
             cols: 40,
             steps: &[(10, 23)],
             output: 0,
-            fit: 40,
         },
         Drag {
-            wrapping: true,
-            label: "one step over lines that wrap, pushing more rows than the ring holds",
-            policy: ResizePolicy::Native,
+            label: "a drag with output under ConPTY",
+            policy: ResizePolicy::ConPty,
             ring: 8,
             rows: 13,
             cols: 40,
-            steps: &[(3, 23)],
-            output: 0,
-            fit: 40,
+            steps: &[(10, 35), (4, 30), (3, 28)],
+            output: 12,
         },
     ];
 
-    /// Logical lines of 0..3 widths of ASCII at `cols`, so most wrap into
-    /// multi-row runs and some straddle the store/ring seam.
-    fn feed_wrapping_history(grid: &mut Grid, seed: u64, logical_lines: usize, cols: u16) {
-        let mut rng = Rng(seed);
-        for i in 0..logical_lines {
-            let len = rng.below(u64::from(cols) * 3) as usize;
-            let mut s = format!("R{i}-");
-            while s.len() < len {
-                s.push((b'a' + rng.below(26) as u8) as char);
-            }
-            logical_line(grid, &s);
-        }
+    /// Every history line, oldest first, as `get_history_line` reads it across
+    /// the tiers: text and wrap flag.
+    fn history_seq(g: &Grid) -> Vec<(String, bool)> {
+        (0..g.scrollback_lines())
+            .map(|i| {
+                g.get_history_line(i).map_or_else(
+                    || (String::new(), false),
+                    |line| (line.as_str().unwrap_or("").to_string(), line.is_wrapped()),
+                )
+            })
+            .collect()
+    }
+
+    /// Every screen row's text.
+    fn screen_rows(g: &Grid) -> Vec<String> {
+        (0..g.rows())
+            .map(|r| g.row_text(r).unwrap_or_default())
+            .collect()
     }
 
     /// With the ring history riding the job, the offloaded width change ends
@@ -2082,21 +2220,7 @@ mod tests {
     /// Mid-flight the ring history must be in the job.
     #[test]
     fn offload_round_trip_matches_plain_resize_history_sequence() {
-        let read = |g: &Grid| -> Vec<(String, bool)> {
-            (0..g.scrollback_lines())
-                .map(|i| {
-                    g.get_history_line(i).map_or_else(
-                        || (String::new(), false),
-                        |line| (line.as_str().unwrap_or("").to_string(), line.is_wrapped()),
-                    )
-                })
-                .collect()
-        };
-        let screen = |g: &Grid| -> Vec<String> {
-            (0..g.rows())
-                .map(|r| g.row_text(r).unwrap_or_default())
-                .collect()
-        };
+        let (read, screen) = (history_seq, screen_rows);
         for drag in &DRAGS {
             for seed in [3u64, 11, 0xFEED] {
                 // The reader: at the live bottom, then scrolled back by a
@@ -2111,11 +2235,7 @@ mod tests {
                     let mut offloaded = tiered_grid(drag.rows, drag.cols, drag.ring);
                     let mut plain = tiered_grid(drag.rows, drag.cols, drag.ring);
                     for g in [&mut offloaded, &mut plain] {
-                        if drag.wrapping {
-                            feed_wrapping_history(g, seed, 300, drag.cols);
-                        } else {
-                            feed_single_row_history(g, seed, 300, drag.fit);
-                        }
+                        feed_mixed_history(g, seed, 300, drag.cols);
                         g.scroll_display(back);
                     }
                     assert!(
@@ -2131,18 +2251,20 @@ mod tests {
                             drag.policy,
                         )
                         .expect("width change with a tiered store detaches");
-                    // The ring history rides the job. The grid's ring is not
-                    // asserted empty: the visible-grid shrink may spill rows into it.
+                    // The ring history past the newest screens' worth the
+                    // window holds back rides the job (RFL-1).
+                    let held = HOLD_BACK_SCREENS
+                        * usize::from(drag.rows.max(first_rows))
+                        * usize::from(drag.cols.max(first_cols))
+                        / usize::from(drag.cols);
                     assert!(
-                        !job.ring_lines.is_empty(),
-                        "{case}: detach lifts the ring history into the job (RFL-1)"
+                        drag.ring <= held || !job.ring_lines.is_empty(),
+                        "{case}: detach lifts the ring history past the hold-back into the job (RFL-1)"
                     );
                     plain.resize_with_policy(first_rows, first_cols, drag.policy);
                     for (step, &(rows, cols)) in drag.steps[1..].iter().enumerate() {
                         for g in [&mut offloaded, &mut plain] {
-                            for i in 0..drag.output {
-                                logical_line(g, &format!("O{step}-{i}"));
-                            }
+                            feed_mixed_history(g, seed ^ step as u64, drag.output, cols);
                         }
                         assert!(
                             drag.output == 0 || !offloaded.storage.lazy_buffer.is_empty(),
@@ -2158,8 +2280,15 @@ mod tests {
                         let (done, _steps) = step_with_schedule(job, &mut rng, 29);
                         next = offloaded.reattach_reflowed_scrollback_or_redetach(done);
                     }
+                    // Unless a grow or a widening inside the window owed the
+                    // re-attach's fill more rows than the ring held, which it
+                    // put on the screen.
+                    let grows = drag
+                        .steps
+                        .windows(2)
+                        .any(|w| w[1].0 > w[0].0 || w[1].1 > w[0].1);
                     assert!(
-                        offloaded.ring_buffer_scrollback() > 0,
+                        offloaded.ring_buffer_scrollback() > 0 || grows,
                         "{case}: re-attach returns ring history to the ring"
                     );
 
@@ -2178,6 +2307,377 @@ mod tests {
                     plain.assert_invariants();
                 }
             }
+        }
+    }
+
+    /// The text of every logical line in the history and on the screen, in
+    /// order: what a resize must keep, wherever it puts each row. A wrapped
+    /// row continues the line before it; any other row opens a line. Blank
+    /// lines are left out: how many blank rows a screen keeps is placement.
+    fn logical_lines(g: &Grid) -> Vec<String> {
+        let rows = history_seq(g).into_iter().chain((0..g.rows()).map(|r| {
+            let wrapped = g
+                .storage
+                .row_at_screen(r)
+                .is_some_and(|row| row.is_wrapped());
+            (g.row_text(r).unwrap_or_default(), wrapped)
+        }));
+        let mut lines: Vec<String> = Vec::new();
+        for (text, wrapped) in rows {
+            match lines.last_mut() {
+                Some(line) if wrapped => line.push_str(&text),
+                _ => lines.push(text),
+            }
+        }
+        lines.retain(|line| !line.is_empty());
+        lines
+    }
+
+    /// Seeded random drags under both policies: any shape and ring, a first
+    /// step that detaches, then up to three steps inside the window (shrinks,
+    /// grows, widenings, narrowings), with output between them or none, on
+    /// full screens and on screens cleared and partly drawn again, and in
+    /// half of them a shell's prompt redrawn after every resize (`CR`, `ED 0`,
+    /// the prompt). Every line ends where the plain resize leaves it, once and
+    /// in order. On a screen with no blank row under the cursor, or with no
+    /// step inside the window, so do the history's rows, the screen and the
+    /// reader's place: the window's steps reveal and fill what the grid holds
+    /// and owe the rest to the re-attach (`FillDebt`). With blank rows under
+    /// the cursor, a step inside the window after one that owed rows can end
+    /// with other history rows above the screen (the module doc's rule).
+    #[test]
+    fn random_offloaded_drags_end_where_the_plain_resize_does() {
+        let mut exact = 0;
+        for policy in [ResizePolicy::Native, ResizePolicy::ConPty] {
+            for seed in 0..300u64 {
+                let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9) ^ 0x5EED);
+                let rows = 2 + rng.below(13) as u16;
+                let cols = 5 + rng.below(40) as u16;
+                let ring = 1 + rng.below(20) as usize;
+                let mut steps: Vec<(u16, u16)> = (0..1 + rng.below(4))
+                    .map(|_| (2 + rng.below(13) as u16, 5 + rng.below(40) as u16))
+                    .collect();
+                if steps[0].1 == cols {
+                    steps[0].1 += 1;
+                }
+                let output = [0, 5, 10][rng.below(3) as usize];
+                // Half the screens are cleared and part drawn again, so the
+                // detach finds blank rows under the cursor.
+                let redrawn = (rng.below(2) == 0).then(|| rng.below(u64::from(rows)) as usize);
+                let prompt = rng.below(2) == 0;
+                let case = format!(
+                    "{policy:?} seed {seed}: {rows}x{cols} ring {ring}, steps {steps:?}, \
+                     output {output}, redrawn {redrawn:?}, prompt {prompt}"
+                );
+                let redraw = |g: &mut Grid| {
+                    if prompt {
+                        g.carriage_return();
+                        g.erase_to_end_of_screen();
+                        "$ ".chars().for_each(|c| g.write_char_wrap(c));
+                    }
+                };
+                let mut offloaded = tiered_grid(rows, cols, ring);
+                let mut plain = tiered_grid(rows, cols, ring);
+                for g in [&mut offloaded, &mut plain] {
+                    feed_mixed_history(g, seed, 120, cols);
+                    if let Some(lines) = redrawn {
+                        g.erase_screen();
+                        g.set_cursor(0, 0);
+                        feed_mixed_history(g, seed ^ 0xC1EA, lines, cols);
+                    }
+                }
+                let job = offloaded
+                    .resize_offloading_scrollback_with_policy(steps[0].0, steps[0].1, policy)
+                    .expect("a width change with a tiered store detaches");
+                plain.resize_with_policy(steps[0].0, steps[0].1, policy);
+                redraw(&mut offloaded);
+                redraw(&mut plain);
+                for (k, &(rows, cols)) in steps[1..].iter().enumerate() {
+                    for g in [&mut offloaded, &mut plain] {
+                        feed_mixed_history(g, seed ^ (k as u64 + 7), output, cols);
+                        g.resize_with_policy(rows, cols, policy);
+                        redraw(g);
+                    }
+                }
+                let mut schedule = Rng(seed ^ 0xD1FF);
+                let mut next = Some(job);
+                while let Some(job) = next {
+                    let (done, _steps) = step_with_schedule(job, &mut schedule, 29);
+                    next = offloaded.reattach_reflowed_scrollback_or_redetach(done);
+                }
+                assert_eq!(
+                    logical_lines(&offloaded),
+                    logical_lines(&plain),
+                    "{case}: every line, once and in order"
+                );
+                if redrawn.is_none() || steps.len() == 1 {
+                    exact += 1;
+                    assert_eq!(
+                        history_seq(&offloaded),
+                        history_seq(&plain),
+                        "{case}: history"
+                    );
+                    assert_eq!(
+                        screen_rows(&offloaded),
+                        screen_rows(&plain),
+                        "{case}: screen"
+                    );
+                    assert_eq!(
+                        offloaded.display_offset(),
+                        plain.display_offset(),
+                        "{case}: the reader's place"
+                    );
+                }
+                offloaded.assert_invariants();
+                plain.assert_invariants();
+            }
+        }
+        assert!(
+            exact > 300,
+            "only {exact} drags were held to the plain resize's rows"
+        );
+    }
+
+    /// What a program does inside a detach window, the same on both grids of a
+    /// differential: output, a prompt redrawn on its row (`CR`, `ED 0`), one
+    /// redrawn from rows above it (`CUU`, `CR`, `ED 0`, as a multi-line prompt
+    /// does), a write at an addressed row (`CUP`), or a screen cleared and drawn
+    /// again (`ED 2`).
+    #[derive(Clone, Copy, Debug)]
+    enum WindowAction {
+        Output,
+        Prompt,
+        PromptAbove,
+        Addressed,
+        Cleared,
+    }
+
+    fn window_action(g: &mut Grid, action: WindowAction, seed: u64) {
+        let mut rng = Rng(seed);
+        match action {
+            WindowAction::Output => feed_mixed_history(g, seed, 5, g.cols()),
+            WindowAction::Prompt | WindowAction::PromptAbove => {
+                if let WindowAction::PromptAbove = action {
+                    g.cursor_up(1 + rng.below(3) as u16);
+                }
+                g.carriage_return();
+                g.erase_to_end_of_screen();
+                "$ ".chars().for_each(|c| g.write_char_wrap(c));
+            }
+            WindowAction::Addressed => {
+                g.set_cursor(rng.below(u64::from(g.rows())) as u16, 0);
+                g.write_char_wrap('Z');
+            }
+            WindowAction::Cleared => {
+                g.erase_screen();
+                g.set_cursor(0, 0);
+                feed_mixed_history(g, seed, 2, g.cols());
+            }
+        }
+    }
+
+    /// Seeded random drags as a session makes them, over a ring that holds more
+    /// history than the window needs (the shipped ring is 1000 rows): any
+    /// shape, a first step that detaches and up to three inside the window,
+    /// full screens and cleared ones, and every [`WindowAction`] after every
+    /// step. The detach holds the ring's newest lines back, so the window's
+    /// steps reveal and fill from them as the plain resize does, and a program
+    /// that moves into the rows a step pulled down, or addresses them, finds
+    /// them there. Where no step owed the re-attach anything (`FillDebt`), the
+    /// drag ends exactly where the plain resize leaves it: the history, the
+    /// screen and the reader's place. Nearly every drag is such a one; the
+    /// rest grow the screen past the four screens held back.
+    #[test]
+    fn random_offloaded_drags_over_a_full_ring_end_where_the_plain_resize_does() {
+        use WindowAction::{Addressed, Cleared, Output, Prompt, PromptAbove};
+        let (mut drags, mut owed_drags) = (0, 0);
+        for policy in [ResizePolicy::Native, ResizePolicy::ConPty] {
+            for action in [Output, Prompt, PromptAbove, Addressed, Cleared] {
+                for seed in 0..100u64 {
+                    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9) ^ 0xF011);
+                    let rows = 2 + rng.below(13) as u16;
+                    let cols = 5 + rng.below(40) as u16;
+                    let mut steps: Vec<(u16, u16)> = (0..1 + rng.below(4))
+                        .map(|_| (2 + rng.below(13) as u16, 5 + rng.below(40) as u16))
+                        .collect();
+                    if steps[0].1 == cols {
+                        steps[0].1 += 1;
+                    }
+                    let redrawn = (rng.below(2) == 0).then(|| rng.below(u64::from(rows)) as usize);
+                    let act_seed = rng.next();
+                    let case = format!(
+                        "{policy:?} {action:?} seed {seed}: {rows}x{cols}, steps {steps:?}, \
+                         redrawn {redrawn:?}"
+                    );
+                    let mut offloaded = tiered_grid(rows, cols, 300);
+                    let mut plain = tiered_grid(rows, cols, 300);
+                    for g in [&mut offloaded, &mut plain] {
+                        feed_mixed_history(g, seed, 120, cols);
+                        if let Some(lines) = redrawn {
+                            g.erase_screen();
+                            g.set_cursor(0, 0);
+                            feed_mixed_history(g, seed ^ 0xC1EA, lines, cols);
+                        }
+                    }
+                    let job = offloaded
+                        .resize_offloading_scrollback_with_policy(steps[0].0, steps[0].1, policy)
+                        .expect("a width change with a tiered store detaches");
+                    plain.resize_with_policy(steps[0].0, steps[0].1, policy);
+                    let mut owed = offloaded.storage.fill_debt != FillDebt::default();
+                    for (k, &(rows, cols)) in steps.iter().enumerate() {
+                        if k > 0 {
+                            offloaded.resize_with_policy(rows, cols, policy);
+                            plain.resize_with_policy(rows, cols, policy);
+                            owed |= offloaded.storage.fill_debt != FillDebt::default();
+                        }
+                        window_action(&mut offloaded, action, act_seed ^ k as u64);
+                        window_action(&mut plain, action, act_seed ^ k as u64);
+                    }
+                    let mut schedule = Rng(seed ^ 0xD1FF);
+                    let mut next = Some(job);
+                    while let Some(job) = next {
+                        let (done, _steps) = step_with_schedule(job, &mut schedule, 29);
+                        next = offloaded.reattach_reflowed_scrollback_or_redetach(done);
+                    }
+                    drags += 1;
+                    if owed {
+                        owed_drags += 1;
+                    } else {
+                        assert_eq!(
+                            history_seq(&offloaded),
+                            history_seq(&plain),
+                            "{case}: history"
+                        );
+                        assert_eq!(
+                            screen_rows(&offloaded),
+                            screen_rows(&plain),
+                            "{case}: screen"
+                        );
+                        assert_eq!(
+                            offloaded.display_offset(),
+                            plain.display_offset(),
+                            "{case}: the reader's place"
+                        );
+                    }
+                    offloaded.assert_invariants();
+                    plain.assert_invariants();
+                }
+            }
+        }
+        assert!(
+            owed_drags * 50 < drags,
+            "{owed_drags} of {drags} drags owed the re-attach rows: the window held too little back"
+        );
+    }
+
+    /// The window holds back the history its screen shows: a full screen
+    /// narrowed in one step pulls the newest history rows down on both paths,
+    /// so a prompt redrawn from two rows up erases the same rows. Without the
+    /// hold-back the window's screen lacked those rows, owed them to the
+    /// re-attach, and the redraw erased other text.
+    #[test]
+    fn a_prompt_redrawn_from_rows_above_finds_the_rows_the_resize_pulled_down() {
+        let mut offloaded = tiered_grid(5, 42, 11);
+        let mut plain = tiered_grid(5, 42, 11);
+        for g in [&mut offloaded, &mut plain] {
+            feed_mixed_history(g, 5, 40, 42);
+            logical_line(g, "first");
+            let long: String = (0..178).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+            logical_line(g, &long);
+        }
+        let job = offloaded
+            .resize_offloading_scrollback(3, 12)
+            .expect("a width change with a tiered store detaches");
+        plain.resize(3, 12);
+        assert_eq!(
+            offloaded.storage.fill_debt,
+            FillDebt::default(),
+            "the window filled its screen from the lines it held back"
+        );
+        assert_eq!(screen_rows(&offloaded), screen_rows(&plain), "the screen");
+        for g in [&mut offloaded, &mut plain] {
+            g.cursor_up(2);
+            g.carriage_return();
+            g.erase_to_end_of_screen();
+            "> ".chars().for_each(|c| g.write_char_wrap(c));
+        }
+        offloaded.reattach_reflowed_scrollback(job.reflow());
+        assert_eq!(screen_rows(&offloaded), screen_rows(&plain), "the screen");
+        assert_eq!(history_seq(&offloaded), history_seq(&plain), "the history");
+        offloaded.assert_invariants();
+    }
+
+    /// What a detach window owes its re-attach (`FillDebt`) follows what the
+    /// program does in it as the synchronous screen moves, each case against
+    /// the plain resize from the same grid: lines printed into the blank rows
+    /// under the cursor move the band, not the rows owed; a prompt redrawn
+    /// after the resize (`CR`, `ED 0`) keeps them owed; a program that homes
+    /// the cursor and erases draws a new screen, filled with nothing; and a
+    /// cleared screen shrunk and grown back inside the window gets its blank
+    /// rows back, not history.
+    #[test]
+    fn window_debt_follows_what_the_program_does() {
+        type Step = fn(&mut Grid);
+        fn print_two(g: &mut Grid) {
+            logical_line(g, "one");
+            logical_line(g, "two");
+        }
+        fn prompt(g: &mut Grid) {
+            g.carriage_return();
+            g.erase_to_end_of_screen();
+            "$ ".chars().for_each(|c| g.write_char_wrap(c));
+        }
+        fn home_and_erase(g: &mut Grid) {
+            g.set_cursor(0, 0);
+            g.erase_to_end_of_screen();
+            logical_line(g, "new screen");
+        }
+        fn shrink_and_grow(g: &mut Grid) {
+            g.resize(4, 30);
+            g.resize(12, 30);
+        }
+        // (name, rows drawn after a clear (None: a full screen), the window's step)
+        let cases: [(&str, Option<usize>, Step); 4] = [
+            ("print", Some(5), print_two),
+            ("prompt", None, prompt),
+            ("home and erase", None, home_and_erase),
+            ("shrink and grow", Some(0), shrink_and_grow),
+        ];
+        for (name, redrawn, step) in cases {
+            // A one-row ring: the window holds back too little to fill the
+            // widening's deficit, so it owes the rest.
+            let mut offloaded = tiered_grid(12, 12, 1);
+            let mut plain = tiered_grid(12, 12, 1);
+            for g in [&mut offloaded, &mut plain] {
+                feed_mixed_history(g, 7, 120, 12);
+                if let Some(lines) = redrawn {
+                    g.erase_screen();
+                    g.set_cursor(0, 0);
+                    feed_mixed_history(g, 9, lines, 12);
+                }
+            }
+            let job = offloaded
+                .resize_offloading_scrollback(12, 30)
+                .expect("a width change with a tiered store detaches");
+            plain.resize(12, 30);
+            assert!(
+                redrawn == Some(0) || offloaded.storage.fill_debt.rows > 0,
+                "{name}: precondition, the widening owes rows"
+            );
+            step(&mut offloaded);
+            step(&mut plain);
+            offloaded.reattach_reflowed_scrollback(job.reflow());
+            assert_eq!(
+                screen_rows(&offloaded),
+                screen_rows(&plain),
+                "{name}: the screen"
+            );
+            assert_eq!(
+                (offloaded.cursor_row(), offloaded.cursor_col()),
+                (plain.cursor_row(), plain.cursor_col()),
+                "{name}: the cursor"
+            );
+            offloaded.assert_invariants();
         }
     }
 
@@ -2463,7 +2963,9 @@ mod tests {
     #[test]
     fn converging_redetach_stages_ring_and_window_output_without_ui_store_push() {
         let (rows, w0, w1, w2) = (10u16, 80u16, 40u16, 60u16);
-        let mut g = tiered_grid(rows, w0, 8);
+        // A ring past the four screens the detach holds back, so some of it
+        // rides the job.
+        let mut g = tiered_grid(rows, w0, 64);
         for i in 0..300 {
             logical_line(&mut g, &format!("H{i}-content"));
         }
@@ -2471,9 +2973,9 @@ mod tests {
         let ring_carried = job.ring_lines.len();
         assert!(ring_carried > 0, "precondition: ring history rides job");
 
-        // Window output stages in the lazy buffer; the width change to `w2`
-        // forces a re-detach.
-        for i in 0..20 {
+        // Window output stages in the lazy buffer once the ring is full; the
+        // width change to `w2` forces a re-detach.
+        for i in 0..40 {
             logical_line(&mut g, &format!("W{i}-window"));
         }
         let staged_before = g.storage.lazy_buffer.len();

@@ -56,16 +56,12 @@ fn drain(sink: &Sink) -> Vec<String> {
     std::mem::take(&mut *sink.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// A node id as `n<local>`, with `.<tree>` when the tree index is not 0.
+/// Compare semantic node names in this single-tree corpus (`TreeId::ROOT`).
+/// Registry graft indices are always 0 here; aterm's exported incarnation uses
+/// that low word for object lifetime instead. Wire-path/held-object tests cover
+/// those identities separately; this oracle compares the same model-node names.
 fn nid(id: NodeId) -> String {
-    let raw = u128::from(id);
-    let local = raw >> 64;
-    let tree = raw & u128::from(u64::MAX);
-    if tree == 0 {
-        format!("n{local}")
-    } else {
-        format!("n{local}.{tree}")
-    }
+    format!("n{}", u128::from(id) >> 64)
 }
 
 fn target(t: NodeIdOrRoot) -> String {

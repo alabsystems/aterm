@@ -1,2 +1,0 @@
-Summary: 55 proved, 15 failed, 43 runtime-checked, 21 assumed, 2 mandated, 0 contract-panic, 19 inconclusive (155 total); not-reproducible; profile e83b120a0708; vector 921b5888f01d
-Coverage: 71/71 eligible function bodies verified (complete)

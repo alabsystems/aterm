@@ -1005,6 +1005,53 @@ fn a_typod_key_in_lexicon_data_is_a_parse_error_not_an_empty_entry() {
     );
 }
 
+/// THE BUILTIN IS THE DATA FILES. The build script decodes `data/lexicon.toml`
+/// and `data/exceptions.toml` (`build.rs`) so a launch parses no TOML; the
+/// lexicon it yields must be the one the run-time decoder makes of the same two
+/// files — every key, hit, language and species id and every conflict, in
+/// order — with nothing ungated, everything, English, and each data language
+/// alone.
+#[test]
+fn the_builtin_decoded_at_build_time_is_the_lexicon_of_the_data_files() {
+    const LEXICON: &str = include_str!("../data/lexicon.toml");
+    const EXCEPTIONS: &str = include_str!("../data/exceptions.toml");
+    #[derive(serde::Deserialize)]
+    struct Doc {
+        entry: Vec<Row>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Row {
+        #[serde(default)]
+        lang: String,
+    }
+    let doc: Doc = aterm_toml::from_str(LEXICON).expect("the data file decodes");
+    let mut langs: Vec<String> = Vec::new();
+    for row in doc.entry {
+        if !langs.contains(&row.lang) {
+            langs.push(row.lang);
+        }
+    }
+    assert!(langs.len() > 10, "fixture: the data names its languages");
+    let mut sets: Vec<Vec<&str>> = vec![vec![], vec!["en"], vec!["all"]];
+    sets.extend(langs.iter().map(|lang| vec![lang.as_str()]));
+    for set in &sets {
+        let decoded =
+            Lexicon::from_sources(LEXICON, EXCEPTIONS, set).expect("the data files decode");
+        assert_eq!(
+            format!("{:?}", Lexicon::with_languages(set)),
+            format!("{decoded:?}"),
+            "with_languages({set:?})"
+        );
+        let unextended =
+            Lexicon::with_languages_and_override(set, None).expect("no override to refuse");
+        assert_eq!(
+            format!("{unextended:?}"),
+            format!("{decoded:?}"),
+            "with_languages_and_override({set:?}, None)"
+        );
+    }
+}
+
 /// AN ENTRY THAT COMPILES TO NOTHING. A surface with a space can never match
 /// whole-word, and 34 such surfaces sit in the shipped file on purpose, as
 /// documentation of a word whose head noun is listed separately ("anak

@@ -39,7 +39,7 @@ impl HotTier {
     /// Push a line to the back.
     ///
     /// Saturating: the counters track bytes this process holds, so the sum always
-    /// fits; saturation only discharges the strict gate's overflow obligations.
+    /// fits; saturation only discharges the Trust lane's overflow obligations.
     #[inline]
     pub(crate) fn push(&mut self, line: Line) {
         let mem = line.memory_used();
@@ -62,7 +62,7 @@ impl HotTier {
         let n = n.min(self.lines.len());
         // Capacity is a hint only. Real callers pass block-size counts (`block_size`
         // is clamped to MAX_DECODE_PAGE_LINES), so the bounded branch always runs;
-        // the bound makes the strict gate's allocation-budget obligation provable.
+        // the bound makes the Trust lane's allocation-budget obligation provable.
         let mut result = if n <= crate::line::MAX_DECODE_PAGE_LINES {
             Vec::with_capacity(n)
         } else {
@@ -129,7 +129,7 @@ impl HotTier {
         self.budgeted_bytes
     }
 
-    /// Saturating for the same strict-gate reason as [`push`](Self::push).
+    /// Saturating for the same Trust-lane reason as [`push`](Self::push).
     ///
     /// Test-only: the invariant recomputation that calls it is.
     #[cfg(test)]

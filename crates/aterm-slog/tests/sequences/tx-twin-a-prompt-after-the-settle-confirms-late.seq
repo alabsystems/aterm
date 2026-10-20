@@ -1,0 +1,12 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_prompt_after_the_settle_confirms_the_closed_turn_late, its first
+# rig (§2.5 row 3).
+bind 0
+see busy
+pass 100
+see idle
+wait 1000
+expect turn=none
+tx prompt v1
+expect amend t1 turn vref=v1
+expect tx mapped=t1

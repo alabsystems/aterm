@@ -56,6 +56,23 @@ pub(crate) enum DetachedReaderAim {
     At { rows: usize, at_counter: u64 },
 }
 
+/// The history rows a detach window owes its re-attach's deficit fill
+/// (`Grid::settle_fill_debt`): where the synchronous resize shows history the
+/// job holds at the top of the screen, the window's screen holds as many
+/// blank rows under its trailing band instead. Kept as a count of those rows,
+/// not as the band the re-attach leaves, so output that draws on or erases
+/// rows under the cursor moves the band as it moves the synchronous one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FillDebt {
+    /// The blank rows that stand for owed history rows.
+    pub(crate) rows: usize,
+    /// Of the trimmed rows a grow appends back (`Edge::Trimmed`), those that
+    /// stood for owed rows: the synchronous shrink demoted history rows
+    /// there, and its grow reveals them back where the window's appends
+    /// blanks, owed again.
+    pub(crate) trimmed: u16,
+}
+
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct GridStorage {
@@ -92,12 +109,16 @@ pub struct GridStorage {
     /// Settings snapshot for the detached tiered store, plus mutations that
     /// arrived while the worker owned it. `None` outside a detach window.
     pub(crate) pending_scrollback_settings: Option<PendingScrollbackSettings>,
-    /// The viewport's trailing-blank-row count when a width-reflow resize
-    /// detached the store (`resize_offloading_scrollback`): the resize cannot
-    /// bottom-anchor without the history, so the re-attach runs the deficit fill
-    /// (`fill_viewport_deficit_from_history`) against it. Consumed by the first
+    /// What a detach window owes its re-attach's deficit fill
+    /// (`fill_viewport_deficit_from_history`): the resizes inside it cannot
+    /// reveal or pull back the history the job holds. Paid by the first
     /// width-matched re-attach; cleared by erase, replacement and abort.
-    pub(crate) pending_fill_target: Option<usize>,
+    pub(crate) fill_debt: FillDebt,
+    /// A width change inside the detach window found the window's output
+    /// staged (`lazy_buffer`), at a width the grid has since left: the
+    /// re-attach re-detaches to rewrap it, even when the job's own width is
+    /// current. Reset when a window opens.
+    pub(crate) staged_width_stale: bool,
     /// The reader's aim while the history is away: `Some` once a gesture asks
     /// for more than is attached, so the re-attach can land the reader there;
     /// `None` leaves the re-attach's restore rule standing. Recorded only by
@@ -155,6 +176,15 @@ pub struct GridStorage {
     /// drawn in between to hand back exactly (`grid::resize_undo`). `None`
     /// outside such a flap. Session-only: never checkpointed.
     pub(crate) resize_undo: Option<Box<super::super::resize_undo::ResizeUndo>>,
+    /// What the Native rows-only resizes moved at one edge, for a resize the
+    /// other way to hand back there first: the blank rows trims took off the
+    /// bottom, or the history lines grows revealed at the top
+    /// (`grid::resize_handback`). A checkpoint carries it through
+    /// `Grid::handback_rows` and `Grid::handback_above`.
+    pub(crate) handback: super::super::resize_handback::HandBack,
+    /// The resize law the rows are laid out under: the current one, or an
+    /// older one for a replay (`Grid::set_resize_law`).
+    pub(crate) resize_law: super::super::resize_handback::ResizeLaw,
     /// Monotonic absolute row counter, for pins that survive scrollback eviction.
     pub absolute_row_counter: u64,
     /// Monotonic content generation, bumped by every `mark_content_*` wrapper

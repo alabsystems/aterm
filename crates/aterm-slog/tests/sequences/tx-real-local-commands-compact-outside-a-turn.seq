@@ -1,0 +1,16 @@
+seq v=1 rig=transcript program=claude build=2.1.294
+# REAL ROWS (5B-2): the rows a real Claude Code 2.1.294 wrote for a run of
+# local commands, two of them /compact (aterm-agent's fixture, lines 2-30,
+# folded whole there: no prompt row, so no vendor turn), each at the offset
+# and time the real reader hands it on (dated= relative, the first at 0),
+# read the instant it was written, Partial (S9: 2.1.294 is no measured
+# build): each is an instant step on the run, orphaned, at strong.
+state partial
+bind 0
+expect turn=none
+tx compact dated=0 off=9580 slice=claude-2.1.294-transcript-local-commands:2-30
+expect open p1 compact par=r1 orphan=1 by=vendor src=transcript conf=strong
+expect close p1 compact out=ok by=vendor
+at 133578 tx compact dated=133578 off=18321 slice=claude-2.1.294-transcript-local-commands:2-30
+expect open p2 compact par=r1 orphan=1 by=vendor conf=strong
+expect close p2 compact out=ok

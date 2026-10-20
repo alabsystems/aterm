@@ -255,6 +255,7 @@ fn the_gate_is_off_by_default_and_follows_the_desk() {
     let on = Config {
         session_log: Some(SessionLogConfig {
             journal: Some(true),
+            clause: None,
         }),
         ..Config::default()
     };
@@ -268,6 +269,16 @@ fn the_gate_is_off_by_default_and_follows_the_desk() {
             !gate(&no_restore, desk),
             "follows restore_session ({desk:?})"
         );
+    }
+    for (requested, restore, desk, supported, expected) in [
+        (false, true, Desk::Window, true, Some(Inactive::Disabled)),
+        (true, true, Desk::Window, false, Some(Inactive::Unsupported)),
+        (true, false, Desk::Window, true, Some(Inactive::RestoreOff)),
+        (true, true, Desk::Headless, true, Some(Inactive::NoDesk)),
+        (true, true, Desk::Window, true, None),
+        (true, true, Desk::LabHeadless, true, None),
+    ] {
+        assert_eq!(eligibility(requested, restore, desk, supported), expected);
     }
     assert_eq!(gate(&on, Desk::Window), cfg!(unix));
     assert_eq!(gate(&on, Desk::LabHeadless), cfg!(unix), "the lab's seam");
@@ -293,6 +304,39 @@ fn the_default_creates_nothing() {
         super::fs::PinnedJournalFs::open(&logs, false)
             .expect("an absent journal is no error")
             .is_none()
+    );
+    // Refusing the actual spawn path must not leave a phantom armed writer or
+    // retain the store in a closure that never ran.
+    let failed_shared = Shared::new();
+    let store = crate::session_store::new_store();
+    let mut failed = Lane {
+        shared: Some(Arc::clone(&failed_shared)),
+        logs: Some(logs.clone()),
+        armed: false,
+        started: false,
+    };
+    failed.start_with(Arc::clone(&store), |_writer| {
+        Err(io::Error::other("injected spawn failure"))
+    });
+    assert_eq!(
+        failed.status(),
+        Status {
+            phase: Some(Phase::Stopped),
+            attention: Attention::Stopped(Cause::Spawn)
+        }
+    );
+    assert_eq!(
+        Arc::strong_count(&store),
+        1,
+        "failed spawn releases captured retirement/store state"
+    );
+    failed.start_with(Arc::clone(&store), |_| {
+        panic!("one launch must not retry its failed spawn")
+    });
+    assert_eq!(
+        lane.status().phase,
+        None,
+        "inert differs from a failed writer"
     );
     // An armed lane's thread (an update candidate) finished before its Commit.
     let shared = Shared::new();
@@ -1447,182 +1491,6 @@ fn version_skew_both_ways() {
     let older: crate::app_config::Config =
         aterm_toml::from_str("[a_future_table]\nanything = true\n").expect("skipped");
     assert!(!older.session_log_journal());
-}
-
-// ---- measurements (reported, never asserted) ----------------------------
-//
-// `targo --unverified test -p aterm-gui --lib -- session_log_journal::tests::measure
-// --ignored --nocapture --test-threads=1`
-
-/// A session's realistic traffic: commands that open and close, and marks.
-fn busy_session(sessions: &Sessions, sid: &str, records: u64) -> Timeline {
-    let tl = sessions.add(sid);
-    let mut ms = 1;
-    while tl.lock().expect("tl").slog().log().last_seq() < records {
-        ms += 3;
-        let r = cmd(&tl, ms);
-        mark(&tl, ms + 1);
-        with_log(&tl, |log| {
-            let _ = log.close(
-                r,
-                Close::new(Out::Run(RunOut::Ok), Src::Shell, Conf::Exact),
-                at(ms + 2),
-            );
-        });
-    }
-    tl
-}
-
-#[cfg(unix)]
-#[test]
-#[ignore = "a measurement: run by name with --ignored --nocapture"]
-fn measure_the_writer_the_wake_the_reader_and_the_quit() {
-    use std::time::Instant;
-    let build = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    // THE WAKE: what an append's ring costs the producer's thread.
-    let wake = Wake::default();
-    let n = 10_000_000u32;
-    let t = Instant::now();
-    for _ in 0..n {
-        wake.ring();
-    }
-    let ring_ns = t.elapsed().as_nanos() as f64 / f64::from(n);
-    let mut with = Log::new(1);
-    let mut without = Log::new(1);
-    let shared = Shared::new();
-    with.set_notify(Some(shared.notify.clone()));
-    let appends = 200_000u64;
-    let time = |log: &mut Log| {
-        let t = Instant::now();
-        for i in 0..appends {
-            let _ = log.mark(Mark::new(Kind::Human, Src::Input, Conf::Exact), at(i));
-        }
-        t.elapsed().as_nanos() as f64 / appends as f64
-    };
-    let (a0, a1) = (time(&mut without), time(&mut with));
-    println!(
-        "MEASURE[{build}] wake: ring {ring_ns:.1} ns (dirty already set); an append {a0:.0} ns \
-         without the wake, {a1:.0} ns with it"
-    );
-    // THE WRITER over a real scratch directory: 300 sessions of 1000 records.
-    let scratch = tempdir("measure");
-    let logs = scratch.join("logs");
-    std::fs::create_dir_all(&logs).expect("logs");
-    let fs: Arc<dyn JournalFs> = Arc::new(
-        super::fs::PinnedJournalFs::open(&logs, true)
-            .expect("opens")
-            .expect("made"),
-    );
-    let sessions = Sessions::default();
-    let tls: Vec<Timeline> = (0..300)
-        .map(|i| busy_session(&sessions, &format!("s-m{i:03}"), 1000))
-        .collect();
-    let clock = Arc::new(TestClock::default());
-    let report = Arc::new(Report::default());
-    let mut w = Writer::new(
-        Arc::clone(&fs),
-        sessions.clone(),
-        inst("p1-ae"),
-        Arc::clone(&clock) as Arc<dyn Clock>,
-        WriterLimits::default(),
-        Arc::clone(&report),
-    );
-    w.start();
-    let t = Instant::now();
-    let mut passes = 0;
-    loop {
-        passes += 1;
-        w.pass();
-        if !w.owed {
-            break;
-        }
-    }
-    let first = t.elapsed();
-    let lines = report.lines.load(Ordering::Relaxed);
-    let bytes = report.bytes.load(Ordering::Relaxed);
-    println!(
-        "MEASURE[{build}] writer: 300 sessions x 1000 records, {passes} passes in {first:?}: \
-         {:.2} us per line, {} lines, {:.0} bytes per line",
-        first.as_secs_f64() * 1e6 / lines as f64,
-        lines,
-        bytes as f64 / lines as f64
-    );
-    // A steady pass: one new record in every session.
-    for (i, tl) in tls.iter().enumerate() {
-        mark(tl, 100_000 + i as u64);
-    }
-    let t = Instant::now();
-    w.pass();
-    let steady = t.elapsed();
-    // The lock hold: one take of a full ring, what runs under a timeline lock.
-    let g = tls[0].lock().expect("tl");
-    let t = Instant::now();
-    let take = journal::take(g.slog().log(), 0, BATCH_RECORDS, true);
-    let hold = t.elapsed();
-    drop(g);
-    println!(
-        "MEASURE[{build}] writer: a pass of 300 sessions with one new record each {steady:?}; \
-         one take of {} records under the lock {hold:?}",
-        take.recs.len()
-    );
-    // Fill to about 64 MiB of segments, then the first read and a later one.
-    while report.bytes.load(Ordering::Relaxed) < 64 << 20 {
-        for (i, tl) in tls.iter().enumerate() {
-            for k in 0..20 {
-                mark(tl, 200_000 + i as u64 * 100 + k);
-            }
-        }
-        loop {
-            w.pass();
-            if !w.owed {
-                break;
-            }
-        }
-    }
-    let total: u64 = list(&*fs)
-        .expect("lists")
-        .names
-        .iter()
-        .filter(|n| n.ends_with(".slog"))
-        .filter_map(|n| fs.meta(n).ok())
-        .map(|m| m.size)
-        .sum();
-    let sid = ShortId::new("s-m150").expect("sid");
-    let index = Mutex::new(Index::default());
-    let len = |r: JournalRead| match r {
-        JournalRead::View(v) => v.log.len(),
-        _ => 0,
-    };
-    let (mut c1, mut c2) = (
-        super::read::ReadCost::default(),
-        super::read::ReadCost::default(),
-    );
-    let t = Instant::now();
-    let v = super::read::view_costed(fs.as_ref(), &index, &sid, Budgets::READER, &mut c1);
-    let first_read = t.elapsed();
-    let t = Instant::now();
-    let v2 = super::read::view_costed(fs.as_ref(), &index, &sid, Budgets::READER, &mut c2);
-    let later_read = t.elapsed();
-    println!(
-        "MEASURE[{build}] reader: {:.1} MiB of segments; the first `log @<sid>` (indexing the \
-         whole directory, then decoding its segments) {first_read:?} ({} records; {c1:?}), a \
-         later one {later_read:?} ({} records; {c2:?})",
-        total as f64 / f64::from(1 << 20),
-        len(v),
-        len(v2),
-    );
-    // THE QUIT: 300 open sessions' closes and `#fin`.
-    let t = Instant::now();
-    w.finish(clock.mono() + QUIT_BUDGET * 100);
-    println!(
-        "MEASURE[{build}] quit: drain, 300 sessions' closes and #fin in {:?}",
-        t.elapsed()
-    );
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 /// A writer that runs long stays within the budget: it removes its own

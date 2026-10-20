@@ -1,0 +1,33 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# §2.4: wall:unresponsive is a stall step, need unresponsive, never a wall
+# step; it never closes the turn, and closes passed when the override lifts.
+see busy
+see wall:unresponsive
+expect open p1 stall par=t1
+expect need=unresponsive
+expect clause=not responding
+half
+half
+half
+half
+half
+half
+half
+half
+half
+half
+half
+half
+half
+half
+half
+half
+half
+half
+half
+half
+expect turn=open
+see busy
+expect close p1 stall out=passed dur_ms=10000
+expect need=none
+expect open t1 turn

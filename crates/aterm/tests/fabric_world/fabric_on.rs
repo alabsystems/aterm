@@ -324,6 +324,128 @@ fn step<'a>(out: &'a str, name: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// **THE DEV APP'S PATH HOLDS A SPACE** (`~/Applications/aterm (dev).app/…`,
+/// what `targo --unverified ship dev-app` installs), and `on` used to refuse
+/// it at the argv step: `[fabric] command` is a whitespace-split line. Now
+/// `on` RUNS THAT PATH THROUGH A LINK in the fabric root, `<root>/bin/aterm`,
+/// so the command it writes is still the one plain line every aterm reads —
+/// never an argv array, which an older aterm sharing aterm.toml would reject
+/// the whole file for. The instance arms that line, the bridge runs through
+/// the link (its argv[0]), and the proof round-trips through the broker. A
+/// second `on` changes nothing. NEGATIVE CONTROL: the line spelling of the
+/// spaced path itself names a program that is not there.
+#[test]
+fn on_with_an_aterm_path_holding_a_space_runs_it_through_a_link() {
+    let s = Scratch::new("sp");
+    let spaced_dir = s.dir.join("bin/aterm (dev).app");
+    std::fs::create_dir_all(&spaced_dir).expect("a spaced dir");
+    let spaced = spaced_dir.join("aterm");
+    std::os::unix::fs::symlink(BIN, &spaced).expect("link aterm under a spaced path");
+    let spaced = spaced.to_string_lossy().into_owned();
+    let gui = Gui::boot(&s);
+    let session = gui.boot_session();
+    let _broker = Broker::spawn(&s);
+
+    let mut on = s.fabric_cmd(&["on", "--service", "none"]);
+    on.env("ATERM_BIN", &spaced);
+    let (code, out, err) = run(&mut on);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    for (name, verdict) in [
+        ("binary", "ok"),
+        ("program", "done"),
+        ("config", "done"),
+        ("rendezvous", "done"),
+        ("instance", "done"),
+        ("proof", "ok"),
+    ] {
+        assert!(
+            step(&out, name)
+                .iter()
+                .any(|l| l.split_whitespace().nth(1) == Some(verdict)),
+            "step `{name}` should read `{verdict}`:\n{out}"
+        );
+    }
+    let link = s.root().join("bin/aterm");
+    assert_eq!(
+        std::fs::read_link(&link).expect("the program link"),
+        std::path::Path::new(&spaced),
+        "the link names the spaced path"
+    );
+    let link = link.to_string_lossy().into_owned();
+    let node = std::fs::read_to_string(s.root().join("link-state/node")).expect("node");
+    let node = node.trim();
+    let line = format!(
+        "{link} link serve --fleet local --broker {} --cap-file {} --state {} --accept-from {node}",
+        s.sock(),
+        s.path("root/node.cap"),
+        s.path("root/link-state")
+    );
+    let want = aterm_types::fabric_command::split_line(&line);
+    let config = std::fs::read_to_string(s.config()).expect("config");
+    assert!(
+        config.contains(&format!("command = \"{line}\"\n")),
+        "the LINE form, never an array:\n{config}"
+    );
+    assert!(!config.contains(&spaced), "{config}");
+    assert_eq!(
+        aterm_link::fabric::command_in_toml(&config),
+        Ok(Some(want.clone()))
+    );
+    let rendezvous_text = std::fs::read_to_string(s.rendezvous()).expect("fabric.toml");
+    assert!(
+        rendezvous_text.contains(&format!("command = \"{line}\"\n")),
+        "{rendezvous_text}"
+    );
+    let rendezvous = aterm_link::enable::Rendezvous::parse(&rendezvous_text).expect("parses");
+    assert_eq!(rendezvous.command, want);
+    // The instance runs exactly that argv, and its bridge is up.
+    let h = gui.verb("fabric status").header().to_string();
+    assert_eq!(kv(&h, "state"), Some("connected"), "{h}");
+    assert_eq!(
+        aterm_link::fabric::status_argv(&h),
+        Some(want.clone()),
+        "{h}"
+    );
+    let bridge: i32 = std::fs::read_to_string(s.root().join("link-state/pid"))
+        .expect("the bridge's pid file")
+        .trim()
+        .parse()
+        .expect("a pid");
+    let argv0 = aterm_uds::process::read_process_argv(bridge)
+        .and_then(|argv| argv.first().map(|w| w.to_string_lossy().into_owned()));
+    assert_eq!(
+        argv0.as_deref(),
+        Some(link.as_str()),
+        "the bridge's argv[0]"
+    );
+    let inbox = gui.verb(&format!("@{session} inbox --peek"));
+    assert!(
+        inbox
+            .rows()
+            .iter()
+            .any(|r| r.starts_with("msg ") && kv(r, "kind") == Some("note")),
+        "the proof's note was delivered: {:#?}",
+        inbox.rows()
+    );
+    // NEGATIVE CONTROL: the line spelling of the spaced path splits it.
+    let split = aterm_types::fabric_command::split_line(&format!("{spaced} link serve"));
+    assert_ne!(split[0], spaced);
+    assert!(!std::path::Path::new(&split[0]).exists(), "{}", split[0]);
+    // A second `on` reads the same command and the same link.
+    let mut again = s.fabric_cmd(&["on", "--service", "none"]);
+    again.env("ATERM_BIN", &spaced);
+    let (code, out, err) = run(&mut again);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    for name in ["program", "config"] {
+        assert!(
+            step(&out, name)
+                .iter()
+                .any(|l| l.split_whitespace().nth(1) == Some("already")),
+            "step `{name}` should read `already`:\n{out}"
+        );
+    }
+}
+
 /// **THE WHOLE THING, END TO END, TWICE.** A headless aterm with no fabric
 /// command and no broker: the first `on` provisions the root, the node id, the
 /// secret and the cap, then FAILS at the broker — `--service none` starts none
@@ -436,12 +558,12 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
         .expect("a [fabric] command");
     assert_eq!(
         command,
-        format!(
+        aterm_types::fabric_command::split_line(&format!(
             "{BIN} link serve --fleet local --broker {} --cap-file {} --state {} --accept-from {node}",
             s.sock(),
             s.path("root/node.cap"),
             s.path("root/link-state")
-        )
+        ))
     );
     let baseline_backup = std::fs::read_to_string(s.dir.join("cfg/aterm/aterm.toml.bak"))
         .expect("the initial isolation config was backed up");
@@ -462,8 +584,8 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     assert_eq!(kv(h, "supervised"), Some("1"), "{h}");
     assert_eq!(kv(h, "state"), Some("connected"), "{h}");
     assert_eq!(
-        kv(h, "command").map(aterm_link::pct::decode).as_deref(),
-        Some(command.as_str()),
+        aterm_link::fabric::status_argv(h),
+        Some(command.clone()),
         "{h}"
     );
     // The proof's note is in the session's inbox, delivered THROUGH the broker
@@ -563,8 +685,9 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     std::fs::write(
         s.config(),
         format!(
-            "font_px = 12.0\n{}\n[fabric]\ncommand = \"{command}\"\n\n[keys]\nx = 1\n",
-            harness::FIXTURE_GUI_CONFIG
+            "font_px = 12.0\n{}\n[fabric]\ncommand = \"{}\"\n\n[keys]\nx = 1\n",
+            harness::FIXTURE_GUI_CONFIG,
+            command.join(" ")
         ),
     )
     .expect("config");
@@ -1221,27 +1344,15 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     assert!(gone, "the managed broker {pid} must be dead after off");
 }
 
-/// **REFUSALS**: `--tcp --key-file` is refused BEFORE anything is written — in
-/// a default build, and in a sealed one for a non-loopback bind without
-/// `--allow-remote` and for an ephemeral port — and a bad `--service` is a
-/// usage error.
+/// **REFUSALS**: a flag `on` does not take (`--tcp`, the removed sealed wire's)
+/// and a bad `--service` are usage errors, refused BEFORE anything is written.
 #[test]
-fn tcp_is_refused_before_anything_is_written() {
+fn a_usage_error_is_refused_before_anything_is_written() {
     let s = Scratch::new("usage");
-    let key = s.path("fleet.key");
-    if cfg!(feature = "sealed") {
-        let (code, _, err) = s.fabric(&["on", "--tcp", "0.0.0.0:7000", "--key-file", &key]);
-        assert_eq!(code, 2, "{err}");
-        let (code, _, err) = s.fabric(&["on", "--tcp", "127.0.0.1:0", "--key-file", &key]);
-        assert_eq!(code, 2, "{err}");
-    } else {
-        let (code, _, err) = s.fabric(&["on", "--tcp", "127.0.0.1:7000", "--key-file", &key]);
-        assert_eq!(code, 2, "{err}");
-    }
     let (code, _, err) = s.fabric(&["on", "--tcp", "127.0.0.1:7000"]);
     assert_eq!(code, 2, "{err}");
     assert!(
-        !s.root().join("link-state").exists() && !Path::new(&key).exists(),
+        !s.root().join("link-state").exists(),
         "a refused flag provisioned something"
     );
     let (code, _, err) = s.fabric(&["on", "--service", "cron"]);
@@ -1253,7 +1364,7 @@ fn tcp_is_refused_before_anything_is_written() {
 
 /// An unreadable or invalid role is not a new one-host fabric. Even without
 /// the login's rendezvous file, the refusing command must leave the previous
-/// node and remotely issued cap untouched and mint no secret of its own.
+/// node and its cap untouched and mint no secret of its own.
 #[test]
 fn role_identity_unreadable_state_never_writes() {
     let mut outcomes = Vec::new();
@@ -1267,7 +1378,7 @@ fn role_identity_unreadable_state_never_writes() {
         let s = Scratch::new(&format!("role-bad-{bad}"));
         std::fs::create_dir_all(s.root().join("link-state")).expect("state");
         let node = b"n-00000000000000aa\n";
-        let cap = b"the cap issued by the other host\n";
+        let cap = b"the cap the root already holds\n";
         std::fs::write(s.root().join("link-state/node"), node).expect("node");
         std::fs::write(s.root().join("node.cap"), cap).expect("cap");
         match bad {
@@ -1275,7 +1386,7 @@ fn role_identity_unreadable_state_never_writes() {
             "config-directory" => std::fs::create_dir(s.config()).unwrap(),
             "bridge-flags" => std::fs::write(
                 s.config(),
-                format!("[fabric]\ncommand = \"{BIN} link serve --fleet work --tcp\"\n"),
+                format!("[fabric]\ncommand = \"{BIN} link serve --fleet work --no-such-flag\"\n"),
             )
             .unwrap(),
             "rendezvous" => {
@@ -1347,7 +1458,7 @@ fn role_identity_reapplication_preserves_the_nondefault_fleet() {
     let flags = aterm_link::fabric::serve_flags(&command).unwrap();
     assert!(
         flags.windows(2).any(|w| w == ["--fleet", "work"]),
-        "{command}"
+        "{command:?}"
     );
     let rendezvous =
         aterm_link::enable::Rendezvous::parse(&std::fs::read_to_string(s.rendezvous()).unwrap())
@@ -1414,14 +1525,12 @@ fn role_identity_conflicting_fleet_is_refused_before_writes() {
 }
 
 /// **A BARE `on` RE-APPLIES THE ROOT AS IT IS** — doctor's remedy for a
-/// broker that does not answer, so it must not change which fleet the host is
-/// on. On a root whose installed job serves the sealed wire, a bare `on` keeps
-/// it (the broker it would run still serves `--tcp`; a default build refuses
-/// it by name rather than drop the listener every joined host dials), and a
-/// Unix job is the control: no `--tcp`. On a root whose `[fabric] command`
-/// JOINED another host's broker, `on` is refused before anything is written.
+/// broker that does not answer. The installed job is READ before anything is
+/// written: a Unix broker job is the control (the bare `on` runs the Unix
+/// broker), and a job that names no broker command is refused, exit 2, with
+/// nothing written — metadata `on` cannot read is never taken for a fresh root.
 #[test]
-fn a_bare_on_keeps_the_served_wire_and_refuses_a_joined_root() {
+fn a_bare_on_runs_the_unix_broker_and_refuses_a_job_it_cannot_read() {
     let s = Scratch::new("role");
     let root = s.path("root");
     let label = format!(
@@ -1429,7 +1538,6 @@ fn a_bare_on_keeps_the_served_wire_and_refuses_a_joined_root() {
         aterm_link::enable::cksum(root.as_bytes())
     );
     let plist = s.root().join(format!("{label}.plist"));
-    let key = s.path("fleet.key");
     let job = |argv: &[&str]| {
         let words: String = argv
             .iter()
@@ -1463,58 +1571,13 @@ fn a_bare_on_keeps_the_served_wire_and_refuses_a_joined_root() {
         step(&out, "broker").iter().any(|l| l.contains(&unix)) && !out.contains("--tcp"),
         "{out}"
     );
-    // ---- a job that serves the sealed wire: kept
-    job(&[
-        BIN,
-        "link",
-        "broker",
-        "--tcp",
-        "127.0.0.1:7999",
-        "--key-file",
-        &key,
-        "--secret-file",
-        &secret,
-        "--unix",
-        &s.sock(),
-        &log,
-    ]);
-    let (code, out, err) = s.fabric(&["on", "--service", "none", "--dry-run"]);
-    if cfg!(feature = "sealed") {
-        assert_eq!(code, 1, "no broker answers:\n{out}{err}");
-        let sealed = format!("{BIN} link broker --tcp 127.0.0.1:7999 --key-file {key} ");
-        assert!(
-            step(&out, "broker").iter().any(|l| l.contains(&sealed)),
-            "a bare `on` dropped the job's sealed wire:\n{out}"
-        );
-    } else {
-        assert_eq!(code, 2, "{out}{err}");
-        assert!(
-            err.contains("`sealed` cargo feature") && err.contains(&plist.display().to_string()),
-            "{err}"
-        );
-        assert!(!s.root().join("link-state").exists(), "{out}");
-    }
-    std::fs::remove_file(&plist).expect("plist");
-
-    // ---- a JOINED root: refused, nothing written
-    let joined = format!(
-        "[fabric]\ncommand = \"{BIN} link serve --fleet local --broker 127.0.0.1:7999 --tcp \
-         --key-file {root}/fleet.key --cap-file {root}/node.cap --state {root}/link-state \
-         --accept-from n-00000000000000bb,n-00000000000000aa\"\n"
-    );
-    std::fs::write(s.config(), &joined).expect("config");
-    for args in [
-        &["on", "--service", "none"][..],
-        &["on", "--service", "none", "--dry-run"][..],
-    ] {
-        let (code, out, err) = s.fabric(args);
-        assert_eq!(code, 2, "{args:?}: a joined root ran `on`:\n{out}{err}");
-        assert!(err.contains("127.0.0.1:7999"), "{err}");
-    }
-    assert_eq!(
-        std::fs::read_to_string(s.config()).expect("config"),
-        joined,
-        "the joined host's command was rewritten"
+    // ---- a job that names no broker command: refused, nothing written
+    job(&[BIN, "link", "serve", "--fleet", "local"]);
+    let (code, out, err) = s.fabric(&["on", "--service", "none"]);
+    assert_eq!(code, 2, "a job naming no broker ran `on`:\n{out}{err}");
+    assert!(
+        err.contains("does not name a recognized broker command"),
+        "{err}"
     );
     for absent in ["link-state", "mint.secret", "node.cap"] {
         assert!(
@@ -1686,7 +1749,7 @@ fn until_hold(gui: &Gui, sid: &str, want: u8) -> std::time::Duration {
 
 /// **A PERSON HALTS THE FLEET AND WITHDRAWS IT, AND `off` NAMES EVERY SESSION
 /// THE FLEET HOLDS.** On the guarded broker `on` deploys, with the commands a
-/// person runs: `mint-for h-review` (a default build), `halt`, and `halt off`.
+/// person runs: `mint-for h-review`, `halt`, and `halt off`.
 /// The bridge holds the session; the Owner's `hold <sid> off` is denied;
 /// node.cap is no person's and cannot halt; `off` — dry and real — stops the
 /// one thing that could ever lift it, so it names the session and the command
@@ -1766,6 +1829,69 @@ fn review_off_names_a_session_the_fleet_holds() {
     assert!(status.header().contains(" hold=1 "), "{}", status.header());
     drop(gui);
     drop(broker);
+}
+
+/// **`(0600)` IS TRUE WHEN IT IS SAID.** `mint-for --out` over an IDENTICAL
+/// cap another user could read makes it 0600 before it says so, and stderr
+/// says it was readable and what voids a copy; over a DIFFERENT file it is
+/// refused, the file untouched; and a symlink at `--out` is refused, its
+/// target's bytes and mode untouched: a cap is never written — or chmodded —
+/// through one.
+#[test]
+fn mint_for_never_claims_0600_of_a_file_that_is_not() {
+    let s = Scratch::new("mint-out");
+    let _broker = Broker::spawn(&s);
+    let (code, out, err) = s.fabric(&["on", "--service", "none"]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let cap = s.path("h-review.cap");
+    let (code, out, err) = s.fabric(&["mint-for", "h-review", "--out", &cap]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    chmod(Path::new(&cap), 0o644);
+    let (code, out, err) = s.fabric(&["mint-for", "h-review", "--out", &cap]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains(&format!("into {cap} (0600)")), "{out}");
+    assert_eq!(
+        harness::mode_of(Path::new(&cap)),
+        0o600,
+        "said 0600 of a 0644 cap"
+    );
+    assert!(
+        err.contains("held this cap at mode 644, readable by other users; now 0600"),
+        "{err}"
+    );
+    let secret = s.root().join("mint.secret");
+    assert!(
+        err.contains(&format!(
+            "move {} aside and run `aterm fabric on` again",
+            secret.display()
+        )),
+        "the remedy names what replaces the secret:\n{err}"
+    );
+
+    // A DIFFERENT cap at --out (another person's): refused, untouched.
+    let other = s.path("h-other.cap");
+    let (code, out, err) = s.fabric(&["mint-for", "h-other", "--out", &other]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let theirs = std::fs::read(&other).expect("h-other's cap");
+    let (code, _, err) = s.fabric(&["mint-for", "h-review", "--out", &other]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("holds a different cap"), "{err}");
+    assert_eq!(std::fs::read(&other).expect("h-other's cap"), theirs);
+
+    // A symlink at --out, to a file of the operator's.
+    let victim = s.path("victim.txt");
+    std::fs::write(&victim, "the operator's own file\n").expect("victim");
+    chmod(Path::new(&victim), 0o644);
+    let linked = s.path("linked.cap");
+    std::os::unix::fs::symlink(&victim, &linked).expect("link");
+    let (code, _, err) = s.fabric(&["mint-for", "h-review", "--out", &linked]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("is not a regular file"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(&victim).expect("victim"),
+        "the operator's own file\n"
+    );
+    assert_eq!(harness::mode_of(Path::new(&victim)), 0o644);
 }
 
 /// **A PERSON READS AN ASK AND ANSWERS IT, AS A HUMAN.** An agent's `post

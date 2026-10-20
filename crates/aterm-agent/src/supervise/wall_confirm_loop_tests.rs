@@ -39,6 +39,18 @@ fn transcript(name: &str) -> &'static str {
         "session-limit-cancelled-then-person-turn" => include_str!(
             "fixtures/claude-2.1.299-transcript-session-limit-cancelled-then-person-turn.jsonl"
         ),
+        "post-hook-blank-reason-then-context" => include_str!(
+            "fixtures/claude-2.1.304-transcript-post-hook-blank-reason-then-context.jsonl"
+        ),
+        "post-hook-reason-context-phrase" => include_str!(
+            "fixtures/claude-2.1.304-transcript-post-hook-reason-context-phrase-empty-reply.jsonl"
+        ),
+        "verbose-long-output-then-context" => include_str!(
+            "fixtures/claude-2.1.304-transcript-verbose-long-output-then-context.jsonl"
+        ),
+        "stop-hook-feedback-then-context" => {
+            include_str!("fixtures/claude-2.1.304-transcript-stop-hook-feedback-then-context.jsonl")
+        }
         other => panic!("no transcript {other}"),
     }
 }
@@ -64,6 +76,9 @@ struct TranscriptHost {
     own_again: std::sync::atomic::AtomicBool,
     /// The host stops wanting once it took a step ([`Self::wanting`]).
     once: std::sync::atomic::AtomicBool,
+    /// When the agent's process started, unix seconds
+    /// ([`IdleHost::agent_started`]); none by default.
+    started: std::sync::Mutex<Option<i64>>,
 }
 
 impl TranscriptHost {
@@ -127,6 +142,9 @@ impl IdleHost for TranscriptHost {
     fn can_restart(&self) -> bool {
         self.restartable.load(Ordering::SeqCst)
     }
+    fn agent_started(&self) -> Option<i64> {
+        *self.started.lock().unwrap()
+    }
     fn transcript_tail(&self) -> Option<String> {
         self.asks.fetch_add(1, Ordering::SeqCst);
         self.next_tail()
@@ -143,10 +161,10 @@ impl IdleHost for TranscriptHost {
 /// One run of `wall` (after a busy read) under the owner's policy, the continuation off unless
 /// `continuing`, the wall's act on short clocks, under `host`: the lines, the server's record,
 /// the journal's records.
-fn run_at(
+fn run_at<H: IdleHost + 'static>(
     tag: &str,
     wall: Vec<String>,
-    host: Option<Arc<TranscriptHost>>,
+    host: Option<Arc<H>>,
     continuing: bool,
 ) -> (
     Vec<String>,
@@ -160,10 +178,10 @@ fn run_at(
 }
 
 /// [`run_at`] on the scripted server `m`.
-fn run_mock(
+fn run_mock<H: IdleHost + 'static>(
     tag: &str,
     mut m: Mock,
-    host: Option<Arc<TranscriptHost>>,
+    host: Option<Arc<H>>,
     continuing: bool,
 ) -> (
     Vec<String>,
@@ -181,7 +199,7 @@ fn run_mock(
             continue_policy: continuing,
             ..SupervisorConfig::default()
         },
-        ..auto(30, None)
+        ..auto(30)
     };
     let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
         s.set_turn_end_timing(TurnEndTiming {
@@ -393,8 +411,8 @@ fn a_wall_in_a_tools_output_the_transcript_refuses_is_no_wall() {
 /// The real walls, each a screen measured on 2.1.294 under the transcript Claude Code wrote for
 /// it, its notice row last, get their act: `/compact` for every context wall (under a prompt's
 /// second paragraph, after an MCP or Bash output, a collapsed group, a Stop hook, a wrapped group
-/// row), `/login` and the alarm, a 529's retry ladder, a weekly limit's wait and episode; nothing
-/// is said unconfirmed.
+/// row), `/login` with no badge beside it, a 529's retry ladder, a weekly limit's wait and
+/// episode; nothing is said unconfirmed.
 #[test]
 fn a_wall_the_transcript_confirms_is_acted_on() {
     let read = |capture: &str| fx::screen(capture);
@@ -476,10 +494,13 @@ fn a_wall_the_transcript_confirms_is_acted_on() {
         assert!(refusals(&records).is_empty(), "{name}: {records:#?}");
         assert!(host.asks() >= 1, "{name}: the transcript was asked");
         if name == "no login" {
+            // The owner hears of a lost login through its notice where the
+            // sign-in stands, never a badge beside the `/login`.
             assert!(
-                m.requests.iter().any(|r| r
-                    .starts_with("meta set attention owner=supervisor claude wall: Not logged in")),
-                "{name}: the alarm — {:#?}",
+                !m.requests
+                    .iter()
+                    .any(|r| r.starts_with("meta set attention")),
+                "{name}: no badge — {:#?}",
                 m.requests
             );
         }
@@ -633,13 +654,12 @@ fn with_no_transcript_a_wall_under_a_tools_call_is_not_acted_on() {
     }
 }
 
-/// ATERM-KI-1015-14: with no transcript (a host with none to read, or no host: `aterm drive
-/// watch`, `aterm drive supervise`), a program's words behind one of Claude Code's own labels —
+/// ATERM-KI-1015-14: with no transcript (a host with none to read, or no host), a program's words behind one of Claude Code's own labels —
 /// a Monitor's event row, a hook's stderr or `systemMessage` (2.1.302, measured in the lab) — are
 /// no wall: nothing typed, nothing waited for, no line (the screen read no wall). On the base the
 /// event's row and the hooks' rows under the person's turn or a hook summary were acted on
 /// (`TYPED rule=auth-login@v1 /login`, `TYPED rule=context-compact@v1 /compact`; the first two
-/// measured with `aterm drive watch` against the lab), and the PostToolUse hook's row under a call
+/// measured with the since-removed `aterm drive watch` against the lab), and the PostToolUse hook's row under a call
 /// was refused as an unconfirmed wall. CONTROL: Claude Code's own context wall under a Monitor's
 /// event is acted on as the screen reads it.
 #[test]
@@ -697,13 +717,19 @@ fn with_no_transcript_a_programs_words_behind_a_vendor_label_are_not_acted_on() 
 /// row of Claude Code's own with NO label (2.1.302, measured in the lab) are no wall — a Stop
 /// hook's `stopReason` under the hook summary, and a PostToolUse hook's blocking `reason` under
 /// its `… hook returned blocking error` row. Nothing typed, nothing waited for, no line. On the
-/// base, measured with `aterm drive watch` against the lab: `TYPED rule=auth-login@v1 /login`
+/// base, measured with the since-removed `aterm drive watch` against the lab: `TYPED rule=auth-login@v1 /login`
 /// on the `stopReason`, and `LIMITED … WAITING … usage-session resets` (the session parked until
 /// the reset it named) on a double-spaced one; the reason under the call was refused as
 /// `read under a tool's call`. CONTROL: Claude Code's own context wall after the Stop hook's
 /// error row is acted on (`TYPED rule=context-compact@v1 /compact`, measured on the base too),
 /// also right under a Stop hook's `{"decision": "block", …}` behind the summary's label
-/// (measured after the fix, 2026-10-17).
+/// (measured after the fix, 2026-10-17). And under `claude --verbose` (2.1.304, measured in the
+/// lab, KI-1015-14): a `stopReason` under a prompt hook's row whose text opens with a label
+/// (`Review: …`) was read as the wall, and `/login` typed (this test's mutation run); the
+/// summary's words end only at a labelled row of its own — `Stop hook error:` and `Stop hook
+/// feedback:`, the row of a context a Stop hook added, under which the continuation's real
+/// context wall stands (2.1.304, measured 2026-10-19; read off the binary before), acted on with
+/// no transcript and confirmed by the session's own.
 #[test]
 fn with_no_transcript_a_hooks_words_under_its_own_rows_are_not_acted_on() {
     let spoofs = [
@@ -723,10 +749,19 @@ fn with_no_transcript_a_hooks_words_under_its_own_rows_are_not_acted_on() {
             "post-tool hook reason",
             fx::POST_HOOK_BLOCKING_REASON_LOGIN_PHRASE_MEASURED,
         ),
+        (
+            "verbose stop hooks, a labelled prompt row, the stop reason last",
+            fx::STOP_HOOKS_VERBOSE_LABELLED_PROMPT_ROW_LAST_MEASURED,
+        ),
+        (
+            "verbose stop hooks, a labelled prompt row",
+            fx::STOP_HOOKS_VERBOSE_LABELLED_PROMPT_ROW_MEASURED,
+        ),
     ];
     let reals = [
         fx::STOP_HOOK_ERROR_THEN_CONTEXT_WALL_302_MEASURED,
         fx::STOP_HOOK_DECISION_BLOCK_THEN_CONTEXT_WALL_MEASURED,
+        fx::STOP_HOOK_FEEDBACK_THEN_CONTEXT_WALL_MEASURED,
     ];
     let mut wrong = Vec::new();
     for none in [true, false] {
@@ -749,7 +784,144 @@ fn with_no_transcript_a_hooks_words_under_its_own_rows_are_not_acted_on() {
             );
         }
     }
+    // The session's own transcript confirms the wall after the feedback row.
+    let host = TranscriptHost::of(&[Some(transcript("stop-hook-feedback-then-context"))]);
+    let (lines, _, records) = run_at(
+        "wc-hook-feedback",
+        fx::screen(fx::STOP_HOOK_FEEDBACK_THEN_CONTEXT_WALL_MEASURED),
+        Some(host),
+        false,
+    );
+    let acts = wall_acts(&lines, &records);
+    if !acts
+        .first()
+        .is_some_and(|a| a.starts_with("TYPED rule=context-compact@v1 /compact"))
+    {
+        wrong.push(format!(
+            "the wall after the feedback row, confirmed: {acts:?}"
+        ));
+    }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// ATERM-KI-1015-14: with no transcript, a `statusLine` command printing `Not logged in · Run
+/// /login` (2.1.304, measured in the lab) is no wall — its row at column 2 above the mode row is
+/// the person's script, not the notice Claude Code right-aligns there. Nothing typed, nothing
+/// waited for, no line; under a usage limit's banner the limit is what is acted on. On the base
+/// the footer read every row's words: the status line was the login notice and `/login` was typed
+/// into a logged-in worker. CONTROL: the same words where Claude Code draws its own notice —
+/// right-aligned on the mode row (as `claude-2.1.304-footer-not-logged-in-no-statusline` measured
+/// it), and stacked under the mode row (as at 26 columns) — composed onto the measured screen,
+/// are acted on. A status line of several fields, its notice words in a later one after two
+/// spaces short of the right edge, is no wall either: the review of 87faa9bf23 typed `/login`
+/// on the first and waited for a 3pm reset on the second.
+#[test]
+fn with_no_transcript_a_status_lines_words_are_not_acted_on() {
+    const WORDS: &str = "Not logged in · Run /login";
+    let login = "TYPED rule=auth-login@v1 /login";
+    let status_line = fx::screen(fx::STATUS_LINE_LOGIN_WORDS_MEASURED);
+    let line = status_line
+        .iter()
+        .position(|r| r.trim() == WORDS)
+        .expect("the status line's row");
+    let mode = status_line[line + 1].clone();
+    assert!(mode.starts_with("  ⏵⏵"), "{mode}");
+    // Ending two columns short of the rule, as measured.
+    let width = status_line[line - 1].chars().count();
+    let pad = width - 2 - mode.chars().count();
+    let mut right = status_line.clone();
+    right.remove(line);
+    right[line] = format!("{mode}{WORDS:>pad$}");
+    let mut stacked = status_line.clone();
+    stacked.swap(line, line + 1);
+    let fields = |text: &str| {
+        let mut s = status_line.clone();
+        s[line] = text.to_string();
+        s
+    };
+    let mut wrong = Vec::new();
+    for none in [true, false] {
+        let host = || (!none).then(|| TranscriptHost::of(&[None]));
+        for (name, screen) in [
+            ("status line", status_line.clone()),
+            (
+                "fields",
+                fields("  opus-5.5  ~/proj/aterm  Not logged in · Run /login"),
+            ),
+            (
+                "fields, a limit",
+                fields("  ~/Developer/aterm  main  You've hit your session limit · resets 3pm"),
+            ),
+        ] {
+            let (lines, m, records) = run_at("wc-status-line", screen, host(), false);
+            let acts = wall_acts(&lines, &records);
+            let said = refusals(&records);
+            if !acts.is_empty() || count(&m, "turn") != 0 || !said.is_empty() {
+                wrong.push(format!("{name} (no host: {none}): {acts:?} {said:?}"));
+            }
+        }
+        let (lines, _, records) = run_at(
+            "wc-status-line-limit",
+            fx::screen(fx::WALL_SESSION_ARMED_STATUS_LINE_LOGIN_WORDS_MEASURED),
+            host(),
+            false,
+        );
+        let acts = wall_acts(&lines, &records);
+        if acts.is_empty() || acts.iter().any(|a| a.starts_with(login)) {
+            wrong.push(format!("under the banner (no host: {none}): {acts:?}"));
+        }
+        for (name, screen) in [("right-aligned", &right), ("stacked", &stacked)] {
+            let (lines, _, records) = run_at("wc-status-line-real", screen.clone(), host(), false);
+            let acts = wall_acts(&lines, &records);
+            if !acts.first().is_some_and(|a| a.starts_with(login)) {
+                wrong.push(format!("{name}, the vendor's (no host: {none}): {acts:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// ATERM-KI-1015-14: a hook's error row with NO ROW OF THE HOOK'S under it (2.1.304, measured in
+/// the lab): a PostToolUse hook blocking with a reason of blank space draws `⎿  PostToolUse:Bash
+/// hook returned blocking error` and nothing of its own, and Claude Code's real context wall stands
+/// right under it, where the hook's words do; a hook whose reason IS the wall's words draws the
+/// same screen. The screen reads no wall at either (the row is the hook's place). With the
+/// session's transcript the real one is found — it ends on `Prompt is too long`, the class the row
+/// shows — and `/compact` is typed; the spoof's ends on the model's empty reply, and nothing is
+/// done. On the base the real wall was never acted on, transcript or none (this test's mutation
+/// run). With no transcript neither is acted on: the knowing loss of recall the manual states.
+#[test]
+fn a_wall_where_a_hooks_words_stand_is_found_by_the_transcript() {
+    let real = fx::screen(fx::POST_HOOK_BLANK_REASON_THEN_CONTEXT_WALL_MEASURED);
+    let spoof = fx::screen(fx::POST_HOOK_REASON_CONTEXT_PHRASE_MEASURED);
+    let compact = "TYPED rule=context-compact@v1 /compact";
+    let host = TranscriptHost::of(&[Some(transcript("post-hook-blank-reason-then-context"))]);
+    let (lines, _, records) = run_at("wc-hook-place-real", real.clone(), Some(host), false);
+    let acts = wall_acts(&lines, &records);
+    assert!(
+        acts.first().is_some_and(|a| a.starts_with(compact)),
+        "the real wall: {acts:#?} {lines:#?}"
+    );
+    let host = TranscriptHost::of(&[Some(transcript("post-hook-reason-context-phrase"))]);
+    let (lines, m, records) = run_at("wc-hook-place-spoof", spoof.clone(), Some(host), false);
+    assert_eq!(
+        wall_acts(&lines, &records),
+        Vec::<String>::new(),
+        "{lines:#?}"
+    );
+    assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
+    for none in [true, false] {
+        let host = || (!none).then(|| TranscriptHost::of(&[None]));
+        for (name, screen) in [("real", &real), ("spoof", &spoof)] {
+            let (lines, m, records) = run_at("wc-hook-place-none", screen.clone(), host(), false);
+            assert_eq!(
+                wall_acts(&lines, &records),
+                Vec::<String>::new(),
+                "{name} (no host: {none}): {lines:#?}"
+            );
+            assert_eq!(count(&m, "turn"), 0, "{name} (no host: {none})");
+        }
+    }
 }
 
 /// A transcript read before Claude Code wrote the notice the screen shows (its newest entry the
@@ -841,12 +1013,7 @@ impl Review for Noted {
     fn approved(&mut self, _seq: u64, _command: &str) -> Result<(), String> {
         Ok(())
     }
-    fn review(
-        &mut self,
-        _turn: &Turn,
-        _report: Option<ReportBrief>,
-        _fold: Option<Fold>,
-    ) -> Result<bool, String> {
+    fn review(&mut self, _turn: &Turn) -> Result<bool, String> {
         Ok(true)
     }
     fn say(&mut self, line: &str) -> Result<(), String> {
@@ -879,7 +1046,7 @@ fn hosted_by(host: &Arc<TranscriptHost>) -> SuperviseOpts {
             continue_policy: false,
             ..SupervisorConfig::default()
         },
-        ..auto(30, None)
+        ..auto(30)
     }
 }
 
@@ -1397,6 +1564,43 @@ fn a_confirmed_unnamed_api_error_is_named_by_its_notice_at_the_decision() {
         Some(server),
         "an older notice than the row shown"
     );
+    // A 403 THE SCREEN'S WORDS NAME BY ITS STATUS ALONE (the review's
+    // KR-LIM-3): `API Error: 403 Forbidden` reads on the screen as a refused
+    // request, the slow ladder (three tries, then the owner), and its notice's
+    // typed word that the login failed names it the lost login, whose
+    // `/login` answers it. NEGATIVE CONTROLS: the same row under an `unknown`
+    // notice stays the refused request, and so does a 403 the table's words
+    // name (a DLP policy's), whatever its `error` word.
+    const FORBIDDEN: &str = "API Error: 403 Forbidden";
+    const BLOCKED: &str =
+        "API Error: 403 Request blocked by your organization's data loss prevention policy.";
+    let forbidden = aterm_phase::WallKind::ApiError {
+        code: Some(403),
+        retryable: false,
+        cause: aterm_phase::ApiCause::Request,
+    };
+    for (seq, text, error, want) in [
+        (
+            13,
+            FORBIDDEN,
+            "authentication_failed",
+            aterm_phase::WallKind::Auth,
+        ),
+        (14, FORBIDDEN, "unknown", forbidden),
+        (15, BLOCKED, "authentication_failed", forbidden),
+    ] {
+        let rows = shown(text);
+        assert_eq!(
+            read(&rows).wall.map(|w| w.kind),
+            Some(forbidden),
+            "{text}: the screen alone"
+        );
+        let host = TranscriptHost::of(&[Some(&typed_turn(text, error, None, true))]);
+        let opts = hosted_by(&host);
+        let mut reading = read(&rows);
+        s.confirm_wall(&mut reading, &at(&rows, seq), &opts, Check::Decide);
+        assert_eq!(reading.wall.map(|w| w.kind), Some(want), "{text} {error}");
+    }
 }
 
 /// A NOTICE THE SCREEN SHOWS WHOSE TURN IS NOT CLOSED YET (the review of
@@ -1563,6 +1767,83 @@ fn a_notice_drawn_like_prose_the_transcript_has_not_written_is_read_again_once()
     assert_eq!(host.asks(), 1, "an ordinary turn end is read once");
 }
 
+/// A NOTICE DRAWN LIKE PROSE AFTER A PROMPT COMMAND SENT RIGHT AFTER AN ERROR
+/// NOTICE (ATERM-KI-1016-1, limits: "a prompt command sent right after an
+/// error notice can miss a new prose-shaped notice at the first decision,
+/// costing one continuation"). A prompt command's rows (`<command-message>`,
+/// its meta prompt) are passed over, so until the notice its request met is
+/// written the transcript's newest entry is the OLDER notice, closed, which
+/// the screen's newer `⏺` row does not show: the transcript is behind the
+/// screen as surely as one that ends, open, on the turn's own input. Read
+/// again once, the notice found then is the wall. Measured before: read once,
+/// no wall, and the point an ordinary turn end (its continuation typed into
+/// the refused request). NEGATIVE CONTROLS: a transcript that stays on the
+/// older notice is read twice, no more, and names nothing; the older notice
+/// the screen itself shows is the wall at the first read, read once.
+#[test]
+fn a_prose_notice_after_a_prompt_command_behind_an_older_notice_is_read_again_once() {
+    use super::super::wall_confirm::Check;
+    const MODEL: &str = "There's an issue with the selected model (claude-opus-9). It may not exist or you may not have access to it. Run /model to pick a different model.";
+    const DLP: &str = "API Error: Request blocked by your organization's policy.";
+    let shown = ended_on(&[
+        "❯ /review",
+        "",
+        "⏺ There's an issue with the selected model (claude-opus-9). It may not exist or",
+        "  you may not have access to it. Run /model to pick a different model.",
+    ]);
+    let read = |rows: &[String]| aterm_phase::reader::read(Some("claude"), rows, Some(2));
+    let older = format!(
+        "{}\n{}\n{}",
+        typed_turn(DLP, "invalid_request", Some("dlp_request_denied"), true),
+        r#"{"parentUuid":"p","isSidechain":false,"type":"user","message":{"role":"user","content":"<command-message>review</command-message>\n<command-name>/review</command-name>"},"uuid":"cmd-1","timestamp":"2026-10-15T10:00:00.000Z"}"#,
+        r#"{"parentUuid":"cmd-1","isSidechain":false,"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"Review the diff."}]},"uuid":"cmd-2","timestamp":"2026-10-15T10:00:00.001Z"}"#,
+    );
+    let written = format!(
+        "{older}\n{}",
+        notice_turn(MODEL, "model_not_found", true)
+            .lines()
+            .skip_while(|r| !r.contains("\"isApiErrorMessage\""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let refused = Some(aterm_phase::WallKind::ApiError {
+        code: None,
+        retryable: false,
+        cause: aterm_phase::ApiCause::Request,
+    });
+    let mut m = Mock::new(vec![busy_screen()]);
+    let mut s = session(&mut m, None);
+    let host = TranscriptHost::of(&[Some(&older), Some(&written)]);
+    let opts = hosted_by(&host);
+    let mut reading = read(&shown);
+    s.confirm_wall(&mut reading, &at(&shown, 1), &opts, Check::Decide);
+    assert_eq!(
+        reading.wall.map(|w| w.kind),
+        refused,
+        "found on the second read"
+    );
+    assert_eq!(host.asks(), 2);
+    // NEGATIVE CONTROLS.
+    let host = TranscriptHost::of(&[Some(&older)]);
+    let opts = hosted_by(&host);
+    let mut reading = read(&shown);
+    s.confirm_wall(&mut reading, &at(&shown, 2), &opts, Check::Decide);
+    assert_eq!(reading.wall, None, "still on the older notice");
+    assert_eq!(host.asks(), 2, "once more, no more");
+    let same = ended_on(&[
+        "❯ carry on with the task",
+        "",
+        "⏺ There's an issue with the selected model (claude-opus-9). It may not exist or",
+        "  you may not have access to it. Run /model to pick a different model.",
+    ]);
+    let host = TranscriptHost::of(&[Some(&notice_turn(MODEL, "model_not_found", true))]);
+    let opts = hosted_by(&host);
+    let mut reading = read(&same);
+    s.confirm_wall(&mut reading, &at(&same, 3), &opts, Check::Decide);
+    assert_eq!(reading.wall.map(|w| w.kind), refused, "the notice shown");
+    assert_eq!(host.asks(), 1, "the notice shown is read once");
+}
+
 /// A wall whose call row is above the rows read (an MCP result's weekly-limit words on a 50-row
 /// pane, the call at row 9, the tail rows 10-49) is judged on the whole grid, read once after the
 /// tail: under the call, refused with no transcript, nothing waited for, one line. Control: the
@@ -1636,6 +1917,312 @@ fn a_wall_whose_call_is_above_the_rows_read_is_judged_on_the_whole_screen() {
     }
 }
 
+/// ATERM-KI-1015-14: A WALL WHOSE CALL SCROLLED OFF THE SCREEN is judged with the history above
+/// it. With no transcript, a gutter wall whose owner walk reaches the screen's first row is read
+/// again with the rows of the main screen's history right above it, up to the nearest row in
+/// column 0 (`search` places the screen, `line` reads each row). MEASURED on 2.1.304: a verbose
+/// Bash output of 80 rows under `⏺ Bash(sleep 4; seq 1 80)`, the call and the output's first 40
+/// rows in the history, the real context wall under the rest — and the history's rows read with
+/// `line` (`claude-2.1.304-verbose-long-output-context-wall-scrollback.txt`). On the base it was
+/// read under no owner and `/compact` typed; now it stands under the call and is refused with no
+/// transcript (the 2026-10-08 ruling's loss of recall), and confirmed with the session's own
+/// transcript. The SPOOF (2.1.294's measured screen of an MCP result whose first block of 60 rows
+/// scrolled the call off, its second block a column-2 `⎿  Not logged in · Please run /login`;
+/// the history above it COMPOSED as Claude Code draws a call: the call row, the block's first 19
+/// rows): `/login` was typed on the base; now refused. CONTROLS: the same history with the
+/// worker's message where the call row was is acted on; an evicted row refuses, as a whole read
+/// that fails does. ON THE ALTERNATE SCREEN (Claude Code's fullscreen renderer keeps no history)
+/// the same rows are read from aterm's archive of the rows that scrolled off it (`offscreen`, the
+/// screen under the same lock): the spoof is refused, the worker's message over the wall is acted
+/// on — refused on the base, which read no archive (the review of 87faa9bf23) — and a gap in the
+/// archive refuses.
+#[test]
+fn a_wall_whose_call_scrolled_off_is_judged_with_the_history_above() {
+    let history = |capture: &str| -> Vec<String> { fx::screen(capture) };
+    let bash = fx::screen(fx::VERBOSE_LONG_OUTPUT_CONTEXT_WALL_MEASURED);
+    let bash_history = history(fx::VERBOSE_LONG_OUTPUT_CONTEXT_WALL_SCROLLBACK_MEASURED);
+    assert_eq!(
+        bash_history
+            .iter()
+            .rev()
+            .find(|r| r.starts_with('⏺'))
+            .map(String::as_str),
+        Some("⏺ Bash(sleep 4; seq 1 80)"),
+        "the measured history holds the call"
+    );
+    let mcp = fx::screen(fx::MCP_LONG_BLOCK_THEN_WALL_PHRASE_MEASURED);
+    let mut mcp_history: Vec<String> = ["❯ toolstart", "", "⏺ github - get_long (MCP)(n: 7)"]
+        .iter()
+        .map(|r| r.to_string())
+        .collect();
+    mcp_history.push("  ⎿  issue line 1".to_string());
+    mcp_history.extend((2..20).map(|n| format!("     issue line {n}")));
+    assert_eq!(
+        mcp[0], "     issue line 20",
+        "the history runs straight into the screen"
+    );
+    let mut worker_history = mcp_history.clone();
+    worker_history[2] = "⏺ The tracker's issue 7, as it stands:".to_string();
+    // On the alternate screen the rows above are the archive's, and the
+    // main screen's history holds none of them.
+    let mock = |rows: &[String], above: &[String], alt: bool, gap: bool| {
+        let mut m = Mock::new(vec![busy_screen(), rows.to_vec()]);
+        m.cursor_on_caret = true;
+        m.vanish_after = Some(3);
+        m.stall_sleep = Some(Duration::from_millis(5));
+        if alt {
+            m.scrollback = Some(Vec::new());
+            m.alt_archive = Some(above.to_vec());
+            m.archive_gap = gap;
+        } else {
+            m.scrollback = Some(above.to_vec());
+        }
+        m.alt_screen = Some(alt);
+        m
+    };
+    let under_call = "read under a tool's call, and no transcript to confirm it";
+    let mut wrong = Vec::new();
+    for none in [true, false] {
+        let host = || (!none).then(|| TranscriptHost::of(&[None]));
+        for (name, rows, above, alt, evicted, gap) in [
+            ("the real wall", &bash, &bash_history, false, 0, false),
+            ("the spoof", &mcp, &mcp_history, false, 0, false),
+            (
+                "the real wall, the alternate screen",
+                &bash,
+                &bash_history,
+                true,
+                0,
+                false,
+            ),
+            (
+                "the spoof, the alternate screen",
+                &mcp,
+                &mcp_history,
+                true,
+                0,
+                false,
+            ),
+            (
+                "the spoof, a row evicted",
+                &mcp,
+                &mcp_history,
+                false,
+                10,
+                false,
+            ),
+            (
+                "the worker's message, a gap in the archive",
+                &mcp,
+                &worker_history,
+                true,
+                0,
+                true,
+            ),
+        ] {
+            let mut m = mock(rows, above, alt, gap);
+            m.evicted_below = evicted;
+            let (lines, m, records) = run_mock("wc-scrolled", m, host(), false);
+            let acts = wall_acts(&lines, &records);
+            let said = refusals(&records);
+            if !acts.is_empty() || said.len() != 1 || !said[0].contains(under_call) {
+                wrong.push(format!("{name} (no host: {none}): {acts:?} {said:?}"));
+            }
+            // Read up to the owner's row, and no further; on the alternate
+            // screen, from the archive.
+            let owner = above
+                .iter()
+                .rposition(|r| !r.is_empty() && !r.starts_with(' '))
+                .expect("an owner");
+            let read = |n: usize| m.requests.iter().any(|r| r.ends_with(&format!("line {n}")));
+            if !alt && evicted == 0 && (!read(owner) || read(owner - 1)) {
+                wrong.push(format!("{name}: the history not read up to its owner"));
+            }
+            let archived = m
+                .requests
+                .iter()
+                .any(|r| r.contains("offscreen since=") && r.ends_with("screen=1"));
+            if alt != archived || alt && read(0) {
+                wrong.push(format!("{name}: the archive read {archived}, alt {alt}"));
+            }
+        }
+        for (name, alt) in [("the main screen", false), ("the alternate screen", true)] {
+            let (lines, _, records) = run_mock(
+                "wc-scrolled-worker",
+                mock(&mcp, &worker_history, alt, false),
+                host(),
+                false,
+            );
+            let acts = wall_acts(&lines, &records);
+            if !acts
+                .first()
+                .is_some_and(|a| a.starts_with("TYPED rule=auth-login@v1 /login"))
+            {
+                wrong.push(format!(
+                    "the worker's message over it, {name} (no host: {none}): {acts:?}"
+                ));
+            }
+        }
+    }
+    // THE SCREEN MOVED UNDER THE READS: the grid read again after the
+    // history's rows is not the one the wall was read on (a row redrawn), so
+    // the rows read are not known to be the ones over it — refused, where
+    // the same history over the same screen is acted on (above). On the base
+    // only the screen's place was compared.
+    let mut moved = mcp.clone();
+    moved[0] = "     issue line 20 (moved)".to_string();
+    let mut m = mock(&mcp, &worker_history, false, false);
+    m.screens.push(mcp.clone());
+    m.screens.push(moved);
+    let (lines, _, records) = run_mock("wc-scrolled-moved", m, None::<Arc<TranscriptHost>>, false);
+    let acts = wall_acts(&lines, &records);
+    let said = refusals(&records);
+    if !acts.is_empty() || said.len() != 1 || !said[0].contains(under_call) {
+        wrong.push(format!(
+            "the screen moved under the reads: {acts:?} {said:?}"
+        ));
+    }
+    // The session's own transcript confirms the real wall.
+    let host = TranscriptHost::of(&[Some(transcript("verbose-long-output-then-context"))]);
+    let (lines, _, records) = run_mock(
+        "wc-scrolled-transcript",
+        mock(&bash, &bash_history, false, false),
+        Some(host),
+        false,
+    );
+    let acts = wall_acts(&lines, &records);
+    if !acts
+        .first()
+        .is_some_and(|a| a.starts_with("TYPED rule=context-compact@v1 /compact"))
+    {
+        wrong.push(format!("the real wall, confirmed: {acts:?}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// ATERM-KI-1015-14 (item 6 of the review of 87faa9bf23): A STOP HOOK'S `stopReason` TALLER THAN
+/// THE LOOP'S TAIL is read with the rows above it ([`Session::limit_words_read_above`]). MEASURED
+/// on 2.1.304 at 144x50 in the real-Claude lab: 35 lines ending `Usage limit reached · resets
+/// 3pm` draw the summary on row 6, above the loop's 40-row tail, which the loop read as a session
+/// limit's notice with no turn served under it (`since_limit`, this test's mutation run); now the
+/// whole grid is read, and the hook's words are cut from the screen the loop reads. 60 lines draw
+/// the summary in the history right above the screen: read up to it (`search`, then `line` up to
+/// the summary's row and no further), on the alternate screen from aterm's archive. CONTROLS: the
+/// worker's message where the summary was reads the limit (the rows above decide, both ways); an
+/// evicted row leaves the screen as read, the limit read as before; a real limit notice reads no
+/// row above it; and the same screen read again takes the verdict with no request.
+#[test]
+fn a_stop_reason_taller_than_the_tail_is_read_with_the_rows_above() {
+    let session_limit = Some((aterm_phase::WallKind::UsageSession, Some("3pm".to_string())));
+    let phrase = "  Usage limit reached · resets 3pm";
+    // The pane's 50 rows: the captures leave the trailing blank row off.
+    let pane = |capture: &str| {
+        let mut rows = fx::screen(capture);
+        assert_eq!(rows.len(), 49, "the capture's rows");
+        rows.push(String::new());
+        rows
+    };
+    let tall35 = pane(fx::STOP_HOOK_STOP_REASON_35_LINES_LIMIT_PHRASE_MEASURED);
+    let tall60 = pane(fx::STOP_HOOK_STOP_REASON_60_LINES_LIMIT_PHRASE_MEASURED);
+    let history = fx::screen(fx::STOP_HOOK_STOP_REASON_60_LINES_SCROLLBACK_MEASURED);
+    let summary = history
+        .iter()
+        .position(|r| r.starts_with("⏺ Ran 1 stop hook"))
+        .expect("the summary in the history");
+    let mut worker_history = history.clone();
+    worker_history[summary] = "⏺ The nightly notes:".to_string();
+    let real = fx::screen(fx::WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED);
+    // One read of the screen as the loop reads it, and what the loop's
+    // reading of that point holds of the newest limit notice.
+    let read = |rows: &[String], above: &[String], alt: bool, evicted: u64| {
+        let mut m = Mock::new(vec![rows.to_vec()]);
+        m.cursor_on_caret = true;
+        m.alt_screen = Some(alt);
+        if alt {
+            m.scrollback = Some(Vec::new());
+            m.alt_archive = Some(above.to_vec());
+        } else {
+            m.scrollback = Some(above.to_vec());
+        }
+        m.evicted_below = evicted;
+        let opts = auto(30);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        let screen = s.screen().unwrap_or_else(|e| panic!("{e:?}"));
+        let since = s
+            .turn_end_reread(&screen, &opts)
+            .since_limit
+            .map(|l| (l.kind, l.reset));
+        drop(s);
+        (since, screen, m.requests)
+    };
+    let mut wrong = Vec::new();
+    // 35 lines: the whole grid over the tail, read once, no history.
+    let (since, screen, requests) = read(&tall35, &[], false, 0);
+    let whole = requests
+        .iter()
+        .filter(|r| r.ends_with("text --json"))
+        .count()
+        == 1;
+    let history_read = requests.iter().any(|r| r.contains(" line "));
+    if since.is_some() || !whole || history_read || screen.rows.iter().any(|r| r == phrase) {
+        wrong.push(format!("35 lines: {since:?} {requests:?}"));
+    }
+    // 60 lines: the history up to the summary, on either screen.
+    for alt in [false, true] {
+        let (since, screen, requests) = read(&tall60, &history, alt, 0);
+        let line = |n: usize| requests.iter().any(|r| r.ends_with(&format!("line {n}")));
+        let archived = requests
+            .iter()
+            .any(|r| r.contains("offscreen since=") && r.ends_with("screen=1"));
+        let up_to_summary = if alt {
+            archived && !line(0)
+        } else {
+            line(summary) && !line(summary - 1)
+        };
+        if since.is_some() || !up_to_summary || screen.rows.iter().any(|r| r == phrase) {
+            wrong.push(format!("60 lines (alt: {alt}): {since:?} {requests:?}"));
+        }
+    }
+    // CONTROLS: the worker's message over the same rows; an evicted row.
+    for (name, above, evicted) in [
+        ("the worker's message", &worker_history, 0),
+        ("a row evicted", &history, history.len() as u64 - 3),
+    ] {
+        let (since, screen, _) = read(&tall60, above, false, evicted);
+        if since != session_limit || !screen.rows.iter().any(|r| r == phrase) {
+            wrong.push(format!("{name}: {since:?}, first {}", screen.first));
+        }
+    }
+    let (since, _, requests) = read(&real, &[], false, 0);
+    if since.is_none() || requests.iter().any(|r| r.ends_with(" search")) {
+        wrong.push(format!("a real notice: {since:?} {requests:?}"));
+    }
+    // The same screen read again: the verdict kept, no request.
+    let mut m = Mock::new(vec![tall35.clone()]);
+    m.cursor_on_caret = true;
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    let tail = Screen {
+        rows: tall35[10..].to_vec(),
+        first: 10,
+        seq: 7,
+        ..Screen::default()
+    };
+    let (once, _) = s
+        .limit_words_read_above(tail.clone(), None, None)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    let (again, _) = s
+        .limit_words_read_above(tail, None, None)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    drop(s);
+    if once.first != again.first || once.first <= 10 || m.requests.len() != 1 {
+        wrong.push(format!(
+            "read again: first {} then {}, {:?}",
+            once.first, again.first, m.requests
+        ));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The whole read fails closed ([`Session::under_call_on_screen`]): a gutter wall read on a tail
 /// with no call over it stands only where the whole grid reads the same wall under no call (the
 /// control). A whole read that fails, or one that reads no wall, another kind or other words,
@@ -1671,7 +2258,7 @@ fn a_whole_read_that_fails_or_reads_another_wall_counts_as_under_a_call() {
             continue_policy: false,
             ..SupervisorConfig::default()
         },
-        ..auto(30, None)
+        ..auto(30)
     };
     // Whether the tail's wall stands, the whole grid read as `grid`
     // (`None`: the read fails).
@@ -2134,7 +2721,7 @@ fn waits_on_the_reset(s: &Session<'_, Mock>, a: &TurnEndAction) -> bool {
 fn backs_off(s: &Session<'_, Mock>, a: &TurnEndAction, before: Instant, after: Instant) -> bool {
     let t = &s.turn_end.timing;
     !s.turn_end.waits_on_named_reset()
-        && matches!(a, TurnEndAction::WaitUntil { until, retry: false, .. }
+        && matches!(a, TurnEndAction::WaitUntil { until, wait: WaitKind::BackOff { .. }, .. }
             if *until >= before + t.short_backoff && *until <= after + t.short_backoff_max)
 }
 
@@ -2187,7 +2774,7 @@ fn a_persons_turn_the_transcript_holds_ends_a_left_limits_wait() {
                 answer_questions: false,
                 ..SupervisorConfig::default()
             },
-            ..auto(30, None)
+            ..auto(30)
         };
         let mut m = Mock::new(vec![armed.clone()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
@@ -2273,7 +2860,7 @@ fn a_cancelled_limit_answers_the_act_only_by_a_notice_written_since_it() {
                 answer_questions: false,
                 ..SupervisorConfig::default()
             },
-            ..auto(30, None)
+            ..auto(30)
         };
         let mut m = Mock::new(vec![cancelled.clone()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
@@ -2414,7 +3001,7 @@ fn transcript_run(
             answer_questions: false,
             ..SupervisorConfig::default()
         },
-        ..auto(30, None)
+        ..auto(30)
     };
     let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
         s.set_turn_end_timing(TurnEndTiming {
@@ -2666,7 +3253,7 @@ fn a_left_limits_wait_ends_on_its_own_rows_alone() {
                 answer_questions: false,
                 ..SupervisorConfig::default()
             },
-            ..auto(30, None)
+            ..auto(30)
         };
         let mut m = Mock::new(vec![armed.clone()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
@@ -2745,7 +3332,7 @@ fn a_limit_notice_is_another_conversations_where_the_tail_lacks_its_row() {
     let mut m = Mock::new(vec![busy_screen()]);
     let mut s = session(&mut m, None);
     s.limit_notice_row = Some(row);
-    assert!(!s.notice_elsewhere(&auto(30, None)), "no host");
+    assert!(!s.notice_elsewhere(&auto(30)), "no host");
 }
 
 /// A `/RESUME`D CONVERSATION'S NOTICE WITH THIS LIMIT'S CLOCK ENDS NO WAIT,
@@ -2760,10 +3347,12 @@ fn a_limit_notice_is_another_conversations_where_the_tail_lacks_its_row() {
 /// continue policy's back-off).
 #[test]
 fn a_resumed_conversations_notice_with_this_limits_clock_ends_no_wait_in_the_loop() {
-    // The loop's clock at 3:12pm PDT, a minute past the armed screen's own
-    // print (`done 3:11 PM`) and three before its reset; the measured
-    // limit's rows written a minute before, naming the same 3:15pm.
-    let now = TEST_NOW + 6 * 3600 + 17 * 60;
+    // The loop's clock at 3:15:30pm PDT, half a minute past the reset: the
+    // vendor's word read before it is no word of this limit's whatever the
+    // tail says (LP-1 of ATERM-KI-1015-1), so the tail decides only from the
+    // reset on; the measured limit's rows written a minute before, naming
+    // the same 3:15pm.
+    let now = TEST_NOW + 6 * 3600 + 20 * 60 + 30;
     let at_cancel = limit_cancelled_at(now - 60).replace("10:38am", "3:15pm");
     let other = another_conversation(&at_cancel);
     let armed = fx::screen(fx::WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED);
@@ -2785,7 +3374,7 @@ fn a_resumed_conversations_notice_with_this_limits_clock_ends_no_wait_in_the_loo
                 answer_questions: false,
                 ..SupervisorConfig::default()
             },
-            ..auto(30, None)
+            ..auto(30)
         };
         let mut m = Mock::new(vec![armed.clone()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
@@ -2815,6 +3404,66 @@ fn a_resumed_conversations_notice_with_this_limits_clock_ends_no_wait_in_the_loo
     // NEGATIVE CONTROL: the limit's own conversation.
     let (a, _, backed) = decided(&at_cancel);
     assert!(backed, "the continue policy's back-off: {a:?}");
+}
+
+/// A COLD RESTORE'S FIRST READ OF A COUNTDOWN ITS AGENT NEVER HELD IS
+/// NOBODY'S (ATERM-KI-1016-1; the loop's half of the policy's
+/// `a_countdown_whose_notice_was_written_before_the_agent_started_goes_on_by_nobody`).
+/// A fresh loop — no earlier read of the limit, as after a cold restore —
+/// reads the armed five-hour limit (2.1.296's screen, at 10:38am) the
+/// measured 2.1.299 transcript's notice row confirms, written at
+/// `MEASURED_NOTICE_AT`; the host's snapshot names the agent's process
+/// started a minute after that row: the countdown is the gone process's,
+/// waited out to its reset and grace (`usage-session resets`), not the
+/// vendor's ten minutes past it. NEGATIVE CONTROLS, the vendor's wait (`goes
+/// on by itself`): the process started before the row was written, and no
+/// start read.
+#[test]
+fn a_cold_restores_first_read_of_a_countdown_its_agent_never_held_is_nobodys() {
+    let now = MEASURED_NOTICE_AT + 120;
+    let measured = transcript("session-limit-cancelled-then-person-turn");
+    let rows: Vec<&str> = measured.lines().skip(1).collect();
+    let cancel = rows
+        .iter()
+        .position(|r| r.contains("Automatic continue cancelled"))
+        .expect("the cancel");
+    let at_limit = rows[..cancel].join("\n");
+    let armed: Vec<String> = fx::screen(fx::WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED)
+        .into_iter()
+        .map(|r| r.replace("3:15pm", "10:38am"))
+        .collect();
+    let decided = |started: Option<i64>| {
+        let host = TranscriptHost::of(&[Some(at_limit.as_str())]);
+        *host.started.lock().unwrap() = started;
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            policy: SupervisorConfig {
+                answer_questions: false,
+                ..SupervisorConfig::default()
+            },
+            ..auto(30)
+        };
+        let mut m = Mock::new(vec![armed.clone()]);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(now, PDT);
+        s.set_zone_lookup(test_zones);
+        let wall = point_at(&mut s, armed.clone(), 101);
+        s.turn_end_at_point(&wall, Some(Duration::from_secs(60)), &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"))
+    };
+    let a = decided(Some(MEASURED_NOTICE_AT + 60));
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why == "usage-session resets"),
+        "{a:?}"
+    );
+    // NEGATIVE CONTROLS: the vendor's own wait.
+    for started in [Some(MEASURED_NOTICE_AT - 60), None] {
+        let a = decided(started);
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("goes on by itself")),
+            "{started:?}: {a:?}"
+        );
+    }
 }
 
 /// A LOOP THAT TOOK A LIMIT'S WAIT OVER READS THE LIMIT'S END IN THE
@@ -2905,7 +3554,7 @@ fn a_seeded_loop_reads_the_limits_end_in_the_transcript_by_its_reset() {
                 answer_questions: false,
                 ..SupervisorConfig::default()
             },
-            ..auto(30, None)
+            ..auto(30)
         };
         let mut m = Mock::new(vec![replied.clone()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
@@ -2917,6 +3566,8 @@ fn a_seeded_loop_reads_the_limits_end_in_the_transcript_by_its_reset() {
             reset: wall.reset.clone(),
             reset_unix: Some(RESET),
             kind: Some(wall.kind),
+            judged_ms: None,
+            retry_ms: None,
         }));
         assert!(s.turn_end.waits_on_named_reset(), "the wait taken over");
         assert!(s.limit_notice_row.is_none(), "no notice row remembered");
@@ -3112,7 +3763,7 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
             let opts = SuperviseOpts {
                 idle_host: Some(host as Arc<dyn IdleHost>),
                 policy: policy.clone(),
-                ..auto(30, None)
+                ..auto(30)
             };
             let mut m = Mock::new(vec![screen.clone()]);
             let mut s = session(&mut m, Some("@s-1".to_string()));
@@ -3124,6 +3775,8 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
                 reset: wall.reset.clone(),
                 reset_unix: Some(RESET),
                 kind: Some(wall.kind),
+                judged_ms: None,
+                retry_ms: None,
             }));
             assert!(s.limit_notice_row.is_none(), "no notice row remembered");
             let point = point_at(&mut s, screen, 101);
@@ -3161,7 +3814,7 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
         let opts = SuperviseOpts {
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
             policy: policy.clone(),
-            ..auto(30, None)
+            ..auto(30)
         };
         let armed = fx::screen(fx::WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED);
         let mut m = Mock::new(vec![armed.clone()]);

@@ -35,8 +35,8 @@ use crate::frameio::{Incoming, read_frame, write_frame};
 use crate::identity::{CheckError, Identity};
 use crate::sys::{self, POLLERR, POLLHUP, POLLIN, PollFd};
 use crate::wire::{
-    Birth, CAP_JOURNAL, COMPANION_JOURNAL, Frame, JournalOffer, MarkerRef, MasterHeader, PROTO,
-    RefuseCode,
+    Birth, CAP_JOURNAL, CAP_SYNC, COMPANION_JOURNAL, Frame, JournalOffer, MarkerRef, MasterHeader,
+    PROTO, RefuseCode,
 };
 
 /// How a relaunch is carried out.
@@ -602,6 +602,12 @@ impl Server {
                 self.send(id, &Frame::Status { text }, None);
                 Vec::new()
             }
+            // Every frame `id` wrote before it has been read and handled: this connection's
+            // frames are read in order, one at a time.
+            Frame::Sync { seq } => {
+                self.send(id, &Frame::Sync { seq }, None);
+                Vec::new()
+            }
             // Accepted; nothing acts on it yet.
             Frame::RestartWhenSafe => Vec::new(),
             Frame::Companion { rdev, kind, len } => self.companion(id, rdev, kind, len, fd),
@@ -711,8 +717,9 @@ impl Server {
                         // registers a master here (§5.7).
                         identity: Some(self.identity.policy()),
                         // A window sends its companions only to a keeper that says it
-                        // takes them; an older window reads no further than the policy.
-                        caps: Some(CAP_JOURNAL),
+                        // takes them, and SYNC only to one that answers it; an older window
+                        // reads no further than the policy.
+                        caps: Some(CAP_JOURNAL | CAP_SYNC),
                     };
                     self.send(conn, &frame, None);
                 }

@@ -1,0 +1,38 @@
+# claude-code 2.1.302 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the fresh Sonnet bucket's generic countdown (seven_day_sonnet, 75 s) gone on by itself at its reset, the stub's reply under it, then the harness's usage-resume@v1 keep going at the reset plus the grace
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.FiIC/proj
+
+
+❯ /clear
+
+❯ start the task
+
+⏺ Hi! I am the local lab stub, not a model. (reply 6)
+
+✻ Crunched for 0s · done 9:12 AM
+
+❯ carry on with the task
+  ⎿  You've hit your Sonnet limit · resets 9:13am (America/Los_Angeles)
+     /upgrade to increase your usage limit.
+
+⏺ Usage limit reached · continuing automatically at 9:13am · esc to cancel
+
+✻ Cooked for 0s · done 9:12 AM
+
+⏺ Usage limit reset · continuing automatically
+
+⏺ Hi! I am the local lab stub, not a model. (reply 8)
+
+✻ Brewed for 0s · done 9:15 AM
+
+❯ keep going
+
+⏺ Hi! I am the local lab stub, not a model. (reply 9)
+
+✻ Cooked for 0s · done 9:16 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

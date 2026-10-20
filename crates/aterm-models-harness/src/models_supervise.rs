@@ -517,48 +517,96 @@ pub fn supervisor_turn_end_model() -> Model {
 
 /// THE DONE CHECK (aterm-agent `supervise/policy/turn_end.rs`). A worker whose last
 /// words say it is DONE is not continued: at the point past its back-off it
-/// is typed the check — *"do every open item you can still do …; end your
-/// reply with ATERM-TASK-DONE … only when what is left needs a person or
-/// cannot be done on this host"* — and when that check's own yield says done
-/// again (the token on a line of its own anywhere in it, or the worker's words
-/// for done; a report only that nothing of its own runs or is queued, or only
-/// the check's words echoed, is work going on there, not done) THE TASK IS
+/// is typed the check — finish the open work and report completion and any
+/// blockers in ordinary language — and when that check's own yield says done
+/// again (a legacy token on a line of its own anywhere in it, or the worker's words
+/// for done, or a report only that nothing of its own runs or is queued as a
+/// short turn's whole answer; that report closing a turn of real work, or
+/// only the check's words echoed, is work going on there, not done; no point
+/// of this model carries an idle report, which the policy's own tests pin)
+/// THE TASK IS
 /// DONE: nothing more is typed into the session until someone else's turn (a
 /// person's, an orchestrator's) opens it again. Without it a finished task is
 /// continued on the back-off until the model invents work.
 ///
-/// THE WORKER'S OWN FINISHED (DONE-1, 2026-10-16): a report whose last line is
-/// `ATERM-TASK-DONE` ends the task at once, with no check — unless its own
-/// words name open work without a blocker (`Still open:`, `Left:`, `not run`):
-/// then it is a first done report owing THE CHALLENGE, typed once a job, and
-/// a finished or done yield to it ends the task whatever it still lists. The
-/// job's memory of the challenge is forgotten when the task ends, so the next
-/// job is challenged afresh.
+/// LEGACY EXPLICIT FINISH (DONE-1, 2026-10-16): a report whose last line is
+/// `ATERM-TASK-DONE` ends the task at once, with no check (`OtherTurnFinished`,
+/// `YieldFinished`) — unless anything of the job is left (the owner's rule of
+/// 2026-10-19): its own words name open work, a blocked item included
+/// (`Still open:`, `Left:`, `not run`; `*OpenFinished`), or the session's
+/// repository holds work no remote has (uncommitted, untracked, stashed or
+/// unpushed; `*DirtyFinished`, the host's `git` probe). Then it is a first
+/// done report owing THE CHALLENGE, typed at EVERY such token — never once a
+/// job — on the back-off's pace as the check is, and only a finished or done
+/// yield with nothing left ends the task. A FINISHED ends the task so OVER A
+/// SHELL OR A MONITOR THE TURN LEFT
+/// RUNNING (design 2026-10-15 §2.4): a turn that ended with the token while a
+/// shell it left runs on (`*FinishedBg`; `bg` 1 while it runs, the screen
+/// busy) is the done of that point, and the idle screen the shell leaves when
+/// it ends with no turn of anyone's since (`BackgroundEnds`) is the same point
+/// (`TurnEndState::finished_over_background`) — and so is the turn Claude
+/// Code's OWN WAKE opens at the shell's end (`AgentWakes`,
+/// `TurnEndState::live_turn`): no message of anyone's started it, and `woken`
+/// says one ran. No act goes at the busy screen. A loop that starts while the
+/// task record reads `done` takes that done on (`SeedDone`,
+/// `TurnEndState::seed_task_done`) — never at a wall: a done point never shows
+/// one, so a walled first point ended someone else's turn after the done, and
+/// its wall's act is owed.
 ///
 /// `done` is the done reports in a row at the points the policy saw: 0 none,
 /// 1 the point is one (the check, or the challenge, is owed), 2 the task is
 /// done; `pending` 0 at a point, 1 a continuation's turn running, 2 the
 /// check's, 3 a wall's act's (the 529's retry, the limit's resume,
-/// `/compact`), 4 the challenge's; `walled` the point shows a wall — its
-/// ladder acts there, never the continuation, the check or the challenge;
-/// `open` the point is a FINISHED naming open work (the challenge is owed);
-/// `challenged` the challenge was typed this job. `typed_done` something was
-/// typed into a done task, `unchecked` a done report was answered with a
-/// plain continuation, `cut_short` the task ended on a done report the check
-/// never asked about, `open_end` the task ended on an open FINISHED no
-/// challenge asked about, `twice` a second challenge typed in one job.
-/// `Buggy = 1` continues a done report like any point and reads it as the end
-/// the moment it repeats, and leaves a done task closed when someone else's
-/// turn ends on a wall (a person's turn that hit a 529 after the task was done
-/// is stranded, no retry) — and adds two dead actions: the harness before
-/// DONE-1, which ended the task on an open FINISHED at once
-/// (`FinishOpenAtOnce`), and a challenge that forgets it was asked, typing
-/// another at the open FINISHED that answers it (`ChallengeAgain`) —
-/// caught by each invariant on a path of its own. Tier-1 (aterm-agent
-/// `tests/supervise_conformance_done_check.rs`) drives the real
-/// `decide_turn_end` and `TurnEndState` along every reachable state and checks
-/// it types the continuation, the check, the challenge, the wall's act, or
-/// nothing exactly where the model does.
+/// `/compact`), 4 an answer's, 5 the challenge's; `walled` the point shows a
+/// wall — its ladder acts there, never the continuation, the check or the
+/// challenge; `asked` the point asks a question (an act's short yield that
+/// asks, `YieldAsk`), answered, never continued; `open` the point is a
+/// FINISHED naming open work or over a repository with work no remote has
+/// (the challenge is owed).
+/// THE BACK-OFF: `short` is the short streak (4 standing for any streak past
+/// `MANAGED_SHORT_TURNS`, 3): a continuation's, the check's, the challenge's
+/// or an answer's yield that says done or asks lengthens it, a turn of real
+/// work ends it, and a wall's act leaves it as it was. At every new point with
+/// a streak the back-off runs (`backoff` 1) until the wait the decider asked
+/// for runs out (`BackoffDue` — only where it waits, no act owed at once). A
+/// session nobody waits on waits it out before every act, saving an idle
+/// person's tokens; A WORKER (`managed` 1, `Tasked`: the loop read its task
+/// record, `TurnEndState::set_managed`) has a manager waiting on its `await
+/// task`, and gets its check and its answer at once for its first three
+/// short turns in a row — past them, at the back-off's pace, so a worker that
+/// asks after every short turn is not answered at the model's; its
+/// continuation keeps the back-off. The challenge keeps the back-off as the
+/// check does: typed at every token while work is left, it is a run of
+/// nudges the back-off slows, a worker's at once within its bound. `waited`
+/// the back-off ran out over a worker's owed check, challenge or answer
+/// within its bound, `rushed` one went at once past it.
+///
+/// `typed_done` something was typed into a done task, `unchecked` a done
+/// report was answered with a plain continuation, `cut_short` the task ended
+/// on a done report the check never asked about, `open_end` the task ended on
+/// a FINISHED with work left. `Buggy = 1` continues a done report like any
+/// point and reads it
+/// as the end the moment it repeats, leaves a done task closed when someone
+/// else's turn ends on a wall (a person's turn that hit a 529 after the task
+/// was done is stranded, no retry) and takes a recorded done on at a wall (the
+/// seed's first cut, stranding the same 529), holds a worker's check
+/// for the back-off like anyone's yet answers it at once however
+/// long it keeps asking, reads nothing of a turn that ended over the agent's
+/// background work until that work ends (the busy screen held the token back
+/// — a shell of hours, or a server that never ends, kept the manager waiting
+/// as long), and reads the agent's own wake at that work's end as someone
+/// else's turn (the task opened again, its check typed into the finished
+/// worker) — and adds two dead actions: the harness before DONE-1, which ended
+/// the task on an open FINISHED at once (`FinishOpenAtOnce`), and the harness
+/// before the owner's rule of 2026-10-19, which challenged once a job and
+/// ended it at the FINISHED that answered the challenge whatever it still
+/// left (`EndAtTheChallengesAnswer`) — caught by each invariant on a path of
+/// its own.
+/// Tier-1 (aterm-agent `tests/supervise_conformance_done_check.rs`) drives the
+/// real `decide_turn_end` and `TurnEndState` along every reachable state and
+/// checks it types the continuation, the check, the challenge, the answer, the
+/// wall's act, waits, or does nothing exactly where the model does, and takes
+/// a recorded done on exactly where the model's `SeedDone` is enabled.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_done_check_model() -> Model {
@@ -571,98 +619,258 @@ pub fn supervisor_done_check_model() -> Model {
             var unchecked = 0;
             var cut_short = 0;
             var walled = 0;
+            var asked = 0;
+            var managed = 0;
+            var short = 0;
+            var backoff = 0;
+            var waited = 0;
+            var rushed = 0;
+            var bg = 0;
+            var woken = 0;
             var open = 0;
-            var challenged = 0;
             var open_end = 0;
-            var twice = 0;
 
-            // Someone else's turn, answered: the task is theirs again, and
-            // a done report in it is a first one — and one that ended on a
-            // wall is no done report at all.
+            // The loop reads the session's task record: a manager waits.
+            action Tasked when (managed == 0) {
+                managed = 1;
+            }
+            // ...and it reads `done`: taken on where the point could be one.
+            action SeedDone when (pending == 0 && (walled == 0 || Buggy == 1)) {
+                done = 2;
+                open = 0;
+            }
+            // Someone else's turn, answered with real work: the task is
+            // theirs again, and a done report in it is a first one — one
+            // that ended on a wall is no done report at all (the streak
+            // stands there).
             action OtherTurnDone when (pending == 0) {
                 done = 1;
                 walled = 0;
+                asked = 0;
+                short = 0;
+                backoff = 0;
+                bg = 0;
+                woken = 0;
                 open = 0;
             }
             action OtherTurnWork when (pending == 0) {
                 done = 0;
                 walled = 0;
+                asked = 0;
+                short = 0;
+                backoff = 0;
+                bg = 0;
+                woken = 0;
                 open = 0;
             }
             action OtherTurnWall when (pending == 0) {
                 done = if Buggy == 1 { done } else { 0 };
                 walled = 1;
+                asked = 0;
+                backoff = if short > 0 { 1 } else { 0 };
+                bg = 0;
+                woken = 0;
                 open = 0;
             }
-            // Someone else's turn ending on the worker's FINISHED: a clean
-            // report ends the task; one naming open work owes the challenge,
-            // unless this job already had it. Either way the job's memory of
-            // the challenge goes: the task ended, or it was never asked.
+            // Someone else's turn ending on the worker's FINISHED: a report
+            // with nothing left ends the task; one naming open work, or one
+            // over a repository with work no remote has, owes the challenge,
+            // however many this job had.
             action OtherTurnFinished when (pending == 0) {
                 done = 2;
                 walled = 0;
+                asked = 0;
+                short = 0;
+                backoff = 0;
+                bg = 0;
+                woken = 0;
                 open = 0;
-                challenged = 0;
             }
             action OtherTurnOpenFinished when (pending == 0) {
-                done = if challenged == 1 { 2 } else { 1 };
-                open = if challenged == 1 { 0 } else { 1 };
+                done = 1;
+                open = 1;
                 walled = 0;
-                challenged = 0;
+                asked = 0;
+                short = 0;
+                backoff = 0;
+                bg = 0;
+                woken = 0;
             }
-            // The policy's act at a free point: the wall's act at a wall,
-            // the continuation where no done was reported, the check where
-            // one was, the challenge at an open FINISHED, nothing on a done
-            // task.
-            action WallAct when (pending == 0 && walled == 1 && done <= 1) {
+            action OtherTurnDirtyFinished when (pending == 0) {
+                done = 1;
+                open = 1;
+                walled = 0;
+                asked = 0;
+                short = 0;
+                backoff = 0;
+                bg = 0;
+                woken = 0;
+            }
+            // …a clean FINISHED while a shell it left runs on.
+            action OtherTurnFinishedBg when (pending == 0) {
+                done = if Buggy == 1 { done } else { 2 };
+                walled = if Buggy == 1 { walled } else { 0 };
+                asked = if Buggy == 1 { asked } else { 0 };
+                backoff = if Buggy == 1 { backoff } else if short > 0 { 1 } else { 0 };
+                open = if Buggy == 1 { open } else { 0 };
+                bg = 1;
+                woken = 0;
+            }
+            // The policy's act at a free point (never at the busy screen):
+            // the wall's act at a wall; the continuation where no done was
+            // reported and nothing asked, past its back-off; the check where
+            // one was, the challenge at a FINISHED with work left and the
+            // answer where the point asks — a worker's at once within its
+            // bound, anyone else's past the back-off; nothing on a done task.
+            action WallAct when (pending == 0 && bg == 0 && walled == 1 && done <= 1) {
                 walled = 0;
                 pending = 3;
             }
-            action Continue when (pending == 0 && walled == 0 && (done == 0 || Buggy == 1)) {
+            action Continue when (
+                pending == 0 && bg == 0 && walled == 0 && asked == 0 &&
+                (backoff == 0 || Buggy == 1) && (done == 0 || Buggy == 1)
+            ) {
                 typed_done = if done == 2 { 1 } else { typed_done };
                 unchecked = if done == 1 { 1 } else { unchecked };
                 pending = 1;
             }
-            action Check when (pending == 0 && walled == 0 && done == 1 && open == 0) {
+            action Check when (
+                pending == 0 && bg == 0 && walled == 0 && done == 1 && open == 0 &&
+                (backoff == 0 || (managed == 1 && short <= 3 && Buggy == 0))
+            ) {
+                rushed = if backoff == 1 && short > 3 { 1 } else { rushed };
                 pending = 2;
             }
-            action Challenge when (pending == 0 && walled == 0 && open == 1) {
-                twice = if challenged == 1 { 1 } else { twice };
-                challenged = 1;
+            // The challenge keeps the back-off as the check does: typed at
+            // every token while work is left, it is a run the back-off slows.
+            action Challenge when (
+                pending == 0 && bg == 0 && walled == 0 && open == 1 &&
+                (backoff == 0 || (managed == 1 && short <= 3 && Buggy == 0))
+            ) {
+                rushed = if backoff == 1 && short > 3 { 1 } else { rushed };
                 open = 0;
+                pending = 5;
+            }
+            action Answer when (
+                pending == 0 && bg == 0 && walled == 0 && asked == 1 && done == 0 &&
+                (backoff == 0 || (managed == 1 && (short <= 3 || Buggy == 1)))
+            ) {
+                rushed = if backoff == 1 && short > 3 { 1 } else { rushed };
+                asked = 0;
                 pending = 4;
             }
-            action YieldWork when (pending > 0) {
+            // The decider's wait for the back-off runs out — where it waits:
+            // a continuation owed, or a check, a challenge or an answer that
+            // does not go at once.
+            action BackoffDue when (
+                pending == 0 && bg == 0 && walled == 0 && backoff == 1 && done <= 1 && (
+                    (done == 0 && asked == 0) ||
+                    (done == 1 && (managed == 0 || short > 3 || Buggy == 1)) ||
+                    (asked == 1 && (managed == 0 || (short > 3 && Buggy == 0)))
+                )
+            ) {
+                waited = if managed == 1 && short <= 3 && (done == 1 || asked == 1) {
+                    1
+                } else {
+                    waited
+                };
+                backoff = 0;
+            }
+            // An act's yield of real work ends the streak (a wall's act's
+            // leaves it, and the back-off it runs).
+            action YieldWork when (pending > 0 && bg == 0) {
                 pending = 0;
                 done = 0;
+                short = if pending == 3 { short } else { 0 };
+                backoff = if pending == 3 && short > 0 { 1 } else { 0 };
             }
-            action YieldDone when (pending > 0) {
+            // A yield that says done with nothing left: the check's or the
+            // challenge's own ends the task; any other is a first done
+            // report. Short, as a yield that asks is.
+            action YieldDone when (pending > 0 && bg == 0) {
                 cut_short = if pending == 1 && done == 1 { 1 } else { cut_short };
-                done = if pending == 2 || pending == 4 || (Buggy == 1 && done == 1) { 2 } else { 1 };
-                challenged = if pending == 2 || pending == 4 || (Buggy == 1 && done == 1) {
-                    0
-                } else {
-                    challenged
-                };
+                done = if pending == 2 || pending == 5 || (Buggy == 1 && done == 1) { 2 } else { 1 };
+                short = if pending == 3 { short } else if short > 3 { 4 } else { short + 1 };
+                backoff = if pending == 3 && short == 0 { 0 } else { 1 };
                 pending = 0;
             }
-            // A yield ending on the worker's FINISHED: as someone else's turn
-            // ending so, the challenge's own yield ending the task.
-            action YieldFinished when (pending > 0) {
-                pending = 0;
-                done = 2;
-                challenged = 0;
-            }
-            action YieldOpenFinished when (pending > 0) {
-                done = if challenged == 1 { 2 } else { 1 };
-                open = if challenged == 1 { 0 } else { 1 };
-                challenged = 0;
+            action YieldAsk when (pending > 0 && bg == 0) {
+                done = 0;
+                asked = 1;
+                short = if pending == 3 { short } else if short > 3 { 4 } else { short + 1 };
+                backoff = if pending == 3 && short == 0 { 0 } else { 1 };
                 pending = 0;
             }
             // A yield that ended on a wall: its done reports stand.
-            action YieldWall when (pending > 0) {
+            action YieldWall when (pending > 0 && bg == 0) {
                 pending = 0;
                 walled = 1;
+                asked = 0;
+                short = if pending == 3 { short } else { 0 };
+                backoff = if pending == 3 && short > 0 { 1 } else { 0 };
+            }
+            // A yield ending on the worker's FINISHED: as someone else's turn
+            // ending so — with nothing left it ends the task, the
+            // challenge's own yield among them; with work left it owes the
+            // challenge again, the challenge's own yield among them.
+            action YieldFinished when (pending > 0 && bg == 0) {
+                done = 2;
+                walled = 0;
+                asked = 0;
+                open = 0;
+                short = if pending == 3 { short } else if short > 3 { 4 } else { short + 1 };
+                backoff = if pending == 3 && short == 0 { 0 } else { 1 };
+                pending = 0;
+            }
+            action YieldOpenFinished when (pending > 0 && bg == 0) {
+                done = 1;
+                open = 1;
+                walled = 0;
+                asked = 0;
+                short = if pending == 3 { short } else if short > 3 { 4 } else { short + 1 };
+                backoff = if pending == 3 && short == 0 { 0 } else { 1 };
+                pending = 0;
+            }
+            action YieldDirtyFinished when (pending > 0 && bg == 0) {
+                done = 1;
+                open = 1;
+                walled = 0;
+                asked = 0;
+                short = if pending == 3 { short } else if short > 3 { 4 } else { short + 1 };
+                backoff = if pending == 3 && short == 0 { 0 } else { 1 };
+                pending = 0;
+            }
+            action YieldFinishedBg when (pending > 0 && bg == 0) {
+                done = if Buggy == 1 { done } else { 2 };
+                pending = if Buggy == 1 { pending } else { 0 };
+                walled = if Buggy == 1 { walled } else { 0 };
+                asked = if Buggy == 1 { asked } else { 0 };
+                backoff = if Buggy == 1 { backoff } else if short > 0 { 1 } else { 0 };
+                open = if Buggy == 1 { open } else { 0 };
+                bg = 1;
+            }
+            // The background work ends with no turn of anyone's since: the
+            // screen it leaves is the point the token made (`Buggy`: read
+            // there at last, the token ends the task only now).
+            action BackgroundEnds when (bg == 1) {
+                bg = 0;
+                done = 2;
+                pending = 0;
+                walled = 0;
+                asked = 0;
+                open = 0;
+            }
+            // Claude Code wakes itself at that work's end and goes on with
+            // no message of anyone's: part of the finished task (`Buggy`:
+            // someone else's turn, its report a first done one).
+            action AgentWakes when (bg == 1) {
+                bg = 0;
+                woken = 1;
+                done = if Buggy == 1 { 1 } else { 2 };
+                pending = 0;
+                walled = 0;
+                asked = 0;
+                open = 0;
             }
             // `Buggy`: the harness before DONE-1, which ended the task on an
             // open FINISHED at once.
@@ -670,21 +878,26 @@ pub fn supervisor_done_check_model() -> Model {
                 open_end = 1;
                 done = 2;
                 open = 0;
-                challenged = 0;
             }
-            // `Buggy`: a challenge that forgets it was asked — the open
-            // FINISHED answering it is challenged again.
-            action ChallengeAgain when (Buggy == 1 && pending == 4) {
-                twice = 1;
-                pending = 4;
+            // `Buggy`: the harness before the owner's rule of 2026-10-19 —
+            // once a job, the FINISHED that answers the challenge ends the
+            // task whatever it still leaves.
+            action EndAtTheChallengesAnswer when (Buggy == 1 && pending == 5) {
+                open_end = 1;
+                done = 2;
+                open = 0;
+                pending = 0;
             }
 
             invariant NeverTypeIntoADoneTask: typed_done == 0;
             invariant ADoneReportIsChecked: unchecked == 0;
             invariant OnlyTheCheckEndsTheTask: cut_short == 0;
             invariant AWallIsNeverLeftOnADoneTask: walled == 0 || done <= 1;
-            invariant AnOpenFinishIsChallenged: open_end == 0;
-            invariant OneChallengeAJob: twice == 0;
+            invariant AManagerIsNeverKeptWaiting: waited == 0;
+            invariant AWorkerThatKeepsAskingWaitsTheBackOff: rushed == 0;
+            invariant TheMarkerEndsTheTaskOverBackgroundWork: bg == 0 || done == 2;
+            invariant TheAgentsOwnWakeLeavesItsTaskDone: woken == 0 || done == 2;
+            invariant WorkLeftNeverEndsTheTask: open_end == 0;
         }
     }
 }
@@ -3183,6 +3396,243 @@ pub fn supervisor_usage_wall_liveness() -> Liveness {
     }
 }
 
+/// THE CREDITS HOLD (aterm-agent `supervise/policy/turn_end.rs`'s
+/// `credits_hold`, `TurnEndState::fold_credits`; the owner, 2026-10-19: *"for
+/// continuing on credits, that's an optional additional feature that's off by
+/// default. use subscriptions."*): usage credits carry a session past its
+/// window with no dialog — credits on at the account, the turn that crossed
+/// the limit served, Claude Code's `Now using usage credits` drawn — and
+/// carry it until the window resets. Under `[harness] usage_credits = false`
+/// (the `UsageCredits` dial 0, the default) the supervisor types no act of
+/// its own billed to them: it waits for the reset the notice they started on
+/// named, and with none named tells its owner once and waits to the hold's
+/// bound (`TurnEndTiming::credits_bound`, `Bound` ticks from their start),
+/// where one act goes as the probe.
+///
+/// `point` 1 a turn has ended (0: one runs); `carry` 1 credits carry the
+/// session — the world's truth, from the turn that crossed the limit to the
+/// window's reset; `notice` 1 the screen says so (the notice can disappear
+/// before restoration, or stand at rest past the reset); `known` 1 a notice
+/// was read and its episode has not ended on a later no-notice read. No
+/// known episode permits an act; a known one with its notice gone still
+/// waits to its placed reset or bound. `named` 1 the reset is known — the
+/// notice they started on, drawn some ten seconds under the running turn,
+/// was read (`CreditsStart`), or not (`CreditsStartUnread`); `clock` the
+/// ticks since they started, the window resetting at `ResetAt` — a tick past
+/// the vendor's reset by the grace the supervisor keeps, so the reset is the
+/// tick its wait ends; `told` the escalations of the episode; `lift` 1 the
+/// hold lifts at its end (0: the defects' hold that never does).
+/// `AnotherWindow`: the turn served past the reset is on credits still —
+/// another window carries them past (the week's under the session's), its
+/// reset unknown — told once more where the first was named; with none named
+/// it is the same episode to the supervisor until its bound, which starts it
+/// over. The window resetting before the bound, the probe's turn may be
+/// served on credits where another window binds: `AnotherWindow` after
+/// `OwnAct`, the act itself not billed (`carry` 0 when it is typed). A
+/// person's turn (`PersonTurn`) is never held.
+///
+/// `Buggy`: `ActsOnCredits`, the continuation typed while credits carry the
+/// session (the policy before the hold), caught by `NoOwnActOnCredits`;
+/// `TellsAgain`, the escalation repeated at every point, caught by
+/// `ToldOnce`; `StaleNoticeHolds`, the notice at rest past the named reset
+/// read as credits still carrying it, the session the subscription serves
+/// held, caught by `NoStaleHold` — stated over `OwnAct`'s guard — and by
+/// [`supervisor_credits_hold_liveness`]; `UnboundedHold`, the hold with no
+/// reset named that never lifts (the policy before its bound, the review of
+/// 2026-10-19), caught by `NoEndlessHold`, stated the same way, and by that
+/// liveness. The usage wall's `NoWallOnCredits`
+/// ([`supervisor_usage_wall_model`]) stands beside it: credits are no wall.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn supervisor_credits_hold_model() -> Model {
+    aterm_spec::ty_model! {
+        SupervisorCreditsHold {
+            const Buggy = 0;
+            const UsageCredits = 0;
+            const ResetAt = 2;
+            const Bound = 3;
+            const Cap = 3;
+            var point = 0;
+            var carry = 0;
+            var notice = 0;
+            var known = 0;
+            var named = 0;
+            var clock = 0;
+            var told = 0;
+            var billed = 0;
+            var lift = 1;
+
+            // ---- the world ----
+            // The running turn crosses the window's limit and credits serve
+            // it: the notice they started on read, or gone unread.
+            action CreditsStart when (point == 0 && carry == 0 && notice == 0 && known == 0) {
+                carry = 1;
+                notice = 1;
+                known = 1;
+                named = 1;
+                clock = 0;
+                told = 0;
+                lift = 1;
+            }
+            action CreditsStartUnread when (point == 0 && carry == 0 && notice == 0 && known == 0) {
+                carry = 1;
+                notice = 1;
+                known = 1;
+                named = 0;
+                clock = 0;
+                told = 0;
+                lift = 1;
+            }
+            // The transient no-reset notice can disappear without showing
+            // restoration. A read ends that episode only past its bound.
+            action NoticeGone when (notice == 1 && named == 0) {
+                notice = 0;
+                known = if (named == 1 && ResetAt <= clock)
+                    || (named == 0 && Bound <= clock) { 0 } else { known };
+            }
+            // The same notice can return without restarting its original bound.
+            action NoticeReturns when (known == 1 && notice == 0) {
+                notice = 1;
+            }
+            // Time passes while an episode is known, even without its notice;
+            // the actual window resets at `ResetAt`.
+            action Tick when (known == 1 && clock <= Cap - 1) {
+                clock = clock + 1;
+                carry = if ResetAt <= clock + 1 { 0 } else { carry };
+            }
+            // The running turn ends. A subscription answer clears the drawn
+            // notice, but does not reveal its unreported reset to the observer.
+            action TurnEnds when (point == 0) {
+                point = 1;
+                notice = if carry == 0 { 0 } else { notice };
+                known = if carry == 0
+                    && ((named == 1 && ResetAt <= clock)
+                        || (named == 0 && Bound <= clock)) { 0 } else { known };
+            }
+            // The turn served past the reset is on credits still: another
+            // window carries them past, its reset unknown. With none named,
+            // the supervisor's episode goes on to its bound.
+            action AnotherWindow when (point == 0 && notice == 1 && carry == 0) {
+                point = 1;
+                carry = 1;
+                told = if named == 1 { 0 } else { told };
+                named = 0;
+                clock = if named == 1 || Bound <= clock { 0 } else { clock };
+            }
+            // A person's own turn: never held.
+            action PersonTurn when (point == 1) {
+                point = 0;
+            }
+
+            // ---- the supervisor ----
+            // Its own act at a turn's end: under the key, with no known
+            // episode, or at the hold's end — the named reset, else the bound.
+            // A missing notice alone does not permit an act.
+            action OwnAct when (
+                point == 1
+                    && (UsageCredits == 1
+                        || known == 0
+                        || (lift == 1
+                            && ((named == 1 && ResetAt <= clock)
+                                || (named == 0 && Bound <= clock))))
+            ) {
+                point = 0;
+                billed = if carry == 1 && UsageCredits == 0 { 1 } else { billed };
+            }
+            // No reset named: the owner told, once an episode, before its
+            // bound.
+            action Tell when (
+                point == 1 && UsageCredits == 0 && known == 1 && named == 0 && told == 0
+                    && clock <= Bound - 1
+            ) {
+                told = 1;
+            }
+
+            // ---- the defects ----
+            action ActsOnCredits when (Buggy == 1 && point == 1 && carry == 1) {
+                point = 0;
+                billed = if UsageCredits == 0 { 1 } else { billed };
+            }
+            action TellsAgain when (
+                Buggy == 1 && point == 1 && UsageCredits == 0 && known == 1 && named == 0
+                    && told == 1
+            ) {
+                told = 2;
+            }
+            action StaleNoticeHolds when (
+                Buggy == 1 && point == 1 && UsageCredits == 0 && notice == 1 && carry == 0
+                    && named == 1 && lift == 1
+            ) {
+                lift = 0;
+            }
+            action UnboundedHold when (
+                Buggy == 1 && point == 1 && UsageCredits == 0 && known == 1 && named == 0
+                    && lift == 1
+            ) {
+                lift = 0;
+            }
+
+            // Under the key off, no act of the supervisor's own is billed to
+            // usage credits.
+            invariant NoOwnActOnCredits: UsageCredits == 1 || billed == 0;
+            // The owner is told once an episode.
+            invariant ToldOnce: told <= 1;
+            // A notice at rest past the named reset holds nothing: at such a
+            // point, `OwnAct`'s guard holds.
+            invariant NoStaleHold: point == 0
+                || named == 0
+                || clock <= ResetAt - 1
+                || UsageCredits == 1
+                || known == 0
+                || (lift == 1
+                    && ((named == 1 && ResetAt <= clock) || (named == 0 && Bound <= clock)));
+            // A hold with no reset named lifts at its bound: at a point past
+            // it, `OwnAct`'s guard holds.
+            invariant NoEndlessHold: point == 0
+                || named == 1
+                || clock <= Bound - 1
+                || UsageCredits == 1
+                || known == 0
+                || (lift == 1
+                    && ((named == 1 && ResetAt <= clock) || (named == 0 && Bound <= clock)));
+        }
+    }
+}
+
+/// THE CREDITS HOLD ENDS ([`supervisor_credits_hold_model`]): `[](point /\ ~carry
+/// ~> OwnAct enabled \/ ~known)` as `[]<>`, under the key off — a point the
+/// credits no longer carry, the notice still drawn at rest, does not stand
+/// held for good: the named reset, else the bound, lifts the hold. Fairness
+/// assumed: the clock ticks (`Tick`). Broken alone by `StaleNoticeHolds` (the
+/// hold that outlives its named reset) and by `UnboundedHold` (the hold with
+/// none named that never lifts, the review of 2026-10-19).
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+#[aterm_spec::liveness(supervisor_credits_hold_model)]
+pub fn supervisor_credits_hold_liveness() -> Liveness {
+    use aterm_spec::derive::{and_, eq, int, le, or_, var};
+    let own_act = or_(
+        eq(var("UsageCredits"), int(1)),
+        and_(
+            eq(var("lift"), int(1)),
+            or_(
+                and_(eq(var("named"), int(1)), le(var("ResetAt"), var("clock"))),
+                and_(eq(var("named"), int(0)), le(var("Bound"), var("clock"))),
+            ),
+        ),
+    );
+    Liveness {
+        name: "TheCreditsHoldEnds",
+        goal: or_(
+            or_(eq(var("point"), int(0)), eq(var("carry"), int(1))),
+            or_(eq(var("known"), int(0)), own_act),
+        ),
+        weak: vec!["Tick"],
+        strong: vec![],
+        mutants: vec!["StaleNoticeHolds", "UnboundedHold"],
+    }
+}
+
 /// THE MODEL SWITCH (aterm-agent `supervise/policy/turn_end.rs`, the model
 /// bucket's arm of `decide_turn_end` and `TurnEndState::restarted`, and the
 /// host's `restart` in `supervise/turn_end_loop.rs`): a tab at a model
@@ -3388,8 +3838,8 @@ pub fn supervisor_model_switch_liveness() -> Liveness {
 /// server and walks each read onto these actions: every invariant at every
 /// state, the real review key's equalities against `key == handed` at every
 /// look, the real file-request comparison against the request at every read
-/// the wait makes under a box's row, and each real ask posted right after
-/// the read the model asks at — with the key before FIX 3 replayed through
+/// the wait makes under a box's row, and each real ask (its badge) raised
+/// right after the read the model asks at — with the key before FIX 3 replayed through
 /// the same walk as the caught negative control.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]

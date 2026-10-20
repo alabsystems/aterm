@@ -260,8 +260,7 @@ impl Grid {
     #[must_use]
     pub fn reserve_older_history_keys(&mut self, lines: u64) -> OlderHistoryClaim {
         let shortfall = lines.saturating_sub(self.oldest_absolute_row());
-        self.storage.absolute_row_counter =
-            self.storage.absolute_row_counter.saturating_add(shortfall);
+        self.renumber_rows(self.storage.absolute_row_counter.saturating_add(shortfall));
         OlderHistoryClaim {
             clear_gen: self.storage.scrollback_clear_gen,
         }
@@ -338,7 +337,7 @@ impl Grid {
         // cannot cover the retained history and is raised, a renumbering.
         let needed = u64::from(self.storage.visible_rows) + self.scrollback_lines() as u64;
         if self.storage.absolute_row_counter < needed {
-            self.storage.absolute_row_counter = needed;
+            self.renumber_rows(needed);
             self.invalidate_host_coordinates();
         }
         self.storage.history_renumber_epoch = self.storage.history_renumber_epoch.saturating_add(1);

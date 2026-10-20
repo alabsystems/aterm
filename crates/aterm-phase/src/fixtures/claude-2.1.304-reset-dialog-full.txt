@@ -1,0 +1,12 @@
+# claude-code 2.1.304 · COMPOSED 2026-10-19, never captured: the texts are the bundle's (the row's label `Ug.label` N:L343317@14097 with the kind `X()` N:L363373@9597, the rows' order N:L371456@33701 (the stop row, one row per kind on offer, the wait row, the credits row); N is a `strings -n 8` dump of the 2.1.304 executable, not kept in the tree; crates/aterm-phase/src/reset.rs's module doc cites the same positions), the frame is the wall dialog's hand-built one (claude-2.1.287-usage-limit-dialog-fullscreen-panel.txt; same Dialog component), the values are invented · OPEN: replace with a capture (SPEC §6) · the usage-limit dialog at a weekly limit with ONE reset on offer, a full one: `Use a full reset (2 left, until Oct 5)` second
+⏺ Suites are running; I'll report the number when it lands.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Use a full reset (2 left, until Oct 5)
+     3. Wait here, then continue automatically at Oct 9 at 5am
+     4. Switch to usage credits
+
+   Enter to confirm · Esc to cancel

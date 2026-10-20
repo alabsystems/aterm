@@ -5,6 +5,8 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 // Modified by the aterm project in 2026; see the repository NOTICE.
+// Modified by Andrew Yates for the aterm project in 2026: the IME messages' decisions are
+// `ime::ime_events`.
 
 #![allow(non_snake_case)]
 
@@ -37,7 +39,7 @@ use windows_sys::Win32::System::Threading::{
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, TIMER_ALL_ACCESS,
 };
 use windows_sys::Win32::UI::Controls::{HOVER_DEFAULT, WM_MOUSELEAVE};
-use windows_sys::Win32::UI::Input::Ime::{GCS_COMPSTR, GCS_RESULTSTR, ISC_SHOWUICOMPOSITIONWINDOW};
+use windows_sys::Win32::UI::Input::Ime::ISC_SHOWUICOMPOSITIONWINDOW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
@@ -84,14 +86,12 @@ use crate::platform_impl::platform::dark_mode::try_theme;
 use crate::platform_impl::platform::dpi::{become_dpi_aware, dpi_to_scale_factor};
 use crate::platform_impl::platform::drop_handler::FileDropHandler;
 use crate::platform_impl::platform::icon::WinCursor;
-use crate::platform_impl::platform::ime::ImeContext;
+use crate::platform_impl::platform::ime::{ime_events, LazyImeContext};
 use crate::platform_impl::platform::keyboard::KeyEventBuilder;
 use crate::platform_impl::platform::keyboard_layout::LAYOUT_CACHE;
 use crate::platform_impl::platform::monitor::{self, MonitorHandle};
 use crate::platform_impl::platform::window::InitData;
-use crate::platform_impl::platform::window_state::{
-    CursorFlags, ImeState, WindowFlags, WindowState,
-};
+use crate::platform_impl::platform::window_state::{CursorFlags, WindowFlags, WindowState};
 use crate::platform_impl::platform::{
     raw_input, util, wrap_device_id, Fullscreen, WindowId, DEVICE_ID,
 };
@@ -131,6 +131,49 @@ pub(crate) struct WindowData {
     pub _file_drop_handler: Option<FileDropHandler>,
     pub userdata_removed: Cell<bool>,
     pub recurse_depth: Cell<u32>,
+    /// aterm: whether the last WM_SIZE minimized the window, so `WM_SIZE` reports
+    /// only the edges of a minimize as `Occluded` ([`minimize_edge`]).
+    pub minimized: Cell<bool>,
+}
+
+/// `WM_SIZE`'s `wParam` for a minimize (the vendored windows-sys carries only
+/// `SIZE_MAXIMIZED`).
+const SIZE_MINIMIZED: u32 = 1;
+
+/// aterm: the `Occluded` edge one `WM_SIZE` makes, given whether the window was
+/// minimized at the last one (`was`, updated here): `Some(true)` as it minimizes,
+/// `Some(false)` as it comes back (restored or maximized), `None` for every other
+/// resize.
+fn minimize_edge(was: &Cell<bool>, wparam: WPARAM) -> Option<bool> {
+    let minimized = wparam == SIZE_MINIMIZED as usize;
+    (was.replace(minimized) != minimized).then_some(minimized)
+}
+
+#[cfg(test)]
+mod minimize_edge_tests {
+    use std::cell::Cell;
+
+    use super::SIZE_MINIMIZED;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SIZE_MAXIMIZED;
+
+    /// `WM_SIZE`'s `wParam` for a plain resize.
+    const SIZE_RESTORED: u32 = 0;
+
+    /// A minimize and its return are one edge each; the resize steps of a drag
+    /// and a maximize of a shown window are none.
+    #[test]
+    fn only_the_edges_of_a_minimize_are_occlusion() {
+        let was = Cell::new(false);
+        let edge = |wparam: u32| super::minimize_edge(&was, wparam as usize);
+        assert_eq!(edge(SIZE_RESTORED), None, "a drag step");
+        assert_eq!(edge(SIZE_MAXIMIZED), None, "a maximize of a shown window");
+        assert_eq!(edge(SIZE_MINIMIZED), Some(true));
+        assert_eq!(edge(SIZE_MINIMIZED), None, "already minimized");
+        assert_eq!(edge(SIZE_MAXIMIZED), Some(false), "back, maximized");
+        assert_eq!(edge(SIZE_MINIMIZED), Some(true));
+        assert_eq!(edge(SIZE_RESTORED), Some(false), "back, restored");
+        assert_eq!(edge(SIZE_RESTORED), None);
+    }
 }
 
 impl WindowData {
@@ -598,15 +641,13 @@ fn dur2timeout(dur: Duration) -> u32 {
     dur.as_secs()
         .checked_mul(1000)
         .and_then(|ms| ms.checked_add((dur.subsec_nanos() as u64) / 1_000_000))
-        .and_then(
-            |ms| {
-                if dur.subsec_nanos() % 1_000_000 > 0 {
-                    ms.checked_add(1)
-                } else {
-                    Some(ms)
-                }
-            },
-        )
+        .and_then(|ms| {
+            if !dur.subsec_nanos().is_multiple_of(1_000_000) {
+                ms.checked_add(1)
+            } else {
+                Some(ms)
+            }
+        })
         .map(|ms| if ms > u32::MAX as u64 { INFINITE } else { ms as u32 })
         .unwrap_or(INFINITE)
 }
@@ -1154,6 +1195,14 @@ unsafe fn public_window_callback_inner(
                 },
             });
         }
+        // aterm: the character an Alt code composed arrives with no key event of its own;
+        // it is committed text, as an input method's is (`KeyEventBuilder::take_alt_code_commit`).
+        if let Some(text) = userdata.key_event_builder.take_alt_code_commit() {
+            userdata.send_event(Event::WindowEvent {
+                window_id: RootWindowId(WindowId(window)),
+                event: WindowEvent::Ime(Ime::Commit(text)),
+            });
+        }
     };
     userdata
         .event_loop_runner
@@ -1348,6 +1397,7 @@ unsafe fn public_window_callback_inner(
         WM_NCDESTROY => {
             unsafe { super::set_window_long(window, GWL_USERDATA, 0) };
             userdata.userdata_removed.set(true);
+            super::dark_mode::forget_menu_theme(window);
             result = ProcResult::Value(0);
         },
 
@@ -1475,7 +1525,7 @@ unsafe fn public_window_callback_inner(
         },
 
         WM_SIZE => {
-            use crate::event::WindowEvent::Resized;
+            use crate::event::WindowEvent::{Occluded, Resized};
             let w = super::loword(lparam as u32) as u32;
             let h = super::hiword(lparam as u32) as u32;
 
@@ -1493,6 +1543,18 @@ unsafe fn public_window_callback_inner(
                     let maximized = wparam == SIZE_MAXIMIZED as usize;
                     w.set_window_flags_in_place(|f| f.set(WindowFlags::MAXIMIZED, maximized));
                 }
+            }
+            // aterm: a minimize takes the window off the screen and a restore brings it
+            // back, so report them as `Occluded`, the event the macOS and X11 backends send
+            // for a window nobody can see (upstream winit sends none on Windows). The app
+            // parks its presents on it. WM_SIZE fires on every resize step, so only the
+            // edges send, and the return is sent before the restore's `Resized` so that
+            // resize's frame is not drawn under a stale occlusion.
+            if let Some(occluded) = minimize_edge(&userdata.minimized, wparam) {
+                userdata.send_event(Event::WindowEvent {
+                    window_id: RootWindowId(WindowId(window)),
+                    event: Occluded(occluded),
+                });
             }
             userdata.send_event(event);
             result = ProcResult::Value(0);
@@ -1590,105 +1652,29 @@ unsafe fn public_window_callback_inner(
             result = ProcResult::Value((MNC_CLOSE << 16) as isize);
         },
 
-        WM_IME_STARTCOMPOSITION => {
-            let ime_allowed = userdata.window_state_lock().ime_allowed;
-            if ime_allowed {
-                userdata.window_state_lock().ime_state = ImeState::Enabled;
-
+        // aterm: the three arms' decisions are `ime::ime_events`, so a recorded composition
+        // drives the same code (`super::recorded`). Not calling DefWindowProc for
+        // WM_IME_COMPOSITION hides the composing text the IME would draw.
+        WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION | WM_IME_ENDCOMPOSITION => {
+            let (allowed, mut state) = {
+                let w = userdata.window_state_lock();
+                (w.ime_allowed, w.ime_state)
+            };
+            let source = LazyImeContext::new(window);
+            let events = ime_events(msg, lparam, allowed, &mut state, &source);
+            drop(source);
+            userdata.window_state_lock().ime_state = state;
+            for event in events {
                 userdata.send_event(Event::WindowEvent {
                     window_id: RootWindowId(WindowId(window)),
-                    event: WindowEvent::Ime(Ime::Enabled),
+                    event: WindowEvent::Ime(event),
                 });
             }
-
-            result = ProcResult::DefWindowProc(wparam);
-        },
-
-        WM_IME_COMPOSITION => {
-            let ime_allowed_and_composing = {
-                let w = userdata.window_state_lock();
-                w.ime_allowed && w.ime_state != ImeState::Disabled
+            result = if msg == WM_IME_COMPOSITION {
+                ProcResult::Value(0)
+            } else {
+                ProcResult::DefWindowProc(wparam)
             };
-            // Windows Hangul IME sends WM_IME_COMPOSITION after WM_IME_ENDCOMPOSITION, so
-            // check whether composing.
-            if ime_allowed_and_composing {
-                let ime_context = unsafe { ImeContext::current(window) };
-
-                if lparam == 0 {
-                    userdata.send_event(Event::WindowEvent {
-                        window_id: RootWindowId(WindowId(window)),
-                        event: WindowEvent::Ime(Ime::Preedit(String::new(), None)),
-                    });
-                }
-
-                // Google Japanese Input and ATOK have both flags, so
-                // first, receive composing result if exist.
-                if (lparam as u32 & GCS_RESULTSTR) != 0 {
-                    if let Some(text) = unsafe { ime_context.get_composed_text() } {
-                        userdata.window_state_lock().ime_state = ImeState::Enabled;
-
-                        userdata.send_event(Event::WindowEvent {
-                            window_id: RootWindowId(WindowId(window)),
-                            event: WindowEvent::Ime(Ime::Preedit(String::new(), None)),
-                        });
-                        userdata.send_event(Event::WindowEvent {
-                            window_id: RootWindowId(WindowId(window)),
-                            event: WindowEvent::Ime(Ime::Commit(text)),
-                        });
-                    }
-                }
-
-                // Next, receive preedit range for next composing if exist.
-                if (lparam as u32 & GCS_COMPSTR) != 0 {
-                    if let Some((text, first, last)) =
-                        unsafe { ime_context.get_composing_text_and_cursor() }
-                    {
-                        userdata.window_state_lock().ime_state = ImeState::Preedit;
-                        let cursor_range = first.map(|f| (f, last.unwrap_or(f)));
-
-                        userdata.send_event(Event::WindowEvent {
-                            window_id: RootWindowId(WindowId(window)),
-                            event: WindowEvent::Ime(Ime::Preedit(text, cursor_range)),
-                        });
-                    }
-                }
-            }
-
-            // Not calling DefWindowProc to hide composing text drawn by IME.
-            result = ProcResult::Value(0);
-        },
-
-        WM_IME_ENDCOMPOSITION => {
-            let ime_allowed_or_composing = {
-                let w = userdata.window_state_lock();
-                w.ime_allowed || w.ime_state != ImeState::Disabled
-            };
-            if ime_allowed_or_composing {
-                if userdata.window_state_lock().ime_state == ImeState::Preedit {
-                    // Windows Hangul IME sends WM_IME_COMPOSITION after WM_IME_ENDCOMPOSITION, so
-                    // trying receiving composing result and commit if exists.
-                    let ime_context = unsafe { ImeContext::current(window) };
-                    if let Some(text) = unsafe { ime_context.get_composed_text() } {
-                        userdata.send_event(Event::WindowEvent {
-                            window_id: RootWindowId(WindowId(window)),
-                            event: WindowEvent::Ime(Ime::Preedit(String::new(), None)),
-                        });
-                        userdata.send_event(Event::WindowEvent {
-                            window_id: RootWindowId(WindowId(window)),
-                            event: WindowEvent::Ime(Ime::Commit(text)),
-                        });
-                    }
-                }
-
-                userdata.window_state_lock().ime_state = ImeState::Disabled;
-
-                userdata.send_event(Event::WindowEvent {
-                    window_id: RootWindowId(WindowId(window)),
-                    event: WindowEvent::Ime(Ime::Disabled),
-                });
-            }
-
-            result = ProcResult::DefWindowProc(wparam);
         },
 
         WM_IME_SETCONTEXT => {
@@ -2211,6 +2197,11 @@ unsafe fn public_window_callback_inner(
 
         WM_NCACTIVATE => {
             let is_active = wparam != false.into();
+            if is_active {
+                // The process-wide menu mode, back on this window's caption side
+                // before its system menu can open (`dark_mode::reassert_menu_theme`).
+                super::dark_mode::reassert_menu_theme(window);
+            }
             let active_focus_changed = userdata.window_state_lock().set_active(is_active);
             if active_focus_changed {
                 if is_active {

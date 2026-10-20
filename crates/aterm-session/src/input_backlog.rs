@@ -90,16 +90,41 @@ impl Contention {
         Self { per_cpu_milli }
     }
 
+    /// Construct [`Contention`] directly from `per_cpu_milli` (`load / cpus * 1000`).
+    #[must_use]
+    pub const fn from_per_cpu_milli(per_cpu_milli: u32) -> Self {
+        Self { per_cpu_milli }
+    }
+
     /// Runnable threads per CPU, times 1000 (for a status or a log line).
     #[must_use]
     pub const fn per_cpu_milli(self) -> u32 {
         self.per_cpu_milli
     }
 
+    /// Whether runnable load exceeds 1.0 thread per CPU (`per_cpu_milli > 1000`).
+    #[must_use]
+    pub const fn is_oversubscribed(self) -> bool {
+        self.per_cpu_milli > 1000
+    }
+
+    /// Whether runnable load reaches or exceeds [`Self::MAX_STRETCH`].
+    #[must_use]
+    pub const fn is_at_max_stretch(self) -> bool {
+        self.per_cpu_milli >= Self::MAX_STRETCH.saturating_mul(1000)
+    }
+
     /// The stretch factor, times 1000: `min(max(1, load/cpu), MAX_STRETCH)`.
-    fn factor_milli(self) -> u32 {
-        self.per_cpu_milli
-            .clamp(1000, Self::MAX_STRETCH.saturating_mul(1000))
+    #[must_use]
+    pub const fn factor_milli(self) -> u32 {
+        let max_milli = Self::MAX_STRETCH.saturating_mul(1000);
+        if self.per_cpu_milli < 1000 {
+            1000
+        } else if self.per_cpu_milli > max_milli {
+            max_milli
+        } else {
+            self.per_cpu_milli
+        }
     }
 
     /// `base`, stretched by the runnable load per CPU when that exceeds one:
@@ -109,16 +134,91 @@ impl Contention {
         base.saturating_mul(self.factor_milli()) / 1000
     }
 
+    /// Stretch a millisecond threshold by [`Self::factor_milli`], saturating on overflow.
+    #[must_use]
+    pub const fn stretch_millis(self, base_ms: u64) -> u64 {
+        let scaled = (base_ms as u128).saturating_mul(self.factor_milli() as u128) / 1000;
+        if scaled > (u64::MAX as u128) {
+            u64::MAX
+        } else {
+            scaled as u64
+        }
+    }
+
     /// The CPU time one runnable thread can expect across `wall_ns` of wall
     /// time, in nanoseconds: all of it when idle, `1/(load/cpu)` of it when
     /// oversubscribed (the [`Self::stretch`] factor). The watch calls a program
     /// spinning when it burned at least half of this, so a frozen program
     /// spinning on a saturated machine is not taken for a sleeper.
     #[must_use]
-    pub fn fair_share_ns(self, wall_ns: u64) -> u64 {
-        let share = u128::from(wall_ns) * 1000 / u128::from(self.factor_milli());
-        u64::try_from(share).unwrap_or(u64::MAX)
+    pub const fn fair_share_ns(self, wall_ns: u64) -> u64 {
+        let factor = self.factor_milli() as u128;
+        let denom = if factor == 0 { 1000 } else { factor };
+        let share = (wall_ns as u128).saturating_mul(1000) / denom;
+        if share > (u64::MAX as u128) {
+            u64::MAX
+        } else {
+            share as u64
+        }
     }
+}
+
+/// Oldest unread byte offset in a FIFO queue where `accepted` bytes have been written
+/// and `unread` bytes remain in the kernel buffer (`accepted.saturating_sub(unread)`).
+#[must_use]
+pub const fn oldest_unread_offset(accepted: u64, unread: u64) -> u64 {
+    accepted.saturating_sub(unread)
+}
+
+/// Return `true` iff `unread <= accepted` (no external writer injected unrecorded bytes).
+#[must_use]
+pub const fn unread_within_accepted(accepted: u64, unread: u64) -> bool {
+    unread <= accepted
+}
+
+/// Encode `(accepted, unread)` input-backlog watermarks into 16 little-endian bytes.
+#[must_use]
+pub const fn encode_backlog_watermarks_le(accepted: u64, unread: u64) -> [u8; 16] {
+    [
+        (accepted & 0xFF) as u8,
+        ((accepted >> 8) & 0xFF) as u8,
+        ((accepted >> 16) & 0xFF) as u8,
+        ((accepted >> 24) & 0xFF) as u8,
+        ((accepted >> 32) & 0xFF) as u8,
+        ((accepted >> 40) & 0xFF) as u8,
+        ((accepted >> 48) & 0xFF) as u8,
+        ((accepted >> 56) & 0xFF) as u8,
+        (unread & 0xFF) as u8,
+        ((unread >> 8) & 0xFF) as u8,
+        ((unread >> 16) & 0xFF) as u8,
+        ((unread >> 24) & 0xFF) as u8,
+        ((unread >> 32) & 0xFF) as u8,
+        ((unread >> 40) & 0xFF) as u8,
+        ((unread >> 48) & 0xFF) as u8,
+        ((unread >> 56) & 0xFF) as u8,
+    ]
+}
+
+/// Decode 16 little-endian bytes into `(accepted, unread)` input-backlog watermarks.
+#[must_use]
+pub const fn decode_backlog_watermarks_le(bytes: [u8; 16]) -> (u64, u64) {
+    let accepted = (bytes[0] as u64)
+        | ((bytes[1] as u64) << 8)
+        | ((bytes[2] as u64) << 16)
+        | ((bytes[3] as u64) << 24)
+        | ((bytes[4] as u64) << 32)
+        | ((bytes[5] as u64) << 40)
+        | ((bytes[6] as u64) << 48)
+        | ((bytes[7] as u64) << 56);
+    let unread = (bytes[8] as u64)
+        | ((bytes[9] as u64) << 8)
+        | ((bytes[10] as u64) << 16)
+        | ((bytes[11] as u64) << 24)
+        | ((bytes[12] as u64) << 32)
+        | ((bytes[13] as u64) << 40)
+        | ((bytes[14] as u64) << 48)
+        | ((bytes[15] as u64) << 56);
+    (accepted, unread)
 }
 
 /// What was seen of the program while its input waited: the evidence that

@@ -1,0 +1,28 @@
+seq v=1 rig=transcript program=claude build=2.1.303
+# REAL ROWS, THE EXACT PATH (5H-2b): the rows the managed Claude Code 2.1.303
+# wrote, in the lab against its stub, for a turn that ran one Bash call
+# (aterm-agent's committed reduction of that transcript, lines 51-60, folded
+# whole there): each row at the offset and time the real reader hands it
+# on (dated= relative, the prompt at 0), read the instant it was written.
+# 2.1.303 is a measured build (aterm-agent's MEASURED_BUILDS), so the reader
+# hands every row on On: the vendor's turn end closes the turn, exact,
+# before the screen comes to rest, as the lab's candidate build logged it
+# (`close t5 turn out=done ... by=vendor src=transcript conf=exact`, then
+# the screen's idle). The screen lines are this test's own.
+state on
+bind 0
+see busy
+expect open t1 turn par=r1 src=screen conf=strong
+tx prompt v1 dated=0 off=45544 slice=2.1.303:51-60
+expect amend t1 turn vref=v1 by=vendor src=transcript conf=exact
+at 2033 tx tool c1 dated=2033 off=47153 slice=2.1.303:51-60
+expect open p1 tool par=t1 cls=shell tool=Bash vref=c1 by=vendor src=transcript conf=exact
+at 8069 tx result c1 dated=8069 off=49032 slice=2.1.303:51-60
+expect close p1 tool out=ok by=vendor src=transcript conf=exact
+at 8092 tx end vdur=8100 in=45497 out=33 dated=8092 off=51030 slice=2.1.303:51-60
+expect close t1 turn out=done steps=1 tools=shell:1 by=vendor src=transcript conf=exact
+expect amend t1 turn vdur_ms=8100 tok_in=45497 tok_out=33 by=vendor src=transcript conf=exact
+expect turn=none
+at 8357 see idle
+wait 1000
+expect turn=none

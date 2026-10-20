@@ -1,33 +1,76 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `ChromeRegrowFloor` (`aterm_models_gui::chrome_regrow_floor_model`):
-//! after any rise of a window's chrome rows, no chrome source's quiet fall re-grids the
-//! window back inside `CHROME_REGROW_SETTLE`.
+//! Tier-1 bind for `ChromeRegrowFloor`
+//! (`aterm_models_gui::chrome_regrow_floor_model`, ruling 414) —
+//! after any rise of a window's chrome rows, neither the band's quiet fall nor
+//! the tab strip's fall re-grids the window back inside
+//! `CHROME_REGROW_SETTLE`.
 //!
-//! The rig drives the shipping band (`MessageCenter::post`/`dismiss`,
-//! `App::settle_messages`) and presence row (a turn's lease, `App::on_presence_wake`,
-//! `App::tell_story`, the test-only `App::note_human_acted`) on one clock, against a
-//! headless window standing in for glass (`chrome_regrids_for_test`). After each step the
-//! host is projected onto the model ([`project`]): an event or a passage of time must be
-//! its model action, a wake that re-grids must be a fall the model admits, and a wake that
-//! declines must decline exactly where the model enables no fall. Negative control: on a
-//! window with no floor each cross-source schedule re-grids back inside the settle, which
-//! the committed model rejects and `Buggy = 1` admits only as `BandFallOwnQuiet` or
-//! `PresFallOwnQuiet`.
+//! WHAT WAS MEASURED (2026-09-29, main `8b24e99a4`, real windows, a stand-in
+//! that reads its size 20 ms after the `SIGWINCH` and ticks a spinner every
+//! 5 ms): a chrome row rising milliseconds before the band's quiet shrink
+//! shifted the alternate screen (a net-zero shrink-then-grow pair). The
+//! presence row was that other source then; presence owns no chrome row since
+//! the owner surfaces (2026-10-16), and the TAB STRIP is the one other row a
+//! window's grid gives way to. On 2026-10-19 the windowed lane
+//! (`aterm-lab presence-flap --window --phases X`) measured the strip's fall —
+//! a Settings edit, then immediate and unfloored — re-gridding a window back
+//! 38 ms after a band row's rise; the strip's fall waits the floor since.
+//!
+//! THE RIG. Everything shipping is REAL: the band through the center
+//! (`MessageCenter::post`, `dismiss`) and the host's step
+//! (`App::settle_messages`: the band's commit with the floor the host hands,
+//! the re-grid, the rise noted on every window); the strip through
+//! `App::set_tab_strip_rows`, the seam every config load and reload takes, and
+//! its waiting fall through `App::settle_strip_fall`, run by the host's step;
+//! and the loop's wake (`App::settle_messages`, `App::sync_message_band_rows`).
+//! The window is a headless one standing in for glass
+//! (`chrome_regrids_for_test`, which every glass test of the host reads
+//! through `app_presence::chrome_regrids_grid`: the floor, and the band's
+//! afford law), and the rig steps ONE clock, so every instant is the rig's.
+//! The window's own shrink is the stand-in's terminal rows taken to none
+//! ([`Step::Cramp`]), which a real window's `on_resize` books after a drag or
+//! a zoom.
+//!
+//! The schedules: the two measured ones (each with its negative control), an
+//! edit back while the strip's fall waits (`StripBack`), an edit down outside
+//! the floor (taken at once), and the window's own shrink taking the band's
+//! waiting row inside the floor (`BandTaken`).
+//!
+//! Each step is one of the model's: an EVENT (a source's want or rise), a
+//! passage of TIME with no host code run (a tick of the floor, the band's own
+//! quiet), or the loop's WAKE. After each, the host is projected onto the
+//! model's variables ([`project`]) and checked BY NAME: an event or a passage
+//! of time must be the model's action it is; a wake that re-grids must be a
+//! fall the model admits; a wake that declines must decline exactly where
+//! the model enables no fall. The host's armed deadline must name the floor.
+//!
+//! Projection: `bw`/`b` the band's want (`MessageCenter::wanted_rows`) and
+//! reserved rows (`message_band_rows`); `sw`/`s` the rows the Settings ask for
+//! the strip (a waiting fall's, else the strip's) and the strip's rows; `bq`
+//! whether a
+//! pending fall's OWN due has passed (`MessageCenter::quiet_shrink_at`);
+//! `since` the ENGINE's count, off the window's `RegrowFloor`; and — ground
+//! truth, from what the rig SAW — `age` (the chrome total's last rise),
+//! `quick` (an unforced fall inside the settle of it), `cramped` (the rig
+//! took the window's room) and `flips`.
+//!
+//! NEGATIVE CONTROLS: each measured schedule on a window with no floor (a
+//! headless window not standing in for glass: the law before the floor, a fall
+//! once its own cause ran) re-grids back inside the settle, which the
+//! committed model rejects and `Buggy = 1` admits only as the law that shipped
+//! — `BandFallOwnQuiet` for the band, `StripFallAtOnce` for the strip.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aterm_messages::chrome::CHROME_REGROW_SETTLE;
-use aterm_messages::presence::drive::{self, Desk};
 use aterm_messages::{Message, MessageId, SHRINK_QUIET, Severity, WallStamp, tags};
 use aterm_models_gui::chrome_regrow_floor_model;
 use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 
-use crate::presence::StoryVerb;
-use crate::{App, Lease, SessionCtx, WindowId};
+use crate::{App, WindowId};
 
 const STAMP: WallStamp = WallStamp {
     unix_ms: 1_790_000_000_000,
@@ -49,23 +92,22 @@ pub(crate) struct Seen {
 /// `ChromeRegrowFloor`'s state for window `wid` at `now`.
 pub(crate) fn project(app: &App, wid: WindowId, now: Instant, seen: &Seen) -> State {
     let ws = app.windows.get(&wid).expect("the rig's window");
-    let v = &ws.presence;
     let bw = app.messages.wanted_rows() > 0;
     let b = app.message_band_rows > 0;
-    let pw = v.words.is_some();
-    let p = v.rows > 0;
-    // A source's own quiet reads as run unless a fall of it is pending and its own due is
-    // still ahead.
+    // The band's OWN quiet reads as run unless a fall of it is pending and
+    // its own due is still ahead.
     let bq = !(b && !bw) || app.messages.quiet_shrink_at().is_some_and(|x| now >= x);
-    let pq = !(p && !pw) || drive::fold_due(v, app.looked_at(wid)).is_some_and(|x| now >= x);
     let young = |at: Option<Instant>| at.is_some_and(|x| now < x);
+    let strip = app.tab_strip_rows > 0;
     let mut s = State::new();
     s.insert("bw", i64::from(bw));
     s.insert("b", i64::from(b));
-    s.insert("pw", i64::from(pw));
-    s.insert("p", i64::from(p));
+    s.insert(
+        "sw",
+        i64::from(app.strip_fall.map_or(strip, |rows| rows > 0)),
+    );
+    s.insert("s", i64::from(strip));
     s.insert("bq", i64::from(bq));
-    s.insert("pq", i64::from(pq));
     s.insert(
         "age",
         i64::from(!young(seen.rise.map(|r| r + CHROME_REGROW_SETTLE))),
@@ -82,14 +124,6 @@ fn fires(model: &Model, action: &str, before: &State, after: &State) -> bool {
     model.successors(action, before).contains(after)
 }
 
-/// Whether `first` then `then` take `before` to `after` in `model`.
-fn fires_both(model: &Model, first: &str, then: &str, before: &State, after: &State) -> bool {
-    model
-        .successors(first, before)
-        .iter()
-        .any(|mid| fires(model, then, mid, after))
-}
-
 /// One step of a schedule.
 #[derive(Clone, Copy, Debug)]
 enum Step {
@@ -97,16 +131,16 @@ enum Step {
     BandRise,
     /// The band row is dismissed (its want drops; its quiet starts).
     BandUnwant,
-    /// A turn's lease raises the presence row.
-    PresRiseLease,
-    /// A told story raises the presence row.
-    PresRiseStory,
-    /// The turn's lease ends: the presence row's want drops.
-    PresUnwant,
-    /// A person's keystroke reads the story (the fold law).
-    PresRead,
-    /// The window's frame loses its room (a drag or zoom `on_resize` books): the stand-in's
-    /// terminal rows drop to none, so its grid can afford neither chrome row.
+    /// The tab strip grows to one row (`App::set_tab_strip_rows`).
+    StripRise,
+    /// A Settings edit takes the strip to none (`App::set_tab_strip_rows`).
+    StripUnwant,
+    /// A Settings edit gives the strip its row back while its fall waits.
+    StripBack,
+    /// The window's frame loses its room: the stand-in's terminal rows drop
+    /// to none, so its grid can afford no band row (the drag or zoom a real
+    /// window's `on_resize` books). The afford law reads the stand-in as
+    /// glass (`app_presence::chrome_regrids_grid`).
     Cramp,
     /// Time passes to the given offset past the rig's origin, running no
     /// host code: the model's action it is, or `None` for a span in which
@@ -122,8 +156,6 @@ enum Step {
 struct Rig {
     app: App,
     wid: WindowId,
-    ctx: Arc<SessionCtx>,
-    session: u64,
     origin: Instant,
     now: Instant,
     band: Option<MessageId>,
@@ -141,7 +173,6 @@ impl Rig {
         let wid = WindowId(0);
         let session = app.next_session_id;
         app.push_stub_tab(wid, crate::stub_session(session));
-        let ctx = app.pool.get(session).expect("stub pooled").ctx.clone();
         app.windows
             .get_mut(&wid)
             .expect("window 0")
@@ -153,8 +184,6 @@ impl Rig {
         let mut rig = Rig {
             app,
             wid,
-            ctx,
-            session,
             origin,
             now: origin,
             band: None,
@@ -175,7 +204,6 @@ impl Rig {
 
     fn set_clock(&mut self, now: Instant) {
         self.now = now;
-        crate::app_presence::set_presence_clock_for_test(Some(now));
     }
 
     fn state(&self) -> State {
@@ -206,15 +234,11 @@ impl Rig {
         self.total = total;
     }
 
-    /// The loop's wake at the rig's instant: the timer's sweep (band step, then presence
-    /// tick), the focus/restore funnel that projects every window whatever its deadline (so
-    /// a fall the floor holds is judged by the commit itself), and the park's convergence
-    /// of the band's count.
+    /// The loop's wake at the rig's instant: the band's step, and the park's
+    /// convergence of the band's count.
     fn wake(&mut self) {
         let now = self.now;
         let _ = self.app.settle_messages(now);
-        let _ = self.app.presence_tick(now);
-        self.app.refresh_presence_all_windows();
         let _ = self.app.sync_message_band_rows(now);
     }
 
@@ -242,28 +266,12 @@ impl Rig {
                 let _ = self.app.settle_messages(self.now);
                 self.seen.flips += 1;
             }
-            Step::PresRiseLease => {
-                *self.ctx.turn_lease.lock().unwrap() = Some(Lease::Turn {
-                    id: 7,
-                    driver: None,
-                    typing: false,
-                });
-                self.app.on_presence_wake(&self.ctx.self_id, false);
+            Step::StripRise | Step::StripBack => {
+                self.app.set_tab_strip_rows(1, self.now);
                 self.seen.flips += 1;
             }
-            Step::PresRiseStory => {
-                self.app
-                    .tell_story(self.session, StoryVerb::Approval, "")
-                    .expect("the stub is held");
-                self.seen.flips += 1;
-            }
-            Step::PresUnwant => {
-                *self.ctx.turn_lease.lock().unwrap() = None;
-                self.app.on_presence_wake(&self.ctx.self_id, false);
-                self.seen.flips += 1;
-            }
-            Step::PresRead => {
-                self.app.note_human_acted(self.wid);
+            Step::StripUnwant => {
+                self.app.set_tab_strip_rows(0, self.now);
                 self.seen.flips += 1;
             }
             Step::Cramp => {
@@ -294,20 +302,14 @@ impl Rig {
     }
 }
 
-impl Drop for Rig {
-    fn drop(&mut self) {
-        crate::app_presence::set_presence_clock_for_test(None);
-    }
-}
-
 /// The model action an event step is.
 fn event_action(step: Step) -> Option<&'static str> {
     match step {
         Step::BandRise => Some("BandRise"),
         Step::BandUnwant => Some("BandUnwant"),
-        Step::PresRiseLease | Step::PresRiseStory => Some("PresRise"),
-        Step::PresUnwant => Some("PresUnwant"),
-        Step::PresRead => Some("PresRead"),
+        Step::StripRise => Some("StripRise"),
+        Step::StripUnwant => Some("StripUnwant"),
+        Step::StripBack => Some("StripBack"),
         Step::Cramp => Some("Cramp"),
         Step::At(_, a) => a,
         Step::AfterRise(_, a) => Some(a),
@@ -315,9 +317,21 @@ fn event_action(step: Step) -> Option<&'static str> {
     }
 }
 
-/// Every fall the model has: the two floored quiet falls and the two the
-/// window's own shrink takes.
-const FALLS: [&str; 4] = ["BandFall", "PresFall", "BandTaken", "PresTaken"];
+/// Every fall the model has: the floored quiet fall, the one the window's own
+/// shrink takes, and the strip's floored fall.
+const FALLS: [&str; 3] = ["BandFall", "BandTaken", "StripFall"];
+
+/// Whether event `action` takes `before` to `after` in `model` — alone, or with
+/// the fall the same host call takes when nothing holds it (a Settings edit down
+/// outside the floor is `StripUnwant` then `fall`).
+fn fires_event(model: &Model, action: &str, fall: &str, before: &State, after: &State) -> bool {
+    fires(model, action, before, after)
+        || (action == "StripUnwant"
+            && model
+                .successors(action, before)
+                .iter()
+                .any(|mid| fires(model, fall, mid, after)))
+}
 
 /// The fixed build: every step the model's, every wake's decision the model's, every
 /// projected state inside the invariants. Returns how many wakes re-gridded and how many
@@ -334,7 +348,7 @@ fn check_fixed(rig: &Rig) -> (usize, usize) {
         }
         match event_action(*step) {
             Some(action) => assert!(
-                fires(&rig.model, action, before, after),
+                fires_event(&rig.model, action, "StripFall", before, after),
                 "step {i} {step:?} is not `{action}`: {before:?} -> {after:?}"
             ),
             None if matches!(step, Step::At(..)) => assert_eq!(
@@ -365,8 +379,9 @@ fn check_fixed(rig: &Rig) -> (usize, usize) {
     (fell, declined)
 }
 
-/// The negative control: exactly one wake's re-grid is rejected by the committed model and
-/// admitted at `Buggy = 1` only as `mutant`; every other step is admitted at `Buggy = 1`.
+/// The negative control: exactly one re-grid is rejected by the committed model and
+/// admitted at `Buggy = 1` only as `mutant` (a wake's, or an edit's with its fall in the
+/// same call); every other step is admitted at `Buggy = 1`.
 fn check_control(rig: &Rig, mutant: &str) {
     let mut caught = 0;
     for (i, (step, before, after)) in rig.trace.iter().enumerate() {
@@ -374,8 +389,12 @@ fn check_control(rig: &Rig, mutant: &str) {
             continue;
         }
         if interp::admits(&rig.model, before, after).is_none() {
+            let as_mutant = match event_action(*step) {
+                None => matches!(step, Step::Wake) && fires(&rig.buggy, mutant, before, after),
+                Some(action) => fires_event(&rig.buggy, action, mutant, before, after),
+            };
             assert!(
-                matches!(step, Step::Wake) && fires(&rig.buggy, mutant, before, after),
+                as_mutant,
                 "step {i} {step:?}: rejected, and not as `{mutant}`: {before:?} -> {after:?}"
             );
             caught += 1;
@@ -393,9 +412,10 @@ fn check_control(rig: &Rig, mutant: &str) {
     );
 }
 
-/// A band row is up and dismissed; 5 ms before its quiet shrink the presence row is born.
-/// The band waits the floor, and its deadline names it.
-fn raise_then_bandshrink(rig: &mut Rig) {
+/// RISE THEN BANDSHRINK: a band row is up and dismissed; 5 ms before its
+/// quiet shrink the strip grows. The band waits the floor, and its state
+/// deadline names it.
+fn rise_then_bandshrink(rig: &mut Rig) {
     let ms = Duration::from_millis;
     let dropped = ms(1000);
     let shrink = dropped + SHRINK_QUIET;
@@ -405,19 +425,19 @@ fn raise_then_bandshrink(rig: &mut Rig) {
         Step::At(dropped, None),
         Step::BandUnwant,
         Step::At(shrink - ms(5), None),
-        Step::PresRiseLease,
+        Step::StripRise,
         Step::At(shrink, Some("BandQuiet")),
         Step::Wake,
     ]);
 }
 
 #[test]
-fn a_presence_birth_just_before_the_bands_quiet_shrink_holds_it_to_the_floor() {
+fn a_strip_rise_just_before_the_bands_quiet_shrink_holds_it_to_the_floor() {
     crate::fabric::with_link_reset(|| {
         let mut rig = Rig::new(true);
-        raise_then_bandshrink(&mut rig);
-        assert_eq!(rig.app.message_band_rows, 1, "5 ms after the birth: held");
-        let floor = rig.floor().expect("the birth noted a rise");
+        rise_then_bandshrink(&mut rig);
+        assert_eq!(rig.app.message_band_rows, 1, "5 ms after the rise: held");
+        let floor = rig.floor().expect("the rise was noted");
         assert_eq!(
             rig.app.messages_deadline(),
             Some(floor),
@@ -428,133 +448,115 @@ fn a_presence_birth_just_before_the_bands_quiet_shrink_holds_it_to_the_floor() {
         let (fell, declined) = check_fixed(&rig);
         assert_eq!((fell, declined), (1, 1), "{:#?}", rig.trace);
 
-        // Negative control: no floor, so the shrink lands 5 ms after the birth.
+        // NEGATIVE CONTROL: no floor — the shrink lands 5 ms after the rise.
         let mut control = Rig::new(false);
-        raise_then_bandshrink(&mut control);
+        rise_then_bandshrink(&mut control);
         assert_eq!(control.app.message_band_rows, 0);
         check_control(&control, "BandFallOwnQuiet");
     });
 }
 
-/// The turn's lease raised the row and ended; 12 ms before the row's timed fold a band row
-/// rises. The fold waits the floor, and the presence deadline names it.
-fn band_then_quietfold(rig: &mut Rig) {
+/// BAND RISE THEN STRIPFALL (the pair measured on 2026-10-19, 38 ms apart):
+/// the strip is up and long settled; a band row rises, and 38 ms later a
+/// Settings edit takes the strip down. The strip's fall waits the floor, and
+/// the host's wake names it.
+fn band_rise_then_stripfall(rig: &mut Rig) {
     let ms = Duration::from_millis;
-    let dropped = ms(500);
-    let due = dropped + aterm_messages::presence::FOLD_QUIET;
+    let rise = ms(2000);
     rig.run(&[
-        Step::PresRiseLease,
-        Step::At(dropped, Some("Tick")),
-        Step::PresUnwant,
-        Step::At(due - ms(12), None),
+        Step::StripRise,
+        Step::At(ms(500), Some("Tick")),
+        Step::At(rise, None),
         Step::BandRise,
-        Step::At(due, Some("PresQuiet")),
+        Step::At(rise + ms(38), None),
+        Step::StripUnwant,
         Step::Wake,
     ]);
 }
 
 #[test]
-fn a_band_rise_just_before_the_presence_rows_timed_fold_holds_it_to_the_floor() {
+fn a_settings_edit_just_after_a_band_rise_holds_the_strips_fall_to_the_floor() {
     crate::fabric::with_link_reset(|| {
         let mut rig = Rig::new(true);
-        band_then_quietfold(&mut rig);
-        assert_eq!(rig.app.presence_view(rig.wid).unwrap().rows, 1, "held");
-        let floor = rig.floor().expect("the band's rise was noted");
+        band_rise_then_stripfall(&mut rig);
+        assert_eq!(rig.app.tab_strip_rows, 1, "38 ms after the rise: held");
+        let floor = rig.floor().expect("the rise was noted");
         assert_eq!(
-            rig.app.presence_deadline(rig.now),
+            rig.app.strip_fall_due(),
             Some(floor),
-            "the presence wake is the floor"
+            "the strip's wake is the floor"
+        );
+        assert!(
+            rig.app.messages_deadline().is_some_and(|d| d <= floor),
+            "the loop wakes by the floor: {:?}",
+            rig.app.messages_deadline()
         );
         rig.run(&[Step::AfterRise(CHROME_REGROW_SETTLE, "Tick"), Step::Wake]);
-        assert_eq!(rig.app.presence_view(rig.wid).unwrap().rows, 0, "folded");
+        assert_eq!(rig.app.tab_strip_rows, 0, "at the floor: the fall");
+        assert_eq!(rig.app.strip_fall_due(), None, "no fall left waiting");
         let (fell, declined) = check_fixed(&rig);
         assert_eq!((fell, declined), (1, 1), "{:#?}", rig.trace);
 
+        // NEGATIVE CONTROL: no floor — the edit re-grids 38 ms after the rise.
         let mut control = Rig::new(false);
-        band_then_quietfold(&mut control);
-        assert_eq!(control.app.presence_view(control.wid).unwrap().rows, 0);
-        check_control(&control, "PresFallOwnQuiet");
+        band_rise_then_stripfall(&mut control);
+        assert_eq!(control.app.tab_strip_rows, 0);
+        check_control(&control, "StripFallAtOnce");
     });
 }
 
-/// A told story's row has stood its quiet; a band row rises and 3 ms later a person's key
-/// reads the story. The read is kept and folds at the floor.
-fn band_then_fold_stood(rig: &mut Rig) {
-    let ms = Duration::from_millis;
-    rig.run(&[
-        Step::PresRiseStory,
-        Step::At(ms(2000), Some("Tick")),
-        Step::BandRise,
-        Step::At(ms(2003), None),
-        Step::PresRead,
-    ]);
-}
-
+/// AN EDIT BACK while the strip's fall waits: the strip keeps its row, no
+/// wake re-grids, and no fall is left waiting.
 #[test]
-fn a_band_rise_just_before_a_persons_read_holds_the_read_to_the_floor() {
+fn a_settings_edit_back_while_the_strips_fall_waits_regrids_nothing() {
     crate::fabric::with_link_reset(|| {
+        let ms = Duration::from_millis;
         let mut rig = Rig::new(true);
-        band_then_fold_stood(&mut rig);
-        assert_eq!(rig.app.presence_view(rig.wid).unwrap().rows, 1, "held");
-        assert!(rig.app.presence_view(rig.wid).unwrap().fold_read);
+        band_rise_then_stripfall(&mut rig);
         rig.run(&[
+            Step::At(ms(2100), None),
+            Step::StripBack,
             Step::Wake,
             Step::AfterRise(CHROME_REGROW_SETTLE, "Tick"),
             Step::Wake,
         ]);
-        assert_eq!(rig.app.presence_view(rig.wid).unwrap().rows, 0, "folded");
+        assert_eq!(rig.app.tab_strip_rows, 1);
+        assert_eq!(rig.app.strip_fall_due(), None);
         let (fell, declined) = check_fixed(&rig);
-        assert_eq!((fell, declined), (1, 1), "{:#?}", rig.trace);
-
-        // Negative control: the read folds at once, 3 ms after the rise (the read and an
-        // unfloored fold in one step), which the committed model rejects and `Buggy = 1`
-        // admits only as the read then `PresFallOwnQuiet`.
-        let mut control = Rig::new(false);
-        band_then_fold_stood(&mut control);
-        assert_eq!(control.app.presence_view(control.wid).unwrap().rows, 0);
-        let (_, before, after) = control.trace.last().expect("the read");
-        assert!(interp::admits(&control.model, before, after).is_none());
-        assert!(
-            !fires_both(&control.model, "PresRead", "PresFall", before, after),
-            "not the fixed law's read then fall"
-        );
-        assert!(
-            fires_both(
-                &control.buggy,
-                "PresRead",
-                "PresFallOwnQuiet",
-                before,
-                after
-            ),
-            "the read, then the unfloored fold: {before:?} -> {after:?}"
-        );
-        assert!(control.seen.quick);
+        assert_eq!((fell, declined), (0, 3), "{:#?}", rig.trace);
     });
 }
 
-/// The window's own shrink, band row: a band row rises and is dismissed, and 100 ms later,
-/// inside both its floor and its own quiet, the window loses its room. The window takes
-/// the row at the next wake, neither quiet nor floor applying: `BandTaken`.
+/// AN EDIT DOWN OUTSIDE THE FLOOR: the strip's fall is taken in the edit's own
+/// call (`StripUnwant`, then `StripFall`), with nothing left to wake for.
+#[test]
+fn a_settings_edit_down_outside_the_floor_takes_the_strip_at_once() {
+    crate::fabric::with_link_reset(|| {
+        let ms = Duration::from_millis;
+        let mut rig = Rig::new(true);
+        rig.run(&[
+            Step::StripRise,
+            Step::At(ms(500), Some("Tick")),
+            Step::StripUnwant,
+        ]);
+        assert_eq!(rig.app.tab_strip_rows, 0);
+        assert_eq!(rig.app.strip_fall_due(), None);
+        let (fell, declined) = check_fixed(&rig);
+        assert_eq!((fell, declined), (0, 0), "{:#?}", rig.trace);
+    });
+}
+
+/// THE WINDOW'S OWN SHRINK, the band's: a band row rises and is dismissed,
+/// and 100 ms later — inside the floor its own rise noted, and inside its
+/// own quiet — the window loses its room. The window takes the row at the
+/// next wake (D1's exception), neither quiet nor the floor applying: the
+/// model's `BandTaken`.
 fn band_taken(rig: &mut Rig) {
     let ms = Duration::from_millis;
     rig.run(&[
         Step::BandRise,
         Step::At(ms(100), None),
         Step::BandUnwant,
-        Step::At(ms(200), None),
-        Step::Cramp,
-        Step::Wake,
-    ]);
-}
-
-/// The window's own shrink, presence row: the row is born and its want drops, and inside
-/// the floor the window loses its room. The window takes the row at once: `PresTaken`.
-fn pres_taken(rig: &mut Rig) {
-    let ms = Duration::from_millis;
-    rig.run(&[
-        Step::PresRiseLease,
-        Step::At(ms(100), None),
-        Step::PresUnwant,
         Step::At(ms(200), None),
         Step::Cramp,
         Step::Wake,
@@ -587,110 +589,9 @@ fn a_window_that_loses_its_room_takes_the_bands_waiting_row_inside_the_floor() {
     });
 }
 
-#[test]
-fn a_window_that_loses_its_room_takes_the_presence_rows_waiting_row_inside_the_floor() {
-    crate::fabric::with_link_reset(|| {
-        let mut rig = Rig::new(true);
-        pres_taken(&mut rig);
-        assert_eq!(rig.app.presence_view(rig.wid).unwrap().rows, 0, "taken");
-        took_inside_the_floor(&rig, "PresTaken");
-        let (fell, declined) = check_fixed(&rig);
-        assert_eq!((fell, declined), (1, 0), "{:#?}", rig.trace);
-    });
-}
-
-/// Two windows: the band re-grids every window, so its quiet shrink waits the latest floor
-/// of every window with glass (`App::band_regrow_floor`). A band row is up and dismissed;
-/// 5 ms before its quiet shrink a presence row is born in window 1, whose floor alone then
-/// holds the band. `other_glass`: whether window 1 stands in for glass too.
-fn two_windows(other_glass: bool) -> (Rig, WindowId) {
-    let ms = Duration::from_millis;
-    let mut rig = Rig::new(true);
-    let first = rig.app.next_session_id;
-    let other = rig
-        .app
-        .insert_logical_window(crate::stub_session(first), 24, 80);
-    // A window's first stub session is not registered (no pty); a pushed tab is, so its
-    // lease reaches the driver.
-    let sid = rig.app.next_session_id;
-    rig.app.push_stub_tab(other, crate::stub_session(sid));
-    rig.app.frontmost_window = Some(rig.wid);
-    rig.app
-        .windows
-        .get_mut(&other)
-        .expect("window 1")
-        .chrome_regrids_for_test = other_glass;
-    let ctx = rig.app.pool.get(sid).expect("stub pooled").ctx.clone();
-    let dropped = ms(1000);
-    let shrink = dropped + SHRINK_QUIET;
-    rig.run(&[
-        Step::BandRise,
-        Step::At(dropped, None),
-        Step::BandUnwant,
-        Step::At(shrink - ms(5), None),
-    ]);
-    *ctx.turn_lease.lock().unwrap() = Some(Lease::Turn {
-        id: 7,
-        driver: None,
-        typing: false,
-    });
-    rig.app.on_presence_wake(&ctx.self_id, false);
-    assert_eq!(
-        rig.app.presence_view(other).unwrap().rows,
-        1,
-        "born in window 1"
-    );
-    assert_eq!(
-        rig.app.presence_view(rig.wid).unwrap().rows,
-        0,
-        "not in window 0"
-    );
-    rig.run(&[Step::At(shrink, None), Step::Wake]);
-    (rig, other)
-}
-
-/// A birth in window 1 holds the band's shrink to window 1's floor, and the band's wake
-/// names it. Negative control: window 1 without glass has no floor, and the band shrinks
-/// 5 ms after the birth, as a band floor that read only its own window would.
-#[test]
-fn a_presence_birth_in_another_window_holds_the_bands_shrink_to_that_windows_floor() {
-    crate::fabric::with_link_reset(|| {
-        let (mut rig, other) = two_windows(true);
-        let floor = rig
-            .app
-            .chrome_regrow_floor(other)
-            .expect("the birth noted a rise on window 1");
-        assert!(
-            rig.app
-                .chrome_regrow_floor(rig.wid)
-                .is_some_and(|own| own < rig.now),
-            "window 0's own floor (the band's rise) has long run"
-        );
-        assert_eq!(rig.app.band_regrow_floor(), Some(floor), "the latest");
-        assert_eq!(rig.app.message_band_rows, 1, "5 ms after the birth: held");
-        assert_eq!(
-            rig.app.messages_deadline(),
-            Some(floor),
-            "the band's wake is window 1's floor"
-        );
-        rig.set_clock(floor - Duration::from_millis(1));
-        rig.wake();
-        assert_eq!(rig.app.message_band_rows, 1);
-        rig.set_clock(floor);
-        rig.wake();
-        assert_eq!(rig.app.message_band_rows, 0, "at window 1's floor");
-
-        let (control, other) = two_windows(false);
-        assert_eq!(control.app.chrome_regrow_floor(other), None);
-        assert_eq!(
-            control.app.message_band_rows, 0,
-            "no floor on window 1: the band shrank 5 ms after the birth there"
-        );
-    });
-}
-
-/// A window that never re-grids for its chrome (headless, no stand-in) has no floor; one
-/// that does reads the latest rise of any source.
+/// A window that never re-grids for its chrome (headless, no stand-in) has
+/// no floor at all — its falls keep the law before — and one that does reads
+/// the latest rise of any source.
 #[test]
 fn only_a_window_whose_grid_moves_for_its_chrome_has_a_floor() {
     crate::fabric::with_link_reset(|| {
@@ -705,95 +606,9 @@ fn only_a_window_whose_grid_moves_for_its_chrome_has_a_floor() {
         assert!(floor.is_some());
         assert_eq!(glass.app.chrome_regrow_floor(glass.wid), floor);
         assert_eq!(glass.app.band_regrow_floor(), floor);
+        // The strip's rise is a rise on that floor too.
+        glass.set_clock(glass.now + Duration::from_secs(5));
+        glass.step(Step::StripRise);
+        assert!(glass.floor() > floor, "the strip's rise moved the anchor");
     });
 }
-
-// The machine's other actions: environment steps, time, the frame and the `Buggy`
-// members. The re-grids carry `#[refines]` anchors on `App::regrid_message_band` and
-// `App::regrid_window_for_chrome_rows`.
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
-    action = "BandUnwant",
-    reason = "The band row's want drops (a dismissal, a hold's end): the center's state. \
-              Tier-1 dismisses a real row and settles the real host step."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
-    action = "BandBack",
-    reason = "A band row wanted again while its shrink waits: no re-grid (D1). The engine's \
-              `commit_rows` Equal arm; pinned by the center's own D1 tests."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
-    action = "PresUnwant",
-    reason = "The presence row's want drops (a lease ends): the session's facts. Tier-1 ends a \
-              real turn lease and delivers its wake."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
-    action = "PresBack",
-    reason = "The presence row wanted again while its fold waits: no re-grid (ruling 394). \
-              Pinned by `presence_drive_tests`' fold-quiet tests."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
-    action = "PresRead",
-    reason = "A person's keystroke reads a calm story: the fold law's input. Tier-1 drives the \
-              test-only `App::note_human_acted`, a seam onto the real `drive::human_acted`; \
-              the shipping key arm (`App::dispatch_hw_key`) reads through \
-              `drive::human_acted_on` after `on_key`."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
-    action = "BandQuiet",
-    reason = "Time: the band's own `SHRINK_QUIET` runs out. Tier-1 steps the clock past \
-              `MessageCenter::quiet_shrink_at`."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
-    action = "PresQuiet",
-    reason = "Time: the presence row's own `FOLD_QUIET` runs out. Tier-1 steps the clock past \
-              `presence::drive::fold_due`."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
-    action = "Tick",
-    reason = "Time: the floor's `CHROME_REGROW_SETTLE` runs out. Tier-1 steps the clock past \
-              the window's `RegrowFloor::floor`."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
-    action = "Cramp",
-    reason = "The window's frame loses its room (a drag, a zoom): the OS window's size, \
-              booked by `on_resize`. Tier-1 takes the stand-in's terminal rows to none and \
-              drives both takes (`BandTaken`, `PresTaken`) inside the floor."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
-    action = "Uncramp",
-    reason = "The window's frame gets its room back: the OS window's size."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
-    action = "BandFallOwnQuiet",
-    reason = "`Buggy = 1` mutant: the band's quiet shrink before the floor. The Tier-1 \
-              negative control is admitted only as this."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
-    action = "PresFallOwnQuiet",
-    reason = "`Buggy = 1` mutant: the presence fold before the floor. The Tier-1 negative \
-              control is admitted only as this."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
-    action = "Restart",
-    reason = "`Buggy = 1` mutant: a floor re-anchored on a step that is no rise. No shipping \
-              code re-anchors: `RegrowFloor::rose` alone moves it, pinned by the engine's \
-              `chrome` tests."
-)]
-#[expect(
-    dead_code,
-    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it"
-)]
-fn chrome_regrow_waivers() {}

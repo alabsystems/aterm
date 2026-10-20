@@ -358,9 +358,10 @@ impl Terminal {
 
             // The history arm is `get_line_text`'s on the line already fetched.
             let line = if row < 0 {
-                current.history.as_ref().and_then(|stored| {
-                    self.history_range_text(row, stored, (start_col, end_col), trailing)
-                })
+                current
+                    .history
+                    .as_ref()
+                    .map(|stored| self.history_range_text(stored, (start_col, end_col), trailing))
             } else {
                 self.line_text(row, Some((start_col, end_col)), trailing)
             };
@@ -550,7 +551,7 @@ impl Terminal {
                 return Some(String::new());
             }
             let (start_col, end_col) = col_range.unwrap_or((0, cols.saturating_sub(1)));
-            self.history_range_text(row, &scrollback_line, (start_col, end_col), trailing)
+            Some(self.history_range_text(&scrollback_line, (start_col, end_col), trailing))
         } else {
             None
         }
@@ -558,28 +559,21 @@ impl Terminal {
 }
 
 impl Terminal {
-    /// The text in columns `start_col..=end_col` of history row `row` (selection-space,
-    /// negative; `line` its stored line), read from the cells the row is drawn in. `None`
-    /// when `row` addresses no history line.
+    /// The text in columns `start_col..=end_col` of a history row whose stored line is
+    /// `line`, read from the cells the row is drawn in.
     fn history_range_text(
         &self,
-        row: i32,
         line: &aterm_scrollback::Line,
         cols: (u16, u16),
         trailing: TrailingBlanks,
-    ) -> Option<String> {
-        let rev_idx = usize::try_from(-(i64::from(row)) - 1).ok()?;
-        let idx = self
-            .grid
-            .scrollback_lines()
-            .checked_sub(rev_idx.checked_add(1)?)?;
-        Some(scrollback_line_range_text(
+    ) -> String {
+        scrollback_line_range_text(
             line.as_bytes(),
             MAX_SCROLLBACK_LINE_SCAN_BYTES,
-            |text| super::history_line_text_cells(&self.grid, idx, line, text),
+            |text| super::history_line_text_cells(&self.grid, line, text),
             cols,
             trailing,
-        ))
+        )
     }
 }
 

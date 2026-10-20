@@ -11,9 +11,11 @@
 
 use std::path::Path;
 
+#[cfg(target_os = "macos")]
+use crate::support::Home;
 use crate::support::{
-    Home, Run, SYSTEM_PATH, Scratch, bash, hermetic, install_sh, installer, q, read, run, s,
-    symlink, tree, write,
+    Run, Scratch, bash, hermetic, install_sh, installer, q, read, run, s, symlink, system_path,
+    tree, write,
 };
 
 /// curl and gh as loggers: any invocation is recorded, never networked.
@@ -73,7 +75,7 @@ fn truncated(scratch: &Scratch, text: &str, cut: usize, shim: &Path) -> Truncate
     cmd.arg("-c")
         .arg(format!("exec {} <{}", q(s(&bash())), q(s(&file))))
         .env_clear();
-    let path = format!("{}:{SYSTEM_PATH}", s(shim));
+    let path = format!("{}:{}", s(shim), system_path());
     for (key, value) in hermetic(&home, &[("PATH", &path), ("SHIM_LOG", s(&log))]) {
         cmd.env(key, value);
     }
@@ -172,6 +174,7 @@ fn the_guard_property_catches_work_after_the_final_call() {
 /// `$STUB_SLUG`: the latest pointer, the manifest's presence, the manifest's
 /// and the zip's sizes, and the manifest's bytes. Anything else — any other
 /// URL or request shape, any API host — fails the run.
+#[cfg(target_os = "macos")]
 const WEB_STUB: &str = r#"#!/bin/sh
 head=0 follow=0 fmt="" url=""
 while [ $# -gt 0 ]; do
@@ -204,11 +207,13 @@ esac
 
 const NO_GH: &str = "#!/bin/sh\necho \"gh stub: the installer ran gh $*\" >&2\nexit 64\n";
 
+#[cfg(target_os = "macos")]
 struct DryRun {
     run: Run,
     requests: Vec<String>,
 }
 
+#[cfg(target_os = "macos")]
 fn dry_run(scratch: &Scratch, home: &Home, args: &[&str]) -> DryRun {
     let web = scratch.mkdir("web");
     scratch.stand_in("web/curl", WEB_STUB);
@@ -223,7 +228,7 @@ fn dry_run(scratch: &Scratch, home: &Home, args: &[&str]) -> DryRun {
     );
     let log = scratch.join("requests.log");
     write(&log, "");
-    let path = format!("{}:{SYSTEM_PATH}", s(&web));
+    let path = format!("{}:{}", s(&web), system_path());
     let run = installer(
         &install_sh(),
         home,
@@ -247,11 +252,8 @@ fn dry_run(scratch: &Scratch, home: &Home, args: &[&str]) -> DryRun {
 /// once by a redirect-refusing HEAD, asks nothing of any other host or of gh,
 /// and leaves HOME and TMPDIR untouched. A bundle at the destination that is
 /// not aterm's skips the app half, left in place.
+#[cfg(target_os = "macos")]
 #[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "the stubbed dry run models the macOS app lane"
-)]
 fn a_dry_run_prints_the_plan_and_changes_nothing() {
     let scratch = Scratch::new();
     let fresh = scratch.home("dry");
@@ -322,6 +324,7 @@ fn a_dry_run_prints_the_plan_and_changes_nothing() {
 /// publishes no Linux executable: the latest pointer, and a 404 for either
 /// architecture's raw binary. Only alabsystems/aterm is served — any other
 /// repository, URL or request shape fails the run.
+#[cfg(target_os = "linux")]
 const PUBLIC_NO_LINUX_STUB: &str = r#"#!/bin/sh
 head=0 follow=0 fmt="" url=""
 while [ $# -gt 0 ]; do
@@ -348,6 +351,7 @@ esac
 "#;
 
 /// `uname` of an aarch64 Linux machine.
+#[cfg(target_os = "linux")]
 const AARCH64_UNAME: &str = "#!/bin/sh\ncase \"$1\" in -m) echo aarch64 ;; *) echo Linux ;; esac\n";
 
 /// `curl … | bash` on an aarch64 Linux machine, as alab.systems hands it out:
@@ -359,11 +363,8 @@ const AARCH64_UNAME: &str = "#!/bin/sh\ncase \"$1\" in -m) echo aarch64 ;; *) ec
 /// of aterm whose own tools/install.sh builds it — never an aterm.app, a clone
 /// offered before Trust (it cannot build), or a tarball; a real run then says
 /// nothing was installed.
+#[cfg(target_os = "linux")]
 #[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "the Linux lane's pre-flight needs Python's memfd_create and coreutils timeout"
-)]
 fn a_piped_linux_run_installs_from_the_public_channel_and_says_what_it_lacks() {
     let scratch = Scratch::new();
     let shim = scratch.mkdir("piped-linux");
@@ -383,7 +384,7 @@ fn a_piped_linux_run_installs_from_the_public_channel_and_says_what_it_lacks() {
                 q(s(&script))
             ))
             .env_clear();
-        let path = format!("{}:{SYSTEM_PATH}", s(&shim));
+        let path = format!("{}:{}", s(&shim), system_path());
         for (key, value) in hermetic(&home, &[("PATH", &path), ("STUB_LOG", s(&log))]) {
             cmd.env(key, value);
         }
@@ -566,7 +567,7 @@ fn a_store_overlapping_a_path_dir_is_refused_up_front() {
     let pathdir = scratch.mkdir("o/pathdir");
     symlink(&pathdir, &scratch.join("o/pathlink"));
     let log = scratch.join("o/calls.log");
-    let path = format!("{}:{SYSTEM_PATH}", s(&shim));
+    let path = format!("{}:{}", s(&shim), system_path());
     for store in [
         scratch.join("o/new/../pathlink").display().to_string(),
         home.home.join(".local").display().to_string(),

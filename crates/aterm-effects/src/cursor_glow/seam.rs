@@ -155,6 +155,18 @@ impl CursorGlow {
             return Some((cr, cc));
         }
         let ((r, c), seen) = self.last_visible?;
+        // A torn word-wrapped insert can move the input's source line up while
+        // its caret returns to the old physical row. Exact preserved prefix,
+        // suffix and chronological keys identify its logical source without
+        // lending a generic hidden relocation more reach.
+        if let Some(run) = cur.and_then(|to| self.exact_repaint_run((r, c), to, now, cfg)) {
+            if run.origin_row != r {
+                let lift = self.exact_hand_prefix((r, c), run.origin_row, now)?;
+                self.v2.lift_hand(lift);
+                self.lift_hand_row(r, run.origin_row);
+            }
+            return Some((run.origin_row, c));
+        }
         let fresh = now.saturating_duration_since(seen).as_millis() as u64
             <= crate::cursor_trail::HIDE_BRIDGE_MS;
         // A fresh typed classifier (peeked; `spawn` consumes) widens the
@@ -707,6 +719,291 @@ impl CursorGlow {
         verdict
     }
 
+    /// Exact content can identify a repainted input batch without using a
+    /// caret's jump as evidence. Competing input classes keep their own
+    /// admission; these proofs concern only the established typing hand.
+    fn exact_repaint_run(
+        &self,
+        from: (u16, u16),
+        to: (u16, u16),
+        now: Instant,
+        cfg: &GlowConfig,
+    ) -> Option<ExactTypedRun> {
+        if !self.v2.engaged()
+            || !matches!(cfg.style, GlowStyle::RainbowKitty)
+            || hint_fresh(self.nav_hint, now, Self::NAV_HINT_FRESH)
+            || hint_fresh(self.return_hint, now, Self::RETURN_HINT_FRESH)
+            || hint_fresh(self.newline_hint, now, Self::RETURN_HINT_FRESH)
+            || hint_fresh(self.quench_hint, now, Self::QUENCH_HINT_FRESH)
+            || hint_fresh(self.kill_hint, now, Self::KILL_HINT_FRESH)
+            || hint_fresh(self.reflow_hint, now, Self::REFLOW_HINT_FRESH)
+            || hint_fresh(self.user_gesture_hint, now, Self::USER_GESTURE_HINT_FRESH)
+            || self.insert.fresh(now).is_some()
+            || self.last_erase.is_some_and(|erase| erase.owed_at(now))
+        {
+            return None;
+        }
+        self.row_inserted_run(from, to, now)
+            .or_else(|| self.split_inserted_run(from, to, now))
+            .or_else(|| self.rewrapped_typed_run(from, to, now))
+    }
+
+    /// A repainted input line can move upward while its keys advance on that
+    /// line. Its whole shown prefix, exact queued insertion and unchanged old
+    /// tail identify the hand even when a long torn copy defeated the generic
+    /// arrival witness. The tail may wrap onto the following row.
+    fn row_inserted_run(
+        &self,
+        (pr, pc): (u16, u16),
+        (cr, cc): (u16, u16),
+        now: Instant,
+    ) -> Option<ExactTypedRun> {
+        let shown = self.row_shown_meta?;
+        let current = self.row_cur_meta?;
+        if self.last.is_some()
+            || !(pr == cr || cr.checked_add(1) == Some(pr))
+            || cc <= pc
+            || shown.row != pr
+            || shown.caret != pc
+            || shown.at >= now
+            || self.hand_row.is_none_or(|hand| hand.row != pr)
+            || current.row != cr
+            || current.caret != cc
+            || current.at != now
+            || self
+                .print_anchor
+                .is_none_or(|(_, _, seq)| seq == self.print_anchor_seen)
+        {
+            return None;
+        }
+        let pane_col0 = self.pane_columns.map_or(0, |(col0, _)| col0);
+        if pc <= pane_col0
+            || !(pane_col0..pc).all(|col| {
+                rk::witness::unit_at(&self.row_shown, col)
+                    == rk::witness::unit_at(&self.row_cur, col)
+            })
+            || !self.insert_tail_preserved(pc, cc)
+        {
+            return None;
+        }
+        let cells = usize::from(cc - pc);
+        if cells > EXACT_COALESCED_PREFIX_MAX {
+            return None;
+        }
+        let glyphs = self.row_cur.get(usize::from(pc)..usize::from(cc))?;
+        if glyphs.contains(&'\0') {
+            return None;
+        }
+        let slot = self.type_press_ring.exact_unpaid_run_with_tail_window(
+            now,
+            shown.at,
+            glyphs,
+            IN_FLIGHT_PATIENCE_S,
+        )?;
+        Some(ExactTypedRun {
+            origin_row: cr,
+            slot,
+            source: None,
+            landing_start: pc,
+            cells,
+            rewrap_start: None,
+        })
+    }
+
+    /// The unedited tail of the last shown input, after the current caret.
+    /// One word-wrap break can omit a Space between the two sampled rows.
+    fn insert_tail_preserved(&self, old_col: u16, new_col: u16) -> bool {
+        let Some(tail) = self
+            .row_shown
+            .get(usize::from(old_col)..self.ink_end_in_pane(&self.row_shown))
+            .filter(|tail| tail.len() >= 2)
+        else {
+            return false;
+        };
+        let end = usize::from(new_col).checked_add(tail.len());
+        if end.and_then(|end| self.row_cur.get(usize::from(new_col)..end)) == Some(tail) {
+            return true;
+        }
+        if !self
+            .row_cur_meta
+            .is_some_and(|m| m.below == NbrProbe::Probed)
+        {
+            return false;
+        }
+        let Some(first) = self
+            .row_cur
+            .get(usize::from(new_col)..self.ink_end_in_pane(&self.row_cur))
+            .filter(|first| !first.is_empty() && first.len() < tail.len())
+        else {
+            return false;
+        };
+        if !tail.starts_with(first) {
+            return false;
+        }
+        let pane_col0 = self.pane_columns.map_or(0, |(col0, _)| col0);
+        let end = self.ink_end_in_pane(&self.row_below_cur);
+        let Some(start) = (usize::from(pane_col0)..end)
+            .find(|&col| !matches!(self.row_below_cur[col], ' ' | '\0'))
+        else {
+            return false;
+        };
+        [false, true].into_iter().any(|dropped| {
+            let split = first.len() + usize::from(dropped);
+            (!dropped || tail.get(first.len()) == Some(&' '))
+                && tail.get(split..).is_some_and(|rest| {
+                    self.row_below_cur.get(start..start + rest.len()) == Some(rest)
+                })
+        })
+    }
+
+    /// Project the retained hand run only after an exact input insertion
+    /// proved its new row. The old glyphs must have left their sampled row;
+    /// an unchanged copy beside them grants no lift.
+    fn exact_hand_prefix(
+        &self,
+        (row, col): (u16, u16),
+        to: u16,
+        now: Instant,
+    ) -> Option<rk::witness::FollowRun> {
+        let current = self.row_cur_meta?;
+        let old_current =
+            if row.checked_add(1) == Some(current.row) && current.above == NbrProbe::Probed {
+                &self.row_above_cur
+            } else if current.row.checked_add(1) == Some(row) && current.below == NbrProbe::Probed {
+                &self.row_below_cur
+            } else if current.row == row {
+                &self.row_cur
+            } else {
+                return None;
+            };
+        let width = self.v2.ribbon().typed_suffix_len((row, col), now);
+        let lo = col.checked_sub(width).filter(|_| width > 0)?;
+        if !(lo..col).any(|c| {
+            rk::witness::unit_at(&self.row_shown, c) != rk::witness::unit_at(old_current, c)
+        }) {
+            return None;
+        }
+        let hi = col.checked_sub(1)?;
+        let last = self
+            .v2
+            .ribbon()
+            .cells()
+            .iter()
+            .filter(|c| c.row == row && c.col == hi && c.typing && !c.leaving())
+            .max_by_key(|c| c.born)?;
+        Some(rk::witness::FollowRun {
+            row,
+            cohort: last.cohort,
+            lo,
+            hi,
+            dr: i16::try_from(i32::from(to) - i32::from(row)).ok()?,
+        })
+    }
+
+    /// A mid-line insertion split across two rows. The prior visible probe,
+    /// or the retained shown probe through a hide, supplies the owned prefix
+    /// that still stands above the new caret. Its entire old suffix follows
+    /// the caret unchanged. Everything inserted between them must spell
+    /// consecutive unpaid one-cell keys. A word-wrap break may consume one
+    /// Space without painting it; a hard wrap consumes none.
+    fn split_inserted_run(
+        &self,
+        (pr, pc): (u16, u16),
+        (cr, cc): (u16, u16),
+        now: Instant,
+    ) -> Option<ExactTypedRun> {
+        let source_row = cr.checked_sub(1)?;
+        let (old_row, previous) = if self.last.is_some() {
+            (
+                &self.row_prev,
+                self.row_prev_meta
+                    .filter(|probe| probe.row == pr && probe.caret == pc)?,
+            )
+        } else {
+            (&self.row_shown, self.row_shown_meta?)
+        };
+        let current = self.row_cur_meta?;
+        if previous.caret != pc
+            || ![previous.row, source_row].contains(&pr)
+            || ![source_row, cr].contains(&previous.row)
+            || self.hand_row.is_none_or(|hand| hand.row != previous.row)
+            || previous.at >= now
+            || current.row != cr
+            || current.caret != cc
+            || current.at != now
+            || current.above != NbrProbe::Probed
+            || self
+                .print_anchor
+                .is_none_or(|(_, _, seq)| seq == self.print_anchor_seen)
+        {
+            return None;
+        }
+        let pane_col0 = self.pane_columns.map_or(0, |(col0, _)| col0);
+        if pc <= pane_col0
+            || !(pane_col0..pc).all(|col| {
+                rk::witness::unit_at(old_row, col) == rk::witness::unit_at(&self.row_above_cur, col)
+            })
+        {
+            return None;
+        }
+        let old_end = self.ink_end_in_pane(old_row);
+        let old_tail = old_row.get(usize::from(pc)..old_end)?;
+        if old_tail.len() < 2
+            || self
+                .row_cur
+                .get(usize::from(cc)..usize::from(cc).checked_add(old_tail.len())?)
+                != Some(old_tail)
+        {
+            return None;
+        }
+        let landing_start = (pane_col0..cc)
+            .find(|&col| !matches!(rk::witness::unit_at(&self.row_cur, col).ch, ' ' | '\0'))?;
+        let source_end = u16::try_from(self.ink_end_in_pane(&self.row_above_cur)).ok()?;
+        let source_len = usize::from(source_end.checked_sub(pc)?);
+        let landing_len = usize::from(cc - landing_start);
+        if source_len == 0 || source_len.checked_add(landing_len)? > EXACT_COALESCED_PREFIX_MAX {
+            return None;
+        }
+        let mut glyphs = [' '; EXACT_COALESCED_PREFIX_MAX];
+        glyphs[..source_len].copy_from_slice(
+            self.row_above_cur
+                .get(usize::from(pc)..usize::from(source_end))?,
+        );
+        for dropped_space in [false, true] {
+            let landing_at = source_len + usize::from(dropped_space);
+            let cells = landing_at.checked_add(landing_len)?;
+            if cells > glyphs.len() {
+                continue;
+            }
+            if dropped_space {
+                glyphs[source_len] = ' ';
+            }
+            glyphs[landing_at..cells].copy_from_slice(
+                self.row_cur
+                    .get(usize::from(landing_start)..usize::from(cc))?,
+            );
+            if glyphs[..cells].contains(&'\0') {
+                return None;
+            }
+            if let Some(slot) = self.type_press_ring.exact_unpaid_run_with_tail_window(
+                now,
+                previous.at,
+                &glyphs[..cells],
+                IN_FLIGHT_PATIENCE_S,
+            ) {
+                return Some(ExactTypedRun {
+                    origin_row: source_row,
+                    slot,
+                    source: Some((source_row, pc, source_end)),
+                    landing_start,
+                    cells,
+                    rewrap_start: Some((landing_start, 0)),
+                });
+            }
+        }
+        None
+    }
+
     /// The glyph at `(row, end - 1)` in this frame's row probe (the caret's row,
     /// [`Self::observe_row`], or a flanking row,
     /// [`Self::observe_neighbor_rows`]): the last cell of a print run ending at
@@ -959,14 +1256,7 @@ impl CursorGlow {
         else {
             return;
         };
-        let credits = self.type_press_ring;
-        self.type_press_ring.retire_before_slot(slot);
-        let admitted = self.spawn(pr, pc - 1, pr, pc, now, cfg, geom, SpawnLane::Visible);
-        if !admitted {
-            self.type_press_ring = credits;
-        } else {
-            self.remember_exact_first_cell(pr, pc - 1, now);
-        }
+        self.admit_exact_prefix(pr, pc, slot, now, cfg, geom);
     }
 
     /// A whole first composer batch can arrive after its first key aged past the
@@ -1023,6 +1313,104 @@ impl CursorGlow {
         )
     }
 
+    /// A rewrap carried the hand's old word left on its row or down one row
+    /// and printed queued keys after it. The old word must match the retained
+    /// source probe at the landing, disappear from the sampled source row,
+    /// and end exactly where the consecutive unpaid glyphs begin.
+    /// Returns only observed geometry and the existing ledger's exact match;
+    /// the classifier owns the single spend.
+    pub(super) fn rewrapped_typed_run(
+        &self,
+        (pr, pc): (u16, u16),
+        (cr, cc): (u16, u16),
+        now: Instant,
+    ) -> Option<ExactTypedRun> {
+        let same_row = pr == cr && cc < pc;
+        let down_one = pr.checked_add(1) == Some(cr);
+        let source = |probe: &RowProbe| probe.row == pr && probe.caret == pc && probe.at < now;
+        let (old_row, previous) = match self.row_prev_meta.filter(source) {
+            Some(previous) => (&self.row_prev, previous),
+            None => (&self.row_shown, self.row_shown_meta.filter(source)?),
+        };
+        let current = self.row_cur_meta?;
+        if !(same_row || down_one)
+            || current.row != cr
+            || current.caret != cc
+            || current.at != now
+            || (down_one && current.above != NbrProbe::Probed)
+            || self.hand_row.is_none_or(|hand| hand.row != pr)
+            || self
+                .print_anchor
+                .is_none_or(|(_, _, seq)| seq == self.print_anchor_seen)
+        {
+            return None;
+        }
+        let width = match self.v2.ribbon().moved_word_len((pr, pc), now) {
+            0 => self.v2.ribbon().typed_suffix_len((pr, pc), now),
+            width => width,
+        };
+        let source_start = pc.checked_sub(width)?;
+        let source_end = pc.checked_sub(1)?;
+        let source_now = if same_row {
+            &self.row_cur
+        } else {
+            &self.row_above_cur
+        };
+        if width == 0
+            || !self.v2.ribbon().cells().iter().any(|cell| {
+                cell.row == pr && cell.col == source_end && cell.typing && !cell.leaving()
+            })
+            || (source_start..pc).any(|col| {
+                source_now
+                    .get(usize::from(col))
+                    .is_some_and(|&glyph| glyph != ' ')
+            })
+        {
+            return None;
+        }
+        let pane_start = self.pane_columns.map_or(0, |(start, _)| start);
+        let start = (pane_start..cc).find(|&col| {
+            self.row_cur
+                .get(usize::from(col))
+                .is_some_and(|&glyph| !matches!(glyph, ' ' | '\0'))
+        })?;
+        let landing_start = start.checked_add(width)?;
+        let cells = usize::from(cc.checked_sub(landing_start)?);
+        if !(1..=EXACT_COALESCED_PREFIX_MAX).contains(&cells)
+            || old_row.get(usize::from(source_start)..usize::from(pc))?
+                != self
+                    .row_cur
+                    .get(usize::from(start)..usize::from(landing_start))?
+        {
+            return None;
+        }
+        let mut glyphs = [' '; EXACT_COALESCED_PREFIX_MAX];
+        for (i, col) in (landing_start..cc).enumerate() {
+            let glyph = self.row_cur.get(usize::from(col)).copied().unwrap_or(' ');
+            if glyph == '\0' {
+                return None;
+            }
+            glyphs[i] = glyph;
+        }
+        // This is an already-owned run whose source visibly disappeared,
+        // rather than first ownership inferred from a moving caret. Its exact
+        // queued keys remain payable for the ledger's existing patience.
+        let slot = self.type_press_ring.exact_unpaid_run_with_tail_window(
+            now,
+            previous.at,
+            &glyphs[..cells],
+            IN_FLIGHT_PATIENCE_S,
+        )?;
+        Some(ExactTypedRun {
+            origin_row: pr,
+            slot,
+            source: None,
+            landing_start,
+            cells,
+            rewrap_start: Some((start, width)),
+        })
+    }
+
     /// A TUI can redraw the caret back onto its old cell after a one-glyph echo
     /// (Codex, for the first glyph on a wrapped composer row, then printing its
     /// status row in the same bracket), so neither the caret nor the last print
@@ -1066,11 +1454,29 @@ impl CursorGlow {
         }) else {
             return false;
         };
+        self.admit_exact_prefix(row, col, press_slot, now, cfg, geom)
+    }
+
+    /// Both prefix witnesses prove the hand's row from content and exact
+    /// unpaid keys, rather than from a raw caret move. Restore that ownership
+    /// before the ordinary admission; a refusal retains the old hand and bank.
+    fn admit_exact_prefix(
+        &mut self,
+        row: u16,
+        col: u16,
+        press_slot: usize,
+        now: Instant,
+        cfg: &GlowConfig,
+        geom: Geom,
+    ) -> bool {
         let credits = self.type_press_ring;
+        let hand = self.hand_row;
         self.type_press_ring.retire_before_slot(press_slot);
+        self.hand_row = Some(HandRow::at(row));
         let admitted = self.spawn(row, col - 1, row, col, now, cfg, geom, SpawnLane::Visible);
         if !admitted {
             self.type_press_ring = credits;
+            self.hand_row = hand;
         } else {
             self.remember_exact_first_cell(row, col - 1, now);
         }
@@ -1196,6 +1602,16 @@ impl CursorGlow {
         let Some((ar, ac, seq)) = self.print_anchor else {
             return;
         };
+        if self.v2.engaged()
+            && !self.caret_hidden
+            && let Some(caret) = self.unowned_caret.as_mut()
+            && let Some((row, _)) = cur
+            && row == caret.row
+            && row != ar
+            && self.hand_row.is_none_or(|hand| hand.row != row)
+        {
+            caret.parked = true;
+        }
         if seq == self.print_anchor_seen {
             return;
         }
@@ -2189,7 +2605,27 @@ impl CursorGlow {
         // met by a one-shot key's +1, and a keyless program +1 after a
         // Backspace or moving kill must not light as typed. An arrow's hop
         // keeps its wake (`Licence::Nav`).
-        if mv.typing
+        if let Some(run) = mv.exact_typed_run
+            && licence == rk::Licence::Typed
+        {
+            let born = Self::sweep_born(mv.typed_at.unwrap_or(now), now);
+            // Ordinary insertions keep their adjacent run's revival witness;
+            // a split or rewrapped prefix changes that glyph geometry.
+            if run.source.is_some() || run.rewrap_start.is_some() {
+                self.recent_typed_run = None;
+            }
+            if let Some((row, col0, col1)) = run.source {
+                self.v2.on_event(rk::Event::Sweep { row, col0, col1 }, born);
+            }
+            self.hand_v2_typed_sweep(cr, run.landing_start, cc, born, now);
+            if let Some((start, width)) = run.rewrap_start {
+                let space = (run.landing_start..cc)
+                    .rev()
+                    .find(|&col| self.row_cur.get(usize::from(col)).copied().unwrap_or(' ') == ' ');
+                self.v2
+                    .prove_typed_rewrap((pr, pc), (cr, cc), start, width, space);
+            }
+        } else if mv.typing
             && mv.typed_hinted
             && cr == pr
             && cc > pc
@@ -2207,6 +2643,19 @@ impl CursorGlow {
                     },
                     mv.typed_at.unwrap_or(now),
                 );
+            }
+        } else if licence == rk::Licence::Typed
+            && cr == pr
+            && cc < pc
+            && (mv.deletion || mv.bs_pair)
+        {
+            if let Some(run) = self.recent_typed_run.as_mut() {
+                if run.row == cr && cc > run.col0 && cc <= run.end() {
+                    run.len = cc - run.col0;
+                    run.at = now;
+                } else {
+                    self.recent_typed_run = None;
+                }
             }
         } else if licence != rk::Licence::Typed || cr != pr || cc < pc {
             self.recent_typed_run = None;
@@ -2238,7 +2687,7 @@ impl CursorGlow {
         //
         // The landing folds at the focused pane's first column, as
         // `Ribbon::lay` wraps at `set_pane`'s edges, whereas `Ribbon::sweep`
-        // clamps to the grid and would lay into a neighbouring split. A landing
+        // relies on the grid and would lay into a neighbouring split. A landing
         // on the pane's first column is refused rather than folded: the credit
         // is spent and no light minted. A flushed park sweeps its landing only
         // if a glyph sat there when held (an Ink park beside the prompt must
@@ -2266,15 +2715,16 @@ impl CursorGlow {
                 born,
             );
             // A one-cell typed re-anchor can lay the first wrapped-row glyph
-            // without the typed-Sweep path; keep its licensed content for a
+            // without the typed-Sweep path. Keep its licensed content for a
             // later same-row continuation.
             if licence == rk::Licence::Typed
                 && mv.typing
                 && mv.typed_hinted
                 && cr == pr
                 && pc.checked_add(1) == Some(cc)
+                && let Some(at_probe) = self.row_cur_meta.filter(|m| m.row == cr).map(|m| m.at)
             {
-                self.remember_exact_first_cell(cr, cc - 1, now);
+                self.remember_exact_first_cell(cr, cc - 1, at_probe);
             }
         }
         // The fold's own cells (the stalled key whose echo wraps the row). A
@@ -2486,7 +2936,11 @@ impl CursorGlow {
         // in-flight pool stands behind is held for its return, in both
         // branches, before anything is consumed or scored; it is scored when
         // judged (flush or return).
-        let park = call == SpawnCall::Live
+        let exact_run = (call == SpawnCall::Live && lane == SpawnLane::Visible)
+            .then(|| self.exact_repaint_run((pr, pc), (cr, cc), now, cfg))
+            .flatten();
+        let park = exact_run.is_none()
+            && call == SpawnCall::Live
             && lane == SpawnLane::Visible
             && self.park_candidate(pr, pc, cr, cc, now, cfg, geom);
         if park && cr != pr {
@@ -2504,6 +2958,7 @@ impl CursorGlow {
         if !self.seam_licensed(now, cfg)
             && !erase_licensed
             && !self.unpaid_typed_echo(pr, pc, cr, cc, now, cfg, geom)
+            && exact_run.is_none()
         {
             if cr == pr && cc > pc {
                 // A refused same-row forward hop is remembered for one delivery
@@ -2539,15 +2994,35 @@ impl CursorGlow {
         // Read before the classifier spends it: `glyph_echo` needs to know
         // whether a press was unpaid on arrival.
         let unpaid_before = self.typed_credits_within(now) >= 1;
-        let mv = self.classify_move(pr, pc, cr, cc, now, cfg, geom, lane, call);
+        let exact_credits = exact_run.map(|_| self.type_press_ring);
+        let mv = self.classify_move(pr, pc, cr, cc, now, cfg, geom, lane, call, exact_run);
         // A typed re-anchor landing on a glyph no live press typed
         // ([`MoveCtx::landing_foreign`]: zsh's Ctrl-R walking the caret along
         // the match) is not the keys' echo. Declined here, before thermals,
         // abandonment, licence takes and v2's `Move` (whose replay would lay
         // the refused cell). The classifier already forgot the presses and
         // spent the stamp; the caller treats it as declined.
-        if mv.landing_foreign {
+        // A visible caret previously parked away from its output is not the
+        // input row's witness. A torn search redisplay can print the live
+        // key's exact glyph there before continuing on its real echo row.
+        // Refuse acquiring the hand here; elapsed time adds no provenance.
+        // Established typing and the anchored lane retain their own evidence.
+        let parked_redisplay = self.v2.engaged()
+            && lane == SpawnLane::Visible
+            && self
+                .unowned_caret
+                .is_some_and(|caret| caret.parked && caret.row == cr)
+            && self.hand_row.is_none_or(|hand| hand.row != cr)
+            && exact_run.is_none()
+            && (mv.typed_hinted || mv.in_flight_licence);
+        if mv.landing_foreign || parked_redisplay {
+            if let Some(credits) = exact_credits {
+                self.type_press_ring = credits;
+            }
             self.last_licensed_row = licensed_row_before;
+            if parked_redisplay {
+                self.forget_typed_credits(now);
+            }
             self.log_decline(now, (pr, pc), (cr, cc), Self::DECLINE_PROGRAM_ROW);
             return false;
         }
@@ -2785,7 +3260,7 @@ impl CursorGlow {
     /// earns.
     #[allow(
         clippy::too_many_arguments,
-        reason = "from/to cursor cells + clock + config + geometry + lane + the call; packing them into a struct would only obscure a single internal call site"
+        reason = "one internal call classifies the observed endpoints, frame context and optional exact content proof"
     )]
     pub(super) fn classify_move<'a>(
         &mut self,
@@ -2798,6 +3273,7 @@ impl CursorGlow {
         geom: Geom,
         lane: SpawnLane,
         call: SpawnCall,
+        exact_typed_run: Option<ExactTypedRun>,
     ) -> MoveCtx<'a> {
         // A flushed park whose source row the content witness carried away
         // (`HeldPark::content_followed`): the proof a short wrap retreat needs.
@@ -2853,7 +3329,10 @@ impl CursorGlow {
         // Gated to the echo shape (a same-row forward advance or a paid fold);
         // other shapes keep the stamp window. The licence's clock is the oldest
         // unpaid press, matching `take_fresh`'s order and the born-at-key rule.
-        if typed_at.is_none() && self.unpaid_typed_echo(pr, pc, cr, cc, now, cfg, geom) {
+        if let Some(run) = exact_typed_run {
+            typed_at = self.type_press_ring.slots[run.slot].map(|(at, _, _)| at);
+            in_flight_licence = fresh_stamp.is_none();
+        } else if typed_at.is_none() && self.unpaid_typed_echo(pr, pc, cr, cc, now, cfg, geom) {
             typed_at = self.type_press_ring.oldest_unpaid(now);
             in_flight_licence = typed_at.is_some();
         }
@@ -2950,7 +3429,7 @@ impl CursorGlow {
             && dr_abs <= 1
             && (raw_dist > 2.0 || (content_followed && cr == pr && pc > cc && pc - cc <= 2))
             && (!self.ctx_alt || blink_fresh);
-        let wrap = shape_wrap || re_anchor;
+        let wrap = shape_wrap || re_anchor || exact_typed_run.is_some();
         // The typed key's move under Rainbow Kitty: a typed-paired move no
         // Backspace or nav one-shot owns; and the typed forward hop, its
         // same-row forward shape (on the alt screen, only under the blink
@@ -3031,6 +3510,7 @@ impl CursorGlow {
         // (`key_pushed_text_down`), whose landing is the key's even after the
         // stamp expired.
         let re_anchor_landing = typed_key
+            && exact_typed_run.is_none()
             && (!in_flight_licence || self.carried_key_move == Some(((pr, pc), (cr, cc))))
             && re_anchor
             && !lays_typed_cells
@@ -3060,12 +3540,12 @@ impl CursorGlow {
         // The typed fold never reaches the gate; a key that pushed text down
         // ([`Self::key_pushed_text_down`]) and a reflowed soft-wrapped word
         // ([`Self::carried_word_left`]) land right of the key's glyph and pass.
-        let soft_wrap = if lays_typed_cells || re_anchor_landing {
+        let soft_wrap = if exact_typed_run.is_none() && (lays_typed_cells || re_anchor_landing) {
             self.soft_wrapped_caret(pr, pc, cr, cc, pane_col0, now)
         } else {
             None
         };
-        let lift = if typed_key && cr == pr && cc < pc {
+        let lift = if exact_typed_run.is_none() && typed_key && cr == pr && cc < pc {
             self.lifted_word(pr, pc, cr, cc)
         } else {
             None
@@ -3102,7 +3582,10 @@ impl CursorGlow {
         // (the seam declines it before v2 sees a `Move`).
         let soft_wrap = soft_wrap.filter(|_| !landing_foreign);
         let mut fold_laid = 0;
-        if lays_typed_cells || re_anchor_lays_landing {
+        if let Some(run) = exact_typed_run {
+            self.type_press_ring.retire_before_slot(run.slot);
+            let _ = self.type_press_ring.spend_counting(now, run.cells);
+        } else if lays_typed_cells || re_anchor_lays_landing {
             // A soft-wrapped caret's fold or re-anchor lays exactly one cell,
             // the key's glyph at the origin ([`Self::soft_wrapped_caret`]);
             // spending the fold's full count would spend presses still to come.
@@ -3225,6 +3708,7 @@ impl CursorGlow {
             credit_starved,
             typed_over_cap,
             re_anchor_lays_landing,
+            exact_typed_run,
             landing_foreign,
             soft_wrap,
             lift,

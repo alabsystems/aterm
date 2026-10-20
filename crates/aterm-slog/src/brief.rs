@@ -16,14 +16,21 @@
 //! ```
 //!
 //! Tokens are estimated as bytes ÷ 4 ([`tokens`]). When the whole does not
-//! fit, it sheds in this order: (1) step lines of older turns; (2) runs of
-//! ordinary turns, collapsed into ranges; (3) marks other than needs and
-//! claims, then the oldest turn lines, newest kept; (4) finally, the session
-//! down to one line. Every line after the header starts with a node id (a
+//! fit, it sheds in this order: first what a Claude Code transcript added
+//! (phase 3B, ruling S15) — the closed transcript steps' lines, and the open
+//! turn's open transcript steps down to the newest and a count (`· +3
+//! open`), then every transcript record (the brief as it read without
+//! them: no transcript step, no transcript amend's numbers, a turn's step
+//! count less its transcript steps); then (1) step lines of older turns;
+//! (2) runs of ordinary turns, collapsed into ranges; (3) marks other than
+//! needs and claims, then the oldest turn lines, newest kept; (4) finally,
+//! the session down to one line. Every line after the header starts with a node id (a
 //! mark's id is its seq) until the trailer: `need` lines for the needs the
-//! session line does not name, `mail`, then one `claim` line per live claim
-//! (a verdict, a label, a need raised by a mark). `more=` names what was
-//! left out. A suffix gives the source's reliability: `!` exact, `+`
+//! session line does not name, the counts of `mail` and of `act` and `story`
+//! marks (`acts 2 · stories 1`, phase 3B; both shed before anything else),
+//! then one
+//! `claim` line per live claim (a verdict, a label, a need raised by a
+//! mark). `more=` names what was left out. A suffix gives the source's reliability: `!` exact, `+`
 //! strong, `~` heuristic, `?` claim; a phase nothing has observed yet has
 //! none (`- session · -`).
 //!
@@ -93,6 +100,34 @@ fn reliability(src: Src, conf: Conf) -> String {
 struct StepInfo<'a> {
     open: Option<&'a Rec>,
     close: Option<&'a Rec>,
+    amends: Vec<&'a Rec>,
+}
+
+impl StepInfo<'_> {
+    fn out(&self) -> Option<&'static str> {
+        best(self.close, &self.amends, Key::Out).and_then(Rec::out)
+    }
+
+    /// A step the transcript opened (phase 3B: a tool, a subagent, a
+    /// compaction).
+    fn transcript(&self) -> bool {
+        self.open
+            .or(self.close)
+            .is_some_and(|r| r.src == Src::Transcript)
+    }
+}
+
+/// How much of what a transcript added a rendering keeps (ruling S15): it
+/// is shed before any line the brief held without it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TxShed {
+    /// All of it.
+    Full,
+    /// No closed transcript step's line; the open turn's open transcript
+    /// steps as the newest and a count.
+    Collapsed,
+    /// None of it: rendered from [`scan_stripped`]'s window.
+    Stripped,
 }
 
 #[derive(Default)]
@@ -101,11 +136,39 @@ struct TurnInfo<'a> {
     close: Option<&'a Rec>,
     amends: Vec<&'a Rec>,
     steps: BTreeMap<u32, StepInfo<'a>>,
+    /// The transcript steps [`scan_stripped`] left out of `steps`: what its
+    /// close's `steps=` rollup counts that this rendering does not show.
+    tx_steps: u64,
+    /// Of those, the tools by class: what its close's `tools=` rollup
+    /// counts that this rendering does not show.
+    tx_tools: BTreeMap<&'static str, u64>,
+}
+
+/// The record a node's `key` is read from (phase 3B, A5): its close, or an
+/// amend that refines it — the fold's own rules, so `brief` and the fold
+/// never disagree: an outcome only by an exact amend
+/// ([`crate::fold::amend_refines_out`]), any other key under the confidence
+/// law. `None` for a node with neither (an open one).
+fn best<'a>(close: Option<&'a Rec>, amends: &[&'a Rec], key: Key) -> Option<&'a Rec> {
+    let mut held = close.filter(|c| c.f.get(key).is_some());
+    for a in amends.iter().copied().filter(|a| a.f.get(key).is_some()) {
+        let wins = match held {
+            None => close.is_some(),
+            Some(h) if key == Key::Out => {
+                crate::fold::amend_refines_out(h.conf, h.seq, a.conf, a.seq)
+            }
+            Some(h) => crate::fold::confidence_law(h.conf, h.seq, a.conf, a.seq),
+        };
+        if wins {
+            held = Some(a);
+        }
+    }
+    held
 }
 
 impl TurnInfo<'_> {
     fn out(&self) -> Option<&'static str> {
-        self.close.and_then(Rec::out)
+        best(self.close, &self.amends, Key::Out).and_then(Rec::out)
     }
 
     /// A turn a range may absorb: closed `done`, `interrupted`, `asked` or
@@ -118,20 +181,52 @@ impl TurnInfo<'_> {
     }
 
     fn steps_total(&self) -> u64 {
-        self.close
+        best(self.close, &self.amends, Key::Steps)
             .and_then(|c| c.f.get_u(Key::Steps))
+            .map(|n| n.saturating_sub(self.tx_steps))
             .unwrap_or(self.steps.len() as u64)
+    }
+
+    /// Its close's `tools=` rollup (`shell:9,edit:8`) as the line shows it
+    /// (`shell 9 edit 8`), less the transcript tools [`scan_stripped`] left
+    /// out; `None` when none is left.
+    fn tools(&self) -> Option<String> {
+        let tools =
+            best(self.close, &self.amends, Key::Tools).and_then(|r| r.f.get_str(Key::Tools))?;
+        let mut by: Vec<(u64, &str)> = tools
+            .split(',')
+            .filter_map(|item| {
+                let (w, n) = item.split_once(':')?;
+                let n = n.parse::<u64>().ok()?;
+                let less = self.tx_tools.get(w).copied().unwrap_or(0);
+                Some((n.saturating_sub(less), w))
+            })
+            .filter(|(n, _)| *n > 0)
+            .collect();
+        by.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+        let words: Vec<String> = by.iter().map(|(n, w)| format!("{w} {n}")).collect();
+        (!words.is_empty()).then(|| words.join(" "))
     }
 }
 
-/// The window, sorted into turns, their steps and the marks worth a line.
+/// The window, sorted into turns, their steps and the marks worth a line;
+/// and the `act` and `story` marks, counted (ruling S15).
 struct Scan<'a> {
     turns: BTreeMap<u32, TurnInfo<'a>>,
     marks: Vec<&'a Rec>,
+    acts: usize,
+    stories: usize,
 }
 
 /// Marks a brief never gives a line: the raw signals the tree is built from,
-/// the content tier, and needs and claims (shown elsewhere).
+/// the content tier, and needs and claims (shown elsewhere). A source's state
+/// and a post's landing (phase 3B) are bookkeeping: the turns they explain
+/// are the lines. PHASE 3B's signals (ruling S15, addendum A23) give none
+/// either, so a brief reads with them as it read without: the engine's,
+/// the status classifier's, the screen's context and goal, the fabric's
+/// (mail is the `mail in · out` line), the usage tap's; `act` and `story`
+/// are one count line ([`Scan::acts`]), the first line shed. A worker's
+/// `task` mark (phase 5, 5C-1) is bookkeeping too: `task` is its reader.
 fn mark_worth_a_line(k: Kind) -> bool {
     !matches!(
         k,
@@ -144,6 +239,25 @@ fn mark_worth_a_line(k: Kind) -> bool {
             | Kind::Label
             | Kind::Cwd
             | Kind::Meta
+            | Kind::Source
+            | Kind::MailLanded
+            | Kind::Integration
+            | Kind::Ctx
+            | Kind::Goal
+            | Kind::Notify
+            | Kind::Progress
+            | Kind::Bell
+            | Kind::Render
+            | Kind::Modes
+            | Kind::InDoubt
+            | Kind::Usage
+            | Kind::Config
+            | Kind::MailSeen
+            | Kind::Mail
+            | Kind::Hold
+            | Kind::Act
+            | Kind::Story
+            | Kind::Task
     )
 }
 
@@ -178,10 +292,58 @@ fn open_path_seeds(st: &SessionState, window: &[&Rec]) -> Vec<Rec> {
         .collect()
 }
 
+/// [`scan`] of the window as it would be without the transcript's records
+/// (ruling S15): no transcript step and no transcript amend of a step or a
+/// turn, each turn's transcript steps counted so its rollup reads without
+/// them; and whether the window held any.
+fn scan_stripped<'a>(window: &[&'a Rec], seeds: &'a [Rec]) -> (Scan<'a>, bool) {
+    let mut tx_steps: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut tx_tools: BTreeMap<u32, BTreeMap<&'static str, u64>> = BTreeMap::new();
+    let mut tx_nodes: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut kept: Vec<&'a Rec> = Vec::with_capacity(window.len());
+    let mut any = false;
+    for r in window.iter().copied() {
+        let tx = r.src == Src::Transcript;
+        let drop = match (r.op, r.node.lvl) {
+            (Op::Open, Lvl::Step) if tx => {
+                tx_nodes.insert(r.node.n);
+                if let Some(p) = r.par.filter(|p| p.lvl == Lvl::Turn)
+                    && r.f.get(Key::Cont).is_none()
+                {
+                    *tx_steps.entry(p.n).or_default() += 1;
+                    if r.k == Kind::Tool
+                        && let Some(cls) = r.f.get_word(Key::Cls)
+                    {
+                        *tx_tools.entry(p.n).or_default().entry(cls).or_default() += 1;
+                    }
+                }
+                true
+            }
+            // A transcript's close of a screen step stays: without it the
+            // step would read open, which it no longer is.
+            (Op::Close, Lvl::Step) => tx_nodes.contains(&r.node.n),
+            (Op::Amend, Lvl::Step) => tx || tx_nodes.contains(&r.node.n),
+            (Op::Amend, Lvl::Turn) => tx,
+            _ => false,
+        };
+        any |= tx && drop;
+        if !drop {
+            kept.push(r);
+        }
+    }
+    let mut s = scan(&kept, seeds);
+    for (n, t) in &mut s.turns {
+        t.tx_steps = tx_steps.get(n).copied().unwrap_or(0);
+        t.tx_tools = tx_tools.remove(n).unwrap_or_default();
+    }
+    (s, any)
+}
+
 fn scan<'a>(window: &[&'a Rec], seeds: &'a [Rec]) -> Scan<'a> {
     let mut turns: BTreeMap<u32, TurnInfo<'a>> = BTreeMap::new();
     let mut step_turn: BTreeMap<u32, u32> = BTreeMap::new();
     let mut marks = Vec::new();
+    let (mut acts, mut stories) = (0, 0);
     for r in window.iter().copied().chain(seeds) {
         let turn_of = |node: Node, step_turn: &BTreeMap<u32, u32>| match node.lvl {
             Lvl::Turn => Some(node.n),
@@ -215,23 +377,50 @@ fn scan<'a>(window: &[&'a Rec], seeds: &'a [Rec]) -> Scan<'a> {
                         .close = Some(r);
                 }
             }
+            // A step's refinement (a transcript's `out=` or `confirmed=1`,
+            // phase 3B) is read with its close.
+            (Op::Amend, Lvl::Step) => {
+                if let Some(t) = step_turn.get(&r.node.n).copied() {
+                    turns
+                        .entry(t)
+                        .or_default()
+                        .steps
+                        .entry(r.node.n)
+                        .or_default()
+                        .amends
+                        .push(r);
+                }
+            }
             (Op::Mark, _) if mark_worth_a_line(r.k) => marks.push(r),
+            (Op::Mark, _) if r.k == Kind::Act => acts += 1,
+            (Op::Mark, _) if r.k == Kind::Story => stories += 1,
             _ => {}
         }
     }
     turns.retain(|_, t| t.open.is_some() || t.close.is_some());
-    Scan { turns, marks }
+    Scan {
+        turns,
+        marks,
+        acts,
+        stories,
+    }
 }
 
 /// The needs the brief names as observed: every one but a claim (a need
 /// raised by a mark), most urgent first.
 fn observed_needs(st: &SessionState) -> impl Iterator<Item = &Need> {
-    st.needs.iter().flatten().filter(|n| n.conf != Conf::Claim)
+    st.needs
+        .iter()
+        .flatten()
+        .filter(|n| n.src != Src::Mark && n.conf != Conf::Claim)
 }
 
 /// The needs raised by a mark: claims, each on a `claim need` line.
 fn claimed_needs(st: &SessionState) -> impl Iterator<Item = &Need> {
-    st.needs.iter().flatten().filter(|n| n.conf == Conf::Claim)
+    st.needs
+        .iter()
+        .flatten()
+        .filter(|n| n.src == Src::Mark || n.conf == Conf::Claim)
 }
 
 /// The session line: the most urgent observed need, else the phase.
@@ -290,7 +479,7 @@ fn step_line(n: u32, s: &StepInfo<'_>, now: u64) -> Option<String> {
             let _ = write!(
                 line,
                 " {} {}",
-                c.out().unwrap_or("unknown"),
+                s.out().unwrap_or("unknown"),
                 dur(c.f.get_u(Key::DurMs).unwrap_or(0))
             );
         }
@@ -302,7 +491,7 @@ fn step_line(n: u32, s: &StepInfo<'_>, now: u64) -> Option<String> {
     Some(line)
 }
 
-fn turn_line(n: u32, t: &TurnInfo<'_>, now: u64) -> String {
+fn turn_line(n: u32, t: &TurnInfo<'_>, shed: TxShed, now: u64) -> String {
     let mut line = format!("t{n}");
     let by = t.open.map_or(Actor::Nobody, |o| o.by);
     match t.close {
@@ -314,7 +503,7 @@ fn turn_line(n: u32, t: &TurnInfo<'_>, now: u64) -> String {
             let _ = write!(
                 line,
                 " {} {}",
-                c.out().unwrap_or("unknown"),
+                t.out().unwrap_or("unknown"),
                 dur(c.f.get_u(Key::DurMs).unwrap_or(0))
             );
         }
@@ -336,15 +525,30 @@ fn turn_line(n: u32, t: &TurnInfo<'_>, now: u64) -> String {
         }
     }
     if t.close.is_none() {
+        let open_step = |line: &mut String, sn: u32, o: &Rec| {
+            let _ = write!(line, " · p{sn} {}", o.k.word());
+            if let Some(w) = step_word(o) {
+                let _ = write!(line, " {w}");
+            }
+            let _ = write!(line, " open {}", dur(now.saturating_sub(o.t)));
+        };
+        // Collapsed, the open transcript steps are the newest and a count.
+        let mut tx_open: Vec<(u32, &Rec)> = Vec::new();
         for (sn, s) in &t.steps {
             if s.close.is_none()
                 && let Some(o) = s.open
             {
-                let _ = write!(line, " · p{sn} {}", o.k.word());
-                if let Some(w) = step_word(o) {
-                    let _ = write!(line, " {w}");
+                if shed == TxShed::Collapsed && s.transcript() {
+                    tx_open.push((*sn, o));
+                } else {
+                    open_step(&mut line, *sn, o);
                 }
-                let _ = write!(line, " open {}", dur(now.saturating_sub(o.t)));
+            }
+        }
+        if let Some((sn, o)) = tx_open.last() {
+            open_step(&mut line, *sn, o);
+            if tx_open.len() > 1 {
+                let _ = write!(line, " · +{} open", tx_open.len() - 1);
             }
         }
     } else if let Some(c) = t.close {
@@ -355,8 +559,8 @@ fn turn_line(n: u32, t: &TurnInfo<'_>, now: u64) -> String {
                 " · {steps} {}",
                 if steps == 1 { "step" } else { "steps" }
             );
-            if let Some(tools) = c.f.get_str(Key::Tools) {
-                let _ = write!(line, " {}", tools.replace([':', ','], " "));
+            if let Some(tools) = t.tools() {
+                let _ = write!(line, " {tools}");
             }
         }
         for (key, word) in [
@@ -537,13 +741,15 @@ fn gap_line(g: &Gap) -> String {
 
 /// Render at shedding `level`, dropping the `drop` oldest turn units at
 /// level 3 (the newest is always kept): the body lines and the `more=`
-/// items.
+/// items. `counts`: with the count lines — `mail in · out` and `acts ·
+/// stories` (S15, A23) — which a rendering that does not fit sheds before
+/// anything else.
 fn render(
     scan: &Scan<'_>,
     gap: Option<&Gap>,
     st: &SessionState,
-    level: u8,
-    drop: usize,
+    (level, drop, shed): (u8, usize, TxShed),
+    counts: bool,
     now: u64,
 ) -> Rendered {
     let mut lines = vec![session_line(st, now)];
@@ -576,12 +782,15 @@ fn render(
                     continue;
                 }
             }
-            let mut unit = vec![turn_line(n, t, now)];
+            let mut unit = vec![turn_line(n, t, shed, now)];
             let detail = level == 0 || Some(n) == newest;
             if detail {
                 for (sn, s) in &t.steps {
-                    // An open turn's open steps are already on its line.
-                    if t.close.is_none() && s.close.is_none() {
+                    // An open turn's open steps are already on its line;
+                    // collapsed, a closed transcript step has none.
+                    if (t.close.is_none() && s.close.is_none())
+                        || (shed == TxShed::Collapsed && s.transcript())
+                    {
                         continue;
                     }
                     if let Some(l) = step_line(*sn, s, now) {
@@ -619,8 +828,11 @@ fn render(
         }
         lines.extend(needs);
         let t = &st.totals;
-        if t.mail_in > 0 || t.mail_out > 0 {
+        if counts && (t.mail_in > 0 || t.mail_out > 0) {
             lines.push(format!("mail in {} · out {}", t.mail_in, t.mail_out));
+        }
+        if counts && scan.acts + scan.stories > 0 {
+            lines.push(format!("acts {} · stories {}", scan.acts, scan.stories));
         }
         lines.extend(claims);
     } else {
@@ -724,12 +936,38 @@ pub fn brief<'a>(
 ) -> Brief {
     let window: Vec<&Rec> = window.into_iter().collect();
     let seeds = open_path_seeds(st, &window);
-    let scan = scan(&window, &seeds);
-    let at = |level: u8, drop: usize| {
-        let r = render(&scan, gap.as_ref(), st, level, drop, now_wall);
+    let scan_full = scan(&window, &seeds);
+    let (stripped, transcript) = scan_stripped(&window, &seeds);
+    let at_with = |level: u8, drop: usize, counts: bool, shed: TxShed| {
+        let sc = if shed == TxShed::Stripped {
+            &stripped
+        } else {
+            &scan_full
+        };
+        let r = render(sc, gap.as_ref(), st, (level, drop, shed), counts, now_wall);
         let (text, used) = assemble(sid, st, budget, &r.lines);
         (Brief { text, used, level }, r.units)
     };
+    // Past the count lines and the transcript's records, the levels shed
+    // what the brief held without them.
+    let at = |level: u8, drop: usize| at_with(level, drop, false, TxShed::Stripped);
+    // The count lines first, shed before any other (S15): the mail a 3B
+    // producer counts and the acts and stories.
+    if scan_full.acts + scan_full.stories > 0 || st.totals.mail_in > 0 || st.totals.mail_out > 0 {
+        let (b, _) = at_with(0, 0, true, TxShed::Full);
+        if b.used <= budget {
+            return b;
+        }
+    }
+    // Then what the transcript added (S15): collapsed, then none of it.
+    if transcript {
+        for shed in [TxShed::Full, TxShed::Collapsed] {
+            let (b, _) = at_with(0, 0, false, shed);
+            if b.used <= budget {
+                return b;
+            }
+        }
+    }
     let mut units = 0;
     for level in 0..=3u8 {
         let (b, n) = at(level, 0);

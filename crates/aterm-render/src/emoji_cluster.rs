@@ -61,9 +61,16 @@ pub(crate) const MAX_RUN_GLYPHS: usize = 8;
 /// run of fewer than two colour glyphs (the one-glyph case is
 /// [`ClusterShape::Glyph`], and a lone base keeps its ordinary fallback) or more
 /// than [`MAX_RUN_GLYPHS`].
+///
+/// A colour glyph that advances nothing joins only when `marks`: a face whose
+/// run is painted in one canvas at the shaper's positions (COLR, see
+/// `colr::rasterize_colr_run`) may stand a member by its outline alone, as
+/// Segoe UI Emoji does the children of a ZWJ family; [`composite`] lays each
+/// glyph in a slot as wide as its advance, so for it such a glyph is refused.
 pub(crate) fn layout_run(
     glyphs: impl IntoIterator<Item = (u32, i32, i32, i32)>,
     drawable: impl Fn(u16) -> bool,
+    marks: bool,
 ) -> Option<ClusterRun> {
     let mut run = Vec::new();
     let mut pen = 0i32;
@@ -71,7 +78,7 @@ pub(crate) fn layout_run(
     for (id, advance, x_offset, y_offset) in glyphs {
         let gid = u16::try_from(id).ok()?;
         if gid != 0 && drawable(gid) {
-            if advance <= 0 || run.len() == MAX_RUN_GLYPHS {
+            if advance < 0 || (advance == 0 && !marks) || run.len() == MAX_RUN_GLYPHS {
                 return None;
             }
             run.push(RunGlyph {
@@ -258,7 +265,7 @@ mod tests {
 
     #[test]
     fn a_run_keeps_its_colour_glyphs_and_skips_hidden_ones() {
-        let run = layout_run(joined(3), colour).expect("three colour glyphs");
+        let run = layout_run(joined(3), colour, false).expect("three colour glyphs");
         let at: Vec<(u16, i32)> = run.glyphs.iter().map(|g| (g.gid, g.x)).collect();
         assert_eq!(at, [(100, 0), (101, 10), (102, 20)]);
         assert_eq!((run.width, run.em), (30, 10));
@@ -267,24 +274,35 @@ mod tests {
     #[test]
     fn a_run_is_refused_unless_it_is_all_colour_and_two_to_eight_glyphs() {
         // One colour glyph: the bare base's own fallback draws it.
-        assert!(layout_run(joined(1), colour).is_none());
-        assert!(layout_run(joined(MAX_RUN_GLYPHS as u32), colour).is_some());
-        assert!(layout_run(joined(MAX_RUN_GLYPHS as u32 + 1), colour).is_none());
+        assert!(layout_run(joined(1), colour, false).is_none());
+        assert!(layout_run(joined(MAX_RUN_GLYPHS as u32), colour, false).is_some());
+        assert!(layout_run(joined(MAX_RUN_GLYPHS as u32 + 1), colour, false).is_none());
         // A visible glyph the colour face cannot draw: text, not an emoji.
         let mut text = joined(2);
         text.push((7, 10, 0, 0));
-        assert!(layout_run(text, colour).is_none());
+        assert!(layout_run(text, colour, false).is_none());
         // `.notdef` is never colour, even with a drawable-looking predicate.
-        assert!(layout_run([(0, 10, 0, 0), (100, 10, 0, 0)], |_| true).is_none());
-        // A colour glyph that advances nothing cannot be placed.
-        assert!(layout_run([(100, 10, 0, 0), (101, 0, 0, 0)], colour).is_none());
+        assert!(layout_run([(0, 10, 0, 0), (100, 10, 0, 0)], |_| true, false).is_none());
+        // A colour glyph that advances nothing cannot be placed in a slot...
+        assert!(layout_run([(100, 10, 0, 0), (101, 0, 0, 0)], colour, false).is_none());
+        // ...but stands at its pen where the run is painted in one canvas
+        // (Segoe UI Emoji's family children); a backwards advance never does.
+        let marked = layout_run([(100, 10, 0, 0), (101, 0, 0, 0)], colour, true)
+            .expect("a member placed by its pen");
+        let at: Vec<(u16, i32, i32)> = marked
+            .glyphs
+            .iter()
+            .map(|g| (g.gid, g.x, g.advance))
+            .collect();
+        assert_eq!(at, [(100, 0, 10), (101, 10, 0)]);
+        assert!(layout_run([(100, 10, 0, 0), (101, -1, 0, 0)], colour, true).is_none());
     }
 
     /// Two opaque squares fitted into a 2:1 box land side by side, each in its
     /// half, and the composite never exceeds the box.
     #[test]
     fn a_composite_places_each_glyph_in_its_slot_within_the_box() {
-        let run = layout_run(joined(2), colour).unwrap();
+        let run = layout_run(joined(2), colour, false).unwrap();
         let solid = |gid: u16, w: usize, h: usize| {
             let v = if gid == 100 { 10 } else { 200 };
             Some(([v, v, v, 255].repeat(w * h), w, h))
@@ -304,7 +322,7 @@ mod tests {
         );
 
         // Three members in the same box shrink to fit its width, aspect kept.
-        let run = layout_run(joined(3), colour).unwrap();
+        let run = layout_run(joined(3), colour, false).unwrap();
         let (_, w, h) = composite(&run, 20, 10, solid).unwrap();
         assert_eq!((w, h), (20, 7));
 
@@ -337,7 +355,7 @@ mod tests {
     #[test]
     fn runs_live_exactly_as_long_as_the_memo_names_them() {
         let mut shapes = ClusterShapes::default();
-        let run = || layout_run(joined(2), colour).unwrap();
+        let run = || layout_run(joined(2), colour, false).unwrap();
         let a = shapes.add_run(run()).unwrap();
         shapes.insert("a", Some(ClusterShape::Run(a)));
         shapes.insert("g", Some(ClusterShape::Glyph(5)));

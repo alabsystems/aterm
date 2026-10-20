@@ -64,6 +64,7 @@ fn realistic_layout() -> RestoreManifest {
                         theme: None,
                         agent: None,
                         supervised: None,
+                        lost: None,
                         held: false,
                         holds: Vec::new(),
                     },
@@ -88,6 +89,7 @@ fn realistic_layout() -> RestoreManifest {
                         theme: None,
                         agent: None,
                         supervised: None,
+                        lost: None,
                         held: false,
                         holds: Vec::new(),
                     },
@@ -362,6 +364,99 @@ fn colour_and_shell_state_cross_the_meta_wire() {
         1,
         "the running command completes"
     );
+}
+
+/// What a shell's prompt left pending about its cwd crosses the REAL wire
+/// (docs/DESIGN-cwd-reports-2026-10-19.md): that the shell signs its own report, the cwd a
+/// key-bound program's report replaced (restored once the successor's host
+/// says the program left the foreground), and a report held at the prompt of
+/// a shell that does not sign (applied at the successor's next `A`). Each is
+/// in the meta JSON, the strict child parser reads it back, and the adopted
+/// engine acts on it.
+#[test]
+fn the_prompts_pending_cwd_crosses_the_meta_wire() {
+    use aterm_core::terminal::{ShellIntegrationNonce, Terminal};
+    const KEY: [u8; 32] = [0x5D; 32];
+    let hex = ShellIntegrationNonce(KEY).to_hex();
+    let mark = |m: &str| format!("\x1b]133;{m};id={hex}\x07").into_bytes();
+    let wire = |t: &Terminal| {
+        let cp = t.checkpoint_carry(64).expect("parser is Ground");
+        let json = aterm_json::to_string(&CheckpointMeta::from_checkpoint(&cp)).expect("meta");
+        let carry = ScreenCarry {
+            schema: ScreenCarry::SCHEMA,
+            meta: json.clone(),
+            grid_file: "unused".to_string(),
+            alt_grid_file: None,
+            repaint: false,
+        };
+        let meta = parse_checkpoint_meta(&carry).expect("child parses meta");
+        let rebuilt = meta.into_checkpoint(cp.grid.clone(), None);
+        assert_eq!(rebuilt.shell, cp.shell, "the shell state crosses intact");
+        let mut adopted = Terminal::new(24, 80);
+        adopted.restore_checkpoint(&rebuilt);
+        adopted.authorize_shell_integration(KEY);
+        (json, adopted)
+    };
+    let prompt = |t: &mut Terminal, report: &[u8]| {
+        t.process(report);
+        t.process(&mark("A"));
+        t.process(b"$ ");
+        t.process(&mark("B"));
+    };
+    let gated = || {
+        let mut t = Terminal::new(24, 80);
+        t.authorize_shell_integration(KEY);
+        t.set_require_shell_integration_nonce(true);
+        t
+    };
+
+    // A signing shell, a key-bound program's report landed at its prompt.
+    let signed_report = format!(
+        "\x1b]633;P;AtermCwd=file://host/home/me;id={hex}\x07\x1b]7;file://host/home/me\x07"
+    )
+    .into_bytes();
+    let mut t = gated();
+    prompt(&mut t, &signed_report);
+    t.process(b"true\r\n");
+    t.process(&mark("C"));
+    t.process(&mark("D;0"));
+    prompt(&mut t, &signed_report);
+    t.set_foreground_job(true);
+    t.process(b"\x1b]7;file://remote/srv/app\x07");
+    assert_eq!(t.current_working_directory(), Some("/srv/app"));
+    let (json, mut adopted) = wire(&t);
+    assert!(json.contains("\"signs_cwd\":true"), "{json}");
+    assert!(
+        json.contains("\"cwd_before_job\":{\"path\":\"/home/me\",\"host\":\"host\"}"),
+        "{json}"
+    );
+    assert_eq!(adopted.current_working_directory(), Some("/srv/app"));
+    adopted.set_foreground_job(false);
+    assert_eq!(adopted.current_working_directory(), Some("/home/me"));
+    adopted.process(b"\x1b]7;file://host/elsewhere\x07");
+    assert_eq!(
+        adopted.current_working_directory(),
+        Some("/home/me"),
+        "a stray at the adopted prompt of a signing shell is dropped"
+    );
+
+    // A shell that does not sign: the stray it left held lands at its next A.
+    let unsigned_report = b"\x1b]7;file://host/home/me\x07";
+    let mut t = gated();
+    prompt(&mut t, unsigned_report);
+    t.process(b"true\r\n");
+    t.process(&mark("C"));
+    t.process(&mark("D;0"));
+    prompt(&mut t, unsigned_report);
+    t.process(b"\x1b]7;file://host/home/me/src\x07");
+    assert_eq!(t.current_working_directory(), Some("/home/me"), "held");
+    let (json, mut adopted) = wire(&t);
+    assert!(
+        json.contains("\"held_cwd\":{\"path\":\"/home/me/src\",\"host\":\"host\"}"),
+        "{json}"
+    );
+    adopted.process(&mark("A"));
+    assert_eq!(adopted.current_working_directory(), Some("/home/me/src"));
 }
 
 /// The parser carry (the round-five plan's item 12) crosses the REAL wire:

@@ -73,6 +73,29 @@ fn every_host_answer_reads_back_as_written() {
             repeat: false,
         }));
     }
+    same(None::<(String, HostTurn)>);
+    for turn in [HostTurn::Notice, HostTurn::CarryOn, HostTurn::Check] {
+        same(Some(("released:give-up".to_string(), turn)));
+    }
+    same(None::<LastTurn>);
+    same(Some(LastTurn::default()));
+    same(Some(LastTurn {
+        last: Some("answer:a-2".to_string()),
+        opened: Some("prompt:u-2".to_string()),
+        opened_said: Some(u64::MAX),
+        ended: Some(Duration::new(41, 7)),
+        opened_ms: Some(1_789_660_500_000),
+        asked: vec!["prompt:c-1".to_string(), "prompt:c-2".to_string()],
+    }));
+    same(None::<crate::harness::repo_work::RepoWork>);
+    same(Some(crate::harness::repo_work::RepoWork {
+        repo: "/Users//a/Developer/r".to_string(),
+        changed: 2,
+        untracked: 1,
+        stashes: 1,
+        unpushed: 3,
+        paths: vec!["src/a.rs".to_string(), "notes/".to_string()],
+    }));
     same(None::<StandingLimit>);
     same(Some(StandingLimit {
         text: "You've hit your weekly limit · resets 6pm".to_string(),
@@ -109,13 +132,16 @@ fn every_host_answer_reads_back_as_written() {
     for no in ResetNo::ALL {
         same(ResetWord::No(no));
     }
-    same(ResetWord::Take(ResetGo {
-        until: 1_789_840_800,
-        long: true,
-        limits: vec!["weekly".to_string(), "Opus".to_string()],
-        left: 2,
-        day: "Oct 5".to_string(),
-    }));
+    for kind in std::iter::once(None).chain(aterm_phase::ResetKind::ALL.map(Some)) {
+        same(ResetWord::Take(ResetGo {
+            until: 1_789_840_800,
+            long: true,
+            limits: vec!["weekly".to_string(), "Opus".to_string()],
+            left: 2,
+            day: "Oct 5".to_string(),
+            kind,
+        }));
+    }
     for outcome in [
         ResetOutcome::Pending,
         ResetOutcome::Spent {
@@ -222,6 +248,10 @@ fn an_answer_this_build_did_not_write_is_refused() {
     assert!(refused::<Result<(), ProbeNo>>(b"\"not-a-word\""));
     assert!(refused::<ResetWord>(b"{\"no\":\"never\"}"));
     assert!(refused::<ResetWord>(b"\"maybe\""));
+    assert!(refused::<ResetWord>(
+        b"{\"take\":{\"until\":1,\"long\":true,\"limits\":[],\"left\":2,\"day\":\"Oct 5\",\
+          \"kind\":\"monthly\"}}"
+    ));
     assert!(refused::<ResetOutcome>(b"\"spent\""));
     assert!(refused::<Reach>(b"\"sideways\""));
     assert!(refused::<Option<HostStep>>(
@@ -231,8 +261,52 @@ fn an_answer_this_build_did_not_write_is_refused() {
         b"{\"footprint_mib\":1,\"physical_mib\":null,\"available_mib\":null,\"used_mib\":null,\
           \"pressure\":\"panic\",\"swap_kib_s\":null,\"largest_other_mib\":null}"
     ));
+    assert!(refused::<Option<(String, HostTurn)>>(
+        b"{\"line\":\"x\",\"turn\":\"song\"}"
+    ));
+    assert!(refused::<Option<(String, HostTurn)>>(b"{\"line\":\"x\"}"));
     assert!(refused::<Option<String>>(b"not json"));
     assert!(refused::<Option<AccountAdvice>>(b"{\"wait\":{}}"));
+}
+
+/// A LINE TYPED AT A BREAK ON A TAPE AN EARLIER BUILD WROTE, from before
+/// such a line had a kind (`at_background`'s answer was the line alone),
+/// reads back as the notice, as that build's loop took every such line; its
+/// none reads back as none.
+#[test]
+fn a_break_line_an_earlier_build_taped_reads_back_as_the_notice() {
+    let origin = Instant::now();
+    assert_eq!(
+        <Option<(String, HostTurn)> as HostReply>::take(b"\"notice:announced\"", origin).ok(),
+        Some(Some(("notice:announced".to_string(), HostTurn::Notice)))
+    );
+    assert_eq!(
+        <Option<(String, HostTurn)> as HostReply>::take(b"null", origin).ok(),
+        Some(None)
+    );
+}
+
+/// A RESET'S GO ON A TAPE AN EARLIER BUILD WROTE, from before Claude Code
+/// 2.1.304's rows named a kind of reset, reads back as a go for a row that
+/// named none. NEGATIVE CONTROL: the same go with a kind reads back with it.
+#[test]
+fn a_resets_go_an_earlier_build_taped_reads_back_with_no_kind() {
+    let origin = Instant::now();
+    let take = |bytes: &[u8]| match <ResetWord as HostReply>::take(bytes, origin) {
+        Ok(ResetWord::Take(go)) => go.kind,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        take(b"{\"take\":{\"until\":1,\"long\":true,\"limits\":[],\"left\":2,\"day\":\"Oct 5\"}}"),
+        None
+    );
+    assert_eq!(
+        take(
+            b"{\"take\":{\"until\":1,\"long\":true,\"limits\":[],\"left\":2,\"day\":\"Oct 5\",\
+              \"kind\":\"full\"}}"
+        ),
+        Some(aterm_phase::ResetKind::Full)
+    );
 }
 
 /// A REQUEST names each argument and its `Debug` text, a line each, in the
@@ -273,6 +347,7 @@ fn an_argument_that_holds_an_instant_is_refused_in_tests() {
             &WaitPlan {
                 at_unix: 1,
                 why: "x".to_string(),
+                kind: crate::supervise::WaitKind::Retry,
             },
         )])
     });

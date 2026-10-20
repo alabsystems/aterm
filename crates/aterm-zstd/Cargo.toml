@@ -9,6 +9,10 @@
 
 [package]
 name = "aterm-zstd"
+# Integration tests are declared below, not discovered: the files are modules of
+# one suite binary where they can share a process. With autotests off a
+# `tests/*.rs` file listed nowhere never compiles.
+autotests = false
 version.workspace = true
 edition.workspace = true
 license = "Apache-2.0 AND MIT"
@@ -30,6 +34,10 @@ path = "src/lib.rs"
 # recorded answers are the decoder's oracle: libzstd, the `zstd` dev-dependency
 # until ZC.6, held the recordings to itself before it left the graph.
 aterm-digest = { workspace = true }
+
+[[test]]
+name = "zstd_suite"
+path = "tests/zstd_suite.rs"
 
 [lints]
 workspace = true

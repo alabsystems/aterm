@@ -40,8 +40,8 @@
 //! Every step below now drives its shipping seam inside a ONE-STEP-WIDE execution
 //! evidence window (`aterm_spec::xref::StepEvidence`): the thread-local anchor-entry
 //! record is cleared, the seam is called, and what was entered is snapshotted before
-//! this module reads anything back. `spec_xref_closure` (crates/aterm-gui/src/lib.rs,
-//! the `SelectionCustody` block) then asks TWO questions of the ledger, and the second
+//! this module reads anything back. `spec_xref_gate`'s
+//! `selection_custody_steps_enter_their_own_seams` then asks TWO questions of the ledger, and the second
 //! is what makes the first worth anything.
 //!
 //! 1. ENTRY: every window driving action A must have entered A's annotated function.
@@ -569,10 +569,9 @@ fn evict_destroys_a_selection_whose_whole_interval_fell_off(ev: &mut StepEvidenc
     );
 }
 
-/// The `SelectionCustody` Tier-1 body, RUN by `spec_xref_gate`'s `spec_xref_closure`
-/// and by nothing else: the gate's "SelectionCustody is actively bound" claim then
-/// means the real engine and GUI seams were driven and checked, not merely that
-/// anchors exist.
+/// The `SelectionCustody` Tier-1 body, run by `spec_xref_gate` with its execution
+/// evidence: the real engine and GUI seams are driven and checked, and each step must
+/// enter its own action's anchored function.
 pub(crate) fn run_conformance() -> StepEvidence {
     let mut validated = 0usize;
     // EXECUTION EVIDENCE. Every step below drives its shipping seam inside a

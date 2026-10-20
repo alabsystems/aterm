@@ -8,10 +8,11 @@
 //!
 //! It holds the budget-scale knob of the release perf gates (`benches/cursor_bench.rs` and
 //! `benches/rainbow_kitty_v2_frame_cost.rs`); the ribbon host's pieces: the rainbow-kitty
-//! config, a grid's geometry, and the frame hold's samples as `app_render.rs` takes them from a
-//! real `Terminal` after the last `process`, one free function each so a host keeps its own
-//! order; the plan-coverage census of a row; the `lab ptyrec` recording parse the real-byte
-//! replays read; and the replay pool ([`par_map`]).
+//! config, a grid's geometry, the present's DEC 2026 hold, and the frame hold's samples as
+//! `app_render.rs` takes them from a real `Terminal` after the last `process`, one free
+//! function each so a host keeps its own order; the plan-coverage census of a row; the
+//! `lab ptyrec` recording parse the real-byte replays read; and the replay pool
+//! ([`par_map`]).
 
 use aterm_core::grid::Cursor;
 use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};
@@ -97,6 +98,55 @@ pub fn geom(rows: usize, cols: usize, cw: usize, ch: usize) -> Geom {
         win_w: (cols * cw) as u16,
         win_h: (rows * ch) as u16,
         head: 0,
+    }
+}
+
+// The ribbon host: the present's DEC 2026 hold.
+
+/// `app_render.rs`'s `SYNC_HOLD_CAP`: how long a dirty DEC 2026 bracket holds
+/// the present; past it the frame is presented as it stands.
+#[allow(dead_code)]
+pub const SYNC_HOLD_CAP: Duration = Duration::from_millis(150);
+
+/// The present's DEC 2026 hold, `app_render.rs`'s `sync_frame_hold` over the
+/// pane's sync level, close counter and open-dirty bit, its timeout
+/// [`SYNC_HOLD_CAP`]: armed on the rising edge, held while armed and
+/// unexpired, re-armed when one bracket closed and another opened (held then
+/// only while the new one is dirty), released when sync ends or the deadline
+/// passes.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameHold {
+    was_active: bool,
+    deadline: Option<Instant>,
+    armed_seq: u64,
+}
+
+#[allow(dead_code)]
+impl FrameHold {
+    /// Whether the present at `now` is withheld; one step of the machine.
+    pub fn withholds(&mut self, term: &Terminal, now: Instant) -> bool {
+        let active = term.modes().synchronized_output();
+        let end_seq = term.sync_end_seq();
+        let (deadline, hold) = if !active {
+            (None, false)
+        } else if self.was_active && end_seq != self.armed_seq {
+            (Some(now + SYNC_HOLD_CAP), term.sync_open_dirty())
+        } else {
+            let armed = if self.was_active {
+                self.deadline
+            } else {
+                Some(now + SYNC_HOLD_CAP)
+            };
+            let hold = armed.is_some_and(|d| now < d);
+            (armed.filter(|_| hold), hold)
+        };
+        *self = Self {
+            was_active: active,
+            deadline,
+            armed_seq: end_seq,
+        };
+        hold
     }
 }
 

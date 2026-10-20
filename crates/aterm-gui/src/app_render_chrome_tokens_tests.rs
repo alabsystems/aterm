@@ -49,10 +49,11 @@ fn drawn(config: &str) -> Drawn {
         .iter()
         .map(|cell| (cell.bg, cell.underline_color))
         .collect();
-    // A two-pane split, composed.
+    // A two-pane split, composed, its window without the keyboard: no ring, so
+    // the whole gap shows the seam.
     app.tab_strip_rows = 0;
     let _ = app.split_active_stub_tab(wid);
-    app.windows.get_mut(&wid).expect("window").focused = true;
+    app.windows.get_mut(&wid).expect("window").focused = false;
     let (rows, cols) = {
         let ws = &app.windows[&wid];
         (usize::from(ws.rows), usize::from(ws.cols))
@@ -62,12 +63,17 @@ fn drawn(config: &str) -> Drawn {
             .is_some(),
         "the split composes"
     );
+    // Every cell's ground, and a hairline's ink (the Fluent gap is the
+    // terminal's ground with the seam drawn in it, `crate::pane_chrome`).
     let composed = app.windows[&wid]
         .input_scratch
         .cells
         .iter()
         .flatten()
-        .map(|cell| cell.bg)
+        .flat_map(|cell| {
+            let hairline = ('\u{2500}'..='\u{257f}').contains(&cell.ch);
+            [cell.bg, if hairline { cell.fg } else { cell.bg }]
+        })
         .collect();
     let grid = app.chrome_palette(ChromeSurface::Grid);
     let seam = grid
@@ -96,8 +102,8 @@ fn drawn(config: &str) -> Drawn {
 }
 
 /// THE AUTHORED CHROME REACHES EVERY SURFACE: one `aterm.toml` with the chrome
-/// keys, and the strip's selected tab wears `active_tab_color` and its rule the
-/// accent; the split's divider is the authored border (held to its floor, which
+/// keys, and the strip's selected tab wears `active_tab_color` and, where it
+/// has one, its rule the accent; the split's divider is the authored border (held to its floor, which
 /// `#5a5a5a` on Default already clears); the Settings accent wears the accent's
 /// hue; the rain and the drop highlight wear the accent. NEGATIVE CONTROL: the
 /// same App without the keys draws none of them.
@@ -111,9 +117,12 @@ fn authored_chrome_reaches_every_surface() {
         "the selected tab is the authored colour: {:?}",
         authored.strip
     );
-    assert!(
+    // A chip-card band (every platform but macOS) marks the selection by its
+    // filled card alone and draws no rule under it (`tab_bar::strip_cell`).
+    assert_eq!(
         authored.strip.iter().any(|(_, rule)| *rule == Some(ACCENT)),
-        "the selected tab's rule is the accent: {:?}",
+        !crate::tab_bar::STRIP_CHIP_CARDS,
+        "the selected tab's rule is the accent where the strip draws one: {:?}",
         authored.strip
     );
     assert_eq!(

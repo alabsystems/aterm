@@ -18,12 +18,34 @@
 //!
 //! A renewable login: a `rostered` state's readings carry the session's renewable
 //! login (`login_label`), and a `renewed` one the host's advice to move onto it.
-//! There the real decider never types `/login`; it waits, relaunches (`Relaunch`)
-//! and follows (`Follow`) exactly where the model does. The real exception asks
-//! for the renewal exactly where `AskRenew` is enabled, and the real
-//! `aterm harness accounts renew`, run through a recording host, checks the new
-//! login in its staging home alone, never the idle one it replaces, as the
+//! There the real decider types `/login` as anywhere until a renewal stands, then
+//! relaunches (`Relaunch`) and follows (`Follow`) exactly where the model does, and
+//! the real `aterm harness accounts renew`, run through a recording host, checks
+//! the new login in its staging home alone, never the idle one it replaces, as the
 //! model's `Renew` does.
+//!
+//! The lost login carried (the owner's ruling of 2026-10-19): the real exception
+//! tells the owner now, not escalated, exactly where `TellNow` is enabled, and the
+//! real supervisor never rests at a wall with nothing typed and nobody told
+//! (`Rest`); a `done` state's wall answered the owner's own prompt to a finished
+//! task (the policy seeded done, the wall read with no work and the person's key
+//! just before it), where the real decider types `/login` as anywhere; and for a
+//! `picker` state the real gate (`TurnEndState::login_typed_at`: the picker
+//! behind a `/login` this loop typed) and picker policy
+//! (`policy::login::pick_method` over the measured 2.1.303 picker) choose
+//! exactly where `PickMethod` is enabled: the method the session's login is,
+//! only when `known`, and never on a person's own picker. A `left` state is a
+//! person's own `/login` left at the lost login (`Login interrupted` with no
+//! `/login` of the loop's), and, with the wall back, their next prompt answered
+//! by it: the real decider types no `/login` there.
+//!
+//! One sign-in per login: an `elsewhere` state is another tab of the host on
+//! the same login, as the host's latch hands it to the reading at the wall —
+//! its sign-in standing (`LoginShared::Carried`, `elsewhere` 1) or the login
+//! back there (`LoginShared::Back`, 2). The real decider types no `/login`
+//! while that tab carries it (a wait with an end: no rest, the owner told
+//! there), and the turn it delivers again once the login is back
+//! (`login-back@v1`) is the model's `Continue` at its wall.
 //!
 //! Negative controls: the model with any one defect switched on (`Buggy`, and each
 //! knob) disagrees with the real code somewhere.
@@ -39,15 +61,18 @@ use aterm_agent::harness::upgrade::{
     self, Agent, Facts, GAVE_UP, MAX_ASKS, Phase, REASK_S, Step, Version,
 };
 use aterm_agent::supervise::SupervisorConfig;
-use aterm_agent::supervise::policy::exception::{Exception, RENEW_STEP, exception_for};
+use aterm_agent::supervise::policy::approval::Decision;
+use aterm_agent::supervise::policy::exception::{Exception, Urgency, exception_for};
+use aterm_agent::supervise::policy::login::{LoginShared, pick_method};
 use aterm_agent::supervise::policy::outlook::ExceptionKind;
 use aterm_agent::supervise::policy::turn_end::{
-    AccountAdvice, AccountAt, RULE_CONTINUE, RULE_LOGIN, Restart, TurnEndAction, TurnEndReading,
-    TurnEndState, decide_turn_end,
+    AccountAdvice, AccountAt, RULE_CONTINUE, RULE_LOGIN, RULE_LOGIN_BACK, Restart, TurnEndAction,
+    TurnEndReading, TurnEndState, decide_turn_end,
 };
 use aterm_json::Value;
 use aterm_models_harness::harness_login_wall_model;
-use aterm_phase::prompt::fixtures::{LOGIN_EXPIRED, screen};
+use aterm_phase::prompt::fixtures::{LOGIN_EXPIRED, LOGIN_PICKER, screen};
+use aterm_phase::{LoginMethod, LoginScreen};
 use aterm_spec::derive::Model;
 
 type S = BTreeMap<&'static str, i64>;
@@ -97,17 +122,25 @@ fn with_tail(tail: &[&str]) -> Vec<String> {
 
 const WALL_ROW: &str = "⏺ Login expired · Please run /login";
 
+/// A person's own `/login`, left with Esc under the wall.
+const LEFT: [&str; 4] = [WALL_ROW, "", "❯ /login", "  ⎿  Login interrupted"];
+
 /// The screen state `s` stands for.
 fn screen_of(s: &S) -> Vec<String> {
-    if s["wall"] == 1 {
+    if s["left"] == 1 && s["back"] == 0 {
+        if s["wall"] == 1 {
+            let mut tail = LEFT.to_vec();
+            tail.extend(["", "❯ go on", "", WALL_ROW]);
+            with_tail(&tail)
+        } else {
+            with_tail(&LEFT)
+        }
+    } else if s["wall"] == 1 {
         with_tail(&[WALL_ROW])
     } else if s["back"] == 1 {
         with_tail(&[WALL_ROW, "", "❯ /login", "  ⎿  Login successful"])
     } else if s["track"] == 1 {
         with_tail(&[WALL_ROW, "", "❯ /login", "  ⎿  Login interrupted"])
-    } else if hidden(s) {
-        // A person's `/status` over the wall: its row gone, the login not.
-        with_tail(&[WALL_ROW, "", "❯ /status", "  ⎿  Status dialog dismissed"])
     } else {
         with_tail(&[
             "⏺ Stage done: the suites are green.",
@@ -408,27 +441,49 @@ fn window_runs(m: &Model, s: &S) -> bool {
     )
 }
 
-/// A rostered login's wall with its row off the screen (a person's
-/// `/status`): the login gone, nothing typed at it.
-fn hidden(s: &S) -> bool {
-    s["rostered"] == 1 && s["wall"] == 0 && s["stood"] == 1 && s["track"] == 0 && s["back"] == 0
-}
-
 /// The reading of a real screen, `worked` the busy work since the last point.
 fn reading(rows: &[String], worked: Option<Duration>) -> TurnEndReading {
     let r = aterm_phase::read(Some("claude"), rows, Some(2));
     TurnEndReading::of(&r, rows, false, worked, None, None)
 }
 
+/// The wall's first read in state `s`: over a finished task (`done`), the turn
+/// the owner's prompt began, read never busy — no work, the person's key a
+/// moment before it.
+fn first_wall(s: &S, st: &mut TurnEndState) -> TurnEndReading {
+    if s["done"] == 1 {
+        assert!(st.seed_task_done(), "a task done at {s:?}");
+        TurnEndReading {
+            person: Some(Duration::from_secs(2)),
+            ..reading(&with_tail(&[WALL_ROW]), None)
+        }
+    } else {
+        reading(&with_tail(&[WALL_ROW]), Some(Duration::from_secs(180)))
+    }
+}
+
 /// The renewable login a rostered state's session runs on.
 const LABEL: &str = "m7-a";
 
-/// `r` as the window's host hands it over for state `s`. On a rostered login:
+/// The tab that carries the login's sign-in in an `elsewhere` state.
+const PEER: &str = "@2";
+
+/// `r` as the window's host hands it over for state `s`. At a lost login, the
+/// other tab's sign-in of it (`elsewhere`: carried there, or the login back
+/// there), as the host's latch answers the loop's ask. On a rostered login:
 /// the session's renewable label and a host that relaunches; once renewed, the
 /// process on the superseded login and the advice to move onto the renewed one
-/// (what `accounts::advise` gives at a lost login or a turn end). Elsewhere `r`
-/// unchanged: no host keeps a roster for it.
+/// (what `accounts::advise` gives at a lost login or a turn end). Elsewhere no
+/// host keeps a roster for it.
 fn hosted(s: &S, renewed: bool, r: TurnEndReading) -> TurnEndReading {
+    let by = PEER.to_string();
+    let login_shared = match s["elsewhere"] {
+        _ if r.wall != Some(aterm_phase::WallKind::Auth) => None,
+        1 => Some(LoginShared::Carried { by }),
+        2 => Some(LoginShared::Back { by }),
+        _ => None,
+    };
+    let r = TurnEndReading { login_shared, ..r };
     if s["rostered"] == 0 {
         return r;
     }
@@ -443,49 +498,104 @@ fn hosted(s: &S, renewed: bool, r: TurnEndReading) -> TurnEndReading {
     }
 }
 
-/// What the real supervisor decides at the point state `s` stands for, and the
-/// exception it raises there. Its policy is fresh, except where the state's
-/// lost-login track stands (it typed `/login` at the wall's first point) and
-/// where a rostered login's wall is hidden (it waited at the wall).
-fn supervisor_at(s: &S) -> (TurnEndAction, Option<Exception>) {
+/// What the real supervisor decides at the point state `s` stands for, the
+/// exception it raises there, and whether a picker read there is behind the
+/// `/login` it typed (the approval loop's gate: `login_typed_at`). Its policy is
+/// fresh, except where the state's lost-login track stands (it typed `/login`
+/// at the wall's first point), where a person's own `/login` was left there
+/// (`left`), and where the wall came over a finished task (the task seeded
+/// done).
+fn supervisor_at(s: &S) -> (TurnEndAction, Option<Exception>, bool) {
     let cfg = SupervisorConfig::default();
     let t0 = Instant::now() + Duration::from_secs(10 * 3600);
     let mut st = TurnEndState::default();
     let long = Some(Duration::from_secs(180));
+    // The instant the state's own reading is a minute after: the wall's, or
+    // the `/login` typed at it once the wait it decided there ended.
+    let mut from = t0;
     let worked = if s["track"] == 1 {
-        let first = reading(&with_tail(&[WALL_ROW]), long);
+        let first = hosted(s, false, first_wall(s, &mut st));
         st.observe(&first, t0);
-        let a = decide_turn_end(&st, &first, &cfg, t0);
+        let (a, first, at) = settled_at(&st, &first, &cfg, t0);
         assert!(
             matches!(&a, TurnEndAction::TypeCommand { rule_id, .. } if *rule_id == RULE_LOGIN),
             "{a:?}"
         );
-        st.acted(&a, &first, t0);
+        st.acted(&a, &first, at);
+        from = at;
         None
-    } else if hidden(s) {
-        let first = hosted(s, false, reading(&with_tail(&[WALL_ROW]), long));
+    } else if s["left"] == 1 && s["back"] == 0 {
+        // The wall read, then the person's own `/login` left under it.
+        let first = hosted(s, false, first_wall(s, &mut st));
         st.observe(&first, t0);
-        let a = decide_turn_end(&st, &first, &cfg, t0);
-        assert!(matches!(&a, TurnEndAction::WaitUntil { .. }), "{a:?}");
-        st.acted(&a, &first, t0);
+        let gone = hosted(s, false, reading(&with_tail(&LEFT), None));
+        st.observe(&gone, t0 + Duration::from_secs(30));
+        assert!(st.login_cancelled(), "the person's /login left at {s:?}");
         None
+    } else if s["done"] == 1 && s["wall"] == 1 {
+        // The wall over the finished task, read first now.
+        let r = hosted(s, s["renewed"] == 1, first_wall(s, &mut st));
+        st.observe(&r, t0);
+        return (
+            settled(&st, &r, &cfg, t0),
+            exception_for(&st, &r, &cfg, t0),
+            st.login_typed_at().is_some(),
+        );
     } else {
         long
     };
-    let now = t0 + Duration::from_secs(60);
+    let now = from + Duration::from_secs(60);
     let r = hosted(s, s["renewed"] == 1, reading(&screen_of(s), worked));
     st.observe(&r, now);
     (
         decide_turn_end(&st, &r, &cfg, now),
         exception_for(&st, &r, &cfg, now),
+        st.login_typed_at().is_some(),
     )
+}
+
+/// What the real decider does at `r` once a wait it decides there ends: the
+/// point decided again at the wait's end, nothing more read (a person's key
+/// that holds an act ages as the wait does). A wait with an end is no rest:
+/// the step it ends in is the model's.
+fn settled(
+    st: &TurnEndState,
+    r: &TurnEndReading,
+    cfg: &SupervisorConfig,
+    now: Instant,
+) -> TurnEndAction {
+    settled_at(st, r, cfg, now).0
+}
+
+/// [`settled`], with the reading and the instant it was decided at.
+fn settled_at(
+    st: &TurnEndState,
+    r: &TurnEndReading,
+    cfg: &SupervisorConfig,
+    now: Instant,
+) -> (TurnEndAction, TurnEndReading, Instant) {
+    match decide_turn_end(st, r, cfg, now) {
+        TurnEndAction::WaitUntil { until, .. } if until > now => {
+            let waited = until - now;
+            let aged = TurnEndReading {
+                person: r.person.map(|ago| ago + waited),
+                ..r.clone()
+            };
+            (decide_turn_end(st, &aged, cfg, until), aged, until)
+        }
+        decided => (decided, r.clone(), now),
+    }
 }
 
 /// The model's action a real turn-end decision is.
 fn supervisor_action(a: &TurnEndAction) -> Option<&'static str> {
     match a {
         TurnEndAction::TypeCommand { rule_id, .. } if *rule_id == RULE_LOGIN => Some("TypeLogin"),
-        TurnEndAction::Type { rule_id, .. } if *rule_id == RULE_CONTINUE => Some("Continue"),
+        TurnEndAction::Type { rule_id, .. }
+            if *rule_id == RULE_CONTINUE || *rule_id == RULE_LOGIN_BACK =>
+        {
+            Some("Continue")
+        }
         TurnEndAction::Restart {
             why: Restart::Account { to, at },
             ..
@@ -497,33 +607,56 @@ fn supervisor_action(a: &TurnEndAction) -> Option<&'static str> {
     }
 }
 
-/// Whether the real exception at the point is the renewal's ask: the owner
-/// needed now to renew the login, not an escalation of the loop's.
-fn asks_renewal(e: Option<&Exception>) -> bool {
+/// The owner told now: the login exception, not escalated (the host's ask on
+/// the glass), with the owner's four-part notice.
+fn tells_now(e: Option<&Exception>) -> bool {
     e.is_some_and(|e| {
-        e.kind == ExceptionKind::Login && !e.escalated && e.action.starts_with(RENEW_STEP)
+        e.kind == ExceptionKind::Login
+            && e.when == Urgency::Now
+            && !e.escalated
+            && e.notice.is_some()
     })
 }
 
+/// Whether the real picker policy chooses at the measured picker for a state
+/// whose method is `known` (or not).
+fn picks(known: bool) -> bool {
+    let rows = screen(LOGIN_PICKER);
+    let read = aterm_phase::read(Some("claude"), &rows, Some(2));
+    let prompt = read.prompt.expect("the picker is a prompt");
+    let Some(LoginScreen::Picker(picker)) = aterm_phase::login_screen(&rows) else {
+        panic!("the measured picker reads as the picker");
+    };
+    let method = known.then_some(LoginMethod::Subscription);
+    matches!(
+        pick_method(&prompt, &picker, method),
+        Decision::Approve { .. }
+    )
+}
+
 /// Whether the model `m` agrees at `s` with what the real code decided: the
-/// upgrade, the supervisor, its exception, and, where the model's renewal is
-/// enabled, what the real renewal touched (`renew_clean`: no check under any
-/// login but its new one, the live login left as it was).
+/// upgrade, the supervisor, its exception, the picker gate (`carry`) and
+/// policy (`picked`, by whether the method is known), and, where the model's
+/// renewal is enabled, what the real renewal touched (`renew_clean`: no check
+/// under any login but its new one, the live login left as it was).
 fn agrees(
     m: &Model,
     s: &S,
     up: &Upgrade,
-    (sup, ask): (Option<&'static str>, bool),
+    (sup, ask, carry): (Option<&'static str>, bool, bool),
     renew_clean: bool,
+    picked: [bool; 2],
 ) -> bool {
     let taken = upgrade_action(&up.step);
     let upgrade_ok = ["Announce", "GiveUp", "Restart"]
         .iter()
         .all(|a| m.action_enabled(a, s) == (taken == Some(*a)));
-    let supervisor_ok = ["TypeLogin", "Continue", "Relaunch", "Follow"]
+    let supervisor_ok = ["TypeLogin", "Continue", "Relaunch", "Follow", "Rest"]
         .iter()
         .all(|a| m.action_enabled(a, s) == (sup == Some(*a)));
-    let ask_ok = m.action_enabled("AskRenew", s) == ask;
+    let ask_ok = m.action_enabled("TellNow", s) == ask;
+    let pick_ok = s["picker"] == 0
+        || m.action_enabled("PickMethod", s) == (carry && picked[usize::from(s["known"] == 1)]);
     let renew_ok = !m.action_enabled("Renew", s) || {
         let mut next = s.clone();
         m.fire("Renew", &mut next)
@@ -543,7 +676,7 @@ fn agrees(
     };
     let clock_ok = !(s["phase"] == 1 && s["window"] == 0)
         || m.action_enabled("Elapse", s) == window_runs(m, s);
-    upgrade_ok && supervisor_ok && ask_ok && renew_ok && asks_ok && clock_ok
+    upgrade_ok && supervisor_ok && ask_ok && pick_ok && renew_ok && asks_ok && clock_ok
 }
 
 /// A host for the real renewal that records what it runs: its sign-in writes
@@ -662,22 +795,37 @@ fn real_renewal_is_clean() -> bool {
 /// The model with one defect switched on.
 fn defective() -> Vec<(&'static str, Model)> {
     let model = harness_login_wall_model();
-    std::iter::once(("Buggy", aterm_spec::interp::with_buggy(&model, 1)))
-        .chain(
-            [
-                "NoGate",
-                "NoRefund",
-                "ClockAtWall",
-                "NoSee",
-                "NoHold",
-                "TypeOnRoster",
-                "NoFollow",
-                "CheckIdle",
-            ]
-            .into_iter()
-            .map(|knob| (knob, aterm_spec::interp::with_consts(&model, &[(knob, 1)]))),
-        )
-        .collect()
+    [
+        ("Buggy", aterm_spec::interp::with_buggy(&model, 1)),
+        ("Buggy2", aterm_spec::interp::with_buggy(&model, 2)),
+        ("Buggy3", aterm_spec::interp::with_buggy(&model, 3)),
+        ("Buggy4", aterm_spec::interp::with_buggy(&model, 4)),
+        ("Buggy5", aterm_spec::interp::with_buggy(&model, 5)),
+        ("Buggy6", aterm_spec::interp::with_buggy(&model, 6)),
+    ]
+    .into_iter()
+    .chain(
+        [
+            "NoGate",
+            "NoRefund",
+            "ClockAtWall",
+            "NoSee",
+            "NoHold",
+            "WaitOnRoster",
+            "NoFollow",
+            "CheckIdle",
+            "NoDoneWall",
+            "GraceHolds",
+            "Relogin",
+            "GuessMethod",
+            "ReloginOverLeft",
+            "PickAnyPicker",
+            "NoLatch",
+        ]
+        .into_iter()
+        .map(|knob| (knob, aterm_spec::interp::with_consts(&model, &[(knob, 1)]))),
+    )
+    .collect()
 }
 
 #[test]
@@ -689,6 +837,8 @@ fn the_real_code_conforms_to_the_login_wall_model() {
     let mut disagree: BTreeMap<&str, usize> = defective.iter().map(|(n, _)| (*n, 0)).collect();
     let mut taken = BTreeSet::new();
     let renew_clean = real_renewal_is_clean();
+    let picked = [picks(false), picks(true)];
+    assert_eq!(picked, [false, true], "the method known, and only then");
     assert!(
         renew_clean,
         "the real renewal checks its staging home alone"
@@ -713,11 +863,16 @@ fn the_real_code_conforms_to_the_login_wall_model() {
                 "the notice's fate at {s:?}"
             );
         }
-        let (decided, exception) = supervisor_at(s);
-        let sup = supervisor_action(&decided);
-        let ask = asks_renewal(exception.as_ref());
+        let (decided, exception, carry) = supervisor_at(s);
+        let ask = tells_now(exception.as_ref());
+        // At a wall nothing typed at, nobody told and no wait with an end: a
+        // rest.
+        let waits = matches!(decided, TurnEndAction::WaitUntil { .. });
+        let sup =
+            supervisor_action(&decided)
+                .or((s["wall"] == 1 && s["track"] == 0 && !ask && !waits).then_some("Rest"));
         assert!(
-            agrees(&model, s, &up, (sup, ask), renew_clean),
+            agrees(&model, s, &up, (sup, ask, carry), renew_clean, picked),
             "at {s:?}: the real upgrade took {:?} (asks {}, about {:?}), the supervisor \
              {decided:?} ({sup:?}), its exception {exception:?}",
             up.step,
@@ -727,13 +882,16 @@ fn the_real_code_conforms_to_the_login_wall_model() {
         taken.extend(upgrade_action(&up.step));
         taken.extend(sup);
         if ask {
-            taken.insert("AskRenew");
+            taken.insert("TellNow");
+        }
+        if s["picker"] != 0 && carry && picked[usize::from(s["known"] == 1)] {
+            taken.insert("PickMethod");
         }
         if model.action_enabled("Renew", s) {
             taken.insert("Renew");
         }
         for (name, m) in &defective {
-            if !agrees(m, s, &up, (sup, ask), renew_clean) {
+            if !agrees(m, s, &up, (sup, ask, carry), renew_clean, picked) {
                 *disagree.get_mut(name).expect("a knob") += 1;
             }
         }
@@ -748,7 +906,8 @@ fn the_real_code_conforms_to_the_login_wall_model() {
             "Continue",
             "Relaunch",
             "Follow",
-            "AskRenew",
+            "TellNow",
+            "PickMethod",
             "Renew",
         ]),
         "every decision of the real code is taken somewhere"

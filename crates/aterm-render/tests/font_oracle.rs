@@ -20,7 +20,9 @@
 //!   variation instance (cmap, metrics, MVAR-applied metrics, advances, bounds,
 //!   glyf/gvar and CFF outlines as point-stream digests, OS/2, name, kern,
 //!   GSUB/GPOS/GDEF, sbix/bitmap and COLR digests), plus aterm's own
-//!   `font::Font` and `variation` answers built on it.
+//!   `font::Font` and `variation` answers built on it. aterm-font's
+//!   `reader_oracle` replays the `read` lines; `reader_answers_hold` here
+//!   holds the `font` and `vary` lines, and answers `read` only to bless.
 //! - `tests/fixtures/font-oracle/reader-gvar-alloc.txt`: the same `read`
 //!   answers for `GVAR_ALLOC_FACES` (`font_oracle/corpus.rs`), faces with
 //!   glyphs past 32 `gvar` tuples, recorded by the recorder below with
@@ -245,10 +247,10 @@ impl Gate {
             .chain(&no_calt_config())
             .map(|f| f.tag)
             .chain(user_tags.iter().copied())
-            .filter(|&t| ligature_shaping::font_advertises_feature(bytes, t))
+            .filter(|&t| ligature_shaping::font_advertises_feature(bytes, 0, t))
             .collect();
         Self {
-            ligatures: ligature_shaping::font_has_ligature_features(bytes),
+            ligatures: ligature_shaping::font_has_ligature_features(bytes, 0),
             advertised,
             user_tags,
         }
@@ -457,49 +459,13 @@ fn complex_cases() -> Vec<Case> {
     .collect()
 }
 
-/// The clusters `Renderer::shape_cluster` shapes on the colour face.
+/// The clusters `Renderer::shape_cluster` shapes on the colour face
+/// ([`corpus::EMOJI_CASES`], which the recorder shapes on rustybuzz too).
 fn emoji_cases() -> Vec<Case> {
-    [
-        ("emoji.grin", "\u{1F600}"),
-        ("emoji.heart-vs16", "\u{2764}\u{FE0F}"),
-        ("emoji.smile-vs15", "\u{263A}\u{FE0E}"),
-        (
-            "emoji.family",
-            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
-        ),
-        ("emoji.technologist", "\u{1F469}\u{200D}\u{1F4BB}"),
-        ("emoji.rainbow-flag", "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}"),
-        ("emoji.heart-fire", "\u{2764}\u{FE0F}\u{200D}\u{1F525}"),
-        (
-            "emoji.holding-hands",
-            "\u{1F9D1}\u{200D}\u{1F91D}\u{200D}\u{1F9D1}",
-        ),
-        ("emoji.thumbs-medium", "\u{1F44D}\u{1F3FD}"),
-        ("emoji.wave-dark", "\u{1F44B}\u{1F3FF}"),
-        (
-            "emoji.red-hair-light",
-            "\u{1F9D1}\u{1F3FB}\u{200D}\u{1F9B0}",
-        ),
-        (
-            "emoji.couple-tones",
-            "\u{1F469}\u{1F3FE}\u{200D}\u{1F91D}\u{200D}\u{1F468}\u{1F3FB}",
-        ),
-        ("emoji.flag-us", "\u{1F1FA}\u{1F1F8}"),
-        ("emoji.flag-jp", "\u{1F1EF}\u{1F1F5}"),
-        ("emoji.flag-invalid", "\u{1F1E6}\u{1F1E6}"),
-        (
-            "emoji.flag-england",
-            "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}",
-        ),
-        ("emoji.keycap-1", "1\u{FE0F}\u{20E3}"),
-        ("emoji.keycap-hash", "#\u{FE0F}\u{20E3}"),
-        ("emoji.keycap-bare", "*\u{20E3}"),
-        ("emoji.melting", "\u{1FAE0}"),
-        ("emoji.ascii", "A"),
-    ]
-    .into_iter()
-    .map(|(id, text)| case(id, text))
-    .collect()
+    corpus::EMOJI_CASES
+        .iter()
+        .map(|&(id, text)| case(id, text))
+        .collect()
 }
 
 /// Strings a user feature changes on its own, with no ligature in sight:
@@ -714,10 +680,15 @@ fn reader_lines(l: &Loaded, out: &mut Vec<Line>) {
             answer,
         });
     };
+    // aterm-font's `reader_oracle` replays the `read` lines on every run, over
+    // the instances recorded here; this test answers them only to bless them.
+    let bless = blessing();
     for &index in l.face.indices {
         for coords in reader_instances(&l.bytes, index) {
-            for (query, answer) in reader::read(&l.bytes, index, &coords) {
-                push("read", index, &coords, &query, answer);
+            if bless {
+                for (query, answer) in reader::read(&l.bytes, index, &coords) {
+                    push("read", index, &coords, &query, answer);
+                }
             }
             for (query, answer) in vary_answers(&l.bytes, index, &coords) {
                 push("vary", index, &coords, &query, answer);
@@ -758,7 +729,7 @@ fn font_answers(bytes: &Arc<Vec<u8>>, index: u32) -> Vec<(String, String)> {
         out.push((
             "ligature_gate".to_string(),
             u8::from(aterm_render::ligature_shaping::font_has_ligature_features(
-                bytes,
+                bytes, 0,
             ))
             .to_string(),
         ));
@@ -934,9 +905,11 @@ struct Report {
     unrecorded: BTreeSet<String>,
 }
 
-/// Hold `got` to the committed `want` text. `present` maps each face key this
-/// host loaded to whether the face is committed (`true`) or a system face.
-fn compare(want: &str, got: &[Line], present: &Present) -> Report {
+/// Hold `got` to the committed `want` text, leaving out the recorded lines of
+/// the kinds in `elsewhere` (another test replays them). `present` maps each
+/// face key this host loaded to whether the face is committed (`true`) or a
+/// system face.
+fn compare(want: &str, got: &[Line], present: &Present, elsewhere: &[&str]) -> Report {
     let mut report = Report::default();
     let mut recorded: BTreeMap<String, Line> = BTreeMap::new();
     let mut keys_recorded: BTreeSet<String> = BTreeSet::new();
@@ -945,6 +918,9 @@ fn compare(want: &str, got: &[Line], present: &Present) -> Report {
         .filter(|t| !t.is_empty() && !t.starts_with('#'))
     {
         let line = Line::parse(text).unwrap_or_else(|| panic!("malformed corpus line: {text:?}"));
+        if elsewhere.contains(&line.kind.as_str()) {
+            continue;
+        }
         if !present.contains_key(&line.key) {
             report
                 .skipped
@@ -1001,7 +977,15 @@ const HEADER: &str = "\
 # Digests are FNV-1a 64; an answer over 480 bytes is its digest and length.
 ";
 
-fn finish(name: &str, mut got: Vec<Line>, present: &Present) {
+/// Whether this run re-records the corpus (`ATERM_BLESS_GOLDEN`).
+fn blessing() -> bool {
+    std::env::var_os("ATERM_BLESS_GOLDEN").is_some()
+}
+
+/// Bless `got` into `{name}.txt`, or hold it to that file. The recorded lines
+/// of the kinds in `elsewhere` are answered only by a bless; another test
+/// replays them.
+fn finish(name: &str, mut got: Vec<Line>, present: &Present, elsewhere: &[&str]) {
     let path = format!(
         "{}/tests/fixtures/font-oracle/{name}.txt",
         env!("CARGO_MANIFEST_DIR")
@@ -1017,7 +1001,7 @@ fn finish(name: &str, mut got: Vec<Line>, present: &Present) {
     let want = std::fs::read_to_string(&path)
         .unwrap_or_default()
         .replace("\r\n", "\n");
-    if std::env::var_os("ATERM_BLESS_GOLDEN").is_some() {
+    if blessing() {
         // Keep every line of a face this host does not have.
         for text in want
             .lines()
@@ -1046,7 +1030,7 @@ fn finish(name: &str, mut got: Vec<Line>, present: &Present) {
         !want.is_empty(),
         "missing font oracle corpus {path}; record it with ATERM_BLESS_GOLDEN=1"
     );
-    let report = compare(&want, &got, present);
+    let report = compare(&want, &got, present, elsewhere);
     if !report.skipped.is_empty() || !report.unrecorded.is_empty() {
         eprintln!(
             "font oracle `{name}`: {} answers compared; {} lines skipped for faces this host lacks {:?}; \
@@ -1062,9 +1046,10 @@ fn finish(name: &str, mut got: Vec<Line>, present: &Present) {
         report.moved.len(),
         report.moved.join("\n")
     );
-    // Not vacuous: the committed faces alone answer hundreds of lines.
+    // Not vacuous: the committed faces alone answer about two hundred `font`
+    // and `vary` lines.
     assert!(
-        report.compared >= 500,
+        report.compared >= 200,
         "font oracle `{name}`: only {} answers compared",
         report.compared
     );
@@ -1641,12 +1626,6 @@ fn normalization_is_not_replayed() {
 fn reader_answers_hold() {
     let mut got = Vec::new();
     let present = for_each_face(|l| reader_lines(l, &mut got));
-    // COLR is read from the committed test fonts, so every host checks it.
-    assert!(
-        got.iter().any(|l| l.label == "fixture-colr_1"
-            && l.case.starts_with("colr.")
-            && !l.answer.starts_with("n=0")),
-        "the COLR fixture paints colour glyphs"
-    );
-    finish("reader", got, &present);
+    // The `read` lines are aterm-font's `reader_oracle::reader_corpus_answers_hold`.
+    finish("reader", got, &present, &["read"]);
 }

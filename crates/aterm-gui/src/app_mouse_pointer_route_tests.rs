@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aterm_session::sink::SinkWriter;
-use winit::dpi::PhysicalPosition;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta};
+use aterm_window::dpi::PhysicalPosition;
+use aterm_window::event::{ElementState, MouseButton, MouseScrollDelta};
 
 use super::PointerRoute;
 use crate::input::{InputEvent, PasteFraming, PixelOffset, Source};
@@ -1198,10 +1198,10 @@ fn a_shift_drag_over_a_tracking_program_selects_and_reports_nothing() {
         app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
         move_to(app, wid, (0, 10), 0.0);
         app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
-        app.windows.get_mut(&wid).unwrap().mods = winit::keyboard::ModifiersState::empty();
+        app.windows.get_mut(&wid).unwrap().mods = aterm_window::keyboard::ModifiersState::empty();
     };
 
-    drag(&mut app, winit::keyboard::ModifiersState::SHIFT);
+    drag(&mut app, aterm_window::keyboard::ModifiersState::SHIFT);
     assert_eq!(
         term_lock(&term).selection_to_string().as_deref(),
         Some("SELECTABLE")
@@ -1213,7 +1213,7 @@ fn a_shift_drag_over_a_tracking_program_selects_and_reports_nothing() {
     );
 
     // Control: a plain drag is still the program's.
-    drag(&mut app, winit::keyboard::ModifiersState::empty());
+    drag(&mut app, aterm_window::keyboard::ModifiersState::empty());
     let plain = written_before_marker(&mut app, wid, front, &mut wire);
     assert!(plain.starts_with("\x1b[<0;"), "the plain press: {plain:?}");
 }

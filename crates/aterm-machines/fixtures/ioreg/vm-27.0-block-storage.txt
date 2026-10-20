@@ -1,0 +1,105 @@
++-o AppleVirtIODiskStorageDevice@1  <class AppleVirtIODiskStorageDevice, id 0x1000001f5, registered, matched, active, busy 0 (50 ms), retain 11>
+  | {
+  |   "IOCommandPoolSize" = 256
+  |   "IOMaximumSegmentByteCountWrite" = 4194304
+  |   "IOMaximumSegmentByteCountRead" = 4194304
+  |   "IOUnit" = 1
+  |   "device-type" = "Generic"
+  |   "IOMinimumSaturationByteCount" = 134217728
+  |   "Protocol Characteristics" = {"Physical Interconnect Location"="Internal"}
+  |   "EmbeddedDeviceTypeRoot" = Yes
+  |   "IOMaximumSegmentCountRead" = 254
+  |   "Device Characteristics" = {"Medium Type"="Solid State"}
+  |   "IOStorageFeatures" = {"Barrier"=Yes,"Unmap"=Yes}
+  |   "AvpVirtioBlockDeviceRole" = 1
+  |   "AppleNANDStatus" = "Ready"
+  |   "IOMinimumSegmentAlignmentByteCount" = 4
+  |   "IOMaximumSegmentCountWrite" = 254
+  | }
+  | 
+  +-o IOBlockStorageDriver  <class IOBlockStorageDriver, id 0x1000001f6, registered, matched, active, busy 0 (50 ms), retain 10>
+    | {
+    |   "IOClass" = "IOBlockStorageDriver"
+    |   "CFBundleIdentifier" = "com.apple.iokit.IOStorageFamily"
+    |   "IOProviderClass" = "IOBlockStorageDevice"
+    |   "IOPropertyMatch" = {"device-type"="Generic"}
+    |   "IOPowerManagement" = {"CapabilityFlags"=0,"CurrentPowerState"=0}
+    |   "IOProbeScore" = 0
+    |   "IOMatchedAtBoot" = Yes
+    |   "IOGeneralInterest" = "IOCommand is not serializable"
+    |   "IOMatchCategory" = "IODefaultMatchCategory"
+    |   "Statistics" = {"Operations (Write)"=21836,"Latency Time (Write)"=0,"Bytes (Read)"=2431920128,"Errors (Write)"=0,"Total Time (Read)"=245700050643,"Latency Time (Read)"=0,"Retries (Read)"=0,"Errors (Read)"=0,"Total Time (Write)"=61616735770,"Bytes (Write)"=225632256,"Operations (Read)"=117348,"Retries (Write)"=0}
+    |   "IOPersonalityPublisher" = "com.apple.iokit.IOStorageFamily"
+    |   "CFBundleIdentifierKernel" = "com.apple.iokit.IOStorageFamily"
+    | }
+    | 
+    +-o Apple Inc. VirtIO Block Media  <class IOMedia, id 0x1000001f7, registered, matched, active, busy 0 (50 ms), retain 12>
+        {
+          "Content" = "GUID_partition_scheme"
+          "Removable" = No
+          "Whole" = Yes
+          "Leaf" = No
+          "BSD Name" = "disk0"
+          "Ejectable" = No
+          "Preferred Block Size" = 512
+          "IOMediaIcon" = {"IOBundleResourceFile"="Internal.icns","CFBundleIdentifier"="com.apple.iokit.IOStorageFamily"}
+          "BSD Minor" = 0
+          "IOGeneralInterest" = "IOCommand is not serializable"
+          "Writable" = Yes
+          "BSD Major" = 1
+          "Size" = 90000003072
+          "IOBusyInterest" = "IOCommand is not serializable"
+          "Open" = Yes
+          "Content Hint" = ""
+          "BSD Unit" = 0
+        }
+        
+
++-o IODiskImageBlockStorageDeviceInKernel  <class IODiskImageBlockStorageDeviceInKernel, id 0x1000003af, registered, matched, active, busy 0 (25 ms), retain 6>
+  | {
+  |   "autodiskmount" = No
+  |   "IOMinimumSegmentAlignmentByteCount" = 4
+  |   "Protocol Characteristics" = {"Physical Interconnect"="Virtual Interface"}
+  |   "Device Characteristics" = {"Product Revision Level"="704","Product Name"="Disk Image","Vendor Name"="Apple"}
+  |   "device-type" = "Generic"
+  | }
+  | 
+  +-o IOBlockStorageDriver  <class IOBlockStorageDriver, id 0x1000003b0, registered, matched, active, busy 0 (24 ms), retain 8>
+    | {
+    |   "IOClass" = "IOBlockStorageDriver"
+    |   "CFBundleIdentifier" = "com.apple.iokit.IOStorageFamily"
+    |   "IOProviderClass" = "IOBlockStorageDevice"
+    |   "IOPropertyMatch" = {"device-type"="Generic"}
+    |   "IOPowerManagement" = {"CapabilityFlags"=0,"CurrentPowerState"=0}
+    |   "IOProbeScore" = 0
+    |   "IOMatchedAtBoot" = Yes
+    |   "IOGeneralInterest" = "IOCommand is not serializable"
+    |   "IOMatchCategory" = "IODefaultMatchCategory"
+    |   "Statistics" = {"Operations (Write)"=0,"Latency Time (Write)"=0,"Bytes (Read)"=303616,"Errors (Write)"=0,"Total Time (Read)"=57252389,"Latency Time (Read)"=0,"Retries (Read)"=0,"Errors (Read)"=0,"Total Time (Write)"=0,"Bytes (Write)"=0,"Operations (Read)"=80,"Retries (Write)"=0}
+    |   "IOPersonalityPublisher" = "com.apple.iokit.IOStorageFamily"
+    |   "CFBundleIdentifierKernel" = "com.apple.iokit.IOStorageFamily"
+    | }
+    | 
+    +-o Apple disk image Media  <class IOMedia, id 0x1000003b1, registered, matched, active, busy 0 (24 ms), retain 11>
+        {
+          "Content" = ""
+          "Removable" = Yes
+          "Whole" = Yes
+          "Leaf" = No
+          "BSD Name" = "disk4"
+          "Ejectable" = Yes
+          "Preferred Block Size" = 512
+          "IOMediaIcon" = {"IOBundleResourceFile"="Removable.icns","CFBundleIdentifier"="com.apple.iokit.IOStorageFamily"}
+          "BSD Minor" = 20
+          "IOGeneralInterest" = "IOCommand is not serializable"
+          "Writable" = No
+          "TierType" = "Main"
+          "BSD Major" = 1
+          "Size" = 4194304
+          "IOBusyInterest" = "IOCommand is not serializable"
+          "Open" = Yes
+          "Content Hint" = ""
+          "BSD Unit" = 4
+        }
+        
+

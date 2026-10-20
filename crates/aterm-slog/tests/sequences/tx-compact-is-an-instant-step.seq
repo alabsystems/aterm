@@ -1,0 +1,10 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# S24: a compaction boundary is an instant step of the turn.
+bind 0
+see busy
+tx prompt v1
+tx compact
+expect open p1 compact par=t1 by=vendor
+expect close p1 compact out=ok
+tx end
+expect close t1 turn out=done steps=1

@@ -16,19 +16,28 @@
 //!
 //! Nothing here runs a tool by a `PATH` lookup or through a shell: every child is an
 //! absolute program built by `aterm_uds::spawnfd::command` and bounded by a deadline.
+//!
+//! Inert off unix: the crate drives macOS's own tools over POSIX descriptors, and
+//! crates/aterm links it only on macOS (answering `aterm machines` elsewhere with a
+//! refusal), so a Windows workspace build compiles nothing here.
+
+#![cfg(unix)]
 
 pub mod agent;
+pub mod askpass;
 pub mod baseline;
 pub mod cli;
 pub mod controller;
 pub mod engine;
 pub mod envelope;
 pub mod facts;
+pub mod hardware;
 pub mod items;
 pub mod model;
 pub mod plist;
 pub mod port;
 pub mod protocol;
+pub mod sessions;
 
 /// Where the agent lives on a managed host: root:wheel, nothing below it writable by
 /// anyone else (design §3).

@@ -263,6 +263,8 @@ pub fn request_cmd(paths: &Paths, target: &Target, command: &str) -> Result<Cmd,
 }
 
 /// Run one forced-command request ([`request_cmd`]) on `target`, with `stdin` from a file.
+/// Every request goes over SSH, where the host key pinned under the host's UUID
+/// (`HostKeyAlias`, `StrictHostKeyChecking=yes`) decides who answers.
 ///
 /// # Errors
 /// [`RunFailed`] when ssh did not run to completion, or [`RunFailed::Refused`] before it
@@ -337,6 +339,19 @@ impl Failure {
             Self::NoRoute => "no route to it".into(),
             Self::Unresolved => "its name does not resolve".into(),
             Self::Other(line) => line.clone(),
+        }
+    }
+
+    /// [`Failure::why`] for a command that reaches `address` and no other host: none can show
+    /// the LAN is there, so no route to a local address also names Local Network privacy,
+    /// which fails a connection the same way (design §9).
+    #[must_use]
+    pub fn why_alone(&self, address: &str) -> String {
+        match self {
+            Self::NoRoute if is_local_address(address) => {
+                format!("no route to it; if it is on this network, {LOCAL_NETWORK_ROW}")
+            }
+            other => other.why(),
         }
     }
 }
@@ -771,6 +786,24 @@ Host key verification failed.\r\n";
         for remote in ["8.8.8.8", "2001:db8::1", "lab.example.com", "localnet"] {
             assert!(!is_local_address(remote), "{remote}");
         }
+    }
+
+    #[test]
+    fn one_host_with_no_route_on_the_lan_names_local_network_privacy() {
+        assert!(
+            Failure::NoRoute
+                .why_alone("192.168.64.2")
+                .ends_with(LOCAL_NETWORK_ROW)
+        );
+        // Off the LAN, or any other failure, it is the plain row.
+        assert_eq!(
+            Failure::NoRoute.why_alone("8.8.8.8"),
+            Failure::NoRoute.why()
+        );
+        assert_eq!(
+            Failure::TimedOut.why_alone("192.168.64.2"),
+            Failure::TimedOut.why()
+        );
     }
 
     #[test]

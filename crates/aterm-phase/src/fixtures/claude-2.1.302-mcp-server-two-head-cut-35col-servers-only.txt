@@ -1,0 +1,7 @@
+# claude-code 2.1.302 · DERIVED 2026-10-17 from a MEASURED frame: `aterm ctl text` of a private headless aterm (35x10, aterm 0.106.0) running the real Claude Code (crates/aterm-lab, a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key, a local stub of the API) · the several-server .mcp.json approval dialog (two new servers lab-probe-a and lab-probe-b, both checked, the cursor on the first), the pane resized to 35x10 (`ctl resize 10 35`), with the frame's top three rows (the body's last rows) cut away, as a pane whose top rows scrolled off shows it: no rule and no body row above the server rows, so the widest row above the footer is `Enable selected`'s. Not measured so: 2.1.302's Select shows two server rows only in a pane tall enough to show body rows above them
+
+  ❯ [✔] lab-probe-a
+    [✔] lab-probe-b
+       Enable selected
+ Space to select · Esc to reject
+ all

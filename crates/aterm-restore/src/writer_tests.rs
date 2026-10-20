@@ -24,6 +24,13 @@ fn word_at<S: RegionStore>(w: &JournalWriter<S>, at: usize) -> u64 {
     w.store().load_u64_acquire(at).expect("a header word")
 }
 
+/// Every byte of the writer's region.
+fn region_of<S: RegionStore>(w: &JournalWriter<S>) -> Vec<u8> {
+    let mut bytes = vec![0u8; w.store().len()];
+    w.store().read(0, &mut bytes).expect("the whole region");
+    bytes
+}
+
 fn tail_header(w: &JournalWriter<VecStore>, pos: u64) -> TailHeader {
     let cap = w.geometry().tail_cap as u64;
     let at = w.geometry().tail_off + (pos % cap) as usize;
@@ -65,12 +72,32 @@ fn create_lays_the_header_out_magic_last() {
         JournalWriter::create(VecStore::new(PAGE * 2), geometry, &WRITER),
         Err(WriteError::Layout(_))
     ));
+    let misaligned = Geometry {
+        tail_cap: geometry.tail_cap - 4,
+        ..geometry
+    };
+    assert!(matches!(
+        JournalWriter::create(VecStore::new(geometry.region_len), misaligned, &WRITER),
+        Err(WriteError::Layout(LayoutError::Misaligned))
+    ));
+    // The session id keeps its printable ASCII only.
+    let odd = WriterIdentity {
+        sid: "s 1\u{7}\u{e9}x",
+        ..WRITER
+    };
+    let w =
+        JournalWriter::create(VecStore::new(geometry.region_len), geometry, &odd).expect("created");
+    let mut sid = [0xFF; 4];
+    w.store()
+        .read(crate::layout::OFF_SID, &mut sid)
+        .expect("inside");
+    assert_eq!(&sid, b"s1x\0");
 }
 
 /// The tail ring: records land 8-aligned and in order, the commit and stream words
 /// follow each, the floor moves only onto record boundaries and only when a record would
 /// overwrite bytes above it, and a record that would straddle the ring's end goes to the
-/// start after a PAD.
+/// start after a PAD, a gap of exactly a header's size included.
 #[test]
 fn the_tail_moves_its_floor_onto_boundaries_before_it_overwrites() {
     let mut w = small(96, 4096);
@@ -89,11 +116,61 @@ fn the_tail_moves_its_floor_onto_boundaries_before_it_overwrites() {
     assert_eq!(word_at(&w, OFF_TAIL_FLOOR), 48);
     assert_eq!(tail_header(&w, 72).kind, KIND_PAD);
     assert_eq!(tail_header(&w, 72).record_len(), 24);
+    // With no keyframe committed, a settle has nothing to settle: the bytes below the
+    // floor stay as they are.
+    let before = region_of(&w);
+    w.settle_clear().expect("nothing to do");
+    assert!(region_of(&w) == before, "no byte changed");
     let moved = tail_header(&w, 96);
     assert_eq!(
         (moved.kind, moved.payload_len, moved.stream_end),
         (KIND_BYTES, 24, 39)
     );
+    // A gap of exactly a header gets its PAD too: the reader skips only a gap under a
+    // header, and reads these 16 bytes, here the last lap's payload, as a record.
+    let mut exact = small(96, 4096);
+    for _ in 0..3 {
+        exact.append_slice(b"0123456789abcdef").expect("[0, 96)"); // 32 bytes each
+    }
+    for _ in 0..2 {
+        exact
+            .append_slice(b"0123456789abcdefghij")
+            .expect("[96, 176)"); // 40 bytes each
+    }
+    exact
+        .append_slice(b"tailend")
+        .expect("a PAD, then [192, 216)");
+    let pad = tail_header(&exact, 176);
+    assert_eq!((pad.kind, pad.record_len()), (KIND_PAD, 16));
+    // Its one byte of padding is zeroed, not left as the last lap's payload.
+    let mut padding = [0xFF];
+    exact
+        .store()
+        .read(exact.geometry().tail_off + 23, &mut padding)
+        .expect("inside");
+    assert_eq!(padding, [0]);
+    // A gap under a header holds no PAD, and nothing lands past the ring's end. The
+    // record goes to the start over the last lap's payload, its 7 bytes of padding zeroed.
+    let mut short = small(96, 4096);
+    for bytes in [&b"abcdefgh"[..], b"0123456789abcdef", b"0123456789abcdef"] {
+        short.append_slice(bytes).expect("[0, 88)"); // 24, 32 and 32 bytes
+    }
+    let past_end = short.geometry().tail_off + 96;
+    let mut past = [0u8; 8];
+    short.store().read(past_end, &mut past).expect("inside");
+    short
+        .append_slice(b"t")
+        .expect("an 8-byte gap, then [96, 120)");
+    assert_eq!(short.tail_commit(), 120);
+    let mut after = [0xFF; 8];
+    short.store().read(past_end, &mut after).expect("inside");
+    assert_eq!(after, past, "the bytes past the ring are as they were");
+    let mut padding = [0xFF; 7];
+    short
+        .store()
+        .read(short.geometry().tail_off + 17, &mut padding)
+        .expect("inside");
+    assert_eq!(padding, [0; 7]);
     // Synthesized bytes are journaled but add nothing to the stream.
     w.append_synthesized(b"\x1bc").expect("five");
     assert_eq!(w.stream_processed(), 39);
@@ -102,6 +179,20 @@ fn the_tail_moves_its_floor_onto_boundaries_before_it_overwrites() {
     big.append_slice(&[b'x'; 100]).expect("split");
     assert_eq!(big.stream_processed(), 100);
     assert!(big.tail_floor() > 0);
+    // In a full-size ring, at MAX_BYTES_PAYLOAD a record.
+    let v1 = Geometry::v1();
+    let mut full = JournalWriter::create(VecStore::new(v1.region_len), v1, &WRITER).expect("c");
+    full.append_slice(&vec![b'x'; MAX_BYTES_PAYLOAD + 1])
+        .expect("split");
+    let two = 2 * TAIL_RECORD_HEADER + MAX_BYTES_PAYLOAD + 8;
+    assert_eq!(full.tail_commit(), two as u64);
+    // A record larger than the whole ring is refused, and nothing is stored.
+    let mut least = small(24, 4096);
+    assert_eq!(
+        least.append_resize(4, 20, ResizePolicy::Native, 1, 1),
+        Err(WriteError::TooLarge { len: 40, cap: 24 })
+    );
+    assert_eq!(least.tail_commit(), 0);
 }
 
 /// Keyframes alternate between the slots by sequence parity; a begun keyframe zeroes its
@@ -166,6 +257,54 @@ fn keyframes_alternate_slots_and_publish_last() {
     ));
     assert!(!tiny.keyframe_in_progress());
     assert_eq!(word_at(&tiny, kf_commit_word(1)), 0, "nothing stored");
+
+    // A keyframe exactly a slot's size fits it, and a restore reads it.
+    let (fit, len) = (0..64u8)
+        .find_map(|n| {
+            let mut t = Terminal::new(4, 20);
+            t.process(&(0..n).map(|k| b'a' + k % 26).collect::<Vec<_>>());
+            let mut w = small(4096, 4096);
+            keyframe_of(&mut w, &t, 0);
+            let len = word_at(&w, kf_len_word(1)) as usize;
+            len.is_multiple_of(8).then_some((t, len))
+        })
+        .expect("a keyframe a multiple of 8 long");
+    let geometry = Geometry::custom(len, 4096, 4096).expect("a slot of its size");
+    let mut exact =
+        JournalWriter::create(VecStore::new(geometry.region_len), geometry, &WRITER).expect("c");
+    assert_eq!(keyframe_of(&mut exact, &fit, 0), 1);
+    let restored = crate::recover::recover(
+        exact.store(),
+        crate::recover::RecoverPolicy {
+            tail: true,
+            config_fp: 1,
+            scratch_nonce: [0xA5; 32],
+        },
+        Terminal::new,
+    );
+    assert!(
+        matches!(restored, crate::recover::Recovery::Restored(ref r) if r.slot == 1),
+        "{restored:?}"
+    );
+
+    // A settle while a keyframe is being written leaves every byte as it was, the slot
+    // being written included (its older keyframe's bytes stay until the copy).
+    let mut busy = small(4096, 4096);
+    for _ in 0..2 {
+        busy.write_keyframe(&ki).expect("committed");
+    }
+    assert_eq!(busy.begin_keyframe(&ki), Ok(3), "in slot 1, over seq 1");
+    let before = region_of(&busy);
+    busy.settle_clear().expect("nothing to do");
+    assert!(region_of(&busy) == before, "no byte changed");
+    // A record appended between a keyframe's begin and its finish, which the writer
+    // accepts, lies past that keyframe's tail_from: it is tail since the keyframe, and a
+    // settle's floor stays below it.
+    busy.append_slice(b"after the capture").expect("appended");
+    assert_eq!(busy.finish_keyframe(), Ok(3));
+    assert_eq!(busy.tail_since_keyframe(), busy.tail_commit());
+    busy.settle_clear().expect("settled");
+    assert_eq!(busy.tail_floor(), 0, "the keyframe's tail_from");
 }
 
 /// The history ring: chunks are dense steps whose run the words bound; a chunk that would
@@ -184,11 +323,39 @@ fn the_history_ring_wraps_evicts_and_clears() {
         .expect("reset");
     let mut row = fence.oldest;
     let mut seqs = Vec::new();
-    while row + 8 <= fence.end {
-        let lines = t.history_lines_since_fence(&fence, row, 8).expect("holds");
+    // Chunks of 8, 3 and 5 lines, so the laps do not line up and a gap falls over an
+    // earlier lap's chunk.
+    let to_end = |w: &JournalWriter<VecStore>, hi: u64| {
+        let at = (hi % 1024) as usize;
+        let mut bytes = vec![0xFF; 1024 - at];
+        w.store()
+            .read(w.geometry().hist_off + at, &mut bytes)
+            .expect("inside");
+        bytes
+    };
+    let mut stale_gaps = 0;
+    for take in [8, 3, 5].into_iter().cycle() {
+        if row + 8 > fence.end {
+            break;
+        }
+        let lines = t
+            .history_lines_since_fence(&fence, row, take)
+            .expect("holds");
+        let hi = w.history.hi;
+        let before = to_end(&w, hi);
         seqs.push(w.append_history(row, &lines).expect("fits"));
         row += lines.len() as u64;
+        if (w.history.hi - 1) / 1024 > hi / 1024 {
+            // It straddled the ring's end: the gap before it is zeroed, and touched.
+            assert!(
+                to_end(&w, hi).iter().all(|b| *b == 0),
+                "a zeroed gap at {hi}"
+            );
+            assert_eq!(w.history.touched(), 1024);
+            stale_gaps += usize::from(before.iter().any(|b| *b != 0));
+        }
     }
+    assert!(stale_gaps > 0, "premise: a gap over an earlier lap's chunk");
     assert!(seqs.windows(2).all(|p| p[1] == p[0] + 1), "dense steps");
     let lo = word_at(&w, OFF_HIST_LO);
     let hi = word_at(&w, OFF_HIST_HI);
@@ -219,6 +386,37 @@ fn the_history_ring_wraps_evicts_and_clears() {
         w.append_history(fence.oldest, &lines),
         Err(WriteError::TooLarge { .. })
     ));
+    // A reset's modulus is a multiple of 8, and never past the physical ring.
+    w.reset_history(cleared, row, 1023, false)
+        .expect("an odd cap");
+    assert_eq!(w.history.cap(), 1016);
+    w.reset_history(cleared, row, 4096, false)
+        .expect("a cap past the ring");
+    assert_eq!((w.history.cap(), word_at(&w, OFF_HIST_CAP)), (1024, 1024));
+
+    // A chunk exactly the ring's size fits it; one exactly filling the room left to the
+    // ring's end lands there, with no gap and nothing evicted.
+    let (lines, len) = (1..64usize)
+        .find_map(|n| {
+            let text: String = (0..n).map(|k| char::from(b'a' + (k % 26) as u8)).collect();
+            let lines = vec![Line::from(text.as_str())];
+            let len = encode_history_chunk(0, 0, identity, &lines)
+                .expect("encodes")
+                .len();
+            len.is_multiple_of(8).then_some((lines, len))
+        })
+        .expect("a chunk a multiple of 8 long");
+    let mut fit = small(4096, 1024);
+    fit.reset_history(identity, 0, len, false).expect("reset");
+    assert_eq!(fit.append_history(0, &lines), Ok(0), "the whole ring");
+    fit.reset_history(identity, 1, 2 * len, false)
+        .expect("twice the modulus: the run starts halfway");
+    assert_eq!(fit.append_history(1, &lines), Ok(1), "the room left");
+    let len = len as u64;
+    assert_eq!(
+        (word_at(&fit, OFF_HIST_LO), word_at(&fit, OFF_HIST_HI)),
+        (len, 2 * len)
+    );
 }
 
 /// The words other threads own go through free functions over the store.
@@ -531,6 +729,11 @@ fn the_settle_keeps_a_record_behind_a_pad() {
         Terminal::from_checkpoint(&r.checkpoint).row_text(1),
         t.row_text(1)
     );
+    // A record ending exactly one lap above the floor overwrites nothing the floor
+    // guards: the floor stays on tail_from, not on the record behind the PAD.
+    w.append_slice(b"0123456789abcdef")
+        .expect("[136, 168), over [40, 72)");
+    assert_eq!(w.tail_floor(), 72);
 }
 
 /// The adaptive cap (the plan's §2.6): a line limit at the corpus's rate with a quarter to
@@ -606,6 +809,34 @@ fn the_ring_writer_stands_apart_from_the_journal_writer() {
     let per_line = ring.bytes_per_line().expect("lines");
     assert!(per_line > 0 && per_line < 200, "{per_line}");
     assert!(ring.touched() > 0 && ring.touched() <= 8192);
+    // The first chunk after a reset, straddling the new modulus's end, starts the run past
+    // the gap: the run's first word, and its bytes a line, count the chunk alone.
+    let lines = t
+        .history_lines_since_fence(&fence, fence.oldest, 4)
+        .expect("holds");
+    let fresh = small(4096, 8192);
+    let mut ring = HistoryWriter::new(fresh.geometry());
+    ring.reset_ring(fresh.store(), identity, 0, 8192, false)
+        .expect("reset");
+    ring.append_chunk(fresh.store(), 0, &lines).expect("fits");
+    let modulus = (ring.hi as usize).next_multiple_of(8) + 8;
+    ring.reset_ring(fresh.store(), identity, 4, modulus, false)
+        .expect("a modulus just past the run");
+    ring.append_chunk(fresh.store(), 4, &lines)
+        .expect("after the gap");
+    let len = ring.hi - modulus as u64;
+    assert_eq!(word_at(&fresh, OFF_HIST_LO), modulus as u64);
+    assert_eq!(ring.bytes_per_line(), Some(len.div_ceil(4)));
+    // The next straddles too and evicts the whole run: the run starts past its gap, at
+    // that chunk alone.
+    ring.append_chunk(fresh.store(), 8, &lines)
+        .expect("after the gap");
+    let start = 2 * modulus as u64;
+    assert_eq!(
+        (word_at(&fresh, OFF_HIST_LO), ring.first_row()),
+        (start, Some(8))
+    );
+    assert_eq!(ring.bytes_per_line(), Some((ring.hi - start).div_ceil(4)));
     // The tail goes on beside it, through the journal writer.
     w.append_slice(b"the tail, beside the ring")
         .expect("appended");

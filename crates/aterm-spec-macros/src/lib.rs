@@ -110,6 +110,12 @@ fn anchor_const(kind: &str, suffix: Option<&str>, fn_ident: &Ident) -> Result<Id
 // that cfg is off the ATTRIBUTE ITSELF is stripped, this macro never runs, and no probe
 // exists to optimize away.
 //
+// WHERE THESE RUN. `aterm_spec_anchor` re-exports these emitters only where Cargo
+// resolved them (a stock compiler, Trust's lint driver). In Trust's build, test, check,
+// doc and verified lanes the anchors are that crate's `macro_rules!` attributes
+// (src/attrs.rs), which emit the same records; its tests/attrs.rs runs this crate's
+// suite (tests/anchors/suite.rs) on them and pins the same digest.
+//
 // BEHAVIOUR. The injection is a statement prepended inside the existing block, so the
 // fn's signature, generics, receiver (including `self` by value), return type and
 // tail expression are untouched; an early `return`, a `?`, a recursive call and a

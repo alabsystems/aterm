@@ -1,6 +1,6 @@
 [package]
 name = "astream-aead"
-description = "astream AEAD wire: XChaCha20-Poly1305 seal/open over a pre-shared key, and a transparent ordered-record SealedStream (a per-connection hello handshake; every record's AAD binds both hellos, the direction, and the sequence) so the broker's Frame protocol runs confidential + authenticated over TCP. Wraps the vetted RustCrypto chacha20poly1305 (an IETF-standard AEAD) -- never a hand-rolled cipher/MAC -- the AEAD half of 'SSH' the capability mint (astream-cap) does not cover. This is the ONE crate that pulls a cipher dependency; the substrate stays zero-third-party."
+description = "astream AEAD wire: XChaCha20-Poly1305 seal/open over a pre-shared key, and a transparent ordered-record SealedStream (a per-connection hello handshake; every record's AAD binds both hellos, the direction, and the sequence) so the broker's Frame protocol runs confidential + authenticated over TCP. The cipher and MAC are ring's ChaCha20-Poly1305 (RFC 8439) -- never a hand-rolled cipher/MAC; only the HChaCha20 subkey derivation that extends its nonce to 192 bits (draft-irtf-cfrg-xchacha-03) is computed in-crate. The AEAD half of 'SSH' the capability mint (astream-cap) does not cover. This is the ONE crate that pulls a cipher dependency; the substrate stays zero-third-party."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,13 +8,25 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
-# The vetted, IETF-standard AEAD (RustCrypto). This crate is the deliberate,
-# isolated cipher-dependency boundary of the workspace.
-# forbid(unsafe) applies to THIS crate's own code (the dep may use SIMD unsafe).
 [dependencies]
-chacha20poly1305 = { version = "0.10", default-features = false }
+# The vetted, IETF-standard AEAD: ring's ChaCha20-Poly1305 (RFC 8439), the same ring
+# 0.17 aterm already ships under rustls. XChaCha20-Poly1305 is that AEAD under a
+# per-message subkey; the subkey's derivation, HChaCha20 (draft-irtf-cfrg-xchacha-03
+# §2.2), is the one part this crate computes itself (src/hchacha.rs: the ChaCha rounds
+# on 32-bit words, constant-time by construction). The wire is byte-identical to the
+# RustCrypto chacha20poly1305 this replaced (tests/recorded.rs). This crate is the
+# deliberate, isolated cipher-dependency boundary of the workspace.
+# forbid(unsafe) applies to THIS crate's own code (ring uses assembly and unsafe).
+ring = { version = "0.17.14", default-features = false }
+# Wipes the subkey and HChaCha20's working state, and the pre-shared key a
+# SealedStream holds, on drop.
+zeroize = { version = "1.5", default-features = false }
 getrandom = "0.2"
-# Rung 7 handshake, behind the `handshake` feature (off by default). We OWN the
+# Rung 7 handshake, behind the `handshake` feature (off by default). It stays on
+# x25519-dalek although the AEAD moved to ring: ring builds an X25519 secret only from
+# its own RNG, never from bytes, and the handshake seeds its ephemeral from getrandom's
+# bytes (handshake.rs `ephemeral`). Nothing in aterm can enable this feature or
+# `identity`. We OWN the
 # protocol, the transcript binding, and HMAC/HKDF-SHA256 (composed here over the
 # workspace's own SHA-256, astream-digest, like astream-cap owns its HMAC). The ONE
 # thing we delegate is

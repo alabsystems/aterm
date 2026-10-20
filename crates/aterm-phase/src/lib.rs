@@ -71,13 +71,6 @@
 //! (the measurements are in the doc comments and the tests); the fixtures
 //! under [`prompt::fixtures`] are the screens those sessions showed, each
 //! newer one with its program, version and provenance on its first line.
-#![cfg_attr(
-    test,
-    allow(
-        clippy::disallowed_types,
-        reason = "test code: a stand-in child may inherit descriptors"
-    )
-)]
 
 pub mod agy;
 pub mod anchors;
@@ -85,6 +78,7 @@ pub mod autocompact;
 pub mod credits;
 pub mod disk_full;
 pub mod gemini;
+pub mod login;
 pub mod muse;
 pub mod panel;
 pub mod phase;
@@ -98,14 +92,22 @@ pub mod turn;
 pub mod wall;
 mod wrap;
 
+#[cfg(test)]
+#[path = "../tests/support/vendor_drift.rs"]
+mod vendor_drift;
+#[cfg(all(test, unix))]
+#[path = "../tests/support/vendor_files.rs"]
+mod vendor_files;
+
 pub use anchors::{ANCHORS, anchor, anchor_text};
 pub use autocompact::{Offer, OfferFocus};
+pub use login::{LoginMethod, LoginScreen, Picker as LoginPicker, login_interrupted, login_screen};
 pub use panel::{
     PanelRenderer, SettingsPanel, panel_tail, settings_panel, usage_tab_mark, usage_unsettled,
 };
 pub use phase::{
     Phase, background_only, busy_signal, busy_zone_start, context_left, limit_notice, notice_reset,
-    transcript_end, worker_phase,
+    opened_by_own_wake, shells_running, transcript_end, turn_over_background, worker_phase,
 };
 pub use prompt::{
     Opt, Origin, PromptKind, PromptV2, Role, footer_keys, parse_prompt, parse_prompt_v2,
@@ -121,18 +123,18 @@ pub use reader::{
     may_host_agent, program_of, read, read_at,
 };
 pub use reset::{
-    ConfirmRead, ResetConfirm, ResetLine, ResetPending, ResetRow, reset_confirm, reset_limit_name,
-    reset_line, reset_pending, reset_row, spends_reset,
+    ConfirmRead, ResetConfirm, ResetKind, ResetLine, ResetPending, ResetRow, is_confirm_title,
+    reset_confirm, reset_limit_name, reset_line, reset_pending, reset_row, spends_reset,
 };
 pub use survey::{SurveyBlock, SurveyKind, survey_block};
 pub use turn::{
-    CardPlace, LaunchCard, continuation_suggestion, goal_active, idle_compacted, interrupted,
-    launch_card, launch_card_held, launch_card_place, launch_card_scan, launch_card_unmoved,
-    launch_card_version, launch_card_words, said_tail,
+    CardPlace, LaunchCard, answered_prompt, continuation_suggestion, goal_active, idle_compacted,
+    interrupted, launch_card, launch_card_held, launch_card_place, launch_card_scan,
+    launch_card_unmoved, launch_card_version, launch_card_words, said_tail,
 };
 pub use wall::{
-    ApiCause, AutoContinue, Placement, SinceLimit, Wall, WallKind, auto_continue_end,
-    auto_continue_toast, classify_wall, left_wall, login_expires_in, login_restored,
-    memory_banner_head, since_limit, wall,
+    ApiCause, AutoContinue, Placement, SinceLimit, Wall, WallKind, WordsAbove, auto_continue_end,
+    auto_continue_toast, classify_wall, left_wall, limit_words_above, login_expires_in,
+    login_restored, memory_banner_head, since_limit, wall,
 };
 pub use wrap::line_start;

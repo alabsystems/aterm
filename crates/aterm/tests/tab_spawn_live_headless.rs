@@ -260,6 +260,23 @@ fn a_wire_spawns_identity_is_refused_on_the_spawner_not_in_the_turn() {
     let (_, boot_sid) = boot_session(&inst);
     let reply = held_round(&inst, &boot_sid, &["spawn", "identity=worker"]);
     let worker = named_sid(&reply).to_string();
+    // The identity's primer files are written by a re-prime pass its spawn
+    // handed off before replying; a removal racing that pass can find a folder
+    // still filling, or see it remade. Remove it once no pass is writing.
+    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    loop {
+        let metrics = ctl_ok(&inst, &["metrics"]);
+        match field(&metrics, "identity_primes_running") {
+            Some("0") => break,
+            Some(_) => {}
+            None => panic!("metrics names no identity_primes_running=: {metrics}"),
+        }
+        assert!(
+            Instant::now() < give_up,
+            "the worker's prime never finished: {metrics}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     std::fs::remove_dir_all(inst.tmp.join("state/identities/worker"))
         .expect("the worker's identity, made by its spawn");
 

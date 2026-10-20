@@ -24,7 +24,18 @@ pub(crate) struct InputMark {
     verb: InputVerb,
     cause: Option<aterm_slog::ShortId>,
     turn: bool,
+    /// What the input says it means for the box it dismisses (`act=`,
+    /// ruling T1), and what the agent's tracker held when it was admitted.
+    act: Option<aterm_slog::ActWord>,
+    admission: Option<aterm_slog::Admission>,
     accepted: Arc<AtomicBool>,
+    /// Informational credit captured at admission. Owns only the existing leaf,
+    /// SID and caller, not a session, input payload or permission to write.
+    typist: Option<(
+        crate::typed_by::TypedStamp,
+        aterm_session::SessionId,
+        Arc<crate::typed_by::Caller>,
+    )>,
 }
 
 impl std::fmt::Debug for InputMark {
@@ -54,13 +65,13 @@ impl InputMark {
         cause: Option<aterm_slog::ShortId>,
         turn: bool,
     ) -> Self {
-        let epoch = ctx
-            .timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .slog()
-            .log()
-            .ep();
+        // THE ADMISSION (ruling T1): the step the input may dismiss is the
+        // one open now, under the lock taken before a byte is written.
+        let (epoch, admission) = {
+            let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            let slog = timeline.slog();
+            (slog.log().ep(), slog.admit_input(slog.now()))
+        };
         Self {
             timeline: Arc::downgrade(&ctx.timeline),
             subscribers: subscribers.map(Arc::downgrade),
@@ -70,14 +81,35 @@ impl InputMark {
             verb,
             cause,
             turn,
+            act: None,
+            admission,
             accepted: Arc::new(AtomicBool::new(false)),
+            typist: None,
         }
+    }
+
+    /// The input's `act=` (ruling T1): what it means for the box it
+    /// dismisses, read only from a proven author.
+    pub(crate) fn acting(mut self, act: Option<aterm_slog::ActWord>) -> Self {
+        self.act = act;
+        self
     }
 
     /// The request read this before validating its cause. A reset at any later
     /// point makes its eventual diagnostic observation ineligible, not retargeted.
     pub(crate) fn within_epoch(mut self, epoch: Option<u32>) -> Self {
         self.epoch = epoch;
+        self
+    }
+
+    /// The already admitted connection's caller, carried with this exact event.
+    /// An unrun, empty, refused, old-epoch or duplicate completion never credits it.
+    pub(crate) fn typed_by(
+        mut self,
+        ctx: &SessionCtx,
+        caller: Option<Arc<crate::typed_by::Caller>>,
+    ) -> Self {
+        self.typist = caller.map(|by| (ctx.typed.clone(), ctx.self_id.clone(), by));
         self
     }
 
@@ -124,20 +156,37 @@ impl InputCompletion {
                 return;
             }
             let at = timeline.slog().now();
+            let bound = timeline.slog_mut().ctl_accepted(
+                self.mark.actor,
+                self.mark.act,
+                self.mark.admission,
+                at,
+            );
+            let acted = crate::session_log::InputAct::of_acceptance(self.mark.act, bound);
             if self.mark.turn {
                 timeline.slog_mut().ctl_input_mark(
                     self.mark.actor,
                     self.mark.verb,
                     self.mark.cause,
+                    acted,
                     at,
                 );
             } else {
-                timeline
-                    .slog_mut()
-                    .ctl_input(self.mark.actor, self.mark.verb, self.mark.cause, at);
+                timeline.slog_mut().ctl_input(
+                    self.mark.actor,
+                    self.mark.verb,
+                    self.mark.cause,
+                    acted,
+                    at,
+                );
             }
             timeline.slog_take_wake()
         };
+        // Credit only after the same nonempty/epoch/once gate as the log, and
+        // outside its leaf lock. Queue admission and a wire reply never come here.
+        if let Some((stamp, session, caller)) = self.mark.typist {
+            stamp.record(&session, caller);
+        }
         // The timeline is a leaf; subscribers are reached after releasing it.
         if owed
             && let Some(subscribers) = self.mark.subscribers.and_then(|s| s.upgrade())

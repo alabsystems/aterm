@@ -227,6 +227,7 @@ fn every_signpost_spells_a_command_the_trust_tool_accepts() {
 
 /// A second `lay` may be in flight: its `.<name>.stub-<pid>` temp and the
 /// marker file are dotfiles, and dotfiles are never swept.
+#[cfg(unix)]
 #[test]
 fn the_sweep_never_touches_dotfiles() {
     let l = layout("dotfiles");
@@ -345,6 +346,7 @@ fn a_second_lay_writes_nothing() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
+#[cfg(unix)]
 #[test]
 fn lay_claims_absent_and_own_files_never_foreign_ones_and_remove_all_sweeps_only_ours() {
     let l = layout("lay");

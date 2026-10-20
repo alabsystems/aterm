@@ -40,6 +40,19 @@ pub type StdCommand = std::process::Command;
 pub type Command = StdCommand;
 pub use std::process::{Child, Stdio};
 
+/// `spawn`, tried once: the refusal the Unix module tries again for a second (Linux's
+/// `ETXTBSY`, an exec of a program something still holds open for writing) is not one a
+/// Windows `CreateProcessW` gives, so a spawn site shared with Unix (atpkg's warm) is
+/// spelled the same here.
+///
+/// # Errors
+/// What `spawn` answered.
+pub fn spawn_past_text_busy<T>(
+    mut spawn: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    spawn()
+}
+
 /// The Unix strip's trait, a no-op here (the module docs say why).
 pub trait InheritNothing {
     /// Nothing to install off Unix.

@@ -114,6 +114,7 @@ fn complete_entry(store: &Path, identity: &Identity, exe: &[u8]) -> Complete {
         macho_sha256: artifact::macho_sha256(&app).unwrap(),
         bundle_digest: artifact::bundle_digest(&app).unwrap(),
         slices: Vec::new(),
+        index_hint: None,
     };
     fs::write(
         dir.join(artifact::COMPLETE_FILE),

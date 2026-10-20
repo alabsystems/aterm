@@ -30,6 +30,13 @@ impl FabricSession for crate::SessionCtx {
             .record(kind, payload);
     }
 
+    fn record_fact(&self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
+        self.timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record_fact(kind, payload, fact)
+    }
+
     fn fabric_changed(&self) {
         crate::presence::post_fabric_changed(&self.self_id);
     }
@@ -73,6 +80,17 @@ impl Timeline for crate::session_timeline::SessionTimeline {
     fn record(&mut self, kind: &'static str, payload: String) {
         crate::session_timeline::SessionTimeline::record(self, kind, payload);
     }
+
+    /// THE ONE FABRIC HOOK (session log phase 3B, addendum A14): the timeline
+    /// row and the session log's typed mark in this one hold, then whether
+    /// the log's readers are owed a wake, which the fabric gives once its
+    /// lock is released.
+    fn record_fact(&mut self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
+        crate::session_timeline::SessionTimeline::record(self, kind, payload);
+        let at = self.slog().now();
+        self.slog_mut().observe_fabric(fact, at);
+        self.slog_take_wake()
+    }
 }
 
 /// [`aterm_gui_fabric::with_link_reset`], resetting the launcher's supervisor
@@ -93,7 +111,7 @@ pub(crate) fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
 /// A copy of aterm-gui-fabric's own: there it is `cfg(test)`, because the hang
 /// detector it waits under (`aterm_spec::wait`) is only that crate's
 /// dev-dependency, so it cannot be exported to these tests.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn assert_parked_on_the_fence(
     fabric: &SessionFabric,
     before: u64,

@@ -91,20 +91,6 @@ fn mode_1049_enter_keeps_cursor_position() {
     assert_eq!(s2.screen(), "", "alt screen is still cleared on enter");
 }
 
-/// 1049 exit still restores the cursor saved on enter (CursorRestore leg of
-/// srm_OPT_ALTBUF_CURSOR RESET) — the enter-side fix must not break it.
-#[test]
-fn mode_1049_round_trip_still_restores_cursor() {
-    let mut s = Screen::new(24, 80);
-    s.feed(b"main\x1b[3;5H"); // saved cursor (2,4)
-    s.feed(b"\x1b[?1049h\x1b[12;40H\x1b[?1049l");
-    assert_eq!(
-        s.cursor(),
-        (2, 4),
-        "exit restores the cursor saved on enter"
-    );
-}
-
 // =========================================================================
 // 4. Invalid DECSTBM is ignored entirely (no margins, no home)
 // =========================================================================

@@ -632,6 +632,68 @@ fn a_walk_cut_short_is_said_on_the_glass() {
     );
 }
 
+/// A directory whose stamp was RACY at the walk (changed under [`RACY_DIR`] before it, after it,
+/// or at a time that cannot be read) is listed again by `moved`, and moves when its entries are
+/// not the walk's, though its stamp is unchanged: Linux stamps a directory from its coarse clock,
+/// and an ext4 directory's size does not move for a new file, so a file made in the walk's tick
+/// changed nothing `stat` says (measured on the Linux lane). A settled stamp is never listed.
+/// NEGATIVE CONTROL: with the stamp alone (the old check), the racy directory's new entry is
+/// unseen.
+#[test]
+fn a_racy_directory_is_listed_again_and_a_settled_one_is_not() {
+    let walked = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    let stamp = |secs_before: u64| Stamp {
+        len: 4096,
+        mtime: Some(walked - std::time::Duration::from_secs(secs_before)),
+        id: None,
+    };
+    let path = PathBuf::from("/s/subagents");
+    let racy = DirSeen::at(path.clone(), Some(stamp(1)), 3, walked);
+    assert_eq!(racy.racy, Some(3), "changed a second before the walk");
+    let settled = DirSeen::at(path.clone(), Some(stamp(3)), 3, walked);
+    assert_eq!(settled.racy, None, "changed three seconds before the walk");
+    let later = Stamp {
+        mtime: Some(walked + std::time::Duration::from_millis(5)),
+        ..stamp(0)
+    };
+    assert_eq!(
+        DirSeen::at(path.clone(), Some(later), 3, walked).racy,
+        Some(3),
+        "after it"
+    );
+    let timeless = Stamp {
+        mtime: None,
+        ..stamp(0)
+    };
+    assert_eq!(
+        DirSeen::at(path.clone(), Some(timeless), 3, walked).racy,
+        Some(3),
+        "no time"
+    );
+    assert_eq!(DirSeen::at(path, None, 0, walked).racy, None, "not there");
+
+    // The same stamp now: a racy directory moves by its entries, a settled one never asks.
+    assert!(
+        dir_moved(&racy, racy.stamp, || Some(4)),
+        "a new entry in the walk's tick"
+    );
+    assert!(
+        !dir_moved(&racy, racy.stamp, || Some(3)),
+        "the walk's own entries"
+    );
+    assert!(dir_moved(&racy, racy.stamp, || None), "gone since");
+    assert!(
+        !dir_moved(&settled, settled.stamp, || panic!(
+            "a settled stamp is never listed"
+        )),
+        "settled"
+    );
+    assert!(
+        dir_moved(&settled, Some(stamp(0)), || None),
+        "a stamp that moved"
+    );
+}
+
 /// What a refresh now could find is known from a few `stat`s: the fold behind with progress to
 /// make, the transcript, a new file in the subagent directory, or a running subagent's file growing
 /// (the main transcript can sit still for minutes while its subagents spend). A fold behind whose
@@ -764,7 +826,8 @@ fn a_spent_budget_opens_no_more_files() {
     assert!(r.complete(), "{r:?}");
     assert_eq!(
         session.total_fold().per_model()["claude-haiku-4-5"].output,
-        30 + 7000 + 1,
+        // The locked file's turn too, where one was made.
+        30 + 7000 + u64::from(cfg!(unix)),
         "admitted once there was budget to open it"
     );
 }
@@ -852,6 +915,25 @@ fn a_quiet_subagent_keeps_only_its_totals() {
     );
 }
 
+/// Date the directory `dir` an hour back: the next entry made in it moves its
+/// mtime to now whatever tick the file system dates by (NTFS can date the
+/// walk's look and a file made just after it alike).
+fn date_dir_back(dir: &Path) {
+    let mut open = fs::OpenOptions::new();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // FILE_WRITE_ATTRIBUTES, and FILE_FLAG_BACKUP_SEMANTICS: a directory
+        // opens only with it.
+        open.access_mode(0x0100).custom_flags(0x0200_0000);
+    }
+    #[cfg(not(windows))]
+    open.read(true);
+    let f = open.open(dir).expect("open the directory");
+    f.set_modified(SystemTime::now() - std::time::Duration::from_secs(3600))
+        .expect("mtime");
+}
+
 /// A subagent file's directory can appear at any depth: the vendor writes
 /// 97 % of them under `subagents/workflows/<run>/`. `moved` stats every
 /// directory the walk looked at — `subagents/` itself before it exists — so a
@@ -868,6 +950,7 @@ fn moved_sees_a_new_file_at_any_depth() {
     let run = subs.join("workflows").join("run-1");
     fs::create_dir_all(&run).expect("dirs");
     assert!(session.moved(), "subagents/ appeared");
+    date_dir_back(&run);
     session.refresh(BIG);
     assert!(!session.moved());
     append(
@@ -884,6 +967,7 @@ fn moved_sees_a_new_file_at_any_depth() {
             &row(&format!("w{i}"), "claude-haiku-4-5", 1, 5),
         );
     }
+    date_dir_back(&run);
     session.refresh(BIG);
     assert!(!session.moved());
     append(

@@ -1,0 +1,21 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# §2.4: unknown is never idle: it disarms the settle and the turn stays.
+see busy
+see idle
+half
+see unknown fixture=claude-2.1.283-launch-before-repl
+expect wake=none
+half
+half
+half
+half
+half
+half
+half
+half
+half
+half
+expect turn=open
+see -
+expect open t1 turn
+expect close t1 turn out=gone dur_ms=5500

@@ -351,9 +351,11 @@ impl Scrollback {
                 // refusing the blank block itself (its LZ4 step failing on
                 // a page of empty lines): then the rows leave the
                 // middle after all, the renumbering above, with no epoch bump.
+                // Kept, the blank page is marked LOST: the budget evicting it
+                // later must not count these lines a second time.
                 let kept = self.cold.line_count() > 0 && {
                     let blank = super::tier::WarmBlock::from_lines(&vec![Line::default(); lost]);
-                    self.cold.push_block(&blank) != 0
+                    self.cold.push_lost_block(&blank) != 0
                 };
                 if !kept {
                     self.line_count = self.line_count.saturating_sub(lost);
@@ -393,11 +395,14 @@ impl Scrollback {
         // Uses evict_bytes for O(P) total cost instead of O(K*P) from repeated pop_front.
         if self.over_budget() && self.cold.line_count() > 0 {
             let excess = self.budgeted_bytes.saturating_sub(self.memory_budget);
-            let evicted_lines = self.cold.evict_bytes(excess);
-            self.line_count = self.line_count.saturating_sub(evicted_lines);
+            let evicted = self.cold.evict_bytes(excess);
+            self.line_count = self.line_count.saturating_sub(evicted.lines);
             // Real retention LOSS (not a user limit): count it so the host can
-            // surface the truncation out-of-band (audit E10a).
-            self.pressure_evicted_lines += evicted_lines as u64;
+            // surface the truncation out-of-band (audit E10a). A quarantined
+            // block's blank rows were counted when it was quarantined, so they
+            // count once (ATERM-KI-1015-12).
+            let newly_lost = evicted.lines.saturating_sub(evicted.already_lost);
+            self.pressure_evicted_lines += newly_lost as u64;
             self.sync_accounting();
             changed = true;
         }

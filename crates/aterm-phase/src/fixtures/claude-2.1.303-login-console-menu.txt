@@ -1,0 +1,23 @@
+# claude-code 2.1.303 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the /login Console sub-menu, 2.1.303
+ ▐▛███▛█   Claude Code v2.1.303
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.pCwf/proj
+
+
+❯ hi
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ /login
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Login
+
+  Anthropic Console account
+
+  How do you want to sign in?
+
+  ❯ 1. Sign in with your Console account (recommended)
+    2. Create an API key (legacy) · adds a key to your Console workspace
+    3. Go back
+
+  Esc to cancel

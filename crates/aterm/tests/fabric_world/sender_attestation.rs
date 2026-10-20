@@ -373,7 +373,9 @@ fn a_refusal_reaches_the_senders_own_lane_and_raises_no_false_alarm() {
 /// its own `live` presence row is refused and no bridge on it can attach again.
 #[test]
 fn attention_is_published_and_the_halt_ack_costs_one_subject() {
-    let w = World::boot("r1att", &[]);
+    // The escalation lands inside the republish window of the session's first
+    // row, so the next round carries it: at test pace ([`harness::FAST_TIMERS`]).
+    let w = World::boot_with("r1att", &[], &[harness::FAST_TIMERS]);
     w.wait_ready();
     let (a, _b) = w.two_sessions();
 

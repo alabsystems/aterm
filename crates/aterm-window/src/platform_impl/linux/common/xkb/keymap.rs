@@ -827,9 +827,14 @@ impl XkbKeymap {
         Self { keymap, _mods_indices: mods_indices, _core_keyboard_id }
     }
 
-    #[cfg(x11_platform)]
     pub fn mods_indices(&self) -> ModsIndices {
         self._mods_indices
+    }
+
+    /// A keymap a test compiled itself (from rule names).
+    #[cfg(test)]
+    pub fn from_raw_for_test(keymap: NonNull<xkb_keymap>) -> Self {
+        Self::new_inner(keymap, 0)
     }
 
     pub fn first_keysym_by_level(

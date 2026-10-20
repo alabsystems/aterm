@@ -5,7 +5,7 @@
 //! The resize journal, heal counters and render debt against flaps of a Claude-shaped
 //! alternate screen.
 
-use super::{RESIZE_JOURNAL_CAP, ResizeReport};
+use super::{RESIZE_JOURNAL_CAP, RenderDebt, ResizeReport};
 use crate::terminal::Terminal;
 
 /// The visible rows' text, trailing blanks trimmed.
@@ -473,16 +473,24 @@ fn flap_with(t: &mut Terminal, rows: u16, between: &[u8]) {
 #[test]
 fn a_quiet_flap_leaves_no_debt() {
     let mut t = claude_shaped_alt(8);
-    assert_eq!(t.render_debt(), (0, 0));
+    assert_eq!(t.render_debt(), RenderDebt::default());
     flap_with(&mut t, 8, b"");
-    assert_eq!(t.render_debt(), (0, 0), "the undo handed the row back");
+    assert_eq!(
+        t.render_debt(),
+        RenderDebt::default(),
+        "the undo handed the row back"
+    );
     // Two shrinks and two grows, all quiet.
     t.resize(7, 20);
     t.resize(6, 20);
-    assert_eq!(t.render_debt(), (-2, 0), "two rows are held by the undo");
+    assert_eq!(
+        t.render_debt(),
+        RenderDebt::of_rows(-2, 0),
+        "two rows are held by the undo"
+    );
     t.resize(7, 20);
     t.resize(8, 20);
-    assert_eq!(t.render_debt(), (0, 0));
+    assert_eq!(t.render_debt(), RenderDebt::default());
 }
 
 #[test]
@@ -496,7 +504,7 @@ fn the_push_corner_leaves_the_bottom_row_as_debt() {
     flap_with(&mut t, 8, MODE_SET);
     assert_eq!(
         t.render_debt(),
-        (0, 1),
+        RenderDebt::of_rows(0, 1),
         "the bottom row is lost, nothing moved"
     );
     // Quiet, the same corner is an identity.
@@ -505,7 +513,7 @@ fn the_push_corner_leaves_the_bottom_row_as_debt() {
     paint(&mut t, 0..8);
     t.process(b"\x1b[1;1H");
     flap_with(&mut t, 8, b"");
-    assert_eq!(t.render_debt(), (0, 0));
+    assert_eq!(t.render_debt(), RenderDebt::default());
 }
 
 #[test]
@@ -525,7 +533,7 @@ fn debt_accumulates_over_a_run_of_flaps_and_is_exact_after_a_journal_overrun() {
     );
     assert_eq!(
         t.render_debt(),
-        (-flaps, 0),
+        RenderDebt::of_rows(-flaps, 0),
         "the counter is exact though the journal is not"
     );
 }
@@ -535,27 +543,43 @@ fn a_full_clear_a_screen_switch_and_ris_each_reset_the_debt() {
     let displaced = || {
         let mut t = claude_shaped_alt(8);
         flap_with(&mut t, 8, MODE_SET);
-        assert_eq!(t.render_debt(), (-1, 0));
+        assert_eq!(t.render_debt(), RenderDebt::of_rows(-1, 0));
         t
     };
     let mut t = displaced();
     t.process(b"\x1b[2J");
-    assert_eq!(t.render_debt(), (0, 0), "ED 2 repaints from scratch");
+    assert_eq!(
+        t.render_debt(),
+        RenderDebt::default(),
+        "ED 2 repaints from scratch"
+    );
     let mut t = displaced();
     t.process(b"\x1b[H\x1b[J");
-    assert_eq!(t.render_debt(), (0, 0), "a home ED 0 is a full clear");
+    assert_eq!(
+        t.render_debt(),
+        RenderDebt::default(),
+        "a home ED 0 is a full clear"
+    );
     let mut t = displaced();
     t.process(b"\x1b[2K\x1b[1J");
-    assert_eq!(t.render_debt(), (-1, 0), "EL and ED 1 repaint nothing");
+    assert_eq!(
+        t.render_debt(),
+        RenderDebt::of_rows(-1, 0),
+        "EL and ED 1 repaint nothing"
+    );
     let mut t = displaced();
     t.process(b"\x1b[?1049l");
-    assert_eq!(t.render_debt(), (0, 0), "leaving the alternate screen");
+    assert_eq!(
+        t.render_debt(),
+        RenderDebt::default(),
+        "leaving the alternate screen"
+    );
     let mut t = displaced();
     t.process(b"\x1b[?1049h");
-    assert_eq!(t.render_debt(), (0, 0), "entering it again");
+    assert_eq!(t.render_debt(), RenderDebt::default(), "entering it again");
     let mut t = displaced();
     t.process(b"\x1bc");
-    assert_eq!(t.render_debt(), (0, 0), "RIS");
+    assert_eq!(t.render_debt(), RenderDebt::default(), "RIS");
 }
 
 #[test]
@@ -567,7 +591,182 @@ fn a_primary_screen_resize_owes_nothing() {
     }
     t.process(b"\x1b[8;3H");
     flap_with(&mut t, 8, MODE_SET);
-    assert_eq!(t.render_debt(), (0, 0));
+    assert_eq!(t.render_debt(), RenderDebt::default());
+}
+
+/// S2R-F4 (ATERM-KI-1015-1, the sweep of 2026-10-15): a net-zero row flap on
+/// the PRIMARY screen with a blank row below the cursor and history above it.
+/// The shrink trimmed the blank bottom row (nothing moved) and the grow revealed
+/// the newest history line at the top, so every row and the cursor ended one
+/// lower than the program drew them. The primary screen is not judged
+/// (`render=ok`); only `cast drift` saw it. The grow hands the trimmed blank
+/// back instead (`aterm_grid`'s rows hand-back).
+#[test]
+fn a_primary_row_flap_over_a_blank_tail_leaves_every_row_where_it_was() {
+    let mut t = Terminal::new(8, 20);
+    for i in 0..20 {
+        t.process(format!("h{i}\r\n").as_bytes());
+    }
+    // A program that clears and draws one line at the top: history stays above.
+    t.process(b"\x1b[H\x1b[2Jtop\r\n");
+    assert!(t.grid().scrollback_lines() > 0, "history above the screen");
+    let painted = screen(&t);
+    let cursor = t.cursor();
+
+    let r = flap(&mut t, &[7, 8]);
+    assert_eq!(screen(&t), painted, "every row where the program drew it");
+    assert_eq!(
+        (t.cursor().row, t.cursor().col),
+        (cursor.row, cursor.col),
+        "the cursor where the program left it"
+    );
+    assert_eq!(r[0].trimmed, 1, "the shrink trimmed the blank bottom row");
+    assert_eq!(
+        (r[1].revealed, r[1].appended, r[1].shift()),
+        (0, 1, 0),
+        "the grow handed the blank back and moved nothing"
+    );
+}
+
+/// S2R-F4's other half: the same primary screen flapped by a drag that grows first
+/// (8 -> 9 -> 8) or overshoots the start on the way back (8 -> 7 -> 9 -> 8, 8 -> 5 -> 10
+/// -> 8, 8 -> 7 -> 8 -> 9 -> 8). The grow reveals history at the top; the shrink back
+/// trimmed the blank tail instead of demoting those rows, so every row and the cursor
+/// ended lower than the program drew them, with nothing judged. The shrink demotes the
+/// revealed rows first.
+#[test]
+fn a_primary_row_flap_that_grows_first_leaves_every_row_where_it_was() {
+    for heights in [&[9u16, 8][..], &[7, 9, 8], &[5, 10, 8], &[7, 8, 9, 8]] {
+        let mut t = Terminal::new(8, 20);
+        for i in 0..20 {
+            t.process(format!("h{i}\r\n").as_bytes());
+        }
+        t.process(b"\x1b[H\x1b[2Jtop\r\n");
+        let painted = screen(&t);
+        let cursor = t.cursor();
+
+        let r = flap(&mut t, heights);
+        assert_eq!(
+            screen(&t),
+            painted,
+            "{heights:?}: every row where it was drawn"
+        );
+        assert_eq!(
+            (t.cursor().row, t.cursor().col),
+            (cursor.row, cursor.col),
+            "{heights:?}: the cursor where the program left it"
+        );
+        let shift: i32 = r.iter().map(|r| r.shift()).sum();
+        assert_eq!(shift, 0, "{heights:?}: the row shifts net to zero");
+    }
+}
+
+/// A resize on the window's offloaded path: the visible grid now, the history's
+/// rewrap driven to its re-attach, as the host's worker does.
+fn offloaded_resize(t: &mut Terminal, rows: u16, cols: u16) {
+    let mut job = t.resize_offloading_scrollback(rows, cols);
+    while let Some(pending) = job {
+        job = t.finish_resize_offload(pending.reflow());
+    }
+}
+
+/// S2R-F4 through a width change: a font zoom in then out, a zoom out then in, and a
+/// window corner dragged and brought back move the rows and the columns together. On the
+/// window's terminal (a tiered store), on the sync and the offloaded path, zsh after
+/// `clear; seq 1 120; printf '\e[H\e[2Jtop row\n'` at 144x50: the width change forgot
+/// the hand-back, its shrink trimmed the blank tail and its grow pulled history back down,
+/// so `top row` and the cursor ended five rows lower, `render=ok`. Every row stays where
+/// the program drew it.
+#[test]
+fn a_primary_flap_that_changes_the_width_too_leaves_every_row_where_it_was() {
+    let paths: [&[(u16, u16)]; 4] = [
+        &[(45, 131), (50, 144)],
+        &[(55, 158), (50, 144)],
+        &[(45, 144), (45, 131), (50, 131), (50, 144)],
+        &[(47, 135), (53, 150), (50, 144)],
+    ];
+    for path in paths {
+        for offloaded in [false, true] {
+            let at = format!("{path:?} offloaded={offloaded}");
+            let mut t = Terminal::with_scrollback(
+                50,
+                144,
+                1000,
+                crate::scrollback::Scrollback::with_defaults(),
+            );
+            for i in 1..=120 {
+                t.process(format!("{i}\r\n").as_bytes());
+            }
+            t.process(b"\x1b[H\x1b[2Jtop row\r\n");
+            let painted = screen(&t);
+            let cursor = (t.cursor().row, t.cursor().col);
+            for &(rows, cols) in path {
+                if offloaded {
+                    offloaded_resize(&mut t, rows, cols);
+                } else {
+                    t.resize(rows, cols);
+                }
+            }
+            assert_eq!(screen(&t), painted, "{at}: every row where it was drawn");
+            assert_eq!(
+                (t.cursor().row, t.cursor().col),
+                cursor,
+                "{at}: the cursor where the program left it"
+            );
+        }
+    }
+    // The small shape the rows-only flaps use.
+    for path in [&[(7u16, 19u16), (8, 20)][..], &[(9, 21), (8, 20)]] {
+        let mut t = Terminal::new(8, 20);
+        for i in 0..20 {
+            t.process(format!("h{i}\r\n").as_bytes());
+        }
+        t.process(b"\x1b[H\x1b[2Jtop\r\n");
+        let painted = screen(&t);
+        for &(rows, cols) in path {
+            t.resize(rows, cols);
+        }
+        assert_eq!(screen(&t), painted, "{path:?}");
+        assert_eq!((t.cursor().row, t.cursor().col), (1, 0), "{path:?}");
+    }
+}
+
+/// A program that redraws its screen from the top after a grow (`ESC [ H` then its lines,
+/// with an erase or without one, or a cursor sent up past the top) owns the top rows: the
+/// shrink back trims under its screen, as on a terminal that never grew. The grow's
+/// revealed history line stayed owed, so the shrink demoted the program's own first line
+/// into history and every row ended one higher, with nothing judged on the primary screen.
+#[test]
+fn a_redraw_from_the_top_after_a_grow_keeps_its_rows_through_the_shrink_back() {
+    let build = || {
+        let mut t = Terminal::new(8, 20);
+        for i in 0..20 {
+            t.process(format!("h{i}\r\n").as_bytes());
+        }
+        t.process(b"\x1b[H\x1b[2Jtop\r\n");
+        t
+    };
+    for redraw in [&b"\x1b[H"[..], b"\x1b[H\x1b[J", b"\x1b[999A\r"] {
+        let at = String::from_utf8_lossy(redraw).escape_debug().to_string();
+        let mut never = build();
+        let mut flapped = build();
+        flapped.resize(9, 20);
+        for t in [&mut never, &mut flapped] {
+            t.process(redraw);
+            t.process(b"N0p\r\nN1p\r\nN2p\r\n");
+        }
+        flapped.resize(8, 20);
+        assert_eq!(
+            screen(&flapped),
+            screen(&never),
+            "{at}: every row where it was drawn"
+        );
+        assert_eq!(
+            (flapped.cursor().row, flapped.cursor().col),
+            (never.cursor().row, never.cursor().col),
+            "{at}: the cursor where the program left it"
+        );
+    }
 }
 
 #[test]
@@ -577,31 +776,84 @@ fn a_conpty_resize_owes_nothing() {
     t.resize_with_policy(7, 20, crate::grid::ResizePolicy::ConPty);
     t.process(MODE_SET);
     t.resize_with_policy(8, 20, crate::grid::ResizePolicy::ConPty);
-    assert_eq!(t.render_debt(), (0, 0));
+    assert_eq!(t.render_debt(), RenderDebt::default());
     // The same flap under Native does.
     let mut t = claude_shaped_alt(8);
     flap_with(&mut t, 8, MODE_SET);
-    assert_eq!(t.render_debt(), (-1, 0));
+    assert_eq!(t.render_debt(), RenderDebt::of_rows(-1, 0));
+}
+
+/// S2R-F3 (ATERM-KI-1015-1): a column flap on the alternate screen cuts the drawn cells
+/// past the narrower width and the grow back brings blanks there, so the cut is debt as a
+/// moved row is, until the program repaints from scratch. Cutting only blanks owes nothing.
+#[test]
+fn a_column_flap_that_cuts_drawn_cells_owes_them_until_a_full_clear() {
+    let ruled = || {
+        let mut t = Terminal::new(8, 20);
+        t.process(b"\x1b[?1049h\x1b[2J\x1b[6;1H");
+        t.process("-".repeat(20).as_bytes());
+        t.process(b"\x1b[1;1Hshort");
+        t
+    };
+    let mut t = ruled();
+    t.resize(8, 19);
+    t.process(MODE_SET);
+    t.resize(8, 20);
+    let (r, _) = t.resize_journal_since(0);
+    assert_eq!((r[0].cut, r[1].cut), (1, 0), "the narrowing cut one column");
+    assert_eq!(t.row_text(5).unwrap_or_default().trim_end().len(), 19);
+    let debt = t.render_debt();
+    assert_eq!(debt.rows(), (0, 0), "no row moved");
+    assert_eq!(debt.cut, 1);
+    assert!(debt.owed(), "a cut cell is owed though no row moved");
+
+    // A deeper cut adds the columns it takes.
+    t.resize(8, 17);
+    t.resize(8, 20);
+    assert_eq!(t.render_debt().cut, 3, "columns 17 and 18 too");
+
+    // Paid like the rows: a full clear, a screen switch, a reset.
+    t.process(b"\x1b[2J");
+    assert!(!t.render_debt().owed(), "ED 2 repaints from scratch");
+
+    // A narrowing that cuts only blanks owes nothing, and neither does the
+    // primary screen's, which rewraps.
+    let mut t = ruled();
+    t.process(b"\x1b[2J\x1b[1;1Hshort");
+    t.resize(8, 10);
+    t.resize(8, 20);
+    assert_eq!(t.render_debt(), RenderDebt::default());
+    let mut t = Terminal::new(8, 20);
+    t.process("-".repeat(20).as_bytes());
+    t.resize(8, 19);
+    t.resize(8, 20);
+    assert_eq!(t.render_debt(), RenderDebt::default());
 }
 
 #[test]
 fn seeding_the_debt_survives_a_checkpoint_restore_and_a_full_clear_resets_it() {
     let mut t = claude_shaped_alt(8);
     flap_with(&mut t, 8, MODE_SET);
-    assert_eq!(t.render_debt(), (-1, 0));
+    assert_eq!(t.render_debt(), RenderDebt::of_rows(-1, 0));
     // A restored engine starts at zero: the successor seeds what the
     // predecessor owed, on the alternate screen only.
     let mut restored = claude_shaped_alt(8);
-    assert_eq!(restored.render_debt(), (0, 0));
-    restored.seed_render_debt(-1, 0);
-    assert_eq!(restored.render_debt(), (-1, 0));
+    assert_eq!(restored.render_debt(), RenderDebt::default());
+    restored.seed_render_debt(RenderDebt::of_rows(-1, 0));
+    assert_eq!(restored.render_debt(), RenderDebt::of_rows(-1, 0));
     restored.process(b"\x1b[2J");
-    assert_eq!(restored.render_debt(), (0, 0));
+    assert_eq!(restored.render_debt(), RenderDebt::default());
+    let cut = RenderDebt {
+        cut: 2,
+        ..RenderDebt::default()
+    };
+    restored.seed_render_debt(cut);
+    assert_eq!(restored.render_debt(), cut, "a cut crosses as the rows do");
     let mut primary = Terminal::new(8, 20);
-    primary.seed_render_debt(-1, 0);
+    primary.seed_render_debt(RenderDebt::of_rows(-1, 0));
     assert_eq!(
         primary.render_debt(),
-        (0, 0),
+        RenderDebt::default(),
         "the primary screen owes nothing"
     );
 }

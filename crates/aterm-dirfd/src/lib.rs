@@ -86,10 +86,67 @@ impl Errno {
         self.0
     }
 
+    /// Return `true` when this errno is `ENOENT`.
+    #[must_use]
+    pub const fn is_noent(self) -> bool {
+        self.0 == libc::ENOENT
+    }
+
+    /// Return `true` when this errno is `EINVAL`.
+    #[must_use]
+    pub const fn is_inval(self) -> bool {
+        self.0 == libc::EINVAL
+    }
+
     /// The current thread's `errno`, read immediately after a failed call.
     fn last() -> Self {
         Self(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
     }
+}
+
+/// Encode a directory-relative inode identity (`dev`, `ino`) into 16 little-endian bytes.
+#[must_use]
+pub const fn encode_inode_identity_le(dev: u64, ino: u64) -> [u8; 16] {
+    [
+        dev as u8,
+        (dev >> 8) as u8,
+        (dev >> 16) as u8,
+        (dev >> 24) as u8,
+        (dev >> 32) as u8,
+        (dev >> 40) as u8,
+        (dev >> 48) as u8,
+        (dev >> 56) as u8,
+        ino as u8,
+        (ino >> 8) as u8,
+        (ino >> 16) as u8,
+        (ino >> 24) as u8,
+        (ino >> 32) as u8,
+        (ino >> 40) as u8,
+        (ino >> 48) as u8,
+        (ino >> 56) as u8,
+    ]
+}
+
+/// Decode 16 little-endian bytes into a directory-relative inode identity (`dev`, `ino`).
+#[must_use]
+pub const fn decode_inode_identity_le(bytes: [u8; 16]) -> (u64, u64) {
+    let dev = (bytes[0] as u64)
+        | ((bytes[1] as u64) << 8)
+        | ((bytes[2] as u64) << 16)
+        | ((bytes[3] as u64) << 24)
+        | ((bytes[4] as u64) << 32)
+        | ((bytes[5] as u64) << 40)
+        | ((bytes[6] as u64) << 48)
+        | ((bytes[7] as u64) << 56);
+    let ino = (bytes[8] as u64)
+        | ((bytes[9] as u64) << 8)
+        | ((bytes[10] as u64) << 16)
+        | ((bytes[11] as u64) << 24)
+        | ((bytes[12] as u64) << 32)
+        | ((bytes[13] as u64) << 40)
+        | ((bytes[14] as u64) << 48)
+        | ((bytes[15] as u64) << 56);
+    (dev, ino)
 }
 
 impl std::fmt::Display for Errno {

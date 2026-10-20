@@ -17,8 +17,8 @@ use aterm_core::terminal::{
     ContentScrollDelta, ContentScrollState, CursorStyle, RenderCell, Terminal,
 };
 use aterm_render::{DamageOutcome, Frame, RenderInput, Theme};
-use winit::dpi::PhysicalSize;
-use winit::window::Window;
+use aterm_window::dpi::PhysicalSize;
+use aterm_window::window::Window;
 
 // The resident pet's laws are the engine's, one copy: this host feeds its
 // driver (in `WindowState::fx`) and reuses the custody and shed laws for
@@ -1026,7 +1026,18 @@ fn compiled_native_paint_damage(
         if before.content == after.content {
             continue;
         }
-        include(before.clip);
+        // A Themes demo's tick moves its grid alone.
+        let changed = match (&before.content, &after.content) {
+            (
+                crate::native_ui::UiContent::SettingsPreview(was),
+                crate::native_ui::UiContent::SettingsPreview(now),
+            ) => was
+                .repaint_rect(now, before.rect)
+                .intersect(before.clip)
+                .unwrap_or(before.clip),
+            _ => before.clip,
+        };
+        include(changed);
     }
     let rect = union?.intersect(current.bounds)?;
     let x = rect.x.floor().max(0.0) as u32;
@@ -2288,10 +2299,10 @@ mod fallback_convergence_tests {
     }
 }
 
-/// The band's landing schedules itself (Windows, Linux): a CJK tab title's
-/// first frame takes the strip's cell lane, and that present parses the chain
-/// face the chrome then draws with. Nothing else asks for the next frame, so
-/// the post-present follow-up asks for it, exactly once.
+/// The band's landing schedules itself (Windows, Linux): a chain face parsed
+/// after a splice read the band key — by the splice itself, for a CJK title's
+/// first frame, or by the terminal — leaves that key stale. Nothing else asks
+/// for the next frame, so the post-present follow-up asks for it, exactly once.
 #[cfg(all(test, any(windows, target_os = "linux")))]
 mod strip_band_landing_tests {
     use super::*;
@@ -2363,12 +2374,15 @@ mod strip_band_landing_tests {
     }
 
     /// Two composed frames of a CJK-titled strip with a steady cursor and only the
-    /// first frame's present and follow-up between them: frame 1 is cell lane, its
-    /// present parses the chain face, the follow-up re-arms and requests a redraw,
-    /// frame 2 is a band title under a band key that differs by the epoch term
-    /// alone, and the follow-up after frame 2 asks for nothing.
+    /// first frame's present and follow-up between them. Frame 1 is ALREADY a
+    /// band title (the 2026-10-18 Fluent judges' `F3`: it was the cell lane's,
+    /// in the terminal's face, with no hairlines): its splice had the chain face
+    /// parsed for the label after reading the band key, so the follow-up re-arms
+    /// and requests one redraw; frame 2 is the band title again, under a band key
+    /// that differs by the epoch term alone, and the follow-up after it asks for
+    /// nothing.
     #[test]
-    fn a_cjk_title_lands_in_the_band_on_the_next_frame_with_no_other_stimulus() {
+    fn a_cjk_title_is_a_band_title_on_its_first_frame_and_asks_one_frame_more() {
         let Some(path) = crate::tray_raster::cjk_chain_face_path_for_test() else {
             return;
         };
@@ -2423,8 +2437,12 @@ mod strip_band_landing_tests {
             return;
         }
 
-        // Frame 1: the chain face is unparsed, the title is not coverable, and
-        // the segment goes to the cell lane.
+        // Frame 1: the chain face is unparsed when the splice reads the band
+        // key; the band has it parsed for the title and draws the title itself.
+        assert!(
+            !crate::tray_raster::chrome_cascade_reaches_for_test('日'),
+            "CONTROL: nothing has parsed the CJK face before frame 1"
+        );
         compose(&mut app, wid);
         let seg = app.windows[&wid]
             .tab_segments
@@ -2435,11 +2453,10 @@ mod strip_band_landing_tests {
         let probe = usize::from(seg.start_col) + 1;
         let first_key = app.windows[&wid].strip_band_key;
         assert!(
-            !band_covers(&app, wid, probe),
-            "frame 1: the CJK segment is the cell lane's (the chain face is unparsed)"
+            band_covers(&app, wid, probe),
+            "frame 1: the CJK segment is band-covered on its first frame"
         );
-        // Its present: the strip cells raster through the live renderer, whose
-        // draw of the ideograph parses the chain face into the shared cell…
+        // Its present through the live renderer…
         present_raster(&mut app, wid);
         // …and stamps the frame's key, as every real present does — the
         // early-out that would swallow a bare redraw request.
@@ -2946,6 +2963,10 @@ pub(crate) fn tray_quad_below_y(
         ph: card.ph - skipped_rows,
         dx: card.dx,
         dy: card.dy.saturating_add(skipped_rows),
+        // The scrim stops at the same floor, so the banner stays topmost.
+        scrim: card
+            .scrim
+            .map(|rgba| aterm_gpu::TrayScrim { rgba, top: floor_y }),
     })
 }
 
@@ -2969,6 +2990,7 @@ pub(crate) fn composite_tray_at(
 }
 
 /// Raw-quad twin used after [`tray_quad_below_y`] has cropped a cached card.
+/// The card's scrim, if any, is filled first ([`composite_tray_scrim_at`]).
 pub(crate) fn composite_tray_quad_at(
     pixels: &mut [u32],
     fb_w: usize,
@@ -2977,6 +2999,9 @@ pub(crate) fn composite_tray_quad_at(
     oy: i64,
     card: aterm_gpu::TrayQuad<'_>,
 ) {
+    if let Some(scrim) = card.scrim {
+        composite_tray_scrim_at(pixels, fb_w, fb_h, oy, scrim);
+    }
     let (cw, ch) = (card.pw as usize, card.ph as usize);
     for ty in 0..ch {
         let py = i64::from(card.dy) + ty as i64 + oy;
@@ -3019,6 +3044,39 @@ pub(crate) fn composite_tray_quad_at(
             let out_t = (dst_t * (255 - a) + 127) / 255;
             *slot = (out_t << 24) | (r << 16) | (g << 8) | b;
         }
+    }
+}
+
+/// A tray card's scrim ([`aterm_gpu::TrayScrim`]): its colour composited
+/// straight-alpha source-over, as a card texel of that colour would be, on every
+/// surface pixel from frame row `top` down (surface row `top + oy`), the frame's
+/// bands and remainder included.
+fn composite_tray_scrim_at(
+    pixels: &mut [u32],
+    fb_w: usize,
+    fb_h: usize,
+    oy: i64,
+    scrim: aterm_gpu::TrayScrim,
+) {
+    let a = u32::from(scrim.rgba[3]);
+    if a == 0 {
+        return;
+    }
+    let first = (i64::from(scrim.top) + oy).clamp(0, fb_h as i64) as usize;
+    let Some(rows) = pixels.get_mut(first * fb_w..(fb_h * fb_w).min(pixels.len())) else {
+        return;
+    };
+    let lit = |s: u8| u32::from(s) * a + 127;
+    let (sr, sg, sb) = (lit(scrim.rgba[0]), lit(scrim.rgba[1]), lit(scrim.rgba[2]));
+    let keep = 255 - a;
+    for slot in rows {
+        let d = *slot;
+        let (dr, dg, db) = ((d >> 16) & 0xff, (d >> 8) & 0xff, d & 0xff);
+        let r = (sr + dr * keep) / 255;
+        let g = (sg + dg * keep) / 255;
+        let b = (sb + db * keep) / 255;
+        let out_t = (((d >> 24) & 0xff) * keep + 127) / 255;
+        *slot = (out_t << 24) | (r << 16) | (g << 8) | b;
     }
 }
 
@@ -3293,6 +3351,149 @@ fn claim_chrome_rows(ws: &mut crate::WindowState, band: std::ops::Range<usize>) 
 /// carry no chrome at all.
 fn chrome_owns_terminal_row_of(ws: &crate::WindowState, row: usize) -> bool {
     ws.chrome_rows.iter().any(|band| band.contains(&row))
+}
+
+/// The cells the find panel rides ([`App::find_region`]), in terminal-band rows
+/// and window columns, and the viewport offset its matches map through.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FindRegion {
+    row0: usize,
+    col0: usize,
+    rows: usize,
+    cols: usize,
+    display_offset: i32,
+}
+
+/// One find-panel rail: `rail_h` device pixels along the bottom of frame row `row`,
+/// in `ink` across frame pixel columns `span` and left alone before it, the row's
+/// words kept a clear pixel off it (`ChromeRaster::clear_rail`, the message band's
+/// seam rail).
+fn find_rail(
+    row: u16,
+    span: Range<usize>,
+    ink: [u8; 3],
+    rail_h: u16,
+) -> aterm_render::ChromeRaster {
+    let ink = aterm_render::rgb_to_u32(ink);
+    let keep = aterm_render::ChromeRaster::KEEP;
+    aterm_render::ChromeRaster {
+        row,
+        ground: Arc::from(Vec::new()),
+        rail: (0..span.end)
+            .map(|x| if x < span.start { keep } else { ink })
+            .collect(),
+        rail_h,
+        clear_rail: true,
+        own: Vec::new(),
+        split: None,
+        rings: Vec::new(),
+        icons: Vec::new(),
+    }
+}
+
+/// The thickest find-panel rail of at most `want` px that the renderer, at its
+/// face's `room` (`Renderer::band_room`), lays without lifting its row's words
+/// ([`aterm_render::chrome_fit`]); `None` when even 1 px would lift them. A
+/// pane-scoped panel's rails ride frame rows its split sibling also draws on,
+/// whose glyphs a lift would move with the panel's.
+fn unlifted_rail_h(want: u16, room: (usize, usize)) -> Option<u16> {
+    (1..=want)
+        .rev()
+        .find(|&h| aterm_render::chrome_fit(&find_rail(0, 0..1, [0; 3], h), room).0 == 0)
+}
+
+/// Drop what frame row `frame_row` carried beside its cells once the find panel
+/// has replaced the whole row: covered clusters, combining marks and inline
+/// images cannot bleed through, the bar paints in logical order (no BiDi map),
+/// and the row is single-width, as `splice_paste_banner` leaves its rows.
+fn clear_find_row_lists(input: &mut RenderInput, frame_row: usize) {
+    if let Some(c) = input.clusters.get_mut(frame_row) {
+        c.clear();
+    }
+    if let Some(c) = input.combining.get_mut(frame_row) {
+        c.clear();
+    }
+    if let Some(m) = input.visual_to_logical.get_mut(frame_row) {
+        m.clear();
+    }
+    if let Some(im) = input.images.get_mut(frame_row) {
+        im.clear();
+    }
+    if let Some(ls) = input.line_sizes.get_mut(frame_row) {
+        *ls = aterm_core::grid::LineSize::SingleWidth;
+    }
+    // Per-pane runs are the per-column truth the renderers read, so a covered
+    // row drops them too.
+    if let Some(spans) = input.line_size_spans.get_mut(frame_row) {
+        spans.clear();
+    }
+    if let Some(spans) = input.default_bg_spans.get_mut(frame_row) {
+        spans.clear();
+    }
+}
+
+/// [`clear_find_row_lists`] for a panel over ONE pane of a split: the panel's
+/// cells replace columns `[col0, col0 + built.len())` of `frame_row`, and only
+/// what those columns carried goes — the sibling beside it keeps its clusters,
+/// marks, images, BiDi map and DEC line size. A line-size run is cut at the
+/// panel's edges, so a double-width sibling row stays double-width.
+fn splice_find_row_span(
+    input: &mut RenderInput,
+    frame_row: usize,
+    col0: usize,
+    built: Vec<RenderCell>,
+) {
+    let span = col0..col0 + built.len();
+    let Some(row) = input.cells.get_mut(frame_row) else {
+        return;
+    };
+    for (col, cell) in span.clone().zip(built) {
+        if let Some(slot) = row.get_mut(col) {
+            *slot = cell;
+        }
+    }
+    if let Some(c) = input.clusters.get_mut(frame_row) {
+        c.retain(|(col, _)| !span.contains(col));
+    }
+    if let Some(c) = input.combining.get_mut(frame_row) {
+        c.retain(|(col, _)| !span.contains(col));
+    }
+    if let Some(im) = input.images.get_mut(frame_row) {
+        im.retain(|(col, _)| !span.contains(col));
+    }
+    // The bar paints in logical order: its columns map to themselves.
+    if let Some(map) = input.visual_to_logical.get_mut(frame_row) {
+        for v in span.clone() {
+            if let Some(slot) = map.get_mut(v) {
+                *slot = u16::try_from(v).unwrap_or(u16::MAX);
+            }
+        }
+    }
+    if let Some(spans) = input.line_size_spans.get_mut(frame_row) {
+        let mut kept = Vec::with_capacity(spans.len() + 1);
+        for run in spans.drain(..) {
+            if run.start_col < span.start {
+                kept.push(aterm_core::render::LineSizeSpan::new(
+                    run.start_col,
+                    run.end_col.min(span.start),
+                    run.line_size,
+                ));
+            }
+            if run.end_col > span.end {
+                kept.push(aterm_core::render::LineSizeSpan::new(
+                    run.start_col.max(span.end),
+                    run.end_col,
+                    run.line_size,
+                ));
+            }
+        }
+        *spans = kept;
+        if spans.is_empty()
+            && let Some(ls) = input.line_sizes.get_mut(frame_row)
+        {
+            *ls = aterm_core::grid::LineSize::SingleWidth;
+        }
+    }
 }
 
 /// Remove every host-owned overlay whose painted extent intersects a frame-row
@@ -4186,7 +4387,10 @@ pub(crate) fn pet_visibility(focused: bool) -> aterm_effects::host::Visibility {
 /// * the lease: `SessionCtx::turn_lease` live at `now_us` ([`crate::Lease::is_live`]);
 /// * quiet: the status observer's phase ([`crate::session_status::Phase::Quiet`]);
 /// * the turn: the newest [`crate::turn_ledger::TurnRecord`]'s id and settle
-///   verdict;
+///   verdict, the window harness's own turns aside
+///   ([`crate::turn_ledger::TurnLedger::newest_not_harness`]): its `keep going`
+///   is no turn of the room's, and its `status=pressed` would read as one that
+///   never settled;
 /// * the sibling: the caret of a sibling pane streaming this frame, in the pet's
 ///   pane cells;
 /// * the inbox: [`crate::fabric::SessionFabric::room_facts`].
@@ -4210,21 +4414,12 @@ fn room_facts(
                 .unwrap_or_else(|p| p.into_inner())
                 .as_ref()
                 .is_some_and(|l| l.is_live(now_us));
-            let turn = {
-                let turns = ctx.turns.lock().unwrap_or_else(|p| p.into_inner());
-                match turns.high_id() {
-                    // `since(id − 1)` is the suffix at `id` exactly (ids are
-                    // unique and strictly increasing), i.e. the newest record.
-                    Some(id) => (
-                        id,
-                        turns
-                            .since(Some(id.saturating_sub(1)))
-                            .next()
-                            .is_some_and(|r| r.status == "settled"),
-                    ),
-                    None => (0, false),
-                }
-            };
+            let turn = ctx
+                .turns
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .newest_not_harness()
+                .map_or((0, false), |r| (r.id, r.status == "settled"));
             let (unseen, overdue, hold) = ctx.fabric.room_facts(crate::turn_ledger::now_ms());
             aterm_effects::companion::SessionRoom {
                 lease,
@@ -4485,285 +4680,6 @@ pub(crate) struct WallpaperScaled {
     tint: Vec<Option<[u8; 3]>>,
 }
 
-/// One glyph tint per grid cell, sampled at each cell's center from the
-/// scaled backdrop (the picture is smooth at cell granularity, so one texel
-/// stands in for the cell; padding offsets are within a cell and immaterial).
-fn wallpaper_cell_tints(
-    rgba: &[u8],
-    w: usize,
-    h: usize,
-    rows: usize,
-    cols: usize,
-    fallback_fg: u32,
-) -> Vec<Option<[u8; 3]>> {
-    let mut out = Vec::with_capacity(rows.saturating_mul(cols));
-    if w == 0 || h == 0 || rows == 0 || cols == 0 {
-        return out;
-    }
-    for r in 0..rows {
-        let y = ((r * 2 + 1) * h / (rows * 2)).min(h - 1);
-        for c in 0..cols {
-            let x = ((c * 2 + 1) * w / (cols * 2)).min(w - 1);
-            let i = (y * w + x) * 4;
-            let px =
-                (u32::from(rgba[i]) << 16) | (u32::from(rgba[i + 1]) << 8) | u32::from(rgba[i + 2]);
-            out.push(wallpaper_text_tint_color(px, fallback_fg));
-        }
-    }
-    out
-}
-
-/// Merge wallpaper-derived default-foreground tints into the frame's existing
-/// sorted-unique ink channel. Existing producers win on an occupied cell. The
-/// two vectors swap at the end so a steady frame reuses resident allocations.
-/// This deliberately does not memoize the cell projection: changed terminal
-/// glyphs must be observed, so a tinted present still performs the O(rows*cols)
-/// eligibility scan.
-fn merge_wallpaper_tint_ink(
-    cells: &[Vec<RenderCell>],
-    rows: usize,
-    cols: usize,
-    default_fg: [u8; 3],
-    tint: &[Option<[u8; 3]>],
-    existing: &mut Vec<aterm_core::render::InkCell>,
-    scratch: &mut Vec<aterm_core::render::InkCell>,
-) {
-    scratch.clear();
-    scratch.reserve(existing.len().saturating_add(rows.saturating_mul(cols) / 4));
-    let mut ex = existing.iter().copied().peekable();
-    for (r, row) in cells.iter().enumerate().take(rows) {
-        if r > usize::from(u16::MAX) {
-            break;
-        }
-        for (c, cell) in row.iter().enumerate().take(cols) {
-            while ex
-                .peek()
-                .is_some_and(|entry| (usize::from(entry.row), usize::from(entry.col)) < (r, c))
-            {
-                scratch.push(ex.next().expect("peeked"));
-            }
-            if ex
-                .peek()
-                .is_some_and(|entry| usize::from(entry.row) == r && usize::from(entry.col) == c)
-            {
-                scratch.push(ex.next().expect("peeked"));
-                continue;
-            }
-            // Blanks paint no glyph; a wide continuation has no lead glyph of
-            // its own; non-default foreground keeps its SGR color.
-            if cell.ch == ' ' || cell.wide || cell.fg != default_fg || c > usize::from(u16::MAX) {
-                continue;
-            }
-            let Some(color) = tint.get(r * cols + c).copied().flatten() else {
-                continue;
-            };
-            scratch.push(aterm_core::render::InkCell {
-                row: r as u16,
-                col: c as u16,
-                color,
-            });
-        }
-    }
-    scratch.extend(ex);
-    std::mem::swap(existing, scratch);
-}
-
-#[cfg(test)]
-mod wallpaper_tint_ink_tests {
-    use super::merge_wallpaper_tint_ink;
-    use aterm_core::render::InkCell;
-    use aterm_core::terminal::{RenderCell, UnderlineStyle};
-
-    fn cell(ch: char, fg: [u8; 3], wide: bool) -> RenderCell {
-        RenderCell {
-            ch,
-            fg,
-            bg: [0, 0, 0],
-            wide,
-            emoji_presentation: false,
-            text_presentation: false,
-            bold: false,
-            italic: false,
-            underline: UnderlineStyle::None,
-            strikethrough: false,
-            overline: false,
-            underline_color: None,
-            overline_color: None,
-            script: aterm_core::terminal::Script::Normal,
-        }
-    }
-
-    fn tuples(ink: &[InkCell]) -> Vec<(u16, u16, [u8; 3])> {
-        ink.iter()
-            .map(|entry| (entry.row, entry.col, entry.color))
-            .collect()
-    }
-
-    #[test]
-    fn merge_preserves_precedence_order() {
-        let default_fg = [200, 200, 200];
-        let cells = vec![
-            vec![
-                cell('a', default_fg, false),
-                cell('b', default_fg, false),
-                cell(' ', default_fg, false),
-                cell('c', default_fg, true),
-            ],
-            vec![
-                cell('d', default_fg, false),
-                cell('e', [1, 2, 3], false),
-                cell('f', default_fg, false),
-                cell('g', default_fg, false),
-            ],
-        ];
-        let tint = vec![
-            Some([1, 1, 1]),
-            Some([2, 2, 2]),
-            Some([3, 3, 3]),
-            Some([4, 4, 4]),
-            Some([5, 5, 5]),
-            Some([6, 6, 6]),
-            None,
-            Some([7, 7, 7]),
-        ];
-        let producers = vec![
-            InkCell {
-                row: 0,
-                col: 1,
-                color: [90, 90, 90],
-            },
-            InkCell {
-                row: 1,
-                col: 0,
-                color: [80, 80, 80],
-            },
-            InkCell {
-                row: 2,
-                col: 0,
-                color: [70, 70, 70],
-            },
-        ];
-        let expected = vec![
-            (0, 0, [1, 1, 1]),
-            (0, 1, [90, 90, 90]),
-            (1, 0, [80, 80, 80]),
-            (1, 3, [7, 7, 7]),
-            (2, 0, [70, 70, 70]),
-        ];
-        let mut ink = producers;
-        let mut scratch = Vec::new();
-        merge_wallpaper_tint_ink(&cells, 2, 4, default_fg, &tint, &mut ink, &mut scratch);
-        assert_eq!(tuples(&ink), expected);
-    }
-}
-
-/// WCAG contrast ratio between two relative luminances.
-fn wcag_contrast(a: f32, b: f32) -> f32 {
-    let (hi, lo) = if a > b { (a, b) } else { (b, a) };
-    (hi + 0.05) / (lo + 0.05)
-}
-
-/// The tint pass guarantees at least this contrast against the backdrop
-/// texel under the cell (WCAG AA for normal text). Both poles clear it at
-/// every ground luminance, so the walk below always terminates readable.
-const WALLPAPER_TINT_CONTRAST_FLOOR: f32 = 4.5;
-
-/// The ground luminance below which white ink out-contrasts black ink
-/// (`(1.05)/(L+0.05) >= (L+0.05)/0.05` ⇒ `L <= sqrt(1.05*0.05) - 0.05`).
-const LIGHT_INK_BELOW: f32 = 0.179;
-
-/// A "cool but readable" glyph tint for text sitting on `backdrop`: the
-/// backdrop's own hue, flipped to whichever brightness pole out-contrasts
-/// the ground (light ink over the picture's dark areas, dark ink over its
-/// bright ones) and then walked — brightness first, saturation after —
-/// until it clears [`WALLPAPER_TINT_CONTRAST_FLOOR`]. The letterforms pick
-/// up the image's local color and stay legible no matter how light or dark
-/// the picture is at that cell. Near-achromatic ground (grey / washed-out
-/// areas) takes no hue — an arbitrary one would read as noise — and keeps
-/// the ordinary foreground (`None`) where it already clears the floor, else
-/// a plain readable neutral of the winning polarity.
-fn wallpaper_text_tint_color(backdrop: u32, fallback_fg: u32) -> Option<[u8; 3]> {
-    use aterm_effects::color_math::{hsv2rgb, relative_luminance, rgb2hsv};
-    let ground = relative_luminance(backdrop);
-    let light_ink = ground <= LIGHT_INK_BELOW;
-    let (hue, s, _v) = rgb2hsv(backdrop);
-    if s < 0.10 {
-        if wcag_contrast(relative_luminance(fallback_fg), ground) >= WALLPAPER_TINT_CONTRAST_FLOOR {
-            return None;
-        }
-        let neutral = if light_ink { 0xF0 } else { 0x20 };
-        return Some([neutral, neutral, neutral]);
-    }
-    let mut sat = (s * 0.9).clamp(0.35, 0.70);
-    let mut v = if light_ink { 0.95 } else { 0.34 };
-    let mut tinted = hsv2rgb(hue, sat, v);
-    // Saturated hues can sit dark even at full brightness (pure blue) or
-    // light even quite low (yellow), so push brightness toward the pole,
-    // then bleed saturation out — sat 0 at the pole is white/black, whose
-    // contrast clears the floor on any ground the polarity choice matched.
-    for _ in 0..24 {
-        if wcag_contrast(relative_luminance(tinted), ground) >= WALLPAPER_TINT_CONTRAST_FLOOR {
-            break;
-        }
-        if light_ink && v < 1.0 {
-            v = (v + 0.06).min(1.0);
-        } else if !light_ink && v > 0.0 {
-            v = (v - 0.06).max(0.0);
-        } else {
-            sat = (sat - 0.08).max(0.0);
-        }
-        tinted = hsv2rgb(hue, sat, v);
-    }
-    Some([
-        ((tinted >> 16) & 0xff) as u8,
-        ((tinted >> 8) & 0xff) as u8,
-        (tinted & 0xff) as u8,
-    ])
-}
-
-/// Cover-scale `src` (straight sRGB RGBA8, `sw × sh`) to exactly `dw × dh`
-/// (center-crop to the destination aspect, then the shared linear-light
-/// `resample_rgba`), composite any translucency over the theme background,
-/// tone the result toward it by `dim`, and force every texel opaque — a
-/// wallpaper replaces the background-opacity glass, never composites with it.
-fn scale_wallpaper_cover(
-    src: &[u8],
-    sw: usize,
-    sh: usize,
-    dw: usize,
-    dh: usize,
-    dim: f32,
-    bg: u32,
-) -> Vec<u8> {
-    let scale = (dw as f64 / sw as f64).max(dh as f64 / sh as f64);
-    let crop_w = ((dw as f64 / scale).round() as usize).clamp(1, sw);
-    let crop_h = ((dh as f64 / scale).round() as usize).clamp(1, sh);
-    let x0 = (sw - crop_w) / 2;
-    let y0 = (sh - crop_h) / 2;
-    let mut crop = Vec::with_capacity(crop_w * crop_h * 4);
-    for y in y0..y0 + crop_h {
-        let start = (y * sw + x0) * 4;
-        crop.extend_from_slice(&src[start..start + crop_w * 4]);
-    }
-    let mut out = aterm_render::resample_rgba(&crop, crop_w, crop_h, dw, dh);
-    let dim = dim.clamp(0.0, 1.0);
-    let bg_rgb = [
-        ((bg >> 16) & 0xff) as f32,
-        ((bg >> 8) & 0xff) as f32,
-        (bg & 0xff) as f32,
-    ];
-    for px in out.as_chunks_mut::<4>().0 {
-        let a = f32::from(px[3]) / 255.0;
-        for (i, ground) in bg_rgb.iter().enumerate() {
-            let composed = f32::from(px[i]) * a + ground * (1.0 - a);
-            let toned = composed * (1.0 - dim) + ground * dim;
-            px[i] = toned.round().clamp(0.0, 255.0) as u8;
-        }
-        px[3] = 255;
-    }
-    out
-}
-
 /// A divider cell for the gaps between split panes: a blank glyph filled with the
 /// chrome's seam tone so the 1-cell line reads as a visible seam regardless of
 /// font glyph coverage. The tone is the seam token on the terminal background
@@ -4772,8 +4688,15 @@ fn scale_wallpaper_cover(
 /// to 1.5:1 either way, on dark and light themes alike. Under an OS-forced
 /// palette (Windows High Contrast) it is the one ink, `COLOR_WINDOWTEXT`: HC
 /// separates surfaces by lines in the text colour.
+///
+/// Under [`crate::pane_chrome::SplitChrome::Fluent`] (Windows) the gap is
+/// instead blank on the terminal background, and
+/// [`crate::pane_chrome::stamp_seam_lines`] draws a hairline down its middle.
 pub(crate) fn divider_cell(p: impl Into<crate::chrome_band::ChromePalette>) -> RenderCell {
     let p = p.into();
+    if crate::pane_chrome::split_chrome() == crate::pane_chrome::SplitChrome::Fluent {
+        return crate::pane_chrome::seam_ground_cell(p);
+    }
     let seam = match crate::chrome_band::forced_chrome() {
         Some(hc) => hc.window_text,
         None => p.tokens().seam_on(crate::settings::u32_rgb(p.theme.bg)),
@@ -5637,7 +5560,11 @@ fn fill_divider_grid_cells<T>(
     // The one thing in a composite that is neither a pane nor a plain seam. It
     // runs here, before any pane blit, so a rectangle that disagrees with the
     // layout loses to the blit and shows no mark rather than eating pane text.
-    if let Some(mark) = mark {
+    // The Fluent seam draws its ring with its hairline instead
+    // (`crate::pane_chrome::stamp_seam_lines`).
+    if let Some(mark) = mark
+        && crate::pane_chrome::split_chrome() == crate::pane_chrome::SplitChrome::Classic
+    {
         mark_active_pane_edges(dst, rows, cols, palette, mark);
     }
     reset_sparse_rows(&mut dst.clusters, rows, keep);
@@ -7757,6 +7684,27 @@ fn delivery_for_window(
     }
 }
 
+/// Send `s` the reports a change from the window queued in its engine
+/// (`Terminal::take_reports`, taken in the change's own hold), now, by the route
+/// every UI-thread report takes (`app_input::write_ui_report`). A new cell box
+/// at the same rows and columns (the first frame's measurement, a font zoom, a
+/// DPI move) queues a DEC 2048 report for a program that asked, and nothing else
+/// would carry it: a ConPTY resize to the same size draws nothing, so it waited
+/// for the session reader's next take, the program's next output. Under
+/// OpenConsole a vim that sat idle had it wait until it was killed, and the
+/// console title written after the kill took it to pwsh, which typed it into its
+/// line (measured 2026-10-18).
+fn send_window_reports(s: &crate::Session, reports: Option<Vec<u8>>) {
+    if let Some(report) = reports {
+        crate::app_input::write_ui_report(
+            &s.term,
+            &s.ctx.modes,
+            &s.ctx.sink,
+            &crate::input::InputEvent::KeySequence(report),
+        );
+    }
+}
+
 impl App {
     /// The predictive-echo mode, resolved once per config generation (the cache
     /// is invalidated by `reload_config`) rather than re-parsed per keystroke and
@@ -7978,7 +7926,13 @@ impl App {
                     s.ctx.crash_journal.host_settings(&term, None);
                 }
                 if term.rows() == sub_rows && term.cols() == sub_cols {
-                    continue; // already this size: no engine/PTY churn
+                    // Already this size: no engine/PTY churn. A new cell box's
+                    // report goes now (`send_window_reports`); a resize's rides
+                    // the output the resize brings.
+                    let reports = term.take_reports();
+                    drop(term);
+                    send_window_reports(s, reports);
+                    continue;
                 }
                 // The split's take-back hold (`crate::split_regrid_hold`): a
                 // collapse does not grow a pane a split shrank straight back to
@@ -8329,7 +8283,7 @@ impl App {
         }
         for id in self.window_terminal_sessions(wid) {
             if let Some(s) = self.pool.get(id) {
-                let (grid, pulse_holds) = {
+                let (grid, pulse_holds, reports) = {
                     let site = crate::metrics::TermWaitSite::Redraw;
                     let mut term = crate::term_lock_ui(&s.term, &s.ctx.ui_waiting, site);
                     term.set_cell_pixel_size(px.0, px.1);
@@ -8338,6 +8292,8 @@ impl App {
                         (term.rows(), term.cols()),
                         s.adopt_pulse_hold
                             .load(std::sync::atomic::Ordering::Acquire),
+                        // The DEC 2048 report the new box queued, taken in its hold.
+                        term.take_reports(),
                     )
                 };
                 // An adoption pulse is holding this PTY at `rows-1`
@@ -8345,15 +8301,16 @@ impl App {
                 // hold before a busy program read the transient, and it might never
                 // repaint. Read under the lock the pulse uses: its second half
                 // writes this cell box when it ends the hold.
-                if pulse_holds {
-                    continue;
+                if !pulse_holds {
+                    // The PTY learns it too, with the same rows/cols and new pixels,
+                    // so `TIOCGWINSZ` is right for the boot session (spawned at 0x0
+                    // before the backend build joined) and after a font zoom or DPI
+                    // change that keeps rows/cols (where `apply_term_resize` returns
+                    // early). Memoized on `cell_px_reported`, so it cannot churn
+                    // SIGWINCH.
+                    aterm_pty::resize_with_cell_px(s.master, grid.0, grid.1, Some(px));
                 }
-                // The PTY learns it too, with the same rows/cols and new pixels, so
-                // `TIOCGWINSZ` is right for the boot session (spawned at 0x0 before
-                // the backend build joined) and after a font zoom or DPI change
-                // that keeps rows/cols (where `apply_term_resize` returns early).
-                // Memoized on `cell_px_reported`, so it cannot churn SIGWINCH.
-                aterm_pty::resize_with_cell_px(s.master, grid.0, grid.1, Some(px));
+                send_window_reports(s, reports);
             }
         }
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -8409,7 +8366,11 @@ impl App {
         session: u64,
     ) -> Option<aterm_effects::companion_look::AppIdentity> {
         let s = self.pool.get(session)?;
-        let term = term_lock(&s.term);
+        let term = crate::term_lock_ui(
+            &s.term,
+            &s.ctx.ui_waiting,
+            crate::metrics::TermWaitSite::Redraw,
+        );
         let ws = self.windows.get_mut(&wid)?;
         ws.fx.look_mut().claim(
             session,
@@ -8957,10 +8918,10 @@ impl App {
     ) -> crate::cursor_glow::GlowConfig {
         crate::app_config::resolve_cursor_glow(
             crate::app_config::CursorGlowInputs {
-                enabled: self.config.cursor_trail_or_default()
-                    && self
-                        .serious_mode_policy()
-                        .allows(crate::motion::SeriousEffect::CursorGlow),
+                // The style decides whether a trail is drawn (Off draws none).
+                enabled: self
+                    .serious_mode_policy()
+                    .allows(crate::motion::SeriousEffect::CursorGlow),
                 color: self.config.cursor_trail_color_u32(),
                 accent: self.config.cursor_trail_accent_u32(),
                 duration_ms: self.config.cursor_trail_ms_or_default(),
@@ -9044,8 +9005,7 @@ impl App {
             .cursor_trail_color_u32()
             .unwrap_or(crate::cursor_glow::COMET_DEFAULT_COLOR);
         crate::cursor_trail::TrailConfig {
-            enabled: self.config.cursor_trail_or_default()
-                && presentation.comet
+            enabled: presentation.comet
                 && self
                     .serious_mode_policy()
                     .allows(crate::motion::SeriousEffect::CursorTrail),
@@ -9098,7 +9058,7 @@ impl App {
         Ok(crate::cursor_glow::TrailStatus {
             style_raw: self.config.cursor_trail_style_raw(),
             style: glow_cfg.style,
-            config_enabled: self.config.cursor_trail_or_default(),
+            config_enabled: self.config.cursor_trail_drawn(),
             effective: glow_cfg.enabled,
             focused: win_focused,
             motion_stage: match self.motion_policy(win_focused) {
@@ -9401,7 +9361,6 @@ impl App {
                     amplitude: cursor_motion.amplitude(crate::motion::MotionEffect::CursorGlow),
                     shed_envelope: shed_env,
                     body_allowed: cursor_body_allowed,
-                    master: self.config.cursor_trail_or_default(),
                     momentum_glow: self.config.cursor_momentum_glow_or_default(),
                     user_tinted: self.config.cursor_trail_color_u32().is_some(),
                 },
@@ -10293,6 +10252,33 @@ impl App {
                 {
                     animation = crate::settings_preview::PreviewAnimation::Continuous;
                 }
+                // A Themes demo that came to rest since its last paint asks
+                // for nothing more, so the glass would keep its last playing
+                // frame: one more edge draws the settled one, and the next
+                // poll, finding it drawn, goes idle.
+                if animation == crate::settings_preview::PreviewAnimation::None
+                    && let Some(now) = state.theme_demo_frame(
+                        phase_ms,
+                        motion,
+                        font_px,
+                        self.windows[&wid].scale.max(f64::EPSILON) as f32,
+                    )
+                    && self
+                        .windows
+                        .get(&wid)
+                        .and_then(|window| window.leaf_render_cache.get(&view))
+                        .and_then(|cache| cache.native.as_ref())
+                        .is_some_and(|raster| {
+                            raster.compiled.paint.iter().any(|paint| {
+                                matches!(&paint.content,
+                                    crate::native_ui::UiContent::SettingsPreview(spec)
+                                    if spec.demo_frame().is_some_and(|drawn| drawn != now))
+                            })
+                        })
+                {
+                    animation =
+                        crate::settings_preview::PreviewAnimation::BlinkEdge { after_ms: 1 };
+                }
                 (animation != crate::settings_preview::PreviewAnimation::None)
                     .then_some((view, animation))
             }
@@ -10385,11 +10371,7 @@ impl App {
             window.route_card = None;
             return false;
         };
-        let Some(host) = window
-            .conn_wire_card
-            .as_ref()
-            .or(window.badge_card.as_ref())
-        else {
+        let Some(host) = window.badge_card.as_ref() else {
             window.route_card = None;
             return true;
         };
@@ -10460,6 +10442,7 @@ impl App {
             return false;
         }
         window.route_card = Some(crate::SettingsCard {
+            scrim: None,
             rgba,
             pw,
             ph,
@@ -10709,6 +10692,7 @@ impl App {
         ws.leaf_render_cache.insert(view, cache);
         if let Some((rgba, pw, ph)) = raster {
             ws.settings_card = Some(crate::SettingsCard {
+                scrim: None,
                 rgba,
                 pw,
                 ph,
@@ -11012,6 +10996,7 @@ impl App {
                 )
             });
         let grid = self.chrome_palette(ChromeSurface::Grid);
+        let fluent_seam = self.fluent_seam(plan);
         if let Some(window) = self.windows.get_mut(&id) {
             fill_divider_grid(
                 &mut window.input_scratch,
@@ -11020,6 +11005,16 @@ impl App {
                 grid,
                 active_pane_mark,
             );
+            if let Some((inks, layout)) = &fluent_seam {
+                crate::pane_chrome::stamp_seam_lines(
+                    &mut window.input_scratch,
+                    rows,
+                    cols,
+                    *inks,
+                    layout,
+                    &[],
+                );
+            }
             // Bump right after the cells rewrite, since the `abandoned` bail skips
             // the exit bump: the divider fill rewrites `cells` but leaves the engine
             // continuity stamps, so the scoped refill would otherwise retain the
@@ -11519,6 +11514,7 @@ impl App {
             match native_layer {
                 Some(rgba) => {
                     window.settings_card = Some(crate::SettingsCard {
+                        scrim: None,
                         rgba,
                         pw: width,
                         ph: height,
@@ -11774,7 +11770,7 @@ impl App {
                     if overlay_open {
                         None
                     } else {
-                        self.presence_overlay(id, now)
+                        self.presence_overlay(id)
                     }
                 })
         };
@@ -11956,7 +11952,7 @@ impl App {
         // renderers, and every GUI renderer is sealed before its first pixel.
         //
         // Register the Windows taskbar jump list once per process, after the first
-        // frame reached the compositor, on its own short-lived thread (the shell
+        // frame reached the compositor, on the jump list's own thread (the shell
         // round-trips registry and profile-disk IO under CommitList, which would
         // sit on time-to-glass at startup). Best-effort; see `jumplist_win`. Never
         // from a unit-test binary: the list is committed against the app's AUMID,
@@ -12278,7 +12274,7 @@ impl App {
         &mut self,
         id: WindowId,
         frame_started: Instant,
-        window: &Option<Arc<winit::window::Window>>,
+        window: &Option<Arc<aterm_window::window::Window>>,
         plan: &crate::tab_model::VisibleLeafPlan,
     ) {
         let Some(title) = self.prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan(
@@ -12290,10 +12286,12 @@ impl App {
         };
         self.splice_find_bar(id);
         self.splice_build_badge(id);
-        self.splice_conn_wire(id);
         if !self.compose_native_route_card(id) {
             return;
         }
+        // The stats Deck in the headroom, folded under the card above.
+        self.splice_stats_deck(id);
+        self.fold_stats_deck(id);
         // The Claude Code footer in each Claude pane's composer bottom rule
         // (`crate::claude_footer`), before the paste question and link caption,
         // which paint over it.
@@ -12350,7 +12348,7 @@ impl App {
         instance: crate::tab_model::AppInstanceId,
         view: crate::tab_model::ViewId,
         frame_started: Instant,
-        window: &Option<Arc<winit::window::Window>>,
+        window: &Option<Arc<aterm_window::window::Window>>,
         plan: &crate::tab_model::VisibleLeafPlan,
     ) {
         if !self.prepare_native_input_scratch_from_plan(id, plan) {
@@ -12358,10 +12356,12 @@ impl App {
         }
         self.splice_find_bar(id);
         self.splice_build_badge(id);
-        self.splice_conn_wire(id);
         if !self.compose_native_route_card(id) {
             return;
         }
+        // The stats Deck in the headroom, folded under the card above.
+        self.splice_stats_deck(id);
+        self.fold_stats_deck(id);
         // The multi-line-paste confirmation is a security question painted over
         // the top rows.
         self.splice_paste_banner(id);
@@ -12502,10 +12502,10 @@ impl App {
         // every route reads the same frame; `band_fp` folds its fingerprint (0 when
         // nothing moves).
         self.prepare_band_motion(id, frame_started);
-        // Connection map lease/watcher annotations have no wake funnel, so the open
-        // map's terms are stamped at paint time, ahead of the repaint key. A cheap
-        // no-op otherwise.
-        self.connection_map_prepaint(id);
+        // An open Overview's coarse ages move with no wake: read again here at
+        // most once a minute, ahead of the repaint key. One clock compare on
+        // every other frame, a no-op with no card open.
+        self.overview_prepaint(id);
         // After a GPU-loss fallback a window's CPU surface may not exist yet;
         // rebuild a missing or mismatched target inside the bounded failed-present
         // funnel, so a transient softbuffer failure backs off.
@@ -12584,9 +12584,13 @@ impl App {
         {
             ws.fx.companion_mut().withdraw_hit_rect();
         }
-        // Per-pane snapshots retire with their route.
+        // Per-pane snapshots retire with their route, and so do the overlays'
+        // facts: only a terminal route draws (and hit-tests) a scrollbar.
         if let Some(ws) = self.windows.get_mut(&id) {
             Self::retire_unfocused_pane_snapshots(ws, route);
+            if !matches!(route, crate::VisibleContentRoute::Terminal { .. }) {
+                ws.pane_overlay.clear();
+            }
         }
         let multi_pane = match route {
             crate::VisibleContentRoute::Terminal { composed } => {
@@ -12776,6 +12780,9 @@ impl App {
             // The front session's effective rain state (runtime override, else
             // config), read before the `ws` borrow; a tab switch re-evaluates it.
             let rain_session_on = self.session_rain_enabled(front_terminal.session);
+            // The overlay scrollbar's inputs (`crate::pane_chrome`), read before
+            // the borrow; `None` keeps the legacy pill below.
+            let overlay_inputs = self.pane_overlay_inputs(id, false);
             let Some(ws) = self.windows.get_mut(&id) else {
                 return;
             };
@@ -13242,6 +13249,9 @@ impl App {
             // The Claude Code footer's facts for this plan, read before the window is
             // borrowed mutably below (`App::claude_footer_fp` reads the pool).
             let claude_footer_fp = self.claude_footer_fp(id, plan);
+            // The stats Deck's prims (`0` with no Deck), read before the window
+            // is borrowed mutably below.
+            let deck_fp = self.stats_deck_fp(id);
             let Some(ws) = self.windows.get_mut(&id) else {
                 return;
             };
@@ -14028,7 +14038,38 @@ impl App {
             // (thumb ∝ viewport/history), the envelope `pill_alpha` (reduced motion
             // shows/hides with no ramp). `pill_fp` joins the RepaintKey (0 when
             // invisible). Suppressed on the alt screen.
-            let pill_fp = {
+            //
+            // With `scrollbar` on (the Windows default) the overlay scrollbar
+            // (`crate::pane_chrome`) takes the pill's place and its key term.
+            let pill_fp = if let Some(inputs) = overlay_inputs {
+                ws.pane_overlay.begin();
+                ws.pane_overlay.note(
+                    crate::pane_chrome::PaneFacts {
+                        session: front_terminal.session,
+                        rect: crate::pane_chrome::CellBox {
+                            row: 0,
+                            col: 0,
+                            rows,
+                            cols,
+                        },
+                        focused: true,
+                        offset: u32::try_from(display_offset).unwrap_or(u32::MAX),
+                        history: u32::try_from(scrollback_lines).unwrap_or(u32::MAX),
+                        alt: is_alt,
+                        cursor: None,
+                        cursor_rgb: [0; 3],
+                        moved: None,
+                    },
+                    frame_started,
+                );
+                ws.pane_overlay.finish(
+                    inputs,
+                    &mut ws.scroll_pill,
+                    &mut ws.pill_shown,
+                    frame_started,
+                )
+            } else {
+                ws.pane_overlay.clear();
                 let animated = scroll_motion.animate(crate::motion::MotionEffect::ScrollPill);
                 let alpha = ws.scroll_pill.alpha(frame_started, animated);
                 let hist = scrollback_lines;
@@ -14114,13 +14155,9 @@ impl App {
                 ws.band_hover,
                 band_geom,
             );
-            // Presence: 0 on a quiet window (no rim, no row, no ripple) — read
-            // off the borrowed window state, the same term `presence_fp` folds.
-            let presence_fp = ws.presence.fp(frame_started);
-            // Drag-to-connect wire on this window: `0` when none renders here, a
-            // cursor-tracking hash while one does.
-            let conn_wire_fp =
-                crate::app_conn_drag::conn_wire_fp_for(self.conn_drag.as_ref(), id, ws.win_px);
+            // Presence: 0 on a quiet window (no border, no pill) — read off
+            // the borrowed window state, the same term `presence_fp` folds.
+            let presence_fp = ws.presence.fp();
             let key = RepaintKey {
                 damage_epoch: epoch,
                 grid_top,
@@ -14165,10 +14202,10 @@ impl App {
                 },
                 relaunch_fp,
                 badge_fp,
+                deck_fp,
                 level_up_fp,
                 band_fp,
                 presence_fp,
-                conn_wire_fp,
                 // An OS appearance flip must reach the glass: the Settings
                 // preview's auto titlebar mock splits on it and no other term moves.
                 system_dark: repaint_system_dark(self.os_appearance),
@@ -14407,6 +14444,9 @@ impl App {
             ws.input_scratch.apron_row.clear();
             ws.input_scratch.apron_stamp = None;
         }
+        // The overlay scrollbar and unfocused panes' hollow cursors, under every
+        // band and card spliced below (`crate::pane_chrome`).
+        self.splice_pane_overlay(id);
         // The Cmd-F find bar (a no-op when not searching).
         self.splice_find_bar(id);
         // The modal Settings panel, after the grid and strip so it paints on top.
@@ -14414,9 +14454,10 @@ impl App {
         // Top-right build/version badge: paint-only, its own slot, shown only when
         // no overlay is open; a no-op when the setting is off.
         self.splice_build_badge(id);
-        // Drag-to-connect wire: paint-only, its own slot, over the badge card
-        // while a connection drag from this window is in flight.
-        self.splice_conn_wire(id);
+        // The stats Deck in the chrome headroom (`crate::stats_deck`), folded
+        // under whichever card the window presents.
+        self.splice_stats_deck(id);
+        self.fold_stats_deck(id);
         // The Claude Code footer in each Claude pane's composer bottom rule
         // (`crate::claude_footer`), within the pane's columns; the paste question,
         // link caption and tab menu outrank it.
@@ -14613,7 +14654,7 @@ impl App {
                         let t = crate::tab_label::informative(term.title());
                         slot.clear();
                         if !t.is_empty() {
-                            slot.push_str(t);
+                            t.push_to(slot);
                         } else if let Some(cwd) =
                             crate::cwd_native::ReportedCwd::native_working_directory(&*term)
                                 .filter(|cwd| !cwd.is_empty())
@@ -14668,9 +14709,11 @@ impl App {
                 .iter()
                 .map(|tab| tab_bar::TabStripMetadata::from_presentation(&tab.presentation)),
         );
-        // The drag-to-connect drop-target highlight, stamped on the buffer the
-        // strip fingerprint hashes so a target change repaints the strip.
-        self.stamp_conn_drop_target(id, metadata);
+        // Each tab's need mark and team marks (owner surfaces §5), the
+        // native strip's own stamp: off macOS this strip is the only one.
+        // Lock-free (`App::stamp_presence_chips`), so the hot path pays map
+        // reads only.
+        self.stamp_presence_chips(id, metadata);
     }
 
     /// Ensure a windowed CPU-backend window owns a CPU presentation target. The
@@ -14945,8 +14988,20 @@ impl App {
                 && cached.cols == cols
         });
         if !fresh {
-            let pixels = scale_wallpaper_cover(&rgba, sw, sh, w, h, dim, bg);
-            let tint = wallpaper_cell_tints(&pixels, w, h, rows, cols, default_fg);
+            // The one preparation every surface shares (the Settings previews
+            // draw the wallpaper through it too).
+            let prepared = crate::wallpaper_present::prepare(
+                crate::wallpaper_present::WallpaperSource {
+                    rgba: &rgba,
+                    w: sw,
+                    h: sh,
+                    fp,
+                },
+                (w, h),
+                (rows, cols),
+                dim,
+                (bg, default_fg),
+            );
             ws.wallpaper_scaled = Some(WallpaperScaled {
                 fp,
                 dim_bits,
@@ -14956,13 +15011,8 @@ impl App {
                 h: h as u32,
                 rows,
                 cols,
-                atlas: std::sync::Arc::new(aterm_core::render::SceneAtlas {
-                    width: w as u32,
-                    height: h as u32,
-                    rgba: pixels,
-                    version: fp ^ u64::from(dim_bits) ^ (((w as u64) << 32) | h as u64),
-                }),
-                tint,
+                atlas: prepared.atlas,
+                tint: prepared.tint,
             });
         }
         ws.input_scratch.wallpaper = ws
@@ -14982,7 +15032,7 @@ impl App {
             // Merge-walk: existing (sorted, unique) ink wins its cells; the
             // wallpaper fills default-fg glyphs between them. The second vector is
             // window-owned scratch, so steady tinted frames allocate nothing.
-            merge_wallpaper_tint_ink(
+            crate::wallpaper_present::merge_wallpaper_tint_ink(
                 &ws.input_scratch.cells,
                 rows,
                 cols,
@@ -15046,6 +15096,9 @@ impl App {
         // content revisions and occupied-row sets once, so prior-frame caches need
         // not clone or rescan the ribbon to decide dirty rows.
         ws.input_scratch.refresh_cursor_effect_damage();
+        // What every effect producer handed this frame, read off the final
+        // input for either arm (`fx_streams_last=`).
+        metrics::note_fx_streams(&ws.input_scratch);
         if backend.is_gpu() {
             // GPU present: render the offscreen frame and blit it into the
             // swapchain (no Frame, no softbuffer copy, no readback); the blit
@@ -15067,19 +15120,22 @@ impl App {
                 height: u32::try_from(visible_height).unwrap_or(u32::MAX),
             };
             // Tray quad for the GPU as raw bytes plus a device-px rect (`None` draws
-            // nothing). Precedence for the one slot: modal card, then connection
-            // wire, then the build badge.
+            // nothing). Precedence for the one slot: modal card, then the build
+            // badge.
             let tray_arg = ws
-                .route_card
+                .deck_fold
                 .as_ref()
+                .or(ws.route_card.as_ref())
                 .or(ws.settings_card.as_ref())
-                .or(ws.conn_wire_card.as_ref())
                 .or(ws.badge_card.as_ref())
+                .or(ws.deck_card.as_ref())
                 .and_then(|card| tray_quad_below_y(card, tray_floor_y))
                 .map(|mut quad| {
-                    quad.dy = quad
-                        .dy
-                        .saturating_add(u32::try_from(source_crop_top).unwrap_or(u32::MAX));
+                    let crop = u32::try_from(source_crop_top).unwrap_or(u32::MAX);
+                    quad.dy = quad.dy.saturating_add(crop);
+                    if let Some(scrim) = quad.scrim.as_mut() {
+                        scrim.top = scrim.top.saturating_add(crop);
+                    }
                     quad
                 });
             // Map the glow to GPU overlay params (alphas are the caller's; the GPU
@@ -15158,7 +15214,15 @@ impl App {
                     if matches!(reported, Ok(None)) {
                         pending_surface = Some(gpu_surface.acquire_id());
                     }
-                    reported.map(|presented| presented.map(|()| window_gpu.last_present_work_ns()))
+                    reported.map(|presented| {
+                        presented.map(|()| {
+                            metrics::note_gpu_frame(
+                                gpu.frame_shape(),
+                                window_gpu.last_present_encode_ns(),
+                            );
+                            window_gpu.last_present_work_ns()
+                        })
+                    })
                 }
                 // Headless recording target: the same compose-and-blit into the
                 // persistent virtual texture (tap copy included), with no
@@ -15177,6 +15241,10 @@ impl App {
                             u32::try_from(visible_height).unwrap_or(u32::MAX),
                         ),
                     ) {
+                        metrics::note_gpu_frame(
+                            gpu.frame_shape(),
+                            window_gpu.last_present_encode_ns(),
+                        );
                         Ok(Some(window_gpu.last_present_work_ns()))
                     } else {
                         Err(metrics::PresentDropReason::Virtual)
@@ -15227,8 +15295,8 @@ impl App {
                 || overlay.is_some()
                 || ws.route_card.is_some()
                 || ws.settings_card.is_some()
-                || ws.conn_wire_card.is_some()
-                || ws.badge_card.is_some();
+                || ws.badge_card.is_some()
+                || ws.deck_card.is_some();
             let chrome_prev = ws.cpu_cache.presented_chrome();
             // Render into the per-window damage cache (per window, so two windows
             // on one CPU `Renderer` keep separate damage tracking) and borrow the
@@ -15236,7 +15304,12 @@ impl App {
             // disjoint borrows; the exclusive render borrow ends after the dims read.
             let raster_started = Instant::now();
             let (fw, raw_fh) = {
-                let view = r.render_input_cached(&mut ws.cpu_cache, &ws.input_scratch);
+                let view = r
+                    .try_render_input_cached(&mut ws.cpu_cache, &ws.input_scratch)
+                    .map_err(|error| {
+                        aterm_log::warn!("CPU render refused: {error}");
+                        metrics::PresentDropReason::CpuRaster
+                    })?;
                 (view.width().max(1), view.height().max(1))
             };
             // The renderer cache allocates `2*pad`; expose only configured-top plus
@@ -15342,11 +15415,12 @@ impl App {
                     // Backend order: base → tray → bell invert → accent overlay,
                     // matching the GPU path's blit effects after the tray.
                     let tray = ws
-                        .route_card
+                        .deck_fold
                         .as_ref()
+                        .or(ws.route_card.as_ref())
                         .or(ws.settings_card.as_ref())
-                        .or(ws.conn_wire_card.as_ref())
                         .or(ws.badge_card.as_ref())
+                        .or(ws.deck_card.as_ref())
                         .and_then(|card| tray_quad_below_y(card, tray_floor_y));
                     apply_host_chrome_at(
                         &mut buf[..n],
@@ -16030,8 +16104,19 @@ impl App {
                 )
             },
         );
+        let fluent_seam = self.fluent_seam(&plan);
         let ws = self.windows.get_mut(&wid)?;
         fill_divider_grid(&mut ws.input_scratch, rows, cols, grid, active_pane_mark);
+        if let Some((inks, layout)) = &fluent_seam {
+            crate::pane_chrome::stamp_seam_lines(
+                &mut ws.input_scratch,
+                rows,
+                cols,
+                *inks,
+                layout,
+                &[],
+            );
+        }
         let sole_pane = panes.len() == 1;
         let mut sole_default_bg = None;
         let mut focused_cursor_rgb = None;
@@ -17320,6 +17405,16 @@ impl App {
                     .get(&wid)
                     .is_some_and(|w| w.fx.rain().is_some())
         });
+        // The overlays (`crate::pane_chrome`) read each pane under the loop's own
+        // hold below, and are built before the repaint decision.
+        let overlay_inputs = self.pane_overlay_inputs(wid, panes.len() > 1);
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            if overlay_inputs.is_some() {
+                ws.pane_overlay.begin();
+            } else {
+                ws.pane_overlay.clear();
+            }
+        }
         // Inspect the focused pane last, so every sibling passes its DEC-2026
         // fence before the focused pane mutates cursor/rain/companion state; a
         // late hold discards only host-side snapshots.
@@ -17370,6 +17465,26 @@ impl App {
             damage_epoch = damage_epoch.wrapping_add(term.damage_epoch());
             pane_selection_fp =
                 crate::fold_pane_selection_fp(pane_selection_fp, pane_index, term.text_selection());
+            // The overlays' facts (scrollbar, an unfocused pane's hollow cursor),
+            // under this same hold.
+            if overlay_inputs.is_some()
+                && let Some(ws) = self.windows.get_mut(&wid)
+            {
+                ws.pane_overlay.note(
+                    crate::pane_chrome::PaneFacts::read(
+                        r.session,
+                        crate::pane_chrome::CellBox {
+                            row: usize::from(r.row_off),
+                            col: usize::from(r.col_off),
+                            rows: usize::from(r.rows),
+                            cols: usize::from(r.cols),
+                        },
+                        pane_index == focus_index,
+                        &term,
+                    ),
+                    now,
+                );
+            }
             if pane_index == focus_index {
                 focus_selection = SelectionFingerprint::of(term.text_selection());
                 let cp = term.cursor();
@@ -18148,6 +18263,7 @@ impl App {
             .map_or(0, |s| s.fingerprint());
         let relaunch_fp = self.relaunch.as_ref().map_or(0, |n| n.fingerprint());
         let badge_fp = crate::build_badge::fingerprint(self.config.show_build_badge_or_default());
+        let deck_fp = self.stats_deck_fp(wid);
         // (`0` under a drag hover outside an overlay, as in the single-pane key:
         // the drop glow is painted there, not the rim.)
         let drag_covers = self
@@ -18169,9 +18285,15 @@ impl App {
             )
         });
         // Presence: the same term as the single-pane key (0 when quiet).
-        let presence_fp = self.presence_fp(wid, Instant::now());
-        // Drag-to-connect wire on this window (same term as the single-pane key).
-        let conn_wire_fp = self.conn_wire_fingerprint(wid);
+        let presence_fp = self.presence_fp(wid);
+        // This frame's overlays from the facts pass 1 read; `0` when none draws.
+        let overlay_fp = match overlay_inputs {
+            Some(inputs) => self.windows.get_mut(&wid).map_or(0, |ws| {
+                ws.pane_overlay
+                    .finish(inputs, &mut ws.scroll_pill, &mut ws.pill_shown, now)
+            }),
+            None => 0,
+        };
         // The active-pane mark from the pane box resolved for `focus` (the same
         // box as the cursor-effect clip). Uses `raw_focused`, not the typed-wake
         // fold: the mark answers only where the keyboard is.
@@ -18217,8 +18339,9 @@ impl App {
             }) ^ crate::autopilot_menu::fingerprint(self.autopilot_menu.as_ref(), wid),
             settings_fp,
             find_fp,
-            // Split-pane compose paints no scroll pill (single-pane only).
-            pill_fp: 0,
+            // The legacy scroll pill is single-pane only; a split keys its
+            // overlays (scrollbars, unfocused panes' hollow cursors).
+            pill_fp: overlay_fp,
             // The focused pane's live composition — same forcing term as the
             // single-pane key; the overlay is spliced into the focused leaf.
             preedit_fp: self.windows.get(&wid).map_or(0, |ws| {
@@ -18229,10 +18352,10 @@ impl App {
             scroll_frac_px: 0,
             relaunch_fp,
             badge_fp,
+            deck_fp,
             level_up_fp,
             band_fp,
             presence_fp,
-            conn_wire_fp,
             // Same appearance term as the single-pane key (see `RepaintKey`).
             system_dark: repaint_system_dark(self.os_appearance),
             // Same caption term as the single-pane key: the focused pane's
@@ -18272,6 +18395,9 @@ impl App {
                 cell_h: glow_ch,
             },
         );
+        // The Fluent seam's hairlines, resolved before the borrow (its focus
+        // ring is the overlays', `crate::pane_chrome::push_focus_ring`).
+        let fluent_seam = self.fluent_seam(plan);
         // Commit to presenting: re-borrow `ws` mutably and fill the composite
         // (divider cells first, then each pane).
         let ws = self.windows.get_mut(&wid)?;
@@ -18329,6 +18455,16 @@ impl App {
                 .take(if tiles_ready { panes.len() } else { 0 }),
             &ws.composed_retain.row_keep,
         );
+        if let Some((inks, layout)) = &fluent_seam {
+            crate::pane_chrome::stamp_seam_lines(
+                &mut ws.input_scratch,
+                rows,
+                cols,
+                *inks,
+                layout,
+                &ws.composed_retain.row_keep,
+            );
+        }
         // Focused-pane clip for the present-time GPU post-fx (bloom, heat-shimmer
         // refraction), which run on the finished frame after the host-side quad
         // clip and could otherwise blur or sample across a divider. `None`
@@ -18759,6 +18895,136 @@ impl App {
         slot
     }
 
+    /// What lies under window `wid`'s strip seam this frame
+    /// ([`tab_bar::StripFloor`]), first match wins:
+    ///
+    ///  * the message band or presence row (`bars` rows of them), the band's
+    ///    tone;
+    ///  * the find panel on the window's top row ([`Self::find_panel_meets_strip`]),
+    ///    its band's tone ([`chrome_band::band_colors`] on the panel's own
+    ///    `OverGrid` palette, read from where `splice_find_bar` paints it);
+    ///  * a split's pane headers on the top row, their fill
+    ///    ([`crate::pane_header::header_ground`]: the ground under the Fluent
+    ///    chrome);
+    ///  * a lone native page (Settings), its page `surface`
+    ///    ([`crate::settings::Roles`] on the native-page palette its raster
+    ///    paints with);
+    ///  * else the terminal's ground.
+    ///
+    /// The strip splice runs before the rows under it are spliced, so this reads
+    /// the state that decides them, never their pixels, and it reads the active
+    /// tab's split tree rather than planning it: a frame plans its tab once.
+    pub(crate) fn strip_floor(
+        &self,
+        wid: WindowId,
+        bars: usize,
+        header: crate::chrome_band::ChromePalette,
+    ) -> tab_bar::StripFloor {
+        if !tab_bar::SELECTED_TAB_IS_GROUND {
+            return tab_bar::StripFloor::Ground;
+        }
+        if bars > 0 {
+            return tab_bar::StripFloor::Surface(chrome_band::band_colors(header).bar_bg);
+        }
+        if self.find_panel_meets_strip(wid) {
+            let panel = self.chrome_palette(ChromeSurface::OverGrid(wid));
+            return tab_bar::StripFloor::Surface(chrome_band::band_colors(panel).bar_bg);
+        }
+        match self.active_lone_view(wid) {
+            // A split: every pane on the top row has its header there
+            // (`VisibleLeafPlan::reserve_pane_headers`).
+            None if self.active_tab_is_split(wid) => {
+                tab_bar::StripFloor::Surface(crate::pane_header::header_colors(header).bar_bg)
+            }
+            Some(view)
+                if matches!(
+                    self.view_store.get(view),
+                    Some(crate::tab_model::View::Native(_))
+                ) =>
+            {
+                let page = self.chrome_palette(ChromeSurface::NativePage);
+                tab_bar::StripFloor::Surface(crate::settings::Roles::from_theme(page).surface)
+            }
+            _ => tab_bar::StripFloor::Ground,
+        }
+    }
+
+    /// The colour window `wid` paints its selected tab with while the
+    /// `active_tab_color` key is unset ([`tab_bar::automatic_active_tab_color`]):
+    /// the strip's derivation over the header palette with the theme's own
+    /// authored chrome and this frame's floor, or macOS's native pill. Settings
+    /// is handed it as a host fact (`ViewMotionCx::automatic_tab_color`) and
+    /// shows it wherever "Automatic" is named.
+    pub(crate) fn automatic_tab_color(&self, wid: WindowId) -> [u8; 3] {
+        let mut header = self.chrome_palette(ChromeSurface::Header);
+        header.authored.active_tab = self.installed_colors.theme_authored_chrome().active_tab;
+        let floor = self.strip_floor(wid, usize::from(self.message_band_rows), header);
+        tab_bar::automatic_active_tab_color(
+            header,
+            floor,
+            self._toolbars
+                .get(&wid)
+                .and_then(crate::toolbar::native_selected_pill_rgb),
+        )
+    }
+
+    /// Does window `wid`'s active tab show more than one pane (a split that is
+    /// not zoomed)?
+    fn active_tab_is_split(&self, wid: WindowId) -> bool {
+        self.windows
+            .get(&wid)
+            .and_then(|ws| ws.tab_set.active())
+            .is_some_and(|tab| {
+                !tab.zoomed && matches!(tab.root, crate::tab_model::SplitTree::Split { .. })
+            })
+    }
+
+    /// The one view window `wid`'s active tab shows when it shows one: its lone
+    /// leaf, or the focused one of a zoomed split.
+    fn active_lone_view(&self, wid: WindowId) -> Option<crate::tab_model::ViewId> {
+        let tab = self.windows.get(&wid)?.tab_set.active()?;
+        match &tab.root {
+            crate::tab_model::SplitTree::Leaf(view) => Some(*view),
+            crate::tab_model::SplitTree::Split { .. } => tab.zoomed.then_some(tab.focus),
+        }
+    }
+
+    /// Does this frame's find panel sit on the window's first row, right under
+    /// the strip? The panel rides the focused pane's top rows, floated to its
+    /// bottom while the current match sits under them: the placement
+    /// `splice_find_bar` makes later in the frame, from the same search state,
+    /// region and frame base (`find_panel_placement_matches_the_strip_floor`
+    /// holds the two together).
+    pub(crate) fn find_panel_meets_strip(&self, wid: WindowId) -> bool {
+        let Some(ws) = self.windows.get(&wid) else {
+            return false;
+        };
+        let Some(search) = ws.search.as_ref() else {
+            return false;
+        };
+        // In a split the panel rides the focused pane under its header; with one
+        // pane its region is the whole terminal band (`Self::find_region`).
+        if self.active_tab_is_split(wid) {
+            return false;
+        }
+        let rows = usize::from(ws.rows);
+        if rows == 0 || ws.cols == 0 {
+            return false;
+        }
+        let stale = ws.input_scratch.absolute_row_revision != search.match_absolute_row_revision
+            || ws.input_scratch.history_renumber_epoch != search.match_history_renumber_epoch;
+        let delta = ws.input_scratch.base_y.saturating_sub(search.match_base_y);
+        let offset = i64::from(ws.input_scratch.display_offset).saturating_sub(delta);
+        let current = (!stale)
+            .then(|| search.matches.get(search.current).map(|&(r, _, _)| r))
+            .flatten()
+            .map(|r| i64::from(r).saturating_add(offset));
+        let band_rows = crate::find_bar::FIND_BAR_ROWS.min(rows);
+        let floats =
+            rows > band_rows && current.is_some_and(|r| r >= 0 && (r as usize) < band_rows);
+        !floats
+    }
+
     /// Splice with the strip fingerprint `tab_strip` the caller already computed
     /// (the redraw reuses the RepaintKey's, so each tab's terminal is locked once
     /// per present). Labels come from the window's `strip_titles_scratch`. When
@@ -18783,16 +19049,21 @@ impl App {
         // would put a hard slab behind them. The renderer keeps
         // `ChromeBleed::top_extends_cells` for a band without cards.
         let extend_top = false;
-        // The message band and this window's presence row ride the same splice
-        // below the strip rows (chrome rows too, prepended first), and their
-        // gutters join the bleed: the strip's band tones when it has a band, else
-        // the band's tone with its closing seam.
-        let bars = usize::from(self.message_band_rows)
-            + usize::from(self.windows.get(&wid).map_or(0, |ws| ws.presence.rows));
+        // The message band rides the splice below the strip rows (chrome rows
+        // too, prepended first), and its gutters join the bleed: the strip's
+        // band tones when it has a band, else the band's tone with its closing
+        // seam.
+        let bars = usize::from(self.message_band_rows);
         // Chrome-resolved like the strip rows (the Header surface), so a forced
         // `window_theme` does not leave terminal-coloured gutters.
         let header = self.chrome_palette(ChromeSurface::Header);
         let chrome_theme = header.theme;
+        // The Windows caption takes the tone of what sits right under it (the
+        // band, else this frame's live background), on the frame that paints it.
+        #[cfg(windows)]
+        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+            crate::platform_win::note_caption_surface(w, self.caption_surface_tone(wid));
+        }
         let strip_bleed = (strip > 0)
             .then(|| tab_bar::strip_bleed_tones(header))
             .flatten();
@@ -18825,7 +19096,7 @@ impl App {
         let bleed = bleed.map(|mut b| {
             if let Some(ws) = self.windows.get(&wid) {
                 b.row_edges = band_row_edges(
-                    strip + usize::from(ws.presence.rows),
+                    strip,
                     usize::from(self.message_band_rows),
                     &ws.cached_band_edges,
                 );
@@ -18856,6 +19127,18 @@ impl App {
                 ws.tab_set.active_index().unwrap_or(0),
             ),
             None => return,
+        };
+        // What lies under the seam this frame (`tab_bar::StripFloor`): the
+        // selected tab opens into it or stands on the seam, and the band's foot
+        // and the gutters' rail take its tone. It changes the strip's pixels
+        // with nothing else changing (a split, the find panel, Settings in
+        // front), so it is folded into the fingerprint the strip cache compares.
+        let floor = self.strip_floor(wid, bars, header);
+        let tab_strip = {
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            (tab_strip, floor).hash(&mut hash);
+            hash.finish()
         };
         // A staged update shows the leading `↻` alert in the strip (even with one tab),
         // so it's folded into the cache key + it forces the strip to appear.
@@ -18936,6 +19219,14 @@ impl App {
             .windows
             .get(&wid)
             .is_some_and(|ws| ws.strip_hover_version);
+        // THE WINDOW'S NEEDS PILL (owner surfaces §5), where this strip carries
+        // it ([`App::strip_carries_pill`]): its key term is the view's seed and
+        // the pill's next age step — plain reads, no words composed — so a quiet
+        // window's key is `None` and a lit one's moves exactly when its pill does.
+        let pill_key = self
+            .strip_carries_pill(wid)
+            .then(|| self.presence_pill_key(wid))
+            .flatten();
         // The window's own buttons, where the band is its header (a Wayland window
         // the compositor leaves undecorated, `crate::client_frame`): measured at
         // this window's cell width and scale, and which one the pointer is on —
@@ -18969,6 +19260,7 @@ impl App {
                         && key.7 == version_hovered
                         && key.8 == caption
                         && key.9 == caption_hovered
+                        && key.10 == pill_key
                 })
         });
         if !hit {
@@ -18994,15 +19286,42 @@ impl App {
                 .get_mut(&wid)
                 .map(|ws| std::mem::take(&mut ws.strip_metadata_scratch))
                 .unwrap_or_default();
+            // The pill's words as of this build, composed only on a miss.
+            let pill = pill_key.and_then(|_| self.presence_pill(wid));
+            // The titles as this strip shows them: the team marks (owner
+            // surfaces §5, S9) ride them, borrowed whole where no tab wears one.
+            let shown = tab_bar::team_titles(&titles, &metadata);
+            // The Windows tabs' sizing (`tab_bar::TabSizing`): the cap in DIPs at
+            // this window's cell width and scale, and each tab's growth toward
+            // its title as the strip shows it, measured in the band's UI face.
+            // Titles and metrics are already cache-key terms (the fingerprint,
+            // `band_key`).
+            #[cfg(any(windows, target_os = "linux"))]
+            let wants = tab_bar::pixel_band::tab_wants(
+                &shown,
+                &metadata,
+                band_key.0,
+                band_key.2 + strip * band_key.1,
+                f32::from_bits(band_key.3),
+            );
+            #[cfg(not(any(windows, target_os = "linux")))]
+            let wants: Vec<u16> = Vec::new();
+            let sizing = tab_bar::TabSizing::at(
+                self.win_cell_size(wid).0,
+                self.windows.get(&wid).map_or(1.0, |ws| ws.scale) as f32,
+                &wants,
+            );
             let segments = if tab_count > 0 || show_update || caption.cols() > 0 {
-                tab_bar::layout_segments_with_caption(
+                tab_bar::layout_segments_with_caption_sized(
                     cols as u16,
                     tab_count,
                     &metadata,
                     active,
                     show_update,
                     version_slot,
+                    pill.as_ref().map(|pill| &pill.words),
                     caption,
+                    sizing,
                 )
             } else {
                 Vec::new()
@@ -19029,12 +19348,26 @@ impl App {
                     };
                     (strip_images, strip_rename_caret) =
                         tab_bar::paint_strip_with_metadata_and_rename_caret(
-                            &mut row, &segments, &titles, &metadata, paint, active, palette,
+                            &mut row, &segments, &shown, &metadata, paint, active, palette, floor,
                         );
+                    if let Some(pill) = pill.as_ref() {
+                        tab_bar::paint_strip_pill(
+                            &mut row,
+                            &segments,
+                            tab_bar::StripPill {
+                                kind: pill.kind,
+                                words: &pill.words,
+                            },
+                            palette,
+                        );
+                    }
                 }
                 if r + 1 == strip {
-                    // The band's bottom edge, stamped after the paint on whatever the
-                    // last row is (segments or bare chrome). A no-op on macOS.
+                    // The band's bottom edge on Linux, stamped after the paint on
+                    // whatever the last row is (segments or bare chrome). On
+                    // Windows it is a rail on the last row's last pixel rows
+                    // (`tab_bar::strip_seam_rail`, installed after the prepend). A
+                    // no-op on macOS.
                     tab_bar::seal_strip_bottom(&mut row, palette);
                 }
                 rows.push(row);
@@ -19060,22 +19393,33 @@ impl App {
                             cursor: *cursor,
                         }),
                 };
-                // The seam's canvas position (the underline the cell lane stamps
-                // across the strip's last row), read per window for mixed DPI. The
-                // band's cards are centred above it. Every input is already a
-                // band-key term.
-                let seam_top_px = self.windows.get(&wid).map(|ws| {
-                    band_key.2
-                        + strip.saturating_sub(1) * band_key.1
-                        + self
-                            .backend
-                            .deco_metrics_for(ws.metrics.font_px)
-                            .underline_y
-                });
+                // The seam's canvas position: on Windows the band's last pixel
+                // rows, where the strip's rail runs (`tab_bar::strip_seam_rail`);
+                // on Linux the underline the cell lane stamps across the strip's
+                // last row, read per window for mixed DPI. The band's cards are
+                // centred above it. Every input is already a band-key term. On
+                // Windows the band's foot (`tab_bar::strip_foot_px`) is under it.
+                let foot_px = self.strip_foot_px(wid, strip);
+                let seam_top_px = if tab_bar::STRIP_WINDOWS_PAINT {
+                    Some(
+                        (band_key.2 + strip * band_key.1)
+                            .saturating_sub(tab_bar::strip_seam_px(f32::from_bits(band_key.3)))
+                            .saturating_sub(foot_px),
+                    )
+                } else {
+                    self.windows.get(&wid).map(|ws| {
+                        band_key.2
+                            + strip.saturating_sub(1) * band_key.1
+                            + self
+                                .backend
+                                .deco_metrics_for(ws.metrics.font_px)
+                                .underline_y
+                    })
+                };
                 tab_bar::pixel_band::raster_band(
                     &tab_bar::pixel_band::BandInput {
                         segments: &segments,
-                        titles: &titles,
+                        titles: &shown,
                         metadata: &metadata,
                         paint,
                         active,
@@ -19088,7 +19432,9 @@ impl App {
                             band_top_px: band_key.2,
                             scale: f32::from_bits(band_key.3),
                             seam_top_px,
+                            foot_px,
                         },
+                        floor,
                     },
                     &strip_images,
                 )
@@ -19099,6 +19445,9 @@ impl App {
                 ws.cached_strip_rows = rows;
                 ws.cached_strip_images = strip_images;
                 ws.cached_strip_rename_caret = strip_rename_caret;
+                // The session the drawn pill names: what a click on its regions
+                // carries, so a pill that moved since acts on nothing.
+                ws.strip_pill_session = pill.as_ref().map(|pill| pill.session);
                 ws.last_strip_fp = Some((
                     tab_strip,
                     cols,
@@ -19110,6 +19459,7 @@ impl App {
                     version_hovered,
                     caption,
                     caption_hovered,
+                    pill_key,
                 ));
                 #[cfg(any(windows, target_os = "linux"))]
                 {
@@ -19129,20 +19479,34 @@ impl App {
         if matches!(
             self.preedit_owner(wid),
             crate::app_input::PreeditOwner::Rename
-        ) && let Some(col) = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.cached_strip_rename_caret)
-        {
-            self.report_ime_cursor_area_frame(wid, (strip.saturating_sub(1), col));
+        ) && let Some(cell) = tab_bar::rename_ime_cursor_cell(
+            strip,
+            self.windows
+                .get(&wid)
+                .and_then(|ws| ws.cached_strip_rename_caret),
+        ) {
+            self.report_ime_cursor_area_frame(wid, cell);
         }
         // Shift the composed frame down by `strip` rows, prepending the cached
         // strip rows (borrowed via disjoint fields; only those rows are cloned),
         // using this window's own cell height.
-        let cell_h = self.win_cell_size(wid).1;
+        let (cell_w, cell_h) = self.win_cell_size(wid);
         // The window's grid-interior top (`pad_top + head`), where the
         // window-space effect streams' row tags are anchored.
         let grid_top = self.win_pad_top(wid) + self.win_head(wid);
+        // The band's seam on Windows: a rail on the strip's last pixel rows,
+        // window edge to window edge, or the band's foot under it
+        // (`tab_bar::strip_seam_rail`; `None` without a band and on Linux, whose
+        // seam is the last row's cell underline).
+        let seam_rail = tab_bar::strip_seam_rail(
+            u16::try_from(strip - 1).unwrap_or(u16::MAX),
+            cols.saturating_mul(cell_w)
+                .saturating_add(2 * self.win_pad(wid)),
+            tab_bar::strip_seam_px(self.windows.get(&wid).map_or(1.0, |ws| ws.scale) as f32),
+            self.strip_foot_px(wid, strip),
+            header,
+            floor,
+        );
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -19153,6 +19517,11 @@ impl App {
             grid_top,
             &mut ws.strip_row_pool,
         );
+        if let Some(rail) = seam_rail {
+            let rasters = &mut ws.input_scratch.chrome_rasters;
+            rasters.retain(|m| m.row != rail.row);
+            rasters.push(rail);
+        }
         // Pixel band (Windows, Linux): when the UI-font band rastered, its per-row
         // `ImageRef` slices replace the icon list (the band bakes its own marks);
         // an empty band keeps the cell path.
@@ -19272,36 +19641,22 @@ impl App {
         let room = aterm_render::band::native_host_room(|| self.backend.band_room());
         let pad = self.win_pad(wid);
         let grid_top = self.win_pad_top(wid) + self.win_head(wid);
-        // The presence row sits above the band, directly under the tab strip, in
-        // the row its window committed (`presence.rows`), painted through its own
-        // `(seed, cols, palette)` cache and borrowed from it (no clone on a hit).
-        // It carries the chrome's closing seam only when no band row follows.
-        let _ = self.presence_band_row(wid, cols, palette);
         // The committed row count is the geometry's truth: a cache painted for
         // another count is trimmed to it and never shifts the grid.
         let committed = usize::from(self.message_band_rows);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        let presence_committed = usize::from(ws.presence.rows);
-        if committed == 0 && presence_committed == 0 {
+        if committed == 0 {
             return;
         }
-        let blank_presence: Vec<RenderCell>;
-        let presence_row: Option<&[RenderCell]> = if presence_committed == 0 {
-            None
-        } else if ws.presence_row.len() == cols {
-            Some(ws.presence_row.as_slice())
-        } else {
-            blank_presence = crate::message_band::blank_band_row(cols, palette);
-            Some(blank_presence.as_slice())
-        };
         // The compose is the renderer's (`aterm_render::band::compose_band`, also
         // run by the web module): the cache trimmed or padded to the committed
-        // count (the window was sized for `committed` rows), the presence row above
-        // it, the prepend (window-space streams already placed below the chrome:
-        // `Placed`), each raster at its row, the stack's seal, the seam's give-way
-        // to a lit rail, and each outlined capsule's floor.
+        // count (the window was sized for `committed` rows), the prepend
+        // (window-space streams already placed below the chrome: `Placed`), each
+        // raster at its row, the stack's seal, the seam's give-way to a lit
+        // rail, and each outlined capsule's floor. Presence lays no row above
+        // it (owner surfaces §5).
         let inks = inks();
         let at = aterm_render::band::BandFrame {
             cols,
@@ -19315,7 +19670,6 @@ impl App {
         };
         let _ = aterm_render::band::compose_band(
             &mut ws.input_scratch,
-            presence_row,
             &ws.cached_band_rows,
             &ws.cached_band_rasters,
             committed,
@@ -19358,13 +19712,66 @@ impl App {
         };
     }
 
+    /// Where the find panel sits and how its matches map onto the frame: the
+    /// whole terminal band with the frame's own viewport offset, or in a split the
+    /// FOCUSED pane's rectangle (the pane the search reads) with the offset of the
+    /// extraction that painted it, which the composite does not carry. The split
+    /// used to paint the panel across every pane and leave highlight-all off,
+    /// since its rows were keyed to the one pane's grid.
+    fn find_region(&self, wid: WindowId) -> FindRegion {
+        let Some(ws) = self.windows.get(&wid) else {
+            return FindRegion::default();
+        };
+        let whole = FindRegion {
+            row0: 0,
+            col0: 0,
+            rows: usize::from(ws.rows),
+            cols: usize::from(ws.cols),
+            display_offset: ws.input_scratch.display_offset,
+        };
+        let Some(plan) = self
+            .active_visible_leaf_plan(wid)
+            .filter(|plan| plan.leaves.len() > 1)
+        else {
+            return whole;
+        };
+        let Some(leaf) = plan.leaves.iter().find(|leaf| leaf.focused) else {
+            return whole;
+        };
+        let source = match self.visible_content_route_from_plan(&plan) {
+            Some(crate::VisibleContentRoute::Terminal { composed: true }) => {
+                Some(&ws.composed_focus_scratch)
+            }
+            Some(crate::VisibleContentRoute::Heterogeneous) => ws
+                .leaf_render_cache
+                .get(&leaf.view)
+                .map(|cache| &cache.input),
+            _ => None,
+        };
+        let Some(source) = source else {
+            return whole;
+        };
+        let cells = |v: f32| v.round().max(0.0) as usize;
+        let row0 = cells(leaf.rect.origin.y).min(whole.rows);
+        let col0 = cells(leaf.rect.origin.x).min(whole.cols);
+        FindRegion {
+            row0,
+            col0,
+            rows: cells(leaf.rect.size.height).min(whole.rows - row0),
+            cols: cells(leaf.rect.size.width).min(whole.cols - col0),
+            display_offset: source.display_offset,
+        }
+    }
+
     /// Paint the Cmd-F find bar over the top terminal rows (below the tab strip;
     /// floated to the bottom when the current match sits under it) while find is
     /// active (`ws.search`): the live query, a caret, the match position and key
-    /// hints. Overwrites rows in place (like [`Self::splice_paste_banner`]) and
-    /// pins them out of the sub-row scroll band; a no-op when no find is in
-    /// flight. Captured by `image`/`snapshot`; the `text`/`screen` verbs read the
-    /// engine, so the bar never appears in machine-readable terminal text.
+    /// hints. In a split it covers the focused pane's top rows only
+    /// ([`Self::find_region`]). Overwrites cells in place (like
+    /// [`Self::splice_paste_banner`]) and pins them out of the sub-row scroll band;
+    /// a no-op when no find is in flight. Captured by `image`/`snapshot`; the
+    /// `text`/`screen` verbs read the engine, so the bar never appears in
+    /// machine-readable terminal text.
     pub(crate) fn splice_find_bar(&mut self, wid: WindowId) {
         // This frame's base_y as captured with the cells, not a fresh term-lock
         // read, so a PTY write between extraction and this splice cannot drift the
@@ -19419,22 +19826,17 @@ impl App {
                     .map(|ws| (ws.preedit.clone(), ws.preedit_caret))
             })
             .flatten();
-        // Read the find state (bar view, current match's terminal-band row and
-        // index, frame/terminal row counts) before the disjoint-field borrow. The
-        // match set is not cloned: the highlight loop borrows `ws.search.matches`
-        // in place. `None` means not searching: no-op.
-        let Some((view, preedit_span, cur_term_row, cur_idx, nrows, term_rows)) =
+        // Read the find state (bar view, current match's stored row and index,
+        // frame/terminal row counts) before the disjoint-field borrow. The match
+        // set is not cloned: the highlight loop borrows `ws.search.matches` in
+        // place. `None` means not searching: no-op.
+        let Some((view, preedit_span, cur_sel_row, cur_idx, nrows, term_rows)) =
             self.windows.get(&wid).and_then(|ws| {
                 ws.search.as_ref().map(|s| {
-                    // Terminal-band row of the current match: `sel_row + display_offset`,
-                    // re-anchored by `− delta` for output that scrolled in since the search.
-                    let offset = i64::from(ws.input_scratch.display_offset).saturating_sub(delta);
-                    let cur_term_row = if stale_absolute_rows {
+                    let cur_sel_row = if stale_absolute_rows {
                         None
                     } else {
-                        s.matches
-                            .get(s.current)
-                            .map(|&(r, _, _)| i64::from(r).saturating_add(offset))
+                        s.matches.get(s.current).map(|&(r, _, _)| r)
                     };
                     // Display query and caret, with the composition (when the field
                     // owns one) spliced at the edit position. `preedit_span` is its
@@ -19468,7 +19870,7 @@ impl App {
                             history_away: s.history_away,
                         },
                         preedit_span,
-                        cur_term_row,
+                        cur_sel_row,
                         s.current,
                         ws.input_scratch.cells.len(),
                         ws.rows as usize,
@@ -19483,58 +19885,75 @@ impl App {
             }
             return;
         };
-        // In a split, matches are keyed to the focused pane's grid but the
-        // composite tiles panes at offsets this splice does not track, so the
-        // highlight-all tint is suppressed; the bar and the current match's
-        // selection are still correct. A zoomed pane renders through the
-        // single-pane path, so the tint stays on there.
-        let multi_pane = self
-            .active_tree(wid)
-            .is_some_and(|t| t.len() > 1 && !t.is_zoomed());
-        // The current match's row is focused-pane-relative in a split; translate
-        // by the pane's row offset, since placement reasons in window
-        // terminal-band rows.
-        let focus_row_off: i64 = if multi_pane {
-            self.active_visible_leaf_plan(wid)
-                .and_then(|plan| {
-                    plan.leaves
-                        .into_iter()
-                        .find(|leaf| leaf.focused)
-                        .map(|leaf| leaf.rect.origin.y.round() as i64)
-                })
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        // The panel rides the focused pane: the whole terminal band, or in a split
+        // the focused leaf's rectangle, with the viewport offset of the extraction
+        // that painted that pane ([`Self::find_region`]). Matches are keyed to the
+        // focused pane's grid, so placement, highlight-all and the current match
+        // all reason in the region's rows and columns.
+        let region = self.find_region(wid);
         let cols = self.windows.get(&wid).map_or(0, |ws| ws.cols as usize);
-        if cols == 0 {
+        if cols == 0 || region.rows == 0 || region.cols == 0 {
             return;
         }
+        // Terminal-band (region) row of a stored match: `sel_row + display_offset`,
+        // re-anchored by `− delta` for output that scrolled in since the search.
+        let offset = i64::from(region.display_offset).saturating_sub(delta);
+        let cur_term_row = cur_sel_row.map(|r| i64::from(r).saturating_add(offset));
         // The frame is `strip` chrome rows then the `term_rows`-tall terminal
-        // band; placement and highlight work in terminal rows, plus `strip` for a
-        // `cells` index.
+        // band; placement and highlight work in region rows, plus the region's
+        // origin and `strip` for a `cells` index.
         let strip = nrows.saturating_sub(term_rows);
-        let Some(term_bottom) = term_rows.checked_sub(1) else {
+        if term_rows == 0 {
             return; // zero-row terminal
-        };
-        // Adaptive placement: the panel rides the top terminal rows, but if the
-        // current match sits under it and the terminal can hold the band twice,
+        }
+        // Adaptive placement: the panel rides the region's top rows, but if the
+        // current match sits under it and the region can hold the band twice,
         // float it to the bottom; the seam rides the content-facing edge. The
         // apply path lands scrollback matches just below the band, so floating
-        // is the exception. A terminal shorter than the band gets a 2-row, then
+        // is the exception. A region shorter than the band gets a 2-row, then
         // 1-row, panel.
-        let band_rows = crate::find_bar::FIND_BAR_ROWS.min(term_rows);
-        let match_under_top_band = cur_term_row
-            .map(|r| r + focus_row_off)
-            .is_some_and(|r| r >= 0 && (r as usize) < band_rows);
-        let bar_row = if term_rows > band_rows && match_under_top_band {
-            term_rows - band_rows
+        let band_rows = crate::find_bar::FIND_BAR_ROWS.min(region.rows);
+        let match_under_top_band = cur_term_row.is_some_and(|r| r >= 0 && (r as usize) < band_rows);
+        let bar_row = if region.rows > band_rows && match_under_top_band {
+            region.rows - band_rows
         } else {
             0
         };
-        let band = bar_row..bar_row + band_rows;
-        let frame_bar_row = strip + bar_row;
-        let seam_at_top = band.end > term_bottom;
+        // The panel's rows within the region, and in the terminal band.
+        let pane_band = bar_row..bar_row + band_rows;
+        let band = region.row0 + bar_row..region.row0 + bar_row + band_rows;
+        let frame_bar_row = strip + band.start;
+        let (cell_w, cell_h) = self.win_cell_size(wid);
+        let pad = self.win_pad(wid);
+        // The rule faces the content: an overline on a bottom-floated panel; at
+        // the top a one-pixel rail on the band's last pixel row, where the cell
+        // and face can keep the hints' descenders a clear row off it (the message
+        // band's own test, `band::seam_can_rail`), else the face's underline.
+        let rails = aterm_render::band::seam_can_rail(
+            cell_h,
+            aterm_render::band::native_host_room(|| self.backend.band_room()),
+        );
+        // In a split the panel covers the focused pane's columns of rows the
+        // sibling beside it also uses, and a rail that lifts its row's words
+        // lifts every glyph on that frame row (`aterm_render::chrome_lifted` is
+        // per row), the sibling's too: a pane-scoped panel lays only rails the
+        // renderer's room seats without a lift ([`unlifted_rail_h`]).
+        let whole_rows = region.col0 == 0 && region.cols == cols;
+        let room = self.backend.band_room();
+        let rail_h = |want: u16| {
+            if whole_rows {
+                Some(want)
+            } else {
+                unlifted_rail_h(want, room)
+            }
+        };
+        let seam = if pane_band.end >= region.rows {
+            crate::find_bar::FindSeam::Top
+        } else if rails && rail_h(1).is_some() {
+            crate::find_bar::FindSeam::BottomRail
+        } else {
+            crate::find_bar::FindSeam::BottomUnderline
+        };
         // The panel is chrome over the grid (the OverGrid surface: the header's
         // palette where `window_theme` forces it, else the terminal's with its
         // live OSC 11 background, so the bar stays WCAG-AA legible on a
@@ -19542,29 +19961,48 @@ impl App {
         let panel = self.chrome_palette(ChromeSurface::OverGrid(wid));
         // Highlight-all colour: painted INTO the pane's cells, so it is taken on
         // the Content surface (the live grid bg): the search-match token, a tint
-        // that stands visibly off the bg and apart from the selection colour the
-        // current match is painted in; each cell's own fg is floored against it.
+        // that stands visibly off the bg; each cell's own fg is floored against
+        // it. The current match wears the solid it is stepped toward
+        // (`find_bar::current_match_fill`).
         let content = self.chrome_palette(ChromeSurface::Content(wid));
-        let hi = content
-            .tokens()
-            .search_match(crate::settings::u32_rgb(content.theme.selection));
-        let painted = crate::find_bar::find_bar_paint(&view, cols, band_rows, panel, seam_at_top);
-        let hi_u32 = aterm_render::rgb_to_u32(hi);
-        let cell_h = self.win_cell_size(wid).1;
-        let offset = self.windows.get(&wid).map_or(delta.saturating_neg(), |ws| {
-            i64::from(ws.input_scratch.display_offset).saturating_sub(delta)
+        let tokens = content.tokens();
+        let hi = tokens.search_match(crate::settings::u32_rgb(content.theme.selection));
+        let current_rgb = crate::find_bar::current_match_fill(&tokens, hi);
+        let current_fill = aterm_render::rgb_to_u32(current_rgb);
+        let current_ink =
+            aterm_render::rgb_to_u32(crate::find_bar::current_match_ink(&tokens, current_rgb));
+        let painted = crate::find_bar::find_bar_paint(&view, region.cols, band_rows, panel, seam);
+        // Windows' Fluent face of the bar (`find_bar::fluent_bar`): a raster per
+        // band row laid over the cells, which keep their characters. `None` where
+        // the cells stand (off Windows, no UI face yet, a query no face draws).
+        let scale = self.windows.get(&wid).map_or(1.0, |ws| ws.scale as f32);
+        let fluent = crate::find_bar::fluent_bar(&crate::find_bar::FluentInput {
+            view: &view,
+            paint: &painted,
+            colors: crate::chrome_band::band_colors(panel),
+            geom: crate::find_bar::FluentGeom {
+                cell_w,
+                cell_h,
+                scale,
+            },
+            seam,
+            preedit: preedit_span.as_ref().and_then(|span| {
+                let start = view.query.get(..span.start)?.chars().count();
+                Some(start..start + view.query.get(span.clone())?.chars().count())
+            }),
         });
+        let hi_u32 = aterm_render::rgb_to_u32(hi);
         // Results are sorted in selection row/column order: binary-slice the
         // history before the mutable borrow, so 100k hits cost O(log N + visible)
         // per frame.
-        let (visible_matches, _match_search_comparisons) = if multi_pane || stale_absolute_rows {
+        let (visible_matches, _match_search_comparisons) = if stale_absolute_rows {
             (0..0, 0)
         } else {
             self.windows
                 .get(&wid)
                 .and_then(|ws| ws.search.as_ref())
                 .map_or((0..0, 0), |search| {
-                    visible_match_range(&search.matches, offset, term_rows, search.max_match_rows)
+                    visible_match_range(&search.matches, offset, region.rows, search.max_match_rows)
                 })
         };
         let Some(ws) = self.windows.get_mut(&wid) else {
@@ -19582,10 +20020,10 @@ impl App {
             None => return,
         };
         // A hit straddling a soft wrap is one match whose `c1` counts through the
-        // boundary: `c0..` on the first row, whole rows between, `c1 % cols` on
-        // the last. Rows outside the viewport or under the bar drop per row, so
-        // the visible half of a straddling hit stays lit.
-        let cols_wide = cols.max(1);
+        // boundary of the pane's own width: `c0..` on the first row, whole rows
+        // between, `c1 % cols` on the last. Rows outside the viewport or under the
+        // bar drop per row, so the visible half of a straddling hit stays lit.
+        let cols_wide = region.cols.max(1);
         for (relative, &(sel_row, c0, c1)) in matches[visible_matches.clone()].iter().enumerate() {
             let i = visible_matches.start + relative;
             let is_current = i == cur_idx;
@@ -19595,10 +20033,10 @@ impl App {
                 let term_row = i64::from(sel_row)
                     .saturating_add(i64::try_from(row_offset).unwrap_or(i64::MAX))
                     .saturating_add(offset);
-                if term_row < 0 || term_row as usize >= term_rows {
+                if term_row < 0 || term_row as usize >= region.rows {
                     continue;
                 }
-                if band.contains(&(term_row as usize)) {
+                if pane_band.contains(&(term_row as usize)) {
                     continue;
                 }
                 let from = if row_offset == 0 { usize::from(c0) } else { 0 };
@@ -19607,26 +20045,32 @@ impl App {
                 } else {
                     cols_wide - 1
                 };
-                let frame_row = strip + term_row as usize;
-                let row = &mut ws.input_scratch.cells[frame_row];
-                // `from..=through` are logical columns, as the search reads the
-                // grid; on a BiDi-reordered row the cell painted at `v` holds
-                // logical column `map[v]`, so tint where that falls in the hit.
+                let frame_row = strip + region.row0 + term_row as usize;
+                let Some(row) = ws.input_scratch.cells.get_mut(frame_row) else {
+                    continue;
+                };
+                // `from..=through` are the pane's logical columns, as the search
+                // reads its grid; on a BiDi-reordered row the cell painted at `v`
+                // holds frame column `map[v]` (a composed pane's map is re-based
+                // into frame columns), so tint where that falls in the hit.
                 let map = ws
                     .input_scratch
                     .visual_to_logical
                     .get(frame_row)
                     .map_or(&[][..], Vec::as_slice);
                 // An unpermuted row (every row of an LTR screen) scans just the
-                // hit; a permuted one may paint the hit anywhere in the row.
+                // hit; a permuted one may paint the hit anywhere in the pane.
                 let (scan_from, scan_end) = if map.is_empty() {
-                    (from, through.saturating_add(1))
+                    (region.col0 + from, region.col0 + through.saturating_add(1))
                 } else {
-                    (0, row.len())
+                    (region.col0, region.col0 + region.cols)
                 };
                 for (v, cell) in row.iter_mut().enumerate().take(scan_end).skip(scan_from) {
                     let logical = map.get(v).map_or(v, |&l| usize::from(l));
-                    if !(from..=through).contains(&logical) {
+                    let Some(pane_col) = logical.checked_sub(region.col0) else {
+                        continue;
+                    };
+                    if !(from..=through).contains(&pane_col) {
                         continue;
                     }
                     cell.bg = hi;
@@ -19637,49 +20081,155 @@ impl App {
                         ));
                     }
                     // The current match's fg is not floored: the renderer paints
-                    // the selection over it with its own floor, and flooring
-                    // twice would shift the settled colour.
+                    // the selection's own ink over it (set below).
+                }
+            }
+        }
+        // THE CURRENT MATCH IS THE LIVE SELECTION (`search_apply_current_in` puts
+        // it there), so while the bar is open the focused pane's selection is
+        // painted in the current match's own fill, its text in the ink that fill
+        // stands off (`find_bar::current_match_ink`), not in the selection colour
+        // the other matches' tint differs from by hue alone. Accepting closes the
+        // bar and returns the selection to its own colour.
+        if cur_term_row.is_some() {
+            ws.input_scratch.selection_bg = current_fill;
+            ws.input_scratch.selection_fg = current_ink;
+            for entry in &mut ws.input_scratch.selections {
+                if !entry.inactive {
+                    entry.bg = current_fill;
+                    entry.fg = current_ink;
                 }
             }
         }
         debug_assert_eq!(painted.rows.len(), band_rows);
         let frame_band = frame_bar_row..frame_bar_row + band_rows;
-        for (offset_row, built) in painted.rows.into_iter().enumerate() {
-            debug_assert_eq!(built.len(), cols);
+        for (offset_row, mut built) in painted.rows.into_iter().enumerate() {
+            debug_assert_eq!(built.len(), region.cols);
+            if fluent.is_some() {
+                // The raster owns every pixel of the band, its rule and the
+                // composition's underline included: a cell's decoration would
+                // draw over it, at the cells' places.
+                for cell in &mut built {
+                    cell.underline = aterm_core::terminal::UnderlineStyle::None;
+                    cell.underline_color = None;
+                    cell.overline = false;
+                    cell.overline_color = None;
+                }
+            }
             let frame_row = frame_bar_row + offset_row;
-            ws.input_scratch.cells[frame_row] = built;
-            // Clear the per-row parallel arrays so covered clusters, combining
-            // marks and inline images cannot bleed through, and mark the row
-            // single-width, as splice_paste_banner does.
-            if let Some(c) = ws.input_scratch.clusters.get_mut(frame_row) {
-                c.clear();
-            }
-            if let Some(c) = ws.input_scratch.combining.get_mut(frame_row) {
-                c.clear();
-            }
-            // The bar paints in logical order: no BiDi map on its rows.
-            if let Some(m) = ws.input_scratch.visual_to_logical.get_mut(frame_row) {
-                m.clear();
-            }
-            if let Some(im) = ws.input_scratch.images.get_mut(frame_row) {
-                im.clear();
-            }
-            if let Some(ls) = ws.input_scratch.line_sizes.get_mut(frame_row) {
-                *ls = aterm_core::grid::LineSize::SingleWidth;
-            }
-            // Per-pane runs are the per-column truth the renderers read, so a
-            // covered row drops them too.
-            if let Some(spans) = ws.input_scratch.line_size_spans.get_mut(frame_row) {
-                spans.clear();
-            }
-            if let Some(spans) = ws.input_scratch.default_bg_spans.get_mut(frame_row) {
-                spans.clear();
+            if whole_rows {
+                ws.input_scratch.cells[frame_row] = built;
+                clear_find_row_lists(&mut ws.input_scratch, frame_row);
+            } else {
+                splice_find_row_span(&mut ws.input_scratch, frame_row, region.col0, built);
             }
         }
         // Scrub the terminal cursor, selection clips, chrome rasters and
-        // cursor/word/rain overlay streams on the covered rows so nothing
-        // paints over the find bar.
-        scrub_overlay_row_band(&mut ws.input_scratch, frame_band.clone(), cell_h);
+        // cursor/word/rain overlay streams on the covered cells so nothing paints
+        // over the find bar: whole rows, or in a split the pane's span of them,
+        // so the sibling beside it keeps its own.
+        if whole_rows {
+            scrub_overlay_row_band(&mut ws.input_scratch, frame_band.clone(), cell_h);
+        } else {
+            scrub_overlay_card(
+                &mut ws.input_scratch,
+                crate::tab_menu::MenuRect {
+                    row: frame_bar_row,
+                    col: region.col0,
+                    w: region.cols,
+                    h: band_rows,
+                },
+                (cell_w, cell_h),
+                pad,
+            );
+        }
+        // The Fluent face: each band row's raster over the panel's columns of that
+        // row, after the scrub. It draws the seam, the focus line and the `✕`
+        // itself, so the rasters below are the cell bar's alone.
+        if let Some(bar) = fluent.as_ref() {
+            let input = &mut ws.input_scratch;
+            if input.images.len() < input.cells.len() {
+                input.images.resize_with(input.cells.len(), Vec::new);
+            }
+            let span = region.col0..region.col0 + region.cols;
+            for (offset_row, image) in bar.rows.iter().enumerate() {
+                let Some(images) = input.images.get_mut(frame_bar_row + offset_row) else {
+                    continue;
+                };
+                images.retain(|(col, _)| !span.contains(col));
+                images.extend((0..region.cols).map(|i| {
+                    (
+                        region.col0 + i,
+                        aterm_core::grid::extra::ImageRef {
+                            image: Arc::clone(image),
+                            cell_row: 0,
+                            cell_col: u16::try_from(i).unwrap_or(u16::MAX),
+                            kitty: None,
+                        },
+                    )
+                }));
+                images.sort_by_key(|(col, _)| *col);
+            }
+        }
+        // The rail, after the scrub retired every raster on the band's rows: one
+        // pixel on the last row's lowest pixel row, under the panel's own columns
+        // only (the gutters and a split's sibling keep their pixels).
+        // Cell column `col` of the region's row as a frame pixel column.
+        let px = |col: usize| pad + (region.col0 + col) * cell_w;
+        let seam_rail = seam == crate::find_bar::FindSeam::BottomRail;
+        if seam_rail
+            && fluent.is_none()
+            && let Ok(row) = u16::try_from(frame_band.end - 1)
+        {
+            let rail = find_rail(row, px(0)..px(region.cols), painted.seam, 1);
+            ws.input_scratch.chrome_rasters.push(rail);
+        }
+        // The well's focus line (`find_bar::WELL_ACCENT_LINE`): a 2 px accent rail on
+        // the field row's lowest pixels under the well's cells, where the face keeps
+        // its words off a rail and the row is not the one the seam's rail took. In
+        // a split, as thick as lifts nothing (1 px), else none.
+        if let Some(ink) = painted.well_line
+            && fluent.is_none()
+            && rails
+            && !(seam_rail && painted.field_row + 1 == band_rows)
+            && let Some(well_h) = rail_h(2)
+            && let Ok(row) = u16::try_from(frame_bar_row + painted.field_row)
+        {
+            let well = &painted.field_cols;
+            let rail = find_rail(row, px(well.start)..px(well.end), ink, well_h);
+            ws.input_scratch.chrome_rasters.push(rail);
+        }
+        // The toolbar's close button (`find_bar::FIND_TOOLBAR`) draws its `✕` as the
+        // band's own cross (`BandIcon::Error`, the message band's), in its cell's ink
+        // and the face's stroke weight, where the terminal face has no `✕` and a
+        // fallback face drew a thin, small one beside the face's arrows. On the
+        // field row's raster when the focus line laid one (one raster per row),
+        // else on its own.
+        if let Some(close) = painted.close_cols.as_ref()
+            && fluent.is_none()
+            && let Ok(row) = u16::try_from(frame_bar_row + painted.field_row)
+            && let Ok(col) = u16::try_from(region.col0 + close.start + 1)
+        {
+            let icon = aterm_render::ChromeIcon {
+                col,
+                icon: aterm_render::BandIcon::Error,
+            };
+            let rasters = &mut ws.input_scratch.chrome_rasters;
+            match rasters.iter_mut().find(|raster| raster.row == row) {
+                Some(raster) => raster.icons.push(icon),
+                None => rasters.push(aterm_render::ChromeRaster {
+                    row,
+                    ground: Arc::from(Vec::new()),
+                    rail: Arc::from(Vec::new()),
+                    rail_h: 0,
+                    clear_rail: false,
+                    own: Vec::new(),
+                    split: None,
+                    rings: Vec::new(),
+                    icons: vec![icon],
+                }),
+            }
+        }
         // The panel's rows are this frame's chrome — see `WindowState::chrome_rows`.
         claim_chrome_rows(ws, frame_band.clone());
         // Pin the panel out of the sub-row scroll band: at the bottom shrink
@@ -19695,18 +20245,35 @@ impl App {
             let bot = ws.input_scratch.grid_bot_row;
             ws.input_scratch.grid_top_row = frame_band.end.min(bot);
         }
+        // The painted spans are the region's; the hit-test and the IME anchor
+        // read window terminal columns.
+        let at = |cols: Range<usize>| cols.start + region.col0..cols.end + region.col0;
+        let field_cols = at(painted.field_cols.clone());
         // Underline the composed IME run inside the well and anchor the OS
         // candidate window on the well's caret. The well paints one cell per
         // char, so this follows that layout; `chrome_band::cell` has no underline
         // input, so it is stamped on the spliced cells.
         let mut ime_caret: Option<(u16, u16)> = None;
+        // Under the Fluent face the raster underlines the composition itself and
+        // the candidate window anchors on the cell under the box's caret.
+        if let Some(bar) = fluent.as_ref()
+            && owner_is_find
+        {
+            let col =
+                (bar.caret_x.max(0.0) as usize / cell_w.max(1)).min(region.cols.saturating_sub(1));
+            ime_caret = Some((
+                u16::try_from(band.start + painted.field_row).unwrap_or(u16::MAX),
+                u16::try_from(region.col0 + col).unwrap_or(u16::MAX),
+            ));
+        }
         if let Some(span) = preedit_span.as_ref().filter(|r| !r.is_empty())
-            && !painted.field_cols.is_empty()
+            && fluent.is_none()
+            && !field_cols.is_empty()
         {
             let pre_chars = view.query[..span.start].chars().count();
             let run_chars = view.query[span.clone()].chars().count();
             let scroll = painted.field_scroll;
-            let field = painted.field_cols.clone();
+            let field = field_cols.clone();
             let frame_field_row = frame_bar_row + painted.field_row;
             if let Some(rowv) = ws.input_scratch.cells.get_mut(frame_field_row) {
                 for i in pre_chars..pre_chars + run_chars {
@@ -19735,31 +20302,38 @@ impl App {
                     .saturating_sub(scroll)
                     .min(field.len().saturating_sub(1));
             ime_caret = Some((
-                u16::try_from(bar_row + painted.field_row).unwrap_or(u16::MAX),
+                u16::try_from(band.start + painted.field_row).unwrap_or(u16::MAX),
                 u16::try_from(caret_col).unwrap_or(u16::MAX),
             ));
         }
         // Fallback: the find field owns the composition but nothing was painted
         // above (a degraded 1-row panel or an empty preedit span). The generic
         // engine-caret reports are suppressed while the field owns it, so anchor
-        // on the field's first column. Read before `painted.field_cols` moves.
+        // on the field's first column.
         let fallback_cell = (owner_is_find && ime_caret.is_none()).then(|| {
             (
-                u16::try_from(bar_row + painted.field_row).unwrap_or(u16::MAX),
-                u16::try_from(painted.field_cols.start.min(cols.saturating_sub(1)))
-                    .unwrap_or(u16::MAX),
+                u16::try_from(band.start + painted.field_row).unwrap_or(u16::MAX),
+                u16::try_from(field_cols.start.min(cols.saturating_sub(1))).unwrap_or(u16::MAX),
             )
         });
         // Record the toggle indicators' and well's row/column spans and the well's
         // scroll from the same builder inputs as the paint, so the mouse hit-test
         // reads exact geometry.
         ws.find_bar_hit = Some(crate::FindBarHit {
-            row: bar_row + painted.field_row,
-            case_cols: painted.case_cols,
-            regex_cols: painted.regex_cols,
-            field_cols: painted.field_cols,
-            field_scroll: painted.field_scroll,
+            row: band.start + painted.field_row,
+            case_cols: painted.case_cols.map(at),
+            regex_cols: painted.regex_cols.map(at),
+            prev_cols: painted.prev_cols.map(at),
+            next_cols: painted.next_cols.map(at),
+            close_cols: painted.close_cols.map(at),
+            field_cols,
+            // The query box's own scroll under the Fluent face, which a click maps
+            // through (`App::find_bar_click_at`).
+            field_scroll: fluent
+                .as_ref()
+                .map_or(painted.field_scroll, |bar| bar.scroll),
             band,
+            cols: region.col0..region.col0 + region.cols,
         });
         ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
         if let Some(cell) = ime_caret.or(fallback_cell) {
@@ -19767,14 +20341,62 @@ impl App {
         }
     }
 
-    /// The theme an overlay card on window `wid` tints with. Tracks the live
-    /// OSC-11 background so a card over a real terminal tints off the current bg.
+    /// The theme an overlay card on window `wid` tints with: the page palette
+    /// over a native page ([`Self::native_page_palette_theme`]), so its ground
+    /// and its ink come from one palette, and over a terminal the terminal
+    /// theme, tinted off the live OSC-11 background.
     pub(crate) fn overlay_card_theme(&self, wid: WindowId) -> Theme {
+        if self.card_over_native_page(wid) {
+            return self.native_page_palette_theme();
+        }
+        self.terminal_card_theme(wid)
+    }
+
+    /// The terminal theme with the live OSC-11 background, for a card over a
+    /// real terminal.
+    fn terminal_card_theme(&self, wid: WindowId) -> Theme {
         let mut theme = self.theme;
         if let Some(ws) = self.windows.get(&wid) {
             theme.bg = present_band_bg(ws.input_scratch.default_bg, theme.bg);
         }
         theme
+    }
+
+    /// Whether the content under a floating card on window `wid` is a native
+    /// page. A lone native leaf is a page wherever the card is; a split with a
+    /// native leaf asks the leaf at the content's top-right corner, where the
+    /// build badge sits and the cards over the grid anchor. A tab with no
+    /// native leaf builds no plan to answer.
+    fn card_over_native_page(&self, wid: WindowId) -> bool {
+        if !self.active_tab_contains_native(wid) {
+            return false;
+        }
+        let Some((plan, route)) = self.active_visible_frame_layout(wid) else {
+            return false;
+        };
+        match route {
+            crate::VisibleContentRoute::Native { .. } => true,
+            crate::VisibleContentRoute::Terminal { .. } => false,
+            crate::VisibleContentRoute::Heterogeneous => {
+                let bounds = plan.bounds;
+                let right = bounds.origin.x + bounds.size.width;
+                let bottom = bounds.origin.y + bounds.size.height;
+                let (x, y) = (right - 0.5, bounds.origin.y + 0.5);
+                let point = crate::tab_model::LogicalPoint {
+                    x: x.clamp(bounds.origin.x, (right - 0.5).max(bounds.origin.x)),
+                    y: y.clamp(bounds.origin.y, (bottom - 0.5).max(bounds.origin.y)),
+                };
+                plan.leaves
+                    .iter()
+                    .find(|leaf| leaf.outer_rect().contains(point))
+                    .is_some_and(|leaf| {
+                        matches!(
+                            self.view_store.get(leaf.view),
+                            Some(crate::tab_model::View::Native(_))
+                        )
+                    })
+            }
+        }
     }
 
     /// Overlay the modal Settings panel over the top `panel_rows` rows of the
@@ -19889,11 +20511,18 @@ impl App {
                 [0, 0, 0, 0],
             );
             ws.settings_card = Some(crate::SettingsCard {
+                // A scrim (`OverlayModel::scrim`: the palette's on Windows) dims the
+                // whole window behind the card, the gutters, the strip and a
+                // maximized window's remainder included. It rides beside the
+                // card-sized raster as a colour the backend fills the target with
+                // ([`tray_quad_below_y`]), so a keystroke in the palette rasterizes,
+                // compares and uploads the card alone, never a window-sized image.
+                scrim: overlay.model().scrim(),
                 rgba,
                 pw,
                 ph,
-                dx: pad + x0 as u32,
-                dy: pad_top + head + y0 as u32,
+                dx: (pad as f32 + x0) as u32,
+                dy: ((pad_top + head) as f32 + y0) as u32,
                 fp,
                 geom: geom_key,
             });
@@ -19906,18 +20535,28 @@ impl App {
         ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
     }
 
-    /// The palette a floating chrome card (build badge, package-progress card)
-    /// rasterizes from. These float above any route and
-    /// [`Self::compose_native_route_card`] folds them into a native route's tray,
-    /// so they take the chrome-resolved palette ([`Self::chrome_palette_theme`]).
+    /// The palette a floating chrome card (build badge, package-progress card,
+    /// and every card over the grid: [`ChromeSurface::OverGrid`]) rasterizes
+    /// from, by the surface under it ([`Self::card_over_native_page`]): over a
+    /// native page the page's own palette ([`Self::native_page_palette_theme`]),
+    /// like [`Self::append_native_modal_prims`], so a colour picked for the
+    /// terminal never inks a card on a page whose ground is the page's; over a
+    /// terminal the chrome-resolved palette ([`Self::chrome_palette_theme`]).
+    /// These float above any route and [`Self::compose_native_route_card`]
+    /// folds them into a native route's tray, so the palette is chosen here,
+    /// when they rasterize.
+    ///
     /// The live OSC-11 tint applies only where that palette is the terminal
     /// theme unchanged.
-    fn chrome_card_theme(&self, wid: WindowId) -> aterm_render::Theme {
+    pub(crate) fn chrome_card_theme(&self, wid: WindowId) -> aterm_render::Theme {
+        if self.card_over_native_page(wid) {
+            return self.native_page_palette_theme();
+        }
         let chrome = self.chrome_palette_theme();
         if (chrome.bg, chrome.fg) != (self.theme.bg, self.theme.fg) {
             return chrome;
         }
-        self.overlay_card_theme(wid)
+        self.terminal_card_theme(wid)
     }
 
     /// Rasterize the top-right build/version badge into its paint-only
@@ -20018,6 +20657,7 @@ impl App {
                 [0, 0, 0, 0],
             );
             ws.badge_card = Some(crate::SettingsCard {
+                scrim: None,
                 rgba,
                 pw,
                 ph,
@@ -20247,12 +20887,19 @@ impl App {
             else {
                 continue; // a native leaf owns its own caret and its own rows
             };
-            let Some(term) = self.pool.get(session).map(|entry| entry.term.clone()) else {
+            let Some((term, ui_waiting)) = self
+                .pool
+                .get(session)
+                .map(|entry| (entry.term.clone(), entry.ctx.ui_waiting.clone()))
+            else {
                 continue;
             };
             let pane_rows = (leaf.rect.size.height.round().max(1.0)) as usize;
             let row_off = leaf.rect.origin.y.round().max(0.0) as usize;
-            if let Some(caret) = term_lock(&term).cursor_row_on_screen(pane_rows) {
+            if let Some(caret) =
+                crate::term_lock_ui(&term, &ui_waiting, crate::metrics::TermWaitSite::Redraw)
+                    .cursor_row_on_screen(pane_rows)
+            {
                 rows.push(row_off + caret);
             }
         }
@@ -20722,13 +21369,14 @@ fn preview_damage_from_compiled(
 ) -> Option<crate::native_app::DamageRegion> {
     let mut union: Option<crate::native_ui::LogicalRect> = None;
     for node in &compiled.paint {
-        if !matches!(
-            node.content,
-            crate::native_ui::UiContent::SettingsPreview(_)
-        ) {
+        let crate::native_ui::UiContent::SettingsPreview(spec) = &node.content else {
             continue;
-        }
-        let rect = node.rect.intersect(node.clip)?.intersect(compiled.bounds)?;
+        };
+        // Only what a tick moves: a Themes demo's grid, not its window.
+        let rect = spec
+            .tick_rect(node.rect)
+            .intersect(node.clip)?
+            .intersect(compiled.bounds)?;
         union = Some(match union {
             Some(existing) => {
                 let x = existing.x.min(rect.x);
@@ -21416,6 +22064,10 @@ mod tab_menu_splice_tests;
 mod tab_strip_bleed_tests;
 
 #[cfg(test)]
+#[path = "app_render_strip_tabs_tests.rs"]
+mod strip_tabs_tests;
+
+#[cfg(test)]
 #[path = "app_render_find_bar_splice_tests.rs"]
 mod find_bar_splice_tests;
 
@@ -21817,7 +22469,8 @@ mod native_ime_anchor_tests {
         // A retained leaf may remain partly on glass during a centered surface
         // crop. Candidate geometry must clip to the physical client area too.
         let plan = app.active_visible_leaf_plan(wid).unwrap();
-        app.windows.get_mut(&wid).unwrap().win_px = Some(winit::dpi::PhysicalSize::new(100, 100));
+        app.windows.get_mut(&wid).unwrap().win_px =
+            Some(aterm_window::dpi::PhysicalSize::new(100, 100));
         let (caret, scale) = {
             let artifact = app
                 .retained_native_leaf_artifact_from_plan(wid, view, true, &plan)

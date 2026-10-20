@@ -22,6 +22,10 @@
 //! Negative controls: an `admit` that takes every reading (it records the idle
 //! repeat), and a silence rule that starts over on a new process without a word (the
 //! window's mark outlives its process), each disagree with the model somewhere.
+//!
+//! Unix only: the tap rides on a POSIX shell's relaunch line, and no Windows
+//! path is a command one would run inert (`tap::exe_admissible`).
+#![cfg(unix)]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;

@@ -86,6 +86,9 @@ pub(crate) struct SessionChromeInput {
     /// Whether a registry identity exists — gates the `Copy Session ID` action
     /// (greyed out rather than copying an empty string).
     pub has_session: bool,
+    /// The session's registry sid, when it has one: the AGENT section's Stop
+    /// Worker row carries it as its argument.
+    pub sid: Option<SessionId>,
     /// Whether this window can PRESENT a rename editor at all. Off macOS the
     /// editor is painted by the tab strip, so `tab_strip_rows = 0` leaves the
     /// command with nowhere to go and the row greys out instead of accepting a
@@ -111,6 +114,60 @@ pub(crate) struct SessionChromeInput {
     /// The mark alone says "needs attention"; the hover names the reason, so a
     /// mark that stays is never a riddle. `None` = no reason recorded.
     pub attention: Option<String>,
+    /// What the menu's AGENT section offers for this session
+    /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4): the person's hold, and
+    /// its manager or its workers, gathered by the caller from the holds and
+    /// the task records.
+    pub agent: AgentMenu,
+    /// THE SESSION LOG'S CLAUSE (phase 3B, plan §5; addendum A12), only
+    /// under `[session_log] clause = true`: `now: <its head words>` after
+    /// `activity:`. `None` with the switch off (the default), and then
+    /// every line and row is today's, byte for byte.
+    pub clause: Option<ClauseLine>,
+}
+
+/// The facts the tab menu's AGENT section is composed from.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AgentMenu {
+    /// Hand Back has a hold to lift — the person's, or an Owner client's
+    /// where no person's stands (`fabric::Holds::hand_back_origin`): the row
+    /// is Hand Back, else Take Over.
+    pub person_hold: bool,
+    /// The manager this session's task names, when this aterm hosts it:
+    /// `(its sid, its label)` — the `Go to <label>` row.
+    pub manager: Option<(SessionId, String)>,
+    /// The session runs a task that is not over: Stop Worker… is offered.
+    pub stoppable: bool,
+    /// The workers whose tasks THIS session started: `(sid, its row's words)`,
+    /// in session order — the `Workers (n)` rows.
+    pub workers: Vec<(SessionId, String)>,
+}
+
+/// The session log's clause as the chrome shows it ([`SessionChromeInput::clause`]):
+/// the tooltip's `now: <head>` line, no age and no minutes left (a clock-free
+/// cache cannot keep either true), and the menu's row aged as it pops
+/// ([`TabMenuEntry::Event`]: `now: running shell · 4m ago`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClauseLine {
+    /// The clause's words without their coarse age (`aterm_slog::Clause::head`).
+    pub head: String,
+    /// When its state began, on [`crate::turn_ledger::now_ms`]'s clock.
+    pub since_ms: u64,
+    /// When a shown label leaves (its `until`, on the same clock), the clause
+    /// being that label; `None` for every other row (ruling S10).
+    pub until_ms: Option<u64>,
+}
+
+/// What the chrome cache keys the clause on (addendum A12): its row, its head
+/// words, its tone, whose it is and when its state began — what moves only
+/// when the state does, never with the clock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClauseKey {
+    pub row: aterm_slog::ClauseRow,
+    pub head: String,
+    pub tone: aterm_slog::Tone,
+    pub by: aterm_slog::Actor,
+    pub since_wall: u64,
 }
 
 /// One tab's live agent upgrade, as its context menu offers it (gap #21):
@@ -262,20 +319,18 @@ pub(crate) enum TabMenuEntry {
     },
 }
 
-/// The closed verb vocabulary of a [`TabMenuEntry::ConnectionAction`] row.
+/// The closed verb vocabulary of a [`TabMenuEntry::ConnectionAction`] row:
+/// an act that needs a session ARGUMENT (`peer_sid`), dispatched by
+/// `App::dispatch_tab_menu_connection`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConnVerb {
-    /// Raise the window hosting the peer and select its tab (the `raise` wire
-    /// verb's UI twin).
+    /// Raise the window hosting the session and select its tab (the `raise`
+    /// wire verb's UI twin): `Go to <manager>`, a worker row.
     Show,
-    /// Open the connection editor for this pair — the §2.5 sheet: the shared
-    /// confirm/configure card (`conn_card`), pre-filled from the live pair
-    /// state; Confirm applies through the declarative `connect` set-semantics
-    /// seam.
-    Configure,
-    /// Dissolve the connection with this peer (both directions), pair-precise
-    /// through [`crate::connections::disconnect_kind_in`], origin `ui`.
-    Disconnect,
+    /// Stop Worker…: after the person confirms the sheet (or, with no sheet
+    /// to ask on, the Overview's inline confirm), SIGTERM to the session's
+    /// agent, in process (`App::stop_worker`); its task reads `exited`.
+    StopWorker,
 }
 
 /// The per-tab chrome EXTENSION the app pushes to the native strip alongside
@@ -323,6 +378,13 @@ pub(crate) struct CachedChrome {
     /// time): the instant the scheduler recomposes it, or `None` when nothing
     /// it says moves with the clock — no wake.
     pub expires_ms: Option<u64>,
+    /// The session log's clause at compose time ([`ClauseKey`]), `None` with
+    /// `[session_log] clause` off or no clause: a clause that moved, or a
+    /// switch that flipped, misses the cache.
+    pub clause: Option<ClauseKey>,
+    /// The clause line composed from it, served again when the timeline is
+    /// contended at the next compose (ruling S16).
+    pub clause_line: Option<ClauseLine>,
     /// The composed extension handed to the native strip.
     pub ext: TabChromeExt,
 }
@@ -361,12 +423,21 @@ pub(crate) struct ExpiryProgress {
 /// tabs, on screen or not, cost the event loop nothing (the Together run,
 /// 2026-10-16, measured one timer wake every 30 s per tab recomposing a
 /// closed menu's ages).
+///
+/// With `[session_log] clause` on, a label the clause shows leaves at its
+/// `until` (ruling S10): the expiry is the earlier of the upgrade's term and
+/// that instant. Off (no clause), it is exactly the upgrade's term.
 #[must_use]
 pub(crate) fn clock_expiry_ms(composed_ms: u64, input: &SessionChromeInput) -> Option<u64> {
-    input
+    let upgrade = input
         .upgrade
         .is_some()
-        .then(|| composed_ms.saturating_add(CACHE_MAX_AGE_MS))
+        .then(|| composed_ms.saturating_add(CACHE_MAX_AGE_MS));
+    let label = input.clause.as_ref().and_then(|c| c.until_ms);
+    match (upgrade, label) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// Earliest absolute process-clock expiry represented by the cache, or `None`
@@ -531,7 +602,10 @@ fn connection_lines(input: &SessionChromeInput) -> Vec<String> {
 /// and observed prose are labeled so a transient status line can never
 /// masquerade as durable session metadata. The newest-first timeline tail is
 /// the menu's alone ([`timeline_rows`]).
-fn header_lines(input: &SessionChromeInput) -> Vec<String> {
+///
+/// Also where the clause goes (after `activity:`, before `cwd:`): the index
+/// the tooltip's `now:` line and the menu's row are put at.
+fn header_lines(input: &SessionChromeInput) -> (Vec<String>, usize) {
     let mut identity = vec![title_line(input)];
     if let Some(description) = input.description.as_deref().and_then(|description| {
         crate::session_timeline::sanitize_metadata_value("description", description)
@@ -550,6 +624,7 @@ fn header_lines(input: &SessionChromeInput) -> Vec<String> {
             identity.push(format!("activity: {}", display_description(&activity)));
         }
     }
+    let clause_at = identity.len();
     if let Some(cwd) = input.cwd.as_deref().filter(|c| !c.is_empty()) {
         let cwd = display_cwd(cwd, input.home.as_deref());
         if !cwd.is_empty() {
@@ -565,7 +640,18 @@ fn header_lines(input: &SessionChromeInput) -> Vec<String> {
     }) {
         identity.push(format!("state: {state}"));
     }
-    identity
+    (identity, clause_at)
+}
+
+/// The clause's words as a line shows them (`now: <head>`), through the
+/// presentation sanitizer every header line takes (a bidi or C1 character
+/// in a label is stripped); `None` when nothing is left.
+fn clause_words(clause: &ClauseLine) -> Option<String> {
+    let head = crate::session_timeline::sanitize_presentation_line(
+        &clause.head,
+        crate::session_timeline::META_DESCRIPTION_MAX,
+    );
+    (!head.is_empty()).then(|| format!("now: {head}"))
 }
 
 /// The menu's newest-first timeline tail: each shown event
@@ -609,7 +695,8 @@ pub(crate) fn menu_shown_at(entries: &[TabMenuEntry], now_ms: u64) -> Vec<TabMen
 }
 
 /// Whether a timeline event earns a row in the tab's hover chrome. An agent's
-/// verdict moves, a person's own typing, the bus's own traffic (a fetch, a
+/// verdict moves, a program's own state reports (`program-state`, a codex's
+/// turn ledger), a person's own typing, the bus's own traffic (a fetch, a
 /// topic, a read receipt, a delivery receipt) and the resize ledger's
 /// `render` verdict (a desync risk and its heal are one kind, told apart only
 /// by the payload) say nothing without their payload, which this surface
@@ -618,7 +705,20 @@ pub(crate) fn menu_shown_at(entries: &[TabMenuEntry], now_ms: u64) -> Vec<TabMen
 pub(crate) fn timeline_row_shown(kind: &str) -> bool {
     !matches!(
         kind,
-        "agent-change" | "human" | "fetch" | "topic" | "inbox-seen" | "post-landed" | "render"
+        "agent-change"
+            | crate::session_timeline::PROGRAM_STATE
+            | "human"
+            | "fetch"
+            | "topic"
+            | "inbox-seen"
+            | "post-landed"
+            | "render"
+            // The card engine's dev rows (`crate::holder_image::DEV_ROWS`).
+            | "holder-edge"
+            | "holder-image"
+            | "holder-named"
+            | "holder-claim"
+            | "card-seen"
     )
 }
 
@@ -653,6 +753,7 @@ fn event_words(kind: &str) -> &str {
         "inbox" => "mail arrived",
         "post" => "mail sent",
         "in-doubt" => "input unconfirmed",
+        "task-change" => "task changed",
         other => other,
     }
 }
@@ -667,7 +768,10 @@ fn event_words(kind: &str) -> &str {
 /// strip joins the tooltip's lines into one help string.
 #[must_use]
 pub(crate) fn compose_tooltip(input: &SessionChromeInput) -> Option<String> {
-    let identity = header_lines(input);
+    let (mut identity, clause_at) = header_lines(input);
+    if let Some(line) = input.clause.as_ref().and_then(clause_words) {
+        identity.insert(clause_at, line);
+    }
     let connections = connection_lines(input);
     let icon = input
         .icon
@@ -706,20 +810,31 @@ fn attention_line(input: &SessionChromeInput) -> Option<String> {
 
 /// Compose the right-click CONTEXT-MENU model for one terminal tab: the same
 /// identity lines as the tooltip as disabled headers, a separator, the
-/// newest-first timeline tail (disabled), a separator, the CONNECTIONS section
-/// (design §2.3), a separator, then the actions. The menu ALWAYS exists
-/// (unlike the tooltip): a bare unnamed session still owns
-/// `Copy Session ID` / `Copy CWD` / `Close Tab`, with the unavailable copies
-/// greyed rather than hidden (a stable menu shape is learnable) — and the
-/// CONNECTIONS section is likewise always present (the spawn presets / picker
-/// entries are its floor), FLAT per design R15: per-peer `Header` rows carry
-/// the direction line, the peer's `ConnectionAction` rows follow flat.
+/// newest-first timeline tail (disabled), a separator, the AGENT section
+/// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4, replacing CONNECTIONS), a
+/// separator, then the actions. The menu ALWAYS exists (unlike the tooltip):
+/// a bare unnamed session still owns `Copy Session ID` / `Copy CWD` / `Close
+/// Tab`, with the unavailable copies greyed rather than hidden (a stable menu
+/// shape is learnable). The AGENT section is always present — Take Over (or
+/// Hand Back), Harness Log, Set Role… are its floor — and adds, on a worker,
+/// `Go to <manager>` and Stop Worker…, and on a manager a `Workers (n)` header
+/// with one row per worker, FLAT per design R15.
 #[must_use]
 pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> {
-    let mut entries: Vec<TabMenuEntry> = header_lines(input)
-        .into_iter()
-        .map(TabMenuEntry::Header)
-        .collect();
+    let (headers, clause_at) = header_lines(input);
+    let mut entries: Vec<TabMenuEntry> = headers.into_iter().map(TabMenuEntry::Header).collect();
+    // The clause, aged as the menu pops ([`TabMenuEntry::shown_at`]).
+    if let Some(clause) = input.clause.as_ref()
+        && let Some(words) = clause_words(clause)
+    {
+        entries.insert(
+            clause_at,
+            TabMenuEntry::Event {
+                words,
+                at_ms: clause.since_ms,
+            },
+        );
+    }
     let timeline = timeline_rows(input);
     if !timeline.is_empty() {
         entries.push(TabMenuEntry::Separator);
@@ -741,60 +856,73 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
         }
     }
     entries.push(TabMenuEntry::Separator);
-    entries.push(TabMenuEntry::Header("CONNECTIONS".to_string()));
-    for fact in &input.connections {
-        entries.push(TabMenuEntry::Header(connection_line(fact)));
-        for (label, verb) in [
-            ("Show", ConnVerb::Show),
-            ("Configure…", ConnVerb::Configure),
-            ("Disconnect", ConnVerb::Disconnect),
-        ] {
-            entries.push(TabMenuEntry::ConnectionAction {
-                label: label.to_string(),
-                peer_sid: fact.peer_sid.clone(),
-                verb,
-                enabled: true,
-            });
-        }
-    }
-    // The §2.3 spawn presets + picker/map entries — plain MenuAction rows (the
-    // same actions the File menu / palette dispatch), gated on `has_session`
-    // where the act needs THIS session as its origin.
+    entries.push(TabMenuEntry::Header("AGENT".to_string()));
     let action = |label: &str, action: MenuAction, enabled: bool| TabMenuEntry::Action {
         label: label.to_string(),
         action,
         enabled,
     };
+    // The person's hold pair: the one that applies (`Take Over` and `Hand
+    // Back` are the person's own; the clicked tab is their subject).
+    let agent = &input.agent;
+    entries.push(if agent.person_hold {
+        action(
+            "Hand Back This Tab",
+            MenuAction::HandBack,
+            input.has_session,
+        )
+    } else {
+        action(
+            "Take Over This Tab",
+            MenuAction::TakeOver,
+            input.has_session,
+        )
+    });
     entries.push(action(
-        "New Controlled Session in New Window",
-        MenuAction::NewControlledWindow,
+        "Harness Log for This Tab",
+        MenuAction::HarnessLog,
         input.has_session,
     ));
     entries.push(action(
-        "New Controlled Session as Tab",
-        MenuAction::NewControlledTab,
-        input.has_session,
+        "Set Role…",
+        MenuAction::SetRole,
+        input.has_session && input.can_rename,
     ));
-    entries.push(action(
-        "New Controller Session in New Window",
-        MenuAction::NewControllerWindow,
-        input.has_session,
-    ));
-    entries.push(action(
-        "New Controller Session as Tab",
-        MenuAction::NewControllerTab,
-        input.has_session,
-    ));
-    entries.push(action(
-        "Connect to Session…",
-        MenuAction::ConnectToSession,
-        input.has_session,
-    ));
-    entries.push(action(
-        "Show Connection Map",
-        MenuAction::ShowConnectionMap,
-        true,
-    ));
+    // On a worker: its manager, and the stop.
+    if let Some((manager, label)) = &agent.manager {
+        entries.push(TabMenuEntry::ConnectionAction {
+            label: format!("Go to {label}"),
+            peer_sid: manager.clone(),
+            verb: ConnVerb::Show,
+            enabled: true,
+        });
+    }
+    if agent.stoppable
+        && let Some(sid) = input.sid.clone()
+    {
+        entries.push(TabMenuEntry::ConnectionAction {
+            label: "Stop Worker\u{2026}".to_string(),
+            peer_sid: sid,
+            verb: ConnVerb::StopWorker,
+            enabled: true,
+        });
+    }
+    // On a manager: its workers, one row each, going there. Flat (design
+    // R15): the header names the count, the rows follow.
+    if !agent.workers.is_empty() {
+        entries.push(TabMenuEntry::Header(format!(
+            "Workers ({})",
+            agent.workers.len()
+        )));
+        for (sid, words) in &agent.workers {
+            entries.push(TabMenuEntry::ConnectionAction {
+                label: words.clone(),
+                peer_sid: sid.clone(),
+                verb: ConnVerb::Show,
+                enabled: true,
+            });
+        }
+    }
     entries.push(TabMenuEntry::Separator);
     // FIRST because it is the identity action the headers above are about; the
     // clipboard pair and the close follow. Gated on `has_session` like the id
@@ -884,6 +1012,8 @@ mod tests {
             connections_revision: 0,
             upgrade_revision: 0,
             expires_ms: Some(composed_ms + CACHE_MAX_AGE_MS),
+            clause: None,
+            clause_line: None,
             ext: TabChromeExt::default(),
         }
     }
@@ -1014,6 +1144,9 @@ mod tests {
             connections: Vec::new(),
             upgrade: None,
             attention: None,
+            sid: None,
+            agent: AgentMenu::default(),
+            clause: None,
         }
     }
 
@@ -1280,6 +1413,7 @@ mod tests {
             ("inbox-seen", 90),
             ("post-landed", 90),
             ("render", 90),
+            ("program-state", 90),
             ("agent-change", 90),
             ("inbox", 90),
             ("cwd-change", 90),
@@ -1289,10 +1423,16 @@ mod tests {
         assert_eq!(kinds, ["inbox", "cwd-change"]);
         assert!(tail.iter().all(|n| n.at_ms == 90), "each keeps its stamp");
         let mut input = full_input();
-        input.timeline = ["agent-change", "human", "agent-change", "cwd-change"]
-            .into_iter()
-            .map(|kind| TimelineNote { kind, at_ms: NOW })
-            .collect();
+        input.timeline = [
+            "agent-change",
+            "task-change",
+            "human",
+            "agent-change",
+            "cwd-change",
+        ]
+        .into_iter()
+        .map(|kind| TimelineNote { kind, at_ms: NOW })
+        .collect();
         let menu = menu_shown_at(&compose_tab_menu(&input), NOW);
         let rows: Vec<&str> = menu
             .iter()
@@ -1301,14 +1441,20 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(rows, ["changed directory \u{b7} just now"]);
+        // A worker's task moving is a row, in words: it is rare and it is news.
+        assert_eq!(
+            rows,
+            [
+                "task changed \u{b7} just now",
+                "changed directory \u{b7} just now"
+            ]
+        );
     }
 
-    /// The menu model carries the pinned structure: identity headers, sep,
-    /// timeline headers, sep, the CONNECTIONS section, sep, then the actions
-    /// in order — with the SAME header text the tooltip shows (one composer,
-    /// two surfaces; the `CONNECTIONS` section marker is the one menu-only
-    /// header, being structure rather than a fact).
+    /// The menu opens with the SAME header text the tooltip shows (one
+    /// composer, two surfaces), plus the timeline tail; the `AGENT` marker is
+    /// the one menu-only header, being structure rather than a fact. Then the
+    /// AGENT rows and the actions, in order; four groups, three separators.
     #[test]
     fn menu_matches_tooltip_headers_and_orders_actions() {
         let mut input = full_input();
@@ -1325,49 +1471,40 @@ mod tests {
         let menu_headers: Vec<&str> = menu
             .iter()
             .filter_map(|e| match e {
-                TabMenuEntry::Header(h) if h != "CONNECTIONS" => Some(h.as_str()),
+                TabMenuEntry::Header(h) if h != "AGENT" => Some(h.as_str()),
                 _ => None,
             })
             .collect();
-        // The tooltip orders identity → connections; the menu adds the
-        // timeline tail and holds the connection line in its own section AFTER
-        // it. Same facts, sorted per surface.
-        let mut tip_sorted = tip_lines.clone();
-        tip_sorted.extend([
-            "details changed · just now",
-            "changed directory · 2m ago",
-            "started · 2h ago",
-        ]);
-        tip_sorted.sort_unstable();
-        let mut menu_sorted = menu_headers.clone();
-        menu_sorted.sort_unstable();
+        // The tooltip carries the connection line; the menu does not (its
+        // CONNECTIONS section went), and adds the timeline tail.
+        let tip_identity: Vec<&str> = tip_lines
+            .iter()
+            .copied()
+            .filter(|l| !l.starts_with('\u{21e5}'))
+            .collect();
+        assert_eq!(&menu_headers[..tip_identity.len()], &tip_identity[..]);
         assert_eq!(
-            menu_sorted, tip_sorted,
-            "menu headers ARE the tooltip plus the timeline tail"
+            menu_headers.len(),
+            tip_identity.len() + 3,
+            "+ the timeline tail"
         );
-        assert!(tip_lines.contains(&"\u{21e5} pushes into \"build\""));
-        let actions: Vec<(MenuAction, bool)> = menu
+        let actions: Vec<MenuAction> = menu
             .iter()
             .filter_map(|e| match e {
-                TabMenuEntry::Action {
-                    action, enabled, ..
-                } => Some((*action, *enabled)),
+                TabMenuEntry::Action { action, .. } => Some(*action),
                 _ => None,
             })
             .collect();
         assert_eq!(
             actions,
             vec![
-                (MenuAction::NewControlledWindow, true),
-                (MenuAction::NewControlledTab, true),
-                (MenuAction::NewControllerWindow, true),
-                (MenuAction::NewControllerTab, true),
-                (MenuAction::ConnectToSession, true),
-                (MenuAction::ShowConnectionMap, true),
-                (MenuAction::RenameSession, true),
-                (MenuAction::CopySessionId, true),
-                (MenuAction::CopyCwd, true),
-                (MenuAction::CloseTab, true),
+                MenuAction::TakeOver,
+                MenuAction::HarnessLog,
+                MenuAction::SetRole,
+                MenuAction::RenameSession,
+                MenuAction::CopySessionId,
+                MenuAction::CopyCwd,
+                MenuAction::CloseTab,
             ]
         );
         assert_eq!(
@@ -1375,81 +1512,86 @@ mod tests {
                 .filter(|e| matches!(e, TabMenuEntry::Separator))
                 .count(),
             3,
-            "identity | timeline | connections | actions"
+            "identity | timeline | agent | actions"
         );
     }
 
-    /// The CONNECTIONS section per state (design §2.3): no connections keeps
-    /// the section with only the preset/picker floor; a one-way connection
-    /// gets its header + the three flat per-peer rows; a peer pair renders the
-    /// `⇆` line; a live connection carries the `· live` qualifier. The menu
-    /// stays FLAT throughout (design R15 — no submenu variant exists to
-    /// regress into).
+    /// THE AGENT SECTION per state (design §4): a plain session offers Take
+    /// Over, the harness log and the role; under the person's hold the first
+    /// row is Hand Back; a worker adds `Go to <manager>` (Show, the manager's
+    /// sid) and Stop Worker… (on its own sid); a manager adds a `Workers (n)`
+    /// header and one Show row per worker. Flat throughout (design R15).
     #[test]
-    fn connections_section_renders_each_state_flat() {
-        let conn_rows = |input: &SessionChromeInput| -> Vec<(String, String, ConnVerb, bool)> {
+    fn the_agent_section_offers_the_hold_and_the_team_rows() {
+        let rows = |input: &SessionChromeInput| -> Vec<(String, ConnVerb)> {
             compose_tab_menu(input)
                 .iter()
                 .filter_map(|e| match e {
-                    TabMenuEntry::ConnectionAction {
-                        label,
-                        peer_sid,
-                        verb,
-                        enabled,
-                    } => Some((
-                        label.clone(),
-                        peer_sid.as_str().to_string(),
-                        *verb,
-                        *enabled,
-                    )),
+                    TabMenuEntry::ConnectionAction { peer_sid, verb, .. } => {
+                        Some((peer_sid.as_str().to_string(), *verb))
+                    }
                     _ => None,
                 })
                 .collect()
         };
-
-        // NONE: the marker + floor rows exist, no per-peer rows.
-        let none = full_input();
-        let menu = compose_tab_menu(&none);
+        let first_agent_action = |input: &SessionChromeInput| {
+            compose_tab_menu(input).iter().find_map(|e| match e {
+                TabMenuEntry::Action { action, .. } => Some(*action),
+                _ => None,
+            })
+        };
+        let mut plain = full_input();
+        plain.sid = Some(SessionId::new("s-me"));
         assert!(
-            menu.iter()
-                .any(|e| matches!(e, TabMenuEntry::Header(h) if h == "CONNECTIONS")),
-            "the section marker is always present"
+            compose_tab_menu(&plain)
+                .iter()
+                .any(|e| matches!(e, TabMenuEntry::Header(h) if h == "AGENT"))
         );
-        assert!(conn_rows(&none).is_empty());
+        assert_eq!(first_agent_action(&plain), Some(MenuAction::TakeOver));
+        assert!(rows(&plain).is_empty(), "no team, no team rows");
 
-        // ONE-WAY: header line + Show/Configure…/Disconnect for that peer.
-        let mut one_way = full_input();
-        one_way.connections = vec![fact(
-            "s-b",
-            "operator",
-            ConnDirection::Inbound,
-            ConnFlow::Pull,
-            false,
-        )];
-        let menu = compose_tab_menu(&one_way);
-        assert!(menu.iter().any(
-            |e| matches!(e, TabMenuEntry::Header(h) if h == "\u{21e4} pulled by \"operator\"")
-        ),);
+        let mut held = plain.clone();
+        held.agent.person_hold = true;
+        assert_eq!(first_agent_action(&held), Some(MenuAction::HandBack));
+
+        let mut worker = plain.clone();
+        worker.agent.manager = Some((SessionId::new("s-boss"), "lab-sweep".to_string()));
+        worker.agent.stoppable = true;
         assert_eq!(
-            conn_rows(&one_way),
-            vec![
-                ("Show".to_string(), "s-b".to_string(), ConnVerb::Show, true),
-                (
-                    "Configure…".to_string(),
-                    "s-b".to_string(),
-                    ConnVerb::Configure,
-                    true
-                ),
-                (
-                    "Disconnect".to_string(),
-                    "s-b".to_string(),
-                    ConnVerb::Disconnect,
-                    true
-                ),
+            rows(&worker),
+            [
+                ("s-boss".to_string(), ConnVerb::Show),
+                ("s-me".to_string(), ConnVerb::StopWorker),
             ]
         );
 
-        // PEER + LIVE: the ⇆ line, and the live qualifier on a live push.
+        let mut manager = plain.clone();
+        manager.agent.workers = vec![
+            (SessionId::new("s-w1"), "bench".to_string()),
+            (SessionId::new("s-w2"), "fmt".to_string()),
+        ];
+        let menu = compose_tab_menu(&manager);
+        let header = menu
+            .iter()
+            .position(|e| matches!(e, TabMenuEntry::Header(h) if h.starts_with("Workers")))
+            .expect("the workers header");
+        assert!(matches!(
+            &menu[header],
+            TabMenuEntry::Header(h) if h.contains('2')
+        ));
+        assert_eq!(
+            rows(&manager),
+            [
+                ("s-w1".to_string(), ConnVerb::Show),
+                ("s-w2".to_string(), ConnVerb::Show),
+            ]
+        );
+    }
+
+    /// The tooltip still carries each connection line (§4: never
+    /// visual-only), and a hostile peer title cannot forge a line.
+    #[test]
+    fn the_tooltip_carries_connection_lines_and_no_forged_one() {
         let mut peers = full_input();
         peers.connections = vec![
             fact(
@@ -1467,46 +1609,28 @@ mod tests {
                 true,
             ),
         ];
-        let headers: Vec<String> = compose_tab_menu(&peers)
-            .iter()
-            .filter_map(|e| match e {
-                TabMenuEntry::Header(h) => Some(h.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(headers.contains(&"\u{21c6} peer \"claude (b)\"".to_string()));
-        assert!(headers.contains(&"\u{21e5} pushes into \"build\" \u{00b7} live".to_string()));
-        // Two peers ⇒ two flat row groups, in the caller's order.
-        let rows = conn_rows(&peers);
-        assert_eq!(rows.len(), 6);
-        assert!(rows[..3].iter().all(|(_, sid, ..)| sid == "s-b"));
-        assert!(rows[3..].iter().all(|(_, sid, ..)| sid == "s-c"));
-
-        // The tooltip carries the SAME connection lines (§4: never
-        // visual-only), and a hostile peer title cannot forge a line.
         let tip = compose_tooltip(&peers).unwrap();
         assert!(tip.contains("\u{21c6} peer \"claude (b)\""));
         assert!(tip.contains("\u{21e5} pushes into \"build\" \u{00b7} live"));
         let mut hostile = full_input();
         hostile.connections = vec![fact(
             "s-evil",
-            "a\u{202e}b\nCONNECTIONS",
+            "a\u{202e}b\nAGENT",
             ConnDirection::Outbound,
             ConnFlow::Pull,
             false,
         )];
         let tip = compose_tooltip(&hostile).unwrap();
         assert!(
-            tip.lines()
-                .any(|l| l == "\u{21e5} pulls from \"abCONNECTIONS\""),
+            tip.lines().any(|l| l == "\u{21e5} pulls from \"abAGENT\""),
             "controls/bidi stripped, no forged extra line: {tip:?}"
         );
     }
 
     /// A bare session still gets a menu (label header + sections + actions),
-    /// with the unavailable copies GREYED, not hidden — and only TWO
-    /// separators (no empty timeline group; the connections section is always
-    /// present because its preset/picker floor is).
+    /// with the acts that need a session GREYED, not hidden — and only TWO
+    /// separators (no empty timeline group; the AGENT section is always
+    /// present because its floor is).
     #[test]
     fn bare_session_menu_greys_unavailable_copies() {
         let input = SessionChromeInput {
@@ -1522,55 +1646,21 @@ mod tests {
                 .count(),
             2
         );
-        // No session ⇒ every act that needs THIS session as its subject greys:
-        // the spawn presets and the picker (their origin is this session).
+        let greyed = |a: MenuAction| {
+            menu.iter().any(|e| {
+                matches!(e, TabMenuEntry::Action { action, enabled: false, .. } if *action == a)
+            })
+        };
         for a in [
-            MenuAction::NewControlledWindow,
-            MenuAction::NewControlledTab,
-            MenuAction::NewControllerWindow,
-            MenuAction::NewControllerTab,
-            MenuAction::ConnectToSession,
+            MenuAction::TakeOver,
+            MenuAction::HarnessLog,
+            MenuAction::SetRole,
+            MenuAction::RenameSession,
+            MenuAction::CopySessionId,
+            MenuAction::CopyCwd,
         ] {
-            assert!(
-                menu.iter().any(|e| matches!(
-                    e,
-                    TabMenuEntry::Action { action, enabled: false, .. } if *action == a
-                )),
-                "{a:?} greys without a session"
-            );
+            assert!(greyed(a), "{a:?} greys without a session");
         }
-        assert!(menu.iter().any(|e| matches!(
-            e,
-            TabMenuEntry::Action {
-                action: MenuAction::ShowConnectionMap,
-                enabled: true,
-                ..
-            }
-        )));
-        assert!(menu.iter().any(|e| matches!(
-            e,
-            TabMenuEntry::Action {
-                action: MenuAction::RenameSession,
-                enabled: false,
-                ..
-            }
-        )));
-        assert!(menu.iter().any(|e| matches!(
-            e,
-            TabMenuEntry::Action {
-                action: MenuAction::CopySessionId,
-                enabled: false,
-                ..
-            }
-        )));
-        assert!(menu.iter().any(|e| matches!(
-            e,
-            TabMenuEntry::Action {
-                action: MenuAction::CopyCwd,
-                enabled: false,
-                ..
-            }
-        )));
         assert!(menu.iter().any(|e| matches!(
             e,
             TabMenuEntry::Action {
@@ -1582,9 +1672,9 @@ mod tests {
     }
 
     /// The `chrome` verb's mirror line serialises EXACTLY the composed model:
-    /// headers verbatim, separators as `---`, disabled actions annotated, and
-    /// connection rows flat with their `@<sid>` peer argument — so the
-    /// introspected listing IS the on-screen menu.
+    /// one token per entry, separators as `---`, disabled actions annotated,
+    /// a session-argument row flat with its `@<sid>` — so the introspected
+    /// listing IS the on-screen menu.
     #[test]
     fn chrome_line_mirrors_composed_model() {
         let mut input = SessionChromeInput {
@@ -1592,25 +1682,27 @@ mod tests {
             cwd: Some("/tmp".to_string()),
             has_session: true,
             can_rename: true,
+            sid: Some(SessionId::new("s-me")),
             ..SessionChromeInput::default()
         };
-        input.connections = vec![fact(
-            "s-b",
-            "build",
-            ConnDirection::Outbound,
-            ConnFlow::Push,
-            false,
-        )];
-        let line = tab_menu_chrome_line(2, &compose_tab_menu(&input), NOW);
-        assert_eq!(
-            line,
-            "tab-menu tab=2 items=[\"zsh\", \"cwd: /tmp\", \"---\", \"CONNECTIONS\", \
-             \"\u{21e5} pushes into \\\"build\\\"\", \"Show @s-b\", \"Configure… @s-b\", \
-             \"Disconnect @s-b\", \"New Controlled Session in New Window\", \
-             \"New Controlled Session as Tab\", \"New Controller Session in New Window\", \
-             \"New Controller Session as Tab\", \"Connect to Session…\", \
-             \"Show Connection Map\", \"---\", \"Rename Session…\", \"Copy Session ID\", \
-             \"Copy CWD\", \"Close Tab\"]"
+        input.agent.manager = Some((SessionId::new("s-boss"), "boss".to_string()));
+        let menu = compose_tab_menu(&input);
+        let line = tab_menu_chrome_line(2, &menu, NOW);
+        let items: Vec<String> = menu_shown_at(&menu, NOW)
+            .iter()
+            .map(menu_entry_mirror)
+            .collect();
+        assert_eq!(line, format!("tab-menu tab=2 items={items:?}"));
+        assert_eq!(items.iter().filter(|t| *t == "---").count(), 2);
+        assert!(items.iter().any(|t| t.ends_with(" @s-boss")), "{items:?}");
+        input.has_session = false;
+        let greyed: Vec<String> = compose_tab_menu(&input)
+            .iter()
+            .map(menu_entry_mirror)
+            .collect();
+        assert!(
+            greyed.iter().any(|t| t.ends_with(" (disabled)")),
+            "{greyed:?}"
         );
     }
 
@@ -1667,5 +1759,116 @@ mod tests {
             ..input.upgrade.clone().expect("set")
         });
         assert_eq!(compose_tab_menu(&input), plain, "no word: no section");
+    }
+
+    /// A clause as the composer is handed it (`SessionLog::chrome_clause`).
+    fn clause(head: &str, since_ms: u64, until_ms: Option<u64>) -> ClauseLine {
+        ClauseLine {
+            head: head.to_string(),
+            since_ms,
+            until_ms,
+        }
+    }
+
+    /// THE CLAUSE'S LINE AND ROW (phase 3B; addendum A12 item 3): the
+    /// tooltip's `now: <head>` sits right after `activity:` with no age, and
+    /// the menu's row at the same place, aged as the menu pops. Every other
+    /// line and row is the input's without a clause, byte for byte.
+    ///
+    /// NEGATIVE CONTROL: no clause, no line and no row.
+    #[test]
+    fn the_clause_is_a_now_line_after_activity_and_an_aged_menu_row() {
+        let plain = full_input();
+        let mut input = full_input();
+        input.clause = Some(clause("running shell", NOW - 240_000, None));
+        assert_eq!(
+            compose_tooltip(&input).expect("composes"),
+            "🤖 build agent\n\
+             description: Rebuilds the docs site\n\
+             activity: Building documentation\n\
+             now: running shell\n\
+             cwd: ~/src/aterm"
+        );
+        let menu = compose_tab_menu(&input);
+        let without = compose_tab_menu(&plain);
+        assert_eq!(menu.len(), without.len() + 1, "one row and nothing else");
+        assert_eq!(
+            menu[3],
+            TabMenuEntry::Event {
+                words: "now: running shell".to_string(),
+                at_ms: NOW - 240_000,
+            }
+        );
+        let mut rest = menu.clone();
+        rest.remove(3);
+        assert_eq!(rest, without, "every other row is today's");
+        assert_eq!(
+            menu_shown_at(&menu, NOW)[3],
+            TabMenuEntry::Header("now: running shell \u{b7} 4m ago".to_string()),
+            "the row is aged where it is shown"
+        );
+        // With no activity line the clause follows the description.
+        input.activity = None;
+        assert!(
+            compose_tooltip(&input)
+                .expect("composes")
+                .contains("description: Rebuilds the docs site\nnow: running shell\ncwd:")
+        );
+        // Negative control.
+        assert!(!compose_tooltip(&plain).expect("composes").contains("now:"));
+        assert!(
+            !without
+                .iter()
+                .any(|e| menu_entry_mirror(e).starts_with("now:"))
+        );
+    }
+
+    /// A label's words reach the chrome through the presentation sanitizer
+    /// every header line takes: a bidi override or a control character is
+    /// stripped, and a clause with nothing left is no line at all.
+    #[test]
+    fn the_clauses_words_are_sanitized_like_every_header() {
+        let mut input = full_input();
+        input.clause = Some(clause("ship\u{202e}ping\u{7}", NOW, None));
+        let tip = compose_tooltip(&input).expect("composes");
+        assert!(tip.contains("\nnow: shipping\n"), "{tip:?}");
+        assert!(!tip.contains('\u{202e}') && !tip.contains('\u{7}'));
+        input.clause = Some(clause("\u{202e}\u{7}", NOW, None));
+        assert_eq!(compose_tooltip(&input), compose_tooltip(&full_input()));
+        assert_eq!(compose_tab_menu(&input), compose_tab_menu(&full_input()));
+    }
+
+    /// RULING S10: a shown label leaves at its `until`, so the composition's
+    /// expiry is the earlier of the upgrade's term and that instant, and
+    /// with the switch off (no clause) it is exactly the upgrade's term —
+    /// `None` for a quiet tab, never `composed + 30 s`. A step or turn
+    /// clause (no `until`) arms nothing.
+    #[test]
+    fn a_shown_labels_until_bounds_the_compositions_expiry() {
+        let mut input = full_input();
+        assert_eq!(clock_expiry_ms(NOW, &input), None, "off and quiet: none");
+        input.clause = Some(clause("running shell", NOW - 1_000, None));
+        assert_eq!(clock_expiry_ms(NOW, &input), None, "a step arms nothing");
+        input.clause = Some(clause("compiling", NOW - 1_000, Some(NOW + 9_000)));
+        assert_eq!(clock_expiry_ms(NOW, &input), Some(NOW + 9_000));
+        input.upgrade = Some(UpgradeMenu {
+            sid: "s-1".to_string(),
+            moving: "Claude Code 2.1.281 → 2.1.282".to_string(),
+            to: "2.1.282".to_string(),
+            words: Vec::new(),
+        });
+        assert_eq!(
+            clock_expiry_ms(NOW, &input),
+            Some(NOW + 9_000),
+            "the earlier of the two"
+        );
+        input.clause = Some(clause("compiling", NOW, Some(NOW + 2 * CACHE_MAX_AGE_MS)));
+        assert_eq!(clock_expiry_ms(NOW, &input), Some(NOW + CACHE_MAX_AGE_MS));
+        input.clause = None;
+        assert_eq!(
+            clock_expiry_ms(NOW, &input),
+            Some(NOW + CACHE_MAX_AGE_MS),
+            "off: exactly the upgrade's term"
+        );
     }
 }

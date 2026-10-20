@@ -37,13 +37,13 @@
 //!   [`SupervisorConfig::on_for`]); `true` changes nothing beyond the master
 //!   switch; any other key there is reported and changes nothing. It limits
 //!   wherever it is written, as every key does. The window's host is its one
-//!   reader: the engine, `aterm drive watch|supervise` and the launcher read
-//!   neither it nor the master switch.
+//!   reader: the engine and the launcher read neither it nor the master
+//!   switch.
 //!
 //! Stops are warnings by default: where the harness would halt, end or wait
 //! on an agent on its own judgment, it says so and goes on. Each stop is one
-//! opt-in switch away: `upgrade_ask` (the live upgrade's notice and READY
-//! handshake), `stall_term` (a frozen agent restarted with `restart if-stalled`),
+//! opt-in switch away: `upgrade_ask` (the live upgrade's notice and readiness
+//! answer), `stall_term` (a frozen agent restarted with `restart if-stalled`),
 //! `rm_breaker_ask` (under `approve = "safe"`, an unproven rm circuit breaker
 //! handed to a person). Written `true`, each is a limit by
 //! [`SupervisorConfig::limits`]'s measure (it takes the harness's own move
@@ -71,6 +71,20 @@
 //! §5.4). A new alert on a machine that did not ask for it is the owner's to
 //! turn on; with accounts listed the record is kept unless `accounts` is
 //! `off` (a wall's is kept under `off` too).
+//!
+//! `usage_credits` ships `false` and is held the same way: its `true` lets
+//! the harness carry a Claude Code session onto usage credits — the consent
+//! box that names them taken, the bucket that asks for one continued into
+//! it, its own turns typed while credits carry the session, a model billed
+//! to them chosen — and its default keeps the session on the subscription
+//! (owner, 2026-10-19: *"for continuing on credits, that's an optional
+//! additional feature that's off by default. use subscriptions."*): but for
+//! one probe turn past the reset the credits' notice named, or at the hold's
+//! bound where none is named, which another window may still bill to
+//! credits. Claude Code saves a model's consent for good per model and
+//! account, so its `true` is the owner's to write, and only the root table's
+//! turns it on. A PURCHASE is no part of it: nothing bought, whatever the
+//! key says.
 //!
 //! One key says how far the harness carries a session's work: `autopilot`
 //! ([`Autopilot`]; `docs/DESIGN-harness-autopilot-2026-10-15.md` §2),
@@ -105,7 +119,7 @@
 //! take, changes nothing, and says so (owner, 2026-09-25).
 //!
 //! [`SupervisorConfig::from_aterm_toml`] is the one reader of that table: the
-//! window's host, `aterm drive watch|supervise` and the hand-run `aterm
+//! window's host, `aterm drive answer` (its grace) and the hand-run `aterm
 //! harness upgrade` all call it, so none of them can disagree on a key, a
 //! default or a refusal.
 
@@ -143,6 +157,7 @@ pub const KEYS: &[&str] = &[
     "limit_reset",
     "usage_tap",
     "usage_notes",
+    "usage_credits",
     "logins",
     "hosts",
     "model_fallback",
@@ -235,19 +250,22 @@ impl Approve {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Autopilot {
     /// Keep the work moving: every point answered, the work continued until
-    /// the agent's clear final statement (`ATERM-TASK-DONE`, or a done reply
-    /// to the done check; a final report that still names open work without
-    /// a blocker is challenged once first, `policy::turn_end`'s
-    /// `RULE_OPEN_ITEMS`). The harness as it ran before Autopilot. The
-    /// default.
+    /// the agent's clear final statement (a done reply to the done check, or
+    /// a legacy explicit-finish report); a final report that still names open
+    /// work, a blocked item included, or a session repository that still
+    /// holds uncommitted, untracked, stashed or unpushed work is challenged
+    /// at every done report while it is left (`policy::turn_end`'s
+    /// `RULE_OPEN_ITEMS` and `RULE_UNCOMMITTED`). The harness as it ran before
+    /// Autopilot. The default.
     #[default]
     Cruise,
     /// Wrap the work up cleanly, then stop: the turn-end policy types the
     /// land instruction once (finish the step in hand, start nothing new,
-    /// leave it verified and committed, reply `ATERM-TASK-DONE`), at most
-    /// `LAND_NUDGES` nudges after it, and then nothing but the land answer,
-    /// which a question asked in prose at a turn end gets whether or not the
-    /// nudges are spent (`policy::turn_end`'s `RULE_LAND`, `RULE_LAND_NUDGE`,
+    /// leave it verified, committed and pushed, write down what is left,
+    /// report the outcome in ordinary language), at most `LAND_NUDGES`
+    /// nudges after it, and then nothing but the land answer, which a
+    /// question asked in prose at a turn end gets whether or not the nudges
+    /// are spent (`policy::turn_end`'s `RULE_LAND`, `RULE_LAND_NUDGE`,
     /// `RULE_LAND_ANSWER`). A question DIALOG is answered as under `Cruise`
     /// (the session's `questions` word, else `question_priority`: the land
     /// answer for a dialog is deferred, the design's §2.2), and so are boxes
@@ -368,9 +386,9 @@ pub struct SupervisorConfig {
     /// decides by that word's fixed policy text, written into a dialog's
     /// free-text row and typed in place of `answer_text` in prose. Never
     /// whether: `answer_questions = false` answers nothing whatever this says.
-    /// A session's own `questions` word decides over it
-    /// ([`Self::session_questions`]). A value the reader cannot take changes
-    /// nothing.
+    /// A session's own `questions` word decides over it (`aterm ctl @<sid>
+    /// meta set questions …`, read by the loop's question policy). A value
+    /// the reader cannot take changes nothing.
     pub question_priority: QuestionPriority,
     /// What a question is answered with.
     pub answer_text: String,
@@ -468,17 +486,45 @@ pub struct SupervisorConfig {
     /// Nothing is typed for it either way: credits are work going on, never a
     /// wall.
     pub usage_notes: bool,
+    /// CONTINUING ON USAGE CREDITS (owner, 2026-10-19: *"for continuing on
+    /// credits, that's an optional additional feature that's off by default.
+    /// use subscriptions."*). `true`: the harness may carry a Claude Code
+    /// session onto usage credits — full power takes a consent box that names
+    /// them (`Continue with …` under `<model> now uses usage credits`, the
+    /// Usage credits dialog's `Continue with usage credits`; the approval
+    /// policy's `credits_consent`, `credits-consent@v1`), and a model bucket
+    /// that asks for that consent is continued into it (the turn-end policy's
+    /// `consent-accept@v1`). Claude Code saves a model's consent (`Continue
+    /// with <M>`) for good per model and account, so later requests on the
+    /// model go to credits with no box; the Usage credits dialog's `Continue
+    /// with usage credits` saves nothing and carries the session onto credits
+    /// already on. `false`, the default: the session stays on the
+    /// subscription — such a box is cancelled with Esc (`credits-decline@v1`),
+    /// or goes to a person where no Esc is read, and the bucket gets what
+    /// `continue = false` gives it (another account, the fallback model, the
+    /// reset waited out); while credits carry the session with no box (`Now
+    /// using usage credits`, `<M> is drawing from usage credits`) the policy
+    /// types none of its own turns (the turn-end policy's `credits-hold@v1`)
+    /// but one probe turn past the reset their notice named or at the hold's
+    /// bound, which another window may still bill to credits; and no upgrade,
+    /// fallback or return moves it onto a model the account's profile bills
+    /// to credits, or onto Fable where the profile cannot say
+    /// (`crate::harness::upgrade_models::credits_billed`). Off by
+    /// default, so `true` is more power, held as [`Self::limit_reset`] is:
+    /// [`Self::limit`] leaves it off and a misplaced table never turns it on.
+    /// Nothing is ever BOUGHT either way (the approval policy's `buys`).
+    pub usage_credits: bool,
     /// THE LOGIN LIFECYCLE (`[harness] logins`, `"renew"` or `"off"`;
     /// `docs/DESIGN-claude-accounts-v2-2026-10-15.md` §5): a session whose
     /// login is a roster row with an email (`accounts.toml`, `aterm harness
-    /// accounts renew`) is WAITED AT when that login ends — never `/login`
-    /// typed — the owner asked once to renew it, and relaunched on its own
-    /// conversation under the renewed login once it is (the wall's resume
-    /// after it); a session still on a login a renewal superseded follows it
-    /// at its next idle turn end. Inert with no such row. Apart from
+    /// accounts renew`) FOLLOWS ITS RENEWAL — relaunched on its own
+    /// conversation under the renewed login at its next idle turn end, or at
+    /// its lost login where a renewal already replaced it. A lost login no
+    /// renewal replaced is signed in where it stands either way (`/login`
+    /// once, the browser sign-in the owner's, its notice says so — the
+    /// owner's ruling of 2026-10-19). Inert with no such row. Apart from
     /// [`Self::accounts`], so `accounts = "off"` keeps renewal working.
-    /// `false` (`"off"`, its limit): a lost login is the person's, `/login`
-    /// typed, as before renewal existed.
+    /// `false` (`"off"`, its limit): no session follows a renewal.
     pub logins: bool,
     /// The machines `aterm harness accounts renew --due` renews on next, over
     /// SSH (`host` or `host:/abs/path/to/aterm`), in one sitting. Read by
@@ -499,9 +545,14 @@ pub struct SupervisorConfig {
     /// Relaunch a Claude Code that crashed (its session record left behind,
     /// read as the exit is seen) on its own conversation, a Muse Code that
     /// crashed (its exit status as its shell recorded it, by Muse Code's own
-    /// table) on its own session, and a codex-alab on the line aterm's copy of
-    /// its own record validated; a graceful exit is someone's decision, a start
-    /// Muse Code refused is never retried, and a vendor `codex` is never
+    /// table) on its own session, an agy that crashed (its shell's exit status
+    /// and the crash file its dead pid left) on its own conversation, a
+    /// Gemini CLI that crashed (its shell's exit status, by its own table) on
+    /// the one session of its project begun since it started, where its own
+    /// resume would load every turn, and a codex-alab on the line aterm's
+    /// copy of its own record validated; a graceful exit is someone's
+    /// decision, a start Muse Code, agy or Gemini CLI refused is never
+    /// retried, a Ctrl-Z'd agy is no exit, and a vendor `codex` is never
     /// relaunched. Its limit limits the stall's remedy too: an agent
     /// frozen past its bound is ended only where it is relaunched
     /// (`supervise/stall.rs`).
@@ -532,9 +583,9 @@ pub struct SupervisorConfig {
     /// Restart an idle agent onto a newer installed build of itself.
     pub upgrade: bool,
     /// The live upgrade asks first: type a notice asking the agent to get to a
-    /// stopping point and answer `ATERM-UPGRADE-READY-…`, and restart only on
-    /// that answer. Off (the default): nothing is typed before the move; a
-    /// session is restarted onto the newer build only at a point where it is
+    /// stopping point and confirm readiness in ordinary language, and restart
+    /// only on that answer. Off (the default): nothing is typed before the
+    /// move; a session is restarted onto the newer build only at a point where it is
     /// genuinely idle (its turn over, nothing running under it, no background
     /// work), and until then its tab only says that a newer build is installed
     /// and that it moves over when idle (owner, 2026-09-29).
@@ -546,16 +597,6 @@ pub struct SupervisorConfig {
     /// Safe rules a retired key switched off ([`RETIRED_KEYS`]); no key of
     /// its own sets it.
     pub withheld: Withheld,
-    /// Whether a session's own `questions` word (`aterm ctl @<sid> meta set
-    /// questions ask|recommended|long-term|short-term`, Owner-only, read by key
-    /// off the bare `meta` reply) decides that session's questions over
-    /// [`Self::answer_questions`] and [`Self::question_priority`] ("global, and
-    /// then session"): a priority word answers its dialogs and its questions
-    /// in prose by that priority, where the table's switch is off too; `ask`
-    /// hands its dialogs to a person (how a controller takes a worker's
-    /// questions, `aterm drive answer`). On by default; off under a loop's own
-    /// `--no-answer`. Not a `[harness]` key (owner, 2026-09-23).
-    pub session_questions: bool,
 }
 
 /// A LOCAL CLOCK TIME, `HH:MM` in 24-hour time (`[harness] land_at`,
@@ -644,8 +685,6 @@ pub struct PolicyTexts {
     /// [`SupervisorConfig::withheld_texts`]: each withheld rule's retired
     /// key, `false`.
     pub withheld: Vec<(String, String)>,
-    /// [`SupervisorConfig::session_questions`].
-    pub session_questions: bool,
 }
 
 /// [`SupervisorConfig::rebuild`]'s answer: the policy, and what of it the
@@ -692,6 +731,7 @@ impl Default for SupervisorConfig {
             limit_reset: false,
             usage_tap: false,
             usage_notes: false,
+            usage_credits: false,
             logins: true,
             hosts: Vec::new(),
             model_fallback: Some("opus".to_string()),
@@ -704,7 +744,6 @@ impl Default for SupervisorConfig {
             upgrade_ask: false,
             human_grace_s: 120,
             withheld: Withheld::default(),
-            session_questions: true,
         }
     }
 }
@@ -774,6 +813,7 @@ impl SupervisorConfig {
             "limit_reset" => switch!(limit_reset),
             "usage_tap" => switch!(usage_tap),
             "usage_notes" => switch!(usage_notes),
+            "usage_credits" => switch!(usage_credits),
             "compact_on_context_wall" => switch!(compact_on_context_wall),
             "relaunch" => switch!(relaunch),
             "upgrade" => switch!(upgrade),
@@ -977,7 +1017,8 @@ impl SupervisorConfig {
     /// (`accounts = "off"`), no limit reset is taken (`limit_reset = false`,
     /// its default), no line carries the usage tap (`usage_tap = false`, its
     /// default), no record of the one account's usage is kept (`usage_notes =
-    /// false`, its default), an agent's own switch (`codex.enabled`) is that
+    /// false`, its default), no session is carried onto usage credits
+    /// (`usage_credits = false`, its default), an agent's own switch (`codex.enabled`) is that
     /// agent off. A text and `question_priority` (HOW a question is answered)
     /// keep their defaults: neither carries power.
     pub fn limit(&mut self, key: &str) {
@@ -1004,6 +1045,8 @@ impl SupervisorConfig {
             "usage_tap" => self.usage_tap = false,
             // An opt-in too: no record and no line.
             "usage_notes" => self.usage_notes = false,
+            // An opt-in too: the subscription, no session onto credits.
+            "usage_credits" => self.usage_credits = false,
             "model_fallback" => self.model_fallback = None,
             "compact_on_context_wall" => self.compact_on_context_wall = false,
             "relaunch" => self.relaunch = false,
@@ -1311,7 +1354,6 @@ impl SupervisorConfig {
                 .iter()
                 .all(|r| before.trust_roots.contains(r))
             && no_more(self.answer_questions, before.answer_questions)
-            && no_more(self.session_questions, before.session_questions)
             && self.question_priority == before.question_priority
             && self.land_at == before.land_at
             && self.answer_text == before.answer_text
@@ -1330,6 +1372,7 @@ impl SupervisorConfig {
             && no_more(self.limit_reset, before.limit_reset)
             && no_more(self.usage_tap, before.usage_tap)
             && no_more(self.usage_notes, before.usage_notes)
+            && no_more(self.usage_credits, before.usage_credits)
             && no_more(self.logins, before.logins)
             && self.hosts.iter().all(|h| before.hosts.contains(h))
             && (self.model_fallback.is_none() || self.model_fallback == before.model_fallback)
@@ -1351,7 +1394,7 @@ impl SupervisorConfig {
     /// Settings ▸ Harness lists it, each value against the full-power
     /// default's, as the effective `[harness]` table.
     #[must_use]
-    pub fn texts(&self) -> [(&'static str, String); 35] {
+    pub fn texts(&self) -> [(&'static str, String); 36] {
         let Self {
             enabled,
             // No key in [`KEYS`]: the agents' own tables ([`Self::agent_texts`];
@@ -1380,6 +1423,7 @@ impl SupervisorConfig {
             limit_reset,
             usage_tap,
             usage_notes,
+            usage_credits,
             logins,
             hosts,
             model_fallback,
@@ -1394,8 +1438,6 @@ impl SupervisorConfig {
             // No key of its own: a retired key's ([`Self::withheld_texts`];
             // `against_default` names it).
             withheld: _,
-            // No key: a session's own word, and a flag's limit on it.
-            session_questions: _,
         } = self;
         let path = |p: &Option<PathBuf>| p.as_ref().map(|p| p.display().to_string());
         [
@@ -1422,6 +1464,7 @@ impl SupervisorConfig {
             ("limit_reset", limit_reset.to_string()),
             ("usage_tap", usage_tap.to_string()),
             ("usage_notes", usage_notes.to_string()),
+            ("usage_credits", usage_credits.to_string()),
             ("logins", if *logins { "renew" } else { "off" }.to_string()),
             ("hosts", hosts.join(",")),
             ("model_fallback", model_fallback.clone().unwrap_or_default()),
@@ -1480,9 +1523,7 @@ impl SupervisorConfig {
     }
 
     /// THE POLICY AS TEXT, WHOLE: [`Self::texts`], [`Self::agent_texts`] and
-    /// [`Self::withheld_texts`], and the one field no text shows
-    /// ([`Self::session_questions`]: a session's word and a flag's limit on
-    /// it, no key). What a tape's header writes of the policy a loop ran
+    /// [`Self::withheld_texts`]. What a tape's header writes of the policy a loop ran
     /// under, so a replay — on this build or a later one — rebuilds it through
     /// the same [`Self::set`] the owner's file goes through
     /// ([`Self::rebuild`]), never through a second encoding of the fields
@@ -1501,7 +1542,6 @@ impl SupervisorConfig {
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),
-            session_questions: self.session_questions,
         }
     }
 
@@ -1538,7 +1578,6 @@ impl SupervisorConfig {
             keys,
             agents,
             withheld,
-            session_questions,
         } = texts;
         let mut cfg = Self::default();
         let wanted: Vec<String> = cfg.texts().iter().map(|(k, _)| k.to_string()).collect();
@@ -1587,7 +1626,6 @@ impl SupervisorConfig {
                 None => return Err(format!("harness.{key}: no withheld rule this build has")),
             }
         }
-        cfg.session_questions = *session_questions;
         Ok(Rebuilt {
             policy: cfg,
             supplied,
@@ -2251,8 +2289,9 @@ mod tests {
             // (`question_priority`): no power to take; nor `stall_term`, whose
             // default (the warning) is already its least, nor `limit_reset`,
             // whose default (no reset taken) is, nor `usage_tap` (no tap), nor
-            // `usage_notes` (no record), nor `hosts`, whose default (no
-            // machine) is, nor `land_at`, which only offers a time.
+            // `usage_notes` (no record), nor `usage_credits` (the
+            // subscription), nor `hosts`, whose default (no machine) is, nor
+            // `land_at`, which only offers a time.
             let text_key = matches!(
                 *key,
                 "trust_roots"
@@ -2265,6 +2304,7 @@ mod tests {
                     | "limit_reset"
                     | "usage_tap"
                     | "usage_notes"
+                    | "usage_credits"
                     | "hosts"
             );
             assert_eq!(c == full, text_key, "{key}: only a text has no limit");
@@ -3002,6 +3042,130 @@ mod tests {
         );
     }
 
+    /// `[harness] usage_credits` (owner, 2026-10-19: *"for continuing on
+    /// credits, that's an optional additional feature that's off by default.
+    /// use subscriptions."*): the key SHIPS `false` and only the root
+    /// table's own `true` turns it on: no other key, no limit, no misplaced
+    /// table and no repeat does. Its `true` is more power, so it is the
+    /// owner's own choice against the default, never a limit; an off however
+    /// spelled, and a value that is no switch, leave it off. NEGATIVE
+    /// CONTROLS: the root table's `true` IS read (so every `false` above it
+    /// is a reading, not a dead key), and a policy that has it on is limited
+    /// by its `false`.
+    #[test]
+    fn usage_credits_ships_off_and_only_the_root_table_turns_it_on() {
+        let full = SupervisorConfig::default();
+        assert!(!full.usage_credits, "the default is off");
+        assert!(!read("").usage_credits && !read("[harness]\n").usage_credits);
+        assert_eq!(
+            SupervisorConfig::default_shown("usage_credits").as_deref(),
+            Some("false")
+        );
+        // No other key turns it on, written as an on, as its own default or
+        // as its limit.
+        for key in KEYS.iter().filter(|k| **k != "usage_credits") {
+            let mut c = full.clone();
+            let _ = c.set(key, "true");
+            assert!(!c.usage_credits, "{key} = true");
+            c.limit(key);
+            assert!(!c.usage_credits, "{key} at its limit");
+        }
+        for key in RETIRED_KEYS {
+            for value in ["true", "false"] {
+                let c = read(&format!("[harness]\n{key} = {value}\n"));
+                assert!(!c.usage_credits, "{key} = {value}");
+            }
+        }
+        // The root table's `true`, in every spelling of an on: that field
+        // and no other.
+        let on = SupervisorConfig {
+            usage_credits: true,
+            ..full.clone()
+        };
+        for text in ["true", "\"true\"", "\"yes\"", "\"On\"", "1"] {
+            let (c, notes) =
+                SupervisorConfig::from_aterm_toml(&format!("[harness]\nusage_credits = {text}\n"));
+            assert_eq!(c, on, "{text}");
+            assert!(notes.is_empty(), "{text}: {notes:?}");
+        }
+        // An off, and a value that is no switch: off, the second one said.
+        for (text, said) in [
+            ("false", 0),
+            ("\"no\"", 0),
+            ("0", 0),
+            ("\"never\"", 1),
+            ("\"sometimes\"", 1),
+            ("3", 1),
+            ("[true]", 1),
+        ] {
+            let (c, notes) =
+                SupervisorConfig::from_aterm_toml(&format!("[harness]\nusage_credits = {text}\n"));
+            assert_eq!(c, full, "{text}");
+            assert_eq!(notes.len(), said, "{text}: {notes:?}");
+        }
+        // Its `true` is more power: a limit takes it away and never gives it.
+        assert!(!on.limits(&full), "on is no limit of off");
+        assert!(full.limits(&on), "off limits on");
+        let mut c = on.clone();
+        c.limit("usage_credits");
+        assert_eq!(c, full, "its limit is off");
+        assert_eq!(
+            on.against_default(),
+            Written {
+                limits: Vec::new(),
+                own: vec!["usage_credits"],
+            }
+        );
+        assert!(on.texts().contains(&("usage_credits", "true".to_string())));
+        let mut c = full.clone();
+        c.set("usage_credits", "true").expect("a switch");
+        assert_eq!(c, on);
+        // Misplaced, it never grants; it still limits.
+        let (c, notes) =
+            SupervisorConfig::from_aterm_toml("[theme]\nharness.usage_credits = true\n");
+        assert_eq!(c, full);
+        assert!(
+            notes[0].contains("`theme.harness.usage_credits`"),
+            "{notes:?}"
+        );
+        assert!(
+            !read("[harness]\nusage_credits = true\n[theme]\nharness.usage_credits = false\n")
+                .usage_credits,
+            "a misplaced off limits all the same"
+        );
+        assert!(
+            !read("[a]\nharness.usage_credits = true\n[harness]\nusage_credits = false\n")
+                .usage_credits,
+            "a table that sorts before `harness` grants nothing either"
+        );
+        // A file that is not TOML: the root section's first word is taken, a
+        // repeat may only limit, and another header's grants nothing.
+        const TYPO: &str = "font_px = \n";
+        for (tail, want) in [
+            ("[harness]\nusage_credits = true\n", true),
+            ("harness = { usage_credits = true }\n", true),
+            (
+                "[harness]\nusage_credits = false\nusage_credits = true\n",
+                false,
+            ),
+            (
+                "[harness]\nusage_credits = true\nusage_credits = false\n",
+                false,
+            ),
+            ("[theme]\nharness.usage_credits = true\n", false),
+            ("[[keybind]]\nharness.usage_credits = true\n", false),
+            ("[harness]\nnote = \"usage_credits = true\"\n", false),
+            ("# harness.usage_credits = true\n", false),
+        ] {
+            let text = format!("{TYPO}{tail}");
+            assert!(
+                aterm_toml::from_str::<aterm_toml::Value>(&text).is_err(),
+                "the fixture must be one the parser refuses: {text:?}"
+            );
+            assert_eq!(read(&text).usage_credits, want, "{text:?}");
+        }
+    }
+
     /// THE AGENTS' OWN SWITCHES, as the effective table lists them: one per
     /// supervisable program, in `Program::ALL`'s order, each `true` at the
     /// default, and each text set back onto a default reproduces the policy.
@@ -3077,8 +3241,8 @@ mod tests {
     /// supplied — the default, and the default with any ONE thing moved: each
     /// key to a value of its own that is not the default's
     /// ([`SupervisorConfig::moved_off_default`]), each agent switched off,
-    /// each rule a retired key withholds (alone: `approve` left above the cap
-    /// that key would also set), and a session's own word turned off.
+    /// and each rule a retired key withholds (alone: `approve` left above the
+    /// cap that key would also set).
     #[test]
     fn rebuild_gives_back_the_policy_its_texts_wrote() {
         let full = SupervisorConfig::default();
@@ -3098,10 +3262,6 @@ mod tests {
             assert_eq!(c.approve, Approve::All, "withheld alone, approve uncapped");
             policies.push(c);
         }
-        policies.push(SupervisorConfig {
-            session_questions: false,
-            ..full.clone()
-        });
         for want in &policies {
             let texts = want.policy_texts();
             assert_eq!(
@@ -3489,29 +3649,18 @@ trust_dialog = false
         );
     }
 
-    /// A session's `questions` word keeps its say unless a loop's own flag
-    /// takes it: an `answer_questions` value the reader cannot take is no
-    /// setting, so the switch keeps its default and the sessions their word
-    /// (owner, 2026-09-25).
-    /// Negative control: the switch spelled right, on or off, or absent, or
-    /// an unknown key, leaves the session's word its say too.
+    /// An `answer_questions` value the reader cannot take is no setting: the
+    /// switch keeps its default (owner, 2026-09-25). Negative control: the
+    /// switch spelled right, off, turns it off.
     #[test]
     fn a_misread_question_switch_changes_nothing() {
         for text in [
             "[harness]\nanswer_questions = \"sometimes\"\n",
             "[harness]\nanswer_questions = 2.5\n",
         ] {
-            let c = read(text);
-            assert!(c.answer_questions && c.session_questions, "{text}");
+            assert!(read(text).answer_questions, "{text}");
         }
-        for text in [
-            "[harness]\nanswer_questions = true\n",
-            "[harness]\nanswer_questions = false\n",
-            "[harness]\nanswer_question = true\n",
-            "",
-        ] {
-            assert!(read(text).session_questions, "{text:?}");
-        }
+        assert!(!read("[harness]\nanswer_questions = false\n").answer_questions);
     }
 
     #[test]
@@ -3638,7 +3787,7 @@ trust_dialog = false
             ));
             assert!(notes.is_empty(), "{value:?}: {notes:?}");
             assert_eq!(c.question_priority, want, "{value:?}");
-            assert!(c.answer_questions && c.session_questions, "{value:?}");
+            assert!(c.answer_questions, "{value:?}");
             let w = c.against_default();
             assert!(w.limits.is_empty(), "{value:?}: HOW is no limit: {w:?}");
             assert_eq!(
@@ -3761,8 +3910,7 @@ trust_dialog = false
 
     /// The priority never turns answering on: `answer_questions = false` with
     /// `question_priority = long-term` answers no question, whichever key the
-    /// file sets first, the priority kept as written and the session's word
-    /// its say. Negative control: with the switch on, the priority rides the
+    /// file sets first, the priority kept as written. Negative control: with the switch on, the priority rides the
     /// hosted options as written.
     #[test]
     fn answer_questions_false_wins_over_any_priority_in_either_order() {
@@ -3775,10 +3923,6 @@ trust_dialog = false
             assert!(notes.is_empty(), "{notes:?}");
             assert!(!c.answer_questions, "{text:?}");
             assert_eq!(c.question_priority, QuestionPriority::LongTerm);
-            assert!(
-                c.session_questions,
-                "a switch written right keeps the session's say"
-            );
             let o = SuperviseOpts::hosted_with(&c);
             assert!(!o.policy.answer_questions, "{text:?}");
         }

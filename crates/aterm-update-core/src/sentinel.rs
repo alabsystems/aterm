@@ -337,23 +337,29 @@ mod tests {
             pid: 7,
             started: (1, 2),
         };
+        // Each write flushes its file, then its directory entry. The entry's flush is
+        // unix's: Windows opens no directory to flush (`File::open` on one is refused,
+        // and aterm-durable's own directory flushes are unix-only), so the best-effort
+        // `sync_dir` records nothing there and a write names its file's flush alone.
+        let per_write = if cfg!(unix) { 2 } else { 1 };
+        let writes = |flush: Flush, n: usize| vec![flush; n * per_write];
         let recording = Recording::start();
         s.arm(9).unwrap();
         assert_eq!(
             recording.take(),
-            [D, D],
+            writes(D, 1),
             "a durable arm: the file, the entry"
         );
         s.arm_with(9, O).unwrap();
-        assert_eq!(recording.take(), [O, O], "an ordered arm");
+        assert_eq!(recording.take(), writes(O, 1), "an ordered arm");
         assert_eq!(s.observe_launch_by(9, Some(me)).unwrap(), 1);
-        assert_eq!(recording.take(), [D, D], "a launch count");
+        assert_eq!(recording.take(), writes(D, 1), "a launch count");
         assert_eq!(s.forgive_launch_of(9, 7, Some((1, 2))).unwrap(), Some(0));
-        assert_eq!(recording.take(), [O, O], "a named give-back");
+        assert_eq!(recording.take(), writes(O, 1), "a named give-back");
         let counter = Sentinel::ordered(dir.join("foreign-trial"));
         counter.arm(9).unwrap();
         assert_eq!(counter.observe_launch(9).unwrap(), 1);
-        assert_eq!(recording.take(), [O, O, O, O], "an ordered counter");
+        assert_eq!(recording.take(), writes(O, 2), "an ordered counter");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

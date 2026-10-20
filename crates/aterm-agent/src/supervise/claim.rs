@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The supervisor claim (`meta set supervisor <holder> [ttl=<ms>]`): a loop
-//! that acts alone (`watch`, the in-GUI host) says so on the session, so
+//! that acts alone (the in-GUI host's) says so on the session, so
 //! `status supervisor=` names who answers its prompts, the server stops
 //! raising the agent's own boxes to the menu bar while the claim is live, and
 //! a second supervisor on the same session learns it is second.
@@ -51,8 +51,8 @@ pub const CLAIM_RENEW: Duration = Duration::from_secs(20);
 /// Where the loop stands on the session's supervisor claim.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum Claim {
-    /// Not taken: a loop that does not act alone (`supervise`), or before
-    /// the start.
+    /// Not taken: a loop that does not act alone (the engine tests'
+    /// stop-at-review `supervise`), or before the start.
     #[default]
     Off,
     /// Asked for and not answered (the request was not served): the loop
@@ -149,7 +149,9 @@ pub(super) fn is_input(args: &[&str]) -> bool {
 }
 
 /// The verbs a watching-only loop may not send: everything that types into
-/// the worker, and every attention write.
+/// the worker, every attention write, and the task record's mark (the
+/// supervisor that holds the session publishes its `done`). A pending claim
+/// holds back input only ([`is_input`]): its badges and its marks still go.
 pub(crate) fn is_write(args: &[&str]) -> bool {
     let words: Vec<&str> = args
         .iter()
@@ -160,6 +162,7 @@ pub(crate) fn is_write(args: &[&str]) -> bool {
         words.as_slice(),
         ["key" | "send" | "turn" | "paste" | "feed-bin" | "post", ..]
             | ["meta", "set" | "unset", "attention", ..]
+            | ["task", "mark", ..]
     )
 }
 
@@ -435,6 +438,7 @@ mod tests {
             &["meta", "set", "attention", "owner=supervisor", "x"],
             &["meta", "unset", "attention", "owner=supervisor"],
             &["post", "to=@s-2", "kind=ask", "x"],
+            &["task", "mark", "done", "why=marker"],
         ] {
             assert!(is_write(w), "{w:?}");
         }
@@ -442,6 +446,7 @@ mod tests {
             &["@s-1", "text", "--json"][..],
             &["status"],
             &["meta"],
+            &["task"],
             &["await", "gone", "x", "timeout", "20000"],
             &["meta", "set", "supervisor", "x", "ttl=90000"],
         ] {
@@ -458,5 +463,6 @@ mod tests {
             "x"
         ]));
         assert!(!is_input(&["post", "to=@s-2", "kind=ask", "x"]));
+        assert!(!is_input(&["task", "mark", "done", "why=marker"]));
     }
 }

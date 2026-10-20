@@ -47,6 +47,13 @@
 //!
 //! `bridge`'s module header states the full argument;
 //! `crates/aterm/tests/fabric_world/bridge_e2e.rs`'s `no_bus_record_ever_reaches_a_pty` drives it.
+//!
+//! Inert off unix: the bridge's lanes are inherited `AF_UNIX` descriptors, its
+//! dials are Unix sockets, its secrets are owner-only modes, and astream serves
+//! a Unix endpoint only there (`Broker::serve`). crates/aterm links it only on
+//! unix (answering `aterm link` elsewhere with a refusal), so a Windows
+//! workspace build compiles nothing here.
+#![cfg(unix)]
 #![cfg_attr(
     test,
     allow(
@@ -92,9 +99,6 @@ pub mod enable;
 pub mod fabric;
 pub mod fabric_brief;
 pub mod glance;
-/// `aterm fabric mint-for|join` — a SECOND HOST joins the fleet over the
-/// sealed transport; see [`join::join`].
-pub mod join;
 pub mod mailbox;
 pub mod mirror;
 pub mod notify;
@@ -125,4 +129,23 @@ pub mod wait_tally;
 #[must_use]
 pub fn now_ms() -> u64 {
     aterm_time::unix_millis().unwrap_or(0)
+}
+
+/// A unit test's broker, at astream's Relaxed tier: an ack once the batch is in the
+/// page cache. A test's broker runs in a scratch dir on the boot volume in a boot
+/// the kernel names, where every event a test can make — a dropped or crashed
+/// broker reopened, a clean stop — keeps the log's identity and every acked record
+/// under Relaxed exactly as under Strict ([`durability`]'s module doc), so the
+/// bridge sees the same log; what it does not pay is a `F_FULLFSYNC` (about 4 ms,
+/// serialised across the drive) per batch. A test of what a tier promises opens
+/// its broker through [`durability::open`] at the tier it names.
+///
+/// # Errors
+///
+/// [`astream_broker::Broker::open_with`]'s.
+#[cfg(test)]
+pub(crate) fn test_broker(
+    log: impl AsRef<std::path::Path>,
+) -> std::io::Result<astream_broker::Broker> {
+    astream_broker::Broker::open_with(log, astream_broker::Durability::Relaxed)
 }

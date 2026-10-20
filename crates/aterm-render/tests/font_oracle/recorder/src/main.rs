@@ -7,19 +7,33 @@
 //!   replay <aterm-render dir>        re-answer every `shape` and `read` line of
 //!                                    the committed corpora with the registry
 //!                                    crates (no aterm facades) and diff
-//!   hint <aterm-render dir> <out>    record skrifa's grid-fitted masks
+//!   hint <aterm-render dir> <out>    record skrifa's grid-fitted masks,
+//!                                    keeping the lines of faces this host
+//!                                    lacks
+//!   shape <aterm-render dir> <out>   record rustybuzz's `shape` lines for
+//!                                    the colour faces this host has (the
+//!                                    `EMOJI` faces), keeping every other line
 //!   gvar-alloc <aterm-render dir> <out>
 //!                                    record ttf-parser's `read` answers for
 //!                                    `GVAR_ALLOC_FACES`
 //!   differential <aterm-render dir> [runs]
 //!                                    shape seeded random runs with rustybuzz
 //!                                    and aterm-font and compare (TF.6)
-//!   hint-differential <aterm-render dir>
+//!   hint-differential <aterm-render dir> [font dir...]
 //!                                    hint every face this host has with
 //!                                    skrifa and aterm-font and compare (TF.4)
+//!   budgets <aterm-render dir> [font dir...]
+//!                                    every glyph's outline steps and paint
+//!                                    tables against aterm-font's work
+//!                                    budgets, each glyph held to ttf-parser
+//!                                    (TF.5)
 
 // Paths are relative to this file: tests/font_oracle/probe.rs, reader.rs,
 // shaper.rs and aterm-render's src/raster.rs.
+/// Reads aterm-font's per-thread spend, which a release build of aterm-font
+/// does not count, so `budgets` exists only in a debug build.
+#[cfg(debug_assertions)]
+mod budgets;
 mod differential;
 mod hint;
 mod hint_diff;
@@ -46,7 +60,7 @@ mod reader;
 #[path = "../../shaper.rs"]
 mod shaper;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use probe::{FACES, Fnv, GVAR_ALLOC_FACES, Line, Origin};
@@ -191,6 +205,70 @@ fn hint_lines(dir: &str) -> Vec<Line> {
     out
 }
 
+/// rustybuzz's answers for the colour faces this host has (`EMOJI`): each
+/// of [`probe::EMOJI_CASES`] shaped as `Renderer::shape_cluster` shapes it,
+/// with no features and no coordinates.
+fn emoji_lines(dir: &str) -> (BTreeSet<String>, Vec<Line>) {
+    let mut keys = BTreeSet::new();
+    let mut out = Vec::new();
+    for l in load(dir) {
+        if l.face.roles & probe::EMOJI == 0 {
+            continue;
+        }
+        keys.insert(l.key.clone());
+        for &index in l.face.indices {
+            for &(case, text) in probe::EMOJI_CASES {
+                out.push(Line {
+                    kind: "shape".to_string(),
+                    label: l.face.label.to_string(),
+                    key: l.key.clone(),
+                    index,
+                    inst: "-".to_string(),
+                    feats: "-".to_string(),
+                    case: case.to_string(),
+                    input: probe::escape(text),
+                    answer: probe::shape(&l.bytes, index, &[], &[], text),
+                });
+            }
+        }
+    }
+    (keys, out)
+}
+
+/// The corpus at `path` with `fresh` merged in, sorted by id: every line of
+/// a face file not in `rerecorded` is kept, so a record on one host never
+/// drops another host's lines. The file's own leading comments stay unless
+/// `header` replaces them.
+fn merged(
+    path: &str,
+    header: Option<&str>,
+    rerecorded: &BTreeSet<String>,
+    fresh: Vec<Line>,
+) -> String {
+    let old = std::fs::read_to_string(path).unwrap_or_default();
+    let mut lines = fresh;
+    let mut comments = String::new();
+    for t in old.lines() {
+        if t.starts_with('#') {
+            let _ = writeln!(comments, "{t}");
+            continue;
+        }
+        if t.is_empty() {
+            continue;
+        }
+        let line = Line::parse(t).expect("a corpus line");
+        if !rerecorded.contains(&line.key) {
+            lines.push(line);
+        }
+    }
+    lines.sort_by_key(Line::id);
+    let mut text = header.map_or(comments, str::to_string);
+    for l in &lines {
+        let _ = writeln!(text, "{}", l.render());
+    }
+    text
+}
+
 fn line(
     l: &Loaded,
     index: u32,
@@ -316,14 +394,23 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("replay") => replay(&args[2]),
         Some("hint") => {
-            let mut lines = hint_lines(&args[2]);
-            lines.sort_by_key(Line::id);
-            let mut text = HINT_HEADER.to_string();
-            for l in &lines {
-                let _ = writeln!(text, "{}", l.render());
-            }
+            let lines = hint_lines(&args[2]);
+            let keys: BTreeSet<String> = load(&args[2])
+                .into_iter()
+                .filter(|l| l.face.roles & probe::HINT != 0)
+                .map(|l| l.key)
+                .collect();
+            let n = lines.len();
+            let text = merged(&args[3], Some(HINT_HEADER), &keys, lines);
             std::fs::write(&args[3], text).expect("write hinting corpus");
-            println!("hint: {} lines", lines.len());
+            println!("hint: {n} lines recorded for {} faces", keys.len());
+        }
+        Some("shape") => {
+            let (keys, lines) = emoji_lines(&args[2]);
+            let n = lines.len();
+            let text = merged(&args[3], None, &keys, lines);
+            std::fs::write(&args[3], text).expect("write shaping corpus");
+            println!("shape: {n} lines recorded for {} colour faces", keys.len());
         }
         Some("gvar-alloc") => {
             let mut lines = gvar_alloc_lines(&args[2]);
@@ -335,13 +422,22 @@ fn main() {
             std::fs::write(&args[3], text).expect("write gvar-alloc reader corpus");
             println!("gvar-alloc: {} lines", lines.len());
         }
-        Some("hint-differential") => hint_diff::run(&args[2]),
+        Some("hint-differential") => hint_diff::run(&args[2], &args[3..]),
+        #[cfg(debug_assertions)]
+        Some("budgets") => budgets::run(&args[2], &args[3..]),
+        #[cfg(not(debug_assertions))]
+        Some("budgets") => {
+            eprintln!(
+                "budgets: aterm-font counts its work only with debug assertions on; run it without --release"
+            );
+            std::process::exit(2);
+        }
         Some("differential") => {
             let runs = args.get(3).and_then(|n| n.parse().ok()).unwrap_or(2000);
             differential::run(&args[2], runs);
         }
         _ => eprintln!(
-            "usage: replay <dir> | hint <dir> <out> | gvar-alloc <dir> <out> | differential <dir> [runs] | hint-differential <dir>"
+            "usage: replay <dir> | hint <dir> <out> | shape <dir> <out> | gvar-alloc <dir> <out> | differential <dir> [runs] | hint-differential <dir> [font dir...] | budgets <dir> [font dir...]"
         ),
     }
 }

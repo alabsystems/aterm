@@ -138,11 +138,24 @@ fn variable_primary_is_grid_fitted_at_12px() {
             "{path} @{px}px: grid fitting must raise whole-ink texels \
              (off {s_off} -> full {s_full})"
         );
-        assert!(
-            f_full < f_off,
-            "{path} @{px}px: grid fitting must cut mid-grey fringe \
-             (off {f_off} -> full {f_full})"
-        );
+        // The smooth target snaps a stem's edges and keeps its width, so a
+        // stem whose width has a fraction keeps one fringe column: Cascadia
+        // Mono 2102.025's `l` at 16px is ~1.7px, 203|219 raw and 255|183
+        // fitted, 20 fringe texels either way (measured 2026-10-17). At the
+        // desktop 12px the fringe must fall; at no size may it grow.
+        if px == 12.0 {
+            assert!(
+                f_full < f_off,
+                "{path} @{px}px: grid fitting must cut mid-grey fringe \
+                 (off {f_off} -> full {f_full})"
+            );
+        } else {
+            assert!(
+                f_full <= f_off,
+                "{path} @{px}px: grid fitting must not add mid-grey fringe \
+                 (off {f_off} -> full {f_full})"
+            );
+        }
         // Ink is REDISTRIBUTED, not invented: a "crisper" raster that simply
         // painted more would be a weight change wearing crispness' clothes.
         let ratio = m_full as f64 / m_off.max(1) as f64;

@@ -45,8 +45,8 @@ use crate::headless_boot::{self, Instance};
 use crate::live_ctl::Ctl;
 use crate::standin;
 
-/// This lane's stand-in entry (see `support/standin.rs`).
-const ENTRY: &str = "foreground_handback_live_headless::standin";
+/// The real test that dispatches this lane's child jobs before its parent body.
+const ENTRY: &str = "foreground_handback_live_headless::zsh_hands_a_killed_holders_modes_back_once";
 
 const ZSH: &[&str] = &["/bin/zsh", "-f", "-i"];
 const BASH: &[&str] = &["/bin/bash", "--norc", "--noprofile", "-i"];
@@ -260,10 +260,8 @@ fn holder() -> ! {
     kill_self()
 }
 
-/// The stand-in entry: plays the [`Job`] named in [`standin::ENV`].
-#[test]
-#[ignore = "the jobs this lane types into its shells: the lane runs it as a program"]
-fn standin() {
+/// Play the [`Job`] named in [`standin::ENV`], or return to the parent test.
+fn play_standin_if_asked() {
     let Some(spec) = standin::spec() else { return };
     match Job::parse(&spec) {
         Some(job) => job.play(),
@@ -486,6 +484,7 @@ fn held_fifo(path: &Path) -> std::fs::File {
 /// keeps 1007. The gate re-arms after it: a one-shot's mouse is the next handback.
 #[test]
 fn zsh_hands_a_killed_holders_modes_back_once() {
+    play_standin_if_asked();
     let mut sh = Shell::boot("zi", ZSH);
     sh.start(Job::Incident);
     sh.ctl.expect_on_screen("zsh:.killed");

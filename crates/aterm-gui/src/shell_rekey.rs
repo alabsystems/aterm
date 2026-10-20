@@ -146,9 +146,14 @@ pub(crate) fn deliver(path: &Path, key_hex: &str) -> std::io::Result<()> {
 }
 
 /// Remove session `sid`'s re-key file, if a key is still waiting there (the
-/// session closed before its shell reached a prompt). Best effort.
+/// session closed before its shell reached a prompt), and the one file a
+/// bash writes beside it, `<sid>.trap` (its fork-free read of the DEBUG trap
+/// its rc set, `aterm_shell_integration::DEBUG_TRAP_SUFFIX`). Best effort.
 pub(crate) fn discard(sid: &SessionId) {
     if let Some(path) = path_for(sid) {
+        let mut trap = path.clone().into_os_string();
+        trap.push(aterm_core::shell_integration::DEBUG_TRAP_SUFFIX);
+        let _ = std::fs::remove_file(trap);
         let _ = std::fs::remove_file(path);
     }
 }
@@ -298,7 +303,7 @@ impl Deferred {
     /// Whether [`Self::release`] has run: the incoming handoff COMMITTED, and
     /// its adopted shells are this process's. A test's view: a session's drop
     /// asks [`Self::withdraw`], which answers the same under one lock.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn released(&self) -> bool {
         self.held
             .lock()

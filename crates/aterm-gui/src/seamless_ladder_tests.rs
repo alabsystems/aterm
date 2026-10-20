@@ -184,6 +184,19 @@ fn assert_wire_admits(at: &str, checkpoint: &TerminalCheckpoint) {
     );
 }
 
+/// [`assert_wire_admits`] of each `(at, checkpoint)`, on four threads.
+fn assert_wire_admits_all(carried: &[(String, TerminalCheckpoint)]) {
+    std::thread::scope(|scope| {
+        for part in carried.chunks(carried.len().div_ceil(4).max(1)) {
+            scope.spawn(move || {
+                for (at, checkpoint) in part {
+                    assert_wire_admits(at, checkpoint);
+                }
+            });
+        }
+    });
+}
+
 /// `n` one-cell OSC 8 links, each with a URL of exactly `url_len` bytes (at
 /// most the engine's 8 KiB `MAX_HYPERLINK_URL_BYTES`, past which it drops the
 /// link): past a small pane's line-record cap once `n * url_len` passes
@@ -282,14 +295,21 @@ pub(super) fn assert_only_over_cap_links_dropped(
 /// The bound on Repaint is therefore ZERO: the walk is deterministic, so any
 /// blank carry at all is a new cause, and names its step. RED before P2-4: no
 /// state reaches StrippedLinks, and 588 are carried blank.
+///
+/// Each state's admission ([`assert_wire_admits`], five sixths of the walk's
+/// time) is checked a batch at a time on four threads
+/// ([`assert_wire_admits_all`]); the walk and every other check keep step
+/// order.
 #[test]
 fn every_reachable_engine_state_is_admitted_by_the_wire() {
+    const BATCH: usize = 64;
     let mut next = xorshift(0x9E37_79B9_7F4A_7C15);
     let mut t = Terminal::new(24, 80);
     let mut rungs = [0_u32; 5];
     let mut stripped_lines = 0_usize;
     let mut first_repaint = None;
     let mut mid_sequence = 0_u32;
+    let mut carried = Vec::with_capacity(BATCH);
     for step in 0..3000_u32 {
         hostile_walk_step(&mut t, &mut next);
         let (checkpoint, rung, cause) = carry_for_wire(
@@ -336,9 +356,14 @@ fn every_reachable_engine_state_is_admitted_by_the_wire() {
             assert!(lines > 0, "{at}: the rung names a line that lost its links");
             stripped_lines += lines;
         }
-        assert_wire_admits(&at, &checkpoint);
         rungs[rung as usize] += 1;
+        carried.push((at, checkpoint));
+        if carried.len() == BATCH {
+            assert_wire_admits_all(&carried);
+            carried.clear();
+        }
     }
+    assert_wire_admits_all(&carried);
     eprintln!(
         "hostile walk: rungs [full, visible-only, stripped-links, sanitized, repaint] = \
          {rungs:?}; {stripped_lines} line(s) lost their links; {mid_sequence} mid-sequence"

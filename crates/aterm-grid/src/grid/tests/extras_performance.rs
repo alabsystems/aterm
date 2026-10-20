@@ -132,40 +132,32 @@ fn assert_shift_ops_o_e(
     );
 }
 
-/// Verify shift_region_up_by is O(E), independent of region size.
+/// The region shifts are O(E), independent of the region size, and the column
+/// shifts O(E), independent of the shift count.
 #[test]
-fn shift_region_up_by_is_o_e_not_o_region() {
-    assert_shift_ops_o_e("10x larger region (O(E))", 10, 100, |entries, region| {
+fn extras_shifts_are_o_e_not_o_region_or_count() {
+    assert_shift_ops_o_e("up_by: 10x larger region", 10, 100, |entries, region| {
         measure_shift(entries, 200, 0, |e| {
             e.shift_region_up_by(0, region.saturating_sub(1), 1)
         })
     });
-}
-
-/// Verify shift_region_down_by is O(E), independent of region size.
-#[test]
-fn shift_region_down_by_is_o_e_not_o_region() {
-    assert_shift_ops_o_e("10x larger region (O(E))", 10, 100, |entries, region| {
+    assert_shift_ops_o_e("down_by: 10x larger region", 10, 100, |entries, region| {
         measure_shift(entries, 200, 0, |e| {
             e.shift_region_down_by(0, region.saturating_sub(1), 1)
         })
     });
-}
-
-/// Verify shift_cols_right is O(E), independent of shift count.
-#[test]
-fn shift_cols_right_is_o_e_not_o_count() {
-    assert_shift_ops_o_e("50x larger shift count", 1, 50, |entries, count| {
-        measure_shift(entries, 50, 10, |e| e.shift_cols_right(0, 5, count, 200))
-    });
-}
-
-/// Verify shift_cols_left is O(E), independent of shift count.
-#[test]
-fn shift_cols_left_is_o_e_not_o_count() {
-    assert_shift_ops_o_e("30x larger shift count", 1, 30, |entries, count| {
-        measure_shift(entries, 50, 50, |e| e.shift_cols_left(0, 10, count, 200))
-    });
+    assert_shift_ops_o_e(
+        "cols_right: 50x larger shift count",
+        1,
+        50,
+        |entries, count| measure_shift(entries, 50, 10, |e| e.shift_cols_right(0, 5, count, 200)),
+    );
+    assert_shift_ops_o_e(
+        "cols_left: 30x larger shift count",
+        1,
+        30,
+        |entries, count| measure_shift(entries, 50, 50, |e| e.shift_cols_left(0, 10, count, 200)),
+    );
 }
 
 // Rapid scroll allocation stress test

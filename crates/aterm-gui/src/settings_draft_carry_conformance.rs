@@ -387,11 +387,15 @@ impl Rig {
     }
 }
 
+/// Type `text` as the font row's name: its text entry (what "Other…"
+/// opens; a closed font row is a list, which typing only searches), then the
+/// name in place of what it held.
 fn type_into_field(app: &mut App, view: crate::tab_model::ViewId, text: &str) {
     for event in [
-        AppEvent::FocusChanged(Some(crate::native_ui::UiKey::new(format!(
-            "settings/control/{FIELD}"
-        )))),
+        AppEvent::Action(crate::native_app::ActionInvocation {
+            id: crate::native_ui::ActionId::new(format!("settings/set/{FIELD}")),
+            value: None,
+        }),
         AppEvent::TextInput(TextInputEvent::SelectAll),
         AppEvent::TextInput(TextInputEvent::Commit(text.to_string())),
     ] {
@@ -480,12 +484,6 @@ fn tab_only_layout(manifest: &RestoreManifest, restore_tag: &str) -> crate::rest
 /// text, still unsaved — its tab dirty, its close held for review — and says
 /// nothing was lost.
 #[test]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "NativeUpdateSettingsDraftCarry",
-    action = "Type",
-    reason = "The person's keystroke: every Settings text reducer edits the draft, and each \
-              schedule here drives the real view's focus, select-all and commit to make one."
-)]
 fn a_settings_draft_rides_the_update_and_reopens_unsaved() {
     let mut rig = Rig::new();
     rig.type_draft("type", "Carried Mono");
@@ -530,13 +528,6 @@ fn a_settings_draft_rides_the_update_and_reopens_unsaved() {
 /// the successor reopened the older draft — and the next attempt carries the
 /// newer one.
 #[test]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "NativeUpdateSettingsDraftCarry",
-    action = "Rollback",
-    reason = "The handoff's own step: a refused Commit rolls the overlap back and the outgoing \
-              process keeps its view untouched; nothing of the Settings carry is undone, so the \
-              step is the rig forgetting the killed successor and its layout."
-)]
 fn typing_into_settings_during_the_overlap_holds_the_commit() {
     let mut rig = Rig::new();
     rig.type_draft("type", "First Mono");
@@ -560,12 +551,6 @@ fn typing_into_settings_during_the_overlap_holds_the_commit() {
 /// both refuse a token that carries a draft, in the person-facing shape, and
 /// a desk with no draft takes either.
 #[test]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "NativeUpdateSettingsDraftCarry",
-    action = "StandDown",
-    reason = "The handoff's own step: a lane the gate refused starts nothing, so standing down \
-              is dropping the token; the outgoing view is untouched."
-)]
 fn the_cold_lane_and_an_older_successor_refuse_a_carried_draft() {
     let mut rig = Rig::new();
     rig.type_draft("type", "Cold Mono");

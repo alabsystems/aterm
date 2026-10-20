@@ -401,7 +401,7 @@ pub struct GlowConfig {
     pub theme_bg: u32,
     /// Whether this style draws its own additive comet beam (the anti-aliased
     /// streak along the swept path). False for `water` (its fluid wake) and
-    /// `rainbow kitty` (its ribbon is the streak). The default `comet` layers
+    /// `rainbow kitty` (its ribbon is the streak). The `comet` style layers
     /// this beam under its faint cell-body ember bed, which makes the streak
     /// continuous rather than grid-quantized. Derive it with [`style_has_beam`],
     /// not from `style` alone (`lumen` and unknown strings parse to
@@ -459,11 +459,131 @@ pub struct GlowConfig {
     pub classic_mono: bool,
 }
 
+/// `Glow size`'s shipped default, in cells: the size every crown is authored
+/// at, from which `cursor_trail_radius` scales it.
+pub const GLOW_RADIUS_DEFAULT: f32 = 0.6;
+
+/// One tuning knob of the cursor family that a style may or may not read:
+/// the `cursor_trail_*` keys the Settings Adjust card lists per style.
+/// (Every style reads its duration and brightness.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TrailKnob {
+    /// `cursor_trail_length`: how many cells one move's trail may span.
+    Length,
+    /// `cursor_trail_radius` (Glow size): the size of the crown at the caret.
+    Radius,
+    /// `cursor_trail_ring`: the landing ring on a jump.
+    Ring,
+    /// `cursor_trail_color`.
+    Color,
+    /// `cursor_trail_accent`.
+    Accent,
+    /// `cursor_fire_shimmer`: the GPU heat shimmer, which distorts the fire
+    /// field only Fire emits.
+    FireShimmer,
+}
+
+/// The facts besides the style that decide whether a knob reaches the
+/// frame: the ground, the live cursor shape, whether the landing ring is on,
+/// and the classic wake's colour face.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct KnobContext {
+    /// The ground is dark. On a light one Lumen and Sparkle draw no beam
+    /// (their glow and their stars are their look there), so nothing reads
+    /// their path's length or their tracer's accent.
+    pub dark: bool,
+    /// The cursor is a bar: the light rod is its body in every style, and it
+    /// wears an explicit trail colour.
+    pub bar: bool,
+    /// `cursor_trail_ring` is on.
+    pub ring: bool,
+    /// The classic wake draws its one-colour face (a trail colour is set, or
+    /// the old `classic mono` spelling is saved).
+    pub classic_tinted: bool,
+}
+
+impl KnobContext {
+    /// The context in which a knob shows at its widest for a style: the ring
+    /// on and the classic face tinted. Settings lists a style's rows from it,
+    /// so a row stays put while another knob toggles whether it shows.
+    #[must_use]
+    pub const fn widest(bar: bool) -> Self {
+        Self {
+            dark: true,
+            bar,
+            ring: true,
+            classic_tinted: true,
+        }
+    }
+}
+
+impl GlowStyle {
+    /// THE KNOB LAW: whether a trail drawn in this style reads `knob` in
+    /// `ctx`. One law for the engine and Settings: the engine applies it
+    /// (`cursor_fx::resolve_glow_config` folds a knob the style does not read
+    /// to the value that leaves its frame unchanged, the light rod wears the
+    /// trail colour only where it says, and the spawn bounds a path by
+    /// `Length` only where it says) and Settings lists and words a style's
+    /// rows from it, so the two cannot disagree. Pinned by
+    /// `the_knob_law_is_what_the_frame_reads`, which changes each knob and
+    /// diffs the frames.
+    ///
+    /// * `Length`: not the rainbow kitty's ribbon (its own walk), nor Laser,
+    ///   Beam and Water, whose streaks span the whole move; Lumen's tracer
+    ///   and Sparkle's ribbon only where they are drawn, on a dark ground.
+    /// * `Radius`, `Ring`: not the rainbow kitty (the ribbon owns its head)
+    ///   or Beam (the tube is its whole look).
+    /// * `Color`: every style's light rod on a bar cursor; on a block, not
+    ///   the styles that colour from their own ramps (the rainbow kitty,
+    ///   Fire, Water, Phaser's sweep).
+    /// * `Accent`: the landing ring of the styles whose ring wears it
+    ///   (Lumen, Comet, Sparkle, Phaser, Classic) while the ring is on, plus
+    ///   the tails that fade from it (Lumen's tracer and Comet's dust and
+    ///   coma fringe on a dark ground, the tinted classic tracer on either).
+    /// * `FireShimmer`: Fire alone.
+    #[must_use]
+    pub fn reads_knob(self, knob: TrailKnob, ctx: KnobContext) -> bool {
+        use GlowStyle::{
+            Beam, Classic, Comet, Fire, Laser, Lumen, Phaser, RainbowKitty, Sparkle, Water,
+        };
+        match knob {
+            TrailKnob::Length => match self {
+                Lumen | Sparkle => ctx.dark,
+                RainbowKitty | Laser | Beam | Water => false,
+                Phaser | Fire | Comet | Classic => true,
+            },
+            TrailKnob::Radius | TrailKnob::Ring => !matches!(self, RainbowKitty | Beam),
+            TrailKnob::Color => ctx.bar || !matches!(self, RainbowKitty | Fire | Water | Phaser),
+            TrailKnob::Accent => match self {
+                Lumen | Comet => ctx.dark || ctx.ring,
+                Classic => ctx.ring || ctx.classic_tinted,
+                Sparkle | Phaser => ctx.ring,
+                RainbowKitty | Fire | Laser | Beam | Water => false,
+            },
+            TrailKnob::FireShimmer => self == Fire,
+        }
+    }
+
+    /// Whether the style draws the trail colour on a block cursor: the auto
+    /// accent then brightens it, and an explicit colour is pinned against the
+    /// live cursor's. A style that does not keeps both on the cursor colour.
+    #[must_use]
+    pub fn draws_trail_color(self) -> bool {
+        self.reads_knob(
+            TrailKnob::Color,
+            KnobContext {
+                dark: true,
+                ..KnobContext::default()
+            },
+        )
+    }
+}
+
 /// Whether a raw `cursor_trail_style` string draws its own additive comet beam.
 ///
 /// False for exactly two style families: `water` (its dedicated curved wake)
 /// and `rainbow kitty` (its continuous ribbon is the streak). Every other style,
-/// including the default `comet`, shows the anti-aliased pixel-space beam: the
+/// `comet` among them, shows the anti-aliased pixel-space beam: the
 /// comet's [`crate::cursor_trail::CursorTrail`] cell body is grid-quantized, so
 /// it layers over the beam (the beam supplies continuity, the cells supply
 /// body; see `READABLE_ALPHA_CAP` in `cursor_trail.rs`).

@@ -54,6 +54,35 @@ pub const WAIT_DEFAULT_MS: u64 = 30_000;
 /// The longest any wait verb waits: 600 s, whatever `<ms>` asked.
 pub const WAIT_MAX_MS: u64 = 600_000;
 
+/// Clamp a wait duration in milliseconds to `[0, WAIT_MAX_MS]`.
+#[must_use]
+pub const fn clamp_wait_ms(ms: u64) -> u64 {
+    if ms > WAIT_MAX_MS { WAIT_MAX_MS } else { ms }
+}
+
+/// Resolve an optional `<ms>` wait parameter to [`WAIT_DEFAULT_MS`] when `None`
+/// or `clamp_wait_ms(ms)` when `Some(ms)`.
+#[must_use]
+pub const fn resolve_wait_timeout_ms(requested: Option<u64>) -> u64 {
+    match requested {
+        Some(ms) => clamp_wait_ms(ms),
+        None => WAIT_DEFAULT_MS,
+    }
+}
+
+/// Return `true` iff `ms <= WAIT_MAX_MS`.
+#[must_use]
+pub const fn wait_within_bounds(ms: u64) -> bool {
+    ms <= WAIT_MAX_MS
+}
+
+/// Bound one park slice of a waiting verb by `poll_ms` (flooring `poll_ms` at `1`).
+#[must_use]
+pub const fn hangup_slice_ms(remaining_ms: u64, poll_ms: u64) -> u64 {
+    let p = if poll_ms == 0 { 1 } else { poll_ms };
+    if remaining_ms < p { remaining_ms } else { p }
+}
+
 /// A wait verb's `<ms>`: a whole number of milliseconds, held at
 /// [`WAIT_MAX_MS`]. `None` for anything else (`2s`, `1.5`, `-1`, empty), which
 /// the verb answers with its usage line: read leniently, `wait 2s` waited the
@@ -61,7 +90,7 @@ pub const WAIT_MAX_MS: u64 = 600_000;
 /// refused it. One reading, so the family cannot disagree again.
 #[must_use]
 pub fn wait_ms(token: &str) -> Option<u64> {
-    token.parse::<u64>().ok().map(|ms| ms.min(WAIT_MAX_MS))
+    token.parse::<u64>().ok().map(clamp_wait_ms)
 }
 
 /// The one JSON string escape under the names every `*_json` emitter, the
@@ -110,5 +139,18 @@ mod tests {
         assert_eq!(value.as_object().expect("object").len(), 1);
         assert_eq!(value[key].as_str(), Some(raw));
         assert!(!reply.contains(['\n', '\u{202e}']));
+    }
+
+    #[test]
+    fn wait_and_hangup_const_helpers_invariants() {
+        assert_eq!(clamp_wait_ms(1_000), 1_000);
+        assert_eq!(clamp_wait_ms(u64::MAX), WAIT_MAX_MS);
+        assert_eq!(resolve_wait_timeout_ms(None), WAIT_DEFAULT_MS);
+        assert_eq!(resolve_wait_timeout_ms(Some(900_000)), WAIT_MAX_MS);
+        assert!(wait_within_bounds(WAIT_MAX_MS));
+        assert!(!wait_within_bounds(WAIT_MAX_MS + 1));
+        assert_eq!(hangup_slice_ms(50, 200), 50);
+        assert_eq!(hangup_slice_ms(500, 200), 200);
+        assert_eq!(hangup_slice_ms(500, 0), 1);
     }
 }

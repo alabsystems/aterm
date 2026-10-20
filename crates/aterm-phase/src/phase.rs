@@ -579,6 +579,46 @@ pub fn background_only(rows: &[String]) -> bool {
         && !turn_just_begun(rows)
 }
 
+/// HOW MANY BACKGROUND SHELLS Claude Code's screen counts: the `N shell(s)
+/// still running` item of the status row over the composer (`✻ Cooked for 9m
+/// 27s · done 11:07 AM · 1 shell still running`), or a footer row's `N
+/// shell(s)` pill item (`⏵⏵ auto mode on · 2 shells · ← for agents`) — the
+/// largest count either names, the items [`still_running`] and
+/// [`footer_count`] read. `Some(0)` for a composer frame that counts none,
+/// `None` without one (no Claude Code screen to read: a box covers it, or it
+/// is another program's). A count of another kind of work (`1 monitor`) is
+/// not a shell.
+#[must_use]
+pub fn shells_running(rows: &[String]) -> Option<u32> {
+    let frame = composer_frame(rows)?;
+    let status = status_block(rows, frame.top)
+        .status
+        .map(|i| rows[i].as_str());
+    let footer = &rows[frame.bottom + 1..];
+    let counted = status
+        .into_iter()
+        .chain(footer.iter().map(String::as_str))
+        .flat_map(|row| row.split("   "))
+        .flat_map(|part| part.split(" · "))
+        .flat_map(|item| item.split(", "))
+        .filter_map(shell_count)
+        .max();
+    Some(counted.unwrap_or(0))
+}
+
+/// One footer or status item's shell count: `N shell`, `N shells`, either
+/// with ` still running`, led by at most a `◇ `.
+fn shell_count(item: &str) -> Option<u32> {
+    let item = crate::text::trim(item);
+    let item = item.strip_prefix("◇ ").unwrap_or(item);
+    let item = item.strip_suffix(" still running").unwrap_or(item);
+    let (count, noun) = item.split_once(' ')?;
+    if !matches!(noun, "shell" | "shells") || !count.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    count.parse().ok()
+}
+
 /// No signal of a LIVE turn on the screen: not on the status row, not in a
 /// hint row, not in ANY footer row (a spinner, `esc to interrupt`, `Still
 /// working`, `ctrl+b to run in background`, the vendor's retry row). Without
@@ -629,6 +669,56 @@ pub fn background_wait(rows: &[String]) -> Option<&'static str> {
     }
     let busy = busy_signal(rows)?;
     BACKGROUND_RULES.contains(&busy.rule).then_some(busy.rule)
+}
+
+/// The [`BACKGROUND_RULES`] of a SHELL or a MONITOR the turn left running.
+const LEFT_RUNNING_RULES: &[&str] = &[
+    "a shell still running",
+    "a shell running",
+    "a monitor still running",
+    "a monitor running",
+];
+
+/// THE TURN IS OVER, AND WHAT RUNS ON IS A SHELL OR A MONITOR IT LEFT: the
+/// status row over the composer is a DONE row ([`turn_over`]: `✻ Worked for
+/// 9m 2s · done 3:15 PM · 1 shell still running`) and what keeps the screen
+/// busy ([`background_wait`]) is a shell or a monitor. Never a turn still
+/// waiting on work it started (`✻ Waiting for 1 background agent to
+/// finish`, `✻ Waiting for 1 dynamic workflow to finish`): that turn goes on
+/// by itself when the work ends, and its last words are not its end. The
+/// worker's own end of its task read here stands over what it left running
+/// (the supervisor's done over background work).
+#[must_use]
+pub fn turn_over_background(rows: &[String]) -> bool {
+    turn_over(rows) && background_wait(rows).is_some_and(|rule| LEFT_RUNNING_RULES.contains(&rule))
+}
+
+/// WHO OPENED THE TURN DRAWN LAST, read up from the composer's top rule: the
+/// newest row that opens a turn is a person's message (`❯` in column 0, then
+/// whitespace; a message queued under the status row included) —
+/// `Some(false)` — or one of Claude Code's OWN WAKES, after which it goes on
+/// by itself with no message of anyone's (`wait_bg6.out`, `wait_bg12.out`):
+/// a background command's end (`⏺ Background command "…" completed (exit
+/// code 0)`, `… failed with exit code 144`) or a monitor's event (`⏺ Monitor
+/// event: …`) — `Some(true)`. `None`: neither is on the screen, or there is
+/// no frame to read up from.
+#[must_use]
+pub fn opened_by_own_wake(rows: &[String]) -> Option<bool> {
+    let top = composer_frame(rows)?.top;
+    rows[..top].iter().rev().find_map(|row| {
+        if row
+            .strip_prefix('❯')
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+        {
+            return Some(false);
+        }
+        let text = row
+            .strip_prefix('⏺')
+            .or_else(|| row.strip_prefix('●'))?
+            .trim_start();
+        (text.starts_with("Background command \"") || text.starts_with("Monitor event:"))
+            .then_some(true)
+    })
 }
 
 /// Which busy signal `row` carries, if any (named for the CLI's diagnostics).
@@ -978,6 +1068,32 @@ impl FrameReach {
             frame: frame_at(rows, caret),
             from: if walked { 0 } else { caret.saturating_sub(1) },
         }
+    }
+
+    /// [`Self::of`], falling back to agy's or Muse Code's composer rules
+    /// ([`crate::agy::composer_rules`], [`crate::muse::composer_rules`]) when
+    /// Claude Code's composer is not on `rows`.
+    #[must_use]
+    pub fn of_or_agy(rows: &[String]) -> Self {
+        let reach = Self::of(rows);
+        if reach.frame.is_some() {
+            return reach;
+        }
+        if let Some((top, bottom)) = crate::agy::composer_rules(rows) {
+            return Self {
+                frame: Some(Frame { top, bottom }),
+                from: top,
+            };
+        }
+        if let Some((top, bottom)) = crate::muse::composer_rules(rows) {
+            // Muse's open-frame test also reads the previous nonblank row
+            // above its top rule for a drawer's key hints.
+            return Self {
+                frame: Some(Frame { top, bottom }),
+                from: 0,
+            };
+        }
+        reach
     }
 
     /// The frame's rules, `(top, bottom)` — [`composer_rules`] of the rows
@@ -1710,32 +1826,211 @@ fn is_list_entry(rows: &[String], i: usize) -> bool {
         .is_some_and(|top| top + 1 < bottom && rows[top + 1].starts_with('❯'))
 }
 
-/// THE ENTRY ENTER WOULD RUN of the completion menu Claude Code opens under the
-/// composer's bottom rule (the `/` menu), as its first word (`/clear`): the entry the
-/// Select's pointer marks (2.1.291 and later: `  ❯ /compact   Free up context …`), or,
-/// where no entry carries it (2.1.287 drew the entries alone, all indented), the first,
-/// opening `/` or `@`. While the menu is open the vendor's Enter runs the selected
-/// suggestion, the top match unless arrows moved it (2.1.300 bundle, the typeahead's
-/// Enter handler `Cr`: `SG({suggestion: Hs[selected], shouldExecute: …})`, with no
-/// screen reader's navigation on), not the draft the composer shows: a person's `/cl`
-/// left standing is `/clear`. `None` when the rows under the bottom rule are no such
-/// menu (the footer, the shortcuts, nothing): the run of indented rows right under it.
+/// One entry of Claude Code's completion menu ([`completion_menu`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuEntry {
+    /// Its row: an index into the rows read.
+    pub row: usize,
+    /// The column its first glyph is drawn at (past the pointer on the pointed row).
+    pub col: usize,
+    /// Its first word (`/clear`; `+` for a file of the `@` menu).
+    pub word: String,
+}
+
+/// THE COMPLETION MENU Claude Code opens under the composer's bottom rule, the one whose
+/// Enter runs an entry: its entries, top to bottom, and the one the Select's pointer
+/// marks (2.1.290 and later: `  ❯ /compact   Free up context …`). The menu is the run of
+/// indented rows right under the bottom rule; an entry is a row of it drawn at the first
+/// one's column, and a row further in is an entry's description wrapped onto a row of
+/// its own (`/code-review`'s, at the description column). While it is open the vendor's
+/// Enter runs the SELECTED suggestion (2.1.300 bundle, the typeahead's Enter handler
+/// `Cr`: `SG({suggestion: Hs[selected], shouldExecute: …})`, with no screen reader's
+/// navigation on), not the draft the composer shows: a person's `/cl` left standing is
+/// `/clear`. [`CompletionMenu::runs`] says which entries that can be.
+///
+/// THE `@` MENU of files (`+`) and agents (`*`) opens with NO entry selected, and Enter
+/// then sends the draft as shown; an entry a person's arrow selected is completed
+/// instead (`read @no` became `read @novel.txt`, `and @RE` became `and @"Explore
+/// (agent)"`), and nothing is sent (MEASURED on 2.1.302 and 2.1.268). A build that
+/// draws the pointer leaves its room before every entry ([`POINTER_ROOM`]: the entries
+/// at column 4, the pointer at 2), so an unpointed `@` menu there has none selected and
+/// is `None`: Enter sends. A build with no pointer (2.1.289 and before; its entries at
+/// column 2) draws the selection in colour only, so its `@` menu is returned
+/// ([`CompletionMenu::mentions`]) and read by its cells ([`CompletionMenu::runs`]).
+///
+/// `None` as well when the rows under the bottom rule are no such run (the footer, the
+/// shortcuts, nothing).
 #[must_use]
-pub fn completion_entry(rows: &[String]) -> Option<String> {
+pub fn completion_menu(rows: &[String]) -> Option<CompletionMenu> {
     let frame = composer_frame(rows)?;
-    let run: Vec<&str> = rows[frame.bottom + 1..]
+    let mut entries = Vec::new();
+    let mut pointed = None;
+    let mut at = None;
+    for (row, r) in rows.iter().enumerate().skip(frame.bottom + 1) {
+        let lead = leading_spaces(r);
+        if lead == 0 || crate::text::trim(r).is_empty() {
+            break;
+        }
+        let t = crate::text::trim_start(r);
+        let (col, text, marked) = match t.strip_prefix('❯') {
+            Some(rest) => {
+                let text = crate::text::trim_start(rest);
+                (
+                    lead + 1 + rest.chars().count() - text.chars().count(),
+                    text,
+                    true,
+                )
+            }
+            None => (lead, t, false),
+        };
+        if *at.get_or_insert(col) != col {
+            continue;
+        }
+        let Some(word) = text.split_whitespace().next() else {
+            continue;
+        };
+        if marked {
+            pointed = Some(entries.len());
+        }
+        entries.push(MenuEntry {
+            row,
+            col,
+            word: word.to_string(),
+        });
+    }
+    // Unpointed, the slash menu (its first entry opens `/`, or `@` as an older `@` menu's
+    // did) has its top entry selected as it opens (MEASURED on 2.1.268: Enter ran it).
+    let first = entries.first();
+    let mentions = first.is_some_and(|e: &MenuEntry| e.word.starts_with(['+', '*']));
+    let menu = pointed.is_some()
+        || first.is_some_and(|e| e.word.starts_with(['/', '@']))
+        || first.is_some_and(|e| mentions && e.col < POINTER_ROOM);
+    menu.then_some(CompletionMenu {
+        entries,
+        pointed,
+        mentions,
+    })
+}
+
+/// The column a build that draws the completion menu's pointer starts every entry at:
+/// `  ❯ ` before the pointed one, four spaces before the rest (2.1.290 and later). A
+/// build with no pointer starts them at column 2 (2.1.289 and before).
+pub const POINTER_ROOM: usize = 4;
+
+/// One thing Enter may do over Claude Code's completion menu ([`CompletionMenu::runs`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuEnter<'a> {
+    /// Run this slash-menu entry, by its first word (`/clear`).
+    Run(&'a str),
+    /// Complete this `@`-menu entry into the draft (`+` for a file, `*` for an agent):
+    /// nothing is sent.
+    Complete(&'a str),
+    /// Send the draft as the composer shows it: the `@` menu with no entry selected.
+    Draft,
+}
+
+/// Claude Code's completion menu as [`completion_menu`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionMenu {
+    /// The entries shown, top to bottom.
+    pub entries: Vec<MenuEntry>,
+    /// The entry the Select's pointer marks: an index into [`Self::entries`].
+    pub pointed: Option<usize>,
+    /// The `@` menu of files (`+`) and agents (`*`): Enter completes its selected entry,
+    /// and with none selected (as it opens) sends the draft ([`completion_menu`]).
+    pub mentions: bool,
+}
+
+impl CompletionMenu {
+    /// Whether the selected entry is drawn IN COLOUR ONLY, so that the rows alone do not
+    /// say which it is: more than one entry, none pointed (2.1.289 and before draw no
+    /// pointer). Claude Code draws the selected entry in its theme's suggestion colour
+    /// and the others dimmed (MEASURED on 2.1.268: the first glyph `/` in `b1b9f9`, the
+    /// others' in `999999`). The selection is not always the top one: a person's arrow
+    /// moves it, and the vendor keeps it as the draft changes (MEASURED: `/copy`, `down`,
+    /// the draft erased and `/co` typed showed its third entry selected). An `@` menu of
+    /// one entry on such a build draws its selection in colour only too, but that colour
+    /// has no other entry's to be told against ([`Self::runs`]).
+    #[must_use]
+    pub fn colour_only(&self) -> bool {
+        self.pointed.is_none() && self.entries.len() > 1
+    }
+
+    /// WHAT ENTER MAY DO: run the pointed or selected entry (the slash menu), complete it
+    /// (the `@` menu, [`Self::mentions`]), or send the draft (the `@` menu with none
+    /// selected). A menu that shows its selection in colour only ([`Self::colour_only`])
+    /// is read by `fg`, the colour of each entry's first glyph in entry order (`None` for
+    /// one not read).
+    ///
+    /// The slash menu has one entry selected: the one drawn unlike all the others, where
+    /// those others are at least two and all alike. Unread, or with no such entry — two
+    /// entries in two colours (nothing on the screen says which colour is the
+    /// selection's), all in one — any entry shown may be the one Enter runs, and every
+    /// one is returned.
+    ///
+    /// The `@` menu draws every entry alike with none selected (MEASURED on 2.1.268: each
+    /// first glyph `999999`, files and agents alike) and the selected one unlike the rest
+    /// (`b1b9f9`): entries all alike send the draft, and any unlike another means one is
+    /// selected, whichever it is, so Enter completes an entry. Unread, or one entry alone
+    /// (nothing to tell its colour against), either may be so, and both are returned.
+    #[must_use]
+    pub fn runs(&self, fg: Option<&[Option<String>]>) -> Vec<MenuEnter<'_>> {
+        let one = |k: usize| {
+            let word = self.entries[k].word.as_str();
+            if self.mentions {
+                MenuEnter::Complete(word)
+            } else {
+                MenuEnter::Run(word)
+            }
+        };
+        let every = || (0..self.entries.len()).map(one);
+        if let Some(k) = self.pointed {
+            return vec![one(k)];
+        }
+        let fg = fg.filter(|fg| self.colour_only() && fg.len() == self.entries.len());
+        if self.mentions {
+            return match fg.and_then(all_alike) {
+                Some(true) => vec![MenuEnter::Draft],
+                Some(false) => every().collect(),
+                None => std::iter::once(MenuEnter::Draft).chain(every()).collect(),
+            };
+        }
+        let selected = if self.colour_only() {
+            fg.and_then(odd_one_out)
+        } else {
+            Some(0)
+        };
+        match selected {
+            Some(k) => vec![one(k)],
+            None => every().collect(),
+        }
+    }
+}
+
+/// Whether every colour of `fg` is the same; `None` when any is unread.
+fn all_alike(fg: &[Option<String>]) -> Option<bool> {
+    let fg: Vec<String> = fg
         .iter()
-        .take_while(|r| leading_spaces(r) > 0 && !crate::text::trim(r).is_empty())
-        .map(|r| crate::text::trim_start(r))
-        .collect();
-    let pointed = run
+        .map(|c| c.as_deref().map(str::to_ascii_lowercase))
+        .collect::<Option<_>>()?;
+    Some(fg.windows(2).all(|w| w[0] == w[1]))
+}
+
+/// The one of `fg` unlike all the others, which are at least two and all alike; `None`
+/// when any is unread.
+fn odd_one_out(fg: &[Option<String>]) -> Option<usize> {
+    let fg: Vec<String> = fg
         .iter()
-        .find_map(|t| t.strip_prefix('❯').map(crate::text::trim_start));
-    let word = pointed
-        .or_else(|| run.first().copied().filter(|t| t.starts_with(['/', '@'])))?
-        .split_whitespace()
-        .next()?;
-    Some(word.to_string())
+        .map(|c| c.as_deref().map(str::to_ascii_lowercase))
+        .collect::<Option<_>>()?;
+    if fg.len() < 3 {
+        return None;
+    }
+    // The others' colour: the one the first two share, else the third's.
+    let rest = if fg[0] == fg[1] { &fg[0] } else { &fg[2] };
+    let mut odd = (0..fg.len()).filter(|&k| fg[k] != *rest);
+    let k = odd.next()?;
+    odd.next().is_none().then_some(k)
 }
 
 fn is_option_like(t: &str) -> bool {
@@ -2241,9 +2536,9 @@ fn notice_at(
         return None;
     }
     let under_call = match block_is_vendors(rows, open) {
-        Block::Output => return None,
+        Block::Output | Block::HookWords => return None,
         Block::UnderCall => true,
-        Block::Vendors => false,
+        Block::Vendors | Block::Unowned => false,
     };
     // The block's lines, each across the rows Ink wrapped it onto
     // ([`line_at`]): the notice is the first, named whole (at 26 columns
@@ -2497,6 +2792,14 @@ pub struct SaidNotice {
     /// [`Placement::ErrorRow`] for a `⏺` row, [`Placement::Gutter`] for a
     /// `⎿` block.
     pub placement: Placement,
+    /// The block stands right under a hook's error row, where the hook's own
+    /// words do ([`block_is_vendors`], rule 4): never a wall on the screen,
+    /// and whether it is the hook's words or Claude Code's notice only the
+    /// caller's words can say — a blocking reason of blank space draws no
+    /// row, and the wall stands right there (2.1.304, measured). Its text is
+    /// the screen's spelling of a notice, which is not the transcript's
+    /// (`Context limit reached · …` for `Prompt is too long`).
+    pub hook_words: bool,
 }
 
 /// THE LAST THING SAID, WHERE CLAUDE CODE DRAWS ITS OWN NOTICES, for a
@@ -2506,7 +2809,8 @@ pub struct SaidNotice {
 /// — where 2.1.300 draws every `isApiErrorMessage` row its renderer has no
 /// case of its own for (`su`), in the warning colour a row of text does not
 /// keep, so the worker's prose stands there too — or a column-2 `⎿` block
-/// that no call's FIRST output row opens ([`block_is_vendors`]). `None` for
+/// that no call's FIRST output row opens ([`block_is_vendors`]), the row
+/// right under a hook's error row included ([`SaidNotice::hook_words`]). `None` for
 /// anything else: a call's output, a command's echo, the person's `❯` row,
 /// a screen with nothing said. The table is not asked: what the screen
 /// cannot name (`There's an issue with the selected model (x). …`, drawn
@@ -2535,12 +2839,15 @@ pub fn last_said_notice(rows: &[String]) -> Option<SaidNotice> {
             text: text.to_string(),
             row: open,
             placement: Placement::ErrorRow,
+            hook_words: false,
         });
     }
     let open = gutter_open(rows, last)?;
-    if block_is_vendors(rows, open) == Block::Output {
-        return None;
-    }
+    let hook_words = match block_is_vendors(rows, open) {
+        Block::Output => return None,
+        Block::HookWords => true,
+        Block::UnderCall | Block::Vendors | Block::Unowned => false,
+    };
     let (_, line) = line_at(rows, open, rows.len(), width);
     let text = crate::text::trim(crate::text::trim(&line).trim_start_matches('⎿'));
     if text.starts_with("$ ") {
@@ -2551,6 +2858,7 @@ pub fn last_said_notice(rows: &[String]) -> Option<SaidNotice> {
         text: text.to_string(),
         row: open,
         placement: Placement::Gutter,
+        hook_words,
     })
 }
 
@@ -2567,12 +2875,21 @@ const VENDOR_GUTTER_COLUMN: usize = 2;
 enum Block {
     /// A tool's output: never a wall.
     Output,
+    /// The row right under a hook's error row (rule 4): the hook's words,
+    /// never a wall on the screen — or, where the hook drew none, Claude
+    /// Code's own notice, which only the transcript tells apart
+    /// ([`SaidNotice::hook_words`]).
+    HookWords,
     /// Read as Claude Code's own row, from a later column-2 row under a call
     /// (rule 3): [`Wall::under_call`].
     UnderCall,
     /// Read as Claude Code's own row under any other owner, or none the
-    /// walk reaches.
+    /// walk reaches before a blank row over a row that opens an item.
     Vendors,
+    /// Read as [`Block::Vendors`] is: the walk reached the first row with no
+    /// owner found, so the owner, if any, is above the rows read
+    /// ([`owner_above_rows`]).
+    Unowned,
 }
 
 /// Whether the `⎿` block opening at `open` is READ as Claude Code's own row —
@@ -2611,18 +2928,22 @@ enum Block {
 /// 4. **A hook's words under a row of Claude Code's own are output**
 ///    (ATERM-KI-1015-14, measured on 2.1.302 in the lab). Under the
 ///    STOP-HOOK SUMMARY (`⏺ Ran 1 stop hook (ctrl+o to expand)`,
-///    [`is_stop_hook_summary`]) the column-2 `⎿` rows up to its first one
-///    that opens with a label are the hooks' own: a Stop hook's `stopReason`
-///    (`{"continue": false, "stopReason": …}`: the first row, its later
-///    lines at column 2 with no `⎿`; the second row in the detailed
-///    transcript, under the hook's command). The 2.1.302 binary draws the
-///    summary's rows as the `stopReason`, only where the hooks prevented the
+///    [`is_stop_hook_summary`]) the column-2 `⎿` rows up to its first
+///    labelled row of its own ([`is_summary_label`]) are the hooks' own: in
+///    verbose output (`claude --verbose`, the detailed transcript) a row per
+///    hook, its command's path or a prompt hook's text; a Stop hook's
+///    `stopReason` (`{"continue": false, "stopReason": …}`: its later lines
+///    at column 2 with no `⎿`). The 2.1.302 and 2.1.304 binaries draw those
+///    rows, the `stopReason` only where the hooks prevented the
 ///    continuation, then a `Stop hook error: …` row per blocking error and a
 ///    `Stop hook feedback: …` row per context a hook added: a continuation,
-///    and so a wall its request meets, comes only under a labelled row,
-///    and that wall is read (measured: `⎿  Stop hook error: [./sb]: …` for
+///    and so a wall its request meets, comes only under one of those, and
+///    that wall is read (measured: `⎿  Stop hook error: [./sb]: …` for
 ///    a stderr, `⎿  Stop hook error: check the tests` for a `{"decision":
-///    "block"}`, then the wall, a blank row between or none). Under A HOOK'S
+///    "block"}`, then the wall, a blank row between or none). Any other
+///    label is the hooks' words: a prompt hook's verbose row opening
+///    `Review: …` ended the walk, and the `stopReason` under it was read as
+///    the wall (2.1.304, measured, KI-1015-14). Under A HOOK'S
 ///    ERROR ROW (`⎿  <hook> hook error`, `⎿  <hook> hook returned blocking
 ///    error`, [`is_hook_error_row`]) the next column-2 `⎿` row is the hook's
 ///    words, the error row's own sub-lines in the binary: its stderr behind
@@ -2631,11 +2952,16 @@ enum Block {
 ///    call's included; a wall comes after it. Read as walls, `aterm drive
 ///    watch` typed `/login` on a `stopReason` and parked the session until
 ///    the reset a double-spaced one named (measured).
-///    THE LIMIT: a hook's error row with no row of the hook's under it would
-///    put Claude Code's wall where the hook's words stand; 2.1.302 always
-///    draws one (measured for an empty stderr and a reasonless block), and
-///    only a blocking reason of blank space draws none (read from the
-///    binary).
+///    THE LIMIT: a hook's error row with no row of the hook's under it puts
+///    Claude Code's wall where the hook's words stand. 2.1.302 draws one for
+///    an empty stderr and a reasonless block (measured); a blocking reason
+///    of blank space draws none (2.1.304, measured: `⎿  PostToolUse:Bash
+///    hook returned blocking error`, then the real context wall), and a
+///    reason that IS the wall's words draws the same screen. That row is
+///    [`Block::HookWords`]: no wall on the screen, and the row a caller
+///    holding the session's transcript asks about ([`last_said_notice`]),
+///    which ends on the wall's notice in the one case and on the model's
+///    reply in the other.
 ///
 /// Any other owner is read as Claude Code's: the person's `❯` turn, the
 /// worker's message, a task notice, a Monitor event, a hook summary past its
@@ -2717,14 +3043,28 @@ fn block_is_vendors(rows: &[String], open: usize) -> Block {
         {
             let text = crate::text::trim(text);
             if adjacent && is_hook_error_row(text) {
-                return Block::Output;
+                return Block::HookWords;
             }
             adjacent = false;
             later = true;
-            labelled |= crate::wall::labelled(text);
+            labelled |= is_summary_label(text);
         }
     }
-    Block::Vendors
+    Block::Unowned
+}
+
+/// Whether the owner walk ([`block_is_vendors`]) from the `⎿` block row `i`
+/// stands in reaches THE FIRST OF `rows` with no owner found — no row in
+/// column 0, no blank row over a row that opens an item — so whatever owns
+/// the block, if anything does, is above the rows: a call row scrolled off
+/// the screen over its long output (2.1.304, measured: the history right
+/// above the screen holds it, `claude-2.1.304-verbose-long-output-context-wall-scrollback.txt`).
+/// A caller that can read the rows above (aterm-agent's wall confirmation,
+/// with no transcript) reads them up to the owner and reads the wall again
+/// with them. `false` for a row under no `⎿` block.
+#[must_use]
+pub fn owner_above_rows(rows: &[String], i: usize) -> bool {
+    gutter_open(rows, i).is_some_and(|open| block_is_vendors(rows, open) == Block::Unowned)
 }
 
 /// Whether `row` is Claude Code's STOP-HOOK SUMMARY, an owner whose first
@@ -2744,6 +3084,21 @@ fn is_stop_hook_summary(row: &str) -> bool {
         && rest[digits..]
             .strip_prefix(' ')
             .is_some_and(|r| r.starts_with(crate::anchors::anchor("hook.ran.stop")))
+}
+
+/// Whether `text`, a column-2 `⎿` row's past its `⎿`, is one of the
+/// STOP-HOOK SUMMARY'S OWN LABELLED ROWS, the first of which ends the hooks'
+/// words under it ([`block_is_vendors`], rule 4): `<event> hook error: …`
+/// per blocking error (the event one word, `Stop` when the hook names none:
+/// the anchor `hook.error.label`) and `Stop hook feedback: …` per context a
+/// hook added (`hook.feedback`) — the 2.1.304 bundle's two, after the
+/// verbose rows and the `stopReason`. Any other label is a hook's own words:
+/// a prompt hook's text opening `Review: …` on its verbose row (measured on
+/// 2.1.304), or the bundle's own `prompt: …` form of that row.
+fn is_summary_label(text: &str) -> bool {
+    text.split_once(crate::anchors::anchor("hook.error.label"))
+        .is_some_and(|(name, _)| !name.is_empty() && !name.contains(char::is_whitespace))
+        || text.starts_with(crate::anchors::anchor("hook.feedback"))
 }
 
 /// Whether `text`, a column-2 `⎿` row's past its `⎿`, is the row A HOOK'S
@@ -2771,10 +3126,92 @@ fn is_hook_error_row(text: &str) -> bool {
 /// `wall::auto_continue_end`, the turn's own notice behind a generic banner),
 /// pass these rows over, as the gutter's reader does: a hook's `stopReason`
 /// of `note  Usage limit reached · resets 3pm` (the double space kept,
-/// measured on 2.1.302) is no limit's notice.
+/// measured on 2.1.302) is no limit's notice. So is a row Ink wrapped a
+/// labelled `⏺` message onto ([`message_open`]): a hook's long `stopReason`
+/// behind `⏺ Operation stopped by hook: …` wraps at column 2, and its row
+/// `  Usage limit reached · resets 3pm` named a session limit
+/// (`since_limit`; 2.1.304, measured, KI-1015-14).
 pub(crate) fn programs_words(rows: &[String], i: usize) -> bool {
-    crate::wall::labelled(&rows[i])
-        || owning_gutter(rows, i).is_some_and(|open| block_is_vendors(rows, open) == Block::Output)
+    words_of(rows, i) == WordsOf::Program
+}
+
+/// WHOSE WORDS row `i` holds, as [`programs_words`] reads them, with the
+/// case it cannot decide from `rows` kept apart ([`WordsOf::Above`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WordsOf {
+    /// A program's words ([`programs_words`]): no notice of Claude Code's.
+    Program,
+    /// Claude Code's own row, or read as its own: the walk found its owner,
+    /// or a row that opens an item, within `rows`.
+    Vendor,
+    /// Read as [`WordsOf::Vendor`] is, for want of the rows above: the walk
+    /// from row `i` up to its `⎿` row, its message's `⏺` row or the block's
+    /// owner reached THE FIRST OF `rows` undecided. A Stop hook's
+    /// `stopReason` of 35 lines drawn its summary on row 6 of 50 and its
+    /// last line, `Usage limit reached · resets 3pm`, on row 41 (2.1.304,
+    /// measured): a 40-row tail of that screen read a session limit, the
+    /// whole screen none; one of 60 lines draws its summary in the history
+    /// right above the screen. Whoever can read the rows above reads row
+    /// `i` again with them (aterm-agent's screen read).
+    Above,
+}
+
+/// [`WordsOf`] row `i` of `rows`.
+#[must_use]
+pub fn words_of(rows: &[String], i: usize) -> WordsOf {
+    if crate::wall::labelled(&rows[i]) {
+        return WordsOf::Program;
+    }
+    let mut above = false;
+    match message_open(rows, i) {
+        Walk::Found(open) if crate::wall::labelled(&rows[open]) => return WordsOf::Program,
+        Walk::Top => above = true,
+        Walk::Found(_) | Walk::None => {}
+    }
+    match owning_gutter(rows, i) {
+        Walk::Found(open) => match block_is_vendors(rows, open) {
+            Block::Output | Block::HookWords => return WordsOf::Program,
+            Block::Unowned => above = true,
+            Block::UnderCall | Block::Vendors => {}
+        },
+        Walk::Top => above = true,
+        Walk::None => {}
+    }
+    if above {
+        WordsOf::Above
+    } else {
+        WordsOf::Vendor
+    }
+}
+
+/// Where a walk up from a row ended ([`message_open`], [`owning_gutter`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    /// At the row it looks for.
+    Found(usize),
+    /// At a row that says the row walked from has none.
+    None,
+    /// At the first of the rows, still looking: the row may be above them.
+    Top,
+}
+
+/// The `⏺` or `●` row whose message row `i` is a later row of: up from `i`
+/// over the message's own rows ([`in_message`]) to that bullet row.
+/// [`Walk::None`] for a row that is no such message's later row;
+/// [`Walk::Top`] where the message's rows run up to the first of `rows`.
+fn message_open(rows: &[String], i: usize) -> Walk {
+    let mut j = i;
+    while in_message(&rows[j]) {
+        let Some(up) = j.checked_sub(1) else {
+            return Walk::Top;
+        };
+        j = up;
+    }
+    if j < i && rows[j].starts_with(['⏺', '●']) {
+        Walk::Found(j)
+    } else {
+        Walk::None
+    }
 }
 
 /// The `⎿` row that row `i` stands under: itself, or the nearest above it
@@ -2782,17 +3219,21 @@ pub(crate) fn programs_words(rows: &[String], i: usize) -> bool {
 /// an output's at column 5 and a `stopReason`'s later lines at column 2
 /// (2.1.302, measured). Wider than [`gutter_open`], which leaves a row short
 /// of the gutter's text column to the item it opens: a row this finds is
-/// judged by its `⎿` row's owner ([`programs_words`]).
-fn owning_gutter(rows: &[String], mut i: usize) -> Option<usize> {
+/// judged by its `⎿` row's owner ([`programs_words`]). [`Walk::Top`] where
+/// those rows run up to the first of `rows` with no `⎿` row among them.
+fn owning_gutter(rows: &[String], mut i: usize) -> Walk {
     loop {
         let row = rows[i].as_str();
         if crate::text::trim_start(row).starts_with('⎿') {
-            return Some(i);
+            return Walk::Found(i);
         }
         if crate::text::trim(row).is_empty() || leading_spaces(row) == 0 {
-            return None;
+            return Walk::None;
         }
-        i = i.checked_sub(1)?;
+        let Some(up) = i.checked_sub(1) else {
+            return Walk::Top;
+        };
+        i = up;
     }
 }
 
@@ -2890,12 +3331,20 @@ fn is_call_name(name: &str) -> bool {
 
 /// A notice in the footer, under the bottom rule (from row `from`) and above
 /// the first blank row (the agents panel and a workflow's line below it are
-/// the worker's words): an item — the row, a part after a wide gap or after
-/// ` · ` — that opens with a notice `classify` names, up to the next wide gap.
-/// The row is read with the rows Ink wrapped its line onto ([`line_at`]): in
-/// a pane narrower than the usage-limit banner, `⚠ Usage limit reached ·
-/// limit` stands over `resets 10:25am` (34 columns, 2.1.299), and the row
-/// alone names no reset.
+/// the worker's words): an item — the text read, a part of it after a wide
+/// gap or after ` · ` — that opens with a notice `classify` names, up to the
+/// next wide gap. Only where Claude Code draws ITS notices is read
+/// ([`footer_text`]): a banner row that opens with a status glyph, read with
+/// the rows Ink wrapped its line onto ([`line_at`]: in a pane narrower than
+/// the usage-limit banner, `⚠ Usage limit reached · limit` stands over
+/// `resets 10:25am`, 34 columns, 2.1.299, and the row alone names no
+/// reset); and the notification column, right-aligned or stacked under the
+/// mode row.
+/// The rest of the footer's left side is the `statusLine` command's text —
+/// the person's script, whatever it prints (KI-1015-14, measured on 2.1.304:
+/// a status line printing `Not logged in · Run /login` read as the vendor's
+/// login notice, and with no transcript `/login` was typed into a logged-in
+/// worker) — and the mode row's.
 fn footer_notice(
     rows: &[String],
     from: usize,
@@ -2906,7 +3355,7 @@ fn footer_notice(
     (from..until)
         .filter(|&i| !crate::text::trim_start(&rows[i]).starts_with(['◯', '⏺', '●']))
         .find_map(|i| {
-            let (_, line) = line_at(rows, i, until, width);
+            let line = footer_text(rows, from, i, until, width)?;
             let t = crate::text::trim(&line);
             let starts = std::iter::once(0)
                 .chain(t.match_indices("  ").map(|(i, s)| i + s.len()))
@@ -2926,6 +3375,59 @@ fn footer_notice(
                     }
                 })
         })
+}
+
+/// What of footer row `i` Claude Code itself drew a notice in, measured on
+/// 2.1.304 (`claude-2.1.304-footer-*`, `…-statusline-login-words-*`,
+/// `…-wall-session-auto-continue-*`) and on 2.1.299 and 2.1.300 at 26, 34,
+/// 50 and 80 columns: the footer is two columns. On the left the vendor's
+/// banner (`⚠ Usage limit reached · …`, a status glyph first, its countdown
+/// under it), then the `statusLine` command's rows, then the mode row
+/// (`⏵⏵ auto mode on …`, `⏸ manual mode on · ? for shortcuts`, [`is_mode_row`]);
+/// on the right, right-aligned (the binary's `flex-end`), the vendor's
+/// notifications (`Not logged in · Run /login`, `Automatic continue
+/// cancelled · …`, `◐ medium · /effort`), level with the left column's first
+/// row — and in a pane too narrow for both, stacked under the mode row, where
+/// one that fills its row starts at column 2 (`Not logged in · Run /…` at 26
+/// columns, `You're now using usage credits · …` at 80). Read: a banner row's
+/// line ([`line_at`]); a row under the mode row, whole; else the row's right
+/// segment ([`crate::wall::right_segment`]) where it ends against the right
+/// edge (within three columns, as every measured notification does: two
+/// short of 144, of 80) and starts at the hint column ([`HINT_COLUMN`]) or
+/// the row stands there whole ([`is_against_right_edge`]); else nothing. A
+/// status line's later field, after two spaces, is no notification short of
+/// the edge: `  opus-5.5  ~/proj  Not logged in · Run /login` read as the
+/// login notice before (the review of 87faa9bf23). A status line that itself
+/// prints a status glyph first, or whose words reach the right edge, reads
+/// as the vendor's.
+fn footer_text(
+    rows: &[String],
+    from: usize,
+    i: usize,
+    until: usize,
+    width: usize,
+) -> Option<String> {
+    let row = crate::text::trim_end(&rows[i]);
+    if crate::text::trim_start(row).starts_with(STATUS_GLYPHS) {
+        return Some(line_at(rows, i, until, width).1);
+    }
+    if (from..i).any(|m| is_mode_row(&rows[m])) {
+        return Some(crate::text::trim(row).to_string());
+    }
+    let (column, segment) = crate::wall::right_segment(row);
+    let at_edge = row.chars().count() + 3 >= width;
+    (at_edge && column >= HINT_COLUMN || is_against_right_edge(row, width))
+        .then(|| segment.to_string())
+}
+
+/// The footer's mode row, the left column's last: the permission mode
+/// (`⏵⏵ auto mode on (shift+tab to cycle)`, `⏵⏵ bypass permissions on`,
+/// `⏸ plan mode on`, `⏸ manual mode on · ? for shortcuts`) or, with none
+/// drawn, `? for shortcuts` — cut to the pane, never wrapped (measured to 10
+/// columns, 2.1.299 to 2.1.304).
+fn is_mode_row(row: &str) -> bool {
+    let t = crate::text::trim_start(row);
+    t.starts_with(['⏵', '⏸']) || t.starts_with("? for shortcuts")
 }
 
 /// One past the footer's last row: the first blank row from row `from` (the
@@ -2995,7 +3497,12 @@ const GUTTER_TEXT_COLUMN: usize = 5;
 /// transcript tells from the output) or one at a tool's column: words a tool
 /// printed, as far as the screen can say. A row under no gutter is not.
 pub(crate) fn under_a_call(rows: &[String], i: usize) -> bool {
-    gutter_open(rows, i).is_some_and(|open| block_is_vendors(rows, open) != Block::Vendors)
+    gutter_open(rows, i).is_some_and(|open| {
+        !matches!(
+            block_is_vendors(rows, open),
+            Block::Vendors | Block::Unowned
+        )
+    })
 }
 
 /// The `⎿` row that opens the gutter block row `i` belongs to: `i` itself, or
@@ -3658,29 +4165,41 @@ mod tests {
         }
     }
 
-    /// THE ENTRY ENTER WOULD RUN ([`completion_entry`]): the slash menu's pointed
+    /// What Enter may do ([`CompletionMenu::runs`]) by the rows alone: each entry's word,
+    /// `<draft>` for sending the draft.
+    fn runs_of(rows: &[String]) -> Option<Vec<String>> {
+        completion_menu(rows).map(|m| m.runs(None).into_iter().map(said).collect())
+    }
+
+    fn said(e: MenuEnter<'_>) -> String {
+        match e {
+            MenuEnter::Run(w) | MenuEnter::Complete(w) => w.to_string(),
+            MenuEnter::Draft => "<draft>".to_string(),
+        }
+    }
+
+    /// THE ENTRY ENTER WOULD RUN ([`CompletionMenu::runs`]): the slash menu's pointed
     /// entry, at the top (`/compact` under `❯ /compact`) or arrowed down (the third,
-    /// `/plugin-authoring`, under `❯ /mod`), both MEASURED on 2.1.292; and 2.1.287's
-    /// menu, no entry pointed, its first. NEGATIVE CONTROLS: the measured idle footer
-    /// under the frame, a `/cl` draft with its footer under it (the menu dismissed), the
-    /// shortcuts list, and no frame are no menu.
+    /// `/plugin-authoring`, under `❯ /mod`), both MEASURED on 2.1.292; and a menu of
+    /// two with no entry pointed (2.1.287 draws the entries alone), unread, either of
+    /// them. NEGATIVE CONTROLS: the measured idle footer under the frame, a `/cl` draft
+    /// with its footer under it (the menu dismissed), the shortcuts list, and no frame
+    /// are no menu.
     #[test]
     fn the_completion_menus_entry_is_what_enter_would_run() {
         use crate::prompt::fixtures::{
             CONTEXT_WALL_COMPACT_MENU_MEASURED, SLASH_MENU_POINTER_DOWN_MEASURED,
             SLASH_MENU_USAGE_MEASURED, screen as fx,
         };
+        let one = |w: &str| Some(vec![w.to_string()]);
         assert_eq!(
-            completion_entry(&fx(CONTEXT_WALL_COMPACT_MENU_MEASURED)).as_deref(),
-            Some("/compact")
+            runs_of(&fx(CONTEXT_WALL_COMPACT_MENU_MEASURED)),
+            one("/compact")
         );
+        assert_eq!(runs_of(&fx(SLASH_MENU_USAGE_MEASURED)), one("/usage"));
         assert_eq!(
-            completion_entry(&fx(SLASH_MENU_USAGE_MEASURED)).as_deref(),
-            Some("/usage")
-        );
-        assert_eq!(
-            completion_entry(&fx(SLASH_MENU_POINTER_DOWN_MEASURED)).as_deref(),
-            Some("/plugin-authoring")
+            runs_of(&fx(SLASH_MENU_POINTER_DOWN_MEASURED)),
+            one("/plugin-authoring")
         );
         let rule = "─".repeat(80);
         let draft = |under: &[&str]| {
@@ -3692,28 +4211,239 @@ mod tests {
             "    /clear              Clear conversation history and free up context",
             "    /color              Set the prompt bar color for this session",
         ]);
-        assert_eq!(completion_entry(&plain).as_deref(), Some("/clear"));
+        assert_eq!(
+            runs_of(&plain),
+            Some(vec!["/clear".to_string(), "/color".to_string()])
+        );
+        let lone =
+            draft(&["    /clear              Clear conversation history and free up context"]);
+        assert_eq!(runs_of(&lone), one("/clear"));
         let pointed = draft(&[
             "  ❯ /clear              Clear conversation history and free up context",
             "    /color              Set the prompt bar color for this session",
         ]);
-        assert_eq!(completion_entry(&pointed).as_deref(), Some("/clear"));
+        assert_eq!(runs_of(&pointed), one("/clear"));
+        let menu = completion_menu(&pointed).expect("the menu");
+        assert_eq!((menu.entries[0].row, menu.entries[0].col), (5, 4));
+        assert_eq!((menu.entries[1].row, menu.entries[1].col), (6, 4));
         // NEGATIVE CONTROLS.
         let idle = fx(include_str!("fixtures/claude-2.1.283-footer-auto-idle.txt"));
-        assert_eq!(completion_entry(&idle), None);
+        assert_eq!(completion_menu(&idle), None);
         assert_eq!(
-            completion_entry(&draft(&["  ⏵⏵ auto mode on (shift+tab to cycle)"])),
+            completion_menu(&draft(&["  ⏵⏵ auto mode on (shift+tab to cycle)"])),
             None
         );
         assert_eq!(
-            completion_entry(&draft(&[
+            completion_menu(&draft(&[
                 "  ! for bash mode          double tap esc to clear input",
                 "  / for commands           shift + tab to auto-accept edits",
             ])),
             None
         );
-        assert_eq!(completion_entry(&draft(&[])), None);
-        assert_eq!(completion_entry(&rows(&["❯ /cl", "    /clear"])), None);
+        assert_eq!(completion_menu(&draft(&[])), None);
+        assert_eq!(completion_menu(&rows(&["❯ /cl", "    /clear"])), None);
+    }
+
+    /// ATERM-KI-1016-1 ("with no pointer drawn, a completion menu is known only by a
+    /// first entry starting `/` or `@`"), held to what Enter did, MEASURED in the
+    /// real-Claude lab on 2026-10-17. 2.1.302: the `@` menu (files `+`, agents `*`, at
+    /// column 4) opens with no entry selected and none pointed, and Enter SENT the draft
+    /// (`@`, `and @RE`), so it is no menu Enter diverts; after `down` the pointer is drawn
+    /// (`  ❯ + notes.txt`) and Enter completed the entry, so it is read by its pointer.
+    /// 2.1.268, a build that draws no pointer: the slash menu's selected entry is drawn
+    /// in colour only, so the rows alone leave any entry the one Enter runs (Enter ran
+    /// `/clear` on `/cl`, its top entry); its `@` menu (at column 2) opens with none
+    /// selected and Enter sent the draft, but after a person's `down` its entry is
+    /// highlighted in colour only, the rows unchanged, and Enter completed it, so by the
+    /// rows alone Enter may do either (its cells decide:
+    /// [`an_at_menus_selection_drawn_in_colour_only_is_read_by_the_cells_measured`]).
+    #[test]
+    fn a_menu_with_no_pointer_is_what_enter_did_measured() {
+        use crate::prompt::fixtures::{
+            AT_MENU_2_1_302, AT_MENU_DOWN_2_1_268, AT_MENU_PARTIAL_2_1_268,
+            AT_MENU_PARTIAL_2_1_302, AT_MENU_POINTED_2_1_302, SLASH_MENU_2_1_268, screen as fx,
+        };
+        let draft_or = |words: &[&str]| {
+            Some(
+                std::iter::once("<draft>")
+                    .chain(words.iter().copied())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for (what, fixture, runs) in [
+            ("2.1.302 `@`, Enter sent it", AT_MENU_2_1_302, None),
+            (
+                "2.1.302 `and @RE`, Enter sent it",
+                AT_MENU_PARTIAL_2_1_302,
+                None,
+            ),
+            (
+                "2.1.268 `and @RE`, Enter sent it",
+                AT_MENU_PARTIAL_2_1_268,
+                draft_or(&["+", "*"]),
+            ),
+            (
+                "2.1.268 after `down`, Enter completed",
+                AT_MENU_DOWN_2_1_268,
+                draft_or(&["+", "*"]),
+            ),
+            (
+                "2.1.302 pointed, Enter completed",
+                AT_MENU_POINTED_2_1_302,
+                Some(vec!["+".to_string()]),
+            ),
+        ] {
+            let r = fx(fixture);
+            assert!(composer_frame(&r).is_some(), "{what}: the frame");
+            assert_eq!(runs_of(&r), runs, "{what}");
+        }
+        let slash = runs_of(&fx(SLASH_MENU_2_1_268)).expect("2.1.268's slash menu");
+        assert!(slash.len() > 2 && slash[0] == "/clear", "{slash:?}");
+        assert!(slash.iter().all(|w| w.starts_with('/')), "{slash:?}");
+        assert_eq!(fx(AT_MENU_DOWN_2_1_268), fx(AT_MENU_PARTIAL_2_1_268));
+    }
+
+    /// The colour of each entry's first glyph, from a cells fixture.
+    fn fg_of(menu: &CompletionMenu, cells: &str) -> Vec<Option<String>> {
+        let cells = crate::prompt::fixtures::cells(cells);
+        menu.entries
+            .iter()
+            .map(|e| {
+                cells
+                    .iter()
+                    .find(|(r, c, _)| (*r, *c) == (e.row, e.col))
+                    .and_then(|(_, _, reply)| reply.split(' ').nth(2).map(str::to_string))
+            })
+            .collect()
+    }
+
+    /// THE SELECTION DRAWN IN COLOUR ONLY (the review of ATERM-KI-1016-1's "no pointer"
+    /// item), on 2.1.268's slash menu MEASURED with the `cell` of each row's first glyph
+    /// and what Enter did. `/config` over nine entries: the text is the same whichever
+    /// is selected; as the menu opened `/config`'s `/` was `b1b9f9` and the others'
+    /// `999999`, and Enter opened the settings; after `down` `/update-config`'s was, and
+    /// Enter ran `/update-config`. The colours name that entry; a description's wrapped
+    /// row (column 32) is no entry. With two entries (`/copy`, `/fork`) the two colours
+    /// do not say which is the selection's, so either may run. NEGATIVE CONTROLS: an
+    /// unread cell, every entry in one colour, and two unlike the rest leave every entry
+    /// a candidate; a pointed menu is read by its pointer whatever the colours say.
+    #[test]
+    fn a_selection_drawn_in_colour_only_is_read_by_the_cells_measured() {
+        use crate::prompt::fixtures::{
+            SLASH_MENU_CONFIG_2_1_268, SLASH_MENU_CONFIG_CELLS_2_1_268,
+            SLASH_MENU_CONFIG_DOWN_CELLS_2_1_268, SLASH_MENU_COPY_2_1_268,
+            SLASH_MENU_COPY_CELLS_2_1_268, SLASH_MENU_COPY_DOWN_CELLS_2_1_268,
+            SLASH_MENU_POINTER_DOWN_MEASURED, screen as fx,
+        };
+        let config = completion_menu(&fx(SLASH_MENU_CONFIG_2_1_268)).expect("the menu");
+        let words: Vec<&str> = config.entries.iter().map(|e| e.word.as_str()).collect();
+        assert_eq!(
+            words,
+            [
+                "/config",
+                "/update-config",
+                "/doctor",
+                "/hooks",
+                "/sandbox",
+                "/run",
+                "/code-review"
+            ]
+        );
+        assert!(config.colour_only() && config.entries.iter().all(|e| e.col == 2));
+        let runs = |menu: &CompletionMenu, fg: Option<&[Option<String>]>| -> Vec<String> {
+            menu.runs(fg).into_iter().map(said).collect()
+        };
+        let fresh = fg_of(&config, SLASH_MENU_CONFIG_CELLS_2_1_268);
+        let down = fg_of(&config, SLASH_MENU_CONFIG_DOWN_CELLS_2_1_268);
+        assert_eq!(config.runs(Some(&fresh)), [MenuEnter::Run("/config")]);
+        assert_eq!(config.runs(Some(&down)), [MenuEnter::Run("/update-config")]);
+        assert_eq!(runs(&config, None), words);
+        let copy = completion_menu(&fx(SLASH_MENU_COPY_2_1_268)).expect("the menu");
+        for cells in [
+            SLASH_MENU_COPY_CELLS_2_1_268,
+            SLASH_MENU_COPY_DOWN_CELLS_2_1_268,
+        ] {
+            assert_eq!(runs(&copy, Some(&fg_of(&copy, cells))), ["/copy", "/fork"]);
+        }
+        // NEGATIVE CONTROLS.
+        let mut unread = fresh.clone();
+        unread[3] = None;
+        assert_eq!(runs(&config, Some(&unread)), words);
+        let alike = vec![Some("999999".to_string()); fresh.len()];
+        assert_eq!(runs(&config, Some(&alike)), words);
+        let mut two = fresh.clone();
+        two[4] = Some("d0d0d0".to_string());
+        assert_eq!(runs(&config, Some(&two)), words);
+        assert_eq!(runs(&config, Some(&fresh[1..])), words);
+        let pointed = completion_menu(&fx(SLASH_MENU_POINTER_DOWN_MEASURED)).expect("the menu");
+        let mut colours = vec![Some("999999".to_string()); pointed.entries.len()];
+        colours[0] = Some("b1b9f9".to_string());
+        assert!(!pointed.colour_only());
+        assert_eq!(
+            pointed.runs(Some(&colours)),
+            [MenuEnter::Run("/plugin-authoring")]
+        );
+    }
+
+    /// THE `@` MENU'S SELECTION DRAWN IN COLOUR ONLY (ATERM-KI-1016-1, dialogs: no
+    /// pointer), on 2.1.268 MEASURED with the `cell` of each entry's first glyph and what
+    /// Enter did. The `@` menu opens with no entry selected, every entry alike (`999999`,
+    /// files `+` and agents `*` alike), and Enter sent the draft; after `down` the entry
+    /// selected is `b1b9f9`, the rows unchanged, and Enter completed it and sent nothing
+    /// (`read @no` became `read @novel.txt`; `and @RE`, after two, `and @"Explore
+    /// (agent)"`). So entries all alike send the draft, and any unlike the rest complete an
+    /// entry. Read by its rows alone it was sent: the turn end's Submit completed the
+    /// person's entry. One entry alone has no other's colour to be told against: either.
+    /// NEGATIVE CONTROLS: an unread cell leaves either; 2.1.302's `@` menu, which leaves
+    /// the pointer's room before its entries ([`POINTER_ROOM`]), is no menu unpointed
+    /// (Enter sent it) and its pointer's when pointed, whatever the colours say.
+    #[test]
+    fn an_at_menus_selection_drawn_in_colour_only_is_read_by_the_cells_measured() {
+        use crate::prompt::fixtures::{
+            AT_MENU_DOWN_2_1_268, AT_MENU_DOWN_CELLS_2_1_268, AT_MENU_DOWN2_CELLS_2_1_268,
+            AT_MENU_NO_2_1_268, AT_MENU_NO_CELLS_2_1_268, AT_MENU_NO_DOWN_CELLS_2_1_268,
+            AT_MENU_ONE_2_1_268, AT_MENU_PARTIAL_2_1_268, AT_MENU_PARTIAL_2_1_302,
+            AT_MENU_PARTIAL_CELLS_2_1_268, AT_MENU_POINTED_2_1_302, screen as fx,
+        };
+        let draft = [MenuEnter::Draft];
+        let re = completion_menu(&fx(AT_MENU_PARTIAL_2_1_268)).expect("the menu");
+        assert!(re.mentions && re.colour_only() && re.entries.iter().all(|e| e.col == 2));
+        let completes = [MenuEnter::Complete("+"), MenuEnter::Complete("*")];
+        assert_eq!(
+            re.runs(Some(&fg_of(&re, AT_MENU_PARTIAL_CELLS_2_1_268))),
+            draft
+        );
+        let down = completion_menu(&fx(AT_MENU_DOWN_2_1_268)).expect("the menu");
+        assert_eq!(down, re, "the same rows whichever is selected");
+        for cells in [AT_MENU_DOWN_CELLS_2_1_268, AT_MENU_DOWN2_CELLS_2_1_268] {
+            assert_eq!(re.runs(Some(&fg_of(&re, cells))), completes);
+        }
+        let no = completion_menu(&fx(AT_MENU_NO_2_1_268)).expect("the menu");
+        assert_eq!(no.entries.len(), 4);
+        assert_eq!(no.runs(Some(&fg_of(&no, AT_MENU_NO_CELLS_2_1_268))), draft);
+        assert_eq!(
+            no.runs(Some(&fg_of(&no, AT_MENU_NO_DOWN_CELLS_2_1_268))),
+            [MenuEnter::Complete("+"); 4]
+        );
+        let one = completion_menu(&fx(AT_MENU_ONE_2_1_268)).expect("the menu");
+        assert!(one.mentions && !one.colour_only());
+        let either = [MenuEnter::Draft, MenuEnter::Complete("+")];
+        for fg in ["999999", "b1b9f9"] {
+            assert_eq!(one.runs(Some(&[Some(fg.to_string())])), either, "{fg}");
+        }
+        // NEGATIVE CONTROLS.
+        let mut unread = fg_of(&no, AT_MENU_NO_CELLS_2_1_268);
+        unread[2] = None;
+        assert_eq!(no.runs(Some(&unread)).len(), 5, "either");
+        assert_eq!(re.runs(None).first(), Some(&MenuEnter::Draft));
+        assert_eq!(completion_menu(&fx(AT_MENU_PARTIAL_2_1_302)), None);
+        let pointed = completion_menu(&fx(AT_MENU_POINTED_2_1_302)).expect("the menu");
+        assert!(pointed.mentions && pointed.entries[0].col == POINTER_ROOM);
+        assert_eq!(
+            pointed.runs(Some(&[Some("999999".to_string())])),
+            [MenuEnter::Complete("+")]
+        );
     }
 
     // ---- the live zone, against real screens ------------------------------
@@ -3769,6 +4499,16 @@ mod tests {
         let top = composer_frame(&r).expect("frame").top;
         for (k, row) in extra.iter().enumerate() {
             r.insert(top + k, (*row).to_string());
+        }
+        r
+    }
+
+    /// Insert `extra` directly above the status row (the done row).
+    fn above_status_row(mut r: Vec<String>, extra: &[&str]) -> Vec<String> {
+        let top = composer_frame(&r).expect("frame").top;
+        let at = status_block(&r, top).status.expect("a status row");
+        for (k, row) in extra.iter().enumerate() {
+            r.insert(at + k, (*row).to_string());
         }
         r
     }
@@ -3974,6 +4714,79 @@ mod tests {
         assert_eq!(background_wait(&bare), None);
     }
 
+    /// THE TURN OVER, A SHELL OR A MONITOR LEFT RUNNING
+    /// ([`turn_over_background`]): a done row over a shell (`wait_bg4.out`)
+    /// or over a monitor is the turn's end. NEGATIVE CONTROLS: a turn still
+    /// waiting on its workflow (`wait_bg.out`) or its background agent is
+    /// background work but not over; a live turn (`wait_bg2.out`) and an
+    /// idle screen (`wait_bg3.out`) are neither.
+    #[test]
+    fn a_turn_over_background_work_is_a_done_row_over_a_shell_or_a_monitor() {
+        let shell = waiter_capture(include_str!("fixtures/wait_bg4.out"));
+        assert!(turn_over_background(&shell));
+        let done = "✻ Crunched for 9m 27s · done 11:07 AM · 1 shell still running";
+        let at = shell.iter().position(|r| r == done).expect("the done row");
+        let mut monitor = with_footer(shell.clone(), IDLE_AUTO_FOOTER);
+        monitor[at] = "✻ Crunched for 9m 27s · done 11:07 AM · 1 monitor still running".to_string();
+        assert_eq!(background_wait(&monitor), Some("a monitor still running"));
+        assert!(turn_over_background(&monitor));
+        // NEGATIVE CONTROLS.
+        let workflow = waiter_capture(include_str!("fixtures/wait_bg.out"));
+        assert!(background_wait(&workflow).is_some());
+        assert!(!turn_over_background(&workflow));
+        let mut agent = shell.clone();
+        agent[at] = "✻ Waiting for 1 background agent to finish".to_string();
+        assert_eq!(
+            background_wait(&agent),
+            Some("waiting for a background agent")
+        );
+        assert!(!turn_over_background(&agent));
+        for (name, text) in [
+            ("wait_bg2.out", include_str!("fixtures/wait_bg2.out")),
+            ("wait_bg3.out", include_str!("fixtures/wait_bg3.out")),
+        ] {
+            assert!(!turn_over_background(&waiter_capture(text)), "{name}");
+        }
+    }
+
+    /// WHO OPENED THE TURN DRAWN LAST ([`opened_by_own_wake`]): Claude Code's
+    /// own wake — a background command's end (`wait_bg6.out`; `wait_bg12.out`,
+    /// whose composer holds a draft that is no message) or a monitor's event
+    /// — with no person's row after it. A person's message after the wake,
+    /// in the transcript or queued under the status row, opened the turn.
+    /// NEGATIVE CONTROLS: a screen with no opener on it, and one with no
+    /// frame, say nothing.
+    #[test]
+    fn the_turn_drawn_last_was_opened_by_the_agents_own_wake_or_a_person() {
+        let woke = waiter_capture(include_str!("fixtures/wait_bg6.out"));
+        assert_eq!(opened_by_own_wake(&woke), Some(true));
+        let drafted = waiter_capture(include_str!("fixtures/wait_bg12.out"));
+        assert_eq!(opened_by_own_wake(&drafted), Some(true));
+        let shell = waiter_capture(include_str!("fixtures/wait_bg4.out"));
+        let monitor = above_status_row(
+            shell.clone(),
+            &[
+                "⏺ Monitor event: \"worker watch\"",
+                "⏺ The worker is still at its prompt.",
+            ],
+        );
+        assert_eq!(opened_by_own_wake(&monitor), Some(true));
+        // A person's message after the wake: in the transcript, and queued.
+        let at = woke
+            .iter()
+            .rposition(|r| r.starts_with("⏺ Background command"))
+            .expect("the wake");
+        let mut asked = woke.clone();
+        asked.insert(at + 1, "❯ Also update the README.".to_string());
+        assert_eq!(opened_by_own_wake(&asked), Some(false));
+        let queued = above_frame(woke, &["❯ Also update the README."]);
+        assert_eq!(opened_by_own_wake(&queued), Some(false));
+        // NEGATIVE CONTROLS.
+        assert_eq!(opened_by_own_wake(&shell), None);
+        let bare = vec!["⏺ Background command \"x\" completed (exit code 0)".to_string()];
+        assert_eq!(opened_by_own_wake(&bare), None);
+    }
+
     /// A MESSAGE SUBMITTED AT A BREAK has begun a turn before its spinner is
     /// drawn: `wait_bg2.out` a frame earlier — the manager's message drawn
     /// under `✻ Waiting for 1 dynamic workflow to finish`, its spinner and tip
@@ -4002,6 +4815,29 @@ mod tests {
         typed.insert(top, "❯ keep going".to_string());
         typed.remove(0);
         assert_eq!(background_wait(&typed), None, "{:?}", &typed[top - 3..=top]);
+    }
+
+    /// THE SHELL COUNT the survey publishes (`bg=`): the done row's or the
+    /// footer's count, whichever names one, and the larger where both do.
+    /// NEGATIVE CONTROLS: a monitor is no shell, a screen with a frame that
+    /// counts none is `0`, and a screen with no frame is no reading.
+    #[test]
+    fn the_shell_count_is_the_done_rows_or_the_footers() {
+        use crate::prompt::fixtures::IDLE_SHELLS_2_1_271 as TEXT;
+        let r = crate::prompt::fixtures::screen(TEXT);
+        assert_eq!(shells_running(&r), Some(2));
+        let one = waiter_capture(include_str!("fixtures/wait_bg4.out"));
+        assert_eq!(shells_running(&one), Some(1));
+        let done = "✻ Cogitated for 3m 12s · done 9:29 PM · 2 shells still running";
+        let at = r.iter().position(|x| x == done).expect("the done row");
+        let mut more = r.clone();
+        more[at] = "✻ Cogitated for 3m 12s · done 9:29 PM · 3 shells still running".to_string();
+        assert_eq!(shells_running(&more), Some(3), "the larger count");
+        const BARE: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents";
+        let mut none = with_footer(r.clone(), BARE);
+        none[at] = "✻ Cogitated for 3m 12s · done 9:29 PM · 1 monitor still running".to_string();
+        assert_eq!(shells_running(&none), Some(0), "a monitor is no shell");
+        assert_eq!(shells_running(&["$ ls".to_string()]), None, "no frame");
     }
 
     /// CLAUDE CODE 2.1.271 AT REST OVER TWO SHELLS THAT NEVER END (the
@@ -6005,7 +6841,10 @@ mod tests {
 
     /// A notice split over two rows keeps both, and the reset its first row
     /// names; a `<X> limit reached ∙ resets …` row is a notice; so is one in
-    /// the footer, but never a warning there.
+    /// the footer where Claude Code draws its notifications — right-aligned,
+    /// or stacked under the mode row in a narrow pane — but never a warning
+    /// there, and never the same words where the `statusLine` command's rows
+    /// stand, at column 2 above the mode row (KI-1015-14, 2.1.304).
     #[test]
     fn a_split_notice_and_a_footer_notice_are_read_whole() {
         let split = screen(
@@ -6030,16 +6869,36 @@ mod tests {
             }
         );
         let body = ["⏺ Done.", "", "✻ Worked for 5s · done 10:02 PM", ""];
-        let footer = screen(
-            &body,
-            "  ⏵⏵ auto mode on · You've hit your limit · resets 3am (Europe/London)",
+        const NOTICE: &str = "You've hit your limit · resets 3am (Europe/London)";
+        const MODE: &str = "  ⏵⏵ auto mode on";
+        let limited = Phase::Limited {
+            message: NOTICE.to_string(),
+            reset: Some("3am (Europe/London)".to_string()),
+        };
+        let right = screen(&body, &crate::prompt::fixtures::right_aligned(MODE, NOTICE));
+        assert_eq!(
+            worker_phase(&right),
+            limited,
+            "right-aligned on the mode row"
+        );
+        let mut stacked = screen(&body, MODE);
+        stacked.push(format!("  {NOTICE}"));
+        assert_eq!(
+            worker_phase(&stacked),
+            limited,
+            "stacked under the mode row"
+        );
+        let mut status_line = screen(&body, &format!("  {NOTICE}"));
+        status_line.push(MODE.to_string());
+        assert_eq!(
+            worker_phase(&status_line),
+            Phase::Idle,
+            "a status line's words"
         );
         assert_eq!(
-            worker_phase(&footer),
-            Phase::Limited {
-                message: "You've hit your limit · resets 3am (Europe/London)".to_string(),
-                reset: Some("3am (Europe/London)".to_string()),
-            }
+            crate::wall::wall(&status_line),
+            None,
+            "a status line's words"
         );
         let warns = screen(
             &body,
@@ -6791,6 +7650,30 @@ mod tests {
             }
         }
         assert!(tight > 100, "CONTROL: screens with a frame: {tight}");
+
+        // A literal indented caret in a Muse draft makes the generic search
+        // find no frame; Muse still reads its column-zero composer. Its
+        // drawer eligibility also reads above the top rule.
+        let mut muse: Vec<String> = [
+            "ordinary reply",
+            "────────────────────────",
+            "❯ draft",
+            "  ❯ quoted draft",
+            "────────────────────────",
+            "  model · high · 50% · $0",
+        ]
+        .map(str::to_owned)
+        .into();
+        assert_eq!(FrameReach::of(&muse).rules(), None);
+        assert_eq!(crate::agy::composer_rules(&muse), None);
+        assert_eq!(crate::muse::composer_rules(&muse), Some((1, 4)));
+        let reached = FrameReach::of_or_agy(&muse);
+        assert_eq!(reached.rules(), Some((1, 4)));
+        assert!(reached.unmoved(&[]));
+        muse[0] = "  ↑↓ move · enter confirm · esc cancel".to_owned();
+        assert_eq!(crate::muse::composer_rules(&muse), None);
+        assert!(!reached.unmoved(&[0]));
+        assert_ne!(FrameReach::of_or_agy(&muse).rules(), reached.rules());
     }
 
     /// ATERM-KI-1015-1 S2R-F1 (the harness sweep of 2026-10-15, Claude Code

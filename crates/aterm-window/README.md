@@ -1,5 +1,7 @@
 <!-- Modified by the aterm project in 2026; see the repository NOTICE. (Dropped the FEATURES.md
-link and the Android MSRV note with the file and the backend they described.) -->
+link and the Android MSRV note with the file and the backend they described.) This copy is the
+cargo package `aterm-window`, renamed from `winit` at winit-core step 7
+(docs/AUDIT-third-party-2026-10-15.md); the text below is upstream's. -->
 
 # winit - Cross-platform window creation and management in Rust
 

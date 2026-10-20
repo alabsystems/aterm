@@ -58,18 +58,34 @@
 //!
 //! ## Caller idioms
 //!
-//! ```ignore
+//! ```no_run
+//! use std::collections::BTreeMap;
+//! use aterm_spec::{derive::Model, verify::{self, Covered, NotRun}};
+//!
 //! // SCALAR derived model — the common case. The interpreter always runs, so
-//! // coverage is unconditional and the returned [`Covered`] is a log line:
-//! aterm_spec::verify::prove_and_catch_scalar(&m, "Thing non-vacuity");
+//! // coverage is unconditional and the returned Covered is a log line.
+//! fn check_scalar(m: &Model) -> Covered {
+//!     verify::prove_and_catch_scalar(m, "Thing non-vacuity")
+//! }
 //!
 //! // FUNCTION-VALUED derived model — only `ty` can walk it, so outside a
 //! // checker run the obligation does NOT run, and the `_tiered` forms return
 //! // `Result<Covered, NotRun>` so the caller must state a policy (a registered
-//! // one is `spec-check models`'s):
-//! match aterm_spec::verify::prove_and_catch_tiered(&m, "Thing Tier-0") { /* ... */ }
+//! // one is `spec-check models`'s). Propagate NotRun; it is not coverage.
+//! fn check_function_valued(m: &Model) -> Result<Covered, NotRun> {
+//!     verify::prove_and_catch_tiered(m, "Thing Tier-0")
+//! }
 //!
-//! let (ok, why) = aterm_spec::verify::validate_transition_tiered(&m, &overrides, &prev, &next, Some("Push"), "Thing conformance");
+//! fn check_transition(
+//!     m: &Model,
+//!     overrides: &[(&'static str, i64)],
+//!     prev: &BTreeMap<&'static str, i64>,
+//!     next: &BTreeMap<&'static str, i64>,
+//! ) -> (bool, String) {
+//!     verify::validate_transition_tiered(
+//!         m, overrides, prev, next, Some("Push"), "Thing conformance",
+//!     )
+//! }
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -821,6 +837,12 @@ fn build_date(p: &Path) -> Option<String> {
 
 /// Days since 1970-01-01 → proleptic Gregorian (year, month, day), UTC.
 /// Howard Hinnant's `civil_from_days`, so the report needs no date crate.
+// Skip: the sealed prover (321aaeda7) runs out of the 120 s function budget on
+// the whole body, its constant divisions included (71 of 71 obligations
+// TIMEOUT, 2026-10-18; bounding the input changed nothing), and a permanent
+// lapse lets the lane read any drop below aterm-spec's floor as
+// NOT-VERIFIED(clock). Report date formatting; verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
 fn civil_from_unix_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);

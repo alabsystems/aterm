@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::harness::host_path::{abs, json};
 #[cfg(unix)]
 use std::io::Write as _;
 
@@ -1667,7 +1668,7 @@ fn facts_floor_at_the_kernel_else_the_registry_start() {
         });
         let text = format!(
             r#"{{"pid":4242,"sessionId":"0b5e7a11-f100","cwd":"{}"{stamp}}}"#,
-            cwd.display()
+            json(&cwd)
         );
         std::fs::write(claude.join("sessions/4242.json"), text).unwrap();
     };
@@ -1699,7 +1700,7 @@ fn facts_floor_at_the_kernel_else_the_registry_start() {
         claude.join("sessions/4242.json"),
         format!(
             r#"{{"pid":4242,"sessionId":"0b5e7a11-f100","cwd":"{}","procStart":"{}","startedAt":{}}}"#,
-            cwd.display(),
+            json(&cwd),
             lstart_utc(old_start),
             start * 1000 + 250
         ),
@@ -1772,7 +1773,7 @@ fn a_clear_keeps_the_model_the_process_chose() {
             claude.join("sessions/4242.json"),
             format!(
                 r#"{{"pid":4242,"sessionId":"{session}","cwd":"{}","procStart":"{}","startedAt":{},"version":"2.1.283"}}"#,
-                cwd.display(),
+                json(&cwd),
                 lstart_utc(start),
                 image * 1000 + 684
             ),
@@ -2809,28 +2810,30 @@ fn a_reused_pid_is_refused_by_its_start_time() {
 /// in; a relative one is under it; neither is read without that directory.
 #[test]
 fn the_claude_dir_is_the_processs_own() {
-    let runs_in = || Some(PathBuf::from("/work"));
+    let (work, cfg, ana) = (abs("/work"), abs("/cfg/claude"), abs("/Users//ana"));
+    let home = Some(ana.as_str());
+    let runs_in = || Some(PathBuf::from(&work));
     assert_eq!(
-        claude_dir_of(Some("/cfg/claude"), Some("/Users//ana"), runs_in),
-        Some(PathBuf::from("/cfg/claude"))
+        claude_dir_of(Some(&cfg), home, runs_in),
+        Some(PathBuf::from(&cfg))
     );
     assert_eq!(
-        claude_dir_of(Some(""), Some("/Users//ana"), runs_in),
-        Some(PathBuf::from("/work")),
+        claude_dir_of(Some(""), home, runs_in),
+        Some(PathBuf::from(&work)),
         "an empty override is the directory it runs in"
     );
     assert_eq!(
-        claude_dir_of(Some("rel/dir"), Some("/Users//ana"), runs_in),
-        Some(PathBuf::from("/work/rel/dir"))
+        claude_dir_of(Some("rel/dir"), home, runs_in),
+        Some(Path::new(&work).join("rel/dir"))
     );
     assert_eq!(
-        claude_dir_of(Some("rel/dir"), Some("/Users//ana"), || None),
+        claude_dir_of(Some("rel/dir"), home, || None),
         None,
         "its directory not read"
     );
     assert_eq!(
-        claude_dir_of(None, Some("/Users//ana"), || None),
-        Some(PathBuf::from("/Users//ana/.claude"))
+        claude_dir_of(None, home, || None),
+        Some(Path::new(&ana).join(".claude"))
     );
     assert_eq!(claude_dir_of(None, None, || None), None);
 }
@@ -3120,7 +3123,7 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
     let lights = Some(LightsWidth {
         chips: 13,
         title: 35,
-        lean: [0, 0],
+        lean: [0; LEAN_FORMS],
         short: 20,
         reason: false,
     });
@@ -3154,7 +3157,7 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
     // them before any fact; a form of width 0 is none and is skipped.
     // NEGATIVE CONTROL: the same steps with no leaner form go whole → short.
     let leaner = lights.map(|l| LightsWidth {
-        lean: [30, 25],
+        lean: [32, 29, 26, 23],
         ..l
     });
     let steps: Vec<(usize, TitleFit, bool)> = (0..=120)
@@ -3171,30 +3174,47 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
             acc
         });
     assert_eq!(
-        steps[..5],
+        steps[..7],
         [
             (3, TitleFit::Full, true),
             (3, TitleFit::Lean(0), true),
             (3, TitleFit::Lean(1), true),
+            (3, TitleFit::Lean(2), true),
+            (3, TitleFit::Lean(3), true),
             (3, TitleFit::Short, true),
             (3, TitleFit::None, true),
         ]
     );
-    let one = lights.map(|l| LightsWidth { lean: [0, 25], ..l });
-    let titles: Vec<TitleFit> = (0..=120)
-        .rev()
-        .map(|room| fit_rule(&facts, room, one).title)
-        .fold(Vec::new(), |mut acc, title| {
-            if acc.last() != Some(&title) {
-                acc.push(title);
-            }
-            acc
-        });
+    let titles = |lean: [usize; LEAN_FORMS]| -> Vec<TitleFit> {
+        let lights = lights.map(|l| LightsWidth { lean, ..l });
+        (0..=120)
+            .rev()
+            .map(|room| fit_rule(&facts, room, lights).title)
+            .fold(Vec::new(), |mut acc, title| {
+                if acc.last() != Some(&title) {
+                    acc.push(title);
+                }
+                acc
+            })
+    };
     assert_eq!(
-        titles,
+        titles([0, 25, 0, 0]),
         [
             TitleFit::Full,
             TitleFit::Lean(1),
+            TitleFit::Short,
+            TitleFit::None
+        ]
+    );
+    // A face whose explanation is no longer than the menu's line has no form
+    // with both clicks (`claude_lights::lean_titles`): v1's words, then the
+    // click alone.
+    assert_eq!(
+        titles([0, 25, 0, 22]),
+        [
+            TitleFit::Full,
+            TitleFit::Lean(1),
+            TitleFit::Lean(3),
             TitleFit::Short,
             TitleFit::None
         ]
@@ -3259,7 +3279,7 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
     let stop = Some(LightsWidth {
         chips: 22,
         title: 47,
-        lean: [0, 0],
+        lean: [0; LEAN_FORMS],
         short: 30,
         reason: true,
     });
@@ -3279,7 +3299,7 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
     let dot = Some(LightsWidth {
         chips: 6,
         title: 0,
-        lean: [0, 0],
+        lean: [0; LEAN_FORMS],
         short: 0,
         reason: false,
     });
@@ -3292,7 +3312,7 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
             let lights = Some(LightsWidth {
                 chips: w,
                 title: 0,
-                lean: [0, 0],
+                lean: [0; LEAN_FORMS],
                 short: 0,
                 reason: false,
             });
@@ -3511,7 +3531,7 @@ fn a_reason_and_the_upgrade_note_take_the_accounts_room() {
     let reason = Some(LightsWidth {
         chips: 13,
         title: 50,
-        lean: [0, 0],
+        lean: [0; LEAN_FORMS],
         short: 35,
         reason: true,
     });
@@ -3798,14 +3818,20 @@ fn the_mode_row_is_found_under_the_composer_and_nowhere_else() {
 #[test]
 fn the_last_cwd_is_the_newest_main_thread_rows() {
     let body = [
-        r#"{"type":"user","cwd":"/w"}"#,
-        r#"{"type":"assistant","cwd":"/w/nested"}"#,
-        r#"{"type":"assistant","cwd":"/w/agent","isSidechain":true}"#,
-        r#"{"type":"summary","summary":"no directory here"}"#,
-        r#"{"type":"user","cwd":"relative"}"#,
+        format!(r#"{{"type":"user","cwd":"{}"}}"#, abs("/w")),
+        format!(r#"{{"type":"assistant","cwd":"{}"}}"#, abs("/w/nested")),
+        format!(
+            r#"{{"type":"assistant","cwd":"{}","isSidechain":true}}"#,
+            abs("/w/agent")
+        ),
+        r#"{"type":"summary","summary":"no directory here"}"#.to_owned(),
+        r#"{"type":"user","cwd":"relative"}"#.to_owned(),
     ]
     .join("\n");
-    assert_eq!(last_cwd(body.as_bytes()), Some(PathBuf::from("/w/nested")));
+    assert_eq!(
+        last_cwd(body.as_bytes()),
+        Some(PathBuf::from(abs("/w/nested")))
+    );
     assert_eq!(last_cwd(br#"{"type":"user"}"#), None);
     assert_eq!(last_cwd(b""), None);
 }
@@ -3825,7 +3851,7 @@ fn shell_cwds_reads_the_live_sessions_launched_in_the_directory() {
             claude.join("sessions").join(format!("{pid}.json")),
             format!(
                 r#"{{"pid":{pid},"sessionId":"{id}","cwd":"{}"}}"#,
-                cwd.display()
+                json(cwd)
             ),
         )
         .expect("session file");
@@ -3835,8 +3861,8 @@ fn shell_cwds_reads_the_live_sessions_launched_in_the_directory() {
             project.join(format!("{id}.jsonl")),
             format!(
                 "{}\n{}\n",
-                format_args!(r#"{{"type":"user","cwd":"{}"}}"#, cwd.display()),
-                format_args!(r#"{{"type":"assistant","cwd":"{}"}}"#, last.display()),
+                format_args!(r#"{{"type":"user","cwd":"{}"}}"#, json(cwd)),
+                format_args!(r#"{{"type":"assistant","cwd":"{}"}}"#, json(last)),
             ),
         )
         .expect("transcript");
@@ -3855,6 +3881,147 @@ fn shell_cwds_reads_the_live_sessions_launched_in_the_directory() {
     // A Bash tool still in the launch directory adds nothing new.
     session(me, "a-live", &launch, &launch);
     assert!(shell_cwds(&claude, &launch).is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// One transcript row stamped `at`, for the survey's excerpt reads.
+#[cfg(unix)]
+fn excerpt_row(kind: &str, at: &str, message: &str) -> String {
+    format!(r#"{{"type":"{kind}","timestamp":"{at}","message":{message}}}"#)
+}
+
+/// THE SURVEY'S EXCERPTS ride the tail read: a fresh read finds the prompt,
+/// the newest words and the call in flight; appends move them (the call's
+/// result ends it, a new prompt goes first) and are read as appends, not
+/// afresh.
+#[cfg(unix)]
+#[test]
+fn the_excerpts_ride_the_tail_read_and_its_appends() {
+    let root = cache_test_dir("excerpts");
+    let path = root.join("session.jsonl");
+    let start = crate::harness::upgrade_models::parse_utc("2026-10-15T10:00:00Z").unwrap();
+    let at = "2026-10-15T10:01:00Z";
+    let append = |text: String| {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+    };
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n{}\n",
+            excerpt_row("user", at, r#"{"content":"wire the survey"}"#),
+            excerpt_row(
+                "assistant",
+                at,
+                r#"{"id":"m1","model":"claude-opus-5-5","content":[{"type":"text","text":"Running the tests."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"targo test"}}]}"#
+            ),
+        ),
+    )
+    .unwrap();
+    let mut cache = TailCache::default();
+    assert!(cache.excerpts().is_none(), "nothing read yet");
+    cache.read_since(&path, 4242, Some(start), start).unwrap();
+    let e = cache.excerpts().cloned().expect("the excerpts");
+    assert_eq!(e.prompts.len(), 1);
+    assert_eq!(e.prompts[0].text, "wire the survey");
+    assert_eq!(e.said.as_deref(), Some("Running the tests."));
+    assert_eq!(e.doing.as_deref(), Some("Bash"));
+
+    append(format!(
+        "{}\n",
+        excerpt_row(
+            "user",
+            at,
+            r#"{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}"#
+        )
+    ));
+    cache.read_since(&path, 4242, Some(start), start).unwrap();
+    assert_eq!(cache.appends, 1, "read as an append");
+    let e = cache.excerpts().cloned().expect("the excerpts");
+    assert_eq!(e.doing, None, "the result answered the call");
+    assert_eq!(e.said.as_deref(), Some("Running the tests."), "carried");
+
+    append(format!(
+        "{}\n",
+        excerpt_row("user", at, r#"{"content":"now the client"}"#)
+    ));
+    cache.read_since(&path, 4242, Some(start), start).unwrap();
+    assert_eq!(cache.appends, 2);
+    let prompts: Vec<String> = cache
+        .excerpts()
+        .expect("the excerpts")
+        .prompts
+        .iter()
+        .map(|p| p.text.clone())
+        .collect();
+    assert_eq!(prompts, ["now the client", "wire the survey"]);
+    // A failed read keeps no excerpts.
+    std::fs::remove_file(&path).unwrap();
+    assert!(cache.read_since(&path, 4242, Some(start), start).is_none());
+    assert!(cache.excerpts().is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A COLD READ STOPS AT ITS BOUND: a prompt more than [`MAX_BACK_BYTES`]
+/// above the end is not looked for, and the survey names none (`-`), while
+/// the newest words and the call in flight are still read. NEGATIVE CONTROL:
+/// the same prompt under less than the bound is found.
+#[cfg(unix)]
+#[test]
+fn a_cold_back_read_past_its_bound_names_no_prompt() {
+    let root = cache_test_dir("excerpts-cold");
+    let start = crate::harness::upgrade_models::parse_utc("2026-10-15T10:00:00Z").unwrap();
+    let at = "2026-10-15T10:01:00Z";
+    // One tool result of about 100 KiB: a long run's filler.
+    let filler = |n: usize| {
+        excerpt_row(
+            "user",
+            at,
+            &format!(
+                r#"{{"content":[{{"type":"tool_result","tool_use_id":"f{n}","content":"{}"}}]}}"#,
+                "x".repeat(100 * 1024)
+            ),
+        )
+    };
+    let transcript = |rows: usize| {
+        let mut body = excerpt_row("user", at, r#"{"content":"the only prompt"}"#);
+        body.push('\n');
+        for n in 0..rows {
+            body.push_str(&filler(n));
+            body.push('\n');
+        }
+        body.push_str(&excerpt_row(
+            "assistant",
+            at,
+            r#"{"id":"m1","model":"claude-opus-5-5","content":[{"type":"text","text":"still at it"},{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}"#,
+        ));
+        body.push('\n');
+        body
+    };
+    let read = |name: &str, rows: usize| {
+        let path = root.join(name);
+        let body = transcript(rows);
+        std::fs::write(&path, &body).unwrap();
+        let mut cache = TailCache::default();
+        cache.read_since(&path, 4242, Some(start), start).unwrap();
+        (
+            body.len() as u64,
+            cache.excerpts().cloned().expect("the excerpts"),
+        )
+    };
+    let (len, past) = read("past.jsonl", 170);
+    assert!(len > MAX_BACK_BYTES + TAIL_BYTES, "{len}");
+    assert!(past.prompts.is_empty(), "past the bound: {past:?}");
+    assert_eq!(past.said.as_deref(), Some("still at it"));
+    assert_eq!(past.doing.as_deref(), Some("Bash"));
+    let (len, under) = read("under.jsonl", 100);
+    assert!(len < MAX_BACK_BYTES, "{len}");
+    assert_eq!(under.prompts.len(), 1, "{under:?}");
+    assert_eq!(under.prompts[0].text, "the only prompt");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -3880,7 +4047,7 @@ fn the_acts_label_is_drawn_whole_or_not_at_all_never_at_a_facts_cost() {
     let label = Some(LightsWidth {
         chips: 3,
         title: "\u{2713} approved".chars().count() + 2,
-        lean: [0, 0],
+        lean: [0; LEAN_FORMS],
         short: 0,
         reason: false,
     });
@@ -3957,25 +4124,33 @@ fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
     let label = LightsWidth {
         chips,
         title: "\u{2713} approved".chars().count() + 2,
-        lean: [0, 0],
+        lean: [0; LEAN_FORMS],
         short: 0,
         reason: false,
     };
     // Cruise's hovered title with no act taken (§9.2.1): the whole, v1's
-    // words (no trail to give up first), and the mode phrase.
+    // words (no trail to give up first), the phrase with both clicks, with
+    // the click alone, and the mode phrase.
     let whole_title = "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land \u{b7} \
                        right-click: more";
     let v1 = "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land";
+    let clicks = "autopilot: cruise \u{b7} click: land \u{b7} right-click: more";
+    let click = "autopilot: cruise \u{b7} click: land";
     let hover = LightsWidth {
         chips,
         title: whole_title.chars().count() + 2,
-        lean: [0, v1.chars().count() + 2],
+        lean: [
+            0,
+            v1.chars().count() + 2,
+            clicks.chars().count() + 2,
+            click.chars().count() + 2,
+        ],
         short: "autopilot: cruise".chars().count() + 2,
         reason: false,
     };
     let untitled = |l: LightsWidth| LightsWidth {
         title: 0,
-        lean: [0, 0],
+        lean: [0; LEAN_FORMS],
         short: 0,
         ..l
     };
@@ -3983,6 +4158,8 @@ fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
         TitleFit::Full,
         TitleFit::Lean(0),
         TitleFit::Lean(1),
+        TitleFit::Lean(2),
+        TitleFit::Lean(3),
         TitleFit::Short,
     ];
     for lights in [label, hover] {
@@ -4060,4 +4237,74 @@ fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
             chips: false
         }
     );
+}
+
+/// THE STEP TAP'S SIDE OF ONE REGISTRY READ (session log Phase 3B, S1 as
+/// built): the lookup says whether the transcript's path is CERTAIN — the
+/// project's own file, or the one file a scan finds — and a read that found
+/// none tells an armed tap so, so the file Claude Code writes next is bound
+/// from its first byte. NEGATIVE CONTROLS: two scanned candidates are not
+/// certain; a tap that never saw the file absent binds it at its length.
+#[cfg(unix)]
+#[test]
+fn a_footer_read_tells_the_step_tap_what_it_found() {
+    use super::super::steps::StepEvent;
+    let root = cache_test_dir("tap-found");
+    let (claude, transcript, two_pm) = walled_session(&root);
+    let entry = session_of_pid(&claude, 4242, None).expect("the entry");
+    assert_eq!(
+        transcript_lookup(&claude, &entry),
+        Some((transcript.clone(), true)),
+        "the project's own file"
+    );
+    let projects = claude.join("projects");
+    std::fs::rename(projects.join("-w-repo"), projects.join("-w-moved")).unwrap();
+    let moved = projects.join("-w-moved/abc-1.jsonl");
+    assert_eq!(
+        transcript_lookup(&claude, &entry),
+        Some((moved.clone(), true)),
+        "the one file a scan finds"
+    );
+    std::fs::create_dir_all(projects.join("-w-other")).unwrap();
+    std::fs::copy(&moved, projects.join("-w-other/abc-1.jsonl")).unwrap();
+    assert!(
+        transcript_lookup(&claude, &entry).is_some_and(|(_, certain)| !certain),
+        "NEGATIVE CONTROL: two candidates"
+    );
+    std::fs::remove_dir_all(&projects).unwrap();
+    std::fs::create_dir_all(projects.join("-w-repo")).unwrap();
+    assert_eq!(transcript_lookup(&claude, &entry), None, "none yet");
+
+    let utc = |_: Option<&str>, _: i64| Some(0);
+    let read = |cache: &mut FooterCache| {
+        let _ = folded(
+            &claude,
+            4242,
+            Some(1_700_000_000),
+            &mut TailCache::default(),
+            cache,
+            two_pm + 60,
+            &utc,
+        );
+        cache
+            .take_steps()
+            .steps
+            .into_iter()
+            .map(|s| s.ev)
+            .collect::<Vec<_>>()
+    };
+    // Armed while no file exists: the tap waits, then binds from byte 0.
+    let mut waited = FooterCache::default();
+    waited.set_floor(0, None);
+    assert!(read(&mut waited).is_empty() && !waited.steps_bound());
+    append_to(&transcript, &served_row("m1", two_pm - 60));
+    let evs = read(&mut waited);
+    assert_eq!(evs.first(), Some(&StepEvent::Bind { len: 0 }), "{evs:?}");
+    assert!(waited.steps_bound());
+    // NEGATIVE CONTROL: armed over the file as it stands, its rows history.
+    let len = std::fs::metadata(&transcript).unwrap().len();
+    let mut over = FooterCache::default();
+    over.set_floor(0, None);
+    assert_eq!(read(&mut over), vec![StepEvent::Bind { len }]);
+    std::fs::remove_dir_all(root).unwrap();
 }

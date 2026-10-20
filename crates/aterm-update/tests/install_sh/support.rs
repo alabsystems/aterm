@@ -8,7 +8,9 @@
 //! written as one record, with no fork per call. Whole-script runs ([`installer`])
 //! get a scratch HOME and a PATH of the stubs a case names. Every child is
 //! started by `aterm_uds::spawnfd::command` and held to [`HANG`], past which
-//! its process group is SIGKILLed.
+//! its process group is SIGKILLed: a whole-script run to [`HANG`] in all, a
+//! batch to [`HANG`] without a call returning (a batch of thousands of calls
+//! may honestly outlast a minute on a loaded machine; one call never does).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -20,8 +22,60 @@ use aterm_uds::spawnfd::Command;
 /// A wait for something that must happen: a hang detector, never a latency budget.
 pub const HANG: Duration = Duration::from_secs(60);
 
-/// The system dirs every run's PATH ends with.
-pub const SYSTEM_PATH: &str = "/usr/bin:/bin";
+/// The programs that are a Rust toolchain to the installer: what it resolves
+/// on PATH (`command -v`, and its walk of PATH's dirs for a `targo`).
+const TOOLCHAIN: [&str; 5] = ["cargo", "rustc", "rustup", "targo", "alab-targo"];
+
+/// The system dirs every run's PATH ends with: `/usr/bin:/bin`, unless one of
+/// them holds a [`TOOLCHAIN`] program — a distribution's rustup puts `cargo`,
+/// `rustc` and `rustup` in `/usr/bin`, as on the Linux lane — when it is one
+/// folder under [`scratch_root`] linking every other program of theirs, so a
+/// case that hands the installer no toolchain hands it none on any host. Made
+/// once, whole, then renamed into place: test processes share it. It is named
+/// by the two dirs' modification times, which a program installed or removed
+/// moves, so a view made before the lane provisioned again (zsh and fish land
+/// in `/usr/bin`) is never the one a later run finds.
+pub fn system_path() -> &'static str {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        const DIRS: [&str; 2] = ["/usr/bin", "/bin"];
+        let toolchain_in = |dir: &str| TOOLCHAIN.iter().any(|t| Path::new(dir).join(t).exists());
+        if !DIRS.into_iter().any(toolchain_in) {
+            return DIRS.join(":");
+        }
+        let changed: Vec<String> = DIRS
+            .into_iter()
+            .map(|dir| {
+                let at = std::fs::metadata(dir).and_then(|meta| meta.modified());
+                let since = at
+                    .ok()
+                    .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok());
+                format!("{:x}", since.unwrap_or_default().as_nanos())
+            })
+            .collect();
+        let view = scratch_root().join(format!("install-sh-system-{}", changed.join("-")));
+        if !view.is_dir() {
+            let part = scratch_root().join(format!("install-sh-system.{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&part);
+            std::fs::create_dir_all(&part).expect("the system view");
+            for dir in DIRS {
+                for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                    let name = entry.file_name();
+                    let at = part.join(&name);
+                    if TOOLCHAIN.iter().any(|t| name == *t) || at.symlink_metadata().is_ok() {
+                        continue;
+                    }
+                    std::os::unix::fs::symlink(entry.path(), at).expect("a system program's link");
+                }
+            }
+            // Another process may have put its own in place first: that one stands.
+            if std::fs::rename(&part, &view).is_err() {
+                let _ = std::fs::remove_dir_all(&part);
+            }
+        }
+        s(&view).to_string()
+    })
+}
 
 /// The checkout this test binary was built from.
 pub fn root() -> PathBuf {
@@ -250,6 +304,10 @@ impl Run {
 pub fn run(cmd: &mut Command) -> Run {
     let out = aterm_uds::deadline::output_until(cmd, Instant::now() + HANG)
         .unwrap_or_else(|e| panic!("{:?} {e}", cmd.get_program()));
+    ran(&out)
+}
+
+fn ran(out: &std::process::Output) -> Run {
     Run {
         status: out.status.code(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -282,7 +340,7 @@ pub fn hermetic(home: &Home, extra: &[(&str, &str)]) -> Vec<(String, String)> {
         ("HOME".into(), s(&home.home).into()),
         ("TMPDIR".into(), s(&home.tmp).into()),
         ("SHELL".into(), "/bin/zsh".into()),
-        ("PATH".into(), SYSTEM_PATH.into()),
+        ("PATH".into(), system_path().into()),
         (
             "ATERM_INSTALL_DIR".into(),
             s(&home.home.join("Applications")).into(),
@@ -360,7 +418,7 @@ impl Lib {
         Self {
             script: script.to_path_buf(),
             items: Vec::new(),
-            env: vec![("PATH".into(), SYSTEM_PATH.into())],
+            env: vec![("PATH".into(), system_path().into())],
         }
     }
 
@@ -371,7 +429,9 @@ impl Lib {
         self
     }
 
-    /// Shell code run at this point, unrecorded; a failure ends the batch.
+    /// Shell code run at this point, unrecorded; a failure ends the batch. It is
+    /// one tick of the batch's progress, as a call is; a step that walks a corpus
+    /// ticks at every item (`__tick`), or the hang detector times the corpus.
     pub fn step(&mut self, code: impl Into<String>) -> &mut Self {
         self.items.push(Item::Step(code.into()));
         self
@@ -402,7 +462,7 @@ impl Lib {
             match item {
                 Item::Step(code) => {
                     driver.push_str(code);
-                    driver.push('\n');
+                    driver.push_str("\n__tick\n");
                 }
                 Item::Call(code, vars) => {
                     driver.push_str("__rc=0\n{\n");
@@ -429,8 +489,16 @@ impl Lib {
         for (key, value) in &self.env {
             cmd.env(key, value);
         }
-        let done = run(&mut cmd);
-        let raw = std::fs::read(dir.join("records")).unwrap_or_default();
+        // THE HANG DETECTOR TIMES PROGRESS, NOT THE BATCH: every call appends
+        // its record as it returns, and the source and every step a tick, so
+        // nothing that has not grown for HANG is a call, a step or the source
+        // that never returned. A batch of thousands of calls runs as long as
+        // they keep returning.
+        let (records, ticks) = (dir.join("records"), dir.join("progress"));
+        let len = |file: &Path| std::fs::metadata(file).map_or(0, |m| m.len());
+        let mut grown = || len(&records) + len(&ticks);
+        let out = aterm_uds::deadline::output_while_progressing(&mut cmd, HANG, &mut grown);
+        let raw = std::fs::read(&records).unwrap_or_default();
         let raw = String::from_utf8_lossy(&raw);
         let recs: Vec<Rec> = raw
             .split('\u{1d}')
@@ -438,6 +506,17 @@ impl Lib {
             .zip(&calls)
             .map(|(record, code)| parse_record(record, code))
             .collect();
+        let done = match out {
+            Ok(out) => ran(&out),
+            Err(aterm_uds::deadline::RunError::TimedOut) => panic!(
+                "no call returned for {HANG:?}, so the batch was killed after {} of {} calls; \
+                 the one that never returned (or a step just before it): {:?}",
+                recs.len(),
+                calls.len(),
+                calls.get(recs.len())
+            ),
+            Err(e) => panic!("{:?} {e}", bash()),
+        };
         assert_eq!(
             recs.len(),
             calls.len(),
@@ -482,6 +561,8 @@ fn parse_record(record: &str, code: &str) -> Rec {
 const DRIVER_PRELUDE: &str = r#"ATERM_INSTALL_LIBRARY_ONLY=1
 . "$1"
 __d="$2"
+__tick() { printf . >>"$__d/progress"; }
+__tick
 __rec() {
 	local __rc="$1" __v __o="" __e=""
 	shift

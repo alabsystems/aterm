@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::font_file;
+use crate::{FaceRef, FaceTarget};
 
 /// Production limits for one font-environment generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,7 +46,10 @@ impl Default for Limits {
             max_font_files: 8_192,
             max_requests: 64,
             max_work: 24_576,
-            max_name_bytes: 128 * 1024 * 1024,
+            // macOS's own font set holds ~240 MB of files under the per-file
+            // name-scan cap; a name that sits late in it (`PTMono-Regular`,
+            // in `Supplemental/`) must still be found.
+            max_name_bytes: 256 * 1024 * 1024,
             max_aggregate_bytes: 512 * 1024 * 1024,
             max_depth: super::FONT_SCAN_MAX_DEPTH,
         }
@@ -73,11 +77,42 @@ impl Stats {
     }
 }
 
-/// One immutable font file admitted for a config generation.
+/// One face admitted for a config generation: its file's immutable bytes and
+/// the face's collection index in them ([`FaceRef`]).
 #[derive(Clone, Debug)]
 pub struct AdmittedFont {
     pub path: String,
+    pub index: u32,
     pub bytes: Arc<Vec<u8>>,
+}
+
+impl AdmittedFont {
+    /// The face this admission resolved to.
+    #[must_use]
+    pub fn face(&self) -> FaceRef {
+        FaceRef::new(self.path.clone(), self.index)
+    }
+}
+
+/// Which face of a resolved file a request takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaceChoice {
+    /// The face at this index: a `name`-table match, or a compiled-in face.
+    At(u32),
+    /// The face nearest this style, chosen from the admitted bytes: a file
+    /// found by its file name or named by path (`crate::best_face`).
+    Nearest(FaceTarget),
+}
+
+impl FaceChoice {
+    fn index(self, bytes: &[u8]) -> u32 {
+        match self {
+            Self::At(index) => index,
+            Self::Nearest(target) => {
+                crate::best_face(bytes, None, target).map_or(0, |(_, index)| index)
+            }
+        }
+    }
 }
 
 /// Result for one request, in input order.
@@ -224,12 +259,17 @@ impl Catalog {
         }
     }
 
-    fn resolve_many(&mut self, requests: &[String]) -> Vec<Result<PathBuf, String>> {
-        let mut results = vec![None; requests.len()];
-        let mut wants: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut prefix_hits: HashMap<String, PathBuf> = HashMap::new();
+    fn resolve_many(
+        &mut self,
+        requests: &[(String, FaceTarget)],
+    ) -> Vec<Result<(PathBuf, FaceChoice), String>> {
+        type Want = (String, FaceTarget);
+        let mut results: Vec<Option<Result<(PathBuf, FaceChoice), String>>> =
+            vec![None; requests.len()];
+        let mut wants: HashMap<Want, Vec<usize>> = HashMap::new();
+        let mut prefix_hits: HashMap<Want, PathBuf> = HashMap::new();
 
-        for (index, request) in requests.iter().enumerate() {
+        for (index, (request, target)) in requests.iter().enumerate() {
             let trimmed = request.trim();
             if index >= self.limits.max_requests {
                 self.stats.exhausted.insert("requests");
@@ -246,11 +286,11 @@ impl Catalog {
                 // (`resolve_family_or_bundled`).
                 results[index] = Some(
                     crate::default_primary_identity()
-                        .map(PathBuf::from)
+                        .map(|face| (PathBuf::from(face.path), FaceChoice::At(face.index)))
                         .ok_or_else(|| format!("{trimmed:?}: no default face loads")),
                 );
             } else if trimmed.contains(['/', '\\']) {
-                results[index] = Some(Ok(PathBuf::from(trimmed)));
+                results[index] = Some(Ok((PathBuf::from(trimmed), FaceChoice::Nearest(*target))));
             } else if crate::bundled::is_identity(trimmed)
                 && let Some((id, _)) = crate::bundled::face_for_family(trimmed)
             {
@@ -259,30 +299,33 @@ impl Catalog {
                 // name-table passes to hunt for. A bundled family NAME is hunted
                 // like any other and falls back to the bundled face below only
                 // when nothing installed answers (`resolve_family_or_bundled`).
-                results[index] = Some(Ok(PathBuf::from(id)));
+                results[index] = Some(Ok((PathBuf::from(id), FaceChoice::At(0))));
             } else {
                 let normalized = normalize_family(trimmed);
                 if normalized.is_empty() {
                     results[index] = Some(Err("empty normalized font family".to_string()));
                 } else {
-                    wants.entry(normalized).or_default().push(index);
+                    wants.entry((normalized, *target)).or_default().push(index);
                 }
             }
         }
 
         // One filename pass resolves exact stems and remembers the first weaker
-        // prefix. Every requested family shares this pass.
+        // prefix. Every requested family shares this pass. A file found by its
+        // name takes the face nearest the request's style, chosen from its
+        // bytes when it is admitted (`FaceChoice::Nearest`).
         for path in &self.files {
             let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
                 continue;
             };
             let normalized = normalize_family(stem);
             for (want, indexes) in &wants {
-                if normalized == *want {
+                if normalized == want.0 {
                     for &index in indexes {
-                        results[index] = Some(Ok(path.clone()));
+                        results[index]
+                            .get_or_insert_with(|| Ok((path.clone(), FaceChoice::Nearest(want.1))));
                     }
-                } else if normalized.starts_with(want) {
+                } else if normalized.starts_with(&want.0) {
                     prefix_hits
                         .entry(want.clone())
                         .or_insert_with(|| path.clone());
@@ -290,7 +333,7 @@ impl Catalog {
             }
         }
 
-        let mut unresolved: BTreeSet<String> = wants
+        let mut unresolved: BTreeSet<Want> = wants
             .iter()
             .filter(|(_, indexes)| indexes.iter().any(|&index| results[index].is_none()))
             .map(|(want, _)| want.clone())
@@ -299,16 +342,20 @@ impl Catalog {
         // Name tables are the expensive fallback. Parse each candidate at most
         // once and compare it against every still-unresolved family. A matched
         // family keeps settling over the files of its first matching directory, so its
-        // best match wins (`name_match_rank`: the most regular face, a file over
-        // a link to it from beside it); finding the regular face that is no such
-        // alias ends that family's search, so the rest of a crowded directory —
-        // a Nix or Stow directory of links elsewhere too — is not read for it.
-        let mut settling: HashMap<String, ((u32, bool), PathBuf)> = HashMap::new();
+        // best match wins (`name_match_rank`: the face nearest the request,
+        // `crate::best_face`, then a file over a link to it from beside it); a
+        // nearest face that is no such alias ends that family's search, so the
+        // rest of a crowded directory — a Nix or Stow directory of links
+        // elsewhere too — is not read for it.
+        let mut settling: HashMap<Want, ((u32, bool), PathBuf, u32)> = HashMap::new();
         let settle =
-            |want: &str, path: &Path, results: &mut Vec<Option<Result<PathBuf, String>>>| {
+            |want: &Want,
+             path: &Path,
+             face: u32,
+             results: &mut Vec<Option<Result<(PathBuf, FaceChoice), String>>>| {
                 if let Some(indexes) = wants.get(want) {
                     for &index in indexes {
-                        results[index] = Some(Ok(path.to_path_buf()));
+                        results[index] = Some(Ok((path.to_path_buf(), FaceChoice::At(face))));
                     }
                 }
             };
@@ -319,12 +366,12 @@ impl Catalog {
                 }
                 // The depth-first walk can leave a directory for a child and
                 // then return to a later sibling file. Keep its candidate until
-                // the regular face or the end, without reading other directories
+                // the nearest face or the end, without reading other directories
                 // solely for a family whose winning directory is already known.
                 if unresolved.is_empty()
                     && !settling
                         .values()
-                        .any(|(_, best)| best.parent() == path.parent())
+                        .any(|(_, best, _)| best.parent() == path.parent())
                 {
                     continue;
                 }
@@ -354,65 +401,87 @@ impl Catalog {
                 }
                 self.stats.work += 1;
                 let Ok(raw) = font_file::read_bounded_font_file(&path, read_cap) else {
+                    // A file the per-file cap admits but the REMAINING budget
+                    // does not is a name this generation could not check: say
+                    // the budget ran out, so a name that file holds is refused
+                    // as "not found before discovery exhausted …", never as
+                    // "does not resolve".
+                    let len = std::fs::metadata(&path).map_or(0, |meta| meta.len());
+                    if len > read_cap as u64 && len <= super::NAME_SCAN_MAX_BYTES {
+                        if len > name_remaining as u64 {
+                            self.stats.exhausted.insert("name bytes");
+                        }
+                        if len > aggregate_remaining as u64 {
+                            self.stats.exhausted.insert("aggregate bytes");
+                        }
+                    }
                     continue;
                 };
                 self.stats.name_files += 1;
                 self.stats.name_bytes += raw.len();
                 self.stats.aggregate_bytes += raw.len();
                 let bytes = Arc::new(raw);
-                let matches: Vec<String> = unresolved
+                let matches: Vec<(Want, u32, u32)> = unresolved
                     .iter()
                     .chain(
                         settling
                             .iter()
-                            .filter(|(_, (_, best))| best.parent() == path.parent())
+                            .filter(|(_, (_, best, _))| best.parent() == path.parent())
                             .map(|(want, _)| want),
                     )
-                    .filter(|want| super::font_name_table_matches(&bytes, want))
-                    .cloned()
+                    .filter_map(|want| {
+                        crate::best_face(&bytes, Some(&want.0), want.1)
+                            .map(|(distance, face)| (want.clone(), distance, face))
+                    })
                     .collect();
                 if !matches.is_empty() {
                     self.bytes.insert(path.clone(), Arc::clone(&bytes));
-                    let rank = super::name_match_rank(&bytes, &path);
-                    for want in matches {
-                        unresolved.remove(&want);
-                        let held = settling
+                }
+                for (want, distance, face) in matches {
+                    unresolved.remove(&want);
+                    let rank = super::name_match_rank(distance, &path);
+                    let held =
+                        settling
                             .entry(want)
-                            .or_insert(((u32::MAX, true), path.clone()));
-                        if rank < held.0 {
-                            *held = (rank, path.clone());
-                        }
+                            .or_insert(((u32::MAX, true), path.clone(), face));
+                    if rank < held.0 {
+                        *held = (rank, path.clone(), face);
                     }
                 }
-                settling.retain(|want, (held, best)| {
-                    let regular = *held == super::NAME_MATCH_SETTLED;
-                    if regular {
-                        settle(want, best, &mut results);
+                settling.retain(|want, (held, best, face)| {
+                    let nearest = *held == super::NAME_MATCH_SETTLED;
+                    if nearest {
+                        settle(want, best, *face, &mut results);
                     }
-                    !regular
+                    !nearest
                 });
             }
         }
-        for (want, (_, best)) in settling {
-            settle(&want, &best, &mut results);
+        for (want, (_, best, face)) in settling {
+            settle(&want, &best, face, &mut results);
         }
 
         let truncated = self.stats.truncated();
         for (want, indexes) in wants {
             for index in indexes {
                 if results[index].is_none() {
-                    let bundled = crate::bundled::face_for_family(requests[index].trim())
-                        .map(|(id, _)| PathBuf::from(id));
-                    results[index] = prefix_hits.get(&want).cloned().or(bundled).map(Ok).or_else(|| {
-                        Some(Err(if truncated {
-                            format!(
-                                "{:?} was not found before bounded font discovery exhausted {:?}",
-                                requests[index], self.stats.exhausted
-                            )
-                        } else {
-                            format!("{:?} does not resolve to a font file", requests[index])
-                        }))
-                    });
+                    let bundled = crate::bundled::face_for_family(requests[index].0.trim())
+                        .map(|(id, _)| (PathBuf::from(id), FaceChoice::At(0)));
+                    results[index] = prefix_hits
+                        .get(&want)
+                        .map(|path| (path.clone(), FaceChoice::Nearest(want.1)))
+                        .or(bundled)
+                        .map(Ok)
+                        .or_else(|| {
+                            Some(Err(if truncated {
+                                format!(
+                                    "{:?} was not found before bounded font discovery exhausted {:?}",
+                                    requests[index].0, self.stats.exhausted
+                                )
+                            } else {
+                                format!("{:?} does not resolve to a font file", requests[index].0)
+                            }))
+                        });
                 }
             }
         }
@@ -424,17 +493,18 @@ impl Catalog {
                 result.unwrap_or_else(|| {
                     Err(format!(
                         "{:?} does not resolve to a font file",
-                        requests[index]
+                        requests[index].0
                     ))
                 })
             })
             .collect()
     }
 
-    fn admit(&mut self, path: &Path) -> Result<AdmittedFont, String> {
+    fn admit(&mut self, path: &Path, choice: FaceChoice) -> Result<AdmittedFont, String> {
         if let Some(bytes) = self.bytes.get(path) {
             return Ok(AdmittedFont {
                 path: path.to_string_lossy().into_owned(),
+                index: choice.index(bytes),
                 bytes: Arc::clone(bytes),
             });
         }
@@ -466,6 +536,7 @@ impl Catalog {
         self.bytes.insert(path.to_path_buf(), Arc::clone(&bytes));
         Ok(AdmittedFont {
             path: path.to_string_lossy().into_owned(),
+            index: choice.index(&bytes),
             bytes,
         })
     }
@@ -490,20 +561,27 @@ fn normalize_family(value: &str) -> String {
 }
 
 /// Resolve and admit every config-authored family/path in one bounded system
-/// catalogue generation. Results retain input order and duplicate paths share
-/// one immutable byte allocation.
+/// catalogue generation, each for the style it serves (`font_family` the
+/// regular face, `font_family_bold` the bold one: [`FaceTarget`]). Results
+/// retain input order and duplicate paths share one immutable byte allocation.
 #[must_use]
-pub fn resolve_and_admit(requests: &[String]) -> Batch {
+pub fn resolve_and_admit(requests: &[(String, FaceTarget)]) -> Batch {
     resolve_and_admit_in_dirs(requests, &crate::font_search_dirs(), Limits::default())
 }
 
-fn resolve_and_admit_in_dirs(requests: &[String], dirs: &[PathBuf], limits: Limits) -> Batch {
-    let need_catalog = requests.iter().take(limits.max_requests).any(|request| {
-        !request.trim().contains(['/', '\\'])
-            && crate::display_face_for_family(request.trim()).is_none()
-            && !crate::bundled::is_identity(request)
-            && !crate::is_generic_monospace_family(request)
-    });
+fn resolve_and_admit_in_dirs(
+    requests: &[(String, FaceTarget)],
+    dirs: &[PathBuf],
+    limits: Limits,
+) -> Batch {
+    let need_catalog = requests
+        .iter()
+        .take(limits.max_requests)
+        .any(|(request, _)| {
+            !request.trim().contains(['/', '\\'])
+                && !crate::bundled::is_identity(request)
+                && !crate::is_generic_monospace_family(request)
+        });
     let mut catalog = if need_catalog {
         Catalog::scan(dirs, limits)
     } else {
@@ -518,32 +596,29 @@ fn resolve_and_admit_in_dirs(requests: &[String], dirs: &[PathBuf], limits: Limi
     let paths = catalog.resolve_many(requests);
     let entries = requests
         .iter()
-        .cloned()
+        .map(|(requested, _)| requested.clone())
         .zip(paths)
         .map(|(requested, result)| {
-            // The `display:` scheme resolves to embedded bytes ahead of the system
-            // catalogue — the exact interception `from_system_with_family`
-            // performs at startup, so the two paths cannot disagree.
-            //
             // A bundled face (`JetBrains Mono` on non-macOS, when nothing
             // installed answers the name) resolved to its virtual identity, and
             // is admitted from its compiled-in bytes under that identity so the
-            // renderer built from this entry finds its Bold/Italic siblings.
-            let result = match crate::display_face_for_family(requested.trim()) {
-                Some(bytes) => Ok(AdmittedFont {
-                    path: requested.trim().to_string(),
-                    bytes: Arc::new(bytes.to_vec()),
-                }),
-                None => result.and_then(|path| {
-                    match path.to_str().and_then(crate::bundled::face_for_id) {
-                        Some(bytes) => Ok(AdmittedFont {
-                            path: path.to_string_lossy().into_owned(),
-                            bytes: Arc::new(bytes.to_vec()),
-                        }),
-                        None => catalog.admit(&path),
-                    }
-                }),
+            // renderer built from this entry finds its Bold/Italic siblings. A
+            // `display:` family is not a font family (it names the display
+            // layer, `Renderer::set_display_faces`), so no face answers it.
+            let result = match crate::display_family_refusal(&requested) {
+                Some(refusal) => Err(refusal),
+                None => result,
             };
+            let result = result.and_then(|(path, choice)| {
+                match path.to_str().and_then(crate::bundled::face_for_id) {
+                    Some(bytes) => Ok(AdmittedFont {
+                        path: path.to_string_lossy().into_owned(),
+                        index: 0,
+                        bytes: Arc::new(bytes.to_vec()),
+                    }),
+                    None => catalog.admit(&path, choice),
+                }
+            });
             Entry { requested, result }
         })
         .collect();
@@ -716,6 +791,34 @@ pub struct MonospaceFamilies {
     pub symbol: Vec<String>,
     /// Installed colour emoji faces, by file name.
     pub emoji: Vec<String>,
+    /// Whether each listed family's regular face has programming ligatures
+    /// (`liga`/`calt`, the features the run shaper turns on), keyed by
+    /// [`normalize_family`]. See [`Self::has_ligatures`].
+    pub ligatures: std::collections::BTreeMap<String, bool>,
+}
+
+impl MonospaceFamilies {
+    /// Whether `family`, as a person writes it in `font_family`, draws
+    /// programming ligatures: `Some(false)` for a listed family whose regular
+    /// face has neither `liga` nor `calt` (Menlo, Monaco), `None` for a path or
+    /// a name this list does not hold, which is not a guess to make.
+    #[must_use]
+    pub fn has_ligatures(&self, family: &str) -> Option<bool> {
+        self.ligatures
+            .get(&normalize_family(family.trim()))
+            .copied()
+    }
+
+    /// How this list spells `family` (`menlo` is `Menlo`), when it lists it.
+    #[must_use]
+    pub fn listed_family(&self, family: &str) -> Option<&str> {
+        let key = normalize_family(family.trim());
+        self.installed
+            .iter()
+            .chain(&self.bundled)
+            .find(|listed| normalize_family(listed) == key)
+            .map(String::as_str)
+    }
 }
 
 type MonospaceMemo = Option<(Arc<FontFilesMemo>, Vec<String>, Arc<MonospaceFamilies>)>;
@@ -768,10 +871,12 @@ fn memoized_monospace_families(
 }
 
 /// [`MonospaceFamilies`] over `files`, with the default face the first of
-/// `automatic_candidates` that loads. Only the first face of a collection
-/// counts, because that is the face the renderer loads from it, and only a
-/// file within the name-table read limit, because the resolvers find no
-/// other by name.
+/// `automatic_candidates` that loads. Every face of a collection counts, each
+/// under its own style (`Menlo.ttc` lists Menlo and Menlo Bold, Italic and
+/// Bold Italic; `PTMono.ttc` lists PT Mono although its Bold comes first),
+/// because the resolvers find each again by its name and load that face. Only
+/// a file within the name-table read limit counts, because the resolvers find
+/// no other by name.
 #[must_use]
 pub fn monospace_families_in(
     files: &[PathBuf],
@@ -792,6 +897,7 @@ fn monospace_families_with_bundled(
     use std::collections::BTreeMap;
 
     let mut installed: BTreeMap<String, String> = BTreeMap::new();
+    let mut ligatures: BTreeMap<String, bool> = BTreeMap::new();
     let mut styled: [BTreeMap<String, String>; 3] = Default::default();
     let mut symbol: BTreeMap<String, String> = BTreeMap::new();
     let mut emoji: BTreeMap<String, String> = BTreeMap::new();
@@ -815,30 +921,38 @@ fn monospace_families_with_bundled(
         {
             continue;
         }
-        let Ok(face) = aterm_font::Face::parse(&bytes, 0) else {
-            continue;
-        };
-        let Some(family) = face_family(&face) else {
-            continue;
-        };
-        let key = normalize_family(&family);
-        if face_is_terminal_text(&face) {
-            let italic = face.is_italic() || face.is_oblique();
-            let bold = face.weight().to_number() >= 600;
-            if !bold && !italic {
-                installed.insert(key, family);
-            } else if let Some(full) = face_full_name(&face, stem) {
-                let slot = match (bold, italic) {
-                    (true, false) => 0,
-                    (false, true) => 1,
-                    _ => 2,
-                };
-                styled[slot].insert(normalize_family(&full), full);
+        let faces = aterm_font::fonts_in_collection(&bytes).unwrap_or(1).max(1);
+        for index in 0..faces {
+            let Ok(face) = aterm_font::Face::parse(&bytes, index) else {
+                continue;
+            };
+            let Some(family) = face_family(&face) else {
+                continue;
+            };
+            let key = normalize_family(&family);
+            if face_is_terminal_text(&face) {
+                let italic = face.is_italic() || face.is_oblique();
+                let bold = face.is_bold() || face.weight().to_number() >= 600;
+                if !bold && !italic {
+                    // First wins, as the resolvers' directory order does
+                    // (per-user fonts shadow system ones).
+                    ligatures.entry(key.clone()).or_insert_with(|| {
+                        crate::ligature_shaping::face_has_ligature_features(&face)
+                    });
+                    installed.insert(key, family);
+                } else if let Some(full) = face_full_name(&face) {
+                    let slot = match (bold, italic) {
+                        (true, false) => 0,
+                        (false, true) => 1,
+                        _ => 2,
+                    };
+                    styled[slot].insert(normalize_family(&full), full);
+                }
+            } else if face.glyph_index('\u{e0a0}').is_some()
+                || family.to_ascii_lowercase().contains("symbol")
+            {
+                symbol.insert(key, family);
             }
-        } else if face.glyph_index('\u{e0a0}').is_some()
-            || family.to_ascii_lowercase().contains("symbol")
-        {
-            symbol.insert(key, family);
         }
     }
     // A bundled family an installed one already answers is listed once,
@@ -848,6 +962,14 @@ fn monospace_families_with_bundled(
         .filter(|family| !installed.contains_key(&normalize_family(family)))
         .cloned()
         .collect();
+    for family in &bundled {
+        if let Some((_, bytes)) = crate::bundled::face_for_family(family) {
+            ligatures.insert(
+                normalize_family(family),
+                crate::ligature_shaping::font_has_ligature_features(bytes, 0),
+            );
+        }
+    }
     let installed = installed.into_values().collect();
     let (automatic, automatic_has_ligatures) = automatic_candidates
         .iter()
@@ -866,12 +988,14 @@ fn monospace_families_with_bundled(
         bold_italic,
         symbol: symbol.into_values().collect(),
         emoji: emoji.into_values().collect(),
+        ligatures,
     }
 }
 
 /// The family and ligature support of the default face at `candidate`, a
-/// path or a bundled identity, when it loads. A system face that hides its
-/// name (`.SF NS Mono`) is called what people call it (`SF Mono`). A bundled
+/// path or a bundled identity, when it loads: the regular face of a
+/// collection. A system face that hides its name (`.SF NS Mono`) is called
+/// what people call it (`SF Mono`, [`crate::public_face_name`]). A bundled
 /// face is called by its identity's family, the name it is selected by: the
 /// Windows default's typographic family is `Iosevka Term` — the name of the
 /// lighter bundled set beside it — where it is selected as `Iosevka Term
@@ -879,20 +1003,15 @@ fn monospace_families_with_bundled(
 fn automatic_face(candidate: &str) -> Option<(String, bool)> {
     use aterm_font::name_id::{FAMILY, TYPOGRAPHIC_FAMILY};
     let bytes = crate::read_resolved_font(candidate).ok()?;
-    let face = aterm_font::Face::parse(&bytes, 0).ok()?;
+    let (_, index) = crate::best_face(&bytes, None, FaceTarget::REGULAR)?;
+    let face = aterm_font::Face::parse(&bytes, index).ok()?;
     let family = match candidate.strip_prefix(crate::bundled::SCHEME) {
         Some(bundled) if crate::bundled::is_bundled_id(candidate) => bundled.to_string(),
         _ => face_name(&face, TYPOGRAPHIC_FAMILY).or_else(|| face_name(&face, FAMILY))?,
     };
-    let family = match family.strip_prefix('.') {
-        Some(hidden) => hidden
-            .strip_prefix("SF NS ")
-            .map_or_else(|| hidden.to_string(), |rest| format!("SF {rest}")),
-        None => family,
-    };
     Some((
-        family,
-        crate::ligature_shaping::font_has_ligature_features(&bytes),
+        crate::public_face_name(&family).into_owned(),
+        crate::ligature_shaping::face_has_ligature_features(&face),
     ))
 }
 
@@ -914,30 +1033,29 @@ fn face_is_terminal_text(face: &aterm_font::Face<'_>) -> bool {
 }
 
 /// The face's family name: the typographic family where it has one (the
-/// whole family across weights), else the legacy family. A hidden system
-/// family (`.SF NS Mono`) is not one to offer.
+/// whole family across weights), else the legacy family, under its public
+/// spelling (`.SF NS Mono` is `SF Mono`, [`crate::public_face_name`]); `None`
+/// for a hidden system face no public family stands for (`.LastResort`).
 fn face_family(face: &aterm_font::Face<'_>) -> Option<String> {
     use aterm_font::name_id::{FAMILY, TYPOGRAPHIC_FAMILY};
     face_name(face, TYPOGRAPHIC_FAMILY)
         .or_else(|| face_name(face, FAMILY))
-        .filter(|family| !family.starts_with('.'))
+        .filter(|family| !crate::is_hidden_face_name(family))
+        .map(|family| crate::public_face_name(&family).into_owned())
 }
 
-/// The face's full name (`JetBrains Mono Bold`) where the resolvers find it
-/// again (it reads as the file's name or its PostScript name once spaces and
-/// hyphens go), else its PostScript name.
-fn face_full_name(face: &aterm_font::Face<'_>, stem: &str) -> Option<String> {
+/// The face's full name (`JetBrains Mono Bold`), else its PostScript name,
+/// under its public spelling: both are names the resolvers find this face by.
+fn face_full_name(face: &aterm_font::Face<'_>) -> Option<String> {
     use aterm_font::name_id::{FULL_NAME, POST_SCRIPT_NAME};
-    let postscript = face_name(face, POST_SCRIPT_NAME)?;
-    let full = face_name(face, FULL_NAME).filter(|full| {
-        let full = normalize_family(full);
-        full == normalize_family(&postscript) || full == normalize_family(stem)
-    });
-    Some(full.unwrap_or(postscript))
+    face_name(face, FULL_NAME)
+        .or_else(|| face_name(face, POST_SCRIPT_NAME))
+        .filter(|name| !crate::is_hidden_face_name(name))
+        .map(|name| crate::public_face_name(&name).into_owned())
 }
 
 /// One `name` record, English where the face has it.
-fn face_name(face: &aterm_font::Face<'_>, id: u16) -> Option<String> {
+pub(crate) fn face_name(face: &aterm_font::Face<'_>, id: u16) -> Option<String> {
     let mut any = None;
     for name in face.names() {
         if name.name_id != id {
@@ -961,6 +1079,40 @@ fn face_name(face: &aterm_font::Face<'_>, id: u16) -> Option<String> {
         any.get_or_insert(text);
     }
     any
+}
+
+/// A `.ttc` collection of `faces`, in order: the TTC header, then each face's
+/// own file with its table offsets rebased to where it lands. Test fixtures
+/// build the collection shapes Apple ships (`PTMono.ttc`: Bold before
+/// Regular; `Menlo.ttc`: Regular, Bold, Italic, Bold Italic) from the bundled
+/// single-face files. Test support for this crate and its hosts.
+#[doc(hidden)]
+#[must_use]
+pub fn ttc_of(faces: &[&[u8]]) -> Vec<u8> {
+    let header = 12 + 4 * faces.len();
+    let mut out = Vec::new();
+    out.extend_from_slice(b"ttcf");
+    out.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+    out.extend_from_slice(&(faces.len() as u32).to_be_bytes());
+    let mut base = header.next_multiple_of(4);
+    let mut bodies = Vec::new();
+    for face in faces {
+        out.extend_from_slice(&(base as u32).to_be_bytes());
+        let mut body = face.to_vec();
+        let tables = usize::from(u16::from_be_bytes([body[4], body[5]]));
+        for record in (0..tables).map(|table| 12 + 16 * table) {
+            let offset = u32::from_be_bytes(body[record + 8..record + 12].try_into().unwrap());
+            body[record + 8..record + 12].copy_from_slice(&(offset + base as u32).to_be_bytes());
+        }
+        body.resize(body.len().next_multiple_of(4), 0);
+        base += body.len();
+        bodies.push(body);
+    }
+    out.resize(header.next_multiple_of(4), 0);
+    for body in bodies {
+        out.extend_from_slice(&body);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1032,6 +1184,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The fixture face renamed `name` wherever its `name` table says
+    /// "JetBrains Mono" (family, full and typographic names), padded with
+    /// spaces to the same length, which the name readers trim.
+    fn with_family(name: &str) -> Vec<u8> {
+        const FROM: &str = "JetBrains Mono";
+        let padded = format!("{name:<14}");
+        assert_eq!(padded.chars().count(), FROM.chars().count(), "{name:?}");
+        let utf16 =
+            |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_be_bytes).collect() };
+        let mut bytes = JETBRAINS.to_vec();
+        for (from, to) in [
+            (utf16(FROM), utf16(&padded)),
+            (FROM.as_bytes().to_vec(), padded.as_bytes().to_vec()),
+        ] {
+            let mut at = 0;
+            while at + from.len() <= bytes.len() {
+                if bytes[at..at + from.len()] == from[..] {
+                    bytes[at..at + from.len()].copy_from_slice(&to);
+                    at += from.len();
+                } else {
+                    at += 1;
+                }
+            }
+        }
+        bytes
+    }
+
+    /// A system face that hides its name (a leading dot) is offered only under
+    /// the public family it stands for: `.SF NS Mono` is SF Mono. One no
+    /// public family stands for — macOS's `.LastResort`, whose letters are
+    /// equal placeholder boxes and so pass for fixed pitch — is never listed.
+    /// Negative control: mapping every hidden name to its dotless spelling
+    /// listed it as "LastResort".
+    #[test]
+    fn a_hidden_system_face_is_listed_only_under_a_public_family() {
+        let root = fixture("hidden");
+        std::fs::write(root.join("Placeholder.ttf"), with_family(".LastResort")).unwrap();
+        std::fs::write(root.join("SFNSMono.ttf"), with_family(".SF NS Mono")).unwrap();
+        let files = Catalog::scan(std::slice::from_ref(&root), Limits::default()).files;
+        let families = monospace_families_in(&files, &[]);
+        assert_eq!(families.installed, ["SF Mono"], "{families:?}");
+        assert!(crate::is_hidden_face_name(".LastResort"));
+        assert!(!crate::is_hidden_face_name(".SF NS Mono"));
+        assert_eq!(crate::public_face_name(".SF NS Mono"), "SF Mono");
+        assert_eq!(crate::public_face_name(".LastResort"), ".LastResort");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Two files name the same family and the bold one sorts first: the
     /// family resolves to its regular face.
     #[test]
@@ -1040,7 +1240,7 @@ mod tests {
         std::fs::write(root.join("JetBrainsMono-Bold.ttf"), with_weight(700)).unwrap();
         std::fs::write(root.join("JetBrainsMono-Regular.ttf"), JETBRAINS).unwrap();
         let batch = resolve_and_admit_in_dirs(
-            &["JetBrains Mono".to_string()],
+            &[("JetBrains Mono".to_string(), FaceTarget::REGULAR)],
             std::slice::from_ref(&root),
             Limits::default(),
         );
@@ -1070,7 +1270,7 @@ mod tests {
         for alias in ["JetBrainsMono-B.ttf", "JetBrainsMono-R.ttf"] {
             std::os::unix::fs::symlink("JetBrainsMono[wght].ttf", root.join(alias)).unwrap();
         }
-        let request = ["JetBrains Mono".to_string()];
+        let request = [("JetBrains Mono".to_string(), FaceTarget::REGULAR)];
         let batch =
             resolve_and_admit_in_dirs(&request, std::slice::from_ref(&root), Limits::default());
         let admitted = batch.get(0).unwrap().as_ref().expect("the family resolves");
@@ -1079,7 +1279,9 @@ mod tests {
             super::super::resolve_by_name_table_in(
                 Catalog::scan(std::slice::from_ref(&root), Limits::default()).files,
                 "jetbrainsmono",
+                FaceTarget::REGULAR,
             )
+            .map(|face| face.path)
             .as_deref(),
             Some(&*file.to_string_lossy()),
             "the by-name resolver `show-face` reports agrees"
@@ -1143,7 +1345,9 @@ mod tests {
                 super::super::resolve_by_name_table_in(
                     Catalog::scan(std::slice::from_ref(&profile), Limits::default()).files,
                     "jetbrainsmono",
+                    FaceTarget::REGULAR,
                 )
+                .map(|face| face.path)
                 .as_deref(),
                 Some(&*link.to_string_lossy()),
                 "{target:?}"
@@ -1166,7 +1370,7 @@ mod tests {
         std::fs::write(&regular, JETBRAINS).unwrap();
         std::fs::write(system.join("Regular.ttf"), JETBRAINS).unwrap();
         let roots = [user.clone(), system.clone()];
-        let request = ["JetBrains Mono".to_string()];
+        let request = [("JetBrains Mono".to_string(), FaceTarget::REGULAR)];
         let winner = |batch: &Batch| batch.get(0).unwrap().as_ref().unwrap().path.clone();
         let batch = resolve_and_admit_in_dirs(&request, &roots, Limits::default());
         assert_eq!(
@@ -1229,6 +1433,215 @@ mod tests {
             "the replacement is now a bold face despite the identical file list"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    const JB_REGULAR: &[u8] = include_bytes!("../assets/bundled/JetBrainsMono-Regular.ttf");
+    const JB_BOLD: &[u8] = include_bytes!("../assets/bundled/JetBrainsMono-Bold.ttf");
+    const JB_ITALIC: &[u8] = include_bytes!("../assets/bundled/JetBrainsMono-Italic.ttf");
+    const JB_BOLD_ITALIC: &[u8] = include_bytes!("../assets/bundled/JetBrainsMono-BoldItalic.ttf");
+
+    /// The face `request` resolves to among `roots`: its file name and index.
+    fn resolved_face(roots: &[PathBuf], request: &str, target: FaceTarget) -> (String, u32) {
+        let batch =
+            resolve_and_admit_in_dirs(&[(request.to_string(), target)], roots, Limits::default());
+        let admitted = batch
+            .get(0)
+            .unwrap()
+            .as_ref()
+            .unwrap_or_else(|error| panic!("{request}: {error}"));
+        let name = Path::new(&admitted.path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        (name, admitted.index)
+    }
+
+    /// `PTMono.ttc`'s shape: Bold at face 0, Regular at face 1. A family is
+    /// its Regular face, a face's own name is that face, and a family asked
+    /// for its bold slot is its Bold — through the name pass (a file named
+    /// unlike the family) and through the stem pass alike. Resolving to the
+    /// file alone loaded face 0, so `font_family = "PT Mono"` drew every
+    /// cell bold.
+    #[test]
+    fn a_collection_resolves_each_request_to_its_own_face() {
+        let collection = ttc_of(&[JB_BOLD, JB_REGULAR]);
+        let by_name = fixture("collection-by-name");
+        std::fs::write(by_name.join("Mono.ttc"), &collection).unwrap();
+        let by_stem = fixture("collection-by-stem");
+        std::fs::write(by_stem.join("JetBrainsMono.ttc"), &collection).unwrap();
+        for root in [&by_name, &by_stem] {
+            let roots = std::slice::from_ref(root);
+            assert_eq!(
+                resolved_face(roots, "JetBrains Mono", FaceTarget::REGULAR).1,
+                1,
+                "the family is its Regular face ({})",
+                root.display()
+            );
+            assert_eq!(
+                resolved_face(roots, "JetBrains Mono", FaceTarget::BOLD).1,
+                0,
+                "the bold slot takes the family's Bold"
+            );
+            assert_eq!(
+                resolved_face(roots, "JetBrains Mono Bold", FaceTarget::REGULAR).1,
+                0,
+                "a face's full name is that face, whatever the slot"
+            );
+            assert_eq!(
+                resolved_face(roots, "JetBrainsMono-Regular", FaceTarget::BOLD).1,
+                1,
+                "a face's PostScript name is that face"
+            );
+        }
+        // What the index names is the face asked for.
+        let (_, index) = resolved_face(
+            std::slice::from_ref(&by_name),
+            "JetBrains Mono",
+            FaceTarget::REGULAR,
+        );
+        let face = aterm_font::Face::parse(&collection, index).unwrap();
+        assert_eq!(face.weight().to_number(), 400);
+        let _ = std::fs::remove_dir_all(by_name);
+        let _ = std::fs::remove_dir_all(by_stem);
+    }
+
+    /// `Menlo.ttc`'s shape: Regular, Bold, Italic, Bold Italic in one file.
+    /// The picker lists the family once and each styled face under its
+    /// style, and each listed name resolves back to its own face. Reading
+    /// face 0 alone listed the family and none of its styles.
+    #[test]
+    fn every_face_of_a_collection_is_listed_under_its_style_and_resolves_back() {
+        let root = fixture("collection-listing");
+        std::fs::write(
+            root.join("Mono.ttc"),
+            ttc_of(&[JB_REGULAR, JB_BOLD, JB_ITALIC, JB_BOLD_ITALIC]),
+        )
+        .unwrap();
+        let files = Catalog::scan(std::slice::from_ref(&root), Limits::default()).files;
+        let families = monospace_families_with_bundled(&files, &[], &[]);
+        assert_eq!(families.installed, ["JetBrains Mono"], "{families:?}");
+        assert_eq!(families.bold, ["JetBrains Mono Bold"], "{families:?}");
+        assert_eq!(families.italic, ["JetBrains Mono Italic"], "{families:?}");
+        assert_eq!(
+            families.bold_italic,
+            ["JetBrains Mono Bold Italic"],
+            "{families:?}"
+        );
+        let roots = std::slice::from_ref(&root);
+        for (slot, (name, index)) in [
+            (&families.bold[0], 1),
+            (&families.italic[0], 2),
+            (&families.bold_italic[0], 3),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                resolved_face(roots, name, FaceTarget::for_slot(slot)),
+                ("Mono.ttc".to_string(), index),
+                "{name}"
+            );
+            // The family alone, asked for that slot, is the same face.
+            assert_eq!(
+                resolved_face(roots, "JetBrains Mono", FaceTarget::for_slot(slot)).1,
+                index
+            );
+        }
+
+        // The PT Mono shape lists its family although its Bold comes first.
+        let bold_first = fixture("collection-bold-first");
+        std::fs::write(bold_first.join("Mono.ttc"), ttc_of(&[JB_BOLD, JB_REGULAR])).unwrap();
+        let files = Catalog::scan(std::slice::from_ref(&bold_first), Limits::default()).files;
+        let families = monospace_families_with_bundled(&files, &[], &[]);
+        assert_eq!(families.installed, ["JetBrains Mono"], "{families:?}");
+        assert_eq!(families.bold, ["JetBrains Mono Bold"], "{families:?}");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(bold_first);
+    }
+
+    /// The fixture face with its `GSUB` table record renamed, so the face
+    /// advertises no ligature feature (the record stays in tag order).
+    fn without_gsub(bytes: &[u8]) -> Vec<u8> {
+        let mut bytes = bytes.to_vec();
+        let tables = usize::from(u16::from_be_bytes([bytes[4], bytes[5]]));
+        let record = (0..tables)
+            .map(|index| 12 + 16 * index)
+            .find(|record| &bytes[*record..*record + 4] == b"GSUB")
+            .expect("the fixture has a GSUB table");
+        bytes[record + 3] = b'c';
+        bytes
+    }
+
+    /// Every listed family records whether its regular face has programming
+    /// ligatures, so Settings can say the Ligatures switch does nothing for a
+    /// chosen family without them — not only for the automatic face.
+    #[test]
+    fn every_listed_family_records_its_ligatures() {
+        let with = fixture("ligatures-with");
+        std::fs::write(with.join("Regular.ttf"), JETBRAINS).unwrap();
+        let without = fixture("ligatures-without");
+        std::fs::write(without.join("Regular.ttf"), without_gsub(JETBRAINS)).unwrap();
+        let families_in = |root: &PathBuf, bundled: &[String]| {
+            let files = Catalog::scan(std::slice::from_ref(root), Limits::default()).files;
+            monospace_families_with_bundled(&files, &[], bundled)
+        };
+        let has = families_in(&with, &[]);
+        assert_eq!(has.has_ligatures("JetBrains Mono"), Some(true));
+        let lacks = families_in(&without, &[]);
+        assert_eq!(lacks.has_ligatures("jetbrains-mono"), Some(false));
+        assert_eq!(lacks.has_ligatures("Not A Listed Family"), None);
+        if crate::bundled::face_for_family(crate::bundled::IOSEVKA_FAMILY).is_some() {
+            let bundled = families_in(&without, &[crate::bundled::IOSEVKA_FAMILY.to_string()]);
+            assert_eq!(
+                bundled.has_ligatures(crate::bundled::IOSEVKA_FAMILY),
+                Some(true)
+            );
+        }
+        let _ = std::fs::remove_dir_all(with);
+        let _ = std::fs::remove_dir_all(without);
+    }
+
+    /// A name that sits in a file the remaining name-read budget cannot hold
+    /// is refused as "not found before discovery exhausted …": the generation
+    /// could not check it. It used to read "does not resolve to a font file",
+    /// a verdict on a name that was never read.
+    ///
+    /// The name is no bundled family's: off macOS a bundled family name
+    /// (`JetBrains Mono Bold`) that the hunt does not find answers from its
+    /// compiled-in face, as `resolve_family_or_bundled` does, so it is never
+    /// refused at all. Control: one byte more of budget reads the name in
+    /// `B.ttf`.
+    #[test]
+    fn a_name_beyond_the_remaining_budget_says_the_budget_ran_out() {
+        let root = fixture("name-budget");
+        let first = without_gsub(JETBRAINS);
+        let second = with_family("Budget Mono");
+        assert!(crate::bundled::face_for_family("Budget Mono").is_none());
+        std::fs::write(root.join("A.ttf"), &first).unwrap();
+        std::fs::write(root.join("B.ttf"), &second).unwrap();
+        let resolve = |max_name_bytes| {
+            resolve_and_admit_in_dirs(
+                &[("Budget Mono".to_string(), FaceTarget::REGULAR)],
+                std::slice::from_ref(&root),
+                Limits {
+                    max_name_bytes,
+                    ..Limits::default()
+                },
+            )
+        };
+        let enough = resolve(first.len() + second.len());
+        let found = enough.get(0).unwrap().as_ref().unwrap();
+        assert!(found.path.ends_with("B.ttf"), "{}", found.path);
+        let batch = resolve(first.len() + second.len() - 1);
+        let error = batch.get(0).unwrap().as_ref().unwrap_err();
+        assert!(error.contains("exhausted"), "{error}");
+        assert!(
+            batch.stats.exhausted.contains("name bytes"),
+            "{:?}",
+            batch.stats
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1355,7 +1768,10 @@ mod tests {
         let root = fixture("batch");
         let path = root.join("Example-Mono.ttf");
         std::fs::write(&path, b"font bytes").unwrap();
-        let requests = vec!["Example Mono".to_string(), "ExampleMono".to_string()];
+        let requests = vec![
+            ("Example Mono".to_string(), FaceTarget::REGULAR),
+            ("ExampleMono".to_string(), FaceTarget::REGULAR),
+        ];
         let batch =
             resolve_and_admit_in_dirs(&requests, std::slice::from_ref(&root), Limits::default());
         let first = batch.get(0).unwrap().as_ref().unwrap();
@@ -1379,8 +1795,11 @@ mod tests {
         let installed = root.join("JetBrainsMono-Regular.ttf");
         std::fs::write(&installed, b"installed jetbrains mono").unwrap();
         let requests = vec![
-            "JetBrains Mono".to_string(),
-            crate::bundled::JETBRAINS_ID.to_string(),
+            ("JetBrains Mono".to_string(), FaceTarget::REGULAR),
+            (
+                crate::bundled::JETBRAINS_ID.to_string(),
+                FaceTarget::REGULAR,
+            ),
         ];
         let batch =
             resolve_and_admit_in_dirs(&requests, std::slice::from_ref(&root), Limits::default());
@@ -1456,7 +1875,9 @@ mod tests {
             max_aggregate_bytes: 16,
             max_depth: 0,
         };
-        let requests = (0..12).map(|i| format!("Missing {i}")).collect::<Vec<_>>();
+        let requests = (0..12)
+            .map(|i| (format!("Missing {i}"), FaceTarget::REGULAR))
+            .collect::<Vec<_>>();
         let batch = resolve_and_admit_in_dirs(&requests, std::slice::from_ref(&root), limits);
         assert!(batch.stats.dirs <= limits.max_dirs);
         assert!(batch.stats.entries <= limits.max_entries);
@@ -1484,8 +1905,8 @@ mod tests {
         std::fs::write(&a, [1; 10]).unwrap();
         std::fs::write(&b, [2; 10]).unwrap();
         let requests = vec![
-            a.to_string_lossy().into_owned(),
-            b.to_string_lossy().into_owned(),
+            (a.to_string_lossy().into_owned(), FaceTarget::REGULAR),
+            (b.to_string_lossy().into_owned(), FaceTarget::REGULAR),
         ];
         let limits = Limits {
             max_aggregate_bytes: 15,

@@ -27,8 +27,9 @@
 //! read to reach it (`policy::probe`). And the WINDOW'S HOST (`IdleHost`): its
 //! every answer and every notification the loop gave it, at `host.<name>`
 //! ([`host`]) — the host's own work inside a call (an upgrade's step, a
-//! relaunch) frozen as the answer it gave. Not on a tape: the mail lane's
-//! deliveries (a run that records refuses `--mail`).
+//! relaunch) frozen as the answer it gave. And a tasked session's result at
+//! its done edge (`doors::TASK_RESULT`): what the transcript settled to and
+//! the snapshot written, never read or written again by a replay.
 //!
 //! WHAT A REPLAY CLAIMS ([`replay`], `aterm drive replay FILE`): a STRICT
 //! replay — on the build that recorded the tape — rebuilds the loop from the
@@ -77,7 +78,7 @@
 //!   [`report`]: what a replay says, as values.
 //!
 //! WHAT A TAPE COSTS, MEASURED (2026-10-17, `aterm drive tape stats`): a
-//! fifteen-minute `aterm drive watch --tape` of Claude Code 2.1.302 in the
+//! fifteen-minute `aterm drive watch --tape` (since removed) of Claude Code 2.1.302 in the
 //! real-Claude lab (`targo --unverified lab`: its local stub API, eight turns
 //! ninety seconds apart), the loop watching behind the lab's own hosted
 //! supervisor — idle twenty-second steps of `await agent …`, the claim's

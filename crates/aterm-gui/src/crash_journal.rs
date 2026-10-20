@@ -34,13 +34,19 @@
 //! `fsync`ed: a death mid-write leaves the previous image whole.
 //!
 //! Writing ([`Lane`]): at most once per [`MIN_WRITE_INTERVAL`], only when the
-//! layout changed, and never while idle — except a tab's STANDING WORDS ABOUT
+//! layout changed, and never while idle — a capture activity prompted is
+//! followed by one more at the interval's end, its trailing settle, for what
+//! a program writes after its last output (Claude Code's record of the
+//! conversation an in-app `/clear` moved its agent to), and then none — except a tab's STANDING WORDS ABOUT
 //! TYPING ([`OwnerWords`]: its Autopilot word and timer, its holds), which are
 //! captured at once whatever the interval says ([`Lane::note_owner_words`]):
 //! a person's Land, Off or hold lost to the write throttle reopened a tab
-//! that was then typed into (the live lab of 2026-10-17). It follows
-//! `restore_session` (off or headless: nothing written, an existing journal
-//! withdrawn); a clean quit removes it after writing its own layout.
+//! that was then typed into (the live lab of 2026-10-17). The control verbs
+//! that move such a word (`hold`, `meta set|unset autopilot`) answer once the
+//! image that carries it is on disk ([`Durable`]), and an image the writer
+//! could not publish (a full disk) is owed again ([`Lane::poll_writer`]). It
+//! follows `restore_session` (off or headless: nothing written, an existing
+//! journal withdrawn); a clean quit removes it after writing its own layout.
 //!
 //! Claiming ([`claim_at_boot`]): a journal whose writer holds its lock is never
 //! touched. A dead writer's journal is taken by renaming it to a claim name
@@ -1371,7 +1377,7 @@ mod unix {
         class
     }
 
-    /// Read a taken journal: no link followed, a regular file, bounded.
+    /// Read a taken journal: no link followed, a sole-named regular file, bounded.
     fn read_taken(path: &Path) -> Result<String, String> {
         let c_path = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| "a NUL in its path".to_string())?;
@@ -1392,6 +1398,9 @@ mod unix {
             .map_err(|error| format!("not inspected ({error})"))?;
         if !meta.file_type().is_file() {
             return Err("not a regular file".to_string());
+        }
+        if meta.nlink() != 1 {
+            return Err("more than one name for the file".to_string());
         }
         if meta.len() > MAX_JOURNAL_BYTES || meta.size() > MAX_JOURNAL_BYTES {
             return Err(format!("{} bytes, more than any layout", meta.len()));
@@ -1977,10 +1986,10 @@ impl Runs {
     /// Whether the agent `record` describes may still be the one running.
     fn may_be(self, record: &crate::restore::AgentRestore) -> bool {
         // The restore names its agent as its relaunch reads it
-        // (`AgentRestore::agent`): an agent this build has no lane for (agy,
-        // Gemini CLI: `lanes()` all false) is none of the agents a status
-        // read names, so a read that names one drops its leaf. Muse Code's
-        // leaf (its relaunch lane) is Muse Code's.
+        // (`AgentRestore::agent`): an agent this build has no lane for
+        // (`lanes()` all false) is none of the agents a status read names, so
+        // a read that names one drops its leaf. Muse Code's, agy's and Gemini
+        // CLI's leaves (their relaunch lanes) are theirs.
         let kind = record
             .agent()
             .map(aterm_agent::harness::upgrade::Agent::program)
@@ -2048,6 +2057,245 @@ fn each_terminal_leaf(
     }
 }
 
+/// How long a control verb that moved a word about typing (`hold`, `meta
+/// set|unset autopilot`) waits for the journal image that carries it to be
+/// durable before it answers ([`Durable::settle`], at [`Durable::word_bound`]).
+/// A bound on a stalled main thread or a disk that does not answer, never a
+/// pace: the image is on disk a loop turn and one `fsync` after the word. No
+/// fast timer in any build: a fast one would answer a word as not journaled
+/// while its disk was merely busy. A test waits as long as a hang detector
+/// does (the review's KR-J-4: at 5 s, a disk a busy gate stalled turned a
+/// test's durable `OK` into `journaled=0`); one that wants the bound's own
+/// answer sets a bound of its own on the lane ([`Durable::set_word_bound`])
+/// where no image can carry the word.
+#[cfg(not(test))]
+pub(crate) const WORD_DURABLE_WAIT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+pub(crate) const WORD_DURABLE_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
+
+/// WHAT THE JOURNAL HOLDS ON DISK OF THE WORDS ABOUT TYPING
+/// ([`OwnerWords`]; ATERM-KI-1016-1): one state the lane (the main thread),
+/// its writer thread and the control verbs that move a word share, so a
+/// verb's `OK` is a durability ack. The `OK` of `hold` and of `meta set
+/// autopilot` came as the word was stored, before the image that carries it
+/// was renamed into place: the live lab had the reply up to 0.4 ms before
+/// the rename in 16 of 100 trials, and a `SIGKILL` sent at the reply lost a
+/// hold in 2 of 7. Now the verb takes a TICKET once its word is stored
+/// ([`Self::ask`]); the lane's next capture is owed at once and reads the
+/// tickets out before it reads the desk, so its image carries every word
+/// stored before them; and the writer COVERS them once that image — or the
+/// same image handed before, when the capture found nothing new — is on disk
+/// (renamed, the directory `fsync`ed). The verb answers then
+/// ([`Self::settle`]).
+///
+/// Fail-closed and bounded: past [`WORD_DURABLE_WAIT`] the answer says
+/// `journaled=0` (the word stands; no image on disk carries it yet), and a
+/// lane that journals nothing — inert (headless, no data dir, off unix) or
+/// `restore_session` off — answers as before, at once. The writer's failure
+/// to publish (a full disk) is here too, for the lane to owe that image again
+/// ([`Lane::poll_writer`]).
+#[derive(Clone, Default)]
+pub(crate) struct Durable {
+    shared: Arc<DurableShared>,
+}
+
+#[derive(Default)]
+struct DurableShared {
+    state: Mutex<DurableState>,
+    moved: std::sync::Condvar,
+    /// Wakes the main loop ([`Durable::set_wake`]): a ticket, or the
+    /// writer's failure, must not wait for an unrelated wake.
+    wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+#[derive(Debug, Default)]
+struct DurableState {
+    /// A lane journals the desk: active, and `restore_session` on.
+    live: bool,
+    /// Tickets handed out ([`Durable::ask`]).
+    asked: u64,
+    /// The newest ticket an image on disk covers ([`Durable::cover`]).
+    covered: u64,
+    /// The writer's newest image did not reach the disk, and the lane has not
+    /// heard it yet ([`Durable::take_failed`]).
+    failed: bool,
+    /// A test's own bound for the verbs ([`Durable::set_word_bound`]);
+    /// `None` is [`WORD_DURABLE_WAIT`].
+    #[cfg(test)]
+    word_bound: Option<Duration>,
+}
+
+/// How a ticket's wait ended ([`Durable::wait`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Settled {
+    /// The image that carries the word is on disk.
+    Durable,
+    /// No lane journals the desk (inert, or `restore_session` off): there is
+    /// nothing to wait for.
+    Unjournaled,
+    /// The bound passed first.
+    Late,
+}
+
+impl std::fmt::Debug for Durable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Durable").field(&*self.lock()).finish()
+    }
+}
+
+impl Durable {
+    fn lock(&self) -> std::sync::MutexGuard<'_, DurableState> {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// What wakes the main loop for a ticket or a failed write (the App's
+    /// proxy; a test's counter).
+    pub(crate) fn set_wake(&self, wake: impl Fn() + Send + Sync + 'static) {
+        *self
+            .shared
+            .wake
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(wake));
+    }
+
+    fn wake(&self) {
+        let wake = self
+            .shared
+            .wake
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+
+    /// A TICKET for the words stored before this call, and the main loop woken
+    /// to capture them; `None` where no lane journals the desk (answer at
+    /// once). Asked AFTER the word is stored: the capture that covers the
+    /// ticket reads the tickets before it reads the desk.
+    pub(crate) fn ask(&self) -> Option<u64> {
+        let ticket = {
+            let mut state = self.lock();
+            if !state.live {
+                return None;
+            }
+            state.asked += 1;
+            state.asked
+        };
+        self.wake();
+        Some(ticket)
+    }
+
+    /// Wait until `ticket` is covered, no lane journals the desk any more, or
+    /// `bound` passes.
+    pub(crate) fn wait(&self, ticket: u64, bound: Duration) -> Settled {
+        let deadline = Instant::now() + bound;
+        let mut state = self.lock();
+        loop {
+            if state.covered >= ticket {
+                return Settled::Durable;
+            }
+            if !state.live {
+                return Settled::Unjournaled;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Settled::Late;
+            }
+            state = self
+                .shared
+                .moved
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    /// THE VERB'S ANSWER, ONCE ITS WORD IS DURABLE: `reply` (an `OK` line)
+    /// as it stands where the image carrying the word is on disk or no lane
+    /// journals the desk, else — `bound` passed — with ` journaled=0` before
+    /// its newline: the word stands, and nothing on disk carries it yet.
+    pub(crate) fn settle(&self, reply: String, bound: Duration) -> String {
+        let Some(ticket) = self.ask() else {
+            return reply;
+        };
+        match self.wait(ticket, bound) {
+            Settled::Durable | Settled::Unjournaled => reply,
+            Settled::Late => {
+                aterm_log::warn!(
+                    "crash journal: a word about typing was answered before an image carrying \
+                     it reached the disk ({} ms)",
+                    bound.as_millis()
+                );
+                let line = reply.strip_suffix('\n').unwrap_or(&reply);
+                format!("{line} journaled=0\n")
+            }
+        }
+    }
+
+    /// How long a verb waits on its word's ticket ([`Self::settle`]):
+    /// [`WORD_DURABLE_WAIT`], or a test's own bound.
+    pub(crate) fn word_bound(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(bound) = self.lock().word_bound {
+            return bound;
+        }
+        WORD_DURABLE_WAIT
+    }
+
+    /// A test's bound for the verbs ([`Self::word_bound`]): short, where no
+    /// image can carry the word, to read the bound's own answer
+    /// (`journaled=0`) without sitting out the hang detector.
+    #[cfg(test)]
+    pub(crate) fn set_word_bound(&self, bound: Duration) {
+        self.lock().word_bound = Some(bound);
+    }
+
+    /// The tickets handed out so far.
+    fn asked(&self) -> u64 {
+        self.lock().asked
+    }
+
+    /// Whether a lane journals the desk; going off ends every wait.
+    fn set_live(&self, live: bool) {
+        let mut state = self.lock();
+        if state.live != live {
+            state.live = live;
+            self.shared.moved.notify_all();
+        }
+    }
+
+    /// The writer: every ticket up to `up_to` is on disk.
+    fn cover(&self, up_to: u64) {
+        let mut state = self.lock();
+        if up_to > state.covered {
+            state.covered = up_to;
+            self.shared.moved.notify_all();
+        }
+    }
+
+    /// The writer: its newest image did not reach the disk.
+    fn note_failed(&self) {
+        self.lock().failed = true;
+        self.wake();
+    }
+
+    /// The lane: whether the writer failed since it last asked.
+    fn take_failed(&self) -> bool {
+        std::mem::take(&mut self.lock().failed)
+    }
+
+    /// A test's look: the newest ticket covered.
+    #[cfg(test)]
+    pub(crate) fn covered(&self) -> u64 {
+        self.lock().covered
+    }
+}
+
 /// THE WRITER'S LANE on the App: when to capture, whether a capture is worth a
 /// write, the brake's probation, and the writer thread that does the I/O. The
 /// main thread only captures and compares; every file operation is the
@@ -2060,6 +2308,22 @@ pub(crate) struct Lane {
     pid: u32,
     /// Something may have changed since the last capture.
     dirty: bool,
+    /// Something that was not a timer woke the loop since the last capture
+    /// ([`Self::note_activity`]): the capture it prompts owes a trailing
+    /// settle ([`Self::settle_owed`]).
+    activity: bool,
+    /// THE TRAILING SETTLE (ATERM-KI-1016-1 LC-1): the last capture was
+    /// prompted by activity, so ONE more is due at the write interval's end
+    /// whatever marks the desk meanwhile — what a tab's program writes after
+    /// its last output, which wakes nothing: Claude Code rewrites its record
+    /// of the agent (the conversation an in-app `/clear` or `/resume` moves
+    /// it to) a moment after it draws, and a capture taken at the draw read
+    /// the record before it; nothing drawn since, the image named the
+    /// conversation the agent had left until something else moved. The
+    /// settle itself, prompted by nothing, owes none, so a quiet desk is
+    /// captured once more and then not again; a desk that keeps moving is
+    /// captured at the interval as before, never more often.
+    settle_owed: bool,
     /// No capture before this instant — unless one is [`Self::owed_now`].
     not_before: Option<Instant>,
     /// A tab's standing words about typing moved from what the last image
@@ -2067,6 +2331,21 @@ pub(crate) struct Lane {
     /// whatever [`Self::not_before`] says. Cleared by the capture that
     /// carries them ([`Self::offer`]).
     owed_now: bool,
+    /// What the disk holds of the words, shared with the writer and the verbs
+    /// that wait on it ([`Durable`]).
+    durable: Durable,
+    /// The newest ticket a capture has carried ([`Self::begin_capture`]): one
+    /// asked past it owes a capture now.
+    confirmed: u64,
+    /// The tickets read out before the capture now under way, which its offer
+    /// covers ([`Self::offer`]).
+    capturing: Option<u64>,
+    /// THE LAST IMAGE HANDED TO THE WRITER DID NOT REACH THE DISK (a full
+    /// disk; ATERM-KI-1016-1): the next capture hands its image again even
+    /// where nothing moved, at the write interval ([`Self::poll_writer`]). A
+    /// failed image was owed nothing until the desk changed, so a word it
+    /// carried could stay off the disk for the rest of the run.
+    unwritten: bool,
     /// This launch reopened a crash journal; until this instant its own
     /// journal carries the probation mark.
     probation_until: Option<Instant>,
@@ -2161,6 +2440,113 @@ impl OwnerWords {
     }
 }
 
+impl OwnerWords {
+    /// The words every terminal leaf of `manifest` carries, by its session's
+    /// local id.
+    fn all_carried(manifest: &RestoreManifest) -> std::collections::BTreeMap<u64, Self> {
+        use crate::restore::{RestoredSplitTree, RestoredView};
+        fn walk(node: &RestoredSplitTree, out: &mut std::collections::BTreeMap<u64, OwnerWords>) {
+            match node {
+                RestoredSplitTree::Leaf {
+                    view: RestoredView::Terminal(leaf),
+                } => {
+                    if let Some(id) = leaf.local_id {
+                        out.insert(id, OwnerWords::of_leaf(leaf));
+                    }
+                }
+                RestoredSplitTree::Leaf { .. } => {}
+                RestoredSplitTree::Split { first, second, .. } => {
+                    walk(first, out);
+                    walk(second, out);
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        for tab in manifest
+            .windows
+            .iter()
+            .flat_map(|window| &window.restored_tabs)
+        {
+            walk(&tab.root, &mut out);
+        }
+        out
+    }
+}
+
+/// How stale Windows' end-session snapshot may grow before the loop takes it
+/// again ([`EndSessionCadence`]): long enough that a busy terminal pays one
+/// cheap layout walk every couple of seconds, short enough that the save is
+/// current for anything a person does between opening a tab and choosing
+/// Restart.
+pub(crate) const END_SESSION_SNAPSHOT_TTL: Duration = Duration::from_secs(2);
+
+/// WHEN WINDOWS' END-SESSION SNAPSHOT IS TAKEN AGAIN: the layout the
+/// `WM_QUERYENDSESSION` / `WM_ENDSESSION` handler writes, which cannot read
+/// the `App` and writes what the loop last published
+/// (`platform_win::set_end_session_snapshot`). At most every
+/// [`END_SESSION_SNAPSHOT_TTL`] — and AT ONCE where a tab's standing words
+/// about typing ([`OwnerWords`]: its Autopilot word and timer, its holds)
+/// moved from what the last snapshot carries (ATERM-KI-1016-1): held to the
+/// TTL, a Land, Off or hold set within 2 s of a logoff was lost there, and
+/// the reopened tab was typed into. Words the snapshot carries owe nothing,
+/// and neither does a session it has no leaf for (a tab newer than it is the
+/// layout's own change, taken at the TTL). Platform-neutral so every host
+/// tests it; only the Windows lane takes the snapshot, and before the first
+/// one nothing is compared.
+#[derive(Debug, Default)]
+pub(crate) struct EndSessionCadence {
+    /// When the last snapshot was taken.
+    taken: Option<Instant>,
+    /// What it carries of each session's words, by local id.
+    carried: std::collections::BTreeMap<u64, OwnerWords>,
+    /// A word moved from what it carries.
+    owed: bool,
+}
+
+#[cfg_attr(
+    not(any(windows, test)),
+    allow(
+        dead_code,
+        reason = "only the Windows lane takes the end-session snapshot; every host tests its cadence"
+    )
+)]
+impl EndSessionCadence {
+    /// Whether a snapshot was ever taken: before one, words are not
+    /// compared, so a host that takes none pays nothing for them.
+    pub(crate) fn taking(&self) -> bool {
+        self.taken.is_some()
+    }
+
+    /// Session `local_id`'s words are `words` now: the next snapshot is due
+    /// at once where the last carries others on its leaf.
+    pub(crate) fn note_owner_words(&mut self, local_id: u64, words: &OwnerWords) {
+        if self
+            .carried
+            .get(&local_id)
+            .is_some_and(|carried| carried != words)
+        {
+            self.owed = true;
+        }
+    }
+
+    /// Whether the snapshot is due at `now`: a word owed, none taken yet, or
+    /// the last one [`END_SESSION_SNAPSHOT_TTL`] old.
+    pub(crate) fn due(&self, now: Instant) -> bool {
+        self.owed
+            || self
+                .taken
+                .is_none_or(|at| now.saturating_duration_since(at) >= END_SESSION_SNAPSHOT_TTL)
+    }
+
+    /// A snapshot was taken at `now`: `manifest`, or `None` where it was
+    /// retracted (`restore_session` off), which carries no words.
+    pub(crate) fn took(&mut self, manifest: Option<&RestoreManifest>, now: Instant) {
+        self.taken = Some(now);
+        self.owed = false;
+        self.carried = manifest.map(OwnerWords::all_carried).unwrap_or_default();
+    }
+}
+
 /// The image last handed to the writer.
 #[derive(Clone, Debug, PartialEq)]
 struct Written {
@@ -2176,12 +2562,23 @@ struct Written {
 impl Lane {
     /// A lane that writes into `dir` as `pid`, or an inert one for `None`.
     pub(crate) fn new(dir: Option<PathBuf>, pid: u32) -> Self {
+        let dir = if cfg!(unix) { dir } else { None };
+        let durable = Durable::default();
+        // An active lane answers tickets from its start; the first capture
+        // that runs with `restore_session` off withdraws (`Self::set_live`).
+        durable.set_live(dir.is_some());
         Self {
-            dir: if cfg!(unix) { dir } else { None },
+            dir,
             pid,
             dirty: true,
+            activity: false,
+            settle_owed: false,
             not_before: None,
             owed_now: false,
+            durable,
+            confirmed: 0,
+            capturing: None,
+            unwritten: false,
             probation_until: None,
             second_chance: false,
             last: None,
@@ -2299,13 +2696,22 @@ impl Lane {
         let id = self.run_id();
         self.inherited_on_disk
             .store(taken.journal.is_some(), Ordering::Release);
-        self.writer = Some(writer::Writer::spawn_owning(
+        #[cfg_attr(
+            not(unix),
+            expect(
+                clippy::unit_arg,
+                reason = "off unix there is no journal to own: `writer::Owned` is `()`"
+            )
+        )]
+        let writer = writer::Writer::spawn_owning(
             dir,
             id,
             taken.owner,
             taken.parent_lock,
             Arc::clone(&self.inherited_on_disk),
-        ));
+            self.durable.clone(),
+        );
+        self.writer = Some(writer);
         self.adopted = taken.journal.is_some();
         self.inherited = Some(Inherited::of(predecessor, taken.journal, taken.image));
         taken.journal
@@ -2452,10 +2858,61 @@ impl Lane {
         self.dir.is_some()
     }
 
+    /// What the disk holds of the words about typing ([`Durable`]), for the
+    /// control verbs that wait on it (`SessionStore::journal_durable`).
+    pub(crate) fn durable(&self) -> Durable {
+        self.durable.clone()
+    }
+
+    /// Whether this lane journals the desk now: active, and `restore_session`
+    /// on (`App::tick_crash_journal`). Off, every ticket's wait ends and the
+    /// verbs answer at once ([`Settled::Unjournaled`]).
+    pub(crate) fn set_live(&self, restore_session: bool) {
+        self.durable.set_live(self.dir.is_some() && restore_session);
+    }
+
+    /// THE WRITER'S WORD SINCE THE LAST LOOK (ATERM-KI-1016-1): an image that
+    /// did not reach the disk is owed again — the next capture hands its image
+    /// whatever it finds, at the write interval, and a word that image
+    /// carried is retried with it. A failed image used to stay the lane's
+    /// `last`, so nothing was owed until the desk changed. Once per loop turn
+    /// (`App::tick_crash_journal`), before the due test.
+    pub(crate) fn poll_writer(&mut self) {
+        if self.durable.take_failed() && self.last.is_some() {
+            self.unwritten = true;
+            self.dirty = true;
+        }
+    }
+
+    /// A capture begins: the tickets handed out so far ([`Durable::ask`]) are
+    /// read out BEFORE the desk is, so its image carries every word stored
+    /// before them, and its offer covers them ([`Self::offer`]).
+    pub(crate) fn begin_capture(&mut self) {
+        self.capturing = Some(self.durable.asked());
+    }
+
+    /// A ticket no capture has carried yet: owed now.
+    fn ticket_owed(&self) -> bool {
+        self.durable.asked() > self.confirmed
+    }
+
+    /// The tickets the capture under way read out: the writer covers them
+    /// with the image it was handed last, once one is on disk.
+    fn confirm(&mut self, covers: Option<u64>) {
+        let Some(covers) = covers.filter(|covers| *covers > self.confirmed) else {
+            return;
+        };
+        if let Some(writer) = self.writer.as_ref() {
+            writer.confirm(covers);
+            self.confirmed = covers;
+        }
+    }
+
     /// Something that was not a timer woke the loop: the layout, a cwd or a
     /// title may have moved.
     pub(crate) fn note_activity(&mut self) {
         self.dirty = true;
+        self.activity = true;
     }
 
     /// SESSION `local_id`'s STANDING WORDS ABOUT TYPING are now `words`
@@ -2488,6 +2945,22 @@ impl Lane {
             self.owed_now = true;
         }
         owed
+    }
+
+    /// WHAT A RESTORE CARRIES OF A TAB'S AGENT MOVED (the host's
+    /// `HostNote::AgentPublished`: an in-app `/clear` or `/resume` followed,
+    /// a relaunched agent read): the next capture is OWED NOW, like a word
+    /// about typing ([`Self::note_owner_words`]). The conversation a leaf
+    /// names is the one the next launch resumes and types its carry-on into;
+    /// held to the write interval, a crash of aterm within it after a
+    /// `/clear` resumed the conversation the agent had left (ATERM-KI-1016-1
+    /// LC-1). Rare as the move: the host says it only when its publication
+    /// moved. An inert lane owes nothing.
+    pub(crate) fn owe_agent_capture(&mut self) {
+        if self.dir.is_some() {
+            self.dirty = true;
+            self.owed_now = true;
+        }
     }
 
     /// Whether a capture was owed, clearing it (tests of what marks it).
@@ -2527,8 +3000,10 @@ impl Lane {
     pub(crate) fn capture_due(&self, now: Instant) -> bool {
         self.dir.is_some()
             && (self.owed_now
+                || self.ticket_owed()
                 || (self.not_before.is_none_or(|at| now >= at)
                     && (self.dirty
+                        || self.settle_owed
                         || self.settle_due(now)
                         || self.title_due_at().is_some_and(|at| now >= at))))
     }
@@ -2552,9 +3027,13 @@ impl Lane {
     ) -> bool {
         self.captures = self.captures.saturating_add(1);
         self.dirty = false;
+        // A capture activity prompted owes one more at the interval's end;
+        // that one, prompted by nothing, owes none.
+        self.settle_owed = std::mem::take(&mut self.activity);
         // This capture carries the words that were owed now: what moved
         // them was stored before it was read.
         self.owed_now = false;
+        let covers = self.capturing.take();
         self.not_before = Some(now + MIN_WRITE_INTERVAL);
         if let Some(last) = &self.last {
             heal_busy_leaves(&mut manifest, &last.manifest);
@@ -2565,11 +3044,15 @@ impl Lane {
             programs,
             handed: std::mem::take(&mut self.handed),
         };
-        if self.last.as_ref() == Some(&written) {
+        // An image that did not reach the disk is handed again, whatever
+        // this capture found ([`Self::unwritten`]).
+        if !self.unwritten && self.last.as_ref() == Some(&written) {
             self.title_owed = false;
+            self.confirm(covers);
             return false;
         }
-        if let Some(last) = &self.last
+        if !self.unwritten
+            && let Some(last) = &self.last
             && last.probation == written.probation
             && last.programs == written.programs
             && last.handed == written.handed
@@ -2578,7 +3061,9 @@ impl Lane {
                 .published_at
                 .is_some_and(|at| now < at + TITLE_WRITE_INTERVAL)
         {
+            // Only titles moved: the image handed last carries every word.
             self.title_owed = true;
+            self.confirm(covers);
             return false;
         }
         let Some(dir) = self.dir.clone() else {
@@ -2590,9 +3075,17 @@ impl Lane {
             .with_handed(written.handed.clone());
         let id = self.run_id();
         let writer = self.writer.get_or_insert_with(|| {
-            writer::Writer::spawn(dir, id, Arc::clone(&self.inherited_on_disk))
+            writer::Writer::spawn(
+                dir,
+                id,
+                Arc::clone(&self.inherited_on_disk),
+                self.durable.clone(),
+            )
         });
-        writer.publish(written.manifest.clone(), header);
+        let covers = covers.map_or(self.confirmed, |covers| covers.max(self.confirmed));
+        writer.publish(written.manifest.clone(), header, covers);
+        self.confirmed = covers;
+        self.unwritten = false;
         self.adopted = false;
         self.last = Some(written);
         self.published_at = Some(now);
@@ -2605,6 +3098,10 @@ impl Lane {
     /// down (the lock stays, so the journal can come back).
     pub(crate) fn withdraw(&mut self) {
         self.title_owed = false;
+        self.unwritten = false;
+        self.settle_owed = false;
+        self.activity = false;
+        self.durable.set_live(false);
         let written = self.last.take().is_some();
         if std::mem::take(&mut self.adopted) || written {
             if let Some(writer) = self.writer.as_ref() {
@@ -2617,12 +3114,12 @@ impl Lane {
     }
 
     /// The next instant the loop must wake for this lane (a pending capture's
-    /// trailing edge, probation end, an owed title), no earlier than the write
+    /// trailing edge or its settle, probation end, an owed title), no earlier than the write
     /// interval allows and never in the past.
     pub(crate) fn next_wake(&self, now: Instant) -> Option<Instant> {
         self.dir.as_ref()?;
         let floor = |at: Instant| self.not_before.map_or(at, |not_before| not_before.max(at));
-        let capture = self.dirty.then_some(now);
+        let capture = (self.dirty || self.settle_owed).then_some(now);
         let settle = self
             .probation_until
             .filter(|_| self.last.as_ref().is_some_and(|w| w.probation));
@@ -2637,6 +3134,7 @@ impl Lane {
     /// The clean quit's half: remove this process's journal, waiting at most
     /// `patience`. A lane that never wrote has nothing to remove.
     pub(crate) fn retire(&mut self, patience: Duration) -> Result<(), String> {
+        self.durable.set_live(false);
         self.last = None;
         self.adopted = false;
         match self.writer.take() {
@@ -2649,41 +3147,218 @@ impl Lane {
 /// Whether `a` and `b` differ in nothing but their terminal leaves' titles (the
 /// engine's OSC title; the user's `meta set` title is the layout's).
 fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
-    use crate::restore::{PaneLayout, RestoredSplitTree, RestoredView};
-    fn blank_tree(node: &mut RestoredSplitTree) {
-        match node {
-            RestoredSplitTree::Leaf {
-                view: RestoredView::Terminal(leaf),
-            } => leaf.title.clear(),
-            RestoredSplitTree::Leaf { .. } => {}
-            RestoredSplitTree::Split { first, second, .. } => {
-                blank_tree(first);
-                blank_tree(second);
+    use crate::restore::{
+        PaneLayout, RestoreManifest, RestoredSplitTree, RestoredTab, RestoredView,
+        TerminalLeafRestore, WindowLayout,
+    };
+    fn same_terminal_leaf(a: &TerminalLeafRestore, b: &TerminalLeafRestore) -> bool {
+        let TerminalLeafRestore {
+            cwd: a_cwd,
+            title: _,
+            profile: a_profile,
+            local_id: a_local_id,
+            user_title: a_user_title,
+            description: a_description,
+            icon: a_icon,
+            role: a_role,
+            attention: a_attention,
+            questions: a_questions,
+            autopilot: a_autopilot,
+            identity: a_identity,
+            agent: a_agent,
+            supervised: a_supervised,
+            held: a_held,
+            holds: a_holds,
+            sid: a_sid,
+            lineage: a_lineage,
+            land_at: a_land_at,
+            theme: a_theme,
+            lost: a_lost,
+        } = a;
+        let TerminalLeafRestore {
+            cwd: b_cwd,
+            title: _,
+            profile: b_profile,
+            local_id: b_local_id,
+            user_title: b_user_title,
+            description: b_description,
+            icon: b_icon,
+            role: b_role,
+            attention: b_attention,
+            questions: b_questions,
+            autopilot: b_autopilot,
+            identity: b_identity,
+            agent: b_agent,
+            supervised: b_supervised,
+            held: b_held,
+            holds: b_holds,
+            sid: b_sid,
+            lineage: b_lineage,
+            land_at: b_land_at,
+            theme: b_theme,
+            lost: b_lost,
+        } = b;
+        a_cwd == b_cwd
+            && a_profile == b_profile
+            && a_local_id == b_local_id
+            && a_user_title == b_user_title
+            && a_description == b_description
+            && a_icon == b_icon
+            && a_role == b_role
+            && a_attention == b_attention
+            && a_questions == b_questions
+            && a_autopilot == b_autopilot
+            && a_identity == b_identity
+            && a_agent == b_agent
+            && a_supervised == b_supervised
+            && a_held == b_held
+            && a_holds == b_holds
+            && a_sid == b_sid
+            && a_lineage == b_lineage
+            && a_land_at == b_land_at
+            && a_theme == b_theme
+            && a_lost == b_lost
+    }
+    fn same_tree(a: &RestoredSplitTree, b: &RestoredSplitTree) -> bool {
+        match (a, b) {
+            (
+                RestoredSplitTree::Leaf {
+                    view: RestoredView::Terminal(la),
+                },
+                RestoredSplitTree::Leaf {
+                    view: RestoredView::Terminal(lb),
+                },
+            ) => same_terminal_leaf(la, lb),
+            (RestoredSplitTree::Leaf { view: va }, RestoredSplitTree::Leaf { view: vb }) => {
+                va == vb
             }
+            (
+                RestoredSplitTree::Split {
+                    axis: aa,
+                    ratio: ra,
+                    first: fa,
+                    second: sa,
+                },
+                RestoredSplitTree::Split {
+                    axis: ab,
+                    ratio: rb,
+                    first: fb,
+                    second: sb,
+                },
+            ) => aa == ab && ra == rb && same_tree(fa, fb) && same_tree(sa, sb),
+            _ => false,
         }
     }
-    fn blank_pane(node: &mut PaneLayout) {
-        match node {
-            PaneLayout::Leaf { title, .. } => title.clear(),
-            PaneLayout::Split { first, second, .. } => {
-                blank_pane(first);
-                blank_pane(second);
-            }
+    fn same_pane(a: &PaneLayout, b: &PaneLayout) -> bool {
+        match (a, b) {
+            (
+                PaneLayout::Leaf {
+                    cwd: ca,
+                    title: _,
+                    focused: fa,
+                    local_id: la,
+                },
+                PaneLayout::Leaf {
+                    cwd: cb,
+                    title: _,
+                    focused: fb,
+                    local_id: lb,
+                },
+            ) => ca == cb && fa == fb && la == lb,
+            (
+                PaneLayout::Split {
+                    dir: da,
+                    ratio: ra,
+                    first: fa,
+                    second: sa,
+                },
+                PaneLayout::Split {
+                    dir: db,
+                    ratio: rb,
+                    first: fb,
+                    second: sb,
+                },
+            ) => da == db && ra == rb && same_pane(fa, fb) && same_pane(sa, sb),
+            _ => false,
         }
     }
-    fn blank(manifest: &RestoreManifest) -> RestoreManifest {
-        let mut manifest = manifest.clone();
-        for window in &mut manifest.windows {
-            for tab in &mut window.restored_tabs {
-                blank_tree(&mut tab.root);
-            }
-            for pane in &mut window.tabs {
-                blank_pane(pane);
-            }
-        }
-        manifest
+    fn same_tab(a: &RestoredTab, b: &RestoredTab) -> bool {
+        let RestoredTab {
+            root: ra,
+            focused_path: fa,
+            zoomed: za,
+        } = a;
+        let RestoredTab {
+            root: rb,
+            focused_path: fb,
+            zoomed: zb,
+        } = b;
+        za == zb && fa == fb && same_tree(ra, rb)
     }
-    a == b || blank(a) == blank(b)
+    fn same_window(a: &WindowLayout, b: &WindowLayout) -> bool {
+        let WindowLayout {
+            rows: ra,
+            cols: ca,
+            active_tab: ata,
+            outer_x: oxa,
+            outer_y: oya,
+            maximized: ma,
+            inner_px: ipa,
+            presence_row: pra,
+            show: sa,
+            tabs: ta,
+            native_tabs: nta,
+            tab_order: toa,
+            active_item: aia,
+            restored_tabs: rta,
+        } = a;
+        let WindowLayout {
+            rows: rb,
+            cols: cb,
+            active_tab: atb,
+            outer_x: oxb,
+            outer_y: oyb,
+            maximized: mb,
+            inner_px: ipb,
+            presence_row: prb,
+            show: sb,
+            tabs: tb,
+            native_tabs: ntb,
+            tab_order: tob,
+            active_item: aib,
+            restored_tabs: rtb,
+        } = b;
+        ra == rb
+            && ca == cb
+            && ata == atb
+            && oxa == oxb
+            && oya == oyb
+            && ma == mb
+            && ipa == ipb
+            && pra == prb
+            && sa == sb
+            && aia == aib
+            && toa == tob
+            && nta == ntb
+            && ta.len() == tb.len()
+            && rta.len() == rtb.len()
+            && ta.iter().zip(tb).all(|(pa, pb)| same_pane(pa, pb))
+            && rta.iter().zip(rtb).all(|(ta, tb)| same_tab(ta, tb))
+    }
+    let RestoreManifest {
+        schema: sa,
+        fold: fa,
+        windows: wa,
+    } = a;
+    let RestoreManifest {
+        schema: sb,
+        fold: fb,
+        windows: wb,
+    } = b;
+    sa == sb
+        && fa == fb
+        && wa.len() == wb.len()
+        && wa.iter().zip(wb).all(|(wa, wb)| same_window(wa, wb))
 }
 
 /// Give each terminal leaf of `fresh` whose cwd and title both came back empty
@@ -2773,12 +3448,17 @@ mod writer {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use super::{JournalHeader, JournalId};
+    use super::{Durable, JournalHeader, JournalId};
     use crate::restore::RestoreManifest;
 
     enum Job {
-        Publish(Box<RestoreManifest>, JournalHeader),
+        /// An image, and the newest ticket its capture read out before it
+        /// read the desk ([`Durable`]): covered once the image is on disk.
+        Publish(Box<RestoreManifest>, JournalHeader, u64),
         Withdraw,
+        /// A capture found nothing new: the image handed before carries the
+        /// words up to this ticket, covered once an image is on disk.
+        Confirm(u64),
         Retire(mpsc::Sender<Result<(), String>>),
     }
 
@@ -2793,14 +3473,20 @@ mod writer {
             f.write_str(match self {
                 Self::Publish(..) => "Publish",
                 Self::Withdraw => "Withdraw",
+                Self::Confirm(_) => "Confirm",
                 Self::Retire(_) => "Retire",
             })
         }
     }
 
     impl Writer {
-        pub(super) fn spawn(dir: PathBuf, id: JournalId, inherited: Inherited) -> Self {
-            Self::start(dir, id, None, None, inherited)
+        pub(super) fn spawn(
+            dir: PathBuf,
+            id: JournalId,
+            inherited: Inherited,
+            durable: Durable,
+        ) -> Self {
+            Self::start(dir, id, None, None, inherited, durable)
         }
 
         /// A writer that owns `owner`, the journal its caller armed already
@@ -2814,8 +3500,9 @@ mod writer {
             owner: super::JournalOwner,
             parent_lock: Option<PathBuf>,
             inherited: Inherited,
+            durable: Durable,
         ) -> Self {
-            Self::start(dir, id, Some(owner), parent_lock, inherited)
+            Self::start(dir, id, Some(owner), parent_lock, inherited, durable)
         }
 
         /// No journal to own off unix.
@@ -2826,8 +3513,9 @@ mod writer {
             _owner: (),
             _parent_lock: Option<PathBuf>,
             inherited: Inherited,
+            durable: Durable,
         ) -> Self {
-            Self::start(dir, id, None, None, inherited)
+            Self::start(dir, id, None, None, inherited, durable)
         }
 
         fn start(
@@ -2836,11 +3524,12 @@ mod writer {
             owner: Option<Owned>,
             parent_lock: Option<PathBuf>,
             inherited: Inherited,
+            durable: Durable,
         ) -> Self {
             let (tx, rx) = mpsc::channel::<Job>();
             let thread = std::thread::Builder::new()
                 .name("aterm-crash-journal".into())
-                .spawn(move || run(&dir, id, &rx, owner, parent_lock, &inherited))
+                .spawn(move || run(&dir, id, &rx, owner, parent_lock, &inherited, &durable))
                 .map_err(|error| {
                     aterm_log::warn!("crash journal: writer thread not spawned ({error})");
                 })
@@ -2848,8 +3537,19 @@ mod writer {
             Self { tx, thread }
         }
 
-        pub(super) fn publish(&self, manifest: RestoreManifest, header: JournalHeader) {
-            let _ = self.tx.send(Job::Publish(Box::new(manifest), header));
+        pub(super) fn publish(
+            &self,
+            manifest: RestoreManifest,
+            header: JournalHeader,
+            covers: u64,
+        ) {
+            let _ = self
+                .tx
+                .send(Job::Publish(Box::new(manifest), header, covers));
+        }
+
+        pub(super) fn confirm(&self, covers: u64) {
+            let _ = self.tx.send(Job::Confirm(covers));
         }
 
         pub(super) fn withdraw(&self) {
@@ -2887,6 +3587,12 @@ mod writer {
     #[cfg(not(unix))]
     pub(super) type Owned = ();
 
+    /// The newest image job of a burst.
+    enum Image {
+        Publish(Box<RestoreManifest>, JournalHeader),
+        Withdraw,
+    }
+
     #[cfg(unix)]
     fn run(
         dir: &std::path::Path,
@@ -2895,18 +3601,37 @@ mod writer {
         owner: Option<Owned>,
         parent_lock: Option<PathBuf>,
         inherited: &Inherited,
+        durable: &Durable,
     ) {
         use std::sync::atomic::Ordering;
         crate::qos::set_self(crate::qos::Role::Background);
         let mut owner = owner;
         let mut parent_lock = parent_lock;
         let mut said = false;
-        while let Ok(mut job) = rx.recv() {
+        // Whether the journal holds an image of this run's own that the
+        // writer published: only then is a ticket covered. A successor's
+        // taken-over image is its parent's, which carries no word said here.
+        let mut on_disk = false;
+        // The newest ticket an image handed or confirmed carries, covered
+        // once one is on disk ([`Durable`]).
+        let mut owed: u64 = 0;
+        while let Ok(first) = rx.recv() {
             // The newest state wins: a burst of images is one write, and a
             // withdraw after an image (or an image after a withdraw) is the
-            // later one. A retire is always the last job sent.
-            while let Ok(next) = rx.try_recv() {
-                job = next;
+            // later one. Every ticket in the burst rides that write. A retire
+            // is always the last job sent, and nothing before it is written.
+            let mut image = None;
+            let mut retire = None;
+            for job in std::iter::once(first).chain(rx.try_iter()) {
+                match job {
+                    Job::Publish(manifest, header, covers) => {
+                        owed = owed.max(covers);
+                        image = Some(Image::Publish(manifest, header));
+                    }
+                    Job::Withdraw => image = Some(Image::Withdraw),
+                    Job::Confirm(covers) => owed = owed.max(covers),
+                    Job::Retire(reply) => retire = Some(reply),
+                }
             }
             // The update's parent's lock, once its `_exit` let it go.
             if parent_lock
@@ -2915,8 +3640,12 @@ mod writer {
             {
                 parent_lock = None;
             }
-            match job {
-                Job::Publish(manifest, header) => {
+            if let Some(reply) = retire {
+                let _ = reply.send(owner.take().map_or(Ok(()), super::JournalOwner::retire));
+                return;
+            }
+            match image {
+                Some(Image::Publish(manifest, header)) => {
                     if owner.is_none() {
                         match super::JournalOwner::create(dir, id) {
                             Ok(created) => owner = Some(created),
@@ -2931,25 +3660,38 @@ mod writer {
                         .as_ref()
                         .map(|owner| owner.publish(&manifest, &header))
                     {
-                        Some(Ok(())) => inherited.store(false, Ordering::Release),
-                        Some(Err(error)) if !said => {
-                            said = true;
-                            aterm_log::warn!("crash journal: not written ({error})");
+                        Some(Ok(())) => {
+                            on_disk = true;
+                            inherited.store(false, Ordering::Release);
                         }
-                        Some(Err(_)) | None => {}
+                        Some(Err(error)) => {
+                            on_disk = false;
+                            if !said {
+                                said = true;
+                                aterm_log::warn!("crash journal: not written ({error})");
+                            }
+                            durable.note_failed();
+                        }
+                        None => {
+                            on_disk = false;
+                            durable.note_failed();
+                        }
                     }
                 }
-                Job::Withdraw => match owner.as_ref().map(super::JournalOwner::withdraw) {
-                    Some(Ok(())) => inherited.store(false, Ordering::Release),
-                    Some(Err(error)) => {
-                        aterm_log::warn!("crash journal: not withdrawn ({error})");
+                Some(Image::Withdraw) => {
+                    on_disk = false;
+                    match owner.as_ref().map(super::JournalOwner::withdraw) {
+                        Some(Ok(())) => inherited.store(false, Ordering::Release),
+                        Some(Err(error)) => {
+                            aterm_log::warn!("crash journal: not withdrawn ({error})");
+                        }
+                        None => {}
                     }
-                    None => {}
-                },
-                Job::Retire(reply) => {
-                    let _ = reply.send(owner.take().map_or(Ok(()), super::JournalOwner::retire));
-                    return;
                 }
+                None => {}
+            }
+            if on_disk {
+                durable.cover(owed);
             }
         }
     }
@@ -2962,6 +3704,7 @@ mod writer {
         _owner: Option<Owned>,
         _parent_lock: Option<PathBuf>,
         _inherited: &Inherited,
+        _durable: &Durable,
     ) {
         while let Ok(job) = rx.recv() {
             if let Job::Retire(reply) = job {
@@ -3000,6 +3743,7 @@ pub(crate) mod fixtures {
                 theme: None,
                 agent: None,
                 supervised: None,
+                lost: None,
                 held: false,
                 holds: Vec::new(),
             },
@@ -3045,7 +3789,7 @@ pub(crate) mod tests {
     pub(crate) use super::fixtures::layout;
     use super::{
         BootClaim, DeathClass, Evidence, JournalHeader, JournalId, JournalOwner, Lane,
-        MIN_WRITE_INTERVAL, Note, OwnerWords, PROBATION, PanesWithoutFolder, QuitLayout,
+        MIN_WRITE_INTERVAL, Note, OwnerWords, PROBATION, PanesWithoutFolder, QuitLayout, Settled,
         TITLE_WRITE_INTERVAL, claim_at_boot, classify_death, decode, encode,
     };
     use crate::crash_signal::{MarkerOwner, markers};
@@ -3809,9 +4553,11 @@ pub(crate) mod tests {
             "a link is never kept: {:?}",
             names(dir.path())
         );
-        // Nor a hard link: its other name is another of the person's files.
+        // Nor a hard link: its other name is another of the person's files,
+        // never read — a decode error quotes the line it stopped on, and the
+        // row would carry that line of their file (ATERM-KI-1015-12).
         let theirs = secret.path().join("notes.txt");
-        std::fs::write(&theirs, torn).unwrap();
+        std::fs::write(&theirs, b"token = \"their-private-line\n").unwrap();
         std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o644)).unwrap();
         let owner = run(dir.path(), logs.path(), &layout(&[("/y", "zsh")]), false);
         let path = owner.path();
@@ -3819,10 +4565,17 @@ pub(crate) mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::hard_link(&theirs, &path).unwrap();
         let claim = claim_here(dir.path(), logs.path());
+        let [
+            Note::Unreadable {
+                path: None, error, ..
+            },
+        ] = &claim.notes[..]
+        else {
+            panic!("{:?}", claim.notes);
+        };
         assert!(
-            matches!(&claim.notes[..], [Note::Unreadable { path: None, .. }]),
-            "{:?}",
-            claim.notes
+            !error.contains("their-private-line"),
+            "the row quotes the linked file: {error}"
         );
         assert_eq!(
             std::fs::metadata(&theirs).unwrap().permissions().mode() & 0o777,
@@ -4072,6 +4825,7 @@ pub(crate) mod tests {
         assert_eq!(classify_death(&none, id, None), Some(DeathClass::Signal));
         std::fs::remove_file(&own).unwrap();
 
+        file_clock_catches_up(logs.path());
         let report = logs.path().join(format!("crash-{}.log", id.pid));
         std::fs::write(&report, b"aterm-gui crashed").unwrap();
         assert_eq!(classify_death(&none, id, None), Some(DeathClass::Panic));
@@ -4101,9 +4855,33 @@ pub(crate) mod tests {
         );
     }
 
+    /// Wait (a one-minute hang detector) until a file written in `dir` now is dated
+    /// no earlier than now. Linux dates a file from its coarse clock, up to a tick
+    /// behind the clock a journal id reads ([`JournalId::now`]), so a report written
+    /// in the tick its run armed in read as written before it; a real report comes
+    /// long after its run armed. On a Mac the first write is dated now.
+    fn file_clock_catches_up(dir: &Path) {
+        let now = std::time::SystemTime::now();
+        let probe = dir.join(".file-clock-probe");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            std::fs::write(&probe, b"").unwrap();
+            if std::fs::metadata(&probe).unwrap().modified().unwrap() >= now {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the file clock did not reach the wall clock in a minute"
+            );
+            std::thread::yield_now();
+        }
+        std::fs::remove_file(&probe).unwrap();
+    }
+
     /// A panic report as the panic hook files it for `pid`: its first line
     /// marked when the panic was on the main thread.
     fn panic_report(logs: &Path, pid: u32, main_thread: bool) -> PathBuf {
+        file_clock_catches_up(logs);
         let path = logs.join(format!("crash-{pid}.log"));
         let mark = if main_thread {
             crate::logging::MAIN_THREAD_PANIC
@@ -4751,15 +5529,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// A PARENT'S LEAF OF AN AGENT WITH NO LANE YET (agy, Gemini CLI, a
-    /// newer build's word) is not this run's to carry once its own status
-    /// read names any agent, that very program included: the record is read
-    /// as no agent a status read names (`Runs::may_be`), as every build
-    /// before those words did, so a successor drops it rather than write it
-    /// into its own image. Unread, it stands, as it always did. NEGATIVE
-    /// CONTROL: Claude Code's, Codex's and Muse Code's leaves are carried
-    /// while their own program runs (a Muse Code word with no `[muse]` run is
-    /// no agent's).
+    /// A PARENT'S LEAF OF AN AGENT THIS BUILD DOES NOT KNOW (a newer
+    /// build's word) is not this run's to carry once its own status read
+    /// names any agent: the record is read as no agent a status read names
+    /// (`Runs::may_be`), as every build before those words did, so a
+    /// successor drops it rather than write it into its own image. Unread, it
+    /// stands, as it always did. NEGATIVE CONTROL: Claude Code's, Codex's,
+    /// Muse Code's, agy's and Gemini CLI's leaves are carried while their own
+    /// program runs (a lane's word with no run table of its own is no
+    /// agent's).
     #[test]
     fn a_parents_leaf_of_an_agent_with_no_lane_is_no_agent_a_status_read_names() {
         use super::Runs;
@@ -4779,11 +5557,12 @@ pub(crate) mod tests {
             cause: None,
             tab: None,
         };
-        for (word, program) in [("agy", Program::Agy), ("gemini", Program::Gemini)] {
+        {
+            let word = "opencode";
             let leaf = record(word);
-            assert!(leaf.agent().is_some(), "{word}: read as that agent");
+            assert!(leaf.agent().is_none(), "{word}: no agent this build knows");
             for runs in [
-                Runs::Agent(program),
+                Runs::Agent(Program::Gemini),
                 Runs::Agent(Program::Claude),
                 Runs::Other,
             ] {
@@ -4820,6 +5599,36 @@ pub(crate) mod tests {
         assert!(!Runs::Agent(Program::Claude).may_be(&muse));
         assert_eq!(record("muse").agent(), None);
         assert!(!Runs::Agent(Program::Muse).may_be(&record("muse")));
+        // agy's leaf the same way: its conversation in its own table.
+        let agy = restore::AgentRestore {
+            session: None,
+            run: Some(restore::RunRestore::Agy(restore::AgyRestore {
+                conversation: Some("eaeec4fb-4e43-47da-b46f-8a10c0fee186".into()),
+                config: "/h/.gemini/antigravity-cli".into(),
+                env: Vec::new(),
+            })),
+            ..record("agy")
+        };
+        assert!(Runs::Agent(Program::Agy).may_be(&agy));
+        assert!(!Runs::Agent(Program::Claude).may_be(&agy));
+        assert_eq!(record("agy").agent(), None);
+        assert!(!Runs::Agent(Program::Agy).may_be(&record("agy")));
+        // Gemini CLI's leaf the same way: its session in its own table.
+        let gemini = restore::AgentRestore {
+            session: None,
+            run: Some(restore::RunRestore::Gemini(restore::GeminiRestore {
+                session: Some("11edd4f1-7048-4ff7-8ff2-83cce0095a7c".into()),
+                home: "/h/.gemini".into(),
+                chats: Some("/h/.gemini/tmp/b/chats".into()),
+                env: Vec::new(),
+                started_ms: 1_792_261_698_000,
+            })),
+            ..record("gemini")
+        };
+        assert!(Runs::Agent(Program::Gemini).may_be(&gemini));
+        assert!(!Runs::Agent(Program::Claude).may_be(&gemini));
+        assert_eq!(record("gemini").agent(), None);
+        assert!(!Runs::Agent(Program::Gemini).may_be(&record("gemini")));
     }
 
     /// ROUND SEVEN, FINDING 5'S REVIEW: the take-over takes only the parent
@@ -5509,6 +6318,23 @@ pub(crate) mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o600);
         assert_eq!(names(dir.path()).len(), 2, "{:?}", names(dir.path()));
+        let path = owner.path();
+        let ordinary = super::unix::read_image(&path).expect("the sole-named image reads");
+        let image = std::fs::read(&path).unwrap();
+        let other = dir.path().join("another-name.toml");
+        std::fs::hard_link(&path, &other).unwrap();
+        for name in [&path, &other] {
+            assert!(
+                super::unix::read_image(name).is_err(),
+                "a second name must not admit another file as a journal"
+            );
+        }
+        assert_eq!(std::fs::read(&other).unwrap(), image);
+        std::fs::remove_file(&other).unwrap();
+        assert_eq!(
+            super::unix::read_image(&path).expect("the sole name reads again"),
+            ordinary
+        );
         owner.retire().unwrap();
     }
 
@@ -5573,6 +6399,62 @@ pub(crate) mod tests {
         assert_eq!(lane.next_wake(t0 + PROBATION), None);
         lane.retire(MUST_HAPPEN).unwrap();
         assert!(names(dir.path()).is_empty(), "{:?}", names(dir.path()));
+    }
+
+    /// THE TRAILING SETTLE (ATERM-KI-1016-1 LC-1): Claude Code rewrites its
+    /// record of the agent — the conversation an in-app `/clear` moved it to
+    /// — a moment after its last output, and that write wakes nothing. A
+    /// capture taken at the output read the record before it, and with
+    /// nothing drawn since the image named the conversation the agent had
+    /// left until something else moved. Now a capture activity prompted owes
+    /// one more at the write interval's end (woken for), whose image is handed
+    /// over when it moved; that one owes none, and the desk is idle again.
+    /// NEGATIVE CONTROLS: the first capture, prompted by no activity, owes no
+    /// settle; activity that keeps coming is captured at the interval, never
+    /// more often.
+    #[test]
+    fn a_capture_activity_prompted_owes_one_trailing_settle() {
+        let dir = scratch("cj-settle");
+        let mut lane = Lane::new(Some(dir.path().to_path_buf()), std::process::id());
+        let t0 = Instant::now();
+        assert!(lane.offer(layout(&[("/a", "claude")]), Vec::new(), t0));
+        assert_eq!(lane.next_wake(t0), None, "the first capture owes none");
+        assert!(!lane.capture_due(t0 + MIN_WRITE_INTERVAL));
+
+        // The `/clear`'s output: a capture at its trailing edge.
+        lane.note_activity();
+        let t1 = t0 + MIN_WRITE_INTERVAL;
+        assert!(lane.capture_due(t1));
+        assert!(!lane.offer(layout(&[("/a", "claude")]), Vec::new(), t1));
+        // Nothing drawn since; the record moved a moment after.
+        let t2 = t1 + MIN_WRITE_INTERVAL;
+        assert!(
+            !lane.capture_due(t1 + Duration::from_millis(500)),
+            "the interval stands"
+        );
+        assert_eq!(lane.next_wake(t1), Some(t2), "the settle is woken for");
+        assert!(lane.capture_due(t2), "the settle is due");
+        assert!(
+            lane.offer(layout(&[("/a", "claude"), ("/b", "zsh")]), Vec::new(), t2),
+            "what moved since is handed over"
+        );
+        assert_eq!(lane.writes, 2);
+        assert_eq!(lane.next_wake(t2), None, "the settle owes none");
+        assert!(!lane.capture_due(t2 + MIN_WRITE_INTERVAL), "idle again");
+
+        // Activity that keeps coming: one capture an interval, a settle after.
+        let mut at = t2 + MIN_WRITE_INTERVAL;
+        for _ in 0..3 {
+            lane.note_activity();
+            assert!(lane.capture_due(at));
+            assert!(!lane.capture_due(at - Duration::from_millis(1)));
+            lane.offer(layout(&[("/a", "claude"), ("/b", "zsh")]), Vec::new(), at);
+            at += MIN_WRITE_INTERVAL;
+        }
+        assert!(lane.capture_due(at), "its settle");
+        lane.offer(layout(&[("/a", "claude"), ("/b", "zsh")]), Vec::new(), at);
+        assert_eq!(lane.next_wake(at), None, "and none after it");
+        lane.retire(MUST_HAPPEN).unwrap();
     }
 
     /// A program starting or ending in a leaf is written even though only the
@@ -5692,6 +6574,157 @@ pub(crate) mod tests {
         assert!(!inert.capture_due(t1));
     }
 
+    /// The image on disk in `dir` under `lane`'s journal, decoded, once one
+    /// `ok` accepts is there (a one-minute hang detector).
+    fn image_on_disk(
+        dir: &Path,
+        lane: &mut Lane,
+        what: &str,
+        ok: impl Fn(&RestoreManifest) -> bool,
+    ) -> RestoreManifest {
+        let journal = dir.join(lane.journal_id().file_name());
+        aterm_spec::wait::until_within(MUST_HAPPEN, what, || {
+            std::fs::read_to_string(&journal)
+                .ok()
+                .and_then(|text| decode(&text).ok())
+                .map(|(_, manifest)| manifest)
+                .filter(|manifest| ok(manifest))
+        })
+    }
+
+    /// `layout`'s first tab, its leaf carrying `holds`.
+    fn held_layout(holds: &[&str]) -> RestoreManifest {
+        let mut m = layout(&[("/a", "claude")]);
+        if let restore::RestoredSplitTree::Leaf {
+            view: restore::RestoredView::Terminal(leaf),
+        } = &mut m.windows[0].restored_tabs[0].root
+        {
+            leaf.holds = holds.iter().map(|h| h.to_string()).collect();
+        }
+        m
+    }
+
+    /// Make `dir` read-only (`true`) or writable again: a journal writer
+    /// that cannot create its temporary there fails to publish, as on a full
+    /// disk.
+    fn read_only(dir: &Path, read_only: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if read_only { 0o500 } else { 0o700 };
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    /// AN IMAGE THE WRITER COULD NOT PUBLISH IS OWED AGAIN (ATERM-KI-1016-1:
+    /// a full disk). The lane kept the failed image as its `last`, so a
+    /// capture that found the same desk handed nothing, and a word that image
+    /// carried stayed off the disk until the desk changed. Now the writer's
+    /// failure reaches the lane (`Lane::poll_writer`), and the next capture
+    /// hands its image again, at the write interval — never in a loop at
+    /// once. NEGATIVE CONTROLS: inside the interval nothing is retried; once
+    /// written, the same desk is handed nothing.
+    #[test]
+    fn an_image_the_writer_could_not_publish_is_handed_again() {
+        let dir = scratch("cj-failed");
+        let mut lane = Lane::new(Some(dir.path().to_path_buf()), reaped_pid());
+        let t0 = Instant::now();
+        assert!(lane.offer(held_layout(&[]), Vec::new(), t0));
+        image_on_disk(dir.path(), &mut lane, "the first image", |_| true);
+
+        // The disk refuses the hold's image.
+        read_only(dir.path(), true);
+        let t1 = t0 + MIN_WRITE_INTERVAL;
+        assert!(lane.offer(held_layout(&["local review"]), Vec::new(), t1));
+        aterm_spec::wait::until_within(MUST_HAPPEN, "the writer's failure heard", || {
+            lane.poll_writer();
+            lane.unwritten.then_some(())
+        });
+        read_only(dir.path(), false);
+        assert!(
+            !lane.capture_due(t1 + Duration::from_millis(500)),
+            "inside the interval nothing is retried"
+        );
+        let t2 = t1 + MIN_WRITE_INTERVAL;
+        assert!(lane.capture_due(t2), "owed again at the interval");
+        assert!(
+            lane.offer(held_layout(&["local review"]), Vec::new(), t2),
+            "the same desk's image is handed again"
+        );
+        image_on_disk(dir.path(), &mut lane, "the hold's image", |manifest| {
+            OwnerWords::carried(manifest, 0).is_some_and(|words| !words.holds.is_empty())
+        });
+        let t3 = t2 + MIN_WRITE_INTERVAL;
+        lane.poll_writer();
+        lane.note_activity();
+        assert!(
+            !lane.offer(held_layout(&["local review"]), Vec::new(), t3),
+            "written, the same desk is handed nothing"
+        );
+        lane.retire(MUST_HAPPEN).unwrap();
+    }
+
+    /// A WORD'S TICKET IS COVERED ONLY ONCE AN IMAGE ON DISK CARRIES IT
+    /// (ATERM-KI-1016-1, the durability ack of `hold` and `meta set
+    /// autopilot`): a ticket owes a capture now, inside the write interval;
+    /// the capture that found the desk unchanged confirms it on the image
+    /// handed before, which is on disk; one whose image the disk refused is
+    /// not covered (the bound answers `Late`) until a later image is written.
+    /// NEGATIVE CONTROLS: an inert lane hands out no ticket, and a lane that
+    /// stops journaling ends the wait (`Unjournaled`).
+    #[test]
+    fn a_words_ticket_is_covered_once_an_image_on_disk_carries_it() {
+        let dir = scratch("cj-ticket");
+        let mut lane = Lane::new(Some(dir.path().to_path_buf()), reaped_pid());
+        let durable = lane.durable();
+        let t0 = Instant::now();
+        lane.begin_capture();
+        assert!(lane.offer(held_layout(&[]), Vec::new(), t0));
+        image_on_disk(dir.path(), &mut lane, "the first image", |_| true);
+
+        // Unchanged: the ticket rides the image already on disk.
+        let first = durable.ask().expect("an active lane hands out tickets");
+        let t1 = t0 + Duration::from_millis(300);
+        assert!(lane.capture_due(t1), "a ticket owes a capture now");
+        lane.begin_capture();
+        assert!(!lane.offer(held_layout(&[]), Vec::new(), t1), "nothing new");
+        assert_eq!(durable.wait(first, MUST_HAPPEN), Settled::Durable);
+        assert!(!lane.capture_due(t1), "carried: owed no more");
+
+        // The hold's image refused by the disk: not covered.
+        read_only(dir.path(), true);
+        let second = durable.ask().expect("a ticket");
+        lane.begin_capture();
+        assert!(lane.offer(held_layout(&["local -"]), Vec::new(), t1));
+        assert_eq!(
+            durable.wait(second, Duration::from_millis(50)),
+            Settled::Late,
+            "no image on disk carries it"
+        );
+        aterm_spec::wait::until_within(MUST_HAPPEN, "the writer's failure heard", || {
+            lane.poll_writer();
+            lane.unwritten.then_some(())
+        });
+        assert_eq!(durable.covered(), first, "still not covered");
+        // Written at the interval: covered.
+        read_only(dir.path(), false);
+        let t2 = t1 + MIN_WRITE_INTERVAL;
+        assert!(lane.capture_due(t2));
+        lane.begin_capture();
+        assert!(lane.offer(held_layout(&["local -"]), Vec::new(), t2));
+        assert_eq!(durable.wait(second, MUST_HAPPEN), Settled::Durable);
+        image_on_disk(dir.path(), &mut lane, "the hold on disk", |manifest| {
+            OwnerWords::carried(manifest, 0).is_some_and(|words| !words.holds.is_empty())
+        });
+
+        // A lane that stops journaling ends the wait.
+        let third = durable.ask().expect("a ticket");
+        lane.withdraw();
+        assert_eq!(durable.wait(third, MUST_HAPPEN), Settled::Unjournaled);
+        assert_eq!(durable.ask(), None, "and hands out no more");
+        lane.retire(MUST_HAPPEN).unwrap();
+
+        // An inert lane hands out none.
+        assert_eq!(Lane::inert().durable().ask(), None);
+    }
+
     #[test]
     fn a_program_starting_is_written_like_a_moved_folder() {
         let dir = scratch("cj-lane");
@@ -5752,15 +6785,91 @@ pub(crate) mod tests {
         t += MIN_WRITE_INTERVAL;
         lane.note_activity();
         assert!(!lane.offer(layout(&[("/a", "done"), ("/b", "zsh")]), Vec::new(), t));
+        // Its trailing settle: one capture more, still only a title moved.
+        let settle = t + MIN_WRITE_INTERVAL;
+        assert_eq!(lane.next_wake(t), Some(settle));
+        assert!(!lane.offer(layout(&[("/a", "done"), ("/b", "zsh")]), Vec::new(), settle));
         assert!(
-            !lane.capture_due(t + MIN_WRITE_INTERVAL),
+            !lane.capture_due(settle + MIN_WRITE_INTERVAL),
             "idle, and not yet due"
         );
         let due = published + TITLE_WRITE_INTERVAL;
-        assert_eq!(lane.next_wake(t), Some(due));
+        assert_eq!(lane.next_wake(settle), Some(due));
         assert!(lane.capture_due(due));
         assert!(lane.offer(layout(&[("/a", "done"), ("/b", "zsh")]), Vec::new(), due));
         assert_eq!(lane.next_wake(due), None);
         lane.retire(MUST_HAPPEN).unwrap();
     }
 }
+
+/// `CrashJournalClaim`'s eight actions that are the process around the journal, which
+/// its Tier-1 (`crash_journal_conformance::the_real_journal_conforms_to_the_model`) plays
+/// and projects rather than code any journal function runs.
+#[cfg(all(any(test, debug_assertions), unix))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "CrashJournalClaim",
+    action = "BootFresh",
+    reason = "The run's own start: the crash marker it arms is crash_signal's install; the \
+              runner arms one in the real log dir and the journal is armed lazily at the \
+              first Write."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "CrashJournalClaim",
+    action = "BootFromJournal",
+    reason = "The run's own start after a reopened journal: Lane::begin_probation only sets \
+              the header mark the runner writes through JournalOwner::publish; its 90 s \
+              clock is crash_journal::tests::the_lane_writes_only_changes_at_the_bounded_rate."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "CrashJournalClaim",
+    action = "BootSecondChance",
+    reason = "The run's own start after the brake let a stopped probation writer's journal \
+              through (ruling 285): Lane::begin_probation's second-chance flag only sets the \
+              header mark the runner writes through JournalOwner::publish \
+              (crash_journal::tests::a_relapse_inside_probation_is_skipped_and_said)."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "CrashJournalClaim",
+    action = "Crash",
+    reason = "A fatal signal runs no journal code: crash_signal's handler writes its banner \
+              into the run's own marker, which the runner writes, and the kernel releases the \
+              locks as for Die."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "CrashJournalClaim",
+    action = "HandOff",
+    reason = "The update parent's _exit after Commit is seamless::commit_and_exit, which \
+              removes the crash marker and ends the process; the runner removes the marker \
+              and drops the owner, whose drop releases its lock by LOCK_UN."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "CrashJournalClaim",
+    action = "Die",
+    reason = "A SIGKILL, a signal or a panic runs no journal code: the runner drops the owner, \
+              whose lock goes as the kernel releases a dead process's (a child forked \
+              under it and not yet exec'd keeps it until its exec), leaving the marker."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "CrashJournalClaim",
+    action = "FinishWrite",
+    reason = "Exists only in the Buggy = 1 unlink-first writer; the shipping publish is one \
+              rename, which the_defects_reject_the_real_steps pins, and a reader racing 400 real \
+              rewrites always finds a whole image (crash_journal::tests::\
+              a_rewrite_never_leaves_the_name_without_a_whole_image)."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "CrashJournalClaim",
+    action = "SuccessorDies",
+    reason = "A successor's end before it took anything over runs no journal code: the \
+              shipping Commit waiter takes the parent's image over before it releases a reader \
+              (release_committed_readers, round eight of the update audit, finding 45; \
+              crash_journal::tests::\
+              a_committed_successor_that_dies_before_its_commit_wake_still_reopens_the_desk), so \
+              the runner plays it only where the parent left no image."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn crash_journal_claim_waivers() {}

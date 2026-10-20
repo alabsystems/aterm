@@ -112,6 +112,69 @@ pub fn scratch_root(label: &str) -> aterm_tempfile::TempDir {
     root
 }
 
+/// THE TAB'S LOGIN SHELL KEEPS THE PATH ITS INSTANCE WAS BOOTED WITH: `path`,
+/// said again by the login profiles of `root`'s scratch home.
+///
+/// A tab runs an ordinary login shell, and a login shell runs the system's
+/// profile before the person's. On macOS that profile (`/etc/zprofile` for zsh,
+/// `/etc/profile` for bash and sh) runs `path_helper`, which puts every
+/// `/etc/paths` and `/etc/paths.d` entry — `/opt/homebrew/bin` among them — IN
+/// FRONT of the PATH the shell was handed. A test that booted its instance with a
+/// stand-in's folder first found the machine's own program instead: measured
+/// 2026-10-18, the worker tests' `claude` was Homebrew's Claude Code 2.1.153,
+/// started under the scratch HOME — whose login is in the keychain, which no HOME
+/// scopes.
+///
+/// So `path` is said again where each login shell reads the person's profile,
+/// after the system's: `~/.zprofile` (zsh, after `/etc/zprofile`) and `~/.profile`
+/// (sh, and bash where neither `~/.bash_profile` nor `~/.bash_login` stands: aterm's
+/// macOS bash loader reads the first of the three after `/etc/profile`, as a login
+/// bash does). The pin opens the file: a profile the test wrote itself keeps its
+/// text after it, so what that text does to PATH still has the last word, and a
+/// `~/.bash_profile` or `~/.bash_login` it wrote gets the pin at its head too.
+///
+/// The pin is `path` exactly: the directories aterm's spawn adds around the
+/// launch PATH for its sessions (the scratch prefix's `agents/` in front, its
+/// `bin/` behind) are left off with the system's, so a tab finds a program where
+/// the test put one and nowhere the machine does.
+///
+/// # Errors
+/// A profile could not be read or written.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn pin_login_path(root: &Path, path: &std::ffi::OsStr) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let home = root.join("home");
+    let mut pin = b"# aterm live test: the PATH this instance was booted with, said again after\n\
+                    # the system profile's (support/launch_isolation.rs, pin_login_path).\n\
+                    PATH='"
+        .to_vec();
+    for &byte in path.as_bytes() {
+        if byte == b'\'' {
+            pin.extend_from_slice(b"'\\''");
+        } else {
+            pin.push(byte);
+        }
+    }
+    pin.extend_from_slice(b"'\nexport PATH\n");
+    for (name, always) in [
+        (".zprofile", true),
+        (".profile", true),
+        (".bash_profile", false),
+        (".bash_login", false),
+    ] {
+        let file = home.join(name);
+        let own = match std::fs::read(&file) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && always => Vec::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        std::fs::write(&file, [pin.as_slice(), own.as_slice()].concat())?;
+    }
+    Ok(())
+}
+
 pub fn prepare(root: &Path) -> std::io::Result<()> {
     for relative in [
         "",

@@ -130,9 +130,14 @@ impl BulkMeter {
 
     /// Ask the writer to drop what it has not yet sent (see
     /// [`SinkWriter::write_frame_metered_with_receipt`]). Idempotent; a frame
-    /// already delivered is unaffected.
+    /// already delivered is unaffected. On unix a writer parked on a full tty
+    /// sees the stop at its next recheck ([`Shared::PARK_RECHECK_MS`]); on
+    /// Windows a write of the frame blocked inside ConPTY's `WriteFile` is
+    /// cancelled now (`aterm_pty::release_stopped_writes`).
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
+        #[cfg(windows)]
+        aterm_pty::release_stopped_writes(&self.stop);
     }
 
     /// Whether a stop was asked for.
@@ -311,6 +316,24 @@ fn write_metered(
         accepted,
         owed: Vec::new(),
     })
+}
+
+/// Write what a stopped paste still owes ([`MeteredEnd::owed`]) through
+/// `write`, a blocking write handed no stop (the stop already cut the frame and
+/// must not also cut its close): the bytes accepted. A discard or sever, a
+/// closed peer or a failed session ends it early. Platform-free, so the unix
+/// suite runs the Windows body's delivery (`metered_body_tests`).
+fn deliver_owed_through(owed: &[u8], mut write: impl FnMut(&[u8]) -> io::Result<usize>) -> usize {
+    let mut off = 0;
+    while let Some(rest) = owed.get(off..).filter(|rest| !rest.is_empty()) {
+        match write(rest) {
+            Ok(n) if n > 0 => off = off.saturating_add(n),
+            // A discard or sever dropped it, the peer closed, or the
+            // session failed: nothing more of this frame is owed.
+            _ => break,
+        }
+    }
+    off
 }
 
 /// Result of a blocking or spill-tolerant sink write, with its accepted order.
@@ -1374,8 +1397,9 @@ impl SinkWriter {
     /// `Session::drop`, after the hang-up), and no later byte can reach a
     /// program anyone will read again.
     ///
-    /// Teardown unblocks every waiter (unix; on Windows a writer inside the
-    /// blocking ConPTY `WriteFile` sees the sever only when that call returns).
+    /// Teardown unblocks every waiter. On Windows a writer blocked inside
+    /// ConPTY's `WriteFile` is cancelled, and every later write to the session
+    /// writes nothing (`aterm_pty::release_input_writes`).
     /// A writer parked on a full tty (the ordered egress writer, the reply
     /// writer, the spill drainer) sees it at its next [`Shared::PARK_RECHECK_MS`]
     /// recheck and abandons its frame; one waiting for spill room at `SPILL_CAP`
@@ -1403,6 +1427,8 @@ impl SinkWriter {
                 .fetch_and(!Shared::SPILL_ACTIVE_BIT, Ordering::Release);
         }
         self.shared.drained.notify_all();
+        #[cfg(windows)]
+        aterm_pty::release_input_writes(self.master);
     }
 
     /// Whether [`Self::sever_input`] has run. For tests, here and downstream
@@ -1985,6 +2011,13 @@ impl SinkWriter {
         // (for spill room or for the fd lock): a frame accepted before a
         // discard is dropped with it, however long it waited to be written.
         let since = self.shared.discard_epoch();
+        // A ConPTY session owes its resize guard's console client after a size
+        // change: an input frame runs it here, before the fd lock, because the
+        // client may wait on the console host and the host on the terminal's
+        // answer to its own cursor query, which the reply writer writes under
+        // that lock (`aterm_pty::settle_input`; a reply, inside `as_reply`,
+        // settles nothing). A no-op off Windows.
+        aterm_pty::settle_input(self.master);
         // FIFO with any SPILLED bytes: while the wedged-tty spill buffer is
         // non-empty this frame must queue BEHIND it (a direct write would overtake
         // spilled keystrokes), under the SPILL_CAP wait so a paste into a wedged
@@ -2071,9 +2104,9 @@ impl SinkWriter {
     ///
     /// One body for both platforms. On Windows a ConPTY handle is not a
     /// pollable fd and has no spill drainer (`spill_append` is a compiled
-    /// no-op), so every frame takes this ordered blocking loop, and a stop is
-    /// seen only between [`METERED_SLICE`]s, never inside the blocking
-    /// `WriteFile` ([`Shared::write_stamped_blocking`]'s Windows twin).
+    /// no-op), so every frame takes this ordered blocking loop, and a stop or
+    /// a sever cancels the blocking `WriteFile` itself
+    /// ([`Shared::write_stamped_blocking`]'s Windows twin).
     fn write_frame_body_locked(
         &self,
         guard: std::sync::MutexGuard<'_, ()>,
@@ -2147,19 +2180,10 @@ impl SinkWriter {
         if self.shared.prepend_owed(self.master, owed, since) {
             return owed.len();
         }
-        let mut off = 0;
-        while let Some(rest) = owed.get(off..).filter(|rest| !rest.is_empty()) {
-            match self
-                .shared
+        deliver_owed_through(owed, |rest| {
+            self.shared
                 .write_stamped_blocking(self.master, rest, since, None)
-            {
-                Ok(n) if n > 0 => off = off.saturating_add(n),
-                // A discard or sever dropped it, the peer closed, or the
-                // session failed: nothing more of this frame is owed.
-                _ => break,
-            }
-        }
-        off
+        })
     }
 
     /// The legacy blocking write, taking the fd lock itself (the degraded path
@@ -3057,16 +3081,25 @@ impl Shared {
     /// blocking call (the unix twin says why that matters there); the probe
     /// answers `None` here anyway. One helper for both of the Windows body's
     /// lanes, plain and metered, so neither can write around the ledger.
-    /// `since` only ever moves for a sever here (the discard is unix-only),
-    /// and it is seen between calls, never inside the blocking `WriteFile`:
-    /// ConPTY gives the call nothing to wake it with.
+    /// `since` only ever moves for a sever here (the discard is unix-only).
     ///
-    /// `stop` is NOT an escape here. There is no park to give up, and
-    /// [`write_metered`] already sees a stop between slices and cuts there;
-    /// the writes that follow a cut are the ones that finish the paste (the
-    /// rest of a character or opening marker, the closing `ESC [ 201 ~`), and
-    /// a stop checked here would drop exactly those, leaving the program in
-    /// an open paste.
+    /// The escapes reach INSIDE the blocking `WriteFile`. ConPTY's input is an
+    /// anonymous pipe, so a write to a program that has stopped reading blocks
+    /// in the call until the console host reads again. The write is made as
+    /// one `aterm_pty` can cancel: the frame's stop ([`BulkMeter::request_stop`])
+    /// cancels a write of that frame, and a write of the frame that begins after
+    /// the stop writes nothing; a sever ([`SinkWriter::sever_input`]) cancels any
+    /// write on the session and bars every later one. It then answers what it
+    /// wrote, `Ok(0)` when nothing, as the unix twin's give-up does:
+    /// [`write_metered`] ends the frame there and hands back what the cut still
+    /// owes (the rest of a character or opening marker, the closing
+    /// `ESC [ 201 ~`), which the body writes next with no stop to drop it
+    /// ([`SinkWriter::deliver_owed_locked`]). With no spill to queue those few
+    /// bytes in, a program that still does not read keeps the session's ordered
+    /// writer in that write, as it would for the next key, until it reads or the
+    /// tab closes. Until 2026-10-19 neither escape was seen until the call
+    /// returned, so `Stop paste` and a tab's close left the writer in the call,
+    /// and the paste's whole rest went to the program once it read again.
     #[cfg(not(unix))]
     fn write_stamped_blocking(
         &self,
@@ -3075,31 +3108,30 @@ impl Shared {
         since: u64,
         stop: Option<&BulkMeter>,
     ) -> io::Result<usize> {
-        self.write_stamped_through(bytes, since, stop, |bytes| {
-            aterm_pty::write_some_blocking(fd, bytes)
+        self.write_stamped_through(bytes, since, stop, |bytes, stop| {
+            aterm_pty::write_some_stoppable(fd, bytes, stop)
         })
     }
 
     /// The Windows twin's body over any blocking write: the sever gate, then
-    /// the one ledger bracket. Platform-free, and handed the same `stop` the
-    /// Windows body hands the twin, so the unix suite runs the twin's logic
-    /// through [`write_metered`] (`metered_body_tests`), which a unix host
-    /// cannot otherwise execute.
+    /// the one ledger bracket around a write handed the frame's stop flag.
+    /// Platform-free, and handed the same `stop` the Windows body hands the
+    /// twin, so the unix suite runs the twin's logic through
+    /// [`write_metered`] (`metered_body_tests`), which a unix host cannot
+    /// otherwise execute.
     #[cfg(any(not(unix), test))]
     fn write_stamped_through(
         &self,
         bytes: &[u8],
         since: u64,
         stop: Option<&BulkMeter>,
-        blocking_write: impl FnOnce(&[u8]) -> io::Result<usize>,
+        blocking_write: impl FnOnce(&[u8], Option<&AtomicBool>) -> io::Result<usize>,
     ) -> io::Result<usize> {
-        // Read, never an escape: see the twin's doc.
-        let _ = stop;
         if self.discarded_since(since) {
             return Ok(0);
         }
         self.ledgered(bytes, true, |bytes| {
-            let wrote = blocking_write(bytes);
+            let wrote = blocking_write(bytes, stop.map(|meter| &meter.stop));
             let accepted = wrote.as_ref().map_or(0, |n| *n);
             (wrote, accepted)
         })
@@ -4908,59 +4940,170 @@ mod metered_body_tests {
         [PASTE_OPEN, body, PASTE_CLOSE].concat()
     }
 
-    /// The Windows metered body with `Stop paste` pressed after `stop_after`
-    /// slices: what the program received, and how the body ended.
-    fn windows_body(frame: &[u8], stop_after: usize) -> (MeteredEnd, Vec<u8>) {
+    /// When `Stop paste` is pressed in [`windows_body`].
+    #[derive(Clone, Copy)]
+    enum StopAt {
+        Never,
+        /// Between writes: after the n-th returned.
+        After(usize),
+        /// While the n-th write is blocked in ConPTY's `WriteFile`.
+        Inside(usize),
+    }
+
+    /// The Windows metered body, as `write_frame_body_locked` runs it, with
+    /// `Stop paste` pressed at `stop`: how [`write_metered`] ended the frame,
+    /// the bytes accepted in all (the frame's and the owed close's), and what
+    /// the program received. The stand-in for ConPTY's input answers as
+    /// `aterm_pty::write_some_stoppable` does: a write whose stop flag is set
+    /// when it begins, or is set while it is blocked (the stop cancels it),
+    /// writes nothing and answers `Ok(0)`.
+    fn windows_body(frame: &[u8], stop: StopAt) -> (MeteredEnd, usize, Vec<u8>) {
         let shared = Shared::new();
         let meter = BulkMeter::new();
         let since = shared.discard_epoch();
         let mut conpty = Vec::new();
-        let mut slices = 0usize;
-        let end = write_metered(frame, &meter, |rest| {
-            let wrote = shared.write_stamped_through(rest, since, Some(&meter), |bytes| {
-                conpty.extend_from_slice(bytes);
-                Ok(bytes.len())
-            });
-            slices += 1;
-            if slices == stop_after {
+        let mut writes = 0usize;
+        let mut conpty_write = |bytes: &[u8], flag: Option<&AtomicBool>| {
+            writes += 1;
+            if matches!(stop, StopAt::Inside(n) if n == writes) {
                 meter.request_stop();
             }
-            wrote
+            if flag.is_some_and(|f| f.load(Ordering::Acquire)) {
+                return Ok(0);
+            }
+            conpty.extend_from_slice(bytes);
+            if matches!(stop, StopAt::After(n) if n == writes) {
+                meter.request_stop();
+            }
+            Ok(bytes.len())
+        };
+        let end = write_metered(frame, &meter, |rest| {
+            shared.write_stamped_through(rest, since, Some(&meter), &mut conpty_write)
         })
         .expect("an in-memory write never fails");
-        (end, conpty)
+        let owed = deliver_owed_through(&end.owed, |rest| {
+            shared.write_stamped_through(rest, since, None, &mut conpty_write)
+        });
+        let accepted = end.accepted + owed;
+        (end, accepted, conpty)
     }
 
-    /// WINDOWS: A STOP MID-PASTE STILL FINISHES IT. The cut is taken between
-    /// slices, and the writes after it — the rest of the begun character,
-    /// the closing `ESC [ 201 ~` — go through the same twin. RED under
-    /// a246be046, whose twin answered `Ok(0)` to any write once the stop was
-    /// asked: the program got the head and no close, left in an open paste.
+    /// WINDOWS: A STOP REACHES THE WRITE, AND THE PASTE STILL ENDS CLOSED.
+    /// Pressed between writes or while a write is blocked in `WriteFile`, the
+    /// stop ends the frame at the write it reaches: the twin hands that write
+    /// the frame's own stop flag, which `aterm_pty` cancels it on. The cut's
+    /// debt (the rest of the begun character, the closing `ESC [ 201 ~`)
+    /// comes back to the body, which writes it with no stop to drop it. RED
+    /// with the twin handing the write no flag: a stop inside a blocked write
+    /// is not seen until it returns, and the rest of its slice goes through
+    /// (KNOWN_ISSUES ATERM-KI-1014-6, until 2026-10-19).
     #[test]
-    fn the_windows_twin_finishes_a_stopped_paste() {
+    fn a_stop_reaches_the_windows_write_and_the_paste_ends_closed() {
         // `é` straddles the first slice boundary: its lead byte is the
         // slice's last, so the cut owes its continuation byte.
         let mut body = vec![b'p'; METERED_SLICE - PASTE_OPEN.len() - 1];
         body.extend_from_slice("\u{e9}".as_bytes());
         body.extend(vec![b'q'; 3 * METERED_SLICE]);
         let frame = bracketed(&body);
-        let (end, conpty) = windows_body(&frame, 1);
-        assert_eq!(end.owed, Vec::<u8>::new(), "nothing is left owed");
-        assert_eq!(end.accepted, conpty.len());
         let mut want = frame[..METERED_SLICE + 1].to_vec();
         want.extend_from_slice(PASTE_CLOSE);
-        assert_eq!(conpty, want, "the head, the rest of `é`, the close");
-        assert!(std::str::from_utf8(&conpty).is_ok(), "no half character");
+        for stop in [StopAt::After(1), StopAt::Inside(2)] {
+            let (end, accepted, conpty) = windows_body(&frame, stop);
+            assert_eq!(
+                end.owed,
+                [&frame[METERED_SLICE..=METERED_SLICE], PASTE_CLOSE].concat(),
+                "the write the stop reached wrote nothing; the cut's debt came back"
+            );
+            assert_eq!(conpty, want, "the head, the rest of `é`, the close");
+            assert_eq!(accepted, conpty.len());
+            assert!(std::str::from_utf8(&conpty).is_ok(), "no half character");
+        }
+        // Stopped inside the first write: nothing reached the program, and
+        // nothing is owed.
+        let (end, accepted, conpty) = windows_body(&frame, StopAt::Inside(1));
+        assert!(end.owed.is_empty());
+        assert_eq!((accepted, conpty.len()), (0, 0));
     }
 
     /// Negative control: an unstopped frame goes through the twin whole.
     #[test]
     fn the_windows_twin_writes_an_unstopped_frame_whole() {
         let frame = bracketed(&vec![b'p'; 3 * METERED_SLICE]);
-        let (end, conpty) = windows_body(&frame, usize::MAX);
+        let (end, accepted, conpty) = windows_body(&frame, StopAt::Never);
         assert_eq!(conpty, frame);
-        assert_eq!(end.accepted, frame.len());
+        assert_eq!(accepted, frame.len());
         assert!(end.owed.is_empty());
+    }
+
+    /// WINDOWS: THE CLOSE A STOP OWES WAITS FOR THE PROGRAM, AND ONLY THE TAB'S
+    /// CLOSE RELEASES IT. The program reads the paste's first slice and then
+    /// stops reading. `Stop paste` cancels the blocked second write, and the
+    /// close the cut owes is written next with no stop flag: on Windows there
+    /// is no spill to queue it in, so the session's ordered writer waits in
+    /// `WriteFile` for room for it, as it would for any later key. Pressing
+    /// `Stop paste` again reaches nothing, since the write carries no flag. The
+    /// sever cancels it (`aterm_pty::release_input_writes`). Nothing more of the
+    /// frame is written, and the delivery is not retried.
+    #[test]
+    fn the_close_a_windows_stop_owes_waits_until_a_sever_releases_it() {
+        let shared = Shared::new();
+        let meter = BulkMeter::new();
+        let since = shared.discard_epoch();
+        let frame = bracketed(&vec![b'p'; 3 * METERED_SLICE]);
+        let mut conpty = Vec::new();
+        let mut writes = Vec::new();
+        let mut conpty_write = |bytes: &[u8], flag: Option<&AtomicBool>| {
+            writes.push(flag.is_some());
+            match writes.len() {
+                // The program reads the first slice, then stops reading.
+                1 => {
+                    conpty.extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                // Blocked; `Stop paste` cancels it through the frame's flag.
+                2 => {
+                    meter.request_stop();
+                    Ok(if flag.is_some_and(|f| f.load(Ordering::Acquire)) {
+                        0
+                    } else {
+                        bytes.len()
+                    })
+                }
+                // The owed close, blocked: a second `Stop paste` cannot
+                // reach a write that carries no flag; the sever cancels it.
+                _ => {
+                    meter.request_stop();
+                    if flag.is_some_and(|f| f.load(Ordering::Acquire)) {
+                        return Ok(0);
+                    }
+                    shared.severed.store(true, Ordering::Release);
+                    Ok(0)
+                }
+            }
+        };
+        let end = write_metered(&frame, &meter, |rest| {
+            shared.write_stamped_through(rest, since, Some(&meter), &mut conpty_write)
+        })
+        .expect("an in-memory write never fails");
+        assert_eq!(end.owed, PASTE_CLOSE, "the cut owes the close");
+        let owed = deliver_owed_through(&end.owed, |rest| {
+            shared.write_stamped_through(rest, since, None, &mut conpty_write)
+        });
+        assert_eq!(
+            writes,
+            [true, true, false],
+            "the frame's writes carry its stop; the owed close's carries none"
+        );
+        assert!(
+            shared.is_severed(),
+            "only the sever ended the close's write"
+        );
+        assert_eq!(owed, 0, "the severed close wrote nothing");
+        assert_eq!(
+            conpty,
+            frame[..METERED_SLICE],
+            "the program got the head alone"
+        );
     }
 
     /// UNIX: A GIVE-UP HANDS BACK WHAT THE CUT OWES. The unix twin answers

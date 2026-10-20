@@ -754,16 +754,63 @@ pub fn session_log_cursor_model() -> Model {
 /// verdict first). `CtlTurn` is a `ctl turn` exchange arriving while the
 /// agent rests, before the settle: the exchange it starts is the next turn,
 /// so the resting one closes at once (`cw = 11`). `cw` is the word that
-/// closed the last turn (10 none yet, 11 a ctl exchange) and `cticks` how
-/// long its resting word had held.
+/// closed the last turn (10 none yet, 11 a ctl exchange, 12 the transcript)
+/// and `cticks` how long its resting word had held.
+///
+/// The transcript (phase 3B, rulings S2 and A6) adds two actions through
+/// `TurnTracker::transcript`: `TxClose`, the vendor turn's end closing the
+/// open turn when no screen step is open under it (`cw = 12`; a wall on
+/// the run stays), and `TxRefute`, the wall judge retracting the screen's
+/// wall, which disarms its settle and latches (`rf`) until the screen's
+/// word moves (every `See*`). `wg` is the GHOST of a wall's need taken by a
+/// transcript close.
+///
+/// WHO DISMISSED A BOX (phase 5, ruling T1). `bk` is the input bound to the
+/// open approval or question step (`step` 1 or 2): 0 none, 1 a control or
+/// harness input (who it came from and its `act=` decide `out=`, which the
+/// conformance binding reads off the real close), 2 a person's, 3 one
+/// accepted more than `STEP_ACT_MS` before now (`Age`: it dismisses
+/// nothing). `pd` is the one input in flight: 1 admitted under the open step
+/// (`Admit` while a step is open; `Accept` binds it), 2 admitted with none
+/// open (the lead: the first approval or question step to open inside
+/// `STEP_INPUT_LEAD_MS` with no close between is the step it was admitted
+/// under, so such an open turns 2 into 1), 3 accepted on the lead (the next
+/// such open binds it), 4 dead: its step closed before its acceptance, or
+/// its lead passed (`LeadOut`); its acceptance binds nothing. `SeeNextBox` is
+/// a box of another word replacing the open one (one `observe` closes box 1
+/// and opens box 2; boxes of one word are one step). A close consumes the
+/// binding; `Person` binds the open step at once (`pp`: the step's latest
+/// input is a person's). With no approval or question step open, a person's
+/// input leads as any input does (`PersonLeads`: `pl`, a person's input
+/// accepted on the lead, which the next such open binds as the person's,
+/// `bk = 2`, or `PersonLeadOut` drops once the lead passed); it is the latest
+/// input, so it takes the lead from an act accepted on it (`pd` 3 to 0), and
+/// an act accepted on the lead after it takes the lead back (`Accept` from
+/// `pd = 2`). Ghosts: `gn`, an input bound to a step that was
+/// neither open at its admission nor the lead's first; `ab`, a binding still
+/// held after it attributed a close; `ga`, a close read
+/// `approved|declined|answered` with no fresh, proven, acted input bound to
+/// it.
 ///
 /// `Buggy = 1` adds one dead mutant per law: a second turn opened without
 /// superseding the first (`AtMostOneOpenTurn`), `unknown` read as an end
 /// (`UnknownNeverClosesATurn`), `idle` closing the turn before the settle —
 /// the 220 ms mid-answer idle Codex shows (`IdleClosesOnlyAfterSettle`), the
 /// question dialog closing its turn (`DialogStaysInTurn`), a step opened
-/// under a turn that has closed (`StepsNestInTheirTurn`), and the input
-/// stall closing the turn (`StallNeverClosesATurn`).
+/// under a turn that has closed (`StepsNestInTheirTurn`), the input
+/// stall closing the turn (`StallNeverClosesATurn`), a turn end closing the
+/// turn with the wall under it (`tx_end` without its screen-step test:
+/// `WallNeedOutlivesTxClose`), and a refutation that leaves the wall's
+/// settle armed (`tx_wall` without its disarm: `RefutedWallStaysShut`).
+/// `Buggy = 2` is T1's family, apart so neither multiplies the other's
+/// space: an acceptance after box 1 closed that binds box 2
+/// (`ActBindsNextBox`: `ActNeverBindsNextBox`), a close past `STEP_ACT_MS`
+/// that reads approved (`AttributeStaleInput`: `ApprovalByObservedInput`), a
+/// person's input that leaves the harness's act bound (`ActOverPerson`:
+/// `PersonSupersedesAct`), a person's input on the lead that leaves an act
+/// waiting on it to bind the next box (`ActLeadOverPerson`, the same law: a
+/// person's lead and an act's never stand together) and a close that keeps
+/// its binding for the next box (`ActTwice`: `AttributesOnce`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn turn_tracker_model() -> Model {
@@ -780,8 +827,22 @@ pub fn turn_tracker_model() -> Model {
             var ticks = 0;
             var cw = 10;
             var cticks = 0;
+            var rf = 0;
+            var wg = 0;
+            var bk = 0;
+            var pd = 0;
+            var pp = 0;
+            var ab = 0;
+            var gn = 0;
+            var ga = 0;
+            var pl = 0;
 
             action SeeBusy {
+                bk = if (step == 1 || step == 2) { 0 } else { bk };
+                pp = if (step == 1 || step == 2) { 0 } else { pp };
+                ab = if (step == 1 || step == 2) { 0 } else { ab };
+                pd = if (step == 1 || step == 2) && pd == 1 { 4 } else { pd };
+                rf = 0;
                 turn = 1;
                 step = 0;
                 sturn = 0;
@@ -790,6 +851,12 @@ pub fn turn_tracker_model() -> Model {
                 word = 1;
             }
             action SeeDialog {
+                bk = if step == 1 { 0 } else { if (1 > step || step > 2) && pd == 3 { 1 } else { if (1 > step || step > 2) && pl == 1 { 2 } else { bk } } };
+                pp = if step == 1 || ((1 > step || step > 2) && pd == 3) { 0 } else { if (1 > step || step > 2) && pl == 1 { 1 } else { pp } };
+                ab = if step == 1 || ((1 > step || step > 2) && (pd == 3 || pl == 1)) { 0 } else { ab };
+                pd = if step == 1 && pd == 1 { 4 } else { if (1 > step || step > 2) && pd == 2 { 1 } else { if (1 > step || step > 2) && pd == 3 { 0 } else { pd } } };
+                pl = 0;
+                rf = 0;
                 turn = 1;
                 step = 2;
                 sturn = 1;
@@ -798,6 +865,25 @@ pub fn turn_tracker_model() -> Model {
                 word = 3;
             }
             action SeeBox {
+                bk = if step == 2 { 0 } else { if (1 > step || step > 2) && pd == 3 { 1 } else { if (1 > step || step > 2) && pl == 1 { 2 } else { bk } } };
+                pp = if step == 2 || ((1 > step || step > 2) && pd == 3) { 0 } else { if (1 > step || step > 2) && pl == 1 { 1 } else { pp } };
+                ab = if step == 2 || ((1 > step || step > 2) && (pd == 3 || pl == 1)) { 0 } else { ab };
+                pd = if step == 2 && pd == 1 { 4 } else { if (1 > step || step > 2) && pd == 2 { 1 } else { if (1 > step || step > 2) && pd == 3 { 0 } else { pd } } };
+                pl = 0;
+                rf = 0;
+                turn = 1;
+                step = 1;
+                sturn = 1;
+                pend = 0;
+                ticks = 0;
+                word = 4;
+            }
+            action SeeNextBox when (step == 1) {
+                bk = 0;
+                pp = 0;
+                ab = 0;
+                pd = if pd == 1 { 4 } else { pd };
+                rf = 0;
                 turn = 1;
                 step = 1;
                 sturn = 1;
@@ -806,6 +892,11 @@ pub fn turn_tracker_model() -> Model {
                 word = 4;
             }
             action SeeWall {
+                bk = if (step == 1 || step == 2) { 0 } else { bk };
+                pp = if (step == 1 || step == 2) { 0 } else { pp };
+                ab = if (step == 1 || step == 2) { 0 } else { ab };
+                pd = if (step == 1 || step == 2) && pd == 1 { 4 } else { pd };
+                rf = 0;
                 step = 3;
                 sturn = turn;
                 pend = turn;
@@ -813,6 +904,11 @@ pub fn turn_tracker_model() -> Model {
                 word = 5;
             }
             action SeeStall {
+                bk = if (step == 1 || step == 2) { 0 } else { bk };
+                pp = if (step == 1 || step == 2) { 0 } else { pp };
+                ab = if (step == 1 || step == 2) { 0 } else { ab };
+                pd = if (step == 1 || step == 2) && pd == 1 { 4 } else { pd };
+                rf = 0;
                 step = 4;
                 sturn = turn;
                 pend = 0;
@@ -820,6 +916,11 @@ pub fn turn_tracker_model() -> Model {
                 word = 6;
             }
             action SeeSurvey {
+                bk = if (step == 1 || step == 2) { 0 } else { bk };
+                pp = if (step == 1 || step == 2) { 0 } else { pp };
+                ab = if (step == 1 || step == 2) { 0 } else { ab };
+                pd = if (step == 1 || step == 2) && pd == 1 { 4 } else { pd };
+                rf = 0;
                 step = if turn == 1 { 5 } else { 0 };
                 sturn = turn;
                 pend = turn;
@@ -827,6 +928,11 @@ pub fn turn_tracker_model() -> Model {
                 word = 7;
             }
             action SeeIdle {
+                bk = if (step == 1 || step == 2) { 0 } else { bk };
+                pp = if (step == 1 || step == 2) { 0 } else { pp };
+                ab = if (step == 1 || step == 2) { 0 } else { ab };
+                pd = if (step == 1 || step == 2) && pd == 1 { 4 } else { pd };
+                rf = 0;
                 step = 0;
                 sturn = 0;
                 pend = turn;
@@ -834,6 +940,11 @@ pub fn turn_tracker_model() -> Model {
                 word = 2;
             }
             action SeeQuestion {
+                bk = if (step == 1 || step == 2) { 0 } else { bk };
+                pp = if (step == 1 || step == 2) { 0 } else { pp };
+                ab = if (step == 1 || step == 2) { 0 } else { ab };
+                pd = if (step == 1 || step == 2) && pd == 1 { 4 } else { pd };
+                rf = 0;
                 step = 0;
                 sturn = 0;
                 pend = turn;
@@ -841,6 +952,11 @@ pub fn turn_tracker_model() -> Model {
                 word = 8;
             }
             action SeeGone {
+                bk = if (step == 1 || step == 2) { 0 } else { bk };
+                pp = if (step == 1 || step == 2) { 0 } else { pp };
+                ab = if (step == 1 || step == 2) { 0 } else { ab };
+                pd = if (step == 1 || step == 2) && pd == 1 { 4 } else { pd };
+                rf = 0;
                 cw = if turn == 1 { 9 } else { cw };
                 cticks = if turn == 1 { 0 } else { cticks };
                 turn = 0;
@@ -851,6 +967,7 @@ pub fn turn_tracker_model() -> Model {
                 word = 9;
             }
             action SeeUnknown {
+                rf = 0;
                 pend = 0;
                 ticks = 0;
                 word = 0;
@@ -875,6 +992,51 @@ pub fn turn_tracker_model() -> Model {
                 ticks = 0;
                 step = if word == 5 { 3 } else { 0 };
                 sturn = 0;
+            }
+            action TxClose when (turn == 1 && (step == 0 || sturn == 0)) {
+                turn = 0;
+                cw = 12;
+                cticks = 0;
+                pend = 0;
+                ticks = 0;
+                sturn = 0;
+            }
+            action TxRefute when (step == 3) {
+                step = 0;
+                sturn = 0;
+                pend = 0;
+                ticks = 0;
+                rf = 1;
+            }
+
+            action Admit when (pd == 0) {
+                pd = if (step == 1 || step == 2) { 1 } else { 2 };
+            }
+            action Accept when (pd == 1 || pd == 2 || pd == 4) {
+                bk = if pd == 1 { 1 } else { bk };
+                pp = if pd == 1 { 0 } else { pp };
+                ab = if pd == 1 { 0 } else { ab };
+                pl = if pd == 2 { 0 } else { pl };
+                pd = if pd == 2 { 3 } else { 0 };
+            }
+            action Person when (step == 1 || step == 2) {
+                bk = 2;
+                pp = 1;
+                ab = 0;
+            }
+            action PersonLeads when (1 > step || step > 2) {
+                pl = 1;
+                pd = if pd == 3 { 0 } else { pd };
+            }
+            action Age when (bk == 1 || bk == 2) {
+                bk = 3;
+                pp = 0;
+            }
+            action LeadOut when (pd == 2 || pd == 3) {
+                pd = if pd == 2 { 4 } else { 0 };
+            }
+            action PersonLeadOut when (pl == 1) {
+                pl = 0;
             }
 
             action SecondTurn when (Buggy == 1 && turn == 1 && extra == 0) {
@@ -923,6 +1085,60 @@ pub fn turn_tracker_model() -> Model {
                 ticks = 0;
                 word = 6;
             }
+            action TxCloseTakesWall when (Buggy == 1 && turn == 1 && step == 3 && sturn == 1) {
+                turn = 0;
+                cw = 12;
+                cticks = 0;
+                step = 0;
+                sturn = 0;
+                pend = 0;
+                ticks = 0;
+                wg = 1;
+            }
+            action RefuteKeepsSettle when (Buggy == 1 && step == 3 && pend == 1) {
+                step = 0;
+                sturn = 0;
+                rf = 1;
+            }
+
+            action ActBindsNextBox when (Buggy == 2 && pd == 4 && step == 1) {
+                bk = 1;
+                pp = 0;
+                ab = 0;
+                pd = 0;
+                gn = 1;
+            }
+            action AttributeStaleInput when (Buggy == 2 && bk == 3 && step == 1) {
+                bk = 0;
+                pp = 0;
+                ab = 0;
+                ga = 1;
+                pd = if pd == 1 { 4 } else { pd };
+                rf = 0;
+                turn = 1;
+                step = 0;
+                sturn = 0;
+                pend = 0;
+                ticks = 0;
+                word = 1;
+            }
+            action ActOverPerson when (Buggy == 2 && bk == 1 && (step == 1 || step == 2)) {
+                pp = 1;
+            }
+            action ActLeadOverPerson when (Buggy == 2 && (1 > step || step > 2) && pd == 3) {
+                pl = 1;
+            }
+            action ActTwice when (Buggy == 2 && step == 1 && ab == 0 && (bk == 1 || bk == 2)) {
+                ab = 1;
+                pd = if pd == 1 { 4 } else { pd };
+                rf = 0;
+                turn = 1;
+                step = 1;
+                sturn = 1;
+                pend = 0;
+                ticks = 0;
+                word = 4;
+            }
 
             invariant AtMostOneOpenTurn: turn + extra <= 1;
             invariant UnknownNeverClosesATurn: cw > 0;
@@ -930,6 +1146,12 @@ pub fn turn_tracker_model() -> Model {
             invariant DialogStaysInTurn: 3 > word || word > 3 || turn == 1;
             invariant StepsNestInTheirTurn: sturn <= turn && sturn <= step;
             invariant StallNeverClosesATurn: 6 > cw || cw > 6;
+            invariant WallNeedOutlivesTxClose: wg == 0;
+            invariant RefutedWallStaysShut: rf == 0 || ((3 > step || step > 3) && pend == 0);
+            invariant ActNeverBindsNextBox: gn == 0;
+            invariant AttributesOnce: ab == 0;
+            invariant ApprovalByObservedInput: ga == 0;
+            invariant PersonSupersedesAct: (bk == 2 || pp == 0) && (pl == 0 || 3 > pd || pd > 3);
         }
     }
 }
@@ -1494,6 +1716,802 @@ pub fn session_log_claims_model() -> Model {
             invariant ProvenLabelFirst: sh == hl;
             invariant RaiserKeepsItsNeed: hlive <= hn;
             bound StateBounded: obs <= 1 && live <= 1 && hn <= 1 && cn <= 1 && en <= 1 && hlive <= 1 && top <= 2 && lab <= 2 && tl <= 2 && lby <= 2 && hl <= 1 && sh <= 1 && vany <= 2 && tv <= 1 && hadt <= 1 && vby <= 2 && hv <= 1 && hadh <= 1;
+        }
+    }
+}
+
+/// SESSION LOG FOLD (phase 3B, plan §4.2 as amended by A31 and ruling S13):
+/// what `aterm_slog::Fold::apply` and the clause make of one agent run,
+/// its one turn, one need-bearing step of that turn (a wall the screen saw),
+/// one claimed need and one label, as records arrive and time passes.
+///
+/// Variables: `r` the run and `t` the turn (0 none, 1 open, 2 closed); `ow`
+/// the outcome the fold holds for the closed turn (0 while it is open, 1
+/// `done`, 2 `wall:*`, 3 `gone`) and `oc` the rank of the record that set it
+/// (`Conf::rank`: 3 strong, 4 exact); `gw`/`gc` the GHOST of the outcome
+/// rulings S9 and A5 give over every close and amend of the turn: the close's
+/// own, unless an EXACT amend (the transcript, on a measured build) refines
+/// it, before the close or after; a strong amend never does; `nd`, `nw`,
+/// `ng` the session totals' `done`, `walled` and `other` buckets; `s` the
+/// step (0 none, 1 open, 2 closed), `nc` the rank of its need in the fold (0
+/// when none) and `sg` the GHOST of the best rank that need was given (its
+/// open's, or an exact `confirmed=1`'s); `cn` a claimed need open (a `need`
+/// mark's, which raises no clause row); `top` the most urgent need (0 none,
+/// 1 the step's, 2 the claim's); `lab` a label held (abstract, A31: what
+/// `shown_label` shows while it lives) and `lx` that it expired; `cl` the
+/// clause's row (`ClauseRow`: 0 none, 1 need, 2 label, 3 step, turn or run);
+/// `dup` that a replayed record changed the fold.
+///
+/// Actions, each a real record or a real read: `OpenRun`, `OpenTurn`;
+/// `CloseDone` the screen's strong close; `AmendOutExact` an exact `out=`
+/// amend (open turn or closed); `AmendOutStrong` a strong one; `OpenStep` a
+/// strong wall step (raises its need), `ConfirmStep` an exact `confirmed=1`
+/// amend of it, `RetractStep` its close; `CloseRun` the run's close (which
+/// cascades its open turn and step `out=gone`); `MarkNeed` a claim's need;
+/// `Label` a label mark; `Expire` time passing the label's TTL; `Tick` time
+/// passing (the clause and hints read at a later `now_wall` over an
+/// unchanged fold); `Replay` a record at or below `as_of` applied again.
+///
+/// `Buggy = 1` adds dead mutants, each naming the real call it breaks
+/// (S13): `ReplayApplies` (`Fold::apply` without its `as_of` check:
+/// `Idempotent`); `StrongAmendRefines` (`on_amend` through `confidence_law`
+/// in place of `amend_refines_out`, a strong amend overruling the screen's
+/// close: the fold half of S9's `PartialNeverOverrules`) and
+/// `LowerAmendWins` (an amend's `out=` written past the law) and
+/// `ConfirmNoUpgrade` (`need_takes_amend` answering no:
+/// `ConfidenceMonotone`); `RebucketWithoutDecrement` (`turn_out_rebucket`
+/// that only adds: `TotalsMatchClosedTurns`); `RetractKeepsNeed`
+/// (`on_close` keeping a closed step's need: `NeedLivesWithItsStep`);
+/// `TickRaisesNeed` (`clause` at a later `now_wall` naming a need the fold
+/// does not hold: `SilenceRaisesNoNeed`); `CloseRunLeavesTurn` (`on_close`
+/// without its child walk: `OpenPathWellNested`); `ExpiredLabelShown`
+/// (`shown_label` without its `until` test) and `LabelHidesNeed`
+/// (`clause_of` with the label row above the need row: `ClauseNeedFirst`).
+/// The claims laws (`ClaimsRankLast`, `LabelOnlyFromTrusted`,
+/// `ProvenLabelFirst`) are `SessionLogClaims`' and not restated. Tier-1:
+/// aterm-slog's `fold_conforms_to_derived_model`.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn session_log_fold_model() -> Model {
+    aterm_spec::ty_model! {
+        SessionLogFold {
+            const Buggy = 0;
+            var r = 0;
+            var t = 0;
+            var ow = 0;
+            var oc = 0;
+            var gw = 0;
+            var gc = 0;
+            var nd = 0;
+            var nw = 0;
+            var ng = 0;
+            var s = 0;
+            var nc = 0;
+            var sg = 0;
+            var cn = 0;
+            var top = 0;
+            var lab = 0;
+            var lx = 0;
+            var cl = 0;
+            var dup = 0;
+
+            action OpenRun when (r == 0) {
+                r = 1;
+                cl = if top == 1 { 1 } else { if lab == 1 && lx == 0 { 2 } else { 3 } };
+            }
+            action OpenTurn when (r == 1 && t == 0) {
+                t = 1;
+            }
+            action CloseDone when (t == 1) {
+                t = 2;
+                ow = if gc == 4 { gw } else { 1 };
+                oc = if gc == 4 { 4 } else { 3 };
+                gw = if gc == 4 { gw } else { 1 };
+                gc = if gc == 4 { 4 } else { 3 };
+                nd = if gc == 4 { 0 } else { 1 };
+                nw = if gc == 4 { 1 } else { 0 };
+                s = if s == 1 { 2 } else { s };
+                nc = 0;
+                top = if cn == 1 { 2 } else { 0 };
+                cl = if lab == 1 && lx == 0 { 2 } else { if r == 1 { 3 } else { 0 } };
+            }
+            action AmendOutExact when (1 <= t && gc <= 3) {
+                gw = 2;
+                gc = 4;
+                ow = if t == 2 { 2 } else { 0 };
+                oc = if t == 2 { 4 } else { 0 };
+                nd = 0;
+                ng = 0;
+                nw = if t == 2 { 1 } else { 0 };
+            }
+            action AmendOutStrong when (1 <= t) {
+                t = t;
+            }
+            action OpenStep when (t == 1 && s == 0) {
+                s = 1;
+                nc = 3;
+                sg = 3;
+                top = 1;
+                cl = 1;
+            }
+            action ConfirmStep when (s == 1 && nc == 3) {
+                nc = 4;
+                sg = 4;
+            }
+            action RetractStep when (s == 1) {
+                s = 2;
+                nc = 0;
+                top = if cn == 1 { 2 } else { 0 };
+                cl = if lab == 1 && lx == 0 { 2 } else { if r == 1 { 3 } else { 0 } };
+            }
+            action CloseRun when (r == 1) {
+                r = 2;
+                t = if t == 1 { 2 } else { t };
+                ow = if t == 1 { if gc == 4 { gw } else { 3 } } else { ow };
+                oc = if t == 1 { if gc == 4 { 4 } else { 3 } } else { oc };
+                gw = if t == 1 { if gc == 4 { gw } else { 3 } } else { gw };
+                gc = if t == 1 { if gc == 4 { 4 } else { 3 } } else { gc };
+                nw = if t == 1 { if gc == 4 { 1 } else { 0 } } else { nw };
+                ng = if t == 1 { if gc == 4 { 0 } else { 1 } } else { ng };
+                s = if s == 1 { 2 } else { s };
+                nc = 0;
+                top = if cn == 1 { 2 } else { 0 };
+                cl = if lab == 1 && lx == 0 { 2 } else { 0 };
+            }
+            action MarkNeed when (cn == 0) {
+                cn = 1;
+                top = if s == 1 { 1 } else { 2 };
+            }
+            action Label when (lab == 0 || lx == 1) {
+                lab = 1;
+                lx = 0;
+                cl = if top == 1 { 1 } else { 2 };
+            }
+            action Expire when (lab == 1 && lx == 0) {
+                lx = 1;
+                cl = if top == 1 { 1 } else { if r == 1 { 3 } else { 0 } };
+            }
+            action Tick {
+                t = t;
+            }
+            action Replay {
+                dup = dup;
+            }
+
+            action ReplayApplies when (Buggy == 1 && t == 2 && dup == 0) {
+                dup = 1;
+            }
+            action StrongAmendRefines when (Buggy == 1 && t == 2 && oc == 3) {
+                ow = 2;
+                nd = 0;
+                ng = 0;
+                nw = 1;
+            }
+            action LowerAmendWins when (Buggy == 1 && t == 2 && oc == 4) {
+                oc = 3;
+            }
+            action ConfirmNoUpgrade when (Buggy == 1 && s == 1 && nc == 3) {
+                sg = 4;
+            }
+            action RebucketWithoutDecrement when (Buggy == 1 && t == 2 && gc == 3) {
+                gw = 2;
+                gc = 4;
+                ow = 2;
+                oc = 4;
+                nw = 1;
+            }
+            action RetractKeepsNeed when (Buggy == 1 && s == 1) {
+                s = 2;
+            }
+            action TickRaisesNeed when (Buggy == 1 && r == 1 && (top == 0 || top == 2)) {
+                cl = 1;
+            }
+            action CloseRunLeavesTurn when (Buggy == 1 && r == 1 && t == 1) {
+                r = 2;
+            }
+            action ExpiredLabelShown when (Buggy == 1 && lab == 1 && lx == 0 && cl == 2) {
+                lx = 1;
+            }
+            action LabelHidesNeed when (Buggy == 1 && top == 1 && (lab == 0 || lx == 1)) {
+                lab = 1;
+                lx = 0;
+                cl = 2;
+            }
+
+            invariant Idempotent: dup == 0;
+            invariant ConfidenceMonotone: (t <= 1 || (ow == gw && oc == gc)) && (s == 0 || s == 2 || nc == sg);
+            invariant TotalsMatchClosedTurns: nd + nw + ng == (if t == 2 { 1 } else { 0 }) && nw == (if t == 2 && ow == 2 { 1 } else { 0 }) && nd == (if t == 2 && ow == 1 { 1 } else { 0 });
+            invariant NeedLivesWithItsStep: (s == 1 && nc > 0) || ((s == 0 || s == 2) && nc == 0);
+            invariant SilenceRaisesNoNeed: cl == 0 || cl > 1 || top == 1;
+            invariant OpenPathWellNested: (t == 0 || t == 2 || r == 1) && (s == 0 || s == 2 || t == 1);
+            invariant ClauseNeedFirst: (top == 0 || top == 2 || cl == 1) && (cl == 0 || cl == 1 || cl == 3 || (lab == 1 && lx == 0));
+            bound StateBounded: r <= 2 && t <= 2 && ow <= 3 && oc <= 4 && gw <= 3 && gc <= 4 && nd <= 2 && nw <= 2 && ng <= 2 && s <= 2 && nc <= 4 && sg <= 4 && cn <= 1 && top <= 2 && lab <= 1 && lx <= 1 && cl <= 3 && dup <= 1;
+        }
+    }
+}
+
+/// TRANSCRIPT JOIN (phase 3B, plan §4.3 as amended by rulings S1, S2, S4,
+/// S9 and S13): what `aterm_slog::TurnTracker::transcript` makes of one
+/// agent run's vendor turns while the screen drives the same tracker.
+///
+/// Variables: `wm` the join holds a watermark (bound to the file); `pt` the
+/// source is `partial` (an unmeasured build) rather than `on`; `lt` the open
+/// turn (0 none, 1 open with no `vref`, 2 open with one); `old` that it
+/// opened outside a prompt's attribution window (5 s before now); `lc` that
+/// the newest closed turn could take a late prompt (no `vref`, opened within
+/// the window); `lv` that it could take one dated near its own open (no
+/// `vref`, this run's: `lc` without the window's clause, for a prompt row
+/// dated in the past); `vm` what the running vendor turn maps to (0 none, 1 the open
+/// turn, 2 a closed turn, 3 nothing: a partial build with no turn to attach)
+/// and `ve` that its end (a turn end, or Esc's interrupt) was read; `vo` that
+/// the prompt of a vendor turn mapped to nothing is older than the window;
+/// `ss` the screen's step under the open turn
+/// (0 none, 1 a box, 2 a wall), `wr` a wall on the run, `pend` the wall's
+/// settle armed, `wd` the screen's word resting (idle: a settle armed on any
+/// open turn), `rf` the refuted latch, `ts` the transcript steps open (tool
+/// and subagent, up to two here).
+///
+/// `g` is ONE GHOST, the first wrong record the real calls appended (0:
+/// none; one variable, not eight, so the mutants' space stays small): 1 a
+/// second open turn; 2 a `confirmed=` or `vref=` the screen wrote; 3 a row
+/// at or below the watermark applied again; 4 a turn the transcript opened
+/// dated before the run's open or the adoption (S1); 5 a prompt attached to
+/// a turn opened more than 5 s from it, either side (S13); 6 a transcript
+/// close that took a screen box with it (S4); 7 one that took the screen's
+/// wall, its need gone (S2); 8 a partial record that closed a turn or
+/// screen node or changed a held outcome (S9); 9 a prompt that named any
+/// turn but the nearer one that could take it (the newest closed turn,
+/// when the prompt is dated nearer its open than the open turn's).
+///
+/// Actions: the screen's `ScreenBusy` (opens a turn, ends any step; a
+/// vendor turn still running on the turn the screen closed continues into
+/// it, `cont=`; one mapped to nothing whose prompt came within the window
+/// is the new turn's, `vref=`), `ScreenBox`, `ScreenWall` (on the turn, armed; else on the
+/// run), `ScreenRest` (the idle settle's close: the cascade takes the
+/// transcript steps), `WallRest` (the wall's settle: it continues on the
+/// run), `Age` (time passes, no settle armed); the source's `Bind` (a first
+/// read or a new file: seeded at its end, the old vendor turn forgotten),
+/// `Lapse` (a re-bind of the same file), `AdoptWithoutWatermark` (a
+/// successor adopted a carry with no `tx_` tokens), `Carry` (one with them),
+/// `SetPartial`, `SetOn`; the rows' `PromptAttach` (the open turn, in the
+/// window, takes `vref=`), `PromptShare` (a turn held by a screen step, or
+/// any on a partial build, is shared), `PromptSupersede` (any other open
+/// turn closes `out=superseded` and the vendor turn opens its own),
+/// `PromptLate` (the newest closed turn takes it), `PromptUnmapped`,
+/// `PromptOpens`; a prompt row dated in the past while a turn is open:
+/// `PromptOld` (older than the open turn by more than the window: an
+/// earlier turn's, read late, it maps to nothing) and `PromptLateNear`
+/// (dated nearer the newest closed turn's open, which takes it though a
+/// turn is open); `ToolUse` (under the open turn its vendor turn maps, else
+/// counted), `ToolResult`, `TxEndCloses` (a measured build's turn end with
+/// no screen step under the turn), `TxEndHeld` (any other: amends only),
+/// `Interrupt` (Esc's row: the vendor turn ended, no turn end follows),
+/// `Refute`, `Confirm`, `Compact` (an instant step: nothing projected);
+/// `Replay` (a row at or below the watermark) and `OldRow` (one past it,
+/// older than the floor): nothing.
+///
+/// `Buggy = 1` adds one dead mutant per broken real call:
+/// `PromptOpensBeside` (`AtMostOneOpenTurn`), `LateStepOrphan` (a
+/// `ToolUse` for a closed turn opening its step) and `RestLeavesSteps` (a
+/// settle without the cascade: `StepsUnderOpenTurn`), `ScreenConfirms`
+/// (`ConfirmedOnlyFromTranscript`), `ReplayAfterLapse` (a lapsed watch
+/// re-emitting: `NoReplay`), `ReplayFromProcess` (a floor of the process
+/// start alone: `NoTurnBeforeRunOpen`), `AttachEarly`
+/// (`AttachOnlyWithinWindow`), `OldPromptAttaches` (an old prompt taken by
+/// the turn opened after its window: `AttachOnlyWithinWindow`),
+/// `LateNamesOpen` (a prompt dated near the closed turn's open taken by the
+/// open turn: `PromptNamesNearestTurn`), `MergeClosesBox`
+/// (`TxNeverClosesScreenStep`), `TxCloseTakesWall`
+/// (`WallNeedOutlivesTxClose`), `RefuteLeavesSettle`
+/// (`RefutedWallStaysShut`) and `PartialCloses` (`PartialNeverOverrules`).
+/// Tier-1: aterm-slog's `transcript_join_conforms_to_derived_model`.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn transcript_join_model() -> Model {
+    aterm_spec::ty_model! {
+        TranscriptJoin {
+            const Buggy = 0;
+            var wm = 0;
+            var pt = 0;
+            var lt = 0;
+            var old = 0;
+            var lc = 0;
+            var lv = 0;
+            var vm = 0;
+            var ve = 0;
+            var vo = 0;
+            var ss = 0;
+            var wr = 0;
+            var pend = 0;
+            var wd = 0;
+            var rf = 0;
+            var ts = 0;
+            var g = 0;
+
+            action ScreenBusy {
+                lt = if lt == 0 { if vm == 3 && ve == 0 && vo == 0 { 2 } else { 1 } } else { lt };
+                old = if lt == 0 { 0 } else { old };
+                vm = if lt == 0 && ve == 0 && (vm == 2 || (vm == 3 && vo == 0)) { 1 } else { vm };
+                ss = 0;
+                wr = 0;
+                pend = 0;
+                wd = 0;
+                rf = 0;
+            }
+            action ScreenBox when (lt > 0 && ss == 0 && wr == 0) {
+                ss = 1;
+                wd = 0;
+                rf = 0;
+            }
+            action ScreenWall when (ss == 0 && wr == 0) {
+                ss = if lt == 0 { 0 } else { 2 };
+                wr = if lt == 0 { 1 } else { 0 };
+                pend = if lt == 0 { 0 } else { 1 };
+                wd = 0;
+                rf = 0;
+            }
+            action ScreenRest when (lt > 0 && ss == 0 && pend == 0) {
+                lt = 0;
+                lc = if lt == 1 && old == 0 { 1 } else { 0 };
+                lv = if lt == 1 { 1 } else { 0 };
+                old = 0;
+                ts = 0;
+                vm = if vm == 1 { 2 } else { vm };
+                wr = 0;
+                wd = 1;
+                rf = 0;
+            }
+            action WallRest when (lt > 0 && ss == 2 && pend == 1) {
+                lt = 0;
+                lc = if lt == 1 && old == 0 { 1 } else { 0 };
+                lv = if lt == 1 { 1 } else { 0 };
+                old = 0;
+                ts = 0;
+                vm = if vm == 1 { 2 } else { vm };
+                ss = 0;
+                wr = 1;
+                pend = 0;
+            }
+            action Age when (pend == 0 && (wd == 0 || lt == 0)) {
+                old = if lt == 0 { 0 } else { 1 };
+                lc = 0;
+                vo = if vm == 3 { 1 } else { 0 };
+            }
+
+            action Bind {
+                wm = 1;
+                vm = 0;
+                ve = 0;
+                vo = 0;
+            }
+            action Lapse when (wm == 1) {
+                wm = 1;
+            }
+            action AdoptWithoutWatermark {
+                wm = 0;
+                vm = 0;
+                ve = 0;
+                vo = 0;
+                rf = 0;
+            }
+            action Carry {
+                wm = wm;
+            }
+            action SetPartial when (pt == 0) {
+                pt = 1;
+            }
+            action SetOn when (pt == 1) {
+                pt = 0;
+            }
+
+            action PromptAttach when (wm == 1 && lt == 1 && old == 0) {
+                lt = 2;
+                vm = 1;
+                ve = 0;
+                vo = 0;
+            }
+            action PromptShare when (wm == 1 && (lt == 2 || (lt == 1 && old == 1)) && (ss > 0 || pt == 1)) {
+                vm = 1;
+                ve = 0;
+                vo = 0;
+            }
+            action PromptSupersede when (wm == 1 && (lt == 2 || (lt == 1 && old == 1)) && ss == 0 && pt == 0) {
+                lt = 2;
+                old = 0;
+                lc = 0;
+                lv = if lt == 1 { 1 } else { 0 };
+                ts = 0;
+                vm = 1;
+                ve = 0;
+                vo = 0;
+            }
+            action PromptLate when (wm == 1 && lt == 0 && lc == 1) {
+                lc = 0;
+                lv = 0;
+                vm = 2;
+                ve = 0;
+                vo = 0;
+            }
+            action PromptOld when (wm == 1 && lt > 0) {
+                vm = 3;
+                ve = 0;
+                vo = 1;
+            }
+            action PromptLateNear when (wm == 1 && lt > 0 && lv == 1) {
+                lc = 0;
+                lv = 0;
+                vm = 2;
+                ve = 0;
+                vo = 0;
+            }
+            action PromptUnmapped when (wm == 1 && lt == 0 && lc == 0 && pt == 1) {
+                vm = 3;
+                ve = 0;
+                vo = 0;
+            }
+            action PromptOpens when (wm == 1 && lt == 0 && lc == 0 && pt == 0) {
+                lt = 2;
+                old = 0;
+                vm = 1;
+                ve = 0;
+                vo = 0;
+            }
+            action ToolUse when (wm == 1 && ts <= 1) {
+                ts = if vm == 1 { ts + 1 } else { ts };
+            }
+            action ToolResult when (wm == 1 && ts > 0) {
+                ts = ts - 1;
+            }
+            action TxEndCloses when (wm == 1 && vm == 1 && ve == 0 && ss == 0 && pt == 0) {
+                lt = 0;
+                lc = if lt == 1 && old == 0 { 1 } else { 0 };
+                lv = if lt == 1 { 1 } else { 0 };
+                old = 0;
+                ts = 0;
+                vm = 2;
+                ve = 1;
+                vo = 0;
+            }
+            action TxEndHeld when (wm == 1 && vm > 0 && ve == 0 && (vm > 1 || ss > 0 || pt == 1)) {
+                ve = 1;
+            }
+            action Interrupt when (wm == 1 && vm > 0 && ve == 0) {
+                ve = 1;
+            }
+            action Refute when (wm == 1 && pt == 0 && (ss == 2 || wr == 1)) {
+                ss = 0;
+                wr = 0;
+                pend = 0;
+                rf = 1;
+            }
+            action Confirm when (wm == 1 && pt == 0 && (ss == 2 || wr == 1)) {
+                wm = 1;
+            }
+            action Replay when (wm == 1) {
+                wm = 1;
+            }
+            action OldRow when (wm == 1) {
+                wm = 1;
+            }
+            action Compact when (wm == 1) {
+                wm = 1;
+            }
+
+            action PromptOpensBeside when (Buggy == 1 && g == 0 && wm == 1 && lt > 0 && ss == 0 && pt == 0) {
+                lt = 2;
+                vm = 1;
+                ve = 0;
+                vo = 0;
+                g = 1;
+            }
+            action LateStepOrphan when (Buggy == 1 && g == 0 && wm == 1 && lt == 0 && vm == 2 && ts == 0) {
+                ts = 1;
+            }
+            action RestLeavesSteps when (Buggy == 1 && g == 0 && lt > 0 && ts > 0 && ss == 0 && pend == 0) {
+                lt = 0;
+                lc = 0;
+                lv = if lt == 1 { 1 } else { 0 };
+                old = 0;
+                vm = if vm == 1 { 2 } else { vm };
+                wr = 0;
+                wd = 1;
+                rf = 0;
+            }
+            action ScreenConfirms when (Buggy == 1 && g == 0 && (ss == 2 || wr == 1)) {
+                g = 2;
+            }
+            action ReplayAfterLapse when (Buggy == 1 && g == 0 && wm == 1) {
+                g = 3;
+            }
+            action ReplayFromProcess when (Buggy == 1 && g == 0 && wm == 1 && lt == 0) {
+                lt = 2;
+                old = 0;
+                vm = 1;
+                ve = 0;
+                vo = 0;
+                g = 4;
+            }
+            action AttachEarly when (Buggy == 1 && g == 0 && wm == 1 && lt == 1 && old == 1) {
+                lt = 2;
+                vm = 1;
+                ve = 0;
+                vo = 0;
+                g = 5;
+            }
+            action OldPromptAttaches when (Buggy == 1 && g == 0 && wm == 1 && lt == 1 && old == 0) {
+                lt = 2;
+                vm = 1;
+                ve = 0;
+                vo = 0;
+                g = 5;
+            }
+            action LateNamesOpen when (Buggy == 1 && g == 0 && wm == 1 && lt == 1 && lv == 1) {
+                lt = 2;
+                vm = 1;
+                ve = 0;
+                vo = 0;
+                g = 9;
+            }
+            action MergeClosesBox when (Buggy == 1 && g == 0 && wm == 1 && pt == 0 && ss == 1 && (lt == 2 || old == 1)) {
+                lt = 2;
+                old = 0;
+                lc = 0;
+                lv = if lt == 1 { 1 } else { 0 };
+                ss = 0;
+                ts = 0;
+                vm = 1;
+                ve = 0;
+                vo = 0;
+                g = 6;
+            }
+            action TxCloseTakesWall when (Buggy == 1 && g == 0 && wm == 1 && pt == 0 && vm == 1 && ve == 0 && ss == 2) {
+                lt = 0;
+                lc = 0;
+                lv = if lt == 1 { 1 } else { 0 };
+                old = 0;
+                ss = 0;
+                pend = 0;
+                ts = 0;
+                vm = 2;
+                ve = 1;
+                vo = 0;
+                g = 7;
+            }
+            action RefuteLeavesSettle when (Buggy == 1 && g == 0 && wm == 1 && pt == 0 && ss == 2 && pend == 1) {
+                ss = 0;
+                rf = 1;
+            }
+            action PartialCloses when (Buggy == 1 && g == 0 && wm == 1 && pt == 1 && vm == 1 && ve == 0 && ss == 0) {
+                lt = 0;
+                lc = 0;
+                lv = if lt == 1 { 1 } else { 0 };
+                old = 0;
+                ts = 0;
+                vm = 2;
+                ve = 1;
+                vo = 0;
+                g = 8;
+            }
+
+            invariant AtMostOneOpenTurn: 1 > g || g > 1;
+            invariant StepsUnderOpenTurn: ts == 0 || lt > 0;
+            invariant ConfirmedOnlyFromTranscript: 2 > g || g > 2;
+            invariant NoReplay: 3 > g || g > 3;
+            invariant NoTurnBeforeRunOpen: 4 > g || g > 4;
+            invariant AttachOnlyWithinWindow: 5 > g || g > 5;
+            invariant TxNeverClosesScreenStep: 6 > g || g > 6;
+            invariant WallNeedOutlivesTxClose: 7 > g || g > 7;
+            invariant RefutedWallStaysShut: rf == 0 || (ss <= 1 && pend == 0 && wr == 0);
+            invariant PartialNeverOverrules: 8 > g || g > 8;
+            invariant PromptNamesNearestTurn: 9 > g || g > 9;
+            bound StateBounded: lt <= 2 && lv <= 1 && vm <= 3 && vo <= 1 && ss <= 2 && ts <= 2 && g <= 9;
+        }
+    }
+}
+
+/// SESSION LOG MAIL LINK (phase 5, plan 5D-5; rulings T10, T11, T36, T39;
+/// design §2.6, DESIGN:203-207): the heuristic mail → turn link
+/// `aterm_slog::Fold::apply` makes as a session's mail and turns arrive and
+/// time passes (`aterm_slog::mail_link_of`, `fold_mail.rs`).
+///
+/// Variables: `cands` the delivered `kind=task` mails waiting for a turn
+/// inside the window (the fold's waiting list, 0..2); `old` one waiting past
+/// the window (still listed until a turn or a person drops it); `t` the
+/// newest turn (0 none, 1 open, 2 closed); `lk` it holds a link and `lc` the
+/// link's confidence (0 none, 1 heuristic, 2 any other); `ex` it names its
+/// cause; `th` it is a person's; `amb` some turn found mail ambiguous (the
+/// totals' `mail_amb=`, T10c). GHOSTS, what the walk knows of the mails
+/// themselves: `hm` a task mail inside the window that a person's act took
+/// off the list; `notes` a note (any kind but `task`) inside the window
+/// since the last person's act; `lm` a mail inside the window already linked
+/// (heuristically or by an explicit `cause=`) since then; and the breaks:
+/// `ga` a link to a mail a person's act took, `gw` to one past the window,
+/// `g2` to one already linked, `gn` to a note, `gm` a link made among two or
+/// more.
+///
+/// Actions, each a real record or time: `TaskMail`, `NoteMail` (`mail
+/// dir=in`); `Human` (a `human` mark: the person's input, since 5D-4 also
+/// the first after mail that reached the program, T39); `HumanNoReach` (a
+/// `human reached=0` mark: a burst's first gesture reached no program, a
+/// view scroll or a selection; it answers nothing, so every mail still
+/// waits); `Age` (time past the window of every mail so
+/// far); `OpenTurn` (a turn of `ctl`, the harness or the screen, no cause:
+/// links the one waiting mail, counts two as ambiguous); `OpenCausedTurn`
+/// (`cause=`: no heuristic link; the mail it names, the newest waiting one,
+/// is taken); `OpenPersonTurn` (`by=human`: no link, every waiting mail
+/// taken); `CloseTurn`.
+///
+/// Laws: `HeuristicStaysHeuristic` (a link is always `~`, never the turn's
+/// own confidence); `ExplicitCauseWins`; `NoLinkAcrossHuman` (no link to a
+/// mail a person's act stands after, and a person's turn links none);
+/// `LinkWithinWindow`; `OneMailOneTurn`; `OnlyTaskLinks`; and
+/// `AmbiguityLinksNone` (T10c: two waiting, none linked).
+///
+/// `Buggy = 1` adds one dead mutant per law, each the broken rule it names:
+/// `LinkAtTurnConf`, `LinkOverExplicit`, `LinkAcrossHuman`,
+/// `LinkPastWindow`, `MailLinksTwice`, `LinkNote` and `LinkAmongMany`.
+/// Tier-1: aterm-slog's `mail_link_conforms_to_derived_model`, its negative
+/// controls hand-built successors over the real fold (T11).
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn session_log_mail_link_model() -> Model {
+    aterm_spec::ty_model! {
+        SessionLogMailLink {
+            const Buggy = 0;
+            var cands = 0;
+            var old = 0;
+            var t = 0;
+            var lk = 0;
+            var lc = 0;
+            var ex = 0;
+            var th = 0;
+            var amb = 0;
+            var hm = 0;
+            var notes = 0;
+            var lm = 0;
+            var ga = 0;
+            var gw = 0;
+            var g2 = 0;
+            var gn = 0;
+            var gm = 0;
+
+            action TaskMail when (2 > cands) {
+                cands = cands + 1;
+            }
+            action NoteMail when (notes == 0) {
+                notes = 1;
+            }
+            action Human {
+                hm = if hm + cands > 0 { 1 } else { 0 };
+                cands = 0;
+                old = 0;
+                notes = 0;
+                lm = 0;
+            }
+            action HumanNoReach {
+                cands = cands;
+            }
+            action Age when (cands + hm + notes + lm > 0) {
+                old = if old + cands > 0 { 1 } else { 0 };
+                cands = 0;
+                hm = 0;
+                notes = 0;
+                lm = 0;
+            }
+            action OpenTurn when (t == 0 || t == 2) {
+                lk = if cands == 1 { 1 } else { 0 };
+                lc = if cands == 1 { 1 } else { 0 };
+                lm = if cands == 1 { 1 } else { lm };
+                amb = if cands == 2 { 1 } else { amb };
+                cands = 0;
+                old = 0;
+                t = 1;
+                ex = 0;
+                th = 0;
+            }
+            action OpenCausedTurn when (t == 0 || t == 2) {
+                lm = if cands > 0 { 1 } else { lm };
+                cands = if cands > 0 { cands - 1 } else { 0 };
+                old = 0;
+                lk = 0;
+                lc = 0;
+                t = 1;
+                ex = 1;
+                th = 0;
+            }
+            action OpenPersonTurn when (t == 0 || t == 2) {
+                hm = if hm + cands > 0 { 1 } else { 0 };
+                cands = 0;
+                old = 0;
+                notes = 0;
+                lm = 0;
+                lk = 0;
+                lc = 0;
+                t = 1;
+                ex = 0;
+                th = 1;
+            }
+            action CloseTurn when (t == 1) {
+                t = 2;
+            }
+            action LinkAtTurnConf when (Buggy == 1 && (t == 0 || t == 2) && cands == 1) {
+                lk = 1;
+                lc = 2;
+                lm = 1;
+                cands = 0;
+                old = 0;
+                t = 1;
+                ex = 0;
+                th = 0;
+            }
+            action LinkOverExplicit when (Buggy == 1 && (t == 0 || t == 2) && cands > 0) {
+                lk = 1;
+                lc = 1;
+                lm = 1;
+                cands = cands - 1;
+                old = 0;
+                t = 1;
+                ex = 1;
+                th = 0;
+            }
+            action LinkAcrossHuman when (Buggy == 1 && (t == 0 || t == 2) && cands == 0 && hm == 1) {
+                lk = 1;
+                lc = 1;
+                ga = 1;
+                hm = 0;
+                old = 0;
+                t = 1;
+                ex = 0;
+                th = 0;
+            }
+            action LinkPastWindow when (Buggy == 1 && (t == 0 || t == 2) && cands == 0 && old == 1) {
+                lk = 1;
+                lc = 1;
+                gw = 1;
+                old = 0;
+                t = 1;
+                ex = 0;
+                th = 0;
+            }
+            action MailLinksTwice when (Buggy == 1 && (t == 0 || t == 2) && cands == 0 && lm == 1) {
+                lk = 1;
+                lc = 1;
+                g2 = 1;
+                old = 0;
+                t = 1;
+                ex = 0;
+                th = 0;
+            }
+            action LinkNote when (Buggy == 1 && (t == 0 || t == 2) && cands == 0 && notes == 1) {
+                lk = 1;
+                lc = 1;
+                gn = 1;
+                notes = 0;
+                old = 0;
+                t = 1;
+                ex = 0;
+                th = 0;
+            }
+            action LinkAmongMany when (Buggy == 1 && (t == 0 || t == 2) && cands == 2) {
+                lk = 1;
+                lc = 1;
+                gm = 1;
+                lm = 1;
+                cands = 0;
+                old = 0;
+                t = 1;
+                ex = 0;
+                th = 0;
+            }
+
+            invariant HeuristicStaysHeuristic: lk == 0 || lc == 1;
+            invariant ExplicitCauseWins: ex == 0 || lk == 0;
+            invariant NoLinkAcrossHuman: ga == 0 && (th == 0 || lk == 0);
+            invariant LinkWithinWindow: gw == 0;
+            invariant OneMailOneTurn: g2 == 0;
+            invariant OnlyTaskLinks: gn == 0;
+            invariant AmbiguityLinksNone: gm == 0;
+            bound StateBounded: cands <= 2 && old <= 1 && t <= 2 && lk <= 1 && lc <= 2 && ex <= 1 && th <= 1 && amb <= 1 && hm <= 1 && notes <= 1 && lm <= 1 && ga <= 1 && gw <= 1 && g2 <= 1 && gn <= 1 && gm <= 1;
         }
     }
 }

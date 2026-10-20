@@ -4,8 +4,10 @@
 //! The gap to main, for a bundle whose pin is held to its repo's origin/main
 //! ([`crate::programs::BundleDef::main_gap`]: trust). Trust is cut at an origin/main
 //! commit, not from a signed release, so a pin ahead of the newest signed release can
-//! still be far behind main. A report only: it holds no group and packs nothing (a cut is
-//! a human act, candidate gate first).
+//! still be far behind main. A report only: it holds no group and packs nothing. The cut
+//! is a run of its own ([`trust_cut_commands`]), which the agent running it performs on a
+//! release-credential machine, the release and the uploads included (Trust DECISION_QUEUE
+//! D27, amended 2026-10-16).
 //!
 //! A build number counts a commit's whole ancestry, so `main's build - the pin's` is what
 //! the pin lacks only when the pin is on main. When the clone has the pin's commit (its
@@ -376,14 +378,12 @@ impl MainGap {
     }
 }
 
-/// The candidate gate (D27), run in the aterm checkout.
-pub const CANDIDATE_GATE: &str = "targo --unverified ship trust candidate";
-
 /// Trust main's cut, as trust's docs/CUTTING-A-TOOLCHAIN.md §3.9 runs it: mint, seal,
 /// stage the trust-wp drivers into a copy of the seal (the directory that is packed), run
-/// the candidate gate on that copy, and only then the archives' release, the re-pin push
-/// and the group publish. Placeholders: `<v>` (the version the mint prints), `<rev>` (the
-/// seal `promote-toolchain.sh` names).
+/// the staged pack's gates (`promote-toolchain.sh --gate-only`) and §3.9's first-step
+/// conditions on that copy (the consumer check, and for P5a the seal-line audit), and only
+/// then the archives' release, the re-pin push and the group publish. Placeholders: `<v>`
+/// (the version the mint prints), `<rev>` (the seal `promote-toolchain.sh` names).
 #[must_use]
 pub fn trust_cut_commands(main_sha: &str) -> Vec<String> {
     let c12 = short(main_sha, 12);
@@ -391,6 +391,7 @@ pub fn trust_cut_commands(main_sha: &str) -> Vec<String> {
     let mint = format!("build/pack-mint-<v>-{arm}-{c12}");
     vec![
         "# on a release-credential machine (m2, m3), in a trust worktree no other lane builds in:".into(),
+        "# §3.9's first step: this seal is cut only when DECISION_QUEUE.md's SEAL-1 holds, or for P5a SEAL-1-P5A's conditions, the seal-line audit and the consumer check among them, each checked on the staged pack below".into(),
         format!(
             "git -C $HOME/trust fetch origin && git -C $HOME/trust worktree add --detach $HOME/trust-cut-{c12} {main_sha} && cd $HOME/trust-cut-{c12}"
         ),
@@ -400,13 +401,18 @@ pub fn trust_cut_commands(main_sha: &str) -> Vec<String> {
         "scripts/mint_and_prove_seed.sh --check-only --ddc-seed \"$ORACLE\"".into(),
         "scripts/mint_and_prove_seed.sh --ddc-seed \"$ORACLE\"   # hours".into(),
         format!("RUSTUP_HOME=\"$PWD/{mint}/rustup\" scripts/promote-toolchain.sh {mint}/{arm}/stage2"),
-        "# the pack: a copy of the seal with the five trust-wp drivers in its bin/ — the directory the gate measures and the publisher packs".into(),
+        "# the pack: a copy of the seal with the five trust-wp drivers in its bin/ — the directory the publisher packs".into(),
         "SEAL=~/toolchains/trust-<rev> STAGE=~/toolchains/stage-trust-<rev>-wp".into(),
         "(cd first-party/trust-wp && RUSTC=\"$SEAL/bin/trustc\" \"$SEAL/bin/targo\" --unverified build --release --locked -p trust-wp-driver -p targo-trust-wp -p trust-wp-cli)".into(),
         "cp -ac \"$SEAL\" \"$STAGE\" && chmod u+w \"$STAGE/bin\" && (cd first-party/trust-wp/target/release && cp trust-wp trust-wp-driver trust-wp-rustc targo-trust-wp cargo-trust-wp \"$STAGE/bin/\")".into(),
-        format!("(cd ~/aterm && {CANDIDATE_GATE} --candidate \"$STAGE\")   # D27: hours; nothing below unless it exits 0 (PUBLISH-OK)"),
-        format!("scripts/publish_seed_cut.sh --pack \"$STAGE\" --mint {mint}   # asks the gate (--admits), prints the archives' release and the re-pin push"),
-        format!("scripts/publish_seed_cut.sh --pack \"$STAGE\" --mint {mint} --publish   # gh release create + git push origin seed/repin-{c12}, refused without the gate's PASS"),
+        "# the staged pack's gates: promotion's UI and tool-start gates again, on this very directory; nothing below unless each passes".into(),
+        "scripts/promote-toolchain.sh --gate-only \"$STAGE\"".into(),
+        "# then the first step's conditions on \"$STAGE\", each result committed as its evidence; nothing below unless each holds:".into(),
+        "# P5a's cut only (SEAL-1-P5A): the seal-line audit (SEAL-1 clause 4) of the deployed seal 321aaeda754's line, which its defaults name, so that commit must be in this clone (the local tag atpkg-trust-9192-seal)".into(),
+        "python3 scripts/seal_line_audit.py   # exit 0 says the record covers the seal line; the condition holds only once each PORT and MEASURE row it lists is closed by a main commit".into(),
+        "# the consumer check: aterm, ay, ty and clean, each at its origin/main, run the Rust steps of publish/config.sh's CHECK_CMD_DEFAULT with \"$STAGE\" as trust, from a scratch RUSTUP_HOME; each exits 0, or every red it shows is red under the published seal on the same tree".into(),
+        format!("scripts/publish_seed_cut.sh --pack \"$STAGE\" --mint {mint}   # prints the archives' release and the re-pin push"),
+        format!("scripts/publish_seed_cut.sh --pack \"$STAGE\" --mint {mint} --publish   # gh release create + git push origin seed/repin-{c12}"),
         "# once main contains the re-pin:".into(),
         "atpkg-publish publish-group rustc --seal \"$STAGE\" --dry-run".into(),
         "atpkg-publish publish-group rustc --seal \"$STAGE\" --upload".into(),

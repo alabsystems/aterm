@@ -1,0 +1,49 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Bash call printing `sleep 4; seq 1 80` (verbose output, `claude --verbose`) and the follow-up request too long: the output fills the screen, its call row and output rows 1-40 scrolled off into the scrollback (`line` reads them, the rows right above the screen: `claude-2.1.304-verbose-long-output-context-wall-scrollback.txt`; the call row is the first column-0 row above the screen), and the real context wall stands under rows 41 to 80 at column 5
+     41
+     42
+     43
+     44
+     45
+     46
+     47
+     48
+     49
+     50
+     51
+     52
+     53
+     54
+     55
+     56
+     57
+     58
+     59
+     60
+     61
+     62
+     63
+     64
+     65
+     66
+     67
+     68
+     69
+     70
+     71
+     72
+     73
+     74
+     75
+     76
+     77
+     78
+     79
+     80
+  ⎿  Context limit reached · /compact or /clear to continue
+
+✻ Baked for 4s · done 6:13 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)                                                                                            12899 tokens

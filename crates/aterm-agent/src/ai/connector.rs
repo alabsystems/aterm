@@ -44,6 +44,7 @@ pub struct Connector {
     /// Lowercase phrases in a failed run's error output meaning the usage limit is reached.
     pub limit_words: &'static [&'static str],
     /// Whether a lab pass has run this row's commands on a real install.
+    /// Evidence metadata, not an install or sign-in admission gate.
     pub measured: bool,
 }
 

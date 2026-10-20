@@ -225,9 +225,9 @@ impl Grid {
             return;
         }
 
-        // SU reveals genuine blank rows at the bottom — same fill-target rule
-        // as DL and the ED family.
-        self.invalidate_pending_fill_target();
+        // The rows an offloaded reflow owes stood above the rows this moves
+        // into history: it can no longer place them (`FillDebt`).
+        self.drop_fill_debt();
         self.scroll_up_storage(n);
         self.finish_scroll_up(n);
     }
@@ -665,6 +665,7 @@ impl Grid {
         if hole > 0 {
             self.storage.history_renumber_epoch =
                 self.storage.history_renumber_epoch.saturating_add(1);
+            self.lose_anchors_renumbered();
         }
     }
 
@@ -956,6 +957,7 @@ impl Grid {
         // and a selection is cleared iff it overlaps it (one anchored in
         // scrollback survives).
         self.record_row_band_move_or_poison(top_u16, bottom_u16, n, false);
+        self.anchors_band_move(top_u16, bottom_u16, -i64::try_from(n).unwrap_or(i64::MAX));
         self.damage_selection_visible_rows_ext(top_u16, bottom_u16, true);
         self.storage
             .mark_content_rows(top_u16, bottom_u16.saturating_add(1));
@@ -1049,6 +1051,9 @@ impl Grid {
         self.storage
             .presentation
             .record_absolute_row_splice(insertion_at, u64::try_from(n).unwrap_or(u64::MAX));
+        // The anchors take the splice alone: in absolute rows the region kept
+        // its keys, and the band below is its screen-row picture.
+        self.anchors_splice(insertion_at, u64::try_from(n).unwrap_or(u64::MAX));
         // On screen this is one band move: rows `0..=bottom` went up by `n`,
         // the footer did not move. The splice above carries the history
         // insertion point for absolute-row metadata; this carries the
@@ -1129,6 +1134,7 @@ impl Grid {
         // bottom `n` rows left the band; consecutive reverse indices at a
         // region top compose into one entry.
         self.record_row_band_move_or_poison(top_u16, bottom_u16, n, true);
+        self.anchors_band_move(top_u16, bottom_u16, i64::try_from(n).unwrap_or(i64::MAX));
         self.damage_selection_visible_rows_ext(top_u16, bottom_u16, true);
         self.storage
             .mark_content_rows(top_u16, bottom_u16.saturating_add(1));
@@ -1171,20 +1177,20 @@ impl Grid {
             let dst_row = row_u16(top + dst_offset);
             let src_row = row_u16(top + dst_offset + n);
             buf.fill(super::Cell::EMPTY);
-            let src_hole = if let Some(src) = self.row(src_row) {
+            let src_marks = if let Some(src) = self.row(src_row) {
                 for (i, col) in (left_usize..=right_usize).enumerate() {
                     if let Some(c) = src.get(row_u16(col)) {
                         buf[i] = *c;
                     }
                 }
-                src.has_early_wrap_hole()
+                src.end_marks()
             } else {
-                false
+                crate::RowFlags::empty()
             };
             if let Some(dst) = self.row_mut(dst_row) {
                 dst.overwrite_span(left_usize, &buf);
                 if right_usize + 1 >= cols {
-                    dst.set_early_wrap_hole(src_hole);
+                    dst.set_end_marks(src_marks);
                 }
                 // Wide char fixup at the rectangle's edges: a whole-row copy has
                 // no per-cell signal, so the `char == ' '` spacer heuristic.
@@ -1200,7 +1206,7 @@ impl Grid {
             let clear_row = row_u16(top + clear_offset);
             if let Some(r) = self.row_mut(clear_row) {
                 if right_usize + 1 >= cols {
-                    r.set_early_wrap_hole(false);
+                    r.set_end_marks(crate::RowFlags::empty());
                 }
                 for col in left_usize..=right_usize {
                     if let Some(c) = r.get_mut(row_u16(col)) {
@@ -1240,6 +1246,7 @@ impl Grid {
         // not a row translate, so the band record is poisoned and hosts see a
         // plain invalidation.
         self.storage.presentation.poison_row_band_moves();
+        self.lose_anchors();
         self.damage_selection_visible_rows_ext(top_u16, bottom_u16, true);
         self.storage
             .mark_content_rows(top_u16, bottom_u16.saturating_add(1));
@@ -1279,20 +1286,20 @@ impl Grid {
             let dst_row = row_u16(top + dst_offset);
             let src_row = row_u16(top + dst_offset - n);
             buf.fill(super::Cell::EMPTY);
-            let src_hole = if let Some(src) = self.row(src_row) {
+            let src_marks = if let Some(src) = self.row(src_row) {
                 for (i, col) in (left_usize..=right_usize).enumerate() {
                     if let Some(c) = src.get(row_u16(col)) {
                         buf[i] = *c;
                     }
                 }
-                src.has_early_wrap_hole()
+                src.end_marks()
             } else {
-                false
+                crate::RowFlags::empty()
             };
             if let Some(dst) = self.row_mut(dst_row) {
                 dst.overwrite_span(left_usize, &buf);
                 if right_usize + 1 >= cols {
-                    dst.set_early_wrap_hole(src_hole);
+                    dst.set_end_marks(src_marks);
                 }
                 // The `char == ' '` spacer heuristic, as in the up scroll.
                 dst.fixup_wide_boundary(left_usize, right_usize, cols, true);
@@ -1306,7 +1313,7 @@ impl Grid {
             let clear_row = row_u16(top + clear_offset);
             if let Some(r) = self.row_mut(clear_row) {
                 if right_usize + 1 >= cols {
-                    r.set_early_wrap_hole(false);
+                    r.set_end_marks(crate::RowFlags::empty());
                 }
                 for col in left_usize..=right_usize {
                     if let Some(c) = r.get_mut(row_u16(col)) {
@@ -1337,6 +1344,7 @@ impl Grid {
         // Row-granular band and a poisoned band record, as in
         // `scroll_region_up_margined`.
         self.storage.presentation.poison_row_band_moves();
+        self.lose_anchors();
         self.damage_selection_visible_rows_ext(top_u16, bottom_u16, true);
         self.storage
             .mark_content_rows(top_u16, bottom_u16.saturating_add(1));

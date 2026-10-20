@@ -1,0 +1,14 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of the_screen_busy_again_continues_a_running_vendor_turn, its first
+# rig (§2.5 cont row).
+bind 0
+see busy
+tx prompt v1
+see idle
+wait 1000
+see busy
+expect amend t1 turn vref=v1
+expect amend t2 turn cont=t1 by=vendor conf=exact
+expect tx mapped=t2
+tx tool c1
+expect open p1 tool par=t2

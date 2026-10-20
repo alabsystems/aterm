@@ -44,7 +44,7 @@
 //! with a skippable frame between, and every cut of a file inside a frame is
 //! refused.
 
-mod support;
+use crate::support;
 
 use std::io::{self, Read};
 
@@ -315,7 +315,7 @@ fn the_decoder_refuses_every_recorded_frame_cut_short() {
             .collect();
         cuts.sort_unstable();
         cuts.dedup();
-        for cut in cuts {
+        support::on_every_core(&cuts, |&cut| {
             let what = format!("{} cut at {cut} of {len}", r.file);
             let boundary = ends.iter().find(|e| e.0 == cut);
             match aterm(&zst[..cut]) {
@@ -329,7 +329,7 @@ fn the_decoder_refuses_every_recorded_frame_cut_short() {
                     assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof, "{what}: {e}");
                 }
             }
-        }
+        });
     }
 }
 

@@ -175,10 +175,19 @@ pub(crate) fn record(
     report: &ResetReport,
 ) {
     let payload = manual_payload(source, report);
-    timeline
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .record("modes-restored", payload.clone());
+    {
+        let mut tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
+        tl.record("modes-restored", payload.clone());
+        // The session log's `modes` mark: a person's reset is theirs; the
+        // verb's caller is not known here (the verb's reply wakes, the
+        // reader's rides its output wake).
+        let by = match source {
+            ResetSource::Menu => aterm_slog::Actor::Human,
+            ResetSource::Verb => aterm_slog::Actor::Nobody,
+        };
+        let at = tl.slog().now();
+        tl.slog_mut().observe_modes(report.reverted.len(), by, at);
+    }
     aterm_log::info!("session {sid}: manual reset: {payload}");
 }
 
@@ -533,9 +542,6 @@ mod tests {
     /// modes are still in force before the click.
     #[test]
     fn reset_terminal_menu_row_resets_the_focused_session() {
-        let _statics = crate::menu::MENU_STATICS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let sid = app.next_session_id;

@@ -161,7 +161,16 @@ fn a_recorded_probe_answers_as_the_live_one_and_tapes_each_look() {
     std::fs::create_dir_all(root.join("real")).expect("real");
     #[cfg(unix)]
     std::os::unix::fs::symlink(root.join("real"), root.join("link")).expect("link");
-    let comps = abs_components(&root.join("link").join("x").to_string_lossy()).expect("abs");
+    // The walks take a path's names below its root (on Windows, below its drive too).
+    let comps: Vec<String> = root
+        .join("link")
+        .join("x")
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
     let tape = MemoryTape::over(&Fx::os());
     let taped = tape.fx.policy_probe();
     let live = LiveProbe;

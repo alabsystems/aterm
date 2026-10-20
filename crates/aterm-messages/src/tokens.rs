@@ -71,6 +71,10 @@ pub struct ChromeSeeds {
     pub ansi: Option<AnsiHues>,
     /// The authored overrides.
     pub authored: AuthoredChrome,
+    /// The operating system's accent colour for a surface on this side of the
+    /// light/dark split (Windows' Personalization ▸ Colours), when the host
+    /// follows it: the accent wherever none is authored. `None` elsewhere.
+    pub system_accent: Option<[u8; 3]>,
     /// Where the band's ground comes from on this platform.
     pub base: BarBase,
 }
@@ -80,6 +84,8 @@ pub struct ChromeSeeds {
 pub enum AccentSource {
     /// The theme's or the config's `accent_color`.
     Authored,
+    /// The operating system's accent colour ([`ChromeSeeds::system_accent`]).
+    System,
     /// The theme's cursor, which has a colour.
     Cursor,
     /// The ANSI blue (slot 4), borrowed for a near-grey cursor.
@@ -96,6 +102,7 @@ impl AccentSource {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Authored => "authored",
+            Self::System => "system",
             Self::Cursor => "cursor",
             Self::Blue => "blue",
             Self::Cyan => "cyan",
@@ -182,6 +189,8 @@ impl ChromeTokens {
         };
         let (accent, accent_source) = if let Some(authored) = s.authored.accent {
             (authored, AccentSource::Authored)
+        } else if let Some(system) = s.system_accent {
+            (system, AccentSource::System)
         } else if !near_grey(s.cursor) {
             (s.cursor, AccentSource::Cursor)
         } else if let Some(a) = s.ansi {

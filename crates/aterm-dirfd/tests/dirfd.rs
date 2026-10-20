@@ -37,6 +37,11 @@
 //! Both implementations run against real filesystems, because every property
 //! being tested — link counts, rename atomicity, the resolution window — only
 //! exists on one.
+//!
+//! Unix only, as the crate is (`#![cfg(unix)]` in `src/lib.rs`): there is no
+//! descriptor-relative API to test elsewhere.
+
+#![cfg(unix)]
 
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
@@ -658,11 +663,8 @@ fn directory_listings_agree() {
 fn two_interleaved_streams_over_one_descriptor_each_see_every_entry() {
     const N: usize = 2000;
     let a = aterm_tempfile::tempdir().unwrap();
-    let b = aterm_tempfile::tempdir().unwrap();
-    for root in [a.path(), b.path()] {
-        for i in 0..N {
-            std::fs::write(root.join(format!("entry-{i:05}")), b"x").unwrap();
-        }
+    for i in 0..N {
+        std::fs::File::create(a.path().join(format!("entry-{i:05}"))).unwrap();
     }
 
     let fa = open_root_mine(a.path());
@@ -697,7 +699,7 @@ fn two_interleaved_streams_over_one_descriptor_each_see_every_entry() {
     assert_eq!(ln, rn, "the two streams must agree");
     assert_eq!(
         Outcome::Names(ln),
-        run_reference(b.path(), &Op::ReadDir, &mut Identities::default()),
+        run_reference(a.path(), &Op::ReadDir, &mut Identities::default()),
         "the streams must see what std sees"
     );
 }

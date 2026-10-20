@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm drive report`: what the worker said since your turn, in full, not
-//! just what is still on its screen. Claude Code runs on the alternate screen
+//! The worker's report, as `aterm drive ledger` and the loop's report count
+//! read it: what the worker said since your turn, in full, not just what is
+//! still on its screen. Claude Code runs on the alternate screen
 //! and repaints in place, so rows that scroll off are gone; the host keeps them
 //! (the alt-screen archive, read with `offscreen`), and every `turn` records
 //! where the archive stood (`history`'s `arch=<origin>:<last>`).
@@ -16,14 +17,14 @@
 //! The report opens at your turn's `❯` row: the last one whose text begins
 //! with the first [`MARKER_CHARS`] characters of the ledger's text (whitespace
 //! ignored), or a `[Pasted text #N +L lines]` row for a paste. Without a turn
-//! in the ledger it opens at the last `❯` row; `--since <origin:i>` opens after
-//! an archived row.
+//! in the ledger it opens at the last `❯` row; a [`ReportOpts::since`] mark
+//! opens after an archived row.
 //!
 //! `complete=1` says nothing was lost: the start was found, the archive is the
 //! one the mark named, the worker is on the alternate screen, no gap or
-//! eviction lies after the start and `--max-rows` held every row; otherwise
-//! `reason=` says why. A host without the archive gets the screen alone
-//! (`reason=no-archive`).
+//! eviction lies after the start, and [`ReportOpts::max_rows`] held every
+//! row; otherwise `reason=` says why. A host without the archive gets the
+//! screen alone (`reason=no-archive`).
 //!
 //! Every report is read in Claude Code's grammar: aterm reads no Codex
 //! screen (its Codex screen lane, which read a Codex worker's report in
@@ -39,10 +40,12 @@ use super::phase::transcript_end;
 use super::run::{Ctl, CtlReply, Fail, Session};
 use super::screen::parse_text_json;
 
-/// `--max-rows`' default: the most archived rows one report reads.
+/// [`ReportOpts::max_rows`]' default: the most archived rows one report reads.
 pub const DEFAULT_MAX_ROWS: usize = 8000;
-/// How many `history` records a report reads to find the newest SUBMITTED turn.
-const HISTORY_DEPTH: &str = "8";
+/// How many `history` records a report reads first to find the newest
+/// SUBMITTED turn; when they are all the window harness's own or unsubmitted
+/// it reads the whole ledger ([`Session::ledger_turn`]).
+const HISTORY_DEPTH: usize = 8;
 /// How many characters of the turn's text (whitespace aside) its `❯` row must
 /// begin with. The ledger keeps up to 512 bytes of it.
 pub const MARKER_CHARS: usize = 60;
@@ -104,11 +107,11 @@ pub(super) fn decimal(s: &str) -> Option<u64> {
 /// `report`'s knobs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReportOpts {
-    /// `--since`: start right after this archived row, not at your turn.
+    /// Start right after this archived row, not at your turn.
     pub since: Option<Mark>,
-    /// `--max-rows`: the most archived rows read.
+    /// The most archived rows read.
     pub max_rows: usize,
-    /// `--final` / `--messages`: which of the rows are printed
+    /// Which of the rows are printed
     /// ([`Report::render_view`]); the rows read are the same.
     pub view: View,
 }
@@ -263,6 +266,9 @@ pub struct LedgerTurn {
     pub id: u64,
     /// The submit verifiably landed.
     pub submitted: bool,
+    /// Who typed it (`by=`: `harness`, `ctl`, `bridge`, a sid, `-`); `-` from
+    /// a host that predates the field.
+    pub by: String,
     /// Where the archive stood when the turn started (a host that predates
     /// the archive prints none).
     pub arch: Option<Mark>,
@@ -285,12 +291,14 @@ fn parse_turn_line(line: &str) -> Option<LedgerTurn> {
     let mut turn = LedgerTurn {
         id,
         submitted: false,
+        by: "-".to_string(),
         arch: None,
         text: pct_decode(text),
     };
     for word in words {
         match word.split_once('=') {
             Some(("submitted", v)) => turn.submitted = v == "1",
+            Some(("by", v)) => turn.by = pct_decode(v),
             Some(("arch", v)) => turn.arch = Mark::parse(v),
             _ => {}
         }
@@ -300,13 +308,17 @@ fn parse_turn_line(line: &str) -> Option<LedgerTurn> {
 
 /// The turn a report starts from: the newest one whose submit landed, else
 /// the newest (a turn that never landed may sit in the composer; its mark
-/// still says where the archive stood when it was typed).
+/// still says where the archive stood when it was typed). The window
+/// harness's own turns (`by=harness`: its `keep going`, its done check, the
+/// upgrade's notice) are never it: the report answers what the worker was
+/// asked, not the harness's nudge.
 fn newest_turn(turns: Vec<LedgerTurn>) -> Option<LedgerTurn> {
+    let mut turns: Vec<LedgerTurn> = turns.into_iter().filter(|t| t.by != "harness").collect();
     let at = turns
         .iter()
         .rposition(|t| t.submitted)
         .or_else(|| turns.len().checked_sub(1))?;
-    turns.into_iter().nth(at)
+    Some(turns.swap_remove(at))
 }
 
 /// Decode the control protocol's `%XX` escape: the wire's one TOTAL decoder,
@@ -714,15 +726,14 @@ fn assess(
 }
 
 impl<C: Ctl> Session<'_, C> {
-    /// `aterm drive report`: what the worker said since your newest submitted
-    /// turn (or `--since`), the archive's rows and the screen's joined (see
-    /// the module doc).
+    /// What the worker said since your newest submitted turn (or
+    /// [`ReportOpts`]'s `since`), the archive's rows and the screen's joined
+    /// (see the module doc).
     pub fn report(&mut self, opts: &ReportOpts) -> Result<Report, String> {
         self.gather_report(opts).map_err(String::from)
     }
 
-    /// [`Self::report`], a request not served told apart (`watch --report`
-    /// rides it out).
+    /// [`Self::report`], a request not served told apart.
     pub(super) fn gather_report(&mut self, opts: &ReportOpts) -> Result<Report, Fail> {
         let (marker, turn, text, mark) = match opts.since {
             Some(since) => (Marker::Since, None, None, Some(since)),
@@ -759,12 +770,30 @@ impl<C: Ctl> Session<'_, C> {
         ))
     }
 
-    /// The newest submitted turn in the ledger (`history 8`); `None` when there
-    /// is none, or the host has no `history`.
+    /// The turn a report starts from ([`newest_turn`]); `None` when there is
+    /// none, or the host has no `history`. The newest [`HISTORY_DEPTH`]
+    /// records first (`history 8`): a submitted one not the harness's ends
+    /// the search there. A window of only the harness's own turns (one row
+    /// per `keep going`, done check and `/usage`) or unsubmitted ones reads
+    /// the whole ledger (`history`, at most 512 records), so a run of them
+    /// since the manager's turn never sends the report to the newest `❯`
+    /// row — the harness's own.
     fn ledger_turn(&mut self) -> Result<Option<LedgerTurn>, Fail> {
-        let r = self.call(&["history", HISTORY_DEPTH])?;
+        let depth = HISTORY_DEPTH.to_string();
+        let Some(near) = self.history_read(&["history", &depth])? else {
+            return Ok(None);
+        };
+        if near.len() < HISTORY_DEPTH || near.iter().any(|t| t.submitted && t.by != "harness") {
+            return Ok(newest_turn(near));
+        }
+        Ok(self.history_read(&["history"])?.and_then(newest_turn))
+    }
+
+    /// One `history` read's records; `None` from a host without the verb.
+    fn history_read(&mut self, args: &[&str]) -> Result<Option<Vec<LedgerTurn>>, Fail> {
+        let r = self.call(args)?;
         if r.ok() {
-            return Ok(newest_turn(parse_history(&r.stdout)));
+            return Ok(Some(parse_history(&r.stdout)));
         }
         if !self.unserved(&r) && without_verb(&r) {
             return Ok(None);

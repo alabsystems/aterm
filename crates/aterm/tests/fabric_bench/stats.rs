@@ -95,10 +95,10 @@ pub fn row(what: &str, values: &[f64]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn quantiles_are_nearest_rank_values_that_were_measured() {
+        use super::*;
+
         let values: Vec<f64> = (1..=100).map(f64::from).collect();
         let s = summarize(&values).expect("non-empty");
         assert_eq!(s.n, 100);
@@ -115,6 +115,8 @@ mod tests {
 
     #[test]
     fn the_json_carries_the_summary_beside_the_raw_values() {
+        use super::*;
+
         let v = to_json(&[1.0004, 2.0]);
         assert_eq!(v.get("n").and_then(Value::as_u64), Some(2));
         assert_eq!(v.get("p99").and_then(Value::as_f64), Some(2.0));

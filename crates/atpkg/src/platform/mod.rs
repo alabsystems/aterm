@@ -226,15 +226,46 @@ pub fn spawn_detached(
     args: &[std::ffi::OsString],
     env: Option<(&str, &str)>,
 ) -> io::Result<()> {
+    spawn_detached_at(program, args, env, true)
+}
+
+/// [`spawn_detached`] for the one pass a person waits on: a first run's (the store's first
+/// install of the ALab toolset still ahead, [`crate::adoption::first_install_ahead`]), whose
+/// stubs block until it lands. Started the same way, at the default band rather than behind
+/// [`utility_clamped`], as the window starts its own first run (aterm-gui
+/// `qos::atpkg_pass_command`): on a busy fresh Mac the clamp held it far behind.
+///
+/// # Errors
+/// As [`spawn_detached`].
+pub fn spawn_detached_waited(
+    program: &std::ffi::OsStr,
+    args: &[std::ffi::OsString],
+    env: Option<(&str, &str)>,
+) -> io::Result<()> {
+    spawn_detached_at(program, args, env, false)
+}
+
+/// [`spawn_detached`]'s body: `clamped` puts the program behind [`utility_clamped`].
+fn spawn_detached_at(
+    program: &std::ffi::OsStr,
+    args: &[std::ffi::OsString],
+    env: Option<(&str, &str)>,
+    clamped: bool,
+) -> io::Result<()> {
     #[cfg(unix)]
     {
         let mut command = aterm_uds::spawnfd::command("/bin/sh");
         if let Some((name, value)) = env {
             command.env(name, value);
         }
+        let head = if clamped {
+            utility_clamped(program)
+        } else {
+            vec![program.into()]
+        };
         let status = command
             .args(["-c", "\"$@\" &", "sh"])
-            .args(utility_clamped(program))
+            .args(head)
             .args(args)
             .stdin(aterm_uds::spawnfd::Stdio::null())
             .stdout(aterm_uds::spawnfd::Stdio::null())
@@ -252,7 +283,8 @@ pub fn spawn_detached(
         // `spawnfd::command` decides its Windows console (`Console::Quiet`): from a
         // console (the terminal session) the pass shares it, as a bare child did;
         // from a process with none it gets a windowless console, where a bare child
-        // would open a visible one for its whole run.
+        // would open a visible one for its whole run. No QoS clamp exists here.
+        let _ = clamped;
         let mut command = aterm_uds::spawnfd::command(program);
         if let Some((name, value)) = env {
             command.env(name, value);
@@ -779,29 +811,35 @@ fn cmd_embedded_path(path: &Path) -> Option<String> {
 }
 
 /// THE PRELUDE of an agent program's `agents/` twin and its `bin/` shim — what
-/// [`crate::activate::reconcile_agents`] renders into both: the self-update block alone
-/// ([`sh_selfupdate_prelude`]) on Unix, and NOTHING on Windows — a `.cmd` block would test
-/// `"%~1"=="update"`, which expands the user's first argument onto a batch line, where an
-/// argument carrying a `"` can end the batch with the tool never run (the strand the Unix
-/// rule forbids); it waits for a Windows host that has measured `%~1` with `"`, `%` and
-/// `^` (`docs/DESIGN-vendor-self-update-2026-09-19.md`). A
+/// [`crate::activate::reconcile_agents`] renders into both: the self-update block
+/// ([`sh_selfupdate_prelude`]) then the `--yolo` block ([`sh_yolo_prelude`]) on
+/// Unix, and NOTHING on Windows — a `.cmd` block would test `"%~1"=="update"`,
+/// which expands the user's first argument onto a batch line, where an argument
+/// carrying a `"` can end the batch with the tool never run (the strand the Unix
+/// rule forbids), and a `--yolo` rewrite would have to take `%*` apart the same
+/// unsafe way; it waits for a Windows host that has measured `%~1` with `"`, `%`
+/// and `^` (`docs/DESIGN-vendor-self-update-2026-09-19.md`). A
 /// twin that still carries a legacy landing prelude compares unequal on the next pass
 /// and is re-laid once (temp + rename; a running `sh` keeps the old inode, a running
 /// `.cmd` ends its batch on the line that runs the program). `verbs` is the program's row
-/// ([`crate::selfupdate::verbs_of`]): empty renders nothing, and the twin is the plain
-/// shim under the twin's name. `atpkg` is the one [`crate::stub::Embedder`] settled on, or
-/// `None` to name none.
+/// ([`crate::selfupdate::verbs_of`]) and `yolo` its policy
+/// ([`crate::yolo::policy_of`]): each empty renders its block as nothing, and both
+/// empty is the plain shim under the twin's name. `atpkg` is the one
+/// [`crate::stub::Embedder`] settled on, or `None` to name none.
 #[must_use]
 pub(crate) fn twin_prelude(
     program: &str,
     prefix: &Path,
     atpkg: Option<&Path>,
     verbs: &[&str],
+    yolo: &crate::yolo::Policy,
 ) -> String {
     if cfg!(windows) {
         return String::new();
     }
-    sh_selfupdate_prelude(program, prefix, crate::stub::named(atpkg), verbs)
+    let mut s = sh_selfupdate_prelude(program, prefix, crate::stub::named(atpkg), verbs);
+    s.push_str(&sh_yolo_prelude(program, yolo, verbs));
+    s
 }
 
 /// The Unix `bin/` shim body: a `/bin/sh` stub that EXECs the store binary.
@@ -1034,6 +1072,358 @@ pub(crate) fn sh_selfupdate_prelude(
     s
 }
 
+/// THE `--yolo` BLOCK of an agent program's twin and `bin/` shim ([`crate::yolo`]),
+/// rendered after the self-update block in [`twin_prelude`]. For claude (no word
+/// lists) it reads:
+///
+/// ```text
+/// # atpkg: yolo by default — this name runs claude with every approval and sandbox off ('--dangerously-skip-permissions'); `--yolo` ahead of a literal `--` spells the same, a launch that types its own posture runs as typed, and the command as run is printed on stderr (aterm help pkg).
+/// __atpkg_yolo=0
+/// __atpkg_posture=0
+/// __atpkg_p0=0
+/// for __atpkg_a in "$@"; do
+///   case "$__atpkg_a" in
+///     --) break ;;
+///     --yolo) __atpkg_yolo=1 ;;
+///     '--dangerously-skip-permissions') __atpkg_p0=1; __atpkg_posture=1 ;;
+///     '--allow-dangerously-skip-permissions'|'--permission-mode'|'--permission-mode='*) __atpkg_posture=1 ;;
+///   esac
+/// done
+/// __atpkg_say=
+/// if [ "$__atpkg_yolo" = 1 ]; then
+///   __atpkg_say="aterm: --yolo: running 'claude'"
+///   __atpkg_stop=0
+///   __atpkg_n=$#
+///   while [ "$__atpkg_n" -gt 0 ]; do
+///     __atpkg_n=$((__atpkg_n - 1))
+///     if [ "$__atpkg_stop" = 0 ] && [ "$1" = "--yolo" ]; then
+///       shift
+///       if [ "$__atpkg_p0" = 0 ]; then __atpkg_p0=1; set -- "$@" '--dangerously-skip-permissions'; fi
+///     else
+///       if [ "$1" = "--" ]; then __atpkg_stop=1; fi
+///       set -- "$@" "$1"
+///       shift
+///     fi
+///   done
+/// elif [ "$__atpkg_posture" = 0 ]; then
+///   __atpkg_say="aterm: yolo (default): running 'claude'"
+///   set -- '--dangerously-skip-permissions' "$@"
+/// fi
+/// if [ -n "$__atpkg_say" ]; then
+///   printf '%s' "$__atpkg_say" 1>&2
+///   for __atpkg_a in "$@"; do
+///     printf " '" 1>&2
+///     __atpkg_rest=$__atpkg_a
+///     while case "$__atpkg_rest" in *"'"*) true ;; *) false ;; esac; do
+///       printf '%s' "${__atpkg_rest%%"'"*}" 1>&2
+///       printf '%s' "'\\''" 1>&2
+///       __atpkg_rest=${__atpkg_rest#*"'"}
+///     done
+///     printf '%s' "$__atpkg_rest" 1>&2
+///     printf "'" 1>&2
+///   done
+///   printf '\n' 1>&2
+/// fi
+/// ```
+///
+/// A row with word lists (muse) also tracks the first non-flag word: the
+/// default goes behind an `after` word and never on a `skip` word, and a
+/// `--yolo` typed ahead of an `after` word expands behind it (the pending
+/// rotation; [`crate::yolo::decide`] is the rule both lanes keep).
+///
+/// * PURE `/bin/sh`, no hand-over: every user word is only ever compared
+///   (`case`, `[ … = … ]`) or moved quoted (`set -- "$@" "$1"`), never parsed,
+///   so the default holds with no atpkg reachable and every run still reaches
+///   the twin's `exec`. A rotation consumes exactly the original `$#` words —
+///   each appended once at the tail, a `--yolo` as the flags not already
+///   present (a flag is never added twice: codex refuses its bypass repeated)
+///   — so order and empty words survive; a literal `--` freezes the rest.
+/// * THE ECHO is [`crate::yolo::echo_line`]/[`crate::yolo::default_echo_line`]'s
+///   twin: each word single-quoted, an embedded `'` split out as `'\''`
+///   (printed with `printf '%s'` — as a printf FORMAT `\'` collapses to `'`
+///   under bash, measured 2026-10-19), on stderr only, on a rewritten launch
+///   only.
+/// * No line is a literal `exec '` or `export `, so every reader of the twin's
+///   target and env answers as over a plain shim; every embedded word is
+///   rendered quoted and validated first.
+/// * FAIL-CLOSED RENDER: the EMPTY string when the flags or the markers are
+///   empty (a default that cannot tell a decided launch would upgrade the
+///   harness's own resume lines), when any flag, marker or word fails its word
+///   rule, or when the program is not a [`crate::store::ToolName`] or fails the
+///   verb word rule — the self-update block's rule, widened.
+///
+/// Measured against this shape in sh, bash, dash and zsh (2026-10-19),
+/// including arguments carrying quotes, `$`, backticks and spaces. Pure string
+/// building, pinned on every platform; [`twin_prelude`] renders it on Unix only.
+#[must_use]
+pub(crate) fn sh_yolo_prelude(
+    program: &str,
+    policy: &crate::yolo::Policy,
+    skip_extra: &[&str],
+) -> String {
+    let crate::yolo::Policy {
+        flags,
+        markers,
+        after,
+        skip,
+    } = *policy;
+    if flags.is_empty()
+        || markers.is_empty()
+        || !flags.iter().all(|f| crate::yolo::is_shell_safe_flag(f))
+        || !markers.iter().all(|m| crate::yolo::is_shell_safe_marker(m))
+        || !after
+            .iter()
+            .chain(skip.iter())
+            .chain(skip_extra.iter())
+            .all(|w| crate::selfupdate::is_shell_safe_verb(w))
+        || crate::store::ToolName::new(program).is_none()
+        || !crate::selfupdate::is_shell_safe_verb(program)
+    {
+        return String::new();
+    }
+    // The twin's self-update verbs ride along as skip words (`twin_prelude`
+    // passes them): an update shape is decided ahead of this block, and its
+    // help forward through `bin/` must not be defaulted on the way.
+    let skip_all: Vec<&str> = skip
+        .iter()
+        .copied()
+        .chain(skip_extra.iter().copied().filter(|w| !skip.contains(w)))
+        .collect();
+    let spelled = flags
+        .iter()
+        .map(|f| sh_quote_str(f))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let words = !after.is_empty() || !skip_all.is_empty();
+    // One `if` per flag not already present/emitted — the dedupe both the
+    // by-the-flag rotation and (via the posture scan) the default rely on.
+    let fresh = |indent: &str| {
+        let mut f = String::new();
+        for (i, flag) in flags.iter().enumerate() {
+            f.push_str(indent);
+            f.push_str("if [ \"$__atpkg_p");
+            f.push_str(&i.to_string());
+            f.push_str("\" = 0 ]; then __atpkg_p");
+            f.push_str(&i.to_string());
+            f.push_str("=1; set -- \"$@\" ");
+            f.push_str(&sh_quote_str(flag));
+            f.push_str("; fi\n");
+        }
+        f
+    };
+    let say = |prefix: &str| {
+        let mut v = String::from("\"");
+        v.push_str(prefix);
+        v.push_str(&sh_quote_str(program));
+        v.push('"');
+        v
+    };
+    let mut s = String::from("# atpkg: yolo by default — this name runs ");
+    s.push_str(program);
+    s.push_str(" with every approval and sandbox off (");
+    s.push_str(&spelled);
+    s.push_str(
+        "); `--yolo` ahead of a literal `--` spells the same, a launch that types \
+         its own posture runs as typed, and the command as run is printed on stderr \
+         (aterm help pkg).\n",
+    );
+    s.push_str("__atpkg_yolo=0\n__atpkg_posture=0\n");
+    if words {
+        s.push_str("__atpkg_have_word=0\n__atpkg_word=\n");
+    }
+    for i in 0..flags.len() {
+        s.push_str("__atpkg_p");
+        s.push_str(&i.to_string());
+        s.push_str("=0\n");
+    }
+    s.push_str(
+        "for __atpkg_a in \"$@\"; do\n  \
+         case \"$__atpkg_a\" in\n    \
+         --) break ;;\n    \
+         --yolo) __atpkg_yolo=1 ;;\n",
+    );
+    for (i, flag) in flags.iter().enumerate() {
+        s.push_str("    ");
+        s.push_str(&sh_quote_str(flag));
+        s.push_str(") __atpkg_p");
+        s.push_str(&i.to_string());
+        s.push_str("=1; __atpkg_posture=1 ;;\n");
+    }
+    let rest: Vec<String> = markers
+        .iter()
+        .filter(|m| !flags.contains(m))
+        .map(|m| {
+            if let Some(word) = m.strip_suffix('=') {
+                let mut p = sh_quote_str(&format!("{word}="));
+                p.push('*');
+                p
+            } else {
+                sh_quote_str(m)
+            }
+        })
+        .collect();
+    if !rest.is_empty() {
+        s.push_str("    ");
+        s.push_str(&rest.join("|"));
+        s.push_str(") __atpkg_posture=1 ;;\n");
+    }
+    if words {
+        s.push_str(
+            "    -*) ;;\n    \
+             *) if [ \"$__atpkg_have_word\" = 0 ]; then __atpkg_have_word=1; \
+             __atpkg_word=$__atpkg_a; fi ;;\n",
+        );
+    }
+    s.push_str("  esac\ndone\n");
+    if !after.is_empty() {
+        s.push_str(
+            "__atpkg_after=0\n\
+             if [ \"$__atpkg_have_word\" = 1 ]; then\n  \
+             case \"$__atpkg_word\" in\n    ",
+        );
+        s.push_str(
+            &after
+                .iter()
+                .map(|w| sh_quote_str(w))
+                .collect::<Vec<_>>()
+                .join("|"),
+        );
+        s.push_str(") __atpkg_after=1 ;;\n  esac\nfi\n");
+    }
+    s.push_str("__atpkg_say=\nif [ \"$__atpkg_yolo\" = 1 ]; then\n  __atpkg_say=");
+    s.push_str(&say(crate::yolo::ECHO_PREFIX));
+    s.push_str(
+        "\n  \
+         __atpkg_stop=0\n",
+    );
+    if !after.is_empty() {
+        s.push_str("  __atpkg_pending=0\n  __atpkg_seen=0\n");
+    }
+    s.push_str(
+        "  __atpkg_n=$#\n  \
+         while [ \"$__atpkg_n\" -gt 0 ]; do\n    \
+         __atpkg_n=$((__atpkg_n - 1))\n    \
+         if [ \"$__atpkg_stop\" = 0 ] && [ \"$1\" = \"--yolo\" ]; then\n      \
+         shift\n",
+    );
+    if after.is_empty() {
+        s.push_str(&fresh("      "));
+    } else {
+        s.push_str(
+            "      if [ \"$__atpkg_after\" = 1 ] && [ \"$__atpkg_seen\" = 0 ]; then\n        \
+             __atpkg_pending=1\n      \
+             else\n",
+        );
+        s.push_str(&fresh("        "));
+        s.push_str("      fi\n");
+    }
+    s.push_str(
+        "    else\n      \
+         if [ \"$1\" = \"--\" ]; then __atpkg_stop=1; fi\n",
+    );
+    if after.is_empty() {
+        s.push_str(
+            "      set -- \"$@\" \"$1\"\n      \
+             shift\n",
+        );
+    } else {
+        s.push_str(
+            "      __atpkg_is_word=0\n      \
+             if [ \"$__atpkg_stop\" = 0 ] && [ \"$__atpkg_seen\" = 0 ]; then\n        \
+             case \"$1\" in -*) ;; *) __atpkg_is_word=1 ;; esac\n      \
+             fi\n      \
+             set -- \"$@\" \"$1\"\n      \
+             shift\n      \
+             if [ \"$__atpkg_is_word\" = 1 ]; then\n        \
+             __atpkg_seen=1\n        \
+             if [ \"$__atpkg_pending\" = 1 ]; then\n          \
+             __atpkg_pending=0\n",
+        );
+        s.push_str(&fresh("          "));
+        s.push_str("        fi\n      fi\n");
+    }
+    s.push_str("    fi\n  done\nelif [ \"$__atpkg_posture\" = 0 ]; then\n");
+    if !words {
+        s.push_str("  __atpkg_say=");
+        s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
+        s.push_str("\n  set -- ");
+        s.push_str(&spelled);
+        s.push_str(" \"$@\"\n");
+    } else {
+        if skip_all.is_empty() {
+            s.push_str("  __atpkg_say=");
+            s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
+            s.push('\n');
+        } else {
+            s.push_str(
+                "  if [ \"$__atpkg_have_word\" = 1 ]; then\n    case \"$__atpkg_word\" in\n      ",
+            );
+            s.push_str(
+                &skip_all
+                    .iter()
+                    .map(|w| sh_quote_str(w))
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            );
+            s.push_str(") ;;\n      *) __atpkg_say=");
+            s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
+            s.push_str(" ;;\n    esac\n  else\n    __atpkg_say=");
+            s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
+            s.push_str("\n  fi\n");
+        }
+        if after.is_empty() {
+            s.push_str("  if [ -n \"$__atpkg_say\" ]; then\n    set -- ");
+            s.push_str(&spelled);
+            s.push_str(" \"$@\"\n  fi\n");
+        } else {
+            s.push_str(
+                "  if [ -n \"$__atpkg_say\" ] && [ \"$__atpkg_after\" = 0 ]; then\n    \
+                 set -- ",
+            );
+            s.push_str(&spelled);
+            s.push_str(
+                " \"$@\"\n  \
+                 elif [ -n \"$__atpkg_say\" ]; then\n    \
+                 __atpkg_n=$#\n    \
+                 __atpkg_done=0\n    \
+                 while [ \"$__atpkg_n\" -gt 0 ]; do\n      \
+                 __atpkg_n=$((__atpkg_n - 1))\n      \
+                 set -- \"$@\" \"$1\"\n      \
+                 if [ \"$__atpkg_done\" = 0 ] && [ \"$1\" = \"$__atpkg_word\" ]; then\n        \
+                 __atpkg_done=1\n        \
+                 set -- \"$@\" ",
+            );
+            s.push_str(&spelled);
+            s.push_str(
+                "\n      \
+                 fi\n      \
+                 shift\n    \
+                 done\n  \
+                 fi\n",
+            );
+        }
+    }
+    s.push_str(
+        "fi\n\
+         if [ -n \"$__atpkg_say\" ]; then\n  \
+         printf '%s' \"$__atpkg_say\" 1>&2\n  \
+         for __atpkg_a in \"$@\"; do\n    \
+         printf \" '\" 1>&2\n    \
+         __atpkg_rest=$__atpkg_a\n    \
+         while case \"$__atpkg_rest\" in *\"'\"*) true ;; *) false ;; esac; do\n      \
+         printf '%s' \"${__atpkg_rest%%\"'\"*}\" 1>&2\n      \
+         printf '%s' \"'\\\\''\" 1>&2\n      \
+         __atpkg_rest=${__atpkg_rest#*\"'\"}\n    \
+         done\n    \
+         printf '%s' \"$__atpkg_rest\" 1>&2\n    \
+         printf \"'\" 1>&2\n  \
+         done\n  \
+         printf '\\n' 1>&2\n\
+         fi\n",
+    );
+    s
+}
+
 /// [`sh_shim_content_routed`] with `prelude` (empty for every shim but an agent program's;
 /// its `agents/` twin's and its `bin/` shim's [`twin_prelude`]) inserted right after the
 /// header comment — ahead of the exports, so a hand-over to `atpkg __selfupdate` inherits
@@ -1247,35 +1637,45 @@ mod tests {
     }
 
     /// The live contract: a program [`spawn_detached`] starts runs at utility (`ps` pri 20
-    /// or below), not the default band (31) the session lane's passes got bare.
+    /// or below), not the default band (31) the session lane's passes got bare; one
+    /// [`spawn_detached_waited`] starts (a first run's) runs at the default band.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_detached_program_starts_at_utility() {
-        let dir = crate::testdir::dir("atpkg-detached-band-");
-        let said = dir.join("pri");
-        let script = format!(
-            "/bin/ps -o pri= -p $$ > '{0}.tmp' && mv '{0}.tmp' '{0}'",
-            said.display()
-        );
-        spawn_detached("/bin/sh".as_ref(), &["-c".into(), script.into()], None).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let pri = loop {
-            if let Ok(text) = std::fs::read_to_string(&said) {
-                break text;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the detached program never ran"
+    fn a_detached_program_starts_at_utility_and_a_waited_one_at_the_default_band() {
+        type Spawn =
+            fn(&std::ffi::OsStr, &[std::ffi::OsString], Option<(&str, &str)>) -> io::Result<()>;
+        let pri_of = |spawn: Spawn| -> i32 {
+            let dir = crate::testdir::dir("atpkg-detached-band-");
+            let said = dir.join("pri");
+            let script = format!(
+                "/bin/ps -o pri= -p $$ > '{0}.tmp' && mv '{0}.tmp' '{0}'",
+                said.display()
             );
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            spawn("/bin/sh".as_ref(), &["-c".into(), script.into()], None).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let pri = loop {
+                if let Ok(text) = std::fs::read_to_string(&said) {
+                    break text;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the detached program never ran"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            pri.trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("no priority in {pri:?}"))
         };
-        let pri: i32 = pri
-            .trim()
-            .parse()
-            .unwrap_or_else(|_| panic!("no priority in {pri:?}"));
+        let pri = pri_of(spawn_detached);
         assert!(
             pri <= 20,
             "a detached pass ran at pri {pri}, not utility (20)"
+        );
+        let pri = pri_of(spawn_detached_waited);
+        assert!(
+            pri > 20,
+            "a first run's detached pass ran at pri {pri}, below the default band (31)"
         );
     }
 
@@ -1607,7 +2007,8 @@ mod tests {
                     "claude",
                     prefix,
                     Some(atpkg),
-                    &["update", "upgrade", "install"]
+                    &["update", "upgrade", "install"],
+                    &crate::yolo::policy_of("claude")
                 ),
                 "",
                 "on Windows the twin carries no prelude"
@@ -2060,11 +2461,13 @@ mod sh_shim_tests {
             body.matches(r"'/it'\''s/store/trust/1/bin/targo'").count(),
             2
         );
-        assert_eq!(
-            body.matches(r"'/it'\''s/compat/trust/1/.atpkg-root'")
-                .count(),
-            2
-        );
+        // The marker is `compat::root_marker`'s host join of the root (`\` on Windows).
+        let marker = if cfg!(windows) {
+            r"'/it'\''s/compat/trust/1\.atpkg-root'"
+        } else {
+            r"'/it'\''s/compat/trust/1/.atpkg-root'"
+        };
+        assert_eq!(body.matches(marker).count(), 2);
         assert!(!body.contains("/it's/"), "no raw quote survives: {body}");
         assert_eq!(parse_sh_shim_target(&body).as_deref(), Some(target));
     }
@@ -2257,7 +2660,13 @@ mod sh_shim_tests {
         assert!(!quoted.contains("/it's/"), "{quoted}");
         // The whole prelude is the block: no landing check, no marker, no `__landing`.
         let want = block.clone();
-        let twin_pre = twin_prelude("claude", prefix, Some(atpkg), verbs);
+        let twin_pre = twin_prelude(
+            "claude",
+            prefix,
+            Some(atpkg),
+            verbs,
+            &crate::yolo::Policy::NONE,
+        );
         if cfg!(windows) {
             assert_eq!(twin_pre, "", "the .cmd twin renders no prelude");
         } else {
@@ -2266,9 +2675,15 @@ mod sh_shim_tests {
         assert!(!want.contains(crate::landing::HIDDEN_VERB), "{want}");
         assert!(!want.contains("landing"), "{want}");
         assert_eq!(
-            twin_prelude("claude", prefix, Some(atpkg), &[]),
+            twin_prelude(
+                "claude",
+                prefix,
+                Some(atpkg),
+                &[],
+                &crate::yolo::Policy::NONE
+            ),
             "",
-            "no verbs: no prelude — the twin is the plain shim"
+            "no verbs, no yolo policy: no prelude — the twin is the plain shim"
         );
         // The full twin, read by every parser as before.
         let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
@@ -2297,5 +2712,215 @@ mod sh_shim_tests {
             sh_shim_content_twin(target, &env, None, ""),
             sh_shim_content_env(target, &env)
         );
+    }
+
+    /// THE YOLO BLOCK EXECUTED: laid twins over a store build that prints its
+    /// argv. By default the flags are injected (behind muse's session words),
+    /// by the flag they replace `--yolo` without ever doubling, and a launch
+    /// that decided its own posture passes untouched and unprinted — the same
+    /// argv [`crate::yolo::decide`] returns and the same lines its echo
+    /// builders spell; stdout carries only the build's own words.
+    #[cfg(unix)]
+    #[test]
+    fn the_yolo_block_expands_prints_and_reaches_the_exec() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = crate::testdir::dir("atpkg-sh-yolo-twin-");
+        let target = root.join("store-build");
+        std::fs::write(&target, b"#!/bin/sh\nprintf '<%s>' \"$@\"\nprintf '\\n'\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let prefix = root.join("pkg");
+        let lay = |program: &str| {
+            let prelude = twin_prelude(
+                program,
+                &prefix,
+                None,
+                &[],
+                &crate::yolo::policy_of(program),
+            );
+            assert!(
+                !prelude.lines().any(|l| l.trim().starts_with("exec '")),
+                "{prelude}"
+            );
+            assert!(
+                !prelude.lines().any(|l| l.trim().starts_with("export ")),
+                "{prelude}"
+            );
+            assert!(!prelude.contains("__selfupdate"), "{prelude}");
+            let twin = root.join(program);
+            std::fs::write(
+                &twin,
+                sh_shim_content_twin(&target, &crate::shim_env::ShimEnv::NONE, None, &prelude),
+            )
+            .unwrap();
+            std::fs::set_permissions(&twin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(resolve_shim(&twin).as_deref(), Some(target.as_path()));
+            twin
+        };
+        let run = |twin: &Path, args: &[&str]| {
+            let out = aterm_spec::wait::past_text_busy(|| {
+                std::process::Command::new(twin).args(args).output()
+            })
+            .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        };
+        let claude = lay("claude");
+        // By default: injected at the front, the default echo, stdout clean.
+        assert_eq!(
+            run(&claude, &["-p", "hello"]),
+            (
+                "<--dangerously-skip-permissions><-p><hello>\n".into(),
+                "aterm: yolo (default): running 'claude' \
+                 '--dangerously-skip-permissions' '-p' 'hello'\n"
+                    .into()
+            )
+        );
+        // A decided posture, and the flag itself typed: as typed, silent.
+        for args in [
+            &["--permission-mode", "plan"][..],
+            &["--permission-mode=auto"][..],
+            &["--dangerously-skip-permissions", "-p", "x"][..],
+        ] {
+            let (stdout, stderr) = run(&claude, args);
+            assert_eq!(stderr, "", "{args:?}");
+            assert!(!stdout.contains("aterm:"), "{args:?}: {stdout}");
+        }
+        assert_eq!(
+            run(&claude, &["--permission-mode", "plan"]).0,
+            "<--permission-mode><plan>\n"
+        );
+        // By the flag: in place, the flag's echo. A prompt with quote/$/backtick.
+        let (stdout, stderr) = run(
+            &claude,
+            &["--model", "opus", "--yolo", "-p", "it's $x `y`", ""],
+        );
+        assert_eq!(
+            stdout,
+            "<--model><opus><--dangerously-skip-permissions><-p><it's $x `y`><>\n"
+        );
+        let typed: Vec<String> = ["--model", "opus", "--yolo", "-p", "it's $x `y`", ""]
+            .iter()
+            .map(|w| (*w).to_string())
+            .collect();
+        let crate::yolo::Launch::Flag(expanded) = crate::yolo::decide("claude", &typed) else {
+            panic!("flag launch");
+        };
+        assert_eq!(
+            stderr,
+            format!("{}\n", crate::yolo::echo_line("claude", &expanded))
+        );
+        // The separator freezes the rest; the default still lands in front.
+        let (stdout, stderr) = run(&claude, &["--", "--yolo"]);
+        assert_eq!(stdout, "<--dangerously-skip-permissions><--><--yolo>\n");
+        assert_eq!(
+            stderr,
+            "aterm: yolo (default): running 'claude' '--dangerously-skip-permissions' \
+             '--' '--yolo'\n"
+        );
+        // muse: behind its session words, never on its tool words.
+        let muse = lay("muse");
+        let behind = "<exec><--disable-approval><--disable-sandbox><--trust-workspace>\
+                      <--disable-request-user-input><x>\n";
+        assert_eq!(run(&muse, &["exec", "x"]).0, behind);
+        assert_eq!(run(&muse, &["--yolo", "exec", "x"]).0, behind);
+        assert_eq!(run(&muse, &["exec", "--yolo", "x"]).0, behind);
+        assert_eq!(
+            run(&muse, &["skills", "list"]),
+            ("<skills><list>\n".into(), String::new())
+        );
+        assert_eq!(
+            run(&muse, &["--approval-mode", "never"]),
+            ("<--approval-mode><never>\n".into(), String::new())
+        );
+        let (stdout, stderr) = run(&muse, &[]);
+        assert_eq!(
+            stdout,
+            "<--disable-approval><--disable-sandbox><--trust-workspace>\
+             <--disable-request-user-input>\n"
+        );
+        assert_eq!(
+            stderr,
+            format!(
+                "{}\n",
+                crate::yolo::default_echo_line(
+                    "muse",
+                    &crate::yolo::flags_of("muse")
+                        .iter()
+                        .map(|f| (*f).to_string())
+                        .collect::<Vec<_>>()
+                )
+            )
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The yolo renderer's fail-closed rows, and its exact first line — the note a
+    /// person reading the twin sees.
+    #[test]
+    fn the_yolo_block_renders_fail_closed() {
+        use crate::yolo::Policy;
+        let ok = Policy {
+            flags: &["--ok"],
+            markers: &["--ok"],
+            after: &[],
+            skip: &[],
+        };
+        assert_eq!(sh_yolo_prelude("claude", &Policy::NONE, &[]), "");
+        assert_eq!(
+            sh_yolo_prelude("claude", &Policy { markers: &[], ..ok }, &[]),
+            "",
+            "no markers: the default cannot tell a decided launch"
+        );
+        assert_eq!(
+            sh_yolo_prelude(
+                "claude",
+                &Policy {
+                    flags: &["--ok", "not-a-flag"],
+                    ..ok
+                },
+                &[]
+            ),
+            ""
+        );
+        assert_eq!(
+            sh_yolo_prelude(
+                "claude",
+                &Policy {
+                    markers: &["--yo lo"],
+                    ..ok
+                },
+                &[]
+            ),
+            ""
+        );
+        assert_eq!(
+            sh_yolo_prelude(
+                "claude",
+                &Policy {
+                    after: &["ex'ec"],
+                    ..ok
+                },
+                &[]
+            ),
+            ""
+        );
+        assert_eq!(sh_yolo_prelude("Claude", &ok, &[]), "");
+        assert_eq!(sh_yolo_prelude("../claude", &ok, &[]), "");
+        let block = sh_yolo_prelude("muse", &crate::yolo::policy_of("muse"), &[]);
+        let note = block.lines().next().unwrap();
+        assert_eq!(
+            note,
+            "# atpkg: yolo by default — this name runs muse with every approval \
+             and sandbox off ('--disable-approval' '--disable-sandbox' \
+             '--trust-workspace' '--disable-request-user-input'); `--yolo` ahead \
+             of a literal `--` spells the same, a launch that types its own \
+             posture runs as typed, and the command as run is printed on stderr \
+             (aterm help pkg)."
+        );
+        assert!(block.contains(crate::yolo::ECHO_PREFIX), "{block}");
+        assert!(block.contains(crate::yolo::DEFAULT_ECHO_PREFIX), "{block}");
     }
 }

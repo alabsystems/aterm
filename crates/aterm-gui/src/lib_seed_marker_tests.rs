@@ -104,7 +104,7 @@ fn the_r6_markers_raise_their_wakes_with_or_without_the_atpkg_prefix() {
         parse_seed_line("atpkg: claude: managed 2.1.280 — Anthropic latest").is_none(),
         "a plain state line is not a marker"
     );
-    // `machine-state:` is an event (`PkgMachineState`, the card's newest state), never a
+    // `machine-state:` is an event (`PkgMachineState`, the status's newest state), never a
     // row, and never mistaken for the change marker sharing its prefix.
     match parse_seed_line(&format!(
         "atpkg: {}universal-control=disabled; policy=off; home=account",

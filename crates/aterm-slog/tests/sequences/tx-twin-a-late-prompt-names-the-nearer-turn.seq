@@ -1,0 +1,13 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_prompt_older_than_the_open_turn_does_not_name_it, its third rig:
+# the prompt read late, 100 ms after the first turn opened, is its.
+state partial
+bind 0
+see busy
+pass 500
+see idle
+wait 1000
+pass 1500
+see busy
+tx prompt v1 dated=100
+expect amend t1 turn vref=v1

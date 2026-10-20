@@ -31,13 +31,3 @@ workspace = true
 [[test]]
 name = "search_suite"
 path = "tests/search_suite.rs"
-
-# Alone: installs a counting #[global_allocator] and asserts net heap bytes.
-[[test]]
-name = "index_release_memory"
-path = "tests/index_release_memory.rs"
-
-# Alone: installs a counting #[global_allocator] and asserts net heap bytes.
-[[test]]
-name = "index_column_map_memory"
-path = "tests/index_column_map_memory.rs"

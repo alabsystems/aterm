@@ -93,21 +93,28 @@ fn the_plan_approval_is_read_whole_through_its_zone() {
 
 #[test]
 fn blank_rows_under_the_drawing_decide_nothing() {
-    let mut swept = 0;
-    for (name, rows) in fixture_screens("live zone sweep") {
+    const PADS: [usize; 4] = [0, 7, 30, 60];
+    let screens = fixture_screens("live zone sweep");
+    let moved: Vec<String> = crate::on_every_core(&screens, |(name, rows)| {
         // The screen in a pane exactly as tall as what is drawn on it.
         let drawn = rows.iter().rposition(|r| !blank(r)).map_or(0, |i| i + 1);
         let tight = &rows[..drawn];
         let want = readings(zone(tight));
-        for pad in [0, 7, 30, 60] {
-            let mut tall = rows.clone();
-            tall.extend(std::iter::repeat_n(String::new(), pad));
-            let got = readings(zone(&tall));
-            for (w, g) in want.iter().zip(&got) {
-                assert_eq!(w, g, "{name} with {pad} blank rows below");
-            }
-            swept += 1;
-        }
-    }
+        PADS.iter()
+            .filter_map(|&pad| {
+                let mut tall = rows.clone();
+                tall.extend(std::iter::repeat_n(String::new(), pad));
+                let got = readings(zone(&tall));
+                want.iter().zip(&got).find(|(w, g)| w != g).map(|(w, g)| {
+                    format!("{name} with {pad} blank rows below:\n  tight {w}\n  tall  {g}")
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    assert!(moved.is_empty(), "{}", moved.join("\n"));
+    let swept = screens.len() * PADS.len();
     assert!(swept > 200, "only {swept} screens swept");
 }

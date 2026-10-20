@@ -37,7 +37,7 @@ clean {
 
     def Always {State : Type} (P : Formula State) : Formula State :=
       fun b => ∀ n : Nat, P (drop n b)
-    prefix:90 "□" => Always
+    prefix:90 "□" => _root_.Astream.Term.TlaSpeculativeEcho.Always
 
     structure StateMachine (State : Type) where
       Init : State → Prop
@@ -51,7 +51,7 @@ clean {
 
     def Satisfies {State : Type} (M : StateMachine State) (P : Formula State) : Prop :=
       ∀ b : Behavior State, Runs M b → P b
-    infix:50 " ⊨ " => Satisfies
+    infix:50 " ⊨ " => _root_.Astream.Term.TlaSpeculativeEcho.Satisfies
 
     theorem invariantAt {State : Type} (M : StateMachine State) (Inv : State → Prop)
         (hInit : ∀ s : State, M.Init s → Inv s)

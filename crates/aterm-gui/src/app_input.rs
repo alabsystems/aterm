@@ -16,9 +16,9 @@ use aterm_effects::cursor_glow::{DeliveredClass, InsertWidth};
 use aterm_effects::kitty_pet::PetInputKind;
 use aterm_effects::typed_tricks::{TrickEvent, TrickFeed};
 use aterm_session::sink::{AcceptedOrder, SinkWriter};
-use winit::event::{ElementState, KeyEvent};
-use winit::event_loop::ActiveEventLoop;
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use aterm_window::event::{ElementState, KeyEvent};
+use aterm_window::event_loop::ActiveEventLoop;
+use aterm_window::keyboard::{Key, ModifiersState, NamedKey};
 
 use crate::input::{self, InputEvent, InputOutcome, ScrollIntent, Source};
 use crate::{App, FONT_ZOOM_STEP, Wake, WindowId, keybinding, keymap, menu, pane, term_lock};
@@ -1096,23 +1096,8 @@ fn native_settings_route_for_aux(
         | AuxTarget::Menu
         | AuxTarget::TabMenu
         | AuxTarget::AutopilotMenu
-        | AuxTarget::ConnCard
         | AuxTarget::SessionPicker
-        | AuxTarget::Connections => None,
-    }
-}
-
-/// Native Settings destination owned by an App-menu command. The menu dispatch
-/// and its regression test share this authority, so "Open aterm.toml" cannot
-/// silently drift back to a platform-specific external editor.
-fn native_settings_route_for_menu(
-    action: crate::menu::MenuAction,
-) -> Option<crate::native_settings::SettingsRoute> {
-    use crate::menu::MenuAction;
-    use crate::native_settings::SettingsRoute;
-    match action {
-        MenuAction::Preferences => Some(SettingsRoute::Manual),
-        _ => None,
+        | AuxTarget::Overview => None,
     }
 }
 
@@ -1228,7 +1213,7 @@ pub(crate) mod paste_order {
     };
     use aterm_core::terminal::ModeMirror;
     use aterm_session::sink::BulkMeter;
-    use winit::event_loop::EventLoopProxy;
+    use aterm_window::event_loop::EventLoopProxy;
 
     const MAX_BYTES: u32 = 32 * 1024 * 1024;
     const MAX_JOBS: u32 = 256;
@@ -1427,8 +1412,30 @@ pub(crate) mod paste_order {
         /// metered sink write, and a stop pressed while it waits here writes nothing.
         meter: Option<Arc<BulkMeter>>,
         completion: Option<crate::control_input_ack::InputCompletion>,
+        /// Who waits for this write's own receipt ([`Written`]): a control lane's
+        /// reply. Dropped unsent with a job that never runs, which the waiter reads
+        /// as nothing written.
+        written: Option<SyncSender<crate::input::EgressReceipt>>,
         /// Last field: payloads above are dropped before capacity is returned.
         _reservation: Reservation,
+    }
+
+    /// The receipt of a write handed to the session's ordered writer, for a control
+    /// lane that answers from the write rather than from its admission
+    /// ([`unparked_observed`]).
+    pub(crate) struct Written(Receiver<crate::input::EgressReceipt>);
+
+    impl Written {
+        /// The write's receipt once the writer has run it, waiting at most `bound`:
+        /// `Err(Timeout)` while it is still queued or writing, `Err(Disconnected)`
+        /// when it was dropped unrun (stopped, or its session severed): nothing of
+        /// it was written.
+        pub(crate) fn wait(
+            &self,
+            bound: Duration,
+        ) -> Result<crate::input::EgressReceipt, RecvTimeoutError> {
+            self.0.recv_timeout(bound)
+        }
     }
 
     /// ConPTY has no non-blocking write, so an inline key or report on Windows could
@@ -1473,6 +1480,35 @@ pub(crate) mod paste_order {
         fn drop(&mut self) {
             CONPTY_ROUTE.with(|route| route.set(false));
         }
+    }
+
+    /// Test-only: the routes a test on this host can drive, `false` the inline one
+    /// and `true` the ConPTY one ([`force_conpty_route_for_test`]). Windows has the
+    /// ConPTY route alone; a unix run drives both, so the tests that run there keep
+    /// the Windows route honest too.
+    #[cfg(test)]
+    pub(crate) fn routes_for_test() -> &'static [bool] {
+        if UI_WRITES_CAN_BLOCK {
+            &[true]
+        } else {
+            &[false, true]
+        }
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// Test-only: jobs this thread handed to an ordered writer
+        /// ([`submitted_on_this_thread_for_test`]).
+        static SUBMITTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Test-only: how many jobs this thread has handed to an ordered writer. On the
+    /// ConPTY route an event that reaches the seam is FIFO admission (`Ok`, with the
+    /// write, and a stub sink's failure, later on the writer thread), so this count
+    /// tells it from an event the App swallowed, which also answers `Ok`.
+    #[cfg(test)]
+    pub(crate) fn submitted_on_this_thread_for_test() -> u64 {
+        SUBMITTED.with(std::cell::Cell::get)
     }
 
     /// One session's serializer: the FIFO sender and a `Weak` to the session
@@ -1550,6 +1586,9 @@ pub(crate) mod paste_order {
         if let Some(completion) = job.completion.take() {
             completion.finish(receipt);
         }
+        if let Some(written) = job.written.take() {
+            let _ = written.try_send(receipt);
+        }
         crate::metrics::note_pty_write_at(job.key_ns);
         // Echo round trip for a key that waited here: the UI thread's bracket
         // closed before this write, so the clock arms at the write's acceptance,
@@ -1587,6 +1626,12 @@ pub(crate) mod paste_order {
                 timeline.slog_mut().open_session(None, at);
             }
             let subscribers = crate::subscribe::new_registry();
+            let caller = |word: &str| {
+                Some(crate::typed_by::Caller::new(crate::typed_by::Who::Word(
+                    word.to_owned(),
+                )))
+            };
+            let credited = || handle.ctx.typed.last().map(|t| t.by.words());
             let mark = InputMark::at_epoch(
                 &handle.ctx,
                 Some(&subscribers),
@@ -1595,7 +1640,8 @@ pub(crate) mod paste_order {
                 crate::session_log::InputVerb::Feed,
                 None,
                 false,
-            );
+            )
+            .typed_by(&handle.ctx, caller("first"));
             let budget = Arc::new(Budget::new(LIMITS));
             let job = |event: InputEvent, completion| {
                 let bytes = retained_bytes(&event).expect("tiny job");
@@ -1612,6 +1658,7 @@ pub(crate) mod paste_order {
                     hot_key: None,
                     meter: None,
                     completion: Some(completion),
+                    written: None,
                     _reservation: Reservation {
                         budget: budget.clone(),
                         sink: handle.ctx.sink.clone(),
@@ -1630,7 +1677,9 @@ pub(crate) mod paste_order {
                 0,
                 "admission is not acceptance"
             );
+            assert_eq!(credited(), None, "queue admission gives no credit");
             run_one(rx.try_recv().expect("owned admitted job"));
+            assert_eq!(credited().as_deref(), Some("first"));
             assert_eq!(testing::byte(&mut reader), b'Q');
             assert_eq!(
                 testing::input_count(&handle),
@@ -1647,13 +1696,19 @@ pub(crate) mod paste_order {
                 crate::session_log::InputVerb::Key,
                 None,
                 false,
-            );
+            )
+            .typed_by(&handle.ctx, caller("cancelled"));
             drop(job(
                 InputEvent::KeySequence(vec![b'X']),
                 cancelled.completion(),
             ));
             assert_eq!(budget.used.load(Ordering::Acquire), 0);
             assert_eq!(handle.ctx.sink.ordered_egress_count(), 0);
+            assert_eq!(
+                credited().as_deref(),
+                Some("first"),
+                "unrun job kept no credit"
+            );
             let refused = InputMark::at_epoch(
                 &handle.ctx,
                 None,
@@ -1662,7 +1717,8 @@ pub(crate) mod paste_order {
                 crate::session_log::InputVerb::Key,
                 None,
                 false,
-            );
+            )
+            .typed_by(&handle.ctx, caller("next"));
             for receipt in [
                 crate::input::EgressReceipt::deferred_full(),
                 crate::input::EgressReceipt::queue_full(),
@@ -1681,6 +1737,11 @@ pub(crate) mod paste_order {
                 1,
                 "empty, deferred, refused and cancelled input is unmarked"
             );
+            assert_eq!(
+                credited().as_deref(),
+                Some("first"),
+                "empty/deferred/refused kept no credit"
+            );
             // None of those outcomes consumed this factory's first-acceptance gate.
             run_one(job(
                 InputEvent::KeySequence(vec![b'R']),
@@ -1694,6 +1755,15 @@ pub(crate) mod paste_order {
                 2,
                 "CTL_INPUT_MARK_REQUIRES_COMPLETED_NONEMPTY_RECEIPT"
             );
+            assert_eq!(credited().as_deref(), Some("next"));
+            assert!(testing::paste(&handle, &mark, "Z"));
+            assert_eq!(testing::byte(&mut reader), b'Z');
+            assert_eq!(
+                credited().as_deref(),
+                Some("next"),
+                "one mark credits only its first acceptance"
+            );
+            assert_eq!(testing::input_count(&handle), 2);
             let stale = InputMark::at_epoch(
                 &handle.ctx,
                 None,
@@ -1702,7 +1772,8 @@ pub(crate) mod paste_order {
                 crate::session_log::InputVerb::Send,
                 None,
                 false,
-            );
+            )
+            .typed_by(&handle.ctx, caller("stale"));
             {
                 let mut timeline = handle.ctx.timeline.lock().unwrap();
                 let old = timeline.slog().log().ep();
@@ -1735,6 +1806,11 @@ pub(crate) mod paste_order {
                 0,
                 "an old request cannot mark a new log epoch"
             );
+            assert_eq!(
+                credited().as_deref(),
+                Some("next"),
+                "old epoch cannot credit a newer one"
+            );
             let current = InputMark::at_epoch(
                 &handle.ctx,
                 None,
@@ -1743,12 +1819,14 @@ pub(crate) mod paste_order {
                 crate::session_log::InputVerb::Send,
                 None,
                 false,
-            );
+            )
+            .typed_by(&handle.ctx, caller("current"));
             run_one(job(
                 InputEvent::KeySequence(vec![b'N']),
                 current.completion(),
             ));
             assert_eq!(testing::byte(&mut reader), b'N');
+            assert_eq!(credited().as_deref(), Some("current"));
             assert_eq!(
                 testing::input_count(&handle),
                 1,
@@ -1847,7 +1925,7 @@ pub(crate) mod paste_order {
 
     /// Enqueue `ev` onto `master`'s FIFO so it reaches the PTY in submission order.
     /// A rejection accepts no bytes and must never fall back around the FIFO.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn enqueue(
         term: &Arc<Mutex<Terminal>>,
         modes: &Arc<ModeMirror>,
@@ -1865,7 +1943,7 @@ pub(crate) mod paste_order {
         clippy::too_many_arguments,
         reason = "enqueue's handles plus the paste's meter, which rides the FIFO job"
     )]
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn enqueue_metered(
         term: &Arc<Mutex<Terminal>>,
         modes: &Arc<ModeMirror>,
@@ -1904,6 +1982,7 @@ pub(crate) mod paste_order {
             hot_key,
             meter,
             completion,
+            None,
         )
     }
 
@@ -1923,6 +2002,7 @@ pub(crate) mod paste_order {
         hot_key: Option<(u64, Option<&EventLoopProxy<Wake>>)>,
         meter: Option<Arc<BulkMeter>>,
         completion: Option<crate::control_input_ack::InputCompletion>,
+        written: Option<SyncSender<crate::input::EgressReceipt>>,
     ) -> Result<(), Rejected> {
         let bytes = retained_bytes(&ev).ok_or(Rejected::TooLarge)?;
         // Neither a paste nor a UI-encoded report (`echo` is `None`) may spend the
@@ -1974,6 +2054,7 @@ pub(crate) mod paste_order {
             hot_key: hot_key.map(|(session, proxy)| (session, proxy.cloned())),
             meter: meter.clone(),
             completion,
+            written,
             _reservation: Reservation {
                 budget,
                 sink: Arc::clone(sink),
@@ -1986,6 +2067,8 @@ pub(crate) mod paste_order {
                 // The UI thread's echo bracket must not arm for this event:
                 // its write happens on the writer thread, which arms it there.
                 crate::echo_rtt::note_deferred_write();
+                #[cfg(test)]
+                SUBMITTED.with(|n| n.set(n.get() + 1));
                 Ok(())
             }
             Err(error) => {
@@ -2064,7 +2147,7 @@ pub(crate) mod paste_order {
         clippy::too_many_arguments,
         reason = "ordered_or_inline's handles plus the one routing fact it is parameterised on"
     )]
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn ordered_or_inline_routed(
         ui_writes_can_block: bool,
         term: &Arc<Mutex<Terminal>>,
@@ -2086,6 +2169,10 @@ pub(crate) mod paste_order {
     /// non-parking interactive egress — except that a paste with nothing queued
     /// ahead of it is written inline too, into the sink's own spill, whose
     /// drain the paste's reply waits on. Never parks the lane on the program.
+    ///
+    /// An event handed to the ordered writer comes with its [`Written`]: admission
+    /// is not the write, so the lane's reply waits, bounded, for the write's own
+    /// receipt, and a write into a dead peer is answered as failed.
     pub(crate) fn unparked_observed(
         term: &Arc<Mutex<Terminal>>,
         modes: &Arc<ModeMirror>,
@@ -2093,9 +2180,32 @@ pub(crate) mod paste_order {
         echo: &Arc<OutputEchoTracker>,
         ev: &InputEvent,
         completion: Option<crate::control_input_ack::InputCompletion>,
-    ) -> crate::input::EgressReceipt {
-        let queue = ui_writes_can_block() || is_ordering(sink);
-        queued_or_inline_observed(queue, term, modes, sink, echo, ev, None, None, completion).0
+    ) -> (crate::input::EgressReceipt, Option<Written>) {
+        if !(ui_writes_can_block() || is_ordering(sink)) {
+            let inline = queued_or_inline_observed(
+                false, term, modes, sink, echo, ev, None, None, completion,
+            );
+            return (inline.0, None);
+        }
+        let (written, receipt) = sync_channel(1);
+        match submit(
+            term,
+            modes,
+            sink,
+            Some(echo),
+            ev.clone(),
+            None,
+            None,
+            None,
+            completion,
+            Some(written),
+        ) {
+            Ok(()) => (
+                crate::input::EgressReceipt::deferred_full(),
+                Some(Written(receipt)),
+            ),
+            Err(_) => (crate::input::EgressReceipt::queue_full(), None),
+        }
     }
 
     /// The tail [`ordered_or_inline_routed`] and [`unparked_observed`] share: `queue`
@@ -2105,7 +2215,7 @@ pub(crate) mod paste_order {
         clippy::too_many_arguments,
         reason = "ordered_or_inline's handles plus the routing decision already made"
     )]
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn queued_or_inline(
         queue: bool,
         term: &Arc<Mutex<Terminal>>,
@@ -2199,25 +2309,56 @@ pub(crate) mod paste_order {
         sink: &Arc<SinkWriter>,
         ev: &InputEvent,
     ) -> crate::input::EgressReceipt {
+        report_route(ui_writes_can_block, term, modes, sink, ev, false).0
+    }
+
+    /// [`report_ordered_or_inline`] for a control lane's mouse report into a session
+    /// not on screen: a report handed to the ordered writer comes with its
+    /// [`Written`], as [`unparked_observed`]'s events do.
+    pub(crate) fn report_unparked(
+        term: &Arc<Mutex<Terminal>>,
+        modes: &Arc<ModeMirror>,
+        sink: &Arc<SinkWriter>,
+        ev: &InputEvent,
+    ) -> (crate::input::EgressReceipt, Option<Written>) {
+        report_route(ui_writes_can_block(), term, modes, sink, ev, true)
+    }
+
+    /// The report route's one body; `written` asks for the queued write's [`Written`].
+    fn report_route(
+        ui_writes_can_block: bool,
+        term: &Arc<Mutex<Terminal>>,
+        modes: &Arc<ModeMirror>,
+        sink: &Arc<SinkWriter>,
+        ev: &InputEvent,
+        written: bool,
+    ) -> (crate::input::EgressReceipt, Option<Written>) {
         if !(ui_writes_can_block || is_ordering(sink)) {
-            return crate::input::seam_egress_receipt(
+            let receipt = crate::input::seam_egress_receipt(
                 term,
                 modes,
                 sink,
                 ev,
                 crate::input::EgressMode::Interactive,
             );
+            return (receipt, None);
         }
         let (egress, bytes) = crate::input::seam_encode(term, modes, sink, ev);
         if bytes.is_empty() {
-            return crate::input::EgressReceipt::unwritten(egress);
+            return (crate::input::EgressReceipt::unwritten(egress), None);
         }
+        let (tx, rx) = if written {
+            let (tx, rx) = sync_channel(1);
+            (Some(tx), Some(Written(rx)))
+        } else {
+            (None, None)
+        };
         // The seam's own bytes, carried verbatim: the raw-bytes arm writes
         // exactly them, so the writer produces nothing of its own.
         let frame = InputEvent::KeySequence(bytes);
-        match submit(term, modes, sink, None, frame, None, None, None, None) {
-            Ok(()) => crate::input::EgressReceipt::deferred_full(),
-            Err(_) => crate::input::EgressReceipt::queue_full(),
+        match submit(term, modes, sink, None, frame, None, None, None, None, tx) {
+            Ok(()) => (crate::input::EgressReceipt::deferred_full(), rx),
+            Err(_) => (crate::input::EgressReceipt::queue_full(), None),
         }
     }
 
@@ -2263,7 +2404,7 @@ pub(crate) mod paste_order {
     /// registered under a number the next fixture's `pipe()` reuses; pruning dead
     /// sinks cannot drop it. The pointer compare is sound for a dead entry too, since
     /// a `Weak` keeps its allocation.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn admitted_for_test(sink: &Arc<SinkWriter>) -> (u64, u64) {
         REG.lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -2277,7 +2418,7 @@ pub(crate) mod paste_order {
 
     /// Test-only: the admission's limits: retained bytes, jobs, and the bytes and
     /// jobs a paste or encoded report may use (the rest is the keys' reserve).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) const fn limits_for_test() -> (u32, u32, u32, u32) {
         (
             LIMITS.bytes,
@@ -2388,12 +2529,38 @@ mod paste_order_sink_isolation_tests;
 /// Map the seam's [`input::Egress`] to the reply-bearing [`InputOutcome`]: a failed
 /// PTY write becomes `WriteFailed` (→ `ERR write failed`) so a reply-bearing verb is
 /// never told OK for bytes that did not land (the input-path reply-fidelity contract).
-pub(crate) fn egress_to_outcome(e: input::Egress) -> InputOutcome {
+fn egress_to_outcome(e: input::Egress) -> InputOutcome {
     match e {
         input::Egress::Reported(input::Delivery::Full) | input::Egress::TrackingOff { .. } => {
             InputOutcome::Ok
         }
         input::Egress::Reported(_) => InputOutcome::WriteFailed,
+    }
+}
+
+/// The answer for a paste the ordered writer refused whole: its queue full now is
+/// [`InputOutcome::QueueFull`] (`ERR busy`, retryable as is), the answer every route
+/// gives a refusal at the input cap; a paste too large for the queue, or a writer
+/// gone, is a failed write, which a retry as is cannot cure.
+const fn rejected_outcome(rejected: paste_order::Rejected) -> InputOutcome {
+    match rejected {
+        paste_order::Rejected::Full => InputOutcome::QueueFull,
+        paste_order::Rejected::TooLarge | paste_order::Rejected::Unavailable => {
+            InputOutcome::WriteFailed
+        }
+    }
+}
+
+/// [`egress_to_outcome`] for a whole receipt: a refusal at the session's input cap
+/// with nothing written is [`InputOutcome::QueueFull`], whichever route took the
+/// event (the front tab's seam, a hidden session, a background control lane). One
+/// cut short after an accepted prefix (a wheel's later notches) stays a failed
+/// write: a retry would send the prefix twice.
+pub(crate) fn receipt_outcome(receipt: input::EgressReceipt) -> InputOutcome {
+    if receipt.input_queue_full() && receipt.accepted_order().is_none() {
+        InputOutcome::QueueFull
+    } else {
+        egress_to_outcome(receipt.egress)
     }
 }
 
@@ -2478,8 +2645,8 @@ fn wheel_viewport_lines(notch_lines: i32, page_rows: u16, detent: bool) -> i32 {
 /// is `1`.
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) fn base_logical_key(ev: &KeyEvent) -> Key {
-    use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-    if ev.location == winit::keyboard::KeyLocation::Numpad {
+    use aterm_window::platform::modifier_supplement::KeyEventExtModifierSupplement;
+    if ev.location == aterm_window::keyboard::KeyLocation::Numpad {
         return ev.logical_key.clone();
     }
     ev.key_without_modifiers()
@@ -2501,7 +2668,9 @@ pub(crate) fn base_logical_key(ev: &KeyEvent) -> Key {
 fn field_chord_key(ev: &KeyEvent, mods: ModifiersState) -> Key {
     let base = base_logical_key(ev);
     match keybinding::chord_layout_twin(&base, ev.physical_key, mods) {
-        Some(twin) => Key::Character(winit::keyboard::SmolStr::new(twin.encode_utf8(&mut [0; 4]))),
+        Some(twin) => Key::Character(aterm_window::keyboard::SmolStr::new(
+            twin.encode_utf8(&mut [0; 4]),
+        )),
         None => base,
     }
 }
@@ -2714,6 +2883,11 @@ pub(crate) const HARDCODED_SUPER_CHORDS: bool = !cfg!(target_os = "linux");
 /// the sole chord modifier (Caps/Num Lock never appear in `ModifiersState`). The
 /// xterm / Terminal.app convention: Shift forms scroll the view, plain keys reach
 /// the application.
+///
+/// WINDOWS: Shift+Home / Shift+End are stock PSReadLine's SelectBackwardsLine /
+/// SelectLine, so there the jumps take Windows Terminal's Ctrl+Shift+Home / End,
+/// and Ctrl+Shift+PageUp / PageDown page as Shift+PageUp / PageDown do (which
+/// PSReadLine binds to nothing).
 fn scrollback_chord(mods: ModifiersState, ev: &KeyEvent) -> Option<ScrollIntent> {
     // ⌘↓ jumps to the live bottom and ⌘↑ to the oldest retained line: a deliberate
     // way back to live, since ordinary keys no longer snap a scrolled-up view.
@@ -2731,14 +2905,22 @@ fn scrollback_chord(mods: ModifiersState, ev: &KeyEvent) -> Option<ScrollIntent>
             _ => None,
         };
     }
-    if !mods.shift_key() || mods.control_key() || mods.alt_key() || mods.super_key() {
+    let windows_terminal_chord = cfg!(windows)
+        && mods.shift_key()
+        && mods.control_key()
+        && !mods.alt_key()
+        && !mods.super_key();
+    if !windows_terminal_chord
+        && (!mods.shift_key() || mods.control_key() || mods.alt_key() || mods.super_key())
+    {
         return None;
     }
+    let jumps = windows_terminal_chord || !cfg!(windows);
     match ev.logical_key {
         Key::Named(NamedKey::PageUp) => Some(ScrollIntent::Up),
         Key::Named(NamedKey::PageDown) => Some(ScrollIntent::Down),
-        Key::Named(NamedKey::Home) => Some(ScrollIntent::Top),
-        Key::Named(NamedKey::End) => Some(ScrollIntent::Bottom),
+        Key::Named(NamedKey::Home) if jumps => Some(ScrollIntent::Top),
+        Key::Named(NamedKey::End) if jumps => Some(ScrollIntent::Bottom),
         _ => None,
     }
 }
@@ -2808,16 +2990,14 @@ fn find_suspends_action(action: keybinding::Action) -> bool {
 }
 
 /// Classify the terminal-only Emacs navigation chords after layout normalization.
-/// Exactly bare Super-S/Super-R qualify: adding Shift, Control, or Alt leaves the
+/// Bare Super-S/Super-R (when `HARDCODED_SUPER_CHORDS` is enabled) and bare
+/// Control-S/Control-R qualify: adding Shift, Alt, or both Super+Control leaves the
 /// chord available to its existing owner. The caller intentionally runs this only
 /// after the native-view and configured-keybinding boundaries.
 fn terminal_emacs_search_direction(base: &Key, mods: ModifiersState) -> Option<bool> {
-    if !HARDCODED_SUPER_CHORDS
-        || !mods.super_key()
-        || mods.shift_key()
-        || mods.control_key()
-        || mods.alt_key()
-    {
+    let bare_super = HARDCODED_SUPER_CHORDS && mods == ModifiersState::SUPER;
+    let bare_ctrl = mods == ModifiersState::CONTROL;
+    if !bare_super && !bare_ctrl {
         return None;
     }
     match base {
@@ -3690,6 +3870,13 @@ impl PressKind {
     }
 }
 
+/// [`note_person_reaching`] for a gesture that reached the program (the
+/// seam's own calls name the class: [`note_person_event`]).
+#[cfg(test)]
+pub(crate) fn note_person(ctx: &crate::SessionCtx, gesture: crate::human_input::Gesture) -> bool {
+    note_person_reaching(ctx, gesture, true)
+}
+
 /// A person's hands were on `ctx`'s session (typing, pasting, clicking, dragging,
 /// scrolling, composing): stamps its person clock
 /// ([`crate::human_input::HumanInputStamp`], `human_ms=`) and records the `human`
@@ -3706,20 +3893,64 @@ impl PressKind {
 /// Returns whether the session log's readers are owed a wake (a burst's `mark -
 /// human` was written): the caller wakes the session's subscribers, the
 /// timeline's lock released.
-pub(crate) fn note_person(ctx: &crate::SessionCtx, gesture: crate::human_input::Gesture) -> bool {
-    if ctx.human_input.note(crate::metrics::now_us(), gesture) {
+///
+/// `reaches` is whether the gesture reached the program
+/// ([`crate::human_input::reaches_program`]): every gesture stamps the
+/// person's clock, counts, and writes the burst's `human` row and mark; only
+/// one that reached the program can dismiss a box or answer delivered mail
+/// in the session log (rulings T1, T39). Its delivery to the log is once per
+/// count ([`crate::session_log::SessionLog::person_input`]).
+pub(crate) fn note_person_reaching(
+    ctx: &crate::SessionCtx,
+    gesture: crate::human_input::Gesture,
+    reaches: bool,
+) -> bool {
+    let noted = ctx
+        .human_input
+        .note_reaching(crate::metrics::now_us(), gesture, reaches);
+    deliver_noted(ctx, noted, reaches)
+}
+
+/// The timeline half of [`note_person_reaching`], for the gesture `noted`
+/// counted: a burst's row and its delivery under the lock, any other's
+/// delivery through a `try_lock`.
+pub(crate) fn deliver_noted(
+    ctx: &crate::SessionCtx,
+    noted: crate::human_input::Noted,
+    reaches: bool,
+) -> bool {
+    if noted.burst {
         let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         tl.record("human", String::new());
         let at = tl.slog().now();
-        tl.slog_mut().human_input(true, at);
+        let own = crate::session_log::PersonGesture {
+            burst: Some(noted.seq),
+            reaches,
+        };
+        tl.slog_mut().person_input(Some(own), at);
         tl.slog_take_wake()
     } else if let Ok(mut tl) = ctx.timeline.try_lock() {
         let at = tl.slog().now();
-        tl.slog_mut().human_input(false, at);
+        let own = crate::session_log::PersonGesture {
+            burst: None,
+            reaches,
+        };
+        tl.slog_mut().person_input(Some(own), at);
         false
     } else {
         false
     }
+}
+
+/// [`note_person_reaching`] for the person's gesture `ev` as the seam
+/// receives it, classed by the session's mode mirror
+/// ([`crate::human_input::reaches_program`]).
+pub(crate) fn note_person_event(ctx: &crate::SessionCtx, ev: &InputEvent) -> bool {
+    note_person_reaching(
+        ctx,
+        crate::human_input::Gesture::of(ev),
+        crate::human_input::reaches_program(ev, &ctx.modes),
+    )
 }
 
 /// The press half of the custody record: which of the four press classes this
@@ -4901,9 +5132,10 @@ impl App {
                     }
                     InputOutcome::Ok
                 }
+                // Refused whole: nothing of the paste was written.
                 Err(rejected) => {
                     self.refuse_input(target_session, InputRefusal::of_rejected(rejected));
-                    InputOutcome::WriteFailed
+                    rejected_outcome(rejected)
                 }
             };
         }
@@ -4919,7 +5151,7 @@ impl App {
         if receipt.input_queue_full() {
             self.refuse_input(target_session, InputRefusal::Busy);
         }
-        egress_to_outcome(receipt.egress)
+        receipt_outcome(receipt)
     }
 
     /// Stamps `session`'s person clock ([`crate::SessionCtx::human_input`]) when `ev`
@@ -4932,7 +5164,7 @@ impl App {
             // A person is present: the warm spare may exist (`spare`).
             self.spares.note_person(std::time::Instant::now());
             if let Some(owner) = self.pool.get(session) {
-                let owed = note_person(&owner.ctx, crate::human_input::Gesture::of(ev));
+                let owed = note_person_event(&owner.ctx, ev);
                 self.wake_log_watchers(session, owed);
             }
         }
@@ -5104,22 +5336,27 @@ impl App {
                 // arrive only here). Only one overlay can be open, so dispatch needs no
                 // ordering. Then swallow from the PTY.
                 use crate::overlay::OverlayKind;
-                match self
-                    .windows
-                    .get(&wid)
-                    .and_then(|ws| ws.overlay.as_ref())
-                    .map(|o| o.kind())
-                {
-                    Some(OverlayKind::Palette) => self.palette_input_event(wid, &ev),
-                    Some(OverlayKind::ConnCard) => self.conn_card_input_event(wid, &ev),
-                    Some(OverlayKind::SessionPicker) => {
-                        self.session_picker_input_event(wid, &ev);
+                // A control client's key into an open overlay is its gesture,
+                // never the person's: Take Over and Hand Back refuse under it
+                // (`App::person_gesture_refused`).
+                let controller = matches!(src, Source::Controller);
+                self.with_gesture_source(controller, |app| {
+                    match app
+                        .windows
+                        .get(&wid)
+                        .and_then(|ws| ws.overlay.as_ref())
+                        .map(|o| o.kind())
+                    {
+                        Some(OverlayKind::Palette) => app.palette_input_event(wid, &ev),
+                        Some(OverlayKind::SessionPicker) => {
+                            app.session_picker_input_event(wid, &ev);
+                        }
+                        Some(OverlayKind::Overview) => {
+                            app.overview_input_event(wid, &ev);
+                        }
+                        None => {}
                     }
-                    Some(OverlayKind::ConnectionMap) => {
-                        self.connection_map_input_event(wid, &ev);
-                    }
-                    None => {}
-                }
+                });
                 return InputOutcome::Ok;
             }
         }
@@ -5128,7 +5365,11 @@ impl App {
         // rename field), so a controller's `aterm ctl key menu` and the physical Menu
         // key answer alike. A consumed press is recorded in the overlay gate's set so
         // its release is swallowed above.
-        if target_session.is_none() && self.tab_menu_input_event(wid, &ev) {
+        if target_session.is_none()
+            && self.with_gesture_source(matches!(src, Source::Controller), |app| {
+                app.tab_menu_input_event(wid, &ev)
+            })
+        {
             if let InputEvent::Key {
                 key, event_type, ..
             } = &ev
@@ -5459,7 +5700,7 @@ impl App {
                             // string: an unrecognized spelling renders the default, and
                             // parsing it would wrongly answer `Lumen`.
                             let n = crate::app_render::ordinary_kitty_cursor_enabled(
-                                self.config.cursor_trail_or_default(),
+                                self.config.cursor_trail_drawn(),
                                 self.glow_style(),
                             );
                             self.kitty_cursor_enabled_cache = Some(n);
@@ -6212,7 +6453,7 @@ impl App {
                         .then_some((session, self.proxy.as_ref())),
                     completion,
                 );
-                let outcome = egress_to_outcome(receipt.egress);
+                let outcome = receipt_outcome(receipt);
                 // The input queue is full: the program stopped reading or the ordered
                 // writer could take no more, so this key was refused. Nothing reached
                 // the PTY; say so once ([`App::refuse_input`]).
@@ -6224,7 +6465,7 @@ impl App {
                 // reaches the wire. A failed inline write reached no tty, and its cohort
                 // is revoked below.
                 if swallowed_press
-                    && outcome != InputOutcome::WriteFailed
+                    && !outcome.failed()
                     && let Some(ws) = self.windows.get_mut(&wid)
                 {
                     ws.fx.cursor_mut().glow.note_typed_swallowed_no_echo();
@@ -6245,11 +6486,11 @@ impl App {
                 // no effect tick sees the arm above before this timestamp-matched
                 // revoke; the licence returns at delivery through the ticket's key class
                 // (`revoke_dispatch` says which engine keeps what).
-                if (!wrote_inline || outcome == InputOutcome::WriteFailed)
+                if (!wrote_inline || outcome.failed())
                     && let Some(armed_at) = input_now
                     && let Some(ws) = self.windows.get_mut(&wid)
                 {
-                    revoke_dispatch(ws, armed_at, outcome == InputOutcome::WriteFailed);
+                    revoke_dispatch(ws, armed_at, outcome.failed());
                 }
                 // The PTY write has returned: close the key→write latency slice (press
                 // path only), paired with `note_input()` above.
@@ -6624,7 +6865,7 @@ impl App {
                 {
                     self.clear_move_license(wid);
                 }
-                egress_to_outcome(receipt.egress)
+                receipt_outcome(receipt)
             }
             // --- Wheel: N reports/line when tracking ON else scroll viewport (e) -
             ev @ InputEvent::Wheel { .. } => {
@@ -6788,7 +7029,7 @@ impl App {
                 self.finish_selection(wid, suppress_copy_on_select);
             }
         }
-        egress_to_outcome(egress)
+        receipt_outcome(receipt)
     }
 
     /// The `InputEvent::Wheel` arm of [`App::input`]: with tracking on, per-line
@@ -6896,7 +7137,7 @@ impl App {
             // a glide still tracking settles to its whole row now. Display-side only.
             self.release_scroll_track(wid);
         }
-        egress_to_outcome(egress)
+        receipt_outcome(receipt)
     }
 
     /// Whether a precise delta of `dy_px` (+ = into history) pushes a band armed on
@@ -7502,16 +7743,24 @@ impl App {
     /// pinned engine.
     pub(crate) fn service_due_scroll_motion(&mut self, now: std::time::Instant) -> Vec<WindowId> {
         let mut ticked: Vec<WindowId> = Vec::new();
-        let glide_due: Vec<WindowId> = self
-            .windows
-            .iter()
-            .filter(|(_, ws)| {
-                ws.scroll_glide
-                    .as_ref()
-                    .is_some_and(|st| now >= st.wake_deadline())
-            })
-            .map(|(id, _)| *id)
-            .collect();
+        let mut glide_due: Vec<WindowId> = Vec::new();
+        let mut bounce_due: Vec<WindowId> = Vec::new();
+        for (&id, ws) in &self.windows {
+            if ws
+                .scroll_glide
+                .as_ref()
+                .is_some_and(|st| now >= st.wake_deadline())
+            {
+                glide_due.push(id);
+            }
+            if ws
+                .overscroll
+                .as_ref()
+                .is_some_and(|sp| now >= sp.wake_deadline())
+            {
+                bounce_due.push(id);
+            }
+        }
         for id in glide_due {
             self.tick_scroll_glide(id, now);
             // A band parked at an edge just wrote frac 0, but a live bounce owns
@@ -7524,21 +7773,29 @@ impl App {
                 ws.scroll_frac_px = sp.sample(now).0.round() as i32;
             }
             ticked.push(id);
-        }
-        let bounce_due: Vec<WindowId> = self
-            .windows
-            .iter()
-            .filter(|(_, ws)| {
-                ws.overscroll
-                    .as_ref()
+            // A glide tick that just started an edge bounce whose wake_deadline is <= now
+            // also services that bounce in this pass.
+            if !bounce_due.contains(&id)
+                && self
+                    .windows
+                    .get(&id)
+                    .and_then(|ws| ws.overscroll.as_ref())
                     .is_some_and(|sp| now >= sp.wake_deadline())
-            })
-            .map(|(id, _)| *id)
-            .collect();
+            {
+                bounce_due.push(id);
+            }
+        }
         for id in bounce_due {
-            self.tick_overscroll(id, now);
-            if !ticked.contains(&id) {
-                ticked.push(id);
+            if self
+                .windows
+                .get(&id)
+                .and_then(|ws| ws.overscroll.as_ref())
+                .is_some_and(|sp| now >= sp.wake_deadline())
+            {
+                self.tick_overscroll(id, now);
+                if !ticked.contains(&id) {
+                    ticked.push(id);
+                }
             }
         }
         ticked
@@ -7787,7 +8044,7 @@ impl App {
             }
             Err(rejected) => {
                 self.refuse_input(session, InputRefusal::of_rejected(rejected));
-                return InputOutcome::WriteFailed;
+                return rejected_outcome(rejected);
             }
         }
         self.snap_to_bottom(wid);
@@ -7902,7 +8159,7 @@ impl App {
             // answer and is fed through the event's path (macOS, X11 and Windows return
             // `None` and stay event-driven).
             if let Some(applied) =
-                w.request_inner_size(winit::dpi::PhysicalSize::new(width, height))
+                w.request_inner_size(aterm_window::dpi::PhysicalSize::new(width, height))
             {
                 // The event's path includes the metrics: the `Resized` handler arms
                 // the resize→present and resize→reflow slices, and no `Resized` will
@@ -7990,7 +8247,7 @@ impl App {
     fn note_consumed_press_key(
         &mut self,
         wid: WindowId,
-        physical_key: winit::keyboard::PhysicalKey,
+        physical_key: aterm_window::keyboard::PhysicalKey,
         repeat: bool,
     ) {
         if repeat {
@@ -8024,7 +8281,7 @@ impl App {
     fn note_forwarded_press_key(
         &mut self,
         wid: WindowId,
-        physical_key: winit::keyboard::PhysicalKey,
+        physical_key: aterm_window::keyboard::PhysicalKey,
         repeat: bool,
         key: aterm_types::keyboard::Key,
         mods: aterm_types::keyboard::Modifiers,
@@ -8054,7 +8311,9 @@ impl App {
 
     /// Record and deliver literal text/raw bytes as one immutable physical-key
     /// episode. Unlike an encoded key press it has no CSI-u release peer, but
-    /// any auto-repeat must retain this exact session and payload.
+    /// any auto-repeat must retain this exact session and payload: `event`, or
+    /// `repeat` where the platform repeats less than the press typed
+    /// ([`keymap::text_press_repeat`]).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -8066,8 +8325,9 @@ impl App {
     fn forward_literal_press(
         &mut self,
         wid: WindowId,
-        physical_key: winit::keyboard::PhysicalKey,
+        physical_key: aterm_window::keyboard::PhysicalKey,
         event: InputEvent,
+        repeat: Option<InputEvent>,
     ) {
         debug_assert!(matches!(
             event,
@@ -8084,6 +8344,7 @@ impl App {
                 window: wid,
                 session,
                 event: event.clone(),
+                repeat,
             },
         );
         #[cfg(test)]
@@ -8106,7 +8367,7 @@ impl App {
             repeated: false,
             delivery: match outcome {
                 InputOutcome::Ok => input::Delivery::Full,
-                InputOutcome::WriteFailed => input::Delivery::Failed,
+                InputOutcome::WriteFailed | InputOutcome::QueueFull => input::Delivery::Failed,
                 InputOutcome::RangeRejected => {
                     unreachable!("a raw key sequence cannot produce a resize range verdict")
                 }
@@ -8130,7 +8391,7 @@ impl App {
     fn repeat_literal(
         &mut self,
         repeat_window: WindowId,
-        physical_key: winit::keyboard::PhysicalKey,
+        physical_key: aterm_window::keyboard::PhysicalKey,
     ) -> bool {
         #[cfg(test)]
         clear_physical_release_trace();
@@ -8138,11 +8399,13 @@ impl App {
             window,
             session,
             event,
+            repeat,
         }) = self.physical_press_owners.get(&physical_key)
         else {
             return false;
         };
-        let (window, session, event) = (*window, *session, event.clone());
+        let (window, session, event) =
+            (*window, *session, repeat.as_ref().unwrap_or(event).clone());
         if self.pool.get(session).is_none() {
             return true;
         }
@@ -8168,7 +8431,7 @@ impl App {
             repeated: true,
             delivery: match outcome {
                 InputOutcome::Ok => input::Delivery::Full,
-                InputOutcome::WriteFailed => input::Delivery::Failed,
+                InputOutcome::WriteFailed | InputOutcome::QueueFull => input::Delivery::Failed,
                 InputOutcome::RangeRejected => {
                     unreachable!("a raw key sequence cannot produce a resize range verdict")
                 }
@@ -8193,7 +8456,7 @@ impl App {
     fn note_local_repeat_press(
         &mut self,
         wid: WindowId,
-        physical_key: winit::keyboard::PhysicalKey,
+        physical_key: aterm_window::keyboard::PhysicalKey,
         action: crate::LocalRepeatAction,
     ) {
         self.retire_previous_physical_press_owner(wid, physical_key);
@@ -8288,12 +8551,12 @@ impl App {
                 self.note_update_handoff_activity();
                 match action {
                     FontZoomRepeatAction::Increase => {
-                        self.set_font_px(self.font_px + FONT_ZOOM_STEP);
+                        self.set_font_size(self.font_size + FONT_ZOOM_STEP);
                     }
                     FontZoomRepeatAction::Decrease => {
-                        self.set_font_px(self.font_px - FONT_ZOOM_STEP);
+                        self.set_font_size(self.font_size - FONT_ZOOM_STEP);
                     }
-                    FontZoomRepeatAction::Reset => self.set_font_px(self.default_font_px),
+                    FontZoomRepeatAction::Reset => self.set_font_size(self.default_font_size),
                 }
                 true
             }
@@ -8326,7 +8589,7 @@ impl App {
     fn repeat_local_press(
         &mut self,
         arrival_window: WindowId,
-        physical_key: winit::keyboard::PhysicalKey,
+        physical_key: aterm_window::keyboard::PhysicalKey,
     ) -> bool {
         #[cfg(test)]
         clear_physical_release_trace();
@@ -8355,7 +8618,7 @@ impl App {
     fn retire_previous_physical_press_owner(
         &mut self,
         replacement_window: WindowId,
-        physical_key: winit::keyboard::PhysicalKey,
+        physical_key: aterm_window::keyboard::PhysicalKey,
     ) {
         if self.physical_press_owners.contains_key(&physical_key) {
             // The ordinary release seam carries every rule: exact press-time
@@ -8371,7 +8634,7 @@ impl App {
     fn press_was_consumed(
         &self,
         _wid: WindowId,
-        physical_key: winit::keyboard::PhysicalKey,
+        physical_key: aterm_window::keyboard::PhysicalKey,
     ) -> bool {
         matches!(
             self.physical_press_owners.get(&physical_key),
@@ -8390,7 +8653,7 @@ impl App {
             project = "aterm_gui::app_input::input_release_pairing_conformance::project"
         )
     )]
-    fn repeat_is_untracked(&self, physical_key: winit::keyboard::PhysicalKey) -> bool {
+    fn repeat_is_untracked(&self, physical_key: aterm_window::keyboard::PhysicalKey) -> bool {
         !self.physical_press_owners.contains_key(&physical_key)
     }
 
@@ -8402,7 +8665,7 @@ impl App {
     fn route_physical_repeat(
         &mut self,
         arrival_window: WindowId,
-        physical_key: winit::keyboard::PhysicalKey,
+        physical_key: aterm_window::keyboard::PhysicalKey,
     ) {
         if self.repeat_local_press(arrival_window, physical_key) {
             return;
@@ -8439,7 +8702,7 @@ impl App {
     fn repeat_forwarded_press(
         &mut self,
         repeat_window: WindowId,
-        physical_key: winit::keyboard::PhysicalKey,
+        physical_key: aterm_window::keyboard::PhysicalKey,
     ) -> bool {
         #[cfg(test)]
         clear_physical_release_trace();
@@ -8485,7 +8748,7 @@ impl App {
         {
             let delivery = match outcome {
                 InputOutcome::Ok => input::Delivery::Full,
-                InputOutcome::WriteFailed => input::Delivery::Failed,
+                InputOutcome::WriteFailed | InputOutcome::QueueFull => input::Delivery::Failed,
                 InputOutcome::RangeRejected => {
                     unreachable!("a key repeat cannot produce a resize range verdict")
                 }
@@ -8521,7 +8784,7 @@ impl App {
     fn take_consumed_release(
         &mut self,
         release_window: WindowId,
-        physical_key: winit::keyboard::PhysicalKey,
+        physical_key: aterm_window::keyboard::PhysicalKey,
     ) -> bool {
         #[cfg(not(test))]
         let _ = release_window;
@@ -8554,7 +8817,7 @@ impl App {
     fn take_literal_release(
         &mut self,
         release_window: WindowId,
-        physical_key: winit::keyboard::PhysicalKey,
+        physical_key: aterm_window::keyboard::PhysicalKey,
     ) -> bool {
         #[cfg(not(test))]
         let _ = release_window;
@@ -8587,7 +8850,7 @@ impl App {
     fn take_local_repeat_release(
         &mut self,
         release_window: WindowId,
-        physical_key: winit::keyboard::PhysicalKey,
+        physical_key: aterm_window::keyboard::PhysicalKey,
     ) -> bool {
         #[cfg(not(test))]
         let _ = release_window;
@@ -8623,7 +8886,7 @@ impl App {
     pub(crate) fn release_physical_press(
         &mut self,
         release_window: WindowId,
-        physical_key: winit::keyboard::PhysicalKey,
+        physical_key: aterm_window::keyboard::PhysicalKey,
     ) {
         #[cfg(test)]
         clear_physical_release_trace();
@@ -9314,6 +9577,7 @@ impl App {
                             wid,
                             ev.physical_key,
                             InputEvent::KeySequence(bytes),
+                            None,
                         );
                         return;
                     }
@@ -9323,16 +9587,13 @@ impl App {
         }
         // Terminal Emacs navigation: native content and configured bindings
         // have had first refusal. A genuine press captures a local
-        // repeat owner, so a held Cmd-S/Cmd-R repeats search against the
-        // press-time terminal and every Kitty release stays byte-silent; shells,
-        // Claude and Codex see zero bytes. Only bare Cmd-S/R qualify, so the
-        // base key is normalized only after the modifier gate (never on Linux,
-        // where the Cmd suite is off).
-        if HARDCODED_SUPER_CHORDS
-            && mods.super_key()
-            && !mods.shift_key()
-            && !mods.control_key()
-            && !mods.alt_key()
+        // repeat owner, so a held Cmd-S/Cmd-R or Ctrl-S/Ctrl-R repeats search
+        // against the press-time terminal and every Kitty release stays
+        // byte-silent; shells, Claude and Codex see zero bytes. Only bare
+        // Cmd-S/R (when `HARDCODED_SUPER_CHORDS` is on) and bare Ctrl-S/R
+        // qualify, so the base key is normalized only after the modifier gate.
+        if ((HARDCODED_SUPER_CHORDS && mods == ModifiersState::SUPER)
+            || mods == ModifiersState::CONTROL)
             && let Some(forward) = terminal_emacs_search_direction(
                 base_key.get_or_insert_with(|| base_logical_key(&ev)),
                 mods,
@@ -9363,9 +9624,13 @@ impl App {
         // encode to the app. Runs before snap_to_bottom so scrolling up is not
         // undone. Not while the find field owns input: ⇧Home would desync the
         // view from the highlighted match, and unshifted Home/End are caret
-        // motions in the field.
+        // motions in the field. Not on the alternate screen either, which has no
+        // scrollback to move: the chord goes to the program (less and vim page on
+        // Shift+PageUp) instead of doing nothing. (`scrollback_chord` has the
+        // Windows spellings.)
         if let Some(intent) = scrollback_chord(mods, &ev)
             .filter(|_| self.windows.get(&wid).is_none_or(|ws| ws.search.is_none()))
+            .filter(|_| !self.front_alternate_screen(wid))
         {
             if let Some(session) = self.front_terminal(wid).map(|terminal| terminal.session) {
                 self.note_local_repeat_press(
@@ -9513,7 +9778,12 @@ impl App {
             && !text.is_empty()
             && !text.chars().any(char::is_control)
         {
-            self.forward_literal_press(wid, ev.physical_key, InputEvent::Text(text.to_string()));
+            self.forward_literal_press(
+                wid,
+                ev.physical_key,
+                InputEvent::Text(text.to_string()),
+                None,
+            );
             return;
         }
         // A Cmd (Super) chord that reaches here was not claimed by a keybinding
@@ -9602,7 +9872,9 @@ impl App {
         // when no composition is active, but never for Ctrl/Alt/Super, whose
         // encoding the engine owns ([`physical_press`] built it bare-only).
         if let Some(text @ InputEvent::Text(_)) = press {
-            self.forward_literal_press(wid, ev.physical_key, text);
+            let repeat = keymap::text_press_repeat(&ev, keymap::modifiers_from_winit(mods))
+                .map(InputEvent::Text);
+            self.forward_literal_press(wid, ev.physical_key, text, repeat);
             return;
         }
         // No byte-producing press was observed, so a later CSI-u release has no
@@ -9617,6 +9889,15 @@ impl App {
         // `NamedKey` long tail (media/browser/launch keys). None produce PTY
         // bytes, so none snap the viewport.
         self.note_consumed_press(wid, &ev);
+    }
+
+    /// Whether the front terminal shows its alternate screen, which keeps no
+    /// scrollback, read lock-free from the session's `ModeMirror`. No front
+    /// terminal (a native tab) ⇒ `false`.
+    fn front_alternate_screen(&self, wid: WindowId) -> bool {
+        self.front_terminal(wid)
+            .and_then(|t| self.pool.get(t.session))
+            .is_some_and(|s| s.ctx.modes.alternate_screen())
     }
 
     /// Whether the front terminal's keyboard mode carries kitty
@@ -9754,11 +10035,7 @@ impl App {
                 // `route_physical_repeat` first, which replays the
                 // consumed-press disposition.
                 "q" => {
-                    if let Some(proxy) = self.proxy.as_ref() {
-                        let _ = proxy.send_event(Wake::MenuAction {
-                            action: crate::menu::MenuAction::Quit,
-                        });
-                    }
+                    self.post_menu_action(crate::menu::MenuAction::Quit);
                     return true;
                 }
                 "w" => {
@@ -9853,10 +10130,19 @@ impl App {
         let bare_cmd =
             mods.super_key() && !mods.shift_key() && !mods.control_key() && !mods.alt_key();
         // Match navigation gets first claim, then the generic field keymap. The
-        // two sets are disjoint (↑/↓ and ^S/^R/⌘S/⌘R are not field motions).
+        // two sets are disjoint (↑/↓, F3 and ^S/^R/⌘S/⌘R are not field motions).
         match &ev.logical_key {
             Key::Named(NamedKey::ArrowDown) => return Some(Action::Step(true)),
             Key::Named(NamedKey::ArrowUp) => return Some(Action::Step(false)),
+            // F3 / Shift+F3: find next / previous, the Windows (and VS Code) reflex
+            // `find_bar::hint_text` teaches there. Only while the field is open: a
+            // closed find leaves F3 to the program (`keybinding`'s seeding note).
+            #[cfg(not(target_os = "macos"))]
+            Key::Named(NamedKey::F3)
+                if !mods.control_key() && !mods.alt_key() && !mods.super_key() =>
+            {
+                return Some(Action::Repeat(!mods.shift_key()));
+            }
             // emacs isearch-repeat.
             _ if (ctrl || bare_cmd) && base_is("s") => return Some(Action::Repeat(true)),
             _ if (ctrl || bare_cmd) && base_is("r") => return Some(Action::Repeat(false)),
@@ -9886,7 +10172,7 @@ impl App {
     pub(crate) fn terminal_emacs_search_pressed(
         &mut self,
         wid: WindowId,
-        physical_key: winit::keyboard::PhysicalKey,
+        physical_key: aterm_window::keyboard::PhysicalKey,
         forward: bool,
     ) {
         let session = self.front_terminal(wid).map(|terminal| terminal.session);
@@ -10280,9 +10566,8 @@ impl App {
         }
         match kind {
             Some(OverlayKind::Palette) => self.on_key_palette_mode(wid, mods, ev),
-            Some(OverlayKind::ConnCard) => self.on_key_conn_card_mode(wid, ev),
             Some(OverlayKind::SessionPicker) => self.on_key_session_picker_mode(wid, ev),
-            Some(OverlayKind::ConnectionMap) => self.on_key_connection_map_mode(wid, ev),
+            Some(OverlayKind::Overview) => self.on_key_overview_mode(wid, ev),
             None => false,
         }
     }
@@ -10514,7 +10799,8 @@ impl App {
 
         // Closed: the chord may pop it, on the in-grid-strip platforms (Windows
         // and Linux) and only for a genuine press (a repeat of a held Menu key
-        // must not re-pop the card).
+        // must not re-pop the card). A control client's chord under a hold is
+        // swallowed with no card, as its `open tab-menu` is refused.
         #[cfg(any(windows, target_os = "linux"))]
         if let InputEvent::Key {
             key,
@@ -10525,6 +10811,9 @@ impl App {
             && tab_menu_chord(self.config.tab_menu_chord_or_default(), *mods, key)
             && !self.front_defers_tab_menu_chord(wid, key)
         {
+            if self.controller_card_refused() {
+                return true;
+            }
             return self.open_active_tab_context_menu(wid);
         }
         false
@@ -10552,13 +10841,13 @@ impl App {
     fn on_key_font_zoom(&mut self, mods: ModifiersState, ev: &KeyEvent) -> bool {
         match font_zoom_repeat_action(mods, ev) {
             Some(crate::FontZoomRepeatAction::Increase) => {
-                self.set_font_px(self.font_px + FONT_ZOOM_STEP);
+                self.set_font_size(self.font_size + FONT_ZOOM_STEP);
             }
             Some(crate::FontZoomRepeatAction::Decrease) => {
-                self.set_font_px(self.font_px - FONT_ZOOM_STEP);
+                self.set_font_size(self.font_size - FONT_ZOOM_STEP);
             }
             Some(crate::FontZoomRepeatAction::Reset) => {
-                self.set_font_px(self.default_font_px);
+                self.set_font_size(self.default_font_size);
             }
             None => return false,
         }
@@ -10632,9 +10921,9 @@ impl App {
                 self.paste_clipboard();
             }
             Action::Find => self.find_requested(),
-            Action::FontIncrease => self.set_font_px(self.font_px + FONT_ZOOM_STEP),
-            Action::FontDecrease => self.set_font_px(self.font_px - FONT_ZOOM_STEP),
-            Action::FontReset => self.set_font_px(self.default_font_px),
+            Action::FontIncrease => self.set_font_size(self.font_size + FONT_ZOOM_STEP),
+            Action::FontDecrease => self.set_font_size(self.font_size - FONT_ZOOM_STEP),
+            Action::FontReset => self.set_font_size(self.default_font_size),
             // Scrollback viewport navigation (the SAME machinery the wheel/trackpad
             // and the control socket drive via InputEvent::ScrollView).
             Action::ScrollPageUp => {
@@ -10695,10 +10984,8 @@ impl App {
             Action::ToggleSettings => {
                 if self.headless {
                     let _ = self.open_settings_tab(crate::native_settings::SettingsRoute::Home);
-                } else if let Some(proxy) = self.proxy.as_ref() {
-                    let _ = proxy.send_event(Wake::MenuAction {
-                        action: crate::menu::MenuAction::ToggleSettings,
-                    });
+                } else {
+                    self.post_menu_action(crate::menu::MenuAction::ToggleSettings);
                 }
             }
             Action::ToggleAbout => {
@@ -10805,7 +11092,8 @@ impl App {
             && let Some(session) = self.focused_session_id(wid)
             && let Some(owner) = self.pool.get(session)
         {
-            let owed = note_person(&owner.ctx, crate::human_input::Gesture::Other);
+            // The preedit reaches no program: it can dismiss no box.
+            let owed = note_person_reaching(&owner.ctx, crate::human_input::Gesture::Other, false);
             self.wake_log_watchers(session, owed);
         }
         if changed && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
@@ -10931,8 +11219,8 @@ impl App {
         ws.last_ime_rect = Some(rect);
         if let Some(window) = ws.os_window.as_ref() {
             window.set_ime_cursor_area(
-                winit::dpi::PhysicalPosition::new(rect.0, rect.1),
-                winit::dpi::PhysicalSize::new(rect.2, rect.3),
+                aterm_window::dpi::PhysicalPosition::new(rect.0, rect.1),
+                aterm_window::dpi::PhysicalSize::new(rect.2, rect.3),
             );
         }
     }
@@ -11239,7 +11527,13 @@ impl App {
         let uri = crate::native_document_host::path_to_file_uri(path)
             .map_err(|error| format!("document open failed: {error}"))?;
         let admission = self.request_document_tab(kind, &uri)?;
-        Ok(admission.message(&crate::app_documents::DocumentAdmissionKey { uri, kind }))
+        Ok(
+            admission.message(&crate::app_documents::DocumentAdmissionKey {
+                uri,
+                kind,
+                edit: None,
+            }),
+        )
     }
 
     fn choose_and_open_document(&mut self, kind: crate::native_app::AppKind) {
@@ -11358,8 +11652,8 @@ impl App {
             // App menu --------------------------------------------------------
             // About and Software Update are routes inside the process-singleton
             // native Settings tab. Settings… (⌘,) focuses or creates that tab. "Open
-            // aterm.toml" opens the same file in Settings ▸ Manual's native assisted
-            // editor on every platform; Help opens the project documentation.
+            // aterm.toml" opens the file in the native assisted editor on every
+            // platform; Help opens the project documentation.
             MenuAction::About => {
                 let _ = self.open_settings_tab(crate::native_settings::SettingsRoute::About);
             }
@@ -11378,10 +11672,13 @@ impl App {
             // staged (stale nudge / QA seam) falls back to the Software Update
             // route.
             MenuAction::ApplyUpdate => self.apply_update_or_details(),
+            // "Open aterm.toml" opens the native editor on the one config
+            // file, as a message's Open aterm.toml does — never an external
+            // editor, and never by way of a Settings page.
             MenuAction::Preferences => {
-                let route = native_settings_route_for_menu(action)
-                    .expect("Preferences has one native Settings destination");
-                let _ = self.open_settings_tab(route);
+                if let Err(message) = self.open_config_editor_in_front() {
+                    aterm_log::warn!("Open aterm.toml: {message}");
+                }
             }
             MenuAction::Help => menu::open_help_url(),
             MenuAction::Quit => self.on_quit_requested(el),
@@ -11423,85 +11720,68 @@ impl App {
             // second window (the same live grid in two windows); the logical
             // attach and OS-window create run directly.
             MenuAction::ViewSessionInNewWindow => self.open_active_session_in_new_window(el),
-            // File ▸ session-connection spawn presets
-            // (`docs/design/SESSION_CONNECTIONS.md` §2.3): the origin is the
-            // focused session of the frontmost window (the items grey out over
-            // a native tab, so no session is a defensive no-op). Failures are
-            // logged; a menu click has no reply channel.
-            MenuAction::NewControlledWindow
-            | MenuAction::NewControlledTab
-            | MenuAction::NewControllerWindow
-            | MenuAction::NewControllerTab => {
-                let origin = self
-                    .frontmost_window
-                    .and_then(|w| self.front_terminal(w))
-                    .and_then(|t| self.pool.get(t.session))
-                    .map(|s| s.ctx.self_id.clone());
-                let Some(origin) = origin else {
-                    aterm_log::info!("connected spawn {action:?} dropped: no focused session");
-                    return;
-                };
-                self.spawn_connected_preset(action, &origin);
-            }
-            // Connection ids (`docs/design/SESSION_CONNECTIONS.md` §2.3):
-            // invoked without a tab context (palette / `invoke`), the subject
-            // is the frontmost window's front session; the tab-strip context
-            // menu posts `Wake::TabMenuAction` instead, carrying the clicked
-            // tab into `dispatch_tab_menu_action`. `session.connect_to` opens
-            // the picker; configure/disconnect open the sheet with one peer,
-            // the picker with several.
-            MenuAction::ConnectToSession
-            | MenuAction::ConfigureConnection
-            | MenuAction::DisconnectSession => {
-                let subject = self
-                    .frontmost_window
-                    .and_then(|w| self.front_terminal(w))
-                    .and_then(|t| self.pool.get(t.session))
-                    .map(|s| s.ctx.self_id.clone());
-                let (Some(wid), Some(subject)) = (self.frontmost_window, subject) else {
-                    aterm_log::info!("connection id {action:?} dropped: no focused session");
-                    return;
-                };
-                self.open_connection_ui(wid, subject, action);
-            }
-            // The connection map (`view.connections`): opened on the frontmost
-            // window, which comes forward with it (the `OperatorAction::Show`
-            // shape). No window resolvable is a logged no-op.
-            MenuAction::ShowConnectionMap => {
-                if let Err(e) = self.open_connection_map() {
-                    aterm_log::info!("connection map: {e}");
+            // The Overview (`view.overview`): opened on the frontmost window,
+            // which comes forward with it. No window resolvable is refused.
+            MenuAction::Overview => {
+                if let Err(e) = self.open_overview() {
+                    self.pending_action_refusal = Some(e);
                 }
             }
-            // THE FABRIC MENU (round 19, SPEC19 §9; the App side lives in
-            // `app_fabric_menu.rs`). The rows act on the FRONT window — the
-            // "front tab is the subject" convention every other bar action uses.
-            MenuAction::Inbox => {
-                if let Some(wid) = self.frontmost_window {
-                    self.open_session_inbox_tab(wid);
+            // THE AGENTS MENU (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4;
+            // the App side lives in `app_take_over.rs`, `summarize.rs` and
+            // `app_overview.rs`). The rows act on the FRONT window — the
+            // "front tab is the subject" convention every other bar action
+            // uses.
+            MenuAction::NextNeed => {
+                if let Err(why) = self.next_need() {
+                    self.pending_action_refusal = Some(why);
                 }
             }
-            MenuAction::LedgerForSession => {
+            MenuAction::HarnessLog => {
                 if let Some(wid) = self.frontmost_window {
                     self.open_session_ledger(wid);
                 }
             }
-            MenuAction::HoldSession | MenuAction::LiftHold => {
-                if let Some(wid) = self.frontmost_window {
-                    self.menu_hold(wid, action == MenuAction::HoldSession);
-                }
-            }
-            MenuAction::FabricStatus | MenuAction::FabricOn | MenuAction::FabricOff => {
-                use crate::app_fabric_menu::FabricVerb;
+            MenuAction::ReadThisMac
+            | MenuAction::ReadFleet
+            | MenuAction::FleetMachines
+            | MenuAction::FabricStatus
+            | MenuAction::FabricOn
+            | MenuAction::FabricOff => {
+                use crate::app_take_over::CliVerb;
                 let verb = match action {
-                    MenuAction::FabricOn => FabricVerb::On,
-                    MenuAction::FabricOff => FabricVerb::Off,
-                    _ => FabricVerb::Status,
+                    MenuAction::ReadFleet => CliVerb::ReadFleet,
+                    MenuAction::FleetMachines => CliVerb::FleetPeers,
+                    MenuAction::FabricStatus => CliVerb::BusStatus,
+                    MenuAction::FabricOn => CliVerb::BusOn,
+                    MenuAction::FabricOff => CliVerb::BusOff,
+                    _ => CliVerb::ReadThisMac,
                 };
-                if let Some(wid) = self.frontmost_window {
-                    self.run_fabric_cli(wid, verb);
+                match self.frontmost_window {
+                    Some(wid) => self.run_cli_to_tab(wid, verb),
+                    None => {
+                        self.pending_action_refusal = Some("no window to open it in".to_string());
+                    }
                 }
             }
-            // Window ▸ Set Role…: the pin's editor over the active tab, one
+            MenuAction::SummarizeFleet => {
+                if let Err(why) = self.summarize_in_new_tab() {
+                    self.pending_action_refusal = Some(why);
+                }
+            }
+            // Take Over / Hand Back (`app_take_over.rs`): the person's hold
+            // on the front window's focused session.
+            MenuAction::TakeOver => {
+                if let Some(wid) = self.frontmost_window {
+                    self.take_over(wid);
+                }
+            }
+            MenuAction::HandBack => {
+                if let Some(wid) = self.frontmost_window {
+                    self.hand_back(wid);
+                }
+            }
+            // Agents ▸ Set Role…: the pin's editor over the active tab, one
             // field over (`meta role`).
             MenuAction::SetRole => {
                 if let Some(wid) = self.frontmost_window {
@@ -11521,8 +11801,8 @@ impl App {
                     self.menu_reset_terminal(wid);
                 }
             }
-            // Window ▸ Show Identity: the focused session's identity, read-only,
-            // as a Markdown tab.
+            // Show Identity (palette-only): the focused session's identity,
+            // read-only, as a Markdown tab.
             MenuAction::ShowIdentity => {
                 if let Some(wid) = self.frontmost_window {
                     self.open_session_identity_tab(wid);
@@ -11539,10 +11819,8 @@ impl App {
                     let _ = self.open_identity_picker(wid, place);
                 }
             }
-            // View ▸ Presence Band / Rim: flip the live bit and persist it.
-            MenuAction::TogglePresenceBand | MenuAction::TogglePresenceRim => {
-                self.user_toggle_presence(action);
-            }
+            // View ▸ Show Needs in Windows: flip the live bit and persist it.
+            MenuAction::ToggleNeedsInWindows => self.user_toggle_needs_in_windows(),
             MenuAction::CloseTab => {
                 // Same rule as Cmd-W: close the focused pane; a tab's last pane
                 // closes the tab (`App::close_active_tab`). When that was the
@@ -11610,9 +11888,9 @@ impl App {
                 }
             }
             // Font size — identical to on_key_font_zoom (⌘= / ⌘- / ⌘0).
-            MenuAction::FontIncrease => self.set_font_px(self.font_px + FONT_ZOOM_STEP),
-            MenuAction::FontDecrease => self.set_font_px(self.font_px - FONT_ZOOM_STEP),
-            MenuAction::FontActualSize => self.set_font_px(self.default_font_px),
+            MenuAction::FontIncrease => self.set_font_size(self.font_size + FONT_ZOOM_STEP),
+            MenuAction::FontDecrease => self.set_font_size(self.font_size - FONT_ZOOM_STEP),
+            MenuAction::FontActualSize => self.set_font_size(self.default_font_size),
             MenuAction::SplitVertical => self.split_focused_pane(pane::SplitDir::Vertical),
             MenuAction::SplitHorizontal => self.split_focused_pane(pane::SplitDir::Horizontal),
             // Per-session matrix rain: toggle the front session of the
@@ -11770,90 +12048,65 @@ impl App {
                 }
                 self.escalate_pending_close(el);
             }
-            // Connection ids from the tab context menu act on the clicked tab's
-            // session, resolved fresh here (as for Copy*), never the front tab
-            // the plain dispatcher would pick.
-            MenuAction::ConnectToSession
-            | MenuAction::ConfigureConnection
-            | MenuAction::DisconnectSession => {
-                let Some(subject) = self.tab_menu_subject(window, index) else {
-                    aterm_log::info!("connection id {action:?} dropped: the tab has no session");
+            // The AGENT section acts on the CLICKED tab's session, resolved
+            // fresh here (as for Copy*), never the front tab the plain
+            // dispatcher would pick. Take Over and Hand Back run now, in the
+            // gesture's turn (`App::person_gesture_refused`).
+            MenuAction::TakeOver | MenuAction::HandBack => {
+                let Some(session) = self.tab_terminal_session(window, index) else {
+                    aterm_log::info!("{action:?} dropped: the tab has no session");
                     return;
                 };
-                self.open_connection_ui(window, subject, action);
+                let done = if action == MenuAction::TakeOver {
+                    self.take_over_session(session)
+                } else {
+                    self.hand_back_session(session)
+                };
+                if let Err(why) = done {
+                    self.pending_action_refusal = Some(why);
+                }
             }
-            // The spawn presets sit under the same tab's CONNECTIONS header:
-            // their origin is the CLICKED tab's session, never the front tab's.
-            MenuAction::NewControlledWindow
-            | MenuAction::NewControlledTab
-            | MenuAction::NewControllerWindow
-            | MenuAction::NewControllerTab => {
-                let Some(origin) = self.tab_menu_subject(window, index) else {
-                    aterm_log::info!("connected spawn {action:?} dropped: the tab has no session");
-                    return;
-                };
-                self.spawn_connected_preset(action, &origin);
+            MenuAction::HarnessLog => {
+                if let Some(session) = self.tab_terminal_session(window, index) {
+                    self.open_session_ledger_for(window, session);
+                }
+            }
+            MenuAction::SetRole => {
+                let _ = self.begin_session_meta_edit(
+                    window,
+                    tab,
+                    crate::session_timeline::MetaField::Role,
+                );
             }
             other => self.dispatch_menu_action(el, other),
         }
     }
 
-    /// The session a tab context-menu row acts on: the clicked tab's focused
-    /// terminal session, resolved fresh (the Copy* discipline).
-    pub(crate) fn tab_menu_subject(
-        &self,
-        window: WindowId,
-        index: usize,
-    ) -> Option<aterm_session::SessionId> {
-        self.tab_terminal_session(window, index)
-            .and_then(|session| self.pool.get(session))
-            .map(|s| s.ctx.self_id.clone())
-    }
-
-    /// Run one connected-spawn preset (`NewControlled*` / `NewController*`)
-    /// from `origin`; failures are logged — a menu click has no reply channel.
-    fn spawn_connected_preset(
-        &mut self,
-        action: menu::MenuAction,
-        origin: &aterm_session::SessionId,
-    ) {
-        use crate::connections::{ConnectedSpawnKind as Kind, ConnectedSpawnPlace as Place};
-        use menu::MenuAction;
-        let (kind, place) = match action {
-            MenuAction::NewControlledWindow => (Kind::Controlled, Place::Window),
-            MenuAction::NewControlledTab => (Kind::Controlled, Place::Tab),
-            MenuAction::NewControllerWindow => (Kind::Controller, Place::Window),
-            MenuAction::NewControllerTab => (Kind::Controller, Place::Tab),
-            _ => return,
-        };
-        let logged = Box::new(move |_: &mut Self, spawned: Result<String, String>| {
-            if let Err(e) = spawned {
-                aterm_log::warn!("connected spawn {action:?} failed: {e}");
-            }
-        });
-        self.spawn_connected_session(kind, place, origin, None, "ui", None, None, logged);
-    }
-
-    /// Dispatch one per-peer CONNECTION row click from a tab's context menu —
-    /// `Wake::TabMenuConnection { window, tab, peer_sid, verb }` (design §2.2
-    /// [v5]). `tab` is the pop-time STABLE id, re-resolved here under the same
-    /// no-positional-guess contract as [`Self::dispatch_tab_menu_action`]; the
-    /// subject session ("S") is that tab's terminal session, `peer_sid` the
-    /// row's snapshot peer.
+    /// Dispatch one session-argument row of a tab's context menu —
+    /// `Wake::TabMenuConnection { window, tab, peer_sid, verb }` — the AGENT
+    /// section's rows (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4). `tab` is
+    /// the pop-time STABLE id, re-resolved here under the same
+    /// no-positional-guess contract as [`Self::dispatch_tab_menu_action`];
+    /// `peer_sid` is the row's snapshot session.
     ///
-    /// * `Show` raises the peer (window focus + tab select) through the same
-    ///   body as the `raise` wire verb ([`Self::raise_session_by_id`]).
-    /// * `Configure` opens the shared confirm/configure card
-    ///   ([`Self::open_confirm_card`]) pre-filled from the live pair state,
-    ///   origin `menu`; Confirm applies through the declarative `connect`
-    ///   set-semantics seam and pokes the freshness funnel.
-    /// * `Disconnect` dissolves both directions of the S↔peer pair through
-    ///   [`crate::connections::disconnect_kind_in`] (origin `ui`): recorded
-    ///   halves by held token, unrecorded wire-grant rows via the op-filtered
-    ///   sweep. Rows toward an unregistered foreign peer died with its table,
-    ///   so only the inbound half remains then. The refresh runs
-    ///   unconditionally, so even a nothing-to-revoke race recomposes the menu.
-    #[cfg(any(target_os = "macos", test))]
+    /// * `Show` raises it (window focus + tab select) through the same body as
+    ///   the `raise` wire verb ([`Self::raise_session_by_id`]): `Go to
+    ///   <manager>`, a worker row.
+    /// * `StopWorker` asks first — "Stop <tab>? Its agent gets SIGTERM and its
+    ///   task reads exited." — on the platform's FAIL-CLOSED sheet (Cancel is
+    ///   the default button: a Return typed elsewhere never stops anything),
+    ///   then signals the agent in process ([`Self::stop_worker`], which reads
+    ///   the task and the hold again when it acts). A stop it would refuse
+    ///   (an ended task, no agent in front, a control client's gesture on a
+    ///   held tab) is refused before any sheet ([`Self::stop_worker_refused`]
+    ///   says it to whom it concerns). A CONTROL CLIENT'S choice of the row
+    ///   (its keys into the tab menu) is the wire `signal` verb's act on the
+    ///   tab it drives: it stops the worker under the gesture mark, refused
+    ///   where the verb would be, and logged only — no sheet and no card
+    ///   reach the person's glass for a robot's act. With no sheet to ask the
+    ///   PERSON on (headless, off macOS) the Overview opens with the worker's
+    ///   inline confirm armed ([`Self::overview_arm_stop`]): the person's
+    ///   stop is never unconfirmed.
     pub(crate) fn dispatch_tab_menu_connection(
         &mut self,
         window: WindowId,
@@ -11861,53 +12114,73 @@ impl App {
         peer_sid: &aterm_session::SessionId,
         verb: crate::session_chrome::ConnVerb,
     ) {
+        use crate::platform::AppRt as _;
         use crate::session_chrome::ConnVerb;
-        let Some(index) = self.tab_index_for_id(window, tab) else {
-            aterm_log::info!(
-                "tab connection {verb:?} dropped: tab {tab} no longer exists in its window"
-            );
+        if self.tab_index_for_id(window, tab).is_none() {
+            aterm_log::info!("tab menu {verb:?} dropped: tab {tab} no longer exists in its window");
+            return;
+        }
+        let local = {
+            let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+            g.by_sid(peer_sid).map(|h| h.local_id)
+        };
+        let Some(local) = local else {
+            aterm_log::info!("tab menu {verb:?} {}: no such session", peer_sid.as_str());
             return;
         };
         match verb {
             ConnVerb::Show => {
-                let peer_local = {
-                    let g = self.store.read().unwrap_or_else(|p| p.into_inner());
-                    g.by_sid(peer_sid).map(|h| h.local_id)
-                };
-                let raised = peer_local
-                    .ok_or_else(|| "no such session".to_string())
-                    .and_then(|local| self.raise_session_by_id(local));
-                if let Err(e) = raised {
-                    aterm_log::info!("show connection peer {}: {e}", peer_sid.as_str());
+                if let Err(e) = self.raise_session_by_id(local) {
+                    aterm_log::info!("show {}: {e}", peer_sid.as_str());
                 }
             }
-            ConnVerb::Configure => {
-                let subject = self
-                    .tab_terminal_session(window, index)
-                    .and_then(|session| self.pool.get(session))
-                    .map(|s| s.ctx.self_id.clone());
-                let Some(subject) = subject else {
-                    aterm_log::info!("configure dropped: the clicked tab has no session");
+            ConnVerb::StopWorker => {
+                if let Some(why) = self.stop_worker_refusal(local) {
+                    self.stop_worker_refused(local, why);
                     return;
-                };
-                let _ = self.open_confirm_card(window, subject, peer_sid.clone(), None, "menu");
-            }
-            ConnVerb::Disconnect => {
-                let Some(session) = self.tab_terminal_session(window, index) else {
-                    aterm_log::info!("disconnect dropped: the clicked tab has no session");
+                }
+                // A CONTROL CLIENT'S CHOICE is the `signal` verb's act: no
+                // sheet or card on the person's glass for a robot's act (the
+                // alert rule), the stop under the mark, logged.
+                if self.person_gesture_refused() {
+                    match self.stop_worker(local) {
+                        Ok(reply) => aterm_log::info!(
+                            "stop worker {local}: a control client's gesture: {reply}"
+                        ),
+                        Err(why) => self.stop_worker_refused(local, why),
+                    }
                     return;
+                }
+                let label = self.tab_label_of_session(local);
+                let body =
+                    format!("Stop {label}? Its agent gets SIGTERM and its task reads exited.");
+                // Only a real window has a sheet to ask on (the CLI rows'
+                // rule): a headless path never reaches the platform's alert.
+                let real_window = self
+                    .windows
+                    .get(&window)
+                    .is_some_and(|ws| ws.os_window.is_some());
+                let answer = if real_window {
+                    self.apprt.confirm_owner("Stop Worker", &body, "Stop")
+                } else {
+                    None
                 };
-                let sid = {
-                    let g = self.store.read().unwrap_or_else(|p| p.into_inner());
-                    g.by_local(session).map(|h| h.sid.clone())
-                };
-                let Some(sid) = sid else {
-                    aterm_log::info!("disconnect dropped: the clicked session is unregistered");
-                    return;
-                };
-                // Both directions of the S↔peer pair, through the SAME seam
-                // the picker's Disconnect intent uses (refresh included).
-                self.disconnect_pair(&sid, peer_sid, "ui");
+                // The test arm answers for the sheet a headless App has not.
+                #[cfg(test)]
+                let answer = self.agents.owner_sheet_for_test.unwrap_or(answer);
+                match answer {
+                    Some(true) => {
+                        if let Err(why) = self.stop_worker(local) {
+                            self.stop_worker_refused(local, why);
+                        }
+                    }
+                    Some(false) => {}
+                    // NO SHEET TO ASK THE PERSON ON (headless, off macOS):
+                    // the confirm is the Overview's inline one, on this
+                    // worker, armed for the person's hand. Their second ⌫
+                    // stops it; nothing is stopped unconfirmed.
+                    None => self.overview_arm_stop(window, local),
+                }
             }
         }
     }
@@ -11984,7 +12257,7 @@ impl App {
     /// Settings and the palette render through the virtual frame when headless.
     pub(crate) fn open_aux_window(
         &mut self,
-        _el: &winit::event_loop::ActiveEventLoop,
+        _el: &aterm_window::event_loop::ActiveEventLoop,
         target: crate::app_introspect::AuxTarget,
     ) -> Result<(), String> {
         use crate::app_introspect::AuxTarget;
@@ -12024,22 +12297,21 @@ impl App {
                     Err("the active tab has no session context menu".to_string())
                 }
             }
+            // The Overview: `open overview` (Owner-only at the dispatch)
+            // opens it on the frontmost window with raise/focus; `controls
+            // overview` / `window overview` then read it.
+            AuxTarget::Overview => self.open_overview(),
             // The Autopilot menu, from the front window's focused session's
             // chip, as `↓` on the selected chip opens it; `controls
             // autopilot-menu` / `image` then read it.
             AuxTarget::AutopilotMenu => self.open_front_autopilot_menu(),
-            // The connection map: `open connections` (Owner-only at the
-            // dispatch) opens it on the frontmost window with raise/focus (the
-            // `OperatorAction::Show` shape); `controls connections` / `window
-            // connections` then read it.
-            AuxTarget::Connections => self.open_connection_map(),
             AuxTarget::Front => {
                 Err("the front terminal window is already open (use window/chrome)".to_string())
             }
-            // The confirm card and the picker need a pair/subject argument only
-            // UI gestures (menu row, picker choice, drag) carry; there is no
-            // wire `open` form, and `cmd_open` rejects them before this arm.
-            AuxTarget::ConnCard | AuxTarget::SessionPicker => Err(format!(
+            // The picker needs a subject argument only its UI gesture (the
+            // menu row) carries; there is no wire `open` form, and `cmd_open`
+            // rejects it before this arm.
+            AuxTarget::SessionPicker => Err(format!(
                 "{} opens from its UI gesture, not the wire",
                 target.keyword()
             )),
@@ -12077,21 +12349,15 @@ impl App {
                 Ok(())
             }
             // Symmetric transient exits (idempotent like the tab menu's).
-            AuxTarget::ConnCard => {
-                if let Some(wid) = self.frontmost_window {
-                    self.conn_card_exit(wid);
-                }
-                Ok(())
-            }
             AuxTarget::SessionPicker => {
                 if let Some(wid) = self.frontmost_window {
                     self.session_picker_exit(wid);
                 }
                 Ok(())
             }
-            AuxTarget::Connections => {
+            AuxTarget::Overview => {
                 if let Some(wid) = self.frontmost_window {
-                    self.connection_map_exit(wid);
+                    self.overview_exit(wid);
                 }
                 Ok(())
             }
@@ -12107,7 +12373,7 @@ impl App {
 #[cfg(all(test, unix))]
 mod forwarded_release_handoff_activity_tests {
     use crate::{App, WindowId};
-    use winit::keyboard::{KeyCode, PhysicalKey};
+    use aterm_window::keyboard::{KeyCode, PhysicalKey};
 
     /// Arm a minimal pending overlap so the tolerated/revoking distinction is
     /// observable: the revoking activity form bumps the epoch and pokes the
@@ -12219,12 +12485,11 @@ mod native_aux_alias_tests {
 
 #[cfg(test)]
 mod native_preferences_menu_tests {
-    use super::native_settings_route_for_menu;
-    use crate::menu::MenuAction;
     use crate::native_app::AppKind;
-    use crate::native_settings::SettingsRoute;
     use crate::{App, WindowId};
 
+    /// The App menu's "Open aterm.toml" opens the native editor on the
+    /// isolated config file — the file itself, never a Settings page.
     #[test]
     fn open_aterm_toml_menu_command_is_the_native_manual_editor() {
         const ROOT: &str = "ATERM_NATIVE_PREFERENCES_MENU_ROOT";
@@ -12238,11 +12503,9 @@ mod native_preferences_menu_tests {
         }
 
         let root = std::path::PathBuf::from(std::env::var_os(ROOT).unwrap());
-        let route = native_settings_route_for_menu(MenuAction::Preferences);
-        assert_eq!(route, Some(SettingsRoute::Manual));
-
         let mut app = App::headless_for_test();
-        assert!(app.open_settings_tab(route.expect("Manual route")));
+        app.open_config_editor_in_front()
+            .expect("the menu command opens aterm.toml");
         assert!(
             root.join("aterm/aterm.toml").is_file(),
             "Manual must resolve only the isolated config file"
@@ -12405,7 +12668,7 @@ mod native_keyboard_boundary_tests;
 #[cfg(test)]
 mod local_repeat_behavior_tests {
     use crate::{App, LocalRepeatAction, SearchRepeatAction, WindowId, term_lock};
-    use winit::keyboard::{KeyCode, PhysicalKey};
+    use aterm_window::keyboard::{KeyCode, PhysicalKey};
 
     #[test]
     fn search_repeat_stays_on_press_window_after_focus_changes() {
@@ -12490,8 +12753,8 @@ mod ledger_key_tests {
 
     use crate::keybinding::Action;
     use crate::{App, WindowId};
-    use winit::event::{ElementState, KeyEvent};
-    use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr};
+    use aterm_window::event::{ElementState, KeyEvent};
+    use aterm_window::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr};
 
     fn shift_l() -> KeyEvent {
         KeyEvent::synthetic_for_test(
@@ -12706,6 +12969,9 @@ mod kitty_orphan_release_tests;
 #[path = "app_input_input_release_pairing_conformance_tests.rs"]
 pub(crate) mod input_release_pairing_conformance;
 
+/// On every route the host drives (`paste_order::routes_for_test`): an encoded key
+/// is the stub sink's synchronous `WriteFailed` inline, and on the ConPTY route (every
+/// key on Windows) an `Ok` with one job handed to the ordered writer.
 #[cfg(test)]
 #[path = "app_input_overlay_gate_pairing_tests.rs"]
 mod overlay_gate_pairing_tests;
@@ -12917,6 +13183,13 @@ mod find_field_key_tests;
 #[cfg(test)]
 #[path = "app_input_pane_focus_fall_through_tests.rs"]
 mod pane_focus_fall_through_tests;
+
+/// The window's key layers on real winit events: the chords the GUI claims
+/// before the program (Windows' PSReadLine chords, the scrollback chords on the
+/// alternate screen) and the keys a non-US Windows layout builds.
+#[cfg(test)]
+#[path = "app_input_key_layer_tests.rs"]
+mod key_layer_tests;
 
 /// The `tone` control verb's App half ([`App::tone_status`]): the readout that
 /// makes an audible-only feature diagnosable. Each test pins one state, since
@@ -13375,6 +13648,27 @@ mod native_ime_selection_tests {
 mod refusal_row_tests {
     use super::{InputRefusal, paste_order};
 
+    /// A paste the ordered writer refused because its queue is full now answers
+    /// `ERR busy input-queue-full`, as a key refused at the cap does on every route;
+    /// one too large for the queue, or a writer gone, is a failed write (a retry as
+    /// is cannot cure it).
+    #[test]
+    fn only_a_full_queue_refuses_a_paste_busy() {
+        use crate::input::InputOutcome;
+        assert_eq!(
+            super::rejected_outcome(paste_order::Rejected::Full),
+            InputOutcome::QueueFull
+        );
+        assert_eq!(
+            super::rejected_outcome(paste_order::Rejected::TooLarge),
+            InputOutcome::WriteFailed
+        );
+        assert_eq!(
+            super::rejected_outcome(paste_order::Rejected::Unavailable),
+            InputOutcome::WriteFailed
+        );
+    }
+
     #[test]
     fn each_refusal_maps_to_its_cause_and_a_burst_is_one_row() {
         assert_eq!(
@@ -13415,3 +13709,69 @@ mod refusal_row_tests {
         );
     }
 }
+
+/// `input_release_pairing` actions no shipping seam performs, each waived where its
+/// Tier-1 (`input_release_pairing_conformance`) binds it.
+// The machine has 21 actions: twelve carry `#[refines]` anchors on their
+// `app_input.rs` seams, and these nine are explicit scope boundaries.
+#[cfg(any(test, debug_assertions))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "input_release_pairing",
+    action = "TransferFocusWhileHeld",
+    reason = "OS/winit environment transition: Tier-1 drives real App::on_focus(A,false) then \
+              App::on_focus(B,true) and validates that physical ownership is unchanged; no \
+              key-owner mutator implements the focus arrival itself."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "input_release_pairing",
+    action = "OpenOverlay",
+    reason = "Orthogonal overlay environment step; cross-window physical-owner conformance \
+              fixes overlays closed, while overlay_gate_pairing_tests drives the real open."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "input_release_pairing",
+    action = "CloseOverlay",
+    reason = "Orthogonal overlay environment step; cross-window physical-owner conformance \
+              fixes overlays closed, while overlay_gate_pairing_tests drives the real close."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "input_release_pairing",
+    action = "ConsumeOverlayPress",
+    reason = "Controller/engine-key overlay ownership uses overlay_consumed_keys, not the \
+              process-wide winit PhysicalKey owner map bound by this Tier-1 runner."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "input_release_pairing",
+    action = "RepeatOfConsumedPress",
+    reason = "Repeat is a read-only peek of the retained physical owner; dedicated shipping \
+              tests prove it neither removes the owner nor emits bytes."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "input_release_pairing",
+    action = "GateConsumesRepeatOfForwardedPress",
+    reason = "Controller/engine-key repeats enter App::input without a winit PhysicalKey; \
+              overlay_gate_pairing_tests drives the real pre-overlay press/open/repeat/release \
+              seam. Physical repeats bypass current-content gates through route_physical_repeat."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "input_release_pairing",
+    action = "PhysicalFocusLoss",
+    reason = "Terminal OS epoch where no matching key-up is delivered. A focus transfer that \
+              does deliver key-up is the separately validated TransferFocusWhileHeld action."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "input_release_pairing",
+    action = "SettledRelease",
+    reason = "Abstract terminal stutter after owner removal; no shipping state mutation exists."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "input_release_pairing",
+    action = "SettledFocusEpoch",
+    reason = "Abstract terminal stutter after an OS-cancelled epoch; no shipping mutation exists."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn input_release_pairing_waivers() {}

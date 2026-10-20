@@ -180,7 +180,14 @@ fn settle(w: &World, hold: &Hold, c: &mut Ctl, sid: &str) -> u64 {
 #[test]
 fn an_add_evicted_from_the_timeline_is_learned_after_the_gap() {
     let hold = Hold::new("r24");
-    let w = World::boot_with("r24gap", &[], &[("ATERM_TEST_PUSH_HOLD", &hold.env())]);
+    // The backlog's replay spends an allowance the round refills: at test pace
+    // ([`harness::FAST_TIMERS`]). A round reads no opt-in of a settled
+    // session ([`settle`]), so it cannot teach the bridge the add ahead of the GAP.
+    let w = World::boot_with(
+        "r24gap",
+        &[],
+        &[("ATERM_TEST_PUSH_HOLD", &hold.env()), harness::FAST_TIMERS],
+    );
     w.wait_ready();
     let s_a = until("aterm's boot session", || {
         w.sessions().first().map(|(_, sid, _)| sid.clone())

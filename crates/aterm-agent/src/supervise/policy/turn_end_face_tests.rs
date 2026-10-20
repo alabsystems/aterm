@@ -147,6 +147,27 @@ fn the_face_is_a_function_of_the_policys_memory_in_the_designs_order() {
             TaskFace::Landed,
         ),
         (
+            "a done seeded for the first point",
+            state(|s| s.done_seed = Some(None)),
+            false,
+            TaskFace::Done,
+        ),
+        (
+            "a landing and a done seeded: the landing",
+            state(|s| {
+                s.landed_seed = Some(true);
+                s.done_seed = Some(None);
+            }),
+            false,
+            TaskFace::Landed,
+        ),
+        (
+            "someone else's turn over a seeded done",
+            state(|s| s.done_seed = Some(None)),
+            true,
+            TaskFace::Open,
+        ),
+        (
             "someone else's turn after landed",
             state(landed),
             true,
@@ -240,13 +261,14 @@ fn the_face_moves_at_the_points_that_end_a_task_and_is_told_once() {
         "Committed the parser.\nStill open: the lexer.\nATERM-TASK-DONE",
         Some(2 * MIN),
     );
-    let a = act(&mut st, &open, t0() + 3 * MIN);
+    // The challenge waits the back-off a done report earns.
+    let (a, came) = until_acted(&mut st, &open, t0() + 3 * MIN);
     assert!(
         matches!(a, TurnEndAction::Type { rule_id, .. } if rule_id == RULE_OPEN_ITEMS),
         "{a:?}"
     );
     assert_eq!(st.face_moved(), None, "challenged, not done");
-    at(&mut st, &idle(TOKEN_REPLY, Some(2 * MIN)), t0() + 6 * MIN);
+    at(&mut st, &idle(TOKEN_REPLY, Some(2 * MIN)), came + 3 * MIN);
     assert_eq!(st.face_moved(), Some(TaskFace::Done));
 
     // Cruise: the done check's second done report — done.
@@ -641,6 +663,82 @@ fn a_seeded_landing_holds_only_where_the_last_words_are_the_landings_own() {
     // No words at all mark nothing.
     assert_eq!(said_mark(None), None);
     assert_eq!(said_mark(Some(" ⏺ … ")), None);
+}
+
+/// A SEEDED DONE IS RESTATED AT THE START AND RESOLVED AT THE FIRST POINT
+/// ([`TurnEndState::seed_done`]; owner-eye-4 / behaviour-5 of the
+/// post-landing check of Autopilot v3 wave 1: a restarted loop told `open`,
+/// then the same done again, so the window stamped `done 13:27` for work
+/// finished at 13:04). ARMED, the start face is `done`; the first point
+/// over the done's own words — as drawn, or wrapped at another width —
+/// reads it again and tells NOTHING (no move: the window gives back the
+/// first time). The seed is the face's alone: every decision at the point
+/// and after its back-off is the unseeded state's. DROPPED: by a live read
+/// before the point (someone else's turn, `open`); by a reply that no
+/// longer says done (`open`, told); and WITHDRAWN where the last words are
+/// another reply's that also ends on the token (a turn no loop watched):
+/// `open` then `done` — the new done told as a move, so it is stamped anew.
+/// A seed with no words (a journal a build before the mark wrote) holds
+/// over any reply. NEGATIVE CONTROL: unseeded, the start is `open` and the
+/// first point's done is a move (`[Open, Done]`, the restart's new stamp).
+#[test]
+fn a_seeded_done_is_restated_at_the_start_and_resolved_at_the_first_point() {
+    let mark = said_mark(Some(TOKEN_REPLY));
+    assert!(mark.is_some());
+    // The faces told over the loop's start and its first point (the order
+    // `TurnEndLoop::tell_face` tells them in), and both decisions.
+    let now = t0();
+    let run = |seed: Option<Option<u64>>, said: &str, live_first: bool| {
+        let mut st = TurnEndState::default();
+        if let Some(words) = seed {
+            st.seed_done(words);
+            assert!(st.done_seed_armed());
+        }
+        let mut told = vec![st.face_start()];
+        if live_first {
+            st.took();
+            assert!(!st.done_seed_armed(), "a live read drops it");
+            told.extend(st.face_withdrawn().into_iter().chain(st.face_moved()));
+        }
+        let r = idle(said, None);
+        let a = at(&mut st, &r, now);
+        assert!(!st.done_seed_armed(), "the first point resolves it: {said}");
+        told.extend(st.face_withdrawn().into_iter().chain(st.face_moved()));
+        let later = now + st.short_wait().unwrap_or_default();
+        let later = decide_turn_end(&st, &r, &cfg(), later);
+        (told, a, later)
+    };
+    let rewrapped =
+        "Committed and pushed the parser\nand its tests; nothing\nis left.\nATERM-TASK-DONE";
+    assert_eq!(said_mark(Some(rewrapped)), mark);
+    let theirs = "Added the module docstring and committed it.\nATERM-TASK-DONE";
+    assert_ne!(said_mark(Some(theirs)), mark);
+    for (said, want) in [
+        // ARMED AND KEPT: restated, nothing more told.
+        (TOKEN_REPLY, vec![TaskFace::Done]),
+        (rewrapped, vec![TaskFace::Done]),
+        // WITHDRAWN: another reply's token, a new done.
+        (theirs, vec![TaskFace::Done, TaskFace::Open, TaskFace::Done]),
+        // DROPPED: the reply no longer says done.
+        (PROGRESS, vec![TaskFace::Done, TaskFace::Open]),
+    ] {
+        let (told, a, later) = run(Some(mark), said, false);
+        assert_eq!(told, want, "{said}");
+        // The seed is the face's alone: the decisions are the unseeded
+        // state's.
+        let (_, a0, later0) = run(None, said, false);
+        assert_eq!((a, later), (a0, later0), "{said}: no decision reads it");
+    }
+    // Dropped by someone else's turn read live before the point.
+    let (told, _, _) = run(Some(mark), TOKEN_REPLY, true);
+    assert_eq!(told, [TaskFace::Done, TaskFace::Open, TaskFace::Done]);
+    // No words kept: no words compared.
+    let (told, _, _) = run(Some(None), theirs, false);
+    assert_eq!(told, [TaskFace::Done]);
+    // NEGATIVE CONTROL: unseeded, the done is a move from open.
+    let (told, a, _) = run(None, TOKEN_REPLY, false);
+    assert_eq!(told, [TaskFace::Open, TaskFace::Done]);
+    assert_eq!(a, TurnEndAction::Nothing);
 }
 
 /// THE LAST REPLY SAID DONE ([`TurnEndState::said_done`]: under Land the

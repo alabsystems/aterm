@@ -1,0 +1,19 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# S1, A1: a successor that adopted a carry with no tx_ tokens (a 3A-shaped
+# line) holds no watermark: nothing is applied until its bind, which seeds
+# past the file; the adoption is the floor; the steps its predecessor opened
+# are rebuilt from the log, so their results close them.
+bind 0
+see busy
+tx prompt v1
+tx tool c1
+expect open p1 tool par=t1 cls=shell tool=Bash vref=c1
+at 1100 adopt drop-tx
+expect tx through=none
+tx prompt v2
+bind 600
+expect mark r1 source field=transcript state=on skipped=0
+expect mark r1 source field=transcript state=on skipped=600 at=1100
+tx result c1 dated=1099
+tx result c1
+expect close p1 tool out=ok by=vendor at=1100

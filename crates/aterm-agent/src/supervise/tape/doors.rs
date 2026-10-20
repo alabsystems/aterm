@@ -79,8 +79,9 @@ pub const JOURNAL: &str = "journal";
 /// An approval-ledger row the loop wrote.
 pub const LEDGER: &str = "ledger";
 
-/// A line the loop wrote to its notes file: a round trip, as [`OUT`] — a notes
-/// file that cannot be written ends the loop.
+/// A line an older build's loop wrote to its notes file (the removed `aterm
+/// drive watch --notes`): a round trip, as [`OUT`]. This build writes none; the
+/// name stays taken.
 pub const NOTES: &str = "notes";
 
 /// A decision on an approval box: its outcome, the judged screen's record
@@ -143,3 +144,19 @@ pub const PROBE_LOCAL_OFFSET: &str = "probe.local_offset_at";
 
 /// The local zone's offset now (`date +%z`), read once a run.
 pub const PROBE_TZ_OFFSET: &str = "probe.tz_offset";
+
+/// A tasked session's result at its done edge (`supervise::task_mark`): the
+/// agent's transcript read on to the turn's end and the result written under
+/// the tasks directory, a round trip — the directory, the result's stem and
+/// the rule out, the settle and the snapshot's outcome back — compared and
+/// never performed on a replay.
+pub const TASK_RESULT: &str = "task.result";
+
+/// The machine's count of its sleep since boot and the boot it counts in
+/// (`policy::sleeps::SleepStamp`): nothing out, the count back — read at the
+/// loop's first look, where its watch suspects a sleep, and at every act.
+pub const PROBE_ASLEEP: &str = "probe.asleep";
+
+/// The machine's record of its last sleep (when it slept and woke, unix ms):
+/// nothing out, the two times back — read once, at the loop's first look.
+pub const PROBE_LAST_SLEEP: &str = "probe.last_sleep";

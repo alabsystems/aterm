@@ -11,6 +11,10 @@
 
 #![cfg(windows)]
 
+#[expect(
+    dead_code,
+    reason = "the report half is the `full_font_stack_heap` bench's; this gate reads `measure`"
+)]
 #[path = "common/heapprof.rs"]
 mod heapprof;
 

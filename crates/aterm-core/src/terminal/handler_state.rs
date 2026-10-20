@@ -81,8 +81,10 @@ impl CursorStateHandler<'_> {
             } else {
                 (state.cursor.row, state.cursor.col)
             };
-            self.grid.set_cursor(row, col);
-            // Restore pending_wrap after set_cursor (which clears it), only if
+            self.grid.set_cursor_following_content(row, col);
+            // The slot follows its content, so the restore keeps an offloaded
+            // reflow's fill debt. Restore pending_wrap after the setter (which
+            // clears it), only if
             // the cursor is still at the right edge: after a resize the saved
             // position may no longer be at the margin.
             if state.pending_wrap {
@@ -560,13 +562,17 @@ mod erase_pending_wrap_tests {
         assert_eq!(cursor(&term), (23, 79));
     }
 
+    /// EL1 (ghostty's golden) and EL2 at a pending wrap reset it: the next
+    /// glyph overwrites the last column and nothing reaches row 1.
     #[test]
-    fn el1_at_pending_wrap_ghostty_golden() {
-        let mut term = Terminal::new(2, 5);
-        term.process(b"ABCDE\x1b[1KB");
-        assert_eq!(row_glyphs(&term, 0), "    B");
-        assert_eq!(cursor(&term), (0, 4));
-        assert!(row_is_blank(&term, 1));
+    fn el1_and_el2_at_pending_wrap_then_print_overwrite_the_last_column() {
+        for el in ["1K", "2K"] {
+            let mut term = Terminal::new(2, 5);
+            term.process(format!("ABCDE\x1b[{el}B").as_bytes());
+            assert_eq!(row_glyphs(&term, 0), "    B", "EL {el}");
+            assert_eq!(cursor(&term), (0, 4), "EL {el}");
+            assert!(row_is_blank(&term, 1), "EL {el}");
+        }
     }
 
     #[test]
@@ -576,15 +582,6 @@ mod erase_pending_wrap_tests {
         let mut term = Terminal::new(2, 4);
         term.process(b"ABCD\x1b[1KZ");
         assert_eq!(row_glyphs(&term, 0), "   Z");
-        assert!(row_is_blank(&term, 1));
-    }
-
-    #[test]
-    fn el2_at_pending_wrap_then_print_overwrites_last_column() {
-        let mut term = Terminal::new(2, 5);
-        term.process(b"ABCDE\x1b[2KB");
-        assert_eq!(row_glyphs(&term, 0), "    B");
-        assert_eq!(cursor(&term), (0, 4));
         assert!(row_is_blank(&term, 1));
     }
 
@@ -647,6 +644,17 @@ mod erase_pending_wrap_tests {
             'Z',
             "the restored wrap takes the next glyph"
         );
+    }
+
+    /// DECRC restores the deferred wrap DECSC saved at the last column: after a
+    /// CR and a print moved the cursor away, the next glyph still wraps.
+    #[test]
+    fn decrc_restores_the_deferred_wrap_decsc_saved() {
+        let mut term = Terminal::new(2, 5);
+        term.process(b"ABCDE\x1b7\rx\x1b8Z");
+        assert_eq!(row_glyphs(&term, 0), "xBCDE", "the parked glyph stays");
+        assert_eq!(row_glyphs(&term, 1), "Z    ", "the restored wrap takes Z");
+        assert_eq!(cursor(&term), (1, 1));
     }
 
     /// A second `CSI ?1049h` clears the screen it finds: xterm runs

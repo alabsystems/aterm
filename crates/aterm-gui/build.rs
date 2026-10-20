@@ -3,7 +3,8 @@
 //
 // build.rs compiles in only committed content and the target (the `a11y_tree` cfg,
 // the update pin, the target triple and the dev `aterm-gui.exe` icon), plus
-// `cfg(clean_islands)`, which the compiler decides. Other facts that move with a
+// `cfg(clean_islands)`, which the compiler decides, and `cfg(anchor_rules)`, which Cargo's
+// cfg query decides (aterm-spec-anchor/anchor_rules.rs). Other facts that move with a
 // commit, version or toolchain belong to `crates/aterm/build.rs` (`BUILD_STAMP`,
 // installed at startup via `aterm_types::version`): a build script's `rustc-env`
 // reaches every unit of its package, so stamping them here would rebuild all of
@@ -22,6 +23,10 @@ mod pins;
 #[path = "../aterm-log/clean_islands.rs"]
 mod clean_islands;
 
+// `cfg(anchor_rules)`: which anchor attributes this crate writes.
+#[path = "../aterm-spec-anchor/anchor_rules.rs"]
+mod anchor_rules;
+
 /// Fixed 64-byte lowercase record used only when no paper master is pinned (a fork).
 /// This tree always has one (`aterm-update-core`'s `pins::PAPER_MASTER_PUBKEYS`), so the
 /// release cutter compares the Mach-O record against it and rejects this sentinel.
@@ -29,14 +34,16 @@ const UNPINNED_UPDATE_PIN_SENTINEL: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
 fn main() {
-    // One cfg for "the accessibility tree is compiled in": on Linux, always, where the
-    // AT-SPI publisher (aterm-a11y) is the only path to a screen reader. The cfg sites
-    // never spell the policy.
+    // One cfg for the shared semantic tree, delivered by the native publisher.
     println!("cargo::rustc-check-cfg=cfg(a11y_tree)");
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+    if matches!(
+        std::env::var("CARGO_CFG_TARGET_OS").as_deref(),
+        Ok("linux" | "macos" | "windows")
+    ) {
         println!("cargo::rustc-cfg=a11y_tree");
     }
     clean_islands::emit();
+    anchor_rules::emit();
 
     // The update pin: the SHA-256 fingerprint of the committed paper master, the same
     // value `aterm-update`'s `compiled_update_pin_sha256` reports. `build_info.rs`

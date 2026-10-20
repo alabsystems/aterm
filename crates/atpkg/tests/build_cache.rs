@@ -50,11 +50,10 @@ fn write(path: &Path, text: &str) {
 fn a_build_script_building_its_own_workspace_finishes_under_the_shim() {
     let targo = Path::new(env!("CARGO"));
     if targo.file_name().is_none_or(|n| n != "targo") {
-        eprintln!(
-            "not run: needs Trust's targo, and this suite runs under {}",
+        aterm_spec::host::could_not_run(format!(
+            "needs Trust's targo, and this suite runs under {}",
             targo.display()
-        );
-        return;
+        ));
     }
     let tmp = aterm_tempfile::Builder::new()
         .prefix("atpkg-build-cache-nested-")

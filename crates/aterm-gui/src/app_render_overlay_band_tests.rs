@@ -518,3 +518,69 @@ fn a_menu_card_untints_a_selection_and_retires_a_meter_and_a_sparkle_under_it() 
         "a sparkle goes where its jittered cell meets the card, and only there"
     );
 }
+
+/// Whether a card raster holds the terminal's orange ink: a pixel whose red
+/// leads its blue by more than 60 at more than a quarter coverage.
+fn has_orange_ink(rgba: &[u8]) -> bool {
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
+        .any(|px| px[3] > 0x40 && i32::from(px[0]) - i32::from(px[2]) > 60)
+}
+
+/// A colour picked for the terminal never inks a floating card on a native
+/// page: over Settings the build badge takes the page's palette whole (its
+/// ground and its ink), while over the terminal tab the same badge still
+/// wears the terminal's colours.
+#[test]
+fn a_floating_chrome_card_on_a_native_page_ignores_terminal_color_overrides() {
+    let overridden = |app: &mut App| {
+        app.config.foreground = Some("#FFAA00".to_string());
+        app.config.background = Some("#002244".to_string());
+        app.config.show_build_badge = Some(true);
+        app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
+    };
+    let wid = WindowId(0);
+
+    let mut page = App::headless_for_test();
+    overridden(&mut page);
+    assert!(page.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    assert!(page.prepare_native_input_scratch(wid));
+    let theme = page.chrome_card_theme(wid);
+    let palette = page.native_page_palette_theme();
+    assert_eq!(
+        (theme.fg, theme.bg, theme.cursor),
+        (palette.fg, palette.bg, palette.cursor),
+        "the card over a page is the page's palette"
+    );
+    assert_eq!(
+        page.overlay_card_theme(wid),
+        palette,
+        "an overlay card over a page takes the same palette"
+    );
+    page.splice_build_badge(wid);
+    let badge = page.windows[&wid]
+        .badge_card
+        .as_ref()
+        .expect("the badge painted");
+    assert!(
+        !has_orange_ink(&badge.rgba),
+        "the badge over Settings carries no terminal-orange ink"
+    );
+
+    // Negative control: the same overrides over the terminal tab ink the
+    // badge orange, so the probe can tell the two apart.
+    let mut terminal = App::headless_for_test();
+    overridden(&mut terminal);
+    terminal.prepare_terminal_capture_grid(wid).unwrap();
+    assert_eq!(terminal.chrome_card_theme(wid).fg, 0x00FF_AA00);
+    terminal.splice_build_badge(wid);
+    let badge = terminal.windows[&wid]
+        .badge_card
+        .as_ref()
+        .expect("the badge painted");
+    assert!(
+        has_orange_ink(&badge.rgba),
+        "over the terminal the badge wears the terminal's foreground"
+    );
+}

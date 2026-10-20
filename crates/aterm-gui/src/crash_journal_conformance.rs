@@ -5,8 +5,9 @@
 //! `aterm_models_gui::crash_journal_claim_model` (`CrashJournalClaim`, PTY
 //! keeper P1).
 //!
-//! Every schedule of the model up to seven steps — enough to reach every state
-//! the model can reach, which the test checks — is replayed on the SHIPPING
+//! Every step the model can take from every state it can reach (a
+//! breadth-first cover, beside the ends a person meets) — which reaches every
+//! state the model can reach, as the test checks — is replayed on the SHIPPING
 //! owner and claim over a real directory: `JournalOwner::create`/`publish`
 //! (the writer thread's two calls) for `Write` and `Settle`,
 //! `JournalOwner::retire` for the quit's removal, `restore::write_quit_to` for
@@ -43,7 +44,6 @@ use aterm_models_gui::crash_journal_claim_model;
 use aterm_spec::interp::{self, State};
 use aterm_spec::verify::validate_transition_tiered;
 
-use crate::conformance_support::schedules;
 use crate::crash_journal::tests::{layout, reaped_pid, scratch};
 use crate::crash_journal::{self, Evidence, JournalHeader, JournalId, JournalOwner, QuitLayout};
 use crate::crash_signal::{MarkerOwner, markers};
@@ -473,6 +473,63 @@ const ACTIONS: &[&str] = &[
 /// One real step, projected: `(before, action, after)`.
 type Step = (State, &'static str, State);
 
+/// The ends a person meets, each replayed whatever the cover holds.
+const ENDS: &[&[&str]] = &[
+    &["BootFresh", "Write", "Die", "Claim"],
+    &["BootFresh", "Write", "Quit"],
+    &["BootFresh", "Write", "WriteQuitLayout", "Quit"],
+    &["BootFresh", "Write", "WriteQuitLayout", "Die", "Claim"],
+    &["BootFresh", "Write", "WriteQuitLayout", "Crash", "Claim"],
+    &["BootFresh", "Write", "HandOff", "Claim"],
+    &["BootFresh", "Write", "HandOff", "Adopt", "Die", "Claim"],
+    &["BootFresh", "Write", "HandOff", "Adopt", "Crash", "Claim"],
+    &["BootFresh", "Write", "HandOff", "Adopt", "Quit"],
+    &["BootFresh", "HandOff", "SuccessorDies"],
+    &["BootFromJournal", "Write", "Die", "Claim"],
+    &["BootFromJournal", "Write", "Crash", "Claim"],
+    &["BootSecondChance", "Write", "Die", "Claim"],
+    &["BootFromJournal", "Write", "Settle", "Die", "Claim"],
+];
+
+/// EVERY STEP OF THE MODEL, EACH ONCE: breadth first from the initial
+/// state, every reachable state by the shortest schedule that reaches it,
+/// and that schedule extended by every action enabled there (`fire`d, the
+/// canonical successor), with every one of [`ENDS`] beside them. A schedule
+/// another one starts with is left out, the longer replaying its every step.
+///
+/// WHY (test-run speed): every schedule up to seven steps was 926 schedules
+/// (1,852 replays) whose prefixes walked the same transitions again and
+/// again, 36-70 s of a loaded suite; one schedule per (state, action) is
+/// every transition the model has, and still reaches every state.
+fn transition_cover(
+    model: &aterm_spec::derive::Model,
+    actions: &[&'static str],
+) -> Vec<Vec<&'static str>> {
+    let init = model.init_state();
+    let mut seen = std::collections::BTreeSet::from([init.clone()]);
+    let mut frontier = std::collections::VecDeque::from([(init, Vec::new())]);
+    let mut cover: Vec<Vec<&'static str>> = ENDS.iter().map(|end| end.to_vec()).collect();
+    while let Some((state, path)) = frontier.pop_front() {
+        for &action in actions {
+            let mut next = state.clone();
+            if !model.fire(action, &mut next) {
+                continue;
+            }
+            let mut schedule: Vec<&'static str> = path.clone();
+            schedule.push(action);
+            if seen.insert(next.clone()) {
+                frontier.push_back((next, schedule.clone()));
+            }
+            cover.push(schedule);
+        }
+    }
+    cover.sort();
+    cover.dedup();
+    let longer =
+        |s: &Vec<&'static str>| cover.iter().any(|t| t.len() > s.len() && t.starts_with(s));
+    cover.iter().filter(|s| !longer(s)).cloned().collect()
+}
+
 /// Replay `schedule` on the real owner and claim, on `desk` (handed back
 /// emptied) — with the evidence read
 /// first by a launch that does not claim before every claim when
@@ -510,8 +567,9 @@ fn replay(
     (rig.finish(), initial, steps)
 }
 
-/// The shipping owner and claim refine `CrashJournalClaim` on every schedule
-/// up to seven steps — each replayed twice, the second time with every claim's
+/// The shipping owner and claim refine `CrashJournalClaim` on every step the
+/// model can take from every state it reaches ([`transition_cover`]) — each
+/// schedule replayed twice, the second time with every claim's
 /// evidence read (and renamed `.seen`) first by a launch that does not claim —
 /// every state they reach satisfies every invariant, and between them they
 /// reach EVERY state the model can reach. Each step is admitted by the
@@ -524,74 +582,22 @@ fn replay(
 /// `claim_at_boot`). The other eight are the process around the journal,
 /// which this runner plays and projects rather than code any journal function
 /// runs.
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "CrashJournalClaim",
-    action = "BootFresh",
-    reason = "The run's own start: the crash marker it arms is crash_signal's install; the \
-              runner arms one in the real log dir and the journal is armed lazily at the \
-              first Write."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "CrashJournalClaim",
-    action = "BootFromJournal",
-    reason = "The run's own start after a reopened journal: Lane::begin_probation only sets \
-              the header mark the runner writes through JournalOwner::publish; its 90 s \
-              clock is crash_journal::tests::the_lane_writes_only_changes_at_the_bounded_rate."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "CrashJournalClaim",
-    action = "BootSecondChance",
-    reason = "The run's own start after the brake let a stopped probation writer's journal \
-              through (ruling 285): Lane::begin_probation's second-chance flag only sets the \
-              header mark the runner writes through JournalOwner::publish \
-              (crash_journal::tests::a_relapse_inside_probation_is_skipped_and_said)."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "CrashJournalClaim",
-    action = "Crash",
-    reason = "A fatal signal runs no journal code: crash_signal's handler writes its banner \
-              into the run's own marker, which the runner writes, and the kernel releases the \
-              locks as for Die."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "CrashJournalClaim",
-    action = "HandOff",
-    reason = "The update parent's _exit after Commit is seamless::commit_and_exit, which \
-              removes the crash marker and ends the process; the runner removes the marker \
-              and drops the owner, whose drop releases its lock by LOCK_UN."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "CrashJournalClaim",
-    action = "Die",
-    reason = "A SIGKILL, a signal or a panic runs no journal code: the runner drops the owner, \
-              whose lock goes as the kernel releases a dead process's (a child forked \
-              under it and not yet exec'd keeps it until its exec), leaving the marker."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "CrashJournalClaim",
-    action = "FinishWrite",
-    reason = "Exists only in the Buggy = 1 unlink-first writer; the shipping publish is one \
-              rename, which the_defects_reject_the_real_steps pins, and a reader racing 400 real \
-              rewrites always finds a whole image (crash_journal::tests::\
-              a_rewrite_never_leaves_the_name_without_a_whole_image)."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "CrashJournalClaim",
-    action = "SuccessorDies",
-    reason = "A successor's end before it took anything over runs no journal code: the \
-              shipping Commit waiter takes the parent's image over before it releases a reader \
-              (release_committed_readers, round eight of the update audit, finding 45; \
-              crash_journal::tests::\
-              a_committed_successor_that_dies_before_its_commit_wake_still_reopens_the_desk), so \
-              the runner plays it only where the parent left no image."
-)]
 #[test]
 fn the_real_journal_conforms_to_the_model() {
     let model = crash_journal_claim_model();
-    let all = schedules(&model, ACTIONS, 7);
+    for end in ENDS {
+        let mut state = model.init_state();
+        for action in *end {
+            assert!(
+                model.fire(action, &mut state),
+                "{end:?}: the model admits {action}"
+            );
+        }
+    }
+    let all = transition_cover(&model, ACTIONS);
     assert!(
         all.len() > 60,
-        "the enumeration reaches the schedules it exists for: {}",
+        "the cover reaches the schedules it exists for: {}",
         all.len()
     );
     // Each replay runs on a rig of its own (its worker's desk, emptied for it,
@@ -714,28 +720,6 @@ fn the_real_journal_conforms_to_the_model() {
         consumed > 0,
         "the second pass's earlier launch found evidence to read first"
     );
-    // The ends a person meets are among them.
-    for ends in [
-        vec!["BootFresh", "Write", "Die", "Claim"],
-        vec!["BootFresh", "Write", "Quit"],
-        vec!["BootFresh", "Write", "WriteQuitLayout", "Quit"],
-        vec!["BootFresh", "Write", "WriteQuitLayout", "Die", "Claim"],
-        vec!["BootFresh", "Write", "WriteQuitLayout", "Crash", "Claim"],
-        vec!["BootFresh", "Write", "HandOff", "Claim"],
-        vec!["BootFresh", "Write", "HandOff", "Adopt", "Die", "Claim"],
-        vec!["BootFresh", "Write", "HandOff", "Adopt", "Crash", "Claim"],
-        vec!["BootFresh", "Write", "HandOff", "Adopt", "Quit"],
-        vec!["BootFresh", "HandOff", "SuccessorDies"],
-        vec!["BootFromJournal", "Write", "Die", "Claim"],
-        vec!["BootFromJournal", "Write", "Crash", "Claim"],
-        vec!["BootSecondChance", "Write", "Die", "Claim"],
-        vec!["BootFromJournal", "Write", "Settle", "Die", "Claim"],
-    ] {
-        assert!(
-            all.iter().any(|schedule| schedule.starts_with(&ends)),
-            "{ends:?} is replayed"
-        );
-    }
 }
 
 /// NEGATIVE CONTROL: `Buggy = 1` is rejected by the real steps — at the claim

@@ -970,16 +970,37 @@ mod tests {
             Instant::now() + Duration::from_secs(60),
             Duration::from_secs(60),
         );
-        let kept = dir.keep();
-        eprintln!("GL_LIFETIME_OWNED_FIXTURE_RETAINED: {}", kept.display());
-        let output = outputs
-            .pop()
-            .expect("one owned child")
-            .expect("Node fixture completed; absence is setup failure");
+        // A machine without node cannot run the fixture: that is the machine's
+        // answer, never a finding, so it panics with verify's COULD NOT RUN
+        // sentinel, as `run_bound_node_flavor` does, and the root goes with it.
+        let output = match outputs.pop().expect("one owned child") {
+            Ok(output) => output,
+            Err(aterm_uds::deadline::RunError::Spawn(e)) => panic!(
+                "{}: node could not start ({e}); the generated glue runs under node; {}",
+                crate::libtest::COULD_NOT_RUN_SENTINEL,
+                crate::install_fix("node", "node", "nodejs")
+            ),
+            Err(e) => panic!("Node fixture did not complete: {e}"),
+        };
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         print!("{stdout}");
         eprint!("{stderr}");
+        // Only a failing run keeps its fixture root for reading.
+        let passed = output.status.success()
+            && [
+                "GL_LIFETIME_ADMITTED_CONTROLS_REACHED",
+                "GL_LIFETIME_RETIREMENT_CASES_REACHED",
+                "GL_LIFETIME_ALL_RETIRED",
+            ]
+            .iter()
+            .all(|marker| stdout.contains(marker));
+        if !passed {
+            eprintln!(
+                "GL_LIFETIME_OWNED_FIXTURE_RETAINED: {}",
+                dir.keep().display()
+            );
+        }
         assert!(
             stdout.contains("GL_LIFETIME_ADMITTED_CONTROLS_REACHED"),
             "fixture controls not reached: {stderr}"

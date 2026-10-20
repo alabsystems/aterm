@@ -786,19 +786,18 @@ fn every_boundary_restores_the_live_screen() {
     }
 }
 
-/// NEGATIVE CONTROL: a tap that drops RESIZE records fails on the flap.
+/// NEGATIVE CONTROL: a tap that drops RESIZE records fails on the flap. The flap is a step
+/// of the scenario, not of a seed's cuts, so one seed shows it.
 #[test]
 fn a_tap_that_drops_resizes_fails_on_the_flap() {
-    for seed in 1..=3 {
-        let Err(why) = run(seed, true, false) else {
-            panic!("seed {seed}: dropping every RESIZE went unnoticed");
-        };
-        assert!(
-            why.starts_with("step 15, a resize to 63x100"),
-            "seed {seed}: caught at the flap's first half: {why}"
-        );
-        run(seed, false, false).unwrap_or_else(|why| panic!("seed {seed}, control: {why}"));
-    }
+    let Err(why) = run(1, true, false) else {
+        panic!("dropping every RESIZE went unnoticed");
+    };
+    assert!(
+        why.starts_with("step 15, a resize to 63x100"),
+        "caught at the flap's first half: {why}"
+    );
+    run(1, false, false).unwrap_or_else(|why| panic!("control: {why}"));
 }
 
 /// NEGATIVE CONTROL of the history half: a ring whose chunks name rows one later than
@@ -806,17 +805,15 @@ fn a_tap_that_drops_resizes_fails_on_the_flap() {
 /// lines below the carried ones are not the live history's.
 #[test]
 fn a_ring_one_row_off_fails_the_history_check() {
-    for seed in 1..=3 {
-        let why = match run_with(seed, false, true, true) {
-            Err(why) => why,
-            Ok(s) => panic!(
-                "seed {seed}: a ring one row off went unnoticed (joined {}, gaps {})",
-                s.joined, s.gaps
-            ),
-        };
-        assert!(
-            why.contains("not the live history's"),
-            "seed {seed}: caught by the history half: {why}"
-        );
-    }
+    let why = match run_with(1, false, true, true) {
+        Err(why) => why,
+        Ok(s) => panic!(
+            "a ring one row off went unnoticed (joined {}, gaps {})",
+            s.joined, s.gaps
+        ),
+    };
+    assert!(
+        why.contains("not the live history's"),
+        "caught by the history half: {why}"
+    );
 }

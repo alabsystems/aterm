@@ -1,0 +1,17 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# T1: the harness's `send act=answer` on the question dialog closes it
+# answered; an approve on a question decides nothing (`passed`).
+see busy
+half
+see prompt question
+expect open p1 question par=t1 at=500
+admit harness act=answer
+accept
+see busy
+expect close p1 question out=answered by=harness
+see prompt question
+expect open p2 question par=t1
+admit harness act=approve
+accept
+see busy
+expect close p2 question out=passed by=harness

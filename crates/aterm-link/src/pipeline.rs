@@ -166,14 +166,6 @@ impl<T> Link<T> {
         self.unacked.iter().map(|owed| &owed.tag)
     }
 
-    /// When the NEWEST owed publish was written — the last frame this
-    /// connection sent, because a request that reads its own reply is sent
-    /// only while nothing is owed ([`Link::ready`]) and so always before every
-    /// publish still owed. `None` when nothing is owed.
-    pub fn last_sent(&self) -> Option<Instant> {
-        self.unacked.back().map(|owed| owed.sent)
-    }
-
     /// Hang `value` on the NEWEST owed ack whose tag `waits_on` names, to come
     /// back with that ack's answer ([`Unacked::rider`]); a rider already there
     /// keeps the larger of the two. Acks are read oldest first, so the rider
@@ -248,11 +240,10 @@ mod tests {
             .tempdir_in("/tmp")
             .expect("a scratch dir");
         let socket = dir.path().join("b.sock");
-        let broker = astream_broker::Broker::open(dir.path().join("b.log")).expect("a broker");
+        let broker = crate::test_broker(dir.path().join("b.log")).expect("a broker");
         let server = broker.serve(&socket).expect("serve");
         let connect = || {
             let (conn, _) = crate::transport::connect(
-                &crate::transport::Transport::Unix,
                 &socket.to_string_lossy(),
                 std::time::Duration::from_secs(60),
             )
@@ -395,10 +386,11 @@ mod tests {
             .tempdir_in("/tmp")
             .expect("a scratch dir");
         let socket = dir.path().join("b.sock");
+        // Strict, not `test_broker`'s tier: the fault fails a batch's `fsync`,
+        // which only Strict issues for every batch.
         let broker = astream_broker::Broker::open(dir.path().join("b.log")).expect("a broker");
         let _server = broker.serve(&socket).expect("serve");
         let (conn, _) = crate::transport::connect(
-            &crate::transport::Transport::Unix,
             &socket.to_string_lossy(),
             std::time::Duration::from_secs(60),
         )

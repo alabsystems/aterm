@@ -574,12 +574,12 @@ fn a_kill_before_the_inbox_bursts_commit_redelivers_and_aterm_keeps_one_row_of_e
 /// above it.
 ///
 /// A BROKER RESTART IS A PRESENCE EPOCH. A broker reopened on its log fires
-/// every will that log holds, so the node row reads `gone inc=<n>` until the
+/// every will that log holds, so the node row reads `away inc=<n>` until the
 /// bridge's in-process reconnect — the presence bring-up every attach runs —
 /// takes `inc=<n+1>`, registers a will on the NEW connection and publishes
-/// `live`. A reconnect that skipped the bring-up leaves the row `gone` while
+/// `live`. A reconnect that skipped the bring-up leaves the row `away` while
 /// mail flows; one that skipped only the will leaves a later crash with no
-/// `gone` at all, because the old will is fenced by the new incarnation's own
+/// `away` at all, because the old will is fenced by the new incarnation's own
 /// records.
 ///
 /// The will's sequence is the reserved TOP of its incarnation's space, so no
@@ -590,7 +590,7 @@ fn a_kill_before_the_inbox_bursts_commit_redelivers_and_aterm_keeps_one_row_of_e
 /// remembers what the disk forgot.
 ///
 /// READ AS HISTORY, not with `Last`: `Last` keeps one record per subject, and
-/// the relaunch's `live` can overwrite a `gone` before a poll of it looks.
+/// the relaunch's `live` can overwrite an `away` before a poll of it looks.
 #[test]
 fn every_connection_carries_its_own_will_across_a_broker_restart_and_a_kill() {
     let mut w = World::boot("will", &[]);
@@ -619,10 +619,10 @@ fn every_connection_carries_its_own_will_across_a_broker_restart_and_a_kill() {
             })
             .collect()
     };
-    // The first `live` above `inc` that comes after a `gone inc=<inc>`.
+    // The first `live` above `inc` that comes after an `away inc=<inc>`.
     let live_after_gone = |w: &World, inc: u64| -> Option<u64> {
         let h = history(w);
-        let gone = h.iter().position(|(s, i)| s == "gone" && *i == inc)?;
+        let gone = h.iter().position(|(s, i)| s == "away" && *i == inc)?;
         h[gone..]
             .iter()
             .find(|(s, i)| s == "live" && *i > inc)
@@ -636,7 +636,7 @@ fn every_connection_carries_its_own_will_across_a_broker_restart_and_a_kill() {
     });
     let pid = w.bridge_pid();
 
-    // THE BROKER RESTARTS. The cut connection's will fires (`gone` at the first
+    // THE BROKER RESTARTS. The cut connection's will fires (`away` at the first
     // incarnation), and the reconnect — the same process, not a relaunch —
     // outranks it with a higher one.
     w.stop_broker();

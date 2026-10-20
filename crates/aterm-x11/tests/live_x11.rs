@@ -589,6 +589,14 @@ fn xlib_xi_and_xcursor_load_and_answer() {
         let image = (cursors.XcursorImageCreate)(2, 2);
         assert!(!image.is_null());
         assert_eq!(((*image).width, (*image).height), (2, 2));
+        // XcursorImageCreate mallocs the image and sets neither its hotspot nor
+        // its pixels. A hotspot left as whatever the heap held can fall past the
+        // image's edge (x86_64 under Rosetta, 2026-10-19), and the server then
+        // refuses RenderCreateCursor with BadMatch, which Xlib's default handler
+        // answers by exiting the test process; the cursor code sets both.
+        (*image).xhot = 0;
+        (*image).yhot = 0;
+        std::slice::from_raw_parts_mut((*image).pixels, 4).fill(0xff00_0000);
         let cursor = (cursors.XcursorImageLoadCursor)(display, image);
         assert_ne!(cursor, 0, "a cursor from pixels");
         (x.XFreeCursor)(display, cursor);

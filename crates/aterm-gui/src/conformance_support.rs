@@ -115,3 +115,29 @@ pub(crate) fn schedules(
     );
     out
 }
+
+/// The stack a Tier-1 body that builds an `App` runs on ([`on_conformance_stack`]). An
+/// unoptimized test build moves a `WindowState` by value through every frame of
+/// `BTreeMap::insert`; on 2026-09-30 input_release_pairing's `two_window_app` ->
+/// `App::insert_logical_window` chain needed 2,135,360 bytes of frames, past libtest's
+/// 2 MiB thread stack, and the SIGBUS at the guard page killed the whole `aterm-gui --lib`
+/// binary with its tests unreported. 32 MiB is reserved, not touched; the by-value moves
+/// are the size, and this stack only gives them room.
+const CONFORMANCE_BODY_STACK: usize = 32 << 20;
+
+/// Run a Tier-1 `body` on a thread of its own with [`CONFORMANCE_BODY_STACK`] and hand
+/// back what it returns; a panic in it is this caller's panic. The thread is joined
+/// before this returns, so a body's thread-local evidence windows (`aterm_spec::xref`)
+/// open and close on that one thread.
+pub(crate) fn on_conformance_stack<T: Send>(machine: &str, body: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        let thread = std::thread::Builder::new()
+            .name(format!("tier1/{machine}"))
+            .stack_size(CONFORMANCE_BODY_STACK)
+            .spawn_scoped(scope, body)
+            .unwrap_or_else(|spawn| panic!("{machine}: its Tier-1 thread did not start: {spawn}"));
+        thread
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    })
+}

@@ -1208,12 +1208,17 @@ impl Real {
     /// `git archive` of `r` into `dest`, without `.cargo/`, each submodule written from
     /// its own object store at the gitlink `r` records.
     fn archive_into(&self, r: &str, dest: &Path) -> bool {
-        // one forwarded child for the pipe: the archive and the tar share its group
+        // one forwarded child for the pipe: the archive and the tar share its group.
+        // `pipefail` through `command`: `set` is a special builtin, and a shell without
+        // the option (dash, Debian's and Ubuntu's /bin/sh, before 0.5.13) exits at a
+        // special builtin's error, `2>/dev/null` or not, so the archive never ran
+        // there; `command set` only fails, and the pipe's status is then tar's, which
+        // an empty archive fails too.
         let tar = |repo: &Path, rev: &str, into: &Path| -> bool {
             let mut pipe = command("/bin/sh");
             pipe.args([
                 "-c",
-                "set -o pipefail 2>/dev/null; git -C \"$1\" archive \"$2\" | tar -x -C \"$3\"",
+                "command set -o pipefail 2>/dev/null; git -C \"$1\" archive \"$2\" | tar -x -C \"$3\"",
                 "archive",
             ])
             .arg(repo)

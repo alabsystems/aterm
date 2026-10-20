@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
+// under them (crates/aterm-spec-anchor/anchor_rules.rs).
+#![cfg_attr(anchor_rules, feature(macro_attr))]
+
 //! Resource sandbox for spawned children (ATERM_DESIGN WS-G).
 //!
 //! Confines the child `$SHELL` with POSIX `setrlimit` bounds, applied in the
@@ -203,6 +207,179 @@ impl Limits {
             .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
         imp::apply_to_job(self, job)
     }
+
+    /// True when every numeric limit is `None` and `restrict_ui` is `false`.
+    #[must_use]
+    pub const fn is_unrestricted(&self) -> bool {
+        self.cpu_seconds.is_none()
+            && self.address_space.is_none()
+            && self.file_size.is_none()
+            && self.open_files.is_none()
+            && self.active_processes.is_none()
+            && !self.restrict_ui
+    }
+
+    /// Combine two [`Limits`] policies by taking the stricter (smaller) bound
+    /// for each resource and the boolean OR of `restrict_ui` and `binding`.
+    #[must_use]
+    pub const fn merge_stricter(self, other: Self) -> Self {
+        const fn min_opt_u64(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+            match (a, b) {
+                (Some(x), Some(y)) => Some(if x < y { x } else { y }),
+                (Some(x), None) => Some(x),
+                (None, Some(y)) => Some(y),
+                (None, None) => None,
+            }
+        }
+        const fn min_opt_u32(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+            match (a, b) {
+                (Some(x), Some(y)) => Some(if x < y { x } else { y }),
+                (Some(x), None) => Some(x),
+                (None, Some(y)) => Some(y),
+                (None, None) => None,
+            }
+        }
+        Self {
+            cpu_seconds: min_opt_u64(self.cpu_seconds, other.cpu_seconds),
+            address_space: min_opt_u64(self.address_space, other.address_space),
+            file_size: min_opt_u64(self.file_size, other.file_size),
+            open_files: min_opt_u64(self.open_files, other.open_files),
+            active_processes: min_opt_u32(self.active_processes, other.active_processes),
+            restrict_ui: self.restrict_ui || other.restrict_ui,
+            binding: self.binding || other.binding,
+        }
+    }
+
+    /// Encode this [`Limits`] policy into a canonical 38-byte little-endian
+    /// wire frame:
+    /// - byte `0`: presence bitmask (`bit 0 = cpu_seconds`, `bit 1 = address_space`,
+    ///   `bit 2 = file_size`, `bit 3 = open_files`, `bit 4 = active_processes`)
+    /// - byte `1`: flags (`bit 0 = restrict_ui`, `bit 1 = binding`)
+    /// - bytes `2..10`: `cpu_seconds` (`0` when absent)
+    /// - bytes `10..18`: `address_space` (`0` when absent)
+    /// - bytes `18..26`: `file_size` (`0` when absent)
+    /// - bytes `26..34`: `open_files` (`0` when absent)
+    /// - bytes `34..38`: `active_processes` (`0` when absent)
+    #[must_use]
+    pub const fn encode_wire_le(&self) -> [u8; 38] {
+        let mut mask = 0u8;
+        let cpu = match self.cpu_seconds {
+            Some(v) => {
+                mask |= 1 << 0;
+                v
+            }
+            None => 0,
+        };
+        let aspace = match self.address_space {
+            Some(v) => {
+                mask |= 1 << 1;
+                v
+            }
+            None => 0,
+        };
+        let fsize = match self.file_size {
+            Some(v) => {
+                mask |= 1 << 2;
+                v
+            }
+            None => 0,
+        };
+        let nofile = match self.open_files {
+            Some(v) => {
+                mask |= 1 << 3;
+                v
+            }
+            None => 0,
+        };
+        let nproc = match self.active_processes {
+            Some(v) => {
+                mask |= 1 << 4;
+                v
+            }
+            None => 0,
+        };
+        let flags = (self.restrict_ui as u8) | ((self.binding as u8) << 1);
+        let c = cpu.to_le_bytes();
+        let a = aspace.to_le_bytes();
+        let f = fsize.to_le_bytes();
+        let n = nofile.to_le_bytes();
+        let p = nproc.to_le_bytes();
+        [
+            mask, flags, c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], a[0], a[1], a[2], a[3],
+            a[4], a[5], a[6], a[7], f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], n[0], n[1],
+            n[2], n[3], n[4], n[5], n[6], n[7], p[0], p[1], p[2], p[3],
+        ]
+    }
+
+    /// Decode a canonical 38-byte little-endian [`Limits`] wire frame,
+    /// rejecting unknown mask/flag bits or non-zero payload fields when the
+    /// corresponding presence bit is clear.
+    #[must_use]
+    pub const fn decode_wire_le(wire: &[u8; 38]) -> Option<Self> {
+        let mask = wire[0];
+        let flags = wire[1];
+        if (mask & !0b0001_1111) != 0 || (flags & !0b0000_0011) != 0 {
+            return None;
+        }
+        let cpu = u64::from_le_bytes([
+            wire[2], wire[3], wire[4], wire[5], wire[6], wire[7], wire[8], wire[9],
+        ]);
+        let aspace = u64::from_le_bytes([
+            wire[10], wire[11], wire[12], wire[13], wire[14], wire[15], wire[16], wire[17],
+        ]);
+        let fsize = u64::from_le_bytes([
+            wire[18], wire[19], wire[20], wire[21], wire[22], wire[23], wire[24], wire[25],
+        ]);
+        let nofile = u64::from_le_bytes([
+            wire[26], wire[27], wire[28], wire[29], wire[30], wire[31], wire[32], wire[33],
+        ]);
+        let nproc = u32::from_le_bytes([wire[34], wire[35], wire[36], wire[37]]);
+
+        let cpu_seconds = if (mask & (1 << 0)) != 0 {
+            Some(cpu)
+        } else if cpu == 0 {
+            None
+        } else {
+            return None;
+        };
+        let address_space = if (mask & (1 << 1)) != 0 {
+            Some(aspace)
+        } else if aspace == 0 {
+            None
+        } else {
+            return None;
+        };
+        let file_size = if (mask & (1 << 2)) != 0 {
+            Some(fsize)
+        } else if fsize == 0 {
+            None
+        } else {
+            return None;
+        };
+        let open_files = if (mask & (1 << 3)) != 0 {
+            Some(nofile)
+        } else if nofile == 0 {
+            None
+        } else {
+            return None;
+        };
+        let active_processes = if (mask & (1 << 4)) != 0 {
+            Some(nproc)
+        } else if nproc == 0 {
+            None
+        } else {
+            return None;
+        };
+        Some(Self {
+            cpu_seconds,
+            address_space,
+            file_size,
+            open_files,
+            active_processes,
+            restrict_ui: (flags & 1) != 0,
+            binding: (flags & 2) != 0,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -285,11 +462,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn none_limits_are_a_no_op() {
+        let _serialized = nofile_guard();
         let auth = unsafe { Authority::root_authority() };
         let cap: Cap<Sandbox> = auth.grant(Tier::Trusted);
-        let before = current(libc::RLIMIT_CPU);
-        Limits::default().apply(&cap).unwrap();
-        assert_eq!(current(libc::RLIMIT_CPU), before);
+        set_limit(libc::RLIMIT_NOFILE, Some(300), false).expect("a known soft limit");
+        let before = (current(libc::RLIMIT_CPU), current(libc::RLIMIT_NOFILE));
+        Limits::inherit().apply(&cap).unwrap();
+        assert_eq!(
+            (current(libc::RLIMIT_CPU), current(libc::RLIMIT_NOFILE)),
+            before
+        );
     }
 
     #[cfg(unix)]
@@ -463,5 +645,94 @@ mod tests {
             RAISED,
             "Safety's soft limit must stay raisable"
         );
+    }
+
+    /// Each limit lands on its own resource, and one above the hard ceiling is clamped under
+    /// it rather than refused (a refusal fails the child closed: no shell where the host's
+    /// hard `RLIMIT_NOFILE` is below the Safety set's), a binding one too, whose hard limit
+    /// is the clamped value and never the asked one (raising a hard limit is refused). The
+    /// child lowers its own ceiling.
+    #[cfg(unix)]
+    #[test]
+    fn each_limit_lands_on_its_resource_clamped_under_the_hard_ceiling() {
+        const CEILING: u64 = 1000;
+        let auth = unsafe { Authority::root_authority() };
+        let cap: Cap<Sandbox> = auth.grant(Tier::Trusted);
+        let mismatch = |binding: bool| {
+            in_forked_child(move || {
+                let read = |resource| {
+                    let mut lim = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    // SAFETY: a valid resource id and out-param.
+                    unsafe { libc::getrlimit(resource, &mut lim) };
+                    lim
+                };
+                // The soft limit starts below the ceiling, so reading the ceiling back
+                // means the asked limit landed (clamped), not that it was left alone.
+                let lowered = libc::rlimit {
+                    rlim_cur: (CEILING / 2) as libc::rlim_t,
+                    rlim_max: CEILING as libc::rlim_t,
+                };
+                // SAFETY: a valid resource id and a fully initialized rlimit.
+                if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) } != 0 {
+                    return 1;
+                }
+                let (cpu, fsize) = (1u64 << 20, 1u64 << 40);
+                let want_cpu = cpu.min(read(libc::RLIMIT_CPU).rlim_max);
+                let want_fsize = fsize.min(read(libc::RLIMIT_FSIZE).rlim_max);
+                let limits = Limits {
+                    cpu_seconds: Some(cpu),
+                    file_size: Some(fsize),
+                    open_files: Some(CEILING + 1),
+                    binding,
+                    ..Limits::inherit()
+                };
+                if limits.apply(&cap).is_err() {
+                    return 2;
+                }
+                let nofile = read(libc::RLIMIT_NOFILE);
+                let got = [
+                    (read(libc::RLIMIT_CPU).rlim_cur, want_cpu),
+                    (read(libc::RLIMIT_FSIZE).rlim_cur, want_fsize),
+                    (nofile.rlim_cur, CEILING),
+                    (nofile.rlim_max, CEILING),
+                ];
+                match got.iter().position(|&(got, want)| got != want) {
+                    Some(row) => 10 + row as i32,
+                    None => 0,
+                }
+            })
+        };
+        for binding in [false, true] {
+            assert_eq!(
+                mismatch(binding),
+                0,
+                "binding {binding}: 1: setup, 2: refused, 10+: the row read back wrong"
+            );
+        }
+    }
+
+    #[test]
+    fn limits_wire_codec_and_merge_stricter_round_trip() {
+        assert!(Limits::inherit().is_unrestricted());
+        assert!(!Limits::shell_default().is_unrestricted());
+        let merged = Limits::shell_default().merge_stricter(Limits {
+            cpu_seconds: Some(300),
+            open_files: Some(1024),
+            binding: true,
+            ..Limits::inherit()
+        });
+        assert_eq!(merged.cpu_seconds, Some(300));
+        assert_eq!(merged.open_files, Some(1024));
+        assert!(merged.binding);
+        assert!(merged.restrict_ui);
+
+        let wire = merged.encode_wire_le();
+        assert_eq!(Limits::decode_wire_le(&wire), Some(merged));
+        let mut bad = wire;
+        bad[0] = 0xff;
+        assert_eq!(Limits::decode_wire_le(&bad), None);
     }
 }

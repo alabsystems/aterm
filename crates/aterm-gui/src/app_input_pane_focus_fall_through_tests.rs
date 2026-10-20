@@ -13,8 +13,8 @@
 use super::{PhysicalReleaseTrace, take_physical_release_trace};
 use crate::{App, PhysicalPressOwner, WindowId};
 use aterm_types::keyboard::{Key as TKey, KeyEventType, Modifiers, NamedKey as TNamed};
-use winit::event::{ElementState, KeyEvent};
-use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey};
+use aterm_window::event::{ElementState, KeyEvent};
+use aterm_window::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey};
 
 /// One arrow, as the four tests below press it.
 #[derive(Clone, Copy, Debug)]
@@ -383,7 +383,7 @@ fn over_a_native_view_alt_left_reaches_the_field_as_word_motion() {
 /// the same press is forwarded and encodes to that LF.
 #[test]
 fn a_ctrl_letter_pane_focus_binding_never_hands_its_byte_to_the_shell() {
-    use winit::keyboard::SmolStr;
+    use aterm_window::keyboard::SmolStr;
     let ctrl_j = |state| {
         KeyEvent::synthetic_for_test(
             PhysicalKey::Code(KeyCode::KeyJ),

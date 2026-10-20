@@ -27,23 +27,14 @@ use aterm_uds::CtlStream;
 /// or group/other-writable directory is REFUSED (fail closed) rather than
 /// provisioned into.
 pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    // A directory that already IS what this returns success for — a
-    // directory, exactly `0700`, passing the SEC-3 predicate below on a fresh
-    // stat — needs nothing created or written: one `stat(2)`, where the full
-    // path below is four (`mkdir`, the `EEXIST` stat, two more). Every spawn
-    // asks for the control dir and its subdirs about eight times. Nothing is
-    // remembered between calls, so a directory removed or loosened since is
-    // seen at once and takes the full path.
-    if let Ok(meta) = std::fs::metadata(dir)
-        && meta.is_dir()
-        && meta.mode() & 0o7777 == 0o700
-        && aterm_types::fs_restricted::dir_safe_for_private_write(
-            our_uid(),
-            meta.uid(),
-            meta.mode(),
-        )
-    {
+    ensure_private_dir_as(dir, our_uid())
+}
+
+/// [`ensure_private_dir`] with the uid that must own `dir` given, so a test can
+/// stand as a stranger to a directory it really owns: the one way, unprivileged,
+/// to reach the SEC-3 refusal of a foreign-owned `0700` directory.
+pub(super) fn ensure_private_dir_as(dir: &Path, owner: u32) -> std::io::Result<()> {
+    if already_private(dir, owner) {
         return Ok(());
     }
     // Missing ancestors `0755` whatever the umask, never `create_dir_all`'s `0777 & ~umask`:
@@ -51,6 +42,55 @@ pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     // prefix's parent (macOS), and `targo trust` refuses every toolchain installed below a
     // group-writable directory.
     aterm_types::fs_restricted::create_dir_all_unshared(dir, 0o700)?;
+    tighten_and_verify(dir, owner)
+}
+
+/// [`ensure_private_dir`] for a directory that must already be there: the same
+/// fresh-stat fast path, `0700` and SEC-3 gate, but nothing is created. A
+/// missing `dir` is `NotFound` and something there that is no directory is
+/// `NotADirectory`. A session identity's admission hardens the folders of an
+/// identity it did not make with this (`agent_identity::harden_identity`), so
+/// an `identities forget` landing between its look and its hardening is never
+/// undone by a create here.
+pub(crate) fn harden_private_dir(dir: &Path) -> std::io::Result<()> {
+    if already_private(dir, our_uid()) {
+        return Ok(());
+    }
+    if !std::fs::metadata(dir)?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("{}: not a directory", dir.display()),
+        ));
+    }
+    tighten_and_verify(dir, our_uid())
+}
+
+/// Whether `dir` already IS what [`ensure_private_dir`] and
+/// [`harden_private_dir`] return success for — a directory, exactly `0700`,
+/// passing the SEC-3 predicate on a fresh stat — so nothing needs creating or
+/// writing: one `stat(2)`, where the full path is four (`mkdir`, the `EEXIST`
+/// stat, two more). Every spawn asks for the control dir and its subdirs about
+/// eight times. Nothing is remembered between calls, so a directory removed or
+/// loosened since is seen at once and takes the full path. `owner` is the uid
+/// the directory must belong to (ours, outside a test).
+fn already_private(dir: &Path, owner: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(dir).is_ok_and(|meta| {
+        meta.is_dir()
+            && meta.mode() & 0o7777 == 0o700
+            && aterm_types::fs_restricted::dir_safe_for_private_write(
+                owner,
+                meta.uid(),
+                meta.mode(),
+            )
+    })
+}
+
+/// The tail both doors share, over a directory that is there: `0700`, written
+/// only when it is not already, then the ownership-safety gate on a fresh stat,
+/// for `owner`.
+fn tighten_and_verify(dir: &Path, owner: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
     // Only a mode that is not already `0700` is written: a `chmod(2)` to the
     // mode a directory already has still moves its `st_ctime` (APFS), and
     // tippy aborts when an ancestor of its executable changes ctime mid-run
@@ -63,7 +103,7 @@ pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     // no group/other write bits. set_permissions cannot fix a foreign owner.
     let meta = std::fs::metadata(dir)?;
     let safe =
-        aterm_types::fs_restricted::dir_safe_for_private_write(our_uid(), meta.uid(), meta.mode());
+        aterm_types::fs_restricted::dir_safe_for_private_write(owner, meta.uid(), meta.mode());
     if safe {
         Ok(())
     } else {
@@ -72,7 +112,7 @@ pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
             format!(
                 "{}: control directory must be owned by uid {} and not group/other-writable",
                 dir.display(),
-                our_uid()
+                owner
             ),
         ))
     }
@@ -112,6 +152,15 @@ pub(crate) fn provision_token(path: &Path) -> Option<String> {
     // refuses a symlink even racing the unlink. The token is thus never written
     // through an attacker-controlled path, and never briefly world-readable.
     let _ = std::fs::remove_file(path);
+    write_fresh_token(path, &token)?;
+    Some(token)
+}
+
+/// The exclusive write behind [`provision_token`], once the unlink is done:
+/// `token` lands only in a file this call creates. Whatever stands at `path`
+/// by now — a file, a symlink, a hard link to a file of ours, planted in the
+/// gap after the unlink — is refused (`None`) and left exactly as it was.
+pub(super) fn write_fresh_token(path: &Path, token: &str) -> Option<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true).mode(0o600);
     opts.custom_flags(libc::O_NOFOLLOW);
@@ -122,8 +171,7 @@ pub(crate) fn provision_token(path: &Path) -> Option<String> {
         .ok()?;
     let mut f = f;
     f.write_all(token.as_bytes()).ok()?;
-    f.flush().ok()?;
-    Some(token)
+    f.flush().ok()
 }
 
 /// Tighten the bound socket file to mode `0600` so only the owner can connect
@@ -160,8 +208,13 @@ pub(crate) fn our_uid() -> u32 {
 /// `None` (cannot verify) also refuses — fail closed. The `Err` carries the
 /// exact denial text the accept loop has always audit-logged.
 pub(crate) fn peer_check(stream: &CtlStream) -> Result<(), String> {
-    let our_uid = our_uid();
-    match peer_uid(stream) {
+    peer_verdict(peer_uid(stream), our_uid())
+}
+
+/// [`peer_check`]'s decision over the uid the kernel reported (`None` when it
+/// would not say): only `our_uid` is admitted.
+pub(super) fn peer_verdict(peer: Option<u32>, our_uid: u32) -> Result<(), String> {
+    match peer {
         Some(uid) if uid == our_uid => Ok(()),
         other => Err(format!("connect (peer uid {other:?} != {our_uid})")),
     }

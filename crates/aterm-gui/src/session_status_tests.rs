@@ -48,7 +48,14 @@ fn stale_claude_sample_cannot_restart_a_stopped_footer_watch() {
     }
     // The UI sampled Claude before the worker published zsh and sent its
     // stop. A later request from that stale sample would revive the watch.
-    observer.request_footer_if_due(7, &timeline, Some("claude"), 42, now);
+    observer.request_footer_if_due(
+        7,
+        &timeline,
+        Some("claude"),
+        42,
+        now,
+        &crate::claude_footer::LogWake::default(),
+    );
     assert!(!observer.footer_asked.contains_key(&7));
 
     {
@@ -56,7 +63,14 @@ fn stale_claude_sample_cannot_restart_a_stopped_footer_watch() {
         current.note_foreground_group(43);
         current.set_program(43, Some("claude".into()));
     }
-    observer.request_footer_if_due(7, &timeline, Some("claude"), 42, now);
+    observer.request_footer_if_due(
+        7,
+        &timeline,
+        Some("claude"),
+        42,
+        now,
+        &crate::claude_footer::LogWake::default(),
+    );
     assert!(!observer.footer_asked.contains_key(&7));
 }
 
@@ -341,6 +355,46 @@ fn published(phase: Phase, last_outcome: Outcome) -> Status {
         reasons: Vec::new(),
         conflict: false,
     }
+}
+
+/// A command Ctrl+C stopped reads as interrupted, not as a failure code:
+/// STATUS_CONTROL_C_EXIT, which a Windows console program (`ping -t` in pwsh,
+/// measured 2026-10-17 as `failed (exit -1073741510)`) and a pwsh line Ctrl+C
+/// stopped report, everywhere; Git Bash's 130 on Windows, so its tabs read as
+/// pwsh's. The outcome stays a failure with its code (the wire and the tab's
+/// failure mark are unchanged). NEGATIVE CONTROL: any other code is its code.
+#[test]
+fn a_ctrl_c_exit_reads_as_interrupted() {
+    let text = |phase, exit_code| {
+        summary_text(&published(phase, Outcome::Failure { exit_code })).expect("text")
+    };
+    assert_eq!(
+        WINDOWS_CONTROL_C_EXIT,
+        i32::from_ne_bytes(0xC000_013A_u32.to_ne_bytes())
+    );
+    assert_eq!(text(Phase::Idle, WINDOWS_CONTROL_C_EXIT), "interrupted");
+    assert_eq!(
+        text(Phase::Exited, WINDOWS_CONTROL_C_EXIT),
+        "exited (interrupted)"
+    );
+    let bash_ctrl_c = if cfg!(windows) {
+        "interrupted"
+    } else {
+        "failed (exit 130)"
+    };
+    assert_eq!(text(Phase::Idle, 130), bash_ctrl_c);
+    assert_eq!(text(Phase::Idle, 1), "failed (exit 1)");
+    assert_eq!(
+        text(Phase::Idle, -1_073_741_819),
+        "failed (exit -1073741819)"
+    );
+    assert_eq!(text(Phase::Exited, 2), "exited (exit 2)");
+    assert!(
+        Outcome::Failure {
+            exit_code: WINDOWS_CONTROL_C_EXIT
+        }
+        .is_failure()
+    );
 }
 
 #[test]
@@ -1103,12 +1157,15 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
     };
     let record = status(&app);
     assert!(
-        record.contains(" flaps=0 land_at=- task=- log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=- gen="),
+        record.contains(
+            " flaps=0 land_at=- task=- pause=- task_state=- task_rev=0 log_seq=1 log_ep=1 run=- \
+             turn=- step=- need=- need_since_ms=- gen="
+        ),
         "{record}"
     );
     assert_stamp_rides_last(&record);
     assert!(
-        roster(&app).ends_with(" upgrade=- land_at=- task=-"),
+        roster(&app).ends_with(" upgrade=- land_at=- task=- pause=- task_state=- task_rev=0"),
         "{}",
         roster(&app)
     );
@@ -1158,7 +1215,8 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
     assert!(crate::session_timeline::release_supervisor(
         &ctx,
         None,
-        crate::metrics::now_us()
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl
     ));
     crate::session_timeline::claim_supervisor(
         &ctx,
@@ -1177,6 +1235,98 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
     );
     let record = status(&app);
     assert_stamp_rides_last(&record);
+}
+
+/// `pause=` AFTER `task=` (the Autopilot design, §10.5.1), on `status` and
+/// the `sessions` roster: the unix second the loop's pause after short
+/// turns ends, told through the host's own wake (`App::apply_harness_fact`,
+/// `HarnessFact::Pause`), printed under `task=`'s rule — an agent session
+/// whose live claim THIS window's host holds — and `-` once the pause is
+/// over. NEGATIVE CONTROLS: a pause told with no claim, or under another
+/// holder's, prints `-`; so does one on a session that runs no agent.
+#[test]
+fn the_status_record_and_the_roster_carry_the_pause_after_task() {
+    const AT: i64 = 1_792_249_260;
+    let mut app = crate::App::headless_for_test();
+    let status = |app: &crate::App| app.session_status_record(0).expect("live session");
+    let roster = |app: &crate::App| {
+        crate::control::cmd_sessions_store(&app.store, None)
+            .lines()
+            .nth(1)
+            .expect("one session")
+            .to_string()
+    };
+    let field = |line: &str, key: &str| {
+        line.split_whitespace()
+            .find_map(|t| t.strip_prefix(key))
+            .unwrap_or_else(|| panic!("{key} in {line}"))
+            .to_string()
+    };
+    let ctx = app.pool.get(0).unwrap().ctx.clone();
+    let sid = ctx.self_id.as_str().to_string();
+    let pause = crate::HarnessFact::Pause(Some(crate::PausePlan {
+        at_unix: AT,
+        short: 3,
+    }));
+    crate::session_timeline::claim_supervisor(
+        &ctx,
+        crate::autopilot::own_holder(),
+        None,
+        None,
+        crate::metrics::now_us(),
+    )
+    .unwrap();
+    app.apply_harness_fact(&sid, pause);
+    assert_eq!(field(&status(&app), "pause="), "-", "no agent runs here");
+    {
+        let mut tl = ctx.timeline.lock().unwrap();
+        tl.note_foreground_group(7);
+        tl.set_program(7, Some("claude".into()));
+    }
+    let record = status(&app);
+    assert!(
+        record.contains(&format!(
+            " task=- pause={AT} task_state=- task_rev=0 log_seq="
+        )),
+        "{record}"
+    );
+    assert_stamp_rides_last(&record);
+    assert!(
+        roster(&app).ends_with(&format!(" task=- pause={AT} task_state=- task_rev=0")),
+        "{}",
+        roster(&app)
+    );
+    app.apply_harness_fact(&sid, crate::HarnessFact::Pause(None));
+    assert_eq!(field(&status(&app), "pause="), "-", "the pause is over");
+    assert_eq!(field(&roster(&app), "pause="), "-");
+    // Another holder's claim: this host hears nothing from its loop.
+    app.apply_harness_fact(&sid, pause);
+    assert_eq!(field(&status(&app), "pause="), AT.to_string());
+    assert!(crate::session_timeline::release_supervisor(
+        &ctx,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl
+    ));
+    assert_eq!(field(&status(&app), "pause="), "-", "no live claim here");
+    crate::session_timeline::claim_supervisor(
+        &ctx,
+        "aterm-supervise:9",
+        None,
+        None,
+        crate::metrics::now_us(),
+    )
+    .unwrap();
+    assert_eq!(
+        field(&status(&app), "pause="),
+        "-",
+        "another holder's claim"
+    );
+    assert_eq!(
+        field(&roster(&app), "pause="),
+        "-",
+        "another holder's claim"
+    );
 }
 
 /// `autopilot=` BESIDE `supervisor=` (the Autopilot design, 2026-10-15, §5):
@@ -1483,14 +1633,16 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
         format!(
             "schema sid subject subject_source observed phase since_ms outcome exit_code signal \
              detail confidence reasons attribution fs_consent conflict revision enabled hold \
-             hold_advisory fabric fabric_rtt_ms fabric_link_age_ms identity hand hand_pid level story why \
-             path program agent agent_detail agent_rev agent_since_ms agent_gen agent_fp \
+             hold_advisory fabric fabric_rtt_ms fabric_link_age_ms fleet identity hand hand_pid level story why \
+             needs hold_by typed_by typed_ms path program agent agent_detail agent_rev \
+             agent_since_ms agent_gen agent_fp \
              program_state last_act os_appearance theme_side reported_scheme scheme_from bg_dark \
-             session_theme theme_origin{conpty} integration input input_bytes input_wait_ms fg_rss_mb supervisor \
+             session_theme theme_origin{conpty} integration input input_bytes input_wait_ms fg_rss_mb \
+             disk disk_free_mb disk_room_mb disk_age_ms supervisor \
              supervisor_proven autopilot \
              human_ms human_seq launch launch_seq path_evidence copy upgrade history_lost \
              journal journal_off integration_rev born render \
-             resizes flaps land_at task \
+             resizes flaps land_at task pause task_state task_rev \
              log_seq log_ep run turn step need need_since_ms gen seq hash"
         ),
         "{observed}"
@@ -2319,6 +2471,33 @@ fn the_sweep_publishes_the_running_detail_onto_the_chrome_status() {
         None,
         "a completed block clears the chrome detail"
     );
+}
+
+/// `task_state=<state|-> task_rev=<n>` (2026-10-15), after `pause=`: the
+/// session's task record, read from the timeline leaf the agent columns come
+/// from — `-`/`0` for a session with no task, the state and rev once one is
+/// marked — and named apart from `task=`, the task's face under Land, which
+/// a session with no live claim here prints `-` whatever its record says.
+/// Additive: the stamp still rides last.
+#[test]
+fn the_status_record_carries_the_task_record() {
+    use crate::task_record::{TaskMark, TaskState, mark_session_task};
+    let app = crate::App::headless_for_test();
+    let none = app.session_status_record(0).expect("live session");
+    assert!(
+        none.contains(" pause=- task_state=- task_rev=0 log_seq="),
+        "{none}"
+    );
+    let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+    let subscribers = crate::subscribe::new_registry();
+    mark_session_task(&ctx, 0, &TaskMark::new(TaskState::Working), &subscribers).expect("unfenced");
+    mark_session_task(&ctx, 0, &TaskMark::new(TaskState::Done), &subscribers).expect("unfenced");
+    let record = app.session_status_record(0).expect("live session");
+    assert!(
+        record.contains(" task=- pause=- task_state=done task_rev=2 log_seq="),
+        "{record}"
+    );
+    assert_stamp_rides_last(&record);
 }
 
 /// `conpty=` names the console host a Windows session runs in, `-` for a key

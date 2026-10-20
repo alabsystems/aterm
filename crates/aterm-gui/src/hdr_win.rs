@@ -28,9 +28,9 @@
 //! reading SDR windows byte-exact — a capture artefact, not a presented colour.
 #![cfg(windows)]
 
+use aterm_window::platform::windows::MonitorHandleExtWindows;
+use aterm_window::window::Window;
 use core::ffi::c_void;
-use winit::platform::windows::MonitorHandleExtWindows;
-use winit::window::Window;
 
 /// `(edr_max, sdr_white_scale)` for `window`'s monitor when Windows HDR is ON;
 /// `(1.0, 1.0)` when HDR is off or any query fails.
@@ -150,13 +150,8 @@ struct PathInfo {
 /// `DISPLAYCONFIG_MODE_INFO` is a 64-byte tagged union; we never read it (only pass
 /// the array to `QueryDisplayConfig`), so an opaque 4-byte-aligned blob suffices.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct ModeInfo([u32; 16]);
-impl Default for ModeInfo {
-    fn default() -> Self {
-        Self([0; 16])
-    }
-}
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct AdvColorInfo {

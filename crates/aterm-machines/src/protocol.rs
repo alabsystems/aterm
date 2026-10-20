@@ -69,6 +69,12 @@ pub struct Hello {
     pub os_build: String,
     /// `uname -m`.
     pub arch: String,
+    /// What the Mac is, in the parts `[names]` fills `{hardware}` with
+    /// (`hardware::Description::parts`: `MacBook Air`, `M5`, `32GB`, `4TB`); empty when a
+    /// fact could not be read, and from an agent older than the field. The controller finds a
+    /// Mac its baseline renamed by it (`controller::naming::renamed_address`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hardware: Vec<String>,
     /// Who owns `/dev/console`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub console_user: Option<String>,
@@ -82,6 +88,72 @@ pub struct Hello {
     /// The newest finished run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run: Option<String>,
+    /// Live `aterm` sessions running on this host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<HostedSession>,
+}
+
+/// One live `aterm` tab/session reported in [`Hello::sessions`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct HostedSession {
+    /// PID of the `aterm` instance hosting this session.
+    pub instance_pid: u32,
+    /// Local tab/session index within that `aterm` instance.
+    pub local_id: u64,
+    /// Globally unique session ID (`s-...`).
+    pub sid: String,
+    /// Session lifecycle state (`alive`, `idle`, `running`, …).
+    pub state: String,
+    /// Tab title (`user_title` when set, otherwise the terminal title).
+    pub title: String,
+    /// Window index (`0`, `1`, … or `none`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub window: String,
+    /// Whether this tab is the active tab of its window.
+    #[serde(default)]
+    pub active: bool,
+    /// Whether its window is focused.
+    #[serde(default)]
+    pub focused: bool,
+    /// Foreground program (`claude`, `codex`, `agy`, `muse`, `gemini`, `zsh`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
+    /// Live AI CLI status word (`working`, `waiting`, `idle`, `confirm`, `error`, `done`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Live AI CLI status detail (`permission`, `plan`, `question`, `thinking`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_detail: Option<String>,
+    /// Milliseconds the AI CLI has been in its current state (`agent_since_ms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_since_ms: Option<u64>,
+    /// Milliseconds since a person last typed in this tab (`human_ms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_ms: Option<u64>,
+    /// Effective Autopilot mode (`off`, `safe`, `cruise`, `land`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autopilot: Option<String>,
+    /// Typed session role (`operator`, `worker`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Typed escalation/attention reason, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<String>,
+    /// Live supervisor holder, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor: Option<String>,
+    /// Active task summary, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Terminal grid columns (`211`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u32>,
+    /// Terminal grid rows (`70`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u32>,
+    /// Working directory (`~/aterm`, `$HOME/trust`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// One principal's serial floor.

@@ -126,7 +126,13 @@ impl TerminalHandler<'_> {
                     if set {
                         self.enter_alternate_screen();
                     } else {
+                        let dead = self.take_dead_alt_screen();
                         self.exit_alternate_screen();
+                        if dead {
+                            // The host's forwarded switch out of a dead app's screen
+                            // is that app's exit: what it left on goes with it.
+                            self.release_dead_app_modes();
+                        }
                     }
                 }
                 2004 => {
@@ -135,6 +141,10 @@ impl TerminalHandler<'_> {
                     } else {
                         self.disable_bracketed_paste();
                     }
+                    // Between the shell's `D` and its next `A` the switch is the shell's own
+                    // set-up for the prompt it is drawing (`release_dead_app_paste`).
+                    self.transient.bracketed_paste_from_prompt = self.shell.phase
+                        == super::grouped_state::ShellIntegrationPhase::CommandFinished;
                 }
                 // Mouse tracking modes are mutually exclusive; DECRST resets to none.
                 9 => {
@@ -223,11 +233,16 @@ impl TerminalHandler<'_> {
                 2048 => {
                     let was = self.modes.in_band_size_reports;
                     self.modes.in_band_size_reports = set;
+                    if !set {
+                        self.transient.size_report_held = false;
+                    }
                     // Emit only on a disabled->enabled transition (as xterm does); the
                     // emitter holds the buffer cap a `?2048l?2048h` flood would test.
-                    if set && !was {
+                    if set && !was && self.hold_size_report() {
+                        self.transient.size_report_held = true;
+                    } else if set && !was {
                         super::state_accessors::push_in_band_size_report(
-                            &mut self.transient.response_buffer,
+                            self.transient,
                             self.grid.rows(),
                             self.grid.cols(),
                             self.iterm2.host_cell_px(),
@@ -351,6 +366,7 @@ impl TerminalHandler<'_> {
         // A flap the parked alt buffer took while resized with the primary is not the screen
         // the app is about to see: its resize undo must not hand rows back into it.
         new_grid.drop_resize_undo();
+        new_grid.set_resize_law(self.grid.resize_law());
         // Tab stops are global in xterm, shared by both screens.
         new_grid.restore_tab_stops(self.grid.tab_stops(), self.grid.tab_defaults_suppressed());
         // xterm shares the cursor between buffers: 47/1047 swap without moving it.
@@ -367,7 +383,9 @@ impl TerminalHandler<'_> {
         *self.alt_grid = Some(old_grid);
         self.modes.alternate_screen = true;
         self.note_screen_replaced();
-        self.grid.invalidate_host_coordinates();
+        // A swap moves no row of either grid: the main grid's anchors stay.
+        self.grid.invalidate_host_coordinates_for_swap();
+        self.send_held_size_report();
     }
 
     /// Point `grid`'s BCE template at the current pen's background. A buffer
@@ -390,7 +408,7 @@ impl TerminalHandler<'_> {
     /// is gone, so a displacement a resize left on it is gone too.
     fn note_screen_replaced(&mut self) {
         self.transient.screen_replaced = self.transient.screen_replaced.wrapping_add(1);
-        self.transient.render_debt = (0, 0);
+        self.transient.render_debt = crate::terminal::RenderDebt::default();
     }
 
     /// Copy the scroll region and horizontal margins from one grid to another. In xterm they
@@ -444,7 +462,8 @@ impl TerminalHandler<'_> {
         self.grid.restore_tab_stops(&tab_stops, tab_suppressed);
         self.modes.alternate_screen = false;
         self.note_screen_replaced();
-        self.grid.invalidate_host_coordinates();
+        self.grid.invalidate_host_coordinates_for_swap();
+        self.holder_fence.note_alt_exit();
     }
 
     /// Exit the alternate screen for mode 1047: clear it, then swap back. No cursor restore.
@@ -506,6 +525,9 @@ impl TerminalHandler<'_> {
             );
             self.grid.erase_screen();
             self.note_screen_replaced();
+            // The clear is the current drawer's: everything on the alt
+            // screen is its from here on.
+            self.holder_fence.note_alt_cleared();
             return;
         }
 
@@ -520,6 +542,7 @@ impl TerminalHandler<'_> {
         self.transient.current_hyperlink_id = None;
         self.transient.update_has_transient_extras();
         let mut new_grid = Grid::with_scrollback(self.grid.rows(), self.grid.cols(), 0);
+        new_grid.set_resize_law(self.grid.resize_law());
         // xterm's 1049-enter ClearScreen fills with the current SGR background (BCE).
         new_grid.set_cursor_template(
             crate::grid::Cell::bce_blank(self.style.cached_colors()),
@@ -541,7 +564,10 @@ impl TerminalHandler<'_> {
         *self.alt_grid = Some(old_grid);
         self.modes.alternate_screen = true;
         self.note_screen_replaced();
-        self.grid.invalidate_host_coordinates();
+        self.grid.invalidate_host_coordinates_for_swap();
+        // 1049 clears the screen it enters (47/1047 do not).
+        self.holder_fence.note_alt_cleared();
+        self.send_held_size_report();
     }
 
     /// Exit the alternate screen for mode 1049, restoring the saved cursor.
@@ -607,7 +633,8 @@ impl TerminalHandler<'_> {
         self.restore_cursor_snapshot(saved);
         self.modes.alternate_screen = false;
         self.note_screen_replaced();
-        self.grid.invalidate_host_coordinates();
+        self.grid.invalidate_host_coordinates_for_swap();
+        self.holder_fence.note_alt_exit();
     }
 
     /// Leave an alternate screen no app is behind any more (the app died before `?1049l`).
@@ -649,24 +676,154 @@ impl TerminalHandler<'_> {
         self.transient.conhost_alt_screen_left_up = conhost;
     }
 
+    /// Whether the `?1049l` about to run leaves the alternate screen of an app that died on it
+    /// while its console host was asked to leave it (`TransientState::dead_alt_screen`, a
+    /// prompt under the host policy or `Terminal::expect_host_alt_screen_leave`): that is the
+    /// host's forwarded switch, and it takes the mark. The switch then releases the dead
+    /// app's modes, which the host's leave does not do for the engine: a killed editor's
+    /// mouse tracking would keep the wheel and clicks going to the shell as reports, and
+    /// its scroll region would keep shell output out of the scrollback (`copy_margins`
+    /// carries it onto the primary screen). An app's own exit, on a screen no prompt
+    /// proved dead, keeps its modes: they are its own to reset.
+    fn take_dead_alt_screen(&mut self) -> bool {
+        let dead = self.modes.alternate_screen
+            && self.transient.dead_alt_screen == Some(self.transient.screen_replaced);
+        if dead {
+            self.transient.dead_alt_screen = None;
+        }
+        dead
+    }
+
     /// Reset the modes a dead full-screen app owned, which its own exit would
-    /// have reset and the exits above carry over: scroll region and horizontal
-    /// margins (shell output would never reach the scrollback), mouse tracking,
-    /// application cursor keys and keypad, and an open 2026 window, the
+    /// have reset and the exits above carry over: its input modes
+    /// (`release_dead_app_input`), scroll region and horizontal margins (shell
+    /// output would never reach the scrollback), and an open 2026 window, the
     /// program's own frame included after the timeout cleared the mode
-    /// (`Terminal::sync_frame_unfinished`). Focus reporting (conhost asks for
-    /// it at ConPTY start), bracketed paste and the keyboard protocols stay:
-    /// the shell sets those itself.
+    /// (`Terminal::sync_frame_unfinished`). Focus reporting (conhost asks for it
+    /// at ConPTY start) and the keyboard protocols stay: a shell sets those
+    /// itself. Bracketed paste is the prompt's to decide
+    /// (`release_dead_app_paste`): this also runs at the host's forwarded
+    /// `?1049l`, which can follow a line editor's own `?2004h`.
     fn release_dead_app_modes(&mut self) {
         self.grid.reset_scroll_region();
         self.modes.left_right_margin_mode = false;
         self.grid.reset_horizontal_margins();
+        self.release_dead_app_input();
+        if self.modes.synchronized_output || self.transient.app_sync_open {
+            self.disable_synchronized_output();
+        }
+    }
+
+    /// Turn off what a dead app left on that decides what the person's input
+    /// becomes: mouse tracking and its encoding (the wheel and clicks would reach
+    /// the shell as reports), application cursor keys and keypad, and the reports
+    /// no shell asks for (`release_dead_app_reports`). None of them changes what
+    /// the screen shows, so the prompt that proves the app dead releases them at
+    /// once on either path (`prompt_leaves_orphaned_alt_screen`). The scroll
+    /// region and margins wait for the screen to be left: under a host that is
+    /// asked to leave (OpenConsole) its dead buffer keeps them until its switch,
+    /// and what the shell draws in between must land alike on both sides.
+    pub(super) fn release_dead_app_input(&mut self) {
         self.modes.mouse_mode = MouseMode::None;
         self.modes.mouse_encoding = MouseEncoding::X10;
         self.modes.application_cursor_keys = false;
         self.modes.application_keypad = false;
-        if self.modes.synchronized_output || self.transient.app_sync_open {
-            self.disable_synchronized_output();
+        self.release_dead_app_reports();
+    }
+
+    /// Turn off the reports a dead app asked for that no shell does: in-band size
+    /// reports (2048), which type `CSI 48 ; rows ; cols ; … t` into the prompt
+    /// at every resize, and colour-scheme reports (2031), which type
+    /// `CSI ? 997 ; n n` at every theme change. vim and neovim set both; under
+    /// OpenConsole, which forwards them, a killed vim left pwsh, cmd and Git
+    /// Bash taking a report per resize as typed input (measured 2026-10-18).
+    ///
+    /// The reports still queued for the dead app go too
+    /// (`TransientState::report_buffer`). One queued outside the session's reader
+    /// waits for the reader's next take, and after a kill the next output is the
+    /// shell's: a size report the window's first cell box queued while vim was
+    /// alive went out with the console title the host wrote after the kill, 6 ms
+    /// before pwsh's prompt, typed `[` and 83 `;` into its line, and its echo
+    /// moved the cursor the host's leave carries the prompt for (measured
+    /// 2026-10-18). The window now sends such a report at once (aterm-gui's
+    /// `App::sync_cell_pixel_size`); one still queued at the prompt is dropped.
+    pub(super) fn release_dead_app_reports(&mut self) {
+        self.modes.in_band_size_reports = false;
+        self.transient.size_report_held = false;
+        self.modes.report_color_scheme = false;
+        self.transient.report_buffer.clear();
+    }
+
+    /// Whether DEC 2048's enable-time size report waits instead of going out at once:
+    /// behind a Windows console host (the `ResizePolicy::ConPty` posture) with the
+    /// primary screen up. The report goes into the console's input, and there the reader
+    /// is as likely the shell as the program that asked: OpenConsole forwards the
+    /// enable, so a pwsh command that wrote `ESC [ ? 2048 h` had `[48;30;100;0;0t`
+    /// typed into the next command line (a ParserError, measured 2026-10-18; conhost
+    /// does not forward it). A full-screen app (vim, neovim) enables 2048 on its
+    /// alternate screen and still gets the report at once; one that enables it first
+    /// gets it when that screen comes up ([`Self::send_held_size_report`]). Every later
+    /// resize reports as before. A Unix PTY, and an app already on the alternate
+    /// screen, get it at once.
+    fn hold_size_report(&self) -> bool {
+        self.modes.win32_input_enabled && !self.modes.alternate_screen
+    }
+
+    /// The alternate screen came up: a size report held at the enable
+    /// ([`Self::hold_size_report`]) goes out now, at the size the screen has, while
+    /// the mode is still on.
+    fn send_held_size_report(&mut self) {
+        if std::mem::take(&mut self.transient.size_report_held) && self.modes.in_band_size_reports {
+            super::state_accessors::push_in_band_size_report(
+                self.transient,
+                self.grid.rows(),
+                self.grid.cols(),
+                self.iterm2.host_cell_px(),
+            );
+        }
+    }
+
+    /// A shell prompt (`133;A`): the program that turned 2048 on has ended, and the
+    /// shell reads the console now, so a size report still held for it
+    /// ([`Self::hold_size_report`]) is dropped.
+    pub(super) fn drop_held_size_report(&mut self) {
+        self.transient.size_report_held = false;
+    }
+
+    /// A shell prompt on a dead app's screen that the console host is asked to leave
+    /// (the host policy, `prompt_leaves_orphaned_alt_screen`): the prompt is drawn with
+    /// the pen the host's `?1049l` restores (the main slot's rendition and character
+    /// sets, DECRC's), as the local leave draws it, not with the one the dead app left
+    /// set. A killed vim left bold reverse video on from its ruler, and the pwsh prompt
+    /// the leave carries back (`Terminal::dead_alt_screen_carry`) came back in it
+    /// (measured 2026-10-18). The cursor stays. Only ours changes: the host draws the
+    /// prompt in the dead app's pen on a buffer it is about to drop, and both restore
+    /// the same slot at the switch.
+    pub(super) fn take_main_pen_for_dead_screen_prompt(&mut self) {
+        let saved = self.cursor_save.main;
+        *self.style = saved.map_or_else(CurrentStyle::default, |s| s.style);
+        *self.charset = saved.map_or_else(CharacterSetState::default, |s| s.charset);
+        self.transient.current_underline_color = saved.and_then(|s| s.underline_color);
+        self.transient.update_has_transient_extras();
+        self.style.update_cached_colors();
+        self.grid.set_cursor_template(
+            crate::grid::Cell::bce_blank(self.style.cached_colors()),
+            self.style.bce_bg_rgb(),
+        );
+    }
+
+    /// At the shell prompt that proves a full-screen app dead (`133;A` on its
+    /// alternate screen), turn off the bracketed paste it left on (2004), unless
+    /// the shell switched paste itself after its `D` for this prompt (fish 3
+    /// from its `fish_prompt` event; a readline whose `A` sits in `PS1`). A line
+    /// editor that sets it after its `A` (bash and zsh under aterm's
+    /// integration) sets it again; pwsh and cmd never do, and under OpenConsole
+    /// a killed vim's `?2004h` turned the next line into junk and every paste
+    /// into `ESC [ 200 ~ … ESC [ 201 ~` (measured 2026-10-18). Off, as DECSTR
+    /// leaves it.
+    pub(super) fn release_dead_app_paste(&mut self) {
+        if !self.transient.bracketed_paste_from_prompt {
+            self.disable_bracketed_paste();
         }
     }
 
@@ -867,8 +1024,9 @@ impl TerminalHandler<'_> {
             } else {
                 (state.cursor.row, state.cursor.col)
             };
-            self.grid.set_cursor(row, col);
-            // `set_cursor` cleared pending_wrap: restore it only if the cursor is still at the
+            self.grid.set_cursor_following_content(row, col);
+            // The slot follows its content, so the restore keeps an offloaded reflow's fill debt;
+            // the setter cleared pending_wrap: restore it only if the cursor is still at the
             // right edge (a resize may have moved the margin).
             if state.pending_wrap {
                 let max_col = self.grid.effective_cols_for_row(row).saturating_sub(1);
@@ -1789,12 +1947,17 @@ mod orphaned_alt_screen_tests {
     #[test]
     fn the_host_leave_releases_the_dead_apps_modes_too() {
         let mut term = on_alt_with_history();
-        term.process(b"\x1b[2;4r\x1b[?1000h\x1b[?1h");
+        term.process(b"\x1b[2;4r\x1b[?1000h\x1b[?1h\x1b[?2048h\x1b[?2031h\x1b[?2004h");
         assert!(term.leave_alternate_screen());
         let region = term.grid().scroll_region();
         assert_eq!((region.top, region.bottom), (0, 4));
         assert_eq!(term.modes().mouse_mode, crate::terminal::MouseMode::None);
         assert!(!term.modes().application_cursor_keys);
+        // The reports no shell asks for go with the app; bracketed paste is the
+        // prompt's to decide (a shell may have set its own since).
+        assert!(!term.modes().in_band_size_reports);
+        assert!(!term.modes().report_color_scheme);
+        assert!(term.modes().bracketed_paste);
     }
 }
 
@@ -2148,6 +2311,69 @@ mod stray_1049_reset_tests {
         assert!(term.style().flags.contains(CellFlags::BOLD));
     }
 
+    /// The contrast: leaving a screen `?1049h` entered is DECRC from the slot
+    /// that set filled (xterm's one `CursorRestore`), not only the cursor the
+    /// main grid kept. Whatever changed between the save and the restore (the
+    /// pen and its underline colour, G0, origin mode, the margins under a saved
+    /// origin mode, a widen that moved the edge away from a saved wrap), the
+    /// terminal and a probe glyph end where a DECSC .. DECRC pair on the main
+    /// screen leaves them.
+    #[test]
+    fn a_1049l_from_the_alternate_screen_restores_the_slot_as_decrc_does() {
+        type Between = fn(&mut Terminal);
+        let cases: [(&str, &[u8], Between); 5] = [
+            ("pen", b"\x1b[1;58;5;3m", |t| {
+                t.process(b"\x1b[0;32;58;5;4m")
+            }),
+            ("G0", b"", |t| t.process(b"\x1b(0")),
+            ("origin mode and clamp", b"\x1b[?6h", |t| {
+                t.process(b"\x1b[2;3r\x1b[?6l");
+            }),
+            (
+                "origin clamp to DECLRMM margins",
+                b"\x1b[?6h\x1b[?69h",
+                |t| {
+                    t.process(b"\x1b[3;4s");
+                },
+            ),
+            ("wrap after a widen", b"ABCDE", |t| t.resize(3, 8)),
+        ];
+        for (label, before, between) in cases {
+            let run = |save: &[u8], restore: &[u8]| {
+                let mut term = Terminal::new(3, 5);
+                term.process(before);
+                term.process(save);
+                between(&mut term);
+                term.process(restore);
+                term.process(b"q");
+                let style = term.style();
+                let rows: Vec<String> = (0..term.grid().rows())
+                    .map(|r| term.grid().row_text(r).unwrap_or_default())
+                    .collect();
+                let grid = term.grid();
+                let underline: Vec<(u16, u16, u32)> = (0..grid.rows())
+                    .flat_map(|r| (0..grid.cols()).map(move |c| (r, c)))
+                    .filter_map(|(r, c)| {
+                        let color = grid.cell_extra(r, c)?.underline_color_u32()?;
+                        Some((r, c, color))
+                    })
+                    .collect();
+                (
+                    cursor(&term),
+                    term.modes().origin_mode,
+                    (style.fg, style.bg, style.flags),
+                    rows,
+                    underline,
+                )
+            };
+            assert_eq!(
+                run(b"\x1b[?1049h", b"\x1b[?1049l"),
+                run(b"\x1b7", b"\x1b8"),
+                "{label}"
+            );
+        }
+    }
+
     /// The case that rules out xterm's restore: a full-screen app dies on the
     /// alternate screen, the shell's prompt mark leaves it for the app
     /// (restoring the slot its `?1049h` saved, which DECRC must keep), output
@@ -2252,6 +2478,45 @@ mod alt_switch_bce_tests {
         let mut term = Terminal::new(3, 10);
         term.process(b"\x1b[?47h\x1b[42m\x1b[?47l\x1b[3;1H\n");
         assert_eq!(bg_index(&term, 2, 0), Some(2), "leaving ?47");
+
+        // 1049l re-arms the main grid from the pen it restores, which a session
+        // restored on the alternate screen needs: the checkpoint rebuilds only
+        // the active grid's template, so its main grid comes back plain.
+        let mut live = Terminal::new(3, 10);
+        live.process(b"\x1b[44m\x1b[?1049h\x1b[0m");
+        let mut restored = Terminal::from_checkpoint(&live.checkpoint());
+        for term in [&mut live, &mut restored] {
+            term.process(b"\x1b[?1049l\x1b[3;1H\n");
+        }
+        assert_eq!(bg_index(&live, 2, 0), Some(4), "leaving ?1049");
+        assert_eq!(
+            bg_index(&restored, 2, 0),
+            Some(4),
+            "leaving ?1049, restored"
+        );
+    }
+
+    /// An OSC 8 link a program left open does not outlive its screen: every
+    /// switch, either way, closes it, so the next glyph on the other screen
+    /// carries no link.
+    #[test]
+    fn an_open_link_ends_at_every_screen_switch() {
+        for (on, switch) in [
+            ("", "?1049h"),
+            ("?1049h", "?1049l"),
+            ("", "?1047h"),
+            ("?1047h", "?1047l"),
+        ] {
+            let mut term = Terminal::new(3, 10);
+            if !on.is_empty() {
+                term.process(format!("\x1b[{on}").as_bytes());
+            }
+            term.process(b"\x1b]8;;https://example.com/\x07");
+            term.process(format!("\x1b[{switch}").as_bytes());
+            let at = term.cursor();
+            term.process(b"x");
+            assert_eq!(term.hyperlink_at(at.row, at.col), None, "{switch}");
+        }
     }
 }
 
@@ -2346,6 +2611,31 @@ mod in_band_size_tests {
         );
     }
 
+    // A resize's report is sent unasked: `take_reports` takes it apart from the
+    // replies (here the answer to a cursor query read after the resize), which
+    // stay for `take_response`; `take_response` alone hands over both, the
+    // replies first, as a host that sends them one way has always got them.
+    #[test]
+    fn a_resize_report_is_taken_apart_from_the_replies() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?2048h");
+        let _ = term.take_response(); // enable report
+        term.resize(30, 100);
+        term.process(b"\x1b[6n");
+        assert_eq!(
+            term.take_reports().unwrap_or_default(),
+            b"\x1b[48;30;100;0;0t"
+        );
+        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[1;1R");
+        term.resize(24, 80);
+        term.process(b"\x1b[6n");
+        assert_eq!(
+            term.take_response().unwrap_or_default(),
+            b"\x1b[1;1R\x1b[48;24;80;0;0t"
+        );
+        assert!(term.take_reports().is_none(), "taken with the replies");
+    }
+
     #[test]
     fn no_report_when_2048_disabled() {
         let mut term = Terminal::new(24, 80);
@@ -2353,6 +2643,94 @@ mod in_band_size_tests {
         assert!(
             term.take_response().is_none(),
             "no in-band report unless mode 2048 is set"
+        );
+    }
+
+    /// A tab behind a Windows console host, postured as the window postures one.
+    fn console_host_tab() -> Terminal {
+        let mut term = Terminal::new(30, 100);
+        term.set_console_host_posture(crate::grid::ResizePolicy::ConPty);
+        term
+    }
+
+    // Behind a console host an enable on the primary screen reports nothing yet:
+    // the console's reader there is as likely the shell, and pwsh took the report
+    // as the start of its next command line (OpenConsole, measured 2026-10-18).
+    // The alternate screen coming up with the mode on sends it, once, at the
+    // size the screen has then.
+    #[test]
+    fn behind_a_console_host_the_enable_report_waits_for_the_alternate_screen() {
+        for (enter, leave) in [
+            (&b"\x1b[?1049h"[..], &b"\x1b[?1049l"[..]),
+            (b"\x1b[?1047h", b"\x1b[?1047l"),
+            (b"\x1b[?47h", b"\x1b[?47l"),
+        ] {
+            let mut term = console_host_tab();
+            term.process(b"\x1b[?2048h");
+            assert!(term.take_response().is_none(), "{enter:?}: held");
+            assert!(term.modes().in_band_size_reports, "the mode is on");
+            term.resize(30, 90);
+            let _ = term.take_response(); // a resize reports as before
+            term.process(enter);
+            assert_eq!(
+                term.take_response().unwrap_or_default(),
+                b"\x1b[48;30;90;0;0t",
+                "{enter:?}"
+            );
+            term.process(leave);
+            term.process(enter);
+            assert!(term.take_response().is_none(), "{enter:?}: sent once");
+        }
+    }
+
+    // A full-screen app that enables 2048 on its own screen (vim, neovim) gets
+    // the report at once, as it does without a console host.
+    #[test]
+    fn behind_a_console_host_an_enable_on_the_alternate_screen_reports_at_once() {
+        let mut term = console_host_tab();
+        term.process(b"\x1b[?1049h\x1b[?2048h");
+        assert_eq!(
+            term.take_response().unwrap_or_default(),
+            b"\x1b[48;30;100;0;0t"
+        );
+    }
+
+    // What ends the program that asked drops the held report: its `?2048l`, the
+    // shell's next prompt (`133;A`), a reset. A later alternate screen (the next
+    // app's) is not sent another program's report.
+    #[test]
+    fn a_held_report_is_dropped_when_its_program_is_done() {
+        for end in [
+            &b"\x1b[?2048l"[..],
+            b"\x1b]133;A\x07PS> ",
+            b"\x1b]633;A\x07PS> ",
+            b"\x1bc",
+        ] {
+            let mut term = console_host_tab();
+            term.process(b"\x1b[?2048h");
+            term.process(end);
+            term.process(b"\x1b[?1049h");
+            assert!(term.take_response().is_none(), "{end:?}");
+        }
+        // The app the prompt is followed by asks again, and is answered.
+        let mut term = console_host_tab();
+        term.process(b"\x1b[?2048h\x1b]133;A\x07PS> \x1b[?1049h\x1b[?2048l\x1b[?2048h");
+        assert_eq!(
+            term.take_response().unwrap_or_default(),
+            b"\x1b[48;30;100;0;0t"
+        );
+    }
+
+    // Without a console host (a Unix PTY, a native session) the enable reports
+    // at once on either screen, as before.
+    #[test]
+    fn a_native_session_reports_the_enable_at_once() {
+        let mut term = Terminal::new(30, 100);
+        term.set_console_host_posture(crate::grid::ResizePolicy::Native);
+        term.process(b"\x1b[?2048h");
+        assert_eq!(
+            term.take_response().unwrap_or_default(),
+            b"\x1b[48;30;100;0;0t"
         );
     }
 }

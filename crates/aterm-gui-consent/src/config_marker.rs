@@ -99,6 +99,63 @@ pub fn remove_marker(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Return `true` when `len` fits within `max_bytes`.
+#[must_use]
+pub const fn is_within_marker_cap(len: usize, max_bytes: usize) -> bool {
+    len <= max_bytes
+}
+
+/// Encode the four FDA record fields (`asked_at`, `opened_at`, `verified_at`, `verified_build`)
+/// into 16 little-endian bytes (`u32` each).
+#[must_use]
+pub const fn encode_fda_timestamps_le(
+    asked_at: u32,
+    opened_at: u32,
+    verified_at: u32,
+    verified_build: u32,
+) -> [u8; 16] {
+    [
+        asked_at as u8,
+        (asked_at >> 8) as u8,
+        (asked_at >> 16) as u8,
+        (asked_at >> 24) as u8,
+        opened_at as u8,
+        (opened_at >> 8) as u8,
+        (opened_at >> 16) as u8,
+        (opened_at >> 24) as u8,
+        verified_at as u8,
+        (verified_at >> 8) as u8,
+        (verified_at >> 16) as u8,
+        (verified_at >> 24) as u8,
+        verified_build as u8,
+        (verified_build >> 8) as u8,
+        (verified_build >> 16) as u8,
+        (verified_build >> 24) as u8,
+    ]
+}
+
+/// Decode 16 little-endian bytes into the four FDA record fields.
+#[must_use]
+pub const fn decode_fda_timestamps_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
+    let asked_at = (bytes[0] as u32)
+        | ((bytes[1] as u32) << 8)
+        | ((bytes[2] as u32) << 16)
+        | ((bytes[3] as u32) << 24);
+    let opened_at = (bytes[4] as u32)
+        | ((bytes[5] as u32) << 8)
+        | ((bytes[6] as u32) << 16)
+        | ((bytes[7] as u32) << 24);
+    let verified_at = (bytes[8] as u32)
+        | ((bytes[9] as u32) << 8)
+        | ((bytes[10] as u32) << 16)
+        | ((bytes[11] as u32) << 24);
+    let verified_build = (bytes[12] as u32)
+        | ((bytes[13] as u32) << 8)
+        | ((bytes[14] as u32) << 16)
+        | ((bytes[15] as u32) << 24);
+    (asked_at, opened_at, verified_at, verified_build)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Flush, read_marker, remove_marker, write_marker};

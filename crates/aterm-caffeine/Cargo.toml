@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-caffeine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm's menu-bar keep-awake mug (`aterm caffeine`): a click keeps this Mac awake, a right click picks 1, 8 or 24 hours or forever, starts it at login or quits. The pure model, menu and icon raster compile everywhere; the status item, the power activity, the launchd job and the bundle copy it runs from are macOS."
+
+[dependencies]
+# The state directory, the logs directory and $HOME (`dirs`), the origin line
+# the about row prints (`identity`).
+aterm-types = { workspace = true }
+# The workspace clock (`unix_secs`).
+aterm-time = { workspace = true }
+# The menu-bar icon is drawn here as coverage and handed to AppKit as PNG.
+aterm-png = { workspace = true }
+# The per-path launchd label of a non-installed build.
+aterm-hash = { workspace = true }
+aterm-log = { workspace = true }
+# The state file's flush (`ordered`): its bytes land before the rename over it.
+aterm-durable = { workspace = true }
+# `spawnfd::command` (launchctl, the re-exec into the bundle copy),
+# `ownerlock::probe` (is a mug running), `process::read_process_path|argv`
+# (is the lock's pid that mug), `peer::our_uid` (the GUI domain).
+aterm-uds = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# `kill` (`aterm caffeine quit`), `sysctlbyname("kern.bootsessionuuid")` (a
+# restart of the Mac turns the mug off), the code directory's backup exclusion
+# (`getxattr`/`setxattr`) and `notify_post`.
+libc = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The status item, its menu, the image and the NSProcessInfo activity.
+aterm-objc = { workspace = true }
+
+[dev-dependencies]
+aterm-tempfile = { workspace = true }
+
+[lints]
+workspace = true

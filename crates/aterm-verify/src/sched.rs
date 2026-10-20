@@ -239,7 +239,13 @@ mod tests {
             spec(StageId::LibcOracle, "libc", Lane::LibcOracleTarget, false),
             spec(StageId::Forge, "forge", Lane::Pure, false),
             spec(StageId::ForeignCells, "cells", Lane::CellsTarget, false),
-            spec(StageId::SealedLane, "sealed", Lane::SealedTarget, false),
+            // A side-lane feature build at t0, beside the test compile.
+            spec(
+                StageId::CheckersCompile,
+                "checkers",
+                Lane::CheckersTarget,
+                false,
+            ),
             spec(
                 StageId::MeasurePrebuild,
                 "prebuild",
@@ -386,7 +392,7 @@ mod tests {
                 ("compile", "forge"),
                 ("forge", "l0"),
                 ("compile", "fmt"),
-                ("compile", "sealed"),
+                ("compile", "checkers"),
                 ("compile", "cells"),
             ],
         );
@@ -417,7 +423,7 @@ mod tests {
              overlap each other too, not queue behind one another"
         );
         // The side lanes start at t0, beside the test compile.
-        for side in ["cells", "sealed"] {
+        for side in ["cells", "checkers"] {
             assert!(
                 overlaps(at(idx("compile")), at(idx(side))),
                 "{side} has its own target dir and must overlap the test compile"

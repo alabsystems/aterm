@@ -494,6 +494,7 @@ fn drain_more_nonblocking_idle_wait_bridges_refill_into_same_batch() {
 /// `EINTR`, as it did before 2026-10-17, gathers one chunk, not two.
 #[test]
 fn a_signal_does_not_end_an_armed_idle_wait() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
@@ -505,59 +506,116 @@ fn a_signal_does_not_end_an_armed_idle_wait() {
     unsafe extern "C" {
         fn pthread_self() -> libc::pthread_t;
     }
-    // SAFETY: a zeroed `sigaction` with `sigemptyset`'s mask and a handler that does
-    // nothing, for a signal no other code in this process sends or handles.
-    unsafe {
+    struct SignalHandler(libc::sigaction);
+    impl Drop for SignalHandler {
+        fn drop(&mut self) {
+            // SAFETY: restore the action saved by this test, after its signaller joins.
+            let restored = unsafe { libc::sigaction(libc::SIGURG, &self.0, std::ptr::null_mut()) };
+            if !std::thread::panicking() {
+                assert_eq!(restored, 0, "restore the SIGURG handler");
+            }
+        }
+    }
+    // SAFETY: initialize sigaction's plain fields and save the previous action;
+    // the no-op handler has no non-signal-safe work and SA_RESTART stays off.
+    let _handler = unsafe {
         let mut act: libc::sigaction = std::mem::zeroed();
+        let mut previous: libc::sigaction = std::mem::zeroed();
         act.sa_sigaction = noop as *const () as usize;
-        libc::sigemptyset(std::ptr::addr_of_mut!(act.sa_mask));
+        assert_eq!(libc::sigemptyset(std::ptr::addr_of_mut!(act.sa_mask)), 0);
         assert_eq!(
-            libc::sigaction(libc::SIGURG, &act, std::ptr::null_mut()),
+            libc::sigaction(libc::SIGURG, &act, &mut previous),
             0,
             "install the SIGURG handler"
         );
+        SignalHandler(previous)
+    };
+    struct GatherState {
+        budget: Option<Duration>,
+        ended: Option<Duration>,
+        interrupts: Option<Arc<AtomicUsize>>,
+        _thread: std::marker::PhantomData<std::rc::Rc<()>>,
     }
+    impl Drop for GatherState {
+        fn drop(&mut self) {
+            super::BUDGET_FOR_TEST.with(|b| b.set(self.budget));
+            super::BUDGET_ENDED.with(|b| b.set(self.ended));
+            super::IDLE_WAIT_INTERRUPTS.with(|c| *c.borrow_mut() = self.interrupts.take());
+        }
+    }
+    // Create the thread-affine restorer before changing any TLS slot.
+    let _state = GatherState {
+        budget: super::BUDGET_FOR_TEST.with(std::cell::Cell::get),
+        ended: super::BUDGET_ENDED.with(std::cell::Cell::get),
+        interrupts: super::IDLE_WAIT_INTERRUPTS.with(|c| c.borrow().clone()),
+        _thread: std::marker::PhantomData,
+    };
     super::BUDGET_FOR_TEST.with(|b| b.set(Some(Duration::from_secs(60))));
     let interrupts = Arc::new(AtomicUsize::new(0));
     super::IDLE_WAIT_INTERRUPTS.with(|c| *c.borrow_mut() = Some(Arc::clone(&interrupts)));
-    let mut m = [0i32; 2];
-    // SAFETY: valid 2-int out-array for pipe(2).
-    assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
-    let (rd, wr) = (m[0], m[1]);
-    set_nonblocking(rd, true).expect("nonblock read end");
+    let (rd, wr) = make_wake_pipe().expect("owned CLOEXEC nonblocking pipe");
+    // SAFETY: both fresh descriptors are transferred exactly once to their owners.
+    let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(rd), OwnedFd::from_raw_fd(wr)) };
     let chunk = [0xB5u8; CHUNK_LEN];
-    // SAFETY: bounded write to this test's live pipe end.
+    // SAFETY: bounded write to this test's live nonblocking pipe end.
     assert_eq!(
-        unsafe { libc::write(wr, chunk.as_ptr().cast(), chunk.len()) },
+        unsafe { libc::write(wr.as_raw_fd(), chunk.as_ptr().cast(), chunk.len()) },
         chunk.len() as isize
     );
-    // SAFETY: names this thread, which outlives the signaller (joined below).
+    // SAFETY: names this thread, which the signaller guard keeps alive until join.
     let gatherer = unsafe { pthread_self() };
+    struct Signaller {
+        done: Arc<AtomicBool>,
+        release: Option<std::sync::mpsc::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Signaller {
+        fn stop(&mut self) -> std::thread::Result<()> {
+            self.done.store(true, Ordering::Relaxed);
+            drop(self.release.take());
+            self.thread.take().map_or(Ok(()), |thread| thread.join())
+        }
+    }
+    impl Drop for Signaller {
+        fn drop(&mut self) {
+            // Also releases a worker that has not reached its first recv on unwind.
+            let _ = self.stop();
+        }
+    }
     let done = Arc::new(AtomicBool::new(false));
     let (release, released) = std::sync::mpsc::channel::<()>();
     let (counted, finished) = (Arc::clone(&interrupts), Arc::clone(&done));
-    let signaller = std::thread::spawn(move || {
-        // A gather that never reached its park drops `release` unsent.
+    let thread = std::thread::spawn(move || {
         if released.recv().is_ok() {
             let hang = Instant::now() + Duration::from_secs(60);
             while counted.load(Ordering::Relaxed) == 0 && !finished.load(Ordering::Relaxed) {
                 assert!(Instant::now() < hang, "no signal landed inside the park");
-                // SAFETY: the gathering thread lives until it joins this one.
+                // SAFETY: the gathering thread joins this worker even during unwind.
                 unsafe { libc::pthread_kill(gatherer, libc::SIGURG) };
                 std::thread::sleep(Duration::from_millis(1));
             }
-            // SAFETY: bounded write to the pipe end this thread owns.
-            unsafe { libc::write(wr, chunk.as_ptr().cast(), chunk.len()) };
+            if !finished.load(Ordering::Relaxed) {
+                // SAFETY: the moved owner keeps this fresh nonblocking pipe end live.
+                assert_eq!(
+                    unsafe { libc::write(wr.as_raw_fd(), chunk.as_ptr().cast(), chunk.len()) },
+                    chunk.len() as isize,
+                    "write the refill"
+                );
+            }
         }
-        close_fd(wr);
     });
+    let mut signaller = Signaller {
+        done,
+        release: Some(release),
+        thread: Some(thread),
+    };
     let idle = AtomicUsize::new(0);
     let mut buf = [0u8; 2 * CHUNK_LEN];
-    let n = read(rd, &mut buf[..1024]);
+    let n = read(rd.as_raw_fd(), &mut buf[..1024]);
     assert!(n > 0);
     let mut gaps = 0u32;
     let filled = drain_more_nonblocking_with_idle_wait_after_gap(
-        rd,
+        rd.as_raw_fd(),
         &mut buf,
         n as usize,
         -1,
@@ -567,19 +625,17 @@ fn a_signal_does_not_end_an_armed_idle_wait() {
         |_| {
             gaps += 1;
             if gaps == 1 {
-                release
+                signaller
+                    .release
+                    .as_ref()
+                    .expect("release sender remains owned")
                     .send(())
                     .expect("the signaller waits for its release");
             }
             false
         },
     );
-    done.store(true, Ordering::Relaxed);
-    drop(release);
-    signaller.join().unwrap();
-    close_fd(rd);
-    super::BUDGET_FOR_TEST.with(|b| b.set(None));
-    super::IDLE_WAIT_INTERRUPTS.with(|c| *c.borrow_mut() = None);
+    signaller.stop().expect("join the signaller");
     assert!(
         interrupts.load(Ordering::Relaxed) >= 1,
         "NON-VACUITY: a signal interrupted the park"
@@ -977,6 +1033,70 @@ fn an_unset_tmpdir_puts_the_status_fifo_in_tmp() {
 /// no copy of the slave — which would block `handoff_masters_closed` forever.
 #[test]
 fn a_spawned_child_gets_its_own_ctty_our_winsize_and_no_other_descriptor() {
+    spawn_probe_checks_the_child(None);
+}
+
+/// The same child, from a kit the pool opened ahead ([`fill_kits`]): the spawn
+/// takes it and gives it this spawn's winsize, pixels included, before the
+/// fork; the termios is the spawn's; the kit still waiting in the pool reaches
+/// the child as no descriptor; and the spent channel end waits in the pool for
+/// the next fill, which closes it and opens the replacement. NEGATIVE CONTROL:
+/// a pool never filled is off, and the spawn takes nothing from it.
+#[test]
+fn a_spawn_takes_a_ready_kit_and_gives_it_its_winsize() {
+    let pool: &'static std::sync::Mutex<KitPool> =
+        Box::leak(Box::new(std::sync::Mutex::new(KitPool::new())));
+    TEST_KITS.with(|kits| kits.set(Some(pool)));
+    let off = pool.lock().unwrap().take();
+    assert!(off.is_none(), "a pool never filled lends nothing");
+    assert_eq!(fill_kits(pool, 2).expect("two kits open"), 2);
+    assert_eq!(ready_spawn_kits(), 2, "the census reads the kits waiting");
+    let waiting = {
+        let kits = pool.lock().unwrap();
+        let first = &kits.ready[0];
+        vec![first.master, first.slave, first.status_rd, first.status_wr]
+    };
+    spawn_probe_checks_the_child(Some(&waiting));
+    {
+        let kits = pool.lock().unwrap();
+        assert_eq!(kits.ready.len(), 1, "the spawn took one kit");
+        assert_eq!(kits.spent.len(), 1, "its spent channel end waits");
+    }
+    assert_eq!(ready_spawn_kits(), 1, "a taken kit leaves the census");
+    assert_eq!(fill_kits(pool, 2).expect("the refill"), 1);
+    let mut kits = pool.lock().unwrap();
+    assert!(kits.spent.is_empty(), "the fill closed the spent end");
+    assert_eq!(kits.ready.len(), 2);
+    // The leaked pool's kits close here, not at the test process's exit.
+    kits.ready.clear();
+    drop(kits);
+    TEST_KITS.with(|kits| kits.set(None));
+}
+
+/// The spent-end hold is bounded: past [`SPENT_MAX`], and with the pool off,
+/// the caller closes its own.
+#[test]
+fn a_full_or_off_pool_hands_a_spent_end_back() {
+    let mut pool = KitPool::new();
+    assert_eq!(pool.keep_spent(-1), Some(-1), "off: closed by the caller");
+    pool.on = true;
+    let held: Vec<libc::c_int> = (0..SPENT_MAX as libc::c_int).map(|n| -2 - n).collect();
+    for fd in &held {
+        assert_eq!(pool.keep_spent(*fd), None);
+    }
+    assert_eq!(
+        pool.keep_spent(-100),
+        Some(-100),
+        "full: closed by the caller"
+    );
+    // The fakes are not descriptors: nothing for `Drop` to close.
+    pool.spent.clear();
+}
+
+/// [`a_spawned_child_gets_its_own_ctty_our_winsize_and_no_other_descriptor`]'s
+/// spawn and checks, with `absent` naming descriptors the child must not hold
+/// besides the parked pipe copy.
+fn spawn_probe_checks_the_child(absent: Option<&[libc::c_int]>) {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
     // SAFETY: single-threaded test, trusted-launcher contract trivially holds.
@@ -998,10 +1118,16 @@ fn a_spawned_child_gets_its_own_ctty_our_winsize_and_no_other_descriptor() {
     // redirection: dash, /bin/sh on Debian and Ubuntu, reads only one digit
     // after `>&`, refuses the whole line as a syntax error and printed
     // nothing here (the Linux lane, 2026-10-16).
+    let others: String = absent
+        .unwrap_or_default()
+        .iter()
+        .map(|fd| format!(" {fd}"))
+        .collect();
     let script = format!(
         "s=n; [ -t 0 ] && [ -t 1 ] && [ -t 2 ] && s=y; \
          c=n; {{ : < /dev/tty; }} 2>/dev/null && c=y; \
          p=closed; [ -e /dev/fd/{parked} ] && p=open; \
+         for f in{others}; do [ -e /dev/fd/$f ] && p=\"$p+$f\"; done; \
          printf 'PROBE stdio=%s ctty=%s size=[%s] tty=[%s] parked=%s\\n' \
            \"$s\" \"$c\" \"$(stty size)\" \"$(tty)\" \"$p\"; \
          exec sleep 30"
@@ -1093,6 +1219,10 @@ fn a_spawned_child_gets_its_own_ctty_our_winsize_and_no_other_descriptor() {
     ] {
         assert!(seen.contains(want), "{what}. Saw: {seen:?}");
     }
+    assert!(
+        !seen.contains("parked=closed+"),
+        "the child holds a descriptor of a kit still in the pool. Saw: {seen:?}"
+    );
     assert!(
         seen.contains(&format!("tty=[{want_tty}]")),
         "the child's controlling terminal must be THIS session's slave \
@@ -1788,4 +1918,159 @@ fn a_nul_in_an_argument_or_the_shell_refuses_the_spawn() {
     }
     end(spawn(NUL_SHELL, None, None, Some(&exec))
         .expect("an -e command does not run the shell, so it is not refused for it"));
+}
+
+/// THE SHELL'S BAND ([`SHELL_ROLE`], macOS). A spawned shell holds the UI darwin
+/// role, so its main thread runs in the UI tier, above the default band (31) a role-less
+/// app child is squashed to; a program the shell starts runs in the default band again;
+/// and a program run directly (`-e`) keeps the default. Under a parent whose children
+/// can hold no role (an aterm that is no app: a launchd job, ssh) nothing is raised and
+/// the spawns still succeed. NEGATIVE CONTROLS: without step (1b) the shell reads role 0
+/// at 31; a raise for every child, not only shells, gives the `-e` program role 2.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_spawned_shell_runs_in_the_ui_tier_and_nothing_it_starts_does() {
+    use std::time::Duration;
+    // SAFETY: the trusted-launcher contract trivially holds in a test.
+    let authority = unsafe { aterm_cap::Authority::root_authority() };
+    let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+    let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+    let spawn = |shell_args: Option<&[String]>, exec: Option<&[std::ffi::OsString]>| {
+        spawn_shell_with_pid_cell_px(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            Some("/bin/sh"),
+            shell_args,
+            None, // argv_override
+            exec,
+            None, // cwd
+            None, // sandbox_wrap
+            aterm_sandbox::Limits::inherit(),
+            None, // cell_px
+        )
+        .expect("the spawn")
+    };
+    // The shell starts one program in the background and names it.
+    let args = [
+        "-c".to_owned(),
+        "sleep 30 & echo \"CHILD=$!\"; wait".to_owned(),
+    ];
+    let shell = spawn(Some(&args), None);
+    let program = spawn(None, Some(&["/bin/sleep".into(), "30".into()]));
+    set_nonblocking(shell.master, true).expect("nonblocking master");
+    let mut seen = String::new();
+    let deadline = std::time::Instant::now() + HANG_DETECTOR;
+    let child = loop {
+        let mut buf = [0u8; 256];
+        let n = read(shell.master, &mut buf);
+        if n > 0 {
+            seen.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
+        }
+        let named = seen.split_once("CHILD=").and_then(|(_, rest)| {
+            let end = rest.find(|c: char| !c.is_ascii_digit())?;
+            rest[..end].parse::<i32>().ok()
+        });
+        if let Some(pid) = named {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no CHILD= line: {seen:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // SAFETY: `getpriority` reads a role; no pointers.
+    let role = |pid: i32| unsafe { libc::getpriority(PRIO_DARWIN_ROLE, pid as libc::id_t) };
+    let seen_bands =
+        [shell.pid, child, program.pid].map(|pid| (role(pid), main_thread_priority(pid)));
+    // Whether a child of this process can hold a role at all: a fork child that asks.
+    // SAFETY: the child calls only `setpriority` and `_exit`, both async-signal-safe.
+    let held = unsafe {
+        let pid = libc::fork();
+        if pid == 0 {
+            libc::_exit(i32::from(
+                libc::setpriority(PRIO_DARWIN_ROLE, 0, SHELL_ROLE) != 0,
+            ));
+        }
+        let mut status = 0;
+        libc::waitpid(pid, &mut status, 0) == pid
+            && libc::WIFEXITED(status)
+            && libc::WEXITSTATUS(status) == 0
+    };
+    for sh in [shell, program] {
+        hangup(sh.pid);
+        close_fd(sh.master);
+        reap(sh.pid);
+    }
+    let [
+        (shell_role, shell_pri),
+        (child_role, child_pri),
+        (program_role, program_pri),
+    ] = seen_bands;
+    if held {
+        assert_eq!(shell_role, SHELL_ROLE, "the shell holds the UI role");
+        assert!(
+            shell_pri > 31,
+            "the shell's main thread runs above the default band: {shell_pri}"
+        );
+        assert_eq!(child_role, 0, "the shell's own program holds no role");
+        assert!(
+            child_pri <= 31,
+            "the shell's program runs in the default band: {child_pri}"
+        );
+    } else {
+        assert_eq!(shell_role, 0, "no role can be held here, so none is");
+    }
+    assert_eq!(program_role, 0, "an -e program holds no role");
+    assert!(
+        program_pri <= 31,
+        "an -e program runs in the default band: {program_pri}"
+    );
+}
+
+/// The base priority of `pid`'s first (main) thread, from `PROC_PIDTHREADINFO`.
+#[cfg(target_os = "macos")]
+fn main_thread_priority(pid: i32) -> i32 {
+    /// `struct proc_threadinfo` (`<sys/proc_info.h>`); not in `libc`.
+    #[repr(C)]
+    struct ProcThreadInfo {
+        user_time: u64,
+        system_time: u64,
+        cpu_usage: i32,
+        policy: i32,
+        run_state: i32,
+        flags: i32,
+        sleep_time: i32,
+        curpri: i32,
+        priority: i32,
+        maxpriority: i32,
+        name: [u8; 64],
+    }
+    const PROC_PIDTHREADINFO: libc::c_int = 5;
+    const PROC_PIDLISTTHREADS: libc::c_int = 6;
+    let mut threads = [0u64; 8];
+    // SAFETY: `proc_pidinfo` writes at most the given size into the live buffers.
+    unsafe {
+        let n = libc::proc_pidinfo(
+            pid,
+            PROC_PIDLISTTHREADS,
+            0,
+            threads.as_mut_ptr().cast(),
+            std::mem::size_of_val(&threads) as libc::c_int,
+        );
+        assert!(n >= 8, "pid {pid} lists its threads");
+        let mut info: ProcThreadInfo = std::mem::zeroed();
+        let got = libc::proc_pidinfo(
+            pid,
+            PROC_PIDTHREADINFO,
+            threads[0],
+            (&raw mut info).cast(),
+            std::mem::size_of::<ProcThreadInfo>() as libc::c_int,
+        );
+        assert!(got > 0, "pid {pid}'s main thread answers");
+        info.priority
+    }
 }

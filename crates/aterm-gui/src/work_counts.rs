@@ -28,6 +28,9 @@ thread_local! {
     static LATENCY_STAMPS_TOUCHED: Cell<usize> = const { Cell::new(0) };
     /// MPT-4: sessions probed by the status sweep.
     static STATUS_PROBES: Cell<usize> = const { Cell::new(0) };
+    /// Clipboard workers started (`spawn::install_clipboard`): one per session
+    /// that wrote the clipboard, none for one that never did.
+    static CLIPBOARD_WORKERS: Cell<usize> = const { Cell::new(0) };
     /// MPT-5: tabs walked by the title-drift gate.
     static TITLE_TAB_TOUCHES: Cell<usize> = const { Cell::new(0) };
     /// The subscribe idle wake: retained ledger records (shell blocks, turn
@@ -37,6 +40,10 @@ thread_local! {
     /// (`messages_host::band_on_screen`: off macOS, a round trip to the
     /// window server).
     static ON_SCREEN_ASKS: Cell<usize> = const { Cell::new(0) };
+    /// Timed choices resolved to an instant (`App::resolve_timer_choice`, one
+    /// wall read): one per press of the `Every session` row's Timer, however
+    /// many sessions it arms, so they all land at that one instant.
+    static TIMER_RESOLVES: Cell<usize> = const { Cell::new(0) };
 }
 
 fn bump(counter: &'static std::thread::LocalKey<Cell<usize>>) {
@@ -62,6 +69,13 @@ pub(crate) fn latency_stamp_touched() {
 }
 pub(crate) fn take_latency_stamps_touched() -> usize {
     take(&LATENCY_STAMPS_TOUCHED)
+}
+
+pub(crate) fn clipboard_worker_started() {
+    bump(&CLIPBOARD_WORKERS);
+}
+pub(crate) fn take_clipboard_workers_started() -> usize {
+    take(&CLIPBOARD_WORKERS)
 }
 
 pub(crate) fn status_probe() {
@@ -90,6 +104,13 @@ pub(crate) fn on_screen_asked() {
 }
 pub(crate) fn take_on_screen_asks() -> usize {
     take(&ON_SCREEN_ASKS)
+}
+
+pub(crate) fn timer_resolved() {
+    bump(&TIMER_RESOLVES);
+}
+pub(crate) fn take_timer_resolves() -> usize {
+    take(&TIMER_RESOLVES)
 }
 
 // ---------------------------------------------------------------------------
